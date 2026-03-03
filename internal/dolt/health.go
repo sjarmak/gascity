@@ -115,23 +115,25 @@ func checkDatabases(cityPath string) []DatabaseHealth {
 		dh := DatabaseHealth{Name: dbName}
 
 		// Commit count — triggers compactor if too high.
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		cmd := buildDoltSQLCmd(ctx, config, "-q",
+		ctx1, cancel1 := context.WithTimeout(context.Background(), 10*time.Second)
+		cmd := buildDoltSQLCmd(ctx1, config, "-q",
 			fmt.Sprintf("SELECT COUNT(*) FROM `%s`.dolt_log", dbName),
 			"-r", "csv")
 		if out, err := cmd.Output(); err == nil {
 			dh.Commits = parseCSVInt(out)
 		}
+		cancel1()
 
-		// Open bead count.
-		cmd = buildDoltSQLCmd(ctx, config, "-q",
+		// Open bead count — separate context so it gets its own timeout budget.
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+		cmd = buildDoltSQLCmd(ctx2, config, "-q",
 			fmt.Sprintf("SELECT COUNT(*) FROM `%s`.issues WHERE status IN ('open','in_progress')", dbName),
 			"-r", "csv")
 		if out, err := cmd.Output(); err == nil {
 			dh.OpenBeads = parseCSVInt(out)
 		}
+		cancel2()
 
-		cancel()
 		results = append(results, dh)
 	}
 

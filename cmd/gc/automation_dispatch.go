@@ -221,6 +221,12 @@ func (m *memoryAutomationDispatcher) dispatchWisp(ctx context.Context, a automat
 	scoped := a.ScopedName()
 
 	if err := ctx.Err(); err != nil {
+		m.rec.Record(events.Event{
+			Type:    events.AutomationFailed,
+			Actor:   "controller",
+			Subject: scoped,
+			Message: err.Error(),
+		})
 		m.store.Update(trackingID, beads.UpdateOpts{Labels: []string{"wisp", "wisp-canceled"}}) //nolint:errcheck // best-effort
 		return
 	}

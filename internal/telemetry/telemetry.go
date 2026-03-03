@@ -157,6 +157,9 @@ func Init(ctx context.Context, serviceName, serviceVersion string) (*Provider, e
 		otlploghttp.WithEndpointURL(logsURL),
 	)
 	if err != nil {
+		// Shut down the already-registered metric provider to avoid leaking
+		// its periodic reader goroutine.
+		_ = mp.Shutdown(ctx)
 		return nil, fmt.Errorf("creating OTLP log exporter: %w", err)
 	}
 	lp := sdklog.NewLoggerProvider(
