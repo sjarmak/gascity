@@ -1650,7 +1650,7 @@ name = "deacon"
 name = "witness"
 `)
 
-	agents, _, _, _, err := loadPack(
+	agents, _, _, _, _, err := loadPack(
 		fsys.OSFS{},
 		filepath.Join(dir, "packs/combined/pack.toml"),
 		filepath.Join(dir, "packs/combined"),
@@ -1688,7 +1688,7 @@ name = "mayor"
 name = "witness"
 `)
 
-	_, _, _, _, err := loadPack(
+	_, _, _, _, _, err := loadPack(
 		fsys.OSFS{},
 		filepath.Join(dir, "packs/bad/pack.toml"),
 		filepath.Join(dir, "packs/bad"),
@@ -2019,7 +2019,7 @@ includes = ["../maintenance"]
 name = "mayor"
 `)
 
-	agents, _, _, _, err := loadPack(
+	agents, _, _, _, _, err := loadPack(
 		fsys.OSFS{},
 		filepath.Join(dir, "packs/gastown/pack.toml"),
 		filepath.Join(dir, "packs/gastown"),
@@ -2066,7 +2066,7 @@ city_agents = ["mayor"]
 name = "mayor"
 `)
 
-	agents, _, _, _, err := loadPack(
+	agents, _, _, _, _, err := loadPack(
 		fsys.OSFS{},
 		filepath.Join(dir, "packs/gastown/pack.toml"),
 		filepath.Join(dir, "packs/gastown"),
@@ -2123,7 +2123,7 @@ name = "mayor"
 `)
 	writeFile(t, dir, "packs/gastown/formulas/.keep", "")
 
-	_, _, topoDirs, _, err := loadPack(
+	_, _, topoDirs, _, _, err := loadPack(
 		fsys.OSFS{},
 		filepath.Join(dir, "packs/gastown/pack.toml"),
 		filepath.Join(dir, "packs/gastown"),
@@ -2167,7 +2167,7 @@ includes = ["../a"]
 name = "beta"
 `)
 
-	_, _, _, _, err := loadPack(
+	_, _, _, _, _, err := loadPack(
 		fsys.OSFS{},
 		filepath.Join(dir, "packs/a/pack.toml"),
 		filepath.Join(dir, "packs/a"),
@@ -2193,7 +2193,7 @@ includes = ["../nonexistent"]
 name = "alpha"
 `)
 
-	_, _, _, _, err := loadPack(
+	_, _, _, _, _, err := loadPack(
 		fsys.OSFS{},
 		filepath.Join(dir, "packs/main/pack.toml"),
 		filepath.Join(dir, "packs/main"),
@@ -2236,7 +2236,7 @@ command = "main-claude"
 name = "boss"
 `)
 
-	_, providers, _, _, err := loadPack(
+	_, providers, _, _, _, err := loadPack(
 		fsys.OSFS{},
 		filepath.Join(dir, "packs/main/pack.toml"),
 		filepath.Join(dir, "packs/main"),
@@ -2382,7 +2382,7 @@ name = "polecat"
 scope = "rig"
 `)
 
-	agents, _, _, _, err := loadPack(
+	agents, _, _, _, _, err := loadPack(
 		fsys.OSFS{}, filepath.Join(dir, "packs/test/pack.toml"),
 		filepath.Join(dir, "packs/test"), dir, "myrig", nil)
 	if err != nil {
@@ -2428,7 +2428,7 @@ name = "polecat"
 scope = "rig"
 `)
 
-	agents, _, _, _, err := loadPack(
+	agents, _, _, _, _, err := loadPack(
 		fsys.OSFS{}, filepath.Join(dir, "packs/test/pack.toml"),
 		filepath.Join(dir, "packs/test"), dir, "myrig", nil)
 	if err != nil {
@@ -2464,7 +2464,7 @@ name = "polecat"
 scope = "rig"
 `)
 
-	_, _, _, _, err := loadPack(
+	_, _, _, _, _, err := loadPack(
 		fsys.OSFS{}, filepath.Join(dir, "packs/test/pack.toml"),
 		filepath.Join(dir, "packs/test"), dir, "myrig", nil)
 	if err == nil {
@@ -3683,5 +3683,220 @@ includes = ["../child"]
 	}
 	if cfg.PackOverlayDirs[1] != wantParent {
 		t.Errorf("PackOverlayDirs[1] = %q, want %q", cfg.PackOverlayDirs[1], wantParent)
+	}
+}
+
+func TestPackGlobal_CityLevel(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "packs/theme/pack.toml", `
+[pack]
+name = "theme"
+schema = 1
+
+[global]
+session_live = ["echo theme applied"]
+`)
+	cfg := &City{
+		Workspace: Workspace{Includes: []string{"packs/theme"}},
+		Agents: []Agent{
+			{Name: "alpha"},
+			{Name: "beta"},
+		},
+	}
+	if _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
+		t.Fatalf("ExpandCityPacks: %v", err)
+	}
+	applyPackGlobals(cfg)
+
+	// Both agents should get the global command appended.
+	for _, a := range cfg.Agents {
+		if len(a.SessionLive) != 1 || a.SessionLive[0] != "echo theme applied" {
+			t.Errorf("agent %q: SessionLive = %v, want [\"echo theme applied\"]", a.Name, a.SessionLive)
+		}
+	}
+}
+
+func TestPackGlobal_RigLevel(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "packs/rig-theme/pack.toml", `
+[pack]
+name = "rig-theme"
+schema = 1
+
+[global]
+session_live = ["echo rig theme"]
+
+[[agents]]
+name = "worker"
+`)
+	cfg := &City{
+		Agents: []Agent{
+			{Name: "city-agent", Dir: ""},
+		},
+		Rigs: []Rig{
+			{Name: "my-rig", Path: "/tmp/rig", Includes: []string{"packs/rig-theme"}},
+		},
+	}
+	if err := ExpandPacks(cfg, fsys.OSFS{}, dir, nil); err != nil {
+		t.Fatalf("ExpandPacks: %v", err)
+	}
+	applyPackGlobals(cfg)
+
+	// City agent should NOT get rig-level global.
+	for _, a := range cfg.Agents {
+		if a.Name == "city-agent" {
+			if len(a.SessionLive) != 0 {
+				t.Errorf("city-agent should not get rig global, got %v", a.SessionLive)
+			}
+		}
+		// Rig agent should get the global.
+		if a.Name == "worker" && a.Dir == "my-rig" {
+			if len(a.SessionLive) != 1 || a.SessionLive[0] != "echo rig theme" {
+				t.Errorf("rig worker: SessionLive = %v, want [\"echo rig theme\"]", a.SessionLive)
+			}
+		}
+	}
+}
+
+func TestPackGlobal_ConfigDirResolution(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "packs/scripts/pack.toml", `
+[pack]
+name = "scripts"
+schema = 1
+
+[global]
+session_live = [
+    "{{.ConfigDir}}/run.sh {{.Session}} {{.Agent}}",
+]
+`)
+	cfg := &City{
+		Workspace: Workspace{Includes: []string{"packs/scripts"}},
+		Agents:    []Agent{{Name: "test-agent"}},
+	}
+	if _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
+		t.Fatalf("ExpandCityPacks: %v", err)
+	}
+	applyPackGlobals(cfg)
+
+	// {{.ConfigDir}} should be resolved to pack dir, {{.Session}} and
+	// {{.Agent}} should remain as templates.
+	packDir := filepath.Join(dir, "packs/scripts")
+	want := packDir + "/run.sh {{.Session}} {{.Agent}}"
+	for _, a := range cfg.Agents {
+		if len(a.SessionLive) != 1 {
+			t.Fatalf("agent %q: got %d SessionLive commands, want 1", a.Name, len(a.SessionLive))
+		}
+		if a.SessionLive[0] != want {
+			t.Errorf("agent %q: SessionLive[0] = %q, want %q", a.Name, a.SessionLive[0], want)
+		}
+	}
+}
+
+func TestPackGlobal_MultipleGlobalPacks(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "packs/theme-a/pack.toml", `
+[pack]
+name = "theme-a"
+schema = 1
+
+[global]
+session_live = ["echo A"]
+`)
+	writeFile(t, dir, "packs/theme-b/pack.toml", `
+[pack]
+name = "theme-b"
+schema = 1
+
+[global]
+session_live = ["echo B"]
+`)
+	cfg := &City{
+		Workspace: Workspace{Includes: []string{"packs/theme-a", "packs/theme-b"}},
+		Agents:    []Agent{{Name: "solo"}},
+	}
+	if _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
+		t.Fatalf("ExpandCityPacks: %v", err)
+	}
+	applyPackGlobals(cfg)
+
+	// Both globals should be appended in order.
+	if len(cfg.Agents[0].SessionLive) != 2 {
+		t.Fatalf("got %d SessionLive, want 2", len(cfg.Agents[0].SessionLive))
+	}
+	if cfg.Agents[0].SessionLive[0] != "echo A" {
+		t.Errorf("SessionLive[0] = %q, want %q", cfg.Agents[0].SessionLive[0], "echo A")
+	}
+	if cfg.Agents[0].SessionLive[1] != "echo B" {
+		t.Errorf("SessionLive[1] = %q, want %q", cfg.Agents[0].SessionLive[1], "echo B")
+	}
+}
+
+func TestPackGlobal_EmptyGlobal(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "packs/empty/pack.toml", `
+[pack]
+name = "empty"
+schema = 1
+
+[global]
+session_live = []
+`)
+	cfg := &City{
+		Workspace: Workspace{Includes: []string{"packs/empty"}},
+		Agents:    []Agent{{Name: "untouched", SessionLive: []string{"existing"}}},
+	}
+	if _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
+		t.Fatalf("ExpandCityPacks: %v", err)
+	}
+	applyPackGlobals(cfg)
+
+	// Empty global should be a no-op.
+	if len(cfg.Agents[0].SessionLive) != 1 || cfg.Agents[0].SessionLive[0] != "existing" {
+		t.Errorf("SessionLive = %v, want [\"existing\"]", cfg.Agents[0].SessionLive)
+	}
+}
+
+func TestPackGlobal_OrderingAfterPatches(t *testing.T) {
+	dir := t.TempDir()
+	// Pack with agent that has own session_live, a patch, and a global.
+	writeFile(t, dir, "packs/full/pack.toml", `
+[pack]
+name = "full"
+schema = 1
+
+[[agents]]
+name = "worker"
+session_live = ["echo own"]
+
+[patches]
+[[patches.agents]]
+name = "worker"
+session_live_append = ["echo patched"]
+
+[global]
+session_live = ["echo global"]
+`)
+	cfg := &City{
+		Workspace: Workspace{Includes: []string{"packs/full"}},
+	}
+	if _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
+		t.Fatalf("ExpandCityPacks: %v", err)
+	}
+	applyPackGlobals(cfg)
+
+	// Order: own < patch < global.
+	want := []string{"echo own", "echo patched", "echo global"}
+	if len(cfg.Agents) != 1 {
+		t.Fatalf("got %d agents, want 1", len(cfg.Agents))
+	}
+	got := cfg.Agents[0].SessionLive
+	if len(got) != len(want) {
+		t.Fatalf("SessionLive = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("SessionLive[%d] = %q, want %q", i, got[i], want[i])
+		}
 	}
 }

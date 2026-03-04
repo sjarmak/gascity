@@ -28,6 +28,7 @@ type packConfig struct {
 	Patches   Patches                 `toml:"patches,omitempty"`
 	Doctor    []PackDoctorEntry       `toml:"doctor,omitempty"`
 	Commands  []PackCommandEntry      `toml:"commands,omitempty"`
+	Global    PackGlobal              `toml:"global,omitempty"`
 }
 
 // ExpandPacks resolves pack references on all rigs. For each rig
@@ -53,6 +54,7 @@ func ExpandPacks(cfg *City, fs fsys.FS, cityRoot string, rigFormulaDirs map[stri
 
 		var rigAgents []Agent
 		var rigTopoDirs []string
+		var rigGlobals []ResolvedPackGlobal
 		for _, ref := range topoRefs {
 			topoDir, err := resolvePackRef(ref, cityRoot, cityRoot)
 			if err != nil {
@@ -60,10 +62,11 @@ func ExpandPacks(cfg *City, fs fsys.FS, cityRoot string, rigFormulaDirs map[stri
 			}
 			topoPath := filepath.Join(topoDir, packFile)
 
-			agents, providers, topoDirs, reqs, err := loadPack(fs, topoPath, topoDir, cityRoot, rig.Name, nil)
+			agents, providers, topoDirs, reqs, globals, err := loadPack(fs, topoPath, topoDir, cityRoot, rig.Name, nil)
 			if err != nil {
 				return fmt.Errorf("rig %q pack %q: %w", rig.Name, ref, err)
 			}
+			rigGlobals = append(rigGlobals, globals...)
 
 			// Validate rig-scoped requirements.
 			for _, req := range reqs {
@@ -149,6 +152,14 @@ func ExpandPacks(cfg *City, fs fsys.FS, cityRoot string, rigFormulaDirs map[stri
 			return fmt.Errorf("rig %q: %w", rig.Name, err)
 		}
 
+		// Store rig-level pack globals.
+		if len(rigGlobals) > 0 {
+			if cfg.RigPackGlobals == nil {
+				cfg.RigPackGlobals = make(map[string][]ResolvedPackGlobal)
+			}
+			cfg.RigPackGlobals[rig.Name] = rigGlobals
+		}
+
 		expanded = append(expanded, rigAgents...)
 	}
 	cfg.Agents = append(cfg.Agents, expanded...)
@@ -186,6 +197,7 @@ func ExpandCityPacks(cfg *City, fs fsys.FS, cityRoot string) ([]string, []PackRe
 	var formulaDirs []string
 	var allPackDirs []string
 	var allRequires []PackRequirement
+	var allGlobals []ResolvedPackGlobal
 
 	for _, ref := range topos {
 		topoDir, err := resolvePackRef(ref, cityRoot, cityRoot)
@@ -194,11 +206,12 @@ func ExpandCityPacks(cfg *City, fs fsys.FS, cityRoot string) ([]string, []PackRe
 		}
 		topoPath := filepath.Join(topoDir, packFile)
 
-		agents, providers, topoDirs, reqs, err := loadPack(fs, topoPath, topoDir, cityRoot, "", nil)
+		agents, providers, topoDirs, reqs, globals, err := loadPack(fs, topoPath, topoDir, cityRoot, "", nil)
 		if err != nil {
 			return nil, nil, fmt.Errorf("city pack %q: %w", ref, err)
 		}
 		allRequires = append(allRequires, reqs...)
+		allGlobals = append(allGlobals, globals...)
 
 		// Accumulate pack dirs (deduped).
 		allPackDirs = appendUnique(allPackDirs, topoDirs...)
@@ -250,6 +263,9 @@ func ExpandCityPacks(cfg *City, fs fsys.FS, cityRoot string) ([]string, []PackRe
 
 	// City pack agents go at the front (before user-defined agents).
 	cfg.Agents = append(allAgents, cfg.Agents...)
+
+	// Store city-level pack globals.
+	cfg.PackGlobals = append(cfg.PackGlobals, allGlobals...)
 
 	return formulaDirs, allRequires, nil
 }
@@ -409,7 +425,7 @@ func checkPackAgentCollisions(agents []Agent, rigName string) error {
 // Pass nil for the initial call; it will be initialized automatically.
 // Includes are processed recursively: included agents come first (base
 // layer), then the parent's own agents (override layer).
-func loadPack(fs fsys.FS, topoPath, topoDir, cityRoot, rigName string, seen map[string]bool) ([]Agent, map[string]ProviderSpec, []string, []PackRequirement, error) {
+func loadPack(fs fsys.FS, topoPath, topoDir, cityRoot, rigName string, seen map[string]bool) ([]Agent, map[string]ProviderSpec, []string, []PackRequirement, []ResolvedPackGlobal, error) {
 	// Initialize seen set on first call.
 	if seen == nil {
 		seen = make(map[string]bool)
@@ -421,47 +437,49 @@ func loadPack(fs fsys.FS, topoPath, topoDir, cityRoot, rigName string, seen map[
 		absTopoDir = topoDir
 	}
 	if seen[absTopoDir] {
-		return nil, nil, nil, nil, fmt.Errorf("cycle detected: pack %q already visited", topoDir)
+		return nil, nil, nil, nil, nil, fmt.Errorf("cycle detected: pack %q already visited", topoDir)
 	}
 	seen[absTopoDir] = true
 
 	data, err := fs.ReadFile(topoPath)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("loading %s: %w", packFile, err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("loading %s: %w", packFile, err)
 	}
 
 	var tc packConfig
 	if _, err := toml.Decode(string(data), &tc); err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("parsing %s: %w", packFile, err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("parsing %s: %w", packFile, err)
 	}
 
 	if err := validatePackMeta(&tc.Pack); err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	// Process includes: accumulate base-layer agents, providers,
-	// pack dirs, and requirements from included packs.
+	// pack dirs, requirements, and globals from included packs.
 	var includedAgents []Agent
 	var includedTopoDirs []string
 	var allRequires []PackRequirement
+	var includedGlobals []ResolvedPackGlobal
 	includedProviders := make(map[string]ProviderSpec)
 
 	for _, inc := range tc.Pack.Includes {
 		incTopoDir, err := resolvePackRef(inc, topoDir, cityRoot)
 		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("include %q: %w", inc, err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("include %q: %w", inc, err)
 		}
 
 		incTopoPath := filepath.Join(incTopoDir, packFile)
-		incAgents, incProviders, incTopoDirs, incReqs, err := loadPack(
+		incAgents, incProviders, incTopoDirs, incReqs, incGlobals, err := loadPack(
 			fs, incTopoPath, incTopoDir, cityRoot, rigName, seen)
 		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("include %q: %w", inc, err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("include %q: %w", inc, err)
 		}
 
 		includedAgents = append(includedAgents, incAgents...)
 		includedTopoDirs = append(includedTopoDirs, incTopoDirs...)
 		allRequires = append(allRequires, incReqs...)
+		includedGlobals = append(includedGlobals, incGlobals...)
 
 		// Merge providers: included first, no overwrite.
 		for name, spec := range incProviders {
@@ -490,13 +508,13 @@ func loadPack(fs fsys.FS, topoPath, topoDir, cityRoot, rigName string, seen map[
 		}
 		for _, ca := range tc.Pack.CityAgents {
 			if !allAgentNames[ca] {
-				return nil, nil, nil, nil, fmt.Errorf("city_agents: agent %q not found in pack", ca)
+				return nil, nil, nil, nil, nil, fmt.Errorf("city_agents: agent %q not found in pack", ca)
 			}
 		}
 		// Stamp scope on parent agents.
 		for i := range tc.Agents {
 			if tc.Agents[i].Scope == "rig" && cityAgentSet[tc.Agents[i].Name] {
-				return nil, nil, nil, nil, fmt.Errorf(
+				return nil, nil, nil, nil, nil, fmt.Errorf(
 					"agent %q: scope=\"rig\" conflicts with city_agents listing", tc.Agents[i].Name)
 			}
 			if tc.Agents[i].Scope == "" {
@@ -552,7 +570,7 @@ func loadPack(fs fsys.FS, topoPath, topoDir, cityRoot, rigName string, seen map[
 	if !tc.Patches.IsEmpty() {
 		adjustPackPatchPaths(&tc.Patches, topoDir, cityRoot)
 		if err := applyPackAgentPatches(includedAgents, tc.Patches.Agents); err != nil {
-			return nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, err
 		}
 	}
 
@@ -568,7 +586,52 @@ func loadPack(fs fsys.FS, topoPath, topoDir, cityRoot, rigName string, seen map[
 	topoDirs = append(topoDirs, includedTopoDirs...)
 	topoDirs = append(topoDirs, topoDir)
 
-	return includedAgents, mergedProviders, topoDirs, allRequires, nil
+	// Collect globals: included globals first, then this pack's own.
+	var allGlobals []ResolvedPackGlobal
+	allGlobals = append(allGlobals, includedGlobals...)
+	if len(tc.Global.SessionLive) > 0 {
+		allGlobals = append(allGlobals, ResolvedPackGlobal{
+			SessionLive: resolveConfigDirInCommands(tc.Global.SessionLive, topoDir),
+			PackName:    tc.Pack.Name,
+		})
+	}
+
+	return includedAgents, mergedProviders, topoDirs, allRequires, allGlobals, nil
+}
+
+// applyPackGlobals appends [global].session_live commands from packs
+// to matching agents. City-level globals affect ALL agents. Rig-level
+// globals affect only agents in that rig.
+func applyPackGlobals(cfg *City) {
+	// City-level globals → all agents.
+	for _, g := range cfg.PackGlobals {
+		for i := range cfg.Agents {
+			cfg.Agents[i].SessionLive = append(
+				cfg.Agents[i].SessionLive, g.SessionLive...)
+		}
+	}
+	// Rig-level globals → only that rig's agents.
+	for rigName, globals := range cfg.RigPackGlobals {
+		for _, g := range globals {
+			for i := range cfg.Agents {
+				if cfg.Agents[i].Dir == rigName {
+					cfg.Agents[i].SessionLive = append(
+						cfg.Agents[i].SessionLive, g.SessionLive...)
+				}
+			}
+		}
+	}
+}
+
+// resolveConfigDirInCommands replaces {{.ConfigDir}} in each command with
+// the concrete pack directory path. Other template variables ({{.Session}},
+// {{.Agent}}, etc.) are left as-is for per-agent expansion later.
+func resolveConfigDirInCommands(cmds []string, configDir string) []string {
+	result := make([]string, len(cmds))
+	for i, cmd := range cmds {
+		result[i] = strings.ReplaceAll(cmd, "{{.ConfigDir}}", configDir)
+	}
+	return result
 }
 
 // adjustPackPatchPaths resolves file-path fields in patches relative to

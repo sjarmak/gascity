@@ -147,6 +147,9 @@ func LoadWithIncludes(fs fsys.FS, path string, extraIncludes ...string) (*City, 
 		}
 	}
 
+	// Apply [global] sections from packs to agents in scope.
+	applyPackGlobals(root)
+
 	// Validate city-scoped pack requirements.
 	if err := validateCityRequirements(cityReqs, root.Agents); err != nil {
 		return nil, nil, err

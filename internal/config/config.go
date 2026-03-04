@@ -95,6 +95,12 @@ type City struct {
 	// from rig packs. Merged with PackOverlayDirs during agent build.
 	// Populated during pack expansion. Not from TOML.
 	RigOverlayDirs map[string][]string `toml:"-" json:"-"`
+	// PackGlobals holds resolved [global] sections from city-level packs.
+	// City-level globals apply to ALL agents. Populated during pack expansion.
+	PackGlobals []ResolvedPackGlobal `toml:"-" json:"-"`
+	// RigPackGlobals maps rig name to resolved [global] sections from
+	// rig-level packs. Rig globals apply only to that rig's agents.
+	RigPackGlobals map[string][]ResolvedPackGlobal `toml:"-" json:"-"`
 }
 
 // FormulaLayers holds resolved formula directories for symlink materialization.
@@ -273,6 +279,20 @@ type PackCommandEntry struct {
 	// Script is the path to the script (relative to pack dir).
 	// Supports Go text/template variables: {{.CityRoot}}, {{.ConfigDir}}, etc.
 	Script string `toml:"script" jsonschema:"required"`
+}
+
+// PackGlobal defines commands a pack applies to all agents in scope.
+// Parsed from the [global] section in pack.toml.
+type PackGlobal struct {
+	SessionLive []string `toml:"session_live,omitempty"`
+}
+
+// ResolvedPackGlobal is a PackGlobal with {{.ConfigDir}} pre-resolved
+// to the pack's concrete cache/directory path. Other template vars
+// ({{.Session}}, {{.Agent}}, etc.) remain for per-agent expansion.
+type ResolvedPackGlobal struct {
+	SessionLive []string
+	PackName    string
 }
 
 // EffectivePrefix returns the bead ID prefix for this rig. Uses the

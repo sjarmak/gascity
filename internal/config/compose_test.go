@@ -1078,3 +1078,56 @@ name = "test-fail"
 		t.Errorf("error = %q, want it to contain %q", err.Error(), "fetching include")
 	}
 }
+
+func TestLoadWithIncludes_PackGlobal(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a pack with [global] section and one agent.
+	writeFile(t, dir, "packs/ui/pack.toml", `
+[pack]
+name = "ui-theme"
+schema = 1
+
+[global]
+session_live = [
+    "{{.ConfigDir}}/theme.sh {{.Session}}",
+]
+
+[[agents]]
+name = "designer"
+`)
+
+	// Create city.toml that includes the pack and has an inline agent.
+	writeFile(t, dir, "city.toml", `
+[workspace]
+name = "global-test"
+includes = ["packs/ui"]
+
+[[agents]]
+name = "coder"
+`)
+
+	cfg, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+
+	// Should have 2 agents: designer (from pack) + coder (inline).
+	if len(cfg.Agents) != 2 {
+		t.Fatalf("got %d agents, want 2", len(cfg.Agents))
+	}
+
+	packDir := filepath.Join(dir, "packs/ui")
+	wantCmd := packDir + "/theme.sh {{.Session}}"
+
+	// Both agents should have the global session_live command.
+	for _, a := range cfg.Agents {
+		if len(a.SessionLive) != 1 {
+			t.Errorf("agent %q: got %d SessionLive, want 1", a.Name, len(a.SessionLive))
+			continue
+		}
+		if a.SessionLive[0] != wantCmd {
+			t.Errorf("agent %q: SessionLive[0] = %q, want %q", a.Name, a.SessionLive[0], wantCmd)
+		}
+	}
+}
