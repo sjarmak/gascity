@@ -246,6 +246,53 @@ func TestUpdatePack(t *testing.T) {
 	}
 }
 
+func TestUpdatePackWithBranchRef(t *testing.T) {
+	// Clone with ref="main", push a new commit to bare, call
+	// updatePack(dir, "main"), and verify we get the new content.
+	// This catches the bug where checkout "main" uses the stale local
+	// branch instead of origin/main.
+	dir := t.TempDir()
+	workDir := filepath.Join(dir, "work")
+	bareDir := filepath.Join(dir, "test.git")
+
+	mustGit(t, "", "init", workDir)
+	if err := os.WriteFile(filepath.Join(workDir, "pack.toml"), []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, workDir, "add", "-A")
+	mustGit(t, workDir, "commit", "-m", "v1")
+	mustGit(t, workDir, "clone", "--bare", workDir, bareDir)
+
+	// Clone into cache WITH ref="main" (creates local main branch).
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	if err := clonePack(bareDir, cacheDir, "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Push a new commit to the bare repo.
+	pushDir := filepath.Join(dir, "push")
+	mustGit(t, "", "clone", bareDir, pushDir)
+	if err := os.WriteFile(filepath.Join(pushDir, "pack.toml"), []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, pushDir, "add", "-A")
+	mustGit(t, pushDir, "commit", "-m", "v2")
+	mustGit(t, pushDir, "push")
+
+	// Update cache with explicit branch ref.
+	if err := updatePack(cacheDir, "main"); err != nil {
+		t.Fatalf("updatePack with branch ref: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(cacheDir, "pack.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "v2" {
+		t.Errorf("expected v2 after update with branch ref, got: %s", data)
+	}
+}
+
 func TestFetchPacks_ClonesMissing(t *testing.T) {
 	bare := initBareRepo(t, "remote-topo")
 	cityRoot := t.TempDir()

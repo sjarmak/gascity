@@ -71,15 +71,17 @@ func updatePack(cacheDir, ref string) error {
 	if _, err := runGit(cacheDir, "fetch", "origin"); err != nil {
 		return fmt.Errorf("fetching: %w", err)
 	}
-	target := ref
-	if target == "" {
-		target = "origin/HEAD"
+	if ref == "" {
+		if _, err := runGit(cacheDir, "checkout", "origin/HEAD"); err != nil {
+			return fmt.Errorf("checking out origin/HEAD: %w", err)
+		}
+		return nil
 	}
-	// Try checkout as-is first (for tags/branches).
-	if _, err := runGit(cacheDir, "checkout", target); err != nil {
-		// If that fails, try origin/<ref> for branch names.
-		if _, err2 := runGit(cacheDir, "checkout", "origin/"+ref); err2 != nil {
-			return fmt.Errorf("checking out %q: %w", ref, err)
+	// Try origin/<ref> first — for branches, this gets the latest remote state.
+	// Fall back to <ref> for tags and commit SHAs.
+	if _, err := runGit(cacheDir, "checkout", "origin/"+ref); err != nil {
+		if _, err2 := runGit(cacheDir, "checkout", ref); err2 != nil {
+			return fmt.Errorf("checking out %q: %w", ref, err2)
 		}
 	}
 	return nil

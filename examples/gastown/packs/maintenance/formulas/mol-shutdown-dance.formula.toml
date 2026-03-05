@@ -87,7 +87,7 @@ cancelled): close this step, burn the wisp, exit.
 
 **3. Check if target session is alive:**
 ```bash
-gc peek {{target}} 1
+gc agent peek {{target}} 1
 ```
 If target session doesn't exist (already dead):
 - Close warrant: `bd close {{warrant_id}} --reason "Target already dead"`
@@ -119,7 +119,7 @@ sleep 60
 
 **3. Check for response:**
 ```bash
-gc peek {{target}} 50
+gc agent peek {{target}} 50
 ```
 
 Look for the ALIVE keyword in the output after your health check message.
@@ -158,7 +158,7 @@ sleep 120
 
 **3. Check for response:**
 ```bash
-gc peek {{target}} 50
+gc agent peek {{target}} 50
 ```
 
 Same evaluation as attempt 1: ALIVE keyword or active output.
@@ -194,7 +194,7 @@ sleep 240
 
 **3. Check for response:**
 ```bash
-gc peek {{target}} 50
+gc agent peek {{target}} 50
 ```
 
 **4. If ALIVE or active:**
@@ -213,7 +213,7 @@ Three attempts, no response. Execute the warrant.
 
 **1. Capture final pane output for forensics:**
 ```bash
-gc peek {{target}} 100
+gc agent peek {{target}} 100
 ```
 Save this output — it's the last evidence of what the agent was doing.
 
