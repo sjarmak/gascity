@@ -27,8 +27,9 @@ import (
 // suspended in the config or belonging to suspended rigs. Also includes
 // all agents when the city itself is suspended (workspace.suspended).
 // Used by the reconciler to distinguish suspended agents from true orphans
-// during Phase 2 cleanup.
-func computeSuspendedNames(cfg *config.City, cityName, cityPath string) map[string]bool {
+// during Phase 2 cleanup. If multiReg is non-nil, suspended multi-instance
+// templates have their running instance sessions included too.
+func computeSuspendedNames(cfg *config.City, cityName, cityPath string, multiReg ...*multiRegistry) map[string]bool {
 	names := make(map[string]bool)
 	st := cfg.Workspace.SessionTemplate
 
@@ -40,11 +41,27 @@ func computeSuspendedNames(cfg *config.City, cityName, cityPath string) map[stri
 		return names
 	}
 
+	// Extract optional multiReg.
+	var reg *multiRegistry
+	if len(multiReg) > 0 {
+		reg = multiReg[0]
+	}
+
 	// Individually suspended agents.
 	for _, a := range cfg.Agents {
 		if a.Suspended {
 			qn := a.QualifiedName()
 			names[agent.SessionNameFor(cityName, qn, st)] = true
+			// Suspended multi template: mark all its running instances as suspended.
+			if a.IsMulti() && reg != nil {
+				instances, err := reg.instancesForTemplate(qn)
+				if err == nil {
+					for _, mi := range instances {
+						instanceQN := qn + "/" + mi.Name
+						names[agent.SessionNameFor(cityName, instanceQN, st)] = true
+					}
+				}
+			}
 		}
 	}
 	// Agents in suspended rigs.
@@ -397,6 +414,20 @@ func doStart(args []string, controllerMode bool, stdout, stderr io.Writer) int {
 
 	sp := newSessionProvider()
 
+	// Open multi registry if any agent is marked multi = true.
+	var multiReg *multiRegistry
+	for _, a := range cfg.Agents {
+		if a.IsMulti() {
+			store, code := openCityStore(stderr, "gc start")
+			if code != 0 {
+				fmt.Fprintln(stderr, "gc start: cannot open city store for multi agents") //nolint:errcheck // best-effort stderr
+			} else {
+				multiReg = newMultiRegistry(store)
+			}
+			break
+		}
+	}
+
 	// beaconTime is captured once so the beacon timestamp remains stable
 	// across reconcile ticks. Without this, FormatBeacon(time.Now()) would
 	// produce a different command string each tick, causing
@@ -435,6 +466,34 @@ func doStart(args []string, controllerMode bool, stdout, stderr io.Writer) int {
 		for i := range c.Agents {
 			if c.Agents[i].Suspended {
 				continue // Suspended agent — skip until resumed.
+			}
+
+			// Multi-instance template: build an agent for each running instance.
+			if c.Agents[i].IsMulti() {
+				if multiReg != nil {
+					instances, mErr := multiReg.instancesForTemplate(c.Agents[i].QualifiedName())
+					if mErr != nil {
+						fmt.Fprintf(stderr, "gc start: multi %q: %v (skipping)\n", c.Agents[i].QualifiedName(), mErr) //nolint:errcheck // best-effort stderr
+						continue
+					}
+					for _, mi := range instances {
+						if mi.State != "running" {
+							continue
+						}
+						instanceAgent := deepCopyAgent(&c.Agents[i], mi.Name, c.Agents[i].Dir)
+						instanceAgent.Multi = false
+						instanceAgent.PoolName = c.Agents[i].QualifiedName()
+						instanceQN := c.Agents[i].QualifiedName() + "/" + mi.Name
+						fpExtra := buildFingerprintExtra(&instanceAgent)
+						a, bErr := buildOneAgent(bp, &instanceAgent, instanceQN, fpExtra)
+						if bErr != nil {
+							fmt.Fprintf(stderr, "gc start: multi instance %q: %v (skipping)\n", instanceQN, bErr) //nolint:errcheck // best-effort stderr
+							continue
+						}
+						agents = append(agents, a)
+					}
+				}
+				continue // Template itself never runs.
 			}
 
 			pool := c.Agents[i].EffectivePool()
@@ -565,7 +624,7 @@ func doStart(args []string, controllerMode bool, stdout, stderr io.Writer) int {
 	runPoolOnBoot(cfg, cityPath, shellScaleCheck, stderr)
 	agents := buildAgents(cfg, sp)
 	rops := newReconcileOps(sp)
-	suspendedNames := computeSuspendedNames(cfg, cityName, cityPath)
+	suspendedNames := computeSuspendedNames(cfg, cityName, cityPath, multiReg)
 	code := doReconcileAgents(agents, sp, rops, nil, nil, nil, recorder, nil, suspendedNames, 0, cfg.Session.StartupTimeoutDuration(), stdout, stderr, sigCtx)
 	ensureObservers(agents, observeSearchPaths(cfg.Daemon.ObservePaths), recorder)
 	if code == 0 {

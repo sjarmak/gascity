@@ -66,6 +66,8 @@ type AgentPatch struct {
 	InjectFragments []string `toml:"inject_fragments,omitempty"`
 	// Attach overrides the agent's attach setting.
 	Attach *bool `toml:"attach,omitempty"`
+	// Multi overrides the agent's multi-instance template flag.
+	Multi *bool `toml:"multi,omitempty"`
 	// PreStartAppend appends commands to the agent's pre_start list
 	// (instead of replacing). Applied after PreStart if both are set.
 	PreStartAppend []string `toml:"pre_start_append,omitempty"`
@@ -233,6 +235,9 @@ func applyAgentPatchFields(a *Agent, p *AgentPatch) {
 	}
 	if p.Attach != nil {
 		a.Attach = p.Attach
+	}
+	if p.Multi != nil {
+		a.Multi = *p.Multi
 	}
 	if len(p.InjectFragments) > 0 {
 		a.InjectFragments = append([]string(nil), p.InjectFragments...)

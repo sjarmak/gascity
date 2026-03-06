@@ -1580,6 +1580,28 @@ func TestValidateAgentsPoolMaxZeroIsValid(t *testing.T) {
 	}
 }
 
+func TestValidateAgentsMultiPoolMutualExclusion(t *testing.T) {
+	agents := []Agent{
+		{Name: "worker", Multi: true, Pool: &PoolConfig{Min: 0, Max: 5}},
+	}
+	err := ValidateAgents(agents)
+	if err == nil {
+		t.Fatal("expected error for multi + pool")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("expected mutually exclusive error, got: %v", err)
+	}
+}
+
+func TestValidateAgentsMultiAloneIsValid(t *testing.T) {
+	agents := []Agent{
+		{Name: "researcher", Multi: true},
+	}
+	if err := ValidateAgents(agents); err != nil {
+		t.Errorf("ValidateAgents: unexpected error for multi alone: %v", err)
+	}
+}
+
 func TestValidateAgentsPoolCheckEmptyIsValid(t *testing.T) {
 	// Empty check is valid — EffectivePool() provides a default check command.
 	agents := []Agent{

@@ -21,13 +21,21 @@ import (
 
 // AgentListEntry is the JSON output format for a single agent in "gc agent list --json".
 type AgentListEntry struct {
-	Name          string    `json:"name"`
-	QualifiedName string    `json:"qualified_name"`
-	Dir           string    `json:"dir"`
-	Scope         string    `json:"scope"`
-	Suspended     bool      `json:"suspended"`
-	RigSuspended  bool      `json:"rig_suspended"`
-	Pool          *PoolJSON `json:"pool"`
+	Name          string         `json:"name"`
+	QualifiedName string         `json:"qualified_name"`
+	Dir           string         `json:"dir"`
+	Scope         string         `json:"scope"`
+	Suspended     bool           `json:"suspended"`
+	RigSuspended  bool           `json:"rig_suspended"`
+	Pool          *PoolJSON      `json:"pool"`
+	Multi         bool           `json:"multi,omitempty"`
+	Instances     []InstanceJSON `json:"instances,omitempty"`
+}
+
+// InstanceJSON is the JSON output format for a multi-instance agent.
+type InstanceJSON struct {
+	Name  string `json:"name"`
+	State string `json:"state"`
 }
 
 // loadCityConfig loads the city configuration with full pack expansion.
@@ -80,6 +88,7 @@ func resolveAgentIdentity(cfg *config.City, input, currentRigDir string) (config
 
 // findAgentByQualified looks up an agent by its qualified identity (dir+name).
 // For pool agents with Max > 1, matches {name}-{N} patterns within the same dir.
+// For multi agents, matches {template}/{instance} by checking the registry.
 func findAgentByQualified(cfg *config.City, identity string) (config.Agent, bool) {
 	dir, name := config.ParseQualifiedName(identity)
 	for _, a := range cfg.Agents {
@@ -95,6 +104,29 @@ func findAgentByQualified(cfg *config.City, identity string) (config.Agent, bool
 					instance := a
 					instance.Name = name
 					instance.Pool = nil // instances are not pools
+					return instance, true
+				}
+			}
+		}
+	}
+	// Multi: try interpreting as {template}/{instance}.
+	// For city-scoped multi agents: "researcher/spike-1" → template="researcher", instance="spike-1".
+	// For rig-scoped: "rig/researcher/spike-1" → template="rig/researcher", instance="spike-1".
+	if strings.Contains(identity, "/") {
+		// Try all multi agents to see if the identity starts with their QN.
+		for _, a := range cfg.Agents {
+			if !a.IsMulti() {
+				continue
+			}
+			templateQN := a.QualifiedName()
+			prefix := templateQN + "/"
+			if strings.HasPrefix(identity, prefix) {
+				instanceName := identity[len(prefix):]
+				if instanceName != "" {
+					instance := a
+					instance.Name = instanceName
+					instance.Multi = false
+					instance.PoolName = templateQN
 					return instance, true
 				}
 			}
@@ -134,7 +166,7 @@ scaled by demand).`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			if len(args) == 0 {
-				fmt.Fprintln(stderr, "gc agent: missing subcommand (add, attach, drain, drain-ack, drain-check, kill, list, nudge, peek, request-restart, resume, status, suspend, undrain)") //nolint:errcheck // best-effort stderr
+				fmt.Fprintln(stderr, "gc agent: missing subcommand (add, attach, destroy, drain, drain-ack, drain-check, kill, list, nudge, peek, request-restart, resume, start, status, stop, suspend, undrain)") //nolint:errcheck // best-effort stderr
 			} else {
 				fmt.Fprintf(stderr, "gc agent: unknown subcommand %q\n", args[0]) //nolint:errcheck // best-effort stderr
 			}
@@ -144,6 +176,7 @@ scaled by demand).`,
 	cmd.AddCommand(
 		newAgentAddCmd(stdout, stderr),
 		newAgentAttachCmd(stdout, stderr),
+		newAgentDestroyCmd(stdout, stderr),
 		newAgentDrainCmd(stdout, stderr),
 		newAgentDrainAckCmd(stdout, stderr),
 		newAgentDrainCheckCmd(stdout, stderr),
@@ -153,7 +186,9 @@ scaled by demand).`,
 		newAgentPeekCmd(stdout, stderr),
 		newAgentRequestRestartCmd(stdout, stderr),
 		newAgentResumeCmd(stdout, stderr),
+		newAgentStartCmd(stdout, stderr),
 		newAgentStatusCmd(stdout, stderr),
+		newAgentStopCmd(stdout, stderr),
 		newAgentSuspendCmd(stdout, stderr),
 		newAgentUndrainCmd(stdout, stderr),
 	)
@@ -729,7 +764,7 @@ func doAgentListJSON(fs fsys.FS, cityPath, dirFilter string, stdout, stderr io.W
 		if a.Pool != nil {
 			pool = &PoolJSON{Min: a.Pool.Min, Max: a.Pool.Max}
 		}
-		entries = append(entries, AgentListEntry{
+		entry := AgentListEntry{
 			Name:          a.Name,
 			QualifiedName: a.QualifiedName(),
 			Dir:           a.Dir,
@@ -737,7 +772,24 @@ func doAgentListJSON(fs fsys.FS, cityPath, dirFilter string, stdout, stderr io.W
 			Suspended:     a.Suspended,
 			RigSuspended:  rigSuspended,
 			Pool:          pool,
-		})
+			Multi:         a.IsMulti(),
+		}
+		if a.IsMulti() {
+			store, code := openCityStore(stderr, "gc agent list")
+			if code == 0 {
+				reg := newMultiRegistry(store)
+				instances, iErr := reg.instancesForTemplate(a.QualifiedName())
+				if iErr == nil {
+					for _, mi := range instances {
+						entry.Instances = append(entry.Instances, InstanceJSON{
+							Name:  mi.Name,
+							State: mi.State,
+						})
+					}
+				}
+			}
+		}
+		entries = append(entries, entry)
 	}
 
 	data, err := json.MarshalIndent(entries, "", "  ")
@@ -869,10 +921,26 @@ func doAgentList(fs fsys.FS, cityPath, dirFilter string, stdout, stderr io.Write
 		if a.Pool != nil {
 			annotations = append(annotations, fmt.Sprintf("pool: min=%d, max=%d", a.Pool.Min, a.Pool.Max))
 		}
+		if a.IsMulti() {
+			annotations = append(annotations, "multi")
+		}
 		if len(annotations) > 0 {
 			fmt.Fprintf(stdout, "  %s  (%s)\n", displayName, strings.Join(annotations, ", ")) //nolint:errcheck // best-effort stdout
 		} else {
 			fmt.Fprintf(stdout, "  %s\n", displayName) //nolint:errcheck // best-effort stdout
+		}
+		// Print multi instances if available.
+		if a.IsMulti() {
+			store, code := openCityStore(stderr, "gc agent list")
+			if code == 0 {
+				reg := newMultiRegistry(store)
+				instances, iErr := reg.instancesForTemplate(a.QualifiedName())
+				if iErr == nil {
+					for _, mi := range instances {
+						fmt.Fprintf(stdout, "    %s/%s  %s\n", a.QualifiedName(), mi.Name, mi.State) //nolint:errcheck // best-effort stdout
+					}
+				}
+			}
 		}
 	}
 	return 0

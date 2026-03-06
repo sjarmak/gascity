@@ -65,6 +65,7 @@ gc agent
 |------------|-------------|
 | [gc agent add](#gc-agent-add) | Add an agent to the workspace |
 | [gc agent attach](#gc-agent-attach) | Attach to an agent session |
+| [gc agent destroy](#gc-agent-destroy) | Destroy a stopped multi-instance agent |
 | [gc agent drain](#gc-agent-drain) | Signal an agent to drain (wind down gracefully) |
 | [gc agent drain-ack](#gc-agent-drain-ack) | Acknowledge drain — signal the controller to stop this session |
 | [gc agent drain-check](#gc-agent-drain-check) | Check if this agent is draining (exit 0 = draining) |
@@ -74,7 +75,9 @@ gc agent
 | [gc agent peek](#gc-agent-peek) | Capture recent output from an agent session |
 | [gc agent request-restart](#gc-agent-request-restart) | Request controller restart this session (blocks until killed) |
 | [gc agent resume](#gc-agent-resume) | Resume a suspended agent |
+| [gc agent start](#gc-agent-start) | Start a multi-instance agent |
 | [gc agent status](#gc-agent-status) | Show agent status |
+| [gc agent stop](#gc-agent-stop) | Stop a multi-instance agent |
 | [gc agent suspend](#gc-agent-suspend) | Suspend an agent (reconciler will skip it) |
 | [gc agent undrain](#gc-agent-undrain) | Cancel drain on an agent |
 
@@ -115,6 +118,16 @@ both fixed agents and pool instances (e.g. "polecat-2").
 
 ```
 gc agent attach <name>
+```
+
+## gc agent destroy
+
+Permanently remove a stopped multi-instance agent by closing its bead.
+
+The instance must be stopped first. Use "gc agent stop" before destroying.
+
+```
+gc agent destroy <template/instance>
 ```
 
 ## gc agent drain
@@ -238,12 +251,39 @@ names (resolved via rig context) and qualified names (e.g. "myrig/worker").
 gc agent resume <name>
 ```
 
+## gc agent start
+
+Start a named instance of a multi-instance agent template.
+
+If --name is not provided, a sequential name is auto-generated.
+Starting a stopped instance resumes it (no new bead is created).
+
+```
+gc agent start <template> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--name` | string |  | instance name (auto-generated if omitted) |
+
 ## gc agent status
 
 Show agent status
 
 ```
 gc agent status <name>
+```
+
+## gc agent stop
+
+Stop a running multi-instance agent.
+
+The session is killed and the instance bead is marked stopped.
+Use "gc agent start" to resume it later, or "gc agent destroy" to
+permanently remove it.
+
+```
+gc agent stop <template/instance>
 ```
 
 ## gc agent suspend

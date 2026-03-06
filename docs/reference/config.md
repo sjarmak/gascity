@@ -73,6 +73,7 @@ Agent defines a configured agent in the city.
 | `inject_fragments` | []string |  |  | InjectFragments lists named template fragments to append to this agent's rendered prompt. Fragments come from shared template directories across all loaded packs. Each name must match a {{ define "name" }} block. |
 | `attach` | boolean |  |  | Attach controls whether the agent's session supports interactive attachment (e.g., tmux attach). When false, the agent can use a lighter runtime (subprocess instead of tmux). Defaults to true. |
 | `fallback` | boolean |  |  | Fallback marks this agent as a fallback definition. During pack composition, a non-fallback agent with the same name wins silently. When two fallbacks collide, the first loaded (depth-first) wins. |
+| `multi` | boolean |  |  | Multi marks this agent as a multi-instance template. Users manually start/stop named instances via "gc agent start/stop/destroy". Unlike pools (declarative auto-scaling), multi is imperative. Multi and pool are mutually exclusive. |
 
 ## AgentOverride
 
@@ -106,6 +107,7 @@ AgentOverride modifies a pack-stamped agent for a specific rig.
 | `session_live_append` | []string |  |  | SessionLiveAppend appends commands to the agent's session_live list. |
 | `install_agent_hooks_append` | []string |  |  | InstallAgentHooksAppend appends to the agent's install_agent_hooks list. |
 | `attach` | boolean |  |  | Attach overrides the agent's attach setting. |
+| `multi` | boolean |  |  | Multi overrides the agent's multi-instance template flag. |
 | `inject_fragments_append` | []string |  |  | InjectFragmentsAppend appends to the agent's inject_fragments list. |
 
 ## AgentPatch
@@ -136,6 +138,7 @@ AgentPatch modifies an existing agent identified by (Dir, Name).
 | `default_sling_formula` | string |  |  | DefaultSlingFormula overrides the default sling formula. |
 | `inject_fragments` | []string |  |  | InjectFragments overrides the agent's inject_fragments list. |
 | `attach` | boolean |  |  | Attach overrides the agent's attach setting. |
+| `multi` | boolean |  |  | Multi overrides the agent's multi-instance template flag. |
 | `pre_start_append` | []string |  |  | PreStartAppend appends commands to the agent's pre_start list (instead of replacing). Applied after PreStart if both are set. |
 | `session_setup_append` | []string |  |  | SessionSetupAppend appends commands to the agent's session_setup list. |
 | `session_live_append` | []string |  |  | SessionLiveAppend appends commands to the agent's session_live list. |

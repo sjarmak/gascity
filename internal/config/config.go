@@ -203,6 +203,8 @@ type AgentOverride struct {
 	InstallAgentHooksAppend []string `toml:"install_agent_hooks_append,omitempty"`
 	// Attach overrides the agent's attach setting.
 	Attach *bool `toml:"attach,omitempty"`
+	// Multi overrides the agent's multi-instance template flag.
+	Multi *bool `toml:"multi,omitempty"`
 	// InjectFragmentsAppend appends to the agent's inject_fragments list.
 	InjectFragmentsAppend []string `toml:"inject_fragments_append,omitempty"`
 }
@@ -940,6 +942,11 @@ type Agent struct {
 	// composition, a non-fallback agent with the same name wins silently.
 	// When two fallbacks collide, the first loaded (depth-first) wins.
 	Fallback bool `toml:"fallback,omitempty"`
+	// Multi marks this agent as a multi-instance template. Users manually
+	// start/stop named instances via "gc agent start/stop/destroy". Unlike
+	// pools (declarative auto-scaling), multi is imperative. Multi and pool
+	// are mutually exclusive.
+	Multi bool `toml:"multi,omitempty"`
 	// PoolName is the template agent's qualified name, set during pool
 	// expansion. Pool instances use this for label-based work discovery
 	// (e.g., pool:dog) rather than their instance name (e.g., pool:dog-1).
@@ -1040,6 +1047,11 @@ func (a *Agent) IsPool() bool {
 	return a.Pool != nil
 }
 
+// IsMulti reports whether this agent is a multi-instance template.
+func (a *Agent) IsMulti() bool {
+	return a.Multi
+}
+
 // EffectiveOnDeath returns the on_death command for this pool agent.
 // Default: unclaims in_progress beads assigned to this agent.
 func (a *Agent) EffectiveOnDeath() string {
@@ -1128,6 +1140,9 @@ func ValidateAgents(agents []Agent) error {
 		// PromptFlag required when prompt_mode = "flag".
 		if a.PromptMode == "flag" && a.PromptFlag == "" {
 			return fmt.Errorf("agent %q: prompt_flag is required when prompt_mode = \"flag\"", a.QualifiedName())
+		}
+		if a.Multi && a.Pool != nil {
+			return fmt.Errorf("agent %q: multi and pool are mutually exclusive", a.QualifiedName())
 		}
 		if a.Pool != nil {
 			if a.Pool.Min < 0 {

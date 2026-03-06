@@ -637,6 +637,7 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 		InjectFragments:        []string{"frag1"},
 		Attach:                 &trueVal,
 		Fallback:               true,
+		Multi:                  true,
 		PoolName:               "template/name",
 	}
 
