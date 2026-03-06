@@ -210,6 +210,24 @@ func (s *Server) handleMailReply(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, msg)
 }
 
+func (s *Server) handleMailDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	mp, err := s.findMailProviderByID(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	if mp == nil {
+		writeError(w, http.StatusNotFound, "not_found", "message "+id+" not found")
+		return
+	}
+	if err := mp.Delete(id); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
 func (s *Server) handleMailThread(w http.ResponseWriter, r *http.Request) {
 	threadID := r.PathValue("id")
 	rig := r.URL.Query().Get("rig")

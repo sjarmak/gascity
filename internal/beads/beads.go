@@ -30,6 +30,7 @@ type Bead struct {
 
 // UpdateOpts specifies which fields to change. Nil pointers are skipped.
 type UpdateOpts struct {
+	Status       *string // set status (nil = no change)
 	Description  *string
 	ParentID     *string
 	Assignee     *string  // set assignee (nil = no change)

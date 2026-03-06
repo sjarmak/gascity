@@ -370,6 +370,9 @@ func (s *BdStore) Get(id string) (Bead, error) {
 // Update modifies fields of an existing bead via bd update.
 func (s *BdStore) Update(id string, opts UpdateOpts) error {
 	args := []string{"update", "--json", id}
+	if opts.Status != nil {
+		args = append(args, "--status", *opts.Status)
+	}
 	if opts.Description != nil {
 		args = append(args, "--description", *opts.Description)
 	}
