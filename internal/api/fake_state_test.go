@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agent"
+	"github.com/gastownhall/gascity/internal/automations"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
@@ -37,6 +38,7 @@ type fakeState struct {
 	cityPath    string
 	startedAt   time.Time
 	quarantined map[string]bool
+	autos       []automations.Automation
 }
 
 func newFakeState(t *testing.T) *fakeState {
@@ -75,6 +77,7 @@ func (f *fakeState) CityPath() string                        { return f.cityPath
 func (f *fakeState) Version() string                         { return "test" }
 func (f *fakeState) StartedAt() time.Time                    { return f.startedAt }
 func (f *fakeState) IsQuarantined(sessionName string) bool   { return f.quarantined[sessionName] }
+func (f *fakeState) Automations() []automations.Automation   { return f.autos }
 func (f *fakeState) RawConfig() *config.City {
 	if f.rawCfg != nil {
 		return f.rawCfg

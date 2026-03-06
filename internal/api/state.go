@@ -8,6 +8,7 @@ package api
 import (
 	"time"
 
+	"github.com/gastownhall/gascity/internal/automations"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
@@ -56,6 +57,10 @@ type State interface {
 	// IsQuarantined reports whether an agent (by session name) is
 	// currently quarantined due to crash-loop detection.
 	IsQuarantined(sessionName string) bool
+
+	// Automations returns the current set of scanned automations.
+	// Returns nil if automations are not configured.
+	Automations() []automations.Automation
 }
 
 // AgentUpdate holds optional fields for a partial agent update. Pointer fields

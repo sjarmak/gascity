@@ -78,6 +78,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 
 	// City
+	s.mux.HandleFunc("GET /v0/city", s.handleCityGet)
 	s.mux.HandleFunc("PATCH /v0/city", s.handleCityPatch)
 
 	// Agents — read
@@ -159,6 +160,10 @@ func (s *Server) registerRoutes() {
 	// Events
 	s.mux.HandleFunc("GET /v0/events", s.handleEventList)
 	s.mux.HandleFunc("GET /v0/events/stream", s.handleEventStream)
+
+	// Automations
+	s.mux.HandleFunc("GET /v0/automations", s.handleAutomationList)
+	s.mux.HandleFunc("GET /v0/automation/{name}", s.handleAutomationGet)
 
 	// Sling (dispatch)
 	s.mux.HandleFunc("POST /v0/sling", s.handleSling)
