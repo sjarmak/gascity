@@ -45,9 +45,9 @@ func doRegister(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// Verify it's a city directory.
-	if _, sErr := os.Stat(filepath.Join(cityPath, ".gc")); sErr != nil {
-		fmt.Fprintf(stderr, "gc register: %s is not a city directory (no .gc/ found)\n", cityPath) //nolint:errcheck
+	// Verify it's a city directory (city.toml is the defining marker).
+	if _, sErr := os.Stat(filepath.Join(cityPath, "city.toml")); sErr != nil {
+		fmt.Fprintf(stderr, "gc register: %s is not a city directory (no city.toml found)\n", cityPath) //nolint:errcheck
 		return 1
 	}
 

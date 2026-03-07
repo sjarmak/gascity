@@ -279,7 +279,14 @@ func runSupervisor(stdout, stderr io.Writer) int {
 	mcs := &multiCityState{cities: cities, mu: &mu, startedAt: time.Now()}
 	bind := supCfg.Supervisor.BindOrDefault()
 	port := supCfg.Supervisor.PortOrDefault()
-	apiSrv := api.New(mcs)
+	nonLocal := bind != "127.0.0.1" && bind != "localhost" && bind != "::1"
+	var apiSrv *api.Server
+	if nonLocal {
+		apiSrv = api.NewReadOnly(mcs)
+		fmt.Fprintf(stderr, "gc supervisor: binding to %s — mutation endpoints disabled (non-localhost)\n", bind) //nolint:errcheck
+	} else {
+		apiSrv = api.New(mcs)
+	}
 	addr := net.JoinHostPort(bind, strconv.Itoa(port))
 	apiLis, apiErr := net.Listen("tcp", addr)
 	if apiErr != nil {
@@ -379,13 +386,20 @@ func reconcileCities(
 		fmt.Fprintf(stdout, "City '%s' stopped.\n", name) //nolint:errcheck
 	}
 
-	// Start new cities.
+	// Start new cities. Build list of cities to start under lock, then
+	// release lock for I/O-heavy initialization (config loading, bead
+	// lifecycle, formula materialization, etc.).
 	mu.Lock()
-	defer mu.Unlock()
+	var toStart []supervisor.CityEntry
 	for path, entry := range desired {
-		if _, running := cities[path]; running {
-			continue
+		if _, running := cities[path]; !running {
+			toStart = append(toStart, entry)
 		}
+	}
+	mu.Unlock()
+
+	for _, entry := range toStart {
+		path := entry.Path
 		name := entry.Name()
 
 		// Load city config.
@@ -401,6 +415,12 @@ func reconcileCities(
 			cityName = filepath.Base(path)
 		}
 
+		// Run critical city initialization (same steps as cmd_start.go).
+		if err := prepareCityForSupervisor(path, cityName, cfg, stderr); err != nil {
+			fmt.Fprintf(stderr, "gc supervisor: city '%s': init: %v (skipping)\n", cityName, err) //nolint:errcheck
+			continue
+		}
+
 		// Warn if city has its own API port.
 		if cfg.API.Port > 0 {
 			fmt.Fprintf(stderr, "gc supervisor: city '%s' has [api] port=%d which is ignored under supervisor mode\n", //nolint:errcheck
@@ -410,14 +430,15 @@ func reconcileCities(
 		sp, spErr := newSessionProviderByName(
 			effectiveProviderName(cfg.Session.Provider), cfg.Session, cityName)
 		if spErr != nil {
-			fmt.Fprintf(stderr, "gc supervisor: city '%s': session provider: %v (skipping)\n", name, spErr) //nolint:errcheck
+			fmt.Fprintf(stderr, "gc supervisor: city '%s': session provider: %v (skipping)\n", cityName, spErr) //nolint:errcheck
 			continue
 		}
 
 		rec := events.Discard
 		var eventProv events.Provider
 		evPath := filepath.Join(path, ".gc", "events.jsonl")
-		if fr, frErr := events.NewFileRecorder(evPath, stderr); frErr == nil {
+		fr, frErr := events.NewFileRecorder(evPath, stderr)
+		if frErr == nil {
 			rec = fr
 			eventProv = fr
 		}
@@ -448,6 +469,9 @@ func reconcileCities(
 		cs.ct = cr.crashTrack()
 		cr.setControllerState(cs)
 
+		// Run pool on_boot hooks (same as runController does).
+		runPoolOnBoot(cfg, path, shellScaleCheck, stderr)
+
 		cityCtx, cityCancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
 
@@ -465,10 +489,115 @@ func reconcileCities(
 			cr.run(cityCtx)
 		}(cityName, path)
 
+		mu.Lock()
+		// Re-check: another goroutine might have added this city while we
+		// were initializing outside the lock.
+		if _, running := cities[path]; running {
+			mu.Unlock()
+			cityCancel()
+			<-done
+			cr.shutdown()
+			// Close recorder if we opened one.
+			if fr != nil {
+				fr.Close() //nolint:errcheck
+			}
+			continue
+		}
 		cities[path] = &managedCity{cr: cr, cancel: cityCancel, done: done}
+		mu.Unlock()
+
 		rec.Record(events.Event{Type: events.ControllerStarted, Actor: "gc"})
 		fmt.Fprintf(stdout, "Started city '%s' (%s)\n", cityName, path) //nolint:errcheck
 	}
+}
+
+// prepareCityForSupervisor runs the critical city initialization steps
+// that cmd_start.go performs before runController. Without these, cities
+// would have no formulas, no bead stores, and no resolved rig paths.
+func prepareCityForSupervisor(cityPath, cityName string, cfg *config.City, stderr io.Writer) error {
+	// Validate rigs.
+	if err := config.ValidateRigs(cfg.Rigs, cityName); err != nil {
+		return fmt.Errorf("validate rigs: %w", err)
+	}
+
+	// Materialize the gc-beads-bd script.
+	if _, err := MaterializeBeadsBdScript(cityPath); err != nil {
+		fmt.Fprintf(stderr, "gc supervisor: city '%s': materializing gc-beads-bd: %v\n", cityName, err) //nolint:errcheck
+		// Non-fatal.
+	}
+
+	// Materialize builtin packs and inject them.
+	if err := MaterializeBuiltinPacks(cityPath); err != nil {
+		fmt.Fprintf(stderr, "gc supervisor: city '%s': builtin packs: %v\n", cityName, err) //nolint:errcheck
+		// Non-fatal.
+	}
+	injectBuiltinPacks(cfg, cityPath)
+
+	// Materialize builtin prompts and formulas.
+	if err := materializeBuiltinPrompts(cityPath); err != nil {
+		fmt.Fprintf(stderr, "gc supervisor: city '%s': builtin prompts: %v\n", cityName, err) //nolint:errcheck
+	}
+	if err := materializeBuiltinFormulas(cityPath); err != nil {
+		fmt.Fprintf(stderr, "gc supervisor: city '%s': builtin formulas: %v\n", cityName, err) //nolint:errcheck
+	}
+
+	// Resolve rig paths and start bead store lifecycle.
+	resolveRigPaths(cityPath, cfg.Rigs)
+	if err := startBeadsLifecycle(cityPath, cityName, cfg, stderr); err != nil {
+		return fmt.Errorf("beads lifecycle: %w", err)
+	}
+
+	// Post-startup bead provider health check.
+	if err := healthBeadsProvider(cityPath); err != nil {
+		fmt.Fprintf(stderr, "gc supervisor: city '%s': beads health: %v\n", cityName, err) //nolint:errcheck
+		// Non-fatal.
+	}
+
+	// Materialize system formulas and prepend as Layer 0.
+	sysDir, sysErr := MaterializeSystemFormulas(systemFormulasFS, "system_formulas", cityPath)
+	if sysErr != nil {
+		fmt.Fprintf(stderr, "gc supervisor: city '%s': system formulas: %v\n", cityName, sysErr) //nolint:errcheck
+	}
+	if sysDir != "" {
+		cfg.FormulaLayers.City = append([]string{sysDir}, cfg.FormulaLayers.City...)
+		for rigName, layers := range cfg.FormulaLayers.Rigs {
+			cfg.FormulaLayers.Rigs[rigName] = append([]string{sysDir}, layers...)
+		}
+	}
+
+	// Resolve formula symlinks.
+	if len(cfg.FormulaLayers.City) > 0 {
+		if err := ResolveFormulas(cityPath, cfg.FormulaLayers.City); err != nil {
+			fmt.Fprintf(stderr, "gc supervisor: city '%s': city formulas: %v\n", cityName, err) //nolint:errcheck
+		}
+	}
+	for _, r := range cfg.Rigs {
+		if layers, ok := cfg.FormulaLayers.Rigs[r.Name]; ok && len(layers) > 0 {
+			if err := ResolveFormulas(r.Path, layers); err != nil {
+				fmt.Fprintf(stderr, "gc supervisor: city '%s': rig %q formulas: %v\n", cityName, r.Name, err) //nolint:errcheck
+			}
+		}
+	}
+
+	// Materialize Claude skill stubs.
+	if cfg.Workspace.Provider == "claude" {
+		dirs := []string{cityPath}
+		for _, r := range cfg.Rigs {
+			if r.Path != "" {
+				dirs = append(dirs, r.Path)
+			}
+		}
+		if err := materializeSkillStubs(dirs...); err != nil {
+			fmt.Fprintf(stderr, "gc supervisor: city '%s': skill stubs: %v\n", cityName, err) //nolint:errcheck
+		}
+	}
+
+	// Validate agents.
+	if err := config.ValidateAgents(cfg.Agents); err != nil {
+		return fmt.Errorf("validate agents: %w", err)
+	}
+
+	return nil
 }
 
 // effectiveProviderName returns the provider name respecting GC_SESSION env override.
@@ -480,31 +609,105 @@ func effectiveProviderName(configured string) string {
 }
 
 // supervisorBuildAgentsFn returns a buildFn suitable for CityRuntimeParams.
-// This mirrors the buildAgents closure in cmd_start.go but without dynamic
-// pool evaluation (pools use their static min count).
+// This mirrors the buildAgents closure in cmd_start.go, including dynamic
+// pool evaluation via scale_check commands.
 func supervisorBuildAgentsFn(cityPath, cityName string, stderr io.Writer) func(*config.City, session.Provider) []agent.Agent {
 	return func(c *config.City, sp session.Provider) []agent.Agent {
+		if c.Workspace.Suspended {
+			return nil
+		}
 		bp := newAgentBuildParams(cityName, cityPath, c, sp, time.Now(), stderr)
+
+		// Pre-compute suspended rig paths.
+		suspendedRigPaths := make(map[string]bool)
+		for _, r := range c.Rigs {
+			if r.Suspended {
+				suspendedRigPaths[filepath.Clean(r.Path)] = true
+			}
+		}
+
+		type poolEvalWork struct {
+			agentIdx int
+			pool     config.PoolConfig
+			poolDir  string
+		}
+
 		var agents []agent.Agent
+		var pendingPools []poolEvalWork
 		for i := range c.Agents {
 			a := &c.Agents[i]
-			pool := a.EffectivePool()
-			if pool.IsMultiInstance() {
-				pa, err := poolAgents(bp, a, pool.Min)
-				if err != nil {
-					fmt.Fprintf(stderr, "gc supervisor: pool %q: %v (skipping)\n", a.QualifiedName(), err) //nolint:errcheck
-					continue
-				}
-				agents = append(agents, pa...)
+			if a.Suspended {
 				continue
 			}
+			pool := a.EffectivePool()
+			if pool.Max == 0 {
+				continue
+			}
+
+			// Check rig suspension.
+			if a.Dir != "" {
+				if wd, wdErr := resolveAgentDir(cityPath, a.Dir); wdErr == nil {
+					if suspendedRigPaths[filepath.Clean(wd)] {
+						continue
+					}
+				}
+			}
+
+			if pool.IsMultiInstance() {
+				// Pool agent — collect for parallel scale_check evaluation.
+				poolDir := cityPath
+				if a.Dir != "" {
+					if pd, pdErr := resolveAgentDir(cityPath, a.Dir); pdErr == nil {
+						poolDir = pd
+					}
+				}
+				pendingPools = append(pendingPools, poolEvalWork{agentIdx: i, pool: pool, poolDir: poolDir})
+				continue
+			}
+
 			qualifiedName := a.QualifiedName()
-			built, err := buildOneAgent(bp, a, qualifiedName, nil)
+			fpExtra := buildFingerprintExtra(a)
+			built, err := buildOneAgent(bp, a, qualifiedName, fpExtra)
 			if err != nil {
 				fmt.Fprintf(stderr, "gc supervisor: agent %q: %v (skipping)\n", qualifiedName, err) //nolint:errcheck
 				continue
 			}
 			agents = append(agents, built)
+		}
+
+		// Evaluate pool scale_check commands in parallel.
+		type poolEvalResult struct {
+			desired int
+			err     error
+		}
+		evalResults := make([]poolEvalResult, len(pendingPools))
+		var wg sync.WaitGroup
+		for j, pw := range pendingPools {
+			wg.Add(1)
+			go func(idx int, name string, pool config.PoolConfig, dir string) {
+				defer wg.Done()
+				desired, err := evaluatePool(name, pool, dir, shellScaleCheck)
+				evalResults[idx] = poolEvalResult{desired: desired, err: err}
+			}(j, c.Agents[pw.agentIdx].Name, pw.pool, pw.poolDir)
+		}
+		wg.Wait()
+
+		for j, pw := range pendingPools {
+			pr := evalResults[j]
+			if pr.err != nil {
+				fmt.Fprintf(stderr, "gc supervisor: %v (using min=%d)\n", pr.err, pw.pool.Min) //nolint:errcheck
+			}
+			running := countRunningPoolInstances(c.Agents[pw.agentIdx].Name, c.Agents[pw.agentIdx].Dir, pw.pool, cityName, c.Workspace.SessionTemplate, sp)
+			if pr.desired != running {
+				fmt.Fprintf(stderr, "gc supervisor: pool '%s': check returned %d, %d running → scaling %s\n", //nolint:errcheck
+					c.Agents[pw.agentIdx].Name, pr.desired, running, scaleDirection(running, pr.desired))
+			}
+			pa, err := poolAgents(bp, &c.Agents[pw.agentIdx], pr.desired)
+			if err != nil {
+				fmt.Fprintf(stderr, "gc supervisor: pool %q: %v (skipping)\n", c.Agents[pw.agentIdx].QualifiedName(), err) //nolint:errcheck
+				continue
+			}
+			agents = append(agents, pa...)
 		}
 		return agents
 	}
@@ -554,42 +757,43 @@ func (m *multiCityState) SessionProvider() session.Provider {
 	if cs := m.firstCity(); cs != nil {
 		return cs.SessionProvider()
 	}
-	return nil
+	// Return a no-op fake so API handlers don't nil-panic when zero cities are running.
+	return &session.Fake{}
 }
 
 func (m *multiCityState) BeadStore(rig string) beads.Store {
 	if cs := m.firstCity(); cs != nil {
 		return cs.BeadStore(rig)
 	}
-	return nil
+	return nil // API handlers check for nil bead stores.
 }
 
 func (m *multiCityState) BeadStores() map[string]beads.Store {
 	if cs := m.firstCity(); cs != nil {
 		return cs.BeadStores()
 	}
-	return nil
+	return map[string]beads.Store{}
 }
 
 func (m *multiCityState) MailProvider(rig string) mail.Provider {
 	if cs := m.firstCity(); cs != nil {
 		return cs.MailProvider(rig)
 	}
-	return nil
+	return nil // API handlers check for nil mail providers.
 }
 
 func (m *multiCityState) MailProviders() map[string]mail.Provider {
 	if cs := m.firstCity(); cs != nil {
 		return cs.MailProviders()
 	}
-	return nil
+	return map[string]mail.Provider{}
 }
 
 func (m *multiCityState) EventProvider() events.Provider {
 	if cs := m.firstCity(); cs != nil {
 		return cs.EventProvider()
 	}
-	return nil
+	return nil // API handlers check for nil event providers.
 }
 
 func (m *multiCityState) CityName() string {

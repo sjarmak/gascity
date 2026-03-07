@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 
 	"github.com/BurntSushi/toml"
 )
@@ -54,7 +55,7 @@ func (r *Registry) List() ([]CityEntry, error) {
 // Register adds a city to the registry. The path is resolved to an
 // absolute path. Returns an error if the city is already registered
 // (by path) or if a different city with the same directory basename
-// is already registered.
+// is already registered. Uses file-level locking for cross-process safety.
 func (r *Registry) Register(cityPath string) error {
 	abs, err := filepath.Abs(cityPath)
 	if err != nil {
@@ -63,6 +64,12 @@ func (r *Registry) Register(cityPath string) error {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	unlock, err := r.fileLock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	entries, err := r.loadLocked()
 	if err != nil {
@@ -85,7 +92,7 @@ func (r *Registry) Register(cityPath string) error {
 
 // Unregister removes a city from the registry by path. Returns an
 // error if the city is not registered. The path is resolved to
-// absolute before comparison.
+// absolute before comparison. Uses file-level locking for cross-process safety.
 func (r *Registry) Unregister(cityPath string) error {
 	abs, err := filepath.Abs(cityPath)
 	if err != nil {
@@ -94,6 +101,12 @@ func (r *Registry) Unregister(cityPath string) error {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	unlock, err := r.fileLock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	entries, err := r.loadLocked()
 	if err != nil {
@@ -129,6 +142,28 @@ func (r *Registry) loadLocked() ([]CityEntry, error) {
 		return nil, fmt.Errorf("parsing registry: %w", err)
 	}
 	return rf.Cities, nil
+}
+
+// fileLock acquires an exclusive flock on a sibling .lock file for
+// cross-process safety during read-modify-write operations. Returns
+// an unlock function. Caller must hold r.mu.Lock.
+func (r *Registry) fileLock() (func(), error) {
+	lockPath := r.path + ".lock"
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		return nil, fmt.Errorf("creating lock dir: %w", err)
+	}
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("opening registry lock: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close() //nolint:errcheck
+		return nil, fmt.Errorf("acquiring registry lock: %w", err)
+	}
+	return func() {
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
+		f.Close()                                   //nolint:errcheck
+	}, nil
 }
 
 // saveLocked writes the registry file atomically. Caller must hold r.mu.Lock.

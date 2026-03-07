@@ -13,7 +13,10 @@ import (
 func TestDoRegister(t *testing.T) {
 	dir := t.TempDir()
 	cityPath := filepath.Join(dir, "my-city")
-	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+	if err := os.MkdirAll(cityPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("GC_HOME", dir)
@@ -59,7 +62,10 @@ func TestDoRegisterNotCity(t *testing.T) {
 func TestDoUnregister(t *testing.T) {
 	dir := t.TempDir()
 	cityPath := filepath.Join(dir, "my-city")
-	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+	if err := os.MkdirAll(cityPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("GC_HOME", dir)
@@ -101,7 +107,10 @@ func TestDoCities(t *testing.T) {
 
 	// Register a city and list again.
 	cityPath := filepath.Join(dir, "bright-lights")
-	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+	if err := os.MkdirAll(cityPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	reg := supervisor.NewRegistry(supervisor.RegistryPath())
