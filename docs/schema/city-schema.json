@@ -208,10 +208,6 @@
           "type": "boolean",
           "description": "Fallback marks this agent as a fallback definition. During pack\ncomposition, a non-fallback agent with the same name wins silently.\nWhen two fallbacks collide, the first loaded (depth-first) wins."
         },
-        "multi": {
-          "type": "boolean",
-          "description": "Multi is deprecated and no longer supported. Templates are session-\nspawnable by default, so old configs that still set this field fail\nvalidation with a migration hint. Manual-only templates should use\npool.max = 0 instead."
-        },
         "depends_on": {
           "items": {
             "type": "string"
@@ -411,10 +407,6 @@
           "type": "boolean",
           "description": "Attach overrides the agent's attach setting."
         },
-        "multi": {
-          "type": "boolean",
-          "description": "Multi is deprecated. It remains parseable so old configs fail loudly."
-        },
         "depends_on": {
           "items": {
             "type": "string"
@@ -559,10 +551,6 @@
         "attach": {
           "type": "boolean",
           "description": "Attach overrides the agent's attach setting."
-        },
-        "multi": {
-          "type": "boolean",
-          "description": "Multi is deprecated. It remains parseable so old patches fail loudly."
         },
         "depends_on": {
           "items": {

@@ -68,8 +68,6 @@ type AgentPatch struct {
 	InjectFragments []string `toml:"inject_fragments,omitempty"`
 	// Attach overrides the agent's attach setting.
 	Attach *bool `toml:"attach,omitempty"`
-	// Multi is deprecated. It remains parseable so old patches fail loudly.
-	Multi *bool `toml:"multi,omitempty"`
 	// DependsOn overrides the agent's dependency list.
 	DependsOn []string `toml:"depends_on,omitempty"`
 	// WakeMode overrides the agent's wake mode ("resume" or "fresh").
@@ -244,9 +242,6 @@ func applyAgentPatchFields(a *Agent, p *AgentPatch) {
 	}
 	if p.Attach != nil {
 		a.Attach = p.Attach
-	}
-	if p.Multi != nil {
-		a.Multi = *p.Multi
 	}
 	// TODO: depends_on = [] cannot clear inherited deps (len check skips
 	// empty lists). This matches the existing pattern for all list fields

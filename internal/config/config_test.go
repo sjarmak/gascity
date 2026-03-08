@@ -1580,19 +1580,6 @@ func TestValidateAgentsPoolMaxZeroIsValid(t *testing.T) {
 	}
 }
 
-func TestValidateAgentsMultiIsRejected(t *testing.T) {
-	agents := []Agent{
-		{Name: "worker", Multi: true},
-	}
-	err := ValidateAgents(agents)
-	if err == nil {
-		t.Fatal("expected error for deprecated multi")
-	}
-	if !strings.Contains(err.Error(), "pool.max = 0") {
-		t.Errorf("expected deprecation error, got: %v", err)
-	}
-}
-
 func TestValidateAgentsPoolCheckEmptyIsValid(t *testing.T) {
 	// Empty check is valid — EffectivePool() provides a default check command.
 	agents := []Agent{

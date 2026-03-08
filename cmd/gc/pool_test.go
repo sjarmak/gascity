@@ -384,7 +384,6 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 		InjectFragments:        []string{"frag1"},
 		Attach:                 &trueVal,
 		Fallback:               true,
-		Multi:                  true,
 		PoolName:               "template/name",
 		DependsOn:              []string{"other-agent"},
 		WakeMode:               "fresh",
@@ -413,7 +412,7 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 	dv := reflect.ValueOf(dst)
 	for i := 0; i < st.NumField(); i++ {
 		fname := st.Field(i).Name
-		if fname == "Name" || fname == "Dir" || fname == "Multi" {
+		if fname == "Name" || fname == "Dir" {
 			continue // Intentionally overridden.
 		}
 		if dv.Field(i).IsZero() {

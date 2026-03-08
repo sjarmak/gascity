@@ -293,7 +293,7 @@ gc agent resume <name>
 Create a detached session from an agent template.
 
 This is a compatibility alias for "gc session new <template> --no-attach".
-Templates no longer need "multi = true" to support multiple sessions.
+Templates can always be used as session sources.
 
 ```
 gc agent start <template> [flags]

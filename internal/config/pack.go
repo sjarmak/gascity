@@ -854,9 +854,6 @@ func applyAgentOverride(a *Agent, ov *AgentOverride) {
 	if ov.Attach != nil {
 		a.Attach = ov.Attach
 	}
-	if ov.Multi != nil {
-		a.Multi = *ov.Multi
-	}
 	if len(ov.DependsOn) > 0 {
 		a.DependsOn = append([]string(nil), ov.DependsOn...)
 	}

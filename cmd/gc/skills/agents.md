@@ -29,10 +29,7 @@ gc agent claim <name> <bead-id>        # Put a bead on agent's hook
 
 ## Sessions from templates
 
-Every configured template can now spawn sessions directly. You do not
-need `multi = true`, and that config field is rejected if present.
-If a former multi template should remain manual-only, set `pool.max = 0`
-so `gc start` does not auto-start it as a fixed agent.
+Every configured template can now spawn sessions directly.
 
 Use the session commands directly:
 
