@@ -440,6 +440,84 @@ func TestAdvanceSessionDrains_ConfigDriftNotCancelable(t *testing.T) {
 	}
 }
 
+func TestAdvanceSessionDrains_TimeoutTokenMismatch(t *testing.T) {
+	now := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	sp := runtime.NewFake()
+	store := beads.NewMemStore()
+	dt := newDrainTracker()
+
+	// Session is running with a different token (re-woken by different incarnation).
+	_ = sp.Start(context.Background(), "test-session", runtime.Config{})
+	_ = sp.SetMeta("test-session", "GC_INSTANCE_TOKEN", "new-token")
+
+	b, _ := store.Create(beads.Bead{
+		Title: "test",
+		Metadata: map[string]string{
+			"session_name":   "test-session",
+			"template":       "worker",
+			"generation":     "3",
+			"instance_token": "old-token", // stale token
+		},
+	})
+
+	// Drain deadline already passed.
+	dt.set(b.ID, &drainState{
+		startedAt:  now.Add(-60 * time.Second),
+		deadline:   now.Add(-10 * time.Second),
+		reason:     "pool-excess",
+		generation: 3,
+	})
+
+	cfg := &config.City{}
+
+	advanceSessionDrains(dt, sp, store, func(id string) *beads.Bead {
+		got, _ := store.Get(id)
+		return &got
+	}, cfg, map[string]int{}, clk)
+
+	// Drain should be canceled (stale token), session still running.
+	if dt.get(b.ID) != nil {
+		t.Error("drain should be removed after token mismatch")
+	}
+	if !sp.IsRunning("test-session") {
+		t.Error("session should still be running after token mismatch")
+	}
+	// Metadata should NOT be updated to asleep.
+	got, _ := store.Get(b.ID)
+	if got.Metadata["state"] == "asleep" {
+		t.Error("state should not be asleep after failed stop")
+	}
+}
+
+func TestCompleteDrain_ClearsLastWokeAt(t *testing.T) {
+	now := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	store := beads.NewMemStore()
+
+	b, _ := store.Create(beads.Bead{
+		Title: "test",
+		Metadata: map[string]string{
+			"session_name": "test-session",
+			"last_woke_at": now.Add(-10 * time.Second).UTC().Format(time.RFC3339),
+		},
+	})
+
+	ds := &drainState{reason: "idle"}
+	completeDrain(&b, store, ds, clk)
+
+	got, _ := store.Get(b.ID)
+	if got.Metadata["last_woke_at"] != "" {
+		t.Errorf("last_woke_at should be cleared after drain, got %q", got.Metadata["last_woke_at"])
+	}
+	if got.Metadata["state"] != "asleep" {
+		t.Errorf("state = %q, want asleep", got.Metadata["state"])
+	}
+	if got.Metadata["sleep_reason"] != "idle" {
+		t.Errorf("sleep_reason = %q, want idle", got.Metadata["sleep_reason"])
+	}
+}
+
 func TestNeedsConfigRestart(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{

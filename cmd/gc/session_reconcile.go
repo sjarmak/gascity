@@ -55,8 +55,10 @@ func wakeReasons(
 	}
 
 	// WakeAttached: check if user terminal is connected.
-	// Only if provider supports attachment detection.
-	if sp != nil && sp.Capabilities().CanReportAttachment {
+	// No provider-level gate — composite providers (auto/hybrid) route
+	// IsAttached per-session to the correct backend, which returns false
+	// safely for backends that don't support attachment detection.
+	if sp != nil {
 		name := session.Metadata["session_name"]
 		if name != "" && sp.IsAttached(name) {
 			reasons = append(reasons, WakeAttached)
@@ -153,6 +155,9 @@ func recordWakeFailure(session beads.Bead, store beads.Store, clk clock.Clock) {
 	attempts, _ := strconv.Atoi(session.Metadata["wake_attempts"])
 	attempts++
 
+	if session.Metadata == nil {
+		session.Metadata = make(map[string]string)
+	}
 	if attempts >= defaultMaxWakeAttempts {
 		qUntil := clk.Now().Add(defaultQuarantineDuration).UTC().Format(time.RFC3339)
 		batch := map[string]string{
@@ -173,10 +178,18 @@ func recordWakeFailure(session beads.Bead, store beads.Store, clk clock.Clock) {
 
 // clearWakeFailures resets crash counter and quarantine for a stable session.
 func clearWakeFailures(session beads.Bead, store beads.Store) {
-	_ = store.SetMetadata(session.ID, "wake_attempts", "0")
-	session.Metadata["wake_attempts"] = "0"
-	_ = store.SetMetadata(session.ID, "quarantined_until", "")
-	session.Metadata["quarantined_until"] = ""
+	batch := map[string]string{
+		"wake_attempts":     "0",
+		"quarantined_until": "",
+	}
+	if err := store.SetMetadataBatch(session.ID, batch); err == nil {
+		if session.Metadata == nil {
+			session.Metadata = make(map[string]string)
+		}
+		for k, v := range batch {
+			session.Metadata[k] = v
+		}
+	}
 }
 
 // stableLongEnough returns true if the session has been alive past stabilityThreshold.
@@ -229,6 +242,9 @@ func healState(session beads.Bead, alive bool, store beads.Store) {
 	target := "asleep"
 	if alive {
 		target = "awake"
+	}
+	if session.Metadata == nil {
+		session.Metadata = make(map[string]string)
 	}
 	if session.Metadata["state"] != target {
 		_ = store.SetMetadata(session.ID, "state", target)

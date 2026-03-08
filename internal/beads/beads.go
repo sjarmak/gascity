@@ -118,8 +118,11 @@ type Store interface {
 	// ErrNotFound if the bead does not exist.
 	SetMetadata(id, key, value string) error
 
-	// SetMetadataBatch atomically sets multiple key-value metadata pairs
-	// on a bead. On failure, no visible change occurs (all-or-nothing).
+	// SetMetadataBatch sets multiple key-value metadata pairs on a bead.
+	// In-memory stores (MemStore, FileStore) apply all writes atomically.
+	// External stores (BdStore, exec) apply writes sequentially; partial
+	// application is possible on mid-batch failure. Callers should design
+	// batch contents to be idempotent and tolerate partial writes.
 	// Returns ErrNotFound if the bead does not exist.
 	SetMetadataBatch(id string, kvs map[string]string) error
 

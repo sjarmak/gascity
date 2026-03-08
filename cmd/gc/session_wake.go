@@ -40,6 +40,9 @@ func preWakeCommit(
 		return 0, "", fmt.Errorf("pre-wake metadata commit: %w", err)
 	}
 	// Update in-memory snapshot.
+	if session.Metadata == nil {
+		session.Metadata = make(map[string]string)
+	}
 	for k, v := range batch {
 		session.Metadata[k] = v
 	}
@@ -153,8 +156,17 @@ func advanceSessionDrains(
 
 		if clk.Now().After(ds.deadline) {
 			// Drain timed out — force stop.
-			_ = verifiedStop(*session, sp)
-			completeDrain(session, store, ds, clk)
+			if err := verifiedStop(*session, sp); err != nil {
+				// Token mismatch means session was re-woken by a different
+				// incarnation — this drain is stale. Cancel it.
+				dt.remove(id)
+				continue
+			}
+			// Re-probe after stop to confirm process actually exited
+			// before marking metadata as asleep.
+			if !sp.IsRunning(name) {
+				completeDrain(session, store, ds, clk)
+			}
 			dt.remove(id)
 		}
 		// Else: still draining, check again next tick.
@@ -167,8 +179,12 @@ func completeDrain(session *beads.Bead, store beads.Store, ds *drainState, clk c
 		"slept_at":     clk.Now().UTC().Format(time.RFC3339),
 		"sleep_reason": ds.reason,
 		"state":        "asleep",
+		"last_woke_at": "", // Clear to prevent false crash detection.
 	}
 	if err := store.SetMetadataBatch(session.ID, batch); err == nil {
+		if session.Metadata == nil {
+			session.Metadata = make(map[string]string)
+		}
 		for k, v := range batch {
 			session.Metadata[k] = v
 		}
