@@ -265,7 +265,7 @@ func TestReconcileSessionBeads_RespectsWakeBudget(t *testing.T) {
 	var cfgAgents []config.Agent
 	var sessions []beads.Bead
 	for i := 0; i < defaultMaxWakesPerTick+3; i++ {
-		name := "worker-" + string(rune('a'+i))
+		name := fmt.Sprintf("worker-%d", i)
 		cfgAgents = append(cfgAgents, config.Agent{Name: name})
 		env.addAgent(name, false)
 		sessions = append(sessions, env.createSessionBead(name, name))
@@ -379,6 +379,85 @@ func TestReconcileSessionBeads_DependencyOrdering_TopoOrder(t *testing.T) {
 	}
 	if !wasStarted(workerAgent) {
 		t.Error("worker should have been started (dep is alive after db.Start)")
+	}
+}
+
+func TestReconcileSessionBeads_PoolDependencyBlocksWake(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", DependsOn: []string{"db"}},
+			{Name: "db", Pool: &config.PoolConfig{Min: 2, Max: 2}},
+		},
+	}
+	// Worker depends on pool "db". No db instances alive → worker blocked.
+	env.addAgent("worker", false)
+	workerBead := env.createSessionBead("worker", "worker")
+
+	woken := env.reconcile([]beads.Bead{workerBead})
+
+	if woken != 0 {
+		t.Errorf("expected 0 woken (pool dep dead), got %d", woken)
+	}
+	workerAgent := env.agentIndex["worker"].(*agent.Fake)
+	if wasStarted(workerAgent) {
+		t.Error("worker should NOT start (pool dependency db has no alive instances)")
+	}
+}
+
+func TestReconcileSessionBeads_PoolDependencyUnblocksWake(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", DependsOn: []string{"db"}},
+			{Name: "db", Pool: &config.PoolConfig{Min: 2, Max: 2}},
+		},
+	}
+	// One db pool instance is alive → unblocks worker.
+	env.addAgent("worker", false)
+	dbAgent := env.addAgent("db-1", true)
+	dbAgent.FakeName = "db-1"
+	dbAgent.FakeSessionName = "db-1"
+	workerBead := env.createSessionBead("worker", "worker")
+
+	woken := env.reconcile([]beads.Bead{workerBead})
+
+	if woken != 1 {
+		t.Errorf("expected 1 woken (pool dep alive), got %d", woken)
+	}
+}
+
+func TestReconcileSessionBeads_OrphanSessionDrained(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "other"}}}
+	// Session bead for "orphan" with no matching agent, but running in provider.
+	_ = env.sp.Start(context.Background(), "orphan", runtime.Config{})
+	session := env.createSessionBead("orphan", "orphan")
+
+	env.reconcile([]beads.Bead{session})
+
+	// Should have initiated a drain for the orphan.
+	ds := env.dt.get(session.ID)
+	if ds == nil {
+		t.Fatal("expected drain for orphan session")
+	}
+	if ds.reason != "orphaned" {
+		t.Errorf("drain reason = %q, want %q", ds.reason, "orphaned")
+	}
+}
+
+func TestReconcileSessionBeads_OrphanNotRunningClosed(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "other"}}}
+	// Session bead for "orphan" with no matching agent and NOT running.
+	session := env.createSessionBead("orphan", "orphan")
+
+	env.reconcile([]beads.Bead{session})
+
+	// Bead should be closed.
+	b, _ := env.store.Get(session.ID)
+	if b.Status != "closed" {
+		t.Errorf("orphan bead status = %q, want closed", b.Status)
 	}
 }
 

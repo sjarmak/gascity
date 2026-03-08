@@ -106,9 +106,10 @@ func allDependenciesAlive(
 // transitions using the Phase 2 building blocks.
 //
 // The function assumes session beads are already synced (syncSessionBeads
-// called before this function). Beads for orphaned/suspended agents are
-// already closed by sync, so only open beads with matching agents appear
-// in the sessions slice.
+// called before this function). When the bead reconciler is active,
+// syncSessionBeads does NOT close orphan/suspended beads (skipClose=true),
+// so the sessions slice may include beads with no matching agent. These
+// are handled by the orphan drain phase.
 //
 // Returns the number of sessions woken this tick.
 func reconcileSessionBeads(
@@ -137,6 +138,9 @@ func reconcileSessionBeads(
 	ordered := topoOrder(sessions, deps)
 
 	// Build session ID -> *beads.Bead lookup for advanceSessionDrains.
+	// These pointers intentionally alias into the ordered slice so that
+	// mutations in Phase 1 (healState, clearWakeFailures, etc.) are
+	// visible to Phase 2's advanceSessionDrains via this map.
 	beadByID := make(map[string]*beads.Bead, len(ordered))
 	for i := range ordered {
 		beadByID[ordered[i].ID] = &ordered[i]
@@ -173,6 +177,7 @@ func reconcileSessionBeads(
 					currentHash := runtime.CoreFingerprint(a.SessionConfig())
 					if storedHash != currentHash {
 						beginSessionDrain(*session, sp, dt, "config-drift", clk, defaultDrainTimeout)
+						fmt.Fprintf(stdout, "Draining session '%s': config-drift\n", name) //nolint:errcheck
 						rec.Record(events.Event{
 							Type:    events.AgentDraining,
 							Actor:   "gc",
@@ -185,11 +190,25 @@ func reconcileSessionBeads(
 			}
 		}
 
-		// Should this session be awake? Agent presence in the desired set
-		// is the WakeConfig equivalent. (Full wakeReasons() integration
-		// comes in a later phase when beads persist independently of the
-		// agent list.)
-		shouldWake := a != nil
+		// Orphan/suspended: bead exists but no agent in desired set.
+		// These beads are kept open (skipClose=true in syncSessionBeads)
+		// so we can drain the running session first.
+		if a == nil {
+			if sp.IsRunning(name) {
+				reason := "orphaned"
+				beginSessionDrain(*session, sp, dt, reason, clk, defaultDrainTimeout)
+				fmt.Fprintf(stdout, "Draining session '%s': %s\n", name, reason) //nolint:errcheck
+			} else {
+				// Not running and no agent — close the bead.
+				closeBead(store, session.ID, "orphaned", clk.Now().UTC(), stderr)
+			}
+			continue
+		}
+
+		// Compute wake reasons using the full contract (includes held_until,
+		// attachment checks, pool desired counts).
+		reasons := wakeReasons(*session, cfg, sp, poolDesired, clk)
+		shouldWake := len(reasons) > 0
 
 		if shouldWake && !alive {
 			// Session should be awake but isn't — wake it.
@@ -254,6 +273,7 @@ func reconcileSessionBeads(
 				reason = "pool-excess"
 			}
 			beginSessionDrain(*session, sp, dt, reason, clk, defaultDrainTimeout)
+			fmt.Fprintf(stdout, "Draining session '%s': %s\n", name, reason) //nolint:errcheck
 		}
 	}
 

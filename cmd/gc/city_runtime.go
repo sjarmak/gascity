@@ -187,9 +187,9 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	// Upgrade to bead-driven reconcile ops when a bead store is available.
 	cr.upgradeToBeadReconcileOps()
 
-	// Initialize bead-driven drain tracker when store is available and
-	// we have a real city path (not "." from empty tomlPath in tests).
-	if cr.cityBeadStore() != nil && cr.tomlPath != "" {
+	// Initialize bead-driven drain tracker when explicitly enabled via config,
+	// a bead store is available, and we have a real city path.
+	if cr.cfg.Daemon.BeadReconciler && cr.cityBeadStore() != nil && cr.tomlPath != "" {
 		cr.sessionDrains = newDrainTracker()
 	}
 
@@ -525,7 +525,7 @@ func (cr *CityRuntime) upgradeToBeadReconcileOps() {
 func (cr *CityRuntime) syncBeadsAndUpdateIndex(agents []agent.Agent) {
 	store := cr.cityBeadStore()
 	cfgNames := configuredSessionNames(cr.cfg, cr.cityName)
-	idx := syncSessionBeads(store, agents, cfgNames, cr.cfg, clock.Real{}, cr.stderr)
+	idx := syncSessionBeads(store, agents, cfgNames, cr.cfg, clock.Real{}, cr.stderr, cr.sessionDrains != nil)
 	if bro, ok := cr.rops.(*beadReconcileOps); ok && idx != nil {
 		bro.updateIndex(idx)
 	}

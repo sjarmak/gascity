@@ -42,6 +42,10 @@ const sessionBeadType = "agent_session"
 // reflects the previous tick's reality — agents not yet started/stopped by
 // the current tick's reconciliation. State converges on the next tick.
 //
+// When skipClose is true, orphan/suspended beads are NOT closed. This is
+// used when the bead-driven reconciler is active — it handles drain/stop
+// for orphan sessions before closing their beads.
+//
 // Returns a map of session_name → bead_id for all open session beads after
 // sync. Callers that don't need the index can ignore the return value.
 func syncSessionBeads(
@@ -51,6 +55,7 @@ func syncSessionBeads(
 	cfg *config.City,
 	clk clock.Clock,
 	stderr io.Writer,
+	skipClose bool,
 ) map[string]string {
 	if store == nil {
 		return nil
@@ -148,38 +153,19 @@ func syncSessionBeads(
 			}
 		}
 
-		// Update existing bead — check for drift.
-		// Write config_hash LAST so it serves as the "commit" signal.
-		// If an earlier write fails, the stale config_hash ensures the
-		// next tick retries the full update.
+		// Update existing bead metadata.
+		//
+		// IMPORTANT: config_hash and live_hash are NOT updated here for
+		// existing beads. These fields record what config the session was
+		// STARTED with. The bead-driven reconciler (reconcileSessionBeads)
+		// detects drift by comparing bead config_hash against the current
+		// desired config. If we overwrote config_hash here, drift would
+		// be undetectable. The reconciler writes config_hash after a
+		// successful start/restart.
+		//
+		// For the legacy reconciler path (beadReconcileOps), config_hash
+		// is updated after successful start via beadReconcileOps.Started().
 		changed := false
-
-		if b.Metadata["config_hash"] != coreHash {
-			// Core config changed — bump generation and token first,
-			// then write config_hash last as the "commit" signal.
-			// If any preceding write fails, skip config_hash so the
-			// stale hash triggers a retry on the next tick.
-			gen, _ := strconv.Atoi(b.Metadata["generation"])
-			gen++
-			ok := true
-			if setMeta(store, b.ID, "generation", strconv.Itoa(gen), stderr) != nil {
-				ok = false
-			}
-			if setMeta(store, b.ID, "instance_token", generateToken(), stderr) != nil {
-				ok = false
-			}
-			if ok {
-				if setMeta(store, b.ID, "config_hash", coreHash, stderr) == nil {
-					changed = true
-				}
-			}
-		}
-
-		if b.Metadata["live_hash"] != liveHash {
-			if setMeta(store, b.ID, "live_hash", liveHash, stderr) == nil {
-				changed = true
-			}
-		}
 
 		// Update state.
 		if b.Metadata["state"] != state {
@@ -219,20 +205,22 @@ func syncSessionBeads(
 	// Closing the bead completes its lifecycle record. When the agent returns
 	// (e.g., resumed from suspension), a fresh bead is created automatically
 	// because the indexing loop above skips closed beads.
-	for _, b := range existing {
-		sn := b.Metadata["session_name"]
-		if sn == "" || desired[sn] {
-			continue
-		}
-		if b.Status == "closed" {
-			continue
-		}
-		if configuredNames[sn] {
-			// Still in config but not runnable (suspended/disabled).
-			closeBead(store, b.ID, "suspended", now, stderr)
-		} else {
-			// Not in config at all — orphaned.
-			closeBead(store, b.ID, "orphaned", now, stderr)
+	if !skipClose {
+		for _, b := range existing {
+			sn := b.Metadata["session_name"]
+			if sn == "" || desired[sn] {
+				continue
+			}
+			if b.Status == "closed" {
+				continue
+			}
+			if configuredNames[sn] {
+				// Still in config but not runnable (suspended/disabled).
+				closeBead(store, b.ID, "suspended", now, stderr)
+			} else {
+				// Not in config at all — orphaned.
+				closeBead(store, b.ID, "orphaned", now, stderr)
+			}
 		}
 	}
 
