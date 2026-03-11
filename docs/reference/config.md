@@ -42,11 +42,11 @@ ACPSessionConfig holds settings for the ACP session provider.
 
 ## APIConfig
 
-APIConfig configures the optional HTTP API server.
+APIConfig configures the HTTP API server.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `port` | integer |  |  | Port is the TCP port to listen on. 0 = disabled (default). |
+| `port` | integer |  |  | Port is the TCP port to listen on. Defaults to 9443; 0 = disabled. |
 | `bind` | string |  |  | Bind is the address to bind the listener to. Defaults to "127.0.0.1". |
 
 ## Agent

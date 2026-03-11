@@ -250,6 +250,17 @@ func (cs *controllerState) IsQuarantined(sessionName string) bool {
 	return ct.isQuarantined(sessionName, time.Now())
 }
 
+// ClearCrashHistory removes in-memory crash tracking for a session.
+func (cs *controllerState) ClearCrashHistory(sessionName string) {
+	cs.mu.RLock()
+	ct := cs.ct
+	cs.mu.RUnlock()
+	if ct == nil {
+		return
+	}
+	ct.clearHistory(sessionName)
+}
+
 // RawConfig returns the raw (pre-expansion) config for provenance detection.
 // Implements api.RawConfigProvider.
 //

@@ -446,7 +446,8 @@ func (cr *CityRuntime) reloadConfig(
 	cr.poolDeathHandlers = computePoolDeathHandlers(cr.cfg, cr.cityName, cityRoot, cr.sp)
 	cr.suspendedNames = computeSuspendedNames(cr.cfg, cr.cityName, cr.cityPath)
 
-	// Rebuild crash tracker if config values changed.
+	// Rebuild crash tracker if config values changed, otherwise clear all
+	// crash history so that a fixed config automatically unquarantines agents.
 	newMaxR := cr.cfg.Daemon.MaxRestartsOrDefault()
 	newWindow := cr.cfg.Daemon.RestartWindowDuration()
 	switch {
@@ -458,6 +459,8 @@ func (cr *CityRuntime) reloadConfig(
 		oldMaxR, oldWindow := cr.ct.limits()
 		if newMaxR != oldMaxR || newWindow != oldWindow {
 			cr.ct = newCrashTracker(newMaxR, newWindow)
+		} else {
+			cr.ct.clearAll()
 		}
 	}
 	if cr.cs != nil {

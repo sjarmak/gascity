@@ -296,6 +296,14 @@ func (s *Server) handleSessionWake(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
+
+	// Clear in-memory crash tracker so the reconciler doesn't immediately
+	// re-quarantine the session based on stale crash history.
+	sessionName := b.Metadata["session_name"]
+	if sessionName != "" {
+		s.state.ClearCrashHistory(sessionName)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "id": id})
 }
 

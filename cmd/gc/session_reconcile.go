@@ -215,6 +215,13 @@ func recordWakeFailure(session *beads.Bead, store beads.Store, clk clock.Clock) 
 	if session.Metadata == nil {
 		session.Metadata = make(map[string]string)
 	}
+	// Clear session_key so the next start gets a fresh conversation.
+	// Prevents crash loops when the key references a conversation that
+	// no longer exists (e.g., deleted, or aimux account rotation).
+	if session.Metadata["session_key"] != "" {
+		_ = store.SetMetadata(session.ID, "session_key", "")
+		session.Metadata["session_key"] = ""
+	}
 	if attempts >= defaultMaxWakeAttempts {
 		qUntil := clk.Now().Add(defaultQuarantineDuration).UTC().Format(time.RFC3339)
 		batch := map[string]string{

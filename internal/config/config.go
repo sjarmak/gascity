@@ -698,10 +698,13 @@ func (c AutomationsConfig) MaxTimeoutDuration() time.Duration {
 	return d
 }
 
-// APIConfig configures the optional HTTP API server.
-// Progressive activation: port == 0 or missing [api] section = no server.
+// DefaultAPIPort is the default TCP port for the API server.
+const DefaultAPIPort = 9443
+
+// APIConfig configures the HTTP API server.
+// The API server starts by default on port 9443. Set port = 0 to disable.
 type APIConfig struct {
-	// Port is the TCP port to listen on. 0 = disabled (default).
+	// Port is the TCP port to listen on. Defaults to 9443; 0 = disabled.
 	Port int `toml:"port,omitempty"`
 	// Bind is the address to bind the listener to. Defaults to "127.0.0.1".
 	Bind string `toml:"bind,omitempty"`
@@ -1473,7 +1476,9 @@ func Load(fs fsys.FS, path string) (*City, error) {
 
 // Parse decodes TOML data into a City config.
 func Parse(data []byte) (*City, error) {
-	var cfg City
+	cfg := City{
+		API: APIConfig{Port: DefaultAPIPort},
+	}
 	if _, err := toml.Decode(string(data), &cfg); err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}

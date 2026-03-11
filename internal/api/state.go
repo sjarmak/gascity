@@ -58,6 +58,11 @@ type State interface {
 	// currently quarantined due to crash-loop detection.
 	IsQuarantined(sessionName string) bool
 
+	// ClearCrashHistory removes in-memory crash tracking for a session.
+	// Called by wake to prevent the in-memory tracker from immediately
+	// re-quarantining a session whose dolt metadata was just cleared.
+	ClearCrashHistory(sessionName string)
+
 	// CityBeadStore returns the city-level bead store for session beads.
 	// Returns nil if no store is available.
 	CityBeadStore() beads.Store

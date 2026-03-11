@@ -1,11 +1,12 @@
 # Gas City controller container image.
 #
-# Extends the agent image with kubectl and K8s helper scripts.
-# The controller runs gc start --foreground inside a pod, managing agent
-# pods via client-go (native K8s session provider) and the K8s API.
+# Extends the agent image with kubectl, K8s helper scripts, and
+# mission-control (per-workspace management dashboard).
 #
 # Build:
-#   docker build -f contrib/k8s/Dockerfile.controller -t gc-controller:latest .
+#   docker build -f contrib/k8s/Dockerfile.controller \
+#     --build-context mc=../mission-control \
+#     -t gc-controller:latest .
 #
 # The gc-agent image must be built first:
 #   docker build -f contrib/k8s/Dockerfile.agent -t gc-agent:latest .
@@ -26,15 +27,23 @@ RUN curl -fsSL "https://dl.k8s.io/release/$(curl -Ls \
 COPY contrib/beads-scripts/gc-beads-k8s /usr/local/bin/gc-beads-k8s
 COPY contrib/events-scripts/gc-events-k8s /usr/local/bin/gc-events-k8s
 
+# Mission Control — per-workspace management dashboard (1:1 with workspace).
+# Pre-built binary + frontend assets from the mission-control repo.
+COPY --from=mc server/target/release/mission-control-server /usr/local/bin/mission-control-server
+COPY --from=mc dist/ /opt/mission-control/dist/
+
 WORKDIR /city
 
 # Wait for city directory to be copied in (via gc-controller-k8s deploy),
 # then init from it and wait for the deploy script to finish setup (bd init
-# for scale_check) before starting the controller.
+# for scale_check) before starting the controller.  Skip init if already
+# initialized (persistent PVC survives pod restarts).
 CMD ["sh", "-c", \
   "while [ ! -f /city/city.toml ]; do sleep 1; done && \
-   cp -r /city /tmp/city-src && \
-   gc init --from /tmp/city-src /city && \
+   if [ ! -d /city/.gc ]; then \
+     cp -r /city /tmp/city-src && \
+     gc init --from /tmp/city-src /city; \
+   fi && \
    touch /city/.gc-init-done && \
    while [ ! -f /city/.gc-start ]; do sleep 0.5; done && \
    exec gc start --foreground /city"]

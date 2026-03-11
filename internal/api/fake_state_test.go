@@ -81,6 +81,7 @@ func (f *fakeState) CityPath() string                        { return f.cityPath
 func (f *fakeState) Version() string                         { return "test" }
 func (f *fakeState) StartedAt() time.Time                    { return f.startedAt }
 func (f *fakeState) IsQuarantined(sessionName string) bool   { return f.quarantined[sessionName] }
+func (f *fakeState) ClearCrashHistory(sessionName string)    { delete(f.quarantined, sessionName) }
 func (f *fakeState) CityBeadStore() beads.Store              { return f.cityBeadStore }
 func (f *fakeState) Automations() []automations.Automation   { return f.autos }
 func (f *fakeState) Poke()                                   {} // no-op in tests

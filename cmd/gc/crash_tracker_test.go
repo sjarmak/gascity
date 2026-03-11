@@ -31,6 +31,11 @@ func (f *fakeCrashTracker) clearHistory(sessionName string) {
 	delete(f.quarantined, sessionName)
 }
 
+func (f *fakeCrashTracker) clearAll() {
+	f.quarantined = make(map[string]bool)
+	f.starts = make(map[string][]time.Time)
+}
+
 func (f *fakeCrashTracker) limits() (int, time.Duration) {
 	return 0, 0 // fake: limits not used in tests
 }

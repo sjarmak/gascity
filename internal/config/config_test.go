@@ -3051,8 +3051,8 @@ name = "a"
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if cfg.API.Port != 0 {
-		t.Errorf("API.Port = %d, want 0 (disabled)", cfg.API.Port)
+	if cfg.API.Port != DefaultAPIPort {
+		t.Errorf("API.Port = %d, want %d (default)", cfg.API.Port, DefaultAPIPort)
 	}
 	if cfg.API.BindOrDefault() != "127.0.0.1" {
 		t.Errorf("BindOrDefault() = %q, want %q", cfg.API.BindOrDefault(), "127.0.0.1")

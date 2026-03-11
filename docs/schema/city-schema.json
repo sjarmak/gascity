@@ -29,7 +29,7 @@
       "properties": {
         "port": {
           "type": "integer",
-          "description": "Port is the TCP port to listen on. 0 = disabled (default)."
+          "description": "Port is the TCP port to listen on. Defaults to 9443; 0 = disabled."
         },
         "bind": {
           "type": "string",
@@ -38,7 +38,7 @@
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "APIConfig configures the optional HTTP API server."
+      "description": "APIConfig configures the HTTP API server."
     },
     "Agent": {
       "properties": {
