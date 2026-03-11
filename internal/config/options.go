@@ -6,35 +6,35 @@ import "fmt"
 // and produces extra CLI args to inject into the command. Options not specified
 // by the user have their schema defaults applied. Returns the extra args and
 // metadata entries (opt_<key>=<value>) for bead persistence.
+//
+// Args are emitted in schema declaration order for deterministic command lines.
 func ResolveOptions(schema []ProviderOption, options map[string]string) (extraArgs []string, metadata map[string]string, err error) {
 	metadata = make(map[string]string)
-	specified := make(map[string]bool)
 
-	// Validate and resolve user-specified options.
+	// Validate user-specified option keys and values up front.
 	for key, value := range options {
 		opt := findOption(schema, key)
 		if opt == nil {
 			return nil, nil, fmt.Errorf("unknown option: %s", key)
 		}
-		choice := findChoice(opt.Choices, value)
-		if choice == nil {
+		if findChoice(opt.Choices, value) == nil {
 			return nil, nil, fmt.Errorf("invalid value for %s: %s", key, value)
 		}
-		extraArgs = append(extraArgs, choice.FlagArgs...)
-		metadata["opt_"+key] = value
-		specified[key] = true
 	}
 
-	// Apply defaults for unspecified options.
+	// Iterate in schema declaration order for deterministic arg ordering.
 	for _, opt := range schema {
-		if specified[opt.Key] || opt.Default == "" {
-			continue
-		}
-		choice := findChoice(opt.Choices, opt.Default)
-		if choice != nil {
+		if value, ok := options[opt.Key]; ok {
+			choice := findChoice(opt.Choices, value)
 			extraArgs = append(extraArgs, choice.FlagArgs...)
+			metadata["opt_"+opt.Key] = value
+		} else if opt.Default != "" {
+			choice := findChoice(opt.Choices, opt.Default)
+			if choice != nil {
+				extraArgs = append(extraArgs, choice.FlagArgs...)
+			}
+			// Defaults are NOT written to metadata — only explicit choices are persisted.
 		}
-		// Defaults are NOT written to metadata — only explicit choices are persisted.
 	}
 
 	return extraArgs, metadata, nil

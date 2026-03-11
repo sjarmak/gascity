@@ -131,7 +131,23 @@ func specToResolved(name string, spec *ProviderSpec) *ResolvedProvider {
 		ResumeFlag:             spec.ResumeFlag,
 		ResumeStyle:            spec.ResumeStyle,
 		SessionIDFlag:          spec.SessionIDFlag,
-		OptionsSchema:          spec.OptionsSchema,
+	}
+	// Deep-copy OptionsSchema to avoid aliasing the spec's slice.
+	if len(spec.OptionsSchema) > 0 {
+		rp.OptionsSchema = make([]ProviderOption, len(spec.OptionsSchema))
+		for i, opt := range spec.OptionsSchema {
+			rp.OptionsSchema[i] = opt
+			if len(opt.Choices) > 0 {
+				rp.OptionsSchema[i].Choices = make([]OptionChoice, len(opt.Choices))
+				for j, c := range opt.Choices {
+					rp.OptionsSchema[i].Choices[j] = c
+					if len(c.FlagArgs) > 0 {
+						rp.OptionsSchema[i].Choices[j].FlagArgs = make([]string, len(c.FlagArgs))
+						copy(rp.OptionsSchema[i].Choices[j].FlagArgs, c.FlagArgs)
+					}
+				}
+			}
+		}
 	}
 	// Default InstructionsFile to "AGENTS.md" if unset.
 	if rp.InstructionsFile == "" {

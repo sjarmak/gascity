@@ -32,16 +32,14 @@ func TestResolveOptions_ExplicitValues(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Should have both explicit flag args.
+	// Args must be in schema declaration order (deterministic).
 	wantArgs := []string{"--permission-mode", "plan", "--thinking", "high"}
-	// Order of map iteration isn't guaranteed, so check both sets exist.
-	argSet := make(map[string]bool)
-	for _, a := range args {
-		argSet[a] = true
+	if len(args) != len(wantArgs) {
+		t.Fatalf("got args=%v, want %v", args, wantArgs)
 	}
-	for _, w := range wantArgs {
-		if !argSet[w] {
-			t.Errorf("missing arg %q in %v", w, args)
+	for i, w := range wantArgs {
+		if args[i] != w {
+			t.Errorf("args[%d]=%q, want %q (full: %v)", i, args[i], w, args)
 		}
 	}
 

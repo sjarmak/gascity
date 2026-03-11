@@ -124,12 +124,34 @@ func (s *Server) buildSessionResume(info session.Info) (string, runtime.Config) 
 	cmd := session.BuildResumeCommand(info)
 	resolved, workDir, _, _, err := s.resolveSessionTemplate(info.Template)
 	if err != nil {
-		return cmd, runtime.Config{WorkDir: info.WorkDir}
-	}
-	if info.WorkDir != "" {
+		// Template not found as agent — try as bare provider so that
+		// provider-kind sessions still get env/ready hints on resume.
+		resolved, err = s.resolveBareProvider(info.Template)
+		if err != nil {
+			return cmd, runtime.Config{WorkDir: info.WorkDir}
+		}
+		workDir = info.WorkDir
+		if workDir == "" {
+			workDir = s.state.CityPath()
+		}
+	} else if info.WorkDir != "" {
 		workDir = info.WorkDir
 	}
 	return cmd, sessionResumeHints(resolved, workDir)
+}
+
+// resolveBareProvider resolves a provider by name without an agent template.
+func (s *Server) resolveBareProvider(providerName string) (*config.ResolvedProvider, error) {
+	cfg := s.state.Config()
+	if cfg == nil {
+		return nil, errors.New("no city config loaded")
+	}
+	return config.ResolveProvider(
+		&config.Agent{Provider: providerName},
+		&cfg.Workspace,
+		cfg.Providers,
+		exec.LookPath,
+	)
 }
 
 func writeSessionManagerError(w http.ResponseWriter, err error) {
@@ -199,19 +221,25 @@ func (s *Server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 
 	switch kind {
 	case "agent":
+		if len(body.Options) > 0 {
+			s.idem.unreserve(idemKey)
+			writeError(w, http.StatusBadRequest, "invalid", "options are not supported for agent sessions; use kind=provider to specify options")
+			return
+		}
 		var err error
 		resolved, workDir, transport, template, err = s.resolveSessionTemplate(name)
 		if err != nil {
-			s.idem.unreserve(idemKey)
 			if errors.Is(err, errSessionTemplateNotFound) {
-				// Legacy fallback: if kind was inferred from template field, try as provider.
+				// Legacy fallback: keep idempotency reservation alive through the fallback.
 				if body.Kind == "" && body.Template != "" {
 					s.createProviderSession(w, r, store, body, name, idemKey, bodyHash)
 					return
 				}
+				s.idem.unreserve(idemKey)
 				writeError(w, http.StatusNotFound, "agent_not_found", "agent '"+name+"' not found")
 				return
 			}
+			s.idem.unreserve(idemKey)
 			writeError(w, http.StatusInternalServerError, "internal", err.Error())
 			return
 		}
@@ -240,7 +268,7 @@ func (s *Server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 	// Merge extra args from options into the command string.
 	command := resolved.CommandString()
 	if len(extraArgs) > 0 {
-		command = command + " " + strings.Join(extraArgs, " ")
+		command = command + " " + shellJoinArgs(extraArgs)
 	}
 
 	mgr := s.sessionManager(store)
@@ -269,7 +297,9 @@ func (s *Server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 	// Deliver initial message if provided.
 	if msg := strings.TrimSpace(body.Message); msg != "" {
 		resumeCommand, nudgeHints := s.buildSessionResume(info)
-		_ = mgr.Send(r.Context(), info.ID, msg, resumeCommand, nudgeHints)
+		if sendErr := mgr.Send(r.Context(), info.ID, msg, resumeCommand, nudgeHints); sendErr != nil {
+			log.Printf("session %s: initial message delivery failed: %v", info.ID, sendErr)
+		}
 	}
 
 	resp := sessionToResponse(info, s.state.Config())
@@ -335,7 +365,7 @@ func (s *Server) createProviderSession(w http.ResponseWriter, r *http.Request, s
 
 	command := resolved.CommandString()
 	if len(extraArgs) > 0 {
-		command = command + " " + strings.Join(extraArgs, " ")
+		command = command + " " + shellJoinArgs(extraArgs)
 	}
 
 	mgr := s.sessionManager(store)
@@ -364,7 +394,9 @@ func (s *Server) createProviderSession(w http.ResponseWriter, r *http.Request, s
 	// Deliver initial message if provided.
 	if msg := strings.TrimSpace(body.Message); msg != "" {
 		resumeCommand, nudgeHints := s.buildSessionResume(info)
-		_ = mgr.Send(r.Context(), info.ID, msg, resumeCommand, nudgeHints)
+		if sendErr := mgr.Send(r.Context(), info.ID, msg, resumeCommand, nudgeHints); sendErr != nil {
+			log.Printf("session %s: initial message delivery failed: %v", info.ID, sendErr)
+		}
 	}
 
 	resp := sessionToResponse(info, s.state.Config())
@@ -383,7 +415,9 @@ func (s *Server) persistSessionMeta(store beads.Store, sessionID, projectID stri
 		batch["mc_project_id"] = projectID
 	}
 	if len(batch) > 0 {
-		_ = store.SetMetadataBatch(sessionID, batch)
+		if err := store.SetMetadataBatch(sessionID, batch); err != nil {
+			log.Printf("persistSessionMeta: session %s: %v", sessionID, err)
+		}
 	}
 }
 
@@ -1031,4 +1065,17 @@ func (s *Server) streamSessionPeek(ctx context.Context, w http.ResponseWriter, i
 			writeSSEComment(w)
 		}
 	}
+}
+
+// shellJoinArgs quotes arguments that contain shell metacharacters.
+// This prevents injection when extra args are appended to a command string.
+func shellJoinArgs(args []string) string {
+	var parts []string
+	for _, a := range args {
+		if strings.ContainsAny(a, " \t\n\"'\\|&;$!(){}[]<>?*~#`") {
+			a = "'" + strings.ReplaceAll(a, "'", "'\"'\"'") + "'"
+		}
+		parts = append(parts, a)
+	}
+	return strings.Join(parts, " ")
 }
