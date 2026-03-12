@@ -3,7 +3,6 @@
 .claude
 docs
 test
-examples
 *.md
 !contrib/**
 coverage.txt

@@ -32,9 +32,10 @@ func apiClient(cityPath string) *api.Client {
 		return nil
 	}
 
-	// Non-localhost bind means API runs read-only — skip API routing.
+	// Non-localhost bind means API runs read-only — skip API routing
+	// (unless allow_mutations is set).
 	bind := cfg.API.BindOrDefault()
-	if bind != "127.0.0.1" && bind != "localhost" && bind != "::1" {
+	if bind != "127.0.0.1" && bind != "localhost" && bind != "::1" && !cfg.API.AllowMutations {
 		return nil
 	}
 

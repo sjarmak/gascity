@@ -48,6 +48,7 @@ APIConfig configures the HTTP API server.
 |-------|------|----------|---------|-------------|
 | `port` | integer |  |  | Port is the TCP port to listen on. Defaults to 9443; 0 = disabled. |
 | `bind` | string |  |  | Bind is the address to bind the listener to. Defaults to "127.0.0.1". |
+| `allow_mutations` | boolean |  |  | AllowMutations overrides the default read-only behavior when bind is non-localhost. Set to true in containerized environments where the API must bind to 0.0.0.0 for health probes but mutations are still safe. |
 
 ## Agent
 

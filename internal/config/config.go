@@ -710,6 +710,10 @@ type APIConfig struct {
 	Port int `toml:"port,omitempty"`
 	// Bind is the address to bind the listener to. Defaults to "127.0.0.1".
 	Bind string `toml:"bind,omitempty"`
+	// AllowMutations overrides the default read-only behavior when bind is
+	// non-localhost. Set to true in containerized environments where the API
+	// must bind to 0.0.0.0 for health probes but mutations are still safe.
+	AllowMutations bool `toml:"allow_mutations,omitempty"`
 }
 
 // BindOrDefault returns the bind address, defaulting to "127.0.0.1".

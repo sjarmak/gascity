@@ -831,16 +831,20 @@ func (s *Server) handleSessionStream(w http.ResponseWriter, r *http.Request) {
 			s.streamSessionTranscriptLog(ctx, w, info, path)
 		}
 	case format == "raw":
-		// No log file yet — raw format cannot fall back to peek (different
-		// response schema). Emit an empty raw event so clients get the
-		// correct format and can distinguish "no data yet" from error.
-		data, _ := json.Marshal(sessionRawTranscriptResponse{
-			ID:       info.ID,
-			Template: info.Template,
-			Format:   "raw",
-			Messages: []json.RawMessage{},
-		})
-		writeSSE(w, "message", 1, data)
+		// No log file yet. If the session is running, poll tmux pane content
+		// and wrap it as a fake raw JSONL assistant message so MC's existing
+		// rendering pipeline shows terminal output (e.g. OAuth prompts).
+		if running {
+			s.streamSessionPeekRaw(ctx, w, info)
+		} else {
+			data, _ := json.Marshal(sessionRawTranscriptResponse{
+				ID:       info.ID,
+				Template: info.Template,
+				Format:   "raw",
+				Messages: []json.RawMessage{},
+			})
+			writeSSE(w, "message", 1, data)
+		}
 		return
 	default:
 		s.streamSessionPeek(ctx, w, info)
@@ -1085,6 +1089,68 @@ func (s *Server) streamSessionTranscriptLog(ctx context.Context, w http.Response
 	}
 
 	lw.Run(ctx, readAndEmit, func() { writeSSEComment(w) })
+}
+
+// streamSessionPeekRaw polls tmux pane content and wraps it as format=raw
+// messages so MC's JSONL rendering pipeline can display terminal output
+// (e.g. OAuth prompts, startup screens) when no transcript log exists yet.
+func (s *Server) streamSessionPeekRaw(ctx context.Context, w http.ResponseWriter, info session.Info) {
+	sp := s.state.SessionProvider()
+	poll := time.NewTicker(outputStreamPollInterval)
+	defer poll.Stop()
+	keepalive := time.NewTicker(sseKeepalive)
+	defer keepalive.Stop()
+
+	var lastOutput string
+	var seq uint64
+
+	emitPeek := func() {
+		if !sp.IsRunning(info.SessionName) {
+			return
+		}
+		output, err := sp.Peek(info.SessionName, 100)
+		if err != nil || output == lastOutput {
+			return
+		}
+		lastOutput = output
+		seq++
+
+		if output == "" {
+			return
+		}
+
+		// Wrap as a fake assistant message in raw JSONL format so MC's
+		// translate_transcript_response handles it like a normal transcript.
+		fakeMsg, _ := json.Marshal(map[string]interface{}{
+			"role": "assistant",
+			"content": []map[string]string{
+				{"type": "text", "text": output},
+			},
+		})
+		data, err := json.Marshal(sessionRawTranscriptResponse{
+			ID:       info.ID,
+			Template: info.Template,
+			Format:   "raw",
+			Messages: []json.RawMessage{fakeMsg},
+		})
+		if err != nil {
+			return
+		}
+		writeSSE(w, "message", seq, data)
+	}
+
+	emitPeek()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-poll.C:
+			emitPeek()
+		case <-keepalive.C:
+			writeSSEComment(w)
+		}
+	}
 }
 
 func (s *Server) streamSessionPeek(ctx context.Context, w http.ResponseWriter, info session.Info) {

@@ -553,7 +553,7 @@ func runController(
 		bind := cfg.API.BindOrDefault()
 		nonLocal := bind != "127.0.0.1" && bind != "localhost" && bind != "::1"
 		var apiSrv *api.Server
-		if nonLocal {
+		if nonLocal && !cfg.API.AllowMutations {
 			apiSrv = api.NewReadOnly(cs)
 			fmt.Fprintf(stderr, "api: binding to %s — mutation endpoints disabled (non-localhost)\n", bind) //nolint:errcheck
 		} else {
