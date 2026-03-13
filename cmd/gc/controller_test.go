@@ -205,6 +205,9 @@ func TestControllerReloadsConfig(t *testing.T) {
 		var names []string
 		ds := make(map[string]TemplateParams)
 		for _, a := range c.Agents {
+			if a.Implicit {
+				continue
+			}
 			names = append(names, a.Name)
 			ds[a.Name] = TemplateParams{
 				SessionName:  a.Name,

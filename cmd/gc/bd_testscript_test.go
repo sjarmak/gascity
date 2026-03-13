@@ -113,12 +113,14 @@ func doBdClose(store beads.Store, rec events.Recorder, args []string) int {
 }
 
 func doBdList(store beads.Store, args []string) int {
+	filters, args := parseBeadFilters(args)
 	format, _ := parseBeadFormat(args)
 	all, err := store.List()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bd list: %v\n", err)
 		return 1
 	}
+	all = filterBeads(all, filters)
 	switch format {
 	case "json":
 		writeBeadsJSON(all, os.Stdout)
@@ -149,12 +151,14 @@ func doBdShow(store beads.Store, args []string) int {
 }
 
 func doBdReady(store beads.Store, args []string) int {
+	filters, args := parseBeadFilters(args)
 	format, _ := parseBeadFormat(args)
 	ready, err := store.Ready()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bd ready: %v\n", err)
 		return 1
 	}
+	ready = filterBeads(ready, filters)
 	switch format {
 	case "json":
 		writeBeadsJSON(ready, os.Stdout)

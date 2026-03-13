@@ -334,7 +334,12 @@ func TestCityAgentsFilter(t *testing.T) {
 	cfg := loadExpanded(t)
 
 	cityAgents := map[string]bool{"mayor": true, "deacon": true, "boot": true, "dog": true}
+	var explicit int
 	for _, a := range cfg.Agents {
+		if a.Implicit {
+			continue
+		}
+		explicit++
 		if !cityAgents[a.Name] {
 			t.Errorf("unexpected agent %q — should be filtered out without rigs", a.Name)
 		}
@@ -342,8 +347,8 @@ func TestCityAgentsFilter(t *testing.T) {
 			t.Errorf("city agent %q: dir = %q, want empty", a.Name, a.Dir)
 		}
 	}
-	if len(cfg.Agents) != 4 {
-		t.Errorf("got %d agents, want 4 city-scoped agents", len(cfg.Agents))
+	if explicit != 4 {
+		t.Errorf("got %d explicit agents, want 4 city-scoped agents", explicit)
 	}
 }
 

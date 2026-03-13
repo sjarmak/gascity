@@ -32,6 +32,64 @@ func parseBeadFormat(args []string) (string, []string) {
 	return format, rest
 }
 
+// beadFilters holds optional --label and --status flags parsed from args.
+type beadFilters struct {
+	label  string
+	status string
+}
+
+// parseBeadFilters extracts --label=X and --status=X from args, returning
+// the filters and the remaining args with those flags removed.
+func parseBeadFilters(args []string) (beadFilters, []string) {
+	var f beadFilters
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case strings.HasPrefix(args[i], "--label="):
+			f.label = strings.TrimPrefix(args[i], "--label=")
+		case args[i] == "--label" && i+1 < len(args):
+			f.label = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--status="):
+			f.status = strings.TrimPrefix(args[i], "--status=")
+		case args[i] == "--status" && i+1 < len(args):
+			f.status = args[i+1]
+			i++
+		default:
+			rest = append(rest, args[i])
+		}
+	}
+	return f, rest
+}
+
+// filterBeads returns beads matching the given filters. Empty filter fields
+// match everything.
+func filterBeads(bs []beads.Bead, f beadFilters) []beads.Bead {
+	if f.label == "" && f.status == "" {
+		return bs
+	}
+	var out []beads.Bead
+	for _, b := range bs {
+		if f.status != "" && b.Status != f.status {
+			continue
+		}
+		if f.label != "" {
+			found := false
+			for _, l := range b.Labels {
+				if l == f.label {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
 // writeBeadJSON writes a single bead as indented JSON.
 func writeBeadJSON(b beads.Bead, stdout io.Writer) {
 	data, _ := json.MarshalIndent(b, "", "  ")

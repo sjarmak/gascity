@@ -389,6 +389,7 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 		ResumeCommand:          "claude --resume {{.SessionKey}} --dangerously",
 		DependsOn:              []string{"other-agent"},
 		WakeMode:               "fresh",
+		Implicit:               true,
 	}
 
 	// Verify every Agent field is set (non-zero) in the test data.

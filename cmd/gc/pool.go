@@ -162,6 +162,7 @@ func deepCopyAgent(src *config.Agent, name, dir string) config.Agent {
 		ResumeCommand:       src.ResumeCommand,
 		WakeMode:            src.WakeMode,
 		PoolName:            src.QualifiedName(),
+		Implicit:            src.Implicit,
 	}
 	if len(src.DependsOn) > 0 {
 		dst.DependsOn = make([]string, len(src.DependsOn))
