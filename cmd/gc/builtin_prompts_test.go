@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/citylayout"
 )
 
 func TestMaterializeBuiltinPrompts(t *testing.T) {
@@ -17,7 +19,7 @@ func TestMaterializeBuiltinPrompts(t *testing.T) {
 		"foreman.md", "loop-mail.md", "loop.md", "mayor.md",
 		"one-shot.md", "pool-worker.md", "scoped-worker.md", "worker.md",
 	}
-	promptsDir := filepath.Join(dir, ".gc", "prompts")
+	promptsDir := filepath.Join(dir, citylayout.SystemPromptsRoot)
 	for _, name := range want {
 		path := filepath.Join(promptsDir, name)
 		info, err := os.Stat(path)
@@ -33,7 +35,7 @@ func TestMaterializeBuiltinPrompts(t *testing.T) {
 
 func TestMaterializeBuiltinPromptsOverwrites(t *testing.T) {
 	dir := t.TempDir()
-	promptsDir := filepath.Join(dir, ".gc", "prompts")
+	promptsDir := filepath.Join(dir, citylayout.SystemPromptsRoot)
 	if err := os.MkdirAll(promptsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -62,32 +64,14 @@ func TestMaterializeBuiltinFormulas(t *testing.T) {
 	if err := materializeBuiltinFormulas(dir); err != nil {
 		t.Fatalf("materializeBuiltinFormulas: %v", err)
 	}
-
-	// All 5 embedded formulas should exist.
-	want := []string{
-		"cooking.formula.toml",
-		"mol-do-work.formula.toml",
-		"mol-polecat-base.formula.toml",
-		"mol-polecat-commit.formula.toml",
-		"pancakes.formula.toml",
-	}
-	formulasDir := filepath.Join(dir, ".gc", "formulas")
-	for _, name := range want {
-		path := filepath.Join(formulasDir, name)
-		info, err := os.Stat(path)
-		if err != nil {
-			t.Errorf("missing formula %s: %v", name, err)
-			continue
-		}
-		if info.Size() == 0 {
-			t.Errorf("formula %s is empty", name)
-		}
+	if _, err := os.Stat(filepath.Join(dir, citylayout.SystemFormulasRoot, "pancakes.formula.toml")); !os.IsNotExist(err) {
+		t.Fatalf("materializeBuiltinFormulas should not write city-local formula seeds on start")
 	}
 }
 
 func TestMaterializeBuiltinFormulasOverwrites(t *testing.T) {
 	dir := t.TempDir()
-	formulasDir := filepath.Join(dir, ".gc", "formulas")
+	formulasDir := filepath.Join(dir, citylayout.SystemFormulasRoot)
 	if err := os.MkdirAll(formulasDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +90,7 @@ func TestMaterializeBuiltinFormulasOverwrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) == "stale" {
-		t.Error("stale content was not overwritten")
+	if string(data) != "stale" {
+		t.Error("materializeBuiltinFormulas should leave city-local formula seeds untouched")
 	}
 }

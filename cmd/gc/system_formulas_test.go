@@ -21,10 +21,10 @@ func TestMaterializeEmpty(t *testing.T) {
 	if dir != "" {
 		t.Errorf("expected empty dir, got %q", dir)
 	}
-	// .gc/system-formulas/ should not exist.
-	sysDir := filepath.Join(cityPath, ".gc", "system-formulas")
+	// .gc/system/formulas/ should not exist.
+	sysDir := filepath.Join(cityPath, ".gc", "system", "formulas")
 	if _, err := os.Stat(sysDir); !os.IsNotExist(err) {
-		t.Errorf("system-formulas dir should not exist for empty FS")
+		t.Errorf("system formulas dir should not exist for empty FS")
 	}
 }
 
@@ -42,7 +42,7 @@ func TestMaterializeWritesFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	expected := filepath.Join(cityPath, ".gc", "system-formulas")
+	expected := filepath.Join(cityPath, ".gc", "system", "formulas")
 	if dir != expected {
 		t.Errorf("dir = %q, want %q", dir, expected)
 	}
@@ -58,7 +58,7 @@ func TestMaterializeWritesFiles(t *testing.T) {
 
 func TestMaterializeOverwrites(t *testing.T) {
 	cityPath := t.TempDir()
-	sysDir := filepath.Join(cityPath, ".gc", "system-formulas")
+	sysDir := filepath.Join(cityPath, ".gc", "system", "formulas")
 	if err := os.MkdirAll(sysDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestMaterializeOverwrites(t *testing.T) {
 
 func TestMaterializeCleansRemoved(t *testing.T) {
 	cityPath := t.TempDir()
-	sysDir := filepath.Join(cityPath, ".gc", "system-formulas")
+	sysDir := filepath.Join(cityPath, ".gc", "system", "formulas")
 	if err := os.MkdirAll(sysDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

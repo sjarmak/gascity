@@ -10,10 +10,11 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/gastownhall/gascity/internal/citylayout"
 )
 
-// packCacheDir is the subdirectory under .gc/ where remote packs are cached.
-const packCacheDir = "packs"
+// packCacheDir is the subdirectory under .gc/cache/ where remote packs are cached.
+const packCacheDir = citylayout.CachePacksRoot
 
 // PackLock represents the lockfile state for reproducible builds.
 type PackLock struct {
@@ -31,7 +32,7 @@ type LockedPack struct {
 // FetchPacks ensures all remote packs are cached locally.
 // Clones missing repos and updates existing ones to match the declared ref.
 func FetchPacks(packs map[string]PackSource, cityRoot string) error {
-	cacheRoot := filepath.Join(cityRoot, ".gc", packCacheDir)
+	cacheRoot := filepath.Join(cityRoot, packCacheDir)
 	if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
 		return fmt.Errorf("creating pack cache dir: %w", err)
 	}
@@ -90,7 +91,7 @@ func updatePack(cacheDir, ref string) error {
 
 // PackCachePath returns the cache directory for a named pack.
 func PackCachePath(cityRoot, name string, src PackSource) string {
-	dir := filepath.Join(cityRoot, ".gc", packCacheDir, name)
+	dir := filepath.Join(cityRoot, packCacheDir, name)
 	if src.Path != "" {
 		dir = filepath.Join(dir, src.Path)
 	}
@@ -148,7 +149,7 @@ func WriteLock(cityRoot string, lock *PackLock) error {
 // LockFromCache builds lock state from current cache contents.
 func LockFromCache(packs map[string]PackSource, cityRoot string) (*PackLock, error) {
 	lock := &PackLock{Packs: make(map[string]LockedPack)}
-	cacheRoot := filepath.Join(cityRoot, ".gc", packCacheDir)
+	cacheRoot := filepath.Join(cityRoot, packCacheDir)
 
 	for name, src := range packs {
 		cacheDir := filepath.Join(cacheRoot, name)

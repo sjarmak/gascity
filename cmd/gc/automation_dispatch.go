@@ -13,7 +13,6 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
-	"github.com/gastownhall/gascity/internal/fsys"
 )
 
 // automationDispatcher evaluates automation gate conditions and dispatches due
@@ -56,37 +55,11 @@ type memoryAutomationDispatcher struct {
 // Scans both city-level and per-rig automations. Rig automations get their Rig
 // field stamped so they use independent scoped labels.
 func buildAutomationDispatcher(cityPath string, cfg *config.City, runner beads.CommandRunner, rec events.Recorder, stderr io.Writer) automationDispatcher {
-	// Scan city-level automations.
-	cityLayers := cityFormulaLayers(cityPath, cfg)
-	cityAA, err := automations.Scan(fsys.OSFS{}, cityLayers, cfg.Automations.Skip)
+	allAA, err := scanAllAutomations(cityPath, cfg, stderr, "gc start: automation scan")
 	if err != nil {
-		fmt.Fprintf(stderr, "gc start: automation scan (city): %v\n", err) //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "gc start: automation scan: %v\n", err) //nolint:errcheck // best-effort stderr
 		return nil
 	}
-
-	// Scan per-rig automations from rig-exclusive layers (skip city prefix).
-	var rigAA []automations.Automation
-	for rigName, layers := range cfg.FormulaLayers.Rigs {
-		exclusive := rigExclusiveLayers(layers, cityLayers)
-		if len(exclusive) == 0 {
-			continue
-		}
-		ra, err := automations.Scan(fsys.OSFS{}, exclusive, cfg.Automations.Skip)
-		if err != nil {
-			fmt.Fprintf(stderr, "gc start: automation scan (rig %s): %v\n", rigName, err) //nolint:errcheck // best-effort stderr
-			continue
-		}
-		for i := range ra {
-			ra[i].Rig = rigName
-		}
-		rigAA = append(rigAA, ra...)
-	}
-
-	allAA := make([]automations.Automation, 0, len(cityAA)+len(rigAA))
-	allAA = append(allAA, cityAA...)
-	allAA = append(allAA, rigAA...)
-
-	// Apply automation overrides from city config.
 	if len(cfg.Automations.Overrides) > 0 {
 		if err := automations.ApplyOverrides(allAA, convertOverrides(cfg.Automations.Overrides)); err != nil {
 			fmt.Fprintf(stderr, "gc start: automation overrides: %v\n", err) //nolint:errcheck // best-effort stderr

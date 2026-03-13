@@ -14,6 +14,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -21,7 +22,7 @@ import (
 
 // --- Core checks ---
 
-// CityStructureCheck verifies .gc/ dir and city.toml exist.
+// CityStructureCheck verifies city.toml exists and reports legacy-only layouts.
 type CityStructureCheck struct{}
 
 // Name returns the check identifier.
@@ -30,21 +31,20 @@ func (c *CityStructureCheck) Name() string { return "city-structure" }
 // Run checks that the city directory has the expected structure.
 func (c *CityStructureCheck) Run(ctx *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
-	gcDir := filepath.Join(ctx.CityPath, ".gc")
 	toml := filepath.Join(ctx.CityPath, "city.toml")
 
-	if fi, err := os.Stat(gcDir); err != nil || !fi.IsDir() {
-		r.Status = StatusError
-		r.Message = ".gc/ directory missing"
-		return r
-	}
 	if _, err := os.Stat(toml); err != nil {
+		if citylayout.HasLegacyRuntimeRoot(ctx.CityPath) {
+			r.Status = StatusWarning
+			r.Message = "legacy .gc/ layout detected; city.toml missing"
+			return r
+		}
 		r.Status = StatusError
 		r.Message = "city.toml missing"
 		return r
 	}
 	r.Status = StatusOK
-	r.Message = ".gc/ and city.toml present"
+	r.Message = "city.toml present"
 	return r
 }
 
@@ -150,13 +150,13 @@ func (c *ConfigRefsCheck) Run(_ *CheckContext) *CheckResult {
 	for _, a := range c.cfg.Agents {
 		qn := a.QualifiedName()
 		if a.PromptTemplate != "" {
-			path := filepath.Join(c.cityPath, a.PromptTemplate)
+			path := citylayout.ResolveReadPath(fsys.OSFS{}, c.cityPath, a.PromptTemplate)
 			if _, err := os.Stat(path); err != nil {
 				issues = append(issues, fmt.Sprintf("agent %q: prompt_template %q not found", qn, a.PromptTemplate))
 			}
 		}
 		if a.SessionSetupScript != "" {
-			path := filepath.Join(c.cityPath, a.SessionSetupScript)
+			path := citylayout.ResolveReadPath(fsys.OSFS{}, c.cityPath, a.SessionSetupScript)
 			if _, err := os.Stat(path); err != nil {
 				issues = append(issues, fmt.Sprintf("agent %q: session_setup_script %q not found", qn, a.SessionSetupScript))
 			}
@@ -907,7 +907,7 @@ func isWorktreeValid(wtPath string) bool {
 
 // --- System formulas check ---
 
-// SystemFormulasCheck verifies .gc/system-formulas/ exists and all expected
+// SystemFormulasCheck verifies .gc/system/formulas/ exists and all expected
 // files are present with correct content.
 type SystemFormulasCheck struct {
 	CityPath string
@@ -923,7 +923,7 @@ type SystemFormulasCheck struct {
 // Name returns the check identifier.
 func (c *SystemFormulasCheck) Name() string { return "system-formulas" }
 
-// Run checks that the system-formulas directory has all expected files.
+// Run checks that the system formulas directory has all expected files.
 func (c *SystemFormulasCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 
@@ -933,10 +933,10 @@ func (c *SystemFormulasCheck) Run(_ *CheckContext) *CheckResult {
 		return r
 	}
 
-	sysDir := filepath.Join(c.CityPath, ".gc", "system-formulas")
+	sysDir := filepath.Join(c.CityPath, citylayout.SystemFormulasRoot)
 	if _, err := os.Stat(sysDir); err != nil {
 		r.Status = StatusError
-		r.Message = ".gc/system-formulas/ directory missing"
+		r.Message = ".gc/system/formulas/ directory missing"
 		r.FixHint = "run gc doctor --fix to re-materialize"
 		return r
 	}

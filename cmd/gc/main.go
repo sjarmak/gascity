@@ -15,6 +15,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	beadsexec "github.com/gastownhall/gascity/internal/beads/exec"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/telemetry"
@@ -179,27 +180,35 @@ func cliSessionName(cityPath, cityName, agentName, sessionTemplate string) strin
 	return sessionName(store, cityName, agentName, sessionTemplate)
 }
 
-// findCity walks dir upward looking for a directory containing .gc/.
-// Returns the city root path or an error.
+// findCity walks dir upward looking for a directory containing city.toml.
+// Falls back to legacy .gc/ markers for compatibility.
 func findCity(dir string) (string, error) {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
 		return "", err
 	}
+	var legacy string
 	for {
-		if fi, err := os.Stat(filepath.Join(dir, ".gc")); err == nil && fi.IsDir() {
+		if citylayout.HasCityConfig(dir) {
 			return dir, nil
+		}
+		if legacy == "" && citylayout.HasLegacyRuntimeRoot(dir) {
+			legacy = dir
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "", fmt.Errorf("not in a city directory (no .gc/ found)")
+			if legacy != "" {
+				return legacy, nil
+			}
+			return "", fmt.Errorf("not in a city directory (no city.toml or .gc/ found)")
 		}
 		dir = parent
 	}
 }
 
 // resolveCity returns the city root path. If --city was provided, it
-// verifies .gc/ exists there. Otherwise falls back to os.Getwd() →
+// verifies city.toml exists there (or falls back to legacy .gc/).
+// Otherwise falls back to os.Getwd() →
 // findCity().
 func resolveCity() (string, error) {
 	if cityFlag != "" {
@@ -207,10 +216,10 @@ func resolveCity() (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if fi, err := os.Stat(filepath.Join(p, ".gc")); err != nil || !fi.IsDir() {
-			return "", fmt.Errorf("not a city directory: %s (no .gc/ found)", p)
+		if citylayout.HasCityConfig(p) || citylayout.HasLegacyRuntimeRoot(p) {
+			return p, nil
 		}
-		return p, nil
+		return "", fmt.Errorf("not a city directory: %s (no city.toml or .gc/ found)", p)
 	}
 	cwd, err := os.Getwd()
 	if err != nil {

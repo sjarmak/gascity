@@ -1,19 +1,19 @@
 package main
 
-import "path/filepath"
+import (
+	"path/filepath"
 
-// materializeBuiltinPrompts writes embedded prompt files to .gc/prompts/.
+	"github.com/gastownhall/gascity/internal/citylayout"
+)
+
+// materializeBuiltinPrompts writes embedded prompt files to .gc/system/prompts/.
 // Files are always overwritten to stay in sync with the gc binary version.
 // Uses materializeFS to walk the embed.FS — no hardcoded filename list.
 func materializeBuiltinPrompts(cityPath string) error {
 	return materializeFS(defaultPrompts, "prompts",
-		filepath.Join(cityPath, ".gc", "prompts"))
+		filepath.Join(cityPath, citylayout.SystemPromptsRoot))
 }
 
-// materializeBuiltinFormulas writes embedded default formula files to .gc/formulas/.
-// Files are always overwritten to stay in sync with the gc binary version.
-// Uses materializeFS to walk the embed.FS — no hardcoded filename list.
-func materializeBuiltinFormulas(cityPath string) error {
-	return materializeFS(defaultFormulas, "formulas",
-		filepath.Join(cityPath, ".gc", "formulas"))
-}
+// materializeBuiltinFormulas is retained for callers that still expect the helper,
+// but city-local default formulas are now written only by gc init.
+func materializeBuiltinFormulas(_ string) error { return nil }

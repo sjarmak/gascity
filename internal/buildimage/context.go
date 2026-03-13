@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/citylayout"
 )
 
 // Options configures the build context assembly.
@@ -71,9 +73,20 @@ func AssembleContext(opts Options) error {
 		return fmt.Errorf("creating workspace dir: %w", err)
 	}
 
-	// Copy city directory contents into workspace, excluding runtime state.
-	if err := copyDirFiltered(opts.CityPath, wsDir); err != nil {
-		return fmt.Errorf("copying city to workspace: %w", err)
+	// Copy the checked-in city content roots only.
+	for _, rel := range []string{
+		citylayout.CityConfigFile,
+		"pack.lock",
+		citylayout.PromptsRoot,
+		citylayout.FormulasRoot,
+		citylayout.AutomationsRoot,
+		"packs",
+		citylayout.HooksRoot,
+		citylayout.ScriptsRoot,
+	} {
+		if err := copySelectedPath(opts.CityPath, wsDir, rel); err != nil {
+			return fmt.Errorf("copying %s: %w", rel, err)
+		}
 	}
 
 	// Copy rig paths into workspace.
@@ -109,6 +122,25 @@ func AssembleContext(opts Options) error {
 	return nil
 }
 
+func copySelectedPath(srcRoot, dstRoot, rel string) error {
+	src := filepath.Join(srcRoot, rel)
+	info, err := os.Stat(src)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	dst := filepath.Join(dstRoot, rel)
+	if info.IsDir() {
+		return copyDirFiltered(src, dst)
+	}
+	if excludedPath(rel) {
+		return nil
+	}
+	return copyFile(src, dst, info.Mode())
+}
+
 // copyDirFiltered copies src directory to dst, skipping excluded paths.
 func copyDirFiltered(src, dst string) error {
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
@@ -124,7 +156,11 @@ func copyDirFiltered(src, dst string) error {
 			return nil
 		}
 
-		if excludedPath(rel) {
+		fullRel, err := filepath.Rel(filepath.Dir(src), path)
+		if err != nil {
+			return err
+		}
+		if excludedPath(rel) || excludedPath(fullRel) {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}

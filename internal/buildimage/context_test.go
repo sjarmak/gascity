@@ -15,9 +15,8 @@ func TestAssembleContextBasic(t *testing.T) {
 	writeFile(t, cityDir, "city.toml", `[workspace]
 name = "test-city"
 `)
-	mkdirAll(t, cityDir, ".gc")
-	mkdirAll(t, cityDir, ".gc/prompts")
-	writeFile(t, cityDir, ".gc/prompts/mayor.md", "You are the mayor.")
+	mkdirAll(t, cityDir, "prompts")
+	writeFile(t, cityDir, "prompts/mayor.md", "You are the mayor.")
 
 	err := AssembleContext(Options{
 		CityPath:  cityDir,
@@ -40,11 +39,8 @@ name = "test-city"
 	// Verify workspace/city.toml exists.
 	assertFileExists(t, outputDir, "workspace/city.toml")
 
-	// Verify workspace/.gc/prompts/mayor.md exists.
-	assertFileExists(t, outputDir, "workspace/.gc/prompts/mayor.md")
-
-	// Verify .gc directory was copied (but runtime files excluded).
-	assertFileExists(t, outputDir, "workspace/.gc")
+	// Verify workspace/prompts/mayor.md exists.
+	assertFileExists(t, outputDir, "workspace/prompts/mayor.md")
 
 	// Verify manifest.
 	assertFileExists(t, outputDir, "workspace/.gc-prebaked")
@@ -79,8 +75,8 @@ name = "test-city"
 	writeFile(t, cityDir, "credentials.json", "{}")
 
 	// Create files that should be included.
-	mkdirAll(t, cityDir, ".gc/formulas")
-	writeFile(t, cityDir, ".gc/formulas/test.toml", "formula")
+	mkdirAll(t, cityDir, "formulas")
+	writeFile(t, cityDir, "formulas/test.toml", "formula")
 
 	err := AssembleContext(Options{
 		CityPath:  cityDir,
@@ -99,7 +95,7 @@ name = "test-city"
 	assertFileNotExists(t, outputDir, "workspace/credentials.json")
 
 	// Verify included files ARE present.
-	assertFileExists(t, outputDir, "workspace/.gc/formulas/test.toml")
+	assertFileExists(t, outputDir, "workspace/formulas/test.toml")
 	assertFileExists(t, outputDir, "workspace/city.toml")
 }
 
@@ -155,9 +151,9 @@ func TestExcludedPath(t *testing.T) {
 		{"credentials.json", true},
 		{"path/to/secret.key", true},
 		{"city.toml", false},
-		{".gc/formulas/test.toml", false},
-		{".gc/prompts/mayor.md", false},
-		{".gc/settings.json", false},
+		{"formulas/test.toml", false},
+		{"prompts/mayor.md", false},
+		{"hooks/claude.json", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {

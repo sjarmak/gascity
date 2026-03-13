@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/fsys"
 )
 
@@ -91,9 +92,9 @@ func Install(fs fsys.FS, cityDir, workDir string, providers []string) error {
 	return nil
 }
 
-// installClaude writes .gc/settings.json in the city directory.
+// installClaude writes hooks/claude.json in the city directory.
 func installClaude(fs fsys.FS, cityDir string) error {
-	dst := filepath.Join(cityDir, ".gc", "settings.json")
+	dst := filepath.Join(cityDir, citylayout.ClaudeHookFile)
 	return writeEmbedded(fs, "config/claude.json", dst)
 }
 

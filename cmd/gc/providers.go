@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	eventsexec "github.com/gastownhall/gascity/internal/events/exec"
@@ -187,7 +188,7 @@ func rawBeadsProvider(cityPath string) string {
 }
 
 // beadsProvider returns the bead store provider name for lifecycle operations.
-// Maps "bd" → "exec:<cityPath>/.gc/bin/gc-beads-bd" so all lifecycle operations
+// Maps "bd" → "exec:<cityPath>/.gc/system/bin/gc-beads-bd" so all lifecycle operations
 // route through the exec: protocol. Other providers pass through unchanged.
 //
 // Related env vars:
@@ -196,7 +197,7 @@ func rawBeadsProvider(cityPath string) string {
 func beadsProvider(cityPath string) string {
 	raw := rawBeadsProvider(cityPath)
 	if raw == "bd" {
-		return "exec:" + filepath.Join(cityPath, ".gc", "bin", "gc-beads-bd")
+		return "exec:" + filepath.Join(cityPath, citylayout.SystemBinRoot, "gc-beads-bd")
 	}
 	return raw
 }

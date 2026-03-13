@@ -55,9 +55,9 @@ func TestInstallClaude(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	data, ok := fs.Files["/city/.gc/settings.json"]
+	data, ok := fs.Files["/city/hooks/claude.json"]
 	if !ok {
-		t.Fatal("expected /city/.gc/settings.json to be written")
+		t.Fatal("expected /city/hooks/claude.json to be written")
 	}
 	s := string(data)
 	if !strings.Contains(s, "SessionStart") {
@@ -166,7 +166,7 @@ func TestInstallMultipleProviders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	if _, ok := fs.Files["/city/.gc/settings.json"]; !ok {
+	if _, ok := fs.Files["/city/hooks/claude.json"]; !ok {
 		t.Error("missing claude settings")
 	}
 	if _, ok := fs.Files["/work/.codex/hooks.json"]; !ok {
@@ -183,7 +183,7 @@ func TestInstallMultipleProviders(t *testing.T) {
 func TestInstallIdempotent(t *testing.T) {
 	fs := fsys.NewFake()
 	// Pre-populate with custom content.
-	fs.Files["/city/.gc/settings.json"] = []byte(`{"custom": true}`)
+	fs.Files["/city/hooks/claude.json"] = []byte(`{"custom": true}`)
 
 	err := Install(fs, "/city", "/work", []string{"claude"})
 	if err != nil {
@@ -191,7 +191,7 @@ func TestInstallIdempotent(t *testing.T) {
 	}
 
 	// Should not overwrite existing file.
-	got := string(fs.Files["/city/.gc/settings.json"])
+	got := string(fs.Files["/city/hooks/claude.json"])
 	if got != `{"custom": true}` {
 		t.Errorf("Install overwrote existing file: got %q", got)
 	}

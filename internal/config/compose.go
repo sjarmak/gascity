@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/fsys"
 )
 
@@ -156,9 +157,9 @@ func LoadWithIncludes(fs fsys.FS, path string, extraIncludes ...string) (*City, 
 	}
 
 	// Compute formula layers from all sources.
-	// Always use FormulasDir() which defaults to ".gc/formulas" when
+	// Always use FormulasDir() which defaults to "formulas" when
 	// [formulas] is not explicitly configured in city.toml.
-	cityLocalFormulas := resolveConfigPath(root.FormulasDir(), cityRoot, cityRoot)
+	cityLocalFormulas := citylayout.ResolveCityFormulasDir(fs, cityRoot, root.FormulasDir())
 	root.FormulaLayers = ComputeFormulaLayers(
 		cityTopoFormulas, cityLocalFormulas, rigFormulaDirs, root.Rigs, cityRoot)
 

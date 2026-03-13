@@ -46,8 +46,8 @@ func TestCityStructureCheck_MissingGC(t *testing.T) {
 
 	c := &CityStructureCheck{}
 	r := c.Run(&CheckContext{CityPath: dir})
-	if r.Status != StatusError {
-		t.Errorf("status = %d, want Error", r.Status)
+	if r.Status != StatusOK {
+		t.Errorf("status = %d, want OK", r.Status)
 	}
 }
 
@@ -59,8 +59,8 @@ func TestCityStructureCheck_MissingToml(t *testing.T) {
 
 	c := &CityStructureCheck{}
 	r := c.Run(&CheckContext{CityPath: dir})
-	if r.Status != StatusError {
-		t.Errorf("status = %d, want Error", r.Status)
+	if r.Status != StatusWarning {
+		t.Errorf("status = %d, want Warning", r.Status)
 	}
 }
 
@@ -735,7 +735,7 @@ func TestIsControllerRunning_UnlockedFile(t *testing.T) {
 
 func TestPackCacheCheck_OK(t *testing.T) {
 	dir := t.TempDir()
-	cacheDir := filepath.Join(dir, ".gc", "packs", "gastown")
+	cacheDir := filepath.Join(dir, ".gc", "cache", "packs", "gastown")
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -772,7 +772,7 @@ func TestPackCacheCheck_Missing(t *testing.T) {
 
 func TestPackCacheCheck_WithPath(t *testing.T) {
 	dir := t.TempDir()
-	cacheDir := filepath.Join(dir, ".gc", "packs", "mono", "packages", "topo")
+	cacheDir := filepath.Join(dir, ".gc", "cache", "packs", "mono", "packages", "topo")
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -794,7 +794,7 @@ func TestPackCacheCheck_WithPath(t *testing.T) {
 
 func TestSystemFormulasCheckOK(t *testing.T) {
 	dir := setupCity(t, "[workspace]\nname = \"test\"\n")
-	sysDir := filepath.Join(dir, ".gc", "system-formulas")
+	sysDir := filepath.Join(dir, ".gc", "system", "formulas")
 	if err := os.MkdirAll(sysDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -815,7 +815,7 @@ func TestSystemFormulasCheckOK(t *testing.T) {
 
 func TestSystemFormulasCheckMissing(t *testing.T) {
 	dir := setupCity(t, "[workspace]\nname = \"test\"\n")
-	// No .gc/system-formulas/ directory.
+	// No .gc/system/formulas/ directory.
 
 	c := &SystemFormulasCheck{
 		CityPath: dir,
@@ -829,7 +829,7 @@ func TestSystemFormulasCheckMissing(t *testing.T) {
 
 func TestSystemFormulasCheckStale(t *testing.T) {
 	dir := setupCity(t, "[workspace]\nname = \"test\"\n")
-	sysDir := filepath.Join(dir, ".gc", "system-formulas")
+	sysDir := filepath.Join(dir, ".gc", "system", "formulas")
 	if err := os.MkdirAll(sysDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -857,7 +857,7 @@ func TestSystemFormulasCheckFix(t *testing.T) {
 		CityPath: dir,
 		Expected: []string{"hello.formula.toml"},
 		FixFn: func() error {
-			sysDir := filepath.Join(dir, ".gc", "system-formulas")
+			sysDir := filepath.Join(dir, ".gc", "system", "formulas")
 			if err := os.MkdirAll(sysDir, 0o755); err != nil {
 				return err
 			}

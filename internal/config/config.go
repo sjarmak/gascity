@@ -10,6 +10,7 @@ import (
 	"unicode"
 
 	"github.com/BurntSushi/toml"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/fsys"
 )
 
@@ -645,8 +646,8 @@ type DoltConfig struct {
 
 // FormulasConfig holds formula directory settings.
 type FormulasConfig struct {
-	// Dir is the path to the formulas directory. Defaults to ".gc/formulas".
-	Dir string `toml:"dir,omitempty" jsonschema:"default=.gc/formulas"`
+	// Dir is the path to the formulas directory. Defaults to "formulas".
+	Dir string `toml:"dir,omitempty" jsonschema:"default=formulas"`
 }
 
 // AutomationsConfig holds automation settings.
@@ -901,12 +902,12 @@ func (d *DaemonConfig) WispGCEnabled() bool {
 	return d.WispGCIntervalDuration() > 0 && d.WispTTLDuration() > 0
 }
 
-// FormulasDir returns the formulas directory, defaulting to ".gc/formulas".
+// FormulasDir returns the formulas directory, defaulting to "formulas".
 func (c *City) FormulasDir() string {
 	if c.Formulas.Dir != "" {
 		return c.Formulas.Dir
 	}
-	return ".gc/formulas"
+	return citylayout.FormulasRoot
 }
 
 // AgentDefaults provides default values applied to all agents that don't
@@ -1494,7 +1495,7 @@ func ValidateRigs(rigs []Rig, cityName string) error {
 func DefaultCity(name string) City {
 	return City{
 		Workspace: Workspace{Name: name},
-		Agents:    []Agent{{Name: "mayor", PromptTemplate: ".gc/prompts/mayor.md"}},
+		Agents:    []Agent{{Name: "mayor", PromptTemplate: "prompts/mayor.md"}},
 	}
 }
 
@@ -1512,7 +1513,7 @@ func WizardCity(name, provider, startCommand string) City {
 	return City{
 		Workspace: ws,
 		Agents: []Agent{
-			{Name: "mayor", PromptTemplate: ".gc/prompts/mayor.md"},
+			{Name: "mayor", PromptTemplate: "prompts/mayor.md"},
 		},
 	}
 }

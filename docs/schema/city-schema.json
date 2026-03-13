@@ -931,8 +931,8 @@
       "properties": {
         "dir": {
           "type": "string",
-          "description": "Dir is the path to the formulas directory. Defaults to \".gc/formulas\".",
-          "default": ".gc/formulas"
+          "description": "Dir is the path to the formulas directory. Defaults to \"formulas\".",
+          "default": "formulas"
         }
       },
       "additionalProperties": false,

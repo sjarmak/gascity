@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agent"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/telemetry"
 )
@@ -130,7 +132,7 @@ func resolveSetupScript(script, cityPath string) string {
 	if script == "" || filepath.IsAbs(script) {
 		return script
 	}
-	return filepath.Join(cityPath, script)
+	return citylayout.ResolveReadPath(fsys.OSFS{}, cityPath, script)
 }
 
 // deepCopyAgent creates a deep copy of a config.Agent with a new name and dir.

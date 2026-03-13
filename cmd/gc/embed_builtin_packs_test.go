@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 )
 
@@ -16,21 +17,21 @@ func TestMaterializeBuiltinPacks(t *testing.T) {
 	}
 
 	// Verify bd pack.toml exists.
-	bdToml := filepath.Join(dir, ".gc", "packs", "bd", "pack.toml")
+	bdToml := filepath.Join(dir, citylayout.SystemPacksRoot, "bd", "pack.toml")
 	if _, err := os.Stat(bdToml); err != nil {
 		t.Errorf("bd pack.toml missing: %v", err)
 	}
 
 	// Verify dolt pack.toml exists.
-	doltToml := filepath.Join(dir, ".gc", "packs", "dolt", "pack.toml")
+	doltToml := filepath.Join(dir, citylayout.SystemPacksRoot, "dolt", "pack.toml")
 	if _, err := os.Stat(doltToml); err != nil {
 		t.Errorf("dolt pack.toml missing: %v", err)
 	}
 
 	// Verify doctor scripts are executable.
 	for _, script := range []string{
-		filepath.Join(dir, ".gc", "packs", "bd", "doctor", "check-bd.sh"),
-		filepath.Join(dir, ".gc", "packs", "dolt", "doctor", "check-dolt.sh"),
+		filepath.Join(dir, citylayout.SystemPacksRoot, "bd", "doctor", "check-bd.sh"),
+		filepath.Join(dir, citylayout.SystemPacksRoot, "dolt", "doctor", "check-dolt.sh"),
 	} {
 		info, err := os.Stat(script)
 		if err != nil {
@@ -43,7 +44,7 @@ func TestMaterializeBuiltinPacks(t *testing.T) {
 	}
 
 	// Verify dolt commands are executable.
-	cmds := filepath.Join(dir, ".gc", "packs", "dolt", "commands")
+	cmds := filepath.Join(dir, citylayout.SystemPacksRoot, "dolt", "commands")
 	entries, err := os.ReadDir(cmds)
 	if err != nil {
 		t.Fatalf("reading dolt commands dir: %v", err)
@@ -63,7 +64,7 @@ func TestMaterializeBuiltinPacks(t *testing.T) {
 	}
 
 	// Verify formulas exist.
-	formulasDir := filepath.Join(dir, ".gc", "packs", "dolt", "formulas")
+	formulasDir := filepath.Join(dir, citylayout.SystemPacksRoot, "dolt", "formulas")
 	if _, err := os.Stat(formulasDir); err != nil {
 		t.Errorf("dolt formulas dir missing: %v", err)
 	}
@@ -87,7 +88,7 @@ func TestMaterializeBuiltinPacks_Idempotent(t *testing.T) {
 	}
 
 	// Files should still exist.
-	if _, err := os.Stat(filepath.Join(dir, ".gc", "packs", "bd", "pack.toml")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, citylayout.SystemPacksRoot, "bd", "pack.toml")); err != nil {
 		t.Error("bd pack.toml missing after second call")
 	}
 }

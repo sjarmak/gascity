@@ -6,10 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/gastownhall/gascity/internal/citylayout"
 )
 
 // MaterializeSystemFormulas writes embedded system formula files to
-// .gc/system-formulas/ in the city directory. Files are always overwritten
+// .gc/system/formulas/ in the city directory. Files are always overwritten
 // to stay in sync with the gc binary version. Returns the directory path
 // (for use as Layer 0), or "" if there are no embedded system formulas.
 // Removes stale files that are no longer in the embedded FS.
@@ -21,9 +23,9 @@ func MaterializeSystemFormulas(embedded fs.FS, subdir, cityPath string) (string,
 		return "", nil
 	}
 
-	sysDir := filepath.Join(cityPath, ".gc", "system-formulas")
+	sysDir := filepath.Join(cityPath, citylayout.SystemFormulasRoot)
 	if err := os.MkdirAll(sysDir, 0o755); err != nil {
-		return "", fmt.Errorf("creating system-formulas dir: %w", err)
+		return "", fmt.Errorf("creating system formulas dir: %w", err)
 	}
 
 	// Write all embedded files (always overwrite to track binary version).

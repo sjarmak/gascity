@@ -10,10 +10,11 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/gastownhall/gascity/examples/bd"
 	"github.com/gastownhall/gascity/examples/dolt"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 )
 
-// builtinPack pairs an embedded FS with the subdirectory name used under .gc/packs/.
+// builtinPack pairs an embedded FS with the subdirectory name used under .gc/system/packs/.
 type builtinPack struct {
 	fs   fs.FS
 	name string // e.g. "bd", "dolt"
@@ -27,13 +28,13 @@ var builtinPacks = []builtinPack{
 }
 
 // MaterializeBuiltinPacks writes the embedded bd and dolt pack files to
-// .gc/packs/bd/ and .gc/packs/dolt/ in the city directory. Files are always
+// .gc/system/packs/bd/ and .gc/system/packs/dolt/ in the city directory. Files are always
 // overwritten to stay in sync with the gc binary version (same pattern as
 // system formulas and gc-beads-bd). Shell scripts get 0755; everything else 0644.
 // Idempotent: safe to call on every gc start and gc init.
 func MaterializeBuiltinPacks(cityPath string) error {
 	for _, bp := range builtinPacks {
-		dst := filepath.Join(cityPath, ".gc", "packs", bp.name)
+		dst := filepath.Join(cityPath, citylayout.SystemPacksRoot, bp.name)
 		if err := materializeFS(bp.fs, ".", dst); err != nil {
 			return fmt.Errorf("materializing %s pack: %w", bp.name, err)
 		}
@@ -100,24 +101,25 @@ func injectBuiltinPacks(cfg *config.City, cityPath string) {
 		return
 	}
 
-	bdDir := filepath.Join(cityPath, ".gc", "packs", "bd")
-	if _, err := os.Stat(filepath.Join(bdDir, "pack.toml")); err != nil {
-		return // Not materialized yet.
+	builtinRoots := map[string]string{
+		"bd":   filepath.Join(cityPath, citylayout.SystemPacksRoot, "bd"),
+		"dolt": filepath.Join(cityPath, citylayout.SystemPacksRoot, "dolt"),
+	}
+	if _, err := os.Stat(filepath.Join(builtinRoots["bd"], "pack.toml")); err != nil {
+		return
 	}
 
-	// Check if any existing PackDirs entry already provides a pack named "bd".
+	// Any user-supplied override of bd or dolt suppresses the whole builtin family.
 	for _, dir := range cfg.PackDirs {
-		if readPackName(dir) == "bd" {
-			return // User-supplied bd pack takes precedence.
+		switch readPackName(dir) {
+		case "bd", "dolt":
+			return
 		}
 	}
 
-	// Inject bd pack dir. The dolt pack is pulled in via bd's includes = ["../dolt"],
-	// but we also add it explicitly so it appears in PackDirs for direct lookups.
-	doltDir := filepath.Join(cityPath, ".gc", "packs", "dolt")
-	cfg.PackDirs = append(cfg.PackDirs, bdDir)
-	if _, err := os.Stat(filepath.Join(doltDir, "pack.toml")); err == nil {
-		cfg.PackDirs = append(cfg.PackDirs, doltDir)
+	cfg.PackDirs = append(cfg.PackDirs, builtinRoots["bd"])
+	if _, err := os.Stat(filepath.Join(builtinRoots["dolt"], "pack.toml")); err == nil {
+		cfg.PackDirs = append(cfg.PackDirs, builtinRoots["dolt"])
 	}
 }
 

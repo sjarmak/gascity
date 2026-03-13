@@ -6,12 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/gastownhall/gascity/internal/citylayout"
 )
 
-// includeCacheDir is the subdirectory under .gc/packs/ where
-// pack includes are cached. The _inc/ prefix prevents collisions
-// with named packs (which use .gc/packs/<name>/).
-const includeCacheDir = "_inc"
+// includeCacheDir is the subdirectory under .gc/cache/includes/ where
+// remote pack includes are cached.
+const includeCacheDir = citylayout.CacheIncludesRoot
 
 // isRemoteInclude reports whether s is a remote include URL
 // (git@, ssh://, https://, http://, or file://).
@@ -159,10 +160,10 @@ func resolvePackRef(ref, declDir, cityRoot string) (string, error) {
 // fetchRemoteInclude ensures a remote pack include is cached locally.
 // Returns the path to the cached pack directory (including subpath
 // resolution). Clones on first access, updates on subsequent calls.
-// Cache location: <cityRoot>/.gc/packs/_inc/<cache-name>/
+// Cache location: <cityRoot>/.gc/cache/includes/<cache-name>/
 func fetchRemoteInclude(source, ref, cityRoot string) (string, error) {
 	cacheName := includeCacheName(source)
-	cacheDir := filepath.Join(cityRoot, ".gc", packCacheDir, includeCacheDir, cacheName)
+	cacheDir := filepath.Join(cityRoot, includeCacheDir, cacheName)
 
 	if _, err := os.Stat(filepath.Join(cacheDir, ".git")); err != nil {
 		// Not yet cloned.

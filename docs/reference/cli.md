@@ -1802,9 +1802,21 @@ gc supervisor
 
 | Subcommand | Description |
 |------------|-------------|
+| [gc supervisor reload](#gc-supervisor-reload) | Trigger immediate reconciliation of all cities |
 | [gc supervisor start](#gc-supervisor-start) | Start the machine-wide supervisor (foreground) |
 | [gc supervisor status](#gc-supervisor-status) | Check if the supervisor is running |
 | [gc supervisor stop](#gc-supervisor-stop) | Stop the machine-wide supervisor |
+
+## gc supervisor reload
+
+Send a reload signal to the running supervisor, causing it to
+immediately re-read the registry and reconcile all cities. Use this
+after killing a child process to force the supervisor to detect the
+change and restart it without waiting for the next patrol tick.
+
+```
+gc supervisor reload
+```
 
 ## gc supervisor start
 
@@ -1868,3 +1880,4 @@ When built with go install, VCS metadata is read from the binary.
 ```
 gc version
 ```
+

@@ -271,7 +271,7 @@ FormulasConfig holds formula directory settings.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `dir` | string |  | `.gc/formulas` | Dir is the path to the formulas directory. Defaults to ".gc/formulas". |
+| `dir` | string |  | `formulas` | Dir is the path to the formulas directory. Defaults to "formulas". |
 
 ## K8sConfig
 

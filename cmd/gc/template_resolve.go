@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/agent"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/convergence"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -102,10 +103,10 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	command := resolved.CommandString()
 	if sa := settingsArgs(p.cityPath, resolved.Name); sa != "" {
 		command = command + " " + sa
-		settingsFile := filepath.Join(p.cityPath, ".gc", "settings.json")
+		settingsFile := citylayout.ResolveReadPath(p.fs, p.cityPath, citylayout.ClaudeHookFile)
 		copyFiles = append(copyFiles, runtime.CopyEntry{Src: settingsFile, RelDst: filepath.Join(".gc", "settings.json")})
 	}
-	scriptsDir := filepath.Join(p.cityPath, ".gc", "scripts")
+	scriptsDir := citylayout.ResolveScriptsDir(p.fs, p.cityPath)
 	if info, sErr := os.Stat(scriptsDir); sErr == nil && info.IsDir() {
 		copyFiles = append(copyFiles, runtime.CopyEntry{Src: scriptsDir, RelDst: filepath.Join(".gc", "scripts")})
 	}

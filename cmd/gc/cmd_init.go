@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/hooks"
@@ -213,7 +214,7 @@ existing TOML config file.`,
 
 // cmdInit initializes a new city at the given path (or cwd if no path given).
 // Runs the interactive wizard to choose a config template and provider.
-// Creates .gc/ and city.toml. If the bead provider is "bd", also
+// Creates the runtime scaffold and city.toml. If the bead provider is "bd", also
 // runs bd init.
 func cmdInit(args []string, providerFlag, bootstrapProfileFlag string, stdout, stderr io.Writer) int {
 	var cityPath string
@@ -326,7 +327,7 @@ func cmdInitFromFile(fileArg string, args []string, stdout, stderr io.Writer) in
 }
 
 // cmdInitFromTOMLFile initializes a city by copying a user-provided TOML
-// file as city.toml. Creates .gc/, .gc/prompts/, and runs bead init.
+// file as city.toml. Creates the runtime scaffold, visible roots, and runs bead init.
 func cmdInitFromTOMLFile(fs fsys.FS, tomlSrc, cityPath string, stdout, stderr io.Writer) int {
 	// Validate the source file parses as a valid city config.
 	data, err := os.ReadFile(tomlSrc)
@@ -352,12 +353,12 @@ func cmdInitFromTOMLFile(fs fsys.FS, tomlSrc, cityPath string, stdout, stderr io
 	}
 
 	// Create directory structure.
-	gcDir := filepath.Join(cityPath, ".gc")
+	gcDir := filepath.Join(cityPath, citylayout.RuntimeRoot)
 	if _, err := fs.Stat(gcDir); err == nil {
 		fmt.Fprintln(stderr, "gc init: already initialized") //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	if err := fs.MkdirAll(gcDir, 0o755); err != nil {
+	if err := ensureCityScaffoldFS(fs, cityPath); err != nil {
 		fmt.Fprintf(stderr, "gc init: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -378,7 +379,7 @@ func cmdInitFromTOMLFile(fs fsys.FS, tomlSrc, cityPath string, stdout, stderr io
 
 	// Materialize system formulas and resolve formula symlinks so bd finds them immediately after init.
 	sysDir, _ := MaterializeSystemFormulas(systemFormulasFS, "system_formulas", cityPath)
-	formulasInitDir := filepath.Join(cityPath, ".gc", "formulas")
+	formulasInitDir := filepath.Join(cityPath, citylayout.FormulasRoot)
 	initLayers := []string{}
 	if sysDir != "" {
 		initLayers = append(initLayers, sysDir)
@@ -408,12 +409,12 @@ func cmdInitFromTOMLFile(fs fsys.FS, tomlSrc, cityPath string, stdout, stderr io
 }
 
 // doInit is the pure logic for "gc init". It creates the city directory
-// structure (.gc/) and writes city.toml. Tutorial configs use WizardCity
+// structure and writes city.toml. Tutorial configs use WizardCity
 // when a provider or start command is supplied; otherwise init writes the
-// default mayor-only city. Errors if .gc/ already exists. Accepts an
+// default mayor-only city. Errors if the runtime scaffold already exists. Accepts an
 // injected FS for testability.
 func doInit(fs fsys.FS, cityPath string, wiz wizardConfig, stdout, stderr io.Writer) int {
-	gcDir := filepath.Join(cityPath, ".gc")
+	gcDir := filepath.Join(cityPath, citylayout.RuntimeRoot)
 
 	// Check if already initialized.
 	if _, err := fs.Stat(gcDir); err == nil {
@@ -422,7 +423,7 @@ func doInit(fs fsys.FS, cityPath string, wiz wizardConfig, stdout, stderr io.Wri
 	}
 
 	// Create directory structure.
-	if err := fs.MkdirAll(gcDir, 0o755); err != nil {
+	if err := ensureCityScaffoldFS(fs, cityPath); err != nil {
 		fmt.Fprintf(stderr, "gc init: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -443,7 +444,7 @@ func doInit(fs fsys.FS, cityPath string, wiz wizardConfig, stdout, stderr io.Wri
 
 	// Materialize system formulas and resolve formula symlinks so bd finds them immediately after init.
 	sysDir, _ := MaterializeSystemFormulas(systemFormulasFS, "system_formulas", cityPath)
-	formulasDir := filepath.Join(cityPath, ".gc", "formulas")
+	formulasDir := filepath.Join(cityPath, citylayout.FormulasRoot)
 	initLayers := []string{}
 	if sysDir != "" {
 		initLayers = append(initLayers, sysDir)
@@ -509,11 +510,11 @@ func installClaudeHooks(fs fsys.FS, cityPath string, stderr io.Writer) int {
 	return 0
 }
 
-// writeDefaultPrompts creates the .gc/prompts/ directory and writes all
+// writeDefaultPrompts creates the prompts/ directory and writes all
 // embedded prompt files. Walks the embed.FS dynamically — no hardcoded
 // filename list. Uses the injected FS for I/O (testability with mock FS).
 func writeDefaultPrompts(fs fsys.FS, cityPath string, stderr io.Writer) int {
-	promptsDir := filepath.Join(cityPath, ".gc", "prompts")
+	promptsDir := filepath.Join(cityPath, citylayout.PromptsRoot)
 	if err := fs.MkdirAll(promptsDir, 0o755); err != nil {
 		fmt.Fprintf(stderr, "gc init: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -541,11 +542,11 @@ func writeDefaultPrompts(fs fsys.FS, cityPath string, stderr io.Writer) int {
 	return 0
 }
 
-// writeDefaultFormulas creates the .gc/formulas/ directory and writes
+// writeDefaultFormulas creates the formulas/ directory and writes
 // embedded example formula files. Walks the embed.FS dynamically — no
 // hardcoded filename list. Uses the injected FS for I/O (testability).
 func writeDefaultFormulas(fs fsys.FS, cityPath string, stderr io.Writer) int {
-	formulasDir := filepath.Join(cityPath, ".gc", "formulas")
+	formulasDir := filepath.Join(cityPath, citylayout.FormulasRoot)
 	if err := fs.MkdirAll(formulasDir, 0o755); err != nil {
 		fmt.Fprintf(stderr, "gc init: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -575,17 +576,17 @@ func writeDefaultFormulas(fs fsys.FS, cityPath string, stderr io.Writer) int {
 
 // initFromSkip returns true for files and directories that should be excluded
 // when copying a city template directory via --from. Skips .gc/ runtime state
-// (but preserves .gc/prompts/, which is user-editable config) and Go test files.
+// but keeps legacy city-owned content so it can be remapped into visible roots.
 func initFromSkip(relPath string, isDir bool) bool {
 	top, rest, _ := strings.Cut(relPath, string(filepath.Separator))
 	if top == ".gc" {
-		// Let the walker enter .gc/ so it can reach .gc/prompts/.
+		// Let the walker enter .gc/ so it can reach legacy city-owned content.
 		if rest == "" {
 			return false
 		}
-		// Allow .gc/prompts/ through — it's user-editable config, not runtime state.
+		// Allow the legacy user-owned content that gets remapped after copy.
 		sub, _, _ := strings.Cut(rest, string(filepath.Separator))
-		if sub == "prompts" {
+		if sub == "prompts" || sub == "formulas" || sub == "scripts" || rest == "settings.json" {
 			return false
 		}
 		// Skip all other .gc/ contents (runtime state).
@@ -638,7 +639,7 @@ func doInitFromDir(srcDir, cityPath string, stdout, stderr io.Writer) int {
 	}
 
 	// Check target not already initialized.
-	gcDir := filepath.Join(cityPath, ".gc")
+	gcDir := filepath.Join(cityPath, citylayout.RuntimeRoot)
 	if _, err := fs.Stat(gcDir); err == nil {
 		fmt.Fprintln(stderr, "gc init: already initialized") //nolint:errcheck // best-effort stderr
 		return 1
@@ -652,6 +653,10 @@ func doInitFromDir(srcDir, cityPath string, stdout, stderr io.Writer) int {
 
 	// Copy directory tree (skip .gc/ and *_test.go).
 	if err := overlay.CopyDirWithSkip(srcDir, cityPath, initFromSkip, stderr); err != nil {
+		fmt.Fprintf(stderr, "gc init --from: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if err := normalizeInitFromLegacyContent(cityPath); err != nil {
 		fmt.Fprintf(stderr, "gc init --from: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -680,8 +685,8 @@ func doInitFromDir(srcDir, cityPath string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// Create .gc/ dir.
-	if err := fs.MkdirAll(gcDir, 0o755); err != nil {
+	// Create runtime scaffold.
+	if err := ensureCityScaffold(cityPath); err != nil {
 		fmt.Fprintf(stderr, "gc init: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -694,11 +699,9 @@ func doInitFromDir(srcDir, cityPath string, stdout, stderr io.Writer) int {
 	// Resolve formulas from pack layers.
 	expandedCfg, _, loadErr := config.LoadWithIncludes(fsys.OSFS{}, copiedToml)
 	if loadErr == nil && len(expandedCfg.FormulaLayers.City) > 0 {
-		formulasDir := filepath.Join(cityPath, ".gc", "formulas")
 		if rfErr := ResolveFormulas(cityPath, expandedCfg.FormulaLayers.City); rfErr != nil {
 			fmt.Fprintf(stderr, "gc init: resolving formulas: %v\n", rfErr) //nolint:errcheck // best-effort stderr
 		}
-		_ = formulasDir // used indirectly by ResolveFormulas
 	}
 
 	fmt.Fprintln(stdout, "Welcome to Gas City!")                                           //nolint:errcheck // best-effort stdout

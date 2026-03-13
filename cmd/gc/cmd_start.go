@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
@@ -258,6 +259,10 @@ func doStart(args []string, controllerMode bool, stdout, stderr io.Writer) int {
 	cityPath, err := findCity(dir)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc start: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if err := ensureCityScaffold(cityPath); err != nil {
+		fmt.Fprintf(stderr, "gc start: runtime scaffold: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 	// Auto-fetch remote packs before full config load.
@@ -535,7 +540,7 @@ func settingsArgs(cityPath, providerName string) string {
 	if providerName != "claude" {
 		return ""
 	}
-	settingsPath := filepath.Join(cityPath, ".gc", "settings.json")
+	settingsPath := citylayout.ResolveReadPath(fsys.OSFS{}, cityPath, citylayout.ClaudeHookFile)
 	if _, err := os.Stat(settingsPath); err != nil {
 		return ""
 	}
@@ -572,7 +577,7 @@ func stageHookFiles(copyFiles []runtime.CopyEntry, cityPath, workDir string) []r
 	// cityDir-based hooks: claude (.gc/settings.json).
 	// Skip if settingsArgs already added it.
 	settingsRel := filepath.Join(".gc", "settings.json")
-	settingsAbs := filepath.Join(cityPath, settingsRel)
+	settingsAbs := citylayout.ResolveReadPath(fsys.OSFS{}, cityPath, citylayout.ClaudeHookFile)
 	if _, err := os.Stat(settingsAbs); err == nil {
 		alreadyStaged := false
 		for _, cf := range copyFiles {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/automations"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
@@ -169,12 +170,30 @@ func loadAutomations(stderr io.Writer, cmdName string) ([]automations.Automation
 // loadAllAutomations scans city layers + per-rig exclusive layers for automations.
 // Rig automations get their Rig field stamped.
 func loadAllAutomations(cityPath string, cfg *config.City, stderr io.Writer, cmdName string) ([]automations.Automation, int) {
-	// City-level automations.
-	cLayers := cityFormulaLayers(cityPath, cfg)
-	cityAA, err := automations.Scan(fsys.OSFS{}, cLayers, cfg.Automations.Skip)
+	allAA, err := scanAllAutomations(cityPath, cfg, stderr, cmdName)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", cmdName, err) //nolint:errcheck // best-effort stderr
 		return nil, 1
+	}
+
+	// Apply automation overrides from city config.
+	if len(cfg.Automations.Overrides) > 0 {
+		if err := automations.ApplyOverrides(allAA, convertOverrides(cfg.Automations.Overrides)); err != nil {
+			fmt.Fprintf(stderr, "%s: %v\n", cmdName, err) //nolint:errcheck // best-effort stderr
+			return nil, 1
+		}
+	}
+
+	return allAA, 0
+}
+
+func scanAllAutomations(cityPath string, cfg *config.City, stderr io.Writer, cmdName string) ([]automations.Automation, error) {
+	// City-level automations.
+	cRoots := cityAutomationRoots(cityPath, cfg)
+	cLayers := cityFormulaLayers(cityPath, cfg)
+	cityAA, err := automations.ScanRoots(fsys.OSFS{}, cRoots, cfg.Automations.Skip)
+	if err != nil {
+		return nil, err
 	}
 
 	// Per-rig automations from rig-exclusive layers.
@@ -184,7 +203,7 @@ func loadAllAutomations(cityPath string, cfg *config.City, stderr io.Writer, cmd
 		if len(exclusive) == 0 {
 			continue
 		}
-		ra, err := automations.Scan(fsys.OSFS{}, exclusive, cfg.Automations.Skip)
+		ra, err := automations.ScanRoots(fsys.OSFS{}, rigAutomationRoots(cityPath, cfg, exclusive), cfg.Automations.Skip)
 		if err != nil {
 			fmt.Fprintf(stderr, "%s: rig %s: %v\n", cmdName, rigName, err) //nolint:errcheck // best-effort stderr
 			continue
@@ -198,16 +217,7 @@ func loadAllAutomations(cityPath string, cfg *config.City, stderr io.Writer, cmd
 	allAA := make([]automations.Automation, 0, len(cityAA)+len(rigAA))
 	allAA = append(allAA, cityAA...)
 	allAA = append(allAA, rigAA...)
-
-	// Apply automation overrides from city config.
-	if len(cfg.Automations.Overrides) > 0 {
-		if err := automations.ApplyOverrides(allAA, convertOverrides(cfg.Automations.Overrides)); err != nil {
-			fmt.Fprintf(stderr, "%s: %v\n", cmdName, err) //nolint:errcheck // best-effort stderr
-			return nil, 1
-		}
-	}
-
-	return allAA, 0
+	return allAA, nil
 }
 
 // cityFormulaLayers returns the formula directory layers for city-level automation
@@ -217,7 +227,42 @@ func cityFormulaLayers(cityPath string, cfg *config.City) []string {
 	if len(cfg.FormulaLayers.City) > 0 {
 		return cfg.FormulaLayers.City
 	}
-	return []string{filepath.Join(cityPath, cfg.FormulasDir())}
+	return []string{citylayout.ResolveCityFormulasDir(fsys.OSFS{}, cityPath, cfg.FormulasDir())}
+}
+
+func cityAutomationRoots(cityPath string, cfg *config.City) []automations.ScanRoot {
+	formulaLayers := cityFormulaLayers(cityPath, cfg)
+	localFormulas := citylayout.ResolveCityFormulasDir(fsys.OSFS{}, cityPath, cfg.FormulasDir())
+	roots := make([]automations.ScanRoot, 0, len(formulaLayers)+2)
+	for _, layer := range formulaLayers {
+		formulaRoot := filepath.Join(layer, "automations")
+		if layer == localFormulas {
+			roots = append(roots, automations.ScanRoot{
+				Dir:          formulaRoot,
+				FormulaLayer: localFormulas,
+			})
+			for _, root := range citylayout.ResolveCityAutomationRoots(fsys.OSFS{}, cityPath) {
+				roots = append(roots, automations.ScanRoot{Dir: root})
+			}
+			continue
+		}
+		roots = append(roots, automations.ScanRoot{
+			Dir:          formulaRoot,
+			FormulaLayer: layer,
+		})
+	}
+	return roots
+}
+
+func rigAutomationRoots(_ string, _ *config.City, formulaLayers []string) []automations.ScanRoot {
+	roots := make([]automations.ScanRoot, 0, len(formulaLayers))
+	for _, layer := range formulaLayers {
+		roots = append(roots, automations.ScanRoot{
+			Dir:          filepath.Join(layer, "automations"),
+			FormulaLayer: layer,
+		})
+	}
+	return roots
 }
 
 // --- gc automation list ---

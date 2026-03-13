@@ -713,7 +713,7 @@ func TestResolveNamedPacks_Basic(t *testing.T) {
 
 	resolveNamedPacks(cfg, "/city")
 
-	want := "/city/.gc/packs/gastown"
+	want := "/city/.gc/cache/packs/gastown"
 	if cfg.Rigs[0].Includes[0] != want {
 		t.Errorf("Includes[0] = %q, want %q", cfg.Rigs[0].Includes[0], want)
 	}
@@ -731,7 +731,7 @@ func TestResolveNamedPacks_WithPath(t *testing.T) {
 
 	resolveNamedPacks(cfg, "/city")
 
-	want := "/city/.gc/packs/mono/packages/topo"
+	want := "/city/.gc/cache/packs/mono/packages/topo"
 	if cfg.Rigs[0].Includes[0] != want {
 		t.Errorf("Includes[0] = %q, want %q", cfg.Rigs[0].Includes[0], want)
 	}
@@ -1177,7 +1177,7 @@ func TestFormulaLayers_MultipleCityAndRigTopoFormulas(t *testing.T) {
 
 	fl := ComputeFormulaLayers(
 		[]string{"/city/topo-a/formulas", "/city/topo-b/formulas"},
-		"/city/.gc/formulas",
+		"/city/formulas",
 		rigTopoFormulas, rigs, "/city")
 
 	// City layers: 2 topo + 1 local = 3.
@@ -1190,7 +1190,7 @@ func TestFormulaLayers_MultipleCityAndRigTopoFormulas(t *testing.T) {
 	if fl.City[1] != "/city/topo-b/formulas" {
 		t.Errorf("City[1] = %q", fl.City[1])
 	}
-	if fl.City[2] != "/city/.gc/formulas" {
+	if fl.City[2] != "/city/formulas" {
 		t.Errorf("City[2] = %q", fl.City[2])
 	}
 
@@ -1394,7 +1394,7 @@ name = "mayor"
 // --- FormulaLayers tests ---
 
 func TestFormulaLayers_CityOnly(t *testing.T) {
-	fl := ComputeFormulaLayers([]string{"/city/topo/formulas"}, "/city/.gc/formulas", nil, nil, "/city")
+	fl := ComputeFormulaLayers([]string{"/city/topo/formulas"}, "/city/formulas", nil, nil, "/city")
 
 	if len(fl.City) != 2 {
 		t.Fatalf("City layers = %d, want 2", len(fl.City))
@@ -1402,7 +1402,7 @@ func TestFormulaLayers_CityOnly(t *testing.T) {
 	if fl.City[0] != "/city/topo/formulas" {
 		t.Errorf("City[0] = %q, want city topo formulas", fl.City[0])
 	}
-	if fl.City[1] != "/city/.gc/formulas" {
+	if fl.City[1] != "/city/formulas" {
 		t.Errorf("City[1] = %q, want city local formulas", fl.City[1])
 	}
 	if len(fl.Rigs) != 0 {
@@ -1418,7 +1418,7 @@ func TestFormulaLayers_WithRigs(t *testing.T) {
 		{Name: "hw", Path: "/home/user/hw", FormulasDir: "local-formulas"},
 	}
 
-	fl := ComputeFormulaLayers([]string{"/city/topo/formulas"}, "/city/.gc/formulas", rigTopoFormulas, rigs, "/city")
+	fl := ComputeFormulaLayers([]string{"/city/topo/formulas"}, "/city/formulas", rigTopoFormulas, rigs, "/city")
 
 	// City layers should be [city-topo, city-local].
 	if len(fl.City) != 2 {
@@ -1433,7 +1433,7 @@ func TestFormulaLayers_WithRigs(t *testing.T) {
 	if hwLayers[0] != "/city/topo/formulas" {
 		t.Errorf("hw[0] = %q, want city topo", hwLayers[0])
 	}
-	if hwLayers[1] != "/city/.gc/formulas" {
+	if hwLayers[1] != "/city/formulas" {
 		t.Errorf("hw[1] = %q, want city local", hwLayers[1])
 	}
 	if hwLayers[2] != "/city/packs/gt/formulas" {

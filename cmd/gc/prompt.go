@@ -10,6 +10,7 @@ import (
 	"text/template"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/git"
@@ -44,7 +45,15 @@ func renderPrompt(fs fsys.FS, cityPath, cityName, templatePath string, ctx Promp
 	if templatePath == "" {
 		return ""
 	}
-	data, err := fs.ReadFile(filepath.Join(cityPath, templatePath))
+	resolved := citylayout.ResolveCityOwnedPath(fs, cityPath, templatePath)
+	sourcePath := citylayout.ResolveReadPath(fs, cityPath, templatePath)
+	data, err := fs.ReadFile(sourcePath)
+	if err != nil && resolved.Asset == citylayout.AssetPrompt {
+		rel := strings.TrimPrefix(resolved.Canonical, citylayout.PromptsRoot+"/")
+		fallback := filepath.Join(cityPath, citylayout.SystemPromptsRoot, rel)
+		data, err = fs.ReadFile(fallback)
+		sourcePath = fallback
+	}
 	if err != nil {
 		return ""
 	}
@@ -63,7 +72,7 @@ func renderPrompt(fs fsys.FS, cityPath, cityName, templatePath string, ctx Promp
 
 	// Load shared templates from sibling shared/ directory (highest priority —
 	// wins on name collision with cross-pack templates).
-	sharedDir := filepath.Join(cityPath, filepath.Dir(templatePath), "shared")
+	sharedDir := filepath.Join(filepath.Dir(sourcePath), "shared")
 	loadSharedTemplates(fs, tmpl, sharedDir, stderr)
 
 	// Parse main template last — its body becomes the "prompt" template.

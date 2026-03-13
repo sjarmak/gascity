@@ -309,7 +309,7 @@ func TestFetchPacks_ClonesMissing(t *testing.T) {
 	}
 
 	// Verify cache exists.
-	topoFile := filepath.Join(cityRoot, ".gc", "packs", "myremote", "pack.toml")
+	topoFile := filepath.Join(cityRoot, ".gc", "cache", "packs", "myremote", "pack.toml")
 	if _, err := os.Stat(topoFile); err != nil {
 		t.Errorf("expected cache to exist: %v", err)
 	}
@@ -444,13 +444,13 @@ func TestLockFromCache(t *testing.T) {
 
 func TestPackCachePath(t *testing.T) {
 	got := PackCachePath("/city", "gastown", PackSource{Source: "url"})
-	want := "/city/.gc/packs/gastown"
+	want := "/city/.gc/cache/packs/gastown"
 	if got != want {
 		t.Errorf("PackCachePath = %q, want %q", got, want)
 	}
 
 	got = PackCachePath("/city", "mono", PackSource{Source: "url", Path: "packages/topo"})
-	want = "/city/.gc/packs/mono/packages/topo"
+	want = "/city/.gc/cache/packs/mono/packages/topo"
 	if got != want {
 		t.Errorf("PackCachePath with Path = %q, want %q", got, want)
 	}
@@ -471,7 +471,7 @@ func TestFetchPacks_WithRefTag(t *testing.T) {
 		t.Fatalf("FetchPacks with ref: %v", err)
 	}
 
-	data, err := os.ReadFile(filepath.Join(cityRoot, ".gc", "packs", "tagref", "pack.toml"))
+	data, err := os.ReadFile(filepath.Join(cityRoot, ".gc", "cache", "packs", "tagref", "pack.toml"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -498,9 +498,9 @@ func TestFetchRemoteInclude(t *testing.T) {
 		t.Errorf("pack.toml not in cache: %v", err)
 	}
 
-	// Cache path should be under _inc/.
-	if !strings.Contains(cacheDir, filepath.Join(".gc", "packs", "_inc")) {
-		t.Errorf("cacheDir = %q, want under _inc/", cacheDir)
+	// Cache path should be under cache/includes/.
+	if !strings.Contains(cacheDir, filepath.Join(".gc", "cache", "includes")) {
+		t.Errorf("cacheDir = %q, want under cache/includes/", cacheDir)
 	}
 
 	// Idempotent: second fetch succeeds (updates existing).
@@ -539,7 +539,7 @@ func TestLoadPack_RemoteInclude(t *testing.T) {
 	bare := initBareRepo(t, "remote-maint")
 
 	// Set up a city root and parent pack that includes the bare repo
-	// via a remote URL. We pre-clone the bare repo into the _inc cache
+	// via a remote URL. We pre-clone the bare repo into the cache/includes cache
 	// to simulate what fetchRemoteInclude does, then verify loadPack
 	// picks up the included agents.
 	cityRoot := t.TempDir()

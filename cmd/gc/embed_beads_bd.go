@@ -5,19 +5,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/gastownhall/gascity/internal/citylayout"
 )
 
 //go:embed gc-beads-bd
 var beadsBdScript []byte
 
 // MaterializeBeadsBdScript writes the embedded gc-beads-bd script to
-// .gc/bin/gc-beads-bd in the city directory with 0755 permissions.
+// .gc/system/bin/gc-beads-bd in the city directory with 0755 permissions.
 // Always overwrites to stay in sync with the gc binary version.
 // Returns the absolute path to the materialized script.
 func MaterializeBeadsBdScript(cityPath string) (string, error) {
-	binDir := filepath.Join(cityPath, ".gc", "bin")
+	binDir := filepath.Join(cityPath, citylayout.SystemBinRoot)
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		return "", fmt.Errorf("creating .gc/bin: %w", err)
+		return "", fmt.Errorf("creating %s: %w", citylayout.SystemBinRoot, err)
 	}
 
 	dst := filepath.Join(binDir, "gc-beads-bd")
