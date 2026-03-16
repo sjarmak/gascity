@@ -590,20 +590,22 @@ op_start() {
 
     # Check if a dolt process is already serving our data dir (any port).
     # This prevents starting a second server that dies on database locks.
+    # Only reuse if we can verify the server is actually reachable.
     local existing_pid
     existing_pid=$(find_dolt_pid)
     if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
-        # Server already running. Use port from state file (most reliable)
-        # or the allocated port if state file is missing.
         local existing_port
         existing_port=$(load_state_field port)
         if [ -n "$existing_port" ] && tcp_check_port "$existing_port"; then
             DOLT_PORT="$existing_port"
+            write_port_file "$GC_CITY_PATH/.beads"
+            echo "$existing_pid" > "$PID_FILE"
+            save_state "$existing_pid" true
+            exit 0
         fi
-        write_port_file "$GC_CITY_PATH/.beads"
-        echo "$existing_pid" > "$PID_FILE"
-        save_state "$existing_pid" true
-        exit 0
+        # Server process exists but unreachable — kill it and start fresh.
+        kill -9 "$existing_pid" 2>/dev/null || true
+        sleep 1
     fi
 
     # Check if a process already holds the port.

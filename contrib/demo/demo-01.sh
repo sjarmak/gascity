@@ -54,6 +54,9 @@ cleanup() {
     if [ -d "$DEMO_CITY" ]; then
         (cd "$DEMO_CITY" && gc stop 2>/dev/null) || true
     fi
+    # Kill all non-system dolt servers (system dolt runs on port 3307).
+    ps aux | grep "dolt sql-server" | grep -v grep | grep -v "port=3307" \
+        | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
     rm -rf "$DEMO_CITY"
     # Restart supervisor under isolated GC_HOME with current binary.
     local pid
@@ -217,19 +220,30 @@ part2() {
     (cd "$DEMO_CITY" && gc sling "$POOL" "$bead_id" )
     echo ""
 
-    step "Watch pool agent pick up work"
-    wait_for_pool_agent 60
-
-    step "Watch the agent work (Ctrl+C to stop)"
-    # Find the latest pool agent (claude-2 for part 2, etc.)
-    local latest_agent
-    latest_agent=$(cd "$DEMO_CITY" && gc rig status "$RIG_NAME" 2>/dev/null \
-        | grep -oP "$RIG_NAME/claude-\d+" | tail -1)
-    if [ -n "$latest_agent" ]; then
-        echo -e "  ${NARR_DIM}\$ gc session logs $latest_agent -f${NARR_NC}"
-        (cd "$DEMO_CITY" && gc session logs "$latest_agent" -f 2>/dev/null) || true
-    fi
+    step "Watch the bead get picked up (Ctrl+C to stop)"
+    echo -e "  ${NARR_DIM}\$ watch bd show $bead_id${NARR_NC}"
+    trap true INT
+    while true; do
+        local status
+        status=$(cd "$RIG_DIR" && bd show --json "$bead_id" 2>/dev/null \
+            | jq -r '.[0].status // "unknown"' 2>/dev/null || echo "unknown")
+        printf "\r  Bead %s: %s  " "$bead_id" "$status"
+        if [ "$status" = "closed" ]; then
+            echo ""
+            break
+        fi
+        sleep 3
+    done
+    trap - INT
     echo ""
+
+    step "Show bead status"
+    echo -e "  ${NARR_DIM}\$ bd show $bead_id${NARR_NC}"
+    bd_in_rig show "$bead_id"
+    echo ""
+
+    step "Files created"
+    show_rig_files
 
     pause "Part 2 complete — press Enter to continue to Part 3..."
 }
@@ -261,15 +275,37 @@ part3() {
     echo ""
 
     step "Watch 3 pool agents spin up"
-    sleep 3
-    echo -e "  ${NARR_DIM}\$ gc rig status $RIG_NAME${NARR_NC}"
-    (cd "$DEMO_CITY" && gc rig status "$RIG_NAME" 2>/dev/null) || true
+    wait_for_pool_agent 60
+
+    step "Watch epic progress (Ctrl+C to stop)"
+    echo -e "  ${NARR_DIM}Tracking: $id1, $id2, $id3${NARR_NC}"
+    trap true INT
+    while true; do
+        local s1 s2 s3 done_count
+        s1=$(cd "$RIG_DIR" && bd show --json "$id1" 2>/dev/null | jq -r '.[0].status // "?"' 2>/dev/null || echo "?")
+        s2=$(cd "$RIG_DIR" && bd show --json "$id2" 2>/dev/null | jq -r '.[0].status // "?"' 2>/dev/null || echo "?")
+        s3=$(cd "$RIG_DIR" && bd show --json "$id3" 2>/dev/null | jq -r '.[0].status // "?"' 2>/dev/null || echo "?")
+        done_count=0
+        [ "$s1" = "closed" ] && done_count=$((done_count + 1))
+        [ "$s2" = "closed" ] && done_count=$((done_count + 1))
+        [ "$s3" = "closed" ] && done_count=$((done_count + 1))
+        printf "\r  Python: %-12s  Rust: %-12s  Haskell: %-12s  [%d/3 done]  " "$s1" "$s2" "$s3" "$done_count"
+        if [ "$done_count" -ge 3 ]; then
+            echo ""
+            break
+        fi
+        sleep 3
+    done
+    trap - INT
     echo ""
 
-    step "Bead status"
+    step "Final bead status"
     echo -e "  ${NARR_DIM}\$ bd list${NARR_NC}"
     bd_in_rig list
     echo ""
+
+    step "Files created"
+    show_rig_files
 
     pause "Part 3 complete — press Enter to wrap up..."
 }
