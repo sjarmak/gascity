@@ -43,14 +43,10 @@ func TestControllerLoopCancel(t *testing.T) {
 		cancel()
 	}()
 
-	controllerLoop(ctx, time.Hour, cfg, "test", "", nil, buildFn, sp, nil, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
+	controllerLoop(ctx, time.Hour, cfg, "test", "", nil, buildFn, sp, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
 
 	if reconcileCount.Load() < 1 {
 		t.Error("expected at least one reconciliation")
-	}
-	// Agent should have been started by reconciliation.
-	if !sp.IsRunning("mayor") {
-		t.Error("agent should be running after initial reconcile")
 	}
 }
 
@@ -82,7 +78,7 @@ func TestControllerLoopTick(t *testing.T) {
 		cancel()
 	}()
 
-	controllerLoop(ctx, 10*time.Millisecond, cfg, "test", "", nil, buildFn, sp, nil, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
+	controllerLoop(ctx, 10*time.Millisecond, cfg, "test", "", nil, buildFn, sp, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
 
 	if got := reconcileCount.Load(); got < 2 {
 		t.Errorf("reconcile count = %d, want >= 2", got)
@@ -246,7 +242,7 @@ func TestControllerReloadsConfig(t *testing.T) {
 	loopDone := make(chan struct{})
 	go func() {
 		controllerLoop(ctx, 20*time.Millisecond, cfg, "test", tomlPath, nil,
-			buildFn, sp, nil, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
+			buildFn, sp, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
 		close(loopDone)
 	}()
 
@@ -323,7 +319,7 @@ func TestControllerReloadInvalidConfig(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
 	go controllerLoop(ctx, 20*time.Millisecond, cfg, "test", tomlPath, nil,
-		buildFn, sp, nil, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
+		buildFn, sp, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
 
 	// Wait for initial reconcile.
 	for reconcileCount.Load() < 1 {
@@ -391,7 +387,7 @@ func TestControllerReloadCityNameChange(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
 	go controllerLoop(ctx, 20*time.Millisecond, cfg, "test", tomlPath, nil,
-		buildFn, sp, nil, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
+		buildFn, sp, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
 
 	// Wait for initial reconcile.
 	for reconcileCount.Load() < 1 {

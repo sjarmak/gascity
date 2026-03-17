@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -15,7 +14,7 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
-func TestCityRuntimeReloadProviderSwapRestoresBeadReconcileOps(t *testing.T) {
+func TestCityRuntimeReloadProviderSwapPreservesDrainTracker(t *testing.T) {
 	cityPath := t.TempDir()
 	tomlPath := filepath.Join(cityPath, "city.toml")
 	writeCityRuntimeConfig(t, tomlPath, "fake")
@@ -44,10 +43,9 @@ func TestCityRuntimeReloadProviderSwapRestoresBeadReconcileOps(t *testing.T) {
 	cs := newControllerState(cfg, sp, events.NewFake(), "test-city", cityPath)
 	cs.cityBeadStore = beads.NewMemStore()
 	cr.setControllerState(cs)
-	cr.upgradeToBeadReconcileOps()
-	if _, ok := cr.rops.(*beadReconcileOps); !ok {
-		t.Fatalf("initial rops = %T, want *beadReconcileOps", cr.rops)
-	}
+
+	// Manually initialize drain tracker (normally done in run()).
+	cr.sessionDrains = newDrainTracker()
 
 	writeCityRuntimeConfig(t, tomlPath, "fail")
 	lastProviderName := "fake"
@@ -56,14 +54,8 @@ func TestCityRuntimeReloadProviderSwapRestoresBeadReconcileOps(t *testing.T) {
 	if lastProviderName != "fail" {
 		t.Fatalf("lastProviderName = %q, want fail", lastProviderName)
 	}
-	if _, ok := cr.rops.(*beadReconcileOps); !ok {
-		t.Fatalf("rops after provider swap = %T, want *beadReconcileOps", cr.rops)
-	}
 	if cr.sessionDrains == nil {
-		t.Fatal("sessionDrains = nil, want default-on bead reconciler to enable drain tracker")
-	}
-	if !strings.Contains(stdout.String(), "set daemon.bead_reconciler=false to use legacy") {
-		t.Fatalf("stdout = %q, want default-on bead_reconciler note", stdout.String())
+		t.Fatal("sessionDrains = nil after provider swap, want non-nil")
 	}
 }
 

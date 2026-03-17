@@ -810,12 +810,6 @@ type DaemonConfig struct {
 	// files (e.g., aimux session paths). The default search path
 	// (~/.claude/projects/) is always included.
 	ObservePaths []string `toml:"observe_paths,omitempty"`
-	// BeadReconciler enables the bead-driven session reconciler (Phase 2f).
-	// When true, session lifecycle is managed through bead state with
-	// dependency-aware wake ordering, config drift detection, and crash
-	// quarantine. Defaults to true when omitted. Set false to force the
-	// legacy reconciler.
-	BeadReconciler *bool `toml:"bead_reconciler,omitempty" jsonschema:"default=true"`
 }
 
 // PatrolIntervalDuration returns the patrol interval as a time.Duration.
@@ -838,15 +832,6 @@ func (d *DaemonConfig) MaxRestartsOrDefault() int {
 		return 5
 	}
 	return *d.MaxRestarts
-}
-
-// BeadReconcilerEnabled reports whether the bead-driven reconciler should run.
-// Omitted config defaults to enabled.
-func (d *DaemonConfig) BeadReconcilerEnabled() bool {
-	if d.BeadReconciler == nil {
-		return true
-	}
-	return *d.BeadReconciler
 }
 
 // RestartWindowDuration returns the restart window as a time.Duration.

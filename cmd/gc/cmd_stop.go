@@ -118,8 +118,7 @@ func cmdStop(args []string, stdout, stderr io.Writer) int {
 
 	// Clean up orphan sessions (sessions with the city prefix that are
 	// not in the current config).
-	rops := newReconcileOps(sp)
-	doStopOrphans(sp, rops, desired, cfg.Daemon.ShutdownTimeoutDuration(), recorder, stdout, stderr)
+	stopOrphans(sp, desired, cfg.Daemon.ShutdownTimeoutDuration(), recorder, stdout, stderr)
 
 	// Stop bead store's backing service after agents.
 	if err := shutdownBeadsProvider(cityPath); err != nil {
@@ -128,6 +127,27 @@ func cmdStop(args []string, stdout, stderr io.Writer) int {
 	}
 
 	return code
+}
+
+// stopOrphans stops sessions that are not in the desired set. Used by gc stop
+// to clean up orphans after stopping config agents. With per-city socket
+// isolation, all sessions on the socket belong to this city.
+func stopOrphans(sp runtime.Provider, desired map[string]bool,
+	timeout time.Duration, rec events.Recorder, stdout, stderr io.Writer,
+) {
+	running, err := sp.ListRunning("")
+	if err != nil {
+		fmt.Fprintf(stderr, "gc stop: listing sessions: %v\n", err) //nolint:errcheck // best-effort stderr
+		return
+	}
+	var orphans []string
+	for _, name := range running {
+		if desired[name] {
+			continue
+		}
+		orphans = append(orphans, name)
+	}
+	gracefulStopAll(orphans, sp, timeout, rec, stdout, stderr)
 }
 
 // tryStopController connects to .gc/controller.sock and sends "stop".

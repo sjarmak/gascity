@@ -5,41 +5,6 @@ import (
 	"time"
 )
 
-// fakeCrashTracker is a test double for crashTracker.
-type fakeCrashTracker struct {
-	quarantined map[string]bool
-	starts      map[string][]time.Time
-}
-
-func newFakeCrashTracker() *fakeCrashTracker {
-	return &fakeCrashTracker{
-		quarantined: make(map[string]bool),
-		starts:      make(map[string][]time.Time),
-	}
-}
-
-func (f *fakeCrashTracker) recordStart(sessionName string, at time.Time) {
-	f.starts[sessionName] = append(f.starts[sessionName], at)
-}
-
-func (f *fakeCrashTracker) isQuarantined(sessionName string, _ time.Time) bool {
-	return f.quarantined[sessionName]
-}
-
-func (f *fakeCrashTracker) clearHistory(sessionName string) {
-	delete(f.starts, sessionName)
-	delete(f.quarantined, sessionName)
-}
-
-func (f *fakeCrashTracker) clearAll() {
-	f.quarantined = make(map[string]bool)
-	f.starts = make(map[string][]time.Time)
-}
-
-func (f *fakeCrashTracker) limits() (int, time.Duration) {
-	return 0, 0 // fake: limits not used in tests
-}
-
 // --- memoryCrashTracker unit tests ---
 
 func TestCrashTrackerNoQuarantineUnderLimit(t *testing.T) {

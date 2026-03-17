@@ -61,7 +61,12 @@ func wakeReasons(
 				reasons = append(reasons, WakeConfig)
 			} else {
 				// Pool: only wake if slot is within desired count.
+				// Singleton pools (max=1) use bare names without a pool_slot;
+				// treat missing/zero slot as 1 for singleton pools.
 				slot, _ := strconv.Atoi(session.Metadata["pool_slot"])
+				if slot == 0 && !agent.Pool.IsMultiInstance() {
+					slot = 1
+				}
 				desired := poolDesired[template]
 				if slot > 0 && slot <= desired {
 					reasons = append(reasons, WakeConfig)
@@ -87,6 +92,9 @@ func wakeReasons(
 	if !waitHold && workSet[template] {
 		if agent := findAgentByTemplate(cfg, template); agent != nil && agent.Pool != nil {
 			slot, _ := strconv.Atoi(session.Metadata["pool_slot"])
+			if slot == 0 && !agent.Pool.IsMultiInstance() {
+				slot = 1
+			}
 			desired := poolDesired[template]
 			if slot > 0 && slot <= desired {
 				reasons = append(reasons, WakeWork)

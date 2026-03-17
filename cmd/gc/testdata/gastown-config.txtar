@@ -43,9 +43,9 @@ exec gc config show
 # --- 6. gc start launches city-scoped agents ---
 
 exec gc start $WORK/gastown
-stdout 'Started agent .mayor.'
-stdout 'Started agent .deacon.'
-stdout 'Started agent .boot.'
+stdout 'Woke session .mayor.'
+stdout 'Woke session .deacon.'
+stdout 'Woke session .boot.'
 stdout 'City started.'
 
 # --- 7. Daemon config is preserved ---
@@ -65,7 +65,7 @@ stdout 'City stopped.'
 
 exec gc start $WORK/gastown-min
 stdout 'City started.'
-! stdout 'Started agent .dog'
+! stdout 'Woke session .dog'
 
 exec gc stop $WORK/gastown-min
 stdout 'City stopped.'
@@ -73,8 +73,8 @@ stdout 'City stopped.'
 # --- 12. Start with pool check for dog (echo 2 → 2 dogs) ---
 
 exec gc start $WORK/gastown-dogs
-stdout 'Started agent .dog-1.'
-stdout 'Started agent .dog-2.'
+stdout 'Woke session .dog-1.'
+stdout 'Woke session .dog-2.'
 stdout 'City started.'
 
 exec gc stop $WORK/gastown-dogs

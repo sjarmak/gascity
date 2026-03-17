@@ -159,52 +159,6 @@ func TestParseEmptyFile(t *testing.T) {
 	}
 }
 
-func TestBeadReconcilerDefaultsEnabledWhenOmitted(t *testing.T) {
-	cfg, err := Parse([]byte(`
-[workspace]
-name = "test-city"
-`))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if !cfg.Daemon.BeadReconcilerEnabled() {
-		t.Fatal("BeadReconcilerEnabled() = false, want true when omitted")
-	}
-	if cfg.Daemon.BeadReconciler != nil {
-		t.Fatalf("BeadReconciler = %v, want nil when omitted", *cfg.Daemon.BeadReconciler)
-	}
-}
-
-func TestBeadReconcilerAllowsExplicitDisable(t *testing.T) {
-	cfg, err := Parse([]byte(`
-[workspace]
-name = "test-city"
-
-[daemon]
-bead_reconciler = false
-`))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if cfg.Daemon.BeadReconciler == nil {
-		t.Fatal("BeadReconciler = nil, want explicit false")
-	}
-	if cfg.Daemon.BeadReconcilerEnabled() {
-		t.Fatal("BeadReconcilerEnabled() = true, want false")
-	}
-}
-
-func TestMarshalOmitsDefaultBeadReconciler(t *testing.T) {
-	c := DefaultCity("test")
-	data, err := c.Marshal()
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	if strings.Contains(string(data), "bead_reconciler") {
-		t.Fatalf("Marshal output should omit bead_reconciler when using default:\n%s", data)
-	}
-}
-
 func TestParseCorruptTOML(t *testing.T) {
 	data := []byte("[[[invalid toml")
 	_, err := Parse(data)

@@ -15,6 +15,21 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
+// fakeIdleTracker is a test double for idleTracker.
+type fakeIdleTracker struct {
+	idle map[string]bool
+}
+
+func newFakeIdleTracker() *fakeIdleTracker {
+	return &fakeIdleTracker{idle: make(map[string]bool)}
+}
+
+func (f *fakeIdleTracker) checkIdle(sessionName string, _ runtime.Provider, _ time.Time) bool {
+	return f.idle[sessionName]
+}
+
+func (f *fakeIdleTracker) setTimeout(_ string, _ time.Duration) {}
+
 // reconcilerTestEnv holds common test infrastructure.
 type reconcilerTestEnv struct {
 	store        beads.Store
@@ -109,7 +124,7 @@ func (e *reconcilerTestEnv) reconcile(sessions []beads.Bead) int {
 	return reconcileSessionBeads(
 		context.Background(), sessions, e.desiredState, cfgNames, e.cfg, e.sp,
 		e.store, nil, nil, nil, e.dt, map[string]int{}, "",
-		e.clk, e.rec, 0, 0, &e.stdout, &e.stderr,
+		nil, e.clk, e.rec, 0, 0, &e.stdout, &e.stderr,
 	)
 }
 
@@ -665,7 +680,7 @@ func TestReconcileSessionBeads_PoolScaleDownOrphansExcess(t *testing.T) {
 	reconcileSessionBeads(
 		context.Background(), []beads.Bead{s1, s2}, env.desiredState, cfgNames,
 		env.cfg, env.sp, env.store, nil, nil, nil, env.dt, poolDesired, "",
-		env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
+		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
 	)
 
 	d2 := env.dt.get(s2.ID)
@@ -734,7 +749,7 @@ func TestReconcileSessionBeads_DriftDrainUsesConfigTimeout(t *testing.T) {
 	reconcileSessionBeads(
 		context.Background(), []beads.Bead{session}, env.desiredState, cfgNames,
 		env.cfg, env.sp, env.store, nil, nil, nil, env.dt, map[string]int{}, "",
-		env.clk, env.rec, 0, env.cfg.Daemon.DriftDrainTimeoutDuration(),
+		nil, env.clk, env.rec, 0, env.cfg.Daemon.DriftDrainTimeoutDuration(),
 		&env.stdout, &env.stderr,
 	)
 
@@ -745,6 +760,110 @@ func TestReconcileSessionBeads_DriftDrainUsesConfigTimeout(t *testing.T) {
 	expected := env.clk.Now().Add(7 * time.Minute)
 	if ds.deadline != expected {
 		t.Errorf("drain deadline = %v, want %v (7m from now)", ds.deadline, expected)
+	}
+}
+
+// --- idle timeout in bead reconciler tests ---
+
+func TestReconcileSessionBeads_IdleTimeoutStopsAndReWakes(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	env.addDesired("worker", "worker", true)
+	session := env.createSessionBead("worker", "worker")
+
+	// Simulate idle: activity was 30m ago, timeout is 15m.
+	it := newFakeIdleTracker()
+	it.idle["worker"] = true
+
+	cfgNames := configuredSessionNames(env.cfg, "", env.store)
+	reconcileSessionBeads(
+		context.Background(), []beads.Bead{session}, env.desiredState, cfgNames,
+		env.cfg, env.sp, env.store, nil, nil, nil, env.dt, map[string]int{}, "",
+		it, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
+	)
+
+	// Session should have been stopped and then re-woken.
+	if !env.sp.IsRunning("worker") {
+		t.Error("worker should be running after idle-restart")
+	}
+
+	// Bead should reflect the restart cycle.
+	b, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// After the idle kill, the session was re-woken in the same tick.
+	// preWakeCommit clears sleep_reason and sets last_woke_at.
+	// State stays "asleep" until healState on the next tick.
+	if b.Metadata["last_woke_at"] == "" {
+		t.Error("last_woke_at should be set after idle-restart re-wake")
+	}
+	// sleep_reason cleared by preWakeCommit during re-wake.
+	if b.Metadata["sleep_reason"] != "" {
+		t.Errorf("sleep_reason = %q, want empty after re-wake", b.Metadata["sleep_reason"])
+	}
+}
+
+func TestReconcileSessionBeads_IdleTimeoutNilTrackerSkipped(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	env.addDesired("worker", "worker", true)
+	session := env.createSessionBead("worker", "worker")
+
+	// No idle tracker — should not idle-kill.
+	cfgNames := configuredSessionNames(env.cfg, "", env.store)
+	reconcileSessionBeads(
+		context.Background(), []beads.Bead{session}, env.desiredState, cfgNames,
+		env.cfg, env.sp, env.store, nil, nil, nil, env.dt, map[string]int{}, "",
+		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
+	)
+
+	if !env.sp.IsRunning("worker") {
+		t.Error("worker should still be running with nil idle tracker")
+	}
+}
+
+// --- zombie scrollback capture tests ---
+
+func TestReconcileSessionBeads_ZombieCapturesScrollback(t *testing.T) {
+	env := newReconcilerTestEnv()
+	rec := events.NewFake()
+	env.rec = rec
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+
+	// Register with ProcessNames so ProcessAlive actually checks zombie state.
+	tp := TemplateParams{
+		Command:      "test-cmd",
+		SessionName:  "worker",
+		TemplateName: "worker",
+		Hints:        agent.StartupHints{ProcessNames: []string{"test-cmd"}},
+	}
+	env.desiredState["worker"] = tp
+	_ = env.sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"})
+
+	session := env.createSessionBead("worker", "worker")
+
+	// Simulate zombie: tmux session exists but process is dead.
+	env.sp.Zombies["worker"] = true
+	env.sp.SetPeekOutput("worker", "panic: nil pointer dereference\ngoroutine 1 [running]:")
+
+	cfgNames := configuredSessionNames(env.cfg, "", env.store)
+	reconcileSessionBeads(
+		context.Background(), []beads.Bead{session}, env.desiredState, cfgNames,
+		env.cfg, env.sp, env.store, nil, nil, nil, env.dt, map[string]int{}, "",
+		nil, env.clk, rec, 0, 0, &env.stdout, &env.stderr,
+	)
+
+	// Should have recorded a crash event with scrollback.
+	found := false
+	for _, e := range rec.Events {
+		if e.Type == events.SessionCrashed && e.Message != "" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected SessionCrashed event with scrollback capture")
 	}
 }
 

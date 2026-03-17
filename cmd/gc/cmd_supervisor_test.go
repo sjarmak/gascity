@@ -389,7 +389,6 @@ func TestStopManagedCityForcesCleanupAfterTimeout(t *testing.T) {
 					DriftDrainTimeout: "20ms",
 				},
 			},
-			rops:   newFakeReconcileOps(),
 			sp:     runtime.NewFake(),
 			rec:    events.Discard,
 			stdout: io.Discard,

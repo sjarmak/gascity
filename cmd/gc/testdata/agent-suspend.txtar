@@ -6,8 +6,8 @@ env GC_DOLT=skip
 
 # 1. gc start skips suspended agents.
 exec gc start $WORK/city
-stdout 'Started agent .mayor.'
-! stdout 'Started agent .builder.'
+stdout 'Woke session .mayor.'
+! stdout 'Woke session .builder.'
 stdout 'City started.'
 
 # 2. gc config show shows suspended annotation.
@@ -23,7 +23,7 @@ stdout 'Resumed agent'
 
 # 4. After resume, gc start spawns the agent.
 exec gc start $WORK/city
-stdout 'Started agent'
+stdout 'Woke session'
 stdout 'City started.'
 
 # 5. gc agent suspend sets suspended (use qualified name).

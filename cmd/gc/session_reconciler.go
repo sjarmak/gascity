@@ -1,5 +1,5 @@
 // session_reconciler.go implements the bead-driven reconciliation loop.
-// It replaces doReconcileAgents with a wake/sleep model: for each session
+// It uses a wake/sleep model: for each session
 // bead, compute whether the session should be awake, and manage lifecycle
 // transitions using the Phase 2 building blocks.
 //
@@ -23,6 +23,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/telemetry"
 )
 
 // buildDepsMap extracts template dependency edges from config for topo ordering.
@@ -140,6 +141,7 @@ func reconcileSessionBeads(
 	dt *drainTracker,
 	poolDesired map[string]int,
 	cityName string,
+	it idleTracker,
 	clk clock.Clock,
 	rec events.Recorder,
 	startupTimeout time.Duration,
@@ -210,6 +212,19 @@ func reconcileSessionBeads(
 		// Liveness includes zombie detection: tmux session exists AND
 		// the expected child process is alive (when ProcessNames configured).
 		alive := sp.IsRunning(name) && sp.ProcessAlive(name, tp.Hints.ProcessNames)
+
+		// Zombie capture: session exists but process dead — grab scrollback for forensics.
+		if sp.IsRunning(name) && !alive {
+			if output, err := sp.Peek(name, 50); err == nil && output != "" {
+				rec.Record(events.Event{
+					Type:    events.SessionCrashed,
+					Actor:   "gc",
+					Subject: tp.DisplayName(),
+					Message: output,
+				})
+				telemetry.RecordAgentCrash(context.Background(), tp.DisplayName(), output)
+			}
+		}
 
 		// Heal advisory state metadata.
 		healState(session, alive, store)
@@ -322,6 +337,32 @@ func reconcileSessionBeads(
 					}
 				}
 			}
+		}
+
+		// Idle timeout: restart sessions idle longer than configured threshold.
+		if it != nil && alive && it.checkIdle(name, sp, clk.Now()) {
+			fmt.Fprintf(stderr, "session reconciler: idle timeout for %s\n", tp.DisplayName()) //nolint:errcheck // best-effort stderr
+			if err := sp.Stop(name); err != nil {
+				fmt.Fprintf(stderr, "session reconciler: stopping idle %s: %v\n", name, err) //nolint:errcheck // best-effort stderr
+			} else {
+				_ = sp.ClearScrollback(name)
+				rec.Record(events.Event{
+					Type:    events.SessionIdleKilled,
+					Actor:   "gc",
+					Subject: tp.DisplayName(),
+				})
+				telemetry.RecordAgentIdleKill(context.Background(), tp.DisplayName())
+				// Mark for immediate re-wake on this same tick by clearing
+				// last_woke_at and setting state to asleep. The wake logic
+				// below will pick it up.
+				_ = store.SetMetadataBatch(session.ID, map[string]string{
+					"state": "asleep", "last_woke_at": "", "sleep_reason": "idle-timeout",
+				})
+				session.Metadata["state"] = "asleep"
+				session.Metadata["last_woke_at"] = ""
+				alive = false
+			}
+			// Fall through to wakeReasons — it will re-wake immediately if config present
 		}
 
 		// Compute wake reasons using the full contract (includes held_until,

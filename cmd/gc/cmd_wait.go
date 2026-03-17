@@ -153,13 +153,8 @@ func cmdSessionWait(args, depIDs []string, matchAny bool, note string, sleep boo
 		fmt.Fprintln(stderr, "gc session wait: session not specified (pass an ID/name or set $GC_SESSION_ID)") //nolint:errcheck
 		return 1
 	}
-	enabled, err := waitLifecycleEnabled()
-	if err != nil {
+	if err := waitLifecycleEnabled(); err != nil {
 		fmt.Fprintf(stderr, "gc session wait: %v\n", err) //nolint:errcheck
-		return 1
-	}
-	if !enabled {
-		fmt.Fprintln(stderr, "gc session wait: waits require daemon.bead_reconciler=true") //nolint:errcheck
 		return 1
 	}
 	if sleep {
@@ -326,13 +321,8 @@ func cmdWaitSetState(waitID, state string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if state == waitStateReady {
-		enabled, err := waitLifecycleEnabled()
-		if err != nil {
+		if err := waitLifecycleEnabled(); err != nil {
 			fmt.Fprintf(stderr, "gc wait: %v\n", err) //nolint:errcheck
-			return 1
-		}
-		if !enabled {
-			fmt.Fprintln(stderr, "gc wait: waits require daemon.bead_reconciler=true") //nolint:errcheck
 			return 1
 		}
 	}
@@ -870,14 +860,14 @@ func withdrawQueuedWaitNudges(cityPath string, nudgeIDs []string) error {
 	return nudgequeue.WithdrawWaitNudges(openNudgeBeadStore(cityPath), cityPath, nudgeIDs)
 }
 
-func waitLifecycleEnabled() (bool, error) {
+func waitLifecycleEnabled() error {
 	cityPath, err := resolveCity()
 	if err != nil {
-		return false, err
+		return err
 	}
-	cfg, _, err := config.LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
-	if err != nil {
-		return false, err
-	}
-	return cfg.Daemon.BeadReconcilerEnabled(), nil
+	// Validate config loads successfully. The bead reconciler is always
+	// enabled now (legacy reconciler removed), so this just confirms
+	// the city is usable.
+	_, _, err = config.LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
+	return err
 }

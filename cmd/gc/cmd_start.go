@@ -510,9 +510,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	enforceGCPermissions(cityPath, stderr)
 
 	runPoolOnBoot(cfg, cityPath, shellScaleCheck, stderr)
-	rops := newReconcileOps(sp)
-	// Upgrade to bead-driven rops so one-shot writes hashes to the same
-	// store as the daemon, preventing false drift on next daemon start.
+
 	var oneShotStore beads.Store
 	if store, err := openCityStoreAt(cityPath); err == nil {
 		oneShotStore = store
@@ -525,31 +523,38 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		if !passed && result.Skipped > 0 {
 			fmt.Fprintf(stderr, "adoption barrier: %d session(s) failed bead creation\n", result.Skipped) //nolint:errcheck
 		}
-
-		cfgNames := configuredSessionNames(cfg, cityName, store)
-		ds := buildDesiredState(cityName, cityPath, beaconTime, cfg, sp, store, stderr)
-		idx := syncSessionBeads(store, ds, sp, cfgNames, cfg, clock.Real{}, stderr, false)
-		if idx != nil {
-			bro := newBeadReconcileOps(rops, func() beads.Store { return store })
-			bro.updateIndex(idx)
-			rops = bro
-		}
 	} else {
-		fmt.Fprintf(stderr, "gc start: bead store unavailable, using provider hashes: %v\n", err) //nolint:errcheck
+		// No persistent store — use in-memory store for one-shot reconciliation.
+		// Beads won't be persisted, but the reconciler still manages lifecycle.
+		oneShotStore = beads.NewMemStore()
 	}
-	agents := buildAgents(cfg, sp, oneShotStore)
-	suspendedNames := computeSuspendedNames(cfg, cityName, cityPath)
-	code := doReconcileAgents(agents, sp, rops, nil, nil, nil, recorder, nil, suspendedNames, 0, cfg.Session.StartupTimeoutDuration(), stdout, stderr, sigCtx)
+
+	// One-shot bead reconciliation: same code path as the daemon.
+	ds := buildDesiredState(cityName, cityPath, beaconTime, cfg, sp, oneShotStore, stderr)
+	cfgNames := configuredSessionNames(cfg, cityName, oneShotStore)
+	syncSessionBeads(oneShotStore, ds, sp, cfgNames, cfg, clock.Real{}, stderr, true)
+
+	open, err := loadSessionBeads(oneShotStore)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc start: loading session beads: %v\n", err) //nolint:errcheck
+		return 1
+	}
+	dt := newDrainTracker()
+	poolDesired := derivePoolDesired(ds, cfg)
+	reconcileSessionBeads(
+		sigCtx, open, ds, cfgNames, cfg, sp, oneShotStore,
+		nil, nil, nil, dt, poolDesired, cityName,
+		nil, clock.Real{}, recorder, cfg.Session.StartupTimeoutDuration(), 0,
+		stdout, stderr,
+	)
+
 	// Post-reconcile sync: update bead state to reflect post-start reality.
-	if oneShotStore != nil {
-		cfgNames := configuredSessionNames(cfg, cityName, oneShotStore)
-		ds := buildDesiredState(cityName, cityPath, beaconTime, cfg, sp, oneShotStore, stderr)
-		syncSessionBeads(oneShotStore, ds, sp, cfgNames, cfg, clock.Real{}, stderr, false)
-	}
-	if code == 0 {
-		fmt.Fprintln(stdout, "City started.") //nolint:errcheck // best-effort stdout
-	}
-	return code
+	ds = buildDesiredState(cityName, cityPath, beaconTime, cfg, sp, oneShotStore, stderr)
+	cfgNames = configuredSessionNames(cfg, cityName, oneShotStore)
+	syncSessionBeads(oneShotStore, ds, sp, cfgNames, cfg, clock.Real{}, stderr, false)
+
+	fmt.Fprintln(stdout, "City started.") //nolint:errcheck // best-effort stdout
+	return 0
 }
 
 // printDryRunPreview prints what agents would be started without starting them.

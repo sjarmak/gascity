@@ -32,7 +32,7 @@ exec gc config show
 # --- 5. Start launches only city-scoped agents ---
 
 exec gc start $WORK/testcity
-stdout 'Started agent .mayor.'
+stdout 'Woke session .mayor.'
 stdout 'City started.'
 
 # --- 6. Stop works ---
