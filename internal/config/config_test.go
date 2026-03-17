@@ -3464,24 +3464,27 @@ func TestInjectImplicitAgents_ConfiguredOnly(t *testing.T) {
 }
 
 func TestInjectImplicitAgents_CustomProvider(t *testing.T) {
-	// Custom (non-builtin) providers also get implicit agents.
+	// Multiple builtins + multiple custom providers: builtins come first
+	// in canonical order, then customs in alphabetical order.
 	cfg := &City{
 		Providers: map[string]ProviderSpec{
+			"codex":    {},
 			"claude":   {},
+			"zebra":    {Command: "zebra-llm"},
 			"my-local": {Command: "ollama"},
 		},
 	}
 	InjectImplicitAgents(cfg)
 
-	if len(cfg.Agents) != 2 {
-		t.Fatalf("got %d agents, want 2", len(cfg.Agents))
+	if len(cfg.Agents) != 4 {
+		t.Fatalf("got %d agents, want 4", len(cfg.Agents))
 	}
-	// Built-in (claude) first, then custom (my-local).
-	if cfg.Agents[0].Name != "claude" {
-		t.Errorf("agent[0].Name = %q, want %q", cfg.Agents[0].Name, "claude")
-	}
-	if cfg.Agents[1].Name != "my-local" {
-		t.Errorf("agent[1].Name = %q, want %q", cfg.Agents[1].Name, "my-local")
+	// Builtins in canonical order (claude before codex), then customs alphabetical.
+	wantOrder := []string{"claude", "codex", "my-local", "zebra"}
+	for i, want := range wantOrder {
+		if cfg.Agents[i].Name != want {
+			t.Errorf("agent[%d].Name = %q, want %q", i, cfg.Agents[i].Name, want)
+		}
 	}
 }
 
