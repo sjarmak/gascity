@@ -4,13 +4,11 @@ package integration
 
 import (
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/beadstest"
@@ -20,10 +18,11 @@ import (
 // backed by a real dolt server. This proves the full stack works:
 // dolt server → bd CLI → BdStore → beads.Store interface.
 //
-// Each subtest gets a fresh database on the shared dolt server by creating
-// a new workspace directory with its own bd init + unique prefix.
+// Each subtest gets a fresh database directory where bd auto-starts a
+// dolt server on a unique port. This avoids port conflicts and lets bd
+// manage the server lifecycle.
 //
-// Requires: dolt and bd installed, no other dolt server on port 3307.
+// Requires: dolt and bd installed.
 func TestBdStoreConformance(t *testing.T) {
 	// Skip if dolt or bd not installed.
 	if _, err := exec.LookPath("dolt"); err != nil {
@@ -36,63 +35,11 @@ func TestBdStoreConformance(t *testing.T) {
 	// Ensure dolt identity is configured (mirrors git user.name/email).
 	ensureDoltIdentity(t)
 
-	// Set up a shared dolt server.
 	serverDir := t.TempDir()
-	dataDir := filepath.Join(serverDir, ".gc", "dolt-data")
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Use a dynamic port to avoid conflicts with other dolt servers.
-	port := findFreePort(t)
-	logFile := filepath.Join(serverDir, ".gc", "dolt.log")
-	if err := os.MkdirAll(filepath.Dir(logFile), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	cmd := exec.Command("dolt", "sql-server",
-		"--port", fmt.Sprintf("%d", port),
-		"--data-dir", dataDir,
-		"--max-connections", "50",
-	)
-	log, err := os.Create(logFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd.Stdout = log
-	cmd.Stderr = log
-	if err := cmd.Start(); err != nil {
-		log.Close()
-		t.Fatalf("starting dolt server: %v", err)
-	}
-	log.Close()
-
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	})
-
-	// Set GC_DOLT_PORT so bd subprocesses connect to our dynamic-port server.
-	t.Setenv("GC_DOLT_PORT", fmt.Sprintf("%d", port))
-
-	// Wait for server to accept connections.
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	for i := 0; i < 20; i++ {
-		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
-		if err == nil {
-			conn.Close()
-			break
-		}
-		if i == 19 {
-			t.Fatal("dolt server not reachable after 10s")
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-
 	var dbCounter atomic.Int64
 
-	// Factory: each call creates a fresh workspace with its own bd init
-	// and unique database on the shared server.
+	// Factory: each call creates a fresh workspace where bd auto-starts
+	// its own dolt server (unique port via bd's auto-start mechanism).
 	newStore := func() beads.Store {
 		n := dbCounter.Add(1)
 		prefix := fmt.Sprintf("ct%d", n)
@@ -110,9 +57,8 @@ func TestBdStoreConformance(t *testing.T) {
 			t.Fatalf("git init: %v: %s", err, out)
 		}
 
-		// Run bd init --server with unique prefix and dynamic port.
-		bdInit := exec.Command("bd", "init", "--server", "-p", prefix, "--skip-hooks",
-			"--server-port", fmt.Sprintf("%d", port))
+		// Run bd init with auto-start (no --server flag = local embedded mode).
+		bdInit := exec.Command("bd", "init", "-p", prefix, "--skip-hooks")
 		bdInit.Dir = wsDir
 		if out, err := bdInit.CombinedOutput(); err != nil {
 			t.Fatalf("bd init: %v: %s", err, out)
@@ -132,18 +78,6 @@ func TestBdStoreConformance(t *testing.T) {
 	// uses bd's ID format (prefix-XXXX), not gc-N sequential format.
 	beadstest.RunStoreTests(t, newStore)
 	beadstest.RunMetadataTests(t, newStore)
-}
-
-// findFreePort asks the OS for a free TCP port.
-func findFreePort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("finding free port: %v", err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
-	return port
 }
 
 // ensureDoltIdentity ensures dolt has user.name and user.email set.
