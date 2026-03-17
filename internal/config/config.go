@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -1294,14 +1295,21 @@ func (a *Agent) defaultOnBoot() string {
 		`xargs -rI{} bd update {} --unclaim 2>/dev/null`
 }
 
-// InjectImplicitAgents adds an implicit agent for each built-in provider
-// that doesn't already have an explicit agent with the same name (city-scoped).
-// InjectImplicitAgents adds on-demand agents for every built-in provider at
-// both city scope and each rig scope. Pool min=0, max=-1 (unlimited) so they
-// are available as sling targets out of the box without city.toml configuration.
-// Explicit agents always win — if city.toml defines [[agent]] name="claude"
-// (or a rig-scoped equivalent), no implicit agent is added for that scope.
+// InjectImplicitAgents adds on-demand agents for each configured provider at
+// both city scope and each rig scope. A provider is "configured" if it
+// appears in cfg.Providers OR is named by cfg.Workspace.Provider — so the
+// common single-provider case (workspace.provider = "claude") works without
+// a redundant [providers.claude] section. Unconfigured built-in providers
+// are skipped. Pool min=0, max=-1 (unlimited) so they are available as
+// sling targets without an explicit [[agent]] entry. Explicit agents always
+// win — if city.toml defines [[agent]] name="claude" (or a rig-scoped
+// equivalent), no implicit agent is added for that scope.
 func InjectImplicitAgents(cfg *City) {
+	configured := configuredProviders(cfg)
+	if len(configured) == 0 {
+		return
+	}
+
 	// Build set of existing agent keys (dir, name).
 	type agentKey struct{ dir, name string }
 	existing := make(map[agentKey]bool, len(cfg.Agents))
@@ -1309,7 +1317,9 @@ func InjectImplicitAgents(cfg *City) {
 		existing[agentKey{a.Dir, a.Name}] = true
 	}
 
-	providers := BuiltinProviderOrder()
+	// Deterministic order: built-in providers first (in canonical order),
+	// then any custom providers in sorted order.
+	providers := configuredProviderOrder(configured)
 
 	promptTemplate := citylayout.SystemPromptsRoot + "/pool-worker.md"
 
@@ -1345,6 +1355,50 @@ func InjectImplicitAgents(cfg *City) {
 			})
 		}
 	}
+}
+
+// configuredProviders returns the merged set of providers that are explicitly
+// configured: the union of cfg.Providers keys and cfg.Workspace.Provider.
+// This lets workspace.provider = "claude" work without a redundant
+// [providers.claude] section.
+func configuredProviders(cfg *City) map[string]ProviderSpec {
+	merged := make(map[string]ProviderSpec, len(cfg.Providers)+1)
+	for k, v := range cfg.Providers {
+		merged[k] = v
+	}
+	if wp := cfg.Workspace.Provider; wp != "" {
+		if _, ok := merged[wp]; !ok {
+			merged[wp] = ProviderSpec{}
+		}
+	}
+	return merged
+}
+
+// configuredProviderOrder returns provider names from the map in a
+// deterministic order: built-in providers first (in canonical order),
+// then any custom providers in sorted order.
+func configuredProviderOrder(providers map[string]ProviderSpec) []string {
+	builtins := BuiltinProviders()
+	order := make([]string, 0, len(providers))
+
+	// Built-in providers in canonical order.
+	for _, name := range BuiltinProviderOrder() {
+		if _, ok := providers[name]; ok {
+			order = append(order, name)
+		}
+	}
+
+	// Custom providers in sorted order.
+	var custom []string
+	for name := range providers {
+		if _, ok := builtins[name]; !ok {
+			custom = append(custom, name)
+		}
+	}
+	sort.Strings(custom)
+	order = append(order, custom...)
+
+	return order
 }
 
 // ValidateAgents checks agent configurations for errors. It returns an error
