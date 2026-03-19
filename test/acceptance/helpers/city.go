@@ -161,6 +161,16 @@ func uniqueName() string {
 	return "at-" + hex.EncodeToString(b)
 }
 
+// MkdirAll creates a directory and all parents.
+func MkdirAll(path string) error {
+	return os.MkdirAll(path, 0o755)
+}
+
+// StatFile returns file info or an error.
+func StatFile(path string) (os.FileInfo, error) {
+	return os.Stat(path)
+}
+
 // ExamplesDir returns the absolute path to the examples/ directory
 // in the source tree.
 func ExamplesDir() string {
