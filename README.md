@@ -24,11 +24,32 @@ trying to port the entire Town architecture literally.
 
 See the full install guide at [docs/getting-started/installation.md](docs/getting-started/installation.md).
 
+### Prerequisites
+
+Gas City requires the following tools on your system. `gc init` and
+`gc start` check for these automatically and report any that are missing.
+
+| Dependency | Required | Min Version | Install (macOS) | Install (Linux) |
+|------------|----------|-------------|-----------------|-----------------|
+| tmux | Always | — | `brew install tmux` | `apt install tmux` |
+| git | Always | — | `brew install git` | `apt install git` |
+| jq | Always | — | `brew install jq` | `apt install jq` |
+| pgrep | Always | — | (included in macOS) | `apt install procps` |
+| lsof | Always | — | (included in macOS) | `apt install lsof` |
+| dolt | Beads provider `bd` | 1.80.0 | `brew install dolt` | [releases](https://github.com/dolthub/dolt/releases) |
+| bd | Beads provider `bd` | 0.61.0 | [releases](https://github.com/gastownhall/beads/releases) | [releases](https://github.com/gastownhall/beads/releases) |
+| flock | Beads provider `bd` | — | `brew install flock` | `apt install util-linux` |
+| claude / codex / gemini | Per provider | — | See provider docs | See provider docs |
+
+The `bd` (beads) provider is the default. To use a file-based store instead
+(no dolt/bd/flock needed), set `GC_BEADS=file` or add `[beads] provider = "file"`
+to your `city.toml`.
+
 Install from Homebrew:
 
 ```bash
 brew tap gastownhall/gascity
-brew install --cask gascity
+brew install gascity
 gc version
 ```
 
