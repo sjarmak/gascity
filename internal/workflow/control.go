@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/convergence"
 	"github.com/gastownhall/gascity/internal/formula"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/molecule"
 )
 
@@ -215,30 +218,23 @@ func spawnNextAttempt(ctx context.Context, store beads.Store, control beads.Bead
 
 	recipe := buildAttemptRecipe(&step, control, attemptNum)
 
-	// Stamp routing from the control bead onto attempt steps.
-	// Attach bypasses sling routing, so we need to propagate the
-	// execution route and pool label manually.
+	// Attach bypasses graph compile routing, so spawned attempts need their
+	// execution lane restored manually. Prefer each step's explicit target when
+	// available, and only inherit the parent execution lane as a fallback.
 	executionRoute := control.Metadata["gc.execution_routed_to"]
-	if executionRoute != "" {
-		poolLabel := "pool:" + executionRoute
-		for i := range recipe.Steps {
-			if recipe.Steps[i].Metadata == nil {
-				recipe.Steps[i].Metadata = make(map[string]string)
-			}
-			recipe.Steps[i].Metadata["gc.routed_to"] = executionRoute
-			recipe.Steps[i].Metadata["gc.execution_routed_to"] = executionRoute
-			// Add pool label if not already present.
-			hasLabel := false
-			for _, l := range recipe.Steps[i].Labels {
-				if l == poolLabel {
-					hasLabel = true
-					break
-				}
-			}
-			if !hasLabel {
-				recipe.Steps[i].Labels = append(recipe.Steps[i].Labels, poolLabel)
-			}
+	routeCfg := loadAttemptRouteConfig(opts.CityPath)
+	for i := range recipe.Steps {
+		target := strings.TrimSpace(recipe.Steps[i].Metadata["gc.routed_to"])
+		if target == "" {
+			target = strings.TrimSpace(recipe.Steps[i].Assignee)
 		}
+		if target == "" {
+			target = executionRoute
+		}
+		if target == "" {
+			continue
+		}
+		applyAttemptStepRoute(&recipe.Steps[i], target, routeCfg)
 	}
 
 	epoch := 0
@@ -393,6 +389,97 @@ func buildAttemptRecipe(step *formula.Step, control beads.Bead, attemptNum int) 
 	}
 
 	return recipe
+}
+
+func loadAttemptRouteConfig(cityPath string) *config.City {
+	if strings.TrimSpace(cityPath) == "" {
+		return nil
+	}
+	cfg, _, err := config.LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
+	if err != nil {
+		return nil
+	}
+	return cfg
+}
+
+func applyAttemptStepRoute(step *formula.RecipeStep, target string, cfg *config.City) {
+	if step.Metadata == nil {
+		step.Metadata = make(map[string]string)
+	}
+	if binding, ok := resolveAttemptRouteBinding(target, cfg); ok {
+		step.Metadata["gc.routed_to"] = binding.qualifiedName
+		step.Metadata["gc.execution_routed_to"] = binding.qualifiedName
+		step.Labels = removeAttemptPoolLabels(step.Labels)
+		if binding.poolLabel != "" {
+			step.Labels = appendUniqueAttemptLabel(step.Labels, binding.poolLabel)
+			step.Assignee = ""
+			return
+		}
+		step.Assignee = binding.sessionName
+		return
+	}
+
+	step.Metadata["gc.routed_to"] = target
+	step.Metadata["gc.execution_routed_to"] = target
+	step.Labels = appendUniqueAttemptLabel(step.Labels, "pool:"+target)
+}
+
+type attemptRouteBinding struct {
+	qualifiedName string
+	poolLabel     string
+	sessionName   string
+}
+
+func resolveAttemptRouteBinding(target string, cfg *config.City) (attemptRouteBinding, bool) {
+	if cfg == nil || strings.TrimSpace(target) == "" {
+		return attemptRouteBinding{}, false
+	}
+
+	if agentCfg := config.FindAgent(cfg, target); agentCfg != nil {
+		binding := attemptRouteBinding{qualifiedName: agentCfg.QualifiedName()}
+		if agentCfg.IsPool() {
+			label := agentCfg.QualifiedName()
+			if agentCfg.PoolName != "" {
+				label = agentCfg.PoolName
+			}
+			binding.poolLabel = "pool:" + label
+			return binding, true
+		}
+		binding.sessionName = config.NamedSessionRuntimeName(cfg.EffectiveCityName(), cfg.Workspace, agentCfg.QualifiedName())
+		return binding, true
+	}
+
+	if named := config.FindNamedSession(cfg, target); named != nil {
+		return attemptRouteBinding{
+			qualifiedName: named.QualifiedName(),
+			sessionName:   config.NamedSessionRuntimeName(cfg.EffectiveCityName(), cfg.Workspace, named.QualifiedName()),
+		}, true
+	}
+
+	return attemptRouteBinding{}, false
+}
+
+func removeAttemptPoolLabels(labels []string) []string {
+	if len(labels) == 0 {
+		return labels
+	}
+	out := make([]string, 0, len(labels))
+	for _, label := range labels {
+		if strings.HasPrefix(label, "pool:") {
+			continue
+		}
+		out = append(out, label)
+	}
+	return out
+}
+
+func appendUniqueAttemptLabel(labels []string, label string) []string {
+	for _, existing := range labels {
+		if existing == label {
+			return labels
+		}
+	}
+	return append(labels, label)
 }
 
 // findLatestAttempt finds the most recent attempt/iteration child of a control bead.

@@ -3,8 +3,12 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/gastownhall/gascity/internal/beads"
 )
@@ -406,6 +410,13 @@ func (s *Server) handleBeadGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fast path: try direct SQL for each rig with a dolt connection.
+	if snap, err := s.tryGraphSQL(rootID); err == nil {
+		writeIndexJSON(w, s.latestIndex(), snap)
+		return
+	}
+
+	// Slow path: bd subprocess.
 	stores := s.state.BeadStores()
 
 	// Find root bead by scanning stores (bd handles prefix routing via routes.jsonl)
@@ -457,6 +468,103 @@ func (s *Server) handleBeadGraph(w http.ResponseWriter, r *http.Request) {
 		Beads: graphBeads,
 		Deps:  deps,
 	})
+}
+
+// tryGraphSQL attempts direct SQL for the graph endpoint using the bead ID
+// prefix to route to the correct store via routes.jsonl.
+func (s *Server) tryGraphSQL(rootID string) (*beadGraphResponseJSON, error) {
+	cityPath := s.state.CityPath()
+	if cityPath == "" {
+		return nil, fmt.Errorf("no city path")
+	}
+
+	// Extract prefix from bead ID (e.g., "ga" from "ga-5b8i").
+	prefix := beadPrefix(rootID)
+	if prefix == "" {
+		return nil, fmt.Errorf("no prefix in bead ID %q", rootID)
+	}
+
+	// Resolve the store path from routes.jsonl in each rig.
+	cfg := s.state.Config()
+	if cfg == nil {
+		return nil, fmt.Errorf("no config")
+	}
+
+	for _, rig := range cfg.Rigs {
+		rigPath := rig.Path
+		if !filepath.IsAbs(rigPath) {
+			rigPath = filepath.Join(cityPath, rigPath)
+		}
+		storePath, ok := resolveRoutePrefix(rigPath, prefix)
+		if !ok {
+			continue
+		}
+		port, database, err := resolveDoltConnection(storePath)
+		if err != nil {
+			continue
+		}
+		graphBeads, beadIndex, depMap, err := workflowSQLSnapshot("127.0.0.1", port, database, rootID)
+		if err != nil || len(graphBeads) == 0 {
+			continue
+		}
+		return buildGraphFromSQL(rootID, graphBeads, beadIndex, depMap), nil
+	}
+
+	return nil, fmt.Errorf("sql fast path unavailable for prefix %q", prefix)
+}
+
+// beadPrefix extracts the alphabetic prefix from a bead ID (e.g., "ga" from "ga-5b8i").
+func beadPrefix(id string) string {
+	for i, c := range id {
+		if c == '-' {
+			return id[:i]
+		}
+		if c < 'a' || c > 'z' {
+			return ""
+		}
+	}
+	return ""
+}
+
+// resolveRoutePrefix reads routes.jsonl from a rig's .beads/ directory and
+// resolves the given prefix to an absolute store path.
+func resolveRoutePrefix(rigPath, prefix string) (string, bool) {
+	routesPath := filepath.Join(rigPath, ".beads", "routes.jsonl")
+	data, err := os.ReadFile(routesPath)
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry struct {
+			Prefix string `json:"prefix"`
+			Path   string `json:"path"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if entry.Prefix == prefix {
+			resolved := entry.Path
+			if !filepath.IsAbs(resolved) {
+				resolved = filepath.Join(rigPath, resolved)
+			}
+			return resolved, true
+		}
+	}
+	return "", false
+}
+
+func buildGraphFromSQL(rootID string, graphBeads []beads.Bead, beadIndex map[string]beads.Bead, depMap map[string][]beads.Dep) *beadGraphResponseJSON {
+	root := beadIndex[rootID]
+	store := &prefetchedDepStore{deps: depMap}
+	deps, _ := collectWorkflowDeps(store, beadIndex)
+	return &beadGraphResponseJSON{
+		Root:  root,
+		Beads: graphBeads,
+		Deps:  deps,
+	}
 }
 
 // decodeBody decodes JSON request body into v.

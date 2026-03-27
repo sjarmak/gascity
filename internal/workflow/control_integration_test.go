@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 
@@ -529,6 +531,155 @@ func TestSpawnNextAttemptPropagatesRoutingLabels(t *testing.T) {
 	if !hasPoolLabel {
 		t.Errorf("attempt 2 labels = %v, want pool:polecat", attempt2.Labels)
 	}
+}
+
+func TestSpawnNextAttemptPreservesExplicitChildPoolRoutes(t *testing.T) {
+	t.Parallel()
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`
+[workspace]
+name = "maintainer-city"
+provider = "claude"
+
+[[agent]]
+name = "claude"
+dir = "gascity"
+
+[agent.pool]
+min = 0
+max = -1
+
+[[agent]]
+name = "codex"
+dir = "gascity"
+
+[agent.pool]
+min = 0
+max = -1
+`), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+
+	store := beads.NewMemStore()
+	spec := &formula.Step{
+		ID:    "review-loop",
+		Title: "Review / fix loop",
+		Type:  "task",
+		Ralph: &formula.RalphSpec{MaxAttempts: 3},
+		Children: []*formula.Step{
+			{
+				ID:       "review-claude",
+				Title:    "Code review: Claude",
+				Type:     "task",
+				Assignee: "gascity/claude",
+				Retry:    &formula.RetrySpec{MaxAttempts: 3},
+			},
+			{
+				ID:       "review-codex",
+				Title:    "Code review: Codex",
+				Type:     "task",
+				Assignee: "gascity/codex",
+				Retry:    &formula.RetrySpec{MaxAttempts: 3},
+			},
+			{
+				ID:    "synthesize",
+				Title: "Synthesize findings",
+				Type:  "task",
+				Needs: []string{"review-claude", "review-codex"},
+			},
+		},
+	}
+	specJSON, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatalf("marshal step spec: %v", err)
+	}
+
+	root := mustCreate(t, store, beads.Bead{
+		Title:    "workflow",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	control := mustCreate(t, store, beads.Bead{
+		Title: "review-loop",
+		Metadata: map[string]string{
+			"gc.kind":                "ralph",
+			"gc.root_bead_id":        root.ID,
+			"gc.step_ref":            "mol-adopt-pr-v2.review-loop",
+			"gc.step_id":             "review-loop",
+			"gc.source_step_spec":    string(specJSON),
+			"gc.control_epoch":       "1",
+			"gc.execution_routed_to": "gascity/claude",
+		},
+	})
+
+	if err := spawnNextAttempt(t.Context(), store, control, 2, ProcessOptions{CityPath: cityPath}); err != nil {
+		t.Fatalf("spawnNextAttempt: %v", err)
+	}
+
+	scope := findAttemptByRef(t, store, root.ID, "mol-adopt-pr-v2.review-loop.iteration.2")
+	if scope.ID == "" {
+		t.Fatal("ralph scope iteration not created")
+	}
+	if scope.Metadata["gc.routed_to"] != "gascity/claude" {
+		t.Fatalf("scope gc.routed_to = %q, want gascity/claude", scope.Metadata["gc.routed_to"])
+	}
+	if !containsString(scope.Labels, "pool:gascity/claude") {
+		t.Fatalf("scope labels = %v, want pool:gascity/claude", scope.Labels)
+	}
+
+	claude := findAttemptByRef(t, store, root.ID, "mol-adopt-pr-v2.review-loop.iteration.2.review-claude")
+	if claude.ID == "" {
+		t.Fatal("review-claude child not created")
+	}
+	if claude.Metadata["gc.routed_to"] != "gascity/claude" {
+		t.Fatalf("review-claude gc.routed_to = %q, want gascity/claude", claude.Metadata["gc.routed_to"])
+	}
+	if !containsString(claude.Labels, "pool:gascity/claude") {
+		t.Fatalf("review-claude labels = %v, want pool:gascity/claude", claude.Labels)
+	}
+	if claude.Assignee != "" {
+		t.Fatalf("review-claude assignee = %q, want empty for pool route", claude.Assignee)
+	}
+
+	codex := findAttemptByRef(t, store, root.ID, "mol-adopt-pr-v2.review-loop.iteration.2.review-codex")
+	if codex.ID == "" {
+		t.Fatal("review-codex child not created")
+	}
+	if codex.Metadata["gc.routed_to"] != "gascity/codex" {
+		t.Fatalf("review-codex gc.routed_to = %q, want gascity/codex", codex.Metadata["gc.routed_to"])
+	}
+	if codex.Metadata["gc.execution_routed_to"] != "gascity/codex" {
+		t.Fatalf("review-codex gc.execution_routed_to = %q, want gascity/codex", codex.Metadata["gc.execution_routed_to"])
+	}
+	if !containsString(codex.Labels, "pool:gascity/codex") {
+		t.Fatalf("review-codex labels = %v, want pool:gascity/codex", codex.Labels)
+	}
+	if containsString(codex.Labels, "pool:gascity/claude") {
+		t.Fatalf("review-codex labels = %v, should not contain pool:gascity/claude", codex.Labels)
+	}
+	if codex.Assignee != "" {
+		t.Fatalf("review-codex assignee = %q, want empty for pool route", codex.Assignee)
+	}
+
+	synthesize := findAttemptByRef(t, store, root.ID, "mol-adopt-pr-v2.review-loop.iteration.2.synthesize")
+	if synthesize.ID == "" {
+		t.Fatal("synthesize child not created")
+	}
+	if synthesize.Metadata["gc.routed_to"] != "gascity/claude" {
+		t.Fatalf("synthesize gc.routed_to = %q, want gascity/claude fallback", synthesize.Metadata["gc.routed_to"])
+	}
+	if !containsString(synthesize.Labels, "pool:gascity/claude") {
+		t.Fatalf("synthesize labels = %v, want pool:gascity/claude fallback", synthesize.Labels)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 // TestBuildAttemptRecipeScopeMetadataForRalph verifies that ralph iteration
