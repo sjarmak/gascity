@@ -42,20 +42,20 @@ func TestComputePoolDesiredStates_ResumeBeatsNew(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{poolAgent("claude", "rig", intPtr(2), 0)},
 	}
+	// 1 assigned (resume) + 2 unassigned. scale_check reports 3 total demand.
 	work := []beads.Bead{
 		workBead("w1", "rig/claude", "sess-1", "in_progress", 5),
-		workBead("w2", "rig/claude", "", "open", 3),
-		workBead("w3", "rig/claude", "", "open", 1),
 	}
 	sessions := []beads.Bead{sessionBead("sess-1", "open")}
+	scaleCheck := map[string]int{"rig/claude": 3}
 
-	result := ComputePoolDesiredStates(cfg, work, sessions, nil)
+	result := ComputePoolDesiredStates(cfg, work, sessions, scaleCheck)
 
 	if len(result) != 1 {
 		t.Fatalf("len(result) = %d, want 1", len(result))
 	}
 	reqs := result[0].Requests
-	// Max=2: resume (w1) + 1 new. The resume should come first.
+	// Max=2: resume (w1) + 1 new from scale_check deficit (3-1=2, capped at max=2).
 	if len(reqs) != 2 {
 		t.Fatalf("len(requests) = %d, want 2 (max=2)", len(reqs))
 	}
@@ -74,24 +74,17 @@ func TestComputePoolDesiredStates_MaxCapsTotal(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{poolAgent("claude", "rig", intPtr(2), 0)},
 	}
-	work := []beads.Bead{
-		workBead("w1", "rig/claude", "", "open", 5),
-		workBead("w2", "rig/claude", "", "open", 3),
-		workBead("w3", "rig/claude", "", "open", 1),
-	}
+	// scale_check reports 3 demand, but max=2.
+	scaleCheck := map[string]int{"rig/claude": 3}
 
-	result := ComputePoolDesiredStates(cfg, work, nil, nil)
+	result := ComputePoolDesiredStates(cfg, nil, nil, scaleCheck)
 
 	if len(result) != 1 {
 		t.Fatalf("len(result) = %d, want 1", len(result))
 	}
-	// Max=2: only 2 of the 3 ready beads get sessions.
+	// Max=2: only 2 of the 3 requested sessions allowed.
 	if len(result[0].Requests) != 2 {
 		t.Errorf("len(requests) = %d, want 2 (capped by max)", len(result[0].Requests))
-	}
-	// Highest priority should be accepted.
-	if result[0].Requests[0].BeadPriority != 5 {
-		t.Errorf("first request priority = %d, want 5", result[0].Requests[0].BeadPriority)
 	}
 }
 
@@ -162,14 +155,9 @@ func TestComputePoolDesiredStates_WorkspaceCap(t *testing.T) {
 			poolAgent("codex", "rig", nil, 0),
 		},
 	}
-	work := []beads.Bead{
-		workBead("w1", "rig/claude", "", "open", 5),
-		workBead("w2", "rig/claude", "", "open", 4),
-		workBead("w3", "rig/codex", "", "open", 3),
-		workBead("w4", "rig/codex", "", "open", 2),
-	}
+	scaleCheck := map[string]int{"rig/claude": 2, "rig/codex": 2}
 
-	result := ComputePoolDesiredStates(cfg, work, nil, nil)
+	result := ComputePoolDesiredStates(cfg, nil, nil, scaleCheck)
 
 	total := 0
 	for _, ds := range result {
@@ -189,13 +177,9 @@ func TestComputePoolDesiredStates_RigCap(t *testing.T) {
 			poolAgent("codex", "rig", nil, 0),
 		},
 	}
-	work := []beads.Bead{
-		workBead("w1", "rig/claude", "", "open", 5),
-		workBead("w2", "rig/claude", "", "open", 4),
-		workBead("w3", "rig/codex", "", "open", 3),
-	}
+	scaleCheck := map[string]int{"rig/claude": 2, "rig/codex": 1}
 
-	result := ComputePoolDesiredStates(cfg, work, nil, nil)
+	result := ComputePoolDesiredStates(cfg, nil, nil, scaleCheck)
 
 	total := 0
 	for _, ds := range result {
@@ -217,14 +201,9 @@ func TestComputePoolDesiredStates_NestedCaps(t *testing.T) {
 			poolAgent("codex", "rig", intPtr(2), 0),
 		},
 	}
-	work := []beads.Bead{
-		workBead("w1", "rig/claude", "", "open", 5),
-		workBead("w2", "rig/claude", "", "open", 4),
-		workBead("w3", "rig/codex", "", "open", 3),
-		workBead("w4", "rig/codex", "", "open", 2),
-	}
+	scaleCheck := map[string]int{"rig/claude": 2, "rig/codex": 2}
 
-	result := ComputePoolDesiredStates(cfg, work, nil, nil)
+	result := ComputePoolDesiredStates(cfg, nil, nil, scaleCheck)
 
 	total := 0
 	perAgent := make(map[string]int)
@@ -249,15 +228,9 @@ func TestComputePoolDesiredStates_UnlimitedWhenUnset(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{poolAgent("claude", "", nil, 0)},
 	}
-	work := []beads.Bead{
-		workBead("w1", "claude", "", "open", 5),
-		workBead("w2", "claude", "", "open", 4),
-		workBead("w3", "claude", "", "open", 3),
-		workBead("w4", "claude", "", "open", 2),
-		workBead("w5", "claude", "", "open", 1),
-	}
+	scaleCheck := map[string]int{"claude": 5}
 
-	result := ComputePoolDesiredStates(cfg, work, nil, nil)
+	result := ComputePoolDesiredStates(cfg, nil, nil, scaleCheck)
 
 	total := 0
 	for _, ds := range result {
@@ -317,22 +290,28 @@ func TestComputePoolDesiredStates_DedupsResumeForSameSession(t *testing.T) {
 	}
 }
 
-func TestComputePoolDesiredStates_PriorityOrder(t *testing.T) {
+func TestComputePoolDesiredStates_ResumePriorityOrder(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{poolAgent("claude", "", intPtr(2), 0)},
 	}
+	// 3 assigned beads with different priorities, max=2. Highest priority wins.
 	work := []beads.Bead{
-		workBead("w-low", "claude", "", "open", 1),
-		workBead("w-high", "claude", "", "open", 10),
-		workBead("w-mid", "claude", "", "open", 5),
+		workBead("w-low", "claude", "s1", "in_progress", 1),
+		workBead("w-high", "claude", "s2", "in_progress", 10),
+		workBead("w-mid", "claude", "s3", "in_progress", 5),
+	}
+	sessions := []beads.Bead{
+		sessionBead("s1", "open"),
+		sessionBead("s2", "open"),
+		sessionBead("s3", "open"),
 	}
 
-	result := ComputePoolDesiredStates(cfg, work, nil, nil)
+	result := ComputePoolDesiredStates(cfg, work, sessions, nil)
 
 	if len(result) != 1 || len(result[0].Requests) != 2 {
 		t.Fatalf("expected 2 requests, got %d", len(result[0].Requests))
 	}
-	// Highest priority beads should be accepted.
+	// Highest priority resume requests should be accepted.
 	if result[0].Requests[0].BeadPriority != 10 {
 		t.Errorf("first priority = %d, want 10", result[0].Requests[0].BeadPriority)
 	}
@@ -347,11 +326,9 @@ func TestComputePoolDesiredStates_SuspendedAgentSkipped(t *testing.T) {
 			{Name: "claude", Suspended: true, Pool: &config.PoolConfig{Max: -1}},
 		},
 	}
-	work := []beads.Bead{
-		workBead("w1", "claude", "", "open", 5),
-	}
+	scaleCheck := map[string]int{"claude": 1}
 
-	result := ComputePoolDesiredStates(cfg, work, nil, nil)
+	result := ComputePoolDesiredStates(cfg, nil, nil, scaleCheck)
 
 	total := 0
 	for _, ds := range result {
@@ -359,5 +336,165 @@ func TestComputePoolDesiredStates_SuspendedAgentSkipped(t *testing.T) {
 	}
 	if total != 0 {
 		t.Errorf("total = %d, want 0 (agent suspended)", total)
+	}
+}
+
+func TestComputePoolDesiredStates_ScaleCheckMerge(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "rig", intPtr(5), 0)},
+	}
+	// No work beads visible (they're in the rig store, not passed here).
+	// But scale_check says 2.
+	scaleCheck := map[string]int{"rig/claude": 2}
+	result := ComputePoolDesiredStates(cfg, nil, nil, scaleCheck)
+
+	if len(result) != 1 {
+		t.Fatalf("len(result) = %d, want 1", len(result))
+	}
+	if len(result[0].Requests) != 2 {
+		t.Fatalf("len(requests) = %d, want 2 (from scale_check)", len(result[0].Requests))
+	}
+	for _, r := range result[0].Requests {
+		if r.Tier != "new" {
+			t.Errorf("request tier = %q, want new", r.Tier)
+		}
+	}
+}
+
+func TestComputePoolDesiredStates_ScaleCheckDoesNotDuplicateBeadDriven(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "rig", intPtr(5), 0)},
+	}
+	// 1 bead-driven request + scale_check=2 → total should be 2 (not 3).
+	work := []beads.Bead{
+		workBead("w1", "rig/claude", "", "open", 5),
+	}
+	scaleCheck := map[string]int{"rig/claude": 2}
+	result := ComputePoolDesiredStates(cfg, work, nil, scaleCheck)
+
+	if len(result) != 1 {
+		t.Fatalf("len(result) = %d, want 1", len(result))
+	}
+	// 1 from bead + 1 deficit from scale_check = 2 total (capped by scale_check=2).
+	if len(result[0].Requests) != 2 {
+		t.Fatalf("len(requests) = %d, want 2", len(result[0].Requests))
+	}
+}
+
+func TestComputePoolDesiredStates_ScaleCheckRespectsCaps(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "rig", intPtr(3), 0)},
+	}
+	// scale_check says 10, but max=3.
+	scaleCheck := map[string]int{"rig/claude": 10}
+	result := ComputePoolDesiredStates(cfg, nil, nil, scaleCheck)
+
+	if len(result) != 1 {
+		t.Fatalf("len(result) = %d, want 1", len(result))
+	}
+	if len(result[0].Requests) != 3 {
+		t.Fatalf("len(requests) = %d, want 3 (capped at max)", len(result[0].Requests))
+	}
+}
+
+// --- Regression tests: these define the consolidated demand behavior ---
+
+// Regression: resume preserves assigned session even when scale_check is 0.
+func TestComputePoolDesiredStates_ResumeOverridesZeroScaleCheck(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "", intPtr(5), 0)},
+	}
+	work := []beads.Bead{
+		workBead("w1", "claude", "sess-1", "in_progress", 5),
+	}
+	sessions := []beads.Bead{sessionBead("sess-1", "open")}
+	scaleCheck := map[string]int{"claude": 0}
+
+	result := ComputePoolDesiredStates(cfg, work, sessions, scaleCheck)
+
+	if len(result) != 1 {
+		t.Fatalf("len(result) = %d, want 1", len(result))
+	}
+	if len(result[0].Requests) != 1 {
+		t.Fatalf("len(requests) = %d, want 1 (resume keeps assigned session despite scale_check=0)", len(result[0].Requests))
+	}
+	if result[0].Requests[0].Tier != "resume" {
+		t.Errorf("tier = %q, want resume", result[0].Requests[0].Tier)
+	}
+}
+
+// Regression: no demand and no assigned work → poolDesired=0.
+// This was the idle-sessions-never-sleeping bug: derivePoolDesired counted
+// session bead existence instead of actual demand.
+func TestComputePoolDesiredStates_NoDemandNoAssignment(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "", intPtr(5), 0)},
+	}
+	// No work beads, no scale_check demand.
+	result := ComputePoolDesiredStates(cfg, nil, nil, map[string]int{"claude": 0})
+
+	counts := PoolDesiredCounts(result)
+	if counts["claude"] != 0 {
+		t.Fatalf("poolDesired[claude] = %d, want 0 (no demand, no assignment)", counts["claude"])
+	}
+}
+
+// Regression: scale_check=3 with 1 assigned → poolDesired=3 (1 resume + 2 new).
+func TestComputePoolDesiredStates_ScaleCheckAndResumeAddUp(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "", intPtr(5), 0)},
+	}
+	work := []beads.Bead{
+		workBead("w1", "claude", "sess-1", "in_progress", 5),
+	}
+	sessions := []beads.Bead{sessionBead("sess-1", "open")}
+	scaleCheck := map[string]int{"claude": 3}
+
+	result := ComputePoolDesiredStates(cfg, work, sessions, scaleCheck)
+
+	if len(result) != 1 {
+		t.Fatalf("len(result) = %d, want 1", len(result))
+	}
+	if len(result[0].Requests) != 3 {
+		t.Fatalf("len(requests) = %d, want 3 (1 resume + 2 new from scale_check deficit)", len(result[0].Requests))
+	}
+	resumeCount := 0
+	newCount := 0
+	for _, r := range result[0].Requests {
+		switch r.Tier {
+		case "resume":
+			resumeCount++
+		case "new":
+			newCount++
+		}
+	}
+	if resumeCount != 1 || newCount != 2 {
+		t.Errorf("resume=%d new=%d, want resume=1 new=2", resumeCount, newCount)
+	}
+}
+
+// Regression: poolDesired must be per-rig scoped. City-scoped agent sees
+// only city work beads, rig-scoped agent sees only its rig's work beads.
+func TestComputePoolDesiredStates_PerRigScoping(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{
+			poolAgent("claude", "", intPtr(5), 0),      // city-scoped
+			poolAgent("claude", "myrig", intPtr(5), 0), // rig-scoped
+		},
+	}
+	// Work bead in rig scope, assigned to a session.
+	work := []beads.Bead{
+		workBead("w1", "myrig/claude", "sess-1", "in_progress", 5),
+	}
+	sessions := []beads.Bead{sessionBead("sess-1", "open")}
+
+	result := ComputePoolDesiredStates(cfg, work, sessions, nil)
+
+	counts := PoolDesiredCounts(result)
+	if counts["claude"] != 0 {
+		t.Errorf("city-scoped poolDesired = %d, want 0 (no city work)", counts["claude"])
+	}
+	if counts["myrig/claude"] != 1 {
+		t.Errorf("rig-scoped poolDesired = %d, want 1 (resume for rig work)", counts["myrig/claude"])
 	}
 }

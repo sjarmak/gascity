@@ -113,10 +113,11 @@ type Store interface {
 	// Returns the number of beads actually closed.
 	CloseAll(ids []string, metadata map[string]string) (int, error)
 
-	// List returns all beads. In-process stores (MemStore, FileStore)
-	// return creation order; external stores (BdStore) may not guarantee
-	// order when beads share the same second-precision timestamp.
-	List() ([]Bead, error)
+	// List returns beads, optionally filtered by status. With no arguments,
+	// returns all beads. With a status argument (e.g., "in_progress"),
+	// returns only beads matching that status. In-process stores return
+	// creation order; external stores may not guarantee order.
+	List(status ...string) ([]Bead, error)
 
 	// Ready returns all beads with status "open". Same ordering note
 	// as List.

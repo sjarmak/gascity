@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 
+	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
@@ -93,12 +94,22 @@ func runAdoptionBarrier(
 
 	// Build config agent lookup: session_name -> agent config.
 	// Also build a reverse lookup by qualified name for pool instance resolution.
+	// Uses the already-loaded session beads to avoid N store queries.
 	st := cfg.Workspace.SessionTemplate
+	snapshot := &sessionBeadSnapshot{}
+	for _, b := range existing {
+		if b.Status != "closed" {
+			snapshot.add(b)
+		}
+	}
 	agentBySession := make(map[string]*config.Agent, len(cfg.Agents))
 	agentByQN := make(map[string]*config.Agent, len(cfg.Agents))
 	for i := range cfg.Agents {
 		a := &cfg.Agents[i]
-		sn := lookupSessionNameOrLegacy(store, cityName, a.QualifiedName(), st)
+		sn := snapshot.FindSessionNameByTemplate(a.QualifiedName())
+		if sn == "" {
+			sn = agent.SessionNameFor(cityName, a.QualifiedName(), st)
+		}
 		agentBySession[sn] = a
 		agentByQN[a.QualifiedName()] = a
 	}

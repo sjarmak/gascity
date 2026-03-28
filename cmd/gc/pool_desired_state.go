@@ -48,12 +48,14 @@ func PoolDesiredCounts(states []PoolDesiredState) map[string]int {
 }
 
 // ComputePoolDesiredStates computes the desired state for all pool agents.
-// Combines bead-driven resume/new requests with scale_check demand signals.
+// assignedWorkBeads contains work beads that have an assignee matching a
+// session — the cross-reference of in-progress/ready work with live sessions.
+// Each bead's gc.routed_to determines which agent template it belongs to.
 // scaleCheckCounts maps agent template → desired count from scale_check.
-// Pass nil when scale_check results are unavailable.
+// Pass nil for either when unavailable.
 func ComputePoolDesiredStates(
 	cfg *config.City,
-	workBeads []beads.Bead,
+	assignedWorkBeads []beads.Bead,
 	sessionBeads []beads.Bead,
 	scaleCheckCounts map[string]int,
 ) []PoolDesiredState {
@@ -75,8 +77,9 @@ func ComputePoolDesiredStates(
 		}
 		template := agent.QualifiedName()
 
-		// Resume tier: in-progress or ready work beads assigned to an open session.
-		for _, wb := range workBeads {
+		// Resume tier: assigned work beads whose assignee matches a
+		// non-closed session bead. These sessions must stay alive.
+		for _, wb := range assignedWorkBeads {
 			routedTo := wb.Metadata["gc.routed_to"]
 			if routedTo != template {
 				continue
@@ -94,26 +97,6 @@ func ComputePoolDesiredStates(
 				Tier:          "resume",
 				SessionBeadID: assignee,
 				WorkBeadID:    wb.ID,
-			})
-		}
-
-		// New tier: ready unassigned work beads routed to this template.
-		for _, wb := range workBeads {
-			routedTo := wb.Metadata["gc.routed_to"]
-			if routedTo != template {
-				continue
-			}
-			if strings.TrimSpace(wb.Assignee) != "" {
-				continue
-			}
-			if wb.Status != "open" {
-				continue
-			}
-			allRequests = append(allRequests, SessionRequest{
-				Template:     template,
-				BeadPriority: beadPriority(wb),
-				Tier:         "new",
-				WorkBeadID:   wb.ID,
 			})
 		}
 	}

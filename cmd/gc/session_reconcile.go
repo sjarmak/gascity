@@ -84,7 +84,10 @@ func evaluateWakeReasons(
 	}
 	sleepSuppressed := configWakeSuppressed(session, policy, sp, clk)
 	if configEligible {
-		if !waitHold && !sleepSuppressed {
+		// When there's active demand (poolDesired > 0), override sleep
+		// suppression. Sessions wake for demand, sleep when idle.
+		hasDemand := poolDesired[template] > 0
+		if !waitHold && (!sleepSuppressed || hasDemand) {
 			reasons = append(reasons, WakeConfig)
 		}
 	}
@@ -93,30 +96,9 @@ func evaluateWakeReasons(
 	}
 
 	// WakeAttached: check if user terminal is connected.
-	// No provider-level gate — composite providers (auto/hybrid) route
-	// IsAttached per-session to the correct backend, which returns false
-	// safely for backends that don't support attachment detection.
 	if !waitHold && sp != nil {
 		if name != "" && sp.IsAttached(name) {
 			reasons = append(reasons, WakeAttached)
-		}
-	}
-
-	// WakeWork: session has open work assigned to its template.
-	// For pool agents, apply the same slot/desired gate as WakeConfig
-	// so excess pool instances aren't woken by pending work.
-	if !waitHold && workSet[template] && session.Metadata["dependency_only"] != "true" {
-		if agent != nil && agent.Pool != nil {
-			slot, _ := strconv.Atoi(session.Metadata["pool_slot"])
-			if slot == 0 && !agent.Pool.IsMultiInstance() {
-				slot = 1
-			}
-			desired := poolDesired[template]
-			if slot > 0 && slot <= desired {
-				reasons = append(reasons, WakeWork)
-			}
-		} else {
-			reasons = append(reasons, WakeWork)
 		}
 	}
 
@@ -144,7 +126,8 @@ func sessionWithinDesiredConfig(session beads.Bead, cfg *config.City, poolDesire
 		return agent, namedSessionMode(session) == "always"
 	}
 	if agent.Pool == nil {
-		return agent, false
+		// Non-pool agents are config-eligible when demand exists.
+		return agent, poolDesired[template] > 0
 	}
 	slot, _ := strconv.Atoi(session.Metadata["pool_slot"])
 	if slot == 0 && !agent.Pool.IsMultiInstance() {
@@ -271,7 +254,6 @@ func containsWakeReason(reasons []WakeReason, want WakeReason) bool {
 
 func hasDependencyWakeRoot(reasons []WakeReason) bool {
 	return containsWakeReason(reasons, WakeConfig) ||
-		containsWakeReason(reasons, WakeWork) ||
 		containsWakeReason(reasons, WakeWait) ||
 		containsWakeReason(reasons, WakeCreate) ||
 		containsWakeReason(reasons, WakeSession) ||
@@ -609,6 +591,7 @@ var knownSessionStates = map[string]bool{
 	"closed":      true,
 	"quarantined": true,
 	"creating":    true,
+	"drained":     true,
 	"":            true, // empty state is valid (legacy beads)
 }
 

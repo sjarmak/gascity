@@ -47,23 +47,6 @@ func buildDepsMap(cfg *config.City) map[string][]string {
 	return deps
 }
 
-// derivePoolDesired computes pool desired counts from the desired state map.
-// Since buildDesiredState already ran evaluatePool, the number of instances
-// per template in the desired state IS the desired count.
-func derivePoolDesired(desiredState map[string]TemplateParams, cfg *config.City) map[string]int {
-	if cfg == nil {
-		return nil
-	}
-	counts := make(map[string]int)
-	for _, tp := range desiredState {
-		cfgAgent := findAgentByTemplate(cfg, tp.TemplateName)
-		if cfgAgent != nil && cfgAgent.Pool != nil && !tp.ManualSession {
-			counts[tp.TemplateName]++
-		}
-	}
-	return counts
-}
-
 // allDependenciesAliveForTemplate checks that all template dependencies of a
 // resolved logical template have at least one alive instance. Uses the
 // runtime.Provider directly instead of agent types for liveness checks.

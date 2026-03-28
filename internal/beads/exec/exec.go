@@ -225,8 +225,12 @@ func (s *Store) CloseAll(ids []string, metadata map[string]string) (int, error) 
 }
 
 // List returns all beads: script list
-func (s *Store) List() ([]beads.Bead, error) {
-	out, err := s.run(nil, "list")
+func (s *Store) List(status ...string) ([]beads.Bead, error) {
+	args := []string{"list"}
+	if len(status) > 0 && status[0] != "" {
+		args = append(args, "--status="+status[0])
+	}
+	out, err := s.run(nil, args...)
 	if err != nil {
 		return nil, fmt.Errorf("exec beads list: %w", err)
 	}

@@ -612,8 +612,12 @@ func (s *BdStore) Close(id string) error {
 }
 
 // List returns all beads via bd list.
-func (s *BdStore) List() ([]Bead, error) {
-	out, err := s.runner(s.dir, "bd", "list", "--json", "--limit", "0", "--all", "--include-infra")
+func (s *BdStore) List(status ...string) ([]Bead, error) {
+	args := []string{"list", "--json", "--limit", "0", "--all", "--include-infra"}
+	if len(status) > 0 && status[0] != "" {
+		args = append(args, "--status="+status[0])
+	}
+	out, err := s.runner(s.dir, "bd", args...)
 	if err != nil {
 		return nil, fmt.Errorf("bd list: %w", err)
 	}

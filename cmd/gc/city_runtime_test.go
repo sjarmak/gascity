@@ -120,8 +120,8 @@ func TestCityRuntimeReloadProviderSwapPreservesDrainTracker(t *testing.T) {
 		TomlPath: tomlPath,
 		Cfg:      cfg,
 		SP:       sp,
-		BuildFn: func(*config.City, runtime.Provider, beads.Store) map[string]TemplateParams {
-			return map[string]TemplateParams{}
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
 		},
 		Dops:   newDrainOps(sp),
 		Rec:    events.Discard,
@@ -168,8 +168,8 @@ func TestCityRuntimeReloadSameRevisionIsNoOp(t *testing.T) {
 		ConfigRev: configRev,
 		Cfg:       cfg,
 		SP:        sp,
-		BuildFn: func(*config.City, runtime.Provider, beads.Store) map[string]TemplateParams {
-			return map[string]TemplateParams{}
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
 		},
 		Dops:   newDrainOps(sp),
 		Rec:    events.Discard,

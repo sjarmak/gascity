@@ -1193,12 +1193,9 @@ type Agent struct {
 	Pool *PoolConfig `toml:"pool,omitempty"`
 	// WorkQuery is the shell command to find available work for this agent.
 	// Used by gc hook and available in prompt templates as {{.WorkQuery}}.
-	// Also used by the controller's reconciler to detect pending work
-	// (WakeWork reason): non-empty output means work exists, which wakes
-	// sleeping sessions even without WakeConfig.
 	// Default for fixed agents: "bd ready --assignee=<qualified-name>".
 	// Default for pool agents:
-	// "bd ready --label=pool:<qualified-name> --unassigned --json --limit=1 2>/dev/null".
+	// "bd ready --metadata-field gc.routed_to=<qualified-name> --unassigned --json --limit=1 2>/dev/null".
 	// Override to integrate with external task systems.
 	WorkQuery string `toml:"work_query,omitempty"`
 	// SlingQuery is the command template to route a bead to this agent/pool.

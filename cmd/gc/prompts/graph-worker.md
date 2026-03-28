@@ -74,7 +74,7 @@ GROUP=$(bd show <id> --json | jq -r '.metadata["gc.continuation_group"] // empty
 
 if [ -n "$GROUP" ]; then
   # Find all open beads in the same group and pre-assign them
-  SIBLINGS=$(bd list --label=pool:$GC_TEMPLATE \
+  SIBLINGS=$(bd list --metadata-field gc.routed_to=$GC_TEMPLATE \
     --metadata-field gc.continuation_group=$GROUP \
     --status=open --json 2>/dev/null \
     | jq -r '.[].id' 2>/dev/null)

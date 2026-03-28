@@ -15,6 +15,15 @@ import (
 	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
 )
 
+// DesiredStateResult bundles the desired session state with the scale_check
+// counts that produced it. Callers that need poolDesired for wake decisions
+// can pass ScaleCheckCounts to ComputePoolDesiredStates without re-running
+// scale_check commands.
+type DesiredStateResult struct {
+	State            map[string]TemplateParams
+	ScaleCheckCounts map[string]int // nil when store is nil or scale_check not run
+}
+
 type poolEvalWork struct {
 	agentIdx int
 	pool     config.PoolConfig
@@ -48,12 +57,7 @@ func evaluatePendingPools(
 		if pr.err != nil {
 			fmt.Fprintf(stderr, "buildDesiredState: %v (using min=%d)\n", pr.err, pw.pool.Min) //nolint:errcheck
 		}
-		desiredCount := pr.desired
-		floored, floorErr := floorSingletonPoolDesiredFromWorkQuery(cfg.Agents[pw.agentIdx], desiredCount, pw.poolDir, shellScaleCheck)
-		if floorErr != nil {
-			fmt.Fprintf(stderr, "buildDesiredState: work_query fallback for %q: %v\n", cfg.Agents[pw.agentIdx].QualifiedName(), floorErr) //nolint:errcheck
-		}
-		counts[j] = floored
+		counts[j] = pr.desired
 	}
 	return counts
 }
@@ -94,7 +98,7 @@ func buildDesiredState(
 	sp runtime.Provider,
 	store beads.Store,
 	stderr io.Writer,
-) map[string]TemplateParams {
+) DesiredStateResult {
 	var sessionBeads *sessionBeadSnapshot
 	if store != nil {
 		var err error
@@ -114,9 +118,9 @@ func buildDesiredStateWithSessionBeads(
 	store beads.Store,
 	sessionBeads *sessionBeadSnapshot,
 	stderr io.Writer,
-) map[string]TemplateParams {
+) DesiredStateResult {
 	if cfg.Workspace.Suspended {
-		return nil
+		return DesiredStateResult{}
 	}
 
 	bp := newAgentBuildParams(cityName, cityPath, cfg, sp, beaconTime, store, stderr)
@@ -173,43 +177,29 @@ func buildDesiredStateWithSessionBeads(
 		pendingPools = append(pendingPools, poolEvalWork{agentIdx: i, pool: pool, poolDir: poolDir})
 	}
 
-	// Always run scale_check — it executes in the correct directory for
-	// each agent (rig or city) and is the authoritative demand signal.
+	// scale_check runs in parallel for all pool agents — the authoritative
+	// demand signal for new sessions. Computed once, returned in result.
 	scaleCheckCounts := evaluatePendingPoolsMap(cfg, pendingPools, stderr)
 
 	if store != nil {
-		allBeads, err := store.List()
-		if err == nil {
-			poolDesiredStates := ComputePoolDesiredStates(cfg, allBeads, sessionBeads.Open(), scaleCheckCounts)
-			for _, poolState := range poolDesiredStates {
-				cfgAgent := findAgentByTemplate(cfg, poolState.Template)
-				if cfgAgent == nil {
-					continue
-				}
-				if agentInSuspendedRig(cityPath, cfgAgent, cfg.Rigs, suspendedRigPaths) {
-					continue
-				}
-				realizePoolDesiredSessions(bp, cfgAgent, poolState, desired, stderr)
+		// Cross-reference: for each non-closed session, query its scope's
+		// store for work beads assigned to that session (in-progress + open).
+		assignedWorkBeads := collectAssignedWorkBeads(cfg, cityPath, store, suspendedRigPaths)
+		poolDesiredStates := ComputePoolDesiredStates(cfg, assignedWorkBeads, sessionBeads.Open(), scaleCheckCounts)
+		for _, poolState := range poolDesiredStates {
+			cfgAgent := findAgentByTemplate(cfg, poolState.Template)
+			if cfgAgent == nil {
+				continue
 			}
-		} else {
-			fmt.Fprintf(stderr, "buildDesiredState: listing work beads: %v\n", err) //nolint:errcheck
-			// Store failed — fall back to scale_check-only counts.
-			poolDesiredStates := ComputePoolDesiredStates(cfg, nil, nil, scaleCheckCounts)
-			for _, poolState := range poolDesiredStates {
-				cfgAgent := findAgentByTemplate(cfg, poolState.Template)
-				if cfgAgent == nil {
-					continue
-				}
-				if agentInSuspendedRig(cityPath, cfgAgent, cfg.Rigs, suspendedRigPaths) {
-					continue
-				}
-				realizePoolDesiredSessions(bp, cfgAgent, poolState, desired, stderr)
+			if agentInSuspendedRig(cityPath, cfgAgent, cfg.Rigs, suspendedRigPaths) {
+				continue
 			}
+			realizePoolDesiredSessions(bp, cfgAgent, poolState, desired, stderr)
 		}
 	} else {
-		desiredCounts := evaluatePendingPools(cfg, pendingPools, stderr)
-		for j, pw := range pendingPools {
-			desiredCount := desiredCounts[j]
+		// No store — use scale_check counts directly.
+		for _, pw := range pendingPools {
+			desiredCount := scaleCheckCounts[cfg.Agents[pw.agentIdx].QualifiedName()]
 			for slot := 1; slot <= desiredCount; slot++ {
 				// If single-instance (max == 1), use bare name (no suffix).
 				// If multi-instance (max > 1 or unlimited), use themed name
@@ -241,7 +231,49 @@ func buildDesiredStateWithSessionBeads(
 	realizedRoots := discoverSessionBeadsWithRoots(bp, cfg, desired, suspendedRigPaths, stderr)
 	realizeDependencyFloors(bp, cfg, desired, realizedRoots, suspendedRigPaths, stderr)
 
-	return desired
+	return DesiredStateResult{State: desired, ScaleCheckCounts: scaleCheckCounts}
+}
+
+// collectAssignedWorkBeads queries each store (city + rigs) for work beads
+// that have an assignee. Two queries per store: bd list --status=in_progress
+// and bd ready. Results are filtered to only beads with a non-empty assignee.
+// The caller cross-references these with session beads to determine which
+// sessions have active work and must stay alive.
+func collectAssignedWorkBeads(
+	cfg *config.City,
+	cityPath string,
+	cityStore beads.Store,
+	suspendedRigPaths map[string]bool,
+) []beads.Bead {
+	// Gather stores: city + each non-suspended rig.
+	stores := []beads.Store{cityStore}
+	for _, rig := range cfg.Rigs {
+		if suspendedRigPaths[filepath.Clean(rig.Path)] {
+			continue
+		}
+		stores = append(stores, bdStoreForCity(rig.Path, cityPath))
+	}
+
+	var result []beads.Bead
+	for _, s := range stores {
+		// In-progress beads with an assignee (active work).
+		if inProgress, err := s.List("in_progress"); err == nil {
+			appendAssigned(&result, inProgress)
+		}
+		// Ready beads with an assignee (claimed but not started).
+		if ready, err := s.Ready(); err == nil {
+			appendAssigned(&result, ready)
+		}
+	}
+	return result
+}
+
+func appendAssigned(dst *[]beads.Bead, beadList []beads.Bead) {
+	for _, b := range beadList {
+		if strings.TrimSpace(b.Assignee) != "" {
+			*dst = append(*dst, b)
+		}
+	}
 }
 
 func workflowControlOnlyConfig(cfg *config.City) *config.City {
@@ -520,11 +552,21 @@ func selectOrCreatePoolSessionBead(
 	preferred *beads.Bead,
 	used map[string]bool,
 ) (beads.Bead, error) {
+	// Resume tier: reuse the session that has in-progress work assigned.
 	if preferred != nil && preferred.ID != "" && !used[preferred.ID] {
 		return *preferred, nil
 	}
+	// Reuse an existing active session bead. Skip drained (dormant,
+	// only revived via resume tier) and closed (terminal).
 	for _, bead := range bp.sessionBeads.Open() {
-		if bead.Status == "closed" || bead.Metadata["manual_session"] == boolMetadata(true) {
+		if bead.Status == "closed" {
+			continue
+		}
+		state := bead.Metadata["state"]
+		if state == "drained" {
+			continue
+		}
+		if bead.Metadata["manual_session"] == boolMetadata(true) {
 			continue
 		}
 		if isNamedSessionBead(bead) {
