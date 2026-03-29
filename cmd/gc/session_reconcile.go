@@ -128,16 +128,8 @@ func sessionWithinDesiredConfig(session beads.Bead, cfg *config.City, poolDesire
 	if isNamedSessionBead(session) {
 		return agent, namedSessionMode(session) == "always"
 	}
-	if agent.Pool == nil {
-		// Non-pool agents are config-eligible when demand exists.
-		return agent, poolDesired[template] > 0
-	}
-	slot, _ := strconv.Atoi(session.Metadata["pool_slot"])
-	if slot == 0 && !agent.Pool.IsMultiInstance() {
-		slot = 1
-	}
-	desired := poolDesired[template]
-	return agent, slot > 0 && slot <= desired
+	// Both pool and non-pool agents are config-eligible when demand exists.
+	return agent, poolDesired[template] > 0
 }
 
 func sessionStartRequested(session beads.Bead, clk clock.Clock) bool {
@@ -245,16 +237,6 @@ func preferredDependencySessions(sessions []beads.Bead, cfg *config.City) map[st
 }
 
 func compareDependencyCandidate(a, b beads.Bead) int {
-	slotA, _ := strconv.Atoi(a.Metadata["pool_slot"])
-	slotB, _ := strconv.Atoi(b.Metadata["pool_slot"])
-	switch {
-	case slotA == 0 && slotB > 0:
-		return -1
-	case slotA > 0 && slotB == 0:
-		return 1
-	case slotA != slotB:
-		return slotA - slotB
-	}
 	return strings.Compare(a.Metadata["session_name"], b.Metadata["session_name"])
 }
 
@@ -489,9 +471,8 @@ func isPoolExcess(session beads.Bead, cfg *config.City, poolDesired map[string]i
 	if agent == nil || agent.Pool == nil {
 		return false
 	}
-	slot, _ := strconv.Atoi(session.Metadata["pool_slot"])
-	desired := poolDesired[template]
-	return slot > 0 && slot > desired
+	// A session is excess when demand is zero.
+	return poolDesired[template] <= 0
 }
 
 // healState updates advisory state metadata only when changed (dirty check).
