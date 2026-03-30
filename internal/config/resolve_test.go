@@ -57,9 +57,14 @@ func TestResolveProviderAgentProvider(t *testing.T) {
 	if rp.Command != "claude" {
 		t.Errorf("Command = %q, want %q", rp.Command, "claude")
 	}
+	// After migration, CommandString() is just "claude" -- schema flags come from ResolveDefaultArgs.
 	cs := rp.CommandString()
-	if cs != "claude --dangerously-skip-permissions" {
-		t.Errorf("CommandString() = %q, want %q", cs, "claude --dangerously-skip-permissions")
+	if cs != "claude" {
+		t.Errorf("CommandString() = %q, want %q", cs, "claude")
+	}
+	defaultArgs := rp.ResolveDefaultArgs()
+	if len(defaultArgs) != 1 || defaultArgs[0] != "--dangerously-skip-permissions" {
+		t.Errorf("ResolveDefaultArgs() = %v, want [--dangerously-skip-permissions]", defaultArgs)
 	}
 }
 
@@ -73,8 +78,13 @@ func TestResolveProviderWorkspaceProvider(t *testing.T) {
 	if rp.Name != "codex" {
 		t.Errorf("Name = %q, want %q", rp.Name, "codex")
 	}
-	if rp.CommandString() != "codex --dangerously-bypass-approvals-and-sandbox" {
-		t.Errorf("CommandString() = %q, want codex command", rp.CommandString())
+	// After migration, CommandString() is just "codex" -- schema flags come from ResolveDefaultArgs.
+	if rp.CommandString() != "codex" {
+		t.Errorf("CommandString() = %q, want %q", rp.CommandString(), "codex")
+	}
+	defaultArgs := rp.ResolveDefaultArgs()
+	if len(defaultArgs) != 1 || defaultArgs[0] != "--dangerously-bypass-approvals-and-sandbox" {
+		t.Errorf("ResolveDefaultArgs() = %v, want [--dangerously-bypass-approvals-and-sandbox]", defaultArgs)
 	}
 }
 
@@ -809,6 +819,7 @@ func TestMergeProviderOverBuiltinFieldSync(t *testing.T) {
 		ResumeCommand:          "custom-cmd --resume {{.SessionKey}}",
 		SessionIDFlag:          "--session-id",
 		PermissionModes:        map[string]string{"yolo": "--yolo"},
+		OptionDefaults:         map[string]string{"permission_mode": "yolo"},
 		OptionsSchema:          []ProviderOption{{Key: "model"}},
 		PrintArgs:              []string{"-p"},
 		TitleModel:             "haiku",

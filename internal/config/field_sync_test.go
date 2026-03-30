@@ -45,6 +45,7 @@ func TestAgentFieldSync(t *testing.T) {
 		"OnDeath":                "scaling field, patched via PoolOverride.OnDeath",
 		"Namepool":               "agent-specific file path, not a patch concern",
 		"NamepoolNames":          "runtime-only, loaded from Namepool file at config load time",
+		"OptionDefaults":         "provider-level concern, applied during ResolveProvider via mergeAgentOverrides",
 	}
 
 	// Fields on AgentOverride/AgentPatch that don't map 1:1 to Agent fields.

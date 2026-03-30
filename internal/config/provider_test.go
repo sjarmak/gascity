@@ -51,8 +51,12 @@ func TestBuiltinProvidersClaude(t *testing.T) {
 	if p.Command != "claude" {
 		t.Errorf("Command = %q, want %q", p.Command, "claude")
 	}
-	if len(p.Args) != 1 || p.Args[0] != "--dangerously-skip-permissions" {
-		t.Errorf("Args = %v, want [--dangerously-skip-permissions]", p.Args)
+	// Args is nil -- schema-managed flags moved to OptionDefaults.
+	if p.Args != nil {
+		t.Errorf("Args = %v, want nil (schema flags moved to OptionDefaults)", p.Args)
+	}
+	if p.OptionDefaults["permission_mode"] != "unrestricted" {
+		t.Errorf("OptionDefaults[permission_mode] = %q, want unrestricted", p.OptionDefaults["permission_mode"])
 	}
 	if p.PromptMode != "arg" {
 		t.Errorf("PromptMode = %q, want %q", p.PromptMode, "arg")
@@ -66,14 +70,23 @@ func TestBuiltinProvidersClaude(t *testing.T) {
 }
 
 func TestBuiltinClaudeCommandString(t *testing.T) {
+	// After migration, claude's Args is nil. CommandString() returns just "claude".
+	// Schema-managed flags come from ResolveDefaultArgs() instead.
 	p := BuiltinProviders()["claude"]
 	rp := &ResolvedProvider{
-		Command: p.Command,
-		Args:    p.Args,
+		Command:           p.Command,
+		Args:              p.Args,
+		OptionsSchema:     p.OptionsSchema,
+		EffectiveDefaults: ComputeEffectiveDefaults(p.OptionsSchema, p.OptionDefaults, nil),
 	}
 	cs := rp.CommandString()
-	if cs != "claude --dangerously-skip-permissions" {
-		t.Errorf("CommandString() = %q, want %q", cs, "claude --dangerously-skip-permissions")
+	if cs != "claude" {
+		t.Errorf("CommandString() = %q, want %q", cs, "claude")
+	}
+	// Default args should produce the permission flag.
+	defaultArgs := rp.ResolveDefaultArgs()
+	if len(defaultArgs) != 1 || defaultArgs[0] != "--dangerously-skip-permissions" {
+		t.Errorf("ResolveDefaultArgs() = %v, want [--dangerously-skip-permissions]", defaultArgs)
 	}
 }
 
@@ -98,8 +111,12 @@ func TestBuiltinProvidersGemini(t *testing.T) {
 	if p.Command != "gemini" {
 		t.Errorf("Command = %q, want %q", p.Command, "gemini")
 	}
-	if len(p.Args) != 2 || p.Args[0] != "--approval-mode" || p.Args[1] != "yolo" {
-		t.Errorf("Args = %v, want [--approval-mode yolo]", p.Args)
+	// Args is nil -- schema-managed flags moved to OptionDefaults.
+	if p.Args != nil {
+		t.Errorf("Args = %v, want nil (schema flags moved to OptionDefaults)", p.Args)
+	}
+	if p.OptionDefaults["permission_mode"] != "unrestricted" {
+		t.Errorf("OptionDefaults[permission_mode] = %q, want unrestricted", p.OptionDefaults["permission_mode"])
 	}
 	if p.PromptMode != "arg" {
 		t.Errorf("PromptMode = %q, want %q", p.PromptMode, "arg")
