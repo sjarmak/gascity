@@ -5,7 +5,7 @@ description: Current-state subsystem documentation for Gas City.
 
 Current-state documentation for Gas City's subsystems. Each document
 describes how the subsystem works **today**, not how we wish it worked.
-For proposed changes, write a design doc in [`docs/design/`](../design/).
+For proposed changes, write a design doc in [`engdocs/design/`](../design/).
 
 ## Reading Order
 
@@ -70,8 +70,8 @@ RFC distinction):
 
 | Type | Directory | Purpose | Lifecycle |
 |---|---|---|---|
-| Architecture doc | `docs/architecture/` | How it works **now** | Living; update when code changes |
-| Design doc | `docs/design/` | How we **want** it to work | Proposal → accepted → implemented → obsolete |
+| Architecture doc | `engdocs/architecture/` | How it works **now** | Living; update when code changes |
+| Design doc | `engdocs/design/` | How we **want** it to work | Proposal → accepted → implemented → obsolete |
 | Reference doc | `docs/reference/` | Exhaustive lookup (CLI, config, API) | Must stay in sync; partially generated |
 | Tutorial | `docs/tutorials/` | Learning path with exercises | Ordered progression |
 

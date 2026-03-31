@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"sort"
 	"strings"
 	"sync"
@@ -89,6 +90,10 @@ func (sm *SupervisorMux) Handler() http.Handler {
 		}
 		apiInner.ServeHTTP(w, r)
 	})
+	// pprof: expose on a separate port for profiling
+	go func() {
+		_ = http.ListenAndServe("localhost:6060", nil) // default mux has pprof handlers
+	}()
 	return withLogging(withRecovery(withCORS(root)))
 }
 

@@ -81,11 +81,11 @@ The docs now use a Mintlify structure rooted in [`docs/`](docs/README.md).
 - [Installation](docs/getting-started/installation.md)
 - [Quickstart](docs/getting-started/quickstart.md)
 - [Repository Map](docs/getting-started/repository-map.md)
-- [Contributors](docs/contributors/index.md)
+- [Contributors](engdocs/contributors/index.md)
 - [Reference](docs/reference/index.md)
-- [Architecture](docs/architecture/index.md)
-- [Design Docs](docs/design/index.md)
-- [Archive](docs/archive/index.md)
+- [Architecture](engdocs/architecture/index.md)
+- [Design Docs](engdocs/design/index.md)
+- [Archive](engdocs/archive/index.md)
 
 Preview the docs locally:
 
@@ -110,7 +110,7 @@ npx --yes mint@latest dev
 ## Contributing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) and
-[docs/contributors/index.md](docs/contributors/index.md) before opening a
+[engdocs/contributors/index.md](engdocs/contributors/index.md) before opening a
 PR.
 
 Useful commands:

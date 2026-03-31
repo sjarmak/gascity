@@ -57,7 +57,7 @@ unchanged via a compatibility shim.
 ### Erlang/OTP parallel
 
 Gas City already explicitly follows the Erlang/OTP supervision model
-(documented in `docs/architecture/health-patrol.md`):
+(documented in `engdocs/architecture/health-patrol.md`):
 
 | Erlang/OTP | Gas City today | Gas City proposed |
 |---|---|---|

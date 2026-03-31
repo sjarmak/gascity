@@ -15,7 +15,7 @@ implementations and links to their detailed architecture docs.
 ## The Primitive Test
 
 Before adding a new primitive, apply three necessary conditions (see
-[`docs/contributors/primitive-test.md`](/contributors/primitive-test)):
+[`engdocs/contributors/primitive-test.md`](/contributors/primitive-test)):
 
 1. **Atomicity** — can it be decomposed into existing primitives? If
    yes, it's derived, not primitive.
