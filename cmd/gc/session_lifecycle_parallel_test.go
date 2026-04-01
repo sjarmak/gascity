@@ -1558,6 +1558,102 @@ func TestCandidateWaveOrder_UsesLegacyAgentLabelTemplate(t *testing.T) {
 	}
 }
 
+// dieAfterStartProvider starts the session successfully, then immediately
+// removes it so IsRunning returns false. This simulates a session that
+// dies immediately after start (e.g., stale resume key).
+type dieAfterStartProvider struct {
+	*runtime.Fake
+}
+
+func (p *dieAfterStartProvider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+	if err := p.Fake.Start(ctx, name, cfg); err != nil {
+		return err
+	}
+	// Simulate the pane dying immediately.
+	_ = p.Stop(name)
+	return nil
+}
+
+func TestExecutePreparedStartWave_StaleSessionKeyDetected(t *testing.T) {
+	sp := &dieAfterStartProvider{Fake: runtime.NewFake()}
+	item := preparedStart{
+		candidate: startCandidate{
+			session: &beads.Bead{
+				ID: "gc-99",
+				Metadata: map[string]string{
+					"session_name": "test-agent",
+					"session_key":  "stale-key-abc",
+					"template":     "worker",
+				},
+			},
+			tp: TemplateParams{
+				Command:      "claude --resume stale-key-abc",
+				SessionName:  "test-agent",
+				TemplateName: "worker",
+			},
+		},
+		cfg: runtime.Config{Command: "claude --resume stale-key-abc"},
+	}
+
+	results := executePreparedStartWave(
+		context.Background(),
+		[]preparedStart{item},
+		sp,
+		10*time.Second,
+		1,
+	)
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	r := results[0]
+	if r.err == nil {
+		t.Fatal("expected error for session that died during startup with stale key")
+	}
+	if !strings.Contains(r.err.Error(), "died during startup") {
+		t.Fatalf("unexpected error: %v", r.err)
+	}
+}
+
+func TestExecutePreparedStartWave_NoStaleCheckWithoutSessionKey(t *testing.T) {
+	// Session without a session_key should not trigger stale detection,
+	// even if the session dies after start.
+	sp := &dieAfterStartProvider{Fake: runtime.NewFake()}
+	item := preparedStart{
+		candidate: startCandidate{
+			session: &beads.Bead{
+				ID: "gc-99",
+				Metadata: map[string]string{
+					"session_name": "test-agent",
+					"template":     "worker",
+				},
+			},
+			tp: TemplateParams{
+				Command:      "claude",
+				SessionName:  "test-agent",
+				TemplateName: "worker",
+			},
+		},
+		cfg: runtime.Config{Command: "claude"},
+	}
+
+	results := executePreparedStartWave(
+		context.Background(),
+		[]preparedStart{item},
+		sp,
+		10*time.Second,
+		1,
+	)
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	r := results[0]
+	if r.err != nil {
+		t.Fatalf("session without session_key should not get stale key error, got: %v", r.err)
+	}
+}
+
 type ioDiscard struct{}
 
 func (ioDiscard) Write(p []byte) (int, error) { return len(p), nil }

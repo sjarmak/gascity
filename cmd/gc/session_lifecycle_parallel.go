@@ -25,6 +25,11 @@ const (
 	defaultMaxParallelStartsPerWave = 3
 	defaultMaxParallelStopsPerWave  = 3
 	defaultMaxParallelInterrupts    = 16
+
+	// staleKeyDetectDelay is how long to wait after starting a session
+	// before checking if it died immediately (stale resume key detection).
+	// Matches the same constant in internal/session/chat.go.
+	staleKeyDetectDelay = 2 * time.Second
 )
 
 type startCandidate struct {
@@ -410,6 +415,17 @@ func executePreparedStartWave(
 			}
 			defer cancel()
 			err := sp.Start(startCtx, item.candidate.name(), item.cfg)
+			// Stale session key detection: if the session was started
+			// with a resume flag but dies immediately, the session key
+			// likely references a conversation that no longer exists
+			// (e.g., "No conversation found"). Report as a failure so
+			// recordWakeFailure clears the key for the next attempt.
+			if err == nil && item.candidate.session.Metadata["session_key"] != "" {
+				time.Sleep(staleKeyDetectDelay)
+				if !sp.IsRunning(item.candidate.name()) {
+					err = fmt.Errorf("session %q died during startup", item.candidate.name())
+				}
+			}
 			finished := time.Now()
 			rollbackPending := err != nil && shouldRollbackPendingCreate(item.candidate.session)
 			if err != nil && rollbackPending && runningSessionMatchesPendingCreate(item.candidate.session, item.candidate.name(), sp) {
