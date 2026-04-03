@@ -254,7 +254,9 @@ func TestGastown_PolecatImplementsRefineryMerges(t *testing.T) {
 	c.StartForeground()
 
 	// Poll for outcome: refinery must eventually merge the work to origin/main.
-	deadline := 8 * time.Minute
+	// 15 minutes: ~1m city startup + ~1m config-drift restart (suspended→unsuspended
+	// changes pool config fingerprint) + ~3m polecat work + ~2m refinery merge + buffer.
+	deadline := 15 * time.Minute
 	merged := pollForCondition(t, deadline, 15*time.Second, func() bool {
 		_ = gitCmd(t, rigDir, "fetch", "origin")
 		content := gitCmd(t, rigDir, "show", "origin/main:feature.txt")
