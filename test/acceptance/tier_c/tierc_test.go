@@ -200,6 +200,20 @@ func TestGastown_PolecatImplementsRefineryMerges(t *testing.T) {
 	unregisterOut, unregisterErr := c.GC("unregister", c.Dir)
 	require.NoError(t, unregisterErr, "gc unregister after init: %s", unregisterOut)
 
+	// Override provider to use aimux, which manages its own OAuth token
+	// refresh cycle. The bare "claude" provider reads ~/.claude/.credentials.json
+	// which may contain an expired token that Claude Code doesn't persist
+	// after in-memory refresh.
+	if _, err := exec.LookPath("aimux"); err == nil {
+		c.AppendToConfig(`
+[providers.claude]
+display_name = "Claude Code (aimux)"
+command = "aimux"
+args = ["run", "claude", "--"]
+ready_delay_ms = 0
+`)
+	}
+
 	// Add the rig via gc rig add (initializes beads, hooks, routes).
 	c.RigAdd(rigDir, "packs/gastown")
 
