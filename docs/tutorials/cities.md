@@ -103,7 +103,7 @@ Gas City also gives you an implicit agent for each supported provider — so `cl
 ## Slinging your first work
 
 <!-- chris: "what's an agent? what does it mean to dispatch work? what's up with 'sling'?" → addressed: agents explained in city.toml section, sling metaphor explained inline below -->
-<!-- chris: "you should be able to sling work to the default provider by default" → noted: I think we now explain what an agent is and how there's an implicit one for every provider. currently you must name the agent. This is a product question, not a tutorial issue. Personally I think the current approach is correct - otherwie there's too much magic -->
+<!-- chris: "you should be able to sling work to the default provider by default" → noted: I think we now explain what an agent is and how there's an implicit one for every provider. currently you must name the agent. This is a product question, not a tutorial issue. my first usage wanted the agent name to be optional (e.g., `gc sling "Do stuff"` but it does create a little magic. It would make this tutorial much short though. In short, I'm torn.  FWIW, the last I checked the default provier shows up as an agent with `gc status`) -->
 
 You assign work to agents by "slinging" it — think of it as tossing a task to someone who knows what to do. The `gc sling` command takes an agent name and a prompt:
 
