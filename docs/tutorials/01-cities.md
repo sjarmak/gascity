@@ -1,23 +1,17 @@
 ---
 title: Tutorial 01 - Cities and Rigs
-description: Create a city, sling work to an agent, add a project, and configure multiple agents.
+description: Create a city, sling work to an agent, add a rig, and configure multiple agents.
 ---
 
 # Tutorial 01: Cities and Rigs
 
-<!-- chris: "good fodder for a tutorial, but doesn't take the time to explain concepts up front... dives deeply into concepts that belong in other parts of the docs" → addressed: rewritten as a walkthrough in the style of 01-beads.md. Conceptual material (taxonomy, composition pipeline, pack internals) moved to cities-draft.md for future reference docs. -->
+Hello and welcome to the first tutorial for [Gas City](https://github.com/gastownhall/GasCity)! The tutorials are designed to get you started using Gas City from the ground up.
 
-Welcome to the Gas City tutorials. These guides walk you through Gas City from the ground up — creating a workspace, dispatching work to AI coding agents, and scaling up to multi-agent orchestration.
+## Setup
 
-In this tutorial, you'll create a city, sling work to an agent, add a project directory, and configure multiple agents with different providers.
+First, you'll need to install at least one CLI coding agent (which Gas City calls "providers) and make sure that they're on the PATH. Gas City supports many providers, including but not limited to Claude Code (`claude`), Codex CLI (`codex`) and Gemini CLI (`gemini`). Also, make sure you've configured each of your chosen providers (the more the merrier!) with the appropriate token and/or API key so that they can each run and do things for you.
 
-## Installing Gas City
-
-<!-- chris: "skips over the entire onboarding wizard" → addressed: full wizard shown below -->
-
-First, you'll need at least one CLI coding agent installed and on your PATH. Gas City works with Claude Code (`claude`), Codex CLI (`codex`), Gemini CLI (`gemini`), and others. Make sure you've configured your agent with the appropriate API key so it can run and do work for you.
-
-Next, install the Gas City CLI:
+Next, you'll need to get the Gas City CLI installed and on your PATH:
 
 ```shell
 ~
@@ -31,9 +25,7 @@ Now we're ready to create our first city.
 
 ## Creating a city
 
-<!-- chris: "what's a workspace?" → addressed: avoided the word entirely. chris: "supervisor is undefined" → addressed: not explained in the tutorial, just implied by the output. Details belong in reference docs. -->
-
-A city is a directory that holds your agent configuration, prompts, and workflows. It's where agents live and work gets done. You create a new city with `gc init`:
+A city is a directory that holds your agent configuration, prompts, and workflows. You create a new city with `gc init`:
 
 ```shell
 ~
@@ -66,7 +58,7 @@ Registered city 'my-city' (/Users/you/my-city)
 [8/8] Waiting for supervisor to start city
 ```
 
-You can avoid the prompts and just specify what provider you want. Here's the same call, just providing the provider specifically.
+You can avoid the prompts and just specify what provider you want. Here's the same command, just providing the provider explicitly.
 
 ```shell
 ~
@@ -84,10 +76,7 @@ $ ls
 city.toml  formulas  hooks  orders  packs  prompts
 ```
 
-<!-- chris: "run-on sentence" → addressed: rewritten -->
-<!-- chris: "at this point, we're off the deep end of what should be in a tutorial into what belongs in conceptual docs" → addressed: taxonomy table, composition pipeline, pack internals all moved out to cities-draft.md. Only essential config shown here. -->
-<!-- chris: "I don't agree that we should have a city.local.toml" → addressed: removed from tutorial entirely. -->
-The main file is `city.toml` — it defines your city, using the contents of those directories as well as containing some definitions and local config. With the tutorial template, `city.toml` looks like this:
+The main file is `city.toml` — it defines your city, using the contents of those directories as well as containing some definitions and local config. Assuming you chose the default `tutorial` config template and default provider, `city.toml` looks like this:
 
 ```toml
 [workspace]
@@ -99,18 +88,13 @@ name = "mayor"
 prompt_template = "prompts/mayor.md"
 ```
 
-<!-- chris: "use 'rigs' for consistency, even when introducing new terms" → addressed: terminology introduced inline below. Rigs covered in their own section later. -->
+The `[workspace]` section names your city and sets the default provider.
 
-The `[workspace]` section names your city and sets a default provider ("provider" is Gas City's term for a model backend — Claude, Codex, Gemini, etc.).
-
-Agents are how you give an AI model a specific role. The `[[agent]]` entry defines one called `mayor` — the name you'll use to sling work to it. The `prompt_template` points to a markdown file that tells the agent what it is and how it should behave. Different agents can have different prompts, different providers, and different configuration — a reviewer agent and a coding agent might use the same model but have very different instructions.
+Each `[[agent]]` table you configure lets you create a named set of config including things like the provider, the model, the prompt you want to use to define its role, etc. An agent is named so that you can assign it work (aka "sling"). Here we've created an agent called the `mayor` with a prompt template. The `prompt_template` setting points to a markdown file that tells the agent what it is and how it should behave. Different agents can have different prompts, different providers, and different configuration — a reviewer agent and a coding agent might use the same provider but have very different instructions.
 
 Gas City also gives you an implicit agent for each supported provider — so `claude`, `codex`, and `gemini` are available as agent names even though they're not listed in `city.toml`. These use the provider's defaults with no custom prompt.
 
 ## Slinging your first work
-
-<!-- chris: "what's an agent? what does it mean to dispatch work? what's up with 'sling'?" → addressed: agents explained in city.toml section, sling metaphor explained inline below -->
-<!-- chris: "you should be able to sling work to the default provider by default" → noted: I think we now explain what an agent is and how there's an implicit one for every provider. currently you must name the agent. This is a product question, not a tutorial issue. my first usage wanted the agent name to be optional (e.g., `gc sling "Do stuff"` but it does create a little magic. It would make this tutorial much short though. In short, I'm torn.  FWIW, the last I checked the default provier shows up as an agent with `gc status`) -->
 
 You assign work to agents by "slinging" it — think of it as tossing a task to someone who knows what to do. The `gc sling` command takes an agent name and a prompt:
 
@@ -120,8 +104,6 @@ $ gc sling claude "Write hello world in python to the file hello.py"
 Created my-1 — "Write hello world in python to the file hello.py"
 Slung my-1 → claude
 ```
-
-<!-- chris: "misses the opportunity to tell them how to monitor an agent in progress" → addressed: bd show --watch shown below -->
 
 The `gc sling` command created a work item in our city (called a "bead") and dispatched it to the `claude` agent. You can watch it progress:
 
@@ -205,9 +187,7 @@ my-project    /Users/you/my-project   mp      no
 
 ## Multiple agents and providers
 
-<!-- chris: "'claude' is called a 'provider' when creating a city but an 'agent' when slinging work — what's up with that?" → addressed: explained that implicit provider agents are created automatically, and that explicit agents let you customize roles/prompts -->
-
-Your city starts with one explicitly configured agent (`mayor`) and implicit agents for each supported provider (`claude`, `codex`, `gemini`). The implicit agents are convenient for quick work, but as you use Gas City more, you'll want to define agents with specific roles and prompts.
+Your city starts with one explicitly configured agent (`mayor`) and implicit agents for each supported provider (`claude`, `codex`, `gemini`, etc.). The implicit agents are convenient for quick work, but as you use Gas City more, you'll want to define agents with specific roles and prompts.
 
 Open `city.toml` and add a second agent. This one uses Codex instead of Claude:
 
@@ -288,33 +268,44 @@ NAME       PATH
 my-city    /Users/you/my-city
 ```
 
-Pause a rig when you're doing disruptive work and don't want agents interfering:
+> ***donna to chris:** You brought up the distuptive work thing.  I dug around a bit more on city vs. rig suspension. For this flow, it should have been ities anyway (likely a surgical error on my part). I did log an issue on whether supending a rig should cause all work to cease on the rig's directory. It's unclear based on the bits.*
+
+Sometimes you need agents to stop what they're doing — you're reorganizing a directory tree, making a large manual commit, or taking a snapshot you don't want agents to interfere with. Suspend the city:
+
+```shell
+~/my-city
+$ gc suspend
+City suspended.
+```
+
+This pauses all agent activity while keeping the city registered and its resources intact. Resume when you're ready:
+
+```shell
+~/my-city
+$ gc resume
+City resumed.
+```
+
+If you only want to pause work in one rig while the rest of the city keeps running, you can suspend and resume individual rigs:
 
 ```shell
 ~/my-city
 $ gc rig suspend my-project
 Suspended rig 'my-project'
-```
 
-When you're ready, bring it back:
-
-```shell
 ~/my-city
 $ gc rig resume my-project
 Resumed rig 'my-project'
 ```
+> **Issue:** City-level maintenance orders still run against suspended rigs — [details](../../../work/tutorials/city/issues.md#orders-ignore-rig-suspension)
 
-Stop the city entirely, which both quiesces activity and releases most of the resources consumed by that city:
+To stop the city entirely and release resources:
 
 ```shell
 ~/my-city
 $ gc stop
 City stopped.
-```
 
-Start it back up:
-
-```shell
 ~/my-city
 $ gc start
 City started.
