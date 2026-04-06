@@ -294,8 +294,8 @@ func TestResolveTemplateUsesRigManagedDoltPortAndPinsHome(t *testing.T) {
 	if got := tp.Env["GC_DOLT_PORT"]; got != port {
 		t.Fatalf("GC_DOLT_PORT = %q, want %q", got, port)
 	}
-	if got := tp.Env["BEADS_DOLT_PORT"]; got != port {
-		t.Fatalf("BEADS_DOLT_PORT = %q, want %q", got, port)
+	if got := tp.Env["BEADS_DOLT_SERVER_PORT"]; got != port {
+		t.Fatalf("BEADS_DOLT_SERVER_PORT = %q, want %q", got, port)
 	}
 	// HOME is intentionally passed through to agents (PR #272:
 	// HOME/USER/XDG env passthrough for macOS Keychain and config access).

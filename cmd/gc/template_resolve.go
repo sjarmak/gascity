@@ -305,24 +305,24 @@ func sessionDoltEnv(cityPath, rigRoot string, rigs []config.Rig) map[string]stri
 	env := map[string]string{
 		// Explicit empty values let tmux unset stale Dolt vars inherited from
 		// the server environment when the current city/rig does not use them.
-		"GC_DOLT_HOST":    "",
-		"GC_DOLT_PORT":    "",
-		"BEADS_DOLT_HOST": "",
-		"BEADS_DOLT_PORT": "",
+		"GC_DOLT_HOST":           "",
+		"GC_DOLT_PORT":           "",
+		"BEADS_DOLT_SERVER_HOST": "",
+		"BEADS_DOLT_SERVER_PORT": "",
 	}
 
 	if host := doltHostForCity(cityPath); host != "" {
 		env["GC_DOLT_HOST"] = host
-		env["BEADS_DOLT_HOST"] = host
+		env["BEADS_DOLT_SERVER_HOST"] = host
 	}
 	if isExternalDolt(cityPath) {
 		if port := doltPortForCity(cityPath); port != "" {
 			env["GC_DOLT_PORT"] = port
-			env["BEADS_DOLT_PORT"] = port
+			env["BEADS_DOLT_SERVER_PORT"] = port
 		}
 	} else if port := currentDoltPort(cityPath); port != "" {
 		env["GC_DOLT_PORT"] = port
-		env["BEADS_DOLT_PORT"] = port
+		env["BEADS_DOLT_SERVER_PORT"] = port
 	}
 	if rigRoot == "" {
 		return env
@@ -338,11 +338,11 @@ func sessionDoltEnv(cityPath, rigRoot string, rigs []config.Rig) map[string]stri
 		}
 		if r.DoltHost != "" {
 			env["GC_DOLT_HOST"] = r.DoltHost
-			env["BEADS_DOLT_HOST"] = r.DoltHost
+			env["BEADS_DOLT_SERVER_HOST"] = r.DoltHost
 		}
 		if r.DoltPort != "" {
 			env["GC_DOLT_PORT"] = r.DoltPort
-			env["BEADS_DOLT_PORT"] = r.DoltPort
+			env["BEADS_DOLT_SERVER_PORT"] = r.DoltPort
 		}
 		if r.DoltHost != "" || r.DoltPort != "" {
 			return env
@@ -352,9 +352,9 @@ func sessionDoltEnv(cityPath, rigRoot string, rigs []config.Rig) map[string]stri
 
 	if port := currentDoltPort(rigRoot); port != "" {
 		env["GC_DOLT_HOST"] = ""
-		env["BEADS_DOLT_HOST"] = ""
+		env["BEADS_DOLT_SERVER_HOST"] = ""
 		env["GC_DOLT_PORT"] = port
-		env["BEADS_DOLT_PORT"] = port
+		env["BEADS_DOLT_SERVER_PORT"] = port
 	}
 	return env
 }

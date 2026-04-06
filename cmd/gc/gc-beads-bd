@@ -863,11 +863,13 @@ run_bd_pinned() {
         cd "$dir" || exit 1
         export BEADS_DIR="$beads_dir"
         export GC_DOLT_HOST="$host"
-        export BEADS_DOLT_HOST="$host"
+        export BEADS_DOLT_SERVER_HOST="$host"
         export GC_DOLT_PORT="$DOLT_PORT"
-        export BEADS_DOLT_PORT="$DOLT_PORT"
+        export BEADS_DOLT_SERVER_PORT="$DOLT_PORT"
         export GC_DOLT_USER="$DOLT_USER"
         export GC_DOLT_PASSWORD="$DOLT_PASSWORD"
+        export BEADS_DOLT_SERVER_USER="$DOLT_USER"
+        export BEADS_DOLT_PASSWORD="$DOLT_PASSWORD"
         bd "$@"
     )
 }

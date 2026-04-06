@@ -137,16 +137,16 @@ func cityRuntimeProcessEnv(cityPath string) []string {
 	if rawBeadsProvider(cityPath) == "bd" {
 		if host := doltHostForCity(cityPath); host != "" {
 			overrides["GC_DOLT_HOST"] = host
-			overrides["BEADS_DOLT_HOST"] = host
+			overrides["BEADS_DOLT_SERVER_HOST"] = host
 		}
 		if isExternalDolt(cityPath) {
 			if port := doltPortForCity(cityPath); port != "" {
 				overrides["GC_DOLT_PORT"] = port
-				overrides["BEADS_DOLT_PORT"] = port
+				overrides["BEADS_DOLT_SERVER_PORT"] = port
 			}
 		} else if port := currentDoltPort(cityPath); port != "" {
 			overrides["GC_DOLT_PORT"] = port
-			overrides["BEADS_DOLT_PORT"] = port
+			overrides["BEADS_DOLT_SERVER_PORT"] = port
 		}
 	}
 	return mergeRuntimeEnv(os.Environ(), overrides)
@@ -157,14 +157,14 @@ func mirrorBeadsDoltEnv(env map[string]string) {
 		return
 	}
 	if host := strings.TrimSpace(env["GC_DOLT_HOST"]); host != "" {
-		env["BEADS_DOLT_HOST"] = host
+		env["BEADS_DOLT_SERVER_HOST"] = host
 	} else {
-		delete(env, "BEADS_DOLT_HOST")
+		delete(env, "BEADS_DOLT_SERVER_HOST")
 	}
 	if port := strings.TrimSpace(env["GC_DOLT_PORT"]); port != "" {
-		env["BEADS_DOLT_PORT"] = port
+		env["BEADS_DOLT_SERVER_PORT"] = port
 	} else {
-		delete(env, "BEADS_DOLT_PORT")
+		delete(env, "BEADS_DOLT_SERVER_PORT")
 	}
 }
 
@@ -183,8 +183,8 @@ func cityForStoreDir(dir string) string {
 func mergeRuntimeEnv(environ []string, overrides map[string]string) []string {
 	keys := []string{
 		"BEADS_DIR",
-		"BEADS_DOLT_HOST",
-		"BEADS_DOLT_PORT",
+		"BEADS_DOLT_SERVER_HOST",
+		"BEADS_DOLT_SERVER_PORT",
 		"GC_CITY",
 		"GC_CITY_ROOT",
 		"GC_CITY_PATH",

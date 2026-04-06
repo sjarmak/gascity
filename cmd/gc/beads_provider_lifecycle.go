@@ -455,23 +455,23 @@ func readDoltPort(cityPath string) {
 	// Don't overwrite with local state files.
 	if isExternalDolt(cityPath) {
 		if host := doltHostForCity(cityPath); host != "" {
-			_ = os.Setenv("BEADS_DOLT_HOST", host)
+			_ = os.Setenv("BEADS_DOLT_SERVER_HOST", host)
 		} else {
-			_ = os.Unsetenv("BEADS_DOLT_HOST")
+			_ = os.Unsetenv("BEADS_DOLT_SERVER_HOST")
 		}
 		if port := doltPortForCity(cityPath); port != "" {
 			_ = os.Setenv("GC_DOLT_PORT", port)
-			_ = os.Setenv("BEADS_DOLT_PORT", port)
+			_ = os.Setenv("BEADS_DOLT_SERVER_PORT", port)
 		} else {
 			_ = os.Unsetenv("GC_DOLT_PORT")
-			_ = os.Unsetenv("BEADS_DOLT_PORT")
+			_ = os.Unsetenv("BEADS_DOLT_SERVER_PORT")
 		}
 		return
 	}
 	if port := currentDoltPort(cityPath); port != "" {
 		_ = os.Setenv("GC_DOLT_PORT", port)
-		_ = os.Setenv("BEADS_DOLT_PORT", port)
-		_ = os.Unsetenv("BEADS_DOLT_HOST")
+		_ = os.Setenv("BEADS_DOLT_SERVER_PORT", port)
+		_ = os.Unsetenv("BEADS_DOLT_SERVER_HOST")
 		return
 	}
 	// When auto-start is disabled, propagate the stale port so bd subprocess
@@ -480,14 +480,14 @@ func readDoltPort(cityPath string) {
 	if doltAutoStartDisabled(cityPath) {
 		if stalePort := staleDoltPort(cityPath); stalePort != "" {
 			_ = os.Setenv("GC_DOLT_PORT", stalePort)
-			_ = os.Setenv("BEADS_DOLT_PORT", stalePort)
-			_ = os.Unsetenv("BEADS_DOLT_HOST")
+			_ = os.Setenv("BEADS_DOLT_SERVER_PORT", stalePort)
+			_ = os.Unsetenv("BEADS_DOLT_SERVER_HOST")
 			return
 		}
 	}
 	_ = os.Unsetenv("GC_DOLT_PORT")
-	_ = os.Unsetenv("BEADS_DOLT_PORT")
-	_ = os.Unsetenv("BEADS_DOLT_HOST")
+	_ = os.Unsetenv("BEADS_DOLT_SERVER_PORT")
+	_ = os.Unsetenv("BEADS_DOLT_SERVER_HOST")
 }
 
 type doltRuntimeState struct {

@@ -250,17 +250,17 @@ func TestReadDoltPortOverwritesInheritedValue(t *testing.T) {
 	}
 
 	t.Setenv("GC_DOLT_PORT", "9999")
-	t.Setenv("BEADS_DOLT_PORT", "9999")
-	t.Setenv("BEADS_DOLT_HOST", "old-host")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "9999")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "old-host")
 	readDoltPort(cityDir)
 	if got := os.Getenv("GC_DOLT_PORT"); got != fmt.Sprintf("%d", ln.Addr().(*net.TCPAddr).Port) {
 		t.Fatalf("GC_DOLT_PORT = %q, want %d", got, ln.Addr().(*net.TCPAddr).Port)
 	}
-	if got := os.Getenv("BEADS_DOLT_PORT"); got != fmt.Sprintf("%d", ln.Addr().(*net.TCPAddr).Port) {
-		t.Fatalf("BEADS_DOLT_PORT = %q, want %d", got, ln.Addr().(*net.TCPAddr).Port)
+	if got := os.Getenv("BEADS_DOLT_SERVER_PORT"); got != fmt.Sprintf("%d", ln.Addr().(*net.TCPAddr).Port) {
+		t.Fatalf("BEADS_DOLT_SERVER_PORT = %q, want %d", got, ln.Addr().(*net.TCPAddr).Port)
 	}
-	if got := os.Getenv("BEADS_DOLT_HOST"); got != "" {
-		t.Fatalf("BEADS_DOLT_HOST = %q, want empty for local managed Dolt", got)
+	if got := os.Getenv("BEADS_DOLT_SERVER_HOST"); got != "" {
+		t.Fatalf("BEADS_DOLT_SERVER_HOST = %q, want empty for local managed Dolt", got)
 	}
 }
 
@@ -629,7 +629,7 @@ capture_dir="` + captureDir + `"
 cmd="${1:-}"
 record() {
   name="$1"
-  printf '%s|%s|%s|%s|%s\n' "${GC_DOLT_HOST:-}" "${GC_DOLT_PORT:-}" "${BEADS_DOLT_HOST:-}" "${BEADS_DOLT_PORT:-}" "${BEADS_DIR:-}" > "$capture_dir/$name"
+  printf '%s|%s|%s|%s|%s\n' "${GC_DOLT_HOST:-}" "${GC_DOLT_PORT:-}" "${BEADS_DOLT_SERVER_HOST:-}" "${BEADS_DOLT_SERVER_PORT:-}" "${BEADS_DIR:-}" > "$capture_dir/$name"
 }
 case "$cmd" in
   init)

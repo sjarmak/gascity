@@ -27,16 +27,16 @@ func controllerQueryEnv(cityPath string, cfg *config.City, agentCfg *config.Agen
 		return nil
 	}
 	env := map[string]string{}
-	for _, key := range []string{"GC_DOLT_HOST", "GC_DOLT_PORT", "BEADS_DOLT_HOST", "BEADS_DOLT_PORT"} {
+	for _, key := range []string{"GC_DOLT_HOST", "GC_DOLT_PORT", "BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SERVER_PORT"} {
 		if value, ok := source[key]; ok {
 			env[key] = value
 		}
 	}
-	if env["BEADS_DOLT_HOST"] == "" {
-		env["BEADS_DOLT_HOST"] = env["GC_DOLT_HOST"]
+	if env["BEADS_DOLT_SERVER_HOST"] == "" {
+		env["BEADS_DOLT_SERVER_HOST"] = env["GC_DOLT_HOST"]
 	}
-	if env["BEADS_DOLT_PORT"] == "" {
-		env["BEADS_DOLT_PORT"] = env["GC_DOLT_PORT"]
+	if env["BEADS_DOLT_SERVER_PORT"] == "" {
+		env["BEADS_DOLT_SERVER_PORT"] = env["GC_DOLT_PORT"]
 	}
 	if len(env) == 0 {
 		return nil

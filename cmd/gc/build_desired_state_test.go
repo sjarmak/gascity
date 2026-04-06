@@ -620,10 +620,10 @@ func TestBuildDesiredState_PoolCheckInjectsDoltPortForRigScopedAgent(t *testing.
 	if err := os.MkdirAll(rigPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// The check command outputs "2" only when BEADS_DOLT_PORT is set.
+	// The check command outputs "2" only when BEADS_DOLT_SERVER_PORT is set.
 	// If the fix works, buildDesiredState prefixes the command with
-	// BEADS_DOLT_PORT=9876, so the inner shell sees the variable.
-	checkCmd := `sh -c 'test -n "$BEADS_DOLT_PORT" && printf 2 || printf 0'`
+	// BEADS_DOLT_SERVER_PORT=9876, so the inner shell sees the variable.
+	checkCmd := `sh -c 'test -n "$BEADS_DOLT_SERVER_PORT" && printf 2 || printf 0'`
 	cfg := &config.City{
 		Rigs: []config.Rig{{
 			Name:     "myrig",
@@ -647,16 +647,16 @@ func TestBuildDesiredState_PoolCheckInjectsDoltPortForRigScopedAgent(t *testing.
 		}
 	}
 	if workerSlots != 2 {
-		t.Fatalf("worker desired slots = %d, want 2 (BEADS_DOLT_PORT injection should make check output 2)", workerSlots)
+		t.Fatalf("worker desired slots = %d, want 2 (BEADS_DOLT_SERVER_PORT injection should make check output 2)", workerSlots)
 	}
 }
 
 func TestBuildDesiredState_PoolCheckOmitsDoltPortForCityScopedAgent(t *testing.T) {
 	t.Setenv("GC_BEADS", "bd")
 	cityPath := t.TempDir()
-	// Same check command but for a city-scoped agent (no rig). BEADS_DOLT_PORT
+	// Same check command but for a city-scoped agent (no rig). BEADS_DOLT_SERVER_PORT
 	// should NOT be injected, so the check outputs 0.
-	checkCmd := `sh -c 'test -n "$BEADS_DOLT_PORT" && printf 2 || printf 0'`
+	checkCmd := `sh -c 'test -n "$BEADS_DOLT_SERVER_PORT" && printf 2 || printf 0'`
 	cfg := &config.City{
 		Agents: []config.Agent{
 			{
@@ -700,7 +700,7 @@ func TestBuildDesiredState_PoolCheckUsesManagedCityDoltPortWhenRigHasNoOverride(
 	}); err != nil {
 		t.Fatal(err)
 	}
-	checkCmd := `sh -c 'test -n "$BEADS_DOLT_PORT" && printf 2 || printf 0'`
+	checkCmd := `sh -c 'test -n "$BEADS_DOLT_SERVER_PORT" && printf 2 || printf 0'`
 	cfg := &config.City{
 		Rigs: []config.Rig{{
 			Name: "myrig",

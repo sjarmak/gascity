@@ -84,10 +84,10 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 			if filepath.Clean(rp) == filepath.Clean(dir) {
 				env = append(env, "GC_RIG="+r.Name, "GC_RIG_ROOT="+dir)
 				if r.DoltHost != "" {
-					env = append(env, "BEADS_DOLT_HOST="+r.DoltHost)
+					env = append(env, "BEADS_DOLT_SERVER_HOST="+r.DoltHost)
 				}
 				if r.DoltPort != "" {
-					env = append(env, "BEADS_DOLT_PORT="+r.DoltPort)
+					env = append(env, "BEADS_DOLT_SERVER_PORT="+r.DoltPort)
 				}
 				break
 			}
