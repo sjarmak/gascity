@@ -556,15 +556,6 @@ func removeAttemptPoolLabels(labels []string) []string {
 	return out
 }
 
-func appendUniqueAttemptLabel(labels []string, label string) []string {
-	for _, existing := range labels {
-		if existing == label {
-			return labels
-		}
-	}
-	return append(labels, label)
-}
-
 // findLatestAttempt finds the most recent attempt/iteration child of a control bead.
 // Matches by gc.step_ref pattern: the attempt's step_ref ends with
 // .attempt.N or .iteration.N where the prefix matches the control's step_ref.

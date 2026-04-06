@@ -1367,15 +1367,6 @@ func graphRouteRigContext(route string) string {
 	return route[:idx]
 }
 
-func appendUniqueString(in []string, value string) []string {
-	for _, existing := range in {
-		if existing == value {
-			return in
-		}
-	}
-	return append(in, value)
-}
-
 func shouldPromoteWorkflowLaunchStatus(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "", "open", "ready", "todo", "triage", "backlog":
