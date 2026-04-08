@@ -1932,3 +1932,37 @@ func TestPrepareStartCandidate_PreservesRuntimeConfigAndProviderEnv(t *testing.T
 		t.Fatalf("GC_HOME = %q, want %q", got, "/tmp/gc-home")
 	}
 }
+
+func TestConfirmPendingStart(t *testing.T) {
+	// commitStartResultTraced must transition freshly-spawned pool
+	// session beads from the pending states ("", creating, asleep,
+	// drained) to active. Running states ("awake", "active") are left
+	// alone to avoid wasteful metadata rewrites on every reconcile
+	// cycle; terminal and transitional states ("draining", "archived",
+	// "quarantined", "suspended") are likewise ignored so we don't
+	// resurrect a session the reconciler deliberately wound down.
+	cases := []struct {
+		state string
+		want  bool
+	}{
+		{"", true},
+		{"creating", true},
+		{"asleep", true},
+		{"drained", true},
+		{"  creating  ", true}, // trimmed
+		{"active", false},
+		{"awake", false},
+		{"draining", false},
+		{"archived", false},
+		{"quarantined", false},
+		{"suspended", false},
+		{"unknown-future-state", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.state, func(t *testing.T) {
+			if got := confirmPendingStart(tc.state); got != tc.want {
+				t.Errorf("confirmPendingStart(%q) = %v, want %v", tc.state, got, tc.want)
+			}
+		})
+	}
+}

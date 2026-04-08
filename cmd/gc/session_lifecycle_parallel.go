@@ -507,6 +507,21 @@ func commitStartResult(
 	return commitStartResultTraced(result, store, clk, rec, wave, stdout, stderr, nil)
 }
 
+// confirmPendingStart reports whether a session in the given metadata
+// state should be transitioned to "active" after a successful runtime
+// spawn. Empty, "creating", "asleep", and "drained" all indicate the
+// session was pending a spawn; "awake" is treated by the reconciler as
+// equivalent to "active" and is intentionally NOT restamped (a no-op
+// metadata write on every spawn). Any other state ("draining",
+// "archived", "quarantined", ...) is left alone.
+func confirmPendingStart(currentState string) bool {
+	switch sessionpkg.State(strings.TrimSpace(currentState)) {
+	case "", sessionpkg.StateCreating, sessionpkg.StateAsleep, sessionpkg.State("drained"):
+		return true
+	}
+	return false
+}
+
 func commitStartResultTraced(
 	result startResult,
 	store beads.Store,
@@ -565,6 +580,14 @@ func commitStartResultTraced(
 	}
 	if bdj, err := json.Marshal(result.prepared.coreBreakdown); err == nil {
 		metadata["core_hash_breakdown"] = string(bdj)
+	}
+	// Transition creating/asleep/drained beads to active once the runtime
+	// spawn has confirmed. Folded into this metadata batch so the state
+	// write is atomic with the hash writes and avoids a second round-trip
+	// per spawn. See confirmPendingStart for the state gate.
+	if confirmPendingStart(session.Metadata["state"]) {
+		metadata["state"] = string(sessionpkg.StateActive)
+		metadata["state_reason"] = "creation_complete"
 	}
 	if session.Metadata["sleep_reason"] != "" {
 		metadata["sleep_reason"] = ""
