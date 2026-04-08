@@ -18,11 +18,11 @@ func (failingStore) Ready() ([]beads.Bead, error) {
 	return nil, errors.New("simulated dolt failure")
 }
 
-func (failingStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+func (failingStore) List(_ beads.ListQuery) ([]beads.Bead, error) {
 	return nil, errors.New("simulated dolt failure")
 }
 
-func mustSeed(t *testing.T, store beads.Store, in beads.Bead) beads.Bead {
+func mustSeed(t *testing.T, store beads.Store, in beads.Bead) {
 	t.Helper()
 	out, err := store.Create(in)
 	if err != nil {
@@ -33,9 +33,7 @@ func mustSeed(t *testing.T, store beads.Store, in beads.Bead) beads.Bead {
 		if err := store.Update(out.ID, beads.UpdateOpts{Status: &status}); err != nil {
 			t.Fatalf("seed bead status: %v", err)
 		}
-		out.Status = status
 	}
-	return out
 }
 
 func TestPrecomputeBulkRoutedCounts_GroupsByRoutedTo(t *testing.T) {
@@ -189,7 +187,7 @@ func TestComputeWorkSet_BulkRigNotCoveredFallsBack(t *testing.T) {
 		OKRigs: map[string]bool{}, // no rigs covered
 	}
 	called := false
-	runner := func(cmd, dir string) (string, error) {
+	runner := func(_, _ string) (string, error) {
 		called = true
 		return `[{"id":"BL-1"}]`, nil
 	}
