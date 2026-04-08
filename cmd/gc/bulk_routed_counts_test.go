@@ -116,6 +116,92 @@ func TestBulkRoutedCounts_NilSafe(t *testing.T) {
 	}
 }
 
+// failingRunner returns an error so any test that hits it will fail loudly
+// — used to assert the bulk fast path skips the subprocess runner.
+func failingRunner(t *testing.T) ScaleCheckRunner {
+	return func(cmd, dir string) (string, error) {
+		t.Helper()
+		t.Errorf("runner called with cmd=%q dir=%q — bulk fast path should skip it", cmd, dir)
+		return "", nil
+	}
+}
+
+func TestComputeWorkSet_BulkFastPathHit(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{{Name: "worker"}},
+	}
+	bulk := &BulkRoutedCounts{
+		Ready:  map[string]int{"worker": 1},
+		OKRigs: map[string]bool{"": true}, // empty rig name matches default
+	}
+	work := computeWorkSet(cfg, failingRunner(t), "test-city", "/tmp", nil, bulk, nil)
+	if !work["worker"] {
+		t.Error("expected worker to be in workSet from bulk hit")
+	}
+}
+
+func TestComputeWorkSet_BulkFastPathMiss(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{{Name: "worker"}},
+	}
+	bulk := &BulkRoutedCounts{
+		Ready:  map[string]int{}, // no work for worker
+		OKRigs: map[string]bool{"": true},
+	}
+	work := computeWorkSet(cfg, failingRunner(t), "test-city", "/tmp", nil, bulk, nil)
+	if work["worker"] {
+		t.Error("expected no work; bulk hit must short-circuit subprocess")
+	}
+}
+
+func TestComputeWorkSet_BulkFastPathPoolNameRouting(t *testing.T) {
+	// Pool instances route by PoolName, not QualifiedName — see
+	// config.Agent.EffectiveWorkQuery / EffectiveOnBoot. Verify the
+	// bulk fast path keys lookups by PoolName when set.
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "worker-1", PoolName: "worker"},
+		},
+	}
+	bulk := &BulkRoutedCounts{
+		Ready:  map[string]int{"worker": 1}, // routed by template, not instance
+		OKRigs: map[string]bool{"": true},
+	}
+	work := computeWorkSet(cfg, failingRunner(t), "test-city", "/tmp", nil, bulk, nil)
+	if !work["worker-1"] {
+		t.Error("expected worker-1 (PoolName=worker) to be in workSet via PoolName routing")
+	}
+}
+
+func TestComputeWorkSet_BulkRigNotCoveredFallsBack(t *testing.T) {
+	// When the bulk path didn't cover this agent's rig, computeWorkSet
+	// must fall back to the per-pool subprocess runner instead of
+	// silently treating the agent as having no work.
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{{Name: "worker"}},
+	}
+	bulk := &BulkRoutedCounts{
+		Ready:  map[string]int{},
+		OKRigs: map[string]bool{}, // no rigs covered
+	}
+	called := false
+	runner := func(cmd, dir string) (string, error) {
+		called = true
+		return `[{"id":"BL-1"}]`, nil
+	}
+	work := computeWorkSet(cfg, runner, "test-city", "/tmp", nil, bulk, nil)
+	if !called {
+		t.Error("runner was not called — fallback path skipped")
+	}
+	if !work["worker"] {
+		t.Error("expected worker to be in workSet from fallback runner")
+	}
+}
+
 func TestPrecomputeBulkRoutedCounts_EmptyInputs(t *testing.T) {
 	if got := precomputeBulkRoutedCounts(nil, &config.City{}); got != nil {
 		t.Error("nil stores should return nil")

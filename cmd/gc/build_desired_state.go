@@ -36,6 +36,10 @@ type DesiredStateResult struct {
 	// store failure would cause running sessions to be falsely orphaned
 	// and interrupted via Ctrl-C.
 	StoreQueryPartial bool
+	// BulkRoutedCounts is the per-tick precomputed routed-bead counts used
+	// by the bulk fast path. Reused by computeWorkSet so we don't query
+	// each rig store twice per cycle on non-cached store implementations.
+	BulkRoutedCounts *BulkRoutedCounts
 }
 
 type poolEvalWork struct {
@@ -67,7 +71,7 @@ func evaluatePendingPools(
 		agentName := agentCfg.Name
 		agentIndex := pw.agentIdx
 		if bulk != nil && agentCfg.ScaleCheck == "" && bulk.Covers(configuredRigName(cityPath, agentCfg, cfg.Rigs)) {
-			d := bulk.Total(template)
+			d := bulk.Total(bulkTargetForAgent(agentCfg))
 			if d < sp.Min {
 				d = sp.Min
 			}
@@ -413,7 +417,7 @@ func buildDesiredStateWithSessionBeads(
 	realizedRoots := discoverSessionBeadsWithRoots(bp, cfg, desired, suspendedRigPaths, stderr)
 	realizeDependencyFloors(bp, cfg, desired, realizedRoots, suspendedRigPaths, stderr)
 
-	return DesiredStateResult{State: desired, ScaleCheckCounts: scaleCheckCounts, AssignedWorkBeads: assignedWorkBeads, NamedSessionDemand: namedWorkReady, StoreQueryPartial: storePartial}
+	return DesiredStateResult{State: desired, ScaleCheckCounts: scaleCheckCounts, AssignedWorkBeads: assignedWorkBeads, NamedSessionDemand: namedWorkReady, StoreQueryPartial: storePartial, BulkRoutedCounts: bulk}
 }
 
 // collectAssignedWorkBeads queries each store (city + rigs) for actionable

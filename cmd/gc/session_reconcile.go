@@ -374,11 +374,10 @@ func hasDependencyWakeRoot(reasons []WakeReason) bool {
 // commands continue to operate on the real repo even when agent sessions use
 // isolated work_dir sandboxes. Non-empty output means work exists. Agents
 // without a work_query produce no WakeWork reason.
-func computeWorkSet(cfg *config.City, runner ScaleCheckRunner, cityName, cityDir string, store beads.Store, rigStores map[string]beads.Store, sessionBeads *sessionBeadSnapshot) map[string]bool { //nolint:unparam // cityName varies at runtime; tests use a fixed value
+func computeWorkSet(cfg *config.City, runner ScaleCheckRunner, cityName, cityDir string, store beads.Store, bulk *BulkRoutedCounts, sessionBeads *sessionBeadSnapshot) map[string]bool { //nolint:unparam // cityName varies at runtime; tests use a fixed value
 	if cfg == nil || runner == nil {
 		return nil
 	}
-	bulk := precomputeBulkRoutedCounts(rigStores, cfg)
 	type probeWork struct {
 		qn  string
 		wq  string
@@ -395,7 +394,7 @@ func computeWorkSet(cfg *config.City, runner ScaleCheckRunner, cityName, cityDir
 		}
 		seen[qn] = true
 		if bulk != nil && a.WorkQuery == "" && bulk.Covers(configuredRigName(cityDir, a, cfg.Rigs)) {
-			if bulk.Has(qn) {
+			if bulk.Has(bulkTargetForAgent(a)) {
 				work[qn] = true
 			}
 			continue

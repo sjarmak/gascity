@@ -45,6 +45,21 @@ func (b *BulkRoutedCounts) Has(template string) bool {
 	return b.Ready[template] > 0 || b.InProgress[template] > 0
 }
 
+// bulkTargetForAgent returns the routing key to use when looking up an
+// agent in BulkRoutedCounts. Pool instances are routed by their template
+// (PoolName), not by the instance qualified name — see
+// config.Agent.EffectiveWorkQuery and EffectiveOnBoot for the same
+// convention. Templates and non-pool agents key by QualifiedName.
+func bulkTargetForAgent(a *config.Agent) string {
+	if a == nil {
+		return ""
+	}
+	if a.PoolName != "" {
+		return a.PoolName
+	}
+	return a.QualifiedName()
+}
+
 // precomputeBulkRoutedCounts queries each rig's bead store once for
 // Ready() and in-progress lists, filters unassigned entries, and groups
 // them by the gc.routed_to metadata. Returns nil when the store map is
