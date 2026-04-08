@@ -78,18 +78,23 @@ func TestPrecomputeBulkRoutedCounts_GroupsByRoutedTo(t *testing.T) {
 	}
 }
 
-func TestPrecomputeBulkRoutedCounts_SkipsFileProvider(t *testing.T) {
-	// When cfg.Beads.Provider == "file", buildStores assigns a single
-	// shared FileStore to every rig, so iterating rigStores would read
-	// HQ data once per rig and miss the rig dolt backends entirely.
-	// precomputeBulkRoutedCounts must short-circuit in that mode so
-	// callers fall back to the per-pool subprocess path.
+func TestPrecomputeBulkRoutedCounts_DedupesSharedStores(t *testing.T) {
+	// When two rigs point at the same backing store (e.g. a legacy
+	// all-shared-file workspace), the bulk path must count each bead
+	// once, not once per rig. Both rigs are still marked covered so
+	// callers don't fall back to the per-pool subprocess path for them.
 	store := beads.NewMemStore()
 	mustSeed(t, store, beads.Bead{Title: "r", Metadata: map[string]string{"gc.routed_to": "alpha"}})
 	stores := map[string]beads.Store{"rig1": store, "rig2": store}
-	cfg := &config.City{Beads: config.BeadsConfig{Provider: "file"}}
-	if got := precomputeBulkRoutedCounts(stores, cfg); got != nil {
-		t.Errorf("file provider must return nil so fallback kicks in, got %+v", got)
+	bulk := precomputeBulkRoutedCounts(stores, &config.City{})
+	if bulk == nil {
+		t.Fatal("bulk is nil")
+	}
+	if got := bulk.Ready["alpha"]; got != 1 {
+		t.Errorf("Ready[alpha] = %d, want 1 (shared store must not be double-counted)", got)
+	}
+	if !bulk.Covers("rig1") || !bulk.Covers("rig2") {
+		t.Error("both rigs sharing a store must be covered")
 	}
 }
 

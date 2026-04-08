@@ -76,23 +76,22 @@ func precomputeBulkRoutedCounts(rigStores map[string]beads.Store, cfg *config.Ci
 	if cfg == nil || len(rigStores) == 0 {
 		return nil
 	}
-	// When the bead provider is "file", buildStores assigns a single
-	// shared FileStore to every rig (all pointing at the city-level
-	// .gc/beads.json). Bulk iteration would query the same HQ data
-	// once per rig and miss the rig's actual dolt database entirely.
-	// In that mode we return nil so callers fall back to the per-pool
-	// subprocess path, which runs `bd` in each rig's cwd and correctly
-	// resolves the rig's own bead backend via .beads/metadata.json.
-	if beadsProviderFor(cfg) == "file" {
-		return nil
-	}
 	out := &BulkRoutedCounts{
 		Ready:      make(map[string]int),
 		InProgress: make(map[string]int),
 		OKRigs:     make(map[string]bool),
 	}
+	// Dedupe by store pointer so rigs that share the same backing store
+	// (e.g. an all-shared-file workspace) are counted once, not N times.
+	// Rigs with distinct stores — the normal case after the buildStores
+	// fix — are each queried independently.
+	queried := make(map[beads.Store]bool)
 	for rig, store := range rigStores {
 		if store == nil {
+			continue
+		}
+		if queried[store] {
+			out.OKRigs[rig] = true
 			continue
 		}
 		ready, err := store.Ready()
@@ -103,6 +102,7 @@ func precomputeBulkRoutedCounts(rigStores map[string]beads.Store, cfg *config.Ci
 		if err != nil {
 			continue
 		}
+		queried[store] = true
 		out.OKRigs[rig] = true
 		// Mirror the default scale_check semantics from
 		// config.Agent.EffectiveScaleCheck: count ready --unassigned

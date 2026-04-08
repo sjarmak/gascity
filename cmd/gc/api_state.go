@@ -132,30 +132,51 @@ func (cs *controllerState) buildStores(cfg *config.City) map[string]beads.Store 
 	provider := beadsProviderFor(cfg)
 	stores := make(map[string]beads.Store, len(cfg.Rigs))
 
-	// For the "file" provider, all rigs share the same city-level beads.json.
+	// For the "file" provider, the city HQ uses a shared beads.json file.
+	// A rig MAY also use that shared file (if it has no bead backend of
+	// its own) or have its own per-rig backend resolved by `bd` via
+	// .beads/metadata.json. Detect per-rig and route accordingly; otherwise
+	// reconciler paths that read via the rig store (bulk scale_check,
+	// collectAssignedWorkBeads) would see HQ data for every rig and miss
+	// the rig's actual work entirely.
 	var sharedFileStore beads.Store
 	if provider == "file" {
 		store, err := beads.OpenFileStore(fsys.OSFS{}, filepath.Join(cs.cityPath, ".gc", "beads.json"))
 		if err == nil {
 			sharedFileStore = store
 		} else {
-			// Fall back to bd provider rather than opening duplicate per-rig file stores.
 			fmt.Fprintf(os.Stderr, "api: failed to open shared file store: %v (falling back to bd provider)\n", err)
 			provider = "bd"
 		}
 	}
 
 	for _, rig := range cfg.Rigs {
-		if sharedFileStore != nil {
+		if sharedFileStore != nil && !rigHasOwnBeadBackend(rig.Path) {
 			stores[rig.Name] = sharedFileStore
-		} else {
-			stores[rig.Name] = wrapWithCachingStore(
-				cs.openRigStore(provider, rig.Path),
-				cs.eventProv,
-			)
+			continue
 		}
+		rigProvider := provider
+		if rigProvider == "file" {
+			rigProvider = "bd"
+		}
+		stores[rig.Name] = wrapWithCachingStore(
+			cs.openRigStore(rigProvider, rig.Path),
+			cs.eventProv,
+		)
 	}
 	return stores
+}
+
+// rigHasOwnBeadBackend reports whether the rig directory has its own
+// bead store (a `.beads/metadata.json` file), in which case `bd`
+// invoked in that directory will resolve to a rig-local backend (dolt
+// or otherwise) rather than falling back to a shared city store.
+func rigHasOwnBeadBackend(rigPath string) bool {
+	if rigPath == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(rigPath, ".beads", "metadata.json"))
+	return err == nil
 }
 
 // beadsProviderFor returns the bead store provider name from the given config.
