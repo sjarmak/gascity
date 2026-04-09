@@ -89,6 +89,9 @@ needs = ["combine"]
 	if err != nil {
 		t.Fatalf("gc formula show failed: %v\noutput: %s", err, out)
 	}
+	if !strings.Contains(out, "Steps (4):") {
+		t.Errorf("expected 'Steps (4):' in formula show output (got %q)", out)
+	}
 	for _, step := range []string{"dry", "wet", "combine", "cook"} {
 		if !strings.Contains(out, step) {
 			t.Errorf("expected step %q in formula show output:\n%s", step, out)
