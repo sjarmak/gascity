@@ -807,8 +807,8 @@ func TestCommitStartResult_ClearsPendingCreateClaimBeforeHashBatch(t *testing.T)
 	}
 
 	ok := commitStartResult(result, store, &clock.Fake{Time: time.Date(2026, 3, 18, 12, 0, 1, 0, time.UTC)}, events.Discard, 0, ioDiscard{}, ioDiscard{})
-	if !ok {
-		t.Fatal("commitStartResult returned false, want true when only hash batch fails")
+	if ok {
+		t.Fatal("commitStartResult returned true, want false when metadata batch fails (state transition lost)")
 	}
 
 	got, err := store.Get(bead.ID)
@@ -1965,5 +1965,58 @@ func TestConfirmPendingStart(t *testing.T) {
 				t.Errorf("confirmPendingStart(%q) = %v, want %v", tc.state, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestCommitStartResult_TransitionsCreatingToActive(t *testing.T) {
+	// Verify that commitStartResult persists state=active and
+	// state_reason=creation_complete when the session starts in
+	// "creating" state. This is the critical integration seam for
+	// the creating→active fix.
+	store := beads.NewMemStore()
+	session, err := store.Create(beads.Bead{
+		Title:  "worker-session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "worker",
+			"session_name": "worker-1",
+			"state":        "creating",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := startCandidate{
+		session: &session,
+		tp:      TemplateParams{TemplateName: "worker", InstanceName: "worker-1"},
+	}
+	result := startResult{
+		prepared: preparedStart{
+			candidate: candidate,
+			coreHash:  "core-abc",
+			liveHash:  "live-xyz",
+		},
+		outcome:  "success",
+		started:  time.Unix(100, 0),
+		finished: time.Unix(101, 0),
+	}
+	rec := events.NewFake()
+	ok := commitStartResult(result, store, &clock.Fake{Time: time.Unix(102, 0)}, rec, 0, ioDiscard{}, ioDiscard{})
+	if !ok {
+		t.Fatal("commitStartResult returned false for successful start")
+	}
+	got, err := store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata["state"] != "active" {
+		t.Errorf("state = %q, want %q", got.Metadata["state"], "active")
+	}
+	if got.Metadata["state_reason"] != "creation_complete" {
+		t.Errorf("state_reason = %q, want %q", got.Metadata["state_reason"], "creation_complete")
+	}
+	if got.Metadata["started_config_hash"] != "core-abc" {
+		t.Errorf("started_config_hash = %q, want %q", got.Metadata["started_config_hash"], "core-abc")
 	}
 }

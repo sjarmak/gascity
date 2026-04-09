@@ -60,7 +60,7 @@ func evaluatePendingPools(
 	// don't stampede the shared dolt sql-server. Without this, ~40+
 	// pool agents launching goroutines in parallel causes per-call
 	// contention that pushes individual probes past their timeout.
-	sem := make(chan struct{}, bdProbeConcurrency)
+	sem := make(chan struct{}, cfg.Daemon.ProbeConcurrencyOrDefault())
 	var wg sync.WaitGroup
 	for j, pw := range pendingPools {
 		wg.Add(1)

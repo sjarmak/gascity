@@ -412,7 +412,7 @@ func computeWorkSet(cfg *config.City, runner ScaleCheckRunner, cityName, cityDir
 		probes = append(probes, probeWork{qn: qn, wq: wq, dir: agentCommandDir(cityDir, a, cfg.Rigs)})
 	}
 
-	sem := make(chan struct{}, bdProbeConcurrency)
+	sem := make(chan struct{}, cfg.Daemon.ProbeConcurrencyOrDefault())
 	results := make([]bool, len(probes))
 	var wg sync.WaitGroup
 	for i := range probes {

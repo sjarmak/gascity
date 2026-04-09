@@ -501,7 +501,7 @@ func commitStartResult(
 	store beads.Store,
 	clk clock.Clock,
 	rec events.Recorder,
-	wave int,
+	wave int, //nolint:unparam // always 0 here but passed through to commitStartResultTraced which uses it
 	stdout, stderr io.Writer,
 ) bool {
 	return commitStartResultTraced(result, store, clk, rec, wave, stdout, stderr, nil)
@@ -600,18 +600,23 @@ func commitStartResultTraced(
 				"error": err.Error(),
 			}, "")
 		}
-	} else {
-		if session.Metadata == nil {
-			session.Metadata = make(map[string]string)
-		}
-		for key, value := range metadata {
-			session.Metadata[key] = value
-		}
-		if trace != nil {
-			trace.recordMutation("bead_metadata", tp.TemplateName, name, "metadata_batch", session.ID, "started_config_hash", "", result.prepared.coreHash, "success", traceRecordPayload{
-				"wave": wave,
-			}, "")
-		}
+		// The runtime started, but we failed to persist metadata
+		// (including the state transition to active). Report failure so
+		// the reconciler retries on the next tick rather than leaving
+		// the session stuck in "creating" where it gets orphan-drained.
+		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, "metadata_batch_failed", result.started, result.finished, err)
+		return false
+	}
+	if session.Metadata == nil {
+		session.Metadata = make(map[string]string)
+	}
+	for key, value := range metadata {
+		session.Metadata[key] = value
+	}
+	if trace != nil {
+		trace.recordMutation("bead_metadata", tp.TemplateName, name, "metadata_batch", session.ID, "started_config_hash", "", result.prepared.coreHash, "success", traceRecordPayload{
+			"wave": wave,
+		}, "")
 	}
 	logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, result.outcome, result.started, result.finished, nil)
 	return true
