@@ -152,7 +152,8 @@ Examples:
 				}
 			}
 
-			_, _ = fmt.Fprintf(stdout, "\nSteps (%d):\n", len(recipe.Steps)-1)
+			stepCount := max(0, len(recipe.Steps)-1)
+			_, _ = fmt.Fprintf(stdout, "\nSteps (%d):\n", stepCount)
 			for i, step := range recipe.Steps {
 				if step.IsRoot {
 					continue
