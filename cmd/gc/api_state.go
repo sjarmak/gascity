@@ -176,8 +176,10 @@ func (cs *controllerState) openRigStore(provider, rigPath, prefix string) beads.
 		s := beadsexec.NewStore(strings.TrimPrefix(provider, "exec:"))
 		env := citylayout.CityRuntimeEnvMap(cs.cityPath)
 		env["GC_BEADS_PREFIX"] = prefix
+		rigPath = filepath.Clean(rigPath)
 		env["BEADS_DIR"] = filepath.Join(rigPath, ".beads")
 		env["GC_RIG_ROOT"] = rigPath
+		env["GC_RIG"] = ""
 		if cs.cfg != nil {
 			for _, r := range cs.cfg.Rigs {
 				rp := r.Path
