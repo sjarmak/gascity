@@ -150,7 +150,7 @@ func (cs *controllerState) buildStores(cfg *config.City) map[string]beads.Store 
 			stores[rig.Name] = sharedFileStore
 		} else {
 			stores[rig.Name] = wrapWithCachingStore(
-				cs.openRigStore(provider, rig.Path, rig.EffectivePrefix()),
+				cs.openRigStore(provider, rig.Path, rig.EffectivePrefix(), rig.Name),
 				cs.eventProv,
 			)
 		}
@@ -171,7 +171,7 @@ func beadsProviderFor(cfg *config.City) string {
 }
 
 // openRigStore creates a bead store for a rig path using the given provider.
-func (cs *controllerState) openRigStore(provider, rigPath, prefix string) beads.Store {
+func (cs *controllerState) openRigStore(provider, rigPath, prefix, rigName string) beads.Store {
 	if strings.HasPrefix(provider, "exec:") {
 		s := beadsexec.NewStore(strings.TrimPrefix(provider, "exec:"))
 		env := citylayout.CityRuntimeEnvMap(cs.cityPath)
@@ -179,19 +179,7 @@ func (cs *controllerState) openRigStore(provider, rigPath, prefix string) beads.
 		rigPath = filepath.Clean(rigPath)
 		env["BEADS_DIR"] = filepath.Join(rigPath, ".beads")
 		env["GC_RIG_ROOT"] = rigPath
-		env["GC_RIG"] = ""
-		if cs.cfg != nil {
-			for _, r := range cs.cfg.Rigs {
-				rp := r.Path
-				if !filepath.IsAbs(rp) {
-					rp = filepath.Join(cs.cityPath, rp)
-				}
-				if samePath(rp, rigPath) {
-					env["GC_RIG"] = r.Name
-					break
-				}
-			}
-		}
+		env["GC_RIG"] = rigName
 		s.SetEnv(env)
 		return s
 	}
