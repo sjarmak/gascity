@@ -42,6 +42,16 @@ func Compile(_ context.Context, name string, searchPaths []string, vars map[stri
 		return nil, fmt.Errorf("resolving formula %q: %w", name, err)
 	}
 
+	// Validate required vars only when the caller explicitly provided them.
+	// nil = include-all-steps mode (order dispatch); empty = read-only display
+	// (formula show). Both skip validation. Non-empty = user-supplied vars from
+	// sling, cook, or API — validate.
+	if len(vars) > 0 {
+		if err := ValidateVars(resolved, vars); err != nil {
+			return nil, fmt.Errorf("formula %q: %w", name, err)
+		}
+	}
+
 	compileVars := make(map[string]string)
 	for vname, def := range resolved.Vars {
 		if def != nil && def.Default != nil {

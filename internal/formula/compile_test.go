@@ -542,3 +542,81 @@ needs = ["a"]
 		t.Fatalf("Compile(graph-cycle) error = %v, want dependency cycle", err)
 	}
 }
+
+func TestCompileValidatesRequiredVars(t *testing.T) {
+	dir := t.TempDir()
+	formulaContent := `
+formula = "repro-unresolved"
+description = "Repro: unresolved template variables survive into bead titles."
+version = 1
+
+[vars.epic]
+description = "Epic ticket ID"
+required = true
+
+[vars.feature]
+description = "Feature slug"
+required = true
+
+[[steps]]
+id = "implement"
+title = "[{{epic}}] Implement: {{feature}}"
+tags = ["implement", "{{epic}}"]
+description = "Implement the {{feature}} feature for {{epic}}."
+
+[[steps]]
+id = "review"
+title = "[{{epic}}] Review: {{feature}}"
+needs = ["implement"]
+tags = ["review", "{{epic}}"]
+description = "Review the {{feature}} implementation."
+`
+	if err := os.WriteFile(filepath.Join(dir, "repro-unresolved.formula.toml"), []byte(formulaContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("empty vars skips validation", func(t *testing.T) {
+		// Empty map = read-only display (formula show). Validation is
+		// deferred to instantiation-time residual checks.
+		recipe, err := Compile(context.Background(), "repro-unresolved", []string{dir}, map[string]string{})
+		if err != nil {
+			t.Fatalf("Compile with empty vars should skip validation: %v", err)
+		}
+		if recipe.Name != "repro-unresolved" {
+			t.Errorf("Name = %q, want %q", recipe.Name, "repro-unresolved")
+		}
+	})
+
+	t.Run("missing one required var", func(t *testing.T) {
+		_, err := Compile(context.Background(), "repro-unresolved", []string{dir}, map[string]string{"epic": "CLOUD-99999"})
+		if err == nil {
+			t.Fatal("Compile should reject missing feature var")
+		}
+		if !strings.Contains(err.Error(), `"feature" is required`) {
+			t.Errorf("error should mention feature: %v", err)
+		}
+	})
+
+	t.Run("all required vars provided", func(t *testing.T) {
+		recipe, err := Compile(context.Background(), "repro-unresolved", []string{dir}, map[string]string{
+			"epic":    "CLOUD-99999",
+			"feature": "auth",
+		})
+		if err != nil {
+			t.Fatalf("Compile should succeed with all vars: %v", err)
+		}
+		if recipe.Name != "repro-unresolved" {
+			t.Errorf("Name = %q, want %q", recipe.Name, "repro-unresolved")
+		}
+	})
+
+	t.Run("nil vars skips validation", func(t *testing.T) {
+		recipe, err := Compile(context.Background(), "repro-unresolved", []string{dir}, nil)
+		if err != nil {
+			t.Fatalf("Compile with nil vars should skip validation: %v", err)
+		}
+		if recipe.Name != "repro-unresolved" {
+			t.Errorf("Name = %q, want %q", recipe.Name, "repro-unresolved")
+		}
+	})
+}
