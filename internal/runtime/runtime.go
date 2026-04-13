@@ -236,8 +236,8 @@ type CopyEntry struct {
 	// worktree-setup.sh). Fingerprinting such entries would conflate
 	// "config changed" with "pre_start not done yet" and cause false
 	// config-drift drains. See issue #682. The entry is still staged to
-	// K8s pods and retained in CopyFiles for container providers — only
-	// its content is ignored by identity hashing. Only meaningful when
+	// K8s pods and retained in CopyFiles for container providers — the
+	// entry is excluded from identity hashing. Only meaningful when
 	// Probed is true; config-derived entries must still drive drain.
 	SkipFingerprint bool
 }
