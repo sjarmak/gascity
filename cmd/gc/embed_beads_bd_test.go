@@ -127,10 +127,19 @@ func TestBeadsBdScript_EnsureReadyNotRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Use a dynamically allocated port to avoid flakiness if a hardcoded
+	// port happens to be in use on the CI host.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	freePort := fmt.Sprintf("%d", ln.Addr().(*net.TCPAddr).Port)
+	ln.Close()
+
 	cmd := exec.Command(scriptPath, "ensure-ready")
 	cmd.Env = []string{
 		"GC_CITY_PATH=" + dir,
-		"GC_DOLT_PORT=19999",
+		"GC_DOLT_PORT=" + freePort,
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + t.TempDir(),
 	}
@@ -344,7 +353,10 @@ func TestBeadsBdScript_EnsureReadyNeverKills(t *testing.T) {
 	if err := sleeper.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer sleeper.Process.Kill() //nolint:errcheck
+	defer func() {
+		_ = sleeper.Process.Kill()
+		_, _ = sleeper.Process.Wait() // Reap to avoid zombie.
+	}()
 	sleeperPID := fmt.Sprintf("%d", sleeper.Process.Pid)
 
 	// Use a port nothing is listening on — this triggers the TCP failure
