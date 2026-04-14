@@ -121,7 +121,6 @@ fi
 # Restart server if it was running.
 if [ "$was_running" = true ] && [ "$dry_run" = false ] && [ -x "$beads_bd" ]; then
   "$beads_bd" start 2>/dev/null || true
-  "$beads_bd" ensure-ready 2>/dev/null || true
 fi
 
 exit $exit_code
