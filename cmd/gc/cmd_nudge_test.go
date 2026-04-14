@@ -36,7 +36,7 @@ func TestDeliverSessionNudgeWithProviderWaitIdleQueuesForCodex(t *testing.T) {
 	target := nudgeTarget{
 		cityPath:    dir,
 		agent:       config.Agent{Name: "worker"},
-		resolved:    &config.ResolvedProvider{Name: "codex", NeedsNudgePoller: true},
+		resolved:    &config.ResolvedProvider{Name: "codex"},
 		sessionName: "sess-worker",
 	}
 
@@ -83,7 +83,7 @@ func TestDeliverSessionNudgeWithProviderWaitIdleStartsCodexPollerWhenQueued(t *t
 	target := nudgeTarget{
 		cityPath:    dir,
 		agent:       config.Agent{Name: "worker"},
-		resolved:    &config.ResolvedProvider{Name: "codex", NeedsNudgePoller: true},
+		resolved:    &config.ResolvedProvider{Name: "codex"},
 		sessionName: "sess-worker",
 	}
 
@@ -105,45 +105,6 @@ func TestDeliverSessionNudgeWithProviderWaitIdleStartsCodexPollerWhenQueued(t *t
 	}
 	if !called {
 		t.Fatal("startNudgePoller was not called")
-	}
-}
-
-// TestMaybeStartNudgePollerGatedOnCapability proves the poller gate is driven
-// by NeedsNudgePoller, not provider name. A hypothetical non-codex provider
-// with the capability flag starts the poller; a provider without it does not.
-func TestMaybeStartNudgePollerGatedOnCapability(t *testing.T) {
-	cases := []struct {
-		name             string
-		providerName     string
-		needsNudgePoller bool
-		wantCalled       bool
-	}{
-		{name: "codex opted in", providerName: "codex", needsNudgePoller: true, wantCalled: true},
-		{name: "custom provider opted in", providerName: "my-poll-runtime", needsNudgePoller: true, wantCalled: true},
-		{name: "claude stays hook-driven", providerName: "claude", needsNudgePoller: false, wantCalled: false},
-		{name: "codex without flag is a no-op", providerName: "codex", needsNudgePoller: false, wantCalled: false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			called := false
-			prev := startNudgePoller
-			startNudgePoller = func(_, _, _ string) error {
-				called = true
-				return nil
-			}
-			t.Cleanup(func() { startNudgePoller = prev })
-
-			target := nudgeTarget{
-				cityPath:    t.TempDir(),
-				agent:       config.Agent{Name: "worker"},
-				resolved:    &config.ResolvedProvider{Name: tc.providerName, NeedsNudgePoller: tc.needsNudgePoller},
-				sessionName: "sess-worker",
-			}
-			maybeStartNudgePoller(target)
-			if called != tc.wantCalled {
-				t.Fatalf("called = %v, want %v", called, tc.wantCalled)
-			}
-		})
 	}
 }
 
@@ -199,7 +160,7 @@ func TestDeliverSessionNudgeWithProviderImmediateUsesImmediateNudge(t *testing.T
 	target := nudgeTarget{
 		cityPath:    dir,
 		agent:       config.Agent{Name: "worker"},
-		resolved:    &config.ResolvedProvider{Name: "codex", NeedsNudgePoller: true},
+		resolved:    &config.ResolvedProvider{Name: "codex"},
 		sessionName: "sess-worker",
 	}
 
@@ -322,7 +283,7 @@ func TestSendMailNotifyWithProviderQueuesWhenSessionSleeping(t *testing.T) {
 	target := nudgeTarget{
 		cityPath:    dir,
 		agent:       config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)},
-		resolved:    &config.ResolvedProvider{Name: "codex", NeedsNudgePoller: true},
+		resolved:    &config.ResolvedProvider{Name: "codex"},
 		sessionName: "sess-mayor",
 	}
 
@@ -361,7 +322,7 @@ func TestSendMailNotifyWithProviderStartsCodexPollerWhenQueueingRunningSession(t
 	target := nudgeTarget{
 		cityPath:    dir,
 		agent:       config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)},
-		resolved:    &config.ResolvedProvider{Name: "codex", NeedsNudgePoller: true},
+		resolved:    &config.ResolvedProvider{Name: "codex"},
 		sessionName: "sess-mayor",
 	}
 
@@ -520,7 +481,7 @@ func TestTryDeliverQueuedNudgesByPollerDeliversAndAcks(t *testing.T) {
 	target := nudgeTarget{
 		cityPath:    dir,
 		agent:       config.Agent{Name: "worker"},
-		resolved:    &config.ResolvedProvider{Name: "codex", NeedsNudgePoller: true},
+		resolved:    &config.ResolvedProvider{Name: "codex"},
 		sessionName: "sess-worker",
 	}
 

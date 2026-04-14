@@ -189,6 +189,13 @@ func applyAgentPatch(cfg *City, patch *AgentPatch) error {
 	target := qualifiedNameFromPatch(patch.Dir, patch.Name)
 	for i := range cfg.Agents {
 		a := &cfg.Agents[i]
+		// V2: match by qualified name so patches targeting "gastown.mayor"
+		// find agents with BindingName="gastown" and Name="mayor".
+		if AgentMatchesIdentity(a, target) {
+			applyAgentPatchFields(a, patch)
+			return nil
+		}
+		// V1 fallback: direct Dir+Name match.
 		if a.Dir == patch.Dir && a.Name == patch.Name {
 			applyAgentPatchFields(a, patch)
 			return nil

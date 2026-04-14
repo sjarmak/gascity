@@ -23,6 +23,9 @@ func TestDoRegister(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(cityPath, "pack.toml"), []byte("[pack]\nname = \"my-city\"\nschema = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("GC_HOME", dir)
 
 	var stdout, stderr bytes.Buffer

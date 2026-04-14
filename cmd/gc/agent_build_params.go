@@ -28,8 +28,9 @@ type agentBuildParams struct {
 	packDirs        []string
 	packOverlayDirs []string
 	rigOverlayDirs  map[string][]string
-	globalFragments []string
-	stderr          io.Writer
+	globalFragments  []string
+	appendFragments  []string // V2: from [agents].append_fragments / [agent_defaults].append_fragments
+	stderr           io.Writer
 
 	// beadStore is the city-level bead store for session bead lookups.
 	// When non-nil, session names are derived from bead IDs ("s-{beadID}")
@@ -62,7 +63,8 @@ func newAgentBuildParams(cityName, cityPath string, cfg *config.City, sp runtime
 		packDirs:        cfg.PackDirs,
 		packOverlayDirs: cfg.PackOverlayDirs,
 		rigOverlayDirs:  cfg.RigOverlayDirs,
-		globalFragments: cfg.Workspace.GlobalFragments,
+		globalFragments:  cfg.Workspace.GlobalFragments,
+		appendFragments:  mergeFragmentLists(cfg.AgentDefaults.AppendFragments, cfg.AgentsDefaults.AppendFragments),
 		beadStore:       store,
 		beadNames:       make(map[string]string),
 		stderr:          stderr,

@@ -824,7 +824,7 @@ func TestPackPromptFilesExist(t *testing.T) {
 func TestCityAgentsFilter(t *testing.T) {
 	// Verify config.LoadWithIncludes with both packs produces
 	// only city-scoped agents when no rigs are registered.
-	// Dog from maintenance + mayor/deacon/boot from gastown = 4.
+	// Effective dog from gastown override + mayor/deacon/boot = 4.
 	cfg := loadExpanded(t)
 
 	cityAgents := map[string]bool{"mayor": true, "deacon": true, "boot": true, "dog": true}
@@ -843,6 +843,42 @@ func TestCityAgentsFilter(t *testing.T) {
 	}
 	if explicit != 4 {
 		t.Errorf("got %d explicit agents, want 4 city-scoped agents", explicit)
+	}
+}
+
+func TestExpandedCityUsesGastownDogOverride(t *testing.T) {
+	cfg := loadExpanded(t)
+
+	var dog *config.Agent
+	for i := range cfg.Agents {
+		if cfg.Agents[i].Name == "dog" && !cfg.Agents[i].Implicit {
+			dog = &cfg.Agents[i]
+			break
+		}
+	}
+	if dog == nil {
+		t.Fatal("expected explicit dog agent in expanded gastown config")
+	}
+	if dog.Fallback {
+		t.Fatal("expanded dog should be the gastown override, not the fallback definition")
+	}
+	if dog.WorkDir != ".gc/agents/dogs/{{.AgentBase}}" {
+		t.Errorf("dog work_dir = %q, want gastown themed work dir", dog.WorkDir)
+	}
+	if dog.PromptTemplate != filepath.Join("packs", "maintenance", "prompts", "dog.md.tmpl") {
+		t.Errorf("dog prompt_template = %q, want maintenance shared dog prompt", dog.PromptTemplate)
+	}
+	if dog.OverlayDir != filepath.Join("packs", "maintenance", "overlays", "default") {
+		t.Errorf("dog overlay_dir = %q, want maintenance shared dog overlay", dog.OverlayDir)
+	}
+	if len(dog.SessionLive) != 2 {
+		t.Fatalf("dog session_live has %d entries, want 2 gastown theming commands", len(dog.SessionLive))
+	}
+	if !strings.Contains(dog.SessionLive[0], "tmux-theme.sh") {
+		t.Errorf("dog session_live[0] = %q, want tmux-theme.sh", dog.SessionLive[0])
+	}
+	if !strings.Contains(dog.SessionLive[1], "tmux-keybindings.sh") {
+		t.Errorf("dog session_live[1] = %q, want tmux-keybindings.sh", dog.SessionLive[1])
 	}
 }
 

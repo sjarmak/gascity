@@ -595,6 +595,8 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 		Namepool:               "names.txt",
 		NamepoolNames:          []string{"alpha", "bravo"},
 		OptionDefaults:         map[string]string{"effort": "max"},
+		BindingName:            "gastown",
+		PackName:               "gastown",
 	}
 
 	// Verify every Agent field is set (non-zero) in the test data.

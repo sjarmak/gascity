@@ -71,10 +71,6 @@ type CityRuntime struct {
 	shutdownOnce   sync.Once
 	logPrefix      string // "gc start" or "gc supervisor"
 	stdout, stderr io.Writer
-
-	// halt gates tick work without killing the process. State is
-	// owned by the reconciliation goroutine and never shared.
-	halt haltGate
 }
 
 // CityRuntimeParams holds the caller-provided parameters for creating a
@@ -124,17 +120,6 @@ func newCityRuntime(p CityRuntimeParams) *CityRuntime {
 	if p.Cfg.Daemon.WispGCEnabled() {
 		wg = newWispGC(p.Cfg.Daemon.WispGCIntervalDuration(),
 			p.Cfg.Daemon.WispTTLDuration(), bdCommandRunnerForCity(p.CityPath))
-	}
-
-	// Clear stale halt file from a previous session so a service restart
-	// always begins in the running state. An operator who wants the halt
-	// to survive a restart can re-issue "gc halt" after startup.
-	if isCityHalted(p.CityPath) {
-		if err := removeHaltFile(p.CityPath); err != nil {
-			fmt.Fprintf(p.Stderr, "%s: clear stale halt file: %v\n", p.LogPrefix, err) //nolint:errcheck // best-effort stderr
-		} else {
-			fmt.Fprintf(p.Stderr, "%s: cleared stale halt file from previous session\n", p.LogPrefix) //nolint:errcheck // best-effort stderr
-		}
 	}
 
 	// Sweep orphaned order-tracking beads on startup only (not config reload).
@@ -379,12 +364,8 @@ func (cr *CityRuntime) run(ctx context.Context) {
 			// are atomic, so each request is processed exactly once.
 			// Note: ordering relative to convergenceTick is non-deterministic
 			// via this path, but handlers are idempotent so interleaving is safe.
-			if cr.halt.check(cr.cityPath, cr.stderr) {
-				req.replyCh <- convergenceReply{Error: "city halted"}
-			} else {
-				reply := cr.safeHandleConvergenceRequest(ctx, req)
-				req.replyCh <- reply
-			}
+			reply := cr.safeHandleConvergenceRequest(ctx, req)
+			req.replyCh <- reply
 		case <-ctx.Done():
 			return
 		}
@@ -402,12 +383,6 @@ func (cr *CityRuntime) tick(
 	prevPoolRunning *map[string]bool,
 	trigger string,
 ) {
-	// Soft circuit breaker: if "gc halt" has placed a flag file in
-	// the city's runtime dir, skip all tick work. The log line fires
-	// only on the running → halted transition, not every tick.
-	if cr.halt.check(cr.cityPath, cr.stderr) {
-		return
-	}
 	sessionBeads := cr.loadSessionBeadSnapshot()
 	trace := cr.beginTraceCycle(trigger, "controller_tick", sessionBeads)
 	// Detect pool instance deaths since last tick.
@@ -873,7 +848,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 			})
 		}
 	}
-	if err := dispatchReadyWaitNudges(cr.cityPath, store, cr.sp, time.Now(), cr.cfg.Providers); err != nil {
+	if err := dispatchReadyWaitNudges(cr.cityPath, store, cr.sp, time.Now()); err != nil {
 		fmt.Fprintf(cr.stderr, "%s: dispatching wait nudges: %v\n", cr.logPrefix, err) //nolint:errcheck
 	}
 
@@ -930,11 +905,6 @@ func sweepUndesiredPoolSessionBeads(
 }
 
 func (cr *CityRuntime) controlDispatcherTick(ctx context.Context) {
-	// Respect the halt gate: if the city is halted, skip controller
-	// dispatch too — halting means no reconciliation work of any kind.
-	if cr.halt.check(cr.cityPath, cr.stderr) {
-		return
-	}
 	store := cr.cityBeadStore()
 	if store == nil || cr.sessionDrains == nil {
 		return

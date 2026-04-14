@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -130,6 +131,68 @@ name = "mayor"
 	}
 	if cfg.Agents[0].StartCommand != "" {
 		t.Errorf("Agents[0].StartCommand = %q, want empty", cfg.Agents[0].StartCommand)
+	}
+}
+
+func TestParseAgentsAliasNormalizesToAgentDefaults(t *testing.T) {
+	data := []byte(`
+[workspace]
+name = "test-city"
+
+[agents]
+default_sling_formula = "mol-focus-review"
+append_fragments = ["command-glossary"]
+`)
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.AgentDefaults.DefaultSlingFormula != "mol-focus-review" {
+		t.Errorf("AgentDefaults.DefaultSlingFormula = %q, want %q", cfg.AgentDefaults.DefaultSlingFormula, "mol-focus-review")
+	}
+	if !reflect.DeepEqual(cfg.AgentDefaults.AppendFragments, []string{"command-glossary"}) {
+		t.Errorf("AgentDefaults.AppendFragments = %v, want %v", cfg.AgentDefaults.AppendFragments, []string{"command-glossary"})
+	}
+	if !reflect.DeepEqual(cfg.AgentsDefaults, AgentDefaults{}) {
+		t.Errorf("AgentsDefaults = %#v, want zero value after normalization", cfg.AgentsDefaults)
+	}
+	out, err := cfg.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(out), "[agent_defaults]") {
+		t.Errorf("Marshal output missing canonical [agent_defaults]:\n%s", out)
+	}
+	if strings.Contains(string(out), "[agents]") {
+		t.Errorf("Marshal output should not contain compatibility alias [agents]:\n%s", out)
+	}
+}
+
+func TestParseAgentDefaultsWinsOverAgentsAlias(t *testing.T) {
+	data := []byte(`
+[workspace]
+name = "test-city"
+
+[agents]
+default_sling_formula = "mol-legacy"
+append_fragments = ["legacy-fragment"]
+
+[agent_defaults]
+default_sling_formula = "mol-canonical"
+append_fragments = []
+`)
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.AgentDefaults.DefaultSlingFormula != "mol-canonical" {
+		t.Errorf("AgentDefaults.DefaultSlingFormula = %q, want %q", cfg.AgentDefaults.DefaultSlingFormula, "mol-canonical")
+	}
+	if len(cfg.AgentDefaults.AppendFragments) != 0 {
+		t.Errorf("AgentDefaults.AppendFragments = %v, want empty canonical override", cfg.AgentDefaults.AppendFragments)
+	}
+	if !reflect.DeepEqual(cfg.AgentsDefaults, AgentDefaults{}) {
+		t.Errorf("AgentsDefaults = %#v, want zero value after normalization", cfg.AgentsDefaults)
 	}
 }
 

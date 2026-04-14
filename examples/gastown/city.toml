@@ -11,9 +11,10 @@
 #   gastown      — domain-specific coding workflow: mayor, deacon, boot,
 #                  witness, refinery, polecat, crew + digest orders
 #
-# City-scoped agents come from both packs: dog (maintenance) + mayor,
-# deacon, boot (gastown). Rig-scoped agents (witness, refinery, polecat)
-# are stamped per-rig.
+# City-scoped agents come from both packs: mayor, deacon, boot, plus the
+# effective dog definition from gastown. Maintenance still supplies the
+# fallback dog shape and shared dog formulas/prompts that gastown reuses.
+# Rig-scoped agents (witness, refinery, polecat) are stamped per-rig.
 #
 # To use: gc start examples/gastown/
 # Requires rigs to be registered: gc rig add <path>

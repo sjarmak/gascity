@@ -3,7 +3,6 @@
 package tutorialgoldens
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	helpers "github.com/gastownhall/gascity/test/acceptance/helpers"
-	"github.com/joho/godotenv"
 )
 
 const canonicalTutorialRoot = "docs/tutorials"
@@ -26,9 +24,6 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	if err := loadTutorialEnvFile(); err != nil {
-		panic("tutorial-goldens: loading .env: " + err.Error())
-	}
 	if !hasClaudeAuth() || (!useClaudeForCodex() && !hasCodexAuth()) {
 		if useClaudeForCodex() {
 			fmt.Fprintln(os.Stderr, "tutorial-goldens: skipping package (requires Claude auth)")
@@ -91,8 +86,7 @@ func newTutorialEnv(t *testing.T) *tutorialEnv {
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	home := filepath.Join(root, "home")
 	runtimeDir := filepath.Join(root, "runtime")
-	tmuxDir := filepath.Join(runtimeDir, "tmux")
-	for _, dir := range []string{home, runtimeDir, tmuxDir} {
+	for _, dir := range []string{home, runtimeDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatalf("creating %s: %v", dir, err)
 		}
@@ -107,8 +101,10 @@ func newTutorialEnv(t *testing.T) *tutorialEnv {
 	if err := os.WriteFile(filepath.Join(home, ".dolt", "config_global.json"), []byte(doltCfg), 0o644); err != nil {
 		t.Fatalf("writing dolt config: %v", err)
 	}
-	claudeConfigDir := filepath.Join(home, ".claude")
-	if err := helpers.EnsureClaudeStateFile(home, claudeConfigDir); err != nil {
+	if err := stageClaudeAuth(home); err != nil {
+		t.Fatalf("staging Claude auth: %v", err)
+	}
+	if err := helpers.EnsureClaudeStateFile(home); err != nil {
 		t.Fatalf("seeding Claude state: %v", err)
 	}
 	if err := stageCodexAuth(home); err != nil {
@@ -123,11 +119,6 @@ func newTutorialEnv(t *testing.T) *tutorialEnv {
 		Without("GC_BEADS").
 		Without("GC_DOLT").
 		With("DOLT_ROOT_PATH", home)
-	ensureTutorialUserEnv(env)
-	env.With("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
-	env.With("TMUX_TMPDIR", tmuxDir)
-	env.With("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	env.With("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
 	env.With("PATH", filepath.Join(home, ".local", "bin")+":"+env.Get("PATH"))
 
 	for _, key := range []string{
@@ -139,7 +130,6 @@ func newTutorialEnv(t *testing.T) *tutorialEnv {
 		"ANTHROPIC_DEFAULT_SONNET_MODEL",
 		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
 		"CLAUDE_CODE_EFFORT_LEVEL",
-		"CLAUDE_CODE_OAUTH_TOKEN",
 		"CLAUDE_CODE_SUBAGENT_MODEL",
 		"OPENAI_API_KEY",
 	} {
@@ -308,13 +298,15 @@ func hostHomeDir() string {
 }
 
 func hasClaudeAuth() bool {
-	// Only accept auth forms that are portable to the isolated temp-home
-	// environment. Host-level `claude auth status` logins are NOT portable
-	// because the harness no longer stages host HOME into the isolated env.
 	if strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")) != "" || strings.TrimSpace(os.Getenv("ANTHROPIC_AUTH_TOKEN")) != "" {
 		return true
 	}
-	return hasValidClaudeOAuthToken()
+	cmd := exec.Command("claude", "auth", "status")
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return claudeStatusOutputLoggedIn(out)
 }
 
 func hasCodexAuth() bool {
@@ -329,21 +321,15 @@ func hasCodexAuth() bool {
 	return codexStatusOutputLoggedIn(out)
 }
 
-func stageCodexAuth(dstHome string) error {
-	if strings.TrimSpace(os.Getenv("OPENAI_API_KEY")) != "" {
-		return nil
-	}
-	realHome := hostHomeDir()
-	srcCodexDir := filepath.Join(realHome, ".codex")
-	dstCodexDir := filepath.Join(dstHome, ".codex")
-	if err := os.MkdirAll(dstCodexDir, 0o755); err != nil {
-		return err
-	}
-	for _, name := range []string{"auth.json", "config.json", "config.toml"} {
-		if err := copyFileIfExists(filepath.Join(srcCodexDir, name), filepath.Join(dstCodexDir, name), 0o600); err != nil {
-			return err
-		}
-	}
+func stageClaudeAuth(_ string) error {
+	// Tutorial acceptance uses wrapped provider binaries that delegate to the
+	// authenticated host CLI, so there is no isolated Claude auth state to copy.
+	return nil
+}
+
+func stageCodexAuth(_ string) error {
+	// Tutorial acceptance uses wrapped provider binaries that delegate to the
+	// authenticated host CLI, so there is no isolated Codex auth state to copy.
 	return nil
 }
 
@@ -352,11 +338,19 @@ func stageProviderBinaries(dstHome string) error {
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		return err
 	}
-	if err := helpers.StageProviderBinary(binDir, "claude", ""); err != nil {
+	claudeShim, err := providerBinaryShim("claude")
+	if err != nil {
+		return err
+	}
+	if err := helpers.StageProviderBinary(binDir, "claude", claudeShim); err != nil {
 		return err
 	}
 	if !useClaudeForCodex() {
-		if err := helpers.StageProviderBinary(binDir, "codex", ""); err != nil {
+		codexShim, err := providerBinaryShim("codex")
+		if err != nil {
+			return err
+		}
+		if err := helpers.StageProviderBinary(binDir, "codex", codexShim); err != nil {
 			return err
 		}
 	}
@@ -370,80 +364,32 @@ func stageProviderBinaries(dstHome string) error {
 	return nil
 }
 
-func loadTutorialEnvFile() error {
-	return loadEnvFile(filepath.Join(helpers.FindModuleRoot(), ".env"))
-}
-
-func loadEnvFile(path string) error {
-	values, err := godotenv.Read(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+func providerBinaryShim(name string) (string, error) {
+	switch name {
+	case "claude":
+		if strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")) != "" || strings.TrimSpace(os.Getenv("ANTHROPIC_AUTH_TOKEN")) != "" {
+			return "", nil
 		}
-		return err
-	}
-	for key, value := range values {
-		if os.Getenv(key) != "" {
-			continue
+		return hostProviderShim(name, []string{"CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME"})
+	case "codex":
+		if strings.TrimSpace(os.Getenv("OPENAI_API_KEY")) != "" {
+			return "", nil
 		}
-		_ = os.Setenv(key, value)
+		return hostProviderShim(name, []string{"XDG_CONFIG_HOME", "XDG_STATE_HOME"})
+	default:
+		return "", nil
 	}
-	return nil
 }
 
-func hasValidClaudeOAuthToken() bool {
-	token := strings.TrimSpace(os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"))
-	if token == "" {
-		return false
-	}
-	tmpHome, err := os.MkdirTemp("", "claude-oauth-check-*")
+func hostProviderShim(name string, unsetVars []string) (string, error) {
+	path, err := exec.LookPath(name)
 	if err != nil {
-		return false
+		return "", err
 	}
-	defer os.RemoveAll(tmpHome)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "claude", "--print", "ok")
-	cmd.Env = []string{
-		"HOME=" + tmpHome,
-		"PATH=" + os.Getenv("PATH"),
-		"CLAUDE_CODE_OAUTH_TOKEN=" + token,
-	}
-	appendNonEmptyEnv := func(key, value string) {
-		if strings.TrimSpace(value) == "" {
-			return
-		}
-		cmd.Env = append(cmd.Env, key+"="+value)
-	}
-	userName, login := resolveTutorialUserIdentity(os.Getenv("USER"), os.Getenv("LOGNAME"))
-	appendNonEmptyEnv("USER", userName)
-	appendNonEmptyEnv("LOGNAME", login)
-	appendNonEmptyEnv("SHELL", os.Getenv("SHELL"))
-	appendNonEmptyEnv("LANG", os.Getenv("LANG"))
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return false
-	}
-	return strings.Contains(strings.ToLower(string(out)), "ok")
-}
-
-func ensureTutorialUserEnv(env *helpers.Env) {
-	if env == nil {
-		return
-	}
-	userName, login := resolveTutorialUserIdentity(env.Get("USER"), env.Get("LOGNAME"))
-	if userName != "" {
-		env.With("USER", userName)
-	}
-	if login != "" {
-		env.With("LOGNAME", login)
-	}
-}
-
-func resolveTutorialUserIdentity(userName, login string) (string, string) {
-	userName = strings.TrimSpace(userName)
-	login = strings.TrimSpace(login)
+	realHome := hostHomeDir()
+	userName := strings.TrimSpace(os.Getenv("USER"))
+	login := strings.TrimSpace(os.Getenv("LOGNAME"))
 	if current, err := user.Current(); err == nil {
 		if userName == "" {
 			userName = strings.TrimSpace(current.Username)
@@ -452,13 +398,28 @@ func resolveTutorialUserIdentity(userName, login string) (string, string) {
 			login = strings.TrimSpace(current.Username)
 		}
 	}
+	if login == "" {
+		login = filepath.Base(realHome)
+	}
 	if userName == "" {
 		userName = login
 	}
-	if login == "" {
-		login = userName
+
+	parts := []string{"env"}
+	for _, key := range unsetVars {
+		parts = append(parts, "-u", key)
 	}
-	return userName, login
+	parts = append(parts,
+		"HOME="+shellQuote(realHome),
+		"USER="+shellQuote(userName),
+		"LOGNAME="+shellQuote(login),
+		shellQuote(path),
+	)
+	return strings.Join(parts, " "), nil
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
 }
 
 func acceptanceTempRoot() (string, error) {
@@ -473,17 +434,6 @@ func acceptanceTempRoot() (string, error) {
 		return "", err
 	}
 	return root, nil
-}
-
-func copyFileIfExists(src, dst string, perm os.FileMode) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	return os.WriteFile(dst, data, perm)
 }
 
 func useClaudeForCodex() bool {
