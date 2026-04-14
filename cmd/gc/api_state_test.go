@@ -831,11 +831,26 @@ func TestBuildStores_ExecProviderSetsPerRigEnv(t *testing.T) {
 	// Cross-rig assertion: the two rigs must have received different prefixes.
 	// This is the exact regression from #391 — before PR #421, both stores
 	// got identical env, so the last rig's prefix silently won.
-	alphaEnv, _ := os.ReadFile(filepath.Join(envDir, "alpha.env"))
-	bravoEnv, _ := os.ReadFile(filepath.Join(envDir, "bravo.env"))
-	if string(alphaEnv) == string(bravoEnv) {
-		t.Errorf("regression: alpha and bravo exec stores received identical env — "+
-			"store identity is not being propagated per rig:\n%s", string(alphaEnv))
+	// Compare extracted GC_BEADS_PREFIX values (not raw env output, whose
+	// line order is non-deterministic due to Go map iteration in exec.Store).
+	extractPrefix := func(envFile string) string {
+		data, err := os.ReadFile(envFile)
+		if err != nil {
+			return ""
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "GC_BEADS_PREFIX=") {
+				return strings.TrimPrefix(line, "GC_BEADS_PREFIX=")
+			}
+		}
+		return ""
+	}
+	alphaPrefix := extractPrefix(filepath.Join(envDir, "alpha.env"))
+	bravoPrefix := extractPrefix(filepath.Join(envDir, "bravo.env"))
+	if alphaPrefix == bravoPrefix {
+		t.Errorf("regression: alpha and bravo exec stores received the same "+
+			"GC_BEADS_PREFIX=%q — store identity is not being propagated per rig",
+			alphaPrefix)
 	}
 }
 
