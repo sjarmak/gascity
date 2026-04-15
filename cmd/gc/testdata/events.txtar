@@ -95,6 +95,11 @@ stderr 'invalid --timeout'
 ! exec gc events --watch --debounce=notaduration
 stderr 'invalid --debounce'
 
+# --- Watch mode: negative --debounce ---
+
+! exec gc events --watch --debounce=-1s
+stderr 'must not be negative'
+
 # --- Watch mode: debounce >= timeout ---
 
 ! exec gc events --watch --timeout=30s --debounce=30s

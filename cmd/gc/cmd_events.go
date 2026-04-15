@@ -274,6 +274,10 @@ func cmdEventsWatch(typeFilter string, payloadMatch []string, afterSeq uint64, t
 			fmt.Fprintf(stderr, "gc events: invalid --debounce %q: %v\n", debounceFlag, err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
+		if debounce < 0 {
+			fmt.Fprintf(stderr, "gc events: --debounce must not be negative\n") //nolint:errcheck // best-effort stderr
+			return 1
+		}
 		if debounce >= timeout {
 			fmt.Fprintf(stderr, "gc events: --debounce (%s) must be less than --timeout (%s)\n", debounce, timeout) //nolint:errcheck // best-effort stderr
 			return 1
@@ -384,11 +388,16 @@ func doEventsWatchDebounce(ep events.Provider, typeFilter string, payloadMatch m
 	}
 
 	for {
-		if time.Now().After(debounceDeadline) {
+		remaining := time.Until(debounceDeadline)
+		if remaining <= 0 {
 			return printEventsJSON(accumulated, stdout, stderr)
 		}
 
-		time.Sleep(pollInterval)
+		sleep := pollInterval
+		if remaining < sleep {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
 
 		evts, err := ep.List(events.Filter{AfterSeq: lastSeq})
 		if err != nil {
