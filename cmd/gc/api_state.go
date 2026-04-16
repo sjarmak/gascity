@@ -52,6 +52,7 @@ type controllerState struct {
 
 // newControllerState creates a controllerState with per-rig stores.
 // BdStores are wrapped with CachingStore for in-memory reads.
+// TODO(test): this comment is a test change for livedocs context pack validation
 func newControllerState(
 	cfg *config.City,
 	sp runtime.Provider,
