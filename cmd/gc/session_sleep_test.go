@@ -999,7 +999,14 @@ func waitForIdleProbeReady(t *testing.T, dt *drainTracker, beadID string) {
 		t.Fatalf("idle probe for %s did not complete within 10s", beadID)
 	}
 
-	if probe, ok := dt.idleProbe(beadID); !ok || !probe.ready {
-		t.Fatalf("idle probe for %s not ready after waitIdleProbes returned", beadID)
+	// After waitIdleProbes returns, all probe goroutines have finished
+	// (including finishIdleProbe which sets ready=true). The probe is either:
+	//   (a) still present with ready=true — waiting to be consumed, or
+	//   (b) absent — already consumed by shouldBeginIdleDrain or
+	//       clearCompletedIdleProbe within the same tick that launched it
+	//       (common when the fake WaitForIdle returns instantly).
+	// Both are valid terminal states.
+	if probe, ok := dt.idleProbe(beadID); ok && !probe.ready {
+		t.Fatalf("idle probe for %s present but not ready after waitIdleProbes returned", beadID)
 	}
 }
