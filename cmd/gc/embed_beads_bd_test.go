@@ -134,7 +134,7 @@ func TestBeadsBdScript_EnsureReadyNotRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 	freePort := fmt.Sprintf("%d", ln.Addr().(*net.TCPAddr).Port)
-	ln.Close()
+	_ = ln.Close()
 
 	cmd := exec.Command(scriptPath, "ensure-ready")
 	cmd.Env = []string{
@@ -227,7 +227,7 @@ func TestBeadsBdScript_EnsureReadyTCPUnreachable(t *testing.T) {
 		t.Fatal(err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+	_ = ln.Close()
 
 	packDir := filepath.Join(dir, ".gc", "runtime", "packs", "dolt")
 	if err := os.MkdirAll(packDir, 0o755); err != nil {
@@ -283,7 +283,7 @@ func TestBeadsBdScript_EnsureReadyTCPReachableQueryFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	port := ln.Addr().(*net.TCPAddr).Port
 
 	// Accept and immediately close connections so nc -z succeeds but
@@ -294,7 +294,7 @@ func TestBeadsBdScript_EnsureReadyTCPReachableQueryFails(t *testing.T) {
 			if err != nil {
 				return
 			}
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 
@@ -366,7 +366,7 @@ func TestBeadsBdScript_EnsureReadyNeverKills(t *testing.T) {
 		t.Fatal(err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+	_ = ln.Close()
 
 	packDir := filepath.Join(dir, ".gc", "runtime", "packs", "dolt")
 	if err := os.MkdirAll(packDir, 0o755); err != nil {
@@ -388,7 +388,7 @@ func TestBeadsBdScript_EnsureReadyNeverKills(t *testing.T) {
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + t.TempDir(),
 	}
-	cmd.CombinedOutput() // Ignore exit code — we only care about the side effect.
+	_, _ = cmd.CombinedOutput() // Ignore exit code — we only care about the side effect.
 
 	// The critical assertion: the sleeper process must still be alive.
 	// Before the fix, op_ensure_ready → op_start → kill -9.
