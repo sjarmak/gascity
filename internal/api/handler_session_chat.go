@@ -107,16 +107,8 @@ func sessionResumeHints(resolved *config.ResolvedProvider, workDir string) runti
 	}
 }
 
-func agentSupportsMultipleSessions(agentCfg config.Agent) bool {
-	if strings.TrimSpace(agentCfg.Namepool) != "" || len(agentCfg.NamepoolNames) > 0 {
-		return true
-	}
-	maxSessions := agentCfg.EffectiveMaxActiveSessions()
-	return maxSessions == nil || *maxSessions != 1
-}
-
 func sessionExplicitNameForCreate(agentCfg config.Agent, alias string) (string, error) {
-	if !agentSupportsMultipleSessions(agentCfg) || strings.TrimSpace(alias) != "" {
+	if !agentCfg.SupportsMultipleSessions() || strings.TrimSpace(alias) != "" {
 		return "", nil
 	}
 	return session.GenerateAdhocExplicitName(agentCfg.Name)
@@ -369,17 +361,20 @@ func (s *Server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 		writeSessionManagerError(w, err)
 		return
 	}
-	if kind == "agent" && alias != "" && agentSupportsMultipleSessions(agentCfg) {
+	if kind == "agent" && alias != "" && agentCfg.SupportsMultipleSessions() {
 		alias = workdirutil.SessionQualifiedName(s.state.CityPath(), agentCfg, s.state.Config().Rigs, alias, "")
 	}
+	explicitName := ""
+	workDirQualifiedName := ""
 	if kind == "agent" {
-		explicitName, explicitErr := sessionExplicitNameForCreate(agentCfg, alias)
+		var explicitErr error
+		explicitName, explicitErr = sessionExplicitNameForCreate(agentCfg, alias)
 		if explicitErr != nil {
 			s.idem.unreserve(idemKey)
 			writeSessionManagerError(w, explicitErr)
 			return
 		}
-		workDirQualifiedName := workdirutil.SessionQualifiedName(s.state.CityPath(), agentCfg, s.state.Config().Rigs, alias, explicitName)
+		workDirQualifiedName = workdirutil.SessionQualifiedName(s.state.CityPath(), agentCfg, s.state.Config().Rigs, alias, explicitName)
 		workDir, err = s.resolveSessionWorkDir(agentCfg, workDirQualifiedName)
 		if err != nil {
 			s.idem.unreserve(idemKey)
@@ -429,14 +424,24 @@ func (s *Server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 	// show the session in the sidebar immediately via optimistic UI.
 	mgr := s.sessionManager(store)
 	var info session.Info
-	err = session.WithCitySessionAliasLock(s.state.CityPath(), alias, func() error {
+	err = session.WithCitySessionIdentifierLocks(s.state.CityPath(), []string{alias, explicitName}, func() error {
 		if err := session.EnsureAliasAvailableWithConfig(store, s.state.Config(), alias, ""); err != nil {
 			return err
+		}
+		if err := session.EnsureSessionNameAvailableWithConfig(store, s.state.Config(), explicitName, ""); err != nil {
+			return err
+		}
+		if kind == "agent" {
+			if extraMeta == nil {
+				extraMeta = make(map[string]string)
+			}
+			extraMeta["agent_name"] = workDirQualifiedName
+			extraMeta["session_origin"] = "manual"
 		}
 		var createErr error
 		info, createErr = mgr.CreateAliasedBeadOnlyNamedWithMetadata(
 			alias,
-			"",
+			explicitName,
 			template,
 			title,
 			command,

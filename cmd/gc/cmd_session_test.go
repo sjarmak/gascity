@@ -305,6 +305,12 @@ func TestCmdSessionNew_PoolTemplateWithoutAliasUsesGeneratedWorkDirIdentity(t *t
 		if sessionName == "" {
 			t.Fatal("session_name should be populated for aliasless pooled session")
 		}
+		if got := bead.Metadata["session_name_explicit"]; got != boolMetadata(true) {
+			t.Fatalf("session_name_explicit = %q, want %q", got, boolMetadata(true))
+		}
+		if !strings.HasPrefix(sessionName, "ant-adhoc-") {
+			t.Fatalf("session_name = %q, want ant-adhoc-*", sessionName)
+		}
 		if seenSessionName[sessionName] {
 			t.Fatalf("duplicate session_name %q for aliasless pooled sessions", sessionName)
 		}
@@ -324,6 +330,9 @@ func TestCmdSessionNew_PoolTemplateWithoutAliasUsesGeneratedWorkDirIdentity(t *t
 			t.Fatalf("duplicate work_dir %q for aliasless pooled sessions", workDir)
 		}
 		seenWorkDir[workDir] = true
+		if got := bead.Metadata["agent_name"]; got != "demo/"+sessionName {
+			t.Fatalf("agent_name(%q) = %q, want %q", sessionName, got, "demo/"+sessionName)
+		}
 	}
 }
 

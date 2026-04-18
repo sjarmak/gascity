@@ -1452,6 +1452,59 @@ func TestBuildDesiredState_StoreBackedPoolUsesQualifiedInstanceNameForBindings(t
 	}
 }
 
+func TestBuildDesiredState_PendingCreatePoolSessionUsesConcreteBeadIdentity(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	workDir := filepath.Join(cityPath, ".gc", "worktrees", "demo", "ants", "ant-adhoc-abc123")
+	if _, err := store.Create(beads.Bead{
+		Title:  "adhoc ant",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "template:demo/ant"},
+		Metadata: map[string]string{
+			"template":              "demo/ant",
+			"session_name":          "ant-adhoc-abc123",
+			"session_name_explicit": boolMetadata(true),
+			"agent_name":            "demo/ant-adhoc-abc123",
+			"session_origin":        "manual",
+			"pending_create_claim":  boolMetadata(true),
+			"state":                 "creating",
+			"work_dir":              workDir,
+		},
+	}); err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+	cfg := &config.City{
+		Rigs: []config.Rig{{Name: "demo", Path: filepath.Join(cityPath, "repos", "demo")}},
+		Agents: []config.Agent{{
+			Name:              "ant",
+			Dir:               "demo",
+			Provider:          "test-agent",
+			StartCommand:      "true",
+			WorkDir:           ".gc/worktrees/{{.Rig}}/ants/{{.AgentBase}}",
+			MinActiveSessions: intPtr(0),
+			MaxActiveSessions: intPtr(4),
+		}},
+	}
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+	got, ok := dsResult.State["ant-adhoc-abc123"]
+	if !ok {
+		t.Fatalf("desired state missing pending create session: keys=%v", mapKeys(dsResult.State))
+	}
+	if got.TemplateName != "demo/ant" {
+		t.Fatalf("TemplateName = %q, want %q", got.TemplateName, "demo/ant")
+	}
+	if got.InstanceName != "demo/ant-adhoc-abc123" {
+		t.Fatalf("InstanceName = %q, want %q", got.InstanceName, "demo/ant-adhoc-abc123")
+	}
+	if got.WorkDir != workDir {
+		t.Fatalf("WorkDir = %q, want %q", got.WorkDir, workDir)
+	}
+	if got.Env["GC_ALIAS"] != "demo/ant-adhoc-abc123" {
+		t.Fatalf("GC_ALIAS = %q, want %q", got.Env["GC_ALIAS"], "demo/ant-adhoc-abc123")
+	}
+}
+
 func TestBuildDesiredState_DoesNotCreateDuplicatePoolBeadForDiscoveredSession(t *testing.T) {
 	cityPath := t.TempDir()
 	store := beads.NewMemStore()

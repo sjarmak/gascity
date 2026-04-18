@@ -278,11 +278,12 @@ func materializeSessionForAgentConfig(cityPath string, cfg *config.City, store b
 	if err != nil {
 		return "", err
 	}
+	sessionQualifiedName := workdirutil.SessionQualifiedName(cityPath, *agentCfg, cfg.Rigs, "", explicitName)
 	workDir, err := resolveWorkDirForQualifiedName(
 		cityPath,
 		cfg,
 		agentCfg,
-		workdirutil.SessionQualifiedName(cityPath, *agentCfg, cfg.Rigs, "", explicitName),
+		sessionQualifiedName,
 	)
 	if err != nil {
 		return "", err
@@ -300,18 +301,29 @@ func materializeSessionForAgentConfig(cityPath string, cfg *config.City, store b
 
 	if cityUsesManagedReconciler(cityPath) {
 		if pokeErr := pokeController(cityPath); pokeErr == nil {
-			info, createErr := mgr.CreateAliasedBeadOnlyNamedWithMetadata(
-				"",
-				"",
-				agentCfg.QualifiedName(),
-				title,
-				resolved.CommandString(),
-				workDir,
-				resolved.Name,
-				agentCfg.Session,
-				resume,
-				map[string]string{"session_origin": "ephemeral"},
-			)
+			var info session.Info
+			createErr := session.WithCitySessionIdentifierLocks(cityPath, []string{explicitName}, func() error {
+				if err := session.EnsureSessionNameAvailableWithConfig(store, cfg, explicitName, ""); err != nil {
+					return err
+				}
+				var err error
+				info, err = mgr.CreateAliasedBeadOnlyNamedWithMetadata(
+					"",
+					explicitName,
+					agentCfg.QualifiedName(),
+					title,
+					resolved.CommandString(),
+					workDir,
+					resolved.Name,
+					agentCfg.Session,
+					resume,
+					map[string]string{
+						"agent_name":     sessionQualifiedName,
+						"session_origin": "manual",
+					},
+				)
+				return err
+			})
 			if createErr == nil {
 				_ = pokeController(cityPath)
 				return info.SessionName, nil
@@ -326,21 +338,32 @@ func materializeSessionForAgentConfig(cityPath string, cfg *config.City, store b
 		ProcessNames:           resolved.ProcessNames,
 		EmitsPermissionWarning: resolved.EmitsPermissionWarning,
 	}
-	info, err := mgr.CreateAliasedNamedWithTransportAndMetadata(
-		context.Background(),
-		"",
-		"",
-		agentCfg.QualifiedName(),
-		title,
-		resolved.CommandString(),
-		workDir,
-		resolved.Name,
-		agentCfg.Session,
-		resolved.Env,
-		resume,
-		hints,
-		map[string]string{"session_origin": "ephemeral"},
-	)
+	var info session.Info
+	err = session.WithCitySessionIdentifierLocks(cityPath, []string{explicitName}, func() error {
+		if err := session.EnsureSessionNameAvailableWithConfig(store, cfg, explicitName, ""); err != nil {
+			return err
+		}
+		var createErr error
+		info, createErr = mgr.CreateAliasedNamedWithTransportAndMetadata(
+			context.Background(),
+			"",
+			explicitName,
+			agentCfg.QualifiedName(),
+			title,
+			resolved.CommandString(),
+			workDir,
+			resolved.Name,
+			agentCfg.Session,
+			resolved.Env,
+			resume,
+			hints,
+			map[string]string{
+				"agent_name":     sessionQualifiedName,
+				"session_origin": "manual",
+			},
+		)
+		return createErr
+	})
 	if err == nil {
 		return info.SessionName, nil
 	}

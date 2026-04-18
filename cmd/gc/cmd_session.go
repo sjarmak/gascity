@@ -175,7 +175,7 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach bool,
 		fmt.Fprintf(stderr, "gc session new: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	if alias != "" && isMultiSessionCfgAgent(&found) {
+	if alias != "" && found.SupportsMultipleSessions() {
 		alias = workdirutil.SessionQualifiedName(cityPath, found, cfg.Rigs, alias, "")
 	}
 	explicitName, err := sessionExplicitNameForNewSession(&found, alias)
@@ -194,11 +194,12 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach bool,
 	mgr := newSessionManager(store, sp)
 
 	// Build the work directory.
+	sessionQualifiedName := workdirutil.SessionQualifiedName(cityPath, found, cfg.Rigs, alias, explicitName)
 	workDir, err := resolveWorkDirForQualifiedName(
 		cityPath,
 		cfg,
 		&found,
-		workdirutil.SessionQualifiedName(cityPath, found, cfg.Rigs, alias, explicitName),
+		sessionQualifiedName,
 	)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session new: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -225,16 +226,22 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach bool,
 		if pokeErr := pokeController(cityPath); pokeErr == nil {
 			// Controller is running — create bead only, let reconciler start it.
 			var info session.Info
-			err := session.WithCitySessionAliasLock(cityPath, alias, func() error {
+			err := session.WithCitySessionIdentifierLocks(cityPath, []string{alias, explicitName}, func() error {
 				if err := session.EnsureAliasAvailableWithConfigForOwner(store, cfg, alias, "", configuredOwner); err != nil {
 					return err
 				}
+				if err := session.EnsureSessionNameAvailableWithConfig(store, cfg, explicitName, ""); err != nil {
+					return err
+				}
 				var createErr error
-				kindMeta := map[string]string{"session_origin": "ephemeral"}
+				kindMeta := map[string]string{
+					"agent_name":     sessionQualifiedName,
+					"session_origin": "manual",
+				}
 				if resolved.Kind != "" && resolved.Kind != resolved.Name {
 					kindMeta["provider_kind"] = resolved.Kind
 				}
-				info, createErr = mgr.CreateAliasedBeadOnlyNamedWithMetadata(alias, "", canonicalTemplate, title, resolved.CommandString(), workDir, resolved.Name, found.Session, session.ProviderResume{
+				info, createErr = mgr.CreateAliasedBeadOnlyNamedWithMetadata(alias, explicitName, canonicalTemplate, title, resolved.CommandString(), workDir, resolved.Name, found.Session, session.ProviderResume{
 					ResumeFlag:    resolved.ResumeFlag,
 					ResumeStyle:   resolved.ResumeStyle,
 					ResumeCommand: resolved.ResumeCommand,
@@ -291,17 +298,23 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach bool,
 		SessionIDFlag: resolved.SessionIDFlag,
 	}
 
-	kindMeta := map[string]string{"session_origin": "ephemeral"}
+	kindMeta := map[string]string{
+		"agent_name":     sessionQualifiedName,
+		"session_origin": "manual",
+	}
 	if resolved.Kind != "" && resolved.Kind != resolved.Name {
 		kindMeta["provider_kind"] = resolved.Kind
 	}
 	var info session.Info
-	err = session.WithCitySessionAliasLock(cityPath, alias, func() error {
+	err = session.WithCitySessionIdentifierLocks(cityPath, []string{alias, explicitName}, func() error {
 		if err := session.EnsureAliasAvailableWithConfigForOwner(store, cfg, alias, "", configuredOwner); err != nil {
 			return err
 		}
+		if err := session.EnsureSessionNameAvailableWithConfig(store, cfg, explicitName, ""); err != nil {
+			return err
+		}
 		var createErr error
-		info, createErr = mgr.CreateAliasedNamedWithTransportAndMetadata(context.Background(), alias, "", canonicalTemplate, title, resolved.CommandString(), workDir, resolved.Name, found.Session, resolved.Env, resume, hints, kindMeta)
+		info, createErr = mgr.CreateAliasedNamedWithTransportAndMetadata(context.Background(), alias, explicitName, canonicalTemplate, title, resolved.CommandString(), workDir, resolved.Name, found.Session, resolved.Env, resume, hints, kindMeta)
 		return createErr
 	})
 	if err != nil {
@@ -1410,7 +1423,7 @@ func resolveWorkDirForQualifiedName(cityPath string, cfg *config.City, agent *co
 }
 
 func sessionExplicitNameForNewSession(agent *config.Agent, alias string) (string, error) {
-	if agent == nil || !isMultiSessionCfgAgent(agent) || strings.TrimSpace(alias) != "" {
+	if agent == nil || !agent.SupportsMultipleSessions() || strings.TrimSpace(alias) != "" {
 		return "", nil
 	}
 	return session.GenerateAdhocExplicitName(agent.Name)

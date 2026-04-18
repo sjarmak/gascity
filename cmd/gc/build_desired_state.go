@@ -15,6 +15,7 @@ import (
 	"github.com/gastownhall/gascity/internal/hooks"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
+	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 )
 
 // DesiredStateResult bundles the desired session state with the scale_check
@@ -706,17 +707,34 @@ func discoverSessionBeadsWithRoots(
 		}
 		// Resolve TemplateParams for this bead's session.
 		//
-		// Canonicalize agent identity before calling resolveTemplate so a
-		// pool-managed bead with pool_slot stamped fingerprints as the
-		// pool-instance form here — the same shape realizePoolDesiredSessions
-		// uses. Without this, GC_ALIAS (part of CoreFingerprint) would read
-		// as the base "rig/dog" in rediscovery and "rig/dog-1" in realize on
-		// the next tick, and the reconciler would declare config drift and
-		// drain the live session. Named beads intentionally pass through
-		// with the base shape (see canonicalSessionIdentity).
-		resolveAgent, resolveQN := canonicalSessionIdentity(cfgAgent, b)
+		// Pool-managed beads and manual pooled sessions recover identity from
+		// different sources:
+		//   - Pool-managed rediscovery must canonicalize stamped pool slots to
+		//     the same instance identity realizePoolDesiredSessions uses, or
+		//     GC_ALIAS / FingerprintExtra will oscillate across ticks.
+		//   - Manual sessions must preserve the concrete identity persisted on
+		//     the bead (agent_name / explicit session_name / alias), even when
+		//     that identity is not a numbered pool slot.
+		var (
+			resolveAgent         *config.Agent
+			sessionQualifiedName string
+		)
+		if isManualSessionBead(b) {
+			sessionQualifiedName = sessionBeadQualifiedName(bp.cityPath, cfgAgent, bp.rigs, b)
+			resolveAgent = sessionBeadConfigAgent(cfgAgent, sessionQualifiedName)
+		} else {
+			// Canonicalize agent identity before calling resolveTemplate so a
+			// pool-managed bead with pool_slot stamped fingerprints as the
+			// pool-instance form here — the same shape realizePoolDesiredSessions
+			// uses. Without this, GC_ALIAS (part of CoreFingerprint) would read
+			// as the base "rig/dog" in rediscovery and "rig/dog-1" in realize on
+			// the next tick, and the reconciler would declare config drift and
+			// drain the live session. Named beads intentionally pass through
+			// with the base shape (see canonicalSessionIdentity).
+			resolveAgent, sessionQualifiedName = canonicalSessionIdentity(cfgAgent, b)
+		}
 		fpExtra := buildFingerprintExtra(resolveAgent)
-		tp, err := resolveTemplateForSessionBead(bp, resolveAgent, resolveQN, fpExtra, b)
+		tp, err := resolveTemplateForSessionBead(bp, resolveAgent, sessionQualifiedName, fpExtra, b)
 		if err != nil {
 			fmt.Fprintf(stderr, "buildDesiredState: bead %s template %q: %v (skipping)\n", b.ID, template, err) //nolint:errcheck
 			continue
@@ -866,17 +884,6 @@ func desiredHasTemplate(desired map[string]TemplateParams, template string) bool
 	return false
 }
 
-func isMultiSessionCfgAgent(a *config.Agent) bool {
-	if a == nil {
-		return false
-	}
-	if strings.TrimSpace(a.Namepool) != "" || len(a.NamepoolNames) > 0 {
-		return true
-	}
-	maxSess := a.EffectiveMaxActiveSessions()
-	return maxSess == nil || *maxSess != 1
-}
-
 func realizePoolDesiredSessions(
 	bp *agentBuildParams,
 	cfgAgent *config.Agent,
@@ -991,6 +998,62 @@ func canonicalSessionIdentity(cfgAgent *config.Agent, bead beads.Bead) (*config.
 	qualifiedInstance := cfgAgent.QualifiedInstanceName(instanceName)
 	instanceAgent := deepCopyAgent(cfgAgent, instanceName, cfgAgent.Dir)
 	return &instanceAgent, qualifiedInstance
+}
+
+func sessionBeadQualifiedName(cityPath string, cfgAgent *config.Agent, rigs []config.Rig, sessionBead beads.Bead) string {
+	if cfgAgent == nil {
+		return ""
+	}
+	if agentName := normalizeSessionBeadQualifiedName(cfgAgent, sessionBeadAgentName(sessionBead)); agentName != "" {
+		return agentName
+	}
+	explicitName := ""
+	if strings.TrimSpace(sessionBead.Metadata["session_name_explicit"]) == boolMetadata(true) {
+		explicitName = strings.TrimSpace(sessionBead.Metadata["session_name"])
+	}
+	qualifiedName := workdirutil.SessionQualifiedName(
+		cityPath,
+		*cfgAgent,
+		rigs,
+		strings.TrimSpace(sessionBead.Metadata["alias"]),
+		explicitName,
+	)
+	if qualifiedName != "" {
+		return qualifiedName
+	}
+	return cfgAgent.QualifiedName()
+}
+
+func normalizeSessionBeadQualifiedName(cfgAgent *config.Agent, identity string) string {
+	if cfgAgent == nil {
+		return strings.TrimSpace(identity)
+	}
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return ""
+	}
+	if identity == cfgAgent.QualifiedName() || strings.Contains(identity, "/") {
+		return identity
+	}
+	if cfgAgent.BindingName != "" && strings.HasPrefix(identity, cfgAgent.BindingName+".") {
+		return identity
+	}
+	return cfgAgent.QualifiedInstanceName(identity)
+}
+
+func sessionBeadConfigAgent(cfgAgent *config.Agent, qualifiedName string) *config.Agent {
+	if cfgAgent == nil || !cfgAgent.SupportsInstanceExpansion() || strings.TrimSpace(qualifiedName) == "" || qualifiedName == cfgAgent.QualifiedName() {
+		return cfgAgent
+	}
+	localName := strings.TrimSpace(qualifiedName)
+	if cfgAgent.Dir != "" {
+		localName = strings.TrimPrefix(localName, cfgAgent.Dir+"/")
+	}
+	if cfgAgent.BindingName != "" {
+		localName = strings.TrimPrefix(localName, cfgAgent.BindingName+".")
+	}
+	instanceAgent := deepCopyAgent(cfgAgent, localName, cfgAgent.Dir)
+	return &instanceAgent
 }
 
 func claimPoolSlot(cfgAgent *config.Agent, sessionBead beads.Bead, used map[int]bool) int {

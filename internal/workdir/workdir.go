@@ -90,7 +90,7 @@ func PathContextForQualifiedName(cityPath, cityName, qualifiedName string, a con
 // session instance. Single-session agents keep their template identity; pooled
 // agents use the alias or generated explicit name.
 func SessionQualifiedName(cityPath string, a config.Agent, rigs []config.Rig, alias, explicitName string) string {
-	if !supportsMultipleSessions(a) {
+	if !a.SupportsMultipleSessions() {
 		return a.QualifiedName()
 	}
 	identity := strings.TrimSpace(alias)
@@ -175,14 +175,6 @@ func ResolveWorkDirPath(cityPath, cityName, qualifiedName string, a config.Agent
 		return ResolveDirPath(cityPath, ExpandTemplate(a.WorkDir, ctx))
 	}
 	return path
-}
-
-func supportsMultipleSessions(a config.Agent) bool {
-	if strings.TrimSpace(a.Namepool) != "" || len(a.NamepoolNames) > 0 {
-		return true
-	}
-	maxSessions := a.EffectiveMaxActiveSessions()
-	return maxSessions == nil || *maxSessions != 1
 }
 
 func samePath(a, b string) bool {

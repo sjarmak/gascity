@@ -299,6 +299,7 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 		}
 		if explicitName != "" {
 			meta["session_name"] = explicitName
+			meta["session_name_explicit"] = "true"
 		}
 		for k, v := range extraMeta {
 			meta[k] = v
@@ -332,6 +333,9 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 			b.Metadata = make(map[string]string)
 		}
 		b.Metadata["session_name"] = sessName
+		if explicitName != "" {
+			b.Metadata["session_name_explicit"] = "true"
+		}
 
 		unroute := m.routeACPIfNeeded(provider, transport, sessName)
 		rollbackFailedCreate := func() error {
@@ -342,7 +346,11 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 				if err := m.store.SetMetadata(b.ID, "session_name", ""); err != nil {
 					return fmt.Errorf("clearing session name during rollback: %w", err)
 				}
+				if err := m.store.SetMetadata(b.ID, "session_name_explicit", ""); err != nil {
+					return fmt.Errorf("clearing explicit session name flag during rollback: %w", err)
+				}
 				b.Metadata["session_name"] = ""
+				b.Metadata["session_name_explicit"] = ""
 			}
 			if err := m.store.Close(b.ID); err != nil {
 				return fmt.Errorf("closing rolled-back session bead: %w", err)

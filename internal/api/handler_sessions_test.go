@@ -1002,6 +1002,13 @@ func TestHandleSessionCreateAsync_PoolTemplateWithoutAliasUsesGeneratedWorkDirId
 		if got := bead.Metadata["alias"]; got != "" {
 			t.Fatalf("alias = %q, want empty", got)
 		}
+		sessionName := bead.Metadata["session_name"]
+		if got := bead.Metadata["session_name_explicit"]; got != "true" {
+			t.Fatalf("session_name_explicit = %q, want %q", got, "true")
+		}
+		if !strings.HasPrefix(sessionName, "ant-adhoc-") {
+			t.Fatalf("session_name = %q, want ant-adhoc-*", sessionName)
+		}
 		workDir := bead.Metadata["work_dir"]
 		if filepath.Dir(workDir) != filepath.Join(fs.cityPath, ".gc", "worktrees", "myrig", "ants") {
 			t.Fatalf("work_dir parent = %q, want %q", filepath.Dir(workDir), filepath.Join(fs.cityPath, ".gc", "worktrees", "myrig", "ants"))
@@ -1014,6 +1021,9 @@ func TestHandleSessionCreateAsync_PoolTemplateWithoutAliasUsesGeneratedWorkDirId
 			t.Fatalf("duplicate work_dir %q", workDir)
 		}
 		seenWorkDir[workDir] = true
+		if got := bead.Metadata["agent_name"]; got != "myrig/"+sessionName {
+			t.Fatalf("agent_name(%q) = %q, want %q", sessionName, got, "myrig/"+sessionName)
+		}
 	}
 }
 
