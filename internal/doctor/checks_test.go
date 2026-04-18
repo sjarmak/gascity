@@ -272,6 +272,71 @@ func TestConfigRefsCheck_MultipleIssues(t *testing.T) {
 	}
 }
 
+// Regression for schema=2 packs: convention-discovered agents store
+// prompt_template / session_setup_script / overlay_dir as absolute paths.
+// The check must stat them directly instead of joining against cityPath,
+// which doubles the root prefix and makes every file "not found".
+func TestConfigRefsCheck_AbsolutePaths(t *testing.T) {
+	cases := []struct {
+		name         string
+		createFiles  bool
+		overlayIsDir bool // only applies when createFiles=true
+		wantStatus   CheckStatus
+		wantIssues   int
+	}{
+		{"existing_files", true, true, StatusOK, 0},
+		{"missing_files", false, false, StatusWarning, 3},
+		{"overlay_is_file_not_dir", true, false, StatusWarning, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cityDir := t.TempDir()
+			packDir := t.TempDir()
+			absPrompt := filepath.Join(packDir, "agents", "mayor", "prompt.template.md")
+			absScript := filepath.Join(packDir, "agents", "mayor", "setup.sh")
+			absOverlay := filepath.Join(packDir, "agents", "mayor", "overlay")
+			if tc.createFiles {
+				if err := os.MkdirAll(filepath.Dir(absPrompt), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(absPrompt, []byte("hi"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(absScript, []byte("#!/bin/sh"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if tc.overlayIsDir {
+					if err := os.MkdirAll(absOverlay, 0o755); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					if err := os.WriteFile(absOverlay, []byte("file-not-dir"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+
+			cfg := &config.City{
+				Agents: []config.Agent{{
+					Name:               "mayor",
+					PromptTemplate:     absPrompt,
+					SessionSetupScript: absScript,
+					OverlayDir:         absOverlay,
+				}},
+			}
+			c := NewConfigRefsCheck(cfg, cityDir)
+			r := c.Run(&CheckContext{})
+			if r.Status != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; msg = %s; details = %v",
+					r.Status, tc.wantStatus, r.Message, r.Details)
+			}
+			if len(r.Details) != tc.wantIssues {
+				t.Errorf("got %d issues, want %d: %v", len(r.Details), tc.wantIssues, r.Details)
+			}
+		})
+	}
+}
+
 // --- BuiltinPackFamilyCheck ---
 
 func TestBuiltinPackFamilyCheck_Unmodified(t *testing.T) {

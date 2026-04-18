@@ -166,23 +166,23 @@ func (c *ConfigRefsCheck) Run(_ *CheckContext) *CheckResult {
 	for _, a := range c.cfg.Agents {
 		qn := a.QualifiedName()
 		if a.PromptTemplate != "" {
-			path := filepath.Join(c.cityPath, a.PromptTemplate)
+			path := resolveConfigRefPath(c.cityPath, a.PromptTemplate)
 			if _, err := os.Stat(path); err != nil {
-				issues = append(issues, fmt.Sprintf("agent %q: prompt_template %q not found", qn, a.PromptTemplate))
+				issues = append(issues, fmt.Sprintf("agent %q: prompt_template %q not found", qn, path))
 			}
 		}
 		if a.SessionSetupScript != "" {
-			path := filepath.Join(c.cityPath, a.SessionSetupScript)
+			path := resolveConfigRefPath(c.cityPath, a.SessionSetupScript)
 			if _, err := os.Stat(path); err != nil {
-				issues = append(issues, fmt.Sprintf("agent %q: session_setup_script %q not found", qn, a.SessionSetupScript))
+				issues = append(issues, fmt.Sprintf("agent %q: session_setup_script %q not found", qn, path))
 			}
 		}
 		if a.OverlayDir != "" {
-			path := filepath.Join(c.cityPath, a.OverlayDir)
+			path := resolveConfigRefPath(c.cityPath, a.OverlayDir)
 			if fi, err := os.Stat(path); err != nil {
-				issues = append(issues, fmt.Sprintf("agent %q: overlay_dir %q not found", qn, a.OverlayDir))
+				issues = append(issues, fmt.Sprintf("agent %q: overlay_dir %q not found", qn, path))
 			} else if !fi.IsDir() {
-				issues = append(issues, fmt.Sprintf("agent %q: overlay_dir %q is not a directory", qn, a.OverlayDir))
+				issues = append(issues, fmt.Sprintf("agent %q: overlay_dir %q is not a directory", qn, path))
 			}
 		}
 		if a.Provider != "" && len(c.cfg.Providers) > 0 {
@@ -208,6 +208,16 @@ func (c *ConfigRefsCheck) CanFix() bool { return false }
 
 // Fix is a no-op.
 func (c *ConfigRefsCheck) Fix(_ *CheckContext) error { return nil }
+
+// resolveConfigRefPath resolves an agent config path reference against the
+// city root. Schema=2 packs emit absolute paths; legacy [[agent]] tables
+// use city-relative paths, so guard against double-rooting before joining.
+func resolveConfigRefPath(cityPath, p string) string {
+	if filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(cityPath, p)
+}
 
 // BuiltinPackFamilyCheck fails when a city overrides only one member of the
 // builtin bd/dolt pack family. Mixed system/user families are unsupported.
