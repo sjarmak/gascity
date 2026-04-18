@@ -388,14 +388,14 @@ func doEventsWatchDebounce(ep events.Provider, typeFilter string, payloadMatch m
 	}
 
 	for {
-		remaining := time.Until(debounceDeadline)
-		if remaining <= 0 {
+		untilDebounce := time.Until(debounceDeadline)
+		if untilDebounce <= 0 {
 			return printEventsJSON(accumulated, stdout, stderr)
 		}
 
 		sleep := pollInterval
-		if remaining < sleep {
-			sleep = remaining
+		if untilDebounce < sleep {
+			sleep = untilDebounce
 		}
 		time.Sleep(sleep)
 
