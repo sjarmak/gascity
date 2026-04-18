@@ -116,7 +116,7 @@ WORK=$(gc bd list --assignee=$GC_AGENT --status=open \
 
 If found: read the bead metadata to confirm it has a branch:
 ```bash
-gc bd show $WORK --json | jq '.metadata'
+gc bd show $WORK --json | jq '.[0].metadata'
 ```
 The bead MUST have `metadata.branch`. If `metadata.target` is missing,
 use {{target_branch}} as default. Note the work bead ID and close this step.
@@ -142,8 +142,8 @@ description = """
 
 Read the work bead metadata:
 ```bash
-BRANCH=$(gc bd show $WORK --json | jq -r '.metadata.branch')
-TARGET=$(gc bd show $WORK --json | jq -r '.metadata.target // "{{target_branch}}"')
+BRANCH=$(gc bd show $WORK --json | jq -r '.[0].metadata.branch')
+TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_branch}}"')
 ```
 
 Fetch and attempt mechanical rebase:
@@ -221,8 +221,8 @@ If any check or test FAILED:
 
 Read the current branch and target again:
 ```bash
-BRANCH=$(gc bd show $WORK --json | jq -r '.metadata.branch')
-TARGET=$(gc bd show $WORK --json | jq -r '.metadata.target // "{{target_branch}}"')
+BRANCH=$(gc bd show $WORK --json | jq -r '.[0].metadata.branch')
+TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_branch}}"')
 ```
 
 1. Diagnose: branch regression or pre-existing on target?
@@ -271,9 +271,9 @@ description = """
 
 Read the merge target and merge strategy from the work bead metadata:
 ```bash
-BRANCH=$(gc bd show $WORK --json | jq -r '.metadata.branch')
-TARGET=$(gc bd show $WORK --json | jq -r '.metadata.target // "{{target_branch}}"')
-MERGE_STRATEGY=$(gc bd show $WORK --json | jq -r '.metadata.merge_strategy // "direct"')
+BRANCH=$(gc bd show $WORK --json | jq -r '.[0].metadata.branch')
+TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_branch}}"')
+MERGE_STRATEGY=$(gc bd show $WORK --json | jq -r '.[0].metadata.merge_strategy // "direct"')
 if [ "$MERGE_STRATEGY" = "pr" ]; then
   MERGE_STRATEGY="mr"
 fi
@@ -325,7 +325,7 @@ git push origin HEAD:$BRANCH --force-with-lease
 
 **2. Create or discover the pull request:**
 ```bash
-ISSUE_TITLE=$(gc bd show $WORK --json | jq -r '.title')
+ISSUE_TITLE=$(gc bd show $WORK --json | jq -r '.[0].title')
 PR_BODY=$(cat <<EOF
 ## Summary
 
