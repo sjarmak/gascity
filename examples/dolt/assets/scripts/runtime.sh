@@ -39,3 +39,32 @@ if [ -z "$GC_DOLT_PORT" ]; then
   fi
   : "${GC_DOLT_PORT:=3307}"
 fi
+
+# Resolve a bounded-execution helper. Prefer gtimeout (coreutils on
+# macOS), fall back to timeout (coreutils on Linux), then to running
+# the command directly if neither is installed. Running unbounded is
+# still better than letting a wedged dolt client hang the caller, but
+# patrol callers need a hard upper bound wherever possible.
+if command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="gtimeout"
+elif command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="timeout"
+else
+  TIMEOUT_BIN=""
+fi
+
+# run_bounded SECS CMD...  — Run CMD with a wall-clock timeout. Exits
+# 124 on timeout (coreutils convention). Uses --kill-after=2 so an
+# uncooperative child that ignores SIGTERM (e.g. a dolt client stuck
+# in kernel socket wait) is escalated to SIGKILL rather than leaking
+# zombies — which is the failure mode the bounded helper exists to
+# prevent. When no timeout binary is available the command runs
+# unbounded; callers must still tolerate a non-zero status.
+run_bounded() {
+  _t="$1"; shift
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" --kill-after=2 "$_t" "$@"
+  else
+    "$@"
+  fi
+}

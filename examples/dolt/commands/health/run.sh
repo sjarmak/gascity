@@ -66,31 +66,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Resolve a bounded-execution helper. Prefer gtimeout (coreutils on
-# macOS), fall back to timeout (coreutils on Linux), then to running
-# the command directly if neither is installed. Running unbounded is
-# still better than the old behavior, but the patrol's goal is a hard
-# upper bound so we prefer a real timeout wherever possible.
-if command -v gtimeout >/dev/null 2>&1; then
-  TIMEOUT_BIN="gtimeout"
-elif command -v timeout >/dev/null 2>&1; then
-  TIMEOUT_BIN="timeout"
-else
-  TIMEOUT_BIN=""
-fi
-
-# run_bounded SECS CMD...  — Run CMD with a wall-clock timeout. Exits
-# 124 on timeout (coreutils convention). When no timeout binary is
-# available the command runs unbounded; callers must still tolerate a
-# non-zero status.
-run_bounded() {
-  _t="$1"; shift
-  if [ -n "$TIMEOUT_BIN" ]; then
-    "$TIMEOUT_BIN" "$_t" "$@"
-  else
-    "$@"
-  fi
-}
+# Note: run_bounded / TIMEOUT_BIN are provided by assets/scripts/runtime.sh.
 
 # Determine host for probing.
 host="${GC_DOLT_HOST:-127.0.0.1}"
@@ -147,11 +123,26 @@ if [ -d "$data_dir" ] && [ "$server_reachable" = true ]; then
     [ ! -d "$d/.dolt" ] && continue
     name="$(basename "$d")"
     case "$name" in information_schema|mysql|dolt_cluster) continue ;; esac
+    # Reject names with anything outside [A-Za-z0-9_] before interpolating
+    # into the SQL identifier. Dolt permits directory names that shell
+    # basename happily returns (e.g. backticks, semicolons) but which
+    # would break out of the identifier and execute attacker-chosen SQL
+    # as the patrol user. Not an external-attack surface today — data
+    # directories are server-controlled — but fragile enough under
+    # config drift that it's worth skipping rather than probing.
+    case "$name" in
+      *[!A-Za-z0-9_]*|'') continue ;;
+    esac
     # Count commits via SQL (bounded). 0 on timeout or error — keep
-    # going rather than hang the whole report.
+    # going rather than hang the whole report. Extract the first
+    # fully-numeric line rather than `sed -n '2p'`: future dolt builds
+    # may emit a status row for `USE` or a warning banner, in which
+    # case positional parsing silently collapses the count to 0 and the
+    # "empty repo" fallback masks the parse miss. Numeric-line grep
+    # gives a deterministic result or clearly-failed parse.
     commits_csv=$(run_bounded 5 dolt $conn_args sql --result-format csv \
       -q "USE \`$name\`; SELECT COUNT(*) FROM dolt_log;" 2>/dev/null || true)
-    commits=$(printf '%s\n' "$commits_csv" | sed -n '2p' | tr -d '[:space:]')
+    commits=$(printf '%s\n' "$commits_csv" | grep -E '^[0-9]+$' | head -1)
     # JSON consumers (deacon patrol) require a number; use 0 on failure.
     case "$commits" in
       ''|*[!0-9]*) commits=0 ;;
@@ -227,29 +218,43 @@ fi
 # each is actually running sql-server via ps. This avoids false
 # positives from processes that merely mention "dolt" in their args
 # (e.g., Claude sessions whose prompt text contains "dolt sql-server").
+#
+# GC_HEALTH_SKIP_ZOMBIE_SCAN is a test-only escape hatch. Zombie
+# enumeration spawns one `ps` per matching process, which on shared
+# dev machines with many accumulated dolt processes dominates the
+# runtime of the hang-mode test below. Setting it to "1" skips the
+# scan so tests exercise just the bounded-probe behavior they care
+# about without being hostage to ambient process state.
 zombie_count=0
 zombie_pids=""
-for p in $(pgrep -x dolt 2>/dev/null || true); do
-  [ "$p" = "$server_pid" ] && continue
-  cmd=$(ps -p "$p" -o args= 2>/dev/null || true)
-  case "$cmd" in
-    *sql-server*) ;;
-    *) continue ;;
-  esac
-  zombie_count=$((zombie_count + 1))
-  zombie_pids="$zombie_pids $p"
-done
+if [ "${GC_HEALTH_SKIP_ZOMBIE_SCAN:-0}" != "1" ]; then
+  for p in $(pgrep -x dolt 2>/dev/null || true); do
+    [ "$p" = "$server_pid" ] && continue
+    cmd=$(ps -p "$p" -o args= 2>/dev/null || true)
+    case "$cmd" in
+      *sql-server*) ;;
+      *) continue ;;
+    esac
+    zombie_count=$((zombie_count + 1))
+    zombie_pids="$zombie_pids $p"
+  done
+fi
 
 # Output.
 timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 if [ "$json_output" = true ]; then
-  # Build JSON output.
+  # Build JSON output. `server.reachable` reports whether the SQL
+  # handshake actually succeeded (port listening AND server answering
+  # SELECT 1). Consumers (deacon patrol) should key health off
+  # `server.reachable`, not `server.running`, because a process can
+  # hold the port while its goroutines are wedged.
   cat <<JSONEOF
 {
   "timestamp": "$timestamp",
   "server": {
     "running": $server_running,
+    "reachable": $server_reachable,
     "pid": $server_pid,
     "port": $GC_DOLT_PORT,
     "latency_ms": $server_latency
@@ -287,12 +292,14 @@ JSONEOF
   }
 }
 JSONEOF
-  # JSON consumers expect the document regardless, but mirror the
-  # human-path exit convention: 0 when the data plane is healthy.
-  if [ "$server_reachable" = true ]; then
-    exit 0
-  fi
-  exit 1
+  # JSON mode always exits 0 when the payload is well-formed. Health
+  # state is signalled in-band via `server.reachable` (and the rest of
+  # the document). Automation that parses the JSON — notably the deacon
+  # patrol formula — must not fail before stdout is parsed just because
+  # the server is down; that's exactly the condition the patrol is
+  # supposed to detect and react to. Callers that want exit-code
+  # signalling should use the human-readable form.
+  exit 0
 fi
 
 # Human-readable output.
@@ -335,11 +342,14 @@ if [ "$zombie_count" -gt 0 ]; then
   echo "Zombie processes: $zombie_count (PIDs:$zombie_pids)"
 fi
 
-# Exit status: 0 when the data plane is healthy (server running AND
-# answering SQL). Non-zero signals a patrol caller that something is
-# wrong — server not running, or port in use by a process that isn't
-# speaking MySQL. Stale backups, orphans, and zombies are informational
-# and do not fail the exit code.
+# Exit status (human mode only): 0 when the data plane is healthy
+# (server running AND answering SQL). Non-zero signals a CLI caller
+# that something is wrong — server not running, or port in use by a
+# process that isn't speaking MySQL. Stale backups, orphans, and
+# zombies are informational and do not fail the exit code.
+#
+# JSON mode is unconditionally exit 0 (see above) — programmatic
+# consumers read `server.reachable` from the payload instead.
 if [ "$server_reachable" = true ]; then
   exit 0
 fi

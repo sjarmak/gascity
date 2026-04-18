@@ -228,17 +228,22 @@ gc dolt health --json
 ```
 
 Parse the JSON output (HealthReport schema):
-- `server`: running, pid, port, latency_ms
+- `server`: running, reachable, pid, port, latency_ms
 - `databases[]`: name, commits, open_beads
 - `backups`: dolt_freshness, dolt_age_seconds, dolt_stale
 - `processes`: zombie_count, zombie_pids
 - `orphans[]`: name, size
 
+Note: `--json` always exits 0 when the payload is well-formed; health
+state is signalled in-band. Key decisions off `server.reachable`, not
+`server.running` — a process can hold the port while its goroutines
+are wedged (the latter is what first prompted this check to exist).
+
 **Step 2: Evaluate thresholds**
 
 | Signal | Threshold | Meaning |
 |--------|-----------|---------|
-| `server.running == false` | — | Dolt server is down (CRITICAL) |
+| `server.reachable == false` | — | Dolt server is down or unresponsive (CRITICAL) |
 | `server.latency_ms > 5000` | 5 s | Server may be overloaded |
 | `databases[].commits > 50000` | 50 k | Compactor dog may have stalled |
 | `backups.dolt_stale == true` | >30 min | Backup dog may have failed |
@@ -247,10 +252,12 @@ Parse the JSON output (HealthReport schema):
 
 **Step 3: React to alerts**
 
-**Server down (CRITICAL):**
+**Server down (CRITICAL):** `server.reachable == false` — either no
+process is listening on the port, or a process is listening but not
+answering SQL (wedged goroutines, migration lock, saturated pool).
 ```bash
 gc mail send mayor/ -s "ESCALATION: Dolt server unreachable [CRITICAL]" \\
-  -m "gc dolt health reports server not running"
+  -m "gc dolt health reports server.reachable=false"
 ```
 
 **Commit bloat (commits > 50k in any DB):**

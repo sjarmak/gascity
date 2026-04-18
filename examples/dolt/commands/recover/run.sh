@@ -24,13 +24,19 @@ if [ -n "$GC_DOLT_HOST" ]; then
 fi
 
 # Check read-only state by attempting a write probe.
+#
+# Always export DOLT_CLI_PASSWORD (even empty) so the client does not
+# prompt for a password on stdin; non-TTY agent sessions would otherwise
+# fail with "Failed to parse credentials: operation not supported by
+# device" and the probe would falsely report writable. The write probe
+# is wrapped in run_bounded so an unresponsive server — the very
+# failure mode `gc dolt recover` exists to handle — cannot hang the
+# script indefinitely. Mirrors the patterns established in health/run.sh.
 check_read_only() {
   host="${GC_DOLT_HOST:-127.0.0.1}"
   args="--host $host --port $GC_DOLT_PORT --user $GC_DOLT_USER --no-tls"
-  if [ -n "$GC_DOLT_PASSWORD" ]; then
-    export DOLT_CLI_PASSWORD="$GC_DOLT_PASSWORD"
-  fi
-  result=$(dolt $args sql -q "CREATE TABLE __gc_ro_check (id INT); DROP TABLE __gc_ro_check;" 2>&1) || true
+  export DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}"
+  result=$(run_bounded 10 dolt $args sql -q "CREATE TABLE __gc_ro_check (id INT); DROP TABLE __gc_ro_check;" 2>&1) || true
   case "$result" in
     *read*only*|*read-only*|*readonly*) return 0 ;; # read-only detected
   esac
