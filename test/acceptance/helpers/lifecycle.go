@@ -132,12 +132,38 @@ func (c *City) WaitForReport(name string, timeout time.Duration) map[string]stri
 	// One more try with diagnostics.
 	data, err := os.ReadFile(reportFile)
 	if err != nil {
+		c.dumpDiagnostics(name)
 		c.t.Fatalf("report for %q not found after %s: %v", name, timeout, err)
 	}
 	if !strings.Contains(string(data), "REPORT_DONE=true") {
+		c.dumpDiagnostics(name)
 		c.t.Fatalf("report for %q incomplete after %s:\n%s", name, timeout, string(data))
 	}
 	return parseEnvReport(string(data))
+}
+
+// dumpDiagnostics prints useful debugging info when a report wait fails.
+func (c *City) dumpDiagnostics(name string) {
+	c.t.Helper()
+	c.t.Logf("=== DIAGNOSTICS for %q in %s ===", name, c.Dir)
+	// Check .gc dir contents.
+	if out, err := exec.Command("bash", "-c", "find "+c.Dir+"/.gc -maxdepth 4 -type f 2>/dev/null | head -40").CombinedOutput(); err == nil {
+		c.t.Logf(".gc files:\n%s", out)
+	}
+	// Try gc status.
+	if out, err := c.GC("status", "--city", c.Dir); err == nil {
+		c.t.Logf("gc status:\n%s", out)
+	}
+	// Dump recent supervisor log.
+	if gcHome := c.Env.vars["GC_HOME"]; gcHome != "" {
+		if out, err := exec.Command("tail", "-n", "200", filepath.Join(gcHome, "supervisor.log")).CombinedOutput(); err == nil {
+			c.t.Logf("supervisor.log tail:\n%s", out)
+		}
+	}
+	// Dump any logs under .gc
+	if out, err := exec.Command("bash", "-c", "for f in "+c.Dir+"/.gc/*.log "+c.Dir+"/.gc/runtime/*.log; do echo \"--- $f ---\"; tail -n 100 \"$f\" 2>/dev/null; done").CombinedOutput(); err == nil {
+		c.t.Logf("city logs:\n%s", out)
+	}
 }
 
 func parseEnvReport(s string) map[string]string {
@@ -186,6 +212,15 @@ func (c *City) WriteE2EConfig(agents []E2EAgent) {
 			if a.Pool.ScaleCheck != "" {
 				fmt.Fprintf(&b, "check = %q\n", a.Pool.ScaleCheck)
 			}
+		}
+		// Reserve a canonical named session so the lifecycle reconciler
+		// materializes and starts the agent. Without this, post-PR-666 the
+		// template is just config and never runs until work arrives. Drain-ack
+		// still transitions the session to the sticky "drained" state, so
+		// mode=always does not prevent the drain-ack tests from observing a
+		// stopped session.
+		if !a.Suspended && a.Pool == nil {
+			fmt.Fprintf(&b, "\n[[named_session]]\ntemplate = %q\nmode = \"always\"\n", a.Name)
 		}
 	}
 
