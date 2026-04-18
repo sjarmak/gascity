@@ -705,8 +705,18 @@ func discoverSessionBeadsWithRoots(
 			}
 		}
 		// Resolve TemplateParams for this bead's session.
-		fpExtra := buildFingerprintExtra(cfgAgent)
-		tp, err := resolveTemplateForSessionBead(bp, cfgAgent, cfgAgent.QualifiedName(), fpExtra, b)
+		//
+		// Canonicalize agent identity before calling resolveTemplate so a
+		// pool-managed bead with pool_slot stamped fingerprints as the
+		// pool-instance form here — the same shape realizePoolDesiredSessions
+		// uses. Without this, GC_ALIAS (part of CoreFingerprint) would read
+		// as the base "rig/dog" in rediscovery and "rig/dog-1" in realize on
+		// the next tick, and the reconciler would declare config drift and
+		// drain the live session. Named beads intentionally pass through
+		// with the base shape (see canonicalSessionIdentity).
+		resolveAgent, resolveQN := canonicalSessionIdentity(cfgAgent, b)
+		fpExtra := buildFingerprintExtra(resolveAgent)
+		tp, err := resolveTemplateForSessionBead(bp, resolveAgent, resolveQN, fpExtra, b)
 		if err != nil {
 			fmt.Fprintf(stderr, "buildDesiredState: bead %s template %q: %v (skipping)\n", b.ID, template, err) //nolint:errcheck
 			continue
@@ -800,14 +810,42 @@ func ensureDependencyOnlyTemplate(
 		return
 	}
 
+	// Bead selection keys off the configured base template, not the pool-
+	// instance form, because normalizedSessionTemplate reads the bead's
+	// "template" metadata which is always the base.
 	qualifiedName := cfgAgent.QualifiedName()
 	sessionBead, err := selectOrCreateDependencyPoolSessionBead(bp, cfgAgent, qualifiedName)
 	if err != nil {
 		fmt.Fprintf(stderr, "buildDesiredState: dependency floor %q: %v (skipping)\n", qualifiedName, err) //nolint:errcheck
 		return
 	}
-	fpExtra := buildFingerprintExtra(cfgAgent)
-	tp, err := resolveTemplateForSessionBead(bp, cfgAgent, qualifiedName, fpExtra, sessionBead)
+	// Env/fingerprint resolution, on the other hand, must use the pool-
+	// instance identity so this store-backed path agrees with both the
+	// no-store dependency-floor path above and realizePoolDesiredSessions.
+	// Otherwise GC_ALIAS would be the base "rig/dog" here and "rig/dog-1"
+	// on the realize path, oscillating across ticks and triggering the
+	// reconciler's config-drift drain on the live dependency-floor session.
+	resolveAgent, resolveQN := canonicalSessionIdentity(cfgAgent, sessionBead)
+	// Dep-floor slot-1 fallback. The guard triggers when the helper returned
+	// the BASE form — meaning no pool_slot was stamped yet. Keying off
+	// resolveQN (a stable value) rather than pointer identity keeps the
+	// fallback correct if the helper ever normalizes fields into a copy of
+	// the base agent. The !isNamedSessionBead guard is defensive:
+	// selectOrCreateDependencyPoolSessionBead already filters named beads
+	// (dependency_only beads are never named), but the guard keeps intent
+	// explicit so a future change that relaxes that filter can't silently
+	// overwrite a named identity with "rig/<agent>-1".
+	if cfgAgent.SupportsInstanceExpansion() && resolveQN == cfgAgent.QualifiedName() && !isNamedSessionBead(sessionBead) {
+		// No pool_slot stamp yet on this freshly-created dep-floor bead.
+		// Default to slot 1, mirroring the no-store path above.
+		instanceName := poolInstanceName(cfgAgent.Name, 1, cfgAgent)
+		qualifiedInstance := cfgAgent.QualifiedInstanceName(instanceName)
+		instanceAgent := deepCopyAgent(cfgAgent, instanceName, cfgAgent.Dir)
+		resolveAgent = &instanceAgent
+		resolveQN = qualifiedInstance
+	}
+	fpExtra := buildFingerprintExtra(resolveAgent)
+	tp, err := resolveTemplateForSessionBead(bp, resolveAgent, resolveQN, fpExtra, sessionBead)
 	if err != nil {
 		fmt.Fprintf(stderr, "buildDesiredState: dependency floor %q: %v (skipping)\n", qualifiedName, err) //nolint:errcheck
 		return
@@ -815,7 +853,7 @@ func ensureDependencyOnlyTemplate(
 	tp.Alias = ""
 	tp.InstanceName = sessionBead.Metadata["session_name"]
 	tp.DependencyOnly = true
-	installAgentSideEffects(bp, cfgAgent, tp, stderr)
+	installAgentSideEffects(bp, resolveAgent, tp, stderr)
 	desired[tp.SessionName] = tp
 }
 
@@ -905,6 +943,53 @@ func resolveTemplateForSessionBead(
 	local := *bp
 	local.beadNames = map[string]string{qualifiedName: sessionBead.Metadata["session_name"]}
 	return resolveTemplate(&local, cfgAgent, qualifiedName, fpExtra)
+}
+
+// canonicalSessionIdentity returns the agent and qualified name to use when
+// resolving a pool-managed session bead through resolveTemplate /
+// resolveTemplateForSessionBead. Scoped to the pool case on purpose:
+// realizePoolDesiredSessions uses a deep-copied instance agent +
+// qualifiedInstance, and this helper is what makes the other pool-backed
+// paths (rediscovery, store-backed dependency-floor) agree. GC_ALIAS and
+// FingerprintExtra are part of CoreFingerprint, so divergent shapes across
+// ticks trip the reconciler's config-drift drain.
+//
+// Named beads are deliberately NOT canonicalized here. The named-session
+// TemplateParams contract (ConfiguredNamedIdentity/Mode, GC_SESSION_ORIGIN,
+// canonical session_name, ...) is authored by the main named-session loop
+// and reconstructNamedSessionTemplateParams; rewriting only the (agent,
+// qualifiedName) pair in rediscovery while leaving the rest of the shape
+// as plain ephemeral would produce a partially-named TemplateParams that
+// downstream consumers don't expect. The Env-side drift that named beads
+// can still exhibit across rediscovery vs. the named-session loop is a
+// separate fix — the accompanying PR explicitly scopes it out.
+//
+// Rules:
+//   - Named bead → (cfgAgent, cfgAgent.QualifiedName()). Identical to the
+//     pre-change rediscovery shape so named-bead handling is unchanged.
+//   - Non-expanding agent → (cfgAgent, cfgAgent.QualifiedName()).
+//   - Instance-expanding agent with a stamped pool_slot → (deepCopyAgent
+//     at that slot, qualifiedInstance). Matches realizePoolDesiredSessions.
+//   - Instance-expanding agent without a slot stamp → (cfgAgent,
+//     cfgAgent.QualifiedName()); realize will claim and stamp later.
+func canonicalSessionIdentity(cfgAgent *config.Agent, bead beads.Bead) (*config.Agent, string) {
+	if cfgAgent == nil {
+		return nil, ""
+	}
+	if isNamedSessionBead(bead) {
+		return cfgAgent, cfgAgent.QualifiedName()
+	}
+	if !cfgAgent.SupportsInstanceExpansion() {
+		return cfgAgent, cfgAgent.QualifiedName()
+	}
+	slot := existingPoolSlot(cfgAgent, bead)
+	if slot <= 0 {
+		return cfgAgent, cfgAgent.QualifiedName()
+	}
+	instanceName := poolInstanceName(cfgAgent.Name, slot, cfgAgent)
+	qualifiedInstance := cfgAgent.QualifiedInstanceName(instanceName)
+	instanceAgent := deepCopyAgent(cfgAgent, instanceName, cfgAgent.Dir)
+	return &instanceAgent, qualifiedInstance
 }
 
 func claimPoolSlot(cfgAgent *config.Agent, sessionBead beads.Bead, used map[int]bool) int {
