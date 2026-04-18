@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10  # cold extraction can take ~5 min; cache hit is <30s
     env:
-      LIVEDOCS_VERSION: "v0.1.1"  # pin to version with relative-path fix
+      LIVEDOCS_VERSION: "v0.2.0"  # pin to version with line-level prbot precision (--diff-format unified)
 
     steps:
       - name: Checkout
