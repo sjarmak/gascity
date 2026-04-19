@@ -32,12 +32,16 @@ can be pinned to specific git refs.`,
 func newPackFetchCmd(stdout, stderr io.Writer) *cobra.Command {
 	return &cobra.Command{
 		Use:   "fetch",
-		Short: "Clone missing and update existing remote packs",
-		Long: `Clone missing and update existing remote pack caches.
+		Short: "Clone missing and update existing remote packs and imports",
+		Long: `Clone missing and update existing remote pack and import caches.
 
-Fetches all configured pack sources from their git repositories,
-updates the local cache, and writes a lockfile with commit hashes
-for reproducibility. Automatically called during "gc start".`,
+Populates the include cache for each remote [imports] entry declared in
+pack.toml, then fetches any legacy [packs] entries from city.toml. This
+is the bootstrap path for a fresh PackV2 city whose config references
+remote imports — without it, loaders cannot read the composed config.
+
+The [packs] fetch is automatically invoked during "gc start"; remote
+[imports] must currently be bootstrapped explicitly via this command.`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			if doPackFetch(stdout, stderr) != 0 {
@@ -56,6 +60,28 @@ func doPackFetch(stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// Bootstrap declared [imports] BEFORE loading the config: a fresh
+	// PackV2 city with remote imports cannot successfully loadCityConfig
+	// until the include-cache is populated (issue #805).
+	manifest, err := loadCityPackManifestFS(fsys.OSFS{}, cityPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc pack fetch: %v\n", err) //nolint:errcheck
+		return 1
+	}
+	remoteImports := 0
+	for _, imp := range manifest.Imports {
+		if isRemoteImportSource(imp.Source) {
+			remoteImports++
+		}
+	}
+	if remoteImports > 0 {
+		fmt.Fprintf(stdout, "Fetching %d import(s)...\n", remoteImports) //nolint:errcheck
+		if err := config.FetchImports(manifest.Imports, cityPath); err != nil {
+			fmt.Fprintf(stderr, "gc pack fetch: %v\n", err) //nolint:errcheck
+			return 1
+		}
+	}
+
 	cfg, err := loadCityConfig(cityPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc pack fetch: %v\n", err) //nolint:errcheck
@@ -63,7 +89,9 @@ func doPackFetch(stdout, stderr io.Writer) int {
 	}
 
 	if len(cfg.Packs) == 0 {
-		fmt.Fprintln(stdout, "No remote packs configured.") //nolint:errcheck
+		if remoteImports == 0 {
+			fmt.Fprintln(stdout, "No remote packs or remote imports configured.") //nolint:errcheck
+		}
 		return 0
 	}
 

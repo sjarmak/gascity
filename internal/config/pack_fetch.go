@@ -29,6 +29,76 @@ type LockedPack struct {
 	Hash   string `toml:"hash"`
 }
 
+// FetchImports clones or updates each declared remote import into the
+// include-cache under <cityRoot>/.gc/cache/includes/<slug-hash>/. Local
+// path imports are skipped. The cache key matches what the loader's
+// fetchRemoteInclude reads so a subsequent config.Load resolves imports
+// from the same directory.
+//
+// FetchImports is the bootstrap path for remote [imports] — loaders are
+// pure readers (see design issue #583), so a fresh PackV2 city with
+// declared remote imports needs a CLI step to populate the cache before
+// any command that performs config.Load can succeed.
+func FetchImports(imports map[string]Import, cityRoot string) error {
+	cacheRoot := filepath.Join(cityRoot, includeCacheDir)
+	if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
+		return fmt.Errorf("creating include cache root: %w", err)
+	}
+
+	names := make([]string, 0, len(imports))
+	for name := range imports {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		imp := imports[name]
+		if !isRemoteRef(imp.Source) {
+			continue
+		}
+		cacheKey, cloneURL, ref := importCloneTarget(imp.Source)
+		cacheDir := filepath.Join(cacheRoot, includeCacheName(cacheKey))
+
+		if _, err := os.Stat(filepath.Join(cacheDir, ".git")); err == nil {
+			if err := updatePack(cacheDir, ref); err != nil {
+				return fmt.Errorf("import %q: %w", name, err)
+			}
+			continue
+		}
+		if err := clonePack(cloneURL, cacheDir, ref); err != nil {
+			return fmt.Errorf("import %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// importCloneTarget parses an import source into three related strings:
+//   - cacheKey: the exact string passed to includeCacheName on the loader
+//     side (fetchRemoteInclude), used to compute the cache directory
+//   - cloneURL: a git-cloneable URL (scheme-prefixed), used for `git clone`
+//   - ref: the git ref (branch/tag) if specified
+//
+// The loader does not normalize bare `github.com/...` sources before
+// hashing (see pack_include.go fetchRemoteInclude), so the bootstrap
+// must use the same raw source for the cache key — otherwise the clone
+// lands at a different hash than the loader will read.
+func importCloneTarget(source string) (cacheKey, cloneURL, ref string) {
+	switch {
+	case isGitHubTreeURL(source):
+		clone, _, r := parseGitHubTreeURL(source)
+		return clone, clone, r
+	case isRemoteInclude(source):
+		parsed, _, r := parseRemoteInclude(source)
+		clone := parsed
+		if strings.HasPrefix(clone, "github.com/") {
+			clone = "https://" + clone
+		}
+		return parsed, clone, r
+	default:
+		return source, source, ""
+	}
+}
+
 // FetchPacks ensures all remote packs are cached locally.
 // Clones missing repos and updates existing ones to match the declared ref.
 func FetchPacks(packs map[string]PackSource, cityRoot string) error {

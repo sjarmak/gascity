@@ -210,7 +210,7 @@ func resolveLockedRemoteImport(source, cityRoot string) (string, bool, error) {
 	cacheDir := filepath.Join(home, ".gc", "cache", "repos", RepoCacheKey(source, entry.Commit))
 	if _, err := os.Stat(filepath.Join(cacheDir, ".git")); err != nil {
 		if os.IsNotExist(err) {
-			return "", false, fmt.Errorf("remote import %s is locked but not cached at %s", source, cacheDir)
+			return "", false, fmt.Errorf("remote import %s is locked but not cached at %s (run `gc import install` to populate the cache)", source, cacheDir)
 		}
 		return "", false, fmt.Errorf("checking cached import %s: %w", source, err)
 	}
@@ -254,9 +254,9 @@ func fetchRemoteInclude(source, ref, cityRoot string) (string, error) {
 	if _, err := os.Stat(filepath.Join(cacheDir, ".git")); err != nil {
 		if os.IsNotExist(err) {
 			if ref != "" {
-				return "", fmt.Errorf("remote include %s#%s is not cached at %s", source, ref, cacheDir)
+				return "", fmt.Errorf("remote include %s#%s is not cached at %s (run `gc pack fetch` to populate the cache)", source, ref, cacheDir)
 			}
-			return "", fmt.Errorf("remote include %s is not cached at %s", source, cacheDir)
+			return "", fmt.Errorf("remote include %s is not cached at %s (run `gc pack fetch` to populate the cache)", source, cacheDir)
 		}
 		return "", fmt.Errorf("checking cached include %s: %w", source, err)
 	}

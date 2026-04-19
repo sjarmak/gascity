@@ -606,6 +606,219 @@ func TestFetchRemoteInclude_MissingCache(t *testing.T) {
 	if !strings.Contains(err.Error(), "not cached") {
 		t.Fatalf("error = %v, want not cached", err)
 	}
+	// The error must point users at the bootstrap command; otherwise a
+	// fresh PackV2 city with declared [imports] has no discoverable way
+	// to populate the cache (issue #805).
+	if !strings.Contains(err.Error(), "gc pack fetch") {
+		t.Fatalf("error = %v, want mention of `gc pack fetch` bootstrap command", err)
+	}
+}
+
+func TestImportCloneTarget_CacheKeyMatchesLoader(t *testing.T) {
+	// fetchRemoteInclude computes its cache directory from the string
+	// that resolvePackRef passes to it. The bootstrap must use the same
+	// key, otherwise `gc pack fetch` writes the cache at a different
+	// hash than `gc config show` will read from (issue #805).
+	tests := []struct {
+		name             string
+		source           string
+		wantLoaderSource string // value resolvePackRef passes to fetchRemoteInclude
+		wantClone        string
+		wantRef          string
+	}{
+		{
+			name:             "github tree URL",
+			source:           "https://github.com/org/repo/tree/main/sub",
+			wantLoaderSource: "https://github.com/org/repo.git",
+			wantClone:        "https://github.com/org/repo.git",
+			wantRef:          "main",
+		},
+		{
+			name:             "https remote include with ref",
+			source:           "https://example.com/repo.git#v1.0",
+			wantLoaderSource: "https://example.com/repo.git",
+			wantClone:        "https://example.com/repo.git",
+			wantRef:          "v1.0",
+		},
+		{
+			name:             "ssh remote include",
+			source:           "git@github.com:org/repo.git",
+			wantLoaderSource: "git@github.com:org/repo.git",
+			wantClone:        "git@github.com:org/repo.git",
+			wantRef:          "",
+		},
+		{
+			name:             "bare github shorthand",
+			source:           "github.com/org/repo",
+			wantLoaderSource: "github.com/org/repo",
+			wantClone:        "https://github.com/org/repo",
+			wantRef:          "",
+		},
+		{
+			name:             "file URL with subpath and ref",
+			source:           "file:///tmp/repo.git//pack#dev",
+			wantLoaderSource: "file:///tmp/repo.git",
+			wantClone:        "file:///tmp/repo.git",
+			wantRef:          "dev",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cacheKey, clone, ref := importCloneTarget(tt.source)
+			if cacheKey != tt.wantLoaderSource {
+				t.Errorf("cacheKey = %q, want %q (loader source)", cacheKey, tt.wantLoaderSource)
+			}
+			if clone != tt.wantClone {
+				t.Errorf("cloneURL = %q, want %q", clone, tt.wantClone)
+			}
+			if ref != tt.wantRef {
+				t.Errorf("ref = %q, want %q", ref, tt.wantRef)
+			}
+			if includeCacheName(cacheKey) != includeCacheName(tt.wantLoaderSource) {
+				t.Errorf("include cache name diverges: got %q, want %q",
+					includeCacheName(cacheKey), includeCacheName(tt.wantLoaderSource))
+			}
+		})
+	}
+}
+
+func TestFetchImports_ClonesRemoteImport(t *testing.T) {
+	bare := initBareRepo(t, "imp-clones")
+	cityRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityRoot, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	imports := map[string]Import{
+		"cass": {Source: "file://" + bare},
+	}
+	if err := FetchImports(imports, cityRoot); err != nil {
+		t.Fatalf("FetchImports: %v", err)
+	}
+
+	cacheName := includeCacheName("file://" + bare)
+	cacheDir := filepath.Join(cityRoot, ".gc", "cache", "includes", cacheName)
+	if _, err := os.Stat(filepath.Join(cacheDir, ".git")); err != nil {
+		t.Fatalf("expected cache clone at %s: %v", cacheDir, err)
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, "pack.toml")); err != nil {
+		t.Errorf("pack.toml missing from cache: %v", err)
+	}
+}
+
+func TestFetchImports_SkipsLocalPathImport(t *testing.T) {
+	cityRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityRoot, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	imports := map[string]Import{
+		"local": {Source: "./assets/imports/gastown"},
+	}
+	if err := FetchImports(imports, cityRoot); err != nil {
+		t.Fatalf("FetchImports on local path: %v", err)
+	}
+
+	cacheRoot := filepath.Join(cityRoot, ".gc", "cache", "includes")
+	entries, err := os.ReadDir(cacheRoot)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("reading cache dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("cache should stay empty for local imports, got %d entries", len(entries))
+	}
+}
+
+func TestFetchImports_Idempotent(t *testing.T) {
+	bare := initBareRepo(t, "imp-idempotent")
+	cityRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityRoot, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	imports := map[string]Import{
+		"cass": {Source: "file://" + bare},
+	}
+	if err := FetchImports(imports, cityRoot); err != nil {
+		t.Fatalf("first FetchImports: %v", err)
+	}
+	if err := FetchImports(imports, cityRoot); err != nil {
+		t.Fatalf("second FetchImports: %v", err)
+	}
+}
+
+func TestFetchImports_LoaderReadsBootstrappedCache(t *testing.T) {
+	// The loader's fetchRemoteInclude must find the cache at the same
+	// path FetchImports writes to. If these two diverge, `gc config
+	// show` will cache-miss even after a successful `gc pack fetch`
+	// (issue #805).
+	bare := initBareRepo(t, "imp-loader")
+	cityRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityRoot, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	imports := map[string]Import{
+		"cass": {Source: "file://" + bare},
+	}
+	if err := FetchImports(imports, cityRoot); err != nil {
+		t.Fatalf("FetchImports: %v", err)
+	}
+
+	cacheDir, err := fetchRemoteInclude("file://"+bare, "", cityRoot)
+	if err != nil {
+		t.Fatalf("loader cannot find bootstrap cache: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, "pack.toml")); err != nil {
+		t.Errorf("pack.toml missing from loader-visible cache: %v", err)
+	}
+}
+
+func TestFetchImports_UpdatesExistingCache(t *testing.T) {
+	// Second run must pick up upstream commits, not stall on stale cache.
+	dir := t.TempDir()
+	workDir := filepath.Join(dir, "work")
+	bareDir := filepath.Join(dir, "imp-update.git")
+	mustGit(t, "", "init", "--initial-branch=main", workDir)
+	if err := os.WriteFile(filepath.Join(workDir, "pack.toml"), []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, workDir, "add", "-A")
+	mustGit(t, workDir, "commit", "-m", "v1")
+	mustGit(t, workDir, "clone", "--bare", workDir, bareDir)
+
+	cityRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityRoot, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	imports := map[string]Import{"cass": {Source: "file://" + bareDir}}
+	if err := FetchImports(imports, cityRoot); err != nil {
+		t.Fatalf("initial FetchImports: %v", err)
+	}
+
+	pushDir := filepath.Join(dir, "push")
+	mustGit(t, "", "clone", bareDir, pushDir)
+	if err := os.WriteFile(filepath.Join(pushDir, "pack.toml"), []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, pushDir, "add", "-A")
+	mustGit(t, pushDir, "commit", "-m", "v2")
+	mustGit(t, pushDir, "push")
+
+	if err := FetchImports(imports, cityRoot); err != nil {
+		t.Fatalf("second FetchImports: %v", err)
+	}
+
+	cacheName := includeCacheName("file://" + bareDir)
+	data, err := os.ReadFile(filepath.Join(cityRoot, ".gc", "cache", "includes", cacheName, "pack.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "v2" {
+		t.Errorf("cache not updated: got %q, want v2", string(data))
+	}
 }
 
 func TestLoadPack_RemoteInclude(t *testing.T) {

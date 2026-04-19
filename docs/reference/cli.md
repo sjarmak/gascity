@@ -1474,16 +1474,20 @@ gc pack
 
 | Subcommand | Description |
 |------------|-------------|
-| [gc pack fetch](#gc-pack-fetch) | Clone missing and update existing remote packs |
+| [gc pack fetch](#gc-pack-fetch) | Clone missing and update existing remote packs and imports |
 | [gc pack list](#gc-pack-list) | Show remote pack sources and cache status |
 
 ## gc pack fetch
 
-Clone missing and update existing remote pack caches.
+Clone missing and update existing remote pack and import caches.
 
-Fetches all configured pack sources from their git repositories,
-updates the local cache, and writes a lockfile with commit hashes
-for reproducibility. Automatically called during "gc start".
+Populates the include cache for each remote [imports] entry declared in
+pack.toml, then fetches any legacy [packs] entries from city.toml. This
+is the bootstrap path for a fresh PackV2 city whose config references
+remote imports — without it, loaders cannot read the composed config.
+
+The [packs] fetch is automatically invoked during "gc start"; remote
+[imports] must currently be bootstrapped explicitly via this command.
 
 ```
 gc pack fetch
