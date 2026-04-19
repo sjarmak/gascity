@@ -59,14 +59,17 @@ func FetchImports(imports map[string]Import, cityRoot string) error {
 		cacheKey, cloneURL, ref := importCloneTarget(imp.Source)
 		cacheDir := filepath.Join(cacheRoot, includeCacheName(cacheKey))
 
-		if _, err := os.Stat(filepath.Join(cacheDir, ".git")); err == nil {
+		switch _, err := os.Stat(filepath.Join(cacheDir, ".git")); {
+		case err == nil:
 			if err := updatePack(cacheDir, ref); err != nil {
 				return fmt.Errorf("import %q: %w", name, err)
 			}
-			continue
-		}
-		if err := clonePack(cloneURL, cacheDir, ref); err != nil {
-			return fmt.Errorf("import %q: %w", name, err)
+		case os.IsNotExist(err):
+			if err := clonePack(cloneURL, cacheDir, ref); err != nil {
+				return fmt.Errorf("import %q: %w", name, err)
+			}
+		default:
+			return fmt.Errorf("import %q: checking cache at %s: %w", name, cacheDir, err)
 		}
 	}
 	return nil
