@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1140,6 +1141,64 @@ func TestDoRigAdd_DefaultRigIncludes(t *testing.T) {
 	}
 	if len(cfg.Rigs[0].Includes) != 1 || cfg.Rigs[0].Includes[0] != "packs/gastown" {
 		t.Errorf("rig includes = %v, want [packs/gastown]", cfg.Rigs[0].Includes)
+	}
+}
+
+func TestDoRigAdd_RootPackDefaultRigIncludes(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cityToml := "[workspace]\nname = \"test-city\"\ndefault_rig_includes = [\"packs/city-pack\"]\n\n[[agent]]\nname = \"mayor\"\n"
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	packToml := `[pack]
+name = "test-city"
+schema = 2
+
+[defaults.rig.imports.z-pack]
+source = "packs/z-pack"
+
+[defaults.rig.imports.a-pack]
+source = "packs/a-pack"
+`
+	if err := os.WriteFile(filepath.Join(cityPath, "pack.toml"), []byte(packToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rigPath := filepath.Join(t.TempDir(), "my-project")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_BEADS", "file")
+
+	var stdout, stderr bytes.Buffer
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, "", "", "", false, false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doRigAdd returned %d, stderr: %s", code, stderr.String())
+	}
+
+	output := stdout.String()
+	if !strings.Contains(output, "Include: packs/z-pack, packs/a-pack, packs/city-pack (default)") {
+		t.Errorf("output missing root pack default includes in declaration order: %s", output)
+	}
+
+	cfg, err := config.Load(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Rigs) != 1 {
+		t.Fatalf("expected 1 rig, got %d", len(cfg.Rigs))
+	}
+	want := []string{"packs/z-pack", "packs/a-pack", "packs/city-pack"}
+	if !reflect.DeepEqual(cfg.Rigs[0].Includes, want) {
+		t.Errorf("rig includes = %v, want %v", cfg.Rigs[0].Includes, want)
+	}
+	if !reflect.DeepEqual(cfg.Workspace.DefaultRigIncludes, []string{"packs/city-pack"}) {
+		t.Errorf("derived root pack defaults should not be written back to city.toml, got %v", cfg.Workspace.DefaultRigIncludes)
 	}
 }
 

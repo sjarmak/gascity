@@ -222,6 +222,12 @@ func doRigAdd(fs fsys.FS, cityPath, rigPath, include, nameOverride, prefixOverri
 		cityDoltConfigs.Store(cityPath, cfg.Dolt)
 		defer cityDoltConfigs.Delete(cityPath)
 	}
+	rootDefaultRigIncludes, err := config.LoadRootPackDefaultRigIncludes(fs, cityPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc rig add: loading root pack defaults: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	defaultRigIncludes := append(append([]string{}, rootDefaultRigIncludes...), cfg.Workspace.DefaultRigIncludes...)
 
 	var reAdd bool
 	existingRigIdx := -1
@@ -292,8 +298,8 @@ func doRigAdd(fs fsys.FS, cityPath, rigPath, include, nameOverride, prefixOverri
 		switch {
 		case include != "":
 			w(fmt.Sprintf("  Include: %s", include))
-		case len(cfg.Workspace.DefaultRigIncludes) > 0:
-			w(fmt.Sprintf("  Include: %s (default)", strings.Join(cfg.Workspace.DefaultRigIncludes, ", ")))
+		case len(defaultRigIncludes) > 0:
+			w(fmt.Sprintf("  Include: %s (default)", strings.Join(defaultRigIncludes, ", ")))
 		}
 	}
 
@@ -345,8 +351,8 @@ func doRigAdd(fs fsys.FS, cityPath, rigPath, include, nameOverride, prefixOverri
 		switch {
 		case include != "":
 			rig.Includes = []string{include}
-		case len(cfg.Workspace.DefaultRigIncludes) > 0:
-			rig.Includes = append([]string{}, cfg.Workspace.DefaultRigIncludes...)
+		case len(defaultRigIncludes) > 0:
+			rig.Includes = append([]string{}, defaultRigIncludes...)
 		}
 		next := *cfg
 		next.Rigs = append(append([]config.Rig{}, cfg.Rigs...), rig)

@@ -80,8 +80,12 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	if packData, pErr := fs.ReadFile(packPath); pErr == nil {
 		packExists = true
 		var pc packConfig
-		if _, decErr := toml.Decode(string(packData), &pc); decErr != nil {
+		md, decErr := toml.Decode(string(packData), &pc)
+		if decErr != nil {
 			return nil, nil, fmt.Errorf("parsing city pack.toml: %w", decErr)
+		}
+		if warnings := CheckUndecodedKeys(md, packPath); len(warnings) > 0 {
+			return nil, nil, fmt.Errorf("parsing city pack.toml: %s", strings.Join(warnings, "; "))
 		}
 		if err := validatePackMeta(&pc.Pack); err != nil {
 			return nil, nil, fmt.Errorf("city pack.toml: %w", err)
@@ -115,6 +119,13 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 					root.Imports[name] = imp
 				}
 			}
+		}
+		defaultRigIncludes, err := defaultRigIncludesFromPackDefaults(pc.Defaults, md)
+		if err != nil {
+			return nil, nil, fmt.Errorf("city pack.toml: %w", err)
+		}
+		if len(defaultRigIncludes) > 0 {
+			root.Workspace.DefaultRigIncludes = append(defaultRigIncludes, root.Workspace.DefaultRigIncludes...)
 		}
 		// Merge pack.toml providers (pack is base, city wins).
 		if len(pc.Providers) > 0 {
@@ -1000,6 +1011,75 @@ func parseWithMeta(data []byte, source string) (*City, toml.MetaData, []string, 
 	normalizeAgentDefaultsAlias(&cfg, md)
 	warnings := CheckUndecodedKeys(md, source)
 	return &cfg, md, warnings, nil
+}
+
+// LoadRootPackDefaultRigIncludes loads default rig includes from the root
+// city pack without expanding the full config. Edit paths use this to honor
+// pack v2 defaults while still writing only city.toml.
+func LoadRootPackDefaultRigIncludes(fs fsys.FS, cityRoot string) ([]string, error) {
+	packPath := filepath.Join(cityRoot, packFile)
+	packData, err := fs.ReadFile(packPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("loading city pack.toml: %w", err)
+	}
+	var pc packConfig
+	md, err := toml.Decode(string(packData), &pc)
+	if err != nil {
+		return nil, fmt.Errorf("parsing city pack.toml: %w", err)
+	}
+	if warnings := CheckUndecodedKeys(md, packPath); len(warnings) > 0 {
+		return nil, fmt.Errorf("parsing city pack.toml: %s", strings.Join(warnings, "; "))
+	}
+	return defaultRigIncludesFromPackDefaults(pc.Defaults, md)
+}
+
+func defaultRigIncludesFromPackDefaults(defaults packDefaults, md toml.MetaData) ([]string, error) {
+	if len(defaults.Rig.Imports) == 0 {
+		return nil, nil
+	}
+	names := orderedDefaultRigImportNames(defaults.Rig.Imports, md)
+
+	includes := make([]string, 0, len(names))
+	for _, name := range names {
+		imp := defaults.Rig.Imports[name]
+		if strings.TrimSpace(imp.Source) == "" {
+			return nil, fmt.Errorf("defaults.rig.imports.%s.source is required", name)
+		}
+		includes = append(includes, imp.Source)
+	}
+	return includes, nil
+}
+
+func orderedDefaultRigImportNames(imports map[string]Import, md toml.MetaData) []string {
+	if len(imports) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(imports))
+	names := make([]string, 0, len(imports))
+	for _, key := range md.Keys() {
+		if len(key) < 4 || key[0] != "defaults" || key[1] != "rig" || key[2] != "imports" {
+			continue
+		}
+		name := key[3]
+		if _, ok := imports[name]; ok && !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	if len(names) == len(imports) {
+		return names
+	}
+	remaining := make([]string, 0, len(imports)-len(names))
+	for name := range imports {
+		if !seen[name] {
+			remaining = append(remaining, name)
+		}
+	}
+	sort.Strings(remaining)
+	return append(names, remaining...)
 }
 
 func newProvenance(rootPath string) *Provenance {

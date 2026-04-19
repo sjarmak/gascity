@@ -28,6 +28,7 @@ type packConfig struct {
 	Pack          PackMeta                `toml:"pack"`
 	Imports       map[string]Import       `toml:"imports,omitempty"`
 	AgentDefaults AgentDefaults           `toml:"agent_defaults,omitempty"`
+	Defaults      packDefaults            `toml:"defaults,omitempty"`
 	Agents        []Agent                 `toml:"agent"`
 	NamedSessions []NamedSession          `toml:"named_session,omitempty"`
 	Services      []Service               `toml:"service,omitempty"`
@@ -37,6 +38,14 @@ type packConfig struct {
 	Doctor        []PackDoctorEntry       `toml:"doctor,omitempty"`
 	Commands      []PackCommandEntry      `toml:"commands,omitempty"`
 	Global        PackGlobal              `toml:"global,omitempty"`
+}
+
+type packDefaults struct {
+	Rig packRigDefaults `toml:"rig,omitempty"`
+}
+
+type packRigDefaults struct {
+	Imports map[string]Import `toml:"imports,omitempty"`
 }
 
 // ExpandPacks resolves pack references on all rigs. For each rig
@@ -983,8 +992,15 @@ func loadPackWithCacheOptions(fs fsys.FS, topoPath, topoDir, cityRoot, rigName s
 	}
 
 	var tc packConfig
-	if _, err := toml.Decode(string(data), &tc); err != nil {
+	md, err := toml.Decode(string(data), &tc)
+	if err != nil {
 		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("parsing %s: %w", packFile, err)
+	}
+	if warnings := CheckUndecodedKeys(md, topoPath); len(warnings) > 0 {
+		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("parsing %s: %s", packFile, strings.Join(warnings, "; "))
+	}
+	if len(tc.Defaults.Rig.Imports) > 0 {
+		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("parsing %s: [defaults.rig.imports] is only supported in a city root pack.toml", packFile)
 	}
 
 	if err := validatePackMeta(&tc.Pack); err != nil {
