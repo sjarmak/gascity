@@ -37,7 +37,7 @@ var (
 
 func waitTestEnv(overrides map[string]string) []string {
 	env := map[string]string{}
-	for _, entry := range os.Environ() {
+	for _, entry := range sanitizedBaseEnv() {
 		key, value, ok := strings.Cut(entry, "=")
 		if !ok {
 			continue
@@ -1215,10 +1215,20 @@ func setupManagedBdWaitTestCity(t *testing.T) (string, string) {
 		t.Fatalf("MaterializeBuiltinPacks: %v", err)
 	}
 	script := gcBeadsBdScriptPath(cityPath)
+	poisonRuntimeDir := filepath.Join(t.TempDir(), "poison-runtime")
+	poisonPackStateDir := filepath.Join(poisonRuntimeDir, "packs", "dolt")
+	poisonStateFile := filepath.Join(poisonPackStateDir, "dolt-provider-state.json")
+	t.Setenv("GC_CITY_RUNTIME_DIR", poisonRuntimeDir)
+	t.Setenv("GC_PACK_STATE_DIR", poisonPackStateDir)
+	t.Setenv("GC_DOLT_STATE_FILE", poisonStateFile)
+	scriptEnv := sanitizedBaseEnv(
+		"GC_CITY="+cityPath,
+		"GC_CITY_PATH="+cityPath,
+	)
 	runScript := func(args ...string) {
 		t.Helper()
 		cmd := exec.Command(script, args...)
-		cmd.Env = os.Environ()
+		cmd.Env = scriptEnv
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("%s: %v\n%s", strings.Join(args, " "), err, out)
@@ -1226,11 +1236,14 @@ func setupManagedBdWaitTestCity(t *testing.T) (string, string) {
 	}
 	t.Cleanup(func() {
 		cmd := exec.Command(script, "stop")
-		cmd.Env = os.Environ()
+		cmd.Env = scriptEnv
 		_, _ = cmd.CombinedOutput()
 	})
 
 	runScript("start")
+	if _, err := os.Stat(poisonStateFile); !os.IsNotExist(err) {
+		t.Fatalf("start leaked ambient GC_* state to %q, stat err = %v", poisonStateFile, err)
+	}
 	if err := publishManagedDoltRuntimeState(cityPath); err != nil {
 		t.Fatalf("publishManagedDoltRuntimeState: %v", err)
 	}

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"strings"
 	"testing"
 )
@@ -100,12 +99,13 @@ func TestSanitizedBaseEnv_AppendsExtras(t *testing.T) {
 
 func TestSanitizedBaseEnv_ExtrasOverrideInheritedLastWins(t *testing.T) {
 	// If the helper ever regresses to NOT filter a var and the extras
-	// also set it, POSIX "last wins" must resolve in the extras' favor —
-	// otherwise the leak reappears silently.
+	// also set it, the caller still hands exec.Cmd an env slice whose last
+	// entry is the intended override. Otherwise the leak reappears silently.
 	t.Setenv("SOMETHING_UNFILTERED", "inherited")
 	env := sanitizedBaseEnv("SOMETHING_UNFILTERED=override")
 
-	// Find the last occurrence — that's what execve sees.
+	// Find the last occurrence — this test only verifies the helper's
+	// slice ordering, not child-process environment lookup semantics.
 	last := ""
 	for _, kv := range env {
 		if strings.HasPrefix(kv, "SOMETHING_UNFILTERED=") {
@@ -113,7 +113,23 @@ func TestSanitizedBaseEnv_ExtrasOverrideInheritedLastWins(t *testing.T) {
 		}
 	}
 	if last != "SOMETHING_UNFILTERED=override" {
-		t.Errorf("last-wins violated; got final %q, want SOMETHING_UNFILTERED=override", last)
+		t.Errorf("override ordering violated; got final %q, want SOMETHING_UNFILTERED=override", last)
+	}
+}
+
+func TestSanitizedBaseEnv_AllowsExplicitEmptyFilteredOverride(t *testing.T) {
+	t.Setenv("GC_BIN", "/pretend/inherited/gc")
+
+	env := sanitizedBaseEnv("GC_BIN=")
+
+	got := ""
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GC_BIN=") {
+			got = kv
+		}
+	}
+	if got != "GC_BIN=" {
+		t.Fatalf("explicit empty GC_BIN override missing: got %q", got)
 	}
 }
 
@@ -127,9 +143,10 @@ func TestSanitizedBaseEnv_MatchesExactlyGCAndBEADSPrefixes(t *testing.T) {
 		"BEADS_=empty_key",
 		"BEADS_BAR=2",
 	} {
-		eqIdx := strings.Index(kv, "=")
-		key := kv[:eqIdx]
-		val := kv[eqIdx+1:]
+		key, val, ok := strings.Cut(kv, "=")
+		if !ok {
+			t.Fatalf("malformed test env entry %q", kv)
+		}
 		t.Setenv(key, val)
 	}
 
@@ -153,5 +170,4 @@ func TestSanitizedBaseEnv_MatchesExactlyGCAndBEADSPrefixes(t *testing.T) {
 	if !found {
 		t.Error("sanitizedBaseEnv stripped a var whose key merely contained GC_ as a substring")
 	}
-	_ = os.Environ // reminder that we're reading from the process env
 }

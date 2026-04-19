@@ -2412,7 +2412,14 @@ func TestGcBeadsBdStartUsesRootBeadsDataDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	scriptEnv := append(os.Environ(),
+	poisonRuntimeDir := filepath.Join(t.TempDir(), "poison-runtime")
+	poisonPackStateDir := filepath.Join(poisonRuntimeDir, "packs", "dolt")
+	poisonStateFile := filepath.Join(poisonPackStateDir, "dolt-provider-state.json")
+	t.Setenv("GC_CITY_RUNTIME_DIR", poisonRuntimeDir)
+	t.Setenv("GC_PACK_STATE_DIR", poisonPackStateDir)
+	t.Setenv("GC_DOLT_STATE_FILE", poisonStateFile)
+
+	scriptEnv := sanitizedBaseEnv(
 		"HOME="+homeDir,
 		"GIT_CONFIG_GLOBAL="+gitConfig,
 		"GC_CITY_PATH="+cityPath,
@@ -2454,6 +2461,9 @@ func TestGcBeadsBdStartUsesRootBeadsDataDir(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cityPath, ".beads", "dolt-server.port")); !os.IsNotExist(err) {
 		t.Fatalf("dolt-server.port should not be written by shell start, stat err = %v", err)
+	}
+	if _, err := os.Stat(poisonStateFile); !os.IsNotExist(err) {
+		t.Fatalf("start leaked ambient GC_* state to %q, stat err = %v", poisonStateFile, err)
 	}
 }
 
@@ -3153,7 +3163,7 @@ esac
 			}
 
 			cmd := exec.Command(script, "init", cityPath, "gc", "gascity")
-			cmd.Env = append(os.Environ(),
+			cmd.Env = sanitizedBaseEnv(
 				"GC_CITY_PATH="+cityPath,
 				"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 			)
@@ -3237,7 +3247,7 @@ exec %q "$@"
 	}
 
 	cmd := exec.Command(script, "init", cityPath, "gc", "gascity")
-	cmd.Env = append(os.Environ(),
+	cmd.Env = sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	)
@@ -3425,7 +3435,7 @@ esac
 	}
 
 	cmd := exec.Command(script, "init", cityPath, "gc", "gascity")
-	cmd.Env = append(os.Environ(),
+	cmd.Env = sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"GC_BIN="+currentGCBinaryForTests(t),
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
@@ -3555,7 +3565,7 @@ esac
 	}
 
 	cmd := exec.Command(script, "init", cityPath, "gc", "gascity")
-	cmd.Env = append(os.Environ(),
+	cmd.Env = sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"GC_BIN="+fakeGC,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
@@ -3644,7 +3654,7 @@ esac
 	}
 
 	cmd := exec.Command(script, "init", cityPath, "gc", "gascity")
-	cmd.Env = append(os.Environ(),
+	cmd.Env = sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"GC_BIN="+currentGCBinaryForTests(t),
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
@@ -3708,7 +3718,7 @@ exit 0
 	}
 
 	cmd := exec.Command(script, "init", cityPath, "gc", "gascity")
-	cmd.Env = append(os.Environ(),
+	cmd.Env = sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	)
@@ -3834,7 +3844,7 @@ esac
 	}
 
 	cmd := exec.Command(script, "init", cityPath, "gc", "gascity")
-	cmd.Env = append(os.Environ(),
+	cmd.Env = sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"GC_BIN="+fakeGC,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
@@ -4014,7 +4024,7 @@ esac
 	}
 
 	cmd := exec.Command(script, "init", cityPath, "gc")
-	cmd.Env = append(os.Environ(),
+	cmd.Env = sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	)
@@ -4380,7 +4390,7 @@ esac
 		t.Fatalf("write compat port file: %v", err)
 	}
 
-	env := append(os.Environ(),
+	env := sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	)
@@ -4936,7 +4946,7 @@ while [ ! -f "$release_file" ]; do
   sleep 0.1
  done
 `, "sh", layout.LockFile, readyFile, releaseFile)
-	holder.Env = append(os.Environ(), "PATH="+os.Getenv("PATH"))
+	holder.Env = sanitizedBaseEnv("PATH=" + os.Getenv("PATH"))
 	if err := holder.Start(); err != nil {
 		t.Fatalf("start lock holder: %v", err)
 	}
@@ -4983,7 +4993,7 @@ while [ ! -f "$release_file" ]; do
 	}
 	beforeInode := inodeFor(layout.LockFile)
 
-	env := append(os.Environ(),
+	env := sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"GC_DOLT_PORT=3311",
 		"GC_FAKE_DOLT_INVOCATION_FILE="+invocationFile,
@@ -5214,7 +5224,7 @@ sleep 4
 printf 'ready\n' > "$started_file"
 sleep 1
 `, "sh", layout.LockFile, readyFile, startedFile)
-	holder.Env = append(os.Environ(), "PATH="+os.Getenv("PATH"))
+	holder.Env = sanitizedBaseEnv("PATH=" + os.Getenv("PATH"))
 	if err := holder.Start(); err != nil {
 		t.Fatalf("start lock holder: %v", err)
 	}
@@ -5233,7 +5243,7 @@ sleep 1
 		time.Sleep(25 * time.Millisecond)
 	}
 
-	env := append(os.Environ(),
+	env := sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"GC_DOLT_PORT=3311",
 		"GC_BIN="+fakeGC,
@@ -5277,7 +5287,7 @@ func TestGcBeadsBdStartUsesGCBinManagedConfigWriter(t *testing.T) {
 	fakeGC := writeFakeManagedConfigWriterGC(t, binDir, invocationFile)
 	writeFakeManagedConfigWriterDolt(t, binDir)
 
-	env := append(os.Environ(),
+	env := sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"GC_BIN="+fakeGC,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
@@ -5352,7 +5362,7 @@ func TestGcBeadsBdStopUsesGCBinStopManagedHelperWhenAvailable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	env := append(os.Environ(),
+	env := sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"GC_BIN="+fakeGC,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
@@ -5391,7 +5401,7 @@ func TestGcBeadsBdRecoverUsesGCBinRecoverManagedHelperWhenAvailable(t *testing.T
 	invocationFile := filepath.Join(t.TempDir(), "gc-invocation")
 	fakeGC := writeFakeManagedConfigWriterGC(t, binDir, invocationFile)
 
-	env := append(os.Environ(),
+	env := sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"GC_BIN="+fakeGC,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
@@ -5430,7 +5440,7 @@ func TestGcBeadsBdRecoverHelperPreservesReadOnlyWarning(t *testing.T) {
 	invocationFile := filepath.Join(t.TempDir(), "gc-invocation")
 	fakeGC := writeFakeManagedConfigWriterGC(t, binDir, invocationFile)
 
-	env := append(os.Environ(),
+	env := sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"GC_BIN="+fakeGC,
 		"GC_FAKE_RECOVER_DIAGNOSED_READ_ONLY=true",
@@ -5509,7 +5519,7 @@ esac
 	if err := os.WriteFile(fakeDolt, []byte(fakeDoltScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	env := append(os.Environ(),
+	env := sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"GC_DOLT_PORT=3311",
 		"GC_DOLT_LOGLEVEL=info",
@@ -5635,7 +5645,7 @@ esac
 		t.Fatal(err)
 	}
 
-	env := append(os.Environ(),
+	env := sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	)
@@ -5776,7 +5786,7 @@ esac
 		t.Fatal(err)
 	}
 
-	env := append(os.Environ(),
+	env := sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	)
@@ -5904,8 +5914,15 @@ esac
 	// instead of this test's t.TempDir() — confirmed in the wild on a
 	// dev workstation where a previous run of this test clobbered a
 	// live city. Regression guard for gastownhall/gascity#938.
+	poisonRuntimeDir := filepath.Join(t.TempDir(), "poison-runtime")
+	poisonPackStateDir := filepath.Join(poisonRuntimeDir, "packs", "dolt")
+	poisonStateFile := filepath.Join(poisonPackStateDir, "dolt-provider-state.json")
+	t.Setenv("GC_CITY_RUNTIME_DIR", poisonRuntimeDir)
+	t.Setenv("GC_PACK_STATE_DIR", poisonPackStateDir)
+	t.Setenv("GC_DOLT_STATE_FILE", poisonStateFile)
 	baseEnv := sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
+		"GC_BIN=",
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	)
 
@@ -5958,7 +5975,7 @@ exec "$real_nc" "$@"
 	if err := os.WriteFile(shimPath, []byte(shim), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	envWithShim := append(os.Environ(),
+	envWithShim := sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"GC_BIN=",
 		"PATH="+strings.Join([]string{shimDir, binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
@@ -5981,6 +5998,9 @@ exec "$real_nc" "$@"
 	}
 	if got := strings.TrimSpace(string(countData)); got != "1" {
 		t.Fatalf("dolt sql-server launch count = %q, want 1", got)
+	}
+	if _, err := os.Stat(poisonStateFile); !os.IsNotExist(err) {
+		t.Fatalf("ensure-ready leaked ambient GC_* state to %q, stat err = %v", poisonStateFile, err)
 	}
 }
 
@@ -6683,7 +6703,7 @@ esac
 	}
 
 	cmd := exec.Command(script, "init", rigPath, "fe", "fe")
-	cmd.Env = append(os.Environ(),
+	cmd.Env = sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"GC_BIN="+currentGCBinaryForTests(t),
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
@@ -6811,7 +6831,7 @@ func TestGcBeadsBdStartFallsBackToShellManagedConfigWriterWhenGCBinUnset(t *test
 	_ = writeFakeManagedConfigWriterGC(t, binDir, invocationFile)
 	writeFakeManagedConfigWriterDolt(t, binDir)
 
-	env := append(os.Environ(),
+	env := sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	)
