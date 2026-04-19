@@ -307,12 +307,12 @@ func reconcileSessionBeadsTraced(
 					if configuredNames[name] {
 						reason = "suspended"
 					}
-					template := normalizedSessionTemplate(*session, cfg)
-					if template == "" {
-						template = session.Metadata["template"]
-					}
 					if beginSessionDrain(*session, sp, dt, reason, clk, defaultDrainTimeout) {
 						if trace != nil {
+							template := normalizedSessionTemplate(*session, cfg)
+							if template == "" {
+								template = session.Metadata["template"]
+							}
 							trace.recordDecision("reconciler.session.orphan_or_suspended", template, name, reason, "drain", traceRecordPayload{
 								"store_query_partial": storeQueryPartial,
 								"provider_alive":      providerAlive,
