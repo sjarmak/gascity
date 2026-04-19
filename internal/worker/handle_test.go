@@ -1165,6 +1165,86 @@ func TestRuntimeHandleExpandedWorkerSurface(t *testing.T) {
 	}
 }
 
+func TestRuntimeHandleStateStoppedSkipsPendingProbe(t *testing.T) {
+	sp := runtime.NewFake()
+	sp.SetPendingInteraction("legacy-worker", &runtime.PendingInteraction{
+		RequestID: "req-stopped",
+		Kind:      "approval",
+		Prompt:    "Proceed?",
+	})
+
+	handle, err := NewRuntimeHandle(RuntimeHandleConfig{
+		Provider:     sp,
+		SessionName:  "legacy-worker",
+		ProviderName: "stub",
+	})
+	if err != nil {
+		t.Fatalf("NewRuntimeHandle: %v", err)
+	}
+
+	state, err := handle.State(context.Background())
+	if err != nil {
+		t.Fatalf("State: %v", err)
+	}
+	if got, want := state.Phase, PhaseStopped; got != want {
+		t.Fatalf("State().Phase = %s, want %s", got, want)
+	}
+	for _, call := range sp.Calls {
+		if call.Method == "Pending" {
+			t.Fatalf("calls = %#v, want no Pending probe for stopped runtime handle", sp.Calls)
+		}
+	}
+}
+
+func TestRuntimeHandleLiveObservationUsesRuntimeMetadataAndLiveness(t *testing.T) {
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "legacy-worker", runtime.Config{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := sp.SetMeta("legacy-worker", "suspended", "true"); err != nil {
+		t.Fatalf("SetMeta(suspended): %v", err)
+	}
+	if err := sp.SetMeta("legacy-worker", "GC_SESSION_ID", "session-123"); err != nil {
+		t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+	}
+	sp.SetAttached("legacy-worker", true)
+	lastActivity := time.Date(2026, time.April, 19, 9, 30, 0, 0, time.UTC)
+	sp.SetActivity("legacy-worker", lastActivity)
+
+	handle, err := NewRuntimeHandle(RuntimeHandleConfig{
+		Provider:     sp,
+		SessionName:  "legacy-worker",
+		ProviderName: "claude",
+		ProcessNames: []string{"claude"},
+	})
+	if err != nil {
+		t.Fatalf("NewRuntimeHandle: %v", err)
+	}
+
+	obs, err := handle.LiveObservation(context.Background())
+	if err != nil {
+		t.Fatalf("LiveObservation: %v", err)
+	}
+	if !obs.Running {
+		t.Fatalf("LiveObservation.Running = false, want true; obs=%#v", obs)
+	}
+	if !obs.Alive {
+		t.Fatalf("LiveObservation.Alive = false, want true; obs=%#v", obs)
+	}
+	if !obs.Attached {
+		t.Fatalf("LiveObservation.Attached = false, want true; obs=%#v", obs)
+	}
+	if !obs.Suspended {
+		t.Fatalf("LiveObservation.Suspended = false, want true; obs=%#v", obs)
+	}
+	if got, want := obs.RuntimeSessionID, "session-123"; got != want {
+		t.Fatalf("LiveObservation.RuntimeSessionID = %q, want %q", got, want)
+	}
+	if obs.LastActivity == nil || !obs.LastActivity.Equal(lastActivity) {
+		t.Fatalf("LiveObservation.LastActivity = %#v, want %v", obs.LastActivity, lastActivity)
+	}
+}
+
 func TestRuntimeHandleStartResolvedStartsLegacyRuntimeSession(t *testing.T) {
 	sp := runtime.NewFake()
 
