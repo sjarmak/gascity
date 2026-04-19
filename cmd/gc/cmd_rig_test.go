@@ -1176,7 +1176,7 @@ source = "packs/a-pack"
 	t.Setenv("GC_BEADS", "file")
 
 	var stdout, stderr bytes.Buffer
-	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, "", "", "", false, false, &stdout, &stderr)
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "", false, false, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doRigAdd returned %d, stderr: %s", code, stderr.String())
 	}
@@ -1290,6 +1290,79 @@ func TestDoRigAdd_MultipleIncludes(t *testing.T) {
 	got := cfg.Rigs[0].Includes
 	if len(got) != 2 || got[0] != "packs/planner" || got[1] != "packs/architect" {
 		t.Errorf("rig includes = %v, want [packs/planner packs/architect]", got)
+	}
+}
+
+// Regression for #782: `--include=` (empty string) and whitespace-only
+// entries must be filtered so rig.Includes never contains a blank path
+// (which downstream pack resolution would read as the city root).
+func TestDoRigAdd_EmptyIncludesFiltered(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cityToml := "[workspace]\nname = \"test-city\"\ndefault_rig_includes = [\"packs/default\"]\n\n[[agent]]\nname = \"mayor\"\n"
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rigPath := filepath.Join(t.TempDir(), "my-project")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_BEADS", "file")
+
+	var stdout, stderr bytes.Buffer
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, []string{"", "  ", "packs/real", ""}, "", "", false, false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doRigAdd returned %d, stderr: %s", code, stderr.String())
+	}
+
+	cfg, err := config.Load(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.Rigs[0].Includes
+	if len(got) != 1 || got[0] != "packs/real" {
+		t.Errorf("rig includes = %v, want [packs/real] (blank entries filtered)", got)
+	}
+}
+
+// Regression for #782: if ALL --include flags are empty, fall back to
+// default_rig_includes rather than producing a rig with blank pack paths.
+func TestDoRigAdd_AllEmptyIncludesFallsBackToDefaults(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cityToml := "[workspace]\nname = \"test-city\"\ndefault_rig_includes = [\"packs/default\"]\n\n[[agent]]\nname = \"mayor\"\n"
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rigPath := filepath.Join(t.TempDir(), "my-project")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_BEADS", "file")
+
+	var stdout, stderr bytes.Buffer
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, []string{"", "  "}, "", "", false, false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doRigAdd returned %d, stderr: %s", code, stderr.String())
+	}
+
+	cfg, err := config.Load(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.Rigs[0].Includes
+	if len(got) != 1 || got[0] != "packs/default" {
+		t.Errorf("rig includes = %v, want [packs/default] (defaults apply when all --include blank)", got)
 	}
 }
 

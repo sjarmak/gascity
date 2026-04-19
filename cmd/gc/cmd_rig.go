@@ -180,6 +180,17 @@ func doRigAdd(fs fsys.FS, cityPath, rigPath string, includes []string, nameOverr
 		return 1
 	}
 
+	// Trim and drop empty --include entries so `--include=` or `--include " "`
+	// doesn't persist a blank pack path that downstream resolution reads
+	// as the city root.
+	cleaned := includes[:0:0]
+	for _, inc := range includes {
+		if trimmed := strings.TrimSpace(inc); trimmed != "" {
+			cleaned = append(cleaned, trimmed)
+		}
+	}
+	includes = cleaned
+
 	fi, err := fs.Stat(rigPath)
 	if err != nil {
 		if adopt {
@@ -285,7 +296,7 @@ func doRigAdd(fs fsys.FS, cityPath, rigPath string, includes []string, nameOverr
 			fmt.Fprintf(stderr, "gc rig add: warning: --start-suspended ignored (existing: suspended=%v); edit city.toml to change\n", existingRig.Suspended) //nolint:errcheck // best-effort stderr
 		}
 		if len(includes) > 0 && !slices.Equal(existingRig.Includes, includes) {
-			fmt.Fprintf(stderr, "gc rig add: warning: --include=%s ignored (existing: %s); edit city.toml to change\n", strings.Join(includes, ", "), strings.Join(existingRig.Includes, ", ")) //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "gc rig add: warning: --include flags %v ignored (existing: %v); edit city.toml to change\n", includes, existingRig.Includes) //nolint:errcheck // best-effort stderr
 		}
 		if prefixOverride != "" && strings.ToLower(prefixOverride) != existingRig.EffectivePrefix() {
 			fmt.Fprintf(stderr, "gc rig add: warning: --prefix=%s ignored (existing: %s); edit city.toml to change\n", prefixOverride, existingRig.EffectivePrefix()) //nolint:errcheck // best-effort stderr
