@@ -52,6 +52,7 @@ func LoadWithIncludes(fs fsys.FS, path string, extraIncludes ...string) (*City, 
 	prov := newProvenance(path)
 	prov.Warnings = append(prov.Warnings, rootWarnings...)
 	root.ResolvedWorkspaceName = filepath.Base(cityRoot)
+	cityAgentsForProvenance := root.Agents
 
 	// V2: if a pack.toml exists alongside city.toml, it is the city's
 	// definition layer. Parse it and merge its content (imports, agents,
@@ -76,6 +77,7 @@ func LoadWithIncludes(fs fsys.FS, path string, extraIncludes ...string) (*City, 
 		// Preserve the city.toml agents so they can override pack-defined
 		// and convention-discovered agents.
 		cityAgents := append([]Agent{}, root.Agents...)
+		cityAgentsForProvenance = cityAgents
 		rootPackIncludes = append([]string(nil), pc.Pack.Includes...)
 		rootPackRequires = append([]PackRequirement(nil), pc.Pack.Requires...)
 		// Dedup: city.toml agents override pack.toml agents with the same
@@ -122,6 +124,9 @@ func LoadWithIncludes(fs fsys.FS, path string, extraIncludes ...string) (*City, 
 			packServices := make([]Service, len(pc.Services))
 			copy(packServices, pc.Services)
 			for i := range packServices {
+				if packServices[i].PublishMode == "direct" {
+					return nil, nil, fmt.Errorf("city pack.toml: service %q: packs may not set publish_mode=direct", packServices[i].Name)
+				}
 				packServices[i].SourceDir = cityRoot
 			}
 			root.Services = append(packServices, root.Services...)
@@ -189,6 +194,7 @@ func LoadWithIncludes(fs fsys.FS, path string, extraIncludes ...string) (*City, 
 		if err != nil {
 			return nil, nil, fmt.Errorf("city pack.toml: %w", err)
 		}
+		trackAgents(prov, packDiscoveredAgents, packPath)
 		root.Agents = append([]Agent{}, packAgents...)
 		root.Agents = append(root.Agents, packDiscoveredAgents...)
 		root.Agents = append(root.Agents, cityAgents...)
@@ -203,7 +209,7 @@ func LoadWithIncludes(fs fsys.FS, path string, extraIncludes ...string) (*City, 
 	}
 
 	// Track root's resources.
-	trackAgents(prov, root.Agents, path)
+	trackAgents(prov, cityAgentsForProvenance, path)
 	trackRigs(prov, root.Rigs, path)
 	trackWorkspace(prov, rootMeta, path)
 

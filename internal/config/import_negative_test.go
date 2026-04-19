@@ -117,6 +117,34 @@ scope = "city"
 	}
 }
 
+func TestImport_RootPackDirectServiceRejected(t *testing.T) {
+	dir := t.TempDir()
+	cityDir := filepath.Join(dir, "city")
+	mustMkdirAll(t, cityDir, 0o755)
+
+	writeTestFile(t, cityDir, "city.toml", `
+[workspace]
+name = "test"
+`)
+	writeTestFile(t, cityDir, "pack.toml", `
+[pack]
+name = "test"
+schema = 2
+
+[[service]]
+name = "ui"
+publish_mode = "direct"
+`)
+
+	_, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityDir, "city.toml"))
+	if err == nil {
+		t.Fatal("expected error for direct service in root pack.toml")
+	}
+	if !strings.Contains(err.Error(), "city pack.toml") || !strings.Contains(err.Error(), "publish_mode=direct") {
+		t.Errorf("error should mention city pack.toml direct service; got: %v", err)
+	}
+}
+
 func TestImport_TransitiveFalseWithExport(t *testing.T) {
 	// transitive=false on an import should suppress its nested deps
 	// even if the nested pack uses export=true internally.

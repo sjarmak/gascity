@@ -147,6 +147,9 @@ name = "mayor"
 	if len(prov.Sources) != 2 {
 		t.Errorf("len(Sources) = %d, want 2", len(prov.Sources))
 	}
+	if prov.Agents["mayor"] != "/city/pack.toml" {
+		t.Errorf("mayor source = %q, want /city/pack.toml", prov.Agents["mayor"])
+	}
 }
 
 func TestLoadWithIncludes_ConcatAgents(t *testing.T) {
