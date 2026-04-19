@@ -382,3 +382,61 @@ func TestFactoryHandleForTargetRuntimeFallbackPreservesRecorder(t *testing.T) {
 		t.Fatalf("payload.Provider = %q, want %q", got, want)
 	}
 }
+
+func TestFactoryRuntimeHandleUsesConfiguredProviderAndRecorder(t *testing.T) {
+	sp := runtime.NewFake()
+	recorder := events.NewFake()
+	processNames := []string{"claude"}
+
+	factory, err := NewFactory(FactoryConfig{
+		Provider: sp,
+		Recorder: recorder,
+	})
+	if err != nil {
+		t.Fatalf("NewFactory: %v", err)
+	}
+
+	handle, err := factory.RuntimeHandle("legacy-runtime-name", "claude", "tmux-cli", processNames)
+	if err != nil {
+		t.Fatalf("RuntimeHandle: %v", err)
+	}
+	runtimeHandle, ok := handle.(*RuntimeHandle)
+	if !ok {
+		t.Fatalf("RuntimeHandle() returned %T, want *RuntimeHandle", handle)
+	}
+	if runtimeHandle.provider != sp {
+		t.Fatal("RuntimeHandle().provider did not reuse factory provider")
+	}
+	if got, want := runtimeHandle.providerName, "claude"; got != want {
+		t.Fatalf("providerName = %q, want %q", got, want)
+	}
+	if got, want := runtimeHandle.transport, "tmux-cli"; got != want {
+		t.Fatalf("transport = %q, want %q", got, want)
+	}
+	processNames[0] = "mutated"
+	if got, want := runtimeHandle.processNames[0], "claude"; got != want {
+		t.Fatalf("processNames[0] = %q, want %q", got, want)
+	}
+
+	if err := sp.Start(context.Background(), "legacy-runtime-name", runtime.Config{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := handle.Interrupt(context.Background(), InterruptRequest{}); err != nil {
+		t.Fatalf("Interrupt: %v", err)
+	}
+
+	recorded := recorder.Events
+	if len(recorded) == 0 {
+		t.Fatal("no worker events recorded")
+	}
+	var payload operationEventPayload
+	if err := json.Unmarshal(recorded[len(recorded)-1].Payload, &payload); err != nil {
+		t.Fatalf("Unmarshal(payload): %v", err)
+	}
+	if got, want := payload.Operation, string(workerOperationInterrupt); got != want {
+		t.Fatalf("payload.Operation = %q, want %q", got, want)
+	}
+	if got, want := payload.SessionName, "legacy-runtime-name"; got != want {
+		t.Fatalf("payload.SessionName = %q, want %q", got, want)
+	}
+}

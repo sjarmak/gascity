@@ -178,6 +178,23 @@ func workerHandleForSessionTargetWithRuntimeHintsWithConfig(cityPath string, sto
 	return factory.HandleForTarget(target, processNames)
 }
 
+func runtimeWorkerHandleWithConfig(
+	cityPath string,
+	store beads.Store,
+	sp runtime.Provider,
+	cfg *config.City,
+	sessionName string,
+	providerName string,
+	transport string,
+	processNames []string,
+) (worker.Handle, error) {
+	factory, err := workerFactoryWithConfig(cityPath, store, sp, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return factory.RuntimeHandle(sessionName, providerName, transport, processNames)
+}
+
 func workerKillSessionTargetWithConfig(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City, target string) error {
 	handle, err := workerHandleForSessionTargetWithConfig(cityPath, store, sp, cfg, target)
 	if err != nil {
