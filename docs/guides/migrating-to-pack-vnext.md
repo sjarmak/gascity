@@ -365,11 +365,16 @@ split between pack-wide and agent-local content.
 
 Use:
 
-- `overlays/` for pack-wide overlay material
+- `overlay/` for pack-wide overlay material
 - `agents/<name>/overlay/` for agent-local overlay material
 
 If your old config depends on `overlay_dir = "..."`, the migration step
 is usually to relocate those files into one of those places.
+
+The loader only discovers `overlay/` (singular) — a directory named
+`overlays/` (plural) is silently ignored. If you have one at the pack
+root from an earlier layout or an older draft of this guide, rename it
+to `overlay/`.
 
 ## Skills, MCP, and template fragments
 
@@ -610,7 +615,7 @@ schema, plus the qualified rows that matter most during migration.
 | `[packs.*]` | Named remote pack sources used by includes | Collapse into `[imports.*]` entries. There should no longer be a separate `[packs.*]` registry in `city.toml`. |
 | `[[agent]]` | Inline agent definitions | Move to `agents/<name>/`, with optional `agent.toml`. |
 | `agent.prompt_template` | Path to agent prompt | Move to `agents/<name>/prompt.template.md` for templated prompts. Use `prompt.md` only for plain, non-templated Markdown. |
-| `agent.overlay_dir` | Path to overlay content | Move content to `agents/<name>/overlay/` or pack-wide `overlays/`. |
+| `agent.overlay_dir` | Path to overlay content | Move content to `agents/<name>/overlay/` or pack-wide `overlay/`. |
 | `agent.session_setup_script` | Path to setup script | Keep as a path-valued field, but point at a pack-local file, usually next to the thing that uses it or under `assets/`. |
 | `agent.namepool` | Path to names file | Move toward agent-local content such as `agents/<name>/namepool.txt` if retained. |
 | `[[named_session]]` | Named reusable sessions | Move to `[[named_session]]` in the root city `pack.toml`. |
@@ -655,7 +660,7 @@ transitional pack fields that people are likely to have.
 | `[imports.*]` | Named imports in transitional configs | Keep in `pack.toml`. This is the new composition surface. |
 | `[[agent]]` | Inline pack agent definitions | Move to `agents/<name>/`, with optional `agent.toml`. |
 | `agent.prompt_template` | Agent prompt file path | Move to `agents/<name>/prompt.template.md` for templated prompts. Use `prompt.md` only for plain, non-templated Markdown. |
-| `agent.overlay_dir` | Agent overlay path | Move content to `agents/<name>/overlay/` or `overlays/`. |
+| `agent.overlay_dir` | Agent overlay path | Move content to `agents/<name>/overlay/` or `overlay/`. |
 | `agent.session_setup_script` | Agent setup script path | Keep as a path-valued field pointing at a pack-local file. |
 | `[[named_session]]` | Pack-defined named sessions | Keep in `pack.toml`. |
 | `[[service]]` | Pack-defined services | Keep only if services remain pack-defined in the new model. Otherwise move city-owned services to `city.toml`. |
@@ -680,8 +685,8 @@ This table is the filesystem companion to the two schema tables above.
 | `formulas/` | Formula directory, sometimes path-wired via TOML | Keep as the fixed top-level `formulas/` convention. |
 | `formulas/orders/` | Nested order definitions under formulas | Move to top-level `orders/` using flat `*.toml` files. |
 | `orders/` | Top-level order directory in some cities | Standardize on this location, but use flat `orders/<name>.toml` files. |
-| `overlays/` | Pack-wide overlay bucket | Keep as top-level `overlays/`. |
-| `overlay/` | Singular overlay directory seen in some older packs | Remove or migrate to `overlays/` or `agents/<name>/overlay/`. |
+| `overlay/` | Pack-wide overlay bucket | Keep as top-level `overlay/`. Agent-local overlays live under `agents/<name>/overlay/`. |
+| `overlays/` | Pack-wide overlay bucket named plural in some older packs and earlier drafts of this guide | Rename to `overlay/` — the loader only discovers the singular form. |
 | `namepools/` | Shared bucket of agent name pools | Move toward agent-local files if retained. |
 | `commands/` with ad hoc scripts | Command helper directory plus TOML wiring | Keep `commands/`, but organize as entry directories such as `commands/<name>/run.sh`. |
 | `doctor/` with ad hoc scripts | Doctor helper directory plus TOML wiring | Keep `doctor/`, but organize as entry directories such as `doctor/<name>/run.sh`. |
