@@ -98,7 +98,11 @@ func (o *providerDrainOps) isRestartRequested(sessionName string) (bool, error) 
 }
 
 func (o *providerDrainOps) clearRestartRequested(sessionName string) error {
-	return o.sp.RemoveMeta(sessionName, "GC_RESTART_REQUESTED")
+	err := o.sp.RemoveMeta(sessionName, "GC_RESTART_REQUESTED")
+	if runtime.IsSessionGone(err) {
+		return nil
+	}
+	return err
 }
 
 func (o *providerDrainOps) setDriftRestart(sessionName string) error {
@@ -367,6 +371,11 @@ The controller will stop the session on its next reconcile tick and
 restart it fresh. The blocking prevents the agent from consuming more
 context while waiting.
 
+For on-demand configured named sessions, the controller cannot restart the
+user-attended process. In that case this command reports that restart was
+skipped and returns without blocking. No session.draining event is emitted
+when restart is skipped.
+
 This command is designed to be called from within a session context.
 It emits a session.draining event before blocking.`,
 		Args: cobra.NoArgs,
@@ -386,12 +395,27 @@ func cmdRuntimeRequestRestart(stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	sp := newSessionProvider()
+	dops := newDrainOps(sp)
 	store, storeErr := openCityStoreAt(current.cityPath)
 	if storeErr != nil {
 		fmt.Fprintf(stderr, "gc runtime request-restart: opening store: %v\n", storeErr) //nolint:errcheck // best-effort stderr
 	}
-	sp := newSessionProvider()
-	dops := newDrainOps(sp)
+	if store != nil {
+		restartable, err := sessionRestartableByController(store, current.sessionName)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc runtime request-restart: checking session type: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if !restartable {
+			if err := clearRestartRequest(store, dops, current.sessionName); err != nil {
+				fmt.Fprintf(stderr, "gc runtime request-restart: clearing stale restart request: %v\n", err) //nolint:errcheck // best-effort stderr
+				return 1
+			}
+			fmt.Fprintln(stdout, "Restart skipped for named session; controller cannot restart on-demand named sessions.") //nolint:errcheck // best-effort stdout
+			return 0
+		}
+	}
 	rec := openCityRecorderAt(current.cityPath, stderr)
 	cfg, _ := loadCityConfig(current.cityPath)
 	var persistRestart func() error
