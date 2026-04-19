@@ -47,6 +47,19 @@ func TestIsControlDispatcherKind(t *testing.T) {
 	}
 }
 
+func TestIsWorkflowTopologyKind(t *testing.T) {
+	for _, kind := range []string{"workflow", "scope", "spec"} {
+		if !IsWorkflowTopologyKind(kind) {
+			t.Errorf("expected true for %q", kind)
+		}
+	}
+	for _, kind := range []string{"", "task", "check", "fanout", "ralph"} {
+		if IsWorkflowTopologyKind(kind) {
+			t.Errorf("expected false for %q", kind)
+		}
+	}
+}
+
 func TestGraphRouteRigContext(t *testing.T) {
 	if got := GraphRouteRigContext("myrig/worker"); got != "myrig" {
 		t.Errorf("got %q, want myrig", got)
@@ -102,11 +115,8 @@ func TestApplyGraphRouting_LegacyStampsRoutedTo(t *testing.T) {
 }
 
 func TestApplyGraphRouting_LegacyNilAgent(t *testing.T) {
-	// Legacy path with nil agent (order-dispatch before resolution) must
-	// resolve via Deps.Resolver, same as the graph.v2 path.
-	cfg := &config.City{Agents: []config.Agent{
-		{Name: "worker", MaxActiveSessions: intPtr(1)},
-	}}
+	// Legacy path stamps gc.routed_to from the routedTo argument without
+	// needing agent resolution — the order-dispatch caller passes a=nil.
 	r := &formula.Recipe{
 		Name: "mol-legacy",
 		Steps: []formula.RecipeStep{
@@ -114,8 +124,7 @@ func TestApplyGraphRouting_LegacyNilAgent(t *testing.T) {
 			{ID: "mol-legacy.step1", Metadata: map[string]string{}},
 		},
 	}
-	deps := Deps{Resolver: testAgentResolver{}}
-	err := ApplyGraphRouting(r, nil, "worker", nil, "", "", "", "", nil, "city", cfg, deps)
+	err := ApplyGraphRouting(r, nil, "worker", nil, "", "", "", "", nil, "city", &config.City{}, Deps{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -125,7 +134,7 @@ func TestApplyGraphRouting_LegacyNilAgent(t *testing.T) {
 }
 
 func TestApplyGraphRouting_LegacyNilCfg(t *testing.T) {
-	// Without cfg the legacy path cannot resolve a nil agent; stay no-op.
+	// ApplyGraphRouting is a no-op whenever cfg is nil.
 	r := &formula.Recipe{
 		Steps: []formula.RecipeStep{
 			{IsRoot: true, Metadata: map[string]string{}},
@@ -137,7 +146,7 @@ func TestApplyGraphRouting_LegacyNilCfg(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if _, ok := r.Steps[1].Metadata["gc.routed_to"]; ok {
-		t.Error("expected no routing on legacy recipe when cfg is nil")
+		t.Error("expected no routing when cfg is nil")
 	}
 }
 
