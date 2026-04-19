@@ -9,6 +9,16 @@
 
 set -euo pipefail
 
+# json_payload strips any non-JSON prefix lines (e.g., `bd`'s
+# `warning: beads.role not configured` diagnostic, which is emitted on
+# stdout before the real payload). Without this, jq fails to parse the
+# combined stdout and the script exits with empty output and status 1,
+# which has produced flaky CI failures for
+# TestReviewCheckScriptsPreferNewestVerdictAcrossRalphStep.
+json_payload() {
+    awk 'found || /^[[:space:]]*[[{]/{ found=1; print }'
+}
+
 load_verdict() {
     local apply_ref="$1"
     local root_id="$2"
@@ -18,6 +28,7 @@ load_verdict() {
     while [ "$attempt" -lt 5 ]; do
         verdict=$(
             bd list --all --json --limit=0 2>/dev/null |
+                json_payload |
                 jq -r --arg ref "$apply_ref" --arg root "$root_id" '
                     [
                         .[]
@@ -50,9 +61,9 @@ if [ -z "$BEAD_ID" ]; then
     exit 1
 fi
 
-BEAD_JSON=$(bd show "$BEAD_ID" --json 2>/dev/null)
-ATTEMPT=$(printf '%s\n' "$BEAD_JSON" | jq -r 'if type == "array" then (.[0].metadata["gc.attempt"] // "") else (.metadata["gc.attempt"] // "") end')
-ROOT_ID=$(printf '%s\n' "$BEAD_JSON" | jq -r 'if type == "array" then (.[0].metadata["gc.root_bead_id"] // "") else (.metadata["gc.root_bead_id"] // "") end')
+BEAD_JSON=$(bd show "$BEAD_ID" --json 2>/dev/null | json_payload)
+ATTEMPT=$(printf '%s\n' "$BEAD_JSON" | jq -r 'if type == "array" then (.[0].metadata["gc.attempt"] // "") else (.metadata["gc.attempt"] // "") end' 2>/dev/null || printf '')
+ROOT_ID=$(printf '%s\n' "$BEAD_JSON" | jq -r 'if type == "array" then (.[0].metadata["gc.root_bead_id"] // "") else (.metadata["gc.root_bead_id"] // "") end' 2>/dev/null || printf '')
 if [ -z "$ATTEMPT" ] || [ -z "$ROOT_ID" ]; then
     echo "ERROR: missing gc.attempt or gc.root_bead_id on $BEAD_ID" >&2
     exit 1

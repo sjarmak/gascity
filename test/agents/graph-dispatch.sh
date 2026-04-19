@@ -452,7 +452,12 @@ while true; do
         exit 1
     fi
 
-    printf '%s\n' "$ref" >> "$REPORT_FILE"
+    # Report emission is deferred until just before close_with_result so a
+    # step that gets skipped by the controller mid-processing (after we
+    # fetched it from the ready queue but before we committed to closing)
+    # does not appear in the report. Writing here would violate
+    # TestGraphWorkflowFailureRunsCleanup's "report should not include
+    # .implement after abort" invariant.
     trace "run bead=$bead_id ref=$ref kind=$kind source=$source_id work_dir=$work_dir"
     trace_store
 
@@ -467,6 +472,7 @@ while true; do
             ;;
         *.preflight-tests*)
             if [ "$MODE" = "fail-preflight" ]; then
+                printf '%s\n' "$ref" >> "$REPORT_FILE"
                 trace "close-fail bead=$bead_id ref=$ref class=hard reason=preflight_failed"
                 close_with_result "$bead_id" "fail" "hard" "preflight_failed"
                 trace "close-returned bead=$bead_id"
@@ -502,6 +508,7 @@ while true; do
 
     if should_fail_transient_once "$ref"; then
         reason=$(transient_reason_for_ref "$ref")
+        printf '%s\n' "$ref" >> "$REPORT_FILE"
         trace "close-fail bead=$bead_id ref=$ref class=transient reason=$reason mode=once"
         close_with_result "$bead_id" "fail" "transient" "$reason"
         trace "close-returned bead=$bead_id"
@@ -512,6 +519,7 @@ while true; do
     fi
     if should_fail_transient_always "$ref"; then
         reason=$(transient_reason_for_ref "$ref")
+        printf '%s\n' "$ref" >> "$REPORT_FILE"
         trace "close-fail bead=$bead_id ref=$ref class=transient reason=$reason mode=always"
         close_with_result "$bead_id" "fail" "transient" "$reason"
         trace "close-returned bead=$bead_id"
@@ -541,6 +549,7 @@ while true; do
         continue
     fi
 
+    printf '%s\n' "$ref" >> "$REPORT_FILE"
     trace "close bead=$bead_id ref=$ref"
     trace_store
     close_with_result "$bead_id" "pass"
