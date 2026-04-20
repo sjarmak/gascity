@@ -4,8 +4,6 @@ package config
 import (
 	"bytes"
 	"fmt"
-	"io"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -173,14 +171,18 @@ type City struct {
 	Services []Service `toml:"service,omitempty"`
 	// AgentDefaults provides city-level defaults for agents that don't
 	// override them (canonical TOML key: agent_defaults). The runtime
-	// currently applies default_sling_formula plus shared skill/MCP
-	// attachment baselines; other fields are parsed/composed but not yet
-	// inherited automatically.
+	// currently applies default_sling_formula and uses append_fragments
+	// during prompt rendering; other fields are parsed/composed but not
+	// yet inherited automatically.
 	AgentDefaults AgentDefaults `toml:"agent_defaults,omitempty"`
 	// AgentsDefaults is a temporary compatibility alias for [agent_defaults].
 	// Parse/load normalize it into AgentDefaults and prefer [agent_defaults]
 	// when both tables are present.
 	AgentsDefaults AgentDefaults `toml:"agents,omitempty" jsonschema:"-"`
+	// LoadWarnings accumulates non-fatal warnings discovered while expanding
+	// imported packs so LoadWithIncludes can surface them through provenance.
+	// Runtime-only — not persisted to TOML or JSON.
+	LoadWarnings []string `toml:"-" json:"-"`
 	// ResolvedWorkspaceName is the effective city name derived from the
 	// config file path when workspace.name is omitted. Runtime-only.
 	ResolvedWorkspaceName string `toml:"-" json:"-"`
@@ -614,6 +616,8 @@ type PackMeta struct {
 	Version string `toml:"version"`
 	// Schema is the pack format version (currently 1).
 	Schema int `toml:"schema" jsonschema:"required"`
+	// Description is an optional human-readable pack summary.
+	Description string `toml:"description,omitempty"`
 	// RequiresGC is an optional minimum gc version requirement.
 	RequiresGC string `toml:"requires_gc,omitempty"`
 	// Includes lists other packs to compose into this one (V1 mechanism).
@@ -1075,20 +1079,36 @@ type OrderOverride struct {
 	Rig string `toml:"rig,omitempty"`
 	// Enabled overrides whether the order is active.
 	Enabled *bool `toml:"enabled,omitempty"`
-	// Gate overrides the gate type.
-	Gate *string `toml:"gate,omitempty"`
+	// Trigger overrides the trigger type.
+	Trigger *string `toml:"trigger,omitempty"`
+	// Gate is a deprecated alias for Trigger accepted during the
+	// gate->trigger migration. Parsed inputs are normalized to Trigger.
+	Gate *string `toml:"gate,omitempty" jsonschema_extras:"deprecated=true"`
 	// Interval overrides the cooldown interval. Go duration string.
 	Interval *string `toml:"interval,omitempty"`
 	// Schedule overrides the cron expression.
 	Schedule *string `toml:"schedule,omitempty"`
-	// Check overrides the condition gate check command.
+	// Check overrides the condition trigger check command.
 	Check *string `toml:"check,omitempty"`
-	// On overrides the event gate event type.
+	// On overrides the event trigger event type.
 	On *string `toml:"on,omitempty"`
 	// Pool overrides the target session config.
 	Pool *string `toml:"pool,omitempty"`
 	// Timeout overrides the per-order timeout. Go duration string.
 	Timeout *string `toml:"timeout,omitempty"`
+}
+
+func (o *OrderOverride) normalizeLegacyAliases() {
+	if o.Trigger == nil {
+		o.Trigger = o.Gate
+	}
+	o.Gate = nil
+}
+
+func normalizeLegacyOrderOverrideAliases(cfg *City) {
+	for i := range cfg.Orders.Overrides {
+		cfg.Orders.Overrides[i].normalizeLegacyAliases()
+	}
 }
 
 // MaxTimeoutDuration parses MaxTimeout as a Go duration.
@@ -1382,8 +1402,9 @@ func (c *City) FormulasDir() string {
 
 // AgentDefaults provides city-level agent defaults declared via
 // [agent_defaults] in city.toml. The runtime currently applies
-// default_sling_formula and append_fragments; the remaining fields are
-// parsed and composed but are not yet inherited onto agents automatically.
+// default_sling_formula and uses append_fragments during prompt
+// rendering; the remaining fields are parsed and composed but are not
+// yet inherited onto agents automatically.
 type AgentDefaults struct {
 	// Model is the parsed/composed default model name for agents
 	// (e.g., "claude-sonnet-4-6"), but it is not yet auto-applied at
@@ -1423,8 +1444,38 @@ type AgentDefaults struct {
 	MCP []string `toml:"mcp,omitempty"`
 }
 
+func mergeAgentDefaultsAliasPreferCanonical(dst *AgentDefaults, src AgentDefaults, meta toml.MetaData) {
+	if !meta.IsDefined("agent_defaults", "model") {
+		dst.Model = src.Model
+	}
+	if !meta.IsDefined("agent_defaults", "wake_mode") {
+		dst.WakeMode = src.WakeMode
+	}
+	if !meta.IsDefined("agent_defaults", "default_sling_formula") {
+		dst.DefaultSlingFormula = src.DefaultSlingFormula
+	}
+	if !meta.IsDefined("agent_defaults", "allow_overlay") {
+		dst.AllowOverlay = append([]string(nil), src.AllowOverlay...)
+	}
+	if !meta.IsDefined("agent_defaults", "allow_env_override") {
+		dst.AllowEnvOverride = append([]string(nil), src.AllowEnvOverride...)
+	}
+	if !meta.IsDefined("agent_defaults", "append_fragments") {
+		dst.AppendFragments = append([]string(nil), src.AppendFragments...)
+	}
+	if !meta.IsDefined("agent_defaults", "skills") {
+		dst.Skills = append([]string(nil), src.Skills...)
+	}
+	if !meta.IsDefined("agent_defaults", "mcp") {
+		dst.MCP = append([]string(nil), src.MCP...)
+	}
+}
+
 func normalizeAgentDefaultsAlias(cfg *City, meta toml.MetaData) {
 	if meta.IsDefined("agent_defaults") {
+		if meta.IsDefined("agents") {
+			mergeAgentDefaultsAliasPreferCanonical(&cfg.AgentDefaults, cfg.AgentsDefaults, meta)
+		}
 		cfg.AgentsDefaults = AgentDefaults{}
 		return
 	}
@@ -1633,10 +1684,21 @@ type Agent struct {
 	// when beads are slung to this agent, unless --no-formula is set.
 	// Example: "mol-polecat-work"
 	DefaultSlingFormula *string `toml:"default_sling_formula,omitempty"`
+	// InheritedDefaultSlingFormula records the pack-scoped default formula for
+	// agents loaded from imported packs. City-level [agent_defaults] can still
+	// override it later because the explicit DefaultSlingFormula pointer remains
+	// nil until a higher-precedence layer sets it.
+	// Runtime-only — not persisted to TOML or JSON.
+	InheritedDefaultSlingFormula *string `toml:"-" json:"-"`
 	// InjectFragments lists named template fragments to append to this agent's
 	// rendered prompt. Fragments come from shared template directories across
 	// all loaded packs. Each name must match a {{ define "name" }} block.
 	InjectFragments []string `toml:"inject_fragments,omitempty"`
+	// InheritedAppendFragments records pack-scoped append_fragments inherited
+	// from an imported pack's [agent_defaults]. City-level append_fragments are
+	// layered separately during prompt rendering.
+	// Runtime-only — not persisted to TOML or JSON.
+	InheritedAppendFragments []string `toml:"-" json:"-"`
 	// InjectAssignedSkills controls whether gc appends an
 	// "assigned skills" appendix to the agent's rendered prompt. The
 	// appendix lists every skill visible to this agent, partitioned
@@ -1843,10 +1905,13 @@ func (a *Agent) DefaultSlingQuery() string {
 // EffectiveDefaultSlingFormula returns the default sling formula for
 // this agent, or "" if none is set.
 func (a *Agent) EffectiveDefaultSlingFormula() string {
-	if a.DefaultSlingFormula == nil {
-		return ""
+	if a.DefaultSlingFormula != nil {
+		return *a.DefaultSlingFormula
 	}
-	return *a.DefaultSlingFormula
+	if a.InheritedDefaultSlingFormula != nil {
+		return *a.InheritedDefaultSlingFormula
+	}
+	return ""
 }
 
 // DrainTimeoutDuration returns the drain timeout as a time.Duration.
@@ -2099,24 +2164,18 @@ func ApplyAgentDefaults(cfg *City) {
 // warning test can assert on its substring.
 const deprecatedAttachmentWarning = "gc: warning: attachment-list fields (`skills`, `mcp`, `skills_append`, `mcp_append`, `shared_skills`) are deprecated as of v0.15.1 and ignored. They may appear on agents, [agent_defaults], [[patches.agent]], [[rigs.overrides]], or [[rigs.patches]]. Remove them from your config (or run `gc doctor --fix` once available). Hard parse error lands in v0.16."
 
-// deprecationWarningSink is the writer used by WarnDeprecatedAttachmentFields.
-// Overridable from tests.
-var deprecationWarningSink io.Writer = os.Stderr
-
-// WarnDeprecatedAttachmentFields emits a one-time deprecation warning to
-// deprecationWarningSink (defaults to os.Stderr) if any of the v0.15.0
-// attachment-list tombstone fields appears populated anywhere in the
-// loaded config — agents, agent_defaults, patches, or rig-level overrides.
-// The check is best-effort and does not error; it only notifies the user
-// so they can clean up ahead of the v0.16 hard parse error.
-func WarnDeprecatedAttachmentFields(cfg *City) {
+// WarnDeprecatedAttachmentFields returns the canonical deprecation warning if
+// any v0.15.0 attachment-list tombstone field appears populated anywhere in
+// the loaded config — agents, agent_defaults, patches, or rig-level overrides.
+// Callers are responsible for routing the warning through their chosen sink.
+func WarnDeprecatedAttachmentFields(cfg *City) string {
 	if cfg == nil {
-		return
+		return ""
 	}
 	if !hasDeprecatedAttachmentFields(cfg) {
-		return
+		return ""
 	}
-	fmt.Fprintln(deprecationWarningSink, deprecatedAttachmentWarning) //nolint:errcheck // best-effort warning sink
+	return deprecatedAttachmentWarning
 }
 
 func hasDeprecatedAttachmentFields(cfg *City) bool {
@@ -2677,6 +2736,7 @@ func Parse(data []byte) (*City, error) {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
 	normalizeAgentDefaultsAlias(&cfg, md)
+	normalizeLegacyOrderOverrideAliases(&cfg)
 	NormalizeSessionSleepFields(&cfg)
 	// Backwards compat: promote deprecated graph_workflows → formula_v2.
 	if cfg.Daemon.GraphWorkflows && !cfg.Daemon.FormulaV2 {

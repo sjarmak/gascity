@@ -77,7 +77,7 @@ func cmdHandoff(args []string, target string, stdout, stderr io.Writer) int {
 	sp := newSessionProvider()
 	dops := newDrainOps(sp)
 	rec := openCityRecorderAt(current.cityPath, stderr)
-	cfg, _ := loadCityConfig(current.cityPath)
+	cfg, _ := loadCityConfig(current.cityPath, stderr)
 	persistRestart := sessionRestartPersister(current.cityPath, store, sp, cfg, current.sessionName)
 
 	outcome := doHandoffWithOutcome(store, rec, dops, persistRestart, current.display, current.sessionName, args, stdout, stderr)
@@ -95,7 +95,7 @@ func cmdHandoff(args []string, target string, stdout, stderr io.Writer) int {
 // cmdHandoffRemote sends handoff mail to a remote session and stops the target
 // only when the controller can restart it. Returns immediately.
 func cmdHandoffRemote(args []string, target string, stdout, stderr io.Writer) int {
-	targetInfo, err := resolveSessionRuntimeTarget(target)
+	targetInfo, err := resolveSessionRuntimeTarget(target, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc handoff: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1

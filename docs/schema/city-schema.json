@@ -971,7 +971,7 @@
         },
         "agent_defaults": {
           "$ref": "#/$defs/AgentDefaults",
-          "description": "AgentDefaults provides city-level defaults for agents that don't\noverride them (canonical TOML key: agent_defaults). The runtime\ncurrently applies default_sling_formula plus shared skill/MCP\nattachment baselines; other fields are parsed/composed but not yet\ninherited automatically."
+          "description": "AgentDefaults provides city-level defaults for agents that don't\noverride them (canonical TOML key: agent_defaults). The runtime\ncurrently applies default_sling_formula and uses append_fragments\nduring prompt rendering; other fields are parsed/composed but not\nyet inherited automatically."
         }
       },
       "additionalProperties": false,
@@ -1270,9 +1270,14 @@
           "type": "boolean",
           "description": "Enabled overrides whether the order is active."
         },
+        "trigger": {
+          "type": "string",
+          "description": "Trigger overrides the trigger type."
+        },
         "gate": {
           "type": "string",
-          "description": "Gate overrides the gate type."
+          "description": "Gate is a deprecated alias for Trigger accepted during the\ngate-\u003etrigger migration. Parsed inputs are normalized to Trigger.",
+          "deprecated": true
         },
         "interval": {
           "type": "string",
@@ -1284,11 +1289,11 @@
         },
         "check": {
           "type": "string",
-          "description": "Check overrides the condition gate check command."
+          "description": "Check overrides the condition trigger check command."
         },
         "on": {
           "type": "string",
-          "description": "On overrides the event gate event type."
+          "description": "On overrides the event trigger event type."
         },
         "pool": {
           "type": "string",

@@ -162,7 +162,7 @@ includes = ["../packs/gastown"]
 [pack]
 name = "legacy-city"
 schema = 2
-description = "silently dropped before strict migration validation"
+legacy_unknown = "silently dropped before strict migration validation"
 `)
 
 	beforeCity := readFile(t, filepath.Join(cityDir, "city.toml"))
@@ -172,8 +172,8 @@ description = "silently dropped before strict migration validation"
 	if err == nil {
 		t.Fatal("expected Apply to reject unknown pack.toml field")
 	}
-	if !strings.Contains(err.Error(), `unknown field "pack.description"`) {
-		t.Fatalf("error = %v, want unknown field detail for pack.description", err)
+	if !strings.Contains(err.Error(), `unknown field "pack.legacy_unknown"`) {
+		t.Fatalf("error = %v, want unknown field detail for pack.legacy_unknown", err)
 	}
 	if got := readFile(t, filepath.Join(cityDir, "city.toml")); got != beforeCity {
 		t.Fatalf("city.toml changed after validation failure:\n%s", got)
@@ -513,18 +513,20 @@ func TestAgentConfigFromAgentCoversPersistedFields(t *testing.T) {
 	}
 
 	omitted := map[string]bool{
-		"Name":                 true,
-		"PromptTemplate":       true,
-		"Namepool":             true,
-		"NamepoolNames":        true,
-		"OverlayDir":           true,
-		"SourceDir":            true,
-		"Implicit":             true,
-		"Fallback":             true,
-		"SleepAfterIdleSource": true,
-		"PoolName":             true,
-		"BindingName":          true,
-		"PackName":             true,
+		"Name":                         true,
+		"PromptTemplate":               true,
+		"Namepool":                     true,
+		"NamepoolNames":                true,
+		"OverlayDir":                   true,
+		"SourceDir":                    true,
+		"InheritedDefaultSlingFormula": true,
+		"InheritedAppendFragments":     true,
+		"Implicit":                     true,
+		"Fallback":                     true,
+		"SleepAfterIdleSource":         true,
+		"PoolName":                     true,
+		"BindingName":                  true,
+		"PackName":                     true,
 		// v0.15.1 tombstones — still on Agent but intentionally not propagated
 		// by migrate (removed in v0.16).
 		"Skills":       true,

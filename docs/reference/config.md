@@ -32,7 +32,7 @@ City is the top-level configuration for a Gas City instance.
 | `session_sleep` | SessionSleepConfig |  |  | SessionSleep configures idle sleep policy defaults for managed sessions. |
 | `convergence` | ConvergenceConfig |  |  | Convergence configures convergence loop limits. |
 | `service` | []Service |  |  | Services declares workspace-owned HTTP services mounted on the controller edge under /svc/&#123;name&#125;. |
-| `agent_defaults` | AgentDefaults |  |  | AgentDefaults provides city-level defaults for agents that don't override them (canonical TOML key: agent_defaults). The runtime currently applies default_sling_formula plus shared skill/MCP attachment baselines; other fields are parsed/composed but not yet inherited automatically. |
+| `agent_defaults` | AgentDefaults |  |  | AgentDefaults provides city-level defaults for agents that don't override them (canonical TOML key: agent_defaults). The runtime currently applies default_sling_formula and uses append_fragments during prompt rendering; other fields are parsed/composed but not yet inherited automatically. |
 
 ## ACPSessionConfig
 
@@ -357,11 +357,12 @@ OrderOverride modifies a scanned order's scheduling fields.
 | `name` | string | **yes** |  | Name is the order name to target (required). |
 | `rig` | string |  |  | Rig scopes the override to a specific rig's order. Empty matches city-level orders. |
 | `enabled` | boolean |  |  | Enabled overrides whether the order is active. |
-| `gate` | string |  |  | Gate overrides the gate type. |
+| `trigger` | string |  |  | Trigger overrides the trigger type. |
+| `gate` | string |  |  | Gate is a deprecated alias for Trigger accepted during the gate-&gt;trigger migration. Parsed inputs are normalized to Trigger. |
 | `interval` | string |  |  | Interval overrides the cooldown interval. Go duration string. |
 | `schedule` | string |  |  | Schedule overrides the cron expression. |
-| `check` | string |  |  | Check overrides the condition gate check command. |
-| `on` | string |  |  | On overrides the event gate event type. |
+| `check` | string |  |  | Check overrides the condition trigger check command. |
+| `on` | string |  |  | On overrides the event trigger event type. |
 | `pool` | string |  |  | Pool overrides the target session config. |
 | `timeout` | string |  |  | Timeout overrides the per-order timeout. Go duration string. |
 

@@ -79,14 +79,14 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	packPath := filepath.Join(cityRoot, packFile)
 	if packData, pErr := fs.ReadFile(packPath); pErr == nil {
 		packExists = true
-		var pc packConfig
-		md, decErr := toml.Decode(string(packData), &pc)
+		pc, md, packWarnings, decErr := parsePackConfigWithMetadata(packData, packPath)
 		if decErr != nil {
 			return nil, nil, fmt.Errorf("parsing city pack.toml: %w", decErr)
 		}
-		if warnings := CheckUndecodedKeys(md, packPath); len(warnings) > 0 {
-			return nil, nil, fmt.Errorf("parsing city pack.toml: %s", strings.Join(warnings, "; "))
+		if fatalWarnings := fatalUndecodedWarnings(md, packPath); len(fatalWarnings) > 0 {
+			return nil, nil, fmt.Errorf("parsing city pack.toml: %s", strings.Join(fatalWarnings, "; "))
 		}
+		prov.Warnings = append(prov.Warnings, packWarnings...)
 		if err := validatePackMeta(&pc.Pack); err != nil {
 			return nil, nil, fmt.Errorf("city pack.toml: %w", err)
 		}
@@ -369,6 +369,9 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	}
 	cityReqs = append(cityReqs, rootPackRequires...)
 	prov.Warnings = append(prov.Warnings, shadowWarnings...)
+	if len(root.LoadWarnings) > 0 {
+		prov.Warnings = appendUnique(prov.Warnings, root.LoadWarnings...)
+	}
 	// Track city pack agents in provenance.
 	for _, ref := range root.Workspace.Includes {
 		topoDir, _ := resolvePackRef(ref, cityRoot, cityRoot)
@@ -395,6 +398,9 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	if HasPackRigs(root.Rigs) {
 		if err := expandPacks(root, fs, cityRoot, rigFormulaDirs, opts); err != nil {
 			return nil, nil, fmt.Errorf("expanding packs: %w", err)
+		}
+		if len(root.LoadWarnings) > 0 {
+			prov.Warnings = appendUnique(prov.Warnings, root.LoadWarnings...)
 		}
 		// Track pack-expanded agents in provenance.
 		for _, r := range root.Rigs {
@@ -467,7 +473,9 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	// still populates the v0.15.0 attachment-list tombstone fields. The
 	// fields still parse (TOML won't error) but are ignored by the new
 	// materializer.
-	WarnDeprecatedAttachmentFields(root)
+	if warning := WarnDeprecatedAttachmentFields(root); warning != "" {
+		prov.Warnings = append(prov.Warnings, warning)
+	}
 
 	siteBindingWarnings, err := ApplySiteBindings(fs, cityRoot, root)
 	if err != nil {
@@ -1023,7 +1031,9 @@ func parseWithMeta(data []byte, source string) (*City, toml.MetaData, []string, 
 		return nil, md, nil, fmt.Errorf("parsing config: %w", err)
 	}
 	normalizeAgentDefaultsAlias(&cfg, md)
-	warnings := CheckUndecodedKeys(md, source)
+	warnings := agentDefaultsCompatibilityWarnings(md, source)
+	normalizeLegacyOrderOverrideAliases(&cfg)
+	warnings = append(warnings, CheckUndecodedKeys(md, source)...)
 	return &cfg, md, warnings, nil
 }
 

@@ -54,7 +54,7 @@ func doctorSkipsDoltChecks(cityPath string) bool {
 	if os.Getenv("GC_DOLT") == "skip" {
 		return true
 	}
-	cfg, err := loadCityConfig(cityPath)
+	cfg, err := loadCityConfig(cityPath, io.Discard)
 	if err != nil {
 		return !cityUsesBdStoreContract(cityPath)
 	}
@@ -130,7 +130,7 @@ func doDoctor(fix, verbose bool, stdout, stderr io.Writer) int {
 
 	// Load config for deeper checks. If it fails, we still run the core
 	// checks above (which will report the parse error).
-	cfg, cfgErr := loadCityConfig(cityPath)
+	cfg, cfgErr := loadCityConfig(cityPath, stderr)
 	if cfgErr == nil {
 		resolveRigPaths(cityPath, cfg.Rigs)
 		if workspaceUsesManagedBdStoreContract(cityPath, cfg.Rigs) {
@@ -273,7 +273,7 @@ func collectPackDirs(cfg *config.City) []string {
 // backfillRigIndex registers all rigs from the given city in the global
 // rig index and writes GT_ROOT to each rig's .beads/.env.
 func backfillRigIndex(cityPath string) error {
-	cfg, err := loadCityConfig(cityPath)
+	cfg, err := loadCityConfig(cityPath, io.Discard)
 	if err != nil {
 		return err
 	}

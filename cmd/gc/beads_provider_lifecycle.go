@@ -184,7 +184,7 @@ func desiredScopeDoltConfigStateForInit(cityPath, dir, prefix string) (contract.
 		return contract.ConfigState{}, false, nil
 	}
 	cityDolt := config.DoltConfig{}
-	if cfg, err := loadCityConfig(cityPath); err == nil {
+	if cfg, err := loadCityConfig(cityPath, io.Discard); err == nil {
 		resolveRigPaths(cityPath, cfg.Rigs)
 		cityPrefix := config.EffectiveHQPrefix(cfg)
 		cityDolt = cfg.Dolt
@@ -499,7 +499,7 @@ func forcedScopeDoltConfigStateForInit(cityPath, dir, prefix string) (contract.C
 		return contract.ConfigState{}, false, nil
 	}
 	cityDolt := config.DoltConfig{}
-	if cfg, err := loadCityConfig(cityPath); err == nil {
+	if cfg, err := loadCityConfig(cityPath, io.Discard); err == nil {
 		resolveRigPaths(cityPath, cfg.Rigs)
 		cityState := desiredCityDoltConfigState(cityPath, cfg.Dolt, config.EffectiveHQPrefix(cfg))
 		if samePath(cityPath, dir) {
@@ -581,7 +581,7 @@ func waitForAllBeadsScopesReadyAfterRecovery(cityPath string, timeout time.Durat
 	// migrated rigs (rig.path only in .gc/site.toml) are still waited
 	// for. A raw config.Load here would silently skip every migrated
 	// rig — the site binding wouldn't populate rig.Path.
-	cfg, err := loadCityConfig(cityPath)
+	cfg, err := loadCityConfig(cityPath, io.Discard)
 	if err != nil {
 		return nil
 	}

@@ -6,6 +6,11 @@
 > design captured here.
 > Read them side-by-side to see the diff.
 
+> [!IMPORTANT]
+> This document describes the pre-release Gas City v0.15.0 rollout.
+> Some PackV2 surfaces are still under active development; release-gated
+> caveats below use the form "As of release v0.15.0, ...".
+
 ## Conceptual overview
 
 V2 reframes loading around five ideas, all of which are missing or weak in
@@ -364,8 +369,8 @@ version = "^1.4"
 source = "./packs/gastown"
 
 [agent_defaults]
-provider = "claude"
-scope    = "rig"
+default_sling_formula = "mol-do-work"
+append_fragments = ["operational-awareness"]
 
 [providers.claude]
 model = "claude-sonnet-4"
@@ -568,7 +573,10 @@ visible to the city scope, including transitive re-exports):
    it under) and `PackName`.
 4. Filter by `scope`: keep `scope="city"` and unscoped agents; drop
    `scope="rig"`.
-5. Apply the pack's `[agent_defaults]` defaults to its own agents.
+5. Compose the pack's `[agent_defaults]` defaults onto its own agents.
+   As of release v0.15.0, the actively-applied defaults are narrow:
+   `default_sling_formula` plus `append_fragments` during prompt
+   rendering.
 6. Add to `City.Agents`.
 
 The city pack itself is processed last so its agents win against any
@@ -655,9 +663,12 @@ explicitly configured or referenced. This logic is unchanged from V1.
 
 ### 18. Apply agent defaults
 
-Same as V1 step 11: `[agent_defaults]` defaults from the city pack apply to all
-agents that don't override. Imported pack `[agent_defaults]` defaults apply only
-to that pack's own agents (already handled in step 11).
+Same as V1 step 11, but only for the currently implemented
+`[agent_defaults]` behavior: city-pack defaults apply to all agents that
+don't override, and imported-pack defaults apply only to that pack's own
+agents (already handled in step 11). As of release v0.15.0, the
+actively-applied defaults are still narrow: `default_sling_formula` plus
+`append_fragments` during prompt rendering.
 
 ### 19. Bind site state
 

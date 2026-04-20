@@ -29,12 +29,13 @@ const initPackSchemaVersion = 2
 const initExitAlreadyInitialized = 2
 
 type initPackMeta struct {
-	Name       string                   `toml:"name"`
-	Version    string                   `toml:"version,omitempty"`
-	Schema     int                      `toml:"schema"`
-	RequiresGC string                   `toml:"requires_gc,omitempty"`
-	Includes   []string                 `toml:"includes,omitempty"`
-	Requires   []config.PackRequirement `toml:"requires,omitempty"`
+	Name        string                   `toml:"name" jsonschema:"required"`
+	Version     string                   `toml:"version"`
+	Schema      int                      `toml:"schema" jsonschema:"required"`
+	Description string                   `toml:"description,omitempty"`
+	RequiresGC  string                   `toml:"requires_gc,omitempty"`
+	Includes    []string                 `toml:"includes,omitempty"`
+	Requires    []config.PackRequirement `toml:"requires,omitempty"`
 }
 
 type packDefaults struct {
@@ -49,19 +50,20 @@ type initPackConfig struct {
 	// Keep this layout in lockstep with internal/config.packConfig so
 	// pack.toml write paths in cmd/gc can round-trip the canonical root
 	// pack shape without dropping supported fields.
-	Pack          initPackMeta                   `toml:"pack"`
-	Imports       map[string]config.Import       `toml:"imports,omitempty"`
-	AgentDefaults config.AgentDefaults           `toml:"agent_defaults,omitempty"`
-	Defaults      packDefaults                   `toml:"defaults,omitempty"`
-	Agents        []config.Agent                 `toml:"agent"`
-	NamedSessions []config.NamedSession          `toml:"named_session,omitempty"`
-	Services      []config.Service               `toml:"service,omitempty"`
-	Providers     map[string]config.ProviderSpec `toml:"providers,omitempty"`
-	Formulas      config.FormulasConfig          `toml:"formulas,omitempty"`
-	Patches       config.Patches                 `toml:"patches,omitempty"`
-	Doctor        []config.PackDoctorEntry       `toml:"doctor,omitempty"`
-	Commands      []config.PackCommandEntry      `toml:"commands,omitempty"`
-	Global        config.PackGlobal              `toml:"global,omitempty"`
+	Pack           initPackMeta                   `toml:"pack"`
+	Imports        map[string]config.Import       `toml:"imports,omitempty"`
+	AgentDefaults  config.AgentDefaults           `toml:"agent_defaults,omitempty"`
+	AgentsDefaults config.AgentDefaults           `toml:"agents,omitempty" jsonschema:"-"`
+	Defaults       packDefaults                   `toml:"defaults,omitempty"`
+	Agents         []config.Agent                 `toml:"agent"`
+	NamedSessions  []config.NamedSession          `toml:"named_session,omitempty"`
+	Services       []config.Service               `toml:"service,omitempty"`
+	Providers      map[string]config.ProviderSpec `toml:"providers,omitempty"`
+	Formulas       config.FormulasConfig          `toml:"formulas,omitempty"`
+	Patches        config.Patches                 `toml:"patches,omitempty"`
+	Doctor         []config.PackDoctorEntry       `toml:"doctor,omitempty"`
+	Commands       []config.PackCommandEntry      `toml:"commands,omitempty"`
+	Global         config.PackGlobal              `toml:"global,omitempty"`
 }
 
 var initConventionDirs = []string{
@@ -456,8 +458,17 @@ func writeInitPackToml(fs fsys.FS, cityPath string, packCfg initPackConfig) erro
 }
 
 func marshalInitPackConfig(cfg initPackConfig) ([]byte, error) {
+	type encodedInitPackMeta struct {
+		Name        string                   `toml:"name" jsonschema:"required"`
+		Version     string                   `toml:"version,omitempty"`
+		Schema      int                      `toml:"schema" jsonschema:"required"`
+		Description string                   `toml:"description,omitempty"`
+		RequiresGC  string                   `toml:"requires_gc,omitempty"`
+		Includes    []string                 `toml:"includes,omitempty"`
+		Requires    []config.PackRequirement `toml:"requires,omitempty"`
+	}
 	type encodedInitPackConfig struct {
-		Pack          initPackMeta                   `toml:"pack"`
+		Pack          encodedInitPackMeta            `toml:"pack"`
 		Imports       map[string]config.Import       `toml:"imports,omitempty"`
 		AgentDefaults *config.AgentDefaults          `toml:"agent_defaults,omitempty"`
 		Defaults      packDefaults                   `toml:"defaults,omitempty"`
@@ -473,7 +484,15 @@ func marshalInitPackConfig(cfg initPackConfig) ([]byte, error) {
 	}
 
 	encCfg := encodedInitPackConfig{
-		Pack:          cfg.Pack,
+		Pack: encodedInitPackMeta{
+			Name:        cfg.Pack.Name,
+			Version:     cfg.Pack.Version,
+			Schema:      cfg.Pack.Schema,
+			Description: cfg.Pack.Description,
+			RequiresGC:  cfg.Pack.RequiresGC,
+			Includes:    cfg.Pack.Includes,
+			Requires:    cfg.Pack.Requires,
+		},
 		Imports:       cfg.Imports,
 		Defaults:      cfg.Defaults,
 		Agents:        cfg.Agents,
@@ -1136,7 +1155,10 @@ func doInitFromDirWithOptions(srcDir, cityPath, nameOverride string, stdout, std
 	}
 
 	// Resolve formulas and scripts from pack layers.
-	expandedCfg, _, loadErr := config.LoadWithIncludes(fsys.OSFS{}, copiedToml)
+	expandedCfg, prov, loadErr := config.LoadWithIncludes(fsys.OSFS{}, copiedToml)
+	if loadErr == nil {
+		emitLoadCityConfigWarnings(stderr, prov)
+	}
 	if loadErr == nil && len(expandedCfg.FormulaLayers.City) > 0 {
 		if rfErr := ResolveFormulas(cityPath, expandedCfg.FormulaLayers.City); rfErr != nil {
 			fmt.Fprintf(stderr, "gc init: resolving formulas: %v\n", rfErr) //nolint:errcheck // best-effort stderr
