@@ -181,24 +181,23 @@ func newAgentBuildParams(cityName, cityPath string, cfg *config.City, sp runtime
 }
 
 func (p *agentBuildParams) sharedSkillCatalogForAgent(agent *config.Agent) *materialize.CityCatalog {
-	cat, _ := p.sharedSkillCatalogSnapshotForAgent(agent)
-	return cat
+	return p.sharedSkillCatalogSnapshotForAgent(agent)
 }
 
-func (p *agentBuildParams) sharedSkillCatalogSnapshotForAgent(agent *config.Agent) (*materialize.CityCatalog, bool) {
+func (p *agentBuildParams) sharedSkillCatalogSnapshotForAgent(agent *config.Agent) *materialize.CityCatalog {
 	if p == nil || agent == nil {
-		return nil, false
+		return nil
 	}
 	rigName := agentRigScopeName(agent, p.rigs)
 	if rigName != "" && p.failedRigSkillCatalogs != nil && p.failedRigSkillCatalogs[rigName] {
-		return nil, false
+		return nil
 	}
 	if p.rigSkillCatalogs != nil && rigName != "" {
 		if cat := p.rigSkillCatalogs[rigName]; cat != nil {
-			return cat, p.rigSkillCatalogsFromCache != nil && p.rigSkillCatalogsFromCache[rigName]
+			return cat
 		}
 	}
-	return p.skillCatalog, p.skillCatalogFromCache
+	return p.skillCatalog
 }
 
 // effectiveOverlayDirs merges city-level and rig-level pack overlay dirs.

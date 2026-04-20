@@ -131,7 +131,7 @@ func materializeSkillsIntoWorkdir(cfg *config.City, agent *config.Agent, workdir
 		return nil
 	}
 
-	cityCat := materialize.CityCatalog{}
+	var cityCat materialize.CityCatalog
 	if sharedCatalog != nil {
 		cityCat = cloneCityCatalog(*sharedCatalog)
 	} else {

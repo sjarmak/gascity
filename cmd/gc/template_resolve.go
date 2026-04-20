@@ -376,7 +376,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		if p.workspace != nil {
 			wsProvider = p.workspace.Provider
 		}
-		sharedCatalog, _ := p.sharedSkillCatalogSnapshotForAgent(cfgAgent)
+		sharedCatalog := p.sharedSkillCatalogSnapshotForAgent(cfgAgent)
 		desired := effectiveSkillsForAgent(sharedCatalog, cfgAgent, wsProvider, p.providers, p.stderr)
 		if len(desired) > 0 {
 			fpExtra = mergeSkillFingerprintEntries(fpExtra, desired)
