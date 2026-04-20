@@ -1054,13 +1054,18 @@ func sessionHasOpenAssignedWorkInStore(store beads.Store, session beads.Bead) (b
 	return false, nil
 }
 
-// namedSessionActivityThreshold is the maximum age of the last reliable activity
-// reference for a named session to be considered "actively in use" for
-// config-drift deferral.
+// namedSessionActivityThreshold is the maximum age of the last reliable
+// activity reference for a named session to be considered "actively in use".
+//
+// namedSessionRecentActivityConfigDriftDeferralLimit bounds recent-activity
+// deferrals for one fixed drift episode. Recent output is only a heuristic,
+// unlike an attachment or pending interaction, so it should not hide config
+// drift indefinitely.
 const (
-	namedSessionActivityThreshold              = 2 * time.Minute
-	namedSessionConfigDriftDeferredAtMetadata  = "config_drift_deferred_at"
-	namedSessionConfigDriftDeferredKeyMetadata = "config_drift_deferred_key"
+	namedSessionActivityThreshold                      = 2 * time.Minute
+	namedSessionRecentActivityConfigDriftDeferralLimit = 30 * time.Second
+	namedSessionConfigDriftDeferredAtMetadata          = "config_drift_deferred_at"
+	namedSessionConfigDriftDeferredKeyMetadata         = "config_drift_deferred_key"
 )
 
 // namedSessionActivelyInUse returns true if a named session is currently
@@ -1083,10 +1088,26 @@ func shouldDeferNamedSessionConfigDrift(session beads.Bead, store beads.Store, s
 	if !active {
 		return "", false, nil
 	}
-	if reason != "activity_unknown" || clk == nil {
+	switch reason {
+	case "activity_unknown":
+		return boundedNamedSessionConfigDriftDeferral(session, store, clk, driftKey, reason, namedSessionActivityThreshold)
+	case "recent_activity":
+		return boundedNamedSessionConfigDriftDeferral(session, store, clk, driftKey, reason, namedSessionRecentActivityConfigDriftDeferralLimit)
+	}
+	return reason, true, nil
+}
+
+func boundedNamedSessionConfigDriftDeferral(
+	session beads.Bead,
+	store beads.Store,
+	clk clock.Clock,
+	driftKey string,
+	reason string,
+	limit time.Duration,
+) (string, bool, error) {
+	if clk == nil {
 		return reason, true, nil
 	}
-
 	now := clk.Now().UTC()
 	if session.Metadata[namedSessionConfigDriftDeferredKeyMetadata] != driftKey {
 		if err := recordNamedSessionConfigDriftDeferredAt(session, store, now, driftKey); err != nil {
@@ -1108,7 +1129,7 @@ func shouldDeferNamedSessionConfigDrift(session beads.Bead, store beads.Store, s
 		}
 		return reason, true, nil
 	}
-	if now.Sub(deferredAt) < namedSessionActivityThreshold {
+	if now.Sub(deferredAt) < limit {
 		return reason, true, nil
 	}
 	return "", false, nil

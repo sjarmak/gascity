@@ -167,9 +167,9 @@ func TestPhase0ConfigDrift_IdleNamedSessionRestartsInPlaceWithoutCapVacancy(t *t
 	}
 }
 
-func TestPhase0ConfigDrift_NamedSessionDefersWhenRecentActivity(t *testing.T) {
-	// When a named session has recent activity (within threshold),
-	// config-drift should be deferred even if not tmux-attached.
+func TestPhase0ConfigDrift_NamedSessionBoundsRecentActivityDeferral(t *testing.T) {
+	// Recent activity is a headless-use signal, but it must not let a live
+	// process loop hide one fixed config-drift episode forever.
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
@@ -222,6 +222,24 @@ func TestPhase0ConfigDrift_NamedSessionDefersWhenRecentActivity(t *testing.T) {
 	}
 	if got.Metadata["state"] == "creating" {
 		t.Fatal("state = creating; config-drift should have been deferred for session with recent activity")
+	}
+	if got.Metadata[namedSessionConfigDriftDeferredAtMetadata] == "" {
+		t.Fatal("recent-activity config-drift deferral timestamp was not recorded")
+	}
+
+	env.clk.Time = env.clk.Now().Add(namedSessionRecentActivityConfigDriftDeferralLimit + time.Second)
+	env.sp.SetActivity(sessionName, env.clk.Now().Add(-time.Second))
+	env.reconcile([]beads.Bead{got})
+
+	got, err = env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get(%s) after deferral limit: %v", session.ID, err)
+	}
+	if got.Metadata["state"] != "creating" {
+		t.Fatalf("state = %q, want creating after bounded recent-activity deferral", got.Metadata["state"])
+	}
+	if got.Metadata[namedSessionConfigDriftDeferredAtMetadata] != "" {
+		t.Fatalf("deferred timestamp = %q, want cleared after restart", got.Metadata[namedSessionConfigDriftDeferredAtMetadata])
 	}
 }
 
