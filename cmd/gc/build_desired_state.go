@@ -870,6 +870,7 @@ func desiredHasConfiguredNamedTemplate(desired map[string]TemplateParams, templa
 	}
 	return false
 }
+
 func realizePoolDesiredSessions(
 	bp *agentBuildParams,
 	cfgAgent *config.Agent,
