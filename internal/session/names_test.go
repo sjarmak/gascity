@@ -176,6 +176,37 @@ func TestEnsureSessionNameAvailable_AllowsBareVsQualifiedCoexistence(t *testing.
 	}
 }
 
+// Same multi-rig scenario via the production entry point
+// EnsureSessionNameAvailableWithConfigForOwner — the reconciler calls this path
+// (cmd/gc/session_beads.go, cmd/gc/session_template_start.go), so regression
+// coverage must include it alongside the helper-level test above.
+func TestEnsureSessionNameAvailableWithConfigForOwner_AllowsBareVsQualifiedCoexistence(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		NamedSessions: []config.NamedSession{
+			{Template: "control-dispatcher"},
+		},
+	}
+
+	for _, rig := range []string{"codeprobe", "geo"} {
+		if _, err := store.Create(beads.Bead{
+			Type:   BeadType,
+			Labels: []string{LabelSession},
+			Metadata: map[string]string{
+				"agent_name":   rig + "/control-dispatcher",
+				"template":     rig + "/control-dispatcher",
+				"session_name": rig + "--control-dispatcher",
+			},
+		}); err != nil {
+			t.Fatalf("Create(%s dispatcher): %v", rig, err)
+		}
+	}
+
+	if err := EnsureSessionNameAvailableWithConfigForOwner(store, cfg, "control-dispatcher", "", "control-dispatcher"); err != nil {
+		t.Fatalf("EnsureSessionNameAvailableWithConfigForOwner(bare vs qualified) = %v, want nil", err)
+	}
+}
+
 func TestEnsureSessionNameAvailable_RejectsLiveAliasCollisions(t *testing.T) {
 	store := beads.NewMemStore()
 	_, err := store.Create(beads.Bead{
