@@ -239,8 +239,11 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach bool,
 				"agent_name":     sessionQualifiedName,
 				"session_origin": "manual",
 			}
-			if resolved.Kind != "" && resolved.Kind != resolved.Name {
-				kindMeta["provider_kind"] = resolved.Kind
+			if family := resolvedProviderFamilyMetadata(resolved); family != "" {
+				kindMeta["provider_kind"] = family
+			}
+			if resolved.BuiltinAncestor != "" && resolved.BuiltinAncestor != resolved.Name {
+				kindMeta["builtin_ancestor"] = resolved.BuiltinAncestor
 			}
 			handle, err := newWorkerSessionHandleForResolvedRuntimeWithConfig(
 				cityPath,
@@ -319,8 +322,11 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach bool,
 		"agent_name":     sessionQualifiedName,
 		"session_origin": "manual",
 	}
-	if resolved.Kind != "" && resolved.Kind != resolved.Name {
-		kindMeta["provider_kind"] = resolved.Kind
+	if family := resolvedProviderFamilyMetadata(resolved); family != "" {
+		kindMeta["provider_kind"] = family
+	}
+	if resolved.BuiltinAncestor != "" && resolved.BuiltinAncestor != resolved.Name {
+		kindMeta["builtin_ancestor"] = resolved.BuiltinAncestor
 	}
 	handle, err := newWorkerSessionHandleForResolvedRuntimeWithConfig(
 		cityPath,
@@ -462,12 +468,7 @@ func waitForSession(sp runtime.Provider, sessionName string, timeout time.Durati
 	deadline := time.Now().Add(timeout)
 	lastProgress := time.Now()
 	for time.Now().Before(deadline) {
-		target := sessionName
-		if store != nil && beadID != "" {
-			target = beadID
-		}
-		running, err := workerSessionTargetRunningWithConfig("", store, sp, nil, target)
-		if err == nil && running {
+		if sp.IsRunning(sessionName) {
 			return nil
 		}
 		// Check for early failure: bead closed or stuck in creating.
@@ -629,9 +630,9 @@ func sessionListTitle(s session.Info) string {
 	return title
 }
 
-// attachmentCachingProvider wraps a runtime.Provider and serves attachment
-// state from a worker-populated cache so session list reason evaluation does
-// not fall back to raw runtime attachment checks.
+// attachmentCachingProvider wraps a runtime.Provider and caches IsAttached
+// results to avoid redundant tmux subprocess calls. wakeReasons calls
+// IsAttached per session, but cmdSessionList already queried it.
 type attachmentCachingProvider struct {
 	runtime.Provider
 	cache map[string]bool
@@ -648,7 +649,10 @@ func (p *attachmentCachingProvider) IsAttached(name string) bool {
 	if v, ok := p.cache[name]; ok {
 		return v
 	}
-	return false
+	if p.Provider == nil {
+		return false
+	}
+	return p.Provider.IsAttached(name)
 }
 
 func (p *attachmentCachingProvider) SleepCapability(name string) runtime.SessionSleepCapability {
@@ -658,15 +662,33 @@ func (p *attachmentCachingProvider) SleepCapability(name string) runtime.Session
 	return runtime.SessionSleepCapabilityDisabled
 }
 
-func buildAttachmentCache(sessions []session.Info, observe func(session.Info) (bool, error)) map[string]bool {
+func (p *attachmentCachingProvider) Pending(name string) (*runtime.PendingInteraction, error) {
+	if ip, ok := p.Provider.(runtime.InteractionProvider); ok {
+		return ip.Pending(name)
+	}
+	return nil, runtime.ErrInteractionUnsupported
+}
+
+func (p *attachmentCachingProvider) Respond(name string, response runtime.InteractionResponse) error {
+	if ip, ok := p.Provider.(runtime.InteractionProvider); ok {
+		return ip.Respond(name, response)
+	}
+	return runtime.ErrInteractionUnsupported
+}
+
+func buildAttachmentCache(sessions []session.Info, observe ...func(session.Info) (bool, error)) map[string]bool {
 	cache := make(map[string]bool)
+	var observeFn func(session.Info) (bool, error)
+	if len(observe) > 0 {
+		observeFn = observe[0]
+	}
 	for _, s := range sessions {
 		if s.State == "" || s.SessionName == "" {
 			continue
 		}
 		attached := s.Attached
-		if observe != nil {
-			if observed, err := observe(s); err == nil {
+		if observeFn != nil {
+			if observed, err := observeFn(s); err == nil {
 				attached = observed
 			}
 		}
@@ -900,7 +922,8 @@ func buildResumeCommand(cityPath string, cfg *config.City, info session.Info, se
 		// continue so `gc session attach` still starts the agent. The strict
 		// path is resolveTemplate at reconciler time, which fails agent
 		// creation on projection errors.
-		sa, saErr := ensureClaudeSettingsArgs(fsys.OSFS{}, cityPath, resolved.Name, stderr)
+		providerFamily := resolvedProviderLaunchFamily(resolved)
+		sa, saErr := ensureClaudeSettingsArgs(fsys.OSFS{}, cityPath, providerFamily, stderr)
 		if saErr == nil && sa != "" {
 			command = command + " " + sa
 		} else if saErr != nil {
@@ -912,7 +935,7 @@ func buildResumeCommand(cityPath string, cfg *config.City, info session.Info, se
 			// with a malformed override, attach therefore launches without
 			// --settings; on an older city with a readable prior projection,
 			// attach uses that projection.
-			if probe := settingsArgsIfReadable(cityPath, resolved.Name); probe != "" {
+			if probe := settingsArgsIfReadable(cityPath, providerFamily); probe != "" {
 				command = command + " " + probe
 			}
 		}
@@ -1275,6 +1298,7 @@ func cmdSessionPeek(args []string, lines int, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "gc session peek: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+
 	output, err := handle.Peek(context.Background(), lines)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session peek: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -1334,6 +1358,7 @@ func cmdSessionKill(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "gc session kill: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+
 	if err := handle.Kill(context.Background()); err != nil {
 		fmt.Fprintf(stderr, "gc session kill: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1441,7 +1466,7 @@ func cmdSessionSubmit(args []string, intent session.SubmitIntent, stdout, stderr
 		fmt.Fprintf(stderr, "gc session submit: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	result, err := handle.Message(context.Background(), worker.MessageRequest{
+	outcome, err := handle.Message(context.Background(), worker.MessageRequest{
 		Text:     message,
 		Delivery: workerDeliveryIntentForSubmitIntent(intent),
 	})
@@ -1449,7 +1474,7 @@ func cmdSessionSubmit(args []string, intent session.SubmitIntent, stdout, stderr
 		fmt.Fprintf(stderr, "gc session submit: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	emitSessionSubmitResult(stdout, target, intent, result.Queued)
+	emitSessionSubmitResult(stdout, target, intent, outcome.Queued)
 	return 0
 }
 
@@ -1471,7 +1496,7 @@ func cmdSessionNudge(args []string, delivery nudgeDeliveryMode, stdout, stderr i
 	target := args[0]
 	message := strings.Join(args[1:], " ")
 
-	targetInfo, err := resolveNudgeTarget(target, stderr)
+	targetInfo, err := resolveNudgeTarget(target)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1

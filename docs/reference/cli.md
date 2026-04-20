@@ -318,17 +318,23 @@ gc config
 
 | Subcommand | Description |
 |------------|-------------|
-| [gc config explain](#gc-config-explain) | Show resolved agent config with provenance annotations |
+| [gc config explain](#gc-config-explain) | Show resolved config with provenance annotations |
 | [gc config show](#gc-config-show) | Dump the resolved city configuration as TOML |
 
 ## gc config explain
 
-Show the resolved configuration for each agent with provenance.
+Show the resolved configuration with provenance.
 
-Displays every resolved field with an annotation showing which config
-file provided the value. Use --rig and --agent to filter the output.
-Useful for debugging config composition and understanding override
-resolution.
+For agents (default): displays every resolved field with an annotation
+showing which config file provided the value. Use --rig and --agent to
+filter.
+
+For providers (--provider): displays the resolved ProviderSpec along
+with per-field and per-map-key attribution — which chain layer
+(builtin:X or providers.Y) contributed each value. Useful for
+debugging base-chain inheritance.
+
+Use --json to emit machine-readable output (providers only).
 
 ```
 gc config explain [flags]
@@ -340,6 +346,8 @@ gc config explain [flags]
 gc config explain
   gc config explain --agent mayor
   gc config explain --rig my-project
+  gc config explain --provider codex-max
+  gc config explain --provider codex-max --json
   gc config explain -f overlay.toml --agent polecat
 ```
 
@@ -347,6 +355,8 @@ gc config explain
 |------|------|---------|-------------|
 | `--agent` | string |  | filter to a specific agent name |
 | `-f`, `--file` | stringArray |  | additional config files to layer (can be repeated) |
+| `--json` | bool |  | emit JSON (requires --provider) |
+| `--provider` | string |  | explain a provider's resolved chain instead of agents |
 | `--rig` | string |  | filter to agents in this rig |
 
 ## gc config show

@@ -1268,6 +1268,53 @@ func TestMaterializeNamedSession_RebrandedSingletonKeepsTemplateWorkDirIdentity(
 	}
 }
 
+func TestMaterializeNamedSessionStampsProviderFamilyMetadata(t *testing.T) {
+	fs := newSessionFakeState(t)
+	base := "builtin:claude"
+	fs.cfg.Agents = []config.Agent{{
+		Name:              "worker",
+		Dir:               "myrig",
+		Provider:          "claude-max",
+		MaxActiveSessions: intPtr(1),
+	}}
+	fs.cfg.Providers = map[string]config.ProviderSpec{
+		"claude-max": {Base: &base},
+	}
+	srv := New(fs)
+
+	spec, ok, err := srv.findNamedSessionSpecForTarget(fs.cityBeadStore, "myrig/worker")
+	if err != nil {
+		t.Fatalf("findNamedSessionSpecForTarget: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected named session spec")
+	}
+	id, err := srv.materializeNamedSession(fs.cityBeadStore, spec)
+	if err != nil {
+		t.Fatalf("materializeNamedSession: %v", err)
+	}
+	bead, err := fs.cityBeadStore.Get(id)
+	if err != nil {
+		t.Fatalf("get bead: %v", err)
+	}
+	if got := bead.Metadata["provider"]; got != "claude-max" {
+		t.Fatalf("provider = %q, want claude-max", got)
+	}
+	if got := bead.Metadata["provider_kind"]; got != "claude" {
+		t.Fatalf("provider_kind = %q, want claude", got)
+	}
+	if got := bead.Metadata["builtin_ancestor"]; got != "claude" {
+		t.Fatalf("builtin_ancestor = %q, want claude", got)
+	}
+	cfg := fs.sp.LastStartConfig(bead.Metadata["session_name"])
+	if cfg == nil {
+		t.Fatalf("Start call not recorded: %#v", fs.sp.Calls)
+	}
+	if got := cfg.Env["GC_PROVIDER"]; got != "claude" {
+		t.Fatalf("GC_PROVIDER = %q, want claude", got)
+	}
+}
+
 func TestHandleProviderSessionCreateWithMessageUsesProviderDefaultNudge(t *testing.T) {
 	fs := newSessionFakeState(t)
 	srv := New(fs)
@@ -1724,6 +1771,41 @@ func TestHandleSessionCreatePreservesInitialMessageWithOptions(t *testing.T) {
 	}
 	if parsed["effort"] != "high" {
 		t.Errorf("effort = %q, want %q", parsed["effort"], "high")
+	}
+}
+
+func TestHandleSessionMessageMaterializedNamedSessionUsesLaunchCommandDefaults(t *testing.T) {
+	fs := newSessionFakeStateWithOptions(t)
+	srv := New(fs)
+	h := newTestCityHandlerWith(t, fs, srv)
+
+	req := newPostRequest(cityURL(fs, "/session/worker/messages"), strings.NewReader(`{"message":"hello"}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	id := resp["id"]
+	if id == "" {
+		t.Fatal("response missing session id")
+	}
+
+	bead, err := fs.cityBeadStore.Get(id)
+	if err != nil {
+		t.Fatalf("Get(%q): %v", id, err)
+	}
+	cmd := bead.Metadata["command"]
+	if !strings.Contains(cmd, "--skip-permissions") {
+		t.Fatalf("command %q missing permission default", cmd)
+	}
+	if !strings.Contains(cmd, "--effort max") {
+		t.Fatalf("command %q missing effort default", cmd)
 	}
 }
 
@@ -3542,5 +3624,41 @@ func TestHandleSessionGetMetadataFiltered(t *testing.T) {
 	}
 	if _, ok := resp.Metadata["command"]; ok {
 		t.Error("command should not be exposed in API response")
+	}
+}
+
+// TestSessionToResponse_BaseOnlyDescendant_InheritsDisplayName mirrors
+// the /v0/agents base-only test for /v0/sessions: the session response
+// must pick up the builtin ancestor's DisplayName when the leaf
+// provider doesn't declare one, routed through the resolved cache.
+func TestSessionToResponse_BaseOnlyDescendant_InheritsDisplayName(t *testing.T) {
+	baseCodex := "builtin:codex"
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Providers: map[string]config.ProviderSpec{
+			"codex-max": {Base: &baseCodex}, // no DisplayName, no Command
+		},
+		ResolvedProviders: map[string]config.ResolvedProvider{
+			"codex-max": {
+				Name:            "codex-max",
+				BuiltinAncestor: "codex",
+				Command:         "codex",
+			},
+		},
+	}
+
+	info := session.Info{
+		ID:       "sess-1",
+		Template: "myrig/mayor",
+		Provider: "codex-max",
+	}
+	resp := sessionToResponse(info, cfg)
+
+	if resp.Provider != "codex-max" {
+		t.Errorf("Provider = %q, want codex-max", resp.Provider)
+	}
+	// DisplayName inherited from builtin:codex via the resolved cache.
+	if resp.DisplayName != "Codex CLI" {
+		t.Errorf("DisplayName = %q, want %q (inherited)", resp.DisplayName, "Codex CLI")
 	}
 }

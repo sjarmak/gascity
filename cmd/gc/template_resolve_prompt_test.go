@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -451,6 +452,48 @@ func TestResolveTemplateClaudeProjectsCityDotClaudeSettingsIntoRuntimeFile(t *te
 	}
 	if !strings.Contains(rendered, "SessionStart") {
 		t.Fatalf("runtime settings lost default Claude hooks:\n%s", rendered)
+	}
+}
+
+func TestResolveTemplateWrappedClaudeProjectsSettings(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, "prompts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, "prompts", "mayor.md"), []byte("mayor prompt body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := "builtin:claude"
+	providers := config.BuiltinProviders()
+	providers["claude-max"] = config.ProviderSpec{Base: &base}
+	params := &agentBuildParams{
+		fs:              fsys.OSFS{},
+		cityName:        "bright-lights",
+		cityPath:        cityPath,
+		workspace:       &config.Workspace{Name: "bright-lights", Provider: "claude-max"},
+		providers:       providers,
+		lookPath:        func(string) (string, error) { return "/usr/bin/claude", nil },
+		beaconTime:      testBeaconTime,
+		sessionTemplate: "",
+		beadNames:       make(map[string]string),
+		stderr:          io.Discard,
+	}
+	agent := &config.Agent{
+		Name:           "mayor",
+		PromptTemplate: "prompts/mayor.md",
+		Provider:       "claude-max",
+	}
+
+	tp, err := resolveTemplate(params, agent, agent.QualifiedName(), nil)
+	if err != nil {
+		t.Fatalf("resolveTemplate: %v", err)
+	}
+	wantSettings := fmt.Sprintf("--settings %q", filepath.Join(cityPath, ".gc", "settings.json"))
+	if !strings.Contains(tp.Command, wantSettings) {
+		t.Fatalf("wrapped Claude command missing settings:\n  got:  %s\n  want: ...%s...", tp.Command, wantSettings)
+	}
+	if _, err := os.Stat(filepath.Join(cityPath, ".gc", "settings.json")); err != nil {
+		t.Fatalf("resolveTemplate did not materialize wrapped Claude settings: %v", err)
 	}
 }
 

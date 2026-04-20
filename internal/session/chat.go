@@ -231,9 +231,7 @@ func (m *Manager) ensureRunning(ctx context.Context, id string, b beads.Bead, se
 		continuationEpoch,
 		instanceToken,
 	))
-	if gcProvider := strings.TrimSpace(b.Metadata["provider_kind"]); gcProvider != "" {
-		cfg.Env = mergeEnv(cfg.Env, map[string]string{"GC_PROVIDER": gcProvider})
-	} else if gcProvider := strings.TrimSpace(b.Metadata["provider"]); gcProvider != "" {
+	if gcProvider := providerKind(b); gcProvider != "" {
 		cfg.Env = mergeEnv(cfg.Env, map[string]string{"GC_PROVIDER": gcProvider})
 	}
 	cfg = runtime.SyncWorkDirEnv(cfg)

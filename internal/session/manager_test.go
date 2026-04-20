@@ -713,6 +713,78 @@ func TestCreateInjectsUnifiedSessionRuntimeEnv(t *testing.T) {
 	}
 }
 
+func TestCreateUsesBuiltinAncestorForGCProviderEnv(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManager(store, sp)
+
+	info, err := mgr.CreateAliasedNamedWithTransportAndMetadata(
+		context.Background(),
+		"mayor",
+		"test-city--mayor",
+		"reviewer",
+		"Mayor",
+		"claude",
+		"/tmp",
+		"claude-max",
+		"",
+		nil,
+		ProviderResume{},
+		runtime.Config{},
+		map[string]string{
+			"builtin_ancestor": "claude",
+			"provider_kind":    "claude-max",
+			"session_origin":   "named",
+		},
+	)
+	if err != nil {
+		t.Fatalf("CreateAliasedNamedWithTransportAndMetadata: %v", err)
+	}
+
+	cfg := sp.LastStartConfig("test-city--mayor")
+	if cfg == nil {
+		t.Fatalf("Start call not recorded: %#v", sp.Calls)
+	}
+	if got := cfg.Env["GC_PROVIDER"]; got != "claude" {
+		t.Fatalf("GC_PROVIDER = %q, want claude for %s", got, info.ID)
+	}
+}
+
+func TestAttachUsesBuiltinAncestorForGCProviderEnv(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManager(store, sp)
+	b, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name":     "test-city--worker",
+			"state":            string(StateSuspended),
+			"template":         "worker",
+			"work_dir":         "/tmp",
+			"provider":         "claude-max",
+			"provider_kind":    "claude-max",
+			"builtin_ancestor": "claude",
+		},
+	})
+	if err != nil {
+		t.Fatalf("creating session bead: %v", err)
+	}
+
+	if err := mgr.Attach(context.Background(), b.ID, "claude --resume abc", runtime.Config{}); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	cfg := sp.LastStartConfig("test-city--worker")
+	if cfg == nil {
+		t.Fatalf("Start call not recorded: %#v", sp.Calls)
+	}
+	if got := cfg.Env["GC_PROVIDER"]; got != "claude" {
+		t.Fatalf("GC_PROVIDER = %q, want claude", got)
+	}
+}
+
 func TestCreateAliaslessMultiSessionUsesConcreteRuntimeIdentity(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()

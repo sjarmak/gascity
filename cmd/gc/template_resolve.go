@@ -147,7 +147,8 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	if defaultArgs := resolved.ResolveDefaultArgs(); len(defaultArgs) > 0 {
 		command = command + " " + shellquote.Join(defaultArgs)
 	}
-	sa, err := ensureClaudeSettingsArgs(p.fs, p.cityPath, resolved.Name, p.stderr)
+	providerFamily := resolvedProviderLaunchFamily(resolved)
+	sa, err := ensureClaudeSettingsArgs(p.fs, p.cityPath, providerFamily, p.stderr)
 	if err != nil {
 		return TemplateParams{}, fmt.Errorf("agent %q: %w", qualifiedName, err)
 	}
@@ -269,7 +270,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		SlingQuery:    expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "sling_query", cfgAgent.EffectiveSlingQuery(), p.stderr),
 		Env:           cfgAgent.Env,
 	}, p.sessionTemplate, p.stderr, p.packDirs, fragments, p.beadStore)
-	hasHooks := config.AgentHasHooks(cfgAgent, p.workspace, resolved.Name)
+	hasHooks := config.AgentHasHooks(cfgAgent, p.workspace, resolved.Name, p.providers)
 	beacon := runtime.FormatBeaconAt(p.cityName, qualifiedName, !hasHooks, p.beaconTime)
 	if prompt != "" {
 		prompt = beacon + "\n\n" + prompt
@@ -300,7 +301,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		if p.workspace != nil {
 			wsProvider = p.workspace.Provider
 		}
-		provider := effectiveAgentProvider(cfgAgent, wsProvider)
+		provider := effectiveAgentProviderFamily(cfgAgent, wsProvider, p.providers)
 		if _, ok := materialize.VendorSink(provider); ok {
 			scopeRoot := agentScopeRoot(cfgAgent, p.cityPath, p.rigs)
 			canonWorkDir := canonicaliseFilePath(workDir, p.cityPath)
@@ -318,7 +319,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 						agentCat = c
 					}
 				}
-				if frag := buildAssignedSkillsPromptFragment(cfgAgent, p.sharedSkillCatalogForAgent(cfgAgent), agentCat); frag != "" {
+				if frag := buildAssignedSkillsPromptFragment(cfgAgent, p.skillCatalog, agentCat); frag != "" {
 					prompt = prompt + "\n\n" + frag
 				}
 			}
@@ -369,7 +370,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		if p.workspace != nil {
 			wsProvider = p.workspace.Provider
 		}
-		desired := effectiveSkillsForAgent(p.sharedSkillCatalogForAgent(cfgAgent), cfgAgent, wsProvider, p.stderr)
+		desired := effectiveSkillsForAgent(p.skillCatalog, cfgAgent, wsProvider, p.providers, p.stderr)
 		if len(desired) > 0 {
 			fpExtra = mergeSkillFingerprintEntries(fpExtra, desired)
 			if canonWorkDir != scopeRoot {
@@ -395,14 +396,9 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	mcpCity := p.city
 	mcpCityIsSynthetic := false
 	if mcpCity == nil {
-		// Tests sometimes construct agentBuildParams directly without
-		// setting `city`. Build a minimal synthetic config.City so
-		// non-MCP resolution still works — but mark the result and
-		// hard-error downstream if the synthetic city resolves any
-		// effective MCP. The synthetic city cannot see
-		// ExplicitImportPackDirs/ImplicitImportPackDirs/BootstrapImportPackDirs
-		// or rig import bindings, so silently returning a degraded MCP
-		// catalog would hide production divergence behind "green" tests.
+		// Tests sometimes construct agentBuildParams directly without setting
+		// city. Build a minimal synthetic config.City so non-MCP resolution still
+		// works, but hard-error if that synthetic city resolves any effective MCP.
 		mcpCityIsSynthetic = true
 		mcpCity = &config.City{
 			Providers:         p.providers,
@@ -423,25 +419,19 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		cfgAgent,
 		qualifiedName,
 		workDir,
-		resolved.Kind,
+		resolvedProviderLaunchFamily(resolved),
 	)
 	if err != nil {
 		return TemplateParams{}, fmt.Errorf("agent %q: %w", qualifiedName, err)
 	}
 	if mcpCityIsSynthetic && len(mcpCatalog.Servers) > 0 {
 		return TemplateParams{}, fmt.Errorf(
-			"agent %q: resolveTemplate invoked without config.City but resolved %d MCP server(s) — "+
+			"agent %q: resolveTemplate invoked without config.City but resolved %d MCP server(s) - "+
 				"tests exercising MCP must construct a real config.City (the synthetic fallback "+
 				"cannot see import/implicit/bootstrap layers and would diverge from production)",
 			qualifiedName, len(mcpCatalog.Servers),
 		)
 	}
-	// MCP delivery only fires when there's an actual catalog to project.
-	// An empty catalog with a supported provider kind still produces a
-	// non-empty projection shell (Provider+Target populated) but has no
-	// servers — skipping it here avoids spurious fingerprint churn and
-	// redundant `gc internal project-mcp` PreStart entries (which is what
-	// TestPhase2StartupMaterialization/WC-START-002 guards against).
 	if mcpProjection.Provider != "" && len(mcpCatalog.Servers) > 0 {
 		stage1Delivers := canStage1Materialize(p.sessionProvider, cfgAgent) && canonWorkDir == scopeRoot
 		stage2Delivers := isStage2EligibleSession(p.sessionProvider, cfgAgent) && canonWorkDir != scopeRoot
@@ -471,7 +461,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		SessionSetup:           expandedSetup,
 		SessionSetupScript:     resolvedScript,
 		SessionLive:            expandedLive,
-		ProviderName:           resolved.Kind,
+		ProviderName:           resolvedProviderLaunchFamily(resolved),
 		InstallAgentHooks:      config.ResolveInstallHooks(cfgAgent, p.workspace),
 		PackOverlayDirs:        effectiveOverlayDirs(p.packOverlayDirs, p.rigOverlayDirs, rigName),
 		OverlayDir:             overlayDir,

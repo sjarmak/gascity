@@ -2297,6 +2297,57 @@ func TestPrepareStartCandidate_PreservesRuntimeConfigAndProviderEnv(t *testing.T
 	}
 }
 
+func TestPrepareStartCandidateUsesBuiltinAncestorForGCProviderEnv(t *testing.T) {
+	store := beads.NewMemStore()
+	bead, err := store.Create(beads.Bead{
+		Title: "mayor",
+		Type:  "task",
+		Metadata: map[string]string{
+			"session_name":       "s-gc-test",
+			"template":           "mayor",
+			"session_origin":     "manual",
+			"provider":           "claude-max",
+			"provider_kind":      "claude-max",
+			"builtin_ancestor":   "claude",
+			"generation":         "1",
+			"continuation_epoch": "1",
+			"instance_token":     "tok",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create bead: %v", err)
+	}
+	tp := TemplateParams{
+		Command:     "claude",
+		WorkDir:     t.TempDir(),
+		SessionName: "s-gc-test",
+		Alias:       "mayor",
+		ResolvedProvider: &config.ResolvedProvider{
+			Name:            "claude-max",
+			Kind:            "claude",
+			BuiltinAncestor: "claude",
+		},
+		TemplateName: "mayor",
+		InstanceName: "mayor",
+	}
+
+	prepared, err := prepareStartCandidate(
+		startCandidate{
+			session: &bead,
+			tp:      tp,
+		},
+		&config.City{},
+		store,
+		clock.Real{},
+	)
+	if err != nil {
+		t.Fatalf("prepareStartCandidate: %v", err)
+	}
+	if got := prepared.cfg.Env["GC_PROVIDER"]; got != "claude" {
+		t.Fatalf("GC_PROVIDER = %q, want claude", got)
+	}
+}
+
 func TestPrepareStartCandidate_EmptyBeadAliasPreservesTemplateGCAlias(t *testing.T) {
 	store := beads.NewMemStore()
 	bead, err := store.Create(beads.Bead{

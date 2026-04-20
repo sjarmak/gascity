@@ -45,6 +45,26 @@ name = "mayor"
 	}
 }
 
+func TestLoadWithIncludes_InvalidProviderChainFailsLoad(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/city.toml"] = []byte(`
+[workspace]
+name = "test"
+
+[providers.bad]
+base = "provider:missing"
+command = "bad"
+`)
+	_, _, err := LoadWithIncludes(fs, "/city/city.toml")
+	if err == nil {
+		t.Fatal("expected LoadWithIncludes to fail for invalid provider chain")
+	}
+	if !strings.Contains(err.Error(), `provider cache build failed`) ||
+		!strings.Contains(err.Error(), `provider "bad"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestLoadWithIncludes_RootPackDefaultRigImportsPreserveOrder(t *testing.T) {
 	fs := fsys.NewFake()
 	fs.Files["/city/city.toml"] = []byte(`

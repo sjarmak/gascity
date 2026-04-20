@@ -466,6 +466,17 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 
 	// Validate cross-entity semantic constraints.
 	prov.Warnings = append(prov.Warnings, ValidateSemantics(root, path)...)
+	prov.Warnings = append(prov.Warnings, DetectLegacyProviderInheritance(root, path)...)
+
+	// Build the resolved provider cache now that compose + patch have
+	// populated the full provider table. Chain resolution errors
+	// (cycles, unknown base, wrapper-resume missing) surface here so
+	// they fail at config load rather than at session spawn. If the
+	// cache cannot be built, emit a warning and leave the cache nil —
+	// callers can still fall back to ResolveProvider per lookup.
+	if err := BuildResolvedProviderCache(root); err != nil {
+		return nil, nil, fmt.Errorf("%s: provider cache build failed: %w", path, err)
+	}
 
 	// Load namepool files for pool agents.
 	loadNamepools(fs, root, cityRoot)
@@ -821,7 +832,7 @@ func deepMergeProvider(base, frag ProviderSpec, name string, fragMeta toml.MetaD
 		},
 		{
 			"emits_permission_warning",
-			func() bool { return base.EmitsPermissionWarning },
+			func() bool { return base.EmitsPermissionWarning != nil },
 			func() { result.EmitsPermissionWarning = frag.EmitsPermissionWarning },
 		},
 	}

@@ -198,6 +198,97 @@ mode = "always"
 	}
 }
 
+func TestSyncSessionBeads_StampsProviderFamilyMetadata(t *testing.T) {
+	store := beads.NewMemStore()
+	clk := &clock.Fake{Time: time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC)}
+	sp := runtime.NewFake()
+	_ = sp.Start(context.TODO(), "mayor", runtime.Config{Command: "claude"})
+
+	ds := map[string]TemplateParams{
+		"mayor": {
+			TemplateName: "mayor",
+			Command:      "claude",
+			ResolvedProvider: &config.ResolvedProvider{
+				Name:            "claude-max",
+				Kind:            "claude",
+				BuiltinAncestor: "claude",
+			},
+		},
+	}
+
+	var stderr bytes.Buffer
+	syncSessionBeads("", store, ds, sp, allConfiguredDS(ds), nil, clk, &stderr, false)
+
+	if stderr.Len() > 0 {
+		t.Fatalf("unexpected stderr: %s", stderr.String())
+	}
+	all := allSessionBeads(t, store)
+	if len(all) != 1 {
+		t.Fatalf("expected 1 bead, got %d", len(all))
+	}
+	if got := all[0].Metadata["provider"]; got != "claude-max" {
+		t.Fatalf("provider = %q, want claude-max", got)
+	}
+	if got := all[0].Metadata["provider_kind"]; got != "claude" {
+		t.Fatalf("provider_kind = %q, want claude", got)
+	}
+	if got := all[0].Metadata["builtin_ancestor"]; got != "claude" {
+		t.Fatalf("builtin_ancestor = %q, want claude", got)
+	}
+}
+
+func TestSyncSessionBeads_BackfillsProviderFamilyMetadata(t *testing.T) {
+	store := beads.NewMemStore()
+	clk := &clock.Fake{Time: time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC)}
+	sp := runtime.NewFake()
+	_ = sp.Start(context.TODO(), "mayor", runtime.Config{Command: "claude"})
+	existing, err := store.Create(beads.Bead{
+		Title:  "mayor",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "agent:mayor"},
+		Metadata: map[string]string{
+			"session_name": "mayor",
+			"state":        "active",
+			"template":     "mayor",
+		},
+	})
+	if err != nil {
+		t.Fatalf("creating existing bead: %v", err)
+	}
+
+	ds := map[string]TemplateParams{
+		"mayor": {
+			TemplateName: "mayor",
+			Command:      "claude",
+			ResolvedProvider: &config.ResolvedProvider{
+				Name:            "claude-max",
+				Kind:            "claude",
+				BuiltinAncestor: "claude",
+			},
+		},
+	}
+
+	var stderr bytes.Buffer
+	syncSessionBeads("", store, ds, sp, allConfiguredDS(ds), nil, clk, &stderr, false)
+
+	if stderr.Len() > 0 {
+		t.Fatalf("unexpected stderr: %s", stderr.String())
+	}
+	updated, err := store.Get(existing.ID)
+	if err != nil {
+		t.Fatalf("getting existing bead: %v", err)
+	}
+	if got := updated.Metadata["provider"]; got != "claude-max" {
+		t.Fatalf("provider = %q, want claude-max", got)
+	}
+	if got := updated.Metadata["provider_kind"]; got != "claude" {
+		t.Fatalf("provider_kind = %q, want claude", got)
+	}
+	if got := updated.Metadata["builtin_ancestor"]; got != "claude" {
+		t.Fatalf("builtin_ancestor = %q, want claude", got)
+	}
+}
+
 func TestSyncSessionBeads_SetsManagedAlias(t *testing.T) {
 	store := beads.NewMemStore()
 	clk := &clock.Fake{Time: time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC)}

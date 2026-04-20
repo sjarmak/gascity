@@ -171,9 +171,9 @@ type City struct {
 	Services []Service `toml:"service,omitempty"`
 	// AgentDefaults provides city-level defaults for agents that don't
 	// override them (canonical TOML key: agent_defaults). The runtime
-	// currently applies default_sling_formula and uses append_fragments
-	// during prompt rendering; other fields are parsed/composed but not
-	// yet inherited automatically.
+	// currently applies default_sling_formula plus shared skill/MCP
+	// attachment baselines; other fields are parsed/composed but not yet
+	// inherited automatically.
 	AgentDefaults AgentDefaults `toml:"agent_defaults,omitempty"`
 	// AgentsDefaults is a temporary compatibility alias for [agent_defaults].
 	// Parse/load normalize it into AgentDefaults and prefer [agent_defaults]
@@ -205,17 +205,16 @@ type City struct {
 	PackDirs []string `toml:"-" json:"-"`
 	// PackGraphOnlyDirs is the city pack closure rooted at workspace.includes,
 	// including nested pack.includes and nested imports reached from those
-	// packs, ordered low→high precedence for MCP resolution.
-	// Runtime-only — not persisted to TOML or JSON.
+	// packs, ordered low->high precedence for MCP resolution.
 	PackGraphOnlyDirs []string `toml:"-" json:"-"`
-	// ExplicitImportPackDirs is the ordered low→high city-level explicit-import
-	// pack closure used by MCP resolution. Runtime-only.
+	// ExplicitImportPackDirs is the ordered low->high city-level explicit-import
+	// pack closure used by MCP resolution.
 	ExplicitImportPackDirs []string `toml:"-" json:"-"`
-	// ImplicitImportPackDirs is the ordered low→high city-level non-bootstrap
-	// implicit-import closure used by MCP resolution. Runtime-only.
+	// ImplicitImportPackDirs is the ordered low->high city-level non-bootstrap
+	// implicit-import closure used by MCP resolution.
 	ImplicitImportPackDirs []string `toml:"-" json:"-"`
-	// BootstrapImportPackDirs is the ordered low→high bootstrap implicit-import
-	// closure used by MCP resolution. Runtime-only.
+	// BootstrapImportPackDirs is the ordered low->high bootstrap implicit-import
+	// closure used by MCP resolution.
 	BootstrapImportPackDirs []string `toml:"-" json:"-"`
 	// RigPackDirs maps rig name to its ordered pack directories.
 	// Used when rig packs differ from city packs.
@@ -223,11 +222,10 @@ type City struct {
 	RigPackDirs map[string][]string `toml:"-" json:"-"`
 	// RigPackGraphOnlyDirs maps rig name to the rig's pack closure rooted at
 	// rig.includes, including nested pack.includes and nested imports reached
-	// from those packs, ordered low→high precedence for MCP resolution.
-	// Runtime-only.
+	// from those packs, ordered low->high precedence for MCP resolution.
 	RigPackGraphOnlyDirs map[string][]string `toml:"-" json:"-"`
 	// RigImportPackDirs maps rig name to the rig's explicit-import closure,
-	// ordered low→high precedence for MCP resolution. Runtime-only.
+	// ordered low->high precedence for MCP resolution.
 	RigImportPackDirs map[string][]string `toml:"-" json:"-"`
 	// PackOverlayDirs is the ordered list of overlay/ directories
 	// from all loaded city packs. Contents are copied to each agent's
@@ -276,20 +274,26 @@ type City struct {
 	BootstrapImportBindings map[string]bool `toml:"-" json:"-"`
 	// ExplicitImportMCPBindings records the city-level explicit-import binding
 	// that currently owns each MCP pack dir after precedence flattening.
-	// Runtime-only.
 	ExplicitImportMCPBindings map[string]string `toml:"-" json:"-"`
 	// ImplicitImportMCPBindings records the city-level non-bootstrap implicit
-	// binding that currently owns each MCP pack dir after precedence
-	// flattening. Runtime-only.
+	// binding that currently owns each MCP pack dir after precedence flattening.
 	ImplicitImportMCPBindings map[string]string `toml:"-" json:"-"`
 	// BootstrapImportMCPBindings records the bootstrap implicit-import binding
 	// that currently owns each MCP pack dir after precedence flattening.
-	// Runtime-only.
 	BootstrapImportMCPBindings map[string]string `toml:"-" json:"-"`
 	// RigImportMCPBindings records, per rig, the rig-import binding that
 	// currently owns each MCP pack dir after precedence flattening.
-	// Runtime-only.
 	RigImportMCPBindings map[string]map[string]string `toml:"-" json:"-"`
+	// ResolvedProviders is the eager-resolution cache populated by
+	// BuildResolvedProviderCache after compose + patch. Each entry
+	// represents a custom provider with its chain fully walked and
+	// merged, including BuiltinAncestor and the resolved Chain.
+	// Lookups via ResolvedProviderCached return deep-copied values so
+	// mutations don't poison the cache. Runtime-only; not persisted.
+	// Nil means the cache was never built or was invalidated (load
+	// paths should always build it; the field may be nil transiently
+	// during reload).
+	ResolvedProviders map[string]ResolvedProvider `toml:"-" json:"-"`
 }
 
 // NamedSession defines a canonical persistent session backed by an agent
@@ -1407,9 +1411,8 @@ func (c *City) FormulasDir() string {
 
 // AgentDefaults provides city-level agent defaults declared via
 // [agent_defaults] in city.toml. The runtime currently applies
-// default_sling_formula and uses append_fragments during prompt
-// rendering; the remaining fields are parsed and composed but are not
-// yet inherited onto agents automatically.
+// default_sling_formula and append_fragments; the remaining fields are
+// parsed and composed but are not yet inherited onto agents automatically.
 type AgentDefaults struct {
 	// Model is the parsed/composed default model name for agents
 	// (e.g., "claude-sonnet-4-6"), but it is not yet auto-applied at
@@ -1558,23 +1561,15 @@ type Agent struct {
 	MinActiveSessions *int `toml:"min_active_sessions,omitempty"`
 	// ScaleCheck is a shell command whose output determines desired session count.
 	// Optional override — when set, its output is the desired count (still clamped
-	// by all cap levels). If it contains Go template placeholders, gc expands them
-	// using the same PathContext fields as work_dir (Agent, AgentBase, Rig,
-	// RigRoot, CityRoot, CityName) before running the command.
+	// by all cap levels).
 	ScaleCheck string `toml:"scale_check,omitempty"`
 	// DrainTimeout is the maximum time to wait for a session to finish its
 	// current work before force-killing it during scale-down. Duration string
 	// (e.g., "5m", "30m", "1h"). Defaults to "5m".
 	DrainTimeout string `toml:"drain_timeout,omitempty" jsonschema:"default=5m"`
 	// OnBoot is a shell command run once at controller startup for this agent.
-	// If it contains Go template placeholders, gc expands them using work_dir's
-	// PathContext fields (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName)
-	// before running the command.
 	OnBoot string `toml:"on_boot,omitempty"`
 	// OnDeath is a shell command run when a session dies unexpectedly.
-	// If it contains Go template placeholders, gc expands them using work_dir's
-	// PathContext fields (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName)
-	// before running the command.
 	OnDeath string `toml:"on_death,omitempty"`
 	// Namepool is the path to a plain text file with one name per line.
 	// When set, sessions use names from the file as display aliases.
@@ -1584,10 +1579,6 @@ type Agent struct {
 	NamepoolNames []string `toml:"-"`
 	// WorkQuery is the shell command to find available work for this agent.
 	// Used by gc hook and available in prompt templates as {{.WorkQuery}}.
-	// If it contains Go template placeholders, gc expands them using work_dir's
-	// PathContext fields (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName)
-	// before probe, hook, and prompt-context execution. Prompt templates
-	// receive the expanded command, not the raw template literal.
 	// If unset, Gas City uses a three-tier default query:
 	//   1. in_progress work assigned to this session/alias (crash recovery)
 	//   2. ready work assigned to this session/alias (pre-assigned work)
@@ -1597,15 +1588,9 @@ type Agent struct {
 	WorkQuery string `toml:"work_query,omitempty"`
 	// SlingQuery is the command template to route a bead to this session config.
 	// Used by gc sling to make a bead visible to the target's work_query.
-	// Custom sling_query values may also use work_dir's PathContext fields
-	// (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName); gc expands those
-	// first, then replaces {} with the bead ID at runtime. Prompt and dry-run
-	// surfaces receive the expanded command before bead-ID substitution.
+	// The placeholder {} is replaced with the bead ID at runtime.
 	// Default for all agents:
 	// "bd update {} --set-metadata gc.routed_to=<qualified-name>".
-	// Explicit pins of that default preserve the built-in metadata-routing and
-	// idempotency fast path. bd-based custom commands with additional side
-	// effects are treated as custom and rerun when invoked.
 	// Routing is metadata-based; sling stamps the target template and the
 	// reconciler/scale_check paths decide when sessions are created.
 	// Custom sling_query and work_query can be overridden independently.
@@ -1693,7 +1678,6 @@ type Agent struct {
 	// agents loaded from imported packs. City-level [agent_defaults] can still
 	// override it later because the explicit DefaultSlingFormula pointer remains
 	// nil until a higher-precedence layer sets it.
-	// Runtime-only — not persisted to TOML or JSON.
 	InheritedDefaultSlingFormula *string `toml:"-" json:"-"`
 	// InjectFragments lists named template fragments to append to this agent's
 	// rendered prompt. Fragments come from shared template directories across
@@ -1702,7 +1686,6 @@ type Agent struct {
 	// InheritedAppendFragments records pack-scoped append_fragments inherited
 	// from an imported pack's [agent_defaults]. City-level append_fragments are
 	// layered separately during prompt rendering.
-	// Runtime-only — not persisted to TOML or JSON.
 	InheritedAppendFragments []string `toml:"-" json:"-"`
 	// InjectAssignedSkills controls whether gc appends an
 	// "assigned skills" appendix to the agent's rendered prompt. The
@@ -1901,8 +1884,7 @@ func (a *Agent) EffectiveSlingQuery() string {
 }
 
 // DefaultSlingQuery returns the built-in metadata-routing sling query for
-// this agent. Callers outside config should prefer this helper over rebuilding
-// the command string to preserve the bd boundary invariant.
+// this agent.
 func (a *Agent) DefaultSlingQuery() string {
 	return "bd update {} --set-metadata gc.routed_to=" + a.QualifiedName()
 }

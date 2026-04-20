@@ -733,6 +733,27 @@ func settingsArgsIfReadable(cityPath, providerName string) string {
 	return fmt.Sprintf("--settings %q", settingsPath)
 }
 
+func resolvedProviderLaunchFamily(resolved *config.ResolvedProvider) string {
+	if resolved == nil {
+		return ""
+	}
+	if family := strings.TrimSpace(resolved.BuiltinAncestor); family != "" {
+		return family
+	}
+	return strings.TrimSpace(resolved.Name)
+}
+
+func resolvedProviderFamilyMetadata(resolved *config.ResolvedProvider) string {
+	if resolved == nil {
+		return ""
+	}
+	name := strings.TrimSpace(resolved.Name)
+	if family := strings.TrimSpace(resolved.BuiltinAncestor); family != "" && family != name {
+		return family
+	}
+	return ""
+}
+
 // ensureClaudeSettingsArgs projects managed Claude settings to
 // .gc/settings.json (idempotent: no-op when bytes match) and returns the
 // "--settings <path>" arg for the resolved Claude command. This is the

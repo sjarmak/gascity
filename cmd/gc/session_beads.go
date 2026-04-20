@@ -55,6 +55,38 @@ func snapshotOrLoadSessionBeads(store beads.Store, sessionBeads *sessionBeadSnap
 	return loadSessionBeads(store)
 }
 
+func stampResolvedProviderSessionMetadata(meta map[string]string, resolved *config.ResolvedProvider) {
+	if meta == nil || resolved == nil {
+		return
+	}
+	name := strings.TrimSpace(resolved.Name)
+	if name != "" {
+		meta["provider"] = name
+	}
+	if family := resolvedProviderFamilyMetadata(resolved); family != "" {
+		meta["provider_kind"] = family
+	}
+	if ancestor := strings.TrimSpace(resolved.BuiltinAncestor); ancestor != "" && ancestor != name {
+		meta["builtin_ancestor"] = ancestor
+	}
+}
+
+func queueMissingResolvedProviderSessionMetadata(existing map[string]string, queue func(string, string), resolved *config.ResolvedProvider) {
+	if queue == nil || resolved == nil {
+		return
+	}
+	name := strings.TrimSpace(resolved.Name)
+	if existing["provider"] == "" && name != "" {
+		queue("provider", name)
+	}
+	if family := resolvedProviderFamilyMetadata(resolved); existing["provider_kind"] == "" && family != "" {
+		queue("provider_kind", family)
+	}
+	if ancestor := strings.TrimSpace(resolved.BuiltinAncestor); existing["builtin_ancestor"] == "" && ancestor != "" && ancestor != name {
+		queue("builtin_ancestor", ancestor)
+	}
+}
+
 func canRebindConfiguredNamedSession(b beads.Bead, identity, sessionName, backingTemplate string) bool {
 	if identity == "" || isNamedSessionBead(b) {
 		return false
@@ -665,9 +697,7 @@ func syncSessionBeadsWithSnapshot(
 				meta["command"] = tp.Command
 			}
 			if tp.ResolvedProvider != nil {
-				if tp.ResolvedProvider.Name != "" {
-					meta["provider"] = tp.ResolvedProvider.Name
-				}
+				stampResolvedProviderSessionMetadata(meta, tp.ResolvedProvider)
 				if tp.ResolvedProvider.ResumeFlag != "" {
 					meta["resume_flag"] = tp.ResolvedProvider.ResumeFlag
 				}
@@ -855,9 +885,7 @@ func syncSessionBeadsWithSnapshot(
 			queueMeta("command", tp.Command)
 		}
 		if tp.ResolvedProvider != nil {
-			if b.Metadata["provider"] == "" && tp.ResolvedProvider.Name != "" {
-				queueMeta("provider", tp.ResolvedProvider.Name)
-			}
+			queueMissingResolvedProviderSessionMetadata(b.Metadata, queueMeta, tp.ResolvedProvider)
 			if b.Metadata["resume_flag"] == "" && tp.ResolvedProvider.ResumeFlag != "" {
 				queueMeta("resume_flag", tp.ResolvedProvider.ResumeFlag)
 			}

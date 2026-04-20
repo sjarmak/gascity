@@ -117,7 +117,7 @@ func TestInstallClaude(t *testing.T) {
 
 func TestInstallClaudeUpgradesStaleGeneratedFile(t *testing.T) {
 	fs := fsys.NewFake()
-	current, err := readEmbedded()
+	current, err := readEmbedded("config/claude.json")
 	if err != nil {
 		t.Fatalf("readEmbedded: %v", err)
 	}
@@ -259,7 +259,7 @@ func TestInstallClaudeTolerantToUnreadableLegacyCandidate(t *testing.T) {
 // override the user's chosen source.
 func TestInstallClaudePinnedHookFileOutranksRuntime(t *testing.T) {
 	fs := fsys.NewFake()
-	base, err := readEmbedded()
+	base, err := readEmbedded("config/claude.json")
 	if err != nil {
 		t.Fatalf("readEmbedded: %v", err)
 	}
@@ -518,6 +518,8 @@ func TestInstallOverlayManagedProviders(t *testing.T) {
 
 func TestInstallMultipleProviders(t *testing.T) {
 	fs := fsys.NewFake()
+	// Claude writes city-level files; overlay-managed names write their
+	// provider hook files into workDir.
 	err := Install(fs, "/city", "/work", []string{"claude", "codex", "gemini", "copilot"})
 	if err != nil {
 		t.Fatalf("Install: %v", err)
@@ -597,10 +599,11 @@ func TestSupportsHooksSyncWithProviderSpec(t *testing.T) {
 
 	providers := config.BuiltinProviders()
 	for name, spec := range providers {
-		if spec.SupportsHooks && !sup[name] {
+		supports := spec.SupportsHooks != nil && *spec.SupportsHooks
+		if supports && !sup[name] {
 			t.Errorf("provider %q has SupportsHooks=true but is not in hooks.SupportedProviders()", name)
 		}
-		if !spec.SupportsHooks && sup[name] {
+		if !supports && sup[name] {
 			t.Errorf("provider %q is in hooks.SupportedProviders() but has SupportsHooks=false", name)
 		}
 	}

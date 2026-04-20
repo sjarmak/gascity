@@ -32,7 +32,7 @@ City is the top-level configuration for a Gas City instance.
 | `session_sleep` | SessionSleepConfig |  |  | SessionSleep configures idle sleep policy defaults for managed sessions. |
 | `convergence` | ConvergenceConfig |  |  | Convergence configures convergence loop limits. |
 | `service` | []Service |  |  | Services declares workspace-owned HTTP services mounted on the controller edge under /svc/&#123;name&#125;. |
-| `agent_defaults` | AgentDefaults |  |  | AgentDefaults provides city-level defaults for agents that don't override them (canonical TOML key: agent_defaults). The runtime currently applies default_sling_formula and uses append_fragments during prompt rendering; other fields are parsed/composed but not yet inherited automatically. |
+| `agent_defaults` | AgentDefaults |  |  | AgentDefaults provides city-level defaults for agents that don't override them (canonical TOML key: agent_defaults). The runtime currently applies default_sling_formula plus shared skill/MCP attachment baselines; other fields are parsed/composed but not yet inherited automatically. |
 
 ## ACPSessionConfig
 
@@ -83,13 +83,13 @@ Agent defines a configured agent in the city.
 | `option_defaults` | map[string]string |  |  | OptionDefaults overrides the provider's effective schema defaults for this agent. Keys are option keys, values are choice values. Applied on top of the provider's OptionDefaults (agent keys win). Example: option_defaults = &#123; permission_mode = "plan", model = "sonnet" &#125; |
 | `max_active_sessions` | integer |  |  | MaxActiveSessions is the agent-level cap on concurrent sessions. Nil means inherit from rig, then workspace, then unlimited. Replaces pool.max. |
 | `min_active_sessions` | integer |  |  | MinActiveSessions is the minimum number of sessions to keep alive. Agent-level only. Counts against rig/workspace caps. Replaces pool.min. |
-| `scale_check` | string |  |  | ScaleCheck is a shell command whose output determines desired session count. Optional override — when set, its output is the desired count (still clamped by all cap levels). If it contains Go template placeholders, gc expands them using the same PathContext fields as work_dir (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName) before running the command. |
+| `scale_check` | string |  |  | ScaleCheck is a shell command whose output determines desired session count. Optional override — when set, its output is the desired count (still clamped by all cap levels). |
 | `drain_timeout` | string |  | `5m` | DrainTimeout is the maximum time to wait for a session to finish its current work before force-killing it during scale-down. Duration string (e.g., "5m", "30m", "1h"). Defaults to "5m". |
-| `on_boot` | string |  |  | OnBoot is a shell command run once at controller startup for this agent. If it contains Go template placeholders, gc expands them using work_dir's PathContext fields (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName) before running the command. |
-| `on_death` | string |  |  | OnDeath is a shell command run when a session dies unexpectedly. If it contains Go template placeholders, gc expands them using work_dir's PathContext fields (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName) before running the command. |
+| `on_boot` | string |  |  | OnBoot is a shell command run once at controller startup for this agent. |
+| `on_death` | string |  |  | OnDeath is a shell command run when a session dies unexpectedly. |
 | `namepool` | string |  |  | Namepool is the path to a plain text file with one name per line. When set, sessions use names from the file as display aliases. |
-| `work_query` | string |  |  | WorkQuery is the shell command to find available work for this agent. Used by gc hook and available in prompt templates as &#123;&#123;.WorkQuery&#125;&#125;. If it contains Go template placeholders, gc expands them using work_dir's PathContext fields (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName) before probe, hook, and prompt-context execution. Prompt templates receive the expanded command, not the raw template literal. If unset, Gas City uses a three-tier default query:   1. in_progress work assigned to this session/alias (crash recovery)   2. ready work assigned to this session/alias (pre-assigned work)   3. ready unassigned work with gc.routed_to=&lt;qualified-name&gt; When the controller probes for demand without session context, only the routed_to tier applies. Override to integrate with external task systems. |
-| `sling_query` | string |  |  | SlingQuery is the command template to route a bead to this session config. Used by gc sling to make a bead visible to the target's work_query. Custom sling_query values may also use work_dir's PathContext fields (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName); gc expands those first, then replaces &#123;&#125; with the bead ID at runtime. Prompt and dry-run surfaces receive the expanded command before bead-ID substitution. Default for all agents: "bd update &#123;&#125; --set-metadata gc.routed_to=&lt;qualified-name&gt;". Explicit pins of that default preserve the built-in metadata-routing and idempotency fast path. bd-based custom commands with additional side effects are treated as custom and rerun when invoked. Routing is metadata-based; sling stamps the target template and the reconciler/scale_check paths decide when sessions are created. Custom sling_query and work_query can be overridden independently. |
+| `work_query` | string |  |  | WorkQuery is the shell command to find available work for this agent. Used by gc hook and available in prompt templates as &#123;&#123;.WorkQuery&#125;&#125;. If unset, Gas City uses a three-tier default query:   1. in_progress work assigned to this session/alias (crash recovery)   2. ready work assigned to this session/alias (pre-assigned work)   3. ready unassigned work with gc.routed_to=&lt;qualified-name&gt; When the controller probes for demand without session context, only the routed_to tier applies. Override to integrate with external task systems. |
+| `sling_query` | string |  |  | SlingQuery is the command template to route a bead to this session config. Used by gc sling to make a bead visible to the target's work_query. The placeholder &#123;&#125; is replaced with the bead ID at runtime. Default for all agents: "bd update &#123;&#125; --set-metadata gc.routed_to=&lt;qualified-name&gt;". Routing is metadata-based; sling stamps the target template and the reconciler/scale_check paths decide when sessions are created. Custom sling_query and work_query can be overridden independently. |
 | `idle_timeout` | string |  |  | IdleTimeout is the maximum time an agent session can be inactive before the controller kills and restarts it. Duration string (e.g., "15m", "1h"). Empty (default) disables idle checking. |
 | `sleep_after_idle` | string |  |  | SleepAfterIdle overrides idle sleep policy for this agent. Accepts a duration string (e.g., "30s") or "off". |
 | `install_agent_hooks` | []string |  |  | InstallAgentHooks overrides workspace-level install_agent_hooks for this agent. When set, replaces (not adds to) the workspace default. |
@@ -420,6 +420,7 @@ ProviderOption declares a single configurable option for a provider.
 | `type` | string | **yes** |  | "select" only (v1) |
 | `default` | string | **yes** |  |  |
 | `choices` | []OptionChoice | **yes** |  |  |
+| `omit` | boolean |  |  | Omit is the removal sentinel for options_schema_merge = "by_key". When set on a child layer's entry, the matching Key inherited from a parent layer is pruned from the resolved schema. |
 
 ## ProviderPatch
 
@@ -428,8 +429,11 @@ ProviderPatch modifies an existing provider identified by Name.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `name` | string | **yes** |  | Name is the targeting key (required). Must match an existing provider's name. |
+| `base` | string |  |  | Base overrides the provider's inheritance parent (presence-aware). Pointer to a pointer so the patch can distinguish "no change" (double-nil) from "clear to inherit default" (single-nil value in outer pointer) from "set to explicit empty opt-out" (value "" in inner pointer) from "set to &lt;name&gt;". Callers use:   nil          = patch does not touch Base   &(*string)(nil) = patch clears Base to absent   &(&"")       = patch sets Base = "" (explicit opt-out)   &(&"builtin:codex") = patch sets Base to that value |
 | `command` | string |  |  | Command overrides the provider command. |
 | `args` | []string |  |  | Args overrides the provider args. |
+| `args_append` | []string |  |  | ArgsAppend overrides the provider args_append list. |
+| `options_schema_merge` | string |  |  | OptionsSchemaMerge overrides the options_schema merge mode. |
 | `prompt_mode` | string |  |  | PromptMode overrides prompt delivery mode. Enum: `arg`, `flag`, `none` |
 | `prompt_flag` | string |  |  | PromptFlag overrides the prompt flag. |
 | `ready_delay_ms` | integer |  |  | ReadyDelayMs overrides the ready delay in milliseconds. |
@@ -443,6 +447,9 @@ ProviderSpec defines a named provider's startup parameters.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
+| `base` | string |  |  | Base names the parent provider this spec inherits from. Supported forms:   "&lt;name&gt;"          - custom first (self-excluded), then built-in   "builtin:&lt;name&gt;"  - force built-in lookup   "provider:&lt;name&gt;" - force custom lookup   ""                - explicit standalone opt-out   nil               - field absent; no explicit declaration |
+| `args_append` | []string |  |  | ArgsAppend accumulates extra args after each layer's Args replacement. |
+| `options_schema_merge` | string |  |  | OptionsSchemaMerge controls OptionsSchema merge mode across the chain: "replace" (default) or "by_key". Enum: `replace`, `by_key` |
 | `display_name` | string |  |  | DisplayName is the human-readable name shown in UI and logs. |
 | `command` | string |  |  | Command is the executable to run for this provider. |
 | `args` | []string |  |  | Args are default command-line arguments passed to the provider. |
@@ -451,7 +458,7 @@ ProviderSpec defines a named provider's startup parameters.
 | `ready_delay_ms` | integer |  |  | ReadyDelayMs is milliseconds to wait after launch before the provider is considered ready. |
 | `ready_prompt_prefix` | string |  |  | ReadyPromptPrefix is the string prefix that indicates the provider is ready for input. |
 | `process_names` | []string |  |  | ProcessNames lists process names to look for when checking if the provider is running. |
-| `emits_permission_warning` | boolean |  |  | EmitsPermissionWarning indicates whether the provider emits permission prompts. |
+| `emits_permission_warning` | boolean |  |  | EmitsPermissionWarning is tri-state: nil = inherit, &true = enable, &false = explicit disable. |
 | `env` | map[string]string |  |  | Env sets additional environment variables for the provider process. |
 | `path_check` | string |  |  | PathCheck overrides the binary name used for PATH detection. When set, lookupProvider and detectProviderName use this instead of Command for exec.LookPath checks. Useful when Command is a shell wrapper (e.g. sh -c '...') but we need to verify the real binary is installed. |
 | `supports_acp` | boolean |  |  | SupportsACP indicates the binary speaks the Agent Client Protocol (JSON-RPC 2.0 over stdio). When an agent sets session = "acp", its resolved provider must have SupportsACP = true. |

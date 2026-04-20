@@ -592,6 +592,33 @@ func TestBuildResumeCommandIncludesSettingsAndDefaultArgs(t *testing.T) {
 	}
 }
 
+func TestBuildResumeCommandUsesBuiltinAncestorForClaudeSettings(t *testing.T) {
+	cityDir := t.TempDir()
+	base := "builtin:claude"
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "mayor", Provider: "claude-max"},
+		},
+		Providers: map[string]config.ProviderSpec{
+			"claude-max": {Base: &base},
+		},
+	}
+	info := session.Info{
+		Template: "mayor",
+		Command:  "claude",
+		Provider: "claude-max",
+		WorkDir:  "/tmp/workdir",
+	}
+
+	cmd, _ := buildResumeCommand(cityDir, cfg, info, "", io.Discard)
+
+	wantSettings := fmt.Sprintf("--settings %q", filepath.Join(cityDir, ".gc", "settings.json"))
+	if !strings.Contains(cmd, wantSettings) {
+		t.Fatalf("wrapped Claude resume command missing settings:\n  got:  %s\n  want: ...%s...", cmd, wantSettings)
+	}
+}
+
 func TestSessionReason_FallsThroughToProviderForSleepingAttachment(t *testing.T) {
 	provider := runtime.NewFake()
 	if err := provider.Start(context.Background(), "sleeping-worker", runtime.Config{Command: "echo"}); err != nil {

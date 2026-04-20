@@ -4370,9 +4370,22 @@
               "null"
             ]
           },
+          "args_append": {
+            "description": "Arguments appended after inherited/base args.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "base": {
+            "description": "Optional provider base for inheritance.",
+            "type": "string"
+          },
           "command": {
-            "description": "Provider command binary.",
-            "minLength": 1,
+            "description": "Provider command binary. Omit for base-only descendants.",
             "type": "string"
           },
           "display_name": {
@@ -4391,6 +4404,10 @@
             "minLength": 1,
             "type": "string"
           },
+          "options_schema_merge": {
+            "description": "Options schema merge mode across inheritance chain.",
+            "type": "string"
+          },
           "prompt_flag": {
             "description": "Flag for prompt delivery.",
             "type": "string"
@@ -4406,8 +4423,7 @@
           }
         },
         "required": [
-          "name",
-          "command"
+          "name"
         ],
         "type": "object"
       },
@@ -4478,6 +4494,21 @@
               "null"
             ]
           },
+          "ArgsAppend": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "Base": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "Command": {
             "type": [
               "string",
@@ -4501,6 +4532,12 @@
           },
           "Name": {
             "type": "string"
+          },
+          "OptionsSchemaMerge": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "PromptFlag": {
             "type": [
@@ -4527,8 +4564,11 @@
         },
         "required": [
           "Name",
+          "Base",
           "Command",
           "Args",
+          "ArgsAppend",
+          "OptionsSchemaMerge",
           "PromptMode",
           "PromptFlag",
           "ReadyDelayMs",
@@ -4781,6 +4821,20 @@
               "null"
             ]
           },
+          "args_append": {
+            "description": "Arguments appended after inherited/base args.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "base": {
+            "description": "Provider base for inheritance.",
+            "type": "string"
+          },
           "command": {
             "description": "Provider command binary.",
             "type": "string"
@@ -4795,6 +4849,10 @@
             },
             "description": "Environment variables.",
             "type": "object"
+          },
+          "options_schema_merge": {
+            "description": "Options schema merge mode across inheritance chain.",
+            "type": "string"
           },
           "prompt_flag": {
             "description": "Flag for prompt delivery.",
