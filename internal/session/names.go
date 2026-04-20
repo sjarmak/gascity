@@ -380,9 +380,6 @@ func sessionNameConflictsWithExistingIdentifier(b beads.Bead, name string) bool 
 		if field == name {
 			return true
 		}
-		if !strings.Contains(name, "/") && strings.HasSuffix(field, "/"+name) {
-			return true
-		}
 	}
 	return false
 }
