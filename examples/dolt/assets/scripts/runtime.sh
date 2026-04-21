@@ -48,6 +48,28 @@ read_runtime_state_string() (
   sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$state_file" 2>/dev/null | head -1 || true
 )
 
+managed_runtime_tcp_reachable() (
+  port="$1"
+
+  case "$port" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+  esac
+
+  if command -v nc >/dev/null 2>&1; then
+    nc -z 127.0.0.1 "$port" >/dev/null 2>&1
+    return $?
+  fi
+
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+    return $?
+  fi
+
+  return 1
+)
+
 managed_runtime_port() (
   state_file="$1"
   expected_data_dir="$2"
@@ -67,9 +89,10 @@ managed_runtime_port() (
 
   if command -v lsof >/dev/null 2>&1; then
     holder_pid=$(lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1 || true)
-    [ -n "$holder_pid" ] || return 0
-    [ "$holder_pid" = "$pid" ] || return 0
-  else
+    [ -n "$holder_pid" ] && [ "$holder_pid" != "$pid" ] && return 0
+  fi
+
+  if ! managed_runtime_tcp_reachable "$port"; then
     return 0
   fi
 

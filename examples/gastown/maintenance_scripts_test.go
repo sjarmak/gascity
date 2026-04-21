@@ -239,6 +239,94 @@ exit 0
 	}
 }
 
+func TestMaintenanceDoltScriptsFallbackToManagedRuntimePortsWithInconclusiveLsof(t *testing.T) {
+	scripts := []struct {
+		name   string
+		script string
+		env    map[string]string
+	}{
+		{
+			name:   "reaper",
+			script: filepath.Join("packs", "maintenance", "assets", "scripts", "reaper.sh"),
+			env: map[string]string{
+				"GC_REAPER_DRY_RUN": "1",
+			},
+		},
+		{
+			name:   "jsonl export",
+			script: filepath.Join("packs", "maintenance", "assets", "scripts", "jsonl-export.sh"),
+			env: map[string]string{
+				"GC_JSONL_ARCHIVE_REPO":      "archive",
+				"GC_JSONL_MAX_PUSH_FAILURES": "99",
+			},
+		},
+	}
+
+	for _, tt := range scripts {
+		t.Run(tt.name, func(t *testing.T) {
+			cityDir := t.TempDir()
+			binDir := t.TempDir()
+			doltLog := filepath.Join(t.TempDir(), "dolt-args.log")
+
+			listener := listenManagedDoltPort(t)
+			wantPort := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+			writeManagedRuntimeState(t, cityDir, listener.Addr().(*net.TCPAddr).Port)
+
+			writeMaintenanceDoltStub(t, filepath.Join(binDir, "dolt"))
+			writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+exit 0
+`)
+			writeExecutable(t, filepath.Join(binDir, "lsof"), `#!/bin/sh
+exit 0
+`)
+			writeExecutable(t, filepath.Join(binDir, "nc"), `#!/bin/sh
+host="$2"
+port="$3"
+if [ "$1" = "-z" ] && [ "$host" = "127.0.0.1" ] && [ "$port" = "`+wantPort+`" ]; then
+  exit 0
+fi
+exit 1
+`)
+
+			env := map[string]string{
+				"DOLT_ARGS_LOG":       doltLog,
+				"GC_CITY":             cityDir,
+				"GC_CITY_PATH":        cityDir,
+				"GC_DOLT_HOST":        "",
+				"GC_DOLT_PORT":        "",
+				"GC_DOLT_USER":        "",
+				"GC_DOLT_PASSWORD":    "",
+				"GIT_CONFIG_GLOBAL":   filepath.Join(t.TempDir(), "gitconfig"),
+				"GIT_CONFIG_NOSYSTEM": "1",
+				"PATH":                binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+			}
+			for key, value := range tt.env {
+				if key == "GC_JSONL_ARCHIVE_REPO" {
+					value = filepath.Join(cityDir, value)
+				}
+				env[key] = value
+			}
+
+			runScript(t, filepath.Join(exampleDir(), tt.script), env)
+
+			logData, err := os.ReadFile(doltLog)
+			if err != nil {
+				t.Fatalf("ReadFile(dolt log): %v", err)
+			}
+			log := string(logData)
+			for _, want := range []string{
+				"--host 127.0.0.1",
+				"--port " + wantPort,
+				"--user root",
+			} {
+				if !strings.Contains(log, want) {
+					t.Fatalf("dolt calls missing %q:\n%s", want, log)
+				}
+			}
+		})
+	}
+}
+
 func TestMaintenanceDoltScriptsRejectInvalidManagedPort(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
