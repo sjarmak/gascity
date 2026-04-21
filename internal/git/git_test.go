@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	_ "github.com/gastownhall/gascity/internal/testenv"
 	"github.com/gastownhall/gascity/internal/testutil"
 )
 

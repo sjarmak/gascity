@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func TestMatchedDeprecatedKey(t *testing.T) {

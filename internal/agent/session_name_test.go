@@ -1,6 +1,10 @@
 package agent
 
-import "testing"
+import (
+	"testing"
+
+	_ "github.com/gastownhall/gascity/internal/testenv"
+)
 
 func TestSanitizeQualifiedNameForSession(t *testing.T) {
 	tests := []struct {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func TestMigrateCityCommonCase(t *testing.T) {

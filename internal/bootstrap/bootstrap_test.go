@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func TestEnsureBootstrapLeavesFreshHomesAlone(t *testing.T) {

@@ -1,6 +1,10 @@
 package mail
 
-import "testing"
+import (
+	"testing"
+
+	_ "github.com/gastownhall/gascity/internal/testenv"
+)
 
 func TestResolveRecipientHuman(t *testing.T) {
 	got, err := ResolveRecipient("human", nil)

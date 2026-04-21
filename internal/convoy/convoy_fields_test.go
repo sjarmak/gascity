@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func TestApplyConvoyFields(t *testing.T) {

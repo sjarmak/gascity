@@ -19,6 +19,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 // healthScript is the on-disk path to the health command script. The

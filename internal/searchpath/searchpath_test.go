@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func TestExpandIncludesUserLocalAndBasePath(t *testing.T) {

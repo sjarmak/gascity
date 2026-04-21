@@ -9,6 +9,7 @@ import (
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 // fakeAdoptionProvider implements runtime.Provider for adoption barrier tests.

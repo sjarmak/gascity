@@ -10,6 +10,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/beadstest"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func TestBrProviderConformance(t *testing.T) {

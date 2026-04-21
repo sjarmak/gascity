@@ -9,6 +9,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/configedit"
 	"github.com/gastownhall/gascity/internal/fsys"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 // minimalCity returns a minimal valid city.toml with one agent.

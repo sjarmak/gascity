@@ -12,6 +12,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/runtime/runtimetest"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 // Compile-time check.

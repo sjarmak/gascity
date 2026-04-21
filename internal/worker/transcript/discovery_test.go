@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/sessionlog"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func TestDiscoverPathPrefersClaudeSessionID(t *testing.T) {

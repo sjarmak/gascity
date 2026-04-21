@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads/contract"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func TestAuthScopeRoot(t *testing.T) {

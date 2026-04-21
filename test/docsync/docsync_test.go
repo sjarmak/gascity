@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/docgen"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func repoRoot() string {

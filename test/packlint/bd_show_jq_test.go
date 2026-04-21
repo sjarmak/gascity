@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func repoRoot() string {

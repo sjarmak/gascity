@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 // TestGeneratedClientInSync regenerates client_gen.go from the live spec

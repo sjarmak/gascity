@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/fsys"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func TestAgentDiscovery_BasicDirectory(t *testing.T) {

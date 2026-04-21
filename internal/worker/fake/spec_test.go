@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func TestLoadProfileJSON(t *testing.T) {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func claudeHookCommand(t *testing.T, data []byte, event string) string {

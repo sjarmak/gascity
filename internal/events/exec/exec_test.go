@@ -12,6 +12,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/events/eventstest"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 // writeScript creates an executable shell script in dir and returns its path.

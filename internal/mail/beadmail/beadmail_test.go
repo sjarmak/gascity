@@ -7,6 +7,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/mail"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 // noListScanStore errors when List is called without a filter, proving that

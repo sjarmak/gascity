@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 // TestCacheKeyAlignment verifies that packman.RepoCacheKey and

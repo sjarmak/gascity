@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func TestBeadsScriptEnsureReadyDoesNotAutoInitSharedWorkspace(t *testing.T) {
@@ -58,6 +60,7 @@ func TestBeadsScriptInitUsesScopeRootAndCanonicalDoltTarget(t *testing.T) {
 }
 
 func TestBeadsScriptInitRejectsPartialCanonicalDoltTarget(t *testing.T) {
+	clearDoltAndCityEnv(t)
 	result := runBeadsScript(t, beadsScriptOptions{
 		Op:   "init",
 		Args: []string{"/city/frontend", "fe"},

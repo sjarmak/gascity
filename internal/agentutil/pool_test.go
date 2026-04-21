@@ -6,6 +6,8 @@ import (
 
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
+
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 type partialSessionLister struct {

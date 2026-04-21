@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 var _ runtime.Provider = (*Provider)(nil)

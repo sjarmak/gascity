@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 // writeAgentSkill creates a skill directory under baseSkillsDir with the

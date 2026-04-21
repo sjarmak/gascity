@@ -1,6 +1,10 @@
 package deps
 
-import "testing"
+import (
+	"testing"
+
+	_ "github.com/gastownhall/gascity/internal/testenv"
+)
 
 func TestCompareVersions(t *testing.T) {
 	tests := []struct {

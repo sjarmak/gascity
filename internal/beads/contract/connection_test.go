@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/fsys"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func TestResolveDoltConnectionTargetManagedCity(t *testing.T) {

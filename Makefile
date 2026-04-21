@@ -123,11 +123,36 @@ fmt: $(GOLANGCI_LINT)
 vet:
 	go vet ./...
 
+## TEST_ENV: env -i wrapper for `go test` invocations. Strips host env so
+## agent-session vars (GC_CITY, GC_HOME, GC_SESSION_ID, ...) cannot leak into
+## tests and corrupt live cities. Only the allowlist below survives. To opt
+## extra vars through, set EXTRA_TEST_ENV='FOO=bar BAZ=qux' on the make line.
+## See PR #746.
+GOPATH_VAL    := $(shell go env GOPATH)
+GOCACHE_VAL   := $(shell go env GOCACHE)
+GOMODCACHE_VAL := $(shell go env GOMODCACHE)
+GOTMPDIR_VAL  := $(shell go env GOTMPDIR)
+TEST_ENV = env -i \
+	PATH="$$PATH" \
+	HOME="$$HOME" \
+	USER="$$USER" \
+	LOGNAME="$$LOGNAME" \
+	SHELL="$$SHELL" \
+	LANG="$$LANG" \
+	TMPDIR="$${TMPDIR:-/tmp}" \
+	XDG_RUNTIME_DIR="$$XDG_RUNTIME_DIR" \
+	GOPATH="$(GOPATH_VAL)" \
+	GOCACHE="$(GOCACHE_VAL)" \
+	GOMODCACHE="$(GOMODCACHE_VAL)" \
+	GOTMPDIR="$(GOTMPDIR_VAL)" \
+	$(EXTRA_TEST_ENV)
+
 ## test: run fast unit tests (skip integration-tagged and GC_FAST_UNIT-gated process tests)
 ## The skipped cmd/gc process-backed scenarios remain covered by
 ## `make test-cmd-gc-process` locally and the CI `test-integration-packages` shard.
+## Wrapped in $(TEST_ENV) — see comment above for why.
 test:
-	GC_FAST_UNIT=1 go test ./...
+	$(TEST_ENV) GC_FAST_UNIT=1 go test ./...
 
 ## test-cmd-gc-process: run the full non-short cmd/gc suite, including the
 ## process-backed lifecycle coverage routed out of the default fast loop

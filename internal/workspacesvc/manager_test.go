@@ -22,6 +22,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/supervisor"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 var uniqueContractSeq atomic.Uint64

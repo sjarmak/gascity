@@ -2,7 +2,11 @@
 
 package tutorialgoldens
 
-import "testing"
+import (
+	"testing"
+
+	_ "github.com/gastownhall/gascity/internal/testenv"
+)
 
 func TestClaudeStatusOutputLoggedIn(t *testing.T) {
 	t.Parallel()

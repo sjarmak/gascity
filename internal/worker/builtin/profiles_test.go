@@ -1,6 +1,10 @@
 package builtin
 
-import "testing"
+import (
+	"testing"
+
+	_ "github.com/gastownhall/gascity/internal/testenv"
+)
 
 func TestBuiltinProvidersAndOrder(t *testing.T) {
 	providers := BuiltinProviders()

@@ -8,6 +8,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/session"
+	_ "github.com/gastownhall/gascity/internal/testenv"
 )
 
 func TestIsCompiledGraphWorkflow(t *testing.T) {
