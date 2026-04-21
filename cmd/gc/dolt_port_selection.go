@@ -12,6 +12,7 @@ import (
 )
 
 func chooseManagedDoltPort(cityPath, stateFile string) (string, error) {
+	cityPath = normalizePathForCompare(cityPath)
 	if port := strings.TrimSpace(os.Getenv("GC_DOLT_PORT")); port != "" {
 		return port, nil
 	}
@@ -91,6 +92,7 @@ func repairedManagedDoltRuntimeState(_ string, layout managedDoltRuntimeLayout, 
 }
 
 func deterministicManagedDoltPortSeed(cityPath string) int {
+	cityPath = normalizePathForCompare(cityPath)
 	if seed, err := cksumManagedDoltPortSeed(cityPath); err == nil {
 		return seed
 	}
