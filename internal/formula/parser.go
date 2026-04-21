@@ -228,9 +228,9 @@ func (p *Parser) Resolve(formula *Formula) (*Formula, error) {
 
 		// Pour is an opt-in escalation: any parent or the child requesting
 		// pour promotes the merged formula. With a plain bool the zero value
-		// is indistinguishable from "unset", so OR is the only coherent rule
-		// here; a *bool field would allow explicit child override but isn't
-		// worth the complexity for this flag.
+		// is indistinguishable from "unset", so OR is the simplest coherent
+		// rule that preserves monotonic opt-in; a *bool field would allow
+		// explicit child opt-out but isn't worth the complexity for this flag.
 		if !merged.Pour {
 			merged.Pour = parent.Pour
 		}

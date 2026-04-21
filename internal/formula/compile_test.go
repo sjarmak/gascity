@@ -363,6 +363,29 @@ extends = ["base"]
 			// RootOnly is gated on !Pour && Phase=="vapor"; Pour=true overrides.
 			wantRootOnly: false,
 		},
+		{
+			// Guards against a future refactor that stops seeding merged
+			// from the child: without seeding, a child-only Pour=true would
+			// be dropped because the parent loop only propagates true values.
+			name: "child_sets_pour_parent_unset",
+			parent: `
+formula = "base"
+version = 1
+
+[[steps]]
+id = "scan"
+title = "Scan"
+`,
+			child: `
+formula = "derived"
+version = 1
+extends = ["base"]
+pour = true
+`,
+			wantPhase:    "",
+			wantPour:     true,
+			wantRootOnly: false,
+		},
 	}
 
 	for _, tc := range cases {
@@ -436,6 +459,63 @@ extends = ["parentA", "parentB"]
 
 	if recipe.Phase != "vapor" {
 		t.Errorf("Phase = %q, want %q (first non-empty parent wins)", recipe.Phase, "vapor")
+	}
+}
+
+// TestCompileExtendsMultiParentPourAnyParentWins verifies OR semantics for
+// Pour across multiple parents — unlike Phase (first-non-empty-wins), any
+// parent declaring pour=true promotes the merged formula regardless of
+// parent order. Pins the Phase-vs-Pour semantic asymmetry so future
+// refactors don't silently align them.
+func TestCompileExtendsMultiParentPourAnyParentWins(t *testing.T) {
+	cases := []struct {
+		name    string
+		extends string
+	}{
+		{name: "pour_first", extends: `["pourParent", "plainParent"]`},
+		{name: "pour_second", extends: `["plainParent", "pourParent"]`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			files := map[string]string{
+				"pourParent.toml": `
+formula = "pourParent"
+version = 1
+pour = true
+
+[[steps]]
+id = "a"
+title = "A"
+`,
+				"plainParent.toml": `
+formula = "plainParent"
+version = 1
+
+[[steps]]
+id = "b"
+title = "B"
+`,
+				"child.toml": `
+formula = "child"
+version = 1
+extends = ` + tc.extends + `
+`,
+			}
+			for name, content := range files {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			recipe, err := Compile(context.Background(), "child", []string{dir}, nil)
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+			if !recipe.Pour {
+				t.Errorf("Pour = false, want true (any parent with pour=true promotes)")
+			}
+		})
 	}
 }
 
