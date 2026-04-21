@@ -1311,15 +1311,19 @@ while True:
 func processHoldsDeletedPath(pid int, targetPath string) bool {
 	fdDir := filepath.Join("/proc", strconv.Itoa(pid), "fd")
 	entries, err := os.ReadDir(fdDir)
-	if err != nil {
-		return false
-	}
-	for _, entry := range entries {
-		target, readErr := os.Readlink(filepath.Join(fdDir, entry.Name()))
-		if readErr != nil || !strings.Contains(target, " (deleted)") {
-			continue
+	if err == nil {
+		for _, entry := range entries {
+			target, readErr := os.Readlink(filepath.Join(fdDir, entry.Name()))
+			if readErr != nil || !strings.Contains(target, " (deleted)") {
+				continue
+			}
+			if samePath(strings.TrimSuffix(target, " (deleted)"), targetPath) {
+				return true
+			}
 		}
-		if samePath(strings.TrimSuffix(target, " (deleted)"), targetPath) {
+	}
+	for _, target := range deletedDataInodeTargetsFromLsof(pid) {
+		if samePath(target, targetPath) {
 			return true
 		}
 	}

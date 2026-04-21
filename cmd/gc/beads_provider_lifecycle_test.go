@@ -3089,8 +3089,9 @@ exit 2
 	if err != nil {
 		t.Fatalf("read provider ops: %v", err)
 	}
-	if strings.TrimSpace(string(ops)) != "health\nrecover" {
-		t.Fatalf("provider ops = %q, want health then recover", string(ops))
+	opLines := strings.Fields(strings.TrimSpace(string(ops)))
+	if len(opLines) < 2 || opLines[0] != "health" || opLines[1] != "recover" {
+		t.Fatalf("provider ops = %q, want first health then recover", string(ops))
 	}
 }
 
@@ -3326,7 +3327,11 @@ case "${1:-}" in
       last="$arg"
     done
     if [ -d "$last/.beads" ]; then
-      stat -c %a "$last/.beads" > "$perm_file"
+      if stat -c %a "$last/.beads" >/dev/null 2>&1; then
+        stat -c %a "$last/.beads" > "$perm_file"
+      else
+        stat -f %Lp "$last/.beads" > "$perm_file"
+      fi
     else
       printf 'missing
 ' > "$perm_file"

@@ -55,7 +55,7 @@ func repairedManagedDoltRuntimeState(_ string, layout managedDoltRuntimeLayout, 
 	if state.Port <= 0 {
 		return doltRuntimeState{}, false
 	}
-	if state.DataDir != "" && state.DataDir != layout.DataDir {
+	if state.DataDir != "" && !samePath(state.DataDir, layout.DataDir) {
 		return doltRuntimeState{}, false
 	}
 	port := strconv.Itoa(state.Port)
