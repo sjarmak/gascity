@@ -259,6 +259,202 @@ func TestShellRemove(t *testing.T) {
 	}
 }
 
+func TestShellInstallFishCreatesConfigDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	root := newRootCmd(os.Stdout, os.Stderr)
+	var stdout, stderr bytes.Buffer
+	code := cmdShellInstall(root, []string{"fish"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+
+	rc := filepath.Join(home, ".config", "fish", "config.fish")
+	data, err := os.ReadFile(rc)
+	if err != nil {
+		t.Fatalf("expected fish rc file to be created: %v", err)
+	}
+	if !strings.Contains(string(data), shellHookMarkerBegin) {
+		t.Fatalf("fish rc file missing hook marker:\n%s", string(data))
+	}
+}
+
+func TestShellStatusTracksBashProfileInstall(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	root := newRootCmd(os.Stdout, os.Stderr)
+	var installOut, installErr bytes.Buffer
+	code := cmdShellInstall(root, []string{"bash"}, &installOut, &installErr)
+	if code != 0 {
+		t.Fatalf("install exit %d: %s", code, installErr.String())
+	}
+
+	bashProfile := filepath.Join(home, ".bash_profile")
+	data, err := os.ReadFile(bashProfile)
+	if err != nil {
+		t.Fatalf("expected bash profile to be created: %v", err)
+	}
+	if !strings.Contains(string(data), shellHookMarkerBegin) {
+		t.Fatalf("bash profile missing hook marker:\n%s", string(data))
+	}
+
+	// Simulate a later shell session creating .bashrc after install.
+	shellTestWriteFile(t, filepath.Join(home, ".bashrc"), "# created later\n")
+
+	var stdout, stderr bytes.Buffer
+	code = cmdShellStatus(&stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("status exit %d: %s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "bash: installed") {
+		t.Fatalf("expected bash to still be reported installed, got:\n%s", out)
+	}
+	if !strings.Contains(out, bashProfile) {
+		t.Fatalf("expected status to point at .bash_profile, got:\n%s", out)
+	}
+}
+
+func TestShellRemoveRemovesBashProfileHookAfterBashrcAppears(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	root := newRootCmd(os.Stdout, os.Stderr)
+	var installOut, installErr bytes.Buffer
+	code := cmdShellInstall(root, []string{"bash"}, &installOut, &installErr)
+	if code != 0 {
+		t.Fatalf("install exit %d: %s", code, installErr.String())
+	}
+
+	bashProfile := filepath.Join(home, ".bash_profile")
+	shellTestWriteFile(t, filepath.Join(home, ".bashrc"), "# created later\n")
+
+	var stdout, stderr bytes.Buffer
+	code = cmdShellRemove(&stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("remove exit %d: %s", code, stderr.String())
+	}
+
+	data, err := os.ReadFile(bashProfile)
+	if err != nil {
+		t.Fatalf("reading bash profile: %v", err)
+	}
+	if strings.Contains(string(data), shellHookMarkerBegin) {
+		t.Fatalf("expected hook to be removed from bash profile, got:\n%s", string(data))
+	}
+	if !strings.Contains(stdout.String(), "Removed hook from "+bashProfile) {
+		t.Fatalf("expected remove output to mention bash profile, got:\n%s", stdout.String())
+	}
+}
+
+func TestShellReinstallUpdatesExistingBashProfileHookAfterBashrcAppears(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	root := newRootCmd(os.Stdout, os.Stderr)
+	var stdout, stderr bytes.Buffer
+	code := cmdShellInstall(root, []string{"bash"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("first install exit %d: %s", code, stderr.String())
+	}
+
+	bashProfile := filepath.Join(home, ".bash_profile")
+	bashRC := filepath.Join(home, ".bashrc")
+	shellTestWriteFile(t, bashRC, "# created later\n")
+
+	stdout.Reset()
+	stderr.Reset()
+	code = cmdShellInstall(root, []string{"bash"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("reinstall exit %d: %s", code, stderr.String())
+	}
+
+	profileData, err := os.ReadFile(bashProfile)
+	if err != nil {
+		t.Fatalf("reading bash profile: %v", err)
+	}
+	if strings.Count(string(profileData), shellHookMarkerBegin) != 1 {
+		t.Fatalf("expected exactly one hook block in bash profile, got:\n%s", string(profileData))
+	}
+
+	rcData, err := os.ReadFile(bashRC)
+	if err != nil {
+		t.Fatalf("reading bashrc: %v", err)
+	}
+	if strings.Contains(string(rcData), shellHookMarkerBegin) {
+		t.Fatalf("expected reinstall to keep hook in original bash profile, got bashrc:\n%s", string(rcData))
+	}
+}
+
+func TestShellReinstallPreservesRCFileMode(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	rc := filepath.Join(home, ".zshrc")
+	shellTestWriteFile(t, rc, "# zshrc\n")
+	if err := os.Chmod(rc, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root := newRootCmd(os.Stdout, os.Stderr)
+	var stdout, stderr bytes.Buffer
+	code := cmdShellInstall(root, []string{"zsh"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("first install exit %d: %s", code, stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = cmdShellInstall(root, []string{"zsh"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("reinstall exit %d: %s", code, stderr.String())
+	}
+
+	info, err := os.Stat(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("expected rc mode 0600 after reinstall, got %03o", info.Mode().Perm())
+	}
+}
+
+func TestShellRemovePreservesRCFileMode(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	rc := filepath.Join(home, ".zshrc")
+	shellTestWriteFile(t, rc, "# zshrc\n")
+	if err := os.Chmod(rc, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root := newRootCmd(os.Stdout, os.Stderr)
+	var stdout, stderr bytes.Buffer
+	code := cmdShellInstall(root, []string{"zsh"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("install exit %d: %s", code, stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = cmdShellRemove(&stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("remove exit %d: %s", code, stderr.String())
+	}
+
+	info, err := os.Stat(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("expected rc mode 0600 after remove, got %03o", info.Mode().Perm())
+	}
+}
+
 func TestShellStatus_NotInstalled(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

@@ -96,25 +96,60 @@ func detectShell(shellEnv string) (string, error) {
 
 // shellRCFile returns the canonical RC file path for a shell.
 func shellRCFile(sh string) (string, error) {
-	home, err := os.UserHomeDir()
+	rcFiles, err := shellRCFiles(sh)
 	if err != nil {
-		return "", fmt.Errorf("determining home directory: %w", err)
+		return "", err
 	}
 	switch sh {
 	case "bash":
 		// Prefer .bashrc; fall back to .bash_profile if .bashrc doesn't exist.
-		rc := filepath.Join(home, ".bashrc")
+		rc := rcFiles[0]
 		if _, err := os.Stat(rc); err == nil {
 			return rc, nil
 		}
-		return filepath.Join(home, ".bash_profile"), nil
-	case "zsh":
-		return filepath.Join(home, ".zshrc"), nil
-	case "fish":
-		return filepath.Join(home, ".config", "fish", "config.fish"), nil
+		return rcFiles[1], nil
+	case "zsh", "fish":
+		return rcFiles[0], nil
 	default:
 		return "", fmt.Errorf("unsupported shell %q", sh)
 	}
+}
+
+// shellRCFiles returns all RC files relevant to a shell.
+func shellRCFiles(sh string) ([]string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("determining home directory: %w", err)
+	}
+	switch sh {
+	case "bash":
+		return []string{
+			filepath.Join(home, ".bashrc"),
+			filepath.Join(home, ".bash_profile"),
+		}, nil
+	case "zsh":
+		return []string{filepath.Join(home, ".zshrc")}, nil
+	case "fish":
+		return []string{filepath.Join(home, ".config", "fish", "config.fish")}, nil
+	default:
+		return nil, fmt.Errorf("unsupported shell %q", sh)
+	}
+}
+
+// installedShellRCFile returns the RC file that currently contains the hook.
+func installedShellRCFile(sh string) (string, error) {
+	rcFiles, err := shellRCFiles(sh)
+	if err != nil {
+		return "", err
+	}
+	for _, rcFile := range rcFiles {
+		hasHook, err := rcFileHasHook(rcFile)
+		if err != nil || !hasHook {
+			continue
+		}
+		return rcFile, nil
+	}
+	return "", os.ErrNotExist
 }
 
 // completionDir returns ~/.gc/completions.
@@ -215,6 +250,13 @@ func cmdShellInstall(root *cobra.Command, args []string, stdout, stderr io.Write
 		fmt.Fprintf(stderr, "gc shell install: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	if existingRC, err := installedShellRCFile(sh); err == nil {
+		rcFile = existingRC
+	}
+	if err := os.MkdirAll(filepath.Dir(rcFile), 0o755); err != nil {
+		fmt.Fprintf(stderr, "gc shell install: creating directory: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	installed, err := rcFileHasHook(rcFile)
 	if err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(stderr, "gc shell install: reading %s: %v\n", rcFile, err) //nolint:errcheck // best-effort stderr
@@ -256,19 +298,21 @@ func cmdShellRemove(stdout, stderr io.Writer) int {
 			}
 		}
 
-		rcFile, err := shellRCFile(sh)
+		rcFiles, err := shellRCFiles(sh)
 		if err != nil {
 			continue
 		}
-		has, err := rcFileHasHook(rcFile)
-		if err != nil || !has {
-			continue
-		}
-		if err := rcFileRemoveHook(rcFile); err != nil {
-			fmt.Fprintf(stderr, "gc shell remove: updating %s: %v\n", rcFile, err) //nolint:errcheck // best-effort stderr
-		} else {
-			fmt.Fprintf(stdout, "Removed hook from %s\n", rcFile) //nolint:errcheck // best-effort stdout
-			removed = true
+		for _, rcFile := range rcFiles {
+			has, err := rcFileHasHook(rcFile)
+			if err != nil || !has {
+				continue
+			}
+			if err := rcFileRemoveHook(rcFile); err != nil {
+				fmt.Fprintf(stderr, "gc shell remove: updating %s: %v\n", rcFile, err) //nolint:errcheck // best-effort stderr
+			} else {
+				fmt.Fprintf(stdout, "Removed hook from %s\n", rcFile) //nolint:errcheck // best-effort stdout
+				removed = true
+			}
 		}
 	}
 	if !removed {
@@ -284,7 +328,7 @@ func cmdShellStatus(stdout, _ io.Writer) int {
 		if err != nil {
 			continue
 		}
-		rcFile, err := shellRCFile(sh)
+		rcFiles, err := shellRCFiles(sh)
 		if err != nil {
 			continue
 		}
@@ -292,7 +336,20 @@ func cmdShellStatus(stdout, _ io.Writer) int {
 		if _, err := os.Stat(compFile); err == nil {
 			hasScript = true
 		}
-		hasHook, _ := rcFileHasHook(rcFile)
+		hasHook := false
+		rcFile, err := shellRCFile(sh)
+		if err != nil {
+			continue
+		}
+		for _, candidate := range rcFiles {
+			candidateHasHook, err := rcFileHasHook(candidate)
+			if err != nil || !candidateHasHook {
+				continue
+			}
+			hasHook = true
+			rcFile = candidate
+			break
+		}
 
 		if hasScript || hasHook {
 			found = true
@@ -388,11 +445,36 @@ func replaceHookBlock(content, replacement string) string {
 
 // atomicWriteFile writes data to a temp file then renames into place.
 func atomicWriteFile(path string, data []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	mode := os.FileMode(0o644)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+	} else if !os.IsNotExist(err) {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 func resolveShellArg(args []string) (string, error) {
