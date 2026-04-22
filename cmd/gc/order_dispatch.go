@@ -7,6 +7,7 @@ import (
 	"log"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -23,11 +24,17 @@ const labelOrderTracking = "order-tracking"
 // orders as wisps or exec scripts. Follows the nil-guard tracker pattern:
 // nil means no auto-dispatchable orders exist.
 //
-// dispatch is fire-and-forget: trigger evaluation is synchronous, but each due
-// order's dispatch action runs in its own goroutine. The tracking bead
-// is created before the goroutine launches to prevent re-fire on the next tick.
+// dispatch runs trigger evaluation synchronously, then spawns a goroutine
+// per due order's dispatch action. The tracking bead is created before the
+// goroutine launches to prevent re-fire on the next tick.
+//
+// drain waits for all in-flight dispatch goroutines spawned by prior
+// dispatch calls to complete, bounded by ctx. Callers use this on
+// controller exit and config reload to ensure tracking bead outcome
+// metadata is persisted before the dispatcher is replaced or discarded.
 type orderDispatcher interface {
 	dispatch(ctx context.Context, cityPath string, now time.Time)
+	drain(ctx context.Context)
 }
 
 // ExecRunner runs a shell command with context, working directory, and
@@ -53,6 +60,11 @@ func logDispatchError(stderr io.Writer, format string, args ...any) {
 type orderStoreFunc func(execStoreTarget) (beads.Store, error)
 
 // memoryOrderDispatcher is the production implementation.
+//
+// inflight tracks dispatchOne goroutines spawned by dispatch so drain can
+// wait for them before shutdown or config reload. dispatch is only ever
+// called from the tick goroutine, so inflight.Add happens-before
+// inflight.Wait without additional synchronization.
 type memoryOrderDispatcher struct {
 	aa         []orders.Order
 	storeFn    orderStoreFunc
@@ -63,6 +75,7 @@ type memoryOrderDispatcher struct {
 	maxTimeout time.Duration
 	cfg        *config.City
 	cityName   string
+	inflight   sync.WaitGroup
 }
 
 // buildOrderDispatcher scans formula layers for orders and returns a
@@ -204,9 +217,29 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			continue
 		}
 
-		// Fire and forget with timeout.
+		// Fire with timeout; inflight tracks the spawned goroutine so
+		// drain can wait for tracking-bead outcome persistence before
+		// controller exit or config reload.
 		a := a // capture loop variable
+		m.inflight.Add(1)
 		go m.dispatchOne(ctx, store, target, a, cityPath, trackingBead.ID)
+	}
+}
+
+// drain blocks until all in-flight dispatchOne goroutines complete or ctx
+// expires. When ctx expires, any still-running dispatches keep running
+// (they will still write tracking-bead outcomes via ctx-unaware store
+// calls). The startup sweep closes orphaned tracking beads on the next
+// boot if drain did not have enough time to let them finish.
+func (m *memoryOrderDispatcher) drain(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		m.inflight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
 	}
 }
 
@@ -232,6 +265,7 @@ func (m *memoryOrderDispatcher) legacyCityStoreForTarget(cityPath string, target
 // For exec orders, runs the script directly. For formula orders,
 // instantiates a wisp. Emits events and updates the tracking bead.
 func (m *memoryOrderDispatcher) dispatchOne(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string) {
+	defer m.inflight.Done()
 	defer store.Close(trackingID) //nolint:errcheck // best-effort close
 
 	timeout := effectiveTimeout(a, m.maxTimeout)
