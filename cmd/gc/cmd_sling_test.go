@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
@@ -963,9 +964,6 @@ func setupRigScopedBdCity(t *testing.T) (cityDir, rigDir string) {
 	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o700); err != nil {
 		t.Fatalf("MkdirAll(rig): %v", err)
 	}
-	if err := os.MkdirAll(filepath.Join(cityDir, ".beads"), 0o700); err != nil {
-		t.Fatalf("MkdirAll(city): %v", err)
-	}
 	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "config.yaml"), []byte(`issue_prefix: FE
 gc.endpoint_origin: inherited_city
 gc.endpoint_status: verified
@@ -991,31 +989,36 @@ dir = "frontend"
 	return cityDir, rigDir
 }
 
-// installCaptureBdCreateRunner swaps beadsExecCommandRunnerWithEnv with a fake
-// that records env + dir on each `bd create --json` invocation and returns a
-// canned rig-prefixed response. Other bd subcommands return benign defaults so
-// sling's post-create metadata writes don't break the test. Auto-restores via
-// t.Cleanup.
-func installCaptureBdCreateRunner(t *testing.T) (envs *[]map[string]string, dirs *[]string) {
+// bdInvocation records a single bd subprocess call — env snapshot, dir, and
+// argv — so tests can assert on the scope the command ran in.
+type bdInvocation struct {
+	Env  map[string]string
+	Dir  string
+	Args []string
+}
+
+// installCaptureBdRunner swaps beadsExecCommandRunnerWithEnv with a fake that
+// records every bd invocation and returns plausible responses for the
+// subcommands cmdSling's inline-text path actually runs (show, create, update).
+// Unexpected subcommands fail the test loudly so drift in sling's bd usage
+// surfaces instead of silently passing. Returns a pointer to the capture slice;
+// auto-restores via t.Cleanup.
+func installCaptureBdRunner(t *testing.T) *[]bdInvocation {
 	t.Helper()
 	orig := beadsExecCommandRunnerWithEnv
 	t.Cleanup(func() { beadsExecCommandRunnerWithEnv = orig })
 
-	envs = &[]map[string]string{}
-	dirs = &[]string{}
+	calls := &[]bdInvocation{}
 	beadsExecCommandRunnerWithEnv = func(env map[string]string) beads.CommandRunner {
-		snap := map[string]string{}
-		for k, v := range env {
-			snap[k] = v
-		}
+		snap := maps.Clone(env)
 		return func(dir, name string, args ...string) ([]byte, error) {
+			*calls = append(*calls, bdInvocation{Env: snap, Dir: dir, Args: append([]string(nil), args...)})
 			if name != "bd" {
+				t.Errorf("unexpected command %q args=%v", name, args)
 				return nil, fmt.Errorf("unexpected command %q", name)
 			}
 			switch {
 			case len(args) >= 2 && args[0] == "create" && args[1] == "--json":
-				*envs = append(*envs, snap)
-				*dirs = append(*dirs, dir)
 				title := ""
 				if len(args) > 2 {
 					title = args[2]
@@ -1027,27 +1030,40 @@ func installCaptureBdCreateRunner(t *testing.T) (envs *[]map[string]string, dirs
 				return []byte(`{}`), nil
 			case len(args) >= 2 && args[0] == "show" && args[1] == "--json":
 				return nil, fmt.Errorf("issue not found")
-			case len(args) >= 2 && args[0] == "list" && args[1] == "--json":
-				return []byte(`[]`), nil
 			default:
-				return []byte(`{}`), nil
+				t.Errorf("unexpected bd subcommand args=%v — fake must be extended if sling now invokes this", args)
+				return nil, fmt.Errorf("unexpected bd subcommand args=%v", args)
 			}
 		}
 	}
-	return envs, dirs
+	return calls
 }
 
-// Regression guard for #200: bdRuntimeEnvForRig used to hardcode BEADS_DIR to
-// <cityPath>/.beads, so bd create always landed the inline bead in the city
-// store and the cross-rig guard blocked routing. PRs #712/#790 split
-// bdStoreForCity/bdStoreForRig but added no bd-provider test. This locks the
-// invariant for the default provider.
+// firstBdCreate returns the first `bd create --json` invocation captured by
+// installCaptureBdRunner, or fails the test if none was observed.
+func firstBdCreate(t *testing.T, calls []bdInvocation) bdInvocation {
+	t.Helper()
+	for _, c := range calls {
+		if len(c.Args) >= 2 && c.Args[0] == "create" && c.Args[1] == "--json" {
+			return c
+		}
+	}
+	t.Fatalf("no bd create invocation observed. Captured %d calls: %v", len(calls), calls)
+	return bdInvocation{}
+}
+
+// Regression guard for #200: on 0.13.5 the pre-bdStoreForRig code path
+// hardcoded BEADS_DIR to <cityPath>/.beads for every bd subprocess, so bd
+// create landed the inline bead in the city store and the cross-rig guard
+// blocked routing. Commit 92c6c0d7 introduced bdStoreForRig +
+// bdRuntimeEnvForRig which silently fixed it; this test locks the invariant
+// for the default bd provider so the scoping cannot regress again.
 func TestCmdSlingInlineBeadRigScopedBdProvider(t *testing.T) {
 	configureIsolatedRuntimeEnv(t)
 	t.Setenv("GC_BEADS", "bd")
 
 	cityDir, rigDir := setupRigScopedBdCity(t)
-	createEnvs, createDirs := installCaptureBdCreateRunner(t)
+	calls := installCaptureBdRunner(t)
 
 	t.Chdir(cityDir)
 
@@ -1057,20 +1073,18 @@ func TestCmdSlingInlineBeadRigScopedBdProvider(t *testing.T) {
 		t.Fatalf("cmdSling returned %d, want 0; stderr: %s", code, stderr.String())
 	}
 
-	if len(*createEnvs) == 0 {
-		t.Fatalf("no bd create invocation observed; stderr: %s", stderr.String())
-	}
+	create := firstBdCreate(t, *calls)
 	wantBeadsDir := filepath.Join(rigDir, ".beads")
-	if got := (*createEnvs)[0]["BEADS_DIR"]; got != wantBeadsDir {
-		t.Fatalf("bd create BEADS_DIR = %q, want %q (rig-scoped)", got, wantBeadsDir)
+	if got := create.Env["BEADS_DIR"]; got != wantBeadsDir {
+		t.Fatalf("bd create BEADS_DIR = %q, want %q (rig-scoped); all calls: %v", got, wantBeadsDir, *calls)
 	}
-	if got := (*createEnvs)[0]["GC_RIG_ROOT"]; got != rigDir {
+	if got := create.Env["GC_RIG_ROOT"]; got != rigDir {
 		t.Fatalf("bd create GC_RIG_ROOT = %q, want %q", got, rigDir)
 	}
-	if got := (*createEnvs)[0]["GC_RIG"]; got != "frontend" {
+	if got := create.Env["GC_RIG"]; got != "frontend" {
 		t.Fatalf("bd create GC_RIG = %q, want %q", got, "frontend")
 	}
-	if got := (*createDirs)[0]; got != rigDir {
+	if got := create.Dir; got != rigDir {
 		t.Fatalf("bd create dir = %q, want %q", got, rigDir)
 	}
 }
@@ -1083,7 +1097,7 @@ func TestCmdSlingInlineBeadBareTargetFromRigCwdBdProvider(t *testing.T) {
 	t.Setenv("GC_BEADS", "bd")
 
 	_, rigDir := setupRigScopedBdCity(t)
-	createEnvs, _ := installCaptureBdCreateRunner(t)
+	calls := installCaptureBdRunner(t)
 
 	t.Chdir(rigDir)
 
@@ -1093,13 +1107,11 @@ func TestCmdSlingInlineBeadBareTargetFromRigCwdBdProvider(t *testing.T) {
 		t.Fatalf("cmdSling returned %d, want 0; stderr: %s", code, stderr.String())
 	}
 
-	if len(*createEnvs) == 0 {
-		t.Fatalf("no bd create invocation observed; stderr: %s", stderr.String())
-	}
+	create := firstBdCreate(t, *calls)
 	wantBeadsDir := filepath.Join(rigDir, ".beads")
-	if got := (*createEnvs)[0]["BEADS_DIR"]; got != wantBeadsDir {
-		t.Fatalf("bd create BEADS_DIR = %q, want %q (rig-scoped). The bare target %q resolved from rig cwd must land the bead in the rig store, not the city.",
-			got, wantBeadsDir, "worker")
+	if got := create.Env["BEADS_DIR"]; got != wantBeadsDir {
+		t.Fatalf("bd create BEADS_DIR = %q, want %q (rig-scoped). Bare target %q from rig cwd must land in the rig store; all calls: %v",
+			got, wantBeadsDir, "worker", *calls)
 	}
 }
 
