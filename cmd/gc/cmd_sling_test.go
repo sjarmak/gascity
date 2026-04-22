@@ -953,6 +953,206 @@ dir = "frontend"
 	}
 }
 
+// TestCmdSlingInlineBeadRigScopedBdProvider is the #200 regression guard
+// for the default bd provider. The inline-text sling flow must create
+// the bead through a BdStore whose command runner sees BEADS_DIR scoped
+// to the target rig — not the city. Before the fix, BEADS_DIR was
+// hardcoded to <cityPath>/.beads so bd create always landed the bead in
+// the city store, then the cross-rig guard blocked routing.
+func TestCmdSlingInlineBeadRigScopedBdProvider(t *testing.T) {
+	configureIsolatedRuntimeEnv(t)
+	t.Setenv("GC_BEADS", "bd")
+
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o700); err != nil {
+		t.Fatalf("MkdirAll(rig): %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cityDir, ".beads"), 0o700); err != nil {
+		t.Fatalf("MkdirAll(city): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "config.yaml"), []byte(`issue_prefix: FE
+gc.endpoint_origin: inherited_city
+gc.endpoint_status: verified
+dolt.auto-start: false
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cityToml := `[workspace]
+name = "demo"
+
+[[rigs]]
+name = "frontend"
+path = "frontend"
+prefix = "FE"
+
+[[agent]]
+name = "worker"
+dir = "frontend"
+`
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+
+	origRunner := beadsExecCommandRunnerWithEnv
+	t.Cleanup(func() { beadsExecCommandRunnerWithEnv = origRunner })
+
+	var createEnvs []map[string]string
+	var createDirs []string
+	beadsExecCommandRunnerWithEnv = func(env map[string]string) beads.CommandRunner {
+		snap := map[string]string{}
+		for k, v := range env {
+			snap[k] = v
+		}
+		return func(dir, name string, args ...string) ([]byte, error) {
+			if name != "bd" {
+				return nil, fmt.Errorf("unexpected command %q", name)
+			}
+			switch {
+			case len(args) >= 2 && args[0] == "create" && args[1] == "--json":
+				createEnvs = append(createEnvs, snap)
+				createDirs = append(createDirs, dir)
+				title := ""
+				if len(args) > 2 {
+					title = args[2]
+				}
+				// Mimic a successful bd create returning JSON with a
+				// rig-prefixed ID. The prefix here is the invariant we
+				// care about: a bd running against BEADS_DIR=rig/.beads
+				// would produce FE-xxx (rig prefix), not c3-xxx (city).
+				resp := fmt.Sprintf(`{"id":"FE-abc","title":%q,"status":"open","issue_type":"task","created_at":"2026-04-22T00:00:00Z","assignee":"","from":"","parent":"","ref":"","needs":null,"description":"","labels":null}`, title)
+				return []byte(resp), nil
+			case len(args) >= 2 && args[0] == "update" && args[1] == "--json":
+				return []byte(`{}`), nil
+			case len(args) >= 2 && args[0] == "show" && args[1] == "--json":
+				return nil, fmt.Errorf("issue not found")
+			case len(args) >= 2 && args[0] == "list" && args[1] == "--json":
+				return []byte(`[]`), nil
+			default:
+				return []byte(`{}`), nil
+			}
+		}
+	}
+
+	t.Chdir(cityDir)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSling([]string{"frontend/worker", "ship feature"}, false, false, true, "", nil, "", true, false, "", false, false, false, "", "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdSling returned %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	if len(createEnvs) == 0 {
+		t.Fatalf("no bd create invocation observed; stderr: %s", stderr.String())
+	}
+	wantBeadsDir := filepath.Join(rigDir, ".beads")
+	if got := createEnvs[0]["BEADS_DIR"]; got != wantBeadsDir {
+		t.Fatalf("bd create BEADS_DIR = %q, want %q (rig-scoped)", got, wantBeadsDir)
+	}
+	if got := createEnvs[0]["GC_RIG_ROOT"]; got != rigDir {
+		t.Fatalf("bd create GC_RIG_ROOT = %q, want %q", got, rigDir)
+	}
+	if got := createEnvs[0]["GC_RIG"]; got != "frontend" {
+		t.Fatalf("bd create GC_RIG = %q, want %q", got, "frontend")
+	}
+	if got := createDirs[0]; got != rigDir {
+		t.Fatalf("bd create dir = %q, want %q", got, rigDir)
+	}
+}
+
+// TestCmdSlingInlineBeadBareTargetFromRigCwdBdProvider covers the exact
+// repro from issue #200: CWD is the rig directory and the sling target
+// is a bare agent name (e.g. "claude") that resolves to the rig-scoped
+// agent via currentRigContext. The created bead must land in the rig
+// store (BEADS_DIR=<rig>/.beads), matching the resolved agent's scope.
+func TestCmdSlingInlineBeadBareTargetFromRigCwdBdProvider(t *testing.T) {
+	configureIsolatedRuntimeEnv(t)
+	t.Setenv("GC_BEADS", "bd")
+
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o700); err != nil {
+		t.Fatalf("MkdirAll(rig): %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cityDir, ".beads"), 0o700); err != nil {
+		t.Fatalf("MkdirAll(city): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "config.yaml"), []byte(`issue_prefix: FE
+gc.endpoint_origin: inherited_city
+gc.endpoint_status: verified
+dolt.auto-start: false
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cityToml := `[workspace]
+name = "demo"
+
+[[rigs]]
+name = "frontend"
+path = "frontend"
+prefix = "FE"
+
+[[agent]]
+name = "worker"
+dir = "frontend"
+`
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+
+	origRunner := beadsExecCommandRunnerWithEnv
+	t.Cleanup(func() { beadsExecCommandRunnerWithEnv = origRunner })
+
+	var createEnvs []map[string]string
+	beadsExecCommandRunnerWithEnv = func(env map[string]string) beads.CommandRunner {
+		snap := map[string]string{}
+		for k, v := range env {
+			snap[k] = v
+		}
+		return func(_ string, name string, args ...string) ([]byte, error) {
+			if name != "bd" {
+				return nil, fmt.Errorf("unexpected command %q", name)
+			}
+			switch {
+			case len(args) >= 2 && args[0] == "create" && args[1] == "--json":
+				createEnvs = append(createEnvs, snap)
+				title := ""
+				if len(args) > 2 {
+					title = args[2]
+				}
+				resp := fmt.Sprintf(`{"id":"FE-abc","title":%q,"status":"open","issue_type":"task","created_at":"2026-04-22T00:00:00Z","assignee":"","from":"","parent":"","ref":"","needs":null,"description":"","labels":null}`, title)
+				return []byte(resp), nil
+			case len(args) >= 2 && args[0] == "update" && args[1] == "--json":
+				return []byte(`{}`), nil
+			case len(args) >= 2 && args[0] == "show" && args[1] == "--json":
+				return nil, fmt.Errorf("issue not found")
+			case len(args) >= 2 && args[0] == "list" && args[1] == "--json":
+				return []byte(`[]`), nil
+			default:
+				return []byte(`{}`), nil
+			}
+		}
+	}
+
+	// Reporter repro: cd into the rig, sling bare target.
+	t.Chdir(rigDir)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSling([]string{"worker", "ship feature"}, false, false, true, "", nil, "", true, false, "", false, false, false, "", "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdSling returned %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	if len(createEnvs) == 0 {
+		t.Fatalf("no bd create invocation observed; stderr: %s", stderr.String())
+	}
+	wantBeadsDir := filepath.Join(rigDir, ".beads")
+	if got := createEnvs[0]["BEADS_DIR"]; got != wantBeadsDir {
+		t.Fatalf("bd create BEADS_DIR = %q, want %q (rig-scoped). The bare target %q resolved from rig cwd must land the bead in the rig store, not the city.",
+			got, wantBeadsDir, "worker")
+	}
+}
+
 func TestSlingStoreEnvUsesRigBdRuntimeForMixedProviderRig(t *testing.T) {
 	cityDir := t.TempDir()
 	wantPort := strconv.Itoa(writeReachableManagedDoltState(t, cityDir))
