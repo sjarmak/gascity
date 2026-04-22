@@ -1023,8 +1023,6 @@ func installCaptureBdRunner(t *testing.T) *[]bdInvocation {
 				if len(args) > 2 {
 					title = args[2]
 				}
-				// FE-* vs c3-* would expose whether BEADS_DIR was rig- or
-				// city-scoped; the test asserts on env, not the ID.
 				return []byte(fmt.Sprintf(`{"id":"FE-abc","title":%q,"status":"open","issue_type":"task","created_at":"2026-04-22T00:00:00Z","assignee":"","from":"","parent":"","ref":"","needs":null,"description":"","labels":null}`, title)), nil
 			case len(args) >= 2 && args[0] == "update" && args[1] == "--json":
 				return []byte(`{}`), nil
@@ -1112,6 +1110,18 @@ func TestCmdSlingInlineBeadBareTargetFromRigCwdBdProvider(t *testing.T) {
 	if got := create.Env["BEADS_DIR"]; got != wantBeadsDir {
 		t.Fatalf("bd create BEADS_DIR = %q, want %q (rig-scoped). Bare target %q from rig cwd must land in the rig store; all calls: %v",
 			got, wantBeadsDir, "worker", *calls)
+	}
+	// Mirror the env-surface assertions from the qualified-target variant
+	// so a regression that sets BEADS_DIR correctly but drops GC_RIG/
+	// GC_RIG_ROOT via the currentRigContext path still fails loudly.
+	if got := create.Env["GC_RIG_ROOT"]; got != rigDir {
+		t.Fatalf("bd create GC_RIG_ROOT = %q, want %q", got, rigDir)
+	}
+	if got := create.Env["GC_RIG"]; got != "frontend" {
+		t.Fatalf("bd create GC_RIG = %q, want %q", got, "frontend")
+	}
+	if got := create.Dir; got != rigDir {
+		t.Fatalf("bd create dir = %q, want %q", got, rigDir)
 	}
 }
 
