@@ -111,9 +111,14 @@ Examples:
 			if err != nil {
 				return err
 			}
-			recipe, err := formula.Compile(cmd.Context(), name, searchPaths, compileVars)
+			recipe, err := formula.CompileWithoutRuntimeVarValidation(cmd.Context(), name, searchPaths, compileVars)
 			if err != nil {
 				return err
+			}
+			if len(vars) > 0 {
+				if err := formula.ValidateProvidedVarDefs(recipe.Vars, vars); err != nil {
+					return err
+				}
 			}
 
 			// Apply var substitution for display only when --var flags were provided.
@@ -274,7 +279,7 @@ bead into a sub-workflow at runtime.`,
 			cookVars := parseFormulaVars(vars)
 
 			if attach != "" {
-				recipe, err := formula.Compile(cmd.Context(), args[0], scope.searchPaths, cookVars)
+				recipe, err := formula.CompileWithoutRuntimeVarValidation(cmd.Context(), args[0], scope.searchPaths, cookVars)
 				if err != nil {
 					return fmt.Errorf("compile: %w", err)
 				}

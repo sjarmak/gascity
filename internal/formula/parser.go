@@ -494,11 +494,28 @@ func ValidateVarDefs(defs map[string]*VarDef, values map[string]string) error {
 	return formatVarValidationErrors(errs)
 }
 
+// ValidateProvidedVarDefs validates constraints for values the caller supplied
+// without requiring every required variable to be present.
+func ValidateProvidedVarDefs(defs map[string]*VarDef, values map[string]string) error {
+	providedDefs := make(map[string]*VarDef)
+	for name := range values {
+		if def, ok := defs[name]; ok {
+			providedDefs[name] = def
+		}
+	}
+	errs, _ := collectVarValidationErrors(providedDefs, values, false)
+	return formatVarValidationErrors(errs)
+}
+
 // CollectVarValidationErrors validates explicit var definitions against the
 // provided values and returns raw error strings plus the set of missing
 // required vars. Callers that need the historical wrapped error can pass the
 // returned error strings through formatVarValidationErrors.
 func CollectVarValidationErrors(defs map[string]*VarDef, values map[string]string) ([]string, map[string]bool) {
+	return collectVarValidationErrors(defs, values, true)
+}
+
+func collectVarValidationErrors(defs map[string]*VarDef, values map[string]string, requireMissing bool) ([]string, map[string]bool) {
 	var errs []string
 	missingRequired := make(map[string]bool)
 	names := make([]string, 0, len(defs))
@@ -509,10 +526,13 @@ func CollectVarValidationErrors(defs map[string]*VarDef, values map[string]strin
 
 	for _, name := range names {
 		def := defs[name]
+		if def == nil {
+			continue
+		}
 		val, provided := values[name]
 
 		// Check required
-		if def.Required && !provided {
+		if requireMissing && def.Required && !provided {
 			errs = append(errs, fmt.Sprintf("variable %q is required", name))
 			missingRequired[name] = true
 			continue

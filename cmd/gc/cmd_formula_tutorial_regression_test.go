@@ -183,6 +183,76 @@ title = "[{{epic}}] Implement: {{feature}}"
 	}
 }
 
+func TestFormulaShowWithPartialVarsStillShowsRequiredVars(t *testing.T) {
+	cityDir := writeTutorialFormulaCity(t, "required-vars", `
+formula = "required-vars"
+description = "Formula with required vars"
+
+[vars.epic]
+description = "Epic ticket ID"
+required = true
+
+[vars.feature]
+description = "Feature slug"
+required = true
+
+[[steps]]
+id = "implement"
+title = "[{{epic}}] Implement: {{feature}}"
+`)
+
+	t.Chdir(cityDir)
+
+	var stdout bytes.Buffer
+	cmd := newFormulaShowCmd(&stdout, &bytes.Buffer{})
+	cmd.SetArgs([]string{"required-vars", "--var", "epic=CLOUD-99999"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("formula show should succeed with partial --var flags: %v", err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "[CLOUD-99999] Implement: {{feature}}") {
+		t.Fatalf("formula show should substitute provided vars and leave missing placeholders intact, got:\n%s", out)
+	}
+	if !strings.Contains(out, "{{feature}}: Feature slug") {
+		t.Fatalf("formula show should still list missing required vars, got:\n%s", out)
+	}
+}
+
+func TestFormulaShowValidatesProvidedVarsWithoutRequiringMissingVars(t *testing.T) {
+	cityDir := writeTutorialFormulaCity(t, "enum-vars", `
+formula = "enum-vars"
+description = "Formula with enum var"
+
+[vars.epic]
+description = "Epic ticket ID"
+required = true
+
+[vars.env]
+description = "Environment"
+enum = ["dev", "prod"]
+
+[[steps]]
+id = "implement"
+title = "[{{epic}}] Deploy {{env}}"
+`)
+
+	t.Chdir(cityDir)
+
+	cmd := newFormulaShowCmd(&bytes.Buffer{}, &bytes.Buffer{})
+	cmd.SetArgs([]string{"enum-vars", "--var", "env=staging"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("formula show should reject invalid provided vars")
+	}
+	if !strings.Contains(err.Error(), `variable "env": value "staging" not in allowed values`) {
+		t.Fatalf("error = %v, want invalid env", err)
+	}
+	if strings.Contains(err.Error(), `variable "epic" is required`) {
+		t.Fatalf("formula show should not require missing runtime vars while validating provided vars: %v", err)
+	}
+}
+
 func writeTutorialFormulaCity(t *testing.T, formulaName, formulaBody string) string {
 	t.Helper()
 

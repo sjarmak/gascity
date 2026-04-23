@@ -180,7 +180,7 @@ func buildFormulaDetail(ctx context.Context, name string, paths []string, _ stri
 	if err != nil {
 		return nil, err
 	}
-	recipe, err := formula.Compile(ctx, name, paths, vars)
+	recipe, err := formula.CompileWithoutRuntimeVarValidation(ctx, name, paths, vars)
 	if err != nil {
 		return nil, err
 	}

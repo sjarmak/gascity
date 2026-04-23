@@ -127,7 +127,7 @@ func Cook(ctx context.Context, store beads.Store, formulaName string, searchPath
 	if compileVars == nil {
 		compileVars = map[string]string{}
 	}
-	recipe, err := formula.Compile(ctx, formulaName, searchPaths, compileVars)
+	recipe, err := formula.CompileWithoutRuntimeVarValidation(ctx, formulaName, searchPaths, compileVars)
 	if err != nil {
 		return nil, fmt.Errorf("compiling formula %q: %w", formulaName, err)
 	}
@@ -422,7 +422,7 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 			}
 			b.Ref = recipe.Name
 			if opts.Title != "" {
-				b.Title = opts.Title
+				b.Title = formula.Substitute(opts.Title, vars)
 			}
 			if opts.ParentID != "" && step.Metadata["gc.kind"] != "workflow" {
 				b.ParentID = opts.ParentID
@@ -916,29 +916,43 @@ func applyVarDefaults(vars map[string]string, defs map[string]*formula.VarDef) m
 	return result
 }
 
+// ValidateRecipeRuntimeVars validates runtime variables for a compiled recipe.
+// It checks declared formula vars, unresolved title placeholders, and avoids
+// duplicating title errors for vars that were already reported as required.
 func ValidateRecipeRuntimeVars(recipe *formula.Recipe, opts Options) error {
-	validationErrs, missingRequired := formula.CollectVarValidationErrors(recipe.Vars, opts.Vars)
-	titleErrs := unresolvedTitleValidationErrors(recipe, opts, missingRequired)
-	switch {
-	case len(validationErrs) == 0 && len(titleErrs) == 0:
+	validationVars := runtimeValidationVars(recipe, opts)
+	validationErrs, missingRequired := formula.CollectVarValidationErrors(recipe.Vars, validationVars)
+	titleErrs := unresolvedTitleValidationErrorsWithVars(recipe, opts, validationVars, missingRequired)
+	if len(validationErrs) == 0 && len(titleErrs) == 0 {
 		return nil
-	case len(validationErrs) == 0 && len(titleErrs) == 1:
-		return fmt.Errorf("%s", titleErrs[0])
-	case len(validationErrs) == 0:
-		return fmt.Errorf("title variable validation failed:\n  - %s", strings.Join(titleErrs, "\n  - "))
-	default:
-		errs := make([]string, 0, len(validationErrs)+len(titleErrs))
-		errs = append(errs, validationErrs...)
-		errs = append(errs, titleErrs...)
-		return fmt.Errorf("variable validation failed:\n  - %s", strings.Join(errs, "\n  - "))
 	}
+	errs := make([]string, 0, len(validationErrs)+len(titleErrs))
+	errs = append(errs, validationErrs...)
+	errs = append(errs, titleErrs...)
+	return fmt.Errorf("variable validation failed:\n  - %s", strings.Join(errs, "\n  - "))
 }
 
-func unresolvedTitleValidationErrors(recipe *formula.Recipe, opts Options, missingRequired map[string]bool) []string {
+func runtimeValidationVars(recipe *formula.Recipe, opts Options) map[string]string {
+	if opts.Title == "" || recipe == nil || recipe.Vars == nil {
+		return opts.Vars
+	}
+	if _, ok := recipe.Vars["title"]; !ok {
+		return opts.Vars
+	}
+	vars := applyVarDefaults(opts.Vars, recipe.Vars)
+	result := make(map[string]string, len(vars)+1)
+	for k, v := range vars {
+		result[k] = v
+	}
+	result["title"] = formula.Substitute(opts.Title, vars)
+	return result
+}
+
+func unresolvedTitleValidationErrorsWithVars(recipe *formula.Recipe, opts Options, providedVars map[string]string, missingRequired map[string]bool) []string {
 	if recipe == nil || len(recipe.Steps) == 0 {
 		return nil
 	}
-	vars := applyVarDefaults(opts.Vars, recipe.Vars)
+	vars := applyVarDefaults(providedVars, recipe.Vars)
 	errs := make([]string, 0)
 	for i, step := range recipe.Steps {
 		if recipe.RootOnly && i > 0 {
