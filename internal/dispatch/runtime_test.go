@@ -692,10 +692,14 @@ func TestProcessWorkflowFinalize_NoCityPath(t *testing.T) {
 	}
 }
 
-// TestProcessWorkflowFinalize_PurgeIdempotent verifies that running
-// finalize twice (crash-recovery path) is safe. The second attempt has
-// nothing to purge; molecule.RemoveDir returns nil on missing dirs.
-func TestProcessWorkflowFinalize_PurgeIdempotent(t *testing.T) {
+// TestProcessWorkflowFinalize_PurgeOnMissingDir verifies that finalize
+// succeeds even when the molecule artifact directory was never created
+// (e.g., a workflow that ran but wrote no artifacts). molecule.RemoveDir
+// returns nil on missing dirs, so the best-effort purge is a no-op.
+// This exercises the crash-recovery precondition: RemoveDir must never
+// surface a fatal error just because the tree it's trying to remove is
+// already gone.
+func TestProcessWorkflowFinalize_PurgeOnMissingDir(t *testing.T) {
 	t.Parallel()
 
 	cityPath := t.TempDir()

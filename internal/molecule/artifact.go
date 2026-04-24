@@ -31,9 +31,9 @@ func ArtifactDirFor(cityPath, rootID, beadID string) string {
 }
 
 // EnsureArtifactDir creates the per-step artifact directory if it does
-// not exist and returns its absolute path. Rejects empty or
-// path-traversing rootID/beadID values so a malformed bead ID cannot
-// write outside the molecule root.
+// not exist and returns its path (joined against cityPath as-given; not
+// canonicalized). Rejects empty or path-traversing rootID/beadID values
+// so a malformed bead ID cannot write outside the molecule root.
 func EnsureArtifactDir(fs fsys.FS, cityPath, rootID, beadID string) (string, error) {
 	if err := validateIDSegment("root bead ID", rootID); err != nil {
 		return "", err
@@ -93,8 +93,12 @@ func RemoveDir(cityPath, rootID string) error {
 }
 
 // validateIDSegment rejects empty or path-unsafe ID segments. A valid ID
-// must be non-empty and contain no path separators or parent-directory
-// references.
+// must be non-empty, not contain path separators, not be an absolute
+// path, and not be the literal ".." (parent directory reference).
+//
+// Note: "root..1" and similar IDs with ".." embedded in them are allowed
+// once separators are already banned — without a separator, ".." is just
+// two literal dots and cannot escape the directory.
 func validateIDSegment(label, id string) error {
 	trimmed := strings.TrimSpace(id)
 	if trimmed == "" {
@@ -106,8 +110,8 @@ func validateIDSegment(label, id string) error {
 	if strings.ContainsAny(trimmed, `/\`) {
 		return fmt.Errorf("%s %q must not contain path separators", label, trimmed)
 	}
-	if trimmed == ".." || strings.Contains(trimmed, "..") {
-		return fmt.Errorf("%s %q must not contain parent-directory references", label, trimmed)
+	if trimmed == ".." {
+		return fmt.Errorf("%s %q must not be a parent-directory reference", label, trimmed)
 	}
 	return nil
 }
