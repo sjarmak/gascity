@@ -9,6 +9,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/formula"
+	"github.com/gastownhall/gascity/internal/molecule"
 )
 
 // ControlResult reports whether a control bead was processed and what it did.
@@ -76,7 +77,7 @@ func ProcessControl(store beads.Store, bead beads.Bead, opts ProcessOptions) (Co
 	case "scope-check":
 		return processScopeCheck(store, bead, opts)
 	case "workflow-finalize":
-		return processWorkflowFinalize(store, bead)
+		return processWorkflowFinalize(store, bead, opts)
 	default:
 		return ControlResult{}, fmt.Errorf("%s: unsupported control bead kind %q", bead.ID, bead.Metadata["gc.kind"])
 	}
@@ -466,7 +467,7 @@ func isRetryAttemptSubject(subject beads.Bead) bool {
 	return false
 }
 
-func processWorkflowFinalize(store beads.Store, bead beads.Bead) (ControlResult, error) {
+func processWorkflowFinalize(store beads.Store, bead beads.Bead, opts ProcessOptions) (ControlResult, error) {
 	rootID := bead.Metadata["gc.root_bead_id"]
 	if rootID == "" {
 		return ControlResult{}, fmt.Errorf("%s: missing gc.root_bead_id", bead.ID)
@@ -491,6 +492,19 @@ func processWorkflowFinalize(store beads.Store, bead beads.Bead) (ControlResult,
 	if err := setOutcomeAndClose(store, bead.ID, "pass"); err != nil {
 		return ControlResult{}, fmt.Errorf("%s: completing workflow finalizer: %w", bead.ID, err)
 	}
+
+	// Purge the molecule-scoped artifact tree now that the workflow has
+	// terminated. Artifact lifetime is anchored to the molecule, not the
+	// worker worktree — see internal/molecule/artifact.go. Best-effort:
+	// os.RemoveAll is idempotent, so a retry after controller crash is
+	// safe. Gated on CityPath being present so tests that omit it don't
+	// spuriously touch the real filesystem.
+	if strings.TrimSpace(opts.CityPath) != "" {
+		if err := molecule.RemoveDir(opts.CityPath, rootID); err != nil {
+			opts.tracef("workflow-finalize bead=%s root=%s artifact-purge-err=%v", bead.ID, rootID, err)
+		}
+	}
+
 	return ControlResult{Processed: true, Action: "workflow-" + outcome}, nil
 }
 

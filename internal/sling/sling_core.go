@@ -274,7 +274,7 @@ func finalize(opts SlingOpts, deps SlingDeps, beadID, method string, result Slin
 	a := opts.Target
 
 	// Execute routing -- prefer typed Router, fall back to shell Runner.
-	slingEnv := ResolveSlingEnv(a, deps)
+	slingEnv := ResolveSlingEnv(a, deps, beadID)
 	rigDir := SlingDirForBead(deps.Cfg, deps.CityPath, beadID)
 	if deps.Router != nil {
 		req := RouteRequest{
@@ -909,7 +909,7 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 			}
 		}
 
-		childEnv := ResolveSlingEnv(a, deps)
+		childEnv := ResolveSlingEnvForBead(a, deps, child)
 		rigDir := SlingDirForBead(deps.Cfg, deps.CityPath, child.ID)
 		if deps.Router != nil {
 			req := RouteRequest{

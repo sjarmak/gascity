@@ -70,3 +70,10 @@ func canonicalizePlatformPathAlias(path string) string {
 func SamePath(a, b string) bool {
 	return NormalizePathForCompare(a) == NormalizePathForCompare(b)
 }
+
+// IsOutsideDir reports whether a relative path (as returned by
+// filepath.Rel) escapes its base directory. Use after filepath.Rel to
+// check containment without re-resolving the base.
+func IsOutsideDir(rel string) bool {
+	return rel == ".." || (len(rel) > 2 && rel[:3] == ".."+string(filepath.Separator))
+}
