@@ -223,7 +223,7 @@ are enforced by the conformance suite in
 | Depended on by | How |
 |---|---|
 | `cmd/gc/controller.go` | Records `controller.started` and `controller.stopped` events at lifecycle boundaries; passes `Recorder` to reconciliation and shutdown |
-| `cmd/gc/reconcile.go` | Records `session.woke`, `session.stopped`, `session.crashed`, `session.idle_killed`, `session.quarantined`, `session.suspended` events during reconciliation (renamed from `agent.*` by `be8debd8`) |
+| `cmd/gc/session_lifecycle_parallel.go` | Records `session.woke`, `session.stopped`, `session.crashed`, `session.idle_killed`, `session.quarantined`, `session.suspended` events during the session lifecycle (renamed from `agent.*` by `be8debd8`) |
 | `cmd/gc/order_dispatch.go` | Records `order.fired`, `order.completed`, `order.failed` events during order dispatch |
 | `cmd/gc/cmd_events.go` | CLI `gc events` command: reads and displays events with filtering (`--type`, `--since`), watch mode (`--watch`), and sequence query (`--seq`) |
 | `cmd/gc/cmd_event_emit.go` | CLI `gc event emit` command: records custom events from scripts and bd hooks (best-effort, always exits 0) |

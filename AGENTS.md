@@ -45,8 +45,9 @@ mechanism is provably composable from the primitives.
    provider. Identity (via `agent.SessionNameFor`), pools, sandboxes,
    resume, crash adoption. Lifecycle is a bead-backed projection
    (`internal/session/lifecycle_projection.go`). Runtime providers
-   (tmux, subprocess, k8s, fake) live under `internal/runtime/` and
-   plug in behind the Session surface.
+   (tmux, subprocess, exec, k8s, fake) plus routing layers (acp,
+   auto, hybrid) live under `internal/runtime/` and plug in behind
+   the Session surface.
 2. **Task Store (Beads)** — CRUD + Hook + Dependencies + Labels + Query
    over work units. Everything is a bead: tasks, mail, molecules, convoys.
 3. **Event Bus** — append-only pub/sub log of all system activity. Two
@@ -59,8 +60,10 @@ mechanism is provably composable from the primitives.
 **Four derived mechanisms (Layer 2-4):**
 
 6. **Messaging** — Mail = `TaskStore.Create(bead{type:"message"})`.
-   Nudge = `Session.Nudge()` (delegating to `runtime.Provider.Nudge()`).
-   No new primitive needed.
+   Nudge = a session-layer operation implemented via
+   `runtime.Provider.Nudge()` (and exposed through
+   `worker.SessionHandle.Nudge()` at the worker boundary). No new
+   primitive needed.
 7. **Formulas & Molecules** — Formula = TOML parsed by Config. Molecule =
    root bead + child step beads in Task Store. Wisps = ephemeral molecules.
    Orders = formulas with gate conditions on Event Bus.

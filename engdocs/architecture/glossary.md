@@ -92,9 +92,10 @@ other source should be updated.
   queryable by label via `ListByLabel`.
 
 - **Messaging**: Inter-agent communication composed from primitives.
-  Mail = `TaskStore.Create(bead{type:"message"})`. Nudge =
-  `Session.Nudge()` (delegating to `runtime.Provider.Nudge()`). No
-  new primitive needed.
+  Mail = `TaskStore.Create(bead{type:"message"})`. Nudge = a
+  session-layer operation implemented via `runtime.Provider.Nudge()`
+  (and exposed through `worker.SessionHandle.Nudge()` at the worker
+  boundary). No new primitive needed.
 
 - **Molecule**: A formula instantiated at runtime: one root bead plus
   zero or more provider-managed step beads. Progress is tracked by closing

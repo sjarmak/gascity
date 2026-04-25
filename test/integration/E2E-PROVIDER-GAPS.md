@@ -146,7 +146,7 @@ minutes — far beyond the 10-minute test timeout.
 
 ---
 
-### RC-3: Agent lifecycle events not emitted with exec provider (MEDIUM)
+### RC-3: Session lifecycle events not emitted with exec provider (MEDIUM)
 
 **Impact:** 1 Docker failure (TestE2E_AgentLifecycleEvents)
 
