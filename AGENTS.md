@@ -42,7 +42,7 @@ mechanism is provably composable from the primitives.
 **Five primitives (Layer 0-1):**
 
 1. **Session** — start/stop/prompt/observe sessions regardless of
-   provider. Identity (via `session.SessionNameFor`), pools, sandboxes,
+   provider. Identity (via `agent.SessionNameFor`), pools, sandboxes,
    resume, crash adoption. Lifecycle is a bead-backed projection
    (`internal/session/lifecycle_projection.go`). Runtime providers
    (tmux, subprocess, k8s, fake) live under `internal/runtime/` and
