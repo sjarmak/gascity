@@ -59,7 +59,8 @@ mechanism is provably composable from the primitives.
 **Four derived mechanisms (Layer 2-4):**
 
 6. **Messaging** — Mail = `TaskStore.Create(bead{type:"message"})`.
-   Nudge = `Session.SendPrompt()`. No new primitive needed.
+   Nudge = `Session.Nudge()` (delegating to `runtime.Provider.Nudge()`).
+   No new primitive needed.
 7. **Formulas & Molecules** — Formula = TOML parsed by Config. Molecule =
    root bead + child step beads in Task Store. Wisps = ephemeral molecules.
    Orders = formulas with gate conditions on Event Bus.
@@ -134,13 +135,19 @@ build; full rationale is in the architecture docs):
 These migrations are in flight. New code on affected paths must take
 the canonical route, not the legacy route.
 
-- **Worker boundary (phase 3 of 4, started `12a0a848` on Apr 17 2026).**
+- **Worker boundary (started `12a0a848` on Apr 17 2026, in progress).**
   `internal/worker/handle.go` is the canonical boundary for session
-  creation and lifecycle operations. Legacy callers still reach
-  `internal/session.Manager` directly (most `cmd/gc/session_*.go` files
-  plus `internal/dispatch/control.go`). New code routes through
-  `worker.Handle`; `session.Manager.Create*` methods are being retired.
-  Do not add new direct `session.Manager.Create*` call sites.
+  creation and lifecycle operations. Production `cmd/gc/*.go` files
+  must route through `worker.Handle` — enforced by
+  `TestGCNonTestFilesStayOnWorkerBoundary` in
+  `cmd/gc/worker_boundary_import_test.go`, which forbids non-test
+  files from importing `session.NewManager(`, `worker.SessionHandle`,
+  `sessionlog`, and similar bypass paths. The remaining production
+  callers of `session.Manager.Create*` directly are
+  `internal/api/session_manager.go` and the package-internal helpers
+  in `internal/session/`. Tests may construct `session.Manager`
+  directly. Do not add new non-test direct `session.Manager.Create*`
+  call sites in `cmd/gc/`.
 - **Session-first (completed `dd90ac0a` on Mar 8 2026).** The former
   Agent Protocol primitive was removed; responsibilities moved to
   `internal/session/` (lifecycle) and `internal/runtime/` (providers).

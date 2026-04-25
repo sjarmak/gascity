@@ -17,7 +17,9 @@ make the primitive usable at the product level are:
 
 - `internal/agent/` for session naming and startup hints
 - `cmd/gc/template_resolve.go` for building runtime start configs
-- `internal/session/` for session bead records, waits, and blocked-turn state
+- `internal/session/` for the bead-backed lifecycle projection
+  (`lifecycle_projection.go`), session bead records, waits, and
+  blocked-turn state
 
 The important current-state split is:
 

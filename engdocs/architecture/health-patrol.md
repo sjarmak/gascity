@@ -251,7 +251,7 @@ Health Patrol follows Erlang/OTP patterns mapped to Gas City:
 | Erlang/OTP concept       | Gas City equivalent                       |
 |--------------------------|-------------------------------------------|
 | Supervisor               | Controller (`controllerLoop`)             |
-| Worker                   | Agent (any role)                          |
+| Worker                   | Session running an `[[agent]]` role       |
 | Child spec               | `[[agent]]` entry in `city.toml`         |
 | one_for_one restart      | Restart dead agent only (no cascade)      |
 | max_restarts/max_seconds | `max_restarts` / `restart_window`         |
