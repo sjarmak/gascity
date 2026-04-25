@@ -41,8 +41,12 @@ mechanism is provably composable from the primitives.
 
 **Five primitives (Layer 0-1):**
 
-1. **Agent Protocol** — start/stop/prompt/observe agents regardless of
-   provider. Identity, pools, sandboxes, resume, crash adoption.
+1. **Session** — start/stop/prompt/observe sessions regardless of
+   provider. Identity (via `session.SessionNameFor`), pools, sandboxes,
+   resume, crash adoption. Lifecycle is a bead-backed projection
+   (`internal/session/lifecycle_projection.go`). Runtime providers
+   (tmux, subprocess, k8s, fake) live under `internal/runtime/` and
+   plug in behind the Session surface.
 2. **Task Store (Beads)** — CRUD + Hook + Dependencies + Labels + Query
    over work units. Everything is a bead: tasks, mail, molecules, convoys.
 3. **Event Bus** — append-only pub/sub log of all system activity. Two
@@ -55,13 +59,13 @@ mechanism is provably composable from the primitives.
 **Four derived mechanisms (Layer 2-4):**
 
 6. **Messaging** — Mail = `TaskStore.Create(bead{type:"message"})`.
-   Nudge = `AgentProtocol.SendPrompt()`. No new primitive needed.
+   Nudge = `Session.SendPrompt()`. No new primitive needed.
 7. **Formulas & Molecules** — Formula = TOML parsed by Config. Molecule =
    root bead + child step beads in Task Store. Wisps = ephemeral molecules.
    Orders = formulas with gate conditions on Event Bus.
 8. **Dispatch (Sling)** — composed: find/spawn agent → select formula →
    create molecule → hook to agent → nudge → create convoy → log event.
-9. **Health Patrol** — ping agents (Agent Protocol), compare thresholds
+9. **Health Patrol** — probe sessions (Session), compare thresholds
    (Config), publish stalls (Event Bus), restart with backoff.
 
 ### Layering invariants
@@ -80,7 +84,7 @@ Capabilities activate progressively via config presence.
 
 | Level | Adds                    |
 |-------|-------------------------|
-| 0-1   | Agent + tasks           |
+| 0-1   | Session + tasks         |
 | 2     | Task loop               |
 | 3     | Multiple agents + pool  |
 | 4     | Messaging               |
@@ -108,10 +112,11 @@ Load-bearing invariants enforced by CI (violating any fails the
 build; full rationale is in the architecture docs):
 
 - **Object model at the center.** `internal/{beads, mail, convoy,
-  formula, agent, events, session, sling, ...}` is the canonical
+  formula, events, session, worker, sling, ...}` is the canonical
   domain. The CLI (`cmd/gc/`) and the HTTP+SSE API
   (`internal/api/`) are projections over it. Neither re-implements
-  domain logic.
+  domain logic. `internal/agent/` is a small helper package
+  (session-name utilities, startup hints) — not a primitive.
 - **Typed wire.** No hand-written JSON on any HTTP or SSE wire
   path; no `map[string]any` or `json.RawMessage` on wire types
   (documented exceptions live in the API control-plane doc). All
@@ -123,6 +128,25 @@ build; full rationale is in the architecture docs):
   `events.NoPayload` for events whose envelope fields alone
   capture the semantics. Enforced by
   `TestEveryKnownEventTypeHasRegisteredPayload`.
+
+## Active migrations
+
+These migrations are in flight. New code on affected paths must take
+the canonical route, not the legacy route.
+
+- **Worker boundary (phase 3 of 4, started `12a0a848` on Apr 17 2026).**
+  `internal/worker/handle.go` is the canonical boundary for session
+  creation and lifecycle operations. Legacy callers still reach
+  `internal/session.Manager` directly (most `cmd/gc/session_*.go` files
+  plus `internal/dispatch/control.go`). New code routes through
+  `worker.Handle`; `session.Manager.Create*` methods are being retired.
+  Do not add new direct `session.Manager.Create*` call sites.
+- **Session-first (completed `dd90ac0a` on Mar 8 2026).** The former
+  Agent Protocol primitive was removed; responsibilities moved to
+  `internal/session/` (lifecycle) and `internal/runtime/` (providers).
+  `internal/agent/` is now a helper package with session-name utilities
+  and startup hints — not a primitive. Do not reconstruct the
+  `Agent` / `Handle` interfaces.
 
 ## Design decisions (settled)
 
