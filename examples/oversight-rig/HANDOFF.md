@@ -1,4 +1,4 @@
-# Oversight-rig handoff — 2026-05-02 (Phase A + a3s handoff session)
+# Oversight-rig handoff — 2026-05-02 (Phase A cutover attempt + rollback)
 
 ## State
 
@@ -30,15 +30,16 @@ verified end-to-end.
 
 ## Live runtime
 
-- **Supervisor** PID **2575673** (rebuilt `/tmp/gc` from this branch;
-  accepts `fanout_policy` on `POST /extmsg/groups`, the provider-neutral
-  nudge fix in `internal/api/handler_extmsg.go`, and now injects
-  `GC_API_BASE_URL` + `GC_CITY_NAME` into order exec env via
-  `cmd/gc/order_store.go:orderExecEnv`).
-- **Slack adapter** PID **2582270**, registered as
-  `slack/T0B17700WUW`. Public `:8775`, internal `127.0.0.1:8766`.
-  Log: `/tmp/gc-slack-adapter/run.log`. Tailscale Funnel still on
-  (`:443 → :8775`).
+- **Supervisor** PID **4187273** (rebuilt `/tmp/gc` from this branch;
+  manually-started so the SLACK_* env from
+  `~/.config/gc-slack-adapter/env` is in its environment ready for
+  any future Phase A retry. The systemd `gascity-supervisor.service`
+  unit is in restart loop because port 8372 is held by the manual
+  one — same shape as the previous cutovers, harmless).
+- **Slack adapter** PID **199927**, registered as
+  `slack/T0B17700WUW`. Legacy nohup mode: public `:8775`, internal
+  `127.0.0.1:8766/publish`. Log: `/tmp/gc-slack-adapter/run.log`.
+  Tailscale Funnel still on (`:443 → :8775`).
 - **Slack app event subscriptions** include `message.im` and
   `message.channels`. **`message.groups` is NOT subscribed** — if any
   rig's channel is private (`G`-prefix id), add it in
@@ -223,14 +224,20 @@ Local-only (not for commit): `city.toml` has
 
 ## Open work, in priority order
 
-> **Session-end note (2026-05-02 Phase A pass):** items 1, 3, 4 (a/b/c),
-> 6, 7, 8, and the canary cleanup are all DONE from prior sessions.
-> Item 2 (Phase A — adapter UDS mode + [[service]] block) is now
-> IMPLEMENTED in commit c1e1f6a1, but the live cutover step is
-> deferred (would disrupt the live rig + 7 channel bindings). Item 5
-> is subsumed. gc-a3s investigation is done — design notes attached
-> to the bead, handed off to a separate PR-agent worktree at
-> `gascity-gascity-pr/`.
+> **Session-end note (2026-05-02 Phase A cutover attempt):** the live
+> cutover for item 2 was attempted this session and **rolled back**
+> after surfacing a real defect. Service was restored to legacy nohup
+> mode; all 8 bindings (cos DM + 7 rig rooms) preserved across the
+> cutover+rollback. **Phase A `[[service]]` block is now commented out
+> in `examples/slack-pack/pack.toml`** with a pointer to bd gc-5rz.
+> Defect: `GC_SERVICE_URL_PREFIX` is injected as `/svc/<name>` but the
+> supervisor only routes `/v0/city/<cityName>/svc/<name>/*` to the
+> per-city proxy mux — adapter's registered CallbackURL ends up 404'ing
+> on gc's own router. Full root-cause + three fix options recorded in
+> bd gc-5rz notes. Items 1, 3, 4 (a/b/c), 6, 7, 8 + canary cleanup
+> remain DONE from prior sessions. Item 5 still subsumed by item 2.
+> gc-a3s investigation handoff intact (separate `gascity-gascity-pr/`
+> worktree).
 
 1. ~~**Switch `gc slack reply-current` to publish through gc
    `/extmsg/outbound`**~~ — DONE this session. `reply-current` now
@@ -244,9 +251,14 @@ Local-only (not for commit): `city.toml` has
    already serves `/extmsg/outbound`, so no supervisor restart is
    needed for this change to take effect — pack scripts hit gc over
    HTTP at runtime.
-2. ~~**Absorb the Go adapter into the slack pack as a
-   `[[service]] proxy_process`** (Phase A)~~ — IMPLEMENTED this
-   session in commit c1e1f6a1.
+2. **Absorb the Go adapter into the slack pack as a
+   `[[service]] proxy_process`** (Phase A) — IMPLEMENTED in commit
+   c1e1f6a1; **cutover ATTEMPTED 2026-05-02 and rolled back** because
+   of a real defect. See bd gc-5rz notes for root cause + three fix
+   options. Pack.toml `[[service]]` block currently commented out with
+   a pointer to gc-5rz; manual nohup adapter restored to legacy TCP
+   `:8766/publish`; all 8 bindings preserved across the round-trip.
+   Re-attempt after the URL-prefix fix lands.
 
    **Shipped:**
    - Adapter (`examples/oversight-rig/adapter/main.go`) reads
@@ -441,8 +453,8 @@ to bypass the noise.
 
 ```bash
 # Supervisor + adapter on rebuilt binaries
-/tmp/gc supervisor status   # expect PID 2575673 (or current)
-pgrep -af gc-slack-adapter  # expect a single PID, registered slack/T0B17700WUW
+/tmp/gc supervisor status   # expect PID 4187273 (or current)
+pgrep -af gc-slack-adapter  # expect PID 199927 (or current), single instance
 
 # Pack is loaded
 /tmp/gc slack --help        # bind-dm, bind-room, reply-current

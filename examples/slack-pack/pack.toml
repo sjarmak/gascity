@@ -44,13 +44,20 @@ schema = 2
 # Secrets (SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, SLACK_WORKSPACE_ID)
 # stay in ~/.config/gc-slack-adapter/env and are inherited via
 # os.Environ() at start time. See README.md "Secrets".
-[[service]]
-name = "slack"
-kind = "proxy_process"
-
-[service.publication]
-visibility = "private"
-
-[service.process]
-command = ["./adapter/gc-slack-adapter"]
-health_path = "/healthz"
+#
+# [[service]] block disabled pending bd gc-5rz follow-up
+# (GC_SERVICE_URL_PREFIX needs the /v0/city/<cityName>/svc/<name>
+# prefix, not just /svc/<name>; otherwise the adapter's registered
+# CallbackURL 404s on gc's own router). Adapter runs in legacy nohup
+# mode in the meantime.
+#
+# [[service]]
+# name = "slack"
+# kind = "proxy_process"
+#
+# [service.publication]
+# visibility = "private"
+#
+# [service.process]
+# command = ["./adapter/gc-slack-adapter"]
+# health_path = "/healthz"
