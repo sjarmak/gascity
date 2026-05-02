@@ -1,0 +1,6 @@
+[order]
+description = "Watch for severity:escalate rollup beads and deliver them. Pure mechanical — no agent decision."
+trigger = "condition"
+check = "bash $GC_PACK_DIR/assets/scripts/has-undelivered-escalates.sh"
+exec = "bash $GC_PACK_DIR/assets/scripts/deliver-rollup.sh"
+timeout = "2m"

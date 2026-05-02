@@ -1,0 +1,3 @@
+scope = "city"
+nudge = "Check mail for inbound human replies. Route each reply to the right project-lead and mark the escalation resolved."
+idle_timeout = "2h"

@@ -1,0 +1,78 @@
+# Oversight (rig variant) — drop-in pack for existing gastown-style cities.
+#
+# Adds two roles alongside your existing mayor:
+#
+#   project-lead (rig scope, always-on, stamped per rig)
+#     • Bounded to ONE rig's beads. Reads its persona/triggers from
+#       <rig>/.gc/project-brief.md (each project owns its own brief).
+#     • Judges severity (info vs escalate) and writes structured rollup
+#       beads with explicit labels.
+#
+#   chief-of-staff (city scope, on-demand)
+#     • Handles inbound human replies routed via extmsg only. NOT in the
+#       outbound critical path. Maps reply → bead → mail to the right
+#       project-lead → mark escalation resolved.
+#
+# Why the outbound path has zero agent gates beyond project-lead:
+#   project-lead writes a rollup bead with label:severity:escalate.
+#   The escalate-rollups order uses a `condition` trigger that mechanically
+#   checks for undelivered escalate-severity rollup beads. When any exist,
+#   it runs deliver-rollup.sh which POSTs to extmsg and marks the bead
+#   delivered. No second agent decides "is this escalation-worthy" — that
+#   judgment was made once, by the agent with the right context, and the
+#   rollup bead IS the audit trail of that decision.
+#
+# Topology in your existing city:
+#
+#   ┌──────────────────────────────────────────────────────────────────┐
+#   │ Your existing city                                               │
+#   │                                                                  │
+#   │  mayor (city, unchanged) ──── plans cross-cutting work           │
+#   │  chief-of-staff (city, new) ── inbound human replies only        │
+#   │                                                                  │
+#   │  ┌── rig: foo ────────────┐  ┌── rig: bar ────────────┐  ...     │
+#   │  │ project-lead-foo (new) │  │ project-lead-bar (new) │          │
+#   │  │ • reads foo/.gc/       │  │ • reads bar/.gc/       │          │
+#   │  │   project-brief.md     │  │   project-brief.md     │          │
+#   │  │ • bounded to foo's     │  │ • bounded to bar's     │          │
+#   │  │   beads only           │  │   beads only           │          │
+#   │  │ + your existing rig    │  │ + your existing rig    │          │
+#   │  │   agents (witness etc) │  │   agents               │          │
+#   │  └────────────────────────┘  └────────────────────────┘          │
+#   │                                                                  │
+#   │  ─── deterministic outbound ─────────────────────────────────    │
+#   │  project-lead writes rollup bead with severity:escalate          │
+#   │     ↓                                                            │
+#   │  escalate-rollups order (condition trigger, no agent)            │
+#   │     ↓                                                            │
+#   │  deliver-rollup.sh → POST /extmsg/outbound → mark delivered      │
+#   └──────────────────────────────────────────────────────────────────┘
+#
+# To install in an existing city:
+#   1. Add to city.toml:
+#        [imports.oversight-rig]
+#        source = "/path/to/examples/oversight-rig"
+#   2. For each rig you want under oversight, author its brief:
+#        cp /path/to/examples/oversight-rig/agents/project-lead/project-brief.template.md \
+#           <rig-root>/.gc/project-brief.md
+#        # then edit the brief to fit the project
+#   3. Bind chief-of-staff session to your extmsg conversation (one-time
+#      curl call — see deliver-rollup.sh for required env vars).
+#   4. gc supervisor reload — picks up the new agents and orders.
+#
+# To trigger a triage tick in v1: `gc order run patrol-stalls --rig <rig>`
+# (or wait for whatever cadence you configure as a rig-local order).
+
+[pack]
+name = "oversight-rig"
+schema = 2
+
+[[named_session]]
+template = "chief-of-staff"
+scope = "city"
+mode = "on_demand"
+
+[[named_session]]
+template = "project-lead"
+scope = "rig"
+mode = "always"

@@ -1,0 +1,4 @@
+scope = "rig"
+work_dir = "{{.RigRoot}}"
+nudge = "Read your brief. Triage your rig. Write a rollup bead if anything is off-baseline."
+idle_timeout = "1h"

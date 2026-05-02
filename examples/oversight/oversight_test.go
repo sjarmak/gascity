@@ -58,7 +58,7 @@ func TestPackTomlParses(t *testing.T) {
 }
 
 func TestEscalateBlockedFormulaParsesAndValidates(t *testing.T) {
-	path := filepath.Join(packDir(), "formulas", "escalate-blocked.toml")
+	path := filepath.Join(packDir(), "formulas", "mol-escalate-blocked.toml")
 	parser := formula.NewParser(filepath.Dir(path))
 	f, err := parser.ParseFile(path)
 	if err != nil {
