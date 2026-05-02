@@ -21,6 +21,19 @@ by network locality (only local processes can reach localhost). If both
 endpoints lived on the public port, anyone on the internet who guessed
 the URL could POST publish requests and make your bot say arbitrary things.
 
+> **Port-collision note (this host):** `:8765` is already in use by an
+> unrelated `scix.viz.server` (uvicorn) on this machine. The deployed
+> env file therefore overrides:
+>
+>   - `LISTEN_PUBLIC=:8775`        # Funnel forwards to this
+>   - `LISTEN_INTERNAL=127.0.0.1:8776`
+>   - `INTERNAL_CALLBACK_URL=http://127.0.0.1:8776`
+>
+> If you adopt this pack on a different host where `:8765`/`:8766` are
+> free, the defaults work as documented and no override is needed.
+> Wherever this guide says `8765` below, substitute `8775` on this host
+> (and `8766` → `8776`).
+
 ## Step 1 — Tailscale Funnel public URL
 
 You need a stable public HTTPS URL Slack can POST to. Tailscale Funnel

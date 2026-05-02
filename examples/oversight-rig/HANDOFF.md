@@ -1,11 +1,14 @@
 # Oversight-rig handoff — 2026-05-02
 
-State at handoff: **Slack adapter is built, tested end-to-end, and the
-city is in a clean state. The blocker is one specific gas-city issue:
-chief-of-staff agent sessions die seconds after starting in this city,
-which prevents inbound Slack replies from being acted on.**
+State at handoff: **Two-way oversight loop is fully working
+end-to-end on this branch. Outbound rollups → Slack DM, inbound
+human replies → chief-of-staff routing works under the new prompt
+template, and the gas-city core nudge text is now provider-neutral
+(the old "reply in Discord" hardcoding has been removed and the
+test for it lives in `internal/api/handler_extmsg_test.go`).**
 
-Outbound flow is fully working — rollups land in Slack DMs.
+The original blocker (chief-of-staff sessions dying during startup)
+was a corrupt `~/.claude-homes/account4/.claude.json` and is fixed.
 
 ## What's verified
 
@@ -19,27 +22,37 @@ Outbound flow is fully working — rollups land in Slack DMs.
   localhost-only (`127.0.0.1:8766`) and only `/slack/events` (HMAC-protected)
   is exposed via Tailscale Funnel on `:8775`.
 
-## What's blocked
+## What was blocked (now resolved)
 
-**chief-of-staff sessions die during startup.** Each session this
-agent created (`gc-82707`, `gc-82759`, `gc-82790`) reached "creating"
-state, briefly went "active" or "asleep", then `tmux pane is dead
-(status 1)` with `provider_error: session died during startup` in
-the supervisor logs. Inbound mail is accepted by gc but has no live
-agent to be delivered to.
+**Root cause:** `~/.claude-homes/account4/.claude.json` was corrupt —
+one trailing `}` past the end of the valid object (likely a race
+between two concurrent `claude-account` writers). The `claude-account`
+launcher does `json.load()` early in startup; the JSON decode threw
+`Extra data: line 554 column 2 (char 22943)`, the launcher exited
+status 1, and tmux reported `Pane is dead (status 1)` which the
+supervisor surfaced as `provider_error: session died during startup`.
 
-This pattern is **not specific to chief-of-staff** — multiple
-oversight-rig.project-lead sessions hit the same provider_error
-during the bulk deploy. Suggests a city-level issue, not a pack issue.
+It hit chief-of-staff (and the bulk project-lead deploy) because both
+templates omit `provider`, so they fall back to the workspace default
+`provider = "claude-4"` — i.e. the one corrupt account.
 
-Possibly relevant warnings observed in supervisor logs:
-- `gc supervisor: warning: [providers.codex] relying on legacy
-  auto-inheritance: name matches built-in "codex"` — a future hard
-  error, may be related
-- `control-dispatcher: lookup error: ambiguous session identifier
-  "control-dispatcher" matches multiple configured named sessions`
-- `config-drift mayor: drifted fields: CopyFiles` — pending drift
-  reconciliation may be competing for reconciler attention
+**Fix applied:** truncated the file to the first valid JSON object;
+backup at `~/.claude-homes/account4/.claude.json.bak-corrupt-*`.
+Verified: `gc session new chief-of-staff --no-attach` reaches `active`
+and runs the prompt cleanly (`Inbox is empty — quiet run`).
+
+**Follow-up worth filing as a Gas City bead:** `bin/claude-account`
+should write `.claude.json` atomically (`tmp + rename` under a flock)
+to prevent this race recurring. It currently does
+`open(path,'w'); json.dump(...)` directly, which is not safe under
+concurrent invocations.
+
+The other supervisor warnings observed during the original failure
+are unrelated to this incident but still worth triaging separately:
+- `[providers.codex] relying on legacy auto-inheritance` — pre-existing,
+  unrelated; will become a hard error in a future gc release
+- `control-dispatcher: ambiguous session identifier` — orthogonal
+- `config-drift mayor: drifted fields: CopyFiles` — orthogonal
 
 ## Where everything lives
 
@@ -67,24 +80,55 @@ Possibly relevant warnings observed in supervisor logs:
 
 - City-level `[imports.oversight-rig]` is **present** (provides
   chief-of-staff template)
-- **NO** `[rigs.imports.oversight-rig]` blocks — the 13 rig-level
-  imports were removed during this session to clear the start queue.
-  Restore from `city.toml.bak-oversight-deploy-20260502T125137Z` once
-  chief-of-staff sessions are stable.
-- `[orders.overrides]` disables `patrol-project-leads` (so it doesn't
-  fire periodically until you opt in)
+- All 13 `[rigs.imports.oversight-rig]` blocks **restored** from
+  `city.toml.bak-pre-unstick-20260502T141433Z` (note: that's the
+  correct backup; the previous handoff incorrectly named
+  `city.toml.bak-oversight-deploy-20260502T125137Z`, which is from
+  *before* the rig imports were ever added).
+- `[orders.overrides]` still disables `patrol-project-leads` so the
+  project-leads only triage when you sling them manually.
 - Backups in `/home/ds/gas-city/`:
-  - `city.toml.bak-oversight-deploy-20260502T125137Z` — full deploy
-    state (city import + 13 rig imports + patrol disable)
-  - `city.toml.bak-pre-unstick-...` — same as above
-  - `city.toml.bak-oversight-test-20260502T023602Z` — pre-anything
-  - `city.toml.bak-doctorfix-...` — pre-this-whole-effort
+  - `city.toml.bak-pre-restore-20260502T144614Z` — current-state
+    snapshot taken just before this restore (rollback target if needed)
+  - `city.toml.bak-pre-unstick-20260502T141433Z` — pre-unstick state
+    (was restored into place)
+  - `city.toml.bak-oversight-deploy-20260502T125137Z` — pre-anything
+    state from earliest deploy attempt (city.toml minus the entire
+    oversight stack)
+  - `city.toml.bak-oversight-test-...`, `city.toml.bak-doctorfix-...`
+    — older snapshots
 
-## Currently NOT running
+## Currently running
 
-- Adapter process (was registered with gc, now unregistered cleanly)
-- chief-of-staff session (closed, binding ended)
-- Tailscale Funnel **still on** (needs sudo to stop)
+- **Supervisor**: PID 2656160, restarted from a freshly built `/tmp/gc`
+  that includes the provider-neutral nudge fix
+  (`internal/api/handler_extmsg.go`). Verified: live system-reminders
+  no longer contain "Discord", `gc discord reply-current`, or
+  `gc transcript read --ack`.
+- **Adapter**: `gc-slack-adapter` (restarted post-supervisor-bounce so
+  it could re-register). Public listener `:8775`, internal `:8766`.
+  Logs: `/tmp/gc-slack-adapter/run.log`. Started by hand (`run.sh`);
+  not under systemd. To make persistent, follow `adapter/SETUP.md` §
+  "Running the adapter as a service".
+- **Tailscale Funnel** still on, forwarding `:443 → :8775`.
+- **Chief-of-staff session** `gc-83161` (alias `oversight-rig.cos`,
+  title `chief-of-staff (slack)`). Bound to `D0B0TTS550F` via binding
+  record `gc-83180` (`BindingGeneration=5`). Picked up the new prompt
+  template at creation. Verified end-to-end: a synthetic inbound POST
+  to `/v0/city/ds-research/extmsg/inbound` produced the new clean
+  system-reminder, and cos correctly routed the unmatched reply to
+  mayor (`gc-83183`) per the four-step algorithm's "do not guess"
+  rule.
+- **13 rig-level project-leads**: each rig has *two* active
+  project-lead sessions — an old `gc-82xxx` one (alias without `-1`
+  suffix, reason flags `session,config`) and a new `gc-83xxx` one
+  (alias with `-1` suffix, reason flag `session` only). Survived the
+  supervisor restart; not auto-reconciled. Per-rig duplicates violate
+  `max_active_sessions = 1`. Safe move: close the unsuffixed
+  `gc-82xxx` ones first (since they predate the recent topology) and
+  let the supervisor confirm it does not respawn them. Watch for any
+  in-flight rollup beads attributed to the closing session before
+  closing.
 
 ## Currently running (left in place)
 
@@ -98,28 +142,51 @@ Possibly relevant warnings observed in supervisor logs:
 - `oversight-test-eda`, `ot-i6x`, `ot-d2c` (from earlier multi-city pack
   test) — also closed, in some other bd context
 
-## Next action (the actual blocker)
+## Next action
 
-**Diagnose why chief-of-staff sessions die during startup.**
-Suggested approach:
+1. **End-to-end smoke test with a real Slack DM** (synthetic inbound
+   already verified). Send any DM to `gc-oversight` and watch:
 
-1. Try a known-good template first. Spin up `gc session new claude-1
-   --no-attach` (or any template you trust) and confirm it stays alive
-   more than a minute. If even that dies, the issue is provider/account
-   level, not pack level — investigate provider config (the codex
-   `legacy auto-inheritance` warning, claude-account script, OAuth
-   token freshness).
-2. If known-good templates work, diff what's different about
-   `oversight-rig.chief-of-staff`. Likely candidates: the prompt template
-   referencing `{{ .AgentName }}`, the agent.toml's `nudge` text, or
-   pack-stamping interaction with the on_demand mode.
-3. Once one chief-of-staff session stays alive for >1 min, the inbound
-   chain is wired and ready — re-bind that session to `D0B0TTS550F` via
-   `POST /v0/city/ds-research/extmsg/bind` and `gc events --type
-   extmsg.inbound --since 5m` will show messages reaching it.
+   ```bash
+   /tmp/gc events --type extmsg.inbound --since 5m
+   /tmp/gc session peek gc-83161
+   ```
 
-After chief-of-staff is stable, restoring the rig-level project-leads
-is a separate (smaller) re-deploy.
+   Expected: `extmsg.inbound` event with
+   `target_session=gc-83161`, the new clean system-reminder appears
+   in cos's prompt, cos either matches an open escalation and routes
+   to that rig's project-lead, or (if no escalation matches) routes
+   to mayor.
+
+2. **Reconcile the project-lead duplicates** (see Currently Running).
+   Suggested: close the `gc-82xxx` unsuffixed sessions, watch for the
+   reconciler reaction.
+
+3. **Optional follow-ups:**
+   - File a Gas City bead for the `bin/claude-account` atomic-write
+     race (original blocker — corrupt account4 JSON from concurrent
+     writers).
+   - Make the adapter a systemd user service so it survives reboot
+     (`adapter/SETUP.md` § "Running the adapter as a service").
+   - Re-enable `patrol-project-leads` in `city.toml` once you want
+     periodic triage instead of manual sling.
+
+## Source-level changes on this branch (not yet committed)
+
+```
+examples/oversight-rig/HANDOFF.md
+examples/oversight-rig/adapter/SETUP.md
+examples/oversight-rig/agents/chief-of-staff/prompt.template.md
+internal/api/handler_extmsg.go
+internal/api/handler_extmsg_test.go
+```
+
+- Pack docs and prompt updated for the new inbound delivery model.
+- Gas City core: `extmsgNotifyMembers` no longer embeds Discord-
+  specific reply instructions in the inbound system-reminder; new
+  test `TestExtmsgNotifyMembersNudgeTextIsProviderNeutral` enforces
+  that. Build clean (`go build ./...`), vet clean (`go vet ./...`),
+  `internal/api` test package green.
 
 ## What this agent did NOT touch
 
