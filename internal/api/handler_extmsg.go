@@ -117,18 +117,19 @@ func (s *Server) extmsgNotifyMembers(
 	}
 
 	notifyResolved := func(sessionSelector, resolvedID string) {
-		handle := s.extmsgSessionHandleForResolvedID(resolvedID, sessionSelector)
+		// The nudge announces the inbound message and lets the
+		// recipient's prompt template decide what to do with it.
+		// We deliberately do NOT embed reply instructions here:
+		// reply pathways are provider-specific and pack-specific,
+		// and stale instructions (e.g. references to subcommands
+		// that no longer exist) make agents stall trying to follow
+		// them. Pack authors put any reply guidance in their own
+		// prompt templates.
 		nudge := fmt.Sprintf("<system-reminder>\nNew message in shared conversation %s/%s:\n\n"+
-			"- %s (%s): %s\n\n"+
-			"To reply in Discord, write your response to a file and run:\n"+
-			"  gc discord reply-current --conversation-id %s --body-file <path>\n"+
-			"Prefix your reply with your agent handle in bold (e.g., **%s:** your message).\n"+
-			"Run 'gc transcript read --ack' after responding to mark as read.\n"+
+			"- %s (%s): %s\n"+
 			"</system-reminder>",
 			conv.Provider, conv.ConversationID,
 			actorDisplayName, actorKind, text,
-			conv.ConversationID,
-			handle,
 		)
 		if err := s.sendBackgroundMessageToSession(ctx, store, resolvedID, nudge); err != nil {
 			log.Printf("extmsg: notify %s failed: %v", sessionSelector, err)

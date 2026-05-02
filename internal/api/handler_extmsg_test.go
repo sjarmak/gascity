@@ -205,6 +205,81 @@ func TestExtmsgNotifyMembersDoesNotMaterializeExcludedNamedSender(t *testing.T) 
 	}
 }
 
+// TestExtmsgNotifyMembersNudgeTextIsProviderNeutral ensures the
+// peer-publication nudge does not embed instructions that reference a
+// specific provider (e.g. "Discord") or non-existent CLI subcommands
+// (e.g. `gc discord reply-current`, `gc transcript read --ack`). The
+// nudge must announce the message and let the recipient's prompt
+// template decide what to do with it.
+func TestExtmsgNotifyMembersNudgeTextIsProviderNeutral(t *testing.T) {
+	fs := newSessionFakeState(t)
+	srv := New(fs)
+
+	services := extmsg.NewServices(fs.cityBeadStore)
+	fs.extmsgSvc = &services
+
+	ref := extmsg.ConversationRef{
+		ScopeID:        "T0B17700WUW",
+		Provider:       "slack",
+		AccountID:      "T0B17700WUW",
+		ConversationID: "D0B0TTS550F",
+		Kind:           extmsg.ConversationDM,
+	}
+	caller := extmsg.Caller{Kind: extmsg.CallerController, ID: "test"}
+	if _, err := services.Transcript.EnsureMembership(context.Background(), extmsg.EnsureMembershipInput{
+		Caller:         caller,
+		Conversation:   ref,
+		SessionID:      "myrig/worker",
+		BackfillPolicy: extmsg.MembershipBackfillSinceJoin,
+		Owner:          extmsg.MembershipOwnerManual,
+		Now:            time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("EnsureMembership: %v", err)
+	}
+
+	srv.extmsgNotifyMembers(context.Background(), ref, "human", "human", "ack", "")
+
+	deadline := time.Now().Add(time.Second)
+	var nudgeMsg string
+	for time.Now().Before(deadline) {
+		for _, call := range fs.sp.Calls {
+			if call.Method == "Nudge" && strings.Contains(call.Message, "ack") {
+				nudgeMsg = call.Message
+				break
+			}
+		}
+		if nudgeMsg != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if nudgeMsg == "" {
+		t.Fatalf("expected a nudge containing the message text; calls=%#v", fs.sp.Calls)
+	}
+
+	mustContain := []string{
+		"slack/D0B0TTS550F",
+		"human",
+		"ack",
+	}
+	for _, want := range mustContain {
+		if !strings.Contains(nudgeMsg, want) {
+			t.Errorf("nudge missing %q; got: %s", want, nudgeMsg)
+		}
+	}
+	mustNotContain := []string{
+		"Discord",
+		"gc discord",
+		"reply-current",
+		"gc transcript",
+	}
+	for _, banned := range mustNotContain {
+		if strings.Contains(nudgeMsg, banned) {
+			t.Errorf("nudge must not contain %q (broken/provider-specific reply instruction); got: %s", banned, nudgeMsg)
+		}
+	}
+}
+
 func TestHandleExtMsgOutboundNotifiesDeliveredConversationMembers(t *testing.T) {
 	fs := newSessionFakeState(t)
 	srv := New(fs)
