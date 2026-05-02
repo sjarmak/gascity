@@ -254,11 +254,13 @@ Local-only (not for commit): `city.toml` has
 2. **Absorb the Go adapter into the slack pack as a
    `[[service]] proxy_process`** (Phase A) — IMPLEMENTED in commit
    c1e1f6a1; **cutover ATTEMPTED 2026-05-02 and rolled back** because
-   of a real defect. See bd gc-5rz notes for root cause + three fix
-   options. Pack.toml `[[service]]` block currently commented out with
-   a pointer to gc-5rz; manual nohup adapter restored to legacy TCP
-   `:8766/publish`; all 8 bindings preserved across the round-trip.
-   Re-attempt after the URL-prefix fix lands.
+   of a real defect. The pack/adapter side of gc-5rz is correct; the
+   blocker is an SDK-level proxy_process URL contract bug, filed
+   separately as bd **gc-cdf** (P1, blocks gc-5rz). Root cause +
+   three fix options recorded there. Pack.toml `[[service]]` block
+   currently commented out with a pointer to gc-5rz; manual nohup
+   adapter restored to legacy TCP `:8766/publish`; all 8 bindings
+   preserved across the round-trip. Re-attempt after gc-cdf closes.
 
    **Shipped:**
    - Adapter (`examples/oversight-rig/adapter/main.go`) reads
