@@ -1,0 +1,32 @@
+# Slack pack — Slack provider extension for Gas City.
+#
+# Status: scaffold (this session). Mirrors the structure of the
+# upstream `discord` pack at github.com/gastownhall/gascity-packs/discord
+# so the same primitives (bind-dm, bind-room, peer fanout, launcher
+# rooms, reply-current, publish) can be ported piece by piece.
+#
+# Currently implemented:
+#   gc slack bind-dm           — bind a Slack DM channel to a named session
+#   gc slack reply-current     — reply to the latest Slack event in the
+#                                current session via the local adapter
+#
+# Not yet implemented (see README.md "Port checklist"):
+#   gc slack bind-room         — including ambient_read + peer_fanout
+#   gc slack enable-room-launch  (launcher mode, @@handle spawning)
+#   gc slack publish           — explicit publish to a saved binding
+#   gc slack import-app        — slash-command intake for `/gc fix` style
+#   gc slack map-channel / map-rig
+#   gc slack sync-commands
+#   gc slack post-message      — workflow status projection
+#   gc slack retry-peer-fanout
+#
+# The intake side (the public-facing webhook receiver) is currently the
+# Go binary at examples/oversight-rig/adapter/. Long-term it should be
+# absorbed into this pack as a `[[service]]` proxy_process; for now we
+# intentionally do NOT register it here so the running adapter is left
+# alone.
+
+[pack]
+name = "slack"
+version = "0.0.1"
+schema = 2
