@@ -1,10 +1,16 @@
-# Oversight-rig handoff — 2026-05-02 (post-rollout)
+# Oversight-rig handoff — 2026-05-02 (post-cleanup session)
 
 ## State
 
 Two-way Slack ↔ gc oversight loop is **fully working end-to-end**
-across the city DM and 7 per-rig channels. All four routing branches
-in chief-of-staff have been exercised against real Slack inbound:
+across the city DM and 7 per-rig channels. cos is now running on the
+slack-v0-aware prompt (DM-ack on step 5, room-silence rule). The
+patrol-project-leads order is firing for all 13 rigs every ~16min —
+contrary to a previous handoff claim, it was never actually disabled
+(see gc-a3s).
+
+All four routing branches in chief-of-staff have been exercised
+against real Slack inbound:
 
 - match-and-route-to-project-lead (`ack GEO-rjz` → mailed
   `geo/oversight-rig.project-lead`, closed bead with `resolved` label)
@@ -41,12 +47,12 @@ verified end-to-end.
   `gc slack {bind-dm,bind-room,reply-current}` available.
 - **chief-of-staff** session `gc-83347` (alias `oversight-rig.cos`),
   bound to DM `D0B0TTS550F`, also a peer in 7 room groups (see
-  table below). cos still uses its handwritten "About Reply
-  Instructions" section — has not been switched to compose the
-  `slack-v0` template fragment from the new pack. Cos hit its
-  Anthropic plan limit during the rollout
-  ("resets May 3, 3pm America/New_York"); it'll resume routing on
-  next available capacity.
+  table below). cos was restarted this session via
+  `gc session reset gc-83347` to pick up the new prompt; it now
+  composes the `slack-v0` template fragment from the slack pack and
+  has a step-5 DM-ack rule (acks routes in DMs only; rooms stay
+  silent). Cos's Anthropic rate limit cleared earlier than the worst
+  case suggested — it's been routing live since mid-session.
 - **13 project-leads** — exactly one per rig, all `awake (always)`.
 
 ### Per-rig room bindings (LIVE)
@@ -94,13 +100,12 @@ and peer-fanout to cos fired in <1s.
 
 ### Canary on `C0B0TQMQF2B` (= `#all-agent-city`)
 
-The original canary binding `gc-83781` (geo PL → `C0B0TQMQF2B`) is
-still active in addition to the new dedicated geo binding
-`gc-84152` (geo PL → `C0B13JH8T35`). `resolve_rig_channel.py` picks
-the most recent active binding, so geo escalates now route to the
-dedicated channel. The canary binding is harmless extra membership;
-unbind with `POST /v0/city/ds-research/extmsg/unbind` for session
-`gc-77139` + conversation `C0B0TQMQF2B` if you want to clean it up.
+CLEANED UP this session. The canary binding `gc-83781`
+(geo PL → `C0B0TQMQF2B`) was unbound via
+`POST /v0/city/ds-research/extmsg/unbind`; geo PL now has only
+the dedicated `gc-84152 → C0B13JH8T35` binding. Verified via
+`/extmsg/bindings?session_id=gc-77139` returning a single
+active item.
 
 ## Known formatting gotcha (Slack ≠ Discord)
 
@@ -151,6 +156,32 @@ pkill -f "gc-slack-adapter$"
 All cos + project-lead conversation bindings survived intact across
 both cutovers; the canary binding `gc-83781` survived as well.
 
+## Findings from this session's cleanup pass
+
+1. **`orders.overrides` rig-scoping is silently no-op for per-rig
+   orders.** A `[[orders.overrides]]` block with no `rig` field
+   only matches city-level orders, never the per-rig fan-out
+   instances that orders like `patrol-project-leads` expand into.
+   `ApplyOverrides` returns "order not found" but
+   `cmd/gc/order_dispatch.go:97-99` only logs it as a warning, so
+   you get no startup failure when an override targets nothing.
+   See bd gc-a3s for the upstream-draft and recommended fixes.
+2. **`bin/claude-account` JSON writes were unserialized.** Three
+   blocks in the launcher (`hasCompletedOnboarding`,
+   `skipDangerousModePermissionPrompt`, `hasTrustDialogAccepted`)
+   did read-modify-write on shared JSON files with no flock and no
+   tmp+rename. Concurrent launches against the same account would
+   truncate the file mid-read on the loser side. Fixed in gc-arr;
+   stress test (20 concurrent / distinct GC_WORK_DIR per spawn)
+   confirms 20/20 writes preserved with the fix vs. 1/20 in the
+   naive control.
+3. **Cos rate limit cleared earlier than worst case.** The
+   "resets May 3, 3pm America/New_York" line was Anthropic's
+   conservative ceiling. cos resumed routing live during this
+   session and was restarted (`gc session reset gc-83347`) to pick
+   up the new prompt. No re-pin to a different `claude-N` provider
+   was needed.
+
 ## Findings from the cutover canary
 
 Three things tripped us up; capture them so the next agent doesn't
@@ -190,6 +221,14 @@ Local-only (not for commit): `city.toml` has
 
 ## Open work, in priority order
 
+> **Session-end note (2026-05-02 cleanup pass):** items 1, 4 (a/b/c),
+> 6, 7, 8, and the canary cleanup are all DONE. Item 3 prompt edit
+> landed and cos was restarted. Item 2 has a design doc;
+> implementation is tracked in bd `gc-5rz`. Item 5 will be subsumed
+> by item 2 once Phase A lands. New finding gc-a3s captures the
+> orders.overrides rig-scoping bug surfaced while investigating
+> item 7.
+
 1. ~~**Switch `gc slack reply-current` to publish through gc
    `/extmsg/outbound`**~~ — DONE this session. `reply-current` now
    defaults to `--via gc` (POST `/v0/city/{city}/extmsg/outbound`),
@@ -203,34 +242,39 @@ Local-only (not for commit): `city.toml` has
    needed for this change to take effect — pack scripts hit gc over
    HTTP at runtime.
 2. **Absorb the Go adapter into the slack pack as a
-   `[[service]] proxy_process`.** Right now the adapter is run by
-   hand and managed externally; the pack should own its lifecycle
-   like discord-interactions does. This also gives you `gc service
-   list` integration and tenant-vs-public publication tiers.
+   `[[service]] proxy_process`.** Design landed this session at
+   `docs/investigations/DESIGN-slack-adapter-as-proxy-process.md`.
 
-   **Scope note (added on second look):** bigger than the description
-   implies. `internal/workspacesvc/proxy_process.go` requires the
-   service to listen on a Unix domain socket at `GC_SERVICE_SOCKET`;
-   gc reverse-proxies HTTP through `/svc/{name}` to that socket. Our
-   Slack adapter today binds TCP `:8775` (public webhook) and `:8766`
-   (internal `/publish`), with Tailscale Funnel pinned to TCP
-   `:443 → :8775`. A clean absorption needs:
-   - (a) UDS-listener mode in the Go adapter (the public-webhook path
-     can stay TCP if Funnel must keep terminating directly, but the
-     `/publish` callback should move to UDS so gc owns it),
-   - (b) a decision on whether the public Slack webhook ingress
-     migrates through gc (`/svc/slack/webhook`) or stays on the
-     direct TCP path (Tailscale Funnel reconfig either way),
-   - (c) env-var plumbing: signing secret / bot token / workspace id
-     flow from pack `[[service]]` config + `GC_SERVICE_*` instead of
-     `~/.config/gc-slack-adapter/env`.
+   **Decision (option b):** UDS for `/publish`, keep public TCP
+   `:8775` for `/slack/events`. Adapter activates UDS mode when
+   `$GC_SERVICE_SOCKET` is set (so legacy mode preserved for
+   rollback). pack.toml gets a `[[service]] kind = "proxy_process"`
+   block with a `health_path = "/healthz"` probe over the UDS.
+   Tailscale Funnel stays unchanged; secrets stay in
+   `~/.config/gc-slack-adapter/env` for now. ~80 lines of adapter
+   Go + ~10 lines of TOML + a README cutover note. No gc-side
+   changes, no schema work, no public surface expansion.
 
-   Worth designing on paper before coding. Until then, keep
+   Phase B (secrets in pack.toml) and Phase C (gc-terminated TLS
+   for the public webhook) are deferred. Implementation tracked
+   in bd **gc-5rz**. Until that lands, keep
    `examples/oversight-rig/adapter/run.sh` as-is.
-3. **Switch the chief-of-staff prompt to compose `slack-v0`**, and
-   decide whether cos should call `gc slack reply-current` directly
-   for "ack" replies (today the prompt forbids it). One-line
-   prompt change once the design call is made.
+3. ~~**Switch the chief-of-staff prompt to compose `slack-v0`**~~ —
+   DONE this session.
+   `examples/oversight-rig/agents/chief-of-staff/prompt.template.md`
+   now inlines `{{ template "slack-v0" . }}` after "Your Role" and
+   adds a step-5 ack rule: in DMs (`D`-prefix conversations), cos
+   sends a one-line `*oversight-rig.cos:* routed → ...` ack via
+   `gc slack reply-current` after mailing the project-lead and
+   closing the bead; in rooms (`C`/`G`-prefix), cos stays silent
+   because the project-lead's own reply is the visible signal.
+   Failure cases (no bead match, multi-bead ambiguity) still mail
+   the mayor; in DMs they also get a one-line "couldn't match"
+   ack. Template render verified offline (5891 bytes, no unrendered
+   directives); cos was restarted via `gc session reset gc-83347`
+   to load the new prompt; no prompt-template errors in the
+   supervisor log. Live verification of step 5 happens on the
+   next real Slack inbound — tracked in bd **gc-17z**.
 4. ~~**Per-rig Slack channels — 4a, 4b, 4c blockers**~~ — ALL THREE
    DONE this session. 7 of 13 rigs now have dedicated channels with
    live bindings (see "Per-rig room bindings" table above). Resolver,
@@ -297,19 +341,39 @@ Local-only (not for commit): `city.toml` has
    **Per-rig delivery is self-driving for the 7 bound rigs.** The 6
    remaining rigs need channels — see "Remaining 6 rigs" above for
    the recipe.
-5. **Adapter as systemd user service** so it survives reboot
-   (subsumed by item 2 once that lands; until then,
-   `adapter/SETUP.md` § "Running the adapter as a service").
-6. **`bin/claude-account` atomic-write race** — original blocker
-   that ate account4's `.claude.json`. Fix: `tmp + rename` under a
-   flock. File as a Gas City bead.
-7. **Re-enable `patrol-project-leads`** in `city.toml` once
-   continuous 15m triage is wanted (currently disabled via
-   `[[orders.overrides]]`).
+5. **Adapter as systemd user service** — subsumed by item 2 / gc-5rz.
+   Until Phase A lands, `adapter/SETUP.md` § "Running the adapter as
+   a service" still applies as a workaround.
+6. ~~**`bin/claude-account` atomic-write race**~~ — DONE this session.
+   `/home/ds/gas-city/bin/claude-account` (deployment-local, not in
+   repo) now wraps the bootstrap section in `flock` against
+   `$ACCOUNT_HOME/.claude-account.lock` and writes all three JSON
+   files via `tempfile.mkstemp + os.replace`. Verified with a 20-way
+   concurrent stress test (distinct `GC_WORK_DIR` per spawn): fixed
+   script preserved 20/20 trust writes, JSON valid; control script
+   without flock + tmp-rename preserved only 1/20. No supervisor
+   restart required — `claude-account` is invoked fresh per agent
+   launch. Tracked in bd **gc-arr** (closed).
+7. ~~**Re-enable `patrol-project-leads`**~~ — N/A this session.
+   Investigation revealed the `[[orders.overrides]]` block was a
+   no-op the whole time: all 13 rig patrols + 1 city-level
+   patrol-project-leads have been firing on schedule (every ~16min)
+   regardless of `enabled = false`. Root cause: `ApplyOverrides`
+   (internal/orders/override.go:36-40) only matches overrides with
+   empty `rig` against city-level orders, but `patrol-project-leads`
+   expands per-rig at scan time. The override silently no-op'd;
+   `cmd/gc/order_dispatch.go:97-99` logs but does not surface the
+   "order not found" error. Cleaned up the misleading override
+   block in `city.toml` with a comment about the gotcha. The
+   broader override-mechanism issue is filed as bd **gc-a3s**
+   (upstream-draft) with two recommendations: (a) make
+   `ApplyOverrides` errors fatal at startup so silent no-ops
+   surface; (b) add wildcard `rig = "*"` syntax for "all instances
+   of this name."
 8. ~~**Update older `examples/oversight/chief-of-staff` prompt**~~ —
-   DONE this session. The "When the Human Replies" section in
-   `examples/oversight/agents/chief-of-staff/prompt.template.md` no
-   longer claims inbound replies arrive via `gc mail inbox`; it now
+   DONE in a previous session. The "When the Human Replies" section
+   in `examples/oversight/agents/chief-of-staff/prompt.template.md`
+   no longer claims inbound replies arrive via `gc mail inbox`; it
    documents the system-reminder injection model and tells cos to
    ignore embedded "To reply in <provider>, run …" hints.
 
@@ -365,12 +429,15 @@ done
 - `examples/slack-pack/` — pack scaffold (`bind-dm`, `bind-room`,
   `reply-current`)
 - `examples/slack-pack/README.md` — port checklist & architecture
+- `examples/slack-pack/template-fragments/slack-v0.template.md` —
+  composable prompt fragment now inlined by cos
 - `examples/slack-pack/scripts/slack_chat_bind_room.py` — supports
   `--binding-owner` (item 4b done; validation relaxed to accept
   gc-id when participants are aliases)
 - `examples/slack-pack/scripts/slack_chat_reply_current.py` — defaults
   to `--via gc` so peer fanout fires
 - `examples/oversight-rig/agents/chief-of-staff/prompt.template.md`
+  — slack-v0 composed; step-5 DM-ack rule
 - `examples/oversight-rig/assets/scripts/deliver-rollup.sh` —
   per-rig delivery via resolver + legacy env-var fallback
 - `examples/oversight-rig/assets/scripts/resolve_rig_channel.py` —
@@ -378,6 +445,8 @@ done
 - `examples/oversight-rig/orders/escalate-rollups.toml` — the order
   whose exit-1 was fixed in 4c (controller now injects
   `GC_API_BASE_URL` + `GC_CITY_NAME`)
+- `examples/oversight-rig/orders/patrol-project-leads.toml` — fires
+  every 15min for all 13 rigs (no override; see gc-a3s)
 - `cmd/gc/order_store.go` — `orderExecEnv` injects city name +
   api base url; `orderExecAPIBaseURLHook` is the testing seam
 - `internal/api/handler_extmsg.go` + `_test.go` — provider-neutral
@@ -385,5 +454,12 @@ done
 - `internal/extmsg/binding_service.go` — note: only one active
   binding per conversation; `Bind` returns `ErrBindingConflict`
   if you try to rebind to a different session
+- `internal/orders/override.go` — see gc-a3s; rig-scoping rule
+- `internal/workspacesvc/proxy_process.go` — referenced by the
+  Phase A design (gc-5rz)
+- `docs/investigations/DESIGN-slack-adapter-as-proxy-process.md` —
+  Phase A/B/C design for absorbing the Go adapter
 - `examples/oversight-rig/adapter/SETUP.md` — port-collision note
   for this host (`:8775`/`:8776`)
+- `/home/ds/gas-city/bin/claude-account` (deployment-local, not in
+  repo) — flock + atomic JSON writes; gc-arr
