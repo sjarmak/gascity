@@ -1,0 +1,3 @@
+scope = "city"
+nudge = "Check mail and bd state. Plan or unblock work; mail a rollup to chief-of-staff if anything is off-baseline."
+idle_timeout = "1h"

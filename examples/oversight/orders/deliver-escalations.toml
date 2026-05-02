@@ -1,0 +1,6 @@
+[order]
+description = "Deliver open escalation beads to the configured external channel and mark them delivered"
+trigger = "cooldown"
+interval = "1m"
+exec = "bash $GC_PACK_DIR/assets/scripts/deliver-escalation.sh"
+timeout = "2m"

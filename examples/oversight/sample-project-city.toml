@@ -1,0 +1,33 @@
+# Sample per-project city for the oversight pack.
+#
+# Copy this file into each project directory you want under oversight,
+# customize [workspace].name and the [[agent]] block, then register the
+# city with the supervisor:
+#
+#   gc supervisor run &     # if not already running
+#   gc register /path/to/this/project
+#
+# The chief-of-staff agent runs in the meta city, not here. This city
+# only runs a project-mayor for THIS project.
+
+[workspace]
+name = "project-EXAMPLE"   # rename per project
+provider = "claude"
+
+[imports.oversight]
+source = "/path/to/examples/oversight"   # or a git URL pinned by ref
+
+[daemon]
+patrol_interval = "30s"
+max_restarts = 5
+restart_window = "1h"
+shutdown_timeout = "5s"
+
+# Per-project mayor. Customize `dir`, `idle_timeout`, and any
+# project-specific pre_start scripts here.
+[[agent]]
+name = "project-mayor"
+dir = "."
+prompt_template = "/path/to/examples/oversight/agents/project-mayor/prompt.template.md"
+nudge = "Check mail and bd state. Plan or unblock work; mail a rollup to chief-of-staff if anything is off-baseline."
+idle_timeout = "1h"

@@ -1,0 +1,7 @@
+[order]
+description = "Patrol blocked work across projects and write escalation beads when warranted"
+trigger = "cooldown"
+interval = "15m"
+formula = "mol-escalate-blocked"
+pool = "chief-of-staff"
+timeout = "5m"

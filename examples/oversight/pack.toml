@@ -1,0 +1,52 @@
+# Oversight — multi-project oversight pack.
+#
+# Bounded-context pattern for running many projects under varying levels
+# of human oversight. Each project is its own city under `gc supervisor`,
+# with a per-project Mayor whose context is bounded to that project's
+# beads and events. A separate "meta" city runs a `chief-of-staff` agent
+# that ingests structured rollups across projects and surfaces to the
+# human via extmsg.
+#
+# Escalation is triggered by orders, not by Mayor judgment, so
+# attention-worthy events can't be missed by a distracted Mayor.
+# Delivery is split: the chief-of-staff writes escalation beads
+# (label:escalation) and the deliver-escalations order ferries them
+# to the configured external channel.
+#
+# Topology:
+#
+#   meta city                              project city (one per project)
+#   ┌───────────────────────────┐         ┌──────────────────────────────┐
+#   │  chief-of-staff           │ <--mail │  project-mayor               │
+#   │  (always-on, stamped)     │ rollup  │  (always-on, inline [[agent]]│
+#   │                           │         │   in each project city.toml) │
+#   │  • triages cross-project  │         │                              │
+#   │  • writes escalation      │         │  • plans project work        │
+#   │    beads                  │         │  • mails rollups to          │
+#   │  • bound to extmsg        │         │    chief-of-staff            │
+#   │    conversation           │         │  • does not escalate         │
+#   └───────────────────────────┘         │    directly                  │
+#                                         └──────────────────────────────┘
+#
+# Why chief-of-staff is stamped but project-mayor is not:
+#   The chief-of-staff is the same role in every meta city — the pack
+#   can stamp it. The project-mayor needs per-project knobs (working
+#   directory, idle timeout tuned to project cadence, optional pre_start
+#   scripts), so each project defines its own [[agent]] inline that
+#   references the pack-provided prompt template.
+#
+# To use:
+#   1. Per-project city.toml: copy sample-project-city.toml, customize
+#                             the [[agent]] block, set [imports.oversight]
+#   2. Meta city.toml:        copy sample-meta-city.toml, set
+#                             [imports.oversight], bind extmsg session
+#   3. gc supervisor run; gc register <each project>; gc register <meta>
+
+[pack]
+name = "oversight"
+schema = 2
+
+[[named_session]]
+template = "chief-of-staff"
+scope = "city"
+mode = "always"

@@ -1,0 +1,49 @@
+# Sample meta city for the oversight pack.
+#
+# The meta city runs the chief-of-staff agent. It does not run any
+# project work itself — its only job is to ingest rollups from project
+# mayors, decide what to escalate, and deliver escalations to the human
+# via extmsg.
+#
+# Setup (one-time, after `gc start`):
+#
+#   1. Bind the chief-of-staff session to your Slack/email conversation:
+#
+#        SESSION_ID=$(gc session list --agent chief-of-staff --json \
+#          | jq -r '.[0].id')
+#        curl -X POST "${GC_API_BASE_URL}/v0/city/oversight-meta/extmsg/bind" \
+#          -H 'Content-Type: application/json' \
+#          -d "{\"session_id\": \"${SESSION_ID}\",
+#                \"conversation\": {
+#                  \"provider\": \"slack\",
+#                  \"account_id\": \"<your-workspace>\",
+#                  \"id\": \"<channel-id>\"
+#                }}"
+#
+#   2. Export the env vars consumed by deliver-escalation.sh in this
+#      city's runtime (or set them in your shell before `gc start`):
+#
+#        export GC_API_BASE_URL=http://127.0.0.1:7777
+#        export GC_CITY_NAME=oversight-meta
+#        export GC_OVERSIGHT_SESSION_ID=$SESSION_ID
+#
+# Once both project cities and this meta city are registered with
+# `gc supervisor`, the loop runs end-to-end.
+
+[workspace]
+name = "oversight-meta"
+provider = "claude"
+
+[imports.oversight]
+source = ".."
+
+[daemon]
+patrol_interval = "30s"
+max_restarts = 5
+restart_window = "1h"
+shutdown_timeout = "5s"
+
+# The pack stamps a chief-of-staff agent automatically via [[named_session]].
+# Nothing else to wire up here — project-mayor is intentionally not stamped
+# (each project city declares its own inline [[agent]] using the pack's
+# project-mayor prompt template).

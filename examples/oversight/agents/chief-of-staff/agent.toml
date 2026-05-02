@@ -1,0 +1,3 @@
+scope = "city"
+nudge = "Check mail, run a triage pass, decide if anything needs escalating."
+idle_timeout = "1h"

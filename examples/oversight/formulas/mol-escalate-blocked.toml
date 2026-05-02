@@ -1,0 +1,62 @@
+description = """
+Investigate stalled work and write an escalation bead if attention is warranted.
+
+Order formula — dispatched on a 15m cooldown by `orders/escalate-blocked.toml`.
+Runs in the chief-of-staff agent. The agent reads bd state across projects,
+decides whether escalation is justified (ZFC: the model judges, the order
+just fires), and writes a structured escalation bead. Delivery is handled
+by a separate order (`deliver-escalations`) that watches for those beads."""
+formula = "mol-escalate-blocked"
+version = 1
+
+[[steps]]
+id = "triage"
+title = "Triage stalled work and write escalation beads"
+description = """
+Survey blocked or stalled work across projects and decide whether the human
+needs to know.
+
+1. For each registered project city, query stalled work:
+   ```bash
+   gc bd list --status blocked --json
+   gc bd list --status in_progress --json
+   ```
+
+2. For each candidate, judge whether it warrants human attention:
+   - **Escalate**: agent stuck, repeated retries, ambiguous spec, blocked
+     on a decision only the human can make, infrastructure failure with
+     no recovery path.
+   - **Skip**: correctly waiting on an upstream gate, recently created,
+     within normal time-to-completion for similar work.
+
+3. Before writing, check for an existing open escalation bead referencing
+   the same project + bead id within the last 24h:
+   ```bash
+   gc bd list --label escalation --status open --json
+   ```
+   If one exists, skip — do not double-page the human.
+
+4. For each item that warrants escalation, write one bead:
+   ```bash
+   gc bd create "Escalation: <one-line summary>" \\
+     -t task \\
+     --label escalation \\
+     --label "project:<project-name>" \\
+     --label "ref:<source-bead-id>" \\
+     --description "<see template below>"
+   ```
+
+   Description template:
+   ```
+   Project: <name>
+   Source bead: <id>
+   Stuck since: <timestamp>
+   Why stuck: <one paragraph, plain language>
+   Smallest ask: <single concrete question or decision the human can make>
+   ```
+
+5. Close this step with output indicating how many escalations were written.
+   Quiet runs (zero escalations) are correct runs — do not invent work.
+
+Do NOT attempt to deliver to Slack/email here. The `deliver-escalations`
+order picks up the new beads and POSTs to the extmsg outbound API."""
