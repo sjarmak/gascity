@@ -1,9 +1,9 @@
-# Oversight-rig handoff — 2026-05-02 (Phase A cutover attempt + rollback)
+# Oversight-rig handoff — 2026-05-02 (Phase A cutover rollback + slack-pack expansion)
 
 ## State
 
 Two-way Slack ↔ gc oversight loop is **fully working end-to-end**
-across the city DM and 7 per-rig channels. cos is now running on the
+across the city DM and 7 per-rig channels. cos is running on the
 slack-v0-aware prompt (DM-ack on step 5, room-silence rule). The
 patrol-project-leads order is firing for all 13 rigs every ~16min —
 contrary to a previous handoff claim, it was never actually disabled
@@ -18,15 +18,28 @@ against real Slack inbound:
 - quiet-tick (no system-reminder, empty mail)
 - prime (first awake read of the prompt)
 
-A new `examples/slack-pack/` scaffolds a slack-side parallel of
-`gastownhall/gascity-packs/discord` with `gc slack bind-dm`,
-`gc slack reply-current`, and `gc slack bind-room` (with
-peer-fanout policy + `--binding-owner` plumbing).
+`examples/slack-pack/` is a slack-side parallel of
+`gastownhall/gascity-packs/discord`. Five commands are implemented and
+backed by 39 unit tests:
 
-The supervisor was restarted onto the rebuilt binary this session.
+- `gc slack bind-dm` — bind a DM to a session
+- `gc slack bind-room` — bind a room to N sessions w/ peer-fanout +
+  `--binding-owner` plumbing
+- `gc slack reply-current` — reply to the latest inbound (default
+  `--via gc` so peer fanout fires; `--via adapter` for diagnostics)
+- `gc slack status` — read-only diagnostics: adapters, bindings,
+  recent traffic; `--session/--since/--limit/--json` flags. Replaces
+  the curl + jq combos that piled up while debugging cutovers.
+- `gc slack publish` — publish to a session's saved binding (no
+  event-scan fallback; fails fast if the session has no binding).
+  Sibling to `reply-current`: explicit "send X" intent.
+
 Per-rig rollout for 7 of 13 rigs is live — outbound publish,
 peer-fanout to cos, and inbound `kind=room` classification all
-verified end-to-end.
+verified end-to-end. The Phase A proxy_process cutover (gc-5rz) was
+attempted this session and rolled back cleanly after surfacing a real
+SDK-side defect; legacy nohup adapter mode is the steady state until
+**bd gc-cdf** lands (see "Open work" item 2).
 
 ## Live runtime
 
@@ -123,7 +136,13 @@ specify its own formatting contract.
 ## What's on the branch
 
 ```
-c1e1f6a1 feat(slack-pack): adapter UDS mode + [[service]] proxy_process (gc-5rz Phase A)  ← THIS SESSION, LOCAL ONLY
+27e603cc chore(slack-pack): drop YAGNI bare-list branch in slack status _events
+3edeb3d0 feat(slack-pack): gc slack publish — publish to a session's binding
+111641dd feat(slack-pack): gc slack status — read-only diagnostics
+9dbd92d2 docs(oversight-rig): point handoff at gc-cdf for proxy_process URL bug
+c0922bba docs(slack-pack): roll back Phase A cutover; pin defect to gc-5rz
+5e83d8fc docs(oversight-rig): handoff after gc-5rz Phase A + gc-a3s investigation handoff
+c1e1f6a1 feat(slack-pack): adapter UDS mode + [[service]] proxy_process (gc-5rz Phase A)
 070f39c1 docs(oversight-rig): cos slack-v0 prompt + Phase A design + handoff refresh
 74b56fc1 docs(oversight-rig): handoff after 7-rig rollout + 4a/4b/4c done
 92493163 feat(slack-pack): bind-room --binding-owner
@@ -132,34 +151,84 @@ c1e1f6a1 feat(slack-pack): adapter UDS mode + [[service]] proxy_process (gc-5rz 
 ... (earlier slack-adapter commits)
 ```
 
-**Branch status:** 1 commit ahead of `fork/feat/oversight-rig-pack`.
-NOT pushed. Local-only by user request.
+**Branch status:** 29 commits ahead of `origin/main`. NOT pushed.
+Local-only by user request. The 5 most recent commits are all from
+this session: 1 cutover-rollback + handoff pointer pair, 2 new pack
+commands (status, publish), 1 follow-up cleanup.
 
-## Cutover (DONE — twice this branch)
+## Cutovers (3 attempted this branch — 2 succeeded, 1 rolled back)
 
-Cutover #1 (last session) brought the supervisor onto the `bind-room` +
-fanout-policy build. Cutover #2 (this session) brought it onto the
-order-exec env-injection build (item 4c). Current supervisor PID
-2575673, current adapter PID 2582270 (see Live runtime).
+Cutover #1 (prior session) brought the supervisor onto the `bind-room` +
+fanout-policy build. Cutover #2 (prior session) brought it onto the
+order-exec env-injection build (item 4c). Cutover #3 (this session)
+attempted Phase A proxy_process and **rolled back** after the SDK URL
+defect surfaced — see "Open work" item 2 and bd gc-cdf. All 8
+bindings (cos DM + 7 rig rooms) preserved across the cutover+rollback
+round trip; the canary binding `gc-83781` was already cleaned up in a
+prior session.
 
-Sequence used (for reference if it has to happen again):
+Current supervisor PID **4187273** (manually-started this session
+with SLACK_* env sourced; supervisor inherits the adapter secrets and
+is ready for any future Phase A retry). Current adapter PID **199927**
+(legacy nohup mode at `:8766/publish`). See Live runtime for full
+context.
+
+Sequence used (for reference; same shape worked for #1 and #2, and
+the disruptive part of #3 before the defect appeared):
 
 ```
 /tmp/gc stop /home/ds/gas-city
 /tmp/gc supervisor stop
+set -a; source ~/.config/gc-slack-adapter/env; set +a   # critical
+pkill -f 'gc-slack-adapter$'                            # if needed
 /tmp/gc supervisor start
 /tmp/gc start /home/ds/gas-city
-pkill -f "gc-slack-adapter$"
 ( cd /home/ds/gascity/examples/oversight-rig/adapter \
   && nohup ./run.sh > /tmp/gc-slack-adapter/run.log 2>&1 & disown )
 ```
 
 `gc stop` takes ~3min on a city with ~30 background sessions
 (stops in waves of 1–2 per second). Sessions reattach on `gc start`.
-All cos + project-lead conversation bindings survived intact across
-both cutovers; the canary binding `gc-83781` survived as well.
 
-## Findings from this session's cleanup pass
+For Phase A retries (after gc-cdf lands): same first 4 lines, then
+`gc reload` instead of restarting the manual adapter — the
+proxy_process service block in `examples/slack-pack/pack.toml`
+(currently commented out) handles the adapter lifecycle.
+
+## Findings from this session (rollback + slack-pack expansion)
+
+1. **proxy_process URL contract is broken on the SDK side.**
+   `GC_SERVICE_URL_PREFIX` is injected as `/svc/<name>` but the
+   supervisor's API only mounts `/v0/city/<cityName>/svc/<name>/*` on
+   the public listener. Any service whose registered CallbackURL is
+   called inbound by gc (slack adapter today; any future provider
+   tomorrow) 404s on gc's own router. Filed as bd **gc-cdf** (P1)
+   with full root cause, three fix options, and acceptance criteria.
+   gc-cdf blocks gc-5rz cutover.
+2. **Two new pack commands shipped, no upstream-PR dependency.**
+   `gc slack status` (read-only diagnostics; replaces ~5 curl + jq
+   one-liners I kept running) and `gc slack publish` (explicit publish
+   to a session's saved binding, sibling to `reply-current`). Pack
+   went from 3 commands → 5; 39/39 unit tests pass; both verified
+   live against the running ds-research city.
+3. **`find_latest_inbound_for_session` works correctly.** Earlier
+   handoff suspicion that the events endpoint returned a bare array
+   (and that the helper's `.get("items", [])` was silently returning
+   `[]` in production) was wrong — the API consistently returns
+   `{items, total}`. Original observation was a jq expression
+   precedence error, not a server-side mismatch. Live test:
+   `find_latest_inbound_for_session('gc-83347')` returns the cos-DM
+   inbound at ts=2026-05-02T11:57:45 matching `gc slack status`.
+4. **systemd `gascity-supervisor.service` crash-loop is cosmetic
+   only.** When the supervisor is started manually (so SLACK_* env
+   is in its environment), the systemd unit can't bind `:8372` and
+   restarts every ~5s. Same shape as previous cutovers; harmless
+   beyond log noise. Will resolve itself once the manual supervisor
+   exits (the systemd one will then take over — but it lacks SLACK_*
+   in `Environment=`, so the proxy_process adapter would fail there
+   too; that's why we're running manually).
+
+## Findings from earlier sessions
 
 1. **`orders.overrides` rig-scoping is silently no-op for per-rig
    orders.** A `[[orders.overrides]]` block with no `rig` field
@@ -224,20 +293,21 @@ Local-only (not for commit): `city.toml` has
 
 ## Open work, in priority order
 
-> **Session-end note (2026-05-02 Phase A cutover attempt):** the live
-> cutover for item 2 was attempted this session and **rolled back**
-> after surfacing a real defect. Service was restored to legacy nohup
-> mode; all 8 bindings (cos DM + 7 rig rooms) preserved across the
-> cutover+rollback. **Phase A `[[service]]` block is now commented out
-> in `examples/slack-pack/pack.toml`** with a pointer to bd gc-5rz.
-> Defect: `GC_SERVICE_URL_PREFIX` is injected as `/svc/<name>` but the
-> supervisor only routes `/v0/city/<cityName>/svc/<name>/*` to the
-> per-city proxy mux — adapter's registered CallbackURL ends up 404'ing
-> on gc's own router. Full root-cause + three fix options recorded in
-> bd gc-5rz notes. Items 1, 3, 4 (a/b/c), 6, 7, 8 + canary cleanup
-> remain DONE from prior sessions. Item 5 still subsumed by item 2.
-> gc-a3s investigation handoff intact (separate `gascity-gascity-pr/`
-> worktree).
+> **Session-end note (2026-05-02 rollback + slack-pack expansion):**
+> Phase A cutover attempted this session and **rolled back** after a
+> real SDK-side defect surfaced. Filed separately as bd **gc-cdf**
+> (P1, blocks gc-5rz). Pack `[[service]]` block commented out with a
+> pointer to gc-5rz; manual nohup adapter is the steady state. All 8
+> bindings (cos DM + 7 rig rooms) preserved across the round trip.
+>
+> Two new pack commands shipped (zero upstream-PR dependency):
+> `gc slack status` and `gc slack publish`. Slack-pack now has 5
+> commands and 39/39 tests passing. See "What's on the branch" for
+> the 5-commit history of this session.
+>
+> Items 1, 3, 4 (a/b/c), 6, 7, 8 + canary cleanup remain DONE from
+> prior sessions. Item 5 still subsumed by item 2. gc-a3s investigation
+> handoff intact (separate `gascity-gascity-pr/` worktree).
 
 1. ~~**Switch `gc slack reply-current` to publish through gc
    `/extmsg/outbound`**~~ — DONE this session. `reply-current` now
