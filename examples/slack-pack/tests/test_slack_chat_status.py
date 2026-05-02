@@ -43,6 +43,11 @@ def _make_router(routes: dict[str, Any]):
     The fake matches the longest substring registered in ``routes`` so
     callers can register both '/extmsg/adapters' and
     '/events?type=extmsg.inbound' without one swallowing the other.
+
+    Convenience: a bare list under an ``events?`` key is wrapped in
+    ``{"items": list}`` automatically so test fixtures can stay terse
+    and the wrapping shape lives in one place — matching what the live
+    /events endpoint returns.
     """
     captured: list[dict[str, Any]] = []
 
@@ -53,6 +58,8 @@ def _make_router(routes: dict[str, Any]):
             if needle in url:
                 if isinstance(response, Exception):
                     raise response
+                if needle.startswith("events?") and isinstance(response, list):
+                    return {"items": response, "total": len(response)}
                 return response
         raise AssertionError(f"unexpected URL in test: {url}")
 

@@ -24,25 +24,16 @@ import slack_intake_common as common
 
 
 def _events(event_type: str, limit: int, since: str) -> list[dict[str, Any]]:
-    """Fetch a slice of events. Returns [] on transport failure or empty.
-
-    The /events endpoint returns a bare JSON array (not wrapped in
-    ``{items: [...]}``), so we parse via _request and accept either shape
-    defensively.
-    """
+    """Fetch a slice of events. Returns [] on transport failure or empty."""
     qs = [f"type={event_type}", f"limit={limit}"]
     if since:
         qs.append(f"since={since}")
     url = f"{common.gc_api_base()}/v0/city/{common.gc_city_name()}/events?" + "&".join(qs)
     try:
-        raw = common._request("GET", url, csrf=False)
+        res = common._request("GET", url, csrf=False)
     except common.GCAPIError:
         return []
-    if isinstance(raw, list):
-        return raw
-    if isinstance(raw, dict):
-        return list(raw.get("items") or [])
-    return []
+    return list(res.get("items") or [])
 
 
 def _adapters() -> list[dict[str, Any]]:
