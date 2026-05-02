@@ -1,4 +1,4 @@
-# Oversight-rig handoff — 2026-05-02 (post-cleanup session)
+# Oversight-rig handoff — 2026-05-02 (Phase A + a3s handoff session)
 
 ## State
 
@@ -122,15 +122,17 @@ specify its own formatting contract.
 ## What's on the branch
 
 ```
-<this commit> feat(slack-pack): bind-room + fanout policy plumbing
-8495e4d7 feat(slack-pack): scaffold + bind-dm + reply-current
-054b92a6 docs(oversight-rig): handoff after end-to-end validation
-3f95d85f fix(oversight-rig): drop redundant min/max_active_sessions on project-lead
-e9c07d31 feat(oversight-rig): adapt chief-of-staff to system-reminder delivery
-16a82b6d fix(api): make extmsg inbound system-reminder provider-neutral
-9ae8003c docs(oversight-rig): handoff state for next agent
+c1e1f6a1 feat(slack-pack): adapter UDS mode + [[service]] proxy_process (gc-5rz Phase A)  ← THIS SESSION, LOCAL ONLY
+070f39c1 docs(oversight-rig): cos slack-v0 prompt + Phase A design + handoff refresh
+74b56fc1 docs(oversight-rig): handoff after 7-rig rollout + 4a/4b/4c done
+92493163 feat(slack-pack): bind-room --binding-owner
+8a6b3c1f feat(controller): inject GC_API_BASE_URL + GC_CITY_NAME into order exec env
+3d7eee3c docs(oversight-rig): handoff after live cutover + canary findings
 ... (earlier slack-adapter commits)
 ```
+
+**Branch status:** 1 commit ahead of `fork/feat/oversight-rig-pack`.
+NOT pushed. Local-only by user request.
 
 ## Cutover (DONE — twice this branch)
 
@@ -221,13 +223,14 @@ Local-only (not for commit): `city.toml` has
 
 ## Open work, in priority order
 
-> **Session-end note (2026-05-02 cleanup pass):** items 1, 4 (a/b/c),
-> 6, 7, 8, and the canary cleanup are all DONE. Item 3 prompt edit
-> landed and cos was restarted. Item 2 has a design doc;
-> implementation is tracked in bd `gc-5rz`. Item 5 will be subsumed
-> by item 2 once Phase A lands. New finding gc-a3s captures the
-> orders.overrides rig-scoping bug surfaced while investigating
-> item 7.
+> **Session-end note (2026-05-02 Phase A pass):** items 1, 3, 4 (a/b/c),
+> 6, 7, 8, and the canary cleanup are all DONE from prior sessions.
+> Item 2 (Phase A — adapter UDS mode + [[service]] block) is now
+> IMPLEMENTED in commit c1e1f6a1, but the live cutover step is
+> deferred (would disrupt the live rig + 7 channel bindings). Item 5
+> is subsumed. gc-a3s investigation is done — design notes attached
+> to the bead, handed off to a separate PR-agent worktree at
+> `gascity-gascity-pr/`.
 
 1. ~~**Switch `gc slack reply-current` to publish through gc
    `/extmsg/outbound`**~~ — DONE this session. `reply-current` now
@@ -241,24 +244,43 @@ Local-only (not for commit): `city.toml` has
    already serves `/extmsg/outbound`, so no supervisor restart is
    needed for this change to take effect — pack scripts hit gc over
    HTTP at runtime.
-2. **Absorb the Go adapter into the slack pack as a
-   `[[service]] proxy_process`.** Design landed this session at
-   `docs/investigations/DESIGN-slack-adapter-as-proxy-process.md`.
+2. ~~**Absorb the Go adapter into the slack pack as a
+   `[[service]] proxy_process`** (Phase A)~~ — IMPLEMENTED this
+   session in commit c1e1f6a1.
 
-   **Decision (option b):** UDS for `/publish`, keep public TCP
-   `:8775` for `/slack/events`. Adapter activates UDS mode when
-   `$GC_SERVICE_SOCKET` is set (so legacy mode preserved for
-   rollback). pack.toml gets a `[[service]] kind = "proxy_process"`
-   block with a `health_path = "/healthz"` probe over the UDS.
-   Tailscale Funnel stays unchanged; secrets stay in
-   `~/.config/gc-slack-adapter/env` for now. ~80 lines of adapter
-   Go + ~10 lines of TOML + a README cutover note. No gc-side
-   changes, no schema work, no public surface expansion.
+   **Shipped:**
+   - Adapter (`examples/oversight-rig/adapter/main.go`) reads
+     `GC_SERVICE_SOCKET`; when set, binds UDS for `/publish` +
+     `/healthz` instead of internal TCP `:8776`. Public TCP `:8775`
+     for `/slack/events` unchanged.
+   - Self-registration callback URL composed from
+     `$GC_API_BASE_URL + $GC_SERVICE_URL_PREFIX`. **Design doc
+     correction:** said "+ /publish" but gc's
+     `internal/extmsg/http_adapter.go:62` appends `/publish` itself,
+     so registered base must NOT include it. README spells this out.
+   - `examples/slack-pack/pack.toml` declares the `[[service]]` block
+     (kind=proxy_process, visibility=private,
+     command=`./adapter/gc-slack-adapter`, health_path=`/healthz`).
+     Validated against `config.ValidateServices` via
+     `internal/config/zz_slack_pack_validate_test.go`.
+   - Slack-pack README has full Phase A section: env-injection
+     contract, env-file secrets path, 7-step cutover, rollback,
+     three foot-guns.
+   - 4 new adapter tests for `loadConfigFromEnv` (legacy mode, UDS
+     callback URL derivation, slash normalization, missing-prefix
+     rejection); all green with `-race`. Existing config +
+     workspacesvc + cmd/gc tests stay green.
+   - Adapter binary builds; legacy nohup mode preserved as rollback
+     target (env var unset → today's TCP-only behavior).
 
-   Phase B (secrets in pack.toml) and Phase C (gc-terminated TLS
-   for the public webhook) are deferred. Implementation tracked
-   in bd **gc-5rz**. Until that lands, keep
-   `examples/oversight-rig/adapter/run.sh` as-is.
+   **Deferred:** the live cutover step from the bead acceptance.
+   Running it would kill the running adapter (PID 2582270), force a
+   `gc reload`, and require re-verifying outbound + inbound across
+   the 7 bound rigs. Recipe is in slack-pack README "Cutover
+   sequence". Run at chosen time.
+
+   Phase B (secrets in pack.toml) and Phase C (gc-terminated TLS for
+   public webhook) remain deferred — out of scope for v1.
 3. ~~**Switch the chief-of-staff prompt to compose `slack-v0`**~~ —
    DONE this session.
    `examples/oversight-rig/agents/chief-of-staff/prompt.template.md`
@@ -354,6 +376,20 @@ Local-only (not for commit): `city.toml` has
    without flock + tmp-rename preserved only 1/20. No supervisor
    restart required — `claude-account` is invoked fresh per agent
    launch. Tracked in bd **gc-arr** (closed).
+9. **gc-a3s upstream investigation handoff.** Investigation pass
+   completed this session — all design notes attached to bd
+   **gc-a3s** via `--design`. Key findings: bug surface is wider
+   than the original report (3 silent-swallow sites, not 1 — added
+   `cmd/gc/api_state.go:699-700`); zero shipped configs in
+   `examples/` use `[[orders.overrides]]` so the fix breaks no
+   examples; recommended single PR (~15 LOC production +
+   ~80-160 LOC test); three open design questions (reload-path
+   semantics, API endpoint behavior, error message wording).
+   **PR work is happening in a separate worktree at
+   `gascity-gascity-pr/`** (the user spun a fresh Claude session
+   there). DO NOT touch the orders-override code path on this
+   branch — let the PR session land first.
+
 7. ~~**Re-enable `patrol-project-leads`**~~ — N/A this session.
    Investigation revealed the `[[orders.overrides]]` block was a
    no-op the whole time: all 13 rig patrols + 1 city-level
@@ -376,6 +412,30 @@ Local-only (not for commit): `city.toml` has
    no longer claims inbound replies arrive via `gc mail inbox`; it
    documents the system-reminder injection model and tells cos to
    ignore embedded "To reply in <provider>, run …" hints.
+
+## Gotcha for next session — nested PR worktree
+
+The user created a worktree for the gc-a3s PR work at
+`/home/ds/gascity/gascity-gascity-pr/` (NESTED inside the main repo
+tree). This trips two tests in `make test`:
+
+- `internal/testenv` lint check finds the worktree's
+  `lint_test.go` and `testenv_test.go` files and complains they
+  lack the canonical `testenv_import_test.go`.
+- `test/docsync.TestDocDirCoverage` sees markdown under
+  `gascity-gascity-pr/` and fails because the path isn't in
+  `docTreeDirs`/`docTreeIgnored`.
+
+Neither is a real regression — they're both side effects of the
+worktree placement. Fix options for the next agent:
+- Move the worktree to a sibling path (`/home/ds/gascity-gascity-pr`
+  instead of nested).
+- Or add `gascity-gascity-pr/` to `.gitignore` AND skip-list it in
+  the two failing tests.
+
+For now, smoke-test packages adjacent to changes directly
+(`go test ./internal/config/ ./internal/workspacesvc/ ./cmd/gc/...`)
+to bypass the noise.
 
 ## How to verify if returning fresh
 
