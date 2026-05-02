@@ -1369,6 +1369,101 @@ func TestOrderDispatchExecRigUsesScopedWorkdirAndStoreEnv(t *testing.T) {
 	}
 }
 
+func TestOrderExecEnvInjectsCityNameAndAPIBaseURL(t *testing.T) {
+	// Order exec scripts in packs commonly need to call back into the
+	// running supervisor (e.g. /extmsg/outbound). The controller knows
+	// both its API base URL (from supervisor config) and the city name
+	// (from cfg) and must surface them so pack scripts don't have to
+	// hardcode either. Without this, deliver-rollup.sh and similar
+	// scripts exit 1 on their `${VAR:?}` checks before doing any work.
+	store := beads.NewMemStore()
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	prevHook := orderExecAPIBaseURLHook
+	t.Cleanup(func() { orderExecAPIBaseURLHook = prevHook })
+	orderExecAPIBaseURLHook = func() string { return "http://127.0.0.1:9000" }
+
+	envCh := make(chan []string, 1)
+	fakeExec := func(_ context.Context, _, _ string, env []string) ([]byte, error) {
+		envCh <- env
+		return nil, nil
+	}
+	aa := []orders.Order{{
+		Name:     "ping",
+		Rig:      "frontend",
+		Trigger:  "cooldown",
+		Interval: "1m",
+		Exec:     "scripts/ping.sh",
+		Source:   "/city/formulas/orders/ping/order.toml",
+	}}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, fakeExec, nil)
+	mad := ad.(*memoryOrderDispatcher)
+	mad.cfg = &config.City{
+		Workspace: config.Workspace{Name: "test-city", Prefix: "ct"},
+		Rigs:      []config.Rig{{Name: "frontend", Path: "frontend", Prefix: "fe"}},
+	}
+
+	ad.dispatch(context.Background(), cityDir, time.Now())
+
+	got := orderDispatchTestEnv(t, envCh)
+	if got["GC_CITY_NAME"] != "test-city" {
+		t.Fatalf("GC_CITY_NAME = %q, want %q", got["GC_CITY_NAME"], "test-city")
+	}
+	if got["GC_API_BASE_URL"] != "http://127.0.0.1:9000" {
+		t.Fatalf("GC_API_BASE_URL = %q, want %q", got["GC_API_BASE_URL"], "http://127.0.0.1:9000")
+	}
+}
+
+func TestOrderExecEnvOmitsAPIBaseURLWhenHookEmpty(t *testing.T) {
+	// When no supervisor config exists (e.g. one-off CLI runs outside a
+	// supervised city), GC_API_BASE_URL stays unset rather than
+	// pointing at the wrong place. Pack scripts surface the missing
+	// var via their own `${VAR:?}` checks.
+	store := beads.NewMemStore()
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	prevHook := orderExecAPIBaseURLHook
+	t.Cleanup(func() { orderExecAPIBaseURLHook = prevHook })
+	orderExecAPIBaseURLHook = func() string { return "" }
+
+	envCh := make(chan []string, 1)
+	fakeExec := func(_ context.Context, _, _ string, env []string) ([]byte, error) {
+		envCh <- env
+		return nil, nil
+	}
+	aa := []orders.Order{{
+		Name:     "ping",
+		Rig:      "frontend",
+		Trigger:  "cooldown",
+		Interval: "1m",
+		Exec:     "scripts/ping.sh",
+	}}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, fakeExec, nil)
+	mad := ad.(*memoryOrderDispatcher)
+	mad.cfg = &config.City{
+		Workspace: config.Workspace{Name: "test-city", Prefix: "ct"},
+		Rigs:      []config.Rig{{Name: "frontend", Path: "frontend", Prefix: "fe"}},
+	}
+
+	ad.dispatch(context.Background(), cityDir, time.Now())
+
+	got := orderDispatchTestEnv(t, envCh)
+	if _, ok := got["GC_API_BASE_URL"]; ok {
+		t.Fatalf("GC_API_BASE_URL should be unset when hook returns empty, got %q", got["GC_API_BASE_URL"])
+	}
+	if got["GC_CITY_NAME"] != "test-city" {
+		t.Fatalf("GC_CITY_NAME = %q, want %q", got["GC_CITY_NAME"], "test-city")
+	}
+}
+
 func TestOrderDispatchExecMarksExternalDoltTargetForManagedLocalOnlyOrders(t *testing.T) {
 	store := beads.NewMemStore()
 	cityDir := t.TempDir()

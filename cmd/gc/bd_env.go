@@ -587,7 +587,9 @@ func mergeRuntimeEnv(environ []string, overrides map[string]string) []string {
 		"BEADS_DOLT_SERVER_HOST",
 		"BEADS_DOLT_SERVER_PORT",
 		"BEADS_DOLT_SERVER_USER",
+		"GC_API_BASE_URL",
 		"GC_CITY",
+		"GC_CITY_NAME",
 		"GC_CITY_ROOT", // kept for stripping: no code emits this anymore, but inherited values must be cleaned
 		"GC_CITY_PATH",
 		"GC_CITY_RUNTIME_DIR",

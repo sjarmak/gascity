@@ -88,6 +88,19 @@ func orderStoreTargetKey(target execStoreTarget) string {
 	return target.ScopeKind + "\x00" + filepath.Clean(target.ScopeRoot)
 }
 
+// orderExecAPIBaseURLHook resolves the supervisor's HTTP base URL for
+// injection into order exec env. Returns "" when no supervisor config
+// exists (e.g. unit tests run without ever installing one), in which
+// case GC_API_BASE_URL is left unset and pack scripts that need it
+// must surface a clear error themselves.
+var orderExecAPIBaseURLHook = func() string {
+	url, err := supervisorAPIBaseURL()
+	if err != nil {
+		return ""
+	}
+	return url
+}
+
 func orderExecEnv(cityPath string, cfg *config.City, target execStoreTarget, a orders.Order) []string {
 	var env map[string]string
 	if target.ScopeKind == "rig" {
@@ -99,6 +112,12 @@ func orderExecEnv(cityPath string, cfg *config.City, target execStoreTarget, a o
 	env["GC_STORE_ROOT"] = target.ScopeRoot
 	env["GC_STORE_SCOPE"] = target.ScopeKind
 	env["GC_BEADS_PREFIX"] = target.Prefix
+	if cityName := loadedCityName(cfg, cityPath); cityName != "" {
+		env["GC_CITY_NAME"] = cityName
+	}
+	if apiBase := orderExecAPIBaseURLHook(); apiBase != "" {
+		env["GC_API_BASE_URL"] = apiBase
+	}
 	if target.ScopeKind == "rig" {
 		env["GC_RIG"] = target.RigName
 		env["GC_RIG_ROOT"] = target.ScopeRoot
