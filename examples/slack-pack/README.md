@@ -24,7 +24,9 @@ is intended to be promoted to the `gastownhall/gascity-packs` repo
       `--default-handle`, `--handle HANDLE=SESSION` (creates a
       launcher-mode group + participants under the hood)
 - [ ] `gc slack enable-room-launch` (`@@handle` thread-scoped sessions)
-- [ ] `gc slack publish` (explicit publish to a saved binding)
+- [x] `gc slack publish` (publish to a session's saved binding;
+      target session is required, no event-scan fallback —
+      fail-fast when the session has no active binding)
 - [ ] `gc slack import-app` / `map-channel` / `map-rig` / `sync-commands`
       (slash-command intake — `/gc fix` style)
 - [ ] `gc slack post-message` (workflow status projection)

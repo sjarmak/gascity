@@ -14,10 +14,12 @@
 #                                with optional fanout policy
 #   gc slack status            — read-only diagnostics: adapters, bindings,
 #                                recent traffic; --session/--since/--json
+#   gc slack publish           — publish to a session's saved binding
+#                                (no event-scan fallback; fails fast when
+#                                the session has no active binding)
 #
 # Not yet implemented (see README.md "Port checklist"):
 #   gc slack enable-room-launch  (launcher mode, @@handle spawning)
-#   gc slack publish           — explicit publish to a saved binding
 #   gc slack import-app        — slash-command intake for `/gc fix` style
 #   gc slack map-channel / map-rig
 #   gc slack sync-commands

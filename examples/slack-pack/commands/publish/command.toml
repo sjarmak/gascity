@@ -1,0 +1,2 @@
+description = "Publish a message into the conversation bound to a session"
+run = "../publish.sh"
