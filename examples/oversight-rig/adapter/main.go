@@ -100,9 +100,12 @@ func envOr(key, fallback string) string {
 // to the gc module. Wire-compatible only.
 
 type conversationRef struct {
-	Provider  string `json:"provider"`
-	AccountID string `json:"account_id"`
-	ID        string `json:"id"`
+	ScopeID              string `json:"scope_id"`
+	Provider             string `json:"provider"`
+	AccountID            string `json:"account_id"`
+	ConversationID       string `json:"conversation_id"`
+	ParentConversationID string `json:"parent_conversation_id,omitempty"`
+	Kind                 string `json:"kind"`
 }
 
 type publishRequest struct {
@@ -120,21 +123,26 @@ type publishReceipt struct {
 	FailureKind  string          `json:"failure_kind,omitempty"`
 }
 
+type externalActor struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	IsBot       bool   `json:"is_bot"`
+}
+
 type externalInboundMessage struct {
-	Provider           string          `json:"provider"`
-	AccountID          string          `json:"account_id"`
-	Conversation       conversationRef `json:"conversation"`
-	SenderID           string          `json:"sender_id,omitempty"`
-	SenderName         string          `json:"sender_name,omitempty"`
-	MessageID          string          `json:"message_id,omitempty"`
-	InReplyToMessageID string          `json:"in_reply_to_message_id,omitempty"`
-	Text               string          `json:"text"`
-	Timestamp          string          `json:"timestamp,omitempty"`
+	ProviderMessageID string          `json:"provider_message_id"`
+	Conversation      conversationRef `json:"conversation"`
+	Actor             externalActor   `json:"actor"`
+	Text              string          `json:"text"`
+	ReplyToMessageID  string          `json:"reply_to_message_id,omitempty"`
+	DedupKey          string          `json:"dedup_key,omitempty"`
+	ReceivedAt        time.Time       `json:"received_at"`
 }
 
 type adapterCapabilities struct {
-	Outbound bool `json:"outbound"`
-	Inbound  bool `json:"inbound"`
+	SupportsChildConversations bool `json:"SupportsChildConversations"`
+	SupportsAttachments        bool `json:"SupportsAttachments"`
+	MaxMessageLength           int  `json:"MaxMessageLength"`
 }
 
 type adapterRegisterRequest struct {
@@ -262,8 +270,9 @@ func registerAdapter(cfg config) error {
 		Name:        "slack-adapter",
 		CallbackURL: cfg.internalCallbackURL,
 		Capabilities: adapterCapabilities{
-			Outbound: true,
-			Inbound:  true,
+			SupportsChildConversations: false,
+			SupportsAttachments:        false,
+			MaxMessageLength:           40000, // Slack's chat.postMessage limit
 		},
 	})
 	url := fmt.Sprintf("%s/v0/city/%s/extmsg/adapters", cfg.gcAPIBase, cfg.cityName)
@@ -272,6 +281,7 @@ func registerAdapter(cfg config) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GC-Request", "gc-slack-adapter")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
@@ -296,10 +306,10 @@ func handlePublish(cfg config) http.HandlerFunc {
 			return
 		}
 		log.Printf("publish: conv=%s text=%dch reply_to=%s idem=%s",
-			req.Conversation.ID, len(req.Text), req.ReplyToMessageID, req.IdempotencyKey)
+			req.Conversation.ConversationID, len(req.Text), req.ReplyToMessageID, req.IdempotencyKey)
 
 		slackResp, err := postToSlack(cfg.slackBotToken, slackPostMessageReq{
-			Channel:  req.Conversation.ID,
+			Channel:  req.Conversation.ConversationID,
 			Text:     req.Text,
 			ThreadTS: req.ReplyToMessageID,
 		})
@@ -433,15 +443,23 @@ func processSlackEvent(cfg config, env slackEventEnvelope) {
 	}
 
 	inbound := externalInboundMessage{
-		Provider:           cfg.provider,
-		AccountID:          cfg.accountID,
-		Conversation:       conversationRef{Provider: cfg.provider, AccountID: cfg.accountID, ID: msg.Channel},
-		SenderID:           msg.User,
-		SenderName:         msg.User, // resolving display name needs users.info — defer
-		MessageID:          msg.TS,
-		InReplyToMessageID: msg.ThreadTS,
-		Text:               msg.Text,
-		Timestamp:          msg.EventTS,
+		ProviderMessageID: msg.TS,
+		Conversation: conversationRef{
+			ScopeID:        cfg.cityName,
+			Provider:       cfg.provider,
+			AccountID:      cfg.accountID,
+			ConversationID: msg.Channel,
+			Kind:           "dm",
+		},
+		Actor: externalActor{
+			ID:          msg.User,
+			DisplayName: msg.User, // resolving display name needs users.info — defer
+			IsBot:       false,
+		},
+		Text:             msg.Text,
+		ReplyToMessageID: msg.ThreadTS,
+		DedupKey:         "slack-" + msg.TS,
+		ReceivedAt:       time.Now().UTC(),
 	}
 	if err := postInbound(cfg, inbound); err != nil {
 		log.Printf("inbound POST failed: %v", err)
@@ -461,6 +479,7 @@ func postInbound(cfg config, msg externalInboundMessage) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GC-Request", "gc-slack-adapter")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err

@@ -4,10 +4,16 @@
 # and mark them delivered. Idempotent.
 #
 # Required environment (set in city.toml or shell before `gc start`):
-#   GC_API_BASE_URL              e.g. http://127.0.0.1:7777
+#   GC_API_BASE_URL              e.g. http://127.0.0.1:8372
 #   GC_CITY_NAME                 the city name (matches [workspace].name)
 #   GC_OVERSIGHT_SESSION_ID      session id pre-bound to a conversation
 #                                via POST /v0/city/{city}/extmsg/bind
+#   GC_OVERSIGHT_PROVIDER        e.g. "slack"
+#   GC_OVERSIGHT_ACCOUNT_ID      e.g. workspace id "T0B17700WUW"
+#   GC_OVERSIGHT_CONVERSATION_ID e.g. DM channel "D0B0TTS550F"
+#   GC_OVERSIGHT_KIND            "dm" | "room" | "thread"
+# (The conversation fields are sent explicitly because the gc binding
+# resolver currently drops scope_id from stored bindings.)
 #
 # Why this script (not a CLI): the v0 SDK has no `gc extmsg send`
 # command. Outbound is HTTP-only. This script encapsulates the curl so
@@ -26,6 +32,10 @@ set -euo pipefail
 : "${GC_API_BASE_URL:?GC_API_BASE_URL must be set}"
 : "${GC_CITY_NAME:?GC_CITY_NAME must be set}"
 : "${GC_OVERSIGHT_SESSION_ID:?GC_OVERSIGHT_SESSION_ID must be set}"
+: "${GC_OVERSIGHT_PROVIDER:?GC_OVERSIGHT_PROVIDER must be set}"
+: "${GC_OVERSIGHT_ACCOUNT_ID:?GC_OVERSIGHT_ACCOUNT_ID must be set}"
+: "${GC_OVERSIGHT_CONVERSATION_ID:?GC_OVERSIGHT_CONVERSATION_ID must be set}"
+: "${GC_OVERSIGHT_KIND:?GC_OVERSIGHT_KIND must be set}"
 
 api="${GC_API_BASE_URL%/}/v0/city/${GC_CITY_NAME}/extmsg/outbound"
 
@@ -51,11 +61,28 @@ for id in "${bead_ids[@]}"; do
     --arg sid "$GC_OVERSIGHT_SESSION_ID" \
     --arg text "$text" \
     --arg key "rollup-$id" \
-    '{session_id: $sid, text: $text, idempotency_key: $key}')
+    --arg scope "$GC_CITY_NAME" \
+    --arg prov "$GC_OVERSIGHT_PROVIDER" \
+    --arg acct "$GC_OVERSIGHT_ACCOUNT_ID" \
+    --arg conv "$GC_OVERSIGHT_CONVERSATION_ID" \
+    --arg kind "$GC_OVERSIGHT_KIND" \
+    '{
+       session_id: $sid,
+       conversation: {
+         scope_id: $scope,
+         provider: $prov,
+         account_id: $acct,
+         conversation_id: $conv,
+         kind: $kind
+       },
+       text: $text,
+       idempotency_key: $key
+     }')
 
   if curl --silent --show-error --fail \
        --max-time 30 \
        --header "Content-Type: application/json" \
+       --header "X-GC-Request: deliver-rollup" \
        --data "$payload" \
        "$api" >/dev/null; then
     gc bd update "$id" --add-label delivered
