@@ -1,62 +1,58 @@
 # Project Brief — `<RIG-NAME>`
 
-> Copy this file to `<rig-root>/.gc/project-brief.md` and customize.
-> The project-lead reads it at the start of every tick. Keep it short
-> (under 1 page) and concrete — vague briefs produce vague rollups.
+> Copy to `<rig-root>/.gc/project-brief.md` and customize. The
+> project-lead reads this every tick. Write it like a memo to a smart
+> colleague who's never worked on this project — plain language,
+> directional, no codebase jargon. The project-lead translates your
+> intent into the operational checks (bead queries, label filters,
+> etc.) — you don't have to.
 
-## Project
+## What this project is
 
-**Name**: <project name>
-**Repo**: <git URL or path>
-**Current focus**: <one line — what the team is actually shipping right now>
+One short paragraph. What problem are we solving, who is it for, and
+what does success look like this quarter? Plain language — no internal
+acronyms, no bead IDs, no file paths. If a new exec joined the team
+tomorrow, this paragraph is what you'd want them to read first.
 
-## Persona
+## How I want to hear about it
 
-How should the project-lead sound when writing rollups for THIS project?
+Two or three sentences on tone and depth. Examples:
 
-- **Voice**: <e.g. "terse and engineering-direct", "context-rich and explanatory", "blameless and outcome-focused">
-- **Style notes**: <e.g. "always include the bead id inline", "never use jargon the founder won't recognize", "translate test failures into product impact">
-- **What the human cares about most**: <e.g. "shipping the migration this week", "not breaking auth", "keeping CI green on main">
+- "Quick research notes, not bug reports. Tell me what shifted, why
+  it matters, and what decision you need."
+- "Plain English. I want to be able to read a rollup at the airport
+  and reply with one sentence."
+- "Lead with the business impact, then the technical context if
+  needed. Skip implementation detail unless I ask."
 
-The project-lead writes the **Why** and **Smallest ask** sections of
-rollups in this voice. Different projects can have different voices —
-that's the point of per-project briefs.
+## When to wake me up
 
-## Escalate (severity:escalate)
+List 3–5 directional statements. Plain language, not bead syntax.
+Examples (replace with what's true for THIS project):
 
-Trigger an escalation when ANY of:
+- Anything that's threatening to slow the headline goal for this quarter
+- Decisions that need my judgment about scope, prioritization, or risk tolerance
+- Spend or commitments that exceed what I've already approved
+- An external dependency falling through (vendor, partner, tool)
+- A repeated failure pattern that suggests something deeper is broken
+- Anything where the team is stuck waiting for me specifically
 
-- <e.g. "any bead with `epic:migration` blocked for >2h">
-- <e.g. "any retry count >3 on the same step (visible in bead metadata)">
-- <e.g. "any blocked bead labeled `priority:high`">
-- <e.g. "ambiguous spec — coder mailed asking a question you can't answer from the brief">
-- <e.g. "infrastructure failure with no automated recovery path">
+The project-lead will turn each of these into the operational signal
+to watch for. Your job is to tell it what counts as worth your time.
 
-Each escalation must end in a single concrete ask the human can
-answer in under a minute. If you can't phrase it that way, downgrade
-to `severity:info`.
+## When NOT to wake me up
 
-## Do Not Escalate (severity:info or skip)
+List 2–4 directional statements. These matter as much as the wake-me
+list — they're how you tune out noise.
 
-Even if the rule above seems to apply, DON'T escalate when:
+- Routine work in progress, even if it's slow
+- Known dependencies on other projects that are already on someone's plate
+- Cleanup, refactoring, or anything explicitly de-prioritized
+- Any specific scenario you've already decided about (just note the decision)
 
-- <e.g. "the bead is on the `awaiting-vendor` epic — that gate is known and slow">
-- <e.g. "the coder explicitly mailed 'will retry tomorrow' within last 24h">
-- <e.g. "the failure is in flaky-test-known-list">
-- <e.g. "the work is on the `cleanup` epic — never page about cleanup">
+## What "going well" looks like
 
-These suppression rules matter as much as the trigger rules. A
-project-lead that pages on every blocked bead is noise; a
-project-lead that pages on the right ones is leverage.
-
-## Info (severity:info)
-
-Write `severity:info` rollups for the weekly digest when:
-
-- A milestone bead closed (`label:milestone status:closed`)
-- A blocker was resolved by the team without escalation
-- A new coder joined the rig
-- Anything else the human would want in a weekly digest but doesn't
-  need to act on now
-
-Info rollups are never delivered — they accumulate for the digest.
+One short paragraph. Forward-looking — what does this project look
+like in 4 weeks if it's on track? The project-lead uses this to
+distinguish "boringly on track" (don't escalate) from "drifting from
+the plan" (mention in a weekly digest).
