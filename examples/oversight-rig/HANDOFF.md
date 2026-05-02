@@ -127,9 +127,18 @@ Local-only (not for commit): `city.toml` has
    decide whether cos should call `gc slack reply-current` directly
    for "ack" replies (today the prompt forbids it). One-line
    prompt change once the design call is made.
-4. **Per-rig Slack channels** — `bind-room` per rig + rewrite
-   `deliver-rollup.sh` to pick `GC_OVERSIGHT_CONVERSATION_ID` from
-   the bead's `rig:` label. The user's stated end-state.
+4. **Per-rig Slack channels** — `bind-room` per rig (still pending
+   live activation; supervisor + adapter restart needed) +
+   ~~rewrite `deliver-rollup.sh` to pick `GC_OVERSIGHT_CONVERSATION_ID`
+   from the bead's `rig:` label~~ DONE this session. Rollups now
+   resolve target conversation per bead: `resolve_rig_channel.py`
+   finds the bead's rig's project-lead session, reads its most
+   recent active extmsg binding, and publishes through gc's
+   `/extmsg/outbound` so peer fanout fires. The legacy
+   `GC_OVERSIGHT_*` env vars are now fallback-only (used when a rig
+   has no project-lead session or no active binding). 12 unit tests
+   in `examples/oversight-rig/assets/scripts/test_resolve_rig_channel.py`.
+   The user's stated end-state.
 5. **Adapter as systemd user service** so it survives reboot
    (subsumed by item 2 once that lands; until then,
    `adapter/SETUP.md` § "Running the adapter as a service").
