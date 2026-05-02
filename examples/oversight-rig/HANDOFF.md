@@ -1,10 +1,10 @@
-# Oversight-rig handoff — 2026-05-02 (post-cutover)
+# Oversight-rig handoff — 2026-05-02 (post-rollout)
 
 ## State
 
-Two-way Slack ↔ gc oversight loop is **fully working end-to-end**.
-All four routing branches in chief-of-staff have been exercised
-against real Slack inbound:
+Two-way Slack ↔ gc oversight loop is **fully working end-to-end**
+across the city DM and 7 per-rig channels. All four routing branches
+in chief-of-staff have been exercised against real Slack inbound:
 
 - match-and-route-to-project-lead (`ack GEO-rjz` → mailed
   `geo/oversight-rig.project-lead`, closed bead with `resolved` label)
@@ -15,49 +15,92 @@ against real Slack inbound:
 A new `examples/slack-pack/` scaffolds a slack-side parallel of
 `gastownhall/gascity-packs/discord` with `gc slack bind-dm`,
 `gc slack reply-current`, and `gc slack bind-room` (with
-peer-fanout policy plumbing).
+peer-fanout policy + `--binding-owner` plumbing).
 
-The cutover to the rebuilt supervisor + adapter happened this
-session. The canary `bind-room` against `C0B0TQMQF2B` works
-end-to-end for outbound publish + peer fanout.
+The supervisor was restarted onto the rebuilt binary this session.
+Per-rig rollout for 7 of 13 rigs is live — outbound publish,
+peer-fanout to cos, and inbound `kind=room` classification all
+verified end-to-end.
 
 ## Live runtime
 
-- **Supervisor** PID **3855171** (rebuilt `/tmp/gc` from this branch;
-  accepts `fanout_policy` on `POST /extmsg/groups`, plus the
-  provider-neutral nudge fix in `internal/api/handler_extmsg.go`).
-- **Slack adapter** PID **3879872**, registered as
+- **Supervisor** PID **2575673** (rebuilt `/tmp/gc` from this branch;
+  accepts `fanout_policy` on `POST /extmsg/groups`, the provider-neutral
+  nudge fix in `internal/api/handler_extmsg.go`, and now injects
+  `GC_API_BASE_URL` + `GC_CITY_NAME` into order exec env via
+  `cmd/gc/order_store.go:orderExecEnv`).
+- **Slack adapter** PID **2582270**, registered as
   `slack/T0B17700WUW`. Public `:8775`, internal `127.0.0.1:8766`.
   Log: `/tmp/gc-slack-adapter/run.log`. Tailscale Funnel still on
-  (`:443 → :8775`). Restarted from the rebuilt binary at
-  `examples/oversight-rig/adapter/gc-slack-adapter` so room-kind
-  classification is in place. **Inbound classification has NOT yet
-  been verified by a live human post in a room — see Open work item 4a.**
+  (`:443 → :8775`).
+- **Slack app event subscriptions** include `message.im` and
+  `message.channels`. **`message.groups` is NOT subscribed** — if any
+  rig's channel is private (`G`-prefix id), add it in
+  api.slack.com → Event Subscriptions and reinstall.
 - **Slack pack** imported via local `[imports.slack]` in `city.toml`.
   `gc slack {bind-dm,bind-room,reply-current}` available.
 - **chief-of-staff** session `gc-83347` (alias `oversight-rig.cos`),
-  bound to `D0B0TTS550F` via binding `gc-83357` (gen 6), running on
-  `claude-2`. cos still uses its handwritten "About Reply
-  Instructions" section — it has not yet been switched to compose
-  the `slack-v0` template fragment from the new pack (deliberate;
-  cos's design today is "do not reply directly", and switching it
-  to use `gc slack reply-current` is a scope decision).
+  bound to DM `D0B0TTS550F`, also a peer in 7 room groups (see
+  table below). cos still uses its handwritten "About Reply
+  Instructions" section — has not been switched to compose the
+  `slack-v0` template fragment from the new pack. Cos hit its
+  Anthropic plan limit during the rollout
+  ("resets May 3, 3pm America/New_York"); it'll resume routing on
+  next available capacity.
 - **13 project-leads** — exactly one per rig, all `awake (always)`.
-  Pool/named-session duplicate collision is fixed.
-- **Canary bind-room** still active on `C0B0TQMQF2B`:
-  - Group `gc-83767`, mode=launcher, peer-fanout=true.
-  - Participants: `cos` → `oversight-rig.cos`,
-    `geo-project-lead` → `geo/oversight-rig.project-lead`.
-  - Conversation binding `gc-83781`: room `C0B0TQMQF2B` →
-    session `gc-77139` (geo project-lead). This binding makes the
-    room a valid target for `/extmsg/outbound`.
-  - Three test publishes landed (`Delivered: true`); peer-fanout to
-    cos at `gc-83347` confirmed (last_active jumped to "0s ago"
-    immediately after each publish).
-  - Leave it in place — useful for next session without setting up
-    a new channel. To unbind: `DELETE /extmsg/unbind` for session
-    `gc-77139` + the `oversight-rig.cos` membership goes away
-    automatically when the participant is removed.
+
+### Per-rig room bindings (LIVE)
+
+| rig | gc-id | channel id | binding id | group id |
+|---|---|---|---|---|
+| codeprobe | gc-82316 | C0B1A0CKEH0 | gc-84162 | gc-84154 |
+| codescalebench | gc-82318 | C0B248JP54Y | gc-84110 | gc-84102 |
+| enterprisebench | gc-82313 | C0B1NSHTSKT | gc-84136 | gc-84129 |
+| gascity | gc-82783 | C0B1NSK4N3T | gc-84144 | gc-84138 |
+| geo (new) | gc-77139 | C0B13JH8T35 | gc-84152 | gc-84146 |
+| scix-experiments | gc-82781 | C0B17TXMT1C | gc-84118 | gc-84112 |
+| zeldascension | gc-82782 | C0B13JE7M35 | gc-84127 | gc-84120 |
+
+All bindings: peer-fanout enabled, mode=launcher, participants are
+`oversight-rig.cos` (alias) + `<rig>/oversight-rig.project-lead`
+(alias), binding-owner is the project-lead's gc-id (so
+`resolve_rig_channel.py` finds the binding via its gc-id-keyed
+lookup against `/extmsg/bindings?session_id=<gc-id>`).
+
+`resolve_rig_channel.py` returns the dedicated room for all 7 rigs;
+verified by direct invocation. Outbound smoke test against
+`#gascity` (`gc-82783` → `C0B1NSK4N3T`) returned `Delivered: True`
+and peer-fanout to cos fired in <1s.
+
+### Remaining 6 rigs (no channel yet)
+
+`mcp-ax`, `background-agents`, `live_docs`, `migration-evals`,
+`agent-diagnostics`, `code-intelligence-digest`. For each:
+
+1. Create a Slack channel (any name; a consistent prefix like
+   `oversight-<rig>` keeps the sidebar grep-able).
+2. Invite `@gc-oversight` to the channel.
+3. Run:
+   ```
+   /tmp/gc slack bind-room <Cxxx> \
+       oversight-rig.cos <rig>/oversight-rig.project-lead \
+       --enable-peer-fanout \
+       --binding-owner <gc-id-of-project-lead>
+   ```
+   Project-lead gc-ids: agent-diagnostics=gc-83263,
+   gascity=gc-82783 (already bound),
+   code-intelligence-digest=gc-82780, background-agents=gc-82315,
+   mcp-ax=gc-82314, live_docs=gc-82312, migration-evals=gc-82311.
+
+### Canary on `C0B0TQMQF2B` (= `#all-agent-city`)
+
+The original canary binding `gc-83781` (geo PL → `C0B0TQMQF2B`) is
+still active in addition to the new dedicated geo binding
+`gc-84152` (geo PL → `C0B13JH8T35`). `resolve_rig_channel.py` picks
+the most recent active binding, so geo escalates now route to the
+dedicated channel. The canary binding is harmless extra membership;
+unbind with `POST /v0/city/ds-research/extmsg/unbind` for session
+`gc-77139` + conversation `C0B0TQMQF2B` if you want to clean it up.
 
 ## Known formatting gotcha (Slack ≠ Discord)
 
@@ -84,10 +127,12 @@ e9c07d31 feat(oversight-rig): adapt chief-of-staff to system-reminder delivery
 ... (earlier slack-adapter commits)
 ```
 
-## Cutover (DONE this session)
+## Cutover (DONE — twice this branch)
 
-The supervisor + adapter restart happened. New supervisor PID 3855171,
-new adapter PID 3879872 (see Live runtime above).
+Cutover #1 (last session) brought the supervisor onto the `bind-room` +
+fanout-policy build. Cutover #2 (this session) brought it onto the
+order-exec env-injection build (item 4c). Current supervisor PID
+2575673, current adapter PID 2582270 (see Live runtime).
 
 Sequence used (for reference if it has to happen again):
 
@@ -101,8 +146,10 @@ pkill -f "gc-slack-adapter$"
   && nohup ./run.sh > /tmp/gc-slack-adapter/run.log 2>&1 & disown )
 ```
 
-Sessions reattach on `gc start`. cos's prior conversation binding
-(`gc-83357` → `D0B0TTS550F`) survived the restart unchanged.
+`gc stop` takes ~3min on a city with ~30 background sessions
+(stops in waves of 1–2 per second). Sessions reattach on `gc start`.
+All cos + project-lead conversation bindings survived intact across
+both cutovers; the canary binding `gc-83781` survived as well.
 
 ## Findings from the cutover canary
 
@@ -184,65 +231,72 @@ Local-only (not for commit): `city.toml` has
    decide whether cos should call `gc slack reply-current` directly
    for "ack" replies (today the prompt forbids it). One-line
    prompt change once the design call is made.
-4. **Per-rig Slack channels — three blockers before rollout.** The
-   delivery side is ready: `resolve_rig_channel.py` finds the
-   bead's rig's project-lead, reads its active extmsg binding,
-   publishes through `/extmsg/outbound`. 12 unit tests in
-   `examples/oversight-rig/assets/scripts/test_resolve_rig_channel.py`.
-   Legacy `GC_OVERSIGHT_*` env vars are fallback-only.
+4. ~~**Per-rig Slack channels — 4a, 4b, 4c blockers**~~ — ALL THREE
+   DONE this session. 7 of 13 rigs now have dedicated channels with
+   live bindings (see "Per-rig room bindings" table above). Resolver,
+   peer-fanout, and inbound classification all verified end-to-end.
 
-   But three things need to land before binding 13 rigs:
+   **4a. Verify inbound `kind=room`.** DONE.
+   First attempt with the canary channel returned no inbound — the
+   bot's Slack app event subscription only had `message.im` (DMs)
+   and not `message.channels` (public channel posts). User added
+   `message.channels` and reinstalled the app; next post in
+   `#all-agent-city` (= `C0B0TQMQF2B`) arrived at the adapter and
+   was routed to gc-77139 via the kind=room binding. Peer-fanout
+   to cos at gc-83347 fired ~700ms after the inbound. Note: the
+   `extmsg.inbound` event payload doesn't carry `.kind` directly
+   (its shape is `{provider, conversation_id, actor, target_session}`),
+   so the verification was via routing behavior — peer-fanout only
+   fires through room group memberships, so successful peer-fanout
+   proves the conversation was classified as room.
 
-   **4a. Verify inbound room-kind classification.** Adapter binary
-   is rebuilt and the binary on disk includes the
-   `channel_type → room/dm` patch, but we never confirmed a real
-   human post in a room arrives at `/extmsg/inbound` with
-   `kind=room`. Test:
+   **Reminder for future channels:** if any new channel is private
+   (`G`-prefix id), also subscribe `message.groups` in api.slack.com
+   and reinstall.
 
-   ```
-   # In Slack, post a message in #C0B0TQMQF2B (the canary channel).
-   /tmp/gc events --type extmsg.inbound --since 2m \
-     | jq -r '.payload.message.conversation.kind'
-   # Expect: "room". If "dm", the binary swap didn't take effect or
-   # the classifier has a bug — re-check adapter PID + ldd.
-   ```
+   **4b. `gc slack bind-room --binding-owner SESSION`.** DONE.
+   `slack_chat_bind_room.py` now POSTs `/extmsg/bind` after creating
+   group + participants. Initial validation required binding-owner
+   to match a participant alias, but during rollout we discovered
+   that `resolve_rig_channel.py` looks up bindings by **gc-id**
+   (from the sessions list), so the binding must be created with
+   the gc-id, not the participant alias. Validation was relaxed:
+   `--binding-owner` now accepts any session id verbatim; the
+   docstring spells out when to pass alias vs gc-id. Test was
+   updated to assert the canonical "alias participants + gc-id
+   owner" shape instead of the participant-membership constraint.
+   20/20 pack tests pass. README updated.
 
-   **4b. `gc slack bind-room` must also bind one publisher.** The
-   script today only POSTs `/extmsg/groups` + `/extmsg/participants`.
-   Add a `--binding-owner SESSION` flag (or default to the last
-   participant) that also POSTs `/extmsg/bind` for that session.
-   Without it, every rig requires a manual curl to make outbound
-   publishes work. Small change in
-   `examples/slack-pack/scripts/slack_chat_bind_room.py`; mirror
-   the bind shape we used in the canary:
+   **4c. `escalate-rollups` order exit-1.** DONE + LIVE.
+   Root cause: the controller's `orderExecEnv` (in
+   `cmd/gc/order_store.go`) never injected `GC_API_BASE_URL` or
+   `GC_CITY_NAME` for exec orders. Supervisor log confirmed
+   `deliver-rollup.sh: line 54: GC_API_BASE_URL: GC_API_BASE_URL must be set`.
 
-   ```
-   POST /v0/city/{city}/extmsg/bind
-   { "session_id": "<gc-id-of-publisher>",
-     "conversation": { ...root_conversation... } }
-   ```
+   Fix:
+   - `orderExecEnv` now injects `GC_CITY_NAME` from
+     `loadedCityName(cfg, cityPath)` and `GC_API_BASE_URL` from a
+     hookable `orderExecAPIBaseURLHook` defaulting to
+     `supervisorAPIBaseURL()`. When no supervisor config is found
+     (one-off CLI runs without supervised city), the URL is left
+     unset rather than guessed at — pack scripts surface the
+     missing var via their own `${VAR:?}` checks.
+   - Both keys added to `mergeRuntimeEnv`'s strip list so inherited
+     stale values can't poison child orders.
+   - Two new tests in `cmd/gc/order_dispatch_test.go`:
+     `TestOrderExecEnvInjectsCityNameAndAPIBaseURL` and
+     `TestOrderExecEnvOmitsAPIBaseURLWhenHookEmpty`.
+   - Full `go test ./cmd/gc/` clean (87s).
 
-   Use the `gc-id`, not the alias — alias-based binding has an
-   open question about resolution semantics. Add a unit test
-   asserting bind-room emits exactly the right three calls.
+   Verified live after the cutover: `escalate-rollups:rig:enterprisebench`
+   now emits `order.completed` (was `order.failed exit 1`). The
+   retry loop went silent — no open undelivered escalates anywhere
+   right now (`EnterpriseBench-2wk` was already closed/resolved by
+   the time the order ran post-fix).
 
-   **4c. `escalate-rollups` order has been exec-failing since
-   2026-05-01 22:44** with `exit status 1` (predates this session's
-   work; visible in `.gc/events.jsonl` from yesterday). Even with
-   rig channels bound, the automatic delivery loop won't fire. Run
-   `bash $GC_PACK_DIR/assets/scripts/deliver-rollup.sh` manually
-   under the controller's spawn env first to reproduce; suspect the
-   controller doesn't pass through `GC_API_BASE_URL` /
-   `GC_CITY_NAME`, which the script's `:?` checks at the top would
-   exit 1 on. If so: either wire `[order.env]` in
-   `escalate-rollups.toml` or have the controller inject those by
-   default.
-
-   Once 4a, 4b, 4c land: invite the bot to N Slack channels, run
-   `gc slack bind-room <Cxxx> oversight-rig.cos <rig>/oversight-rig.project-lead --enable-peer-fanout --binding-owner <rig>/oversight-rig.project-lead`
-   per rig, and the per-rig delivery pipeline becomes self-driving.
-
-   The user's stated end-state.
+   **Per-rig delivery is self-driving for the 7 bound rigs.** The 6
+   remaining rigs need channels — see "Remaining 6 rigs" above for
+   the recipe.
 5. **Adapter as systemd user service** so it survives reboot
    (subsumed by item 2 once that lands; until then,
    `adapter/SETUP.md` § "Running the adapter as a service").
@@ -263,7 +317,7 @@ Local-only (not for commit): `city.toml` has
 
 ```bash
 # Supervisor + adapter on rebuilt binaries
-/tmp/gc supervisor status   # expect PID 3855171 (or current)
+/tmp/gc supervisor status   # expect PID 2575673 (or current)
 pgrep -af gc-slack-adapter  # expect a single PID, registered slack/T0B17700WUW
 
 # Pack is loaded
@@ -273,10 +327,11 @@ pgrep -af gc-slack-adapter  # expect a single PID, registered slack/T0B17700WUW
 /tmp/gc events --city /home/ds/gas-city --type extmsg.inbound --since 5m
 /tmp/gc session list --city /home/ds/gas-city | grep -E "chief-of-staff|project-lead"
 
-# Canary bind-room is still on C0B0TQMQF2B
-curl -s "http://127.0.0.1:8372/v0/city/ds-research/extmsg/bindings?session_id=gc-77139" \
-  | python3 -m json.tool | head -20
-# Expect: one active binding to C0B0TQMQF2B (kind=room)
+# Bindings for the 7 bound rigs
+for sid in gc-82316 gc-82318 gc-82313 gc-82783 gc-77139 gc-82781 gc-82782; do
+  curl -s "http://127.0.0.1:8372/v0/city/ds-research/extmsg/bindings?session_id=$sid" \
+    | jq -r --arg sid "$sid" '.items[0] | "\($sid) -> conv=\(.Conversation.conversation_id) kind=\(.Conversation.kind) status=\(.Status)"'
+done
 
 # DM path (oversight-rig.cos): send a Slack DM to gc-oversight, then:
 /tmp/gc session peek gc-83347
@@ -288,17 +343,21 @@ curl -s "http://127.0.0.1:8372/v0/city/ds-research/extmsg/bindings?session_id=gc
   --body "*test:* hello from the slack pack"
 # Expect: delivered: true, message in Slack DM.
 
-# Room publish via gc /extmsg/outbound (canary path):
+# Room publish via gc /extmsg/outbound (gascity binding):
 curl -s -X POST -H "Content-Type: application/json" -H "X-GC-Request: smoke" \
-  -d '{"session_id":"gc-77139","conversation":{"scope_id":"ds-research","provider":"slack","account_id":"T0B17700WUW","conversation_id":"C0B0TQMQF2B","kind":"room"},"text":"*smoke:* hello room"}' \
+  -d '{"session_id":"gc-82783","conversation":{"scope_id":"ds-research","provider":"slack","account_id":"T0B17700WUW","conversation_id":"C0B1NSK4N3T","kind":"room"},"text":"*smoke:* hello gascity"}' \
   http://127.0.0.1:8372/v0/city/ds-research/extmsg/outbound \
   | python3 -c 'import json,sys; print("Delivered:", json.load(sys.stdin)["Receipt"]["Delivered"])'
 # Expect: Delivered: True
 
-# Rig-channel resolver (no live binding for non-canary rigs yet)
-GC_API_BASE_URL=http://127.0.0.1:8372 GC_CITY_NAME=ds-research \
-  python3 /home/ds/gascity/examples/oversight-rig/assets/scripts/resolve_rig_channel.py geo
-# Expect: JSON with the C0B0TQMQF2B conversation
+# Rig-channel resolver — should return a dedicated room for each
+# of the 7 bound rigs:
+for rig in codeprobe codescalebench enterprisebench gascity geo scix-experiments zeldascension; do
+  printf "%-22s " "$rig"
+  GC_API_BASE_URL=http://127.0.0.1:8372 GC_CITY_NAME=ds-research \
+    python3 /home/ds/gascity/examples/oversight-rig/assets/scripts/resolve_rig_channel.py "$rig" \
+    | jq -r '"sid=\(.session_id) conv=\(.conversation.conversation_id) kind=\(.conversation.kind)"'
+done
 ```
 
 ## Key files
@@ -306,8 +365,9 @@ GC_API_BASE_URL=http://127.0.0.1:8372 GC_CITY_NAME=ds-research \
 - `examples/slack-pack/` — pack scaffold (`bind-dm`, `bind-room`,
   `reply-current`)
 - `examples/slack-pack/README.md` — port checklist & architecture
-- `examples/slack-pack/scripts/slack_chat_bind_room.py` — needs
-  `--binding-owner` work (item 4b)
+- `examples/slack-pack/scripts/slack_chat_bind_room.py` — supports
+  `--binding-owner` (item 4b done; validation relaxed to accept
+  gc-id when participants are aliases)
 - `examples/slack-pack/scripts/slack_chat_reply_current.py` — defaults
   to `--via gc` so peer fanout fires
 - `examples/oversight-rig/agents/chief-of-staff/prompt.template.md`
@@ -316,7 +376,10 @@ GC_API_BASE_URL=http://127.0.0.1:8372 GC_CITY_NAME=ds-research \
 - `examples/oversight-rig/assets/scripts/resolve_rig_channel.py` —
   rig → publishing target resolver (12 unit tests)
 - `examples/oversight-rig/orders/escalate-rollups.toml` — the order
-  that's been exec-failing (item 4c)
+  whose exit-1 was fixed in 4c (controller now injects
+  `GC_API_BASE_URL` + `GC_CITY_NAME`)
+- `cmd/gc/order_store.go` — `orderExecEnv` injects city name +
+  api base url; `orderExecAPIBaseURLHook` is the testing seam
 - `internal/api/handler_extmsg.go` + `_test.go` — provider-neutral
   nudge; peer-fanout via `extmsgNotifyMembers`
 - `internal/extmsg/binding_service.go` — note: only one active
