@@ -22,13 +22,35 @@
 #   gc slack post-message      — workflow status projection
 #   gc slack retry-peer-fanout
 #
-# The intake side (the public-facing webhook receiver) is currently the
-# Go binary at examples/oversight-rig/adapter/. Long-term it should be
-# absorbed into this pack as a `[[service]]` proxy_process; for now we
-# intentionally do NOT register it here so the running adapter is left
-# alone.
+# The intake side (public-facing Slack webhook receiver) and the
+# /publish endpoint that gc reaches via the extmsg HTTP adapter are
+# served by the Go binary whose source lives at
+# examples/oversight-rig/adapter/main.go. The pack expects a built
+# binary at ./adapter/gc-slack-adapter (gitignored) — see
+# README.md "Cutover" for the build + cutover sequence.
 
 [pack]
 name = "slack"
 version = "0.0.1"
 schema = 2
+
+# proxy_process service: gc supervises the slack adapter as part of
+# the city's service set. The adapter binds a Unix domain socket at
+# $GC_SERVICE_SOCKET for /publish + /healthz and gc reverse-proxies
+# /svc/slack/* to it. The adapter ALSO binds public TCP :8775 for
+# /slack/events (Tailscale Funnel terminates there); proxy_process
+# accepts that — the controller only owns the UDS lifecycle.
+#
+# Secrets (SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, SLACK_WORKSPACE_ID)
+# stay in ~/.config/gc-slack-adapter/env and are inherited via
+# os.Environ() at start time. See README.md "Secrets".
+[[service]]
+name = "slack"
+kind = "proxy_process"
+
+[service.publication]
+visibility = "private"
+
+[service.process]
+command = ["./adapter/gc-slack-adapter"]
+health_path = "/healthz"

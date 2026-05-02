@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -49,7 +50,8 @@ const (
 
 type config struct {
 	publicListen        string
-	internalListen      string
+	internalListen      string // unused when serviceSocket is set
+	serviceSocket       string // when set, bind a UDS here for /publish instead of internalListen
 	internalCallbackURL string
 	gcAPIBase           string
 	cityName            string
@@ -61,18 +63,51 @@ type config struct {
 }
 
 func loadConfig() (config, error) {
-	cfg := config{
-		publicListen:        envOr("LISTEN_PUBLIC", defaultPublicListen),
-		internalListen:      envOr("LISTEN_INTERNAL", defaultInternalListen),
-		internalCallbackURL: strings.TrimRight(envOr("INTERNAL_CALLBACK_URL", defaultInternalCallback), "/"),
-		gcAPIBase:           strings.TrimRight(envOr("GC_API_BASE_URL", "http://127.0.0.1:9443"), "/"),
-		cityName:            envOr("GC_CITY_NAME", "ds-research"),
-		provider:            envOr("ADAPTER_PROVIDER", "slack"),
-		accountID:           os.Getenv("SLACK_WORKSPACE_ID"),
-		slackBotToken:       os.Getenv("SLACK_BOT_TOKEN"),
-		slackSigningKey:     os.Getenv("SLACK_SIGNING_SECRET"),
-		registerOnStart:     envOr("REGISTER_ON_START", "true") == "true",
+	return loadConfigFromEnv(os.Getenv)
+}
+
+// loadConfigFromEnv reads adapter configuration from a getenv function. When
+// $GC_SERVICE_SOCKET is set, the adapter switches to proxy_process mode: it
+// binds a Unix domain socket for /publish (and /healthz) instead of an
+// internal TCP listener, and registers the callback URL gc routes through
+// its /svc/{name} mount. This keeps a single binary serving both the legacy
+// nohup-managed deployment and the proxy_process deployment.
+func loadConfigFromEnv(getenv func(string) string) (config, error) {
+	envOrFn := func(key, fallback string) string {
+		if v := getenv(key); v != "" {
+			return v
+		}
+		return fallback
 	}
+	cfg := config{
+		publicListen:        envOrFn("LISTEN_PUBLIC", defaultPublicListen),
+		internalListen:      envOrFn("LISTEN_INTERNAL", defaultInternalListen),
+		serviceSocket:       getenv("GC_SERVICE_SOCKET"),
+		internalCallbackURL: strings.TrimRight(envOrFn("INTERNAL_CALLBACK_URL", defaultInternalCallback), "/"),
+		gcAPIBase:           strings.TrimRight(envOrFn("GC_API_BASE_URL", "http://127.0.0.1:9443"), "/"),
+		cityName:            envOrFn("GC_CITY_NAME", "ds-research"),
+		provider:            envOrFn("ADAPTER_PROVIDER", "slack"),
+		accountID:           getenv("SLACK_WORKSPACE_ID"),
+		slackBotToken:       getenv("SLACK_BOT_TOKEN"),
+		slackSigningKey:     getenv("SLACK_SIGNING_SECRET"),
+		registerOnStart:     envOrFn("REGISTER_ON_START", "true") == "true",
+	}
+
+	if cfg.serviceSocket != "" {
+		// proxy_process mode: gc reaches us via $GC_API_BASE_URL +
+		// $GC_SERVICE_URL_PREFIX (e.g. http://127.0.0.1:8372/svc/slack).
+		// gc's extmsg HTTP adapter appends "/publish" itself when calling,
+		// so the registered base URL must NOT include /publish.
+		urlPrefix := strings.TrimRight(getenv("GC_SERVICE_URL_PREFIX"), "/")
+		if urlPrefix == "" {
+			return cfg, errors.New("GC_SERVICE_SOCKET is set but GC_SERVICE_URL_PREFIX is empty — controller-injected env is incomplete")
+		}
+		if cfg.gcAPIBase == "" {
+			return cfg, errors.New("GC_SERVICE_SOCKET is set but GC_API_BASE_URL is empty — cannot compute callback URL for self-registration")
+		}
+		cfg.internalCallbackURL = cfg.gcAPIBase + urlPrefix
+	}
+
 	var missing []string
 	if cfg.accountID == "" {
 		missing = append(missing, "SLACK_WORKSPACE_ID")
@@ -87,13 +122,6 @@ func loadConfig() (config, error) {
 		return cfg, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
 	}
 	return cfg, nil
-}
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }
 
 // gc-side types — mirrored from internal/extmsg/types.go to avoid coupling
@@ -194,8 +222,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+	internalDescr := cfg.internalListen
+	if cfg.serviceSocket != "" {
+		internalDescr = "uds:" + cfg.serviceSocket
+	}
 	log.Printf("starting gc-slack-adapter public=%s internal=%s gc=%s city=%s",
-		cfg.publicListen, cfg.internalListen, cfg.gcAPIBase, cfg.cityName)
+		cfg.publicListen, internalDescr, cfg.gcAPIBase, cfg.cityName)
 
 	// Public mux: only /slack/events (HMAC-verified) and /healthz.
 	// Bound to 0.0.0.0 by default so Tailscale Funnel can reach it.
@@ -209,8 +241,9 @@ func main() {
 		http.NotFound(w, r)
 	})
 
-	// Internal mux: /publish (gc-only). Bound to 127.0.0.1 so only
-	// processes on this machine can reach it.
+	// Internal mux: /publish (gc-only). Served either on a UDS that gc
+	// proxies through /svc/{name}/ (proxy_process mode), or on a
+	// 127.0.0.1 TCP listener (legacy nohup mode).
 	internalMux := http.NewServeMux()
 	internalMux.HandleFunc("/publish", handlePublish(cfg))
 	internalMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -224,7 +257,6 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	internalSrv := &http.Server{
-		Addr:              cfg.internalListen,
 		Handler:           internalMux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -233,8 +265,12 @@ func main() {
 		if err := registerAdapter(cfg); err != nil {
 			log.Fatalf("register adapter: %v", err)
 		}
-		log.Printf("registered with gc as provider=%s account=%s callback=%s/publish (LOCALHOST ONLY)",
-			cfg.provider, cfg.accountID, cfg.internalCallbackURL)
+		mode := "LOCALHOST ONLY"
+		if cfg.serviceSocket != "" {
+			mode = "via gc /svc proxy"
+		}
+		log.Printf("registered with gc as provider=%s account=%s callback=%s/publish (%s)",
+			cfg.provider, cfg.accountID, cfg.internalCallbackURL, mode)
 	}
 
 	errCh := make(chan error, 2)
@@ -243,8 +279,19 @@ func main() {
 		errCh <- publicSrv.ListenAndServe()
 	}()
 	go func() {
-		log.Printf("internal listener serving on %s (gc publish only)", cfg.internalListen)
-		errCh <- internalSrv.ListenAndServe()
+		if cfg.serviceSocket != "" {
+			log.Printf("internal listener serving on UDS %s (gc proxy_process)", cfg.serviceSocket)
+			lis, err := listenUDS(cfg.serviceSocket)
+			if err != nil {
+				errCh <- fmt.Errorf("listen unix %s: %w", cfg.serviceSocket, err)
+				return
+			}
+			errCh <- internalSrv.Serve(lis)
+		} else {
+			internalSrv.Addr = cfg.internalListen
+			log.Printf("internal listener serving on %s (gc publish only)", cfg.internalListen)
+			errCh <- internalSrv.ListenAndServe()
+		}
 	}()
 
 	stop := make(chan os.Signal, 1)
@@ -261,6 +308,17 @@ func main() {
 	defer cancel()
 	_ = publicSrv.Shutdown(ctx)
 	_ = internalSrv.Shutdown(ctx)
+}
+
+// listenUDS binds a Unix domain socket at path, removing any stale entry
+// first so restarts succeed. The socket file is left in place on shutdown
+// — the controller's proxy_process supervisor cleans it up via
+// cleanupProxyProcessSocketPath when the service is closed.
+func listenUDS(path string) (net.Listener, error) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("remove stale socket: %w", err)
+	}
+	return net.Listen("unix", path)
 }
 
 func registerAdapter(cfg config) error {

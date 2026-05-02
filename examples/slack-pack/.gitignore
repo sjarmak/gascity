@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .gc/
+
+# Built adapter binary — sourced from examples/oversight-rig/adapter/
+# and copied/symlinked here for the [[service]] proxy_process to find.
+adapter/gc-slack-adapter

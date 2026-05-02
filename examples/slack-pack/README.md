@@ -30,9 +30,11 @@ is intended to be promoted to the `gastownhall/gascity-packs` repo
 - [ ] `gc slack post-message` (workflow status projection)
 - [ ] `gc slack retry-peer-fanout`
 - [ ] `gc slack status`
-- [ ] Pack-owned intake service (`[[service]]` proxy_process) that
-      replaces the externally-run `examples/oversight-rig/adapter/`
-      Go binary
+- [x] Pack-owned intake service (`[[service]]` proxy_process). Phase A:
+      adapter is the same Go binary, but gc supervises it via UDS for
+      `/publish` while the public Slack webhook still terminates at
+      adapter TCP `:8775` (Funnel unchanged). See "Adapter as a
+      proxy_process service" below for the cutover.
 
 ## Architecture (current)
 
@@ -118,6 +120,115 @@ prefer the session that "owns" the room from gc's perspective (the
 project-lead, not the chief-of-staff). Pass the gc session id (e.g.
 `gc-77139`) when alias resolution semantics matter; for stable named
 sessions, the alias works too.
+
+## Adapter as a proxy_process service
+
+Phase A of the in-pack adapter (tracked as bd `gc-5rz`) lets gc
+supervise the adapter as part of the city's services. The adapter
+binds a Unix domain socket for the `/publish` endpoint that gc reaches
+via the extmsg HTTP adapter, and gc reverse-proxies `/svc/slack/*` to
+that UDS. The public Slack webhook (`/slack/events`) still terminates
+at the adapter's TCP `:8775` so Tailscale Funnel and Slack's signing
+secret verification are unchanged. The same binary runs in both modes
+— the legacy `nohup ./run.sh` deployment is preserved as a rollback
+target.
+
+### What gc injects vs. what stays in the env file
+
+`proxy_process` injects the controller-managed env at start time:
+
+- `GC_SERVICE_NAME=slack`
+- `GC_SERVICE_SOCKET=/tmp/gcsvc-<uid>/<hash>/slack-*.sock`
+- `GC_SERVICE_URL_PREFIX=/svc/slack`
+- `GC_SERVICE_STATE_ROOT=.../.gc/services/slack`
+- `GC_SERVICE_RUN_ROOT=.../.gc/services/slack/run`
+- plus `GC_API_BASE_URL` and `GC_CITY_NAME` (already set by the
+  controller for any exec it spawns under the city scope)
+
+When `GC_SERVICE_SOCKET` is set, the adapter:
+- skips its `LISTEN_INTERNAL` TCP listener and binds the UDS instead;
+- computes its self-registration `CallbackURL` as
+  `$GC_API_BASE_URL + $GC_SERVICE_URL_PREFIX` (gc's extmsg HTTP adapter
+  appends `/publish` itself when calling out, so the registered base
+  URL must NOT include `/publish`);
+- still binds public TCP for `/slack/events`;
+- still serves `/healthz` on the UDS so the controller's `health_path`
+  probe succeeds.
+
+Slack secrets stay in `~/.config/gc-slack-adapter/env`:
+
+```
+SLACK_WORKSPACE_ID=T01234567
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_SIGNING_SECRET=...
+```
+
+Source the file before `gc start` (or the supervisor's start) so the
+adapter inherits the secrets via `os.Environ()`. Phase B will move
+the env-file path into pack config; not yet wired.
+
+### Cutover sequence
+
+```
+# 1. Build the adapter binary into the pack tree
+make -C examples/oversight-rig/adapter build  # or: go build -o gc-slack-adapter
+mkdir -p examples/slack-pack/adapter
+cp examples/oversight-rig/adapter/gc-slack-adapter \
+   examples/slack-pack/adapter/gc-slack-adapter
+
+# 2. Source the secrets so the supervisor inherits them
+set -a; source ~/.config/gc-slack-adapter/env; set +a
+
+# 3. Stop the manually-managed adapter
+pkill -f gc-slack-adapter
+
+# 4. Reload the city so the [[service]] block from slack-pack registers
+gc reload   # or: gc supervisor reload
+
+# 5. Verify the service is ready
+gc service list                            # expect: slack proxy_process ready
+curl --unix-socket "$(gc service show slack --json | jq -r .socket)" \
+     http://x/healthz                      # expect: 200 ok
+
+# 6. Verify outbound publish through gc
+curl -s -X POST -H "Content-Type: application/json" -H "X-GC-Request: cutover" \
+  -d '{"session_id":"<bound-session>","conversation":{"scope_id":"<city>","provider":"slack","account_id":"T...","conversation_id":"D...","kind":"dm"},"text":"*cutover:* hello"}' \
+  http://127.0.0.1:8372/v0/city/<city>/extmsg/outbound \
+  | jq '.Receipt.Delivered'                # expect: true
+
+# 7. Verify inbound — send a Slack DM to the bot, then:
+gc events --city <city> --type extmsg.inbound --since 2m
+```
+
+Rollback: remove (or comment out) the `[[service]]` block in
+`pack.toml`, `gc reload`, then restart the manual adapter via the
+legacy script:
+
+```
+( cd examples/oversight-rig/adapter \
+    && nohup ./run.sh > /tmp/gc-slack-adapter/run.log 2>&1 & disown )
+```
+
+The adapter ignores `$GC_SERVICE_SOCKET` when unset and falls back to
+TCP-only mode, so the same binary serves both deployments.
+
+### Known foot-guns
+
+- **Two adapters running.** If you forget step 3 and the manual
+  adapter stays up while gc starts the proxy_process one, both will
+  call `/extmsg/adapters` to register. The second registration
+  overwrites the first; outbound publishes go through whichever one
+  registered last (last-write-wins). Symptom: outbound succeeds but
+  through the wrong process. Stop the manual one and reload.
+- **Slack signing key missing.** The adapter Fatals at start with
+  `missing required env vars: SLACK_SIGNING_SECRET`. Under
+  proxy_process this shows up as the service stuck in `degraded`
+  state with the env-var name in the reason field. Source the env
+  file in the supervisor's launching shell.
+- **Funnel rule out-of-band.** Tailscale Funnel `:443 → :8775` is not
+  declared in the city. If you reboot the host or `tailscale funnel
+reset`, traffic stops landing at the adapter. Re-add the rule
+  manually until Phase C lands.
 
 ## Where the work that's still missing comes from
 
