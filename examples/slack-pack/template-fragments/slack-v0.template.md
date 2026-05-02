@@ -18,6 +18,14 @@ When you see one, treat the text as input. Do not look in
 `gc mail inbox` for it — the inbound delivery path is the system
 reminder, not mail.
 
+## Rooms vs DMs
+
+If the channel id starts with `D`, it is a 1:1 DM and only you and the
+human can see it. If it starts with `C` or `G`, it is a room — other
+sessions and humans may also be members. In a room, every reply you
+publish lands in front of all peers as a system reminder labeled with
+your handle in the actor field. Speak as if peers are reading.
+
 ## How to reply
 
 Plain assistant output stays private to the session and does NOT go

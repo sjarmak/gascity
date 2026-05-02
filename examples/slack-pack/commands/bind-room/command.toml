@@ -1,0 +1,2 @@
+description = "Bind a Slack room/channel to one or more named sessions"
+run = "../bind-room.sh"

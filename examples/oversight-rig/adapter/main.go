@@ -422,6 +422,32 @@ func verifySlackSignature(secret, ts string, body []byte, sig string) bool {
 	return hmac.Equal([]byte(expected), []byte(sig))
 }
 
+// slackKindFromChannelType maps a Slack message event's channel_type
+// onto a gc ConversationKind. Slack channel_type values are:
+//   "im"       -> direct message between two users  -> dm
+//   "channel"  -> public channel                    -> room
+//   "group"    -> private channel                   -> room
+//   "mpim"     -> multi-party DM (group DM)         -> room
+// When channel_type is missing, fall back to the channel-id prefix
+// (D=im, C=channel, G=group). Defaults to "dm" for safety.
+func slackKindFromChannelType(channelType, channelID string) string {
+	switch channelType {
+	case "channel", "group", "mpim":
+		return "room"
+	case "im":
+		return "dm"
+	}
+	if len(channelID) > 0 {
+		switch channelID[0] {
+		case 'C', 'G':
+			return "room"
+		case 'D':
+			return "dm"
+		}
+	}
+	return "dm"
+}
+
 func processSlackEvent(cfg config, env slackEventEnvelope) {
 	if env.Type != "event_callback" || len(env.Event) == 0 {
 		return
@@ -449,7 +475,7 @@ func processSlackEvent(cfg config, env slackEventEnvelope) {
 			Provider:       cfg.provider,
 			AccountID:      cfg.accountID,
 			ConversationID: msg.Channel,
-			Kind:           "dm",
+			Kind:           slackKindFromChannelType(msg.ChannelType, msg.Channel),
 		},
 		Actor: externalActor{
 			ID:          msg.User,

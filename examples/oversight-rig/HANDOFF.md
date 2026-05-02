@@ -52,6 +52,7 @@ specify its own formatting contract.
 ## What's on the branch
 
 ```
+<this commit> feat(slack-pack): bind-room + fanout policy plumbing
 8495e4d7 feat(slack-pack): scaffold + bind-dm + reply-current
 054b92a6 docs(oversight-rig): handoff after end-to-end validation
 3f95d85f fix(oversight-rig): drop redundant min/max_active_sessions on project-lead
@@ -61,6 +62,43 @@ e9c07d31 feat(oversight-rig): adapt chief-of-staff to system-reminder delivery
 ... (earlier slack-adapter commits)
 ```
 
+## NEW: bind-room is built but the live supervisor + adapter are not yet
+restarted to pick it up. Status snapshot:
+
+- `gc slack bind-room` is registered in the rebuilt `/tmp/gc`. The
+  live supervisor (PID 2656160) is still the previous binary; it
+  accepts the existing extmsg endpoints but cannot accept the new
+  `fanout_policy` field on `POST /extmsg/groups` (Huma rejects unknown
+  body keys). Calls without any fanout flag DO work against the live
+  supervisor today.
+- The Slack Go adapter at `examples/oversight-rig/adapter/` was
+  patched to classify Slack `channel_type` → `room`/`dm` (was
+  hardcoded `dm`). The on-disk binary is rebuilt but the running
+  adapter is still the previous binary, so room-kind inbound from
+  Slack still arrives as kind=`dm`.
+- API: `internal/extmsg/types.go` `FanoutPolicy` now has snake_case
+  JSON tags; `ExtMsgGroupEnsureInput.Body` accepts `fanout_policy`.
+  `openapi.json` + `docs/schema/openapi.{json,txt}` regenerated;
+  `make dashboard-check` passes; `TestHandleExtMsgGroupEnsureRoundTripsFanoutPolicy`
+  guards the round-trip.
+
+To take bind-room live (still YOUR call — the running loop has 13
+project-leads + chief-of-staff with state in memory):
+
+```
+# 1) Stop and replace the supervisor (sessions reattach on restart).
+/tmp/gc stop && /tmp/gc start
+
+# 2) Restart the slack adapter binary so room-kind classification fires.
+pkill -f gc-slack-adapter
+~/gascity/examples/oversight-rig/adapter/run.sh &
+
+# 3) Verify.
+/tmp/gc slack bind-room C0123ROOM01 \
+    oversight-rig.mayor geo/oversight-rig.project-lead \
+    --enable-peer-fanout
+```
+
 Local-only (not for commit): `city.toml` has
 `[[patches.agent]] name="chief-of-staff" provider="claude-2"` and
 `[imports.slack] source = .../examples/slack-pack`. Backups:
@@ -68,11 +106,14 @@ Local-only (not for commit): `city.toml` has
 
 ## Open work, in priority order
 
-1. **`gc slack bind-room` + peer fanout** in the slack pack. Largest
-   unblock for "monitor mayor↔project-lead conversations" and
-   `@@handle`-style spawning. Same pattern as `bind-dm` plus the
-   routing-logic state. The discord pack's `discord_chat_bind.py`
-   and the bind-room flag set is the reference.
+1. **Switch `gc slack reply-current` to publish through gc
+   `/extmsg/outbound`** instead of the adapter's `/publish` directly.
+   Today reply-current bypasses gc, so when one bound session in a
+   bind-room replies, peer sessions never see it (no `extmsgNotifyMembers`
+   fires). Change is small: same body shape, different URL, same
+   adapter ends up called via the registered HTTP adapter callback.
+   This is the actual mechanic that makes bind-room peer-visible
+   end-to-end.
 2. **Absorb the Go adapter into the slack pack as a
    `[[service]] proxy_process`.** Right now the adapter is run by
    hand and managed externally; the pack should own its lifecycle

@@ -826,6 +826,10 @@ export type ExtMsgGroupEnsureInputBody = {
      */
     default_handle?: string;
     /**
+     * Optional fanout policy controlling peer-triggered publishes.
+     */
+    fanout_policy?: FanoutPolicy;
+    /**
      * Group metadata.
      */
     metadata?: {
@@ -992,10 +996,10 @@ export type ExtmsgAdapterInfo = {
 };
 
 export type FanoutPolicy = {
-    AllowUntargetedPublication: boolean;
-    Enabled: boolean;
-    MaxPeerTriggeredPublishes: number;
-    MaxTotalPeerDeliveries: number;
+    allow_untargeted_publication: boolean;
+    enabled: boolean;
+    max_peer_triggered_publishes: number;
+    max_total_peer_deliveries: number;
 };
 
 export type FormulaDetailResponse = {

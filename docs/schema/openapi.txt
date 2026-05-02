@@ -2180,6 +2180,10 @@
             "description": "Default handle for the group.",
             "type": "string"
           },
+          "fanout_policy": {
+            "$ref": "#/components/schemas/FanoutPolicy",
+            "description": "Optional fanout policy controlling peer-triggered publishes."
+          },
           "metadata": {
             "additionalProperties": {
               "type": "string"
@@ -2481,26 +2485,26 @@
       "FanoutPolicy": {
         "additionalProperties": false,
         "properties": {
-          "AllowUntargetedPublication": {
+          "allow_untargeted_publication": {
             "type": "boolean"
           },
-          "Enabled": {
+          "enabled": {
             "type": "boolean"
           },
-          "MaxPeerTriggeredPublishes": {
+          "max_peer_triggered_publishes": {
             "format": "int64",
             "type": "integer"
           },
-          "MaxTotalPeerDeliveries": {
+          "max_total_peer_deliveries": {
             "format": "int64",
             "type": "integer"
           }
         },
         "required": [
-          "Enabled",
-          "AllowUntargetedPublication",
-          "MaxPeerTriggeredPublishes",
-          "MaxTotalPeerDeliveries"
+          "enabled",
+          "allow_untargeted_publication",
+          "max_peer_triggered_publishes",
+          "max_total_peer_deliveries"
         ],
         "type": "object"
       },

@@ -382,3 +382,95 @@ func TestHandleExtMsgOutboundNotifiesDeliveredConversationMembers(t *testing.T) 
 		t.Fatalf("delivered conversation peer nudge not found; calls=%#v", fs.sp.Calls)
 	}
 }
+
+// TestHandleExtMsgGroupEnsureRoundTripsFanoutPolicy verifies that
+// FanoutPolicy is settable via the Huma input on POST /extmsg/groups
+// and is preserved on the returned record (and on the subsequent GET
+// /extmsg/groups lookup). Without this, gc slack bind-room (and the
+// upstream discord pack equivalent) cannot configure peer-fanout
+// policy through the public API.
+func TestHandleExtMsgGroupEnsureRoundTripsFanoutPolicy(t *testing.T) {
+	fs := newSessionFakeState(t)
+	srv := New(fs)
+
+	services := extmsg.NewServices(fs.cityBeadStore)
+	fs.extmsgSvc = &services
+
+	ref := extmsg.ConversationRef{
+		ScopeID:        "T0B17700WUW",
+		Provider:       "slack",
+		AccountID:      "T0B17700WUW",
+		ConversationID: "C0123ROOM01",
+		Kind:           extmsg.ConversationRoom,
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"root_conversation": map[string]any{
+			"scope_id":        ref.ScopeID,
+			"provider":        ref.Provider,
+			"account_id":      ref.AccountID,
+			"conversation_id": ref.ConversationID,
+			"kind":            ref.Kind,
+		},
+		"mode":           extmsg.GroupModeLauncher,
+		"default_handle": "mayor",
+		"fanout_policy": map[string]any{
+			"enabled":                       true,
+			"allow_untargeted_publication":  true,
+			"max_peer_triggered_publishes":  5,
+			"max_total_peer_deliveries":     12,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal(body): %v", err)
+	}
+	req := newPostRequest(cityURL(fs, "/extmsg/groups"), strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	var ensured struct {
+		ID           string              `json:"ID"`
+		FanoutPolicy extmsg.FanoutPolicy `json:"FanoutPolicy"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &ensured); err != nil {
+		t.Fatalf("Unmarshal ensure response: %v; body=%s", err, rec.Body.String())
+	}
+	if ensured.ID == "" {
+		t.Fatalf("ensure response missing ID; body=%s", rec.Body.String())
+	}
+	if !ensured.FanoutPolicy.Enabled ||
+		!ensured.FanoutPolicy.AllowUntargetedPublication ||
+		ensured.FanoutPolicy.MaxPeerTriggeredPublishes != 5 ||
+		ensured.FanoutPolicy.MaxTotalPeerDeliveries != 12 {
+		t.Fatalf("ensure response did not preserve fanout policy: %+v", ensured.FanoutPolicy)
+	}
+
+	// Read it back via GET /extmsg/groups.
+	lookupURL := cityURL(fs, "/extmsg/groups") +
+		"?scope_id=" + ref.ScopeID +
+		"&provider=" + ref.Provider +
+		"&account_id=" + ref.AccountID +
+		"&conversation_id=" + ref.ConversationID +
+		"&kind=" + string(ref.Kind)
+	getReq := httptest.NewRequest("GET", lookupURL, nil)
+	getRec := httptest.NewRecorder()
+	srv.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want %d; body: %s", getRec.Code, http.StatusOK, getRec.Body.String())
+	}
+	var fetched struct {
+		FanoutPolicy extmsg.FanoutPolicy `json:"FanoutPolicy"`
+	}
+	if err := json.Unmarshal(getRec.Body.Bytes(), &fetched); err != nil {
+		t.Fatalf("Unmarshal lookup response: %v; body=%s", err, getRec.Body.String())
+	}
+	if !fetched.FanoutPolicy.Enabled ||
+		!fetched.FanoutPolicy.AllowUntargetedPublication ||
+		fetched.FanoutPolicy.MaxPeerTriggeredPublishes != 5 ||
+		fetched.FanoutPolicy.MaxTotalPeerDeliveries != 12 {
+		t.Fatalf("lookup did not preserve fanout policy: %+v", fetched.FanoutPolicy)
+	}
+}

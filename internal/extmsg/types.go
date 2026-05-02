@@ -290,10 +290,10 @@ const (
 
 // FanoutPolicy controls how messages are distributed within a group.
 type FanoutPolicy struct {
-	Enabled                    bool
-	AllowUntargetedPublication bool
-	MaxPeerTriggeredPublishes  int
-	MaxTotalPeerDeliveries     int
+	Enabled                    bool `json:"enabled"`
+	AllowUntargetedPublication bool `json:"allow_untargeted_publication"`
+	MaxPeerTriggeredPublishes  int  `json:"max_peer_triggered_publishes"`
+	MaxTotalPeerDeliveries     int  `json:"max_total_peer_deliveries"`
 }
 
 // ConversationGroupRecord defines a group of related conversations.

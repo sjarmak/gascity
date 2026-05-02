@@ -2555,6 +2555,8 @@ export interface components {
         ExtMsgGroupEnsureInputBody: {
             /** @description Default handle for the group. */
             default_handle?: string;
+            /** @description Optional fanout policy controlling peer-triggered publishes. */
+            fanout_policy?: components["schemas"]["FanoutPolicy"];
             /** @description Group metadata. */
             metadata?: {
                 [key: string]: string;
@@ -2658,12 +2660,12 @@ export interface components {
             provider: string;
         };
         FanoutPolicy: {
-            AllowUntargetedPublication: boolean;
-            Enabled: boolean;
+            allow_untargeted_publication: boolean;
+            enabled: boolean;
             /** Format: int64 */
-            MaxPeerTriggeredPublishes: number;
+            max_peer_triggered_publishes: number;
             /** Format: int64 */
-            MaxTotalPeerDeliveries: number;
+            max_total_peer_deliveries: number;
         };
         FormulaDetailResponse: {
             deps: components["schemas"]["FormulaPreviewEdgeResponse"][] | null;

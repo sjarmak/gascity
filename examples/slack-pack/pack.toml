@@ -9,9 +9,11 @@
 #   gc slack bind-dm           — bind a Slack DM channel to a named session
 #   gc slack reply-current     — reply to the latest Slack event in the
 #                                current session via the local adapter
+#   gc slack bind-room         — bind a Slack room to N sessions; creates a
+#                                launcher-mode group + per-session participants
+#                                with optional fanout policy
 #
 # Not yet implemented (see README.md "Port checklist"):
-#   gc slack bind-room         — including ambient_read + peer_fanout
 #   gc slack enable-room-launch  (launcher mode, @@handle spawning)
 #   gc slack publish           — explicit publish to a saved binding
 #   gc slack import-app        — slash-command intake for `/gc fix` style

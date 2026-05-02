@@ -111,6 +111,7 @@ type ExtMsgGroupEnsureInput struct {
 		RootConversation extmsg.ConversationRef `json:"root_conversation,omitempty" doc:"Root conversation reference."`
 		Mode             extmsg.GroupMode       `json:"mode,omitempty" doc:"Group mode (launcher, etc.)."`
 		DefaultHandle    string                 `json:"default_handle,omitempty" doc:"Default handle for the group."`
+		FanoutPolicy     *extmsg.FanoutPolicy   `json:"fanout_policy,omitempty" doc:"Optional fanout policy controlling peer-triggered publishes."`
 		Metadata         map[string]string      `json:"metadata,omitempty" doc:"Group metadata."`
 	}
 }

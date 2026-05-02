@@ -266,12 +266,16 @@ func (s *Server) humaHandleExtMsgGroupEnsure(ctx context.Context, input *ExtMsgG
 	}
 
 	caller := extmsg.Caller{Kind: extmsg.CallerController, ID: "api"}
-	group, err := svc.Groups.EnsureGroup(ctx, caller, extmsg.EnsureGroupInput{
+	ensureInput := extmsg.EnsureGroupInput{
 		RootConversation: input.Body.RootConversation,
 		Mode:             mode,
 		DefaultHandle:    input.Body.DefaultHandle,
 		Metadata:         input.Body.Metadata,
-	})
+	}
+	if input.Body.FanoutPolicy != nil {
+		ensureInput.FanoutPolicy = *input.Body.FanoutPolicy
+	}
+	group, err := svc.Groups.EnsureGroup(ctx, caller, ensureInput)
 	if err != nil {
 		return nil, huma.Error422UnprocessableEntity(err.Error())
 	}

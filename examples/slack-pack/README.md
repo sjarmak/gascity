@@ -16,8 +16,11 @@ is intended to be promoted to the `gastownhall/gascity-packs` repo
       current session, via the local Slack adapter's `/publish`
 - [x] `template-fragments/slack-v0.template.md` — composable prompt
       fragment for any agent in a slack-bound session
-- [ ] `gc slack bind-room` (incl. `--enable-ambient-read`,
-      `--enable-peer-fanout`, `--allow-untargeted-*`)
+- [x] `gc slack bind-room` — bind a room to multiple sessions; flags
+      `--enable-peer-fanout`, `--allow-untargeted-publication`,
+      `--max-peer-triggered-publishes`, `--max-total-peer-deliveries`,
+      `--default-handle`, `--handle HANDLE=SESSION` (creates a
+      launcher-mode group + participants under the hood)
 - [ ] `gc slack enable-room-launch` (`@@handle` thread-scoped sessions)
 - [ ] `gc slack publish` (explicit publish to a saved binding)
 - [ ] `gc slack import-app` / `map-channel` / `map-rig` / `sync-commands`
@@ -81,6 +84,23 @@ gc slack reply-current --body-file /tmp/reply.txt
 ```
 
 The reply should land in your Slack DM.
+
+To bind a room (public or private channel) to multiple sessions so
+that mayor and project-lead are visible peers and a human can join the
+conversation:
+
+```
+gc slack bind-room C0123ROOM01 \
+    oversight-rig.mayor geo/oversight-rig.project-lead \
+    --enable-peer-fanout
+```
+
+Both sessions then receive an inbound system reminder for every human
+message in the channel; `extmsg.inbound` events list both as
+conversation members. To make peer-visible publishes work end-to-end,
+the publishing session must call `gc slack reply-current` (which will
+be re-routed to publish through gc's outbound API in a follow-up so
+peer fanout fires on outbound too).
 
 ## Where the work that's still missing comes from
 
