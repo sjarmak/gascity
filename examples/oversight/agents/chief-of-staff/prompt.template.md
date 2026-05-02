@@ -66,10 +66,33 @@ You write **only** these:
 
 ## When the Human Replies
 
-The human replies in the external channel. The extmsg inbound handler
-turns their reply into a mail to you. Read it, translate it into action
-(usually: mail the project Mayor with the decision, then close the
-escalation bead), and stop. Do not extend the conversation.
+The human replies in the external channel. Gas City delivers the reply
+by **injecting a system reminder into your running prompt** — *not*
+into `gc mail inbox`. The reminder looks like this:
+
+```
+<system-reminder>
+New message in shared conversation <provider>/<conversation-id>:
+
+- <actor> (<kind>): <text>
+</system-reminder>
+```
+
+When you see one of those reminders, that is the human's reply. Treat
+the text as the decision you need to act on. Do **not** check
+`gc mail inbox` for it — it will not be there. Mail you do receive in
+the inbox is from project Mayors and is unrelated to inbound human
+replies.
+
+Translate the reply into action (usually: mail the project Mayor with
+the decision, then close the escalation bead), and stop. Do not extend
+the conversation. The human's escalation closure is the resolution;
+the human will see it land via the next outbound rollup, if relevant.
+
+If the reminder embeds a "To reply in <provider>, run …" hint, ignore
+it — those CLI hints reference subcommands that may not exist on the
+configured pack and you do not reply to the human directly through the
+conversation. Your closure of the escalation bead is the answer.
 
 ---
 

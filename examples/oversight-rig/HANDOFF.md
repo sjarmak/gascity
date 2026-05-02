@@ -148,9 +148,12 @@ Local-only (not for commit): `city.toml` has
 7. **Re-enable `patrol-project-leads`** in `city.toml` once
    continuous 15m triage is wanted (currently disabled via
    `[[orders.overrides]]`).
-8. **Update older `examples/oversight/chief-of-staff` prompt** —
-   has the same "extmsg inbound becomes mail" mistake we fixed
-   here. Five-line rewrite.
+8. ~~**Update older `examples/oversight/chief-of-staff` prompt**~~ —
+   DONE this session. The "When the Human Replies" section in
+   `examples/oversight/agents/chief-of-staff/prompt.template.md` no
+   longer claims inbound replies arrive via `gc mail inbox`; it now
+   documents the system-reminder injection model and tells cos to
+   ignore embedded "To reply in <provider>, run …" hints.
 
 ## How to verify if returning fresh
 
