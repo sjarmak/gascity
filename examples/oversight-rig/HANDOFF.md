@@ -106,14 +106,18 @@ Local-only (not for commit): `city.toml` has
 
 ## Open work, in priority order
 
-1. **Switch `gc slack reply-current` to publish through gc
-   `/extmsg/outbound`** instead of the adapter's `/publish` directly.
-   Today reply-current bypasses gc, so when one bound session in a
-   bind-room replies, peer sessions never see it (no `extmsgNotifyMembers`
-   fires). Change is small: same body shape, different URL, same
-   adapter ends up called via the registered HTTP adapter callback.
-   This is the actual mechanic that makes bind-room peer-visible
-   end-to-end.
+1. ~~**Switch `gc slack reply-current` to publish through gc
+   `/extmsg/outbound`**~~ — DONE this session. `reply-current` now
+   defaults to `--via gc` (POST `/v0/city/{city}/extmsg/outbound`),
+   which goes through `humaHandleExtMsgOutbound` → the registered
+   HTTP adapter's `/publish` and fires `extmsgNotifyMembers` for peer
+   sessions. `--via adapter` retains the old direct-to-adapter path
+   for diagnostics. Test coverage in
+   `examples/slack-pack/tests/test_slack_chat_reply_current.py`
+   (3 cases; 18/18 pack tests pass). The live supervisor (PID 2656160)
+   already serves `/extmsg/outbound`, so no supervisor restart is
+   needed for this change to take effect — pack scripts hit gc over
+   HTTP at runtime.
 2. **Absorb the Go adapter into the slack pack as a
    `[[service]] proxy_process`.** Right now the adapter is run by
    hand and managed externally; the pack should own its lifecycle

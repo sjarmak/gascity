@@ -13,7 +13,9 @@ is intended to be promoted to the `gastownhall/gascity-packs` repo
 
 - [x] `gc slack bind-dm` — bind a Slack DM channel to one named session
 - [x] `gc slack reply-current` — reply to the latest Slack event in the
-      current session, via the local Slack adapter's `/publish`
+      current session, by default through gc's `/extmsg/outbound` so
+      transcript recording + peer fanout fire (`--via adapter` keeps the
+      old direct-to-adapter path for diagnostics)
 - [x] `template-fragments/slack-v0.template.md` — composable prompt
       fragment for any agent in a slack-bound session
 - [x] `gc slack bind-room` — bind a room to multiple sessions; flags
@@ -39,14 +41,17 @@ is the public-facing webhook receiver and outbound publisher. It runs
 outside this pack — for now, it is left in place exactly as-is. This
 pack adds CLI surface around it: `bind-dm` writes to gc's
 `/extmsg/bind` and to the pack's local config; `reply-current` reads
-recent gc events to find the conversation, then POSTs directly to the
-adapter's localhost-only `/publish` endpoint.
+recent gc events to find the conversation, then POSTs to gc's
+`/extmsg/outbound` (which calls the registered HTTP adapter's
+`/publish` endpoint internally and emits `ExtMsgOutbound` so peer
+fanout fires for bind-room sessions). `--via adapter` is available
+for adapter-only diagnostics that bypass gc.
 
 ```
                    ┌──── public ────┐
 Slack  ──HMAC──▶  Go adapter :8775  ──▶ gc /extmsg/inbound
-                  Go adapter :8766  ◀── gc /extmsg/outbound
-                                    ◀── gc slack reply-current   ← THIS PACK
+                  Go adapter :8766  ◀── gc /extmsg/outbound  ◀── gc slack reply-current
+                                    ◀── (--via adapter) ─────── gc slack reply-current
                    └────────────────┘
 ```
 
@@ -97,10 +102,11 @@ gc slack bind-room C0123ROOM01 \
 
 Both sessions then receive an inbound system reminder for every human
 message in the channel; `extmsg.inbound` events list both as
-conversation members. To make peer-visible publishes work end-to-end,
-the publishing session must call `gc slack reply-current` (which will
-be re-routed to publish through gc's outbound API in a follow-up so
-peer fanout fires on outbound too).
+conversation members. When the publishing session calls
+`gc slack reply-current` (default `--via gc`), gc records the publish
+in the conversation transcript and fans out a peer-publication
+reminder to the other bound sessions so they see what their peer just
+said.
 
 ## Where the work that's still missing comes from
 

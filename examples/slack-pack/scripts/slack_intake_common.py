@@ -150,7 +150,52 @@ def gc_get(path: str) -> dict[str, Any]:
     return _request("GET", url, csrf=False)
 
 
-# --- adapter publish ------------------------------------------------------
+# --- publish --------------------------------------------------------------
+#
+# Two paths exist:
+#
+#   * publish_via_gc_outbound — POSTs to gc's /v0/city/{city}/extmsg/outbound.
+#     gc resolves the binding, calls the registered adapter (Slack), records
+#     transcript + delivery context, and emits ExtMsgOutbound. Peer fanout
+#     to other sessions in the same conversation group fires from gc, which
+#     is what makes bind-room peer-visibility work end-to-end.
+#
+#   * publish_via_adapter — POSTs directly to the local adapter's /publish.
+#     Bypasses gc entirely. Useful for adapter-only smoke tests, but peers
+#     bound to the same room never see the message because gc never observes
+#     the publish. Kept for diagnostics; production replies should use the
+#     gc path.
+
+def publish_via_gc_outbound(
+    *,
+    session_id: str,
+    scope_id: str,
+    provider: str,
+    account_id: str,
+    conversation_id: str,
+    kind: str,
+    text: str,
+    reply_to_message_id: str = "",
+    idempotency_key: str = "",
+) -> dict[str, Any]:
+    """Publish through gc so peer fanout + transcript recording fire."""
+    body: dict[str, Any] = {
+        "session_id": session_id,
+        "conversation": {
+            "scope_id": scope_id,
+            "provider": provider,
+            "account_id": account_id,
+            "conversation_id": conversation_id,
+            "kind": kind,
+        },
+        "text": text,
+    }
+    if reply_to_message_id:
+        body["reply_to_message_id"] = reply_to_message_id
+    if idempotency_key:
+        body["idempotency_key"] = idempotency_key
+    return gc_post("/extmsg/outbound", body)
+
 
 def publish_via_adapter(
     *,
@@ -164,7 +209,8 @@ def publish_via_adapter(
     reply_to_message_id: str = "",
     idempotency_key: str = "",
 ) -> dict[str, Any]:
-    body = {
+    """Publish directly to the local adapter (skips gc; peers won't see it)."""
+    body: dict[str, Any] = {
         "session_id": session_id,
         "conversation": {
             "scope_id": scope_id,

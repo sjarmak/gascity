@@ -89,6 +89,15 @@ def main(argv: list[str]) -> int:
                         help="Caller-supplied idempotency key")
     parser.add_argument("--body", default="")
     parser.add_argument("--body-file", default="")
+    parser.add_argument(
+        "--via",
+        choices=("gc", "adapter"),
+        default="gc",
+        help=("Publish through gc /extmsg/outbound (default) so peer fanout "
+              "+ transcript recording fire, or directly to the local adapter "
+              "(adapter-only diagnostics; peers in a bind-room won't see "
+              "the message)."),
+    )
     args = parser.parse_args(argv)
 
     body = _load_body(args)
@@ -106,24 +115,29 @@ def main(argv: list[str]) -> int:
     if not conv.get("account_id"):
         raise SystemExit("missing slack account_id (SLACK_WORKSPACE_ID env)")
 
+    publish_kwargs = dict(
+        session_id=session_id,
+        scope_id=conv["scope_id"],
+        provider=conv["provider"],
+        account_id=conv["account_id"],
+        conversation_id=conv["conversation_id"],
+        kind=conv["kind"],
+        text=body,
+        reply_to_message_id=args.reply_to,
+        idempotency_key=args.idempotency_key,
+    )
     try:
-        result = common.publish_via_adapter(
-            session_id=session_id,
-            scope_id=conv["scope_id"],
-            provider=conv["provider"],
-            account_id=conv["account_id"],
-            conversation_id=conv["conversation_id"],
-            kind=conv["kind"],
-            text=body,
-            reply_to_message_id=args.reply_to,
-            idempotency_key=args.idempotency_key,
-        )
-    except common.AdapterError as exc:
+        if args.via == "adapter":
+            result = common.publish_via_adapter(**publish_kwargs)
+        else:
+            result = common.publish_via_gc_outbound(**publish_kwargs)
+    except (common.AdapterError, common.GCAPIError) as exc:
         raise SystemExit(str(exc)) from exc
 
     print(json.dumps({
         "conversation_id": conv["conversation_id"],
         "session_id": session_id,
+        "via": args.via,
         "result": result,
     }, indent=2))
     return 0
