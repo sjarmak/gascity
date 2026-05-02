@@ -12,6 +12,8 @@
 #   gc slack bind-room         — bind a Slack room to N sessions; creates a
 #                                launcher-mode group + per-session participants
 #                                with optional fanout policy
+#   gc slack status            — read-only diagnostics: adapters, bindings,
+#                                recent traffic; --session/--since/--json
 #
 # Not yet implemented (see README.md "Port checklist"):
 #   gc slack enable-room-launch  (launcher mode, @@handle spawning)

@@ -29,7 +29,9 @@ is intended to be promoted to the `gastownhall/gascity-packs` repo
       (slash-command intake — `/gc fix` style)
 - [ ] `gc slack post-message` (workflow status projection)
 - [ ] `gc slack retry-peer-fanout`
-- [ ] `gc slack status`
+- [x] `gc slack status` — read-only diagnostics (adapters, bindings,
+      recent traffic). `--session SID` for one-session detail,
+      `--since 5m` for a time window, `--json` for scripting.
 - [x] Pack-owned intake service (`[[service]]` proxy_process). Phase A:
       adapter is the same Go binary, but gc supervises it via UDS for
       `/publish` while the public Slack webhook still terminates at

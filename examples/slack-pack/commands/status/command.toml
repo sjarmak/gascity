@@ -1,0 +1,2 @@
+description = "Show slack pack status: adapters, bindings, recent traffic"
+run = "../status.sh"
