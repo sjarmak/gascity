@@ -34,7 +34,16 @@ no recent inbound but want to reply to a specific channel, pass
 `--conversation-id` explicitly.
 
 Always prefix your Slack message with your handle in bold so humans
-can see who is speaking. Example: `**oversight-rig.cos:** ack`.
+can see who is speaking. **Slack uses single asterisks for bold**
+(unlike Discord/Markdown which use double). Example, for handle
+`oversight-rig.cos`:
+
+```
+*oversight-rig.cos:* ack
+```
+
+Do NOT use `**double asterisks**` — Slack will render them literally
+as four characters around your text instead of bolding.
 
 Do not pipe `gc slack reply-current` through filters that hide
 failures. Trust the JSON it prints — only claim success after seeing

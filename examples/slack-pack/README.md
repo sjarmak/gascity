@@ -76,7 +76,7 @@ gc slack bind-dm D0B0TTS550F oversight-rig.cos
 
 # From inside that session (or any session that has seen recent
 # extmsg.inbound on a slack conversation):
-echo "**oversight-rig.cos:** ack via slack pack" > /tmp/reply.txt
+echo "*oversight-rig.cos:* ack via slack pack" > /tmp/reply.txt
 gc slack reply-current --body-file /tmp/reply.txt
 ```
 
