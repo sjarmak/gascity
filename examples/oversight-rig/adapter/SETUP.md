@@ -4,6 +4,23 @@ End-to-end walkthrough to get rollups flowing into your personal Slack
 DM and replies routed back to chief-of-staff. Estimated time: ~20 min
 of clicking + a few one-line commands.
 
+## Architecture: two listeners, only one Funneled
+
+The adapter binds **two separate ports** by design:
+
+- **`:8765` — public listener** — serves only `/slack/events` (HMAC-verified)
+  and `/healthz`. This is the one Tailscale Funnel exposes to the public
+  internet.
+- **`127.0.0.1:8766` — internal listener** — serves only `/publish`.
+  Bound to localhost so it is **physically unreachable from outside the
+  machine**. gc reaches it via the loopback interface.
+
+Why this split: gc and Slack are different trust zones. The Slack endpoint
+is authenticated by signing secret. The publish endpoint is authenticated
+by network locality (only local processes can reach localhost). If both
+endpoints lived on the public port, anyone on the internet who guessed
+the URL could POST publish requests and make your bot say arbitrary things.
+
 ## Step 1 — Tailscale Funnel public URL
 
 You need a stable public HTTPS URL Slack can POST to. Tailscale Funnel
@@ -13,17 +30,24 @@ gives you one for free.
 # Confirm Funnel is enabled for your tailnet
 tailscale funnel status
 
-# Expose port 8765 (the adapter's default listen port) on your tailnet
+# Expose ONLY the public listener port (:8765) — NOT 8766
 tailscale funnel --bg --https=443 8765
 ```
 
 Tailscale prints the public URL — something like
 `https://<machine>.<tailnet>.ts.net`. **Copy this URL — you need it for
-both Slack app config and the adapter env file.**
+the Slack app's Event Subscriptions Request URL.**
 
-You'll see traffic to `https://<...>.ts.net/publish` and
-`https://<...>.ts.net/slack/events` flow through Funnel into the adapter
-on your local machine.
+Verify isolation: the publish endpoint is NOT exposed:
+
+```bash
+# This should return 404 (publish is not on the public listener):
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -X POST https://<your-tailnet>.ts.net/publish
+
+# This should return ok (proves the public listener works):
+curl -s https://<your-tailnet>.ts.net/healthz
+```
 
 ## Step 2 — Create the Slack app
 
@@ -88,13 +112,23 @@ Create the env file:
 ```bash
 mkdir -p ~/.config/gc-slack-adapter
 cat > ~/.config/gc-slack-adapter/env <<'EOF'
-PUBLIC_URL=https://<your-tailnet>.ts.net
 SLACK_WORKSPACE_ID=T01234567
 SLACK_BOT_TOKEN=xoxb-YOUR-BOT-TOKEN-HERE
 SLACK_SIGNING_SECRET=YOUR-SIGNING-SECRET-HERE
+
+# Defaults shown — only override if you have a port conflict.
+# LISTEN_PUBLIC=:8765                      # Funnel exposes this
+# LISTEN_INTERNAL=127.0.0.1:8766           # gc-only, localhost
+# INTERNAL_CALLBACK_URL=http://127.0.0.1:8766
+# GC_API_BASE_URL=http://127.0.0.1:9443
+# GC_CITY_NAME=ds-research
 EOF
 chmod 600 ~/.config/gc-slack-adapter/env
 ```
+
+Note: `PUBLIC_URL` is no longer needed by the adapter itself (we register
+with the internal callback URL). You only need the public URL to plug
+into the Slack app's Event Subscriptions config.
 
 Run the adapter:
 
@@ -106,9 +140,10 @@ cd /home/ds/gascity/examples/oversight-rig/adapter
 You should see:
 
 ```
-starting gc-slack-adapter listen=:8765 public=https://...ts.net gc=http://127.0.0.1:9443 city=ds-research
-registered with gc as provider=slack account=T01234567 callback=https://...ts.net/publish
-listening on :8765
+starting gc-slack-adapter public=:8765 internal=127.0.0.1:8766 gc=http://127.0.0.1:9443 city=ds-research
+registered with gc as provider=slack account=T01234567 callback=http://127.0.0.1:8766/publish (LOCALHOST ONLY)
+public listener serving on :8765 (Slack events)
+internal listener serving on 127.0.0.1:8766 (gc publish only)
 ```
 
 If registration fails, check that `gc supervisor` is running and the

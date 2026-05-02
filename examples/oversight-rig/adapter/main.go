@@ -37,38 +37,43 @@ import (
 )
 
 const (
-	defaultListenAddr = ":8765"
-	slackAPIBase      = "https://slack.com/api"
+	// Public listener: serves /slack/events only. Bind to 0.0.0.0 so
+	// Tailscale Funnel can reach it.
+	defaultPublicListen = ":8765"
+	// Internal listener: serves /publish only. Bound to 127.0.0.1 so
+	// only processes on this machine (i.e. gc) can reach it.
+	defaultInternalListen     = "127.0.0.1:8766"
+	defaultInternalCallback   = "http://127.0.0.1:8766"
+	slackAPIBase              = "https://slack.com/api"
 )
 
 type config struct {
-	listenAddr        string
-	publicURL         string
-	gcAPIBase         string
-	cityName          string
-	provider          string
-	accountID         string
-	slackBotToken     string
-	slackSigningKey   string
-	registerOnStart   bool
+	publicListen        string
+	internalListen      string
+	internalCallbackURL string
+	gcAPIBase           string
+	cityName            string
+	provider            string
+	accountID           string
+	slackBotToken       string
+	slackSigningKey     string
+	registerOnStart     bool
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
-		listenAddr:      envOr("LISTEN_ADDR", defaultListenAddr),
-		publicURL:       strings.TrimRight(os.Getenv("PUBLIC_URL"), "/"),
-		gcAPIBase:       strings.TrimRight(envOr("GC_API_BASE_URL", "http://127.0.0.1:9443"), "/"),
-		cityName:        envOr("GC_CITY_NAME", "ds-research"),
-		provider:        envOr("ADAPTER_PROVIDER", "slack"),
-		accountID:       os.Getenv("SLACK_WORKSPACE_ID"),
-		slackBotToken:   os.Getenv("SLACK_BOT_TOKEN"),
-		slackSigningKey: os.Getenv("SLACK_SIGNING_SECRET"),
-		registerOnStart: envOr("REGISTER_ON_START", "true") == "true",
+		publicListen:        envOr("LISTEN_PUBLIC", defaultPublicListen),
+		internalListen:      envOr("LISTEN_INTERNAL", defaultInternalListen),
+		internalCallbackURL: strings.TrimRight(envOr("INTERNAL_CALLBACK_URL", defaultInternalCallback), "/"),
+		gcAPIBase:           strings.TrimRight(envOr("GC_API_BASE_URL", "http://127.0.0.1:9443"), "/"),
+		cityName:            envOr("GC_CITY_NAME", "ds-research"),
+		provider:            envOr("ADAPTER_PROVIDER", "slack"),
+		accountID:           os.Getenv("SLACK_WORKSPACE_ID"),
+		slackBotToken:       os.Getenv("SLACK_BOT_TOKEN"),
+		slackSigningKey:     os.Getenv("SLACK_SIGNING_SECRET"),
+		registerOnStart:     envOr("REGISTER_ON_START", "true") == "true",
 	}
 	var missing []string
-	if cfg.publicURL == "" {
-		missing = append(missing, "PUBLIC_URL")
-	}
 	if cfg.accountID == "" {
 		missing = append(missing, "SLACK_WORKSPACE_ID")
 	}
@@ -181,20 +186,38 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
-	log.Printf("starting gc-slack-adapter listen=%s public=%s gc=%s city=%s",
-		cfg.listenAddr, cfg.publicURL, cfg.gcAPIBase, cfg.cityName)
+	log.Printf("starting gc-slack-adapter public=%s internal=%s gc=%s city=%s",
+		cfg.publicListen, cfg.internalListen, cfg.gcAPIBase, cfg.cityName)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/publish", handlePublish(cfg))
-	mux.HandleFunc("/slack/events", handleSlackEvents(cfg))
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	// Public mux: only /slack/events (HMAC-verified) and /healthz.
+	// Bound to 0.0.0.0 by default so Tailscale Funnel can reach it.
+	publicMux := http.NewServeMux()
+	publicMux.HandleFunc("/slack/events", handleSlackEvents(cfg))
+	publicMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+
+	// Internal mux: /publish (gc-only). Bound to 127.0.0.1 so only
+	// processes on this machine can reach it.
+	internalMux := http.NewServeMux()
+	internalMux.HandleFunc("/publish", handlePublish(cfg))
+	internalMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
 
-	srv := &http.Server{
-		Addr:              cfg.listenAddr,
-		Handler:           mux,
+	publicSrv := &http.Server{
+		Addr:              cfg.publicListen,
+		Handler:           publicMux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	internalSrv := &http.Server{
+		Addr:              cfg.internalListen,
+		Handler:           internalMux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -202,24 +225,34 @@ func main() {
 		if err := registerAdapter(cfg); err != nil {
 			log.Fatalf("register adapter: %v", err)
 		}
-		log.Printf("registered with gc as provider=%s account=%s callback=%s/publish",
-			cfg.provider, cfg.accountID, cfg.publicURL)
+		log.Printf("registered with gc as provider=%s account=%s callback=%s/publish (LOCALHOST ONLY)",
+			cfg.provider, cfg.accountID, cfg.internalCallbackURL)
 	}
 
+	errCh := make(chan error, 2)
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("listen: %v", err)
-		}
+		log.Printf("public listener serving on %s (Slack events)", cfg.publicListen)
+		errCh <- publicSrv.ListenAndServe()
 	}()
-	log.Printf("listening on %s", cfg.listenAddr)
+	go func() {
+		log.Printf("internal listener serving on %s (gc publish only)", cfg.internalListen)
+		errCh <- internalSrv.ListenAndServe()
+	}()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
-	log.Println("shutting down")
+	select {
+	case <-stop:
+		log.Println("shutting down (signal)")
+	case err := <-errCh:
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("listener error: %v", err)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(ctx)
+	_ = publicSrv.Shutdown(ctx)
+	_ = internalSrv.Shutdown(ctx)
 }
 
 func registerAdapter(cfg config) error {
@@ -227,7 +260,7 @@ func registerAdapter(cfg config) error {
 		Provider:    cfg.provider,
 		AccountID:   cfg.accountID,
 		Name:        "slack-adapter",
-		CallbackURL: cfg.publicURL,
+		CallbackURL: cfg.internalCallbackURL,
 		Capabilities: adapterCapabilities{
 			Outbound: true,
 			Inbound:  true,

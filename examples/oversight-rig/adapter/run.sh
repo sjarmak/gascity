@@ -7,13 +7,14 @@
 # Override via GC_SLACK_ADAPTER_ENV.
 #
 # Required env keys (in the file):
-#   PUBLIC_URL              # https URL Slack can reach (Tailscale Funnel)
 #   SLACK_WORKSPACE_ID      # T... id, find via Slack admin or auth.test API
 #   SLACK_BOT_TOKEN         # xoxb-...
 #   SLACK_SIGNING_SECRET    # signing secret from Slack app's Basic Information
 #
 # Optional env keys:
-#   LISTEN_ADDR             # default :8765
+#   LISTEN_PUBLIC           # default :8765 (Funnel exposes this; /slack/events)
+#   LISTEN_INTERNAL         # default 127.0.0.1:8766 (localhost-only; /publish)
+#   INTERNAL_CALLBACK_URL   # default http://127.0.0.1:8766
 #   GC_API_BASE_URL         # default http://127.0.0.1:9443
 #   GC_CITY_NAME            # default ds-research
 #   ADAPTER_PROVIDER        # default slack
@@ -27,7 +28,6 @@ if [[ ! -f "$env_file" ]]; then
 gc-slack-adapter: env file not found at $env_file
 Create it with at minimum:
 
-  PUBLIC_URL=https://<your-tailnet>.ts.net
   SLACK_WORKSPACE_ID=T01234567
   SLACK_BOT_TOKEN=xoxb-...
   SLACK_SIGNING_SECRET=...
