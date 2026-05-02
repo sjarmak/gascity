@@ -123,6 +123,26 @@ Local-only (not for commit): `city.toml` has
    hand and managed externally; the pack should own its lifecycle
    like discord-interactions does. This also gives you `gc service
    list` integration and tenant-vs-public publication tiers.
+
+   **Scope note (added on second look):** bigger than the description
+   implies. `internal/workspacesvc/proxy_process.go` requires the
+   service to listen on a Unix domain socket at `GC_SERVICE_SOCKET`;
+   gc reverse-proxies HTTP through `/svc/{name}` to that socket. Our
+   Slack adapter today binds TCP `:8775` (public webhook) and `:8766`
+   (internal `/publish`), with Tailscale Funnel pinned to TCP
+   `:443 → :8775`. A clean absorption needs:
+   - (a) UDS-listener mode in the Go adapter (the public-webhook path
+     can stay TCP if Funnel must keep terminating directly, but the
+     `/publish` callback should move to UDS so gc owns it),
+   - (b) a decision on whether the public Slack webhook ingress
+     migrates through gc (`/svc/slack/webhook`) or stays on the
+     direct TCP path (Tailscale Funnel reconfig either way),
+   - (c) env-var plumbing: signing secret / bot token / workspace id
+     flow from pack `[[service]]` config + `GC_SERVICE_*` instead of
+     `~/.config/gc-slack-adapter/env`.
+
+   Worth designing on paper before coding. Until then, keep
+   `examples/oversight-rig/adapter/run.sh` as-is.
 3. **Switch the chief-of-staff prompt to compose `slack-v0`**, and
    decide whether cos should call `gc slack reply-current` directly
    for "ack" replies (today the prompt forbids it). One-line
