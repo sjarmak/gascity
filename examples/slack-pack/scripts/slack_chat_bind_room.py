@@ -154,6 +154,18 @@ def main(argv: list[str]) -> int:
                         help="Cap peer-triggered publishes per inbound (0 = unlimited)")
     parser.add_argument("--max-total-peer-deliveries", type=int, default=0,
                         help="Cap total peer deliveries per inbound (0 = unlimited)")
+    parser.add_argument("--binding-owner", default="",
+                        metavar="SESSION",
+                        help="Also bind this session to the conversation as the publisher "
+                             "for /extmsg/outbound. Required to make outbound publishes "
+                             "work; without it, peer-fanout still fires but publishes need "
+                             "a separate /extmsg/bind call. Should refer semantically to one "
+                             "of the participants. Pass the gc-id (e.g. gc-77139) when the "
+                             "binding will be looked up by gc-id (e.g. resolve_rig_channel.py); "
+                             "pass the participant alias when the rest of the system reads "
+                             "the binding by alias. The script does NOT cross-check the owner "
+                             "against the participant list — this is intentional so gc-ids "
+                             "can be used alongside alias-based participants.")
     args = parser.parse_args(argv)
 
     workspace_id = _slack_workspace_id()
@@ -161,6 +173,7 @@ def main(argv: list[str]) -> int:
     overrides = _parse_handle_overrides(args.handle)
     participants = build_participants(args.session_names, overrides, args.default_handle)
     default_handle = args.default_handle or participants[0][0]
+    binding_owner = args.binding_owner.strip()
     conv = build_conversation_ref(
         conversation_id=args.conversation_id,
         kind=args.kind,
@@ -196,6 +209,16 @@ def main(argv: list[str]) -> int:
             raise SystemExit(f"upsert participant {handle}={session}: {exc}") from exc
         participant_records.append(res)
 
+    binding_record: dict[str, Any] | None = None
+    if binding_owner:
+        try:
+            binding_record = common.gc_post(
+                "/extmsg/bind",
+                {"session_id": binding_owner, "conversation": conv},
+            )
+        except common.GCAPIError as exc:
+            raise SystemExit(f"bind {binding_owner}: {exc}") from exc
+
     cfg = common.load_pack_config()
     cfg.setdefault("bindings", {})
     binding_key = f"{args.kind}:{args.conversation_id}"
@@ -208,6 +231,8 @@ def main(argv: list[str]) -> int:
         "participants": [
             {"handle": h, "session_name": s} for h, s in participants
         ],
+        "binding_owner": binding_owner or None,
+        "binding_record": (binding_record or {}).get("ID", "") or None,
     }
     common.save_pack_config(cfg)
 
@@ -217,6 +242,8 @@ def main(argv: list[str]) -> int:
         "default_handle": default_handle,
         "fanout_policy": fanout_policy,
         "participants": participant_records,
+        "binding_owner": binding_owner or None,
+        "binding_record": binding_record,
     }, indent=2, default=str))
     return 0
 

@@ -97,7 +97,8 @@ conversation:
 ```
 gc slack bind-room C0123ROOM01 \
     oversight-rig.mayor geo/oversight-rig.project-lead \
-    --enable-peer-fanout
+    --enable-peer-fanout \
+    --binding-owner geo/oversight-rig.project-lead
 ```
 
 Both sessions then receive an inbound system reminder for every human
@@ -107,6 +108,16 @@ conversation members. When the publishing session calls
 in the conversation transcript and fans out a peer-publication
 reminder to the other bound sessions so they see what their peer just
 said.
+
+`--binding-owner SESSION` is what makes outbound publishes (and
+therefore `gc slack reply-current --via gc`) actually work. Without
+it, peer fanout still fires on inbound, but `/extmsg/outbound` has
+no SessionBindingRecord to resolve the conversation through and the
+publish is rejected. The owner must be one of the participants —
+prefer the session that "owns" the room from gc's perspective (the
+project-lead, not the chief-of-staff). Pass the gc session id (e.g.
+`gc-77139`) when alias resolution semantics matter; for stable named
+sessions, the alias works too.
 
 ## Where the work that's still missing comes from
 

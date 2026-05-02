@@ -199,6 +199,7 @@ def test_main_round_trip_with_fake_gc(monkeypatch: pytest.MonkeyPatch, capsys: p
     ])
     assert rc == 0
     paths = [c[0] for c in calls]
+    # No --binding-owner: bind-room only creates the group + N participants.
     assert paths == ["/extmsg/groups", "/extmsg/participants", "/extmsg/participants"]
 
     group_body = calls[0][1]
@@ -235,3 +236,96 @@ def test_main_round_trip_with_fake_gc(monkeypatch: pytest.MonkeyPatch, capsys: p
     out = capsys.readouterr().out
     assert "binding_key" in out
     assert "group-xyz" in out
+
+
+def test_main_with_binding_owner_emits_extmsg_bind(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    """``--binding-owner SESSION`` adds a fourth POST to /extmsg/bind for that session."""
+    mod = _import_module()
+    common = sys.modules["slack_intake_common"]
+
+    calls: list[tuple[str, dict]] = []
+
+    def fake_post(path: str, body: dict):
+        calls.append((path, body))
+        if path == "/extmsg/groups":
+            return {"ID": "group-xyz"}
+        if path == "/extmsg/participants":
+            return {"ID": "p-" + body["handle"]}
+        if path == "/extmsg/bind":
+            return {"ID": "binding-1", "SessionID": body["session_id"]}
+        raise AssertionError(f"unexpected path {path}")
+
+    monkeypatch.setattr(common, "gc_post", fake_post)
+
+    rc = mod.main([
+        "C0123ROOM01",
+        "gc-77139", "gc-83347",
+        "--handle", "geo-pl=gc-77139",
+        "--handle", "cos=gc-83347",
+        "--default-handle", "geo-pl",
+        "--binding-owner", "gc-77139",
+    ])
+    assert rc == 0
+    paths = [c[0] for c in calls]
+    assert paths == [
+        "/extmsg/groups",
+        "/extmsg/participants",
+        "/extmsg/participants",
+        "/extmsg/bind",
+    ]
+    bind_body = calls[-1][1]
+    assert bind_body["session_id"] == "gc-77139"
+    assert bind_body["conversation"] == {
+        "scope_id": "test-city",
+        "provider": "slack",
+        "account_id": "T0TESTWS",
+        "conversation_id": "C0123ROOM01",
+        "kind": "room",
+    }
+
+    saved = json.loads(
+        (pathlib.Path(os.environ["GC_CITY_PATH"]) / ".gc/services/slack/data/config.json").read_text()
+    )
+    binding = saved["bindings"]["room:C0123ROOM01"]
+    assert binding["binding_owner"] == "gc-77139"
+    assert binding["binding_record"] == "binding-1"
+
+
+def test_binding_owner_can_be_separate_gcid_when_participants_are_aliases(monkeypatch: pytest.MonkeyPatch):
+    """``--binding-owner`` accepts a gc-id even when participants are passed as aliases.
+
+    This is the canonical room-binding shape used by oversight-rig: participants
+    are passed as aliases (e.g. ``geo/oversight-rig.project-lead``) so handles
+    derive cleanly, but the binding owner is the gc-id of the project-lead so
+    that ``resolve_rig_channel.py`` (which queries bindings by gc-id from the
+    sessions list) finds the binding.
+    """
+    mod = _import_module()
+    common = sys.modules["slack_intake_common"]
+
+    calls: list[tuple[str, dict]] = []
+
+    def fake_post(path: str, body: dict):
+        calls.append((path, body))
+        if path == "/extmsg/groups":
+            return {"ID": "group-xyz"}
+        if path == "/extmsg/participants":
+            return {"ID": "p-" + body["handle"]}
+        if path == "/extmsg/bind":
+            return {"ID": "binding-1", "SessionID": body["session_id"]}
+        raise AssertionError(f"unexpected path {path}")
+
+    monkeypatch.setattr(common, "gc_post", fake_post)
+
+    rc = mod.main([
+        "C0123ROOM01",
+        "oversight-rig.cos", "geo/oversight-rig.project-lead",
+        "--binding-owner", "gc-77139",  # gc-id, not in participant alias set
+    ])
+    assert rc == 0
+    bind_call = next(c for c in calls if c[0] == "/extmsg/bind")
+    assert bind_call[1]["session_id"] == "gc-77139"
+
+
+# Module-level json import for the test above.
+import json  # noqa: E402
