@@ -49,19 +49,18 @@ schema = 2
 # stay in ~/.config/gc-slack-adapter/env and are inherited via
 # os.Environ() at start time. See README.md "Secrets".
 #
-# [[service]] block disabled pending bd gc-5rz follow-up
-# (GC_SERVICE_URL_PREFIX needs the /v0/city/<cityName>/svc/<name>
-# prefix, not just /svc/<name>; otherwise the adapter's registered
-# CallbackURL 404s on gc's own router). Adapter runs in legacy nohup
-# mode in the meantime.
-#
-# [[service]]
-# name = "slack"
-# kind = "proxy_process"
-#
-# [service.publication]
-# visibility = "private"
-#
-# [service.process]
-# command = ["./adapter/gc-slack-adapter"]
-# health_path = "/healthz"
+# [[service]] block re-enabled 2026-05-03 afternoon: gc-cdf shipped
+# the URL-prefix fix so GC_SERVICE_URL_PREFIX now resolves to
+# /v0/city/<cityName>/svc/<name>, which matches the supervisor's
+# router. Phase A cutover from legacy nohup → proxy_process.
+
+[[service]]
+name = "slack"
+kind = "proxy_process"
+
+[service.publication]
+visibility = "private"
+
+[service.process]
+command = ["./adapter/gc-slack-adapter"]
+health_path = "/healthz"

@@ -177,6 +177,7 @@ func TestProxyProcessHelper(t *testing.T) {
 			"GC_CITY_RUNTIME_DIR":       os.Getenv("GC_CITY_RUNTIME_DIR"),
 			"GC_SERVICE_NAME":           os.Getenv("GC_SERVICE_NAME"),
 			"GC_SERVICE_STATE_ROOT":     os.Getenv("GC_SERVICE_STATE_ROOT"),
+			"GC_SERVICE_URL_PREFIX":     os.Getenv("GC_SERVICE_URL_PREFIX"),
 			"GC_SERVICE_PUBLIC_URL":     os.Getenv("GC_SERVICE_PUBLIC_URL"),
 			"GC_SERVICE_VISIBILITY":     os.Getenv("GC_SERVICE_VISIBILITY"),
 			"GC_PUBLISHED_SERVICES_DIR": os.Getenv("GC_PUBLISHED_SERVICES_DIR"),
@@ -277,6 +278,13 @@ func TestProxyProcessPublishesServiceEnv(t *testing.T) {
 	}
 	if env["GC_SERVICE_VISIBILITY"] != "public" {
 		t.Fatalf("GC_SERVICE_VISIBILITY = %q, want public", env["GC_SERVICE_VISIBILITY"])
+	}
+	// gc-cdf: GC_SERVICE_URL_PREFIX must be the path the supervisor's
+	// public router actually serves. A service composes its CallbackURL
+	// as $GC_API_BASE_URL + $GC_SERVICE_URL_PREFIX, so the prefix MUST
+	// include the /v0/city/<cityName> segment.
+	if want := "/v0/city/test-city/svc/bridge"; env["GC_SERVICE_URL_PREFIX"] != want {
+		t.Fatalf("GC_SERVICE_URL_PREFIX = %q, want %q", env["GC_SERVICE_URL_PREFIX"], want)
 	}
 	if env["GC_PUBLISHED_SERVICES_DIR"] != citylayout.PublishedServicesDir(rt.cityPath) {
 		t.Fatalf("GC_PUBLISHED_SERVICES_DIR = %q, want %q", env["GC_PUBLISHED_SERVICES_DIR"], citylayout.PublishedServicesDir(rt.cityPath))
@@ -831,5 +839,29 @@ func TestProxyProcessSwapAndCloseCleanUpSocketFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(secondSocket); !os.IsNotExist(err) {
 		t.Fatalf("socket still exists after close: %v", err)
+	}
+}
+
+func TestServiceURLPrefix(t *testing.T) {
+	cases := []struct {
+		name      string
+		cityName  string
+		svcName   string
+		want      string
+	}{
+		{"populated city wraps with v0 prefix", "ds-research", "slack", "/v0/city/ds-research/svc/slack"},
+		{"different city different prefix", "test-city", "bridge", "/v0/city/test-city/svc/bridge"},
+		{"empty city falls back to bare mount", "", "slack", "/svc/slack"},
+		{"city names with hyphens preserved", "multi-word-city", "x", "/v0/city/multi-word-city/svc/x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := config.Service{Name: tc.svcName}
+			got := serviceURLPrefix(tc.cityName, svc)
+			if got != tc.want {
+				t.Errorf("serviceURLPrefix(%q, %q) = %q, want %q",
+					tc.cityName, tc.svcName, got, tc.want)
+			}
+		})
 	}
 }
