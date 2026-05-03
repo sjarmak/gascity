@@ -1,4 +1,4 @@
-# Slack pack (scaffold)
+# Slack pack (v0.1.0 preview — scaffold)
 
 A Slack provider extension for Gas City. Modeled directly on the
 upstream `discord` pack
@@ -7,38 +7,66 @@ the same primitives can be ported one at a time.
 
 This pack lives in-tree at `examples/slack-pack/` for the moment. It
 is intended to be promoted to the `gastownhall/gascity-packs` repo
-(or a sibling) once it has feature parity worth upstreaming.
+(or a sibling) once the upstream-prep blockers tracked under bd
+`gc-ywe` close.
+
+> **Scope: not yet at parity with the discord pack.** The discord pack
+> ships ~350K LOC of provider-agnostic Python state-machine logic.
+> Slack pack is a feature-by-feature port; today's surface is enough
+> to run a multi-session oversight loop end-to-end (DMs + rooms +
+> peer fanout + identity overrides + bidirectional file
+> attachments), but several discord-pack features are still missing
+> (see "Not yet implemented" below). If you need parity today, use
+> the discord pack.
 
 ## Status
 
+Implemented:
+
 - [x] `gc slack bind-dm` — bind a Slack DM channel to one named session
-- [x] `gc slack reply-current` — reply to the latest Slack event in the
-      current session, by default through gc's `/extmsg/outbound` so
-      transcript recording + peer fanout fire (`--via adapter` keeps the
-      old direct-to-adapter path for diagnostics)
-- [x] `template-fragments/slack-v0.template.md` — composable prompt
-      fragment for any agent in a slack-bound session
 - [x] `gc slack bind-room` — bind a room to multiple sessions; flags
       `--enable-peer-fanout`, `--allow-untargeted-publication`,
       `--max-peer-triggered-publishes`, `--max-total-peer-deliveries`,
       `--default-handle`, `--handle HANDLE=SESSION` (creates a
       launcher-mode group + participants under the hood)
-- [ ] `gc slack enable-room-launch` (`@@handle` thread-scoped sessions)
-- [x] `gc slack publish` (publish to a session's saved binding;
-      target session is required, no event-scan fallback —
-      fail-fast when the session has no active binding)
-- [ ] `gc slack import-app` / `map-channel` / `map-rig` / `sync-commands`
-      (slash-command intake — `/gc fix` style)
-- [ ] `gc slack post-message` (workflow status projection)
-- [ ] `gc slack retry-peer-fanout`
+- [x] `gc slack reply-current` — reply to the latest Slack event in the
+      current session, by default through gc's `/extmsg/outbound` so
+      transcript recording + peer fanout fire (`--via adapter` keeps the
+      old direct-to-adapter path for diagnostics)
+- [x] `gc slack publish` — publish to a session's saved binding (target
+      session required, no event-scan fallback — fail-fast when the
+      session has no active binding)
+- [x] `gc slack publish-to-channel` — publish to an arbitrary channel
+      ID (no session binding required; useful for one-shot ops posts)
 - [x] `gc slack status` — read-only diagnostics (adapters, bindings,
       recent traffic). `--session SID` for one-session detail,
       `--since 5m` for a time window, `--json` for scripting.
+- [x] `gc slack react` — add an emoji reaction to a Slack message
+- [x] `gc slack identity` — register/unregister a per-session
+      `chat:write.customize` identity (display name + icon) so each
+      bound session posts under its own persona
+- [x] `gc slack handle-alias` — register/unregister a cross-channel
+      `@handle` → session-id alias used by the address-by-handle
+      protocol
+- [x] `gc slack upload` — bidirectional file attachments
+      (`/publish-file` outbound + auto-download of inbound files into
+      `$INBOUND_FILE_STORE/<channel>/<ts>-<filename>`, scrubbed by an
+      in-process retention janitor)
+- [x] `template-fragments/slack-v0.template.md` — composable prompt
+      fragment for any agent in a slack-bound session
 - [x] Pack-owned intake service (`[[service]]` proxy_process). Phase A:
       adapter is the same Go binary, but gc supervises it via UDS for
       `/publish` while the public Slack webhook still terminates at
       adapter TCP `:8775` (Funnel unchanged). See "Adapter as a
       proxy_process service" below for the cutover.
+
+Not yet implemented (planned):
+
+- [ ] `gc slack enable-room-launch` (`@@handle` thread-scoped sessions)
+- [ ] `gc slack import-app` / `map-channel` / `map-rig` /
+      `sync-commands` (slash-command intake — `/gc fix` style)
+- [ ] `gc slack post-message` (workflow status projection)
+- [ ] `gc slack retry-peer-fanout`
 
 ## Architecture (current)
 
@@ -82,29 +110,31 @@ gc slack reply-current --help
 
 Assuming the adapter is up and `SLACK_WORKSPACE_ID` /
 `SLACK_BOT_TOKEN` are exported (the same env the adapter consumes,
-sourced from `~/.config/gc-slack-adapter/env`):
+sourced from `${XDG_CONFIG_HOME:-$HOME/.config}/gc-slack-adapter/env`
+— see "Slack secrets" below):
 
 ```
-# Bind a DM channel to a session
-gc slack bind-dm D0B0TTS550F oversight-rig.cos
+# Bind a DM channel to a session. Replace D0XXXXXXXXX with the DM
+# channel ID Slack assigned to your bot's IM with the human user.
+gc slack bind-dm D0XXXXXXXXX my-session.cos
 
 # From inside that session (or any session that has seen recent
 # extmsg.inbound on a slack conversation):
-echo "*oversight-rig.cos:* ack via slack pack" > /tmp/reply.txt
+echo "*my-session.cos:* ack via slack pack" > /tmp/reply.txt
 gc slack reply-current --body-file /tmp/reply.txt
 ```
 
 The reply should land in your Slack DM.
 
 To bind a room (public or private channel) to multiple sessions so
-that mayor and project-lead are visible peers and a human can join the
+that two or more agents are visible peers and a human can join the
 conversation:
 
 ```
-gc slack bind-room C0123ROOM01 \
-    oversight-rig.mayor geo/oversight-rig.project-lead \
+gc slack bind-room C0XXXXXXXXX \
+    my-pack.session-a my-pack.session-b \
     --enable-peer-fanout \
-    --binding-owner geo/oversight-rig.project-lead
+    --binding-owner my-pack.session-b
 ```
 
 Both sessions then receive an inbound system reminder for every human
@@ -118,12 +148,11 @@ said.
 `--binding-owner SESSION` is what makes outbound publishes (and
 therefore `gc slack reply-current --via gc`) actually work. Without
 it, peer fanout still fires on inbound, but `/extmsg/outbound` has
-no SessionBindingRecord to resolve the conversation through and the
+no `SessionBindingRecord` to resolve the conversation through and the
 publish is rejected. The owner must be one of the participants —
-prefer the session that "owns" the room from gc's perspective (the
-project-lead, not the chief-of-staff). Pass the gc session id (e.g.
-`gc-77139`) when alias resolution semantics matter; for stable named
-sessions, the alias works too.
+prefer the session that "owns" the room from gc's perspective. Pass
+the gc session id (e.g. `gc-77139`) when alias resolution semantics
+matter; for stable named sessions, the alias works too.
 
 ## Adapter as a proxy_process service
 
@@ -159,32 +188,45 @@ When `GC_SERVICE_SOCKET` is set, the adapter:
 - still serves `/healthz` on the UDS so the controller's `health_path`
   probe succeeds.
 
-Slack secrets stay in `~/.config/gc-slack-adapter/env`:
+### Slack secrets
+
+The adapter reads three required secrets from the environment:
 
 ```
-SLACK_WORKSPACE_ID=T01234567
+SLACK_WORKSPACE_ID=T0XXXXXXXXX
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_SIGNING_SECRET=...
 ```
 
-Source the file before `gc start` (or the supervisor's start) so the
-adapter inherits the secrets via `os.Environ()`. Phase B will move
-the env-file path into pack config; not yet wired.
+Recommended placement: `${XDG_CONFIG_HOME:-$HOME/.config}/gc-slack-adapter/env`
+(0600 perms). Source the file before `gc start` so the adapter
+inherits the secrets via `os.Environ()`. Under systemd-managed
+deployments, drop a unit override that points
+`EnvironmentFile=-…/gc-slack-adapter/env` at the same path so the
+supervisor passes the env to its `proxy_process` children. Phase B
+will move the env-file path into pack config; not yet wired.
 
 ### Cutover sequence
 
+The build flow below uses the canonical adapter source path while it
+still lives in `examples/oversight-rig/adapter/`. Once bd `gc-28a`
+relocates the source into the pack itself, steps 1a/1b collapse into
+a single `make -C adapter build`.
+
 ```
-# 1. Build the adapter binary into the pack tree
-make -C examples/oversight-rig/adapter build  # or: go build -o gc-slack-adapter
+# 1a. Build the adapter binary
+( cd examples/oversight-rig/adapter && go build -o gc-slack-adapter )
+
+# 1b. Stage the binary where the [[service]] block expects it
 mkdir -p examples/slack-pack/adapter
 cp examples/oversight-rig/adapter/gc-slack-adapter \
    examples/slack-pack/adapter/gc-slack-adapter
 
 # 2. Source the secrets so the supervisor inherits them
-set -a; source ~/.config/gc-slack-adapter/env; set +a
+set -a; source "${XDG_CONFIG_HOME:-$HOME/.config}/gc-slack-adapter/env"; set +a
 
-# 3. Stop the manually-managed adapter
-pkill -f gc-slack-adapter
+# 3. Stop any manually-managed adapter that may still be running
+pkill -f gc-slack-adapter || true
 
 # 4. Reload the city so the [[service]] block from slack-pack registers
 gc reload   # or: gc supervisor reload
@@ -194,14 +236,16 @@ gc service list                            # expect: slack proxy_process ready
 curl --unix-socket "$(gc service show slack --json | jq -r .socket)" \
      http://x/healthz                      # expect: 200 ok
 
-# 6. Verify outbound publish through gc
+# 6. Verify outbound publish through gc (replace the placeholders).
+#    GC_API_BASE_URL defaults to http://127.0.0.1:8372 on a single-host
+#    deployment; GC_CITY_NAME is the directory-name of your city.
 curl -s -X POST -H "Content-Type: application/json" -H "X-GC-Request: cutover" \
-  -d '{"session_id":"<bound-session>","conversation":{"scope_id":"<city>","provider":"slack","account_id":"T...","conversation_id":"D...","kind":"dm"},"text":"*cutover:* hello"}' \
-  http://127.0.0.1:8372/v0/city/<city>/extmsg/outbound \
+  -d '{"session_id":"<bound-session>","conversation":{"scope_id":"<city>","provider":"slack","account_id":"T0XXXXXXXXX","conversation_id":"D0XXXXXXXXX","kind":"dm"},"text":"*cutover:* hello"}' \
+  "${GC_API_BASE_URL:-http://127.0.0.1:8372}/v0/city/${GC_CITY_NAME:-<city>}/extmsg/outbound" \
   | jq '.Receipt.Delivered'                # expect: true
 
 # 7. Verify inbound — send a Slack DM to the bot, then:
-gc events --city <city> --type extmsg.inbound --since 2m
+gc events --city "${GC_CITY_NAME:-<city>}" --type extmsg.inbound --since 2m
 ```
 
 Rollback: remove (or comment out) the `[[service]]` block in
