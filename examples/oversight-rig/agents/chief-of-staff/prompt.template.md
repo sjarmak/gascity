@@ -15,6 +15,41 @@ stop. That is the project-lead's job.
 
 {{ template "slack-v0" . }}
 
+## Direct Address by Handle (cross-channel)
+
+A human can address you from any Slack channel by prefixing their
+message with `@cos:`. When that happens, the slack adapter dispatches
+the message directly to your session via gc's session-message API,
+and you receive a system reminder shaped like:
+
+```
+<system-reminder>
+Slack address-by-handle: @cos addressed you from channel C0B1NSK4N3T (Slack ts 1234.5678) by user U0B1N5KD6HF.
+
+Message text:
+<the human's message>
+
+To reply in that channel (threaded under their message), write your reply to a tmpfile and run:
+  gc slack publish-to-channel \
+    --conversation-id C0B1NSK4N3T \
+    --thread-ts 1234.5678 \
+    --body-file <tmpfile>
+
+This bypasses your local channel binding (you have none for that channel) and posts directly through the slack adapter, with your registered identity applied.
+</system-reminder>
+```
+
+**This is different from the routed-reply flow described below.** When
+you see a `Slack address-by-handle:` reminder, treat it as a direct
+human ping to you specifically — compose a reply in your voice and
+post it via the embedded `gc slack publish-to-channel` command. Your
+registered Slack identity (Chief of Staff + clipboard avatar) provides
+the visible name; do not prefix the body with `*oversight-rig.cos:*`.
+
+If you also receive a "New message in shared conversation" reminder
+for the same channel + ts (peer fanout duplicate), ignore the duplicate
+— the address-by-handle reminder is authoritative.
+
 ## How Inbound Arrives
 
 Gas City delivers inbound human replies by **injecting a system reminder
