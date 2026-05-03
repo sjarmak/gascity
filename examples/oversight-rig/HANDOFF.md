@@ -29,7 +29,11 @@ Item C (gc-side `HandleOutboundFile`) is still deferred/optional — only worth 
 
 ## Commits landed this session (gc-ywe wave 3 — gc-28a + gc-ywe.5)
 
-This session's work: a single atomic commit relocating the slack adapter Go source from `examples/oversight-rig/adapter/` to `examples/slack-pack/adapter/` and updating all 11 path-bearing references (workflow YAML, pack.toml comment, README, CONTRIBUTING, CHANGELOG, .gitignore comment, `slack_chat_upload.py` docstring, `internal/extmsg/types.go` docstring, the design doc, this HANDOFF). gc-28a closes; gc-ywe.5 closes as a side-effect (adapter Go tests now travel with the pack); epic gc-ywe goes 6/6. The exact SHA will be pinned in a follow-up doc commit (same pattern as the prior wave's `1acd2c7b`).
+This session's work: a single atomic commit `e197a9be` relocating the slack adapter Go source from `examples/oversight-rig/adapter/` to `examples/slack-pack/adapter/` and updating all 11 path-bearing references (workflow YAML, pack.toml comment, README, CONTRIBUTING, CHANGELOG, .gitignore comment, `slack_chat_upload.py` docstring, `internal/extmsg/types.go` docstring, the design doc, this HANDOFF). gc-28a closes; gc-ywe.5 closes as a side-effect (adapter Go tests now travel with the pack); epic gc-ywe goes 6/6.
+
+```
+e197a9be feat(slack-pack): self-contain adapter source (gc-28a)
+```
 
 ## Commits landed prior session (gc-ywe wave 2 — gc-ywe.2 + gc-ywe.3)
 
