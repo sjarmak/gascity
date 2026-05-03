@@ -1,0 +1,2 @@
+description = "Register a handle -> session alias for cross-channel address-by-handle routing"
+run = "../handle-alias.sh"

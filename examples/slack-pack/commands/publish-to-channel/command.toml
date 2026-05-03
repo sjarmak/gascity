@@ -1,0 +1,2 @@
+description = "Publish into a Slack channel by id, bypassing gc binding lookup"
+run = "../publish-to-channel.sh"

@@ -1,0 +1,2 @@
+description = "Upload a file to a session's bound Slack channel (files-upload-v2)"
+run = "../upload.sh"
