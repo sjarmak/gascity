@@ -1,6 +1,6 @@
 # Oversight-rig handoff — 2026-05-03 late night (gc-ywe wave 2: ywe.2 + ywe.3)
 
-> **To the next agent:** the upstream-prep epic gc-ywe ran a parallel wave this session (gc-ywe.2 + gc-ywe.3) via `/focus parallel`, including a unified Phase 4 review and a follow-up bead filed (gc-ywe.6, P3 /tmp store-perm hardening). Epic is now **4/6 (66%)** — gc-ywe.1, .2, .3, .4 closed; gc-ywe.5 blocked on gc-28a; gc-ywe.6 newly filed. Branch `feat/oversight-rig-pack` is at `88e81d40` (4 new commits past prior handoff, linear after `git pull --rebase fork` flattened the wave merge), working tree clean, pushed to `fork/feat/oversight-rig-pack`.
+> **To the next agent:** the upstream-prep epic gc-ywe ran a parallel wave this session (gc-ywe.2 + gc-ywe.3) via `/focus parallel`, including a unified Phase 4 review and a follow-up bead filed (gc-ywe.6, P3 /tmp store-perm hardening). Epic is now **4/6 (66%)** — gc-ywe.1, .2, .3, .4 closed; gc-ywe.5 blocked on gc-28a; gc-ywe.6 newly filed. Branch `feat/oversight-rig-pack` is at `fad9a131` (4 new commits past prior handoff, linear after `git pull --rebase fork` flattened the wave merge), working tree clean, pushed to `fork/feat/oversight-rig-pack`.
 >
 > **`core.hooksPath` regression**: `git config core.hooksPath` currently prints `/home/ds/gascity/.git/hooks` (default) — the prior handoff claimed `.githooks` was restored, but the setting is back to default. The wave's commits and merge went through the default hooks path, not the project's curated `.githooks/pre-commit` pipeline. Re-run `git config core.hooksPath .githooks` if you want the gates active for upcoming work; the wave's quality gates (go vet, go test -race, YAML/shell parse) were validated manually.
 
@@ -29,13 +29,13 @@ Item C (gc-side `HandleOutboundFile`) is still deferred/optional — only worth 
 
 ## Commits landed this session (this wave — gc-ywe.2 + gc-ywe.3)
 
-Four commits past prior HANDOFF (range `717aa27c..88e81d40`), pushed to `fork/feat/oversight-rig-pack`:
+Four commits past prior HANDOFF (range `717aa27c..fad9a131`), pushed to `fork/feat/oversight-rig-pack`:
 
 ```
 3db27544 feat(slack-pack): document adapter env contract + remove ds-research default (gc-ywe.2)
 8e8acb3a chore(slack-pack): add LICENSE/CONTRIBUTING/CHANGELOG/CI for upstream layout (gc-ywe.3)
 48fb88f4 fix(slack-pack): address Phase 4 review findings (gc-ywe.2, gc-ywe.3)
-88e81d40 docs(oversight-rig): refresh HANDOFF after gc-ywe wave 2 (ywe.2 + ywe.3)
+fad9a131 docs(oversight-rig): refresh HANDOFF after gc-ywe wave 2 (ywe.2 + ywe.3)
 ```
 
 Wave was orchestrated via `/focus parallel`: two worktree-isolated subagents ran plan→execute→simplify on each bead concurrently; the main session cherry-picked their commits into a `wave-ywe23-review` branch, ran a unified Phase 4 review (3 reviewers in parallel — code, security, Go), applied fixes in `48fb88f4`, and merged the wave into `feat/oversight-rig-pack` with `--no-ff`. The subsequent `git pull --rebase fork` flattened the merge into linear history (fork was already on the same line of work), so the merge commit doesn't appear above. Key file changes:
