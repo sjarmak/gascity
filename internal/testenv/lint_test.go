@@ -44,6 +44,13 @@ func TestRequiresDedicatedTestenvImportFile(t *testing.T) {
 			if skipRepoLintDir(d.Name()) {
 				return filepath.SkipDir
 			}
+			// Skip nested Go modules: they cannot import internal/testenv,
+			// so the canonical sentinel does not (and must not) live there.
+			if path != root {
+				if _, statErr := os.Stat(filepath.Join(path, "go.mod")); statErr == nil {
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 		if !strings.HasSuffix(path, "_test.go") {

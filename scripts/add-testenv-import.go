@@ -53,6 +53,17 @@ func main() {
 			if skipDirs[d.Name()] {
 				return filepath.SkipDir
 			}
+			// Skip any nested Go module (a directory containing its
+			// own go.mod that is not the repo root). The testenv
+			// helper lives under internal/, which nested modules
+			// cannot import — dropping a sentinel into them would
+			// make their `go test` fail with "no required module
+			// provides package …/internal/testenv".
+			if path != root {
+				if _, statErr := os.Stat(filepath.Join(path, "go.mod")); statErr == nil {
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 		if !strings.HasSuffix(path, "_test.go") {
