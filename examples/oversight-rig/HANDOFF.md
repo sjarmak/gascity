@@ -1,609 +1,424 @@
-# Oversight-rig handoff — 2026-05-02 (Phase A cutover rollback + slack-pack expansion)
+# Oversight-rig handoff — 2026-05-03 evening (gc-5rz Phase A cutover live, gc-9ha shipped)
+
+> **To the next agent:** the previous overnight session completed every Item from the prior handoff (1 DELETE methods, 2 outbound files, 3 inbound files, 4 PL restart sweep, 5 bd issues, mayor 7 AM debrief). The morning session shipped (a) gc-g52 inbound-file retention janitor, (b) gc-cdf proxy_process URL-prefix fix, (c) gc-txv investigation + gc-67o phase-timing instrumentation. The afternoon session activated those (adapter + supervisor restarts) and observed the first slow-start (codescalebench-worker, start_call=1m22.53s). Then **the evening session shipped gc-9ha** (state_sync_recovery sub-phase split), **completed the gc-5rz Phase A cutover** (slack adapter is now supervised as proxy_process on a UDS), and **wired up systemd EnvironmentFile** so supervisor children inherit Slack secrets. **The Slack app `A0B1CVDSG5S` was granted `files:write` + `files:read` + `channels:read` + `groups:read` mid-day** — Items A, B, D-path-1 from the prior open-work list are all unblocked and verified. The follow-on session **closed gc-w1h** by adding snake_case json tags to PublishReceipt (sibling of the PublishRequest fix), adding regression tests, and regenerating the OpenAPI/dashboard artifacts — see "extmsg wire-tag audit (gc-w1h)" below. This unblocks gc-kvt.
+
+## Up next (recommended dispatch)
+
+All restarts, the gc-5rz Phase A cutover, gc-9ha instrumentation, and the v3 PL restart sweep are done. Remaining queue:
+
+1. **Watch for the next slow-start log line** to localize start_call between provider.Start and state_sync_recovery. With gc-9ha live, the next `phases=[start_call=2m… …]` line will either include `state_sync_recovery=Xs` (recovery branch is the cost) or won't (provider.Start is the cost). That answers gc-9ha acceptance #3 about whether the 60s `session.startup_timeout` should bound start_call.
+2. **Slack identity caveat** is still real — `files.completeUploadExternal` ignores `chat:write.customize`, so file posts appear under the default bot identity. Documented in adapter handler comment + PL prompt addition. Not a bug; just a Slack API limit.
+
+Item C (gc-side `HandleOutboundFile`) is still deferred/optional — only worth doing if files need to flow through gc's outbound machinery for transcripts/peer fanout, which v1 doesn't need.
 
 ## State
 
-Two-way Slack ↔ gc oversight loop is **fully working end-to-end**
-across the city DM and 7 per-rig channels. cos is running on the
-slack-v0-aware prompt (DM-ack on step 5, room-silence rule). The
-patrol-project-leads order is firing for all 13 rigs every ~16min —
-contrary to a previous handoff claim, it was never actually disabled
-(see gc-a3s).
+The Slack ↔ gc loop now supports:
 
-All four routing branches in chief-of-staff have been exercised
-against real Slack inbound:
+- **Bidirectional file attachments**:
+  - **Outbound**: `gc slack upload --file <path> [--initial-comment ...] [--thread-current|--thread-ts ...]` posts a file to a session's bound channel via Slack's three-step files-upload-v2 protocol. Adapter endpoint `/publish-file`. Bot needs `files:write`; without it the path returns `{delivered:false, failure_kind:"auth", error:"missing_scope"}` cleanly.
+  - **Inbound**: when a Slack message has files, the adapter downloads each file's bytes (Bearer auth, atomic temp+rename) into `${INBOUND_FILE_STORE:-/tmp/gc-slack-adapter/inbound}/<channel>/<ts>-<safe-filename>`, then forwards the inbound to gc with `attachments=[{provider_id, url:"file://..." mime_type}]`. PLs `Read` the local path directly — no token leak, no curl.
 
-- match-and-route-to-project-lead (`ack GEO-rjz` → mailed
-  `geo/oversight-rig.project-lead`, closed bead with `resolved` label)
-- no-match-route-to-mayor (raw text → mailed mayor, no guess)
-- quiet-tick (no system-reminder, empty mail)
-- prime (first awake read of the prompt)
+- **Identity + alias deletion** (8A/8B):
+  - `DELETE /identity?session_id=...` and `DELETE /handle-alias?handle=...` (both also accept JSON body).
+  - Pack: `gc slack identity --remove` and `gc slack handle-alias --remove` flags.
+  - Idempotent — missing entries return `{removed:true, existed:false}` without error.
+  - Stale `smoke-test` entry was cleaned up using the new endpoint; the live identities.json now holds exactly 9 personas + 2 aliases.
 
-`examples/slack-pack/` is a slack-side parallel of
-`gastownhall/gascity-packs/discord`. Five commands are implemented and
-backed by 39 unit tests:
+- **Per-agent identities (8A)** and **cross-channel address-by-handle (8B)** unchanged from the previous handoff — both still working.
 
-- `gc slack bind-dm` — bind a DM to a session
-- `gc slack bind-room` — bind a room to N sessions w/ peer-fanout +
-  `--binding-owner` plumbing
-- `gc slack reply-current` — reply to the latest inbound (default
-  `--via gc` so peer fanout fires; `--via adapter` for diagnostics)
-- `gc slack status` — read-only diagnostics: adapters, bindings,
-  recent traffic; `--session/--since/--limit/--json` flags. Replaces
-  the curl + jq combos that piled up while debugging cutovers.
-- `gc slack publish` — publish to a session's saved binding (no
-  event-scan fallback; fails fast if the session has no binding).
-  Sibling to `reply-current`: explicit "send X" intent.
-
-Per-rig rollout for 7 of 13 rigs is live — outbound publish,
-peer-fanout to cos, and inbound `kind=room` classification all
-verified end-to-end. The Phase A proxy_process cutover (gc-5rz) was
-attempted this session and rolled back cleanly after surfacing a real
-SDK-side defect; legacy nohup adapter mode is the steady state until
-**bd gc-cdf** lands (see "Open work" item 2).
+Verified by `go test -count=1 -race ./...` in `examples/oversight-rig/adapter` (all green) plus a live `/publish-file` smoke against the running adapter — **post-scope-grant** the response is `{delivered:true, file_id:"F0B1G3CFHKN"}`. The smoke artifact (45-byte `smoke-up.txt`) currently sits in `#all-agent-city`; safe to delete.
 
 ## Live runtime
 
-- **Supervisor** PID **4187273** (rebuilt `/tmp/gc` from this branch;
-  manually-started so the SLACK_* env from
-  `~/.config/gc-slack-adapter/env` is in its environment ready for
-  any future Phase A retry. The systemd `gascity-supervisor.service`
-  unit is in restart loop because port 8372 is held by the manual
-  one — same shape as the previous cutovers, harmless).
-- **Slack adapter** PID **199927**, registered as
-  `slack/T0B17700WUW`. Legacy nohup mode: public `:8775`, internal
-  `127.0.0.1:8766/publish`. Log: `/tmp/gc-slack-adapter/run.log`.
-  Tailscale Funnel still on (`:443 → :8775`).
-- **Slack app event subscriptions** include `message.im` and
-  `message.channels`. **`message.groups` is NOT subscribed** — if any
-  rig's channel is private (`G`-prefix id), add it in
-  api.slack.com → Event Subscriptions and reinstall.
-- **Slack pack** imported via local `[imports.slack]` in `city.toml`.
-  `gc slack {bind-dm,bind-room,reply-current}` available.
-- **chief-of-staff** session `gc-83347` (alias `oversight-rig.cos`),
-  bound to DM `D0B0TTS550F`, also a peer in 7 room groups (see
-  table below). cos was restarted this session via
-  `gc session reset gc-83347` to pick up the new prompt; it now
-  composes the `slack-v0` template fragment from the slack pack and
-  has a step-5 DM-ack rule (acks routes in DMs only; rooms stay
-  silent). Cos's Anthropic rate limit cleared earlier than the worst
-  case suggested — it's been routing live since mid-session.
-- **13 project-leads** — exactly one per rig, all `awake (always)`.
+- **Supervisor + gc API** PID **2448608** (systemd `gascity-supervisor.service`, restarted **2026-05-03 12:59:56 EDT**, third restart of the day to deploy gc-9ha). `/tmp/gc` rebuilt from current source at 12:58 — includes gc-cdf, gc-67o, and gc-9ha instrumentation. New systemd drop-in `slack-adapter-env.conf` adds `EnvironmentFile=-/home/ds/.config/gc-slack-adapter/env` so supervisor inherits Slack secrets and passes them to proxy_process children.
+- **Slack adapter** PID **2455221** — supervised by gc as **proxy_process** (gc-5rz Phase A cutover, originally cut over **2026-05-03 12:54:45 EDT**, then respawned by supervisor at 13:00:12 EDT after the gc-9ha rebuild restart). Internal listener on UDS `/tmp/gcsvc-1000/ee31dfef/slack-*.sock`; public TCP `:8775` (Slack events) unchanged. Service state = `ready/ready`. Registered callback URL = `http://127.0.0.1:8372/v0/city/ds-research/svc/slack/publish (via gc /svc proxy)` — confirms gc-cdf URL-prefix fix end-to-end. gc-g52 janitor active in this adapter binary. Per-service log at `/home/ds/gas-city/.gc/services/slack/logs/service.log`. Current binary serves all of:
+  - `POST /publish`, `POST /publish-file`, `POST /react`
+  - `POST /identity`, `DELETE /identity`
+  - `POST /handle-alias`, `DELETE /handle-alias`
+  - `POST /slack/events` (public)
+  - `GET /healthz` (both)
+  - Capabilities now declare `SupportsAttachments: true`.
+- **chief-of-staff** session `gc-83347`. **Mayor** session `gc-2568`.
+- **13 project-leads** all on `claude-auto`. **v3 sweep ran 2026-05-03 13:16-13:32 EDT** (see /tmp/pl-restart-sweep-v3.log) — picked up the prompt template's "Files" subsection (gc slack upload protocol). All 13 PLs reset. The earlier v1+v2 sweeps had already covered the broader Files-protocol additions; v3 just refreshes everyone after the latest template tweak. **chief-of-staff (gc-83347) deliberately NOT swept** to avoid disrupting the user-facing channel. If a future template change touches cos behavior, reset gc-83347 manually.
+  - **Bonus**: PLs re-registered Slack identities on restart per their template, so the identity registry grew from 9 → 12 entries. New identities: codescalebench, migration-evals, oversight-rig (deployment-local rig), agent-diagnostics. zeldascension switched emoji from `princess` → `triforce`.
+- **Slack pack** has 10 commands now: bind-dm, bind-room, reply-current, publish, status, react, identity, handle-alias, publish-to-channel, **upload**.
+- **Per-rig channels** unchanged — 7 of 13 rigs bound.
 
-### Per-rig room bindings (LIVE)
+## Mayor 7 AM debrief — fired and posted (with one manual unblock)
 
-| rig | gc-id | channel id | binding id | group id |
-|---|---|---|---|---|
-| codeprobe | gc-82316 | C0B1A0CKEH0 | gc-84162 | gc-84154 |
-| codescalebench | gc-82318 | C0B248JP54Y | gc-84110 | gc-84102 |
-| enterprisebench | gc-82313 | C0B1NSHTSKT | gc-84136 | gc-84129 |
-| gascity | gc-82783 | C0B1NSK4N3T | gc-84144 | gc-84138 |
-| geo (new) | gc-77139 | C0B13JH8T35 | gc-84152 | gc-84146 |
-| scix-experiments | gc-82781 | C0B17TXMT1C | gc-84118 | gc-84112 |
-| zeldascension | gc-82782 | C0B13JE7M35 | gc-84127 | gc-84120 |
+Timer fired on schedule at **2026-05-03 07:00:25 EDT**, dispatched the system-reminder to mayor's session, and got a 202 from the gc API. Mayor composed the debrief but blocked on the channel ID for `#all-agent-city` — at the time the bot lacked `channels:read` and the channel had never sent an event the adapter could record, so mayor had no way to resolve the name → ID.
 
-All bindings: peer-fanout enabled, mode=launcher, participants are
-`oversight-rig.cos` (alias) + `<rig>/oversight-rig.project-lead`
-(alias), binding-owner is the project-lead's gc-id (so
-`resolve_rig_channel.py` finds the binding via its gc-id-keyed
-lookup against `/extmsg/bindings?session_id=<gc-id>`).
+After the user pasted the channel ID (`C0B0TQMQF2B`), a follow-up reminder was injected and mayor published the debrief at **2026-05-03 08:33:11 EDT** — Slack ts `1777811592.120509`, posted under the registered "Mayor" identity (crown emoji), 1250 chars covering all six overnight items + status.
 
-`resolve_rig_channel.py` returns the dedicated room for all 7 rigs;
-verified by direct invocation. Outbound smoke test against
-`#gascity` (`gc-82783` → `C0B1NSK4N3T`) returned `Delivered: True`
-and peer-fanout to cos fired in <1s.
+**Lesson now obsolete for the immediate cause** — `channels:read` was granted mid-day; agents can resolve `#name` → `C…` via `conversations.list`. The general operational hygiene still applies: when scheduling a "post to channel X" reminder, prefer to bake the channel ID into the script so the agent isn't doing a Slack API call inside a one-shot reminder.
 
-### Remaining 6 rigs (no channel yet)
+Artifacts:
+- Unit: `mayor-7am-debrief.timer` → `mayor-7am-debrief.service` (one-shot, expired after firing)
+- Script: `/tmp/mayor-7am-debrief.sh`
+- Log: `/tmp/mayor-7am-debrief.log` (shows POST status 202, exit 0)
+- Mayor session log: `gc session logs gc-2568 | tail -100` shows the draft, the unblock, and the publish receipt.
 
-`mcp-ax`, `background-agents`, `live_docs`, `migration-evals`,
-`agent-diagnostics`, `code-intelligence-digest`. For each:
+## What changed this session
 
-1. Create a Slack channel (any name; a consistent prefix like
-   `oversight-<rig>` keeps the sidebar grep-able).
-2. Invite `@gc-oversight` to the channel.
-3. Run:
-   ```
-   /tmp/gc slack bind-room <Cxxx> \
-       oversight-rig.cos <rig>/oversight-rig.project-lead \
-       --enable-peer-fanout \
-       --binding-owner <gc-id-of-project-lead>
-   ```
-   Project-lead gc-ids: agent-diagnostics=gc-83263,
-   gascity=gc-82783 (already bound),
-   code-intelligence-digest=gc-82780, background-agents=gc-82315,
-   mcp-ax=gc-82314, live_docs=gc-82312, migration-evals=gc-82311.
+### Item 1 — DELETE methods for identity + alias
 
-### Canary on `C0B0TQMQF2B` (= `#all-agent-city`)
+- Adapter: `identityRegistry.Delete(sessionID)` and `handleAliasRegistry.Delete(handle)` returning `(existed bool, err error)`. New types `identityDeleteReceipt`, `handleAliasDeleteReceipt`. New handlers `handleIdentityDelete`, `handleHandleAliasDelete` accepting either query param or JSON body. Wired into mux as `DELETE /identity` and `DELETE /handle-alias` (Go 1.22+ method-prefixed patterns). The existing POST routes are now `POST /identity` and `POST /handle-alias` — same behavior, different mux registration.
+- Pack: `slack_chat_identity.py` and `slack_chat_handle_alias.py` gained `--remove` flags. New helpers `remove_identity_via_adapter`, `remove_handle_alias_via_adapter` in `slack_intake_common.py` (added `urllib.parse` import).
+- Tests: `TestIdentityRegistryDelete`, `TestHandleAliasRegistryDelete`, `TestHandleIdentityDelete` (table-driven, query+body, idempotency, method rejection), `TestHandleHandleAliasDelete`.
 
-CLEANED UP this session. The canary binding `gc-83781`
-(geo PL → `C0B0TQMQF2B`) was unbound via
-`POST /v0/city/ds-research/extmsg/unbind`; geo PL now has only
-the dedicated `gc-84152 → C0B13JH8T35` binding. Verified via
-`/extmsg/bindings?session_id=gc-77139` returning a single
-active item.
+### Item 2 — Slack file upload (outbound)
 
-## Known formatting gotcha (Slack ≠ Discord)
+- Adapter: new types `publishFileRequest`, `publishFileReceipt`, `slackGetUploadURLResp`, `slackCompleteUploadReq`, `slackCompleteUploadResp`. New handler `handlePublishFile(cfg, identityReg)` mounted on `/publish-file`. Three Slack-API helpers: `slackGetUploadURL` (form-urlencoded), `slackPutFileBytes` (raw PUT, no auth header), `slackCompleteUpload` (JSON). Shared `mapSlackError` helper consolidates the failure-kind mapping. `registerAdapter` now declares `SupportsAttachments: true`.
+- File-upload identity caveat: Slack's `files.completeUploadExternal` doesn't honor `chat:write.customize` overrides, so file posts appear under the default bot identity even when an identity record is registered. The adapter does the lookup for log parity but the override doesn't apply. Documented in the handler comment + the PL prompt addition.
+- Pack: new command `gc slack upload`. Files: `examples/slack-pack/scripts/slack_chat_upload.py`, `examples/slack-pack/commands/upload.sh`, `examples/slack-pack/commands/upload/{command.toml,help.md}`. Helper `upload_via_adapter` in `slack_intake_common.py`.
+- Tests: `TestHandlePublishFile` table-driven — happy path with thread + initial comment, missing inputs, GET/garbage rejected, missing_scope→auth, ratelimited→rate_limited, channel_not_found on complete→not_found, PUT 5xx→transient. Uses `httptest.NewServer` to stub Slack API + a separate stub for the pre-signed upload URL.
 
-Slack's mrkdwn uses **single asterisks** for bold (`*text*`).
-Double asterisks (`**text**`) render literally. The first
-verification message landed in Slack as
-`**slack-pack:** verifying ...` with the asterisks visible to the
-human. The `slack-v0` template fragment now spells this out
-explicitly so future agent-authored replies use the right syntax.
-The Go adapter does NOT translate Markdown bold; the right surface
-for this is the prompt-fragment level, where each provider can
-specify its own formatting contract.
+### Item 3 — Slack file download (inbound)
 
-## What's on the branch
+- Adapter: new type `externalAttachment` mirroring `extmsg.ExternalAttachment`. `slackMessageEvent` extended with `Files []slackFile`. `externalInboundMessage` extended with `Attachments []externalAttachment` (gc-side `extmsg.ExternalInboundMessage.Attachments` already existed, no gc-side change needed). `processSlackEvent` calls new `downloadSlackFiles` helper when `len(msg.Files) > 0`; failed downloads are dropped from the slice with a warning, the message itself still forwards. New helpers `downloadSlackFiles`, `safeFilename` (path-traversal-safe — strips `/`, `\`, NUL, control chars; replaces leading dots; caps at 200 chars), `slackDownloadToFile` (Bearer-auth GET + atomic temp+rename).
+- New env: `INBOUND_FILE_STORE` (default `/tmp/gc-slack-adapter/inbound`).
+- Tests: `TestSafeFilename` (table-driven, path-traversal cases), `TestDownloadSlackFiles` table-driven (single, two, none, missing url_private, 404 drops one but other succeeds, empty store path, sanitized name).
+
+### PL prompt template — file protocol
+
+Added a "Files" subsection to `agents/project-lead/prompt.template.md` between steps 5 and 6 of the reply-in-rooms protocol. Two beats:
+- **Outbound**: use `gc slack upload --file ... --initial-comment ... --thread-current` instead of describing files in text. Notes the identity caveat.
+- **Inbound**: when `attachments:` shows a `file://` URL, use `Read` directly — don't curl/HTTP.
+
+PL restart sweep ran tonight to pick up the new template.
+
+### Bd issues filed (Item 5)
+
+- **gc-g52** — ~~extmsg adapter inbound file retention policy missing~~ **CLOSED this morning** — see "Inbound file retention janitor" section below.
+- **gc-txv** — ~~gc session reset on chief-of-staff takes 1m+~~ **CLOSED this morning** — investigated; normal cos start is 5-7s, the 1m+ symptom comes from async-start queue saturation under sweep load + a 60s-startup-timeout escape (split into follow-up **gc-67o**). Operational mitigation (sequential restart sweep at 75s/session) is already in place.
+- **gc-67o** — ~~session start timing — split lifecycle 'duration' into per-phase~~ **CLOSED this session** — instrumentation shipped; next slow-start log line will carry `phases=[start_call=Xs post_start_observe=Yms commit_refresh=Zms]` so the bottleneck localizes immediately. See "Phase-timing instrumentation" section below.
+- **gc-kvt** — extmsg PublishRequest still lacks SessionID; metadata fallback is a workaround (P2, extmsg,tech-debt)
+
+### Inbound file retention janitor (gc-g52)
+
+In-process janitor in the adapter sweeps `$INBOUND_FILE_STORE` on a configurable interval, deleting regular files older than the TTL (mtime-based) and removing channel sub-directories that become empty afterwards. Defaults: TTL = `168h` (7 days), sweep interval = `1h`. Env knobs:
+
+- `INBOUND_FILE_TTL` — duration string (e.g. `30m`, `48h`). `0` disables. Invalid duration also disables (with a warning).
+- `INBOUND_FILE_SWEEP_INTERVAL` — duration string for the tick. `0` disables.
+
+Code (in `examples/oversight-rig/adapter/main.go`):
+
+- `sweepInboundStore(root, ttl, now)` — pure function returning `sweepResult{FilesRemoved, DirsRemoved, BytesRemoved, Errors}`. Skips files at the root level (only touches `<root>/<channel>/*`). Missing root is a no-op.
+- `sweepChannelDir(channelDir, cutoff, *res)` — per-channel pass; one bad file doesn't abort the sweep.
+- `runInboundFileJanitor(ctx, cfg)` — goroutine wired in `main()`. Runs one sweep on startup, then ticks. Cancels via `janitorCtx`. Disabled paths log once at startup; active paths log only when files/dirs were removed or errors occurred.
+- `logSweepResult(res)` — silent on idle passes; logs counts + per-error lines on non-trivial passes.
+
+Tests: `TestSweepInboundStore` (9 subtests covering missing/empty root, fresh vs old, empty-dir cleanup, multi-channel independence, ttl=0 disable, root-level files skipped, non-regular files skipped) plus four `TestLoadConfigInboundFileRetention*` tests for env parsing (defaults, overrides, disabled, invalid).
+
+Activated by adapter restart on 2026-05-03 12:30:33 EDT (PID 1145516). Startup log confirms `inbound file janitor started: store=/tmp/gc-slack-adapter/inbound ttl=168h0m0s interval=1h0m0s`.
+
+### gc-67o payoff + gc-9ha sub-phase split
+
+Within the first wave of starts after the gc-67o supervisor restart, `phases=` segments populated correctly across all post-restart success paths (sync, async, control-dispatcher, worker-pool). One slow start showed up on the very first wave:
 
 ```
-27e603cc chore(slack-pack): drop YAGNI bare-list branch in slack status _events
-3edeb3d0 feat(slack-pack): gc slack publish — publish to a session's binding
-111641dd feat(slack-pack): gc slack status — read-only diagnostics
-9dbd92d2 docs(oversight-rig): point handoff at gc-cdf for proxy_process URL bug
-c0922bba docs(slack-pack): roll back Phase A cutover; pin defect to gc-5rz
-5e83d8fc docs(oversight-rig): handoff after gc-5rz Phase A + gc-a3s investigation handoff
-c1e1f6a1 feat(slack-pack): adapter UDS mode + [[service]] proxy_process (gc-5rz Phase A)
-070f39c1 docs(oversight-rig): cos slack-v0 prompt + Phase A design + handoff refresh
-74b56fc1 docs(oversight-rig): handoff after 7-rig rollout + 4a/4b/4c done
-92493163 feat(slack-pack): bind-room --binding-owner
-8a6b3c1f feat(controller): inject GC_API_BASE_URL + GC_CITY_NAME into order exec env
-3d7eee3c docs(oversight-rig): handoff after live cutover + canary findings
-... (earlier slack-adapter commits)
+session lifecycle: op=start wave=0 session=codescalebench-worker-gc-71304
+  template=/home/ds/projects/CodeScaleBench/codescalebench-worker
+  outcome=success duration=1m24.557s
+  phases=[start_call=1m22.53s post_start_observe=2.044s commit_refresh=1ms]
 ```
 
-**Branch status:** 29 commits ahead of `origin/main`. NOT pushed.
-Local-only by user request. The 5 most recent commits are all from
-this session: 1 cutover-rollback + handoff pointer pair, 2 new pack
-commands (status, publish), 1 follow-up cleanup.
+Bottleneck localizes cleanly to **start_call** (provider.Start + ErrStateSync recovery branch) — not post_start_observe (deterministic 2s sleep + observe), not commit_refresh (1ms bead reload).
 
-## Cutovers (3 attempted this branch — 2 succeeded, 1 rolled back)
+**gc-9ha shipped** — start_call is now split between `provider.Start` (implicit; start_call - state_sync_recovery) and `state_sync_recovery` (the workerSessionTargetRunningWithConfig branch fired only when provider.Start returns ErrStateSync). New field `startPhaseTimings.StateSyncRecovery`; the format-log emits `state_sync_recovery=Xms` only when > 0, so the elision rule still holds for healthy starts. After the next slow-start observation we'll know whether the 1m22s lives in provider.Start itself or in the recovery branch — answers gc-9ha acceptance #3 about whether `session.startup_timeout` should bound start_call.
 
-Cutover #1 (prior session) brought the supervisor onto the `bind-room` +
-fanout-policy build. Cutover #2 (prior session) brought it onto the
-order-exec env-injection build (item 4c). Cutover #3 (this session)
-attempted Phase A proxy_process and **rolled back** after the SDK URL
-defect surfaced — see "Open work" item 2 and bd gc-cdf. All 8
-bindings (cos DM + 7 rig rooms) preserved across the cutover+rollback
-round trip; the canary binding `gc-83781` was already cleaned up in a
-prior session.
+**Pre-restart phase-timing instrumentation (gc-67o)**
 
-Current supervisor PID **4187273** (manually-started this session
-with SLACK_* env sourced; supervisor inherits the adapter secrets and
-is ready for any future Phase A retry). Current adapter PID **199927**
-(legacy nohup mode at `:8766/publish`). See Live runtime for full
-context.
+`startResult` gained a `phases startPhaseTimings` field with three duration sub-fields:
+- `StartCall` — wall-clock inside `startPreparedStartCandidate` (provider Start + ErrStateSync recovery)
+- `PostStartObserve` — `staleKeyDetectDelay` (2s) + `workerObserveSessionTarget` (only when `session_key` present)
+- `CommitRefresh` — `refreshAsyncStartResult` bead reload (commit-side, async path only)
 
-Sequence used (for reference; same shape worked for #1 and #2, and
-the disruptive part of #3 before the defect appeared):
+`logLifecycleOutcome` accepts an optional variadic `startPhaseTimings` tail; when non-zero, it emits a `phases=[...]` segment after `duration=`. Existing 14+ legacy callers stay untouched (variadic = back-compat). All 7 callers inside `commitStartResultTraced` and the two stale-path callers in `commitAsyncStartResultWithContext` now pass `result.phases`.
+
+Tests in new file `cmd/gc/session_lifecycle_phases_test.go`:
+- `TestStartPhaseTimingsFormatLog` (6 subtests) — zero elision, single phase, partial phases, all three, ms rounding, commit-only.
+- `TestLogLifecycleOutcomeWithPhases` (4 subtests) — legacy no-phases call, phases segment present, zero phases elided, error + phases coexist.
+
+Activated by supervisor restart on 2026-05-03 12:32:33 EDT (PID 1214945, `/tmp/gc` rebuilt at 12:31). First post-restart slow-start observation captured:
 
 ```
-/tmp/gc stop /home/ds/gas-city
-/tmp/gc supervisor stop
-set -a; source ~/.config/gc-slack-adapter/env; set +a   # critical
-pkill -f 'gc-slack-adapter$'                            # if needed
-/tmp/gc supervisor start
-/tmp/gc start /home/ds/gas-city
-( cd /home/ds/gascity/examples/oversight-rig/adapter \
-  && nohup ./run.sh > /tmp/gc-slack-adapter/run.log 2>&1 & disown )
+session lifecycle: op=start wave=0 session=codescalebench-worker-gc-71304
+  ... duration=1m24.557s phases=[start_call=1m22.53s post_start_observe=2.044s commit_refresh=1ms]
 ```
 
-`gc stop` takes ~3min on a city with ~30 background sessions
-(stops in waves of 1–2 per second). Sessions reattach on `gc start`.
+Bottleneck is in `start_call` (provider Start + ErrStateSync recovery). Filed as **gc-9ha** for sub-phase split.
 
-For Phase A retries (after gc-cdf lands): same first 4 lines, then
-`gc reload` instead of restarting the manual adapter — the
-proxy_process service block in `examples/slack-pack/pack.toml`
-(currently commented out) handles the adapter lifecycle.
+### extmsg wire-tag audit (gc-w1h)
 
-## Findings from this session (rollback + slack-pack expansion)
+Closes the wire-types fix that started with PublishRequest's missing snake_case json tags (silent data loss of `reply_to_message_id`, `idempotency_key`, `metadata` on the gc → adapter HTTP wire — discovered during PL room-reply threading work). PublishRequest tags were hot-patched live earlier; this session lands the proper fix + sibling-type audit:
 
-1. **proxy_process URL contract is broken on the SDK side.**
-   `GC_SERVICE_URL_PREFIX` is injected as `/svc/<name>` but the
-   supervisor's API only mounts `/v0/city/<cityName>/svc/<name>/*` on
-   the public listener. Any service whose registered CallbackURL is
-   called inbound by gc (slack adapter today; any future provider
-   tomorrow) 404s on gc's own router. Filed as bd **gc-cdf** (P1)
-   with full root cause, three fix options, and acceptance criteria.
-   gc-cdf blocks gc-5rz cutover.
-2. **Two new pack commands shipped, no upstream-PR dependency.**
-   `gc slack status` (read-only diagnostics; replaces ~5 curl + jq
-   one-liners I kept running) and `gc slack publish` (explicit publish
-   to a session's saved binding, sibling to `reply-current`). Pack
-   went from 3 commands → 5; 39/39 unit tests pass; both verified
-   live against the running ds-research city.
-3. **`find_latest_inbound_for_session` works correctly.** Earlier
-   handoff suspicion that the events endpoint returned a bare array
-   (and that the helper's `.get("items", [])` was silently returning
-   `[]` in production) was wrong — the API consistently returns
-   `{items, total}`. Original observation was a jq expression
-   precedence error, not a server-side mismatch. Live test:
-   `find_latest_inbound_for_session('gc-83347')` returns the cos-DM
-   inbound at ts=2026-05-02T11:57:45 matching `gc slack status`.
-4. **systemd `gascity-supervisor.service` crash-loop is cosmetic
-   only.** When the supervisor is started manually (so SLACK_* env
-   is in its environment), the systemd unit can't bind `:8372` and
-   restarts every ~5s. Same shape as previous cutovers; harmless
-   beyond log noise. Will resolve itself once the manual supervisor
-   exits (the systemd one will then take over — but it lacks SLACK_*
-   in `Environment=`, so the proxy_process adapter would fail there
-   too; that's why we're running manually).
+- **`PublishReceipt`** (sibling, same hazard) — adapter `/publish` returns snake_case JSON (`{"message_id":"…","failure_kind":"…"}`); gc unmarshals into PublishReceipt. Without tags, Go's case-insensitive matcher does not bridge the underscore boundary, so `MessageID` and `FailureKind` silently arrived empty — breaking threading (no provider_message_id to thread on) and retry semantics. Now tagged snake_case in `internal/extmsg/types.go`.
+- **`AdapterCapabilities`** — kept as PascalCase (matches the existing OpenAPI contract and the explicit PascalCase tags on the adapter's mirror struct). Added a doc comment so future contributors don't change it without also regenerating openapi + updating every adapter.
+- **`ExternalInboundMessage`** — already had snake_case tags (verified).
+- **Regression tests** — new `internal/extmsg/wire_serialization_test.go` covers PublishRequest marshal (snake_case keys present, PascalCase keys absent), PublishRequest decode of snake_case wire bodies, PublishReceipt decode of snake_case wire bodies (success + failure_kind branches), and PublishReceipt marshal (typed-Huma-wire emission also snake_case).
+- **Side-effect of `make spec-ci` regen** — picked up two stale items unrelated to this fix but in the same generated artifacts: `FanoutPolicy` got snake_case json tags in the genclient (matching the actual struct tags in `extmsg/types.go`), and `ExtMsgGroupEnsureInputBody` gained its missing `FanoutPolicy` field. Both are pre-existing drift, now corrected. `make dashboard-check` and `go test -race ./internal/extmsg/...` are green; the two remaining `internal/api` race failures (`TestStreamSessionPeekAcceptsPeekCapability`, `TestHandleExtMsgOutboundNotifiesDeliveredConversationMembers`) reproduce on `main` and are baseline noise.
+- **gc-kvt unblock** — the `Metadata["source_session_id"]` workaround in `internal/extmsg/outbound.go` (declared as `MetadataKeySourceSessionID`) can now be retired by adding a native `SessionID` field to PublishRequest. Not done in this session (not load-bearing for any current consumer); follow-up bead is gc-kvt.
 
-## Findings from earlier sessions
+Files touched: `internal/extmsg/types.go`, `internal/extmsg/wire_serialization_test.go` (new), `internal/api/openapi.json`, `docs/schema/openapi.{json,txt}`, `internal/api/genclient/client_gen.go`, `cmd/gc/dashboard/web/src/generated/*` (regenerated by dashboard-check).
 
-1. **`orders.overrides` rig-scoping is silently no-op for per-rig
-   orders.** A `[[orders.overrides]]` block with no `rig` field
-   only matches city-level orders, never the per-rig fan-out
-   instances that orders like `patrol-project-leads` expand into.
-   `ApplyOverrides` returns "order not found" but
-   `cmd/gc/order_dispatch.go:97-99` only logs it as a warning, so
-   you get no startup failure when an override targets nothing.
-   See bd gc-a3s for the upstream-draft and recommended fixes.
-2. **`bin/claude-account` JSON writes were unserialized.** Three
-   blocks in the launcher (`hasCompletedOnboarding`,
-   `skipDangerousModePermissionPrompt`, `hasTrustDialogAccepted`)
-   did read-modify-write on shared JSON files with no flock and no
-   tmp+rename. Concurrent launches against the same account would
-   truncate the file mid-read on the loser side. Fixed in gc-arr;
-   stress test (20 concurrent / distinct GC_WORK_DIR per spawn)
-   confirms 20/20 writes preserved with the fix vs. 1/20 in the
-   naive control.
-3. **Cos rate limit cleared earlier than worst case.** The
-   "resets May 3, 3pm America/New_York" line was Anthropic's
-   conservative ceiling. cos resumed routing live during this
-   session and was restarted (`gc session reset gc-83347`) to pick
-   up the new prompt. No re-pin to a different `claude-N` provider
-   was needed.
+### proxy_process URL-prefix fix (gc-cdf)
 
-## Findings from the cutover canary
+`GC_SERVICE_URL_PREFIX` injected into proxy_process children was previously the bare mount path (`/svc/<name>`), which 404'd against the supervisor's public router (which only mounts at `/v0/city/<cityName>/svc/<name>`). Slack adapter Phase A cutover hit this on 2026-05-02; the fork has been on legacy nohup ever since.
 
-Three things tripped us up; capture them so the next agent doesn't
-hit the same wall:
+Fix: new helper `serviceURLPrefix(cityName, svc)` in `internal/workspacesvc/proxy_process.go` composes `/v0/city/<cityName>/svc/<name>` when cityName is non-empty. Empty cityName falls back to bare mount (legacy/test compat — useful so a service spawned from a half-initialized runtime gets a non-mangled prefix even though the URL still won't route).
 
-1. **The HANDOFF's prior bind-room example was wrong.** It used
-   `oversight-rig.mayor` as a participant, but the pack only defines
-   `chief-of-staff` (city scope) and `project-lead` (rig scope). There
-   is no `mayor` template anywhere in the oversight-rig pack — the
-   existing `gc-2568 mayor` session is unrelated, from a different
-   pack. Don't pair `oversight-rig.mayor` in any future bind-room.
-   For peer-fanout against cos, use the alias `oversight-rig.cos`.
+Tests:
+- `TestServiceURLPrefix` — 4 subtests: populated-city wraps correctly, different city different prefix, empty city falls back to bare mount, hyphen-rich names preserved.
+- `TestProxyProcessPublishesServiceEnv` — now also asserts the helper subprocess sees `GC_SERVICE_URL_PREFIX = /v0/city/test-city/svc/bridge` end-to-end through the actual env-injection path.
 
-2. **Participant `session_id` should be the alias, not the template.**
-   Using the template name (`oversight-rig.chief-of-staff`) caused
-   `extmsgNotifyMembers` to materialize a NEW session under that name
-   instead of routing to the existing cos at `gc-83347` (whose alias
-   is `oversight-rig.cos`). The alias resolves correctly. The
-   slack-pack `bind-room` README/docs should call this out, and the
-   handle-override convention should default to alias-based selectors.
-   (We had to close the orphan `gc-83796` session that got materialized
-   from the bad selector.)
+This unblocks **gc-5rz Phase A**, which was completed in this evening's session. See "gc-5rz Phase A cutover" below for details.
 
-3. **`bind-room` does NOT create a `SessionBindingRecord`.** It only
-   creates the group + participants. `gc /extmsg/outbound` requires a
-   binding to resolve the conversation to a publishing session — so
-   peer-fanout works (it reads from group membership) but outbound
-   publish does not, until you separately POST to `/extmsg/bind` for
-   one of the participants. We worked around this manually in the
-   canary; doing it 13 times for 13 rigs is fragile. See Open work
-   item 4b.
+### gc-5rz Phase A cutover (completed) — gotchas + fixes
 
-Local-only (not for commit): `city.toml` has
-`[[patches.agent]] name="chief-of-staff" provider="claude-2"` and
-`[imports.slack] source = .../examples/slack-pack`. Backups:
-`city.toml.bak-pre-cos-patch-*`, `city.toml.bak-pre-restore-*`.
+**Two regressions surfaced after the initial cutover; both fixed in the same session before any PL noticed.**
 
-## Open work, in priority order
+1. **Pack scripts hardcoded `127.0.0.1:8766`.** `slack_intake_common.py` had `DEFAULT_ADAPTER_PUBLISH = "http://127.0.0.1:8766/publish"` and seven manual urllib request sites. Post-cutover that port is dead — the adapter listens on the UDS via supervisor. Fix:
+   - `adapter_publish_url()` now derives the proxy URL from `${GC_API_BASE_URL}/v0/city/${city}/svc/slack/publish` by default; `SLACK_ADAPTER_PUBLISH_URL` remains an env override (legacy + tests).
+   - New `_adapter_csrf_headers()` helper returns headers including `X-GC-Request: 1`. Required because gc API enforces CSRF on `/svc/<name>/<path>` private mutation endpoints.
+   - The 7 manual urllib request sites now use `_adapter_csrf_headers()` instead of literal header dicts. Single sed-style replace covered 5 sites; two DELETE sites had a slightly different dict.
+   - Line 230 publish call: `csrf=False` → `csrf=True` (`_request` default).
 
-> **Session-end note (2026-05-02 rollback + slack-pack expansion):**
-> Phase A cutover attempted this session and **rolled back** after a
-> real SDK-side defect surfaced. Filed separately as bd **gc-cdf**
-> (P1, blocks gc-5rz). Pack `[[service]]` block commented out with a
-> pointer to gc-5rz; manual nohup adapter is the steady state. All 8
-> bindings (cos DM + 7 rig rooms) preserved across the round trip.
->
-> Two new pack commands shipped (zero upstream-PR dependency):
-> `gc slack status` and `gc slack publish`. Slack-pack now has 5
-> commands and 39/39 tests passing. See "What's on the branch" for
-> the 5-commit history of this session.
->
-> Items 1, 3, 4 (a/b/c), 6, 7, 8 + canary cleanup remain DONE from
-> prior sessions. Item 5 still subsumed by item 2. gc-a3s investigation
-> handoff intact (separate `gascity-gascity-pr/` worktree).
+2. **Stale adapter binary in slack-pack/adapter/.** Two binaries existed:
+   - `examples/slack-pack/adapter/gc-slack-adapter` (May 2 16:20) — what supervisor's proxy_process actually executes.
+   - `examples/oversight-rig/adapter/gc-slack-adapter` (May 3 09:30) — the canonical build with /publish-file, /identity, /handle-alias, the janitor.
+   The proxy_process service was running the stale binary, so /identity returned 404 even after CSRF was satisfied. Fix: `cp -f oversight-rig/adapter/gc-slack-adapter slack-pack/adapter/gc-slack-adapter`, then `kill` the running adapter so supervisor respawns it (1s backoff). New binary picks up; janitor logs `inbound file janitor started: …`. Filed bd **gc-28a** for the longer-term build fix.
 
-1. ~~**Switch `gc slack reply-current` to publish through gc
-   `/extmsg/outbound`**~~ — DONE this session. `reply-current` now
-   defaults to `--via gc` (POST `/v0/city/{city}/extmsg/outbound`),
-   which goes through `humaHandleExtMsgOutbound` → the registered
-   HTTP adapter's `/publish` and fires `extmsgNotifyMembers` for peer
-   sessions. `--via adapter` retains the old direct-to-adapter path
-   for diagnostics. Test coverage in
-   `examples/slack-pack/tests/test_slack_chat_reply_current.py`
-   (3 cases; 18/18 pack tests pass). The live supervisor (PID 2656160)
-   already serves `/extmsg/outbound`, so no supervisor restart is
-   needed for this change to take effect — pack scripts hit gc over
-   HTTP at runtime.
-2. **Absorb the Go adapter into the slack pack as a
-   `[[service]] proxy_process`** (Phase A) — IMPLEMENTED in commit
-   c1e1f6a1; **cutover ATTEMPTED 2026-05-02 and rolled back** because
-   of a real defect. The pack/adapter side of gc-5rz is correct; the
-   blocker is an SDK-level proxy_process URL contract bug, filed
-   separately as bd **gc-cdf** (P1, blocks gc-5rz). Root cause +
-   three fix options recorded there. Pack.toml `[[service]]` block
-   currently commented out with a pointer to gc-5rz; manual nohup
-   adapter restored to legacy TCP `:8766/publish`; all 8 bindings
-   preserved across the round-trip. Re-attempt after gc-cdf closes.
+**Cutover sequence (now correct after both fixes):**
 
-   **Shipped:**
-   - Adapter (`examples/oversight-rig/adapter/main.go`) reads
-     `GC_SERVICE_SOCKET`; when set, binds UDS for `/publish` +
-     `/healthz` instead of internal TCP `:8776`. Public TCP `:8775`
-     for `/slack/events` unchanged.
-   - Self-registration callback URL composed from
-     `$GC_API_BASE_URL + $GC_SERVICE_URL_PREFIX`. **Design doc
-     correction:** said "+ /publish" but gc's
-     `internal/extmsg/http_adapter.go:62` appends `/publish` itself,
-     so registered base must NOT include it. README spells this out.
-   - `examples/slack-pack/pack.toml` declares the `[[service]]` block
-     (kind=proxy_process, visibility=private,
-     command=`./adapter/gc-slack-adapter`, health_path=`/healthz`).
-     Validated against `config.ValidateServices` via
-     `internal/config/zz_slack_pack_validate_test.go`.
-   - Slack-pack README has full Phase A section: env-injection
-     contract, env-file secrets path, 7-step cutover, rollback,
-     three foot-guns.
-   - 4 new adapter tests for `loadConfigFromEnv` (legacy mode, UDS
-     callback URL derivation, slash normalization, missing-prefix
-     rejection); all green with `-race`. Existing config +
-     workspacesvc + cmd/gc tests stay green.
-   - Adapter binary builds; legacy nohup mode preserved as rollback
-     target (env var unset → today's TCP-only behavior).
+The `[[service]]` block in `examples/slack-pack/pack.toml` was re-enabled. Sequence:
 
-   **Deferred:** the live cutover step from the bead acceptance.
-   Running it would kill the running adapter (PID 2582270), force a
-   `gc reload`, and require re-verifying outbound + inbound across
-   the 7 bound rigs. Recipe is in slack-pack README "Cutover
-   sequence". Run at chosen time.
+1. Edited `examples/slack-pack/pack.toml`: replaced the commented-out `[[service]]` placeholder with the live block.
+2. Killed the legacy-nohup adapter (PID 1145516).
+3. Issued `gc supervisor reload` — supervisor's reconciler picked up the new service, but the first spawn died with `config: missing required env vars: SLACK_WORKSPACE_ID, SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET` because the supervisor's systemd unit didn't carry the secrets in its environ.
+4. Added systemd drop-in `/home/ds/.config/systemd/user/gascity-supervisor.service.d/slack-adapter-env.conf` with `EnvironmentFile=-/home/ds/.config/gc-slack-adapter/env`. This is the canonical place for "secrets the supervisor should pass to proxy_process children." The leading `-` makes the file optional so the unit doesn't refuse to start if it's absent.
+5. `systemctl --user daemon-reload && systemctl --user restart gascity-supervisor` — supervisor spawned the adapter cleanly. Service state went `degraded` → `starting` → `ready/ready`.
+6. Verification:
+   - `pgrep -af gc-slack-adapter` → `./adapter/gc-slack-adapter` (relative path, supervised — i.e., NOT the standalone nohup invocation)
+   - `ss -ltnp | grep 8775` → adapter has the public Slack-events port
+   - `ls /tmp/gcsvc-1000/ee31dfef/` → `slack-*.sock` UDS present
+   - `curl /v0/city/ds-research/svc/slack/healthz` → 200
+   - Service log line: `registered with gc as ... callback=http://127.0.0.1:8372/v0/city/ds-research/svc/slack/publish (via gc /svc proxy)` — the FIXED prefix.
+   - CSRF guard: private mutation endpoints (`/svc/slack/identity` etc.) return 403 unless `X-GC-Request` header is supplied. The CLI knows how to do this; raw curl needs to pass the header.
 
-   Phase B (secrets in pack.toml) and Phase C (gc-terminated TLS for
-   public webhook) remain deferred — out of scope for v1.
-3. ~~**Switch the chief-of-staff prompt to compose `slack-v0`**~~ —
-   DONE this session.
-   `examples/oversight-rig/agents/chief-of-staff/prompt.template.md`
-   now inlines `{{ template "slack-v0" . }}` after "Your Role" and
-   adds a step-5 ack rule: in DMs (`D`-prefix conversations), cos
-   sends a one-line `*oversight-rig.cos:* routed → ...` ack via
-   `gc slack reply-current` after mailing the project-lead and
-   closing the bead; in rooms (`C`/`G`-prefix), cos stays silent
-   because the project-lead's own reply is the visible signal.
-   Failure cases (no bead match, multi-bead ambiguity) still mail
-   the mayor; in DMs they also get a one-line "couldn't match"
-   ack. Template render verified offline (5891 bytes, no unrendered
-   directives); cos was restarted via `gc session reset gc-83347`
-   to load the new prompt; no prompt-template errors in the
-   supervisor log. Live verification of step 5 happens on the
-   next real Slack inbound — tracked in bd **gc-17z**.
-4. ~~**Per-rig Slack channels — 4a, 4b, 4c blockers**~~ — ALL THREE
-   DONE this session. 7 of 13 rigs now have dedicated channels with
-   live bindings (see "Per-rig room bindings" table above). Resolver,
-   peer-fanout, and inbound classification all verified end-to-end.
+Things to know going forward:
+- Adapter restarts are now `gc supervisor reload` (or natural recycle), not nohup commands. The supervisor's per-service state lives at `/home/ds/gas-city/.gc/services/slack/`.
+- The legacy `127.0.0.1:8766` internal listener is GONE. Anything that hardcoded that URL is broken; route through `http://127.0.0.1:8372/v0/city/ds-research/svc/slack/...` instead.
+- If you ever need to revert, set `[[service]]` to commented out in `pack.toml`, `gc supervisor reload` to drain it, then `cd examples/oversight-rig/adapter && nohup ./run.sh >> /tmp/gc-slack-adapter/run.log 2>&1 &`.
 
-   **4a. Verify inbound `kind=room`.** DONE.
-   First attempt with the canary channel returned no inbound — the
-   bot's Slack app event subscription only had `message.im` (DMs)
-   and not `message.channels` (public channel posts). User added
-   `message.channels` and reinstalled the app; next post in
-   `#all-agent-city` (= `C0B0TQMQF2B`) arrived at the adapter and
-   was routed to gc-77139 via the kind=room binding. Peer-fanout
-   to cos at gc-83347 fired ~700ms after the inbound. Note: the
-   `extmsg.inbound` event payload doesn't carry `.kind` directly
-   (its shape is `{provider, conversation_id, actor, target_session}`),
-   so the verification was via routing behavior — peer-fanout only
-   fires through room group memberships, so successful peer-fanout
-   proves the conversation was classified as room.
+## What's NOT done — open work for next agent
 
-   **Reminder for future channels:** if any new channel is private
-   (`G`-prefix id), also subscribe `message.groups` in api.slack.com
-   and reinstall.
+### A. ~~Wait for `files:write` scope~~ — DONE, but the early "verified" smokes were ghost uploads (gc-am2)
 
-   **4b. `gc slack bind-room --binding-owner SESSION`.** DONE.
-   `slack_chat_bind_room.py` now POSTs `/extmsg/bind` after creating
-   group + participants. Initial validation required binding-owner
-   to match a participant alias, but during rollout we discovered
-   that `resolve_rig_channel.py` looks up bindings by **gc-id**
-   (from the sessions list), so the binding must be created with
-   the gc-id, not the participant alias. Validation was relaxed:
-   `--binding-owner` now accepts any session id verbatim; the
-   docstring spells out when to pass alias vs gc-id. Test was
-   updated to assert the canonical "alias participants + gc-id
-   owner" shape instead of the participant-membership constraint.
-   20/20 pack tests pass. README updated.
+`files:write` was granted mid-day and smoked via direct `POST /publish-file`. The receipt looked clean — `delivered:true` with a Slack file_id — but **the files never actually appeared in their target channels** (F0B1G3CFHKN, F0B0X9SALSK, and the PL's first attempt F0B19BU203F were all invisible to humans in Slack). Root cause: the adapter's step-2 upload used `PUT Content-Type: application/octet-stream`. Slack accepts those bytes but treats the resulting file as malformed (empty mimetype, `shares:{}`), and `files.completeUploadExternal` cannot bind a malformed file to the supplied `channel_id` even though it returns `ok:true`. Filed and closed as **gc-am2** in the same session.
 
-   **4c. `escalate-rollups` order exit-1.** DONE + LIVE.
-   Root cause: the controller's `orderExecEnv` (in
-   `cmd/gc/order_store.go`) never injected `GC_API_BASE_URL` or
-   `GC_CITY_NAME` for exec orders. Supervisor log confirmed
-   `deliver-rollup.sh: line 54: GC_API_BASE_URL: GC_API_BASE_URL must be set`.
+Fix: `slackPutFileBytes` now POSTs multipart/form-data with a single `filename` field carrying the file bytes — the canonical shape the pre-signed URL expects. Tests updated. Adapter respawned 2026-05-03 15:08:20 EDT (PID 4028019). Verified end-to-end against `#zelda`: `F0B1CVBRK7U` has `mimetype=image/webp`, `shares=['public']`, `channels=['C0B13JE7M35']`, and appears in `conversations.history`. Real PL-driven smoke from gc-82782 (`gc slack upload --file ... --thread-current` style) is still outstanding — same path, just hasn't been re-driven from a session.
 
-   Fix:
-   - `orderExecEnv` now injects `GC_CITY_NAME` from
-     `loadedCityName(cfg, cityPath)` and `GC_API_BASE_URL` from a
-     hookable `orderExecAPIBaseURLHook` defaulting to
-     `supervisorAPIBaseURL()`. When no supervisor config is found
-     (one-off CLI runs without supervised city), the URL is left
-     unset rather than guessed at — pack scripts surface the
-     missing var via their own `${VAR:?}` checks.
-   - Both keys added to `mergeRuntimeEnv`'s strip list so inherited
-     stale values can't poison child orders.
-   - Two new tests in `cmd/gc/order_dispatch_test.go`:
-     `TestOrderExecEnvInjectsCityNameAndAPIBaseURL` and
-     `TestOrderExecEnvOmitsAPIBaseURLWhenHookEmpty`.
-   - Full `go test ./cmd/gc/` clean (87s).
+### B. Live-smoke the inbound file download path
 
-   Verified live after the cutover: `escalate-rollups:rig:enterprisebench`
-   now emits `order.completed` (was `order.failed exit 1`). The
-   retry loop went silent — no open undelivered escalates anywhere
-   right now (`EnterpriseBench-2wk` was already closed/resolved by
-   the time the order ran post-fix).
+`files:read` is granted; the adapter code is in place. Now needs a real Slack file upload to exercise the path. Trigger:
+1. Human posts an image into a bound `C`-prefix channel.
+2. Adapter log expects: `inbound: chan=... files=N text=...ch`.
+3. `ls /tmp/gc-slack-adapter/inbound/<channel-id>/` should show the file.
+4. The receiving PL's session log should show `attachments[0].url = "file:///..."` in the system reminder.
 
-   **Per-rig delivery is self-driving for the 7 bound rigs.** The 6
-   remaining rigs need channels — see "Remaining 6 rigs" above for
-   the recipe.
-5. **Adapter as systemd user service** — subsumed by item 2 / gc-5rz.
-   Until Phase A lands, `adapter/SETUP.md` § "Running the adapter as
-   a service" still applies as a workaround.
-6. ~~**`bin/claude-account` atomic-write race**~~ — DONE this session.
-   `/home/ds/gas-city/bin/claude-account` (deployment-local, not in
-   repo) now wraps the bootstrap section in `flock` against
-   `$ACCOUNT_HOME/.claude-account.lock` and writes all three JSON
-   files via `tempfile.mkstemp + os.replace`. Verified with a 20-way
-   concurrent stress test (distinct `GC_WORK_DIR` per spawn): fixed
-   script preserved 20/20 trust writes, JSON valid; control script
-   without flock + tmp-rename preserved only 1/20. No supervisor
-   restart required — `claude-account` is invoked fresh per agent
-   launch. Tracked in bd **gc-arr** (closed).
-9. **gc-a3s upstream investigation handoff.** Investigation pass
-   completed this session — all design notes attached to bd
-   **gc-a3s** via `--design`. Key findings: bug surface is wider
-   than the original report (3 silent-swallow sites, not 1 — added
-   `cmd/gc/api_state.go:699-700`); zero shipped configs in
-   `examples/` use `[[orders.overrides]]` so the fix breaks no
-   examples; recommended single PR (~15 LOC production +
-   ~80-160 LOC test); three open design questions (reload-path
-   semantics, API endpoint behavior, error message wording).
-   **PR work is happening in a separate worktree at
-   `gascity-gascity-pr/`** (the user spun a fresh Claude session
-   there). DO NOT touch the orders-override code path on this
-   branch — let the PR session land first.
+Doesn't need code changes — just a real Slack event. (Verified `files:read` grants via `files.info` on the `F0B1G3CFHKN` smoke artifact — `url_private` is reachable.)
 
-7. ~~**Re-enable `patrol-project-leads`**~~ — N/A this session.
-   Investigation revealed the `[[orders.overrides]]` block was a
-   no-op the whole time: all 13 rig patrols + 1 city-level
-   patrol-project-leads have been firing on schedule (every ~16min)
-   regardless of `enabled = false`. Root cause: `ApplyOverrides`
-   (internal/orders/override.go:36-40) only matches overrides with
-   empty `rig` against city-level orders, but `patrol-project-leads`
-   expands per-rig at scan time. The override silently no-op'd;
-   `cmd/gc/order_dispatch.go:97-99` logs but does not surface the
-   "order not found" error. Cleaned up the misleading override
-   block in `city.toml` with a comment about the gotcha. The
-   broader override-mechanism issue is filed as bd **gc-a3s**
-   (upstream-draft) with two recommendations: (a) make
-   `ApplyOverrides` errors fatal at startup so silent no-ops
-   surface; (b) add wildcard `rig = "*"` syntax for "all instances
-   of this name."
-8. ~~**Update older `examples/oversight/chief-of-staff` prompt**~~ —
-   DONE in a previous session. The "When the Human Replies" section
-   in `examples/oversight/agents/chief-of-staff/prompt.template.md`
-   no longer claims inbound replies arrive via `gc mail inbox`; it
-   documents the system-reminder injection model and tells cos to
-   ignore embedded "To reply in <provider>, run …" hints.
+### C. Wire up gc-side `HandleOutboundFile` (deferred, optional)
 
-## Gotcha for next session — nested PR worktree
+The pack currently goes adapter-direct for `gc slack upload` (same pattern as `publish-to-channel`). If/when we want files to flow through gc's outbound machinery for transcript recording + peer fanout, add an `OutboundFileRequest` + `HandleOutboundFile` in `internal/extmsg/outbound.go` plus a new `PublishFile` HTTP method on the adapter client. The adapter side already declares `SupportsAttachments: true`, so capability negotiation is in place. Adapter-direct is correct for v1 — keeps the rollout small. The handoff that originally wrote this Item said "the adapter-direct path is simpler and works today" and that still holds.
 
-The user created a worktree for the gc-a3s PR work at
-`/home/ds/gascity/gascity-gascity-pr/` (NESTED inside the main repo
-tree). This trips two tests in `make test`:
+### D. ~~Channel-name → ID resolution~~ — DONE via Path 1
 
-- `internal/testenv` lint check finds the worktree's
-  `lint_test.go` and `testenv_test.go` files and complains they
-  lack the canonical `testenv_import_test.go`.
-- `test/docsync.TestDocDirCoverage` sees markdown under
-  `gascity-gascity-pr/` and fails because the path isn't in
-  `docTreeDirs`/`docTreeIgnored`.
+`channels:read` and `groups:read` were granted mid-day. Smoked via `conversations.list`:
 
-Neither is a real regression — they're both side effects of the
-worktree placement. Fix options for the next agent:
-- Move the worktree to a sibling path (`/home/ds/gascity-gascity-pr`
-  instead of nested).
-- Or add `gascity-gascity-pr/` to `.gitignore` AND skip-list it in
-  the two failing tests.
+```
+public:  C0B0TQMQF2B #all-agent-city, C0B12SXQNF5 #social, C0B13JE7M35 #zelda, ...
+private: 0 (bot isn't yet in any private channels — scope works)
+```
 
-For now, smoke-test packages adjacent to changes directly
-(`go test ./internal/config/ ./internal/workspacesvc/ ./cmd/gc/...`)
-to bypass the noise.
+Any agent can now call `conversations.list` directly via the bot token to resolve `#name` → `C…`. Mayor's 7 AM blocker is fixed without needing the adapter-side cache (Path 2 is no longer warranted — YAGNI).
+
+Recurring channel IDs to remember:
+- `#all-agent-city` = `C0B0TQMQF2B`
+
+### E. Keep an eye on the bd issues
+
+- ~~gc-g52 (file retention)~~ — **closed**; janitor shipped + activated (live adapter restarted 12:30:33 EDT).
+- ~~gc-txv (slow cos restart)~~ — **closed**; investigated, split into gc-67o.
+- ~~gc-67o (phase-timing instrumentation)~~ — **closed + activated** (live supervisor restarted 12:32:33 EDT). First slow-start data point captured.
+- ~~gc-9ha (state_sync_recovery sub-phase split)~~ — **closed + activated** (live supervisor restarted 12:59:56 EDT). Awaiting next slow-start to localize provider.Start vs state_sync_recovery.
+- **gc-28a** (NEW) — slack-pack: dual adapter binary locations cause stale-deploy on cutover. P2, tech-debt. Worked around manually this session; needs build process fix.
+- ~~**gc-am2** (NEW, P1 bug, fixed same-session)~~ — slack adapter ghost-uploads: PUT octet-stream produces unshareable files; rewrote step 2 to POST multipart. Closed; adapter live with the fix.
+- ~~**gc-w1h** (P1 bug)~~ — extmsg PublishRequest/PublishReceipt missing snake_case json tags caused silent data loss on the adapter ↔ gc HTTP wire. **Closed this session**: PublishReceipt now has tags (sibling of the PublishRequest fix landed earlier); regression tests in `internal/extmsg/wire_serialization_test.go`; OpenAPI/genclient/dashboard regenerated. See "extmsg wire-tag audit (gc-w1h)" below.
+- **gc-kvt** is now **unblocked** (was blocked on gc-w1h). Optional follow-up to add a native SessionID field to PublishRequest and drop the `Metadata["source_session_id"]` workaround in `internal/extmsg/outbound.go`.
+
+### F. ~~Restart the adapter to activate the janitor~~ — DONE 2026-05-03 12:30:33 EDT
+
+Adapter (PID 1145516) restarted via `cd examples/oversight-rig/adapter && nohup ./run.sh >> /tmp/gc-slack-adapter/run.log 2>&1 &`. Startup log confirmed `inbound file janitor started: store=/tmp/gc-slack-adapter/inbound ttl=168h0m0s interval=1h0m0s`. Healthz, DELETE round-trip, and identity registry all green. Smoke seed cleaned up.
+
+For future restarts, the recipe is unchanged. To confirm the janitor sweeps real files, set `INBOUND_FILE_SWEEP_INTERVAL=10s INBOUND_FILE_TTL=1m` in `~/.config/gc-slack-adapter/env` for a quick smoke before reverting to defaults.
+
+## Decisions still locked (do NOT re-ask the user)
+
+| Decision | Choice | Reaffirmed |
+|----------|--------|------------|
+| Image inbound: bytes-down vs URL-only | **bytes-down** | shipped this session |
+| Image outbound: separate endpoint | **/publish-file** | shipped |
+| files.upload legacy vs v2 | **getUploadURLExternal + completeUploadExternal** | shipped |
+| Image storage retention | **none for v1; bd follow-up filed** | gc-g52 |
+| Where to put `PublishFileRequest` | **adapter-only struct; no gc-side yet** | shipped (deferred gc-side per C above) |
+| Pack command name | **`gc slack upload`** | shipped |
+| HANDLE_PREFIX | **`@`** | unchanged |
+| Colon after handle | **optional** | unchanged |
+
+## Smoke tests for next agent
+
+```bash
+# === Outbound file (gc-5rz Phase A; verified post-cutover) ===
+# Use the proxy URL via the python helper (sets X-GC-Request CSRF for you):
+echo "test" > /tmp/smoke-up.txt
+GC_API_BASE_URL=http://127.0.0.1:8372 GC_CITY_NAME=ds-research SLACK_WORKSPACE_ID=T0B17700WUW python3 -c "
+import sys; sys.path.insert(0, '/home/ds/gascity/examples/slack-pack/scripts')
+import slack_intake_common as common
+print(common.upload_via_adapter(
+  session_id='smoke', file_path='/tmp/smoke-up.txt',
+  conversation_id='C0B0TQMQF2B', kind='room',
+  initial_comment='smoke', filename='smoke-up.txt', title='smoke-up.txt'))
+"
+# expect: {'delivered': True, 'file_id': 'F...', 'conversation': {...}}
+# Verified 2026-05-03 13:30:33 EDT — F0B0X9SALSK landed in #all-agent-city.
+
+# Or via raw curl through the proxy with explicit CSRF header:
+curl -s -X POST -H "Content-Type: application/json" -H "X-GC-Request: 1" \
+  -d '{
+    "session_id":"smoke",
+    "conversation":{"scope_id":"ds-research","provider":"slack","account_id":"T0B17700WUW","conversation_id":"C0B0TQMQF2B","kind":"room"},
+    "file_path":"/tmp/smoke-up.txt",
+    "initial_comment":"smoke"
+  }' \
+  http://127.0.0.1:8372/v0/city/ds-research/svc/slack/publish-file | jq
+# expect: {... "delivered": true, "file_id": "F..." ...}
+
+# Or via the pack from a PL session that has a bound channel:
+gc slack upload --file /tmp/smoke-up.txt
+# expect same shape via stdout
+
+# === Inbound file (real Slack event needed) ===
+# Human uploads image in a bound channel.
+ls /tmp/gc-slack-adapter/inbound/<channel-id>/
+# Adapter log lives at the supervisor's per-service log post-cutover:
+tail -20 /home/ds/gas-city/.gc/services/slack/logs/service.log
+# (Pre-cutover, the legacy nohup adapter logged to /tmp/gc-slack-adapter/run.log.
+#  After gc-5rz Phase A that file stops at 12:51:24 EDT 2026-05-03.)
+# expect log line: inbound: ... files=N text=...ch
+
+# === Channel name → ID resolution ===
+SLACK_BOT_TOKEN=$(cat /proc/$(pgrep -f 'gc-slack-adapter$')/environ | tr '\0' '\n' | grep "^SLACK_BOT_TOKEN=" | cut -d= -f2)
+curl -s -X POST -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+  -d "exclude_archived=true&types=public_channel,private_channel" \
+  https://slack.com/api/conversations.list | jq '.channels[] | {id, name}'
+
+# === DELETE smoke (works now via proxy + CSRF) ===
+curl -s -X POST -H "Content-Type: application/json" -H "X-GC-Request: 1" \
+  -d '{"session_id":"smoke-dele","username":"X"}' \
+  http://127.0.0.1:8372/v0/city/ds-research/svc/slack/identity
+curl -s -X DELETE -H "X-GC-Request: 1" \
+  "http://127.0.0.1:8372/v0/city/ds-research/svc/slack/identity?session_id=smoke-dele"
+# expect: {"stored":true,"session_id":"smoke-dele"}
+#         {"removed":true,"existed":true,"session_id":"smoke-dele"}
+
+# === Phase-timing post-restart (after supervisor restart picks up gc-67o) ===
+# Trigger a session reset and watch for phases= segment in the lifecycle log:
+grep "session lifecycle: op=start" /home/ds/.gc/supervisor.log | tail -5
+# look for: ... phases=[start_call=Xs post_start_observe=Yms commit_refresh=Zms]
+```
 
 ## How to verify if returning fresh
 
 ```bash
-# Supervisor + adapter on rebuilt binaries
-/tmp/gc supervisor status   # expect PID 4187273 (or current)
-pgrep -af gc-slack-adapter  # expect PID 199927 (or current), single instance
+# Supervisor + adapter health
+systemctl --user status gascity-supervisor 2>&1 | head -5
+pgrep -af "gc-slack-adapter$"
+curl -s -o /dev/null -w "gc API health: %{http_code}\n" http://127.0.0.1:8372/v0/cities
 
-# Pack is loaded
-/tmp/gc slack --help        # bind-dm, bind-room, reply-current
+# New endpoints alive
+curl -s -X POST -H "Content-Type: application/json" -H "X-GC-Request: 1" \
+  -d '{"session_id":"probe","username":"x"}' \
+  http://127.0.0.1:8372/v0/city/ds-research/svc/slack/identity | jq
+curl -s -X DELETE -H "X-GC-Request: 1" \
+  "http://127.0.0.1:8372/v0/city/ds-research/svc/slack/identity?session_id=probe" | jq
 
-# Loop is live
-/tmp/gc events --city /home/ds/gas-city --type extmsg.inbound --since 5m
-/tmp/gc session list --city /home/ds/gas-city | grep -E "chief-of-staff|project-lead"
+# Mayor 7 AM debrief still scheduled
+systemctl --user list-timers --all | grep mayor-7am
 
-# Bindings for the 7 bound rigs
-for sid in gc-82316 gc-82318 gc-82313 gc-82783 gc-77139 gc-82781 gc-82782; do
-  curl -s "http://127.0.0.1:8372/v0/city/ds-research/extmsg/bindings?session_id=$sid" \
-    | jq -r --arg sid "$sid" '.items[0] | "\($sid) -> conv=\(.Conversation.conversation_id) kind=\(.Conversation.kind) status=\(.Status)"'
-done
+# Recent activity
+tail -30 /tmp/gc-slack-adapter/run.log
 
-# DM path (oversight-rig.cos): send a Slack DM to gc-oversight, then:
-/tmp/gc session peek gc-83347
-# Expect: clean system-reminder, cos routes the reply.
-
-# Direct DM reply via pack:
-/tmp/gc slack reply-current --session gc-83347 \
-  --conversation-id D0B0TTS550F \
-  --body "*test:* hello from the slack pack"
-# Expect: delivered: true, message in Slack DM.
-
-# Room publish via gc /extmsg/outbound (gascity binding):
-curl -s -X POST -H "Content-Type: application/json" -H "X-GC-Request: smoke" \
-  -d '{"session_id":"gc-82783","conversation":{"scope_id":"ds-research","provider":"slack","account_id":"T0B17700WUW","conversation_id":"C0B1NSK4N3T","kind":"room"},"text":"*smoke:* hello gascity"}' \
-  http://127.0.0.1:8372/v0/city/ds-research/extmsg/outbound \
-  | python3 -c 'import json,sys; print("Delivered:", json.load(sys.stdin)["Receipt"]["Delivered"])'
-# Expect: Delivered: True
-
-# Rig-channel resolver — should return a dedicated room for each
-# of the 7 bound rigs:
-for rig in codeprobe codescalebench enterprisebench gascity geo scix-experiments zeldascension; do
-  printf "%-22s " "$rig"
-  GC_API_BASE_URL=http://127.0.0.1:8372 GC_CITY_NAME=ds-research \
-    python3 /home/ds/gascity/examples/oversight-rig/assets/scripts/resolve_rig_channel.py "$rig" \
-    | jq -r '"sid=\(.session_id) conv=\(.conversation.conversation_id) kind=\(.conversation.kind)"'
-done
+# PL sweep log
+tail -40 /tmp/pl-restart-sweep.log
 ```
 
-## Key files
+## Files modified across this branch (uncommitted, multi-session)
 
-- `examples/slack-pack/` — pack scaffold (`bind-dm`, `bind-room`,
-  `reply-current`)
-- `examples/slack-pack/README.md` — port checklist & architecture
-- `examples/slack-pack/template-fragments/slack-v0.template.md` —
-  composable prompt fragment now inlined by cos
-- `examples/slack-pack/scripts/slack_chat_bind_room.py` — supports
-  `--binding-owner` (item 4b done; validation relaxed to accept
-  gc-id when participants are aliases)
-- `examples/slack-pack/scripts/slack_chat_reply_current.py` — defaults
-  to `--via gc` so peer fanout fires
-- `examples/oversight-rig/agents/chief-of-staff/prompt.template.md`
-  — slack-v0 composed; step-5 DM-ack rule
-- `examples/oversight-rig/assets/scripts/deliver-rollup.sh` —
-  per-rig delivery via resolver + legacy env-var fallback
-- `examples/oversight-rig/assets/scripts/resolve_rig_channel.py` —
-  rig → publishing target resolver (12 unit tests)
-- `examples/oversight-rig/orders/escalate-rollups.toml` — the order
-  whose exit-1 was fixed in 4c (controller now injects
-  `GC_API_BASE_URL` + `GC_CITY_NAME`)
-- `examples/oversight-rig/orders/patrol-project-leads.toml` — fires
-  every 15min for all 13 rigs (no override; see gc-a3s)
-- `cmd/gc/order_store.go` — `orderExecEnv` injects city name +
-  api base url; `orderExecAPIBaseURLHook` is the testing seam
-- `internal/api/handler_extmsg.go` + `_test.go` — provider-neutral
-  nudge; peer-fanout via `extmsgNotifyMembers`
-- `internal/extmsg/binding_service.go` — note: only one active
-  binding per conversation; `Bind` returns `ErrBindingConflict`
-  if you try to rebind to a different session
-- `internal/orders/override.go` — see gc-a3s; rig-scoping rule
-- `internal/workspacesvc/proxy_process.go` — referenced by the
-  Phase A design (gc-5rz)
-- `docs/investigations/DESIGN-slack-adapter-as-proxy-process.md` —
-  Phase A/B/C design for absorbing the Go adapter
-- `examples/oversight-rig/adapter/SETUP.md` — port-collision note
-  for this host (`:8775`/`:8776`)
-- `/home/ds/gas-city/bin/claude-account` (deployment-local, not in
-  repo) — flock + atomic JSON writes; gc-arr
+Branch: `feat/oversight-rig-pack`. As of EOD 2026-05-03, `git diff --stat` shows 12 modified files / 1 new tracked file / multiple new pack commands. The `gascity-gascity-pr/` and `gascity-gascity-pr-1/` directories at the repo root are nested PR-staging worktrees — leave them alone (see "Gotcha — nested PR worktrees" below).
+
+```
+examples/oversight-rig/adapter/main.go                            -- /publish-file, DELETE handlers, inbound file download, externalAttachment, slackFile, inbound file retention janitor (gc-g52). gc-am2: slackPutFileBytes rewritten to multipart POST (was PUT octet-stream); mime/multipart import added; caller passes filename through.
+examples/oversight-rig/adapter/main_test.go                       -- TestHandlePublishFile, TestHandleIdentityDelete, TestHandleHandleAliasDelete, TestSafeFilename, TestDownloadSlackFiles, TestIdentityRegistryDelete, TestHandleAliasRegistryDelete, TestSweepInboundStore (9 subtests), TestLoadConfigInboundFileRetention{Defaults,Overrides,Disabled,Invalid}. gc-am2: fakeSlackFiles.uploadServer parses multipart; uploadedFilename field; subtest renamed PUT 5xx → POST 5xx.
+internal/workspacesvc/proxy_process.go                            -- gc-cdf: serviceURLPrefix helper, GC_SERVICE_URL_PREFIX now includes /v0/city/<cityName> segment
+internal/workspacesvc/proxy_process_test.go                       -- TestServiceURLPrefix (4 subtests), TestProxyProcessPublishesServiceEnv asserts URL prefix; TestProxyProcessHelper exposes GC_SERVICE_URL_PREFIX
+cmd/gc/session_lifecycle_parallel.go                              -- gc-67o: startPhaseTimings struct, phases captured in runPreparedStartCandidate + commitAsyncStartResultWithContext, logLifecycleOutcome variadic phases tail. gc-9ha: StateSyncRecovery sub-phase + format-log emission (state_sync_recovery=Xms when nonzero).
+cmd/gc/session_lifecycle_phases_test.go                           -- NEW: TestStartPhaseTimingsFormatLog (8 subtests, +2 for state_sync_recovery), TestLogLifecycleOutcomeWithPhases (4 subtests)
+examples/slack-pack/pack.toml                                     -- gc-5rz: [[service]] block re-enabled; comment refreshed.
+examples/slack-pack/scripts/slack_intake_common.py                -- gc-5rz fixup: adapter_publish_url() derives proxy URL by default; new _adapter_csrf_headers() helper (X-GC-Request); 7 manual urllib sites now CSRF-aware; line 230 publish call drops csrf=False.
+examples/slack-pack/adapter/gc-slack-adapter                      -- promoted from oversight-rig/adapter/ build (gitignored binary, May 3 13:29).
+examples/oversight-rig/adapter/gc-slack-adapter                   -- rebuilt binary (gitignored)
+examples/oversight-rig/agents/project-lead/prompt.template.md     -- added Files subsection (outbound + inbound)
+examples/oversight-rig/HANDOFF.md                                 -- this file
+examples/slack-pack/scripts/slack_chat_identity.py                -- --remove flag
+examples/slack-pack/scripts/slack_chat_handle_alias.py            -- --remove flag
+examples/slack-pack/scripts/slack_chat_upload.py                  -- new
+examples/slack-pack/scripts/slack_intake_common.py                -- remove_identity_via_adapter, remove_handle_alias_via_adapter, upload_via_adapter, urllib.parse import
+examples/slack-pack/commands/upload.sh                            -- new
+examples/slack-pack/commands/upload/{command.toml,help.md}        -- new
+examples/slack-pack/commands/{identity,handle-alias,react,publish-to-channel}.sh + dirs -- new (untracked)
+examples/slack-pack/scripts/slack_chat_{identity,handle_alias,react,publish_to_channel,upload}.py -- new (untracked)
+internal/extmsg/outbound.go, internal/extmsg/types.go             -- modified by earlier session; gc-w1h owns types.go (don't re-touch)
+```
+
+Plus deployment-local (NOT in repo):
+- `/tmp/gc-slack-adapter/identities.json` — stale `smoke-test` entry cleaned up; 9 personas
+- `/tmp/mayor-7am-debrief.sh` — one-shot script invoked by systemd-user timer at 7 AM
+- `/tmp/pl-restart-sweep-v2.sh`, `/tmp/pl-restart-sweep.log` — fixed-delay sweep artifacts
+- `/home/ds/.config/systemd/user/gascity-supervisor.service.d/slack-adapter-env.conf` — adds `EnvironmentFile=-/home/ds/.config/gc-slack-adapter/env` to the supervisor unit so secrets propagate to proxy_process children. Required for gc-5rz Phase A; without it the slack adapter dies on missing env at startup.
+
+Test summary (re-run after gc-9ha):
+- `go test -count=1 -race ./...` in `examples/oversight-rig/adapter` — **green** (136 RUN entries including all sweep + retention tests).
+- `go test -count=1 -race ./internal/workspacesvc/...` — **green** (gc-cdf serviceURLPrefix + proxy_process env injection tests).
+- `go test -count=1 ./cmd/gc/ -run "TestStart|TestLogLifecycle|TestPhase|TestServiceURL|TestProxyProcess"` — **green** (gc-67o + gc-9ha phase formatLog + state_sync_recovery cases all pass; 14.7s).
+- `go vet ./...` — **clean**.
+- One pre-existing baseline race in `internal/api/TestStreamSessionPeekAcceptsPeekCapability` reproduces on `git stash` and is unrelated to this branch.
+
+## Items NOT to do
+
+- **DO NOT touch `internal/extmsg/types.go`** — gc-w1h PR worktree owns it.
+- **DO NOT touch `internal/orders/override.go`** — gc-a3s PR worktree owns it.
+- **DO NOT push the local branch to origin** — keep local-only.
+- **ASK BEFORE restarting the supervisor or live adapter.** Both have on-disk code ahead of the running binary; restarts are the activation step for gc-cdf, gc-67o, and gc-g52, but they disturb live Slack flow / running sessions. The "Up next" block calls these out explicitly.
+
+## Findings from earlier sessions (carried forward)
+
+1. **`orders.overrides` rig-scoping is silently no-op for per-rig orders** — bd gc-a3s, separate worktree.
+2. ~~**proxy_process URL contract is broken on the SDK side**~~ — **fixed this morning** (gc-cdf closed; see "proxy_process URL-prefix fix" above). Adapter is still in legacy nohup mode pending the gc-5rz cutover step.
+3. **`bin/claude-account` JSON writes were unserialized** — gc-arr, closed.
+
+## Gotcha — nested PR worktrees
+
+`/home/ds/gascity/gascity-gascity-pr/` and `/home/ds/gascity/gascity-gascity-pr-1/` trip `internal/testenv` and `test/docsync.TestDocDirCoverage` on broad sweeps. Smoke-test adapter changes directly with `go test ./...` from `examples/oversight-rig/adapter` rather than running from the repo root.
