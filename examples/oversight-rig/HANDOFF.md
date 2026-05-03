@@ -1,16 +1,19 @@
-# Oversight-rig handoff — 2026-05-03 (gc-j8h: gc-routed file uploads)
+# Oversight-rig handoff — 2026-05-03 (gc-j8h live smoke + 2 follow-up fixes)
 
-> **To the next agent:** this session closed **gc-j8h** — `gc slack upload` now routes through gc's new `/v0/city/{name}/extmsg/outbound-file` endpoint by default, picking up transcript records + peer fanout for file posts. Adapter-direct path preserved as `--via adapter` for diagnostics. Backend types + handler + Huma route, regenerated openapi.json + Go genclient + dashboard typescript bindings, pack-side switch, and tests all shipped in a single atomic commit at SHA `aca8a70f`. `core.hooksPath` is `.githooks`; `make dashboard-check` is green; full `go test -short ./...` is green.
+> **To the next agent:** the live smoke for **gc-j8h** drove `gc slack upload --thread-current` end-to-end against the running supervisor + adapter and surfaced two real bugs that landed in two atomic commits this session:
 >
-> **Live smokes still pending** — gc-j8h is code-complete and unit-tested but has not been exercised against a real running supervisor + adapter binary in the live city yet. Items 1 + 2 in "Up next" cover the smokes; item 1 also subsumes the long-standing 'PL-driven outbound file smoke' gap that survived from the prior handoff.
+> - **`43f778e4` — `fix(extmsg): set X-GC-Request on HTTPAdapter callbacks (gc-5sd)`** — `HTTPAdapter.Publish/PublishFile/EnsureChildConversation` posted to the registered callback URL without the X-GC-Request CSRF header. When the adapter is supervised as proxy_process the callback URL routes through gc's own /svc proxy whose CSRF middleware rejected every gc-routed mutation with 403 → `delivered:false, failure_kind:auth`. **All gc-routed text /publish was silently broken too**, not just the new file path. Pre-existing latent bug; gc-j8h was the first end-to-end exerciser to surface it.
+> - **`5c936ac4` — `fix(slack-pack): unwrap thread_ts tuple in upload --thread-current (gc-qp8)`** — `slack_chat_upload.py:125` assigned the whole `(msg_id, conversation)` tuple to `thread_ts` instead of `match[0]`. Sibling `reply_current` and `react` already unpack correctly; only upload missed. Pure pack-side, one-line fix + regression test.
+>
+> Live smoke is now **PASS** for the gc-j8h acceptance criteria — see "gc-j8h smoke results" below for the receipts. `core.hooksPath` is `.githooks`; `make dashboard-check` is green; `go test -short` on touched packages green; 43 slack-pack pytests green.
 
 ## Up next (recommended dispatch)
 
-With **gc-ywe** (slack-pack upstream-prep) at 6/6 and **gc-j8h** (gc-routed file uploads) closed, the slack-pack file-coordination story is structurally complete. Remaining work is dominated by operational smokes and the one P3 hardening bead. Surface area, ranked by user impact:
+The slack-pack file-coordination story is structurally complete (gc-ywe 6/6 + gc-j8h closed + live-smoked + CSRF blocker removed). Remaining work is dominated by the inbound-file smoke and the one P3 hardening bead. Surface area, ranked by user impact:
 
 ### Day-to-day coordination smokes (priority work — no code)
 
-1. **Live-smoke the gc-routed outbound file path** (operational). Drive `gc slack upload --file <path> --thread-current` from a PL session; confirm: (a) `gc events --type extmsg.outbound` shows the upload with the FileID as MessageID; (b) `gc extmsg transcript ...` lists the outbound entry with `attachments[0].provider_id == file_id`; (c) any peer member of the room receives a session-log nudge containing the initial-comment text. Failure modes to watch: 422 from `/extmsg/outbound-file` (binding mismatch / unsupported adapter), 404 (no binding), or a delivered=true response with no transcript entry (Transcript.Append non-fatal swallow — would be visible in supervisor logs).
+1. ~~**Live-smoke the gc-routed outbound file path** (operational)~~ — **DONE this session.** See "gc-j8h smoke results" below. Acceptance points (a) and (b) confirmed; (c) is structurally inert because every active binding in this deployment is 1:1 (no multi-session rooms) — peer-fanout subscriber path is code-reviewed but not exercised live. Open a multi-session room (e.g. `gc slack bind-room <C…> mayor zeldascension/oversight-rig.project-lead`) to drive (c) end-to-end if needed.
 
 2. **Live-smoke the inbound file download path** (operational, surviving from prior handoff). `files:read` is granted; the adapter code is in place; the retention janitor is active. Confirm `inbound: chan=... files=N text=...ch` log line + `/tmp/gc-slack-adapter/inbound/<channel-id>/` artifact + the receiving PL's session log shows `attachments[0].url=file:///...`. Not a bead — drive once when next convenient.
 
@@ -33,7 +36,48 @@ With **gc-ywe** (slack-pack upstream-prep) at 6/6 and **gc-j8h** (gc-routed file
 - **Slow-start log line** — with gc-9ha live, the next `phases=[start_call=2m… …]` log line will either include `state_sync_recovery=Xs` (recovery branch is the cost) or won't (provider.Start is the cost). That answers gc-9ha acceptance #3 about whether the 60s `session.startup_timeout` should bound start_call.
 - **Slack identity caveat on file uploads** — `files.completeUploadExternal` ignores `chat:write.customize`, so file posts appear under the default bot identity even when an agent has a registered persona. Slack API limit; documented in adapter handler comment + PL prompt. With gc-j8h shipped, the gc-side `HandleOutboundFile` is the natural place to compose a file-then-`chat.postMessage`-with-persona-identity pattern centrally if/when persona attribution on file uploads becomes important. Not currently filed as a bead — defer until a real user surface forces the question.
 
-## Commits landed this session (gc-j8h)
+## gc-j8h smoke results (this session)
+
+**Procedure.** Rebuilt `/tmp/gc` from current source (commit `5c936ac4`), restarted the supervisor (PID 3448768 was the slack adapter PID after respawn), confirmed the new `POST /v0/city/{name}/extmsg/outbound-file` endpoint went from 404 → 422 (route alive, validation requires fields). Drove `gc slack upload --session gc-82782 --file /tmp/smoke-j8h.txt --initial-comment "…" --thread-current` from a shell.
+
+**First attempt failed twice and surfaced two bugs.** The pack-side request blew up with a 422 because `slack_chat_upload.py` was sending `reply_to_message_id` as a 2-element list (gc-qp8). After fixing the unpack, the second attempt succeeded at the wire level but came back `delivered:false, failure_kind:auth` — adapter never logged the request. Traced to HTTPAdapter callbacks missing the X-GC-Request CSRF header (gc-5sd). Verified via direct curl against `/svc/slack/publish*` that text /publish has the same problem. Patched both, rebuilt, restarted supervisor.
+
+**Third attempt — full PASS:**
+
+```
+gc slack upload --session gc-82782 --file /tmp/smoke-j8h.txt \
+  --initial-comment "gc-j8h live-smoke: gc-routed file upload (post-CSRF-fix)" \
+  --thread-current
+→ Receipt: delivered=true, file_id=F0B0Y0R4UKZ
+  DeliveryContext.LastMessageID = F0B0Y0R4UKZ
+  TranscriptEntry.ProviderMessageID = F0B0Y0R4UKZ
+                  .Attachments[0].provider_id = F0B0Y0R4UKZ
+                  .Text = "gc-j8h live-smoke: gc-routed file upload (post-CSRF-fix)"
+                  .Kind = outbound, .Provenance = live
+```
+
+**Acceptance:**
+- (a) ✅ `gc events --type extmsg.outbound` shows `{message_id: "F0B0Y0R4UKZ", session: "gc-82782"}` at seq 625850.
+- (b) ✅ Transcript GET for the conversation lists the entry above; `attachments[0].provider_id == file_id`.
+- (c) N/A in current deployment — every active binding is 1:1 (8 bindings: 7 per-rig rooms + 1 cos DM). Subscriber path is reviewed but not live-exercised. To drive: bind a second session into one of the per-rig rooms.
+
+**Slack-side verification:** `files.info F0B0Y0R4UKZ` reports `mimetype=text/plain, size=42, channels=[C0B13JE7M35], shares.public present` — file is real, not a ghost upload (gc-am2 regression class). `conversations.replies` for the root parent thread `1777773137.595289` shows the smoke file as the last reply at ts `1777849856.016399` with `text="gc-j8h live-smoke: gc-routed file upload (post-CSRF-fix)"` and `has_files=true`. Slack's `files.info` legacy `initial_comment` field is null for v2 uploads — that's a Slack quirk, not a regression; the comment lives on the `conversations.history` message body.
+
+**Side-effect smoke:** post-CSRF-fix text outbound also smoked clean — `POST /extmsg/outbound` for gc-82782 returned `delivered:true, message_id=1777850087.196779`, message visible in #zelda. Pre-fix this would have silently 403'd into a synthesized auth-failure receipt, which yesterday's 5 most recent `extmsg.outbound` events show (all with empty `message_id`).
+
+**Live-runtime deltas this session:**
+- `/home/ds/.config/gc-slack-adapter/env` gained `GC_CITY_NAME=ds-research`. The gc-ywe.2 hardening removed the adapter's default; the operator-supplied env file didn't carry the var, so the first post-rebuild adapter respawn died with `config: missing required env vars: GC_CITY_NAME`. Adding the env line and restarting the supervisor unblocked. This is the canonical place for the var per the upstream-prep contract — the controller does NOT inject it.
+- Supervisor restarted at 18:53:57 EDT (first try, hit GC_CITY_NAME), then again at 18:56:18 (post env-fix), then 19:08:38 (post HTTPAdapter CSRF fix rebuild). Adapter respawned cleanly each time via proxy_process. Last known good adapter PID: 3448768. Service state ready/ready, callback `http://127.0.0.1:8372/v0/city/ds-research/svc/slack/publish (via gc /svc proxy)`.
+- All 8 active bindings unchanged. PLs that were waking up post-restart (zeldascension pool spawning workers gc-97576..gc-97589) progressed normally — none disturbed by the smoke.
+
+## Commits landed this session
+
+```
+5c936ac4 fix(slack-pack): unwrap thread_ts tuple in upload --thread-current (gc-qp8)
+43f778e4 fix(extmsg): set X-GC-Request on HTTPAdapter callbacks (gc-5sd)
+```
+
+## Commits landed prior session (gc-j8h)
 
 This session's work: a single atomic commit `aca8a70f` implementing gc-routed file uploads end-to-end. New extmsg wire types (`PublishFileRequest` / `PublishFileReceipt`) and an optional `FileTransportAdapter` capability interface that `HTTPAdapter` implements by POSTing to the existing adapter `/publish-file` endpoint. New `extmsg.HandleOutboundFile` mirrors `HandleOutbound`: resolve binding → verify session → dispatch via `FileTransportAdapter` → record delivery context → append outbound transcript entry tagged with the FileID → emit `extmsg.outbound`. New Huma route `POST /v0/city/{name}/extmsg/outbound-file` registered alongside the existing outbound route; OpenAPI spec, Go genclient, and dashboard typescript bindings all regenerated. Pack-side: `gc slack upload` now defaults to gc-routed; `--via adapter` preserves the legacy direct path. Three new Go integration tests (happy path with transcript + peer fanout, file_path-required validation, ErrAdapterUnsupported when adapter lacks file capability) plus three new Python tests covering both routing paths. Pre-existing `csrf is False` assertions in `test_slack_chat_publish` / `test_slack_chat_reply_current` corrected to match the gc-5rz Phase A reality (proxied adapter calls carry `X-GC-Request`). gc-j8h closes.
 
