@@ -844,10 +844,10 @@ func TestProxyProcessSwapAndCloseCleanUpSocketFiles(t *testing.T) {
 
 func TestServiceURLPrefix(t *testing.T) {
 	cases := []struct {
-		name      string
-		cityName  string
-		svcName   string
-		want      string
+		name     string
+		cityName string
+		svcName  string
+		want     string
 	}{
 		{"populated city wraps with v0 prefix", "ds-research", "slack", "/v0/city/ds-research/svc/slack"},
 		{"different city different prefix", "test-city", "bridge", "/v0/city/test-city/svc/bridge"},

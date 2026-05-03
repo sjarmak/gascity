@@ -117,14 +117,14 @@ func TestLoadConfigMissingSlackSecretsReportsAll(t *testing.T) {
 
 func TestHandleReact(t *testing.T) {
 	cases := []struct {
-		name           string
-		body           string
-		method         string
-		slackResponse  string
-		wantStatus     int
-		wantDelivered  bool
-		wantFailKind   string
-		wantSlackPath  string
+		name          string
+		body          string
+		method        string
+		slackResponse string
+		wantStatus    int
+		wantDelivered bool
+		wantFailKind  string
+		wantSlackPath string
 	}{
 		{
 			name:          "happy path",
@@ -387,13 +387,13 @@ func TestHandleIdentity(t *testing.T) {
 
 func TestHandlePublishInjectsIdentity(t *testing.T) {
 	cases := []struct {
-		name           string
-		registerSID    string
-		registerRec    identityRecord
-		publishBody    string
-		wantUsername   string
-		wantIconURL    string
-		wantIconEmoji  string
+		name          string
+		registerSID   string
+		registerRec   identityRecord
+		publishBody   string
+		wantUsername  string
+		wantIconURL   string
+		wantIconEmoji string
 	}{
 		{
 			name:          "matched session injects all identity fields",
@@ -538,10 +538,10 @@ func TestHandlePublishIdentityFallsBackToMetadataSourceSessionID(t *testing.T) {
 func TestParseHandlePrefix(t *testing.T) {
 	const prefix = "@oversight."
 	cases := []struct {
-		name         string
-		text         string
-		prefix       string
-		wantHandle   string
+		name          string
+		text          string
+		prefix        string
+		wantHandle    string
 		wantRemainder string
 	}{
 		{"matched simple", "@oversight.gascity: status?", prefix, "gascity", "status?"},
@@ -1023,17 +1023,17 @@ func TestHandleHandleAliasDelete(t *testing.T) {
 // for handlePublishFile tests. Each tracker captures the most recent
 // request; per-step error injection lets cases exercise failure modes.
 type fakeSlackFiles struct {
-	server          *httptest.Server
-	uploadServer    *httptest.Server
-	getURLPath      string
-	getURLForm      string
-	completePath    string
-	completeBody    slackCompleteUploadReq
+	server           *httptest.Server
+	uploadServer     *httptest.Server
+	getURLPath       string
+	getURLForm       string
+	completePath     string
+	completeBody     slackCompleteUploadReq
 	uploadedBytes    []byte
 	uploadedFilename string
 	getURLResp       string
-	completeResp    string
-	uploadStatus    int
+	completeResp     string
+	uploadStatus     int
 }
 
 func newFakeSlackFiles(t *testing.T) *fakeSlackFiles {
@@ -1102,69 +1102,69 @@ func newFakeSlackFiles(t *testing.T) *fakeSlackFiles {
 
 func TestHandlePublishFile(t *testing.T) {
 	cases := []struct {
-		name           string
-		body           string
-		method         string
-		seedFile       bool
-		fileContent    string
+		name             string
+		body             string
+		method           string
+		seedFile         bool
+		fileContent      string
 		filePathOverride string
-		getURLResp     string
-		completeResp   string
-		uploadStatus   int
-		wantStatus     int
-		wantDelivered  bool
-		wantFailKind   string
-		wantFileID     string
-		wantChannel    string
-		wantThreadTS   string
-		wantInitial    string
-		wantUploadBody string
+		getURLResp       string
+		completeResp     string
+		uploadStatus     int
+		wantStatus       int
+		wantDelivered    bool
+		wantFailKind     string
+		wantFileID       string
+		wantChannel      string
+		wantThreadTS     string
+		wantInitial      string
+		wantUploadBody   string
 	}{
 		{
-			name:          "happy path with thread + initial comment",
-			method:        http.MethodPost,
-			seedFile:      true,
-			fileContent:   "PNGDATA-12345",
-			body:          `{"conversation":{"conversation_id":"C123","kind":"room"},"file_path":"PLACEHOLDER","filename":"plot.png","initial_comment":"latest run","reply_to_message_id":"1234.5678"}`,
-			wantStatus:    http.StatusOK,
-			wantDelivered: true,
-			wantFileID:    "F123",
-			wantChannel:   "C123",
-			wantThreadTS:  "1234.5678",
-			wantInitial:   "latest run",
+			name:           "happy path with thread + initial comment",
+			method:         http.MethodPost,
+			seedFile:       true,
+			fileContent:    "PNGDATA-12345",
+			body:           `{"conversation":{"conversation_id":"C123","kind":"room"},"file_path":"PLACEHOLDER","filename":"plot.png","initial_comment":"latest run","reply_to_message_id":"1234.5678"}`,
+			wantStatus:     http.StatusOK,
+			wantDelivered:  true,
+			wantFileID:     "F123",
+			wantChannel:    "C123",
+			wantThreadTS:   "1234.5678",
+			wantInitial:    "latest run",
 			wantUploadBody: "PNGDATA-12345",
 		},
 		{
-			name:          "missing file_path rejected",
-			method:        http.MethodPost,
-			body:          `{"conversation":{"conversation_id":"C1"}}`,
-			wantStatus:    http.StatusBadRequest,
+			name:       "missing file_path rejected",
+			method:     http.MethodPost,
+			body:       `{"conversation":{"conversation_id":"C1"}}`,
+			wantStatus: http.StatusBadRequest,
 		},
 		{
-			name:          "missing channel rejected",
-			method:        http.MethodPost,
-			seedFile:      true,
-			fileContent:   "x",
-			body:          `{"file_path":"PLACEHOLDER"}`,
-			wantStatus:    http.StatusBadRequest,
+			name:        "missing channel rejected",
+			method:      http.MethodPost,
+			seedFile:    true,
+			fileContent: "x",
+			body:        `{"file_path":"PLACEHOLDER"}`,
+			wantStatus:  http.StatusBadRequest,
 		},
 		{
-			name:             "nonexistent file rejected",
-			method:           http.MethodPost,
-			body:             `{"conversation":{"conversation_id":"C1"},"file_path":"/tmp/definitely-not-here-12345.png"}`,
-			wantStatus:       http.StatusBadRequest,
+			name:       "nonexistent file rejected",
+			method:     http.MethodPost,
+			body:       `{"conversation":{"conversation_id":"C1"},"file_path":"/tmp/definitely-not-here-12345.png"}`,
+			wantStatus: http.StatusBadRequest,
 		},
 		{
-			name:          "GET rejected",
-			method:        http.MethodGet,
-			body:          "",
-			wantStatus:    http.StatusMethodNotAllowed,
+			name:       "GET rejected",
+			method:     http.MethodGet,
+			body:       "",
+			wantStatus: http.StatusMethodNotAllowed,
 		},
 		{
-			name:          "garbage JSON rejected",
-			method:        http.MethodPost,
-			body:          `not-json`,
-			wantStatus:    http.StatusBadRequest,
+			name:       "garbage JSON rejected",
+			method:     http.MethodPost,
+			body:       `not-json`,
+			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name:          "missing_scope on getUploadURL maps to auth",
@@ -1324,13 +1324,13 @@ func TestSafeFilename(t *testing.T) {
 
 func TestDownloadSlackFiles(t *testing.T) {
 	cases := []struct {
-		name        string
-		files       []slackFile
-		fileBodies  map[string]string // url_private path -> body returned by stub
-		fileStatus  map[string]int    // url_private path -> HTTP status
-		emptyStore  bool
-		wantCount   int
-		wantBodies  []string
+		name       string
+		files      []slackFile
+		fileBodies map[string]string // url_private path -> body returned by stub
+		fileStatus map[string]int    // url_private path -> HTTP status
+		emptyStore bool
+		wantCount  int
+		wantBodies []string
 	}{
 		{
 			name: "single file downloaded",
@@ -1475,7 +1475,7 @@ func writeAged(t *testing.T, path string, content string, mtime time.Time) {
 func TestSweepInboundStore(t *testing.T) {
 	now := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
 	ttl := 24 * time.Hour
-	old := now.Add(-48 * time.Hour) // older than ttl, should be removed
+	old := now.Add(-48 * time.Hour)  // older than ttl, should be removed
 	fresh := now.Add(-1 * time.Hour) // within ttl, should be kept
 
 	t.Run("missing root is no-op", func(t *testing.T) {

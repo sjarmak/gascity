@@ -96,8 +96,8 @@ func TestOrdersScanCleanly(t *testing.T) {
 		formula string
 		exec    bool
 	}{
-		"escalate-blocked":     {trigger: "cooldown", formula: "mol-escalate-blocked"},
-		"deliver-escalations":  {trigger: "cooldown", exec: true},
+		"escalate-blocked":    {trigger: "cooldown", formula: "mol-escalate-blocked"},
+		"deliver-escalations": {trigger: "cooldown", exec: true},
 	}
 
 	for name, w := range want {

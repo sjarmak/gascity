@@ -415,10 +415,10 @@ func TestHandleExtMsgGroupEnsureRoundTripsFanoutPolicy(t *testing.T) {
 		"mode":           extmsg.GroupModeLauncher,
 		"default_handle": "mayor",
 		"fanout_policy": map[string]any{
-			"enabled":                       true,
-			"allow_untargeted_publication":  true,
-			"max_peer_triggered_publishes":  5,
-			"max_total_peer_deliveries":     12,
+			"enabled":                      true,
+			"allow_untargeted_publication": true,
+			"max_peer_triggered_publishes": 5,
+			"max_total_peer_deliveries":    12,
 		},
 	})
 	if err != nil {
