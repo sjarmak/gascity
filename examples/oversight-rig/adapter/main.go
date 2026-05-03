@@ -14,6 +14,87 @@
 // so subsequent replies thread correctly.
 //
 // All configuration via env vars — keep secrets out of source.
+//
+// # Environment contract
+//
+// Must-set (no default; loadConfigFromEnv returns an error if missing):
+//
+//   - SLACK_WORKSPACE_ID      Slack team id (e.g. T01234567).
+//   - SLACK_BOT_TOKEN         xoxb- bot token. Must have chat:write,
+//     reactions:write, files:write, and (for
+//     identity overrides) chat:write.customize.
+//   - SLACK_SIGNING_SECRET    Slack app signing secret used to verify
+//     incoming /slack/events HMAC signatures.
+//   - GC_CITY_NAME            Name of the gc city the adapter posts to
+//     (matches [workspace].name in city.toml). Used
+//     to construct /v0/city/{name}/extmsg/inbound and
+//     /v0/city/{name}/session/{id}/messages URLs.
+//
+// Optional override (sane default; set to override):
+//
+//   - LISTEN_PUBLIC                Default ":8765". Public TCP listener
+//     for /slack/events. Bind 0.0.0.0 if
+//     fronted by a tunnel (Tailscale Funnel,
+//     ngrok, etc.).
+//   - LISTEN_INTERNAL              Default "127.0.0.1:8766". Loopback
+//     listener for /publish and other gc-side
+//     endpoints. Ignored when GC_SERVICE_SOCKET
+//     is set (proxy_process mode).
+//   - INTERNAL_CALLBACK_URL        Default "http://127.0.0.1:8766". URL
+//     advertised to gc during self-registration.
+//     In proxy_process mode this is computed
+//     from GC_API_BASE_URL + GC_SERVICE_URL_PREFIX
+//     and the env var is ignored.
+//   - GC_API_BASE_URL              Default "http://127.0.0.1:9443". Base
+//     URL for gc's HTTP API.
+//   - ADAPTER_PROVIDER             Default "slack". Provider name used in
+//     conversation refs and adapter registration.
+//   - REGISTER_ON_START            Default "true". Set "false" to skip
+//     /extmsg/adapters self-registration (used
+//     by tests + diagnostics).
+//   - HANDLE_PREFIX                Default "@". Leading address token
+//     recognized on inbound messages for
+//     keyword routing (e.g. "@name: text").
+//     Empty string disables routing.
+//   - IDENTITY_STORE_PATH          Default "/tmp/gc-slack-adapter/identities.json".
+//     JSON file backing the per-session
+//     chat:write.customize identity registry.
+//     Persisted so adapter restarts don't strip
+//     identity from running sessions.
+//   - HANDLE_ALIAS_STORE_PATH      Default "/tmp/gc-slack-adapter/handle-aliases.json".
+//     JSON file backing the cross-channel
+//     handle → session-id alias registry.
+//   - INBOUND_FILE_STORE           Default "/tmp/gc-slack-adapter/inbound".
+//     Directory for downloaded inbound Slack
+//     file attachments. Files are organized as
+//     <store>/<channel>/<ts>-<safe-filename>
+//     and exposed to gc as file:// URLs.
+//   - INBOUND_FILE_TTL             Default "168h" (7 days). Maximum age
+//     (mtime-based) before the in-process
+//     janitor deletes a file. "0" disables the
+//     janitor.
+//   - INBOUND_FILE_SWEEP_INTERVAL  Default "1h". How often the janitor
+//     wakes to scan INBOUND_FILE_STORE. "0"
+//     disables the janitor.
+//
+// Controller-injected (proxy_process mode only — set by gc when the
+// adapter runs as a [[service]]):
+//
+//   - GC_SERVICE_SOCKET            Path to the UDS the adapter binds for
+//     /publish and /healthz. Presence of this
+//     var switches the adapter into
+//     proxy_process mode.
+//   - GC_SERVICE_URL_PREFIX        Required when GC_SERVICE_SOCKET is set
+//     (e.g. "/svc/slack"). The adapter's
+//     self-registered CallbackURL is computed
+//     as GC_API_BASE_URL + GC_SERVICE_URL_PREFIX.
+//
+// Consumer-specific (referenced by deployment scripts and prompts but
+// NOT consumed by the adapter binary):
+//
+//   - any environment used by sibling tooling (deliver-rollup.sh,
+//     resolve_rig_channel.py, etc.) lives outside this binary and is
+//     documented in the consumer pack's README.
 package main
 
 import (
@@ -79,12 +160,12 @@ type config struct {
 	handlePrefix string
 	// handleAliasStorePath is the JSON file backing the handle-alias
 	// registry. Maps handle -> gc session id; used to dispatch
-	// cross-channel address-by-handle messages (e.g. `@mayor:` from
-	// any channel routes to the Mayor session even though Mayor has
-	// no Slack binding).
+	// cross-channel address-by-handle messages (e.g. `@ops:` from any
+	// channel routes to the session registered under the "ops" handle
+	// even when that session has no Slack binding for the channel).
 	handleAliasStorePath string
-	// inboundFileStore is the local directory where inbound Slack
-	// file attachments are written so PLs can Read them directly
+	// inboundFileStore is the local directory where inbound Slack file
+	// attachments are written so bound sessions can read them directly
 	// (no bot-token leak). Files are organized as
 	// <store>/<channel>/<ts>-<safe-filename>.
 	inboundFileStore string
@@ -120,7 +201,7 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 		serviceSocket:        getenv("GC_SERVICE_SOCKET"),
 		internalCallbackURL:  strings.TrimRight(envOrFn("INTERNAL_CALLBACK_URL", defaultInternalCallback), "/"),
 		gcAPIBase:            strings.TrimRight(envOrFn("GC_API_BASE_URL", "http://127.0.0.1:9443"), "/"),
-		cityName:             envOrFn("GC_CITY_NAME", "ds-research"),
+		cityName:             getenv("GC_CITY_NAME"),
 		provider:             envOrFn("ADAPTER_PROVIDER", "slack"),
 		accountID:            getenv("SLACK_WORKSPACE_ID"),
 		slackBotToken:        getenv("SLACK_BOT_TOKEN"),
@@ -172,6 +253,13 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 	if cfg.slackSigningKey == "" {
 		missing = append(missing, "SLACK_SIGNING_SECRET")
 	}
+	if cfg.cityName == "" {
+		// GC_CITY_NAME is required: every inbound POST and every
+		// dispatch-to-aliased-session call constructs a URL of the
+		// form /v0/city/{cityName}/.... A wrong default silently
+		// routes traffic to the wrong city, so fail-fast instead.
+		missing = append(missing, "GC_CITY_NAME")
+	}
 	if len(missing) > 0 {
 		return cfg, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
 	}
@@ -221,9 +309,9 @@ type externalActor struct {
 
 // externalAttachment mirrors extmsg.ExternalAttachment on the gc side.
 // URL is a `file://` local path when the adapter has downloaded the bytes
-// for inbound files (so PLs can Read it directly without leaking the bot
-// token); for outbound transcripts that originated as outbound files, URL
-// is the Slack permalink.
+// for inbound files (so bound sessions can read it directly without
+// leaking the bot token); for outbound transcripts that originated as
+// outbound files, URL is the Slack permalink.
 type externalAttachment struct {
 	ProviderID string `json:"provider_id"`
 	URL        string `json:"url"`
@@ -1201,10 +1289,10 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, env slackEvent
 		msg.Channel, msg.User, msg.TS, msg.ThreadTS, target, len(attachments), len(text))
 
 	// Cross-channel address-by-handle: if the parsed target matches a
-	// registered alias (e.g. "mayor" or "cos"), dispatch the inbound
-	// directly to the aliased session via gc's session-message API,
-	// regardless of channel binding. The originating channel's PL still
-	// sees the inbound (above) and stays silent per its prompt rule
+	// registered alias, dispatch the inbound directly to the aliased
+	// session via gc's session-message API, regardless of channel
+	// binding. The originating channel's bound session still sees the
+	// inbound (above) and is expected to stay silent (per its prompt)
 	// because target != its handle.
 	if target != "" && aliasReg != nil {
 		if aliasedSessionID, ok := aliasReg.Get(target); ok {
@@ -1469,22 +1557,23 @@ func logSweepResult(res sweepResult) {
 // parseHandlePrefix recognizes a leading address token of the form
 // "<prefix><handle>" at the start of text, where the handle is followed
 // by a colon, whitespace, or end-of-string. Leading whitespace before
-// the prefix is tolerated. The handle character class is [A-Za-z0-9_-]
-// (matches the rig naming convention). When matched, the handle is
-// returned along with the remainder of the text (with any leading
-// separator + single leading space trimmed); on no match, the original
-// text is returned with an empty handle.
+// the prefix is tolerated. The handle character class is [A-Za-z0-9_-];
+// the consumer chooses what handles map to which sessions via the
+// /handle-alias registry. When matched, the handle is returned along
+// with the remainder of the text (with any leading separator + single
+// leading space trimmed); on no match, the original text is returned
+// with an empty handle.
 //
-// Both `@cos: foo` and `@cos foo` are accepted because human users
+// Both `@name: foo` and `@name foo` are accepted because human users
 // don't reliably type the colon — the colon is optional, but if it
 // appears it must be the first character after the handle.
 //
 // Examples (with prefix "@"):
 //
-//	"@gascity: status?"      -> ("gascity", "status?")
-//	"@cos foo"                -> ("cos",     "foo")
-//	"@cos:hello"              -> ("cos",     "hello")
-//	"  @mayor hi"             -> ("mayor",   "hi")
+//	"@gascity: status?"       -> ("gascity", "status?")
+//	"@ops foo"                -> ("ops",     "foo")
+//	"@ops:hello"              -> ("ops",     "hello")
+//	"  @lead hi"              -> ("lead",    "hi")
 //	"@gascity"                -> ("gascity", "")
 //	"@: foo"                  -> ("",        "@: foo")           (empty handle)
 //	"hello @gascity: x"       -> ("",        "hello @gascity: x") (not at start)
@@ -1517,7 +1606,7 @@ func parseHandlePrefix(text, prefix string) (handle, remainder string) {
 	body := rest[handleEnd:]
 
 	// Handle must end at: end-of-string, colon, or whitespace.
-	// Anything else (e.g. `@cos.foo`) means this isn't an address token.
+	// Anything else (e.g. `@name.foo`) means this isn't an address token.
 	if body == "" {
 		return candidate, ""
 	}
@@ -1638,11 +1727,12 @@ func (r *identityRegistry) saveLocked() error {
 	return nil
 }
 
-// handleAliasRegistry maps a handle (e.g. "mayor", "cos") to a gc session
-// id. Used by the cross-channel address-by-handle dispatcher: when a Slack
-// inbound parses a handle that matches an alias, the adapter delivers the
-// inbound directly to the aliased session via gc's session-message API,
-// even if that session has no Slack binding for the originating channel.
+// handleAliasRegistry maps a handle (consumer-defined string, e.g. a role
+// or persona name) to a gc session id. Used by the cross-channel
+// address-by-handle dispatcher: when a Slack inbound parses a handle
+// that matches an alias, the adapter delivers the inbound directly to
+// the aliased session via gc's session-message API, even if that session
+// has no Slack binding for the originating channel.
 //
 // Persists to disk so restarts don't lose mappings; same atomic write
 // pattern as the identity registry.
@@ -1821,9 +1911,9 @@ func handleHandleAliasDelete(reg *handleAliasRegistry) http.HandlerFunc {
 }
 
 // dispatchToAliasedSession POSTs a system reminder to the gc session-message
-// endpoint for the aliased session. The payload carries everything mayor /
-// cos needs to compose a reply: originating channel id (for routing the
-// reply back), message ts (for threading), and the inbound text.
+// endpoint for the aliased session. The payload carries everything the
+// receiving session needs to compose a reply: originating channel id (for
+// routing the reply back), message ts (for threading), and the inbound text.
 //
 // On error we log and continue — best-effort delivery; the originating
 // channel's transcript still records the inbound regardless.

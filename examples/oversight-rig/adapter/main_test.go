@@ -25,6 +25,10 @@ func baseSlackEnv() map[string]string {
 		"SLACK_WORKSPACE_ID":   "T01234567",
 		"SLACK_BOT_TOKEN":      "xoxb-test",
 		"SLACK_SIGNING_SECRET": "secret",
+		// GC_CITY_NAME is must-set: every URL the adapter constructs
+		// for gc-side calls is /v0/city/{cityName}/.... Tests
+		// targeting alternate cities override this in their own env.
+		"GC_CITY_NAME": "test-city",
 	}
 }
 
@@ -101,17 +105,39 @@ func TestLoadConfigProxyProcessModeRejectsMissingURLPrefix(t *testing.T) {
 }
 
 func TestLoadConfigMissingSlackSecretsReportsAll(t *testing.T) {
-	// All three Slack secrets missing — should report all three in one error.
+	// All three Slack secrets + GC_CITY_NAME missing — should report
+	// all four in one error. GC_CITY_NAME has no default because the
+	// fallback (silently posting to the wrong city) is worse than
+	// fail-fast.
 	env := map[string]string{}
 
 	_, err := loadConfigFromEnv(stubEnv(env))
 	if err == nil {
 		t.Fatal("loadConfigFromEnv: want error for missing slack secrets, got nil")
 	}
-	for _, key := range []string{"SLACK_WORKSPACE_ID", "SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET"} {
+	for _, key := range []string{
+		"SLACK_WORKSPACE_ID", "SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET", "GC_CITY_NAME",
+	} {
 		if !strings.Contains(err.Error(), key) {
 			t.Errorf("error %q missing %s", err.Error(), key)
 		}
+	}
+}
+
+func TestLoadConfigRejectsMissingCityName(t *testing.T) {
+	// All Slack secrets present but GC_CITY_NAME unset — adapter must
+	// fail-fast rather than silently route inbound traffic to a wrong
+	// default city. Regression guard for gc-ywe.2 (removed the
+	// "ds-research" fallback).
+	env := baseSlackEnv()
+	delete(env, "GC_CITY_NAME")
+
+	_, err := loadConfigFromEnv(stubEnv(env))
+	if err == nil {
+		t.Fatal("loadConfigFromEnv: want error when GC_CITY_NAME is unset, got nil")
+	}
+	if !strings.Contains(err.Error(), "GC_CITY_NAME") {
+		t.Errorf("error %q must mention GC_CITY_NAME", err.Error())
 	}
 }
 

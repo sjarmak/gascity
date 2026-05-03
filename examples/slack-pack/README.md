@@ -108,10 +108,11 @@ gc slack reply-current --help
 
 ## Verify
 
-Assuming the adapter is up and `SLACK_WORKSPACE_ID` /
-`SLACK_BOT_TOKEN` are exported (the same env the adapter consumes,
-sourced from `${XDG_CONFIG_HOME:-$HOME/.config}/gc-slack-adapter/env`
-— see "Slack secrets" below):
+Assuming the adapter is up and the four must-set vars
+(`SLACK_WORKSPACE_ID`, `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`,
+`GC_CITY_NAME`) are exported (sourced from
+`${XDG_CONFIG_HOME:-$HOME/.config}/gc-slack-adapter/env` — see
+"Adapter env contract" below):
 
 ```
 # Bind a DM channel to a session. Replace D0XXXXXXXXX with the DM
@@ -188,23 +189,68 @@ When `GC_SERVICE_SOCKET` is set, the adapter:
 - still serves `/healthz` on the UDS so the controller's `health_path`
   probe succeeds.
 
-### Slack secrets
+### Adapter env contract
 
-The adapter reads three required secrets from the environment:
+The full adapter env contract — what the binary at
+`examples/oversight-rig/adapter/main.go` reads — is enumerated in the
+package docstring at the top of that file. Summary:
+
+**Must-set** (no default; adapter exits at startup if missing):
+
+| Var                    | Purpose                                                            |
+| ---------------------- | ------------------------------------------------------------------ |
+| `SLACK_WORKSPACE_ID`   | Slack team id (e.g. `T0XXXXXXXXX`).                                |
+| `SLACK_BOT_TOKEN`      | `xoxb-…` token. Scopes: `chat:write`, `reactions:write`, `files:write`, and `chat:write.customize` for per-session identity overrides. |
+| `SLACK_SIGNING_SECRET` | Used to verify HMAC signatures on `/slack/events` requests.        |
+| `GC_CITY_NAME`         | gc city the adapter posts inbound + session-message traffic to. Matches `[workspace].name` in `city.toml`. No fallback default — the adapter fails fast rather than silently route to a wrong city. |
+
+**Optional override** (sane default; set to override):
+
+| Var                            | Default                                          | Purpose                                                                         |
+| ------------------------------ | ------------------------------------------------ | ------------------------------------------------------------------------------- |
+| `LISTEN_PUBLIC`                | `:8765`                                          | Public listener for `/slack/events` (bind `0.0.0.0` if fronted by a tunnel).    |
+| `LISTEN_INTERNAL`              | `127.0.0.1:8766`                                 | Loopback listener for `/publish`. Ignored under proxy_process mode.             |
+| `INTERNAL_CALLBACK_URL`        | `http://127.0.0.1:8766`                          | URL advertised to gc at self-registration. Ignored under proxy_process mode.    |
+| `GC_API_BASE_URL`              | `http://127.0.0.1:9443`                          | Base URL for gc's HTTP API.                                                     |
+| `ADAPTER_PROVIDER`             | `slack`                                          | Provider name in conversation refs + adapter registration.                      |
+| `REGISTER_ON_START`            | `true`                                           | Set `false` to skip `/extmsg/adapters` registration (tests, diagnostics).       |
+| `HANDLE_PREFIX`                | `@`                                              | Leading address token for keyword routing. Empty disables routing.              |
+| `IDENTITY_STORE_PATH`          | `/tmp/gc-slack-adapter/identities.json`          | JSON file backing the per-session `chat:write.customize` identity registry.    |
+| `HANDLE_ALIAS_STORE_PATH`      | `/tmp/gc-slack-adapter/handle-aliases.json`      | JSON file backing the cross-channel handle → session-id alias registry.        |
+| `INBOUND_FILE_STORE`           | `/tmp/gc-slack-adapter/inbound`                  | Directory for downloaded inbound Slack file attachments.                        |
+| `INBOUND_FILE_TTL`             | `168h` (7 days)                                  | Janitor retention. `0` disables sweeping.                                       |
+| `INBOUND_FILE_SWEEP_INTERVAL`  | `1h`                                             | Janitor scan period. `0` disables sweeping.                                     |
+
+**Controller-injected** (proxy_process mode only — gc sets these when
+the adapter runs as a `[[service]]`; do not set them by hand):
+`GC_SERVICE_NAME`, `GC_SERVICE_SOCKET`, `GC_SERVICE_URL_PREFIX`,
+`GC_SERVICE_STATE_ROOT`, `GC_SERVICE_RUN_ROOT`. See
+"What gc injects vs. what stays in the env file" above.
+
+**Consumer-specific** (referenced by deployment scripts and prompts in
+sibling tooling, not by the adapter binary): variables consumed by
+`deliver-rollup.sh`, `resolve_rig_channel.py`, etc., live with the
+consumer pack and are documented there. The adapter has no opinion on
+what handles map to which sessions — that's `/handle-alias` registry
+content, set by the consumer at deploy time.
+
+### Slack secrets — placement
+
+Recommended placement for the four must-set vars (and any overrides):
+`${XDG_CONFIG_HOME:-$HOME/.config}/gc-slack-adapter/env` (`0600`
+perms). Source the file before `gc start` so the adapter inherits
+the env via `os.Environ()`. Under systemd-managed deployments, drop a
+unit override that points
+`EnvironmentFile=-…/gc-slack-adapter/env` at the same path so the
+supervisor passes the env to its `proxy_process` children. Phase B
+will move the env-file path into pack config; not yet wired.
 
 ```
 SLACK_WORKSPACE_ID=T0XXXXXXXXX
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_SIGNING_SECRET=...
+GC_CITY_NAME=<your-city-name>
 ```
-
-Recommended placement: `${XDG_CONFIG_HOME:-$HOME/.config}/gc-slack-adapter/env`
-(0600 perms). Source the file before `gc start` so the adapter
-inherits the secrets via `os.Environ()`. Under systemd-managed
-deployments, drop a unit override that points
-`EnvironmentFile=-…/gc-slack-adapter/env` at the same path so the
-supervisor passes the env to its `proxy_process` children. Phase B
-will move the env-file path into pack config; not yet wired.
 
 ### Cutover sequence
 
