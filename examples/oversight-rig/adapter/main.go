@@ -47,7 +47,7 @@ const (
 	defaultPublicListen = ":8765"
 	// Internal listener: serves /publish only. Bound to 127.0.0.1 so
 	// only processes on this machine (i.e. gc) can reach it.
-	defaultInternalListen     = "127.0.0.1:8766"
+	defaultInternalListen   = "127.0.0.1:8766"
 	defaultInternalCallback = "http://127.0.0.1:8766"
 )
 
@@ -115,17 +115,17 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 		return fallback
 	}
 	cfg := config{
-		publicListen:        envOrFn("LISTEN_PUBLIC", defaultPublicListen),
-		internalListen:      envOrFn("LISTEN_INTERNAL", defaultInternalListen),
-		serviceSocket:       getenv("GC_SERVICE_SOCKET"),
-		internalCallbackURL: strings.TrimRight(envOrFn("INTERNAL_CALLBACK_URL", defaultInternalCallback), "/"),
-		gcAPIBase:           strings.TrimRight(envOrFn("GC_API_BASE_URL", "http://127.0.0.1:9443"), "/"),
-		cityName:            envOrFn("GC_CITY_NAME", "ds-research"),
-		provider:            envOrFn("ADAPTER_PROVIDER", "slack"),
-		accountID:           getenv("SLACK_WORKSPACE_ID"),
-		slackBotToken:       getenv("SLACK_BOT_TOKEN"),
-		slackSigningKey:     getenv("SLACK_SIGNING_SECRET"),
-		registerOnStart:     envOrFn("REGISTER_ON_START", "true") == "true",
+		publicListen:         envOrFn("LISTEN_PUBLIC", defaultPublicListen),
+		internalListen:       envOrFn("LISTEN_INTERNAL", defaultInternalListen),
+		serviceSocket:        getenv("GC_SERVICE_SOCKET"),
+		internalCallbackURL:  strings.TrimRight(envOrFn("INTERNAL_CALLBACK_URL", defaultInternalCallback), "/"),
+		gcAPIBase:            strings.TrimRight(envOrFn("GC_API_BASE_URL", "http://127.0.0.1:9443"), "/"),
+		cityName:             envOrFn("GC_CITY_NAME", "ds-research"),
+		provider:             envOrFn("ADAPTER_PROVIDER", "slack"),
+		accountID:            getenv("SLACK_WORKSPACE_ID"),
+		slackBotToken:        getenv("SLACK_BOT_TOKEN"),
+		slackSigningKey:      getenv("SLACK_SIGNING_SECRET"),
+		registerOnStart:      envOrFn("REGISTER_ON_START", "true") == "true",
 		identityStorePath:    envOrFn("IDENTITY_STORE_PATH", "/tmp/gc-slack-adapter/identities.json"),
 		handlePrefix:         envOrFn("HANDLE_PREFIX", "@"),
 		handleAliasStorePath: envOrFn("HANDLE_ALIAS_STORE_PATH", "/tmp/gc-slack-adapter/handle-aliases.json"),
@@ -199,11 +199,11 @@ type publishRequest struct {
 	Metadata         map[string]string `json:"metadata,omitempty"`
 }
 
-// metadataKeySourceSessionID mirrors extmsg.MetadataKeySourceSessionID on
-// the gc side. The gc outbound forwarder injects the originating session
-// id under this key in PublishRequest.Metadata so adapters that need it
-// (e.g. for per-session Slack identity overrides) can recover it without
-// PublishRequest gaining a wire-level SessionID field.
+// metadataKeySourceSessionID is the legacy metadata key gc used to
+// propagate the originating session id before PublishRequest gained a
+// native SessionID field (gc-kvt). Modern gc binaries write SessionID
+// directly; this fallback exists only so older gc binaries publishing
+// through this adapter still resolve the per-session identity record.
 const metadataKeySourceSessionID = "source_session_id"
 
 type publishReceipt struct {
@@ -876,7 +876,7 @@ func slackGetUploadURL(token, filename string, length int) (*slackGetUploadURLRe
 }
 
 // slackPutFileBytes POSTs the file contents to a pre-signed Slack upload
-// URL using multipart/form-data with a single ``filename`` field. The URL
+// URL using multipart/form-data with a single “filename“ field. The URL
 // itself encodes auth — no Bearer header needed. Slack returns 200 OK with
 // "OK - <bytes>" on success; we treat any non-2xx as a transport failure.
 //
@@ -1112,10 +1112,12 @@ func verifySlackSignature(secret, ts string, body []byte, sig string) bool {
 
 // slackKindFromChannelType maps a Slack message event's channel_type
 // onto a gc ConversationKind. Slack channel_type values are:
-//   "im"       -> direct message between two users  -> dm
-//   "channel"  -> public channel                    -> room
-//   "group"    -> private channel                   -> room
-//   "mpim"     -> multi-party DM (group DM)         -> room
+//
+//	"im"       -> direct message between two users  -> dm
+//	"channel"  -> public channel                    -> room
+//	"group"    -> private channel                   -> room
+//	"mpim"     -> multi-party DM (group DM)         -> room
+//
 // When channel_type is missing, fall back to the channel-id prefix
 // (D=im, C=channel, G=group). Defaults to "dm" for safety.
 func slackKindFromChannelType(channelType, channelID string) string {

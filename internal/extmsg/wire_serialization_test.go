@@ -15,6 +15,7 @@ import (
 // metadata) on the receiver — threading and idempotency break.
 func TestPublishRequestMarshalsSnakeCase(t *testing.T) {
 	req := PublishRequest{
+		SessionID: "gc-1",
 		Conversation: ConversationRef{
 			Provider:       "slack",
 			AccountID:      "T0",
@@ -24,7 +25,7 @@ func TestPublishRequestMarshalsSnakeCase(t *testing.T) {
 		Text:             "hi",
 		ReplyToMessageID: "1.2",
 		IdempotencyKey:   "idem-1",
-		Metadata:         map[string]string{"source_session_id": "gc-1"},
+		Metadata:         map[string]string{"k": "v"},
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -32,11 +33,12 @@ func TestPublishRequestMarshalsSnakeCase(t *testing.T) {
 	}
 
 	mustContain := []string{
+		`"session_id":"gc-1"`,
 		`"conversation":`,
 		`"text":"hi"`,
 		`"reply_to_message_id":"1.2"`,
 		`"idempotency_key":"idem-1"`,
-		`"metadata":{"source_session_id":"gc-1"}`,
+		`"metadata":{"k":"v"}`,
 	}
 	for _, want := range mustContain {
 		if !bytes.Contains(body, []byte(want)) {
@@ -45,6 +47,7 @@ func TestPublishRequestMarshalsSnakeCase(t *testing.T) {
 	}
 
 	mustNotContain := []string{
+		`"SessionID"`,
 		`"ReplyToMessageID"`,
 		`"IdempotencyKey"`,
 		`"Metadata"`,
@@ -55,6 +58,44 @@ func TestPublishRequestMarshalsSnakeCase(t *testing.T) {
 		if bytes.Contains(body, []byte(bad)) {
 			t.Errorf("PublishRequest JSON contains PascalCase key %q (should be snake_case)\n  got: %s", bad, body)
 		}
+	}
+}
+
+// TestPublishRequestSessionIDOmitemptyWhenBlank asserts the gc-kvt native
+// SessionID field is omitted from the wire when empty, so direct
+// adapter-publish callers (smoke tests, raw curl, pack helpers) that
+// don't supply a session id produce the same wire shape they did before
+// the field was added.
+func TestPublishRequestSessionIDOmitemptyWhenBlank(t *testing.T) {
+	req := PublishRequest{
+		Conversation: ConversationRef{Provider: "slack", AccountID: "T0", ConversationID: "C0"},
+		Text:         "hi",
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(body, []byte(`"session_id"`)) {
+		t.Errorf("PublishRequest with empty SessionID should omit session_id key, got: %s", body)
+	}
+}
+
+// TestPublishRequestSessionIDRoundTrip asserts the gc-kvt SessionID
+// field decodes into the Go struct from a snake_case wire body — the
+// native path the slack adapter prefers over the legacy
+// metadata["source_session_id"] fallback.
+func TestPublishRequestSessionIDRoundTrip(t *testing.T) {
+	wire := []byte(`{
+		"session_id":"gc-pl-7",
+		"conversation":{"provider":"slack","account_id":"T0","conversation_id":"C0","kind":"room"},
+		"text":"hi"
+	}`)
+	var req PublishRequest
+	if err := json.Unmarshal(wire, &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if req.SessionID != "gc-pl-7" {
+		t.Errorf("SessionID = %q, want %q", req.SessionID, "gc-pl-7")
 	}
 }
 
