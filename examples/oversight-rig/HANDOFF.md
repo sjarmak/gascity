@@ -1,17 +1,15 @@
-# Oversight-rig handoff — 2026-05-03 late evening (full session work pushed to fork)
+# Oversight-rig handoff — 2026-05-03 night (gc-kvt + testenv lint fix shipped)
 
-> **To the next agent:** earlier sessions today shipped a large pile of work (gc-g52, gc-cdf, gc-67o, gc-9ha, gc-5rz Phase A cutover, gc-am2 ghost-upload fix, gc-w1h wire-tag audit) but the changes had accumulated as 4300+ insertions of uncommitted local diff against `feat/oversight-rig-pack` with the HANDOFF describing them as shipped. **This session committed that work in 8 logical commits and pushed to `fork/feat/oversight-rig-pack`**, regenerated the missing `examples/oversight-rig/adapter/testenv_import_test.go` lint sentinel, and removed the two nested PR worktrees (`gascity-gascity-pr/`, `gascity-gascity-pr-1/`) that were causing baseline test noise. Tree is clean, branch is up to date with the fork, three pre-existing baseline test failures resolved as a side effect.
+> **To the next agent:** earlier today's commit/push session shipped 8 logical commits (gc-g52, gc-cdf, gc-67o, gc-9ha, gc-5rz Phase A cutover, gc-am2, gc-w1h) and brought the working tree clean. **This follow-up session shipped two more (gc-kvt + a testenv lint walker fix) and closed gc-98y.** Branch `feat/oversight-rig-pack` is now at `20b0bb9c`, working tree clean, up to date with `fork/feat/oversight-rig-pack`. `git config core.hooksPath` is now correctly `.githooks` (fixed this session); all three commits ran the full pre-commit pipeline (lint → spec regen → schema regen → make test → dashboard typecheck).
 
 ## Up next (recommended dispatch)
 
-The shipped work from earlier sessions is now actually shipped — committed and on `fork/feat/oversight-rig-pack`. Active queue (from `bd ready`):
+Active queue (from `bd ready`) — gc-kvt and gc-98y are now closed:
 
 1. **gc-28a** P2 — slack-pack: dual adapter binary locations cause stale-deploy on cutover. Tech-debt; build process needs to publish the binary to a single canonical path so cutovers don't run a stale copy.
-2. **gc-kvt** P2 — extmsg PublishRequest still lacks SessionID; the `Metadata["source_session_id"]` workaround landed this session in `internal/extmsg/outbound.go` (commit cd372627) is intentional placeholder. Now unblocked by gc-w1h. Add a typed SessionID field to PublishRequest, update both wire sides, drop the metadata workaround.
-3. **gc-a3s** P2 — `orders.overrides` with empty rig silently no-ops on per-rig orders. Owned by `gascity-pr-gc-a3s` worktree (already has fix branch `fix/gc-a3s-orders-overrides-rig-scope` at bf931ccf).
-4. **gc-17z** P2 — verify cos picks up slack-v0 prompt + DM-ack behavior.
-5. **gc-5rz** P2 — slack adapter Phase A absorption (UDS for /publish). Phase A is shipped and live; remaining phases not yet scoped.
-6. **gc-98y** P3 — Rollup(gascity): gc-z0o resolved, investigation doc deleted, no source bead needed. Trivial close.
+2. **gc-a3s** P2 — `orders.overrides` with empty rig silently no-ops on per-rig orders. Owned by `gascity-pr-gc-a3s` worktree (already has fix branch `fix/gc-a3s-orders-overrides-rig-scope` at bf931ccf).
+3. **gc-17z** P2 — verify cos picks up slack-v0 prompt + DM-ack behavior.
+4. **gc-5rz** P2 — slack adapter Phase A absorption (UDS for /publish). Phase A is shipped and live; remaining phases not yet scoped.
 
 **Standing watch items** (no action unless triggered):
 
@@ -22,7 +20,15 @@ Item C (gc-side `HandleOutboundFile`) is still deferred/optional — only worth 
 
 ## Commits landed this session (pushed to fork/feat/oversight-rig-pack)
 
-Eight commits, range `070f39c1..e7c51e6d`, all pushed:
+Three commits, range `69dc5545..20b0bb9c`, all pushed:
+
+```
+69dc5545 fix(testenv): respect nested go.mod boundaries when walking for sentinel
+bfd64511 fix(extmsg): add native SessionID to PublishRequest, drop metadata workaround (gc-kvt)
+20b0bb9c chore: golangci-lint fmt whitespace alignment in test tables
+```
+
+Prior session (kept for context, range `070f39c1..e7c51e6d`):
 
 ```
 6416c171 fix(workspacesvc): include /v0/city/<name> in GC_SERVICE_URL_PREFIX (gc-cdf)
@@ -35,13 +41,18 @@ b8abb72d feat(slack-pack): identity DELETE + bidirectional file attachments + ne
 e7c51e6d chore: regenerate testenv import sentinels
 ```
 
-Quality gates this session:
-- `go vet ./...` — clean
-- `make spec-ci` — clean (no drift; tooling needs `/home/ds/gopath/bin` on PATH)
-- `make dashboard-check` — clean
-- `make test` — only flake remaining is `TestPhase0HandleSessionWake_ContinuityEligibleArchivedBeadRequestsStart` in the broader internal/api race sweep. Passes 3/3 in isolation. Same class as the two flakes called out in the prior handoff (`TestStreamSessionPeekAcceptsPeekCapability`, `TestHandleExtMsgOutboundNotifiesDeliveredConversationMembers`).
+Quality gates this session (run by .githooks/pre-commit on each commit):
+- `golangci-lint fmt` + `golangci-lint run --new-from-rev=HEAD --fix` — clean (one S1016 surfaced and was suppressed with an inline `//nolint:staticcheck` and a comment explaining why the explicit struct literal documents the wire boundary; converting `OutboundRequest` to `PublishRequest` would let any future divergence silently leak to adapters)
+- `go run ./cmd/genspec` + `go generate ./internal/api/genclient` — no drift (PublishRequest is an internal extmsg wire type, not exposed in the gc HTTP API)
+- `go run ./cmd/genschema` — no drift
+- `make lint` + `make vet` — clean
+- `make test` — green
+- `make dashboard-check` (run manually) — clean
+- `make check-docs` — not triggered (no docs touched)
 
-The two pre-existing baseline failures `TestDocDirCoverage` and `TestNoBdExecOutsideBeads` were caused by the nested PR worktrees — both resolved as a side effect of the worktree removal.
+Known baseline noise (unchanged from prior handoff, reproduces on clean tree):
+- `TestHandleExtMsgOutboundNotifiesDeliveredConversationMembers` race in `internal/api` — confirmed reproduces via `git stash && go test -race -run TestHandleExtMsg... ./internal/api/` on the bare `82d5e16d` checkout. Pre-existing.
+- `TestStreamSessionPeekAcceptsPeekCapability`, `TestPhase0HandleSessionWake_ContinuityEligibleArchivedBeadRequestsStart` — same class.
 
 ## State
 
@@ -457,9 +468,9 @@ Deployment-local (NOT in repo, unchanged this session):
 2. ~~**proxy_process URL contract is broken on the SDK side**~~ — **fixed and shipped** (gc-cdf — landed on this branch as commit 6416c171; PR worktree `gascity-pr-gc-cdf` carries the standalone fix branch).
 3. **`bin/claude-account` JSON writes were unserialized** — gc-arr, closed.
 
-## Follow-up: `core.hooksPath` is misconfigured
+## Resolved this session: `core.hooksPath` restored
 
-`git config core.hooksPath` currently prints `.beads/hooks`, which contains only bd's lifecycle hooks (`on_close`, `on_create`, `on_update`) — not git's `pre-commit`. AGENTS.md requires `.githooks/pre-commit` to be active locally so the auto-fmt + spec/dashboard regen + lint gate fires on every commit. The 8 commits this session were committed without that hook firing; quality gates were run manually instead. To restore: `git config core.hooksPath .githooks`. bd's hooks live under a different namespace and don't share `core.hooksPath`, so the bd integration won't break.
+`git config core.hooksPath .githooks` ran at the start of this session; all three commits this session went through the full pre-commit pipeline. bd's lifecycle hooks under `.beads/hooks/` use a different mechanism and continued to fire (auto-export warnings about `git add` failing on the unrelated `.beads/issues.dolt/` are cosmetic and pre-existing).
 
 ## Resolved this session: nested PR worktrees removed
 
