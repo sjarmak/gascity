@@ -127,15 +127,18 @@ cat > "${XDG_CONFIG_HOME:-$HOME/.config}/gc-slack-adapter/env" <<'EOF'
 SLACK_WORKSPACE_ID=T0XXXXXXXXX
 SLACK_BOT_TOKEN=xoxb-YOUR-BOT-TOKEN-HERE
 SLACK_SIGNING_SECRET=YOUR-SIGNING-SECRET-HERE
+GC_CITY_NAME=<your-city-name>
 
 # Defaults shown — only override if you have a port conflict.
 # LISTEN_PUBLIC=:8765                      # Funnel exposes this
 # LISTEN_INTERNAL=127.0.0.1:8766           # gc-only, localhost
 # INTERNAL_CALLBACK_URL=http://127.0.0.1:8766
 
-# Required when running standalone (Phase A proxy_process injects these).
+# Optional override; defaults to http://127.0.0.1:9443 (no /v0/... suffix).
+# Under proxy_process supervision you don't set this — but you do need
+# it sourced before `gc start` so the supervisor inherits it for the
+# spawned adapter (it is NOT auto-injected by the controller).
 # GC_API_BASE_URL=http://127.0.0.1:8372
-# GC_CITY_NAME=<your-city-name>
 EOF
 chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/gc-slack-adapter/env"
 ```

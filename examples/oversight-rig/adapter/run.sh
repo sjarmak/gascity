@@ -10,13 +10,15 @@
 #   SLACK_WORKSPACE_ID      # T... id, find via Slack admin or auth.test API
 #   SLACK_BOT_TOKEN         # xoxb-...
 #   SLACK_SIGNING_SECRET    # signing secret from Slack app's Basic Information
+#   GC_CITY_NAME            # gc city the adapter posts to (matches
+#                           # [workspace].name in city.toml). No default —
+#                           # adapter exits at startup if unset.
 #
 # Optional env keys:
 #   LISTEN_PUBLIC           # default :8765 (Funnel exposes this; /slack/events)
 #   LISTEN_INTERNAL         # default 127.0.0.1:8766 (localhost-only; /publish)
 #   INTERNAL_CALLBACK_URL   # default http://127.0.0.1:8766
 #   GC_API_BASE_URL         # default http://127.0.0.1:9443
-#   GC_CITY_NAME            # default ds-research
 #   ADAPTER_PROVIDER        # default slack
 #   REGISTER_ON_START       # default true; set false to skip self-registration
 

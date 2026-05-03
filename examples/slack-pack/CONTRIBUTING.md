@@ -50,7 +50,7 @@ CI runs both on every PR that touches `examples/slack-pack/**` or
 ## Secret handling
 
 slack-pack reads Slack credentials from environment variables only. Never
-commit `.env` files or tokens. The README's "Setting up secrets" section
+commit `.env` files or tokens. The README's "Adapter env contract" section
 documents the full env-var contract; use a `.env` file outside the repo or a
 secret manager and source it before running adapter / scripts.
 

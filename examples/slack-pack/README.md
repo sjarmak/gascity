@@ -176,8 +176,11 @@ target.
 - `GC_SERVICE_URL_PREFIX=/svc/slack`
 - `GC_SERVICE_STATE_ROOT=.../.gc/services/slack`
 - `GC_SERVICE_RUN_ROOT=.../.gc/services/slack/run`
-- plus `GC_API_BASE_URL` and `GC_CITY_NAME` (already set by the
-  controller for any exec it spawns under the city scope)
+
+Note: `GC_API_BASE_URL` and `GC_CITY_NAME` are NOT injected by the
+controller for `proxy_process` services — they must be present in the
+env file you source before `gc start`, so the supervisor inherits them
+and passes them down to the spawned adapter.
 
 When `GC_SERVICE_SOCKET` is set, the adapter:
 - skips its `LISTEN_INTERNAL` TCP listener and binds the UDS instead;

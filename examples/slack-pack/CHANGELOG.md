@@ -51,6 +51,19 @@ file attachments).
   metadata workaround).
 - Scope banner and host-agnostic README copy for upstream-prep
   readiness.
+- Adapter env contract documented in the package docstring and in the
+  pack README, categorized as must-set / optional-override /
+  controller-injected / consumer-specific.
+
+### Changed
+
+- **Breaking (standalone deployments only):** `GC_CITY_NAME` is now
+  required. The adapter previously fell back to a hardcoded city name
+  when the env var was unset, silently routing inbound traffic to the
+  wrong destination. Any standalone (`run.sh`-style) deployment must
+  set `GC_CITY_NAME` explicitly. `proxy_process`-supervised deployments
+  are unaffected as long as the env file sourced before `gc start`
+  defines it.
 
 ### Provenance
 
@@ -71,5 +84,7 @@ adapter at `examples/oversight-rig/adapter/`). Key gascity commits:
   workaround (`gc-kvt`).
 - `010bc588` — strip host-specific references and add scope banner
   (`gc-ywe.1`, `gc-ywe.4`).
+- `3db27544` — document adapter env contract and remove the
+  `ds-research` `GC_CITY_NAME` fallback (`gc-ywe.2`).
 
-[0.1.0]: https://github.com/sjarmak/gascity/commits/main/examples/slack-pack
+[0.1.0]: https://github.com/gastownhall/gascity/commits/main/examples/slack-pack
