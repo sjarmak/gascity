@@ -1,23 +1,24 @@
-# Oversight-rig handoff — 2026-05-03 night (gc-kvt + upstream-prep epic kicked off)
+# Oversight-rig handoff — 2026-05-03 late night (gc-ywe wave 2: ywe.2 + ywe.3)
 
-> **To the next agent:** today shipped a lot. Earlier sessions landed 8 commits (gc-g52, gc-cdf, gc-67o, gc-9ha, gc-5rz Phase A cutover, gc-am2, gc-w1h). This thread added 5 more: gc-kvt (extmsg native SessionID), a testenv lint walker fix that respects nested go.mod boundaries, the `core.hooksPath` restoration, and the first two deliverables under a new upstream-prep epic for shipping slack-pack to gastownhall/gascity-packs (gc-ywe). Branch `feat/oversight-rig-pack` is at `010bc588`, working tree clean, tracking `fork/feat/oversight-rig-pack`.
+> **To the next agent:** the upstream-prep epic gc-ywe ran a parallel wave this session (gc-ywe.2 + gc-ywe.3) via `/focus parallel`, including a unified Phase 4 review and a follow-up bead filed (gc-ywe.6, P3 /tmp store-perm hardening). Epic is now **4/6 (66%)** — gc-ywe.1, .2, .3, .4 closed; gc-ywe.5 blocked on gc-28a; gc-ywe.6 newly filed. Branch `feat/oversight-rig-pack` is at `88e81d40` (4 new commits past prior handoff, linear after `git pull --rebase fork` flattened the wave merge), working tree clean, pushed to `fork/feat/oversight-rig-pack`.
+>
+> **`core.hooksPath` regression**: `git config core.hooksPath` currently prints `/home/ds/gascity/.git/hooks` (default) — the prior handoff claimed `.githooks` was restored, but the setting is back to default. The wave's commits and merge went through the default hooks path, not the project's curated `.githooks/pre-commit` pipeline. Re-run `git config core.hooksPath .githooks` if you want the gates active for upcoming work; the wave's quality gates (go vet, go test -race, YAML/shell parse) were validated manually.
 
 ## Up next (recommended dispatch)
 
-The new epic **gc-ywe** ("upstream prep: slack-pack v0.1.0 to gascity-packs") tracks the work to share the slack-pack on the upstream packs repo. **Three children remain**, plus the standing bd queue:
+The upstream-prep epic **gc-ywe** is at **4/6 done**. Two children remain plus a new follow-up; the standing bd queue is otherwise unchanged.
 
-**Upstream-prep epic (gc-ywe — 2/5 done):**
+**Upstream-prep epic (gc-ywe — 4/6 done):**
 
-1. **gc-28a** P2 (epic blocker) — slack-pack: dual adapter binary locations cause stale-deploy on cutover. Source currently lives in `examples/oversight-rig/adapter/` (separate Go module `github.com/sjarmak/gc-slack-adapter`); pack expects binary at `./adapter/gc-slack-adapter`. Move source into the pack itself, rename module to `github.com/gastownhall/gascity-packs/slack/adapter` (or similar), wire pack.toml build target. **gc-ywe.5 (port adapter Go tests) is blocked on this.**
-2. **gc-ywe.2** P2 — separate pack-default vs consumer-config for adapter behaviors that originated in oversight-rig (inbound file janitor, identity registry persistence path, handle-alias semantics, HANDLE_PREFIX, per-rig channel binding model). Audit `examples/oversight-rig/adapter/main.go` for any string/concept naming a consumer-side abstraction.
-3. **gc-ywe.3** P3 — add LICENSE/CONTRIBUTING/CHANGELOG/CI for the upstream repo layout (match the discord pack's plumbing).
-4. **gc-ywe.5** P2 (blocked by gc-28a) — port adapter Go tests so they travel with the pack post-relocation.
+1. **gc-28a** P2 (epic blocker, own session recommended) — slack-pack: dual adapter binary locations cause stale-deploy on cutover. Source currently lives in `examples/oversight-rig/adapter/` (separate Go module `github.com/sjarmak/gc-slack-adapter`); pack expects binary at `./adapter/gc-slack-adapter`. Move source into the pack itself, rename module to `github.com/gastownhall/gascity-packs/slack/adapter` (or similar), wire pack.toml build target. **Touches the live supervised proxy_process binary path — needs a deliberate cutover plan.** gc-ywe.5 is blocked on this. The CHANGELOG, CONTRIBUTING, and the slack-pack CI workflow's `working-directory` + `go-version-file` all point at `examples/oversight-rig/adapter/` today; each will need a one-line update when the relocation lands (callouts left in CONTRIBUTING and the workflow comment).
+2. **gc-ywe.5** P2 (blocked by gc-28a) — port adapter Go tests so they travel with the pack post-relocation.
+3. **gc-ywe.6** P3 (new — filed by Phase 4 review on this wave) — harden adapter `/tmp/gc-slack-adapter/` store default permissions to `0700`/`0600` for `IDENTITY_STORE_PATH`, `HANDLE_ALIAS_STORE_PATH`, `INBOUND_FILE_STORE`. Code change in `examples/oversight-rig/adapter/main.go` plus a regression test guarding mode 0600 on state writes; doc note in the env-contract README. Pre-existing risk, not a regression in this wave.
 
 **Standing bd queue:**
 
-5. **gc-a3s** P2 — `orders.overrides` with empty rig silently no-ops on per-rig orders. Owned by `gascity-pr-gc-a3s` worktree (already has fix branch `fix/gc-a3s-orders-overrides-rig-scope` at bf931ccf).
-6. **gc-17z** P2 — verify cos picks up slack-v0 prompt + DM-ack behavior.
-7. **gc-5rz** P2 — slack adapter Phase A absorption (UDS for /publish). Phase A is shipped and live; remaining phases not yet scoped.
+4. **gc-a3s** P2 — `orders.overrides` with empty rig silently no-ops on per-rig orders. Owned by `gascity-pr-gc-a3s` worktree (already has fix branch `fix/gc-a3s-orders-overrides-rig-scope` at bf931ccf).
+5. **gc-17z** P2 — verify cos picks up slack-v0 prompt + DM-ack behavior.
+6. **gc-5rz** P2 — slack adapter Phase A absorption (UDS for /publish). Phase A is shipped and live; remaining phases not yet scoped.
 
 **Standing watch items** (no action unless triggered):
 
@@ -26,9 +27,36 @@ The new epic **gc-ywe** ("upstream prep: slack-pack v0.1.0 to gascity-packs") tr
 
 Item C (gc-side `HandleOutboundFile`) is still deferred/optional — only worth doing if files need to flow through gc's outbound machinery for transcripts/peer fanout, which v1 doesn't need.
 
-## Commits landed this session (pushed to fork/feat/oversight-rig-pack)
+## Commits landed this session (this wave — gc-ywe.2 + gc-ywe.3)
 
-Five commits, range `69dc5545..010bc588`, all pushed:
+Four commits past prior HANDOFF (range `717aa27c..88e81d40`), pushed to `fork/feat/oversight-rig-pack`:
+
+```
+3db27544 feat(slack-pack): document adapter env contract + remove ds-research default (gc-ywe.2)
+8e8acb3a chore(slack-pack): add LICENSE/CONTRIBUTING/CHANGELOG/CI for upstream layout (gc-ywe.3)
+48fb88f4 fix(slack-pack): address Phase 4 review findings (gc-ywe.2, gc-ywe.3)
+88e81d40 docs(oversight-rig): refresh HANDOFF after gc-ywe wave 2 (ywe.2 + ywe.3)
+```
+
+Wave was orchestrated via `/focus parallel`: two worktree-isolated subagents ran plan→execute→simplify on each bead concurrently; the main session cherry-picked their commits into a `wave-ywe23-review` branch, ran a unified Phase 4 review (3 reviewers in parallel — code, security, Go), applied fixes in `48fb88f4`, and merged the wave into `feat/oversight-rig-pack` with `--no-ff`. The subsequent `git pull --rebase fork` flattened the merge into linear history (fork was already on the same line of work), so the merge commit doesn't appear above. Key file changes:
+
+- `examples/oversight-rig/adapter/main.go`: env-contract docstring expanded; `GC_CITY_NAME` default `"ds-research"` removed (loadConfig fails fast); 6 consumer-domain comments rephrased to neutral handles.
+- `examples/oversight-rig/adapter/main_test.go`: new `TestLoadConfigRejectsMissingCityName`; `baseSlackEnv()` extended with `GC_CITY_NAME`.
+- `examples/oversight-rig/adapter/run.sh` + `SETUP.md`: `GC_CITY_NAME` promoted to required-keys section / env-file template.
+- `examples/slack-pack/README.md`: new "Adapter env contract" section (must-set / optional-override / controller-injected / consumer-specific tables); corrected false claim that controller injects `GC_CITY_NAME` for proxy_process services.
+- `examples/slack-pack/{LICENSE, CONTRIBUTING.md, CHANGELOG.md}`: new — MIT to match repo root, CHANGELOG documents v0.1.0 surface + provenance, breaking `GC_CITY_NAME` requirement called out in `### Changed`.
+- `.github/workflows/slack-pack.yml`: new — paths-filtered Go (`go test -race`) + Python (`pytest`) jobs; actions pinned to commit SHAs matching `.github/workflows/ci.yml`; `permissions: contents: read`; `cancel-in-progress` restricted to `pull_request`.
+
+bd state changes this session:
+
+- Closed: gc-ywe.2 (env-contract + ds-research removal), gc-ywe.3 (LICENSE/CONTRIBUTING/CHANGELOG/CI).
+- Created: gc-ywe.6 (P3 follow-up — /tmp store perm hardening, surfaced by Phase 4 security review).
+
+Phase 4 review summary: 0 CRITICAL, 3 HIGH (all fixed in `48fb88f4`), 4 MEDIUM-quick (all fixed), 1 MEDIUM follow-up (filed as gc-ywe.6), several LOW skipped as pre-existing.
+
+## Commits landed prior session (gc-kvt + upstream-prep kickoff)
+
+Range `69dc5545..010bc588`, pushed:
 
 ```
 69dc5545 fix(testenv): respect nested go.mod boundaries when walking for sentinel
@@ -38,7 +66,7 @@ bfd64511 fix(extmsg): add native SessionID to PublishRequest, drop metadata work
 010bc588 docs(slack-pack): strip host-specific references + add scope banner (gc-ywe.1, gc-ywe.4)
 ```
 
-bd state changes this session:
+Prior bd state changes:
 
 - Closed: gc-98y (rollup), gc-kvt (PublishRequest native SessionID), gc-ywe.1 (docs scrub), gc-ywe.4 (scope banner).
 - Created: gc-ywe (epic — upstream prep), gc-ywe.1..gc-ywe.5 (children).
