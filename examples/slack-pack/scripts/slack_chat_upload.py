@@ -1,15 +1,30 @@
 #!/usr/bin/env python3
-"""Upload a file to a session's bound Slack channel via the local adapter.
+"""Upload a file to a session's bound Slack channel.
 
-Wraps Slack's three-step files-upload-v2 protocol behind a single command.
-The adapter (``examples/slack-pack/adapter``) handles
-``files.getUploadURLExternal`` → ``PUT`` bytes → ``files.completeUploadExternal``;
-this script just resolves the session binding and posts ``/publish-file``.
+Two routing paths are supported, mirroring ``slack_chat_reply_current``:
 
-The bot token must hold the ``files:write`` scope. Without it, the adapter
-returns ``failure_kind=auth`` with ``error=missing_scope`` and the post
-falls through cleanly (no exception); the user can grant the scope
-without restarting anything and the next upload picks it up.
+* **gc-routed (default)** — POST to gc's
+  ``/v0/city/{city}/extmsg/outbound-file``. gc records the upload in the
+  conversation transcript, fans out a peer notification to other
+  sessions bound to the same room, and emits an ``extmsg.outbound``
+  event. This is the production path because it keeps the multi-session
+  coordination story consistent between text and files.
+
+* **adapter-direct (``--via adapter``)** — POST straight to the local
+  adapter's ``/publish-file``. Bypasses gc entirely; no transcript, no
+  peer fanout. Kept as a fast path for adapter-only smoke tests and
+  diagnostics — when the gc API is down or you're testing the adapter
+  in isolation.
+
+Either path delegates to the adapter (``examples/slack-pack/adapter``),
+which handles Slack's three-step files-upload-v2 protocol
+(``files.getUploadURLExternal`` → ``PUT`` bytes →
+``files.completeUploadExternal``).
+
+The bot token must hold the ``files:write`` scope. Without it, the
+adapter returns ``failure_kind=auth`` with ``error=missing_scope`` and
+the post falls through cleanly (no exception); the user can grant the
+scope without restarting anything and the next upload picks it up.
 
 Files post under the bot's default identity, NOT the per-session
 ``chat:write.customize`` identity — Slack's file-upload API doesn't
@@ -72,6 +87,10 @@ def main(argv: list[str]) -> int:
                              "Mutually exclusive with --thread-ts.")
     parser.add_argument("--idempotency-key", default="",
                         help="Caller-supplied idempotency key for retries.")
+    parser.add_argument("--via", choices=("gc", "adapter"), default="gc",
+                        help="Routing path. 'gc' (default) records the upload "
+                             "in the transcript and fans out to peer sessions; "
+                             "'adapter' bypasses gc for diagnostics only.")
     args = parser.parse_args(argv)
 
     if args.thread_ts and args.thread_current:
@@ -106,18 +125,34 @@ def main(argv: list[str]) -> int:
         thread_ts = match
 
     try:
-        result = common.upload_via_adapter(
-            session_id=session_id,
-            conversation_id=conv["conversation_id"],
-            kind=conv["kind"],
-            file_path=str(file_path),
-            filename=args.filename,
-            initial_comment=args.initial_comment,
-            thread_ts=thread_ts,
-            title=args.title,
-            idempotency_key=args.idempotency_key,
-        )
-    except common.AdapterError as exc:
+        if args.via == "adapter":
+            result = common.upload_via_adapter(
+                session_id=session_id,
+                conversation_id=conv["conversation_id"],
+                kind=conv["kind"],
+                file_path=str(file_path),
+                filename=args.filename,
+                initial_comment=args.initial_comment,
+                thread_ts=thread_ts,
+                title=args.title,
+                idempotency_key=args.idempotency_key,
+            )
+        else:
+            result = common.upload_via_gc_outbound_file(
+                session_id=session_id,
+                scope_id=conv["scope_id"],
+                provider=conv["provider"],
+                account_id=conv["account_id"],
+                conversation_id=conv["conversation_id"],
+                kind=conv["kind"],
+                file_path=str(file_path),
+                filename=args.filename,
+                initial_comment=args.initial_comment,
+                thread_ts=thread_ts,
+                title=args.title,
+                idempotency_key=args.idempotency_key,
+            )
+    except (common.AdapterError, common.GCAPIError) as exc:
         raise SystemExit(str(exc)) from exc
 
     print(json.dumps({
@@ -126,6 +161,7 @@ def main(argv: list[str]) -> int:
         "kind": conv["kind"],
         "file_path": str(file_path),
         "thread_ts": thread_ts,
+        "via": args.via,
         "result": result,
     }, indent=2))
     return 0

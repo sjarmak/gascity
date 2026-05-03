@@ -115,7 +115,11 @@ def test_publish_via_adapter_keeps_direct_path(
     ])
     assert rc == 0
     assert captured["url"].endswith("/publish")
-    assert captured["csrf"] is False
+    # gc-5rz Phase A: the supervised adapter is reached via the gc /svc
+    # proxy, which requires X-GC-Request on private mutation endpoints
+    # — so even the adapter-direct path carries csrf=True.
+    assert captured["csrf"] is True
+    assert "/extmsg/" not in captured["url"]
 
 
 def test_publish_fails_fast_when_session_has_no_binding(

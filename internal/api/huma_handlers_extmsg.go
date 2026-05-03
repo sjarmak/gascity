@@ -134,6 +134,63 @@ func (s *Server) humaHandleExtMsgOutbound(ctx context.Context, input *ExtMsgOutb
 	return out, nil
 }
 
+// humaHandleExtMsgOutboundFile is the Huma-typed handler for
+// POST /v0/extmsg/outbound-file.
+//
+// Mirrors humaHandleExtMsgOutbound: resolve services + adapter registry,
+// dispatch through extmsg.HandleOutboundFile, then fan out a peer
+// notification via extmsgNotifyMembers using the initial comment as the
+// message body (Slack threading semantics: the file's initial_comment
+// IS the message text).
+func (s *Server) humaHandleExtMsgOutboundFile(ctx context.Context, input *ExtMsgOutboundFileInput) (*ExtMsgOutboundFileOutput, error) {
+	svc, err := s.humaExtmsgServices()
+	if err != nil {
+		return nil, err
+	}
+	reg, err := s.humaExtmsgAdapterRegistry()
+	if err != nil {
+		return nil, err
+	}
+
+	caller := extmsg.Caller{Kind: extmsg.CallerController, ID: "api"}
+	deps := extmsg.OutboundDeps{
+		Services:  *svc,
+		Registry:  reg,
+		EmitEvent: s.extmsgEmitEvent(),
+	}
+
+	result, err := extmsg.HandleOutboundFile(ctx, deps, caller, extmsg.OutboundFileRequest{
+		SessionID:        input.Body.SessionID,
+		Conversation:     input.Body.Conversation,
+		FilePath:         input.Body.FilePath,
+		Filename:         input.Body.Filename,
+		Title:            input.Body.Title,
+		InitialComment:   input.Body.InitialComment,
+		ReplyToMessageID: input.Body.ReplyToMessageID,
+		IdempotencyKey:   input.Body.IdempotencyKey,
+	})
+	if err != nil {
+		return nil, huma.Error422UnprocessableEntity(err.Error())
+	}
+	if result != nil && result.Receipt.Delivered {
+		notifyConversation := input.Body.Conversation
+		if result.Receipt.Conversation != (extmsg.ConversationRef{}) {
+			notifyConversation = result.Receipt.Conversation
+		}
+		sourceDisplay := s.extmsgSessionHandleForSelector(input.Body.SessionID)
+		body := input.Body.InitialComment
+		if body == "" {
+			body = "[file] " + input.Body.Filename
+		}
+		go s.extmsgNotifyMembers(s.backgroundCtx(), notifyConversation, sourceDisplay, "agent", body, input.Body.SessionID)
+	}
+	out := &ExtMsgOutboundFileOutput{}
+	if result != nil {
+		out.Body = *result
+	}
+	return out, nil
+}
+
 // --- Bindings ---
 
 // humaHandleExtMsgBindingList is the Huma-typed handler for GET /v0/extmsg/bindings.

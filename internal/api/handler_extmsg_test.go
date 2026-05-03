@@ -15,13 +15,16 @@ import (
 
 type testExtMsgAdapter struct {
 	publishCalls        []extmsg.PublishRequest
+	publishFileCalls    []extmsg.PublishFileRequest
 	receiptConversation extmsg.ConversationRef
+	fileFailureKind     extmsg.PublishFailureKind
+	fileNotSupported    bool
 }
 
 func (a *testExtMsgAdapter) Name() string { return "test-extmsg-adapter" }
 
 func (a *testExtMsgAdapter) Capabilities() extmsg.AdapterCapabilities {
-	return extmsg.AdapterCapabilities{}
+	return extmsg.AdapterCapabilities{SupportsAttachments: !a.fileNotSupported}
 }
 
 func (a *testExtMsgAdapter) VerifyAndNormalizeInbound(context.Context, extmsg.InboundPayload) (*extmsg.ExternalInboundMessage, error) {
@@ -41,8 +44,59 @@ func (a *testExtMsgAdapter) Publish(_ context.Context, req extmsg.PublishRequest
 	}, nil
 }
 
+func (a *testExtMsgAdapter) PublishFile(_ context.Context, req extmsg.PublishFileRequest) (*extmsg.PublishFileReceipt, error) {
+	a.publishFileCalls = append(a.publishFileCalls, req)
+	conversation := req.Conversation
+	if a.receiptConversation != (extmsg.ConversationRef{}) {
+		conversation = a.receiptConversation
+	}
+	if a.fileFailureKind != "" {
+		return &extmsg.PublishFileReceipt{
+			Conversation: conversation,
+			Delivered:    false,
+			FailureKind:  a.fileFailureKind,
+		}, nil
+	}
+	return &extmsg.PublishFileReceipt{
+		FileID:       "discord-file-1",
+		Conversation: conversation,
+		Delivered:    true,
+	}, nil
+}
+
 func (a *testExtMsgAdapter) EnsureChildConversation(context.Context, extmsg.ConversationRef, string) (*extmsg.ConversationRef, error) {
 	panic("unexpected EnsureChildConversation call")
+}
+
+// newTestExtMsgAdapterNoFile returns a TransportAdapter that does NOT
+// implement FileTransportAdapter, used to verify HandleOutboundFile
+// rejects adapters without file capability with ErrAdapterUnsupported.
+func newTestExtMsgAdapterNoFile() extmsg.TransportAdapter {
+	return testExtMsgAdapterNoFileWrapper{inner: &testExtMsgAdapter{fileNotSupported: true}}
+}
+
+// testExtMsgAdapterNoFileWrapper wraps testExtMsgAdapter without
+// re-exporting the PublishFile method, so the wrapper satisfies
+// TransportAdapter but fails the FileTransportAdapter assertion.
+type testExtMsgAdapterNoFileWrapper struct {
+	inner *testExtMsgAdapter
+}
+
+func (w testExtMsgAdapterNoFileWrapper) Name() string { return w.inner.Name() }
+func (w testExtMsgAdapterNoFileWrapper) Capabilities() extmsg.AdapterCapabilities {
+	return w.inner.Capabilities()
+}
+
+func (w testExtMsgAdapterNoFileWrapper) VerifyAndNormalizeInbound(ctx context.Context, p extmsg.InboundPayload) (*extmsg.ExternalInboundMessage, error) {
+	return w.inner.VerifyAndNormalizeInbound(ctx, p)
+}
+
+func (w testExtMsgAdapterNoFileWrapper) Publish(ctx context.Context, r extmsg.PublishRequest) (*extmsg.PublishReceipt, error) {
+	return w.inner.Publish(ctx, r)
+}
+
+func (w testExtMsgAdapterNoFileWrapper) EnsureChildConversation(ctx context.Context, ref extmsg.ConversationRef, label string) (*extmsg.ConversationRef, error) {
+	return w.inner.EnsureChildConversation(ctx, ref, label)
 }
 
 func TestHandleExtMsgOutboundNotifiesPeerMembersAndMaterializesNamedSessions(t *testing.T) {
@@ -472,5 +526,240 @@ func TestHandleExtMsgGroupEnsureRoundTripsFanoutPolicy(t *testing.T) {
 		fetched.FanoutPolicy.MaxPeerTriggeredPublishes != 5 ||
 		fetched.FanoutPolicy.MaxTotalPeerDeliveries != 12 {
 		t.Fatalf("lookup did not preserve fanout policy: %+v", fetched.FanoutPolicy)
+	}
+}
+
+// TestHandleExtMsgOutboundFileRoutesThroughGCRecordsTranscriptAndFansOut
+// is the gc-j8h acceptance test: file uploads routed through gc's
+// /extmsg/outbound-file endpoint must (1) succeed, (2) call the
+// adapter's PublishFile path with the file_path passed through, (3)
+// surface in the conversation transcript so other sessions see the
+// file, (4) fan out a peer notification to other transcript members.
+func TestHandleExtMsgOutboundFileRoutesThroughGCRecordsTranscriptAndFansOut(t *testing.T) {
+	fs := newSessionFakeState(t)
+	srv := New(fs)
+
+	services := extmsg.NewServices(fs.cityBeadStore)
+	fs.extmsgSvc = &services
+	registry := extmsg.NewAdapterRegistry()
+	adapter := &testExtMsgAdapter{}
+	registry.Register(extmsg.AdapterKey{Provider: "slack", AccountID: "acct-1"}, adapter)
+	fs.adapterReg = registry
+
+	source := createTestSession(t, fs.cityBeadStore, fs.sp, "Publisher")
+	ref := extmsg.ConversationRef{
+		ScopeID:        "T0B17700WUW",
+		Provider:       "slack",
+		AccountID:      "acct-1",
+		ConversationID: "C0123ROOM01",
+		Kind:           extmsg.ConversationRoom,
+	}
+	caller := extmsg.Caller{Kind: extmsg.CallerController, ID: "test"}
+	now := time.Now().UTC()
+	if _, err := services.Bindings.Bind(context.Background(), caller, extmsg.BindInput{
+		Conversation: ref,
+		SessionID:    source.ID,
+		Now:          now,
+	}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if _, err := services.Transcript.EnsureMembership(context.Background(), extmsg.EnsureMembershipInput{
+		Caller:         caller,
+		Conversation:   ref,
+		SessionID:      "myrig/worker",
+		BackfillPolicy: extmsg.MembershipBackfillSinceJoin,
+		Owner:          extmsg.MembershipOwnerManual,
+		Now:            now,
+	}); err != nil {
+		t.Fatalf("EnsureMembership(peer): %v", err)
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"session_id": source.ID,
+		"conversation": map[string]any{
+			"scope_id":        ref.ScopeID,
+			"provider":        ref.Provider,
+			"account_id":      ref.AccountID,
+			"conversation_id": ref.ConversationID,
+			"kind":            ref.Kind,
+		},
+		"file_path":       "/tmp/sample-report.pdf",
+		"filename":        "sample-report.pdf",
+		"initial_comment": "smoke test report",
+		"title":           "Smoke Test Report",
+	})
+	if err != nil {
+		t.Fatalf("Marshal(body): %v", err)
+	}
+	req := newPostRequest(cityURL(fs, "/extmsg/outbound-file"), strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if len(adapter.publishFileCalls) != 1 {
+		t.Fatalf("publish-file calls = %d, want 1", len(adapter.publishFileCalls))
+	}
+	got := adapter.publishFileCalls[0]
+	if got.FilePath != "/tmp/sample-report.pdf" {
+		t.Errorf("publish-file file_path = %q, want /tmp/sample-report.pdf", got.FilePath)
+	}
+	if got.SessionID != source.ID {
+		t.Errorf("publish-file session_id = %q, want %q", got.SessionID, source.ID)
+	}
+	if got.InitialComment != "smoke test report" {
+		t.Errorf("publish-file initial_comment = %q", got.InitialComment)
+	}
+
+	// Transcript: outbound entry referencing the FileID must be retrievable.
+	entries, err := services.Transcript.List(context.Background(), extmsg.ListTranscriptInput{
+		Caller:       caller,
+		Conversation: ref,
+	})
+	if err != nil {
+		t.Fatalf("Transcript.List: %v", err)
+	}
+	var foundFile bool
+	for _, e := range entries {
+		if e.Kind == extmsg.TranscriptMessageOutbound && e.ProviderMessageID == "discord-file-1" {
+			foundFile = true
+			if len(e.Attachments) != 1 || e.Attachments[0].ProviderID != "discord-file-1" {
+				t.Errorf("transcript attachment = %+v, want ProviderID=discord-file-1", e.Attachments)
+			}
+		}
+	}
+	if !foundFile {
+		t.Fatalf("transcript missing outbound file entry; entries=%+v", entries)
+	}
+
+	// Peer fanout: the named peer member should be materialized and nudged.
+	var peerID string
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		peerID, err = session.ResolveSessionID(fs.cityBeadStore, "myrig/worker")
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("peer session not materialized: %v", err)
+	}
+	peerBead, err := fs.cityBeadStore.Get(peerID)
+	if err != nil {
+		t.Fatalf("Get(peer): %v", err)
+	}
+	peerSessionName := peerBead.Metadata["session_name"]
+	peerNudges := 0
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		peerNudges = 0
+		for _, call := range fs.sp.Calls {
+			if call.Method == "Nudge" && call.Name == peerSessionName && strings.Contains(call.Message, "smoke test report") {
+				peerNudges++
+			}
+		}
+		if peerNudges == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if peerNudges != 1 {
+		t.Fatalf("peer file-nudge count = %d, want 1; calls=%#v", peerNudges, fs.sp.Calls)
+	}
+}
+
+// TestHandleExtMsgOutboundFileRequiresFilePath enforces the minLength
+// validation on file_path: an empty string must be rejected at the
+// schema layer (422) and never reach the adapter.
+func TestHandleExtMsgOutboundFileRequiresFilePath(t *testing.T) {
+	fs := newSessionFakeState(t)
+	srv := New(fs)
+
+	services := extmsg.NewServices(fs.cityBeadStore)
+	fs.extmsgSvc = &services
+	registry := extmsg.NewAdapterRegistry()
+	adapter := &testExtMsgAdapter{}
+	registry.Register(extmsg.AdapterKey{Provider: "slack", AccountID: "acct-1"}, adapter)
+	fs.adapterReg = registry
+
+	body, err := json.Marshal(map[string]any{
+		"session_id": "sess-1",
+		"conversation": map[string]any{
+			"scope_id":        "T0B17700WUW",
+			"provider":        "slack",
+			"account_id":      "acct-1",
+			"conversation_id": "C0123ROOM01",
+			"kind":            extmsg.ConversationRoom,
+		},
+		"file_path": "",
+	})
+	if err != nil {
+		t.Fatalf("Marshal(body): %v", err)
+	}
+	req := newPostRequest(cityURL(fs, "/extmsg/outbound-file"), strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code/100 != 4 {
+		t.Fatalf("status = %d, want 4xx; body: %s", rec.Code, rec.Body.String())
+	}
+	if len(adapter.publishFileCalls) != 0 {
+		t.Fatalf("adapter received %d calls, want 0 (validation should reject before dispatch)", len(adapter.publishFileCalls))
+	}
+}
+
+// TestHandleExtMsgOutboundFileRejectsAdapterWithoutFileSupport ensures
+// that registering an adapter that lacks the FileTransportAdapter
+// capability surfaces ErrAdapterUnsupported (422), not a panic or a
+// silent success.
+func TestHandleExtMsgOutboundFileRejectsAdapterWithoutFileSupport(t *testing.T) {
+	fs := newSessionFakeState(t)
+	srv := New(fs)
+
+	services := extmsg.NewServices(fs.cityBeadStore)
+	fs.extmsgSvc = &services
+	registry := extmsg.NewAdapterRegistry()
+	registry.Register(extmsg.AdapterKey{Provider: "slack", AccountID: "acct-1"}, newTestExtMsgAdapterNoFile())
+	fs.adapterReg = registry
+
+	source := createTestSession(t, fs.cityBeadStore, fs.sp, "Publisher")
+	ref := extmsg.ConversationRef{
+		ScopeID:        "T0B17700WUW",
+		Provider:       "slack",
+		AccountID:      "acct-1",
+		ConversationID: "C0123ROOM01",
+		Kind:           extmsg.ConversationRoom,
+	}
+	caller := extmsg.Caller{Kind: extmsg.CallerController, ID: "test"}
+	if _, err := services.Bindings.Bind(context.Background(), caller, extmsg.BindInput{
+		Conversation: ref,
+		SessionID:    source.ID,
+		Now:          time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"session_id": source.ID,
+		"conversation": map[string]any{
+			"scope_id":        ref.ScopeID,
+			"provider":        ref.Provider,
+			"account_id":      ref.AccountID,
+			"conversation_id": ref.ConversationID,
+			"kind":            ref.Kind,
+		},
+		"file_path": "/tmp/anything.bin",
+	})
+	req := newPostRequest(cityURL(fs, "/extmsg/outbound-file"), strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusUnprocessableEntity, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "does not support file uploads") {
+		t.Errorf("error body = %q, want mention of unsupported file uploads", rec.Body.String())
 	}
 }

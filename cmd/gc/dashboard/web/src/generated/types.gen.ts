@@ -864,6 +864,41 @@ export type ExtMsgInboundInputBody = {
     provider?: string;
 };
 
+export type ExtMsgOutboundFileInputBody = {
+    /**
+     * Target conversation.
+     */
+    conversation?: ConversationRef;
+    /**
+     * Local filesystem path readable by the adapter.
+     */
+    file_path: string;
+    /**
+     * Override displayed filename. Defaults to basename(file_path) on the adapter side.
+     */
+    filename?: string;
+    /**
+     * Idempotency key.
+     */
+    idempotency_key?: string;
+    /**
+     * Comment posted alongside the file; treated as the message body for threading.
+     */
+    initial_comment?: string;
+    /**
+     * Message ID to thread under.
+     */
+    reply_to_message_id?: string;
+    /**
+     * Session ID.
+     */
+    session_id: string;
+    /**
+     * Display title.
+     */
+    title?: string;
+};
+
 export type ExtMsgOutboundInputBody = {
     /**
      * Target conversation.
@@ -1724,6 +1759,12 @@ export type OutboundEventPayload = {
     session: string;
 };
 
+export type OutboundFileResult = {
+    DeliveryContext: DeliveryContextRecord;
+    Receipt: PublishFileReceipt;
+    TranscriptEntry: ConversationTranscriptRecord;
+};
+
 export type OutboundResult = {
     DeliveryContext: DeliveryContextRecord;
     Receipt: PublishReceipt;
@@ -2071,6 +2112,17 @@ export type ProviderUpdateInputBody = {
      * Milliseconds to wait before probing readiness.
      */
     ready_delay_ms?: number;
+};
+
+export type PublishFileReceipt = {
+    conversation: ConversationRef;
+    delivered: boolean;
+    failure_kind: string;
+    file_id: string;
+    metadata: {
+        [key: string]: string;
+    };
+    retry_after: number;
 };
 
 export type PublishReceipt = {
@@ -6635,6 +6687,42 @@ export type PostV0CityByCityNameExtmsgOutboundResponses = {
 };
 
 export type PostV0CityByCityNameExtmsgOutboundResponse = PostV0CityByCityNameExtmsgOutboundResponses[keyof PostV0CityByCityNameExtmsgOutboundResponses];
+
+export type PostV0CityByCityNameExtmsgOutboundFileData = {
+    body: ExtMsgOutboundFileInputBody;
+    headers: {
+        /**
+         * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+         */
+        'X-GC-Request': string;
+    };
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/extmsg/outbound-file';
+};
+
+export type PostV0CityByCityNameExtmsgOutboundFileErrors = {
+    /**
+     * Error
+     */
+    default: ErrorModel;
+};
+
+export type PostV0CityByCityNameExtmsgOutboundFileError = PostV0CityByCityNameExtmsgOutboundFileErrors[keyof PostV0CityByCityNameExtmsgOutboundFileErrors];
+
+export type PostV0CityByCityNameExtmsgOutboundFileResponses = {
+    /**
+     * OK
+     */
+    200: OutboundFileResult;
+};
+
+export type PostV0CityByCityNameExtmsgOutboundFileResponse = PostV0CityByCityNameExtmsgOutboundFileResponses[keyof PostV0CityByCityNameExtmsgOutboundFileResponses];
 
 export type DeleteV0CityByCityNameExtmsgParticipantsData = {
     body: ExtMsgParticipantRemoveInputBody;

@@ -1,0 +1,160 @@
+"""Tests for slack upload's gc-vs-adapter routing path.
+
+Mirror of ``test_slack_chat_reply_current``: by default ``gc slack
+upload`` routes through gc's ``/extmsg/outbound-file`` so transcript
+recording + peer fanout fire. ``--via adapter`` is preserved as the
+diagnostic path that hits the local adapter directly.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import sys
+from typing import Any
+
+import pytest
+
+PACK_DIR = pathlib.Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = PACK_DIR / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    monkeypatch.setenv("GC_CITY_NAME", "test-city")
+    monkeypatch.setenv("GC_CITY_PATH", str(tmp_path))
+    monkeypatch.setenv("GC_API_BASE_URL", "http://127.0.0.1:8372")
+    monkeypatch.setenv("SLACK_WORKSPACE_ID", "T0TESTWS")
+    monkeypatch.setenv("GC_SESSION_ID", "gc-test-session")
+    monkeypatch.delenv("GC_SLACK_ADAPTER_ENV", raising=False)
+
+
+def _import_modules():
+    for name in ("slack_chat_upload", "slack_intake_common"):
+        sys.modules.pop(name, None)
+    import slack_intake_common  # type: ignore
+    import slack_chat_upload  # type: ignore
+    return slack_chat_upload, slack_intake_common
+
+
+def _fake_binding() -> dict[str, str]:
+    return {
+        "scope_id": "test-city",
+        "provider": "slack",
+        "account_id": "T0TESTWS",
+        "conversation_id": "C0123ROOM",
+        "kind": "room",
+    }
+
+
+def _make_file(tmp_path: pathlib.Path) -> pathlib.Path:
+    p = tmp_path / "report.txt"
+    p.write_text("payload bytes", encoding="utf-8")
+    return p
+
+
+def test_default_via_routes_through_gc_outbound_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upload, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        captured["method"] = method
+        captured["url"] = url
+        captured["body"] = body
+        captured["csrf"] = csrf
+        return {"Receipt": {"Delivered": True, "FileID": "F123"}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(common, "look_up_binding", lambda _sid: _fake_binding())
+
+    file_path = _make_file(tmp_path)
+    exit_code = upload.main([
+        "--file", str(file_path),
+        "--session", "gc-test-session",
+        "--initial-comment", "hi peers",
+    ])
+    assert exit_code == 0
+    assert captured["method"] == "POST"
+    assert captured["url"] == (
+        "http://127.0.0.1:8372/v0/city/test-city/extmsg/outbound-file"
+    )
+    assert captured["csrf"] is True
+    body = captured["body"]
+    assert body["session_id"] == "gc-test-session"
+    assert body["conversation"]["conversation_id"] == "C0123ROOM"
+    assert body["file_path"] == str(file_path.resolve())
+    assert body["initial_comment"] == "hi peers"
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["via"] == "gc"
+
+
+def test_via_adapter_keeps_direct_adapter_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upload, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        captured["method"] = method
+        captured["url"] = url
+        captured["body"] = body
+        captured["csrf"] = csrf
+        return {"delivered": True, "file_id": "F999"}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(common, "look_up_binding", lambda _sid: _fake_binding())
+
+    file_path = _make_file(tmp_path)
+    exit_code = upload.main([
+        "--file", str(file_path),
+        "--session", "gc-test-session",
+        "--via", "adapter",
+    ])
+    assert exit_code == 0
+    assert captured["url"].endswith("/publish-file")
+    # No /extmsg/ prefix — adapter-direct path bypasses gc entirely.
+    assert "/extmsg/" not in captured["url"]
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["via"] == "adapter"
+
+
+def test_thread_ts_and_idempotency_propagate_through_gc_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    upload, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        captured["body"] = body
+        return {"Receipt": {"Delivered": True, "FileID": "F1"}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(common, "look_up_binding", lambda _sid: _fake_binding())
+
+    file_path = _make_file(tmp_path)
+    upload.main([
+        "--file", str(file_path),
+        "--session", "gc-test-session",
+        "--thread-ts", "1700000.000100",
+        "--idempotency-key", "up-42",
+        "--title", "Run 7",
+        "--filename", "out.txt",
+    ])
+    body = captured["body"]
+    assert body["reply_to_message_id"] == "1700000.000100"
+    assert body["idempotency_key"] == "up-42"
+    assert body["title"] == "Run 7"
+    assert body["filename"] == "out.txt"

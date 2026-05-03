@@ -209,6 +209,47 @@ type PublishReceipt struct {
 // ErrAdapterUnsupported is returned when the adapter does not support the requested operation.
 var ErrAdapterUnsupported = errors.New("adapter unsupported")
 
+// PublishFileRequest is a request to publish a file to an external
+// conversation. It mirrors PublishRequest in shape but adds the file
+// payload fields used by Slack-style file uploads (see
+// `examples/slack-pack/adapter` /publish-file).
+//
+// FilePath is interpreted on the adapter side: the gc-routed flow
+// passes the path through unchanged because gc and the supervised
+// adapter share a filesystem. Streaming bytes through gc would force
+// large-file buffering and is intentionally avoided; gc-routing adds
+// transcript + peer fanout without taking ownership of the bytes.
+//
+// JSON tags follow the same snake_case contract as PublishRequest. The
+// out-of-process adapter binary parses these keys directly; see
+// `examples/slack-pack/adapter/main.go publishFileRequest`.
+type PublishFileRequest struct {
+	SessionID        string            `json:"session_id,omitempty"`
+	Conversation     ConversationRef   `json:"conversation"`
+	FilePath         string            `json:"file_path"`
+	Filename         string            `json:"filename,omitempty"`
+	Title            string            `json:"title,omitempty"`
+	InitialComment   string            `json:"initial_comment,omitempty"`
+	ReplyToMessageID string            `json:"reply_to_message_id,omitempty"`
+	IdempotencyKey   string            `json:"idempotency_key,omitempty"`
+	Metadata         map[string]string `json:"metadata,omitempty"`
+}
+
+// PublishFileReceipt is the result of a publish-file attempt. FileID is
+// the canonical entity reference produced by the adapter (e.g. a Slack
+// `file_id`); it stands in for a chat MessageID since file uploads do
+// not produce a chat ts on Slack.
+//
+// JSON tags follow the same snake_case contract as PublishReceipt.
+type PublishFileReceipt struct {
+	FileID       string             `json:"file_id"`
+	Conversation ConversationRef    `json:"conversation"`
+	Delivered    bool               `json:"delivered"`
+	FailureKind  PublishFailureKind `json:"failure_kind"`
+	RetryAfter   time.Duration      `json:"retry_after"`
+	Metadata     map[string]string  `json:"metadata"`
+}
+
 // TranscriptMessageKind classifies a transcript entry as inbound or outbound.
 type TranscriptMessageKind string
 
@@ -538,4 +579,13 @@ type TransportAdapter interface {
 	VerifyAndNormalizeInbound(ctx context.Context, payload InboundPayload) (*ExternalInboundMessage, error)
 	Publish(ctx context.Context, req PublishRequest) (*PublishReceipt, error)
 	EnsureChildConversation(ctx context.Context, ref ConversationRef, label string) (*ConversationRef, error)
+}
+
+// FileTransportAdapter is an optional capability implemented by adapters
+// that support file uploads. HandleOutboundFile type-asserts the adapter
+// looked up from the registry against this interface and returns
+// ErrAdapterUnsupported if the assertion fails. Implementing it implies
+// AdapterCapabilities.SupportsAttachments is true.
+type FileTransportAdapter interface {
+	PublishFile(ctx context.Context, req PublishFileRequest) (*PublishFileReceipt, error)
 }

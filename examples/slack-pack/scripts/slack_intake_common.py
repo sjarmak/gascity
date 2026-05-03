@@ -626,6 +626,54 @@ def publish_to_channel_via_adapter(
         raise AdapterError(f"POST {publish_url}: response is not JSON: {raw!r}") from exc
 
 
+def upload_via_gc_outbound_file(
+    *,
+    session_id: str,
+    scope_id: str,
+    provider: str,
+    account_id: str,
+    conversation_id: str,
+    kind: str,
+    file_path: str,
+    filename: str = "",
+    initial_comment: str = "",
+    thread_ts: str = "",
+    title: str = "",
+    idempotency_key: str = "",
+) -> dict[str, Any]:
+    """Upload a file through gc's /extmsg/outbound-file endpoint.
+
+    Matches ``publish_via_gc_outbound`` but for file payloads. gc resolves
+    the binding, hands off to the adapter via the FileTransportAdapter
+    interface, records the outbound transcript entry, and fans out to
+    other sessions bound to the same conversation. The file body is not
+    streamed through gc — ``file_path`` is interpreted on the adapter
+    side (gc and the adapter share a filesystem).
+    """
+    body: dict[str, Any] = {
+        "session_id": session_id,
+        "conversation": {
+            "scope_id": scope_id,
+            "provider": provider,
+            "account_id": account_id,
+            "conversation_id": conversation_id,
+            "kind": kind,
+        },
+        "file_path": file_path,
+    }
+    if filename:
+        body["filename"] = filename
+    if initial_comment:
+        body["initial_comment"] = initial_comment
+    if thread_ts:
+        body["reply_to_message_id"] = thread_ts
+    if title:
+        body["title"] = title
+    if idempotency_key:
+        body["idempotency_key"] = idempotency_key
+    return gc_post("/extmsg/outbound-file", body)
+
+
 def upload_via_adapter(
     *,
     session_id: str,
@@ -676,27 +724,10 @@ def upload_via_adapter(
         body["title"] = title
     if idempotency_key:
         body["idempotency_key"] = idempotency_key
-    headers = _adapter_csrf_headers()
-    req = urllib.request.Request(
-        upload_url,
-        data=json.dumps(body).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise AdapterError(f"POST {upload_url} -> {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise AdapterError(f"POST {upload_url} failed: {exc}") from exc
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise AdapterError(f"POST {upload_url}: response is not JSON: {raw!r}") from exc
+        return _request("POST", upload_url, body, timeout=60.0)
+    except GCAPIError as exc:
+        raise AdapterError(str(exc)) from exc
 
 
 def look_up_binding(session_id: str) -> dict[str, Any] | None:

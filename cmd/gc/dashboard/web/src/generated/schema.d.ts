@@ -691,6 +691,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v0/city/{cityName}/extmsg/outbound-file": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Post v0 city by city name extmsg outbound file */
+        post: operations["post-v0-city-by-city-name-extmsg-outbound-file"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v0/city/{cityName}/extmsg/participants": {
         parameters: {
             query?: never;
@@ -2576,6 +2593,24 @@ export interface components {
             /** @description Provider name for raw payloads (required when message is absent). */
             provider?: string;
         };
+        ExtMsgOutboundFileInputBody: {
+            /** @description Target conversation. */
+            conversation?: components["schemas"]["ConversationRef"];
+            /** @description Local filesystem path readable by the adapter. */
+            file_path: string;
+            /** @description Override displayed filename. Defaults to basename(file_path) on the adapter side. */
+            filename?: string;
+            /** @description Idempotency key. */
+            idempotency_key?: string;
+            /** @description Comment posted alongside the file; treated as the message body for threading. */
+            initial_comment?: string;
+            /** @description Message ID to thread under. */
+            reply_to_message_id?: string;
+            /** @description Session ID. */
+            session_id: string;
+            /** @description Display title. */
+            title?: string;
+        };
         ExtMsgOutboundInputBody: {
             /** @description Target conversation. */
             conversation?: components["schemas"]["ConversationRef"];
@@ -3201,6 +3236,11 @@ export interface components {
             provider: string;
             session: string;
         };
+        OutboundFileResult: {
+            DeliveryContext: components["schemas"]["DeliveryContextRecord"];
+            Receipt: components["schemas"]["PublishFileReceipt"];
+            TranscriptEntry: components["schemas"]["ConversationTranscriptRecord"];
+        };
         OutboundResult: {
             DeliveryContext: components["schemas"]["DeliveryContextRecord"];
             Receipt: components["schemas"]["PublishReceipt"];
@@ -3461,6 +3501,17 @@ export interface components {
              * @description Milliseconds to wait before probing readiness.
              */
             ready_delay_ms?: number;
+        };
+        PublishFileReceipt: {
+            conversation: components["schemas"]["ConversationRef"];
+            delivered: boolean;
+            failure_kind: string;
+            file_id: string;
+            metadata: {
+                [key: string]: string;
+            };
+            /** Format: int64 */
+            retry_after: number;
         };
         PublishReceipt: {
             conversation: components["schemas"]["ConversationRef"];
@@ -7999,6 +8050,47 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["OutboundResult"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    "X-GC-Request-Id": components["headers"]["X-GC-Request-Id"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ErrorModel"];
+                };
+            };
+        };
+    };
+    "post-v0-city-by-city-name-extmsg-outbound-file": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks. */
+                "X-GC-Request": string;
+            };
+            path: {
+                /** @description City name. */
+                cityName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExtMsgOutboundFileInputBody"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    "X-GC-Request-Id": components["headers"]["X-GC-Request-Id"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OutboundFileResult"];
                 };
             };
             /** @description Error */

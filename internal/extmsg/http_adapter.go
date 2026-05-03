@@ -115,6 +115,86 @@ func (a *HTTPAdapter) Publish(ctx context.Context, req PublishRequest) (*Publish
 	return &receipt, nil
 }
 
+// PublishFile forwards a publish-file request to the adapter's callback
+// URL. The wire shape is documented on PublishFileRequest /
+// PublishFileReceipt; failure kinds mirror Publish so the calling code
+// can use a single classification path.
+func (a *HTTPAdapter) PublishFile(ctx context.Context, req PublishFileRequest) (*PublishFileReceipt, error) {
+	if a.callbackURL == "" {
+		return &PublishFileReceipt{
+			Conversation: req.Conversation,
+			Delivered:    false,
+			FailureKind:  PublishFailureUnsupported,
+		}, nil
+	}
+	if !a.capabilities.SupportsAttachments {
+		return &PublishFileReceipt{
+			Conversation: req.Conversation,
+			Delivered:    false,
+			FailureKind:  PublishFailureUnsupported,
+		}, nil
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling publish-file request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.callbackURL+"/publish-file", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("creating HTTP request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.client.Do(httpReq)
+	if err != nil {
+		return &PublishFileReceipt{
+			Conversation: req.Conversation,
+			Delivered:    false,
+			FailureKind:  PublishFailureTransient,
+		}, nil
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return &PublishFileReceipt{
+			Conversation: req.Conversation,
+			Delivered:    false,
+			FailureKind:  PublishFailureTransient,
+		}, nil
+	}
+
+	if resp.StatusCode >= 400 {
+		kind := PublishFailureTransient
+		switch {
+		case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+			kind = PublishFailureAuth
+		case resp.StatusCode == http.StatusNotFound:
+			kind = PublishFailureNotFound
+		case resp.StatusCode == http.StatusTooManyRequests:
+			kind = PublishFailureRateLimited
+		case resp.StatusCode >= 400 && resp.StatusCode < 500:
+			kind = PublishFailurePermanent
+		}
+		return &PublishFileReceipt{
+			Conversation: req.Conversation,
+			Delivered:    false,
+			FailureKind:  kind,
+		}, nil
+	}
+
+	var receipt PublishFileReceipt
+	if err := json.Unmarshal(respBody, &receipt); err != nil {
+		return &PublishFileReceipt{
+			Conversation: req.Conversation,
+			Delivered:    false,
+			FailureKind:  PublishFailureTransient,
+		}, nil
+	}
+	return &receipt, nil
+}
+
 // EnsureChildConversation forwards a child conversation request to the
 // adapter's callback URL.
 func (a *HTTPAdapter) EnsureChildConversation(ctx context.Context, ref ConversationRef, label string) (*ConversationRef, error) {

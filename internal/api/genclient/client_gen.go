@@ -965,6 +965,32 @@ type ExtMsgInboundInputBody struct {
 	Provider *string `json:"provider,omitempty"`
 }
 
+// ExtMsgOutboundFileInputBody defines model for ExtMsgOutboundFileInputBody.
+type ExtMsgOutboundFileInputBody struct {
+	Conversation *ConversationRef `json:"conversation,omitempty"`
+
+	// FilePath Local filesystem path readable by the adapter.
+	FilePath string `json:"file_path"`
+
+	// Filename Override displayed filename. Defaults to basename(file_path) on the adapter side.
+	Filename *string `json:"filename,omitempty"`
+
+	// IdempotencyKey Idempotency key.
+	IdempotencyKey *string `json:"idempotency_key,omitempty"`
+
+	// InitialComment Comment posted alongside the file; treated as the message body for threading.
+	InitialComment *string `json:"initial_comment,omitempty"`
+
+	// ReplyToMessageId Message ID to thread under.
+	ReplyToMessageId *string `json:"reply_to_message_id,omitempty"`
+
+	// SessionId Session ID.
+	SessionId string `json:"session_id"`
+
+	// Title Display title.
+	Title *string `json:"title,omitempty"`
+}
+
 // ExtMsgOutboundInputBody defines model for ExtMsgOutboundInputBody.
 type ExtMsgOutboundInputBody struct {
 	Conversation *ConversationRef `json:"conversation,omitempty"`
@@ -1720,6 +1746,13 @@ type OutboundEventPayload struct {
 	Session        string `json:"session"`
 }
 
+// OutboundFileResult defines model for OutboundFileResult.
+type OutboundFileResult struct {
+	DeliveryContext DeliveryContextRecord        `json:"DeliveryContext"`
+	Receipt         PublishFileReceipt           `json:"Receipt"`
+	TranscriptEntry ConversationTranscriptRecord `json:"TranscriptEntry"`
+}
+
 // OutboundResult defines model for OutboundResult.
 type OutboundResult struct {
 	DeliveryContext DeliveryContextRecord        `json:"DeliveryContext"`
@@ -2014,6 +2047,16 @@ type ProviderUpdateInputBody struct {
 
 	// ReadyDelayMs Milliseconds to wait before probing readiness.
 	ReadyDelayMs *int64 `json:"ready_delay_ms,omitempty"`
+}
+
+// PublishFileReceipt defines model for PublishFileReceipt.
+type PublishFileReceipt struct {
+	Conversation ConversationRef   `json:"conversation"`
+	Delivered    bool              `json:"delivered"`
+	FailureKind  string            `json:"failure_kind"`
+	FileId       string            `json:"file_id"`
+	Metadata     map[string]string `json:"metadata"`
+	RetryAfter   int64             `json:"retry_after"`
 }
 
 // PublishReceipt defines model for PublishReceipt.
@@ -4232,6 +4275,12 @@ type PostV0CityByCityNameExtmsgOutboundParams struct {
 	XGCRequest string `json:"X-GC-Request"`
 }
 
+// PostV0CityByCityNameExtmsgOutboundFileParams defines parameters for PostV0CityByCityNameExtmsgOutboundFile.
+type PostV0CityByCityNameExtmsgOutboundFileParams struct {
+	// XGCRequest Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+	XGCRequest string `json:"X-GC-Request"`
+}
+
 // DeleteV0CityByCityNameExtmsgParticipantsParams defines parameters for DeleteV0CityByCityNameExtmsgParticipants.
 type DeleteV0CityByCityNameExtmsgParticipantsParams struct {
 	// XGCRequest Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
@@ -4870,6 +4919,9 @@ type PostV0CityByCityNameExtmsgInboundJSONRequestBody = ExtMsgInboundInputBody
 
 // PostV0CityByCityNameExtmsgOutboundJSONRequestBody defines body for PostV0CityByCityNameExtmsgOutbound for application/json ContentType.
 type PostV0CityByCityNameExtmsgOutboundJSONRequestBody = ExtMsgOutboundInputBody
+
+// PostV0CityByCityNameExtmsgOutboundFileJSONRequestBody defines body for PostV0CityByCityNameExtmsgOutboundFile for application/json ContentType.
+type PostV0CityByCityNameExtmsgOutboundFileJSONRequestBody = ExtMsgOutboundFileInputBody
 
 // DeleteV0CityByCityNameExtmsgParticipantsJSONRequestBody defines body for DeleteV0CityByCityNameExtmsgParticipants for application/json ContentType.
 type DeleteV0CityByCityNameExtmsgParticipantsJSONRequestBody = ExtMsgParticipantRemoveInputBody
@@ -8565,6 +8617,11 @@ type ClientInterface interface {
 
 	PostV0CityByCityNameExtmsgOutbound(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgOutboundParams, body PostV0CityByCityNameExtmsgOutboundJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// PostV0CityByCityNameExtmsgOutboundFileWithBody request with any body
+	PostV0CityByCityNameExtmsgOutboundFileWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgOutboundFileParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	PostV0CityByCityNameExtmsgOutboundFile(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgOutboundFileParams, body PostV0CityByCityNameExtmsgOutboundFileJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// DeleteV0CityByCityNameExtmsgParticipantsWithBody request with any body
 	DeleteV0CityByCityNameExtmsgParticipantsWithBody(ctx context.Context, cityName string, params *DeleteV0CityByCityNameExtmsgParticipantsParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -9741,6 +9798,30 @@ func (c *Client) PostV0CityByCityNameExtmsgOutboundWithBody(ctx context.Context,
 
 func (c *Client) PostV0CityByCityNameExtmsgOutbound(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgOutboundParams, body PostV0CityByCityNameExtmsgOutboundJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewPostV0CityByCityNameExtmsgOutboundRequest(c.Server, cityName, params, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PostV0CityByCityNameExtmsgOutboundFileWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgOutboundFileParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV0CityByCityNameExtmsgOutboundFileRequestWithBody(c.Server, cityName, params, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PostV0CityByCityNameExtmsgOutboundFile(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgOutboundFileParams, body PostV0CityByCityNameExtmsgOutboundFileJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV0CityByCityNameExtmsgOutboundFileRequest(c.Server, cityName, params, body)
 	if err != nil {
 		return nil, err
 	}
@@ -14420,6 +14501,66 @@ func NewPostV0CityByCityNameExtmsgOutboundRequestWithBody(server string, cityNam
 	}
 
 	operationPath := fmt.Sprintf("/v0/city/%s/extmsg/outbound", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	if params != nil {
+
+		var headerParam0 string
+
+		headerParam0, err = runtime.StyleParamWithOptions("simple", false, "X-GC-Request", params.XGCRequest, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("X-GC-Request", headerParam0)
+
+	}
+
+	return req, nil
+}
+
+// NewPostV0CityByCityNameExtmsgOutboundFileRequest calls the generic PostV0CityByCityNameExtmsgOutboundFile builder with application/json body
+func NewPostV0CityByCityNameExtmsgOutboundFileRequest(server string, cityName string, params *PostV0CityByCityNameExtmsgOutboundFileParams, body PostV0CityByCityNameExtmsgOutboundFileJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewPostV0CityByCityNameExtmsgOutboundFileRequestWithBody(server, cityName, params, "application/json", bodyReader)
+}
+
+// NewPostV0CityByCityNameExtmsgOutboundFileRequestWithBody generates requests for PostV0CityByCityNameExtmsgOutboundFile with any type of body
+func NewPostV0CityByCityNameExtmsgOutboundFileRequestWithBody(server string, cityName string, params *PostV0CityByCityNameExtmsgOutboundFileParams, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cityName", cityName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v0/city/%s/extmsg/outbound-file", pathParam0)
 	if operationPath[0] == '/' {
 		operationPath = "." + operationPath
 	}
@@ -20394,6 +20535,11 @@ type ClientWithResponsesInterface interface {
 
 	PostV0CityByCityNameExtmsgOutboundWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgOutboundParams, body PostV0CityByCityNameExtmsgOutboundJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameExtmsgOutboundResponse, error)
 
+	// PostV0CityByCityNameExtmsgOutboundFileWithBodyWithResponse request with any body
+	PostV0CityByCityNameExtmsgOutboundFileWithBodyWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgOutboundFileParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameExtmsgOutboundFileResponse, error)
+
+	PostV0CityByCityNameExtmsgOutboundFileWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgOutboundFileParams, body PostV0CityByCityNameExtmsgOutboundFileJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameExtmsgOutboundFileResponse, error)
+
 	// DeleteV0CityByCityNameExtmsgParticipantsWithBodyWithResponse request with any body
 	DeleteV0CityByCityNameExtmsgParticipantsWithBodyWithResponse(ctx context.Context, cityName string, params *DeleteV0CityByCityNameExtmsgParticipantsParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*DeleteV0CityByCityNameExtmsgParticipantsResponse, error)
 
@@ -21937,6 +22083,29 @@ func (r PostV0CityByCityNameExtmsgOutboundResponse) Status() string {
 
 // StatusCode returns HTTPResponse.StatusCode
 func (r PostV0CityByCityNameExtmsgOutboundResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type PostV0CityByCityNameExtmsgOutboundFileResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	JSON200                       *OutboundFileResult
+	ApplicationproblemJSONDefault *ErrorModel
+}
+
+// Status returns HTTPResponse.Status
+func (r PostV0CityByCityNameExtmsgOutboundFileResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PostV0CityByCityNameExtmsgOutboundFileResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -24624,6 +24793,23 @@ func (c *ClientWithResponses) PostV0CityByCityNameExtmsgOutboundWithResponse(ctx
 		return nil, err
 	}
 	return ParsePostV0CityByCityNameExtmsgOutboundResponse(rsp)
+}
+
+// PostV0CityByCityNameExtmsgOutboundFileWithBodyWithResponse request with arbitrary body returning *PostV0CityByCityNameExtmsgOutboundFileResponse
+func (c *ClientWithResponses) PostV0CityByCityNameExtmsgOutboundFileWithBodyWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgOutboundFileParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameExtmsgOutboundFileResponse, error) {
+	rsp, err := c.PostV0CityByCityNameExtmsgOutboundFileWithBody(ctx, cityName, params, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV0CityByCityNameExtmsgOutboundFileResponse(rsp)
+}
+
+func (c *ClientWithResponses) PostV0CityByCityNameExtmsgOutboundFileWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgOutboundFileParams, body PostV0CityByCityNameExtmsgOutboundFileJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameExtmsgOutboundFileResponse, error) {
+	rsp, err := c.PostV0CityByCityNameExtmsgOutboundFile(ctx, cityName, params, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV0CityByCityNameExtmsgOutboundFileResponse(rsp)
 }
 
 // DeleteV0CityByCityNameExtmsgParticipantsWithBodyWithResponse request with arbitrary body returning *DeleteV0CityByCityNameExtmsgParticipantsResponse
@@ -27339,6 +27525,39 @@ func ParsePostV0CityByCityNameExtmsgOutboundResponse(rsp *http.Response) (*PostV
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
 		var dest OutboundResult
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParsePostV0CityByCityNameExtmsgOutboundFileResponse parses an HTTP response from a PostV0CityByCityNameExtmsgOutboundFileWithResponse call
+func ParsePostV0CityByCityNameExtmsgOutboundFileResponse(rsp *http.Response) (*PostV0CityByCityNameExtmsgOutboundFileResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PostV0CityByCityNameExtmsgOutboundFileResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest OutboundFileResult
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}

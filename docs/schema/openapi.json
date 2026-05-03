@@ -2225,6 +2225,50 @@
         },
         "type": "object"
       },
+      "ExtMsgOutboundFileInputBody": {
+        "additionalProperties": false,
+        "properties": {
+          "conversation": {
+            "$ref": "#/components/schemas/ConversationRef",
+            "description": "Target conversation."
+          },
+          "file_path": {
+            "description": "Local filesystem path readable by the adapter.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "filename": {
+            "description": "Override displayed filename. Defaults to basename(file_path) on the adapter side.",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "description": "Idempotency key.",
+            "type": "string"
+          },
+          "initial_comment": {
+            "description": "Comment posted alongside the file; treated as the message body for threading.",
+            "type": "string"
+          },
+          "reply_to_message_id": {
+            "description": "Message ID to thread under.",
+            "type": "string"
+          },
+          "session_id": {
+            "description": "Session ID.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": {
+            "description": "Display title.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "file_path"
+        ],
+        "type": "object"
+      },
       "ExtMsgOutboundInputBody": {
         "additionalProperties": false,
         "properties": {
@@ -4281,6 +4325,26 @@
         ],
         "type": "object"
       },
+      "OutboundFileResult": {
+        "additionalProperties": false,
+        "properties": {
+          "DeliveryContext": {
+            "$ref": "#/components/schemas/DeliveryContextRecord"
+          },
+          "Receipt": {
+            "$ref": "#/components/schemas/PublishFileReceipt"
+          },
+          "TranscriptEntry": {
+            "$ref": "#/components/schemas/ConversationTranscriptRecord"
+          }
+        },
+        "required": [
+          "Receipt",
+          "DeliveryContext",
+          "TranscriptEntry"
+        ],
+        "type": "object"
+      },
       "OutboundResult": {
         "additionalProperties": false,
         "properties": {
@@ -5123,6 +5187,42 @@
             "type": "integer"
           }
         },
+        "type": "object"
+      },
+      "PublishFileReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "conversation": {
+            "$ref": "#/components/schemas/ConversationRef"
+          },
+          "delivered": {
+            "type": "boolean"
+          },
+          "failure_kind": {
+            "type": "string"
+          },
+          "file_id": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "retry_after": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "file_id",
+          "conversation",
+          "delivered",
+          "failure_kind",
+          "retry_after",
+          "metadata"
+        ],
         "type": "object"
       },
       "PublishReceipt": {
@@ -15944,6 +16044,79 @@
           }
         },
         "summary": "Post v0 city by city name extmsg outbound"
+      }
+    },
+    "/v0/city/{cityName}/extmsg/outbound-file": {
+      "post": {
+        "operationId": "post-v0-city-by-city-name-extmsg-outbound-file",
+        "parameters": [
+          {
+            "description": "Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.",
+            "in": "header",
+            "name": "X-GC-Request",
+            "required": true,
+            "schema": {
+              "description": "Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "City name.",
+            "in": "path",
+            "name": "cityName",
+            "required": true,
+            "schema": {
+              "description": "City name.",
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtMsgOutboundFileInputBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutboundFileResult"
+                }
+              }
+            },
+            "description": "OK",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Error",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          }
+        },
+        "summary": "Post v0 city by city name extmsg outbound file"
       }
     },
     "/v0/city/{cityName}/extmsg/participants": {

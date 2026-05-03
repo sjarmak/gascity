@@ -1,7 +1,13 @@
 # gc slack upload
 
-Upload a local file to the Slack channel a session is bound to. Goes
-directly to the local adapter, which handles Slack's three-step
+Upload a local file to the Slack channel a session is bound to. By
+default the upload is routed through gc, mirroring the text-reply
+contract: gc records the upload in the conversation transcript and
+fans out a peer notification to other sessions bound to the same
+room. Pass `--via adapter` to fall back to the legacy direct-to-adapter
+path for diagnostics.
+
+Either way the local adapter handles Slack's three-step
 files-upload-v2 protocol (`files.getUploadURLExternal` →
 `PUT bytes` → `files.completeUploadExternal`).
 
@@ -44,6 +50,9 @@ gc slack upload --file /tmp/raw.csv --filename results.csv --title "Run 42 metri
   session, same logic as `gc slack reply-current`.
 - `--idempotency-key KEY` — caller-supplied idempotency key for
   retries.
+- `--via {gc,adapter}` — routing path. `gc` (default) records the
+  upload in the transcript and fans out to peer sessions; `adapter`
+  bypasses gc for diagnostics only.
 
 ## Required Slack scope
 
@@ -70,12 +79,17 @@ explanatory text — that reply will carry the per-session identity.
 
 1. Resolves the session's active extmsg binding to find the
    target channel id.
-2. Reads the file from the local filesystem.
-3. POSTs `{session_id, conversation, file_path, filename,
-   initial_comment, reply_to_message_id, title}` to the adapter
-   `/publish-file` endpoint.
-4. The adapter handles the three Slack API calls, posts to the
-   channel, and returns a receipt with `{delivered, file_id,
+2. **`--via gc` (default)** — POSTs the file metadata to
+   `/v0/city/{city}/extmsg/outbound-file`. gc verifies the binding,
+   hands off to the adapter via the FileTransportAdapter interface,
+   appends an outbound transcript entry, and emits an
+   `extmsg.outbound` event so peer sessions receive a nudge.
+3. **`--via adapter`** — POSTs `{session_id, conversation, file_path,
+   filename, initial_comment, reply_to_message_id, title}` directly
+   to the adapter's `/publish-file` endpoint. No transcript record,
+   no peer fanout.
+4. Either way, the adapter handles the three Slack API calls, posts
+   to the channel, and returns a receipt with `{delivered, file_id,
    failure_kind, error}`.
 
 ## Examples

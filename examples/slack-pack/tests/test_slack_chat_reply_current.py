@@ -98,7 +98,11 @@ def test_via_adapter_keeps_direct_adapter_path(monkeypatch: pytest.MonkeyPatch) 
     ])
     assert exit_code == 0
     assert captured["url"].endswith("/publish")
-    assert captured["csrf"] is False
+    # gc-5rz Phase A: the supervised adapter is reached via the gc /svc
+    # proxy, which requires X-GC-Request on private mutation endpoints
+    # — so even the adapter-direct path carries csrf=True.
+    assert captured["csrf"] is True
+    assert "/extmsg/" not in captured["url"]
 
 
 def test_idempotency_and_reply_to_propagate(monkeypatch: pytest.MonkeyPatch) -> None:

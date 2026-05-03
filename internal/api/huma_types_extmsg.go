@@ -49,6 +49,31 @@ type ExtMsgOutboundOutput struct {
 	Body extmsg.OutboundResult
 }
 
+// ExtMsgOutboundFileInput is the Huma input for POST /v0/city/{cityName}/extmsg/outbound-file.
+//
+// The file body is not streamed through gc; FilePath is interpreted on
+// the adapter side. gc and the supervised adapter share a filesystem,
+// so passing the path through avoids large-file buffering while still
+// routing transcript and peer-fanout coordination through the gc layer.
+type ExtMsgOutboundFileInput struct {
+	CityScope
+	Body struct {
+		SessionID        string                 `json:"session_id" minLength:"1" doc:"Session ID."`
+		Conversation     extmsg.ConversationRef `json:"conversation,omitempty" doc:"Target conversation."`
+		FilePath         string                 `json:"file_path" minLength:"1" doc:"Local filesystem path readable by the adapter."`
+		Filename         string                 `json:"filename,omitempty" doc:"Override displayed filename. Defaults to basename(file_path) on the adapter side."`
+		Title            string                 `json:"title,omitempty" doc:"Display title."`
+		InitialComment   string                 `json:"initial_comment,omitempty" doc:"Comment posted alongside the file; treated as the message body for threading."`
+		ReplyToMessageID string                 `json:"reply_to_message_id,omitempty" doc:"Message ID to thread under."`
+		IdempotencyKey   string                 `json:"idempotency_key,omitempty" doc:"Idempotency key."`
+	}
+}
+
+// ExtMsgOutboundFileOutput is the Huma output for POST /v0/extmsg/outbound-file.
+type ExtMsgOutboundFileOutput struct {
+	Body extmsg.OutboundFileResult
+}
+
 // ExtMsgBindingListInput is the Huma input for GET /v0/city/{cityName}/extmsg/bindings.
 type ExtMsgBindingListInput struct {
 	CityScope

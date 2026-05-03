@@ -324,6 +324,7 @@ func (sm *SupervisorMux) registerCityRoutes() {
 	// ExtMsg.
 	cityPost(sm, "/extmsg/inbound", (*Server).humaHandleExtMsgInbound)
 	cityPost(sm, "/extmsg/outbound", (*Server).humaHandleExtMsgOutbound)
+	cityPost(sm, "/extmsg/outbound-file", (*Server).humaHandleExtMsgOutboundFile)
 	cityGet(sm, "/extmsg/bindings", (*Server).humaHandleExtMsgBindingList)
 	cityPost(sm, "/extmsg/bind", (*Server).humaHandleExtMsgBind)
 	cityPost(sm, "/extmsg/unbind", (*Server).humaHandleExtMsgUnbind)
