@@ -122,7 +122,7 @@ def main(argv: list[str]) -> int:
             raise SystemExit(
                 f"session {session_id!r} has no inbound to thread under; "
                 "pass --thread-ts <ts> explicitly or omit threading")
-        thread_ts = match
+        thread_ts = match[0]
 
     try:
         if args.via == "adapter":

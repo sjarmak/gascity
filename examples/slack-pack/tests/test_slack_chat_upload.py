@@ -158,3 +158,44 @@ def test_thread_ts_and_idempotency_propagate_through_gc_path(
     assert body["idempotency_key"] == "up-42"
     assert body["title"] == "Run 7"
     assert body["filename"] == "out.txt"
+
+
+def test_thread_current_unwraps_helper_tuple(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Regression for the gc-j8h live-smoke bug.
+
+    `find_latest_inbound_message_id_for_session` returns
+    `tuple[str, dict]`; the upload script must extract `match[0]`
+    rather than passing the whole tuple as `thread_ts`. Without
+    the unpack, gc rejects the request with a 422 because
+    `reply_to_message_id` arrives on the wire as a 2-element list
+    instead of a string.
+    """
+    upload, common = _import_modules()
+    captured: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, body: dict[str, Any] | None = None,
+                     *, csrf: bool = True, timeout: float = 30.0) -> dict[str, Any]:
+        captured["body"] = body
+        return {"Receipt": {"Delivered": True, "FileID": "F2"}}
+
+    monkeypatch.setattr(common, "_request", fake_request)
+    monkeypatch.setattr(common, "look_up_binding", lambda _sid: _fake_binding())
+    monkeypatch.setattr(
+        common,
+        "find_latest_inbound_message_id_for_session",
+        lambda _sid: ("1777779766.848799", _fake_binding()),
+    )
+
+    file_path = _make_file(tmp_path)
+    upload.main([
+        "--file", str(file_path),
+        "--session", "gc-test-session",
+        "--thread-current",
+    ])
+    body = captured["body"]
+    # Critical: a plain string, NOT the (msg_id, conversation) tuple.
+    assert body["reply_to_message_id"] == "1777779766.848799"
+    assert isinstance(body["reply_to_message_id"], str)
