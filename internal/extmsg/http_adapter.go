@@ -64,6 +64,11 @@ func (a *HTTPAdapter) Publish(ctx context.Context, req PublishRequest) (*Publish
 		return nil, fmt.Errorf("creating HTTP request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	// callbackURL routes through gc's /svc proxy when the adapter is
+	// supervised as proxy_process; the proxy enforces CSRF on private
+	// service mutations. Set the header unconditionally — it's
+	// harmless for direct (non-proxied) callback URLs.
+	httpReq.Header.Set("X-GC-Request", "1")
 
 	resp, err := a.client.Do(httpReq)
 	if err != nil {
@@ -145,6 +150,7 @@ func (a *HTTPAdapter) PublishFile(ctx context.Context, req PublishFileRequest) (
 		return nil, fmt.Errorf("creating HTTP request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-GC-Request", "1")
 
 	resp, err := a.client.Do(httpReq)
 	if err != nil {
@@ -215,6 +221,7 @@ func (a *HTTPAdapter) EnsureChildConversation(ctx context.Context, ref Conversat
 		return nil, fmt.Errorf("creating HTTP request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-GC-Request", "1")
 
 	resp, err := a.client.Do(httpReq)
 	if err != nil {
