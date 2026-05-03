@@ -1,15 +1,23 @@
-# Oversight-rig handoff — 2026-05-03 night (gc-kvt + testenv lint fix shipped)
+# Oversight-rig handoff — 2026-05-03 night (gc-kvt + upstream-prep epic kicked off)
 
-> **To the next agent:** earlier today's commit/push session shipped 8 logical commits (gc-g52, gc-cdf, gc-67o, gc-9ha, gc-5rz Phase A cutover, gc-am2, gc-w1h) and brought the working tree clean. **This follow-up session shipped two more (gc-kvt + a testenv lint walker fix) and closed gc-98y.** Branch `feat/oversight-rig-pack` is now at `20b0bb9c`, working tree clean, up to date with `fork/feat/oversight-rig-pack`. `git config core.hooksPath` is now correctly `.githooks` (fixed this session); all three commits ran the full pre-commit pipeline (lint → spec regen → schema regen → make test → dashboard typecheck).
+> **To the next agent:** today shipped a lot. Earlier sessions landed 8 commits (gc-g52, gc-cdf, gc-67o, gc-9ha, gc-5rz Phase A cutover, gc-am2, gc-w1h). This thread added 5 more: gc-kvt (extmsg native SessionID), a testenv lint walker fix that respects nested go.mod boundaries, the `core.hooksPath` restoration, and the first two deliverables under a new upstream-prep epic for shipping slack-pack to gastownhall/gascity-packs (gc-ywe). Branch `feat/oversight-rig-pack` is at `010bc588`, working tree clean, tracking `fork/feat/oversight-rig-pack`.
 
 ## Up next (recommended dispatch)
 
-Active queue (from `bd ready`) — gc-kvt and gc-98y are now closed:
+The new epic **gc-ywe** ("upstream prep: slack-pack v0.1.0 to gascity-packs") tracks the work to share the slack-pack on the upstream packs repo. **Three children remain**, plus the standing bd queue:
 
-1. **gc-28a** P2 — slack-pack: dual adapter binary locations cause stale-deploy on cutover. Tech-debt; build process needs to publish the binary to a single canonical path so cutovers don't run a stale copy.
-2. **gc-a3s** P2 — `orders.overrides` with empty rig silently no-ops on per-rig orders. Owned by `gascity-pr-gc-a3s` worktree (already has fix branch `fix/gc-a3s-orders-overrides-rig-scope` at bf931ccf).
-3. **gc-17z** P2 — verify cos picks up slack-v0 prompt + DM-ack behavior.
-4. **gc-5rz** P2 — slack adapter Phase A absorption (UDS for /publish). Phase A is shipped and live; remaining phases not yet scoped.
+**Upstream-prep epic (gc-ywe — 2/5 done):**
+
+1. **gc-28a** P2 (epic blocker) — slack-pack: dual adapter binary locations cause stale-deploy on cutover. Source currently lives in `examples/oversight-rig/adapter/` (separate Go module `github.com/sjarmak/gc-slack-adapter`); pack expects binary at `./adapter/gc-slack-adapter`. Move source into the pack itself, rename module to `github.com/gastownhall/gascity-packs/slack/adapter` (or similar), wire pack.toml build target. **gc-ywe.5 (port adapter Go tests) is blocked on this.**
+2. **gc-ywe.2** P2 — separate pack-default vs consumer-config for adapter behaviors that originated in oversight-rig (inbound file janitor, identity registry persistence path, handle-alias semantics, HANDLE_PREFIX, per-rig channel binding model). Audit `examples/oversight-rig/adapter/main.go` for any string/concept naming a consumer-side abstraction.
+3. **gc-ywe.3** P3 — add LICENSE/CONTRIBUTING/CHANGELOG/CI for the upstream repo layout (match the discord pack's plumbing).
+4. **gc-ywe.5** P2 (blocked by gc-28a) — port adapter Go tests so they travel with the pack post-relocation.
+
+**Standing bd queue:**
+
+5. **gc-a3s** P2 — `orders.overrides` with empty rig silently no-ops on per-rig orders. Owned by `gascity-pr-gc-a3s` worktree (already has fix branch `fix/gc-a3s-orders-overrides-rig-scope` at bf931ccf).
+6. **gc-17z** P2 — verify cos picks up slack-v0 prompt + DM-ack behavior.
+7. **gc-5rz** P2 — slack adapter Phase A absorption (UDS for /publish). Phase A is shipped and live; remaining phases not yet scoped.
 
 **Standing watch items** (no action unless triggered):
 
@@ -20,13 +28,21 @@ Item C (gc-side `HandleOutboundFile`) is still deferred/optional — only worth 
 
 ## Commits landed this session (pushed to fork/feat/oversight-rig-pack)
 
-Three commits, range `69dc5545..20b0bb9c`, all pushed:
+Five commits, range `69dc5545..010bc588`, all pushed:
 
 ```
 69dc5545 fix(testenv): respect nested go.mod boundaries when walking for sentinel
 bfd64511 fix(extmsg): add native SessionID to PublishRequest, drop metadata workaround (gc-kvt)
 20b0bb9c chore: golangci-lint fmt whitespace alignment in test tables
+783ca9de docs(oversight-rig): refresh HANDOFF after gc-kvt + testenv lint fix
+010bc588 docs(slack-pack): strip host-specific references + add scope banner (gc-ywe.1, gc-ywe.4)
 ```
+
+bd state changes this session:
+
+- Closed: gc-98y (rollup), gc-kvt (PublishRequest native SessionID), gc-ywe.1 (docs scrub), gc-ywe.4 (scope banner).
+- Created: gc-ywe (epic — upstream prep), gc-ywe.1..gc-ywe.5 (children).
+- Wired: gc-28a → blocks → gc-ywe.5.
 
 Prior session (kept for context, range `070f39c1..e7c51e6d`):
 
