@@ -6,26 +6,34 @@
 
 ## Up next (recommended dispatch)
 
-Epic **gc-ywe** is **6/6 done**. Standing queue + the one remaining quality fix:
+Epic **gc-ywe** (slack-pack upstream-prep) is **6/6 done** and the pack is structurally lift-and-shift-able into a separate gascity-packs repo. **But day-to-day coordination still has real gaps** — files don't flow through gc's transcript + peer-fanout machinery, persona attribution doesn't apply to file uploads (Slack API limit), and the inbound file path has never been live-smoked. Surface area, ranked by user impact:
 
-**Upstream-prep epic (gc-ywe — 6/6 done, only the P3 perm fix open):**
+### Day-to-day coordination gaps (priority work)
 
-1. **gc-ywe.6** P3 — harden adapter `/tmp/gc-slack-adapter/` store default permissions to `0700`/`0600` for `IDENTITY_STORE_PATH`, `HANDLE_ALIAS_STORE_PATH`, `INBOUND_FILE_STORE`. Code change in `examples/slack-pack/adapter/main.go` (post-relocation path) plus a regression test guarding mode 0600 on state writes; doc note in the env-contract README. Pre-existing risk; not a regression. Architect adversarial pass on a prior plan flagged: 6 write-mode call sites not 4 (INBOUND_FILE_STORE involves 2 sites in `downloadSlackFiles` + `slackDownloadToFile`); test must cover inbound-file dir + post-rename file mode; CHANGELOG entry under `### Security` required; consider startup `chmod` fixup for pre-existing-tree case. See gc-ywe.6 plan note.
+1. **gc-j8h** P2 (NEW — promoted from prior 'Item C') — slack-pack: route file uploads through gc `/extmsg/outbound` for transcript + peer fanout. Today `gc slack upload` is adapter-direct, so file posts skip gc's outbound history (no transcript replay) and miss peer fanout in multi-session rooms. Adapter is already capability-ready (`SupportsAttachments: true`). Needs new `OutboundFileRequest` + `HandleOutboundFile` in `internal/extmsg/outbound.go`, a Huma-typed gc API endpoint, a `PublishFile` genclient method, and a CLI default switch (`--via adapter` preserves the fast path). See bead body for full acceptance + risk on body-size limits.
 
-**Module rename follow-up (file as new bead at upstream-extraction time):** the adapter Go module is still `github.com/sjarmak/gc-slack-adapter`; rename to upstream-scoped path (e.g. `github.com/gastownhall/gascity-packs/slack/adapter`) when the pack is mirrored into the standalone gascity-packs repo. Cosmetic for a `package main` binary with zero internal importers, but worth doing at extraction time.
+2. **Live-smoke the inbound file download path** (operational, no code). `files:read` is granted; the adapter code is in place; the retention janitor is active. What's missing is a real human-uploads-to-bound-channel exercise to confirm `inbound: chan=... files=N text=...ch` log line + `/tmp/gc-slack-adapter/inbound/<channel-id>/` artifact + the receiving PL's session log shows `attachments[0].url=file:///...`. Not a bead — drive it once when next convenient.
 
-**Standing bd queue:**
+3. **Re-drive a real PL-driven outbound file smoke** (operational, no code). Manual `curl` smokes verified the channel post-gc-am2 multipart fix; a session-driven `gc slack upload --thread-current` from a PL has not been re-run. Not a bead — drive it once.
 
-4. **gc-a3s** P2 — `orders.overrides` with empty rig silently no-ops on per-rig orders. Owned by `gascity-pr-gc-a3s` worktree (already has fix branch `fix/gc-a3s-orders-overrides-rig-scope` at bf931ccf).
-5. **gc-17z** P2 — verify cos picks up slack-v0 prompt + DM-ack behavior.
-6. **gc-5rz** P2 — slack adapter Phase A absorption (UDS for /publish). Phase A is shipped and live; remaining phases not yet scoped.
+### Quality / hardening
 
-**Standing watch items** (no action unless triggered):
+4. **gc-ywe.6** P3 — harden adapter `/tmp/gc-slack-adapter/` store default permissions to `0700`/`0600` for `IDENTITY_STORE_PATH`, `HANDLE_ALIAS_STORE_PATH`, `INBOUND_FILE_STORE`. Code change in `examples/slack-pack/adapter/main.go` plus a regression test guarding mode 0600 on state writes; doc note in env-contract README. Pre-existing risk; not a regression. Architect adversarial pass on a prior plan flagged: 6 write-mode call sites not 4 (INBOUND_FILE_STORE involves 2 sites in `downloadSlackFiles` + `slackDownloadToFile`); test must cover inbound-file dir + post-rename file mode; CHANGELOG entry under `### Security` required; consider startup `chmod` fixup for pre-existing-tree case. See gc-ywe.6 plan note.
+
+### Standing bd queue (gc-side, not slack-pack)
+
+5. **gc-a3s** P2 — `orders.overrides` with empty rig silently no-ops on per-rig orders. Owned by `gascity-pr-gc-a3s` worktree (already has fix branch `fix/gc-a3s-orders-overrides-rig-scope` at bf931ccf).
+6. **gc-17z** P2 — verify cos picks up slack-v0 prompt + DM-ack behavior.
+7. **gc-5rz** P2 — slack adapter Phase A absorption (UDS for /publish). Phase A is shipped and live; Phase B/C remaining work not yet scoped.
+
+### Deferred / module rename
+
+**Module rename** (file as new bead at upstream-extraction time): the adapter Go module is still `github.com/sjarmak/gc-slack-adapter`; rename to upstream-scoped path (e.g. `github.com/gastownhall/gascity-packs/slack/adapter`) when the pack is mirrored into the standalone gascity-packs repo. Cosmetic for a `package main` binary with zero internal importers, but worth doing at extraction time.
+
+### Standing watch items (no action unless triggered)
 
 - **Slow-start log line** — with gc-9ha live, the next `phases=[start_call=2m… …]` log line will either include `state_sync_recovery=Xs` (recovery branch is the cost) or won't (provider.Start is the cost). That answers gc-9ha acceptance #3 about whether the 60s `session.startup_timeout` should bound start_call.
-- **Slack identity caveat** — `files.completeUploadExternal` ignores `chat:write.customize`, so file posts appear under the default bot identity. Documented in adapter handler comment + PL prompt addition. Not a bug; Slack API limit.
-
-Item C (gc-side `HandleOutboundFile`) is still deferred/optional — only worth doing if files need to flow through gc's outbound machinery for transcripts/peer fanout, which v1 doesn't need.
+- **Slack identity caveat on file uploads** — `files.completeUploadExternal` ignores `chat:write.customize`, so file posts appear under the default bot identity even when an agent has a registered persona. Slack API limit; documented in adapter handler comment + PL prompt. Workaround would be an adapter-side follow-up `chat.postMessage` after `files.completeUploadExternal` to attribute the file to the persona; not currently a bead because gc-j8h's gc-routed flow may obviate it (the gc-side handler can compose the file-then-message pattern centrally). Revisit after gc-j8h lands.
 
 ## Commits landed this session (gc-ywe wave 3 — gc-28a + gc-ywe.5)
 
@@ -325,9 +333,9 @@ Fix: `slackPutFileBytes` now POSTs multipart/form-data with a single `filename` 
 
 Doesn't need code changes — just a real Slack event. (Verified `files:read` grants via `files.info` on the `F0B1G3CFHKN` smoke artifact — `url_private` is reachable.)
 
-### C. Wire up gc-side `HandleOutboundFile` (deferred, optional)
+### C. Wire up gc-side `HandleOutboundFile` — **promoted to bead gc-j8h (P2)**
 
-The pack currently goes adapter-direct for `gc slack upload` (same pattern as `publish-to-channel`). If/when we want files to flow through gc's outbound machinery for transcript recording + peer fanout, add an `OutboundFileRequest` + `HandleOutboundFile` in `internal/extmsg/outbound.go` plus a new `PublishFile` HTTP method on the adapter client. The adapter side already declares `SupportsAttachments: true`, so capability negotiation is in place. Adapter-direct is correct for v1 — keeps the rollout small. The handoff that originally wrote this Item said "the adapter-direct path is simpler and works today" and that still holds.
+Day-to-day coordination gap: the pack currently goes adapter-direct for `gc slack upload`, so file posts skip gc's outbound history (no transcript replay) and miss peer fanout in multi-session rooms. Promoted from "deferred/optional" to tracked work because files are increasingly part of the multi-session coordination surface (rollup attachments, smoke-test files, etc.). Adapter is already capability-ready (`SupportsAttachments: true`); needs new `OutboundFileRequest` + `HandleOutboundFile` in `internal/extmsg/outbound.go`, a Huma-typed gc API endpoint, a `PublishFile` genclient method, and a CLI default switch. See `bd show gc-j8h` for full plan + acceptance.
 
 ### D. ~~Channel-name → ID resolution~~ — DONE via Path 1
 
@@ -352,7 +360,7 @@ Recurring channel IDs to remember:
 - ~~**gc-28a**~~ — slack-pack: dual adapter binary locations cause stale-deploy on cutover. **Closed this session** (gc-ywe wave 3): adapter source relocated from `examples/oversight-rig/adapter/` into `examples/slack-pack/adapter/`; pack is self-contained and lift-and-shift-able into upstream gascity-packs.
 - ~~**gc-am2** (NEW, P1 bug, fixed same-session)~~ — slack adapter ghost-uploads: PUT octet-stream produces unshareable files; rewrote step 2 to POST multipart. Closed; adapter live with the fix.
 - ~~**gc-w1h** (P1 bug)~~ — extmsg PublishRequest/PublishReceipt missing snake_case json tags caused silent data loss on the adapter ↔ gc HTTP wire. **Closed this session**: PublishReceipt now has tags (sibling of the PublishRequest fix landed earlier); regression tests in `internal/extmsg/wire_serialization_test.go`; OpenAPI/genclient/dashboard regenerated. See "extmsg wire-tag audit (gc-w1h)" below.
-- **gc-kvt** is now **unblocked** (was blocked on gc-w1h). Optional follow-up to add a native SessionID field to PublishRequest and drop the `Metadata["source_session_id"]` workaround in `internal/extmsg/outbound.go`.
+- ~~**gc-kvt**~~ — **closed wave 1** (commit `bfd64511 fix(extmsg): add native SessionID to PublishRequest, drop metadata workaround`). The metadata-key workaround is gone; PublishRequest carries SessionID natively.
 
 ### F. ~~Restart the adapter to activate the janitor~~ — DONE 2026-05-03 12:30:33 EDT
 
