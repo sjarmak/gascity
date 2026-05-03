@@ -1,0 +1,52 @@
+name: slack-pack
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "examples/slack-pack/**"
+      - "examples/oversight-rig/adapter/**"
+      - ".github/workflows/slack-pack.yml"
+  pull_request:
+    paths:
+      - "examples/slack-pack/**"
+      - "examples/oversight-rig/adapter/**"
+      - ".github/workflows/slack-pack.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: slack-pack-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  adapter-go-tests:
+    name: Adapter Go tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: examples/oversight-rig/adapter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: examples/oversight-rig/adapter/go.mod
+          cache: false
+      - name: go test -race
+        run: go test -race ./...
+
+  pack-python-tests:
+    name: Pack Python tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+      - name: pytest
+        run: pytest examples/slack-pack/tests/
