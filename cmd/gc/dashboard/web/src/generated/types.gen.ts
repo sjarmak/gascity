@@ -2074,14 +2074,14 @@ export type ProviderUpdateInputBody = {
 };
 
 export type PublishReceipt = {
-    Conversation: ConversationRef;
-    Delivered: boolean;
-    FailureKind: string;
-    MessageID: string;
-    Metadata: {
+    conversation: ConversationRef;
+    delivered: boolean;
+    failure_kind: string;
+    message_id: string;
+    metadata: {
         [key: string]: string;
     };
-    RetryAfter: number;
+    retry_after: number;
 };
 
 export type ReadinessItem = {

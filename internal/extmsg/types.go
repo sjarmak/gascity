@@ -131,6 +131,14 @@ type ExternalOriginEnvelope struct {
 }
 
 // AdapterCapabilities describes what a transport adapter supports.
+//
+// Wire shape: PascalCase keys (`SupportsChildConversations`,
+// `SupportsAttachments`, `MaxMessageLength`). This is the contract on both
+// the Huma typed wire (POST /v0/city/{name}/extmsg/adapters body) and the
+// adapter registration callback. The current out-of-process adapter
+// (`examples/oversight-rig/adapter`) explicitly tags its mirror struct
+// with PascalCase keys to match. If you add tags here, regenerate the
+// OpenAPI spec and update every adapter that posts capabilities.
 type AdapterCapabilities struct {
 	SupportsChildConversations bool
 	SupportsAttachments        bool
@@ -138,12 +146,19 @@ type AdapterCapabilities struct {
 }
 
 // PublishRequest is a request to publish a message to an external conversation.
+//
+// JSON tags are required: this struct is serialized over the HTTP wire to
+// out-of-process adapters (gc → adapter `/publish`), and the adapter side
+// parses snake_case keys. Without tags, Go marshals fields as PascalCase,
+// and case-insensitive matching on the receiver does not bridge the
+// underscore difference (so `ReplyToMessageID` would not match the
+// adapter's `reply_to_message_id` tag and the field would silently zero).
 type PublishRequest struct {
-	Conversation     ConversationRef
-	Text             string
-	ReplyToMessageID string
-	IdempotencyKey   string
-	Metadata         map[string]string
+	Conversation     ConversationRef   `json:"conversation"`
+	Text             string            `json:"text"`
+	ReplyToMessageID string            `json:"reply_to_message_id,omitempty"`
+	IdempotencyKey   string            `json:"idempotency_key,omitempty"`
+	Metadata         map[string]string `json:"metadata,omitempty"`
 }
 
 // PublishFailureKind classifies the reason a publish attempt failed.
@@ -165,13 +180,22 @@ const (
 )
 
 // PublishReceipt is the result of a publish attempt.
+//
+// JSON tags are required: out-of-process adapters POST snake_case bodies
+// (e.g. `{"message_id":"…","failure_kind":"…"}`) to gc as the response to
+// `/publish`, and gc unmarshals into this struct. Without tags, Go's
+// case-insensitive matcher does not bridge the underscore boundary, so
+// `MessageID` would not match `message_id` and the receipt would silently
+// arrive with `Delivered=true` but `MessageID=""` — breaking threading
+// (no `provider_message_id` to thread on) and idempotency. Same hazard
+// applies in reverse to the typed (Huma) wire path. See gc-w1h.
 type PublishReceipt struct {
-	MessageID    string
-	Conversation ConversationRef
-	Delivered    bool
-	FailureKind  PublishFailureKind
-	RetryAfter   time.Duration
-	Metadata     map[string]string
+	MessageID    string             `json:"message_id"`
+	Conversation ConversationRef    `json:"conversation"`
+	Delivered    bool               `json:"delivered"`
+	FailureKind  PublishFailureKind `json:"failure_kind"`
+	RetryAfter   time.Duration      `json:"retry_after"`
+	Metadata     map[string]string  `json:"metadata"`
 }
 
 // ErrAdapterUnsupported is returned when the adapter does not support the requested operation.

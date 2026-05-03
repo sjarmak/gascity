@@ -941,7 +941,8 @@ type ExtMsgBindInputBody struct {
 // ExtMsgGroupEnsureInputBody defines model for ExtMsgGroupEnsureInputBody.
 type ExtMsgGroupEnsureInputBody struct {
 	// DefaultHandle Default handle for the group.
-	DefaultHandle *string `json:"default_handle,omitempty"`
+	DefaultHandle *string       `json:"default_handle,omitempty"`
+	FanoutPolicy  *FanoutPolicy `json:"fanout_policy,omitempty"`
 
 	// Metadata Group metadata.
 	Metadata *map[string]string `json:"metadata,omitempty"`
@@ -1074,10 +1075,10 @@ type ExtmsgAdapterInfo struct {
 
 // FanoutPolicy defines model for FanoutPolicy.
 type FanoutPolicy struct {
-	AllowUntargetedPublication bool  `json:"AllowUntargetedPublication"`
-	Enabled                    bool  `json:"Enabled"`
-	MaxPeerTriggeredPublishes  int64 `json:"MaxPeerTriggeredPublishes"`
-	MaxTotalPeerDeliveries     int64 `json:"MaxTotalPeerDeliveries"`
+	AllowUntargetedPublication bool  `json:"allow_untargeted_publication"`
+	Enabled                    bool  `json:"enabled"`
+	MaxPeerTriggeredPublishes  int64 `json:"max_peer_triggered_publishes"`
+	MaxTotalPeerDeliveries     int64 `json:"max_total_peer_deliveries"`
 }
 
 // FormulaDetailResponse defines model for FormulaDetailResponse.
@@ -2017,12 +2018,12 @@ type ProviderUpdateInputBody struct {
 
 // PublishReceipt defines model for PublishReceipt.
 type PublishReceipt struct {
-	Conversation ConversationRef   `json:"Conversation"`
-	Delivered    bool              `json:"Delivered"`
-	FailureKind  string            `json:"FailureKind"`
-	MessageID    string            `json:"MessageID"`
-	Metadata     map[string]string `json:"Metadata"`
-	RetryAfter   int64             `json:"RetryAfter"`
+	Conversation ConversationRef   `json:"conversation"`
+	Delivered    bool              `json:"delivered"`
+	FailureKind  string            `json:"failure_kind"`
+	MessageId    string            `json:"message_id"`
+	Metadata     map[string]string `json:"metadata"`
+	RetryAfter   int64             `json:"retry_after"`
 }
 
 // ReadinessItem defines model for ReadinessItem.

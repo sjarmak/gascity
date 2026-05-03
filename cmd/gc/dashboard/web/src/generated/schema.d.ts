@@ -3463,15 +3463,15 @@ export interface components {
             ready_delay_ms?: number;
         };
         PublishReceipt: {
-            Conversation: components["schemas"]["ConversationRef"];
-            Delivered: boolean;
-            FailureKind: string;
-            MessageID: string;
-            Metadata: {
+            conversation: components["schemas"]["ConversationRef"];
+            delivered: boolean;
+            failure_kind: string;
+            message_id: string;
+            metadata: {
                 [key: string]: string;
             };
             /** Format: int64 */
-            RetryAfter: number;
+            retry_after: number;
         };
         ReadinessItem: {
             detail?: string;

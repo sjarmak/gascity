@@ -5128,36 +5128,36 @@
       "PublishReceipt": {
         "additionalProperties": false,
         "properties": {
-          "Conversation": {
+          "conversation": {
             "$ref": "#/components/schemas/ConversationRef"
           },
-          "Delivered": {
+          "delivered": {
             "type": "boolean"
           },
-          "FailureKind": {
+          "failure_kind": {
             "type": "string"
           },
-          "MessageID": {
+          "message_id": {
             "type": "string"
           },
-          "Metadata": {
+          "metadata": {
             "additionalProperties": {
               "type": "string"
             },
             "type": "object"
           },
-          "RetryAfter": {
+          "retry_after": {
             "format": "int64",
             "type": "integer"
           }
         },
         "required": [
-          "MessageID",
-          "Conversation",
-          "Delivered",
-          "FailureKind",
-          "RetryAfter",
-          "Metadata"
+          "message_id",
+          "conversation",
+          "delivered",
+          "failure_kind",
+          "retry_after",
+          "metadata"
         ],
         "type": "object"
       },
