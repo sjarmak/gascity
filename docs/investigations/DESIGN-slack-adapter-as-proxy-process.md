@@ -18,7 +18,7 @@ external machine state.
 ## Today (concrete state on this host)
 
 ```
-adapter:    /home/ds/gascity/examples/oversight-rig/adapter/gc-slack-adapter
+adapter:    /home/ds/gascity/examples/slack-pack/adapter/gc-slack-adapter
             (PID 2582270; started by ./run.sh + nohup; logs in /tmp/...)
 public:     TCP :8775           — /slack/events, /healthz
 internal:   TCP 127.0.0.1:8776  — /publish

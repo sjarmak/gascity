@@ -70,9 +70,9 @@ Not yet implemented (planned):
 
 ## Architecture (current)
 
-The Go adapter at `examples/oversight-rig/adapter/gc-slack-adapter`
-is the public-facing webhook receiver and outbound publisher. It runs
-outside this pack — for now, it is left in place exactly as-is. This
+The Go adapter at `examples/slack-pack/adapter/gc-slack-adapter`
+(built from `adapter/main.go` colocated with this pack) is the
+public-facing webhook receiver and outbound publisher. This
 pack adds CLI surface around it: `bind-dm` writes to gc's
 `/extmsg/bind` and to the pack's local config; `reply-current` reads
 recent gc events to find the conversation, then POSTs to gc's
@@ -195,7 +195,7 @@ When `GC_SERVICE_SOCKET` is set, the adapter:
 ### Adapter env contract
 
 The full adapter env contract — what the binary at
-`examples/oversight-rig/adapter/main.go` reads — is enumerated in the
+`examples/slack-pack/adapter/main.go` reads — is enumerated in the
 package docstring at the top of that file. Summary:
 
 **Must-set** (no default; adapter exits at startup if missing):
@@ -257,19 +257,9 @@ GC_CITY_NAME=<your-city-name>
 
 ### Cutover sequence
 
-The build flow below uses the canonical adapter source path while it
-still lives in `examples/oversight-rig/adapter/`. Once bd `gc-28a`
-relocates the source into the pack itself, steps 1a/1b collapse into
-a single `make -C adapter build`.
-
 ```
-# 1a. Build the adapter binary
-( cd examples/oversight-rig/adapter && go build -o gc-slack-adapter )
-
-# 1b. Stage the binary where the [[service]] block expects it
-mkdir -p examples/slack-pack/adapter
-cp examples/oversight-rig/adapter/gc-slack-adapter \
-   examples/slack-pack/adapter/gc-slack-adapter
+# 1. Build the adapter binary in place (source colocated with the pack)
+( cd examples/slack-pack/adapter && go build -o gc-slack-adapter )
 
 # 2. Source the secrets so the supervisor inherits them
 set -a; source "${XDG_CONFIG_HOME:-$HOME/.config}/gc-slack-adapter/env"; set +a
@@ -302,7 +292,7 @@ Rollback: remove (or comment out) the `[[service]]` block in
 legacy script:
 
 ```
-( cd examples/oversight-rig/adapter \
+( cd examples/slack-pack/adapter \
     && nohup ./run.sh > /tmp/gc-slack-adapter/run.log 2>&1 & disown )
 ```
 

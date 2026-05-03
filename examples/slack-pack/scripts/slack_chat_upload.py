@@ -2,7 +2,7 @@
 """Upload a file to a session's bound Slack channel via the local adapter.
 
 Wraps Slack's three-step files-upload-v2 protocol behind a single command.
-The adapter (``examples/oversight-rig/adapter``) handles
+The adapter (``examples/slack-pack/adapter``) handles
 ``files.getUploadURLExternal`` → ``PUT`` bytes → ``files.completeUploadExternal``;
 this script just resolves the session binding and posts ``/publish-file``.
 

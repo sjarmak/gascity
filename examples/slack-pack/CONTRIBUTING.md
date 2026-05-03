@@ -14,18 +14,15 @@ Two pieces ship with this pack:
 
 - **Pack scripts** live in `scripts/` and are pure Python. They run via the
   `gc slack <command>` shims under `commands/` and have no compile step.
-- **Adapter** (the Slack-side HTTP/UDS bridge) currently lives at
-  `examples/oversight-rig/adapter/` while it is in the gascity tree. Bead
-  `gc-28a` tracks relocating it alongside the pack — once that lands the
-  adapter source will move under `slack-pack/` (or a sibling). Treat the
-  current path as load-bearing for this pack only; do not deeply hard-code
-  it in scripts.
+- **Adapter** (the Slack-side HTTP/UDS bridge) is the Go binary whose source
+  lives at `adapter/main.go` (colocated with the pack). It is its own Go
+  module so it can travel intact when the pack is mirrored upstream.
 
 Build the adapter with:
 
 ```bash
-cd examples/oversight-rig/adapter
-go build ./...
+cd examples/slack-pack/adapter
+go build -o gc-slack-adapter
 ```
 
 ## Test flow
@@ -39,12 +36,11 @@ pytest examples/slack-pack/tests/
 Run adapter tests:
 
 ```bash
-cd examples/oversight-rig/adapter
+cd examples/slack-pack/adapter
 go test -race ./...
 ```
 
-CI runs both on every PR that touches `examples/slack-pack/**` or
-`examples/oversight-rig/adapter/**` (see
+CI runs both on every PR that touches `examples/slack-pack/**` (see
 `.github/workflows/slack-pack.yml`).
 
 ## Secret handling

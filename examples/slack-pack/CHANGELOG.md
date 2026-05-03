@@ -5,6 +5,20 @@ All notable changes to slack-pack are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Adapter Go source relocated from `examples/oversight-rig/adapter/`
+  to `examples/slack-pack/adapter/` (`gc-28a`). The pack is now
+  self-contained for upstream extraction into a separate
+  `gascity-packs` repo. No behavioral change; the binary path
+  (`examples/slack-pack/adapter/gc-slack-adapter`) is unchanged, so
+  the supervised `proxy_process` service picks up the new build at
+  next restart with byte-identical functionality.
+- Build flow simplified to a single command:
+  `cd examples/slack-pack/adapter && go build -o gc-slack-adapter`.
+
 ## [0.1.0] - 2026-05-03
 
 Initial preview. Feature-by-feature port of the upstream `discord` pack

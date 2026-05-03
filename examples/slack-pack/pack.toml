@@ -28,10 +28,10 @@
 #
 # The intake side (public-facing Slack webhook receiver) and the
 # /publish endpoint that gc reaches via the extmsg HTTP adapter are
-# served by the Go binary whose source lives at
-# examples/oversight-rig/adapter/main.go. The pack expects a built
-# binary at ./adapter/gc-slack-adapter (gitignored) — see
-# README.md "Cutover" for the build + cutover sequence.
+# served by the Go binary whose source lives at ./adapter/main.go
+# (colocated with the pack). The pack expects a built binary at
+# ./adapter/gc-slack-adapter (gitignored) — see CONTRIBUTING.md for
+# the build flow and README.md "Cutover" for the deployment sequence.
 
 [pack]
 name = "slack"

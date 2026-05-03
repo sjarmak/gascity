@@ -148,11 +148,10 @@ with the internal callback URL). You only need the public URL to plug
 into the Slack app's Event Subscriptions config.
 
 Run the adapter (replace `<gascity-repo>` with your local checkout
-path; once bd `gc-28a` lands, the source moves into the slack pack
-itself):
+path):
 
 ```bash
-cd <gascity-repo>/examples/oversight-rig/adapter
+cd <gascity-repo>/examples/slack-pack/adapter
 ./run.sh
 ```
 
@@ -263,7 +262,7 @@ After=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=-${XDG_CONFIG_HOME:-$HOME/.config}/gc-slack-adapter/env
-ExecStart=<gascity-repo>/examples/oversight-rig/adapter/run.sh
+ExecStart=<gascity-repo>/examples/slack-pack/adapter/run.sh
 Restart=on-failure
 RestartSec=5
 

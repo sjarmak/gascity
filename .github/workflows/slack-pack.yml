@@ -5,12 +5,10 @@ on:
     branches: [main]
     paths:
       - "examples/slack-pack/**"
-      - "examples/oversight-rig/adapter/**"
       - ".github/workflows/slack-pack.yml"
   pull_request:
     paths:
       - "examples/slack-pack/**"
-      - "examples/oversight-rig/adapter/**"
       - ".github/workflows/slack-pack.yml"
 
 permissions:
@@ -27,15 +25,12 @@ jobs:
     timeout-minutes: 10
     defaults:
       run:
-        # NOTE: this path moves under gc-28a (adapter relocation into the pack);
-        # update both this working-directory and the go-version-file below when
-        # the relocation lands.
-        working-directory: examples/oversight-rig/adapter
+        working-directory: examples/slack-pack/adapter
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
-          go-version-file: examples/oversight-rig/adapter/go.mod
+          go-version-file: examples/slack-pack/adapter/go.mod
           cache: false
       - name: go test -race
         run: go test -race ./...

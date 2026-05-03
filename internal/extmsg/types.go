@@ -136,7 +136,7 @@ type ExternalOriginEnvelope struct {
 // `SupportsAttachments`, `MaxMessageLength`). This is the contract on both
 // the Huma typed wire (POST /v0/city/{name}/extmsg/adapters body) and the
 // adapter registration callback. The current out-of-process adapter
-// (`examples/oversight-rig/adapter`) explicitly tags its mirror struct
+// (`examples/slack-pack/adapter`) explicitly tags its mirror struct
 // with PascalCase keys to match. If you add tags here, regenerate the
 // OpenAPI spec and update every adapter that posts capabilities.
 type AdapterCapabilities struct {
