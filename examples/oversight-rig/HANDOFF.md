@@ -1,11 +1,29 @@
-# Oversight-rig handoff — 2026-05-03 (gc-j8h live smoke + 2 follow-up fixes)
+# Oversight-rig handoff — 2026-05-03 evening (gc-ywe.6 hardening + worktree cleanup + gc-17z staged)
 
-> **To the next agent:** the live smoke for **gc-j8h** drove `gc slack upload --thread-current` end-to-end against the running supervisor + adapter and surfaced two real bugs that landed in two atomic commits this session:
+> **To the next agent:** this session shipped the slack adapter perm-hardening (gc-ywe.6), surfaced a defense-in-depth follow-up (gc-ywe.7), staged the cos-prompt-verification runbook for gc-17z, and cleaned up three stale PR-staging worktrees. Single commit landed on `fork/feat/oversight-rig-pack`:
 >
-> - **`43f778e4` — `fix(extmsg): set X-GC-Request on HTTPAdapter callbacks (gc-5sd)`** — `HTTPAdapter.Publish/PublishFile/EnsureChildConversation` posted to the registered callback URL without the X-GC-Request CSRF header. When the adapter is supervised as proxy_process the callback URL routes through gc's own /svc proxy whose CSRF middleware rejected every gc-routed mutation with 403 → `delivered:false, failure_kind:auth`. **All gc-routed text /publish was silently broken too**, not just the new file path. Pre-existing latent bug; gc-j8h was the first end-to-end exerciser to surface it.
-> - **`5c936ac4` — `fix(slack-pack): unwrap thread_ts tuple in upload --thread-current (gc-qp8)`** — `slack_chat_upload.py:125` assigned the whole `(msg_id, conversation)` tuple to `thread_ts` instead of `match[0]`. Sibling `reply_current` and `react` already unpack correctly; only upload missed. Pure pack-side, one-line fix + regression test.
+> - **`5ef244ca` — `fix(slack-pack): harden adapter /tmp store default permissions (gc-ywe.6)`** — six mode constants flipped (0o755→0o700 dirs, 0o644→0o600 files) across `downloadSlackFiles` + `identityRegistry.saveLocked` + `handleAliasRegistry.saveLocked`; proxy_process UDS `os.Chmod`'d to 0o600 after `net.Listen` as defense-in-depth on top of its 0o700 controller-managed parent; new `tightenStorePermissions` startup migration helper preserves setuid/setgid/sticky bits, refuses to follow symlinks (no `Lchmod` in stdlib), never loosens operator-tighter perms (e.g. 0o400 read-only). 4 new test funcs covering all 7 mode-bearing call sites + 12 helper subtests. Phase 4 review (code+security+go reviewers in parallel) closed 2 HIGH (`os.IsNotExist`→`errors.Is`, EACCES test root-guard) + 3 MEDIUM (Lstat for symlink safety, listenUDS error wrap, log-line preserves special bits) in-band.
 >
-> Live smoke is now **PASS** for the gc-j8h acceptance criteria — see "gc-j8h smoke results" below for the receipts. `core.hooksPath` is `.githooks`; `make dashboard-check` is green; `go test -short` on touched packages green; 43 slack-pack pytests green.
+> Worktree audit found three stale PR-staging worktrees whose PRs had already squash-merged earlier today. Removed: `gascity-pr-gc-a3s` (PR #1622), `gascity-pr-gc-cdf` (PR #1625), `gascity-gascity-reply` (PR #1203). The "DO NOT touch `internal/orders/override.go`" warning is now stale and removed below.
+>
+> `core.hooksPath` is `.githooks`; the gc-ywe.6 commit went through the full pre-commit pipeline (gofmt + golangci-lint + go test sweep + docsync). `bd dolt push` no-op'd (remote not configured for this fork — beads stay versioned in `.beads/`).
+
+## This session at a glance
+
+- Closed: gc-ywe.6 (P3 perm hardening, shipped 5ef244ca).
+- Created: gc-ywe.7 (P2 follow-up — pre-existing path-component sanitization for `msg.Channel`/`ts` in `downloadSlackFiles`; gated behind `SLACK_SIGNING_SECRET` HMAC, surfaced as defense-in-depth gap by Phase 4 security review).
+- Staged: gc-17z runbook in `/tmp/gc-17z-verify/` — 6 scripts (preflight, restart-cos, seed-test-bead, watch-logs, collect-evidence, cleanup) + README documenting the 3-scenario protocol. Preflight smoke-tested green this session.
+- Removed: 3 worktrees (`gascity-pr-gc-a3s`, `gascity-pr-gc-cdf`, `gascity-gascity-reply`) + their branches (force-deleted; SHAs preserved in reflog).
+- Epic gc-ywe still has gc-ywe.7 (P2) open; otherwise complete.
+
+## Prior session (kept for context — gc-j8h live smoke + 2 follow-up fixes)
+
+The live smoke for **gc-j8h** drove `gc slack upload --thread-current` end-to-end against the running supervisor + adapter and surfaced two real bugs that landed in two atomic commits:
+
+- **`43f778e4` — `fix(extmsg): set X-GC-Request on HTTPAdapter callbacks (gc-5sd)`** — `HTTPAdapter.Publish/PublishFile/EnsureChildConversation` posted to the registered callback URL without the X-GC-Request CSRF header. When the adapter is supervised as proxy_process the callback URL routes through gc's own /svc proxy whose CSRF middleware rejected every gc-routed mutation with 403 → `delivered:false, failure_kind:auth`. **All gc-routed text /publish was silently broken too**, not just the new file path. Pre-existing latent bug; gc-j8h was the first end-to-end exerciser to surface it.
+- **`5c936ac4` — `fix(slack-pack): unwrap thread_ts tuple in upload --thread-current (gc-qp8)`** — `slack_chat_upload.py:125` assigned the whole `(msg_id, conversation)` tuple to `thread_ts` instead of `match[0]`. Sibling `reply_current` and `react` already unpack correctly; only upload missed. Pure pack-side, one-line fix + regression test.
+
+Live smoke is now **PASS** for the gc-j8h acceptance criteria — see "gc-j8h smoke results" below for the receipts.
 
 ## Up next (recommended dispatch)
 
@@ -19,12 +37,14 @@ The slack-pack file-coordination story is structurally complete (gc-ywe 6/6 + gc
 
 ### Quality / hardening
 
-3. **gc-ywe.6** P3 — harden adapter `/tmp/gc-slack-adapter/` store default permissions to `0700`/`0600` for `IDENTITY_STORE_PATH`, `HANDLE_ALIAS_STORE_PATH`, `INBOUND_FILE_STORE`. Code change in `examples/slack-pack/adapter/main.go` plus a regression test guarding mode 0600 on state writes; doc note in env-contract README. Pre-existing risk; not a regression. Architect adversarial pass on a prior plan flagged: 6 write-mode call sites not 4 (INBOUND_FILE_STORE involves 2 sites in `downloadSlackFiles` + `slackDownloadToFile`); test must cover inbound-file dir + post-rename file mode; CHANGELOG entry under `### Security` required; consider startup `chmod` fixup for pre-existing-tree case. See gc-ywe.6 plan note.
+3. ~~**gc-ywe.6** P3 — adapter `/tmp` store perm hardening~~ — **DONE this session** (commit 5ef244ca). See top callout for the shipped scope.
+
+4. **gc-ywe.7** P2 — sanitize `msg.Channel` + `ts` as filesystem path components in `downloadSlackFiles` (`examples/slack-pack/adapter/main.go:1351,1370`). Pre-existing defense-in-depth gap surfaced by gc-ywe.6 Phase 4 security review. Gated behind `SLACK_SIGNING_SECRET` HMAC today (not externally reachable without the secret) but exploitable as path-traversal if the secret ever leaks. Fix: new `safePathComponent` helper (analogous to the existing `safeFilename` for user-provided basenames; stricter — strips path separators, NUL, control chars, leading dots, caps length). Add regression test for malformed channel + ts in `TestDownloadSlackFiles`. Estimated ~50 LOC.
 
 ### Standing bd queue (gc-side, not slack-pack)
 
-4. **gc-a3s** P2 — `orders.overrides` with empty rig silently no-ops on per-rig orders. Owned by `gascity-pr-gc-a3s` worktree (already has fix branch `fix/gc-a3s-orders-overrides-rig-scope` at bf931ccf).
-5. **gc-17z** P2 — verify cos picks up slack-v0 prompt + DM-ack behavior.
+5. **gc-17z** P2 — verify cos picks up slack-v0 prompt + DM-ack behavior. **Runbook staged this session in `/tmp/gc-17z-verify/`** — 6 scripts driving a 3-scenario protocol (DM-with-matching-bead → routed ack; rig-channel @cos → cos silent, PL responds; DM-no-match → mailed-mayor ack). Preflight smoke-tested green; just needs an operator window for the cos session reset (`01-restart-cos.sh`) and the manual Slack interactions. Evidence collector + bead cleanup included.
+
 6. **gc-5rz** P2 — slack adapter Phase A absorption (UDS for /publish). Phase A is shipped and live; Phase B/C remaining work not yet scoped.
 
 ### Deferred / module rename
@@ -569,19 +589,28 @@ Deployment-local (NOT in repo, unchanged this session):
 
 ## Items NOT to do
 
-- **DO NOT touch `internal/orders/override.go`** — gc-a3s PR worktree owns it.
-- **ASK BEFORE restarting the supervisor or live adapter.** Both have on-disk code ahead of the running binary at various points in the rollout; restarts disturb live Slack flow / running sessions. The "Up next" block calls these out explicitly when relevant.
+- **ASK BEFORE restarting the supervisor or live adapter.** Both have on-disk code ahead of the running binary at various points in the rollout; restarts disturb live Slack flow / running sessions. The "Up next" block calls these out explicitly when relevant. (`/tmp/gc-17z-verify/01-restart-cos.sh` does a narrower `gc session reset gc-83347` only — still ask before running.)
 
 ## Findings from earlier sessions (carried forward)
 
-1. **`orders.overrides` rig-scoping is silently no-op for per-rig orders** — bd gc-a3s, separate worktree at `/home/ds/gascity-pr-gc-a3s` (branch `fix/gc-a3s-orders-overrides-rig-scope`).
-2. ~~**proxy_process URL contract is broken on the SDK side**~~ — **fixed and shipped** (gc-cdf — landed on this branch as commit 6416c171; PR worktree `gascity-pr-gc-cdf` carries the standalone fix branch).
+1. ~~**`orders.overrides` rig-scoping is silently no-op for per-rig orders**~~ — **fixed and shipped** (gc-a3s — squash-merged to main as `bb1e8679` via PR #1622 on 2026-05-03). Worktree `gascity-pr-gc-a3s` removed this session post-merge.
+2. ~~**proxy_process URL contract is broken on the SDK side**~~ — **fixed and shipped** (gc-cdf — landed on this branch as commit 6416c171, separately squash-merged to main via PR #1625). Worktree `gascity-pr-gc-cdf` removed this session post-merge.
 3. **`bin/claude-account` JSON writes were unserialized** — gc-arr, closed.
 
 ## Resolved this session: `core.hooksPath` restored
 
 `git config core.hooksPath .githooks` ran at the start of this session; all three commits this session went through the full pre-commit pipeline. bd's lifecycle hooks under `.beads/hooks/` use a different mechanism and continued to fire (auto-export warnings about `git add` failing on the unrelated `.beads/issues.dolt/` are cosmetic and pre-existing).
 
-## Resolved this session: nested PR worktrees removed
+## Resolved this session: stale PR worktrees removed
 
-`/home/ds/gascity/gascity-gascity-pr/` and `/home/ds/gascity/gascity-gascity-pr-1/` were nested git worktrees inside the main repo's working tree, causing `TestDocDirCoverage` and `TestNoBdExecOutsideBeads` to flag files inside them as repo-root violations. Both removed via `git worktree remove --force`. The corresponding PRs are already open from their proper sibling worktrees (`gascity-pr-gc-w1h`, `gascity-pr-gc-cdf`, `gascity-pr-gc-a3s` etc. at `/home/ds/gascity-pr-*`). If new PRs need staging worktrees, place them as siblings of `/home/ds/gascity` (matching the `/home/ds/gascity-pr-<bd-id>` pattern), not inside it.
+Three PR-staging worktrees whose PRs had squash-merged earlier today were lingering at full size:
+
+- `/home/ds/gascity-pr-gc-a3s` (branch `fix/gc-a3s-orders-overrides-rig-scope`) → PR #1622 merged
+- `/home/ds/gascity-pr-gc-cdf` (branch `fix/gc-cdf-service-url-prefix-city-segment`) → PR #1625 merged
+- `/home/ds/gascity-gascity-reply` (branch `docs/spec-update-session-first`) → PR #1203 merged
+
+All three removed via `git worktree remove`; branches force-deleted (`-D`) since squash-merge means the original commits aren't reachable from origin/main even though gh confirms them merged. SHAs preserved in reflog for ~90d if needed. Active worktrees remaining: main repo at `/home/ds/gascity`, `gascity-main` (handy main ref), `gascity-pr-gc-w1h` (PR #1632 still OPEN), `gascity-gascity-pr-2` (orphaned local — no matching PR; needs human review), plus 2 locked subagent worktrees under `.claude/worktrees/`.
+
+## Resolved earlier session: nested PR worktrees removed
+
+`/home/ds/gascity/gascity-gascity-pr/` and `/home/ds/gascity/gascity-gascity-pr-1/` were nested git worktrees inside the main repo's working tree, causing `TestDocDirCoverage` and `TestNoBdExecOutsideBeads` to flag files inside them as repo-root violations. Both removed via `git worktree remove --force`. If new PRs need staging worktrees, place them as siblings of `/home/ds/gascity` (matching the `/home/ds/gascity-pr-<bd-id>` pattern), not inside it.
