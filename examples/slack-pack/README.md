@@ -62,9 +62,11 @@ Implemented:
 
 Not yet implemented (planned):
 
+- [x] `gc slack import-app` — register a Slack app manifest with the gc
+      city ([`manifest/README.md`](./manifest/README.md#importing-into-gc-gc-slack-import-app))
 - [ ] `gc slack enable-room-launch` (`@@handle` thread-scoped sessions)
-- [ ] `gc slack import-app` / `map-channel` / `map-rig` /
-      `sync-commands` (slash-command intake — `/gc fix` style)
+- [ ] `gc slack map-channel` / `map-rig` / `sync-commands` (slash-command
+      intake — `/gc fix` style)
 - [ ] `gc slack post-message` (workflow status projection)
 - [ ] `gc slack retry-peer-fanout`
 

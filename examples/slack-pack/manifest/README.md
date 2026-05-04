@@ -73,17 +73,36 @@ Schema reference: <https://api.slack.com/reference/manifests>
    Request URL** onward — you still need to plug in your Tailscale
    Funnel URL and copy the signing secret.
 
-### Automated (`gc slack import-app`) — _planned_
+### Importing into gc (`gc slack import-app`)
 
-Once gc-cby.1 lands:
+After running the manual install above to mint the app at Slack, capture
+the assigned **app id** (`A0…`, found at api.slack.com → your app →
+**Basic Information**) and import the manifest into the gc city:
 
 ```bash
-gc slack import-app --manifest examples/slack-pack/manifest/app.json
+gc slack import-app examples/slack-pack/manifest/app.json \
+  --workspace-id T0123456 \
+  --app-id       A0123456
 ```
 
-will use the Slack `apps.manifest.create` API to provision the app,
-then print the bot token + signing secret for you to capture into
-`~/.config/gc-slack-adapter/env`.
+This validates the manifest's bot scopes against the set the slack-pack
+adapter and downstream commands require, then persists a typed app
+record at `<cityPath>/.gc/slack/apps.json` (composite key
+`(workspace_id, app_id)`). Re-importing the same `(workspace_id,
+app_id)` updates the record in place — the registry never grows from
+idempotent re-imports.
+
+`import-app` does **not** call Slack — provisioning the app at Slack is
+still a one-time manual step (or, eventually, gc-cby.9's OAuth install
+flow). What this command does is establish the foundation that
+[`sync-commands`](../README.md) (gc-cby.2),
+[`map-channel` / `map-rig`](../README.md) (gc-cby.3 / .4), and friends
+read from.
+
+The on-disk shape is described by
+[`schema/apps.schema.json`](../schema/apps.schema.json) — that file is
+the contract between the gc CLI (writer) and the slack-pack adapter
+(reader).
 
 ## Required secrets after install
 
