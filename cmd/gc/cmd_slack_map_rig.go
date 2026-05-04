@@ -24,9 +24,10 @@ const slackMapRigRestartReminder = "Restart slack-pack adapter (gc service resta
 // exists.
 func newSlackMapRigCmd(stdout, stderr io.Writer) *cobra.Command {
 	var (
-		workspaceID string
-		channels    []string
-		remove      bool
+		workspaceID    string
+		channels       []string
+		remove         bool
+		removeChannels []string
 	)
 	cmd := &cobra.Command{
 		Use:   "map-rig <rig-name>",
@@ -43,11 +44,14 @@ channel set (sorted+deduped) and preserves the original CreatedAt.
 Channels can be supplied as repeated --channel flags, comma-
 separated values, or a mix.
 
---remove drops the entire rig record (partial channel removal is a
-follow-up bead). Always exits 0 — a missing record is a no-op.`,
+--remove drops the entire rig record. --remove-channels drops just
+the listed channels from the rig's set; if the resulting set is
+empty, the record itself is deleted. Both are idempotent — a missing
+record (or unknown channel) is a silent no-op. --remove,
+--remove-channels, and --channel are mutually exclusive.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runSlackMapRig(stdout, stderr, args[0], workspaceID, channels, remove)
+			return runSlackMapRig(stdout, stderr, args[0], workspaceID, channels, remove, removeChannels)
 		},
 	}
 	cmd.Flags().StringVar(&workspaceID, "workspace-id", "",
@@ -55,12 +59,14 @@ follow-up bead). Always exits 0 — a missing record is a no-op.`,
 	cmd.Flags().StringSliceVar(&channels, "channel", nil,
 		"Slack channel id to include in the rig's set; repeat or comma-separate for multiple")
 	cmd.Flags().BoolVar(&remove, "remove", false,
-		"Remove the rig record entirely (idempotent; mutually exclusive with --channel)")
+		"Remove the rig record entirely (idempotent; mutually exclusive with --channel and --remove-channels)")
+	cmd.Flags().StringSliceVar(&removeChannels, "remove-channels", nil,
+		"Drop these channels from the rig's set; if the set becomes empty the record is deleted (idempotent; mutually exclusive with --channel and --remove)")
 	_ = cmd.MarkFlagRequired("workspace-id")
 	return cmd
 }
 
-func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, channels []string, remove bool) error {
+func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, channels []string, remove bool, removeChannels []string) error {
 	cityPath, err := resolveCity()
 	if err != nil {
 		return fmt.Errorf("resolve city: %w", err)
@@ -68,7 +74,10 @@ func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, chann
 
 	if remove {
 		if len(channels) > 0 {
-			return fmt.Errorf("--remove cannot be combined with --channel; use --remove alone to drop the rig record (partial channel removal is a follow-up bead)")
+			return fmt.Errorf("--remove cannot be combined with --channel; use --remove alone to drop the rig record")
+		}
+		if len(removeChannels) > 0 {
+			return fmt.Errorf("--remove cannot be combined with --remove-channels; use one or the other")
 		}
 		reg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityPath))
 		if err != nil {
@@ -87,8 +96,15 @@ func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, chann
 		return nil
 	}
 
+	if len(removeChannels) > 0 {
+		if len(channels) > 0 {
+			return fmt.Errorf("--remove-channels cannot be combined with --channel; use --remove-channels alone to drop a subset")
+		}
+		return runSlackMapRigRemoveChannels(stdout, cityPath, rigName, workspaceID, removeChannels)
+	}
+
 	if len(channels) == 0 {
-		return fmt.Errorf("--channel is required (one or more) unless --remove is set")
+		return fmt.Errorf("--channel is required (one or more) unless --remove or --remove-channels is set")
 	}
 
 	// Open both registries: cby.4 (rig) for the actual write, cby.3
@@ -152,6 +168,70 @@ func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, chann
 	}
 	fmt.Fprintf(stdout, "Mapped rig %s (workspace=%s) → channels %v\n", //nolint:errcheck
 		rigName, workspaceID, desired)
+	fmt.Fprintln(stdout, slackMapRigRestartReminder) //nolint:errcheck
+	return nil
+}
+
+// runSlackMapRigRemoveChannels handles `gc slack map-rig <rig>
+// --remove-channels c1,c2`. It loads the existing rig record, drops
+// the requested channels from the set, and either re-Sets the
+// remaining channels or Removes the record entirely if the set
+// becomes empty. Idempotent: a missing rig or channels not present in
+// the record are silent no-ops.
+func runSlackMapRigRemoveChannels(stdout io.Writer, cityPath, rigName, workspaceID string, removeChannels []string) error {
+	toRemove := dedupSortedChannels(removeChannels)
+	if len(toRemove) == 0 {
+		return fmt.Errorf("--remove-channels must include at least one non-empty value")
+	}
+
+	reg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityPath))
+	if err != nil {
+		return fmt.Errorf("open slack rig mapping registry: %w", err)
+	}
+
+	existing, ok := reg.Get(workspaceID, rigName)
+	if !ok {
+		fmt.Fprintf(stdout, "No rig mapping %s (workspace=%s); nothing to remove channels from\n", rigName, workspaceID) //nolint:errcheck
+		fmt.Fprintln(stdout, slackMapRigRestartReminder)                                                                 //nolint:errcheck
+		return nil
+	}
+
+	remaining := diffStrings(existing.ChannelIDs, toRemove)
+	actuallyRemoved := diffStrings(existing.ChannelIDs, remaining)
+
+	if len(remaining) == 0 {
+		existed, err := reg.Remove(workspaceID, rigName)
+		if err != nil {
+			return fmt.Errorf("remove slack rig mapping for %q: %w", rigName, err)
+		}
+		if existed {
+			fmt.Fprintf(stdout, "Removed rig mapping %s (workspace=%s) — channel set became empty after removing %v\n", //nolint:errcheck
+				rigName, workspaceID, actuallyRemoved)
+		}
+		fmt.Fprintln(stdout, slackMapRigRestartReminder) //nolint:errcheck
+		return nil
+	}
+
+	if len(actuallyRemoved) == 0 {
+		fmt.Fprintf(stdout, "Rig %s (workspace=%s): no channels matched %v; channel set unchanged %v\n", //nolint:errcheck
+			rigName, workspaceID, toRemove, existing.ChannelIDs)
+		fmt.Fprintln(stdout, slackMapRigRestartReminder) //nolint:errcheck
+		return nil
+	}
+
+	updated := slackRigMappingRecord{
+		WorkspaceID: workspaceID,
+		RigName:     rigName,
+		ChannelIDs:  remaining,
+		// CreatedAt is preserved by Set when the record exists.
+		CreatedAt: existing.CreatedAt,
+		UpdatedAt: time.Now().UTC(),
+	}
+	if err := reg.Set(updated); err != nil {
+		return fmt.Errorf("persist slack rig mapping after partial removal: %w", err)
+	}
+	fmt.Fprintf(stdout, "Rig %s (workspace=%s): removed channels %v; remaining %v\n", //nolint:errcheck
+		rigName, workspaceID, actuallyRemoved, remaining)
 	fmt.Fprintln(stdout, slackMapRigRestartReminder) //nolint:errcheck
 	return nil
 }

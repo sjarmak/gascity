@@ -74,7 +74,10 @@ Not yet implemented (planned):
       fall-through default for slash-command resolution. Per-channel
       `map-channel --session` bindings override rig defaults; channel
       mapping wins. Cross-store conflict detection refuses contradictory
-      writes in either direction.
+      writes in either direction. `--remove` drops the entire rig
+      record; `--remove-channels c1,c2` drops just the listed channels
+      (the record itself is deleted if the set becomes empty). Both
+      removal paths are idempotent.
 - [ ] `gc slack enable-room-launch` (`@@handle` thread-scoped sessions)
 - [ ] `gc slack post-message` (workflow status projection)
 - [ ] `gc slack retry-peer-fanout`
