@@ -37,6 +37,9 @@ CITY="${GC_CITY:-.}"
 PACK_STATE_DIR="${GC_PACK_STATE_DIR:-${GC_CITY_RUNTIME_DIR:-$CITY/.gc/runtime}/packs/maintenance}"
 AUDIT_LOG="$PACK_STATE_DIR/stale-claim-audit.jsonl"
 
+if [ -n "${GC_STALE_CLAIM_REAPER_APPLY:-}" ] && [ -z "${STALE_CLAIM_REAPER_APPLY:-}" ]; then
+    echo "stale-claim-reaper: WARNING: GC_STALE_CLAIM_REAPER_APPLY is deprecated; use STALE_CLAIM_REAPER_APPLY" >&2
+fi
 APPLY="${STALE_CLAIM_REAPER_APPLY:-${GC_STALE_CLAIM_REAPER_APPLY:-}}"
 APPLY_MODE="dry-run"
 if [ "$APPLY" = "1" ] || [ "$APPLY" = "true" ]; then
@@ -59,13 +62,22 @@ now_epoch() {
 # parse_epoch converts an ISO-8601 timestamp to seconds since epoch.
 # Returns "0" if the timestamp is unparseable so the caller can decide
 # how to treat it (we conservatively skip beads with unparseable times).
+#
+# Strict ISO-8601 UTC format is required: bead `updated_at` is operator-
+# settable data, and GNU date -d accepts permissive expressions
+# ("yesterday", "next thursday", arithmetic). Without the format gate
+# below, a crafted updated_at could shift a bead's apparent age in
+# either direction and bypass the stale-threshold filter.
 parse_epoch() {
     local ts="$1"
     if [ -z "$ts" ]; then
         echo "0"
         return 0
     fi
-    # GNU date understands ISO-8601 with -d.
+    if [[ ! "$ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+        echo "0"
+        return 0
+    fi
     date -u -d "$ts" +"%s" 2>/dev/null || echo "0"
 }
 
@@ -215,6 +227,14 @@ while IFS= read -r RIG; do
     EXCLUDE_META=$(read_policy_value "$POLICY_FILE" "exclude_metadata")
     THRESHOLD_SECONDS=$(duration_to_seconds "$THRESHOLD_RAW")
 
+    # exclude_metadata is interpolated into a `bd list --metadata-field`
+    # argument; restrict it to identifier characters so a malformed
+    # policy value cannot inject extra flags or arguments.
+    if [ -n "$EXCLUDE_META" ] && ! [[ "$EXCLUDE_META" =~ ^[A-Za-z_][A-Za-z0-9_.:-]*$ ]]; then
+        echo "stale-claim-reaper: WARNING: ignoring malformed exclude_metadata in $POLICY_FILE" >&2
+        EXCLUDE_META=""
+    fi
+
     # Step 2: list in_progress beads with assignees. We list once per rig
     # because the bd store is global — `gc rig list` may return multiple
     # rig paths but they all see the same bead store. We still scope the
@@ -261,6 +281,9 @@ while IFS= read -r RIG; do
             continue
         fi
         AGE=$((NOW_EPOCH - UPDATED_EPOCH))
+        if [ "$AGE" -lt 0 ]; then
+            AGE=0
+        fi
         if [ "$AGE" -lt "$THRESHOLD_SECONDS" ]; then
             audit "reap-skipped-not-stale" "$RIG" "$BEAD_ID" "$ASSIGNEE" "$UPDATED_AT" "$AGE" "age below threshold"
             continue
@@ -272,9 +295,12 @@ while IFS= read -r RIG; do
         # ambiguous: we cannot tell whether commits exist, so we skip the
         # bead with a distinct audit action rather than risk a false reap.
         if [ -d "$RIG/.git" ]; then
-            # Use literal --grep (no regex meta in canonical bead IDs) and
-            # bound the search to the lifetime of the claim.
-            if COMMIT_HITS=$(git -C "$RIG" log --grep "$BEAD_ID" --since "$UPDATED_AT" --oneline 2>/dev/null); then
+            # --fixed-strings makes --grep treat the bead ID as a literal
+            # substring (avoids regex over-match on IDs with `.`, `[`, etc.).
+            # --since= form keeps the timestamp from being split into
+            # extra git flags. UPDATED_AT was already format-validated by
+            # parse_epoch above before reaching this point.
+            if COMMIT_HITS=$(git -C "$RIG" log --fixed-strings --grep="$BEAD_ID" "--since=$UPDATED_AT" --oneline 2>/dev/null); then
                 if [ -n "$COMMIT_HITS" ]; then
                     audit "reap-skipped-recent-commit" "$RIG" "$BEAD_ID" "$ASSIGNEE" "$UPDATED_AT" "$AGE" "git log mentions bead"
                     continue
@@ -287,11 +313,14 @@ while IFS= read -r RIG; do
 
         # Selection passed — reap or dry-run.
         if [ "$APPLY_MODE" = "apply" ]; then
-            if bd update "$BEAD_ID" --status=open --assignee="" >/dev/null 2>&1; then
+            # Capture stderr so a flag-shape regression in `bd` surfaces in
+            # the audit reason rather than silently degrading to "non-zero".
+            if BD_ERR=$(bd update "$BEAD_ID" --status=open --assignee="" 2>&1 >/dev/null); then
                 audit "reap-applied" "$RIG" "$BEAD_ID" "$ASSIGNEE" "$UPDATED_AT" "$AGE" "process-orphan"
                 TOTAL_REAPED=$((TOTAL_REAPED + 1))
             else
-                audit "reap-failed" "$RIG" "$BEAD_ID" "$ASSIGNEE" "$UPDATED_AT" "$AGE" "bd update returned non-zero"
+                BD_ERR_TRUNC=$(printf '%s' "$BD_ERR" | head -c 256 | tr '\n' ' ')
+                audit "reap-failed" "$RIG" "$BEAD_ID" "$ASSIGNEE" "$UPDATED_AT" "$AGE" "bd update non-zero: ${BD_ERR_TRUNC:-no stderr}"
             fi
         else
             audit "reap-dry-run" "$RIG" "$BEAD_ID" "$ASSIGNEE" "$UPDATED_AT" "$AGE" "process-orphan"

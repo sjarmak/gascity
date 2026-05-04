@@ -1794,7 +1794,7 @@ func (a *Agent) AttachEnabled() bool {
 //
 // Parent epics are excluded from every tier (--exclude-type=epic). An epic
 // has no executable spec — its semantic is "all children done" — so a worker
-// claiming an epic does undefined work (gc-udx). Roles that legitimately
+// claiming an epic does undefined work. Roles that legitimately
 // process epics (oversight, reviewers, closers) opt in by setting an explicit
 // work_query in their agent config; that custom query is returned unchanged
 // above.

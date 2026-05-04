@@ -15,6 +15,7 @@ import (
 // TestStaleClaimReaperScriptSyntax checks that the materialized script
 // parses as bash. Caught build errors at the script level before runtime.
 func TestStaleClaimReaperScriptSyntax(t *testing.T) {
+	skipSlowCmdGCTest(t, "invokes bash subprocess")
 	dir := t.TempDir()
 	if err := MaterializeBuiltinPacks(dir); err != nil {
 		t.Fatalf("MaterializeBuiltinPacks() error: %v", err)
@@ -64,9 +65,10 @@ func TestStaleClaimReaperDormantWithoutPolicy(t *testing.T) {
 
 	auditPath := filepath.Join(stateDir, "stale-claim-audit.jsonl")
 	if _, err := os.Stat(auditPath); err == nil {
-		// File may exist but should contain no reap-relevant line for a
-		// dormant rig. Reading instead of statting to allow scan markers.
-		data, _ := os.ReadFile(auditPath)
+		data, err := os.ReadFile(auditPath)
+		if err != nil {
+			t.Fatalf("read audit log: %v", err)
+		}
 		if bytes.Contains(data, []byte(`"action":"reap-`)) {
 			t.Fatalf("audit log contains reap action while dormant:\n%s", data)
 		}
@@ -288,7 +290,10 @@ func TestStaleClaimReaperSkipsRecentCommit(t *testing.T) {
 		}
 	}
 	auditPath := filepath.Join(stateDir, "stale-claim-audit.jsonl")
-	auditData, _ := os.ReadFile(auditPath)
+	auditData, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatalf("read audit log: %v", err)
+	}
 	if !strings.Contains(string(auditData), `"action":"reap-skipped-recent-commit"`) {
 		t.Fatalf("expected reap-skipped-recent-commit audit entry, got:\n%s", auditData)
 	}
@@ -387,6 +392,10 @@ exit 0
 	// case (default). When useRealGit is true, the test wants real git on
 	// PATH so callers can actually create commits in the rig fixture.
 	if !rig.useRealGit {
+		realGit, err := exec.LookPath("git")
+		if err != nil {
+			t.Skipf("git not found on PATH: %v", err)
+		}
 		gitShim := `#!/usr/bin/env bash
 # git shim: only handles the queries the reaper makes. For 'log --grep',
 # always print nothing (no commits found). For everything else, exec real git.
@@ -396,7 +405,7 @@ for ((i=1; i<=$#; i++)); do
     exit 0
   fi
 done
-exec /usr/bin/git "$@"
+exec ` + realGit + ` "$@"
 `
 		if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(gitShim), 0o755); err != nil {
 			t.Fatalf("write git shim: %v", err)

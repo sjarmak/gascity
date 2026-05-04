@@ -73,13 +73,10 @@ stale_threshold: "24h"
 
 # Optional: skip beads carrying this metadata key set to "true".
 # Useful for genuinely long-running work that wouldn't produce
-# intermediate commits.
+# intermediate commits. Restricted to identifier characters
+# ([A-Za-z_][A-Za-z0-9_.:-]*); malformed values are ignored with a
+# warning to stderr.
 exclude_metadata: long_running
-
-# Optional: customize the git-log search pattern. Default is the bead
-# ID literal; change only if you embed bead IDs differently in commit
-# messages.
-match_commit_pattern: "{bead_id}"
 ```
 
 The script uses a small built-in YAML scalar parser. The schema is
@@ -100,7 +97,7 @@ Audit fields per line:
 | Field | Meaning |
 | ----- | ------- |
 | `ts` | ISO-8601 UTC time of the audit entry. |
-| `action` | One of `reap-applied`, `reap-dry-run`, `reap-failed`, `reap-skipped-excluded`, `reap-skipped-not-stale`, `reap-skipped-recent-commit`. |
+| `action` | One of `reap-applied`, `reap-dry-run`, `reap-failed`, `reap-skipped-excluded`, `reap-skipped-not-stale`, `reap-skipped-recent-commit`, `reap-skipped-git-error` (rig is a git repo but `git log` failed — corrupt repo, permissions, etc.). |
 | `apply_mode` | `dry-run` or `apply`. |
 | `rig` | Absolute path to the rig the bead was inspected under. |
 | `bead_id` | Bead ID. |

@@ -1108,9 +1108,9 @@ func TestWorkflowServeControlReadyQueryUsesControlTiers(t *testing.T) {
 		t.Fatalf("workflowServeControlReadyQuery should not return in-progress control beads: %q", query)
 	}
 	for _, want := range []string{
-		`bd ready --assignee="$cand"`,
-		`bd ready --metadata-field "gc.routed_to=$GC_CONTROL_TARGET" --unassigned`,
-		`bd ready --metadata-field "gc.routed_to=$GC_CONTROL_LEGACY_TARGET" --unassigned`,
+		`bd ready --assignee="$cand" --exclude-type=epic`,
+		`bd ready --metadata-field "gc.routed_to=$GC_CONTROL_TARGET" --unassigned --exclude-type=epic`,
+		`bd ready --metadata-field "gc.routed_to=$GC_CONTROL_LEGACY_TARGET" --unassigned --exclude-type=epic`,
 	} {
 		if !strings.Contains(query, want) {
 			t.Fatalf("workflowServeControlReadyQuery missing %q in %q", want, query)
@@ -1133,10 +1133,10 @@ case "$*" in
   "list --status in_progress --assignee=gascity--control-dispatcher --json --limit=20")
     printf '[{"id":"ga-in-progress"}]'
     ;;
-  "ready --assignee=gascity--control-dispatcher --json --limit=20")
+  "ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
     printf '[{"id":"ga-ready"}]'
     ;;
-  "ready --metadata-field gc.routed_to=gascity/control-dispatcher --unassigned --json --limit=20")
+  "ready --metadata-field gc.routed_to=gascity/control-dispatcher --unassigned --exclude-type=epic --json --limit=20")
     printf '[{"id":"ga-routed"}]'
     ;;
   *)
@@ -1153,8 +1153,8 @@ func TestWorkflowServeControlReadyQueryQuotesMetadataFallbackTarget(t *testing.T
 	query := workflowServeControlReadyQuery(config.Agent{Name: config.ControlDispatcherAgentName, Dir: "my rig"})
 	out := runWorkflowServeShellQueryForTest(t, query, map[string]string{}, `#!/bin/sh
 set -eu
-case "$1|$2|$3|$4|$5|$6" in
-  "ready|--metadata-field|gc.routed_to=my rig/control-dispatcher|--unassigned|--json|--limit=20")
+case "$1|$2|$3|$4|$5|$6|$7" in
+  "ready|--metadata-field|gc.routed_to=my rig/control-dispatcher|--unassigned|--exclude-type=epic|--json|--limit=20")
     printf '[{"id":"ga-routed"}]'
     ;;
   *)
@@ -1176,7 +1176,7 @@ func TestWorkflowServeControlReadyQueryUsesLegacyRouteForNamedSessions(t *testin
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "ready --metadata-field gc.routed_to=gascity/workflow-control --unassigned --json --limit=20")
+  "ready --metadata-field gc.routed_to=gascity/workflow-control --unassigned --exclude-type=epic --json --limit=20")
     printf '[{"id":"ga-legacy-route"}]'
     ;;
   *)
