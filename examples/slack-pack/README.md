@@ -64,13 +64,16 @@ Not yet implemented (planned):
 
 - [x] `gc slack import-app` — register a Slack app manifest with the gc
       city ([`manifest/README.md`](./manifest/README.md#importing-into-gc-gc-slack-import-app))
-- [x] `gc slack map-channel` — bind a Slack channel to a rig or session;
-      backs the adapter's `/slack/interactions` slash-command dispatcher
-      (rig-target dispatch wiring tracked as gc-cby.18)
+- [x] `gc slack map-channel` — bind a Slack channel to a session;
+      backs the adapter's `/slack/interactions` slash-command
+      dispatcher. (Note: the legacy `--rig` flag on this verb is
+      deprecated as of gc-cby.25; use `gc slack map-rig` for
+      rig→channel bindings. The flag still works for back-compat
+      and emits a stderr deprecation warning.)
 - [x] `gc slack map-rig` — bind a rig to a set of channels as the
       fall-through default for slash-command resolution. Per-channel
-      `map-channel` bindings override rig defaults; channel mapping
-      wins. Cross-store conflict detection refuses contradictory
+      `map-channel --session` bindings override rig defaults; channel
+      mapping wins. Cross-store conflict detection refuses contradictory
       writes in either direction.
 - [ ] `gc slack enable-room-launch` (`@@handle` thread-scoped sessions)
 - [ ] `gc slack post-message` (workflow status projection)

@@ -262,6 +262,65 @@ func TestSlackMapChannelCrossStoreSessionIgnoresRigStore(t *testing.T) {
 	}
 }
 
+// slackMapChannelRigDeprecationHint is the substring that must appear
+// on stderr whenever an operator invokes `gc slack map-channel --rig`.
+// Option-1 unification (gc-cby.25): per-channel rig bindings are
+// deprecated in favor of `gc slack map-rig`. The flag remains
+// functional (back-compat), but the warning steers operators to the
+// canonical verb. Match a minimal, stable substring so wording can
+// evolve without breaking the assertion.
+const slackMapChannelRigDeprecationHint = "deprecated"
+
+func TestSlackMapChannelRigFlagEmitsDeprecationWarning(t *testing.T) {
+	cityRoot := newTestCity(t)
+	stdout, stderr, err := execSlackMapChannelCmd(t, cityRoot,
+		"C0123", "--workspace-id", "T123", "--rig", "alpha",
+	)
+	if err != nil {
+		t.Fatalf("map-channel --rig should still succeed (soft deprecation): %v", err)
+	}
+	if !strings.Contains(stderr, slackMapChannelRigDeprecationHint) {
+		t.Errorf("stderr missing deprecation warning: %q", stderr)
+	}
+	if !strings.Contains(stderr, "map-rig") {
+		t.Errorf("stderr deprecation should redirect to 'map-rig': %q", stderr)
+	}
+	// Operation must still complete: registry record persisted.
+	reg, _ := newSlackChannelMappingRegistry(slackChannelMappingsPath(cityRoot))
+	if rec, ok := reg.Get("T123", "C0123"); !ok || rec.TargetID != "alpha" {
+		t.Errorf("record missing/wrong after deprecated --rig: %+v ok=%v", rec, ok)
+	}
+	// Stdout must still report the mapping (existing operators rely
+	// on parsing this for confirmation).
+	if !strings.Contains(stdout, "alpha") {
+		t.Errorf("stdout missing rig name: %q", stdout)
+	}
+}
+
+func TestSlackMapChannelSessionDoesNotEmitDeprecationWarning(t *testing.T) {
+	cityRoot := newTestCity(t)
+	_, stderr, err := execSlackMapChannelCmd(t, cityRoot,
+		"C1", "--workspace-id", "T1", "--session", "gc-1",
+	)
+	if err != nil {
+		t.Fatalf("map-channel --session: %v", err)
+	}
+	if strings.Contains(stderr, slackMapChannelRigDeprecationHint) {
+		t.Errorf("--session must NOT emit --rig deprecation warning: %q", stderr)
+	}
+}
+
+func TestSlackMapChannelRigFlagHiddenFromHelp(t *testing.T) {
+	cmd := newSlackMapChannelCmd(nil, nil)
+	flag := cmd.Flags().Lookup("rig")
+	if flag == nil {
+		t.Fatal("--rig flag missing entirely; soft deprecation must keep the flag")
+	}
+	if !flag.Hidden {
+		t.Errorf("--rig flag must be Hidden:true after deprecation, got Hidden=%v", flag.Hidden)
+	}
+}
+
 func TestSlackMapChannelIdempotentReSetPreservesCreatedAt(t *testing.T) {
 	cityRoot := newTestCity(t)
 	if _, _, err := execSlackMapChannelCmd(t, cityRoot,

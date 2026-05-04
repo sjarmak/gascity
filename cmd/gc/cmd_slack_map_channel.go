@@ -8,16 +8,29 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// slackMapChannelRigDeprecationWarning is the stderr message emitted
+// whenever an operator invokes `gc slack map-channel --rig`. Per
+// option-1 unification (gc-cby.25), rig→{channels} bindings live in
+// the cby.4 rig-mapping store and are written via `gc slack map-rig`.
+// `map-channel --rig` remains functional for back-compat but is
+// hidden from --help and emits this redirect on every invocation.
+const slackMapChannelRigDeprecationWarning = "warning: 'gc slack map-channel --rig' is deprecated; use 'gc slack map-rig <rig> --workspace-id <ws> --channel <c1> [--channel <c2> ...]' instead. The --rig flag still works for back-compat but will be removed in a future release."
+
 // newSlackMapChannelCmd returns `gc slack map-channel` — the verb that
-// persists a (workspace_id, channel_id) → (rig|session) binding (or
+// persists a (workspace_id, channel_id) → session binding (or
 // removes one) at <cityPath>/.gc/slack/channel_mappings.json. The
-// slack-pack adapter reads this file at startup and uses it to route
-// /slack/interactions slash-command requests.
+// slack-pack adapter reads this file at startup and routes
+// /slack/interactions slash-command requests to the bound session.
 //
-// Per-channel `map-channel` bindings are overrides on top of the
-// rig→{channels} default written by `gc slack map-rig`; channel
-// mapping wins. Cross-store conflict detection refuses to write a
-// `--rig` mapping when the same channel is already bound to a
+// Per-channel `map-channel --session` bindings are overrides on top of
+// the rig→{channels} default written by `gc slack map-rig`; channel
+// mapping wins.
+//
+// The legacy `--rig` flag is deprecated (gc-cby.25) — use `gc slack
+// map-rig` for rig→channel bindings. The flag is hidden from --help
+// but still functional with a stderr deprecation warning. While
+// active, the cby.4 cross-store conflict check still applies: a
+// `--rig` write is rejected when the channel is already bound to a
 // DIFFERENT rig in the rig-mapping registry.
 func newSlackMapChannelCmd(stdout, stderr io.Writer) *cobra.Command {
 	var (
@@ -28,44 +41,56 @@ func newSlackMapChannelCmd(stdout, stderr io.Writer) *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "map-channel <channel-id>",
-		Short: "Bind a Slack channel to a gc rig or session for slash-command routing",
-		Long: `Bind a Slack channel to a gc rig or session for slash-command routing.
+		Short: "Bind a Slack channel to a gc session for slash-command routing",
+		Long: `Bind a Slack channel to a gc session for slash-command routing.
 
-Persists a (workspace_id, channel_id) → (target_kind, target_id) record
-at <cityPath>/.gc/slack/channel_mappings.json. The slack-pack adapter
+Persists a (workspace_id, channel_id) → session record at
+<cityPath>/.gc/slack/channel_mappings.json. The slack-pack adapter
 reads this file at startup and routes incoming /slack/interactions
-slash-command requests for the channel to the bound target.
+slash-command requests for the channel to the bound session.
 
-Exactly one of --rig or --session is required (unless --remove). The
-binding is idempotent: re-binding the same channel preserves the
-original CreatedAt and overwrites the target fields. --remove always
-exits 0 — if no binding exists, the command is a no-op.
+--session is required (unless --remove). The binding is idempotent:
+re-binding the same channel preserves the original CreatedAt and
+overwrites the target fields. --remove always exits 0 — if no
+binding exists, the command is a no-op.
 
-When --rig is used, the cby.4 rig-mapping store
-(<cityPath>/.gc/slack/rig_mappings.json) is consulted: if the channel
-is already bound to a DIFFERENT rig there, the write is rejected.`,
+For rig→channel bindings, use 'gc slack map-rig' (gc-cby.4). The
+legacy '--rig' flag on this verb is deprecated (gc-cby.25); it
+still works for back-compat but emits a deprecation warning.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runSlackMapChannel(stdout, args[0], workspaceID, rigName, sessionID, remove)
+			return runSlackMapChannel(stdout, stderr, args[0], workspaceID, rigName, sessionID, remove)
 		},
 	}
 	cmd.Flags().StringVar(&workspaceID, "workspace-id", "",
 		"Slack workspace (team) id, e.g. T0123456 (required)")
 	cmd.Flags().StringVar(&rigName, "rig", "",
-		"Bind the channel to a gc rig (mutually exclusive with --session)")
+		"DEPRECATED (gc-cby.25): use 'gc slack map-rig' instead. Bind the channel to a gc rig.")
 	cmd.Flags().StringVar(&sessionID, "session", "",
 		"Bind the channel to a gc session (mutually exclusive with --rig)")
 	cmd.Flags().BoolVar(&remove, "remove", false,
 		"Remove the binding for <channel-id> if one exists (idempotent)")
 	_ = cmd.MarkFlagRequired("workspace-id")
 	cmd.MarkFlagsMutuallyExclusive("rig", "session")
+	// --rig is hidden from --help to steer new users at map-rig, but
+	// still functional with a deprecation warning for existing scripts.
+	if f := cmd.Flags().Lookup("rig"); f != nil {
+		f.Hidden = true
+	}
 	return cmd
 }
 
-func runSlackMapChannel(stdout io.Writer, channelID, workspaceID, rigName, sessionID string, remove bool) error {
+func runSlackMapChannel(stdout, stderr io.Writer, channelID, workspaceID, rigName, sessionID string, remove bool) error {
 	cityPath, err := resolveCity()
 	if err != nil {
 		return fmt.Errorf("resolve city: %w", err)
+	}
+	// Soft deprecation (gc-cby.25): `--rig` on map-channel is
+	// superseded by the purpose-built `gc slack map-rig` verb. Emit
+	// the redirect on every --rig invocation; the existing
+	// --remove/--rig mutual-exclusion error fires below.
+	if rigName != "" {
+		fmt.Fprintln(stderr, slackMapChannelRigDeprecationWarning) //nolint:errcheck
 	}
 	if remove {
 		if rigName != "" || sessionID != "" {

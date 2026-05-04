@@ -295,8 +295,8 @@ func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry, rigReg 
 		rec, source, ok := resolveChannelTarget(mapReg, rigReg, teamID, channelID)
 		if !ok {
 			writeEphemeral(w, http.StatusOK, fmt.Sprintf(
-				"No binding for this channel. Run `gc slack map-channel %s --workspace-id %s --rig <name>` (or `--session <id>`), or bind a rig set with `gc slack map-rig <name> --workspace-id %s --channel %s`.",
-				channelID, teamID, teamID, channelID))
+				"No binding for this channel. Bind a rig with `gc slack map-rig <name> --workspace-id %s --channel %s`, or bind a session with `gc slack map-channel %s --workspace-id %s --session <id>`.",
+				teamID, channelID, channelID, teamID))
 			return
 		}
 		log.Printf("interaction: workspace=%q channel=%q source=%s target=%s/%s",
