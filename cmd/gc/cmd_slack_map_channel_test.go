@@ -11,7 +11,7 @@ func execSlackMapChannelCmd(t *testing.T, cityRoot string, args ...string) (stri
 	t.Helper()
 	t.Chdir(cityRoot)
 	var stdout, stderr bytes.Buffer
-	cmd := newSlackMapChannelCmd(&stdout, &stderr)
+	cmd := newSlackMapChannelCmd(&stdout)
 	cmd.SetOut(&stdout)
 	cmd.SetErr(&stderr)
 	cmd.SetArgs(args)
@@ -262,36 +262,37 @@ func TestSlackMapChannelCrossStoreSessionIgnoresRigStore(t *testing.T) {
 	}
 }
 
-// slackMapChannelRigDeprecationHint is the substring that must appear
-// on stderr whenever an operator invokes `gc slack map-channel --rig`.
-// Option-1 unification (gc-cby.25): per-channel rig bindings are
-// deprecated in favor of `gc slack map-rig`. The flag remains
-// functional (back-compat), but the warning steers operators to the
-// canonical verb. Match a minimal, stable substring so wording can
-// evolve without breaking the assertion.
+// slackMapChannelRigDeprecationHint is the substring cobra's
+// MarkDeprecated emits whenever an operator invokes `gc slack
+// map-channel --rig`. Option-1 unification (gc-cby.25): per-channel
+// rig bindings are deprecated in favor of `gc slack map-rig`. The
+// flag remains functional (back-compat) and cobra steers operators
+// to the canonical verb. Match a minimal, stable substring so the
+// flag-deprecation message wording can evolve without breaking the
+// assertion. Cobra writes the warning to OutOrStderr → cmd.outWriter
+// (i.e., stdout in this codebase, where root.SetOut(stdout) is set);
+// see cmd_events.go --json deprecation for the same pattern.
 const slackMapChannelRigDeprecationHint = "deprecated"
 
 func TestSlackMapChannelRigFlagEmitsDeprecationWarning(t *testing.T) {
 	cityRoot := newTestCity(t)
-	stdout, stderr, err := execSlackMapChannelCmd(t, cityRoot,
+	stdout, _, err := execSlackMapChannelCmd(t, cityRoot,
 		"C0123", "--workspace-id", "T123", "--rig", "alpha",
 	)
 	if err != nil {
 		t.Fatalf("map-channel --rig should still succeed (soft deprecation): %v", err)
 	}
-	if !strings.Contains(stderr, slackMapChannelRigDeprecationHint) {
-		t.Errorf("stderr missing deprecation warning: %q", stderr)
+	if !strings.Contains(stdout, slackMapChannelRigDeprecationHint) {
+		t.Errorf("stdout missing cobra deprecation warning: %q", stdout)
 	}
-	if !strings.Contains(stderr, "map-rig") {
-		t.Errorf("stderr deprecation should redirect to 'map-rig': %q", stderr)
+	if !strings.Contains(stdout, "map-rig") {
+		t.Errorf("stdout deprecation should redirect to 'map-rig': %q", stdout)
 	}
 	// Operation must still complete: registry record persisted.
 	reg, _ := newSlackChannelMappingRegistry(slackChannelMappingsPath(cityRoot))
 	if rec, ok := reg.Get("T123", "C0123"); !ok || rec.TargetID != "alpha" {
 		t.Errorf("record missing/wrong after deprecated --rig: %+v ok=%v", rec, ok)
 	}
-	// Stdout must still report the mapping (existing operators rely
-	// on parsing this for confirmation).
 	if !strings.Contains(stdout, "alpha") {
 		t.Errorf("stdout missing rig name: %q", stdout)
 	}
@@ -299,19 +300,19 @@ func TestSlackMapChannelRigFlagEmitsDeprecationWarning(t *testing.T) {
 
 func TestSlackMapChannelSessionDoesNotEmitDeprecationWarning(t *testing.T) {
 	cityRoot := newTestCity(t)
-	_, stderr, err := execSlackMapChannelCmd(t, cityRoot,
+	stdout, _, err := execSlackMapChannelCmd(t, cityRoot,
 		"C1", "--workspace-id", "T1", "--session", "gc-1",
 	)
 	if err != nil {
 		t.Fatalf("map-channel --session: %v", err)
 	}
-	if strings.Contains(stderr, slackMapChannelRigDeprecationHint) {
-		t.Errorf("--session must NOT emit --rig deprecation warning: %q", stderr)
+	if strings.Contains(stdout, slackMapChannelRigDeprecationHint) {
+		t.Errorf("--session must NOT emit --rig deprecation warning: %q", stdout)
 	}
 }
 
 func TestSlackMapChannelRigFlagHiddenFromHelp(t *testing.T) {
-	cmd := newSlackMapChannelCmd(nil, nil)
+	cmd := newSlackMapChannelCmd(nil)
 	flag := cmd.Flags().Lookup("rig")
 	if flag == nil {
 		t.Fatal("--rig flag missing entirely; soft deprecation must keep the flag")

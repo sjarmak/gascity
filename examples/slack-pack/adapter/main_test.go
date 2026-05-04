@@ -792,12 +792,22 @@ func TestDispatchToAliasedSession(t *testing.T) {
 // TestDispatchToAliasedSessionEscapesPathSegments verifies that cityName and
 // sessionID values containing URL-significant characters are percent-encoded
 // in the constructed dispatch URL (sec-S-06). The receiver decodes them and
-// observes the original logical values via r.URL.Path.
+// observes the original logical values via r.URL.Path. Channel-based
+// capture matches the sister test in interactions_test.go and keeps the
+// pattern race-clean if dispatchToAliasedSession is ever moved into a
+// goroutine in tests (production call site at main.go:1525 already does).
 func TestDispatchToAliasedSessionEscapesPathSegments(t *testing.T) {
-	var rawPath, decodedPath string
+	rawPathCh := make(chan string, 1)
+	decodedPathCh := make(chan string, 1)
 	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rawPath = r.URL.EscapedPath()
-		decodedPath = r.URL.Path
+		select {
+		case rawPathCh <- r.URL.EscapedPath():
+		default:
+		}
+		select {
+		case decodedPathCh <- r.URL.Path:
+		default:
+		}
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	t.Cleanup(gcStub.Close)
@@ -813,6 +823,18 @@ func TestDispatchToAliasedSessionEscapesPathSegments(t *testing.T) {
 	}
 	dispatchToAliasedSession(cfg, "gc/2568%evil", inbound, "mayor")
 
+	var rawPath, decodedPath string
+	select {
+	case rawPath = <-rawPathCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatch did not POST to gc stub within 2s")
+	}
+	select {
+	case decodedPath = <-decodedPathCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatch did not send decoded path within 2s")
+	}
+
 	// EscapedPath preserves percent-encoding; assert the raw form contains
 	// the encoded delimiters so the receiver-side router cannot be tricked
 	// by an embedded slash or percent.
@@ -824,7 +846,9 @@ func TestDispatchToAliasedSessionEscapesPathSegments(t *testing.T) {
 	if !strings.Contains(rawPath, wantRawSession) {
 		t.Errorf("raw path %q missing escaped sessionID %q", rawPath, wantRawSession)
 	}
-	// Decoded path should round-trip to the original logical values.
+	// Decoded path round-trips to original logical values. Note the literal
+	// '%' in "2568%evil" — pflag's net/http server decodes the wire form
+	// "%25" back to "%" so r.URL.Path observes the original string.
 	wantDecoded := "/v0/city/city/with slash/session/gc/2568%evil/messages"
 	if decodedPath != wantDecoded {
 		t.Errorf("decoded path = %q, want %q", decodedPath, wantDecoded)

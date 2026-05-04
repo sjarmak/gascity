@@ -579,7 +579,8 @@ func TestDispatchSlashCommandToSessionEscapesPathSegments(t *testing.T) {
 	}
 	select {
 	case decodedPath = <-decodedPathCh:
-	default:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatch goroutine did not send decoded path within 2s")
 	}
 
 	wantRawCity := "city%2Fwith%20slash"
@@ -590,6 +591,9 @@ func TestDispatchSlashCommandToSessionEscapesPathSegments(t *testing.T) {
 	if !strings.Contains(rawPath, wantRawSession) {
 		t.Errorf("raw path %q missing escaped sessionID %q", rawPath, wantRawSession)
 	}
+	// Decoded path round-trips. Note the literal '%' in "2568%evil" —
+	// the wire form "%25" is decoded back to "%" by net/http on the
+	// receiver side, so r.URL.Path observes the original string.
 	wantDecoded := "/v0/city/city/with slash/session/gc/2568%evil/messages"
 	if decodedPath != wantDecoded {
 		t.Errorf("decoded path = %q, want %q", decodedPath, wantDecoded)

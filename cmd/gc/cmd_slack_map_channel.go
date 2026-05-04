@@ -8,14 +8,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// slackMapChannelRigDeprecationWarning is the stderr message emitted
-// whenever an operator invokes `gc slack map-channel --rig`. Per
-// option-1 unification (gc-cby.25), rig→{channels} bindings live in
-// the cby.4 rig-mapping store and are written via `gc slack map-rig`.
-// `map-channel --rig` remains functional for back-compat but is
-// hidden from --help and emits this redirect on every invocation.
-const slackMapChannelRigDeprecationWarning = "warning: 'gc slack map-channel --rig' is deprecated; use 'gc slack map-rig <rig> --workspace-id <ws> --channel <c1> [--channel <c2> ...]' instead. The --rig flag still works for back-compat but will be removed in a future release."
-
 // newSlackMapChannelCmd returns `gc slack map-channel` — the verb that
 // persists a (workspace_id, channel_id) → session binding (or
 // removes one) at <cityPath>/.gc/slack/channel_mappings.json. The
@@ -27,12 +19,12 @@ const slackMapChannelRigDeprecationWarning = "warning: 'gc slack map-channel --r
 // mapping wins.
 //
 // The legacy `--rig` flag is deprecated (gc-cby.25) — use `gc slack
-// map-rig` for rig→channel bindings. The flag is hidden from --help
-// but still functional with a stderr deprecation warning. While
-// active, the cby.4 cross-store conflict check still applies: a
-// `--rig` write is rejected when the channel is already bound to a
-// DIFFERENT rig in the rig-mapping registry.
-func newSlackMapChannelCmd(stdout, stderr io.Writer) *cobra.Command {
+// map-rig` for rig→channel bindings. Cobra's MarkDeprecated handles
+// the redirect: hides from --help and emits a stderr warning on
+// every invocation. While active, the cby.4 cross-store conflict
+// check still applies: a `--rig` write is rejected when the channel
+// is already bound to a DIFFERENT rig in the rig-mapping registry.
+func newSlackMapChannelCmd(stdout io.Writer) *cobra.Command {
 	var (
 		workspaceID string
 		rigName     string
@@ -55,11 +47,12 @@ overwrites the target fields. --remove always exits 0 — if no
 binding exists, the command is a no-op.
 
 For rig→channel bindings, use 'gc slack map-rig' (gc-cby.4). The
-legacy '--rig' flag on this verb is deprecated (gc-cby.25); it
-still works for back-compat but emits a deprecation warning.`,
+legacy '--rig' flag on this verb is deprecated (gc-cby.25); cobra
+hides it from --help and emits a stderr deprecation warning on
+every use.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runSlackMapChannel(stdout, stderr, args[0], workspaceID, rigName, sessionID, remove)
+			return runSlackMapChannel(stdout, args[0], workspaceID, rigName, sessionID, remove)
 		},
 	}
 	cmd.Flags().StringVar(&workspaceID, "workspace-id", "",
@@ -72,25 +65,18 @@ still works for back-compat but emits a deprecation warning.`,
 		"Remove the binding for <channel-id> if one exists (idempotent)")
 	_ = cmd.MarkFlagRequired("workspace-id")
 	cmd.MarkFlagsMutuallyExclusive("rig", "session")
-	// --rig is hidden from --help to steer new users at map-rig, but
-	// still functional with a deprecation warning for existing scripts.
-	if f := cmd.Flags().Lookup("rig"); f != nil {
-		f.Hidden = true
-	}
+	// MarkDeprecated auto-hides --rig from --help and emits
+	// "Flag --rig has been deprecated, ..." on stderr at parse time.
+	// Pattern mirrors cmd_events.go's --json deprecation.
+	_ = cmd.Flags().MarkDeprecated("rig",
+		"use 'gc slack map-rig <rig> --workspace-id <ws> --channel <c1> [--channel <c2> ...]' instead; the flag will be removed in a future release")
 	return cmd
 }
 
-func runSlackMapChannel(stdout, stderr io.Writer, channelID, workspaceID, rigName, sessionID string, remove bool) error {
+func runSlackMapChannel(stdout io.Writer, channelID, workspaceID, rigName, sessionID string, remove bool) error {
 	cityPath, err := resolveCity()
 	if err != nil {
 		return fmt.Errorf("resolve city: %w", err)
-	}
-	// Soft deprecation (gc-cby.25): `--rig` on map-channel is
-	// superseded by the purpose-built `gc slack map-rig` verb. Emit
-	// the redirect on every --rig invocation; the existing
-	// --remove/--rig mutual-exclusion error fires below.
-	if rigName != "" {
-		fmt.Fprintln(stderr, slackMapChannelRigDeprecationWarning) //nolint:errcheck
 	}
 	if remove {
 		if rigName != "" || sessionID != "" {
