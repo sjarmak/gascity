@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,9 +17,21 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// TestMain installs a default dispatchSem capacity for all tests in
+// this package. Production main() initializes dispatchSem from
+// loadConfig; tests that exercise dispatch goroutines without going
+// through main need a non-nil channel here. Tests asserting drop-on-
+// saturation behavior install their own scoped sem via
+// setDispatchSemaphoreForTest.
+func TestMain(m *testing.M) {
+	dispatchSem = make(chan struct{}, 50)
+	os.Exit(m.Run())
+}
 
 // stubEnv builds a getenv function from a fixed map, mirroring os.Getenv's
 // "missing key returns empty string" contract.
@@ -2692,4 +2705,236 @@ func TestVerifySlackSignatureFailsClosedOnMalformedTimestamp(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLoadConfigDispatchConcurrencyDefault verifies the default cap
+// when SLACK_DISPATCH_CONCURRENCY is unset. sec-S-04.
+func TestLoadConfigDispatchConcurrencyDefault(t *testing.T) {
+	cfg, err := loadConfigFromEnv(stubEnv(baseSlackEnv()))
+	if err != nil {
+		t.Fatalf("loadConfigFromEnv: %v", err)
+	}
+	if cfg.dispatchConcurrency != 50 {
+		t.Errorf("dispatchConcurrency = %d, want 50 (default)", cfg.dispatchConcurrency)
+	}
+}
+
+// TestLoadConfigDispatchConcurrencyOverride verifies operator override
+// via SLACK_DISPATCH_CONCURRENCY. sec-S-04.
+func TestLoadConfigDispatchConcurrencyOverride(t *testing.T) {
+	env := baseSlackEnv()
+	env["SLACK_DISPATCH_CONCURRENCY"] = "5"
+	cfg, err := loadConfigFromEnv(stubEnv(env))
+	if err != nil {
+		t.Fatalf("loadConfigFromEnv: %v", err)
+	}
+	if cfg.dispatchConcurrency != 5 {
+		t.Errorf("dispatchConcurrency = %d, want 5", cfg.dispatchConcurrency)
+	}
+}
+
+// TestLoadConfigDispatchConcurrencyRejectsZero — SLACK_DISPATCH_CONCURRENCY=0
+// would silently disable inbound dispatch, almost certainly a misconfiguration.
+// Fail-fast at startup. sec-S-04.
+func TestLoadConfigDispatchConcurrencyRejectsZero(t *testing.T) {
+	env := baseSlackEnv()
+	env["SLACK_DISPATCH_CONCURRENCY"] = "0"
+	_, err := loadConfigFromEnv(stubEnv(env))
+	if err == nil {
+		t.Fatal("loadConfigFromEnv: want error for SLACK_DISPATCH_CONCURRENCY=0, got nil")
+	}
+	if !strings.Contains(err.Error(), "SLACK_DISPATCH_CONCURRENCY") {
+		t.Errorf("error %q must mention SLACK_DISPATCH_CONCURRENCY", err.Error())
+	}
+}
+
+// TestLoadConfigDispatchConcurrencyRejectsNegative — same fail-fast
+// rationale as zero. sec-S-04.
+func TestLoadConfigDispatchConcurrencyRejectsNegative(t *testing.T) {
+	env := baseSlackEnv()
+	env["SLACK_DISPATCH_CONCURRENCY"] = "-3"
+	_, err := loadConfigFromEnv(stubEnv(env))
+	if err == nil {
+		t.Fatal("loadConfigFromEnv: want error for SLACK_DISPATCH_CONCURRENCY=-3, got nil")
+	}
+	if !strings.Contains(err.Error(), "SLACK_DISPATCH_CONCURRENCY") {
+		t.Errorf("error %q must mention SLACK_DISPATCH_CONCURRENCY", err.Error())
+	}
+}
+
+// TestLoadConfigDispatchConcurrencyRejectsNonNumeric — operator typo'd
+// the value (or the var name); fail-fast rather than silently
+// accepting a default. sec-S-04.
+func TestLoadConfigDispatchConcurrencyRejectsNonNumeric(t *testing.T) {
+	env := baseSlackEnv()
+	env["SLACK_DISPATCH_CONCURRENCY"] = "abc"
+	_, err := loadConfigFromEnv(stubEnv(env))
+	if err == nil {
+		t.Fatal("loadConfigFromEnv: want error for SLACK_DISPATCH_CONCURRENCY=abc, got nil")
+	}
+	if !strings.Contains(err.Error(), "SLACK_DISPATCH_CONCURRENCY") {
+		t.Errorf("error %q must mention SLACK_DISPATCH_CONCURRENCY", err.Error())
+	}
+}
+
+// captureLog redirects log.Printf output to an in-memory buffer for
+// the duration of the returned cleanup. Caller must not call t.Parallel.
+func captureLog(t *testing.T) (read func() string, cleanup func()) {
+	t.Helper()
+	prevOut := log.Writer()
+	prevFlags := log.Flags()
+	prevPrefix := log.Prefix()
+	var buf strings.Builder
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	return func() string { return buf.String() }, func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+		log.SetPrefix(prevPrefix)
+	}
+}
+
+// TestProcessSlackEventDropsAliasDispatchWhenSemaphoreFull verifies
+// the alias-resolved dispatch goroutine in processSlackEvent is
+// dropped (and logged) when the dispatch semaphore is saturated.
+// sec-S-04.
+func TestProcessSlackEventDropsAliasDispatchWhenSemaphoreFull(t *testing.T) {
+	// Stub gc API that records inbound + alias-dispatch hits.
+	var inboundHits, aliasHits int32
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/extmsg/inbound"):
+			atomic.AddInt32(&inboundHits, 1)
+		case strings.Contains(r.URL.Path, "/session/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			atomic.AddInt32(&aliasHits, 1)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	// Saturate the semaphore: cap=1, hold the only slot.
+	restore := setDispatchSemaphoreForTest(1)
+	t.Cleanup(restore)
+	holdRelease, _, ok := acquireDispatchSlot()
+	if !ok {
+		t.Fatal("acquireDispatchSlot: failed to take initial slot in fresh sem")
+	}
+	t.Cleanup(holdRelease)
+
+	cfg := config{
+		gcAPIBase:    gcStub.URL,
+		cityName:     "test-city",
+		provider:     "slack",
+		accountID:    "T1",
+		handlePrefix: "@",
+	}
+	aliasReg := newTestHandleAliasRegistry(t)
+	if err := aliasReg.Set("mayor", "gc-2568"); err != nil {
+		t.Fatalf("aliasReg.Set: %v", err)
+	}
+
+	read, cleanup := captureLog(t)
+	t.Cleanup(cleanup)
+
+	// Pre-formed message envelope so processSlackEvent sees an
+	// alias-resolvable target.
+	rawMsg, _ := json.Marshal(slackMessageEvent{
+		Type:    "message",
+		Channel: "C1",
+		User:    "U1",
+		TS:      "1.0",
+		Text:    "@mayor please ack",
+	})
+	env := slackEventEnvelope{Type: "event_callback", Event: rawMsg}
+
+	// processSlackEvent posts inbound (synchronous), then attempts
+	// the alias dispatch via the semaphore-guarded goroutine.
+	processSlackEvent(cfg, aliasReg, env)
+
+	// inbound POST is synchronous and unrelated to the sem; it should
+	// have hit the stub.
+	if atomic.LoadInt32(&inboundHits) != 1 {
+		t.Errorf("inbound POSTs = %d, want 1 (semaphore should not gate inbound)", atomic.LoadInt32(&inboundHits))
+	}
+	// Alias dispatch should have been dropped — the only slot is held
+	// by this test goroutine. Give the runtime a chance to schedule
+	// any spurious goroutine before asserting.
+	time.Sleep(100 * time.Millisecond)
+	if got := atomic.LoadInt32(&aliasHits); got != 0 {
+		t.Errorf("alias dispatch hits = %d, want 0 (sem full → drop)", got)
+	}
+	if !strings.Contains(read(), "dispatch queue full") {
+		t.Errorf("log missing 'dispatch queue full' marker:\n%s", read())
+	}
+	if !strings.Contains(read(), "cap=1") {
+		t.Errorf("log missing cap=1 marker:\n%s", read())
+	}
+}
+
+// TestProcessSlackEventDispatchesAliasWhenSemaphoreHasRoom — happy
+// path: with a non-saturated semaphore, the alias dispatch goroutine
+// runs and POSTs to the gc session-message endpoint. sec-S-04 guard.
+func TestProcessSlackEventDispatchesAliasWhenSemaphoreHasRoom(t *testing.T) {
+	pathCh := make(chan string, 1)
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		if strings.Contains(r.URL.Path, "/session/") {
+			select {
+			case pathCh <- r.URL.Path:
+			default:
+			}
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	restore := setDispatchSemaphoreForTest(2)
+	t.Cleanup(restore)
+
+	cfg := config{
+		gcAPIBase:    gcStub.URL,
+		cityName:     "test-city",
+		provider:     "slack",
+		accountID:    "T1",
+		handlePrefix: "@",
+	}
+	aliasReg := newTestHandleAliasRegistry(t)
+	if err := aliasReg.Set("mayor", "gc-2568"); err != nil {
+		t.Fatalf("aliasReg.Set: %v", err)
+	}
+
+	rawMsg, _ := json.Marshal(slackMessageEvent{
+		Type:    "message",
+		Channel: "C1",
+		User:    "U1",
+		TS:      "1.0",
+		Text:    "@mayor please ack",
+	})
+	env := slackEventEnvelope{Type: "event_callback", Event: rawMsg}
+
+	processSlackEvent(cfg, aliasReg, env)
+
+	select {
+	case path := <-pathCh:
+		want := "/v0/city/test-city/session/gc-2568/messages"
+		if path != want {
+			t.Errorf("alias dispatch path = %q, want %q", path, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("alias dispatch goroutine did not POST within 2s")
+	}
+}
+
+// newTestHandleAliasRegistry builds an isolated handle-alias registry
+// in a tmpdir for tests that need one.
+func newTestHandleAliasRegistry(t *testing.T) *handleAliasRegistry {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "handle-aliases.json")
+	reg, err := newHandleAliasRegistry(path)
+	if err != nil {
+		t.Fatalf("newHandleAliasRegistry: %v", err)
+	}
+	return reg
 }

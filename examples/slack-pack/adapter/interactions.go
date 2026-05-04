@@ -304,9 +304,20 @@ func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry, rigReg 
 
 		switch rec.TargetKind {
 		case channelMappingTargetKindSession:
+			release, capacity, acquired := acquireDispatchSlot()
+			if !acquired {
+				log.Printf("slack adapter: dispatch queue full (cap=%d), dropping slash command=%q channel=%q session=%q",
+					capacity, command, channelID, rec.TargetID)
+				writeEphemeral(w, http.StatusOK,
+					"Slack adapter is currently saturated; please retry shortly.")
+				return
+			}
 			writeEphemeral(w, http.StatusOK, fmt.Sprintf(
 				"Routing %s to session %s…", command, rec.TargetID))
-			go dispatchSlashCommandToSession(cfg, rec.TargetID, command, text, channelID, teamID, userID)
+			go func() {
+				defer release()
+				dispatchSlashCommandToSession(cfg, rec.TargetID, command, text, channelID, teamID, userID)
+			}()
 		case channelMappingTargetKindRig:
 			writeEphemeral(w, http.StatusOK, fmt.Sprintf(
 				"Channel %s is bound to rig %s (source=%s). Rig-target dispatch is implemented in a follow-up bead (gc-cby.18); the binding is recorded but not yet routed.",

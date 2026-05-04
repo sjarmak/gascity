@@ -241,6 +241,7 @@ package docstring at the top of that file. Summary:
 | `INBOUND_FILE_STORE`           | `/tmp/gc-slack-adapter/inbound`                  | Directory for downloaded inbound Slack file attachments.                        |
 | `INBOUND_FILE_TTL`             | `168h` (7 days)                                  | Janitor retention. `0` disables sweeping.                                       |
 | `INBOUND_FILE_SWEEP_INTERVAL`  | `1h`                                             | Janitor scan period. `0` disables sweeping.                                     |
+| `SLACK_DISPATCH_CONCURRENCY`   | `50`                                             | Cap on in-flight inbound-dispatch goroutines (slash-command, slack-event, alias-resolved). On saturation the adapter drops the dispatch with a `dispatch queue full` log line; the inbound POST itself is not affected. Must be a positive integer; 0/negative/non-numeric values fail at startup. (sec-S-04) |
 
 **Permissions:** `IDENTITY_STORE_PATH`, `HANDLE_ALIAS_STORE_PATH`, and
 `INBOUND_FILE_STORE` are written with `0o700` directories and `0o600`

@@ -182,6 +182,49 @@ const (
 // slackAPIBase is a var (not const) so tests can replace it with a fake.
 var slackAPIBase = "https://slack.com/api"
 
+// dispatchSem caps the number of concurrent inbound dispatch
+// goroutines (slash-command → session, slack-event → session,
+// alias-resolved → session). Initialized in main() from
+// config.dispatchConcurrency. Tests that exercise the dispatch
+// goroutines must call setDispatchSemaphoreForTest to install a
+// scoped semaphore and restore the previous one in t.Cleanup.
+// The pre-init nil channel deliberately blocks forever in the select's
+// send case so a caller hitting the dispatch path before main() has
+// initialized falls through to the non-blocking `default` branch and
+// the request is dropped with a clear log line. main() must
+// initialize this var before any dispatch site fires. sec-S-04.
+var dispatchSem chan struct{}
+
+// acquireDispatchSlot tries to acquire one slot on dispatchSem
+// without blocking. On success it returns a release func bound to
+// the channel observed at acquire time, plus the channel's capacity
+// (handy for log messages); on failure it returns nil and the
+// observed cap. The caller must defer release() at goroutine entry.
+//
+// Capturing the channel reference at acquire time keeps the goroutine
+// race-clean even if tests swap dispatchSem out via
+// setDispatchSemaphoreForTest before the goroutine completes.
+func acquireDispatchSlot() (release func(), capacity int, ok bool) {
+	sem := dispatchSem
+	semCap := cap(sem)
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, semCap, true
+	default:
+		return nil, semCap, false
+	}
+}
+
+// setDispatchSemaphoreForTest installs a fresh dispatchSem of the
+// given capacity and restores the previous one when the test ends.
+// Tests using this helper must NOT call t.Parallel — dispatchSem is
+// package-level state.
+func setDispatchSemaphoreForTest(capacity int) func() {
+	prev := dispatchSem
+	dispatchSem = make(chan struct{}, capacity)
+	return func() { dispatchSem = prev }
+}
+
 type config struct {
 	publicListen        string
 	internalListen      string // unused when serviceSocket is set
@@ -250,6 +293,16 @@ type config struct {
 	// caller cannot ask the adapter to upload arbitrary files (e.g.
 	// /etc/passwd) on its behalf. Sourced from FILE_UPLOAD_ROOT.
 	fileUploadRoot string
+	// dispatchConcurrency caps the number of in-flight inbound
+	// dispatch goroutines (slash-command → session, slack-event →
+	// session, alias-resolved → session). A burst of inbound traffic
+	// otherwise spawns one goroutine per request, each holding an
+	// http.Client with a 10s timeout — memory and FD pressure scale
+	// linearly with traffic. Sourced from SLACK_DISPATCH_CONCURRENCY,
+	// default 50. Must be a positive integer; loadConfig rejects 0,
+	// negative, and non-numeric values rather than silently disabling
+	// dispatch. sec-S-04.
+	dispatchConcurrency int
 }
 
 func loadConfig() (config, error) {
@@ -315,6 +368,22 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 		cfg.inboundFileSweepInterval = d
 	} else {
 		log.Printf("INBOUND_FILE_SWEEP_INTERVAL %q invalid: %v (janitor disabled)", getenv("INBOUND_FILE_SWEEP_INTERVAL"), err)
+	}
+
+	// dispatchConcurrency: bound goroutine fan-out on inbound dispatch
+	// paths. Reject 0/negative/non-numeric at startup — silently
+	// disabling dispatch (cap=0 -> always-drop) is almost certainly a
+	// misconfiguration, and a non-numeric value usually means the
+	// operator typo'd the var name. sec-S-04.
+	if raw := envOrFn("SLACK_DISPATCH_CONCURRENCY", "50"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return cfg, fmt.Errorf("SLACK_DISPATCH_CONCURRENCY %q is not an integer: %w", raw, err)
+		}
+		if n <= 0 {
+			return cfg, fmt.Errorf("SLACK_DISPATCH_CONCURRENCY must be > 0, got %d", n)
+		}
+		cfg.dispatchConcurrency = n
 	}
 
 	if cfg.serviceSocket != "" {
@@ -647,12 +716,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+	// Initialize the shared dispatch semaphore from config. cap is a
+	// fixed positive int — loadConfig rejected 0/negative. sec-S-04.
+	dispatchSem = make(chan struct{}, cfg.dispatchConcurrency)
 	internalDescr := cfg.internalListen
 	if cfg.serviceSocket != "" {
 		internalDescr = "uds:" + cfg.serviceSocket
 	}
-	log.Printf("starting gc-slack-adapter public=%s internal=%s gc=%s city=%s",
-		cfg.publicListen, internalDescr, cfg.gcAPIBase, cfg.cityName)
+	log.Printf("starting gc-slack-adapter public=%s internal=%s gc=%s city=%s dispatch_concurrency=%d",
+		cfg.publicListen, internalDescr, cfg.gcAPIBase, cfg.cityName, cfg.dispatchConcurrency)
 
 	// Tighten any pre-existing /tmp/gc-slack-adapter/* state from
 	// pre-fix installs to 0o700 dirs / 0o600 files. Must run BEFORE
@@ -1398,7 +1470,16 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry) http.HandlerFu
 
 		// Process event_callback. Always 200 quickly to avoid Slack retries.
 		w.WriteHeader(http.StatusOK)
-		go processSlackEvent(cfg, aliasReg, env)
+		release, capacity, ok := acquireDispatchSlot()
+		if !ok {
+			log.Printf("slack adapter: dispatch queue full (cap=%d), dropping slack event type=%q",
+				capacity, env.Type)
+			return
+		}
+		go func() {
+			defer release()
+			processSlackEvent(cfg, aliasReg, env)
+		}()
 	}
 }
 
@@ -1522,7 +1603,16 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, env slackEvent
 	// because target != its handle.
 	if target != "" && aliasReg != nil {
 		if aliasedSessionID, ok := aliasReg.Get(target); ok {
-			go dispatchToAliasedSession(cfg, aliasedSessionID, inbound, target)
+			release, capacity, acquired := acquireDispatchSlot()
+			if !acquired {
+				log.Printf("slack adapter: dispatch queue full (cap=%d), dropping alias dispatch handle=%q session=%q",
+					capacity, target, aliasedSessionID)
+			} else {
+				go func() {
+					defer release()
+					dispatchToAliasedSession(cfg, aliasedSessionID, inbound, target)
+				}()
+			}
 		}
 	}
 }

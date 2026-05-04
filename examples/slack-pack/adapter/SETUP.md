@@ -139,6 +139,14 @@ GC_CITY_NAME=<your-city-name>
 # it sourced before `gc start` so the supervisor inherits it for the
 # spawned adapter (it is NOT auto-injected by the controller).
 # GC_API_BASE_URL=http://127.0.0.1:8372
+
+# Bound goroutine fan-out on inbound dispatch paths (slash-command,
+# slack-event, alias-resolved). Each in-flight dispatch holds an
+# http.Client with a 10s timeout, so unbounded fan-out scales memory
+# and FD pressure with traffic. Default 50; raise for high-traffic
+# workspaces, lower to harden against bursts. Must be a positive
+# integer; 0/negative/non-numeric values fail at startup. sec-S-04.
+# SLACK_DISPATCH_CONCURRENCY=50
 EOF
 chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/gc-slack-adapter/env"
 ```

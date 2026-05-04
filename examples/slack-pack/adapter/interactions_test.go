@@ -599,3 +599,134 @@ func TestDispatchSlashCommandToSessionEscapesPathSegments(t *testing.T) {
 		t.Errorf("decoded path = %q, want %q", decodedPath, wantDecoded)
 	}
 }
+
+// TestSlackInteractionsDropsSlashCommandWhenSemaphoreFull verifies
+// that a saturated dispatch semaphore causes the slash-command
+// handler to drop the dispatch (logging + ephemeral "saturated"
+// reply), instead of spawning an unbounded goroutine. sec-S-04.
+func TestSlackInteractionsDropsSlashCommandWhenSemaphoreFull(t *testing.T) {
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Any hit here would be a regression: with the semaphore full,
+		// the dispatch goroutine should not run.
+		w.WriteHeader(http.StatusAccepted)
+		t.Errorf("gc stub hit unexpectedly: %s", r.URL.Path)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	cfg := config{
+		slackSigningKey: "secret",
+		accountID:       "T1",
+		cityName:        "test-city",
+		gcAPIBase:       gcStub.URL,
+	}
+	mapReg := newTestChannelMappingRegistry(t)
+	now := time.Now().UTC()
+	if err := mapReg.Set(channelMappingDiskRecord{
+		WorkspaceID: "T1", ChannelID: "C1",
+		TargetKind: "session", TargetID: "gc-2568",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// cap=1, hold the only slot.
+	restore := setDispatchSemaphoreForTest(1)
+	t.Cleanup(restore)
+	holdRelease, _, ok := acquireDispatchSlot()
+	if !ok {
+		t.Fatal("acquireDispatchSlot: failed to take initial slot")
+	}
+	t.Cleanup(holdRelease)
+
+	read, cleanup := captureLog(t)
+	t.Cleanup(cleanup)
+
+	body := []byte(url.Values{
+		"team_id":    {"T1"},
+		"channel_id": {"C1"},
+		"command":    {"/gc"},
+		"text":       {"saturated"},
+		"user_id":    {"U1"},
+	}.Encode())
+	req := signedSlackInteractionRequest(t, cfg.slackSigningKey, body)
+	rec := httptest.NewRecorder()
+	handleSlackInteractions(cfg, mapReg, nil)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "saturated") {
+		t.Errorf("body should mention 'saturated': %s", rec.Body.String())
+	}
+	if !strings.Contains(read(), "dispatch queue full") {
+		t.Errorf("log missing 'dispatch queue full' marker:\n%s", read())
+	}
+	if !strings.Contains(read(), "cap=1") {
+		t.Errorf("log missing cap=1 marker:\n%s", read())
+	}
+
+	// Give any spurious goroutine a chance to surface the regression
+	// before the test ends.
+	time.Sleep(100 * time.Millisecond)
+}
+
+// TestSlackInteractionsAdmitsSlashCommandWhenSemaphoreHasRoom — happy
+// path: when the dispatch sem has room, the slash command dispatches
+// to the gc API. sec-S-04 guard.
+func TestSlackInteractionsAdmitsSlashCommandWhenSemaphoreHasRoom(t *testing.T) {
+	pathCh := make(chan string, 1)
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		select {
+		case pathCh <- r.URL.Path:
+		default:
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	cfg := config{
+		slackSigningKey: "secret",
+		accountID:       "T1",
+		cityName:        "test-city",
+		gcAPIBase:       gcStub.URL,
+	}
+	mapReg := newTestChannelMappingRegistry(t)
+	now := time.Now().UTC()
+	if err := mapReg.Set(channelMappingDiskRecord{
+		WorkspaceID: "T1", ChannelID: "C1",
+		TargetKind: "session", TargetID: "gc-2568",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// cap=2 leaves one free slot for the dispatch goroutine.
+	restore := setDispatchSemaphoreForTest(2)
+	t.Cleanup(restore)
+
+	body := []byte(url.Values{
+		"team_id":    {"T1"},
+		"channel_id": {"C1"},
+		"command":    {"/gc"},
+		"text":       {"hello"},
+		"user_id":    {"U1"},
+	}.Encode())
+	req := signedSlackInteractionRequest(t, cfg.slackSigningKey, body)
+	rec := httptest.NewRecorder()
+	handleSlackInteractions(cfg, mapReg, nil)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+
+	select {
+	case path := <-pathCh:
+		want := "/v0/city/test-city/session/gc-2568/messages"
+		if path != want {
+			t.Errorf("dispatch path = %q, want %q", path, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatch goroutine did not POST within 2s")
+	}
+}
