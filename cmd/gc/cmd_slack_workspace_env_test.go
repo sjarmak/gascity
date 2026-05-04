@@ -234,3 +234,35 @@ func TestSlackStatusFlagOverridesEnv(t *testing.T) {
 		t.Errorf("status with --workspace-id=T_B should NOT include T_A: %q", stdout)
 	}
 }
+
+// TestSlackStatusEmptyFlagShowsAllWorkspaces pins the escape hatch
+// documented in the --workspace-id help text. With $SLACK_WORKSPACE_ID
+// set, an explicit --workspace-id="" must override the env default and
+// show records across all workspaces. Operators without this contract
+// would have no way to see other workspaces while their env is set.
+func TestSlackStatusEmptyFlagShowsAllWorkspaces(t *testing.T) {
+	cityRoot := newTestCity(t)
+	appReg, err := newSlackAppRegistry(slackAppsRegistryPath(cityRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ws := range []string{"T_A", "T_B"} {
+		if err := appReg.Set(slackAppRecord{
+			WorkspaceID: ws, AppID: "A_" + ws, DisplayName: "app-" + ws,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Setenv(slackWorkspaceIDEnv, "T_A")
+	stdout, _, err := execSlackStatusCmd(t, cityRoot, "--workspace-id", "")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if !strings.Contains(stdout, "T_A") {
+		t.Errorf(`status with --workspace-id="" should include T_A: %q`, stdout)
+	}
+	if !strings.Contains(stdout, "T_B") {
+		t.Errorf(`status with --workspace-id="" should include T_B: %q`, stdout)
+	}
+}

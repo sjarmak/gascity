@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -199,4 +200,50 @@ func TestAppsRegistryConcurrentReads(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestAppsRegistryLoadRejectsOversizedFile pins the 10 MiB cap. Without
+// the LimitReader the read would allocate the full hostile payload before
+// failing; the test guarantees the cap is enforced and the error mentions
+// the size violation.
+func TestAppsRegistryLoadRejectsOversizedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "apps.json")
+	payload := strings.Repeat("x", maxRegistryBytes+1)
+	if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
+		t.Fatalf("seed oversized file: %v", err)
+	}
+	_, err := newAppsRegistry(path)
+	if err == nil {
+		t.Fatal("newAppsRegistry on oversized file: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error %q does not mention size cap", err)
+	}
+}
+
+// TestAppsRegistryLen exposes the entry count to the startup log so
+// operators see "registry loaded empty" cases immediately. The startup
+// log uses Len() to print entries=N alongside the store path.
+func TestAppsRegistryLen(t *testing.T) {
+	dir := t.TempDir()
+	emptyReg, err := newAppsRegistry(filepath.Join(dir, "missing.json"))
+	if err != nil {
+		t.Fatalf("newAppsRegistry empty: %v", err)
+	}
+	if got := emptyReg.Len(); got != 0 {
+		t.Errorf("empty registry Len = %d, want 0", got)
+	}
+
+	path := writeAppsRegistryFile(t, dir, map[string]appRecord{
+		"T1:A1": {WorkspaceID: "T1", AppID: "A1", SigningSecret: "s1"},
+		"T1:A2": {WorkspaceID: "T1", AppID: "A2", SigningSecret: "s2"},
+		"T2:A3": {WorkspaceID: "T2", AppID: "A3", SigningSecret: "s3"},
+	})
+	reg, err := newAppsRegistry(path)
+	if err != nil {
+		t.Fatalf("newAppsRegistry: %v", err)
+	}
+	if got := reg.Len(); got != 3 {
+		t.Errorf("Len = %d, want 3", got)
+	}
 }

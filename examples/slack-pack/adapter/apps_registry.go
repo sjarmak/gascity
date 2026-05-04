@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -99,12 +100,17 @@ func (r *appsRegistry) load() error {
 	if r.diskPath == "" {
 		return nil
 	}
-	data, err := os.ReadFile(r.diskPath)
+	f, err := os.Open(r.diskPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("open apps registry %s: %w", r.diskPath, err)
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxRegistryBytes+1))
+	if err != nil {
+		return fmt.Errorf("read apps registry %s: %w", r.diskPath, err)
 	}
 	if int64(len(data)) > maxRegistryBytes {
 		return fmt.Errorf("apps registry file %s exceeds %d bytes", r.diskPath, maxRegistryBytes)
@@ -119,8 +125,20 @@ func (r *appsRegistry) load() error {
 	return nil
 }
 
-// Set is provided for tests only. Production reads only — operator
-// writes go through `gc slack import-app` (cmd/gc side).
+// Len returns the number of records currently loaded. Used by the
+// startup log to surface "registry loaded empty" cases to operators.
+func (r *appsRegistry) Len() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.byKey)
+}
+
+// Set writes a record to the registry. Production callers today are
+// limited to test setup: operator-driven writes go through
+// `gc slack import-app` (cmd/gc side), and the adapter only reads.
+// gc-cby.9 (OAuth flow) will promote this to a real production
+// caller when it lands; the locking, atomic-write, and validation
+// already match production requirements.
 func (r *appsRegistry) Set(rec appRecord) error {
 	if rec.WorkspaceID == "" || rec.AppID == "" {
 		return fmt.Errorf("apps registry: workspace_id and app_id are both required (got workspace_id=%q app_id=%q)", rec.WorkspaceID, rec.AppID)

@@ -84,6 +84,8 @@ JSON shape sets "conflict": true.
 --channel <id> filters channel mappings to the named channel AND
 filters rig mappings to records whose channel set contains <id>.
 --workspace-id <id> filters all three sections to the named workspace.
+When $SLACK_WORKSPACE_ID is set the filter defaults to that workspace;
+pass --workspace-id="" to override and see records across all workspaces.
 --json emits a machine-readable shape with top-level keys "apps",
 "channel_mappings", and "rig_mappings".`,
 		Args: cobra.NoArgs,
@@ -94,7 +96,7 @@ filters rig mappings to records whose channel set contains <id>.
 	cmd.Flags().StringVar(&channelFilter, "channel", "",
 		"Filter channel mappings to a single channel id; rig mappings are filtered to records whose channel_ids contain this id")
 	cmd.Flags().StringVar(&workspaceFilter, "workspace-id", slackWorkspaceIDDefault(),
-		"Filter apps, channel mappings, and rig mappings to a single Slack workspace id (defaults to $"+slackWorkspaceIDEnv+" when set)")
+		"Filter apps, channel mappings, and rig mappings to a single Slack workspace id (defaults to $"+slackWorkspaceIDEnv+" when set; pass --workspace-id=\"\" to see all workspaces)")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false,
 		"Emit machine-readable JSON instead of human-readable text")
 	return cmd

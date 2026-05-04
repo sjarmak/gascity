@@ -803,8 +803,11 @@ func main() {
 		log.Fatalf("apps registry: %v", err)
 	}
 	cfg.appsRegistry = appsReg
-	log.Printf("apps registry: store=%s (read-only; restart to reload)",
-		cfg.appsRegistryPath)
+	log.Printf("apps registry: store=%s entries=%d (read-only; restart to reload)",
+		cfg.appsRegistryPath, appsReg.Len())
+	if appsReg.Len() == 0 && cfg.slackSigningKey == "" {
+		log.Printf("WARN: apps registry is empty and SLACK_SIGNING_SECRET is unset — all inbound Slack requests will be rejected with 401 until an app is imported (gc slack import-app + OAuth) or the env var is set")
+	}
 
 	// Cross-store overlap WARN: surface contradictory bindings (cby.3
 	// channel mapping vs cby.4 rig mapping pointing at different rigs
@@ -1505,7 +1508,7 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry) http.HandlerFu
 		ts := r.Header.Get("X-Slack-Request-Timestamp")
 		sig := r.Header.Get("X-Slack-Signature")
 		if !verifySlackSignatureMulti(secrets, ts, body, sig) {
-			log.Printf("slack signature verify FAILED team_id=%q candidates=%d", teamID, len(secrets))
+			log.Printf("slack signature verify FAILED team_id=%q candidates=%d", clipTeamIDForLog(teamID), len(secrets))
 			http.Error(w, "invalid signature", http.StatusUnauthorized)
 			return
 		}
@@ -1576,6 +1579,18 @@ func verifySlackSignatureMulti(secrets []string, ts string, body []byte, sig str
 		}
 	}
 	return false
+}
+
+// clipTeamIDForLog bounds attacker-controlled team_id values before they
+// hit log lines. Real Slack team IDs are "T" + 8-11 alphanumerics; 32
+// is generous. Pre-HMAC body is unsigned, so an unbounded value would
+// allow log amplification (~1 MiB per request).
+func clipTeamIDForLog(s string) string {
+	const max = 32
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
 
 func verifySlackSignature(secret, ts string, body []byte, sig string) bool {

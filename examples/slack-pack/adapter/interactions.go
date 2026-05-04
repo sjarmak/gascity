@@ -283,7 +283,7 @@ func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry, rigReg 
 		teamID := parseTeamIDFromInteractionsBody(body)
 		secrets := lookupSigningSecrets(cfg.appsRegistry, cfg.slackSigningKey, teamID)
 		if !verifySlackSignatureMulti(secrets, r.Header.Get("X-Slack-Request-Timestamp"), body, r.Header.Get("X-Slack-Signature")) {
-			log.Printf("slack interactions: signature verify FAILED team_id=%q candidates=%d", teamID, len(secrets))
+			log.Printf("slack interactions: signature verify FAILED team_id=%q candidates=%d", clipTeamIDForLog(teamID), len(secrets))
 			http.Error(w, "invalid signature", http.StatusUnauthorized)
 			return
 		}
