@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/spf13/cobra"
 )
@@ -140,7 +141,7 @@ func runSlackStatus(stdout io.Writer, channelFilter, workspaceFilter string, jso
 		if workspaceFilter != "" && r.WorkspaceID != workspaceFilter {
 			continue
 		}
-		if channelFilter != "" && !stringsContains(r.ChannelIDs, channelFilter) {
+		if channelFilter != "" && !slices.Contains(r.ChannelIDs, channelFilter) {
 			continue
 		}
 		rigMappings = append(rigMappings, slackStatusRigMapping{

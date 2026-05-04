@@ -531,3 +531,17 @@ func TestChannelMappingRegistryRejectsCorruptFile(t *testing.T) {
 		t.Fatal("expected load error for corrupt file")
 	}
 }
+
+// TestChannelMappingRegistryRejectsUnknownField pins sec-S-02: the
+// adapter's reader must use DisallowUnknownFields so a hand-edited
+// file that adds an unknown JSON field is surfaced rather than
+// silently absorbed. Mirrors the rig-mapping reader's policy.
+func TestChannelMappingRegistryRejectsUnknownField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "channel_mappings.json")
+	if err := writeFile0600(path, []byte(`{"T1:C1":{"workspace_id":"T1","channel_id":"C1","target_kind":"session","target_id":"gc-1","created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-01T00:00:00Z","bogus":42}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newChannelMappingRegistry(path); err == nil {
+		t.Fatal("expected error for unknown field, got nil")
+	}
+}

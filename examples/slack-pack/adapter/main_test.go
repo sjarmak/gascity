@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -2572,6 +2576,53 @@ func TestSlackKindFromChannelType(t *testing.T) {
 			if got != tc.want {
 				t.Errorf("slackKindFromChannelType(%q, %q) = %q, want %q",
 					tc.channelType, tc.channelID, got, tc.want)
+			}
+		})
+	}
+}
+
+// signFor returns the v0= HMAC signature for a given secret/timestamp/
+// body — the same construction the production verifier expects, so
+// these tests can build "valid sig + malformed timestamp" inputs.
+func signFor(secret, ts string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte("v0:" + ts + ":"))
+	_, _ = mac.Write(body)
+	return "v0=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+// TestVerifySlackSignatureFailsClosedOnMalformedTimestamp pins sec-S-01:
+// any non-integer timestamp must fail verification BEFORE the HMAC
+// check, so an attacker who can craft a valid signature for a stale
+// payload cannot bypass the 5-minute replay window by mangling the
+// timestamp header.
+func TestVerifySlackSignatureFailsClosedOnMalformedTimestamp(t *testing.T) {
+	secret := "shh"
+	body := []byte("payload=ok")
+
+	cases := []struct {
+		name string
+		ts   string
+		want bool
+	}{
+		{"empty timestamp rejected", "", false},
+		{"non-numeric rejected", "abc", false},
+		{"decimal rejected", "1.5", false},
+		// Negative integer parses, but Unix(neg, 0) is far in the past so
+		// the staleness check kicks in.
+		{"negative parses but stale", "-1", false},
+		{"valid recent accepted", strconv.FormatInt(time.Now().Unix(), 10), true},
+		{"valid old rejected", strconv.FormatInt(time.Now().Add(-10*time.Minute).Unix(), 10), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// For the malformed-ts cases we still build a sig that WOULD
+			// be valid if the verifier wrongly fell through the parse
+			// failure — that's the whole point of the regression test.
+			sig := signFor(secret, tc.ts, body)
+			got := verifySlackSignature(secret, tc.ts, body, sig)
+			if got != tc.want {
+				t.Errorf("verifySlackSignature(ts=%q) = %v, want %v", tc.ts, got, tc.want)
 			}
 		})
 	}

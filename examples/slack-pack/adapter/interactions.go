@@ -75,6 +75,14 @@ func (r *channelMappingRegistry) Get(workspaceID, channelID string) (channelMapp
 	return rec, ok
 }
 
+// Len returns the number of records currently loaded. Read-locked so
+// callers (e.g. startup logs) don't race with concurrent Set in tests.
+func (r *channelMappingRegistry) Len() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.byKey)
+}
+
 // Set is provided for tests only. Production reads only — operator
 // writes go through `gc slack map-channel`.
 func (r *channelMappingRegistry) Set(rec channelMappingDiskRecord) error {
@@ -92,19 +100,36 @@ func (r *channelMappingRegistry) Set(rec channelMappingDiskRecord) error {
 	return r.saveLocked()
 }
 
+// maxRegistryBytes caps the size of the JSON registry file we'll
+// load off disk. Channel mappings are a few hundred records of a
+// fixed shape; 10 MiB is several orders of magnitude over a healthy
+// install. A file beyond that is either corrupt or hostile and must
+// not be loaded.
+const maxRegistryBytes = 10 << 20 // 10 MiB
+
 func (r *channelMappingRegistry) load() error {
 	if r.diskPath == "" {
 		return nil
 	}
-	data, err := os.ReadFile(r.diskPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	f, err := os.Open(r.diskPath)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
 		return err
 	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxRegistryBytes+1))
+	if err != nil {
+		return fmt.Errorf("read %s: %w", r.diskPath, err)
+	}
+	if int64(len(data)) > maxRegistryBytes {
+		return fmt.Errorf("registry file %s exceeds %d bytes", r.diskPath, maxRegistryBytes)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
 	var stored map[string]channelMappingDiskRecord
-	if err := json.Unmarshal(data, &stored); err != nil {
+	if err := dec.Decode(&stored); err != nil {
 		return fmt.Errorf("decode channel mapping store: %w", err)
 	}
 	for key, rec := range stored {
@@ -136,16 +161,38 @@ func (r *channelMappingRegistry) saveLocked() error {
 }
 
 // writeFile0600 atomically writes data to path with 0o600 perms.
+// Uses os.CreateTemp so two concurrent writers in the same directory
+// (in tests) don't clobber each other's temp file before the rename.
 // Helper exposed so tests can seed a corrupt file at the same perms
 // the production writer would use.
 func writeFile0600(path string, data []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("write %q: %w", tmp, err)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("mkdir %q: %w", dir, err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("rename %q -> %q: %w", tmp, path, err)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp in %q: %w", dir, err)
+	}
+	tmpName := f.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		cleanup()
+		return fmt.Errorf("chmod %q: %w", tmpName, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		cleanup()
+		return fmt.Errorf("write %q: %w", tmpName, err)
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("close %q: %w", tmpName, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		cleanup()
+		return fmt.Errorf("rename %q -> %q: %w", tmpName, path, err)
 	}
 	return nil
 }
@@ -201,7 +248,8 @@ func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry, rigReg 
 
 		form, err := url.ParseQuery(string(body))
 		if err != nil {
-			http.Error(w, fmt.Sprintf("parse form: %v", err), http.StatusBadRequest)
+			log.Printf("slack interactions: parse form: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
 		if len(form) == 0 {
@@ -251,7 +299,7 @@ func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry, rigReg 
 				channelID, teamID, teamID, channelID))
 			return
 		}
-		log.Printf("interaction: workspace=%s channel=%s source=%s target=%s/%s",
+		log.Printf("interaction: workspace=%q channel=%q source=%s target=%s/%s",
 			teamID, channelID, source, rec.TargetKind, rec.TargetID)
 
 		switch rec.TargetKind {
@@ -267,7 +315,7 @@ func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry, rigReg 
 			// load() rejects unknown target_kind, so reaching this branch
 			// means the registry was mutated mid-flight by another
 			// process. Fail closed.
-			log.Printf("slack interactions: unexpected target_kind %q for %s/%s", rec.TargetKind, teamID, channelID)
+			log.Printf("slack interactions: unexpected target_kind %q for %q/%q", rec.TargetKind, teamID, channelID)
 			writeEphemeral(w, http.StatusOK,
 				"Channel binding is in an unexpected state; please re-run `gc slack map-channel`.")
 		}
@@ -293,7 +341,11 @@ func dispatchSlashCommandToSession(cfg config, sessionID, command, text, channel
 			"</system-reminder>",
 		command, channelID, teamID, userID, text, channelID,
 	)
-	payload, _ := json.Marshal(gcSessionMessageRequest{Message: body})
+	payload, err := json.Marshal(gcSessionMessageRequest{Message: body})
+	if err != nil {
+		log.Printf("slack interactions: marshal session-message body: %v", err)
+		return
+	}
 	target := fmt.Sprintf("%s/v0/city/%s/session/%s/messages",
 		cfg.gcAPIBase, cfg.cityName, sessionID)
 	req, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(payload))

@@ -105,6 +105,11 @@ func runSlackMapChannel(stdout io.Writer, channelID, workspaceID, rigName, sessi
 		targetID = sessionID
 	}
 
+	// Cross-store conflict check is best-effort: load registry A, then write registry B.
+	// CLI invocations are not atomic across both stores. Concurrent invocations between
+	// check and write may produce overlap; the adapter detects and surfaces this via
+	// `gc slack status` (conflict annotation) and a startup WARN log.
+	//
 	// Cross-store conflict check (cby.4 → cby.3 direction): only
 	// applies to --rig writes. Session bindings are explicit
 	// overrides on top of any rig default — that's the intended
@@ -115,7 +120,7 @@ func runSlackMapChannel(stdout io.Writer, channelID, workspaceID, rigName, sessi
 			return fmt.Errorf("open slack rig mapping registry: %w", err)
 		}
 		if owner, _, ok := rigReg.LookupRigForChannel(workspaceID, channelID); ok && owner.RigName != rigName {
-			return fmt.Errorf("cmd/gc/cmd_slack_map_channel.go: channel %q is already bound to rig %q via 'gc slack map-rig'; remove that binding first or use --rig %q to keep the same target rig",
+			return fmt.Errorf("map-channel: channel %q is already bound to rig %q via 'gc slack map-rig'; remove that binding first or use --rig %q to keep the same target rig",
 				channelID, owner.RigName, owner.RigName)
 		}
 	}

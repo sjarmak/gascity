@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -250,16 +251,33 @@ func validateRigName(name string) error {
 	return nil
 }
 
+// maxRigMappingBytes caps the size of the JSON rig-mapping file
+// we'll read off disk. Rig mappings are at most a few hundred records
+// of a fixed shape, so 10 MiB is several orders of magnitude over a
+// healthy install. A file beyond that is either corrupt or hostile
+// and must not be loaded. Per-file constant (rather than a shared
+// helper) keeps each registry's size policy explicit at the call
+// site.
+const maxRigMappingBytes = 10 << 20 // 10 MiB
+
 func (r *slackRigMappingRegistry) load() error {
 	if r.diskPath == "" {
 		return nil
 	}
-	data, err := os.ReadFile(r.diskPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	f, err := os.Open(r.diskPath)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
 		return err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxRigMappingBytes+1))
+	if err != nil {
+		return fmt.Errorf("read %s: %w", r.diskPath, err)
+	}
+	if int64(len(data)) > maxRigMappingBytes {
+		return fmt.Errorf("registry file %s exceeds %d bytes", r.diskPath, maxRigMappingBytes)
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -362,17 +380,4 @@ func (r *slackRigMappingRegistry) saveLocked() error {
 		return fmt.Errorf("rename slack rig mapping store: %w", err)
 	}
 	return nil
-}
-
-// stringsContains reports whether v appears in slice. Local helper
-// (rather than slices.Contains) so the file's import set stays
-// minimal and the call site in cmd_slack_status.go reads as a plain
-// containment check.
-func stringsContains(slice []string, v string) bool {
-	for _, s := range slice {
-		if s == v {
-			return true
-		}
-	}
-	return false
 }

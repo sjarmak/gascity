@@ -678,14 +678,14 @@ func main() {
 		log.Fatalf("channel mapping registry: %v", err)
 	}
 	log.Printf("channel mapping registry: store=%s entries=%d (read-only; restart to reload)",
-		cfg.channelMappingPath, len(channelMapReg.byKey))
+		cfg.channelMappingPath, channelMapReg.Len())
 
 	rigMapReg, err := newRigMappingRegistry(cfg.rigMappingPath)
 	if err != nil {
 		log.Fatalf("rig mapping registry: %v", err)
 	}
 	log.Printf("rig mapping registry: store=%s entries=%d (read-only; restart to reload)",
-		cfg.rigMappingPath, len(rigMapReg.byKey))
+		cfg.rigMappingPath, rigMapReg.Len())
 
 	// Cross-store overlap WARN: surface contradictory bindings (cby.3
 	// channel mapping vs cby.4 rig mapping pointing at different rigs
@@ -1406,11 +1406,16 @@ func verifySlackSignature(secret, ts string, body []byte, sig string) bool {
 	if secret == "" || ts == "" || sig == "" {
 		return false
 	}
-	// Reject stale requests (>5 min) to mitigate replay.
-	if tsInt, err := strconv.ParseInt(ts, 10, 64); err == nil {
-		if time.Since(time.Unix(tsInt, 0)) > 5*time.Minute {
-			return false
-		}
+	// Reject stale requests (>5 min) to mitigate replay. Fail closed on
+	// any timestamp parse error: an attacker who controls the
+	// timestamp header must not be able to bypass the replay window
+	// just by sending an unparseable value (e.g. "abc", "1.5").
+	tsInt, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return false
+	}
+	if time.Since(time.Unix(tsInt, 0)) > 5*time.Minute {
+		return false
 	}
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write([]byte("v0:" + ts + ":"))

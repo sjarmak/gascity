@@ -123,6 +123,25 @@ func TestSlackChannelMappingRegistryRejectsCorruptFile(t *testing.T) {
 	}
 }
 
+// TestSlackChannelMappingRegistryRejectsUnknownField pins the
+// DisallowUnknownFields decoder behavior: a hand-edited file that
+// adds an unknown JSON field must be rejected at load time, mirroring
+// the rig-mapping store's policy. Symmetric strictness across both
+// stores is what closes sec-S-02.
+func TestSlackChannelMappingRegistryRejectsUnknownField(t *testing.T) {
+	cityRoot := newTestCity(t)
+	path := slackChannelMappingsPath(cityRoot)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"T1:C1":{"workspace_id":"T1","channel_id":"C1","target_kind":"session","target_id":"gc-1","created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-01T00:00:00Z","bogus":42}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newSlackChannelMappingRegistry(path); err == nil {
+		t.Fatal("expected error for unknown field, got nil")
+	}
+}
+
 func TestSlackChannelMappingRegistryIdempotentOverwrite(t *testing.T) {
 	cityRoot := newTestCity(t)
 	reg, err := newSlackChannelMappingRegistry(slackChannelMappingsPath(cityRoot))

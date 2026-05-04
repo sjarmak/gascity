@@ -107,6 +107,11 @@ func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, chann
 		return fmt.Errorf("--channel must include at least one non-empty value")
 	}
 
+	// Cross-store conflict check is best-effort: load registry A, then write registry B.
+	// CLI invocations are not atomic across both stores. Concurrent invocations between
+	// check and write may produce overlap; the adapter detects and surfaces this via
+	// `gc slack status` (conflict annotation) and a startup WARN log.
+	//
 	// Cross-store conflict check (cby.3 → cby.4 direction): if any
 	// channel in the desired set has a per-channel mapping pointing
 	// at a DIFFERENT rig in cby.3, refuse. Same-rig and session
@@ -117,7 +122,7 @@ func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, chann
 			continue
 		}
 		if rec.TargetKind == slackChannelMappingTargetKindRig && rec.TargetID != rigName {
-			return fmt.Errorf("cmd/gc/cmd_slack_map_rig.go: channel %q is already bound to rig %q via 'gc slack map-channel'; remove that binding first or pick a different channel set",
+			return fmt.Errorf("map-rig: channel %q is already bound to rig %q via 'gc slack map-channel'; remove that binding first or pick a different channel set",
 				ch, rec.TargetID)
 		}
 	}

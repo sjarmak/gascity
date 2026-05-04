@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -81,6 +82,14 @@ func (r *rigMappingRegistry) LookupRigForChannel(workspaceID, channelID string) 
 	return rec, "rig", true
 }
 
+// Len returns the number of records currently loaded. Read-locked so
+// callers (e.g. startup logs) don't race with concurrent Set in tests.
+func (r *rigMappingRegistry) Len() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.byKey)
+}
+
 // All returns every loaded rig mapping, sorted by composite key for
 // diff-stable ordering.
 func (r *rigMappingRegistry) All() []rigMappingDiskRecord {
@@ -122,16 +131,32 @@ func (r *rigMappingRegistry) Set(rec rigMappingDiskRecord) error {
 	return r.saveLocked()
 }
 
+// maxRigRegistryBytes caps the size of the JSON rig-mapping file
+// we'll read off disk. Rig mappings are a few hundred records of a
+// fixed shape; 10 MiB is several orders of magnitude over a healthy
+// install. A file beyond that is either corrupt or hostile and must
+// not be loaded. A separate constant from maxRegistryBytes in
+// interactions.go keeps each file's size policy explicit.
+const maxRigRegistryBytes = 10 << 20 // 10 MiB
+
 func (r *rigMappingRegistry) load() error {
 	if r.diskPath == "" {
 		return nil
 	}
-	data, err := os.ReadFile(r.diskPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	f, err := os.Open(r.diskPath)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
 		return err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxRigRegistryBytes+1))
+	if err != nil {
+		return fmt.Errorf("read %s: %w", r.diskPath, err)
+	}
+	if int64(len(data)) > maxRigRegistryBytes {
+		return fmt.Errorf("registry file %s exceeds %d bytes", r.diskPath, maxRigRegistryBytes)
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -231,6 +256,9 @@ func resolveChannelTarget(chanReg *channelMappingRegistry, rigReg *rigMappingReg
 // claims the same channel for a DIFFERENT rig. Channel mapping wins
 // at resolution time; the WARN is purely observability so operators
 // see the contradictory binding in adapter logs at startup.
+//
+// Lock order: chanReg then rigReg. Must be consistent across all
+// callers that hold both locks.
 func logCrossStoreOverlapWarnings(chanReg *channelMappingRegistry, rigReg *rigMappingRegistry) {
 	if chanReg == nil || rigReg == nil {
 		return

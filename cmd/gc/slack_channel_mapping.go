@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -153,19 +155,36 @@ func (r *slackChannelMappingRegistry) All() []slackChannelMappingRecord {
 	return out
 }
 
+// maxRegistryBytes caps the size of the JSON registry file we'll read
+// off disk. The slack channel-mapping registry stores at most a few
+// hundred records of a fixed shape, so 10 MiB is several orders of
+// magnitude over what a healthy install ever produces; a file beyond
+// that is either corrupt or hostile and must not be loaded.
+const maxRegistryBytes = 10 << 20 // 10 MiB
+
 func (r *slackChannelMappingRegistry) load() error {
 	if r.diskPath == "" {
 		return nil
 	}
-	data, err := os.ReadFile(r.diskPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	f, err := os.Open(r.diskPath)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
 		return err
 	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxRegistryBytes+1))
+	if err != nil {
+		return fmt.Errorf("read %s: %w", r.diskPath, err)
+	}
+	if int64(len(data)) > maxRegistryBytes {
+		return fmt.Errorf("registry file %s exceeds %d bytes", r.diskPath, maxRegistryBytes)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
 	var stored map[string]slackChannelMappingRecord
-	if err := json.Unmarshal(data, &stored); err != nil {
+	if err := dec.Decode(&stored); err != nil {
 		return fmt.Errorf("decode slack channel mapping store: %w", err)
 	}
 	for key, rec := range stored {
