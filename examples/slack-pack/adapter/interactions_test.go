@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -728,5 +729,165 @@ func TestSlackInteractionsAdmitsSlashCommandWhenSemaphoreHasRoom(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("dispatch goroutine did not POST within 2s")
+	}
+}
+
+// TestParseTeamIDFromInteractionsBody exercises the pre-verify
+// extraction for both slash-command form (top-level team_id field) and
+// payload= JSON (payload.team.id) shapes.
+func TestParseTeamIDFromInteractionsBody(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "slash command form",
+			body: url.Values{"team_id": {"T1"}, "channel_id": {"C1"}, "command": {"/gc"}}.Encode(),
+			want: "T1",
+		},
+		{
+			name: "block_actions payload",
+			body: url.Values{"payload": {`{"type":"block_actions","team":{"id":"T2","domain":"x"}}`}}.Encode(),
+			want: "T2",
+		},
+		{
+			name: "view_submission payload",
+			body: url.Values{"payload": {`{"type":"view_submission","team":{"id":"T3"}}`}}.Encode(),
+			want: "T3",
+		},
+		{
+			name: "form without team_id",
+			body: url.Values{"channel_id": {"C1"}, "command": {"/gc"}}.Encode(),
+			want: "",
+		},
+		{
+			name: "payload missing team",
+			body: url.Values{"payload": {`{"type":"block_actions"}`}}.Encode(),
+			want: "",
+		},
+		{
+			name: "malformed body",
+			body: "%%%not a form%%%",
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseTeamIDFromInteractionsBody([]byte(tc.body))
+			if got != tc.want {
+				t.Errorf("parseTeamIDFromInteractionsBody = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSlackInteractionsPerAppSignatureLookup — slash command signed with
+// a per-app secret resolved from the apps registry by team_id.
+func TestSlackInteractionsPerAppSignatureLookup(t *testing.T) {
+	dir := t.TempDir()
+	appsPath := filepath.Join(dir, "apps.json")
+	data, _ := json.MarshalIndent(map[string]appRecord{
+		"T1:A1": {WorkspaceID: "T1", AppID: "A1", SigningSecret: "secret-a1"},
+		"T1:A2": {WorkspaceID: "T1", AppID: "A2", SigningSecret: "secret-a2"},
+	}, "", "  ")
+	if err := os.WriteFile(appsPath, data, 0o600); err != nil {
+		t.Fatalf("write apps seed: %v", err)
+	}
+	appsReg, err := newAppsRegistry(appsPath)
+	if err != nil {
+		t.Fatalf("newAppsRegistry: %v", err)
+	}
+
+	cfg := config{
+		// no env signing key; registry-only
+		accountID:    "T1",
+		cityName:     "test-city",
+		appsRegistry: appsReg,
+	}
+	mapReg := newTestChannelMappingRegistry(t)
+
+	body := []byte(url.Values{
+		"team_id":    {"T1"},
+		"channel_id": {"C1"},
+		"command":    {"/gc"},
+		"text":       {"hello"},
+		"user_id":    {"U1"},
+	}.Encode())
+	// Sign with A2's secret. Trial-verify must find it.
+	req := signedSlackInteractionRequest(t, "secret-a2", body)
+	rec := httptest.NewRecorder()
+	handleSlackInteractions(cfg, mapReg, nil)(rec, req)
+
+	// Without a binding the body is "No binding" but the verify path
+	// passed (status 200 — not 401). That's the behavior we're
+	// asserting here.
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (verify must pass with A2 secret)", rec.Code)
+	}
+}
+
+// TestSlackInteractionsRegistryMissUsesEnvFallback — slash command from
+// a workspace not in the registry falls back to env. Single-app dev
+// installs without an apps registry keep working.
+func TestSlackInteractionsRegistryMissUsesEnvFallback(t *testing.T) {
+	dir := t.TempDir()
+	appsPath := filepath.Join(dir, "apps.json")
+	data, _ := json.MarshalIndent(map[string]appRecord{
+		"T2:A2": {WorkspaceID: "T2", AppID: "A2", SigningSecret: "secret-t2"},
+	}, "", "  ")
+	if err := os.WriteFile(appsPath, data, 0o600); err != nil {
+		t.Fatalf("write apps seed: %v", err)
+	}
+	appsReg, err := newAppsRegistry(appsPath)
+	if err != nil {
+		t.Fatalf("newAppsRegistry: %v", err)
+	}
+
+	cfg := config{
+		slackSigningKey: "env-fallback",
+		accountID:       "T1",
+		cityName:        "test-city",
+		appsRegistry:    appsReg,
+	}
+	mapReg := newTestChannelMappingRegistry(t)
+
+	body := []byte(url.Values{
+		"team_id":    {"T1"},
+		"channel_id": {"C1"},
+		"command":    {"/gc"},
+		"text":       {"hello"},
+		"user_id":    {"U1"},
+	}.Encode())
+	req := signedSlackInteractionRequest(t, "env-fallback", body)
+	rec := httptest.NewRecorder()
+	handleSlackInteractions(cfg, mapReg, nil)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (env fallback must verify)", rec.Code)
+	}
+}
+
+// TestSlackInteractionsNoSecretRejects401 — neither registry match nor
+// env: trial-verify has no candidates, return 401.
+func TestSlackInteractionsNoSecretRejects401(t *testing.T) {
+	cfg := config{
+		accountID: "T1",
+		cityName:  "test-city",
+		// no env, no apps registry
+	}
+	mapReg := newTestChannelMappingRegistry(t)
+
+	body := []byte(url.Values{
+		"team_id":    {"T1"},
+		"channel_id": {"C1"},
+		"command":    {"/gc"},
+	}.Encode())
+	req := signedSlackInteractionRequest(t, "anything", body)
+	rec := httptest.NewRecorder()
+	handleSlackInteractions(cfg, mapReg, nil)(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
 	}
 }

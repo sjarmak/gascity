@@ -23,8 +23,6 @@
 //   - SLACK_BOT_TOKEN         xoxb- bot token. Must have chat:write,
 //     reactions:write, files:write, and (for
 //     identity overrides) chat:write.customize.
-//   - SLACK_SIGNING_SECRET    Slack app signing secret used to verify
-//     incoming /slack/events HMAC signatures.
 //   - GC_CITY_NAME            Name of the gc city the adapter posts to
 //     (matches [workspace].name in city.toml). Used
 //     to construct /v0/city/{name}/extmsg/inbound and
@@ -41,6 +39,18 @@
 //     host files like /etc/passwd to Slack). Set
 //     to the directory tree gc agents write
 //     uploadable artifacts under.
+//   - SLACK_SIGNING_SECRET    Single-app fallback for HMAC verification on
+//     /slack/events and /slack/interactions. The
+//     adapter looks up per-app signing secrets in
+//     the apps registry first (keyed by team_id);
+//     this env var only takes effect when the
+//     registry has no record for the inbound
+//     team_id. Multi-app deployments should
+//     populate the registry via `gc slack
+//     import-app`; single-app dev installs can
+//     keep using this env var alone. With neither
+//     source set, every inbound is rejected 401
+//     (correct fail-closed behavior).
 //
 // Optional override (sane default; set to override):
 //
@@ -105,9 +115,18 @@
 //     SLACK_CHANNEL_MAPPING_PATH. Channel
 //     mappings override rig mappings when both
 //     claim the same channel.
+//   - SLACK_APPS_REGISTRY_PATH      Default "<GC_CITY_PATH>/.gc/slack/apps.json"
+//     when GC_CITY_PATH is set, otherwise
+//     "/tmp/gc-slack-adapter/apps.json". JSON
+//     file written by `gc slack import-app`,
+//     populated post-OAuth (gc-cby.9). Read-only
+//     on the adapter side; same load-once-at-
+//     startup contract. Used for per-app signing
+//     secret lookup keyed by team_id.
 //   - GC_CITY_PATH                 Optional; consulted only to derive
-//     SLACK_CHANNEL_MAPPING_PATH and
-//     SLACK_RIG_MAPPING_PATH defaults.
+//     SLACK_CHANNEL_MAPPING_PATH,
+//     SLACK_RIG_MAPPING_PATH, and
+//     SLACK_APPS_REGISTRY_PATH defaults.
 //
 // # File permissions
 //
@@ -303,6 +322,20 @@ type config struct {
 	// negative, and non-numeric values rather than silently disabling
 	// dispatch. sec-S-04.
 	dispatchConcurrency int
+	// appsRegistryPath is the JSON file written by `gc slack import-app`
+	// mapping (workspace_id, app_id) → app record (incl. signing_secret
+	// populated post-OAuth). Read-only on this side; same load-once-at-
+	// startup contract as channelMappingPath. Sourced from
+	// SLACK_APPS_REGISTRY_PATH, defaulting to
+	// <GC_CITY_PATH>/.gc/slack/apps.json when GC_CITY_PATH is set, else
+	// /tmp/gc-slack-adapter/apps.json. Used to resolve per-app signing
+	// secrets for /slack/events and /slack/interactions request
+	// verification.
+	appsRegistryPath string
+	// appsRegistry is the in-memory snapshot of appsRegistryPath, wired
+	// at startup. Nil-safe — when nil, lookupSigningSecrets falls
+	// through to slackSigningKey for single-app dev installs.
+	appsRegistry *appsRegistry
 }
 
 func loadConfig() (config, error) {
@@ -345,15 +378,19 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 	// GC_CITY_PATH is set so a single-host slack-pack deployment
 	// "just works" without operator config; fall back to the legacy
 	// /tmp/gc-slack-adapter/ tree otherwise. Operators can override
-	// explicitly with SLACK_CHANNEL_MAPPING_PATH.
+	// explicitly with SLACK_CHANNEL_MAPPING_PATH. Apps registry path
+	// follows the same convention.
 	defaultMappingPath := "/tmp/gc-slack-adapter/channel_mappings.json"
 	defaultRigMappingPath := "/tmp/gc-slack-adapter/rig_mappings.json"
+	defaultAppsRegistryPath := "/tmp/gc-slack-adapter/apps.json"
 	if cityPath := getenv("GC_CITY_PATH"); cityPath != "" {
 		defaultMappingPath = filepath.Join(cityPath, ".gc", "slack", "channel_mappings.json")
 		defaultRigMappingPath = filepath.Join(cityPath, ".gc", "slack", "rig_mappings.json")
+		defaultAppsRegistryPath = filepath.Join(cityPath, ".gc", "slack", "apps.json")
 	}
 	cfg.channelMappingPath = envOrFn("SLACK_CHANNEL_MAPPING_PATH", defaultMappingPath)
 	cfg.rigMappingPath = envOrFn("SLACK_RIG_MAPPING_PATH", defaultRigMappingPath)
+	cfg.appsRegistryPath = envOrFn("SLACK_APPS_REGISTRY_PATH", defaultAppsRegistryPath)
 
 	// Retention controls. Defaults: keep inbound files for 7 days,
 	// sweep every hour. Setting either to "0" disables the janitor.
@@ -407,9 +444,12 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 	if cfg.slackBotToken == "" {
 		missing = append(missing, "SLACK_BOT_TOKEN")
 	}
-	if cfg.slackSigningKey == "" {
-		missing = append(missing, "SLACK_SIGNING_SECRET")
-	}
+	// SLACK_SIGNING_SECRET is now optional: gc-cby.16 introduced a
+	// per-app apps registry (apps.json) that supplies signing secrets
+	// per (workspace_id, app_id). The env var remains as a single-app
+	// fallback for dev / legacy installs. lookupSigningSecrets returns
+	// no candidates when both sources are empty, and the verify path
+	// returns 401 — the correct fail-closed behavior.
 	if cfg.cityName == "" {
 		// GC_CITY_NAME is required: every inbound POST and every
 		// dispatch-to-aliased-session call constructs a URL of the
@@ -757,6 +797,14 @@ func main() {
 	}
 	log.Printf("rig mapping registry: store=%s entries=%d (read-only; restart to reload)",
 		cfg.rigMappingPath, rigMapReg.Len())
+
+	appsReg, err := newAppsRegistry(cfg.appsRegistryPath)
+	if err != nil {
+		log.Fatalf("apps registry: %v", err)
+	}
+	cfg.appsRegistry = appsReg
+	log.Printf("apps registry: store=%s (read-only; restart to reload)",
+		cfg.appsRegistryPath)
 
 	// Cross-store overlap WARN: surface contradictory bindings (cby.3
 	// channel mapping vs cby.4 rig mapping pointing at different rigs
@@ -1445,11 +1493,19 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry) http.HandlerFu
 			http.Error(w, "read body", http.StatusBadRequest)
 			return
 		}
-		// Verify Slack signing secret.
+		// Resolve the candidate signing secrets BEFORE HMAC. Body is
+		// unsigned bytes by definition until verified — that's the
+		// whole point of the signature — so we parse only the small
+		// team_id field to choose which key(s) to trial-verify with.
+		// Standard Slack multi-tenant pattern. No team_id in body
+		// (e.g. malformed) falls through to env fallback inside
+		// lookupSigningSecrets.
+		teamID := parseTeamIDFromEventsBody(body)
+		secrets := lookupSigningSecrets(cfg.appsRegistry, cfg.slackSigningKey, teamID)
 		ts := r.Header.Get("X-Slack-Request-Timestamp")
 		sig := r.Header.Get("X-Slack-Signature")
-		if !verifySlackSignature(cfg.slackSigningKey, ts, body, sig) {
-			log.Printf("slack signature verify FAILED")
+		if !verifySlackSignatureMulti(secrets, ts, body, sig) {
+			log.Printf("slack signature verify FAILED team_id=%q candidates=%d", teamID, len(secrets))
 			http.Error(w, "invalid signature", http.StatusUnauthorized)
 			return
 		}
@@ -1483,6 +1539,43 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry) http.HandlerFu
 		// Phase 4 review fix).
 		go processSlackEvent(cfg, aliasReg, env, release)
 	}
+}
+
+// parseTeamIDFromEventsBody extracts the JSON `team_id` field from a
+// Slack /slack/events POST body. The body is unsigned at this point in
+// the pipeline, so this is intentionally minimal — no error
+// propagation, no full envelope decode. Returns "" on any decode
+// failure or missing field; the caller treats "" as "fall through to
+// env fallback" inside lookupSigningSecrets.
+//
+// Body size is already capped upstream at 1 MiB by io.LimitReader.
+func parseTeamIDFromEventsBody(body []byte) string {
+	var head struct {
+		TeamID string `json:"team_id"`
+	}
+	if err := json.Unmarshal(body, &head); err != nil {
+		return ""
+	}
+	return head.TeamID
+}
+
+// verifySlackSignatureMulti trials each candidate secret against the
+// HMAC and returns true on the first match. Each per-secret call
+// inherits fail-closed semantics from verifySlackSignature (malformed
+// timestamp, stale window, missing headers); sec-S-01 still pins.
+//
+// Empty candidate list returns false — the natural fail-closed path
+// when neither the apps registry nor the env supplies a secret. The
+// extra HMAC ops are cheap and bounded by the small number of gc-
+// imported apps per workspace; the trial is mechanical (no judgment
+// in Go).
+func verifySlackSignatureMulti(secrets []string, ts string, body []byte, sig string) bool {
+	for _, s := range secrets {
+		if verifySlackSignature(s, ts, body, sig) {
+			return true
+		}
+	}
+	return false
 }
 
 func verifySlackSignature(secret, ts string, body []byte, sig string) bool {

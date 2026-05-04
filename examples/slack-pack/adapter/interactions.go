@@ -197,6 +197,42 @@ func writeFile0600(path string, data []byte) error {
 	return nil
 }
 
+// parseTeamIDFromInteractionsBody extracts the Slack team id from a
+// /slack/interactions POST body to drive per-app signing-secret
+// lookup. Two body shapes occur:
+//
+//  1. Slash-command form: top-level field `team_id=T01234567`.
+//  2. Block-action / view-submission: top-level field `payload=<JSON>`
+//     where the JSON contains `{"team":{"id":"T01234567",...},...}`.
+//
+// Returns "" on any decode failure or missing field. The body is
+// unsigned at this point in the pipeline; the caller treats "" as
+// "fall through to env fallback" inside lookupSigningSecrets.
+//
+// Body size is already capped upstream at 1 MiB by io.LimitReader.
+func parseTeamIDFromInteractionsBody(body []byte) string {
+	form, err := url.ParseQuery(string(body))
+	if err != nil {
+		return ""
+	}
+	if t := form.Get("team_id"); t != "" {
+		return t
+	}
+	payload := form.Get("payload")
+	if payload == "" {
+		return ""
+	}
+	var p struct {
+		Team struct {
+			ID string `json:"id"`
+		} `json:"team"`
+	}
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		return ""
+	}
+	return p.Team.ID
+}
+
 // slackInteractionResponse is the ephemeral envelope Slack expects on
 // a slash-command HTTP response.
 type slackInteractionResponse struct {
@@ -240,8 +276,14 @@ func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry, rigReg 
 			http.Error(w, "read body", http.StatusBadRequest)
 			return
 		}
-		if !verifySlackSignature(cfg.slackSigningKey, r.Header.Get("X-Slack-Request-Timestamp"), body, r.Header.Get("X-Slack-Signature")) {
-			log.Printf("slack interactions: signature verify FAILED")
+		// Pre-parse team_id from the (still-unsigned) body to choose
+		// which signing secret(s) to trial-verify against. Body is
+		// either a slash-command form (top-level team_id field) or a
+		// payload= JSON form (payload.team.id). See gc-cby.16.
+		teamID := parseTeamIDFromInteractionsBody(body)
+		secrets := lookupSigningSecrets(cfg.appsRegistry, cfg.slackSigningKey, teamID)
+		if !verifySlackSignatureMulti(secrets, r.Header.Get("X-Slack-Request-Timestamp"), body, r.Header.Get("X-Slack-Signature")) {
+			log.Printf("slack interactions: signature verify FAILED team_id=%q candidates=%d", teamID, len(secrets))
 			http.Error(w, "invalid signature", http.StatusUnauthorized)
 			return
 		}
@@ -267,7 +309,7 @@ func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry, rigReg 
 			return
 		}
 
-		teamID := form.Get("team_id")
+		teamID = form.Get("team_id")
 		channelID := form.Get("channel_id")
 		command := form.Get("command")
 		text := form.Get("text")

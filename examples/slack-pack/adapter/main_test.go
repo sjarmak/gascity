@@ -127,22 +127,26 @@ func TestLoadConfigProxyProcessModeRejectsMissingURLPrefix(t *testing.T) {
 }
 
 func TestLoadConfigMissingSlackSecretsReportsAll(t *testing.T) {
-	// All three Slack secrets + GC_CITY_NAME missing — should report
-	// all four in one error. GC_CITY_NAME has no default because the
-	// fallback (silently posting to the wrong city) is worse than
-	// fail-fast.
+	// SLACK_WORKSPACE_ID, SLACK_BOT_TOKEN, GC_CITY_NAME remain must-set;
+	// SLACK_SIGNING_SECRET became optional in gc-cby.16 (per-app secrets
+	// resolved via the apps registry at request time, with this env var
+	// as a single-app fallback). The error must enumerate every still-
+	// required missing key.
 	env := map[string]string{}
 
 	_, err := loadConfigFromEnv(stubEnv(env))
 	if err == nil {
-		t.Fatal("loadConfigFromEnv: want error for missing slack secrets, got nil")
+		t.Fatal("loadConfigFromEnv: want error for missing required env, got nil")
 	}
 	for _, key := range []string{
-		"SLACK_WORKSPACE_ID", "SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET", "GC_CITY_NAME",
+		"SLACK_WORKSPACE_ID", "SLACK_BOT_TOKEN", "GC_CITY_NAME",
 	} {
 		if !strings.Contains(err.Error(), key) {
 			t.Errorf("error %q missing %s", err.Error(), key)
 		}
+	}
+	if strings.Contains(err.Error(), "SLACK_SIGNING_SECRET") {
+		t.Errorf("error %q must NOT mention SLACK_SIGNING_SECRET (now optional, gc-cby.16)", err.Error())
 	}
 }
 
@@ -2980,4 +2984,290 @@ func newTestHandleAliasRegistry(t *testing.T) *handleAliasRegistry {
 		t.Fatalf("newHandleAliasRegistry: %v", err)
 	}
 	return reg
+}
+
+// newTestAppsRegistry seeds an apps registry on disk for tests. Records
+// keyed by the same composite key (`<workspace>:<app>`) the production
+// writer (cmd/gc) uses.
+func newTestAppsRegistry(t *testing.T, recs map[string]appRecord) *appsRegistry {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "apps.json")
+	if recs != nil {
+		data, err := json.MarshalIndent(recs, "", "  ")
+		if err != nil {
+			t.Fatalf("marshal apps registry seed: %v", err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatalf("write apps registry seed: %v", err)
+		}
+	}
+	reg, err := newAppsRegistry(path)
+	if err != nil {
+		t.Fatalf("newAppsRegistry: %v", err)
+	}
+	return reg
+}
+
+// signedSlackEventRequest builds a signed POST to /slack/events with the
+// given body and secret + current timestamp.
+func signedSlackEventRequest(t *testing.T, secret string, body []byte) *http.Request {
+	t.Helper()
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := signFor(secret, ts, body)
+	req := httptest.NewRequest(http.MethodPost, "/slack/events", bytes.NewReader(body))
+	req.Header.Set("X-Slack-Request-Timestamp", ts)
+	req.Header.Set("X-Slack-Signature", sig)
+	return req
+}
+
+// TestParseTeamIDFromEventsBody — pre-verify extraction of team_id from
+// the JSON event envelope. The body is unsigned bytes by definition at
+// this point in the pipeline; parsing only reads the small struct shape.
+func TestParseTeamIDFromEventsBody(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"event_callback with team_id", `{"type":"event_callback","team_id":"T123"}`, "T123"},
+		{"url_verification with team_id", `{"type":"url_verification","team_id":"T9","challenge":"x"}`, "T9"},
+		{"missing team_id", `{"type":"event_callback"}`, ""},
+		{"malformed JSON", `{not json`, ""},
+		{"empty body", ``, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseTeamIDFromEventsBody([]byte(tc.body))
+			if got != tc.want {
+				t.Errorf("parseTeamIDFromEventsBody = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestVerifySlackSignatureMultiPicksMatching — three candidate secrets,
+// only one produces a valid HMAC. Trial-verify must return true and not
+// short-circuit on a wrong-secret early hit.
+func TestVerifySlackSignatureMultiPicksMatching(t *testing.T) {
+	body := []byte(`{"team_id":"T1"}`)
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := signFor("secret-correct", ts, body)
+	candidates := []string{"secret-wrong-1", "secret-correct", "secret-wrong-2"}
+	if !verifySlackSignatureMulti(candidates, ts, body, sig) {
+		t.Error("verifySlackSignatureMulti: must return true when one candidate matches")
+	}
+}
+
+func TestVerifySlackSignatureMultiNoneMatch(t *testing.T) {
+	body := []byte(`{"team_id":"T1"}`)
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := signFor("secret-correct", ts, body)
+	candidates := []string{"secret-wrong-1", "secret-wrong-2"}
+	if verifySlackSignatureMulti(candidates, ts, body, sig) {
+		t.Error("verifySlackSignatureMulti: must return false when no candidate matches")
+	}
+}
+
+func TestVerifySlackSignatureMultiEmptyCandidates(t *testing.T) {
+	body := []byte(`{"team_id":"T1"}`)
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := signFor("any", ts, body)
+	if verifySlackSignatureMulti(nil, ts, body, sig) {
+		t.Error("verifySlackSignatureMulti(nil): must return false")
+	}
+	if verifySlackSignatureMulti([]string{}, ts, body, sig) {
+		t.Error("verifySlackSignatureMulti([]): must return false")
+	}
+}
+
+// TestVerifySlackSignatureMultiFailsClosedOnMalformedTimestamp pins
+// sec-S-01 across the trial-verify wrapper: each candidate inherits
+// fail-closed semantics from verifySlackSignature, so a malformed
+// timestamp is rejected regardless of how many secrets we try.
+func TestVerifySlackSignatureMultiFailsClosedOnMalformedTimestamp(t *testing.T) {
+	body := []byte(`{"team_id":"T1"}`)
+	cases := []string{"", "abc", "1.5", "-1"}
+	for _, ts := range cases {
+		t.Run("ts="+ts, func(t *testing.T) {
+			sig := signFor("secret", ts, body)
+			candidates := []string{"secret"}
+			if verifySlackSignatureMulti(candidates, ts, body, sig) {
+				t.Errorf("verifySlackSignatureMulti(ts=%q): must reject malformed timestamp", ts)
+			}
+		})
+	}
+}
+
+// TestSlackEventsPerAppSignatureLookup — registry has two apps for the
+// same workspace with different signing secrets. A request signed with
+// app A2's secret must verify (trial-verify finds the matching one).
+func TestSlackEventsPerAppSignatureLookup(t *testing.T) {
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	appsReg := newTestAppsRegistry(t, map[string]appRecord{
+		"T1:A1": {WorkspaceID: "T1", AppID: "A1", SigningSecret: "secret-a1"},
+		"T1:A2": {WorkspaceID: "T1", AppID: "A2", SigningSecret: "secret-a2"},
+	})
+	cfg := config{
+		gcAPIBase:    gcStub.URL,
+		cityName:     "test-city",
+		provider:     "slack",
+		accountID:    "T1",
+		appsRegistry: appsReg,
+		// no env signing key — registry is the only source.
+	}
+	aliasReg := newTestHandleAliasRegistry(t)
+
+	rawMsg, _ := json.Marshal(slackMessageEvent{
+		Type: "message", Channel: "C1", User: "U1", TS: "1.0", Text: "hello",
+	})
+	envBody, _ := json.Marshal(slackEventEnvelope{
+		Type: "event_callback", TeamID: "T1", Event: rawMsg,
+	})
+	req := signedSlackEventRequest(t, "secret-a2", envBody)
+	w := httptest.NewRecorder()
+
+	handleSlackEvents(cfg, aliasReg)(w, req)
+
+	if w.Result().StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 (per-app lookup must verify with A2's secret)", w.Result().StatusCode)
+	}
+}
+
+// TestSlackEventsRegistryMissUsesEnvFallback — registry has T2 only;
+// inbound from T1 falls back to the env signing secret. Single-app dev
+// installs (no apps registry imports done) keep working.
+func TestSlackEventsRegistryMissUsesEnvFallback(t *testing.T) {
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	appsReg := newTestAppsRegistry(t, map[string]appRecord{
+		"T2:A2": {WorkspaceID: "T2", AppID: "A2", SigningSecret: "secret-t2"},
+	})
+	cfg := config{
+		gcAPIBase:       gcStub.URL,
+		cityName:        "test-city",
+		provider:        "slack",
+		accountID:       "T1",
+		slackSigningKey: "env-fallback",
+		appsRegistry:    appsReg,
+	}
+	aliasReg := newTestHandleAliasRegistry(t)
+
+	rawMsg, _ := json.Marshal(slackMessageEvent{
+		Type: "message", Channel: "C1", User: "U1", TS: "1.0", Text: "hello",
+	})
+	envBody, _ := json.Marshal(slackEventEnvelope{
+		Type: "event_callback", TeamID: "T1", Event: rawMsg,
+	})
+	req := signedSlackEventRequest(t, "env-fallback", envBody)
+	w := httptest.NewRecorder()
+
+	handleSlackEvents(cfg, aliasReg)(w, req)
+
+	if w.Result().StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 (env fallback must verify when registry misses)", w.Result().StatusCode)
+	}
+}
+
+// TestSlackEventsNoSecretRejects401 — registry has no match and env is
+// empty: nothing can verify, return 401 without leaking which path
+// failed.
+func TestSlackEventsNoSecretRejects401(t *testing.T) {
+	appsReg := newTestAppsRegistry(t, nil)
+	cfg := config{
+		cityName:     "test-city",
+		provider:     "slack",
+		accountID:    "T1",
+		appsRegistry: appsReg,
+		// no env, no registry match → no candidates.
+	}
+	aliasReg := newTestHandleAliasRegistry(t)
+
+	rawMsg, _ := json.Marshal(slackMessageEvent{Type: "message", Channel: "C1", User: "U1", TS: "1.0"})
+	envBody, _ := json.Marshal(slackEventEnvelope{Type: "event_callback", TeamID: "T1", Event: rawMsg})
+	req := signedSlackEventRequest(t, "anything", envBody)
+	w := httptest.NewRecorder()
+
+	handleSlackEvents(cfg, aliasReg)(w, req)
+	if w.Result().StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Result().StatusCode)
+	}
+}
+
+// TestSlackEventsMalformedBodyFallsBackToEnv — body that won't parse as
+// JSON has no extractable team_id. We still try env fallback (single-
+// app dev installs). When the sig matches env, verify passes and the
+// downstream JSON decode rejects it as a malformed envelope.
+func TestSlackEventsMalformedBodyFallsBackToEnv(t *testing.T) {
+	cfg := config{
+		cityName:        "test-city",
+		provider:        "slack",
+		accountID:       "T1",
+		slackSigningKey: "env-secret",
+		// no apps registry seeded.
+	}
+	aliasReg := newTestHandleAliasRegistry(t)
+
+	body := []byte(`{not json at all`)
+	req := signedSlackEventRequest(t, "env-secret", body)
+	w := httptest.NewRecorder()
+
+	handleSlackEvents(cfg, aliasReg)(w, req)
+	// Verify passed (env fallback) but JSON decode of envelope failed.
+	if w.Result().StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (malformed envelope after env-fallback verify)", w.Result().StatusCode)
+	}
+}
+
+// TestLoadConfigSigningSecretOptionalWithoutEnv — when SLACK_SIGNING_SECRET
+// is unset, loadConfig must NOT fail. The runtime apps registry may
+// supply secrets at request time. Operators who deploy with neither env
+// nor an apps registry will get 401s on every inbound (which is the
+// correct fail-closed behavior, and observable through logs).
+func TestLoadConfigSigningSecretOptionalWithoutEnv(t *testing.T) {
+	env := baseSlackEnv()
+	delete(env, "SLACK_SIGNING_SECRET")
+	cfg, err := loadConfigFromEnv(stubEnv(env))
+	if err != nil {
+		t.Fatalf("loadConfigFromEnv without SLACK_SIGNING_SECRET: %v", err)
+	}
+	if cfg.slackSigningKey != "" {
+		t.Errorf("slackSigningKey = %q, want empty (env unset)", cfg.slackSigningKey)
+	}
+}
+
+// TestLoadConfigAppsRegistryPathDefaults — derived from GC_CITY_PATH the
+// same way channel/rig mappings are.
+func TestLoadConfigAppsRegistryPathDefaults(t *testing.T) {
+	env := baseSlackEnv()
+	env["GC_CITY_PATH"] = "/tmp/test-city-root"
+	cfg, err := loadConfigFromEnv(stubEnv(env))
+	if err != nil {
+		t.Fatalf("loadConfigFromEnv: %v", err)
+	}
+	want := "/tmp/test-city-root/.gc/slack/apps.json"
+	if cfg.appsRegistryPath != want {
+		t.Errorf("appsRegistryPath = %q, want %q", cfg.appsRegistryPath, want)
+	}
+}
+
+func TestLoadConfigAppsRegistryPathOverride(t *testing.T) {
+	env := baseSlackEnv()
+	env["SLACK_APPS_REGISTRY_PATH"] = "/custom/apps.json"
+	cfg, err := loadConfigFromEnv(stubEnv(env))
+	if err != nil {
+		t.Fatalf("loadConfigFromEnv: %v", err)
+	}
+	if cfg.appsRegistryPath != "/custom/apps.json" {
+		t.Errorf("appsRegistryPath = %q, want /custom/apps.json", cfg.appsRegistryPath)
+	}
 }
