@@ -42,7 +42,7 @@ Two commits on `fork/feat/oversight-rig-pack` from the prior session:
 - Created: **gc-1b2.1** (P3, concurrent-invocation lock follow-up), **gc-1b2.2** (P3, DRY rig-fixture test helper), **gc-1b2.3** (P3, code-reviewer LOW polish — function-redef in loop + per-rig `bd list` hoist + split skip actions for unparseable timestamps).
 - Wave commits: `43d2b319` (gc-1b2 base), `016ab2a1` (gc-udx base), `3ee0f7be` (Phase 4 hardening), `66e4035f` (`--no-ff` merge).
 - Phase 4 unified review (3 reviewers in parallel against the combined diff): 0 CRITICAL, 7 HIGH (4 security, 2 go-test, 1 cross-cutting code) — all fixed before merge in `3ee0f7be`. 8 MEDIUM — most fixed in same commit, 3 deferred to gc-1b2.{1,2,3}.
-- Filed **gc-cby epic** (P2) — `slack-pack utility parity with discord pack for human coordination` — with 7 new child beads scoping the deferred command surface (`import-app`, `sync-commands`, `map-channel`, `map-rig`, `enable-room-launch`, `post-message`, `retry-peer-fanout`) plus reparented gc-vrw + gc-z23. Hard dep: gc-cby.2 blocked-by gc-cby.1 (sync-commands needs the imported manifest). See "Up next" below.
+- Filed **gc-cby epic** (P2) — `slack-pack utility parity with discord pack for human coordination` — with 9 new child beads scoping the deferred command surface (`import-app`, `sync-commands`, `map-channel`, `map-rig`, `enable-room-launch`, `post-message`, `retry-peer-fanout`) plus the manifest-scaffold prereq (gc-cby.8) and OAuth-install polish (gc-cby.9), plus reparented gc-vrw + gc-z23 hardening. Hard deps: gc-cby.1 blocked-by gc-cby.8 (import needs a manifest to import); gc-cby.2 blocked-by gc-cby.1 (sync-commands needs the imported app). See "Up next" below.
 
 ### Prior-session glance (gc-0fn / gc-5rz / gc-17z)
 
@@ -70,10 +70,13 @@ Live smoke is now **PASS** for the gc-j8h acceptance criteria — see "gc-j8h sm
 
 The slack-pack file-coordination story is structurally complete (gc-ywe 6/6 + gc-j8h closed + live-smoked + CSRF blocker removed). The remaining slack-pack work is now tracked under a single epic: **gc-cby — slack-pack utility parity with discord pack for human coordination.** Goal: bring `examples/slack-pack/` to feature parity with the upstream discord pack so Slack becomes a complete human-coordination surface (humans drive work via Slack alone, no parallel CLI required). When all gc-cby children close, the README's "Scope: not yet at parity" banner can be removed.
 
-### gc-cby children (9 total)
+### gc-cby children (11 total)
+
+**Prereq — must land before B-bucket can claim parity:**
+- **gc-cby.8 P2** author the Slack app manifest scaffold under `examples/slack-pack/manifest/` (no manifest exists today; the operator hand-created the Slack app via the api.slack.com UI and the manifest was never committed). Blocks .1.
 
 **B-bucket — slash-command intake (parity-critical for the human-coordination goal):**
-- **gc-cby.1 P2** `gc slack import-app` — import Slack app manifest into gc (foundation; blocks .2)
+- **gc-cby.1 P2** `gc slack import-app` — import the manifest from .8 into gc (blocked by .8; blocks .2)
 - **gc-cby.2 P2** `gc slack sync-commands` — register slash commands with Slack (blocked by .1)
 - **gc-cby.3 P2** `gc slack map-channel` — bind a channel to a session/rig for slash dispatch
 - **gc-cby.4 P2** `gc slack map-rig` — bind a channel set to a rig for slash dispatch
@@ -89,9 +92,12 @@ The slack-pack file-coordination story is structurally complete (gc-ywe 6/6 + gc
 - **gc-vrw P3** — slackDownloadToFile DNS rebinding + redirect-following defense
 - **gc-z23 P3** — handlePublishFile FilePath allowlist confinement
 
-Suggested dispatch order: B-bucket first (.1 → .2 → .{3,4} parallel), then A-bucket (.5), then C-bucket + D-bucket as background. B-bucket is what unlocks "humans use only Slack to drive work" — without slash commands they always need a parallel CLI window. A-bucket adds ad-hoc thread-scoped session spawning. C and D are post-parity polish.
+**Polish (post-parity, stretch — not blocking the parity claim):**
+- **gc-cby.9 P3** OAuth install flow so non-developer humans in other workspaces can adopt the pack without hand-editing env files (today: operator hand-creates the Slack app + copies bot_token into env). Single-tenant first; multi-tenant only if needed.
 
-Authoritative gap source-of-truth: `examples/slack-pack/README.md` § "Not yet implemented (planned)" + `pack.toml` header comment. The list was cross-checked against bd this session — no other slack-pack work was filed and dropped on the floor.
+Suggested dispatch order: gc-cby.8 (manifest) → B-bucket (.1 → .2 → .{3,4} parallel) → A-bucket (.5) → C/D-buckets as background → gc-cby.9 last. B-bucket is what unlocks "humans use only Slack to drive work" — without slash commands they always need a parallel CLI window. A-bucket adds ad-hoc thread-scoped session spawning. C/D are post-parity polish; .9 is the broader-adoption polish.
+
+Authoritative gap source-of-truth: `examples/slack-pack/README.md` § "Not yet implemented (planned)" + `pack.toml` header comment, cross-checked against bd this session. Two gaps surfaced beyond the README list and were filed: gc-cby.8 (manifest doesn't exist yet — the README's import-app entry implicitly assumed one) and gc-cby.9 (no OAuth install path — flagged as polish, not parity-blocker).
 
 ### Day-to-day coordination smokes (priority work — no code, not bd-tracked)
 
