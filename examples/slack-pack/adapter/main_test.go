@@ -1404,7 +1404,21 @@ func TestSafePathComponent(t *testing.T) {
 	}
 }
 
+// testAllowAnyURL bypasses the SSRF gate for tests of unrelated download
+// mechanics (atomic write, 4xx handling, sanitization) that point url_private
+// at httptest.NewServer URLs (http://127.0.0.1:<port>). Use ONLY in tests
+// where the gate is not the subject under test — gate tests
+// (TestIsSlackFileURL, TestSlackDownloadToFileRejectsNonSlackHostHTTPS) must
+// never call this.
+func testAllowAnyURL(t *testing.T) {
+	t.Helper()
+	prev := validateSlackFileURL
+	validateSlackFileURL = func(string) (bool, error) { return true, nil }
+	t.Cleanup(func() { validateSlackFileURL = prev })
+}
+
 func TestDownloadSlackFiles(t *testing.T) {
+	testAllowAnyURL(t)
 	cases := []struct {
 		name       string
 		files      []slackFile
@@ -1860,6 +1874,7 @@ func TestStorePermissions(t *testing.T) {
 // source mode set by OpenFile, so this also locks in the OpenFile
 // constant. gc-ywe.6.
 func TestDownloadSlackFilesPermissions(t *testing.T) {
+	testAllowAnyURL(t)
 	const body = "PNG-BYTES"
 	slackStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(body))
@@ -2127,6 +2142,126 @@ func TestTightenStorePermissions(t *testing.T) {
 			t.Errorf("error not wrapped with context: %v", err)
 		}
 	})
+}
+
+func TestIsSlackFileURL(t *testing.T) {
+	cases := []struct {
+		name      string
+		in        string
+		want      bool
+		expectErr bool // parse-failure cases — must surface a non-nil error
+	}{
+		// Allow: known Slack file hosts.
+		{"canonical files.slack.com", "https://files.slack.com/files-pri/T123-F456/example.png", true, false},
+		{"slack.com root", "https://slack.com/api/files.info", true, false},
+		{"slack-files.com", "https://slack-files.com/T123-F456-abc", true, false},
+		{"slack-files.com CDN subdomain", "https://cdn-0.slack-files.com/files-pri/T123-F456/example.png", true, false},
+		{"files-edge subdomain of slack.com", "https://files-edge.slack.com/files-pri/T123-F456/example.png", true, false},
+		{"explicit https port 443", "https://files.slack.com:443/files-pri/T123-F456/example.png", true, false},
+		{"uppercase host normalized", "https://Files.Slack.Com/files-pri/T123-F456/example.png", true, false},
+
+		// Reject: SSRF vectors (host policy).
+		{"loopback IPv4", "https://127.0.0.1/leak", false, false},
+		{"loopback IPv6", "https://[::1]/leak", false, false},
+		{"loopback IPv6 with port", "https://[::1]:80/leak", false, false},
+		{"IMDS link-local", "https://169.254.169.254/latest/meta-data/", false, false},
+		{"decimal-encoded loopback", "https://2130706433/leak", false, false},
+		{"decimal-encoded IMDS", "https://2852039166/", false, false},
+		{"GCP metadata internal hostname", "https://metadata.google.internal/computeMetadata/v1/", false, false},
+		{"attacker domain", "https://attacker.com/leak", false, false},
+		{"sound-alike not-slack", "https://notslack.com/", false, false},
+		{"suffix-trick subdomain", "https://evil.slack.com.attacker.com/leak", false, false},
+		{"userinfo bypass — host is attacker", "https://files.slack.com@attacker.com/leak", false, false},
+		{"trailing dot FQDN normalization", "https://files.slack.com./files", false, false},
+		{"non-standard port on slack host", "https://files.slack.com:8443/files-pri/T123-F456", false, false},
+		{"explicit 443 on attacker host", "https://attacker.com:443/leak", false, false},
+		{"explicit 443 on IMDS", "https://169.254.169.254:443/latest/meta-data/", false, false},
+
+		// Reject: scheme policy.
+		{"http scheme rejected", "http://files.slack.com/files-pri/T123-F456", false, false},
+		{"opaque url (javascript)", "javascript:alert(1)", false, false},
+
+		// Reject: must surface non-nil error.
+		// "" / "https://%zz" fail url.ParseRequestURI; "/files-pri/..." parses
+		// successfully but fails the !u.IsAbs() guard — both surface non-nil
+		// errors so callers can distinguish parse failure from policy reject.
+		{"empty url", "", false, true},
+		{"non-absolute path", "/files-pri/T123-F456", false, true},
+		{"malformed percent-encoding", "https://%zz", false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := isSlackFileURL(tc.in)
+			if got != tc.want {
+				t.Errorf("isSlackFileURL(%q) = %v, want %v (err=%v)", tc.in, got, tc.want, err)
+			}
+			if tc.expectErr && err == nil {
+				t.Errorf("isSlackFileURL(%q) expected non-nil error, got nil", tc.in)
+			}
+			if !tc.expectErr && err != nil {
+				t.Errorf("isSlackFileURL(%q) unexpected error: %v", tc.in, err)
+			}
+		})
+	}
+}
+
+func TestSlackDownloadToFileRedactsUserinfoInError(t *testing.T) {
+	// A forged url_private may carry attacker-chosen credentials in
+	// user:password@host form. The rejection error must not leak those
+	// credentials into adapter logs verbatim; url.URL.Redacted replaces
+	// the password component with "xxxxx".
+	dest := filepath.Join(t.TempDir(), "leaked")
+	err := slackDownloadToFile("xoxb-fake-bot-token",
+		"https://user:supersecret@attacker.com/leak", dest)
+	if err == nil {
+		t.Fatal("expected rejection of attacker host with userinfo, got nil")
+	}
+	if strings.Contains(err.Error(), "supersecret") {
+		t.Errorf("attacker-supplied password leaked in rejection error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "allowlist") {
+		t.Errorf("expected error to mention allowlist, got: %v", err)
+	}
+}
+
+func TestSlackDownloadToFileRejectsNonSlackHostHTTPS(t *testing.T) {
+	// Forged url_private pointing at a local TLS server. If the SSRF gate
+	// works, slackDownloadToFile must NOT make the HTTP request — verified
+	// via hits==0 and capturedAuth=="" (defense-in-depth: even if hits
+	// were nonzero, the bot token must not have left the process).
+	//
+	// Using NewTLSServer (https://127.0.0.1:<port>) is essential: with a
+	// plain http:// test URL the scheme check would fire first and the
+	// host gate would never be exercised, leaving "hits==0" as a
+	// coincidence rather than a host-gate guarantee.
+	var (
+		hits         int
+		capturedAuth string
+	)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		capturedAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "leaked")
+	err := slackDownloadToFile("xoxb-fake-bot-token", srv.URL+"/leak", dest)
+	if err == nil {
+		t.Fatal("expected error rejecting non-slack host, got nil")
+	}
+	if !strings.Contains(err.Error(), "allowlist") {
+		t.Errorf("expected error to mention allowlist (so log scanners can identify SSRF rejections), got: %v", err)
+	}
+	if hits != 0 {
+		t.Errorf("attacker TLS server received %d hit(s); host gate did not fire", hits)
+	}
+	if capturedAuth != "" {
+		t.Errorf("bot token leaked in Authorization header: %q", capturedAuth)
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Errorf("dest file %q should not exist after rejection, stat err: %v", dest, statErr)
+	}
 }
 
 func TestSlackKindFromChannelType(t *testing.T) {

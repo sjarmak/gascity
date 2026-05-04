@@ -1469,10 +1469,92 @@ func safeFilename(name string) string {
 	return cleaned
 }
 
+// isSlackFileURL reports whether rawURL is safe to fetch with the Slack bot
+// token: scheme must be https, host (lowercased, port stripped) must be one
+// of slack.com, *.slack.com, slack-files.com, or *.slack-files.com, and the
+// port (if present) must be 443. Trailing-dot FQDNs are rejected by the
+// suffix check (see comment in the body). Returns a non-nil error only when
+// the input fails URL parsing; policy rejections return (false, nil) so
+// callers can distinguish.
+//
+// Defense against forged inbound url_private values post signing-secret
+// compromise (gc-0fn). Without this gate, a forged event can point
+// url_private at any URL and slackDownloadToFile sends the bot token in
+// the Authorization header to that URL — credential exfiltration plus
+// internal-service probing (cloud metadata, gc API on loopback, etc.).
+//
+// Limitations not addressed here:
+//   - DNS rebinding: validation is on the URL string, not the resolved IP.
+//     A full defense would also require a custom Dialer with an IP allowlist.
+//   - HTTP redirects from a legitimate Slack CDN host to an internal IP:
+//     slackDownloadToFile uses http.DefaultClient which follows redirects
+//     without re-validating the destination. Requires a Slack CDN
+//     compromise to exploit; out of the immediate threat model.
+func isSlackFileURL(rawURL string) (bool, error) {
+	u, err := url.ParseRequestURI(rawURL)
+	if err != nil {
+		return false, fmt.Errorf("parse url_private: %w", err)
+	}
+	if !u.IsAbs() {
+		// ParseRequestURI accepts absolute paths (e.g. "/files-pri/...") and
+		// protocol-relative URLs ("//attacker.com/...") without an error;
+		// IsAbs() returns false for both, so they are caught here. A forged
+		// url_private must be a full absolute URL, never a path.
+		return false, fmt.Errorf("url_private not absolute: %q", rawURL)
+	}
+	if u.Scheme != "https" {
+		return false, nil
+	}
+	if p := u.Port(); p != "" && p != "443" {
+		return false, nil
+	}
+	// Note: we do NOT trim a trailing dot from the host. A trailing-dot FQDN
+	// (e.g. "files.slack.com.") is rejected by the suffix check below
+	// because the literal string ends in ".com." rather than ".com" or
+	// ".slack.com". This is the intended strict policy — Slack never
+	// returns trailing-dot hosts in url_private.
+	host := strings.ToLower(u.Hostname())
+	if host == "slack.com" || host == "slack-files.com" ||
+		strings.HasSuffix(host, ".slack.com") ||
+		strings.HasSuffix(host, ".slack-files.com") {
+		return true, nil
+	}
+	return false, nil
+}
+
+// validateSlackFileURL is the SSRF gate applied to inbound url_private
+// values before slackDownloadToFile sends the bot token. Indirected through
+// a package var so tests of unrelated download mechanics (atomic write,
+// 4xx handling, permissions) can swap it for a permit-all stub via
+// testAllowAnyURL — production callers always see isSlackFileURL.
+//
+// WARNING: not safe for concurrent test access. Tests that swap this var
+// must NOT call t.Parallel(), and must not run alongside any test that
+// depends on the production validator. testAllowAnyURL uses t.Cleanup to
+// restore the previous value after the test exits.
+var validateSlackFileURL = isSlackFileURL
+
 // slackDownloadToFile GETs urlPrivate with a Bearer token and streams the
 // body to dest via an atomic temp+rename. Non-2xx responses produce an
-// error with the truncated body for diagnosis.
+// error with the truncated body for diagnosis. The url_private host is
+// validated against the Slack allowlist before any network I/O — see
+// isSlackFileURL for the threat model (gc-0fn).
 func slackDownloadToFile(token, urlPrivate, dest string) error {
+	ok, err := validateSlackFileURL(urlPrivate)
+	if err != nil {
+		return fmt.Errorf("validating url_private: %w", err)
+	}
+	if !ok {
+		// Redact userinfo before logging — a forged url_private may carry
+		// attacker-chosen credentials in user:password@host form, which
+		// would otherwise land in adapter logs verbatim. Redacted() also
+		// preserves the host/path for log-scanner matching.
+		safe := urlPrivate
+		if u, perr := url.Parse(urlPrivate); perr == nil {
+			safe = u.Redacted()
+		}
+		return fmt.Errorf("url_private host not in slack allowlist: %q", safe)
+	}
 	req, err := http.NewRequest(http.MethodGet, urlPrivate, nil)
 	if err != nil {
 		return err
