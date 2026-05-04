@@ -22,5 +22,7 @@ via env vars injected at "gc start".`,
 	}
 	cmd.AddCommand(newSlackImportAppCmd(stdout, stderr))
 	cmd.AddCommand(newSlackSyncCommandsCmd(stdout, stderr))
+	cmd.AddCommand(newSlackMapChannelCmd(stdout, stderr))
+	cmd.AddCommand(newSlackStatusCmd(stdout, stderr))
 	return cmd
 }

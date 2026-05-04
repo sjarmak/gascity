@@ -64,11 +64,17 @@ Not yet implemented (planned):
 
 - [x] `gc slack import-app` — register a Slack app manifest with the gc
       city ([`manifest/README.md`](./manifest/README.md#importing-into-gc-gc-slack-import-app))
+- [x] `gc slack map-channel` — bind a Slack channel to a rig or session;
+      backs the adapter's `/slack/interactions` slash-command dispatcher
+      (rig-target dispatch wiring tracked as gc-cby.18)
 - [ ] `gc slack enable-room-launch` (`@@handle` thread-scoped sessions)
-- [ ] `gc slack map-channel` / `map-rig` / `sync-commands` (slash-command
-      intake — `/gc fix` style)
+- [ ] `gc slack map-rig` (alternate verb shape — see `map-channel --rig`)
 - [ ] `gc slack post-message` (workflow status projection)
 - [ ] `gc slack retry-peer-fanout`
+
+The adapter exposes `POST /slack/interactions` (HMAC-verified) for
+slash-command dispatch. Block-action and view-submission payloads
+return a clear "not yet supported" message — tracked as gc-cby.17.
 
 ## Architecture (current)
 

@@ -88,6 +88,16 @@
 //   - INBOUND_FILE_SWEEP_INTERVAL  Default "1h". How often the janitor
 //     wakes to scan INBOUND_FILE_STORE. "0"
 //     disables the janitor.
+//   - SLACK_CHANNEL_MAPPING_PATH    Default "<GC_CITY_PATH>/.gc/slack/channel_mappings.json"
+//     when GC_CITY_PATH is set, otherwise
+//     "/tmp/gc-slack-adapter/channel_mappings.json".
+//     JSON file written by `gc slack
+//     map-channel`. Read-only on the adapter
+//     side. The adapter does NOT reload on
+//     change — restart to pick up new
+//     bindings.
+//   - GC_CITY_PATH                 Optional; consulted only to derive
+//     SLACK_CHANNEL_MAPPING_PATH's default.
 //
 // # File permissions
 //
@@ -203,6 +213,14 @@ type config struct {
 	// inboundFileSweepInterval is how often the janitor wakes up to
 	// scan inboundFileStore. Empty or zero disables the janitor.
 	inboundFileSweepInterval time.Duration
+	// channelMappingPath is the JSON file written by
+	// `gc slack map-channel` mapping (workspace_id, channel_id) →
+	// (rig|session, target_id). Read-only on this side; the adapter
+	// loads it once at startup and never reloads — restart the adapter
+	// to pick up new bindings. Sourced from SLACK_CHANNEL_MAPPING_PATH,
+	// defaulting to <GC_CITY_PATH>/.gc/slack/channel_mappings.json when
+	// GC_CITY_PATH is set, else /tmp/gc-slack-adapter/channel_mappings.json.
+	channelMappingPath string
 	// fileUploadRoot is the absolute filesystem prefix
 	// /publish-file is allowed to read. Empty disables /publish-file
 	// entirely (fail-closed). gc and the adapter share a filesystem,
@@ -250,6 +268,17 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 		inboundFileStore:     envOrFn("INBOUND_FILE_STORE", "/tmp/gc-slack-adapter/inbound"),
 		fileUploadRoot:       getenv("FILE_UPLOAD_ROOT"),
 	}
+
+	// channelMappingPath default: prefer the city-rooted path when
+	// GC_CITY_PATH is set so a single-host slack-pack deployment
+	// "just works" without operator config; fall back to the legacy
+	// /tmp/gc-slack-adapter/ tree otherwise. Operators can override
+	// explicitly with SLACK_CHANNEL_MAPPING_PATH.
+	defaultMappingPath := "/tmp/gc-slack-adapter/channel_mappings.json"
+	if cityPath := getenv("GC_CITY_PATH"); cityPath != "" {
+		defaultMappingPath = filepath.Join(cityPath, ".gc", "slack", "channel_mappings.json")
+	}
+	cfg.channelMappingPath = envOrFn("SLACK_CHANNEL_MAPPING_PATH", defaultMappingPath)
 
 	// Retention controls. Defaults: keep inbound files for 7 days,
 	// sweep every hour. Setting either to "0" disables the janitor.
@@ -622,10 +651,19 @@ func main() {
 	}
 	log.Printf("handle alias registry: store=%s", cfg.handleAliasStorePath)
 
-	// Public mux: only /slack/events (HMAC-verified) and /healthz.
-	// Bound to 0.0.0.0 by default so Tailscale Funnel can reach it.
+	channelMapReg, err := newChannelMappingRegistry(cfg.channelMappingPath)
+	if err != nil {
+		log.Fatalf("channel mapping registry: %v", err)
+	}
+	log.Printf("channel mapping registry: store=%s entries=%d (read-only; restart to reload)",
+		cfg.channelMappingPath, len(channelMapReg.byKey))
+
+	// Public mux: only /slack/events + /slack/interactions
+	// (HMAC-verified) and /healthz. Bound to 0.0.0.0 by default so
+	// Tailscale Funnel can reach it.
 	publicMux := http.NewServeMux()
 	publicMux.HandleFunc("/slack/events", handleSlackEvents(cfg, aliasReg))
+	publicMux.HandleFunc("/slack/interactions", handleSlackInteractions(cfg, channelMapReg))
 	publicMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
@@ -2000,7 +2038,7 @@ func logSweepResult(res sweepResult) {
 //
 // gc-ywe.6.
 func tightenStorePermissions(cfg config) {
-	for _, p := range []string{cfg.identityStorePath, cfg.handleAliasStorePath} {
+	for _, p := range []string{cfg.identityStorePath, cfg.handleAliasStorePath, cfg.channelMappingPath} {
 		if p == "" {
 			continue
 		}

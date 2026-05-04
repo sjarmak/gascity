@@ -20,9 +20,7 @@
 #
 # Not yet implemented (see README.md "Port checklist"):
 #   gc slack enable-room-launch  (launcher mode, @@handle spawning)
-#   gc slack import-app        — slash-command intake for `/gc fix` style
-#   gc slack map-channel / map-rig
-#   gc slack sync-commands
+#   gc slack map-rig           — alternate verb shape (see `map-channel --rig`)
 #   gc slack post-message      — workflow status projection
 #   gc slack retry-peer-fanout
 #
