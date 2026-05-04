@@ -96,8 +96,18 @@
 //     side. The adapter does NOT reload on
 //     change — restart to pick up new
 //     bindings.
+//   - SLACK_RIG_MAPPING_PATH        Default "<GC_CITY_PATH>/.gc/slack/rig_mappings.json"
+//     when GC_CITY_PATH is set, otherwise
+//     "/tmp/gc-slack-adapter/rig_mappings.json".
+//     JSON file written by `gc slack map-rig`.
+//     Read-only on the adapter side; same
+//     load-once-at-startup contract as
+//     SLACK_CHANNEL_MAPPING_PATH. Channel
+//     mappings override rig mappings when both
+//     claim the same channel.
 //   - GC_CITY_PATH                 Optional; consulted only to derive
-//     SLACK_CHANNEL_MAPPING_PATH's default.
+//     SLACK_CHANNEL_MAPPING_PATH and
+//     SLACK_RIG_MAPPING_PATH defaults.
 //
 // # File permissions
 //
@@ -221,6 +231,15 @@ type config struct {
 	// defaulting to <GC_CITY_PATH>/.gc/slack/channel_mappings.json when
 	// GC_CITY_PATH is set, else /tmp/gc-slack-adapter/channel_mappings.json.
 	channelMappingPath string
+	// rigMappingPath is the JSON file written by `gc slack map-rig`
+	// mapping (workspace_id, rig_name) → set-of-channel-ids. Read-only
+	// on this side; same load-once-at-startup contract as
+	// channelMappingPath. Per-channel `map-channel` bindings take
+	// precedence over rig defaults — see resolveChannelTarget. Sourced
+	// from SLACK_RIG_MAPPING_PATH, defaulting to
+	// <GC_CITY_PATH>/.gc/slack/rig_mappings.json when GC_CITY_PATH is
+	// set, else /tmp/gc-slack-adapter/rig_mappings.json.
+	rigMappingPath string
 	// fileUploadRoot is the absolute filesystem prefix
 	// /publish-file is allowed to read. Empty disables /publish-file
 	// entirely (fail-closed). gc and the adapter share a filesystem,
@@ -275,10 +294,13 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 	// /tmp/gc-slack-adapter/ tree otherwise. Operators can override
 	// explicitly with SLACK_CHANNEL_MAPPING_PATH.
 	defaultMappingPath := "/tmp/gc-slack-adapter/channel_mappings.json"
+	defaultRigMappingPath := "/tmp/gc-slack-adapter/rig_mappings.json"
 	if cityPath := getenv("GC_CITY_PATH"); cityPath != "" {
 		defaultMappingPath = filepath.Join(cityPath, ".gc", "slack", "channel_mappings.json")
+		defaultRigMappingPath = filepath.Join(cityPath, ".gc", "slack", "rig_mappings.json")
 	}
 	cfg.channelMappingPath = envOrFn("SLACK_CHANNEL_MAPPING_PATH", defaultMappingPath)
+	cfg.rigMappingPath = envOrFn("SLACK_RIG_MAPPING_PATH", defaultRigMappingPath)
 
 	// Retention controls. Defaults: keep inbound files for 7 days,
 	// sweep every hour. Setting either to "0" disables the janitor.
@@ -658,12 +680,26 @@ func main() {
 	log.Printf("channel mapping registry: store=%s entries=%d (read-only; restart to reload)",
 		cfg.channelMappingPath, len(channelMapReg.byKey))
 
+	rigMapReg, err := newRigMappingRegistry(cfg.rigMappingPath)
+	if err != nil {
+		log.Fatalf("rig mapping registry: %v", err)
+	}
+	log.Printf("rig mapping registry: store=%s entries=%d (read-only; restart to reload)",
+		cfg.rigMappingPath, len(rigMapReg.byKey))
+
+	// Cross-store overlap WARN: surface contradictory bindings (cby.3
+	// channel mapping vs cby.4 rig mapping pointing at different rigs
+	// for the same channel) at startup so operators see them in
+	// adapter logs. resolveChannelTarget always lets channel mapping
+	// win at runtime — this is purely observability.
+	logCrossStoreOverlapWarnings(channelMapReg, rigMapReg)
+
 	// Public mux: only /slack/events + /slack/interactions
 	// (HMAC-verified) and /healthz. Bound to 0.0.0.0 by default so
 	// Tailscale Funnel can reach it.
 	publicMux := http.NewServeMux()
 	publicMux.HandleFunc("/slack/events", handleSlackEvents(cfg, aliasReg))
-	publicMux.HandleFunc("/slack/interactions", handleSlackInteractions(cfg, channelMapReg))
+	publicMux.HandleFunc("/slack/interactions", handleSlackInteractions(cfg, channelMapReg, rigMapReg))
 	publicMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
@@ -2038,7 +2074,7 @@ func logSweepResult(res sweepResult) {
 //
 // gc-ywe.6.
 func tightenStorePermissions(cfg config) {
-	for _, p := range []string{cfg.identityStorePath, cfg.handleAliasStorePath, cfg.channelMappingPath} {
+	for _, p := range []string{cfg.identityStorePath, cfg.handleAliasStorePath, cfg.channelMappingPath, cfg.rigMappingPath} {
 		if p == "" {
 			continue
 		}

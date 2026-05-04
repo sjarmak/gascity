@@ -173,15 +173,16 @@ func writeEphemeral(w http.ResponseWriter, status int, text string) {
 
 // handleSlackInteractions serves POST /slack/interactions — the
 // public webhook for Slack slash-command and (eventually) block-action
-// payloads. HMAC-verified with cfg.slackSigningKey. Slash commands hit
-// the (workspace_id, channel_id) → (rig|session) mapping registry and
-// dispatch accordingly; block-action payloads return a clear "not yet
-// supported" response (tracked as gc-cby.17).
+// payloads. HMAC-verified with cfg.slackSigningKey. Slash commands
+// resolve through resolveChannelTarget — per-channel `map-channel`
+// bindings (cby.3) are overrides on top of the rig→{channels} default
+// (cby.4); channel mapping wins. Block-action payloads return a clear
+// "not yet supported" response (tracked as gc-cby.17).
 //
 // Slack's 3-second response deadline means dispatch to gc happens in a
 // goroutine; the HTTP response is always immediate. Errors from the
 // goroutine are logged.
-func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry) http.HandlerFunc {
+func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry, rigReg *rigMappingRegistry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -243,13 +244,15 @@ func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry) http.Ha
 			return
 		}
 
-		rec, ok := mapReg.Get(teamID, channelID)
+		rec, source, ok := resolveChannelTarget(mapReg, rigReg, teamID, channelID)
 		if !ok {
 			writeEphemeral(w, http.StatusOK, fmt.Sprintf(
-				"No binding for this channel. Run `gc slack map-channel %s --workspace-id %s --rig <name>` (or `--session <id>`) first.",
-				channelID, teamID))
+				"No binding for this channel. Run `gc slack map-channel %s --workspace-id %s --rig <name>` (or `--session <id>`), or bind a rig set with `gc slack map-rig <name> --workspace-id %s --channel %s`.",
+				channelID, teamID, teamID, channelID))
 			return
 		}
+		log.Printf("interaction: workspace=%s channel=%s source=%s target=%s/%s",
+			teamID, channelID, source, rec.TargetKind, rec.TargetID)
 
 		switch rec.TargetKind {
 		case channelMappingTargetKindSession:
@@ -258,8 +261,8 @@ func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry) http.Ha
 			go dispatchSlashCommandToSession(cfg, rec.TargetID, command, text, channelID, teamID, userID)
 		case channelMappingTargetKindRig:
 			writeEphemeral(w, http.StatusOK, fmt.Sprintf(
-				"Channel %s is bound to rig %s. Rig-target dispatch is implemented in a follow-up bead (gc-cby.18); the binding is recorded but not yet routed.",
-				channelID, rec.TargetID))
+				"Channel %s is bound to rig %s (source=%s). Rig-target dispatch is implemented in a follow-up bead (gc-cby.18); the binding is recorded but not yet routed.",
+				channelID, rec.TargetID, source))
 		default:
 			// load() rejects unknown target_kind, so reaching this branch
 			// means the registry was mutated mid-flight by another

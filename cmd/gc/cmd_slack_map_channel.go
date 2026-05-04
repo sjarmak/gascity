@@ -13,6 +13,12 @@ import (
 // removes one) at <cityPath>/.gc/slack/channel_mappings.json. The
 // slack-pack adapter reads this file at startup and uses it to route
 // /slack/interactions slash-command requests.
+//
+// Per-channel `map-channel` bindings are overrides on top of the
+// rig→{channels} default written by `gc slack map-rig`; channel
+// mapping wins. Cross-store conflict detection refuses to write a
+// `--rig` mapping when the same channel is already bound to a
+// DIFFERENT rig in the rig-mapping registry.
 func newSlackMapChannelCmd(stdout, stderr io.Writer) *cobra.Command {
 	var (
 		workspaceID string
@@ -33,7 +39,11 @@ slash-command requests for the channel to the bound target.
 Exactly one of --rig or --session is required (unless --remove). The
 binding is idempotent: re-binding the same channel preserves the
 original CreatedAt and overwrites the target fields. --remove always
-exits 0 — if no binding exists, the command is a no-op.`,
+exits 0 — if no binding exists, the command is a no-op.
+
+When --rig is used, the cby.4 rig-mapping store
+(<cityPath>/.gc/slack/rig_mappings.json) is consulted: if the channel
+is already bound to a DIFFERENT rig there, the write is rejected.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runSlackMapChannel(stdout, args[0], workspaceID, rigName, sessionID, remove)
@@ -74,6 +84,7 @@ func runSlackMapChannel(stdout io.Writer, channelID, workspaceID, rigName, sessi
 		} else {
 			fmt.Fprintf(stdout, "No binding for channel %s (workspace=%s); nothing to remove\n", channelID, workspaceID) //nolint:errcheck
 		}
+		fmt.Fprintln(stdout, slackMapRigRestartReminder) //nolint:errcheck
 		return nil
 	}
 
@@ -94,6 +105,21 @@ func runSlackMapChannel(stdout io.Writer, channelID, workspaceID, rigName, sessi
 		targetID = sessionID
 	}
 
+	// Cross-store conflict check (cby.4 → cby.3 direction): only
+	// applies to --rig writes. Session bindings are explicit
+	// overrides on top of any rig default — that's the intended
+	// composition pattern.
+	if targetKind == slackChannelMappingTargetKindRig {
+		rigReg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityPath))
+		if err != nil {
+			return fmt.Errorf("open slack rig mapping registry: %w", err)
+		}
+		if owner, _, ok := rigReg.LookupRigForChannel(workspaceID, channelID); ok && owner.RigName != rigName {
+			return fmt.Errorf("cmd/gc/cmd_slack_map_channel.go: channel %q is already bound to rig %q via 'gc slack map-rig'; remove that binding first or use --rig %q to keep the same target rig",
+				channelID, owner.RigName, owner.RigName)
+		}
+	}
+
 	now := time.Now().UTC()
 	rec := slackChannelMappingRecord{
 		WorkspaceID: workspaceID,
@@ -112,5 +138,6 @@ func runSlackMapChannel(stdout io.Writer, channelID, workspaceID, rigName, sessi
 	}
 	fmt.Fprintf(stdout, "Mapped channel %s (workspace=%s) → %s:%s\n", //nolint:errcheck
 		channelID, workspaceID, targetKind, targetID)
+	fmt.Fprintln(stdout, slackMapRigRestartReminder) //nolint:errcheck
 	return nil
 }

@@ -144,6 +144,124 @@ func TestSlackMapChannelRemoveWithTargetIsError(t *testing.T) {
 	}
 }
 
+// slackMapChannelRestartHint is the trailing reminder appended by
+// every success-path output of `gc slack map-channel`, parallel to
+// the cby.4 rig-mapping CLI.
+const slackMapChannelRestartHint = "Restart slack-pack adapter"
+
+func TestSlackMapChannelHappyPathIncludesRestartReminder(t *testing.T) {
+	cityRoot := newTestCity(t)
+	stdout, _, err := execSlackMapChannelCmd(t, cityRoot,
+		"C0123", "--workspace-id", "T123", "--rig", "alpha",
+	)
+	if err != nil {
+		t.Fatalf("map-channel: %v", err)
+	}
+	if !strings.Contains(stdout, slackMapChannelRestartHint) {
+		t.Errorf("stdout missing restart hint: %q", stdout)
+	}
+}
+
+func TestSlackMapChannelRemoveExistingIncludesRestartReminder(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapChannelCmd(t, cityRoot,
+		"C1", "--workspace-id", "T1", "--rig", "alpha",
+	); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := execSlackMapChannelCmd(t, cityRoot,
+		"C1", "--workspace-id", "T1", "--remove",
+	)
+	if err != nil {
+		t.Fatalf("--remove: %v", err)
+	}
+	if !strings.Contains(stdout, slackMapChannelRestartHint) {
+		t.Errorf("--remove existing missing restart hint: %q", stdout)
+	}
+}
+
+func TestSlackMapChannelRemoveMissingIncludesRestartReminder(t *testing.T) {
+	cityRoot := newTestCity(t)
+	stdout, _, err := execSlackMapChannelCmd(t, cityRoot,
+		"C1", "--workspace-id", "T1", "--remove",
+	)
+	if err != nil {
+		t.Fatalf("--remove missing: %v", err)
+	}
+	if !strings.Contains(stdout, slackMapChannelRestartHint) {
+		t.Errorf("--remove missing missing restart hint: %q", stdout)
+	}
+}
+
+func TestSlackMapChannelSessionIncludesRestartReminder(t *testing.T) {
+	cityRoot := newTestCity(t)
+	stdout, _, err := execSlackMapChannelCmd(t, cityRoot,
+		"C1", "--workspace-id", "T1", "--session", "gc-1",
+	)
+	if err != nil {
+		t.Fatalf("map-channel --session: %v", err)
+	}
+	if !strings.Contains(stdout, slackMapChannelRestartHint) {
+		t.Errorf("session map missing restart hint: %q", stdout)
+	}
+}
+
+func TestSlackMapChannelCrossStoreConflictDifferentRig(t *testing.T) {
+	cityRoot := newTestCity(t)
+	// Pre-write rig alpha owning C1 in cby.4.
+	rigReg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rigReg.Set(slackRigMappingRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelIDs: []string{"C1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Trying to map-channel C1 → rig beta should be rejected.
+	_, _, err = execSlackMapChannelCmd(t, cityRoot,
+		"C1", "--workspace-id", "T1", "--rig", "beta",
+	)
+	if err == nil {
+		t.Fatal("expected cross-store conflict error, got nil")
+	}
+	if !strings.Contains(err.Error(), "alpha") {
+		t.Errorf("error should mention conflicting rig %q: %v", "alpha", err)
+	}
+}
+
+func TestSlackMapChannelCrossStoreSameRigOK(t *testing.T) {
+	cityRoot := newTestCity(t)
+	rigReg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	_ = rigReg.Set(slackRigMappingRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelIDs: []string{"C1"},
+	})
+	if _, _, err := execSlackMapChannelCmd(t, cityRoot,
+		"C1", "--workspace-id", "T1", "--rig", "alpha",
+	); err != nil {
+		t.Fatalf("same-rig override should be OK: %v", err)
+	}
+}
+
+func TestSlackMapChannelCrossStoreSessionIgnoresRigStore(t *testing.T) {
+	cityRoot := newTestCity(t)
+	rigReg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	_ = rigReg.Set(slackRigMappingRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelIDs: []string{"C1"},
+	})
+	// --session is an explicit override, even on top of an existing
+	// rig binding, so it must succeed without touching the rig
+	// store.
+	if _, _, err := execSlackMapChannelCmd(t, cityRoot,
+		"C1", "--workspace-id", "T1", "--session", "gc-1",
+	); err != nil {
+		t.Fatalf("session override should not be blocked by rig binding: %v", err)
+	}
+}
+
 func TestSlackMapChannelIdempotentReSetPreservesCreatedAt(t *testing.T) {
 	cityRoot := newTestCity(t)
 	if _, _, err := execSlackMapChannelCmd(t, cityRoot,

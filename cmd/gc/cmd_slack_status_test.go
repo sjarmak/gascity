@@ -166,6 +166,163 @@ func TestSlackStatusJSONEmpty(t *testing.T) {
 	}
 }
 
+func TestSlackStatusShowsRigMappings(t *testing.T) {
+	cityRoot := newTestCity(t)
+	rigReg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rigReg.Set(slackRigMappingRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelIDs: []string{"C1", "C2"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := execSlackStatusCmd(t, cityRoot)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	for _, want := range []string{"T1/alpha", "C1", "C2"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q: %s", want, stdout)
+		}
+	}
+}
+
+func TestSlackStatusEmptyRigMappingsHumanOutput(t *testing.T) {
+	cityRoot := newTestCity(t)
+	stdout, _, err := execSlackStatusCmd(t, cityRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.ToLower(stdout), "no rig mappings") {
+		t.Errorf("stdout should mention 'No rig mappings.' on empty store: %s", stdout)
+	}
+}
+
+func TestSlackStatusJSONIncludesRigMappings(t *testing.T) {
+	cityRoot := newTestCity(t)
+	rigReg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	_ = rigReg.Set(slackRigMappingRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelIDs: []string{"C1"},
+	})
+	stdout, _, err := execSlackStatusCmd(t, cityRoot, "--json")
+	if err != nil {
+		t.Fatalf("status --json: %v", err)
+	}
+	if !strings.Contains(stdout, `"rig_mappings"`) {
+		t.Errorf("JSON missing rig_mappings key: %s", stdout)
+	}
+	var parsed slackStatusJSON
+	if err := json.Unmarshal([]byte(stdout), &parsed); err != nil {
+		t.Fatalf("not valid JSON: %v\n%s", err, stdout)
+	}
+	if len(parsed.RigMappings) != 1 || parsed.RigMappings[0].Record.RigName != "alpha" {
+		t.Errorf("rig_mappings = %+v, want one record for alpha", parsed.RigMappings)
+	}
+}
+
+func TestSlackStatusChannelFilterIncludesRigMappings(t *testing.T) {
+	cityRoot := newTestCity(t)
+	rigReg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	_ = rigReg.Set(slackRigMappingRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelIDs: []string{"C1", "C2"},
+	})
+	_ = rigReg.Set(slackRigMappingRecord{
+		WorkspaceID: "T1", RigName: "beta",
+		ChannelIDs: []string{"C3"},
+	})
+	chanReg, _ := newSlackChannelMappingRegistry(slackChannelMappingsPath(cityRoot))
+	now := time.Now().UTC()
+	_ = chanReg.Set(slackChannelMappingRecord{
+		WorkspaceID: "T1", ChannelID: "C1",
+		TargetKind: "session", TargetID: "gc-1",
+		CreatedAt: now, UpdatedAt: now,
+	})
+
+	stdout, _, err := execSlackStatusCmd(t, cityRoot, "--channel", "C1", "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed slackStatusJSON
+	if err := json.Unmarshal([]byte(stdout), &parsed); err != nil {
+		t.Fatalf("not valid JSON: %v\n%s", err, stdout)
+	}
+	// rig alpha contains C1, rig beta does not — only alpha should appear.
+	if len(parsed.RigMappings) != 1 || parsed.RigMappings[0].Record.RigName != "alpha" {
+		t.Errorf("--channel C1 filter on rig_mappings: %+v, want only alpha", parsed.RigMappings)
+	}
+	// per-channel mapping for C1 must also appear.
+	if len(parsed.Mappings) != 1 || parsed.Mappings[0].ChannelID != "C1" {
+		t.Errorf("--channel C1 filter on channel_mappings: %+v", parsed.Mappings)
+	}
+}
+
+func TestSlackStatusWorkspaceFilterAppliesToRigMappings(t *testing.T) {
+	cityRoot := newTestCity(t)
+	rigReg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	_ = rigReg.Set(slackRigMappingRecord{WorkspaceID: "T1", RigName: "a", ChannelIDs: []string{"C1"}})
+	_ = rigReg.Set(slackRigMappingRecord{WorkspaceID: "T2", RigName: "b", ChannelIDs: []string{"C2"}})
+	stdout, _, err := execSlackStatusCmd(t, cityRoot, "--workspace-id", "T2", "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed slackStatusJSON
+	if err := json.Unmarshal([]byte(stdout), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.RigMappings) != 1 || parsed.RigMappings[0].Record.WorkspaceID != "T2" {
+		t.Errorf("--workspace-id filter: %+v", parsed.RigMappings)
+	}
+}
+
+func TestSlackStatusConflictAnnotation(t *testing.T) {
+	// A hand-edited / out-of-band scenario: cby.3 channel mapping
+	// claims C1 for rig X; cby.4 rig store claims C1 for rig Y.
+	// Status surfaces this so operators can resolve it.
+	cityRoot := newTestCity(t)
+	now := time.Now().UTC()
+	chanReg, _ := newSlackChannelMappingRegistry(slackChannelMappingsPath(cityRoot))
+	_ = chanReg.Set(slackChannelMappingRecord{
+		WorkspaceID: "T1", ChannelID: "C1",
+		TargetKind: "rig", TargetID: "x",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	rigReg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	_ = rigReg.Set(slackRigMappingRecord{
+		WorkspaceID: "T1", RigName: "y",
+		ChannelIDs: []string{"C1"},
+	})
+
+	stdoutHuman, _, err := execSlackStatusCmd(t, cityRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdoutHuman, "conflict") {
+		t.Errorf("human output should annotate the conflict: %s", stdoutHuman)
+	}
+
+	stdoutJSON, _, err := execSlackStatusCmd(t, cityRoot, "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed slackStatusJSON
+	if err := json.Unmarshal([]byte(stdoutJSON), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	var foundConflict bool
+	for _, rm := range parsed.RigMappings {
+		if rm.Conflict {
+			foundConflict = true
+		}
+	}
+	if !foundConflict {
+		t.Errorf("JSON output should mark conflict=true on at least one rig mapping: %+v", parsed.RigMappings)
+	}
+}
+
 func TestSlackStatusJSONChannelFilter(t *testing.T) {
 	cityRoot := newTestCity(t)
 	mapReg, _ := newSlackChannelMappingRegistry(slackChannelMappingsPath(cityRoot))

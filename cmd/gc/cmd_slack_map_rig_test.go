@@ -1,0 +1,294 @@
+package main
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+	"time"
+)
+
+// execSlackMapRigCmd executes the verb directly against a temp city.
+func execSlackMapRigCmd(t *testing.T, cityRoot string, args ...string) (string, string, error) {
+	t.Helper()
+	t.Chdir(cityRoot)
+	var stdout, stderr bytes.Buffer
+	cmd := newSlackMapRigCmd(&stdout, &stderr)
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs(args)
+	err := cmd.Execute()
+	return stdout.String(), stderr.String(), err
+}
+
+const slackMapRigRestartHint = "Restart slack-pack adapter"
+
+func TestSlackMapRigHappyPath(t *testing.T) {
+	cityRoot := newTestCity(t)
+	stdout, stderr, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1", "--channel", "C2",
+	)
+	if err != nil {
+		t.Fatalf("map-rig: %v\nstderr=%s", err, stderr)
+	}
+	if !strings.Contains(stdout, "alpha") {
+		t.Errorf("stdout should mention rig alpha: %q", stdout)
+	}
+	if !strings.Contains(stdout, slackMapRigRestartHint) {
+		t.Errorf("stdout missing restart hint: %q", stdout)
+	}
+	reg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _, ok := reg.LookupRigForChannel("T1", "C1")
+	if !ok {
+		t.Fatal("rig mapping missing after map-rig")
+	}
+	if rec.RigName != "alpha" {
+		t.Errorf("RigName = %q, want alpha", rec.RigName)
+	}
+	if len(rec.ChannelIDs) != 2 || rec.ChannelIDs[0] != "C1" || rec.ChannelIDs[1] != "C2" {
+		t.Errorf("ChannelIDs = %v, want [C1 C2] (sorted)", rec.ChannelIDs)
+	}
+}
+
+func TestSlackMapRigCommaSeparatedChannels(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1,C2",
+	); err != nil {
+		t.Fatalf("map-rig comma-separated: %v", err)
+	}
+	reg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	rec, _, ok := reg.LookupRigForChannel("T1", "C1")
+	if !ok {
+		t.Fatal("missing record")
+	}
+	if len(rec.ChannelIDs) != 2 {
+		t.Errorf("ChannelIDs = %v, want 2", rec.ChannelIDs)
+	}
+}
+
+func TestSlackMapRigMixedFlagAndCommas(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1", "--channel", "C2,C3",
+	); err != nil {
+		t.Fatalf("map-rig mixed: %v", err)
+	}
+	reg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	rec, _, _ := reg.LookupRigForChannel("T1", "C1")
+	if len(rec.ChannelIDs) != 3 {
+		t.Errorf("ChannelIDs = %v, want 3", rec.ChannelIDs)
+	}
+}
+
+func TestSlackMapRigDedupesChannels(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1", "--channel", "C1",
+	); err != nil {
+		t.Fatalf("map-rig: %v", err)
+	}
+	reg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	rec, _, _ := reg.LookupRigForChannel("T1", "C1")
+	if len(rec.ChannelIDs) != 1 {
+		t.Errorf("ChannelIDs = %v, want 1 (deduped)", rec.ChannelIDs)
+	}
+}
+
+func TestSlackMapRigMissingWorkspaceID(t *testing.T) {
+	cityRoot := newTestCity(t)
+	_, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--channel", "C1",
+	)
+	if err == nil {
+		t.Fatal("expected error for missing --workspace-id")
+	}
+}
+
+func TestSlackMapRigMissingChannel(t *testing.T) {
+	cityRoot := newTestCity(t)
+	_, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1",
+	)
+	if err == nil {
+		t.Fatal("expected error when --channel missing without --remove")
+	}
+}
+
+func TestSlackMapRigRemoveExisting(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1",
+	); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--remove",
+	)
+	if err != nil {
+		t.Fatalf("--remove existing: %v", err)
+	}
+	if !strings.Contains(stdout, "Removed rig mapping alpha") {
+		t.Errorf("stdout = %q, want substring 'Removed rig mapping alpha'", stdout)
+	}
+	if !strings.Contains(stdout, slackMapRigRestartHint) {
+		t.Errorf("stdout missing restart hint: %q", stdout)
+	}
+	reg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	if _, _, ok := reg.LookupRigForChannel("T1", "C1"); ok {
+		t.Errorf("byChannel still has C1 after --remove")
+	}
+}
+
+func TestSlackMapRigRemoveMissing(t *testing.T) {
+	cityRoot := newTestCity(t)
+	stdout, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--remove",
+	)
+	if err != nil {
+		t.Fatalf("--remove missing should succeed (idempotent): %v", err)
+	}
+	if !strings.Contains(stdout, "No rig mapping alpha") {
+		t.Errorf("stdout = %q, want substring 'No rig mapping alpha'", stdout)
+	}
+	if !strings.Contains(stdout, slackMapRigRestartHint) {
+		t.Errorf("stdout missing restart hint: %q", stdout)
+	}
+}
+
+func TestSlackMapRigRemoveWithChannelIsError(t *testing.T) {
+	cityRoot := newTestCity(t)
+	_, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--remove", "--channel", "C1",
+	)
+	if err == nil {
+		t.Fatal("expected error for --remove with --channel")
+	}
+}
+
+func TestSlackMapRigReplaceWithDropsWarning(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1,C2,C3",
+	); err != nil {
+		t.Fatal(err)
+	}
+	_, stderr, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C2,C3",
+	)
+	if err != nil {
+		t.Fatalf("re-set: %v", err)
+	}
+	if !strings.Contains(stderr, "dropped: C1") {
+		t.Errorf("stderr should warn about dropped channels: %q", stderr)
+	}
+}
+
+func TestSlackMapRigCrossStoreConflictDifferentRig(t *testing.T) {
+	cityRoot := newTestCity(t)
+	// Pre-write cby.3 channel mapping C1 → rig beta.
+	chanReg, err := newSlackChannelMappingRegistry(slackChannelMappingsPath(cityRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := chanReg.Set(slackChannelMappingRecord{
+		WorkspaceID: "T1", ChannelID: "C1",
+		TargetKind: "rig", TargetID: "beta",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Now try to map-rig alpha to include C1 → should fail.
+	_, _, err = execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1",
+	)
+	if err == nil {
+		t.Fatal("expected cross-store conflict error, got nil")
+	}
+	if !strings.Contains(err.Error(), "beta") {
+		t.Errorf("error should mention conflicting rig %q: %v", "beta", err)
+	}
+}
+
+func TestSlackMapRigCrossStoreSameRigOK(t *testing.T) {
+	cityRoot := newTestCity(t)
+	// Pre-write cby.3 channel mapping C1 → rig alpha.
+	chanReg, _ := newSlackChannelMappingRegistry(slackChannelMappingsPath(cityRoot))
+	now := time.Now().UTC()
+	_ = chanReg.Set(slackChannelMappingRecord{
+		WorkspaceID: "T1", ChannelID: "C1",
+		TargetKind: "rig", TargetID: "alpha",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	// Now map-rig alpha including C1 — same rig, should succeed.
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1",
+	); err != nil {
+		t.Fatalf("same-rig should be OK: %v", err)
+	}
+}
+
+func TestSlackMapRigCrossStoreSessionMappingOK(t *testing.T) {
+	cityRoot := newTestCity(t)
+	// Pre-write cby.3 channel mapping C1 → session gc-1 (an explicit override).
+	chanReg, _ := newSlackChannelMappingRegistry(slackChannelMappingsPath(cityRoot))
+	now := time.Now().UTC()
+	_ = chanReg.Set(slackChannelMappingRecord{
+		WorkspaceID: "T1", ChannelID: "C1",
+		TargetKind: "session", TargetID: "gc-1",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	// map-rig alpha including C1 should succeed; the per-channel
+	// session mapping is the explicit override (the intended
+	// composition pattern).
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1",
+	); err != nil {
+		t.Fatalf("session override should not block map-rig: %v", err)
+	}
+}
+
+func TestSlackMapRigCrossRigConflictWithinCBy4(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1",
+	); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := execSlackMapRigCmd(t, cityRoot,
+		"beta", "--workspace-id", "T1", "--channel", "C1",
+	)
+	if err == nil {
+		t.Fatal("expected cross-rig conflict, got nil")
+	}
+}
+
+func TestSlackMapRigIdempotentReSetPreservesCreatedAt(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1",
+	); err != nil {
+		t.Fatal(err)
+	}
+	reg1, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	rec1, _, _ := reg1.LookupRigForChannel("T1", "C1")
+	createdAt := rec1.CreatedAt
+
+	time.Sleep(2 * time.Millisecond)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1,C2",
+	); err != nil {
+		t.Fatal(err)
+	}
+	reg2, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	rec2, _, _ := reg2.LookupRigForChannel("T1", "C1")
+	if !rec2.CreatedAt.Equal(createdAt) {
+		t.Errorf("CreatedAt advanced on re-set: was %v, now %v", createdAt, rec2.CreatedAt)
+	}
+	if !rec2.UpdatedAt.After(createdAt) {
+		t.Errorf("UpdatedAt did not advance: %v vs %v", rec2.UpdatedAt, createdAt)
+	}
+}

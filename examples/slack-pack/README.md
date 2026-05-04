@@ -67,8 +67,12 @@ Not yet implemented (planned):
 - [x] `gc slack map-channel` — bind a Slack channel to a rig or session;
       backs the adapter's `/slack/interactions` slash-command dispatcher
       (rig-target dispatch wiring tracked as gc-cby.18)
+- [x] `gc slack map-rig` — bind a rig to a set of channels as the
+      fall-through default for slash-command resolution. Per-channel
+      `map-channel` bindings override rig defaults; channel mapping
+      wins. Cross-store conflict detection refuses contradictory
+      writes in either direction.
 - [ ] `gc slack enable-room-launch` (`@@handle` thread-scoped sessions)
-- [ ] `gc slack map-rig` (alternate verb shape — see `map-channel --rig`)
 - [ ] `gc slack post-message` (workflow status projection)
 - [ ] `gc slack retry-peer-fanout`
 

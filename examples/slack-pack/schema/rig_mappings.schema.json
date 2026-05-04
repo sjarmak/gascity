@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gastownhall/gascity/examples/slack-pack/schema/rig_mappings.schema.json",
+  "title": "slack-pack rig_mappings.json",
+  "description": "Authoritative schema for the Slack rig mapping registry persisted at <cityPath>/.gc/slack/rig_mappings.json. The on-disk JSON is the only contract between the gc CLI (writer, via 'gc slack map-rig') and the slack-pack adapter (reader, via /slack/interactions). Composite primary key is the JSON object key, formatted '<workspace_id>:<rig_name>'. Per-channel mappings written by 'gc slack map-channel' (channel_mappings.json) take precedence over rig defaults; channel mapping wins. The adapter loads this file once at startup and does NOT reload — operators must restart the adapter to pick up new bindings.",
+  "type": "object",
+  "additionalProperties": { "$ref": "#/$defs/slackRigMappingRecord" },
+  "$defs": {
+    "slackRigMappingRecord": {
+      "type": "object",
+      "required": ["workspace_id", "rig_name", "channel_ids", "created_at", "updated_at"],
+      "properties": {
+        "workspace_id": {
+          "type": "string",
+          "description": "Slack workspace (team) id, e.g. T0123456. Required component of the composite key."
+        },
+        "rig_name": {
+          "type": "string",
+          "description": "Operator-supplied rig name. Required component of the composite key. Must not contain whitespace, control characters, or path separators (/, \\)."
+        },
+        "channel_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "Sorted, deduplicated list of Slack channel ids the rig owns. The adapter builds an inverted index (channel → rig) at load time so slash-command resolution is O(1). A channel may only appear in one rig record at a time within this store."
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC3339 timestamp of the first successful binding for this composite key. Idempotent re-binds preserve this value."
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC3339 timestamp of the most recent successful binding for this composite key. Idempotent re-binds advance this in place."
+        }
+      }
+    }
+  }
+}

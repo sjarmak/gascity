@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -49,7 +50,7 @@ func TestSlackInteractionsRejectsNonPost(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/slack/interactions", nil)
 	rec := httptest.NewRecorder()
-	handleSlackInteractions(cfg, mapReg)(rec, req)
+	handleSlackInteractions(cfg, mapReg, nil)(rec, req)
 
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want 405", rec.Code)
@@ -65,7 +66,7 @@ func TestSlackInteractionsRejectsBadSignature(t *testing.T) {
 	req.Header.Set("X-Slack-Request-Timestamp", strconv.FormatInt(time.Now().Unix(), 10))
 	req.Header.Set("X-Slack-Signature", "v0=deadbeef")
 	rec := httptest.NewRecorder()
-	handleSlackInteractions(cfg, mapReg)(rec, req)
+	handleSlackInteractions(cfg, mapReg, nil)(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", rec.Code)
@@ -79,7 +80,7 @@ func TestSlackInteractionsBlockActionPayloadNotYetSupported(t *testing.T) {
 	body := []byte(url.Values{"payload": {`{"type":"block_actions"}`}}.Encode())
 	req := signedSlackInteractionRequest(t, cfg.slackSigningKey, body)
 	rec := httptest.NewRecorder()
-	handleSlackInteractions(cfg, mapReg)(rec, req)
+	handleSlackInteractions(cfg, mapReg, nil)(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)
@@ -102,7 +103,7 @@ func TestSlackInteractionsTeamIDMismatch(t *testing.T) {
 	}.Encode())
 	req := signedSlackInteractionRequest(t, cfg.slackSigningKey, body)
 	rec := httptest.NewRecorder()
-	handleSlackInteractions(cfg, mapReg)(rec, req)
+	handleSlackInteractions(cfg, mapReg, nil)(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401 for team_id mismatch", rec.Code)
@@ -123,7 +124,7 @@ func TestSlackInteractionsMissingTeamID(t *testing.T) {
 	}.Encode())
 	req := signedSlackInteractionRequest(t, cfg.slackSigningKey, body)
 	rec := httptest.NewRecorder()
-	handleSlackInteractions(cfg, mapReg)(rec, req)
+	handleSlackInteractions(cfg, mapReg, nil)(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401 for missing team_id", rec.Code)
@@ -171,7 +172,7 @@ func TestSlackInteractionsSessionMappingHitDispatches(t *testing.T) {
 	}.Encode())
 	req := signedSlackInteractionRequest(t, cfg.slackSigningKey, body)
 	rec := httptest.NewRecorder()
-	handleSlackInteractions(cfg, mapReg)(rec, req)
+	handleSlackInteractions(cfg, mapReg, nil)(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -211,7 +212,7 @@ func TestSlackInteractionsRigMappingHitFollowUp(t *testing.T) {
 	}.Encode())
 	req := signedSlackInteractionRequest(t, cfg.slackSigningKey, body)
 	rec := httptest.NewRecorder()
-	handleSlackInteractions(cfg, mapReg)(rec, req)
+	handleSlackInteractions(cfg, mapReg, nil)(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)
@@ -234,7 +235,7 @@ func TestSlackInteractionsMappingMiss(t *testing.T) {
 	}.Encode())
 	req := signedSlackInteractionRequest(t, cfg.slackSigningKey, body)
 	rec := httptest.NewRecorder()
-	handleSlackInteractions(cfg, mapReg)(rec, req)
+	handleSlackInteractions(cfg, mapReg, nil)(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -253,7 +254,7 @@ func TestSlackInteractionsEmptyBody(t *testing.T) {
 
 	req := signedSlackInteractionRequest(t, cfg.slackSigningKey, []byte(""))
 	rec := httptest.NewRecorder()
-	handleSlackInteractions(cfg, mapReg)(rec, req)
+	handleSlackInteractions(cfg, mapReg, nil)(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 for empty body", rec.Code)
@@ -273,7 +274,7 @@ func TestSlackInteractionsResponseEnvelope(t *testing.T) {
 	}.Encode())
 	req := signedSlackInteractionRequest(t, cfg.slackSigningKey, body)
 	rec := httptest.NewRecorder()
-	handleSlackInteractions(cfg, mapReg)(rec, req)
+	handleSlackInteractions(cfg, mapReg, nil)(rec, req)
 
 	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "application/json") {
 		t.Errorf("Content-Type = %q, want JSON", got)
@@ -290,6 +291,226 @@ func TestSlackInteractionsResponseEnvelope(t *testing.T) {
 	}
 	if env.Text == "" {
 		t.Errorf("text empty")
+	}
+}
+
+func newTestRigMappingRegistry(t *testing.T) *rigMappingRegistry {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "rig_mappings.json")
+	reg, err := newRigMappingRegistry(path)
+	if err != nil {
+		t.Fatalf("newRigMappingRegistry: %v", err)
+	}
+	return reg
+}
+
+func TestResolveChannelTargetChannelMappingWinsOverRig(t *testing.T) {
+	chanReg := newTestChannelMappingRegistry(t)
+	rigReg := newTestRigMappingRegistry(t)
+	now := time.Now().UTC()
+	if err := chanReg.Set(channelMappingDiskRecord{
+		WorkspaceID: "T1", ChannelID: "C1",
+		TargetKind: "session", TargetID: "gc-1",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rigReg.Set(rigMappingDiskRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelIDs: []string{"C1"},
+		CreatedAt:  now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec, src, ok := resolveChannelTarget(chanReg, rigReg, "T1", "C1")
+	if !ok {
+		t.Fatal("resolveChannelTarget ok=false")
+	}
+	if src != "channel" {
+		t.Errorf("source = %q, want channel", src)
+	}
+	if rec.TargetKind != "session" || rec.TargetID != "gc-1" {
+		t.Errorf("channel mapping should have won: %+v", rec)
+	}
+}
+
+func TestResolveChannelTargetFallsThroughToRig(t *testing.T) {
+	chanReg := newTestChannelMappingRegistry(t)
+	rigReg := newTestRigMappingRegistry(t)
+	now := time.Now().UTC()
+	if err := rigReg.Set(rigMappingDiskRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelIDs: []string{"C2"},
+		CreatedAt:  now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec, src, ok := resolveChannelTarget(chanReg, rigReg, "T1", "C2")
+	if !ok {
+		t.Fatal("expected fall-through to rig store")
+	}
+	if src != "rig" {
+		t.Errorf("source = %q, want rig", src)
+	}
+	if rec.TargetKind != "rig" || rec.TargetID != "alpha" {
+		t.Errorf("synthetic record mismatch: %+v", rec)
+	}
+}
+
+func TestResolveChannelTargetMiss(t *testing.T) {
+	chanReg := newTestChannelMappingRegistry(t)
+	rigReg := newTestRigMappingRegistry(t)
+	if _, src, ok := resolveChannelTarget(chanReg, rigReg, "T1", "C-UNBOUND"); ok || src != "" {
+		t.Errorf("expected miss, got src=%q ok=%v", src, ok)
+	}
+}
+
+func TestSlackInteractionsResolverRigFallThrough(t *testing.T) {
+	cfg := config{slackSigningKey: "secret", accountID: "T1", cityName: "test-city"}
+	chanReg := newTestChannelMappingRegistry(t)
+	rigReg := newTestRigMappingRegistry(t)
+	now := time.Now().UTC()
+	if err := rigReg.Set(rigMappingDiskRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelIDs: []string{"C1"},
+		CreatedAt:  now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(url.Values{
+		"team_id":    {"T1"},
+		"channel_id": {"C1"},
+		"command":    {"/gc"},
+		"text":       {"deploy"},
+		"user_id":    {"U1"},
+	}.Encode())
+	req := signedSlackInteractionRequest(t, cfg.slackSigningKey, body)
+	rec := httptest.NewRecorder()
+	handleSlackInteractions(cfg, chanReg, rigReg)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "alpha") {
+		t.Errorf("body should mention rig alpha (rig fall-through): %s", rec.Body.String())
+	}
+}
+
+func TestSlackInteractionsResolverChannelOverride(t *testing.T) {
+	// Stub gc session-message endpoint.
+	gotPath := make(chan string, 1)
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusAccepted)
+		select {
+		case gotPath <- r.URL.Path:
+		default:
+		}
+	}))
+	t.Cleanup(gcStub.Close)
+
+	cfg := config{
+		slackSigningKey: "secret",
+		accountID:       "T1",
+		cityName:        "test-city",
+		gcAPIBase:       gcStub.URL,
+	}
+	chanReg := newTestChannelMappingRegistry(t)
+	rigReg := newTestRigMappingRegistry(t)
+	now := time.Now().UTC()
+	// channel mapping pins C1 to a session — that's the override.
+	_ = chanReg.Set(channelMappingDiskRecord{
+		WorkspaceID: "T1", ChannelID: "C1",
+		TargetKind: "session", TargetID: "gc-2568",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	// rig store ALSO covers C1 — but channel mapping must win.
+	_ = rigReg.Set(rigMappingDiskRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelIDs: []string{"C1"},
+		CreatedAt:  now, UpdatedAt: now,
+	})
+
+	body := []byte(url.Values{
+		"team_id":    {"T1"},
+		"channel_id": {"C1"},
+		"command":    {"/gc"},
+		"text":       {"x"},
+		"user_id":    {"U1"},
+	}.Encode())
+	req := signedSlackInteractionRequest(t, cfg.slackSigningKey, body)
+	rec := httptest.NewRecorder()
+	handleSlackInteractions(cfg, chanReg, rigReg)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	select {
+	case path := <-gotPath:
+		if path != "/v0/city/test-city/session/gc-2568/messages" {
+			t.Errorf("dispatched path = %q, want session route", path)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatch did not occur — channel override did not win")
+	}
+}
+
+func TestSlackInteractionsResolverSourceDiscriminatorLogged(t *testing.T) {
+	var logs strings.Builder
+	prevOut := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(prevOut) })
+
+	cfg := config{slackSigningKey: "secret", accountID: "T1", cityName: "test-city"}
+	chanReg := newTestChannelMappingRegistry(t)
+	rigReg := newTestRigMappingRegistry(t)
+	now := time.Now().UTC()
+	_ = rigReg.Set(rigMappingDiskRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelIDs: []string{"C1"},
+		CreatedAt:  now, UpdatedAt: now,
+	})
+	body := []byte(url.Values{
+		"team_id":    {"T1"},
+		"channel_id": {"C1"},
+		"command":    {"/gc"},
+		"text":       {"x"},
+		"user_id":    {"U1"},
+	}.Encode())
+	req := signedSlackInteractionRequest(t, cfg.slackSigningKey, body)
+	rec := httptest.NewRecorder()
+	handleSlackInteractions(cfg, chanReg, rigReg)(rec, req)
+
+	if !strings.Contains(logs.String(), "source=rig") {
+		t.Errorf("log should include source discriminator 'source=rig': %s", logs.String())
+	}
+}
+
+func TestLogCrossStoreOverlapWarning(t *testing.T) {
+	var logs strings.Builder
+	prevOut := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(prevOut) })
+
+	chanReg := newTestChannelMappingRegistry(t)
+	rigReg := newTestRigMappingRegistry(t)
+	now := time.Now().UTC()
+	_ = chanReg.Set(channelMappingDiskRecord{
+		WorkspaceID: "T1", ChannelID: "C1",
+		TargetKind: "rig", TargetID: "x",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	_ = rigReg.Set(rigMappingDiskRecord{
+		WorkspaceID: "T1", RigName: "y",
+		ChannelIDs: []string{"C1"},
+		CreatedAt:  now, UpdatedAt: now,
+	})
+	logCrossStoreOverlapWarnings(chanReg, rigReg)
+	out := logs.String()
+	if !strings.Contains(out, "WARN") {
+		t.Errorf("log should include WARN: %s", out)
+	}
+	if !strings.Contains(out, "rig=\"x\"") || !strings.Contains(out, "rig=\"y\"") {
+		t.Errorf("log should include both conflicting rig names: %s", out)
 	}
 }
 

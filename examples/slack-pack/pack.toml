@@ -20,7 +20,6 @@
 #
 # Not yet implemented (see README.md "Port checklist"):
 #   gc slack enable-room-launch  (launcher mode, @@handle spawning)
-#   gc slack map-rig           — alternate verb shape (see `map-channel --rig`)
 #   gc slack post-message      — workflow status projection
 #   gc slack retry-peer-fanout
 #
