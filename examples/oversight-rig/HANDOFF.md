@@ -1,20 +1,32 @@
-# Oversight-rig handoff — 2026-05-03 evening (gc-ywe.6 hardening + worktree cleanup + gc-17z staged)
+# Oversight-rig handoff — 2026-05-04 (gc-ywe.7 + gc-a3s shipped; operator-stance section landed)
 
-> **To the next agent:** this session shipped the slack adapter perm-hardening (gc-ywe.6), surfaced a defense-in-depth follow-up (gc-ywe.7), staged the cos-prompt-verification runbook for gc-17z, and cleaned up three stale PR-staging worktrees. Single commit landed on `fork/feat/oversight-rig-pack`:
+> **To the next agent:** this session closed the gc-ywe slack-pack epic (gc-ywe.7 path-component sanitization shipped, parent gc-ywe auto-closed) AND the gc-a3s loud-validation fix for `[[orders.overrides]]`. Three commits on `fork/feat/oversight-rig-pack`:
 >
-> - **`5ef244ca` — `fix(slack-pack): harden adapter /tmp store default permissions (gc-ywe.6)`** — six mode constants flipped (0o755→0o700 dirs, 0o644→0o600 files) across `downloadSlackFiles` + `identityRegistry.saveLocked` + `handleAliasRegistry.saveLocked`; proxy_process UDS `os.Chmod`'d to 0o600 after `net.Listen` as defense-in-depth on top of its 0o700 controller-managed parent; new `tightenStorePermissions` startup migration helper preserves setuid/setgid/sticky bits, refuses to follow symlinks (no `Lchmod` in stdlib), never loosens operator-tighter perms (e.g. 0o400 read-only). 4 new test funcs covering all 7 mode-bearing call sites + 12 helper subtests. Phase 4 review (code+security+go reviewers in parallel) closed 2 HIGH (`os.IsNotExist`→`errors.Is`, EACCES test root-guard) + 3 MEDIUM (Lstat for symlink safety, listenUDS error wrap, log-line preserves special bits) in-band.
+> - **`f3ab1393` — `docs(oversight-rig): add durable operator stance section to HANDOFF`** — added the "Operator stance" callout below (operator-at-keyboard for Slack tests, defer to reasonable design defaults, restarts pre-approved on this fork). Also persisted via `bd remember --key operator-stance-sjarmak` so it survives even if HANDOFF gets rewritten.
 >
-> Worktree audit found three stale PR-staging worktrees whose PRs had already squash-merged earlier today. Removed: `gascity-pr-gc-a3s` (PR #1622), `gascity-pr-gc-cdf` (PR #1625), `gascity-gascity-reply` (PR #1203). The "DO NOT touch `internal/orders/override.go`" warning is now stale and removed below.
+> - **`1eef688e` — `fix(slack-pack): sanitize channel + ts as filesystem path components (gc-ywe.7)`** — added `safePathComponent` strict allowlist helper (`[A-Za-z0-9_.-]`, leading-dot scrub, 64-char cap, empty → `_`) and applied to `channel` + `ts` in `downloadSlackFiles` before `filepath.Join`. Defense-in-depth on top of the existing `verifySlackSignature` HMAC gate. New `TestSafePathComponent` (~20 cases) + extended `TestDownloadSlackFiles` malformed-channel/ts subcase using `filepath.EvalSymlinks` for symlink-aware containment. Phase 4 review closed 3 MEDIUM in-band (leading-dot doc accuracy, EvalSymlinks containment, ASCII-invariant comment on byte truncation). 2 pre-existing security gaps surfaced and filed: **gc-0fn (P1 SSRF in `slackDownloadToFile` — `url_private` host not validated; gates: bot token leak post signing-secret compromise)** and **gc-z23 (P3 unrestricted `req.FilePath` in `handlePublishFile` — internal mux trust)**.
 >
-> `core.hooksPath` is `.githooks`; the gc-ywe.6 commit went through the full pre-commit pipeline (gofmt + golangci-lint + go test sweep + docsync). `bd dolt push` no-op'd (remote not configured for this fork — beads stay versioned in `.beads/`).
+> - **`016a344e` — `fix(orders): make orders.overrides validation errors loud, not silent (gc-a3s)`** — three call sites used to silently swallow override-not-found errors (startup `buildOrderDispatcher`, reload, API `controllerState.Orders()`). Fix: `buildOrderDispatcher` returns `(orderDispatcher, error)`; `newCityRuntime` returns `(*CityRuntime, error)`; reload path validates orders early (after lifecycle, before any state mutation), fails with `reloadOutcomeFailed` mirroring the provider-swap pattern. Error message enriched with rig-scoping hint: `"add one [[orders.overrides]] block per rig with rig = \"<rig-name>\" (matching rigs: alpha, beta, ...)"`. API endpoint logs once per controller lifetime via `atomic.Bool`. New `internal/orders/override_test.go` (7 tests) + new `TestBuildOrderDispatcherRejectsRiglessOverrideOnPerRigOrder` driving the full FS-scan → ApplyOverrides → wrapped-error path. Phase 4 review closed 4 MEDIUM in-band (log wording, error wording, log spam, error wrap symmetry). Filed **gc-4hn (P3 missing reload-path test coverage)**. Operator design decisions Q1=A (reloadOutcomeFailed), Q2=B (best-effort API + log), Q3=A (enriched error) all applied.
+>
+> All three commits passed the full `.githooks/pre-commit` pipeline (gofmt + golangci-lint + go test sweep + docsync). `bd dolt push` no-op'd (remote not configured for this fork — beads stay versioned in `.beads/`).
+>
+> **Branch state at session end:** `fork/feat/oversight-rig-pack` is 3 ahead of remote (commits above), pushed at session close.
 
 ## This session at a glance
 
-- Closed: gc-ywe.6 (P3 perm hardening, shipped 5ef244ca).
-- Created: gc-ywe.7 (P2 follow-up — pre-existing path-component sanitization for `msg.Channel`/`ts` in `downloadSlackFiles`; gated behind `SLACK_SIGNING_SECRET` HMAC, surfaced as defense-in-depth gap by Phase 4 security review).
-- Staged: gc-17z runbook in `/tmp/gc-17z-verify/` — 6 scripts (preflight, restart-cos, seed-test-bead, watch-logs, collect-evidence, cleanup) + README documenting the 3-scenario protocol. Preflight smoke-tested green this session.
-- Removed: 3 worktrees (`gascity-pr-gc-a3s`, `gascity-pr-gc-cdf`, `gascity-gascity-reply`) + their branches (force-deleted; SHAs preserved in reflog).
-- Epic gc-ywe still has gc-ywe.7 (P2) open; otherwise complete.
+- Closed: gc-ywe.7 (P2 slack-pack path-sanitization, shipped 1eef688e), gc-ywe (P2 epic auto-closed — 0 open children), gc-a3s (P2 orders.overrides loud-validation, shipped 016a344e).
+- Created: gc-0fn (P1 SSRF, slack-pack), gc-z23 (P3 file-path confinement, slack-pack), gc-4hn (P3 reload-path test, orders).
+- Updated: HANDOFF gained a durable "Operator stance" section (also in `bd remember`).
+
+## Up next — operational/Slack work, deferred from this session
+
+Two beads are ready and pre-planned but require live operations + operator-in-Slack work; deferred to a fresh session for safer execution:
+
+1. **gc-5rz** P2 — slack adapter Phase A live cutover. Re-attempt now that gc-cdf (the SDK-side `GC_SERVICE_URL_PREFIX` bug) is closed. Steps: stop manual nohup adapter (PID 2242537 last verified — re-check on next session start), uncomment the `[[service]]` block in `examples/slack-pack/pack.toml`, reload supervisor, verify proxy_process spawned the adapter, smoke `gc /v0/extmsg/outbound` end-to-end, then tear down nohup. Has a documented rollback plan (re-comment, restart nohup). Risk: brief outbound-publish disruption window during cutover.
+
+2. **gc-17z** P2 — verify cos picks up slack-v0 prompt + DM-ack behavior. Runbook at `/tmp/gc-17z-verify/` (preflight smoke-tested green prior session — but `/tmp` survives reboots variably; **re-check the runbook exists** on next session start, and re-run `./00-preflight.sh` before driving). Three Slack scenarios: DM `gc-oversight` with `ack <test-bead-id>` → routed-ack + bead closed; post `@cos any update` in `#zelda` → cos silent + PL responds; DM `gc-oversight` with random text → mailed-mayor ack. Operator drives Slack; agent tails logs; `./04-collect-evidence.sh` snapshots the receipts before close.
+
+Order suggestion: **gc-17z first** (cos session reset is independent of adapter) then **gc-5rz** (adapter cutover). Or interleave: do the cos restart + Slack scenario 1 to validate cos prompt is picked up, then the adapter cutover, then scenarios 2-3 (which exercise the new adapter path). The interleaved order also gives faster signal that the cos prompt change is good before disturbing the adapter.
 
 ## Prior session (kept for context — gc-j8h live smoke + 2 follow-up fixes)
 
