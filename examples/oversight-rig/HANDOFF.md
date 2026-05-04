@@ -1,6 +1,30 @@
-# Oversight-rig handoff — 2026-05-04 (gc-0fn SSRF fix + gc-5rz/gc-17z operational verification shipped)
+# Oversight-rig handoff — 2026-05-04 (gc-udx + gc-1b2 wave shipped via /focus parallel)
 
-> **To the next agent:** this session shipped the P1 SSRF gate on slack-pack inbound file downloads (gc-0fn) and closed out the two pre-flagged operational beads (gc-5rz Phase A cutover + gc-17z cos slack-v0 verification — both resolved against the live deployment without code changes beyond a HANDOFF cleanup). Two commits on `fork/feat/oversight-rig-pack`:
+> **To the next agent:** this session shipped a two-bead wave via `/focus parallel` — gc-udx (P2 bug — `gc hook` was routing parent epics to workers) and gc-1b2 (P2 feat — new `stale-claim-reaper` maintenance order). Both worktree-isolated subagents ran plan→execute→simplify, the main session ran a unified Phase 4 review (code-reviewer + security-reviewer + go-reviewer in parallel against the combined diff), applied all CRITICAL/HIGH fixes before merge, then `--no-ff` merged the wave into `feat/oversight-rig-pack`. Four commits on the wave + the merge:
+>
+> - **`43d2b319` — `feat(maintenance-pack): stale-claim-reaper order (gc-1b2)`** — new exec order with companion 305-line shell script under `examples/gastown/packs/maintenance/`. Reaps `in_progress` beads older than `stale_threshold` whose assignee is alive but where no commit references the bead ID. **Dormant by default** (no `<rig>/.beads/stale-claim-policy.yaml` = no action). **Dry-run by default** (`STALE_CLAIM_REAPER_APPLY=1` required to actually issue `bd update`). Per-scope policy YAML (small built-in scalar parser; 2 documented keys: `stale_threshold`, `exclude_metadata`). Audit JSONL with 7 documented action types. 5 process-tier tests in `cmd/gc/stale_claim_reaper_test.go` with PATH-shimmed `bd`/`gc`/`git` fakes, gated on `GC_FAST_UNIT=0`. Action explicitly NOT close — close discards potentially-valid work.
+>
+> - **`016ab2a1` — `fix(config): exclude epic beads from default worker work_query (gc-udx)`** — root cause was `Agent.EffectiveWorkQuery()` in `internal/config/config.go` building the default 3-tier query (in_progress+assigned crash-recovery → ready+assigned → ready+unassigned+routed_to) without `--exclude-type=epic`. An epic with `gc.routed_to=<worker>` would surface as claimable. Fix adds `--exclude-type=epic` to all 6 `bd ready`/`bd list` invocations across the legacy-aware control-dispatcher and standard query paths. Custom-WorkQuery override path is unchanged so roles legitimately processing epics opt in via explicit `work_query` config — the explicit-override escape hatch the bead required. ZFC clean: filter is a structural `issue_type=epic` check, not a semantic judgment. 4 new tests + 11 existing assertions updated.
+>
+> - **`3ee0f7be` — `fix(udx-1b2): address phase 4 review findings`** — 6 HIGH (4 security + 2 go-reviewer) + 6 MEDIUM fixed before merge. Highlights: (1) `workflowServeControlReadyQuery` in `cmd/gc/dispatch_runtime.go` was a separately-constructed query path that bypassed `EffectiveWorkQuery`; added `--exclude-type=epic` there too. (2) `parse_epoch` in stale-claim-reaper.sh now requires strict `^YYYY-MM-DDTHH:MM:SSZ$` before handing the timestamp to GNU `date -d` (which otherwise accepts permissive expressions like "yesterday"). (3) `git log --grep="$BEAD_ID"` was regex by default — switched to `--fixed-strings --grep=` (literal substring) + `--since=` form. (4) `exclude_metadata` from policy YAML now identifier-validated (`^[A-Za-z_][A-Za-z0-9_.:-]*$`) before reaching `bd list --metadata-field`. (5) `bd update` apply path now captures stderr into the `reap-failed` audit reason. (6) Test fixes: `TestStaleClaimReaperScriptSyntax` gated by `skipSlowCmdGCTest`; two silent `os.ReadFile` error discards switched to `t.Fatalf`; git shim now uses `exec.LookPath("git")` instead of hardcoded `/usr/bin/git`.
+>
+> - **`66e4035f` — merge commit** — `--no-ff` merge of `wave-udx-1b2-review` into `feat/oversight-rig-pack`.
+>
+> Three follow-up beads filed: **gc-1b2.1** (P3, security M7 — concurrent-invocation flock for the reaper, defense-in-depth behind the order's 1h cooldown), **gc-1b2.2** (P3, go M2 — DRY rig-fixture setup helper across 4 test bodies), **gc-1b2.3** (P3, code-reviewer LOWs — `is_excluded()` redef in loop + per-rig `bd list` hoist + split skip actions for unparseable timestamps).
+>
+> All gates green on the merged tip: `make lint` (0 issues), `make vet`, `make check-docs` (docsync passes), `go test -short` on `internal/config/` + `cmd/gc/` (~71s, ok), `go test -race -short ./internal/config/` (ok), and process-tier `GC_FAST_UNIT=0 go test -run TestStaleClaimReaper ./cmd/gc/` (5/5 ok including the new `--fixed-strings` git invocation against a real git tree).
+>
+> **Branch state at session end:** `fork/feat/oversight-rig-pack` pushed at session close, up-to-date with remote.
+>
+> ---
+>
+> **Pre-existing PR #1661 status (`fix/gate-sweep-bd-flags`, gc-mrg):** still OPEN upstream against `gastownhall/gascity`. CI all green; copilot-pull-request-reviewer commented; no review decision yet. No new code work needed — bead waits on PR merge.
+>
+> **Stale subagent worktrees** at `.claude/worktrees/agent-a0f489faa6bbb1552` and `.claude/worktrees/agent-af1b8eaf34e6a396a` — leftovers from prior `/focus parallel` runs (HANDOFF mention from a session ago). Both `locked`. Cleanup deferred to a future session unless they're known to be done; this session left them alone.
+
+## Prior session — gc-0fn SSRF fix + gc-5rz/gc-17z operational verification
+
+Two commits on `fork/feat/oversight-rig-pack` from the prior session:
 >
 > - **`f730b88b` — `docs(oversight-rig): close out gc-5rz + gc-17z verifications`** — HANDOFF was self-contradictory on entry (the "Up next" section said "re-attempt cutover" but the Live runtime section deeper in the doc treated the cutover as historical). Replaced with a "Verified this session" callout summarizing the live evidence: `gc-5rz` Phase A was already live (proxy_process spawning gc-slack-adapter with UDS env + post-gc-cdf URL prefix, 11+ outbound publishes to rig channels today, healthz 200 via supervisor route); `gc-17z` cos slack-v0 prompt verified via passive room-silence observation (`gc session peek` showing the verbatim "Room message from peer agent — stay silent." rule firing) + direct DM no-match round-trip (operator DM'd `ack gc-qs4` synthetic bead → cos returned the verbatim step-5 ack `*oversight-rig.cos:* couldn't match — mailed mayor for triage`). Scenario 1 (match-path) deferred opportunistically — zero open `rollup`+`severity:escalate` beads at test time, and the match-path uses identical step-5 mechanics already exercised. Also marked gc-ywe.7 done in the "Quality / hardening" subsection (was already shipped 1eef688e but the entry was stale).
 >
@@ -13,6 +37,13 @@
 > Side note: cos addressed the mayor as `gc-98657` in the gc-17z no-match ack — the prior runbook reference (`gc-2568`) may be stale or the mayor session id has rolled forward. No action unless mayor routing is touched again.
 
 ## This session at a glance
+
+- Closed: **gc-udx** (P2 bug — epic-routing in `gc hook` claim path, two patches across `EffectiveWorkQuery` + `workflowServeControlReadyQuery`), **gc-1b2** (P2 feat — `stale-claim-reaper` maintenance order with policy YAML + dry-run-default + audit JSONL). Both shipped via `/focus parallel`.
+- Created: **gc-1b2.1** (P3, concurrent-invocation lock follow-up), **gc-1b2.2** (P3, DRY rig-fixture test helper), **gc-1b2.3** (P3, code-reviewer LOW polish — function-redef in loop + per-rig `bd list` hoist + split skip actions for unparseable timestamps).
+- Wave commits: `43d2b319` (gc-1b2 base), `016ab2a1` (gc-udx base), `3ee0f7be` (Phase 4 hardening), `66e4035f` (`--no-ff` merge).
+- Phase 4 unified review (3 reviewers in parallel against the combined diff): 0 CRITICAL, 7 HIGH (4 security, 2 go-test, 1 cross-cutting code) — all fixed before merge in `3ee0f7be`. 8 MEDIUM — most fixed in same commit, 3 deferred to gc-1b2.{1,2,3}.
+
+### Prior-session glance (gc-0fn / gc-5rz / gc-17z)
 
 - Closed: gc-5rz (P2 slack adapter Phase A cutover, verified live), gc-17z (P2 cos slack-v0 prompt, mechanism verified), gc-0fn (P1 SSRF in slackDownloadToFile, shipped c6a7b3f8). Plus cleanup-closed gc-qs4 and gc-rq3 (orphaned synthetic test beads from the gc-17z runbook).
 - Created: gc-vrw (P3 DNS-rebinding + redirect-re-validation defense-in-depth follow-up to gc-0fn).
