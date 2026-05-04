@@ -1348,12 +1348,18 @@ func downloadSlackFiles(cfg config, channel, ts string, files []slackFile) []ext
 		log.Printf("inbound file download skipped: INBOUND_FILE_STORE empty (%d files dropped)", len(files))
 		return nil
 	}
-	channelDir := filepath.Join(cfg.inboundFileStore, channel)
+	// Sanitize channel + ts as path components before joining: filepath.Join
+	// cleans `..` but does not confine to the base, so a hostile channel id
+	// like "../etc" would still escape inboundFileStore. safePathComponent is
+	// stricter than safeFilename — Slack channel IDs and ts strings are
+	// ID-like, so a strict allowlist is appropriate. gc-ywe.7.
+	channelDir := filepath.Join(cfg.inboundFileStore, safePathComponent(channel))
 	// 0o700: store may contain DM file content; not world-readable. gc-ywe.6.
 	if err := os.MkdirAll(channelDir, 0o700); err != nil {
 		log.Printf("inbound file download: mkdir %s: %v", channelDir, err)
 		return nil
 	}
+	tsPrefix := safePathComponent(ts)
 	out := make([]externalAttachment, 0, len(files))
 	for _, f := range files {
 		if f.URLPrivate == "" {
@@ -1367,7 +1373,7 @@ func downloadSlackFiles(cfg config, channel, ts string, files []slackFile) []ext
 		if name == "" {
 			name = f.ID
 		}
-		dest := filepath.Join(channelDir, ts+"-"+safeFilename(name))
+		dest := filepath.Join(channelDir, tsPrefix+"-"+safeFilename(name))
 		if err := slackDownloadToFile(cfg.slackBotToken, f.URLPrivate, dest); err != nil {
 			log.Printf("inbound file %s download failed: %v", f.ID, err)
 			continue
@@ -1381,10 +1387,58 @@ func downloadSlackFiles(cfg config, channel, ts string, files []slackFile) []ext
 	return out
 }
 
+// safePathComponent sanitizes a Slack-supplied identifier (channel id, ts)
+// for use as a filesystem path component. Stricter than safeFilename: only
+// [A-Za-z0-9_.-] survive; everything else (path separators, NUL, control
+// chars, whitespace, unicode, punctuation) is replaced with '_'. The first
+// leading dot is replaced with '_' so the result can never be `.`, `..`,
+// or be treated as a hidden dotfile; any further internal `..` segments
+// are harmless because filepath.Join normalizes them within the joined
+// path (they cannot escape the parent once the leading byte is `_`).
+// Empty input returns "_" so the caller always has a usable non-empty
+// component. Length capped at 64 chars — Slack channel IDs are ~10 chars
+// and ts strings are ~17 chars, so 64 is generous. gc-ywe.7.
+func safePathComponent(s string) string {
+	const maxLen = 64
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z',
+			r >= 'a' && r <= 'z',
+			r >= '0' && r <= '9',
+			r == '_' || r == '-' || r == '.':
+			b.WriteRune(r)
+		default:
+			// Non-allowlist runes (including all multi-byte runes) are
+			// replaced with a single ASCII underscore. This keeps the
+			// invariant: cleaned is pure ASCII below.
+			b.WriteRune('_')
+		}
+	}
+	cleaned := b.String()
+	if strings.HasPrefix(cleaned, ".") {
+		cleaned = "_" + cleaned[1:]
+	}
+	// cleaned is guaranteed ASCII here (loop above maps every non-allowlist
+	// rune to '_'), so the byte-indexed truncation cannot split a multi-byte
+	// rune. Do not introduce a non-ASCII character into the allowlist
+	// without revisiting this assumption.
+	if len(cleaned) > maxLen {
+		cleaned = cleaned[:maxLen]
+	}
+	if cleaned == "" {
+		return "_"
+	}
+	return cleaned
+}
+
 // safeFilename strips path separators and other dangerous characters from
 // a Slack-supplied filename so it can't escape the inbound file store
-// directory. Length is capped at 200 chars (well under the typical 255
-// filename limit) to leave room for the leading ts prefix.
+// directory. More permissive than safePathComponent: keeps spaces and
+// non-ASCII characters that humans expect in filenames. Length is capped
+// at 200 chars (well under the typical 255 filename limit) to leave room
+// for the leading ts prefix.
 func safeFilename(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {

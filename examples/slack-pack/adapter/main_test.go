@@ -1349,6 +1349,61 @@ func TestSafeFilename(t *testing.T) {
 	}
 }
 
+func TestSafePathComponent(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		// Real-world Slack identifiers pass through unchanged.
+		{"C0B13JE7M35", "C0B13JE7M35"},
+		{"1234567890.123456", "1234567890.123456"},
+		{"abc-def_ghi.123", "abc-def_ghi.123"},
+
+		// Path traversal attempts — separators replaced.
+		{"../etc", "_._etc"},
+		{"/abs/path", "_abs_path"},
+		{"\\windows\\path", "_windows_path"},
+
+		// NUL + control chars + whitespace + non-ASCII all replaced.
+		{"with\x00null", "with_null"},
+		{"with\nnewline", "with_newline"},
+		{"with space", "with_space"},
+		{"unicode-é", "unicode-_"},
+
+		// Other non-allowlist punctuation replaced.
+		{"hash#tag", "hash_tag"},
+
+		// Leading-dot scrub (defense against `.` and `..` parents).
+		{".hidden", "_hidden"},
+		{"...trip", "_..trip"},
+
+		// Empty / whitespace-only fall back to "_".
+		{"", "_"},
+		{"   ", "___"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got := safePathComponent(tc.in)
+			if got != tc.want {
+				t.Errorf("safePathComponent(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	// Length cap: input >64 chars truncates to 64.
+	long := strings.Repeat("a", 200)
+	if got := safePathComponent(long); len(got) != 64 {
+		t.Errorf("long input: len = %d, want 64", len(got))
+	}
+
+	// Result never contains a path separator or NUL, regardless of input.
+	hostile := "/" + strings.Repeat("../", 30) + "\x00\n\\"
+	got := safePathComponent(hostile)
+	if strings.ContainsAny(got, "/\\\x00") {
+		t.Errorf("safePathComponent kept a separator or NUL: %q", got)
+	}
+}
+
 func TestDownloadSlackFiles(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -1356,6 +1411,8 @@ func TestDownloadSlackFiles(t *testing.T) {
 		fileBodies map[string]string // url_private path -> body returned by stub
 		fileStatus map[string]int    // url_private path -> HTTP status
 		emptyStore bool
+		channel    string // override default "C123" — used by malformed-id case
+		ts         string // override default "1234.5678" — used by malformed-id case
 		wantCount  int
 		wantBodies []string
 	}{
@@ -1424,6 +1481,22 @@ func TestDownloadSlackFiles(t *testing.T) {
 			wantCount:  1,
 			wantBodies: []string{"X"},
 		},
+		{
+			// Defense-in-depth: even if SLACK_SIGNING_SECRET leaks and an
+			// attacker forges a Slack event with hostile channel/ts, the
+			// resulting filesystem write must stay under inboundFileStore.
+			name: "malformed channel and ts sanitized",
+			files: []slackFile{{
+				ID:         "F1",
+				Name:       "ok.png",
+				URLPrivate: "PLACEHOLDER/files/F1",
+			}},
+			fileBodies: map[string]string{"/files/F1": "Y"},
+			channel:    "../../etc",
+			ts:         "../boom",
+			wantCount:  1,
+			wantBodies: []string{"Y"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1457,9 +1530,26 @@ func TestDownloadSlackFiles(t *testing.T) {
 				cfg.inboundFileStore = ""
 			}
 
-			got := downloadSlackFiles(cfg, "C123", "1234.5678", files)
+			channel := tc.channel
+			if channel == "" {
+				channel = "C123"
+			}
+			ts := tc.ts
+			if ts == "" {
+				ts = "1234.5678"
+			}
+			got := downloadSlackFiles(cfg, channel, ts, files)
 			if len(got) != tc.wantCount {
 				t.Fatalf("got %d attachments, want %d (%+v)", len(got), tc.wantCount, got)
+			}
+			// File must live under inboundFileStore/<sanitized-channel>/, not
+			// escape via path traversal in channel or ts. Use EvalSymlinks
+			// so a hostile symlink can't defeat the prefix check by yielding
+			// a path that lexically lives under the store but resolves
+			// elsewhere on the filesystem.
+			realStore, err := filepath.EvalSymlinks(cfg.inboundFileStore)
+			if err != nil {
+				t.Fatalf("evalSymlinks(inboundFileStore): %v", err)
 			}
 			for i, att := range got {
 				if !strings.HasPrefix(att.URL, "file://") {
@@ -1473,10 +1563,12 @@ func TestDownloadSlackFiles(t *testing.T) {
 				if string(body) != tc.wantBodies[i] {
 					t.Errorf("attachment[%d] body = %q, want %q", i, string(body), tc.wantBodies[i])
 				}
-				// File must live under inboundFileStore/<channel>/, not escape.
-				wantPrefix := filepath.Join(cfg.inboundFileStore, "C123") + string(filepath.Separator)
-				if !strings.HasPrefix(path, wantPrefix) {
-					t.Errorf("attachment[%d] path %q escapes store dir %q", i, path, wantPrefix)
+				realPath, err := filepath.EvalSymlinks(path)
+				if err != nil {
+					t.Fatalf("evalSymlinks(%s): %v", path, err)
+				}
+				if !strings.HasPrefix(realPath, realStore+string(filepath.Separator)) {
+					t.Errorf("attachment[%d] path %q escapes store dir %q", i, realPath, realStore)
 				}
 			}
 		})
