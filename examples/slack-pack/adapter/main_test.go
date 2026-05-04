@@ -1141,14 +1141,27 @@ func TestHandlePublishFile(t *testing.T) {
 		getURLResp       string
 		completeResp     string
 		uploadStatus     int
-		wantStatus       int
-		wantDelivered    bool
-		wantFailKind     string
-		wantFileID       string
-		wantChannel      string
-		wantThreadTS     string
-		wantInitial      string
-		wantUploadBody   string
+		// unsetUploadRoot leaves cfg.fileUploadRoot empty so the
+		// fail-closed branch is exercised. Default (false) sets
+		// cfg.fileUploadRoot to the per-test TempDir, so seedFile paths
+		// are inside the configured root.
+		unsetUploadRoot bool
+		// uploadRootOverride overrides cfg.fileUploadRoot (e.g. point
+		// it at a different tempdir from where the symlink target
+		// lives, to cover symlink-escape).
+		uploadRootOverride string
+		// extraSetup runs before the request, with the per-test root.
+		// Used to plant symlinks or files outside the root for escape
+		// cases.
+		extraSetup     func(t *testing.T, root string) string
+		wantStatus     int
+		wantDelivered  bool
+		wantFailKind   string
+		wantFileID     string
+		wantChannel    string
+		wantThreadTS   string
+		wantInitial    string
+		wantUploadBody string
 	}{
 		{
 			name:           "happy path with thread + initial comment",
@@ -1179,10 +1192,62 @@ func TestHandlePublishFile(t *testing.T) {
 			wantStatus:  http.StatusBadRequest,
 		},
 		{
-			name:       "nonexistent file rejected",
-			method:     http.MethodPost,
-			body:       `{"conversation":{"conversation_id":"C1"},"file_path":"/tmp/definitely-not-here-12345.png"}`,
+			name:   "nonexistent file rejected",
+			method: http.MethodPost,
+			extraSetup: func(_ *testing.T, root string) string {
+				// Inside-root nonexistent path → confinement check
+				// passes, os.Stat fails → 400.
+				return filepath.Join(root, "definitely-not-here-12345.png")
+			},
+			body:       `{"conversation":{"conversation_id":"C1"},"file_path":"PLACEHOLDER"}`,
 			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:            "FILE_UPLOAD_ROOT unset rejects with 503",
+			method:          http.MethodPost,
+			seedFile:        true,
+			fileContent:     "x",
+			body:            `{"conversation":{"conversation_id":"C1"},"file_path":"PLACEHOLDER"}`,
+			unsetUploadRoot: true,
+			wantStatus:      http.StatusServiceUnavailable,
+		},
+		{
+			name:   "absolute path outside root rejected",
+			method: http.MethodPost,
+			body: `{"conversation":{"conversation_id":"C1"},` +
+				`"file_path":"/etc/passwd"}`,
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:   "traversal escape rejected",
+			method: http.MethodPost,
+			extraSetup: func(_ *testing.T, root string) string {
+				// root/../../../etc/passwd canonicalizes outside
+				// root, so confinement must reject before any IO.
+				return filepath.Join(root, "..", "..", "..", "etc", "passwd")
+			},
+			body:       `{"conversation":{"conversation_id":"C1"},"file_path":"PLACEHOLDER"}`,
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:   "symlink escape rejected",
+			method: http.MethodPost,
+			extraSetup: func(t *testing.T, root string) string {
+				// Plant a symlink inside the root pointing at a
+				// file outside the root. After os.Stat passes,
+				// the post-stat EvalSymlinks check must reject.
+				outside := filepath.Join(t.TempDir(), "secret.txt")
+				if err := os.WriteFile(outside, []byte("nope"), 0o600); err != nil {
+					t.Fatalf("seed outside file: %v", err)
+				}
+				link := filepath.Join(root, "shortcut.txt")
+				if err := os.Symlink(outside, link); err != nil {
+					t.Fatalf("symlink: %v", err)
+				}
+				return link
+			},
+			body:       `{"conversation":{"conversation_id":"C1"},"file_path":"PLACEHOLDER"}`,
+			wantStatus: http.StatusForbidden,
 		},
 		{
 			name:       "GET rejected",
@@ -1258,9 +1323,22 @@ func TestHandlePublishFile(t *testing.T) {
 			}
 			slackAPIBase = fake.server.URL
 
+			// Per-test upload root. Resolved through EvalSymlinks
+			// so the confinement check (which canonicalizes both
+			// sides) treats it as the root macOS uses /private
+			// under /var, etc.
+			testRoot := t.TempDir()
+			if resolved, err := filepath.EvalSymlinks(testRoot); err == nil {
+				testRoot = resolved
+			}
+
 			body := tc.body
-			if tc.seedFile {
-				path := filepath.Join(t.TempDir(), "in.bin")
+			switch {
+			case tc.extraSetup != nil:
+				path := tc.extraSetup(t, testRoot)
+				body = strings.ReplaceAll(body, "PLACEHOLDER", path)
+			case tc.seedFile:
+				path := filepath.Join(testRoot, "in.bin")
 				if err := os.WriteFile(path, []byte(tc.fileContent), 0o600); err != nil {
 					t.Fatalf("seed file: %v", err)
 				}
@@ -1273,6 +1351,13 @@ func TestHandlePublishFile(t *testing.T) {
 			}
 
 			cfg := config{slackBotToken: "xoxb-test"}
+			if !tc.unsetUploadRoot {
+				if tc.uploadRootOverride != "" {
+					cfg.fileUploadRoot = tc.uploadRootOverride
+				} else {
+					cfg.fileUploadRoot = testRoot
+				}
+			}
 			req := httptest.NewRequest(tc.method, "/publish-file", strings.NewReader(body))
 			rec := httptest.NewRecorder()
 			handlePublishFile(cfg, reg)(rec, req)

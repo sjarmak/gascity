@@ -30,6 +30,18 @@
 //     to construct /v0/city/{name}/extmsg/inbound and
 //     /v0/city/{name}/session/{id}/messages URLs.
 //
+// Conditionally required (no default; the dependent endpoint is
+// disabled when unset):
+//
+//   - FILE_UPLOAD_ROOT        Absolute filesystem prefix the adapter is
+//     allowed to read for /publish-file. Without
+//     it, /publish-file returns 503 (defense-in-
+//     depth: anyone on the internal mux could
+//     otherwise ask the adapter to upload arbitrary
+//     host files like /etc/passwd to Slack). Set
+//     to the directory tree gc agents write
+//     uploadable artifacts under.
+//
 // Optional override (sane default; set to override):
 //
 //   - LISTEN_PUBLIC                Default ":8765". Public TCP listener
@@ -191,6 +203,16 @@ type config struct {
 	// inboundFileSweepInterval is how often the janitor wakes up to
 	// scan inboundFileStore. Empty or zero disables the janitor.
 	inboundFileSweepInterval time.Duration
+	// fileUploadRoot is the absolute filesystem prefix
+	// /publish-file is allowed to read. Empty disables /publish-file
+	// entirely (fail-closed). gc and the adapter share a filesystem,
+	// so the trust boundary is the gc controller process — but the
+	// internal mux is reachable by anything on the loopback (or, in
+	// proxy_process mode, by anything that can connect to the UDS),
+	// so confinement here is defense-in-depth: a compromised internal
+	// caller cannot ask the adapter to upload arbitrary files (e.g.
+	// /etc/passwd) on its behalf. Sourced from FILE_UPLOAD_ROOT.
+	fileUploadRoot string
 }
 
 func loadConfig() (config, error) {
@@ -226,6 +248,7 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 		handlePrefix:         envOrFn("HANDLE_PREFIX", "@"),
 		handleAliasStorePath: envOrFn("HANDLE_ALIAS_STORE_PATH", "/tmp/gc-slack-adapter/handle-aliases.json"),
 		inboundFileStore:     envOrFn("INBOUND_FILE_STORE", "/tmp/gc-slack-adapter/inbound"),
+		fileUploadRoot:       getenv("FILE_UPLOAD_ROOT"),
 	}
 
 	// Retention controls. Defaults: keep inbound files for 7 days,
@@ -842,7 +865,24 @@ func handlePublishFile(cfg config, reg *identityRegistry) http.HandlerFunc {
 			http.Error(w, "conversation.conversation_id is required", http.StatusBadRequest)
 			return
 		}
-		fi, err := os.Stat(req.FilePath)
+		// Confinement gate: the adapter only reads files under the
+		// configured FILE_UPLOAD_ROOT. Without it, /publish-file is a
+		// host-wide arbitrary-read primitive for anyone on the
+		// internal mux. Fail-closed when unset rather than silently
+		// allowing everything.
+		if cfg.fileUploadRoot == "" {
+			http.Error(w, "file upload disabled: FILE_UPLOAD_ROOT not configured", http.StatusServiceUnavailable)
+			return
+		}
+		resolvedPath, err := confineFileUploadPath(cfg.fileUploadRoot, req.FilePath)
+		if err != nil {
+			// Use the request path verbatim in the error so operators
+			// can correlate logs without leaking the canonicalized
+			// (post-symlink) target.
+			http.Error(w, fmt.Sprintf("file_path %q outside FILE_UPLOAD_ROOT: %v", req.FilePath, err), http.StatusForbidden)
+			return
+		}
+		fi, err := os.Stat(resolvedPath)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("file_path: %v", err), http.StatusBadRequest)
 			return
@@ -851,7 +891,20 @@ func handlePublishFile(cfg config, reg *identityRegistry) http.HandlerFunc {
 			http.Error(w, "file_path is a directory", http.StatusBadRequest)
 			return
 		}
-		fileBytes, err := os.ReadFile(req.FilePath)
+		// Symlink escape gate: now that os.Stat confirmed the path
+		// exists, resolve symlinks and re-check the in-root invariant
+		// so an attacker who plants a symlink inside the root cannot
+		// pivot to an arbitrary host file.
+		realPath, err := filepath.EvalSymlinks(resolvedPath)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("file_path: %v", err), http.StatusBadRequest)
+			return
+		}
+		if _, err := confineFileUploadPath(cfg.fileUploadRoot, realPath); err != nil {
+			http.Error(w, fmt.Sprintf("file_path %q resolves outside FILE_UPLOAD_ROOT: %v", req.FilePath, err), http.StatusForbidden)
+			return
+		}
+		fileBytes, err := os.ReadFile(realPath)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("read file_path: %v", err), http.StatusInternalServerError)
 			return
@@ -937,6 +990,61 @@ func handlePublishFile(cfg config, reg *identityRegistry) http.HandlerFunc {
 		receipt.FileID = urlResp.FileID
 		writeJSON(w, receipt)
 	}
+}
+
+// confineFileUploadPath validates that path is inside root and returns
+// the cleaned absolute form on success.
+//
+// Both root and path are canonicalized with filepath.Abs +
+// filepath.Clean. Root is additionally run through EvalSymlinks
+// (best-effort) so an operator-configured root that is itself a
+// symlink (macOS /var → /private/var, etc.) lines up with paths the
+// caller later resolves via EvalSymlinks. The path argument is NOT
+// EvalSymlinks'd — the caller is responsible for re-invoking this
+// helper on the EvalSymlinks-resolved path once os.Stat has confirmed
+// existence (handlePublishFile does this to defeat symlink escape).
+//
+// Returns an error when:
+//   - root or path is empty
+//   - either path can't be made absolute
+//   - cleaned path is not equal to root and not a strict descendant
+//
+// The returned path is the cleaned absolute form, suitable for passing
+// to os.Stat / os.ReadFile.
+func confineFileUploadPath(root, path string) (string, error) {
+	if root == "" {
+		return "", errors.New("FILE_UPLOAD_ROOT is empty")
+	}
+	if strings.TrimSpace(path) == "" {
+		return "", errors.New("path is empty")
+	}
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolving root: %w", err)
+	}
+	rootAbs = filepath.Clean(rootAbs)
+	// Best-effort symlink resolution on the root: if the operator
+	// configured a symlinked root (e.g. /var on macOS) the canonical
+	// form is what later EvalSymlinks calls on a path will return.
+	if resolved, err := filepath.EvalSymlinks(rootAbs); err == nil {
+		rootAbs = resolved
+	}
+	pathAbs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolving path: %w", err)
+	}
+	pathAbs = filepath.Clean(pathAbs)
+	rel, err := filepath.Rel(rootAbs, pathAbs)
+	if err != nil {
+		return "", fmt.Errorf("computing relative path: %w", err)
+	}
+	// rel == "." means path == root (a directory). Anything that
+	// starts with ".." has escaped. An absolute rel (Windows volume
+	// crossing) is also out of bounds.
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("path %q is outside root %q", pathAbs, rootAbs)
+	}
+	return pathAbs, nil
 }
 
 // writeJSON writes the receipt as a JSON response. Errors during encoding
