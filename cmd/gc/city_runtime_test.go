@@ -72,7 +72,10 @@ func TestSweepUndesiredPoolSessionBeads_KeepsRunningSessionsOpen(t *testing.T) {
 func newTestCityRuntime(t *testing.T, params CityRuntimeParams) *CityRuntime {
 	t.Helper()
 
-	cr := newCityRuntime(params)
+	cr, err := newCityRuntime(params)
+	if err != nil {
+		t.Fatalf("newCityRuntime: %v", err)
+	}
 	t.Cleanup(cr.shutdown)
 	return cr
 }
@@ -313,7 +316,7 @@ func TestCityRuntimeRunDispatchesOrdersBeforeStartupReconcile(t *testing.T) {
 	defer cancel()
 
 	var started atomic.Bool
-	cr := newCityRuntime(CityRuntimeParams{
+	cr, err := newCityRuntime(CityRuntimeParams{
 		CityPath: cityPath,
 		CityName: "test-city",
 		TomlPath: tomlPath,
@@ -334,6 +337,9 @@ func TestCityRuntimeRunDispatchesOrdersBeforeStartupReconcile(t *testing.T) {
 		Stdout: io.Discard,
 		Stderr: io.Discard,
 	})
+	if err != nil {
+		t.Fatalf("newCityRuntime: %v", err)
+	}
 	cr.od = od
 
 	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
@@ -371,7 +377,7 @@ func TestCityRuntimeRunStartupOrderDispatchPanicIsRecovered(t *testing.T) {
 
 	var stderr bytes.Buffer
 	var started atomic.Bool
-	cr := newCityRuntime(CityRuntimeParams{
+	cr, err := newCityRuntime(CityRuntimeParams{
 		CityPath: cityPath,
 		CityName: "test-city",
 		TomlPath: tomlPath,
@@ -389,6 +395,9 @@ func TestCityRuntimeRunStartupOrderDispatchPanicIsRecovered(t *testing.T) {
 		Stdout: io.Discard,
 		Stderr: &stderr,
 	})
+	if err != nil {
+		t.Fatalf("newCityRuntime: %v", err)
+	}
 	cr.od = od
 
 	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
@@ -2445,7 +2454,7 @@ name = "fresh-agent"
 	t.Cleanup(cancel)
 
 	var startupAgentCount atomic.Int32
-	cr := newCityRuntime(CityRuntimeParams{
+	cr, err := newCityRuntime(CityRuntimeParams{
 		CityPath:  cityPath,
 		CityName:  "test-city",
 		TomlPath:  tomlPath,
@@ -2462,6 +2471,9 @@ name = "fresh-agent"
 		Stdout: io.Discard,
 		Stderr: io.Discard,
 	})
+	if err != nil {
+		t.Fatalf("newCityRuntime: %v", err)
+	}
 	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
 	cs.cityBeadStore = beads.NewMemStore()
 	cr.setControllerState(cs)

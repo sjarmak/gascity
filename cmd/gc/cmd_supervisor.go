@@ -1305,7 +1305,8 @@ func reconcileCities(
 
 		var cityRuntime *CityRuntime
 		if err := runPostPrepareStep("building_city_runtime", func() error {
-			cityRuntime = newCityRuntime(CityRuntimeParams{
+			var crErr error
+			cityRuntime, crErr = newCityRuntime(CityRuntimeParams{
 				CityPath:                path,
 				CityName:                cityName,
 				TomlPath:                tomlPath,
@@ -1340,7 +1341,7 @@ func reconcileCities(
 				Stdout:    stdout,
 				Stderr:    stderr,
 			})
-			return nil
+			return crErr
 		}); err != nil {
 			emitPendingCityCreateFailure(cr, path, cityName, "city_runtime_failed", err, stderr)
 			recordInitFailure(cityName, fmt.Sprintf("city runtime: %v", err))

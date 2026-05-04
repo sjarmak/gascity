@@ -108,7 +108,10 @@ func (s *createdAtOverrideStore) List(query beads.ListQuery) ([]beads.Bead, erro
 }
 
 func TestOrderDispatcherNil(t *testing.T) {
-	ad := buildOrderDispatcher(t.TempDir(), &config.City{}, events.Discard, &bytes.Buffer{})
+	ad, err := buildOrderDispatcher(t.TempDir(), &config.City{}, events.Discard, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("buildOrderDispatcher: %v", err)
+	}
 	if ad != nil {
 		t.Error("expected nil dispatcher for empty orders")
 	}
@@ -118,7 +121,10 @@ func TestBuildOrderDispatcherNoOrders(t *testing.T) {
 	// City with formula layers that exist but contain no orders.
 	dir := t.TempDir()
 	cfg := &config.City{}
-	ad := buildOrderDispatcher(dir, cfg, events.Discard, &bytes.Buffer{})
+	ad, err := buildOrderDispatcher(dir, cfg, events.Discard, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("buildOrderDispatcher: %v", err)
+	}
 	if ad != nil {
 		t.Error("expected nil dispatcher when no orders exist")
 	}
@@ -2375,7 +2381,10 @@ pool = "polecat"
 	}
 
 	var stderr bytes.Buffer
-	ad := buildOrderDispatcher(t.TempDir(), cfg, events.Discard, &stderr)
+	ad, err := buildOrderDispatcher(t.TempDir(), cfg, events.Discard, &stderr)
+	if err != nil {
+		t.Fatalf("buildOrderDispatcher: %v", err)
+	}
 	if ad == nil {
 		t.Fatalf("expected non-nil dispatcher; stderr: %s", stderr.String())
 	}
@@ -2622,7 +2631,10 @@ pool = "worker"
 	}
 
 	var stderr bytes.Buffer
-	ad := buildOrderDispatcher(cityDir, cfg, events.Discard, &stderr)
+	ad, err := buildOrderDispatcher(cityDir, cfg, events.Discard, &stderr)
+	if err != nil {
+		t.Fatalf("buildOrderDispatcher: %v", err)
+	}
 	if ad == nil {
 		t.Fatalf("expected non-nil dispatcher; stderr: %s", stderr.String())
 	}
@@ -2691,7 +2703,10 @@ pool = "worker"
 	}
 
 	var stderr bytes.Buffer
-	ad := buildOrderDispatcher(cityDir, cfg, events.Discard, &stderr)
+	ad, err := buildOrderDispatcher(cityDir, cfg, events.Discard, &stderr)
+	if err != nil {
+		t.Fatalf("buildOrderDispatcher: %v", err)
+	}
 	if ad == nil {
 		t.Fatalf("expected non-nil dispatcher; stderr: %s", stderr.String())
 	}
@@ -2780,7 +2795,10 @@ pool = "worker"
 	}
 
 	var stderr bytes.Buffer
-	ad := buildOrderDispatcher(cityDir, cfg, events.Discard, &stderr)
+	ad, err := buildOrderDispatcher(cityDir, cfg, events.Discard, &stderr)
+	if err != nil {
+		t.Fatalf("buildOrderDispatcher: %v", err)
+	}
 	if ad == nil {
 		t.Fatalf("expected non-nil dispatcher; stderr: %s", stderr.String())
 	}
@@ -3053,7 +3071,10 @@ pool = "worker"
 		},
 	}
 
-	ad := buildOrderDispatcher(cityDir, cfg, events.Discard, &bytes.Buffer{})
+	ad, err := buildOrderDispatcher(cityDir, cfg, events.Discard, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("buildOrderDispatcher: %v", err)
+	}
 	if ad == nil {
 		t.Fatal("expected non-nil dispatcher")
 	}
@@ -3118,7 +3139,10 @@ interval = "2m"
 	}
 
 	var stderr bytes.Buffer
-	ad := buildOrderDispatcher(t.TempDir(), cfg, events.Discard, &stderr)
+	ad, err := buildOrderDispatcher(t.TempDir(), cfg, events.Discard, &stderr)
+	if err != nil {
+		t.Fatalf("buildOrderDispatcher: %v", err)
+	}
 	if ad == nil {
 		t.Fatalf("expected non-nil dispatcher; stderr: %s", stderr.String())
 	}
@@ -3178,7 +3202,10 @@ interval = "2m"
 	}
 
 	var stderr bytes.Buffer
-	ad := buildOrderDispatcher(t.TempDir(), cfg, events.Discard, &stderr)
+	ad, err := buildOrderDispatcher(t.TempDir(), cfg, events.Discard, &stderr)
+	if err != nil {
+		t.Fatalf("buildOrderDispatcher: %v", err)
+	}
 	if ad == nil {
 		t.Fatalf("expected non-nil dispatcher; stderr: %s", stderr.String())
 	}
@@ -3200,10 +3227,12 @@ interval = "2m"
 	t.Error("wasteland-poll not found in dispatcher orders")
 }
 
-func TestBuildOrderDispatcherOverrideNotFoundNonFatal(t *testing.T) {
-	// Single formula layer with beads-health only.
-	// Override targets wasteland-poll (nonexistent).
-	// Verify beads-health is still dispatched and stderr contains warning.
+func TestBuildOrderDispatcherOverrideNotFoundIsFatal(t *testing.T) {
+	// gc-a3s: prior to the fix, an override targeting a nonexistent order
+	// only logged a warning to stderr and the dispatcher was still built —
+	// users could not detect that their `enabled = false` block was a
+	// silent no-op. With the fix, override-not-found returns a non-nil
+	// error and the dispatcher is nil.
 	sysDir := t.TempDir()
 
 	sysAutoDir := sysDir + "/orders/beads-health"
@@ -3229,22 +3258,92 @@ interval = "30s"
 	}
 
 	var stderr bytes.Buffer
-	ad := buildOrderDispatcher(t.TempDir(), cfg, events.Discard, &stderr)
-	if ad == nil {
-		t.Fatalf("expected non-nil dispatcher (beads-health should still be found); stderr: %s", stderr.String())
+	ad, err := buildOrderDispatcher(t.TempDir(), cfg, events.Discard, &stderr)
+	if err == nil {
+		t.Fatalf("expected error for unknown override target, got dispatcher=%v", ad)
+	}
+	if ad != nil {
+		t.Errorf("expected nil dispatcher on error, got %v", ad)
+	}
+	if !strings.Contains(err.Error(), `"wasteland-poll"`) {
+		t.Errorf("error = %v, want quoted order name 'wasteland-poll'", err)
+	}
+	if !strings.Contains(err.Error(), "order overrides") {
+		t.Errorf("error = %v, want 'order overrides' context wrap", err)
+	}
+}
+
+func TestBuildOrderDispatcherRejectsRiglessOverrideOnPerRigOrder(t *testing.T) {
+	// gc-a3s: rigless override targeting an order that exists only as
+	// per-rig instances must fail loudly with a hint pointing the operator
+	// to the per-rig syntax. Previously this silently no-op'd: the user
+	// thought they had disabled a patrol but every rig kept firing it.
+	cityDir := t.TempDir()
+	rigAlpha := filepath.Join(cityDir, "alpha")
+	rigBeta := filepath.Join(cityDir, "beta")
+
+	cityLayer := filepath.Join(cityDir, "formulas")
+	if err := mkdirAll(cityLayer); err != nil {
+		t.Fatal(err)
+	}
+	rigLayers := map[string]string{
+		"alpha": filepath.Join(rigAlpha, "formulas"),
+		"beta":  filepath.Join(rigBeta, "formulas"),
+	}
+	for _, rigDir := range []string{rigAlpha, rigBeta} {
+		layer := filepath.Join(rigDir, "formulas")
+		ordersDir := filepath.Join(rigDir, "orders")
+		if err := mkdirAll(layer); err != nil {
+			t.Fatal(err)
+		}
+		if err := mkdirAll(ordersDir); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(ordersDir, "patrol-project-leads.toml"), `[order]
+exec = "scripts/patrol.sh"
+trigger = "cooldown"
+interval = "1h"
+`)
 	}
 
-	mad := ad.(*memoryOrderDispatcher)
-	if len(mad.aa) != 1 {
-		t.Fatalf("got %d orders, want 1", len(mad.aa))
-	}
-	if mad.aa[0].Name != "beads-health" {
-		t.Errorf("order name = %q, want %q", mad.aa[0].Name, "beads-health")
+	disabled := false
+	cfg := &config.City{
+		Rigs: []config.Rig{
+			{Name: "alpha", Path: "alpha"},
+			{Name: "beta", Path: "beta"},
+		},
+		FormulaLayers: config.FormulaLayers{
+			City: []string{cityLayer},
+			// Rig layers must include the city layer first, then the
+			// rig-exclusive layer; rigExclusiveLayers strips the city
+			// prefix to avoid double-scanning city orders.
+			Rigs: map[string][]string{
+				"alpha": {cityLayer, rigLayers["alpha"]},
+				"beta":  {cityLayer, rigLayers["beta"]},
+			},
+		},
+		Orders: config.OrdersConfig{
+			Overrides: []config.OrderOverride{
+				// Rigless! Today this silently no-ops.
+				{Name: "patrol-project-leads", Enabled: &disabled},
+			},
+		},
 	}
 
-	// Verify stderr contains the "not found" warning from ApplyOverrides.
-	if !strings.Contains(stderr.String(), "not found") {
-		t.Errorf("expected stderr to contain 'not found' warning, got: %s", stderr.String())
+	// The full error-message contract (city scope / per-rig hint / matching
+	// rig names) is exercised by TestApplyOverridesRiglessOnPerRigOnlyHasEnrichedError
+	// in internal/orders. Here we only assert the integration: a rigless
+	// override against a real per-rig-only scanned order surfaces as an
+	// error from buildOrderDispatcher with the expected wrap.
+	ad, err := buildOrderDispatcher(cityDir, cfg, events.Discard, &bytes.Buffer{})
+	if err == nil {
+		t.Fatalf("expected error for rigless override on per-rig-only order, got dispatcher=%v", ad)
+	}
+	if ad != nil {
+		t.Errorf("expected nil dispatcher on error, got %v", ad)
+	}
+	if !strings.Contains(err.Error(), "order overrides") {
+		t.Errorf("error = %v, want 'order overrides' wrap from buildOrderDispatcher", err)
 	}
 }
 

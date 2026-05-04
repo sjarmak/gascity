@@ -58,6 +58,13 @@ type controllerState struct {
 	// until the loop observes and applies the same or a newer on-disk config.
 	configMutationPending atomic.Bool
 	pendingConfigRev      string
+
+	// loggedOrdersOverrideErr flips to true the first time Orders() detects
+	// an invalid [[orders.overrides]] block, so per-request API traffic
+	// does not spam supervisor stderr. Operators already see the loud
+	// startup / reload failure; this flag bounds the redundant API-path
+	// log to one line per controller process lifetime.
+	loggedOrdersOverrideErr atomic.Bool
 }
 
 var controllerStateInitRigDirIfReady = initDirIfReady
@@ -697,7 +704,22 @@ func (cs *controllerState) Orders() []orders.Order {
 	}
 
 	if len(cfg.Orders.Overrides) > 0 {
-		orders.ApplyOverrides(allAA, convertOverrides(cfg.Orders.Overrides)) //nolint:errcheck // best-effort
+		// Best-effort: an invalid override block (e.g. one that targets a
+		// nonexistent or per-rig-only order) is loud at startup/reload
+		// (newCityRuntime returns an error and the reload outcome is
+		// reloadOutcomeFailed). The API path here cannot 500 — that would
+		// break dashboards while an operator is in the middle of fixing
+		// city.toml. ApplyOverrides mutates allAA in place and returns on
+		// the first failing override, so the returned list may have
+		// earlier overrides applied; clients should treat it as a
+		// best-effort snapshot. Log once per controller lifetime so a
+		// chronically broken override doesn't spam supervisor stderr on
+		// every API request.
+		if err := orders.ApplyOverrides(allAA, convertOverrides(cfg.Orders.Overrides)); err != nil {
+			if cs.loggedOrdersOverrideErr.CompareAndSwap(false, true) {
+				fmt.Fprintf(os.Stderr, "api: orders override: %v (returning best-effort partially-overridden list; fix city.toml then reload)\n", err) //nolint:errcheck // best-effort stderr
+			}
+		}
 	}
 
 	return allAA

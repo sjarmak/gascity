@@ -1084,8 +1084,12 @@ type OrdersConfig struct {
 type OrderOverride struct {
 	// Name is the order name to target (required).
 	Name string `toml:"name" jsonschema:"required"`
-	// Rig scopes the override to a specific rig's order.
-	// Empty matches city-level orders.
+	// Rig scopes the override to a specific rig's order. When empty (or
+	// omitted), the override matches only city-level orders — NOT per-rig
+	// instances. To override a per-rig order (e.g. one that expands at scan
+	// time into one instance per rig), set Rig to the rig name explicitly.
+	// There is currently no wildcard syntax; one override per rig is
+	// required when targeting per-rig instances.
 	Rig string `toml:"rig,omitempty"`
 	// Enabled overrides whether the order is active.
 	Enabled *bool `toml:"enabled,omitempty"`

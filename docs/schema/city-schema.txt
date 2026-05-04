@@ -1295,7 +1295,7 @@
         },
         "rig": {
           "type": "string",
-          "description": "Rig scopes the override to a specific rig's order.\nEmpty matches city-level orders."
+          "description": "Rig scopes the override to a specific rig's order. When empty (or\nomitted), the override matches only city-level orders — NOT per-rig\ninstances. To override a per-rig order (e.g. one that expands at scan\ntime into one instance per rig), set Rig to the rig name explicitly.\nThere is currently no wildcard syntax; one override per rig is\nrequired when targeting per-rig instances."
         },
         "enabled": {
           "type": "boolean",

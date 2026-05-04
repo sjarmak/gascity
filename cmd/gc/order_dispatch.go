@@ -84,18 +84,30 @@ type memoryOrderDispatcher struct {
 }
 
 // buildOrderDispatcher scans formula layers for orders and returns a
-// dispatcher. Returns nil if no auto-dispatchable orders are found.
-// Scans both city-level and per-rig orders. Rig orders get their Rig
-// field stamped so they use independent scoped labels.
-func buildOrderDispatcher(cityPath string, cfg *config.City, rec events.Recorder, stderr io.Writer) orderDispatcher {
+// dispatcher. Returns (nil, nil) if no auto-dispatchable orders are
+// found. Scans both city-level and per-rig orders. Rig orders get their
+// Rig field stamped so they use independent scoped labels.
+//
+// Failure modes are deliberately asymmetric:
+//
+//   - A filesystem scan failure (I/O error reading formula dirs) is
+//     non-fatal: the function logs to stderr and returns (nil, nil) so
+//     the controller starts without order dispatch rather than refusing
+//     to start over a transient FS hiccup.
+//   - An invalid [[orders.overrides]] block (e.g. targeting a
+//     nonexistent or per-rig-only order) returns a non-nil error.
+//     Callers must treat this as a startup/reload failure, because
+//     silent failure historically led to users believing
+//     `enabled = false` was disabling per-rig orders when it wasn't.
+func buildOrderDispatcher(cityPath string, cfg *config.City, rec events.Recorder, stderr io.Writer) (orderDispatcher, error) {
 	allAA, err := scanAllOrders(cityPath, cfg, stderr, "gc start: order scan")
 	if err != nil {
 		logDispatchError(stderr, "gc start: order scan: %v", err)
-		return nil
+		return nil, nil
 	}
 	if len(cfg.Orders.Overrides) > 0 {
 		if err := orders.ApplyOverrides(allAA, convertOverrides(cfg.Orders.Overrides)); err != nil {
-			logDispatchError(stderr, "gc start: order overrides: %v", err)
+			return nil, fmt.Errorf("order overrides: %w", err)
 		}
 	}
 
@@ -107,7 +119,7 @@ func buildOrderDispatcher(cityPath string, cfg *config.City, rec events.Recorder
 		}
 	}
 	if len(auto) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Extract events.Provider from recorder if available.
@@ -129,7 +141,7 @@ func buildOrderDispatcher(cityPath string, cfg *config.City, rec events.Recorder
 		maxTimeout: cfg.Orders.MaxTimeoutDuration(),
 		cfg:        cfg,
 		cityName:   loadedCityName(cfg, cityPath),
-	}
+	}, nil
 }
 
 func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, now time.Time) {

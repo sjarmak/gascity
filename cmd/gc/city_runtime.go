@@ -139,8 +139,12 @@ const cityRuntimeReloadLifecycleRetryLimit = 2
 
 // newCityRuntime creates a CityRuntime, building internal components
 // (crash tracker, idle tracker, wisp GC, order dispatcher) from the
-// provided parameters.
-func newCityRuntime(p CityRuntimeParams) *CityRuntime {
+// provided parameters. Returns a non-nil error if a configuration-level
+// failure prevents the runtime from being constructed cleanly — today
+// the only such failure is invalid [[orders.overrides]] (e.g. targeting
+// a nonexistent order); callers should surface this as a startup
+// failure rather than ignoring it.
+func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 	configName := lockedConfigName(p.Cfg, p.CityPath)
 	applyRuntimeCityIdentity(p.Cfg, p.CityName)
 
@@ -174,7 +178,10 @@ func newCityRuntime(p CityRuntimeParams) *CityRuntime {
 		fmt.Fprintf(p.Stderr, "gc start: closed %d orphaned order-tracking beads\n", n) //nolint:errcheck // best-effort stderr
 	}
 
-	od := buildOrderDispatcher(p.CityPath, p.Cfg, p.Rec, p.Stderr)
+	od, err := buildOrderDispatcher(p.CityPath, p.Cfg, p.Rec, p.Stderr)
+	if err != nil {
+		return nil, fmt.Errorf("building order dispatcher: %w", err)
+	}
 
 	suspendedNames := computeSuspendedNames(p.Cfg, p.CityName, p.CityPath)
 
@@ -236,7 +243,7 @@ func newCityRuntime(p CityRuntimeParams) *CityRuntime {
 	if err := cr.svc.Reload(); err != nil {
 		fmt.Fprintf(cr.stderr, "%s: service init: %v\n", cr.logPrefix, err) //nolint:errcheck // best-effort stderr
 	}
-	return cr
+	return cr, nil
 }
 
 // setControllerState sets the API state for this city. The controller
@@ -980,6 +987,26 @@ func (cr *CityRuntime) reloadConfigTraced(
 			Warnings: warnings,
 		}
 	}
+
+	// Validate orders config and build the new dispatcher BEFORE mutating
+	// any cr.* state so an invalid [[orders.overrides]] block (e.g. one
+	// targeting a nonexistent or per-rig-only order) fails the reload
+	// cleanly with the old config still active. Mirrors the lifecycle
+	// fail-fast pattern above.
+	nextOd, odErr := buildOrderDispatcher(cityRoot, nextCfg, cr.rec, cr.stderr)
+	if odErr != nil {
+		err := fmt.Errorf("config reload: %w", odErr)
+		fmt.Fprintf(cr.stderr, "%s: %v (keeping old config)\n", cr.logPrefix, err) //nolint:errcheck // best-effort stderr
+		telemetry.RecordConfigReload(ctx, "", string(source), string(reloadOutcomeFailed), len(warnings), err)
+		if trace != nil {
+			trace.RecordConfigReload(oldRevision, result.Revision, TraceOutcomeFailed, source, nil, nil, false, warnings, err)
+		}
+		return reloadControlReply{
+			Outcome:  reloadOutcomeFailed,
+			Error:    err.Error(),
+			Warnings: warnings,
+		}
+	}
 	if len(nextCfg.FormulaLayers.City) > 0 {
 		if err := ResolveFormulas(cityRoot, nextCfg.FormulaLayers.City); err != nil {
 			appendWarning(fmt.Sprintf("config reload: city formulas: %v", err))
@@ -1070,7 +1097,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 		cr.wg = nil
 	}
 
-	cr.od = buildOrderDispatcher(cityRoot, nextCfg, cr.rec, cr.stderr)
+	cr.od = nextOd
 
 	cr.serviceStateMu.Lock()
 	cr.cfg = nextCfg

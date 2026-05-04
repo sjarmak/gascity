@@ -359,7 +359,7 @@ OrderOverride modifies a scanned order's scheduling fields.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `name` | string | **yes** |  | Name is the order name to target (required). |
-| `rig` | string |  |  | Rig scopes the override to a specific rig's order. Empty matches city-level orders. |
+| `rig` | string |  |  | Rig scopes the override to a specific rig's order. When empty (or omitted), the override matches only city-level orders — NOT per-rig instances. To override a per-rig order (e.g. one that expands at scan time into one instance per rig), set Rig to the rig name explicitly. There is currently no wildcard syntax; one override per rig is required when targeting per-rig instances. |
 | `enabled` | boolean |  |  | Enabled overrides whether the order is active. |
 | `trigger` | string |  |  | Trigger overrides the trigger type. |
 | `gate` | string |  |  | Gate is a deprecated alias for Trigger accepted during the gate-&gt;trigger migration. Parsed inputs are normalized to Trigger. |
