@@ -224,6 +224,21 @@ package docstring at the top of that file. Summary:
 | `INBOUND_FILE_TTL`             | `168h` (7 days)                                  | Janitor retention. `0` disables sweeping.                                       |
 | `INBOUND_FILE_SWEEP_INTERVAL`  | `1h`                                             | Janitor scan period. `0` disables sweeping.                                     |
 
+**Permissions:** `IDENTITY_STORE_PATH`, `HANDLE_ALIAS_STORE_PATH`, and
+`INBOUND_FILE_STORE` are written with `0o700` directories and `0o600`
+files so contents are readable only by the adapter's UID. On startup
+the adapter additionally tightens any pre-existing files/directories
+that are looser (one-shot migration for legacy `/tmp/gc-slack-adapter/`
+trees from earlier versions). Operators using a custom-mode parent
+(e.g. setgid for shared-group access) should set the perms before
+adapter start; the tightener preserves setuid/setgid/sticky bits and
+never loosens an operator-tighter mode. For multi-tenant hosts,
+override these paths to a host-private location explicitly created
+with `0o700`. The proxy_process Unix domain socket
+(`GC_SERVICE_SOCKET`) is also chmod'd to `0o600` after bind as
+defense-in-depth on top of its `0o700` controller-managed parent
+directory at `/tmp/gcsvc-<uid>/<hash>/`.
+
 **Controller-injected** (proxy_process mode only — gc sets these when
 the adapter runs as a `[[service]]`; do not set them by hand):
 `GC_SERVICE_NAME`, `GC_SERVICE_SOCKET`, `GC_SERVICE_URL_PREFIX`,

@@ -77,6 +77,21 @@
 //     wakes to scan INBOUND_FILE_STORE. "0"
 //     disables the janitor.
 //
+// # File permissions
+//
+// IDENTITY_STORE_PATH, HANDLE_ALIAS_STORE_PATH, and INBOUND_FILE_STORE
+// are written with 0o700 directories and 0o600 files so contents
+// (session-id ↔ persona mappings, cross-channel handle aliases, and
+// downloaded inbound Slack files — potentially DM content) are
+// readable only by the adapter's UID. On startup the adapter
+// additionally tightens any pre-existing files/directories that are
+// looser. Operators using a custom-mode parent (setgid for
+// shared-group access, etc.) should set perms before adapter start;
+// the tightener preserves setuid/setgid/sticky bits and never
+// loosens. The proxy_process Unix domain socket
+// (GC_SERVICE_SOCKET) is also chmod'd to 0o600 after bind as
+// defense-in-depth on top of its 0o700 controller-managed parent dir.
+//
 // Controller-injected (proxy_process mode only — set by gc when the
 // adapter runs as a [[service]]):
 //
@@ -565,6 +580,13 @@ func main() {
 	log.Printf("starting gc-slack-adapter public=%s internal=%s gc=%s city=%s",
 		cfg.publicListen, internalDescr, cfg.gcAPIBase, cfg.cityName)
 
+	// Tighten any pre-existing /tmp/gc-slack-adapter/* state from
+	// pre-fix installs to 0o700 dirs / 0o600 files. Must run BEFORE
+	// the public listener binds and BEFORE concurrent writers
+	// (registries on first save, janitor goroutine) start, so there's
+	// no race with other writers in this process. gc-ywe.6.
+	tightenStorePermissions(cfg)
+
 	identityReg, err := newIdentityRegistry(cfg.identityStorePath)
 	if err != nil {
 		log.Fatalf("identity registry: %v", err)
@@ -676,7 +698,20 @@ func listenUDS(path string) (net.Listener, error) {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("remove stale socket: %w", err)
 	}
-	return net.Listen("unix", path)
+	lis, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("listen unix %s: %w", path, err)
+	}
+	// Defense-in-depth: the controller-managed parent at
+	// /tmp/gcsvc-<uid>/<hash>/ is already 0o700 so the socket is
+	// unreachable to other UIDs via parent-dir traversal-deny, but
+	// chmod the socket itself too in case the parent ever loosens.
+	// gc-ywe.6.
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = lis.Close()
+		return nil, fmt.Errorf("chmod uds: %w", err)
+	}
+	return lis, nil
 }
 
 func registerAdapter(cfg config) error {
@@ -1314,7 +1349,8 @@ func downloadSlackFiles(cfg config, channel, ts string, files []slackFile) []ext
 		return nil
 	}
 	channelDir := filepath.Join(cfg.inboundFileStore, channel)
-	if err := os.MkdirAll(channelDir, 0o755); err != nil {
+	// 0o700: store may contain DM file content; not world-readable. gc-ywe.6.
+	if err := os.MkdirAll(channelDir, 0o700); err != nil {
 		log.Printf("inbound file download: mkdir %s: %v", channelDir, err)
 		return nil
 	}
@@ -1398,7 +1434,8 @@ func slackDownloadToFile(token, urlPrivate, dest string) error {
 		return fmt.Errorf("GET %s: %s — %s", urlPrivate, resp.Status, string(respBody))
 	}
 	tmp := dest + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	// 0o600: file content may be DM-private; rename below preserves this mode. gc-ywe.6.
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("open tmp %s: %w", tmp, err)
 	}
@@ -1552,6 +1589,96 @@ func logSweepResult(res sweepResult) {
 	for _, err := range res.Errors {
 		log.Printf("inbound file janitor error: %v", err)
 	}
+}
+
+// tightenStorePermissions is a one-shot startup migration helper for
+// pre-fix installs. The create-time mode constants in saveLocked +
+// downloadSlackFiles + slackDownloadToFile produce 0o700/0o600 for
+// every new write, but legacy state from prior versions sits at
+// 0o755/0o644. This walks the three configured stores and tightens
+// only-if-strictly-looser. Setuid/setgid/sticky bits are preserved
+// (operators may deliberately set setgid on a shared-group inbound
+// dir). Operator-tighter perms (e.g. 0o400 read-only) are left alone.
+// Errors are logged and never fatal — the helper is best-effort.
+//
+// gc-ywe.6.
+func tightenStorePermissions(cfg config) {
+	for _, p := range []string{cfg.identityStorePath, cfg.handleAliasStorePath} {
+		if p == "" {
+			continue
+		}
+		tightenPerm(filepath.Dir(p), 0o700)
+		tightenPerm(p, 0o600)
+	}
+
+	if cfg.inboundFileStore == "" {
+		return
+	}
+	tightenPerm(cfg.inboundFileStore, 0o700)
+	// One level deep: each <channel>/ subdir + its immediate
+	// children. The adapter owns this layout (downloadSlackFiles
+	// at L1316). Don't recurse further — anything deeper is
+	// operator-customized territory.
+	entries, err := os.ReadDir(cfg.inboundFileStore)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("tighten store: readdir %s: %v", cfg.inboundFileStore, err)
+		}
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		channelDir := filepath.Join(cfg.inboundFileStore, e.Name())
+		tightenPerm(channelDir, 0o700)
+		children, err := os.ReadDir(channelDir)
+		if err != nil {
+			log.Printf("tighten store: readdir %s: %v", channelDir, err)
+			continue
+		}
+		for _, c := range children {
+			if c.IsDir() {
+				continue
+			}
+			tightenPerm(filepath.Join(channelDir, c.Name()), 0o600)
+		}
+	}
+}
+
+// tightenPerm chmods path to target if its perm bits are strictly
+// looser. Setuid/setgid/sticky bits are preserved. Missing paths and
+// symlinks are no-ops (Go's stdlib has no Lchmod, so following the
+// link would chmod the target — refuse to do that). Errors are
+// logged and never fatal.
+func tightenPerm(path string, target os.FileMode) {
+	if path == "" {
+		return
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("tighten store: stat %s: %v", path, err)
+		}
+		return
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		log.Printf("tighten store: skipping symlink %s", path)
+		return
+	}
+	mode := info.Mode()
+	if mode.Perm()&^target == 0 {
+		return
+	}
+	preserved := mode & (os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
+	final := preserved | target
+	if err := os.Chmod(path, final); err != nil {
+		log.Printf("tighten store: chmod %s: %v", path, err)
+		return
+	}
+	// Use %v to render special bits symbolically (e.g. "g+s" for setgid)
+	// so an operator reading the log can verify preservation.
+	log.Printf("tighten store: %s %v -> %v (legacy state)", path, mode, final)
 }
 
 // parseHandlePrefix recognizes a leading address token of the form
@@ -1710,7 +1837,8 @@ func (r *identityRegistry) saveLocked() error {
 	if r.diskPath == "" {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(r.diskPath), 0o755); err != nil {
+	// 0o700/0o600: store maps session-id ↔ persona display name; not world-readable. gc-ywe.6.
+	if err := os.MkdirAll(filepath.Dir(r.diskPath), 0o700); err != nil {
 		return fmt.Errorf("mkdir identity store dir: %w", err)
 	}
 	data, err := json.MarshalIndent(r.byID, "", "  ")
@@ -1718,7 +1846,7 @@ func (r *identityRegistry) saveLocked() error {
 		return fmt.Errorf("encode identity store: %w", err)
 	}
 	tmp := r.diskPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return fmt.Errorf("write identity store tmp: %w", err)
 	}
 	if err := os.Rename(tmp, r.diskPath); err != nil {
@@ -1816,7 +1944,8 @@ func (r *handleAliasRegistry) saveLocked() error {
 	if r.diskPath == "" {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(r.diskPath), 0o755); err != nil {
+	// 0o700/0o600: store maps cross-channel @handle → session-id; not world-readable. gc-ywe.6.
+	if err := os.MkdirAll(filepath.Dir(r.diskPath), 0o700); err != nil {
 		return fmt.Errorf("mkdir handle alias store dir: %w", err)
 	}
 	data, err := json.MarshalIndent(r.byHandle, "", "  ")
@@ -1824,7 +1953,7 @@ func (r *handleAliasRegistry) saveLocked() error {
 		return fmt.Errorf("encode handle alias store: %w", err)
 	}
 	tmp := r.diskPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return fmt.Errorf("write handle alias store tmp: %w", err)
 	}
 	if err := os.Rename(tmp, r.diskPath); err != nil {

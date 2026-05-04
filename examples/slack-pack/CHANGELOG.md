@@ -19,6 +19,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Build flow simplified to a single command:
   `cd examples/slack-pack/adapter && go build -o gc-slack-adapter`.
 
+### Security
+
+- Default adapter state under `/tmp/gc-slack-adapter/*` is no longer
+  world-readable on shared hosts (`gc-ywe.6`). Concretely: the
+  identity registry, handle-alias registry, and inbound file store now
+  create directories with mode `0o700` and files with mode `0o600`
+  (previously `0o755`/`0o644`). Pre-fix installs are migrated on
+  startup by a one-shot tightener that walks the three configured
+  store paths and chmods only-if-strictly-looser; setuid, setgid, and
+  sticky bits are preserved so operator-customized layouts (e.g.
+  setgid for shared-group access) survive intact. Operators who
+  deliberately set tighter perms (e.g. `0o400` read-only) are also
+  left alone. As defense-in-depth, the proxy_process Unix domain
+  socket is chmod'd to `0o600` after bind on top of its
+  `0o700` controller-managed parent directory at
+  `/tmp/gcsvc-<uid>/<hash>/`.
+
 ## [0.1.0] - 2026-05-03
 
 Initial preview. Feature-by-feature port of the upstream `discord` pack

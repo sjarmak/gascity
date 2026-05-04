@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1698,6 +1699,342 @@ func TestLoadConfigInboundFileRetentionInvalid(t *testing.T) {
 	if cfg.inboundFileTTL != 0 {
 		t.Errorf("inboundFileTTL = %s, want 0 on invalid input", cfg.inboundFileTTL)
 	}
+}
+
+// TestStorePermissions guards the create-time perm constants on the two
+// JSON-backed registries: identity store and handle-alias store. Both
+// must produce 0o600 files inside 0o700 parent dirs so default
+// /tmp/gc-slack-adapter/* state is not world-readable on a shared host.
+// gc-ywe.6.
+func TestStorePermissions(t *testing.T) {
+	cases := []struct {
+		name string
+		make func(t *testing.T) (path string, write func() error)
+	}{
+		{
+			name: "identity registry",
+			make: func(t *testing.T) (string, func() error) {
+				path := filepath.Join(t.TempDir(), "store", "identities.json")
+				reg, err := newIdentityRegistry(path)
+				if err != nil {
+					t.Fatalf("newIdentityRegistry: %v", err)
+				}
+				return path, func() error {
+					return reg.Set("gc-perm-test", identityRecord{Username: "x"})
+				}
+			},
+		},
+		{
+			name: "handle alias registry",
+			make: func(t *testing.T) (string, func() error) {
+				path := filepath.Join(t.TempDir(), "store", "handle-aliases.json")
+				reg, err := newHandleAliasRegistry(path)
+				if err != nil {
+					t.Fatalf("newHandleAliasRegistry: %v", err)
+				}
+				return path, func() error {
+					return reg.Set("@perm", "gc-perm-test")
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path, write := tc.make(t)
+			if err := write(); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			fileInfo, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("stat file: %v", err)
+			}
+			if got := fileInfo.Mode().Perm(); got != 0o600 {
+				t.Errorf("file %s mode = %#o, want 0o600", path, got)
+			}
+			dirInfo, err := os.Stat(filepath.Dir(path))
+			if err != nil {
+				t.Fatalf("stat parent dir: %v", err)
+			}
+			if got := dirInfo.Mode().Perm(); got != 0o700 {
+				t.Errorf("parent dir %s mode = %#o, want 0o700", filepath.Dir(path), got)
+			}
+		})
+	}
+}
+
+// TestDownloadSlackFilesPermissions guards the create-time perms on the
+// inbound-file path: the per-channel directory must be 0o700 and the
+// downloaded file (post-rename) must be 0o600. Rename preserves the
+// source mode set by OpenFile, so this also locks in the OpenFile
+// constant. gc-ywe.6.
+func TestDownloadSlackFilesPermissions(t *testing.T) {
+	const body = "PNG-BYTES"
+	slackStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(slackStub.Close)
+
+	cfg := config{
+		slackBotToken:    "xoxb-test",
+		inboundFileStore: filepath.Join(t.TempDir(), "inbound"),
+	}
+	files := []slackFile{{
+		ID:         "F1",
+		Name:       "shot.png",
+		URLPrivate: slackStub.URL + "/files/F1",
+		MIMEType:   "image/png",
+	}}
+
+	got := downloadSlackFiles(cfg, "C123", "1234.5678", files)
+	if len(got) != 1 {
+		t.Fatalf("got %d attachments, want 1", len(got))
+	}
+
+	channelDir := filepath.Join(cfg.inboundFileStore, "C123")
+	dirInfo, err := os.Stat(channelDir)
+	if err != nil {
+		t.Fatalf("stat channel dir: %v", err)
+	}
+	if perm := dirInfo.Mode().Perm(); perm != 0o700 {
+		t.Errorf("channel dir mode = %#o, want 0o700", perm)
+	}
+
+	destPath := strings.TrimPrefix(got[0].URL, "file://")
+	fileInfo, err := os.Stat(destPath)
+	if err != nil {
+		t.Fatalf("stat downloaded file: %v", err)
+	}
+	if perm := fileInfo.Mode().Perm(); perm != 0o600 {
+		t.Errorf("file mode = %#o, want 0o600 (rename should preserve OpenFile mode)", perm)
+	}
+}
+
+// TestUDSPermissions guards that the proxy_process Unix domain socket is
+// chmod'd to 0o600 immediately after bind. Defense-in-depth on top of
+// the controller-managed 0o700 parent dir at /tmp/gcsvc-<uid>/<hash>/.
+// gc-ywe.6.
+func TestUDSPermissions(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "test.sock")
+	lis, err := listenUDS(sockPath)
+	if err != nil {
+		t.Fatalf("listenUDS: %v", err)
+	}
+	t.Cleanup(func() { _ = lis.Close() })
+
+	info, err := os.Stat(sockPath)
+	if err != nil {
+		t.Fatalf("stat socket: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("UDS mode = %#o, want 0o600", perm)
+	}
+}
+
+// TestTightenStorePermissions covers the one-shot startup migration
+// helper: legacy state from pre-fix installs gets tightened to
+// 0o700/0o600, but already-tight perms are left alone, deliberately
+// setuid/setgid/sticky bits are preserved, and operator-tighter perms
+// (e.g. 0o400 read-only) are not loosened. gc-ywe.6.
+func TestTightenStorePermissions(t *testing.T) {
+	t.Run("loose perms tightened", func(t *testing.T) {
+		dir := t.TempDir()
+		idDir := filepath.Join(dir, "id")
+		idFile := filepath.Join(idDir, "identities.json")
+		aliasDir := filepath.Join(dir, "alias")
+		aliasFile := filepath.Join(aliasDir, "handle-aliases.json")
+		inboundDir := filepath.Join(dir, "inbound")
+		channelDir := filepath.Join(inboundDir, "C123")
+		channelFile := filepath.Join(channelDir, "1234.5678-pic.png")
+		for _, d := range []string{idDir, aliasDir, channelDir} {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				t.Fatalf("mkdir %s: %v", d, err)
+			}
+		}
+		for _, f := range []string{idFile, aliasFile, channelFile} {
+			if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+				t.Fatalf("write %s: %v", f, err)
+			}
+		}
+
+		cfg := config{
+			identityStorePath:    idFile,
+			handleAliasStorePath: aliasFile,
+			inboundFileStore:     inboundDir,
+		}
+		tightenStorePermissions(cfg)
+
+		for _, d := range []string{idDir, aliasDir, inboundDir, channelDir} {
+			info, err := os.Stat(d)
+			if err != nil {
+				t.Fatalf("stat %s: %v", d, err)
+			}
+			if perm := info.Mode().Perm(); perm != 0o700 {
+				t.Errorf("dir %s mode = %#o, want 0o700", d, perm)
+			}
+		}
+		for _, f := range []string{idFile, aliasFile, channelFile} {
+			info, err := os.Stat(f)
+			if err != nil {
+				t.Fatalf("stat %s: %v", f, err)
+			}
+			if perm := info.Mode().Perm(); perm != 0o600 {
+				t.Errorf("file %s mode = %#o, want 0o600", f, perm)
+			}
+		}
+	})
+
+	t.Run("already-tight no-op", func(t *testing.T) {
+		dir := t.TempDir()
+		idFile := filepath.Join(dir, "identities.json")
+		if err := os.WriteFile(idFile, []byte("x"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Fatalf("chmod parent: %v", err)
+		}
+		cfg := config{identityStorePath: idFile}
+		tightenStorePermissions(cfg)
+		info, err := os.Stat(idFile)
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("file mode drifted from 0o600 to %#o", perm)
+		}
+	})
+
+	t.Run("missing paths no-op", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := config{
+			identityStorePath:    filepath.Join(dir, "missing-id", "id.json"),
+			handleAliasStorePath: filepath.Join(dir, "missing-alias", "alias.json"),
+			inboundFileStore:     filepath.Join(dir, "missing-inbound"),
+		}
+		// Should not panic, should not error to caller (helper returns void).
+		tightenStorePermissions(cfg)
+		// And should not have created any of the missing paths.
+		for _, p := range []string{cfg.identityStorePath, cfg.handleAliasStorePath, cfg.inboundFileStore} {
+			if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("%s should still be missing, got err=%v", p, err)
+			}
+		}
+	})
+
+	t.Run("empty paths no-op", func(t *testing.T) {
+		// All-empty config: helper should be a no-op without panicking.
+		tightenStorePermissions(config{})
+	})
+
+	t.Run("setgid bit preserved on dir", func(t *testing.T) {
+		dir := t.TempDir()
+		inboundDir := filepath.Join(dir, "inbound")
+		if err := os.MkdirAll(inboundDir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		// Set 0o2755 — setgid + world-readable. Tightener should drop
+		// the world bits but preserve the setgid bit.
+		if err := os.Chmod(inboundDir, os.ModeSetgid|0o755); err != nil {
+			t.Fatalf("chmod setgid: %v", err)
+		}
+		cfg := config{inboundFileStore: inboundDir}
+		tightenStorePermissions(cfg)
+		info, err := os.Stat(inboundDir)
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		if info.Mode()&os.ModeSetgid == 0 {
+			t.Errorf("setgid bit was stripped: mode = %v", info.Mode())
+		}
+		if perm := info.Mode().Perm(); perm != 0o700 {
+			t.Errorf("perm bits = %#o, want 0o700", perm)
+		}
+	})
+
+	t.Run("operator-tighter file not loosened", func(t *testing.T) {
+		dir := t.TempDir()
+		idFile := filepath.Join(dir, "identities.json")
+		if err := os.WriteFile(idFile, []byte("x"), 0o400); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		cfg := config{identityStorePath: idFile}
+		tightenStorePermissions(cfg)
+		info, err := os.Stat(idFile)
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o400 {
+			t.Errorf("operator-tighter 0o400 file was loosened to %#o", perm)
+		}
+	})
+
+	t.Run("symlinks not followed", func(t *testing.T) {
+		// Defense-in-depth: a symlink planted in INBOUND_FILE_STORE/<channel>/
+		// must NOT cause tightenPerm to chmod the symlink target. Go's
+		// stdlib has no Lchmod, so chmod-on-symlink would silently
+		// modify whatever the link points to.
+		dir := t.TempDir()
+		inboundDir := filepath.Join(dir, "inbound")
+		channelDir := filepath.Join(inboundDir, "C123")
+		if err := os.MkdirAll(channelDir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		// Target file lives outside the store and stays at 0o644 — if the
+		// tightener follows the symlink, this will become 0o600.
+		targetFile := filepath.Join(dir, "outside.txt")
+		if err := os.WriteFile(targetFile, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write target: %v", err)
+		}
+		linkPath := filepath.Join(channelDir, "link")
+		if err := os.Symlink(targetFile, linkPath); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+
+		cfg := config{inboundFileStore: inboundDir}
+		tightenStorePermissions(cfg)
+
+		info, err := os.Stat(targetFile)
+		if err != nil {
+			t.Fatalf("stat target: %v", err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o644 {
+			t.Errorf("symlink target chmod'd to %#o; tightener followed the link", perm)
+		}
+	})
+
+	t.Run("operator-tighter file: subsequent saveLocked propagates EACCES", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses DAC; cannot validate EACCES propagation")
+		}
+		// Architect M2: if operator pre-set the file to 0o400, the
+		// tightener correctly skips, but the next saveLocked must
+		// still surface the EACCES rather than swallowing it.
+		dir := t.TempDir()
+		idFile := filepath.Join(dir, "identities.json")
+		if err := os.WriteFile(idFile, []byte("{}"), 0o400); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		// Lock the parent dir read-only too — this prevents the
+		// atomic temp-file write rather than the rename, which is
+		// the actual EACCES surface. (0o400 file alone is fine for
+		// the rename target since rename replaces; the parent's
+		// write bit is what gates tmp-file creation.)
+		if err := os.Chmod(dir, 0o500); err != nil {
+			t.Fatalf("chmod parent: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+		reg, err := newIdentityRegistry(idFile)
+		if err != nil {
+			t.Fatalf("newIdentityRegistry: %v", err)
+		}
+		err = reg.Set("gc-x", identityRecord{Username: "x"})
+		if err == nil {
+			t.Fatalf("Set: want error, got nil")
+		}
+		if !strings.Contains(err.Error(), "identity store") {
+			t.Errorf("error not wrapped with context: %v", err)
+		}
+	})
 }
 
 func TestSlackKindFromChannelType(t *testing.T) {
