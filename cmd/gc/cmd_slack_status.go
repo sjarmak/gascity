@@ -93,8 +93,8 @@ filters rig mappings to records whose channel set contains <id>.
 	}
 	cmd.Flags().StringVar(&channelFilter, "channel", "",
 		"Filter channel mappings to a single channel id; rig mappings are filtered to records whose channel_ids contain this id")
-	cmd.Flags().StringVar(&workspaceFilter, "workspace-id", "",
-		"Filter apps, channel mappings, and rig mappings to a single Slack workspace id")
+	cmd.Flags().StringVar(&workspaceFilter, "workspace-id", slackWorkspaceIDDefault(),
+		"Filter apps, channel mappings, and rig mappings to a single Slack workspace id (defaults to $"+slackWorkspaceIDEnv+" when set)")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false,
 		"Emit machine-readable JSON instead of human-readable text")
 	return cmd

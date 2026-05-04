@@ -98,6 +98,7 @@ func TestSlackMapRigDedupesChannels(t *testing.T) {
 }
 
 func TestSlackMapRigMissingWorkspaceID(t *testing.T) {
+	t.Setenv(slackWorkspaceIDEnv, "")
 	cityRoot := newTestCity(t)
 	_, _, err := execSlackMapRigCmd(t, cityRoot,
 		"alpha", "--channel", "C1",

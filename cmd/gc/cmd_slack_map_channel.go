@@ -55,15 +55,18 @@ every use.`,
 			return runSlackMapChannel(stdout, args[0], workspaceID, rigName, sessionID, remove)
 		},
 	}
-	cmd.Flags().StringVar(&workspaceID, "workspace-id", "",
-		"Slack workspace (team) id, e.g. T0123456 (required)")
+	defaultWorkspace := slackWorkspaceIDDefault()
+	cmd.Flags().StringVar(&workspaceID, "workspace-id", defaultWorkspace,
+		slackWorkspaceIDFlagUsage)
 	cmd.Flags().StringVar(&rigName, "rig", "",
 		"DEPRECATED (gc-cby.25): use 'gc slack map-rig' instead. Bind the channel to a gc rig.")
 	cmd.Flags().StringVar(&sessionID, "session", "",
 		"Bind the channel to a gc session (mutually exclusive with --rig)")
 	cmd.Flags().BoolVar(&remove, "remove", false,
 		"Remove the binding for <channel-id> if one exists (idempotent)")
-	_ = cmd.MarkFlagRequired("workspace-id")
+	if defaultWorkspace == "" {
+		_ = cmd.MarkFlagRequired("workspace-id")
+	}
 	cmd.MarkFlagsMutuallyExclusive("rig", "session")
 	// MarkDeprecated auto-hides --rig from --help and emits
 	// "Flag --rig has been deprecated, ..." on stderr at parse time.

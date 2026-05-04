@@ -64,6 +64,7 @@ func TestSlackMapChannelHappyPathSession(t *testing.T) {
 }
 
 func TestSlackMapChannelMissingWorkspaceID(t *testing.T) {
+	t.Setenv(slackWorkspaceIDEnv, "")
 	cityRoot := newTestCity(t)
 	_, _, err := execSlackMapChannelCmd(t, cityRoot,
 		"C1", "--rig", "alpha",

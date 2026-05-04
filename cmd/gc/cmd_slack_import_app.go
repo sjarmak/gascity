@@ -121,11 +121,14 @@ Schema reference: https://api.slack.com/reference/manifests`,
 			return runSlackImportApp(stdout, args[0], workspaceID, appID)
 		},
 	}
-	cmd.Flags().StringVar(&workspaceID, "workspace-id", "",
-		"Slack workspace (team) id, e.g. T0123456 (required)")
+	defaultWorkspace := slackWorkspaceIDDefault()
+	cmd.Flags().StringVar(&workspaceID, "workspace-id", defaultWorkspace,
+		slackWorkspaceIDFlagUsage)
 	cmd.Flags().StringVar(&appID, "app-id", "",
 		"Slack app id, e.g. A0123456 — assigned by Slack post-create (required)")
-	_ = cmd.MarkFlagRequired("workspace-id")
+	if defaultWorkspace == "" {
+		_ = cmd.MarkFlagRequired("workspace-id")
+	}
 	_ = cmd.MarkFlagRequired("app-id")
 	return cmd
 }

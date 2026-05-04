@@ -131,8 +131,9 @@ Schema: https://api.slack.com/methods/apps.manifest.update`,
 			return runSlackSyncCommands(cmd.Context(), stdout, o)
 		},
 	}
-	cmd.Flags().StringVar(&o.workspaceID, "workspace-id", "",
-		"Slack workspace (team) id, e.g. T0123456 (required)")
+	defaultWorkspace := slackWorkspaceIDDefault()
+	cmd.Flags().StringVar(&o.workspaceID, "workspace-id", defaultWorkspace,
+		slackWorkspaceIDFlagUsage)
 	cmd.Flags().StringVar(&o.appID, "app-id", "",
 		"Slack app id, e.g. A0123456 (required)")
 	cmd.Flags().StringVar(&o.token, "token", "",
@@ -145,7 +146,9 @@ Schema: https://api.slack.com/methods/apps.manifest.update`,
 		"Output format: text|json")
 	cmd.Flags().DurationVar(&o.timeout, "timeout", 30*time.Second,
 		"Hard timeout for the entire operation")
-	_ = cmd.MarkFlagRequired("workspace-id")
+	if defaultWorkspace == "" {
+		_ = cmd.MarkFlagRequired("workspace-id")
+	}
 	_ = cmd.MarkFlagRequired("app-id")
 	return cmd
 }

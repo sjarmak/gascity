@@ -54,15 +54,18 @@ record (or unknown channel) is a silent no-op. --remove,
 			return runSlackMapRig(stdout, stderr, args[0], workspaceID, channels, remove, removeChannels)
 		},
 	}
-	cmd.Flags().StringVar(&workspaceID, "workspace-id", "",
-		"Slack workspace (team) id, e.g. T0123456 (required)")
+	defaultWorkspace := slackWorkspaceIDDefault()
+	cmd.Flags().StringVar(&workspaceID, "workspace-id", defaultWorkspace,
+		slackWorkspaceIDFlagUsage)
 	cmd.Flags().StringSliceVar(&channels, "channel", nil,
 		"Slack channel id to include in the rig's set; repeat or comma-separate for multiple")
 	cmd.Flags().BoolVar(&remove, "remove", false,
 		"Remove the rig record entirely (idempotent; mutually exclusive with --channel and --remove-channels)")
 	cmd.Flags().StringSliceVar(&removeChannels, "remove-channels", nil,
 		"Drop these channels from the rig's set; if the set becomes empty the record is deleted (idempotent; mutually exclusive with --channel and --remove)")
-	_ = cmd.MarkFlagRequired("workspace-id")
+	if defaultWorkspace == "" {
+		_ = cmd.MarkFlagRequired("workspace-id")
+	}
 	// Three-way mutual exclusion: --remove drops the whole record;
 	// --remove-channels drops a subset; --channel adds/replaces.
 	// Cobra surfaces these as parse-time errors with standardized
