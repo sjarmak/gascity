@@ -1483,13 +1483,13 @@ func safeFilename(name string) string {
 // the Authorization header to that URL — credential exfiltration plus
 // internal-service probing (cloud metadata, gc API on loopback, etc.).
 //
-// Limitations not addressed here:
-//   - DNS rebinding: validation is on the URL string, not the resolved IP.
-//     A full defense would also require a custom Dialer with an IP allowlist.
-//   - HTTP redirects from a legitimate Slack CDN host to an internal IP:
-//     slackDownloadToFile uses http.DefaultClient which follows redirects
-//     without re-validating the destination. Requires a Slack CDN
-//     compromise to exploit; out of the immediate threat model.
+// Companion defenses live in buildSlackHTTPClient (gc-vrw):
+//   - DNS rebinding: a constrained Dialer rejects connections to private,
+//     loopback, link-local, or unspecified addresses regardless of the
+//     hostname that resolved to them.
+//   - HTTP redirects: CheckRedirect re-applies validateSlackFileURL to
+//     each 3xx target so a compromised Slack CDN host cannot 302 the
+//     bot token to an attacker-controlled host.
 func isSlackFileURL(rawURL string) (bool, error) {
 	u, err := url.ParseRequestURI(rawURL)
 	if err != nil {
@@ -1534,6 +1534,16 @@ func isSlackFileURL(rawURL string) (bool, error) {
 // restore the previous value after the test exits.
 var validateSlackFileURL = isSlackFileURL
 
+// slackDialIPGuard is the per-IP guard invoked from net.Dialer.Control
+// inside buildSlackHTTPClient. Indirected through a package var so the
+// existing test helper testAllowAnyURL can also relax the dial-time
+// check for tests that point url_private at httptest stubs on
+// 127.0.0.1. Production callers always see isPrivateOrLoopbackIP.
+//
+// WARNING: same concurrency contract as validateSlackFileURL. Tests
+// swapping this var must NOT call t.Parallel().
+var slackDialIPGuard = isPrivateOrLoopbackIP
+
 // slackDownloadToFile GETs urlPrivate with a Bearer token and streams the
 // body to dest via an atomic temp+rename. Non-2xx responses produce an
 // error with the truncated body for diagnosis. The url_private host is
@@ -1560,7 +1570,7 @@ func slackDownloadToFile(token, urlPrivate, dest string) error {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := buildSlackHTTPClient().Do(req)
 	if err != nil {
 		return err
 	}
@@ -1588,6 +1598,109 @@ func slackDownloadToFile(token, urlPrivate, dest string) error {
 		return fmt.Errorf("rename %s -> %s: %w", tmp, dest, err)
 	}
 	return nil
+}
+
+// isPrivateOrLoopbackIP reports whether ip falls into a range that the
+// adapter must never dial when fetching url_private. The set covers
+// IPv4 RFC1918 (10/8, 172.16/12, 192.168/16) and IPv6 unique-local
+// (fc00::/7) via net.IP.IsPrivate; loopback (127/8, ::1) via
+// IsLoopback; link-local unicast (169.254/16, fe80::/10) and
+// link-local/interface-local multicast; and the unspecified address
+// (0.0.0.0, ::). Public unicast addresses, including legitimate Slack
+// CDN ranges, return false.
+//
+// The check is by address only — there is no DNS or hostname lookup
+// here. It is invoked from net.Dialer.Control after Go's resolver has
+// produced a candidate address but before the connect syscall, so a
+// hostname that briefly resolves to a private IP (DNS rebinding) is
+// caught at the dial step regardless of how the URL was validated.
+// gc-vrw.
+func isPrivateOrLoopbackIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() {
+		return true
+	}
+	if ip.IsPrivate() {
+		return true
+	}
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	if ip.IsInterfaceLocalMulticast() {
+		return true
+	}
+	return false
+}
+
+// buildSlackHTTPClient returns an *http.Client wired with two
+// defense-in-depth controls beyond the URL allowlist enforced by
+// validateSlackFileURL:
+//
+//  1. A constrained net.Dialer whose Control hook inspects the
+//     resolved address (post-DNS, pre-connect) and refuses any IP that
+//     isPrivateOrLoopbackIP flags. This blocks DNS-rebinding attacks
+//     where an allowlisted hostname briefly resolves to an internal IP.
+//
+//  2. A CheckRedirect policy that re-applies validateSlackFileURL to
+//     each 3xx target. The default http.Client.CheckRedirect would
+//     follow a 302 from a legitimate (or compromised) Slack CDN host
+//     to attacker.com, sending the bot token in the Authorization
+//     header. This policy aborts the redirect with a typed error
+//     before the second hop is dialed.
+//
+// The function returns a fresh client per call rather than a shared
+// singleton because the cost is negligible (Transport reuse is per-
+// process via the underlying default DialContext semantics) and a
+// fresh client keeps test isolation simple. gc-vrw.
+func buildSlackHTTPClient() *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control: func(network, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return fmt.Errorf("dial %s %s: split host/port: %w", network, address, err)
+			}
+			ip := net.ParseIP(host)
+			if ip == nil {
+				// net.Dialer resolves to literal IPs before invoking
+				// Control, so a non-IP host here is a programming
+				// error or an unexpected resolver result — fail closed.
+				return fmt.Errorf("dial %s %s: refusing to dial non-literal address %q", network, address, host)
+			}
+			if slackDialIPGuard(ip) {
+				return fmt.Errorf("dial %s %s: refusing to dial private, loopback, or link-local address %s", network, address, ip)
+			}
+			return nil
+		},
+	}
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("redirect chain exceeded 10 hops at %s", req.URL.Redacted())
+			}
+			ok, err := validateSlackFileURL(req.URL.String())
+			if err != nil {
+				return fmt.Errorf("validating redirect target: %w", err)
+			}
+			if !ok {
+				return fmt.Errorf("refusing redirect to non-slack host %q", req.URL.Redacted())
+			}
+			return nil
+		},
+	}
 }
 
 // sweepResult summarizes one pass of the inbound file janitor. All counts

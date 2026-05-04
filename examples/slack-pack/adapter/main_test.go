@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1404,17 +1407,28 @@ func TestSafePathComponent(t *testing.T) {
 	}
 }
 
-// testAllowAnyURL bypasses the SSRF gate for tests of unrelated download
-// mechanics (atomic write, 4xx handling, sanitization) that point url_private
-// at httptest.NewServer URLs (http://127.0.0.1:<port>). Use ONLY in tests
-// where the gate is not the subject under test — gate tests
-// (TestIsSlackFileURL, TestSlackDownloadToFileRejectsNonSlackHostHTTPS) must
-// never call this.
+// testAllowAnyURL bypasses both the SSRF URL gate and the dial-time
+// private-IP guard for tests of unrelated download mechanics (atomic
+// write, 4xx handling, sanitization) that point url_private at
+// httptest.NewServer URLs (http://127.0.0.1:<port>). Use ONLY in tests
+// where the gates are not the subject under test — gate tests
+// (TestIsSlackFileURL, TestSlackDownloadToFileRejectsNonSlackHostHTTPS,
+// TestSlackHTTPClientDialRefusesPrivateIP) must never call this.
+//
+// The dial-time relaxation is needed alongside the URL relaxation
+// because buildSlackHTTPClient (gc-vrw) refuses to connect to 127.0.0.1
+// regardless of the URL's host string, which would otherwise break
+// every test that uses a local httptest stub.
 func testAllowAnyURL(t *testing.T) {
 	t.Helper()
-	prev := validateSlackFileURL
+	prevURL := validateSlackFileURL
 	validateSlackFileURL = func(string) (bool, error) { return true, nil }
-	t.Cleanup(func() { validateSlackFileURL = prev })
+	prevIP := slackDialIPGuard
+	slackDialIPGuard = func(net.IP) bool { return false }
+	t.Cleanup(func() {
+		validateSlackFileURL = prevURL
+		slackDialIPGuard = prevIP
+	})
 }
 
 func TestDownloadSlackFiles(t *testing.T) {
@@ -2262,6 +2276,186 @@ func TestSlackDownloadToFileRejectsNonSlackHostHTTPS(t *testing.T) {
 	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
 		t.Errorf("dest file %q should not exist after rejection, stat err: %v", dest, statErr)
 	}
+}
+
+// TestIsPrivateOrLoopbackIP table-tests the IP guard that backs the
+// constrained Dialer in buildSlackHTTPClient. Covers RFC1918 IPv4,
+// loopback, link-local, the 0.0.0.0 unspecified address, and IPv6
+// equivalents (::1, fc00::/7, fe80::/10). gc-vrw.
+func TestIsPrivateOrLoopbackIP(t *testing.T) {
+	cases := []struct {
+		name string
+		ip   string
+		want bool
+	}{
+		{"loopback v4", "127.0.0.1", true},
+		{"loopback v4 high", "127.255.255.254", true},
+		{"private 10/8", "10.1.2.3", true},
+		{"private 172.16/12", "172.16.0.1", true},
+		{"private 192.168/16", "192.168.1.1", true},
+		{"link-local v4", "169.254.169.254", true},
+		{"unspecified v4", "0.0.0.0", true},
+		{"loopback v6", "::1", true},
+		{"link-local v6", "fe80::1", true},
+		{"unique-local v6", "fc00::1", true},
+		{"unique-local v6 fd", "fd12::1", true},
+		{"unspecified v6", "::", true},
+
+		{"public v4 google", "8.8.8.8", false},
+		{"public v4 cloudflare", "1.1.1.1", false},
+		{"public v6 google", "2001:4860:4860::8888", false},
+		{"public v6 cloudflare", "2606:4700:4700::1111", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ip := net.ParseIP(tc.ip)
+			if ip == nil {
+				t.Fatalf("net.ParseIP(%q) returned nil — bad test input", tc.ip)
+			}
+			got := isPrivateOrLoopbackIP(ip)
+			if got != tc.want {
+				t.Errorf("isPrivateOrLoopbackIP(%q) = %v, want %v", tc.ip, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSlackHTTPClientDialRefusesPrivateIP covers the DNS-rebinding
+// defense: even after a host passes isSlackFileURL, the dialer must
+// refuse to connect when the resolved address lands on a private,
+// loopback, or link-local range. The URL is a literal-IP form so the
+// resolver pass-through is bypassed and the Dialer.Control hook
+// inspects the address directly. gc-vrw.
+func TestSlackHTTPClientDialRefusesPrivateIP(t *testing.T) {
+	cases := []struct {
+		name   string
+		target string // host:port form for net.Dial
+	}{
+		{"loopback v4", "127.0.0.1:443"},
+		{"private 10/8", "10.1.2.3:443"},
+		{"link-local v4", "169.254.169.254:443"},
+		{"loopback v6", "[::1]:443"},
+		{"link-local v6", "[fe80::1]:443"},
+	}
+	client := buildSlackHTTPClient()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr, ok := client.Transport.(*http.Transport)
+			if !ok {
+				t.Fatalf("client.Transport is %T, want *http.Transport", client.Transport)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			conn, err := tr.DialContext(ctx, "tcp", tc.target)
+			if conn != nil {
+				_ = conn.Close()
+			}
+			if err == nil {
+				t.Fatalf("DialContext(%q) succeeded, want refusal", tc.target)
+			}
+			if !strings.Contains(err.Error(), "refusing to dial private") {
+				t.Errorf("DialContext(%q) error = %v, want it to mention private-IP refusal", tc.target, err)
+			}
+		})
+	}
+}
+
+// TestSlackHTTPClientCheckRedirectRevalidates covers the open-redirect
+// defense. When the initial request lands on a Slack-allowlisted host
+// and the response is a 302 to attacker.com, CheckRedirect must reject
+// the follow so the bot token is never sent to the redirect target.
+// We invoke CheckRedirect directly (no network) because that exercises
+// exactly the policy the http.Client applies on a 3xx. gc-vrw.
+func TestSlackHTTPClientCheckRedirectRevalidates(t *testing.T) {
+	client := buildSlackHTTPClient()
+	if client.CheckRedirect == nil {
+		t.Fatal("buildSlackHTTPClient produced a client with nil CheckRedirect")
+	}
+
+	// Permitted target: a real Slack file URL.
+	okURL := mustParseURL(t, "https://files.slack.com/files-pri/T1-F2/foo")
+	okReq := &http.Request{URL: okURL}
+	if err := client.CheckRedirect(okReq, nil); err != nil {
+		t.Errorf("CheckRedirect to allowlisted host = %v, want nil", err)
+	}
+
+	// Denied target: attacker.com. Even though the *previous* hop was
+	// to files.slack.com (via), this hop must be rejected.
+	badURL := mustParseURL(t, "https://attacker.com/leak")
+	badReq := &http.Request{URL: badURL}
+	prevURL := mustParseURL(t, "https://files.slack.com/files-pri/T1-F2/foo")
+	via := []*http.Request{{URL: prevURL}}
+	err := client.CheckRedirect(badReq, via)
+	if err == nil {
+		t.Fatal("CheckRedirect to attacker.com returned nil, want rejection")
+	}
+	if !strings.Contains(err.Error(), "redirect") {
+		t.Errorf("redirect-rejection error %v should mention 'redirect' for log triage", err)
+	}
+
+	// Denied target: too many hops (defense-in-depth — http.Client uses
+	// CheckRedirect's len(via) >= cap signal to abort).
+	manyVia := make([]*http.Request, 11)
+	for i := range manyVia {
+		manyVia[i] = &http.Request{URL: prevURL}
+	}
+	if err := client.CheckRedirect(okReq, manyVia); err == nil {
+		t.Errorf("CheckRedirect with %d prior hops returned nil, want abort", len(manyVia))
+	}
+}
+
+// TestSlackHTTPClientRejectsRedirectEndToEnd exercises the full
+// download path: a stub on 127.0.0.1 (allowed by a selective
+// validateSlackFileURL override that admits only the stub host) returns
+// a 302 to attacker.com. CheckRedirect must fire — the override rejects
+// attacker.com — and slackDownloadToFile must surface a redirect
+// rejection error without writing dest. gc-vrw.
+func TestSlackHTTPClientRejectsRedirectEndToEnd(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			t.Errorf("expected bot token on initial hop, got empty Authorization")
+		}
+		w.Header().Set("Location", "https://attacker.com/leak")
+		w.WriteHeader(http.StatusFound)
+	}))
+	t.Cleanup(stub.Close)
+
+	stubURL := mustParseURL(t, stub.URL)
+	prevURL := validateSlackFileURL
+	validateSlackFileURL = func(rawURL string) (bool, error) {
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return false, err
+		}
+		return u.Host == stubURL.Host, nil
+	}
+	prevIP := slackDialIPGuard
+	slackDialIPGuard = func(net.IP) bool { return false }
+	t.Cleanup(func() {
+		validateSlackFileURL = prevURL
+		slackDialIPGuard = prevIP
+	})
+
+	dest := filepath.Join(t.TempDir(), "redirected")
+	err := slackDownloadToFile("xoxb-fake-bot-token", stub.URL+"/files/F1", dest)
+	if err == nil {
+		t.Fatal("expected redirect rejection, got nil error")
+	}
+	if !strings.Contains(err.Error(), "redirect") {
+		t.Errorf("expected redirect-rejection error, got: %v", err)
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Errorf("dest file %q should not exist after rejection, stat err: %v", dest, statErr)
+	}
+}
+
+func mustParseURL(t *testing.T, s string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(s)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", s, err)
+	}
+	return u
 }
 
 func TestSlackKindFromChannelType(t *testing.T) {
