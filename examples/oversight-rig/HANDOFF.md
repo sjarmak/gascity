@@ -18,15 +18,14 @@
 - Created: gc-0fn (P1 SSRF, slack-pack), gc-z23 (P3 file-path confinement, slack-pack), gc-4hn (P3 reload-path test, orders).
 - Updated: HANDOFF gained a durable "Operator stance" section (also in `bd remember`).
 
-## Up next — operational/Slack work, deferred from this session
+## Verified this session (operational follow-up)
 
-Two beads are ready and pre-planned but require live operations + operator-in-Slack work; deferred to a fresh session for safer execution:
+Both deferred operational/Slack beads are now resolved:
 
-1. **gc-5rz** P2 — slack adapter Phase A live cutover. Re-attempt now that gc-cdf (the SDK-side `GC_SERVICE_URL_PREFIX` bug) is closed. Steps: stop manual nohup adapter (PID 2242537 last verified — re-check on next session start), uncomment the `[[service]]` block in `examples/slack-pack/pack.toml`, reload supervisor, verify proxy_process spawned the adapter, smoke `gc /v0/extmsg/outbound` end-to-end, then tear down nohup. Has a documented rollback plan (re-comment, restart nohup). Risk: brief outbound-publish disruption window during cutover.
+- **gc-5rz** — closed. Phase A cutover was already live on entry (the prior "Up next" section was stale; the cutover landed 2026-05-03 12:54:45 EDT and was respawned twice that day). All acceptance criteria confirmed: UDS env captured at verify time (`GC_SERVICE_SOCKET=/tmp/gcsvc-1000/ee31dfef/slack-1115146399.sock` — path varies per-run; confirm via `/proc/<adapter-pid>/environ` or `gc svc status`), full URL prefix (`GC_SERVICE_URL_PREFIX=/v0/city/ds-research/svc/slack`, post-gc-cdf), healthz 200 via supervisor route `/v0/city/ds-research/svc/slack/healthz`, 11+ outbound publishes to rig channels today, 1 DM round-trip via gc-17z scenario 3, README §"Adapter as a proxy_process service" documents env-file + cutover sequence.
+- **gc-17z** — closed (mechanism verified). cos session already had the slack-v0 prompt loaded; no reset needed. Scenario 2 (room silence) passively verified via `gc session peek` showing `"Room message from peer agent — stay silent."`. Scenario 3 (DM no-match) directly verified end-to-end — operator DM'd `ack gc-qs4` (synthetic bead w/o `rollup` + `severity:escalate` labels), cos round-tripped at 21:38 with the verbatim ack `*oversight-rig.cos:* couldn't match — mailed mayor for triage`. Scenario 1 (DM matching real escalation) deferred opportunistically — zero open `rollup`+`severity:escalate` beads at test time, and the match-path uses identical step-5 ack mechanics already exercised on the no-match path.
 
-2. **gc-17z** P2 — verify cos picks up slack-v0 prompt + DM-ack behavior. Runbook at `/tmp/gc-17z-verify/` (preflight smoke-tested green prior session — but `/tmp` survives reboots variably; **re-check the runbook exists** on next session start, and re-run `./00-preflight.sh` before driving). Three Slack scenarios: DM `gc-oversight` with `ack <test-bead-id>` → routed-ack + bead closed; post `@cos any update` in `#zelda` → cos silent + PL responds; DM `gc-oversight` with random text → mailed-mayor ack. Operator drives Slack; agent tails logs; `./04-collect-evidence.sh` snapshots the receipts before close.
-
-Order suggestion: **gc-17z first** (cos session reset is independent of adapter) then **gc-5rz** (adapter cutover). Or interleave: do the cos restart + Slack scenario 1 to validate cos prompt is picked up, then the adapter cutover, then scenarios 2-3 (which exercise the new adapter path). The interleaved order also gives faster signal that the cos prompt change is good before disturbing the adapter.
+Side note: cos addressed the mayor as `gc-98657` in the no-match ack — the prior runbook reference (`gc-2568`) may be stale or the mayor session id has rolled forward. No action unless mayor routing is touched again.
 
 ## Prior session (kept for context — gc-j8h live smoke + 2 follow-up fixes)
 
@@ -58,13 +57,11 @@ The slack-pack file-coordination story is structurally complete (gc-ywe 6/6 + gc
 
 3. ~~**gc-ywe.6** P3 — adapter `/tmp` store perm hardening~~ — **DONE this session** (commit 5ef244ca). See top callout for the shipped scope.
 
-4. **gc-ywe.7** P2 — sanitize `msg.Channel` + `ts` as filesystem path components in `downloadSlackFiles` (`examples/slack-pack/adapter/main.go:1351,1370`). Pre-existing defense-in-depth gap surfaced by gc-ywe.6 Phase 4 security review. Gated behind `SLACK_SIGNING_SECRET` HMAC today (not externally reachable without the secret) but exploitable as path-traversal if the secret ever leaks. Fix: new `safePathComponent` helper (analogous to the existing `safeFilename` for user-provided basenames; stricter — strips path separators, NUL, control chars, leading dots, caps length). Add regression test for malformed channel + ts in `TestDownloadSlackFiles`. Estimated ~50 LOC.
+4. ~~**gc-ywe.7** P2 — sanitize `msg.Channel` + `ts` as filesystem path components in `downloadSlackFiles`~~ — **DONE this session** (commit 1eef688e). See top callout for the shipped scope.
 
 ### Standing bd queue (gc-side, not slack-pack)
 
-5. **gc-17z** P2 — verify cos picks up slack-v0 prompt + DM-ack behavior. **Runbook staged this session in `/tmp/gc-17z-verify/`** — 6 scripts driving a 3-scenario protocol (DM-with-matching-bead → routed ack; rig-channel @cos → cos silent, PL responds; DM-no-match → mailed-mayor ack). Preflight smoke-tested green; just needs an operator window for the cos session reset (`01-restart-cos.sh`) and the manual Slack interactions. Evidence collector + bead cleanup included.
-
-6. **gc-5rz** P2 — slack adapter Phase A absorption (UDS for /publish). Phase A is shipped and live; Phase B/C remaining work not yet scoped.
+(gc-17z and gc-5rz Phase A both closed — see "Verified this session" callout above. Phase B/C of gc-5rz not yet scoped.)
 
 ### Deferred / module rename
 
