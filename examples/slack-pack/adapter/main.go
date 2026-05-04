@@ -1007,7 +1007,9 @@ func handlePublishFile(cfg config, reg *identityRegistry) http.HandlerFunc {
 // Returns an error when:
 //   - root or path is empty
 //   - either path can't be made absolute
-//   - cleaned path is not equal to root and not a strict descendant
+//   - cleaned path is equal to root itself (the root is not an
+//     uploadable file even when downstream IsDir would later reject it)
+//   - cleaned path is not a strict descendant of root
 //
 // The returned path is the cleaned absolute form, suitable for passing
 // to os.Stat / os.ReadFile.
@@ -1038,10 +1040,12 @@ func confineFileUploadPath(root, path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("computing relative path: %w", err)
 	}
-	// rel == "." means path == root (a directory). Anything that
-	// starts with ".." has escaped. An absolute rel (Windows volume
-	// crossing) is also out of bounds.
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+	// Reject the root itself: the helper's contract is "file inside
+	// root", and any caller that later treats the returned path as a
+	// regular file would otherwise be set up for surprise on
+	// directory-typed paths. Anything starting with ".." has escaped.
+	// An absolute rel (Windows volume crossing) is also out of bounds.
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("path %q is outside root %q", pathAbs, rootAbs)
 	}
 	return pathAbs, nil
@@ -1685,7 +1689,14 @@ func slackDownloadToFile(token, urlPrivate, dest string) error {
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("GET %s: %s — %s", urlPrivate, resp.Status, string(respBody))
+		// Redact url_private query string before logging — Slack CDN
+		// links can carry t=xoxe-... user tokens that must not reach
+		// the structured error reaching log.Printf upstream.
+		safeURL := urlPrivate
+		if u, perr := url.Parse(urlPrivate); perr == nil {
+			safeURL = u.Redacted()
+		}
+		return fmt.Errorf("GET %s: %s — %s", safeURL, resp.Status, string(respBody))
 	}
 	tmp := dest + ".tmp"
 	// 0o600: file content may be DM-private; rename below preserves this mode. gc-ywe.6.
@@ -1708,21 +1719,30 @@ func slackDownloadToFile(token, urlPrivate, dest string) error {
 	return nil
 }
 
+// cgnat100_64 is RFC 6598 (100.64.0.0/10), the IPv4 carrier-grade NAT
+// space. net.IP.IsPrivate does not cover this range, but Tailscale
+// assigns 100.64.x.x addresses to peers and this adapter is documented
+// as deployable behind Tailscale Funnel. A url_private host that briefly
+// resolves to a Tailscale peer is exactly the DNS-rebinding case the
+// dial guard exists to defeat. gc-vrw review.
+var cgnat100_64 = &net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
+
 // isPrivateOrLoopbackIP reports whether ip falls into a range that the
 // adapter must never dial when fetching url_private. The set covers
 // IPv4 RFC1918 (10/8, 172.16/12, 192.168/16) and IPv6 unique-local
-// (fc00::/7) via net.IP.IsPrivate; loopback (127/8, ::1) via
-// IsLoopback; link-local unicast (169.254/16, fe80::/10) and
+// (fc00::/7) via net.IP.IsPrivate; RFC 6598 carrier-grade NAT
+// (100.64.0.0/10) including Tailnet peer ranges; loopback (127/8, ::1)
+// via IsLoopback; link-local unicast (169.254/16, fe80::/10) and
 // link-local/interface-local multicast; and the unspecified address
 // (0.0.0.0, ::). Public unicast addresses, including legitimate Slack
 // CDN ranges, return false.
 //
 // The check is by address only — there is no DNS or hostname lookup
-// here. It is invoked from net.Dialer.Control after Go's resolver has
-// produced a candidate address but before the connect syscall, so a
-// hostname that briefly resolves to a private IP (DNS rebinding) is
-// caught at the dial step regardless of how the URL was validated.
-// gc-vrw.
+// here. It is invoked from net.Dialer.ControlContext after Go's
+// resolver has produced a candidate address but before the connect
+// syscall, so a hostname that briefly resolves to a private IP (DNS
+// rebinding) is caught at the dial step regardless of how the URL was
+// validated. gc-vrw.
 func isPrivateOrLoopbackIP(ip net.IP) bool {
 	if ip == nil {
 		return true
@@ -1731,6 +1751,9 @@ func isPrivateOrLoopbackIP(ip net.IP) bool {
 		return true
 	}
 	if ip.IsPrivate() {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil && cgnat100_64.Contains(v4) {
 		return true
 	}
 	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
@@ -1758,15 +1781,27 @@ func isPrivateOrLoopbackIP(ip net.IP) bool {
 //     header. This policy aborts the redirect with a typed error
 //     before the second hop is dialed.
 //
-// The function returns a fresh client per call rather than a shared
-// singleton because the cost is negligible (Transport reuse is per-
-// process via the underlying default DialContext semantics) and a
-// fresh client keeps test isolation simple. gc-vrw.
+// The function returns a fresh client per call. Each call constructs a
+// new http.Transport with its own idle-connection pool, so connection
+// reuse across calls is intentionally sacrificed for test isolation
+// simplicity. The cost is one TCP+TLS handshake per Slack file
+// download, which is negligible against the file payload itself. If
+// burst download throughput becomes a concern, promote the client to
+// a process singleton — slackDialIPGuard already provides the test
+// indirection a singleton would need.
+//
+// HTTP proxy environment variables (HTTP_PROXY / HTTPS_PROXY) are
+// intentionally NOT honored: a private-IP proxy would bypass the
+// dial-time IP guard, since net.Dialer.ControlContext sees the proxy
+// address rather than the final Slack target. The slack-pack adapter
+// reaches Slack CDN hosts directly in every supported deployment, so
+// proxy support is unnecessary and removing it eliminates a real
+// SSRF bypass. gc-vrw review.
 func buildSlackHTTPClient() *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
-		Control: func(network, address string, _ syscall.RawConn) error {
+		ControlContext: func(_ context.Context, network, address string, _ syscall.RawConn) error {
 			host, _, err := net.SplitHostPort(address)
 			if err != nil {
 				return fmt.Errorf("dial %s %s: split host/port: %w", network, address, err)
@@ -1774,8 +1809,9 @@ func buildSlackHTTPClient() *http.Client {
 			ip := net.ParseIP(host)
 			if ip == nil {
 				// net.Dialer resolves to literal IPs before invoking
-				// Control, so a non-IP host here is a programming
-				// error or an unexpected resolver result — fail closed.
+				// ControlContext, so a non-IP host here is a
+				// programming error or an unexpected resolver result —
+				// fail closed.
 				return fmt.Errorf("dial %s %s: refusing to dial non-literal address %q", network, address, host)
 			}
 			if slackDialIPGuard(ip) {
@@ -1785,7 +1821,7 @@ func buildSlackHTTPClient() *http.Client {
 		},
 	}
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		// Proxy intentionally nil — see function doc.
 		DialContext:           dialer.DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
@@ -1794,6 +1830,10 @@ func buildSlackHTTPClient() *http.Client {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	return &http.Client{
+		// Bound the whole round-trip including response-body read.
+		// 5 minutes accommodates a slow ~1 GB Slack file at modest
+		// throughput; legitimate downloads finish well inside this.
+		Timeout:   5 * time.Minute,
 		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {

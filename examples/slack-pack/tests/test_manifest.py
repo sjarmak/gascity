@@ -59,16 +59,31 @@ def test_manifest_declares_bot_scopes(manifest: dict) -> None:
     # Every scope the live adapter actually relies on must be present.
     # If the adapter starts using something new, add it here AND to the
     # manifest in the same change.
+    # Each subscribed message.* bot event Slack delivers requires the
+    # matching *:history scope on the install. If we subscribe to
+    # message.channels but only declare im:history, Slack rejects the
+    # install or silently drops the channel subscription. Lock the
+    # invariant scope-by-event into this assertion.
     required = {
+        "channels:history",
         "chat:write",
         "chat:write.customize",
         "files:read",
         "files:write",
+        "groups:history",
         "im:history",
+        "mpim:history",
         "reactions:write",
     }
     missing = required - set(scopes)
     assert not missing, f"manifest missing required bot scopes: {sorted(missing)}"
+    # im:read was historically declared but no adapter code path uses
+    # it (DMs flow through im:history events). Guard against re-adding
+    # an over-broad scope without a justifying call site.
+    assert "im:read" not in scopes, (
+        "im:read is over-broad — adapter has no im.list / conversations.open "
+        "call site. Remove it or open a bead documenting the planned use."
+    )
 
 
 def test_manifest_scopes_unique_and_sorted(manifest: dict) -> None:
@@ -86,8 +101,16 @@ def test_manifest_subscribes_to_required_bot_events(manifest: dict) -> None:
     assert isinstance(events, list) and events, (
         "settings.event_subscriptions.bot_events must be a non-empty array"
     )
-    # The adapter dispatches on these channel-type buckets + app_mention.
-    required = {"app_mention", "message.im"}
+    # The adapter dispatches across all four message channel-type
+    # buckets plus app_mention. Drop one and that channel type goes
+    # silent; the assertion locks the full set in.
+    required = {
+        "app_mention",
+        "message.channels",
+        "message.groups",
+        "message.im",
+        "message.mpim",
+    }
     missing = required - set(events)
     assert not missing, f"manifest missing required bot events: {sorted(missing)}"
 

@@ -18,7 +18,12 @@ Schema reference: <https://api.slack.com/reference/manifests>
   that command lands. Until then, the slack-pack does not expose any
   `/gc …` shortcuts in Slack.
 - **`oauth_config.scopes.bot`** — the minimal scope set the live
-  adapter (`examples/slack-pack/adapter/main.go`) requires today:
+  adapter (`examples/slack-pack/adapter/main.go`) requires today.
+  Each `*:history` scope pairs with the matching `message.*` event
+  subscription below — Slack rejects an install whose subscriptions
+  exceed its scopes, so the two lists must move together.
+  - `channels:history` — read public channel messages (pairs with
+    `message.channels`)
   - `chat:write` — post messages
   - `chat:write.customize` — per-session display-name + avatar overrides
   - `commands` — placeholder for the slash-command surface; required
@@ -26,8 +31,11 @@ Schema reference: <https://api.slack.com/reference/manifests>
   - `files:read` — download user-uploaded files referenced by inbound
     `message` events
   - `files:write` — upload files via `gc slack upload`
-  - `im:history` — read DM history (inbound replies)
-  - `im:read` — open/list DM channels
+  - `groups:history` — read private channel messages (pairs with
+    `message.groups`)
+  - `im:history` — read DM history (pairs with `message.im`)
+  - `mpim:history` — read multi-party DM messages (pairs with
+    `message.mpim`)
   - `reactions:write` — `gc slack react` emoji ack
 - **`settings.event_subscriptions.bot_events`** — the events the
   adapter actually dispatches on (see `processSlackEvent` in

@@ -2358,7 +2358,7 @@ func TestSlackDownloadToFileRejectsNonSlackHostHTTPS(t *testing.T) {
 	if capturedAuth != "" {
 		t.Errorf("bot token leaked in Authorization header: %q", capturedAuth)
 	}
-	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(dest); !errors.Is(statErr, os.ErrNotExist) {
 		t.Errorf("dest file %q should not exist after rejection, stat err: %v", dest, statErr)
 	}
 }
@@ -2379,6 +2379,9 @@ func TestIsPrivateOrLoopbackIP(t *testing.T) {
 		{"private 172.16/12", "172.16.0.1", true},
 		{"private 192.168/16", "192.168.1.1", true},
 		{"link-local v4", "169.254.169.254", true},
+		{"cgnat 100.64/10 low", "100.64.0.1", true},
+		{"cgnat 100.64/10 mid", "100.96.0.1", true},
+		{"cgnat 100.64/10 high", "100.127.255.254", true},
 		{"unspecified v4", "0.0.0.0", true},
 		{"loopback v6", "::1", true},
 		{"link-local v6", "fe80::1", true},
@@ -2388,6 +2391,8 @@ func TestIsPrivateOrLoopbackIP(t *testing.T) {
 
 		{"public v4 google", "8.8.8.8", false},
 		{"public v4 cloudflare", "1.1.1.1", false},
+		{"public 100/8 below cgnat", "100.63.255.254", false},
+		{"public 100/8 above cgnat", "100.128.0.1", false},
 		{"public v6 google", "2001:4860:4860::8888", false},
 		{"public v6 cloudflare", "2606:4700:4700::1111", false},
 	}
@@ -2419,6 +2424,7 @@ func TestSlackHTTPClientDialRefusesPrivateIP(t *testing.T) {
 		{"loopback v4", "127.0.0.1:443"},
 		{"private 10/8", "10.1.2.3:443"},
 		{"link-local v4", "169.254.169.254:443"},
+		{"cgnat 100.64/10", "100.64.1.2:443"},
 		{"loopback v6", "[::1]:443"},
 		{"link-local v6", "[fe80::1]:443"},
 	}
@@ -2529,7 +2535,7 @@ func TestSlackHTTPClientRejectsRedirectEndToEnd(t *testing.T) {
 	if !strings.Contains(err.Error(), "redirect") {
 		t.Errorf("expected redirect-rejection error, got: %v", err)
 	}
-	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(dest); !errors.Is(statErr, os.ErrNotExist) {
 		t.Errorf("dest file %q should not exist after rejection, stat err: %v", dest, statErr)
 	}
 }
