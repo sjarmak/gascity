@@ -789,6 +789,48 @@ func TestDispatchToAliasedSession(t *testing.T) {
 	}
 }
 
+// TestDispatchToAliasedSessionEscapesPathSegments verifies that cityName and
+// sessionID values containing URL-significant characters are percent-encoded
+// in the constructed dispatch URL (sec-S-06). The receiver decodes them and
+// observes the original logical values via r.URL.Path.
+func TestDispatchToAliasedSessionEscapesPathSegments(t *testing.T) {
+	var rawPath, decodedPath string
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawPath = r.URL.EscapedPath()
+		decodedPath = r.URL.Path
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	// cityName + sessionID intentionally include characters that would
+	// otherwise alter URL routing if interpolated raw: '/', '%', ' '.
+	cfg := config{gcAPIBase: gcStub.URL, cityName: "city/with slash"}
+	inbound := externalInboundMessage{
+		ProviderMessageID: "1.0",
+		Conversation:      conversationRef{ConversationID: "C1"},
+		Actor:             externalActor{ID: "U1"},
+		Text:              "hello",
+	}
+	dispatchToAliasedSession(cfg, "gc/2568%evil", inbound, "mayor")
+
+	// EscapedPath preserves percent-encoding; assert the raw form contains
+	// the encoded delimiters so the receiver-side router cannot be tricked
+	// by an embedded slash or percent.
+	wantRawCity := "city%2Fwith%20slash"
+	wantRawSession := "gc%2F2568%25evil"
+	if !strings.Contains(rawPath, wantRawCity) {
+		t.Errorf("raw path %q missing escaped cityName %q", rawPath, wantRawCity)
+	}
+	if !strings.Contains(rawPath, wantRawSession) {
+		t.Errorf("raw path %q missing escaped sessionID %q", rawPath, wantRawSession)
+	}
+	// Decoded path should round-trip to the original logical values.
+	wantDecoded := "/v0/city/city/with slash/session/gc/2568%evil/messages"
+	if decodedPath != wantDecoded {
+		t.Errorf("decoded path = %q, want %q", decodedPath, wantDecoded)
+	}
+}
+
 func TestIdentityRegistryDelete(t *testing.T) {
 	store := filepath.Join(t.TempDir(), "identities.json")
 	reg, err := newIdentityRegistry(store)

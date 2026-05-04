@@ -346,8 +346,13 @@ func dispatchSlashCommandToSession(cfg config, sessionID, command, text, channel
 		log.Printf("slack interactions: marshal session-message body: %v", err)
 		return
 	}
+	// PathEscape cityName and sessionID so URL-significant characters
+	// (slash, percent, etc.) cannot alter routing on the gc API side
+	// (sec-S-06). cityName comes from operator config and sessionID is
+	// currently always gc-internal, but the registry is operator-editable
+	// and future cby work may let external systems supply session ids.
 	target := fmt.Sprintf("%s/v0/city/%s/session/%s/messages",
-		cfg.gcAPIBase, cfg.cityName, sessionID)
+		cfg.gcAPIBase, url.PathEscape(cfg.cityName), url.PathEscape(sessionID))
 	req, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(payload))
 	if err != nil {
 		log.Printf("slack interactions: build session-message request: %v", err)

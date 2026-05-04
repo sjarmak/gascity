@@ -2547,9 +2547,14 @@ func dispatchToAliasedSession(cfg config, sessionID string, msg externalInboundM
 		msg.ProviderMessageID,
 	)
 	payload, _ := json.Marshal(gcSessionMessageRequest{Message: body})
-	url := fmt.Sprintf("%s/v0/city/%s/session/%s/messages",
-		cfg.gcAPIBase, cfg.cityName, sessionID)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+	// PathEscape cityName and sessionID so URL-significant characters
+	// (slash, percent, etc.) cannot alter routing on the gc API side
+	// (sec-S-06). cityName comes from operator config and sessionID is
+	// currently always gc-internal, but the registry is operator-editable
+	// and future cby work may let external systems supply session ids.
+	target := fmt.Sprintf("%s/v0/city/%s/session/%s/messages",
+		cfg.gcAPIBase, url.PathEscape(cfg.cityName), url.PathEscape(sessionID))
+	req, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(payload))
 	if err != nil {
 		log.Printf("alias dispatch: build request: %v", err)
 		return
@@ -2558,13 +2563,13 @@ func dispatchToAliasedSession(cfg config, sessionID string, msg externalInboundM
 	req.Header.Set("X-GC-Request", "gc-slack-adapter-alias")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Printf("alias dispatch: POST %s: %v", url, err)
+		log.Printf("alias dispatch: POST %s: %v", target, err)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(resp.Body)
-		log.Printf("alias dispatch: %s -> %s: %s", url, resp.Status, string(respBody))
+		log.Printf("alias dispatch: %s -> %s: %s", target, resp.Status, string(respBody))
 		return
 	}
 	log.Printf("alias dispatch: handle=%s -> session=%s OK", handle, sessionID)

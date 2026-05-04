@@ -545,3 +545,53 @@ func TestChannelMappingRegistryRejectsUnknownField(t *testing.T) {
 		t.Fatal("expected error for unknown field, got nil")
 	}
 }
+
+// TestDispatchSlashCommandToSessionEscapesPathSegments verifies that
+// cityName and sessionID values containing URL-significant characters
+// are percent-encoded in the constructed dispatch URL (sec-S-06). The
+// receiver decodes them and observes the original logical values via
+// r.URL.Path.
+func TestDispatchSlashCommandToSessionEscapesPathSegments(t *testing.T) {
+	rawPathCh := make(chan string, 1)
+	decodedPathCh := make(chan string, 1)
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusAccepted)
+		select {
+		case rawPathCh <- r.URL.EscapedPath():
+		default:
+		}
+		select {
+		case decodedPathCh <- r.URL.Path:
+		default:
+		}
+	}))
+	t.Cleanup(gcStub.Close)
+
+	cfg := config{gcAPIBase: gcStub.URL, cityName: "city/with slash"}
+	dispatchSlashCommandToSession(cfg, "gc/2568%evil", "/gc", "fix the build", "C1", "T1", "U1")
+
+	var rawPath, decodedPath string
+	select {
+	case rawPath = <-rawPathCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatch goroutine did not POST to gc stub within 2s")
+	}
+	select {
+	case decodedPath = <-decodedPathCh:
+	default:
+	}
+
+	wantRawCity := "city%2Fwith%20slash"
+	wantRawSession := "gc%2F2568%25evil"
+	if !strings.Contains(rawPath, wantRawCity) {
+		t.Errorf("raw path %q missing escaped cityName %q", rawPath, wantRawCity)
+	}
+	if !strings.Contains(rawPath, wantRawSession) {
+		t.Errorf("raw path %q missing escaped sessionID %q", rawPath, wantRawSession)
+	}
+	wantDecoded := "/v0/city/city/with slash/session/gc/2568%evil/messages"
+	if decodedPath != wantDecoded {
+		t.Errorf("decoded path = %q, want %q", decodedPath, wantDecoded)
+	}
+}
