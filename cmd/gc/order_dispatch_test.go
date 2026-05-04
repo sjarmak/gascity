@@ -3602,9 +3602,9 @@ func TestOrderDispatchFiresAfterWorkClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ran := false
+	ran := make(chan struct{})
 	fakeExec := func(_ context.Context, _, _ string, _ []string) ([]byte, error) {
-		ran = true
+		close(ran)
 		return nil, nil
 	}
 
@@ -3618,9 +3618,12 @@ func TestOrderDispatchFiresAfterWorkClosed(t *testing.T) {
 
 	// Use a future "now" so cooldown trigger sees the seed bead as old enough.
 	ad.dispatch(context.Background(), t.TempDir(), time.Now().Add(5*time.Second))
-	time.Sleep(100 * time.Millisecond)
 
-	if !ran {
+	// Wait for the dispatchOne goroutine to call fakeExec. Closing the channel
+	// from the worker establishes a happens-before edge for the test goroutine.
+	select {
+	case <-ran:
+	case <-time.After(2 * time.Second):
 		t.Error("exec should have run — all previous work is closed")
 	}
 }
