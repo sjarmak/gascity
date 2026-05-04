@@ -42,6 +42,7 @@ Two commits on `fork/feat/oversight-rig-pack` from the prior session:
 - Created: **gc-1b2.1** (P3, concurrent-invocation lock follow-up), **gc-1b2.2** (P3, DRY rig-fixture test helper), **gc-1b2.3** (P3, code-reviewer LOW polish — function-redef in loop + per-rig `bd list` hoist + split skip actions for unparseable timestamps).
 - Wave commits: `43d2b319` (gc-1b2 base), `016ab2a1` (gc-udx base), `3ee0f7be` (Phase 4 hardening), `66e4035f` (`--no-ff` merge).
 - Phase 4 unified review (3 reviewers in parallel against the combined diff): 0 CRITICAL, 7 HIGH (4 security, 2 go-test, 1 cross-cutting code) — all fixed before merge in `3ee0f7be`. 8 MEDIUM — most fixed in same commit, 3 deferred to gc-1b2.{1,2,3}.
+- Filed **gc-cby epic** (P2) — `slack-pack utility parity with discord pack for human coordination` — with 7 new child beads scoping the deferred command surface (`import-app`, `sync-commands`, `map-channel`, `map-rig`, `enable-room-launch`, `post-message`, `retry-peer-fanout`) plus reparented gc-vrw + gc-z23. Hard dep: gc-cby.2 blocked-by gc-cby.1 (sync-commands needs the imported manifest). See "Up next" below.
 
 ### Prior-session glance (gc-0fn / gc-5rz / gc-17z)
 
@@ -67,19 +68,42 @@ Live smoke is now **PASS** for the gc-j8h acceptance criteria — see "gc-j8h sm
 
 ## Up next (recommended dispatch)
 
-The slack-pack file-coordination story is structurally complete (gc-ywe 6/6 + gc-j8h closed + live-smoked + CSRF blocker removed). Remaining work is dominated by the inbound-file smoke and the one P3 hardening bead. Surface area, ranked by user impact:
+The slack-pack file-coordination story is structurally complete (gc-ywe 6/6 + gc-j8h closed + live-smoked + CSRF blocker removed). The remaining slack-pack work is now tracked under a single epic: **gc-cby — slack-pack utility parity with discord pack for human coordination.** Goal: bring `examples/slack-pack/` to feature parity with the upstream discord pack so Slack becomes a complete human-coordination surface (humans drive work via Slack alone, no parallel CLI required). When all gc-cby children close, the README's "Scope: not yet at parity" banner can be removed.
 
-### Day-to-day coordination smokes (priority work — no code)
+### gc-cby children (9 total)
 
-1. ~~**Live-smoke the gc-routed outbound file path** (operational)~~ — **DONE this session.** See "gc-j8h smoke results" below. Acceptance points (a) and (b) confirmed; (c) is structurally inert because every active binding in this deployment is 1:1 (no multi-session rooms) — peer-fanout subscriber path is code-reviewed but not exercised live. Open a multi-session room (e.g. `gc slack bind-room <C…> mayor zeldascension/oversight-rig.project-lead`) to drive (c) end-to-end if needed.
+**B-bucket — slash-command intake (parity-critical for the human-coordination goal):**
+- **gc-cby.1 P2** `gc slack import-app` — import Slack app manifest into gc (foundation; blocks .2)
+- **gc-cby.2 P2** `gc slack sync-commands` — register slash commands with Slack (blocked by .1)
+- **gc-cby.3 P2** `gc slack map-channel` — bind a channel to a session/rig for slash dispatch
+- **gc-cby.4 P2** `gc slack map-rig` — bind a channel set to a rig for slash dispatch
+
+**A-bucket — launcher mode:**
+- **gc-cby.5 P2** `gc slack enable-room-launch` — `@@handle` thread-scoped session spawning (the fabric design doc already names `GroupModeLauncher`; this is the slack-pack glue)
+
+**C-bucket — operational tooling:**
+- **gc-cby.6 P3** `gc slack post-message` — workflow status projection to a Slack channel (Block Kit rendering)
+- **gc-cby.7 P3** `gc slack retry-peer-fanout` — retry failed peer-fanout deliveries
+
+**D-bucket — defense-in-depth hardening (existing P3 follow-ups, reparented to gc-cby this session):**
+- **gc-vrw P3** — slackDownloadToFile DNS rebinding + redirect-following defense
+- **gc-z23 P3** — handlePublishFile FilePath allowlist confinement
+
+Suggested dispatch order: B-bucket first (.1 → .2 → .{3,4} parallel), then A-bucket (.5), then C-bucket + D-bucket as background. B-bucket is what unlocks "humans use only Slack to drive work" — without slash commands they always need a parallel CLI window. A-bucket adds ad-hoc thread-scoped session spawning. C and D are post-parity polish.
+
+Authoritative gap source-of-truth: `examples/slack-pack/README.md` § "Not yet implemented (planned)" + `pack.toml` header comment. The list was cross-checked against bd this session — no other slack-pack work was filed and dropped on the floor.
+
+### Day-to-day coordination smokes (priority work — no code, not bd-tracked)
+
+1. ~~**Live-smoke the gc-routed outbound file path** (operational)~~ — **DONE.** See "gc-j8h smoke results" below. Acceptance points (a) and (b) confirmed; (c) is structurally inert because every active binding in this deployment is 1:1 (no multi-session rooms). Open a multi-session room (e.g. `gc slack bind-room <C…> mayor zeldascension/oversight-rig.project-lead`) to drive (c) end-to-end if needed.
 
 2. **Live-smoke the inbound file download path** (operational, surviving from prior handoff). `files:read` is granted; the adapter code is in place; the retention janitor is active. Confirm `inbound: chan=... files=N text=...ch` log line + `/tmp/gc-slack-adapter/inbound/<channel-id>/` artifact + the receiving PL's session log shows `attachments[0].url=file:///...`. Not a bead — drive once when next convenient.
 
-### Quality / hardening
+### Quality / hardening (historical, kept for context)
 
-3. ~~**gc-ywe.6** P3 — adapter `/tmp` store perm hardening~~ — **DONE this session** (commit 5ef244ca). See top callout for the shipped scope.
+3. ~~**gc-ywe.6** P3 — adapter `/tmp` store perm hardening~~ — **DONE** (commit 5ef244ca).
 
-4. ~~**gc-ywe.7** P2 — sanitize `msg.Channel` + `ts` as filesystem path components in `downloadSlackFiles`~~ — **DONE this session** (commit 1eef688e). See top callout for the shipped scope.
+4. ~~**gc-ywe.7** P2 — sanitize `msg.Channel` + `ts` as filesystem path components in `downloadSlackFiles`~~ — **DONE** (commit 1eef688e).
 
 ### Standing bd queue (gc-side, not slack-pack)
 
