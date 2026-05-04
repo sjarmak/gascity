@@ -352,6 +352,9 @@ func TestSlackMapRigRemoveChannelsEmptyAfterDeletesRecord(t *testing.T) {
 	if !strings.Contains(stdout, "Removed rig mapping alpha") {
 		t.Errorf("stdout = %q, want substring 'Removed rig mapping alpha' (record deleted because channel set became empty)", stdout)
 	}
+	if !strings.Contains(stdout, slackMapRigRestartHint) {
+		t.Errorf("stdout missing restart hint after empty-after deletion: %q", stdout)
+	}
 	reg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
 	if _, ok := reg.Get("T1", "alpha"); ok {
 		t.Errorf("record should be deleted after channel set became empty")

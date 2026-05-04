@@ -63,6 +63,13 @@ record (or unknown channel) is a silent no-op. --remove,
 	cmd.Flags().StringSliceVar(&removeChannels, "remove-channels", nil,
 		"Drop these channels from the rig's set; if the set becomes empty the record is deleted (idempotent; mutually exclusive with --channel and --remove)")
 	_ = cmd.MarkFlagRequired("workspace-id")
+	// Three-way mutual exclusion: --remove drops the whole record;
+	// --remove-channels drops a subset; --channel adds/replaces.
+	// Cobra surfaces these as parse-time errors with standardized
+	// text, matching cmd_slack_map_channel.go's --rig/--session pair.
+	cmd.MarkFlagsMutuallyExclusive("remove", "remove-channels")
+	cmd.MarkFlagsMutuallyExclusive("remove", "channel")
+	cmd.MarkFlagsMutuallyExclusive("remove-channels", "channel")
 	return cmd
 }
 
@@ -73,12 +80,8 @@ func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, chann
 	}
 
 	if remove {
-		if len(channels) > 0 {
-			return fmt.Errorf("--remove cannot be combined with --channel; use --remove alone to drop the rig record")
-		}
-		if len(removeChannels) > 0 {
-			return fmt.Errorf("--remove cannot be combined with --remove-channels; use one or the other")
-		}
+		// Mutual exclusion enforced at parse time by cobra
+		// MarkFlagsMutuallyExclusive (see newSlackMapRigCmd).
 		reg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityPath))
 		if err != nil {
 			return fmt.Errorf("open slack rig mapping registry: %w", err)
@@ -97,9 +100,6 @@ func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, chann
 	}
 
 	if len(removeChannels) > 0 {
-		if len(channels) > 0 {
-			return fmt.Errorf("--remove-channels cannot be combined with --channel; use --remove-channels alone to drop a subset")
-		}
 		return runSlackMapRigRemoveChannels(stdout, cityPath, rigName, workspaceID, removeChannels)
 	}
 

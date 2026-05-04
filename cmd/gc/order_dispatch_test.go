@@ -3624,7 +3624,7 @@ func TestOrderDispatchFiresAfterWorkClosed(t *testing.T) {
 	select {
 	case <-ran:
 	case <-time.After(2 * time.Second):
-		t.Error("exec should have run — all previous work is closed")
+		t.Fatal("exec should have run — all previous work is closed")
 	}
 }
 

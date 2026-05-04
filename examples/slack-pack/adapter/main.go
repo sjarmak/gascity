@@ -375,16 +375,15 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 	// disabling dispatch (cap=0 -> always-drop) is almost certainly a
 	// misconfiguration, and a non-numeric value usually means the
 	// operator typo'd the var name. sec-S-04.
-	if raw := envOrFn("SLACK_DISPATCH_CONCURRENCY", "50"); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil {
-			return cfg, fmt.Errorf("SLACK_DISPATCH_CONCURRENCY %q is not an integer: %w", raw, err)
-		}
-		if n <= 0 {
-			return cfg, fmt.Errorf("SLACK_DISPATCH_CONCURRENCY must be > 0, got %d", n)
-		}
-		cfg.dispatchConcurrency = n
+	raw := envOrFn("SLACK_DISPATCH_CONCURRENCY", "50")
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return cfg, fmt.Errorf("SLACK_DISPATCH_CONCURRENCY %q is not an integer: %w", raw, err)
 	}
+	if n <= 0 {
+		return cfg, fmt.Errorf("SLACK_DISPATCH_CONCURRENCY must be > 0, got %d", n)
+	}
+	cfg.dispatchConcurrency = n
 
 	if cfg.serviceSocket != "" {
 		// proxy_process mode: gc reaches us via $GC_API_BASE_URL +
@@ -1476,10 +1475,13 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry) http.HandlerFu
 				capacity, env.Type)
 			return
 		}
-		go func() {
-			defer release()
-			processSlackEvent(cfg, aliasReg, env)
-		}()
+		// Slot ownership transfers to processSlackEvent, which either
+		// releases on its own return path or hands the slot to its
+		// alias-dispatch goroutine. This avoids double-counting against
+		// dispatchSem when an inbound triggers an alias dispatch (which
+		// would otherwise hold two slots concurrently — see gc-cby.26
+		// Phase 4 review fix).
+		go processSlackEvent(cfg, aliasReg, env, release)
 	}
 }
 
@@ -1533,7 +1535,19 @@ func slackKindFromChannelType(channelType, channelID string) string {
 	return "dm"
 }
 
-func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, env slackEventEnvelope) {
+// processSlackEvent runs the per-inbound-event work (signature parse,
+// postInbound to gc, optional alias dispatch). It owns the dispatch
+// slot supplied by handleSlackEvents: the slot is released either on
+// the function's own return path, or — when an alias dispatch fans
+// out to its own goroutine — transferred to that goroutine's defer.
+// The slot is released exactly once.
+func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, env slackEventEnvelope, release func()) {
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
 	if env.Type != "event_callback" || len(env.Event) == 0 {
 		return
 	}
@@ -1603,16 +1617,14 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, env slackEvent
 	// because target != its handle.
 	if target != "" && aliasReg != nil {
 		if aliasedSessionID, ok := aliasReg.Get(target); ok {
-			release, capacity, acquired := acquireDispatchSlot()
-			if !acquired {
-				log.Printf("slack adapter: dispatch queue full (cap=%d), dropping alias dispatch handle=%q session=%q",
-					capacity, target, aliasedSessionID)
-			} else {
-				go func() {
-					defer release()
-					dispatchToAliasedSession(cfg, aliasedSessionID, inbound, target)
-				}()
-			}
+			// Transfer the slot we already hold to the alias goroutine.
+			// No new acquireDispatchSlot — that would double-count
+			// against dispatchSem (gc-cby.26 Phase 4 review fix).
+			released = true
+			go func() {
+				defer release()
+				dispatchToAliasedSession(cfg, aliasedSessionID, inbound, target)
+			}()
 		}
 	}
 }

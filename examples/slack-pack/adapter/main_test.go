@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -2795,21 +2796,122 @@ func captureLog(t *testing.T) (read func() string, cleanup func()) {
 	}
 }
 
-// TestProcessSlackEventDropsAliasDispatchWhenSemaphoreFull verifies
-// the alias-resolved dispatch goroutine in processSlackEvent is
-// dropped (and logged) when the dispatch semaphore is saturated.
-// sec-S-04.
-func TestProcessSlackEventDropsAliasDispatchWhenSemaphoreFull(t *testing.T) {
-	// Stub gc API that records inbound + alias-dispatch hits.
-	var inboundHits, aliasHits int32
+// TestProcessSlackEventReleasesSlotOnNoAliasPath verifies the
+// caller-supplied release closure fires exactly once when
+// processSlackEvent returns without spawning an alias-dispatch
+// goroutine. Slot ownership stays with processSlackEvent; the defer
+// hands it back via release(). gc-cby.26 release-transfer fix.
+func TestProcessSlackEventReleasesSlotOnNoAliasPath(t *testing.T) {
 	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/extmsg/inbound"):
-			atomic.AddInt32(&inboundHits, 1)
-		case strings.Contains(r.URL.Path, "/session/") && strings.HasSuffix(r.URL.Path, "/messages"):
-			atomic.AddInt32(&aliasHits, 1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	cfg := config{
+		gcAPIBase:    gcStub.URL,
+		cityName:     "test-city",
+		provider:     "slack",
+		accountID:    "T1",
+		handlePrefix: "@",
+	}
+	aliasReg := newTestHandleAliasRegistry(t)
+
+	// No handlePrefix match → no alias dispatch path → defer releases.
+	rawMsg, _ := json.Marshal(slackMessageEvent{
+		Type: "message", Channel: "C1", User: "U1", TS: "1.0",
+		Text: "plain message no handle",
+	})
+	env := slackEventEnvelope{Type: "event_callback", Event: rawMsg}
+
+	var releases int32
+	release := func() { atomic.AddInt32(&releases, 1) }
+	processSlackEvent(cfg, aliasReg, env, release)
+
+	if got := atomic.LoadInt32(&releases); got != 1 {
+		t.Errorf("release fired %d times on no-alias path; want exactly 1", got)
+	}
+}
+
+// TestProcessSlackEventTransfersSlotToAliasGoroutine verifies the
+// alias-dispatch path takes ownership of the caller-supplied slot
+// (no separate acquire) and the release fires exactly once after
+// the alias dispatch completes. Closes the double-acquire bug
+// flagged in gc-cby.26 Phase 4 review.
+func TestProcessSlackEventTransfersSlotToAliasGoroutine(t *testing.T) {
+	pathCh := make(chan string, 1)
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		if strings.Contains(r.URL.Path, "/session/") {
+			select {
+			case pathCh <- r.URL.Path:
+			default:
+			}
 		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	cfg := config{
+		gcAPIBase:    gcStub.URL,
+		cityName:     "test-city",
+		provider:     "slack",
+		accountID:    "T1",
+		handlePrefix: "@",
+	}
+	aliasReg := newTestHandleAliasRegistry(t)
+	if err := aliasReg.Set("mayor", "gc-2568"); err != nil {
+		t.Fatalf("aliasReg.Set: %v", err)
+	}
+
+	rawMsg, _ := json.Marshal(slackMessageEvent{
+		Type: "message", Channel: "C1", User: "U1", TS: "1.0",
+		Text: "@mayor please ack",
+	})
+	env := slackEventEnvelope{Type: "event_callback", Event: rawMsg}
+
+	var releases int32
+	release := func() { atomic.AddInt32(&releases, 1) }
+	processSlackEvent(cfg, aliasReg, env, release)
+
+	// The alias goroutine runs after processSlackEvent returns; wait
+	// for the dispatch to land on the gc stub.
+	select {
+	case path := <-pathCh:
+		want := "/v0/city/test-city/session/gc-2568/messages"
+		if path != want {
+			t.Errorf("alias dispatch path = %q, want %q", path, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("alias dispatch goroutine did not POST within 2s")
+	}
+
+	// The release fires inside the alias goroutine's defer, after the
+	// dispatch completes. It may not have run yet when pathCh fires;
+	// poll briefly.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&releases) >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := atomic.LoadInt32(&releases); got != 1 {
+		t.Errorf("release fired %d times on alias-transfer path; want exactly 1", got)
+	}
+}
+
+// TestHandleSlackEventsDropsWhenSemaphoreFull verifies the OUTER
+// dispatch bound: when handleSlackEvents acquires the slot at the
+// HTTP handler entry and the semaphore is saturated, the inbound is
+// dropped with a "queue full" log and processSlackEvent never runs.
+// This is the canonical drop path post-cby.26-fix; per-event bound
+// lives at the handler boundary, not inside processSlackEvent.
+func TestHandleSlackEventsDropsWhenSemaphoreFull(t *testing.T) {
+	var inboundHits int32
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		atomic.AddInt32(&inboundHits, 1)
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	t.Cleanup(gcStub.Close)
@@ -2824,106 +2926,47 @@ func TestProcessSlackEventDropsAliasDispatchWhenSemaphoreFull(t *testing.T) {
 	t.Cleanup(holdRelease)
 
 	cfg := config{
-		gcAPIBase:    gcStub.URL,
-		cityName:     "test-city",
-		provider:     "slack",
-		accountID:    "T1",
-		handlePrefix: "@",
+		gcAPIBase:       gcStub.URL,
+		cityName:        "test-city",
+		provider:        "slack",
+		accountID:       "T1",
+		slackSigningKey: "secret",
 	}
 	aliasReg := newTestHandleAliasRegistry(t)
-	if err := aliasReg.Set("mayor", "gc-2568"); err != nil {
-		t.Fatalf("aliasReg.Set: %v", err)
-	}
 
 	read, cleanup := captureLog(t)
 	t.Cleanup(cleanup)
 
-	// Pre-formed message envelope so processSlackEvent sees an
-	// alias-resolvable target.
+	// Build a signed event POST.
 	rawMsg, _ := json.Marshal(slackMessageEvent{
-		Type:    "message",
-		Channel: "C1",
-		User:    "U1",
-		TS:      "1.0",
-		Text:    "@mayor please ack",
+		Type: "message", Channel: "C1", User: "U1", TS: "1.0", Text: "hi",
 	})
-	env := slackEventEnvelope{Type: "event_callback", Event: rawMsg}
+	envBody, _ := json.Marshal(slackEventEnvelope{Type: "event_callback", Event: rawMsg})
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := signFor(cfg.slackSigningKey, ts, envBody)
 
-	// processSlackEvent posts inbound (synchronous), then attempts
-	// the alias dispatch via the semaphore-guarded goroutine.
-	processSlackEvent(cfg, aliasReg, env)
+	req := httptest.NewRequest(http.MethodPost, "/slack/events", bytes.NewReader(envBody))
+	req.Header.Set("X-Slack-Request-Timestamp", ts)
+	req.Header.Set("X-Slack-Signature", sig)
+	w := httptest.NewRecorder()
 
-	// inbound POST is synchronous and unrelated to the sem; it should
-	// have hit the stub.
-	if atomic.LoadInt32(&inboundHits) != 1 {
-		t.Errorf("inbound POSTs = %d, want 1 (semaphore should not gate inbound)", atomic.LoadInt32(&inboundHits))
+	handleSlackEvents(cfg, aliasReg)(w, req)
+
+	// Slack always sees 200 (we ack quickly to suppress retries).
+	if w.Result().StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", w.Result().StatusCode)
 	}
-	// Alias dispatch should have been dropped — the only slot is held
-	// by this test goroutine. Give the runtime a chance to schedule
-	// any spurious goroutine before asserting.
+	// Sem was full: processSlackEvent never ran → no inbound POST hit
+	// the gc stub.
 	time.Sleep(100 * time.Millisecond)
-	if got := atomic.LoadInt32(&aliasHits); got != 0 {
-		t.Errorf("alias dispatch hits = %d, want 0 (sem full → drop)", got)
+	if got := atomic.LoadInt32(&inboundHits); got != 0 {
+		t.Errorf("inbound POSTs = %d, want 0 (event dropped at sem boundary)", got)
 	}
 	if !strings.Contains(read(), "dispatch queue full") {
 		t.Errorf("log missing 'dispatch queue full' marker:\n%s", read())
 	}
 	if !strings.Contains(read(), "cap=1") {
 		t.Errorf("log missing cap=1 marker:\n%s", read())
-	}
-}
-
-// TestProcessSlackEventDispatchesAliasWhenSemaphoreHasRoom — happy
-// path: with a non-saturated semaphore, the alias dispatch goroutine
-// runs and POSTs to the gc session-message endpoint. sec-S-04 guard.
-func TestProcessSlackEventDispatchesAliasWhenSemaphoreHasRoom(t *testing.T) {
-	pathCh := make(chan string, 1)
-	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.ReadAll(r.Body)
-		if strings.Contains(r.URL.Path, "/session/") {
-			select {
-			case pathCh <- r.URL.Path:
-			default:
-			}
-		}
-		w.WriteHeader(http.StatusAccepted)
-	}))
-	t.Cleanup(gcStub.Close)
-
-	restore := setDispatchSemaphoreForTest(2)
-	t.Cleanup(restore)
-
-	cfg := config{
-		gcAPIBase:    gcStub.URL,
-		cityName:     "test-city",
-		provider:     "slack",
-		accountID:    "T1",
-		handlePrefix: "@",
-	}
-	aliasReg := newTestHandleAliasRegistry(t)
-	if err := aliasReg.Set("mayor", "gc-2568"); err != nil {
-		t.Fatalf("aliasReg.Set: %v", err)
-	}
-
-	rawMsg, _ := json.Marshal(slackMessageEvent{
-		Type:    "message",
-		Channel: "C1",
-		User:    "U1",
-		TS:      "1.0",
-		Text:    "@mayor please ack",
-	})
-	env := slackEventEnvelope{Type: "event_callback", Event: rawMsg}
-
-	processSlackEvent(cfg, aliasReg, env)
-
-	select {
-	case path := <-pathCh:
-		want := "/v0/city/test-city/session/gc-2568/messages"
-		if path != want {
-			t.Errorf("alias dispatch path = %q, want %q", path, want)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("alias dispatch goroutine did not POST within 2s")
 	}
 }
 
