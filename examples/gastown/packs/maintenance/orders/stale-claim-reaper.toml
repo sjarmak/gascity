@@ -1,0 +1,16 @@
+# Reap stranded in_progress claims left by dead worker processes.
+#
+# `bd update --claim` sets assignee + status=in_progress atomically but has
+# no liveness signal. If a worker dies between claim and `bd close`, the
+# claim sticks forever (and so does the worker's worktree). orphan-sweep
+# does not catch this case because the assignee is a *configured* agent
+# slot whose specific process happens to be dead.
+#
+# This order is the failsafe behind the worker liveness gap. It is dormant
+# in any scope that does not opt in via `<rig>/.beads/stale-claim-policy.yaml`,
+# and it runs in dry-run mode unless STALE_CLAIM_REAPER_APPLY=1 is set.
+[order]
+description = "Reap in_progress claims abandoned by dead worker processes"
+trigger = "cooldown"
+interval = "1h"
+exec = "$PACK_DIR/assets/scripts/stale-claim-reaper.sh"

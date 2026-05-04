@@ -90,12 +90,21 @@ func TestMaterializeBuiltinPacks(t *testing.T) {
 		filepath.Join(dir, citylayout.SystemPacksRoot, "maintenance", "orders", "gate-sweep.toml"),
 		filepath.Join(dir, citylayout.SystemPacksRoot, "maintenance", "orders", "mol-dog-jsonl.toml"),
 		filepath.Join(dir, citylayout.SystemPacksRoot, "maintenance", "orders", "mol-dog-reaper.toml"),
+		filepath.Join(dir, citylayout.SystemPacksRoot, "maintenance", "orders", "stale-claim-reaper.toml"),
 		filepath.Join(dir, citylayout.SystemPacksRoot, "dolt", "orders", "dolt-health.toml"),
 		filepath.Join(dir, citylayout.SystemPacksRoot, "gastown", "orders", "digest-generate.toml"),
 	} {
 		if _, err := os.Stat(order); err != nil {
 			t.Errorf("embedded order missing: %v", err)
 		}
+	}
+
+	// Verify companion stale-claim-reaper script is materialized and executable.
+	staleScript := filepath.Join(dir, citylayout.SystemPacksRoot, "maintenance", "assets", "scripts", "stale-claim-reaper.sh")
+	if info, err := os.Stat(staleScript); err != nil {
+		t.Errorf("stale-claim-reaper.sh missing: %v", err)
+	} else if info.Mode()&0o111 == 0 {
+		t.Errorf("stale-claim-reaper.sh not executable: mode %v", info.Mode())
 	}
 
 	// Verify TOML files are not executable.
