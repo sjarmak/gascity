@@ -603,13 +603,14 @@ Deployment-local (NOT in repo, unchanged this session):
 
 ## Resolved this session: stale PR worktrees removed
 
-Three PR-staging worktrees whose PRs had squash-merged earlier today were lingering at full size:
+Four PR-staging worktrees whose work had already integrated were lingering at full size:
 
 - `/home/ds/gascity-pr-gc-a3s` (branch `fix/gc-a3s-orders-overrides-rig-scope`) → PR #1622 merged
 - `/home/ds/gascity-pr-gc-cdf` (branch `fix/gc-cdf-service-url-prefix-city-segment`) → PR #1625 merged
 - `/home/ds/gascity-gascity-reply` (branch `docs/spec-update-session-first`) → PR #1203 merged
+- `/home/ds/gascity-gascity-pr-2` (branch `gascity-pr-2`) → no matching PR; verified all branch commits (`1dacc57f`, `27e603cc`, `3edeb3d0`, `111641dd`, `c1e1f6a1`, `070f39c1`, etc.) are reachable from `feat/oversight-rig-pack`, so the branch was just an older integration snapshot
 
-All three removed via `git worktree remove`; branches force-deleted (`-D`) since squash-merge means the original commits aren't reachable from origin/main even though gh confirms them merged. SHAs preserved in reflog for ~90d if needed. Active worktrees remaining: main repo at `/home/ds/gascity`, `gascity-main` (handy main ref), `gascity-pr-gc-w1h` (PR #1632 still OPEN), `gascity-gascity-pr-2` (orphaned local — no matching PR; needs human review), plus 2 locked subagent worktrees under `.claude/worktrees/`.
+All four removed via `git worktree remove`; branches force-deleted (`-D`) since squash-merge / re-integration means the original commits aren't reachable from origin/main even though they are reachable from this branch. SHAs preserved in reflog for ~90d if needed. Active worktrees remaining: main repo at `/home/ds/gascity`, `gascity-main` (handy main ref), `gascity-pr-gc-w1h` (PR #1632 still OPEN), plus 2 locked subagent worktrees under `.claude/worktrees/` (artifacts of prior `/focus parallel` runs — leave alone unless the parent /focus is known to be done).
 
 ## Resolved earlier session: nested PR worktrees removed
 
