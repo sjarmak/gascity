@@ -25,6 +25,13 @@ The live smoke for **gc-j8h** drove `gc slack upload --thread-current` end-to-en
 
 Live smoke is now **PASS** for the gc-j8h acceptance criteria — see "gc-j8h smoke results" below for the receipts.
 
+## Operator stance (durable — assume true unless HANDOFF says otherwise)
+
+- **Operator at keyboard for Slack interaction.** When work needs a real Slack DM/channel post (gc-17z scenarios, future cos/PL behavior verification), assume the operator is available to drive in-Slack scenarios; pair work between an in-repo session and the Slack client is fine.
+- **Defer to reasonable design decisions.** When a bead carries a written design doc or a `pr-ready-with-design-questions` label and the doc recommends a default for an open question, take the recommended default unless something has materially changed since the doc was written. Don't block on confirmation for design questions whose answers a thoughtful reviewer would land on.
+- **Restarts are pre-approved on this fork.** No critical work runs on `feat/oversight-rig-pack`; the slack adapter, the supervisor, individual cos/PL sessions, and proxy_process services may be restarted, reset, or cut over without pausing for approval. The session reset / cutover IS the work — don't wait. (Destructive ops — `rm -rf`, force-push to a remote-tracking branch, branch force-deletion — still require explicit approval. Restarts are not destructive.)
+- **Persisted as `bd remember --key operator-stance-sjarmak`** so this stance survives even if HANDOFF gets rewritten.
+
 ## Up next (recommended dispatch)
 
 The slack-pack file-coordination story is structurally complete (gc-ywe 6/6 + gc-j8h closed + live-smoked + CSRF blocker removed). Remaining work is dominated by the inbound-file smoke and the one P3 hardening bead. Surface area, ranked by user impact:
