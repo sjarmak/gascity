@@ -1,31 +1,22 @@
-# Oversight-rig handoff — 2026-05-04 (gc-ywe.7 + gc-a3s shipped; operator-stance section landed)
+# Oversight-rig handoff — 2026-05-04 (gc-0fn SSRF fix + gc-5rz/gc-17z operational verification shipped)
 
-> **To the next agent:** this session closed the gc-ywe slack-pack epic (gc-ywe.7 path-component sanitization shipped, parent gc-ywe auto-closed) AND the gc-a3s loud-validation fix for `[[orders.overrides]]`. Three commits on `fork/feat/oversight-rig-pack`:
+> **To the next agent:** this session shipped the P1 SSRF gate on slack-pack inbound file downloads (gc-0fn) and closed out the two pre-flagged operational beads (gc-5rz Phase A cutover + gc-17z cos slack-v0 verification — both resolved against the live deployment without code changes beyond a HANDOFF cleanup). Two commits on `fork/feat/oversight-rig-pack`:
 >
-> - **`f3ab1393` — `docs(oversight-rig): add durable operator stance section to HANDOFF`** — added the "Operator stance" callout below (operator-at-keyboard for Slack tests, defer to reasonable design defaults, restarts pre-approved on this fork). Also persisted via `bd remember --key operator-stance-sjarmak` so it survives even if HANDOFF gets rewritten.
+> - **`f730b88b` — `docs(oversight-rig): close out gc-5rz + gc-17z verifications`** — HANDOFF was self-contradictory on entry (the "Up next" section said "re-attempt cutover" but the Live runtime section deeper in the doc treated the cutover as historical). Replaced with a "Verified this session" callout summarizing the live evidence: `gc-5rz` Phase A was already live (proxy_process spawning gc-slack-adapter with UDS env + post-gc-cdf URL prefix, 11+ outbound publishes to rig channels today, healthz 200 via supervisor route); `gc-17z` cos slack-v0 prompt verified via passive room-silence observation (`gc session peek` showing the verbatim "Room message from peer agent — stay silent." rule firing) + direct DM no-match round-trip (operator DM'd `ack gc-qs4` synthetic bead → cos returned the verbatim step-5 ack `*oversight-rig.cos:* couldn't match — mailed mayor for triage`). Scenario 1 (match-path) deferred opportunistically — zero open `rollup`+`severity:escalate` beads at test time, and the match-path uses identical step-5 mechanics already exercised. Also marked gc-ywe.7 done in the "Quality / hardening" subsection (was already shipped 1eef688e but the entry was stale).
 >
-> - **`1eef688e` — `fix(slack-pack): sanitize channel + ts as filesystem path components (gc-ywe.7)`** — added `safePathComponent` strict allowlist helper (`[A-Za-z0-9_.-]`, leading-dot scrub, 64-char cap, empty → `_`) and applied to `channel` + `ts` in `downloadSlackFiles` before `filepath.Join`. Defense-in-depth on top of the existing `verifySlackSignature` HMAC gate. New `TestSafePathComponent` (~20 cases) + extended `TestDownloadSlackFiles` malformed-channel/ts subcase using `filepath.EvalSymlinks` for symlink-aware containment. Phase 4 review closed 3 MEDIUM in-band (leading-dot doc accuracy, EvalSymlinks containment, ASCII-invariant comment on byte truncation). 2 pre-existing security gaps surfaced and filed: **gc-0fn (P1 SSRF in `slackDownloadToFile` — `url_private` host not validated; gates: bot token leak post signing-secret compromise)** and **gc-z23 (P3 unrestricted `req.FilePath` in `handlePublishFile` — internal mux trust)**.
+> - **`c6a7b3f8` — `fix(slack-pack): validate url_private host before fetch (gc-0fn)`** — adds `isSlackFileURL` (https-only, IsAbs-required so absolute paths and protocol-relative URLs are caught, port empty/443, host in `{slack.com, *.slack.com, slack-files.com, *.slack-files.com}`, trailing-dot FQDN strict-rejected by suffix check). `slackDownloadToFile` gates on this BEFORE any network I/O; on rejection the error uses `url.URL.Redacted()` so attacker-supplied `user:password@host` doesn't leak to adapter logs verbatim. Validator routed through a swappable `validateSlackFileURL` package var (warning: not safe under `t.Parallel`) so unrelated download-mechanics tests bypass via `testAllowAnyURL(t)`. Tests: `TestIsSlackFileURL` ~25 cases (canonical hosts, CDN subdomains, port 443, uppercase normalization, IPv4/IPv6 loopback, IMDS link-local + decimal-encoded form, GCP metadata internal hostname, attacker.com, sound-alike, suffix-trick, userinfo bypass, trailing-dot, non-standard port, valid-port-wrong-host, http://, opaque, non-absolute, malformed percent-encoding) + `TestSlackDownloadToFileRejectsNonSlackHostHTTPS` (`httptest.NewTLSServer`; asserts `hits == 0` AND `capturedAuth == ""`) + `TestSlackDownloadToFileRedactsUserinfoInError`. Pre-impl test review closed 1 CRITICAL (http:// vs https:// in integration test would have masked host-gate failures) + 3 HIGH + 3 MEDIUM. Phase 4 review closed 2 HIGH (userinfo log injection, t.Parallel race) + 6 MEDIUM. Filed **gc-vrw (P3 follow-up)** for the two acknowledged limitations: DNS rebinding (custom Dialer with private-IP block) + redirect re-validation (CheckRedirect that revalidates each hop via isSlackFileURL).
 >
-> - **`016a344e` — `fix(orders): make orders.overrides validation errors loud, not silent (gc-a3s)`** — three call sites used to silently swallow override-not-found errors (startup `buildOrderDispatcher`, reload, API `controllerState.Orders()`). Fix: `buildOrderDispatcher` returns `(orderDispatcher, error)`; `newCityRuntime` returns `(*CityRuntime, error)`; reload path validates orders early (after lifecycle, before any state mutation), fails with `reloadOutcomeFailed` mirroring the provider-swap pattern. Error message enriched with rig-scoping hint: `"add one [[orders.overrides]] block per rig with rig = \"<rig-name>\" (matching rigs: alpha, beta, ...)"`. API endpoint logs once per controller lifetime via `atomic.Bool`. New `internal/orders/override_test.go` (7 tests) + new `TestBuildOrderDispatcherRejectsRiglessOverrideOnPerRigOrder` driving the full FS-scan → ApplyOverrides → wrapped-error path. Phase 4 review closed 4 MEDIUM in-band (log wording, error wording, log spam, error wrap symmetry). Filed **gc-4hn (P3 missing reload-path test coverage)**. Operator design decisions Q1=A (reloadOutcomeFailed), Q2=B (best-effort API + log), Q3=A (enriched error) all applied.
+> Both commits passed the full `.githooks/pre-commit` pipeline (gofmt + golangci-lint + go vet + sharded test sweep + docsync). `bd dolt push` no-op'd (remote not configured for this fork — beads stay versioned in `.beads/`).
 >
-> All three commits passed the full `.githooks/pre-commit` pipeline (gofmt + golangci-lint + go test sweep + docsync). `bd dolt push` no-op'd (remote not configured for this fork — beads stay versioned in `.beads/`).
+> **Branch state at session end:** `fork/feat/oversight-rig-pack` is up-to-date with remote, both commits pushed at session close.
 >
-> **Branch state at session end:** `fork/feat/oversight-rig-pack` is 3 ahead of remote (commits above), pushed at session close.
+> Side note: cos addressed the mayor as `gc-98657` in the gc-17z no-match ack — the prior runbook reference (`gc-2568`) may be stale or the mayor session id has rolled forward. No action unless mayor routing is touched again.
 
 ## This session at a glance
 
-- Closed: gc-ywe.7 (P2 slack-pack path-sanitization, shipped 1eef688e), gc-ywe (P2 epic auto-closed — 0 open children), gc-a3s (P2 orders.overrides loud-validation, shipped 016a344e).
-- Created: gc-0fn (P1 SSRF, slack-pack), gc-z23 (P3 file-path confinement, slack-pack), gc-4hn (P3 reload-path test, orders).
-- Updated: HANDOFF gained a durable "Operator stance" section (also in `bd remember`).
-
-## Verified this session (operational follow-up)
-
-Both deferred operational/Slack beads are now resolved:
-
-- **gc-5rz** — closed. Phase A cutover was already live on entry (the prior "Up next" section was stale; the cutover landed 2026-05-03 12:54:45 EDT and was respawned twice that day). All acceptance criteria confirmed: UDS env captured at verify time (`GC_SERVICE_SOCKET=/tmp/gcsvc-1000/ee31dfef/slack-1115146399.sock` — path varies per-run; confirm via `/proc/<adapter-pid>/environ` or `gc svc status`), full URL prefix (`GC_SERVICE_URL_PREFIX=/v0/city/ds-research/svc/slack`, post-gc-cdf), healthz 200 via supervisor route `/v0/city/ds-research/svc/slack/healthz`, 11+ outbound publishes to rig channels today, 1 DM round-trip via gc-17z scenario 3, README §"Adapter as a proxy_process service" documents env-file + cutover sequence.
-- **gc-17z** — closed (mechanism verified). cos session already had the slack-v0 prompt loaded; no reset needed. Scenario 2 (room silence) passively verified via `gc session peek` showing `"Room message from peer agent — stay silent."`. Scenario 3 (DM no-match) directly verified end-to-end — operator DM'd `ack gc-qs4` (synthetic bead w/o `rollup` + `severity:escalate` labels), cos round-tripped at 21:38 with the verbatim ack `*oversight-rig.cos:* couldn't match — mailed mayor for triage`. Scenario 1 (DM matching real escalation) deferred opportunistically — zero open `rollup`+`severity:escalate` beads at test time, and the match-path uses identical step-5 ack mechanics already exercised on the no-match path.
-
-Side note: cos addressed the mayor as `gc-98657` in the no-match ack — the prior runbook reference (`gc-2568`) may be stale or the mayor session id has rolled forward. No action unless mayor routing is touched again.
+- Closed: gc-5rz (P2 slack adapter Phase A cutover, verified live), gc-17z (P2 cos slack-v0 prompt, mechanism verified), gc-0fn (P1 SSRF in slackDownloadToFile, shipped c6a7b3f8). Plus cleanup-closed gc-qs4 and gc-rq3 (orphaned synthetic test beads from the gc-17z runbook).
+- Created: gc-vrw (P3 DNS-rebinding + redirect-re-validation defense-in-depth follow-up to gc-0fn).
+- Updated: HANDOFF top callout refreshed; stale "Up next — operational/Slack work" section removed; gc-ywe.7 + gc-5rz + gc-17z removed from "Standing bd queue" and "Quality / hardening" stale entries.
 
 ## Prior session (kept for context — gc-j8h live smoke + 2 follow-up fixes)
 
@@ -107,6 +98,21 @@ gc slack upload --session gc-82782 --file /tmp/smoke-j8h.txt \
 - All 8 active bindings unchanged. PLs that were waking up post-restart (zeldascension pool spawning workers gc-97576..gc-97589) progressed normally — none disturbed by the smoke.
 
 ## Commits landed this session
+
+```
+c6a7b3f8 fix(slack-pack): validate url_private host before fetch (gc-0fn)
+f730b88b docs(oversight-rig): close out gc-5rz + gc-17z verifications
+```
+
+## Commits landed prior session (gc-ywe.7 + gc-a3s + operator-stance)
+
+```
+016a344e fix(orders): make orders.overrides validation errors loud, not silent (gc-a3s)
+1eef688e fix(slack-pack): sanitize channel + ts as filesystem path components (gc-ywe.7)
+f3ab1393 docs(oversight-rig): add durable operator stance section to HANDOFF
+```
+
+## Commits landed prior session (gc-j8h follow-ups: gc-qp8 + gc-5sd)
 
 ```
 5c936ac4 fix(slack-pack): unwrap thread_ts tuple in upload --thread-current (gc-qp8)
