@@ -54,12 +54,12 @@ type slackInteractionContainer struct {
 // Slack typically sends length 1 but multi_*_select finalizations can
 // produce multiple entries with the same action_id.
 type slackInteractionAction struct {
-	ActionID       string                        `json:"action_id"`
-	BlockID        string                        `json:"block_id"`
-	Type           string                        `json:"type"`
-	Value          string                        `json:"value"`
-	SelectedOption *slackInteractionSelectedOpt  `json:"selected_option,omitempty"`
-	SelectedDate   string                        `json:"selected_date,omitempty"`
+	ActionID       string                       `json:"action_id"`
+	BlockID        string                       `json:"block_id"`
+	Type           string                       `json:"type"`
+	Value          string                       `json:"value"`
+	SelectedOption *slackInteractionSelectedOpt `json:"selected_option,omitempty"`
+	SelectedDate   string                       `json:"selected_date,omitempty"`
 }
 
 type slackInteractionSelectedOpt struct {
