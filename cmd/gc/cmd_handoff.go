@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
@@ -349,11 +350,19 @@ func doHandoffRemote(store beads.Store, rec events.Recorder, sp runtime.Provider
 		fmt.Fprintf(stderr, "gc handoff: killing %s: %v\n", targetAddress, err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	sessionID, resolveErr := resolveSessionID(store, sessionName)
+	if resolveErr != nil {
+		// The session was just killed; resolution can fail if its bead
+		// has been closed mid-flight. Fall back to the runtime name so
+		// subscribers still get a usable correlation key.
+		sessionID = sessionName
+	}
 	rec.Record(events.Event{
 		Type:    events.SessionStopped,
 		Actor:   sender,
 		Subject: targetAddress,
 		Message: "handoff",
+		Payload: api.SessionLifecyclePayloadJSON(sessionID, "", "handoff"),
 	})
 
 	fmt.Fprintf(stdout, "Handoff: sent mail %s to %s, killed session (reconciler will restart)\n", b.ID, targetAddress) //nolint:errcheck // best-effort stdout

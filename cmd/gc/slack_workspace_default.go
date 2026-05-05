@@ -30,7 +30,7 @@ func slackWorkspaceIDDefault() string {
 }
 
 // slackWorkspaceIDFlagUsage is the canonical usage string for every
-// `--workspace-id` flag on `gc slack` verbs. Centralising it here keeps
+// `--workspace-id` flag on `gc slack` verbs. Centralizing it here keeps
 // help text identical across verbs and makes the env-var fallback
 // discoverable from --help.
 //

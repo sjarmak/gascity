@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func execSlackStatusCmd(t *testing.T, cityRoot string, args ...string) (string, string, error) {
+func execSlackStatusCmd(t *testing.T, cityRoot string, args ...string) (string, string, error) { //nolint:unparam // helper returns stderr for callers that may grow to inspect it
 	t.Helper()
 	t.Chdir(cityRoot)
 	var stdout, stderr bytes.Buffer

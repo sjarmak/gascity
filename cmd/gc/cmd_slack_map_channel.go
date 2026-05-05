@@ -51,7 +51,7 @@ legacy '--rig' flag on this verb is deprecated (gc-cby.25); cobra
 hides it from --help and emits a stderr deprecation warning on
 every use.`,
 		Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(_ *cobra.Command, args []string) error {
 			return runSlackMapChannel(stdout, args[0], workspaceID, rigName, sessionID, remove)
 		},
 	}

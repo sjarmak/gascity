@@ -59,7 +59,7 @@ type slackStatusJSON struct {
 // newSlackStatusCmd returns `gc slack status` — the unified observability
 // verb across the slack-pack registries (apps + channel mappings +
 // rig mappings).
-func newSlackStatusCmd(stdout, stderr io.Writer) *cobra.Command {
+func newSlackStatusCmd(stdout, _ io.Writer) *cobra.Command {
 	var (
 		channelFilter   string
 		workspaceFilter string
@@ -89,7 +89,7 @@ pass --workspace-id="" to override and see records across all workspaces.
 --json emits a machine-readable shape with top-level keys "apps",
 "channel_mappings", and "rig_mappings".`,
 		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			return runSlackStatus(stdout, channelFilter, workspaceFilter, jsonOutput)
 		},
 	}

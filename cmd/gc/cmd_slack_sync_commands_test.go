@@ -74,7 +74,7 @@ func (r slackAPIResponse) writeTo(t *testing.T, w http.ResponseWriter) {
 		envelope["errors"] = r.Errors
 	}
 	if len(r.ManifestObj) > 0 {
-		envelope["manifest"] = json.RawMessage(r.ManifestObj)
+		envelope["manifest"] = r.ManifestObj
 	}
 	if r.AppID != "" {
 		envelope["app_id"] = r.AppID
@@ -221,7 +221,7 @@ func jsonEquivalent(t *testing.T, a, b []byte) bool {
 // sync-commands tests start from the same registry shape that real
 // operators see, rather than backdooring records into the registry
 // directly.
-func importAppViaCmd(t *testing.T, cityRoot string, manifest []byte, workspaceID, appID string) {
+func importAppViaCmd(t *testing.T, cityRoot string, manifest []byte, workspaceID, appID string) { //nolint:unparam // workspaceID is the registry key callers may vary in future fixtures
 	t.Helper()
 	manifestPath := writeManifest(t, t.TempDir(), manifest)
 	if _, stderr, err := execSlackImportAppCmd(t, cityRoot,
@@ -773,9 +773,9 @@ func TestSyncCommandsJSONOutput_HasStructuredEnvelope(t *testing.T) {
 		WorkspaceID string `json:"workspace_id"`
 		AppID       string `json:"app_id"`
 		Diff        struct {
-			Added                  []map[string]any `json:"added"`
-			Removed                []map[string]any `json:"removed"`
-			Changed                []map[string]any `json:"changed"`
+			Added                   []map[string]any `json:"added"`
+			Removed                 []map[string]any `json:"removed"`
+			Changed                 []map[string]any `json:"changed"`
 			NonCommandFieldsChanged bool             `json:"non_command_fields_changed"`
 		} `json:"diff"`
 		UpdateIssued bool `json:"update_issued"`
@@ -809,7 +809,7 @@ func TestSyncCommandsTimeoutBudget_AppliesToHTTPCalls(t *testing.T) {
 	// active connections.
 	release := make(chan struct{})
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/apps.manifest.export", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/apps.manifest.export", func(_ http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return

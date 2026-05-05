@@ -104,7 +104,7 @@ type slackSyncOpts struct {
 
 // newSlackSyncCommandsCmd wires the cobra verb. The runner is split out
 // so tests can drive the same code path without re-parsing flags.
-func newSlackSyncCommandsCmd(stdout, stderr io.Writer) *cobra.Command {
+func newSlackSyncCommandsCmd(stdout, _ io.Writer) *cobra.Command {
 	var o slackSyncOpts
 	cmd := &cobra.Command{
 		Use:   "sync-commands",
@@ -216,7 +216,7 @@ func runSlackSyncCommands(ctx context.Context, stdout io.Writer, o slackSyncOpts
 		if o.output == "json" {
 			return emitJSONEnvelope(stdout, o, diff, false, false)
 		}
-		fmt.Fprintln(stdout, "Slack manifest in sync; no update issued.")
+		fmt.Fprintln(stdout, "Slack manifest in sync; no update issued.") //nolint:errcheck // best-effort stdout
 		return nil
 	}
 
@@ -263,7 +263,7 @@ func runSlackSyncCommands(ctx context.Context, stdout io.Writer, o slackSyncOpts
 	if o.output == "json" {
 		return emitJSONEnvelope(stdout, o, diff, true, true)
 	}
-	fmt.Fprintf(stdout, "Slack manifest synced for workspace=%s app=%s.\n", o.workspaceID, o.appID)
+	fmt.Fprintf(stdout, "Slack manifest synced for workspace=%s app=%s.\n", o.workspaceID, o.appID) //nolint:errcheck // best-effort stdout
 	return nil
 }
 
@@ -355,7 +355,7 @@ func slackPostForm(ctx context.Context, c *http.Client, endpoint, token string, 
 		// URL but not the headers, so the token does not leak here.
 		return nil, fmt.Errorf("slack POST %s: %w", endpoint, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, fmt.Errorf("read slack response: %w", err)
@@ -505,30 +505,30 @@ func walkPaths(a, b any, prefix string, out *[]string) {
 
 func printDiffText(w io.Writer, d slashCmdDiff) {
 	if d.NonCommandFieldsChanged {
-		fmt.Fprintln(w, "Non-command manifest fields drifted from local:")
+		fmt.Fprintln(w, "Non-command manifest fields drifted from local:") //nolint:errcheck // best-effort writer
 		for _, p := range d.NonCommandFieldsPaths {
-			fmt.Fprintf(w, "  - %s\n", p)
+			fmt.Fprintf(w, "  - %s\n", p) //nolint:errcheck // best-effort writer
 		}
 	}
 	if len(d.Added) > 0 {
-		fmt.Fprintln(w, "Added (in local, not live):")
+		fmt.Fprintln(w, "Added (in local, not live):") //nolint:errcheck // best-effort writer
 		for _, c := range d.Added {
-			fmt.Fprintf(w, "  - %s    %s\n", c.Command, c.Description)
+			fmt.Fprintf(w, "  - %s    %s\n", c.Command, c.Description) //nolint:errcheck // best-effort writer
 		}
 	}
 	if len(d.Removed) > 0 {
-		fmt.Fprintln(w, "Removed (in live, not local):")
+		fmt.Fprintln(w, "Removed (in live, not local):") //nolint:errcheck // best-effort writer
 		for _, c := range d.Removed {
-			fmt.Fprintf(w, "  - %s    %s\n", c.Command, c.Description)
+			fmt.Fprintf(w, "  - %s    %s\n", c.Command, c.Description) //nolint:errcheck // best-effort writer
 		}
 	}
 	if len(d.Changed) > 0 {
-		fmt.Fprintln(w, "Changed (description / url / usage_hint differs):")
+		fmt.Fprintln(w, "Changed (description / url / usage_hint differs):") //nolint:errcheck // best-effort writer
 		for _, ch := range d.Changed {
-			fmt.Fprintf(w, "  - %s\n", ch.Command)
-			fmt.Fprintf(w, "      from: description=%q url=%q usage_hint=%q\n",
+			fmt.Fprintf(w, "  - %s\n", ch.Command)                              //nolint:errcheck // best-effort writer
+			fmt.Fprintf(w, "      from: description=%q url=%q usage_hint=%q\n", //nolint:errcheck // best-effort writer
 				ch.From.Description, ch.From.URL, ch.From.UsageHint)
-			fmt.Fprintf(w, "      to:   description=%q url=%q usage_hint=%q\n",
+			fmt.Fprintf(w, "      to:   description=%q url=%q usage_hint=%q\n", //nolint:errcheck // best-effort writer
 				ch.To.Description, ch.To.URL, ch.To.UsageHint)
 		}
 	}

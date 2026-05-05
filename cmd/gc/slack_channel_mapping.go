@@ -173,7 +173,7 @@ func (r *slackChannelMappingRegistry) load() error {
 		}
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	data, err := io.ReadAll(io.LimitReader(f, maxRegistryBytes+1))
 	if err != nil {
 		return fmt.Errorf("read %s: %w", r.diskPath, err)

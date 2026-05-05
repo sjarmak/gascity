@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
@@ -1958,6 +1959,7 @@ func stopTargetsBounded(
 					stopped++
 					rec.Record(events.Event{
 						Type: events.SessionStopped, Actor: actor, Subject: result.target.subject,
+						Payload: api.SessionLifecyclePayloadJSON(result.target.sessionID, result.target.template, "stopped"),
 					})
 				}
 				logLifecycleWave(stderr, "stop", wave, waveStarted, 1)
@@ -2000,6 +2002,7 @@ func stopTargetsBounded(
 			stopped++
 			rec.Record(events.Event{
 				Type: events.SessionStopped, Actor: actor, Subject: result.target.subject,
+				Payload: api.SessionLifecyclePayloadJSON(result.target.sessionID, result.target.template, "stopped"),
 			})
 		}
 		logLifecycleWave(stderr, "stop", wave, waveStarted, len(waveTargets))

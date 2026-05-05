@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
@@ -417,6 +418,7 @@ func reconcileSessionBeadsTraced(
 								Actor:   "gc",
 								Subject: template,
 								Message: "drain acknowledged by agent",
+								Payload: api.SessionLifecyclePayloadJSON(session.ID, template, "drain acknowledged"),
 							})
 							hasAssignedWork, assignedErr := sessionHasOpenAssignedWork(store, rigStores, *session)
 							if assignedErr != nil {
@@ -515,6 +517,7 @@ func reconcileSessionBeadsTraced(
 					Actor:   "gc",
 					Subject: tp.DisplayName(),
 					Message: output,
+					Payload: api.SessionLifecyclePayloadJSON(session.ID, tp.TemplateName, "zombie process"),
 				})
 				telemetry.RecordAgentCrash(context.Background(), tp.DisplayName(), output)
 			}
@@ -597,6 +600,7 @@ func reconcileSessionBeadsTraced(
 							Actor:   "gc",
 							Subject: tp.DisplayName(),
 							Message: "drain acknowledged by agent",
+							Payload: api.SessionLifecyclePayloadJSON(session.ID, tp.TemplateName, "drain acknowledged"),
 						})
 						// Drain-ack lands here right after the agent ran
 						// `bd close` on its last unit of work. The cached

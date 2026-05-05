@@ -95,7 +95,7 @@ func validateSlackManifest(m slackManifest) error {
 	return nil
 }
 
-func newSlackImportAppCmd(stdout, stderr io.Writer) *cobra.Command {
+func newSlackImportAppCmd(stdout, _ io.Writer) *cobra.Command {
 	var (
 		workspaceID string
 		appID       string
@@ -117,7 +117,7 @@ place — the registry never grows from idempotent re-imports.
 
 Schema reference: https://api.slack.com/reference/manifests`,
 		Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(_ *cobra.Command, args []string) error {
 			return runSlackImportApp(stdout, args[0], workspaceID, appID)
 		},
 	}

@@ -58,7 +58,7 @@ func writeManifest(t *testing.T, dir string, body []byte) string {
 
 // execSlackImportAppCmd executes the verb directly against a temp city. It
 // invokes the cobra command in-process so flag parsing is exercised.
-func execSlackImportAppCmd(t *testing.T, cityRoot string, args ...string) (string, string, error) {
+func execSlackImportAppCmd(t *testing.T, cityRoot string, args ...string) (string, string, error) { //nolint:unparam // helper returns stdout for callers that may grow to inspect it
 	t.Helper()
 	t.Chdir(cityRoot)
 

@@ -86,7 +86,8 @@ record (or unknown channel) is a silent no-op. --remove,
 }
 
 func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, channels []string, remove bool, removeChannels []string,
-	slingTarget string, slingTargetSet bool, fixFormula string, fixFormulaSet bool) error {
+	slingTarget string, slingTargetSet bool, fixFormula string, fixFormulaSet bool,
+) error {
 	cityPath, err := resolveCity()
 	if err != nil {
 		return fmt.Errorf("resolve city: %w", err)

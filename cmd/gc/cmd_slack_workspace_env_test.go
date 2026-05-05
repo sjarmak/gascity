@@ -90,7 +90,7 @@ func TestSlackMapRigFlagOverridesEnv(t *testing.T) {
 
 // --- import-app ----------------------------------------------------------
 
-func execSlackImportAppCmdNoCity(t *testing.T, args ...string) (string, string, error) {
+func execSlackImportAppCmdNoCity(t *testing.T, args ...string) (string, string, error) { //nolint:unparam // helper returns stdout for callers that may grow to inspect it
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	cmd := newSlackImportAppCmd(&stdout, &stderr)
@@ -134,7 +134,7 @@ func TestSlackImportAppFlagOptionalWhenEnvSet(t *testing.T) {
 
 // --- sync-commands -------------------------------------------------------
 
-func execSlackSyncCommandsCmdNoCity(t *testing.T, args ...string) (string, string, error) {
+func execSlackSyncCommandsCmdNoCity(t *testing.T, args ...string) (string, string, error) { //nolint:unparam // helper returns stdout for callers that may grow to inspect it
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	cmd := newSlackSyncCommandsCmd(&stdout, &stderr)
