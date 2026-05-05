@@ -456,3 +456,72 @@ func TestSlackMapRigIdempotentReSetPreservesCreatedAt(t *testing.T) {
 		t.Errorf("UpdatedAt did not advance: %v vs %v", rec2.UpdatedAt, createdAt)
 	}
 }
+
+// TestSlackMapRigSlingTargetAndFixFormulaPersisted exercises the
+// cby.18.a flags: --sling-target and --fix-formula are persisted on
+// the rig record so the adapter's /slack/interactions handler can
+// route without hardcoded role names.
+func TestSlackMapRigSlingTargetAndFixFormulaPersisted(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1",
+		"--sling-target", "alpha/polecat",
+		"--fix-formula", "mol-slack-fix-issue",
+	); err != nil {
+		t.Fatalf("map-rig with --sling-target/--fix-formula: %v", err)
+	}
+	reg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	rec, ok := reg.Get("T1", "alpha")
+	if !ok {
+		t.Fatal("missing record")
+	}
+	if rec.SlingTarget != "alpha/polecat" {
+		t.Errorf("SlingTarget = %q, want alpha/polecat", rec.SlingTarget)
+	}
+	if rec.FixFormula != "mol-slack-fix-issue" {
+		t.Errorf("FixFormula = %q, want mol-slack-fix-issue", rec.FixFormula)
+	}
+}
+
+// TestSlackMapRigInvalidSlingTargetIsRejected ensures the CLI refuses a
+// malformed --sling-target before touching disk.
+func TestSlackMapRigInvalidSlingTargetIsRejected(t *testing.T) {
+	cityRoot := newTestCity(t)
+	_, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1",
+		"--sling-target", "no-slash",
+	)
+	if err == nil {
+		t.Fatal("expected error for malformed --sling-target, got nil")
+	}
+}
+
+// TestSlackMapRigPreservesSlingTargetOnReSet ensures an idempotent
+// re-bind that omits --sling-target/--fix-formula keeps the previously
+// stored values rather than clearing them. This matches the existing
+// CreatedAt-preservation behavior — operators who only want to update
+// the channel set don't have to re-supply every field.
+func TestSlackMapRigPreservesSlingTargetOnReSet(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1",
+		"--sling-target", "alpha/polecat",
+		"--fix-formula", "mol-slack-fix-issue",
+	); err != nil {
+		t.Fatal(err)
+	}
+	// Re-bind with new channel set, no --sling-target/--fix-formula.
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1,C2",
+	); err != nil {
+		t.Fatalf("re-bind without flags: %v", err)
+	}
+	reg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	rec, _ := reg.Get("T1", "alpha")
+	if rec.SlingTarget != "alpha/polecat" {
+		t.Errorf("SlingTarget cleared on re-bind: got %q", rec.SlingTarget)
+	}
+	if rec.FixFormula != "mol-slack-fix-issue" {
+		t.Errorf("FixFormula cleared on re-bind: got %q", rec.FixFormula)
+	}
+}

@@ -25,6 +25,14 @@
           "uniqueItems": true,
           "description": "Sorted, deduplicated list of Slack channel ids the rig owns. The adapter builds an inverted index (channel → rig) at load time so slash-command resolution is O(1). A channel may only appear in one rig record at a time within this store."
         },
+        "sling_target": {
+          "type": "string",
+          "description": "Qualified agent name of the form '<rig>/<role>' (e.g. 'mission-control/polecat') that the slack-pack adapter passes to `gc sling --target` when dispatching for this rig. Optional in the schema for legacy-record tolerance: records written before cby.18.a omit this field. Required at use time — the adapter's resolver returns a fix-it error directing the operator to re-run `gc slack map-rig --sling-target ...` when this is empty. Role names are operator-supplied (ZFC: never hardcoded in Go)."
+        },
+        "fix_formula": {
+          "type": "string",
+          "description": "Molecule name the adapter spawns when this rig handles an inbound interaction (e.g. 'mol-slack-fix-issue'). Optional. The dispatch handler may fall back to a config-driven default when empty."
+        },
         "created_at": {
           "type": "string",
           "format": "date-time",

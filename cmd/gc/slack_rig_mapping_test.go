@@ -450,3 +450,125 @@ func TestSlackRigMappingRegistryLoadWarnsOnHandEditedOverlap(t *testing.T) {
 		t.Errorf("overlap winner = %q, want alpha (first-by-sorted-key)", rec.RigName)
 	}
 }
+
+// TestSlackRigMappingRegistryRoundTripWithSlingTargetAndFixFormula
+// pins the new fields (cby.18.a) — round-trip on disk preserves the
+// values the operator supplied via `gc slack map-rig --sling-target
+// ... --fix-formula ...`.
+func TestSlackRigMappingRegistryRoundTripWithSlingTargetAndFixFormula(t *testing.T) {
+	cityRoot := newTestCity(t)
+	path := slackRigMappingsPath(cityRoot)
+	reg, err := newSlackRigMappingRegistry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	want := slackRigMappingRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelIDs:  []string{"C1"},
+		SlingTarget: "alpha/polecat",
+		FixFormula:  "mol-slack-fix-issue",
+		CreatedAt:   now, UpdatedAt: now,
+	}
+	if err := reg.Set(want); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	reg2, err := newSlackRigMappingRegistry(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	got, ok := reg2.Get("T1", "alpha")
+	if !ok {
+		t.Fatal("Get after reload ok=false")
+	}
+	if got.SlingTarget != want.SlingTarget {
+		t.Errorf("SlingTarget = %q, want %q", got.SlingTarget, want.SlingTarget)
+	}
+	if got.FixFormula != want.FixFormula {
+		t.Errorf("FixFormula = %q, want %q", got.FixFormula, want.FixFormula)
+	}
+}
+
+// TestSlackRigMappingRegistryLoadsLegacyRecordWithoutNewFields covers
+// the tolerance contract: a rig_mappings.json written before cby.18.a
+// (no sling_target / fix_formula keys) must still load cleanly. The
+// resolution-time check (not load-time) surfaces the missing field.
+func TestSlackRigMappingRegistryLoadsLegacyRecordWithoutNewFields(t *testing.T) {
+	cityRoot := newTestCity(t)
+	path := slackRigMappingsPath(cityRoot)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Hand-write a legacy record with NO sling_target / fix_formula keys.
+	legacy := `{"T1:alpha":{"workspace_id":"T1","rig_name":"alpha","channel_ids":["C1"],"created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-01T00:00:00Z"}}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := newSlackRigMappingRegistry(path)
+	if err != nil {
+		t.Fatalf("legacy record load: %v", err)
+	}
+	rec, ok := reg.Get("T1", "alpha")
+	if !ok {
+		t.Fatal("legacy record missing after load")
+	}
+	if rec.SlingTarget != "" {
+		t.Errorf("SlingTarget = %q, want empty (legacy)", rec.SlingTarget)
+	}
+	if rec.FixFormula != "" {
+		t.Errorf("FixFormula = %q, want empty (legacy)", rec.FixFormula)
+	}
+}
+
+// TestValidateSlingTargetShape pins the shape rule: sling targets must
+// match `<rig>/<role>` (a single forward slash, non-empty segments,
+// printable identifiers).
+func TestValidateSlingTargetShape(t *testing.T) {
+	good := []string{
+		"alpha/polecat",
+		"mission-control/polecat",
+		"rig_1/role_2",
+		"rig.alpha/polecat-1",
+	}
+	for _, s := range good {
+		if err := validateSlingTarget(s); err != nil {
+			t.Errorf("validateSlingTarget(%q) = %v, want nil", s, err)
+		}
+	}
+	bad := []string{
+		"",
+		"alpha",               // no slash
+		"/polecat",            // empty rig segment
+		"alpha/",              // empty role segment
+		"alpha/polecat/extra", // too many segments
+		"alpha polecat",       // whitespace
+		"alpha\\polecat",
+		"alpha\npolecat",
+	}
+	for _, s := range bad {
+		if err := validateSlingTarget(s); err == nil {
+			t.Errorf("validateSlingTarget(%q) = nil, want error", s)
+		}
+	}
+}
+
+// TestSlackRigMappingRegistryRejectsInvalidSlingTargetOnSet ensures we
+// fail fast on invalid sling_target shape at write time, mirroring
+// validateRigName behavior.
+func TestSlackRigMappingRegistryRejectsInvalidSlingTargetOnSet(t *testing.T) {
+	cityRoot := newTestCity(t)
+	reg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	err = reg.Set(slackRigMappingRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelIDs:  []string{"C1"},
+		SlingTarget: "no-slash",
+		CreatedAt:   now, UpdatedAt: now,
+	})
+	if err == nil {
+		t.Fatal("expected error for malformed sling_target, got nil")
+	}
+}

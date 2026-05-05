@@ -28,6 +28,8 @@ func newSlackMapRigCmd(stdout, stderr io.Writer) *cobra.Command {
 		channels       []string
 		remove         bool
 		removeChannels []string
+		slingTarget    string
+		fixFormula     string
 	)
 	cmd := &cobra.Command{
 		Use:   "map-rig <rig-name>",
@@ -51,7 +53,10 @@ record (or unknown channel) is a silent no-op. --remove,
 --remove-channels, and --channel are mutually exclusive.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runSlackMapRig(stdout, stderr, args[0], workspaceID, channels, remove, removeChannels)
+			slingTargetSet := cmd.Flags().Changed("sling-target")
+			fixFormulaSet := cmd.Flags().Changed("fix-formula")
+			return runSlackMapRig(stdout, stderr, args[0], workspaceID, channels, remove, removeChannels,
+				slingTarget, slingTargetSet, fixFormula, fixFormulaSet)
 		},
 	}
 	defaultWorkspace := slackWorkspaceIDDefault()
@@ -63,6 +68,10 @@ record (or unknown channel) is a silent no-op. --remove,
 		"Remove the rig record entirely (idempotent; mutually exclusive with --channel and --remove-channels)")
 	cmd.Flags().StringSliceVar(&removeChannels, "remove-channels", nil,
 		"Drop these channels from the rig's set; if the set becomes empty the record is deleted (idempotent; mutually exclusive with --channel and --remove)")
+	cmd.Flags().StringVar(&slingTarget, "sling-target", "",
+		"Qualified agent name (`<rig>/<role>`, e.g. `mission-control/polecat`) the adapter targets when dispatching for this rig. Stored on the rig record; required at use time. Omit on re-bind to preserve the current value.")
+	cmd.Flags().StringVar(&fixFormula, "fix-formula", "",
+		"Molecule name spawned by the adapter when this rig handles an inbound interaction (e.g. `mol-slack-fix-issue`). Optional. Omit on re-bind to preserve the current value.")
 	if defaultWorkspace == "" {
 		_ = cmd.MarkFlagRequired("workspace-id")
 	}
@@ -76,10 +85,18 @@ record (or unknown channel) is a silent no-op. --remove,
 	return cmd
 }
 
-func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, channels []string, remove bool, removeChannels []string) error {
+func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, channels []string, remove bool, removeChannels []string,
+	slingTarget string, slingTargetSet bool, fixFormula string, fixFormulaSet bool) error {
 	cityPath, err := resolveCity()
 	if err != nil {
 		return fmt.Errorf("resolve city: %w", err)
+	}
+
+	// Validate --sling-target shape early — fail before touching disk.
+	if slingTargetSet && slingTarget != "" {
+		if err := validateSlingTarget(slingTarget); err != nil {
+			return fmt.Errorf("--sling-target: %w", err)
+		}
 	}
 
 	if remove {
@@ -150,11 +167,24 @@ func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, chann
 	// previously-bound channel is almost always operator surprise
 	// (forgot to include it). Include the dropped set so they can
 	// recover with one re-run.
+	//
+	// Preserve sling_target / fix_formula on idempotent re-bind when
+	// the operator did not supply the corresponding flag — mirrors the
+	// CreatedAt-preservation behavior so that re-binding a channel set
+	// doesn't silently clear dispatch routing.
+	effectiveSlingTarget := slingTarget
+	effectiveFixFormula := fixFormula
 	if existing, ok := rigReg.Get(workspaceID, rigName); ok {
 		dropped := diffStrings(existing.ChannelIDs, desired)
 		if len(dropped) > 0 {
 			fmt.Fprintf(stderr, "Rig %q had channels %v; replacing with %v (dropped: %s). To preserve channels across re-bind, include them all in --channel.\n", //nolint:errcheck
 				rigName, existing.ChannelIDs, desired, strings.Join(dropped, ", "))
+		}
+		if !slingTargetSet {
+			effectiveSlingTarget = existing.SlingTarget
+		}
+		if !fixFormulaSet {
+			effectiveFixFormula = existing.FixFormula
 		}
 	}
 
@@ -163,6 +193,8 @@ func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, chann
 		WorkspaceID: workspaceID,
 		RigName:     rigName,
 		ChannelIDs:  desired,
+		SlingTarget: effectiveSlingTarget,
+		FixFormula:  effectiveFixFormula,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
@@ -226,6 +258,11 @@ func runSlackMapRigRemoveChannels(stdout io.Writer, cityPath, rigName, workspace
 		WorkspaceID: workspaceID,
 		RigName:     rigName,
 		ChannelIDs:  remaining,
+		// Preserve sling_target / fix_formula across partial channel
+		// removal — operators removing a channel don't expect dispatch
+		// routing to be silently cleared.
+		SlingTarget: existing.SlingTarget,
+		FixFormula:  existing.FixFormula,
 		// CreatedAt is preserved by Set when the record exists.
 		CreatedAt: existing.CreatedAt,
 		UpdatedAt: time.Now().UTC(),

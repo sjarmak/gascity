@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	"unicode"
@@ -29,10 +30,21 @@ import (
 // re-Set for the same composite key. UpdatedAt advances on every Set.
 // ChannelIDs is sorted and deduplicated on every Set so on-disk JSON
 // is diff-stable.
+//
+// SlingTarget and FixFormula are the dispatch-routing fields (cby.18.a):
+// SlingTarget is the qualified agent name (`<rig>/<role>`) the adapter
+// passes to `gc sling --target`, and FixFormula is the molecule name
+// the adapter spawns (e.g. `mol-slack-fix-issue`). Both are stored as
+// strings so role names never appear in Go code (ZFC). They are
+// optional in the JSON Schema for legacy-record tolerance — load-time
+// missing → empty string; the resolver surfaces a fix-it error at
+// use time when SlingTarget is empty.
 type slackRigMappingRecord struct {
 	WorkspaceID string    `json:"workspace_id"`
 	RigName     string    `json:"rig_name"`
 	ChannelIDs  []string  `json:"channel_ids"`
+	SlingTarget string    `json:"sling_target,omitempty"`
+	FixFormula  string    `json:"fix_formula,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
@@ -131,6 +143,11 @@ func (r *slackRigMappingRegistry) Set(rec slackRigMappingRecord) error {
 	}
 	if err := validateRigName(rec.RigName); err != nil {
 		return fmt.Errorf("slack rig mapping: %w", err)
+	}
+	if rec.SlingTarget != "" {
+		if err := validateSlingTarget(rec.SlingTarget); err != nil {
+			return fmt.Errorf("slack rig mapping: %w", err)
+		}
 	}
 	channels := dedupSortedChannels(rec.ChannelIDs)
 	if len(channels) == 0 {
@@ -231,6 +248,39 @@ func dedupSortedChannels(in []string) []string {
 	return out
 }
 
+// validateSlingTarget enforces the `<rig>/<role>` shape required by
+// `gc sling --target`. The discord-pack convention (e.g.
+// `mission-control/polecat`) is the wire contract: a single forward
+// slash, two non-empty segments, no whitespace or control characters,
+// no backslashes, no extra slashes. Role names are operator-supplied
+// (ZFC: never hardcoded in Go); this only checks structural shape.
+func validateSlingTarget(target string) error {
+	if target == "" {
+		return fmt.Errorf("sling_target is required")
+	}
+	parts := strings.Split(target, "/")
+	if len(parts) != 2 {
+		return fmt.Errorf("sling_target %q must be of the form <rig>/<role>", target)
+	}
+	for _, seg := range parts {
+		if seg == "" {
+			return fmt.Errorf("sling_target %q has empty segment", target)
+		}
+		for _, r := range seg {
+			if unicode.IsSpace(r) {
+				return fmt.Errorf("sling_target %q must not contain whitespace", target)
+			}
+			if unicode.IsControl(r) {
+				return fmt.Errorf("sling_target %q must not contain control characters", target)
+			}
+			if r == '\\' {
+				return fmt.Errorf("sling_target %q must not contain backslashes", target)
+			}
+		}
+	}
+	return nil
+}
+
 // validateRigName rejects whitespace, slash, backslash, and control
 // characters. Rig names are operator-supplied identifiers used as
 // part of the composite key on disk and as the JSON object key after
@@ -294,6 +344,11 @@ func (r *slackRigMappingRegistry) load() error {
 		}
 		if err := validateRigName(rec.RigName); err != nil {
 			return fmt.Errorf("slack rig mapping store: record %q: %w", key, err)
+		}
+		if rec.SlingTarget != "" {
+			if err := validateSlingTarget(rec.SlingTarget); err != nil {
+				return fmt.Errorf("slack rig mapping store: record %q: %w", key, err)
+			}
 		}
 		if len(rec.ChannelIDs) == 0 {
 			return fmt.Errorf("slack rig mapping store: record %q has empty channel_ids", key)

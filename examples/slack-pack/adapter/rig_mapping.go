@@ -17,10 +17,19 @@ import (
 // rigMappingDiskRecord is the byte-for-byte mirror of
 // cmd/gc.slackRigMappingRecord (cmd/gc/slack_rig_mapping.go). The
 // schema lives at examples/slack-pack/schema/rig_mappings.schema.json.
+//
+// SlingTarget and FixFormula are dispatch-routing fields (cby.18.a):
+// the adapter passes SlingTarget to `gc sling --target` and uses
+// FixFormula as the molecule name to spawn. Both are optional in the
+// JSON Schema for legacy-record tolerance — load-time missing → empty
+// string; ResolveSlingTarget surfaces a fix-it error at use time when
+// SlingTarget is empty.
 type rigMappingDiskRecord struct {
 	WorkspaceID string    `json:"workspace_id"`
 	RigName     string    `json:"rig_name"`
 	ChannelIDs  []string  `json:"channel_ids"`
+	SlingTarget string    `json:"sling_target,omitempty"`
+	FixFormula  string    `json:"fix_formula,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
@@ -62,6 +71,34 @@ func newRigMappingRegistry(diskPath string) (*rigMappingRegistry, error) {
 		return nil, fmt.Errorf("load rig mapping registry from %s: %w", diskPath, err)
 	}
 	return r, nil
+}
+
+// ResolveSlingTarget returns the dispatch-routing fields for the
+// (workspaceID, rigName) record, or an actionable error. Three failure
+// modes:
+//
+//   - record missing → "no rig mapping for workspace=... rig=..."
+//   - record present but SlingTarget empty (legacy or partially
+//     configured) → fix-it message instructing the operator to re-run
+//     `gc slack map-rig --sling-target ...`. The message is verbatim
+//     so callers can surface it to operators (Slack DM, log line) and
+//     the operator knows the exact verb to run.
+//
+// FixFormula is returned as-is (may be empty); the dispatch handler
+// (cby.18.3) decides whether to fall back to a config-driven default.
+func (r *rigMappingRegistry) ResolveSlingTarget(workspaceID, rigName string) (target, fixFormula string, err error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rec, ok := r.byKey[rigMappingKey(workspaceID, rigName)]
+	if !ok {
+		return "", "", fmt.Errorf("no rig mapping for workspace=%q rig=%q; run `gc slack map-rig %s --workspace-id %s --channel <c> --sling-target <rig>/<role>` to create one",
+			workspaceID, rigName, rigName, workspaceID)
+	}
+	if rec.SlingTarget == "" {
+		return "", "", fmt.Errorf("rig %q in workspace %q has no sling target; re-run `gc slack map-rig %s --workspace-id %s --sling-target <rig>/<role>` to set one",
+			rigName, workspaceID, rigName, workspaceID)
+	}
+	return rec.SlingTarget, rec.FixFormula, nil
 }
 
 // LookupRigForChannel returns the record covering (workspaceID,
