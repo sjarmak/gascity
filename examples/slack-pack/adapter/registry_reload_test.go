@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -525,5 +527,78 @@ func TestParseFunctionsReturnNilSentinelOnMissingFile(t *testing.T) {
 	}
 	if snap, err := parseRoomLaunchMappingRegistry(missing); snap != nil || err != nil {
 		t.Errorf("parseRoomLaunchMappingRegistry missing = (%v, %v), want (nil, nil)", snap, err)
+	}
+}
+
+// --- scrubAppsRegistryError --------------------------------------------------
+//
+// gc-cby.37: defensive scrub before logReloadOutcome writes to journald. The
+// apps registry error wraps json.Decoder offsets and file paths today — Go's
+// stdlib does not embed payload values in type-mismatch messages, but a
+// future stdlib change or a json-decoder swap could change that. Replace any
+// apps-registry-prefixed error component with a fixed sentinel; keep other
+// registries' errors verbatim so operators retain actionable context.
+
+func TestScrubAppsRegistryErrorReplacesAppsOnlyError(t *testing.T) {
+	err := fmt.Errorf("apps registry: decode apps registry: invalid character 'x' looking for value")
+	got := scrubAppsRegistryError(err)
+	if strings.Contains(got, "invalid character") || strings.Contains(got, "decode apps registry") {
+		t.Errorf("scrubbed output %q must not contain raw apps-registry parse detail", got)
+	}
+	if !strings.Contains(got, "apps registry: reload failed") {
+		t.Errorf("scrubbed output %q must contain sentinel", got)
+	}
+}
+
+func TestScrubAppsRegistryErrorPreservesNonAppsErrorVerbatim(t *testing.T) {
+	err := fmt.Errorf("rig mapping: parse rig_mappings.json: unexpected EOF")
+	got := scrubAppsRegistryError(err)
+	if got != err.Error() {
+		t.Errorf("non-apps error must be verbatim: got %q, want %q", got, err.Error())
+	}
+}
+
+func TestScrubAppsRegistryErrorScrubsOnlyAppsPortionOfJoinedChain(t *testing.T) {
+	apps := fmt.Errorf("apps registry: decode apps registry: secret-bearing detail %s", "v=hunter2")
+	chans := fmt.Errorf("channel mapping: parse channel_mappings.json: unexpected EOF")
+	rigs := fmt.Errorf("rig mapping: empty channel_ids for rig-a")
+	joined := errors.Join(apps, chans, rigs)
+
+	got := scrubAppsRegistryError(joined)
+
+	if strings.Contains(got, "hunter2") || strings.Contains(got, "secret-bearing") {
+		t.Errorf("scrubbed joined output %q must not leak apps-registry detail", got)
+	}
+	if !strings.Contains(got, "apps registry: reload failed") {
+		t.Errorf("scrubbed joined output %q must contain sentinel", got)
+	}
+	if !strings.Contains(got, "channel mapping: parse channel_mappings.json: unexpected EOF") {
+		t.Errorf("scrubbed joined output %q must preserve channel mapping error verbatim", got)
+	}
+	if !strings.Contains(got, "rig mapping: empty channel_ids for rig-a") {
+		t.Errorf("scrubbed joined output %q must preserve rig mapping error verbatim", got)
+	}
+}
+
+func TestScrubAppsRegistryErrorHandlesAppsErrorWithEmbeddedNewlines(t *testing.T) {
+	// Defensive: even if a future apps-registry error contains a newline
+	// (e.g. a multi-line JSON decode message), the structural unwrap of
+	// errors.Join components must still scrub the entire apps component.
+	apps := fmt.Errorf("apps registry: decode failed at offset 42:\nleaked-line: hunter2")
+	chans := fmt.Errorf("channel mapping: parse channel_mappings.json: unexpected EOF")
+	joined := errors.Join(apps, chans)
+
+	got := scrubAppsRegistryError(joined)
+	if strings.Contains(got, "hunter2") || strings.Contains(got, "leaked-line") {
+		t.Errorf("scrubbed output %q must not leak content from multi-line apps error", got)
+	}
+	if !strings.Contains(got, "channel mapping: parse channel_mappings.json: unexpected EOF") {
+		t.Errorf("scrubbed output %q must preserve channel mapping error verbatim", got)
+	}
+}
+
+func TestScrubAppsRegistryErrorOnNilReturnsEmpty(t *testing.T) {
+	if got := scrubAppsRegistryError(nil); got != "" {
+		t.Errorf("scrubAppsRegistryError(nil) = %q, want empty string", got)
 	}
 }

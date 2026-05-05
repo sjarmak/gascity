@@ -5,7 +5,57 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 )
+
+// appsRegistryErrorPrefix is the name passed to stage() for the apps
+// registry — `errors.Join` wraps each registry's error with this prefix.
+// scrubAppsRegistryError matches on it to find the apps component.
+const appsRegistryErrorPrefix = "apps registry:"
+
+// appsRegistryScrubSentinel replaces the apps-registry component of a
+// reload error chain before it is logged. apps_registry.go parse errors
+// today carry only structural detail (file path, byte offset, JSON
+// decode position), but the encoding/json contract does not document
+// that payload values are absent from type-mismatch messages — a future
+// stdlib version or a json-decoder swap could change that. Defensive
+// scrub keeps signing-secret material out of journald regardless.
+const appsRegistryScrubSentinel = "apps registry: reload failed (see structured debug log)"
+
+// scrubAppsRegistryError formats err for operator-facing logging while
+// replacing any apps-registry-prefixed component with a fixed sentinel.
+//
+// errors.Join (the only producer of multi-error chains in
+// reloadAllRegistries) returns a value that implements
+// `Unwrap() []error`. We use that structural API to identify each
+// component error individually rather than splitting err.Error() on
+// newlines — splitting is brittle if a future apps-registry error
+// contains an embedded newline (the second line wouldn't carry the
+// "apps registry:" prefix and would slip through unscrubbed).
+//
+// Errors not produced by errors.Join (e.g. a single-source failure) are
+// inspected by their Error() string prefix as a fallback.
+//
+// Returns empty string for nil so call sites can use it unconditionally.
+func scrubAppsRegistryError(err error) string {
+	if err == nil {
+		return ""
+	}
+	type multi interface{ Unwrap() []error }
+	if m, ok := err.(multi); ok {
+		parts := m.Unwrap()
+		scrubbed := make([]string, len(parts))
+		for i, p := range parts {
+			scrubbed[i] = scrubAppsRegistryError(p)
+		}
+		return strings.Join(scrubbed, "\n")
+	}
+	msg := err.Error()
+	if strings.HasPrefix(msg, appsRegistryErrorPrefix) {
+		return appsRegistryScrubSentinel
+	}
+	return msg
+}
 
 // reloadAllRegistries re-reads the four CLI-written registry files and
 // atomically swaps the in-memory snapshots — SIGHUP entry point for
@@ -109,7 +159,7 @@ func logReloadOutcome(
 ) {
 	log.Printf("SIGHUP received: reloading slack-pack registries")
 	if err := reloadAllRegistries(apps, chans, rigs, rooms); err != nil {
-		log.Printf("WARN: registry reload failed (live state preserved): %v", err)
+		log.Printf("WARN: registry reload failed (live state preserved): %s", scrubAppsRegistryError(err))
 		return
 	}
 	log.Printf("registry reload OK: apps=%d channels=%d rigs=%d rooms=%d",
