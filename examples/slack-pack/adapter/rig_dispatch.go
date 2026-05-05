@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os/exec"
+	"sort"
 	"strings"
 )
 
@@ -52,20 +53,33 @@ func runDispatchTestHook() {
 	}
 }
 
-// dispatchSlashCommandToRig is the rig-target counterpart of
-// dispatchSlashCommandToSession. It runs the synchronous validation
-// (sling-target lookup, rig workdir resolution, dispatch-slot acquire)
-// and writes the appropriate ephemeral; on success it spawns the
-// background dispatch goroutine that calls `bd create` then `gc sling`.
+// openRigFixModalForSlash is the rig-target counterpart of
+// dispatchSlashCommandToSession. It runs synchronous validation
+// (sling-target lookup, rig workdir resolution) and — on success —
+// calls Slack's views.open API with a modal collecting summary +
+// context_markdown before any bead is created. Dispatch happens later,
+// in handleViewSubmissionPayload, when the user submits the modal.
 //
-// The function is invoked from handleSlackInteractions's rig branch and
-// owns the HTTP response — every code path here either calls
-// writeEphemeral or writes a synchronous ack and returns.
-func dispatchSlashCommandToRig(
+// Why pre-validate before opening the modal: a modal that submits to a
+// misconfigured rig wastes the user's typing. We reject up front via
+// ephemeral so the user can re-run after `gc slack map-rig` fixes.
+//
+// Slack's trigger_id is valid for ~3 seconds — the views.open call
+// MUST fire synchronously inside this handler. The HTTP response to
+// the slash command itself is empty (Slack treats `200` with empty
+// body as "no slash response" while still surfacing the modal that
+// the views.open call opened).
+//
+// gc-cby.18.4: replaces the cby.18.3 immediate-dispatch flow on
+// slash. Block_actions still dispatches immediately
+// (dispatchBlockActionsToRig); modal capture is slash-only by design
+// — block_actions already carries an action_id+value of the user's
+// choice, so prompting for a summary on top would be friction.
+func openRigFixModalForSlash(
 	w http.ResponseWriter,
 	cfg config,
 	rigReg *rigMappingRegistry,
-	workspaceID, rigName, command, text, channelID, userID string,
+	workspaceID, rigName, command, text, channelID, userID, triggerID string,
 ) {
 	if rigReg == nil {
 		writeEphemeral(w, http.StatusOK, fmt.Sprintf(
@@ -75,42 +89,63 @@ func dispatchSlashCommandToRig(
 	}
 	target, fixFormula, err := rigReg.ResolveSlingTarget(workspaceID, rigName)
 	if err != nil {
-		// ResolveSlingTarget errors are operator-actionable fix-its;
-		// surface verbatim.
 		writeEphemeral(w, http.StatusOK, err.Error())
 		return
 	}
-	workdir, err := rigWorkdir(cfg.cityPath, rigName)
-	if err != nil {
+	if _, err := rigWorkdir(cfg.cityPath, rigName); err != nil {
 		writeEphemeral(w, http.StatusOK, fmt.Sprintf(
 			"rig workdir not found in routes.jsonl: %v", err))
 		return
 	}
-
-	release, capacity, acquired := acquireDispatchSlot()
-	if !acquired {
-		log.Printf("slack adapter: dispatch queue full (cap=%d), dropping slash command=%q channel=%q rig=%q",
-			capacity, command, channelID, rigName)
+	if cfg.slackBotToken == "" {
 		writeEphemeral(w, http.StatusOK,
-			"Slack adapter is currently saturated; please retry shortly.")
+			"Slack adapter has no bot token configured; cannot open modal. Set SLACK_BOT_TOKEN and restart.")
+		return
+	}
+	if triggerID == "" {
+		writeEphemeral(w, http.StatusOK,
+			"Slack slash-command payload missing trigger_id; cannot open modal.")
 		return
 	}
 
-	writeEphemeral(w, http.StatusOK, fmt.Sprintf(
-		"Routing %s to rig %s…", command, rigName))
-
-	title := fmt.Sprintf("[slack/%s by %s] %s",
-		neutralizeMarkupBoundaries(channelID),
-		neutralizeMarkupBoundaries(userID),
-		neutralizeMarkupBoundaries(text),
-	)
-	title = truncateForTitle(title)
-
-	go func() {
-		defer release()
-		defer runDispatchTestHook()
-		runRigDispatch(workdir, cfg.cityPath, target, fixFormula, title, rigName)
-	}()
+	meta := slackRigDispatchMetadata{
+		Kind:                metadataKindRigFix,
+		WorkspaceID:         workspaceID,
+		RigName:             rigName,
+		SlingTarget:         target,
+		FixFormula:          fixFormula,
+		ChannelID:           channelID,
+		UserID:              userID,
+		OriginalCommand:     command,
+		OriginalCommandText: text,
+	}
+	pm, err := encodeRigDispatchMetadata(meta)
+	if err != nil {
+		log.Printf("slack interactions: encode rig modal metadata rig=%q: %v", rigName, err)
+		writeEphemeral(w, http.StatusOK,
+			"Internal error preparing modal payload; please retry or use `gc slack map-rig` to verify configuration.")
+		return
+	}
+	view, err := buildRigFixModalView(meta, pm)
+	if err != nil {
+		log.Printf("slack interactions: build rig modal view rig=%q: %v", rigName, err)
+		writeEphemeral(w, http.StatusOK,
+			"Internal error building modal view; please retry.")
+		return
+	}
+	if _, err := callViewsOpen(cfg.slackBotToken, triggerID, view); err != nil {
+		log.Printf("slack interactions: views.open rig=%q trigger=%q: %v",
+			rigName, triggerID, err)
+		writeEphemeral(w, http.StatusOK, fmt.Sprintf(
+			"Could not open Slack modal: %v", err))
+		return
+	}
+	log.Printf("interaction: workspace=%q channel=%q rig=%q opened rig-fix modal user=%q",
+		workspaceID, channelID, rigName, userID)
+	// Slack already received our modal-open via views.open — respond
+	// with an empty 200 so no extra ephemeral fires (the modal itself
+	// is the user-visible feedback).
+	w.WriteHeader(http.StatusOK)
 }
 
 // dispatchBlockActionsToRig is the rig-target counterpart of
@@ -176,27 +211,138 @@ func dispatchBlockActionsToRig(
 	go func() {
 		defer release()
 		defer runDispatchTestHook()
-		runRigDispatch(workdir, cfg.cityPath, target, fixFormula, title, rigName)
+		runRigDispatch(workdir, cfg.cityPath, target, fixFormula, title, rigName, nil)
+	}()
+}
+
+// dispatchRigFixFromViewSubmission handles a Slack view_submission
+// whose private_metadata is a `rig_fix` envelope written by
+// openRigFixModalForSlash. Block_actions doesn't reach here — modal
+// submission is the only path.
+//
+// Re-resolves rig + workdir at submission time (the metadata is
+// trusted insofar as Slack signed the interactions envelope, but the
+// rig may have been remapped between open and submit; we want the
+// authoritative current registry view, not the snapshot the modal
+// opener captured).
+//
+// The summary input (required) becomes the bead title; the
+// context_markdown input (optional) is forwarded to `gc sling` as
+// `--var context_markdown=<value>`. The original slash-command text
+// is forwarded as `--var slash_command_text=<value>` so the model
+// sees both the user's modal-curated framing and the original raw
+// trigger.
+//
+// Errors from rigReg/rigWorkdir at submission time route to
+// clear-modal so the user sees the modal close + a logged warning;
+// they have to re-run the slash command after fixing config.
+func dispatchRigFixFromViewSubmission(
+	w http.ResponseWriter,
+	cfg config,
+	rigReg *rigMappingRegistry,
+	meta slackRigDispatchMetadata,
+	p *slackInteractionPayload,
+) {
+	if rigReg == nil {
+		log.Printf("slack interactions: view_submission rig_fix but rigReg=nil rig=%q", meta.RigName)
+		writeViewClear(w)
+		return
+	}
+	target, fixFormula, err := rigReg.ResolveSlingTarget(meta.WorkspaceID, meta.RigName)
+	if err != nil {
+		log.Printf("slack interactions: view_submission rig_fix re-resolve failed workspace=%q rig=%q: %v",
+			meta.WorkspaceID, meta.RigName, err)
+		writeViewClear(w)
+		return
+	}
+	workdir, err := rigWorkdir(cfg.cityPath, meta.RigName)
+	if err != nil {
+		log.Printf("slack interactions: view_submission rig_fix workdir lookup failed rig=%q: %v",
+			meta.RigName, err)
+		writeViewClear(w)
+		return
+	}
+
+	summary := strings.TrimSpace(extractModalInput(
+		p.View.State.Values, rigFixModalSummaryBlockID, rigFixModalSummaryActionID))
+	if summary == "" {
+		// Slack enforces required input on its side, but defend in
+		// depth in case the schema drifts.
+		log.Printf("slack interactions: view_submission rig_fix missing summary rig=%q user=%q",
+			meta.RigName, meta.UserID)
+		writeViewClear(w)
+		return
+	}
+	contextMarkdown := strings.TrimSpace(extractModalInput(
+		p.View.State.Values, rigFixModalContextBlockID, rigFixModalContextActionID))
+
+	release, capacity, acquired := acquireDispatchSlot()
+	if !acquired {
+		log.Printf("slack adapter: dispatch queue full (cap=%d), dropping view_submission rig_fix rig=%q user=%q",
+			capacity, meta.RigName, meta.UserID)
+		writeViewClear(w)
+		return
+	}
+
+	// Respond `{}` synchronously so Slack closes only the current
+	// view. The dispatch goroutine fires after the response.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write([]byte("{}")); err != nil {
+		log.Printf("slack interactions: write view_submission rig_fix ack: %v", err)
+	}
+	log.Printf("interaction: workspace=%q user=%q rig=%q type=view_submission callback=%q kind=rig_fix",
+		meta.WorkspaceID, meta.UserID, meta.RigName, p.View.CallbackID)
+
+	title := fmt.Sprintf("[slack/%s by %s] %s",
+		neutralizeMarkupBoundaries(meta.ChannelID),
+		neutralizeMarkupBoundaries(meta.UserID),
+		neutralizeMarkupBoundaries(summary),
+	)
+	title = truncateForTitle(title)
+
+	vars := map[string]string{
+		"slack_channel_id": meta.ChannelID,
+		"slack_user_id":    meta.UserID,
+		"slack_rig":        meta.RigName,
+		"summary":          summary,
+	}
+	if contextMarkdown != "" {
+		vars["context_markdown"] = contextMarkdown
+	}
+	if meta.OriginalCommandText != "" {
+		vars["slash_command_text"] = meta.OriginalCommandText
+	}
+
+	go func() {
+		defer release()
+		defer runDispatchTestHook()
+		runRigDispatch(workdir, cfg.cityPath, target, fixFormula, title, meta.RigName, vars)
 	}()
 }
 
 // runRigDispatch performs the two subprocess legs of a rig-target
 // dispatch: `bd create` inside the rig workdir to mint a task bead,
-// then `gc sling <target> <bead_id> [--on <fix_formula>]` from the
-// city root to invoke dispatch. Failures at the gc-sling leg trigger a
-// best-effort `bd close <bead_id> -r dispatch_failed` so the orphan
-// task does not show up as queued work.
+// then `gc sling <target> <bead_id> [--on <fix_formula>] [--var k=v]…`
+// from the city root to invoke dispatch. Failures at the gc-sling leg
+// trigger a best-effort `bd close <bead_id> -r dispatch_failed` so the
+// orphan task does not show up as queued work.
 //
 // Empty fixFormula deliberately omits the --on flag (cby.18.3 design
 // choice): gc sling falls through to its own default formula
 // resolution rather than the adapter inventing one.
-func runRigDispatch(workdir, cityPath, target, fixFormula, title, rigName string) {
+//
+// vars is forwarded as repeated --var k=v pairs in deterministic key
+// order. nil/empty omits the flag entirely. Used by the modal-backed
+// intake (gc-cby.18.4) to pipe captured summary/context_markdown to
+// the dispatched formula.
+func runRigDispatch(workdir, cityPath, target, fixFormula, title, rigName string, vars map[string]string) {
 	beadID, err := runBdCreate(workdir, title)
 	if err != nil {
 		log.Printf("rig dispatch: bd create in %s rig=%q: %v", workdir, rigName, err)
 		return
 	}
-	if err := runGcSling(cityPath, target, beadID, fixFormula); err != nil {
+	if err := runGcSling(cityPath, target, beadID, fixFormula, vars); err != nil {
 		log.Printf("rig dispatch: gc sling target=%q bead=%s rig=%q: %v",
 			target, beadID, rigName, err)
 		closeOrphanBead(workdir, beadID)
@@ -227,13 +373,26 @@ func runBdCreate(workdir, title string) (string, error) {
 	return rec.ID, nil
 }
 
-// runGcSling invokes `gc sling <target> <beadID> [--on <fixFormula>]`
-// from cityPath. Empty fixFormula omits --on so gc applies its
-// configured default formula (cby.18.3).
-func runGcSling(cityPath, target, beadID, fixFormula string) error {
+// runGcSling invokes `gc sling <target> <beadID> [--on <fixFormula>]
+// [--var k=v]…` from cityPath. Empty fixFormula omits --on so gc
+// applies its configured default formula (cby.18.3). vars is emitted
+// as repeated --var pairs in sorted-by-key order so the command line
+// is deterministic across calls (test-friendly + log-readable).
+// nil/empty vars omits the flag entirely.
+func runGcSling(cityPath, target, beadID, fixFormula string, vars map[string]string) error {
 	args := []string{"sling", target, beadID}
 	if fixFormula != "" {
 		args = append(args, "--on", fixFormula)
+	}
+	if len(vars) > 0 {
+		keys := make([]string, 0, len(vars))
+		for k := range vars {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			args = append(args, "--var", fmt.Sprintf("%s=%s", k, vars[k]))
+		}
 	}
 	cmd := dispatchExecCommand("gc", args...)
 	cmd.Dir = cityPath

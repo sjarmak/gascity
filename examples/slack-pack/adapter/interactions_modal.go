@@ -1,0 +1,292 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+)
+
+// Modal-backed summary/context capture for rig slash-command intake.
+// gc-cby.18.4 — when a slash command lands in a rig-bound channel, the
+// adapter calls Slack's `views.open` API to surface a modal collecting
+// a one-line summary plus optional markdown context BEFORE creating
+// the bead. The captured fields land on the bead title and a
+// `gc sling --var context_markdown=...` argument so the agent picking
+// the work has more than the raw slash text.
+//
+// Why a modal instead of dispatching the raw slash text:
+//   - Slash text is single-line, untyped, and often a one-word trigger
+//     ("/gc") that the user expects to drive a richer interaction. The
+//     modal gives the user a place to describe the work without
+//     learning a slash-flag DSL.
+//   - The captured `context_markdown` is forwarded to the model verbatim
+//     via --var, keeping ZFC: Go is plumbing, the agent decides.
+//
+// Wire reference (Slack docs, May 2026):
+//   - views.open:                 https://api.slack.com/methods/views.open
+//   - block_kit input element:    https://api.slack.com/reference/block-kit/block-elements#input
+
+// rigFixModalCallbackID identifies the modal on submission. Stable
+// across releases — view_submission handler routes on it (combined
+// with the kind in private_metadata).
+const rigFixModalCallbackID = "gc_rig_fix_modal"
+
+// metadataKindRigFix is the discriminator embedded in
+// view.private_metadata to distinguish rig-fix submissions from the
+// legacy session-message submissions handled by gc-cby.17.
+const metadataKindRigFix = "rig_fix"
+
+// Modal block + action ids. The view_submission handler reads
+// view.state.values[block_id][action_id].value to recover the user's
+// input — these constants are the contract.
+const (
+	rigFixModalSummaryBlockID  = "summary_block"
+	rigFixModalSummaryActionID = "summary_input"
+	rigFixModalContextBlockID  = "context_block"
+	rigFixModalContextActionID = "context_input"
+)
+
+// rigFixModalSummaryMaxLen caps the summary input. Slack's
+// plain_text_input enforces a max_length on its own when set; we
+// mirror that here for the bead title (cf. rigDispatchTitleMaxLen).
+const rigFixModalSummaryMaxLen = 150
+
+// slackRigDispatchMetadata is the contract carried in
+// view.private_metadata when the slash-command rig branch opens the
+// modal. The view_submission handler decodes this strictly: any extra
+// field, missing kind, or malformed JSON routes to clear-modal.
+//
+// Kind is the discriminator — exactly "rig_fix" today. RigName is the
+// authoritative routing key (lookups go through rigReg at submission
+// time, not the embedded SlingTarget/FixFormula). SlingTarget and
+// FixFormula are carried for diagnostics only; the submission handler
+// re-resolves them from the registry to defeat metadata staleness if
+// the rig was remapped between open and submit.
+//
+// OriginalCommandText is the slash command's `text` argument verbatim —
+// surfaced to the agent (via system-reminder or --var context) so the
+// model has the user's original phrasing alongside the modal-captured
+// summary.
+type slackRigDispatchMetadata struct {
+	Kind                string `json:"kind"`
+	WorkspaceID         string `json:"workspace_id"`
+	RigName             string `json:"rig_name"`
+	SlingTarget         string `json:"sling_target"`
+	FixFormula          string `json:"fix_formula"`
+	ChannelID           string `json:"channel_id"`
+	UserID              string `json:"user_id"`
+	OriginalCommand     string `json:"original_command"`
+	OriginalCommandText string `json:"original_command_text"`
+}
+
+// maxRigDispatchMetadataLen caps the encoded private_metadata size.
+// Slack lets openers stuff up to 3000 bytes; we cap well below that
+// since the embedded ids are short and a runaway value indicates
+// either misuse or a hostile opener.
+const maxRigDispatchMetadataLen = 2500
+
+// encodeRigDispatchMetadata serializes meta to a compact JSON string
+// suitable for view.private_metadata. Returns the encoded length so
+// callers can refuse to call views.open with an oversized payload.
+func encodeRigDispatchMetadata(meta slackRigDispatchMetadata) (string, error) {
+	if meta.Kind == "" {
+		meta.Kind = metadataKindRigFix
+	}
+	b, err := json.Marshal(meta)
+	if err != nil {
+		return "", fmt.Errorf("encode rig dispatch metadata: %w", err)
+	}
+	if len(b) > maxRigDispatchMetadataLen {
+		return "", fmt.Errorf("rig dispatch metadata exceeds %d bytes (got %d)",
+			maxRigDispatchMetadataLen, len(b))
+	}
+	return string(b), nil
+}
+
+// decodeRigDispatchMetadata parses the private_metadata string set by
+// the slash-command flow. Strict decode (DisallowUnknownFields)
+// prevents app authors from smuggling extra routing knobs the handler
+// hasn't sanctioned. Returns (meta, true) only when the kind matches
+// metadataKindRigFix — any other shape (legacy session_id, malformed,
+// unknown kind) returns (_, false) so the caller falls back to the
+// existing routing path.
+func decodeRigDispatchMetadata(raw string) (slackRigDispatchMetadata, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return slackRigDispatchMetadata{}, false
+	}
+	if len(raw) > maxRigDispatchMetadataLen {
+		return slackRigDispatchMetadata{}, false
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var meta slackRigDispatchMetadata
+	if err := dec.Decode(&meta); err != nil {
+		return slackRigDispatchMetadata{}, false
+	}
+	if meta.Kind != metadataKindRigFix {
+		return slackRigDispatchMetadata{}, false
+	}
+	if meta.RigName == "" || meta.WorkspaceID == "" {
+		return slackRigDispatchMetadata{}, false
+	}
+	return meta, true
+}
+
+// buildRigFixModalView assembles the Slack views.open `view` payload.
+// The block layout is two plain_text_inputs:
+//
+//  1. summary (single-line, required, max 150 chars) — drives the
+//     bead title.
+//  2. context_markdown (multi-line, optional) — forwarded to gc sling
+//     via --var context_markdown=<value>.
+//
+// title_text is a short modal header derived from the rig name so the
+// user sees which rig will receive the work.
+//
+// Returns a JSON-encoded view object; callers pass this verbatim to
+// the views.open API call.
+func buildRigFixModalView(meta slackRigDispatchMetadata, privateMetadata string) ([]byte, error) {
+	titleText := "gc rig: " + meta.RigName
+	if len(titleText) > 24 {
+		// Slack caps modal titles at 24 characters.
+		titleText = titleText[:24]
+	}
+
+	view := map[string]any{
+		"type":             "modal",
+		"callback_id":      rigFixModalCallbackID,
+		"private_metadata": privateMetadata,
+		"title": map[string]any{
+			"type": "plain_text",
+			"text": titleText,
+		},
+		"submit": map[string]any{
+			"type": "plain_text",
+			"text": "Dispatch",
+		},
+		"close": map[string]any{
+			"type": "plain_text",
+			"text": "Cancel",
+		},
+		"blocks": []any{
+			map[string]any{
+				"type":     "input",
+				"block_id": rigFixModalSummaryBlockID,
+				"label": map[string]any{
+					"type": "plain_text",
+					"text": "Summary",
+				},
+				"element": map[string]any{
+					"type":       "plain_text_input",
+					"action_id":  rigFixModalSummaryActionID,
+					"max_length": rigFixModalSummaryMaxLen,
+					"placeholder": map[string]any{
+						"type": "plain_text",
+						"text": "One-line description of the work",
+					},
+				},
+			},
+			map[string]any{
+				"type":     "input",
+				"block_id": rigFixModalContextBlockID,
+				"optional": true,
+				"label": map[string]any{
+					"type": "plain_text",
+					"text": "Context (markdown)",
+				},
+				"element": map[string]any{
+					"type":      "plain_text_input",
+					"action_id": rigFixModalContextActionID,
+					"multiline": true,
+					"placeholder": map[string]any{
+						"type": "plain_text",
+						"text": "Optional: links, logs, repro steps",
+					},
+				},
+			},
+		},
+	}
+	b, err := json.Marshal(view)
+	if err != nil {
+		return nil, fmt.Errorf("encode rig fix modal view: %w", err)
+	}
+	return b, nil
+}
+
+// slackViewsOpenRequest is the JSON envelope Slack's views.open API
+// expects. We keep View as a json.RawMessage so we don't double-marshal.
+type slackViewsOpenRequest struct {
+	TriggerID string          `json:"trigger_id"`
+	View      json.RawMessage `json:"view"`
+}
+
+// slackViewsOpenResponse mirrors the shape of the views.open response
+// fields the handler reads. Slack returns more fields than this; we
+// model only what we need to log+surface.
+type slackViewsOpenResponse struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+// callViewsOpen posts the trigger_id + view JSON to Slack's views.open
+// API using the configured bot token. Returns the parsed response or
+// an error wrapping any transport / decode failure. A 2xx response
+// with `ok:false` becomes a typed error including Slack's error code.
+//
+// Slack's trigger_id is valid for ~3 seconds — callers must invoke
+// this synchronously inside the slash-command HTTP handler to stay
+// inside that window.
+func callViewsOpen(token, triggerID string, view []byte) (*slackViewsOpenResponse, error) {
+	body, err := json.Marshal(slackViewsOpenRequest{TriggerID: triggerID, View: view})
+	if err != nil {
+		return nil, fmt.Errorf("encode views.open request: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, slackAPIBase+"/views.open", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build views.open request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("POST views.open: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read views.open response: %w", err)
+	}
+	var sr slackViewsOpenResponse
+	if err := json.Unmarshal(respBody, &sr); err != nil {
+		return nil, fmt.Errorf("decode views.open response: %w (body=%s)", err, string(respBody))
+	}
+	if !sr.OK {
+		return &sr, fmt.Errorf("views.open returned ok=false error=%q", sr.Error)
+	}
+	return &sr, nil
+}
+
+// extractModalInput returns the user-supplied value for one
+// plain_text_input on a view_submission's view.state.values. Missing
+// blocks and missing actions yield "" so optional fields don't error.
+func extractModalInput(values map[string]map[string]json.RawMessage, blockID, actionID string) string {
+	block, ok := values[blockID]
+	if !ok {
+		return ""
+	}
+	raw, ok := block[actionID]
+	if !ok {
+		return ""
+	}
+	var elem struct {
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(raw, &elem); err != nil {
+		return ""
+	}
+	return elem.Value
+}

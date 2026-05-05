@@ -365,6 +365,7 @@ func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry, rigReg 
 		command := form.Get("command")
 		text := form.Get("text")
 		userID := form.Get("user_id")
+		triggerID := form.Get("trigger_id")
 
 		if teamID == "" {
 			log.Printf("slack interactions: missing team_id in slash-command form")
@@ -412,7 +413,7 @@ func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry, rigReg 
 				dispatchSlashCommandToSession(cfg, rec.TargetID, command, text, channelID, teamID, userID)
 			}()
 		case channelMappingTargetKindRig:
-			dispatchSlashCommandToRig(w, cfg, rigReg, teamID, rec.TargetID, command, text, channelID, userID)
+			openRigFixModalForSlash(w, cfg, rigReg, teamID, rec.TargetID, command, text, channelID, userID, triggerID)
 		default:
 			// load() rejects unknown target_kind, so reaching this branch
 			// means the registry was mutated mid-flight by another
@@ -549,7 +550,7 @@ func handleInteractionPayload(w http.ResponseWriter, cfg config, mapReg *channel
 	case interactionTypeBlockActions:
 		handleBlockActionsPayload(w, cfg, mapReg, rigReg, &p)
 	case interactionTypeViewSubmission:
-		handleViewSubmissionPayload(w, cfg, &p)
+		handleViewSubmissionPayload(w, cfg, rigReg, &p)
 	default:
 		writeEphemeral(w, http.StatusOK, fmt.Sprintf(
 			"unsupported interaction type=%q. slack-pack supports block_actions and view_submission today; other Slack interaction types (shortcut, message_action, view_closed, block_suggestion) are tracked under the gc-cby epic.",
@@ -619,15 +620,28 @@ func handleBlockActionsPayload(w http.ResponseWriter, cfg config, mapReg *channe
 	}
 }
 
-// handleViewSubmissionPayload routes a view_submission payload via
-// view.private_metadata = `{"session_id":"..."}`. Modals carry no
-// channel context, so the opener is responsible for stuffing the
-// target session into private_metadata when it calls views.open. Any
-// decode failure (missing, malformed, unknown fields, oversized
-// session_id) responds with `{"response_action":"clear"}` so Slack
-// closes the modal stack and the user knows the submission did not
-// process. The accountID gate has already fired in the caller.
-func handleViewSubmissionPayload(w http.ResponseWriter, cfg config, p *slackInteractionPayload) {
+// handleViewSubmissionPayload routes a view_submission payload by
+// inspecting view.private_metadata. Two metadata shapes are
+// recognized:
+//
+//  1. `{"kind":"rig_fix",…}` (gc-cby.18.4) — written by
+//     openRigFixModalForSlash. Routes to dispatchRigFixFromViewSubmission
+//     which mints a bead in the rig workdir and dispatches via gc sling.
+//  2. `{"session_id":"..."}` (gc-cby.17 legacy) — modal opened by an
+//     external session that wants the submission forwarded as a
+//     system-reminder.
+//
+// Modals carry no channel context, so the opener is responsible for
+// stuffing the target into private_metadata when it calls views.open.
+// Any decode failure (missing, malformed, unknown fields, oversized
+// values) responds with `{"response_action":"clear"}` so Slack closes
+// the modal stack and the user knows the submission did not process.
+// The accountID gate has already fired in the caller.
+func handleViewSubmissionPayload(w http.ResponseWriter, cfg config, rigReg *rigMappingRegistry, p *slackInteractionPayload) {
+	if meta, ok := decodeRigDispatchMetadata(p.View.PrivateMetadata); ok {
+		dispatchRigFixFromViewSubmission(w, cfg, rigReg, meta, p)
+		return
+	}
 	sessionID, ok := decodePrivateMetadata(p.View.PrivateMetadata)
 	if !ok {
 		log.Printf("slack interactions: view_submission private_metadata invalid team=%q user=%q callback=%q (clearing modal)",
