@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1648,6 +1649,77 @@ func TestHandlePublishFile(t *testing.T) {
 				t.Errorf("getUploadURL form missing filename: %q", fake.getURLForm)
 			}
 		})
+	}
+}
+
+// TestReadConfinedFileReadsRealFile is the positive baseline for the
+// readConfinedFile helper that closes the gc-cby.10 TOCTOU window —
+// reading a regular file inside the upload root must succeed and return
+// the file's bytes verbatim.
+func TestReadConfinedFileReadsRealFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "real.txt")
+	want := []byte("hello world")
+	if err := os.WriteFile(path, want, 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	got, err := readConfinedFile(dir, path)
+	if err != nil {
+		t.Fatalf("readConfinedFile: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestReadConfinedFileRejectsSymlink covers the gc-cby.10 residual TOCTOU.
+// In production the call site has already EvalSymlinks-resolved the path
+// to a canonical target with no symlinks; if a symlink appears at the leaf
+// between the confinement re-check and the read, an attacker would have
+// swapped the inode in the race window. O_NOFOLLOW makes that swap visible
+// as ELOOP rather than silent arbitrary-read. Both Linux and macOS return
+// ELOOP from open(2) with O_NOFOLLOW on a symlink — errors.Is unwraps
+// through *os.PathError to the underlying syscall.Errno.
+func TestReadConfinedFileRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.txt")
+	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	link := filepath.Join(dir, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	_, err := readConfinedFile(dir, link)
+	if err == nil {
+		t.Fatal("readConfinedFile(symlink): want error, got nil — TOCTOU window unclosed")
+	}
+	if !errors.Is(err, syscall.ELOOP) {
+		t.Errorf("readConfinedFile(symlink) error = %v, want ELOOP", err)
+	}
+}
+
+// TestReadConfinedFileRejectsOutOfRoot exercises the safe-by-default
+// confinement contract baked into the helper signature: a path outside
+// the supplied root must be rejected even before the open is attempted,
+// so future call sites cannot regress safety by skipping the confine
+// step.
+func TestReadConfinedFileRejectsOutOfRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	path := filepath.Join(outside, "elsewhere.txt")
+	if err := os.WriteFile(path, []byte("escape"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	_, err := readConfinedFile(root, path)
+	if err == nil {
+		t.Fatal("readConfinedFile(out-of-root): want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "outside") {
+		t.Errorf("readConfinedFile(out-of-root) error = %v, want mention of 'outside'", err)
 	}
 }
 

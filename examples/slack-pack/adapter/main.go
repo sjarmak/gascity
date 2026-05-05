@@ -1216,7 +1216,7 @@ func handlePublishFile(cfg config, reg *identityRegistry) http.HandlerFunc {
 			http.Error(w, fmt.Sprintf("file_path %q resolves outside FILE_UPLOAD_ROOT: %v", req.FilePath, err), http.StatusForbidden)
 			return
 		}
-		fileBytes, err := os.ReadFile(realPath)
+		fileBytes, err := readConfinedFile(cfg.fileUploadRoot, realPath)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("read file_path: %v", err), http.StatusInternalServerError)
 			return
@@ -1361,6 +1361,33 @@ func confineFileUploadPath(root, path string) (string, error) {
 		return "", fmt.Errorf("path %q is outside root %q", pathAbs, rootAbs)
 	}
 	return pathAbs, nil
+}
+
+// readConfinedFile reads realPath after re-asserting that it lies under
+// root, then opens with O_NOFOLLOW so a symlink that appears at the
+// leaf inode in the TOCTOU window between the caller's EvalSymlinks
+// resolution and the read causes the open to fail with ELOOP rather
+// than silently disclosing an arbitrary host file (gc-cby.10).
+//
+// realPath should be the filepath.EvalSymlinks-resolved canonical path
+// the caller has already verified with confineFileUploadPath; the
+// internal re-check makes the safe path the only path so a future call
+// site cannot regress arbitrary-read safety by skipping confinement.
+//
+// O_NOFOLLOW is leaf-only — a parent-directory component being swapped
+// to a symlink mid-flight is still followed by the kernel. Closing
+// that residual race requires openat2(2) with RESOLVE_BENEATH
+// (Linux ≥5.6) and is tracked separately.
+func readConfinedFile(root, realPath string) ([]byte, error) {
+	if _, err := confineFileUploadPath(root, realPath); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(realPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
 }
 
 // writeJSON writes the receipt as a JSON response. Errors during encoding
