@@ -83,8 +83,34 @@ Not yet implemented (planned):
 - [ ] `gc slack retry-peer-fanout`
 
 The adapter exposes `POST /slack/interactions` (HMAC-verified) for
-slash-command dispatch. Block-action and view-submission payloads
-return a clear "not yet supported" message — tracked as gc-cby.17.
+slash-command, `block_actions`, and `view_submission` dispatch.
+
+`block_actions` (button clicks, select-menu finalizations, datepickers,
+etc.) routes through the same channel-binding flow as slash commands:
+the action's originating channel (`payload.channel.id` falling back to
+`payload.container.channel_id`) must be bound via `gc slack
+map-channel` (session target) or `gc slack map-rig` (rig target — the
+rig branch is recorded but routing is deferred to gc-cby.18).
+
+`view_submission` (modal submits) carries no channel context, so the
+modal opener MUST set `view.private_metadata` to the JSON string
+`{"session_id":"<gc-session-id>"}` when calling `views.open`/`views.push`.
+On submit, the adapter strict-decodes that field (extra keys rejected,
+session_id length-capped) and posts a system-reminder to that session
+describing the `callback_id` plus `view.state.values`. Any decode
+failure responds `{"response_action":"clear"}` so Slack closes the
+modal stack and the user knows the submit did not process.
+
+The adapter's workspace gate (`SLACK_WORKSPACE_ID` / `cfg.accountID`)
+applies on both branches — `payload.team.id` must match. `response_url`
+(valid ~30 minutes / 5 uses on `block_actions`) is forwarded to the
+agent in the system-reminder; persistent storage of `response_url` for
+later use is out of scope.
+
+Other Slack interaction types (`shortcut`, `message_action`,
+`view_closed`, `block_suggestion`) return an ephemeral "unsupported
+interaction type" reply — they need separate routing logic and are
+tracked under the gc-cby epic.
 
 ## Architecture (current)
 
