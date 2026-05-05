@@ -349,3 +349,53 @@ func TestSlackStatusJSONChannelFilter(t *testing.T) {
 		t.Errorf("filter mismatch: %+v", parsed.Mappings)
 	}
 }
+
+// TestSlackStatusRendersChannelPatterns confirms `gc slack status`
+// surfaces channel_patterns alongside literal channels both in human
+// output and the JSON wire shape.
+func TestSlackStatusRendersChannelPatterns(t *testing.T) {
+	cityRoot := newTestCity(t)
+	rigReg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := rigReg.Set(slackRigMappingRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelIDs:      []string{"C1"},
+		ChannelPatterns: []string{"oversight-*", "team-?"},
+		CreatedAt:       now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Human output mentions both literals and patterns.
+	stdout, _, err := execSlackStatusCmd(t, cityRoot, "--workspace-id", "T1")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	for _, want := range []string{"alpha", "C1", "oversight-*", "team-?"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("human output missing %q: %s", want, stdout)
+		}
+	}
+
+	// JSON output round-trips channel_patterns.
+	stdout, _, err = execSlackStatusCmd(t, cityRoot, "--workspace-id", "T1", "--json")
+	if err != nil {
+		t.Fatalf("status --json: %v", err)
+	}
+	var parsed struct {
+		RigMappings []slackStatusRigMapping `json:"rig_mappings"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &parsed); err != nil {
+		t.Fatalf("invalid JSON: %v\nout=%s", err, stdout)
+	}
+	if len(parsed.RigMappings) != 1 {
+		t.Fatalf("expected 1 rig mapping, got %d", len(parsed.RigMappings))
+	}
+	got := parsed.RigMappings[0].Record.ChannelPatterns
+	if len(got) != 2 || got[0] != "oversight-*" || got[1] != "team-?" {
+		t.Errorf("ChannelPatterns = %v, want [oversight-* team-?]", got)
+	}
+}

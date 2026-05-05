@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -40,13 +41,22 @@ import (
 // missing → empty string; the resolver surfaces a fix-it error at
 // use time when SlingTarget is empty.
 type slackRigMappingRecord struct {
-	WorkspaceID string    `json:"workspace_id"`
-	RigName     string    `json:"rig_name"`
-	ChannelIDs  []string  `json:"channel_ids"`
-	SlingTarget string    `json:"sling_target,omitempty"`
-	FixFormula  string    `json:"fix_formula,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	WorkspaceID string   `json:"workspace_id"`
+	RigName     string   `json:"rig_name"`
+	ChannelIDs  []string `json:"channel_ids"`
+	// ChannelPatterns are glob patterns (path.Match syntax restricted
+	// to the Slack channel-name charset) the rig claims by NAME rather
+	// than literal id. Either ChannelIDs or ChannelPatterns must be
+	// non-empty; both may coexist on the same record. The runtime
+	// resolver that matches names against patterns ships with the
+	// slash-command intake bead (cby.b) — for now this field is
+	// persisted, validated, and surfaced in `gc slack status`, but no
+	// adapter call site routes on it yet.
+	ChannelPatterns []string  `json:"channel_patterns,omitempty"`
+	SlingTarget     string    `json:"sling_target,omitempty"`
+	FixFormula      string    `json:"fix_formula,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // slackRigMappingsPath returns the on-disk path for the rig mapping
@@ -150,10 +160,15 @@ func (r *slackRigMappingRegistry) Set(rec slackRigMappingRecord) error {
 		}
 	}
 	channels := dedupSortedChannels(rec.ChannelIDs)
-	if len(channels) == 0 {
-		return fmt.Errorf("slack rig mapping: at least one non-empty channel_id is required")
+	patterns, err := dedupSortedValidPatterns(rec.ChannelPatterns)
+	if err != nil {
+		return fmt.Errorf("slack rig mapping: %w", err)
+	}
+	if len(channels) == 0 && len(patterns) == 0 {
+		return fmt.Errorf("slack rig mapping: at least one non-empty channel_id or channel_pattern is required")
 	}
 	rec.ChannelIDs = channels
+	rec.ChannelPatterns = patterns
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -281,6 +296,78 @@ func validateSlingTarget(target string) error {
 	return nil
 }
 
+// validateChannelPattern enforces a write-time guard on channel-name
+// glob patterns. Slack channel names are restricted to lowercase
+// a-z, digits, '-', and '_'; legal pattern metacharacters are
+// path.Match's '*', '?', '[', ']', and '^' (the only character-class
+// negation prefix path.Match recognises). '!' is deliberately NOT
+// accepted: in path.Match it is a literal-in-class, not a negation,
+// so allowing it would let an operator write `team-[!prod]` thinking
+// it means "not prod" while it actually matches `{!, p, r, o, d}`.
+// Anything else is rejected to keep the resolver's input space small
+// (no '/' separator surprise from path.Match, no character-class
+// footguns from operator typos like `team-prod/*`). After charset
+// validation we round-trip the pattern through path.Match to flush
+// ErrBadPattern early — path.Match defers malformed-bracket errors
+// to match-time.
+// maxChannelPatternLen caps a single pattern's length. Slack channel
+// names max out at 80 chars; 128 leaves room for glob metacharacters
+// while keeping per-pattern resolver-time work bounded once cby.b
+// wires patterns into the dispatch path. A file with thousands of
+// kilobyte-long patterns is otherwise still bounded only by the
+// 10 MiB load-time cap.
+const maxChannelPatternLen = 128
+
+func validateChannelPattern(pattern string) error {
+	if pattern == "" {
+		return fmt.Errorf("channel_pattern is required")
+	}
+	if len(pattern) > maxChannelPatternLen {
+		return fmt.Errorf("channel_pattern exceeds maximum length %d (got %d)", maxChannelPatternLen, len(pattern))
+	}
+	for _, r := range pattern {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_':
+		case r == '*' || r == '?' || r == '[' || r == ']' || r == '^':
+		default:
+			return fmt.Errorf("channel_pattern %q contains illegal character %q (allowed: a-z, 0-9, -, _, glob metas * ? [ ] ^)", pattern, r)
+		}
+	}
+	if _, err := path.Match(pattern, "x"); err != nil {
+		return fmt.Errorf("channel_pattern %q is malformed: %w", pattern, err)
+	}
+	return nil
+}
+
+// dedupSortedValidPatterns is the pattern analog of
+// dedupSortedChannels: drops empties, dedupes, sorts, and validates
+// each surviving pattern. Returning a new slice keeps callers'
+// immutable-input contract intact. Empty input yields nil + nil.
+func dedupSortedValidPatterns(in []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		if err := validateChannelPattern(s); err != nil {
+			return nil, err
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // validateRigName rejects whitespace, slash, backslash, and control
 // characters. Rig names are operator-supplied identifiers used as
 // part of the composite key on disk and as the JSON object key after
@@ -350,8 +437,8 @@ func (r *slackRigMappingRegistry) load() error {
 				return fmt.Errorf("slack rig mapping store: record %q: %w", key, err)
 			}
 		}
-		if len(rec.ChannelIDs) == 0 {
-			return fmt.Errorf("slack rig mapping store: record %q has empty channel_ids", key)
+		if len(rec.ChannelIDs) == 0 && len(rec.ChannelPatterns) == 0 {
+			return fmt.Errorf("slack rig mapping store: record %q has neither channel_ids nor channel_patterns", key)
 		}
 		// Reject duplicate channels within a single record.
 		seen := make(map[string]struct{}, len(rec.ChannelIDs))
@@ -363,6 +450,22 @@ func (r *slackRigMappingRegistry) load() error {
 				return fmt.Errorf("slack rig mapping store: record %q has duplicate channel_id %q", key, ch)
 			}
 			seen[ch] = struct{}{}
+		}
+		// Validate channel_patterns at load time so a hand-edited file
+		// with a malformed pattern is rejected before downstream
+		// readers (the adapter) consume it.
+		seenP := make(map[string]struct{}, len(rec.ChannelPatterns))
+		for _, p := range rec.ChannelPatterns {
+			if p == "" {
+				return fmt.Errorf("slack rig mapping store: record %q has empty channel_pattern entry", key)
+			}
+			if _, dup := seenP[p]; dup {
+				return fmt.Errorf("slack rig mapping store: record %q has duplicate channel_pattern %q", key, p)
+			}
+			seenP[p] = struct{}{}
+			if err := validateChannelPattern(p); err != nil {
+				return fmt.Errorf("slack rig mapping store: record %q: %w", key, err)
+			}
 		}
 	}
 

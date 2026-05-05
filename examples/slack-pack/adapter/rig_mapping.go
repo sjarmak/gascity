@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -25,13 +26,23 @@ import (
 // string; ResolveSlingTarget surfaces a fix-it error at use time when
 // SlingTarget is empty.
 type rigMappingDiskRecord struct {
-	WorkspaceID string    `json:"workspace_id"`
-	RigName     string    `json:"rig_name"`
-	ChannelIDs  []string  `json:"channel_ids"`
-	SlingTarget string    `json:"sling_target,omitempty"`
-	FixFormula  string    `json:"fix_formula,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	WorkspaceID string   `json:"workspace_id"`
+	RigName     string   `json:"rig_name"`
+	ChannelIDs  []string `json:"channel_ids"`
+	// ChannelPatterns are glob patterns matched against Slack channel
+	// NAMES (path.Match syntax restricted to a-z, 0-9, '-', '_', * ?
+	// [ ] ^ !). Persisted in lockstep with cmd/gc.slackRigMappingRecord.
+	// Either ChannelIDs or ChannelPatterns must be non-empty. The
+	// runtime resolver tier that consumes patterns ships with the
+	// slash-command intake bead — for now this field is parsed,
+	// validated, and indexed into byPattern so the adapter is
+	// forward-compatible with files written by the new CLI (without
+	// parsing, DisallowUnknownFields would reject them).
+	ChannelPatterns []string  `json:"channel_patterns,omitempty"`
+	SlingTarget     string    `json:"sling_target,omitempty"`
+	FixFormula      string    `json:"fix_formula,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // rigMappingRegistry is a read-mostly in-memory view of the
@@ -44,6 +55,13 @@ type rigMappingRegistry struct {
 	mu        sync.RWMutex
 	byKey     map[string]rigMappingDiskRecord // "<workspace_id>:<rig_name>"
 	byChannel map[string]string               // "<workspace_id>:<channel_id>" -> rigName
+	// byPattern groups patterns by composite (workspaceID, rigName)
+	// key. Population is mechanical (one pattern → one entry under the
+	// owning rig's key) so SIGHUP reload can swap it atomically. The
+	// resolver that walks this index ships with cby.b — for now it is
+	// parsed and exposed via PatternsForRig so the adapter is
+	// forward-compatible with operator-written pattern records.
+	byPattern map[string][]string // "<workspace_id>:<rig_name>" -> sorted patterns
 	diskPath  string
 }
 
@@ -53,6 +71,11 @@ type rigMappingRegistry struct {
 type rigMappingSnapshot struct {
 	byKey     map[string]rigMappingDiskRecord
 	byChannel map[string]string
+	// byPattern is swapped together with byKey/byChannel under the
+	// same write lock so a SIGHUP reload never exposes a state where
+	// patterns reference rigs that are no longer present (or vice
+	// versa).
+	byPattern map[string][]string
 }
 
 func rigMappingKey(workspaceID, rigName string) string {
@@ -72,6 +95,7 @@ func newRigMappingRegistry(diskPath string) (*rigMappingRegistry, error) {
 	r := &rigMappingRegistry{
 		byKey:     make(map[string]rigMappingDiskRecord),
 		byChannel: make(map[string]string),
+		byPattern: make(map[string][]string),
 		diskPath:  diskPath,
 	}
 	if err := r.load(); err != nil {
@@ -157,9 +181,19 @@ func (r *rigMappingRegistry) Set(rec rigMappingDiskRecord) error {
 	if rec.WorkspaceID == "" || rec.RigName == "" {
 		return fmt.Errorf("rig mapping: workspace_id and rig_name required")
 	}
-	if len(rec.ChannelIDs) == 0 {
-		return fmt.Errorf("rig mapping: at least one channel_id required")
+	if len(rec.ChannelIDs) == 0 && len(rec.ChannelPatterns) == 0 {
+		return fmt.Errorf("rig mapping: at least one channel_id or channel_pattern required")
 	}
+	// Normalise patterns once so byKey[k].ChannelPatterns and byPattern[k]
+	// stay in lockstep — callers reading the record via LookupRigForChannel
+	// must see the same ordering PatternsForRig returns.
+	patterns := dedupSortedAdapterPatterns(rec.ChannelPatterns)
+	for _, p := range patterns {
+		if err := validateAdapterChannelPattern(p); err != nil {
+			return fmt.Errorf("rig mapping: %w", err)
+		}
+	}
+	rec.ChannelPatterns = patterns
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	key := rigMappingKey(rec.WorkspaceID, rec.RigName)
@@ -167,12 +201,90 @@ func (r *rigMappingRegistry) Set(rec rigMappingDiskRecord) error {
 		for _, ch := range existing.ChannelIDs {
 			delete(r.byChannel, rigChannelKey(rec.WorkspaceID, ch))
 		}
+		delete(r.byPattern, key)
 	}
 	r.byKey[key] = rec
 	for _, ch := range rec.ChannelIDs {
 		r.byChannel[rigChannelKey(rec.WorkspaceID, ch)] = rec.RigName
 	}
+	if len(patterns) > 0 {
+		stored := make([]string, len(patterns))
+		copy(stored, patterns)
+		r.byPattern[key] = stored
+	}
 	return r.saveLocked()
+}
+
+// PatternsForRig returns the sorted glob patterns associated with
+// (workspaceID, rigName), or nil if the rig has none. Read-locked so
+// the caller never observes a snapshot mid-swap.
+func (r *rigMappingRegistry) PatternsForRig(workspaceID, rigName string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	got := r.byPattern[rigMappingKey(workspaceID, rigName)]
+	if len(got) == 0 {
+		return nil
+	}
+	out := make([]string, len(got))
+	copy(out, got)
+	return out
+}
+
+// dedupSortedAdapterPatterns drops empties, dedupes, and sorts the
+// input. Mirrors cmd/gc.dedupSortedValidPatterns minus the validation
+// step (callers run validateAdapterChannelPattern after).
+func dedupSortedAdapterPatterns(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s == "" {
+			continue
+		}
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Strings(out)
+	return out
+}
+
+// validateAdapterChannelPattern mirrors cmd/gc.validateChannelPattern.
+// Charset (lowercase a-z, 0-9, '-', '_', glob metas * ? [ ] ^ !) plus
+// a path.Match probe to flush ErrBadPattern early. Duplicated here
+// rather than imported because the adapter is a separate Go module.
+// maxAdapterChannelPatternLen mirrors cmd/gc.maxChannelPatternLen.
+// Duplicated here because the adapter is a separate Go module.
+const maxAdapterChannelPatternLen = 128
+
+func validateAdapterChannelPattern(pattern string) error {
+	if pattern == "" {
+		return fmt.Errorf("channel_pattern is required")
+	}
+	if len(pattern) > maxAdapterChannelPatternLen {
+		return fmt.Errorf("channel_pattern exceeds maximum length %d (got %d)", maxAdapterChannelPatternLen, len(pattern))
+	}
+	for _, r := range pattern {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_':
+		case r == '*' || r == '?' || r == '[' || r == ']' || r == '^':
+		default:
+			return fmt.Errorf("channel_pattern %q contains illegal character %q (allowed: a-z, 0-9, -, _, glob metas * ? [ ] ^)", pattern, r)
+		}
+	}
+	if _, err := path.Match(pattern, "x"); err != nil {
+		return fmt.Errorf("channel_pattern %q is malformed: %w", pattern, err)
+	}
+	return nil
 }
 
 // maxRigRegistryBytes caps the size of the JSON rig-mapping file
@@ -219,8 +331,13 @@ func parseRigMappingRegistry(diskPath string) (*rigMappingSnapshot, error) {
 		if rec.WorkspaceID == "" || rec.RigName == "" {
 			return nil, fmt.Errorf("rig mapping store: record %q missing workspace_id or rig_name", key)
 		}
-		if len(rec.ChannelIDs) == 0 {
-			return nil, fmt.Errorf("rig mapping store: record %q has empty channel_ids", key)
+		if len(rec.ChannelIDs) == 0 && len(rec.ChannelPatterns) == 0 {
+			return nil, fmt.Errorf("rig mapping store: record %q has neither channel_ids nor channel_patterns", key)
+		}
+		for _, p := range rec.ChannelPatterns {
+			if err := validateAdapterChannelPattern(p); err != nil {
+				return nil, fmt.Errorf("rig mapping store: record %q: %w", key, err)
+			}
 		}
 	}
 	if stored == nil {
@@ -228,6 +345,7 @@ func parseRigMappingRegistry(diskPath string) (*rigMappingSnapshot, error) {
 	}
 
 	byChannel := make(map[string]string)
+	byPattern := make(map[string][]string)
 	keys := make([]string, 0, len(stored))
 	for k := range stored {
 		keys = append(keys, k)
@@ -244,9 +362,14 @@ func parseRigMappingRegistry(diskPath string) (*rigMappingSnapshot, error) {
 			}
 			byChannel[ck] = rec.RigName
 		}
+		if len(rec.ChannelPatterns) > 0 {
+			patterns := append([]string(nil), rec.ChannelPatterns...)
+			sort.Strings(patterns)
+			byPattern[k] = patterns
+		}
 	}
 
-	return &rigMappingSnapshot{byKey: stored, byChannel: byChannel}, nil
+	return &rigMappingSnapshot{byKey: stored, byChannel: byChannel, byPattern: byPattern}, nil
 }
 
 // load is the constructor-time helper — called pre-publish, no lock needed.
@@ -258,6 +381,7 @@ func (r *rigMappingRegistry) load() error {
 	if snap != nil {
 		r.byKey = snap.byKey
 		r.byChannel = snap.byChannel
+		r.byPattern = snap.byPattern
 	}
 	return nil
 }
@@ -268,8 +392,10 @@ func (r *rigMappingRegistry) Stage() (*rigMappingSnapshot, error) {
 	return parseRigMappingRegistry(r.diskPath)
 }
 
-// Commit atomically swaps byKey and byChannel under the write lock so
-// resolver readers never observe a desync between the two indexes.
+// Commit atomically swaps byKey, byChannel, AND byPattern under the
+// write lock so resolver readers never observe a desync between the
+// three indexes — for example, a state where new patterns are live
+// but the inverted byChannel index is still stale (or vice versa).
 func (r *rigMappingRegistry) Commit(snap *rigMappingSnapshot) {
 	if snap == nil {
 		return
@@ -278,6 +404,7 @@ func (r *rigMappingRegistry) Commit(snap *rigMappingSnapshot) {
 	defer r.mu.Unlock()
 	r.byKey = snap.byKey
 	r.byChannel = snap.byChannel
+	r.byPattern = snap.byPattern
 }
 
 // Reload combines Stage and Commit; per-registry test convenience.

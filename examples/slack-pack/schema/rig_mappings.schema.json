@@ -2,13 +2,17 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/gastownhall/gascity/examples/slack-pack/schema/rig_mappings.schema.json",
   "title": "slack-pack rig_mappings.json",
-  "description": "Authoritative schema for the Slack rig mapping registry persisted at <cityPath>/.gc/slack/rig_mappings.json. The on-disk JSON is the only contract between the gc CLI (writer, via 'gc slack map-rig') and the slack-pack adapter (reader, via /slack/interactions). Composite primary key is the JSON object key, formatted '<workspace_id>:<rig_name>'. Per-channel mappings written by 'gc slack map-channel' (channel_mappings.json) take precedence over rig defaults; channel mapping wins. The adapter loads this file once at startup and does NOT reload — operators must restart the adapter to pick up new bindings.",
+  "description": "Authoritative schema for the Slack rig mapping registry persisted at <cityPath>/.gc/slack/rig_mappings.json. The on-disk JSON is the only contract between the gc CLI (writer, via 'gc slack map-rig') and the slack-pack adapter (reader, via /slack/interactions). Composite primary key is the JSON object key, formatted '<workspace_id>:<rig_name>'. Per-channel mappings written by 'gc slack map-channel' (channel_mappings.json) take precedence over rig defaults; channel mapping wins. The adapter loads this file at startup and re-reads on SIGHUP (cby.23) — operators send `pkill -HUP gc-slack-adapter` (or restart the service) to pick up new bindings.",
   "type": "object",
   "additionalProperties": { "$ref": "#/$defs/slackRigMappingRecord" },
   "$defs": {
     "slackRigMappingRecord": {
       "type": "object",
-      "required": ["workspace_id", "rig_name", "channel_ids", "created_at", "updated_at"],
+      "required": ["workspace_id", "rig_name", "created_at", "updated_at"],
+      "anyOf": [
+        { "properties": { "channel_ids": { "type": "array", "minItems": 1 } }, "required": ["channel_ids"] },
+        { "properties": { "channel_patterns": { "type": "array", "minItems": 1 } }, "required": ["channel_patterns"] }
+      ],
       "properties": {
         "workspace_id": {
           "type": "string",
@@ -21,9 +25,18 @@
         "channel_ids": {
           "type": "array",
           "items": { "type": "string" },
-          "minItems": 1,
           "uniqueItems": true,
-          "description": "Sorted, deduplicated list of Slack channel ids the rig owns. The adapter builds an inverted index (channel → rig) at load time so slash-command resolution is O(1). A channel may only appear in one rig record at a time within this store."
+          "description": "Sorted, deduplicated list of Slack channel ids the rig owns. The adapter builds an inverted index (channel → rig) at load time so slash-command resolution is O(1). A channel may only appear in one rig record at a time within this store. Either channel_ids or channel_patterns (or both) must be non-empty."
+        },
+        "channel_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9_*?\\[\\]^!-]+$",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "description": "Sorted, deduplicated list of glob patterns matched against Slack channel NAMES (path.Match syntax restricted to a-z, 0-9, '-', '_', and the metacharacters * ? [ ] ^ !). The runtime resolver that matches names against patterns ships with the slash-command intake bead — for now this field is persisted, validated, and surfaced in `gc slack status`, but no resolver tier consumes it. Either channel_ids or channel_patterns (or both) must be non-empty."
         },
         "sling_target": {
           "type": "string",

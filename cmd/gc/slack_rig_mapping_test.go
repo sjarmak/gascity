@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -572,3 +573,307 @@ func TestSlackRigMappingRegistryRejectsInvalidSlingTargetOnSet(t *testing.T) {
 		t.Fatal("expected error for malformed sling_target, got nil")
 	}
 }
+
+// TestSlackRigMappingPatternsRoundTrip verifies channel_patterns are
+// persisted and loaded byte-for-byte, and that a record may carry
+// patterns alone (no literal channel_ids).
+func TestSlackRigMappingPatternsRoundTrip(t *testing.T) {
+	cityRoot := newTestCity(t)
+	reg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	rec := slackRigMappingRecord{
+		WorkspaceID:     "T1",
+		RigName:         "alpha",
+		ChannelPatterns: []string{"oversight-*", "team-?", "alpha-prod"},
+		CreatedAt:       now, UpdatedAt: now,
+	}
+	if err := reg.Set(rec); err != nil {
+		t.Fatalf("Set with patterns only: %v", err)
+	}
+
+	// Reload from disk and confirm the patterns came back sorted+deduped.
+	reg2, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	got, ok := reg2.Get("T1", "alpha")
+	if !ok {
+		t.Fatal("record missing after reload")
+	}
+	wantPatterns := []string{"alpha-prod", "oversight-*", "team-?"}
+	if !slices.Equal(got.ChannelPatterns, wantPatterns) {
+		t.Errorf("ChannelPatterns = %v, want %v", got.ChannelPatterns, wantPatterns)
+	}
+	if len(got.ChannelIDs) != 0 {
+		t.Errorf("ChannelIDs should be empty, got %v", got.ChannelIDs)
+	}
+}
+
+// TestSlackRigMappingPatternsAndChannelsCoexist confirms a record may
+// carry both literal channel_ids and channel_patterns; both round-trip.
+func TestSlackRigMappingPatternsAndChannelsCoexist(t *testing.T) {
+	cityRoot := newTestCity(t)
+	reg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	rec := slackRigMappingRecord{
+		WorkspaceID:     "T1",
+		RigName:         "alpha",
+		ChannelIDs:      []string{"C1", "C2"},
+		ChannelPatterns: []string{"oversight-*"},
+		CreatedAt:       now, UpdatedAt: now,
+	}
+	if err := reg.Set(rec); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	// Literal-channel index still works.
+	got, src, ok := reg.LookupRigForChannel("T1", "C1")
+	if !ok || src != "rig" || got.RigName != "alpha" {
+		t.Errorf("LookupRigForChannel(T1,C1) = (%+v,%q,%v); want alpha,rig,true", got, src, ok)
+	}
+	if !slices.Equal(got.ChannelPatterns, []string{"oversight-*"}) {
+		t.Errorf("ChannelPatterns = %v, want [oversight-*]", got.ChannelPatterns)
+	}
+}
+
+// TestSlackRigMappingRequiresChannelOrPattern confirms zero-of-both is
+// rejected at Set time.
+func TestSlackRigMappingRequiresChannelOrPattern(t *testing.T) {
+	cityRoot := newTestCity(t)
+	reg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	cases := []slackRigMappingRecord{
+		// nil/empty both
+		{WorkspaceID: "T1", RigName: "alpha", CreatedAt: now, UpdatedAt: now},
+		{WorkspaceID: "T1", RigName: "alpha", ChannelIDs: []string{}, ChannelPatterns: []string{}, CreatedAt: now, UpdatedAt: now},
+		// All entries empty after dedup
+		{WorkspaceID: "T1", RigName: "alpha", ChannelIDs: []string{""}, ChannelPatterns: []string{""}, CreatedAt: now, UpdatedAt: now},
+	}
+	for i, rec := range cases {
+		if err := reg.Set(rec); err == nil {
+			t.Errorf("case %d: Set with no channels or patterns: expected error, got nil", i)
+		}
+	}
+}
+
+// TestSlackRigMappingRejectsMalformedPattern confirms each class of
+// invalid pattern (charset, malformed glob, empty) is rejected at Set.
+func TestSlackRigMappingRejectsMalformedPattern(t *testing.T) {
+	cityRoot := newTestCity(t)
+	reg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	bad := []string{
+		"Oversight-*",     // uppercase
+		"team prod",       // whitespace
+		"team\tprod",      // tab
+		"team/prod",       // slash separator
+		"team\\prod",      // backslash
+		"team\nprod",      // control char
+		"team[",           // unclosed bracket — path.Match ErrBadPattern
+		"team[a-",         // unclosed range
+		"team.prod",       // dot not in slack channel charset
+		"team-[!xyz]",     // '!' is path.Match literal, not negation; rejected to avoid operator footgun
+		"",                // empty
+	}
+	for _, p := range bad {
+		err := reg.Set(slackRigMappingRecord{
+			WorkspaceID: "T1", RigName: "alpha",
+			ChannelPatterns: []string{p},
+			CreatedAt:       now, UpdatedAt: now,
+		})
+		if err == nil {
+			t.Errorf("Set channel_pattern=%q: expected error, got nil", p)
+		}
+	}
+}
+
+// TestSlackRigMappingRejectsOversizePattern caps a single pattern's
+// length at maxChannelPatternLen so an operator (or hand-edit) can't
+// stuff a multi-kilobyte pattern into a record that the resolver tier
+// (cby.b) would later replay against every inbound channel name.
+func TestSlackRigMappingRejectsOversizePattern(t *testing.T) {
+	cityRoot := newTestCity(t)
+	reg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	huge := strings.Repeat("a", maxChannelPatternLen+1)
+	err = reg.Set(slackRigMappingRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelPatterns: []string{huge},
+		CreatedAt:       now, UpdatedAt: now,
+	})
+	if err == nil {
+		t.Fatal("expected error for oversize pattern, got nil")
+	}
+	// At-cap is acceptable.
+	atCap := strings.Repeat("a", maxChannelPatternLen)
+	if err := reg.Set(slackRigMappingRecord{
+		WorkspaceID: "T1", RigName: "beta",
+		ChannelPatterns: []string{atCap},
+		CreatedAt:       now, UpdatedAt: now,
+	}); err != nil {
+		t.Errorf("at-cap pattern should be accepted: %v", err)
+	}
+}
+
+// TestSlackRigMappingPatternsAcceptsValid confirms each class of valid
+// glob pattern survives validation.
+func TestSlackRigMappingPatternsAcceptsValid(t *testing.T) {
+	cityRoot := newTestCity(t)
+	reg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	good := []string{
+		"oversight-*",
+		"*-prod",
+		"team-?",
+		"alpha-[abc]",
+		"alpha-[a-z]",
+		"alpha-[^xyz]", // path.Match negated class — leading '^' inside [...]
+		"plain-channel",
+		"a",
+		"_underscore-leading",
+	}
+	for _, p := range good {
+		err := reg.Set(slackRigMappingRecord{
+			WorkspaceID: "T1", RigName: "rig-" + p,
+			ChannelPatterns: []string{p},
+			CreatedAt:       now, UpdatedAt: now,
+		})
+		if err != nil {
+			t.Errorf("Set channel_pattern=%q: unexpected error: %v", p, err)
+		}
+	}
+}
+
+// TestSlackRigMappingPatternsSortedDeduped confirms patterns are sorted
+// and deduped on Set, identical to ChannelIDs ergonomics.
+func TestSlackRigMappingPatternsSortedDeduped(t *testing.T) {
+	cityRoot := newTestCity(t)
+	reg, err := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	rec := slackRigMappingRecord{
+		WorkspaceID: "T1", RigName: "alpha",
+		ChannelPatterns: []string{"zeta-*", "alpha-*", "alpha-*", "", "beta-?"},
+		CreatedAt:       now, UpdatedAt: now,
+	}
+	if err := reg.Set(rec); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	got, _ := reg.Get("T1", "alpha")
+	want := []string{"alpha-*", "beta-?", "zeta-*"}
+	if !slices.Equal(got.ChannelPatterns, want) {
+		t.Errorf("ChannelPatterns = %v, want %v", got.ChannelPatterns, want)
+	}
+}
+
+// TestSlackRigMappingLoadRejectsMalformedPattern confirms hand-edited
+// files with malformed patterns are rejected at load — symmetric with
+// the existing rig_name validation.
+func TestSlackRigMappingLoadRejectsMalformedPattern(t *testing.T) {
+	cityRoot := newTestCity(t)
+	path := slackRigMappingsPath(cityRoot)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	// Hand-rolled to skirt Set's validation.
+	corrupt := `{
+  "T1:alpha": {
+    "workspace_id": "T1",
+    "rig_name": "alpha",
+    "channel_ids": [],
+    "channel_patterns": ["Oversight-BAD"],
+    "created_at": "` + now + `",
+    "updated_at": "` + now + `"
+  }
+}`
+	if err := os.WriteFile(path, []byte(corrupt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newSlackRigMappingRegistry(path); err == nil {
+		t.Error("expected load error for malformed pattern, got nil")
+	}
+}
+
+// TestSlackRigMappingLoadRejectsZeroOfBoth confirms hand-edited records
+// missing both channel_ids and channel_patterns are rejected at load.
+func TestSlackRigMappingLoadRejectsZeroOfBoth(t *testing.T) {
+	cityRoot := newTestCity(t)
+	path := slackRigMappingsPath(cityRoot)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	corrupt := `{
+  "T1:alpha": {
+    "workspace_id": "T1",
+    "rig_name": "alpha",
+    "channel_ids": [],
+    "channel_patterns": [],
+    "created_at": "` + now + `",
+    "updated_at": "` + now + `"
+  }
+}`
+	if err := os.WriteFile(path, []byte(corrupt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newSlackRigMappingRegistry(path); err == nil {
+		t.Error("expected load error for zero-of-both, got nil")
+	}
+}
+
+// TestSlackRigMappingLegacyRecordWithoutPatternsLoads confirms a record
+// written before this bead (no channel_patterns field) still loads
+// — DisallowUnknownFields would reject the new field; we need
+// backwards-compat in the OTHER direction (missing field is fine).
+func TestSlackRigMappingLegacyRecordWithoutPatternsLoads(t *testing.T) {
+	cityRoot := newTestCity(t)
+	path := slackRigMappingsPath(cityRoot)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	legacy := `{
+  "T1:alpha": {
+    "workspace_id": "T1",
+    "rig_name": "alpha",
+    "channel_ids": ["C1"],
+    "created_at": "` + now + `",
+    "updated_at": "` + now + `"
+  }
+}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := newSlackRigMappingRegistry(path)
+	if err != nil {
+		t.Fatalf("legacy load failed: %v", err)
+	}
+	got, ok := reg.Get("T1", "alpha")
+	if !ok {
+		t.Fatal("record missing")
+	}
+	if len(got.ChannelPatterns) != 0 {
+		t.Errorf("legacy record ChannelPatterns = %v, want empty", got.ChannelPatterns)
+	}
+}
+

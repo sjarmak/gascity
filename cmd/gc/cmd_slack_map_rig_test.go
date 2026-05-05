@@ -525,3 +525,249 @@ func TestSlackMapRigPreservesSlingTargetOnReSet(t *testing.T) {
 		t.Errorf("FixFormula cleared on re-bind: got %q", rec.FixFormula)
 	}
 }
+
+// TestSlackMapRigChannelPatternFlag covers the cby.22 surface: a rig
+// can be bound by glob pattern alone (no literal --channel) and the
+// result round-trips through the registry.
+func TestSlackMapRigChannelPatternFlag(t *testing.T) {
+	cityRoot := newTestCity(t)
+	stdout, stderr, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1",
+		"--channel-pattern", "oversight-*",
+		"--channel-pattern", "team-?",
+	)
+	if err != nil {
+		t.Fatalf("map-rig --channel-pattern: %v\nstderr=%s", err, stderr)
+	}
+	if !strings.Contains(stdout, slackMapRigRestartHint) {
+		t.Errorf("stdout missing restart hint: %q", stdout)
+	}
+	reg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	rec, ok := reg.Get("T1", "alpha")
+	if !ok {
+		t.Fatal("rig record missing")
+	}
+	if len(rec.ChannelIDs) != 0 {
+		t.Errorf("ChannelIDs should be empty, got %v", rec.ChannelIDs)
+	}
+	want := []string{"oversight-*", "team-?"}
+	if len(rec.ChannelPatterns) != len(want) ||
+		rec.ChannelPatterns[0] != want[0] || rec.ChannelPatterns[1] != want[1] {
+		t.Errorf("ChannelPatterns = %v, want %v", rec.ChannelPatterns, want)
+	}
+}
+
+// TestSlackMapRigChannelPatternCommaSeparated confirms the
+// --channel-pattern flag accepts comma-separated values, matching
+// --channel ergonomics.
+func TestSlackMapRigChannelPatternCommaSeparated(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1",
+		"--channel-pattern", "oversight-*,team-?",
+	); err != nil {
+		t.Fatalf("map-rig comma-pattern: %v", err)
+	}
+	reg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	rec, _ := reg.Get("T1", "alpha")
+	if len(rec.ChannelPatterns) != 2 {
+		t.Errorf("expected 2 patterns, got %v", rec.ChannelPatterns)
+	}
+}
+
+// TestSlackMapRigMixesChannelsAndPatterns confirms a rig can carry
+// both literal --channel ids and --channel-pattern globs in a single
+// invocation.
+func TestSlackMapRigMixesChannelsAndPatterns(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1",
+		"--channel", "C1",
+		"--channel-pattern", "oversight-*",
+	); err != nil {
+		t.Fatalf("mix channels+patterns: %v", err)
+	}
+	reg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	rec, _ := reg.Get("T1", "alpha")
+	if len(rec.ChannelIDs) != 1 || rec.ChannelIDs[0] != "C1" {
+		t.Errorf("ChannelIDs = %v, want [C1]", rec.ChannelIDs)
+	}
+	if len(rec.ChannelPatterns) != 1 || rec.ChannelPatterns[0] != "oversight-*" {
+		t.Errorf("ChannelPatterns = %v, want [oversight-*]", rec.ChannelPatterns)
+	}
+	// Literal channel still resolves through inverted index.
+	if _, _, ok := reg.LookupRigForChannel("T1", "C1"); !ok {
+		t.Error("literal channel C1 should still resolve via byChannel")
+	}
+}
+
+// TestSlackMapRigRejectsMalformedPattern confirms invalid patterns are
+// surfaced as CLI errors before disk write.
+func TestSlackMapRigRejectsMalformedPattern(t *testing.T) {
+	cityRoot := newTestCity(t)
+	_, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1",
+		"--channel-pattern", "Bad-Caps-*",
+	)
+	if err == nil {
+		t.Fatal("expected error for uppercase pattern, got nil")
+	}
+}
+
+// TestSlackMapRigRequiresChannelOrPattern confirms invoking map-rig
+// with neither --channel nor --channel-pattern (and not --remove) is
+// rejected by the CLI rather than silently writing an empty record.
+func TestSlackMapRigRequiresChannelOrPattern(t *testing.T) {
+	cityRoot := newTestCity(t)
+	_, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1",
+	)
+	if err == nil {
+		t.Fatal("expected error when neither --channel nor --channel-pattern supplied")
+	}
+}
+
+// TestSlackMapRigAddPatternsToExistingChannelsRig covers the
+// incremental-migration path: a rig already exists with literal
+// channels; operator re-binds with --channel-pattern only. Existing
+// channels MUST be preserved (mirrors --sling-target preservation).
+func TestSlackMapRigAddPatternsToExistingChannelsRig(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1,C2",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1",
+		"--channel-pattern", "oversight-*",
+	); err != nil {
+		t.Fatalf("re-bind with patterns only: %v", err)
+	}
+	reg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	rec, ok := reg.Get("T1", "alpha")
+	if !ok {
+		t.Fatal("rig missing after re-bind")
+	}
+	if len(rec.ChannelIDs) != 2 || rec.ChannelIDs[0] != "C1" || rec.ChannelIDs[1] != "C2" {
+		t.Errorf("ChannelIDs not preserved: %v", rec.ChannelIDs)
+	}
+	if len(rec.ChannelPatterns) != 1 || rec.ChannelPatterns[0] != "oversight-*" {
+		t.Errorf("ChannelPatterns missing: %v", rec.ChannelPatterns)
+	}
+}
+
+// TestSlackMapRigAddChannelsToExistingPatternsRig covers the
+// symmetric incremental path: a rig exists with patterns only;
+// operator re-binds with --channel only. Existing patterns MUST be
+// preserved.
+func TestSlackMapRigAddChannelsToExistingPatternsRig(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1",
+		"--channel-pattern", "oversight-*",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1", "--channel", "C1",
+	); err != nil {
+		t.Fatalf("re-bind with channels only: %v", err)
+	}
+	reg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	rec, ok := reg.Get("T1", "alpha")
+	if !ok {
+		t.Fatal("rig missing after re-bind")
+	}
+	if len(rec.ChannelPatterns) != 1 || rec.ChannelPatterns[0] != "oversight-*" {
+		t.Errorf("ChannelPatterns not preserved: %v", rec.ChannelPatterns)
+	}
+	if len(rec.ChannelIDs) != 1 || rec.ChannelIDs[0] != "C1" {
+		t.Errorf("ChannelIDs missing: %v", rec.ChannelIDs)
+	}
+}
+
+// TestSlackMapRigRemoveChannelsKeepsPatterns confirms --remove-channels
+// (literal-id removal) does not touch ChannelPatterns. Operators
+// removing a literal id from a hybrid record should keep their globs.
+func TestSlackMapRigRemoveChannelsKeepsPatterns(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1",
+		"--channel", "C1,C2",
+		"--channel-pattern", "oversight-*",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1",
+		"--remove-channels", "C1",
+	); err != nil {
+		t.Fatalf("remove-channels: %v", err)
+	}
+	reg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	rec, ok := reg.Get("T1", "alpha")
+	if !ok {
+		t.Fatal("rig should still exist after removing one literal")
+	}
+	if len(rec.ChannelIDs) != 1 || rec.ChannelIDs[0] != "C2" {
+		t.Errorf("ChannelIDs = %v, want [C2]", rec.ChannelIDs)
+	}
+	if len(rec.ChannelPatterns) != 1 || rec.ChannelPatterns[0] != "oversight-*" {
+		t.Errorf("ChannelPatterns = %v, want [oversight-*]", rec.ChannelPatterns)
+	}
+}
+
+// TestSlackMapRigRemoveAllLiteralsKeepsRecordWhenPatternsRemain
+// confirms removing the last literal channel from a record that ALSO
+// has patterns leaves the record intact (pattern-only is valid).
+func TestSlackMapRigRemoveAllLiteralsKeepsRecordWhenPatternsRemain(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1",
+		"--channel", "C1",
+		"--channel-pattern", "oversight-*",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1",
+		"--remove-channels", "C1",
+	); err != nil {
+		t.Fatalf("remove last literal: %v", err)
+	}
+	reg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	rec, ok := reg.Get("T1", "alpha")
+	if !ok {
+		t.Fatal("rig should remain because patterns are still present")
+	}
+	if len(rec.ChannelIDs) != 0 {
+		t.Errorf("ChannelIDs should be empty, got %v", rec.ChannelIDs)
+	}
+	if len(rec.ChannelPatterns) != 1 {
+		t.Errorf("ChannelPatterns lost: %v", rec.ChannelPatterns)
+	}
+}
+
+// TestSlackMapRigRemoveChannelsDeletesRecordWhenAllEmpty confirms the
+// existing "empty after removal → delete" behavior still triggers
+// when there are no patterns to keep the record alive.
+func TestSlackMapRigRemoveChannelsDeletesRecordWhenAllEmpty(t *testing.T) {
+	cityRoot := newTestCity(t)
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1",
+		"--channel", "C1",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := execSlackMapRigCmd(t, cityRoot,
+		"alpha", "--workspace-id", "T1",
+		"--remove-channels", "C1",
+	); err != nil {
+		t.Fatal(err)
+	}
+	reg, _ := newSlackRigMappingRegistry(slackRigMappingsPath(cityRoot))
+	if _, ok := reg.Get("T1", "alpha"); ok {
+		t.Error("rig should be deleted when last literal removed and no patterns")
+	}
+}

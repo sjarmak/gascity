@@ -204,8 +204,12 @@ func printSlackStatusHuman(stdout io.Writer, apps []slackAppRecord, mappings []s
 			if r.Conflict {
 				conflict = " (conflict: cby.3 channel mapping wins)"
 			}
-			fmt.Fprintf(stdout, "  %s/%s -> channels %v%s\n", //nolint:errcheck
-				r.Record.WorkspaceID, r.Record.RigName, r.Record.ChannelIDs, conflict)
+			patterns := ""
+			if len(r.Record.ChannelPatterns) > 0 {
+				patterns = fmt.Sprintf(" patterns %v", r.Record.ChannelPatterns)
+			}
+			fmt.Fprintf(stdout, "  %s/%s -> channels %v%s%s\n", //nolint:errcheck
+				r.Record.WorkspaceID, r.Record.RigName, r.Record.ChannelIDs, patterns, conflict)
 		}
 	}
 	return nil

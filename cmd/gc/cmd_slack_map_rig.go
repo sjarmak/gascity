@@ -25,12 +25,13 @@ const slackMapRigRestartReminder = "Send SIGHUP to slack-pack adapter (e.g. `pki
 // exists.
 func newSlackMapRigCmd(stdout, stderr io.Writer) *cobra.Command {
 	var (
-		workspaceID    string
-		channels       []string
-		remove         bool
-		removeChannels []string
-		slingTarget    string
-		fixFormula     string
+		workspaceID     string
+		channels        []string
+		channelPatterns []string
+		remove          bool
+		removeChannels  []string
+		slingTarget     string
+		fixFormula      string
 	)
 	cmd := &cobra.Command{
 		Use:   "map-rig <rig-name>",
@@ -56,7 +57,11 @@ record (or unknown channel) is a silent no-op. --remove,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			slingTargetSet := cmd.Flags().Changed("sling-target")
 			fixFormulaSet := cmd.Flags().Changed("fix-formula")
-			return runSlackMapRig(stdout, stderr, args[0], workspaceID, channels, remove, removeChannels,
+			channelsSet := cmd.Flags().Changed("channel")
+			patternsSet := cmd.Flags().Changed("channel-pattern")
+			return runSlackMapRig(stdout, stderr, args[0], workspaceID,
+				channels, channelsSet, channelPatterns, patternsSet,
+				remove, removeChannels,
 				slingTarget, slingTargetSet, fixFormula, fixFormulaSet)
 		},
 	}
@@ -65,6 +70,8 @@ record (or unknown channel) is a silent no-op. --remove,
 		slackWorkspaceIDFlagUsage)
 	cmd.Flags().StringSliceVar(&channels, "channel", nil,
 		"Slack channel id to include in the rig's set; repeat or comma-separate for multiple")
+	cmd.Flags().StringSliceVar(&channelPatterns, "channel-pattern", nil,
+		"Glob pattern matched against Slack channel names (path.Match syntax restricted to a-z, 0-9, -, _, and the metacharacters * ? [ ] ^); repeat or comma-separate for multiple. Either --channel or --channel-pattern (or both) must be supplied.")
 	cmd.Flags().BoolVar(&remove, "remove", false,
 		"Remove the rig record entirely (idempotent; mutually exclusive with --channel and --remove-channels)")
 	cmd.Flags().StringSliceVar(&removeChannels, "remove-channels", nil,
@@ -83,10 +90,18 @@ record (or unknown channel) is a silent no-op. --remove,
 	cmd.MarkFlagsMutuallyExclusive("remove", "remove-channels")
 	cmd.MarkFlagsMutuallyExclusive("remove", "channel")
 	cmd.MarkFlagsMutuallyExclusive("remove-channels", "channel")
+	// --channel-pattern is mutually exclusive with the destructive
+	// flags for the same reason --channel is: writes (literal or
+	// pattern) cannot mix with removals on the same invocation.
+	cmd.MarkFlagsMutuallyExclusive("remove", "channel-pattern")
+	cmd.MarkFlagsMutuallyExclusive("remove-channels", "channel-pattern")
 	return cmd
 }
 
-func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, channels []string, remove bool, removeChannels []string,
+func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string,
+	channels []string, channelsSet bool,
+	channelPatterns []string, patternsSet bool,
+	remove bool, removeChannels []string,
 	slingTarget string, slingTargetSet bool, fixFormula string, fixFormulaSet bool,
 ) error {
 	cityPath, err := resolveCity()
@@ -125,8 +140,14 @@ func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, chann
 		return runSlackMapRigRemoveChannels(stdout, cityPath, rigName, workspaceID, removeChannels)
 	}
 
-	if len(channels) == 0 {
-		return fmt.Errorf("--channel is required (one or more) unless --remove or --remove-channels is set")
+	if !channelsSet && !patternsSet {
+		return fmt.Errorf("--channel and/or --channel-pattern is required (one or more) unless --remove or --remove-channels is set")
+	}
+
+	// Validate patterns early — fail before opening any registry.
+	desiredPatterns, err := dedupSortedValidPatterns(channelPatterns)
+	if err != nil {
+		return fmt.Errorf("--channel-pattern: %w", err)
 	}
 
 	// Open both registries: cby.4 (rig) for the actual write, cby.3
@@ -141,8 +162,11 @@ func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, chann
 	}
 
 	desired := dedupSortedChannels(channels)
-	if len(desired) == 0 {
+	if channelsSet && len(desired) == 0 {
 		return fmt.Errorf("--channel must include at least one non-empty value")
+	}
+	if patternsSet && len(desiredPatterns) == 0 {
+		return fmt.Errorf("--channel-pattern must include at least one non-empty value")
 	}
 
 	// Cross-store conflict check is best-effort: load registry A, then write registry B.
@@ -176,11 +200,32 @@ func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, chann
 	// doesn't silently clear dispatch routing.
 	effectiveSlingTarget := slingTarget
 	effectiveFixFormula := fixFormula
+	effectiveChannels := desired
+	effectivePatterns := desiredPatterns
 	if existing, ok := rigReg.Get(workspaceID, rigName); ok {
-		dropped := diffStrings(existing.ChannelIDs, desired)
-		if len(dropped) > 0 {
-			fmt.Fprintf(stderr, "Rig %q had channels %v; replacing with %v (dropped: %s). To preserve channels across re-bind, include them all in --channel.\n", //nolint:errcheck
-				rigName, existing.ChannelIDs, desired, strings.Join(dropped, ", "))
+		// --channel/--channel-pattern preservation mirrors the
+		// --sling-target rule: a re-bind that does NOT supply the flag
+		// keeps the existing dimension intact rather than silently
+		// stripping it. Operators who want to clear a dimension supply
+		// the relevant --remove-channels (literal) or, in a future
+		// follow-up, a --remove-channel-patterns flag.
+		if channelsSet {
+			dropped := diffStrings(existing.ChannelIDs, desired)
+			if len(dropped) > 0 {
+				fmt.Fprintf(stderr, "Rig %q had channels %v; replacing with %v (dropped: %s). To preserve channels across re-bind, include them all in --channel.\n", //nolint:errcheck
+					rigName, existing.ChannelIDs, desired, strings.Join(dropped, ", "))
+			}
+		} else {
+			effectiveChannels = existing.ChannelIDs
+		}
+		if patternsSet {
+			droppedPatterns := diffStrings(existing.ChannelPatterns, desiredPatterns)
+			if len(droppedPatterns) > 0 {
+				fmt.Fprintf(stderr, "Rig %q had channel_patterns %v; replacing with %v (dropped: %s). To preserve patterns across re-bind, include them all in --channel-pattern.\n", //nolint:errcheck
+					rigName, existing.ChannelPatterns, desiredPatterns, strings.Join(droppedPatterns, ", "))
+			}
+		} else {
+			effectivePatterns = existing.ChannelPatterns
 		}
 		if !slingTargetSet {
 			effectiveSlingTarget = existing.SlingTarget
@@ -192,19 +237,25 @@ func runSlackMapRig(stdout, stderr io.Writer, rigName, workspaceID string, chann
 
 	now := time.Now().UTC()
 	rec := slackRigMappingRecord{
-		WorkspaceID: workspaceID,
-		RigName:     rigName,
-		ChannelIDs:  desired,
-		SlingTarget: effectiveSlingTarget,
-		FixFormula:  effectiveFixFormula,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		WorkspaceID:     workspaceID,
+		RigName:         rigName,
+		ChannelIDs:      effectiveChannels,
+		ChannelPatterns: effectivePatterns,
+		SlingTarget:     effectiveSlingTarget,
+		FixFormula:      effectiveFixFormula,
+		CreatedAt:       now,
+		UpdatedAt:       now,
 	}
 	if err := rigReg.Set(rec); err != nil {
 		return fmt.Errorf("persist slack rig mapping: %w", err)
 	}
-	fmt.Fprintf(stdout, "Mapped rig %s (workspace=%s) → channels %v\n", //nolint:errcheck
-		rigName, workspaceID, desired)
+	if len(effectivePatterns) > 0 {
+		fmt.Fprintf(stdout, "Mapped rig %s (workspace=%s) → channels %v patterns %v\n", //nolint:errcheck
+			rigName, workspaceID, effectiveChannels, effectivePatterns)
+	} else {
+		fmt.Fprintf(stdout, "Mapped rig %s (workspace=%s) → channels %v\n", //nolint:errcheck
+			rigName, workspaceID, effectiveChannels)
+	}
 	fmt.Fprintln(stdout, slackMapRigRestartReminder) //nolint:errcheck
 	return nil
 }
@@ -236,7 +287,11 @@ func runSlackMapRigRemoveChannels(stdout io.Writer, cityPath, rigName, workspace
 	remaining := diffStrings(existing.ChannelIDs, toRemove)
 	actuallyRemoved := diffStrings(existing.ChannelIDs, remaining)
 
-	if len(remaining) == 0 {
+	// If both literals AND patterns are now empty, the record carries
+	// no resolver inputs — delete it. If patterns remain, keep the
+	// record alive with an empty literal set; the rig is still
+	// reachable by name-pattern when cby.b wires up the resolver.
+	if len(remaining) == 0 && len(existing.ChannelPatterns) == 0 {
 		existed, err := reg.Remove(workspaceID, rigName)
 		if err != nil {
 			return fmt.Errorf("remove slack rig mapping for %q: %w", rigName, err)
@@ -260,6 +315,11 @@ func runSlackMapRigRemoveChannels(stdout io.Writer, cityPath, rigName, workspace
 		WorkspaceID: workspaceID,
 		RigName:     rigName,
 		ChannelIDs:  remaining,
+		// Preserve channel_patterns across partial literal-channel
+		// removal — --remove-channels names literal ids only and must
+		// not silently strip globs. Pattern removal is deferred to a
+		// future flag (see cby.22 follow-up bead).
+		ChannelPatterns: existing.ChannelPatterns,
 		// Preserve sling_target / fix_formula across partial channel
 		// removal — operators removing a channel don't expect dispatch
 		// routing to be silently cleared.
@@ -286,7 +346,7 @@ func diffStrings(a, b []string) []string {
 	for _, s := range b {
 		in[s] = struct{}{}
 	}
-	out := make([]string, 0)
+	out := make([]string, 0, len(a))
 	for _, s := range a {
 		if _, ok := in[s]; ok {
 			continue
