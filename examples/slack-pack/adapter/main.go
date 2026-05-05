@@ -936,6 +936,17 @@ func main() {
 	defer janitorCancel()
 	go runInboundFileJanitor(janitorCtx, cfg)
 
+	// Thread-binding teardown subscriber (cby.5.4): listens to gc's
+	// city-scoped event stream for terminal session lifecycle events
+	// (session.stopped, session.crashed) and drops the corresponding
+	// thread→session binding plus any handle aliases the launcher
+	// bootstrapped on spawn. Best-effort: a missing gcAPIBase or
+	// cityName disables the goroutine cleanly.
+	go runThreadTeardownSubscriber(janitorCtx, teardownSubscriberConfig{
+		gcAPIBase: cfg.gcAPIBase,
+		cityName:  cfg.cityName,
+	}, threadReg, aliasReg)
+
 	errCh := make(chan error, 2)
 	go func() {
 		log.Printf("public listener serving on %s (Slack events)", cfg.publicListen)
@@ -2671,6 +2682,29 @@ func (r *handleAliasRegistry) Set(handle, sessionID string) error {
 		r.byHandle[handle] = sessionID
 	}
 	return r.saveLocked()
+}
+
+// findHandlesBySessionID returns every handle currently mapped to
+// sessionID. Returns an empty slice (not nil) when sessionID is empty
+// or no handles match. Used by the cby.5.4 thread-binding teardown
+// subscriber to unwind the alias bootstrap installed in
+// dispatchRoomLaunch when the underlying session ends. O(n) over the
+// alias map; acceptable while the alias registry is bounded by active
+// handles (typically tens to low hundreds). If the alias map ever
+// grows large, store the handle alongside the thread binding instead.
+func (r *handleAliasRegistry) findHandlesBySessionID(sessionID string) []string {
+	if sessionID == "" {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var matches []string
+	for handle, sid := range r.byHandle {
+		if sid == sessionID {
+			matches = append(matches, handle)
+		}
+	}
+	return matches
 }
 
 // Delete removes the alias for handle and persists the registry. Returns
