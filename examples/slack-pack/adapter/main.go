@@ -103,15 +103,14 @@
 //     "/tmp/gc-slack-adapter/channel_mappings.json".
 //     JSON file written by `gc slack
 //     map-channel`. Read-only on the adapter
-//     side. The adapter does NOT reload on
-//     change — restart to pick up new
-//     bindings.
+//     side; loaded at startup and re-read on
+//     SIGHUP (gc-cby.23).
 //   - SLACK_RIG_MAPPING_PATH        Default "<GC_CITY_PATH>/.gc/slack/rig_mappings.json"
 //     when GC_CITY_PATH is set, otherwise
 //     "/tmp/gc-slack-adapter/rig_mappings.json".
 //     JSON file written by `gc slack map-rig`.
 //     Read-only on the adapter side; same
-//     load-once-at-startup contract as
+//     SIGHUP-or-restart reload contract as
 //     SLACK_CHANNEL_MAPPING_PATH. Channel
 //     mappings override rig mappings when both
 //     claim the same channel.
@@ -120,8 +119,8 @@
 //     "/tmp/gc-slack-adapter/apps.json". JSON
 //     file written by `gc slack import-app`,
 //     populated post-OAuth (gc-cby.9). Read-only
-//     on the adapter side; same load-once-at-
-//     startup contract. Used for per-app signing
+//     on the adapter side; same SIGHUP-or-restart
+//     reload contract. Used for per-app signing
 //     secret lookup keyed by team_id.
 //   - GC_CITY_PATH                 Optional; consulted only to derive
 //     SLACK_CHANNEL_MAPPING_PATH,
@@ -305,14 +304,14 @@ type config struct {
 	// channelMappingPath is the JSON file written by
 	// `gc slack map-channel` mapping (workspace_id, channel_id) →
 	// (rig|session, target_id). Read-only on this side; the adapter
-	// loads it once at startup and never reloads — restart the adapter
-	// to pick up new bindings. Sourced from SLACK_CHANNEL_MAPPING_PATH,
-	// defaulting to <GC_CITY_PATH>/.gc/slack/channel_mappings.json when
-	// GC_CITY_PATH is set, else /tmp/gc-slack-adapter/channel_mappings.json.
+	// loads it at startup and re-reads on SIGHUP (gc-cby.23). Sourced
+	// from SLACK_CHANNEL_MAPPING_PATH, defaulting to
+	// <GC_CITY_PATH>/.gc/slack/channel_mappings.json when GC_CITY_PATH
+	// is set, else /tmp/gc-slack-adapter/channel_mappings.json.
 	channelMappingPath string
 	// rigMappingPath is the JSON file written by `gc slack map-rig`
 	// mapping (workspace_id, rig_name) → set-of-channel-ids. Read-only
-	// on this side; same load-once-at-startup contract as
+	// on this side; same SIGHUP-or-restart reload contract as
 	// channelMappingPath. Per-channel `map-channel` bindings take
 	// precedence over rig defaults — see resolveChannelTarget. Sourced
 	// from SLACK_RIG_MAPPING_PATH, defaulting to
@@ -341,8 +340,8 @@ type config struct {
 	dispatchConcurrency int
 	// appsRegistryPath is the JSON file written by `gc slack import-app`
 	// mapping (workspace_id, app_id) → app record (incl. signing_secret
-	// populated post-OAuth). Read-only on this side; same load-once-at-
-	// startup contract as channelMappingPath. Sourced from
+	// populated post-OAuth). Read-only on this side; same SIGHUP-or-
+	// restart reload contract as channelMappingPath. Sourced from
 	// SLACK_APPS_REGISTRY_PATH, defaulting to
 	// <GC_CITY_PATH>/.gc/slack/apps.json when GC_CITY_PATH is set, else
 	// /tmp/gc-slack-adapter/apps.json. Used to resolve per-app signing
@@ -845,21 +844,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("room launch mapping registry: %v", err)
 	}
-	log.Printf("room launch mapping registry: store=%s (read-only; restart to reload)",
+	log.Printf("room launch mapping registry: store=%s (read-only; SIGHUP or restart to reload)",
 		cfg.roomLaunchPath)
 
 	channelMapReg, err := newChannelMappingRegistry(cfg.channelMappingPath)
 	if err != nil {
 		log.Fatalf("channel mapping registry: %v", err)
 	}
-	log.Printf("channel mapping registry: store=%s entries=%d (read-only; restart to reload)",
+	log.Printf("channel mapping registry: store=%s entries=%d (read-only; SIGHUP or restart to reload)",
 		cfg.channelMappingPath, channelMapReg.Len())
 
 	rigMapReg, err := newRigMappingRegistry(cfg.rigMappingPath)
 	if err != nil {
 		log.Fatalf("rig mapping registry: %v", err)
 	}
-	log.Printf("rig mapping registry: store=%s entries=%d (read-only; restart to reload)",
+	log.Printf("rig mapping registry: store=%s entries=%d (read-only; SIGHUP or restart to reload)",
 		cfg.rigMappingPath, rigMapReg.Len())
 
 	appsReg, err := newAppsRegistry(cfg.appsRegistryPath)
@@ -867,7 +866,7 @@ func main() {
 		log.Fatalf("apps registry: %v", err)
 	}
 	cfg.appsRegistry = appsReg
-	log.Printf("apps registry: store=%s entries=%d (read-only; restart to reload)",
+	log.Printf("apps registry: store=%s entries=%d (read-only; SIGHUP or restart to reload)",
 		cfg.appsRegistryPath, appsReg.Len())
 	if appsReg.Len() == 0 && cfg.slackSigningKey == "" {
 		log.Printf("WARN: apps registry is empty and SLACK_SIGNING_SECRET is unset — all inbound Slack requests will be rejected with 401 until an app is imported (gc slack import-app + OAuth) or the env var is set")
@@ -967,6 +966,21 @@ func main() {
 			errCh <- internalSrv.ListenAndServe()
 		}
 	}()
+
+	// SIGHUP-driven reload of the four CLI-written registry files
+	// (apps, channel mappings, rig mappings, room launch mappings) —
+	// gc-cby.23. Buffer-size-1 + a separate Notify channel from `stop`
+	// so SIGHUP cannot trigger shutdown. reloadStop is closed by the
+	// trailing defer below alongside janitorCancel, so the goroutine
+	// exits cleanly during shutdown.
+	reloadStop := make(chan struct{})
+	defer close(reloadStop)
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	defer signal.Stop(hupCh)
+	go runReloadLoop(reloadStop, hupCh, func() {
+		logReloadOutcome(appsReg, channelMapReg, rigMapReg, roomLaunchReg)
+	})
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)

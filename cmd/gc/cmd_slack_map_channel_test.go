@@ -148,7 +148,7 @@ func TestSlackMapChannelRemoveWithTargetIsError(t *testing.T) {
 // slackMapChannelRestartHint is the trailing reminder appended by
 // every success-path output of `gc slack map-channel`, parallel to
 // the cby.4 rig-mapping CLI.
-const slackMapChannelRestartHint = "Restart slack-pack adapter"
+const slackMapChannelRestartHint = "Send SIGHUP to slack-pack adapter"
 
 func TestSlackMapChannelHappyPathIncludesRestartReminder(t *testing.T) {
 	cityRoot := newTestCity(t)

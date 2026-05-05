@@ -11,10 +11,11 @@ import (
 )
 
 // slackMapRigRestartReminder is the trailing line printed on every
-// success path of `gc slack map-rig` AND `gc slack map-channel` so
-// operators are reminded that the slack-pack adapter loads the
-// registries once at startup. SIGHUP reload is a follow-up bead.
-const slackMapRigRestartReminder = "Restart slack-pack adapter (gc service restart slack) to pick up the binding."
+// success path of `gc slack map-rig`, `gc slack map-channel`, and
+// `gc slack enable-room-launch` so operators see how to make the new
+// binding live. SIGHUP-driven reload (gc-cby.23) is the cheap path; a
+// full restart still works as the fallback when the pid is unknown.
+const slackMapRigRestartReminder = "Send SIGHUP to slack-pack adapter (e.g. `pkill -HUP gc-slack-adapter`) — or restart it via `gc service restart slack` — to pick up the binding."
 
 // newSlackMapRigCmd returns `gc slack map-rig` — the verb that
 // persists a (workspace_id, rig_name) → set-of-channel-ids binding

@@ -35,17 +35,24 @@ type rigMappingDiskRecord struct {
 }
 
 // rigMappingRegistry is a read-mostly in-memory view of the
-// rig_mappings.json file written by `gc slack map-rig`. Loaded once
-// at adapter startup; restart adapter to pick up new bindings written
-// via `gc slack map-rig`. Same caveat as channelMappingRegistry — a
-// watcher would race against in-flight Slack interactions, and
-// Slack's 3-second slash-command latency budget is too tight to
-// retry.
+// rig_mappings.json file written by `gc slack map-rig`. Loaded once at
+// adapter startup and re-read on SIGHUP via Stage/Commit (gc-cby.23).
+// Same caveat as channelMappingRegistry — a watcher would race against
+// in-flight Slack interactions, and Slack's 3-second slash-command
+// latency budget is too tight to retry.
 type rigMappingRegistry struct {
 	mu        sync.RWMutex
 	byKey     map[string]rigMappingDiskRecord // "<workspace_id>:<rig_name>"
 	byChannel map[string]string               // "<workspace_id>:<channel_id>" -> rigName
 	diskPath  string
+}
+
+// rigMappingSnapshot is a parsed-but-not-yet-committed view of
+// rig_mappings.json. Carries BOTH byKey and byChannel pre-built so the
+// live indexes never desync mid-commit. nil = "file absent" sentinel.
+type rigMappingSnapshot struct {
+	byKey     map[string]rigMappingDiskRecord
+	byChannel map[string]string
 }
 
 func rigMappingKey(workspaceID, rigName string) string {
@@ -176,66 +183,110 @@ func (r *rigMappingRegistry) Set(rec rigMappingDiskRecord) error {
 // interactions.go keeps each file's size policy explicit.
 const maxRigRegistryBytes = 10 << 20 // 10 MiB
 
-func (r *rigMappingRegistry) load() error {
-	if r.diskPath == "" {
-		return nil
+// parseRigMappingRegistry reads diskPath into a ready-to-commit snapshot
+// with byKey and byChannel both pre-built. nil + nil = "file absent"
+// sentinel. Validation errors return (nil, err); on overlap (only
+// possible via a hand-edited file) the first-by-sorted-key rig wins and
+// a WARN is logged. Logging on each parse means a SIGHUP reload of a
+// chronically-overlapping file re-emits the WARN — operators see drift
+// they introduced; deduping is tracked separately.
+func parseRigMappingRegistry(diskPath string) (*rigMappingSnapshot, error) {
+	if diskPath == "" {
+		return nil, nil
 	}
-	f, err := os.Open(r.diskPath)
+	f, err := os.Open(diskPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return nil, nil
 		}
-		return err
+		return nil, err
 	}
 	defer f.Close()
 	data, err := io.ReadAll(io.LimitReader(f, maxRigRegistryBytes+1))
 	if err != nil {
-		return fmt.Errorf("read %s: %w", r.diskPath, err)
+		return nil, fmt.Errorf("read %s: %w", diskPath, err)
 	}
 	if int64(len(data)) > maxRigRegistryBytes {
-		return fmt.Errorf("registry file %s exceeds %d bytes", r.diskPath, maxRigRegistryBytes)
+		return nil, fmt.Errorf("registry file %s exceeds %d bytes", diskPath, maxRigRegistryBytes)
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	var stored map[string]rigMappingDiskRecord
 	if err := dec.Decode(&stored); err != nil {
-		return fmt.Errorf("decode rig mapping store: %w", err)
+		return nil, fmt.Errorf("decode rig mapping store: %w", err)
 	}
 	for key, rec := range stored {
 		if rec.WorkspaceID == "" || rec.RigName == "" {
-			return fmt.Errorf("rig mapping store: record %q missing workspace_id or rig_name", key)
+			return nil, fmt.Errorf("rig mapping store: record %q missing workspace_id or rig_name", key)
 		}
 		if len(rec.ChannelIDs) == 0 {
-			return fmt.Errorf("rig mapping store: record %q has empty channel_ids", key)
+			return nil, fmt.Errorf("rig mapping store: record %q has empty channel_ids", key)
 		}
 	}
-	r.byKey = stored
-	if r.byKey == nil {
-		r.byKey = make(map[string]rigMappingDiskRecord)
+	if stored == nil {
+		stored = make(map[string]rigMappingDiskRecord)
 	}
 
-	// Rebuild byChannel deterministically. On overlap (only possible
-	// via a hand-edited file), the first-by-sorted-key rig wins and
-	// a WARN is emitted so operators see the conflict in adapter
-	// logs.
-	r.byChannel = make(map[string]string)
-	keys := make([]string, 0, len(r.byKey))
-	for k := range r.byKey {
+	byChannel := make(map[string]string)
+	keys := make([]string, 0, len(stored))
+	for k := range stored {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		rec := r.byKey[k]
+		rec := stored[k]
 		for _, ch := range rec.ChannelIDs {
 			ck := rigChannelKey(rec.WorkspaceID, ch)
-			if existing, ok := r.byChannel[ck]; ok && existing != rec.RigName {
+			if existing, ok := byChannel[ck]; ok && existing != rec.RigName {
 				log.Printf("WARN: rig mapping store: channel %q in workspace %q claimed by rig %q and rig %q (hand-edited?); rig %q wins for resolver",
 					ch, rec.WorkspaceID, existing, rec.RigName, existing)
 				continue
 			}
-			r.byChannel[ck] = rec.RigName
+			byChannel[ck] = rec.RigName
 		}
 	}
+
+	return &rigMappingSnapshot{byKey: stored, byChannel: byChannel}, nil
+}
+
+// load is the constructor-time helper — called pre-publish, no lock needed.
+func (r *rigMappingRegistry) load() error {
+	snap, err := parseRigMappingRegistry(r.diskPath)
+	if err != nil {
+		return err
+	}
+	if snap != nil {
+		r.byKey = snap.byKey
+		r.byChannel = snap.byChannel
+	}
+	return nil
+}
+
+// Stage parses the on-disk file into a snapshot ready for atomic Commit.
+// nil snapshot + nil error = file absent, preserve live state.
+func (r *rigMappingRegistry) Stage() (*rigMappingSnapshot, error) {
+	return parseRigMappingRegistry(r.diskPath)
+}
+
+// Commit atomically swaps byKey and byChannel under the write lock so
+// resolver readers never observe a desync between the two indexes.
+func (r *rigMappingRegistry) Commit(snap *rigMappingSnapshot) {
+	if snap == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.byKey = snap.byKey
+	r.byChannel = snap.byChannel
+}
+
+// Reload combines Stage and Commit; per-registry test convenience.
+func (r *rigMappingRegistry) Reload() error {
+	snap, err := r.Stage()
+	if err != nil {
+		return err
+	}
+	r.Commit(snap)
 	return nil
 }
 

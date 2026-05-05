@@ -20,7 +20,7 @@ func execSlackMapRigCmd(t *testing.T, cityRoot string, args ...string) (string, 
 	return stdout.String(), stderr.String(), err
 }
 
-const slackMapRigRestartHint = "Restart slack-pack adapter"
+const slackMapRigRestartHint = "Send SIGHUP to slack-pack adapter"
 
 func TestSlackMapRigHappyPath(t *testing.T) {
 	cityRoot := newTestCity(t)

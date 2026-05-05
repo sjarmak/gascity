@@ -290,6 +290,44 @@ the adapter runs as a `[[service]]`; do not set them by hand):
 `GC_SERVICE_STATE_ROOT`, `GC_SERVICE_RUN_ROOT`. See
 "What gc injects vs. what stays in the env file" above.
 
+### SIGHUP-driven reload
+
+Four of the adapter's registries are written by `gc slack` CLI
+commands and read by the adapter at startup:
+
+| Registry             | File                          | CLI writer                    |
+| -------------------- | ----------------------------- | ----------------------------- |
+| Apps                 | `apps.json`                   | `gc slack import-app`         |
+| Channel mappings     | `channel_mappings.json`       | `gc slack map-channel`        |
+| Rig mappings         | `rig_mappings.json`           | `gc slack map-rig`            |
+| Room launch mappings | `room_launch_mappings.json`   | `gc slack enable-room-launch` |
+
+Send `SIGHUP` to the running adapter to pick up CLI-driven changes
+without a full restart:
+
+```
+pkill -HUP gc-slack-adapter
+```
+
+Reload is all-or-nothing across the four files — a single parse
+failure (corrupt JSON, unknown `target_kind`, missing required field,
+file >10 MiB) aborts the cycle with the live in-memory state
+untouched. Errors are logged at WARN; the adapter keeps serving.
+
+A missing file is a **no-op** (live state is preserved). To clear a
+registry, write an empty JSON object instead of removing the file:
+
+```
+echo '{}' > <city>/.gc/slack/channel_mappings.json
+pkill -HUP gc-slack-adapter
+```
+
+The other three registries — `IDENTITY_STORE_PATH`,
+`HANDLE_ALIAS_STORE_PATH`, and the thread-session store — are written
+in-process by the adapter itself (via `/identity`, `/handle-alias`,
+and the launcher), not by the CLI, so they do not participate in
+SIGHUP reload.
+
 **Consumer-specific** (referenced by deployment scripts and prompts in
 sibling tooling, not by the adapter binary): variables consumed by
 `deliver-rollup.sh`, `resolve_rig_channel.py`, etc., live with the

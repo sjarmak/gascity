@@ -37,8 +37,8 @@ func TestSlackEnableRoomLaunchHappyPath(t *testing.T) {
 	if !strings.Contains(stdout, "C0123") || !strings.Contains(stdout, "mission-control/launcher") {
 		t.Errorf("stdout should mention channel and launcher pool: %q", stdout)
 	}
-	if !strings.Contains(stdout, "Restart slack-pack adapter") {
-		t.Errorf("stdout should remind operator to restart adapter: %q", stdout)
+	if !strings.Contains(stdout, "Send SIGHUP to slack-pack adapter") {
+		t.Errorf("stdout should remind operator how to reload adapter: %q", stdout)
 	}
 
 	reg, err := newSlackRoomLaunchMappingRegistry(slackRoomLaunchMappingsPath(cityRoot))

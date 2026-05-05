@@ -221,6 +221,238 @@ func TestAppsRegistryLoadRejectsOversizedFile(t *testing.T) {
 	}
 }
 
+// TestAppsRegistryReloadPicksUpNewRecords — gc-cby.23: after the CLI
+// (`gc slack import-app` or post-OAuth callback) rewrites apps.json, a
+// SIGHUP-driven Reload must surface the new records without restarting
+// the adapter binary.
+func TestAppsRegistryReloadPicksUpNewRecords(t *testing.T) {
+	dir := t.TempDir()
+	path := writeAppsRegistryFile(t, dir, map[string]appRecord{
+		"T1:A1": {WorkspaceID: "T1", AppID: "A1", SigningSecret: "old-secret"},
+	})
+	reg, err := newAppsRegistry(path)
+	if err != nil {
+		t.Fatalf("newAppsRegistry: %v", err)
+	}
+	if got := reg.Len(); got != 1 {
+		t.Fatalf("initial Len = %d, want 1", got)
+	}
+
+	// CLI rewrites apps.json with a new record + secret rotation on the
+	// existing one.
+	data, err := json.MarshalIndent(map[string]appRecord{
+		"T1:A1": {WorkspaceID: "T1", AppID: "A1", SigningSecret: "rotated-secret"},
+		"T1:A2": {WorkspaceID: "T1", AppID: "A2", SigningSecret: "new-secret"},
+	}, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal new file: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("rewrite apps.json: %v", err)
+	}
+
+	if err := reg.Reload(); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if got := reg.Len(); got != 2 {
+		t.Errorf("post-Reload Len = %d, want 2", got)
+	}
+	got := reg.GetByTeamID("T1")
+	if len(got) != 2 {
+		t.Fatalf("post-Reload GetByTeamID(T1) returned %d, want 2", len(got))
+	}
+	for _, rec := range got {
+		if rec.AppID == "A1" && rec.SigningSecret != "rotated-secret" {
+			t.Errorf("A1 secret = %q after Reload, want rotated-secret", rec.SigningSecret)
+		}
+	}
+}
+
+// TestAppsRegistryReloadHandlesDeletedRecords — when apps.json is
+// rewritten with a record removed, Reload drops it from in-memory state.
+func TestAppsRegistryReloadHandlesDeletedRecords(t *testing.T) {
+	dir := t.TempDir()
+	path := writeAppsRegistryFile(t, dir, map[string]appRecord{
+		"T1:A1": {WorkspaceID: "T1", AppID: "A1", SigningSecret: "s1"},
+		"T1:A2": {WorkspaceID: "T1", AppID: "A2", SigningSecret: "s2"},
+	})
+	reg, err := newAppsRegistry(path)
+	if err != nil {
+		t.Fatalf("newAppsRegistry: %v", err)
+	}
+	// Rewrite with A2 removed.
+	data, _ := json.MarshalIndent(map[string]appRecord{
+		"T1:A1": {WorkspaceID: "T1", AppID: "A1", SigningSecret: "s1"},
+	}, "", "  ")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	if err := reg.Reload(); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if got := reg.Len(); got != 1 {
+		t.Errorf("post-Reload Len = %d, want 1", got)
+	}
+}
+
+// TestAppsRegistryReloadEmptyJSONClearsState — operators clear the
+// registry by writing `{}`, NOT by removing the file. This documents the
+// missing-file vs empty-object distinction in Reload semantics.
+func TestAppsRegistryReloadEmptyJSONClearsState(t *testing.T) {
+	dir := t.TempDir()
+	path := writeAppsRegistryFile(t, dir, map[string]appRecord{
+		"T1:A1": {WorkspaceID: "T1", AppID: "A1", SigningSecret: "s1"},
+	})
+	reg, err := newAppsRegistry(path)
+	if err != nil {
+		t.Fatalf("newAppsRegistry: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write empty: %v", err)
+	}
+	if err := reg.Reload(); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if got := reg.Len(); got != 0 {
+		t.Errorf("post-Reload Len after `{}` = %d, want 0 (empty JSON clears)", got)
+	}
+}
+
+// TestAppsRegistryReloadOnMissingFileIsNoop — missing file means "no
+// change," NOT "clear state." Operators who `rm apps.json` then SIGHUP
+// keep their old in-memory bindings (paranoid default — rm is more
+// likely a mistake than a deliberate clear).
+func TestAppsRegistryReloadOnMissingFileIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	path := writeAppsRegistryFile(t, dir, map[string]appRecord{
+		"T1:A1": {WorkspaceID: "T1", AppID: "A1", SigningSecret: "preserved"},
+	})
+	reg, err := newAppsRegistry(path)
+	if err != nil {
+		t.Fatalf("newAppsRegistry: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("rm: %v", err)
+	}
+	if err := reg.Reload(); err != nil {
+		t.Fatalf("Reload on missing file should be a no-op, got err: %v", err)
+	}
+	got := reg.GetByTeamID("T1")
+	if len(got) != 1 || got[0].SigningSecret != "preserved" {
+		t.Errorf("post-Reload state = %v, want preserved single A1 record", got)
+	}
+}
+
+// TestAppsRegistryReloadOnCorruptFilePreservesState — Reload on a
+// corrupt/oversized file must return an error AND leave the live state
+// intact. This is the all-or-nothing guarantee that reloadAllRegistries
+// builds on for cross-registry atomicity.
+func TestAppsRegistryReloadOnCorruptFilePreservesState(t *testing.T) {
+	dir := t.TempDir()
+	path := writeAppsRegistryFile(t, dir, map[string]appRecord{
+		"T1:A1": {WorkspaceID: "T1", AppID: "A1", SigningSecret: "preserved"},
+	})
+	reg, err := newAppsRegistry(path)
+	if err != nil {
+		t.Fatalf("newAppsRegistry: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("not valid json {"), 0o600); err != nil {
+		t.Fatalf("write corrupt: %v", err)
+	}
+	if err := reg.Reload(); err == nil {
+		t.Fatal("Reload on corrupt file: want error, got nil")
+	}
+	// State must be unchanged.
+	got := reg.GetByTeamID("T1")
+	if len(got) != 1 || got[0].SigningSecret != "preserved" {
+		t.Errorf("post-failed-Reload state = %v, want preserved single A1 record (Reload error must NOT corrupt live state)", got)
+	}
+}
+
+// TestAppsRegistryStageDoesNotMutate — Stage parses without committing.
+// Repeated calls must not affect live state.
+func TestAppsRegistryStageDoesNotMutate(t *testing.T) {
+	dir := t.TempDir()
+	path := writeAppsRegistryFile(t, dir, map[string]appRecord{
+		"T1:A1": {WorkspaceID: "T1", AppID: "A1", SigningSecret: "live"},
+	})
+	reg, err := newAppsRegistry(path)
+	if err != nil {
+		t.Fatalf("newAppsRegistry: %v", err)
+	}
+	// Rewrite the file with different content.
+	data, _ := json.MarshalIndent(map[string]appRecord{
+		"T1:A2": {WorkspaceID: "T1", AppID: "A2", SigningSecret: "staged"},
+	}, "", "  ")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	snap, err := reg.Stage()
+	if err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	if snap == nil {
+		t.Fatal("Stage on present file returned nil snapshot")
+	}
+	// Live state must still be the original A1.
+	got := reg.GetByTeamID("T1")
+	if len(got) != 1 || got[0].AppID != "A1" {
+		t.Errorf("post-Stage live state = %v, want unchanged A1 (Stage must not mutate)", got)
+	}
+	// After Commit, state reflects the staged file.
+	reg.Commit(snap)
+	got = reg.GetByTeamID("T1")
+	if len(got) != 1 || got[0].AppID != "A2" {
+		t.Errorf("post-Commit state = %v, want A2 from staged file", got)
+	}
+}
+
+// TestAppsRegistryReloadConcurrentReadsSafe — Reload swap under the
+// write lock must not race with concurrent GetByTeamID readers. Run
+// with -race to catch lock-omission bugs.
+func TestAppsRegistryReloadConcurrentReadsSafe(t *testing.T) {
+	dir := t.TempDir()
+	path := writeAppsRegistryFile(t, dir, map[string]appRecord{
+		"T1:A1": {WorkspaceID: "T1", AppID: "A1", SigningSecret: "v1"},
+	})
+	reg, err := newAppsRegistry(path)
+	if err != nil {
+		t.Fatalf("newAppsRegistry: %v", err)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_ = reg.GetByTeamID("T1")
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < 50; i++ {
+		secret := "v" + strings.Repeat("x", i%4+1)
+		data, _ := json.MarshalIndent(map[string]appRecord{
+			"T1:A1": {WorkspaceID: "T1", AppID: "A1", SigningSecret: secret},
+		}, "", "  ")
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatalf("rewrite: %v", err)
+		}
+		if err := reg.Reload(); err != nil {
+			t.Fatalf("Reload iteration %d: %v", i, err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
+
 // TestAppsRegistryLen exposes the entry count to the startup log so
 // operators see "registry loaded empty" cases immediately. The startup
 // log uses Len() to print entries=N alongside the store path.

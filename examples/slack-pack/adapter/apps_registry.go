@@ -39,8 +39,8 @@ type appRecord struct {
 }
 
 // appsRegistry is a read-mostly in-memory view of apps.json for the
-// adapter side. The adapter loads the file once at startup and never
-// re-reads it; SIGHUP-driven reload is gc-cby.23. RWMutex is provided
+// adapter side. The adapter loads the file once at startup and re-reads
+// it on SIGHUP via Stage/Commit (gc-cby.23). RWMutex is provided
 // because gc-cby.9 (OAuth flow) will eventually drive in-process
 // updates from the same binary.
 //
@@ -51,6 +51,14 @@ type appsRegistry struct {
 	mu       sync.RWMutex
 	byKey    map[string]appRecord
 	diskPath string
+}
+
+// appsSnapshot is a parsed-but-not-yet-committed view of apps.json. A
+// nil snapshot is the "file is absent" sentinel (see Stage); Commit
+// treats it as a no-op so an operator-side `rm` does NOT silently wipe
+// in-memory state. To clear, write an empty `{}` JSON document.
+type appsSnapshot struct {
+	byKey map[string]appRecord
 }
 
 func appsRegistryKey(workspaceID, appID string) string {
@@ -88,40 +96,80 @@ func (r *appsRegistry) GetByTeamID(workspaceID string) []appRecord {
 	return out
 }
 
-// load reads diskPath into byKey. A missing file is not an error.
-// 10 MiB cap matches channelMappingRegistry: any larger is corrupt or
-// hostile and must not be loaded. The decoder rejects unknown fields
-// is intentionally NOT enabled here — the cmd/gc writer may grow the
-// schema (e.g. forward-compat manifest_raw additions) before the
-// adapter is updated. Field-by-field strict matching would silently
+// parseAppsRegistry reads diskPath and returns a ready-to-commit
+// snapshot. A missing file returns (nil, nil) — the "no change" sentinel
+// for SIGHUP reload semantics. 10 MiB cap matches channelMappingRegistry.
+// DisallowUnknownFields is intentionally NOT enabled — the cmd/gc writer
+// may grow the schema (e.g. forward-compat manifest_raw additions) before
+// the adapter is updated. Field-by-field strict matching would silently
 // break operators on partial upgrades; the on-disk schema is the only
 // contract.
-func (r *appsRegistry) load() error {
-	if r.diskPath == "" {
-		return nil
+func parseAppsRegistry(diskPath string) (*appsSnapshot, error) {
+	if diskPath == "" {
+		return nil, nil
 	}
-	f, err := os.Open(r.diskPath)
+	f, err := os.Open(diskPath)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return fmt.Errorf("open apps registry %s: %w", r.diskPath, err)
+		return nil, fmt.Errorf("open apps registry %s: %w", diskPath, err)
 	}
 	defer f.Close()
 	data, err := io.ReadAll(io.LimitReader(f, maxRegistryBytes+1))
 	if err != nil {
-		return fmt.Errorf("read apps registry %s: %w", r.diskPath, err)
+		return nil, fmt.Errorf("read apps registry %s: %w", diskPath, err)
 	}
 	if int64(len(data)) > maxRegistryBytes {
-		return fmt.Errorf("apps registry file %s exceeds %d bytes", r.diskPath, maxRegistryBytes)
+		return nil, fmt.Errorf("apps registry file %s exceeds %d bytes", diskPath, maxRegistryBytes)
 	}
 	var stored map[string]appRecord
 	if err := json.Unmarshal(data, &stored); err != nil {
-		return fmt.Errorf("decode apps registry: %w", err)
+		return nil, fmt.Errorf("decode apps registry: %w", err)
 	}
-	if stored != nil {
-		r.byKey = stored
+	if stored == nil {
+		stored = make(map[string]appRecord)
 	}
+	return &appsSnapshot{byKey: stored}, nil
+}
+
+// load is the constructor-time helper — called pre-publish, no lock needed.
+func (r *appsRegistry) load() error {
+	snap, err := parseAppsRegistry(r.diskPath)
+	if err != nil {
+		return err
+	}
+	if snap != nil {
+		r.byKey = snap.byKey
+	}
+	return nil
+}
+
+// Stage parses the on-disk file into a snapshot ready for atomic Commit.
+// nil snapshot + nil error = file absent, preserve live state.
+func (r *appsRegistry) Stage() (*appsSnapshot, error) {
+	return parseAppsRegistry(r.diskPath)
+}
+
+// Commit atomically swaps the in-memory snapshot under the write lock.
+// nil snapshot is a no-op so missing-file Stages preserve live state.
+func (r *appsRegistry) Commit(snap *appsSnapshot) {
+	if snap == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.byKey = snap.byKey
+}
+
+// Reload combines Stage and Commit; per-registry test convenience.
+// Production reload uses reloadAllRegistries for all-or-nothing semantics.
+func (r *appsRegistry) Reload() error {
+	snap, err := r.Stage()
+	if err != nil {
+		return err
+	}
+	r.Commit(snap)
 	return nil
 }
 

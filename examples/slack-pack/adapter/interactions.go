@@ -37,15 +37,22 @@ const (
 
 // channelMappingRegistry is a read-mostly in-memory view of the
 // channel_mappings.json file written by `gc slack map-channel`. The
-// adapter loads it once at startup; it does NOT watch the file for
-// changes — operators must restart the adapter to pick up new
-// bindings. This is intentional: a watcher introduces races against
-// in-flight Slack interactions, and slash-command latency budget
-// (Slack's 3s) is too tight to retry.
+// adapter loads it once at startup and re-reads it on SIGHUP via
+// Stage/Commit (gc-cby.23); it does NOT fsnotify-watch the file —
+// a watcher introduces races against in-flight Slack interactions,
+// and the slash-command latency budget (Slack's 3s) is too tight to
+// retry.
 type channelMappingRegistry struct {
 	mu       sync.RWMutex
 	byKey    map[string]channelMappingDiskRecord
 	diskPath string
+}
+
+// channelMappingSnapshot is a parsed-but-not-yet-committed view of
+// channel_mappings.json. nil snapshot is the "file is absent" sentinel;
+// Commit on nil is a no-op (operators clear by writing `{}`, not `rm`).
+type channelMappingSnapshot struct {
+	byKey map[string]channelMappingDiskRecord
 }
 
 func channelMappingKey(workspaceID, channelID string) string {
@@ -108,41 +115,85 @@ func (r *channelMappingRegistry) Set(rec channelMappingDiskRecord) error {
 // not be loaded.
 const maxRegistryBytes = 10 << 20 // 10 MiB
 
-func (r *channelMappingRegistry) load() error {
-	if r.diskPath == "" {
-		return nil
+// parseChannelMappingRegistry reads diskPath into a ready-to-commit
+// snapshot. A missing file returns (nil, nil) — "no change" sentinel for
+// SIGHUP semantics. Records with unknown target_kind are rejected at
+// parse time so a corrupt write can't be served as policy.
+func parseChannelMappingRegistry(diskPath string) (*channelMappingSnapshot, error) {
+	if diskPath == "" {
+		return nil, nil
 	}
-	f, err := os.Open(r.diskPath)
+	f, err := os.Open(diskPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return nil, nil
 		}
-		return err
+		return nil, err
 	}
 	defer f.Close()
 	data, err := io.ReadAll(io.LimitReader(f, maxRegistryBytes+1))
 	if err != nil {
-		return fmt.Errorf("read %s: %w", r.diskPath, err)
+		return nil, fmt.Errorf("read %s: %w", diskPath, err)
 	}
 	if int64(len(data)) > maxRegistryBytes {
-		return fmt.Errorf("registry file %s exceeds %d bytes", r.diskPath, maxRegistryBytes)
+		return nil, fmt.Errorf("registry file %s exceeds %d bytes", diskPath, maxRegistryBytes)
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	var stored map[string]channelMappingDiskRecord
 	if err := dec.Decode(&stored); err != nil {
-		return fmt.Errorf("decode channel mapping store: %w", err)
+		return nil, fmt.Errorf("decode channel mapping store: %w", err)
 	}
 	for key, rec := range stored {
 		if rec.TargetKind != channelMappingTargetKindRig &&
 			rec.TargetKind != channelMappingTargetKindSession {
-			return fmt.Errorf("channel mapping store: record %q has invalid target_kind %q (must be %q or %q)",
+			return nil, fmt.Errorf("channel mapping store: record %q has invalid target_kind %q (must be %q or %q)",
 				key, rec.TargetKind, channelMappingTargetKindRig, channelMappingTargetKindSession)
 		}
 	}
-	if stored != nil {
-		r.byKey = stored
+	if stored == nil {
+		stored = make(map[string]channelMappingDiskRecord)
 	}
+	return &channelMappingSnapshot{byKey: stored}, nil
+}
+
+// load is the constructor-time helper — called pre-publish, no lock needed.
+func (r *channelMappingRegistry) load() error {
+	snap, err := parseChannelMappingRegistry(r.diskPath)
+	if err != nil {
+		return err
+	}
+	if snap != nil {
+		r.byKey = snap.byKey
+	}
+	return nil
+}
+
+// Stage parses the on-disk file into a snapshot ready for atomic Commit.
+// nil snapshot + nil error = file absent, preserve live state.
+func (r *channelMappingRegistry) Stage() (*channelMappingSnapshot, error) {
+	return parseChannelMappingRegistry(r.diskPath)
+}
+
+// Commit atomically swaps the in-memory snapshot under the write lock.
+// nil snapshot is a no-op.
+func (r *channelMappingRegistry) Commit(snap *channelMappingSnapshot) {
+	if snap == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.byKey = snap.byKey
+}
+
+// Reload combines Stage and Commit; per-registry test convenience.
+// Production reload uses reloadAllRegistries for all-or-nothing semantics.
+func (r *channelMappingRegistry) Reload() error {
+	snap, err := r.Stage()
+	if err != nil {
+		return err
+	}
+	r.Commit(snap)
 	return nil
 }
 

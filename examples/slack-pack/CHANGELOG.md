@@ -7,8 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- SIGHUP-driven reload for the four CLI-written registry files
+  (`apps.json`, `channel_mappings.json`, `rig_mappings.json`,
+  `room_launch_mappings.json`). Operators can now run
+  `gc slack import-app`, `gc slack map-channel`, `gc slack map-rig`, or
+  `gc slack enable-room-launch` and signal the adapter with
+  `pkill -HUP gc-slack-adapter` (or any other SIGHUP delivery) to pick
+  up the new bindings without a service restart (`gc-cby.23`). Reload is
+  all-or-nothing across the four registries — a single parse failure
+  aborts the cycle with the live state untouched. A missing file is a
+  no-op (preserves state); operators clear by writing an empty `{}`
+  document, NOT by `rm`.
+
 ### Changed
 
+- The trailing reminder printed by `gc slack map-rig`,
+  `gc slack map-channel`, and `gc slack enable-room-launch` now leads
+  with the SIGHUP path (`pkill -HUP gc-slack-adapter`) and offers
+  `gc service restart slack` as the fallback, since SIGHUP avoids the
+  startup gap.
 - Adapter Go source relocated from `examples/oversight-rig/adapter/`
   to `examples/slack-pack/adapter/` (`gc-28a`). The pack is now
   self-contained for upstream extraction into a separate

@@ -28,13 +28,19 @@ type roomLaunchMappingDiskRecord struct {
 
 // roomLaunchMappingRegistry is the read-mostly adapter-side view of the
 // room_launch_mappings.json file written by `gc slack
-// enable-room-launch`. Loaded once at adapter startup; restart the
-// adapter to pick up new bindings (same caveat as
-// channelMappingRegistry / rigMappingRegistry).
+// enable-room-launch`. Loaded once at adapter startup and re-read on
+// SIGHUP via Stage/Commit (gc-cby.23). Same caveat as
+// channelMappingRegistry / rigMappingRegistry — no fsnotify watching.
 type roomLaunchMappingRegistry struct {
 	mu       sync.RWMutex
 	byKey    map[string]roomLaunchMappingDiskRecord // "<workspace_id>:<channel_id>"
 	diskPath string
+}
+
+// roomLaunchMappingSnapshot is a parsed-but-not-yet-committed view of
+// room_launch_mappings.json. nil = "file absent" sentinel.
+type roomLaunchMappingSnapshot struct {
+	byKey map[string]roomLaunchMappingDiskRecord
 }
 
 func roomLaunchMappingKey(workspaceID, channelID string) string {
@@ -114,43 +120,82 @@ func (r *roomLaunchMappingRegistry) Set(rec roomLaunchMappingDiskRecord) error {
 // is several orders of magnitude over a healthy install.
 const maxRoomLaunchRegistryBytes = 10 << 20 // 10 MiB
 
-func (r *roomLaunchMappingRegistry) load() error {
-	if r.diskPath == "" {
-		return nil
+// parseRoomLaunchMappingRegistry reads diskPath into a ready-to-commit
+// snapshot. nil + nil = "file absent" sentinel for SIGHUP semantics.
+func parseRoomLaunchMappingRegistry(diskPath string) (*roomLaunchMappingSnapshot, error) {
+	if diskPath == "" {
+		return nil, nil
 	}
-	f, err := os.Open(r.diskPath)
+	f, err := os.Open(diskPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return nil, nil
 		}
-		return err
+		return nil, err
 	}
 	defer f.Close()
 	data, err := io.ReadAll(io.LimitReader(f, maxRoomLaunchRegistryBytes+1))
 	if err != nil {
-		return fmt.Errorf("read %s: %w", r.diskPath, err)
+		return nil, fmt.Errorf("read %s: %w", diskPath, err)
 	}
 	if int64(len(data)) > maxRoomLaunchRegistryBytes {
-		return fmt.Errorf("registry file %s exceeds %d bytes", r.diskPath, maxRoomLaunchRegistryBytes)
+		return nil, fmt.Errorf("registry file %s exceeds %d bytes", diskPath, maxRoomLaunchRegistryBytes)
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	var stored map[string]roomLaunchMappingDiskRecord
 	if err := dec.Decode(&stored); err != nil {
-		return fmt.Errorf("decode room launch mapping store: %w", err)
+		return nil, fmt.Errorf("decode room launch mapping store: %w", err)
 	}
 	for key, rec := range stored {
 		if rec.WorkspaceID == "" || rec.ChannelID == "" {
-			return fmt.Errorf("room launch mapping store: record %q missing workspace_id or channel_id", key)
+			return nil, fmt.Errorf("room launch mapping store: record %q missing workspace_id or channel_id", key)
 		}
 		if rec.PoolTemplate == "" {
-			return fmt.Errorf("room launch mapping store: record %q missing pool_template", key)
+			return nil, fmt.Errorf("room launch mapping store: record %q missing pool_template", key)
 		}
 	}
-	r.byKey = stored
-	if r.byKey == nil {
-		r.byKey = make(map[string]roomLaunchMappingDiskRecord)
+	if stored == nil {
+		stored = make(map[string]roomLaunchMappingDiskRecord)
 	}
+	return &roomLaunchMappingSnapshot{byKey: stored}, nil
+}
+
+// load is the constructor-time helper — called pre-publish, no lock needed.
+func (r *roomLaunchMappingRegistry) load() error {
+	snap, err := parseRoomLaunchMappingRegistry(r.diskPath)
+	if err != nil {
+		return err
+	}
+	if snap != nil {
+		r.byKey = snap.byKey
+	}
+	return nil
+}
+
+// Stage parses the on-disk file into a snapshot ready for atomic Commit.
+// nil snapshot + nil error = file absent, preserve live state.
+func (r *roomLaunchMappingRegistry) Stage() (*roomLaunchMappingSnapshot, error) {
+	return parseRoomLaunchMappingRegistry(r.diskPath)
+}
+
+// Commit atomically swaps the in-memory snapshot under the write lock.
+func (r *roomLaunchMappingRegistry) Commit(snap *roomLaunchMappingSnapshot) {
+	if snap == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.byKey = snap.byKey
+}
+
+// Reload combines Stage and Commit; per-registry test convenience.
+func (r *roomLaunchMappingRegistry) Reload() error {
+	snap, err := r.Stage()
+	if err != nil {
+		return err
+	}
+	r.Commit(snap)
 	return nil
 }
 
