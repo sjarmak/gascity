@@ -65,6 +65,36 @@ func appsRegistryKey(workspaceID, appID string) string {
 	return workspaceID + ":" + appID
 }
 
+// openRegistryFile opens path for reading, but rejects it first if the
+// path itself is a symlink. gc-cby.38 defense-in-depth: the four
+// registry SIGHUP-reload paths (apps.json, channel_mappings.json,
+// rig_mappings.json, room_launch_mappings.json) live under the city's
+// .gc/slack/ directory which on a properly-configured 0o700 city is
+// adapter-UID-only. Bare os.Open follows symlinks unconditionally, so
+// an attacker with same-UID write access could swap any of these files
+// for a symlink redirecting reads to any file the adapter can read.
+// We Lstat first and reject ModeSymlink before opening.
+//
+// On a missing file the returned error wraps syscall.ENOENT so callers
+// can keep using errors.Is(err, os.ErrNotExist) as the SIGHUP "no
+// change" sentinel — same contract as bare os.Open.
+//
+// TOCTOU window: between Lstat and Open an attacker could swap the
+// path. Under the trust model (same-UID writer to .gc/slack/ only) the
+// remaining race is acceptable; closing it would require openat with
+// O_NOFOLLOW (Go 1.25+ os.Root or golang.org/x/sys/unix), tracked
+// separately if escalation is warranted.
+func openRegistryFile(path string) (*os.File, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("registry file %s is a symlink; refusing to open", path)
+	}
+	return os.Open(path)
+}
+
 // newAppsRegistry opens the registry at diskPath. A missing file yields
 // an empty registry (tolerant load) so adapter restarts on a fresh
 // city — where no apps have been imported yet — succeed instead of
@@ -108,7 +138,7 @@ func parseAppsRegistry(diskPath string) (*appsSnapshot, error) {
 	if diskPath == "" {
 		return nil, nil
 	}
-	f, err := os.Open(diskPath)
+	f, err := openRegistryFile(diskPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}

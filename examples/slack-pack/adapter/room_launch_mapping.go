@@ -126,7 +126,7 @@ func parseRoomLaunchMappingRegistry(diskPath string) (*roomLaunchMappingSnapshot
 	if diskPath == "" {
 		return nil, nil
 	}
-	f, err := os.Open(diskPath)
+	f, err := openRegistryFile(diskPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
