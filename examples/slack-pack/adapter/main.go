@@ -772,6 +772,24 @@ func main() {
 	// no race with other writers in this process. gc-ywe.6.
 	tightenStorePermissions(cfg)
 
+	// Best-effort sweep of orphaned atomic-write .tmp files left over
+	// from a previous crashed run. Runs before any registry constructor
+	// so a follow-up first save cannot collide with a stale tmp name.
+	// Errors are logged inside the helper; only directory-listing
+	// failures bubble up here (treated as non-fatal — the registry will
+	// still load from <diskPath>).
+	for _, p := range []string{
+		cfg.identityStorePath,
+		cfg.handleAliasStorePath,
+		cfg.channelMappingPath,
+		cfg.rigMappingPath,
+		cfg.appsRegistryPath,
+	} {
+		if err := sweepOrphanTmpFiles(p); err != nil {
+			log.Printf("orphan-tmp sweep: %v", err)
+		}
+	}
+
 	identityReg, err := newIdentityRegistry(cfg.identityStorePath)
 	if err != nil {
 		log.Fatalf("identity registry: %v", err)
