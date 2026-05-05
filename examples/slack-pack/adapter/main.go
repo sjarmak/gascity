@@ -2733,6 +2733,11 @@ func handleHandleAliasDelete(reg *handleAliasRegistry) http.HandlerFunc {
 // On error we log and continue — best-effort delivery; the originating
 // channel's transcript still records the inbound regardless.
 func dispatchToAliasedSession(cfg config, sessionID string, msg externalInboundMessage, handle string) {
+	// Every interpolated string is run through neutralizeMarkupBoundaries
+	// to prevent a Slack workspace member from forging </system-reminder>
+	// boundaries inside the dispatched body and injecting arbitrary
+	// system instructions into the receiving aliased session (cby.33,
+	// extends cby.17 sanitization to the alias dispatch path).
 	body := fmt.Sprintf(
 		"<system-reminder>\n"+
 			"Slack address-by-handle: @%s addressed you from channel %s (Slack ts %s) by user %s.\n"+
@@ -2748,13 +2753,13 @@ func dispatchToAliasedSession(cfg config, sessionID string, msg externalInboundM
 			"\n"+
 			"This bypasses your local channel binding (you have none for that channel) and posts directly through the slack adapter, with your registered identity applied.\n"+
 			"</system-reminder>",
-		handle,
-		msg.Conversation.ConversationID,
-		msg.ProviderMessageID,
-		msg.Actor.ID,
-		msg.Text,
-		msg.Conversation.ConversationID,
-		msg.ProviderMessageID,
+		neutralizeMarkupBoundaries(handle),
+		neutralizeMarkupBoundaries(msg.Conversation.ConversationID),
+		neutralizeMarkupBoundaries(msg.ProviderMessageID),
+		neutralizeMarkupBoundaries(msg.Actor.ID),
+		neutralizeMarkupBoundaries(msg.Text),
+		neutralizeMarkupBoundaries(msg.Conversation.ConversationID),
+		neutralizeMarkupBoundaries(msg.ProviderMessageID),
 	)
 	payload, _ := json.Marshal(gcSessionMessageRequest{Message: body})
 	// PathEscape cityName and sessionID so URL-significant characters
