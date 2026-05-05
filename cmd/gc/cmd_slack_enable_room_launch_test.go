@@ -1,0 +1,129 @@
+package main
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+	"time"
+)
+
+// execSlackEnableRoomLaunchCmd executes `gc slack enable-room-launch`
+// directly against a temp city, mirroring the test pattern used for
+// the sibling map-channel/map-rig verbs.
+func execSlackEnableRoomLaunchCmd(t *testing.T, cityRoot string, args ...string) (string, string, error) {
+	t.Helper()
+	t.Chdir(cityRoot)
+	var stdout, stderr bytes.Buffer
+	cmd := newSlackEnableRoomLaunchCmd(&stdout)
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs(args)
+	err := cmd.Execute()
+	return stdout.String(), stderr.String(), err
+}
+
+// TestSlackEnableRoomLaunchHappyPath — the common case writes a
+// (workspace, channel) → pool_template record, prints a confirmation,
+// and reminds the operator to restart the slack-pack adapter.
+func TestSlackEnableRoomLaunchHappyPath(t *testing.T) {
+	cityRoot := newTestCity(t)
+
+	stdout, stderr, err := execSlackEnableRoomLaunchCmd(t, cityRoot,
+		"C0123", "--workspace-id", "T123", "--launcher", "mission-control/launcher",
+	)
+	if err != nil {
+		t.Fatalf("enable-room-launch: %v\nstderr=%s", err, stderr)
+	}
+	if !strings.Contains(stdout, "C0123") || !strings.Contains(stdout, "mission-control/launcher") {
+		t.Errorf("stdout should mention channel and launcher pool: %q", stdout)
+	}
+	if !strings.Contains(stdout, "Restart slack-pack adapter") {
+		t.Errorf("stdout should remind operator to restart adapter: %q", stdout)
+	}
+
+	reg, err := newSlackRoomLaunchMappingRegistry(slackRoomLaunchMappingsPath(cityRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, ok := reg.Get("T123", "C0123")
+	if !ok {
+		t.Fatal("registry missing record after enable-room-launch")
+	}
+	if rec.PoolTemplate != "mission-control/launcher" {
+		t.Errorf("PoolTemplate = %q, want %q", rec.PoolTemplate, "mission-control/launcher")
+	}
+}
+
+// TestSlackEnableRoomLaunchPreservesCreatedAtOnReBind — re-binding the
+// same channel keeps the original CreatedAt and refreshes UpdatedAt.
+// Mirrors the cby.3/cby.4 idempotent-re-bind contract.
+func TestSlackEnableRoomLaunchPreservesCreatedAtOnReBind(t *testing.T) {
+	cityRoot := newTestCity(t)
+
+	if _, _, err := execSlackEnableRoomLaunchCmd(t, cityRoot,
+		"C1", "--workspace-id", "T1", "--launcher", "rigA/pool",
+	); err != nil {
+		t.Fatalf("first bind: %v", err)
+	}
+	reg1, _ := newSlackRoomLaunchMappingRegistry(slackRoomLaunchMappingsPath(cityRoot))
+	rec1, _ := reg1.Get("T1", "C1")
+	createdAt := rec1.CreatedAt
+
+	// Sleep a hair so UpdatedAt can advance on second write.
+	time.Sleep(2 * time.Millisecond)
+
+	if _, _, err := execSlackEnableRoomLaunchCmd(t, cityRoot,
+		"C1", "--workspace-id", "T1", "--launcher", "rigB/pool",
+	); err != nil {
+		t.Fatalf("re-bind: %v", err)
+	}
+	reg2, _ := newSlackRoomLaunchMappingRegistry(slackRoomLaunchMappingsPath(cityRoot))
+	rec2, ok := reg2.Get("T1", "C1")
+	if !ok {
+		t.Fatal("missing record after re-bind")
+	}
+	if !rec2.CreatedAt.Equal(createdAt) {
+		t.Errorf("CreatedAt drifted on re-bind: was %v, now %v", createdAt, rec2.CreatedAt)
+	}
+	if rec2.PoolTemplate != "rigB/pool" {
+		t.Errorf("PoolTemplate not replaced on re-bind: got %q", rec2.PoolTemplate)
+	}
+}
+
+// TestSlackEnableRoomLaunchMissingLauncher — the verb refuses an empty
+// --launcher because the slack-pack adapter has nothing to spawn.
+func TestSlackEnableRoomLaunchMissingLauncher(t *testing.T) {
+	cityRoot := newTestCity(t)
+	_, _, err := execSlackEnableRoomLaunchCmd(t, cityRoot,
+		"C1", "--workspace-id", "T1",
+	)
+	if err == nil {
+		t.Fatal("expected error when --launcher is missing")
+	}
+}
+
+// TestSlackEnableRoomLaunchMissingWorkspaceID — the verb refuses an
+// empty workspace id when SLACK_WORKSPACE_ID is not set.
+func TestSlackEnableRoomLaunchMissingWorkspaceID(t *testing.T) {
+	t.Setenv(slackWorkspaceIDEnv, "")
+	cityRoot := newTestCity(t)
+	_, _, err := execSlackEnableRoomLaunchCmd(t, cityRoot,
+		"C1", "--launcher", "rigA/pool",
+	)
+	if err == nil {
+		t.Fatal("expected error when --workspace-id is unset and SLACK_WORKSPACE_ID is empty")
+	}
+}
+
+// TestSlackEnableRoomLaunchEmptyChannel — the channel argument cannot
+// be empty (cobra's ExactArgs takes care of presence; this guards
+// whitespace-only input).
+func TestSlackEnableRoomLaunchEmptyChannel(t *testing.T) {
+	cityRoot := newTestCity(t)
+	_, _, err := execSlackEnableRoomLaunchCmd(t, cityRoot,
+		"   ", "--workspace-id", "T1", "--launcher", "rigA/pool",
+	)
+	if err == nil {
+		t.Fatal("expected error for blank/whitespace channel")
+	}
+}
