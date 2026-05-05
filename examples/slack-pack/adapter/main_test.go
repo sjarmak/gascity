@@ -168,6 +168,61 @@ func TestLoadConfigRejectsMissingCityName(t *testing.T) {
 	}
 }
 
+// TestLoadConfigRejectsUnsafeCityName verifies that loadConfigFromEnv
+// fails fast when GC_CITY_NAME contains URL-significant characters
+// (/, ?, #, %). cityName is interpolated into every /v0/city/{cityName}/...
+// URL the adapter constructs; an unescaped path separator or query/
+// fragment marker would silently route traffic to the wrong city or
+// inject query state. Per-call PathEscape (sec-S-06) defends downstream,
+// but the semantic fix is to reject these at startup so misconfiguration
+// surfaces immediately. gc-cby.29.
+func TestLoadConfigRejectsUnsafeCityName(t *testing.T) {
+	cases := []struct {
+		name     string
+		cityName string
+	}{
+		{"slash_path_traversal", "prod/../../other"},
+		{"plain_slash", "prod/staging"},
+		{"question_mark", "prod?admin=1"},
+		{"hash_fragment", "prod#frag"},
+		{"percent_encoded", "prod%2fother"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := baseSlackEnv()
+			env["GC_CITY_NAME"] = tc.cityName
+
+			_, err := loadConfigFromEnv(stubEnv(env))
+			if err == nil {
+				t.Fatalf("loadConfigFromEnv: want error for cityName %q, got nil", tc.cityName)
+			}
+			if !strings.Contains(err.Error(), "GC_CITY_NAME") {
+				t.Errorf("error %q must mention GC_CITY_NAME", err.Error())
+			}
+		})
+	}
+}
+
+// TestLoadConfigAcceptsSafeCityName is the positive-side companion to
+// TestLoadConfigRejectsUnsafeCityName: names containing only ordinary
+// URL-path-safe characters must continue to load successfully.
+func TestLoadConfigAcceptsSafeCityName(t *testing.T) {
+	for _, name := range []string{"test-city", "prod_city", "city.1", "abc"} {
+		t.Run(name, func(t *testing.T) {
+			env := baseSlackEnv()
+			env["GC_CITY_NAME"] = name
+
+			cfg, err := loadConfigFromEnv(stubEnv(env))
+			if err != nil {
+				t.Fatalf("loadConfigFromEnv(%q): %v", name, err)
+			}
+			if cfg.cityName != name {
+				t.Errorf("cityName = %q, want %q", cfg.cityName, name)
+			}
+		})
+	}
+}
+
 func TestHandleReact(t *testing.T) {
 	cases := []struct {
 		name          string

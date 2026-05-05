@@ -511,6 +511,16 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 	if len(missing) > 0 {
 		return cfg, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
 	}
+	// cityName is interpolated into every /v0/city/{cityName}/... URL the
+	// adapter constructs. URL-significant characters (/, ?, #, %) here
+	// would either change the URL's path structure or be ambiguously
+	// interpreted by intermediate proxies — silently routing traffic to
+	// the wrong city. Per-call PathEscape (sec-S-06) defends downstream,
+	// but a legitimate city name should never contain these characters,
+	// so reject them at startup. gc-cby.29.
+	if strings.ContainsAny(cfg.cityName, "/?#%") {
+		return cfg, fmt.Errorf("GC_CITY_NAME must not contain '/', '?', '#', or '%%': %q", cfg.cityName)
+	}
 	return cfg, nil
 }
 
