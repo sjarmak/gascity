@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -34,6 +35,59 @@ var peerFanoutRetryGate = struct {
 	sync.Mutex
 	last map[string]time.Time
 }{last: make(map[string]time.Time)}
+
+// validatePeerFanoutRetryAgainstFailedEvent looks up the event with
+// Seq == originalSeq and confirms it is a peer_fanout_failed event
+// whose payload matches the (provider, conversationID, targetSession)
+// supplied by the caller. Returns an error suitable for
+// huma.Error400BadRequest on any mismatch.
+//
+// Returns nil when the EventProvider is absent — the validation is
+// best-effort defense-in-depth, not a substitute for the auth
+// middleware. A test harness without an event provider will still
+// work; production deployments always have one.
+func validatePeerFanoutRetryAgainstFailedEvent(
+	ep events.Provider,
+	originalSeq uint64,
+	provider, conversationID, targetSession string,
+) error {
+	if ep == nil {
+		return nil
+	}
+	// AfterSeq: originalSeq-1 narrows to events with Seq >= originalSeq.
+	// Filter by Type so we don't scan the full log.
+	evs, err := ep.List(events.Filter{
+		Type:     events.ExtMsgPeerFanoutFailed,
+		AfterSeq: originalSeq - 1,
+	})
+	if err != nil {
+		return fmt.Errorf("event lookup: %w", err)
+	}
+	var match *events.Event
+	for i := range evs {
+		if evs[i].Seq == originalSeq {
+			match = &evs[i]
+			break
+		}
+	}
+	if match == nil {
+		return fmt.Errorf("original_seq %d does not reference a known peer_fanout_failed event", originalSeq)
+	}
+	var payload extmsg.PeerFanoutFailedEventPayload
+	if err := json.Unmarshal(match.Payload, &payload); err != nil {
+		return fmt.Errorf("decode failed-event payload: %w", err)
+	}
+	if payload.Provider != provider {
+		return fmt.Errorf("provider mismatch: failed event has %q, request has %q", payload.Provider, provider)
+	}
+	if payload.ConversationID != conversationID {
+		return fmt.Errorf("conversation_id mismatch: failed event has %q, request has %q", payload.ConversationID, conversationID)
+	}
+	if payload.TargetSession != targetSession {
+		return fmt.Errorf("target_session mismatch: failed event has %q, request has %q", payload.TargetSession, targetSession)
+	}
+	return nil
+}
 
 // peerFanoutRetryAllow returns false if the (cityName, conversation,
 // target) tuple has been retried within peerFanoutRetryMinGap. On
@@ -78,6 +132,23 @@ func (s *Server) humaHandleExtMsgPeerFanoutRetry(
 	}
 	if input.Body.OriginalSeq == 0 {
 		return nil, huma.Error400BadRequest("original_seq is required")
+	}
+
+	// gc-cby.40: validate original_seq references a real
+	// peer_fanout_failed event whose payload matches the request's
+	// (provider, conversation_id, target_session). This prevents
+	// audit-log poisoning (forging "retried" events for arbitrary
+	// seqs) and bounds the rate-limit-amplification cardinality to
+	// the count of real failures, since an attacker can't fabricate
+	// new (conversation, target) tuples that pass validation.
+	if err := validatePeerFanoutRetryAgainstFailedEvent(
+		s.state.EventProvider(),
+		input.Body.OriginalSeq,
+		conv.Provider,
+		conv.ConversationID,
+		target,
+	); err != nil {
+		return nil, huma.Error400BadRequest(err.Error())
 	}
 
 	if !peerFanoutRetryAllow(time.Now, input.CityName, conv.ConversationID, target) {

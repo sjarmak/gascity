@@ -23,7 +23,7 @@ func peerFanoutTestState(t *testing.T) *fakeState {
 	return fs
 }
 
-func newPeerFanoutRetryBody(t *testing.T, sess string) ([]byte, extmsg.ConversationRef) {
+func newPeerFanoutRetryBody(t *testing.T, sess string, originalSeq uint64) ([]byte, extmsg.ConversationRef) {
 	t.Helper()
 	conv := extmsg.ConversationRef{
 		ScopeID:        "test-city",
@@ -33,7 +33,7 @@ func newPeerFanoutRetryBody(t *testing.T, sess string) ([]byte, extmsg.Conversat
 		Kind:           extmsg.ConversationRoom,
 	}
 	body, err := json.Marshal(map[string]any{
-		"original_seq":       uint64(101),
+		"original_seq":       originalSeq,
 		"target_session":     sess,
 		"actor_display_name": "alice",
 		"actor_kind":         "human",
@@ -50,6 +50,39 @@ func newPeerFanoutRetryBody(t *testing.T, sess string) ([]byte, extmsg.Conversat
 		t.Fatalf("Marshal: %v", err)
 	}
 	return body, conv
+}
+
+// seedFailedEvent records an extmsg.peer_fanout_failed event with the
+// supplied payload tuple so the retry handler's gc-cby.40 validation
+// can find it. Returns the assigned Seq.
+//
+// Note: Fake.Record auto-assigns Seq via f.seq++ regardless of the
+// input event's Seq, so we read LatestSeq after recording to obtain
+// the value the handler will see.
+//
+// The handler validates that original_seq references a real failed
+// event whose payload (provider, conversation_id, target_session)
+// matches the request — without seeding this, every test would 400.
+func seedFailedEvent(t *testing.T, prov events.Provider, conv extmsg.ConversationRef, target string) uint64 {
+	t.Helper()
+	payload := extmsg.PeerFanoutFailedEventPayload{
+		Provider:       conv.Provider,
+		ConversationID: conv.ConversationID,
+		TargetSession:  target,
+	}
+	pb, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal failed payload: %v", err)
+	}
+	prov.Record(events.Event{
+		Type:    events.ExtMsgPeerFanoutFailed,
+		Payload: pb,
+	})
+	seq, err := prov.LatestSeq()
+	if err != nil {
+		t.Fatalf("latest seq: %v", err)
+	}
+	return seq
 }
 
 // readRetriedEvent fetches the extmsg.peer_fanout_retried audit event
@@ -79,7 +112,13 @@ func TestPeerFanoutRetrySuccessEmitsAuditEvent(t *testing.T) {
 
 	target := createTestSession(t, fs.cityBeadStore, fs.sp, "Peer worker")
 
-	body, conv := newPeerFanoutRetryBody(t, target.ID)
+	conv := extmsg.ConversationRef{
+		ScopeID: "test-city", Provider: "slack",
+		AccountID: "T0TESTWS", ConversationID: "C0ROOM01",
+		Kind: extmsg.ConversationRoom,
+	}
+	seq := seedFailedEvent(t, fs.eventProv, conv, target.ID)
+	body, _ := newPeerFanoutRetryBody(t, target.ID, seq)
 	req := newPostRequest(cityURL(fs, "/extmsg/peer-fanout/retry"), strings.NewReader(string(body)))
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
@@ -95,16 +134,16 @@ func TestPeerFanoutRetrySuccessEmitsAuditEvent(t *testing.T) {
 	if !resp.Body.Success {
 		t.Fatalf("expected Success=true, got error=%q", resp.Body.Error)
 	}
-	if resp.Body.OriginalSeq != 101 {
-		t.Fatalf("OriginalSeq = %d, want 101", resp.Body.OriginalSeq)
+	if resp.Body.OriginalSeq != seq {
+		t.Fatalf("OriginalSeq = %d, want %d", resp.Body.OriginalSeq, seq)
 	}
 
 	got := readRetriedEvent(t, fs.eventProv)
 	if !got.Success {
 		t.Fatalf("retried event should be success=true, got %+v", got)
 	}
-	if got.OriginalSeq != 101 {
-		t.Fatalf("retried event OriginalSeq = %d, want 101", got.OriginalSeq)
+	if got.OriginalSeq != seq {
+		t.Fatalf("retried event OriginalSeq = %d, want %d", got.OriginalSeq, seq)
 	}
 	if got.Provider != conv.Provider {
 		t.Fatalf("retried event provider = %q, want %q", got.Provider, conv.Provider)
@@ -118,7 +157,13 @@ func TestPeerFanoutRetryUnknownSessionEmitsFailureEvent(t *testing.T) {
 	fs := peerFanoutTestState(t)
 	srv := New(fs)
 
-	body, _ := newPeerFanoutRetryBody(t, "no-such-session-xyz")
+	conv := extmsg.ConversationRef{
+		ScopeID: "test-city", Provider: "slack",
+		AccountID: "T0TESTWS", ConversationID: "C0ROOM01",
+		Kind: extmsg.ConversationRoom,
+	}
+	seq := seedFailedEvent(t, fs.eventProv, conv, "no-such-session-xyz")
+	body, _ := newPeerFanoutRetryBody(t, "no-such-session-xyz", seq)
 	req := newPostRequest(cityURL(fs, "/extmsg/peer-fanout/retry"), strings.NewReader(string(body)))
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
@@ -175,6 +220,81 @@ func TestPeerFanoutRetryRequiresOriginalSeq(t *testing.T) {
 
 	if rec.Code < 400 || rec.Code >= 500 {
 		t.Fatalf("status = %d, want a 4xx for missing original_seq; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPeerFanoutRetryRejectsForgedSeq — gc-cby.40: original_seq that
+// does not reference a real peer_fanout_failed event must be rejected
+// with 400, preventing audit-log poisoning and bounded amplification.
+func TestPeerFanoutRetryRejectsForgedSeq(t *testing.T) {
+	fs := peerFanoutTestState(t)
+	srv := New(fs)
+
+	target := createTestSession(t, fs.cityBeadStore, fs.sp, "Peer worker")
+	body, _ := newPeerFanoutRetryBody(t, target.ID, 101)
+	// Do NOT seed a failed event — the seq=101 in the body is forged.
+	req := newPostRequest(cityURL(fs, "/extmsg/peer-fanout/retry"), strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "does not reference") {
+		t.Errorf("expected error to mention missing failed event; got %s", rec.Body.String())
+	}
+}
+
+// TestPeerFanoutRetryRejectsTargetSessionMismatch — gc-cby.40: even
+// when seq references a real failed event, the request's
+// target_session must match the failed event's payload. Otherwise an
+// attacker could redirect the retry to a different session.
+func TestPeerFanoutRetryRejectsTargetSessionMismatch(t *testing.T) {
+	fs := peerFanoutTestState(t)
+	srv := New(fs)
+
+	target := createTestSession(t, fs.cityBeadStore, fs.sp, "Peer worker")
+	conv := extmsg.ConversationRef{
+		ScopeID: "test-city", Provider: "slack",
+		AccountID: "T0TESTWS", ConversationID: "C0ROOM01",
+		Kind: extmsg.ConversationRoom,
+	}
+	// Seed the failed event with a DIFFERENT target_session than the request.
+	seq := seedFailedEvent(t, fs.eventProv, conv, "different-target-session")
+	body, _ := newPeerFanoutRetryBody(t, target.ID, seq)
+	req := newPostRequest(cityURL(fs, "/extmsg/peer-fanout/retry"), strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "target_session mismatch") {
+		t.Errorf("expected target_session-mismatch error; got %s", rec.Body.String())
+	}
+}
+
+// TestPeerFanoutRetryRejectsConversationIDMismatch — gc-cby.40:
+// conversation_id must also match.
+func TestPeerFanoutRetryRejectsConversationIDMismatch(t *testing.T) {
+	fs := peerFanoutTestState(t)
+	srv := New(fs)
+
+	target := createTestSession(t, fs.cityBeadStore, fs.sp, "Peer worker")
+	// Seed with a DIFFERENT conversation_id than the request.
+	seq := seedFailedEvent(t, fs.eventProv,
+		extmsg.ConversationRef{Provider: "slack", ConversationID: "C-OTHER"},
+		target.ID)
+	body, _ := newPeerFanoutRetryBody(t, target.ID, seq)
+	req := newPostRequest(cityURL(fs, "/extmsg/peer-fanout/retry"), strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "conversation_id mismatch") {
+		t.Errorf("expected conversation_id-mismatch error; got %s", rec.Body.String())
 	}
 }
 

@@ -137,6 +137,59 @@ func decodeRigDispatchMetadata(raw string) (slackRigDispatchMetadata, bool) {
 	return meta, true
 }
 
+// slackPlainText is Slack's plain_text composition object. Used for
+// titles, button labels, input labels, and placeholders.
+type slackPlainText struct {
+	Type string `json:"type"` // always "plain_text"
+	Text string `json:"text"`
+}
+
+// slackModalInput is the Slack `plain_text_input` element. MaxLength
+// is omitted from the wire when zero (Slack accepts no cap as the
+// absence of the field).
+type slackModalInput struct {
+	Type        string         `json:"type"` // always "plain_text_input"
+	ActionID    string         `json:"action_id"`
+	MaxLength   int            `json:"max_length,omitempty"`
+	Multiline   bool           `json:"multiline,omitempty"`
+	Placeholder slackPlainText `json:"placeholder"`
+}
+
+// slackModalBlock is a Slack `input` block holding a label and a single
+// element. Optional flag omitted when false (Slack default is required).
+type slackModalBlock struct {
+	Type     string          `json:"type"` // always "input"
+	BlockID  string          `json:"block_id"`
+	Optional bool            `json:"optional,omitempty"`
+	Label    slackPlainText  `json:"label"`
+	Element  slackModalInput `json:"element"`
+}
+
+// slackModalView is the typed shape of the Slack `views.open` view
+// payload for the rig-fix modal. Replaces the prior `map[string]any`
+// per AGENTS.md typed-wire principle.
+type slackModalView struct {
+	Type            string            `json:"type"` // always "modal"
+	CallbackID      string            `json:"callback_id"`
+	PrivateMetadata string            `json:"private_metadata"`
+	Title           slackPlainText    `json:"title"`
+	Submit          slackPlainText    `json:"submit"`
+	Close           slackPlainText    `json:"close"`
+	Blocks          []slackModalBlock `json:"blocks"`
+}
+
+// truncateRunes caps s at maxRunes runes (not bytes). Used for Slack's
+// modal-title 24-character limit and similar UI caps where the
+// underlying contract is in characters, not bytes. Byte-slicing a
+// multibyte UTF-8 codepoint at the boundary produces invalid output.
+func truncateRunes(s string, maxRunes int) string {
+	rs := []rune(s)
+	if len(rs) > maxRunes {
+		return string(rs[:maxRunes])
+	}
+	return s
+}
+
 // buildRigFixModalView assembles the Slack views.open `view` payload.
 // The block layout is two plain_text_inputs:
 //
@@ -151,62 +204,39 @@ func decodeRigDispatchMetadata(raw string) (slackRigDispatchMetadata, bool) {
 // Returns a JSON-encoded view object; callers pass this verbatim to
 // the views.open API call.
 func buildRigFixModalView(meta slackRigDispatchMetadata, privateMetadata string) ([]byte, error) {
-	titleText := "gc rig: " + meta.RigName
-	if len(titleText) > 24 {
-		// Slack caps modal titles at 24 characters.
-		titleText = titleText[:24]
-	}
+	// Slack caps modal titles at 24 characters. Cap by runes so a
+	// multibyte rig name doesn't produce invalid UTF-8 at the boundary.
+	titleText := truncateRunes("gc rig: "+meta.RigName, 24)
 
-	view := map[string]any{
-		"type":             "modal",
-		"callback_id":      rigFixModalCallbackID,
-		"private_metadata": privateMetadata,
-		"title": map[string]any{
-			"type": "plain_text",
-			"text": titleText,
-		},
-		"submit": map[string]any{
-			"type": "plain_text",
-			"text": "Dispatch",
-		},
-		"close": map[string]any{
-			"type": "plain_text",
-			"text": "Cancel",
-		},
-		"blocks": []any{
-			map[string]any{
-				"type":     "input",
-				"block_id": rigFixModalSummaryBlockID,
-				"label": map[string]any{
-					"type": "plain_text",
-					"text": "Summary",
-				},
-				"element": map[string]any{
-					"type":       "plain_text_input",
-					"action_id":  rigFixModalSummaryActionID,
-					"max_length": rigFixModalSummaryMaxLen,
-					"placeholder": map[string]any{
-						"type": "plain_text",
-						"text": "One-line description of the work",
-					},
+	view := slackModalView{
+		Type:            "modal",
+		CallbackID:      rigFixModalCallbackID,
+		PrivateMetadata: privateMetadata,
+		Title:           slackPlainText{Type: "plain_text", Text: titleText},
+		Submit:          slackPlainText{Type: "plain_text", Text: "Dispatch"},
+		Close:           slackPlainText{Type: "plain_text", Text: "Cancel"},
+		Blocks: []slackModalBlock{
+			{
+				Type:    "input",
+				BlockID: rigFixModalSummaryBlockID,
+				Label:   slackPlainText{Type: "plain_text", Text: "Summary"},
+				Element: slackModalInput{
+					Type:        "plain_text_input",
+					ActionID:    rigFixModalSummaryActionID,
+					MaxLength:   rigFixModalSummaryMaxLen,
+					Placeholder: slackPlainText{Type: "plain_text", Text: "One-line description of the work"},
 				},
 			},
-			map[string]any{
-				"type":     "input",
-				"block_id": rigFixModalContextBlockID,
-				"optional": true,
-				"label": map[string]any{
-					"type": "plain_text",
-					"text": "Context (markdown)",
-				},
-				"element": map[string]any{
-					"type":      "plain_text_input",
-					"action_id": rigFixModalContextActionID,
-					"multiline": true,
-					"placeholder": map[string]any{
-						"type": "plain_text",
-						"text": "Optional: links, logs, repro steps",
-					},
+			{
+				Type:     "input",
+				BlockID:  rigFixModalContextBlockID,
+				Optional: true,
+				Label:    slackPlainText{Type: "plain_text", Text: "Context (markdown)"},
+				Element: slackModalInput{
+					Type:        "plain_text_input",
+					ActionID:    rigFixModalContextActionID,
+					Multiline:   true,
+					Placeholder: slackPlainText{Type: "plain_text", Text: "Optional: links, logs, repro steps"},
 				},
 			},
 		},

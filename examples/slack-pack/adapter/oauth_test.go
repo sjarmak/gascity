@@ -198,6 +198,7 @@ func TestHandleOAuthCallbackHappyPath(t *testing.T) {
 		t.Fatalf("newAppsRegistry: %v", err)
 	}
 
+	recordOAuthState(cfg.now, "expected-state")
 	req := httptest.NewRequest(http.MethodGet,
 		"/slack/oauth/callback?code=test-code&state=expected-state", nil)
 	req.AddCookie(&http.Cookie{Name: oauthStateCookie, Value: "expected-state"})
@@ -328,6 +329,7 @@ func TestHandleOAuthCallbackSlackError(t *testing.T) {
 		t.Fatalf("newAppsRegistry: %v", err)
 	}
 
+	recordOAuthState(cfg.now, "s")
 	req := httptest.NewRequest(http.MethodGet, "/slack/oauth/callback?code=bad&state=s", nil)
 	req.AddCookie(&http.Cookie{Name: oauthStateCookie, Value: "s"})
 	rec := httptest.NewRecorder()
@@ -371,6 +373,7 @@ func TestHandleOAuthCallbackIncompleteSlackResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newAppsRegistry: %v", err)
 	}
+	recordOAuthState(cfg.now, "s")
 	req := httptest.NewRequest(http.MethodGet, "/slack/oauth/callback?code=c&state=s", nil)
 	req.AddCookie(&http.Cookie{Name: oauthStateCookie, Value: "s"})
 	rec := httptest.NewRecorder()
@@ -390,6 +393,7 @@ func TestHandleOAuthCallbackHTTPError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newAppsRegistry: %v", err)
 	}
+	recordOAuthState(cfg.now, "s")
 	req := httptest.NewRequest(http.MethodGet, "/slack/oauth/callback?code=c&state=s", nil)
 	req.AddCookie(&http.Cookie{Name: oauthStateCookie, Value: "s"})
 	rec := httptest.NewRecorder()
@@ -517,11 +521,80 @@ func TestHandleOAuthCallbackSuccessIsPlainText(t *testing.T) {
 		t.Fatalf("newAppsRegistry: %v", err)
 	}
 
+	recordOAuthState(cfg.now, "s")
 	req := httptest.NewRequest(http.MethodGet, "/slack/oauth/callback?code=c&state=s", nil)
 	req.AddCookie(&http.Cookie{Name: oauthStateCookie, Value: "s"})
 	rec := httptest.NewRecorder()
 	handleOAuthCallback(cfg, reg)(rec, req)
 	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
 		t.Errorf("Content-Type = %q, want text/plain prefix", got)
+	}
+	body := rec.Body.String()
+	// gc-cby.42: success page must NOT echo the filesystem path. Adapter
+	// log line carries it for the operator with shell access. Mentioning
+	// the bare filename is fine; leaking the absolute path is not.
+	if strings.Contains(body, cityDir) {
+		t.Errorf("success page leaks filesystem path %q: %q", cityDir, body)
+	}
+	if strings.Contains(body, "/.gc/slack/") {
+		t.Errorf("success page leaks slack install path fragment: %q", body)
+	}
+}
+
+// TestRecordOAuthStateSingleUse — gc-cby.41: a state nonce can only
+// be consumed once. Replaying the same callback (same code+state) is
+// rejected at the server-side store check, even if the cookie still
+// holds the value.
+func TestRecordOAuthStateSingleUse(t *testing.T) {
+	cityDir := t.TempDir()
+	mock, mockSrv := newSlackOAuthMock(t)
+	mock.useStructuredJSON = true
+	mock.respBodyJSON = slackOAuthAccessResponse{
+		OK: true, AppID: "A1", AccessToken: "xoxb-1", BotUserID: "U1",
+	}
+	mock.respBodyJSON.Team.ID = "T1"
+	mock.respBodyJSON.Team.Name = "Acme"
+	cfg := newTestOAuthConfig(t, mockSrv.URL, cityDir)
+	reg, err := newAppsRegistry(filepath.Join(cityDir, "apps.json"))
+	if err != nil {
+		t.Fatalf("newAppsRegistry: %v", err)
+	}
+
+	recordOAuthState(cfg.now, "single-use-state")
+
+	// First request: should succeed.
+	req := httptest.NewRequest(http.MethodGet,
+		"/slack/oauth/callback?code=c1&state=single-use-state", nil)
+	req.AddCookie(&http.Cookie{Name: oauthStateCookie, Value: "single-use-state"})
+	rec := httptest.NewRecorder()
+	handleOAuthCallback(cfg, reg)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first call: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Replay (same state, fresh request): nonce was consumed, must reject.
+	req2 := httptest.NewRequest(http.MethodGet,
+		"/slack/oauth/callback?code=c2&state=single-use-state", nil)
+	req2.AddCookie(&http.Cookie{Name: oauthStateCookie, Value: "single-use-state"})
+	rec2 := httptest.NewRecorder()
+	handleOAuthCallback(cfg, reg)(rec2, req2)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("replay: status=%d, want 400; body=%s", rec2.Code, rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), "consumed") {
+		t.Errorf("replay error should mention nonce consumption: %q", rec2.Body.String())
+	}
+}
+
+// TestConsumeOAuthStateExpired — a nonce older than oauthStateTTL
+// is rejected even though it's present in the store.
+func TestConsumeOAuthStateExpired(t *testing.T) {
+	now := time.Now()
+	frozen := func() time.Time { return now }
+	recordOAuthState(frozen, "old-nonce")
+	// Move the clock past TTL.
+	advanced := now.Add(oauthStateTTL + time.Second)
+	if consumeOAuthState(func() time.Time { return advanced }, "old-nonce") {
+		t.Errorf("expired nonce was accepted; want rejected")
 	}
 }

@@ -42,6 +42,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -54,6 +55,56 @@ const oauthStateCookie = "gc_slack_oauth_state"
 // The OAuth grant should complete in seconds; 10 minutes is generous
 // padding for slow operator clicks and absent-minded approvals.
 const oauthStateTTL = 10 * time.Minute
+
+// oauthStateStore is the in-process server-side nonce store that
+// enforces single-use semantics on the CSRF state value. The cookie
+// alone is not sufficient: an attacker who captures the cookie+code
+// before clearing could replay /callback. Slack invalidates OAuth
+// codes on first use so the practical exploit is bounded, but
+// defense-in-depth requires server-side single-use.
+//
+// On /start: nonce is recorded with creation time.
+// On /callback: nonce is consumed (deleted) atomically; absence
+// rejects the request.
+//
+// In-process: slack-pack runs a single adapter, so this is sufficient.
+// A multi-process deployment would need a shared store.
+var oauthStateStore = struct {
+	sync.Mutex
+	nonces map[string]time.Time
+}{nonces: make(map[string]time.Time)}
+
+// recordOAuthState stores nonce with timestamp; cleans expired entries
+// while we hold the lock so the map doesn't grow unbounded across
+// long-running adapters with many install attempts.
+func recordOAuthState(now func() time.Time, nonce string) {
+	t := now()
+	oauthStateStore.Lock()
+	defer oauthStateStore.Unlock()
+	for n, ts := range oauthStateStore.nonces {
+		if t.Sub(ts) > oauthStateTTL {
+			delete(oauthStateStore.nonces, n)
+		}
+	}
+	oauthStateStore.nonces[nonce] = t
+}
+
+// consumeOAuthState atomically tests-and-deletes nonce. Returns true
+// only if the nonce was present and within TTL.
+func consumeOAuthState(now func() time.Time, nonce string) bool {
+	if nonce == "" {
+		return false
+	}
+	t := now()
+	oauthStateStore.Lock()
+	defer oauthStateStore.Unlock()
+	ts, ok := oauthStateStore.nonces[nonce]
+	if !ok {
+		return false
+	}
+	delete(oauthStateStore.nonces, nonce)
+	return t.Sub(ts) <= oauthStateTTL
+}
 
 // defaultSlackOAuthBase is overridden in tests via cfg.slackOAuthBase
 // to point at an httptest.Server.
@@ -201,6 +252,10 @@ func handleOAuthStart(cfg oauthConfig) http.HandlerFunc {
 			http.Error(w, fmt.Sprintf("generate state: %v", err), http.StatusInternalServerError)
 			return
 		}
+		// Record the nonce server-side so /callback can enforce single-use
+		// (cookie clear alone is not enough — defense-in-depth against
+		// callback replay).
+		recordOAuthState(cfg.now, state)
 		http.SetCookie(w, &http.Cookie{
 			Name:     oauthStateCookie,
 			Value:    state,
@@ -249,6 +304,12 @@ func handleOAuthCallback(cfg oauthConfig, reg *appsRegistry) http.HandlerFunc {
 			http.Error(w, "state mismatch (CSRF check failed)", http.StatusBadRequest)
 			return
 		}
+		// Atomically consume the server-side nonce. Rejects callback
+		// replay regardless of cookie or code state.
+		if !consumeOAuthState(cfg.now, state) {
+			http.Error(w, "state nonce already consumed or expired (CSRF check failed)", http.StatusBadRequest)
+			return
+		}
 
 		resp, err := exchangeSlackOAuthCode(r.Context(), cfg, code)
 		if err != nil {
@@ -294,6 +355,25 @@ func handleOAuthCallback(cfg oauthConfig, reg *appsRegistry) http.HandlerFunc {
 			return
 		}
 
+		// Log the path operator-side; the browser must NOT see it. The
+		// success page goes to the public Tailscale Funnel — anyone who
+		// reaches that URL after install would otherwise harvest the
+		// filesystem path of the bot token's container.
+		log.Printf("oauth install: workspace=%q (%s) app=%s wrote %s",
+			resp.Team.Name, resp.Team.ID, resp.AppID, envPath)
+
+		// Defense-in-depth: warn the operator if SLACK_SIGNING_SECRET is
+		// unset at install time. The new app record is stamped with
+		// cfg.signingSecret (Slack does NOT return signing_secret in
+		// oauth.v2.access); a missing or stale env value means
+		// subsequent traffic from this workspace will fail signature
+		// verification until the operator runs `gc slack import-app
+		// --signing-secret <secret>`.
+		if cfg.signingSecret == "" {
+			log.Printf("WARNING: oauth install: SLACK_SIGNING_SECRET unset — workspace=%q (%s) will fail signature verification until you run `gc slack import-app --signing-secret <secret>` for this app",
+				resp.Team.Name, resp.Team.ID)
+		}
+
 		// Clear the state cookie now that exchange succeeded.
 		http.SetCookie(w, &http.Cookie{
 			Name:     oauthStateCookie,
@@ -306,14 +386,18 @@ func handleOAuthCallback(cfg oauthConfig, reg *appsRegistry) http.HandlerFunc {
 			SameSite: http.SameSiteLaxMode,
 		})
 
+		// Render a minimal success page. The filesystem path of
+		// install.env is intentionally NOT echoed — it would appear in
+		// browser history and access logs on the public Tailscale Funnel
+		// listener, leaking host-side filesystem layout. The operator
+		// finds the path in the adapter log.
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintf(w,
 			"slack-pack installed for workspace %s (%s), app %s.\n\n"+
-				"Bot token written to: %s\n\n"+
-				"Restart the adapter with that env file sourced, e.g.:\n"+
-				"  set -a; source %s; set +a\n"+
-				"  ./gc-slack-adapter\n",
-			resp.Team.Name, resp.Team.ID, resp.AppID, envPath, envPath)
+				"Bot token has been written to your gc city's slack install.env.\n"+
+				"Check your adapter log for the absolute path, then restart the\n"+
+				"adapter with that env file sourced.\n",
+			resp.Team.Name, resp.Team.ID, resp.AppID)
 	}
 }
 
