@@ -510,10 +510,26 @@ func postSessionMessage(cfg config, sessionID, body, requestTag string) error {
 // matcher cannot match the resulting "<​…>" sequence.
 //
 // Applied to every interpolated user-controlled field before it
-// enters a system-reminder template. Idempotent on input with no
-// '<' character (the common case for Slack-generated IDs).
+// enters a system-reminder template. Fully idempotent: f(f(x)) == f(x)
+// for all inputs. A '<' that is already followed by U+200B (because a
+// prior pass neutralized it, or the byte sequence happens to appear in
+// raw input) is not double-padded. This protects against latent bugs
+// where a future refactor double-applies the function on the same
+// value.
 func neutralizeMarkupBoundaries(s string) string {
-	return strings.ReplaceAll(s, "<", "<​")
+	if !strings.Contains(s, "<") {
+		return s
+	}
+	const zwsp = "​"
+	var b strings.Builder
+	b.Grow(len(s) + len(zwsp))
+	for i := 0; i < len(s); i++ {
+		b.WriteByte(s[i])
+		if s[i] == '<' && !strings.HasPrefix(s[i+1:], zwsp) {
+			b.WriteString(zwsp)
+		}
+	}
+	return b.String()
 }
 
 // handleInteractionPayload decodes and routes block_actions /
