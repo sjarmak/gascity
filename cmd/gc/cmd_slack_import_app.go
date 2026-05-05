@@ -191,7 +191,8 @@ func runSlackImportApp(stdout io.Writer, manifestPath, workspaceID, appID string
 		return fmt.Errorf("persist slack app record: %w", err)
 	}
 
+	v := rec.safeLogFields()
 	fmt.Fprintf(stdout, "Imported Slack app %s/%s (display_name=%q, scopes=%d, slash_commands=%d)\n", //nolint:errcheck
-		workspaceID, appID, rec.DisplayName, len(rec.Scopes), len(rec.SlashCommands))
+		v.WorkspaceID, v.AppID, v.DisplayName, v.ScopeCount, v.SlashCommandCount)
 	return nil
 }

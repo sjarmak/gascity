@@ -277,3 +277,173 @@ func TestSlackAppRegistryManifestRawRoundTrip(t *testing.T) {
 		t.Errorf("manifest_raw round-trip mismatch:\noriginal=%s\nreloaded=%s", original, got.ManifestRaw)
 	}
 }
+
+// TestSanitizeForLog verifies the operator-supplied-string sanitizer used
+// at every CLI/log boundary touching slackAppRecord fields (gc-cby.13).
+// It must strip bytes that corrupt terminals or downstream log
+// aggregation while preserving legitimate Unicode and standard
+// whitespace.
+func TestSanitizeForLog(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain ascii", "hello world", "hello world"},
+		{"tab preserved", "col1\tcol2", "col1\tcol2"},
+		{"newline stripped", "line1\nline2", "line1line2"},
+		{"carriage return stripped", "first\rsecond", "firstsecond"},
+		{"crlf stripped", "a\r\nb", "ab"},
+		{"japanese unicode preserved", "日本語アプリ", "日本語アプリ"},
+		{"emoji preserved", "rocket \U0001f680", "rocket \U0001f680"},
+		{"ansi color CSI stripped", "alert \x1b[31mRED\x1b[0m end", "alert RED end"},
+		{"ansi cursor CSI stripped", "x\x1b[2Jy", "xy"},
+		{"ansi CSI with ECMA-48 final ~", "fn\x1b[1~key", "fnkey"},
+		{"OSC ESC stripped (payload survives, terminal-control defanged)", "\x1b]0;title\x07name", "]0;titlename"},
+		{"bare escape stripped", "a\x1bb", "ab"},
+		{"NUL stripped", "ab\x00cd", "abcd"},
+		{"BEL stripped", "ring\x07ring", "ringring"},
+		{"backspace stripped", "ab\x08cd", "abcd"},
+		{"DEL stripped", "ab\x7fcd", "abcd"},
+		{"invalid utf8 stripped", "valid \xff\xfe end", "valid  end"},
+		{"forged log line via newline neutralized", "name\nINFO: signing_secret=sk-evil", "nameINFO: signing_secret=sk-evil"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeForLog(tc.in)
+			if got != tc.want {
+				t.Errorf("sanitizeForLog(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSlackAppRecordSafeLogFieldsExcludesSecrets is the structural
+// tripwire enforcing the gc-cby.13 deny-list. slackAppLogView must
+// expose ONLY the allowlisted fields; adding a sensitive field to
+// slackAppRecord later must not silently surface it to logs. The test
+// uses reflection on the view's struct fields so it survives JSON-tag
+// refactors and only fails on actual struct-shape changes.
+func TestSlackAppRecordSafeLogFieldsExcludesSecrets(t *testing.T) {
+	allowed := map[string]bool{
+		"WorkspaceID":       true,
+		"AppID":             true,
+		"DisplayName":       true,
+		"ScopeCount":        true,
+		"SlashCommandCount": true,
+		"ImportedAt":        true,
+	}
+	view := slackAppRecord{}.safeLogFields()
+	rt := reflect.TypeOf(view)
+	if rt.Kind() != reflect.Struct {
+		t.Fatalf("safeLogFields() must return a struct, got %v", rt.Kind())
+	}
+	for i := 0; i < rt.NumField(); i++ {
+		name := rt.Field(i).Name
+		if !allowed[name] {
+			t.Errorf("slackAppLogView contains disallowed field %q — gc-cby.13 deny-list breach", name)
+		}
+		delete(allowed, name)
+	}
+	for name := range allowed {
+		t.Errorf("slackAppLogView missing required field %q", name)
+	}
+
+	// Belt-and-suspenders: assert known-sensitive field names are absent.
+	for _, deny := range []string{"SigningSecret", "ManifestRaw", "ManifestPath", "BotUserID"} {
+		if _, ok := rt.FieldByName(deny); ok {
+			t.Errorf("slackAppLogView leaks sensitive field %q", deny)
+		}
+	}
+}
+
+// TestSlackAppRecordSafeJSONFieldsExcludesSecrets is the parallel
+// deny-list tripwire for the --json projection (gc-cby.13). Adding a
+// new sensitive field to slackAppRecord must NOT silently appear in
+// the JSON view; this test forces a structural review.
+func TestSlackAppRecordSafeJSONFieldsExcludesSecrets(t *testing.T) {
+	allowed := map[string]bool{
+		"WorkspaceID":   true,
+		"AppID":         true,
+		"DisplayName":   true,
+		"Scopes":        true,
+		"SlashCommands": true,
+		"ImportedAt":    true,
+	}
+	view := slackAppRecord{}.safeJSONFields()
+	rt := reflect.TypeOf(view)
+	if rt.Kind() != reflect.Struct {
+		t.Fatalf("safeJSONFields() must return a struct, got %v", rt.Kind())
+	}
+	for i := 0; i < rt.NumField(); i++ {
+		name := rt.Field(i).Name
+		if !allowed[name] {
+			t.Errorf("slackAppJSONView contains disallowed field %q — gc-cby.13 deny-list breach", name)
+		}
+		delete(allowed, name)
+	}
+	for name := range allowed {
+		t.Errorf("slackAppJSONView missing required field %q", name)
+	}
+	for _, deny := range []string{"SigningSecret", "ManifestRaw", "ManifestPath", "BotUserID"} {
+		if _, ok := rt.FieldByName(deny); ok {
+			t.Errorf("slackAppJSONView leaks sensitive field %q", deny)
+		}
+	}
+}
+
+// TestSlackAppRecordSafeJSONFieldsExcludesSigningSecretAtRuntime is the
+// runtime check: even with a fully populated post-OAuth record, the
+// JSON-marshaled output must not contain "signing_secret".
+func TestSlackAppRecordSafeJSONFieldsExcludesSigningSecretAtRuntime(t *testing.T) {
+	rec := slackAppRecord{
+		WorkspaceID:   "T1",
+		AppID:         "A1",
+		BotUserID:     "U1",
+		DisplayName:   "alpha",
+		Scopes:        []string{"chat:write"},
+		SigningSecret: "sk-VERY-SECRET",
+		ManifestPath:  "/tmp/manifest.json",
+		ManifestRaw:   json.RawMessage(`{"hidden":"data"}`),
+	}
+	out, err := json.Marshal(rec.safeJSONFields())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(out), "signing_secret") {
+		t.Errorf("safeJSONFields() emits signing_secret: %s", out)
+	}
+	if strings.Contains(string(out), "sk-VERY-SECRET") {
+		t.Errorf("safeJSONFields() leaks signing-secret value: %s", out)
+	}
+	if strings.Contains(string(out), "manifest_raw") || strings.Contains(string(out), "manifest_path") {
+		t.Errorf("safeJSONFields() leaks manifest fields: %s", out)
+	}
+	if strings.Contains(string(out), "bot_user_id") {
+		t.Errorf("safeJSONFields() leaks bot_user_id: %s", out)
+	}
+}
+
+// TestSlackAppRecordSafeLogFieldsSanitizesDisplayName confirms hostile
+// display-name content is neutralized before reaching any printer.
+func TestSlackAppRecordSafeLogFieldsSanitizesDisplayName(t *testing.T) {
+	rec := slackAppRecord{
+		WorkspaceID: "T1",
+		AppID:       "A1",
+		DisplayName: "evil\x1b[31m\x00name",
+		Scopes:      []string{"chat:write", "files:write"},
+	}
+	view := rec.safeLogFields()
+	if strings.ContainsRune(view.DisplayName, 0x1b) {
+		t.Errorf("safeLogFields().DisplayName still contains ESC: %q", view.DisplayName)
+	}
+	if strings.ContainsRune(view.DisplayName, 0x00) {
+		t.Errorf("safeLogFields().DisplayName still contains NUL: %q", view.DisplayName)
+	}
+	if view.ScopeCount != 2 {
+		t.Errorf("ScopeCount = %d, want 2", view.ScopeCount)
+	}
+	if view.SlashCommandCount != 0 {
+		t.Errorf("SlashCommandCount = %d, want 0", view.SlashCommandCount)
+	}
+}

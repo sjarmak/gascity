@@ -50,8 +50,13 @@ func (s *slackStatusRigMapping) UnmarshalJSON(data []byte) error {
 // slackStatusJSON is the wire shape emitted by `gc slack status --json`.
 // All arrays are non-nil even on empty stores so consumers can rely
 // on the keys being present.
+//
+// Apps is typed as []slackAppJSONView (gc-cby.13) so the post-OAuth
+// signing_secret and the ManifestRaw blob never reach operator-facing
+// CLI output. The on-disk apps.json persistence path uses the full
+// slackAppRecord type — that contract is unchanged.
 type slackStatusJSON struct {
-	Apps        []slackAppRecord            `json:"apps"`
+	Apps        []slackAppJSONView          `json:"apps"`
 	Mappings    []slackChannelMappingRecord `json:"channel_mappings"`
 	RigMappings []slackStatusRigMapping     `json:"rig_mappings"`
 }
@@ -153,7 +158,11 @@ func runSlackStatus(stdout io.Writer, channelFilter, workspaceFilter string, jso
 	}
 
 	if jsonOutput {
-		out := slackStatusJSON{Apps: apps, Mappings: mappings, RigMappings: rigMappings}
+		appViews := make([]slackAppJSONView, 0, len(apps))
+		for _, a := range apps {
+			appViews = append(appViews, a.safeJSONFields())
+		}
+		out := slackStatusJSON{Apps: appViews, Mappings: mappings, RigMappings: rigMappings}
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(out)
@@ -182,8 +191,9 @@ func printSlackStatusHuman(stdout io.Writer, apps []slackAppRecord, mappings []s
 	} else {
 		fmt.Fprintf(stdout, "Slack apps (%d):\n", len(apps)) //nolint:errcheck
 		for _, a := range apps {
+			v := a.safeLogFields()
 			fmt.Fprintf(stdout, "  %s/%s: %s (scopes=%d, slash_commands=%d)\n", //nolint:errcheck
-				a.WorkspaceID, a.AppID, a.DisplayName, len(a.Scopes), len(a.SlashCommands))
+				v.WorkspaceID, v.AppID, v.DisplayName, v.ScopeCount, v.SlashCommandCount)
 		}
 	}
 	if len(mappings) == 0 {

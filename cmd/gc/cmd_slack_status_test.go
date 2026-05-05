@@ -399,3 +399,59 @@ func TestSlackStatusRendersChannelPatterns(t *testing.T) {
 		t.Errorf("ChannelPatterns = %v, want [oversight-* team-?]", got)
 	}
 }
+
+// TestSlackStatusHumanSanitizesDisplayName covers gc-cby.13: when an
+// operator-supplied manifest puts ANSI escapes or control bytes in
+// display_name, the human-formatted CLI output must not pass them
+// through (terminals corrupted, log aggregators tripped). The JSON
+// projection (--json) is unchanged because JSON encodes those bytes
+// safely; only the human projection is at risk.
+func TestSlackStatusHumanSanitizesDisplayName(t *testing.T) {
+	cityRoot := newTestCity(t)
+	appReg, _ := newSlackAppRegistry(slackAppsRegistryPath(cityRoot))
+	// Mix of ANSI CSI, NUL, BEL, and the higher-impact log-injection
+	// vectors: newline (forges separate log lines) and CR (overwrites
+	// the line in a TTY).
+	hostile := "evil\x1b[31m\x00name\x07\nINFO: signing_secret=sk-fake\rOVERWRITE"
+	if err := appReg.Set(slackAppRecord{WorkspaceID: "T1", AppID: "A1", DisplayName: hostile, ImportedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("seed apps registry: %v", err)
+	}
+	stdout, _, err := execSlackStatusCmd(t, cityRoot)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	for _, c := range []struct {
+		name string
+		r    rune
+	}{{"ESC", 0x1b}, {"NUL", 0x00}, {"BEL", 0x07}} {
+		if strings.ContainsRune(stdout, c.r) {
+			t.Errorf("status output contains raw %s byte: %q", c.name, stdout)
+		}
+	}
+	// The app-row line is the one containing "T1/A1". Locate it and
+	// assert no embedded newline or CR survived inside that single
+	// logical row — anywhere else in stdout newlines may exist as
+	// legitimate row separators.
+	var appRow string
+	for _, line := range strings.Split(stdout, "\n") {
+		if strings.Contains(line, "T1/A1") {
+			appRow = line
+			break
+		}
+	}
+	if appRow == "" {
+		t.Fatalf("status output missing app row: %q", stdout)
+	}
+	if strings.ContainsRune(appRow, '\r') {
+		t.Errorf("app row contains raw CR: %q", appRow)
+	}
+	// "INFO:" and "OVERWRITE" must appear (if at all) only as inert
+	// substrings of the app row, never as the start of a separate
+	// physical line in stdout.
+	for _, line := range strings.Split(stdout, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "INFO:") || trimmed == "OVERWRITE" {
+			t.Errorf("hostile newline produced forged log line %q in stdout %q", line, stdout)
+		}
+	}
+}
