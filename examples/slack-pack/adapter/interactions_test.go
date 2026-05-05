@@ -219,7 +219,11 @@ func TestSlackInteractionsSessionMappingHitDispatches(t *testing.T) {
 	}
 }
 
-func TestSlackInteractionsRigMappingHitFollowUp(t *testing.T) {
+// TestSlackInteractionsRigMappingHitNilRegistry — channel mapping has
+// target_kind=rig but the adapter started without a rig registry
+// (SLACK_RIG_MAPPING_PATH unset / unreadable). Dispatch must surface an
+// actionable fix-it ephemeral rather than NPE.
+func TestSlackInteractionsRigMappingHitNilRegistry(t *testing.T) {
 	cfg := config{slackSigningKey: "secret", accountID: "T1", cityName: "test-city"}
 	mapReg := newTestChannelMappingRegistry(t)
 	now := time.Now().UTC()
@@ -243,8 +247,11 @@ func TestSlackInteractionsRigMappingHitFollowUp(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "follow-up") {
-		t.Errorf("body should mention follow-up bead: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "no rig registry is loaded") {
+		t.Errorf("body should mention nil-registry fix-it: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "alpha") {
+		t.Errorf("body should mention rig name: %s", rec.Body.String())
 	}
 }
 
@@ -1158,10 +1165,10 @@ func TestSlackInteractionsBlockActionsNoBinding(t *testing.T) {
 	}
 }
 
-// TestSlackInteractionsBlockActionsRigBinding — rig-target dispatch
-// is deferred to gc-cby.18; block_actions on a rig-bound channel
-// returns the same parity message as the slash-command path.
-func TestSlackInteractionsBlockActionsRigBinding(t *testing.T) {
+// TestSlackInteractionsBlockActionsRigBindingMissingSlingTarget —
+// block_actions on a rig-bound channel whose record lacks SlingTarget
+// must surface the resolver's fix-it ephemeral verbatim (cby.18.3).
+func TestSlackInteractionsBlockActionsRigBindingMissingSlingTarget(t *testing.T) {
 	cfg := config{slackSigningKey: "secret", accountID: "T1", cityName: "test-city"}
 	mapReg := newTestChannelMappingRegistry(t)
 	rigReg := newTestRigMappingRegistry(t)
@@ -1184,8 +1191,8 @@ func TestSlackInteractionsBlockActionsRigBinding(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "gc-cby.18") {
-		t.Errorf("body should mention deferred rig-dispatch bead gc-cby.18: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "no sling target") {
+		t.Errorf("body should surface resolver fix-it 'no sling target': %s", rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "alpha") {
 		t.Errorf("body should mention the rig name: %s", rec.Body.String())

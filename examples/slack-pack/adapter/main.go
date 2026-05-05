@@ -336,6 +336,13 @@ type config struct {
 	// at startup. Nil-safe — when nil, lookupSigningSecrets falls
 	// through to slackSigningKey for single-app dev installs.
 	appsRegistry *appsRegistry
+	// cityPath is the on-disk root of the gc city this adapter is bound
+	// to. Sourced from GC_CITY_PATH; required for the rig-target
+	// dispatch path (cby.18.3) which must shell `bd create` inside the
+	// rig's workdir (read from <cityPath>/.beads/routes.jsonl) and
+	// `gc sling` from the city root. Empty when GC_CITY_PATH is unset;
+	// the rig dispatch path surfaces a fix-it ephemeral in that case.
+	cityPath string
 }
 
 func loadConfig() (config, error) {
@@ -387,6 +394,7 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 		defaultMappingPath = filepath.Join(cityPath, ".gc", "slack", "channel_mappings.json")
 		defaultRigMappingPath = filepath.Join(cityPath, ".gc", "slack", "rig_mappings.json")
 		defaultAppsRegistryPath = filepath.Join(cityPath, ".gc", "slack", "apps.json")
+		cfg.cityPath = cityPath
 	}
 	cfg.channelMappingPath = envOrFn("SLACK_CHANNEL_MAPPING_PATH", defaultMappingPath)
 	cfg.rigMappingPath = envOrFn("SLACK_RIG_MAPPING_PATH", defaultRigMappingPath)

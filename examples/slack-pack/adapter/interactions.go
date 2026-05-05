@@ -361,9 +361,7 @@ func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry, rigReg 
 				dispatchSlashCommandToSession(cfg, rec.TargetID, command, text, channelID, teamID, userID)
 			}()
 		case channelMappingTargetKindRig:
-			writeEphemeral(w, http.StatusOK, fmt.Sprintf(
-				"Channel %s is bound to rig %s (source=%s). Rig-target dispatch is implemented in a follow-up bead (gc-cby.18); the binding is recorded but not yet routed.",
-				channelID, rec.TargetID, source))
+			dispatchSlashCommandToRig(w, cfg, rigReg, teamID, rec.TargetID, command, text, channelID, userID)
 		default:
 			// load() rejects unknown target_kind, so reaching this branch
 			// means the registry was mutated mid-flight by another
@@ -562,9 +560,7 @@ func handleBlockActionsPayload(w http.ResponseWriter, cfg config, mapReg *channe
 			dispatchBlockActionsToSession(cfg, rec.TargetID, channelID, p)
 		}()
 	case channelMappingTargetKindRig:
-		writeEphemeral(w, http.StatusOK, fmt.Sprintf(
-			"Channel %s is bound to rig %s (source=%s). Rig-target dispatch is implemented in a follow-up bead (gc-cby.18); the binding is recorded but not yet routed.",
-			channelID, rec.TargetID, source))
+		dispatchBlockActionsToRig(w, cfg, rigReg, p.Team.ID, rec.TargetID, channelID, p)
 	default:
 		log.Printf("slack interactions: unexpected target_kind %q for %q/%q", rec.TargetKind, p.Team.ID, channelID)
 		writeEphemeral(w, http.StatusOK,
