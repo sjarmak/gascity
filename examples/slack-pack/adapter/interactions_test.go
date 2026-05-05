@@ -1812,6 +1812,12 @@ func TestNeutralizeMarkupBoundariesIdempotentWithMarkup(t *testing.T) {
 		"trailing<",
 		"<漢字>",
 		"</tag1><tag2>",
+		// Pre-neutralized input — already contains '<' followed by U+200B
+		// in the raw source. The skip-if-already-padded branch must not
+		// add a second ZWSP. Documents the intent so a future refactor
+		// that splits double-application into two separate calls keeps
+		// coverage of this branch.
+		"<​foo>",
 	}
 	for _, in := range cases {
 		once := neutralizeMarkupBoundaries(in)

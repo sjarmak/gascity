@@ -121,6 +121,11 @@ func TestSweepOrphanTmpFilesEmptyDiskPathIsNoop(t *testing.T) {
 // Skipped on Windows (no POSIX directory-write semantics) and when
 // running as root (uid 0 bypasses directory permission checks on
 // most kernels — see DAC_OVERRIDE).
+//
+// Do NOT add t.Parallel() to this test. It mutates the package-global
+// log.Default() writer via log.SetOutput, which races any concurrent
+// test that also calls log.Printf. This package has no t.Parallel
+// today; the broader logger-race story is tracked by gc-cby.36.
 func TestSweepOrphanTmpFilesRemoveErrorLoggedAndContinues(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX directory write-permission semantics required")

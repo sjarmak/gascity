@@ -522,7 +522,7 @@ func neutralizeMarkupBoundaries(s string) string {
 	}
 	const zwsp = "​"
 	var b strings.Builder
-	b.Grow(len(s) + len(zwsp))
+	b.Grow(len(s) + strings.Count(s, "<")*len(zwsp))
 	for i := 0; i < len(s); i++ {
 		b.WriteByte(s[i])
 		if s[i] == '<' && !strings.HasPrefix(s[i+1:], zwsp) {
