@@ -134,7 +134,7 @@ func parseDoubleHandlePrefix(text, prefix string) (handle, remainder string, ok 
 // threadReg is non-nil at the call site (the caller checks for nil
 // before parsing). It is captured here so 5.3 can wire the
 // AcquireOrCreate call without touching this function's signature.
-func handleDoubleHandleDispatch(cfg config, aliasReg *handleAliasRegistry, threadReg *threadSessionRegistry, msg slackMessageEvent, teamID, handle string) {
+func handleDoubleHandleDispatch(cfg config, aliasReg *handleAliasRegistry, threadReg *threadSessionRegistry, roomLaunchReg *roomLaunchMappingRegistry, msg slackMessageEvent, teamID, handle, remainder string) {
 	if aliasReg != nil {
 		if existingSessionID, ok := aliasReg.Get(handle); ok {
 			body := fmt.Sprintf(
@@ -151,19 +151,7 @@ func handleDoubleHandleDispatch(cfg config, aliasReg *handleAliasRegistry, threa
 		}
 	}
 
-	// Free for a new launcher session. cby.5.3 will replace this
-	// ephemeral with the actual spawn call wired through
-	// threadReg.AcquireOrCreate.
-	body := fmt.Sprintf(
-		"launcher mode handle @@%s recognized; thread-spawn flow lands in gc-cby.5.3",
-		handle,
-	)
-	if err := postSlackEphemeral(cfg.slackBotToken, msg.Channel, msg.User, msg.ThreadTS, body); err != nil {
-		log.Printf("launcher dispatch (stub): postEphemeral channel=%s user=%s handle=%q: %v",
-			msg.Channel, msg.User, handle, err)
-	}
-	log.Printf("launcher dispatch (stub): handle=%q team=%s channel=%s user=%s thread=%s — awaiting cby.5.3",
-		handle, teamID, msg.Channel, msg.User, msg.ThreadTS)
+	dispatchRoomLaunch(cfg, aliasReg, threadReg, roomLaunchReg, msg, teamID, handle, remainder)
 }
 
 // slackPostEphemeralReq is the chat.postEphemeral request shape we

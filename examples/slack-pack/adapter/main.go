@@ -281,6 +281,15 @@ type config struct {
 	// defaulting to <GC_CITY_PATH>/.gc/slack/thread_sessions.json when
 	// GC_CITY_PATH is set, else /tmp/gc-slack-adapter/thread_sessions.json.
 	threadSessionsStorePath string
+	// roomLaunchPath is the JSON file backing the room-launch mapping
+	// registry used by Slack launcher mode (cby.5.3). Maps
+	// (workspace_id, channel_id) → pool_template; written by
+	// `gc slack enable-room-launch`. Sourced from
+	// GC_SLACK_ROOM_LAUNCH_FILE, defaulting to
+	// <GC_CITY_PATH>/.gc/slack/room_launch_mappings.json when
+	// GC_CITY_PATH is set, else
+	// /tmp/gc-slack-adapter/room_launch_mappings.json.
+	roomLaunchPath string
 	// inboundFileStore is the local directory where inbound Slack file
 	// attachments are written so bound sessions can read them directly
 	// (no bot-token leak). Files are organized as
@@ -399,17 +408,20 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 	defaultRigMappingPath := "/tmp/gc-slack-adapter/rig_mappings.json"
 	defaultAppsRegistryPath := "/tmp/gc-slack-adapter/apps.json"
 	defaultThreadSessionsPath := "/tmp/gc-slack-adapter/thread_sessions.json"
+	defaultRoomLaunchPath := "/tmp/gc-slack-adapter/room_launch_mappings.json"
 	if cityPath := getenv("GC_CITY_PATH"); cityPath != "" {
 		defaultMappingPath = filepath.Join(cityPath, ".gc", "slack", "channel_mappings.json")
 		defaultRigMappingPath = filepath.Join(cityPath, ".gc", "slack", "rig_mappings.json")
 		defaultAppsRegistryPath = filepath.Join(cityPath, ".gc", "slack", "apps.json")
 		defaultThreadSessionsPath = filepath.Join(cityPath, ".gc", "slack", "thread_sessions.json")
+		defaultRoomLaunchPath = filepath.Join(cityPath, ".gc", "slack", "room_launch_mappings.json")
 		cfg.cityPath = cityPath
 	}
 	cfg.channelMappingPath = envOrFn("SLACK_CHANNEL_MAPPING_PATH", defaultMappingPath)
 	cfg.rigMappingPath = envOrFn("SLACK_RIG_MAPPING_PATH", defaultRigMappingPath)
 	cfg.appsRegistryPath = envOrFn("SLACK_APPS_REGISTRY_PATH", defaultAppsRegistryPath)
 	cfg.threadSessionsStorePath = envOrFn("GC_SLACK_THREAD_SESSIONS_FILE", defaultThreadSessionsPath)
+	cfg.roomLaunchPath = envOrFn("GC_SLACK_ROOM_LAUNCH_FILE", defaultRoomLaunchPath)
 
 	// Retention controls. Defaults: keep inbound files for 7 days,
 	// sweep every hour. Setting either to "0" disables the janitor.
@@ -804,6 +816,7 @@ func main() {
 		cfg.rigMappingPath,
 		cfg.appsRegistryPath,
 		cfg.threadSessionsStorePath,
+		cfg.roomLaunchPath,
 	} {
 		if err := sweepOrphanTmpFiles(p); err != nil {
 			log.Printf("orphan-tmp sweep: %v", err)
@@ -827,6 +840,13 @@ func main() {
 		log.Fatalf("thread session registry: %v", err)
 	}
 	log.Printf("thread session registry: store=%s", cfg.threadSessionsStorePath)
+
+	roomLaunchReg, err := newRoomLaunchMappingRegistry(cfg.roomLaunchPath)
+	if err != nil {
+		log.Fatalf("room launch mapping registry: %v", err)
+	}
+	log.Printf("room launch mapping registry: store=%s (read-only; restart to reload)",
+		cfg.roomLaunchPath)
 
 	channelMapReg, err := newChannelMappingRegistry(cfg.channelMappingPath)
 	if err != nil {
@@ -864,7 +884,7 @@ func main() {
 	// (HMAC-verified) and /healthz. Bound to 0.0.0.0 by default so
 	// Tailscale Funnel can reach it.
 	publicMux := http.NewServeMux()
-	publicMux.HandleFunc("/slack/events", handleSlackEvents(cfg, aliasReg, threadReg))
+	publicMux.HandleFunc("/slack/events", handleSlackEvents(cfg, aliasReg, threadReg, roomLaunchReg))
 	publicMux.HandleFunc("/slack/interactions", handleSlackInteractions(cfg, channelMapReg, rigMapReg))
 	publicMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -1529,7 +1549,7 @@ func postToSlack(token string, req slackPostMessageReq) (*slackPostMessageResp, 
 	return &sr, nil
 }
 
-func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry, threadReg *threadSessionRegistry) http.HandlerFunc {
+func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry, threadReg *threadSessionRegistry, roomLaunchReg *roomLaunchMappingRegistry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1584,7 +1604,7 @@ func handleSlackEvents(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 		// dispatchSem when an inbound triggers an alias dispatch (which
 		// would otherwise hold two slots concurrently — see gc-cby.26
 		// Phase 4 review fix).
-		go processSlackEvent(cfg, aliasReg, threadReg, env, release)
+		go processSlackEvent(cfg, aliasReg, threadReg, roomLaunchReg, env, release)
 	}
 }
 
@@ -1698,7 +1718,7 @@ func slackKindFromChannelType(channelType, channelID string) string {
 // in tests or in deployments that disable launcher mode entirely; the
 // `@@<handle>` branch falls through to the regular `@<handle>` path
 // when nil.
-func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *threadSessionRegistry, env slackEventEnvelope, release func()) {
+func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *threadSessionRegistry, roomLaunchReg *roomLaunchMappingRegistry, env slackEventEnvelope, release func()) {
 	released := false
 	defer func() {
 		if !released {
@@ -1733,8 +1753,8 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 	// transport. The single-`@` parser below only runs on miss, so the
 	// existing alias dispatch behavior is unchanged.
 	if cfg.handlePrefix != "" && threadReg != nil {
-		if h, _, ok := parseDoubleHandlePrefix(msg.Text, cfg.handlePrefix); ok {
-			handleDoubleHandleDispatch(cfg, aliasReg, threadReg, msg, env.TeamID, h)
+		if h, remainder, ok := parseDoubleHandlePrefix(msg.Text, cfg.handlePrefix); ok {
+			handleDoubleHandleDispatch(cfg, aliasReg, threadReg, roomLaunchReg, msg, env.TeamID, h, remainder)
 			return
 		}
 	}
@@ -2353,7 +2373,7 @@ func logSweepResult(res sweepResult) {
 //
 // gc-ywe.6.
 func tightenStorePermissions(cfg config) {
-	for _, p := range []string{cfg.identityStorePath, cfg.handleAliasStorePath, cfg.channelMappingPath, cfg.rigMappingPath, cfg.threadSessionsStorePath} {
+	for _, p := range []string{cfg.identityStorePath, cfg.handleAliasStorePath, cfg.channelMappingPath, cfg.rigMappingPath, cfg.threadSessionsStorePath, cfg.roomLaunchPath} {
 		if p == "" {
 			continue
 		}

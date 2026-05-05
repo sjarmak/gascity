@@ -101,7 +101,7 @@ func TestProcessSlackEventDoubleHandleUnclaimedEmitsLauncherEphemeral(t *testing
 
 	var releases int32
 	release := func() { atomic.AddInt32(&releases, 1) }
-	processSlackEvent(cfg, aliasReg, threadReg, env, release)
+	processSlackEvent(cfg, aliasReg, threadReg, nil, env, release)
 
 	// One ephemeral POST must land within a short deadline.
 	select {
@@ -184,7 +184,7 @@ func TestProcessSlackEventDoubleHandlePreClaimedEmitsBoundEphemeral(t *testing.T
 	env := slackEventEnvelope{Type: "event_callback", Event: rawMsg}
 
 	release := func() {}
-	processSlackEvent(cfg, aliasReg, threadReg, env, release)
+	processSlackEvent(cfg, aliasReg, threadReg, nil, env, release)
 
 	select {
 	case body := <-ephemeralCh:
@@ -254,7 +254,7 @@ func TestProcessSlackEventSingleHandleStillReachesAliasDispatch(t *testing.T) {
 	env := slackEventEnvelope{Type: "event_callback", Event: rawMsg}
 
 	release := func() {}
-	processSlackEvent(cfg, aliasReg, threadReg, env, release)
+	processSlackEvent(cfg, aliasReg, threadReg, nil, env, release)
 
 	select {
 	case path := <-pathCh:
@@ -300,7 +300,7 @@ func TestProcessSlackEventPlainTextUnaffected(t *testing.T) {
 	env := slackEventEnvelope{Type: "event_callback", Event: rawMsg}
 
 	release := func() {}
-	processSlackEvent(cfg, aliasReg, threadReg, env, release)
+	processSlackEvent(cfg, aliasReg, threadReg, nil, env, release)
 
 	if got := atomic.LoadInt32(&inboundHits); got != 1 {
 		t.Errorf("inbound POSTs = %d, want 1 (plain text must still post inbound)", got)
@@ -344,7 +344,7 @@ func TestProcessSlackEventDoubleHandleNilThreadRegistry(t *testing.T) {
 
 	release := func() {}
 	// Must not panic.
-	processSlackEvent(cfg, aliasReg, nil, env, release)
+	processSlackEvent(cfg, aliasReg, nil, nil, env, release)
 }
 
 // TestLoadConfigThreadSessionsStorePathDefaultsCity exercises the
@@ -420,7 +420,7 @@ func TestHandleSlackEventsAcceptsThreadRegistry(t *testing.T) {
 	req := signedSlackEventRequest(t, cfg.slackSigningKey, envBody)
 	w := httptest.NewRecorder()
 
-	handler := handleSlackEvents(cfg, aliasReg, threadReg)
+	handler := handleSlackEvents(cfg, aliasReg, threadReg, nil)
 	handler(w, req)
 
 	// Slack ack happens before downstream work, regardless of gc reachability.

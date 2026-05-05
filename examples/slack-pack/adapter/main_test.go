@@ -2881,7 +2881,7 @@ func TestProcessSlackEventReleasesSlotOnNoAliasPath(t *testing.T) {
 
 	var releases int32
 	release := func() { atomic.AddInt32(&releases, 1) }
-	processSlackEvent(cfg, aliasReg, nil, env, release)
+	processSlackEvent(cfg, aliasReg, nil, nil, env, release)
 
 	if got := atomic.LoadInt32(&releases); got != 1 {
 		t.Errorf("release fired %d times on no-alias path; want exactly 1", got)
@@ -2927,7 +2927,7 @@ func TestProcessSlackEventTransfersSlotToAliasGoroutine(t *testing.T) {
 
 	var releases int32
 	release := func() { atomic.AddInt32(&releases, 1) }
-	processSlackEvent(cfg, aliasReg, nil, env, release)
+	processSlackEvent(cfg, aliasReg, nil, nil, env, release)
 
 	// The alias goroutine runs after processSlackEvent returns; wait
 	// for the dispatch to land on the gc stub.
@@ -3005,7 +3005,7 @@ func TestHandleSlackEventsDropsWhenSemaphoreFull(t *testing.T) {
 	req.Header.Set("X-Slack-Signature", sig)
 	w := httptest.NewRecorder()
 
-	handleSlackEvents(cfg, aliasReg, nil)(w, req)
+	handleSlackEvents(cfg, aliasReg, nil, nil)(w, req)
 
 	// Slack always sees 200 (we ack quickly to suppress retries).
 	if w.Result().StatusCode != http.StatusOK {
@@ -3183,7 +3183,7 @@ func TestSlackEventsPerAppSignatureLookup(t *testing.T) {
 	req := signedSlackEventRequest(t, "secret-a2", envBody)
 	w := httptest.NewRecorder()
 
-	handleSlackEvents(cfg, aliasReg, nil)(w, req)
+	handleSlackEvents(cfg, aliasReg, nil, nil)(w, req)
 
 	if w.Result().StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want 200 (per-app lookup must verify with A2's secret)", w.Result().StatusCode)
@@ -3222,7 +3222,7 @@ func TestSlackEventsRegistryMissUsesEnvFallback(t *testing.T) {
 	req := signedSlackEventRequest(t, "env-fallback", envBody)
 	w := httptest.NewRecorder()
 
-	handleSlackEvents(cfg, aliasReg, nil)(w, req)
+	handleSlackEvents(cfg, aliasReg, nil, nil)(w, req)
 
 	if w.Result().StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want 200 (env fallback must verify when registry misses)", w.Result().StatusCode)
@@ -3248,7 +3248,7 @@ func TestSlackEventsNoSecretRejects401(t *testing.T) {
 	req := signedSlackEventRequest(t, "anything", envBody)
 	w := httptest.NewRecorder()
 
-	handleSlackEvents(cfg, aliasReg, nil)(w, req)
+	handleSlackEvents(cfg, aliasReg, nil, nil)(w, req)
 	if w.Result().StatusCode != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", w.Result().StatusCode)
 	}
@@ -3272,7 +3272,7 @@ func TestSlackEventsMalformedBodyFallsBackToEnv(t *testing.T) {
 	req := signedSlackEventRequest(t, "env-secret", body)
 	w := httptest.NewRecorder()
 
-	handleSlackEvents(cfg, aliasReg, nil)(w, req)
+	handleSlackEvents(cfg, aliasReg, nil, nil)(w, req)
 	// Verify passed (env fallback) but JSON decode of envelope failed.
 	if w.Result().StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 (malformed envelope after env-fallback verify)", w.Result().StatusCode)
