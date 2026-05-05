@@ -25,5 +25,6 @@ via env vars injected at "gc start".`,
 	cmd.AddCommand(newSlackMapChannelCmd(stdout))
 	cmd.AddCommand(newSlackMapRigCmd(stdout, stderr))
 	cmd.AddCommand(newSlackStatusCmd(stdout, stderr))
+	cmd.AddCommand(newSlackPostMessageCmd(stdout))
 	return cmd
 }
