@@ -9,6 +9,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -114,8 +115,15 @@ func runThreadTeardownSubscriber(ctx context.Context, cfg teardownSubscriberConf
 		cfg.readHeaderTimeout = defaultTeardownHeaderTimeout
 	}
 
-	url := fmt.Sprintf("%s/v0/city/%s/events/stream",
-		strings.TrimRight(cfg.gcAPIBase, "/"), cfg.cityName)
+	// PathEscape cityName so URL-significant characters cannot alter
+	// routing on the gc API side (sec-S-06). cityName is operator-supplied
+	// via GC_CITY_NAME and gc-cby.29 rejects /?#% at startup, but the
+	// per-call escape keeps the wire format correct regardless and matches
+	// the cby-set-c dispatch paths and the cby.28 register/inbound paths.
+	// Local var named `target` (not `url`) so the net/url import is not
+	// shadowed. gc-cby.48.
+	target := fmt.Sprintf("%s/v0/city/%s/events/stream",
+		strings.TrimRight(cfg.gcAPIBase, "/"), url.PathEscape(cfg.cityName))
 
 	backoff := cfg.initialBackoff
 	for {
@@ -123,7 +131,7 @@ func runThreadTeardownSubscriber(ctx context.Context, cfg teardownSubscriberConf
 			return
 		}
 
-		processed, runErr := streamTeardownEvents(ctx, url, cfg.readHeaderTimeout, threadReg, aliasReg)
+		processed, runErr := streamTeardownEvents(ctx, target, cfg.readHeaderTimeout, threadReg, aliasReg)
 		if ctx.Err() != nil {
 			return
 		}
@@ -137,7 +145,7 @@ func runThreadTeardownSubscriber(ctx context.Context, cfg teardownSubscriberConf
 
 		if runErr != nil {
 			log.Printf("thread teardown subscriber: stream %s: %v (sleep %s before reconnect)",
-				url, runErr, backoff.Round(time.Millisecond))
+				target, runErr, backoff.Round(time.Millisecond))
 		}
 
 		// Sleep with jitter, respecting context.
@@ -159,8 +167,8 @@ func runThreadTeardownSubscriber(ctx context.Context, cfg teardownSubscriberConf
 // until the connection closes or ctx is canceled. Returns the number of
 // terminal-session events processed and the error that ended the stream
 // (nil on a clean ctx cancellation).
-func streamTeardownEvents(ctx context.Context, url string, headerTimeout time.Duration, threadReg threadBindingDropper, aliasReg *handleAliasRegistry) (int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func streamTeardownEvents(ctx context.Context, target string, headerTimeout time.Duration, threadReg threadBindingDropper, aliasReg *handleAliasRegistry) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return 0, fmt.Errorf("build request: %w", err)
 	}

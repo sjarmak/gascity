@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -539,5 +540,87 @@ func TestFindHandlesBySessionID(t *testing.T) {
 	// Non-matching sessionID.
 	if got := reg.findHandlesBySessionID("gc-missing"); len(got) != 0 {
 		t.Errorf("gc-missing: got %v, want []", got)
+	}
+}
+
+// TestThreadTeardownSubscriberEscapesCityName verifies that
+// runThreadTeardownSubscriber percent-encodes cityName before
+// interpolating it into the /v0/city/{city}/events/stream URL
+// (gc-cby.48). Mirrors the TestRegisterAdapterEscapesCityName /
+// TestPostInboundEscapesCityName pattern: capture both the raw wire form
+// (to confirm the escape lands on the wire) and the decoded form (to
+// confirm round-trip identity through net/http).
+func TestThreadTeardownSubscriberEscapesCityName(t *testing.T) {
+	rawPathCh := make(chan string, 1)
+	decodedPathCh := make(chan string, 1)
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case rawPathCh <- r.URL.EscapedPath():
+		default:
+		}
+		select {
+		case decodedPathCh <- r.URL.Path:
+		default:
+		}
+		// Hold the connection until the client cancels so the
+		// subscriber doesn't reconnect and noisily multiply hits.
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer httpSrv.Close()
+
+	aliasReg, err := newHandleAliasRegistry(filepath.Join(t.TempDir(), "alias.json"))
+	if err != nil {
+		t.Fatalf("alias registry: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := teardownSubscriberConfig{
+		gcAPIBase:      httpSrv.URL,
+		cityName:       "city/with slash",
+		initialBackoff: 10 * time.Millisecond,
+		maxBackoff:     50 * time.Millisecond,
+	}
+	done := make(chan struct{})
+	go func() {
+		runThreadTeardownSubscriber(ctx, cfg, newFakeThreadRegistry(), aliasReg)
+		close(done)
+	}()
+
+	var rawPath, decodedPath string
+	select {
+	case rawPath = <-rawPathCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber did not connect to gc stub within 2s")
+	}
+	select {
+	case decodedPath = <-decodedPathCh:
+	default:
+	}
+
+	wantRawCity := "city%2Fwith%20slash"
+	if !strings.Contains(rawPath, wantRawCity) {
+		t.Errorf("raw path %q missing escaped cityName %q", rawPath, wantRawCity)
+	}
+	if !strings.HasSuffix(rawPath, "/events/stream") {
+		t.Errorf("raw path %q missing /events/stream suffix", rawPath)
+	}
+	wantDecoded := "/v0/city/city/with slash/events/stream"
+	if decodedPath != wantDecoded {
+		t.Errorf("decoded path = %q, want %q", decodedPath, wantDecoded)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("subscriber did not exit within 2s of cancel")
 	}
 }
