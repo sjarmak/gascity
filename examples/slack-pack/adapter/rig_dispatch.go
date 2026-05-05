@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -34,13 +35,17 @@ const rigDispatchTitleMaxLen = 200
 // truncateForTitle returns s capped at rigDispatchTitleMaxLen runes,
 // using a fall-back placeholder when s trims to empty. It runs after
 // neutralizeMarkupBoundaries so callers don't lose sanitization.
+//
+// Uses []rune slicing (not byte slicing) so multibyte UTF-8 characters
+// at the boundary don't produce invalid UTF-8 in the bead title.
 func truncateForTitle(s string) string {
 	t := strings.TrimSpace(s)
 	if t == "" {
 		return "(empty)"
 	}
-	if len(t) > rigDispatchTitleMaxLen {
-		return t[:rigDispatchTitleMaxLen]
+	runes := []rune(t)
+	if len(runes) > rigDispatchTitleMaxLen {
+		return string(runes[:rigDispatchTitleMaxLen])
 	}
 	return t
 }
@@ -76,6 +81,7 @@ func runDispatchTestHook() {
 // — block_actions already carries an action_id+value of the user's
 // choice, so prompting for a summary on top would be friction.
 func openRigFixModalForSlash(
+	ctx context.Context,
 	w http.ResponseWriter,
 	cfg config,
 	rigReg *rigMappingRegistry,
@@ -133,7 +139,7 @@ func openRigFixModalForSlash(
 			"Internal error building modal view; please retry.")
 		return
 	}
-	if _, err := callViewsOpen(cfg.slackBotToken, triggerID, view); err != nil {
+	if _, err := callViewsOpen(ctx, cfg.slackBotToken, triggerID, view); err != nil {
 		log.Printf("slack interactions: views.open rig=%q trigger=%q: %v",
 			rigName, triggerID, err)
 		writeEphemeral(w, http.StatusOK, fmt.Sprintf(
@@ -280,7 +286,12 @@ func dispatchRigFixFromViewSubmission(
 	if !acquired {
 		log.Printf("slack adapter: dispatch queue full (cap=%d), dropping view_submission rig_fix rig=%q user=%q",
 			capacity, meta.RigName, meta.UserID)
-		writeViewClear(w)
+		// Surface saturation to the user via the modal's field-level
+		// errors response_action. Without this, writeViewClear silently
+		// closes the modal and the user has no idea the work was lost.
+		writeViewSubmissionErrors(w, map[string]string{
+			rigFixModalSummaryBlockID: "Slack adapter is currently saturated; please retry shortly.",
+		})
 		return
 	}
 
@@ -301,17 +312,22 @@ func dispatchRigFixFromViewSubmission(
 	)
 	title = truncateForTitle(title)
 
+	// Neutralize markup boundaries on user-controlled fields before
+	// they flow into --var values. The downstream formula MAY embed
+	// these in a system-reminder block; without neutralization a user
+	// could close the boundary tag and inject instructions into the
+	// agent's prompt.
 	vars := map[string]string{
 		"slack_channel_id": meta.ChannelID,
 		"slack_user_id":    meta.UserID,
 		"slack_rig":        meta.RigName,
-		"summary":          summary,
+		"summary":          neutralizeMarkupBoundaries(summary),
 	}
 	if contextMarkdown != "" {
-		vars["context_markdown"] = contextMarkdown
+		vars["context_markdown"] = neutralizeMarkupBoundaries(contextMarkdown)
 	}
 	if meta.OriginalCommandText != "" {
-		vars["slash_command_text"] = meta.OriginalCommandText
+		vars["slash_command_text"] = neutralizeMarkupBoundaries(meta.OriginalCommandText)
 	}
 
 	go func() {

@@ -772,10 +772,11 @@ func TestSlackInteractionsRigViewSubmissionGcFailureClosesBead(t *testing.T) {
 }
 
 // TestSlackInteractionsRigViewSubmissionSaturationDrop — when the
-// dispatch semaphore is full at slot-acquire time, the modal closes
-// and no subprocess fires. The slot acquisition moved from slash
-// (cby.18.3) to view_submission (cby.18.4) so we don't hold a slot
-// across the modal lifecycle.
+// dispatch semaphore is full at slot-acquire time, the response
+// surfaces a field-level error in the modal so the user sees the
+// cause and can retry without losing their typed input. The earlier
+// design closed the modal silently (response_action=clear); the
+// review-time fix replaced it with response_action=errors.
 func TestSlackInteractionsRigViewSubmissionSaturationDrop(t *testing.T) {
 	cityPath := t.TempDir()
 	seedRoutesJSONL(t, cityPath, map[string]string{"alpha": "."})
@@ -822,8 +823,15 @@ func TestSlackInteractionsRigViewSubmissionSaturationDrop(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), `"response_action":"clear"`) {
-		t.Errorf("response should be clear-modal on saturation; got: %s", rec.Body.String())
+	bodyStr := rec.Body.String()
+	if !strings.Contains(bodyStr, `"response_action":"errors"`) {
+		t.Errorf("response should surface field-level errors on saturation; got: %s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "saturated") {
+		t.Errorf("response should mention saturation in the error message; got: %s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, rigFixModalSummaryBlockID) {
+		t.Errorf("error should target the summary block; got: %s", bodyStr)
 	}
 	time.Sleep(50 * time.Millisecond)
 	if len(*records) != 0 {

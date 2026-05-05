@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // Modal-backed summary/context capture for rig slash-command intake.
@@ -231,6 +233,15 @@ type slackViewsOpenResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
+// viewsOpenTimeout bounds the views.open call. Slack's trigger_id is
+// valid for ~3 seconds; we cap below that so a stalled connection
+// can't block the slash handler past the trigger-id deadline.
+const viewsOpenTimeout = 2500 * time.Millisecond
+
+// viewsOpenMaxResponseBytes caps the response body read so a hostile
+// or misconfigured upstream can't bloat handler memory.
+const viewsOpenMaxResponseBytes = 1 << 20
+
 // callViewsOpen posts the trigger_id + view JSON to Slack's views.open
 // API using the configured bot token. Returns the parsed response or
 // an error wrapping any transport / decode failure. A 2xx response
@@ -238,25 +249,29 @@ type slackViewsOpenResponse struct {
 //
 // Slack's trigger_id is valid for ~3 seconds — callers must invoke
 // this synchronously inside the slash-command HTTP handler to stay
-// inside that window.
-func callViewsOpen(token, triggerID string, view []byte) (*slackViewsOpenResponse, error) {
+// inside that window. Uses a dedicated client with viewsOpenTimeout
+// rather than http.DefaultClient (which has no timeout) so a stalled
+// upstream cannot hang the handler past the deadline.
+func callViewsOpen(ctx context.Context, token, triggerID string, view []byte) (*slackViewsOpenResponse, error) {
 	body, err := json.Marshal(slackViewsOpenRequest{TriggerID: triggerID, View: view})
 	if err != nil {
 		return nil, fmt.Errorf("encode views.open request: %w", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, slackAPIBase+"/views.open", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		slackAPIBase+"/views.open", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("build views.open request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: viewsOpenTimeout}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("POST views.open: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, viewsOpenMaxResponseBytes))
 	if err != nil {
 		return nil, fmt.Errorf("read views.open response: %w", err)
 	}

@@ -104,6 +104,14 @@ func registerOAuthHandlers(mux *http.ServeMux, cfg config, reg *appsRegistry) {
 		log.Printf("WARN: SLACK_CLIENT_ID is set but SLACK_REDIRECT_URI is empty — oauth install endpoints not registered")
 		return
 	}
+	if cfg.oauthClientSecret == "" {
+		log.Printf("WARN: SLACK_CLIENT_ID is set but SLACK_CLIENT_SECRET is empty — oauth install endpoints not registered (token exchange would fail)")
+		return
+	}
+	if err := validateSlackOAuthBase(cfg.oauthSlackBaseURL); err != nil {
+		log.Printf("WARN: SLACK_OAUTH_BASE_URL invalid (%v) — oauth install endpoints not registered", err)
+		return
+	}
 	oc := oauthConfig{
 		clientID:      cfg.oauthClientID,
 		clientSecret:  cfg.oauthClientSecret,
@@ -118,6 +126,41 @@ func registerOAuthHandlers(mux *http.ServeMux, cfg config, reg *appsRegistry) {
 	mux.HandleFunc("/slack/oauth/start", handleOAuthStart(oc))
 	mux.HandleFunc("/slack/oauth/callback", handleOAuthCallback(oc, reg))
 	log.Printf("oauth install endpoints registered: redirect_uri=%s", cfg.oauthRedirectURI)
+}
+
+// validateSlackOAuthBase enforces an SSRF-safe shape on the OAuth base
+// URL. Empty is allowed (handlers fall back to defaultSlackOAuthBase).
+// Non-empty must be https + slack.com (or *.slack.com), with one
+// concession for tests that inject an httptest.Server URL via the
+// SLACK_OAUTH_TEST_BASE escape — production deployments never set
+// SLACK_OAUTH_BASE_URL to anything else.
+//
+// Without this, an operator (or a compromised env injector) who points
+// SLACK_OAUTH_BASE_URL at internal infrastructure causes the adapter
+// to POST the OAuth client_id + client_secret to that internal target
+// during code exchange — a credential-leak SSRF vector.
+func validateSlackOAuthBase(base string) error {
+	if base == "" {
+		return nil
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return fmt.Errorf("parse url: %w", err)
+	}
+	// Allow http only when the host is loopback (test harness using
+	// httptest.Server); reject all other http schemes.
+	if u.Scheme != "https" {
+		host := u.Hostname()
+		if u.Scheme == "http" && (host == "127.0.0.1" || host == "localhost" || host == "::1") {
+			return nil
+		}
+		return fmt.Errorf("scheme must be https (got %q)", u.Scheme)
+	}
+	host := u.Hostname()
+	if host != "slack.com" && !strings.HasSuffix(host, ".slack.com") {
+		return fmt.Errorf("host must be slack.com or *.slack.com (got %q)", host)
+	}
+	return nil
 }
 
 // oauthBotScopes is the bot scope set requested at authorize-time.

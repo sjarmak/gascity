@@ -120,6 +120,9 @@ capture it for the next refresh.`,
 		"Slack bot token (xoxb-...); defaults to $"+slackBotTokenEnv)
 	cmd.Flags().StringVar(&opts.APIBase, "api-base", "",
 		"Slack web API base URL (defaults to $"+slackAPIBaseEnv+" or "+slackChatAPIDefaultBase+")")
+	_ = cmd.MarkFlagRequired("channel")
+	_ = cmd.MarkFlagRequired("kind")
+	_ = cmd.MarkFlagRequired("payload")
 	return cmd
 }
 

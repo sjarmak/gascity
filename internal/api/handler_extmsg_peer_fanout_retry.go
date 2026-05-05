@@ -4,11 +4,52 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/extmsg"
 )
+
+// peerFanoutRetryMinGap is the minimum interval between successful
+// peer-fanout retry calls per (city, conversation, target_session)
+// tuple. Defense-in-depth against amplification: the Python CLI has
+// a client-side cooldown but the server can't trust that. Without
+// this gate, a misbehaving caller could blast the retry endpoint at
+// Slack and trigger workspace-wide rate-limits.
+//
+// 100ms accommodates the legitimate retry cadence (the client default
+// is 250ms cooldown) while bounding the worst-case attempt rate to
+// ~10/s per tuple. Per-tuple keying means distinct conversations
+// retry independently — the gate is a per-message-stream throttle,
+// not a global one.
+const peerFanoutRetryMinGap = 100 * time.Millisecond
+
+// peerFanoutRetryGate tracks the last attempt time per
+// (cityName, conversation_id, target_session) tuple in-process.
+// In-memory, per-process: a distributed deployment would need a
+// shared store, but slack-pack is single-process today.
+var peerFanoutRetryGate = struct {
+	sync.Mutex
+	last map[string]time.Time
+}{last: make(map[string]time.Time)}
+
+// peerFanoutRetryAllow returns false if the (cityName, conversation,
+// target) tuple has been retried within peerFanoutRetryMinGap. On
+// allow, records the current time so subsequent calls within the gap
+// are denied. now is injectable for tests.
+func peerFanoutRetryAllow(now func() time.Time, cityName, conversationID, targetSession string) bool {
+	key := cityName + "|" + conversationID + "|" + targetSession
+	t := now()
+	peerFanoutRetryGate.Lock()
+	defer peerFanoutRetryGate.Unlock()
+	if last, ok := peerFanoutRetryGate.last[key]; ok && t.Sub(last) < peerFanoutRetryMinGap {
+		return false
+	}
+	peerFanoutRetryGate.last[key] = t
+	return true
+}
 
 // humaHandleExtMsgPeerFanoutRetry is the Huma-typed handler for
 // POST /v0/city/{cityName}/extmsg/peer-fanout/retry.
@@ -37,6 +78,12 @@ func (s *Server) humaHandleExtMsgPeerFanoutRetry(
 	}
 	if input.Body.OriginalSeq == 0 {
 		return nil, huma.Error400BadRequest("original_seq is required")
+	}
+
+	if !peerFanoutRetryAllow(time.Now, input.CityName, conv.ConversationID, target) {
+		return nil, huma.Error429TooManyRequests(fmt.Sprintf(
+			"retry rate limit: minimum %s between retries for the same (conversation, target_session)",
+			peerFanoutRetryMinGap))
 	}
 
 	store := s.state.CityBeadStore()

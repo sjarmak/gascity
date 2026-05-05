@@ -29,6 +29,14 @@ import slack_intake_common as common
 
 
 DEFAULT_SINCE = "1h"
+# RETRIED_LOOKBACK is the window over which we look for prior successful
+# retries when building the dedupe set. It is decoupled from --since
+# (which scopes the candidate failed events): a failure inside the
+# --since window can correspond to a successful retry that happened
+# *before* the window, and re-firing that retry would produce duplicate
+# Slack nudges. 7d is generous coverage for any reasonable operator
+# cadence and bounded enough not to re-scan the entire event log.
+RETRIED_LOOKBACK = "7d"
 DEFAULT_LIMIT = 200
 DEFAULT_MAX = 50
 DEFAULT_COOLDOWN_SECONDS = 0.25
@@ -130,9 +138,13 @@ def main(argv: list[str]) -> int:
         since=args.since,
         limit=DEFAULT_LIMIT,
     )
+    # Use a wider window for the retried-events lookup so a successful
+    # retry that fell outside --since still suppresses re-delivery.
+    # Without this, re-running the command with the same --since after
+    # a successful retry happened earlier would re-fire that retry.
     retried = _events(
         "extmsg.peer_fanout_retried",
-        since=args.since,
+        since=RETRIED_LOOKBACK,
         limit=DEFAULT_LIMIT,
     )
     already_succeeded = _successful_retried_seqs(retried)

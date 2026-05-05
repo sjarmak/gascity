@@ -413,7 +413,7 @@ func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry, rigReg 
 				dispatchSlashCommandToSession(cfg, rec.TargetID, command, text, channelID, teamID, userID)
 			}()
 		case channelMappingTargetKindRig:
-			openRigFixModalForSlash(w, cfg, rigReg, teamID, rec.TargetID, command, text, channelID, userID, triggerID)
+			openRigFixModalForSlash(r.Context(), w, cfg, rigReg, teamID, rec.TargetID, command, text, channelID, userID, triggerID)
 		default:
 			// load() rejects unknown target_kind, so reaching this branch
 			// means the registry was mutated mid-flight by another
@@ -710,6 +710,29 @@ func writeViewClear(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write([]byte(`{"response_action":"clear"}`)); err != nil {
 		log.Printf("slack interactions: write view clear: %v", err)
+	}
+}
+
+// writeViewSubmissionErrors responds with response_action=errors so
+// Slack keeps the modal open and surfaces a per-block error message to
+// the user. Used when submission cannot proceed for a recoverable
+// reason (e.g. dispatch saturation) — the user sees the cause and can
+// retry without re-typing.
+func writeViewSubmissionErrors(w http.ResponseWriter, errors map[string]string) {
+	body := map[string]any{
+		"response_action": "errors",
+		"errors":          errors,
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		log.Printf("slack interactions: encode view errors: %v", err)
+		writeViewClear(w)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(b); err != nil {
+		log.Printf("slack interactions: write view errors: %v", err)
 	}
 }
 
