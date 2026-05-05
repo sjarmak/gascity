@@ -90,7 +90,7 @@ func openRegistryFile(path string) (*os.File, error) {
 		return nil, err
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("registry file %s is a symlink; refusing to open", path)
+		return nil, fmt.Errorf("registry file %q is a symlink; refusing to open", path)
 	}
 	return os.Open(path)
 }
@@ -139,10 +139,10 @@ func parseAppsRegistry(diskPath string) (*appsSnapshot, error) {
 		return nil, nil
 	}
 	f, err := openRegistryFile(diskPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("open apps registry %s: %w", diskPath, err)
 	}
 	defer f.Close()

@@ -8,10 +8,13 @@ import (
 	"strings"
 )
 
-// appsRegistryErrorPrefix is the name passed to stage() for the apps
-// registry — `errors.Join` wraps each registry's error with this prefix.
-// scrubAppsRegistryError matches on it to find the apps component.
-const appsRegistryErrorPrefix = "apps registry:"
+// appsRegistryStageLabel is the name passed to stage() for the apps
+// registry. stage() wraps each registry's error as "<label>: <inner>",
+// so the resulting message starts with appsRegistryErrorPrefix —
+// scrubAppsRegistryError matches on the prefix to find the apps
+// component. Keep label and prefix in sync via the constant binding.
+const appsRegistryStageLabel = "apps registry"
+const appsRegistryErrorPrefix = appsRegistryStageLabel + ":"
 
 // appsRegistryScrubSentinel replaces the apps-registry component of a
 // reload error chain before it is logged. apps_registry.go parse errors
@@ -104,7 +107,7 @@ func reloadAllRegistries(
 
 	if apps != nil {
 		snap, err := apps.Stage()
-		stage("apps registry", err, func() { apps.Commit(snap) })
+		stage(appsRegistryStageLabel, err, func() { apps.Commit(snap) })
 	}
 	if chans != nil {
 		snap, err := chans.Stage()
