@@ -1056,8 +1056,13 @@ func registerAdapter(cfg config) error {
 			MaxMessageLength:           40000, // Slack's chat.postMessage limit
 		},
 	})
-	url := fmt.Sprintf("%s/v0/city/%s/extmsg/adapters", cfg.gcAPIBase, cfg.cityName)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	// PathEscape cityName so URL-significant characters cannot alter
+	// routing on the gc API side (sec-S-06). cityName is operator-supplied
+	// via GC_CITY_NAME and gc-cby.29 rejects /?#% at startup, but the
+	// per-call escape keeps the wire format correct regardless and matches
+	// the dispatch paths that cby-set-c hardened. gc-cby.28.
+	target := fmt.Sprintf("%s/v0/city/%s/extmsg/adapters", cfg.gcAPIBase, url.PathEscape(cfg.cityName))
+	req, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -3025,8 +3030,9 @@ func postInbound(cfg config, msg externalInboundMessage) error {
 	body, _ := json.Marshal(map[string]any{
 		"message": msg,
 	})
-	url := fmt.Sprintf("%s/v0/city/%s/extmsg/inbound", cfg.gcAPIBase, cfg.cityName)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	// PathEscape cityName for the same reason as registerAdapter (gc-cby.28).
+	target := fmt.Sprintf("%s/v0/city/%s/extmsg/inbound", cfg.gcAPIBase, url.PathEscape(cfg.cityName))
+	req, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

@@ -873,6 +873,114 @@ func TestDispatchToAliasedSessionEscapesPathSegments(t *testing.T) {
 	}
 }
 
+// TestRegisterAdapterEscapesCityName verifies that registerAdapter
+// percent-encodes cityName before interpolating it into the
+// /v0/city/{city}/extmsg/adapters URL (gc-cby.28). Mirrors the
+// TestDispatchToAliasedSessionEscapesPathSegments pattern: capture both
+// the raw wire form (to confirm the escape lands on the wire) and the
+// decoded form (to confirm round-trip identity through net/http).
+func TestRegisterAdapterEscapesCityName(t *testing.T) {
+	rawPathCh := make(chan string, 1)
+	decodedPathCh := make(chan string, 1)
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case rawPathCh <- r.URL.EscapedPath():
+		default:
+		}
+		select {
+		case decodedPathCh <- r.URL.Path:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	cfg := config{
+		gcAPIBase: gcStub.URL,
+		cityName:  "city/with slash",
+		provider:  "slack",
+		accountID: "T0",
+	}
+	if err := registerAdapter(cfg); err != nil {
+		t.Fatalf("registerAdapter: %v", err)
+	}
+
+	var rawPath, decodedPath string
+	select {
+	case rawPath = <-rawPathCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("registerAdapter did not POST to gc stub within 2s")
+	}
+	select {
+	case decodedPath = <-decodedPathCh:
+	default:
+	}
+	wantRawCity := "city%2Fwith%20slash"
+	if !strings.Contains(rawPath, wantRawCity) {
+		t.Errorf("raw path %q missing escaped cityName %q", rawPath, wantRawCity)
+	}
+	if !strings.Contains(rawPath, "/extmsg/adapters") {
+		t.Errorf("raw path %q missing /extmsg/adapters suffix", rawPath)
+	}
+	wantDecoded := "/v0/city/city/with slash/extmsg/adapters"
+	if decodedPath != wantDecoded {
+		t.Errorf("decoded path = %q, want %q", decodedPath, wantDecoded)
+	}
+}
+
+// TestPostInboundEscapesCityName verifies that postInbound percent-encodes
+// cityName before interpolating it into the /v0/city/{city}/extmsg/inbound
+// URL (gc-cby.28).
+func TestPostInboundEscapesCityName(t *testing.T) {
+	rawPathCh := make(chan string, 1)
+	decodedPathCh := make(chan string, 1)
+	gcStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case rawPathCh <- r.URL.EscapedPath():
+		default:
+		}
+		select {
+		case decodedPathCh <- r.URL.Path:
+		default:
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(gcStub.Close)
+
+	cfg := config{gcAPIBase: gcStub.URL, cityName: "city/with slash"}
+	msg := externalInboundMessage{
+		ProviderMessageID: "1.0",
+		Conversation:      conversationRef{ConversationID: "C1"},
+		Actor:             externalActor{ID: "U1"},
+		Text:              "hello",
+	}
+	if err := postInbound(cfg, msg); err != nil {
+		t.Fatalf("postInbound: %v", err)
+	}
+
+	var rawPath, decodedPath string
+	select {
+	case rawPath = <-rawPathCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("postInbound did not POST to gc stub within 2s")
+	}
+	select {
+	case decodedPath = <-decodedPathCh:
+	default:
+	}
+	wantRawCity := "city%2Fwith%20slash"
+	if !strings.Contains(rawPath, wantRawCity) {
+		t.Errorf("raw path %q missing escaped cityName %q", rawPath, wantRawCity)
+	}
+	if !strings.Contains(rawPath, "/extmsg/inbound") {
+		t.Errorf("raw path %q missing /extmsg/inbound suffix", rawPath)
+	}
+	wantDecoded := "/v0/city/city/with slash/extmsg/inbound"
+	if decodedPath != wantDecoded {
+		t.Errorf("decoded path = %q, want %q", decodedPath, wantDecoded)
+	}
+}
+
 // TestDispatchToAliasedSessionNeutralizesSystemReminderInjection — extends the
 // cby.17 sanitization (slash / block-action / view-submission paths in
 // interactions.go) to the address-by-handle dispatch path. A Slack workspace
