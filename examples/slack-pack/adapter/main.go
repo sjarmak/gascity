@@ -352,6 +352,23 @@ type config struct {
 	// at startup. Nil-safe — when nil, lookupSigningSecrets falls
 	// through to slackSigningKey for single-app dev installs.
 	appsRegistry *appsRegistry
+	// oauthClientID, oauthClientSecret, oauthRedirectURI configure the
+	// OAuth install flow (gc-cby.9). When oauthClientID is empty the
+	// /slack/oauth/{start,callback} handlers are not registered and
+	// install relies on the manual web-UI flow documented in
+	// adapter/SETUP.md. When set, the adapter registers the two
+	// handlers on the public mux; an operator visits /slack/oauth/start
+	// to grant the app to a workspace, and the callback persists the
+	// resulting bot_token + workspace_id + app_id into the apps
+	// registry and writes <cityPath>/.gc/slack/install.env so the
+	// operator can re-source and restart the adapter.
+	oauthClientID     string
+	oauthClientSecret string
+	oauthRedirectURI  string
+	// oauthSlackBaseURL overrides the Slack base URL used by the OAuth
+	// flow (default https://slack.com). Tests inject an httptest.Server
+	// URL via this field; production deployments leave it empty.
+	oauthSlackBaseURL string
 	// cityPath is the on-disk root of the gc city this adapter is bound
 	// to. Sourced from GC_CITY_PATH; required for the rig-target
 	// dispatch path (cby.18.3) which must shell `bd create` inside the
@@ -419,6 +436,10 @@ func loadConfigFromEnv(getenv func(string) string) (config, error) {
 	cfg.channelMappingPath = envOrFn("SLACK_CHANNEL_MAPPING_PATH", defaultMappingPath)
 	cfg.rigMappingPath = envOrFn("SLACK_RIG_MAPPING_PATH", defaultRigMappingPath)
 	cfg.appsRegistryPath = envOrFn("SLACK_APPS_REGISTRY_PATH", defaultAppsRegistryPath)
+	cfg.oauthClientID = getenv("SLACK_CLIENT_ID")
+	cfg.oauthClientSecret = getenv("SLACK_CLIENT_SECRET")
+	cfg.oauthRedirectURI = getenv("SLACK_REDIRECT_URI")
+	cfg.oauthSlackBaseURL = getenv("SLACK_OAUTH_BASE_URL")
 	cfg.threadSessionsStorePath = envOrFn("GC_SLACK_THREAD_SESSIONS_FILE", defaultThreadSessionsPath)
 	cfg.roomLaunchPath = envOrFn("GC_SLACK_ROOM_LAUNCH_FILE", defaultRoomLaunchPath)
 
@@ -885,6 +906,7 @@ func main() {
 	publicMux := http.NewServeMux()
 	publicMux.HandleFunc("/slack/events", handleSlackEvents(cfg, aliasReg, threadReg, roomLaunchReg))
 	publicMux.HandleFunc("/slack/interactions", handleSlackInteractions(cfg, channelMapReg, rigMapReg))
+	registerOAuthHandlers(publicMux, cfg, appsReg)
 	publicMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
