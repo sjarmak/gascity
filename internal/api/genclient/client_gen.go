@@ -1035,6 +1035,37 @@ type ExtMsgParticipantUpsertInputBody struct {
 	SessionId string `json:"session_id"`
 }
 
+// ExtMsgPeerFanoutRetryInputBody defines model for ExtMsgPeerFanoutRetryInputBody.
+type ExtMsgPeerFanoutRetryInputBody struct {
+	// ActorDisplayName Original actor display name.
+	ActorDisplayName string `json:"actor_display_name"`
+
+	// ActorKind Original actor kind (agent or human). Defaults to 'agent'.
+	ActorKind    *string         `json:"actor_kind,omitempty"`
+	Conversation ConversationRef `json:"conversation"`
+
+	// OriginalSeq seq of the extmsg.peer_fanout_failed event being retried.
+	OriginalSeq int64 `json:"original_seq"`
+
+	// TargetSession Member session selector to re-notify.
+	TargetSession string `json:"target_session"`
+
+	// Text Original message text.
+	Text *string `json:"text,omitempty"`
+}
+
+// ExtMsgPeerFanoutRetryOutputBody defines model for ExtMsgPeerFanoutRetryOutputBody.
+type ExtMsgPeerFanoutRetryOutputBody struct {
+	// Error Failure reason when success is false.
+	Error *string `json:"error,omitempty"`
+
+	// OriginalSeq Echoes the input original_seq for client correlation.
+	OriginalSeq int64 `json:"original_seq"`
+
+	// Success Whether the re-issued notification was delivered.
+	Success bool `json:"success"`
+}
+
 // ExtMsgTranscriptAckInputBody defines model for ExtMsgTranscriptAckInputBody.
 type ExtMsgTranscriptAckInputBody struct {
 	Conversation *ConversationRef `json:"conversation,omitempty"`
@@ -1818,6 +1849,30 @@ type PatchOKResponseBody struct {
 
 	// Status Operation result.
 	Status string `json:"status"`
+}
+
+// PeerFanoutFailedEventPayload defines model for PeerFanoutFailedEventPayload.
+type PeerFanoutFailedEventPayload struct {
+	AccountId        string `json:"account_id"`
+	ActorDisplayName string `json:"actor_display_name"`
+	ActorKind        string `json:"actor_kind"`
+	ConversationId   string `json:"conversation_id"`
+	Kind             string `json:"kind"`
+	Provider         string `json:"provider"`
+	Reason           string `json:"reason"`
+	ScopeId          string `json:"scope_id"`
+	TargetSession    string `json:"target_session"`
+	Text             string `json:"text"`
+}
+
+// PeerFanoutRetriedEventPayload defines model for PeerFanoutRetriedEventPayload.
+type PeerFanoutRetriedEventPayload struct {
+	ConversationId string  `json:"conversation_id"`
+	Error          *string `json:"error,omitempty"`
+	OriginalSeq    int64   `json:"original_seq"`
+	Provider       string  `json:"provider"`
+	Success        bool    `json:"success"`
+	TargetSession  string  `json:"target_session"`
 }
 
 // PendingInteraction defines model for PendingInteraction.
@@ -2898,6 +2953,30 @@ type TypedEventStreamEnvelopeExtmsgOutbound struct {
 	Workflow *WorkflowEventProjection `json:"workflow,omitempty"`
 }
 
+// TypedEventStreamEnvelopeExtmsgPeerFanoutFailed defines model for TypedEventStreamEnvelopeExtmsgPeerFanoutFailed.
+type TypedEventStreamEnvelopeExtmsgPeerFanoutFailed struct {
+	Actor    string                       `json:"actor"`
+	Message  *string                      `json:"message,omitempty"`
+	Payload  PeerFanoutFailedEventPayload `json:"payload"`
+	Seq      int64                        `json:"seq"`
+	Subject  *string                      `json:"subject,omitempty"`
+	Ts       time.Time                    `json:"ts"`
+	Type     string                       `json:"type"`
+	Workflow *WorkflowEventProjection     `json:"workflow,omitempty"`
+}
+
+// TypedEventStreamEnvelopeExtmsgPeerFanoutRetried defines model for TypedEventStreamEnvelopeExtmsgPeerFanoutRetried.
+type TypedEventStreamEnvelopeExtmsgPeerFanoutRetried struct {
+	Actor    string                        `json:"actor"`
+	Message  *string                       `json:"message,omitempty"`
+	Payload  PeerFanoutRetriedEventPayload `json:"payload"`
+	Seq      int64                         `json:"seq"`
+	Subject  *string                       `json:"subject,omitempty"`
+	Ts       time.Time                     `json:"ts"`
+	Type     string                        `json:"type"`
+	Workflow *WorkflowEventProjection      `json:"workflow,omitempty"`
+}
+
 // TypedEventStreamEnvelopeExtmsgUnbound defines model for TypedEventStreamEnvelopeExtmsgUnbound.
 type TypedEventStreamEnvelopeExtmsgUnbound struct {
 	Actor    string                   `json:"actor"`
@@ -3471,6 +3550,32 @@ type TypedTaggedEventStreamEnvelopeExtmsgOutbound struct {
 	Ts       time.Time                `json:"ts"`
 	Type     string                   `json:"type"`
 	Workflow *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
+// TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed defines model for TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed.
+type TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed struct {
+	Actor    string                       `json:"actor"`
+	City     string                       `json:"city"`
+	Message  *string                      `json:"message,omitempty"`
+	Payload  PeerFanoutFailedEventPayload `json:"payload"`
+	Seq      int64                        `json:"seq"`
+	Subject  *string                      `json:"subject,omitempty"`
+	Ts       time.Time                    `json:"ts"`
+	Type     string                       `json:"type"`
+	Workflow *WorkflowEventProjection     `json:"workflow,omitempty"`
+}
+
+// TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried defines model for TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried.
+type TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried struct {
+	Actor    string                        `json:"actor"`
+	City     string                        `json:"city"`
+	Message  *string                       `json:"message,omitempty"`
+	Payload  PeerFanoutRetriedEventPayload `json:"payload"`
+	Seq      int64                         `json:"seq"`
+	Subject  *string                       `json:"subject,omitempty"`
+	Ts       time.Time                     `json:"ts"`
+	Type     string                        `json:"type"`
+	Workflow *WorkflowEventProjection      `json:"workflow,omitempty"`
 }
 
 // TypedTaggedEventStreamEnvelopeExtmsgUnbound defines model for TypedTaggedEventStreamEnvelopeExtmsgUnbound.
@@ -4305,6 +4410,12 @@ type PostV0CityByCityNameExtmsgParticipantsParams struct {
 	XGCRequest string `json:"X-GC-Request"`
 }
 
+// PostV0CityByCityNameExtmsgPeerFanoutRetryParams defines parameters for PostV0CityByCityNameExtmsgPeerFanoutRetry.
+type PostV0CityByCityNameExtmsgPeerFanoutRetryParams struct {
+	// XGCRequest Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+	XGCRequest string `json:"X-GC-Request"`
+}
+
 // GetV0CityByCityNameExtmsgTranscriptParams defines parameters for GetV0CityByCityNameExtmsgTranscript.
 type GetV0CityByCityNameExtmsgTranscriptParams struct {
 	// ScopeId Scope ID.
@@ -4941,6 +5052,9 @@ type DeleteV0CityByCityNameExtmsgParticipantsJSONRequestBody = ExtMsgParticipant
 // PostV0CityByCityNameExtmsgParticipantsJSONRequestBody defines body for PostV0CityByCityNameExtmsgParticipants for application/json ContentType.
 type PostV0CityByCityNameExtmsgParticipantsJSONRequestBody = ExtMsgParticipantUpsertInputBody
 
+// PostV0CityByCityNameExtmsgPeerFanoutRetryJSONRequestBody defines body for PostV0CityByCityNameExtmsgPeerFanoutRetry for application/json ContentType.
+type PostV0CityByCityNameExtmsgPeerFanoutRetryJSONRequestBody = ExtMsgPeerFanoutRetryInputBody
+
 // PostV0CityByCityNameExtmsgTranscriptAckJSONRequestBody defines body for PostV0CityByCityNameExtmsgTranscriptAck for application/json ContentType.
 type PostV0CityByCityNameExtmsgTranscriptAckJSONRequestBody = ExtMsgTranscriptAckInputBody
 
@@ -5274,6 +5388,58 @@ func (t *EventPayload) FromOutboundEventPayload(v OutboundEventPayload) error {
 
 // MergeOutboundEventPayload performs a merge with any union data inside the EventPayload, using the provided OutboundEventPayload
 func (t *EventPayload) MergeOutboundEventPayload(v OutboundEventPayload) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsPeerFanoutFailedEventPayload returns the union data inside the EventPayload as a PeerFanoutFailedEventPayload
+func (t EventPayload) AsPeerFanoutFailedEventPayload() (PeerFanoutFailedEventPayload, error) {
+	var body PeerFanoutFailedEventPayload
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromPeerFanoutFailedEventPayload overwrites any union data inside the EventPayload as the provided PeerFanoutFailedEventPayload
+func (t *EventPayload) FromPeerFanoutFailedEventPayload(v PeerFanoutFailedEventPayload) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergePeerFanoutFailedEventPayload performs a merge with any union data inside the EventPayload, using the provided PeerFanoutFailedEventPayload
+func (t *EventPayload) MergePeerFanoutFailedEventPayload(v PeerFanoutFailedEventPayload) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsPeerFanoutRetriedEventPayload returns the union data inside the EventPayload as a PeerFanoutRetriedEventPayload
+func (t EventPayload) AsPeerFanoutRetriedEventPayload() (PeerFanoutRetriedEventPayload, error) {
+	var body PeerFanoutRetriedEventPayload
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromPeerFanoutRetriedEventPayload overwrites any union data inside the EventPayload as the provided PeerFanoutRetriedEventPayload
+func (t *EventPayload) FromPeerFanoutRetriedEventPayload(v PeerFanoutRetriedEventPayload) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergePeerFanoutRetriedEventPayload performs a merge with any union data inside the EventPayload, using the provided PeerFanoutRetriedEventPayload
+func (t *EventPayload) MergePeerFanoutRetriedEventPayload(v PeerFanoutRetriedEventPayload) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -6030,6 +6196,62 @@ func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopeExtmsgOutbound(v 
 // MergeTypedEventStreamEnvelopeExtmsgOutbound performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopeExtmsgOutbound
 func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeExtmsgOutbound(v TypedEventStreamEnvelopeExtmsgOutbound) error {
 	v.Type = "extmsg.outbound"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsTypedEventStreamEnvelopeExtmsgPeerFanoutFailed returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeExtmsgPeerFanoutFailed
+func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeExtmsgPeerFanoutFailed() (TypedEventStreamEnvelopeExtmsgPeerFanoutFailed, error) {
+	var body TypedEventStreamEnvelopeExtmsgPeerFanoutFailed
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedEventStreamEnvelopeExtmsgPeerFanoutFailed overwrites any union data inside the TypedEventStreamEnvelope as the provided TypedEventStreamEnvelopeExtmsgPeerFanoutFailed
+func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopeExtmsgPeerFanoutFailed(v TypedEventStreamEnvelopeExtmsgPeerFanoutFailed) error {
+	v.Type = "extmsg.peer_fanout_failed"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedEventStreamEnvelopeExtmsgPeerFanoutFailed performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopeExtmsgPeerFanoutFailed
+func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeExtmsgPeerFanoutFailed(v TypedEventStreamEnvelopeExtmsgPeerFanoutFailed) error {
+	v.Type = "extmsg.peer_fanout_failed"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsTypedEventStreamEnvelopeExtmsgPeerFanoutRetried returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeExtmsgPeerFanoutRetried
+func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeExtmsgPeerFanoutRetried() (TypedEventStreamEnvelopeExtmsgPeerFanoutRetried, error) {
+	var body TypedEventStreamEnvelopeExtmsgPeerFanoutRetried
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedEventStreamEnvelopeExtmsgPeerFanoutRetried overwrites any union data inside the TypedEventStreamEnvelope as the provided TypedEventStreamEnvelopeExtmsgPeerFanoutRetried
+func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopeExtmsgPeerFanoutRetried(v TypedEventStreamEnvelopeExtmsgPeerFanoutRetried) error {
+	v.Type = "extmsg.peer_fanout_retried"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedEventStreamEnvelopeExtmsgPeerFanoutRetried performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopeExtmsgPeerFanoutRetried
+func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeExtmsgPeerFanoutRetried(v TypedEventStreamEnvelopeExtmsgPeerFanoutRetried) error {
+	v.Type = "extmsg.peer_fanout_retried"
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -6902,6 +7124,10 @@ func (t TypedEventStreamEnvelope) ValueByDiscriminator() (interface{}, error) {
 		return t.AsTypedEventStreamEnvelopeExtmsgInbound()
 	case "extmsg.outbound":
 		return t.AsTypedEventStreamEnvelopeExtmsgOutbound()
+	case "extmsg.peer_fanout_failed":
+		return t.AsTypedEventStreamEnvelopeExtmsgPeerFanoutFailed()
+	case "extmsg.peer_fanout_retried":
+		return t.AsTypedEventStreamEnvelopeExtmsgPeerFanoutRetried()
 	case "extmsg.unbound":
 		return t.AsTypedEventStreamEnvelopeExtmsgUnbound()
 	case "mail.archived":
@@ -7439,6 +7665,62 @@ func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopeExtms
 // MergeTypedTaggedEventStreamEnvelopeExtmsgOutbound performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopeExtmsgOutbound
 func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeExtmsgOutbound(v TypedTaggedEventStreamEnvelopeExtmsgOutbound) error {
 	v.Type = "extmsg.outbound"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsTypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed
+func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed() (TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed, error) {
+	var body TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed overwrites any union data inside the TypedTaggedEventStreamEnvelope as the provided TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed
+func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed(v TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed) error {
+	v.Type = "extmsg.peer_fanout_failed"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed
+func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed(v TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed) error {
+	v.Type = "extmsg.peer_fanout_failed"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsTypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried
+func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried() (TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried, error) {
+	var body TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried overwrites any union data inside the TypedTaggedEventStreamEnvelope as the provided TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried
+func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried(v TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried) error {
+	v.Type = "extmsg.peer_fanout_retried"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried
+func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried(v TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried) error {
+	v.Type = "extmsg.peer_fanout_retried"
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -8311,6 +8593,10 @@ func (t TypedTaggedEventStreamEnvelope) ValueByDiscriminator() (interface{}, err
 		return t.AsTypedTaggedEventStreamEnvelopeExtmsgInbound()
 	case "extmsg.outbound":
 		return t.AsTypedTaggedEventStreamEnvelopeExtmsgOutbound()
+	case "extmsg.peer_fanout_failed":
+		return t.AsTypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed()
+	case "extmsg.peer_fanout_retried":
+		return t.AsTypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried()
 	case "extmsg.unbound":
 		return t.AsTypedTaggedEventStreamEnvelopeExtmsgUnbound()
 	case "mail.archived":
@@ -8669,6 +8955,11 @@ type ClientInterface interface {
 	PostV0CityByCityNameExtmsgParticipantsWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgParticipantsParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	PostV0CityByCityNameExtmsgParticipants(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgParticipantsParams, body PostV0CityByCityNameExtmsgParticipantsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// PostV0CityByCityNameExtmsgPeerFanoutRetryWithBody request with any body
+	PostV0CityByCityNameExtmsgPeerFanoutRetryWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgPeerFanoutRetryParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	PostV0CityByCityNameExtmsgPeerFanoutRetry(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgPeerFanoutRetryParams, body PostV0CityByCityNameExtmsgPeerFanoutRetryJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GetV0CityByCityNameExtmsgTranscript request
 	GetV0CityByCityNameExtmsgTranscript(ctx context.Context, cityName string, params *GetV0CityByCityNameExtmsgTranscriptParams, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -9908,6 +10199,30 @@ func (c *Client) PostV0CityByCityNameExtmsgParticipantsWithBody(ctx context.Cont
 
 func (c *Client) PostV0CityByCityNameExtmsgParticipants(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgParticipantsParams, body PostV0CityByCityNameExtmsgParticipantsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewPostV0CityByCityNameExtmsgParticipantsRequest(c.Server, cityName, params, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PostV0CityByCityNameExtmsgPeerFanoutRetryWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgPeerFanoutRetryParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV0CityByCityNameExtmsgPeerFanoutRetryRequestWithBody(c.Server, cityName, params, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PostV0CityByCityNameExtmsgPeerFanoutRetry(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgPeerFanoutRetryParams, body PostV0CityByCityNameExtmsgPeerFanoutRetryJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV0CityByCityNameExtmsgPeerFanoutRetryRequest(c.Server, cityName, params, body)
 	if err != nil {
 		return nil, err
 	}
@@ -14719,6 +15034,66 @@ func NewPostV0CityByCityNameExtmsgParticipantsRequestWithBody(server string, cit
 	}
 
 	operationPath := fmt.Sprintf("/v0/city/%s/extmsg/participants", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	if params != nil {
+
+		var headerParam0 string
+
+		headerParam0, err = runtime.StyleParamWithOptions("simple", false, "X-GC-Request", params.XGCRequest, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("X-GC-Request", headerParam0)
+
+	}
+
+	return req, nil
+}
+
+// NewPostV0CityByCityNameExtmsgPeerFanoutRetryRequest calls the generic PostV0CityByCityNameExtmsgPeerFanoutRetry builder with application/json body
+func NewPostV0CityByCityNameExtmsgPeerFanoutRetryRequest(server string, cityName string, params *PostV0CityByCityNameExtmsgPeerFanoutRetryParams, body PostV0CityByCityNameExtmsgPeerFanoutRetryJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewPostV0CityByCityNameExtmsgPeerFanoutRetryRequestWithBody(server, cityName, params, "application/json", bodyReader)
+}
+
+// NewPostV0CityByCityNameExtmsgPeerFanoutRetryRequestWithBody generates requests for PostV0CityByCityNameExtmsgPeerFanoutRetry with any type of body
+func NewPostV0CityByCityNameExtmsgPeerFanoutRetryRequestWithBody(server string, cityName string, params *PostV0CityByCityNameExtmsgPeerFanoutRetryParams, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cityName", cityName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v0/city/%s/extmsg/peer-fanout/retry", pathParam0)
 	if operationPath[0] == '/' {
 		operationPath = "." + operationPath
 	}
@@ -20588,6 +20963,11 @@ type ClientWithResponsesInterface interface {
 
 	PostV0CityByCityNameExtmsgParticipantsWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgParticipantsParams, body PostV0CityByCityNameExtmsgParticipantsJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameExtmsgParticipantsResponse, error)
 
+	// PostV0CityByCityNameExtmsgPeerFanoutRetryWithBodyWithResponse request with any body
+	PostV0CityByCityNameExtmsgPeerFanoutRetryWithBodyWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgPeerFanoutRetryParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameExtmsgPeerFanoutRetryResponse, error)
+
+	PostV0CityByCityNameExtmsgPeerFanoutRetryWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgPeerFanoutRetryParams, body PostV0CityByCityNameExtmsgPeerFanoutRetryJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameExtmsgPeerFanoutRetryResponse, error)
+
 	// GetV0CityByCityNameExtmsgTranscriptWithResponse request
 	GetV0CityByCityNameExtmsgTranscriptWithResponse(ctx context.Context, cityName string, params *GetV0CityByCityNameExtmsgTranscriptParams, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameExtmsgTranscriptResponse, error)
 
@@ -22190,6 +22570,29 @@ func (r PostV0CityByCityNameExtmsgParticipantsResponse) Status() string {
 
 // StatusCode returns HTTPResponse.StatusCode
 func (r PostV0CityByCityNameExtmsgParticipantsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type PostV0CityByCityNameExtmsgPeerFanoutRetryResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	JSON200                       *ExtMsgPeerFanoutRetryOutputBody
+	ApplicationproblemJSONDefault *ErrorModel
+}
+
+// Status returns HTTPResponse.Status
+func (r PostV0CityByCityNameExtmsgPeerFanoutRetryResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PostV0CityByCityNameExtmsgPeerFanoutRetryResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -24882,6 +25285,23 @@ func (c *ClientWithResponses) PostV0CityByCityNameExtmsgParticipantsWithResponse
 		return nil, err
 	}
 	return ParsePostV0CityByCityNameExtmsgParticipantsResponse(rsp)
+}
+
+// PostV0CityByCityNameExtmsgPeerFanoutRetryWithBodyWithResponse request with arbitrary body returning *PostV0CityByCityNameExtmsgPeerFanoutRetryResponse
+func (c *ClientWithResponses) PostV0CityByCityNameExtmsgPeerFanoutRetryWithBodyWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgPeerFanoutRetryParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameExtmsgPeerFanoutRetryResponse, error) {
+	rsp, err := c.PostV0CityByCityNameExtmsgPeerFanoutRetryWithBody(ctx, cityName, params, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV0CityByCityNameExtmsgPeerFanoutRetryResponse(rsp)
+}
+
+func (c *ClientWithResponses) PostV0CityByCityNameExtmsgPeerFanoutRetryWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameExtmsgPeerFanoutRetryParams, body PostV0CityByCityNameExtmsgPeerFanoutRetryJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameExtmsgPeerFanoutRetryResponse, error) {
+	rsp, err := c.PostV0CityByCityNameExtmsgPeerFanoutRetry(ctx, cityName, params, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV0CityByCityNameExtmsgPeerFanoutRetryResponse(rsp)
 }
 
 // GetV0CityByCityNameExtmsgTranscriptWithResponse request returning *GetV0CityByCityNameExtmsgTranscriptResponse
@@ -27662,6 +28082,39 @@ func ParsePostV0CityByCityNameExtmsgParticipantsResponse(rsp *http.Response) (*P
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
 		var dest ConversationGroupParticipant
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParsePostV0CityByCityNameExtmsgPeerFanoutRetryResponse parses an HTTP response from a PostV0CityByCityNameExtmsgPeerFanoutRetryWithResponse call
+func ParsePostV0CityByCityNameExtmsgPeerFanoutRetryResponse(rsp *http.Response) (*PostV0CityByCityNameExtmsgPeerFanoutRetryResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PostV0CityByCityNameExtmsgPeerFanoutRetryResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest ExtMsgPeerFanoutRetryOutputBody
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}

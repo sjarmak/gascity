@@ -73,6 +73,43 @@ type AdapterEventPayload struct {
 // IsEventPayload marks AdapterEventPayload as an events.Payload variant.
 func (AdapterEventPayload) IsEventPayload() {}
 
+// PeerFanoutFailedEventPayload is emitted on events.ExtMsgPeerFanoutFailed
+// when the per-member peer notification issued by extmsgNotifyMembers
+// cannot be delivered (resolution failure, session-message failure,
+// rate-limit). Carries enough context for an out-of-band retry tool to
+// re-issue the notification verbatim.
+type PeerFanoutFailedEventPayload struct {
+	Provider         string `json:"provider"`
+	ScopeID          string `json:"scope_id"`
+	AccountID        string `json:"account_id"`
+	ConversationID   string `json:"conversation_id"`
+	Kind             string `json:"kind"`
+	TargetSession    string `json:"target_session"`
+	ActorDisplayName string `json:"actor_display_name"`
+	ActorKind        string `json:"actor_kind"`
+	Text             string `json:"text"`
+	Reason           string `json:"reason"`
+}
+
+// IsEventPayload marks PeerFanoutFailedEventPayload as an events.Payload variant.
+func (PeerFanoutFailedEventPayload) IsEventPayload() {}
+
+// PeerFanoutRetriedEventPayload is emitted on events.ExtMsgPeerFanoutRetried
+// per retry attempt issued by `gc <provider> retry-peer-fanout`. OriginalSeq
+// is the seq number of the corresponding ExtMsgPeerFanoutFailed event so
+// the retry tool can dedupe successful attempts on a subsequent run.
+type PeerFanoutRetriedEventPayload struct {
+	Provider       string `json:"provider"`
+	ConversationID string `json:"conversation_id"`
+	TargetSession  string `json:"target_session"`
+	OriginalSeq    uint64 `json:"original_seq"`
+	Success        bool   `json:"success"`
+	Error          string `json:"error,omitempty"`
+}
+
+// IsEventPayload marks PeerFanoutRetriedEventPayload as an events.Payload variant.
+func (PeerFanoutRetriedEventPayload) IsEventPayload() {}
+
 func init() {
 	events.RegisterPayload(events.ExtMsgBound, BoundEventPayload{})
 	events.RegisterPayload(events.ExtMsgUnbound, UnboundEventPayload{})
@@ -81,4 +118,6 @@ func init() {
 	events.RegisterPayload(events.ExtMsgAdapterRemoved, AdapterEventPayload{})
 	events.RegisterPayload(events.ExtMsgInbound, InboundEventPayload{})
 	events.RegisterPayload(events.ExtMsgOutbound, OutboundEventPayload{})
+	events.RegisterPayload(events.ExtMsgPeerFanoutFailed, PeerFanoutFailedEventPayload{})
+	events.RegisterPayload(events.ExtMsgPeerFanoutRetried, PeerFanoutRetriedEventPayload{})
 }

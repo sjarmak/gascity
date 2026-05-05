@@ -228,3 +228,35 @@ type ExtMsgAdapterUnregisterInput struct {
 		AccountID string `json:"account_id" minLength:"1" doc:"Account ID."`
 	}
 }
+
+// ExtMsgPeerFanoutRetryInput is the Huma input for
+// POST /v0/city/{cityName}/extmsg/peer-fanout/retry.
+//
+// The retry tool reads “extmsg.peer_fanout_failed“ events, fills in
+// the conversation + recipient + nudge text from the failed-event
+// payload, and POSTs each candidate here. The handler re-issues the
+// same per-member nudge produced by extmsgNotifyMembers and emits an
+// “extmsg.peer_fanout_retried“ audit event with the original_seq so
+// subsequent runs can dedupe.
+type ExtMsgPeerFanoutRetryInput struct {
+	CityScope
+	Body struct {
+		OriginalSeq      uint64                 `json:"original_seq" minimum:"1" doc:"seq of the extmsg.peer_fanout_failed event being retried."`
+		TargetSession    string                 `json:"target_session" minLength:"1" doc:"Member session selector to re-notify."`
+		ActorDisplayName string                 `json:"actor_display_name" doc:"Original actor display name."`
+		ActorKind        string                 `json:"actor_kind,omitempty" doc:"Original actor kind (agent or human). Defaults to 'agent'."`
+		Text             string                 `json:"text,omitempty" doc:"Original message text."`
+		Conversation     extmsg.ConversationRef `json:"conversation" doc:"Conversation the original publish targeted."`
+	}
+}
+
+// ExtMsgPeerFanoutRetryOutput is the Huma output for the retry endpoint.
+// Mirrors the audit event payload so callers can render the same shape
+// they would see on the events stream.
+type ExtMsgPeerFanoutRetryOutput struct {
+	Body struct {
+		Success     bool   `json:"success" doc:"Whether the re-issued notification was delivered."`
+		Error       string `json:"error,omitempty" doc:"Failure reason when success is false."`
+		OriginalSeq uint64 `json:"original_seq" doc:"Echoes the input original_seq for client correlation."`
+	}
+}

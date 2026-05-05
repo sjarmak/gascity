@@ -18,10 +18,15 @@
 #                                (no event-scan fallback; fails fast when
 #                                the session has no active binding)
 #
+# Currently implemented (continued):
+#   gc slack retry-peer-fanout — re-issue failed peer-fanout deliveries by
+#                                walking extmsg.peer_fanout_failed events;
+#                                idempotent against extmsg.peer_fanout_retried
+#                                history.
+#
 # Not yet implemented (see README.md "Port checklist"):
 #   gc slack enable-room-launch  (launcher mode, @@handle spawning)
 #   gc slack post-message      — workflow status projection
-#   gc slack retry-peer-fanout
 #
 # The intake side (public-facing Slack webhook receiver) and the
 # /publish endpoint that gc reaches via the extmsg HTTP adapter are

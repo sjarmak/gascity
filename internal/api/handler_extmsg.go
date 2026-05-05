@@ -116,6 +116,25 @@ func (s *Server) extmsgNotifyMembers(
 		}
 	}
 
+	emitFailed := func(sessionSelector, reason string) {
+		s.extmsgEmitEvent()(
+			events.ExtMsgPeerFanoutFailed,
+			fmt.Sprintf("%s/%s", conv.Provider, conv.ConversationID),
+			extmsg.PeerFanoutFailedEventPayload{
+				Provider:         conv.Provider,
+				ScopeID:          conv.ScopeID,
+				AccountID:        conv.AccountID,
+				ConversationID:   conv.ConversationID,
+				Kind:             string(conv.Kind),
+				TargetSession:    sessionSelector,
+				ActorDisplayName: actorDisplayName,
+				ActorKind:        actorKind,
+				Text:             text,
+				Reason:           reason,
+			},
+		)
+	}
+
 	notifyResolved := func(sessionSelector, resolvedID string) {
 		// The nudge announces the inbound message and lets the
 		// recipient's prompt template decide what to do with it.
@@ -125,14 +144,10 @@ func (s *Server) extmsgNotifyMembers(
 		// that no longer exist) make agents stall trying to follow
 		// them. Pack authors put any reply guidance in their own
 		// prompt templates.
-		nudge := fmt.Sprintf("<system-reminder>\nNew message in shared conversation %s/%s:\n\n"+
-			"- %s (%s): %s\n"+
-			"</system-reminder>",
-			conv.Provider, conv.ConversationID,
-			actorDisplayName, actorKind, text,
-		)
+		nudge := extmsgPeerFanoutNudge(conv, actorDisplayName, actorKind, text)
 		if err := s.sendBackgroundMessageToSession(ctx, store, resolvedID, nudge); err != nil {
 			log.Printf("extmsg: notify %s failed: %v", sessionSelector, err)
+			emitFailed(sessionSelector, fmt.Sprintf("send: %v", err))
 		}
 	}
 
@@ -155,6 +170,7 @@ func (s *Server) extmsgNotifyMembers(
 			resolvedID, err := s.resolveSessionIDMaterializingNamedWithContext(ctx, store, sessionSelector)
 			if err != nil {
 				log.Printf("extmsg: resolve session %s failed: %v", sessionSelector, err)
+				emitFailed(sessionSelector, fmt.Sprintf("resolve: %v", err))
 				return
 			}
 			if preErr != nil {
@@ -167,6 +183,18 @@ func (s *Server) extmsgNotifyMembers(
 		}(m.SessionID)
 	}
 	wg.Wait()
+}
+
+// extmsgPeerFanoutNudge formats the system-reminder body delivered to peer
+// members of a shared conversation. Extracted so the retry handler can
+// re-issue the identical nudge without duplicating the format string.
+func extmsgPeerFanoutNudge(conv extmsg.ConversationRef, actorDisplayName, actorKind, text string) string {
+	return fmt.Sprintf("<system-reminder>\nNew message in shared conversation %s/%s:\n\n"+
+		"- %s (%s): %s\n"+
+		"</system-reminder>",
+		conv.Provider, conv.ConversationID,
+		actorDisplayName, actorKind, text,
+	)
 }
 
 func (s *Server) extmsgNotifyInboundMembers(ctx context.Context, msg extmsg.ExternalInboundMessage) {

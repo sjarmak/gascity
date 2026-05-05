@@ -69,6 +69,11 @@ const (
 	ExtMsgAdapterRemoved = "extmsg.adapter_removed"
 	ExtMsgInbound        = "extmsg.inbound"
 	ExtMsgOutbound       = "extmsg.outbound"
+	// Peer-fanout audit trail. Emitted when extmsgNotifyMembers fails to
+	// deliver a peer notification (PeerFanoutFailed) and on each retry
+	// attempt issued by `gc <provider> retry-peer-fanout` (PeerFanoutRetried).
+	ExtMsgPeerFanoutFailed  = "extmsg.peer_fanout_failed"
+	ExtMsgPeerFanoutRetried = "extmsg.peer_fanout_retried"
 )
 
 // KnownEventTypes lists every event-type constant this package defines.
@@ -94,6 +99,7 @@ var KnownEventTypes = []string{
 	ExtMsgBound, ExtMsgUnbound, ExtMsgGroupCreated,
 	ExtMsgAdapterAdded, ExtMsgAdapterRemoved,
 	ExtMsgInbound, ExtMsgOutbound,
+	ExtMsgPeerFanoutFailed, ExtMsgPeerFanoutRetried,
 }
 
 // Event is a single recorded occurrence in the system.

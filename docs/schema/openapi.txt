@@ -2007,6 +2007,12 @@
             "$ref": "#/components/schemas/OutboundEventPayload"
           },
           {
+            "$ref": "#/components/schemas/PeerFanoutFailedEventPayload"
+          },
+          {
+            "$ref": "#/components/schemas/PeerFanoutRetriedEventPayload"
+          },
+          {
             "$ref": "#/components/schemas/RequestFailedPayload"
           },
           {
@@ -2356,6 +2362,69 @@
           "group_id",
           "handle",
           "session_id"
+        ],
+        "type": "object"
+      },
+      "ExtMsgPeerFanoutRetryInputBody": {
+        "additionalProperties": false,
+        "properties": {
+          "actor_display_name": {
+            "description": "Original actor display name.",
+            "type": "string"
+          },
+          "actor_kind": {
+            "description": "Original actor kind (agent or human). Defaults to 'agent'.",
+            "type": "string"
+          },
+          "conversation": {
+            "$ref": "#/components/schemas/ConversationRef",
+            "description": "Conversation the original publish targeted."
+          },
+          "original_seq": {
+            "description": "seq of the extmsg.peer_fanout_failed event being retried.",
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "target_session": {
+            "description": "Member session selector to re-notify.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "text": {
+            "description": "Original message text.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "original_seq",
+          "target_session",
+          "actor_display_name",
+          "conversation"
+        ],
+        "type": "object"
+      },
+      "ExtMsgPeerFanoutRetryOutputBody": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "description": "Failure reason when success is false.",
+            "type": "string"
+          },
+          "original_seq": {
+            "description": "Echoes the input original_seq for client correlation.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "success": {
+            "description": "Whether the re-issued notification was delivered.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "original_seq"
         ],
         "type": "object"
       },
@@ -4510,6 +4579,87 @@
         },
         "required": [
           "status"
+        ],
+        "type": "object"
+      },
+      "PeerFanoutFailedEventPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "actor_display_name": {
+            "type": "string"
+          },
+          "actor_kind": {
+            "type": "string"
+          },
+          "conversation_id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "scope_id": {
+            "type": "string"
+          },
+          "target_session": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "scope_id",
+          "account_id",
+          "conversation_id",
+          "kind",
+          "target_session",
+          "actor_display_name",
+          "actor_kind",
+          "text",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "PeerFanoutRetriedEventPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "conversation_id": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "original_seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "target_session": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "conversation_id",
+          "target_session",
+          "original_seq",
+          "success"
         ],
         "type": "object"
       },
@@ -6776,6 +6926,8 @@
             "extmsg.group_created": "#/components/schemas/TypedEventStreamEnvelopeExtmsgGroupCreated",
             "extmsg.inbound": "#/components/schemas/TypedEventStreamEnvelopeExtmsgInbound",
             "extmsg.outbound": "#/components/schemas/TypedEventStreamEnvelopeExtmsgOutbound",
+            "extmsg.peer_fanout_failed": "#/components/schemas/TypedEventStreamEnvelopeExtmsgPeerFanoutFailed",
+            "extmsg.peer_fanout_retried": "#/components/schemas/TypedEventStreamEnvelopeExtmsgPeerFanoutRetried",
             "extmsg.unbound": "#/components/schemas/TypedEventStreamEnvelopeExtmsgUnbound",
             "mail.archived": "#/components/schemas/TypedEventStreamEnvelopeMailArchived",
             "mail.deleted": "#/components/schemas/TypedEventStreamEnvelopeMailDeleted",
@@ -6858,6 +7010,12 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeExtmsgOutbound"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeExtmsgPeerFanoutFailed"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeExtmsgPeerFanoutRetried"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeExtmsgUnbound"
@@ -7480,7 +7638,9 @@
                 "extmsg.adapter_added",
                 "extmsg.adapter_removed",
                 "extmsg.inbound",
-                "extmsg.outbound"
+                "extmsg.outbound",
+                "extmsg.peer_fanout_failed",
+                "extmsg.peer_fanout_retried"
               ]
             },
             "type": "string"
@@ -7749,6 +7909,90 @@
           "payload"
         ],
         "title": "TypedEventStreamEnvelope extmsg.outbound",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopeExtmsgPeerFanoutFailed": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/PeerFanoutFailedEventPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "extmsg.peer_fanout_failed",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope extmsg.peer_fanout_failed",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopeExtmsgPeerFanoutRetried": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/PeerFanoutRetriedEventPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "extmsg.peer_fanout_retried",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope extmsg.peer_fanout_retried",
         "type": "object"
       },
       "TypedEventStreamEnvelopeExtmsgUnbound": {
@@ -8948,6 +9192,8 @@
             "extmsg.group_created": "#/components/schemas/TypedTaggedEventStreamEnvelopeExtmsgGroupCreated",
             "extmsg.inbound": "#/components/schemas/TypedTaggedEventStreamEnvelopeExtmsgInbound",
             "extmsg.outbound": "#/components/schemas/TypedTaggedEventStreamEnvelopeExtmsgOutbound",
+            "extmsg.peer_fanout_failed": "#/components/schemas/TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed",
+            "extmsg.peer_fanout_retried": "#/components/schemas/TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried",
             "extmsg.unbound": "#/components/schemas/TypedTaggedEventStreamEnvelopeExtmsgUnbound",
             "mail.archived": "#/components/schemas/TypedTaggedEventStreamEnvelopeMailArchived",
             "mail.deleted": "#/components/schemas/TypedTaggedEventStreamEnvelopeMailDeleted",
@@ -9030,6 +9276,12 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeExtmsgOutbound"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeExtmsgUnbound"
@@ -9699,7 +9951,9 @@
                 "extmsg.adapter_added",
                 "extmsg.adapter_removed",
                 "extmsg.inbound",
-                "extmsg.outbound"
+                "extmsg.outbound",
+                "extmsg.peer_fanout_failed",
+                "extmsg.peer_fanout_retried"
               ]
             },
             "type": "string"
@@ -9993,6 +10247,98 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope extmsg.outbound",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutFailed": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/PeerFanoutFailedEventPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "extmsg.peer_fanout_failed",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope extmsg.peer_fanout_failed",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeExtmsgPeerFanoutRetried": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/PeerFanoutRetriedEventPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "extmsg.peer_fanout_retried",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope extmsg.peer_fanout_retried",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeExtmsgUnbound": {
@@ -16285,6 +16631,79 @@
           }
         },
         "summary": "Post v0 city by city name extmsg participants"
+      }
+    },
+    "/v0/city/{cityName}/extmsg/peer-fanout/retry": {
+      "post": {
+        "operationId": "post-v0-city-by-city-name-extmsg-peer-fanout-retry",
+        "parameters": [
+          {
+            "description": "Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.",
+            "in": "header",
+            "name": "X-GC-Request",
+            "required": true,
+            "schema": {
+              "description": "Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "City name.",
+            "in": "path",
+            "name": "cityName",
+            "required": true,
+            "schema": {
+              "description": "City name.",
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtMsgPeerFanoutRetryInputBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtMsgPeerFanoutRetryOutputBody"
+                }
+              }
+            },
+            "description": "OK",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Error",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          }
+        },
+        "summary": "Post v0 city by city name extmsg peer fanout retry"
       }
     },
     "/v0/city/{cityName}/extmsg/transcript": {

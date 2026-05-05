@@ -80,7 +80,10 @@ Not yet implemented (planned):
       removal paths are idempotent.
 - [ ] `gc slack enable-room-launch` (`@@handle` thread-scoped sessions)
 - [ ] `gc slack post-message` (workflow status projection)
-- [ ] `gc slack retry-peer-fanout`
+- [x] `gc slack retry-peer-fanout` (walks `extmsg.peer_fanout_failed`
+      events, dedupes against successful `extmsg.peer_fanout_retried`
+      events, re-issues each notification via the gc retry endpoint with
+      a small cooldown between attempts)
 
 The adapter exposes `POST /slack/interactions` (HMAC-verified) for
 slash-command, `block_actions`, and `view_submission` dispatch.

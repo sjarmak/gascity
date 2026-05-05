@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `gc slack retry-peer-fanout` — operational recovery for peer-fanout.
+  Walks recent `extmsg.peer_fanout_failed` events (added in this change
+  too), filters by `--since` / `--conversation` / `--max`, deduplicates
+  against successful `extmsg.peer_fanout_retried` events, and re-issues
+  each notification via the new
+  `POST /v0/city/<cityName>/extmsg/peer-fanout/retry` endpoint with a
+  small cooldown between attempts. The endpoint emits an
+  `extmsg.peer_fanout_retried` audit event per attempt with the
+  `original_seq`, so re-running on the same set is a no-op
+  (`gc-cby.7`).
 - SIGHUP-driven reload for the four CLI-written registry files
   (`apps.json`, `channel_mappings.json`, `rig_mappings.json`,
   `room_launch_mappings.json`). Operators can now run

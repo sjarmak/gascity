@@ -349,4 +349,5 @@ func (sm *SupervisorMux) registerCityRoutes() {
 		DefaultStatus: http.StatusCreated,
 	}, (*Server).humaHandleExtMsgAdapterRegister)
 	cityDelete(sm, "/extmsg/adapters", (*Server).humaHandleExtMsgAdapterUnregister)
+	cityPost(sm, "/extmsg/peer-fanout/retry", (*Server).humaHandleExtMsgPeerFanoutRetry)
 }

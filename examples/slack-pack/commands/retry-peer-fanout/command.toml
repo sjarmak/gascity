@@ -1,0 +1,2 @@
+description = "Retry failed Slack peer-fanout deliveries"
+run = "../retry-peer-fanout.sh"
