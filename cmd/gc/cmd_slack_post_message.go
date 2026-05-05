@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,15 @@ import (
 
 	"github.com/spf13/cobra"
 )
+
+// slackErrorBodyMaxLen caps the response-body excerpt embedded in
+// decode-error messages from postSlackChat. Slack response bodies are
+// typically small JSON, but a misconfigured --api-base can land us at
+// an HTML proxy or a large CDN error page; bounding the echo keeps
+// errors readable in operator logs without truncating the underlying
+// error wrapping. 1 KiB is generous for a Slack JSON envelope and
+// short enough to fit in a single log line.
+const slackErrorBodyMaxLen = 1024
 
 // slackChatAPIDefaultBase is the production Slack web API origin. Tests
 // override via the --api-base flag (or SLACK_API_BASE env) to point at
@@ -104,8 +114,8 @@ post in place (Slack chat.update). Without --update we call
 chat.postMessage and print the new ts to stdout so callers can
 capture it for the next refresh.`,
 		Args: cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return runSlackPostMessage(opts)
+		RunE: func(c *cobra.Command, _ []string) error {
+			return runSlackPostMessage(c.Context(), opts)
 		},
 	}
 	cmd.Flags().StringVar(&opts.Channel, "channel", "",
@@ -119,7 +129,9 @@ capture it for the next refresh.`,
 	cmd.Flags().StringVar(&opts.BotToken, "token", "",
 		"Slack bot token (xoxb-...); defaults to $"+slackBotTokenEnv)
 	cmd.Flags().StringVar(&opts.APIBase, "api-base", "",
-		"Slack web API base URL (defaults to $"+slackAPIBaseEnv+" or "+slackChatAPIDefaultBase+")")
+		"Slack web API base URL (defaults to $"+slackAPIBaseEnv+" or "+slackChatAPIDefaultBase+"). "+
+			"Trusted operator-only flag — do not source from untrusted user input; the verb posts the "+
+			"bot token to whatever host this URL resolves to.")
 	_ = cmd.MarkFlagRequired("channel")
 	_ = cmd.MarkFlagRequired("kind")
 	_ = cmd.MarkFlagRequired("payload")
@@ -130,7 +142,14 @@ capture it for the next refresh.`,
 // and calls Slack's chat.postMessage (or chat.update when UpdateTS is
 // set). Returns a slackHTTPError on transport failures and a regular
 // error on API-level (ok=false) failures.
-func runSlackPostMessage(opts slackPostMessageOpts) error {
+//
+// ctx is plumbed through to the HTTP request so SIGINT (cmd.Context())
+// cancels an in-flight call instead of blocking on the 15s client
+// timeout.
+func runSlackPostMessage(ctx context.Context, opts slackPostMessageOpts) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if strings.TrimSpace(opts.Channel) == "" {
 		return fmt.Errorf("--channel is required")
 	}
@@ -180,7 +199,7 @@ func runSlackPostMessage(opts slackPostMessageOpts) error {
 		endpoint = apiRoot + "/chat.update"
 	}
 
-	resp, err := postSlackChat(endpoint, token, body)
+	resp, err := postSlackChat(ctx, endpoint, token, body)
 	if err != nil {
 		return err
 	}
@@ -213,13 +232,15 @@ func fallbackText(p slackStatusPayload) string {
 
 // postSlackChat issues the HTTP POST to Slack and returns the parsed
 // response. Non-2xx returns a slackHTTPError; decode failures wrap the
-// underlying decoder error with the response body for diagnostics.
-func postSlackChat(endpoint, token string, body slackChatPostBody) (*slackChatPostResponse, error) {
+// underlying decoder error with a bounded response-body excerpt for
+// diagnostics. ctx propagates SIGINT/operator cancellation into the
+// in-flight HTTP call.
+func postSlackChat(ctx context.Context, endpoint, token string, body slackChatPostBody) (*slackChatPostResponse, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal body: %w", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
 	if err != nil {
 		return nil, fmt.Errorf("build slack request: %w", err)
 	}
@@ -240,7 +261,8 @@ func postSlackChat(endpoint, token string, body slackChatPostBody) (*slackChatPo
 	}
 	var out slackChatPostResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
-		return nil, fmt.Errorf("decode slack response: %w (body=%s)", err, string(respBody))
+		return nil, fmt.Errorf("decode slack response: %w (body=%s)",
+			err, truncate(string(respBody), slackErrorBodyMaxLen))
 	}
 	return &out, nil
 }

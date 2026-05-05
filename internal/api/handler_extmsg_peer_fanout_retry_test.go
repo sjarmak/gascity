@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/extmsg"
@@ -53,22 +52,25 @@ func newPeerFanoutRetryBody(t *testing.T, sess string) ([]byte, extmsg.Conversat
 	return body, conv
 }
 
-func waitForRetriedEvent(t *testing.T, prov events.Provider) extmsg.PeerFanoutRetriedEventPayload {
+// readRetriedEvent fetches the extmsg.peer_fanout_retried audit event
+// emitted by the retry handler. The handler emits SYNCHRONOUSLY before
+// returning from ServeHTTP (see extmsgEmitEvent in handler_extmsg.go),
+// so by the time the HTTP response is decoded the event is already on
+// the bus — no polling required.
+func readRetriedEvent(t *testing.T, prov events.Provider) extmsg.PeerFanoutRetriedEventPayload {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		evts, _ := prov.List(events.Filter{Type: events.ExtMsgPeerFanoutRetried})
-		if len(evts) > 0 {
-			var p extmsg.PeerFanoutRetriedEventPayload
-			if err := json.Unmarshal(evts[0].Payload, &p); err != nil {
-				t.Fatalf("decode peer_fanout_retried payload: %v", err)
-			}
-			return p
-		}
-		time.Sleep(10 * time.Millisecond)
+	evts, err := prov.List(events.Filter{Type: events.ExtMsgPeerFanoutRetried})
+	if err != nil {
+		t.Fatalf("list peer_fanout_retried events: %v", err)
 	}
-	t.Fatal("timed out waiting for extmsg.peer_fanout_retried event")
-	return extmsg.PeerFanoutRetriedEventPayload{}
+	if len(evts) == 0 {
+		t.Fatal("expected extmsg.peer_fanout_retried event to be recorded synchronously, got none")
+	}
+	var p extmsg.PeerFanoutRetriedEventPayload
+	if err := json.Unmarshal(evts[0].Payload, &p); err != nil {
+		t.Fatalf("decode peer_fanout_retried payload: %v", err)
+	}
+	return p
 }
 
 func TestPeerFanoutRetrySuccessEmitsAuditEvent(t *testing.T) {
@@ -97,7 +99,7 @@ func TestPeerFanoutRetrySuccessEmitsAuditEvent(t *testing.T) {
 		t.Fatalf("OriginalSeq = %d, want 101", resp.Body.OriginalSeq)
 	}
 
-	got := waitForRetriedEvent(t, fs.eventProv)
+	got := readRetriedEvent(t, fs.eventProv)
 	if !got.Success {
 		t.Fatalf("retried event should be success=true, got %+v", got)
 	}
@@ -136,7 +138,7 @@ func TestPeerFanoutRetryUnknownSessionEmitsFailureEvent(t *testing.T) {
 		t.Fatal("expected non-empty Error on failure response")
 	}
 
-	got := waitForRetriedEvent(t, fs.eventProv)
+	got := readRetriedEvent(t, fs.eventProv)
 	if got.Success {
 		t.Fatalf("retried event should be success=false, got %+v", got)
 	}

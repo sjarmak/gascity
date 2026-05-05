@@ -219,6 +219,14 @@ func TestSlackInteractionsRigSlashOpensModal(t *testing.T) {
 	records, restore := installStubExecCommand(t, "bd-42", 0)
 	t.Cleanup(restore)
 
+	// Wire the completion hook BEFORE the request so an unexpected
+	// dispatch goroutine racing with our assertion still trips the
+	// channel — replaces the prior 50ms sleep that masked races.
+	dispatched := make(chan struct{})
+	prevHook := dispatchTestCompletionHook
+	dispatchTestCompletionHook = func() { close(dispatched) }
+	t.Cleanup(func() { dispatchTestCompletionHook = prevHook })
+
 	req := signedSlashRequestForRig(t, cfg.slackSigningKey, "T1", "C1", "/gc", "deploy now", "U1", "trig-xyz")
 	rec := httptest.NewRecorder()
 	handleSlackInteractions(cfg, chanReg, rigReg)(rec, req)
@@ -254,7 +262,11 @@ func TestSlackInteractionsRigSlashOpensModal(t *testing.T) {
 	}
 
 	// No bd/gc subprocess should fire from the slash command alone.
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-dispatched:
+		t.Errorf("unexpected dispatch goroutine fired on slash-only path; records=%+v", *records)
+	case <-time.After(50 * time.Millisecond):
+	}
 	if len(*records) != 0 {
 		t.Errorf("expected no exec invocations on slash-only path; got %+v", *records)
 	}
@@ -646,6 +658,11 @@ func TestSlackInteractionsRigViewSubmissionMissingSummaryClearsModal(t *testing.
 	records, restore := installStubExecCommand(t, "bd-x", 0)
 	t.Cleanup(restore)
 
+	dispatched := make(chan struct{})
+	prevHook := dispatchTestCompletionHook
+	dispatchTestCompletionHook = func() { close(dispatched) }
+	t.Cleanup(func() { dispatchTestCompletionHook = prevHook })
+
 	meta := slackRigDispatchMetadata{
 		Kind:        metadataKindRigFix,
 		WorkspaceID: "T1", RigName: "alpha",
@@ -664,7 +681,11 @@ func TestSlackInteractionsRigViewSubmissionMissingSummaryClearsModal(t *testing.
 	if !strings.Contains(rec.Body.String(), `"response_action":"clear"`) {
 		t.Errorf("response should be clear-modal: %s", rec.Body.String())
 	}
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-dispatched:
+		t.Errorf("unexpected dispatch goroutine fired on missing summary; records=%+v", *records)
+	case <-time.After(50 * time.Millisecond):
+	}
 	if len(*records) != 0 {
 		t.Errorf("expected no exec invocations on missing summary; got %+v", *records)
 	}
@@ -689,6 +710,11 @@ func TestSlackInteractionsRigViewSubmissionRigUnmappedClearsModal(t *testing.T) 
 	records, restore := installStubExecCommand(t, "bd-x", 0)
 	t.Cleanup(restore)
 
+	dispatched := make(chan struct{})
+	prevHook := dispatchTestCompletionHook
+	dispatchTestCompletionHook = func() { close(dispatched) }
+	t.Cleanup(func() { dispatchTestCompletionHook = prevHook })
+
 	meta := slackRigDispatchMetadata{
 		Kind:        metadataKindRigFix,
 		WorkspaceID: "T1", RigName: "alpha",
@@ -707,7 +733,11 @@ func TestSlackInteractionsRigViewSubmissionRigUnmappedClearsModal(t *testing.T) 
 	if !strings.Contains(rec.Body.String(), `"response_action":"clear"`) {
 		t.Errorf("response should be clear-modal: %s", rec.Body.String())
 	}
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-dispatched:
+		t.Errorf("unexpected dispatch goroutine fired on missing rig; records=%+v", *records)
+	case <-time.After(50 * time.Millisecond):
+	}
 	if len(*records) != 0 {
 		t.Errorf("no subprocess should fire on missing rig: %+v", *records)
 	}
@@ -808,6 +838,11 @@ func TestSlackInteractionsRigViewSubmissionSaturationDrop(t *testing.T) {
 	records, restoreExec := installStubExecCommand(t, "bd-x", 0)
 	t.Cleanup(restoreExec)
 
+	dispatched := make(chan struct{})
+	prevHook := dispatchTestCompletionHook
+	dispatchTestCompletionHook = func() { close(dispatched) }
+	t.Cleanup(func() { dispatchTestCompletionHook = prevHook })
+
 	meta := slackRigDispatchMetadata{
 		Kind:        metadataKindRigFix,
 		WorkspaceID: "T1", RigName: "alpha",
@@ -833,7 +868,11 @@ func TestSlackInteractionsRigViewSubmissionSaturationDrop(t *testing.T) {
 	if !strings.Contains(bodyStr, rigFixModalSummaryBlockID) {
 		t.Errorf("error should target the summary block; got: %s", bodyStr)
 	}
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-dispatched:
+		t.Errorf("unexpected dispatch goroutine fired on saturation; records=%+v", *records)
+	case <-time.After(50 * time.Millisecond):
+	}
 	if len(*records) != 0 {
 		t.Errorf("no exec invocations expected on saturation; got %+v", *records)
 	}

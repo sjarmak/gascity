@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -56,7 +57,7 @@ func TestRunSlackPostMessageMilestone(t *testing.T) {
 		APIBase:    f.server.URL,
 		Stdout:     stdout,
 	}
-	if err := runSlackPostMessage(opts); err != nil {
+	if err := runSlackPostMessage(context.Background(), opts); err != nil {
 		t.Fatalf("runSlackPostMessage: %v", err)
 	}
 	if f.LastPath != "/chat.postMessage" {
@@ -90,7 +91,7 @@ func TestRunSlackPostMessageProgress(t *testing.T) {
 		APIBase:    f.server.URL,
 		Stdout:     new(bytes.Buffer),
 	}
-	if err := runSlackPostMessage(opts); err != nil {
+	if err := runSlackPostMessage(context.Background(), opts); err != nil {
 		t.Fatalf("runSlackPostMessage: %v", err)
 	}
 	if !strings.Contains(f.LastRawBody, "3/5") {
@@ -108,7 +109,7 @@ func TestRunSlackPostMessageRollup(t *testing.T) {
 		APIBase:    f.server.URL,
 		Stdout:     new(bytes.Buffer),
 	}
-	if err := runSlackPostMessage(opts); err != nil {
+	if err := runSlackPostMessage(context.Background(), opts); err != nil {
 		t.Fatalf("runSlackPostMessage: %v", err)
 	}
 	if !strings.Contains(f.LastRawBody, "polecat-7") {
@@ -127,7 +128,7 @@ func TestRunSlackPostMessageUpdate(t *testing.T) {
 		APIBase:    f.server.URL,
 		Stdout:     new(bytes.Buffer),
 	}
-	if err := runSlackPostMessage(opts); err != nil {
+	if err := runSlackPostMessage(context.Background(), opts); err != nil {
 		t.Fatalf("runSlackPostMessage: %v", err)
 	}
 	if f.LastPath != "/chat.update" {
@@ -139,7 +140,7 @@ func TestRunSlackPostMessageUpdate(t *testing.T) {
 }
 
 func TestRunSlackPostMessageMissingChannel(t *testing.T) {
-	err := runSlackPostMessage(slackPostMessageOpts{
+	err := runSlackPostMessage(context.Background(), slackPostMessageOpts{
 		Kind:       "milestone",
 		PayloadRaw: `{"title":"x"}`,
 		BotToken:   "xoxb-test",
@@ -152,7 +153,7 @@ func TestRunSlackPostMessageMissingChannel(t *testing.T) {
 }
 
 func TestRunSlackPostMessageMissingToken(t *testing.T) {
-	err := runSlackPostMessage(slackPostMessageOpts{
+	err := runSlackPostMessage(context.Background(), slackPostMessageOpts{
 		Channel:    "C0001",
 		Kind:       "milestone",
 		PayloadRaw: `{"title":"x"}`,
@@ -164,7 +165,7 @@ func TestRunSlackPostMessageMissingToken(t *testing.T) {
 }
 
 func TestRunSlackPostMessageInvalidPayload(t *testing.T) {
-	err := runSlackPostMessage(slackPostMessageOpts{
+	err := runSlackPostMessage(context.Background(), slackPostMessageOpts{
 		Channel:    "C0001",
 		Kind:       "milestone",
 		PayloadRaw: `not-json`,
@@ -178,7 +179,7 @@ func TestRunSlackPostMessageInvalidPayload(t *testing.T) {
 }
 
 func TestRunSlackPostMessageUnknownKind(t *testing.T) {
-	err := runSlackPostMessage(slackPostMessageOpts{
+	err := runSlackPostMessage(context.Background(), slackPostMessageOpts{
 		Channel:    "C0001",
 		Kind:       "wat",
 		PayloadRaw: `{"title":"x"}`,
@@ -194,7 +195,7 @@ func TestRunSlackPostMessageUnknownKind(t *testing.T) {
 func TestRunSlackPostMessageSlackError(t *testing.T) {
 	f := newFakeSlackServer(t)
 	f.NextResp = slackChatPostResponse{OK: false, Error: "channel_not_found"}
-	err := runSlackPostMessage(slackPostMessageOpts{
+	err := runSlackPostMessage(context.Background(), slackPostMessageOpts{
 		Channel:    "C0001",
 		Kind:       "milestone",
 		PayloadRaw: `{"title":"x"}`,
@@ -210,11 +211,87 @@ func TestRunSlackPostMessageSlackError(t *testing.T) {
 	}
 }
 
+// TestRunSlackPostMessageContextCancel asserts that a canceled context
+// short-circuits the in-flight Slack call instead of waiting for the
+// 15s client timeout. This is the SIGINT propagation contract: when
+// the cobra command's context is canceled, http.NewRequestWithContext
+// causes client.Do to return promptly with a context error.
+func TestRunSlackPostMessageContextCancel(t *testing.T) {
+	// Server hangs forever; the client must return because of ctx, not
+	// because the server replied.
+	hang := make(chan struct{})
+	t.Cleanup(func() { close(hang) })
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-hang:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before the call so client.Do returns immediately
+
+	err := runSlackPostMessage(ctx, slackPostMessageOpts{
+		Channel:    "C0001",
+		Kind:       "milestone",
+		PayloadRaw: `{"title":"x"}`,
+		BotToken:   "xoxb-test",
+		APIBase:    srv.URL,
+		Stdout:     new(bytes.Buffer),
+	})
+	if err == nil {
+		t.Fatal("want context-cancellation error, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("want context.Canceled in error chain, got %v", err)
+	}
+}
+
+// TestRunSlackPostMessageDecodeErrorTruncated asserts that a giant
+// undecodable response body does not flood the error string. The
+// excerpt embedded in the wrapping error is bounded by
+// slackErrorBodyMaxLen.
+func TestRunSlackPostMessageDecodeErrorTruncated(t *testing.T) {
+	huge := strings.Repeat("X", 10_000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(huge))
+	}))
+	t.Cleanup(srv.Close)
+
+	err := runSlackPostMessage(context.Background(), slackPostMessageOpts{
+		Channel:    "C0001",
+		Kind:       "milestone",
+		PayloadRaw: `{"title":"x"}`,
+		BotToken:   "xoxb-test",
+		APIBase:    srv.URL,
+		Stdout:     new(bytes.Buffer),
+	})
+	if err == nil {
+		t.Fatal("want decode error, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "decode slack response") {
+		t.Errorf("error should mention decode failure: %v", err)
+	}
+	// Bound: 1KiB excerpt + the surrounding wrap text. Cap with margin
+	// to absorb decoder error message and "(body=...)" framing.
+	if len(msg) > slackErrorBodyMaxLen+512 {
+		t.Errorf("error string not bounded: len=%d, want <= %d (full=%q)",
+			len(msg), slackErrorBodyMaxLen+512, msg)
+	}
+	if strings.Count(msg, "X") > slackErrorBodyMaxLen {
+		t.Errorf("body excerpt not truncated: %d X chars in error", strings.Count(msg, "X"))
+	}
+}
+
 func TestRunSlackPostMessageHTTPError(t *testing.T) {
 	f := newFakeSlackServer(t)
 	f.NextStatus = http.StatusInternalServerError
 	f.NextResp = slackChatPostResponse{}
-	err := runSlackPostMessage(slackPostMessageOpts{
+	err := runSlackPostMessage(context.Background(), slackPostMessageOpts{
 		Channel:    "C0001",
 		Kind:       "milestone",
 		PayloadRaw: `{"title":"x"}`,
