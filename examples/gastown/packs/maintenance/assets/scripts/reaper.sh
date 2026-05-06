@@ -32,9 +32,14 @@ PURGE_AGE_H=$(duration_to_hours "$PURGE_AGE")
 STALE_AGE_H=$(duration_to_hours "$STALE_ISSUE_AGE")
 MAIL_AGE_H=$(duration_to_hours "$MAIL_DELETE_AGE")
 
-# Discover databases from Dolt server. Exclude Dolt/MySQL system schemas and
-# Gas City's internal health-probe database; remaining DBs are bead stores.
-DATABASES=$(dolt_sql -r csv -q "SHOW DATABASES" 2>/dev/null | tail -n +2 | grep -vi '^information_schema$\|^mysql$\|^dolt_cluster$\|^__gc_probe$' || true)
+# Discover databases from Dolt server. Exclude Dolt/MySQL system schemas,
+# Gas City's internal health-probe database, and test-fixture scratch
+# databases (benchdb, testdb_*, lowercase beads_t[0-9a-f]{8,}, beads_pt*,
+# beads_vr*, doctest_*, doctortest_* — matching the Go cleanup planner
+# contract); the remainder are bead stores.
+DATABASES=$(dolt_sql -r csv -q "SHOW DATABASES" 2>/dev/null | tail -n +2 \
+    | grep -vi '^information_schema$\|^mysql$\|^dolt_cluster$\|^performance_schema$\|^sys$\|^__gc_probe$\|^benchdb$\|^testdb_\|^beads_pt\|^beads_vr\|^doctest_\|^doctortest_' \
+    | grep -v '^beads_t[0-9a-f]\{8,\}$' || true)
 if [ -z "$DATABASES" ]; then
     # No databases accessible — nothing to do.
     exit 0
@@ -157,5 +162,5 @@ if [ -n "$DRY_RUN" ]; then
     SUMMARY="$SUMMARY (dry run)"
 fi
 
-gc nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
+gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
 echo "reaper: $SUMMARY"

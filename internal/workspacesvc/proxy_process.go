@@ -198,20 +198,13 @@ func (p *proxyProcessInstance) start(now time.Time) error {
 
 	cmd := exec.Command(p.svc.Process.Command[0], p.svc.Process.Command[1:]...)
 	cmd.Dir = p.commandDir()
-	cmd.Env = append(os.Environ(), citylayout.CityRuntimeEnv(p.rt.CityPath())...)
+	cmd.Env = append(os.Environ(), citylayout.CityRuntimeEnvForRuntimeDir(p.rt.CityPath(), citylayout.TrustedAmbientCityRuntimeDir(p.rt.CityPath()))...)
 	cmd.Env = append(cmd.Env,
 		"GC_SERVICE_NAME="+p.svc.Name,
 		"GC_SERVICE_STATE_ROOT="+p.absStateRoot,
 		"GC_SERVICE_RUN_ROOT="+filepath.Join(p.absStateRoot, "run"),
 		"GC_SERVICE_SOCKET="+p.socketPath,
-		// GC_SERVICE_URL_PREFIX is the path the supervisor's HTTP router
-		// actually serves: /v0/city/<cityName>/svc/<name>. A service
-		// composes its inbound CallbackURL as $GC_API_BASE_URL +
-		// $GC_SERVICE_URL_PREFIX, so the prefix must include the
-		// /v0/city/<cityName> segment that the public listener requires.
-		// See bd gc-cdf for the full trace; previously this dropped the
-		// city prefix and every inbound call from gc 404'd.
-		"GC_SERVICE_URL_PREFIX="+serviceURLPrefix(p.rt.CityName(), p.svc),
+		"GC_SERVICE_URL_PREFIX="+citylayout.PublicServiceMountPath(p.rt.CityName(), p.svc.Name),
 		"GC_SERVICE_PUBLIC_URL="+p.publication.URL,
 		"GC_SERVICE_VISIBILITY="+p.publication.Visibility,
 		"GC_PUBLISHED_SERVICES_DIR="+citylayout.PublishedServicesDir(p.rt.CityPath()),
@@ -342,25 +335,6 @@ func (p *proxyProcessInstance) checkHealth(now time.Time) error {
 	}
 	p.mu.Unlock()
 	return nil
-}
-
-// serviceURLPrefix builds the URL prefix injected into a proxy_process
-// child's environment as GC_SERVICE_URL_PREFIX. The prefix matches the
-// path the supervisor's HTTP router actually serves
-// (/v0/city/<cityName>/svc/<name>) so a service that composes its
-// inbound CallbackURL as $GC_API_BASE_URL + $GC_SERVICE_URL_PREFIX
-// gets a URL gc can route back to it.
-//
-// An empty cityName falls back to the bare /svc/<name> mount path,
-// matching the legacy behavior so tests and any out-of-tree callers
-// without a populated city name still get a non-broken prefix (the
-// resulting URL still won't route, but at least it isn't /v0/city///svc/...).
-func serviceURLPrefix(cityName string, svc config.Service) string {
-	mount := svc.MountPathOrDefault()
-	if cityName == "" {
-		return mount
-	}
-	return "/v0/city/" + cityName + mount
 }
 
 func (p *proxyProcessInstance) commandDir() string {

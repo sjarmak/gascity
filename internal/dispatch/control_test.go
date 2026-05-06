@@ -507,6 +507,58 @@ func TestProcessRetryControlInvariantViolation(t *testing.T) {
 	}
 }
 
+func TestProcessRetryControlPendingAttemptAddsBlockingDep(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+
+	root := mustCreate(t, store, beads.Bead{
+		Title:    "workflow",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	control := mustCreate(t, store, beads.Bead{
+		Title: "review",
+		Metadata: map[string]string{
+			"gc.kind":             "retry",
+			"gc.root_bead_id":     root.ID,
+			"gc.step_ref":         "mol-test.review",
+			"gc.step_id":          "review",
+			"gc.max_attempts":     "3",
+			"gc.source_step_spec": `{"id":"review","title":"Review","type":"task"}`,
+			"gc.control_epoch":    "1",
+		},
+	})
+	attempt := mustCreate(t, store, beads.Bead{
+		Title: "review attempt 1",
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID,
+			"gc.step_ref":     "mol-test.review.attempt.1",
+			"gc.attempt":      "1",
+		},
+	})
+
+	_, err := processRetryControl(store, mustGet(t, store, control.ID), ProcessOptions{})
+	if !errors.Is(err, ErrControlPending) {
+		t.Fatalf("error = %v, want %v", err, ErrControlPending)
+	}
+
+	deps, err := store.DepList(control.ID, "down")
+	if err != nil {
+		t.Fatalf("DepList: %v", err)
+	}
+	if len(deps) != 1 || deps[0].DependsOnID != attempt.ID || deps[0].Type != "blocks" {
+		t.Fatalf("deps = %#v, want one blocks dep on pending attempt %s", deps, attempt.ID)
+	}
+	ready, err := store.Ready()
+	if err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	for _, bead := range ready {
+		if bead.ID == control.ID {
+			t.Fatalf("control bead stayed ready while pending attempt %s is open", attempt.ID)
+		}
+	}
+}
+
 func TestProcessRetryControlControllerError(t *testing.T) {
 	t.Parallel()
 	store := beads.NewMemStore()
@@ -940,6 +992,58 @@ func TestProcessRalphControlReturnsPendingForOpenIteration(t *testing.T) {
 	_, err := processRalphControl(store, mustGet(t, store, control.ID), ProcessOptions{})
 	if !errors.Is(err, ErrControlPending) {
 		t.Fatalf("error = %v, want %v", err, ErrControlPending)
+	}
+}
+
+func TestProcessRalphControlPendingIterationAddsBlockingDep(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+
+	root := mustCreate(t, store, beads.Bead{
+		Title:    "workflow",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	control := mustCreate(t, store, beads.Bead{
+		Title: "review loop",
+		Metadata: map[string]string{
+			"gc.kind":         "ralph",
+			"gc.root_bead_id": root.ID,
+			"gc.step_ref":     "mol-test.review-loop",
+			"gc.step_id":      "review-loop",
+			"gc.max_attempts": "2",
+		},
+	})
+	iteration := mustCreate(t, store, beads.Bead{
+		Title: "review loop iteration 1",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.root_bead_id": root.ID,
+			"gc.step_ref":     "mol-test.review-loop.iteration.1",
+			"gc.scope_role":   "body",
+			"gc.attempt":      "1",
+		},
+	})
+
+	_, err := processRalphControl(store, mustGet(t, store, control.ID), ProcessOptions{})
+	if !errors.Is(err, ErrControlPending) {
+		t.Fatalf("error = %v, want %v", err, ErrControlPending)
+	}
+
+	deps, err := store.DepList(control.ID, "down")
+	if err != nil {
+		t.Fatalf("DepList: %v", err)
+	}
+	if len(deps) != 1 || deps[0].DependsOnID != iteration.ID || deps[0].Type != "blocks" {
+		t.Fatalf("deps = %#v, want one blocks dep on pending iteration %s", deps, iteration.ID)
+	}
+	ready, err := store.Ready()
+	if err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	for _, bead := range ready {
+		if bead.ID == control.ID {
+			t.Fatalf("control bead stayed ready while pending iteration %s is open", iteration.ID)
+		}
 	}
 }
 

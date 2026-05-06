@@ -2,6 +2,8 @@ package beads
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 )
 
@@ -85,6 +87,8 @@ func (c *CachingStore) runReconciliation() {
 		freshByID[b.ID] = cloneBead(b)
 	}
 
+	c.recoverMissingFromList(freshByID)
+
 	depMap, depsComplete, depErr := c.fetchDepsForIDs(beadIDs(freshByID))
 	if depErr != nil {
 		c.recordProblem("refresh dep cache during reconcile", depErr)
@@ -104,6 +108,7 @@ func (c *CachingStore) runReconciliation() {
 			if _, keep := c.recentLocalBeadConflictLocked(id, freshBead, now); keep {
 				continue
 			}
+			freshDeps := c.depsForReconcileLocked(id, freshBead, depMap, useFreshDeps)
 
 			old, exists := c.beads[id]
 			switch {
@@ -119,7 +124,7 @@ func (c *CachingStore) runReconciliation() {
 					eventType: "bead.updated",
 					bead:      cloneBead(freshBead),
 				})
-			case useFreshDeps && depsChanged(c.deps[id], depMap[id]):
+			case depsChanged(c.deps[id], freshDeps):
 				updates++
 				notifications = append(notifications, cacheNotification{
 					eventType: "bead.updated",
@@ -128,9 +133,7 @@ func (c *CachingStore) runReconciliation() {
 			}
 
 			c.beads[id] = cloneBead(freshBead)
-			if useFreshDeps {
-				c.deps[id] = cloneDeps(depMap[id])
-			}
+			c.deps[id] = cloneDeps(freshDeps)
 			delete(c.dirty, id)
 			delete(c.deletedSeq, id)
 			if !recentLocalMutation(c.localBeadAt[id], now) {
@@ -203,12 +206,9 @@ func (c *CachingStore) runReconciliation() {
 			beadForCache = current
 			preservedRecentLocal = true
 		}
+		freshDeps := c.depsForReconcileLocked(id, freshBead, depMap, useFreshDeps)
 		nextBeads[id] = cloneBead(beadForCache)
-		if useFreshDeps {
-			nextDeps[id] = cloneDeps(depMap[id])
-		} else if deps, ok := c.deps[id]; ok {
-			nextDeps[id] = cloneDeps(deps)
-		}
+		nextDeps[id] = cloneDeps(freshDeps)
 
 		old, exists := c.beads[id]
 		switch {
@@ -224,7 +224,7 @@ func (c *CachingStore) runReconciliation() {
 				eventType: "bead.updated",
 				bead:      cloneBead(freshBead),
 			})
-		case useFreshDeps && depsChanged(c.deps[id], depMap[id]):
+		case !preservedRecentLocal && depsChanged(c.deps[id], freshDeps):
 			updates++
 			notifications = append(notifications, cacheNotification{
 				eventType: "bead.updated",
@@ -279,4 +279,85 @@ func (c *CachingStore) runReconciliation() {
 	c.updateStatsLocked()
 	c.mu.Unlock()
 	c.notifyChanges(notifications)
+}
+
+func (c *CachingStore) depsForReconcileLocked(id string, freshBead Bead, depMap map[string][]Dep, useFreshDeps bool) []Dep {
+	if useFreshDeps {
+		return cloneDeps(depMap[id])
+	}
+	freshDeps := depsFromBeadFields(freshBead)
+	if _, ok := c.backing.(*BdStore); ok {
+		return freshDeps
+	}
+	if len(freshDeps) == 0 {
+		if cachedDeps, ok := c.deps[id]; ok && len(cachedDeps) > 0 {
+			return cloneDeps(cachedDeps)
+		}
+	}
+	return freshDeps
+}
+
+// recoverMissingFromList re-fetches any cached active bead that didn't appear
+// in freshByID and merges verified-alive ones back. This guards against
+// cleanly incomplete List results: a List that drops an active bead must not
+// synthesize a spurious bead.closed event for it.
+//
+// On ErrNotFound the bead is left absent so the diff path can emit
+// bead.closed as before. On any other error the cached entry is merged
+// back conservatively, deferring the close to a later scan when the
+// backing store's state is unambiguous. Callers must own freshByID and not
+// access it concurrently while recovery is running.
+func (c *CachingStore) recoverMissingFromList(freshByID map[string]Bead) {
+	c.mu.RLock()
+	candidates := make(map[string]Bead)
+	for id, b := range c.beads {
+		if _, ok := freshByID[id]; ok {
+			continue
+		}
+		if b.Status == "closed" {
+			continue
+		}
+		candidates[id] = cloneBead(b)
+	}
+	c.mu.RUnlock()
+	if len(candidates) == 0 {
+		return
+	}
+	var recoveredAlive int64
+	var deferredClose int64
+	for id, cached := range candidates {
+		bead, err := c.backing.Get(id)
+		switch {
+		case err == nil:
+			if bead.ID != id {
+				c.recordProblem(
+					"verify missing bead before close",
+					fmt.Errorf("%s: backing returned bead %q", id, bead.ID),
+				)
+				freshByID[id] = cached
+				deferredClose++
+				continue
+			}
+			if bead.Status == "closed" {
+				continue
+			}
+			freshByID[id] = cloneBead(bead)
+			recoveredAlive++
+		case errors.Is(err, ErrNotFound):
+			// Confirmed gone; let the diff path emit bead.closed.
+		default:
+			c.recordProblem(
+				"verify missing bead before close",
+				fmt.Errorf("%s: %w", id, err),
+			)
+			freshByID[id] = cached
+			deferredClose++
+		}
+	}
+	if recoveredAlive != 0 || deferredClose != 0 {
+		c.mu.Lock()
+		c.stats.ReconcileRecoveries += recoveredAlive
+		c.stats.ReconcileCloseDeferrals += deferredClose
+		c.mu.Unlock()
+	}
 }

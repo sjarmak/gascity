@@ -219,7 +219,38 @@ func preserveConfiguredNamedSessionBead(b beads.Bead, cfg *config.City, cityName
 	if !ok {
 		return false
 	}
-	return strings.TrimSpace(b.Metadata["session_name"]) == spec.SessionName
+	if strings.TrimSpace(b.Metadata["session_name"]) != spec.SessionName {
+		return false
+	}
+	// Identity match. Gate on terminal-ish state so a dead bead releases its
+	// alias instead of holding it forever (ga-ue1r / gm-0fl34g5 incident).
+	state := strings.TrimSpace(b.Metadata["state"])
+	switch state {
+	case "stopped":
+		// Deliberate sleep markers (city-stop, idle-timeout, drained,
+		// user-hold, wait-hold, context-churn, quarantine, no-wake-reason,
+		// config-drift) all signal "the runtime is gone but we plan to
+		// resume this bead" — hold the alias.
+		if strings.TrimSpace(b.Metadata["sleep_reason"]) != "" {
+			return true
+		}
+		// Race guard: preWakeCommit writes last_woke_at atomically before
+		// the runtime confirms started; state stays "stopped" until
+		// ConfirmStartedPatch. Mirror the precedent at city_runtime.go.
+		if lastWoke, ok := parseRFC3339Metadata(b.Metadata["last_woke_at"]); ok {
+			if time.Since(lastWoke) < staleCreatingStateTimeout {
+				return true
+			}
+		}
+		return false
+	case "failed-create":
+		// rollbackPendingCreate sets state="failed-create" only with
+		// Status=closed atomically. A Status=open + state="failed-create"
+		// combination means a write failed mid-rollback — release the
+		// alias so the next spawn can recover.
+		return false
+	}
+	return true
 }
 
 func reopenClosedConfiguredNamedSessionBead(
@@ -287,6 +318,16 @@ func reopenClosedConfiguredNamedSessionBead(
 			"closed_at":            "",
 			"pending_create_claim": pendingCreateClaim,
 			"synced_at":            now.Format("2006-01-02T15:04:05Z07:00"),
+		}
+		// Reset the pending-create stale clock to NOW. The bead row's
+		// CreatedAt reflects when it was first minted (potentially
+		// long ago); this reopen is a fresh spawn attempt, so the
+		// staleCreatingState window must start counting from here,
+		// not from CreatedAt.
+		if pendingCreateClaim == "true" {
+			batch["pending_create_started_at"] = pendingCreateStartedAtNow(now)
+		} else {
+			batch["pending_create_started_at"] = ""
 		}
 		for k, v := range extraMeta {
 			batch[k] = v
@@ -892,6 +933,7 @@ func syncSessionBeadsWithSnapshotAndRigStores(
 			}
 			if createState != "active" {
 				meta["pending_create_claim"] = "true"
+				meta["pending_create_started_at"] = pendingCreateStartedAtNow(now)
 			}
 			if tp.DependencyOnly {
 				meta["dependency_only"] = boolMetadata(true)
@@ -1464,6 +1506,7 @@ func setMetaBatch(store beads.Store, id string, batch map[string]string, stderr 
 func closeFailedCreateBead(store beads.Store, id string, now time.Time, stderr io.Writer) bool {
 	patch := session.ClosePatch(now.UTC(), "failed-create")
 	patch["pending_create_claim"] = ""
+	patch["pending_create_started_at"] = ""
 	if setMetaBatch(store, id, patch, stderr) != nil {
 		return false
 	}
@@ -1474,10 +1517,14 @@ func closeFailedCreateBead(store beads.Store, id string, now time.Time, stderr i
 	return true
 }
 
-// reapStaleSessionBeads closes session beads that are stuck in the creating
-// state past the startup grace period — sessions whose tmux process never
-// completed startup, so they are guaranteed not to hold work claims (claim
-// is the first thing a worker does after startup).
+// reapStaleSessionBeads closes beads whose runtime is gone while startup is
+// still incomplete. cleanupDeadRuntimeSessionCorpses handles the inverse
+// mismatch: open beads whose runtime artifact is visible but confirmed dead.
+//
+// This function only targets session beads stuck in the creating state past the
+// startup grace period — sessions whose tmux process never completed startup,
+// so they are guaranteed not to hold work claims (claim is the first thing a
+// worker does after startup).
 //
 // Sessions that completed startup (state=active, awake, etc.) are NEVER reaped
 // here even if their tmux session has died: they may hold in_progress claims,
@@ -1553,6 +1600,75 @@ func reapStaleSessionBeads(
 		}
 	}
 	return reaped
+}
+
+func cleanupDeadRuntimeSessionCorpses(
+	sessionBeads *sessionBeadSnapshot,
+	dt *drainTracker,
+	sp runtime.Provider,
+	stderr io.Writer,
+) int {
+	if sessionBeads == nil || sp == nil {
+		return 0
+	}
+	deadChecker, ok := sp.(runtime.DeadRuntimeSessionChecker)
+	if !ok {
+		return 0
+	}
+	visible, err := sp.ListRunning("")
+	partialList := runtime.IsPartialListError(err)
+	if err != nil && !partialList {
+		fmt.Fprintf(stderr, "session reconciler: listing runtime sessions for dead cleanup: %v\n", err) //nolint:errcheck
+		return 0
+	}
+	if partialList {
+		fmt.Fprintf(stderr, "session reconciler: listing runtime sessions partially failed for dead cleanup; checking %d visible session(s): %v\n", len(visible), err) //nolint:errcheck
+	}
+	if len(visible) == 0 {
+		return 0
+	}
+	visibleSet := make(map[string]bool, len(visible))
+	for _, name := range visible {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			visibleSet[name] = true
+		}
+	}
+	if len(visibleSet) == 0 {
+		return 0
+	}
+
+	cleaned := 0
+	seen := make(map[string]bool)
+	for _, b := range sessionBeads.Open() {
+		pendingCreate := strings.TrimSpace(b.Metadata["pending_create_claim"]) == "true"
+		if pendingCreate || (dt != nil && dt.get(b.ID) != nil) || isNamedSessionBead(b) {
+			continue
+		}
+		name := strings.TrimSpace(b.Metadata["session_name"])
+		if name == "" || seen[name] || !visibleSet[name] {
+			continue
+		}
+		seen[name] = true
+		dead, err := deadChecker.IsDeadRuntimeSession(name)
+		if err != nil {
+			fmt.Fprintf(stderr, "session reconciler: confirming dead runtime session %s: %v\n", name, err) //nolint:errcheck
+			continue
+		}
+		if !dead {
+			continue
+		}
+		if err := sp.Stop(name); err != nil {
+			if runtime.IsSessionGone(err) {
+				continue
+			}
+			fmt.Fprintf(stderr, "session reconciler: cleaning dead runtime session %s: %v\n", name, err) //nolint:errcheck
+			continue
+		}
+		fmt.Fprintf(stderr, "session reconciler: cleaned dead runtime session %s\n", name) //nolint:errcheck
+		cleaned++
+	}
+	return cleaned
 }
 
 func closeSessionBeadIfRuntimeStoppedAndUnassigned(
