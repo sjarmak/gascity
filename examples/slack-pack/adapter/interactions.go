@@ -408,7 +408,9 @@ func handleSlackInteractions(cfg config, mapReg *channelMappingRegistry, rigReg 
 			}
 			writeEphemeral(w, http.StatusOK, fmt.Sprintf(
 				"Routing %s to session %s…", command, rec.TargetID))
+			dispatchInflightWG.Add(1)
 			go func() {
+				defer dispatchInflightWG.Done()
 				defer release()
 				dispatchSlashCommandToSession(cfg, rec.TargetID, command, text, channelID, teamID, userID)
 			}()
@@ -623,7 +625,9 @@ func handleBlockActionsPayload(w http.ResponseWriter, cfg config, mapReg *channe
 		}
 		writeEphemeral(w, http.StatusOK, fmt.Sprintf(
 			"Routing block-action to session %s…", rec.TargetID))
+		dispatchInflightWG.Add(1)
 		go func() {
+			defer dispatchInflightWG.Done()
 			defer release()
 			dispatchBlockActionsToSession(cfg, rec.TargetID, channelID, p)
 		}()
@@ -686,7 +690,9 @@ func handleViewSubmissionPayload(w http.ResponseWriter, cfg config, rigReg *rigM
 	}
 	log.Printf("interaction: workspace=%q user=%q target=session/%s type=view_submission callback=%q",
 		p.Team.ID, p.User.ID, sessionID, p.View.CallbackID)
+	dispatchInflightWG.Add(1)
 	go func() {
+		defer dispatchInflightWG.Done()
 		defer release()
 		dispatchViewSubmissionToSession(cfg, sessionID, p)
 	}()

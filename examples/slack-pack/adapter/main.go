@@ -213,6 +213,29 @@ var slackAPIBase = "https://slack.com/api"
 // initialize this var before any dispatch site fires. sec-S-04.
 var dispatchSem chan struct{}
 
+// dispatchInflightWG counts in-flight dispatch goroutines that own a
+// dispatchSem release(). Every `go func()` that defers release() MUST
+// also Add(1) before the spawn and `defer dispatchInflightWG.Done()`
+// inside. The current set of spawn sites:
+//
+//   - interactions.go: slash → session, block_actions → session,
+//     view_submission → session
+//   - rig_dispatch.go: block_actions → rig, view_submission → rig
+//   - main.go: events-path alias → session (handleSlackEvents)
+//
+// Tests use it as a barrier: signedSlackInteractionRequest registers
+// dispatchInflightWG.Wait via t.Cleanup so any goroutine spawned by
+// the test fully drains before the test framework moves on. Without
+// the barrier, a leftover goroutine writing to log.Default() races
+// the next test's log.SetOutput (gc-cby.36).
+//
+// Complementary to dispatchTestCompletionHook (rig_dispatch.go): the
+// hook is a per-test signal that fires once at goroutine exit and is
+// used by tests that assert on dispatch completion side effects;
+// the WG is a universal drain barrier covering ALL dispatch sites.
+// Folding the hook into the WG is left as a future cleanup.
+var dispatchInflightWG sync.WaitGroup
+
 // acquireDispatchSlot tries to acquire one slot on dispatchSem
 // without blocking. On success it returns a release func bound to
 // the channel observed at acquire time, plus the channel's capacity
@@ -1905,7 +1928,9 @@ func processSlackEvent(cfg config, aliasReg *handleAliasRegistry, threadReg *thr
 			// No new acquireDispatchSlot — that would double-count
 			// against dispatchSem (gc-cby.26 Phase 4 review fix).
 			released = true
+			dispatchInflightWG.Add(1)
 			go func() {
+				defer dispatchInflightWG.Done()
 				defer release()
 				dispatchToAliasedSession(cfg, aliasedSessionID, inbound, target)
 			}()

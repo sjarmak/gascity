@@ -214,7 +214,9 @@ func dispatchBlockActionsToRig(
 	)
 	title = truncateForTitle(title)
 
+	dispatchInflightWG.Add(1)
 	go func() {
+		defer dispatchInflightWG.Done()
 		defer release()
 		defer runDispatchTestHook()
 		runRigDispatch(workdir, cfg.cityPath, target, fixFormula, title, rigName, nil)
@@ -330,7 +332,9 @@ func dispatchRigFixFromViewSubmission(
 		vars["slash_command_text"] = neutralizeMarkupBoundaries(meta.OriginalCommandText)
 	}
 
+	dispatchInflightWG.Add(1)
 	go func() {
+		defer dispatchInflightWG.Done()
 		defer release()
 		defer runDispatchTestHook()
 		runRigDispatch(workdir, cfg.cityPath, target, fixFormula, title, meta.RigName, vars)

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,8 +22,24 @@ import (
 
 // signedSlackInteractionRequest builds a POST request to /slack/interactions
 // signed with the given secret + current timestamp.
+//
+// Side effect: registers t.Cleanup(dispatchInflightWG.Wait) so any
+// dispatch goroutine the test spawns via handleSlackInteractions
+// drains before the test framework moves on to the next test.
+// Without this barrier, a leftover goroutine writing to log.Default()
+// races the next test's log.SetOutput (gc-cby.36).
+//
+// The barrier guarantees only "all goroutines complete before next
+// test starts" — it does NOT promise where drain-time log writes land
+// relative to a test's own log.SetOutput restore. If a test asserts
+// on log output produced by a dispatch goroutine, it must wait on
+// dispatch completion explicitly inside the test body (see
+// TestSlackInteractionsSessionMappingHitDispatches for the channel-
+// signal pattern). The cleanup-time Wait is solely a cross-test
+// race fence.
 func signedSlackInteractionRequest(t *testing.T, secret string, body []byte) *http.Request {
 	t.Helper()
+	t.Cleanup(dispatchInflightWG.Wait)
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write([]byte("v0:" + ts + ":"))
@@ -515,6 +532,98 @@ func TestSlackInteractionsResolverSourceDiscriminatorLogged(t *testing.T) {
 
 	if !strings.Contains(logs.String(), "source=rig") {
 		t.Errorf("log should include source discriminator 'source=rig': %s", logs.String())
+	}
+}
+
+// TestSessionDispatchGoroutineDrainedBeforeNextTest pins the gc-cby.36
+// race fix: every dispatch goroutine spawned by handleSlackInteractions
+// must register with dispatchInflightWG so the test framework can drain
+// it before the next test mutates log.Default().
+//
+// Mechanism: a stub gcAPIBase blocks on `release` until the test closes
+// it, so the dispatch goroutine is verifiably in-flight after the
+// handler returns. We then race dispatchInflightWG.Wait against a short
+// timeout: Wait MUST block while the goroutine is still in postSessionMessage.
+// Once `release` is closed and the goroutine exits, Wait MUST return.
+//
+// Without the production fix (Add(1)/Done() on the spawn site), the WG
+// counter is always 0, Wait returns immediately, and the second
+// assertion fires — proving the test would catch a regression.
+func TestSessionDispatchGoroutineDrainedBeforeNextTest(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseFn := func() { releaseOnce.Do(func() { close(release) }) }
+
+	stubHit := make(chan struct{}, 1)
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case stubHit <- struct{}{}:
+		default:
+		}
+		<-release
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	// stub.Close registered first → fires LAST in LIFO. The helper-
+	// registered Wait fires after releaseFn (registered below), so a
+	// genuine Done()-missing regression cannot deadlock cleanup: the
+	// goroutine is unblocked by releaseFn first, then Wait returns
+	// (or the framework times out — never an indefinite hang here).
+	t.Cleanup(stub.Close)
+
+	cfg := config{
+		slackSigningKey: "secret",
+		accountID:       "T1",
+		cityName:        "test-city",
+		gcAPIBase:       stub.URL,
+	}
+	chanReg := newTestChannelMappingRegistry(t)
+	now := time.Now().UTC()
+	if err := chanReg.Set(channelMappingDiskRecord{
+		WorkspaceID: "T1", ChannelID: "C1",
+		TargetKind: channelMappingTargetKindSession, TargetID: "gc-9",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(url.Values{
+		"team_id":    {"T1"},
+		"channel_id": {"C1"},
+		"command":    {"/gc"},
+		"text":       {"x"},
+		"user_id":    {"U1"},
+	}.Encode())
+	req := signedSlackInteractionRequest(t, cfg.slackSigningKey, body)
+	// Register releaseFn AFTER the helper (which registers Wait).
+	// LIFO order: releaseFn → Wait → stub.Close — releaseFn always
+	// unblocks the handler before Wait drains.
+	t.Cleanup(releaseFn)
+	rec := httptest.NewRecorder()
+	handleSlackInteractions(cfg, chanReg, nil)(rec, req)
+
+	select {
+	case <-stubHit:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatch goroutine never reached stub gcAPIBase")
+	}
+
+	waitDone := make(chan struct{})
+	go func() {
+		dispatchInflightWG.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+		t.Fatal("dispatchInflightWG.Wait returned before release — goroutine not tracked by WG (regression: gc-cby.36)")
+	case <-time.After(75 * time.Millisecond):
+		// Expected: Wait still blocked while the dispatch goroutine is in postSessionMessage.
+	}
+
+	releaseFn()
+	select {
+	case <-waitDone:
+		// Expected: Wait unblocks once the goroutine returns.
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatchInflightWG.Wait did not return after release")
 	}
 }
 
