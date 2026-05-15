@@ -8,6 +8,16 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 )
 
+type countingSessionNameListStore struct {
+	beads.Store
+	listCalls int
+}
+
+func (s *countingSessionNameListStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	s.listCalls++
+	return s.Store.List(query)
+}
+
 func TestCreatePoolSessionBead_SetsPendingCreateClaim(t *testing.T) {
 	store := beads.NewMemStore()
 	now := time.Date(2026, 5, 1, 9, 15, 0, 0, time.UTC)
@@ -132,5 +142,21 @@ func TestExistingPoolSlot_CanonicalSingletonReturnsZero(t *testing.T) {
 	}
 	if got := existingPoolSlotWithConfig(cfg, cfgAgent, bead); got != 0 {
 		t.Fatalf("existingPoolSlotWithConfig(canonical singleton) = %d, want 0", got)
+	}
+}
+
+func TestSessionNameLookupResolverReusesLoadedSnapshotAcrossLookups(t *testing.T) {
+	base := beads.NewMemStore()
+	store := &countingSessionNameListStore{Store: base}
+
+	resolver := newSessionNameLookupResolver(store, "city", "")
+	if got := resolver.Resolve("mayor"); got != "mayor" {
+		t.Fatalf("Resolve(mayor) = %q, want mayor", got)
+	}
+	if got := resolver.Resolve("worker"); got != "worker" {
+		t.Fatalf("Resolve(worker) = %q, want worker", got)
+	}
+	if store.listCalls != 1 {
+		t.Fatalf("store.List calls = %d, want 1", store.listCalls)
 	}
 }
