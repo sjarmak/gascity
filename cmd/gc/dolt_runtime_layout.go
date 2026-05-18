@@ -15,8 +15,20 @@ type managedDoltRuntimeLayout struct {
 	LogFile      string
 	StateFile    string
 	PIDFile      string
-	LockFile     string
-	ConfigFile   string
+	// LockFile is the shell-side serialization lock owned by
+	// `gc-beads-bd.sh`'s op_start (`exec 9>"$LOCK_FILE"`; `flock -n 9`).
+	// It is broadcast to the script via the GC_DOLT_LOCK_FILE env var. The
+	// gc binary itself MUST NOT flock this path — see LifecycleLockFile.
+	LockFile string
+	// LifecycleLockFile is the in-process gc lifecycle lock added in
+	// gastownhall/gascity#2130 to serialize concurrent `gc dolt start`
+	// invocations regardless of how they were launched. It must be a
+	// distinct path from LockFile because the script's op_start holds an
+	// exclusive flock on LockFile when it shells out to
+	// `gc dolt-state start-managed`; if gc also locked LockFile, the
+	// subprocess would deadlock-wait against its own parent script.
+	LifecycleLockFile string
+	ConfigFile        string
 }
 
 func resolveManagedDoltRuntimeLayout(cityPath string) (managedDoltRuntimeLayout, error) {
@@ -39,16 +51,18 @@ func resolveManagedDoltRuntimeLayout(cityPath string) (managedDoltRuntimeLayout,
 	stateFile := defaultEnvPath("GC_DOLT_STATE_FILE", filepath.Join(packStateDir, "dolt-provider-state.json"))
 	pidFile := defaultEnvPath("GC_DOLT_PID_FILE", filepath.Join(packStateDir, "dolt.pid"))
 	lockFile := defaultEnvPath("GC_DOLT_LOCK_FILE", filepath.Join(packStateDir, "dolt.lock"))
+	lifecycleLockFile := defaultEnvPath("GC_DOLT_LIFECYCLE_LOCK_FILE", filepath.Join(packStateDir, "dolt-gc-lifecycle.lock"))
 	configFile := defaultEnvPath("GC_DOLT_CONFIG_FILE", filepath.Join(packStateDir, "dolt-config.yaml"))
 
 	return managedDoltRuntimeLayout{
-		PackStateDir: packStateDir,
-		DataDir:      dataDir,
-		LogFile:      logFile,
-		StateFile:    stateFile,
-		PIDFile:      pidFile,
-		LockFile:     lockFile,
-		ConfigFile:   configFile,
+		PackStateDir:      packStateDir,
+		DataDir:           dataDir,
+		LogFile:           logFile,
+		StateFile:         stateFile,
+		PIDFile:           pidFile,
+		LockFile:          lockFile,
+		LifecycleLockFile: lifecycleLockFile,
+		ConfigFile:        configFile,
 	}, nil
 }
 

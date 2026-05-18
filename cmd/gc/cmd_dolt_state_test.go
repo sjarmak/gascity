@@ -116,13 +116,14 @@ func TestResolveManagedDoltRuntimeLayoutCanonicalizesSymlinkedCityPath(t *testin
 
 	packStateDir := citylayout.PackStateDir(wantCityPath, "dolt")
 	want := managedDoltRuntimeLayout{
-		PackStateDir: packStateDir,
-		DataDir:      filepath.Join(wantCityPath, ".beads", "dolt"),
-		LogFile:      filepath.Join(packStateDir, "dolt.log"),
-		StateFile:    filepath.Join(packStateDir, "dolt-provider-state.json"),
-		PIDFile:      filepath.Join(packStateDir, "dolt.pid"),
-		LockFile:     filepath.Join(packStateDir, "dolt.lock"),
-		ConfigFile:   filepath.Join(packStateDir, "dolt-config.yaml"),
+		PackStateDir:      packStateDir,
+		DataDir:           filepath.Join(wantCityPath, ".beads", "dolt"),
+		LogFile:           filepath.Join(packStateDir, "dolt.log"),
+		StateFile:         filepath.Join(packStateDir, "dolt-provider-state.json"),
+		PIDFile:           filepath.Join(packStateDir, "dolt.pid"),
+		LockFile:          filepath.Join(packStateDir, "dolt.lock"),
+		LifecycleLockFile: filepath.Join(packStateDir, "dolt-gc-lifecycle.lock"),
+		ConfigFile:        filepath.Join(packStateDir, "dolt-config.yaml"),
 	}
 	if layout != want {
 		t.Fatalf("resolveManagedDoltRuntimeLayout() = %+v, want %+v", layout, want)
@@ -2837,7 +2838,7 @@ func TestRecoverManagedDoltProcessReturnsWhenConcurrentStarterBecomesReady(t *te
 	}
 
 	port := reserveRandomTCPPort(t)
-	starter := startLockedDelayedTCPListenerProcessInDir(t, layout.LockFile, port, layout.DataDir, 600*time.Millisecond)
+	starter := startLockedDelayedTCPListenerProcessInDir(t, layout.LifecycleLockFile, port, layout.DataDir, 600*time.Millisecond)
 	defer func() {
 		_ = starter.Process.Kill()
 		_ = starter.Wait()

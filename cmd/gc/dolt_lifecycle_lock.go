@@ -8,15 +8,21 @@ import (
 	"syscall"
 )
 
+// openManagedDoltLifecycleLock opens the gc-side in-process lifecycle lock
+// added in gastownhall/gascity#2130 to serialize concurrent `gc dolt start`
+// invocations. The path is layout.LifecycleLockFile, which is distinct from
+// layout.LockFile so the lock does not collide with the shell-side flock
+// owned by gc-beads-bd.sh's op_start; that distinction is what makes this
+// lock safe to acquire from a subprocess of the script.
 func openManagedDoltLifecycleLock(cityPath string) (*os.File, managedDoltRuntimeLayout, error) {
 	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
 	if err != nil {
 		return nil, managedDoltRuntimeLayout{}, err
 	}
-	if err := os.MkdirAll(filepath.Dir(layout.LockFile), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(layout.LifecycleLockFile), 0o755); err != nil {
 		return nil, managedDoltRuntimeLayout{}, fmt.Errorf("create managed dolt lock dir: %w", err)
 	}
-	f, err := os.OpenFile(layout.LockFile, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(layout.LifecycleLockFile, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, managedDoltRuntimeLayout{}, fmt.Errorf("open managed dolt lock: %w", err)
 	}
