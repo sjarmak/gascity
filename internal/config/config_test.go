@@ -1634,10 +1634,10 @@ func TestEffectiveWorkQueryControlDispatcherClaimsLegacyUnassignedRoute(t *testi
 	out := runEffectiveWorkQuery(t, a, nil, `#!/bin/sh
 set -eu
 case "$*" in
-  "ready --metadata-field gc.routed_to=gascity/control-dispatcher --unassigned --exclude-type=epic --json")
+  "ready --metadata-field gc.routed_to=gascity/control-dispatcher --unassigned --exclude-type=epic --json --limit 0")
     printf '[]'
     ;;
-  "ready --metadata-field gc.routed_to=gascity/workflow-control --unassigned --exclude-type=epic --json")
+  "ready --metadata-field gc.routed_to=gascity/workflow-control --unassigned --exclude-type=epic --json --limit 0")
     printf '[{"id":"ga-legacy-route"}]'
     ;;
   *)
@@ -1935,6 +1935,48 @@ esac
 	}
 	if got := strings.TrimSpace(out); got != "[]" {
 		t.Fatalf("EffectiveWorkQuery() = %q, want terminal [] (no claimable demand)", got)
+	}
+}
+
+// TestEffectiveWorkQueryFallbackFetchesPastDefaultLimit is the copilot review's
+// finding-1 regression: the gc.routed_to fallback probe must fetch with bd's
+// unlimited idiom (--limit 0), not rely on bd ready's default --limit (10). If
+// the first page of routed_to matches is all foreign-run_target rows the filter
+// drops, a valid (native) row past the default cap must still surface — else the
+// pool silently fails to claim work it owns.
+//
+// The fake bd mirrors real bd ready: it caps at 10 rows unless --limit 0 is
+// passed. It returns 10 foreign-run_target rows followed by one native row at
+// position 11. Without --limit 0 the native row is truncated away and the filter
+// yields []; with it, the native row claims. The assertion therefore fails if the
+// probe ever drops --limit 0.
+func TestEffectiveWorkQueryFallbackFetchesPastDefaultLimit(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; the gc.routed_to fallback probe is a jq pipeline")
+	}
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+	}, `#!/bin/sh
+set -eu
+foreign='{"id":"f01","metadata":{"gc.run_target":"hello-world/other","gc.routed_to":"hello-world/worker"}},{"id":"f02","metadata":{"gc.run_target":"hello-world/other","gc.routed_to":"hello-world/worker"}},{"id":"f03","metadata":{"gc.run_target":"hello-world/other","gc.routed_to":"hello-world/worker"}},{"id":"f04","metadata":{"gc.run_target":"hello-world/other","gc.routed_to":"hello-world/worker"}},{"id":"f05","metadata":{"gc.run_target":"hello-world/other","gc.routed_to":"hello-world/worker"}},{"id":"f06","metadata":{"gc.run_target":"hello-world/other","gc.routed_to":"hello-world/worker"}},{"id":"f07","metadata":{"gc.run_target":"hello-world/other","gc.routed_to":"hello-world/worker"}},{"id":"f08","metadata":{"gc.run_target":"hello-world/other","gc.routed_to":"hello-world/worker"}},{"id":"f09","metadata":{"gc.run_target":"hello-world/other","gc.routed_to":"hello-world/worker"}},{"id":"f10","metadata":{"gc.run_target":"hello-world/other","gc.routed_to":"hello-world/worker"}}'
+native='{"id":"native-beyond-cap","metadata":{"gc.routed_to":"hello-world/worker"}}'
+case "$*" in
+  *"--metadata-field gc.run_target=hello-world/worker"*) printf '[]' ;;
+  *"--metadata-field gc.routed_to=hello-world/worker"*)
+    case "$*" in
+      *"--limit 0"*) printf '[%s,%s]' "$foreign" "$native" ;;
+      *) printf '[%s]' "$foreign" ;;
+    esac
+    ;;
+  *) printf '[]' ;;
+esac
+`)
+	if !strings.Contains(out, "native-beyond-cap") {
+		t.Fatalf("EffectiveWorkQuery() dropped a valid row past bd ready's default limit (fallback probe must use --limit 0): %q", out)
+	}
+	if strings.Contains(out, "f01") || strings.Contains(out, "f10") {
+		t.Fatalf("EffectiveWorkQuery() surfaced a foreign-run_target row the filter must drop: %q", out)
 	}
 }
 

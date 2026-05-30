@@ -2691,10 +2691,13 @@ func poolDemandFallbackFilter(keyIndex int) string {
 // The preferred key lets bd stop at the first row (--limit=1). Fallback keys
 // cannot: a --limit=1 row could be one poolDemandFallbackFilter must drop (it
 // also carries a higher-precedence key) while a valid row is left unreturned,
-// so they fetch the matches, filter, and take the first in jq. The jq program
-// is single-quoted with each embedded quote escaped (the close-escape-reopen
-// idiom) because the whole work_query body is itself single-quoted in the
-// `sh -c '...'` wrapper.
+// so they fetch the matches, filter, and take the first in jq. They fetch with
+// --limit 0 (bd's unlimited idiom) rather than relying on the default --limit:
+// bd ready caps results at its default limit (10), so a valid row past that cap
+// would be silently truncated before jq could surface it — the pool would then
+// fail to claim work it owns. The jq program is single-quoted with each
+// embedded quote escaped (the close-escape-reopen idiom) because the whole
+// work_query body is itself single-quoted in the `sh -c '...'` wrapper.
 func poolDemandFirstRowProbes(target string) string {
 	var b strings.Builder
 	for i, key := range poolDemandKeys {
@@ -2702,7 +2705,7 @@ func poolDemandFirstRowProbes(target string) string {
 			b.WriteString(`r=$(` + bdReadyPoolDemandShell(key, target) + ` --limit=1 2>/dev/null); `)
 		} else {
 			b.WriteString(`r=$(` + bdReadyPoolDemandShell(key, target) +
-				` 2>/dev/null | jq -c '\''` + poolDemandFallbackFilter(i) + `[0:1]'\'' 2>/dev/null); `)
+				` --limit 0 2>/dev/null | jq -c '\''` + poolDemandFallbackFilter(i) + `[0:1]'\'' 2>/dev/null); `)
 		}
 		b.WriteString(`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `)
 	}
