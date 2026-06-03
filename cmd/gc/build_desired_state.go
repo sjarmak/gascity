@@ -16,6 +16,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/hooks"
+	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
 	"github.com/gastownhall/gascity/internal/session"
@@ -3082,6 +3083,9 @@ func stampRunSessionIdentity(workBeads []beads.Bead, workStores []beads.Store, s
 	// Roots stamped this pass, so a multi-step run's shared root is resolved
 	// once rather than per step.
 	stampedRoots := map[string]struct{}{}
+	// Workflow roots bound to a slot this pass, deduped so a multi-step run's
+	// shared root binds + fans out to its open steps once rather than per step.
+	boundRoots := map[string]struct{}{}
 	for i, wb := range workBeads {
 		if wb.Status != "in_progress" {
 			continue
@@ -3099,6 +3103,11 @@ func stampRunSessionIdentity(workBeads []beads.Bead, workStores []beads.Store, s
 			continue
 		}
 		sb := match.bead
+		// Bind a multi-step workflow to the slot running it, keyed on the
+		// slot-stable identity (not the per-session session_name), so later
+		// steps co-locate on this slot rather than scattering across the pool
+		// (#2978). Independent of the observability stamping below.
+		bindWorkflowSlotAffinity(store, wb, sessionBeadSlotIdentity(sb), boundRoots, stderr)
 		sessionName := sessionBeadIdentifier(sb)
 		workDir := strings.TrimSpace(sb.Metadata["work_dir"])
 		if sessionName == "" && workDir == "" {
@@ -3157,6 +3166,82 @@ func stampRunRootFromStep(store beads.Store, step beads.Bead, sessionName, workD
 	}
 	if err := store.SetMetadataBatch(rootID, patch); err != nil && stderr != nil {
 		fmt.Fprintf(stderr, "stampRunSessionIdentity root %s: %v\n", rootID, err) //nolint:errcheck
+	}
+}
+
+// sessionBeadSlotIdentity returns a session's slot-stable identity: its
+// configured alias / named identity, which is preserved across session
+// rotations for the same pool slot. Unlike session_name (minted fresh per
+// session — see sessionBeadIdentifier), this is the value a worker sees as
+// $GC_ALIAS, so it is the correct key for binding a multi-step workflow to a
+// slot: a forced rotation re-spawns the slot under the same identity and the
+// successor reclaims the workflow's steps (#2978).
+func sessionBeadSlotIdentity(sb beads.Bead) string {
+	for _, key := range []string{"alias", "configured_named_identity"} {
+		if v := strings.TrimSpace(sb.Metadata[key]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// bindWorkflowSlotAffinity binds a graph.v2 workflow to the pool slot running
+// one of its steps and propagates that binding to the workflow's open step
+// beads, so subsequent steps co-locate on the same slot's worktree instead of
+// scattering across the pool and stalling on slot-local branch/plan state
+// (#2978).
+//
+// The workflow root is the authoritative owner record: the binding is
+// first-writer-wins (only set when unset), so a brief startup race where two
+// slots each grab a parallel step converges to a single owner. The owner is
+// then copied onto every open step (resolved via gc.root_bead_id) so the pool
+// work-query can match continuations directly with `bd ready --metadata-field`.
+//
+// Idempotent and best-effort: writes only the steps whose binding differs, and
+// a missing/cross-store root or a write error is logged and skipped — affinity
+// is a scheduling optimization and must never block reconciliation. Deduped per
+// root per pass via boundRoots.
+func bindWorkflowSlotAffinity(store beads.Store, step beads.Bead, slotID string, boundRoots map[string]struct{}, stderr io.Writer) {
+	if store == nil || slotID == "" {
+		return
+	}
+	rootID := strings.TrimSpace(step.Metadata["gc.root_bead_id"])
+	if rootID == "" || rootID == step.ID {
+		return
+	}
+	if _, done := boundRoots[rootID]; done {
+		return
+	}
+	root, err := store.Get(rootID)
+	if err != nil {
+		// Cross-store / missing / transient — do NOT mark done, so a later
+		// step this pass (or a later reconcile) can retry resolving the root.
+		return
+	}
+	owner := strings.TrimSpace(root.Metadata[molecule.SessionAffinitySlotMetadataKey])
+	if owner == "" {
+		owner = slotID
+		if err := store.SetMetadata(rootID, molecule.SessionAffinitySlotMetadataKey, owner); err != nil {
+			// Do NOT mark done — leave the root for a same-pass sibling or a
+			// later reconcile to retry binding.
+			if stderr != nil {
+				fmt.Fprintf(stderr, "bindWorkflowSlotAffinity root %s: %v\n", rootID, err) //nolint:errcheck
+			}
+			return
+		}
+	}
+	boundRoots[rootID] = struct{}{}
+	siblings, err := store.ListByMetadata(map[string]string{"gc.root_bead_id": rootID}, 0)
+	if err != nil {
+		return
+	}
+	for _, sib := range siblings {
+		if strings.TrimSpace(sib.Metadata[molecule.SessionAffinitySlotMetadataKey]) == owner {
+			continue
+		}
+		if err := store.SetMetadata(sib.ID, molecule.SessionAffinitySlotMetadataKey, owner); err != nil && stderr != nil {
+			fmt.Fprintf(stderr, "bindWorkflowSlotAffinity step %s: %v\n", sib.ID, err) //nolint:errcheck
+		}
 	}
 }
 

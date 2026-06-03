@@ -5,19 +5,26 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/molecule"
 )
 
-// countingStore wraps a Store and counts SetMetadataBatch calls so a test can
-// assert the stamp is idempotent (no writes once the bead already carries the
-// resolved identity).
+// countingStore wraps a Store and counts SetMetadataBatch / SetMetadata calls so
+// a test can assert the stamp + affinity binding are idempotent (no writes once
+// the bead already carries the resolved identity / slot binding).
 type countingStore struct {
 	beads.Store
-	writes int
+	writes     int
+	metaWrites int
 }
 
 func (c *countingStore) SetMetadataBatch(id string, kvs map[string]string) error {
 	c.writes++
 	return c.Store.SetMetadataBatch(id, kvs)
+}
+
+func (c *countingStore) SetMetadata(id, key, value string) error {
+	c.metaWrites++
+	return c.Store.SetMetadata(id, key, value)
 }
 
 func stampTestSession(name, workDir string) beads.Bead {
@@ -95,6 +102,67 @@ func TestStampRunSessionIdentityPropagatesToRunRoot(t *testing.T) {
 	stampRunSessionIdentity([]beads.Bead{stamped}, []beads.Store{store}, sessions, io.Discard)
 	if store.writes != 0 {
 		t.Errorf("second pass wrote %d times, want 0 (step+root already stamped)", store.writes)
+	}
+}
+
+func TestStampRunSessionIdentityBindsWorkflowSlotAffinity(t *testing.T) {
+	// #2978: when a slot runs a graph.v2 workflow step, the workflow binds to
+	// the slot's STABLE identity (alias), not its per-session session_name, and
+	// that binding propagates to the workflow's open step beads so they
+	// co-locate on the same slot rather than scattering across the pool.
+	// slotID is slot-stable (survives rotation); sessionName is session-unique
+	// and must NOT be used as the binding.
+	const slotID = "rig/polecat-1"
+	const sessionName = "rig-polecat-gc-555"
+	root := beads.Bead{ID: "wf-root", Type: "molecule", Status: "in_progress", Metadata: map[string]string{"gc.kind": "workflow"}}
+	step1 := beads.Bead{ID: "wf-s1", Type: "step", Status: "in_progress", Assignee: sessionName, Metadata: map[string]string{"gc.root_bead_id": "wf-root"}}
+	step2 := beads.Bead{ID: "wf-s2", Type: "step", Status: "open", Metadata: map[string]string{"gc.root_bead_id": "wf-root"}}
+	mem := beads.NewMemStoreFrom(0, []beads.Bead{root, step1, step2}, nil)
+	store := &countingStore{Store: mem}
+	sess := beads.Bead{
+		ID: "sess-1", Type: "session", Status: "open",
+		Metadata: map[string]string{"session_name": sessionName, "alias": slotID, "work_dir": "/wt/1"},
+	}
+	sessions := newSessionBeadSnapshot([]beads.Bead{sess})
+
+	stampRunSessionIdentity([]beads.Bead{step1}, []beads.Store{store}, sessions, io.Discard)
+
+	for _, id := range []string{"wf-root", "wf-s1", "wf-s2"} {
+		got, _ := mem.Get(id)
+		if v := got.Metadata[molecule.SessionAffinitySlotMetadataKey]; v != slotID {
+			t.Errorf("%s affinity = %q, want slot-stable %q (not session_name %q)", id, v, slotID, sessionName)
+		}
+	}
+
+	// Idempotent: a second pass writes no metadata once everything is bound.
+	stamped, _ := mem.Get("wf-s1")
+	store.metaWrites = 0
+	stampRunSessionIdentity([]beads.Bead{stamped}, []beads.Store{store}, sessions, io.Discard)
+	if store.metaWrites != 0 {
+		t.Errorf("second pass wrote %d affinity metadata, want 0 (binding must be idempotent)", store.metaWrites)
+	}
+}
+
+func TestStampRunSessionIdentityAffinityFirstWriterWins(t *testing.T) {
+	// A workflow already bound to polecat-2; a step of it briefly runs under
+	// polecat-1 (startup race). The root's owner is authoritative and must NOT
+	// be overwritten, and the open step converges to the recorded owner.
+	root := beads.Bead{ID: "wf-root", Type: "molecule", Status: "in_progress", Metadata: map[string]string{"gc.kind": "workflow", molecule.SessionAffinitySlotMetadataKey: "rig/polecat-2"}}
+	step := beads.Bead{ID: "wf-s1", Type: "step", Status: "in_progress", Assignee: "rig-polecat-gc-1", Metadata: map[string]string{"gc.root_bead_id": "wf-root"}}
+	mem := beads.NewMemStoreFrom(0, []beads.Bead{root, step}, nil)
+	store := &countingStore{Store: mem}
+	sess := beads.Bead{ID: "s1", Type: "session", Status: "open", Metadata: map[string]string{"session_name": "rig-polecat-gc-1", "alias": "rig/polecat-1", "work_dir": "/wt/1"}}
+	sessions := newSessionBeadSnapshot([]beads.Bead{sess})
+
+	stampRunSessionIdentity([]beads.Bead{step}, []beads.Store{store}, sessions, io.Discard)
+
+	gotRoot, _ := mem.Get("wf-root")
+	if v := gotRoot.Metadata[molecule.SessionAffinitySlotMetadataKey]; v != "rig/polecat-2" {
+		t.Errorf("root affinity = %q, want unchanged rig/polecat-2 (first-writer-wins)", v)
+	}
+	gotStep, _ := mem.Get("wf-s1")
+	if v := gotStep.Metadata[molecule.SessionAffinitySlotMetadataKey]; v != "rig/polecat-2" {
+		t.Errorf("step affinity = %q, want propagated owner rig/polecat-2", v)
 	}
 }
 
