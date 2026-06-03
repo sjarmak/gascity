@@ -3021,6 +3021,19 @@ func poolDemandMigrationFilterJQ(limit int) string {
 	return shellquote.Join([]string{"jq", filter})
 }
 
+// jqRequiredGuardShell emits a POSIX-sh fragment that hard-validates jq as a
+// prerequisite for the pool-demand path. When jq is missing it writes a clear,
+// actionable diagnostic to stderr naming the operation that needs it and exits
+// 127 (the conventional command-not-found code), so a misconfigured worker or
+// reconciler surfaces a loud failure rather than silently behaving as if there
+// were no demand. The trailing semicolon lets callers concatenate it inline.
+func jqRequiredGuardShell(operation string) string {
+	msg := "gc work_query: jq not found in PATH; cannot " + operation +
+		" — install jq or the pool will silently process no routed work"
+	return `command -v jq >/dev/null 2>&1 || { ` +
+		shellquote.Join([]string{"printf", "%s\n", msg}) + ` >&2; exit 127; }; `
+}
+
 // poolDemandFirstRowFunctionScript emits the work_query Tier 3 function: it
 // reads the first claimable ready, unassigned, routed bead for the supplied
 // target, prints it, and exits 0. The caller appends a terminal fallthrough
@@ -3039,7 +3052,11 @@ func poolDemandMigrationFilterJQ(limit int) string {
 //
 // Tier 3a is a pure bd predicate (no jq) so cross-rotation continuation works
 // even where jq is unavailable; Tier 3b and the count-form share jq, which the
-// pool-demand path already requires.
+// pool-demand path already requires. That requirement is validated loudly
+// rather than failing closed: if Tier 3a finds nothing and jq is absent, the
+// probe exits non-zero with a diagnostic on stderr instead of returning an
+// empty result that masquerades as "no work" and silently strands routed
+// demand on a jq-less worker.
 func poolDemandFirstRowFunctionScript() string {
 	return `probe_pool_demand() { ` +
 		`target="$1"; ` +
@@ -3048,6 +3065,7 @@ func poolDemandFirstRowFunctionScript() string {
 		`r=$(` + affineReadyTierCommand() + `); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`fi; ` +
+		jqRequiredGuardShell("evaluate unbound pool demand (tier 3b)") +
 		`r=$(` + unboundRoutedReadyTierCommand() + `); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit=20") + ` 2>/dev/null); ` +
@@ -3103,6 +3121,7 @@ func unboundAffinityFilterJQ(limit int) string {
 // therefore still counted as demand that warrants a slot.
 func poolDemandCountShell(target string) string {
 	script := `target="$1"; ` +
+		jqRequiredGuardShell("count routed pool demand") +
 		`ready_json=$(` + bdReadyPoolDemandShell("--limit 0") + `) || exit $?; ` +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0") + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + `) || exit $?; ` +

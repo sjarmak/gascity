@@ -1860,3 +1860,75 @@ func TestReleaseOrphanedPoolAssignments_PreservesNamedIdentityForSameStore(t *te
 		t.Fatalf("assignee = %q, want reviewer", got.Assignee)
 	}
 }
+
+// boundWorkflow returns a graph.v2 workflow root plus an open, unassigned
+// continuation step, both bound to slotID. Continuation steps are type "task"
+// (graph.v2 skips the #1039 step coercion) so Store.Ready surfaces them for
+// pool claim — the sweep relies on that.
+func boundWorkflow(rootID, stepID, slotID, target string) (beads.Bead, beads.Bead) {
+	root := beads.Bead{
+		ID: rootID, Type: "task", Status: "in_progress",
+		Metadata: map[string]string{
+			"gc.kind":                               "workflow",
+			molecule.SessionAffinitySlotMetadataKey: slotID,
+		},
+	}
+	step := beads.Bead{
+		ID: stepID, Type: "task", Status: "open",
+		Metadata: map[string]string{
+			"gc.root_bead_id":                       rootID,
+			"gc.routed_to":                          target,
+			molecule.SessionAffinitySlotMetadataKey: slotID,
+		},
+	}
+	return root, step
+}
+
+// TestReleaseDeadAffinityWorkflowStepsClearsRetiredSlotBinding covers the
+// scale-to-zero stranding fix (#2978): a Min=0 pool slot cleanly finishes one
+// step of a multi-step workflow and is retired, leaving the next OPEN+UNASSIGNED
+// step bound to the now-dead slot. No orphaned ASSIGNED step exists, so
+// releaseOrphanedPoolAssignments never runs; the standalone sweep must clear the
+// binding so the step returns to unbound demand the count form can see.
+func TestReleaseDeadAffinityWorkflowStepsClearsRetiredSlotBinding(t *testing.T) {
+	root, step := boundWorkflow("wf-root", "wf-s2", "rig/polecat-1", "rig/polecat")
+	mem := beads.NewMemStoreFrom(0, []beads.Bead{root, step}, nil)
+
+	// No open session holds rig/polecat-1: the slot was scaled to zero.
+	releaseDeadAffinityWorkflowSteps(mem, nil, nil, nil)
+
+	for _, id := range []string{"wf-root", "wf-s2"} {
+		got, err := mem.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if v := strings.TrimSpace(got.Metadata[molecule.SessionAffinitySlotMetadataKey]); v != "" {
+			t.Errorf("%s affinity = %q, want cleared (dead slot must be unbound)", id, v)
+		}
+	}
+}
+
+// TestReleaseDeadAffinityWorkflowStepsPreservesLiveSlotBinding is the safety
+// counterpart: a binding whose slot still has an open session must NOT be
+// cleared, so an in-flight or rotating slot keeps reclaiming its own steps via
+// Tier 3a instead of having them scattered back to unbound demand.
+func TestReleaseDeadAffinityWorkflowStepsPreservesLiveSlotBinding(t *testing.T) {
+	root, step := boundWorkflow("wf-root", "wf-s2", "rig/polecat-1", "rig/polecat")
+	mem := beads.NewMemStoreFrom(0, []beads.Bead{root, step}, nil)
+
+	liveSession := beads.Bead{
+		ID: "sess-live", Type: "session", Status: "open",
+		Metadata: map[string]string{"session_name": "rig-polecat-gc-9", "alias": "rig/polecat-1"},
+	}
+	releaseDeadAffinityWorkflowSteps(mem, nil, []beads.Bead{liveSession}, nil)
+
+	for _, id := range []string{"wf-root", "wf-s2"} {
+		got, err := mem.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if v := strings.TrimSpace(got.Metadata[molecule.SessionAffinitySlotMetadataKey]); v != "rig/polecat-1" {
+			t.Errorf("%s affinity = %q, want preserved rig/polecat-1 (slot still live)", id, v)
+		}
+	}
+}

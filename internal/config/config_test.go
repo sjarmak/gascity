@@ -7222,3 +7222,91 @@ func TestPackDirsForRig(t *testing.T) {
 		t.Fatalf("PackDirsForRig(missing) = %v, want %v", got, want)
 	}
 }
+
+// runWorkQueryIsolatedPATH executes the agent's work_query with PATH restricted
+// to a temp dir holding a fake `bd`, so jq is genuinely off PATH. It returns
+// stdout, stderr, and the exit error (nil on success) WITHOUT failing the test,
+// so a test can assert the jq-missing failure contract.
+func runWorkQueryIsolatedPATH(t *testing.T, a Agent, env map[string]string, bdScript string) (string, string, error) {
+	t.Helper()
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "bd"), []byte(bdScript), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	// The work_query nests `sh -c`, so sh must resolve on the isolated PATH.
+	// Symlink the real sh in (and nothing else) so jq stays genuinely absent.
+	shPath, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skipf("sh not found: %v", err)
+	}
+	if err := os.Symlink(shPath, filepath.Join(tmp, "sh")); err != nil {
+		t.Fatalf("symlink sh: %v", err)
+	}
+	cmd := exec.Command(shPath, "-c", a.EffectiveWorkQuery())
+	// PATH is ONLY the temp dir: bd is the fake, sh is symlinked, jq is absent.
+	cmd.Env = []string{"PATH=" + tmp}
+	for k, v := range env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+	return stdout.String(), stderr.String(), runErr
+}
+
+// TestEffectiveWorkQueryMissingJqFailsLoud verifies the pool-demand path
+// hard-validates jq instead of silently masquerading as "no work" when jq is
+// absent. With GC_ALIAS empty (Tier 3a skipped) and jq off PATH, the probe must
+// exit non-zero with a stderr diagnostic naming jq, and must NOT print the empty
+// "[]" result that a jq-less worker previously fell through to — which silently
+// stranded all unbound routed demand.
+func TestEffectiveWorkQueryMissingJqFailsLoud(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	a := Agent{Name: "polecat", Dir: "rig"}
+	// Fake bd: never reached for unbound demand (the jq guard fires first), but
+	// present so PATH resolution of bd succeeds for any earlier tier.
+	stdout, stderr, err := runWorkQueryIsolatedPATH(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+	}, "#!/bin/sh\nprintf '[]'\n")
+
+	if err == nil {
+		t.Fatalf("work_query exited 0 with jq missing; want loud non-zero failure (stdout=%q)", stdout)
+	}
+	if strings.TrimSpace(stdout) == "[]" {
+		t.Errorf("work_query printed %q (silent no-work) with jq missing; want no fallthrough result", stdout)
+	}
+	if !strings.Contains(stderr, "jq") {
+		t.Errorf("work_query stderr = %q, want a diagnostic naming jq", stderr)
+	}
+}
+
+// TestEffectiveWorkQueryMissingJqStillServesTier3a verifies the jq guard does
+// NOT block Tier 3a: a slot reclaiming its own bound continuation works in a
+// jq-less environment, because Tier 3a is a pure bd predicate evaluated before
+// the guard.
+func TestEffectiveWorkQueryMissingJqStillServesTier3a(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	a := Agent{Name: "polecat", Dir: "rig"}
+	// Fake bd returns a bound continuation for the Tier 3a affinity probe (the
+	// only bd invocation with --metadata-field gc.session_affinity_slot).
+	bd := "#!/bin/sh\n" +
+		"for arg in \"$@\"; do\n" +
+		"  case \"$arg\" in gc.session_affinity_slot=*) printf '[{\"id\":\"wf-s2\"}]'; exit 0;; esac\n" +
+		"done\n" +
+		"printf '[]'\n"
+	stdout, stderr, err := runWorkQueryIsolatedPATH(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+		"GC_ALIAS":          "rig/polecat-1",
+	}, bd)
+	if err != nil {
+		t.Fatalf("Tier 3a claim failed in jq-less env: %v (stderr=%q)", err, stderr)
+	}
+	if !strings.Contains(stdout, "wf-s2") {
+		t.Errorf("work_query stdout = %q, want Tier 3a bound continuation wf-s2 served without jq", stdout)
+	}
+}

@@ -124,15 +124,7 @@ func releaseOrphanedPoolAssignments(
 	}
 
 	openIdentifiers := makeOpenSessionStoreRefIndex(cityPath, cfg, openSessionBeads, storeRefAware)
-	legacyOpenIdentifiers := make(map[string]struct{}, len(openSessionBeads)*5)
-	for _, sb := range openSessionBeads {
-		if sb.Status == "closed" {
-			continue
-		}
-		for _, id := range sessionBeadAssigneeIdentities(sb) {
-			legacyOpenIdentifiers[id] = struct{}{}
-		}
-	}
+	legacyOpenIdentifiers := openSessionAssigneeIdentitySet(openSessionBeads)
 
 	var released []releasedPoolAssignment
 	// Workflow roots whose slot binding we have re-evaluated this pass, deduped
@@ -254,6 +246,87 @@ func clearDeadWorkflowAffinity(store beads.Store, wb beads.Bead, liveIdentifiers
 		}
 		if err := store.SetMetadata(sib.ID, molecule.SessionAffinitySlotMetadataKey, ""); err != nil {
 			log.Printf("clearDeadWorkflowAffinity: step %q: %v", sib.ID, err)
+		}
+	}
+}
+
+// openSessionAssigneeIdentitySet returns every assignment identity held by an
+// open session bead. This is the "live slot" set: a workflow whose
+// gc.session_affinity_slot is in this set still has a session that can claim its
+// continuation steps, so its binding must be preserved. Closed session beads are
+// skipped.
+func openSessionAssigneeIdentitySet(openSessionBeads []beads.Bead) map[string]struct{} {
+	live := make(map[string]struct{}, len(openSessionBeads)*5)
+	for _, sb := range openSessionBeads {
+		if sb.Status == "closed" {
+			continue
+		}
+		for _, id := range sessionBeadAssigneeIdentities(sb) {
+			live[id] = struct{}{}
+		}
+	}
+	return live
+}
+
+// releaseDeadAffinityWorkflowSteps clears multi-step workflow slot bindings whose
+// bound slot no longer has any open session, returning the workflow's open steps
+// to unbound pool demand (#2978).
+//
+// It closes the scale-to-zero gap that releaseOrphanedPoolAssignments cannot
+// reach. That sweep only acts on assigned work and early-returns on an empty
+// assigned-work snapshot, so it never fires for the failure shape below:
+//
+//   - A Min=0 pool slot claims step 1 of a multi-step workflow; binding stamps
+//     the root and its open steps with the slot's gc.session_affinity_slot.
+//   - Step 1 closes cleanly. Step 2 is now OPEN + UNASSIGNED but still bound.
+//   - sessionHasOpenAssignedWorkForConfig sees no ASSIGNED work (step 2 is
+//     unassigned), so the now-idle slot is retired and scaled to zero.
+//   - No orphaned ASSIGNED step exists, so clearDeadWorkflowAffinity never runs,
+//     and poolDemandCountShell excludes bound steps from the spawn count — so the
+//     pool never respawns a slot and step 2 strands permanently.
+//
+// This standalone sweep is the counterpart: it scans ready, unassigned, bound
+// steps across every work store and releases any whose slot identity holds no
+// open session. Releasing one step releases its whole molecule, because
+// clearDeadWorkflowAffinity clears the root and every sibling.
+//
+// Idempotent and best-effort: a slot still backed by an open session keeps its
+// binding (so an in-flight or rotating slot reclaims its own steps via Tier 3a),
+// and a store query failure skips that store for this tick — the next tick
+// retries. Callers MUST skip this sweep on a partial session snapshot: a missing
+// open session would make a live slot look dead and wrongly unbind its steps.
+func releaseDeadAffinityWorkflowSteps(store beads.Store, rigStores map[string]beads.Store, openSessionBeads []beads.Bead, cfg *config.City) {
+	if store == nil {
+		return
+	}
+	live := openSessionAssigneeIdentitySet(openSessionBeads)
+	clearedRoots := map[string]struct{}{}
+	stores := make([]beads.Store, 0, len(rigStores)+1)
+	stores = append(stores, store)
+	for _, rs := range rigStores {
+		if rs != nil {
+			stores = append(stores, rs)
+		}
+	}
+	limit := assignedWorkReadyLimit(cfg)
+	for _, s := range stores {
+		ready, err := liveReadyForControllerDemandQuery(s, beads.ReadyQuery{Limit: limit})
+		if err != nil {
+			log.Printf("releaseDeadAffinityWorkflowSteps: ready query: %v", err)
+			continue
+		}
+		for _, step := range ready {
+			if strings.TrimSpace(step.Assignee) != "" {
+				continue
+			}
+			slot := strings.TrimSpace(step.Metadata[molecule.SessionAffinitySlotMetadataKey])
+			if slot == "" {
+				continue
+			}
+			if _, isLive := live[slot]; isLive {
+				continue
+			}
+			clearDeadWorkflowAffinity(s, step, live, clearedRoots)
 		}
 	}
 }

@@ -1926,6 +1926,18 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		}
 		assignedWorkBeads, assignedWorkStoreRefs = filterReleasedAssignedWorkSnapshot(assignedWorkBeads, assignedWorkStoreRefs, released)
 	}
+	// Release multi-step workflow steps still bound to a slot that has been
+	// retired (e.g. a Min=0 pool slot scaled to zero after a clean step
+	// completion). The orphan-release pass above cannot reach these — they carry
+	// no assignee — so without this sweep a bound, unassigned continuation step is
+	// excluded from spawn demand and strands forever (#2978). Skipped on a partial
+	// session snapshot so a transiently-missing session cannot look like a dead
+	// slot and wrongly unbind a live workflow.
+	if !result.snapshotQueryPartial() {
+		phaseStart = time.Now()
+		releaseDeadAffinityWorkflowSteps(store, rigStores, sessionBeads.Open(), cr.cfg)
+		recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.release_dead_affinity_workflow_steps", phaseStart, nil)
+	}
 	// poolDesired determines how many sessions should be AWAKE. Uses the
 	// same scale_check counts that buildDesiredState already computed (no
 	// duplicate shell-outs). Resume tier from cross-referenced assigned
