@@ -10,6 +10,7 @@ import (
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sling"
 )
@@ -134,6 +135,9 @@ func releaseOrphanedPoolAssignments(
 	}
 
 	var released []releasedPoolAssignment
+	// Workflow roots whose slot binding we have re-evaluated this pass, deduped
+	// so a multi-step run's shared root is cleared at most once.
+	clearedAffinityRoots := map[string]struct{}{}
 	for i, wb := range assignedWorkBeads {
 		if wb.Status != "open" && wb.Status != "in_progress" {
 			continue
@@ -191,8 +195,67 @@ func releaseOrphanedPoolAssignments(
 			continue
 		}
 		released = append(released, releasedPoolAssignment{ID: wb.ID, Index: i})
+		// If this orphaned step belonged to a multi-step workflow bound to a now
+		// dead slot, release the binding so its remaining steps return to
+		// unbound pool demand instead of waiting forever on a slot that is gone
+		// (#2978).
+		clearDeadWorkflowAffinity(ownerStore, wb, legacyOpenIdentifiers, clearedAffinityRoots)
 	}
 	return released
+}
+
+// clearDeadWorkflowAffinity releases a multi-step workflow's slot binding when
+// the bound slot no longer has any open session, returning the workflow's steps
+// to unbound pool demand (#2978). It is called after an in-progress step is
+// orphan-released: if the step's workflow root (gc.root_bead_id) is bound to a
+// slot identity that no open session still holds, the binding is cleared from
+// the root and its open steps.
+//
+// A slot rotation keeps the binding: rotation is idle-gated (a slot mid-step is
+// not recycled), so an orphaned in-progress step means the slot genuinely died
+// rather than rotated; and if the successor session is already open under the
+// same slot identity, that identity is in liveIdentifiers and the binding is
+// preserved so the successor reclaims the steps. Best-effort and deduped per
+// root per pass; a missing root or write error is logged and skipped.
+func clearDeadWorkflowAffinity(store beads.Store, wb beads.Bead, liveIdentifiers map[string]struct{}, clearedRoots map[string]struct{}) {
+	if store == nil {
+		return
+	}
+	rootID := strings.TrimSpace(wb.Metadata["gc.root_bead_id"])
+	if rootID == "" || rootID == wb.ID {
+		return
+	}
+	if _, done := clearedRoots[rootID]; done {
+		return
+	}
+	root, err := store.Get(rootID)
+	if err != nil {
+		return
+	}
+	slot := strings.TrimSpace(root.Metadata[molecule.SessionAffinitySlotMetadataKey])
+	if slot == "" {
+		clearedRoots[rootID] = struct{}{}
+		return
+	}
+	if _, live := liveIdentifiers[slot]; live {
+		return
+	}
+	clearedRoots[rootID] = struct{}{}
+	if err := store.SetMetadata(rootID, molecule.SessionAffinitySlotMetadataKey, ""); err != nil {
+		log.Printf("clearDeadWorkflowAffinity: root %q: %v", rootID, err)
+	}
+	siblings, err := store.ListByMetadata(map[string]string{"gc.root_bead_id": rootID}, 0)
+	if err != nil {
+		return
+	}
+	for _, sib := range siblings {
+		if strings.TrimSpace(sib.Metadata[molecule.SessionAffinitySlotMetadataKey]) == "" {
+			continue
+		}
+		if err := store.SetMetadata(sib.ID, molecule.SessionAffinitySlotMetadataKey, ""); err != nil {
+			log.Printf("clearDeadWorkflowAffinity: step %q: %v", sib.ID, err)
+		}
+	}
 }
 
 func detachedProbeAllowsOrphanRelease(wb beads.Bead) (bool, bool) {

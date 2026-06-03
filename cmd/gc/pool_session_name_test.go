@@ -9,6 +9,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/molecule"
 )
 
 const testDetachedPoolProbeSpec = "tmux:gascity:soak-loop"
@@ -283,6 +284,106 @@ func TestReleaseOrphanedPoolAssignments_ReopensMissingPoolAssignee(t *testing.T)
 	}
 	if got.Assignee != "" {
 		t.Fatalf("assignee = %q, want empty", got.Assignee)
+	}
+}
+
+// TestReleaseOrphanedPoolAssignments_ClearsDeadSlotWorkflowAffinity verifies
+// that when a slot dies while running a multi-step workflow, releasing its
+// orphaned in-progress step also clears the workflow's slot binding from the
+// root and its open steps, so the remaining steps return to unbound pool
+// demand instead of waiting forever on a gone slot (#2978).
+func TestReleaseOrphanedPoolAssignments_ClearsDeadSlotWorkflowAffinity(t *testing.T) {
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{Title: "wf root", Metadata: map[string]string{"gc.kind": "workflow", molecule.SessionAffinitySlotMetadataKey: "worker-1"}})
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+	step1, err := store.Create(beads.Bead{Title: "wf step1", Assignee: "worker-dead-sess", Metadata: map[string]string{"gc.routed_to": "worker", "gc.root_bead_id": root.ID, molecule.SessionAffinitySlotMetadataKey: "worker-1"}})
+	if err != nil {
+		t.Fatalf("create step1: %v", err)
+	}
+	if err := store.Update(step1.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("set step1 status: %v", err)
+	}
+	step2, err := store.Create(beads.Bead{Title: "wf step2", Metadata: map[string]string{"gc.routed_to": "worker", "gc.root_bead_id": root.ID, molecule.SessionAffinitySlotMetadataKey: "worker-1"}})
+	if err != nil {
+		t.Fatalf("create step2: %v", err)
+	}
+	step1, err = store.Get(step1.ID)
+	if err != nil {
+		t.Fatalf("reload step1: %v", err)
+	}
+
+	released := releaseOrphanedPoolAssignments(
+		store,
+		&config.City{Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}}},
+		"",
+		nil, // no live sessions: slot worker-1 is dead
+		[]beads.Bead{step1},
+		nil, nil, nil,
+	)
+	if len(released) != 1 || released[0].ID != step1.ID {
+		t.Fatalf("released = %v, want [%s]", released, step1.ID)
+	}
+	for _, id := range []string{root.ID, step1.ID, step2.ID} {
+		got, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if v := got.Metadata[molecule.SessionAffinitySlotMetadataKey]; v != "" {
+			t.Errorf("%s affinity = %q, want cleared (dead slot)", id, v)
+		}
+	}
+}
+
+// TestReleaseOrphanedPoolAssignments_KeepsAffinityWhenSlotStillLive verifies the
+// rotation case: releasing an orphaned step whose slot still has an open session
+// (a new session under the same slot identity) preserves the workflow binding so
+// the successor reclaims the steps rather than scattering them (#2978).
+func TestReleaseOrphanedPoolAssignments_KeepsAffinityWhenSlotStillLive(t *testing.T) {
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{Title: "wf root", Metadata: map[string]string{"gc.kind": "workflow", molecule.SessionAffinitySlotMetadataKey: "worker-1"}})
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+	step1, err := store.Create(beads.Bead{Title: "wf step1", Assignee: "worker-gc-old", Metadata: map[string]string{"gc.routed_to": "worker", "gc.root_bead_id": root.ID, molecule.SessionAffinitySlotMetadataKey: "worker-1"}})
+	if err != nil {
+		t.Fatalf("create step1: %v", err)
+	}
+	if err := store.Update(step1.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("set step1 status: %v", err)
+	}
+	step2, err := store.Create(beads.Bead{Title: "wf step2", Metadata: map[string]string{"gc.routed_to": "worker", "gc.root_bead_id": root.ID, molecule.SessionAffinitySlotMetadataKey: "worker-1"}})
+	if err != nil {
+		t.Fatalf("create step2: %v", err)
+	}
+	step1, err = store.Get(step1.ID)
+	if err != nil {
+		t.Fatalf("reload step1: %v", err)
+	}
+
+	// A successor session for the SAME slot identity (alias worker-1) is open.
+	newSession := beads.Bead{ID: "sess-new", Type: "session", Status: "open", Metadata: map[string]string{"alias": "worker-1", "session_name": "worker-gc-new"}}
+
+	released := releaseOrphanedPoolAssignments(
+		store,
+		&config.City{Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}}},
+		"",
+		[]beads.Bead{newSession},
+		[]beads.Bead{step1},
+		nil, nil, nil,
+	)
+	if len(released) != 1 || released[0].ID != step1.ID {
+		t.Fatalf("released = %v, want [%s] (old session gone)", released, step1.ID)
+	}
+	for _, id := range []string{root.ID, step1.ID, step2.ID} {
+		got, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if v := got.Metadata[molecule.SessionAffinitySlotMetadataKey]; v != "worker-1" {
+			t.Errorf("%s affinity = %q, want kept worker-1 (slot still live)", id, v)
+		}
 	}
 }
 

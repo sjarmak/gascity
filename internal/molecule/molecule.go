@@ -71,6 +71,21 @@ const (
 	// molecule creation. Speculative actionable work is created as a ready-
 	// excluded type and restored on activation.
 	DeferredTypeMetadataKey = "gc.deferred_type"
+
+	// SessionAffinitySlotMetadataKey binds a multi-step graph.v2 workflow to the
+	// slot that first ran one of its steps, so subsequent steps co-locate on
+	// that slot's worktree rather than scattering across a pool (#2978). It is
+	// set for any session with a stable identity, but only the pool work-query
+	// consults it; named single-session agents are unaffected.
+	// The value is the slot-stable identity (the session alias / qualified slot
+	// name, e.g. "rig/polecat-1" — NOT the session-unique session_name), which is
+	// the same value a worker sees as $GC_ALIAS. It is stamped on the workflow
+	// root (the authoritative owner record, first-writer-wins) and propagated to
+	// the root's open step beads so the pool work-query can match it directly via
+	// `bd ready --metadata-field`. The orphan-release sweep clears it when no live
+	// session holds the slot, returning the workflow's steps to unbound pool
+	// demand; a forced slot rotation (new session, same slot id) preserves it.
+	SessionAffinitySlotMetadataKey = "gc.session_affinity_slot"
 )
 
 // FragmentOptions configures instantiation of a rootless recipe fragment into

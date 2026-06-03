@@ -2998,14 +2998,33 @@ func poolDemandMigrationFilterJQ(limit int) string {
 }
 
 // poolDemandFirstRowFunctionScript emits the work_query Tier 3 function: it
-// reads the first ready, unassigned, routed bead for the supplied target,
-// prints it, and exits 0. The caller appends a terminal fallthrough
+// reads the first claimable ready, unassigned, routed bead for the supplied
+// target, prints it, and exits 0. The caller appends a terminal fallthrough
 // (printf "[]") for the empty case.
+//
+// Claim ordering honors multi-step workflow slot affinity (#2978):
+//   - Tier 3a: a slot's own bound continuation steps
+//     (gc.session_affinity_slot == $GC_ALIAS) take priority, so a multi-step
+//     molecule stays on the slot that ran its first step rather than scattering
+//     across the pool and stalling on slot-local branch/plan state.
+//   - Tier 3b: unbound routed demand (steps with no slot binding yet). Any free
+//     slot may claim these; the binding is stamped once the step runs. Steps
+//     bound to a different live slot are intentionally NOT claimable here — they
+//     are served by their owning slot's Tier 3a (the orphan-release sweep clears
+//     the binding when the slot dies, returning the steps to this tier).
+//
+// Tier 3a is a pure bd predicate (no jq) so cross-rotation continuation works
+// even where jq is unavailable; Tier 3b and the count-form share jq, which the
+// pool-demand path already requires.
 func poolDemandFirstRowFunctionScript() string {
 	return `probe_pool_demand() { ` +
 		`target="$1"; ` +
 		`[ -z "$target" ] && return 1; ` +
-		`r=$(` + routedReadyTierCommand() + `); ` +
+		`if [ -n "$GC_ALIAS" ]; then ` +
+		`r=$(` + affineReadyTierCommand() + `); ` +
+		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+		`fi; ` +
+		`r=$(` + unboundRoutedReadyTierCommand() + `); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit=20") + ` 2>/dev/null); ` +
 		`r=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(1) + ` 2>/dev/null); ` +
@@ -3014,10 +3033,30 @@ func poolDemandFirstRowFunctionScript() string {
 		`}; `
 }
 
-func routedReadyTierCommand() string {
-	// The shared predicate stays order-free so the count-form does no wasted
-	// sorting; the worker first-row path asks bd for the oldest candidate.
-	return bdReadyPoolDemandShell("--sort oldest --limit=1") + ` 2>/dev/null`
+// affineReadyTierCommand returns the worker Tier 3a predicate: the oldest ready,
+// unassigned step routed to target whose workflow is already bound to this
+// slot's stable identity ($GC_ALIAS). Pure bd — no jq — so a slot reclaims its
+// own continuation even across a session rotation in a jq-less environment.
+func affineReadyTierCommand() string {
+	return `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --metadata-field "gc.session_affinity_slot=$GC_ALIAS" --unassigned --exclude-type=epic --json --sort oldest --limit=1 2>/dev/null`
+}
+
+// unboundRoutedReadyTierCommand returns the worker Tier 3b predicate: the oldest
+// ready, unassigned routed candidate that carries no slot binding yet
+// (gc.session_affinity_slot empty/absent). Workflow roots and single-bead work
+// have no binding and so remain claimable by any free slot here.
+func unboundRoutedReadyTierCommand() string {
+	return bdReadyPoolDemandShell("--sort oldest --limit 0") + ` 2>/dev/null | ` + unboundAffinityFilterJQ(1) + ` 2>/dev/null`
+}
+
+// unboundAffinityFilterJQ filters a ready-bead JSON array down to candidates
+// with no workflow slot binding, optionally truncating to limit rows.
+func unboundAffinityFilterJQ(limit int) string {
+	filter := `[.[] | select((.metadata["gc.session_affinity_slot"] // "") == "")]`
+	if limit > 0 {
+		filter += ` | .[:` + strconv.Itoa(limit) + `]`
+	}
+	return shellquote.Join([]string{"jq", "-c", filter})
 }
 
 // poolDemandCountShell emits the reconciler count-form for target: it counts
@@ -3031,12 +3070,19 @@ func routedReadyTierCommand() string {
 // masquerade as "no demand", which would silently stop the pool from spawning.
 // The && chain ensures any non-zero bd exit short-circuits the whole expression
 // (TestEffectiveScaleCheckUsesReadyOnly).
+// The spawn count is restricted to UNBOUND demand
+// (gc.session_affinity_slot empty/absent) so it stays symmetric with the
+// worker's Tier 3b: steps already bound to a slot are served by that slot's
+// own Tier 3a continuation claim and must not inflate the spawn count, which
+// would otherwise over-provision idle slots that cannot claim the bound work
+// (#2978). Workflow roots and single-bead work carry no binding and are
+// therefore still counted as demand that warrants a slot.
 func poolDemandCountShell(target string) string {
 	script := `target="$1"; ` +
 		`ready_json=$(` + bdReadyPoolDemandShell("--limit 0") + `) || exit $?; ` +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0") + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + `) || exit $?; ` +
-		`printf "%s\n%s\n" "$ready_json" "$legacy_json" | jq -s "(add // []) | unique_by(.id) | length"`
+		`printf "%s\n%s\n" "$ready_json" "$legacy_json" | jq -s '(add // []) | map(select((.metadata["gc.session_affinity_slot"] // "") == "")) | unique_by(.id) | length'`
 	return shellquote.Join([]string{"sh", "-c", script, "--", target})
 }
 

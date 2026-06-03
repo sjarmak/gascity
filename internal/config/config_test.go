@@ -1646,11 +1646,18 @@ func TestPoolRoundTrip(t *testing.T) {
 func TestEffectiveWorkQueryDefault(t *testing.T) {
 	a := Agent{Name: "mayor"}
 	got := a.EffectiveWorkQuery()
-	// Tiered query: tier 3 routes via gc.routed_to, with a temporary
+	// Tiered query: tier 3 routes via gc.routed_to, split into 3a (this slot's
+	// own bound workflow continuations) and 3b (unbound demand), with a temporary
 	// gc.run_target migration fallback for pre-backfill workflow roots, and
 	// tiers 1-2 resolve by assignee.
-	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json --sort oldest --limit=1`) {
-		t.Errorf("EffectiveWorkQuery() missing tier 3 pool-demand probe: %q", got)
+	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --metadata-field "gc.session_affinity_slot=$GC_ALIAS" --unassigned --exclude-type=epic --json --sort oldest --limit=1`) {
+		t.Errorf("EffectiveWorkQuery() missing tier 3a affinity continuation probe: %q", got)
+	}
+	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json --sort oldest --limit 0`) {
+		t.Errorf("EffectiveWorkQuery() missing tier 3b unbound routed probe: %q", got)
+	}
+	if !strings.Contains(got, `select((.metadata["gc.session_affinity_slot"] // "") == "")`) {
+		t.Errorf("EffectiveWorkQuery() missing tier 3b unbound affinity filter: %q", got)
 	}
 	if !strings.Contains(got, "-- mayor") {
 		t.Errorf("EffectiveWorkQuery() missing tier 3 target argument: %q", got)
@@ -1809,14 +1816,17 @@ esac
 }
 
 func TestEffectiveWorkQueryControlDispatcherClaimsLegacyUnassignedRoute(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; tier 3b unbound demand filters affinity with jq")
+	}
 	a := Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}
 	out := runEffectiveWorkQuery(t, a, nil, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=1"*)
+  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[]'
     ;;
-  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/workflow-control"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=1"*)
+  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/workflow-control"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[{"id":"ga-legacy-route"}]'
     ;;
   *)
@@ -1840,13 +1850,16 @@ func TestEffectiveWorkQueryRoutedQueueUsesNativeOldestSortAcrossReadyTiers(t *te
 			t.Fatalf("EffectiveWorkQuery() = %q, want ephemeral-aware assigned tier %q", got, want)
 		}
 	}
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; tier 3b unbound demand filters affinity with jq")
+	}
 	out := runEffectiveWorkQuery(t, a, map[string]string{
 		"GC_SESSION_ORIGIN": "ephemeral",
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "ready --include-ephemeral --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --json --sort oldest --limit=1")
-    printf '[{"id":"older-no-history","priority":2,"created_at":"2026-05-20T06:09:30Z","no_history":true}]'
+  "ready --include-ephemeral --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --json --sort oldest --limit 0")
+    printf '[{"id":"older-no-history","priority":2,"created_at":"2026-05-20T06:09:30Z","no_history":true},{"id":"newer-durable","priority":2,"created_at":"2026-05-21T06:09:30Z"}]'
     ;;
   *)
     printf '[]'
@@ -1862,14 +1875,17 @@ esac
 }
 
 func TestEffectiveWorkQueryRoutedQueueUsesOldestBeforePriority(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; tier 3b unbound demand filters affinity with jq")
+	}
 	a := Agent{Name: "worker", Dir: "hello-world"}
 	out := runEffectiveWorkQuery(t, a, map[string]string{
 		"GC_SESSION_ORIGIN": "ephemeral",
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=1"*)
-    printf '[{"id":"older-p2","priority":2,"created_at":"2026-05-20T06:09:30Z"}]'
+  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
+    printf '[{"id":"older-p2","priority":2,"created_at":"2026-05-20T06:09:30Z"},{"id":"newer-p0","priority":0,"created_at":"2026-05-21T06:09:30Z"}]'
     ;;
   *)
     printf '[]'
@@ -2035,6 +2051,61 @@ esac
 	}
 }
 
+// TestEffectiveWorkQueryPrefersOwnBoundContinuation verifies tier 3a: a slot
+// claims a workflow step already bound to its own slot identity ($GC_ALIAS)
+// ahead of any unbound demand, so a multi-step molecule co-locates on the slot
+// that ran its first step (#2978).
+func TestEffectiveWorkQueryPrefersOwnBoundContinuation(t *testing.T) {
+	a := Agent{Name: "polecat", Dir: "rig", MinActiveSessions: ptrInt(1), MaxActiveSessions: ptrInt(3)}
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+		"GC_ALIAS":          "rig/polecat-1",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  *"--metadata-field gc.session_affinity_slot=rig/polecat-1"*)
+    printf '[{"id":"my-continuation-step"}]'
+    ;;
+  *) printf '[]' ;;
+esac
+`)
+	if !strings.Contains(out, "my-continuation-step") {
+		t.Fatalf("EffectiveWorkQuery() did not claim the slot's own bound continuation: %q", out)
+	}
+}
+
+// TestEffectiveWorkQuerySkipsOtherSlotBoundStepClaimsUnbound verifies tier 3b:
+// a step bound to a DIFFERENT slot is left for its owner, while an unbound step
+// on the same routed queue is claimed — the core fix for steps scattering
+// across pool slots and stalling (#2978).
+func TestEffectiveWorkQuerySkipsOtherSlotBoundStepClaimsUnbound(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; tier 3b unbound demand filters affinity with jq")
+	}
+	a := Agent{Name: "polecat", Dir: "rig", MinActiveSessions: ptrInt(1), MaxActiveSessions: ptrInt(3)}
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+		"GC_ALIAS":          "rig/polecat-1",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  *"--metadata-field gc.session_affinity_slot=rig/polecat-1"*)
+    printf '[]'
+    ;;
+  *"--metadata-field gc.routed_to=rig/polecat"*"--limit 0"*)
+    printf '[{"id":"bound-elsewhere","metadata":{"gc.session_affinity_slot":"rig/polecat-2"}},{"id":"unbound-step","metadata":{}}]'
+    ;;
+  *) printf '[]' ;;
+esac
+`)
+	if !strings.Contains(out, "unbound-step") {
+		t.Fatalf("EffectiveWorkQuery() did not claim the unbound routed step: %q", out)
+	}
+	if strings.Contains(out, "bound-elsewhere") {
+		t.Fatalf("EffectiveWorkQuery() claimed a step bound to another slot: %q", out)
+	}
+}
+
 func TestEffectiveWorkQueryClaimsRunTargetOnlyRootDuringMigration(t *testing.T) {
 	if _, err := exec.LookPath("jq"); err != nil {
 		t.Skip("jq not available; migration fallback filters routed_to with jq")
@@ -2105,6 +2176,32 @@ esac
 `)
 	if strings.TrimSpace(out) != "2" {
 		t.Fatalf("EffectivePoolDemandQuery() count = %q, want 2 (routed_to demand)", strings.TrimSpace(out))
+	}
+}
+
+// TestEffectivePoolDemandQueryExcludesSlotBoundDemand verifies the spawn count
+// ignores steps already bound to a slot (gc.session_affinity_slot set), so a
+// busy affine slot serializing its own chain does not inflate demand and
+// over-provision idle slots that cannot claim the bound work (#2978). Unbound
+// work and workflow roots (no binding) are still counted.
+func TestEffectivePoolDemandQueryExcludesSlotBoundDemand(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; count-form exercises a jq pipeline")
+	}
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	out := runShellWithFakeBd(t, a.EffectivePoolDemandQuery(), nil, `#!/bin/sh
+set -eu
+case "$*" in
+  *"--metadata-field gc.routed_to=hello-world/worker"*)
+    printf '[{"id":"unbound-root","metadata":{}},{"id":"bound-step","metadata":{"gc.session_affinity_slot":"hello-world/worker-1"}}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if strings.TrimSpace(out) != "1" {
+		t.Fatalf("EffectivePoolDemandQuery() count = %q, want 1 (unbound demand only)", strings.TrimSpace(out))
 	}
 }
 
@@ -2240,9 +2337,19 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			wq := tt.agent.EffectiveWorkQuery()
 			demand := tt.agent.EffectivePoolDemandQuery()
-			workPredicate := bdReadyPoolDemandShell("--sort oldest --limit=1")
+			// Tier 3b (unbound demand) scans the routed queue, then both paths
+			// apply the SAME unbound-affinity filter so a slot-bound step never
+			// counts as spawn demand nor gets claimed by a foreign slot (#2978).
+			workPredicate := bdReadyPoolDemandShell("--sort oldest --limit 0")
 			if !strings.Contains(wq, workPredicate) {
 				t.Errorf("EffectiveWorkQuery() missing shared predicate %q in %q", workPredicate, wq)
+			}
+			affinityFilter := `select((.metadata["gc.session_affinity_slot"] // "") == "")`
+			if !strings.Contains(wq, affinityFilter) {
+				t.Errorf("EffectiveWorkQuery() missing shared unbound-affinity filter %q in %q", affinityFilter, wq)
+			}
+			if !strings.Contains(demand, affinityFilter) {
+				t.Errorf("EffectivePoolDemandQuery() missing shared unbound-affinity filter %q in %q", affinityFilter, demand)
 			}
 			migrationWorkPredicate := bdReadyPoolDemandMigrationShell("--limit=20")
 			if !strings.Contains(wq, migrationWorkPredicate) {
