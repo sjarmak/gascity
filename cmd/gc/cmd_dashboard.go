@@ -18,6 +18,7 @@ var dashboardServeHook = dashboard.Serve
 func newDashboardCmd(stdout, stderr io.Writer) *cobra.Command {
 	var port int
 	var apiURL string
+	var allowedHosts []string
 	cmd := &cobra.Command{
 		Use:   "dashboard",
 		Short: "Web dashboard for monitoring the supervisor and managed cities",
@@ -28,13 +29,13 @@ city tabs. From a city directory or with --city, city-specific panels and action
 forms are enabled for that city.`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			if runDashboardServe("gc dashboard", port, apiURL, stderr) != nil {
+			if runDashboardServe("gc dashboard", port, apiURL, allowedHosts, stderr) != nil {
 				return errExit
 			}
 			return nil
 		},
 	}
-	bindDashboardServeFlags(cmd, &port, &apiURL)
+	bindDashboardServeFlags(cmd, &port, &apiURL, &allowedHosts)
 	cmd.AddCommand(newDashboardServeCmd(stdout, stderr))
 	return cmd
 }
@@ -43,6 +44,7 @@ forms are enabled for that city.`,
 func newDashboardServeCmd(_, stderr io.Writer) *cobra.Command {
 	var port int
 	var apiURL string
+	var allowedHosts []string
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Start the web dashboard",
@@ -53,22 +55,25 @@ city tabs. From a city directory or with --city, city-specific panels and action
 forms are enabled for that city.`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			if runDashboardServe("gc dashboard serve", port, apiURL, stderr) != nil {
+			if runDashboardServe("gc dashboard serve", port, apiURL, allowedHosts, stderr) != nil {
 				return errExit
 			}
 			return nil
 		},
 	}
-	bindDashboardServeFlags(cmd, &port, &apiURL)
+	bindDashboardServeFlags(cmd, &port, &apiURL, &allowedHosts)
 	return cmd
 }
 
-func bindDashboardServeFlags(cmd *cobra.Command, port *int, apiURL *string) {
+func bindDashboardServeFlags(cmd *cobra.Command, port *int, apiURL *string, allowedHosts *[]string) {
 	cmd.Flags().IntVar(port, "port", 8080, "HTTP port")
 	cmd.Flags().StringVar(apiURL, "api", "", "GC API server URL override (auto-discovered by default)")
+	cmd.Flags().StringArrayVar(allowedHosts, "allowed-host", nil,
+		"non-loopback Host header value to accept (repeatable); loopback is always allowed. "+
+			"Set this when binding the dashboard to a real hostname so DNS-rebinding protection lets it through")
 }
 
-func runDashboardServe(commandName string, port int, apiURLOverride string, stderr io.Writer) error {
+func runDashboardServe(commandName string, port int, apiURLOverride string, allowedHosts []string, stderr io.Writer) error {
 	cityPath, cfg, err := resolveDashboardContext(stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", commandName, err) //nolint:errcheck // best-effort stderr
@@ -81,7 +86,7 @@ func runDashboardServe(commandName string, port int, apiURLOverride string, stde
 		return err
 	}
 
-	if err := dashboardServeHook(port, apiURL); err != nil {
+	if err := dashboardServeHook(port, apiURL, allowedHosts); err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", commandName, err) //nolint:errcheck // best-effort stderr
 		return err
 	}
