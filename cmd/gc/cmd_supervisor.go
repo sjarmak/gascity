@@ -283,6 +283,34 @@ var supervisorLoadConfig = supervisor.LoadConfig
 // the escalation.
 const supervisorHardExitCodeRepeatedShutdown = 130
 
+// supervisorExitCodePortInUse is returned when the API port is already bound
+// by another supervisor. Only one supervisor may own the port machine-wide, so
+// a collision means this process is a duplicate install. The generated systemd
+// unit lists this code in RestartPreventExitStatus so the duplicate exits once
+// with a clear diagnostic instead of crash-looping on the shared port forever.
+const supervisorExitCodePortInUse = 3
+
+// supervisorAddrInUse reports whether err indicates the listen address was
+// already bound (EADDRINUSE) — the signature of a second supervisor competing
+// for the shared API port, as opposed to any other listen failure.
+func supervisorAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE)
+}
+
+// supervisorPortInUseMessage returns the loud, actionable diagnostic emitted
+// when the API port is already held by another supervisor. It names the
+// address and both remedies so a duplicate install fails legibly instead of
+// emitting an opaque "bind: address already in use" on every restart.
+func supervisorPortInUseMessage(addr, configPath string) string {
+	return fmt.Sprintf(
+		"gc supervisor: API address %s is already in use.\n"+
+			"Another gc supervisor already owns this port — only one supervisor may run per machine.\n"+
+			"This instance is a duplicate and is exiting without restart. To resolve, either:\n"+
+			"  - stop the other supervisor (gc supervisor stop) before starting this one, or\n"+
+			"  - give this supervisor its own port: set [supervisor] port = <N> in %s\n",
+		addr, configPath)
+}
+
 // supervisorHardExit terminates the supervisor immediately. It intentionally
 // bypasses graceful cleanup and may leave managed sessions or child processes
 // alive for operator recovery. Overridable for tests.
@@ -1152,6 +1180,10 @@ func runSupervisor(stdout, stderr io.Writer) int {
 	addr := net.JoinHostPort(bind, strconv.Itoa(port))
 	apiLis, apiErr := net.Listen("tcp", addr)
 	if apiErr != nil {
+		if supervisorAddrInUse(apiErr) {
+			fmt.Fprint(stderr, supervisorPortInUseMessage(addr, supervisor.ConfigPath())) //nolint:errcheck
+			return supervisorExitCodePortInUse
+		}
 		fmt.Fprintf(stderr, "gc supervisor: api: listen %s failed: %v\n", addr, apiErr) //nolint:errcheck
 		return 1
 	}
