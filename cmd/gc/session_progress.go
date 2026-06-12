@@ -1,6 +1,23 @@
 package main
 
-import "time"
+import (
+	"time"
+
+	"github.com/gastownhall/gascity/internal/runtime"
+)
+
+// dialogCapableProvider reports whether the runtime provider behind sp can
+// dismiss known blocking dialogs, unwrapping the attachment-caching
+// decorator first: the decorator embeds the runtime.Provider interface, so
+// optional side interfaces implemented by the concrete provider are not
+// visible through it (mirrors pendingInteractionReady's unwrap).
+func dialogCapableProvider(sp runtime.Provider) (runtime.DialogProvider, bool) {
+	if cached, ok := sp.(*attachmentCachingProvider); ok && cached.Provider != nil {
+		sp = cached.Provider
+	}
+	dp, ok := sp.(runtime.DialogProvider)
+	return dp, ok
+}
 
 // isMinFloorIdleWorker reports whether a session is a legitimate pool floor
 // worker that should be exempt from the progress-stall recycler.
