@@ -1,0 +1,77 @@
+// Deployment model — where each piece runs at review time.
+//
+// The canonical long-running process is `gc supervisor run`, hosting one
+// controller runtime per registered city. Agent sessions run on a runtime
+// substrate (tmux on the same host, or subprocess / k8s / cloudflare
+// remotely). The bead store is the shared work spine through which the
+// controller and the agents coordinate. Rigs are external git repos on disk.
+
+deployment {
+
+  cityHost = host 'City host' {
+    description 'Where the supervisor + controller and (by default) the local agent sessions run'
+
+    supervisorProc = proc 'gc supervisor — controller runtime' {
+      description 'One CityRuntime per registered city; reconcile loop + order dispatch + graph dispatch. Owns the .gc/controller.lock flock and the controller/supervisor Unix sockets'
+      instanceOf gascity.controller
+    }
+    cliProc = proc 'gc CLI' {
+      description 'Operator commands; calls the core library directly or routes mutations through the supervisor HTTP API'
+      instanceOf gascity.cli
+    }
+    apiProc = proc 'HTTP + SSE API' {
+      description 'Hosted by the supervisor; Huma-generated OpenAPI 3.1 surface for dashboards and remote clients'
+      instanceOf gascity.api
+    }
+    sessionProc = proc 'tmux agent sessions' {
+      description 'Local agent sessions as tmux windows (the production provider); each runs an agent CLI'
+      instanceOf gascity.runtime
+    }
+    eventsLog = proc 'Event log — .gc/events.jsonl' {
+      description 'Append-only JSONL on disk; Watch() tails it for reactive delivery'
+      instanceOf gascity.events
+    }
+  }
+
+  beadHost = host 'Bead backend' {
+    description 'The work spine. Default: bd CLI over a Dolt-versioned store (a local dolt server). File/mem stores run in-process on the city host instead'
+    instanceOf beadBackend
+  }
+
+  remoteRuntimeHost = host 'Remote runtime substrate' {
+    description 'Where remote / scaled agent sessions run when the provider is subprocess / k8s / cloudflare rather than local tmux'
+    instanceOf agentProviders
+    instanceOf codingAgent
+  }
+
+  rigHost = host 'Rig repositories' {
+    description 'External git projects registered as rigs; agents edit code here. Can live anywhere on disk, inside or outside the city'
+    instanceOf gitRepos
+  }
+
+  githubHost = host 'GitHub' {
+    description 'Source-control surface read by GitHub-monitor / source-workflow orders'
+    instanceOf github
+  }
+
+  // Runtime data & control flow between processes/hosts.
+  supervisorProc -> beadHost 'reconcile against desired state; drive bead graphs'
+  supervisorProc -> sessionProc 'spawn / stop / interrupt / nudge sessions'
+  supervisorProc -> remoteRuntimeHost 'spawn remote sessions (subprocess / k8s / cloudflare)'
+  supervisorProc -> eventsLog 'record lifecycle + order events'
+  supervisorProc -> githubHost 'evaluate PR-readiness order triggers'
+  cliProc -> apiProc 'route mutations through the supervisor when a lock boundary requires it'
+  apiProc -> beadHost 'in-process domain reads/writes'
+  sessionProc -> rigHost 'agents edit code in the rig'
+  sessionProc -> beadHost 'claim ready work, close beads (bd hook / work_query)'
+  remoteRuntimeHost -> rigHost 'remote agents edit code in the rig'
+  remoteRuntimeHost -> beadHost 'remote agents claim / close beads'
+}
+
+views {
+
+  deployment view deployment {
+    title 'Deployment — where each piece runs'
+    include *
+  }
+}

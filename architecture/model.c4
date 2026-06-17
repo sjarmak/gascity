@@ -1,0 +1,490 @@
+// Gas City — composable orchestration infrastructure for multi-agent coding
+// workflows.
+//
+// Gas City is an orchestration-builder SDK: you write a Formula (a method) and
+// the controller runs it as a graph of beads — decomposing the job, fanning
+// ready work out to many agents, gating each step on its dependencies,
+// retrying failures, and draining convoys, all outside any user session. A
+// central design property is that this is composed entirely from substrate
+// primitives with ZERO hardcoded roles, which is why the same SDK can express
+// Gas Town, Ralph, or any other pack.
+//
+// Modeled at system → container → component granularity (major subsystems and
+// their key components), not one box per file (~2000 Go files). Delivery state
+// is tagged from real evidence — see spec.c4 for the legend.
+//
+// Every element links to its source path and, where one exists, to the
+// relevant current-state architecture doc under engdocs/architecture/.
+
+model {
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Actors.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  operator = actor 'Operator' {
+    description 'Runs `gc` — inits cities, registers rigs, slings work, watches the fleet'
+  }
+
+  codingAgent = actor 'Coding agent' {
+    description 'A configured worker (claude / codex / gemini …) running in a session; claims and works beads. Behavior is 100% pack-supplied prompt — the SDK hardcodes no roles'
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // External systems — runtimes, work backend, and source-control surface.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  agentProviders = externalSystem 'Agent CLIs / runtimes' {
+    description 'The engines a session runs on: claude / codex / gemini CLIs, tmux, subprocess, exec scripts, Kubernetes, ACP, and Cloudflare Worker runtime'
+  }
+
+  beadBackend = externalSystem 'bd + Dolt' {
+    description 'The default work backend: the `bd` (beads) CLI over a Dolt-versioned store. File/mem stores are in-process alternatives'
+  }
+
+  github = externalSystem 'GitHub' {
+    description 'Source-control surface: PR readiness gates (checks, mergeability, conflicts) read by GitHub-monitor orders'
+  }
+
+  gitRepos = externalSystem 'Rig git repositories' {
+    description 'External projects registered as rigs; each gets its own bead namespace and agent scope. Work runs here'
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // The Gas City system.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  gascity = system 'Gas City' {
+    description 'Orchestration-builder SDK: a controller loop that reconciles desired config to running agents and drives formula bead-graphs to completion'
+    link ../README.md 'README'
+    link ../engdocs/architecture/index.md 'Architecture overview'
+    link ../docs/getting-started/how-gas-city-works.md 'How Gas City works (six primitives)'
+
+    // ── The CLI + control plane: the projection surface over the domain ─────
+    cli = container 'gc CLI & control plane' {
+      description 'cmd/gc/ — arg parsing, controller wiring, runtime assembly, command handlers (619 .go files). The CLI and HTTP+SSE API are projections over the object model'
+      technology 'Go / Cobra'
+      link ../cmd/gc 'cmd/gc/'
+      link ../engdocs/architecture/api-control-plane.md 'API control plane'
+
+      cliCommands = component 'command handlers' {
+        #built
+        description 'cmd_*.go — init, rig, sling, session, convoy, order, hook, stop, suspend, …; text formatting + exit codes only'
+        link ../cmd/gc 'cmd/gc/'
+      }
+      prompts = component 'prompt rendering' {
+        #built
+        description 'renderPrompt() — Go text/template in Markdown. All agent behavior is pack-supplied; zero hardcoded role names'
+        link ../cmd/gc/prompt.go 'prompt.go'
+        link ../engdocs/architecture/prompt-templates.md 'Prompt Templates'
+      }
+      apiroute = component 'CLI ↔ API routing' {
+        #built
+        description 'apiroute.go — calls the core library directly, or routes mutations through the local supervisor HTTP API when a lock boundary requires it'
+        link ../cmd/gc/apiroute.go 'apiroute.go'
+      }
+    }
+
+    // ── Controller: the reconciliation runtime ──────────────────────────────
+    controller = container 'Controller runtime' {
+      description 'The per-city reconciliation loop: config watch → reconcile sessions → pool scaling → wisp GC → order dispatch → graph dispatch. Implemented as functions in cmd/gc/, not a standalone package'
+      technology 'Go'
+      link ../cmd/gc/controller.go 'controller.go'
+      link ../engdocs/architecture/controller.md 'Controller'
+
+      loop = component 'controller loop' {
+        #built
+        description 'controllerLoop() — ticker (default 30s) + fsnotify config-dirty edge trigger; runs the full reconcile/GC/dispatch pipeline each tick'
+        link ../cmd/gc/controller.go 'controller.go'
+      }
+      cityRuntime = component 'CityRuntime' {
+        #built
+        description 'Per-city runtime shared by the machine-wide supervisor and the hidden standalone --foreground path'
+        link ../cmd/gc/city_runtime.go 'city_runtime.go'
+      }
+      reconciler = component 'session reconciler' {
+        #built
+        description 'reconcileSessionBeads() — declarative convergence of session beads + running sessions to desired config; orphan/suspended drains, crash quarantine, idle drains, drift repair'
+        link ../cmd/gc/session_reconciler.go 'session_reconciler.go'
+        link ../engdocs/architecture/health-patrol.md 'Health Patrol'
+      }
+      pool = component 'pool evaluation' {
+        #built
+        description 'evaluatePool() — runs each pool agent scale_check in parallel, clamps to [min,max], sizes the pool'
+        link ../cmd/gc/pool.go 'pool.go'
+      }
+      orderDispatch = component 'order dispatcher' {
+        #built
+        description 'Evaluates trigger conditions (cooldown/cron/condition/event) for non-manual orders and fires their formula/exec each tick'
+        link ../cmd/gc/order_dispatch.go 'order_dispatch.go'
+        link ../engdocs/architecture/orders.md 'Orders'
+      }
+      wispGC = component 'wisp GC' {
+        #built
+        description 'TTL-based purge of closed molecules (wisps); nil-means-disabled'
+        link ../cmd/gc/wisp_gc.go 'wisp_gc.go'
+      }
+      supervisor = component 'supervisor' {
+        #built
+        description 'gc supervisor run — machine-wide process hosting one CityRuntime per registered city; the canonical long-running control process'
+        link ../cmd/gc/cmd_supervisor.go 'cmd_supervisor.go'
+        link ../internal/supervisor 'internal/supervisor/'
+      }
+    }
+
+    // ── Dispatch: kicking off and driving formula runs ──────────────────────
+    dispatch = container 'Dispatch & graph execution' {
+      description 'Sling kicks off a run (compile formula → materialize bead graph → route → nudge); the control dispatcher then drives the v2 graph to completion via control beads'
+      technology 'Go'
+      link ../internal/sling 'internal/sling/'
+      link ../engdocs/architecture/dispatch.md 'Dispatch (Sling)'
+
+      sling = component 'sling' {
+        #built
+        description 'cmd_sling.go + internal/sling — resolve target, instantiate wisp (MolCook), execute the agent sling_query ({}→bead id), auto-convoy, telemetry, nudge'
+        link ../cmd/gc/cmd_sling.go 'cmd_sling.go'
+        link ../internal/sling/sling.go 'internal/sling/sling.go'
+      }
+      controlDispatcher = component 'control dispatcher' {
+        #built
+        description 'internal/dispatch — executes control beads (check, retry, fan-out, tally, drain, scope-check, workflow-finalize) to gate, fan out, retry, and drain a v2 formula graph outside any session'
+        link ../internal/dispatch/control.go 'control.go'
+        link ../cmd/gc/dispatch_runtime.go 'dispatch_runtime.go'
+      }
+      ralph = component 'ralph loop' {
+        #evolving
+        description 'internal/dispatch/ralph.go — bounded iterate-until-done dispatch shape; a built control pattern still being generalized across packs'
+        link ../internal/dispatch/ralph.go 'ralph.go'
+      }
+      graphroute = component 'graph routing' {
+        #built
+        description 'internal/graphroute — stamps route metadata (gc.routed_to) on workflow roots / routable children so scale_check and work_query observe the same routed queue'
+        link ../internal/graphroute/graphroute.go 'graphroute.go'
+      }
+      telemetry = component 'sling telemetry' {
+        #built
+        description 'RecordSling — metrics + structured log on every dispatch attempt (success and failure)'
+        link ../internal/telemetry/recorder.go 'recorder.go'
+      }
+    }
+
+    // ── Formula & molecule: the HOW primitive ───────────────────────────────
+    formula = container 'Formulas & molecules' {
+      description 'Formula = a written-down method (TOML). Compile → flat graph (v2) or molecule (v1 single-agent sequence). A formula is the method; the beads are the work'
+      technology 'Go / TOML'
+      link ../internal/formula 'internal/formula/'
+      link ../engdocs/architecture/formulas.md 'Formulas & Molecules'
+
+      compile = component 'formula compiler' {
+        #built
+        description 'compile.go / expand.go / controlflow.go — turns a formula + vars into a graph of step beads plus controller-owned control beads'
+        link ../internal/formula/compile.go 'compile.go'
+      }
+      molecule = component 'molecule materialization' {
+        #built
+        description 'internal/molecule — v1 run shape: a root bead plus child step beads (ephemeral runs are wisps); graph_apply lands the compiled graph on the store'
+        link ../internal/molecule/molecule.go 'molecule.go'
+        link ../engdocs/architecture/life-of-a-molecule.md 'Life of a Molecule'
+      }
+      convergence = component 'convergence loops' {
+        #built
+        description 'internal/convergence — bounded iterative refinement: condition/gate evaluation, artifact capture, ACL on retry steps'
+        link ../internal/convergence 'internal/convergence/'
+      }
+      reviewQuorum = component 'review-quorum finalizer' {
+        #planned
+        #risk
+        description 'internal/reviewquorum — defines the durable two-lane review synthesis contract. RISK: the Go finalizer is NOT yet invoked by formula synthesis (formula writes the summary state directly); the contract and its consumer are not yet connected'
+        link ../internal/reviewquorum/finalize.go 'finalize.go'
+      }
+    }
+
+    // ── Beads store: the universal persistence substrate ────────────────────
+    beads = container 'Bead store' {
+      description 'The work spine: everything is a bead (task, mail, session, convoy, molecule), differing only by type, behind one Store interface. The loop closes through this shared state, so work survives a crash on either side'
+      technology 'Go'
+      link ../internal/beads 'internal/beads/'
+      link ../engdocs/architecture/beads.md 'Bead Store'
+
+      storeIface = component 'Store interface' {
+        #built
+        description 'beads.go — Create/Get/Update/Close/List/Ready/Children/ListByLabel/SetMetadata/MolCook over all work units'
+        link ../internal/beads/beads.go 'beads.go'
+      }
+      bdStore = datastore 'BdStore (bd + Dolt)' {
+        #built
+        description 'bdstore.go — production store: shells the `bd` CLI over a Dolt-versioned database; MolCook does formula-backed wisp instantiation via `bd mol`'
+        link ../internal/beads/bdstore.go 'bdstore.go'
+      }
+      fileStore = datastore 'FileStore' {
+        #built
+        description 'filestore.go — file-based store (GC_BEADS=file); no dolt/bd/flock needed'
+        link ../internal/beads/filestore.go 'filestore.go'
+      }
+      memStore = datastore 'MemStore' {
+        #built
+        description 'memstore.go — in-memory store for tests and fakes'
+        link ../internal/beads/memstore.go 'memstore.go'
+      }
+      cachingStore = component 'caching store + ready projection' {
+        #evolving
+        description 'caching_store*.go — read-model cache + ready projection + reconcile/recovery in front of a backend; a built but actively-moving performance layer'
+        link ../internal/beads/caching_store.go 'caching_store.go'
+      }
+    }
+
+    // ── Session & runtime: the Agent primitive ──────────────────────────────
+    runtime = container 'Session & runtime providers' {
+      description 'Start/stop/prompt/observe sessions regardless of engine. The SDK manages session lifecycle; the prompt defines behavior — these concerns never cross'
+      technology 'Go'
+      link ../internal/runtime 'internal/runtime/'
+      link ../engdocs/architecture/session.md 'Session'
+
+      providerIface = component 'Provider interface' {
+        #built
+        description 'runtime.go — the lowest-level agent-runtime seam: Start/Stop/IsRunning/ListRunning/Interrupt/Peek/Nudge/Set+GetMeta'
+        link ../internal/runtime/runtime.go 'runtime.go'
+      }
+      session = component 'session lifecycle' {
+        #built
+        description 'internal/session — bead-backed session identity, naming, wait helpers, crash adoption (adopt live sessions on controller restart)'
+        link ../internal/session 'internal/session/'
+      }
+      tmux = component 'tmux provider' {
+        #built
+        description 'Production provider — sessions as tmux windows'
+        link ../internal/runtime/tmux 'tmux/'
+      }
+      subprocess = component 'subprocess / exec providers' {
+        #built
+        description 'subprocess (remote) + exec (script-driven) providers'
+        link ../internal/runtime/subprocess 'subprocess/'
+      }
+      k8s = component 'k8s provider' {
+        #evolving
+        description 'Kubernetes-pod provider; built but a less-exercised runtime'
+        link ../internal/runtime/k8s 'k8s/'
+      }
+      acp = component 'ACP / hybrid / auto routing' {
+        #evolving
+        description 'ACP protocol provider plus auto/hybrid layers that compose the concrete providers'
+        link ../internal/runtime/acp 'acp/'
+        link ../internal/runtime/hybrid 'hybrid/'
+      }
+      cloudflare = component 'Cloudflare Worker provider' {
+        #research
+        description 'cloudflare/ — Provider over a Cloudflare Worker runtime API; experimental remote-runtime track'
+        link ../internal/runtime/cloudflare/cloudflare.go 'cloudflare.go'
+      }
+    }
+
+    // ── Config & packs: the Pack primitive ──────────────────────────────────
+    config = container 'Config & packs' {
+      description 'city.toml schema + progressive activation (Levels 0–8 by section presence) + multi-layer override resolution. Pack config IS the feature flag; the City is the local (root) pack'
+      technology 'Go / TOML'
+      link ../internal/config 'internal/config/'
+      link ../engdocs/architecture/config.md 'Config System'
+
+      configLoad = component 'config loader' {
+        #built
+        description 'config.go — Load() / LoadWithIncludes(); City/Pack/Agent/Rig/ProviderSpec types; EffectiveSlingQuery / work_query / scale_check'
+        link ../internal/config/config.go 'config.go'
+      }
+      packs = component 'pack composition' {
+        #built
+        description 'pack.go / compose.go / pack_include.go — pack expansion, imports, and layered override/patch resolution'
+        link ../internal/config/pack.go 'pack.go'
+      }
+      packFetch = component 'remote pack fetch' {
+        #evolving
+        description 'pack_fetch.go — fetch shared packs from remote sources before load'
+        link ../internal/config/pack_fetch.go 'pack_fetch.go'
+      }
+      revision = component 'revision + watch dirs' {
+        #built
+        description 'revision.go — SHA-256 config-bundle hash for reload detection + WatchDirs() fsnotify targets'
+        link ../internal/config/revision.go 'revision.go'
+      }
+    }
+
+    // ── Events: the Event (observe) primitive ───────────────────────────────
+    events = container 'Event bus' {
+      description 'Append-only pub/sub log of all activity. Immutable outbound notifications with monotonically increasing seq; Watch() delivers reactively without polling. Two tiers: critical (bounded) + optional (fire-and-forget)'
+      technology 'Go / JSONL'
+      link ../internal/events 'internal/events/'
+      link ../engdocs/architecture/event-bus.md 'Event Bus'
+
+      eventsProvider = component 'events.Provider' {
+        #built
+        description 'events.go — Record/List/LatestSeq/Watch/Close; storage in .gc/events.jsonl'
+        link ../internal/events/events.go 'events.go'
+      }
+      multiplexer = component 'multiplexer' {
+        #built
+        description 'multiplexer.go — fans one event stream to multiple subscribers'
+        link ../internal/events/multiplexer.go 'multiplexer.go'
+      }
+    }
+
+    // ── Messaging: composed from Bead + Session ─────────────────────────────
+    messaging = container 'Messaging (mail + nudge)' {
+      description 'Mail = a bead of type "message" (inbox = query open message beads). Nudge = text typed into a session. No new substrate'
+      technology 'Go'
+      link ../internal/mail 'internal/mail/'
+      link ../engdocs/architecture/messaging.md 'Messaging'
+
+      mail = component 'mail' {
+        #built
+        description 'mail.go / beadmail — inter-agent mail derived entirely from the bead store'
+        link ../internal/mail/mail.go 'mail.go'
+      }
+      convoy = component 'convoy' {
+        #built
+        description 'internal/convoy — container beads grouping related work; dispatch expands a convoy to its open children'
+        link ../internal/convoy/convoy.go 'convoy.go'
+      }
+    }
+
+    // ── API: the second projection over the object model ────────────────────
+    api = container 'HTTP + SSE API' {
+      description 'Every endpoint registered through Huma against annotated Go types → generated OpenAPI 3.1. The CLI and API are two typed projections over one canonical domain; long-running mutations return 202 + a request.result event'
+      technology 'Go / Huma / OpenAPI'
+      link ../internal/api 'internal/api/'
+      link ../engdocs/architecture/api-control-plane.md 'API Control Plane'
+
+      handlers = component 'API handlers' {
+        #built
+        description 'handler_*.go — typed Huma input/output, typed error returns; calls the domain in-process (never shells out to gc)'
+        link ../internal/api 'internal/api/'
+      }
+      readModel = component 'read-model cache' {
+        #evolving
+        description 'cache_read_model.go / cache_liveness.go — cached resource views for dashboards; a built but moving performance surface'
+        link ../internal/api/cache_read_model.go 'cache_read_model.go'
+      }
+    }
+
+    // ── Orders & GitHub-monitor: the WHEN automation ────────────────────────
+    orders = container 'Orders & GitHub monitor' {
+      description 'An Order automates WHEN a formula runs: a trigger (cooldown/cron/condition/event/manual) paired with the formula to fire. Health Patrol is one kind of order'
+      technology 'Go'
+      link ../internal/orders 'internal/orders/'
+      link ../engdocs/architecture/orders.md 'Orders'
+
+      orderScan = component 'order discovery & triggers' {
+        #built
+        description 'discovery.go / order.go / filter.go — scan orders/ dirs, evaluate triggers, rig-scoped labels'
+        link ../internal/orders/order.go 'order.go'
+      }
+      githubMonitor = component 'GitHub PR monitor' {
+        #evolving
+        description 'internal/githubmonitor — evaluates configured PR-readiness monitors against live or fixture PR state (clean/pending/failed/conflicted/behind)'
+        link ../internal/githubmonitor/monitor.go 'monitor.go'
+      }
+      sourceWorkflow = component 'source workflow' {
+        #evolving
+        description 'internal/sourceworkflow — branch/PR-oriented workflow helpers around source-control state'
+        link ../internal/sourceworkflow/sourceworkflow.go 'sourceworkflow.go'
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Relationships.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // Actors → surfaces
+  operator -> gascity.cli 'runs gc (init / rig / sling / session / order …)'
+  operator -> gascity.api 'HTTP + SSE (dashboards, remote)'
+  operator -> gascity.events 'watches the event stream (gc events --follow)'
+
+  // CLI → control plane / domain
+  gascity.cli.cliCommands -> gascity.controller 'starts / stops / inspects the controller'
+  gascity.cli.cliCommands -> gascity.dispatch.sling 'gc sling'
+  gascity.cli.apiroute -> gascity.api 'routes mutations through the supervisor when a lock boundary requires it'
+  gascity.cli.prompts -> gascity.config 'renders pack-supplied prompt templates'
+
+  // Controller loop
+  gascity.controller.loop -> gascity.config 'LoadWithIncludes on dirty / startup'
+  gascity.controller.loop -> gascity.controller.reconciler 'reconcile session beads to desired config'
+  gascity.controller.loop -> gascity.controller.pool 'evaluate pool scale_checks (parallel)'
+  gascity.controller.loop -> gascity.controller.orderDispatch 'dispatch due orders'
+  gascity.controller.loop -> gascity.controller.wispGC 'purge expired wisps'
+  gascity.controller.supervisor -> gascity.controller.cityRuntime 'hosts one runtime per registered city'
+  gascity.controller.reconciler -> gascity.runtime.providerIface 'start / stop / interrupt sessions'
+  gascity.controller.reconciler -> gascity.beads.storeIface 'session beads (desired vs live)'
+  gascity.controller.pool -> gascity.config 'EffectivePoolDemandQuery (scale_check)'
+  gascity.controller.orderDispatch -> gascity.orders.orderScan 'scan + evaluate triggers'
+  gascity.controller.orderDispatch -> gascity.dispatch.sling 'fire formula / exec'
+
+  // Dispatch
+  gascity.dispatch.sling -> gascity.formula.compile 'instantiate formula (--formula → MolCook)'
+  gascity.dispatch.sling -> gascity.beads.storeIface 'MolCook / auto-convoy / route metadata'
+  gascity.dispatch.sling -> gascity.runtime.providerIface 'nudge target session'
+  gascity.dispatch.sling -> gascity.dispatch.telemetry 'RecordSling (every attempt)'
+  gascity.dispatch.sling -> gascity.dispatch.graphroute 'stamp gc.routed_to on roots / children'
+  gascity.dispatch.controlDispatcher -> gascity.beads.storeIface 'execute control beads; gate / fan-out / retry / drain'
+  gascity.dispatch.controlDispatcher -> gascity.formula.convergence 'retry / gate evaluation'
+  gascity.dispatch.ralph -> gascity.beads.storeIface 'iterate-until-done over the work graph'
+
+  // Formula / molecule
+  gascity.formula.compile -> gascity.formula.molecule 'materialize compiled graph as a molecule (v1)'
+  gascity.formula.molecule -> gascity.beads.storeIface 'graph_apply: write root + step beads'
+  gascity.formula.compile -> gascity.config 'resolve formula layers + active files'
+
+  // Beads backends
+  gascity.beads.storeIface -> gascity.beads.bdStore 'default backend'
+  gascity.beads.storeIface -> gascity.beads.fileStore 'GC_BEADS=file'
+  gascity.beads.storeIface -> gascity.beads.memStore 'tests'
+  gascity.beads.cachingStore -> gascity.beads.storeIface 'read-model cache in front of a backend'
+  gascity.beads.bdStore -> beadBackend 'shells the bd CLI over Dolt'
+
+  // Runtime providers → engines
+  gascity.runtime.providerIface -> gascity.runtime.tmux 'production'
+  gascity.runtime.providerIface -> gascity.runtime.subprocess 'remote / script'
+  gascity.runtime.providerIface -> gascity.runtime.k8s 'kubernetes'
+  gascity.runtime.providerIface -> gascity.runtime.acp 'acp / hybrid / auto'
+  gascity.runtime.providerIface -> gascity.runtime.cloudflare 'experimental remote' {
+    #research
+  }
+  gascity.runtime.tmux -> agentProviders 'spawns the agent CLI (claude / codex / gemini)'
+  gascity.runtime.subprocess -> agentProviders 'spawns the agent CLI'
+  gascity.runtime.tmux -> codingAgent 'runs the session process'
+  codingAgent -> gitRepos 'edits code in the rig'
+
+  // Agents read/write the work spine
+  codingAgent -> gascity.beads.storeIface 'claims ready work, closes beads (via bd hook / work_query)'
+  codingAgent -> gascity.messaging.mail 'sends / reads inter-agent mail (beads)'
+
+  // Config / packs
+  gascity.config.configLoad -> gascity.config.packs 'expand imports + overrides'
+  gascity.config.packs -> gascity.config.packFetch 'fetch remote shared packs'
+  gascity.config.configLoad -> gitRepos 'rigs register external project paths'
+
+  // Events — activity fires events
+  gascity.beads.storeIface -> gascity.events.eventsProvider 'bead.created / bead.closed'
+  gascity.runtime.session -> gascity.events.eventsProvider 'session.woke / session.crashed'
+  gascity.controller.orderDispatch -> gascity.events.eventsProvider 'order.fired / order.completed'
+  gascity.events.eventsProvider -> gascity.events.multiplexer 'fan out to subscribers'
+  gascity.controller.orderDispatch -> gascity.events.eventsProvider 'event-triggered orders read the stream'
+
+  // Messaging
+  gascity.messaging.mail -> gascity.beads.storeIface 'message = a bead'
+  gascity.messaging.convoy -> gascity.beads.storeIface 'convoy = a container bead'
+
+  // API projection
+  gascity.api.handlers -> gascity.beads.storeIface 'in-process domain calls'
+  gascity.api.handlers -> gascity.dispatch.sling 'LaunchFormula / RouteBead'
+  gascity.api.readModel -> gascity.beads.storeIface 'cached resource views'
+  gascity.api.handlers -> gascity.events.eventsProvider 'request.result + SSE stream'
+
+  // Orders / GitHub
+  gascity.orders.githubMonitor -> github 'reads PR checks / mergeability / conflicts'
+  gascity.orders.sourceWorkflow -> github 'branch / PR workflow state'
+  gascity.orders.orderScan -> gascity.config 'thresholds, skip list, max_timeout'
+
+  // Planned wiring
+  gascity.formula.reviewQuorum -> gascity.beads.storeIface 'durable review-quorum summary (contract defined, finalizer not yet invoked)' {
+    #planned
+  }
+}

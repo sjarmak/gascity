@@ -1,0 +1,208 @@
+// Views over the Gas City model. Planned (#planned) and research (#research)
+// elements/relationships are dimmed + dashed so the "what exists vs what is
+// proposed" split is readable at a glance.
+
+views {
+
+  // Landscape — the whole system in context.
+  view index {
+    title 'Gas City — system landscape'
+    include *
+
+    style * {
+      opacity 25%
+    }
+    style element.tag == #built, element.tag == #evolving {
+      opacity 100%
+    }
+    style element.tag == #planned {
+      color muted
+      border dashed
+    }
+    style element.tag == #research {
+      color indigo
+      border dashed
+    }
+  }
+
+  // The Gas City system, decomposed into its containers.
+  view gascitySystem of gascity {
+    title 'Gas City — containers (built vs evolving vs planned)'
+    include *
+
+    style element.tag == #planned {
+      color muted
+      border dashed
+    }
+    style element.tag == #research {
+      color indigo
+      border dashed
+    }
+  }
+
+  // Per-container component views.
+  view controllerContainer of gascity.controller {
+    title 'Controller runtime — components'
+    include *
+  }
+
+  view dispatchContainer of gascity.dispatch {
+    title 'Dispatch & graph execution — components'
+    include *
+
+    style element.tag == #evolving {
+      color amber
+    }
+  }
+
+  view formulaContainer of gascity.formula {
+    title 'Formulas & molecules — components'
+    include *
+
+    style element.tag == #planned {
+      color muted
+      border dashed
+    }
+  }
+
+  view beadsContainer of gascity.beads {
+    title 'Bead store — interface & backends'
+    include *
+  }
+
+  view runtimeContainer of gascity.runtime {
+    title 'Session & runtime providers — components'
+    include *
+
+    style element.tag == #research {
+      color indigo
+      border dashed
+    }
+  }
+
+  view configContainer of gascity.config {
+    title 'Config & packs — components'
+    include *
+  }
+
+  view ordersContainer of gascity.orders {
+    title 'Orders & GitHub monitor — components'
+    include *
+  }
+
+  view apiContainer of gascity.api {
+    title 'HTTP + SSE API — components'
+    include *
+  }
+
+  // Risks & open questions — the elements that carry a #risk flag, with the
+  // open question stated in each box's description.
+  view risks {
+    title 'Risks & open questions'
+    include
+      gascity,
+      element.tag == #risk,
+      gascity.formula
+
+    style * {
+      opacity 30%
+    }
+    style element.tag == #risk {
+      opacity 100%
+      color red
+    }
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Walkthrough flows (dynamic views) — the narrative spine of the review.
+  // ───────────────────────────────────────────────────────────────────────
+
+  // Flow 1 — the controller reconciliation tick.
+  dynamic view controllerTick {
+    title 'Walkthrough — one controller reconciliation tick'
+    description 'Each tick (default 30s, or on config-dirty edge): reload config if changed, rebuild the desired agent set (pool scale_checks run in parallel), converge sessions, GC wisps, and dispatch due orders.'
+
+    gascity.controller.loop -> gascity.config.configLoad 'if dirty: LoadWithIncludes + validate'
+    gascity.controller.loop -> gascity.controller.pool 'buildAgents: run scale_checks (parallel)'
+    gascity.controller.pool -> gascity.config.configLoad 'EffectivePoolDemandQuery'
+    gascity.controller.loop -> gascity.controller.reconciler 'reconcileSessionBeads'
+    gascity.controller.reconciler -> gascity.beads.storeIface 'desired vs live session beads'
+    gascity.controller.reconciler -> gascity.runtime.providerIface 'start / stop / interrupt sessions'
+    gascity.runtime.providerIface -> gascity.events.eventsProvider 'session.woke / session.crashed'
+    gascity.controller.loop -> gascity.controller.wispGC 'purge closed molecules past TTL'
+    gascity.controller.loop -> gascity.controller.orderDispatch 'evaluate + fire due orders'
+  }
+
+  // Flow 2 — slinging a formula and driving the graph to completion.
+  dynamic view slingFormula {
+    title 'Walkthrough — sling a formula → graph drives to completion'
+    description 'Sling kicks off the run; the control dispatcher then drives the v2 graph outside any session — gating, fanning out, retrying, and draining via control beads.'
+
+    operator -> gascity.cli.cliCommands 'gc sling <pool> --formula <name>'
+    gascity.cli.cliCommands -> gascity.dispatch.sling 'doSling'
+    gascity.dispatch.sling -> gascity.formula.compile 'compile formula + vars'
+    gascity.formula.compile -> gascity.formula.molecule 'materialize graph (root + step + control beads)'
+    gascity.formula.molecule -> gascity.beads.storeIface 'graph_apply: write beads'
+    gascity.dispatch.sling -> gascity.dispatch.graphroute 'stamp gc.routed_to on root'
+    gascity.dispatch.sling -> gascity.dispatch.telemetry 'RecordSling'
+    gascity.controller.loop -> gascity.dispatch.controlDispatcher 'each tick: process ready control beads'
+    gascity.dispatch.controlDispatcher -> gascity.beads.storeIface 'fan-out / check / retry / tally / drain'
+    gascity.dispatch.controlDispatcher -> gascity.beads.storeIface 'workflow-finalize when graph closes'
+  }
+
+  // Flow 3 — an agent claims and works a bead.
+  dynamic view workBead {
+    title 'Walkthrough — an agent claims and works a bead'
+    description 'The loop closes through shared bead-store state: the controller spawns sessions but reads progress from the store and event bus, which is why work survives a crash on either side.'
+
+    gascity.controller.reconciler -> gascity.runtime.providerIface 'spawn pool session'
+    gascity.runtime.providerIface -> gascity.runtime.tmux 'tmux window'
+    gascity.runtime.tmux -> agentProviders 'launch agent CLI'
+    agentProviders -> codingAgent 'agent boots with pack-supplied prompt'
+    codingAgent -> gascity.beads.storeIface 'work_query: claim ready routed bead'
+    codingAgent -> gitRepos 'edit code in the rig'
+    codingAgent -> gascity.beads.storeIface 'close bead'
+    gascity.beads.storeIface -> gascity.events.eventsProvider 'bead.closed'
+    gascity.dispatch.controlDispatcher -> gascity.beads.storeIface 'next step becomes ready'
+  }
+
+  // Flow 4 — an event-triggered order fires a remediation formula.
+  dynamic view orderFires {
+    title 'Walkthrough — an order fires a formula'
+    description 'An Order automates WHEN a formula runs. Event-triggered orders read the event stream to decide; the same notifications humans watch can drive the fleet — no specific agent role required.'
+
+    gascity.controller.loop -> gascity.controller.orderDispatch 'each tick'
+    gascity.controller.orderDispatch -> gascity.orders.orderScan 'scan orders/ + evaluate triggers'
+    gascity.orders.orderScan -> gascity.events.eventsProvider 'event-triggered: read the stream'
+    gascity.orders.githubMonitor -> github 'condition-triggered: read PR readiness'
+    gascity.controller.orderDispatch -> gascity.dispatch.sling 'trigger met: sling the formula'
+    gascity.controller.orderDispatch -> gascity.events.eventsProvider 'order.fired / order.completed'
+  }
+
+  // Planned + research lens: contracts defined but not yet wired in.
+  view planned {
+    title 'Planned & research work'
+    include
+      gascity,
+      gascity.formula,
+      gascity.formula.reviewQuorum,
+      gascity.runtime,
+      gascity.runtime.cloudflare,
+      gascity.beads.storeIface,
+      gascity.runtime.providerIface
+
+    style * {
+      opacity 30%
+    }
+    style element.tag == #planned {
+      opacity 100%
+      color muted
+      border dashed
+    }
+    style element.tag == #research {
+      opacity 100%
+      color indigo
+      border dashed
+    }
+  }
+}
