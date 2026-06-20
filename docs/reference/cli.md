@@ -1110,6 +1110,7 @@ gc dashboard [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--allowed-host` | stringArray |  | non-loopback Host header value to accept (repeatable); loopback is always allowed. Set this when binding the dashboard to a real hostname so DNS-rebinding protection lets it through |
 | `--api` | string |  | GC API server URL override (auto-discovered by default) |
 | `--port` | int | `8080` | HTTP port |
 
@@ -1131,6 +1132,7 @@ gc dashboard serve [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--allowed-host` | stringArray |  | non-loopback Host header value to accept (repeatable); loopback is always allowed. Set this when binding the dashboard to a real hostname so DNS-rebinding protection lets it through |
 | `--api` | string |  | GC API server URL override (auto-discovered by default) |
 | `--port` | int | `8080` | HTTP port |
 

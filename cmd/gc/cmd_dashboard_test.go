@@ -29,13 +29,15 @@ func TestRunDashboardServeAllowsNoCityWithSupervisor(t *testing.T) {
 
 	var gotPort int
 	var gotURL string
-	dashboardServeHook = func(port int, apiURL string) error {
+	var gotHosts []string
+	dashboardServeHook = func(port int, apiURL string, allowedHosts []string) error {
 		gotPort = port
 		gotURL = apiURL
+		gotHosts = allowedHosts
 		return nil
 	}
 
-	if err := runDashboardServe("gc dashboard", 9090, "", io.Discard); err != nil {
+	if err := runDashboardServe("gc dashboard", 9090, "", []string{"dash.internal"}, io.Discard); err != nil {
 		t.Fatalf("runDashboardServe() error: %v", err)
 	}
 
@@ -48,6 +50,9 @@ func TestRunDashboardServeAllowsNoCityWithSupervisor(t *testing.T) {
 	}
 	if gotURL != strings.TrimRight(wantURL, "/") {
 		t.Fatalf("dashboard api URL = %q, want %q", gotURL, strings.TrimRight(wantURL, "/"))
+	}
+	if len(gotHosts) != 1 || gotHosts[0] != "dash.internal" {
+		t.Fatalf("allowed hosts = %v, want [dash.internal]", gotHosts)
 	}
 }
 
@@ -71,12 +76,12 @@ func TestRunDashboardServeAllowsNoCityWithAPIOverride(t *testing.T) {
 	rigFlag = ""
 
 	var gotURL string
-	dashboardServeHook = func(_ int, apiURL string) error {
+	dashboardServeHook = func(_ int, apiURL string, _ []string) error {
 		gotURL = apiURL
 		return nil
 	}
 
-	if err := runDashboardServe("gc dashboard", 9090, "http://127.0.0.1:9999/", io.Discard); err != nil {
+	if err := runDashboardServe("gc dashboard", 9090, "http://127.0.0.1:9999/", nil, io.Discard); err != nil {
 		t.Fatalf("runDashboardServe() error: %v", err)
 	}
 	if gotURL != "http://127.0.0.1:9999" {
@@ -130,13 +135,13 @@ port = 9123
 
 	calledServe := false
 	var gotAPIURL string
-	dashboardServeHook = func(_ int, apiURL string) error {
+	dashboardServeHook = func(_ int, apiURL string, _ []string) error {
 		calledServe = true
 		gotAPIURL = apiURL
 		return nil
 	}
 
-	err := runDashboardServe("gc dashboard", 9090, "", io.Discard)
+	err := runDashboardServe("gc dashboard", 9090, "", nil, io.Discard)
 	if err != nil {
 		t.Fatalf("runDashboardServe() error = %v, want nil (standalone-controller API is supported)", err)
 	}
