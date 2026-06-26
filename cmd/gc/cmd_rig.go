@@ -1162,9 +1162,10 @@ func renderRigListFromAPI(fs fsys.FS, cityPath string, cr api.CachedRead[[]api.R
 }
 
 // cacheAgeBannerThresholdSeconds is the cache-age cutoff above which human
-// output appends the "reconciler may be lagging" banner. Matches the
-// enabler contract D5 documented in the ga-h6w plan.
-const cacheAgeBannerThresholdSeconds = 30.0
+// output appends the cache-age staleness banner. Lowered from the original
+// ga-h6w D5 value of 30s to 15s so the banner fires inside the post-wake lag
+// window, where the STATE column most often shows a stale cached value (#3755).
+const cacheAgeBannerThresholdSeconds = 15.0
 
 // RigListJSON is the JSON output format for "gc rig list --json".
 type RigListJSON struct {

@@ -798,9 +798,21 @@ func renderSessionListFromAPI(cr api.CachedRead[[]SessionView], jsonOutput bool,
 	_ = w.Flush() //nolint:errcheck // best-effort stdout
 
 	if cr.AgeSeconds > cacheAgeBannerThresholdSeconds {
-		fmt.Fprintf(stdout, "(cache age: %.0fs — reconciler may be lagging)\n", cr.AgeSeconds) //nolint:errcheck
+		fmt.Fprintln(stdout, sessionStateCacheAgeBanner(cr.AgeSeconds)) //nolint:errcheck
 	}
 	return 0
+}
+
+// sessionStateCacheAgeBanner is the human-output footer for the session list and
+// peek views when the supervisor read-cache age exceeds
+// cacheAgeBannerThresholdSeconds. Unlike the generic cache-age banner, it names
+// the STATE column — the value most likely to lag a just-woken session within
+// the reconciler poll window — and points operators at out-of-band ground truth.
+// cr.AgeSeconds is a single whole-list value, so this stays a low-noise footer
+// rather than a per-row marker (true per-row freshness needs a SessionView
+// state_updated_at field — out of scope, follow-up gco-cyt3).
+func sessionStateCacheAgeBanner(ageSeconds float64) string {
+	return fmt.Sprintf("(cache age: %.0fs — STATE may lag the runtime; verify a just-woken session via transcript / bead state)", ageSeconds)
 }
 
 // sessionViewTarget mirrors sessionListTarget's fallback behavior, but
@@ -2097,7 +2109,7 @@ func renderSessionPeekFromAPI(cr api.CachedRead[api.SessionView], target string,
 		fmt.Fprintln(stdout) //nolint:errcheck // best-effort stdout
 	}
 	if cr.AgeSeconds > cacheAgeBannerThresholdSeconds {
-		fmt.Fprintf(stdout, "(cache age: %.0fs — reconciler may be lagging)\n", cr.AgeSeconds) //nolint:errcheck
+		fmt.Fprintln(stdout, sessionStateCacheAgeBanner(cr.AgeSeconds)) //nolint:errcheck
 	}
 	return 0
 }
