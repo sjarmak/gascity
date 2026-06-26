@@ -84,6 +84,7 @@ type CityRuntime struct {
 	trace                   *sessionReconcilerTraceManager
 
 	orderSweepWatchdogLast             time.Time
+	orderWispSweepWatchdogLast         time.Time
 	orderTrackingRetentionWatchdogLast time.Time
 	nudgeMailSweepWatchdogLast         time.Time
 	wispIndexMigrationApplied          bool
@@ -1281,6 +1282,7 @@ func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
 	}
 	cr.rescanOrderDispatcherIfDue(ctx, cityRoot, now)
 	cr.runOrderTrackingSweepWatchdog(now)
+	cr.runOrderWispSubtreeSweepWatchdog(now)
 	cr.runOrderTrackingRetentionWatchdog(now)
 	cr.runNudgeMailSweepWatchdog(now)
 	if cr.od != nil {
@@ -1422,6 +1424,46 @@ func (cr *CityRuntime) runOrderTrackingSweepWatchdog(now time.Time) {
 	n := result.trackingClosed
 	if n > 0 && cr.stderr != nil {
 		fmt.Fprintf(cr.stderr, "%s: order tracking sweep watchdog closed %d stale tracking bead(s)\n", cr.logPrefix, n) //nolint:errcheck // best-effort stderr
+	}
+}
+
+// runOrderWispSubtreeSweepWatchdog reaps abandoned order-run molecule/wisp
+// subtrees the tracking-bead watchdog cannot see (#3407). A molecule root and
+// its steps carry order-run:<name> but never order-tracking, so an abandoned
+// subtree — a pool step the agent never executed, left open under the order's
+// molecule — falls outside the tracking sweep's label filter. That open
+// descendant both trips the single-flight dispatch guard forever (the order
+// never fires again) and is never auto-reaped, so the schedule wedges silently
+// until an operator runs `gc order sweep-tracking --include-wisps`. This pass
+// closes such subtrees automatically, but only once EVERY open bead in them is
+// older than the generous staleness window, so a genuinely in-flight molecule
+// (which keeps emitting fresh beads) is never touched. It runs on its own
+// slower cadence because the reap needs a full-store scan, not an indexed
+// lookup.
+func (cr *CityRuntime) runOrderWispSubtreeSweepWatchdog(now time.Time) {
+	if !cr.orderWispSweepWatchdogLast.IsZero() && now.Sub(cr.orderWispSweepWatchdogLast) < orderWispSubtreeWatchdogInterval {
+		return
+	}
+	cr.orderWispSweepWatchdogLast = now
+
+	stores, _, closeOpened, storeErr := cr.orderTrackingSweepStores()
+	defer closeOpened()
+	if len(stores) == 0 {
+		if storeErr != nil && cr.stderr != nil {
+			fmt.Fprintf(cr.stderr, "%s: order wisp subtree sweep watchdog: %v\n", cr.logPrefix, storeErr) //nolint:errcheck // best-effort stderr
+		}
+		return
+	}
+
+	cutoff := now.Add(-orderWispSubtreeWatchdogStaleAfter)
+	n, sweepErr := sweepStaleOrderWispSubtreesAllOrdersAcrossStores(stores, cutoff, orderWispSubtreeWatchdogMetadataInitiator)
+	if err := errors.Join(storeErr, sweepErr); err != nil {
+		if cr.stderr != nil {
+			fmt.Fprintf(cr.stderr, "%s: order wisp subtree sweep watchdog: %v\n", cr.logPrefix, err) //nolint:errcheck // best-effort stderr
+		}
+	}
+	if n > 0 && cr.stderr != nil {
+		fmt.Fprintf(cr.stderr, "%s: order wisp subtree sweep watchdog reaped %d abandoned order-run bead(s)\n", cr.logPrefix, n) //nolint:errcheck // best-effort stderr
 	}
 }
 

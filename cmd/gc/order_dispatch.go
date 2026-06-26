@@ -77,6 +77,25 @@ const (
 	defaultMaxOrderDispatchesPerTick = 4
 	orderTrackingSweepCloseBudget    = 4
 
+	// orderWispSubtreeWatchdogInterval gates the controller's automatic
+	// abandoned-molecule reaper (#3407). It runs far less often than the
+	// 30s tracking-bead watchdog because abandonment is rare and the reap
+	// needs a full-store scan rather than an indexed label lookup; a wedged
+	// order schedule recovers within one interval.
+	orderWispSubtreeWatchdogInterval = 5 * time.Minute
+	// orderWispSubtreeWatchdogStaleAfter is the minimum age of EVERY open
+	// bead in an order-run molecule subtree before the automatic reaper
+	// closes it. It is deliberately far larger than the tracking-bead window
+	// (and any in-flight pool step's bead age) so a genuinely-progressing
+	// molecule — which keeps emitting fresh beads — is never reaped; only a
+	// subtree abandoned with all-old open descendants (the pool step that was
+	// never executed) qualifies.
+	orderWispSubtreeWatchdogStaleAfter = 2 * time.Hour
+	// orderWispSubtreeWatchdogMetadataInitiator tags closes made by the
+	// automatic abandoned-molecule reaper, distinct from the operator CLI's
+	// scoped --include-wisps sweep and the tracking-bead watchdog.
+	orderWispSubtreeWatchdogMetadataInitiator = "controller-wisp-watchdog"
+
 	// orderTrackingRetentionWatchdogInterval is the minimum time between
 	// controller-driven closed-bead retention sweeps. 15 minutes balances
 	// effective cleanup against per-tick overhead.
@@ -2110,7 +2129,7 @@ func sweepStaleOrderTrackingWithOptionsLimitMode(store beads.Store, now time.Tim
 	}
 
 	if includeWispSubtrees {
-		n, err := sweepStaleOrderWispSubtreesMode(store, cutoff, onlyOrders, initiator, dryRun)
+		n, err := sweepStaleOrderWispSubtreesMode(store, cutoff, onlyOrders, initiator, dryRun, false)
 		result.wispClosed = n
 		if err != nil {
 			return result, err
@@ -2326,15 +2345,52 @@ func orderTrackingClosedReferenceTime(b beads.Bead) time.Time {
 }
 
 func sweepStaleOrderWispSubtrees(store beads.Store, cutoff time.Time, onlyOrders map[string]struct{}) (int, error) {
-	return sweepStaleOrderWispSubtreesMode(store, cutoff, onlyOrders, orderTrackingSweepMetadataInitiator, false)
+	return sweepStaleOrderWispSubtreesMode(store, cutoff, onlyOrders, orderTrackingSweepMetadataInitiator, false, false)
 }
 
-func sweepStaleOrderWispSubtreesMode(store beads.Store, cutoff time.Time, onlyOrders map[string]struct{}, initiator string, dryRun bool) (int, error) {
-	batchIDs, handled, err := staleOrderWispSubtreeBatchCloseIDs(store, cutoff, onlyOrders)
+// sweepStaleOrderWispSubtreesAllOrders reaps abandoned order-run molecule
+// subtrees for EVERY order, without a name filter, closing only subtrees whose
+// open beads are all older than cutoff. Unlike the operator-facing scoped
+// sweep (which requires --include-wisps plus explicit order names), it is the
+// controller watchdog's automatic recovery path (#3407): an abandoned subtree
+// both trips the single-flight dispatch guard forever and is invisible to the
+// tracking-bead sweep (molecule roots/steps carry order-run:<name> but never
+// order-tracking). It relies on the generous watchdog cutoff and the
+// openSubtreeOlderThan freshness veto to leave in-flight pool work untouched.
+// Legacy graph-v2 wisps without gc.root_bead_id stamps are not reaped here;
+// those remain the scoped operator CLI's responsibility.
+func sweepStaleOrderWispSubtreesAllOrders(store beads.Store, cutoff time.Time, initiator string) (int, error) {
+	return sweepStaleOrderWispSubtreesMode(store, cutoff, nil, initiator, false, true)
+}
+
+// sweepStaleOrderWispSubtreesAllOrdersAcrossStores runs the automatic
+// abandoned-molecule reaper across every order-tracking store, summing reaped
+// bead counts. A per-store failure is collected and the remaining stores are
+// still swept, mirroring the tracking-bead watchdog's best-effort behavior.
+func sweepStaleOrderWispSubtreesAllOrdersAcrossStores(stores []beads.Store, cutoff time.Time, initiator string) (int, error) {
+	total := 0
+	var errs []error
+	for i, store := range stores {
+		if store == nil {
+			continue
+		}
+		n, err := sweepStaleOrderWispSubtreesAllOrders(store, cutoff, initiator)
+		total += n
+		if err != nil {
+			errs = append(errs, fmt.Errorf("reaping abandoned order wisp subtrees %s: %w", orderTrackingSweepStoreLabel(store, i), err))
+		}
+	}
+	return total, errors.Join(errs...)
+}
+
+func sweepStaleOrderWispSubtreesMode(store beads.Store, cutoff time.Time, onlyOrders map[string]struct{}, initiator string, dryRun, allOrders bool) (int, error) {
+	batchIDs, handled, err := staleOrderWispSubtreeBatchCloseIDs(store, cutoff, onlyOrders, allOrders)
 	if err != nil {
 		return 0, err
 	}
-	if handled {
+	// allOrders has no scoped name list, so the legacy per-order-name walk
+	// fallback below cannot run for it; the stamped batch path is authoritative.
+	if handled || allOrders {
 		if dryRun || len(batchIDs) == 0 {
 			return len(batchIDs), nil
 		}
@@ -2416,8 +2472,8 @@ func closeStaleOrderWispIDs(store beads.Store, ids []string, initiator string) (
 	return n, nil
 }
 
-func staleOrderWispSubtreeBatchCloseIDs(store beads.Store, cutoff time.Time, onlyOrders map[string]struct{}) ([]string, bool, error) {
-	if len(onlyOrders) == 0 {
+func staleOrderWispSubtreeBatchCloseIDs(store beads.Store, cutoff time.Time, onlyOrders map[string]struct{}, allOrders bool) ([]string, bool, error) {
+	if len(onlyOrders) == 0 && !allOrders {
 		return nil, false, fmt.Errorf("include-wisps requires at least one order name")
 	}
 	all, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
@@ -2477,8 +2533,10 @@ func staleOrderWispSubtreeBatchCloseIDs(store beads.Store, cutoff time.Time, onl
 		if !ok {
 			continue
 		}
-		if _, ok := onlyOrders[name]; !ok {
-			continue
+		if !allOrders {
+			if _, ok := onlyOrders[name]; !ok {
+				continue
+			}
 		}
 		if root.CreatedAt.IsZero() || !root.CreatedAt.Before(cutoff) {
 			continue
