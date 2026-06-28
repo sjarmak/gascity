@@ -3612,6 +3612,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeSessionColdStartTimeout) | ({
     type: 'session.crashed';
 } & TypedEventStreamEnvelopeSessionCrashed) | ({
+    type: 'session.dialog_dismissed';
+} & TypedEventStreamEnvelopeSessionDialogDismissed) | ({
     type: 'session.drain_acked_with_assigned_work';
 } & TypedEventStreamEnvelopeSessionDrainAckedWithAssignedWork) | ({
     type: 'session.draining';
@@ -4394,6 +4396,20 @@ export type TypedEventStreamEnvelopeSessionCrashed = {
 };
 
 /**
+ * TypedEventStreamEnvelope session.dialog_dismissed
+ */
+export type TypedEventStreamEnvelopeSessionDialogDismissed = {
+    actor: string;
+    message?: string;
+    payload: SessionLifecyclePayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'session.dialog_dismissed';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedEventStreamEnvelope session.drain_acked_with_assigned_work
  */
 export type TypedEventStreamEnvelopeSessionDrainAckedWithAssignedWork = {
@@ -4755,6 +4771,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeSessionColdStartTimeout) | ({
     type: 'session.crashed';
 } & TypedTaggedEventStreamEnvelopeSessionCrashed) | ({
+    type: 'session.dialog_dismissed';
+} & TypedTaggedEventStreamEnvelopeSessionDialogDismissed) | ({
     type: 'session.drain_acked_with_assigned_work';
 } & TypedTaggedEventStreamEnvelopeSessionDrainAckedWithAssignedWork) | ({
     type: 'session.draining';
@@ -5586,6 +5604,21 @@ export type TypedTaggedEventStreamEnvelopeSessionCrashed = {
     subject?: string;
     ts: string;
     type: 'session.crashed';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope session.dialog_dismissed
+ */
+export type TypedTaggedEventStreamEnvelopeSessionDialogDismissed = {
+    actor: string;
+    city: string;
+    message?: string;
+    payload: SessionLifecyclePayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'session.dialog_dismissed';
     workflow?: WorkflowEventProjection;
 };
 
