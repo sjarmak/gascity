@@ -594,6 +594,55 @@ func TestRuntimeScriptManagedStateBeatsStaleEnvPort(t *testing.T) {
 	}
 }
 
+// TestRuntimeScriptTCPReachableHonorsDoltHost guards gascity#2883: the
+// reachability probe in managed_runtime_tcp_reachable must target
+// GC_DOLT_HOST (defaulting to 127.0.0.1) rather than a hardcoded
+// 127.0.0.1. The bug made dolt-health declare a remote-only Dolt server
+// unreachable on every cooldown — the SQL probe that would have worked
+// was never attempted because the TCP precheck always failed on loopback.
+//
+// The test binds a listener on a non-default loopback alias and points
+// GC_DOLT_HOST at it: a probe that still hardcodes 127.0.0.1 cannot reach
+// that port, so only a host-honoring probe reports it reachable. Platforms
+// without spare loopback aliases (e.g. stock macOS) skip rather than fail.
+func TestRuntimeScriptTCPReachableHonorsDoltHost(t *testing.T) {
+	const altHost = "127.0.0.2"
+	lc := net.ListenConfig{}
+	listener, err := lc.Listen(t.Context(), "tcp", net.JoinHostPort(altHost, "0"))
+	if err != nil {
+		t.Skipf("cannot bind %s (no spare loopback alias on this platform): %v", altHost, err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	root := repoRoot(t)
+	const script = `. "$GC_PACK_DIR/assets/scripts/runtime.sh" >/dev/null 2>&1
+if managed_runtime_tcp_reachable "$GC_PROBE_PORT"; then printf reachable; else printf unreachable; fi`
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Env = append(filteredEnv(
+		"GC_CITY_PATH",
+		"GC_PACK_DIR",
+		"GC_DOLT_PORT",
+		"GC_DOLT_HOST",
+		"GC_PROBE_PORT",
+	),
+		"GC_CITY_PATH="+t.TempDir(),
+		"GC_PACK_DIR="+root,
+		// Operator seed so sourcing runtime.sh resolves a port (no managed
+		// state in the temp city); the value is irrelevant to the probe call.
+		"GC_DOLT_PORT="+strconv.Itoa(port),
+		"GC_DOLT_HOST="+altHost,
+		"GC_PROBE_PORT="+strconv.Itoa(port),
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("runtime.sh probe failed: %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "reachable" {
+		t.Fatalf("managed_runtime_tcp_reachable with GC_DOLT_HOST=%s probing :%d = %q, want reachable (probe must honor GC_DOLT_HOST, not hardcode 127.0.0.1)", altHost, port, got)
+	}
+}
+
 func TestRuntimeScriptPortPrecedenceToleratesInconclusiveLsof(t *testing.T) {
 	tests := []struct {
 		name        string
