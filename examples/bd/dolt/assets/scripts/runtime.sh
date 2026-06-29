@@ -155,24 +155,27 @@ managed_runtime_tcp_reachable() (
       ;;
   esac
 
+  # Probe the configured Dolt host, not a hardcoded loopback: a remote-only
+  # server (dolt.auto-start=false, [dolt].host=<remote>) lives off 127.0.0.1,
+  # so a loopback probe always failed and suppressed the SQL ping that would
+  # have worked (gascity#2883). Mirrors host="${GC_DOLT_HOST:-127.0.0.1}" in
+  # commands/health/run.sh.
+  host="${GC_DOLT_HOST:-127.0.0.1}"
+
   if command -v nc >/dev/null 2>&1; then
-    nc -z 127.0.0.1 "$port" >/dev/null 2>&1
+    nc -z "$host" "$port" >/dev/null 2>&1
     return $?
   fi
 
   if command -v python3 >/dev/null 2>&1; then
-    python3 - "$port" <<'PY' >/dev/null 2>&1
+    python3 - "$host" "$port" <<'PY' >/dev/null 2>&1
 import socket
 import sys
 
-sock = socket.socket()
-sock.settimeout(0.25)
 try:
-    sock.connect(("127.0.0.1", int(sys.argv[1])))
+    socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=0.25).close()
 except OSError:
     raise SystemExit(1)
-finally:
-    sock.close()
 PY
     return $?
   fi
