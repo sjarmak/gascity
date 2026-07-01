@@ -1294,3 +1294,97 @@ func TestPathStrictlyInside(t *testing.T) {
 		}
 	}
 }
+
+// --- WorktreeDiskSizeCheck: maintenance-artifact exclusion (#2894) ---
+
+// writeSizedFile writes n bytes to path, creating parent dirs.
+func writeSizedFile(t *testing.T, path string, n int) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, make([]byte, n), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWorktreeDiskSizeCheck_ExcludesMaintenanceBackupDirs asserts that an
+// in-path Dolt GC backup does not inflate the measured rig footprint: the
+// scan with a .dolt.bak-<ts>/ present returns the same size as without it
+// (gastownhall/gascity#2894, acceptance criterion 1).
+func TestWorktreeDiskSizeCheck_ExcludesMaintenanceBackupDirs(t *testing.T) {
+	dir := t.TempDir()
+	rig := filepath.Join(dir, ".gc", "worktrees", "rig-a")
+	// Live working file that must always be counted.
+	writeSizedFile(t, filepath.Join(rig, "live.txt"), 4096)
+
+	c := NewWorktreeDiskSizeCheck(config.DoctorConfig{
+		WorktreeRigWarnSize:  "10GB",
+		WorktreeRigErrorSize: "50GB",
+	})
+
+	baseline, exists, err := c.measureDir(rig)
+	if err != nil || !exists {
+		t.Fatalf("baseline measure: exists=%v err=%v", exists, err)
+	}
+	if baseline != 4096 {
+		t.Fatalf("baseline size = %d, want 4096", baseline)
+	}
+
+	// bd gc writes a large backup inside the rig path.
+	bak := filepath.Join(rig, ".beads", ".dolt.bak-20260701T000000")
+	writeSizedFile(t, filepath.Join(bak, "oldgen", "chunk-0.bin"), 1<<20) // 1 MB
+	writeSizedFile(t, filepath.Join(bak, "chunk-1.bin"), 1<<20)           // 1 MB
+
+	withBackup, exists, err := c.measureDir(rig)
+	if err != nil || !exists {
+		t.Fatalf("with-backup measure: exists=%v err=%v", exists, err)
+	}
+	if withBackup != baseline {
+		t.Errorf("size with backup = %d, want %d (backup dir must be excluded)", withBackup, baseline)
+	}
+}
+
+// TestWorktreeDiskSizeCheck_CountsNonBackupDirs guards against the exclusion
+// being too aggressive: ordinary subdirectories (e.g. a build output tree)
+// must still be counted.
+func TestWorktreeDiskSizeCheck_CountsNonBackupDirs(t *testing.T) {
+	dir := t.TempDir()
+	rig := filepath.Join(dir, ".gc", "worktrees", "rig-a")
+	writeSizedFile(t, filepath.Join(rig, "live.txt"), 4096)
+	writeSizedFile(t, filepath.Join(rig, "build", "artifact.o"), 8192)
+
+	c := NewWorktreeDiskSizeCheck(config.DoctorConfig{
+		WorktreeRigWarnSize:  "10GB",
+		WorktreeRigErrorSize: "50GB",
+	})
+	got, exists, err := c.measureDir(rig)
+	if err != nil || !exists {
+		t.Fatalf("measure: exists=%v err=%v", exists, err)
+	}
+	if got != 4096+8192 {
+		t.Errorf("size = %d, want %d (non-backup dirs must be counted)", got, 4096+8192)
+	}
+}
+
+func TestIsMaintenanceArtifactDir(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{".dolt.bak-20260701T120000", true},
+		{".dolt.bak", true},
+		{"snapshot.bak", true},
+		{"scratch.tmp", true},
+		{".beads", false},
+		{".dolt", false},
+		{"build", false},
+		{"rig-a", false},
+		{"backup", false},
+	}
+	for _, tt := range tests {
+		if got := isMaintenanceArtifactDir(tt.name); got != tt.want {
+			t.Errorf("isMaintenanceArtifactDir(%q) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}

@@ -206,8 +206,9 @@ type rigSize struct {
 // unboundedly here; without this check the disk fills silently.
 type WorktreeDiskSizeCheck struct {
 	cfg config.DoctorConfig
-	// measureDir is injectable so tests can avoid shelling out to du.
-	// Production uses duDirBytes from checks.go.
+	// measureDir is injectable so tests can supply deterministic sizes.
+	// Production uses measureRigDirBytes from checks.go, which prunes
+	// maintenance-artifact subdirectories (gastownhall/gascity#2894).
 	measureDir func(string) (int64, bool, error)
 }
 
@@ -215,11 +216,13 @@ type WorktreeDiskSizeCheck struct {
 // The cfg is read for thresholds and policy at Run time, so reload-time
 // changes propagate naturally.
 func NewWorktreeDiskSizeCheck(cfg config.DoctorConfig) *WorktreeDiskSizeCheck {
-	// Wrap duDirBytes so its dolt-flavored error messages
-	// ("measure dolt data dir: ...") get re-tagged as worktree
-	// measurement failures when surfaced through this check.
+	// measureRigDirBytes prunes maintenance-artifact subdirectories (Dolt
+	// backups, *.bak, *.tmp) so an in-path backup neither inflates the rig
+	// footprint nor slows the scan (gastownhall/gascity#2894). Its errors are
+	// re-tagged as worktree measurement failures when surfaced through this
+	// check.
 	measure := func(path string) (int64, bool, error) {
-		n, ok, err := duDirBytes(path)
+		n, ok, err := measureRigDirBytes(path)
 		if err != nil {
 			return n, ok, fmt.Errorf("measure worktree dir %q: %w", path, err)
 		}
@@ -251,7 +254,7 @@ func (c *WorktreeDiskSizeCheck) Run(ctx *CheckContext) *CheckResult {
 
 	measure := c.measureDir
 	if measure == nil {
-		measure = duDirBytes
+		measure = measureRigDirBytes
 	}
 
 	var sizes []rigSize

@@ -2181,6 +2181,39 @@ func sumDirBytes(root string) (int64, bool, error) {
 }
 
 func sumDirBytesWithContext(ctx context.Context, root string) (int64, bool, error) {
+	return sumDirBytesFiltered(ctx, root, nil)
+}
+
+// maintenanceArtifactDirGlobs are directory-name patterns for maintenance
+// artifacts (Dolt GC backups, generic backups, transient temp dirs) that a
+// rig-size scan should skip. A large in-path backup — e.g. a multi-GB
+// .dolt.bak-<timestamp>/ that `bd gc --backup` writes alongside the live
+// store — otherwise inflates the measured footprint and slows the walk
+// enough to wedge the scan. See gastownhall/gascity#2894.
+var maintenanceArtifactDirGlobs = []string{
+	".dolt.bak-*", // Dolt GC backup with timestamp suffix
+	".dolt.bak",   // Dolt backup without suffix
+	"*.bak",       // generic maintenance backup suffix
+	"*.tmp",       // transient temp dirs
+}
+
+// isMaintenanceArtifactDir reports whether a directory base name matches any
+// maintenance-artifact pattern and should be pruned from a rig-size walk.
+func isMaintenanceArtifactDir(name string) bool {
+	for _, glob := range maintenanceArtifactDirGlobs {
+		if ok, _ := filepath.Match(glob, name); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// sumDirBytesFiltered is sumDirBytesWithContext with an optional skipDir
+// predicate. When skipDir returns true for a directory's base name, that
+// directory and its entire subtree are pruned via fs.SkipDir — so its bytes
+// are excluded and its contents are never stat'd. The root is never pruned,
+// even if its name matches. A nil predicate walks everything.
+func sumDirBytesFiltered(ctx context.Context, root string, skipDir func(name string) bool) (int64, bool, error) {
 	info, err := os.Stat(root)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -2192,7 +2225,7 @@ func sumDirBytesWithContext(ctx context.Context, root string) (int64, bool, erro
 		return 0, false, fmt.Errorf("%s is not a directory", root)
 	}
 	var total int64
-	err = filepath.WalkDir(root, func(_ string, d fs.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
@@ -2200,6 +2233,9 @@ func sumDirBytesWithContext(ctx context.Context, root string) (int64, bool, erro
 			return walkErr
 		}
 		if d.IsDir() {
+			if skipDir != nil && path != root && skipDir(d.Name()) {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		fi, statErr := d.Info()
@@ -2215,6 +2251,17 @@ func sumDirBytesWithContext(ctx context.Context, root string) (int64, bool, erro
 		return 0, true, err
 	}
 	return total, true, nil
+}
+
+// measureRigDirBytes measures a rig directory footprint while pruning
+// maintenance-artifact subdirectories (Dolt backups, *.bak, *.tmp). It uses
+// the bounded filepath walk rather than `du -sk` because du cannot portably
+// exclude paths; pruning the backup subtree also keeps the walk fast on the
+// pathological large-in-path-backup case. See gastownhall/gascity#2894.
+func measureRigDirBytes(root string) (int64, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), doltDirMeasureTimeout)
+	defer cancel()
+	return sumDirBytesFiltered(ctx, root, isMaintenanceArtifactDir)
 }
 
 func boundedSumDirBytes(root string) (int64, bool, error) {
