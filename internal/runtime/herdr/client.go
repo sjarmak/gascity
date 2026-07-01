@@ -261,8 +261,8 @@ func (c *client) paneRun(ctx context.Context, paneID, command string) error {
 // paste+Enter+confirm dance approximated — targeting the pane id, which agent
 // verbs accept even after the registry name is unavailable to the caller.
 // Panes with no registered agent (raw `exec /bin/sh -c` sessions, bare
-// shells) fall back to paste + Enter: there is no TUI prompt machinery to
-// confirm against, so delivery is best-effort by construction.
+// shells) fall back to pasteAndSubmit: there is no TUI prompt machinery to
+// confirm against, so delivery closes the loop on the paste landing instead.
 //
 // Note this path does NOT confirm the submit landed: `agent prompt` without
 // --wait reports ok the moment the text is typed. Against a live mid-session
@@ -339,8 +339,9 @@ var startupConfirmStates = []string{"working", "done", "blocked"}
 //     Enter would answer the dialog rather than do nothing. No keystroke —
 //     report it unconfirmed and let the caller record the strand.
 //
-// Unregistered panes (raw shells) keep the best-effort paste+settle+Enter
-// path. A non-nil error means the turn could not be confirmed submitted.
+// Unregistered panes (raw shells) keep the best-effort paste-confirm+Enter
+// path (pasteAndSubmit). A non-nil error means the turn could not be
+// confirmed submitted.
 func (c *client) deliverStartupTurn(ctx context.Context, paneID, text string) error {
 	args := []string{"agent", "prompt", paneID, text, "--wait"}
 	for _, s := range startupConfirmStates {
@@ -385,13 +386,38 @@ func (c *client) deliverStartupTurn(ctx context.Context, paneID, text string) er
 	return err
 }
 
-// pasteAndSubmit is the unregistered-pane delivery: paste, settle, submit.
+// pasteAndSubmit is the unregistered-pane delivery: paste, confirm the paste
+// landed, submit. `pane run` reports success even when the paste never lands
+// (empty output → nil) — a shell→TUI handoff still settling swallows it,
+// leaving an empty box that no Enter can ever submit. So each attempt
+// snapshots the visible screen, pastes, and re-reads: a paste that landed
+// changes the screen, a swallowed one leaves it identical and we re-paste on
+// the next attempt. Only once the paste is visibly in the box do we spend an
+// Enter. Bounded so a nudge that legitimately produces no work cannot spin.
 func (c *client) pasteAndSubmit(ctx context.Context, paneID, text string) error {
-	if err := c.paneRun(ctx, paneID, text); err != nil {
-		return err
+	var lastErr error
+	for attempt := 0; attempt < submitMaxAttempts; attempt++ {
+		before, rerr := c.paneRead(ctx, paneID, "visible", 0)
+		if rerr != nil {
+			lastErr = rerr // transient read failure; retry within the bound
+		}
+		if err := c.paneRun(ctx, paneID, text); err != nil {
+			return err
+		}
+		time.Sleep(c.settleDelay)
+		after, rerr := c.paneRead(ctx, paneID, "visible", 0)
+		if rerr != nil {
+			lastErr = rerr // transient read failure; retry within the bound
+		}
+		if strings.TrimSpace(before) == strings.TrimSpace(after) {
+			continue // paste swallowed — pane not input-ready yet; re-paste next attempt
+		}
+		return c.sendKeys(ctx, paneID, "Enter")
 	}
-	time.Sleep(c.settleDelay)
-	return c.sendKeys(ctx, paneID, "Enter")
+	if lastErr != nil {
+		return fmt.Errorf("herdr pasteAndSubmit: %q not confirmed after %d attempts: %w", paneID, submitMaxAttempts, lastErr)
+	}
+	return fmt.Errorf("herdr pasteAndSubmit: %q paste never landed after %d attempts", paneID, submitMaxAttempts)
 }
 
 // isAgentNotFound reports whether err is herdr's missing-agent rejection
@@ -411,6 +437,13 @@ func isAgentNotFound(err error) bool {
 // `pane run` paste to commit before the submit Enter (a submit racing the
 // paste is swallowed).
 const submitSettleDelay = 1 * time.Second
+
+// submitMaxAttempts bounds pasteAndSubmit's closed-loop paste confirmation:
+// ~submitMaxAttempts·settleDelay is the worst-case latency before it gives up
+// and returns an error. Sized to cover a slow shell→TUI handoff under
+// restart-time load without spinning on a nudge that legitimately leaves the
+// agent idle.
+const submitMaxAttempts = 5
 
 // closePane → `herdr pane close <paneID>`.
 func (c *client) closePane(ctx context.Context, paneID string) error {
