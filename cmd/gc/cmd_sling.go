@@ -1402,7 +1402,19 @@ func doSlingNudge(a *config.Agent, cityName, cityPath string, cfg *config.City,
 				}
 			}
 		}
-		// No running config session — poke controller for immediate wake.
+		// No running pool session. An instance-expandable agent may still be
+		// fronted by a running named session bound to its base identity (for
+		// example an always-on wake_mode=resume session), which is not among the
+		// pool refs above (#3412). Nudge it directly if it is live before falling
+		// back to a controller poke.
+		if sn := lookupSessionNameOrLegacy(store, cityName, a.QualifiedName(), st); sn != "" {
+			target := buildSlingNudgeTarget(*a, cityName, cityPath, cfg, store, sn)
+			if obs, obsErr := workerObserveNudgeTarget(target, store, sp); obsErr == nil && obs.Running {
+				deliverSlingNudge(target, sp, store, cityPath, stdout, stderr)
+				return
+			}
+		}
+		// No running config or named session — poke controller for immediate wake.
 		if err := pokeController(cityPath); err != nil {
 			fmt.Fprintf(stderr, "No running sessions for %q; poke failed: %v\n", a.QualifiedName(), err) //nolint:errcheck // best-effort
 		} else {

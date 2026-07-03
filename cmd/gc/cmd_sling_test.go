@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	convoycore "github.com/gastownhall/gascity/internal/convoy"
@@ -1307,6 +1308,55 @@ func TestDoSlingNudgePoolUsesCityStoreForSessionBeads(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "gascity/workflows.codex-max-8") {
 		t.Fatalf("stdout = %q, want nudge output for city-store pool instance", stdout.String())
+	}
+}
+
+// TestDoSlingNudgePoolFallsBackToNamedSession is the guard for #3412: an
+// instance-expandable agent fronted by a running named session (bound to its
+// base identity, not a numbered pool slot) must be nudged directly, not
+// reported as "No running sessions" with a controller poke. The named session
+// is not among the pool refs, so before this fix the instance-expansion branch
+// fell straight through to pokeController.
+func TestDoSlingNudgePoolFallsBackToNamedSession(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{
+		Name:              "witness",
+		Dir:               "hw",
+		MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(3),
+	}
+	// Running named session bound to the base identity (not a numbered slot).
+	namedSession := agent.SessionNameFor(cfg.Workspace.Name, a.QualifiedName(), cfg.Workspace.SessionTemplate)
+	if err := sp.Start(context.Background(), namedSession, runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	sp.Calls = nil
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	deps.CityPath = t.TempDir()
+	prev := startNudgePoller
+	startNudgePoller = func(_, _, _ string) error { return nil }
+	t.Cleanup(func() { startNudgePoller = prev })
+
+	doSlingNudge(&a, deps.CityName, deps.CityPath, cfg, sp, deps.Store, stdout, stderr)
+
+	// Before the fix the instance-expansion branch never considered the base
+	// named session and fell through to a controller poke.
+	if strings.Contains(stdout.String(), "No running sessions") || strings.Contains(stderr.String(), "poke failed") {
+		t.Fatalf("sling nudge missed live named session and poked controller; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	// The fix must resolve and target the live base named session — not just a
+	// numbered pool slot — so it is observed as a nudge target.
+	var observedNamed bool
+	for _, call := range sp.Calls {
+		if call.Method == "IsRunning" && call.Name == namedSession {
+			observedNamed = true
+			break
+		}
+	}
+	if !observedNamed {
+		t.Fatalf("runtime calls = %#v, want IsRunning on base named session %q", sp.Calls, namedSession)
 	}
 }
 
