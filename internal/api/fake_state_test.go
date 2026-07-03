@@ -5,18 +5,22 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/configedit"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/orders"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/usage"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
 )
 
@@ -30,25 +34,31 @@ func newPostRequest(url string, body io.Reader) *http.Request {
 
 // fakeState implements State for testing.
 type fakeState struct {
-	cfg           *config.City
-	rawCfg        *config.City // optional: raw config for provenance detection
-	sp            *runtime.Fake
-	stores        map[string]beads.Store
-	cityBeadStore beads.Store   // city-level store for session beads
-	cityMailProv  mail.Provider // city-level mail provider (all mail is city-scoped)
-	eventProv     events.Provider
-	cityName      string
-	cityPath      string
-	startedAt     time.Time
-	quarantined   map[string]bool
-	autos         []orders.Order
-	services      workspacesvc.Registry
-	pokeCount     int
-	extmsgSvc     *extmsg.Services
-	adapterReg    *extmsg.AdapterRegistry
+	cfg               *config.City
+	rawCfg            *config.City // optional: raw config for provenance detection
+	sp                *runtime.Fake
+	stores            map[string]beads.Store
+	cityBeadStore     beads.Store // city-level store for session beads
+	nudgesBeadStore   beads.Store // relocated nudges store; nil falls back to cityBeadStore (default backend)
+	sessionsBeadStore beads.Store // relocated sessions store; nil falls back to cityBeadStore (default backend)
+	graphBeadStore    beads.Store // relocated graph store; nil falls back to cityBeadStore (default backend)
+	cityBeadsDiag     *beads.BeadsDiagnostic
+	cityMailProv      mail.Provider // city-level mail provider (all mail is city-scoped)
+	eventProv         events.Provider
+	cityName          string
+	cityPath          string
+	startedAt         time.Time
+	quarantined       map[string]bool
+	autos             []orders.Order
+	allOrders         []orders.Order
+	services          workspacesvc.Registry
+	pokeCount         int
+	extmsgSvc         *extmsg.Services
+	adapterReg        *extmsg.AdapterRegistry
+	maintenance       MaintenanceProvider
 }
 
-func newFakeState(t *testing.T) *fakeState {
+func newFakeState(t testing.TB) *fakeState {
 	t.Helper()
 	store := beads.NewMemStore()
 	mp := beadmail.New(store)
@@ -89,19 +99,55 @@ func (f *fakeState) MailProviders() map[string]mail.Provider {
 	}
 	return map[string]mail.Provider{f.cityName: f.cityMailProv}
 }
-func (f *fakeState) EventProvider() events.Provider           { return f.eventProv }
-func (f *fakeState) CityName() string                         { return f.cityName }
-func (f *fakeState) CityPath() string                         { return f.cityPath }
-func (f *fakeState) Version() string                          { return "test" }
-func (f *fakeState) StartedAt() time.Time                     { return f.startedAt }
-func (f *fakeState) IsQuarantined(sessionName string) bool    { return f.quarantined[sessionName] }
-func (f *fakeState) ClearCrashHistory(sessionName string)     { delete(f.quarantined, sessionName) }
-func (f *fakeState) CityBeadStore() beads.Store               { return f.cityBeadStore }
-func (f *fakeState) Orders() []orders.Order                   { return f.autos }
+func (f *fakeState) EventProvider() events.Provider        { return f.eventProv }
+func (f *fakeState) UsageSink() usage.Sink                 { return usage.Discard }
+func (f *fakeState) CityName() string                      { return f.cityName }
+func (f *fakeState) CityPath() string                      { return f.cityPath }
+func (f *fakeState) Version() string                       { return "test" }
+func (f *fakeState) StartedAt() time.Time                  { return f.startedAt }
+func (f *fakeState) IsQuarantined(sessionName string) bool { return f.quarantined[sessionName] }
+func (f *fakeState) ClearCrashHistory(sessionName string)  { delete(f.quarantined, sessionName) }
+func (f *fakeState) CityBeadStore() beads.Store            { return f.cityBeadStore }
+func (f *fakeState) NudgesBeadStore() beads.NudgesStore {
+	if f.nudgesBeadStore != nil {
+		return beads.NudgesStore{Store: f.nudgesBeadStore}
+	}
+	return beads.NudgesStore{Store: f.cityBeadStore}
+}
+
+func (f *fakeState) SessionsBeadStore() beads.SessionStore {
+	if f.sessionsBeadStore != nil {
+		return beads.SessionStore{Store: f.sessionsBeadStore}
+	}
+	return beads.SessionStore{Store: f.cityBeadStore}
+}
+
+func (f *fakeState) GraphBeadStore() beads.GraphStore {
+	if f.graphBeadStore != nil {
+		return beads.GraphStore{Store: f.graphBeadStore}
+	}
+	return beads.GraphStore{Store: f.cityBeadStore}
+}
+
+func (f *fakeState) CityBeadsDiagnostic() *beads.BeadsDiagnostic {
+	if f.cityBeadsDiag == nil {
+		return nil
+	}
+	diag := *f.cityBeadsDiag
+	return &diag
+}
+func (f *fakeState) Orders() []orders.Order { return f.autos }
+func (f *fakeState) OrdersAll() []orders.Order {
+	if f.allOrders != nil {
+		return f.allOrders
+	}
+	return f.autos
+}
 func (f *fakeState) Poke()                                    { f.pokeCount++ }
 func (f *fakeState) ServiceRegistry() workspacesvc.Registry   { return f.services }
 func (f *fakeState) ExtMsgServices() *extmsg.Services         { return f.extmsgSvc }
 func (f *fakeState) AdapterRegistry() *extmsg.AdapterRegistry { return f.adapterReg }
+func (f *fakeState) MaintenanceLoop() MaintenanceProvider     { return f.maintenance }
 
 func (f *fakeState) RawConfig() *config.City {
 	if f.rawCfg != nil {
@@ -114,6 +160,12 @@ func (f *fakeState) RawConfig() *config.City {
 type fakeMutatorState struct {
 	*fakeState
 	suspended map[string]bool
+
+	// serializeMu + serializeCalls make fakeMutatorState a ConfigWriteSerializer
+	// so pack handler tests exercise the real per-city write-lock seam and can
+	// assert mutations route through it.
+	serializeMu    sync.Mutex
+	serializeCalls atomic.Int32
 }
 
 func newFakeMutatorState(t *testing.T) *fakeMutatorState {
@@ -122,6 +174,15 @@ func newFakeMutatorState(t *testing.T) *fakeMutatorState {
 		fakeState: newFakeState(t),
 		suspended: make(map[string]bool),
 	}
+}
+
+// SerializeConfigWrite runs fn under a real lock and counts the call, mirroring
+// the production controllerState seam that shares the configedit.Editor lock.
+func (f *fakeMutatorState) SerializeConfigWrite(fn func() error) error {
+	f.serializeMu.Lock()
+	defer f.serializeMu.Unlock()
+	f.serializeCalls.Add(1)
+	return fn()
 }
 
 func (f *fakeMutatorState) SuspendAgent(name string) error { f.suspended[name] = true; return nil }
@@ -161,7 +222,7 @@ func (f *fakeMutatorState) SuspendRig(name string) error {
 		}
 	}
 	if !found {
-		return fmt.Errorf("rig %q not found", name)
+		return fmt.Errorf("%w: rig %q", configedit.ErrNotFound, name)
 	}
 	tmpl := cfg.Workspace.SessionTemplate
 	for _, a := range cfg.Agents {
@@ -187,7 +248,7 @@ func (f *fakeMutatorState) ResumeRig(name string) error {
 		}
 	}
 	if !found {
-		return fmt.Errorf("rig %q not found", name)
+		return fmt.Errorf("%w: rig %q", configedit.ErrNotFound, name)
 	}
 	tmpl := cfg.Workspace.SessionTemplate
 	for _, a := range cfg.Agents {
@@ -206,6 +267,9 @@ func (f *fakeMutatorState) ResumeRig(name string) error {
 func (f *fakeMutatorState) SuspendCity() error { f.cfg.Workspace.Suspended = true; return nil }
 func (f *fakeMutatorState) ResumeCity() error  { f.cfg.Workspace.Suspended = false; return nil }
 func (f *fakeMutatorState) CreateAgent(a config.Agent) error {
+	if err := config.ValidateAgents([]config.Agent{a}); err != nil {
+		return fmt.Errorf("%w: agent: %w", configedit.ErrValidation, err)
+	}
 	f.cfg.Agents = append(f.cfg.Agents, a)
 	return nil
 }
@@ -226,7 +290,7 @@ func (f *fakeMutatorState) UpdateAgent(name string, patch AgentUpdate) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("agent %q not found", name)
+	return fmt.Errorf("%w: agent %q", configedit.ErrNotFound, name)
 }
 
 func (f *fakeMutatorState) DeleteAgent(name string) error {
@@ -237,7 +301,7 @@ func (f *fakeMutatorState) DeleteAgent(name string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("agent %q not found", name)
+	return fmt.Errorf("%w: agent %q", configedit.ErrNotFound, name)
 }
 
 func (f *fakeMutatorState) CreateRig(r config.Rig) error {
@@ -254,13 +318,16 @@ func (f *fakeMutatorState) UpdateRig(name string, patch RigUpdate) error {
 			if patch.Prefix != "" {
 				f.cfg.Rigs[i].Prefix = patch.Prefix
 			}
+			if patch.DefaultBranch != "" {
+				f.cfg.Rigs[i].DefaultBranch = patch.DefaultBranch
+			}
 			if patch.Suspended != nil {
 				f.cfg.Rigs[i].Suspended = *patch.Suspended
 			}
 			return nil
 		}
 	}
-	return fmt.Errorf("rig %q not found", name)
+	return fmt.Errorf("%w: rig %q", configedit.ErrNotFound, name)
 }
 
 func (f *fakeMutatorState) DeleteRig(name string) error {
@@ -270,7 +337,7 @@ func (f *fakeMutatorState) DeleteRig(name string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("rig %q not found", name)
+	return fmt.Errorf("%w: rig %q", configedit.ErrNotFound, name)
 }
 
 func (f *fakeMutatorState) CreateProvider(name string, spec config.ProviderSpec) error {
@@ -278,7 +345,7 @@ func (f *fakeMutatorState) CreateProvider(name string, spec config.ProviderSpec)
 		f.cfg.Providers = make(map[string]config.ProviderSpec)
 	}
 	if _, exists := f.cfg.Providers[name]; exists {
-		return fmt.Errorf("provider %q already exists", name)
+		return fmt.Errorf("%w: provider %q", configedit.ErrAlreadyExists, name)
 	}
 	f.cfg.Providers[name] = spec
 	return nil
@@ -286,21 +353,35 @@ func (f *fakeMutatorState) CreateProvider(name string, spec config.ProviderSpec)
 
 func (f *fakeMutatorState) UpdateProvider(name string, patch ProviderUpdate) error {
 	if f.cfg.Providers == nil {
-		return fmt.Errorf("provider %q not found", name)
+		return fmt.Errorf("%w: provider %q", configedit.ErrNotFound, name)
 	}
 	spec, ok := f.cfg.Providers[name]
 	if !ok {
-		return fmt.Errorf("provider %q not found", name)
+		return fmt.Errorf("%w: provider %q", configedit.ErrNotFound, name)
 	}
 	if patch.DisplayName != nil {
 		spec.DisplayName = *patch.DisplayName
 	}
+	if patch.Base != nil {
+		spec.Base = *patch.Base
+	}
 	if patch.Command != nil {
 		spec.Command = *patch.Command
+	}
+	if patch.ACPCommand != nil {
+		spec.ACPCommand = *patch.ACPCommand
 	}
 	if patch.Args != nil {
 		spec.Args = make([]string, len(patch.Args))
 		copy(spec.Args, patch.Args)
+	}
+	if patch.ACPArgs != nil {
+		spec.ACPArgs = make([]string, len(patch.ACPArgs))
+		copy(spec.ACPArgs, patch.ACPArgs)
+	}
+	if patch.ArgsAppend != nil {
+		spec.ArgsAppend = make([]string, len(patch.ArgsAppend))
+		copy(spec.ArgsAppend, patch.ArgsAppend)
 	}
 	if patch.PromptMode != nil {
 		spec.PromptMode = *patch.PromptMode
@@ -319,16 +400,30 @@ func (f *fakeMutatorState) UpdateProvider(name string, patch ProviderUpdate) err
 			spec.Env[k] = v
 		}
 	}
+	if patch.OptionsSchemaMerge != nil {
+		spec.OptionsSchemaMerge = *patch.OptionsSchemaMerge
+	}
+	if patch.OptionsSchema != nil {
+		spec.OptionsSchema = append([]config.ProviderOption(nil), patch.OptionsSchema...)
+	}
+	if len(patch.OptionDefaults) > 0 {
+		if spec.OptionDefaults == nil {
+			spec.OptionDefaults = make(map[string]string, len(patch.OptionDefaults))
+		}
+		for k, v := range patch.OptionDefaults {
+			spec.OptionDefaults[k] = v
+		}
+	}
 	f.cfg.Providers[name] = spec
 	return nil
 }
 
 func (f *fakeMutatorState) DeleteProvider(name string) error {
 	if f.cfg.Providers == nil {
-		return fmt.Errorf("provider %q not found", name)
+		return fmt.Errorf("%w: provider %q", configedit.ErrNotFound, name)
 	}
 	if _, ok := f.cfg.Providers[name]; !ok {
-		return fmt.Errorf("provider %q not found", name)
+		return fmt.Errorf("%w: provider %q", configedit.ErrNotFound, name)
 	}
 	delete(f.cfg.Providers, name)
 	return nil
@@ -353,7 +448,7 @@ func (f *fakeMutatorState) DeleteAgentPatch(name string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("agent patch %q not found", name)
+	return fmt.Errorf("%w: agent patch %q", configedit.ErrNotFound, name)
 }
 
 func (f *fakeMutatorState) SetRigPatch(patch config.RigPatch) error {
@@ -374,7 +469,7 @@ func (f *fakeMutatorState) DeleteRigPatch(name string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("rig patch %q not found", name)
+	return fmt.Errorf("%w: rig patch %q", configedit.ErrNotFound, name)
 }
 
 func (f *fakeMutatorState) SetProviderPatch(patch config.ProviderPatch) error {
@@ -395,7 +490,7 @@ func (f *fakeMutatorState) DeleteProviderPatch(name string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("provider patch %q not found", name)
+	return fmt.Errorf("%w: provider patch %q", configedit.ErrNotFound, name)
 }
 
 func intPtr(n int) *int { return &n }

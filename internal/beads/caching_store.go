@@ -5,213 +5,804 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
-	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// CachingStore wraps a BdStore with an in-memory cache.
+// CachingStore wraps a Store with an in-memory cache.
 // Reads are served from memory when the cache is live. Writes pass
 // through to the backing store and update the cache on success.
 //
 // External writes (agents running bd directly) are picked up via the
-// bd hook → gc event emit → event bus path. Call ApplyEvent when the
-// event bus delivers bead.created/updated/closed events. A background
-// reconciler periodically syncs as a safety net.
+// bd hook -> gc event emit -> event bus path. Call ApplyEvent when the
+// event bus delivers bead.created/updated/closed events. The background
+// reconciler acts as a watchdog and only performs a full scan once the
+// cache has gone stale or degraded.
 //
-// Only wraps BdStore because the event hook path requires dolt/bd.
+// BdStore-backed caches can filter hook events by issue prefix. Other Store
+// implementations are valid backings, but run without foreign-event filtering.
 type CachingStore struct {
-	backing Store // runtime: always *BdStore; tests may use MemStore
+	backing  Store // runtime: usually *BdStore; tests and projections may use any Store
+	idPrefix string
 
-	mu       sync.RWMutex
-	beads    map[string]Bead
-	deps     map[string][]Dep
-	state    cacheState
-	syncedAt time.Time
-
-	// primeReady is closed when Prime completes (success or failure).
-	// Full-scan reads (List) block on this instead of falling through
-	// to a bd subprocess, preventing stampedes during startup.
-	primeReady chan struct{}
-	primeErr   error // set if Prime fails; readers fall through to backing
+	mu              sync.RWMutex
+	beads           map[string]Bead
+	deps            map[string][]Dep
+	depsComplete    bool
+	dirty           map[string]struct{}
+	beadSeq         map[string]uint64
+	localBeadAt     map[string]time.Time
+	deletedSeq      map[string]uint64
+	state           cacheState
+	lastFreshAt     time.Time
+	mutationSeq     uint64
+	primePartialErr error
 
 	reconciling  atomic.Bool
 	syncFailures int
 	stats        CacheStats
-	onChange     func(eventType, beadID string, payload json.RawMessage)
-	cancelFn     context.CancelFunc
+	onChange     func(eventType, beadID, runID, sessionID, stepID string, payload json.RawMessage)
+	problemf     func(string)
+	problemLog   map[string]cacheProblemLogState
+
+	// lastReconcileLogAt rate-limits the per-reconcile success log line
+	// emitted by runReconciliation. Without this, a busy cache at SMALL
+	// cadence (30 s) would still produce 2 lines/min — and at faster test
+	// cadences would flood logs. cacheReconcileSuccessLogWindow caps the
+	// rate at one line per minute, matching cacheProblemLogWindow.
+	lastReconcileLogAt     time.Time
+	primeMu                sync.Mutex
+	primeRunning           bool
+	primeCycle             *fullPrimeCycle
+	lastFullPrimeStartedAt time.Time
+	primeRetryDelay        func(attempt int) time.Duration
+
+	lifecycleMu sync.Mutex
+	lifecycleWG sync.WaitGroup
+	cancelFn    context.CancelFunc
+	stopCh      chan struct{}
+	stopped     bool
+
+	// latencyWindow holds the most recent reconciliation bd-list
+	// durations for adaptive cadence decisions. Bounded at
+	// cacheLatencyWindowSize.
+	latencyWindow []time.Duration
+	// latencyDriverActive tracks whether sustained high P95 latency has
+	// promoted the cadence to MEDIUM and is keeping it there. Bead-count
+	// pressure is independent and not reflected here. Demotion happens
+	// once the rolling window has drained — see recomputeCadenceLocked.
+	latencyDriverActive bool
+
+	applyEventBeforeCommitForTest func()
 }
+
+var (
+	_ ConditionalAssignmentReleaser = (*CachingStore)(nil)
+	_ AtomicTxStore                 = (*CachingStore)(nil)
+)
 
 type cacheState int
 
 const (
 	cacheUninitialized cacheState = iota
-	cachePartial                  // PrimeActive loaded active beads; filtered active queries hit cache immediately
+	cachePartial                  // PrimeActive loaded active beads; active queries can use the cache immediately.
 	cacheLive
 	cacheDegraded
 )
 
-// CacheStats exposes reconciliation metrics for observability.
+type cacheProblemLogState struct {
+	lastAt     time.Time
+	suppressed int64
+}
+
+type fullPrimeCycle struct {
+	done chan struct{}
+	err  error
+}
+
+// CacheStats exposes cache freshness, reconciliation, and problem state.
 type CacheStats struct {
-	TotalBeads      int
-	TotalDeps       int
-	LastReconcileAt time.Time
-	LastReconcileMs float64
-	Adds            int64
-	Removes         int64
-	Updates         int64
-	SyncFailures    int
-	State           string
+	TotalBeads              int
+	TotalDeps               int
+	LastFreshAt             time.Time
+	LastReconcileAt         time.Time
+	LastReconcileMs         float64
+	Adds                    int64
+	Removes                 int64
+	Updates                 int64
+	ReconcileRecoveries     int64
+	ReconcileCloseDeferrals int64
+	SyncFailures            int
+	ProblemCount            int64
+	LastProblemAt           time.Time
+	LastProblem             string
+	State                   string
+	// StaggerOffsetMs is the one-shot startup delay applied between Prime
+	// and the first reconciler tick, in milliseconds. Set once when
+	// StartReconciler runs; zero if stagger is disabled.
+	StaggerOffsetMs int64
+	// CurrentReconcileInterval is the effective bd-list cadence the
+	// reconciler is currently using. Composed as max(bead-count cadence,
+	// latency cadence) — see adaptiveIntervalLocked.
+	CurrentReconcileInterval time.Duration
+	// LatencyP95Ms is the P95 of the most recent N=cacheLatencyWindowSize
+	// reconciliation bd-list durations, in milliseconds. Zero until the
+	// window has been filled.
+	LatencyP95Ms float64
+	// CadenceDriver names which input drives the current cadence:
+	// "default" (SMALL, nothing pressuring), "bead-count" (>=1000 beads),
+	// "latency" (P95 above the high-water mark), or "both" (bead count
+	// and latency both push to MEDIUM).
+	CadenceDriver string
 }
 
 const (
-	maxCacheSyncFailures         = 5
-	cacheReconcileIntervalSmall  = 30 * time.Second
-	cacheReconcileIntervalMedium = 60 * time.Second
-	cacheReconcileIntervalLarge  = 120 * time.Second
+	maxCacheSyncFailures            = 5
+	cacheReconcilePollInterval      = 5 * time.Second
+	cacheReconcileIntervalSmall     = 30 * time.Second
+	cacheLazyFullPrimeRetryInterval = cacheReconcileIntervalSmall
+	cacheReconcileIntervalMedium    = 60 * time.Second
+	cacheReconcileIntervalLarge     = 120 * time.Second
+	cacheProblemLogWindow           = time.Minute
+	cacheReconcileFailureBackoff    = time.Minute
+	// cacheReconcileSuccessLogWindow rate-limits the per-reconcile success
+	// log line. Reuses the one-minute pattern from cacheProblemLogWindow so
+	// the reconciler's footprint in the operator-visible log stays bounded
+	// regardless of cadence.
+	cacheReconcileSuccessLogWindow = time.Minute
 )
 
-// NewCachingStore wraps a BdStore with an in-memory read cache.
+// StaggerOption configures the deterministic startup stagger applied
+// between Prime and the first reconciler tick. N agents starting in
+// lockstep would otherwise hit the shared dolt server simultaneously;
+// the stagger spreads first-tick load across a 0–30 s window.
+//
+// Construct one via WithStaggerAuto, WithStaggerOff, or
+// WithStaggerFixed at the call site for self-documenting intent. The
+// zero value is equivalent to WithStaggerOff().
+type StaggerOption struct {
+	auto     bool
+	fixed    bool
+	explicit time.Duration
+}
+
+// WithStaggerAuto enables a deterministic per-agent stagger derived
+// from FNV-32a(agentID) mod cacheReconcileIntervalSmall. The stagger
+// is reproducible across runs given the same agent ID.
+func WithStaggerAuto() StaggerOption {
+	return StaggerOption{auto: true}
+}
+
+// WithStaggerOff disables stagger; the reconciler enters its loop with
+// no startup delay. This is the default for tests so existing behavior
+// is preserved.
+func WithStaggerOff() StaggerOption {
+	return StaggerOption{}
+}
+
+// WithStaggerFixed sets an explicit stagger duration regardless of
+// agentID. Negative durations clamp to zero.
+func WithStaggerFixed(d time.Duration) StaggerOption {
+	if d < 0 {
+		d = 0
+	}
+	return StaggerOption{fixed: true, explicit: d}
+}
+
+// resolve returns the concrete stagger duration for this option.
+// agentID is consulted only when the option is WithStaggerAuto.
+func (o StaggerOption) resolve(agentID string) time.Duration {
+	switch {
+	case o.fixed:
+		return o.explicit
+	case o.auto:
+		return computeAutoStagger(agentID)
+	}
+	return 0
+}
+
+// computeAutoStagger hashes agentID with FNV-32a and reduces it modulo
+// cacheReconcileIntervalSmall (in milliseconds). The result lies in
+// [0, cacheReconcileIntervalSmall) and is fully deterministic — no
+// time-seeding — so test runs reproduce.
+func computeAutoStagger(agentID string) time.Duration {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(agentID))
+	modMs := cacheReconcileIntervalSmall.Milliseconds()
+	if modMs <= 0 {
+		return 0
+	}
+	return time.Duration(int64(h.Sum32())%modMs) * time.Millisecond
+}
+
+// NewCachingStore wraps a Store with an in-memory read cache.
 // Call Prime() before serving reads, then StartReconciler() for
-// background sync. The onChange callback (optional) is called for
+// watchdog reconciliation. The onChange callback (optional) is called for
 // each detected external change with event type and bead JSON.
 //
-// Only BdStore is supported because the event hook path (bd hooks →
-// gc event emit → event bus → ApplyEvent) requires dolt infrastructure.
-func NewCachingStore(backing *BdStore, onChange func(eventType, beadID string, payload json.RawMessage)) *CachingStore {
-	return newCachingStore(backing, onChange)
+// BdStore-backed caches filter hook events by issue prefix. Other Store
+// implementations are valid backings, but run without foreign-event filtering.
+//
+// onChange receives the opaque run/session correlation ids resolved from the
+// changed bead's metadata at the record site (see notifyChange); the wiring
+// stamps them onto the recorded event so the redacted export can forward them
+// as typed primitives without ever decoding the payload.
+func NewCachingStore(backing Store, onChange func(eventType, beadID, runID, sessionID, stepID string, payload json.RawMessage)) *CachingStore {
+	prefix := ""
+	bdBacking := false
+	nilBdBacking := false
+	if bd, ok := backing.(*BdStore); ok {
+		bdBacking = true
+		if bd == nil {
+			nilBdBacking = true
+		} else {
+			prefix = bd.IDPrefix()
+		}
+	} else if backing, ok := backing.(interface{ IDPrefix() string }); ok {
+		prefix = backing.IDPrefix()
+	}
+	cs := newCachingStore(backing, prefix, onChange)
+	switch {
+	case backing == nil:
+		cs.recordProblem("cache backing", errors.New("nil store backing; cache will panic on first use"))
+	case nilBdBacking:
+		cs.recordProblem("bd cache ownership", errors.New("nil *BdStore backing; cache will panic on first use"))
+	case bdBacking && cs.idPrefix == "":
+		cs.recordProblem("bd cache ownership", errors.New("missing issue prefix; foreign bead event filtering disabled"))
+	}
+	return cs
 }
 
-// NewCachingStoreForTest wraps any Store for testing. Production code
-// must use NewCachingStore with a *BdStore.
+// NewCachingStoreForTest wraps any Store for testing without production prefix
+// validation. It keeps the legacy 3-param onChange (tests do not exercise the
+// run/session ids); adaptLegacyOnChange bridges it to the production 5-param form.
 func NewCachingStoreForTest(backing Store, onChange func(eventType, beadID string, payload json.RawMessage)) *CachingStore {
-	return newCachingStore(backing, onChange)
+	return newCachingStore(backing, "", adaptLegacyOnChange(onChange))
 }
 
-func newCachingStore(backing Store, onChange func(eventType, beadID string, payload json.RawMessage)) *CachingStore {
-	return &CachingStore{
-		backing:    backing,
-		beads:      make(map[string]Bead),
-		deps:       make(map[string][]Dep),
-		onChange:   onChange,
-		primeReady: make(chan struct{}),
+// NewCachingStoreForTestWithPrefix wraps any Store for tests that need
+// production-style bead ID ownership filtering.
+func NewCachingStoreForTestWithPrefix(backing Store, idPrefix string, onChange func(eventType, beadID string, payload json.RawMessage)) *CachingStore {
+	return newCachingStore(backing, idPrefix, adaptLegacyOnChange(onChange))
+}
+
+// adaptLegacyOnChange bridges the legacy 3-param onChange used by the test
+// constructors to the production 5-param form, dropping the run/session ids the
+// tests do not exercise. Nil-safe.
+func adaptLegacyOnChange(fn func(eventType, beadID string, payload json.RawMessage)) func(eventType, beadID, runID, sessionID, stepID string, payload json.RawMessage) {
+	if fn == nil {
+		return nil
+	}
+	return func(eventType, beadID string, _, _, _ string, payload json.RawMessage) {
+		fn(eventType, beadID, payload)
 	}
 }
 
-// PrimeActive loads all non-closed beads (open + in_progress) into the
-// cache. These are fast indexed queries (~1-2s total) that populate
-// enough data for the startup path (adoption, session snapshot, desired
-// state) without waiting for the full Prime. The cache enters
-// cachePartial state: filtered List queries and Get hit cache for primed
+// SetPrimeRetryDelayForTest overrides the inter-attempt backoff Prime
+// uses when the backing store's full scan fails, so tests can exercise
+// prime-failure paths without real multi-second sleeps. Test-only.
+func (c *CachingStore) SetPrimeRetryDelayForTest(fn func(attempt int) time.Duration) {
+	c.primeRetryDelay = fn
+}
+
+func newCachingStore(backing Store, idPrefix string, onChange func(eventType, beadID, runID, sessionID, stepID string, payload json.RawMessage)) *CachingStore {
+	return &CachingStore{
+		backing:     backing,
+		idPrefix:    normalizeIDPrefix(idPrefix),
+		beads:       make(map[string]Bead),
+		deps:        make(map[string][]Dep),
+		dirty:       make(map[string]struct{}),
+		beadSeq:     make(map[string]uint64),
+		localBeadAt: make(map[string]time.Time),
+		deletedSeq:  make(map[string]uint64),
+		problemLog:  make(map[string]cacheProblemLogState),
+		onChange:    onChange,
+		problemf: func(msg string) {
+			log.Printf("beads cache: %s", msg)
+		},
+		primeRetryDelay: defaultCachePrimeRetryDelay,
+		stopCh:          make(chan struct{}),
+	}
+}
+
+func defaultCachePrimeRetryDelay(attempt int) time.Duration {
+	return time.Duration(attempt*5) * time.Second
+}
+
+// IDPrefix returns the bead ID prefix owned by this cache's backing store.
+func (c *CachingStore) IDPrefix() string {
+	if c == nil {
+		return ""
+	}
+	return c.idPrefix
+}
+
+func normalizeIDPrefix(prefix string) string {
+	return strings.Trim(strings.ToLower(strings.TrimSpace(prefix)), "-")
+}
+
+func (c *CachingStore) ownsBeadID(id string) bool {
+	if c.idPrefix == "" {
+		return true
+	}
+	id = strings.ToLower(strings.TrimSpace(id))
+	return strings.HasPrefix(id, c.idPrefix+"-")
+}
+
+// WaitForParentProjection forwards the optional parent-projection wait
+// capability to the backing store when available.
+func (c *CachingStore) WaitForParentProjection(ctx context.Context, id, oldParentID, newParentID string) error {
+	waiter, ok := c.backing.(ParentProjectionWaiter)
+	if !ok {
+		return nil
+	}
+	return waiter.WaitForParentProjection(ctx, id, oldParentID, newParentID)
+}
+
+func (c *CachingStore) noteMutationLocked(ids ...string) uint64 {
+	c.mutationSeq++
+	seq := c.mutationSeq
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		c.beadSeq[id] = seq
+	}
+	return seq
+}
+
+func (c *CachingStore) noteLocalMutationLocked(ids ...string) uint64 {
+	seq := c.noteMutationLocked(ids...)
+	now := time.Now()
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		c.localBeadAt[id] = now
+	}
+	return seq
+}
+
+// PrimeActive loads the common active bead statuses (open + in_progress) across
+// both persistent issues and ephemeral wisps into the cache. These are fast indexed
+// queries that populate enough data for
+// startup paths without waiting for a full scan. The cache enters
+// cachePartial state: filtered active queries and Get hit cache for primed
 // beads, while closed-bead queries still delegate to the backing store.
 func (c *CachingStore) PrimeActive() error {
+	c.mu.RLock()
+	startSeq := c.mutationSeq
+	c.mu.RUnlock()
+
 	var all []Bead
+	var partialErr error
 	for _, status := range []string{"open", "in_progress"} {
-		beads, err := c.backing.List(ListQuery{Status: status})
+		beads, err := c.backing.List(ListQuery{Status: status, TierMode: TierBoth})
 		if err != nil {
-			return fmt.Errorf("prime active (%s): %w", status, err)
+			if !IsPartialResult(err) {
+				return fmt.Errorf("prime active (%s): %w", status, err)
+			}
+			partialErr = errors.Join(partialErr, err)
+			c.recordProblem(fmt.Sprintf("prime active (%s)", status), err)
 		}
 		all = append(all, beads...)
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, b := range all {
-		c.beads[b.ID] = cloneBead(b)
-	}
-	if c.state == cacheUninitialized {
-		c.state = cachePartial
-	}
-	log.Printf("caching-store: pre-primed %d active beads", len(all))
-	return nil
-}
-
-// Prime loads all active beads and deps from the backing store into memory.
-// Closes the primeReady channel on completion so blocked callers can proceed.
-// Retries up to 3 times on failure since bd list can time out under
-// concurrent dolt load.
-func (c *CachingStore) Prime(_ context.Context) error {
-	var all []Bead
-	var err error
-	for attempt := 1; attempt <= 3; attempt++ {
-		all, err = c.backing.List(ListQuery{AllowScan: true}) // active beads only (default)
-		if err == nil {
-			break
-		}
-		log.Printf("caching-store: prime attempt %d/3 failed: %v", attempt, err)
-		if attempt < 3 {
-			time.Sleep(time.Duration(attempt*5) * time.Second)
-		}
-	}
-	if err != nil {
-		c.primeErr = err
-		c.signalPrimeReady()
-		return fmt.Errorf("prime list: %w", err)
+	if enriched, err := c.enrichReadyProjectionForCache(all); err != nil {
+		partialErr = errors.Join(partialErr, err)
+		c.recordProblem("prime active ready projection", err)
+	} else {
+		all = enriched
 	}
 
 	beadMap := make(map[string]Bead, len(all))
 	for _, b := range all {
 		beadMap[b.ID] = cloneBead(b)
 	}
-	// Batch-fetch deps in one subprocess call (if backing is BdStore).
-	depMap := make(map[string][]Dep)
-	if bdStore, ok := c.backing.(*BdStore); ok && len(beadMap) > 0 {
-		ids := make([]string, 0, len(beadMap))
-		for id := range beadMap {
-			ids = append(ids, id)
-		}
-		if batchDeps, err := bdStore.DepListBatch(ids); err == nil {
-			for id, deps := range batchDeps {
-				depMap[id] = slices.Clone(deps)
-			}
-		}
+	depMap, depsComplete, depErr := c.fetchDepsForBeads(beadMap)
+	if depErr != nil {
+		partialErr = errors.Join(partialErr, depErr)
+		c.recordProblem("prime active dep cache", depErr)
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.beads = beadMap
-	c.deps = depMap
-	c.state = cacheLive
-	c.syncedAt = time.Now()
-	c.syncFailures = 0
+	now := time.Now()
+	for _, b := range all {
+		if c.mutationSeq != startSeq {
+			if c.deletedSeq[b.ID] > startSeq {
+				continue
+			}
+			if _, exists := c.beads[b.ID]; exists {
+				continue
+			}
+		}
+		if _, keep := c.recentLocalBeadConflictLocked(b.ID, b, now, false); keep {
+			continue
+		}
+		c.beads[b.ID] = cloneBead(b)
+		if depsComplete && depErr == nil {
+			c.deps[b.ID] = cloneDeps(depMap[b.ID])
+		} else {
+			c.deps[b.ID] = depsFromBeadFields(b)
+		}
+		delete(c.deletedSeq, b.ID)
+		if !recentLocalMutation(c.localBeadAt[b.ID], now) {
+			delete(c.beadSeq, b.ID)
+			delete(c.localBeadAt, b.ID)
+		}
+	}
+	if c.state == cacheUninitialized {
+		c.state = cachePartial
+	}
+	c.primePartialErr = partialErr
+	c.markFreshLocked(now)
 	c.updateStatsLocked()
-	log.Printf("caching-store: primed %d beads, %d dep entries", len(beadMap), len(depMap))
-	c.signalPrimeReady()
 	return nil
 }
 
-// signalPrimeReady closes the primeReady channel exactly once.
-func (c *CachingStore) signalPrimeReady() {
+// Prime loads all active beads and deps from the backing store into memory.
+// Retries up to 3 times on failure since bd list can time out under
+// concurrent dolt load.
+func (c *CachingStore) Prime(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := c.beginCacheWorker(); err != nil {
+		return err
+	}
+	defer c.endCacheWorker()
+	if err := c.cacheContextErr(ctx); err != nil {
+		return err
+	}
+
+	done, owner := c.beginFullPrime()
+	if !owner {
+		return c.waitForFullPrimeDone(ctx, done)
+	}
+	err := c.prime(ctx)
+	c.finishFullPrime(done, err)
+	return err
+}
+
+func (c *CachingStore) prime(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := c.cacheContextErr(ctx); err != nil {
+		return err
+	}
+
+	c.mu.RLock()
+	startSeq := c.mutationSeq
+	c.mu.RUnlock()
+
+	var all []Bead
+	var err error
+	var partialErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		all, err = c.backing.List(cacheFullScanQuery()) // active beads only; see cacheFullScanQuery
+		if err == nil {
+			break
+		}
+		if IsPartialResult(err) {
+			c.recordProblem("prime cache: partial list", err)
+			partialErr = err
+			err = nil
+			break
+		}
+		c.recordProblem(fmt.Sprintf("prime cache attempt %d/3", attempt), err)
+		if attempt < 3 {
+			delay := defaultCachePrimeRetryDelay(attempt)
+			if c.primeRetryDelay != nil {
+				delay = c.primeRetryDelay(attempt)
+			}
+			if delay > 0 {
+				if err := c.cacheSleep(ctx, delay); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("prime list: %w", err)
+	}
+	if enriched, enrichErr := c.enrichReadyProjectionForCache(all); enrichErr != nil {
+		c.recordProblem("prime ready projection", enrichErr)
+		partialErr = errors.Join(partialErr, enrichErr)
+	} else {
+		all = enriched
+	}
+	if err := c.cacheContextErr(ctx); err != nil {
+		return err
+	}
+
+	beadMap := make(map[string]Bead, len(all))
+	for _, b := range all {
+		beadMap[b.ID] = cloneBead(b)
+	}
+
+	depMap, depsComplete, depErr := c.fetchDepsForBeads(beadMap)
+	if depErr != nil {
+		c.recordProblem("prime dep cache", depErr)
+	}
+	if err := c.cacheContextErr(ctx); err != nil {
+		return err
+	}
+
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mutationSeq == startSeq {
+		nextBeads := beadMap
+		nextDeps := depsFromBeads(beadMap, depMap, depsComplete && depErr == nil)
+		nextDirty := make(map[string]struct{})
+		nextBeadSeq := make(map[string]uint64)
+		nextLocalBeadAt := make(map[string]time.Time)
+		for id, current := range c.beads {
+			if fresh, exists := beadMap[id]; exists {
+				if _, keep := c.recentLocalBeadConflictLocked(id, fresh, now, true); keep {
+					nextBeads[id] = cloneBead(current)
+					if deps, ok := c.deps[id]; ok {
+						nextDeps[id] = cloneDeps(deps)
+					}
+					c.carryRecentLocalMutationLocked(id, nextDirty, nextBeadSeq, nextLocalBeadAt)
+				}
+				continue
+			}
+			if current.Status != "closed" && recentLocalMutation(c.localBeadAt[id], now) {
+				nextBeads[id] = cloneBead(current)
+				if deps, ok := c.deps[id]; ok {
+					nextDeps[id] = cloneDeps(deps)
+				}
+				c.carryRecentLocalMutationLocked(id, nextDirty, nextBeadSeq, nextLocalBeadAt)
+			}
+		}
+		c.beads = nextBeads
+		c.deps = nextDeps
+		c.depsComplete = depsComplete && depErr == nil
+		c.dirty = nextDirty
+		c.beadSeq = nextBeadSeq
+		c.localBeadAt = nextLocalBeadAt
+		c.deletedSeq = make(map[string]uint64)
+	} else {
+		for id, b := range beadMap {
+			if c.deletedSeq[id] > startSeq {
+				continue
+			}
+			if _, exists := c.beads[id]; exists {
+				continue
+			}
+			c.beads[id] = b
+			delete(c.deletedSeq, id)
+			delete(c.beadSeq, id)
+			if depsComplete && depErr == nil {
+				c.deps[id] = cloneDeps(depMap[id])
+			} else {
+				c.deps[id] = depsFromBeadFields(b)
+			}
+		}
+		c.depsComplete = false
+	}
+	c.state = cacheLive
+	c.syncFailures = 0
+	c.stats.SyncFailures = 0
+	c.primePartialErr = partialErr
+	c.markFreshLocked(now)
+	c.updateStatsLocked()
+	return nil
+}
+
+func (c *CachingStore) beginFullPrime() (*fullPrimeCycle, bool) {
+	c.primeMu.Lock()
+	defer c.primeMu.Unlock()
+	if c.primeRunning {
+		return c.primeCycle, false
+	}
+	return c.startFullPrimeLocked(), true
+}
+
+func (c *CachingStore) finishFullPrime(cycle *fullPrimeCycle, err error) {
+	c.primeMu.Lock()
+	defer c.primeMu.Unlock()
+	if c.primeCycle != cycle {
+		return
+	}
+	cycle.err = err
+	c.primeRunning = false
+	close(cycle.done)
+}
+
+func (c *CachingStore) waitForFullPrimeDone(ctx context.Context, cycle *fullPrimeCycle) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if cycle == nil || cycle.done == nil {
+		return ErrCacheUnavailable
+	}
 	select {
-	case <-c.primeReady:
-		// Already closed (from a previous Prime call).
+	case <-cycle.done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	c.primeMu.Lock()
+	defer c.primeMu.Unlock()
+	return cycle.err
+}
+
+func (c *CachingStore) ensureFullPrime(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c.cacheFullyPrimed() {
+		return nil
+	}
+	if err := c.beginCacheWorker(); err != nil {
+		return errors.Join(ErrCacheUnavailable, err)
+	}
+	defer c.endCacheWorker()
+	if err := c.cacheContextErr(ctx); err != nil {
+		return errors.Join(ErrCacheUnavailable, err)
+	}
+	cycle, owner, suppressed := c.beginLazyFullPrime(time.Now())
+	if suppressed {
+		return ErrCacheUnavailable
+	}
+	var err error
+	if owner {
+		err = c.prime(ctx)
+		c.finishFullPrime(cycle, err)
+	} else {
+		err = c.waitForFullPrimeDone(ctx, cycle)
+	}
+	if err != nil {
+		return errors.Join(ErrCacheUnavailable, fmt.Errorf("prime cache: %w", err))
+	}
+	if !c.cacheFullyPrimed() {
+		return ErrCacheUnavailable
+	}
+	return nil
+}
+
+func (c *CachingStore) beginLazyFullPrime(now time.Time) (*fullPrimeCycle, bool, bool) {
+	c.mu.RLock()
+	state := c.state
+	partial := c.primePartialErr != nil
+	c.mu.RUnlock()
+
+	if state == cacheDegraded {
+		return nil, false, true
+	}
+
+	c.primeMu.Lock()
+	defer c.primeMu.Unlock()
+	if c.primeRunning {
+		return c.primeCycle, false, state != cacheUninitialized
+	}
+	if c.lastFullPrimeStartedAt.IsZero() {
+		return c.startFullPrimeLocked(), true, false
+	}
+	if now.Sub(c.lastFullPrimeStartedAt) < cacheLazyFullPrimeRetryInterval && (state != cacheUninitialized || partial) {
+		return nil, false, true
+	}
+	return c.startFullPrimeLocked(), true, false
+}
+
+func (c *CachingStore) startFullPrimeLocked() *fullPrimeCycle {
+	cycle := &fullPrimeCycle{done: make(chan struct{})}
+	c.primeRunning = true
+	c.primeCycle = cycle
+	c.lastFullPrimeStartedAt = time.Now()
+	return cycle
+}
+
+func (c *CachingStore) cacheFullyPrimed() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.state == cacheLive && c.primePartialErr == nil
+}
+
+func (c *CachingStore) beginCacheWorker() error {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if c.stopped {
+		return context.Canceled
+	}
+	c.lifecycleWG.Add(1)
+	return nil
+}
+
+func (c *CachingStore) endCacheWorker() {
+	c.lifecycleWG.Done()
+}
+
+func (c *CachingStore) cacheContextErr(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.stopCh:
+		return context.Canceled
 	default:
-		close(c.primeReady)
+		return nil
 	}
 }
 
-// StartReconciler launches background periodic sync. Cancel ctx to stop.
-func (c *CachingStore) StartReconciler(ctx context.Context) {
+func (c *CachingStore) cacheSleep(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.stopCh:
+		return context.Canceled
+	case <-timer.C:
+		return nil
+	}
+}
+
+// StartReconciler launches watchdog reconciliation. Cancel ctx to stop.
+// The stagger applies a one-time delay between this call and the first
+// reconciler tick (see StaggerOption); agentID is consulted only when
+// stagger is WithStaggerAuto. A single "beads cache: stagger=Nms
+// agent=..." log line is emitted before the loop starts, even when the
+// resolved stagger is zero, so absence is unambiguous.
+func (c *CachingStore) StartReconciler(ctx context.Context, stagger StaggerOption, agentID string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ctx, cancel := context.WithCancel(ctx)
+	c.lifecycleMu.Lock()
+	if c.stopped {
+		c.lifecycleMu.Unlock()
+		cancel()
+		return
+	}
 	c.cancelFn = cancel
-	go c.reconcileLoop(ctx)
+	c.lifecycleWG.Add(1)
+	c.lifecycleMu.Unlock()
+
+	offset := stagger.resolve(agentID)
+
+	c.mu.Lock()
+	c.stats.StaggerOffsetMs = offset.Milliseconds()
+	c.mu.Unlock()
+
+	log.Printf("beads cache: stagger=%dms agent=%s", offset.Milliseconds(), agentID)
+
+	go func() {
+		defer c.lifecycleWG.Done()
+		c.reconcileLoop(ctx, offset)
+	}()
 }
 
-// StopReconciler cancels the background reconciler.
+// StopReconciler cancels and waits for cache-owned background work.
 func (c *CachingStore) StopReconciler() {
-	if c.cancelFn != nil {
-		c.cancelFn()
+	c.lifecycleMu.Lock()
+	if !c.stopped {
+		close(c.stopCh)
+		c.stopped = true
 	}
+	cancel := c.cancelFn
+	c.cancelFn = nil
+	c.lifecycleMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	c.lifecycleWG.Wait()
 }
 
 // Stats returns current cache statistics.
 func (c *CachingStore) Stats() CacheStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+
 	s := c.stats
 	switch c.state {
+	case cachePartial:
+		s.State = "partial"
 	case cacheLive:
 		s.State = "live"
 	case cacheDegraded:
@@ -232,621 +823,53 @@ func (c *CachingStore) IsLive() bool {
 // Backing returns the underlying store.
 func (c *CachingStore) Backing() Store { return c.backing }
 
-// ApplyEvent updates the cache from a bd hook event. Call this when the
-// event bus delivers a bead.created, bead.updated, or bead.closed event
-// with the full bead JSON payload. This provides sub-second cache
-// freshness for agent-initiated bd mutations without waiting for
-// reconciliation.
-func (c *CachingStore) ApplyEvent(eventType string, payload json.RawMessage) {
-	if len(payload) == 0 {
-		return
-	}
-	var b Bead
-	if err := json.Unmarshal(payload, &b); err != nil {
-		return
-	}
-	if b.ID == "" {
-		return
-	}
-	// bd hook payloads use "issue_type" while Bead uses "type". If Type
-	// wasn't populated from "type", check for the bd field name.
-	if b.Type == "" {
-		var bdCompat struct {
-			IssueType string `json:"issue_type"`
-		}
-		if err := json.Unmarshal(payload, &bdCompat); err == nil && bdCompat.IssueType != "" {
-			b.Type = bdCompat.IssueType
-		}
-	}
+func (c *CachingStore) markFreshLocked(now time.Time) {
+	c.lastFreshAt = now
+	c.stats.LastFreshAt = now
+}
 
+func (c *CachingStore) recordProblem(op string, err error) {
+	if err == nil {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.state != cacheLive {
+	c.recordProblemLocked(op, err)
+}
+
+func (c *CachingStore) recordProblemLocked(op string, err error) {
+	if err == nil {
 		return
 	}
-
-	switch eventType {
-	case "bead.created":
-		if _, exists := c.beads[b.ID]; !exists {
-			c.beads[b.ID] = cloneBead(b)
-			c.updateStatsLocked()
-		}
-	case "bead.updated":
-		c.beads[b.ID] = cloneBead(b)
-	case "bead.closed":
-		if existing, ok := c.beads[b.ID]; ok {
-			existing.Status = "closed"
-			// Merge metadata from the event — close events often carry
-			// gc.outcome and other fields set in the same bd update.
-			for k, v := range b.Metadata {
-				if existing.Metadata == nil {
-					existing.Metadata = make(map[string]string)
-				}
-				existing.Metadata[k] = v
-			}
-			c.beads[b.ID] = existing
-		} else {
-			// Bead not in cache yet — store the closed version.
-			c.beads[b.ID] = cloneBead(b)
-			c.updateStatsLocked()
+	msg := fmt.Sprintf("%s: %v", op, err)
+	now := time.Now()
+	c.stats.ProblemCount++
+	c.stats.LastProblemAt = now
+	c.stats.LastProblem = msg
+	if c.problemf != nil {
+		if logMsg, ok := c.problemLogMessageLocked(msg, now); ok {
+			c.problemf(logMsg)
 		}
 	}
 }
 
-// ApplyDepEvent updates the dep cache for a bead. Call after dep
-// mutations are detected via events or write-through.
-func (c *CachingStore) ApplyDepEvent(beadID string, deps []Dep) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.state != cacheLive {
-		return
+func (c *CachingStore) problemLogMessageLocked(msg string, now time.Time) (string, bool) {
+	if c.problemLog == nil {
+		c.problemLog = make(map[string]cacheProblemLogState)
 	}
-	c.deps[beadID] = slices.Clone(deps)
-}
-
-// ── Read methods (cache when live, fallback to backing) ─────────────
-
-// List returns beads matching the query. Active-bead queries are served from
-// cache when available. IncludeClosed queries merge cached active results with
-// backing-store history when possible so callers keep the old best-effort
-// behavior from ListByLabel/ListByMetadata during transient bd failures.
-func (c *CachingStore) List(query ListQuery) ([]Bead, error) {
-	if !query.HasFilter() && !query.AllowScan {
-		return nil, fmt.Errorf("listing beads: %w", ErrQueryRequiresScan)
+	state := c.problemLog[msg]
+	if !state.lastAt.IsZero() && now.Sub(state.lastAt) < cacheProblemLogWindow {
+		state.suppressed++
+		c.problemLog[msg] = state
+		return "", false
 	}
 
-	c.mu.RLock()
-	state := c.state
-	if state == cacheLive || state == cachePartial {
-		// PrimeActive loads the full active set (open + in_progress), so
-		// active-only queries are complete even before the history prime finishes.
-		cached := make([]Bead, 0, len(c.beads))
-		for _, b := range c.beads {
-			if !query.Matches(b) {
-				continue
-			}
-			cached = append(cached, cloneBead(b))
-		}
-		c.mu.RUnlock()
-
-		finish := func(items []Bead) ([]Bead, error) {
-			sortBeadsForQuery(items, query.Sort)
-			if query.Limit > 0 && len(items) > query.Limit {
-				items = items[:query.Limit]
-			}
-			return items, nil
-		}
-
-		if !query.IncludesClosed() {
-			return finish(cached)
-		}
-
-		// The cache never has a complete closed-only or parent-history view, so
-		// preserve the old backing-store behavior for those query shapes.
-		if query.Status == "closed" || query.ParentID != "" {
-			return c.backing.List(query)
-		}
-
-		all, err := c.backing.List(query)
-		if err != nil {
-			return finish(cached)
-		}
-
-		seen := make(map[string]bool, len(cached))
-		for _, b := range cached {
-			seen[b.ID] = true
-		}
-		for _, b := range all {
-			if seen[b.ID] {
-				continue
-			}
-			cached = append(cached, b)
-			seen[b.ID] = true
-		}
-		return finish(cached)
+	logMsg := msg
+	if state.suppressed > 0 {
+		logMsg = fmt.Sprintf("%s (suppressed %d duplicate logs)", msg, state.suppressed)
 	}
-	c.mu.RUnlock()
-	return c.backing.List(query)
-}
-
-// ListOpen returns all cached beads, optionally filtered by status.
-func (c *CachingStore) ListOpen(status ...string) ([]Bead, error) {
-	query := ListQuery{AllowScan: true}
-	if len(status) > 0 {
-		query.Status = status[0]
-	}
-	return c.List(query)
-}
-
-// Get returns a single bead by ID from the cache or backing store.
-func (c *CachingStore) Get(id string) (Bead, error) {
-	c.mu.RLock()
-	if c.state == cacheLive || c.state == cachePartial {
-		if b, ok := c.beads[id]; ok {
-			c.mu.RUnlock()
-			return cloneBead(b), nil
-		}
-		c.mu.RUnlock()
-		return c.backing.Get(id)
-	}
-	c.mu.RUnlock()
-	return c.backing.Get(id)
-}
-
-// Ready returns open beads whose blocking deps are all closed.
-func (c *CachingStore) Ready() ([]Bead, error) {
-	c.mu.RLock()
-	if c.state == cacheLive {
-		statusByID := make(map[string]string, len(c.beads))
-		depsByID := make(map[string][]Dep, len(c.deps))
-		openBeads := make([]Bead, 0, len(c.beads))
-		missingDepIDs := make(map[string]struct{})
-		for _, b := range c.beads {
-			statusByID[b.ID] = b.Status
-			if b.Status == "open" {
-				openBeads = append(openBeads, cloneBead(b))
-			}
-		}
-		for _, b := range openBeads {
-			deps := slices.Clone(c.deps[b.ID])
-			depsByID[b.ID] = deps
-			for _, dep := range deps {
-				switch dep.Type {
-				case "blocks", "waits-for", "conditional-blocks":
-				default:
-					continue
-				}
-				if _, ok := statusByID[dep.DependsOnID]; !ok {
-					missingDepIDs[dep.DependsOnID] = struct{}{}
-				}
-			}
-		}
-		c.mu.RUnlock()
-
-		for depID := range missingDepIDs {
-			dep, err := c.backing.Get(depID)
-			if err != nil {
-				if errors.Is(err, ErrNotFound) {
-					continue
-				}
-				return nil, err
-			}
-			statusByID[depID] = dep.Status
-		}
-
-		var result []Bead
-		for _, b := range openBeads {
-			blocked := false
-			for _, dep := range depsByID[b.ID] {
-				switch dep.Type {
-				case "blocks", "waits-for", "conditional-blocks":
-				default:
-					continue
-				}
-				if statusByID[dep.DependsOnID] != "closed" {
-					blocked = true
-					break
-				}
-			}
-			if !blocked {
-				result = append(result, cloneBead(b))
-			}
-		}
-		return result, nil
-	}
-	c.mu.RUnlock()
-	return c.backing.Ready()
-}
-
-// Children returns beads with the given parent ID.
-func (c *CachingStore) Children(parentID string, opts ...QueryOpt) ([]Bead, error) {
-	return c.List(ListQuery{
-		ParentID:      parentID,
-		IncludeClosed: HasOpt(opts, IncludeClosed),
-		Sort:          SortCreatedAsc,
-	})
-}
-
-// ListByLabel returns beads matching the given label. By default, serves from
-// cache only (non-closed beads). Pass IncludeClosed to also query the backing
-// store for closed beads and merge results.
-func (c *CachingStore) ListByLabel(label string, limit int, opts ...QueryOpt) ([]Bead, error) {
-	return c.List(ListQuery{
-		Label:         label,
-		Limit:         limit,
-		IncludeClosed: HasOpt(opts, IncludeClosed),
-		Sort:          SortCreatedDesc,
-	})
-}
-
-// ListByAssignee returns beads assigned to the given agent with matching status.
-func (c *CachingStore) ListByAssignee(assignee, status string, limit int) ([]Bead, error) {
-	return c.List(ListQuery{
-		Assignee: assignee,
-		Status:   status,
-		Limit:    limit,
-		Sort:     SortCreatedDesc,
-	})
-}
-
-// ListByMetadata filters beads by metadata key-value pairs. By default, serves
-// from cache only (non-closed beads). Pass IncludeClosed to also query the
-// backing store for closed beads and merge results.
-func (c *CachingStore) ListByMetadata(filters map[string]string, limit int, opts ...QueryOpt) ([]Bead, error) {
-	return c.List(ListQuery{
-		Metadata:      filters,
-		Limit:         limit,
-		IncludeClosed: HasOpt(opts, IncludeClosed),
-		Sort:          SortCreatedDesc,
-	})
-}
-
-func matchesMetadata(b Bead, filters map[string]string) bool {
-	for k, v := range filters {
-		if b.Metadata[k] != v {
-			return false
-		}
-	}
-	return true
-}
-
-// DepList returns dependencies for a bead in the given direction.
-func (c *CachingStore) DepList(id, direction string) ([]Dep, error) {
-	c.mu.RLock()
-	if c.state == cacheLive {
-		if direction == "down" || direction == "" {
-			if deps, ok := c.deps[id]; ok {
-				c.mu.RUnlock()
-				return slices.Clone(deps), nil
-			}
-			// Dep not cached yet — fetch from backing and cache it.
-			c.mu.RUnlock()
-			deps, err := c.backing.DepList(id, direction)
-			if err != nil {
-				return nil, err
-			}
-			c.mu.Lock()
-			c.deps[id] = slices.Clone(deps)
-			c.mu.Unlock()
-			return deps, nil
-		}
-		// "up" — reverse lookup (best-effort from cache, fall through for uncached)
-		var result []Dep
-		for _, deps := range c.deps {
-			for _, d := range deps {
-				if d.DependsOnID == id {
-					result = append(result, d)
-				}
-			}
-		}
-		c.mu.RUnlock()
-		if len(result) > 0 {
-			return result, nil
-		}
-		// Cache might be incomplete for "up" — fall through.
-		return c.backing.DepList(id, direction)
-	}
-	c.mu.RUnlock()
-	return c.backing.DepList(id, direction)
-}
-
-// Ping delegates to the backing store.
-func (c *CachingStore) Ping() error {
-	return c.backing.Ping()
-}
-
-// ── Write methods (pass through + update cache) ─────────────────────
-
-// Create passes through to the backing store and updates the cache.
-func (c *CachingStore) Create(b Bead) (Bead, error) {
-	created, err := c.backing.Create(b)
-	if err != nil {
-		return created, err
-	}
-	c.mu.Lock()
-	c.beads[created.ID] = cloneBead(created)
-	c.mu.Unlock()
-	c.notifyChange("bead.created", created)
-	return created, nil
-}
-
-// Update passes through to the backing store and refreshes the cache.
-func (c *CachingStore) Update(id string, opts UpdateOpts) error {
-	if err := c.backing.Update(id, opts); err != nil {
-		return err
-	}
-	// Re-fetch from backing to get the authoritative state.
-	if fresh, err := c.backing.Get(id); err == nil {
-		c.mu.Lock()
-		c.beads[id] = cloneBead(fresh)
-		c.mu.Unlock()
-		c.notifyChange("bead.updated", fresh)
-	}
-	return nil
-}
-
-// Close marks a bead as closed in the backing store and cache.
-func (c *CachingStore) Close(id string) error {
-	if err := c.backing.Close(id); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	if b, ok := c.beads[id]; ok {
-		b.Status = "closed"
-		c.beads[id] = b
-		c.mu.Unlock()
-		c.notifyChange("bead.closed", b)
-	} else {
-		c.mu.Unlock()
-	}
-	return nil
-}
-
-// CloseAll closes multiple beads and sets metadata on each.
-func (c *CachingStore) CloseAll(ids []string, metadata map[string]string) (int, error) {
-	n, err := c.backing.CloseAll(ids, metadata)
-	if err != nil {
-		return n, err
-	}
-	c.mu.Lock()
-	for _, id := range ids {
-		if b, ok := c.beads[id]; ok {
-			b.Status = "closed"
-			if b.Metadata == nil {
-				b.Metadata = make(map[string]string, len(metadata))
-			}
-			for k, v := range metadata {
-				b.Metadata[k] = v
-			}
-			c.beads[id] = b
-		}
-	}
-	c.mu.Unlock()
-	return n, nil
-}
-
-// SetMetadata sets a single metadata key-value on a bead.
-func (c *CachingStore) SetMetadata(id, key, value string) error {
-	if err := c.backing.SetMetadata(id, key, value); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	if b, ok := c.beads[id]; ok {
-		if b.Metadata == nil {
-			b.Metadata = make(map[string]string)
-		}
-		b.Metadata[key] = value
-		c.beads[id] = b
-	}
-	c.mu.Unlock()
-	return nil
-}
-
-// SetMetadataBatch sets multiple metadata key-values on a bead.
-func (c *CachingStore) SetMetadataBatch(id string, kvs map[string]string) error {
-	if err := c.backing.SetMetadataBatch(id, kvs); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	if b, ok := c.beads[id]; ok {
-		if b.Metadata == nil {
-			b.Metadata = make(map[string]string, len(kvs))
-		}
-		for k, v := range kvs {
-			b.Metadata[k] = v
-		}
-		c.beads[id] = b
-	}
-	c.mu.Unlock()
-	return nil
-}
-
-// DepAdd adds a dependency and updates the cache.
-func (c *CachingStore) DepAdd(issueID, dependsOnID, depType string) error {
-	if err := c.backing.DepAdd(issueID, dependsOnID, depType); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	deps := c.deps[issueID]
-	for i, d := range deps {
-		if d.DependsOnID == dependsOnID {
-			deps[i].Type = depType
-			c.deps[issueID] = deps
-			c.mu.Unlock()
-			return nil
-		}
-	}
-	c.deps[issueID] = append(deps, Dep{IssueID: issueID, DependsOnID: dependsOnID, Type: depType})
-	c.mu.Unlock()
-	return nil
-}
-
-// DepRemove removes a dependency and updates the cache.
-func (c *CachingStore) DepRemove(issueID, dependsOnID string) error {
-	if err := c.backing.DepRemove(issueID, dependsOnID); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	deps := c.deps[issueID]
-	for i, d := range deps {
-		if d.DependsOnID == dependsOnID {
-			c.deps[issueID] = append(deps[:i], deps[i+1:]...)
-			break
-		}
-	}
-	c.mu.Unlock()
-	return nil
-}
-
-// ── Background reconciler ───────────────────────────────────────────
-
-func (c *CachingStore) reconcileLoop(ctx context.Context) {
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-		}
-
-		if c.reconciling.CompareAndSwap(false, true) {
-			c.runReconciliation()
-			c.reconciling.Store(false)
-		}
-
-		timer.Reset(c.adaptiveInterval())
-	}
-}
-
-func (c *CachingStore) adaptiveInterval() time.Duration {
-	c.mu.RLock()
-	total := len(c.beads)
-	c.mu.RUnlock()
-	switch {
-	case total >= 5000:
-		return cacheReconcileIntervalLarge
-	case total >= 1000:
-		return cacheReconcileIntervalMedium
-	default:
-		return cacheReconcileIntervalSmall
-	}
-}
-
-func (c *CachingStore) runReconciliation() {
-	start := time.Now()
-	fresh, err := c.backing.List(ListQuery{AllowScan: true})
-	if err != nil {
-		c.mu.Lock()
-		c.syncFailures++
-		if c.syncFailures >= maxCacheSyncFailures && c.state == cacheLive {
-			c.state = cacheDegraded
-			log.Printf("caching-store: degraded after %d consecutive failures", c.syncFailures)
-		}
-		c.mu.Unlock()
-		log.Printf("caching-store: reconcile failed: %v", err)
-		return
-	}
-
-	freshByID := make(map[string]Bead, len(fresh))
-	for _, b := range fresh {
-		freshByID[b.ID] = b
-	}
-
-	c.mu.Lock()
-
-	var adds, removes, updates int64
-	var changedIDs []string
-
-	// Detect new and updated
-	for id, fb := range freshByID {
-		old, exists := c.beads[id]
-		if !exists {
-			c.beads[id] = cloneBead(fb)
-			adds++
-			changedIDs = append(changedIDs, id)
-			c.notifyChangeLocked("bead.created", fb)
-		} else if beadChanged(old, fb) {
-			c.beads[id] = cloneBead(fb)
-			updates++
-			changedIDs = append(changedIDs, id)
-			c.notifyChangeLocked("bead.updated", fb)
-		}
-	}
-
-	// Detect removed
-	for id, old := range c.beads {
-		if _, exists := freshByID[id]; !exists {
-			delete(c.beads, id)
-			delete(c.deps, id)
-			removes++
-			c.notifyChangeLocked("bead.closed", old)
-		}
-	}
-
-	c.syncFailures = 0
-	c.syncedAt = time.Now()
-	if c.state == cacheDegraded {
-		c.state = cacheLive
-		log.Printf("caching-store: recovered to live")
-	}
-
-	durMs := float64(time.Since(start).Microseconds()) / 1000.0
-	c.stats.LastReconcileAt = time.Now()
-	c.stats.LastReconcileMs = durMs
-	c.stats.Adds += adds
-	c.stats.Removes += removes
-	c.stats.Updates += updates
-	c.stats.SyncFailures = c.syncFailures
-	c.updateStatsLocked()
-	c.mu.Unlock()
-
-	// Batch-refresh deps for changed beads (one subprocess call).
-	if len(changedIDs) > 0 {
-		if bdStore, ok := c.backing.(*BdStore); ok {
-			if depMap, err := bdStore.DepListBatch(changedIDs); err == nil {
-				c.mu.Lock()
-				for id, deps := range depMap {
-					c.deps[id] = slices.Clone(deps)
-				}
-				c.mu.Unlock()
-			}
-		} else {
-			// Non-BdStore fallback: per-ID dep fetch.
-			for _, id := range changedIDs {
-				if deps, err := c.backing.DepList(id, "down"); err == nil {
-					c.mu.Lock()
-					c.deps[id] = slices.Clone(deps)
-					c.mu.Unlock()
-				}
-			}
-		}
-	}
-
-	if adds > 0 || removes > 0 || updates > 0 {
-		log.Printf("caching-store: reconciled in %.0fms (+%d -%d ~%d, %d total)",
-			durMs, adds, removes, updates, len(c.beads))
-	}
-}
-
-func (c *CachingStore) notifyChange(eventType string, b Bead) {
-	if c.onChange == nil {
-		return
-	}
-	payload, _ := json.Marshal(b)
-	c.onChange(eventType, b.ID, payload)
-}
-
-func (c *CachingStore) notifyChangeLocked(eventType string, b Bead) {
-	if c.onChange == nil {
-		return
-	}
-	payload, _ := json.Marshal(b)
-	// Unlock before callback to avoid holding the lock during event recording.
-	c.mu.Unlock()
-	c.onChange(eventType, b.ID, payload)
-	c.mu.Lock()
+	c.problemLog[msg] = cacheProblemLogState{lastAt: now}
+	return logMsg, true
 }
 
 func (c *CachingStore) updateStatsLocked() {
@@ -856,40 +879,111 @@ func (c *CachingStore) updateStatsLocked() {
 		totalDeps += len(deps)
 	}
 	c.stats.TotalDeps = totalDeps
+	c.stats.SyncFailures = c.syncFailures
+	c.updateCadenceStatsLocked()
 }
 
-func beadChanged(old, fresh Bead) bool {
-	if old.Status != fresh.Status {
-		return true
+func beadIDs(beadMap map[string]Bead) []string {
+	ids := make([]string, 0, len(beadMap))
+	for id := range beadMap {
+		ids = append(ids, id)
 	}
-	if old.Title != fresh.Title {
-		return true
+	return ids
+}
+
+type listDependencyCompletenessStore interface {
+	listIncludesCompleteDependencies() bool
+}
+
+type cacheDependencySnapshotStore interface {
+	dependencySnapshotForCache(ids []string) (map[string][]Dep, bool, error)
+}
+
+type readyProjectionEnrichmentStore interface {
+	enrichReadyProjectionForCache([]Bead) ([]Bead, error)
+}
+
+func (c *CachingStore) enrichReadyProjectionForCache(items []Bead) ([]Bead, error) {
+	if backing, ok := c.backing.(readyProjectionEnrichmentStore); ok {
+		return backing.enrichReadyProjectionForCache(items)
 	}
-	if old.Assignee != fresh.Assignee {
-		return true
+	return items, nil
+}
+
+func (c *CachingStore) fetchDepsForBeads(beadMap map[string]Bead) (map[string][]Dep, bool, error) {
+	ids := beadIDs(beadMap)
+	if backing, ok := c.backing.(cacheDependencySnapshotStore); ok {
+		return backing.dependencySnapshotForCache(ids)
 	}
-	if old.Description != fresh.Description {
-		return true
+	if backing, ok := c.backing.(listDependencyCompletenessStore); ok {
+		return depsFromBeads(beadMap, nil, false), backing.listIncludesCompleteDependencies(), nil
 	}
-	if len(old.Metadata) != len(fresh.Metadata) {
-		return true
+	return c.fetchDepsForIDs(ids)
+}
+
+func (c *CachingStore) fetchDepsForIDs(ids []string) (map[string][]Dep, bool, error) {
+	depMap := make(map[string][]Dep)
+	if len(ids) == 0 {
+		return depMap, true, nil
 	}
-	for k, v := range old.Metadata {
-		if fresh.Metadata[k] != v {
-			return true
+
+	for _, id := range ids {
+		deps, err := c.backing.DepList(id, "down")
+		if err != nil {
+			return depMap, false, fmt.Errorf("listing deps for %s: %w", id, err)
 		}
+		depMap[id] = cloneDeps(deps)
 	}
-	return len(old.Labels) != len(fresh.Labels)
+	return depMap, true, nil
 }
 
-// Delete passes through to the backing store and removes from cache.
-func (c *CachingStore) Delete(id string) error {
-	if err := c.backing.Delete(id); err != nil {
-		return err
+func depsFromBeads(beadMap map[string]Bead, depMap map[string][]Dep, useDepMap bool) map[string][]Dep {
+	deps := make(map[string][]Dep, len(beadMap))
+	for id, b := range beadMap {
+		if useDepMap {
+			deps[id] = cloneDeps(depMap[id])
+			continue
+		}
+		deps[id] = depsFromBeadFields(b)
 	}
-	c.mu.Lock()
-	delete(c.beads, id)
-	delete(c.deps, id)
-	c.mu.Unlock()
-	return nil
+	return deps
+}
+
+func depsFromBeadFields(b Bead) []Dep {
+	// Structured dependencies are the authoritative bead representation when
+	// present; Needs is the legacy shorthand used when no dependency objects
+	// were carried on the bead payload.
+	if len(b.Dependencies) > 0 {
+		return cloneDeps(b.Dependencies)
+	}
+	if len(b.Needs) == 0 {
+		return nil
+	}
+	deps := make([]Dep, 0, len(b.Needs))
+	for _, need := range b.Needs {
+		depType := "blocks"
+		dependsOnID := need
+		if strings.Contains(need, ":") {
+			parts := strings.SplitN(need, ":", 2)
+			if parts[0] != "" && parts[1] != "" {
+				depType = parts[0]
+				dependsOnID = parts[1]
+			}
+		}
+		deps = append(deps, Dep{IssueID: b.ID, DependsOnID: dependsOnID, Type: depType})
+	}
+	return deps
+}
+
+func beadCarriesDependencyFields(b Bead) bool {
+	return len(b.Dependencies) > 0 || len(b.Needs) > 0
+}
+
+func cloneDeps(deps []Dep) []Dep {
+	if len(deps) == 0 {
+		return nil
+	}
+	cloned := make([]Dep, len(deps))
+	copy(cloned, deps)
+	return cloned
 }

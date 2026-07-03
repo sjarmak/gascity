@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,9 +19,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gastownhall/gascity/internal/overlay"
 	"github.com/gastownhall/gascity/internal/runtime"
 )
+
+// nudgePostWriteDrainTimeout caps the wait for sc.done after a Nudge stdin
+// write fails. Sized to match terminateProcess's SIGTERM grace period so a
+// Nudge racing with Stop still converges to the best-effort nil contract
+// rather than surfacing a spurious error before SIGKILL lands.
+const nudgePostWriteDrainTimeout = 5 * time.Second
 
 // Config holds ACP provider settings.
 type Config struct {
@@ -61,8 +67,9 @@ type Provider struct {
 
 // Compile-time check.
 var (
-	_ runtime.Provider            = (*Provider)(nil)
-	_ runtime.InteractionProvider = (*Provider)(nil)
+	_ runtime.Provider                    = (*Provider)(nil)
+	_ runtime.InteractionProvider         = (*Provider)(nil)
+	_ runtime.TransportCapabilityProvider = (*Provider)(nil)
 )
 
 // NewProvider returns an ACP [Provider] that stores socket files in
@@ -88,6 +95,12 @@ func NewProviderWithDir(dir string, cfg Config) *Provider {
 		workDirs: make(map[string]string),
 		cfg:      cfg,
 	}
+}
+
+// SupportsTransport reports whether this provider can host the requested
+// session transport.
+func (p *Provider) SupportsTransport(transport string) bool {
+	return transport == "acp"
 }
 
 // Start spawns an ACP agent process, performs the JSON-RPC handshake, and
@@ -137,21 +150,9 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		p.mu.Unlock()
 	}
 
-	// Copy overlay and CopyFiles before starting the process.
-	if cfg.OverlayDir != "" && cfg.WorkDir != "" {
-		_ = overlay.CopyDir(cfg.OverlayDir, cfg.WorkDir, io.Discard)
-	}
-	for _, cf := range cfg.CopyFiles {
-		dst := cfg.WorkDir
-		if cf.RelDst != "" {
-			dst = filepath.Join(cfg.WorkDir, cf.RelDst)
-		}
-		if absSrc, err := filepath.Abs(cf.Src); err == nil {
-			if absDst, err := filepath.Abs(dst); err == nil && absSrc == absDst {
-				continue
-			}
-		}
-		_ = overlay.CopyFileOrDir(cf.Src, dst, io.Discard)
+	if err := runtime.StageSessionWorkDir(cfg); err != nil {
+		clearSentinel()
+		return fmt.Errorf("staging workdir for %q: %w", name, err)
 	}
 
 	command := cfg.Command
@@ -232,7 +233,8 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 	stderrW.Close() //nolint:errcheck
 
 	// Create control socket for cross-process discovery.
-	lis, err := p.startControlSocket(name, cmd)
+	processDone := make(chan struct{})
+	lis, err := p.startControlSocket(name, cmd, processDone)
 	if err != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Wait()
@@ -240,19 +242,25 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		return fmt.Errorf("creating control socket for %q: %w", name, err)
 	}
 
-	sc := newSessionConn(cmd, stdinPipe, lis, p.cfg.outputBufferLines())
+	sc := newSessionConn(cmd, stdinPipe, lis, p.cfg.outputBufferLines(), processDone)
 
 	// Start readLoop before handshake so we can receive responses.
 	go sc.readLoop(stdoutPipe)
 
 	// Monitor process exit — clean up pending state, socket, and listener.
+	// Socket cleanup happens BEFORE close(done) so that callers waiting
+	// on sc.done (e.g., terminateProcess) can rely on the socket being
+	// gone when done fires. Without this ordering, IsRunning can race:
+	// Stop deletes the conn from the map, terminateProcess waits on done,
+	// done closes, Stop returns — but the socket is still alive, so
+	// IsRunning falls through to socketAlive and returns true.
 	go func() {
 		_ = cmd.Wait()
 		sc.drainPending()
-		close(sc.done)
 		lis.Close()                 //nolint:errcheck
 		os.Remove(p.sockPath(name)) //nolint:errcheck
 		_ = os.Remove(p.sockNamePath(name))
+		close(processDone)
 	}()
 
 	// Perform ACP handshake with a deadline. hsCtx (created above with
@@ -262,7 +270,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 	hsTimeoutCtx, hsTimeoutCancel := context.WithTimeout(hsCtx, p.cfg.handshakeTimeout())
 	defer hsTimeoutCancel()
 
-	if err := p.handshake(hsTimeoutCtx, sc); err != nil {
+	if err := p.handshake(hsTimeoutCtx, sc, cfg.WorkDir, cfg.MCPServers); err != nil {
 		// Handshake failed — kill the process. The monitor goroutine
 		// handles listener/socket cleanup when the process exits.
 		_ = stdinPipe.Close()
@@ -300,7 +308,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 }
 
 // handshake performs the ACP initialize → initialized → session/new sequence.
-func (p *Provider) handshake(ctx context.Context, sc *sessionConn) error {
+func (p *Provider) handshake(ctx context.Context, sc *sessionConn, workDir string, mcpServers []runtime.MCPServerConfig) error {
 	// Step 1: Send "initialize" request.
 	initReq, _ := newInitializeRequest()
 	ch, err := sc.sendRequest(initReq)
@@ -327,7 +335,7 @@ func (p *Provider) handshake(ctx context.Context, sc *sessionConn) error {
 	}
 
 	// Step 3: Send "session/new" request.
-	newReq, _ := newSessionNewRequest()
+	newReq, _ := newSessionNewRequest(workDir, mcpServers)
 	ch, err = sc.sendRequest(newReq)
 	if err != nil {
 		return fmt.Errorf("sending session/new: %w", err)
@@ -381,13 +389,19 @@ func (p *Provider) Stop(name string) error {
 		}
 		_ = sc.stdin.Close()
 		err := terminateProcess(sc)
-		p.cleanupMeta(name)
+		if err == nil || runtime.IsSessionGone(err) {
+			p.cleanupMeta(name)
+			return nil
+		}
 		return err
 	}
 
 	// Fall back to socket (cross-process case).
 	err := p.stopBySocket(name)
-	p.cleanupMeta(name)
+	if err == nil || runtime.IsSessionGone(err) {
+		p.cleanupMeta(name)
+		return nil
+	}
 	return err
 }
 
@@ -440,14 +454,15 @@ func (p *Provider) ProcessAlive(name string, processNames []string) bool {
 }
 
 // Nudge sends a session/prompt to the named session. Waits for the agent to
-// become idle before sending. Returns nil if the session doesn't exist
-// (best-effort).
+// become idle before sending. Returns ErrSessionNotFound when this provider
+// instance does not own the in-memory ACP connection. Returns nil if the
+// agent process exits during the send (best-effort).
 func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
 	p.mu.Lock()
 	sc, ok := p.conns[name]
 	p.mu.Unlock()
 	if !ok {
-		return nil
+		return fmt.Errorf("%w: ACP provider does not own session %q", runtime.ErrSessionNotFound, name)
 	}
 	if !sc.alive() {
 		return nil
@@ -457,6 +472,13 @@ func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
 	// sendRequest is atomic with respect to other concurrent Nudge calls.
 	sc.nudgeMu.Lock()
 	defer sc.nudgeMu.Unlock()
+
+	// Re-check liveness under the lock. If an earlier Nudge observed the
+	// process exit and returned nil while we were queued on nudgeMu, skip
+	// the marshal+write work instead of tripping through the recovery path.
+	if !sc.alive() {
+		return nil
+	}
 
 	// Wait for agent to become idle.
 	if !sc.waitIdle(p.cfg.nudgeBusyTimeout()) {
@@ -479,13 +501,31 @@ func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
 
 	ch, err := sc.sendRequest(msg)
 	if err != nil {
-		// Clear busy state on send failure.
-		sc.mu.Lock()
-		if sc.activePromptID == id {
-			sc.activePromptID = 0
+		sc.clearActivePrompt(id)
+		// Non-pipe failures (e.g., marshal errors) have nothing to do with
+		// the agent lifecycle, so surface them immediately rather than
+		// stalling the caller on sc.done.
+		if !isPipeWriteError(err) {
+			return fmt.Errorf("sending prompt to %q: %w", name, err)
 		}
-		sc.mu.Unlock()
-		return fmt.Errorf("sending prompt to %q: %w", name, err)
+		// Pipe write failed — the agent process is exiting (e.g., a prior
+		// Interrupt delivered SIGINT and the agent died, or Stop closed
+		// our stdin end between the alive() check and the write).
+		// Sync on the existing lifecycle event: cmd.Wait() → drainPending →
+		// close(sc.done). Once that fires, this is identical to the
+		// !sc.alive() case above, so honor the best-effort contract by
+		// returning nil. The bound matches terminateProcess's SIGTERM grace
+		// period; the common path returns in microseconds.
+		select {
+		case <-sc.done:
+			// A chronically flapping agent would otherwise be silent here;
+			// a single stderr line lets ops distinguish "nothing happened"
+			// from "agent died mid-write."
+			fmt.Fprintf(os.Stderr, "acp: nudge to %q skipped (agent exiting): %v\n", name, err)
+			return nil
+		case <-time.After(nudgePostWriteDrainTimeout):
+			return fmt.Errorf("sending prompt to %q: %w", name, err)
+		}
 	}
 
 	// Drain the response channel in the background. If the agent
@@ -606,7 +646,7 @@ func (p *Provider) CopyTo(name, src, relDst string) error {
 	if relDst != "" {
 		dst = filepath.Join(wd, relDst)
 	}
-	return overlay.CopyFileOrDir(src, dst, io.Discard)
+	return runtime.StagePath(src, dst)
 }
 
 // ListRunning returns the names of all running sessions whose names
@@ -637,15 +677,24 @@ func (p *Provider) ListRunning(prefix string) ([]string, error) {
 }
 
 func (p *Provider) metaPath(name, key string) string {
-	return filepath.Join(p.dir, name+".meta."+key)
+	return filepath.Join(p.dir, metaFilePrefix(name)+".meta."+metaFileKey(key))
 }
 
 // cleanupMeta removes all sidecar meta files for the named session.
 func (p *Provider) cleanupMeta(name string) {
-	matches, _ := filepath.Glob(filepath.Join(p.dir, name+".meta.*"))
+	matches, _ := filepath.Glob(filepath.Join(p.dir, metaFilePrefix(name)+".meta.*"))
 	for _, m := range matches {
 		os.Remove(m) //nolint:errcheck
 	}
+}
+
+func metaFilePrefix(name string) string {
+	return "m" + metaFileKey(name)
+}
+
+func metaFileKey(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
 
 // --- Unix socket helpers (same as subprocess) ---
@@ -680,7 +729,7 @@ func (p *Provider) socketNameForEntry(key string) string {
 }
 
 // startControlSocket creates a unix socket for cross-process commands.
-func (p *Provider) startControlSocket(name string, cmd *exec.Cmd) (net.Listener, error) {
+func (p *Provider) startControlSocket(name string, cmd *exec.Cmd, done <-chan struct{}) (net.Listener, error) {
 	sp := p.sockPath(name)
 	namePath := p.sockNamePath(name)
 	os.Remove(sp) //nolint:errcheck
@@ -699,14 +748,14 @@ func (p *Provider) startControlSocket(name string, cmd *exec.Cmd) (net.Listener,
 			if err != nil {
 				return
 			}
-			go handleControlConn(conn, cmd)
+			go handleControlConn(conn, cmd, done)
 		}
 	}()
 	return lis, nil
 }
 
 // handleControlConn reads a command from the connection and acts on the process.
-func handleControlConn(conn net.Conn, cmd *exec.Cmd) {
+func handleControlConn(conn net.Conn, cmd *exec.Cmd, done <-chan struct{}) {
 	defer conn.Close()                                     //nolint:errcheck
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
 	scanner := bufio.NewScanner(conn)
@@ -715,25 +764,10 @@ func handleControlConn(conn net.Conn, cmd *exec.Cmd) {
 	}
 	switch scanner.Text() {
 	case "stop":
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-		deadline := time.After(5 * time.Second)
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
-		alive := true
-		for alive {
-			select {
-			case <-deadline:
-				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				alive = false
-			case <-ticker.C:
-				if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
-					alive = false
-				}
-			}
-		}
+		_ = runtime.TerminateManagedProcess(cmd, done, runtime.ManagedProcessStopGrace)
 		conn.Write([]byte("ok\n")) //nolint:errcheck
 	case "interrupt":
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGINT)
+		_ = runtime.SignalProcessGroup(cmd, syscall.SIGINT)
 		conn.Write([]byte("ok\n")) //nolint:errcheck
 	case "ping":
 		conn.Write([]byte("ok\n")) //nolint:errcheck
@@ -759,29 +793,41 @@ func (p *Provider) socketAlive(name string) bool {
 
 // sendSocketCommand connects to the session's control socket and sends a command.
 func (p *Provider) sendSocketCommand(name, command string, timeout time.Duration) error {
-	var lastErr error
+	var (
+		lastErr            error
+		firstActionableErr error
+	)
 	for _, sp := range []string{p.sockPath(name), p.legacySockPath(name)} {
-		conn, err := net.DialTimeout("unix", sp, timeout)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		defer conn.Close()                        //nolint:errcheck
-		conn.SetDeadline(time.Now().Add(timeout)) //nolint:errcheck
-		_, err = fmt.Fprintf(conn, "%s\n", command)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		scanner := bufio.NewScanner(conn)
-		if scanner.Scan() && scanner.Text() == "ok" {
+		err := func(path string) error {
+			conn, err := net.DialTimeout("unix", path, timeout)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()                        //nolint:errcheck
+			conn.SetDeadline(time.Now().Add(timeout)) //nolint:errcheck
+			_, err = fmt.Fprintf(conn, "%s\n", command)
+			if err != nil {
+				return err
+			}
+			scanner := bufio.NewScanner(conn)
+			if scanner.Scan() && scanner.Text() == "ok" {
+				return nil
+			}
+			if err := scanner.Err(); err != nil {
+				return err
+			}
+			return fmt.Errorf("unexpected response from socket")
+		}(sp)
+		if err == nil {
 			return nil
 		}
-		if err := scanner.Err(); err != nil {
-			lastErr = err
-			continue
+		if !isUnavailableSocketError(err) && firstActionableErr == nil {
+			firstActionableErr = err
 		}
-		lastErr = fmt.Errorf("unexpected response from socket")
+		lastErr = err
+	}
+	if firstActionableErr != nil {
+		return firstActionableErr
 	}
 	return lastErr
 }
@@ -790,11 +836,20 @@ func (p *Provider) sendSocketCommand(name, command string, timeout time.Duration
 func (p *Provider) stopBySocket(name string) error {
 	err := p.sendSocketCommand(name, "stop", 7*time.Second)
 	if err != nil {
-		os.Remove(p.sockPath(name)) //nolint:errcheck
-		_ = os.Remove(p.sockNamePath(name))
-		return nil
+		if isUnavailableSocketError(err) {
+			os.Remove(p.sockPath(name)) //nolint:errcheck
+			_ = os.Remove(p.sockNamePath(name))
+			return nil
+		}
+		return err
 	}
 	return nil
+}
+
+func isUnavailableSocketError(err error) bool {
+	return errors.Is(err, os.ErrNotExist) ||
+		errors.Is(err, syscall.ENOENT) ||
+		errors.Is(err, syscall.ECONNREFUSED)
 }
 
 // Capabilities reports ACP provider capabilities. The ACP provider has
@@ -808,15 +863,15 @@ func (p *Provider) SleepCapability(string) runtime.SessionSleepCapability {
 	return runtime.SessionSleepCapabilityTimedOnly
 }
 
+// isPipeWriteError reports whether err originated from writing to a closed
+// stdin pipe — the signal that the agent process exited between our alive()
+// check and the write. Other sendRequest failures (marshal errors, etc.) are
+// unrelated to lifecycle and should surface immediately.
+func isPipeWriteError(err error) bool {
+	return errors.Is(err, io.ErrClosedPipe) || errors.Is(err, syscall.EPIPE)
+}
+
 // terminateProcess sends SIGTERM then SIGKILL to a tracked process group.
 func terminateProcess(sc *sessionConn) error {
-	_ = syscall.Kill(-sc.cmd.Process.Pid, syscall.SIGTERM)
-	select {
-	case <-sc.done:
-		return nil
-	case <-time.After(5 * time.Second):
-	}
-	_ = syscall.Kill(-sc.cmd.Process.Pid, syscall.SIGKILL)
-	<-sc.done
-	return nil
+	return runtime.TerminateManagedProcess(sc.cmd, sc.done, runtime.ManagedProcessStopGrace)
 }

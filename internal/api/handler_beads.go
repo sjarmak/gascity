@@ -1,149 +1,22 @@
 package api
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
-	"io"
-	"net/http"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
+	convoycore "github.com/gastownhall/gascity/internal/convoy"
+	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/sling"
 )
-
-func (s *Server) handleBeadList(w http.ResponseWriter, r *http.Request) {
-	bp := parseBlockingParams(r)
-	if bp.isBlocking() {
-		waitForChange(r.Context(), s.state.EventProvider(), bp)
-	}
-
-	q := r.URL.Query()
-	qStatus := q.Get("status")
-	qType := q.Get("type")
-	qLabel := q.Get("label")
-	qAssignee := q.Get("assignee")
-	qRig := q.Get("rig")
-	pp := parsePagination(r, 50)
-
-	stores := s.state.BeadStores()
-	// When a specific rig is requested, query its store directly to avoid
-	// dedup-related misses when multiple rigs share a store (file provider).
-	var rigNames []string
-	if qRig != "" {
-		if _, ok := stores[qRig]; ok {
-			rigNames = []string{qRig}
-		}
-	} else {
-		rigNames = sortedRigNames(stores)
-	}
-	setDataSource(r, "bd_subprocess")
-	var all []beads.Bead
-	for _, rigName := range rigNames {
-		store := stores[rigName]
-		query := beads.ListQuery{
-			Status:   qStatus,
-			Type:     qType,
-			Label:    qLabel,
-			Assignee: qAssignee,
-		}
-		if !query.HasFilter() {
-			query.AllowScan = true
-		}
-		list, err := store.List(query)
-		if err != nil {
-			continue
-		}
-		all = append(all, list...)
-	}
-
-	if all == nil {
-		all = []beads.Bead{}
-	}
-	if !pp.IsPaging {
-		if pp.Limit < len(all) {
-			all = all[:pp.Limit]
-		}
-		writeListJSON(w, s.latestIndex(), all, len(all))
-		return
-	}
-	page, total, nextCursor := paginate(all, pp)
-	if page == nil {
-		page = []beads.Bead{}
-	}
-	writePagedJSON(w, s.latestIndex(), page, total, nextCursor)
-}
-
-func (s *Server) handleBeadReady(w http.ResponseWriter, r *http.Request) {
-	bp := parseBlockingParams(r)
-	if bp.isBlocking() {
-		waitForChange(r.Context(), s.state.EventProvider(), bp)
-	}
-
-	stores := s.state.BeadStores()
-	rigNames := sortedRigNames(stores)
-	var all []beads.Bead
-	for _, rigName := range rigNames {
-		ready, err := stores[rigName].Ready()
-		if err != nil {
-			continue
-		}
-		all = append(all, ready...)
-	}
-
-	if all == nil {
-		all = []beads.Bead{}
-	}
-	writeListJSON(w, s.latestIndex(), all, len(all))
-}
-
-func (s *Server) handleBeadGet(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	for _, store := range s.beadStoresForID(id) {
-		b, err := store.Get(id)
-		if err != nil {
-			if errors.Is(err, beads.ErrNotFound) {
-				continue
-			}
-			writeError(w, http.StatusInternalServerError, "internal", err.Error())
-			return
-		}
-		writeIndexJSON(w, s.latestIndex(), b)
-		return
-	}
-	writeError(w, http.StatusNotFound, "not_found", "bead "+id+" not found")
-}
-
-func (s *Server) handleBeadDeps(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	for _, store := range s.beadStoresForID(id) {
-		parent, err := store.Get(id)
-		if err != nil {
-			if errors.Is(err, beads.ErrNotFound) {
-				continue
-			}
-			writeError(w, http.StatusInternalServerError, "internal", err.Error())
-			return
-		}
-		children, err := store.List(beads.ListQuery{
-			ParentID: id,
-			Sort:     beads.SortCreatedAsc,
-		})
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal", err.Error())
-			return
-		}
-		children = appendMetadataAttachedChildren(store, parent, children)
-		if children == nil {
-			children = []beads.Bead{}
-		}
-		writeIndexJSON(w, s.latestIndex(), map[string]any{"children": children})
-		return
-	}
-	writeError(w, http.StatusNotFound, "not_found", "bead "+id+" not found")
-}
 
 func appendMetadataAttachedChildren(store beads.Store, parent beads.Bead, children []beads.Bead) []beads.Bead {
 	if store == nil {
@@ -171,206 +44,95 @@ func appendMetadataAttachedChildren(store beads.Store, parent beads.Bead, childr
 	return children
 }
 
-func (s *Server) handleBeadCreate(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Rig         string   `json:"rig"`
-		Title       string   `json:"title"`
-		Type        string   `json:"type"`
-		Priority    *int     `json:"priority"`
-		Assignee    string   `json:"assignee"`
-		Description string   `json:"description"`
-		Labels      []string `json:"labels"`
+func (s *Server) beadListAssigneeTerms(ctx context.Context, assignee string) []string {
+	assignee = strings.TrimSpace(assignee)
+	if assignee == "" {
+		return []string{""}
 	}
-	if err := decodeBody(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid", err.Error())
-		return
-	}
-	if body.Title == "" {
-		writeError(w, http.StatusBadRequest, "invalid", "title is required")
-		return
-	}
-
-	// Idempotency check — key is scoped by method+path to prevent cross-endpoint collisions.
-	idemKey := scopedIdemKey(r, r.Header.Get("Idempotency-Key"))
-	var bodyHash string
-	if idemKey != "" {
-		bodyHash = hashBody(body)
-		if s.idem.handleIdempotent(w, idemKey, bodyHash) {
-			return
-		}
-	}
-
-	store := s.findStore(body.Rig)
+	store := s.state.CityBeadStore()
 	if store == nil {
-		s.idem.unreserve(idemKey)
-		writeError(w, http.StatusBadRequest, "invalid", "rig is required when multiple rigs are configured")
-		return
+		return []string{assignee}
 	}
+	id, err := s.resolveSessionTargetIDWithContext(ctx, store, assignee, apiSessionResolveOptions{})
+	if err != nil || id == "" {
+		return []string{assignee}
+	}
+	// A work bead's stored assignee may be ANY of the resolved session's
+	// identity forms — the bead ID, session_name, alias, configured named
+	// identity, or a prior alias — so match against all of them (mirrors
+	// sessionBeadAssigneeIdentities used by the reconciler). Without this the
+	// session-name form written by assign/update (and the claim path) would be
+	// invisible to ?assignee=<alias|id> list filters.
+	seen := map[string]bool{}
+	var terms []string
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" || seen[v] {
+			return
+		}
+		seen[v] = true
+		terms = append(terms, v)
+	}
+	add(assignee)
+	add(id)
+	if b, getErr := store.Get(id); getErr == nil {
+		add(b.Metadata["session_name"])
+		add(b.Metadata["alias"])
+		add(b.Metadata[session.NamedSessionIdentityMetadata])
+		for _, prior := range session.AliasHistory(b.Metadata) {
+			add(prior)
+		}
+	}
+	return terms
+}
 
-	b, err := store.Create(beads.Bead{
-		Title:       body.Title,
-		Type:        body.Type,
-		Priority:    body.Priority,
-		Assignee:    body.Assignee,
-		Description: body.Description,
-		Labels:      body.Labels,
-	})
+func (s *Server) normalizeRawBeadAssignee(ctx context.Context, assignee string) (string, error) {
+	assignee = strings.TrimSpace(assignee)
+	if assignee == "" {
+		return "", nil
+	}
+	store := s.state.CityBeadStore()
+	if store == nil {
+		return assignee, nil
+	}
+	id, err := s.resolveSessionTargetIDWithContext(ctx, store, assignee, apiSessionResolveOptions{})
+	if errors.Is(err, session.ErrSessionNotFound) {
+		id, err = s.resolveSessionTargetIDWithContext(ctx, store, assignee, apiSessionResolveOptions{materialize: true})
+	}
 	if err != nil {
-		s.idem.unreserve(idemKey)
-		writeError(w, http.StatusInternalServerError, "internal", err.Error())
-		return
-	}
-	s.idem.storeResponse(idemKey, bodyHash, http.StatusCreated, b)
-	writeJSON(w, http.StatusCreated, b)
-}
-
-func (s *Server) handleBeadClose(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	for _, store := range s.beadStoresForID(id) {
-		if err := store.Close(id); err != nil {
-			if errors.Is(err, beads.ErrNotFound) {
-				continue
-			}
-			writeError(w, http.StatusInternalServerError, "internal", err.Error())
-			return
+		if errors.Is(err, session.ErrSessionNotFound) {
+			return "", fmt.Errorf("assignee must resolve to a concrete open session bead ID: %q", assignee)
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "closed"})
-		return
+		return "", fmt.Errorf("resolving assignee %q: %w", assignee, err)
 	}
-	writeError(w, http.StatusNotFound, "not_found", "bead "+id+" not found")
-}
-
-func (s *Server) handleBeadUpdate(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	payload, err := decodeBodyBytes(r)
+	b, err := store.Get(id)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid", err.Error())
-		return
+		return "", fmt.Errorf("looking up resolved assignee session %q: %w", id, err)
 	}
-	var raw map[string]json.RawMessage
-	if len(bytes.TrimSpace(payload)) > 0 {
-		if err := json.Unmarshal(payload, &raw); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid", err.Error())
-			return
-		}
+	if !session.IsSessionBeadOrRepairable(b) || b.Status == "closed" {
+		return "", fmt.Errorf("assignee must resolve to a concrete open session bead ID: %q", assignee)
 	}
-	var body struct {
-		Title        *string           `json:"title"`
-		Status       *string           `json:"status"`
-		Type         *string           `json:"type"`
-		Priority     *int              `json:"priority"`
-		Assignee     *string           `json:"assignee"`
-		Description  *string           `json:"description"`
-		Labels       []string          `json:"labels"`
-		RemoveLabels []string          `json:"remove_labels"`
-		Metadata     map[string]string `json:"metadata"`
-	}
-	if err := json.Unmarshal(payload, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid", err.Error())
-		return
-	}
-	if rawPriority, ok := raw["priority"]; ok && bytes.Equal(bytes.TrimSpace(rawPriority), []byte("null")) {
-		writeError(w, http.StatusBadRequest, "invalid", "clearing priority is not supported")
-		return
-	}
-
-	opts := beads.UpdateOpts{
-		Title:        body.Title,
-		Status:       body.Status,
-		Type:         body.Type,
-		Priority:     body.Priority,
-		Assignee:     body.Assignee,
-		Description:  body.Description,
-		Labels:       body.Labels,
-		RemoveLabels: body.RemoveLabels,
-	}
-
-	for _, store := range s.beadStoresForID(id) {
-		if err := store.Update(id, opts); err != nil {
-			if errors.Is(err, beads.ErrNotFound) {
-				continue
-			}
-			writeError(w, http.StatusInternalServerError, "internal", err.Error())
-			return
-		}
-		// Apply metadata key-value pairs if provided.
-		if len(body.Metadata) > 0 {
-			if err := store.SetMetadataBatch(id, body.Metadata); err != nil {
-				writeError(w, http.StatusInternalServerError, "internal", err.Error())
-				return
-			}
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
-		return
-	}
-	writeError(w, http.StatusNotFound, "not_found", "bead "+id+" not found")
+	session.RepairEmptyType(store, &b)
+	return sessionBeadAssigneeIdentifier(b), nil
 }
 
-func (s *Server) handleBeadReopen(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	status := "open"
-
-	for _, store := range s.beadStoresForID(id) {
-		b, err := store.Get(id)
-		if err != nil {
-			if errors.Is(err, beads.ErrNotFound) {
-				continue
-			}
-			writeError(w, http.StatusInternalServerError, "internal", err.Error())
-			return
+// sessionBeadAssigneeIdentifier returns the durable agent-facing identity form
+// of a session bead — its session_name, else alias, else configured named
+// identity — falling back to the bead ID when no name metadata is present so a
+// resolved assignment is never silently cleared. This is the form the agent
+// claims and verifies work with (BEADS_ACTOR / GC_SESSION_NAME), so stamping it
+// keeps assign/update consistent with the claim path (which already stores the
+// raw session-name) and with the form-agnostic session matching in the
+// reconciler (sessionBeadAssigneeIdentities). Stamping the bare bead ID here
+// instead made template-routed continuation work unclaimable by name-matching
+// agents.
+func sessionBeadAssigneeIdentifier(b beads.Bead) string {
+	for _, key := range []string{"session_name", "alias", session.NamedSessionIdentityMetadata} {
+		if v := strings.TrimSpace(b.Metadata[key]); v != "" {
+			return v
 		}
-		if b.Status != "closed" {
-			writeError(w, http.StatusConflict, "conflict", "bead "+id+" is not closed (status: "+b.Status+")")
-			return
-		}
-		if err := store.Update(id, beads.UpdateOpts{Status: &status}); err != nil {
-			writeError(w, http.StatusInternalServerError, "internal", err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "reopened"})
-		return
 	}
-	writeError(w, http.StatusNotFound, "not_found", "bead "+id+" not found")
-}
-
-func (s *Server) handleBeadAssign(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	var body struct {
-		Assignee string `json:"assignee"`
-	}
-	if err := decodeBody(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid", err.Error())
-		return
-	}
-
-	for _, store := range s.beadStoresForID(id) {
-		if err := store.Update(id, beads.UpdateOpts{Assignee: &body.Assignee}); err != nil {
-			if errors.Is(err, beads.ErrNotFound) {
-				continue
-			}
-			writeError(w, http.StatusInternalServerError, "internal", err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "assigned", "assignee": body.Assignee})
-		return
-	}
-	writeError(w, http.StatusNotFound, "not_found", "bead "+id+" not found")
-}
-
-func (s *Server) handleBeadDelete(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	for _, store := range s.beadStoresForID(id) {
-		if err := store.Close(id); err != nil {
-			if errors.Is(err, beads.ErrNotFound) {
-				continue
-			}
-			writeError(w, http.StatusInternalServerError, "internal", err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
-		return
-	}
-	writeError(w, http.StatusNotFound, "not_found", "bead "+id+" not found")
+	return b.ID
 }
 
 // findStore returns the bead store for the given rig. If rig is empty, returns
@@ -379,6 +141,9 @@ func (s *Server) handleBeadDelete(w http.ResponseWriter, r *http.Request) {
 func (s *Server) findStore(rig string) beads.Store {
 	if rig != "" {
 		return s.state.BeadStore(rig)
+	}
+	if cityStore := s.state.CityBeadStore(); cityStore != nil {
+		return cityStore
 	}
 	stores := s.state.BeadStores()
 	names := sortedRigNames(stores)
@@ -391,10 +156,40 @@ func (s *Server) findStore(rig string) beads.Store {
 // beadStoresForID resolves the authoritative store for a bead ID using its
 // prefix/routes mapping when possible. If there is no routed match, it falls
 // back to the legacy store scan order.
+//
+// The result is the per-class by-id candidate set: a successful prefix/route
+// match returns the single store that owns the ID's namespace (which is already
+// the bead's class+rig store), and the unrouted fallback leads with the
+// city/HQ store ahead of the per-rig work stores. A graph-relocated city adds a
+// class-prefix arm so graph-class ids reach the dedicated graph store.
 func (s *Server) beadStoresForID(id string) []beads.Store {
-	if prefix := beadPrefix(strings.TrimSpace(id)); prefix != "" {
+	id = strings.TrimSpace(id)
+	if store := s.resolveStoreByConfiguredIDPrefix(id); store != nil {
+		return []beads.Store{store}
+	}
+	if prefix := beadPrefix(id); prefix != "" {
 		if store := s.resolveStoreByPrefix(prefix); store != nil {
 			return []beads.Store{store}
+		}
+	}
+
+	// Class-prefix arm: a graph-relocated city keeps graph-class beads (reserved
+	// id-prefix "gcg") in a dedicated graph store that is NOT reachable via a
+	// rig/HQ prefix or a routes.jsonl entry, so a graph-class id would otherwise
+	// fall through to the candidate scan and miss. Return [graph, work] —
+	// graph-first (prefix-owner first) — so the per-store Get-then-mutate loop in
+	// the by-id handlers federates the graph store ahead of work and pins it on
+	// the first probe. Skipped for a default (non-relocated) city, where
+	// GraphBeadStore() == CityBeadStore(): the arm never fires and this path stays
+	// byte-identical.
+	if graph := s.state.GraphBeadStore().Store; graph != nil {
+		if city := s.state.CityBeadStore(); graph != city {
+			if prefix, ok := config.ReservedClassPrefix(config.BeadClassGraph); ok && beadIDHasConfiguredPrefix(id, prefix) {
+				if city != nil {
+					return []beads.Store{graph, city}
+				}
+				return []beads.Store{graph}
+			}
 		}
 	}
 
@@ -410,6 +205,57 @@ func (s *Server) beadStoresForID(id string) []beads.Store {
 	return candidates
 }
 
+func (s *Server) resolveStoreByConfiguredIDPrefix(id string) beads.Store {
+	if id == "" {
+		return nil
+	}
+	cfg := s.state.Config()
+	if cfg == nil {
+		return nil
+	}
+
+	// Only stores that are actually loaded are candidates: a configured prefix
+	// whose store is missing must not win the slot, so a shorter loaded prefix
+	// can still own the id (and otherwise the id is left to the legacy scan).
+	//
+	// This caller routes on the configured (rig/HQ) prefixes with a
+	// longest-prefix, exact-or-hyphen match (beadIDHasConfiguredPrefix). It
+	// resolves against the configured prefixes (not each store's own IDPrefix)
+	// and requires the longest configured prefix to win, so it keeps the scan
+	// inline rather than using the namespace-only, first-match by-id resolver.
+	var bestStore beads.Store
+	bestLen := -1
+	if prefix := strings.TrimSpace(config.EffectiveHQPrefix(cfg)); beadIDHasConfiguredPrefix(id, prefix) {
+		if cityStore := s.state.CityBeadStore(); cityStore != nil {
+			bestStore = cityStore
+			bestLen = len(prefix)
+		}
+	}
+	for _, rig := range cfg.Rigs {
+		prefix := strings.TrimSpace(rig.EffectivePrefix())
+		if !beadIDHasConfiguredPrefix(id, prefix) || len(prefix) <= bestLen {
+			continue
+		}
+		store := s.state.BeadStore(rig.Name)
+		if store == nil {
+			continue
+		}
+		bestStore = store
+		bestLen = len(prefix)
+	}
+	return bestStore
+}
+
+// beadIDHasConfiguredPrefix reports whether id falls under prefix, matching a
+// bare id == prefix exactly or the "prefix-" namespace. This is the
+// exact-or-hyphen match the configured-prefix resolver uses.
+func beadIDHasConfiguredPrefix(id, prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	return id == prefix || strings.HasPrefix(id, prefix+"-")
+}
+
 // resolveStoreByPrefix finds the store that owns a bead prefix by checking
 // routes.jsonl files in the city and each rig's .beads/ directory, then
 // mapping the resolved store path back to the correct store.
@@ -420,6 +266,21 @@ func (s *Server) resolveStoreByPrefix(prefix string) beads.Store {
 	}
 	stores := s.state.BeadStores()
 	cityPath := strings.TrimSpace(s.state.CityPath())
+
+	if prefix == config.EffectiveHQPrefix(cfg) {
+		if cityStore := s.state.CityBeadStore(); cityStore != nil {
+			return cityStore
+		}
+	}
+	for _, rig := range cfg.Rigs {
+		if prefix != rig.EffectivePrefix() {
+			continue
+		}
+		if store, exists := stores[rig.Name]; exists {
+			return store
+		}
+		return nil
+	}
 
 	// Build rig path → name map for reverse lookup (used by both city
 	// and rig route resolution below).
@@ -507,82 +368,141 @@ func sortedRigNames(stores map[string]beads.Store) []string {
 	return deduped
 }
 
-// beadGraphResponseJSON is the response shape for GET /v0/beads/graph/{rootID}.
+// BeadGraphResponse is the response shape for GET /v0/beads/graph/{rootID}.
 // Returns raw beads and deps — no status mapping, no presentation logic.
-type beadGraphResponseJSON struct {
+type BeadGraphResponse struct {
 	Root  beads.Bead            `json:"root"`
 	Beads []beads.Bead          `json:"beads"`
 	Deps  []workflowDepResponse `json:"deps"`
 }
 
-func (s *Server) handleBeadGraph(w http.ResponseWriter, r *http.Request) {
-	rootID := r.PathValue("rootID")
-	if rootID == "" {
-		writeError(w, http.StatusBadRequest, "invalid", "rootID is required")
-		return
-	}
+func collectBeadGraph(store beads.Store, root beads.Bead) ([]beads.Bead, []workflowDepResponse, error) {
+	graphBeads := make([]beads.Bead, 0, 1)
+	beadIndex := make(map[string]beads.Bead)
 
-	var root beads.Bead
-	var foundStore beads.Store
-	for _, store := range s.beadStoresForID(rootID) {
-		b, err := store.Get(rootID)
-		if err != nil {
-			if errors.Is(err, beads.ErrNotFound) {
-				continue
-			}
-			writeError(w, http.StatusInternalServerError, "internal", err.Error())
+	upsert := func(b beads.Bead) {
+		if b.ID == "" {
 			return
 		}
-		root = b
-		foundStore = store
-		break
+		if existing, ok := beadIndex[b.ID]; ok {
+			if existing.ParentID == "" && b.ParentID != "" {
+				existing.ParentID = b.ParentID
+				beadIndex[b.ID] = existing
+				for i := range graphBeads {
+					if graphBeads[i].ID == b.ID {
+						graphBeads[i].ParentID = b.ParentID
+						break
+					}
+				}
+			}
+			return
+		}
+		beadIndex[b.ID] = b
+		graphBeads = append(graphBeads, b)
 	}
-	if foundStore == nil {
-		writeError(w, http.StatusNotFound, "not_found", "bead "+rootID+" not found")
-		return
-	}
+	upsert(root)
 
-	// Collect all beads in the graph: root + workflow descendants keyed by gc.root_bead_id.
-	all, err := foundStore.List(beads.ListQuery{
-		Metadata:      map[string]string{"gc.root_bead_id": rootID},
+	metadataChildren, err := store.List(beads.ListQuery{
+		Metadata:      map[string]string{beadmeta.RootBeadIDMetadataKey: root.ID},
 		IncludeClosed: true,
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", err.Error())
-		return
+		return nil, nil, fmt.Errorf("listing metadata children for bead %q: %w", root.ID, err)
+	}
+	for _, child := range metadataChildren {
+		upsert(child)
 	}
 
-	graphBeads := []beads.Bead{root}
-	beadIndex := map[string]beads.Bead{root.ID: root}
-	for _, b := range all {
-		if b.ID == root.ID {
-			continue
+	if root.Type == "convoy" {
+		members, err := convoycore.Members(store, root.ID, true)
+		if err != nil {
+			return nil, nil, fmt.Errorf("listing convoy members for bead %q: %w", root.ID, err)
 		}
-		graphBeads = append(graphBeads, b)
-		beadIndex[b.ID] = b
+		for _, member := range members {
+			upsert(member)
+		}
 	}
 
-	// Collect deps between graph beads (reuse existing dedup logic)
-	deps, _ := collectWorkflowDeps(foundStore, beadIndex)
+	parentEdges := make([]workflowDepResponse, 0)
+	seenEdges := make(map[string]bool)
+	addParentEdge := func(parentID, childID string) {
+		if parentID == "" || childID == "" {
+			return
+		}
+		edge := workflowDepResponse{From: parentID, To: childID, Kind: "parent-child"}
+		key := edge.From + "|" + edge.To + "|" + edge.Kind
+		if seenEdges[key] {
+			return
+		}
+		seenEdges[key] = true
+		parentEdges = append(parentEdges, edge)
+	}
 
-	writeIndexJSON(w, s.latestIndex(), beadGraphResponseJSON{
-		Root:  root,
-		Beads: graphBeads,
-		Deps:  deps,
-	})
+	// Discover parent-linked descendants and their parent-child edges by walking
+	// the tree one BFS level at a time, fetching each level's children with a
+	// single batched store.List(ParentIDs=...) call. This replaces the former
+	// per-bead store.List(ParentID=...) fan-out — an N+1 (one round-trip per bead)
+	// that serialized on a single read connection and dominated graph-read latency
+	// under load. The returned beads are filtered in memory against the level's
+	// parent set, so the result is correct even on a backend that does not honor
+	// ParentIDs (such a backend returns a superset, which the filter narrows).
+	frontier := make([]string, 0, len(graphBeads))
+	for _, b := range graphBeads {
+		frontier = append(frontier, b.ID)
+	}
+	for len(frontier) > 0 {
+		frontierSet := make(map[string]bool, len(frontier))
+		for _, id := range frontier {
+			frontierSet[id] = true
+		}
+		children, err := store.List(beads.ListQuery{
+			ParentIDs:     frontier,
+			IncludeClosed: true,
+			AllowScan:     true,
+			Sort:          beads.SortCreatedAsc,
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("listing child beads for graph %q: %w", root.ID, err)
+		}
+		var next []string
+		for _, child := range children {
+			if !frontierSet[child.ParentID] {
+				continue
+			}
+			addParentEdge(child.ParentID, child.ID)
+			if _, seen := beadIndex[child.ID]; !seen {
+				upsert(child)
+				next = append(next, child.ID)
+			}
+		}
+		frontier = next
+	}
+
+	return graphBeads, parentEdges, nil
 }
 
-// beadPrefix extracts the alphabetic prefix from a bead ID (e.g., "ga" from "ga-5b8i").
-func beadPrefix(id string) string {
-	for i, c := range id {
-		if c == '-' {
-			return id[:i]
-		}
-		if c < 'a' || c > 'z' {
-			return ""
-		}
+func mergeWorkflowDeps(primary, extra []workflowDepResponse) []workflowDepResponse {
+	if len(extra) == 0 {
+		return primary
 	}
-	return ""
+	seen := make(map[string]bool, len(primary)+len(extra))
+	for _, edge := range primary {
+		seen[edge.From+"|"+edge.To+"|"+edge.Kind] = true
+	}
+	for _, edge := range extra {
+		key := edge.From + "|" + edge.To + "|" + edge.Kind
+		if seen[key] {
+			continue
+		}
+		primary = append(primary, edge)
+		seen[key] = true
+	}
+	return primary
+}
+
+// beadPrefix extracts the config-free heuristic prefix from a bead ID.
+func beadPrefix(id string) string {
+	return sling.BeadPrefix(id)
 }
 
 // resolveRoutePrefix reads routes.jsonl from a rig's .beads/ directory and
@@ -613,16 +533,4 @@ func resolveRoutePrefix(rigPath, prefix string) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-// decodeBody decodes JSON request body into v.
-// Limits body size to 1 MiB to prevent OOM from oversized requests.
-func decodeBody(r *http.Request, v any) error {
-	r.Body = http.MaxBytesReader(nil, r.Body, 1<<20) // 1 MiB
-	return json.NewDecoder(r.Body).Decode(v)
-}
-
-func decodeBodyBytes(r *http.Request) ([]byte, error) {
-	r.Body = http.MaxBytesReader(nil, r.Body, 1<<20) // 1 MiB
-	return io.ReadAll(r.Body)
 }

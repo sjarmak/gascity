@@ -9,8 +9,21 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 )
+
+type noBroadSessionIdentifierStore struct {
+	*beads.MemStore
+	t *testing.T
+}
+
+func (s *noBroadSessionIdentifierStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.Label == LabelSession && len(query.Metadata) == 0 {
+		s.t.Fatalf("session identifier availability used broad session label scan: %+v", query)
+	}
+	return s.MemStore.List(query)
+}
 
 func TestValidateExplicitName(t *testing.T) {
 	longName := strings.Repeat("a", explicitSessionNameMaxLen+1)
@@ -60,6 +73,7 @@ func TestValidateAlias(t *testing.T) {
 	}{
 		{name: "empty allowed", input: "", want: ""},
 		{name: "trimmed qualified", input: "  myrig/worker  ", want: "myrig/worker"},
+		{name: "binding qualified", input: "employees.corp--alex", want: "employees.corp--alex"},
 		{name: "reserved prefix", input: "s-gc-123", wantErr: ErrInvalidSessionAlias},
 		{name: "human reserved", input: "human", wantErr: ErrInvalidSessionAlias},
 		{name: "session id syntax reserved", input: "gc-42", wantErr: ErrInvalidSessionAlias},
@@ -109,7 +123,7 @@ func TestEnsureSessionNameAvailable_RejectsOpenIdentifierCollisions(t *testing.T
 		Type:   BeadType,
 		Labels: []string{LabelSession},
 		Metadata: map[string]string{
-			"template": "myrig/worker",
+			"template": "worker",
 		},
 	})
 	if err != nil {
@@ -125,6 +139,83 @@ func TestEnsureSessionNameAvailable_RejectsOpenIdentifierCollisions(t *testing.T
 	}
 	if err := ensureSessionNameAvailable(store, "worker"); err != nil {
 		t.Fatalf("ensureSessionNameAvailable(closed collision) = %v, want nil", err)
+	}
+}
+
+// Bare names and qualified identifiers occupy distinct namespaces. A city-scoped
+// control-dispatcher with bare session_name="control-dispatcher" must coexist
+// with rig-scoped dispatchers whose agent_name is "<rig>/control-dispatcher".
+// Regression for the multi-rig collision fixed by dropping the bare-vs-qualified
+// suffix match in sessionNameConflictsWithExistingIdentifier.
+func TestEnsureSessionNameAvailable_AllowsBareVsQualifiedCoexistence(t *testing.T) {
+	store := beads.NewMemStore()
+
+	// Two rig-scoped dispatchers already registered with qualified identifiers.
+	// Matches the production shape where tp.SessionName = "<rig>--control-dispatcher"
+	// and agent_name/template carry the qualified "<rig>/control-dispatcher" form.
+	for _, rig := range []string{"codeprobe", "geo"} {
+		if _, err := store.Create(beads.Bead{
+			Type:   BeadType,
+			Labels: []string{LabelSession},
+			Metadata: map[string]string{
+				"agent_name":   rig + "/control-dispatcher",
+				"template":     rig + "/control-dispatcher",
+				"session_name": rig + "--control-dispatcher",
+			},
+		}); err != nil {
+			t.Fatalf("Create(%s dispatcher): %v", rig, err)
+		}
+	}
+
+	// City-scoped dispatcher with bare session_name must still be able to claim
+	// "control-dispatcher" despite the qualified identifiers above.
+	if err := ensureSessionNameAvailable(store, "control-dispatcher"); err != nil {
+		t.Fatalf("ensureSessionNameAvailable(bare vs qualified) = %v, want nil", err)
+	}
+
+	// Exact-match on template must still collide (guard that the narrower check holds).
+	if _, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"template": "control-dispatcher",
+		},
+	}); err != nil {
+		t.Fatalf("Create(bare template): %v", err)
+	}
+	if err := ensureSessionNameAvailable(store, "control-dispatcher"); !errors.Is(err, ErrSessionNameExists) {
+		t.Fatalf("ensureSessionNameAvailable(bare exact-match) error = %v, want %v", err, ErrSessionNameExists)
+	}
+}
+
+// Same multi-rig scenario via the production entry point
+// EnsureSessionNameAvailableWithConfigForOwner — the reconciler calls this path
+// (cmd/gc/session_beads.go, cmd/gc/session_template_start.go), so regression
+// coverage must include it alongside the helper-level test above.
+func TestEnsureSessionNameAvailableWithConfigForOwner_AllowsBareVsQualifiedCoexistence(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		NamedSessions: []config.NamedSession{
+			{Template: "control-dispatcher"},
+		},
+	}
+
+	for _, rig := range []string{"codeprobe", "geo"} {
+		if _, err := store.Create(beads.Bead{
+			Type:   BeadType,
+			Labels: []string{LabelSession},
+			Metadata: map[string]string{
+				"agent_name":   rig + "/control-dispatcher",
+				"template":     rig + "/control-dispatcher",
+				"session_name": rig + "--control-dispatcher",
+			},
+		}); err != nil {
+			t.Fatalf("Create(%s dispatcher): %v", rig, err)
+		}
+	}
+
+	if err := EnsureSessionNameAvailableWithConfigForOwner(store, cfg, "control-dispatcher", "", "control-dispatcher"); err != nil {
+		t.Fatalf("EnsureSessionNameAvailableWithConfigForOwner(bare vs qualified) = %v, want nil", err)
 	}
 }
 
@@ -146,7 +237,7 @@ func TestEnsureSessionNameAvailable_RejectsLiveAliasCollisions(t *testing.T) {
 	}
 }
 
-func TestEnsureSessionNameAvailable_RejectsLiveAliasHistoryCollisions(t *testing.T) {
+func TestEnsureSessionNameAvailable_AllowsLiveAliasHistoryReuse(t *testing.T) {
 	store := beads.NewMemStore()
 	_, err := store.Create(beads.Bead{
 		Type:   BeadType,
@@ -160,8 +251,8 @@ func TestEnsureSessionNameAvailable_RejectsLiveAliasHistoryCollisions(t *testing
 		t.Fatalf("Create: %v", err)
 	}
 
-	if err := ensureSessionNameAvailable(store, "mayor"); !errors.Is(err, ErrSessionNameExists) {
-		t.Fatalf("ensureSessionNameAvailable(alias history collision) error = %v, want %v", err, ErrSessionNameExists)
+	if err := ensureSessionNameAvailable(store, "mayor"); err != nil {
+		t.Fatalf("ensureSessionNameAvailable(alias history reuse) = %v, want nil", err)
 	}
 }
 
@@ -217,7 +308,65 @@ func TestEnsureSessionNameAvailable_RejectsClosedAdHocSession(t *testing.T) {
 	}
 }
 
-func TestEnsureAliasAvailableWithConfig_RejectsLiveAliasHistoryCollision(t *testing.T) {
+// TestEnsureSessionNameAvailable_AllowsClosedNamedSessionByIdentity reproduces
+// ga-841: a closed configured named session bead that carries the
+// configured_named_identity but is MISSING the boolean configured_named_session
+// flag must not permanently reserve its runtime session name. Such stale beads
+// (closed by a path that only retained the identity, or predating the flag)
+// otherwise block on-demand respawn with ErrSessionNameExists ("already belongs
+// to <closed-id>"), which is exactly the refinery no-respawn class in ga-n2d.
+func TestEnsureSessionNameAvailable_AllowsClosedNamedSessionByIdentity(t *testing.T) {
+	store := beads.NewMemStore()
+
+	bead, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name":              "gascity--gastown__refinery",
+			"configured_named_identity": "gastown.refinery",
+			// configured_named_session flag intentionally absent.
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.Close(bead.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// A closed configured named session — recognized by its identity even
+	// without the boolean flag — releases its runtime name so the reconciler
+	// can materialize a fresh canonical bead.
+	if err := ensureSessionNameAvailable(store, "gascity--gastown__refinery"); err != nil {
+		t.Fatalf("ensureSessionNameAvailable(closed named-by-identity) = %v, want nil", err)
+	}
+}
+
+// TestEnsureSessionNameAvailable_RejectsLiveNamedSessionByIdentity guards the
+// no-regression requirement of ga-841: the release only applies to CLOSED
+// beads. A live (open) configured named session must still own its runtime
+// name so two live sessions cannot collide.
+func TestEnsureSessionNameAvailable_RejectsLiveNamedSessionByIdentity(t *testing.T) {
+	store := beads.NewMemStore()
+
+	if _, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name":              "gascity--gastown__refinery",
+			"configured_named_identity": "gastown.refinery",
+			"configured_named_session":  "true",
+		},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := ensureSessionNameAvailable(store, "gascity--gastown__refinery"); !errors.Is(err, ErrSessionNameExists) {
+		t.Fatalf("ensureSessionNameAvailable(live named) = %v, want %v", err, ErrSessionNameExists)
+	}
+}
+
+func TestEnsureAliasAvailableWithConfig_AllowsLiveAliasHistoryReuse(t *testing.T) {
 	store := beads.NewMemStore()
 	_, err := store.Create(beads.Bead{
 		Type:   BeadType,
@@ -231,8 +380,8 @@ func TestEnsureAliasAvailableWithConfig_RejectsLiveAliasHistoryCollision(t *test
 		t.Fatalf("Create: %v", err)
 	}
 
-	if err := EnsureAliasAvailable(store, "mayor", ""); !errors.Is(err, ErrSessionAliasExists) {
-		t.Fatalf("EnsureAliasAvailable(history collision) error = %v, want %v", err, ErrSessionAliasExists)
+	if err := EnsureAliasAvailable(store, "mayor", ""); err != nil {
+		t.Fatalf("EnsureAliasAvailable(history reuse) = %v, want nil", err)
 	}
 }
 
@@ -272,6 +421,63 @@ func TestEnsureAliasAvailable_RejectsLiveSessionNameCollision(t *testing.T) {
 
 	if err := EnsureAliasAvailable(store, "sky", ""); !errors.Is(err, ErrSessionAliasExists) {
 		t.Fatalf("EnsureAliasAvailable(live session_name collision) error = %v, want %v", err, ErrSessionAliasExists)
+	}
+}
+
+func TestEnsureAliasAvailable_AllowsFailedCreateIdentity(t *testing.T) {
+	store := beads.NewMemStore()
+	_, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name": "worker-1",
+			"alias":        "worker-1",
+			"agent_name":   "worker-1",
+			"state":        string(StateFailedCreate),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := EnsureAliasAvailable(store, "worker-1", ""); err != nil {
+		t.Fatalf("EnsureAliasAvailable(failed-create identity) = %v, want nil", err)
+	}
+}
+
+func TestEnsureSessionNameAvailable_AllowsFailedCreateIdentity(t *testing.T) {
+	store := beads.NewMemStore()
+	_, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name": "worker-1",
+			"alias":        "worker-1",
+			"agent_name":   "worker-1",
+			"state":        string(StateFailedCreate),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := ensureSessionNameAvailable(store, "worker-1"); err != nil {
+		t.Fatalf("ensureSessionNameAvailable(failed-create identity) = %v, want nil", err)
+	}
+}
+
+func TestContinuityIneligibleConfiguredOwnerAllowsFailedCreateIdentity(t *testing.T) {
+	bead := beads.Bead{Metadata: map[string]string{
+		"state":                      string(StateFailedCreate),
+		"configured_named_identity":  "mayor",
+		"continuity_eligible":        "false",
+		"configured_named_session":   "true",
+		"configured_named_mode":      "on_demand",
+		"configured_named_qualifier": "mayor",
+	}}
+
+	if continuityIneligibleConfiguredOwner(bead, "mayor") {
+		t.Fatal("failed-create configured owner was treated as continuity-ineligible")
 	}
 }
 
@@ -356,6 +562,31 @@ func TestEnsureAliasAvailableWithConfigForOwner_AllowsConfiguredSingletonCreate(
 	}
 }
 
+func TestEnsureAliasAvailableWithConfigForOwner_AllowsConfiguredAliasAgainstOrdinaryConcreteIdentity(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		NamedSessions: []config.NamedSession{
+			{Template: "worker", Dir: "myrig"},
+		},
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name": "s-gc-ordinary-worker",
+			"template":     "myrig/worker",
+			"agent_name":   "myrig/worker",
+			"state":        "asleep",
+		},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := EnsureAliasAvailableWithConfigForOwner(store, cfg, "myrig/worker", "", "myrig/worker"); err != nil {
+		t.Fatalf("EnsureAliasAvailableWithConfigForOwner(named owner vs concrete identity) = %v, want nil", err)
+	}
+}
+
 func TestEnsureSessionNameAvailableWithConfig_UsesResolvedWorkspaceName(t *testing.T) {
 	store := beads.NewMemStore()
 	cfg := &config.City{
@@ -403,6 +634,31 @@ func TestWithCitySessionNameLock_EmptyCityPathFallsBackWithoutLockFile(t *testin
 	}
 	if _, err := os.Stat(filepath.Join(tmp, ".gc")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf(".gc should not be created for empty cityPath, got err=%v", err)
+	}
+}
+
+func TestWithCitySessionNameLock_HashesUntrustedIdentifier(t *testing.T) {
+	cityPath := t.TempDir()
+	identifier := "../escape"
+
+	if err := WithCitySessionNameLock(cityPath, identifier, func() error { return nil }); err != nil {
+		t.Fatalf("WithCitySessionNameLock: %v", err)
+	}
+
+	lockDir := citylayout.SessionNameLocksDir(cityPath)
+	entries, err := os.ReadDir(lockDir)
+	if err != nil {
+		t.Fatalf("ReadDir(%q): %v", lockDir, err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("lock files = %d, want 1", len(entries))
+	}
+	name := entries[0].Name()
+	if strings.Contains(name, "..") || strings.ContainsAny(name, `/\`) {
+		t.Fatalf("lock file name = %q, want hashed file name without path tokens", name)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(lockDir), "escape.lock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("lock escaped lock dir, stat err=%v", err)
 	}
 }
 
@@ -471,6 +727,383 @@ func TestEnsureSessionNameAvailableWithConfigForOwner_AllowsClosedSelfReopen(t *
 	}
 	if err := EnsureSessionNameAvailableWithConfigForOwner(store, cfg, "test-city--mayor", bead.ID, "mayor"); err != nil {
 		t.Fatalf("EnsureSessionNameAvailableWithConfigForOwner(reopen self session_name) = %v, want nil", err)
+	}
+}
+
+// TestEnsureConfiguredSessionNameAvailable_AllowsClosedLegacyBeadForOwner
+// covers the cold-boot scenario where a closed bead predates the
+// configured_named_session flag and still holds the session_name. The
+// config-aware path should allow reuse when the caller owns the configured
+// named session.
+func TestEnsureConfiguredSessionNameAvailable_AllowsClosedLegacyBeadForOwner(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		ResolvedWorkspaceName: "gc-management",
+		NamedSessions: []config.NamedSession{
+			{Template: "mayor"},
+		},
+	}
+
+	// Create a legacy bead: closed/orphaned, holds session_name "mayor",
+	// but does NOT have configured_named_session=true (predates the flag).
+	b, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name":          "mayor",
+			"session_name_explicit": "true",
+			"template":              "mayor",
+			"close_reason":          "orphaned",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.Close(b.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Base check (no config) should still reject — ad-hoc semantics.
+	if err := ensureSessionNameAvailable(store, "mayor"); !errors.Is(err, ErrSessionNameExists) {
+		t.Fatalf("ensureSessionNameAvailable(legacy closed) = %v, want ErrSessionNameExists", err)
+	}
+
+	// Config-aware check with matching owner should allow reuse.
+	if err := EnsureSessionNameAvailableWithConfigForOwner(store, cfg, "mayor", "", "mayor"); err != nil {
+		t.Fatalf("EnsureSessionNameAvailableWithConfigForOwner(legacy closed, matching owner) = %v, want nil", err)
+	}
+}
+
+// TestEnsureConfiguredSessionNameAvailable_RejectsClosedLegacyBeadWrongOwner
+// verifies that the config-aware bypass does not allow a different configured
+// named session to steal a name held by a closed legacy bead.
+func TestEnsureConfiguredSessionNameAvailable_RejectsClosedLegacyBeadWrongOwner(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		ResolvedWorkspaceName: "gc-management",
+		NamedSessions: []config.NamedSession{
+			{Template: "foreman"},
+		},
+	}
+
+	b, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name":          "mayor",
+			"session_name_explicit": "true",
+			"template":              "mayor",
+			"close_reason":          "orphaned",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.Close(b.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// "foreman" does not own "mayor" — should be rejected.
+	if err := EnsureSessionNameAvailableWithConfigForOwner(store, cfg, "mayor", "", "foreman"); !errors.Is(err, ErrSessionNameExists) {
+		t.Fatalf("EnsureSessionNameAvailableWithConfigForOwner(wrong owner) = %v, want ErrSessionNameExists", err)
+	}
+}
+
+// TestEnsureConfiguredSessionNameAvailable_RejectsLiveLegacyBead verifies
+// that even with config and matching owner, an open (non-closed) bead still
+// blocks name reuse.
+func TestEnsureConfiguredSessionNameAvailable_RejectsLiveLegacyBead(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		ResolvedWorkspaceName: "gc-management",
+		NamedSessions: []config.NamedSession{
+			{Template: "mayor"},
+		},
+	}
+
+	// Create a live bead (not closed) that holds the name.
+	_, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name":          "mayor",
+			"session_name_explicit": "true",
+			"template":              "mayor",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Even with matching owner, a live bead blocks.
+	if err := EnsureSessionNameAvailableWithConfigForOwner(store, cfg, "mayor", "", "mayor"); !errors.Is(err, ErrSessionNameExists) {
+		t.Fatalf("EnsureSessionNameAvailableWithConfigForOwner(live bead) = %v, want ErrSessionNameExists", err)
+	}
+}
+
+// TestEnsureConfiguredSessionNameAvailable_RejectsWithoutConfig verifies that
+// the legacy bypass requires config context — nil config gets no special treatment.
+func TestEnsureConfiguredSessionNameAvailable_RejectsWithoutConfig(t *testing.T) {
+	store := beads.NewMemStore()
+
+	b, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name": "mayor",
+			"close_reason": "orphaned",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.Close(b.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// No config — should still reject.
+	if err := EnsureSessionNameAvailableWithConfigForOwner(store, nil, "mayor", "", "mayor"); !errors.Is(err, ErrSessionNameExists) {
+		t.Fatalf("EnsureSessionNameAvailableWithConfigForOwner(nil config) = %v, want ErrSessionNameExists", err)
+	}
+}
+
+// TestEnsureConfiguredSessionNameAvailable_AllowsClosedLegacyWithWorkspacePrefix
+// covers the case where the runtime name includes a workspace prefix
+// (e.g., "gc-management--mayor") which is the standard production format.
+func TestEnsureConfiguredSessionNameAvailable_AllowsClosedLegacyWithWorkspacePrefix(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		ResolvedWorkspaceName: "test-city",
+		NamedSessions: []config.NamedSession{
+			{Template: "mayor"},
+		},
+	}
+
+	runtimeName := config.NamedSessionRuntimeName(cfg.EffectiveCityName(), cfg.Workspace, "mayor")
+
+	b, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name": runtimeName,
+			"close_reason": "orphaned",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.Close(b.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := EnsureSessionNameAvailableWithConfigForOwner(store, cfg, runtimeName, "", "mayor"); err != nil {
+		t.Fatalf("EnsureSessionNameAvailableWithConfigForOwner(workspace-prefixed) = %v, want nil", err)
+	}
+}
+
+// TestEnsureConfiguredSessionNameAvailable_RejectsLiveAliasCollisionDespiteLegacyBypass
+// verifies that the legacy-bypass path does not suppress rejections from live
+// alias collisions. A live ad-hoc session holding the target name as its alias
+// must still block, even when a closed legacy bead holds the session_name.
+func TestEnsureConfiguredSessionNameAvailable_RejectsLiveAliasCollisionDespiteLegacyBypass(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		ResolvedWorkspaceName: "gc-management",
+		NamedSessions: []config.NamedSession{
+			{Template: "mayor"},
+		},
+	}
+
+	// Closed legacy bead holding the session_name (no configured_named_session flag).
+	b, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name": "mayor",
+			"close_reason": "orphaned",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create legacy: %v", err)
+	}
+	if err := store.Close(b.ID); err != nil {
+		t.Fatalf("Close legacy: %v", err)
+	}
+
+	// Live ad-hoc session using "mayor" as an alias.
+	_, err = store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"alias": "mayor",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create live alias: %v", err)
+	}
+
+	// Must reject — live alias collision takes precedence over legacy bypass.
+	if err := EnsureSessionNameAvailableWithConfigForOwner(store, cfg, "mayor", "", "mayor"); !errors.Is(err, ErrSessionNameExists) {
+		t.Fatalf("EnsureSessionNameAvailableWithConfigForOwner(live alias collision) = %v, want ErrSessionNameExists", err)
+	}
+}
+
+// TestEnsureConfiguredSessionNameAvailable_AllowsLiveAliasHistoryReuseDespiteLegacyBypass
+// verifies that historical aliases do not reserve namespace for configured
+// named session creation.
+func TestEnsureConfiguredSessionNameAvailable_AllowsLiveAliasHistoryReuseDespiteLegacyBypass(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		ResolvedWorkspaceName: "gc-management",
+		NamedSessions: []config.NamedSession{
+			{Template: "mayor"},
+		},
+	}
+
+	// Closed legacy bead.
+	b, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name": "mayor",
+			"close_reason": "orphaned",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create legacy: %v", err)
+	}
+	if err := store.Close(b.ID); err != nil {
+		t.Fatalf("Close legacy: %v", err)
+	}
+
+	// Live session with "mayor" in alias history.
+	_, err = store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"alias":         "sky",
+			"alias_history": "mayor",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create live alias history: %v", err)
+	}
+
+	if err := EnsureSessionNameAvailableWithConfigForOwner(store, cfg, "mayor", "", "mayor"); err != nil {
+		t.Fatalf("EnsureSessionNameAvailableWithConfigForOwner(live alias history reuse) = %v, want nil", err)
+	}
+}
+
+// TestEnsureConfiguredSessionNameAvailable_RejectsLiveIdentifierCollisionDespiteLegacyBypass
+// verifies that a live bead's identifier (template/common_name) blocks the legacy bypass.
+func TestEnsureConfiguredSessionNameAvailable_RejectsLiveIdentifierCollisionDespiteLegacyBypass(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		ResolvedWorkspaceName: "gc-management",
+		NamedSessions: []config.NamedSession{
+			{Template: "mayor"},
+		},
+	}
+
+	// Closed legacy bead.
+	b, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name": "mayor",
+			"close_reason": "orphaned",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create legacy: %v", err)
+	}
+	if err := store.Close(b.ID); err != nil {
+		t.Fatalf("Close legacy: %v", err)
+	}
+
+	// Live session with "mayor" as template identifier.
+	_, err = store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"template": "mayor",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create live identifier: %v", err)
+	}
+
+	if err := EnsureSessionNameAvailableWithConfigForOwner(store, cfg, "mayor", "", "mayor"); !errors.Is(err, ErrSessionNameExists) {
+		t.Fatalf("EnsureSessionNameAvailableWithConfigForOwner(live identifier collision) = %v, want ErrSessionNameExists", err)
+	}
+}
+
+func TestEnsureSessionNameAvailableWithConfigForOwner_AllowsPoolManagedIdentifierCollision(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "mayor"},
+		},
+		NamedSessions: []config.NamedSession{
+			{Template: "mayor"},
+		},
+	}
+
+	if _, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name": "mayor-gc-1",
+			"agent_name":   "mayor",
+			"template":     "mayor",
+			"pool_managed": "true",
+		},
+	}); err != nil {
+		t.Fatalf("Create pool managed: %v", err)
+	}
+
+	if err := EnsureSessionNameAvailableWithConfigForOwner(store, cfg, "mayor", "", "mayor"); err != nil {
+		t.Fatalf("EnsureSessionNameAvailableWithConfigForOwner(pool identifier collision) = %v, want nil", err)
+	}
+	if err := EnsureSessionNameAvailableWithConfigForOwner(store, cfg, "mayor", "", "foreman"); !errors.Is(err, ErrSessionNameExists) {
+		t.Fatalf("EnsureSessionNameAvailableWithConfigForOwner(wrong owner) = %v, want ErrSessionNameExists", err)
+	}
+}
+
+func TestEnsureSessionNameAvailableUsesTargetedIdentifierLookups(t *testing.T) {
+	store := &noBroadSessionIdentifierStore{MemStore: beads.NewMemStore(), t: t}
+	_, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"alias": "sky",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(alias holder): %v", err)
+	}
+
+	if err := EnsureSessionNameAvailableWithConfig(store, nil, "sky", ""); !errors.Is(err, ErrSessionNameExists) {
+		t.Fatalf("EnsureSessionNameAvailableWithConfig(alias collision) = %v, want ErrSessionNameExists", err)
+	}
+}
+
+func TestEnsureAliasAvailableUsesTargetedIdentifierLookups(t *testing.T) {
+	store := &noBroadSessionIdentifierStore{MemStore: beads.NewMemStore(), t: t}
+	_, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name": "sky",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(session_name holder): %v", err)
+	}
+
+	if err := EnsureAliasAvailableWithConfig(store, nil, "sky", ""); !errors.Is(err, ErrSessionAliasExists) {
+		t.Fatalf("EnsureAliasAvailableWithConfig(session_name collision) = %v, want ErrSessionAliasExists", err)
 	}
 }
 

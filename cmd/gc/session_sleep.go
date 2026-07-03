@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"strings"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 type resolvedSessionSleepPolicy struct {
@@ -76,6 +78,15 @@ func resolveSleepCapability(sp runtime.Provider, name string) runtime.SessionSle
 	}
 }
 
+func sessionActivityReportable(sp runtime.Provider, name string) bool {
+	if sp == nil || name == "" {
+		return false
+	}
+	sleepCapability := resolveSleepCapability(sp, name)
+	return sleepCapability != runtime.SessionSleepCapabilityDisabled &&
+		(sleepCapability != runtime.SessionSleepCapabilityTimedOnly || sp.Capabilities().CanReportActivity)
+}
+
 func sessionSleepFingerprint(agent *config.Agent, policy resolvedSessionSleepPolicy) string {
 	if agent == nil {
 		return ""
@@ -95,15 +106,38 @@ func pendingInteractionReady(sp runtime.Provider, name string) bool {
 	if sp == nil || name == "" {
 		return false
 	}
-	ip, ok := sp.(runtime.InteractionProvider)
-	if !ok {
-		return false
+	if cached, ok := sp.(*attachmentCachingProvider); ok && cached.Provider != nil {
+		sp = cached.Provider
 	}
-	pending, err := ip.Pending(name)
+	pending, err := workerSessionTargetPendingWithConfig("", nil, sp, nil, name)
 	if err != nil {
 		return false
 	}
 	return pending != nil
+}
+
+func pendingInteractionKeepsAwake(session beads.Bead, sp runtime.Provider, name string, clk clock.Clock) bool {
+	if !pendingInteractionReady(sp, name) {
+		return false
+	}
+	if strings.TrimSpace(session.Metadata["wait_hold"]) != "" {
+		return false
+	}
+	var now time.Time
+	if clk != nil {
+		now = clk.Now()
+	}
+	view := sessionpkg.ProjectLifecycle(sessionpkg.LifecycleInput{
+		Status:   session.Status,
+		Metadata: session.Metadata,
+		Runtime: sessionpkg.RuntimeFacts{
+			Observed: true,
+			Alive:    true,
+			Pending:  true,
+		},
+		Now: now,
+	})
+	return !view.HasBlocker(sessionpkg.BlockerHeld) && !view.HasBlocker(sessionpkg.BlockerQuarantined)
 }
 
 func reconcileDetachedAt(
@@ -119,8 +153,11 @@ func reconcileDetachedAt(
 	}
 	if policy.Class == config.SessionSleepNonInteractive || !policy.enabled() || sp == nil || !alive || policy.Capability != runtime.SessionSleepCapabilityFull {
 		if session.Metadata["detached_at"] != "" {
-			_ = store.SetMetadata(session.ID, "detached_at", "")
-			session.Metadata["detached_at"] = ""
+			if err := sessionFrontDoor(store).SetMarker(session.ID, "detached_at", ""); err != nil {
+				log.Printf("session sleep: clearing detached_at for %s: %v", session.ID, err)
+			} else {
+				session.Metadata["detached_at"] = ""
+			}
 		}
 		return
 	}
@@ -128,17 +165,24 @@ func reconcileDetachedAt(
 	if name == "" {
 		return
 	}
-	if sp.IsAttached(name) {
+	attached, err := workerSessionTargetAttachedWithConfig("", store, sp, nil, session.ID)
+	if err == nil && attached {
 		if session.Metadata["detached_at"] != "" {
-			_ = store.SetMetadata(session.ID, "detached_at", "")
-			session.Metadata["detached_at"] = ""
+			if err := sessionFrontDoor(store).SetMarker(session.ID, "detached_at", ""); err != nil {
+				log.Printf("session sleep: clearing detached_at for %s: %v", session.ID, err)
+			} else {
+				session.Metadata["detached_at"] = ""
+			}
 		}
 		return
 	}
 	if session.Metadata["detached_at"] == "" {
 		ts := clk.Now().UTC().Format(time.RFC3339)
-		_ = store.SetMetadata(session.ID, "detached_at", ts)
-		session.Metadata["detached_at"] = ts
+		if err := sessionFrontDoor(store).SetMarker(session.ID, "detached_at", ts); err != nil {
+			log.Printf("session sleep: setting detached_at for %s: %v", session.ID, err)
+		} else {
+			session.Metadata["detached_at"] = ts
+		}
 	}
 }
 
@@ -149,7 +193,7 @@ func sessionIdleReference(session beads.Bead, sp runtime.Provider) time.Time {
 	}
 	lastActivity := time.Time{}
 	if sp != nil {
-		if activity, err := sp.GetLastActivity(session.Metadata["session_name"]); err == nil {
+		if activity, err := workerSessionTargetLastActivityWithConfig("", nil, sp, nil, session.Metadata["session_name"]); err == nil {
 			lastActivity = activity
 		}
 	}
@@ -212,11 +256,11 @@ func sessionKeepWarmEligible(
 
 func persistSleepPolicyMetadata(
 	session *beads.Bead,
-	store beads.Store,
+	sessFront *sessionpkg.InfoStore,
 	policy resolvedSessionSleepPolicy,
 	configSuppressed bool,
 ) {
-	if session == nil || store == nil {
+	if session == nil || sessFront == nil {
 		return
 	}
 	fingerprint := policy.Fingerprint
@@ -248,7 +292,7 @@ func persistSleepPolicyMetadata(
 	if len(changed) == 0 {
 		return
 	}
-	if err := store.SetMetadataBatch(session.ID, changed); err != nil {
+	if err := sessFront.ApplyPatch(session.ID, changed); err != nil {
 		return
 	}
 	if session.Metadata == nil {
@@ -259,11 +303,11 @@ func persistSleepPolicyMetadata(
 	}
 }
 
-func markIdleSleepPending(session *beads.Bead, store beads.Store) {
-	if session == nil || store == nil || session.Metadata["sleep_intent"] == "idle-stop-pending" {
+func markIdleSleepPending(session *beads.Bead, sessFront *sessionpkg.InfoStore) {
+	if session == nil || sessFront == nil || session.Metadata["sleep_intent"] == "idle-stop-pending" {
 		return
 	}
-	if err := store.SetMetadata(session.ID, "sleep_intent", "idle-stop-pending"); err != nil {
+	if err := sessFront.SetMarker(session.ID, "sleep_intent", "idle-stop-pending"); err != nil {
 		return
 	}
 	if session.Metadata == nil {
@@ -274,24 +318,18 @@ func markIdleSleepPending(session *beads.Bead, store beads.Store) {
 
 func recoverPendingIdleSleep(
 	session *beads.Bead,
-	store beads.Store,
+	sessFront *sessionpkg.InfoStore,
 	running bool,
 	clk clock.Clock,
 ) bool {
-	if session == nil || store == nil || running || session.Metadata["sleep_intent"] != "idle-stop-pending" {
+	if session == nil || sessFront == nil || running || session.Metadata["sleep_intent"] != "idle-stop-pending" {
 		return false
 	}
-	batch := map[string]string{
-		"state":        "asleep",
-		"sleep_reason": "idle",
-		"sleep_intent": "",
-		"slept_at":     clk.Now().UTC().Format(time.RFC3339),
-		"last_woke_at": "",
-	}
+	batch := sessionpkg.SleepPatch(clk.Now(), "idle")
 	if fingerprint := session.Metadata["sleep_policy_fingerprint"]; fingerprint != "" {
 		batch["sleep_policy_fingerprint"] = fingerprint
 	}
-	if err := store.SetMetadataBatch(session.ID, batch); err != nil {
+	if err := sessFront.ApplyPatch(session.ID, batch); err != nil {
 		return false
 	}
 	if session.Metadata == nil {
@@ -308,4 +346,8 @@ func boolMetadata(v bool) string {
 		return "true"
 	}
 	return ""
+}
+
+func isManualSessionBead(bead beads.Bead) bool {
+	return strings.TrimSpace(bead.Metadata["session_origin"]) == "manual" || bead.Metadata["manual_session"] == boolMetadata(true)
 }

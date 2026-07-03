@@ -28,17 +28,14 @@ func bdTestCmd() {
 	subcmd := args[0]
 	rest := args[1:]
 
-	// Find city root by walking up from cwd.
+	// Resolve city root: honor GC_CITY (exact validation, no walk-up)
+	// then fall back to bounded parent discovery — mirroring cityForStoreDir.
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bd: %v\n", err)
 		os.Exit(1)
 	}
-	cityPath, err := findCity(cwd)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "bd: %v\n", err)
-		os.Exit(1)
-	}
+	cityPath := cityForStoreDir(cwd)
 
 	store, err := beads.OpenFileStore(fsys.OSFS{}, filepath.Join(cityPath, ".gc", "beads.json"))
 	if err != nil {
@@ -66,6 +63,12 @@ func bdTestCmd() {
 		code = doBdShow(store, rest)
 	case "ready":
 		code = doBdReady(store, rest)
+	case "init", "config", "migrate":
+		// No-op stubs used by gc-beads-bd.sh during finalize. The
+		// file-backed store does not need schema seeding, so accept
+		// these and exit 0 to keep finalize green for tests that
+		// exercise the real localInitializer + finalizeInit path.
+		code = 0
 	default:
 		fmt.Fprintf(os.Stderr, "bd: unknown subcommand %q\n", subcmd)
 		code = 1

@@ -28,8 +28,6 @@ func (m *SessionReconcilerTracer) beginCycle(info sessionReconcilerTraceCycleInf
 		cycle.RecordSessionBaseline("", "", traceRecordPayload{
 			"open_count": len(sessionBeads.Open()),
 		})
-	}
-	if cycle != nil {
 		_ = cycle.flushCurrentBatch(TraceDurabilityDurable)
 	}
 	return cycle
@@ -76,6 +74,48 @@ func (c *SessionReconcilerTraceCycle) recordDecision(siteCode, template, session
 	c.RecordDecision(normSite, normReason, normOutcome, template, sessionName, fields)
 }
 
+// RecordControllerDecision records a baseline daemon-level decision that is
+// not scoped to a specific session template.
+func (c *SessionReconcilerTraceCycle) RecordControllerDecision(site TraceSiteCode, reason TraceReasonCode, outcome TraceOutcomeCode, fields map[string]any) {
+	if c == nil {
+		return
+	}
+	rec := newTraceRecord(TraceRecordDecision).withCycle(c, time.Now().UTC())
+	rec.SiteCode = site
+	rec.ReasonCode = reason
+	rec.OutcomeCode = outcome
+	rec.TraceMode = TraceModeBaseline
+	rec.TraceSource = TraceSourceAlwaysOn
+	if len(fields) > 0 {
+		rec.ensureFields()
+		for k, v := range fields {
+			rec.Fields[k] = v
+		}
+	}
+	c.addRecord(rec)
+}
+
+// RecordControllerOperation records an always-on controller phase duration.
+func (c *SessionReconcilerTraceCycle) RecordControllerOperation(site TraceSiteCode, reason TraceReasonCode, outcome TraceOutcomeCode, opName string, duration time.Duration, fields map[string]any) {
+	if c == nil {
+		return
+	}
+	rec := newTraceRecord(TraceRecordOperation).withCycle(c, time.Now().UTC())
+	rec.SiteCode = site
+	rec.ReasonCode = reason
+	rec.OutcomeCode = outcome
+	rec.OperationID = newTraceID(opName)
+	rec.TraceMode = TraceModeBaseline
+	rec.TraceSource = TraceSourceAlwaysOn
+	rec.DurationMS = duration.Milliseconds()
+	rec.ensureFields()
+	rec.Fields["operation_name"] = opName
+	for k, v := range fields {
+		rec.Fields[k] = v
+	}
+	c.addRecord(rec)
+}
+
 func (c *SessionReconcilerTraceCycle) recordOperation(siteCode, template, sessionName, _ string, reason, outcome string, data traceRecordPayload, _ string) {
 	if c == nil {
 		return
@@ -107,7 +147,7 @@ func (c *SessionReconcilerTraceCycle) recordMutation(siteCode, template, _ strin
 	if c == nil {
 		return
 	}
-	fields := make(map[string]any, len(data)+3)
+	fields := make(map[string]any)
 	for k, v := range data {
 		fields[k] = v
 	}

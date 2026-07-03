@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -9,149 +8,75 @@ import (
 )
 
 const (
-	nudgeBeadType  = "chore"
+	nudgeBeadType = "chore"
+	// nudgeBeadLabel is the label applied to queued-nudge beads. coordclass
+	// mirrors this string privately (as labelNudge) for store routing; the two
+	// must stay in sync.
 	nudgeBeadLabel = "gc:nudge"
+	// nudgeLookupLimit bounds recovery lookups by the durable nudge ID label.
+	// Mirrors nudgequeue.NudgeLookupLimit so cmd/gc adapter tests can assert the
+	// bound the front door applies.
+	nudgeLookupLimit = nudgequeue.NudgeLookupLimit
 )
+
+// nudgeEnqueueRollbackCloseReason is the close_reason metadata value stamped on
+// a partially-created nudge bead when the enqueue transaction rolls back. It
+// mirrors nudgequeue.EnqueueRollbackCloseReason (the front door owns the write).
+const nudgeEnqueueRollbackCloseReason = nudgequeue.EnqueueRollbackCloseReason
 
 type nudgeReference = nudgequeue.Reference
 
-func openNudgeBeadStore(cityPath string) beads.Store {
-	store, err := openCityStoreAt(cityPath)
+// openNudgeBeadStore is a test seam (mirrors the injectable vars in
+// cmd_nudge.go) so tests can substitute a fake store and assert that
+// per-tick poll helpers close every store they open. Tests that replace this
+// package variable must stay serial; do not use t.Parallel in those tests.
+// It routes the opened work store through resolveNudgesStore and returns the
+// strongly-typed beads.NudgesStore so the nudges class is statically visible to
+// every leaf nudge-bead helper; the wrapper carries the same underlying store
+// value (identity to the work store until the nudges class relocates).
+var openNudgeBeadStore = func(cityPath string) beads.NudgesStore {
+	store, err := openStoreAtForCity(cityPath, cityPath)
 	if err != nil {
-		return nil
+		return beads.NudgesStore{}
 	}
-	return store
+	return beads.NudgesStore{Store: resolveNudgesStore(store, nil, cityPath, nil)}
 }
 
-func findQueuedNudgeBead(store beads.Store, nudgeID string) (beads.Bead, bool, error) {
-	return findNudgeBead(store, nudgeID, false)
+// nudgeFrontDoor wraps a strongly-typed nudges store as the nudge object's
+// front door (internal/nudgequeue.Store). The bead is a SHADOW of the flock'd
+// state.json queue; the front door confines the Item<->Bead codec, leaving these
+// cmd/gc helpers as thin adapters that keep the methods callable inside the
+// withNudgeQueueState transaction.
+func nudgeFrontDoor(store beads.NudgesStore) *nudgequeue.Store {
+	return nudgequeue.NewStore(store)
 }
 
-func findAnyQueuedNudgeBead(store beads.Store, nudgeID string) (beads.Bead, bool, error) {
-	return findNudgeBead(store, nudgeID, true)
+func ensureQueuedNudgeBead(store beads.NudgesStore, item queuedNudge) (string, bool, error) {
+	return nudgeFrontDoor(store).Save(item)
 }
 
-func findNudgeBead(store beads.Store, nudgeID string, includeClosed bool) (beads.Bead, bool, error) {
-	if store == nil || nudgeID == "" {
-		return beads.Bead{}, false, nil
-	}
-	opts := []beads.QueryOpt(nil)
-	if includeClosed {
-		opts = append(opts, beads.IncludeClosed)
-	}
-	items, err := store.List(beads.ListQuery{
-		Label:         "nudge:" + nudgeID,
-		IncludeClosed: beads.HasOpt(opts, beads.IncludeClosed),
-		Sort:          beads.SortCreatedDesc,
-	})
-	if err != nil {
-		return beads.Bead{}, false, err
-	}
-	var fallback beads.Bead
-	hasFallback := false
-	for _, item := range items {
-		if item.Status != "closed" {
-			return item, true, nil
-		}
-		if !includeClosed {
-			continue
-		}
-		if isTerminalNudgeState(item.Metadata["state"]) {
-			return item, true, nil
-		}
-		if !hasFallback {
-			fallback = item
-			hasFallback = true
-		}
-	}
-	if includeClosed && hasFallback {
-		return fallback, true, nil
-	}
-	return beads.Bead{}, false, nil
+// findQueuedNudgeBead resolves the OPEN nudge shadow bead for nudgeID through
+// the front door. Thin adapter retained for cmd/gc callers/tests that inspect
+// the raw bead; new logic should prefer nudgeFrontDoor(store).Find.
+func findQueuedNudgeBead(store beads.NudgesStore, nudgeID string) (beads.Bead, bool, error) {
+	return nudgeFrontDoor(store).FindBead(nudgeID)
 }
 
-func ensureQueuedNudgeBead(store beads.Store, item queuedNudge) (string, bool, error) {
-	if store == nil {
-		return "", false, nil
-	}
-	existing, ok, err := findQueuedNudgeBead(store, item.ID)
-	if err != nil {
-		return "", false, err
-	}
-	if ok {
-		return existing.ID, false, nil
-	}
-	meta := map[string]string{
-		"nudge_id":           item.ID,
-		"agent":              item.Agent,
-		"session_id":         item.SessionID,
-		"continuation_epoch": item.ContinuationEpoch,
-		"state":              "queued",
-		"source":             item.Source,
-		"message":            item.Message,
-		"deliver_after":      item.DeliverAfter.UTC().Format(time.RFC3339),
-		"expires_at":         item.ExpiresAt.UTC().Format(time.RFC3339),
-		"reference_json":     marshalNudgeReference(item.Reference),
-		"last_attempt_at":    formatOptionalTime(item.LastAttemptAt),
-		"last_error":         item.LastError,
-		"terminal_reason":    "",
-		"commit_boundary":    "",
-		"terminal_at":        "",
-	}
-	created, err := store.Create(beads.Bead{
-		Title: "nudge:" + item.ID,
-		Type:  nudgeBeadType,
-		Labels: []string{
-			nudgeBeadLabel,
-			"agent:" + item.Agent,
-			"nudge:" + item.ID,
-			"source:" + item.Source,
-		},
-		Metadata: meta,
-	})
-	if err != nil {
-		return "", false, err
-	}
-	return created.ID, true, nil
+// findAnyQueuedNudgeBead resolves the nudge shadow bead for nudgeID including
+// terminal/closed beads, through the front door.
+func findAnyQueuedNudgeBead(store beads.NudgesStore, nudgeID string) (beads.Bead, bool, error) {
+	return nudgeFrontDoor(store).FindBeadIncludingTerminal(nudgeID)
 }
 
-func markQueuedNudgeTerminal(store beads.Store, item queuedNudge, state, reason, commitBoundary string, now time.Time) error {
-	if store == nil {
-		return nil
-	}
-	beadID := item.BeadID
-	if beadID == "" {
-		b, ok, err := findQueuedNudgeBead(store, item.ID)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return nil
-		}
-		beadID = b.ID
-	}
-	if err := store.SetMetadataBatch(beadID, map[string]string{
-		"state":           state,
-		"last_attempt_at": formatOptionalTime(item.LastAttemptAt),
-		"last_error":      item.LastError,
-		"terminal_reason": reason,
-		"commit_boundary": commitBoundary,
-		"terminal_at":     now.UTC().Format(time.RFC3339),
-	}); err != nil {
-		return err
-	}
-	return store.Close(beadID)
+// nudgeCanonicalCloseReason maps a terminalization state to the canonical
+// close_reason. Thin adapter over the front door's codec, retained for the
+// cmd/gc test that guards the >=20 char validator floor.
+func nudgeCanonicalCloseReason(stateCode string) string {
+	return nudgequeue.CanonicalCloseReason(stateCode)
 }
 
-func marshalNudgeReference(ref *nudgeReference) string {
-	if ref == nil {
-		return ""
-	}
-	data, err := json.Marshal(ref)
-	if err != nil {
-		return ""
-	}
-	return string(data)
+func markQueuedNudgeTerminal(store beads.NudgesStore, item queuedNudge, state, reason, commitBoundary string, now time.Time) error {
+	return nudgeFrontDoor(store).Terminalize(item, state, reason, commitBoundary, now)
 }
 
 func formatOptionalTime(ts time.Time) string {

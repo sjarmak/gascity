@@ -9,13 +9,17 @@ package session
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/clock"
+	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
@@ -29,13 +33,22 @@ const (
 	StateAsleep State = "asleep"
 	// StateSuspended means the conversation is paused with no runtime resources.
 	StateSuspended State = "suspended"
-	// StateCreating means the session bead has been written but the runtime
+	// StateStartPending means the controller has reserved a session identity
+	// and should start it, but no provider Start call is currently in flight.
+	StateStartPending State = "start-pending"
+	// StateCreating means the provider Start call is in flight and the runtime
 	// process has not yet been confirmed alive. Counts against pool occupancy.
 	StateCreating State = "creating"
+	// StateFailedCreate means create rollback wrote terminal metadata but the
+	// bead status close did not complete. It is eligible for cleanup/replacement.
+	StateFailedCreate State = "failed-create"
 	// StateDraining means the session is being gracefully stopped (in-flight
 	// work completing). The pool routing label has been removed so no new
 	// work is routed to this session.
 	StateDraining State = "draining"
+	// StateDrained marks an acknowledged drain that should remain dormant
+	// until an explicit compatible wake reason appears.
+	StateDrained State = "drained"
 	// StateAwake is equivalent to StateActive. Written by the reconciler's
 	// healState when a session transitions from asleep to running.
 	StateAwake State = "awake"
@@ -53,6 +66,10 @@ const BeadType = "session"
 // LabelSession is the label applied to all session beads for filtering.
 const LabelSession = "gc:session"
 
+// MetadataLastNudgeDeliveredAt is the session-bead metadata key that records
+// the wall-clock time of the most recent successful queued-nudge delivery.
+const MetadataLastNudgeDeliveredAt = "last_nudge_delivered_at"
+
 // Info holds the user-facing details of a chat session.
 type Info struct {
 	ID            string
@@ -61,7 +78,9 @@ type Info struct {
 	Closed        bool
 	Title         string
 	Alias         string
+	AgentName     string // persisted concrete identity for MCP materialization
 	Provider      string
+	Transport     string
 	Command       string // resolved command stored at creation
 	WorkDir       string
 	SessionName   string // tmux session name
@@ -71,7 +90,32 @@ type Info struct {
 	ResumeCommand string // explicit resume command template ({{.SessionKey}})
 	CreatedAt     time.Time
 	LastActive    time.Time
-	Attached      bool
+	// LastNudgeDeliveredAt records the wall-clock time of the most recent
+	// successful nudge delivery to this session. Zero when no nudge has
+	// been delivered yet (or the metadata predates the stamping path).
+	// Surfaced in `gc session list` so operators can spot warm sessions
+	// whose delivery loop has stalled.
+	LastNudgeDeliveredAt time.Time
+	Attached             bool
+	// ContinuationEpoch is the persisted continuation_epoch marker, used by the
+	// wait registration/retry paths to stamp registered_epoch on wait beads.
+	// Additive, internal-only: it is NOT emitted on the HTTP session-response
+	// wire (the response builder maps a fixed field set).
+	ContinuationEpoch string
+	// SleepReason is the persisted sleep_reason marker, read by the wait-hold
+	// clear path to decide whether to clear sleep_reason. Additive,
+	// internal-only: NOT emitted on the HTTP session-response wire.
+	SleepReason string
+}
+
+// RuntimeObservation reports the provider-backed live runtime state for a
+// persisted session.
+type RuntimeObservation struct {
+	Running     bool
+	Alive       bool
+	Attached    bool
+	LastActive  time.Time
+	SessionName string
 }
 
 func normalizeInfoState(state State) State {
@@ -105,7 +149,9 @@ type ProviderResume struct {
 type Manager struct {
 	store             beads.Store
 	sp                runtime.Provider
-	transportResolver func(template string) string
+	cityPath          string
+	transportResolver func(template, provider string) transportResolution
+	clk               clock.Clock
 }
 
 // PruneResult reports which sessions were pruned and which queued wait nudges
@@ -116,6 +162,11 @@ type PruneResult struct {
 	WaitNudgeIDs []string
 }
 
+// CloseResult reports session-close cleanup artifacts needed by callers.
+type CloseResult struct {
+	WaitNudgeIDs []string
+}
+
 type acpRouteRegistrar interface {
 	RouteACP(name string)
 	Unroute(name string)
@@ -123,6 +174,11 @@ type acpRouteRegistrar interface {
 
 type transportDetector interface {
 	DetectTransport(name string) string
+}
+
+type transportResolution struct {
+	transport            string
+	allowStoppedFallback bool
 }
 
 func normalizeTransport(provider, transport string) string {
@@ -139,16 +195,38 @@ func transportFromMetadata(b beads.Bead) string {
 	return normalizeTransport(b.Metadata["provider"], b.Metadata["transport"])
 }
 
+func (m *Manager) resolveConfiguredTransport(template, provider string) (string, bool) {
+	if m.transportResolver == nil {
+		return "", false
+	}
+	resolution := m.transportResolver(strings.TrimSpace(template), strings.TrimSpace(provider))
+	return normalizeTransport(provider, resolution.transport), resolution.allowStoppedFallback
+}
+
 func (m *Manager) transportForBead(b beads.Bead, sessName string) (string, bool) {
 	transport := transportFromMetadata(b)
 	if transport != "" {
 		return transport, false
+	}
+	if strings.TrimSpace(b.Metadata[MCPIdentityMetadataKey]) != "" ||
+		strings.TrimSpace(b.Metadata[MCPServersSnapshotMetadataKey]) != "" {
+		return "acp", false
+	}
+	if strings.TrimSpace(b.Metadata["pending_create_claim"]) == "true" {
+		transport, _ = m.resolveConfiguredTransport(b.Metadata["template"], b.Metadata["provider"])
+		if transport != "" {
+			return transport, true
+		}
+		return "", false
 	}
 	if detector, ok := m.sp.(transportDetector); ok {
 		transport = normalizeTransport(b.Metadata["provider"], detector.DetectTransport(sessName))
 		if transport != "" {
 			return transport, true
 		}
+	}
+	if m.sp != nil && m.sp.IsRunning(sessName) {
+		return "", false
 	}
 	return "", false
 }
@@ -159,6 +237,37 @@ func (m *Manager) persistTransport(id, provider, transport string) {
 		return
 	}
 	_ = m.store.SetMetadata(id, "transport", transport)
+}
+
+func (m *Manager) killExistingOrphans(ctx context.Context, sessionID string) {
+	_ = ctx
+	scanner, ok := m.sp.(runtime.ProcessTableScanner)
+	if !ok || sessionID == "" {
+		return
+	}
+	found, err := scanner.FindRuntimesBySessionID(sessionID)
+	if err != nil {
+		log.Printf("session: scanning for orphaned runtimes for %s: %v", sessionID, err)
+	}
+	cityPath := pathutil.NormalizePathForCompare(strings.TrimSpace(m.cityPath))
+	for _, live := range found {
+		if live.IsTracked || live.SessionID != sessionID {
+			continue
+		}
+		if cityPath != "" && pathutil.NormalizePathForCompare(strings.TrimSpace(live.City)) != cityPath {
+			continue
+		}
+		if err := scanner.TerminateRuntime(live); err != nil {
+			log.Printf("session: terminating orphaned runtime for %s pid=%d provider_name=%q: %v", sessionID, live.PID, live.ProviderName, err)
+		}
+	}
+}
+
+func (m *Manager) now() time.Time {
+	if m != nil && m.clk != nil {
+		return m.clk.Now()
+	}
+	return time.Now()
 }
 
 func (m *Manager) routeACPIfNeeded(provider, transport, sessName string) func() {
@@ -179,9 +288,69 @@ func NewManager(store beads.Store, sp runtime.Provider) *Manager {
 }
 
 // NewManagerWithTransportResolver creates a Manager that can infer session
-// transport from template config when older beads do not have transport metadata.
-func NewManagerWithTransportResolver(store beads.Store, sp runtime.Provider, resolver func(template string) string) *Manager {
-	return &Manager{store: store, sp: sp, transportResolver: resolver}
+// transport from template or provider config when older beads do not have
+// transport metadata.
+func NewManagerWithTransportResolver(store beads.Store, sp runtime.Provider, resolver func(template, provider string) string) *Manager {
+	return &Manager{
+		store: store,
+		sp:    sp,
+		transportResolver: func(template, provider string) transportResolution {
+			if resolver == nil {
+				return transportResolution{}
+			}
+			return transportResolution{transport: resolver(template, provider)}
+		},
+	}
+}
+
+// NewManagerWithCityPath creates a Manager that can persist deferred submits
+// into the city's nudge queue.
+func NewManagerWithCityPath(store beads.Store, sp runtime.Provider, cityPath string) *Manager {
+	return &Manager{store: store, sp: sp, cityPath: cityPath}
+}
+
+// NewManagerWithTransportResolverAndCityPath creates a Manager that can infer
+// session transport from template or provider config and persist deferred
+// submits into the city's nudge queue.
+func NewManagerWithTransportResolverAndCityPath(store beads.Store, sp runtime.Provider, cityPath string, resolver func(template, provider string) string) *Manager {
+	return &Manager{
+		store:    store,
+		sp:       sp,
+		cityPath: cityPath,
+		transportResolver: func(template, provider string) transportResolution {
+			if resolver == nil {
+				return transportResolution{}
+			}
+			return transportResolution{transport: resolver(template, provider)}
+		},
+	}
+}
+
+// NewManagerWithTransportPolicyResolverAndCityPath creates a Manager that can
+// infer transport from config and, when the resolver marks it safe, continue
+// using that transport for stopped legacy sessions without persisted
+// transport metadata.
+func NewManagerWithTransportPolicyResolverAndCityPath(
+	store beads.Store,
+	sp runtime.Provider,
+	cityPath string,
+	resolver func(template, provider string) (string, bool),
+) *Manager {
+	return &Manager{
+		store:    store,
+		sp:       sp,
+		cityPath: cityPath,
+		transportResolver: func(template, provider string) transportResolution {
+			if resolver == nil {
+				return transportResolution{}
+			}
+			transport, allowStoppedFallback := resolver(template, provider)
+			return transportResolution{
+				transport:            transport,
+				allowStoppedFallback: allowStoppedFallback,
+			}
+		},
+	}
 }
 
 // Create creates a new chat session bead and starts the runtime session.
@@ -190,20 +359,26 @@ func NewManagerWithTransportResolver(store beads.Store, sp runtime.Provider, res
 // supports SessionIDFlag, a UUID session key is generated and injected.
 // The caller is responsible for attaching after Create returns.
 func (m *Manager) Create(ctx context.Context, template, title, command, workDir, provider string, env map[string]string, resume ProviderResume, hints runtime.Config) (Info, error) {
-	return m.CreateNamedWithTransport(ctx, "", template, title, command, workDir, provider, "", env, resume, hints)
+	return m.CreateAliasedNamedWithTransportAndMetadata(ctx, "", "", template, title, command, workDir, provider, "", env, resume, hints, map[string]string{
+		"session_origin": "manual",
+	})
 }
 
 // CreateWithTransport creates a new chat session bead and starts the runtime
 // session, preserving the transport override separately from the provider name
 // so ACP-routed sessions can be resumed correctly.
 func (m *Manager) CreateWithTransport(ctx context.Context, template, title, command, workDir, provider, transport string, env map[string]string, resume ProviderResume, hints runtime.Config) (Info, error) {
-	return m.CreateNamedWithTransport(ctx, "", template, title, command, workDir, provider, transport, env, resume, hints)
+	return m.CreateAliasedNamedWithTransportAndMetadata(ctx, "", "", template, title, command, workDir, provider, transport, env, resume, hints, map[string]string{
+		"session_origin": "manual",
+	})
 }
 
 // CreateAliasedNamedWithTransport creates a new chat session bead with an
 // optional public alias and optional explicit runtime session_name.
 func (m *Manager) CreateAliasedNamedWithTransport(ctx context.Context, alias, explicitName, template, title, command, workDir, provider, transport string, env map[string]string, resume ProviderResume, hints runtime.Config) (Info, error) {
-	return m.createAliasedNamedWithTransport(ctx, alias, explicitName, template, title, command, workDir, provider, transport, env, resume, hints, nil)
+	return m.createAliasedNamedWithTransport(ctx, alias, explicitName, template, title, command, workDir, provider, transport, env, resume, hints, map[string]string{
+		"session_origin": "manual",
+	})
 }
 
 // CreateAliasedNamedWithTransportAndMetadata creates a new chat session bead
@@ -224,12 +399,16 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 	if title == "" {
 		title = template
 	}
+	aliasOwner := ""
+	if extraMeta["configured_named_session"] == "true" && extraMeta["configured_named_identity"] == alias {
+		aliasOwner = alias
+	}
 	var info Info
 	err = withSessionIdentifierReservationLocks([]string{alias, explicitName}, func() error {
-		if err := ensureSessionAliasAvailable(m.store, nil, alias, "", ""); err != nil {
+		if err := ensureSessionAliasAvailable(m.store, nil, alias, "", aliasOwner); err != nil {
 			return err
 		}
-		if err := ensureSessionNameAvailable(m.store, explicitName); err != nil {
+		if err := ensureSessionNameAvailableForSelfAndOwner(m.store, explicitName, "", aliasOwner); err != nil {
 			return err
 		}
 
@@ -259,6 +438,8 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 			"continuation_epoch": fmt.Sprintf("%d", DefaultContinuationEpoch),
 			"instance_token":     NewInstanceToken(),
 		}
+		// provider_kind may be injected via extraMeta when the caller has
+		// resolved the canonical builtin kind for a custom provider alias.
 		if alias != "" {
 			meta["alias"] = alias
 		}
@@ -270,9 +451,13 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 		}
 		if explicitName != "" {
 			meta["session_name"] = explicitName
+			meta["session_name_explicit"] = "true"
 		}
 		for k, v := range extraMeta {
 			meta[k] = v
+		}
+		if meta["session_origin"] == "" {
+			meta["session_origin"] = "manual"
 		}
 		createdBead, createErr := m.store.Create(beads.Bead{
 			Title: title,
@@ -300,6 +485,13 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 			b.Metadata = make(map[string]string)
 		}
 		b.Metadata["session_name"] = sessName
+		if explicitName != "" {
+			b.Metadata["session_name_explicit"] = "true"
+		}
+		if err := m.syncStoredMCPServers(b.ID, &b, hints.MCPServers); err != nil {
+			_ = m.store.Close(b.ID)
+			return err
+		}
 
 		unroute := m.routeACPIfNeeded(provider, transport, sessName)
 		rollbackFailedCreate := func() error {
@@ -310,7 +502,11 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 				if err := m.store.SetMetadata(b.ID, "session_name", ""); err != nil {
 					return fmt.Errorf("clearing session name during rollback: %w", err)
 				}
+				if err := m.store.SetMetadata(b.ID, "session_name_explicit", ""); err != nil {
+					return fmt.Errorf("clearing explicit session name flag during rollback: %w", err)
+				}
 				b.Metadata["session_name"] = ""
+				b.Metadata["session_name_explicit"] = ""
 			}
 			if err := m.store.Close(b.ID); err != nil {
 				return fmt.Errorf("closing rolled-back session bead: %w", err)
@@ -328,19 +524,32 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 		cfg := hints
 		cfg.Command = startCommand
 		cfg.WorkDir = workDir
-		cfg.Env = mergeEnv(mergeEnv(cfg.Env, env), RuntimeEnvWithAlias(
+		runtimeAlias := alias
+		if runtimeAlias == "" {
+			runtimeAlias = strings.TrimSpace(extraMeta["agent_name"])
+		}
+		cfg.Env = mergeEnv(mergeEnv(cfg.Env, env), RuntimeEnvWithSessionContext(
 			b.ID,
 			sessName,
-			alias,
+			runtimeAlias,
+			template,
+			meta["session_origin"],
 			DefaultGeneration,
 			DefaultContinuationEpoch,
 			meta["instance_token"],
 		))
+		if gcProvider := ProviderFamilyFromMetadata(meta, provider); gcProvider != "" {
+			cfg.Env = mergeEnv(cfg.Env, map[string]string{"GC_PROVIDER": gcProvider})
+		}
 		cfg = runtime.SyncWorkDirEnv(cfg)
 
 		// Start the runtime session.
+		m.killExistingOrphans(ctx, b.ID)
 		if err := m.sp.Start(ctx, sessName, cfg); err != nil {
 			if runtimeSessionMatchesBead(m.sp, sessName, b.ID, meta["instance_token"]) {
+				if metaErr := m.confirmStartedRuntimeMetadata(b.ID, &b); metaErr != nil {
+					return metaErr
+				}
 				info = m.infoFromBead(b)
 				return nil
 			}
@@ -355,6 +564,15 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 			}
 			return fmt.Errorf("starting session: %w", err)
 		}
+		if metaErr := m.confirmStartedRuntimeMetadata(b.ID, &b); metaErr != nil {
+			if stopErr := m.sp.Stop(sessName); stopErr != nil {
+				metaErr = errors.Join(metaErr, fmt.Errorf("stopping runtime after metadata failure: %w", stopErr))
+			}
+			if rbErr := rollbackFailedCreate(); rbErr != nil {
+				return errors.Join(metaErr, rbErr)
+			}
+			return metaErr
+		}
 
 		info = m.infoFromBead(b)
 		return nil
@@ -365,6 +583,22 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 	return info, nil
 }
 
+func (m *Manager) confirmStartedRuntimeMetadata(id string, b *beads.Bead) error {
+	metadata := ConfirmStartedPatch(time.Now().UTC())
+	if err := m.store.SetMetadataBatch(id, metadata); err != nil {
+		return fmt.Errorf("storing started runtime metadata: %w", err)
+	}
+	if b != nil {
+		if b.Metadata == nil {
+			b.Metadata = make(map[string]string, len(metadata))
+		}
+		for k, v := range metadata {
+			b.Metadata[k] = v
+		}
+	}
+	return nil
+}
+
 // CreateNamedWithTransport creates a new chat session bead with an optional
 // explicit session_name and starts the runtime session.
 //
@@ -372,7 +606,9 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 // process. Callers MUST also hold WithCitySessionNameLock(cityPath, explicitName)
 // when explicitName is non-empty so duplicate names cannot race across processes.
 func (m *Manager) CreateNamedWithTransport(ctx context.Context, explicitName, template, title, command, workDir, provider, transport string, env map[string]string, resume ProviderResume, hints runtime.Config) (Info, error) {
-	return m.CreateAliasedNamedWithTransport(ctx, "", explicitName, template, title, command, workDir, provider, transport, env, resume, hints)
+	return m.CreateAliasedNamedWithTransportAndMetadata(ctx, "", explicitName, template, title, command, workDir, provider, transport, env, resume, hints, map[string]string{
+		"session_origin": "manual",
+	})
 }
 
 func runtimeSessionMatchesBead(sp runtime.Provider, sessionName, beadID, instanceToken string) bool {
@@ -397,8 +633,9 @@ func runtimeSessionMatchesBead(sp runtime.Provider, sessionName, beadID, instanc
 }
 
 // CreateBeadOnly creates a session bead without starting the runtime process.
-// The bead is created with state "creating" — the controller's reconciler
-// will detect it in buildDesiredState and start the process on its next tick.
+// The bead is created with state "start-pending" — the controller's
+// reconciler will detect it in buildDesiredState and start the process on its
+// next tick.
 //
 // This is the Phase 2 path: CLI creates intent (bead), reconciler executes.
 func (m *Manager) CreateBeadOnly(template, title, command, workDir, provider, transport string, env map[string]string, resume ProviderResume) (Info, error) {
@@ -430,12 +667,16 @@ func (m *Manager) createAliasedBeadOnlyNamed(alias, explicitName, template, titl
 	if title == "" {
 		title = template
 	}
+	aliasOwner := ""
+	if extraMeta["configured_named_session"] == "true" && extraMeta["configured_named_identity"] == alias {
+		aliasOwner = alias
+	}
 	var info Info
 	err = withSessionIdentifierReservationLocks([]string{alias, explicitName}, func() error {
-		if err := ensureSessionAliasAvailable(m.store, nil, alias, "", ""); err != nil {
+		if err := ensureSessionAliasAvailable(m.store, nil, alias, "", aliasOwner); err != nil {
 			return err
 		}
-		if err := ensureSessionNameAvailable(m.store, explicitName); err != nil {
+		if err := ensureSessionNameAvailableForSelfAndOwner(m.store, explicitName, "", aliasOwner); err != nil {
 			return err
 		}
 
@@ -450,9 +691,8 @@ func (m *Manager) createAliasedBeadOnlyNamed(alias, explicitName, template, titl
 
 		meta := map[string]string{
 			"template":           template,
-			"state":              "creating",
+			"state":              string(StateStartPending),
 			"provider":           provider,
-			"manual_session":     "true",
 			"work_dir":           workDir,
 			"command":            command,
 			"resume_flag":        resume.ResumeFlag,
@@ -472,12 +712,16 @@ func (m *Manager) createAliasedBeadOnlyNamed(alias, explicitName, template, titl
 			meta["session_key"] = sessionKey
 		}
 		meta["pending_create_claim"] = "true"
+		meta["pending_create_started_at"] = pendingCreateStartedAt(time.Now().UTC())
 		if explicitName != "" {
 			meta["session_name"] = explicitName
 			meta["session_name_explicit"] = "true"
 		}
 		for k, v := range extraMeta {
 			meta[k] = v
+		}
+		if meta["session_origin"] == "" {
+			meta["session_origin"] = "ephemeral"
 		}
 		createdBead, createErr := m.store.Create(beads.Bead{
 			Title: title,
@@ -549,54 +793,186 @@ func (m *Manager) Suspend(id string) error {
 		if err != nil {
 			return err
 		}
-		if State(b.Metadata["state"]) == StateSuspended {
-			return nil // already suspended
+		// Closed beads are terminal; mutating lifecycle metadata after
+		// close produces impossible status=closed + live-state rows.
+		if b.Status == "closed" {
+			return &IllegalTransitionError{From: StateClosed, Command: CmdSuspend}
+		}
+		current := State(b.Metadata["state"])
+		if current == StateSuspended {
+			return nil // idempotent: already suspended
+		}
+		// failed-create is a create-rollback terminal state: the create never
+		// reached creation_complete, so there is no live turn to suspend — only
+		// a possibly-leaked runtime process to tear down. `gc stop` issues
+		// suspend on every session bead (no state pre-filter), and under a
+		// backing-store outage the reconciler cannot reap failed-create beads
+		// (its close path requires a reachable store), so suspend is the only
+		// thing that can clear the leaked process. Tear the runtime down
+		// best-effort and report success rather than rejecting with an
+		// illegal-transition error that blocks `gc stop` city-wide (#2597). The
+		// bead is left in failed-create for the reconciler to reap once the
+		// store is reachable again.
+		//
+		// Limitation: explicit-named beads whose rollback already cleared
+		// session_name (rollbackPendingCreate in
+		// cmd/gc/session_lifecycle_parallel.go) fall back to the synthetic
+		// sessionNameFor(id) here, so this Stop targets the synthetic name
+		// rather than the original explicit name and the leak under the
+		// original name persists. That is a strict improvement over the pre-fix
+		// state (suspend rejected outright, runtime leaked, `gc stop` blocked
+		// city-wide); preserving the original name across rollback for cleanup
+		// is tracked as follow-up.
+		if current == StateFailedCreate {
+			if strings.TrimSpace(sessName) != "" {
+				_ = m.sp.Stop(sessName) // best-effort: tear down any leaked runtime
+			}
+			return nil
+		}
+		// Legacy bead normalization: pre-metadata cities may have empty
+		// state fields. Treat empty as StateActive so the state-machine
+		// transition works during upgrade. Matches what Close and
+		// checkTransition already do for the other lifecycle methods.
+		if current == StateNone {
+			current = StateActive
+		}
+		// StateAwake is the reconciler's alias for StateActive.
+		if current == StateAwake {
+			current = StateActive
+		}
+		if _, err := Transition(current, CmdSuspend); err != nil {
+			return err
 		}
 
-		// Kill the runtime session (skip if already dead).
-		if m.sp.IsRunning(sessName) {
-			if err := m.sp.Stop(sessName); err != nil {
+		// Kill the runtime session. Stop is provider-idempotent, so call it
+		// even when liveness already reports false; tmux remain-on-exit panes
+		// can be non-running but still need their session artifact removed.
+		if strings.TrimSpace(sessName) != "" {
+			running := m.sp.IsRunning(sessName)
+			err := m.sp.Stop(sessName)
+			if err != nil && !running {
+				// Preserve historical Suspend semantics for already-dead
+				// sessions: cleanup is best-effort when the runtime did not
+				// report a live process before Stop.
+				err = nil
+			}
+			if err != nil {
 				return fmt.Errorf("stopping runtime session: %w", err)
 			}
 		}
 
-		// Update state and record suspension timestamp.
-		if err := m.store.SetMetadata(id, "state", string(StateSuspended)); err != nil {
-			return fmt.Errorf("updating session state: %w", err)
-		}
-		if err := m.store.SetMetadata(id, "suspended_at", time.Now().UTC().Format(time.RFC3339)); err != nil {
-			return fmt.Errorf("storing suspension timestamp: %w", err)
+		// Update state and suspension timestamp together so stores with a
+		// write-through cache preserve one coherent lifecycle transition.
+		if err := m.store.Update(id, beads.UpdateOpts{Metadata: map[string]string{
+			"state":        string(StateSuspended),
+			"suspended_at": time.Now().UTC().Format(time.RFC3339),
+		}}); err != nil {
+			return fmt.Errorf("updating suspension state: %w", err)
 		}
 
 		return nil
 	})
 }
 
+// RequestFreshRestart marks a session for a controller-owned fresh restart
+// without closing its bead or clearing resume metadata immediately.
+func (m *Manager) RequestFreshRestart(id string) error {
+	return withSessionMutationLock(id, func() error {
+		if _, _, err := m.sessionBead(id); err != nil {
+			return err
+		}
+		return m.store.SetMetadataBatch(id, map[string]string{
+			"restart_requested":          "true",
+			"continuation_reset_pending": "true",
+		})
+	})
+}
+
 // Close ends a conversation permanently.
 func (m *Manager) Close(id string) error {
-	return withSessionMutationLock(id, func() error {
+	_, err := m.CloseDetailed(id)
+	return err
+}
+
+// CloseDetailed ends a conversation permanently and reports cleanup artifacts.
+func (m *Manager) CloseDetailed(id string) (CloseResult, error) {
+	result := CloseResult{}
+	err := withSessionMutationLock(id, func() error {
 		b, sessName, err := m.loadSessionBead(id, true)
 		if err != nil {
 			return err
 		}
 		if b.Status == "closed" {
-			return nil // already closed
+			_ = clearRuntimeMCPServersSnapshot(m.cityPath, id)
+			return nil // idempotent: already closed
+		}
+		// CmdClose is legal from any non-none state; this is effectively a
+		// documentation check that will catch future table changes. Treat
+		// empty metadata state as StateActive for bootstrap beads, and
+		// treat the reconciler's StateAwake alias as StateActive so
+		// already-awake beads can close cleanly.
+		current := State(b.Metadata["state"])
+		if current == StateNone {
+			current = StateActive
+		}
+		if current == StateAwake {
+			current = StateActive
+		}
+		if _, err := Transition(current, CmdClose); err != nil {
+			return err
 		}
 
-		// Best-effort stop cleans up any live runtime and allows auto.Provider
-		// to discard stale ACP route entries for suspended sessions as well.
-		_ = m.sp.Stop(sessName)
-		_ = CancelWaits(m.store, id, time.Now().UTC())
+		// Stop the live runtime before marking the bead closed. Stop is
+		// idempotent for an already-gone session (returns nil), which also lets
+		// auto.Provider discard stale ACP route entries for suspended sessions.
+		// A genuine terminate failure must propagate and leave the bead open
+		// rather than report a "closed but still running" session — swallowing
+		// it here previously masked exactly that wedge.
+		if err := m.sp.Stop(sessName); err != nil {
+			return fmt.Errorf("stopping runtime for session %s: %w", id, err)
+		}
+		nudgeIDs, capped, err := CancelWaitsAndCollectNudgeIDs(m.store, id, time.Now().UTC())
+		if err != nil {
+			log.Printf("session %s: closing after wait cancellation lookup failed: %v", id, err)
+		}
+		if capped {
+			log.Printf("session %s: closing after capped wait cancellation lookup", id)
+		}
+		result.WaitNudgeIDs = append(result.WaitNudgeIDs, nudgeIDs...)
+		if err := m.clearWakeAndHoldOverrides(id); err != nil {
+			return err
+		}
 		if err := m.retireConfiguredNamedSessionIdentifiers(id, b); err != nil {
 			return err
 		}
 
-		return m.store.Close(id)
+		if err := m.store.Close(id); err != nil {
+			return err
+		}
+		_ = clearRuntimeMCPServersSnapshot(m.cityPath, id)
+		return nil
 	})
+	return result, err
+}
+
+func (m *Manager) clearWakeAndHoldOverrides(id string) error {
+	update := map[string]string{
+		"pin_awake":    "",
+		"held_until":   "",
+		"sleep_intent": "",
+	}
+	if err := m.store.SetMetadataBatch(id, update); err != nil {
+		return fmt.Errorf("clearing wake and hold overrides: %w", err)
+	}
+	return nil
 }
 
 func (m *Manager) retireConfiguredNamedSessionIdentifiers(id string, b beads.Bead) error {
-	if strings.TrimSpace(b.Metadata["configured_named_session"]) != "true" {
+	// Recognize configured named sessions by flag OR identity so a
+	// partially-tagged bead (identity recorded, boolean flag absent) still
+	// releases its reserved runtime name on close instead of stranding the
+	// name and blocking respawn (ga-841).
+	if !wasConfiguredNamedSession(b) {
 		return nil
 	}
 	update := beads.UpdateOpts{
@@ -605,6 +981,7 @@ func (m *Manager) retireConfiguredNamedSessionIdentifiers(id string, b beads.Bea
 	update.Metadata["session_name"] = ""
 	update.Metadata["session_name_explicit"] = ""
 	update.Metadata["pending_create_claim"] = ""
+	update.Metadata["pending_create_started_at"] = ""
 	if err := m.store.Update(id, update); err != nil {
 		return fmt.Errorf("retiring configured named session identifiers: %w", err)
 	}
@@ -624,7 +1001,7 @@ func (m *Manager) Kill(id string) error {
 	// state can lag behind reality, so also check provider liveness.
 	state := State(b.Metadata["state"])
 	switch state {
-	case StateActive, StateCreating, StateDraining, StateAwake:
+	case StateActive, StateStartPending, StateCreating, StateDraining, StateAwake:
 		// Known live states — proceed.
 	default:
 		if !m.sp.IsRunning(sessName) {
@@ -636,60 +1013,136 @@ func (m *Manager) Kill(id string) error {
 
 // BeginDrain transitions a session to the draining state. The caller is
 // responsible for signaling the runtime process to finish its work.
+// Idempotent: returns nil if the session is already draining.
 func (m *Manager) BeginDrain(id, reason string) error {
-	batch := map[string]string{
-		"state":        string(StateDraining),
-		"state_reason": reason,
-		"drain_at":     time.Now().UTC().Format(time.RFC3339),
-	}
-	return m.store.SetMetadataBatch(id, batch)
+	return withSessionMutationLock(id, func() error {
+		cmdLegal, err := m.checkTransition(id, CmdDrain, StateDraining)
+		if err != nil {
+			return err
+		}
+		if !cmdLegal {
+			return nil // idempotent: already draining
+		}
+		return m.store.SetMetadataBatch(id, BeginDrainPatch(time.Now().UTC(), reason))
+	})
 }
 
-// Archive transitions a session from draining to archived. The runtime
-// process should already be stopped.
+// Archive transitions a session from draining to archived. Idempotent:
+// returns nil if the session is already archived.
 func (m *Manager) Archive(id, reason string) error {
-	batch := map[string]string{
-		"state":        string(StateArchived),
-		"state_reason": reason,
-		"archived_at":  time.Now().UTC().Format(time.RFC3339),
-	}
-	return m.store.SetMetadataBatch(id, batch)
+	return withSessionMutationLock(id, func() error {
+		cmdLegal, err := m.checkTransition(id, CmdArchive, StateArchived)
+		if err != nil {
+			return err
+		}
+		if !cmdLegal {
+			return nil // idempotent: already archived
+		}
+		return m.store.SetMetadataBatch(id, ArchivePatch(time.Now().UTC(), reason, false))
+	})
 }
 
 // Quarantine marks a session as crash-quarantined until the given time.
+// Idempotent: returns nil if the session is already quarantined.
 func (m *Manager) Quarantine(id string, until time.Time, cycle int) error {
-	batch := map[string]string{
-		"state":             string(StateQuarantined),
-		"state_reason":      "crash-loop",
-		"quarantined_until": until.UTC().Format(time.RFC3339),
-		"quarantine_cycle":  fmt.Sprintf("%d", cycle),
-	}
-	return m.store.SetMetadataBatch(id, batch)
+	return withSessionMutationLock(id, func() error {
+		cmdLegal, err := m.checkTransition(id, CmdQuarantine, StateQuarantined)
+		if err != nil {
+			return err
+		}
+		if !cmdLegal {
+			return nil // idempotent: already quarantined
+		}
+		return m.store.SetMetadataBatch(id, QuarantinePatch(until, cycle))
+	})
 }
 
-// Reactivate transitions a session from archived or quarantined back to
-// active (or creating, depending on caller's next step).
+// Reactivate clears archive/quarantine blockers and returns a session to
+// asleep so normal wake machinery owns the next runtime start. Idempotent:
+// returns nil if the session is already in an awake-eligible state.
 func (m *Manager) Reactivate(id string) error {
-	batch := map[string]string{
-		"state":             string(StateActive),
-		"state_reason":      "reactivated",
-		"quarantined_until": "",
-		"crash_count":       "0",
-		"archived_at":       "",
-	}
-	// Note: quarantine_cycle is intentionally preserved across reactivations.
-	// It tracks how many quarantine rounds the session has been through,
-	// enabling eviction after quarantine_max_attempts.
-	return m.store.SetMetadataBatch(id, batch)
+	return withSessionMutationLock(id, func() error {
+		cmdLegal, err := m.checkTransition(id, CmdWake, StateAsleep)
+		if err != nil {
+			return err
+		}
+		if !cmdLegal {
+			return nil // idempotent: already in target state
+		}
+		b, err := m.store.Get(id)
+		if err != nil {
+			return err
+		}
+		view := ProjectLifecycle(LifecycleInput{
+			Status:   b.Status,
+			Metadata: b.Metadata,
+		})
+		// Note: quarantine_cycle is intentionally preserved across reactivations.
+		// It tracks how many quarantine rounds the session has been through,
+		// enabling eviction after quarantine_max_attempts.
+		return m.store.SetMetadataBatch(id, ReactivatePatch(view.ContinuityEligible))
+	})
 }
 
 // ConfirmCreation transitions a session from creating to active after the
-// runtime process has been confirmed alive.
+// runtime process has been confirmed alive. Idempotent: returns nil if the
+// session is already active.
 func (m *Manager) ConfirmCreation(id string) error {
-	return m.store.SetMetadataBatch(id, map[string]string{
-		"state":        string(StateActive),
-		"state_reason": "creation_complete",
+	return withSessionMutationLock(id, func() error {
+		cmdLegal, err := m.checkTransition(id, CmdReady, StateActive)
+		if err != nil {
+			return err
+		}
+		if !cmdLegal {
+			return nil // idempotent: already active
+		}
+		return m.store.SetMetadataBatch(id, ConfirmStartedPatch(time.Now()))
 	})
+}
+
+// checkTransition reads the current state of session id and reports whether
+// cmd is legal. Empty state metadata is treated as StateActive for legacy
+// bootstrap beads (pre-metadata upgrades). Closed beads are terminal and
+// reject any lifecycle mutation (callers should use the dedicated Close
+// idempotency branch, not a lifecycle transition). Returns:
+//   - cmdLegal: true if the command produces a real transition, false if
+//     the session is already in targetState (idempotent no-op)
+//   - err: *IllegalTransitionError wrapping ErrIllegalTransition when the
+//     command is neither legal nor a no-op
+//
+// MUST be called while holding withSessionMutationLock(id).
+func (m *Manager) checkTransition(id string, cmd TransitionCommand, targetState State) (bool, error) {
+	b, _, err := m.sessionBead(id)
+	if err != nil {
+		return false, err
+	}
+	// Closed beads are terminal. Mutating lifecycle metadata after close
+	// would produce impossible status=closed + live-state combinations
+	// that the reconciler misreads. Surface a clear illegal-transition
+	// error instead of silently mutating.
+	if b.Status == "closed" {
+		return false, &IllegalTransitionError{From: StateClosed, Command: cmd}
+	}
+	current := State(b.Metadata["state"])
+	if current == StateNone {
+		// Legacy bead: pre-metadata cities may have empty state fields.
+		// Treat as active so transitions work during upgrade.
+		current = StateActive
+	}
+	// StateAwake is the reconciler's alias for StateActive. The state
+	// machine table only knows StateActive, so normalize before calling
+	// Transition to keep already-awake beads accepting Suspend/Drain/
+	// Archive/Quarantine.
+	if current == StateAwake {
+		current = StateActive
+	}
+	if current == targetState {
+		return false, nil
+	}
+	if _, err := Transition(current, cmd); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Rename updates the title of a chat session.
@@ -749,6 +1202,147 @@ func (m *Manager) UpdatePresentation(id string, title *string, alias *string) er
 	})
 }
 
+// UpdateTemplateOverrides merges option overrides into the session metadata.
+func (m *Manager) UpdateTemplateOverrides(id string, updates map[string]string) (map[string]string, error) {
+	var merged map[string]string
+	err := withSessionMutationLock(id, func() error {
+		b, sessName, err := m.loadSessionBead(id, true)
+		if err != nil {
+			return err
+		}
+		state := State(b.Metadata["state"])
+		if IsTemplateOverrideRuntimeActive(state) || templateOverrideWakeInFlight(b.Metadata, state, m.now()) || (strings.TrimSpace(sessName) != "" && m.sp != nil && m.sp.IsRunning(sessName)) {
+			return fmt.Errorf("%w: template overrides apply only before the next launch", ErrSessionActive)
+		}
+		overrides, err := ParseTemplateOverrides(b.Metadata)
+		if err != nil {
+			log.Printf("session %s: repairing malformed template_overrides: %v", id, err)
+			overrides = nil
+		}
+		if overrides == nil {
+			overrides = make(map[string]string, len(updates))
+		}
+		for key, value := range updates {
+			overrides[key] = value
+		}
+		raw, err := json.Marshal(overrides)
+		if err != nil {
+			return fmt.Errorf("marshal template_overrides: %w", err)
+		}
+		metadata := map[string]string{"template_overrides": string(raw)}
+		for key, value := range updates {
+			if key == "initial_message" {
+				continue
+			}
+			metadata[beadmeta.OptionMetadataPrefix+key] = value
+		}
+		if err := m.store.SetMetadataBatch(id, metadata); err != nil {
+			return err
+		}
+		merged = make(map[string]string, len(overrides))
+		for key, value := range overrides {
+			merged[key] = value
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return merged, nil
+}
+
+// IsTemplateOverrideRuntimeActive reports whether a session state is too live
+// for template override changes that only apply on the next launch.
+func IsTemplateOverrideRuntimeActive(state State) bool {
+	switch state {
+	case StateActive, StateAwake, StateStartPending, StateCreating, StateDraining, StateQuarantined:
+		return true
+	default:
+		return false
+	}
+}
+
+func templateOverrideWakeInFlightGrace() time.Duration {
+	return time.Minute + staleKeyDetectDelay + 5*time.Second
+}
+
+func templateOverrideWakeInFlight(metadata map[string]string, state State, now time.Time) bool {
+	if metadata == nil {
+		return false
+	}
+	switch state {
+	case StateFailedCreate, StateDrained, StateArchived:
+		return false
+	}
+	if strings.TrimSpace(metadata["pending_create_claim"]) == "true" {
+		return true
+	}
+	lastWoke := strings.TrimSpace(metadata["last_woke_at"])
+	if lastWoke == "" {
+		return false
+	}
+	started, err := time.Parse(time.RFC3339, lastWoke)
+	if err != nil {
+		return false
+	}
+	// PreWakePatch records last_woke_at before the reconciler can observe
+	// runtime liveness; keep overrides locked out through that startup window.
+	return now.UTC().Before(started.UTC().Add(templateOverrideWakeInFlightGrace()))
+}
+
+// pruneStateTimestamp returns the timestamp that PruneDetailed compares
+// against its cutoff for a session in the given state. Suspended sessions keep
+// the historical CreatedAt fallback for legacy beads. Asleep sessions normally
+// require slept_at, except legacy drained-asleep beads without slept_at can use
+// the bead update timestamp because sleep_reason=drained is terminal.
+func pruneStateTimestamp(b beads.Bead, state State) (time.Time, bool) {
+	switch state {
+	case StateSuspended:
+		if raw := b.Metadata["suspended_at"]; raw != "" {
+			if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
+				return parsed, true
+			}
+		}
+		return b.CreatedAt, true
+	case StateAsleep:
+		if ts, ok := parsePruneMetadataTimestamp(b.Metadata, "slept_at"); ok {
+			return ts, true
+		}
+		if strings.TrimSpace(b.Metadata["slept_at"]) != "" {
+			return time.Time{}, false
+		}
+		if strings.TrimSpace(b.Metadata["sleep_reason"]) != "drained" {
+			return time.Time{}, false
+		}
+		if !b.UpdatedAt.IsZero() {
+			return b.UpdatedAt, true
+		}
+		if !b.CreatedAt.IsZero() {
+			return b.CreatedAt, true
+		}
+		return time.Time{}, false
+	case StateDrained:
+		return parsePruneMetadataTimestamp(b.Metadata, "drain_at")
+	default:
+		return time.Time{}, false
+	}
+}
+
+func parsePruneMetadataTimestamp(metadata map[string]string, key string) (time.Time, bool) {
+	if metadata == nil {
+		return time.Time{}, false
+	}
+	raw := metadata[key]
+	if raw == "" {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed, true
+}
+
 // Prune closes suspended sessions whose suspension time is before the given
 // cutoff. Active and already-closed sessions are never pruned.
 // Returns the number of sessions pruned.
@@ -757,9 +1351,20 @@ func (m *Manager) Prune(before time.Time) (int, error) {
 	return result.Count, err
 }
 
-// PruneDetailed closes suspended sessions whose suspension time is before the
-// given cutoff and reports the affected session IDs and queued wait nudges.
-func (m *Manager) PruneDetailed(before time.Time) (PruneResult, error) {
+// PruneDetailed closes terminal-state sessions whose state timestamp is before
+// the given cutoff and reports the affected session IDs and queued wait nudges.
+// When no states are supplied it defaults to [StateSuspended] for backward
+// compatibility. Callers may opt in to asleep or drained cleanup by passing
+// StateAsleep or StateDrained. StateDrained also matches legacy
+// state=asleep/sleep_reason=drained beads.
+func (m *Manager) PruneDetailed(before time.Time, states ...State) (PruneResult, error) {
+	if len(states) == 0 {
+		states = []State{StateSuspended}
+	}
+	allowed := make(map[State]struct{}, len(states))
+	for _, s := range states {
+		allowed[s] = struct{}{}
+	}
 	all, err := m.store.List(beads.ListQuery{
 		Label: LabelSession,
 	})
@@ -775,26 +1380,24 @@ func (m *Manager) PruneDetailed(before time.Time) (PruneResult, error) {
 			continue // already closed
 		}
 		state := State(b.Metadata["state"])
-		if state != StateSuspended {
-			continue // only prune suspended sessions
+		if !pruneStateAllowed(state, b.Metadata, allowed) {
+			continue
 		}
-		// Use suspended_at timestamp if available, fall back to CreatedAt
-		// for beads created before suspended_at was introduced.
-		ts := b.CreatedAt
-		if raw := b.Metadata["suspended_at"]; raw != "" {
-			if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
-				ts = parsed
-			}
+		ts, ok := pruneStateTimestamp(b, state)
+		if !ok {
+			continue
 		}
 		if !ts.Before(before) {
 			continue
 		}
-		nudgeIDs, err := WaitNudgeIDs(m.store, b.ID)
-		if err != nil {
-			return result, fmt.Errorf("listing wait nudges for session %s: %w", b.ID, err)
+		nudgeIDs, capped, err := CancelWaitsAndCollectNudgeIDs(m.store, b.ID, time.Now().UTC())
+		if err != nil && !beads.IsLookupLimitError(err) {
+			return result, fmt.Errorf("canceling waits for session %s: %w", b.ID, err)
+		}
+		if capped || beads.IsLookupLimitError(err) {
+			log.Printf("session %s: pruning after capped wait nudge lookup: %v", b.ID, err)
 		}
 		result.WaitNudgeIDs = append(result.WaitNudgeIDs, nudgeIDs...)
-		_ = CancelWaits(m.store, b.ID, time.Now().UTC())
 		if err := m.store.Close(b.ID); err != nil {
 			return result, fmt.Errorf("closing session %s: %w", b.ID, err)
 		}
@@ -804,13 +1407,76 @@ func (m *Manager) PruneDetailed(before time.Time) (PruneResult, error) {
 	return result, nil
 }
 
+func pruneStateAllowed(state State, metadata map[string]string, allowed map[State]struct{}) bool {
+	if _, ok := allowed[state]; ok {
+		return true
+	}
+	if state != StateAsleep {
+		return false
+	}
+	if strings.TrimSpace(metadata["sleep_reason"]) != "drained" {
+		return false
+	}
+	_, ok := allowed[StateDrained]
+	return ok
+}
+
 // Get returns info about a single session.
 func (m *Manager) Get(id string) (Info, error) {
+	info, _, err := m.GetWithBead(id)
+	return info, err
+}
+
+// GetWithBead returns session info and the underlying bead in a single
+// store fetch, for callers that need both views (e.g. spec build plus
+// metadata lookup) without a redundant store.Get.
+func (m *Manager) GetWithBead(id string) (Info, beads.Bead, error) {
 	b, _, err := m.loadSessionBead(id, true)
 	if err != nil {
-		return Info{}, err
+		return Info{}, beads.Bead{}, err
 	}
-	return m.infoFromBead(b), nil
+	return m.infoFromBead(b), b, nil
+}
+
+// GetWithPersistedResponse returns the runtime-enriched session Info plus the
+// persisted-response projection (status + metadata) in a single store fetch.
+// It is the domain-typed read the API response path routes through: the caller
+// gets session.Info for the scalar/runtime fields and session.PersistedResponse
+// for the status/metadata-derived fields, without a raw *beads.Bead crossing the
+// boundary or a redundant second store.Get beside Get. Bead serialization stays
+// confined here via PersistedResponseFromBead.
+func (m *Manager) GetWithPersistedResponse(id string) (Info, PersistedResponse, error) {
+	info, b, err := m.GetWithBead(id)
+	if err != nil {
+		return Info{}, PersistedResponse{}, err
+	}
+	return info, PersistedResponseFromBead(b), nil
+}
+
+// SessionInfoFromBead converts an already-loaded session bead to Info,
+// applying the same enrichment as Get. Callers that have just resolved
+// the bead can use this to avoid a second store.Get.
+func (m *Manager) SessionInfoFromBead(b beads.Bead) Info {
+	return m.infoFromBead(b)
+}
+
+// ObserveRuntimeForInfo reports live provider state for a session whose Info
+// has already been loaded by the caller, avoiding a redundant store fetch.
+func (m *Manager) ObserveRuntimeForInfo(info Info, processNames []string) RuntimeObservation {
+	obs := RuntimeObservation{SessionName: info.SessionName}
+	if strings.TrimSpace(info.SessionName) == "" || m.sp == nil {
+		return obs
+	}
+	liveness := runtime.ObserveLiveness(m.sp, info.SessionName, processNames)
+	obs.Running = liveness.Running
+	obs.Alive = liveness.Alive
+	if obs.Running {
+		obs.Attached = m.sp.IsAttached(info.SessionName)
+		if lastActive, err := m.sp.GetLastActivity(info.SessionName); err == nil {
+			obs.LastActive = lastActive
+		}
+	}
+	return obs
 }
 
 // ListResult holds the results of a ListFull call, including the raw beads
@@ -846,7 +1512,7 @@ func (m *Manager) ListFull(stateFilter string, templateFilter string) (*ListResu
 // session-labeled beads. Callers that already loaded session beads can avoid
 // a second store scan by passing the same slice here.
 func (m *Manager) ListFullFromBeads(all []beads.Bead, stateFilter string, templateFilter string) *ListResult {
-	var result []Info
+	result := make([]Info, 0, len(all))
 	for _, b := range all {
 		if !IsSessionBeadOrRepairable(b) {
 			continue
@@ -902,47 +1568,30 @@ func (m *Manager) Peek(id string, lines int) (string, error) {
 	return m.sp.Peek(sessName, lines)
 }
 
-// infoFromBead converts a bead to an Info struct, enriching with runtime state.
+// infoFromBead converts a bead to an Info struct, enriching the persisted
+// projection (InfoFromPersistedBead) with live runtime state. The persisted
+// fields come from the shared codec so the manager and the Info-typed domain
+// store agree on the storage projection; only the runtime overlay (transport
+// detection, ACP routing, stale-state downgrade, attachment/last-active) lives
+// here, where the runtime provider is available.
 func (m *Manager) infoFromBead(b beads.Bead) Info {
-	sessName := b.Metadata["session_name"]
-	if sessName == "" {
-		sessName = sessionNameFor(b.ID)
-	}
-	closed := b.Status == "closed"
-	if !closed {
-		transport, _ := m.transportForBead(b, sessName)
-		_ = m.routeACPIfNeeded(b.Metadata["provider"], transport, sessName)
-	}
+	info := InfoFromPersistedBead(b)
+	sessName := info.SessionName
 
-	state := normalizeInfoState(State(b.Metadata["state"]))
-	if closed {
-		state = "" // closed beads have no runtime state
-	} else if m.sp != nil && state == StateActive && !m.sp.IsRunning(sessName) {
+	if !info.Closed {
+		transport, _ := m.transportForBead(b, sessName)
+		info.Transport = transport
+		_ = m.routeACPIfNeeded(b.Metadata["provider"], transport, sessName)
+
 		// Surface stale "awake" / "active" beads as dormant immediately.
 		// The controller also heals metadata on the next tick.
-		state = StateAsleep
-	}
-
-	info := Info{
-		ID:            b.ID,
-		Template:      b.Metadata["template"],
-		State:         state,
-		Closed:        closed,
-		Title:         b.Title,
-		Alias:         b.Metadata["alias"],
-		Provider:      b.Metadata["provider"],
-		Command:       b.Metadata["command"],
-		WorkDir:       b.Metadata["work_dir"],
-		SessionName:   sessName,
-		SessionKey:    b.Metadata["session_key"],
-		ResumeFlag:    b.Metadata["resume_flag"],
-		ResumeStyle:   b.Metadata["resume_style"],
-		ResumeCommand: b.Metadata["resume_command"],
-		CreatedAt:     b.CreatedAt,
+		if m.sp != nil && info.State == StateActive && !m.sp.IsRunning(sessName) {
+			info.State = StateAsleep
+		}
 	}
 
 	// Enrich with live runtime state if active.
-	if state == StateActive && m.sp != nil {
+	if info.State == StateActive && m.sp != nil {
 		info.Attached = m.sp.IsAttached(sessName)
 		if t, err := m.sp.GetLastActivity(sessName); err == nil && !t.IsZero() {
 			info.LastActive = t
@@ -950,6 +1599,57 @@ func (m *Manager) infoFromBead(b beads.Bead) Info {
 	}
 
 	return info
+}
+
+// PersistSessionKey stores a provider resume key on an existing session when
+// the key is learned after creation (for example from transcript evidence).
+// Existing non-empty keys are preserved.
+func (m *Manager) PersistSessionKey(id, sessionKey string) error {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if id == "" || sessionKey == "" {
+		return nil
+	}
+	return withSessionMutationLock(id, func() error {
+		b, _, err := m.sessionBead(id)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(b.Metadata["session_key"]) != "" {
+			return nil
+		}
+		if err := m.store.SetMetadata(id, "session_key", sessionKey); err != nil {
+			return fmt.Errorf("storing session key: %w", err)
+		}
+		return nil
+	})
+}
+
+// MetadataKeyInvocationUsageCursor stores the identity of the most recently
+// telemetry-recorded invocation for a session: the provider message id
+// (msg_*) when the transcript carries one, otherwise the transcript entry
+// UUID. It prevents double-counting of the gc.agent.tokens.* counters
+// across prompt operations: handles are rebuilt per gc process, so the
+// dedup cursor must live on the session bead, not in memory.
+const MetadataKeyInvocationUsageCursor = "invocation_usage_cursor"
+
+// PersistInvocationUsageCursor stores the invocation-usage telemetry cursor
+// on an existing session. Unlike PersistSessionKey it overwrites any
+// existing value — the cursor advances with every recorded invocation.
+// Empty id or cursor is a no-op.
+func (m *Manager) PersistInvocationUsageCursor(id, cursor string) error {
+	cursor = strings.TrimSpace(cursor)
+	if id == "" || cursor == "" {
+		return nil
+	}
+	return withSessionMutationLock(id, func() error {
+		if _, _, err := m.sessionBead(id); err != nil {
+			return err
+		}
+		if err := m.store.SetMetadata(id, MetadataKeyInvocationUsageCursor, cursor); err != nil {
+			return fmt.Errorf("storing invocation usage cursor: %w", err)
+		}
+		return nil
+	})
 }
 
 // sessionNameFor derives the tmux session name from a bead ID.
@@ -1001,7 +1701,7 @@ func mergeEnv(base, override map[string]string) map[string]string {
 	if len(base) == 0 && len(override) == 0 {
 		return nil
 	}
-	merged := make(map[string]string, len(base)+len(override))
+	merged := make(map[string]string)
 	for k, v := range base {
 		merged[k] = v
 	}

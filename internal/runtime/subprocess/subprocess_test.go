@@ -1,7 +1,9 @@
 package subprocess
 
 import (
+	"bufio"
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -40,6 +42,36 @@ func TestStartCreatesProcess(t *testing.T) {
 
 	if !p.IsRunning("test") {
 		t.Error("expected IsRunning=true after Start")
+	}
+}
+
+func TestStartPersistsRuntimeMetadataForGetMeta(t *testing.T) {
+	p := newTestProvider(t)
+	err := p.Start(context.Background(), "meta-start", runtime.Config{
+		Command: "sleep 3600",
+		Env: map[string]string{
+			"GC_SESSION_ID":     "bead-123",
+			"GC_INSTANCE_TOKEN": "token-456",
+			"GC_TEMPLATE":       "worker",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Stop("meta-start") //nolint:errcheck
+
+	for key, want := range map[string]string{
+		"GC_SESSION_ID":     "bead-123",
+		"GC_INSTANCE_TOKEN": "token-456",
+		"GC_TEMPLATE":       "worker",
+	} {
+		got, err := p.GetMeta("meta-start", key)
+		if err != nil {
+			t.Fatalf("GetMeta(%s): %v", key, err)
+		}
+		if got != want {
+			t.Fatalf("GetMeta(%s) = %q, want %q", key, got, want)
+		}
 	}
 }
 
@@ -86,6 +118,49 @@ func TestStartLongSocketPathUsesShortSocketName(t *testing.T) {
 	}
 	if len(p.sockPath(name)) >= len(p.legacySockPath(name)) {
 		t.Fatalf("short socket path = %q, legacy = %q; want shorter path", p.sockPath(name), p.legacySockPath(name))
+	}
+}
+
+func TestStartVeryLongSocketDirFallsBackToTempDir(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "gc-sock-fallback-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+
+	longDir := filepath.Join(root, strings.Repeat("p", 120), "runtime", "gc", "subprocess", "hash")
+	if err := os.MkdirAll(longDir, 0o755); err != nil {
+		t.Fatalf("mkdir longDir: %v", err)
+	}
+
+	p := NewProviderWithDir(longDir)
+	name := "dog-gc-112"
+	localShort := filepath.Join(longDir, p.sockKey(name)+".sock")
+	if len(localShort) <= socketPathLimit {
+		t.Fatalf("test setup failed: %q does not exceed socket path limit", localShort)
+	}
+	if !strings.HasPrefix(p.sockPath(name), os.TempDir()) {
+		t.Fatalf("sockPath(%q) = %q, want temp-dir fallback", name, p.sockPath(name))
+	}
+	if len(p.sockPath(name)) > socketPathLimit {
+		t.Fatalf("sockPath(%q) = %q exceeds limit %d", name, p.sockPath(name), socketPathLimit)
+	}
+
+	if err := p.Start(context.Background(), name, runtime.Config{Command: "sleep 3600"}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Stop(name) //nolint:errcheck
+
+	p2 := NewProviderWithDir(longDir)
+	if !p2.socketAlive(name) {
+		t.Fatalf("fallback socket for %q should be visible cross-process", name)
+	}
+	got, err := p2.ListRunning("")
+	if err != nil {
+		t.Fatalf("ListRunning: %v", err)
+	}
+	if len(got) != 1 || got[0] != name {
+		t.Fatalf("ListRunning = %#v, want [%q]", got, name)
 	}
 }
 
@@ -284,6 +359,167 @@ func TestWorkDirSet(t *testing.T) {
 	t.Fatal("timed out waiting for workdir marker file")
 }
 
+func TestStartStagesSingleFileCopyIntoWorkDirRoot(t *testing.T) {
+	workDir := t.TempDir()
+	srcDir := t.TempDir()
+	src := filepath.Join(srcDir, "seed.txt")
+	if err := os.WriteFile(src, []byte("seed data"), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	p := newTestProvider(t)
+	err := p.Start(context.Background(), "copy-root", runtime.Config{
+		Command:   "sleep 3600",
+		WorkDir:   workDir,
+		CopyFiles: []runtime.CopyEntry{{Src: src}},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Stop("copy-root") //nolint:errcheck
+
+	data, err := os.ReadFile(filepath.Join(workDir, "seed.txt"))
+	if err != nil {
+		t.Fatalf("read staged file: %v", err)
+	}
+	if string(data) != "seed data" {
+		t.Fatalf("staged file = %q, want %q", string(data), "seed data")
+	}
+}
+
+func TestStartStagesKiroPackOverlayBeforeLaunch(t *testing.T) {
+	workDir := t.TempDir()
+	packOverlay := t.TempDir()
+	agentConfig := filepath.Join(packOverlay, "per-provider", "kiro", ".kiro", "agents", "gascity.json")
+	if err := os.MkdirAll(filepath.Dir(agentConfig), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", filepath.Dir(agentConfig), err)
+	}
+	if err := os.WriteFile(agentConfig, []byte(`{"name":"gascity"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q): %v", agentConfig, err)
+	}
+	fallbackInstructions := filepath.Join(packOverlay, "per-provider", "kiro", "AGENTS.md")
+	if err := os.WriteFile(fallbackInstructions, []byte("fallback instructions"), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q): %v", fallbackInstructions, err)
+	}
+	projectInstructions := filepath.Join(workDir, "AGENTS.md")
+	if err := os.WriteFile(projectInstructions, []byte("project instructions"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q): %v", projectInstructions, err)
+	}
+
+	p := newTestProvider(t)
+	err := p.Start(context.Background(), "kiro-overlay", runtime.Config{
+		Command:         "sleep 3600",
+		WorkDir:         workDir,
+		ProviderName:    "kiro",
+		PackOverlayDirs: []string{packOverlay},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Stop("kiro-overlay") //nolint:errcheck
+
+	if _, err := os.Stat(filepath.Join(workDir, ".kiro", "agents", "gascity.json")); err != nil {
+		t.Fatalf("expected Kiro agent config to be staged: %v", err)
+	}
+	data, err := os.ReadFile(projectInstructions)
+	if err != nil {
+		t.Fatalf("read AGENTS.md: %v", err)
+	}
+	if string(data) != "project instructions" {
+		t.Fatalf("AGENTS.md = %q, want project instructions preserved", string(data))
+	}
+}
+
+func TestStartFailsWhenCopyFileCannotBeStaged(t *testing.T) {
+	workDir := t.TempDir()
+	srcDir := t.TempDir()
+	src := filepath.Join(srcDir, "seed.txt")
+	if err := os.WriteFile(src, []byte("seed data"), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	blocker := filepath.Join(workDir, "blocked")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+
+	p := newTestProvider(t)
+	err := p.Start(context.Background(), "copy-error", runtime.Config{
+		Command: "sleep 3600",
+		WorkDir: workDir,
+		CopyFiles: []runtime.CopyEntry{{
+			Src:    src,
+			RelDst: filepath.Join("blocked", "seed.txt"),
+		}},
+	})
+	if err == nil {
+		t.Fatal("Start should fail when staging a copy file fails")
+	}
+}
+
+func TestStartFailsWhenOverlayCannotBeStaged(t *testing.T) {
+	workDir := t.TempDir()
+	overlayDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(overlayDir, "ok.txt"), []byte("copied"), 0o644); err != nil {
+		t.Fatalf("write ok overlay file: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(overlayDir, "blocked"), 0o755); err != nil {
+		t.Fatalf("mkdir blocked src dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(overlayDir, "blocked", "nested.txt"), []byte("ignored"), 0o644); err != nil {
+		t.Fatalf("write blocked overlay file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "blocked"), []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("write blocked dst file: %v", err)
+	}
+
+	p := newTestProvider(t)
+	err := p.Start(context.Background(), "overlay-error", runtime.Config{
+		Command:    "sleep 3600",
+		WorkDir:    workDir,
+		OverlayDir: overlayDir,
+	})
+	if err == nil {
+		t.Fatal("Start should fail when staging an overlay warns")
+	}
+}
+
+func TestStartFailedStagingDoesNotRetainWorkDirForCopyTo(t *testing.T) {
+	workDir := t.TempDir()
+	srcDir := t.TempDir()
+	src := filepath.Join(srcDir, "seed.txt")
+	if err := os.WriteFile(src, []byte("seed data"), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	blocker := filepath.Join(workDir, "blocked")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+
+	p := newTestProvider(t)
+	err := p.Start(context.Background(), "copy-error", runtime.Config{
+		Command: "sleep 3600",
+		WorkDir: workDir,
+		CopyFiles: []runtime.CopyEntry{{
+			Src:    src,
+			RelDst: filepath.Join("blocked", "seed.txt"),
+		}},
+	})
+	if err == nil {
+		t.Fatal("Start should fail when staging a copy file fails")
+	}
+
+	lateSrc := filepath.Join(srcDir, "late.txt")
+	if err := os.WriteFile(lateSrc, []byte("late data"), 0o644); err != nil {
+		t.Fatalf("write late src: %v", err)
+	}
+	if err := p.CopyTo("copy-error", lateSrc, "late.txt"); err != nil {
+		t.Fatalf("CopyTo: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "late.txt")); !os.IsNotExist(err) {
+		t.Fatalf("late copy err = %v, want no copy into failed session workdir", err)
+	}
+}
+
 func TestSocketCreated(t *testing.T) {
 	p := newTestProvider(t)
 	if err := p.Start(context.Background(), "sock-check", runtime.Config{Command: "sleep 3600"}); err != nil {
@@ -314,6 +550,103 @@ func TestSocketRemovedAfterStop(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Error("socket file should be removed after Stop")
+}
+
+func TestStopBySocket_ReturnsErrorWhenSocketRejectsStop(t *testing.T) {
+	p := newTestProvider(t)
+	name := "reject-stop"
+
+	if err := os.WriteFile(p.sockNamePath(name), []byte(name), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	lis, err := net.Listen("unix", p.sockPath(name))
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	t.Cleanup(func() { _ = lis.Close() })
+
+	gotCommand := make(chan string, 1)
+	go func() {
+		conn, acceptErr := lis.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close() //nolint:errcheck
+
+		line, readErr := bufio.NewReader(conn).ReadString('\n')
+		if readErr == nil {
+			gotCommand <- strings.TrimSpace(line)
+		}
+		_, _ = conn.Write([]byte("nope\n"))
+	}()
+
+	err = p.stopBySocket(name)
+	if err == nil {
+		t.Fatal("stopBySocket succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "unexpected response") {
+		t.Fatalf("stopBySocket error = %v, want unexpected response", err)
+	}
+	if got := <-gotCommand; got != "stop" {
+		t.Fatalf("socket command = %q, want stop", got)
+	}
+	if _, statErr := os.Stat(p.sockPath(name)); statErr != nil {
+		t.Fatalf("socket path err = %v, want socket preserved after failed stop", statErr)
+	}
+	if _, statErr := os.Stat(p.sockNamePath(name)); statErr != nil {
+		t.Fatalf("socket name path err = %v, want socket name preserved after failed stop", statErr)
+	}
+}
+
+func TestStopBySocket_FallsBackToLegacySocketWhenCanonicalRejectsStop(t *testing.T) {
+	p := newTestProvider(t)
+	name := "legacy-fallback"
+
+	canonical, err := net.Listen("unix", p.sockPath(name))
+	if err != nil {
+		t.Fatalf("Listen canonical: %v", err)
+	}
+	t.Cleanup(func() { _ = canonical.Close() })
+
+	legacy, err := net.Listen("unix", p.legacySockPath(name))
+	if err != nil {
+		t.Fatalf("Listen legacy: %v", err)
+	}
+	t.Cleanup(func() { _ = legacy.Close() })
+
+	go func() {
+		conn, acceptErr := canonical.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close() //nolint:errcheck
+
+		_, _ = bufio.NewReader(conn).ReadString('\n')
+		_, _ = conn.Write([]byte("nope\n"))
+	}()
+
+	gotLegacy := make(chan string, 1)
+	go func() {
+		conn, acceptErr := legacy.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close() //nolint:errcheck
+
+		line, readErr := bufio.NewReader(conn).ReadString('\n')
+		if readErr == nil {
+			gotLegacy <- strings.TrimSpace(line)
+		}
+		_, _ = conn.Write([]byte("ok\n"))
+	}()
+
+	if err := p.stopBySocket(name); err != nil {
+		t.Fatalf("stopBySocket error = %v, want legacy fallback success", err)
+	}
+	if got := <-gotLegacy; got != "stop" {
+		t.Fatalf("legacy socket command = %q, want stop", got)
+	}
 }
 
 func TestSocketGoneAfterProcessDeath(t *testing.T) {
@@ -361,6 +694,33 @@ func TestCrossProcessStopBySocket(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if p2.IsRunning("cross") {
 		t.Error("process should be dead after cross-process Stop")
+	}
+}
+
+func TestMetaPath_HashesUntrustedNameAndKey(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "socks")
+	p := NewProviderWithDir(dir)
+
+	path := p.metaPath("../escape", "../key")
+	if filepath.Dir(path) != dir {
+		t.Fatalf("metaPath escaped provider dir: %q", path)
+	}
+	if base := filepath.Base(path); strings.Contains(base, "..") || strings.ContainsAny(base, `/\`) {
+		t.Fatalf("metaPath base = %q, want hashed file name without path tokens", base)
+	}
+
+	if err := p.SetMeta("../escape", "../key", "secret"); err != nil {
+		t.Fatalf("SetMeta with untrusted tokens: %v", err)
+	}
+	got, err := p.GetMeta("../escape", "../key")
+	if err != nil {
+		t.Fatalf("GetMeta with untrusted tokens: %v", err)
+	}
+	if got != "secret" {
+		t.Fatalf("GetMeta = %q, want secret", got)
+	}
+	if err := p.RemoveMeta("../escape", "../key"); err != nil {
+		t.Fatalf("RemoveMeta with untrusted tokens: %v", err)
 	}
 }
 

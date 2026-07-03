@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"io"
 	"sort"
 	"strings"
 
@@ -10,41 +12,90 @@ import (
 	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
-func controllerQueryEnv(cityPath string, cfg *config.City, agentCfg *config.Agent) map[string]string {
+func controllerQueryRuntimeEnv(cityPath string, cfg *config.City, agentCfg *config.Agent) (map[string]string, error) {
 	if strings.TrimSpace(cityPath) == "" || cfg == nil || agentCfg == nil {
-		return nil
-	}
-	if rawBeadsProvider(cityPath) != "bd" {
-		return nil
+		return nil, nil
 	}
 	var source map[string]string
-	if agentCfg.Dir != "" {
-		source = bdRuntimeEnvForRig(cityPath, cfg, agentCommandDir(cityPath, agentCfg, cfg.Rigs))
+	var err error
+	if rigName := configuredRigName(cityPath, agentCfg, cfg.Rigs); rigName != "" {
+		if rigRoot := rigRootForName(rigName, cfg.Rigs); rigRoot != "" {
+			if !scopeUsesManagedBdStoreContract(cityPath, rigRoot) {
+				return nil, nil
+			}
+			source, err = bdRuntimeEnvForRigWithError(cityPath, cfg, rigRoot)
+		} else {
+			if !scopeUsesManagedBdStoreContract(cityPath, cityPath) {
+				return nil, nil
+			}
+			source, err = bdRuntimeEnvWithError(cityPath)
+		}
 	} else {
-		source = bdRuntimeEnv(cityPath)
+		if !scopeUsesManagedBdStoreContract(cityPath, cityPath) {
+			return nil, nil
+		}
+		source, err = bdRuntimeEnvWithError(cityPath)
 	}
+	if err != nil {
+		return nil, err
+	}
+	if len(source) == 0 {
+		return nil, nil
+	}
+	env := make(map[string]string, len(source))
+	for key, value := range source {
+		env[key] = value
+	}
+	return env, nil
+}
+
+func controllerWorkQueryEnv(cityPath string, cfg *config.City, agentCfg *config.Agent) (map[string]string, error) {
+	if strings.TrimSpace(cityPath) == "" || cfg == nil || agentCfg == nil {
+		return nil, nil
+	}
+	env := cityRuntimeEnvMapForCity(cityPath)
+	env["GC_STORE_ROOT"] = cityPath
+	env["GC_STORE_SCOPE"] = "city"
+	env["GC_BEADS_PREFIX"] = config.EffectiveHQPrefix(cfg)
+	env["GC_RIG"] = ""
+	env["GC_RIG_ROOT"] = ""
+	if rigName := configuredRigName(cityPath, agentCfg, cfg.Rigs); rigName != "" {
+		if rigRoot := rigRootForName(rigName, cfg.Rigs); rigRoot != "" {
+			env["GC_STORE_ROOT"] = rigRoot
+			env["GC_STORE_SCOPE"] = "rig"
+			env["GC_RIG"] = rigName
+			env["GC_RIG_ROOT"] = rigRoot
+			if rig, ok := rigByName(cfg, rigName); ok {
+				env["GC_BEADS_PREFIX"] = rig.EffectivePrefix()
+				env["GC_RIG"] = rig.Name
+			}
+		}
+	}
+	queryEnv, err := controllerQueryRuntimeEnv(cityPath, cfg, agentCfg)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range queryEnv {
+		env[key] = value
+	}
+	return env, nil
+}
+
+func controllerQueryPrefixEnv(source map[string]string) map[string]string {
 	if len(source) == 0 {
 		return nil
 	}
 	env := map[string]string{}
-	// Only include connection coordinates (host/port) in the prefix — NOT
-	// credentials. Passwords serialized into the shell prefix would be
-	// visible in process listings. Auth vars (GC_DOLT_USER, GC_DOLT_PASSWORD,
-	// BEADS_DOLT_SERVER_USER, BEADS_DOLT_PASSWORD) are inherited from the
-	// controller's process env set by cityRuntimeProcessEnv.
+	// Only include connection coordinates (host/port) in the shell prefix —
+	// NOT credentials. Passwords serialized into the command string would be
+	// visible in process listings. Full canonical probe env is supplied via the
+	// subprocess environment by the controller probe runners.
 	for _, key := range []string{
 		"GC_DOLT_HOST", "GC_DOLT_PORT",
-		"BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SERVER_PORT",
 	} {
-		if value, ok := source[key]; ok {
+		if value := strings.TrimSpace(source[key]); value != "" {
 			env[key] = value
 		}
-	}
-	if env["BEADS_DOLT_SERVER_HOST"] == "" {
-		env["BEADS_DOLT_SERVER_HOST"] = env["GC_DOLT_HOST"]
-	}
-	if env["BEADS_DOLT_SERVER_PORT"] == "" {
-		env["BEADS_DOLT_SERVER_PORT"] = env["GC_DOLT_PORT"]
 	}
 	if len(env) == 0 {
 		return nil
@@ -52,8 +103,12 @@ func controllerQueryEnv(cityPath string, cfg *config.City, agentCfg *config.Agen
 	return env
 }
 
-func prefixControllerQueryEnv(cityPath string, cfg *config.City, agentCfg *config.Agent, command string) string {
-	return prefixShellEnv(controllerQueryEnv(cityPath, cfg, agentCfg), command)
+func controllerQueryEnv(cityPath string, cfg *config.City, agentCfg *config.Agent) (map[string]string, error) {
+	runtimeEnv, err := controllerQueryRuntimeEnv(cityPath, cfg, agentCfg)
+	if err != nil {
+		return nil, err
+	}
+	return controllerQueryPrefixEnv(runtimeEnv), nil
 }
 
 func prefixedWorkQueryForProbe(
@@ -63,19 +118,51 @@ func prefixedWorkQueryForProbe(
 	store beads.Store,
 	sessionBeads *sessionBeadSnapshot,
 	agentCfg *config.Agent,
+	stderr io.Writer,
+) string {
+	queryEnv, err := controllerQueryEnv(cityPath, cfg, agentCfg)
+	if err != nil {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "work_query probe env: %v\n", err) //nolint:errcheck // best-effort stderr
+		}
+		return ""
+	}
+	return prefixedWorkQueryForProbeWithEnv(queryEnv, cfg, cityPath, cityName, store, sessionBeads, agentCfg, stderr)
+}
+
+func prefixedWorkQueryForProbeWithEnv(
+	queryEnv map[string]string,
+	cfg *config.City,
+	cityPath string,
+	cityName string,
+	store beads.Store,
+	sessionBeads *sessionBeadSnapshot,
+	agentCfg *config.Agent,
+	stderr io.Writer,
 ) string {
 	if agentCfg == nil {
 		return ""
 	}
-	command := strings.TrimSpace(agentCfg.EffectiveWorkQuery())
-	if command == "" || isMultiSessionCfgAgent(agentCfg) {
-		return prefixControllerQueryEnv(cityPath, cfg, agentCfg, command)
+	beadsCfg := config.BeadsConfig{}
+	var rigs []config.Rig
+	if cfg != nil {
+		beadsCfg = cfg.Beads
+		rigs = cfg.Rigs
+	}
+	command := strings.TrimSpace(agentCfg.EffectiveWorkQueryForBeads(beadsCfg))
+	// Expand {{.Rig}}/{{.AgentBase}} so rig-scoped agents probe with
+	// rig-specific metadata. Mirrors the scale_check expansion in
+	// build_desired_state.go; #793. Malformed templates are logged to
+	// stderr (when supplied) and fall back to the raw command.
+	command = expandAgentCommandTemplate(cityPath, cityName, agentCfg, rigs, "work_query", command, stderr)
+	if command == "" || agentCfg.SupportsMultipleSessions() {
+		return prefixShellEnv(queryEnv, command)
 	}
 	sessionName := probeSessionNameForTemplate(cfg, cityName, store, sessionBeads, agentCfg.QualifiedName())
 	if sessionName == "" {
-		return prefixControllerQueryEnv(cityPath, cfg, agentCfg, command)
+		return prefixShellEnv(queryEnv, command)
 	}
-	env := controllerQueryEnv(cityPath, cfg, agentCfg)
+	env := cloneStringMap(queryEnv)
 	if env == nil {
 		env = map[string]string{}
 	}
@@ -123,6 +210,17 @@ func probeSessionNameForTemplate(
 		sessionTemplate = cfg.Workspace.SessionTemplate
 	}
 	return agent.SessionNameFor(cityName, identity, sessionTemplate)
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	if len(source) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func prefixShellEnv(env map[string]string, command string) string {

@@ -1,14 +1,26 @@
 package api
 
 import (
-	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/agentutil"
+	"github.com/gastownhall/gascity/internal/beadmeta"
+	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/execenv"
+	gitpkg "github.com/gastownhall/gascity/internal/git"
+	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/sling"
+	"github.com/gastownhall/gascity/internal/sourceworkflow"
 )
 
 type slingBody struct {
@@ -21,103 +33,115 @@ type slingBody struct {
 	Vars           map[string]string `json:"vars"`
 	ScopeKind      string            `json:"scope_kind"`
 	ScopeRef       string            `json:"scope_ref"`
+	Force          bool              `json:"force"`
 }
 
 type slingResponse struct {
-	Status         string `json:"status"`
-	Target         string `json:"target"`
-	Formula        string `json:"formula,omitempty"`
-	Bead           string `json:"bead,omitempty"`
-	WorkflowID     string `json:"workflow_id,omitempty"`
-	RootBeadID     string `json:"root_bead_id,omitempty"`
-	AttachedBeadID string `json:"attached_bead_id,omitempty"`
-	Mode           string `json:"mode,omitempty"`
+	Status         string   `json:"status"`
+	Target         string   `json:"target"`
+	Formula        string   `json:"formula,omitempty"`
+	Bead           string   `json:"bead,omitempty"`
+	WorkflowID     string   `json:"workflow_id,omitempty"`
+	RootBeadID     string   `json:"root_bead_id,omitempty"`
+	AttachedBeadID string   `json:"attached_bead_id,omitempty"`
+	Mode           string   `json:"mode,omitempty"`
+	Warnings       []string `json:"warnings,omitempty"`
 }
 
-// slingCommandRunner is the function that executes gc sling as a subprocess.
-// Replaceable in tests.
-var slingCommandRunner = runSlingCommand
+var apiSlingStderr = func() io.Writer { return os.Stderr }
 
-func (s *Server) handleSling(w http.ResponseWriter, r *http.Request) {
-	var body slingBody
-	if err := decodeBody(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid", err.Error())
-		return
-	}
-	if body.Target == "" {
-		writeError(w, http.StatusBadRequest, "invalid", "target agent or pool is required")
-		return
-	}
+// controlDispatcherRuntimeMissing reports whether the named control-dispatcher
+// agent's session is asleep with reason runtime-missing. It powers the rig→city
+// control-dispatcher fallback (#3454) on the API sling graph-routing path.
+//
+// Session beads are city-scoped, so it reads the server's already-open city
+// bead store directly — never openCityStoreAt — which keeps it off the
+// managed-Dolt spawn path and therefore leak-guard-safe on the sling hot path.
+func (s *Server) controlDispatcherRuntimeMissing(qualifiedName string) bool {
+	return session.RuntimeMissingInStore(s.state.CityBeadStore(), qualifiedName)
+}
 
+// execSling calls the intent-based Sling API directly. The Huma handler
+// humaHandleSling performs all validation before calling this.
+//
+// Return tuple:
+//   - resp: the success body (nil when code != "")
+//   - status: HTTP status for the success or error case
+//   - code: short error code ("" on success)
+//   - message: human-readable error message ("" on success)
+//   - conflict: populated when code == "conflict"; carries the blocking
+//     source_bead_id, workflow IDs, and cleanup hint the caller needs
+//     to render a rich 409 Problem Details body. Returning it out-of-band
+//     keeps Huma's structured error path available without widening the
+//     (*slingResponse, int, string, string) shape every non-conflict
+//     caller already consumes.
+func (s *Server) execSling(ctx context.Context, body slingBody, _ string) (*slingResponse, int, string, string, *sourceworkflow.ConflictError) {
 	cfg := s.state.Config()
-	agentCfg, ok := findAgent(cfg, body.Target)
-	if !ok {
-		writeError(w, http.StatusNotFound, "not_found", "target "+body.Target+" not found")
-		return
-	}
-
-	if body.Bead == "" && body.Formula == "" {
-		writeError(w, http.StatusBadRequest, "invalid", "bead or formula is required")
-		return
-	}
-	if body.Bead != "" && body.Formula != "" {
-		writeError(w, http.StatusBadRequest, "invalid", "bead and formula are mutually exclusive")
-		return
-	}
-	if body.Bead != "" && body.AttachedBeadID != "" {
-		writeError(w, http.StatusBadRequest, "invalid", "bead and attached_bead_id are mutually exclusive")
-		return
-	}
-
-	body.ScopeKind = strings.TrimSpace(body.ScopeKind)
-	body.ScopeRef = strings.TrimSpace(body.ScopeRef)
-	workflowLaunchOptions := body.AttachedBeadID != "" ||
-		len(body.Vars) > 0 ||
-		body.Title != "" ||
-		body.ScopeKind != "" ||
-		body.ScopeRef != ""
-	defaultFormulaLaunch := body.Formula == "" &&
-		body.AttachedBeadID == "" &&
-		body.Bead != "" &&
-		agentCfg.DefaultSlingFormula != "" &&
-		(len(body.Vars) > 0 || body.Title != "" || body.ScopeKind != "" || body.ScopeRef != "")
-	if body.Formula == "" && body.AttachedBeadID != "" {
-		writeError(w, http.StatusBadRequest, "invalid", "formula is required when attached_bead_id is provided")
-		return
-	}
-	if body.Formula == "" && workflowLaunchOptions && !defaultFormulaLaunch {
-		writeError(w, http.StatusBadRequest, "invalid", "formula or target default formula is required when vars, title, or scope are provided")
-		return
-	}
-	if (body.ScopeKind == "") != (body.ScopeRef == "") {
-		writeError(w, http.StatusBadRequest, "invalid", "scope_kind and scope_ref must be provided together")
-		return
-	}
-	if body.ScopeKind != "" && body.ScopeKind != "city" && body.ScopeKind != "rig" {
-		writeError(w, http.StatusBadRequest, "invalid", "scope_kind must be 'city' or 'rig'")
-		return
-	}
-
-	resp, status, code, message := s.execSling(r.Context(), body, agentCfg.DefaultSlingFormula)
-	if code != "" {
-		writeError(w, status, code, message)
-		return
-	}
-	writeJSON(w, status, resp)
-}
-
-// execSling builds gc sling CLI args from the request body and shells out.
-// Both plain-bead and workflow-backed launches use the same subprocess entry
-// point so the HTTP API stays aligned with `gc sling`.
-func (s *Server) execSling(
-	ctx context.Context,
-	body slingBody,
-	defaultFormula string,
-) (*slingResponse, int, string, string) {
-	args := []string{"--city", s.state.CityPath(), "sling", body.Target}
+	agentCfg, _ := findAgent(cfg, body.Target)
 
 	formulaName := strings.TrimSpace(body.Formula)
 	attachedBeadID := strings.TrimSpace(body.AttachedBeadID)
+	storeBeadID := slingStoreBeadID(body)
+
+	// Build deps and construct Sling instance.
+	store := s.findSlingStore(body.Rig, agentCfg, storeBeadID)
+	storeRef := s.slingStoreRef(body.Rig, agentCfg, storeBeadID)
+	if store == nil && allowsForceStoreFallback(body, agentCfg) {
+		store = s.findSlingStore(body.Rig, agentCfg, "")
+		storeRef = s.slingStoreRef(body.Rig, agentCfg, "")
+	}
+	if store == nil {
+		message := fmt.Sprintf("bead prefix store %s is not registered; cannot verify bead %q", storeRef, storeBeadID)
+		return nil, http.StatusBadRequest, "missing_bead", message, nil
+	}
+	deps := sling.SlingDeps{
+		CityName: s.state.CityName(),
+		CityPath: s.state.CityPath(),
+		Cfg:      s.state.Config(),
+		SP:       s.state.SessionProvider(),
+		Store:    store,
+		StoreRef: storeRef,
+		SourceWorkflowStores: func() ([]sling.SourceWorkflowStore, error) {
+			return s.sourceWorkflowStores(), nil
+		},
+		Runner:                          s.slingRunner(),
+		Router:                          apiBeadRouter{server: s, store: store},
+		Resolver:                        apiAgentResolver{},
+		Branches:                        apiBranchResolver{cityPath: s.state.CityPath()},
+		Notify:                          &apiNotifier{state: s.state},
+		ControlDispatcherRuntimeMissing: s.controlDispatcherRuntimeMissing,
+		Tracer: func(format string, args ...any) {
+			fmt.Fprintf(apiSlingStderr(), format+"\n", args...) //nolint:errcheck
+		},
+	}
+	sl, err := sling.New(deps)
+	if err != nil {
+		return nil, http.StatusInternalServerError, "internal", err.Error(), nil
+	}
+
+	// Build vars slice from map (sorted for determinism).
+	var varSlice []string
+	if len(body.Vars) > 0 {
+		keys := make([]string, 0, len(body.Vars))
+		for k := range body.Vars {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			varSlice = append(varSlice, k+"="+body.Vars[k])
+		}
+	}
+
+	formulaOpts := sling.FormulaOpts{
+		Title:     strings.TrimSpace(body.Title),
+		Vars:      varSlice,
+		ScopeKind: body.ScopeKind,
+		ScopeRef:  body.ScopeRef,
+		Force:     body.Force,
+	}
+
+	// Dispatch to the right intent-based method.
+	var result sling.SlingResult
 	mode := "direct"
 	workflowLaunch := false
 
@@ -125,117 +149,322 @@ func (s *Server) execSling(
 	case attachedBeadID != "":
 		mode = "attached"
 		workflowLaunch = true
-		args = append(args, attachedBeadID, "--on", formulaName)
+		result, err = sl.AttachFormula(ctx, formulaName, attachedBeadID, agentCfg, formulaOpts)
+
 	case formulaName != "":
 		mode = "standalone"
 		workflowLaunch = true
-		args = append(args, formulaName, "--formula")
+		result, err = sl.LaunchFormula(ctx, formulaName, agentCfg, formulaOpts)
+
 	case strings.TrimSpace(body.Bead) != "" &&
-		defaultFormula != "" &&
+		agentCfg.EffectiveDefaultSlingFormula() != "" &&
 		(len(body.Vars) > 0 || body.Title != "" || body.ScopeKind != "" || body.ScopeRef != ""):
 		mode = "attached"
 		workflowLaunch = true
 		attachedBeadID = strings.TrimSpace(body.Bead)
-		formulaName = strings.TrimSpace(defaultFormula)
-		args = append(args, attachedBeadID)
+		formulaName = agentCfg.EffectiveDefaultSlingFormula()
+		// Default formula: route the bead and let the domain apply the default.
+		result, err = sl.RouteBead(ctx, attachedBeadID, agentCfg, sling.RouteOpts{Force: body.Force})
+
 	default:
-		args = append(args, body.Bead)
+		result, err = sl.RouteBead(ctx, body.Bead, agentCfg, sling.RouteOpts{Force: body.Force})
 	}
 
-	if workflowLaunch {
-		if title := strings.TrimSpace(body.Title); title != "" {
-			args = append(args, "--title", title)
-		}
-		if scopeKind := strings.TrimSpace(body.ScopeKind); scopeKind != "" {
-			args = append(args, "--scope-kind", scopeKind)
-		}
-		if scopeRef := strings.TrimSpace(body.ScopeRef); scopeRef != "" {
-			args = append(args, "--scope-ref", scopeRef)
-		}
-		if len(body.Vars) > 0 {
-			keys := make([]string, 0, len(body.Vars))
-			for key := range body.Vars {
-				keys = append(keys, key)
-			}
-			sort.Strings(keys)
-			for _, key := range keys {
-				args = append(args, "--var", key+"="+body.Vars[key])
-			}
-		}
-	}
-
-	stdout, stderr, err := slingCommandRunner(ctx, s.state.CityPath(), args)
 	if err != nil {
-		message := strings.TrimSpace(stderr)
-		if message == "" {
-			message = strings.TrimSpace(stdout)
+		var conflictErr *sourceworkflow.ConflictError
+		if errors.As(err, &conflictErr) {
+			return nil, http.StatusConflict, "conflict", err.Error(), conflictErr
 		}
-		if message == "" {
-			message = err.Error()
+		var lookupErr *sling.BeadLookupError
+		if errors.As(err, &lookupErr) {
+			fmt.Fprintf(apiSlingStderr(), "gc api sling: %v\n", lookupErr) //nolint:errcheck
+			return nil, http.StatusInternalServerError, "internal", "sling bead lookup failed", nil
 		}
-		return nil, http.StatusBadRequest, "invalid", message
+		var missingBeadErr *sling.MissingBeadError
+		if errors.As(err, &missingBeadErr) {
+			return nil, http.StatusBadRequest, "missing_bead", err.Error(), nil
+		}
+		var crossRigErr *sling.CrossRigError
+		if errors.As(err, &crossRigErr) {
+			return nil, http.StatusBadRequest, "cross_rig", err.Error(), nil
+		}
+		var crossStoreErr *sling.CrossStoreRouteError
+		if errors.As(err, &crossStoreErr) {
+			return nil, http.StatusBadRequest, "cross_store", err.Error(), nil
+		}
+		return nil, http.StatusBadRequest, "invalid", err.Error(), nil
 	}
 
 	resp := &slingResponse{
-		Status: "slung",
-		Target: body.Target,
-		Bead:   body.Bead,
-		Mode:   mode,
+		Status:   "slung",
+		Target:   body.Target,
+		Bead:     body.Bead,
+		Mode:     mode,
+		Warnings: result.MetadataErrors,
 	}
 	if !workflowLaunch {
-		return resp, http.StatusOK, "", ""
+		return resp, http.StatusOK, "", "", nil
 	}
 
 	resp.Formula = formulaName
 	resp.AttachedBeadID = attachedBeadID
-	workflowID := parseWorkflowIDFromSlingOutput(stdout)
-	if workflowID == "" {
-		workflowID = parseWorkflowIDFromSlingOutput(stderr)
+	// Use structured result fields directly -- no stdout parsing needed.
+	resp.WorkflowID = result.WorkflowID
+	resp.RootBeadID = result.BeadID
+	if resp.WorkflowID == "" && resp.RootBeadID == "" {
+		return nil, http.StatusInternalServerError, "internal", "sling did not produce a workflow or bead id", nil
 	}
-	if workflowID == "" {
-		return nil, http.StatusInternalServerError, "internal", "gc sling did not report a workflow id"
-	}
-	resp.WorkflowID = workflowID
-	resp.RootBeadID = workflowID
-	return resp, http.StatusCreated, "", ""
+	return resp, http.StatusOK, "", "", nil
 }
 
-func runSlingCommand(ctx context.Context, cityPath string, args []string) (string, string, error) {
-	gcBin, err := os.Executable()
-	if err != nil {
-		return "", "", err
+func allowsForceStoreFallback(body slingBody, agentCfg config.Agent) bool {
+	if !body.Force || strings.TrimSpace(body.Bead) == "" {
+		return false
 	}
-
-	cmdCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(cmdCtx, gcBin, args...)
-	cmd.Dir = cityPath
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err = cmd.Run()
-	return stdout.String(), stderr.String(), err
+	if strings.TrimSpace(body.Formula) != "" || strings.TrimSpace(body.AttachedBeadID) != "" {
+		return false
+	}
+	return agentCfg.EffectiveDefaultSlingFormula() == ""
 }
 
-func parseWorkflowIDFromSlingOutput(output string) string {
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		for _, prefix := range []string{"Started workflow ", "Attached workflow "} {
-			if rest, ok := strings.CutPrefix(line, prefix); ok {
-				workflowID, _, _ := strings.Cut(rest, " ")
-				return strings.TrimSpace(workflowID)
-			}
+func slingStoreBeadID(body slingBody) string {
+	// Formula attachment validates the attached bead, not the formula name.
+	if attachedBeadID := strings.TrimSpace(body.AttachedBeadID); attachedBeadID != "" {
+		return attachedBeadID
+	}
+	return strings.TrimSpace(body.Bead)
+}
+
+// sourceWorkflowCleanupHint renders the CLI command that clears the blocking
+// source workflow. Surfaced in the conflict response body so users can fix
+// the state without grepping docs.
+func sourceWorkflowCleanupHint(sourceBeadID, storeRef string) string {
+	args := []string{"gc workflow delete-source", sourceBeadID}
+	if storeRef = strings.TrimSpace(storeRef); storeRef != "" {
+		args = append(args, "--store-ref", storeRef)
+	}
+	args = append(args, "--apply")
+	return strings.Join(args, " ")
+}
+
+// findSlingStore returns the bead store for sling operations.
+func (s *Server) findSlingStore(rig string, agentCfg config.Agent, beadID string) beads.Store {
+	// Match the CLI's bead-prefix-first resolution so existence checks consult
+	// the bead's home store before any cross-rig guard runs.
+	if resolvedRig, cityScope := s.slingStoreScopeForBead(beadID); cityScope {
+		return s.state.CityBeadStore()
+	} else if resolvedRig != "" {
+		return s.state.BeadStore(resolvedRig)
+	}
+	if rig != "" {
+		if store := s.state.BeadStore(rig); store != nil {
+			return store
 		}
-		if rest, ok := strings.CutPrefix(line, "Slung formula "); ok {
-			if _, afterRoot, found := strings.Cut(rest, "(wisp root "); found {
-				workflowID, _, _ := strings.Cut(afterRoot, ")")
-				return strings.TrimSpace(workflowID)
-			}
+	}
+	if agentCfg.Dir != "" {
+		if store := s.state.BeadStore(agentCfg.Dir); store != nil {
+			return store
 		}
+	}
+	return s.state.CityBeadStore()
+}
+
+// slingStoreRef returns a store ref string for the sling context.
+func (s *Server) slingStoreRef(rig string, agentCfg config.Agent, beadID string) string {
+	if resolvedRig, cityScope := s.slingStoreScopeForBead(beadID); cityScope {
+		return "city:" + s.state.CityName()
+	} else if resolvedRig != "" {
+		return "rig:" + resolvedRig
+	}
+	if rig != "" {
+		return "rig:" + rig
+	}
+	if agentCfg.Dir != "" {
+		return "rig:" + agentCfg.Dir
+	}
+	return "city:" + s.state.CityName()
+}
+
+func (s *Server) slingStoreScopeForBead(beadID string) (rigName string, cityScope bool) {
+	beadID = strings.TrimSpace(beadID)
+	if beadID == "" {
+		return "", false
+	}
+	cfg := s.state.Config()
+	prefix := sling.BeadPrefixForCity(cfg, beadID)
+	if prefix == "" {
+		return "", false
+	}
+	if sling.IsHQPrefix(cfg, prefix) {
+		return "", true
+	}
+	rig, ok := sling.FindRigByPrefix(cfg, prefix)
+	if !ok {
+		return "", false
+	}
+	return rig.Name, false
+}
+
+func (s *Server) sourceWorkflowStores() []sling.SourceWorkflowStore {
+	stores := make([]sling.SourceWorkflowStore, 0, len(s.state.BeadStores())+1)
+	if cityStore := s.state.CityBeadStore(); cityStore != nil {
+		stores = append(stores, sling.SourceWorkflowStore{
+			Store:    cityStore,
+			StoreRef: "city:" + s.state.CityName(),
+		})
+	}
+	for rigName, store := range s.state.BeadStores() {
+		if store == nil {
+			continue
+		}
+		stores = append(stores, sling.SourceWorkflowStore{
+			Store:    store,
+			StoreRef: "rig:" + rigName,
+		})
+	}
+	return stores
+}
+
+// slingRunner returns the SlingRunner for the API context.
+// Uses SlingRunnerFunc if set (for tests), otherwise a real shell runner.
+func (s *Server) slingRunner() sling.SlingRunner {
+	if s.SlingRunnerFunc != nil {
+		return s.SlingRunnerFunc
+	}
+	return func(dir, command string, env map[string]string) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "sh", "-c", command)
+		if dir != "" {
+			cmd.Dir = dir
+		}
+		cmd.Env = mergeEnvForSling(env)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return string(out), fmt.Errorf("running %q: %w", command, err)
+		}
+		return string(out), nil
+	}
+}
+
+// mergeEnvForSling merges extra env vars into the current process env.
+func mergeEnvForSling(extra map[string]string) []string {
+	return execenv.MergeMap(os.Environ(), extra)
+}
+
+// apiAgentResolver implements sling.AgentResolver for the API context.
+// Mirrors the CLI's rig-context behavior for bare agent names while still
+// delegating qualified and city-scoped lookups to findAgent.
+type apiAgentResolver struct{}
+
+func (apiAgentResolver) ResolveAgent(cfg *config.City, name, rigContext string) (config.Agent, bool) {
+	if rigContext != "" && !strings.Contains(name, "/") {
+		if a, ok := findAgent(cfg, rigContext+"/"+name); ok {
+			return a, true
+		}
+	}
+	return findAgent(cfg, name)
+}
+
+// qualifySlingTarget prepends a rig directory to a bare target when the
+// caller supplied a rig context and the qualified form resolves.
+func qualifySlingTarget(cfg *config.City, target, rigContext string) string {
+	if rigContext == "" || strings.Contains(target, "/") {
+		return target
+	}
+	qualified := rigContext + "/" + target
+	if _, ok := findAgent(cfg, qualified); ok {
+		return qualified
+	}
+	return target
+}
+
+// slingRigContext derives the effective rig context for target qualification.
+// scope_ref wins for explicit rig scope; otherwise body.Rig is used for legacy
+// dashboard dispatches that pass --rig without scope metadata.
+func slingRigContext(body slingBody) string {
+	if body.ScopeKind == "rig" && body.ScopeRef != "" {
+		return body.ScopeRef
+	}
+	if body.ScopeKind == "" && body.Rig != "" {
+		return body.Rig
 	}
 	return ""
+}
+
+// apiBranchResolver implements sling.BranchResolver for the API context.
+// Uses the same git resolution as the CLI.
+type apiBranchResolver struct {
+	cityPath string
+}
+
+func (r apiBranchResolver) DefaultBranch(dir string) string {
+	if dir == "" {
+		dir = r.cityPath
+	}
+	// Best-effort: read git's origin/HEAD ref for the default branch.
+	// Falls back to empty string if git is unavailable.
+	cmd := exec.CommandContext(context.Background(), "git", "-C", dir,
+		"symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+	// Sanitize the environment so a leaked GIT_DIR from a parent repo or hook
+	// cannot redirect resolution to the wrong repository's default branch.
+	cmd.Env = gitpkg.SanitizedEnv()
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(out)), "origin/"))
+}
+
+// apiNotifier implements sling.Notifier for the API context.
+type apiNotifier struct {
+	state State
+}
+
+func (n *apiNotifier) PokeController(_ string) {
+	n.state.Poke()
+}
+
+func (n *apiNotifier) PokeControlDispatch(_ string) {
+	n.state.Poke()
+}
+
+type apiBeadRouter struct {
+	server *Server
+	store  beads.Store
+}
+
+func (r apiBeadRouter) Route(_ context.Context, req sling.RouteRequest) error {
+	if r.server == nil {
+		return fmt.Errorf("sling router: missing server")
+	}
+	cfg := r.server.state.Config()
+	if cfg != nil {
+		if agentCfg, ok := findAgentByQualifiedTemplate(cfg, req.Target); ok && sling.IsCustomSlingQuery(agentCfg) {
+			runner := r.server.slingRunner()
+			if runner == nil {
+				return fmt.Errorf("custom sling_query requires a runner")
+			}
+			slingCmd, slingWarn := sling.BuildSlingCommandForAgent("sling_query", agentCfg.EffectiveSlingQuery(), req.BeadID, r.server.state.CityPath(), r.server.state.CityName(), agentCfg, cfg.Rigs)
+			if slingWarn != "" {
+				fmt.Fprintf(apiSlingStderr(), "gc api sling: %s\n", slingWarn) //nolint:errcheck
+			}
+			_, err := runner(req.WorkDir, slingCmd, req.Env)
+			return err
+		}
+	}
+	if r.store == nil {
+		return fmt.Errorf("built-in sling routing requires a store")
+	}
+	routedTo := req.Target
+	if cfg != nil {
+		routedTo = agentutil.NormalizePoolRouteTarget(cfg, req.Target)
+	}
+	if err := r.store.SetMetadata(req.BeadID, beadmeta.RoutedToMetadataKey, routedTo); err != nil {
+		if req.Force && errors.Is(err, beads.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("setting gc.routed_to on %s: %w", req.BeadID, err)
+	}
+	return nil
 }

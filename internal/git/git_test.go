@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/testutil"
 )
 
 // initTestRepo creates a git repo with one commit in a temp directory.
@@ -35,6 +37,84 @@ func runGit(t *testing.T, dir string, args ...string) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s: %s: %v", strings.Join(args, " "), out, err)
+	}
+}
+
+func TestSanitizeGitEnvStripsGitLocatingVariables(t *testing.T) {
+	in := []string{
+		"PATH=/usr/bin",
+		"GIT_DIR=/poison/.git",
+		"GIT_WORK_TREE=/poison",
+		"GIT_INDEX_FILE=/poison/.git/index",
+		"GIT_OBJECT_DIRECTORY=/poison/.git/objects",
+		"HOME=/home/user",
+		"GIT_AUTHOR_NAME=keep-me",
+	}
+	got := sanitizeGitEnv(in)
+	for _, e := range got {
+		if k, _, _ := strings.Cut(e, "="); gitEnvBlacklist[k] {
+			t.Errorf("sanitizeGitEnv kept blacklisted var %q", k)
+		}
+	}
+	want := map[string]bool{"PATH": true, "HOME": true, "GIT_AUTHOR_NAME": true}
+	if len(got) != len(want) {
+		t.Fatalf("sanitizeGitEnv returned %d vars %v, want %d", len(got), got, len(want))
+	}
+	for _, e := range got {
+		k, _, _ := strings.Cut(e, "=")
+		if !want[k] {
+			t.Errorf("sanitizeGitEnv dropped expected var %q", k)
+		}
+	}
+}
+
+func TestSanitizedEnvStripsPoisonedProcessEnv(t *testing.T) {
+	t.Setenv("GIT_DIR", "/poison/.git")
+	t.Setenv("GIT_WORK_TREE", "/poison")
+	t.Setenv("GIT_INDEX_FILE", "/poison/.git/index")
+	for _, e := range SanitizedEnv() {
+		switch k, _, _ := strings.Cut(e, "="); k {
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE":
+			t.Errorf("SanitizedEnv leaked git-locating var %q", k)
+		}
+	}
+}
+
+func TestHermeticEnvStripsDiscoveryAndConfigVarsAndPinsHermeticConfig(t *testing.T) {
+	// SanitizedEnv-covered locating vars plus HermeticEnv-only discovery and
+	// config-location vars must all be removed; the hermetic config pins must be
+	// appended.
+	t.Setenv("GIT_DIR", "/poison/.git")
+	t.Setenv("GIT_CEILING_DIRECTORIES", "/poison")
+	t.Setenv("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1")
+	t.Setenv("GIT_NAMESPACE", "poison")
+	t.Setenv("GIT_CONFIG_SYSTEM", "/poison/system")
+	t.Setenv("GIT_EXEC_PATH", "/poison/exec")
+	t.Setenv("GIT_PAGER", "poison-pager")
+	t.Setenv("PATH", "/usr/bin")
+
+	got := HermeticEnv()
+	stripped := map[string]bool{
+		"GIT_DIR": true, "GIT_CEILING_DIRECTORIES": true,
+		"GIT_DISCOVERY_ACROSS_FILESYSTEM": true, "GIT_NAMESPACE": true,
+		"GIT_CONFIG_SYSTEM": true, "GIT_EXEC_PATH": true, "GIT_PAGER": true,
+	}
+	seen := map[string]string{}
+	for _, e := range got {
+		k, v, _ := strings.Cut(e, "=")
+		if stripped[k] {
+			t.Errorf("HermeticEnv leaked %q", k)
+		}
+		seen[k] = v
+	}
+	if seen["GIT_CONFIG_NOSYSTEM"] != "1" {
+		t.Errorf("HermeticEnv GIT_CONFIG_NOSYSTEM = %q, want 1", seen["GIT_CONFIG_NOSYSTEM"])
+	}
+	if seen["GIT_CONFIG_GLOBAL"] != "/dev/null" {
+		t.Errorf("HermeticEnv GIT_CONFIG_GLOBAL = %q, want /dev/null", seen["GIT_CONFIG_GLOBAL"])
+	}
+	if _, ok := seen["PATH"]; !ok {
+		t.Error("HermeticEnv dropped non-git var PATH")
 	}
 }
 
@@ -75,6 +155,165 @@ func TestDefaultBranch_NoRemote(t *testing.T) {
 	}
 	if branch != "main" {
 		t.Errorf("DefaultBranch() = %q, want %q (fallback)", branch, "main")
+	}
+}
+
+// TestDefaultBranch_FromOriginHEAD exercises the symref parsing path and
+// verifies that branch names containing slashes round-trip correctly.
+// Regression test for the bug where strings.LastIndex(ref, "/") truncated
+// "refs/remotes/origin/user/feature" to "feature".
+func TestDefaultBranch_FromOriginHEAD(t *testing.T) {
+	tests := []struct {
+		name   string
+		branch string
+	}{
+		{"plain branch", "main"},
+		{"single slash", "boylec/develop"},
+		{"nested slashes", "team/feature/x"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Set up a bare remote and a clone that tracks it, so
+			// refs/remotes/origin/HEAD can be wired to the target ref.
+			bare := t.TempDir()
+			runGit(t, bare, "init", "--bare")
+
+			clone := t.TempDir()
+			runGit(t, clone, "clone", bare, ".")
+			runGit(t, clone, "config", "user.email", "test@test.com")
+			runGit(t, clone, "config", "user.name", "Test")
+			runGit(t, clone, "commit", "--allow-empty", "-m", "init")
+
+			// Create the target ref under refs/remotes/origin/ and point
+			// origin/HEAD at it. symbolic-ref is permissive about its
+			// target so we don't need to push the branch first.
+			target := "refs/remotes/origin/" + tt.branch
+			runGit(t, clone, "update-ref", target, "HEAD")
+			runGit(t, clone, "symbolic-ref", "refs/remotes/origin/HEAD", target)
+
+			g := New(clone)
+			got, err := g.DefaultBranch()
+			if err != nil {
+				t.Fatalf("DefaultBranch: %v", err)
+			}
+			if got != tt.branch {
+				t.Errorf("DefaultBranch() = %q, want %q", got, tt.branch)
+			}
+		})
+	}
+}
+
+// TestDefaultBranch_OriginHEADUnsetWithMasterRef covers the master-default
+// rig case from gc-8cowk: a clone where refs/remotes/origin/HEAD is not set
+// but refs/remotes/origin/master exists. The hardcoded "main" fallback
+// strands polecats on master-default rigs (added before PR#1554) with
+// metadata.target=main, causing refinery rejection loops.
+func TestDefaultBranch_OriginHEADUnsetWithMasterRef(t *testing.T) {
+	tests := []struct {
+		name        string
+		remoteRefs  []string
+		wantBranch  string
+		description string
+	}{
+		{
+			name:        "origin/master only",
+			remoteRefs:  []string{"master"},
+			wantBranch:  "master",
+			description: "master-default rig: must detect master without origin/HEAD",
+		},
+		{
+			name:        "origin/main only",
+			remoteRefs:  []string{"main"},
+			wantBranch:  "main",
+			description: "main-default rig with unset origin/HEAD must still detect main",
+		},
+		{
+			name:        "both main and master",
+			remoteRefs:  []string{"main", "master"},
+			wantBranch:  "main",
+			description: "when ambiguous, prefer main (matches the hardcoded historical default)",
+		},
+		{
+			name:        "neither candidate exists",
+			remoteRefs:  []string{"develop"},
+			wantBranch:  "main",
+			description: "last-resort fallback remains main when no known candidate is on origin",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bare := t.TempDir()
+			runGit(t, bare, "init", "--bare")
+
+			clone := t.TempDir()
+			runGit(t, clone, "clone", bare, ".")
+			runGit(t, clone, "config", "user.email", "test@test.com")
+			runGit(t, clone, "config", "user.name", "Test")
+			runGit(t, clone, "commit", "--allow-empty", "-m", "init")
+
+			// Populate refs/remotes/origin/<name> for each requested ref
+			// but DO NOT wire refs/remotes/origin/HEAD. This mirrors the
+			// state of rig clones added before gc rig add auto-detected
+			// the default branch.
+			for _, ref := range tt.remoteRefs {
+				runGit(t, clone, "update-ref", "refs/remotes/origin/"+ref, "HEAD")
+			}
+			// Defensive: ensure no origin/HEAD symref lingers from clone.
+			_ = exec.Command("git", "-C", clone, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD").Run()
+
+			g := New(clone)
+			got, err := g.DefaultBranch()
+			if err != nil {
+				t.Fatalf("DefaultBranch: %v", err)
+			}
+			if got != tt.wantBranch {
+				t.Errorf("%s: DefaultBranch() = %q, want %q",
+					tt.description, got, tt.wantBranch)
+			}
+		})
+	}
+}
+
+func TestProbeDefaultBranch_FromOriginHEAD(t *testing.T) {
+	bare := t.TempDir()
+	runGit(t, bare, "init", "--bare")
+
+	clone := t.TempDir()
+	runGit(t, clone, "clone", bare, ".")
+	runGit(t, clone, "config", "user.email", "test@test.com")
+	runGit(t, clone, "config", "user.name", "Test")
+	runGit(t, clone, "commit", "--allow-empty", "-m", "init")
+
+	target := "refs/remotes/origin/master"
+	runGit(t, clone, "update-ref", target, "HEAD")
+	runGit(t, clone, "symbolic-ref", "refs/remotes/origin/HEAD", target)
+
+	g := New(clone)
+	got := g.ProbeDefaultBranch()
+	if got != "master" {
+		t.Errorf("ProbeDefaultBranch() = %q, want %q", got, "master")
+	}
+}
+
+func TestProbeDefaultBranch_FallsBackToCurrentBranch(t *testing.T) {
+	repo := initTestRepo(t)
+	// Force a known branch name; the test repo's default may be "main"
+	// or "master" depending on the host's git init.defaultBranch.
+	runGit(t, repo, "checkout", "-b", "develop")
+	g := New(repo)
+	got := g.ProbeDefaultBranch()
+	if got != "develop" {
+		t.Errorf("ProbeDefaultBranch() = %q, want %q (current branch fallback)", got, "develop")
+	}
+}
+
+func TestProbeDefaultBranch_NoRepo(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(dir))
+	g := New(dir)
+	got := g.ProbeDefaultBranch()
+	if got != "" {
+		t.Errorf("ProbeDefaultBranch() = %q, want empty (no repo)", got)
 	}
 }
 
@@ -133,7 +372,7 @@ func TestWorktreeList(t *testing.T) {
 	// Find our worktree.
 	var found bool
 	for _, wt := range worktrees {
-		if wt.Path == wtPath {
+		if testutil.CanonicalPath(wt.Path) == testutil.CanonicalPath(wtPath) {
 			found = true
 			if wt.Branch != "listed" {
 				t.Errorf("worktree branch = %q, want %q", wt.Branch, "listed")
@@ -142,6 +381,75 @@ func TestWorktreeList(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("worktree at %q not found in list", wtPath)
+	}
+}
+
+// TestWorktreeList_NestedSiblings verifies the algorithmic assumption used
+// by NestedWorktreePruneCheck: when worktree B is created at a path that
+// lies inside worktree A's working tree, git treats them as siblings in
+// the same admin dir. WorktreeList() from any of A, B, or the main repo
+// returns all three entries with each entry's true on-disk path.
+//
+// This is the foundation for "find nested worktrees" — we walk per-agent
+// homes, list siblings, and filter by path containment to identify nested
+// entries.
+func TestWorktreeList_NestedSiblings(t *testing.T) {
+	repo := initTestRepo(t)
+
+	// Outer worktree (the "agent home").
+	home := filepath.Join(t.TempDir(), "home")
+	runGit(t, repo, "worktree", "add", "-b", "home-branch", home)
+
+	// Nested worktree, path lies inside `home`. Equivalent to the polecat
+	// "$(pwd)/worktrees/<issue>" pattern from mol-polecat-work.toml.
+	nested := filepath.Join(home, "worktrees", "task-x")
+	runGit(t, home, "worktree", "add", "-b", "task-x-branch", nested)
+
+	// Listing from the home worktree returns all three siblings.
+	gHome := New(home)
+	wts, err := gHome.WorktreeList()
+	if err != nil {
+		t.Fatalf("WorktreeList from home: %v", err)
+	}
+	gotPaths := make(map[string]string)
+	for _, wt := range wts {
+		gotPaths[testutil.CanonicalPath(wt.Path)] = wt.Branch
+	}
+
+	wantHome := testutil.CanonicalPath(home)
+	wantNested := testutil.CanonicalPath(nested)
+	wantRepo := testutil.CanonicalPath(repo)
+
+	if _, ok := gotPaths[wantHome]; !ok {
+		t.Errorf("home worktree %q missing from list; got %v", wantHome, gotPaths)
+	}
+	if br := gotPaths[wantNested]; br != "task-x-branch" {
+		t.Errorf("nested worktree branch = %q (path %q), want task-x-branch; full list: %v",
+			br, wantNested, gotPaths)
+	}
+	if _, ok := gotPaths[wantRepo]; !ok {
+		t.Errorf("main repo %q missing from list; got %v", wantRepo, gotPaths)
+	}
+
+	// Listing from inside the nested worktree must produce the same set.
+	gNested := New(nested)
+	wts2, err := gNested.WorktreeList()
+	if err != nil {
+		t.Fatalf("WorktreeList from nested: %v", err)
+	}
+	if len(wts2) != len(wts) {
+		t.Errorf("WorktreeList from nested returned %d entries; from home returned %d (must match)",
+			len(wts2), len(wts))
+	}
+
+	// Path containment is the discriminator the doctor check uses to
+	// classify "nested" vs "agent home" vs "main repo". Verify it works
+	// on canonical paths.
+	if !strings.HasPrefix(wantNested+string(filepath.Separator), wantHome+string(filepath.Separator)) {
+		t.Errorf("nested path %q is not a strict subpath of home %q", wantNested, wantHome)
+	}
+	if strings.HasPrefix(wantHome+string(filepath.Separator), wantNested+string(filepath.Separator)) {
+		t.Errorf("home %q must not be classified as inside nested %q", wantHome, wantNested)
 	}
 }
 
@@ -216,6 +524,18 @@ func TestHasUnpushedCommits_NoRemote(t *testing.T) {
 	}
 }
 
+func TestHasUnpushedCommitsResult_ReturnsProbeError(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(dir))
+	g := New(dir)
+	if _, err := g.HasUnpushedCommitsResult(); err == nil {
+		t.Fatal("HasUnpushedCommitsResult() error = nil, want probe error")
+	}
+	if !g.HasUnpushedCommits() {
+		t.Error("HasUnpushedCommits() should fail closed on probe errors")
+	}
+}
+
 func TestHasStashes_NoneWhenClean(t *testing.T) {
 	repo := initTestRepo(t)
 	g := New(repo)
@@ -236,6 +556,18 @@ func TestHasStashes_DetectsStash(t *testing.T) {
 	g := New(repo)
 	if !g.HasStashes() {
 		t.Error("HasStashes() = false for repo with stash, want true")
+	}
+}
+
+func TestHasStashesResult_ReturnsProbeError(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(dir))
+	g := New(dir)
+	if _, err := g.HasStashesResult(); err == nil {
+		t.Fatal("HasStashesResult() error = nil, want probe error")
+	}
+	if !g.HasStashes() {
+		t.Error("HasStashes() should fail closed on probe errors")
 	}
 }
 
@@ -410,5 +742,41 @@ func TestParseWorktreeList_Empty(t *testing.T) {
 	wts := parseWorktreeList("")
 	if len(wts) != 0 {
 		t.Errorf("len(worktrees) = %d, want 0", len(wts))
+	}
+}
+
+// TestUntrustedRemoteGitConfigArgs pins the hardening applied to git invocations
+// whose remote URL is attacker-influenced (the pack-import add path). Redirect
+// following must be disabled and the transport allowlist constrained, so a
+// fenced public host cannot 30x to an internal target and a crafted URL cannot
+// escalate to a dangerous transport such as ext::.
+func TestUntrustedRemoteGitConfigArgs(t *testing.T) {
+	args := UntrustedRemoteGitConfigArgs()
+
+	// Every override is passed as a leading "-c key=value" pair.
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-c http.followRedirects=false",
+		"-c protocol.allow=never",
+		"-c protocol.https.allow=always",
+		"-c protocol.http.allow=always",
+		"-c protocol.ssh.allow=always",
+		"-c protocol.git.allow=always",
+		"-c protocol.file.allow=always",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("UntrustedRemoteGitConfigArgs missing %q; got %v", want, args)
+		}
+	}
+
+	// The args must be well-formed -c pairs so they can be prepended before a git
+	// subcommand.
+	if len(args)%2 != 0 {
+		t.Fatalf("expected an even number of args (-c pairs), got %d: %v", len(args), args)
+	}
+	for i := 0; i < len(args); i += 2 {
+		if args[i] != "-c" {
+			t.Fatalf("arg %d = %q, want -c; full: %v", i, args[i], args)
+		}
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -16,6 +17,7 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessions "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/telemetry"
+	"github.com/gastownhall/gascity/internal/worker"
 )
 
 // errTokenMismatch indicates the running session's instance token
@@ -28,7 +30,7 @@ var errTokenMismatch = errors.New("instance token mismatch")
 // Returns the new generation and instance token on success.
 func preWakeCommit(
 	session *beads.Bead,
-	store beads.Store,
+	sessFront *sessions.InfoStore,
 	clk clock.Clock,
 ) (newGen int, token string, err error) {
 	name := session.Metadata["session_name"]
@@ -54,21 +56,19 @@ func preWakeCommit(
 		sleepReason = "idle-timeout"
 	}
 
-	// Use one batched metadata update to avoid paying multiple bd update
-	// round-trips before every wake.
-	batch := map[string]string{
-		"instance_token":             token,
-		"continuation_epoch":         strconv.Itoa(continuationEpoch),
-		"continuation_reset_pending": "",
-		"detached_at":                "",
-		"last_woke_at":               clk.Now().UTC().Format(time.RFC3339),
-		"sleep_reason":               sleepReason,
-		"sleep_intent":               "",
-		"generation":                 strconv.Itoa(newGen),
-	}
-	if writeErr := store.SetMetadataBatch(session.ID, batch); writeErr != nil {
+	freshWake := session.Metadata["wake_mode"] == "fresh" || pendingContinuationResetNeedsFreshStart(session.Metadata)
+	batch := sessions.PreWakePatch(sessions.PreWakePatchInput{
+		Generation:        newGen,
+		InstanceToken:     token,
+		ContinuationEpoch: continuationEpoch,
+		Now:               clk.Now(),
+		SleepReason:       sleepReason,
+		FreshWake:         freshWake,
+	})
+	if writeErr := sessFront.ApplyPatch(session.ID, batch); writeErr != nil {
 		return 0, "", fmt.Errorf("pre-wake metadata commit: %w", writeErr)
 	}
+	traceFreshWakeMetadataReset(name, session.Metadata, batch, freshWake)
 	if session.Metadata == nil {
 		session.Metadata = make(map[string]string, len(batch))
 	}
@@ -79,6 +79,27 @@ func preWakeCommit(
 	return newGen, token, nil
 }
 
+func traceFreshWakeMetadataReset(name string, before map[string]string, batch sessions.MetadataPatch, freshWake bool) {
+	if !freshWake || os.Getenv("GC_TMUX_TRACE") != "1" {
+		return
+	}
+	cleared := make([]string, 0, len(sessions.FreshWakeConversationResetKeys()))
+	for _, key := range sessions.FreshWakeConversationResetKeys() {
+		if strings.TrimSpace(before[key]) == "" || batch[key] != "" {
+			continue
+		}
+		cleared = append(cleared, key)
+	}
+	if len(cleared) == 0 {
+		return
+	}
+	log.Printf(
+		"[WAKE-TRACE] preWakeCommit session=%s wake_mode=fresh cleared_provider_metadata=%s",
+		name,
+		strings.Join(cleared, ","),
+	)
+}
+
 func shouldBumpContinuationEpoch(meta map[string]string) bool {
 	if meta == nil {
 		return false
@@ -87,6 +108,18 @@ func shouldBumpContinuationEpoch(meta map[string]string) bool {
 		return true
 	}
 	return meta["wake_mode"] == "fresh" && meta["last_woke_at"] != ""
+}
+
+func pendingContinuationResetNeedsFreshStart(meta map[string]string) bool {
+	if meta == nil {
+		return false
+	}
+	switch sessions.State(strings.TrimSpace(meta["state"])) {
+	case sessions.StateStartPending, sessions.StateCreating:
+		return false
+	}
+	return strings.TrimSpace(meta["continuation_reset_pending"]) != "" &&
+		strings.TrimSpace(meta["started_config_hash"]) != ""
 }
 
 // validateWorkDir ensures the path is safe to use as a working directory.
@@ -111,6 +144,12 @@ func validateWorkDir(dir string) error {
 // beginSessionDrain initiates an async drain. Returns immediately.
 // The drainTracker stores in-memory state; advanceSessionDrains progresses it.
 //
+// Returns true when this call enqueued a new drain (a state transition) and
+// false when a drain was already enqueued for this session (no-op). Callers
+// that emit user-visible log lines or convergence events tied to the drain
+// MUST gate on the return value — otherwise those emissions fire every
+// reconciler tick for the life of a stuck drain.
+//
 // The interrupt signal (Ctrl-C) is NOT sent immediately. It is deferred to
 // the next reconciler tick via advanceSessionDrains. This gives the drain
 // one full tick to be canceled (e.g., if the session was falsely orphaned
@@ -123,9 +162,13 @@ func beginSessionDrain(
 	reason string,
 	clk clock.Clock,
 	timeout time.Duration,
-) {
+) bool {
+	name := session.Metadata["session_name"]
 	if dt.get(session.ID) != nil {
-		return // already draining
+		if os.Getenv("GC_TMUX_TRACE") == "1" {
+			log.Printf("[DRAIN-TRACE] beginSessionDrain session=%s reason=%s noop=already-draining", name, reason)
+		}
+		return false
 	}
 	gen, _ := strconv.Atoi(session.Metadata["generation"])
 
@@ -136,19 +179,105 @@ func beginSessionDrain(
 		generation: gen,
 	})
 
-	name := session.Metadata["session_name"]
 	if os.Getenv("GC_TMUX_TRACE") == "1" {
 		log.Printf("[DRAIN-TRACE] beginSessionDrain session=%s reason=%s", name, reason)
 	}
 	telemetry.RecordDrainTransition(context.Background(), name, reason, "begin")
+	return true
 }
 
-// cancelSessionDrain removes a drain if wake reasons reappeared for the same generation.
-// If GC_DRAIN_ACK was already set by the reconciler (deferred drain signal),
-// it is cleared so the Phase 1 drain-ack check doesn't kill the session.
+func drainReasonCancelable(reason string) bool {
+	return reason != "config-drift" && reason != "orphaned" && reason != "suspended"
+}
+
+func pendingDrainReasonCancelable(reason string) bool {
+	return reason != "orphaned" && reason != "suspended"
+}
+
+const (
+	reconcilerDrainAckSourceKey     = "GC_DRAIN_ACK_SOURCE"
+	reconcilerDrainAckSourceValue   = "reconciler"
+	drainAckSourceAgentValue        = "agent"
+	reconcilerDrainAckReasonKey     = "GC_DRAIN_REASON"
+	reconcilerDrainAckGenerationKey = "GC_DRAIN_GENERATION"
+)
+
+func setReconcilerDrainAckMetadata(sp runtime.Provider, name string, ds *drainState) error {
+	if ds == nil {
+		return nil
+	}
+	if err := sp.SetMeta(name, reconcilerDrainAckSourceKey, reconcilerDrainAckSourceValue); err != nil {
+		return err
+	}
+	if err := sp.SetMeta(name, reconcilerDrainAckReasonKey, ds.reason); err != nil {
+		_ = clearReconcilerDrainAckMetadata(sp, name)
+		return err
+	}
+	if err := sp.SetMeta(name, reconcilerDrainAckGenerationKey, strconv.Itoa(ds.generation)); err != nil {
+		_ = clearReconcilerDrainAckMetadata(sp, name)
+		return err
+	}
+	if err := sp.SetMeta(name, "GC_DRAIN_ACK", "1"); err != nil {
+		_ = clearReconcilerDrainAckMetadata(sp, name)
+		return err
+	}
+	return nil
+}
+
+func clearReconcilerDrainAckMetadata(sp runtime.Provider, name string) error {
+	if sp == nil {
+		return fmt.Errorf("session provider is nil")
+	}
+	var errs []error
+	for _, key := range []string{"GC_DRAIN_ACK", reconcilerDrainAckSourceKey, reconcilerDrainAckReasonKey, reconcilerDrainAckGenerationKey} {
+		if err := sp.RemoveMeta(name, key); err != nil {
+			log.Printf("session wake: clearing reconciler drain ack metadata %s for %s: %v", key, name, err)
+			errs = append(errs, fmt.Errorf("removing %s: %w", key, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// cancelSessionDrain removes a cancelable drain if wake reasons reappeared for
+// the same generation. If GC_DRAIN_ACK was already set by the reconciler
+// (deferred drain signal), it is cleared so the Phase 1 drain-ack check doesn't
+// kill the session.
 func cancelSessionDrain(session beads.Bead, sp runtime.Provider, dt *drainTracker) bool {
+	return cancelSessionDrainIf(session, sp, dt, drainReasonCancelable)
+}
+
+func cancelSessionDrainForPending(session beads.Bead, sp runtime.Provider, dt *drainTracker) bool {
+	return cancelSessionDrainIf(session, sp, dt, pendingDrainReasonCancelable)
+}
+
+func assignedWorkDrainReasonCancelable(reason string) bool {
+	switch reason {
+	case "orphaned", "no-wake-reason":
+		return true
+	default:
+		return false
+	}
+}
+
+func cancelSessionDrainForAssignedWork(session beads.Bead, sp runtime.Provider, dt *drainTracker) bool {
+	return cancelSessionDrainIf(session, sp, dt, assignedWorkDrainReasonCancelable)
+}
+
+func cancelSessionConfigDriftDrain(session beads.Bead, sp runtime.Provider, dt *drainTracker) bool {
+	if dt == nil {
+		return false
+	}
+	return cancelSessionDrainIf(session, sp, dt, func(reason string) bool {
+		return reason == "config-drift"
+	})
+}
+
+func cancelSessionDrainIf(session beads.Bead, sp runtime.Provider, dt *drainTracker, canCancel func(string) bool) bool {
 	ds := dt.get(session.ID)
 	if ds == nil {
+		return false
+	}
+	if !canCancel(ds.reason) {
 		return false
 	}
 	gen, _ := strconv.Atoi(session.Metadata["generation"])
@@ -159,13 +288,102 @@ func cancelSessionDrain(session beads.Bead, sp runtime.Provider, dt *drainTracke
 		// Clear GC_DRAIN_ACK if it was set — prevents stale ack from
 		// killing the session on the next Phase 1 drain-ack check.
 		if ds.ackSet {
-			_ = sp.RemoveMeta(name, "GC_DRAIN_ACK")
-			_ = sp.RemoveMeta(name, "GC_DRAIN")
+			_ = clearReconcilerDrainAckMetadata(sp, name)
 		}
 		telemetry.RecordDrainTransition(context.Background(), name, ds.reason, "cancel")
 		return true
 	}
 	return false
+}
+
+func cancelReconcilerAckedDrain(session beads.Bead, sp runtime.Provider, dt *drainTracker) bool {
+	if dt == nil {
+		return false
+	}
+	name := strings.TrimSpace(session.Metadata["session_name"])
+	reason, ok := reconcilerDrainAckMatchesSession(session, sp, name)
+	if !ok || !pendingDrainReasonCancelable(reason) {
+		return false
+	}
+	ds := dt.get(session.ID)
+	if ds == nil || !ds.ackSet {
+		return false
+	}
+	return cancelSessionDrainForPending(session, sp, dt)
+}
+
+func reconcilerDrainAckMatchesSession(session beads.Bead, sp runtime.Provider, name string) (string, bool) {
+	if sp == nil || name == "" {
+		return "", false
+	}
+	source, err := sp.GetMeta(name, reconcilerDrainAckSourceKey)
+	if err != nil || source != reconcilerDrainAckSourceValue {
+		return "", false
+	}
+	reason, err := sp.GetMeta(name, reconcilerDrainAckReasonKey)
+	if err != nil || reason == "" {
+		return "", false
+	}
+	expectedGeneration, err := sp.GetMeta(name, reconcilerDrainAckGenerationKey)
+	if err != nil || expectedGeneration == "" {
+		return "", false
+	}
+	currentGeneration := strings.TrimSpace(session.Metadata["generation"])
+	if currentGeneration == "" || currentGeneration != expectedGeneration {
+		return "", false
+	}
+	return reason, true
+}
+
+func staleReconcilerDrainAck(session beads.Bead, sp runtime.Provider, name string) bool {
+	if sp == nil || name == "" {
+		return false
+	}
+	source, err := sp.GetMeta(name, reconcilerDrainAckSourceKey)
+	if err != nil || source != reconcilerDrainAckSourceValue {
+		return false
+	}
+	expectedGeneration, err := sp.GetMeta(name, reconcilerDrainAckGenerationKey)
+	if err != nil || expectedGeneration == "" {
+		return true
+	}
+	currentGeneration := strings.TrimSpace(session.Metadata["generation"])
+	return currentGeneration == "" || currentGeneration != expectedGeneration
+}
+
+func staleOrLegacyDrainAckBeforeStart(session beads.Bead, sp runtime.Provider, name string) bool {
+	if sp == nil || name == "" {
+		return false
+	}
+	source, err := sp.GetMeta(name, reconcilerDrainAckSourceKey)
+	if err == nil && source == drainAckSourceAgentValue {
+		return false
+	}
+	if err == nil && source == reconcilerDrainAckSourceValue {
+		return staleReconcilerDrainAck(session, sp, name)
+	}
+	acked, err := sp.GetMeta(name, "GC_DRAIN_ACK")
+	return err == nil && acked == "1"
+}
+
+func cancelRecoveredReconcilerAckedDrain(session beads.Bead, sp runtime.Provider, name string) bool {
+	reason, ok := reconcilerDrainAckMatchesSession(session, sp, name)
+	if !ok || !pendingDrainReasonCancelable(reason) {
+		return false
+	}
+	_ = clearReconcilerDrainAckMetadata(sp, name)
+	telemetry.RecordDrainTransition(context.Background(), name, reason, "cancel")
+	return true
+}
+
+func cancelRecoveredDrainForAssignedWork(session beads.Bead, sp runtime.Provider, name string) bool {
+	reason, ok := reconcilerDrainAckMatchesSession(session, sp, name)
+	if !ok || !assignedWorkDrainReasonCancelable(reason) {
+		return false
+	}
+	_ = clearReconcilerDrainAckMetadata(sp, name)
+	telemetry.RecordDrainTransition(context.Background(), name, reason, "cancel")
+	return true
 }
 
 // advanceSessionDrains checks all in-progress drains. Called once per tick.
@@ -224,6 +442,12 @@ func advanceSessionDrainsWithSessionsTraced(
 	if wakeEvals == nil {
 		wakeEvals = computeWakeEvaluations(sessions, cfg, sp, poolDesired, workSet, readyWaitSet, clk)
 	}
+	// Session front door constructed once from the same store; nil when store is
+	// nil so completeDrain keeps its store==nil short-circuit.
+	sessFront := sessionFrontDoor(store)
+	if store == nil {
+		sessFront = nil
+	}
 	for id, ds := range dt.all() {
 		session := sessionLookup(id)
 		if session == nil {
@@ -237,6 +461,9 @@ func advanceSessionDrainsWithSessionsTraced(
 		gen, _ := strconv.Atoi(session.Metadata["generation"])
 		if gen != ds.generation {
 			dt.clearIdleProbe(id)
+			if ds.ackSet {
+				_ = clearReconcilerDrainAckMetadata(sp, name)
+			}
 			dt.remove(id)
 			if trace != nil {
 				trace.recordDecision("reconciler.drain.stale", normalizedSessionTemplate(*session, cfg), name, "stale_generation", "cancel", traceRecordPayload{
@@ -249,9 +476,13 @@ func advanceSessionDrainsWithSessionsTraced(
 		}
 
 		// Check if process exited.
-		if !sp.IsRunning(name) {
+		running, err := workerSessionTargetRunningWithConfig("", store, sp, cfg, session.ID)
+		if err != nil {
+			running = false
+		}
+		if !running {
 			// Process exited — drain complete.
-			completeDrain(session, store, ds, clk)
+			completeDrain(session, sessFront, ds, clk)
 			dt.clearIdleProbe(id)
 			dt.remove(id)
 			telemetry.RecordDrainTransition(context.Background(), name, ds.reason, "complete")
@@ -263,18 +494,39 @@ func advanceSessionDrainsWithSessionsTraced(
 			continue
 		}
 
-		// Cancelation check: if wake reasons reappeared, cancel drain.
-		// Config-drift, orphaned, and suspended drains are NOT cancelable —
-		// they represent explicit lifecycle decisions that should not be
-		// reversed by the wake contract (the session is leaving the desired set).
-		if ds.reason != "config-drift" && ds.reason != "orphaned" && ds.reason != "suspended" {
+		if eval, ok := wakeEvals[session.ID]; ok &&
+			containsWakeReason(eval.Reasons, WakePending) &&
+			pendingDrainReasonCancelable(ds.reason) {
+			if cancelSessionDrainForPending(*session, sp, dt) {
+				if trace != nil {
+					trace.recordDecision("reconciler.drain.cancel", normalizedSessionTemplate(*session, cfg), name, ds.reason, "cancel_pending", nil, nil, "")
+				}
+				continue
+			}
+		}
+
+		if eval, ok := wakeEvals[session.ID]; ok &&
+			eval.Reason == "assigned-work" &&
+			containsWakeReason(eval.Reasons, WakeWork) &&
+			assignedWorkDrainReasonCancelable(ds.reason) {
+			if cancelSessionDrainForAssignedWork(*session, sp, dt) {
+				if trace != nil {
+					trace.recordDecision("reconciler.drain.cancel", normalizedSessionTemplate(*session, cfg), name, ds.reason, "cancel_assigned_work", nil, nil, "")
+				}
+				continue
+			}
+		}
+
+		// Cancellation check: if wake reasons reappeared, cancel the in-memory
+		// drain. Orphaned, suspended, and ordinary config-drift drains are not
+		// canceled here.
+		if drainReasonCancelable(ds.reason) {
 			if eval, ok := wakeEvals[session.ID]; ok && len(eval.Reasons) > 0 {
 				dt.clearIdleProbe(id)
 				// Clear GC_DRAIN_ACK if it was set — prevents stale ack
 				// from killing the session on the next Phase 1 check.
 				if ds.ackSet {
-					_ = sp.RemoveMeta(name, "GC_DRAIN_ACK")
-					_ = sp.RemoveMeta(name, "GC_DRAIN")
+					_ = clearReconcilerDrainAckMetadata(sp, name)
 				}
 				dt.remove(id)
 				if trace != nil {
@@ -298,8 +550,11 @@ func advanceSessionDrainsWithSessionsTraced(
 			if os.Getenv("GC_TMUX_TRACE") == "1" {
 				log.Printf("[DRAIN-TRACE] advanceSessionDrains: setting GC_DRAIN_ACK session=%s reason=%s", name, ds.reason)
 			}
-			err := sp.SetMeta(name, "GC_DRAIN_ACK", "1")
-			ds.ackSet = true
+			err := setReconcilerDrainAckMetadata(sp, name, ds)
+			if err == nil {
+				ds.ackSet = true
+				ds.followUp = true
+			}
 			if trace != nil {
 				outcome := "success"
 				fields := traceRecordPayload{
@@ -314,9 +569,11 @@ func advanceSessionDrainsWithSessionsTraced(
 			}
 		}
 
+		// Pending-interaction guards and wake-based cancellation run before this
+		// timeout path. Preserve that ordering if this block is refactored.
 		if clk.Now().After(ds.deadline) {
 			// Drain timed out — force stop.
-			if err := verifiedStop(*session, sp); err != nil {
+			if err := verifiedStop(*session, store, sp, cfg); err != nil {
 				if errors.Is(err, errTokenMismatch) {
 					// Session was re-woken by a different incarnation.
 					// This drain is stale — cancel it.
@@ -334,8 +591,12 @@ func advanceSessionDrainsWithSessionsTraced(
 			}
 			// Re-probe after stop to confirm process actually exited
 			// before marking metadata as asleep.
-			if !sp.IsRunning(name) {
-				completeDrain(session, store, ds, clk)
+			running, err := workerSessionTargetRunningWithConfig("", store, sp, cfg, session.ID)
+			if err != nil {
+				running = false
+			}
+			if !running {
+				completeDrain(session, sessFront, ds, clk)
 				dt.clearIdleProbe(id)
 				dt.remove(id)
 				telemetry.RecordDrainTransition(context.Background(), name, ds.reason, "timeout")
@@ -350,21 +611,18 @@ func advanceSessionDrainsWithSessionsTraced(
 }
 
 // completeDrain writes drain-complete metadata to the bead.
-func completeDrain(session *beads.Bead, store beads.Store, ds *drainState, clk clock.Clock) {
-	batch := map[string]string{
-		"slept_at":     clk.Now().UTC().Format(time.RFC3339),
-		"sleep_reason": ds.reason,
-		"sleep_intent": "",
-		"state":        "asleep",
-		"last_woke_at": "", // Clear to prevent false crash detection.
+func completeDrain(session *beads.Bead, sessFront *sessions.InfoStore, ds *drainState, clk clock.Clock) {
+	batch := sessions.CompleteDrainPatch(clk.Now(), ds.reason, session.Metadata["wake_mode"] == "fresh")
+	if sessFront != nil {
+		if err := sessFront.ApplyPatch(session.ID, batch); err != nil {
+			return
+		}
 	}
-	if err := store.SetMetadataBatch(session.ID, batch); err == nil {
-		if session.Metadata == nil {
-			session.Metadata = make(map[string]string)
-		}
-		for k, v := range batch {
-			session.Metadata[k] = v
-		}
+	if session.Metadata == nil {
+		session.Metadata = make(map[string]string)
+	}
+	for k, v := range batch {
+		session.Metadata[k] = v
 	}
 }
 
@@ -376,7 +634,7 @@ func completeDrain(session *beads.Bead, store beads.Store, ds *drainState, clk c
 // to different backends if the route table is stale. This is a pre-existing
 // routing limitation — when the reconciler is wired in, consider a
 // provider-level VerifiedStop that atomically verifies+stops on the same backend.
-func verifiedStop(session beads.Bead, sp runtime.Provider) error {
+func verifiedStop(session beads.Bead, store beads.Store, sp runtime.Provider, cfg *config.City) error {
 	name := session.Metadata["session_name"]
 	expectedToken := session.Metadata["instance_token"]
 	if expectedToken != "" {
@@ -385,11 +643,15 @@ func verifiedStop(session beads.Bead, sp runtime.Provider) error {
 			return fmt.Errorf("%w for session %s", errTokenMismatch, session.ID)
 		}
 	}
-	return sp.Stop(name)
+	handle, err := workerHandleForSessionWithConfig("", store, sp, cfg, session.ID)
+	if err != nil {
+		return err
+	}
+	return handle.Kill(context.Background())
 }
 
 // verifiedInterrupt sends an interrupt signal after verifying instance_token.
-func verifiedInterrupt(session beads.Bead, sp runtime.Provider) error {
+func verifiedInterrupt(session beads.Bead, store beads.Store, sp runtime.Provider, cfg *config.City) error {
 	name := session.Metadata["session_name"]
 	expectedToken := session.Metadata["instance_token"]
 	if expectedToken != "" {
@@ -398,21 +660,9 @@ func verifiedInterrupt(session beads.Bead, sp runtime.Provider) error {
 			return fmt.Errorf("%w for session %s", errTokenMismatch, session.ID)
 		}
 	}
-	return sp.Interrupt(name)
-}
-
-// needsConfigRestart returns true if the session's core config has drifted
-// and needs a drain-then-restart cycle.
-func needsConfigRestart(session beads.Bead, cfg *config.City, buildConfigFn func(*config.Agent) runtime.Config) bool {
-	template := normalizedSessionTemplate(session, cfg)
-	agent := findAgentByTemplate(cfg, template)
-	if agent == nil {
-		return false
+	handle, err := workerHandleForSessionWithConfig("", store, sp, cfg, session.ID)
+	if err != nil {
+		return err
 	}
-	storedHash := session.Metadata["config_hash"]
-	if storedHash == "" {
-		return false // no hash stored yet — can't detect drift
-	}
-	currentHash := runtime.CoreFingerprint(buildConfigFn(agent))
-	return storedHash != currentHash
+	return handle.Interrupt(context.Background(), worker.InterruptRequest{})
 }

@@ -32,9 +32,10 @@ func TestE2E_Pool_InstanceNaming(t *testing.T) {
 	}
 }
 
-// TestE2E_Pool_SingletonNaming verifies that pool agents with max=1 use
-// the bare agent name (no -1 suffix).
-func TestE2E_Pool_SingletonNaming(t *testing.T) {
+// TestE2E_Pool_MaxOneUsesCanonicalIdentity verifies that max=1 pool configs
+// use the canonical singleton identity rather than concrete pool instance
+// naming.
+func TestE2E_Pool_MaxOneUsesCanonicalIdentity(t *testing.T) {
 	city := e2eCity{
 		Agents: []e2eAgent{
 			{
@@ -74,10 +75,10 @@ func TestE2E_Pool_WithDir(t *testing.T) {
 	wantDir := filepath.Join(cityDir, "workdir")
 
 	// Both instances share the same workdir (no template expansion).
-	if cwd := r1.get("CWD"); cwd != wantDir {
+	if cwd := r1.get("CWD"); !sameE2EPath(t, cwd, wantDir) {
 		t.Errorf("dirpool-1 CWD = %q, want %q", cwd, wantDir)
 	}
-	if cwd := r2.get("CWD"); cwd != wantDir {
+	if cwd := r2.get("CWD"); !sameE2EPath(t, cwd, wantDir) {
 		t.Errorf("dirpool-2 CWD = %q, want %q", cwd, wantDir)
 	}
 }

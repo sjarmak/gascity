@@ -39,10 +39,9 @@ unchanged via a compatibility shim.
    `gc status` only shows the current city. Checking all cities requires
    `cd`-ing into each directory.
 
-2. **No cross-city visibility.** Mission Control (the dashboard) connects
-   to one API URL. Monitoring multiple cities requires multiple browser
-   tabs pointed at different ports, or re-launching with different
-   `--api` flags.
+2. **No cross-city visibility.** The dashboard connects to one API URL.
+   Monitoring multiple cities requires multiple browser tabs pointed at
+   different ports, or re-launching with different `--api` flags.
 
 3. **Resource waste.** Each controller runs its own fsnotify watcher,
    reconciliation goroutine, and HTTP listener. On machines with 5+
@@ -74,19 +73,20 @@ them under one application controller -- the same pattern as Erlang's
 
 ### Design principles alignment
 
-- **NDI (Nondeterministic Idempotence):** A machine-wide supervisor
-  converges all cities to their desired state on every tick, regardless
-  of which cities were added, removed, or crashed since the last tick.
-  The registry file is the desired state; running city supervisors are
-  the actual state.
+- **The system converges because work persists:** A machine-wide
+  supervisor converges all cities to their desired state on every tick,
+  regardless of which cities were added, removed, or crashed since the
+  last tick. The registry file is the desired state; running city
+  supervisors are the actual state.
 
 - **SDK self-sufficiency:** The machine supervisor is pure
   infrastructure. It does not require any user-configured agent role to
   function.
 
-- **Bitter Lesson:** A unified API surface gets MORE useful as models
-  improve -- agents can query cross-city state, external tools can
-  monitor all cities, dashboards can show a fleet view.
+- **A primitive must become more useful as models improve:** A unified
+  API surface gets MORE useful as models improve -- agents can query
+  cross-city state, external tools can monitor all cities, dashboards can
+  show a fleet view.
 
 ## Guide-Level Explanation
 
@@ -176,6 +176,11 @@ The supervisor reads a global config at `~/.gc/supervisor.toml`:
 # City-level [api] sections are ignored when running under the supervisor.
 port = 8080
 bind = "127.0.0.1"
+
+# Additional Host headers accepted beyond localhost/127.0.0.1/[::1].
+# Use only when intentionally exposing the supervisor through a named
+# local proxy or private network endpoint.
+allowed_hosts = ["city-admin.local"]
 
 # Patrol interval for the supervisor's own reconciliation
 # (checking city health, not agent health -- that's per-city).

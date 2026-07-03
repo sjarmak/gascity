@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -68,12 +71,74 @@ func TestContentBlocks(t *testing.T) {
 	}
 }
 
+func TestContentBlocksInteractionPreservesFields(t *testing.T) {
+	msg := `{"role":"assistant","content":[{"type":"interaction","request_id":"req-1","kind":"approval","state":"blocked","prompt":"Proceed?","options":["approve","reject"],"action":"respond","metadata":{"source":"claude"}}]}`
+	e := &Entry{Message: json.RawMessage(msg)}
+	blocks := e.ContentBlocks()
+	if len(blocks) != 1 {
+		t.Fatalf("got %d blocks, want 1", len(blocks))
+	}
+	block := blocks[0]
+	if block.Type != "interaction" {
+		t.Fatalf("block type = %q, want interaction", block.Type)
+	}
+	if block.RequestID != "req-1" || block.Kind != "approval" || block.State != "blocked" {
+		t.Fatalf("block core fields = %#v, want request_id/kind/state preserved", block)
+	}
+	if block.Prompt != "Proceed?" || block.Action != "respond" {
+		t.Fatalf("block prompt/action = %#v, want preserved", block)
+	}
+	if !reflect.DeepEqual(block.Options, []string{"approve", "reject"}) {
+		t.Fatalf("block options = %#v, want preserved", block.Options)
+	}
+	assertRawMetadata(t, block.Metadata, map[string]any{"source": "claude"})
+}
+
+func TestContentBlocksInteractionAllowsNonStringMetadata(t *testing.T) {
+	msg := `{"role":"assistant","content":[{"type":"interaction","request_id":"req-1","kind":"approval","state":"pending","prompt":"Proceed?","metadata":{"attempt":2,"details":{"tool":"Read"}}}]}`
+	e := &Entry{Message: json.RawMessage(msg)}
+	blocks := e.ContentBlocks()
+	if len(blocks) != 1 {
+		t.Fatalf("got %d blocks, want 1", len(blocks))
+	}
+	if blocks[0].Type != "interaction" {
+		t.Fatalf("block type = %q, want interaction", blocks[0].Type)
+	}
+	assertRawMetadata(t, blocks[0].Metadata, map[string]any{
+		"attempt": float64(2),
+		"details": map[string]any{"tool": "Read"},
+	})
+}
+
 func TestContentBlocksPlainString(t *testing.T) {
 	msg := `{"role":"user","content":"hello world"}`
 	e := &Entry{Message: json.RawMessage(msg)}
 	blocks := e.ContentBlocks()
 	if blocks != nil {
 		t.Errorf("expected nil blocks for plain string content, got %d", len(blocks))
+	}
+}
+
+func TestProviderFamilyPiAliasAnchoring(t *testing.T) {
+	tests := []struct {
+		provider string
+		want     string
+	}{
+		{provider: "pi", want: "pi"},
+		{provider: "pi/tmux", want: "pi"},
+		{provider: "my-pi", want: "pi"},
+		{provider: "my-pi/tmux", want: "pi"},
+		{provider: "wrapped/pi", want: "pi"},
+		{provider: "happy-pirate", want: "happy-pirate"},
+		{provider: "claude-pirep", want: "claude-pirep"},
+		{provider: "user-pid", want: "user-pid"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.provider, func(t *testing.T) {
+			if got := ProviderFamily(tt.provider); got != tt.want {
+				t.Fatalf("ProviderFamily(%q) = %q, want %q", tt.provider, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -284,6 +349,57 @@ func TestParseFileSkipsMalformed(t *testing.T) {
 	}
 }
 
+func TestParseFileDetailedDiagnostics(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name              string
+		content           string
+		wantCount         int
+		wantMalformedTail bool
+		wantEntries       int
+	}{
+		{
+			name: "malformed tail line",
+			content: "{\"uuid\":\"a\",\"type\":\"user\",\"timestamp\":\"2025-01-01T00:00:00Z\"}\n" +
+				"not json",
+			wantCount:         1,
+			wantMalformedTail: true,
+			wantEntries:       1,
+		},
+		{
+			name: "valid unterminated tail line",
+			content: "{\"uuid\":\"a\",\"type\":\"user\",\"timestamp\":\"2025-01-01T00:00:00Z\"}\n" +
+				"{\"uuid\":\"b\",\"type\":\"assistant\",\"timestamp\":\"2025-01-01T00:00:01Z\"}",
+			wantCount:         0,
+			wantMalformedTail: false,
+			wantEntries:       2,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(dir, tt.name+".jsonl")
+			if err := os.WriteFile(path, []byte(tt.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			entries, diagnostics, err := parseFileDetailed(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != tt.wantEntries {
+				t.Fatalf("got %d entries, want %d", len(entries), tt.wantEntries)
+			}
+			if diagnostics.MalformedLineCount != tt.wantCount {
+				t.Fatalf("MalformedLineCount = %d, want %d", diagnostics.MalformedLineCount, tt.wantCount)
+			}
+			if diagnostics.MalformedTail != tt.wantMalformedTail {
+				t.Fatalf("MalformedTail = %v, want %v", diagnostics.MalformedTail, tt.wantMalformedTail)
+			}
+		})
+	}
+}
+
 func TestParseFileMissing(t *testing.T) {
 	_, err := parseFile(filepath.Join(t.TempDir(), "nope.jsonl"))
 	if err == nil {
@@ -332,11 +448,72 @@ func TestReadFileFiltersDisplayTypes(t *testing.T) {
 	}
 }
 
+func TestReadFileDiagnostics(t *testing.T) {
+	path := writeJSONL(t,
+		`{"uuid":"a","parentUuid":"","type":"user","timestamp":"2025-01-01T00:00:00Z"}`,
+		`not json`,
+	)
+
+	tests := []struct {
+		name string
+		read func(string, int) (*Session, error)
+	}{
+		{name: "ReadFile", read: ReadFile},
+		{name: "ReadFileRaw", read: ReadFileRaw},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess, err := tt.read(path, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sess.Diagnostics.MalformedLineCount != 1 {
+				t.Fatalf("MalformedLineCount = %d, want 1", sess.Diagnostics.MalformedLineCount)
+			}
+			if !sess.Diagnostics.MalformedTail {
+				t.Fatal("expected MalformedTail")
+			}
+		})
+	}
+}
+
+func TestReadFileOlderDiagnostics(t *testing.T) {
+	path := writeJSONL(t,
+		`{"uuid":"a","parentUuid":"","type":"user","timestamp":"2025-01-01T00:00:00Z"}`,
+		`{"uuid":"b","parentUuid":"a","type":"assistant","timestamp":"2025-01-01T00:00:01Z"}`,
+		`not json`,
+	)
+
+	tests := []struct {
+		name string
+		read func(string, int, string) (*Session, error)
+	}{
+		{name: "ReadFileOlder", read: ReadFileOlder},
+		{name: "ReadFileRawOlder", read: ReadFileRawOlder},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess, err := tt.read(path, 0, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sess.Diagnostics.MalformedLineCount != 1 {
+				t.Fatalf("MalformedLineCount = %d, want 1", sess.Diagnostics.MalformedLineCount)
+			}
+			if !sess.Diagnostics.MalformedTail {
+				t.Fatal("expected MalformedTail")
+			}
+		})
+	}
+}
+
 // --- Pagination tests ---
 
 func TestSliceAtCompactBoundariesNoBoundaries(t *testing.T) {
 	entries := makeEntries("a", "b", "c", "d")
-	sliced, info := sliceAtCompactBoundaries(entries, 1, "")
+	sliced, info := sliceAtCompactBoundaries(entries, 1, "", "")
 	if len(sliced) != 4 {
 		t.Fatalf("got %d, want all 4 (no boundaries to slice at)", len(sliced))
 	}
@@ -359,7 +536,7 @@ func TestSliceAtCompactBoundariesOneBoundary(t *testing.T) {
 	}
 
 	// tailCompactions=1 with 2 boundaries → slice from the last boundary.
-	sliced, info := sliceAtCompactBoundaries(entries, 1, "")
+	sliced, info := sliceAtCompactBoundaries(entries, 1, "", "")
 	if len(sliced) != 2 {
 		t.Fatalf("got %d, want 2 (from cb2 to end)", len(sliced))
 	}
@@ -385,7 +562,7 @@ func TestSliceAtCompactBoundariesReturnsAllWhenFewer(t *testing.T) {
 	}
 
 	// 1 boundary, tailCompactions=1 → len(boundaries) <= tailCompactions → return all.
-	sliced, info := sliceAtCompactBoundaries(entries, 1, "")
+	sliced, info := sliceAtCompactBoundaries(entries, 1, "", "")
 	if len(sliced) != 3 {
 		t.Fatalf("got %d, want 3 (all entries returned when boundaries <= tailCompactions)", len(sliced))
 	}
@@ -409,7 +586,7 @@ func TestSliceAtCompactBoundariesMultiple(t *testing.T) {
 	}
 
 	// tailCompactions=2 → include from the 2nd-from-last boundary.
-	sliced, info := sliceAtCompactBoundaries(entries, 2, "")
+	sliced, info := sliceAtCompactBoundaries(entries, 2, "", "")
 	if len(sliced) != 4 {
 		t.Fatalf("got %d, want 4", len(sliced))
 	}
@@ -431,7 +608,7 @@ func TestSliceAtCompactBoundariesBeforeCursor(t *testing.T) {
 	}
 
 	// Load older messages before "cb2".
-	sliced, info := sliceAtCompactBoundaries(entries, 1, "cb2")
+	sliced, info := sliceAtCompactBoundaries(entries, 1, "cb2", "")
 	// Working set is [a, cb1, b] — 1 boundary, tailCompactions=1 → return all.
 	if len(sliced) != 3 {
 		t.Fatalf("got %d, want 3 (all working set when boundaries <= tailCompactions)", len(sliced))
@@ -457,7 +634,7 @@ func TestSliceAtCompactBoundariesBeforeCursorWithSlicing(t *testing.T) {
 
 	// Load older before "cb3". Working set: [a, cb1, b, cb2, c].
 	// 2 boundaries in working set, tailCompactions=1 → slice from cb2.
-	sliced, info := sliceAtCompactBoundaries(entries, 1, "cb3")
+	sliced, info := sliceAtCompactBoundaries(entries, 1, "cb3", "")
 	if len(sliced) != 2 {
 		t.Fatalf("got %d, want 2", len(sliced))
 	}
@@ -466,6 +643,79 @@ func TestSliceAtCompactBoundariesBeforeCursorWithSlicing(t *testing.T) {
 	}
 	if !info.HasOlderMessages {
 		t.Error("expected HasOlderMessages")
+	}
+}
+
+func TestSliceAtCompactBoundariesAfterCursor(t *testing.T) {
+	entries := []*Entry{
+		{UUID: "a", Type: "user"},
+		{UUID: "cb1", Type: "system", Subtype: "compact_boundary"},
+		{UUID: "b", Type: "assistant"},
+		{UUID: "cb2", Type: "system", Subtype: "compact_boundary"},
+		{UUID: "c", Type: "user"},
+	}
+
+	// After "cb1" with tailCompactions=0 → returns [b, cb2, c].
+	sliced, info := sliceAtCompactBoundaries(entries, 0, "", "cb1")
+	if len(sliced) != 3 {
+		t.Fatalf("got %d, want 3 (entries after cb1)", len(sliced))
+	}
+	if sliced[0].UUID != "b" {
+		t.Errorf("first = %q, want %q", sliced[0].UUID, "b")
+	}
+	if info.ReturnedMessageCount != 3 {
+		t.Errorf("ReturnedMessageCount = %d, want 3", info.ReturnedMessageCount)
+	}
+}
+
+func TestSliceAtCompactBoundariesAfterCursorWithSlicing(t *testing.T) {
+	entries := []*Entry{
+		{UUID: "a", Type: "user"},
+		{UUID: "cb1", Type: "system", Subtype: "compact_boundary"},
+		{UUID: "b", Type: "assistant"},
+		{UUID: "cb2", Type: "system", Subtype: "compact_boundary"},
+		{UUID: "c", Type: "user"},
+		{UUID: "cb3", Type: "system", Subtype: "compact_boundary"},
+		{UUID: "d", Type: "assistant"},
+	}
+
+	// After "a" with tailCompactions=1 → working set is [cb1, b, cb2, c, cb3, d],
+	// then sliced from last boundary cb3 → [cb3, d].
+	sliced, info := sliceAtCompactBoundaries(entries, 1, "", "a")
+	if len(sliced) != 2 {
+		t.Fatalf("got %d, want 2 (sliced from cb3)", len(sliced))
+	}
+	if sliced[0].UUID != "cb3" {
+		t.Errorf("first = %q, want %q", sliced[0].UUID, "cb3")
+	}
+	if !info.HasOlderMessages {
+		t.Error("expected HasOlderMessages after compaction slicing")
+	}
+}
+
+func TestSliceAtCompactBoundariesAfterCursorLastEntry(t *testing.T) {
+	entries := makeEntries("a", "b", "c")
+
+	// After last entry → empty slice.
+	sliced, info := sliceAtCompactBoundaries(entries, 0, "", "c")
+	if len(sliced) != 0 {
+		t.Fatalf("got %d, want 0 (cursor at last entry)", len(sliced))
+	}
+	if info.ReturnedMessageCount != 0 {
+		t.Errorf("ReturnedMessageCount = %d, want 0", info.ReturnedMessageCount)
+	}
+}
+
+func TestSliceAtCompactBoundariesAfterCursorNotFound(t *testing.T) {
+	entries := makeEntries("a", "b", "c")
+
+	// After nonexistent UUID → full set returned.
+	sliced, info := sliceAtCompactBoundaries(entries, 0, "", "z")
+	if len(sliced) != 3 {
+		t.Fatalf("got %d, want 3 (cursor not found = full set)", len(sliced))
+	}
+	if info.ReturnedMessageCount != 3 {
+		t.Errorf("ReturnedMessageCount = %d, want 3", info.ReturnedMessageCount)
 	}
 }
 
@@ -503,6 +753,358 @@ func TestFindSessionFileNotFound(t *testing.T) {
 	got := FindSessionFile([]string{t.TempDir()}, "/nonexistent/path")
 	if got != "" {
 		t.Errorf("got %q, want empty string", got)
+	}
+}
+
+func TestFindSessionFileByIDRejectsTraversalSessionID(t *testing.T) {
+	base := t.TempDir()
+	workDir := "/home/user/myproject"
+	slugDir := filepath.Join(base, ProjectSlug(workDir))
+	if err := os.MkdirAll(slugDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "escape.jsonl"), []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := FindSessionFileByID([]string{base}, workDir, "../escape"); got != "" {
+		t.Fatalf("FindSessionFileByID traversal = %q, want empty", got)
+	}
+	if got := FindSessionFileByID([]string{base}, workDir, `nested\escape`); got != "" {
+		t.Fatalf("FindSessionFileByID backslash traversal = %q, want empty", got)
+	}
+}
+
+func TestFindSessionFileByIDUsesClaudeProjectPathAlias(t *testing.T) {
+	skipUnlessDarwinClaudePathAliases(t)
+
+	base := t.TempDir()
+	storedWorkDir := "/tmp/gcac/gctutenv-123/home/my-city"
+	providerWorkDir := "/private/tmp/gcac/gctutenv-123/home/my-city"
+	slugDir := filepath.Join(base, ProjectSlug(providerWorkDir))
+	if err := os.MkdirAll(slugDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(slugDir, "session-123.jsonl")
+	if err := os.WriteFile(want, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := FindSessionFileByID([]string{base}, storedWorkDir, "session-123"); got != want {
+		t.Fatalf("FindSessionFileByID() = %q, want %q", got, want)
+	}
+}
+
+func TestFindSessionFileByIDPrefersStoredWorkDirSpelling(t *testing.T) {
+	skipUnlessDarwinClaudePathAliases(t)
+
+	base := t.TempDir()
+	storedWorkDir := "/tmp/gcac/gctutenv-123/home/my-city"
+	providerWorkDir := "/private/tmp/gcac/gctutenv-123/home/my-city"
+	rawSlugDir := filepath.Join(base, ProjectSlug(storedWorkDir))
+	aliasSlugDir := filepath.Join(base, ProjectSlug(providerWorkDir))
+	for _, dir := range []string{rawSlugDir, aliasSlugDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := filepath.Join(rawSlugDir, "session-123.jsonl")
+	if err := os.WriteFile(want, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	aliasPath := filepath.Join(aliasSlugDir, "session-123.jsonl")
+	if err := os.WriteFile(aliasPath, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Unix(1_700_000_000, 0)
+	for _, path := range []string{want, aliasPath} {
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := FindSessionFileByID([]string{base}, storedWorkDir, "session-123"); got != want {
+		t.Fatalf("FindSessionFileByID() = %q, want stored spelling %q", got, want)
+	}
+}
+
+func TestFindSessionFileByIDForCandidatesUsesNewestMatch(t *testing.T) {
+	base := t.TempDir()
+	storedSlugDir := filepath.Join(base, "stored-slug")
+	aliasSlugDir := filepath.Join(base, "alias-slug")
+	for _, dir := range []string{storedSlugDir, aliasSlugDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	storedPath := filepath.Join(storedSlugDir, "session-123.jsonl")
+	if err := os.WriteFile(storedPath, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(storedPath, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	want := filepath.Join(aliasSlugDir, "session-123.jsonl")
+	if err := os.WriteFile(want, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := findSessionFileByIDForCandidates([]string{base}, []string{"stored-slug", "alias-slug"}, "session-123.jsonl")
+	if got != want {
+		t.Fatalf("findSessionFileByIDForCandidates() = %q, want newest match %q", got, want)
+	}
+}
+
+func TestFindSessionFileByIDForCandidatesPrefersEarlierSearchPath(t *testing.T) {
+	firstBase := t.TempDir()
+	secondBase := t.TempDir()
+	for _, base := range []string{firstBase, secondBase} {
+		if err := os.MkdirAll(filepath.Join(base, "alias-slug"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	want := filepath.Join(firstBase, "alias-slug", "session-123.jsonl")
+	if err := os.WriteFile(want, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newerInLaterBase := filepath.Join(secondBase, "alias-slug", "session-123.jsonl")
+	if err := os.WriteFile(newerInLaterBase, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(want, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	got := findSessionFileByIDForCandidates([]string{firstBase, secondBase}, []string{"alias-slug"}, "session-123.jsonl")
+	if got != want {
+		t.Fatalf("findSessionFileByIDForCandidates() = %q, want earlier search path %q", got, want)
+	}
+}
+
+func TestFindSessionFileUsesClaudeProjectPathAlias(t *testing.T) {
+	skipUnlessDarwinClaudePathAliases(t)
+
+	base := t.TempDir()
+	storedWorkDir := "/tmp/gcac/gctutenv-123/home/my-city"
+	providerWorkDir := "/private/tmp/gcac/gctutenv-123/home/my-city"
+	slugDir := filepath.Join(base, ProjectSlug(providerWorkDir))
+	if err := os.MkdirAll(slugDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(slugDir, "session-123.jsonl")
+	if err := os.WriteFile(want, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := FindSessionFile([]string{base}, storedWorkDir); got != want {
+		t.Fatalf("FindSessionFile() = %q, want %q", got, want)
+	}
+}
+
+func TestFindSessionFileUsesNewestClaudeProjectPathAliasMatch(t *testing.T) {
+	skipUnlessDarwinClaudePathAliases(t)
+
+	base := t.TempDir()
+	storedWorkDir := "/tmp/gcac/gctutenv-123/home/my-city"
+	providerWorkDir := "/private/tmp/gcac/gctutenv-123/home/my-city"
+	rawSlugDir := filepath.Join(base, ProjectSlug(storedWorkDir))
+	aliasSlugDir := filepath.Join(base, ProjectSlug(providerWorkDir))
+	for _, dir := range []string{rawSlugDir, aliasSlugDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	storedPath := filepath.Join(rawSlugDir, "stored-session.jsonl")
+	if err := os.WriteFile(storedPath, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(storedPath, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	want := filepath.Join(aliasSlugDir, "alias-session.jsonl")
+	if err := os.WriteFile(want, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := FindSessionFile([]string{base}, storedWorkDir); got != want {
+		t.Fatalf("FindSessionFile() = %q, want newest alias match %q", got, want)
+	}
+}
+
+func TestFindSlugSessionFileForCandidatesUsesNewestMatch(t *testing.T) {
+	base := t.TempDir()
+	storedSlugDir := filepath.Join(base, "stored-slug")
+	aliasSlugDir := filepath.Join(base, "alias-slug")
+	for _, dir := range []string{storedSlugDir, aliasSlugDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	storedPath := filepath.Join(storedSlugDir, "stored-session.jsonl")
+	if err := os.WriteFile(storedPath, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(storedPath, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	want := filepath.Join(aliasSlugDir, "alias-session.jsonl")
+	if err := os.WriteFile(want, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := findSlugSessionFileForCandidates([]string{base}, []string{"stored-slug", "alias-slug"})
+	if got != want {
+		t.Fatalf("findSlugSessionFileForCandidates() = %q, want newest match %q", got, want)
+	}
+}
+
+func TestFindClaudeLatestSessionFileForCandidatesUsesNewestMatch(t *testing.T) {
+	base := t.TempDir()
+	storedSlugDir := filepath.Join(base, "stored-slug")
+	aliasSlugDir := filepath.Join(base, "alias-slug")
+	for _, dir := range []string{storedSlugDir, aliasSlugDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	storedPath := filepath.Join(storedSlugDir, "latest-session.jsonl")
+	if err := os.WriteFile(storedPath, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(storedPath, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	want := filepath.Join(aliasSlugDir, "latest-session.jsonl")
+	if err := os.WriteFile(want, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := findClaudeLatestSessionFileForCandidates([]string{base}, []string{"stored-slug", "alias-slug"})
+	if got != want {
+		t.Fatalf("findClaudeLatestSessionFileForCandidates() = %q, want newest match %q", got, want)
+	}
+}
+
+func TestFindClaudeLatestSessionFileForCandidatesPrefersEarlierSearchPath(t *testing.T) {
+	firstBase := t.TempDir()
+	secondBase := t.TempDir()
+	for _, base := range []string{firstBase, secondBase} {
+		if err := os.MkdirAll(filepath.Join(base, "alias-slug"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	want := filepath.Join(firstBase, "alias-slug", "latest-session.jsonl")
+	if err := os.WriteFile(want, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newerInLaterBase := filepath.Join(secondBase, "alias-slug", "latest-session.jsonl")
+	if err := os.WriteFile(newerInLaterBase, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(want, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	got := findClaudeLatestSessionFileForCandidates([]string{firstBase, secondBase}, []string{"alias-slug"})
+	if got != want {
+		t.Fatalf("findClaudeLatestSessionFileForCandidates() = %q, want earlier search path %q", got, want)
+	}
+}
+
+func TestFindSessionFileUsesResolvedSymlinkProjectSlug(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires elevated privileges on Windows")
+	}
+
+	base := t.TempDir()
+	workRoot := t.TempDir()
+	realWorkDir := filepath.Join(workRoot, "real-city")
+	linkWorkDir := filepath.Join(workRoot, "link-city")
+	if err := os.MkdirAll(realWorkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realWorkDir, linkWorkDir); err != nil {
+		t.Fatal(err)
+	}
+
+	slugDir := filepath.Join(base, ProjectSlug(realWorkDir))
+	if err := os.MkdirAll(slugDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(slugDir, "session-123.jsonl")
+	if err := os.WriteFile(want, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := FindSessionFile([]string{base}, linkWorkDir); got != want {
+		t.Fatalf("FindSessionFile() = %q, want resolved symlink slug %q", got, want)
+	}
+}
+
+func TestFindSessionFileUsesResolvedMissingSymlinkPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires elevated privileges on Windows")
+	}
+
+	base := t.TempDir()
+	workRoot := t.TempDir()
+	realRoot := filepath.Join(workRoot, "real-root")
+	linkRoot := filepath.Join(workRoot, "link-root")
+	if err := os.MkdirAll(realRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+
+	missingWorkDir := filepath.Join(linkRoot, "missing-city")
+	slugDir := filepath.Join(base, ProjectSlug(filepath.Join(realRoot, "missing-city")))
+	if err := os.MkdirAll(slugDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(slugDir, "session-123.jsonl")
+	if err := os.WriteFile(want, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := FindSessionFile([]string{base}, missingWorkDir); got != want {
+		t.Fatalf("FindSessionFile() = %q, want resolved missing-path slug %q", got, want)
+	}
+}
+
+func TestFindClaudeLatestSessionFileUsesProjectPathAlias(t *testing.T) {
+	skipUnlessDarwinClaudePathAliases(t)
+
+	base := t.TempDir()
+	storedWorkDir := "/tmp/gcac/gctutenv-123/home/my-city"
+	providerWorkDir := "/private/tmp/gcac/gctutenv-123/home/my-city"
+	slugDir := filepath.Join(base, ProjectSlug(providerWorkDir))
+	if err := os.MkdirAll(slugDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(slugDir, "latest-session.jsonl")
+	if err := os.WriteFile(want, []byte(`{}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := findClaudeLatestSessionFile([]string{base}, storedWorkDir); got != want {
+		t.Fatalf("findClaudeLatestSessionFile() = %q, want %q", got, want)
 	}
 }
 
@@ -586,6 +1188,59 @@ func TestReadFileOlder(t *testing.T) {
 	}
 }
 
+func TestReadFileNewer(t *testing.T) {
+	path := writeJSONL(t,
+		`{"uuid":"a","parentUuid":"","type":"user","timestamp":"2025-01-01T00:00:00Z"}`,
+		`{"uuid":"b","parentUuid":"a","type":"assistant","timestamp":"2025-01-01T00:00:01Z"}`,
+		`{"uuid":"cb1","parentUuid":"b","type":"system","subtype":"compact_boundary","timestamp":"2025-01-01T00:00:02Z"}`,
+		`{"uuid":"c","parentUuid":"cb1","type":"user","timestamp":"2025-01-01T00:00:03Z"}`,
+		`{"uuid":"cb2","parentUuid":"c","type":"system","subtype":"compact_boundary","timestamp":"2025-01-01T00:00:04Z"}`,
+		`{"uuid":"d","parentUuid":"cb2","type":"assistant","timestamp":"2025-01-01T00:00:05Z"}`,
+	)
+	sess, err := ReadFileNewer(path, 0, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Should return display-type entries after "b": c and d (cb1/cb2 are system).
+	for _, m := range sess.Messages {
+		if m.UUID == "a" || m.UUID == "b" {
+			t.Errorf("should not contain entry %q (before or at cursor)", m.UUID)
+		}
+	}
+	found := false
+	for _, m := range sess.Messages {
+		if m.UUID == "d" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected entry d in newer messages")
+	}
+}
+
+func TestReadFileRawNewer(t *testing.T) {
+	path := writeJSONL(t,
+		`{"uuid":"a","parentUuid":"","type":"user","timestamp":"2025-01-01T00:00:00Z"}`,
+		`{"uuid":"b","parentUuid":"a","type":"assistant","timestamp":"2025-01-01T00:00:01Z"}`,
+		`{"uuid":"cb1","parentUuid":"b","type":"system","subtype":"compact_boundary","timestamp":"2025-01-01T00:00:02Z"}`,
+		`{"uuid":"c","parentUuid":"cb1","type":"user","timestamp":"2025-01-01T00:00:03Z"}`,
+		`{"uuid":"d","parentUuid":"c","type":"assistant","timestamp":"2025-01-01T00:00:05Z"}`,
+	)
+	sess, err := ReadFileRawNewer(path, 0, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Raw includes all types (including system). After "b": cb1, c, d.
+	if len(sess.Messages) != 3 {
+		t.Fatalf("got %d messages, want 3 (cb1, c, d after cursor b)", len(sess.Messages))
+	}
+	for _, m := range sess.Messages {
+		if m.UUID == "a" || m.UUID == "b" {
+			t.Errorf("should not contain entry %q (before or at cursor)", m.UUID)
+		}
+	}
+}
+
 // --- Edge case tests (from review findings) ---
 
 func TestSliceAtCompactBoundariesCursorAtFirstMessage(t *testing.T) {
@@ -595,7 +1250,7 @@ func TestSliceAtCompactBoundariesCursorAtFirstMessage(t *testing.T) {
 		{UUID: "c", Type: "user"},
 	}
 	// Cursor at first message → should return empty working set.
-	sliced, info := sliceAtCompactBoundaries(entries, 1, "a")
+	sliced, info := sliceAtCompactBoundaries(entries, 1, "a", "")
 	if len(sliced) != 0 {
 		t.Fatalf("got %d, want 0 (cursor at first message = no older messages)", len(sliced))
 	}
@@ -611,7 +1266,7 @@ func TestSliceAtCompactBoundariesTailCompactionsZero(t *testing.T) {
 		{UUID: "b", Type: "assistant"},
 	}
 	// tailCompactions=0 should return everything (no panic).
-	sliced, info := sliceAtCompactBoundaries(entries, 0, "")
+	sliced, info := sliceAtCompactBoundaries(entries, 0, "", "")
 	if len(sliced) != 3 {
 		t.Fatalf("got %d, want 3", len(sliced))
 	}
@@ -627,7 +1282,7 @@ func TestSliceAtCompactBoundariesTailZeroWithCursor(t *testing.T) {
 		{UUID: "c", Type: "user"},
 	}
 	// tailCompactions=0 with cursor should still respect the cursor.
-	sliced, info := sliceAtCompactBoundaries(entries, 0, "b")
+	sliced, info := sliceAtCompactBoundaries(entries, 0, "b", "")
 	if len(sliced) != 1 {
 		t.Fatalf("got %d, want 1 (only messages before cursor 'b')", len(sliced))
 	}
@@ -705,6 +1360,268 @@ func TestBuildDagFallbackOnlyForCompactBoundary(t *testing.T) {
 }
 
 // --- Codex session file tests ---
+
+func TestReadCodexFileDiagnostics(t *testing.T) {
+	path := writeJSONL(t,
+		`{"timestamp":"2026-01-02T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"hello"}]}}`,
+		`not json`,
+		`{"timestamp":"2026-01-02T00:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"done"}]}}`,
+	)
+
+	sess, err := ReadCodexFile(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sess.Diagnostics.MalformedLineCount; got != 1 {
+		t.Fatalf("MalformedLineCount = %d, want 1", got)
+	}
+	if sess.Diagnostics.MalformedTail {
+		t.Fatal("MalformedTail = true, want false for valid tail")
+	}
+	if got := len(sess.Messages); got != 2 {
+		t.Fatalf("Messages = %d, want valid prefix/suffix entries", got)
+	}
+}
+
+func TestReadCodexFileMalformedTailDiagnostics(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rollout.jsonl")
+	body := `{"timestamp":"2026-01-02T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"hello"}]}}` + "\n" +
+		`{"timestamp":"2026-01-02T00:00:01Z","type":"response_item","payload":`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sess, err := ReadCodexFile(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sess.Diagnostics.MalformedLineCount; got != 1 {
+		t.Fatalf("MalformedLineCount = %d, want 1", got)
+	}
+	if !sess.Diagnostics.MalformedTail {
+		t.Fatal("MalformedTail = false, want true")
+	}
+	if got := len(sess.Messages); got != 1 {
+		t.Fatalf("Messages = %d, want readable prefix entry", got)
+	}
+}
+
+func TestReadCodexFileInteractionResponseItem(t *testing.T) {
+	path := writeJSONL(t,
+		`{"timestamp":"2026-01-02T00:00:00Z","type":"response_item","payload":{"type":"interaction","request_id":"req-1","id":"legacy-1","kind":"approval","state":"blocked","prompt":"Proceed?","options":["approve","reject"],"action":"respond","metadata":{"source":"codex"}}}`,
+	)
+
+	sess, err := ReadCodexFile(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(sess.Messages); got != 1 {
+		t.Fatalf("Messages = %d, want 1", got)
+	}
+	msg := sess.Messages[0]
+	if msg.Type != "assistant" {
+		t.Fatalf("message type = %q, want assistant", msg.Type)
+	}
+	if msg.UUID != "codex-0" {
+		t.Fatalf("message UUID = %q, want sequence-stable codex ID", msg.UUID)
+	}
+	blocks := msg.ContentBlocks()
+	if len(blocks) != 1 {
+		t.Fatalf("content blocks = %d, want 1", len(blocks))
+	}
+	block := blocks[0]
+	if block.Type != "interaction" {
+		t.Fatalf("block type = %q, want interaction", block.Type)
+	}
+	if block.RequestID != "req-1" || block.Kind != "approval" || block.State != "blocked" {
+		t.Fatalf("block core fields = %#v, want preserved interaction fields", block)
+	}
+	if block.Prompt != "Proceed?" || block.Action != "respond" {
+		t.Fatalf("block prompt/action = %#v, want preserved interaction fields", block)
+	}
+	if !reflect.DeepEqual(block.Options, []string{"approve", "reject"}) {
+		t.Fatalf("block options = %#v, want preserved interaction options", block.Options)
+	}
+	assertRawMetadata(t, block.Metadata, map[string]any{"source": "codex"})
+}
+
+func TestReadCodexFileInteractionLifecycleUsesDistinctEntryIDs(t *testing.T) {
+	path := writeJSONL(t,
+		`{"timestamp":"2026-01-02T00:00:00Z","type":"response_item","payload":{"type":"interaction","request_id":"req-1","kind":"approval","state":"pending","prompt":"Proceed?"}}`,
+		`{"timestamp":"2026-01-02T00:00:01Z","type":"response_item","payload":{"type":"interaction","request_id":"req-1","kind":"approval","state":"resolved","action":"approve"}}`,
+	)
+
+	sess, err := ReadCodexFile(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(sess.Messages); got != 2 {
+		t.Fatalf("Messages = %d, want 2", got)
+	}
+	if sess.Messages[0].UUID == sess.Messages[1].UUID {
+		t.Fatalf("codex interaction entry IDs reused %q for lifecycle transition", sess.Messages[0].UUID)
+	}
+	if sess.Messages[0].UUID != "codex-0" || sess.Messages[1].UUID != "codex-1" {
+		t.Fatalf("codex interaction entry IDs = %q, %q; want codex-0, codex-1", sess.Messages[0].UUID, sess.Messages[1].UUID)
+	}
+	if sess.Messages[1].ParentUUID != sess.Messages[0].UUID {
+		t.Fatalf("resolved interaction parent = %q, want %q", sess.Messages[1].ParentUUID, sess.Messages[0].UUID)
+	}
+}
+
+func TestReadCodexFileErrorEventMsgTypes(t *testing.T) {
+	errorLine := `{"timestamp":"2026-05-03T00:05:41.798Z","type":"event_msg","payload":{"type":"error","message":"You've hit your usage limit.","codex_error_info":"usage_limit_exceeded"}}`
+	streamErrorLine := `{"timestamp":"2026-05-03T00:06:00.000Z","type":"event_msg","payload":{"type":"stream_error","message":"stream interrupted"}}`
+	turnAbortedLine := `{"timestamp":"2026-05-03T00:07:00.000Z","type":"event_msg","payload":{"type":"turn_aborted","message":"turn was aborted"}}`
+	userMsgLine := `{"timestamp":"2026-05-03T00:04:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}`
+	responseLine := `{"timestamp":"2026-05-03T00:04:30.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"hi"}]}}`
+
+	path := writeJSONL(t, userMsgLine, responseLine, errorLine, streamErrorLine, turnAbortedLine)
+
+	sess, err := ReadCodexFile(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Expect: user_message (event_msg, but no response_item user → included),
+	// response_item/message, error, stream_error, turn_aborted = 5 entries.
+	if got := len(sess.Messages); got != 5 {
+		t.Fatalf("Messages = %d, want 5", got)
+	}
+
+	// Verify the three error-category entries.
+	for i, want := range []struct {
+		idx     int
+		entType string
+		rawLine string
+	}{
+		{2, "system", errorLine},
+		{3, "system", streamErrorLine},
+		{4, "system", turnAbortedLine},
+	} {
+		msg := sess.Messages[want.idx]
+		if msg.Type != want.entType {
+			t.Errorf("[%d] Type = %q, want %q", i, msg.Type, want.entType)
+		}
+		if string(msg.Raw) != want.rawLine {
+			t.Errorf("[%d] Raw mismatch:\n got: %s\nwant: %s", i, msg.Raw, want.rawLine)
+		}
+		if msg.UUID != fmt.Sprintf("codex-event-%d", want.idx) {
+			t.Errorf("[%d] UUID = %q, want codex-event-%d", i, msg.UUID, want.idx)
+		}
+		if msg.TextContent() == "" && len(msg.ContentBlocks()) == 0 {
+			t.Errorf("[%d] error entry has no visible message content", i)
+		}
+	}
+	if text := sess.Messages[2].ContentBlocks()[0].Text; !strings.Contains(text, "usage_limit_exceeded") || !strings.Contains(text, "You've hit your usage limit.") {
+		t.Fatalf("error text = %q, want code and message", text)
+	}
+
+	// Verify parent chain is linked.
+	for i := 1; i < len(sess.Messages); i++ {
+		if sess.Messages[i].ParentUUID != sess.Messages[i-1].UUID {
+			t.Errorf("Messages[%d].ParentUUID = %q, want %q", i, sess.Messages[i].ParentUUID, sess.Messages[i-1].UUID)
+		}
+	}
+}
+
+func TestReadCodexFileUnknownEventMsgForwarded(t *testing.T) {
+	unknownLine := `{"timestamp":"2026-05-03T00:08:00.000Z","type":"event_msg","payload":{"type":"new_future_type","data":"something"}}`
+
+	path := writeJSONL(t, unknownLine)
+
+	sess, err := ReadCodexFile(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := len(sess.Messages); got != 1 {
+		t.Fatalf("Messages = %d, want 1 (unknown event_msg should be forwarded)", got)
+	}
+	msg := sess.Messages[0]
+	if msg.Type != "event_msg" {
+		t.Fatalf("Type = %q, want event_msg", msg.Type)
+	}
+	if string(msg.Raw) != unknownLine {
+		t.Fatalf("Raw mismatch:\n got: %s\nwant: %s", msg.Raw, unknownLine)
+	}
+}
+
+func TestReadCodexFileTokenCountEventMsgSkipped(t *testing.T) {
+	path := writeJSONL(t,
+		`{"timestamp":"2026-05-03T00:08:00.000Z","type":"event_msg","payload":{"type":"token_count","input_tokens":10,"output_tokens":2}}`,
+		`{"timestamp":"2026-05-03T00:08:01.000Z","type":"event_msg","payload":{"type":"new_future_type","data":"diagnostic"}}`,
+	)
+
+	sess, err := ReadCodexFile(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := len(sess.Messages); got != 1 {
+		t.Fatalf("Messages = %d, want only unknown diagnostic event", got)
+	}
+	if sess.Messages[0].Type != "event_msg" {
+		t.Fatalf("Type = %q, want event_msg", sess.Messages[0].Type)
+	}
+	if !strings.Contains(string(sess.Messages[0].Raw), "new_future_type") {
+		t.Fatalf("Raw = %s, want unknown diagnostic event", sess.Messages[0].Raw)
+	}
+}
+
+func TestReadCodexFileCustomToolPayloadsPreserved(t *testing.T) {
+	path := writeJSONL(t,
+		`{"timestamp":"2026-05-03T00:08:00.000Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-edit","name":"apply_patch","input":{"patch":"*** Begin Patch\n*** End Patch"}}}`,
+		`{"timestamp":"2026-05-03T00:08:01.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-edit","output":{"output":"Success. Updated files."}}}`,
+	)
+
+	sess, err := ReadCodexFile(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(sess.Messages); got != 2 {
+		t.Fatalf("Messages = %d, want 2", got)
+	}
+	toolUseBlocks := sess.Messages[0].ContentBlocks()
+	if len(toolUseBlocks) != 1 {
+		t.Fatalf("tool use blocks = %d, want 1", len(toolUseBlocks))
+	}
+	if toolUseBlocks[0].Type != "tool_use" || toolUseBlocks[0].ID != "call-edit" {
+		t.Fatalf("tool use block = %#v, want call-edit tool_use", toolUseBlocks[0])
+	}
+	assertRawMetadata(t, toolUseBlocks[0].Input, map[string]any{"patch": "*** Begin Patch\n*** End Patch"})
+
+	toolResultBlocks := sess.Messages[1].ContentBlocks()
+	if len(toolResultBlocks) != 1 {
+		t.Fatalf("tool result blocks = %d, want 1", len(toolResultBlocks))
+	}
+	if toolResultBlocks[0].Type != "tool_result" || toolResultBlocks[0].ToolUseID != "call-edit" {
+		t.Fatalf("tool result block = %#v, want call-edit tool_result", toolResultBlocks[0])
+	}
+	assertRawMetadata(t, toolResultBlocks[0].Content, map[string]any{"output": "Success. Updated files."})
+}
+
+func TestReadCodexFileFunctionCallFallsBackToID(t *testing.T) {
+	path := writeJSONL(t,
+		`{"timestamp":"2026-05-03T00:08:00.000Z","type":"response_item","payload":{"type":"function_call","id":"call-from-id","name":"Read"}}`,
+	)
+
+	sess, err := ReadCodexFile(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(sess.Messages); got != 1 {
+		t.Fatalf("Messages = %d, want 1", got)
+	}
+	blocks := sess.Messages[0].ContentBlocks()
+	if len(blocks) != 1 {
+		t.Fatalf("blocks = %d, want 1", len(blocks))
+	}
+	if blocks[0].ID != "call-from-id" {
+		t.Fatalf("tool_use id = %q, want id fallback", blocks[0].ID)
+	}
+}
 
 func TestFindCodexSessionFileIn(t *testing.T) {
 	sessDir := t.TempDir()
@@ -793,6 +1710,115 @@ func TestFindCodexSessionFileUsesObservedRoots(t *testing.T) {
 	}
 }
 
+func TestFindCodexSessionFileByIDNoWindowMatchesRolloutSuffix(t *testing.T) {
+	sessDir := t.TempDir()
+	workDir := "/data/projects/myproject"
+	dayDir := filepath.Join(sessDir, "2026", "05", "19")
+	if err := os.MkdirAll(dayDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	targetID := "019e3e8e-3591-7532-a1ef-8b9e882bea2f"
+	targetFile := filepath.Join(dayDir, "rollout-2026-05-19T04-46-07-"+targetID+".jsonl")
+	targetMeta := fmt.Sprintf(`{"timestamp":"2026-05-19T04:46:07.848Z","type":"session_meta","payload":{"id":%q,"cwd":%q}}`, targetID, workDir)
+	if err := os.WriteFile(targetFile, []byte(targetMeta+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	otherID := "019e3e8e-ffff-7000-a1ef-8b9e882bea2f"
+	otherFile := filepath.Join(dayDir, "rollout-2026-05-19T04-47-07-"+otherID+".jsonl")
+	otherMeta := fmt.Sprintf(`{"timestamp":"2026-05-19T04:47:07.848Z","type":"session_meta","payload":{"id":%q,"cwd":%q}}`, otherID, workDir)
+	if err := os.WriteFile(otherFile, []byte(otherMeta+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := FindCodexSessionFileByIDNoWindow([]string{sessDir}, workDir, targetID); got != targetFile {
+		t.Fatalf("FindCodexSessionFileByIDNoWindow() = %q, want %q", got, targetFile)
+	}
+	// A workDir mismatch must refuse attribution even when the id suffix matches.
+	if got := FindCodexSessionFileByIDNoWindow([]string{sessDir}, "/data/projects/other", targetID); got != "" {
+		t.Fatalf("FindCodexSessionFileByIDNoWindow(other workDir) = %q, want empty", got)
+	}
+}
+
+func TestFindCodexSessionFileByIDNoWindowRejectsSubstringKey(t *testing.T) {
+	sessDir := t.TempDir()
+	workDir := "/data/projects/myproject"
+	dayDir := filepath.Join(sessDir, "2026", "05", "19")
+	if err := os.MkdirAll(dayDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	fullID := "019e3e8e-3591-7532-a1ef-8b9e882bea2f"
+	// The id appears as a substring in these filenames but never as the exact
+	// "-<id>.jsonl" suffix, so the keyed lookup must refuse both.
+	prefixFile := filepath.Join(dayDir, "rollout-2026-05-19T04-46-07-"+fullID+"-resumed.jsonl")
+	meta := fmt.Sprintf(`{"timestamp":"2026-05-19T04:46:07.848Z","type":"session_meta","payload":{"cwd":%q}}`, workDir)
+	if err := os.WriteFile(prefixFile, []byte(meta+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A truncated key is a substring of the real filename suffix; the old
+	// strings.Contains matcher would have accepted it, the suffix matcher must not.
+	truncated := fullID[:len(fullID)-4]
+	if got := FindCodexSessionFileByIDNoWindow([]string{sessDir}, workDir, truncated); got != "" {
+		t.Fatalf("FindCodexSessionFileByIDNoWindow(truncated) = %q, want empty (no substring match)", got)
+	}
+	// The full id is present but only as a non-suffix substring; still no match.
+	if got := FindCodexSessionFileByIDNoWindow([]string{sessDir}, workDir, fullID); got != "" {
+		t.Fatalf("FindCodexSessionFileByIDNoWindow(non-suffix substring) = %q, want empty", got)
+	}
+}
+
+func TestFindCodexSessionFileInTimeWindowRequiresUniqueMatch(t *testing.T) {
+	sessDir := t.TempDir()
+	workDir := "/data/projects/myproject"
+	dayDir := filepath.Join(sessDir, "2026", "05", "19")
+	if err := os.MkdirAll(dayDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Date(2026, 5, 19, 4, 46, 0, 0, time.UTC)
+	for _, name := range []string{"rollout-one.jsonl", "rollout-two.jsonl"} {
+		path := filepath.Join(dayDir, name)
+		meta := fmt.Sprintf(`{"timestamp":"2026-05-19T04:46:07Z","type":"session_meta","payload":{"cwd":%q}}`, workDir)
+		if err := os.WriteFile(path, []byte(meta+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := FindCodexSessionFileInTimeWindow([]string{sessDir}, workDir, start, start.Add(time.Minute)); got != "" {
+		t.Fatalf("FindCodexSessionFileInTimeWindow() = %q, want empty for non-unique window", got)
+	}
+}
+
+func TestFindCodexSessionFileInTimeWindowDedupsSymlinkAliasRoots(t *testing.T) {
+	base := t.TempDir()
+	workDir := "/data/projects/myproject"
+	dayDir := filepath.Join(base, "2026", "05", "19")
+	if err := os.MkdirAll(dayDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Date(2026, 5, 19, 4, 46, 7, 0, time.UTC)
+	rollout := filepath.Join(dayDir, "rollout-2026-05-19T04-46-07-019e3e8e-3591-7532-a1ef-8b9e882bea2f.jsonl")
+	meta := fmt.Sprintf(`{"timestamp":%q,"type":"session_meta","payload":{"cwd":%q}}`, start.Format(time.RFC3339), workDir)
+	if err := os.WriteFile(rollout, []byte(meta+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A symlinked "account root" that resolves back into base, so the single
+	// physical rollout is reachable via both the direct date tree and the
+	// symlinked root. Without physical-identity dedup it is counted twice and
+	// the uniqueness gate wrongly collapses the window to empty.
+	if err := os.Symlink(base, filepath.Join(base, "account-alias")); err != nil {
+		t.Skipf("symlink unsupported on this platform: %v", err)
+	}
+
+	if got := FindCodexSessionFileInTimeWindow([]string{base}, workDir, start, time.Time{}); got != rollout {
+		t.Fatalf("FindCodexSessionFileInTimeWindow() = %q, want %q (symlink alias must not double-count)", got, rollout)
+	}
+}
+
 func TestCodexSessionCWD(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "test.jsonl")
@@ -825,6 +1851,20 @@ func TestFindSessionFileFallsBackToCodex(t *testing.T) {
 	got := FindSessionFile([]string{t.TempDir()}, "/nonexistent/codex/project")
 	if got != "" {
 		t.Errorf("expected empty, got %q", got)
+	}
+}
+
+func TestFindSessionFileFallsBackToPi(t *testing.T) {
+	base := t.TempDir()
+	workDir := filepath.Join(t.TempDir(), "pi-project")
+	want := filepath.Join(base, "session.jsonl")
+	body := `{"type":"session","version":3,"id":"ses_pi","timestamp":"2026-02-02T00:00:00.000Z","cwd":"` + filepath.ToSlash(workDir) + `"}`
+	if err := os.WriteFile(want, []byte(body+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := FindSessionFile([]string{base}, workDir); got != want {
+		t.Fatalf("FindSessionFile() = %q, want Pi fallback %q", got, want)
 	}
 }
 
@@ -866,6 +1906,13 @@ func TestFindGeminiSessionFileUsesObservedRoots(t *testing.T) {
 	got := FindGeminiSessionFile([]string{root}, workDir)
 	if got != sessionFile {
 		t.Errorf("got %q, want %q", got, sessionFile)
+	}
+}
+
+func skipUnlessDarwinClaudePathAliases(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS-only /tmp <-> /private/tmp Claude project path alias")
 	}
 }
 
@@ -917,7 +1964,90 @@ func TestReadGeminiFileConvertsMessages(t *testing.T) {
 	}
 }
 
+func TestReadGeminiFileConvertsInteractions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.json")
+	content := `{
+		"sessionId":"g-456",
+		"messages":[
+			{"id":"a1","timestamp":"2026-03-27T09:00:10Z","type":"gemini","content":"Done","interactions":[{"request_id":"req-9","id":"legacy-9","kind":"approval","state":"blocked","prompt":"Proceed?","options":["approve","reject"],"action":"respond","metadata":{"source":"gemini"}}]}
+		]
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sess, err := ReadGeminiFile(path, 0)
+	if err != nil {
+		t.Fatalf("ReadGeminiFile: %v", err)
+	}
+	if got := len(sess.Messages); got != 1 {
+		t.Fatalf("messages = %d, want 1", got)
+	}
+	blocks := sess.Messages[0].ContentBlocks()
+	if len(blocks) != 2 {
+		t.Fatalf("content blocks = %d, want 2", len(blocks))
+	}
+	if blocks[1].Type != "interaction" {
+		t.Fatalf("interaction block type = %q, want interaction", blocks[1].Type)
+	}
+	if blocks[1].RequestID != "req-9" || blocks[1].Kind != "approval" || blocks[1].State != "blocked" {
+		t.Fatalf("interaction block core fields = %#v, want preserved fields", blocks[1])
+	}
+	if blocks[1].Prompt != "Proceed?" || blocks[1].Action != "respond" {
+		t.Fatalf("interaction block prompt/action = %#v, want preserved fields", blocks[1])
+	}
+	if !reflect.DeepEqual(blocks[1].Options, []string{"approve", "reject"}) {
+		t.Fatalf("interaction block options = %#v, want preserved fields", blocks[1].Options)
+	}
+	assertRawMetadata(t, blocks[1].Metadata, map[string]any{"source": "gemini"})
+}
+
+func TestReadGeminiFileConvertsUserInteractions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.json")
+	content := `{
+		"sessionId":"g-user-interaction",
+		"messages":[
+			{"id":"u1","timestamp":"2026-03-27T09:00:10Z","type":"user","content":"approved","interactions":[{"request_id":"req-9","kind":"approval","state":"resolved","text":"approval recorded","action":"approve"}]}
+		]
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sess, err := ReadGeminiFile(path, 0)
+	if err != nil {
+		t.Fatalf("ReadGeminiFile: %v", err)
+	}
+	if got := len(sess.Messages); got != 1 {
+		t.Fatalf("messages = %d, want 1", got)
+	}
+	blocks := sess.Messages[0].ContentBlocks()
+	if len(blocks) != 2 {
+		t.Fatalf("content blocks = %d, want 2", len(blocks))
+	}
+	if blocks[0].Type != "text" || blocks[0].Text != "approved" {
+		t.Fatalf("first block = %#v, want user text block", blocks[0])
+	}
+	if blocks[1].Type != "interaction" || blocks[1].RequestID != "req-9" || blocks[1].State != "resolved" {
+		t.Fatalf("interaction block = %#v, want resolved interaction", blocks[1])
+	}
+	if blocks[1].Text != "approval recorded" || blocks[1].Action != "approve" {
+		t.Fatalf("interaction text/action = %#v, want preserved fields", blocks[1])
+	}
+}
+
 // --- helpers ---
+
+func assertRawMetadata(t *testing.T, raw json.RawMessage, want map[string]any) {
+	t.Helper()
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal metadata %s: %v", string(raw), err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("metadata = %#v, want %#v", got, want)
+	}
+}
 
 func makeEntries(uuids ...string) []*Entry {
 	entries := make([]*Entry, len(uuids))

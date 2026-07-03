@@ -6,41 +6,53 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 // buildAwakeInputFromReconciler constructs AwakeInput from the reconciler's
-// existing data. Runtime state (running, attached) is populated from the
-// already-computed wakeTargets to avoid redundant tmux calls.
+// existing data. Runtime liveness is populated from the already-computed
+// wakeTargets; attachment and pending interactions come from provider
+// capability probes.
 func buildAwakeInputFromReconciler(
 	cfg *config.City,
+	cityPath string,
 	sessionBeads []beads.Bead,
 	poolDesired map[string]int,
+	namedSessionDemand map[string]bool,
 	workSet map[string]bool,
 	readyWaitSet map[string]bool,
 	assignedWorkBeads []beads.Bead,
+	readyAssignedFlags []bool,
 	wakeTargets []wakeTarget,
 	sp runtime.Provider,
 	clk time.Time,
 ) AwakeInput {
 	input := AwakeInput{
-		ScaleCheckCounts: poolDesired,
-		WorkSet:          workSet,
-		ReadyWaitSet:     readyWaitSet,
-		RunningSessions:  make(map[string]bool),
-		AttachedSessions: make(map[string]bool),
-		PendingSessions:  make(map[string]bool),
-		ChatIdleTimeout:  cfg.ChatSessions.IdleTimeoutDuration(),
-		Now:              clk,
+		ScaleCheckCounts:   poolDesired,
+		NamedSessionDemand: cloneBoolMap(namedSessionDemand),
+		WorkSet:            workSet,
+		ReadyWaitSet:       readyWaitSet,
+		RunningSessions:    make(map[string]bool),
+		AttachedSessions:   make(map[string]bool),
+		PendingSessions:    make(map[string]bool),
+		ChatIdleTimeout:    cfg.ChatSessions.IdleTimeoutDuration(),
+		ManualGracePeriod:  cfg.ChatSessions.GracePeriodDuration(),
+		Now:                clk,
 	}
 
-	// Agents
+	// Agents. Load runtime suspension state once against the in-scope
+	// city path so suspension resolves against the controlled city
+	// rather than the process cwd.
+	suspState, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
 	for i := range cfg.Agents {
 		a := &cfg.Agents[i]
 		agent := AwakeAgent{
-			QualifiedName:  a.QualifiedName(),
-			Suspended:      isAgentEffectivelySuspended(cfg, a),
-			SleepAfterIdle: parseSleepDuration(a.SleepAfterIdle),
+			QualifiedName:     a.QualifiedName(),
+			Suspended:         isAgentEffectivelySuspendedWith(cfg, a, suspState),
+			SleepAfterIdle:    parseSleepDuration(a.SleepAfterIdle),
+			MinActiveSessions: a.EffectiveMinActiveSessions(),
 		}
 		if len(a.DependsOn) > 0 {
 			agent.DependsOn = a.DependsOn
@@ -49,21 +61,34 @@ func buildAwakeInputFromReconciler(
 	}
 
 	// Named sessions
+	cityName := config.EffectiveCityName(cfg, "")
 	for i := range cfg.NamedSessions {
 		ns := &cfg.NamedSessions[i]
+		identity := ns.QualifiedName()
 		input.NamedSessions = append(input.NamedSessions, AwakeNamedSession{
-			Identity: ns.QualifiedName(),
-			Template: ns.QualifiedName(),
-			Mode:     ns.Mode,
+			Identity:    identity,
+			Template:    ns.TemplateQualifiedName(),
+			Mode:        ns.Mode,
+			RuntimeName: config.NamedSessionRuntimeName(cityName, cfg.Workspace, identity),
 		})
 	}
 
-	// Work beads
-	for _, wb := range assignedWorkBeads {
+	// Work beads. Readiness is the store's verdict (readyAssignedFlags), not a
+	// status-only guess: assignedWorkBeads mixes the open-routed orphan-release
+	// pass (which admits any open assigned+routed bead with no deps check) into
+	// the same slice as the genuinely-ready passes. Fabricating Ready from
+	// status alone held a blocked open bead's session awake forever (it never
+	// slept, so the resume-on-ShouldWake path never fired). readyAssignedFlags is
+	// index-aligned with assignedWorkBeads and resolved from the store-scoped
+	// readiness verdict, so a blocked open rig bead is not marked ready by a
+	// same-ID ready bead in another store. A missing flag defaults to not-ready.
+	for i := range assignedWorkBeads {
+		wb := assignedWorkBeads[i]
 		a := strings.TrimSpace(wb.Assignee)
 		if a != "" && (wb.Status == "open" || wb.Status == "in_progress") {
+			ready := i < len(readyAssignedFlags) && readyAssignedFlags[i]
 			input.WorkBeads = append(input.WorkBeads, AwakeWorkBead{
-				ID: wb.ID, Assignee: a, Status: wb.Status,
+				ID: wb.ID, Assignee: a, Status: wb.Status, Ready: ready,
 			})
 		}
 	}
@@ -78,42 +103,106 @@ func buildAwakeInputFromReconciler(
 		if name == "" {
 			continue
 		}
+		lifecycle := session.ProjectLifecycle(session.LifecycleInput{
+			Status:   b.Status,
+			Metadata: b.Metadata,
+			Now:      clk,
+		})
 		bead := AwakeSessionBead{
-			ID:             b.ID,
-			SessionName:    name,
-			Template:       b.Metadata["template"],
-			State:          normalizeBeadState(b.Metadata["state"]),
-			ManualSession:  b.Metadata["manual_session"] == "true",
-			PendingCreate:  b.Metadata["pending_create_claim"] == "true",
-			DependencyOnly: b.Metadata["dependency_only"] == "true",
-			NamedIdentity:  namedSessionIdentity(*b),
-			Drained:        isDrainedSessionMetadata(b.Metadata),
-			WaitHold:       b.Metadata["wait_hold"] == "true",
+			ID:          b.ID,
+			SessionName: name,
+			// Canonicalize so adopted beads persisted under a legacy identity
+			// (e.g. a removed binding) key the awake engine by the current
+			// agent template. Unresolvable templates pass through unchanged.
+			Template:               normalizeAgentTemplateIdentity(cfg, b.Metadata["template"]),
+			State:                  string(lifecycle.CompatState),
+			SleepReason:            b.Metadata["sleep_reason"],
+			ManualSession:          isManualSessionBead(*b),
+			PendingCreate:          lifecycle.HasWakeCause(session.WakeCausePendingCreate),
+			ExplicitWake:           lifecycle.HasWakeCause(session.WakeCauseExplicit),
+			DependencyOnly:         b.Metadata["dependency_only"] == "true",
+			NamedIdentity:          lifecycle.NamedIdentity,
+			ConfiguredNamedSession: isNamedSessionBead(*b),
+			Pinned:                 lifecycle.HasWakeCause(session.WakeCausePinned),
+			Drained:                lifecycle.BaseState == session.BaseStateDrained,
+			WaitHold:               b.Metadata["wait_hold"] == "true",
+			RestartRequested:       strings.TrimSpace(b.Metadata["restart_requested"]) == "true",
+			ContinuationResetPending: strings.TrimSpace(b.Metadata["continuation_reset_pending"]) == "true" &&
+				strings.TrimSpace(b.Metadata[session.ResetCommittedAtKey]) != "",
+			CurrentlyProcessingBeadID: strings.TrimSpace(b.Metadata[session.CurrentBeadIDKey]),
 		}
-		if t, err := time.Parse(time.RFC3339, b.Metadata["held_until"]); err == nil && !t.IsZero() {
-			bead.HeldUntil = t
-		}
-		if t, err := time.Parse(time.RFC3339, b.Metadata["quarantined_until"]); err == nil && !t.IsZero() {
-			bead.QuarantinedUntil = t
-		}
+		bead.HeldUntil = lifecycle.HeldUntil
+		bead.QuarantinedUntil = lifecycle.QuarantinedUntil
+		bead.CreatedAt = b.CreatedAt
 		if t, err := time.Parse(time.RFC3339, b.Metadata["detached_at"]); err == nil && !t.IsZero() {
 			bead.IdleSince = t
 		}
 		input.SessionBeads = append(input.SessionBeads, bead)
 	}
 
-	// Runtime state from wakeTargets (already computed, no extra tmux calls)
+	// Preserve the reconciler's existing wake continuity for already-materialized
+	// on-demand named sessions: when work_query matched the backing template and
+	// the canonical bead still exists, carry an explicit named-session work-query
+	// signal rather than waking ordinary siblings from the generic WorkSet path.
+	for _, ns := range input.NamedSessions {
+		if ns.Mode != "on_demand" || !input.WorkSet[ns.Template] {
+			continue
+		}
+		if resolveNamedSessionBeadName(input.SessionBeads, ns) == "" {
+			continue
+		}
+		if input.NamedSessionWorkQ == nil {
+			input.NamedSessionWorkQ = make(map[string]bool)
+		}
+		input.NamedSessionWorkQ[ns.Identity] = true
+	}
+
+	// Runtime liveness comes from wakeTargets. Attachment is probed only when
+	// it can affect the awake decision; the common active desired-session path
+	// is already awake and has no idle reference to suppress.
 	for _, target := range wakeTargets {
-		name := target.session.Metadata["session_name"]
+		name := strings.TrimSpace(target.session.Metadata["session_name"])
+		if name == "" {
+			continue
+		}
 		if target.alive {
 			input.RunningSessions[name] = true
 		}
-		if sp != nil && sp.IsAttached(name) {
-			input.AttachedSessions[name] = true
+		if shouldProbeAttachmentForAwakeInput(target, cfg, poolDesired) {
+			if attached, err := workerSessionTargetAttachedWithConfig("", nil, sp, nil, name); err == nil && attached {
+				input.AttachedSessions[name] = true
+			}
+		}
+		if pendingInteractionReady(sp, name) {
+			input.PendingSessions[name] = true
 		}
 	}
 
 	return input
+}
+
+func shouldProbeAttachmentForAwakeInput(target wakeTarget, cfg *config.City, poolDesired map[string]int) bool {
+	if target.session == nil {
+		return false
+	}
+	if !target.alive {
+		return false
+	}
+	state := target.session.Metadata["state"]
+	if state != string(session.StateActive) && state != string(session.StateAwake) {
+		return true
+	}
+	if target.session.Metadata["detached_at"] != "" {
+		return true
+	}
+	template := normalizedSessionTemplate(*target.session, cfg)
+	if template == "" {
+		template = target.session.Metadata["template"]
+	}
+	if template != "" && poolDesired[template] > 0 {
+		return false
+	}
+	return true
 }
 
 // awakeSetToWakeEvals converts ComputeAwakeSet output to wakeEvaluation map
@@ -130,35 +219,43 @@ func awakeSetToWakeEvals(decisions map[string]AwakeDecision, sessionBeads []Awak
 			switch d.Reason {
 			case "pending-create":
 				reasons = []WakeReason{WakeCreate}
+			case "explicit-wake":
+				reasons = []WakeReason{WakeConfig}
 			case "attached":
 				reasons = []WakeReason{WakeAttached}
 			case "pending":
 				reasons = []WakeReason{WakePending}
+			case "pin":
+				reasons = []WakeReason{WakePin}
 			case "wait-ready":
 				reasons = []WakeReason{WakeWait}
-			case "work-query":
+			case "assigned-work", "named-demand", "work-query":
 				reasons = []WakeReason{WakeWork}
+			case "min-active":
+				reasons = []WakeReason{WakeConfig}
 			default:
 				reasons = []WakeReason{WakeConfig}
 			}
 		}
 		evals[bead.ID] = wakeEvaluation{
 			Reasons:          reasons,
+			Reason:           d.Reason,
 			ConfigSuppressed: d.Reason == "idle-sleep",
+			HasAssignedWork:  d.HasAssignedWork,
 		}
 	}
 	return evals
 }
 
-func normalizeBeadState(state string) string {
-	switch state {
-	case "awake":
-		return "active"
-	case "drained":
-		return "asleep"
-	default:
-		return state
+func cloneBoolMap(source map[string]bool) map[string]bool {
+	if source == nil {
+		return nil
 	}
+	out := make(map[string]bool, len(source))
+	for key, value := range source {
+		out[key] = value
+	}
+	return out
 }
 
 func parseSleepDuration(s string) time.Duration {

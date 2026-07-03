@@ -1,19 +1,35 @@
 package doctor
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/gastownhall/gascity/internal/beads"
 )
 
 // RequiredCustomTypes lists the bead types that Gas City requires
 // to be registered with every bd store (city + rigs).
+//
+// "convergence" is included because gc's convergence handler
+// (internal/convergence/create.go) creates beads with type="convergence"
+// as the root of every convergence loop. Without it registered, every
+// `gc converge create` call fails with "invalid issue type: convergence".
+//
+// "step" is included because formula instantiation creates non-root
+// step beads with type="step" (internal/molecule/molecule.go Instantiate)
+// so Ready() and `bd ready` can exclude formula scaffolding from actionable
+// work queues. Without it registered, formula dispatch fails with
+// "invalid issue type: step" (#1039).
 var RequiredCustomTypes = []string{
 	"molecule", "convoy", "message", "event", "gate",
 	"merge-request", "agent", "role", "rig", "session", "spec",
-	"nudge",
+	"convergence", "step",
 }
 
 // CustomTypesCheck verifies that all required Gas City custom bead
@@ -87,24 +103,93 @@ func (c *CustomTypesCheck) Run(_ *CheckContext) *CheckResult {
 // CanFix returns true — missing types can be registered.
 func (c *CustomTypesCheck) CanFix() bool { return true }
 
-// Fix registers all required custom types with the bd store.
+// Fix registers any missing required custom types with the bd store,
+// preserving any additional custom types the user has already added.
+//
+// This function MUST merge — not overwrite — because a city may have
+// additional custom types registered beyond the RequiredCustomTypes
+// baseline (e.g., pack-specific types, user-defined types). Overwriting
+// would silently delete those, causing failures the next time code tries
+// to create beads of the deleted types.
 func (c *CustomTypesCheck) Fix(_ *CheckContext) error {
 	if len(c.missing) == 0 {
 		return nil
 	}
-	fullList := strings.Join(RequiredCustomTypes, ",")
-	return setCustomTypes(c.Dir, fullList)
+	// Read the current list so we can preserve user-added types.
+	// If we cannot read it, return the error rather than overwriting —
+	// silently dropping user types is worse than failing loud.
+	current, err := getCustomTypes(c.Dir)
+	if err != nil {
+		return fmt.Errorf("reading current custom types: %w", err)
+	}
+	merged := mergeCustomTypes(current, RequiredCustomTypes)
+	return setCustomTypes(c.Dir, strings.Join(merged, ","))
+}
+
+// mergeCustomTypes returns the union of current and required, in order:
+// current entries first (preserving user order), then any required entries
+// not already present. Empty/whitespace-only entries are dropped and
+// duplicates are removed.
+func mergeCustomTypes(current, required []string) []string {
+	seen := make(map[string]bool, len(current)+len(required))
+	merged := make([]string, 0, len(current)+len(required))
+	for _, t := range current {
+		trimmed := strings.TrimSpace(t)
+		if trimmed == "" {
+			continue
+		}
+		if seen[trimmed] {
+			continue
+		}
+		seen[trimmed] = true
+		merged = append(merged, trimmed)
+	}
+	for _, req := range required {
+		if seen[req] {
+			continue
+		}
+		seen[req] = true
+		merged = append(merged, req)
+	}
+	return merged
 }
 
 // getCustomTypes reads the current types.custom config from a bd store.
+// Uses --json so an unset key returns an empty string value rather than
+// the human-readable "types.custom (not set)" sentinel (which would
+// otherwise be persisted as a fake custom type when Fix() merges).
 func getCustomTypes(dir string) ([]string, error) {
-	cmd := exec.Command("bd", "config", "get", "types.custom")
+	start := time.Now()
+	args := []string{"config", "get", "--json", "types.custom"}
+	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
 	out, err := cmd.Output()
+	exitCode := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+	beads.TraceBDCall("go:doctor.getCustomTypes", dir, args, start, exitCode, err)
 	if err != nil {
 		return nil, err
 	}
-	raw := strings.TrimSpace(string(out))
+	return parseCustomTypesJSON(out)
+}
+
+// parseCustomTypesJSON decodes the output of `bd config get --json types.custom`
+// into a list of types. Empty values yield nil (not []string{""}).
+func parseCustomTypesJSON(out []byte) ([]string, error) {
+	var parsed struct {
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		return nil, fmt.Errorf("parsing bd config get output: %w", err)
+	}
+	raw := strings.TrimSpace(parsed.Value)
 	if raw == "" {
 		return nil, nil
 	}
@@ -113,9 +198,22 @@ func getCustomTypes(dir string) ([]string, error) {
 
 // setCustomTypes writes the types.custom config to a bd store.
 func setCustomTypes(dir, types string) error {
-	cmd := exec.Command("bd", "config", "set", "types.custom", types)
+	start := time.Now()
+	args := []string{"config", "set", "types.custom", types}
+	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
-	return cmd.Run()
+	err := cmd.Run()
+	exitCode := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+	beads.TraceBDCall("go:doctor.setCustomTypes", dir, args, start, exitCode, err)
+	return err
 }
 
 // dirExists checks if a directory exists.

@@ -4,24 +4,45 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/gastownhall/gascity/internal/api"
+	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
+	"github.com/gastownhall/gascity/internal/worker"
 	"github.com/spf13/cobra"
 )
 
-// StatusJSON is the JSON output format for "gc status --json".
+// StatusJSON is the JSON output format for gc status.
 type StatusJSON struct {
-	CityName   string            `json:"city_name"`
-	CityPath   string            `json:"city_path"`
-	Controller ControllerJSON    `json:"controller"`
-	Suspended  bool              `json:"suspended"`
-	Agents     []StatusAgentJSON `json:"agents"`
-	Rigs       []StatusRigJSON   `json:"rigs"`
-	Summary    StatusSummaryJSON `json:"summary"`
+	SchemaVersion string                 `json:"schema_version"`
+	OK            bool                   `json:"ok"`
+	CityName      string                 `json:"city_name"`
+	Workspace     WorkspaceJSON          `json:"workspace"`
+	CityPath      string                 `json:"city_path"`
+	Controller    ControllerJSON         `json:"controller"`
+	Running       bool                   `json:"running"`
+	Suspended     bool                   `json:"suspended"`
+	Health        HealthJSON             `json:"health"`
+	Beads         *beads.BeadsDiagnostic `json:"beads,omitempty"`
+	Agents        []StatusAgentJSON      `json:"agents"`
+	Rigs          []StatusRigJSON        `json:"rigs"`
+	Summary       StatusSummaryJSON      `json:"summary"`
+}
+
+type WorkspaceJSON struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+type HealthJSON struct {
+	Usable   bool     `json:"usable"`
+	Degraded bool     `json:"degraded"`
+	Signals  []string `json:"signals,omitempty"`
 }
 
 // ControllerJSON represents controller state in JSON output.
@@ -39,7 +60,7 @@ type StatusAgentJSON struct {
 	Scope         string    `json:"scope"`
 	Running       bool      `json:"running"`
 	Suspended     bool      `json:"suspended"`
-	Pool          *PoolJSON `json:"pool"`
+	Pool          *PoolJSON `json:"pool,omitempty"`
 }
 
 // PoolJSON represents pool configuration in JSON output.
@@ -50,70 +71,398 @@ type PoolJSON struct {
 
 // StatusRigJSON represents a rig in the JSON status output.
 type StatusRigJSON struct {
-	Name      string `json:"name"`
-	Path      string `json:"path"`
-	Suspended bool   `json:"suspended"`
+	Name                string   `json:"name"`
+	Path                string   `json:"path"`
+	Prefix              string   `json:"prefix,omitempty"`
+	Suspended           bool     `json:"suspended"`
+	DefaultSlingTarget  string   `json:"default_sling_target,omitempty"`
+	DefaultSlingTargets []string `json:"default_sling_targets,omitempty"`
 }
 
 // StatusSummaryJSON is the agent count summary in JSON output.
 type StatusSummaryJSON struct {
-	TotalAgents       int `json:"total_agents"`
-	RunningAgents     int `json:"running_agents"`
-	ActiveSessions    int `json:"active_sessions,omitempty"`
-	SuspendedSessions int `json:"suspended_sessions,omitempty"`
+	TotalAgents       int          `json:"total_agents"`
+	RunningAgents     int          `json:"running_agents"`
+	ActiveSessions    int          `json:"active_sessions,omitempty"`
+	SuspendedSessions int          `json:"suspended_sessions,omitempty"`
+	StoreHealth       *StoreHealth `json:"store_health,omitempty"`
 }
+
+// StoreHealth is the JSON shape of the Dolt bead store health block
+// surfaced by gc status. See ADR 0002 / bead ga-d5y design D9.
+type StoreHealth struct {
+	Path         string  `json:"path"`
+	SizeBytes    int64   `json:"size_bytes"`
+	LiveRows     int     `json:"live_rows"`
+	RatioMB      float64 `json:"ratio_mb_per_row"`
+	Warning      bool    `json:"warning"`
+	ThresholdMB  float64 `json:"threshold_mb_per_row"`
+	LastGCAt     string  `json:"last_gc_at,omitempty"`
+	LastGCStatus string  `json:"last_gc_status,omitempty"`
+}
+
+var (
+	observeSessionTargetForStatus = workerObserveSessionTargetWithConfig
+	openCityStoreAtForStatus      = openCityStoreResultAt
+)
+
+var (
+	controllerStatusStandaloneFallbackTimeout = 250 * time.Millisecond
+	statusObservationTimeout                  = 750 * time.Millisecond
+	statusSessionSnapshotTimeout              = 3 * time.Second
+)
 
 // newStatusCmd creates the "gc status [path]" command.
 func newStatusCmd(stdout, stderr io.Writer) *cobra.Command {
 	var jsonFlag bool
+	var formatFlag string
 	cmd := &cobra.Command{
-		Use:   "status [path]",
+		Use:   "status [path|name]",
 		Short: "Show city-wide status overview",
 		Long: `Shows a city-wide overview: controller state, suspension,
 all agents with running status, rigs, and a summary count.`,
-		Args: cobra.MaximumNArgs(1),
+		Args:              cobra.MaximumNArgs(1),
+		ValidArgsFunction: completeCityNames,
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdCityStatus(args, jsonFlag, stdout, stderr) != 0 {
+			format := strings.ToLower(strings.TrimSpace(formatFlag))
+			switch format {
+			case "", "text", "json":
+			default:
+				fmt.Fprintf(stderr, "gc status: unsupported format %q\n", formatFlag) //nolint:errcheck // best-effort stderr
+				return errExit
+			}
+			if cmdCityStatus(args, jsonFlag || format == "json", stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&jsonFlag, "json", false, "Output in JSON format")
+	cmd.Flags().StringVar(&formatFlag, "format", "", "Output format: text or json")
 	return cmd
 }
 
 // cmdCityStatus is the CLI entry point for the city status overview.
+// Routes through the supervisor API when a controller is up and falls
+// back to the local snapshot builder otherwise.
 func cmdCityStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) int {
-	var cityPath string
-	var err error
-	if len(args) > 0 {
-		cityPath, err = filepath.Abs(args[0])
-		if err != nil {
+	cityPath, err := resolveCommandCity(args)
+	if err != nil {
+		if jsonOutput {
+			return writeJSONError(stdout, stderr, "city_resolve_failed", fmt.Sprintf("gc status: %v", err), 1)
+		}
+		fmt.Fprintf(stderr, "gc status: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+
+	configStderr := stderr
+	if jsonOutput {
+		configStderr = io.Discard
+	}
+	cfg, err := loadCityConfig(cityPath, configStderr)
+	if err != nil {
+		if jsonOutput {
+			return writeJSONError(stdout, stderr, "config_load_failed", fmt.Sprintf("gc status: %v", err), 1)
+		}
+		fmt.Fprintf(stderr, "gc status: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+
+	storeStderr := stderr
+	if jsonOutput {
+		storeStderr = io.Discard
+	}
+	store, _, code := openCityStatusStore(cityPath, storeStderr)
+	if code != 0 {
+		if jsonOutput {
+			return writeJSONError(stdout, stderr, "store_open_failed", "gc status: opening bead store failed", code)
+		}
+		return code
+	}
+	statusSnapshot := loadStatusSessionSnapshot(store, stderr)
+	sp := newStatusSessionProviderForCityWithSnapshot(cfg, cityPath, statusSnapshot)
+	dops := newDrainOps(sp)
+	c, reason := cityStatusAPIClient(cityPath)
+	return routeCityStatus(cityPath, cfg, sp, dops, c, reason, jsonOutput, stdout, stderr)
+}
+
+// cityStatusAPIClient returns (client, "") when the API path is available,
+// or (nil, reason) when the caller should fall back. Indirected through a
+// var so tests inject a client pointed at httptest.Server or force a
+// specific fallback reason without spinning up a real controller.
+var cityStatusAPIClient = func(cityPath string) (*api.Client, string) {
+	if c := apiClient(cityPath); c != nil {
+		return c, ""
+	}
+	return nil, apiClientFallbackReason(cityPath)
+}
+
+// routeCityStatus dispatches `gc status` to the supervisor API when a
+// controller is up; otherwise falls back to the local snapshot builder.
+// Emits exactly one route=... log line per exit path (gated on GC_DEBUG).
+func routeCityStatus(
+	cityPath string,
+	cfg *config.City,
+	sp runtime.Provider,
+	dops drainOps,
+	c *api.Client,
+	nilReason string,
+	jsonOutput bool,
+	stdout, stderr io.Writer,
+) int {
+	const cmdName = "status"
+	if c != nil {
+		cr, err := c.GetStatus()
+		if err == nil {
+			logRoute(stderr, cmdName, "api", "")
+			return renderCityStatusFromAPI(cityPath, cr, dops, jsonOutput, stdout)
+		}
+		if !api.ShouldFallbackForRead(err) {
+			logRoute(stderr, cmdName, "api", "error")
 			fmt.Fprintf(stderr, "gc status: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		cityPath, err = findCity(cityPath)
+		logRoute(stderr, cmdName, "fallback", api.FallbackReason(err))
 	} else {
-		cityPath, err = resolveCity()
+		logRoute(stderr, cmdName, "fallback", nilReason)
 	}
-	if err != nil {
-		fmt.Fprintf(stderr, "gc status: %v\n", err) //nolint:errcheck // best-effort stderr
-		return 1
+	store, diagnostic, code := openCityStatusStore(cityPath, stderr)
+	if code != 0 {
+		return code
 	}
-
-	cfg, err := loadCityConfig(cityPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "gc status: %v\n", err) //nolint:errcheck // best-effort stderr
-		return 1
-	}
-
-	sp := newSessionProvider()
-	dops := newDrainOps(sp)
+	statusSnapshot := loadStatusSessionSnapshot(store, stderr)
 	if jsonOutput {
-		return doCityStatusJSON(sp, cfg, cityPath, stdout, stderr)
+		return doCityStatusJSONWithDiagnosticAndSnapshot(sp, cfg, cityPath, store, diagnostic, statusSnapshot, stdout, stderr)
 	}
-	return doCityStatus(sp, dops, cfg, cityPath, stdout, stderr)
+	return doCityStatusWithStoreAndSnapshot(sp, dops, cfg, cityPath, store, statusSnapshot, stdout, stderr)
+}
+
+// renderCityStatusFromAPI renders the server's StatusView using the same
+// text and JSON formatters as the fallback path. The API path adds
+// _cache_age_s on --json output and a staleness banner on human output
+// when cache age > 30 s.
+//
+// Controller authority is not surfaced through the API response (the
+// server is the controller, so the CLI resolves that locally via
+// controllerStatusForCity — same call the fallback path makes).
+func renderCityStatusFromAPI(cityPath string, cr api.CachedRead[api.StatusView], dops drainOps, jsonOutput bool, stdout io.Writer) int {
+	snapshot := snapshotFromStatusView(cityPath, cr.Body)
+	if jsonOutput {
+		writeCityStatusJSONWithCache(snapshot, snapshot.Summary, cr.AgeSeconds, stdout)
+		return 0
+	}
+	renderCityStatusText(snapshot, dops, stdout)
+	if cr.Body.SessionCounts.Active > 0 || cr.Body.SessionCounts.Suspended > 0 {
+		fmt.Fprintln(stdout)                                                                                                      //nolint:errcheck // best-effort stdout
+		fmt.Fprintf(stdout, "Sessions: %d active, %d suspended\n", cr.Body.SessionCounts.Active, cr.Body.SessionCounts.Suspended) //nolint:errcheck // best-effort stdout
+	}
+	if cr.AgeSeconds > cacheAgeBannerThresholdSeconds {
+		fmt.Fprintf(stdout, "(cache age: %.0fs — reconciler may be lagging)\n", cr.AgeSeconds) //nolint:errcheck // best-effort stdout
+	}
+	return 0
+}
+
+// snapshotFromStatusView builds a cityStatusSnapshot from the API's
+// StatusView so the existing renderCityStatusText + cityStatusJSONFromSnapshot
+// helpers produce identical output on the API path.
+func snapshotFromStatusView(cityPath string, v api.StatusView) cityStatusSnapshot {
+	snapshot := cityStatusSnapshot{
+		CityName:   v.CityName,
+		CityPath:   v.CityPath,
+		Suspended:  v.Suspended,
+		Controller: controllerStatusForCity(cityPath),
+		Beads:      v.Beads,
+		Summary: StatusSummaryJSON{
+			TotalAgents:       v.Summary.TotalAgents,
+			RunningAgents:     v.Summary.RunningAgents,
+			ActiveSessions:    v.SessionCounts.Active,
+			SuspendedSessions: v.SessionCounts.Suspended,
+		},
+	}
+	for _, a := range v.Agents {
+		snapshot.Agents = append(snapshot.Agents, cityStatusAgentRow{
+			Agent: StatusAgentJSON{
+				Name:          a.Name,
+				QualifiedName: a.QualifiedName,
+				Scope:         a.Scope,
+				Running:       a.Running,
+				Suspended:     a.Suspended,
+			},
+			SessionName: a.SessionName,
+			GroupName:   a.GroupName,
+			ScaleLabel:  a.ScaleLabel,
+			Expanded:    a.Expanded,
+		})
+	}
+	for _, r := range v.Rigs {
+		snapshot.Rigs = append(snapshot.Rigs, StatusRigJSON{
+			Name:      r.Name,
+			Path:      r.Path,
+			Suspended: r.Suspended,
+		})
+	}
+	for _, ns := range v.NamedSessions {
+		snapshot.NamedSessions = append(snapshot.NamedSessions, cityStatusNamedSession{
+			Identity: ns.Identity,
+			Status:   ns.Status,
+			Mode:     ns.Mode,
+		})
+	}
+	if v.StoreHealth != nil {
+		snapshot.Summary.StoreHealth = &StoreHealth{
+			Path:         v.StoreHealth.Path,
+			SizeBytes:    v.StoreHealth.SizeBytes,
+			LiveRows:     v.StoreHealth.LiveRows,
+			RatioMB:      v.StoreHealth.RatioMB,
+			Warning:      v.StoreHealth.Warning,
+			ThresholdMB:  v.StoreHealth.ThresholdMB,
+			LastGCAt:     v.StoreHealth.LastGCAt,
+			LastGCStatus: v.StoreHealth.LastGCStatus,
+		}
+	}
+	return snapshot
+}
+
+// writeCityStatusJSONWithCache writes the snapshot's JSON form with a
+// leading _cache_age_s field inserted at the envelope level. Mirrors the
+// envelope shape other routed read commands emit on the API path.
+func writeCityStatusJSONWithCache(
+	snapshot cityStatusSnapshot,
+	summary StatusSummaryJSON,
+	ageSeconds float64,
+	stdout io.Writer,
+) {
+	status := cityStatusJSONFromSnapshot(snapshot, summary)
+	envelope := struct {
+		CacheAgeS  float64 `json:"_cache_age_s"`
+		StatusJSON         // inline
+	}{CacheAgeS: ageSeconds, StatusJSON: status}
+	data, err := json.MarshalIndent(envelope, "", "  ")
+	if err != nil {
+		fmt.Fprintf(stdout, "{\"error\": %q}\n", err.Error()) //nolint:errcheck // best-effort stdout
+		return
+	}
+	fmt.Fprintln(stdout, string(data)) //nolint:errcheck // best-effort stdout
+}
+
+func observeSessionTargetWithWarning(
+	cmdName string,
+	cityPath string,
+	_ beads.Store,
+	sp runtime.Provider,
+	cfg *config.City,
+	target statusObservationTarget,
+	stderr io.Writer,
+) worker.LiveObservation {
+	// Status already passes a concrete runtime session name. Resolving that
+	// string back through the bead store turns stopped pool instances such as
+	// "dog-1" into invalid bd show lookups, which can block the overview.
+	type observeResult struct {
+		observation worker.LiveObservation
+		err         error
+	}
+	done := make(chan observeResult, 1)
+	go func() {
+		obs, err := observeSessionTargetForStatus(cityPath, nil, sp, cfg, target.runtimeSessionName)
+		done <- observeResult{observation: obs, err: err}
+	}()
+
+	select {
+	case result := <-done:
+		if result.err != nil && stderr != nil {
+			fmt.Fprintf(stderr, "%s: observing %q: %v\n", cmdName, target.runtimeSessionName, result.err) //nolint:errcheck // best-effort stderr
+		}
+		return result.observation
+	case <-time.After(statusObservationTimeout):
+		if stderr != nil {
+			fmt.Fprintf(stderr, "%s: observing %q timed out after %s\n", cmdName, target.runtimeSessionName, statusObservationTimeout) //nolint:errcheck // best-effort stderr
+		}
+		return worker.LiveObservation{}
+	}
+}
+
+type statusObservationTarget struct {
+	runtimeSessionName string
+	sessionID          string
+	suspended          bool
+}
+
+func loadStatusSessionSnapshot(store beads.Store, stderr io.Writer) *sessionBeadSnapshot {
+	if store == nil {
+		return newSessionBeadSnapshot(nil)
+	}
+	type snapshotResult struct {
+		snapshot *sessionBeadSnapshot
+		err      error
+	}
+	done := make(chan snapshotResult, 1)
+	go func() {
+		snapshot, err := loadSessionBeadSnapshot(store)
+		done <- snapshotResult{snapshot: snapshot, err: err}
+	}()
+
+	select {
+	case result := <-done:
+		if result.err != nil {
+			if stderr != nil {
+				fmt.Fprintf(stderr, "gc status: loading session snapshot: %v\n", result.err) //nolint:errcheck // best-effort stderr
+			}
+			return newSessionBeadSnapshotWithError(fmt.Errorf("loading session snapshot: %w", result.err))
+		}
+		if result.snapshot == nil {
+			return newSessionBeadSnapshot(nil)
+		}
+		return result.snapshot
+	case <-time.After(statusSessionSnapshotTimeout):
+		if stderr != nil {
+			fmt.Fprintf(stderr, "gc status: loading session snapshot timed out after %s; continuing with runtime-only status\n", statusSessionSnapshotTimeout) //nolint:errcheck // best-effort stderr
+		}
+		return newSessionBeadSnapshotWithError(fmt.Errorf("loading session snapshot timed out after %s", statusSessionSnapshotTimeout))
+	}
+}
+
+func statusObservationTargetForIdentity(
+	snapshot *sessionBeadSnapshot,
+	cityName string,
+	identity string,
+	sessionTemplate string,
+) statusObservationTarget {
+	if snapshot != nil {
+		if bead, ok := snapshot.FindSessionBeadByTemplate(identity); ok {
+			if sessionName := strings.TrimSpace(bead.Metadata["session_name"]); sessionName != "" {
+				return statusObservationTarget{
+					runtimeSessionName: sessionName,
+					sessionID:          bead.ID,
+					suspended:          sessionMetadataState(bead) == string(session.StateSuspended),
+				}
+			}
+		}
+		if bead, ok := snapshot.FindSessionBeadByNamedIdentity(identity); ok {
+			if sessionName := strings.TrimSpace(bead.Metadata["session_name"]); sessionName != "" {
+				return statusObservationTarget{
+					runtimeSessionName: sessionName,
+					sessionID:          bead.ID,
+					suspended:          sessionMetadataState(bead) == string(session.StateSuspended),
+				}
+			}
+		}
+	}
+	return statusObservationTarget{
+		runtimeSessionName: sessionName(nil, cityName, identity, sessionTemplate),
+	}
+}
+
+func namedSessionBlockedBySuspension(cfg *config.City, agentCfg *config.Agent, suspState suspensionstate.State, suspendedRigs map[string]bool) bool {
+	if cfg == nil {
+		return false
+	}
+	if citySuspendedWithState(cfg, suspState) {
+		return true
+	}
+	if agentCfg == nil {
+		return false
+	}
+	return agentCfg.Suspended || (agentCfg.Dir != "" && suspendedRigs[agentCfg.Dir])
 }
 
 // doCityStatus prints the city-wide status overview. Accepts injected
@@ -125,110 +474,45 @@ func doCityStatus(
 	cityPath string,
 	stdout, stderr io.Writer,
 ) int {
-	_ = stderr // reserved for future error reporting
-
-	cityName := cfg.Workspace.Name
-	if cityName == "" {
-		cityName = filepath.Base(cityPath)
+	store, _, code := openCityStatusStore(cityPath, stderr)
+	if code != 0 {
+		return code
 	}
+	return doCityStatusWithStoreAndSnapshot(sp, dops, cfg, cityPath, store, loadStatusSessionSnapshot(store, stderr), stdout, stderr)
+}
 
-	// Header: city name and path.
-	fmt.Fprintf(stdout, "%s  %s\n", cityName, cityPath) //nolint:errcheck // best-effort stdout
+func doCityStatusWithStoreAndSnapshot(
+	sp runtime.Provider,
+	dops drainOps,
+	cfg *config.City,
+	cityPath string,
+	store beads.Store,
+	statusSnapshot *sessionBeadSnapshot,
+	stdout, stderr io.Writer,
+) int {
+	snapshot := collectCityStatusSnapshotFromStoreSnapshot(sp, cfg, cityPath, store, statusSnapshot, stderr)
+	renderCityStatusText(snapshot, dops, stdout)
 
-	ctrl := controllerStatusForCity(cityPath)
-	fmt.Fprintf(stdout, "  Controller: %s\n", controllerStatusLine(ctrl)) //nolint:errcheck // best-effort stdout
+	// Track session-snapshot degradation so we can render the textual report
+	// AND signal the failure via exit code. Restores the pre-#2005 contract
+	// that monitoring callers rely on (see #2147).
+	snapshotDegraded := statusSnapshot.LoadError() != nil
 
-	// Suspended status.
-	if citySuspended(cfg) {
-		fmt.Fprintf(stdout, "  Suspended:  yes\n") //nolint:errcheck // best-effort stdout
-	} else {
-		fmt.Fprintf(stdout, "  Suspended:  no\n") //nolint:errcheck // best-effort stdout
-	}
-
-	// Build set of suspended rig names.
-	suspendedRigs := make(map[string]bool)
-	for _, r := range cfg.Rigs {
-		if r.Suspended {
-			suspendedRigs[r.Name] = true
+	if store != nil {
+		sessions, err := collectCitySessionCounts(cityPath, store, sp, cfg, statusSnapshot)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc status: building session catalog: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if sessions.ActiveSessions > 0 || sessions.SuspendedSessions > 0 {
+			fmt.Fprintln(stdout)                                                                                            //nolint:errcheck // best-effort stdout
+			fmt.Fprintf(stdout, "Sessions: %d active, %d suspended\n", sessions.ActiveSessions, sessions.SuspendedSessions) //nolint:errcheck // best-effort stdout
 		}
 	}
 
-	// Agents section.
-	if len(cfg.Agents) > 0 {
-		fmt.Fprintln(stdout) //nolint:errcheck // best-effort stdout
-		fmt.Fprintln(stdout, "Agents:")
-
-		var totalAgents, runningAgents int
-
-		for _, a := range cfg.Agents {
-			// Effective suspended: agent-level or inherited from rig.
-			suspended := a.Suspended || (a.Dir != "" && suspendedRigs[a.Dir])
-			sp0 := scaleParamsFor(&a)
-
-			if isMultiSessionCfgAgent(&a) {
-				// Multi-session agent — show header then instances.
-				maxDisplay := fmt.Sprintf("max=%d", sp0.Max)
-				if sp0.Max < 0 {
-					maxDisplay = "max=unlimited"
-				}
-				fmt.Fprintf(stdout, "  %-24spool (min=%d, %s)\n", a.QualifiedName(), sp0.Min, maxDisplay) //nolint:errcheck // best-effort stdout
-				for _, qualifiedInstance := range discoverPoolInstances(a.Name, a.Dir, sp0, &a, cityName, cfg.Workspace.SessionTemplate, sp) {
-					sn := cliSessionName(cityPath, cityName, qualifiedInstance, cfg.Workspace.SessionTemplate)
-					status := agentStatusLine(sp, dops, sn, suspended)
-					fmt.Fprintf(stdout, "    %-22s%s\n", qualifiedInstance, status) //nolint:errcheck // best-effort stdout
-					totalAgents++
-					if sp.IsRunning(sn) {
-						runningAgents++
-					}
-				}
-			} else {
-				// Singleton agent.
-				sn := cliSessionName(cityPath, cityName, a.QualifiedName(), cfg.Workspace.SessionTemplate)
-				status := agentStatusLine(sp, dops, sn, suspended)
-				fmt.Fprintf(stdout, "  %-24s%s\n", a.QualifiedName(), status) //nolint:errcheck // best-effort stdout
-				totalAgents++
-				if sp.IsRunning(sn) {
-					runningAgents++
-				}
-			}
-		}
-
-		// Summary line.
-		fmt.Fprintln(stdout)                                                      //nolint:errcheck // best-effort stdout
-		fmt.Fprintf(stdout, "%d/%d agents running\n", runningAgents, totalAgents) //nolint:errcheck // best-effort stdout
+	if snapshotDegraded {
+		return 1
 	}
-
-	// Rigs section.
-	if len(cfg.Rigs) > 0 {
-		fmt.Fprintln(stdout) //nolint:errcheck // best-effort stdout
-		fmt.Fprintln(stdout, "Rigs:")
-		for _, r := range cfg.Rigs {
-			annotation := ""
-			if r.Suspended {
-				annotation = "  (suspended)"
-			}
-			fmt.Fprintf(stdout, "  %-24s%s%s\n", r.Name, r.Path, annotation) //nolint:errcheck // best-effort stdout
-		}
-	}
-
-	// Chat sessions count (best-effort — skip if store unavailable).
-	if store, err := openCityStoreAt(cityPath); err == nil {
-		mgr := newSessionManagerWithConfig(store, sp, cfg)
-		if sessions, err := mgr.List("", ""); err == nil && len(sessions) > 0 {
-			var active, suspended int
-			for _, s := range sessions {
-				switch s.State {
-				case session.StateActive:
-					active++
-				case session.StateSuspended:
-					suspended++
-				}
-			}
-			fmt.Fprintln(stdout)                                                          //nolint:errcheck // best-effort stdout
-			fmt.Fprintf(stdout, "Sessions: %d active, %d suspended\n", active, suspended) //nolint:errcheck // best-effort stdout
-		}
-	}
-
 	return 0
 }
 
@@ -240,136 +524,98 @@ func doCityStatusJSON(
 	cityPath string,
 	stdout, stderr io.Writer,
 ) int {
-	_ = stderr // reserved for future error reporting
-
-	cityName := cfg.Workspace.Name
-	if cityName == "" {
-		cityName = filepath.Base(cityPath)
+	store, diagnostic, code := openCityStatusStore(cityPath, stderr)
+	if code != 0 {
+		return code
 	}
+	return doCityStatusJSONWithDiagnosticAndSnapshot(sp, cfg, cityPath, store, diagnostic, loadStatusSessionSnapshot(store, stderr), stdout, stderr)
+}
 
-	// Build suspended rig lookup.
-	suspendedRigs := make(map[string]bool)
-	for _, r := range cfg.Rigs {
-		if r.Suspended {
-			suspendedRigs[r.Name] = true
+func doCityStatusJSONWithDiagnosticAndSnapshot(
+	sp runtime.Provider,
+	cfg *config.City,
+	cityPath string,
+	store beads.Store,
+	diagnostic *beads.BeadsDiagnostic,
+	statusSnapshot *sessionBeadSnapshot,
+	stdout, stderr io.Writer,
+) int {
+	snapshot := collectCityStatusSnapshotFromStoreSnapshot(sp, cfg, cityPath, store, statusSnapshot, stderr)
+	snapshot.Beads = diagnostic
+	// Track session-snapshot degradation so we can emit the JSON payload AND
+	// signal the failure via exit code. Restores the pre-#2005 contract that
+	// monitoring callers rely on (see #2147).
+	snapshotDegraded := statusSnapshot.LoadError() != nil
+	if store != nil {
+		sessions, err := collectCitySessionCounts(cityPath, store, sp, cfg, statusSnapshot)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc status: building session catalog: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
 		}
+		snapshot.Summary.ActiveSessions = sessions.ActiveSessions
+		snapshot.Summary.SuspendedSessions = sessions.SuspendedSessions
 	}
 
-	// Controller.
-	ctrl := controllerStatusForCity(cityPath)
-
-	// Agents.
-	var agents []StatusAgentJSON
-	var totalAgents, runningAgents int
-	for _, a := range cfg.Agents {
-		suspended := a.Suspended || (a.Dir != "" && suspendedRigs[a.Dir])
-		sp0 := scaleParamsFor(&a)
-		scope := "city"
-		if a.Dir != "" {
-			scope = "rig"
-		}
-
-		if isMultiSessionCfgAgent(&a) {
-			// Multi-session agent — emit each instance.
-			for _, qualifiedInstance := range discoverPoolInstances(a.Name, a.Dir, sp0, &a, cityName, cfg.Workspace.SessionTemplate, sp) {
-				_, instanceName := config.ParseQualifiedName(qualifiedInstance)
-				sn := cliSessionName(cityPath, cityName, qualifiedInstance, cfg.Workspace.SessionTemplate)
-				running := sp.IsRunning(sn)
-				agents = append(agents, StatusAgentJSON{
-					Name:          instanceName,
-					QualifiedName: qualifiedInstance,
-					Scope:         scope,
-					Running:       running,
-					Suspended:     suspended,
-					Pool:          &PoolJSON{Min: sp0.Min, Max: sp0.Max},
-				})
-				totalAgents++
-				if running {
-					runningAgents++
-				}
-			}
-		} else {
-			// Singleton agent.
-			sn := cliSessionName(cityPath, cityName, a.QualifiedName(), cfg.Workspace.SessionTemplate)
-			running := sp.IsRunning(sn)
-			agents = append(agents, StatusAgentJSON{
-				Name:          a.Name,
-				QualifiedName: a.QualifiedName(),
-				Scope:         scope,
-				Running:       running,
-				Suspended:     suspended,
-				Pool:          nil,
-			})
-			totalAgents++
-			if running {
-				runningAgents++
-			}
-		}
-	}
-
-	// Rigs.
-	var rigs []StatusRigJSON
-	for _, r := range cfg.Rigs {
-		rigs = append(rigs, StatusRigJSON{
-			Name:      r.Name,
-			Path:      r.Path,
-			Suspended: r.Suspended,
-		})
-	}
-
-	summary := StatusSummaryJSON{TotalAgents: totalAgents, RunningAgents: runningAgents}
-
-	// Chat sessions count (best-effort).
-	if store, err := openCityStoreAt(cityPath); err == nil {
-		mgr := newSessionManagerWithConfig(store, sp, cfg)
-		if sessions, err := mgr.List("", ""); err == nil {
-			for _, s := range sessions {
-				switch s.State {
-				case session.StateActive:
-					summary.ActiveSessions++
-				case session.StateSuspended:
-					summary.SuspendedSessions++
-				}
-			}
-		}
-	}
-
-	status := StatusJSON{
-		CityName:   cityName,
-		CityPath:   cityPath,
-		Controller: ctrl,
-		Suspended:  citySuspended(cfg),
-		Agents:     agents,
-		Rigs:       rigs,
-		Summary:    summary,
-	}
-
+	status := cityStatusJSONFromSnapshot(snapshot, snapshot.Summary)
 	data, err := json.MarshalIndent(status, "", "  ")
 	if err != nil {
 		fmt.Fprintf(stderr, "gc status: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 	fmt.Fprintln(stdout, string(data)) //nolint:errcheck // best-effort stdout
+	if snapshotDegraded {
+		return 1
+	}
 	return 0
 }
 
 func controllerStatusForCity(cityPath string) ControllerJSON {
-	if pid := controllerAlive(cityPath); pid != 0 {
-		return ControllerJSON{Running: true, PID: pid, Mode: "standalone"}
-	}
 	_, registered, err := registeredCityEntry(cityPath)
+	supervisorWasAlive := false
 	if err == nil && registered {
 		ctrl := ControllerJSON{Mode: "supervisor"}
 		if pid := supervisorAliveHook(); pid != 0 {
+			supervisorWasAlive = true
 			ctrl.PID = pid
 			if running, status, known := supervisorCityRunningHook(cityPath); known {
 				ctrl.Running = running
 				ctrl.Status = status
+				return ctrl
+			}
+			if supervisorAliveHook() != 0 {
+				ctrl.Status = "unknown"
+				return ctrl
 			}
 		}
-		return ctrl
+	}
+	if supervisorWasAlive {
+		if pid := controllerAliveWithin(cityPath, controllerStatusStandaloneFallbackTimeout); pid != 0 {
+			return ControllerJSON{Running: true, PID: pid, Mode: "supervisor"}
+		}
+	}
+	if pid := controllerAlive(cityPath); pid != 0 {
+		return ControllerJSON{Running: true, PID: pid, Mode: "standalone"}
+	}
+	if err == nil && registered {
+		return ControllerJSON{Mode: "supervisor"}
 	}
 	return ControllerJSON{}
+}
+
+func controllerAliveWithin(cityPath string, timeout time.Duration) int {
+	if timeout <= 0 {
+		return controllerAlive(cityPath)
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		if pid := controllerAlive(cityPath); pid != 0 {
+			return pid
+		}
+		if time.Now().After(deadline) {
+			return 0
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 }
 
 func controllerSupervisorStatusText(status string) string {
@@ -397,16 +643,55 @@ func controllerStatusLine(ctrl ControllerJSON) string {
 	switch ctrl.Mode {
 	case "supervisor":
 		if ctrl.Running {
-			return fmt.Sprintf("supervisor (PID %d)", ctrl.PID)
+			return fmt.Sprintf("supervisor-managed (PID %d)", ctrl.PID)
 		}
 		if ctrl.PID != 0 {
-			return fmt.Sprintf("supervisor (PID %d, %s)", ctrl.PID, controllerSupervisorStatusText(ctrl.Status))
+			return fmt.Sprintf("supervisor-managed (PID %d, %s)", ctrl.PID, controllerSupervisorStatusText(ctrl.Status))
 		}
 		return "supervisor-managed (supervisor not running)"
 	case "standalone":
 		if ctrl.Running {
-			return fmt.Sprintf("standalone (PID %d)", ctrl.PID)
+			return fmt.Sprintf("standalone-managed (PID %d)", ctrl.PID)
 		}
 	}
 	return "stopped"
+}
+
+func controllerStatusGuidance(ctrl ControllerJSON, cityPath string) []string {
+	quotedPath := shellQuotePath(cityPath)
+	startCommand := "gc start " + quotedPath
+
+	switch ctrl.Mode {
+	case "standalone":
+		if !ctrl.Running {
+			return nil
+		}
+		authority := "Authority: standalone controller"
+		if ctrl.PID != 0 {
+			authority = fmt.Sprintf("Authority: standalone controller PID %d", ctrl.PID)
+		}
+		return []string{
+			authority,
+			"Next: gc stop " + quotedPath + " && " + startCommand + " to hand ownership to the supervisor",
+		}
+	case "supervisor":
+		if ctrl.PID == 0 {
+			return []string{
+				"Authority: supervisor registry; no supervisor process is running",
+				"Next: " + startCommand + " to start the supervisor and reconcile this city",
+			}
+		}
+		lines := []string{fmt.Sprintf("Authority: supervisor process PID %d", ctrl.PID)}
+		if ctrl.Running {
+			return lines
+		}
+		if ctrl.Status == "" || ctrl.Status == "unknown" {
+			return append(lines, "Next: "+startCommand+" to ask the supervisor to start this city")
+		}
+		if ctrl.Status == "init_failed" {
+			return append(lines, "Next: gc supervisor logs to see the init failure")
+		}
+		return append(lines, "Next: gc supervisor logs to inspect startup progress")
+	}
+	return nil
 }

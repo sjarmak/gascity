@@ -1,10 +1,15 @@
-// template_resolve.go extracts a pure function for resolving agent config
-// into session parameters. This is the data-only half of buildOneAgent:
-// all steps that compute values (provider resolution, dir expansion, env
-// merging, prompt rendering) without side effects.
+// template_resolve.go extracts a value-producing function for resolving
+// agent config into session parameters. Most of the work is pure (provider
+// resolution, dir expansion, env merging, prompt rendering).
 //
-// Side effects (ACP route registration, hook installation) are handled
-// by the caller (buildOneAgent).
+// One side effect lives here by necessity: managed Claude settings are
+// projected to .gc/settings.json via ensureClaudeSettingsArgs so that the
+// --settings path is on disk before runtime fingerprints are captured.
+// This is the single chokepoint for Claude projection — installAgentSideEffects
+// skips the "claude" entry in its hook list to avoid duplicate work.
+//
+// Other side effects (ACP route registration, non-Claude hook installation)
+// are handled by the caller (buildOneAgent → installAgentSideEffects).
 //
 // resolveTemplate returns TemplateParams — a value type suitable for
 // session.Manager.CreateFromParams or for constructing runtime.Config.
@@ -12,20 +17,35 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/agent"
-	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/convergence"
+	"github.com/gastownhall/gascity/internal/materialize"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
 )
+
+const (
+	startupPromptDeliveredEnv = "GC_STARTUP_PROMPT_DELIVERED"
+	managedSessionHookEnv     = "GC_MANAGED_SESSION_HOOK"
+)
+
+// resolvedProviderName returns the resolved harness/provider name, nil-safe (for
+// diagnostics on the upstream-binding render path).
+func resolvedProviderName(r *config.ResolvedProvider) string {
+	if r == nil {
+		return ""
+	}
+	return r.Name
+}
 
 // TemplateParams holds all resolved values needed to start a session.
 // This is a pure data type — no side effects, no provider references.
@@ -36,6 +56,11 @@ type TemplateParams struct {
 	Prompt string
 	// Env is the merged environment (passthrough + provider + agent + passthrough vars).
 	Env map[string]string
+	// Upstream is the selected model-serving endpoint name (a key in [upstreams],
+	// Phase C). Carried to runtime.Config.Upstream (launch-half fingerprint) so a
+	// switch relaunches the warm box; the resolved serving env is already merged
+	// into Env (and is not fingerprinted).
+	Upstream string
 	// Hints contains startup behavior (pre_start, session_setup, etc.).
 	Hints agent.StartupHints
 	// WorkDir is the resolved absolute working directory.
@@ -56,7 +81,7 @@ type TemplateParams struct {
 	// For pool instances this is the base template (e.g., "dog"), not the instance.
 	TemplateName string
 	// InstanceName is the qualified instance name used for display and events.
-	// For singletons it equals TemplateName; for pool instances it's "dog-1".
+	// For non-expanding templates it equals TemplateName; for pool instances it's "dog-1".
 	InstanceName string
 	// RigName is the resolved rig association (empty if none).
 	RigName string
@@ -64,8 +89,20 @@ type TemplateParams struct {
 	RigRoot string
 	// WakeMode controls whether the next wake resumes or starts fresh conversation state.
 	WakeMode string
-	// IsACP is true if session = "acp".
+	// IsACP is true when the resolved session transport is SessionTransportACP.
 	IsACP bool
+	// HookEnabled reports whether provider hooks are installed for this agent.
+	// Hooks complement startup delivery but do not replace the initial
+	// user-turn prompt. SessionStart hooks can add context, persist session
+	// metadata, and start background helpers, but they do not initiate the
+	// first model turn on their own.
+	HookEnabled bool
+	// SessionOverride is the per-agent session provider override (e.g., "acp",
+	// "tmux", "exec:..."). Empty means use the city-level default.
+	SessionOverride string
+	// EffectiveSessionProvider is the actual session provider after applying
+	// city-level defaults.
+	EffectiveSessionProvider string
 	// DependencyOnly marks a realized cold slot kept only so dependency wake
 	// has something concrete to wake even when pool check wants zero.
 	DependencyOnly bool
@@ -78,11 +115,21 @@ type TemplateParams struct {
 	// pool_slot metadata without reverse-engineering the slot from the name
 	// (which fails for namepool-themed instances like "fenrir").
 	PoolSlot int
+	// EnvIdentityStamped reports whether setTemplateEnvIdentity has written
+	// an authoritative GC_ALIAS/GC_AGENT identity into Env. resolveTemplate
+	// always seeds GC_ALIAS=qualifiedName, so "Env has GC_ALIAS" is not a
+	// sufficient signal on its own — callers use this flag to distinguish
+	// identity-stamped templates (pool workers, dependency floors) from the
+	// resolver's default stamping on ordinary sessions.
+	EnvIdentityStamped bool
+	// MCPServers is the effective ACP session/new MCP server set for this
+	// concrete session context.
+	MCPServers []runtime.MCPServerConfig
 }
 
 // DisplayName returns the name to use for log messages and event subjects.
 // For pool instances this is the instance name (e.g., "dog-1"); for
-// singletons it equals TemplateName.
+// non-expanding templates it equals TemplateName.
 func (tp TemplateParams) DisplayName() string {
 	if tp.InstanceName != "" {
 		return tp.InstanceName
@@ -90,10 +137,9 @@ func (tp TemplateParams) DisplayName() string {
 	return tp.TemplateName
 }
 
-// resolveTemplate computes all session parameters from a config.Agent without
-// side effects. This is a pure extraction of steps 1-13 and 15-16 from
-// buildOneAgent. The only side effect excluded is ACP route registration
-// (step 14), which the caller handles.
+// resolveTemplate computes all session parameters from a config.Agent.
+// It also reconciles managed Claude settings before wiring the active
+// --settings path so runtime fingerprinting sees the current projected file.
 //
 // qualifiedName is the agent's canonical identity. fpExtra carries additional
 // fingerprint data (e.g., pool bounds); pass nil for pool instances.
@@ -103,14 +149,21 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	if err != nil {
 		return TemplateParams{}, fmt.Errorf("agent %q: %w", qualifiedName, err)
 	}
+	sessionTransport := config.ResolveSessionCreateTransport(cfgAgent.Session, resolved)
 	// Step 2: Validate session vs provider compatibility.
-	if cfgAgent.Session == "acp" && !resolved.SupportsACP {
-		return TemplateParams{}, fmt.Errorf("agent %q: session = \"acp\" but provider %q does not support ACP (set supports_acp = true on the provider)", qualifiedName, resolved.Name)
+	switch sessionTransport {
+	case config.SessionTransportACP:
+		if !resolved.SupportsACP {
+			return TemplateParams{}, fmt.Errorf("agent %q: session = \"acp\" but provider %q does not support ACP (set supports_acp = true on the provider)", qualifiedName, resolved.Name)
+		}
+	case "", config.SessionTransportTmux:
+	default:
+		return TemplateParams{}, fmt.Errorf("agent %q: unknown session transport %q", qualifiedName, sessionTransport)
 	}
 
 	// Step 3: Expand dir template.
 	dirCtx := sessionSetupContextForAgent(p.cityPath, p.cityName, qualifiedName, cfgAgent, p.rigs)
-	workDir, err := resolveConfiguredWorkDir(p.cityPath, p.cityName, cfgAgent, p.rigs)
+	workDir, err := resolveConfiguredWorkDir(p.cityPath, p.cityName, qualifiedName, cfgAgent, p.rigs)
 	if err != nil {
 		return TemplateParams{}, fmt.Errorf("agent %q: %w", qualifiedName, err)
 	}
@@ -123,24 +176,57 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 
 	// Step 5: Build copy_files and command with settings args + schema defaults.
 	var copyFiles []runtime.CopyEntry
-	command := resolved.CommandString()
+	var command string
+	switch sessionTransport {
+	case config.SessionTransportACP:
+		command = resolved.ACPCommandString()
+	case "", config.SessionTransportTmux:
+		command = resolved.CommandString()
+	default:
+		return TemplateParams{}, fmt.Errorf("agent %q: unknown session transport %q", qualifiedName, sessionTransport)
+	}
+	providerFamily := resolvedProviderLaunchFamily(resolved)
+	installHooks := config.ResolveInstallHooks(cfgAgent, p.workspace)
+	if providerFamily == "kimi" && installHooksIncludeFamily(installHooks, "kimi", p.providers) {
+		command = appendKimiHookConfigArg(command)
+	}
 	// Append schema-derived default args (e.g., --dangerously-skip-permissions
 	// from EffectiveDefaults["permission_mode"] = "unrestricted").
 	if defaultArgs := resolved.ResolveDefaultArgs(); len(defaultArgs) > 0 {
 		command = command + " " + shellquote.Join(defaultArgs)
 	}
-	if sa := settingsArgs(p.cityPath, resolved.Name); sa != "" {
+	sa, err := ensureClaudeSettingsArgs(p.fs, p.cityPath, providerFamily, p.stderr)
+	if err != nil {
+		return TemplateParams{}, fmt.Errorf("agent %q: %w", qualifiedName, err)
+	}
+	if sa != "" {
 		command = command + " " + sa
 		settingsFile, relDst := claudeSettingsSource(p.cityPath)
 		if settingsFile != "" {
-			copyFiles = append(copyFiles, runtime.CopyEntry{Src: settingsFile, RelDst: relDst})
+			// .gc/settings.json is managed by gc (regenerated on binary upgrade).
+			// Using path-only fingerprinting prevents content changes from
+			// cascading stale-session drains to unrelated productive sessions.
+			// The legacy hooks/claude.json path is user-authored, so it uses
+			// content hashing to detect intentional changes. (ga-zfm)
+			probed := relDst != path.Join(".gc", "settings.json")
+			var contentHash string
+			if probed {
+				contentHash = runtime.HashPathContent(settingsFile)
+			}
+			copyFiles = append(copyFiles, runtime.CopyEntry{
+				Src: settingsFile, RelDst: relDst,
+				Probed: probed, ContentHash: contentHash,
+			})
 		}
 	}
 	scriptsDir := citylayout.ScriptsPath(p.cityPath)
 	if info, sErr := os.Stat(scriptsDir); sErr == nil && info.IsDir() {
-		copyFiles = append(copyFiles, runtime.CopyEntry{Src: scriptsDir, RelDst: path.Join(".gc", "scripts")})
+		copyFiles = append(copyFiles, runtime.CopyEntry{
+			Src: scriptsDir, RelDst: path.Join(".gc", "scripts"),
+			Probed: true, ContentHash: runtime.HashPathContent(scriptsDir),
+		})
 	}
-	copyFiles = stageHookFiles(copyFiles, p.cityPath, workDir)
+	copyFiles = stageHookFiles(copyFiles, p.cityPath, workDir, hookFileProvidersForResolved(resolved, installHooks, p.providers))
 
 	// Step 6: Compute session name.
 	// Uses bead-derived naming ("s-{beadID}") when a bead store is available,
@@ -150,7 +236,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 
 	// Step 7: Resolve session bead ID for traceability.
 	// Look up the session bead by session_name to get the bead ID (e.g., mc-cnf).
-	// This is what MC uses to link beads → session logs.
+	// This is what real-world apps use to link beads to session logs.
 	sessionBeadID := ""
 	if p.sessionBeads != nil {
 		for _, b := range p.sessionBeads.Open() {
@@ -161,7 +247,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		}
 	}
 	if sessionBeadID == "" && p.beadStore != nil {
-		if all, err := p.beadStore.List(beads.ListQuery{Label: "gc:session"}); err == nil {
+		if all, err := session.ExactMetadataSessionCandidates(p.beadStore, false, map[string]string{"session_name": sessName}); err == nil {
 			for _, b := range all {
 				if !session.IsSessionBeadOrRepairable(b) || b.Status == "closed" {
 					continue
@@ -182,14 +268,12 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		"GC_SESSION_NAME":     sessName,
 		"GC_SESSION_ID":       sessionBeadID,
 		"GC_TEMPLATE":         templateNameFor(cfgAgent, qualifiedName),
-		"GC_AGENT":            sessionBeadID,
+		"GC_SESSION_ORIGIN":   "ephemeral",
+		"GC_AGENT":            sessName,
 		"GC_ALIAS":            qualifiedName,
 		"BEADS_ACTOR":         sessName,
-		"GC_CITY":             p.cityPath,
-		"GC_CITY_ROOT":        p.cityPath,
-		"GC_CITY_PATH":        p.cityPath,
-		"GC_CITY_RUNTIME_DIR": citylayout.RuntimeDataDir(p.cityPath),
 		"GC_DIR":              workDir,
+		"GC_BEADS_SCOPE_ROOT": p.cityPath,
 		// Explicit empty values matter here. tmux session creation uses `env -u`
 		// only for keys present with empty strings, which prevents stale rig
 		// scope from leaking out of the tmux server's inherited environment.
@@ -202,44 +286,204 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		// Rig-scoped agents override the rig-specific keys below.
 		"GT_ROOT": p.cityPath,
 	}
+	for key, value := range cityRuntimeEnvMapForCity(p.cityPath) {
+		agentEnv[key] = value
+	}
+	// Override the city-uniform GC_CONTROL_DISPATCHER_TRACE_DEFAULT with a
+	// per-dispatcher path so each control-dispatcher writes to its own
+	// trace file (closes #1650). Goes in agentEnv (last in mergeEnv) so it
+	// wins over both passthroughEnv and the uniform city default seeded by
+	// cityRuntimeEnvMapForCity above.
+	if cfgAgent.Name == config.ControlDispatcherAgentName {
+		agentEnv["GC_CONTROL_DISPATCHER_TRACE_DEFAULT"] = citylayout.ControlDispatcherTraceDefaultPathForRuntimeDirAndName(
+			p.cityPath,
+			agentEnv["GC_CITY_RUNTIME_DIR"],
+			qualifiedName,
+		)
+	}
+	agentEnv["GC_BEADS"] = rawBeadsProviderForScope(rigRoot, p.cityPath)
 	if exe, err := os.Executable(); err == nil && exe != "" {
 		agentEnv["GC_BIN"] = exe
 	}
-	for key, value := range sessionDoltEnv(p.cityPath, rigRoot, p.rigs) {
+	sessionBackendEnv, err := sessionBackendEnvWithError(p.cityPath, rigRoot, p.rigs)
+	if err != nil {
+		return TemplateParams{}, fmt.Errorf("agent %q: building session backend env: %w", qualifiedName, err)
+	}
+	for key, value := range sessionBackendEnv {
 		agentEnv[key] = value
 	}
 	if rigName != "" {
 		agentEnv["GC_RIG"] = rigName
 		agentEnv["GC_RIG_ROOT"] = rigRoot
 		agentEnv["BEADS_DIR"] = filepath.Join(rigRoot, ".beads")
+		agentEnv["GC_BEADS_SCOPE_ROOT"] = rigRoot
 	}
 
 	// Step 9: Render prompt with beacon.
 	var prompt string
-	fragments := mergeFragmentLists(p.globalFragments, cfgAgent.InjectFragments)
+	// Merge fragment sources: V1 global_fragments + inject_fragments,
+	// per-agent append_fragments, imported-pack [agent_defaults].append_fragments,
+	// then city-level [agent_defaults].append_fragments.
+	fragments := effectivePromptFragments(
+		p.globalFragments,
+		cfgAgent.InjectFragments,
+		cfgAgent.AppendFragments,
+		cfgAgent.InheritedAppendFragments,
+		p.appendFragments,
+	)
+	providerKey, providerDisplayName := providerInfoForAgent(cfgAgent, p.workspace, p.providers)
+	packDirs := p.packDirs
+	if p.city != nil {
+		packDirs = p.city.PackDirsForRig(rigName)
+	}
+	beadsCfg := config.BeadsConfig{}
+	if p.city != nil {
+		beadsCfg = p.city.Beads
+	}
 	prompt = renderPrompt(p.fs, p.cityPath, p.cityName, cfgAgent.PromptTemplate, PromptContext{
-		CityRoot:      p.cityPath,
-		AgentName:     qualifiedName,
-		TemplateName:  cfgAgent.Name,
-		RigName:       rigName,
-		RigRoot:       rigRoot,
-		WorkDir:       workDir,
-		IssuePrefix:   findRigPrefix(rigName, p.rigs),
-		DefaultBranch: defaultBranchFor(workDir),
-		WorkQuery:     cfgAgent.EffectiveWorkQuery(),
-		SlingQuery:    cfgAgent.EffectiveSlingQuery(),
-		Env:           cfgAgent.Env,
-	}, p.sessionTemplate, p.stderr, p.packDirs, fragments, p.beadStore)
-	hasHooks := config.AgentHasHooks(cfgAgent, p.workspace, resolved.Name)
+		CityRoot:                p.cityPath,
+		AgentName:               qualifiedName,
+		TemplateName:            cfgAgent.Name,
+		BindingName:             cfgAgent.BindingName,
+		BindingPrefix:           cfgAgent.BindingPrefix(),
+		RigName:                 rigName,
+		RigRoot:                 rigRoot,
+		WorkDir:                 workDir,
+		IssuePrefix:             findRigPrefix(rigName, p.rigs),
+		DefaultBranch:           defaultBranchForRig(rigName, p.rigs, workDir),
+		AssignedInProgressQuery: expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "assigned_in_progress_query", cfgAgent.EffectiveAssignedInProgressQueryForBeads(beadsCfg), p.stderr),
+		AssignedReadyQuery:      expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "assigned_ready_query", cfgAgent.EffectiveAssignedReadyQueryForBeads(beadsCfg), p.stderr),
+		RoutedPoolQuery:         expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "routed_pool_query", cfgAgent.EffectiveRoutedPoolQueryForBeads(beadsCfg), p.stderr),
+		WorkQuery:               expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "work_query", cfgAgent.EffectiveWorkQueryForBeads(beadsCfg), p.stderr),
+		SlingQuery:              expandAgentCommandTemplate(p.cityPath, p.cityName, cfgAgent, p.rigs, "sling_query", cfgAgent.EffectiveSlingQuery(), p.stderr),
+		ProviderKey:             providerKey,
+		ProviderDisplayName:     providerDisplayName,
+		InstructionsFile:        instructionsFileForAgent(cfgAgent, p.workspace, p.providers),
+		Env:                     cfgAgent.Env,
+	}, p.sessionTemplate, p.stderr, packDirs, fragments, p.beadStore)
+	hasHooks := config.AgentHasHooks(cfgAgent, p.workspace, resolved.Name, p.providers)
 	beacon := runtime.FormatBeaconAt(p.cityName, qualifiedName, !hasHooks, p.beaconTime)
-	if prompt != "" {
+	suppressStartupPrompt := suppressStartupPromptForAgent(cfgAgent)
+	switch {
+	case suppressStartupPrompt:
+		prompt = ""
+	case prompt != "":
 		prompt = beacon + "\n\n" + prompt
-	} else {
+	default:
 		prompt = beacon
 	}
 
-	// Step 10: Merge environment layers.
-	env := convergence.ScrubTokenEnv(mergeEnv(passthroughEnv(), expandEnvMap(resolved.Env), expandEnvMap(cfgAgent.Env), agentEnv))
+	// Step 9b: Append the assigned-skills appendix when the agent
+	// has a vendor sink, hasn't opted out, AND the runtime actually
+	// delivers the skills to the session workdir. The appendix claims
+	// "these skills are materialized in your provider's skill
+	// directory and load automatically" — that claim has to match
+	// reality, so we gate on the same availability conditions as
+	// materialization itself:
+	//
+	//   - Stage-1-eligible runtime + workdir == scope root: stage 1
+	//     wrote the sink into the scope root the agent sees.
+	//   - Stage-2-eligible runtime (regardless of workdir): the
+	//     session PreStart invokes `gc internal materialize-skills`
+	//     into the session workdir before the agent starts.
+	//
+	// Agents for which neither path delivers (ACP, k8s, hybrid,
+	// subprocess with WorkDir ≠ scope root — because subprocess
+	// doesn't execute PreStart) get no appendix; we'd be lying to
+	// them. Discovered via the pass-1 Codex review.
+	if !suppressStartupPrompt && effectiveInjectAssignedSkills(cfgAgent) {
+		wsProvider := ""
+		if p.workspace != nil {
+			wsProvider = p.workspace.Provider
+		}
+		provider := effectiveAgentProviderFamily(cfgAgent, wsProvider, p.providers)
+		if _, ok := materialize.VendorSink(provider); ok {
+			scopeRoot := agentScopeRoot(cfgAgent, p.cityPath, p.rigs)
+			canonWorkDir := canonicaliseFilePath(workDir, p.cityPath)
+			stage1Delivers := canStage1Materialize(p.sessionProvider, cfgAgent) && canonWorkDir == scopeRoot
+			stage2Delivers := isStage2EligibleSession(p.sessionProvider, cfgAgent)
+			if stage1Delivers || stage2Delivers {
+				var agentCat materialize.AgentCatalog
+				if cfgAgent.SkillsDir != "" {
+					// Best-effort: a transient I/O failure loading the
+					// agent catalog shouldn't break the prompt render.
+					// The error is already surfaced via
+					// effectiveSkillsForAgent's stderr path earlier in
+					// the call graph.
+					if c, err := materialize.LoadAgentCatalog(cfgAgent.SkillsDir); err == nil {
+						agentCat = c
+					}
+				}
+				if frag := buildAssignedSkillsPromptFragment(cfgAgent, p.sharedSkillCatalogForAgent(cfgAgent), agentCat); frag != "" {
+					prompt = prompt + "\n\n" + frag
+				}
+			}
+		}
+	}
+
+	// Step 10: Merge environment layers. Workspace.Env sits between
+	// passthrough and provider so a per-provider/agent/patch entry can
+	// still override a workspace-wide default.
+	var workspaceEnv map[string]string
+	if p.workspace != nil {
+		workspaceEnv = p.workspace.Env
+	}
+	env := mergeEnv(passthroughEnv(), expandEnvMap(workspaceEnv), expandEnvMap(resolved.Env), expandEnvMap(cfgAgent.Env), agentEnv)
+	prependGCBinDirToPATH(env, env["GC_BIN"])
+	env = convergence.ScrubTokenEnv(env)
+
+	// Step 10b: Upstream axis (Phase C). Inject the selected upstream's serving
+	// env LAST so it is authoritative for the model-serving keys, and after
+	// ScrubTokenEnv so its credential refs survive. The env-ref values ($VAR)
+	// resolve from the controller environment via expandEnvMap; the resolved
+	// credentials are NOT fingerprinted (the Config.Env allow-list excludes
+	// them), only the selected NAME — carried to runtime.Config.Upstream
+	// (launch-half) so switching upstream relaunches the agent in the warm box.
+	if upstreamName := cfgAgent.Upstream; upstreamName != "" {
+		var upstreams map[string]config.UpstreamSpec
+		if p.city != nil {
+			upstreams = p.city.Upstreams
+		}
+		spec, ok := upstreams[upstreamName]
+		if !ok {
+			return TemplateParams{}, fmt.Errorf("agent %q selects upstream %q which is not declared in [upstreams]", qualifiedName, upstreamName)
+		}
+		// Render the abstract serving fields onto the agent's HARNESS env-var
+		// names (the resolved provider's upstream_env binding), so one upstream is
+		// portable across harnesses. An abstract field with no matching binding is
+		// a hard error — never a silent no-op (config-surface §4). $VAR refs in the
+		// values resolve from the controller environment.
+		if spec.HasAbstractServing() {
+			var binding config.UpstreamEnvBinding
+			if resolved != nil {
+				binding = resolved.UpstreamEnv
+			}
+			// Per field, the target env-var name is the upstream's override if set
+			// (for gateway harnesses), else the harness binding, else a hard error.
+			for _, r := range []struct{ value, override, bound, field string }{
+				{spec.BaseURL, spec.BaseURLEnv, binding.BaseURL, "base_url"},
+				{spec.APIKey, spec.APIKeyEnv, binding.APIKey, "api_key"},
+				{spec.AuthToken, spec.AuthTokenEnv, binding.AuthToken, "auth_token"},
+			} {
+				if r.value == "" {
+					continue
+				}
+				envName := r.override
+				if envName == "" {
+					envName = r.bound
+				}
+				if envName == "" {
+					return TemplateParams{}, fmt.Errorf("agent %q upstream %q sets %s, but its harness %q declares no upstream_env.%s binding (set %s_env on the upstream, or upstream_env.%s on the harness)", qualifiedName, upstreamName, r.field, resolvedProviderName(resolved), r.field, r.field, r.field)
+				}
+				env[envName] = os.ExpandEnv(r.value)
+			}
+		}
+		// Raw env is the harness-specific escape hatch, merged LAST (wins over the
+		// abstract render and ambient/agent env for the keys it sets).
+		for k, v := range expandEnvMap(spec.Env) {
+			env[k] = v
+		}
+	}
 
 	// Step 11: Expand session setup templates.
 	configDir := p.cityPath
@@ -262,30 +506,159 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		command = expanded[0]
 	}
 	expandedSetup := expandSessionSetup(cfgAgent.SessionSetup, setupCtx)
-	resolvedScript := resolveSetupScript(cfgAgent.SessionSetupScript, p.cityPath)
+	resolvedScript := config.ResolveSessionSetupScriptPath(p.cityPath, cfgAgent.SourceDir, cfgAgent.SessionSetupScript)
 	expandedPreStart := expandSessionSetup(cfgAgent.PreStart, setupCtx)
 	expandedLive := expandSessionSetup(cfgAgent.SessionLive, setupCtx)
 
+	// Step 11b: Skill materialization integration (per engdocs
+	// skill-materialization.md § "When FingerprintExtra[\"skills:*\"]
+	// is populated" and § "Stage 2 runtime gate"). Stage-2 eligible
+	// runtimes (tmux for v0.15.1) get a PreStart entry for per-session
+	// materialization into non-scope-root workdirs, and every eligible
+	// agent gets per-skill fingerprint entries so catalog edits drain.
+	// Stage-2 ineligible runtimes (subprocess/acp/k8s/hybrid/...) get
+	// neither — the materializer cannot reach them, so spurious
+	// fingerprint drift would cause pointless drain-restart cycles.
+	if isStage2EligibleSession(p.sessionProvider, cfgAgent) {
+		scopeRoot := agentScopeRoot(cfgAgent, p.cityPath, p.rigs)
+		canonWorkDir := canonicaliseFilePath(workDir, p.cityPath)
+		wsProvider := ""
+		if p.workspace != nil {
+			wsProvider = p.workspace.Provider
+		}
+		sharedCatalog := p.sharedSkillCatalogSnapshotForAgent(cfgAgent)
+		desired := effectiveSkillsForAgent(sharedCatalog, cfgAgent, wsProvider, p.providers, p.stderr)
+		if len(desired) > 0 {
+			fpExtra = mergeSkillFingerprintEntries(fpExtra, desired)
+			if canonWorkDir != scopeRoot {
+				// Pool instances inherit their skill catalog from the
+				// template, not the instance — namepool members (e.g.
+				// repo/furiosa from polecat) are not resolvable as
+				// standalone agents by `gc internal materialize-skills`.
+				// templateNameFor returns cfgAgent.PoolName for pool
+				// instances and qualifiedName for singletons.
+				materializeAgent := templateNameFor(cfgAgent, qualifiedName)
+				if sharedCatalog != nil {
+					if snapshot, err := encodeSharedCatalogSnapshot(*sharedCatalog); err == nil {
+						if writeSkillSnapshotFile(workDir, materializeAgent, snapshot) == "" {
+							removeSkillSnapshotFile(workDir, materializeAgent)
+						}
+					} else {
+						removeSkillSnapshotFile(workDir, materializeAgent)
+					}
+				} else {
+					removeSkillSnapshotFile(workDir, materializeAgent)
+				}
+				expandedPreStart = appendMaterializeSkillsPreStart(expandedPreStart, materializeAgent, workDir)
+			}
+		}
+	}
+
+	// Step 11c: MCP projection integration. Provider-native MCP config is
+	// session/runtime state rather than passive content, so every deliverable
+	// target contributes a projection hash to the runtime fingerprint. When the
+	// session workdir differs from the scope root, tmux sessions reconcile the
+	// workdir-local target via a hidden PreStart command before launch.
+	scopeRoot := agentScopeRoot(cfgAgent, p.cityPath, p.rigs)
+	canonWorkDir := canonicaliseFilePath(workDir, p.cityPath)
+	mcpCity := p.city
+	mcpCityIsSynthetic := false
+	if mcpCity == nil {
+		// Tests sometimes construct agentBuildParams directly without setting
+		// city. Build a minimal synthetic config.City so non-MCP resolution still
+		// works, but hard-error if that synthetic city resolves any effective MCP.
+		mcpCityIsSynthetic = true
+		mcpCity = &config.City{
+			Providers:         p.providers,
+			Rigs:              p.rigs,
+			PackGraphOnlyDirs: append([]string(nil), p.packDirs...),
+		}
+		if p.workspace != nil {
+			mcpCity.Workspace = *p.workspace
+		}
+		cityMCPDir := filepath.Join(p.cityPath, "mcp")
+		if info, err := os.Stat(cityMCPDir); err == nil && info.IsDir() {
+			mcpCity.PackMCPDir = cityMCPDir
+		}
+	}
+	mcpCatalog, mcpProjection, err := resolveAgentMCPProjection(
+		p.cityPath,
+		mcpCity,
+		cfgAgent,
+		qualifiedName,
+		workDir,
+		resolvedProviderLaunchFamily(resolved),
+	)
+	if err != nil {
+		return TemplateParams{}, fmt.Errorf("agent %q: %w", qualifiedName, err)
+	}
+	if mcpCityIsSynthetic && len(mcpCatalog.Servers) > 0 {
+		return TemplateParams{}, fmt.Errorf(
+			"agent %q: resolveTemplate invoked without config.City but resolved %d MCP server(s) - "+
+				"tests exercising MCP must construct a real config.City (the synthetic fallback "+
+				"cannot see import/implicit/bootstrap layers and would diverge from production)",
+			qualifiedName, len(mcpCatalog.Servers),
+		)
+	}
+	if mcpProjection.Provider != "" && len(mcpCatalog.Servers) > 0 {
+		stage1Delivers := canStage1Materialize(p.sessionProvider, cfgAgent) && canonWorkDir == scopeRoot
+		stage2Delivers := isStage2EligibleSession(p.sessionProvider, cfgAgent) && canonWorkDir != scopeRoot
+		switch {
+		case stage1Delivers || stage2Delivers:
+			fpExtra = mergeMCPFingerprintEntry(fpExtra, mcpProjection)
+			if stage2Delivers {
+				projectAgent := templateNameFor(cfgAgent, qualifiedName)
+				expandedPreStart = appendProjectMCPPreStart(expandedPreStart, projectAgent, qualifiedName, workDir)
+			}
+		default:
+			return TemplateParams{}, fmt.Errorf(
+				"agent %q: effective MCP cannot be delivered to workdir %q with session provider %q",
+				qualifiedName, workDir, p.sessionProvider,
+			)
+		}
+	}
+	var mcpServers []runtime.MCPServerConfig
+	if sessionTransport == config.SessionTransportACP {
+		mcpServers = materialize.RuntimeMCPServers(mcpCatalog.Servers)
+	}
+
 	// Step 12: Build startup hints.
+	nudge := cfgAgent.Nudge
+	acceptStartupDialogs := resolved.AcceptStartupDialogs
+	if suppressStartupPrompt {
+		// Deterministic control-dispatcher workers are subprocesses, not
+		// interactive model providers. Keep ProcessNames for liveness without
+		// routing startup through prompt, nudge, or trust-dialog handling.
+		nudge = ""
+		accept := false
+		acceptStartupDialogs = &accept
+	}
 	hints := agent.StartupHints{
+		Lifecycle:              runtime.Lifecycle(resolved.Lifecycle),
 		ReadyPromptPrefix:      resolved.ReadyPromptPrefix,
 		ReadyDelayMs:           resolved.ReadyDelayMs,
 		ProcessNames:           resolved.ProcessNames,
 		EmitsPermissionWarning: resolved.EmitsPermissionWarning,
-		Nudge:                  cfgAgent.Nudge,
+		AcceptStartupDialogs:   acceptStartupDialogs,
+		MouseOn:                cfgAgent.MouseModeOn(),
+		Nudge:                  nudge,
 		PreStart:               expandedPreStart,
 		SessionSetup:           expandedSetup,
 		SessionSetupScript:     resolvedScript,
 		SessionLive:            expandedLive,
+		ProviderName:           resolvedProviderLaunchFamily(resolved),
+		ProviderOverlayName:    strings.TrimSpace(resolved.Name),
+		InstallAgentHooks:      installHooks,
 		PackOverlayDirs:        effectiveOverlayDirs(p.packOverlayDirs, p.rigOverlayDirs, rigName),
 		OverlayDir:             overlayDir,
 		CopyFiles:              copyFiles,
 	}
 
-	return TemplateParams{
+	params := TemplateParams{
 		Command:          command,
 		Prompt:           prompt,
 		Env:              env,
+		Upstream:         cfgAgent.Upstream,
 		Hints:            hints,
 		WorkDir:          workDir,
 		SessionName:      sessName,
@@ -297,120 +670,187 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		RigName:          rigName,
 		RigRoot:          rigRoot,
 		WakeMode:         cfgAgent.WakeMode,
-		IsACP:            cfgAgent.Session == "acp",
-	}, nil
+		IsACP:            sessionTransport == config.SessionTransportACP,
+		HookEnabled:      hasHooks,
+		MCPServers:       mcpServers,
+	}
+	params.SessionOverride = cfgAgent.Session
+	params.EffectiveSessionProvider = effectiveSessionProvider(cfgAgent.Session, p.sessionProvider)
+	return params, nil
 }
 
-func sessionDoltEnv(cityPath, rigRoot string, rigs []config.Rig) map[string]string {
-	env := map[string]string{
-		// Explicit empty values let tmux unset stale Dolt vars inherited from
-		// the server environment when the current city/rig does not use them.
-		"GC_DOLT_HOST":           "",
-		"GC_DOLT_PORT":           "",
-		"GC_DOLT_USER":           "",
-		"GC_DOLT_PASSWORD":       "",
-		"BEADS_DOLT_SERVER_HOST": "",
-		"BEADS_DOLT_SERVER_PORT": "",
-		"BEADS_DOLT_SERVER_USER": "",
-		"BEADS_DOLT_PASSWORD":    "",
+func installHooksIncludeFamily(installHooks []string, family string, providers map[string]config.ProviderSpec) bool {
+	family = strings.TrimSpace(family)
+	if family == "" {
+		return false
 	}
-
-	if host := doltHostForCity(cityPath); host != "" {
-		env["GC_DOLT_HOST"] = host
-		env["BEADS_DOLT_SERVER_HOST"] = host
-	}
-	if user := os.Getenv("GC_DOLT_USER"); user != "" {
-		env["GC_DOLT_USER"] = user
-		env["BEADS_DOLT_SERVER_USER"] = user
-	}
-	if pass := os.Getenv("GC_DOLT_PASSWORD"); pass != "" {
-		env["GC_DOLT_PASSWORD"] = pass
-		env["BEADS_DOLT_PASSWORD"] = pass
-	}
-	if isExternalDolt(cityPath) {
-		if port := doltPortForCity(cityPath); port != "" {
-			env["GC_DOLT_PORT"] = port
-			env["BEADS_DOLT_SERVER_PORT"] = port
-		}
-	} else if port := currentDoltPort(cityPath); port != "" {
-		env["GC_DOLT_PORT"] = port
-		env["BEADS_DOLT_SERVER_PORT"] = port
-	}
-	if rigRoot == "" {
-		return env
-	}
-
-	for _, r := range rigs {
-		rp := r.Path
-		if !filepath.IsAbs(rp) {
-			rp = filepath.Join(cityPath, rp)
-		}
-		if filepath.Clean(rp) != filepath.Clean(rigRoot) {
+	for _, hook := range installHooks {
+		hook = strings.TrimSpace(hook)
+		if hook == "" {
 			continue
 		}
-		if r.DoltHost != "" {
-			env["GC_DOLT_HOST"] = r.DoltHost
-			env["BEADS_DOLT_SERVER_HOST"] = r.DoltHost
+		if hook == family || config.BuiltinFamily(hook, providers) == family {
+			return true
 		}
-		if r.DoltPort != "" {
-			env["GC_DOLT_PORT"] = r.DoltPort
-			env["BEADS_DOLT_SERVER_PORT"] = r.DoltPort
+	}
+	return false
+}
+
+func appendKimiHookConfigArg(command string) string {
+	parts := shellquote.Split(command)
+	if len(parts) == 0 {
+		return command
+	}
+	configArgs := []string{"--config-file", ".kimi/config.toml"}
+	if parts[len(parts)-1] == "acp" {
+		withConfig := make([]string, 0, len(parts)+len(configArgs))
+		withConfig = append(withConfig, parts[:len(parts)-1]...)
+		withConfig = append(withConfig, configArgs...)
+		withConfig = append(withConfig, parts[len(parts)-1])
+		return shellquote.Join(withConfig)
+	}
+	parts = append(parts, configArgs...)
+	return shellquote.Join(parts)
+}
+
+func suppressStartupPromptForAgent(cfgAgent *config.Agent) bool {
+	return config.IsDeterministicControlDispatcher(cfgAgent)
+}
+
+func sessionBackendEnvWithError(cityPath, rigRoot string, rigs []config.Rig) (map[string]string, error) {
+	env := map[string]string{
+		// Suppress bd's built-in Dolt auto-start. The gc controller manages
+		// the server; bd's CLI auto-start launches rogue servers from the
+		// agent's cwd with the wrong data_dir.
+		"BEADS_DOLT_AUTO_START": "0",
+	}
+	applyBdCLIRemoteSyncOptOut(env)
+	applyBdAutoBackupOptOut(env)
+	applyBdContributorRoutingOptOut(env)
+	// Explicit empty values let tmux unset stale Dolt vars inherited from
+	// the server environment when the current city/rig does not use them.
+	setProjectedDoltEnvEmpty(env)
+	ensureProjectedPostgresEnvExplicit(env)
+
+	// Session env projection must not trigger provider recovery. Session setup
+	// only publishes the currently resolved target; store operations use the
+	// bd runtime env when recovery is allowed.
+	if rigRoot == "" {
+		if cityUsesBdStoreContract(cityPath) {
+			if usedPostgres, err := applyCityPostgresBackendEnv(env, cityPath); err != nil {
+				// On PG projection errors, keep explicit empty keys so tmux
+				// clears stale inherited backend variables for the session.
+				clearProjectedDoltEnv(env)
+				clearProjectedPostgresEnv(env)
+				mirrorBeadsDoltEnv(env)
+				ensureProjectedDoltEnvExplicit(env)
+				ensureProjectedPostgresEnvExplicit(env)
+				return env, err
+			} else if usedPostgres {
+				ensureProjectedDoltEnvExplicit(env)
+				return env, nil
+			}
 		}
-		if r.DoltHost != "" || r.DoltPort != "" {
-			return env
+		if err := applyResolvedCityDoltEnv(env, cityPath, false); err != nil {
+			mirrorBeadsDoltEnv(env)
+			ensureProjectedPostgresEnvExplicit(env)
+			if !isRecoverableManagedDoltEnvError(err) {
+				return env, err
+			}
 		}
-		break
+		ensureProjectedPostgresEnvExplicit(env)
+		return env, nil
 	}
 
-	if port := currentDoltPort(rigRoot); port != "" {
-		env["GC_DOLT_HOST"] = ""
-		env["BEADS_DOLT_SERVER_HOST"] = ""
-		env["GC_DOLT_PORT"] = port
-		env["BEADS_DOLT_SERVER_PORT"] = port
+	if err := applyResolvedRigDoltEnv(env, cityPath, rigRoot, rigConfigForScopeRoot(cityPath, rigRoot, rigs), false); err != nil {
+		mirrorBeadsDoltEnv(env)
+		ensureProjectedPostgresEnvExplicit(env)
+		if !isRecoverableManagedDoltEnvError(err) {
+			return env, err
+		}
 	}
-	return env
+	ensureProjectedPostgresEnvExplicit(env)
+	return env, nil
 }
 
 // templateParamsToConfig converts TemplateParams to the runtime.Config
-// needed by Provider.Start. This mirrors managed.SessionConfig() at
-// internal/agent/agent.go:292-315 — for the same inputs, both must
-// produce identical output.
+// needed by Provider.Start. When it materializes the rendered prompt into the
+// launch or nudge path, it marks the runtime env so SessionStart hooks can add
+// context without repeating the full startup prompt.
 func templateParamsToConfig(tp TemplateParams) runtime.Config {
 	var promptSuffix string
 	var promptFlag string
 	nudge := tp.Hints.Nudge
+	env := maps.Clone(tp.Env)
+	startupPromptDelivered := false
 	if tp.Prompt != "" {
-		if tp.ResolvedProvider != nil && tp.ResolvedProvider.PromptMode == "none" {
-			if nudge != "" {
-				nudge = tp.Prompt + "\n\n---\n\n" + nudge
-			} else {
-				nudge = tp.Prompt
-			}
-		} else {
+		// SessionStart hooks can enrich context, but the startup prompt still
+		// needs a first-turn delivery mechanism. Without argv/flag/nudge
+		// delivery, freshly spawned workers sit idle at the provider prompt.
+		switch {
+		case tp.IsACP:
+			nudge = prependStartupPromptToNudge(tp.Prompt, nudge)
+			startupPromptDelivered = true
+		case tp.ResolvedProvider != nil && tp.ResolvedProvider.PromptMode == "none":
+			nudge = prependStartupPromptToNudge(tp.Prompt, nudge)
+			startupPromptDelivered = true
+		default:
 			promptSuffix = shellquote.Quote(tp.Prompt)
-			if tp.ResolvedProvider != nil && tp.ResolvedProvider.PromptMode == "flag" && tp.ResolvedProvider.PromptFlag != "" {
-				promptFlag = tp.ResolvedProvider.PromptFlag
+			startupPromptDelivered = promptSuffix != ""
+			if tp.ResolvedProvider != nil && tp.ResolvedProvider.PromptMode == "flag" {
+				if tp.ResolvedProvider.PromptFlag != "" {
+					promptFlag = tp.ResolvedProvider.PromptFlag
+				} else {
+					startupPromptDelivered = false
+				}
 			}
 		}
 	}
-	return runtime.Config{
-		Command:                tp.Command,
-		PromptSuffix:           promptSuffix,
-		PromptFlag:             promptFlag,
-		Env:                    tp.Env,
-		WorkDir:                tp.WorkDir,
-		ReadyPromptPrefix:      tp.Hints.ReadyPromptPrefix,
-		ReadyDelayMs:           tp.Hints.ReadyDelayMs,
-		ProcessNames:           tp.Hints.ProcessNames,
-		EmitsPermissionWarning: tp.Hints.EmitsPermissionWarning,
-		Nudge:                  nudge,
-		PreStart:               tp.Hints.PreStart,
-		SessionSetup:           tp.Hints.SessionSetup,
-		SessionSetupScript:     tp.Hints.SessionSetupScript,
-		SessionLive:            tp.Hints.SessionLive,
-		PackOverlayDirs:        tp.Hints.PackOverlayDirs,
-		OverlayDir:             tp.Hints.OverlayDir,
-		CopyFiles:              tp.Hints.CopyFiles,
-		FingerprintExtra:       tp.FPExtra,
+	if startupPromptDelivered {
+		if env == nil {
+			env = map[string]string{}
+		}
+		env[startupPromptDeliveredEnv] = "1"
 	}
+	// Startup-hint fields project through the single StartupHints →
+	// runtime.Config mapping (agent.StartupHints.ToRuntimeConfig) so a hint
+	// added to StartupHints reaches this path automatically instead of being
+	// threaded by hand here — the gc-wuofg / gc-0tna7 field-omission class.
+	// The reflective guard is agent.TestStartupHintsToRuntimeConfigPropagatesEveryField.
+	// Caller-owned, non-hint fields and the path-specific Nudge/MouseOn
+	// overrides below are layered on top.
+	cfg := tp.Hints.ToRuntimeConfig()
+	cfg.Command = tp.Command
+	cfg.Upstream = tp.Upstream
+	cfg.PromptSuffix = promptSuffix
+	cfg.PromptFlag = promptFlag
+	cfg.Env = env
+	if tp.IsACP {
+		cfg.MCPServers = tp.MCPServers
+	}
+	cfg.WorkDir = tp.WorkDir
+	cfg.FingerprintExtra = tp.FPExtra
+	// Prompt delivery may prepend the startup prompt to the configured nudge.
+	cfg.Nudge = nudge
+	// ga-c4w: interactive `gc session new` sessions (session_origin=manual)
+	// resolve mouse-on so the tmux wheel drives copy-mode scrollback, even
+	// when the agent config sets no mouse_mode. This is the managed,
+	// reconciler-deferred start seam the original API-only fix missed. Scoped
+	// to manual on purpose: MouseOn is a core-fingerprint field (locked by
+	// runtime.TestConfigFingerprintIncludesMouseOn), so auto-flipping it for
+	// long-lived config-declared/named sessions would force a one-time drift
+	// restart — they follow their resolved Hints.MouseOn (mouse_mode) instead.
+	// Ephemeral pool agents are likewise mouse-off (controller-poll safety).
+	cfg.MouseOn = tp.Hints.MouseOn || templateParamsSessionOrigin(tp) == "manual"
+	applyT3BridgeRuntimeConfig(tp, env)
+	return cfg
 }
+
+func prependStartupPromptToNudge(prompt, nudge string) string {
+	if nudge != "" {
+		return prompt + startupPromptNudgeSeparator + nudge
+	}
+	return prompt
+}
+
+const startupPromptNudgeSeparator = "\n\n---\n\n"

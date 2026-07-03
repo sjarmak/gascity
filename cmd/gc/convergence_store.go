@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/convergence"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/graphv2"
 	"github.com/gastownhall/gascity/internal/molecule"
 )
 
@@ -17,11 +20,13 @@ import (
 // It maintains an in-memory index of active convergence beads (bead ID →
 // target agent) to avoid O(n) scans on every tick. The index is populated
 // once at startup and maintained on state transitions via SetMetadata.
-// No mutex is needed — single-writer event loop.
+// No mutex is needed — single-writer event loop. indexReady is an atomic
+// flag for safe cross-goroutine reads of the ready state (e.g. test pollers).
 type convergenceStoreAdapter struct {
 	store              beads.Store
 	formulaSearchPaths []string          // search paths for formula compilation in PourWisp
 	activeIndex        map[string]string // bead ID → target agent; nil until populateIndex
+	indexReady         atomic.Bool       // true once populateIndex has completed
 }
 
 var _ convergence.Store = (*convergenceStoreAdapter)(nil)
@@ -43,11 +48,12 @@ func (a *convergenceStoreAdapter) populateIndex() error {
 			continue
 		}
 		state := b.Metadata[convergence.FieldState]
-		if state == convergence.StateActive || state == convergence.StateWaitingManual {
+		if state == convergence.StateActive || state == convergence.StateWaitingManual || state == convergence.StateWaitingTrigger {
 			idx[b.ID] = b.Metadata[convergence.FieldTarget]
 		}
 	}
 	a.activeIndex = idx
+	a.indexReady.Store(true)
 	return nil
 }
 
@@ -94,7 +100,7 @@ func (a *convergenceStoreAdapter) SetMetadata(id, key, value string) error {
 	// Maintain active index on state transitions.
 	if a.activeIndex != nil && key == convergence.FieldState {
 		switch value {
-		case convergence.StateActive, convergence.StateWaitingManual:
+		case convergence.StateActive, convergence.StateWaitingManual, convergence.StateWaitingTrigger:
 			// Add to index. Read target if not already indexed.
 			if _, ok := a.activeIndex[id]; !ok {
 				b, err := a.store.Get(id)
@@ -112,8 +118,25 @@ func (a *convergenceStoreAdapter) SetMetadata(id, key, value string) error {
 	return nil
 }
 
-func (a *convergenceStoreAdapter) CloseBead(id string) error {
+func (a *convergenceStoreAdapter) CloseBead(id, reason string) error {
+	// Stamp close_reason before Close so validation.on-close=error sees
+	// it on the close that follows. Best-effort: an error here is not
+	// fatal — Close still proceeds and any pre-existing close_reason is
+	// preserved.
+	if reason != "" {
+		_ = a.store.SetMetadata(id, "close_reason", reason)
+	}
 	if err := a.store.Close(id); err != nil {
+		return err
+	}
+	if a.activeIndex != nil {
+		delete(a.activeIndex, id)
+	}
+	return nil
+}
+
+func (a *convergenceStoreAdapter) DeleteBead(id string) error {
+	if err := a.store.Delete(id); err != nil {
 		return err
 	}
 	if a.activeIndex != nil {
@@ -138,6 +161,14 @@ func (a *convergenceStoreAdapter) Children(parentID string) ([]convergence.BeadI
 }
 
 func (a *convergenceStoreAdapter) PourWisp(parentID, formula, idempotencyKey string, vars map[string]string, evaluatePrompt string) (string, error) {
+	return a.pourWisp(parentID, formula, idempotencyKey, vars, evaluatePrompt, false)
+}
+
+func (a *convergenceStoreAdapter) PourSpeculativeWisp(parentID, formula, idempotencyKey string, vars map[string]string, evaluatePrompt string) (string, error) {
+	return a.pourWisp(parentID, formula, idempotencyKey, vars, evaluatePrompt, true)
+}
+
+func (a *convergenceStoreAdapter) pourWisp(parentID, formula, idempotencyKey string, vars map[string]string, evaluatePrompt string, deferAssignees bool) (string, error) {
 	// Idempotency: check if a wisp with this key already exists (crash-retry safety).
 	// Fail closed on lookup errors to prevent duplicate wisps.
 	existing, found, err := a.FindByIdempotencyKey(idempotencyKey)
@@ -149,22 +180,74 @@ func (a *convergenceStoreAdapter) PourWisp(parentID, formula, idempotencyKey str
 	}
 
 	// Build vars map with evaluate_prompt if set.
-	cookVars := make(map[string]string, len(vars)+1)
+	cookVars := make(map[string]string)
 	for k, v := range vars {
 		cookVars[k] = v
 	}
 	if evaluatePrompt != "" {
 		cookVars["evaluate_prompt"] = evaluatePrompt
 	}
+	isGraphV2, _, err := graphv2.IsGraphV2Formula(formula, a.formulaSearchPaths)
+	if err != nil {
+		return "", fmt.Errorf("checking formulas v2 contract for convergence wisp %q: %w", formula, err)
+	}
+	if isGraphV2 {
+		return "", fmt.Errorf("convergence wisps do not support v2 formula %q; use a v1 formula until convergence has an explicit input convoy target", formula)
+	}
 	result, err := molecule.Cook(context.Background(), a.store, formula, a.formulaSearchPaths, molecule.Options{
 		Vars:           cookVars,
 		ParentID:       parentID,
 		IdempotencyKey: idempotencyKey,
+		DeferAssignees: deferAssignees,
 	})
 	if err != nil {
 		return "", err
 	}
 	return result.RootID, nil
+}
+
+func (a *convergenceStoreAdapter) ActivateWisp(id string) error {
+	return a.activateDeferredAssignees(id)
+}
+
+func (a *convergenceStoreAdapter) activateDeferredAssignees(id string) error {
+	b, err := a.store.Get(id)
+	if err != nil {
+		return err
+	}
+	update := beads.UpdateOpts{}
+	if assignee := b.Metadata[molecule.DeferredAssigneeMetadataKey]; assignee != "" && b.Assignee != assignee {
+		update.Assignee = &assignee
+	}
+	metadata := map[string]string{}
+	if routedTo := b.Metadata[molecule.DeferredRoutedToMetadataKey]; routedTo != "" && b.Metadata[beadmeta.RoutedToMetadataKey] != routedTo {
+		metadata[beadmeta.RoutedToMetadataKey] = routedTo
+	}
+	if executionRoutedTo := b.Metadata[molecule.DeferredExecutionRoutedToMetadataKey]; executionRoutedTo != "" && b.Metadata[beadmeta.ExecutionRoutedToMetadataKey] != executionRoutedTo {
+		metadata[beadmeta.ExecutionRoutedToMetadataKey] = executionRoutedTo
+	}
+	if typ := b.Metadata[molecule.DeferredTypeMetadataKey]; typ != "" && b.Type != typ {
+		update.Type = &typ
+	}
+	if len(metadata) > 0 {
+		update.Metadata = metadata
+	}
+	if update.Assignee != nil || update.Type != nil || len(update.Metadata) > 0 {
+		if err := a.store.Update(id, update); err != nil {
+			return fmt.Errorf("assigning deferred bead %q: %w", id, err)
+		}
+	}
+
+	children, err := a.store.Children(id, beads.IncludeClosed)
+	if err != nil {
+		return fmt.Errorf("listing children for activation %q: %w", id, err)
+	}
+	for _, child := range children {
+		if err := a.activateDeferredAssignees(child.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (a *convergenceStoreAdapter) FindByIdempotencyKey(key string) (string, bool, error) {
@@ -229,7 +312,7 @@ func (a *convergenceStoreAdapter) CountActiveConvergenceLoops(targetAgent string
 		}
 		state := b.Metadata[convergence.FieldState]
 		target := b.Metadata[convergence.FieldTarget]
-		if (state == convergence.StateActive || state == convergence.StateWaitingManual) && target == targetAgent {
+		if (state == convergence.StateActive || state == convergence.StateWaitingManual || state == convergence.StateWaitingTrigger) && target == targetAgent {
 			count++
 		}
 	}

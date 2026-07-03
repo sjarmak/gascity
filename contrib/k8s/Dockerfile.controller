@@ -1,16 +1,16 @@
 # Gas City controller container image.
 #
 # Extends the agent image with kubectl, K8s helper scripts, and
-# mission-control (per-workspace management dashboard).
+# the workspace management dashboard.
 #
 # Build:
 #   docker build -f contrib/k8s/Dockerfile.controller \
-#     --build-context mc=../mission-control \
 #     -t gc-controller:latest .
 #
 # The gc-agent image must be built first:
 #   docker build -f contrib/k8s/Dockerfile.agent -t gc-agent:latest .
 
+# Local build-layer image produced by Dockerfile.agent, not a registry pull.
 ARG BASE=gc-agent:latest
 FROM ${BASE}
 
@@ -18,21 +18,29 @@ FROM ${BASE}
 USER root
 
 # kubectl for agent attach and beads/events exec providers.
-RUN curl -fsSL "https://dl.k8s.io/release/$(curl -Ls \
-    https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
-    -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
+ARG KUBECTL_VERSION=v1.36.0
+RUN curl -fsSL \
+    "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+    -o /tmp/kubectl \
+    && curl -fsSL \
+       "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256" \
+       -o /tmp/kubectl.sha256 \
+    && echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum -c - \
+    && install -m 0755 /tmp/kubectl /usr/local/bin/kubectl \
+    && rm -f /tmp/kubectl /tmp/kubectl.sha256
 
 # K8s provider scripts (beads, events). Session provider is now native
 # (compiled into gc binary as GC_SESSION=k8s).
 COPY contrib/beads-scripts/gc-beads-k8s /usr/local/bin/gc-beads-k8s
 COPY contrib/events-scripts/gc-events-k8s /usr/local/bin/gc-events-k8s
 
-# Mission Control — per-workspace management dashboard (1:1 with workspace).
-# Pre-built binary + frontend assets from the mission-control repo.
-COPY --from=mc server/target/release/mission-control-server /usr/local/bin/mission-control-server
-COPY --from=mc dist/ /opt/mission-control/dist/
+# Dashboard — per-workspace management UI (1:1 with workspace).
+# Pre-built binary + frontend assets from the dashboard repo.
+# COPY --from=dashboard server/target/release/dashboard-server /usr/local/bin/dashboard-server
+# COPY --from=dashboard dist/ /opt/dashboard/dist/
 
 WORKDIR /city
+USER gcagent
 
 # Wait for city directory to be copied in (via gc-controller-k8s deploy),
 # then init from it and wait for the deploy script to finish setup (bd init

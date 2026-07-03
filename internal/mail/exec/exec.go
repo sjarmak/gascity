@@ -115,6 +115,34 @@ func (p *Provider) Delete(id string) error {
 	return err
 }
 
+// ArchiveMany archives a batch by looping over [Provider.Archive].
+// The exec script protocol is single-id per invocation; a batch endpoint
+// would require a protocol extension that is out of scope here.
+func (p *Provider) ArchiveMany(ids []string) ([]mail.ArchiveResult, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	results := make([]mail.ArchiveResult, len(ids))
+	for i, id := range ids {
+		results[i] = mail.ArchiveResult{ID: id, Err: p.Archive(id)}
+	}
+	return results, nil
+}
+
+// DeleteMany deletes a batch by looping over [Provider.Delete].
+// The exec script protocol is single-id per invocation; a batch endpoint
+// would require a protocol extension that is out of scope here.
+func (p *Provider) DeleteMany(ids []string) ([]mail.ArchiveResult, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	results := make([]mail.ArchiveResult, len(ids))
+	for i, id := range ids {
+		results[i] = mail.ArchiveResult{ID: id, Err: p.Delete(id)}
+	}
+	return results, nil
+}
+
 // All delegates to: script all <recipient>
 func (p *Provider) All(recipient string) ([]mail.Message, error) {
 	p.ensureRunning()
@@ -155,10 +183,11 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 	return unmarshalMessage(out)
 }
 
-// Thread delegates to: script thread <thread-id>
-func (p *Provider) Thread(threadID string) ([]mail.Message, error) {
+// Thread delegates to: script thread <id>, where id may be a thread ID or
+// any message ID in that thread.
+func (p *Provider) Thread(id string) ([]mail.Message, error) {
 	p.ensureRunning()
-	out, err := p.run(nil, "thread", threadID)
+	out, err := p.run(nil, "thread", id)
 	if err != nil {
 		return nil, err
 	}
@@ -194,6 +223,9 @@ func (p *Provider) ensureRunning() {
 //
 // Exit code 2 is treated as success (unknown operation — forward compatible).
 // Any other non-zero exit code returns an error wrapping stderr.
+//
+// Stdin is always explicitly set so the script never inherits the caller's
+// stdin (which would break shell loops over gc mail archive / delete).
 func (p *Provider) run(stdinData []byte, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
 	defer cancel()
@@ -204,10 +236,7 @@ func (p *Provider) run(stdinData []byte, args ...string) (string, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-
-	if stdinData != nil {
-		cmd.Stdin = bytes.NewReader(stdinData)
-	}
+	cmd.Stdin = bytes.NewReader(stdinData) // nil → empty reader → script reads EOF
 
 	err := cmd.Run()
 	if err != nil {

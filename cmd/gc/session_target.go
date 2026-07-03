@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strings"
 )
@@ -14,13 +15,18 @@ type sessionRuntimeTarget struct {
 	sessionName string
 }
 
-func currentSessionRuntimeTarget() (sessionRuntimeTarget, error) {
-	cityPath := strings.TrimSpace(os.Getenv("GC_CITY"))
-	if cityPath == "" {
-		return sessionRuntimeTarget{}, fmt.Errorf("not in session context (GC_CITY not set)")
+func defaultSessionDisplayIdentity() string {
+	for _, key := range []string{"GC_ALIAS", "GC_SESSION_ID", "GC_AGENT"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
 	}
-	display := defaultMailIdentity()
-	if display == "human" {
+	return ""
+}
+
+func currentSessionRuntimeTarget() (sessionRuntimeTarget, error) {
+	display := defaultSessionDisplayIdentity()
+	if display == "" {
 		return sessionRuntimeTarget{}, fmt.Errorf("not in session context (GC_ALIAS/GC_SESSION_ID not set)")
 	}
 	sessionName := strings.TrimSpace(os.Getenv("GC_TMUX_SESSION"))
@@ -30,6 +36,15 @@ func currentSessionRuntimeTarget() (sessionRuntimeTarget, error) {
 	if sessionName == "" {
 		return sessionRuntimeTarget{}, fmt.Errorf("not in session context (GC_SESSION_NAME not set)")
 	}
+	cityPath, ok := resolveExplicitCityPathEnv()
+	if !ok {
+		if cityPath, ok = resolveCityPathFromGCDir(); !ok {
+			cityPath, ok = resolveCityPathFromCwd()
+		}
+	}
+	if !ok {
+		return sessionRuntimeTarget{}, fmt.Errorf("not in session context (city context not set)")
+	}
 	return sessionRuntimeTarget{
 		cityPath:    cityPath,
 		display:     display,
@@ -37,8 +52,8 @@ func currentSessionRuntimeTarget() (sessionRuntimeTarget, error) {
 	}, nil
 }
 
-func resolveSessionRuntimeTarget(identifier string) (sessionRuntimeTarget, error) {
-	target, err := resolveNudgeTarget(identifier)
+func resolveSessionRuntimeTarget(identifier string, warningWriter ...io.Writer) (sessionRuntimeTarget, error) {
+	target, err := resolveNudgeTarget(identifier, warningWriter...)
 	if err != nil {
 		return sessionRuntimeTarget{}, err
 	}

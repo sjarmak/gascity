@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,11 +43,40 @@ func NewStore(script string) *Store {
 	}
 }
 
+func execProcessEnv(overrides map[string]string) []string {
+	out := make([]string, 0, len(os.Environ())+len(overrides))
+	for _, entry := range os.Environ() {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok || stripExecEnvKey(key) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	keys := make([]string, 0, len(overrides))
+	for key := range overrides {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		out = append(out, key+"="+overrides[key])
+	}
+	return out
+}
+
+func stripExecEnvKey(key string) bool {
+	switch key {
+	case "GC_BEADS_PREFIX", "GC_CITY", "GC_CITY_PATH", "GC_CITY_ROOT", "GC_CITY_RUNTIME_DIR", "GC_PROVIDER", "GC_RIG", "GC_RIG_ROOT", "GC_STORE_ROOT", "GC_STORE_SCOPE":
+		return true
+	}
+	return strings.HasPrefix(key, "BEADS_") || strings.HasPrefix(key, "GC_DOLT_")
+}
+
 // run executes the script with the given args, optionally piping stdinData
 // to its stdin. Returns the trimmed stdout on success.
 //
-// Exit code 2 is treated as success (unknown operation — forward compatible).
-// Any other non-zero exit code returns an error wrapping stderr.
+// Exit code 2 is treated as success for unknown operation names. When ready is
+// called with contract flags, exit code 2 means the invocation was rejected and
+// must surface as an error instead of silently returning empty data.
 func (s *Store) run(stdinData []byte, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
@@ -55,12 +86,7 @@ func (s *Store) run(stdinData []byte, args ...string) (string, error) {
 	// expires, even if grandchild processes still hold them open.
 	cmd.WaitDelay = 2 * time.Second
 
-	if len(s.env) > 0 {
-		cmd.Env = os.Environ()
-		for k, v := range s.env {
-			cmd.Env = append(cmd.Env, k+"="+v)
-		}
-	}
+	cmd.Env = execProcessEnv(s.env)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -75,6 +101,13 @@ func (s *Store) run(stdinData []byte, args ...string) (string, error) {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			if exitErr.ExitCode() == 2 {
+				if readyExit2IsRejectedInvocation(args) {
+					errMsg := strings.TrimSpace(stderr.String())
+					if errMsg == "" {
+						errMsg = err.Error()
+					}
+					return "", fmt.Errorf("exec beads %s %s: %s", s.script, strings.Join(args, " "), errMsg)
+				}
 				return "", nil
 			}
 		}
@@ -86,6 +119,10 @@ func (s *Store) run(stdinData []byte, args ...string) (string, error) {
 	}
 
 	return strings.TrimRight(stdout.String(), "\n"), nil
+}
+
+func readyExit2IsRejectedInvocation(args []string) bool {
+	return len(args) > 1 && args[0] == "ready"
 }
 
 // isNotFoundError reports whether an error from the script indicates a
@@ -129,13 +166,18 @@ func (w *beadWire) toBead() beads.Bead {
 		cloned := *w.Priority
 		priority = &cloned
 	}
+	status := w.Status
+	if strings.TrimSpace(status) == "" {
+		status = "open"
+	}
 	return beads.Bead{
 		ID:          w.ID,
 		Title:       w.Title,
-		Status:      w.Status,
+		Status:      status,
 		Type:        w.Type,
 		Priority:    priority,
 		CreatedAt:   w.CreatedAt,
+		UpdatedAt:   w.UpdatedAt,
 		Assignee:    w.Assignee,
 		From:        w.From,
 		ParentID:    w.ParentID,
@@ -143,8 +185,38 @@ func (w *beadWire) toBead() beads.Bead {
 		Needs:       w.Needs,
 		Description: w.Description,
 		Labels:      w.Labels,
-		Metadata:    w.Metadata,
+		Metadata:    coerceMetadata(w.Metadata),
+		Ephemeral:   w.Ephemeral,
+		NoHistory:   w.NoHistory,
+		DeferUntil:  cloneTimePtr(w.DeferUntil),
 	}
+}
+
+func cloneTimePtr(v *time.Time) *time.Time {
+	if v == nil {
+		return nil
+	}
+	cloned := *v
+	return &cloned
+}
+
+// coerceMetadata converts raw JSON metadata values to strings. Backing stores
+// may return numbers or booleans; the domain model is map[string]string.
+func coerceMetadata(raw map[string]json.RawMessage) map[string]string {
+	if len(raw) == 0 {
+		return nil
+	}
+	m := make(map[string]string, len(raw))
+	for k, v := range raw {
+		var s string
+		if json.Unmarshal(v, &s) == nil {
+			m[k] = s
+		} else {
+			// Number, boolean, or other non-string — use the raw JSON text.
+			m[k] = strings.TrimSpace(string(v))
+		}
+	}
+	return m
 }
 
 // Create persists a new bead: script create (stdin: JSON)
@@ -211,6 +283,18 @@ func (s *Store) Close(id string) error {
 	return nil
 }
 
+// Reopen sets a bead's status to "open": script reopen <id>
+func (s *Store) Reopen(id string) error {
+	_, err := s.run(nil, "reopen", id)
+	if err != nil {
+		if isNotFoundError(err) {
+			return fmt.Errorf("reopening bead %q: %w", id, beads.ErrNotFound)
+		}
+		return fmt.Errorf("reopening bead %q: %w", id, err)
+	}
+	return nil
+}
+
 // CloseAll closes multiple beads and sets metadata on each.
 func (s *Store) CloseAll(ids []string, metadata map[string]string) (int, error) {
 	closed := 0
@@ -245,6 +329,15 @@ func (s *Store) List(query beads.ListQuery) ([]beads.Bead, error) {
 		if query.Status != "" {
 			args = append(args, "--status="+query.Status)
 		}
+		if query.Assignee != "" {
+			args = append(args, "--assignee="+query.Assignee)
+		}
+		if query.Type != "" {
+			args = append(args, "--type="+query.Type)
+		}
+		if query.Limit > 0 && query.CreatedBefore.IsZero() {
+			args = append(args, "--limit="+strconv.Itoa(query.Limit))
+		}
 		out, err = s.run(nil, args...)
 	}
 	if err != nil {
@@ -268,13 +361,33 @@ func (s *Store) ListOpen(status ...string) ([]beads.Bead, error) {
 	return s.List(query)
 }
 
-// Ready returns all open beads: script ready
-func (s *Store) Ready() ([]beads.Bead, error) {
-	out, err := s.run(nil, "ready")
+// Ready returns actionable open beads (excluding infrastructure types):
+// script ready [--include-ephemeral]
+func (s *Store) Ready(query ...beads.ReadyQuery) ([]beads.Bead, error) {
+	q := beads.ReadyQuery{}
+	if len(query) > 0 {
+		q = query[0]
+	}
+	args := []string{"ready"}
+	if q.TierMode == beads.TierBoth || q.TierMode == beads.TierWisps {
+		args = append(args, "--include-ephemeral")
+	}
+	out, err := s.run(nil, args...)
 	if err != nil {
 		return nil, fmt.Errorf("exec beads ready: %w", err)
 	}
-	return parseBeadList(out)
+	all, err := parseBeadList(out)
+	if err != nil {
+		return nil, err
+	}
+	result := all[:0]
+	now := time.Now().UTC()
+	for _, b := range all {
+		if beads.IsReadyCandidateForTier(b, now, q.TierMode) {
+			result = append(result, b)
+		}
+	}
+	return beads.ApplyListQuery(result, beads.ListQuery{Assignee: q.Assignee, Limit: q.Limit, TierMode: q.TierMode}), nil
 }
 
 // Children returns non-closed beads whose ParentID matches by default:
@@ -295,6 +408,7 @@ func (s *Store) ListByLabel(label string, limit int, opts ...beads.QueryOpt) ([]
 		Limit:         limit,
 		IncludeClosed: beads.HasOpt(opts, beads.IncludeClosed),
 		Sort:          beads.SortCreatedDesc,
+		TierMode:      beads.TierModeFromOpts(opts),
 	})
 }
 
@@ -317,6 +431,7 @@ func (s *Store) ListByMetadata(filters map[string]string, limit int, opts ...bea
 		Limit:         limit,
 		IncludeClosed: beads.HasOpt(opts, beads.IncludeClosed),
 		Sort:          beads.SortCreatedDesc,
+		TierMode:      beads.TierModeFromOpts(opts),
 	})
 }
 
@@ -338,6 +453,14 @@ func (s *Store) SetMetadataBatch(id string, kvs map[string]string) error {
 		}
 	}
 	return nil
+}
+
+// Tx executes fn sequentially against the exec store.
+func (s *Store) Tx(_ string, fn func(beads.Tx) error) error {
+	if fn == nil {
+		return errors.New("beads tx: nil callback")
+	}
+	return fn(s)
 }
 
 // Delete permanently removes a bead by calling the "delete" subcommand.

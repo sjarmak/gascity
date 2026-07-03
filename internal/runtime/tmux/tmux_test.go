@@ -8,16 +8,19 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
 
-// testSocketName is the dedicated tmux socket used by all integration tests.
-// Using a separate socket ensures tests never interfere with the user's
-// running tmux server.
-const testSocketName = "gc-test"
+// testSocketName is the dedicated tmux socket used by this integration test
+// process. It uses the tmuxtest cleanup prefix and a per-process suffix so
+// reused CI runners cannot inherit a stale fixed test socket from an aborted
+// run.
+var testSocketName = fmt.Sprintf("gctest-%d-%d", os.Getpid(), time.Now().UnixNano())
 
 func hasTmux() bool {
 	_, err := exec.LookPath("tmux")
@@ -29,6 +32,54 @@ func testTmux() *Tmux {
 	cfg := DefaultConfig()
 	cfg.SocketName = testSocketName
 	return NewTmuxWithConfig(cfg)
+}
+
+func ensureTestSocketSession(t *testing.T, tm *Tmux) {
+	t.Helper()
+
+	session := fmt.Sprintf("binding-test-%d", time.Now().UnixNano())
+	if _, err := tm.run("new-session", "-d", "-s", session, "sleep 60"); err != nil {
+		t.Fatalf("new-session on test socket: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = tm.run("kill-session", "-t", session)
+	})
+}
+
+func buildEchoBinary(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	bin := dir + "/" + name
+	src := dir + "/" + name + ".go"
+	if err := os.WriteFile(src, []byte(`package main
+import (
+	"bufio"
+	"fmt"
+	"os"
+)
+func main() {
+	r := bufio.NewReader(os.Stdin)
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return
+		}
+		if b == 27 {
+			fmt.Print("^[")
+			continue
+		}
+		_, _ = os.Stdout.Write([]byte{b})
+	}
+}
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(%s): %v", src, err)
+	}
+	build := exec.Command("go", "build", "-o", bin, src)
+	build.Dir = dir
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build %s: %v\n%s", name, err, string(out))
+	}
+	return bin
 }
 
 func TestListSessionsNoServer(t *testing.T) {
@@ -139,6 +190,94 @@ func TestDuplicateSession(t *testing.T) {
 	err := tm.NewSession(sessionName, "")
 	if !errors.Is(err, ErrSessionExists) {
 		t.Errorf("expected ErrSessionExists, got %v", err)
+	}
+}
+
+func TestHiddenAttachedClientLifecycle(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-hidden-attach-" + t.Name()
+	_ = tm.KillSession(sessionName)
+
+	if err := tm.NewSession(sessionName, "sleep 300"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	if tm.IsSessionAttached(sessionName) {
+		t.Fatal("session unexpectedly attached before hidden client starts")
+	}
+
+	if err := tm.ensureHiddenAttachedClient(sessionName); err != nil {
+		t.Fatalf("ensureHiddenAttachedClient: %v", err)
+	}
+	if !tm.IsSessionAttached(sessionName) {
+		t.Fatal("session should report attached while hidden client is active")
+	}
+
+	tm.CloseHiddenAttachClient(sessionName)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !tm.IsSessionAttached(sessionName) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("session stayed attached after hidden client close")
+}
+
+func TestHiddenAttachedClientCanSendText(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-hidden-input-" + t.Name()
+	_ = tm.KillSession(sessionName)
+
+	bin := buildEchoBinary(t, t.TempDir(), "echo-hidden-input")
+	if err := tm.NewSession(sessionName, bin); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	if err := tm.ensureHiddenAttachedClient(sessionName); err != nil {
+		t.Fatalf("ensureHiddenAttachedClient: %v", err)
+	}
+	defer tm.CloseHiddenAttachClient(sessionName)
+
+	used, err := tm.sendHiddenAttachedText(sessionName, "HELLO_HIDDEN_ATTACH")
+	if err != nil {
+		t.Fatalf("sendHiddenAttachedText: %v", err)
+	}
+	if !used {
+		t.Fatal("sendHiddenAttachedText = false, want true with hidden client active")
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		out, err := tm.CapturePaneAll(sessionName)
+		if err == nil && strings.Contains(out, "HELLO_HIDDEN_ATTACH") {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	out, _ := tm.CapturePaneAll(sessionName)
+	t.Fatalf("CapturePaneAll did not contain hidden attach text:\n%s", out)
+}
+
+func TestHiddenAttachScriptArgsArePlatformSpecific(t *testing.T) {
+	tmuxArgs := []string{"-u", "-L", "socket", "attach-session", "-t", "target"}
+
+	if got, want := hiddenAttachScriptArgs("darwin", tmuxArgs), []string{"-q", "/dev/null", "tmux", "-u", "-L", "socket", "attach-session", "-t", "target"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("darwin script args = %#v, want %#v", got, want)
+	}
+	if got, want := hiddenAttachScriptArgs("linux", tmuxArgs), []string{"-qfc", "tmux -u -L socket attach-session -t target", "/dev/null"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("linux script args = %#v, want %#v", got, want)
 	}
 }
 
@@ -515,6 +654,35 @@ func TestIsRuntimeRunning_ShellWithNodeChild(t *testing.T) {
 		t.Logf("Pane command: %q, IsRuntimeRunning: %v", paneCmd, got)
 		// Note: This may or may not detect depending on how tmux runs the command.
 		// On some systems, tmux runs the command directly; on others via a shell.
+	}
+}
+
+func TestIsRuntimeRunningMatchesProviderNameInWrapperArgs(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-runtime-wrapper-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+
+	dir := t.TempDir()
+	fakeBun := buildEchoBinary(t, dir, "bun")
+	fakeGemini := dir + "/gemini"
+	if err := os.WriteFile(fakeGemini, []byte("placeholder"), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s): %v", fakeGemini, err)
+	}
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommand(sessionName, dir, fakeBun+" "+fakeGemini); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	if !tm.IsRuntimeRunning(sessionName, []string{"gemini", "node"}) {
+		pid, _ := tm.GetPanePID(sessionName)
+		cmd, _ := tm.GetPaneCommand(sessionName)
+		t.Fatalf("IsRuntimeRunning() = false, want true (pane cmd: %q pid: %q)", cmd, pid)
 	}
 }
 
@@ -1109,8 +1277,15 @@ func TestCollectReparentedGroupMembers(t *testing.T) {
 		if rpid == pid {
 			t.Errorf("collectReparentedGroupMembers returned known PID %s", pid)
 		}
-		// Each reparented PID should have PPID == 1
+		// Each reparented PID should have PPID == 1.
+		// The process may have exited between collection and this check
+		// (TOCTOU race), so skip verification if getParentPID returns empty.
 		ppid := getParentPID(rpid)
+		if ppid == "" && runtime.GOOS != "windows" {
+			if err := exec.Command("kill", "-0", rpid).Run(); err != nil {
+				continue
+			}
+		}
 		if ppid != "1" {
 			t.Errorf("collectReparentedGroupMembers returned PID %s with PPID %s (expected 1)", rpid, ppid)
 		}
@@ -1749,6 +1924,26 @@ func TestIsTransientSendKeysError(t *testing.T) {
 	}
 }
 
+func TestNudgeSubmitDebounceUsesKimiProviderHint(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-kimi-debounce-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	if err := tm.SetEnvironment(sessionName, "GC_PROVIDER", "kimi"); err != nil {
+		t.Fatalf("SetEnvironment: %v", err)
+	}
+	if got, want := tm.nudgeSubmitDebounce(sessionName), 1500*time.Millisecond; got != want {
+		t.Fatalf("nudgeSubmitDebounce = %s, want %s", got, want)
+	}
+}
+
 func TestSendKeysLiteralWithRetry_ImmediateSuccess(t *testing.T) {
 	if !hasTmux() {
 		t.Skip("tmux not installed")
@@ -1812,6 +2007,61 @@ func TestSendKeysLiteralWithRetry_NonTransientFailsFast(t *testing.T) {
 	}
 }
 
+func TestSendKeysLiteralWithRetryFallsBackToPasteBufferOnCommandTooLong(t *testing.T) {
+	fe := &fakeExecutor{
+		errs: []error{errors.New("command too long")},
+	}
+	tm := NewTmuxWithConfig(DefaultConfig())
+	tm.exec = fe
+
+	err := tm.sendKeysLiteralWithRetry("%1", "large startup prompt", time.Second)
+	if err != nil {
+		t.Fatalf("sendKeysLiteralWithRetry() = %v, want nil", err)
+	}
+
+	if len(fe.calls) != 3 {
+		t.Fatalf("tmux calls = %d, want 3: %#v", len(fe.calls), fe.calls)
+	}
+	first := strings.Join(fe.calls[0], " ")
+	if !strings.Contains(first, "send-keys") || !strings.Contains(first, "-l") {
+		t.Fatalf("first call = %v, want literal send-keys", fe.calls[0])
+	}
+	assertTmuxCommand(t, fe.calls[1], "load-buffer")
+	assertTmuxCommand(t, fe.calls[2], "paste-buffer")
+	third := strings.Join(fe.calls[2], "\x00")
+	for _, want := range []string{"\x00-p\x00", "\x00-d\x00", "\x00-t\x00%1"} {
+		if !strings.Contains(third, want) {
+			t.Fatalf("paste-buffer call = %v, missing %q", fe.calls[2], want)
+		}
+	}
+}
+
+func TestSendKeysLiteralWithRetryUsesPasteBufferForLargeText(t *testing.T) {
+	fe := &fakeExecutor{}
+	tm := NewTmuxWithConfig(DefaultConfig())
+	tm.exec = fe
+
+	err := tm.sendKeysLiteralWithRetry("%1", strings.Repeat("x", maxSendKeysLiteralLen+1), time.Second)
+	if err != nil {
+		t.Fatalf("sendKeysLiteralWithRetry() = %v, want nil", err)
+	}
+
+	if len(fe.calls) != 2 {
+		t.Fatalf("tmux calls = %d, want 2: %#v", len(fe.calls), fe.calls)
+	}
+	assertTmuxCommand(t, fe.calls[0], "load-buffer")
+	assertTmuxCommand(t, fe.calls[1], "paste-buffer")
+}
+
+func assertTmuxCommand(t *testing.T, args []string, want string) {
+	t.Helper()
+
+	joined := "\x00" + strings.Join(args, "\x00") + "\x00"
+	if !strings.Contains(joined, "\x00"+want+"\x00") {
+		t.Fatalf("tmux call = %v, want command %q", args, want)
+	}
+}
+
 func TestNudgeSession_WithRetry(t *testing.T) {
 	if !hasTmux() {
 		t.Skip("tmux not installed")
@@ -1833,6 +2083,225 @@ func TestNudgeSession_WithRetry(t *testing.T) {
 	err := tm.NudgeSession(sessionName, "test message")
 	if err != nil {
 		t.Errorf("NudgeSession() = %v, want nil", err)
+	}
+}
+
+func TestNudgeSessionSkipsEscapeForCodex(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-nudge-codex-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommandAndEnv(sessionName, os.TempDir(), "cat -v", map[string]string{
+		"GC_PROVIDER": "codex",
+	}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	out, err := tm.CapturePaneAll(sessionName)
+	if err != nil {
+		t.Fatalf("CapturePaneAll: %v", err)
+	}
+	if strings.Contains(out, "^[") {
+		t.Fatalf("CapturePaneAll contained Escape for codex nudge:\n%s", out)
+	}
+}
+
+func TestNudgeSessionSkipsEscapeForCodexWithoutProviderEnv(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-nudge-codex-fallback-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+
+	dir := t.TempDir()
+	fakeCodex := dir + "/codex"
+	src := dir + "/main.go"
+	if err := os.WriteFile(src, []byte(`package main
+import (
+	"bufio"
+	"fmt"
+	"os"
+)
+func main() {
+	r := bufio.NewReader(os.Stdin)
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return
+		}
+		if b == 27 {
+			fmt.Print("^[")
+			continue
+		}
+		_, _ = os.Stdout.Write([]byte{b})
+	}
+}
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(%s): %v", src, err)
+	}
+	build := exec.Command("go", "build", "-o", fakeCodex, src)
+	build.Dir = dir
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build fake codex: %v\n%s", err, string(out))
+	}
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommand(sessionName, dir, fakeCodex); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	out, err := tm.CapturePaneAll(sessionName)
+	if err != nil {
+		t.Fatalf("CapturePaneAll: %v", err)
+	}
+	if strings.Contains(out, "^[") {
+		t.Fatalf("CapturePaneAll contained Escape for codex nudge without provider env:\n%s", out)
+	}
+}
+
+func TestNudgeSessionSkipsEscapeForClaude(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-nudge-claude-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommandAndEnv(sessionName, os.TempDir(), "cat -v", map[string]string{
+		"GC_PROVIDER": "claude",
+	}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	out, err := tm.CapturePaneAll(sessionName)
+	if err != nil {
+		t.Fatalf("CapturePaneAll: %v", err)
+	}
+	if strings.Contains(out, "^[") {
+		t.Fatalf("CapturePaneAll contained Escape for claude nudge:\n%s", out)
+	}
+}
+
+func TestNudgeSessionSkipsEscapeForOpenCode(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-nudge-opencode-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommandAndEnv(sessionName, os.TempDir(), "cat -v", map[string]string{
+		"GC_PROVIDER": "opencode",
+	}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	out, err := tm.CapturePaneAll(sessionName)
+	if err != nil {
+		t.Fatalf("CapturePaneAll: %v", err)
+	}
+	if strings.Contains(out, "^[") {
+		t.Fatalf("CapturePaneAll contained Escape for opencode nudge:\n%s", out)
+	}
+}
+
+func TestNudgeSessionSkipsEscapeForGeminiWithoutProviderEnv(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-nudge-gemini-fallback-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+
+	dir := t.TempDir()
+	fakeBun := buildEchoBinary(t, dir, "bun")
+	fakeGemini := dir + "/gemini"
+	if err := os.WriteFile(fakeGemini, []byte("placeholder"), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s): %v", fakeGemini, err)
+	}
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommand(sessionName, dir, fakeBun+" "+fakeGemini); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	out, err := tm.CapturePaneAll(sessionName)
+	if err != nil {
+		t.Fatalf("CapturePaneAll: %v", err)
+	}
+	if strings.Contains(out, "^[") {
+		t.Fatalf("CapturePaneAll contained Escape for gemini nudge without provider env:\n%s", out)
+	}
+}
+
+func TestNudgeSessionSendsEscapeForUnknownProvider(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := testTmux()
+	sessionName := "gt-test-nudge-default-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommand(sessionName, os.TempDir(), "cat -v"); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	out, err := tm.CapturePaneAll(sessionName)
+	if err != nil {
+		t.Fatalf("CapturePaneAll: %v", err)
+	}
+	if !strings.Contains(out, "^[") {
+		t.Fatalf("CapturePaneAll did not contain Escape for default nudge:\n%s", out)
 	}
 }
 
@@ -1875,6 +2344,12 @@ func TestMatchesPromptPrefix(t *testing.T) {
 
 		// Bare prompt character without any space
 		{"bare prompt no space", "❯", regularPrefix, true},
+
+		// Boxed prompt: TUIs (e.g. grok) render the input line inside a box
+		// border, so the captured line is "│ ❯ …" rather than "❯ …".
+		{"boxed prompt bare", "│ ❯ ", regularPrefix, true},
+		{"boxed prompt with content", "│ ❯ do the work", regularPrefix, true},
+		{"heavy box border", "┃ ❯ ", regularPrefix, true},
 	}
 
 	for _, tt := range tests {
@@ -1885,6 +2360,16 @@ func TestMatchesPromptPrefix(t *testing.T) {
 					tt.line, tt.prefix, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestProviderEnvSkipsEscapeGrok guards the grok engagement fix: grok's TUI
+// treats a pre-Enter Escape as "clear input", so synthesizing one between the
+// pasted prompt and the submit Enter prevents submission and the worker idles
+// at the welcome screen forever. grok must be on the skip list.
+func TestProviderEnvSkipsEscapeGrok(t *testing.T) {
+	if !providerEnvSkipsEscape("grok") {
+		t.Error("grok must skip pre-Enter Escape (TUI treats Escape as clear-input)")
 	}
 }
 
@@ -1931,7 +2416,21 @@ func TestPaneContainsBusyIndicator(t *testing.T) {
 		{"idle prompt", []string{"❯ ", ""}, false},
 		{"busy status bar", []string{"❯ ", "  esc to interrupt  "}, true},
 		{"busy mid-line", []string{"some output", "Press esc to interrupt generation"}, true},
+		{"gemini auth spinner", []string{"Waiting for authentication... (Press Esc or Ctrl+C to cancel)"}, true},
+		{"gemini shell tool panel", []string{"│ ?  Shell sleep 12 [current working directory /tmp/city] (Sleep … │"}, true},
 		{"no indicator", []string{"some output", "building..."}, false},
+		// Current Claude Code (bypass mode) shows a live spinner with an elapsed
+		// timer + token stream, not "esc to interrupt", while working.
+		{"claude busy spinner token footer", []string{"· Boogieing… (2m 28s · ↓ 10.9k tokens)"}, true},
+		{"claude busy spinner long turn", []string{"✶ Investigating… (31m 40s · ↓ 108.6k tokens)"}, true},
+		{"claude busy spinner thinking", []string{"✢ Clauding… (56s · ↓ 1.7k tokens · thinking with max effort)"}, true},
+		{"codex busy spinner bullet", []string{"◦ Working (2m 48s • esc to interrupt)"}, true},
+		// Idle/done markers and status chrome must NOT read as busy — a false
+		// positive makes WaitForIdle never return, so the agent is never nudged.
+		{"claude done marker", []string{"✻ Worked for 1m 49s", "❯ "}, false},
+		{"claude status bar time", []string{"🧠 Sonnet 4.6 | 📁 witness | ⏱️  Jun 3 20:10:09"}, false},
+		{"scrollback truncation parens", []string{"  … +9 lines (ctrl+o to expand)"}, false},
+		{"git branch in status bar", []string{"  🚀 Opus 4.8 | 📁 thriva | (main) | ⏱️  Jun 4 02:57:04"}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1943,6 +2442,52 @@ func TestPaneContainsBusyIndicator(t *testing.T) {
 	}
 }
 
+func TestCodexTranscriptTailContainsTurnAborted(t *testing.T) {
+	tail := strings.Join([]string{
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>"}]}}`,
+	}, "\n")
+	if !codexTranscriptTailContainsTurnAborted(tail) {
+		t.Fatal("codexTranscriptTailContainsTurnAborted() = false, want true")
+	}
+
+	oldAbort := `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>"}]}}`
+	var stale []string
+	stale = append(stale, oldAbort)
+	for i := 0; i < codexInterruptBoundaryRecentLines+2; i++ {
+		stale = append(stale, fmt.Sprintf(`{"type":"event_msg","payload":{"type":"agent_message","message":"line-%d"}}`, i))
+	}
+	if codexTranscriptTailContainsTurnAborted(strings.Join(stale, "\n")) {
+		t.Fatal("codexTranscriptTailContainsTurnAborted() = true for stale abort marker, want false")
+	}
+}
+
+func TestWaitForCodexInterruptBoundary(t *testing.T) {
+	codexHome := t.TempDir()
+	transcript := filepath.Join(codexHome, "sessions", "2026", "04", "18", "rollout.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcript), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(transcript, []byte(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"still working"}]}}`+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	since := time.Now()
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		_, _ = f.WriteString(`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>"}]}}` + "\n")
+	}()
+
+	if err := waitForCodexInterruptBoundary(context.Background(), codexHome, since, 2*time.Second); err != nil {
+		t.Fatalf("waitForCodexInterruptBoundary: %v", err)
+	}
+}
+
 func TestDefaultReadyPromptPrefix(t *testing.T) {
 	// Verify the constant is set correctly
 	if DefaultReadyPromptPrefix == "" {
@@ -1950,6 +2495,15 @@ func TestDefaultReadyPromptPrefix(t *testing.T) {
 	}
 	if !strings.Contains(DefaultReadyPromptPrefix, "❯") {
 		t.Errorf("DefaultReadyPromptPrefix = %q, want to contain ❯", DefaultReadyPromptPrefix)
+	}
+}
+
+func TestIdlePromptPrefix(t *testing.T) {
+	if got := idlePromptPrefix("> "); got != "> " {
+		t.Fatalf("idlePromptPrefix(> ) = %q, want %q", got, "> ")
+	}
+	if got := idlePromptPrefix(""); got != DefaultReadyPromptPrefix {
+		t.Fatalf("idlePromptPrefix(\"\") = %q, want %q", got, DefaultReadyPromptPrefix)
 	}
 }
 
@@ -2186,6 +2740,7 @@ func TestGetKeyBinding_SkipsGasTownBindings(t *testing.T) {
 		t.Skip("not inside tmux — need server for bind-key")
 	}
 	tm := testTmux()
+	ensureTestSocketSession(t, tm)
 
 	// Set a GT-style if-shell binding (contains both "if-shell" and "gt ")
 	ifShell := fmt.Sprintf("echo '#{session_name}' | grep -Eq '%s'", sessionPrefixPattern())
@@ -2211,6 +2766,7 @@ func TestGetKeyBinding_CapturesUserBinding(t *testing.T) {
 		t.Skip("not inside tmux — need server for bind-key")
 	}
 	tm := testTmux()
+	ensureTestSocketSession(t, tm)
 
 	// Set a user binding that doesn't contain "gt "
 	_, _ = tm.run("bind-key", "-T", "prefix", "F11", "display-message", "hello")
@@ -2236,6 +2792,7 @@ func TestIsGTBinding_DetectsGasTownBindings(t *testing.T) {
 		t.Skip("not inside tmux — need server for bind-key")
 	}
 	tm := testTmux()
+	ensureTestSocketSession(t, tm)
 
 	// A plain user binding should NOT be detected as GT
 	_, _ = tm.run("bind-key", "-T", "prefix", "F11", "display-message", "hello")
@@ -2265,6 +2822,7 @@ func TestSetBindings_PreserveFallbackOnRepeatedCalls(t *testing.T) {
 		t.Skip("not inside tmux — need server for bind-key")
 	}
 	tm := testTmux()
+	ensureTestSocketSession(t, tm)
 
 	// Set a custom user binding on F11
 	_, _ = tm.run("bind-key", "-T", "prefix", "F11", "display-message", "custom-user-cmd")

@@ -66,7 +66,7 @@ func TestHelp_ListsSubcommands(t *testing.T) {
 // using a single shared city.
 func TestHookAndStop(t *testing.T) {
 	c := helpers.NewCity(t, testEnv)
-	c.Init("claude")
+	c.InitNoStart("claude")
 
 	t.Run("Hook_NoAgent_ReturnsError", func(t *testing.T) {
 		out, err := c.GC("hook")
@@ -127,10 +127,15 @@ func TestRestart_NotInitialized_ReturnsError(t *testing.T) {
 	}
 }
 
-// TestDashboard_BareCommand_ReturnsHelp verifies that gc dashboard
-// without a subcommand shows help or requires a subcommand.
-func TestDashboard_BareCommand(t *testing.T) {
-	// Bare "gc dashboard" should show help or error.
-	out, _ := helpers.RunGC(testEnv, "", "dashboard")
-	_ = out
+// TestDashboard_HelpFlag verifies that gc dashboard --help remains available
+// now that bare gc dashboard prints where the supervisor serves the dashboard
+// instead of starting a static server.
+func TestDashboard_HelpFlag(t *testing.T) {
+	out, err := helpers.RunGC(testEnv, "", "dashboard", "--help")
+	if err != nil {
+		t.Fatalf("gc dashboard --help failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Print where the web dashboard is served") {
+		t.Fatalf("dashboard help missing serve description:\n%s", out)
+	}
 }

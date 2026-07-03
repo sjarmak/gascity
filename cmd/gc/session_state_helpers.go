@@ -17,3 +17,55 @@ func isDrainedSessionMetadata(meta map[string]string) bool {
 func isDrainedSessionBead(session beads.Bead) bool {
 	return isDrainedSessionMetadata(session.Metadata)
 }
+
+// poolSessionIsLive reports whether a pool session bead represents an
+// actively running session for the runningSessions counter in
+// build_desired_state. An asleep or drained bead is not live — it holds
+// no active process and must not suppress the isCold cross-store wake
+// probe.
+func poolSessionIsLive(session beads.Bead) bool {
+	if strings.TrimSpace(session.Metadata["state"]) == "asleep" {
+		return false
+	}
+	if isDrainedSessionBead(session) {
+		return false
+	}
+	return true
+}
+
+// isPoolSessionSlotFreeable reports whether a session's bead is in a terminal
+// state where the pool slot it occupies can be freed — either explicitly
+// drained, or asleep from a normal idle transition. Sessions parked via
+// `gc session wait` (sleep_reason=wait-hold), held by context-churn
+// quarantine, or otherwise signaling "don't touch me" keep their slot.
+//
+// Distinct from `isDrainedSessionBead` because drain-ack can land pool
+// workers in state=asleep+sleep_reason=idle when the pre-close ownership
+// snapshot falsely reports assigned work. Freeing the slot for idle-asleep
+// pool beads lets the supervisor spawn a fresh worker for ready queue work
+// instead of stranding it on a ghost slot.
+//
+// A session parked with sleep_reason=provider-terminal-error is also freeable:
+// markProviderTerminalError has classified it as a dead, non-retryable provider
+// failure, so its slot must be reaped — otherwise the dead bead and its worktree
+// leak indefinitely while still excluded from pool capacity.
+//
+// An explicit sleep_reason is required: deny-by-default for unknown or
+// missing reasons so writes that land in state=asleep without a known
+// reason (legacy beads, regressions, write races) cannot silently free
+// their slot.
+func isPoolSessionSlotFreeable(session beads.Bead) bool {
+	if isDrainedSessionBead(session) {
+		return true
+	}
+	if strings.TrimSpace(session.Metadata["state"]) != "asleep" {
+		return false
+	}
+	reason := strings.TrimSpace(session.Metadata["sleep_reason"])
+	switch reason {
+	case "idle", "idle-timeout", sleepReasonCityStop, "failed-create", sleepReasonRuntimeMissing,
+		sleepReasonProviderTerminalError:
+		return true
+	}
+	return false
+}

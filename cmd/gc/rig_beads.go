@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/fsys"
 )
 
 // rigRoute pairs a bead prefix with the absolute directory it lives in.
@@ -61,7 +62,7 @@ func writeAllRoutes(rigs []rigRoute) error {
 // Uses temp file + rename for crash safety per CLAUDE.md conventions.
 func writeRoutesFile(dir string, routes []routeEntry) error {
 	beadsDir := filepath.Join(dir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+	if err := ensureBeadsDir(fsys.OSFS{}, beadsDir); err != nil {
 		return fmt.Errorf("creating .beads dir: %w", err)
 	}
 
@@ -96,6 +97,9 @@ func collectRigRoutes(cityPath string, cfg *config.City) []rigRoute {
 
 	rigs := []rigRoute{{Prefix: hqPrefix, AbsDir: cityPath}}
 	for i := range cfg.Rigs {
+		if strings.TrimSpace(cfg.Rigs[i].Path) == "" {
+			continue
+		}
 		rigs = append(rigs, rigRoute{
 			Prefix: cfg.Rigs[i].EffectivePrefix(),
 			AbsDir: cfg.Rigs[i].Path,

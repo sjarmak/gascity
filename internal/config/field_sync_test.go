@@ -19,33 +19,42 @@ func TestAgentFieldSync(t *testing.T) {
 	// Add to this list with a comment explaining why.
 	excluded := map[string]string{
 		"Name":        "identity field, not overridable",
-		"Description": "display field for MC session creation UI, not overridable via patch",
+		"Description": "display field for real-world app session creation UI, not overridable via patch",
 		// Provider-level fields: set during ResolveProvider, not typically
 		// overridden per-rig. Agent-level overrides happen in the Agent
 		// struct itself (which feeds into ResolveProvider).
-		"Args":                   "provider field, set via ResolveProvider",
-		"PromptMode":             "provider field, set via ResolveProvider",
-		"PromptFlag":             "provider field, set via ResolveProvider",
-		"ReadyDelayMs":           "provider field, set via ResolveProvider",
-		"ReadyPromptPrefix":      "provider field, set via ResolveProvider",
-		"ProcessNames":           "provider field, set via ResolveProvider",
-		"EmitsPermissionWarning": "provider field, set via ResolveProvider",
-		"WorkQuery":              "agent-specific, derived from name — not a patch concern",
-		"SlingQuery":             "agent-specific, derived from name/pool — not a patch concern",
-		"MaxActiveSessions":      "cap field, inherits from rig/workspace — not a patch concern",
-		"MinActiveSessions":      "cap field, inherits from rig/workspace — not a patch concern",
-		"ScaleCheck":             "agent-specific scaling, derived from pool config — not a patch concern",
-		"SourceDir":              "runtime-only, set during pack/fragment loading",
-		"Fallback":               "pack composition hint, not overridable at runtime",
-		"PoolName":               "internal field set during pool expansion, not user-configurable",
-		"Implicit":               "runtime-only, set during InjectImplicitAgents, not user-configurable",
-		"SleepAfterIdleSource":   "runtime-only provenance, derived from the layer that set SleepAfterIdle",
-		"DrainTimeout":           "scaling field, patched via PoolOverride.DrainTimeout",
-		"OnBoot":                 "scaling field, patched via PoolOverride.OnBoot",
-		"OnDeath":                "scaling field, patched via PoolOverride.OnDeath",
-		"Namepool":               "agent-specific file path, not a patch concern",
-		"NamepoolNames":          "runtime-only, loaded from Namepool file at config load time",
-		"OptionDefaults":         "provider-level concern, applied during ResolveProvider via mergeAgentOverrides",
+		"PromptMode":                   "provider field, set via ResolveProvider",
+		"PromptFlag":                   "provider field, set via ResolveProvider",
+		"ReadyDelayMs":                 "provider field, set via ResolveProvider",
+		"ReadyPromptPrefix":            "provider field, set via ResolveProvider",
+		"ProcessNames":                 "provider field, set via ResolveProvider",
+		"EmitsPermissionWarning":       "provider field, set via ResolveProvider",
+		"WorkQuery":                    "agent-specific, derived from name — not a patch concern",
+		"SlingQuery":                   "agent-specific, derived from name/pool — not a patch concern",
+		"MaxActiveSessions":            "cap field, inherits from rig/workspace — not a patch concern",
+		"MinActiveSessions":            "cap field, inherits from rig/workspace — not a patch concern",
+		"ScaleCheck":                   "agent-specific scaling, derived from pool config — not a patch concern",
+		"SourceDir":                    "runtime-only, set during pack/fragment loading",
+		"InheritedProvider":            "runtime-only, derived from imported pack [agent_defaults]",
+		"InheritedDefaultSlingFormula": "runtime-only, derived from imported pack [agent_defaults]",
+		"InheritedAppendFragments":     "runtime-only, derived from imported pack [agent_defaults]",
+		"SharedSkills":                 "runtime-only legacy tombstone field retained for backwards compatibility",
+		"SharedMCP":                    "runtime-only legacy tombstone field retained for backwards compatibility",
+		"SkillsDir":                    "runtime-only, set during agent discovery from agents/<name>/skills/",
+		"MCPDir":                       "runtime-only, set during agent discovery from agents/<name>/mcp/",
+		"Fallback":                     "pack composition hint, not overridable at runtime",
+		"PoolName":                     "internal field set during pool expansion, not user-configurable",
+		"Implicit":                     "runtime-only, set during InjectImplicitAgents, not user-configurable",
+		"SleepAfterIdleSource":         "runtime-only provenance, derived from the layer that set SleepAfterIdle",
+		"DrainTimeout":                 "scaling field, patched via PoolOverride.DrainTimeout",
+		"OnBoot":                       "scaling field, patched via PoolOverride.OnBoot",
+		"OnDeath":                      "scaling field, patched via PoolOverride.OnDeath",
+		"Namepool":                     "agent-specific file path, not a patch concern",
+		"NamepoolNames":                "runtime-only, loaded from Namepool file at config load time",
+		"BindingName":                  "runtime-only, set during V2 import expansion, not user-configurable",
+		"PackName":                     "runtime-only, set during V2 import expansion, not user-configurable",
+		"source":                       "runtime-only unexported provenance enum (ga-tpfc); stamped at discovery, not patched or overridden",
+		"layout":                       "runtime-only unexported pack-layout enum (ga-9ogb); stamped at discovery, not patched or overridden",
 	}
 
 	// Fields on AgentOverride/AgentPatch that don't map 1:1 to Agent fields.
@@ -59,6 +68,8 @@ func TestAgentFieldSync(t *testing.T) {
 		"SessionLiveAppend":       true, // append modifier, no Agent field
 		"InstallAgentHooksAppend": true, // append modifier, no Agent field
 		"InjectFragmentsAppend":   true, // append modifier, no Agent field
+		"SkillsAppend":            true, // append modifier, no Agent field
+		"MCPAppend":               true, // append modifier, no Agent field
 		"Pool":                    true, // legacy PoolOverride, maps to flat Agent fields via applyPoolOverride
 	}
 
@@ -158,6 +169,7 @@ func TestApplyAgentPatchCoversAllFields(t *testing.T) {
 		Dir:                     "target-dir",
 		Name:                    "target-name",
 		WorkDir:                 strVal(".gc/agents/worker"),
+		TmuxAlias:               strVal("worker--{{.Rig}}"),
 		Scope:                   strVal("city"),
 		Suspended:               &trueVal,
 		Attach:                  &trueVal,
@@ -167,30 +179,43 @@ func TestApplyAgentPatchCoversAllFields(t *testing.T) {
 		PromptTemplate:          strVal("prompts/test.md"),
 		Session:                 strVal("acp"),
 		Provider:                strVal("claude"),
+		Upstream:                strVal("bedrock"),
+		Args:                    Fragments("--custom-arg"),
 		StartCommand:            strVal("claude --dangerously"),
+		Lifecycle:               strVal(AgentLifecycleOneShot),
 		Nudge:                   strVal("wake up"),
 		IdleTimeout:             strVal("15m"),
+		MaxSessionAge:           strVal("5h"),
+		MaxSessionAgeJitter:     strVal("15m"),
 		SleepAfterIdle:          strVal("30s"),
 		InstallAgentHooks:       []string{"claude"},
 		HooksInstalled:          &trueVal,
+		InjectAssignedSkills:    &trueVal,
 		SessionSetup:            []string{"setup-cmd"},
 		SessionSetupScript:      strVal("scripts/setup.sh"),
 		SessionLive:             []string{"live-cmd"},
 		OverlayDir:              strVal("overlays/test"),
 		DefaultSlingFormula:     strVal("mol-work"),
-		InjectFragments:         []string{"frag1"},
+		InjectFragments:         Fragments("frag1"),
+		AppendFragments:         []string{"append1"},
 		DependsOn:               []string{"other-agent"},
 		ResumeCommand:           strVal("claude --resume {{.SessionKey}}"),
 		WakeMode:                strVal("fresh"),
+		MouseMode:               strVal("on"),
 		PreStartAppend:          []string{"pre-append"},
 		SessionSetupAppend:      []string{"setup-append"},
 		SessionLiveAppend:       []string{"live-append"},
 		InstallAgentHooksAppend: []string{"gemini"},
 		InjectFragmentsAppend:   []string{"frag2"},
+		Skills:                  []string{"code-review"},
+		SkillsAppend:            []string{"security"},
+		MCP:                     []string{"beads-health"},
+		MCPAppend:               []string{"tmux-helper"},
 		EnvRemove:               []string{"REMOVE_ME"},
 		MaxActiveSessions:       intVal(5),
 		MinActiveSessions:       intVal(1),
 		ScaleCheck:              strVal("echo 3"),
+		OptionDefaults:          map[string]string{"model": "sonnet"},
 	}
 
 	// Verify every AgentPatch field is set (non-zero).
@@ -218,6 +243,12 @@ func TestApplyAgentPatchCoversAllFields(t *testing.T) {
 		"SessionLiveAppend":       true,
 		"InstallAgentHooksAppend": true,
 		"InjectFragmentsAppend":   true,
+		// Tombstone fields (deprecated in v0.15.1, removed in v0.16) are
+		// parsed but not applied. See engdocs/proposals/skill-materialization.md
+		"Skills":       true,
+		"MCP":          true,
+		"SkillsAppend": true,
+		"MCPAppend":    true,
 	}
 
 	// Check that all non-targeting, non-modifier fields were applied.
@@ -233,8 +264,8 @@ func TestApplyAgentPatchCoversAllFields(t *testing.T) {
 		if targeting[fname] || modifiers[fname] {
 			continue
 		}
-		// Env and Pool are handled specially (not a direct field copy).
-		if fname == "Env" || fname == "Pool" {
+		// Env, OptionDefaults, and Pool are handled specially (not a direct field copy).
+		if fname == "Env" || fname == "OptionDefaults" || fname == "Pool" {
 			continue
 		}
 		idx, ok := agentFieldByName[fname]
@@ -249,6 +280,10 @@ func TestApplyAgentPatchCoversAllFields(t *testing.T) {
 	// Verify Env was merged.
 	if agent.Env["KEY"] != "val" {
 		t.Errorf("Env[KEY] = %q, want %q", agent.Env["KEY"], "val")
+	}
+	// Verify OptionDefaults was merged.
+	if agent.OptionDefaults["model"] != "sonnet" {
+		t.Errorf("OptionDefaults[model] = %q, want %q", agent.OptionDefaults["model"], "sonnet")
 	}
 	// Verify EnvRemove worked.
 	if _, exists := agent.Env["REMOVE_ME"]; exists {
@@ -288,6 +323,7 @@ func TestApplyAgentOverrideCoversAllFields(t *testing.T) {
 		Agent:                   "target",
 		Dir:                     strVal("new-dir"),
 		WorkDir:                 strVal(".gc/agents/target"),
+		TmuxAlias:               strVal("target--{{.Rig}}"),
 		Scope:                   strVal("city"),
 		Suspended:               &trueVal,
 		Attach:                  &trueVal,
@@ -298,29 +334,42 @@ func TestApplyAgentOverrideCoversAllFields(t *testing.T) {
 		PromptTemplate:          strVal("prompts/test.md"),
 		Session:                 strVal("acp"),
 		Provider:                strVal("claude"),
+		Upstream:                strVal("bedrock"),
+		Args:                    Fragments("--custom-arg"),
 		StartCommand:            strVal("claude --dangerously"),
+		Lifecycle:               strVal(AgentLifecycleOneShot),
 		Nudge:                   strVal("wake up"),
 		IdleTimeout:             strVal("15m"),
+		MaxSessionAge:           strVal("5h"),
+		MaxSessionAgeJitter:     strVal("15m"),
 		SleepAfterIdle:          strVal("30s"),
 		InstallAgentHooks:       []string{"claude"},
 		HooksInstalled:          &trueVal,
+		InjectAssignedSkills:    &trueVal,
 		SessionSetup:            []string{"setup-cmd"},
 		SessionSetupScript:      strVal("scripts/setup.sh"),
 		SessionLive:             []string{"live-cmd"},
 		OverlayDir:              strVal("overlays/test"),
 		DefaultSlingFormula:     strVal("mol-work"),
-		InjectFragments:         []string{"frag1"},
+		InjectFragments:         Fragments("frag1"),
+		AppendFragments:         []string{"append1"},
 		DependsOn:               []string{"other-agent"},
 		ResumeCommand:           strVal("claude --resume {{.SessionKey}}"),
 		WakeMode:                strVal("fresh"),
+		MouseMode:               strVal("on"),
 		PreStartAppend:          []string{"pre-append"},
 		SessionSetupAppend:      []string{"setup-append"},
 		SessionLiveAppend:       []string{"live-append"},
 		InstallAgentHooksAppend: []string{"gemini"},
 		InjectFragmentsAppend:   []string{"frag2"},
+		Skills:                  []string{"code-review"},
+		SkillsAppend:            []string{"security"},
+		MCP:                     []string{"beads-health"},
+		MCPAppend:               []string{"tmux-helper"},
 		MaxActiveSessions:       intVal(5),
 		MinActiveSessions:       intVal(1),
 		ScaleCheck:              strVal("echo 3"),
+		OptionDefaults:          map[string]string{"model": "sonnet"},
 	}
 
 	// Verify every AgentOverride field is set (non-zero).
@@ -346,6 +395,12 @@ func TestApplyAgentOverrideCoversAllFields(t *testing.T) {
 		"SessionLiveAppend":       true,
 		"InstallAgentHooksAppend": true,
 		"InjectFragmentsAppend":   true,
+		// Tombstone fields (deprecated in v0.15.1, removed in v0.16) are
+		// parsed but not applied. See engdocs/proposals/skill-materialization.md
+		"Skills":       true,
+		"MCP":          true,
+		"SkillsAppend": true,
+		"MCPAppend":    true,
 	}
 
 	av := reflect.ValueOf(agent)
@@ -360,7 +415,7 @@ func TestApplyAgentOverrideCoversAllFields(t *testing.T) {
 		if targeting[fname] || modifiers[fname] {
 			continue
 		}
-		if fname == "Env" || fname == "Pool" {
+		if fname == "Env" || fname == "OptionDefaults" || fname == "Pool" {
 			continue
 		}
 		idx, ok := agentFieldByName[fname]
@@ -379,8 +434,86 @@ func TestApplyAgentOverrideCoversAllFields(t *testing.T) {
 	if _, exists := agent.Env["REMOVE_ME"]; exists {
 		t.Error("EnvRemove did not remove REMOVE_ME from Env")
 	}
+	// Verify OptionDefaults was merged.
+	if agent.OptionDefaults["model"] != "sonnet" {
+		t.Errorf("OptionDefaults[model] = %q, want %q", agent.OptionDefaults["model"], "sonnet")
+	}
 	if agent.MinActiveSessions == nil || *agent.MinActiveSessions != 2 || agent.MaxActiveSessions == nil || *agent.MaxActiveSessions != 10 {
 		t.Errorf("Scaling not applied correctly: min=%v max=%v", agent.MinActiveSessions, agent.MaxActiveSessions)
+	}
+}
+
+// TestProviderFieldSync verifies every ProviderSpec field (other than the
+// small excluded set) has a matching ProviderPatch field. Parallel to
+// TestAgentFieldSync. Prevents the class of bug where a new ProviderSpec
+// field ships without a corresponding patch path.
+func TestProviderFieldSync(t *testing.T) {
+	// Fields on ProviderSpec that are NOT overridable via patch.
+	excluded := map[string]string{
+		// OptionsSchema is a complex slice with its own merge semantics
+		// (merge-by-Key when OptionsSchemaMerge = "by_key"). Direct patch
+		// is not yet implemented; users mutate via higher-level APIs.
+		"OptionsSchema": "patched via higher-level mutation APIs, not raw patch",
+		// OptionDefaults: existing fields, no patch path yet
+		"OptionDefaults": "existing map field, patched via higher-level APIs",
+		// PermissionModes: reference lookup table, not intended for patching
+		"PermissionModes": "reference lookup table, not patched",
+		// Provider-identity fields that don't belong on a patch
+		"DisplayName":            "identity/display field, not patched",
+		"PathCheck":              "internal PATH override, not patched",
+		"ReadyPromptPrefix":      "internal ready detection, not patched",
+		"ProcessNames":           "reference list, not currently patched",
+		"EmitsPermissionWarning": "tri-state *bool; merged via MergeProviderOverBuiltin, not ProviderPatch",
+		"SupportsACP":            "tri-state *bool; merged via MergeProviderOverBuiltin, not ProviderPatch",
+		"UpstreamEnv":            "harness serving-env binding; merged via MergeProviderOverBuiltin, not ProviderPatch",
+		"SupportsHooks":          "tri-state *bool; merged via MergeProviderOverBuiltin, not ProviderPatch",
+		"InstructionsFile":       "internal config path, not patched",
+		"ResumeFlag":             "internal resume config, not patched directly (use ResumeCommand)",
+		"ResumeStyle":            "internal resume config, not patched directly (use ResumeCommand)",
+		"ResumeCommand":          "already patchable at agent level via AgentPatch.ResumeCommand",
+		"SessionIDFlag":          "internal session-id config, not patched",
+		"ForkFlag":               "internal fork-launch config (claude-only), not patched",
+		"PrintArgs":              "internal print-mode args, not patched",
+		"TitleModel":             "internal title-model key, not patched",
+	}
+
+	// Fields on ProviderPatch that don't map 1:1 to ProviderSpec.
+	patchOnly := map[string]bool{
+		"Name":      true, // targeting key
+		"EnvRemove": true, // remove modifier, no Spec field
+		"Replace":   true, // patch-mode flag
+	}
+
+	specFields := structFields(reflect.TypeOf(ProviderSpec{}))
+	patchFields := structFields(reflect.TypeOf(ProviderPatch{}))
+
+	var expected []string
+	for _, f := range specFields {
+		if _, ok := excluded[f]; !ok {
+			expected = append(expected, f)
+		}
+	}
+	sort.Strings(expected)
+
+	patchSet := toSet(patchFields)
+	var missing []string
+	for _, f := range expected {
+		if !patchSet[f] {
+			missing = append(missing, f)
+		}
+	}
+	if len(missing) > 0 {
+		t.Errorf("ProviderPatch missing fields present on ProviderSpec: %v\n"+
+			"Add them to ProviderPatch + applyProviderPatch, or add to the excluded map with justification.",
+			missing)
+	}
+
+	// Check for extra fields on Patch not on Spec or patchOnly.
+	specSet := toSet(specFields)
+	for _, f := range patchFields {
+		if !specSet[f] && !patchOnly[f] {
+			t.Errorf("ProviderPatch has field %q not on ProviderSpec or patchOnly exclusion list", f)
+		}
 	}
 }
 

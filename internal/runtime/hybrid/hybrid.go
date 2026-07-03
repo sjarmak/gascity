@@ -18,8 +18,12 @@ type Provider struct {
 }
 
 var (
-	_ runtime.Provider            = (*Provider)(nil)
-	_ runtime.InteractionProvider = (*Provider)(nil)
+	_ runtime.Provider                      = (*Provider)(nil)
+	_ runtime.DeadRuntimeSessionChecker     = (*Provider)(nil)
+	_ runtime.InteractionProvider           = (*Provider)(nil)
+	_ runtime.InterruptBoundaryWaitProvider = (*Provider)(nil)
+	_ runtime.InterruptedTurnResetProvider  = (*Provider)(nil)
+	_ runtime.RelaunchProvider              = (*Provider)(nil)
 )
 
 // New creates a hybrid provider. isRemote returns true for sessions
@@ -53,6 +57,16 @@ func (p *Provider) Interrupt(name string) error {
 // IsRunning delegates to the routed backend.
 func (p *Provider) IsRunning(name string) bool {
 	return p.route(name).IsRunning(name)
+}
+
+// IsDeadRuntimeSession delegates to the routed backend when it can positively
+// distinguish live sessions from visible dead artifacts.
+func (p *Provider) IsDeadRuntimeSession(name string) (bool, error) {
+	checker, ok := p.route(name).(runtime.DeadRuntimeSessionChecker)
+	if !ok {
+		return false, nil
+	}
+	return checker.IsDeadRuntimeSession(name)
 }
 
 // IsAttached delegates to the routed backend.
@@ -93,6 +107,34 @@ func (p *Provider) NudgeNow(name string, content []runtime.ContentBlock) error {
 	return p.route(name).Nudge(name, content)
 }
 
+// ResetInterruptedTurn delegates to the routed backend when it supports
+// provider-native interrupted-turn discard semantics.
+func (p *Provider) ResetInterruptedTurn(ctx context.Context, name string) error {
+	if rp, ok := p.route(name).(runtime.InterruptedTurnResetProvider); ok {
+		return rp.ResetInterruptedTurn(ctx, name)
+	}
+	return runtime.ErrInteractionUnsupported
+}
+
+// Relaunch forwards a warm-box agent relaunch to the routed backend when it
+// supports one, so the reconciler's RelaunchProvider type-assert is not masked
+// by the hybrid router.
+func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config) error {
+	if rp, ok := p.route(name).(runtime.RelaunchProvider); ok {
+		return rp.Relaunch(ctx, name, cfg)
+	}
+	return runtime.ErrRelaunchUnsupported
+}
+
+// WaitForInterruptBoundary delegates to the routed backend when it can confirm
+// a provider-native interrupt boundary before the next turn is injected.
+func (p *Provider) WaitForInterruptBoundary(ctx context.Context, name string, since time.Time, timeout time.Duration) error {
+	if wp, ok := p.route(name).(runtime.InterruptBoundaryWaitProvider); ok {
+		return wp.WaitForInterruptBoundary(ctx, name, since, timeout)
+	}
+	return runtime.ErrInteractionUnsupported
+}
+
 // Pending delegates to the routed backend when it supports structured
 // interactions.
 func (p *Provider) Pending(name string) (*runtime.PendingInteraction, error) {
@@ -131,15 +173,15 @@ func (p *Provider) Peek(name string, lines int) (string, error) {
 	return p.route(name).Peek(name, lines)
 }
 
-// ListRunning queries both backends and merges results. If one backend
-// errors, results from the other are still returned (best-effort).
+// ListRunning queries both backends and returns best-effort results plus a
+// partial-list error when one backend fails.
 func (p *Provider) ListRunning(prefix string) ([]string, error) {
 	local, lErr := p.local.ListRunning(prefix)
 	remote, rErr := p.remote.ListRunning(prefix)
-	if lErr != nil && rErr != nil {
-		return nil, lErr
-	}
-	return append(local, remote...), nil
+	return runtime.MergeBackendListResults(
+		runtime.BackendListResult{Label: "local", Names: local, Err: lErr},
+		runtime.BackendListResult{Label: "remote", Names: remote, Err: rErr},
+	)
 }
 
 // GetLastActivity delegates to the routed backend.

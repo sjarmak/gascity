@@ -3,6 +3,7 @@ package beads
 import (
 	"errors"
 	"sort"
+	"time"
 )
 
 // ErrQueryRequiresScan reports that a query would require an explicit scan.
@@ -20,21 +21,112 @@ const (
 	SortCreatedDesc SortOrder = "created_desc"
 )
 
+// TierMode selects which storage tier(s) a List query reads from.
+// The zero value is TierIssues.
+//
+// TierIssues is the permanent logical tier and filters out Ephemeral rows when
+// a store returns them to the caller. NoHistory rows remain visible to list
+// filters in TierIssues because they are durable work without Dolt history.
+// Raw bd ready defaults are narrower than the logical union surface. In bd
+// 1.0.4, ready queries cannot expose no-history rows with the full ready
+// filter semantics, so compatibility policy keeps claimable work history-backed
+// in that mode. TierBoth is a logical union; implementations may satisfy it
+// through a single backend query when the backing store exposes a supported
+// union surface for the requested bead type.
+type TierMode int
+
+const (
+	// TierIssues reads only the permanent (issues) tier. Default.
+	TierIssues TierMode = iota
+	// TierWisps reads only the wisp-backed tier, including ephemeral and
+	// no-history rows.
+	TierWisps
+	// TierBoth unions the issues and wisps tiers, deduping by ID and
+	// preserving the query's sort.
+	TierBoth
+)
+
+// TierModeFromOpts returns the tier mode implied by a slice of QueryOpts.
+// WithBothTiers takes precedence over WithEphemeral.
+func TierModeFromOpts(opts []QueryOpt) TierMode {
+	switch {
+	case HasOpt(opts, WithBothTiers):
+		return TierBoth
+	case HasOpt(opts, WithEphemeral):
+		return TierWisps
+	default:
+		return TierIssues
+	}
+}
+
 // ListQuery describes a filtered bead lookup.
 //
 // Queries are conjunctive: every populated field must match. A zero-value query
 // is rejected unless AllowScan is true.
 type ListQuery struct {
-	Status        string
-	Type          string
-	Label         string
-	Assignee      string
-	ParentID      string
+	Status   string
+	Type     string
+	Label    string
+	Assignee string
+	// Assignees matches beads assigned to any listed assignee.
+	// It is mutually exclusive with Assignee; call Validate to enforce that contract.
+	Assignees []string
+	ParentID  string
+	// ParentIDs matches beads whose parent_id is any of the listed ids — a
+	// batched form of ParentID for graph/subtree walks. Backends that do not
+	// recognize it should ignore it (returning a superset); callers that need
+	// exact results must filter the returned beads by parent in memory.
+	ParentIDs     []string
 	Metadata      map[string]string
+	CreatedBefore time.Time
+	// UpdatedBefore matches beads whose UpdatedAt is before this timestamp.
+	// Legacy beads with zero UpdatedAt fall back to CreatedAt. Purge callers
+	// using CachingStore must also set Live: true to avoid stale cached timestamps.
+	UpdatedBefore time.Time
 	Limit         int
 	IncludeClosed bool
 	AllowScan     bool
-	Sort          SortOrder
+	// SkipLabels tells backing stores and cache reconciliation that the
+	// caller does not need labels for change detection. Stores that cannot
+	// omit labels may ignore it.
+	SkipLabels bool
+	// Live bypasses CachingStore and reads from the backing store. Other Store
+	// implementations ignore it. Use it only for lifecycle gates that must
+	// observe external mutations immediately.
+	Live bool
+	Sort SortOrder
+	// TierMode selects the storage tier(s) to read from. Zero value
+	// (TierIssues) preserves the legacy single-tier behavior.
+	TierMode TierMode
+}
+
+// Validate returns an error when the query contains contradictory selectors.
+func (q ListQuery) Validate() error {
+	if q.Assignee != "" && len(q.Assignees) > 0 {
+		return errors.New("ListQuery: Assignee and Assignees are mutually exclusive")
+	}
+	return nil
+}
+
+// ReadyQuery describes optional filters for ready-work lookup. A zero-value
+// query preserves Ready's historical behavior: all open, unblocked actionable
+// work.
+type ReadyQuery struct {
+	Assignee string
+	Limit    int
+	// TierMode selects the storage tier(s) to read from. Zero value
+	// (TierIssues) preserves raw Ready's historical main-tier behavior.
+	// Policy-aware callers should use the policy store wrapper, which expands
+	// default Ready reads to TierBoth so no-history and ephemeral policy rows
+	// remain reachable under bd 1.0.4.
+	TierMode TierMode
+}
+
+func readyQueryFromArgs(queries []ReadyQuery) ReadyQuery {
+	if len(queries) == 0 {
+		return ReadyQuery{}
+	}
+	return queries[0]
 }
 
 // HasFilter reports whether the query includes at least one indexed selector.
@@ -43,8 +135,11 @@ func (q ListQuery) HasFilter() bool {
 		q.Type != "" ||
 		q.Label != "" ||
 		q.Assignee != "" ||
+		len(q.Assignees) > 0 ||
 		q.ParentID != "" ||
-		len(q.Metadata) > 0
+		len(q.Metadata) > 0 ||
+		!q.CreatedBefore.IsZero() ||
+		!q.UpdatedBefore.IsZero()
 }
 
 // IncludesClosed reports whether the query may return closed beads.
@@ -54,6 +149,18 @@ func (q ListQuery) IncludesClosed() bool {
 
 // Matches reports whether the bead satisfies the query.
 func (q ListQuery) Matches(b Bead) bool {
+	switch q.TierMode {
+	case TierWisps:
+		if !b.Ephemeral && !b.NoHistory {
+			return false
+		}
+	case TierBoth:
+		// no tier filter
+	default: // TierIssues
+		if b.Ephemeral {
+			return false
+		}
+	}
 	if q.Status != "" {
 		if b.Status != q.Status {
 			return false
@@ -70,13 +177,38 @@ func (q ListQuery) Matches(b Bead) bool {
 	if q.Assignee != "" && b.Assignee != q.Assignee {
 		return false
 	}
+	if len(q.Assignees) > 0 {
+		matched := false
+		for _, assignee := range q.Assignees {
+			if b.Assignee == assignee {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
 	if q.ParentID != "" && b.ParentID != q.ParentID {
 		return false
 	}
 	if len(q.Metadata) > 0 && !matchesMetadata(b, q.Metadata) {
 		return false
 	}
+	if !q.CreatedBefore.IsZero() && !b.CreatedAt.Before(q.CreatedBefore) {
+		return false
+	}
+	if !q.UpdatedBefore.IsZero() && !beadUpdatedReferenceTime(b).Before(q.UpdatedBefore) {
+		return false
+	}
 	return true
+}
+
+func beadUpdatedReferenceTime(b Bead) time.Time {
+	if !b.UpdatedAt.IsZero() {
+		return b.UpdatedAt
+	}
+	return b.CreatedAt
 }
 
 func beadHasLabel(b Bead, want string) bool {
@@ -105,6 +237,39 @@ func ApplyListQuery(items []Bead, q ListQuery) []Bead {
 
 func applyListQuery(items []Bead, q ListQuery) []Bead {
 	return ApplyListQuery(items, q)
+}
+
+// SortBeads sorts items into the canonical (created_at, id) total order for
+// the given direction. SortDefault leaves the slice order unchanged. Callers
+// that merge results across stores use this to impose one deterministic
+// global order on the merged set (#3208).
+func SortBeads(items []Bead, order SortOrder) {
+	sortBeadsForQuery(items, order)
+}
+
+// sortBeadsReadyOrder sorts ready results into the canonical
+// (priority, created_at, id) ascending order used by the SQL-backed ready
+// readers (a nil priority sorts as 2, matching their COALESCE(i.priority, 2)),
+// so a bounded ready read cuts the same deterministic prefix regardless of
+// which store path served it (#3208).
+func sortBeadsReadyOrder(items []Bead) {
+	sort.Slice(items, func(i, j int) bool {
+		pi, pj := readySortPriority(items[i]), readySortPriority(items[j])
+		if pi != pj {
+			return pi < pj
+		}
+		if !items[i].CreatedAt.Equal(items[j].CreatedAt) {
+			return items[i].CreatedAt.Before(items[j].CreatedAt)
+		}
+		return items[i].ID < items[j].ID
+	})
+}
+
+func readySortPriority(b Bead) int {
+	if b.Priority == nil {
+		return 2
+	}
+	return *b.Priority
 }
 
 func sortBeadsForQuery(items []Bead, order SortOrder) {

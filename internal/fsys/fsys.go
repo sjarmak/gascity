@@ -24,6 +24,11 @@ type FS interface {
 	// Stat returns file info for the named file.
 	Stat(name string) (os.FileInfo, error)
 
+	// Lstat returns file info for the named file without following symlinks.
+	// Callers that must reject symlinked targets should call Lstat and check
+	// the mode's ModeSymlink bit before touching the path.
+	Lstat(name string) (os.FileInfo, error)
+
 	// ReadDir reads the named directory and returns its entries.
 	ReadDir(name string) ([]os.DirEntry, error)
 
@@ -32,6 +37,9 @@ type FS interface {
 
 	// Remove removes the named file or empty directory.
 	Remove(name string) error
+
+	// Chmod changes the mode of the named file or directory.
+	Chmod(name string, mode os.FileMode) error
 }
 
 // OSFS implements [FS] by delegating to the os package.
@@ -57,6 +65,21 @@ func (OSFS) Stat(name string) (os.FileInfo, error) {
 	return os.Stat(name)
 }
 
+// Lstat delegates to [os.Lstat].
+func (OSFS) Lstat(name string) (os.FileInfo, error) {
+	return os.Lstat(name)
+}
+
+// Readlink delegates to [os.Readlink].
+func (OSFS) Readlink(name string) (string, error) {
+	return os.Readlink(name)
+}
+
+// Symlink delegates to [os.Symlink].
+func (OSFS) Symlink(oldname, newname string) error {
+	return os.Symlink(oldname, newname)
+}
+
 // ReadDir delegates to [os.ReadDir].
 func (OSFS) ReadDir(name string) ([]os.DirEntry, error) {
 	return os.ReadDir(name)
@@ -70,4 +93,9 @@ func (OSFS) Rename(oldpath, newpath string) error {
 // Remove delegates to [os.Remove].
 func (OSFS) Remove(name string) error {
 	return os.Remove(name)
+}
+
+// Chmod delegates to [os.Chmod].
+func (OSFS) Chmod(name string, mode os.FileMode) error {
+	return os.Chmod(name, mode)
 }
