@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -275,5 +276,104 @@ func TestStopManagedDoltWaitsForLockReleaseAfterExit(t *testing.T) {
 	}
 	if pidAlive(pid) {
 		t.Fatal("expected the SIGTERM-respecting process to have exited")
+	}
+}
+
+// Regression coverage for gastownhall/gascity#2130: `gc dolt start` must
+// acquire the managed-dolt lifecycle lock so two overlapping starters cannot
+// both run preflight cleanup and spawn duplicate `dolt sql-server` processes
+// racing for the same data_dir. `gc dolt recover` already took this lock; these
+// tests pin the symmetric behavior on the start path.
+
+// holdLifecycleLock acquires the managed-dolt lifecycle lock for cityPath via
+// the production helpers and returns a release func. The lock is also released
+// on test cleanup, so callers that never release explicitly still don't leak
+// it. Because flock is per-open-file-description, this blocks a second
+// acquisition from within the same process — exactly how a concurrent starter
+// would be serialized.
+func holdLifecycleLock(t *testing.T, cityPath string) func() {
+	t.Helper()
+	f, _, err := openManagedDoltLifecycleLock(cityPath)
+	if err != nil {
+		t.Fatalf("open lifecycle lock: %v", err)
+	}
+	locked, err := tryManagedDoltLifecycleLock(f)
+	if err != nil || !locked {
+		t.Fatalf("acquire lifecycle lock: locked=%v err=%v", locked, err)
+	}
+	var released int32
+	release := func() {
+		if atomic.CompareAndSwapInt32(&released, 0, 1) {
+			releaseManagedDoltLifecycleLock(f)
+		}
+	}
+	t.Cleanup(release)
+	return release
+}
+
+func TestStartManagedDoltWaitsForLifecycleLockThenSpawns(t *testing.T) {
+	city, _ := raceTestCity(t, "")
+	shimLockReleaseTimeout(t, 150*time.Millisecond)
+	release := holdLifecycleLock(t, city)
+
+	origStart := managedDoltStartSQLServerFn
+	t.Cleanup(func() { managedDoltStartSQLServerFn = origStart })
+	var spawned int32
+	sentinel := errors.New("spawn reached")
+	managedDoltStartSQLServerFn = func(string, string, string, *os.File) (managedDoltStartedProcess, error) {
+		atomic.StoreInt32(&spawned, 1)
+		return managedDoltStartedProcess{}, sentinel
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := startManagedDoltProcessWithOptions(city, "127.0.0.1", "13317", "root", "warning", -1, 5*time.Second, false)
+		done <- err
+	}()
+
+	// While another lifecycle holds the lock, start must block instead of
+	// spawning a duplicate.
+	time.Sleep(400 * time.Millisecond)
+	if atomic.LoadInt32(&spawned) != 0 {
+		t.Fatal("start spawned dolt sql-server while another lifecycle held the lock")
+	}
+
+	release()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("expected the stubbed spawn error after lock release, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("start did not proceed after the lifecycle lock was released")
+	}
+	if atomic.LoadInt32(&spawned) == 0 {
+		t.Fatal("start never spawned dolt sql-server after the lock was released")
+	}
+}
+
+func TestStartManagedDoltLifecycleLockTimeoutDoesNotSpawn(t *testing.T) {
+	city, _ := raceTestCity(t, "")
+	shimLockReleaseTimeout(t, 150*time.Millisecond)
+	holdLifecycleLock(t, city) // never released until cleanup
+
+	origStart := managedDoltStartSQLServerFn
+	t.Cleanup(func() { managedDoltStartSQLServerFn = origStart })
+	spawned := false
+	managedDoltStartSQLServerFn = func(string, string, string, *os.File) (managedDoltStartedProcess, error) {
+		spawned = true
+		return managedDoltStartedProcess{}, errors.New("must not spawn while another lifecycle holds the lock")
+	}
+
+	_, err := startManagedDoltProcessWithOptions(city, "127.0.0.1", "13317", "root", "warning", -1, 300*time.Millisecond, false)
+	if err == nil {
+		t.Fatal("expected start to fail closed while another lifecycle holds the lock")
+	}
+	if !strings.Contains(err.Error(), "lifecycle") {
+		t.Fatalf("expected a lifecycle-lock wait error, got %v", err)
+	}
+	if spawned {
+		t.Fatal("start spawned a duplicate dolt sql-server instead of waiting on the lifecycle lock (gastownhall/gascity#2130)")
 	}
 }

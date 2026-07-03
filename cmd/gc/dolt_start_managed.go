@@ -137,12 +137,100 @@ func startManagedDoltProcess(cityPath, host, port, user, logLevel string, timeou
 	return startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel, -1, timeout, true)
 }
 
+// startManagedDoltProcessWithOptions serializes managed-dolt starts under the
+// lifecycle lock (gastownhall/gascity#2130). Without it, two overlapping
+// `gc dolt start` invocations — supervisor boot racing the default dolt-health
+// order, or an operator racing either — both run preflight cleanup and both
+// spawn `dolt sql-server` for the same data_dir. The second collides on the
+// port, bumps to the next free one, and the resulting "database is locked" /
+// closed-connection churn looks like a Dolt crash. `gc dolt recover` already
+// takes this lock (dolt_recover_managed.go); this makes `gc dolt start`
+// symmetric.
+//
+// When the lock is contended, we wait for the in-flight lifecycle to finish
+// and reuse its healthy server instead of respawning — the same
+// observe-or-acquire dance recover uses. recover itself calls the lock-free
+// core (startManagedDoltProcessLocked) because it already holds the lock;
+// re-acquiring here would self-deadlock (flock is per-open-file, not
+// re-entrant within a process).
+//
 //nolint:unparam // archiveLevel is an explicit override hook; current callers use config/env fallback.
 func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel string, archiveLevel int, timeout time.Duration, publish bool) (managedDoltStartReport, error) {
-	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
-	if err != nil {
-		return managedDoltStartReport{}, err
+	host = normalizeManagedDoltBindHost(host)
+	if strings.TrimSpace(user) == "" {
+		user = "root"
 	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
+	report := managedDoltStartReport{}
+	lockFile, layout, err := openManagedDoltLifecycleLock(cityPath)
+	if err != nil {
+		return report, err
+	}
+	defer func() {
+		if lockFile != nil {
+			_ = lockFile.Close()
+		}
+	}()
+
+	locked, err := tryManagedDoltLifecycleLock(lockFile)
+	if err != nil {
+		return report, err
+	}
+	if !locked {
+		obs := managedDoltRecoverReport{}
+		observed, acquired, waitErr := waitForManagedDoltLifecycleOrReady(cityPath, host, port, user, timeout, lockFile, layout, &obs)
+		if waitErr != nil {
+			return report, waitErr
+		}
+		if observed {
+			return finishReusedManagedDoltStart(cityPath, obs, publish)
+		}
+		locked = acquired
+	}
+	if !locked {
+		return report, fmt.Errorf("managed dolt lifecycle lock not acquired")
+	}
+	defer releaseManagedDoltLifecycleLock(lockFile)
+	lockFile = nil
+
+	// We won the lock, but a concurrent starter may have brought a healthy
+	// server up on the requested port in the window between our last observe
+	// and the lock handoff. Reuse it rather than tearing it down in preflight
+	// cleanup and respawning a duplicate.
+	obs := managedDoltRecoverReport{}
+	if observeExistingManagedDoltForRecovery(cityPath, host, port, user, recoverManagedDoltExistingObserveTimeout(timeout), &obs) {
+		return finishReusedManagedDoltStart(cityPath, obs, publish)
+	}
+
+	return startManagedDoltProcessLocked(cityPath, host, port, user, logLevel, archiveLevel, layout, timeout, publish)
+}
+
+// finishReusedManagedDoltStart translates an observed, already-healthy managed
+// dolt server (surfaced by the lifecycle-lock wait or the post-lock reuse
+// probe) into a ready start report, republishing runtime state when the caller
+// asked to publish — matching what a fresh start would have done.
+func finishReusedManagedDoltStart(cityPath string, obs managedDoltRecoverReport, publish bool) (managedDoltStartReport, error) {
+	report := managedDoltStartReport{Ready: true, PID: obs.PID, Port: obs.Port}
+	if publish {
+		if err := publishManagedDoltRuntimeStateIfOwned(cityPath); err != nil {
+			return report, fmt.Errorf("publish managed dolt runtime state: %w", err)
+		}
+	}
+	return report, nil
+}
+
+// startManagedDoltProcessLocked is the lock-free core of the managed-dolt
+// start path. Callers MUST hold the managed-dolt lifecycle lock (or be a
+// single-writer test): startManagedDoltProcessWithOptions acquires it, and
+// recoverManagedDoltProcess already holds it. It resolves config, waits out
+// any prior instance's on-disk store lock, and runs the address-in-use retry
+// loop.
+//
+//nolint:unparam // archiveLevel is an explicit override hook; current callers use config/env fallback.
+func startManagedDoltProcessLocked(cityPath, host, port, user, logLevel string, archiveLevel int, layout managedDoltRuntimeLayout, timeout time.Duration, publish bool) (managedDoltStartReport, error) {
 	if err := checkManagedDoltDiskPreflight(layout.DataDir, doltDiskMinFreeBytes(), doltDiskWarnFreeBytes(), os.Stderr); err != nil {
 		return managedDoltStartReport{}, err
 	}
