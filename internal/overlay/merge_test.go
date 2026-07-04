@@ -785,3 +785,41 @@ func TestMergeSettingsJSON_NoWrap_LeavesBareEntries(t *testing.T) {
 		t.Errorf("bare entry was wrapped without WithWrapBareHooks: %v", arr[0])
 	}
 }
+
+// TestMergeSettingsJSON_BareSourceReprojectionIsIdempotent guards against the
+// #3862 bloat: a pack ships a Claude .claude/settings.json hook in BARE shape
+// ({"type":"command","command":"..."}), but WithWrapBareHooks normalizes the
+// merged result to WRAPPED shape ({"matcher":"","hooks":[...]}) when it is
+// persisted. On the next reconcile tick the projector reads that wrapped file
+// back as the merge base while the pack overlay source is still bare, so the
+// two shapes must resolve to the SAME identity or the entry is appended anew on
+// every tick — unbounded growth (observed: 5,760 identical entries / 1.4 MB on
+// a 5-day session). Re-projecting the bare source over its own wrapped output
+// must stay at one entry.
+func TestMergeSettingsJSON_BareSourceReprojectionIsIdempotent(t *testing.T) {
+	// The pack overlay's .claude/settings.json — a bare PreToolUse entry, the
+	// shape the ubs flywheel hook ships in.
+	src := `{"hooks":{"PreToolUse":[{"type":"command","command":"if echo \"$TOOL_INPUT\" | grep -q 'git commit'; then ubs --staged --format=json 2>/dev/null || true; fi"}]}}`
+
+	// Tick 1: first materialization merges the bare source into an empty base
+	// and wraps it, exactly as createCanonicalSettingsFile does.
+	persisted, err := MergeSettingsJSON([]byte("{}"), []byte(src), WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("tick 1 merge: %v", err)
+	}
+	if got := len(preToolUse(t, persisted)); got != 1 {
+		t.Fatalf("after tick 1: PreToolUse entries = %d, want 1", got)
+	}
+
+	// Ticks 2..N: the projector re-reads the wrapped file as the base and
+	// merges the still-bare source on top. Each tick must be a no-op.
+	for tick := 2; tick <= 5; tick++ {
+		persisted, err = MergeSettingsJSON(persisted, []byte(src), WithWrapBareHooks())
+		if err != nil {
+			t.Fatalf("tick %d merge: %v", tick, err)
+		}
+		if got := len(preToolUse(t, persisted)); got != 1 {
+			t.Fatalf("after tick %d: PreToolUse entries = %d, want 1 (bare source re-projected over wrapped base must dedupe)", tick, got)
+		}
+	}
+}

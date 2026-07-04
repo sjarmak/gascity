@@ -457,3 +457,48 @@ func assertFileContent(t *testing.T, path, want string) {
 		t.Errorf("%q content = %q, want %q", path, string(data), want)
 	}
 }
+
+// TestCopyDir_BareHookOverlayReprojectionIsIdempotent is the end-to-end
+// regression for #3862: a pack overlay ships a bare Claude PreToolUse hook
+// ({"type","command"}), and the reconciler re-runs the overlay copy on every
+// tick, reading the previously-written (and now wrapped) settings.json back as
+// the merge base. Before the fix the wrapped base and the still-bare source
+// resolved to different identities, so each tick appended another copy —
+// unbounded .claude/settings.json growth on long-lived sessions. Repeated
+// projections must leave exactly one PreToolUse entry.
+func TestCopyDir_BareHookOverlayReprojectionIsIdempotent(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+
+	// Pack overlay ships the hook in bare shape (the ubs flywheel hook shape).
+	overJSON := `{
+  "hooks": {
+    "PreToolUse": [{"type": "command", "command": "if echo \"$TOOL_INPUT\" | grep -q 'git commit'; then ubs --staged --format=json 2>/dev/null || true; fi"}]
+  }
+}`
+	writeFile(t, filepath.Join(src, ".claude", "settings.json"), overJSON)
+
+	settingsPath := filepath.Join(dst, ".claude", "settings.json")
+	for tick := 1; tick <= 5; tick++ {
+		var stderr bytes.Buffer
+		if err := CopyDir(src, dst, &stderr); err != nil {
+			t.Fatalf("tick %d CopyDir: %v", tick, err)
+		}
+		data, err := os.ReadFile(settingsPath)
+		if err != nil {
+			t.Fatalf("tick %d reading result: %v", tick, err)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(data, &doc); err != nil {
+			t.Fatalf("tick %d unmarshal: %v", tick, err)
+		}
+		arr := doc["hooks"].(map[string]any)["PreToolUse"].([]any)
+		if len(arr) != 1 {
+			t.Fatalf("after tick %d: PreToolUse entries = %d, want 1", tick, len(arr))
+		}
+		// The persisted entry must be valid wrapped Claude shape.
+		if _, ok := arr[0].(map[string]any)["hooks"]; !ok {
+			t.Fatalf("after tick %d: entry lacks wrapped hooks array: %v", tick, arr[0])
+		}
+	}
+}

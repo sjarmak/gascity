@@ -121,7 +121,7 @@ func MergeSettingsJSON(base, overlay []byte, opts ...MergeOption) ([]byte, error
 		if k == "hooks" {
 			baseHooks := toMapStringAny(baseDoc["hooks"])
 			overHooks := toMapStringAny(v)
-			result["hooks"] = mergeHooksMap(baseHooks, overHooks)
+			result["hooks"] = mergeHooksMap(baseHooks, overHooks, cfg.wrapBareHooks)
 		} else {
 			// Non-hook keys: last writer wins.
 			result[k] = v
@@ -182,8 +182,10 @@ func MarshalCanonicalJSON(doc any) ([]byte, error) {
 
 // mergeHooksMap unions hook categories from base and overlay.
 // Categories present in only one side are preserved as-is.
-// Categories present in both get entry-level merge.
-func mergeHooksMap(base, over map[string]any) map[string]any {
+// Categories present in both get entry-level merge. bridgeShapes enables the
+// bare↔wrapped-empty cross-shape identity bridge (Claude settings only); see
+// mergeHookArray.
+func mergeHooksMap(base, over map[string]any, bridgeShapes bool) map[string]any {
 	result := make(map[string]any, len(base)+len(over))
 	for k, v := range base {
 		result[k] = v
@@ -192,7 +194,7 @@ func mergeHooksMap(base, over map[string]any) map[string]any {
 		overArr, okOver := toSliceAny(v)
 		baseArr, okBase := toSliceAny(result[k])
 		if okOver && okBase {
-			result[k] = mergeHookArray(baseArr, overArr)
+			result[k] = mergeHookArray(baseArr, overArr, bridgeShapes)
 		} else {
 			result[k] = v
 		}
@@ -203,18 +205,38 @@ func mergeHooksMap(base, over map[string]any) map[string]any {
 // mergeHookArray merges two arrays of hook entries by identity key.
 // Entries with the same identity → overlay replaces base in-place.
 // New entries → appended.
-func mergeHookArray(base, over []any) []any {
+//
+// When bridgeShapes is set (Claude .claude/settings.json, where WithWrapBareHooks
+// normalizes a bare {"type","command"} entry to the wrapped
+// {"matcher":"","hooks":[...]} form after each merge), a second identity is also
+// consulted for empty-matcher entries: the canonical inner-command content. This
+// bridges the two shapes of the same hook so a bare overlay entry re-projected
+// over its own already-wrapped persisted form is recognized as identical and
+// replaced in place, rather than appended anew on every reconcile tick (#3862).
+// Non-empty matchers keep pure matcher identity, and distinct commands keep
+// distinct inner keys, so neither the same-matcher-replacement nor the
+// distinct-bare-entry semantics change.
+func mergeHookArray(base, over []any, bridgeShapes bool) []any {
 	// Build ordered result starting from base entries.
 	result := make([]any, len(base))
 	copy(result, base)
 
 	// Index base entries by identity for in-place replacement.
-	baseIdx := make(map[string]int) // identity → index in result
+	baseIdx := make(map[string]int)  // primary identity → index in result
+	innerIdx := make(map[string]int) // empty-matcher inner-content identity → index
+	indexEntry := func(m map[string]any, i int) {
+		if key, hasKey := hookEntryKey(m); hasKey {
+			baseIdx[key] = i
+		}
+		if bridgeShapes {
+			if ik, ok := emptyMatcherInnerKey(m); ok {
+				innerIdx[ik] = i
+			}
+		}
+	}
 	for i, entry := range result {
 		if m, ok := entry.(map[string]any); ok {
-			if key, hasKey := hookEntryKey(m); hasKey {
-				baseIdx[key] = i
-			}
+			indexEntry(m, i)
 		}
 	}
 
@@ -225,21 +247,54 @@ func mergeHookArray(base, over []any) []any {
 			continue
 		}
 		key, hasKey := hookEntryKey(m)
-		if !hasKey {
-			// No identity → always append.
-			result = append(result, entry)
-			continue
+		if hasKey {
+			if idx, found := baseIdx[key]; found {
+				// Same primary identity → replace in-place.
+				result[idx] = entry
+				continue
+			}
 		}
-		if idx, found := baseIdx[key]; found {
-			// Same identity → replace in-place.
-			result[idx] = entry
-		} else {
-			// New identity → append.
-			result = append(result, entry)
-			baseIdx[key] = len(result) - 1
+		if bridgeShapes {
+			if ik, ok := emptyMatcherInnerKey(m); ok {
+				if idx, found := innerIdx[ik]; found {
+					// Same inner content in the other shape → replace in-place.
+					result[idx] = entry
+					continue
+				}
+			}
 		}
+		// New identity → append and index for later overlay entries.
+		result = append(result, entry)
+		indexEntry(m, len(result)-1)
 	}
 	return result
+}
+
+// emptyMatcherInnerKey returns a canonical identity derived from a hook entry's
+// inner command content, but only for entries whose effective matcher is empty:
+// a bare {"type","command"} entry (whose normalized form is
+// {"matcher":"","hooks":[entry]}) or a {"matcher":"","hooks":[...]} wrapper.
+// Both shapes of the same hook yield the same key, which is what lets
+// mergeHookArray dedupe a re-projected bare overlay entry against its own
+// wrapped persisted form (#3862). Entries carrying a non-empty matcher return
+// false so they keep pure matcher identity.
+func emptyMatcherInnerKey(entry map[string]any) (string, bool) {
+	if v, ok := entry["matcher"]; ok {
+		s, sok := v.(string)
+		if !sok || s != "" {
+			return "", false
+		}
+		if inner, ok := entry["hooks"]; ok {
+			return innerHooksKey(inner)
+		}
+		return "", false
+	}
+	// No matcher key. A matcherless wrapper keys on its inner hooks directly;
+	// a truly bare entry keys on its own single-element normalized inner array.
+	if inner, ok := entry["hooks"]; ok {
+		return innerHooksKey(inner)
+	}
+	return innerHooksKey([]any{entry})
 }
 
 // hookEntryKey extracts the identity key from a hook entry.
