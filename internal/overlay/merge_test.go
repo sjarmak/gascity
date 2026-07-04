@@ -785,3 +785,57 @@ func TestMergeSettingsJSON_NoWrap_LeavesBareEntries(t *testing.T) {
 		t.Errorf("bare entry was wrapped without WithWrapBareHooks: %v", arr[0])
 	}
 }
+
+// ubsBareOverlay is the exact bare {type,command} PreToolUse hook the flywheel
+// ubs pack ships: no top-level matcher, so it keys on "cmd:<command>", while the
+// accumulated agent-side copy is wrapped to {"matcher":"","hooks":[…]} (key "").
+const ubsBareOverlay = `{"hooks":{"PreToolUse":[{"type":"command","command":"if echo \"$TOOL_INPUT\" | grep -q 'git commit'; then ubs --staged --format=json 2>/dev/null || true; fi"}]}}`
+
+func TestMergeSettingsJSON_WrapBareHooks_IdempotentAcrossReprojection(t *testing.T) {
+	// Regression for #3862: hook projection re-merges the ubs pack's bare
+	// PreToolUse overlay into each agent's already-wrapped settings on every
+	// reconcile tick. The bare overlay entry keys on "cmd:<command>" while the
+	// accumulated destination copy — wrapped to matcher="" after a prior merge —
+	// keys on "". The two never matched, so a fresh copy was appended every
+	// tick and .claude/settings.json grew without bound (observed: 5,760
+	// identical entries / 1.4 MB on a 5-day session). Re-projection must
+	// converge to exactly one entry.
+	merged, err := MergeSettingsJSON([]byte("{}"), []byte(ubsBareOverlay), WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("initial merge: %v", err)
+	}
+	for i := 0; i < 25; i++ {
+		merged, err = MergeSettingsJSON(merged, []byte(ubsBareOverlay), WithWrapBareHooks())
+		if err != nil {
+			t.Fatalf("merge iteration %d: %v", i, err)
+		}
+	}
+	arr := preToolUse(t, merged)
+	if len(arr) != 1 {
+		t.Fatalf("PreToolUse entries after 26 projections = %d, want 1 (idempotent)", len(arr))
+	}
+	if _, ok := arr[0].(map[string]any)["hooks"]; !ok {
+		t.Errorf("entry lacks a hooks array (invalid Claude shape): %v", arr[0])
+	}
+}
+
+func TestMergeSettingsJSON_WrapBareHooks_CollapsesExistingBloat(t *testing.T) {
+	// A settings file that already accumulated many byte-identical wrapped
+	// copies (the #3862 steady state) must self-heal to a single entry on the
+	// next projection rather than staying bloated.
+	wrapped := `{"matcher":"","hooks":[{"type":"command","command":"scan"}]}`
+	bloat := wrapped
+	for i := 0; i < 11; i++ {
+		bloat += "," + wrapped
+	}
+	base := `{"hooks":{"PreToolUse":[` + bloat + `]}}`
+	over := `{"hooks":{"PreToolUse":[{"type":"command","command":"scan"}]}}`
+
+	merged, err := MergeSettingsJSON([]byte(base), []byte(over), WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("MergeSettingsJSON: %v", err)
+	}
+	if got := len(preToolUse(t, merged)); got != 1 {
+		t.Fatalf("PreToolUse entries = %d, want 1 (bloat collapsed)", got)
+	}
+}

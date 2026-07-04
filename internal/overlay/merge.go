@@ -137,6 +137,19 @@ func MergeSettingsJSON(base, overlay []byte, opts ...MergeOption) ([]byte, error
 		}
 	}
 
+	// Collapse byte-identical duplicate entries within each hook category.
+	// mergeHookArray only deduplicates overlay entries against the base, never
+	// the base against itself, so a bare overlay entry (identity "cmd:…") that
+	// is wrapped to {"matcher":"","hooks":[…]} (identity "") only after the
+	// merge is appended afresh on every reconcile and never matches the copy it
+	// wrapped last tick — unbounded growth on long-lived sessions (#3862). Two
+	// byte-identical hook entries always do the same thing, so keeping the first
+	// occurrence preserves behavior while converging re-projection to one copy.
+	// Runs after wrapping so entries are compared in their final wrapped shape.
+	if hooks, ok := result["hooks"].(map[string]any); ok {
+		result["hooks"] = dedupExactHookEntries(hooks)
+	}
+
 	out, err := MarshalCanonicalJSON(result)
 	if err != nil {
 		return nil, fmt.Errorf("merge: marshaling result: %w", err)
@@ -294,6 +307,41 @@ func innerHooksKey(inner any) (string, bool) {
 		return "", false
 	}
 	return "inner:" + string(bytes.TrimRight(canon, "\n")), true
+}
+
+// dedupExactHookEntries returns a copy of a hooks map in which byte-identical
+// duplicate entries within each category are collapsed to a single occurrence,
+// preserving first-seen order. Identity is the canonical JSON of the entry, so
+// only entries that are truly identical (same shape and content) are removed;
+// distinct commands and distinct matchers are always kept. Entries that cannot
+// be canonicalized are kept as-is. See MergeSettingsJSON for why base-side
+// accumulation needs this pass (#3862).
+func dedupExactHookEntries(hooks map[string]any) map[string]any {
+	out := make(map[string]any, len(hooks))
+	for category, v := range hooks {
+		arr, ok := toSliceAny(v)
+		if !ok {
+			out[category] = v
+			continue
+		}
+		seen := make(map[string]struct{}, len(arr))
+		deduped := make([]any, 0, len(arr))
+		for _, entry := range arr {
+			canon, err := MarshalCanonicalJSON(entry)
+			if err != nil {
+				deduped = append(deduped, entry)
+				continue
+			}
+			key := string(canon)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			deduped = append(deduped, entry)
+		}
+		out[category] = deduped
+	}
+	return out
 }
 
 // wrapBareHookEntries returns a copy of a hooks map in which every bare
