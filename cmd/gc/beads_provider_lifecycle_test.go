@@ -11727,6 +11727,42 @@ func TestHealthBeadsProviderSkipsRecoverWhenBreakerOpen(t *testing.T) {
 	}
 }
 
+// #3898: after a supervisor start, exec orders can fire before pack
+// staging projects the provider script. Recovery would re-exec the same
+// missing path — a doomed recover against a half-staged city. The health
+// failure must surface as a distinct not-staged error with no recover
+// attempt and no recover-backoff side effects.
+func TestHealthBeadsProviderSkipsRecoverWhenScriptNotStaged(t *testing.T) {
+	cityPath := t.TempDir()
+	writeMinimalCityToml(t, cityPath)
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads", "dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "issue_prefix: gc\ngc.endpoint_origin: managed_city\ngc.endpoint_status: verified\n"
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "config.yaml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately do NOT write the provider script: .gc/scripts has not
+	// been staged yet in this window.
+
+	cityKey := normalizePathForCompare(cityPath)
+	t.Cleanup(func() { lastBeadsProviderRecover.Delete(cityKey) })
+
+	err := healthBeadsProvider(cityPath)
+	if err == nil {
+		t.Fatalf("healthBeadsProvider() error = nil, want not-staged health error")
+	}
+	if !strings.Contains(err.Error(), "not staged yet") {
+		t.Fatalf("healthBeadsProvider() error = %v, want not-staged classification", err)
+	}
+	if strings.Contains(err.Error(), "recovery failed") {
+		t.Fatalf("healthBeadsProvider() error = %v; recover must not run against a missing script", err)
+	}
+	if _, loaded := lastBeadsProviderRecover.Load(cityKey); loaded {
+		t.Fatalf("not-staged skip should NOT update lastBeadsProviderRecover for %q", cityPath)
+	}
+}
+
 func TestHealthBeadsProviderBacksOffSecondRecoverWithinCooldown(t *testing.T) {
 	cityPath := t.TempDir()
 	writeMinimalCityToml(t, cityPath)

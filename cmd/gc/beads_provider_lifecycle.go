@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"os"
@@ -1063,6 +1064,15 @@ func healthBeadsProvider(cityPath string) error {
 			return err
 		}
 		if err := runProviderOpWithEnv(script, providerEnv, "health"); err != nil {
+			// #3898: right after a supervisor start, pack staging may not
+			// have projected the provider script yet. Recovery re-execs
+			// the same missing path, so it is doomed — and for bd
+			// providers it runs a real recover against a half-staged
+			// city. Surface the health failure without recovering; the
+			// next tick re-checks after staging lands.
+			if _, statErr := os.Stat(script); errors.Is(statErr, fs.ErrNotExist) {
+				return fmt.Errorf("beads provider script not staged yet (%s): %w", script, err)
+			}
 			if providerUsesBdStoreContract(provider) {
 				owned, ownershipErr := managedDoltLifecycleOwned(cityPath)
 				if ownershipErr != nil {
