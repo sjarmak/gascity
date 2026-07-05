@@ -454,6 +454,14 @@ func ClosePatch(now time.Time, stateCode string) MetadataPatch {
 	}
 }
 
+// UnknownStateCloseReason is the close-reason/state code the reconciler's
+// recordUnknownStateSkip (cmd/gc/session_reconciler.go) passes to ClosePatch
+// when escalating a session bead stuck in a metadata "state" this build
+// never recognized (#1497). Shared as a constant, rather than two
+// independent string literals, so the call site and the CanonicalCloseReason
+// case below cannot silently drift apart.
+const UnknownStateCloseReason = "unknown-state"
+
 // CanonicalCloseReason maps a short session stateCode to a human-readable
 // close reason of at least 20 characters, suitable for use as
 // `bd close --reason` under validation.on-close=error.
@@ -482,6 +490,8 @@ func CanonicalCloseReason(stateCode string) string {
 		return "session reconfigured: superseded by new agent config"
 	case "suspended":
 		return "session suspended: agent disabled in city config"
+	case UnknownStateCloseReason:
+		return "session terminated: unrecognized metadata state persisted"
 	}
 	if len(stateCode) >= 20 {
 		return stateCode

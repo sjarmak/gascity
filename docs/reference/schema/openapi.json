@@ -8253,6 +8253,7 @@
             "session.stranded": "#/components/schemas/TypedEventStreamEnvelopeSessionStranded",
             "session.suspended": "#/components/schemas/TypedEventStreamEnvelopeSessionSuspended",
             "session.undrained": "#/components/schemas/TypedEventStreamEnvelopeSessionUndrained",
+            "session.unknown_state_persisted": "#/components/schemas/TypedEventStreamEnvelopeSessionUnknownStatePersisted",
             "session.updated": "#/components/schemas/TypedEventStreamEnvelopeSessionUpdated",
             "session.woke": "#/components/schemas/TypedEventStreamEnvelopeSessionWoke",
             "session.work_query_failed": "#/components/schemas/TypedEventStreamEnvelopeSessionWorkQueryFailed",
@@ -8450,6 +8451,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionUndrained"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionUnknownStatePersisted"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionUpdated"
@@ -9295,6 +9299,7 @@
                 "session.reset_stalled",
                 "session.work_query_failed",
                 "session.cold_start_timeout",
+                "session.unknown_state_persisted",
                 "bead.created",
                 "bead.closed",
                 "bead.deleted",
@@ -11765,6 +11770,57 @@
         "title": "TypedEventStreamEnvelope session.undrained",
         "type": "object"
       },
+      "TypedEventStreamEnvelopeSessionUnknownStatePersisted": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SessionLifecyclePayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.unknown_state_persisted",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope session.unknown_state_persisted",
+        "type": "object"
+      },
       "TypedEventStreamEnvelopeSessionUpdated": {
         "additionalProperties": false,
         "properties": {
@@ -12239,6 +12295,7 @@
             "session.stranded": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStranded",
             "session.suspended": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionSuspended",
             "session.undrained": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionUndrained",
+            "session.unknown_state_persisted": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionUnknownStatePersisted",
             "session.updated": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionUpdated",
             "session.woke": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionWoke",
             "session.work_query_failed": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionWorkQueryFailed",
@@ -12436,6 +12493,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionUndrained"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionUnknownStatePersisted"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionUpdated"
@@ -13344,6 +13404,7 @@
                 "session.reset_stalled",
                 "session.work_query_failed",
                 "session.cold_start_timeout",
+                "session.unknown_state_persisted",
                 "bead.created",
                 "bead.closed",
                 "bead.deleted",
@@ -16001,6 +16062,61 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope session.undrained",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeSessionUnknownStatePersisted": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SessionLifecyclePayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.unknown_state_persisted",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope session.unknown_state_persisted",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeSessionUpdated": {

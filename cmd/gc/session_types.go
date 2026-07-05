@@ -307,4 +307,13 @@ const (
 	// wake→die cycles before quarantine. Three cycles means the session
 	// failed to be productive three times in a row.
 	defaultMaxChurnCycles = 3
+
+	// defaultMaxUnknownStateSkips is how many consecutive reconciler ticks
+	// a session bead may sit in a metadata "state" value this build does
+	// not recognize before recordUnknownStateSkip escalates by closing it
+	// (see #1497). Sessions in this shape are already runtime-dead —
+	// unlike wake/churn quarantine there is no live process to back off
+	// from, so the threshold only exists to absorb a transient state write
+	// race rather than to protect a runtime that might still recover.
+	defaultMaxUnknownStateSkips = 10
 )

@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1181,13 +1182,20 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 
 		// Skip beads with unrecognized states. This enables forward-compatible
 		// rollback: if a newer version writes "draining" or "archived", the
-		// older reconciler ignores those beads rather than crashing.
+		// older reconciler ignores those beads rather than crashing. Skipping
+		// forever has no escape hatch of its own (#1497), so
+		// recordUnknownStateSkip accrues a per-bead counter and escalates to a
+		// close (freeing the slot for a fresh respawn) once
+		// defaultMaxUnknownStateSkips is reached.
 		if !isKnownState(*session) {
+			escalatedClose := recordUnknownStateSkip(cityPath, cfg, store, rigStores, session, clk, rec, stderr)
 			fmt.Fprintf(stderr, "session reconciler: skipping %s with unknown state %q\n", //nolint:errcheck // best-effort stderr
 				session.Metadata["session_name"], session.Metadata["state"])
 			if trace != nil {
 				trace.recordDecision("reconciler.session.unknown_state", session.Metadata["template"], session.Metadata["session_name"], "unknown_state_skipped", "skipped", traceRecordPayload{
-					"state": session.Metadata["state"],
+					"state":           session.Metadata["state"],
+					"skip_count":      session.Metadata[unknownStateSkipCountKey],
+					"escalated_close": escalatedClose,
 				}, nil, "")
 			}
 			continue
@@ -1928,6 +1936,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		if alive && productiveLongEnough(*session, clk) {
 			clearChurn(session, sessFront)
 		}
+		// Clear the unknown-state skip counter now that the bead's state is
+		// recognized again. Reaching this line already proves isKnownState
+		// passed earlier this tick, so no additional gate is needed. Without
+		// this reset, a bead that later re-enters an unrecognized state in a
+		// distinct episode would inherit the prior episode's counter and
+		// event-emitted marker, escalating too early and silently
+		// suppressing the event for the new episode (#1497).
+		clearUnknownStateSkip(session, sessFront)
 		if alive && shouldRollbackPendingCreate(session) {
 			switch stateBeforeHeal {
 			case sessionpkg.StateStartPending, sessionpkg.StateCreating:
@@ -3095,6 +3111,128 @@ func formatStrandedMessage(template, sessionName string, ids []string) string {
 	}
 	return fmt.Sprintf("%s; %d in-progress work bead(s) stranded: %s%s",
 		prefix, len(ids), strings.Join(shown, ","), suffix)
+}
+
+// unknownStateSkipCountKey is the per-session-bead counter of consecutive
+// reconciler ticks the bead has been skipped for an unrecognized metadata
+// "state" value. Reset implicitly when the bead is closed or a fresh
+// session bead takes over (a new bead starts the counter at zero).
+const unknownStateSkipCountKey = "unknown_state_skip_count"
+
+// unknownStateEventEmittedKey is the per-session-bead throttle marker for
+// session.unknown_state_persisted diagnostics, mirroring
+// strandedEventEmittedKey: set after the first emission so a session stuck
+// in unknown state (because it could not be safely closed — see
+// recordUnknownStateSkip) doesn't re-fire the event every subsequent tick.
+const unknownStateEventEmittedKey = "unknown_state_event_emitted_at"
+
+// recordUnknownStateSkip escalates a session bead that has been skipped for
+// defaultMaxUnknownStateSkips consecutive ticks because its metadata "state"
+// is not one isKnownState recognizes. Left alone, such a bead is skipped
+// silently forever (#1497) — the only manual recovery operators found was
+// "gc session close", which this mirrors: once the threshold is reached, it
+// closes the bead (only when no open/in-progress work is assigned, so
+// nothing is orphaned) so the autoscaler can respawn a fresh session, and
+// emits a one-time session.unknown_state_persisted event so the escalation
+// is visible to gc trace and dashboard consumers even when the close itself
+// is deferred pending assigned work clearing.
+//
+// Returns true if the session bead was closed this tick.
+func recordUnknownStateSkip(
+	cityPath string,
+	cfg *config.City,
+	store beads.Store,
+	rigStores map[string]beads.Store,
+	session *beads.Bead,
+	clk clock.Clock,
+	rec events.Recorder,
+	stderr io.Writer,
+) bool {
+	if session == nil {
+		return false
+	}
+	if session.Metadata == nil {
+		session.Metadata = make(map[string]string)
+	}
+	skips, _ := strconv.Atoi(session.Metadata[unknownStateSkipCountKey])
+	// Clamp the write at the threshold instead of incrementing forever: once
+	// a session bead is stuck, the close attempt below retries every tick
+	// regardless (deferred only by assigned work), so nothing downstream
+	// needs a counter past the threshold. Without the clamp, a bead whose
+	// close stays deferred writes this metadata key every single tick
+	// indefinitely — each write is a bd subprocess call at roughly the same
+	// cost the rollback-budget comment above prices at ~2s.
+	if skips < defaultMaxUnknownStateSkips {
+		skips++
+		next := strconv.Itoa(skips)
+		if err := sessionFrontDoor(store).SetMarker(session.ID, unknownStateSkipCountKey, next); err != nil {
+			fmt.Fprintf(stderr, "session reconciler: stamping unknown-state skip counter on %s: %v\n", session.ID, err) //nolint:errcheck
+		}
+		session.Metadata[unknownStateSkipCountKey] = next
+	}
+	if skips < defaultMaxUnknownStateSkips {
+		return false
+	}
+	name := strings.TrimSpace(session.Metadata["session_name"])
+	template := normalizedSessionTemplate(*session, cfg)
+	if template == "" {
+		template = session.Metadata["template"]
+	}
+	state := session.Metadata["state"]
+	if rec != nil && strings.TrimSpace(session.Metadata[unknownStateEventEmittedKey]) == "" {
+		reason := fmt.Sprintf("session %q stuck in unrecognized state %q for %d consecutive reconciler ticks", name, state, skips)
+		rec.Record(events.Event{
+			Type:      events.SessionUnknownStatePersisted,
+			Actor:     "gc",
+			Subject:   session.ID,
+			Message:   reason,
+			SessionID: session.ID,
+			Payload:   api.SessionLifecyclePayloadJSON(session.ID, template, reason),
+		})
+		now := clk.Now().UTC().Format(time.RFC3339)
+		session.Metadata[unknownStateEventEmittedKey] = now
+		if err := sessionFrontDoor(store).SetMarker(session.ID, unknownStateEventEmittedKey, now); err != nil {
+			fmt.Fprintf(stderr, "session reconciler: stamping unknown-state event throttle marker on %s: %v\n", session.ID, err) //nolint:errcheck
+		}
+	}
+	// Re-verify against a fresh read immediately before closing. session is a
+	// tick-start snapshot; per this file's own concurrent-observer design
+	// (see e.g. the drain-ack path above), another actor can heal the bead's
+	// state between when this tick began and this point. Narrows — cannot
+	// eliminate — the window where a since-recovered session gets closed
+	// anyway based on stale in-memory state (raised in review of #1497).
+	if fresh, err := store.Get(session.ID); err == nil && isKnownState(fresh) {
+		return false
+	}
+	closed := closeSessionBeadIfReachableStoreUnassigned(cityPath, cfg, store, rigStores, *session, sessionpkg.UnknownStateCloseReason, clk.Now().UTC(), stderr)
+	if closed {
+		session.Status = "closed"
+	}
+	return closed
+}
+
+// clearUnknownStateSkip resets the unknown-state skip counter and its
+// throttled-event marker once a session bead's metadata state is recognized
+// again, mirroring clearWakeFailures/clearChurn. Without this reset, a bead
+// that later re-enters an unrecognized state in a distinct episode would
+// inherit the prior episode's counter and event-emitted marker — escalating
+// too early and silently suppressing the event for the new episode (#1497).
+func clearUnknownStateSkip(session *beads.Bead, sessFront *sessionpkg.InfoStore) {
+	batch := make(map[string]string, 2)
+	if session.Metadata[unknownStateSkipCountKey] != "" {
+		batch[unknownStateSkipCountKey] = ""
+	}
+	if session.Metadata[unknownStateEventEmittedKey] != "" {
+		batch[unknownStateEventEmittedKey] = ""
+	}
+	if len(batch) == 0 {
+		return
+	}
+	if err := sessFront.ApplyPatch(session.ID, batch); err == nil {
+		for k, v := range batch {
+			session.Metadata[k] = v
+		}
+	}
 }
 
 // collectSessionAssignedWork returns the open/in_progress work beads

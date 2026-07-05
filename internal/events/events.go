@@ -85,10 +85,16 @@ const (
 	// Emitted by the session reconciler's start-result commit path; the
 	// envelope's Subject carries the session name.
 	SessionColdStartTimeout = "session.cold_start_timeout"
-	ConvoyCreated           = "convoy.created"
-	ConvoyClosed            = "convoy.closed"
-	ControllerStarted       = "controller.started"
-	ControllerStopped       = "controller.stopped"
+	// SessionUnknownStatePersisted fires when a session bead has sat in a
+	// metadata "state" value this reconciler build does not recognize for
+	// defaultMaxUnknownStateSkips consecutive ticks. Before this event the
+	// only trace was the per-tick "unknown_state_skipped" decision, easy to
+	// miss since it fires silently forever with no escalation (#1497).
+	SessionUnknownStatePersisted = "session.unknown_state_persisted"
+	ConvoyCreated                = "convoy.created"
+	ConvoyClosed                 = "convoy.closed"
+	ControllerStarted            = "controller.started"
+	ControllerStopped            = "controller.stopped"
 	// SupervisorStarted fires once per supervisor startup, after the
 	// instance lock is acquired. Its payload classifies how the previous
 	// supervisor instance exited (clean, crash, or unknown), derived from
@@ -208,6 +214,7 @@ var KnownEventTypes = []string{
 	SessionResetStalled,
 	SessionWorkQueryFailed,
 	SessionColdStartTimeout,
+	SessionUnknownStatePersisted,
 	BeadCreated, BeadClosed, BeadDeleted, BeadUpdated,
 	BeadWorktreeReaped, BeadWorktreeReapSkipped,
 	BeadClaimRejected,

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
@@ -2504,6 +2506,245 @@ func TestForwardCompatibility_UnknownState(t *testing.T) {
 	// The warning should appear in stderr.
 	if !strings.Contains(env.stderr.String(), "unknown state") {
 		t.Errorf("expected warning about unknown state in stderr, got: %s", env.stderr.String())
+	}
+}
+
+// TestUnknownStateSkip_BelowThresholdStaysOpen verifies that a session bead
+// stuck in an unrecognized state accrues a skip counter but is left alone —
+// no close, no event — until defaultMaxUnknownStateSkips is reached (#1497).
+func TestUnknownStateSkip_BelowThresholdStaysOpen(t *testing.T) {
+	env := newReconcilerTestEnv()
+	rec := &capturingRecorder{}
+	env.rec = rec
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	env.addDesired("worker", "worker", false)
+
+	session := env.createSessionBead("worker", "worker")
+	env.setSessionMetadata(&session, map[string]string{"state": "draining"})
+
+	for i := 0; i < defaultMaxUnknownStateSkips-1; i++ {
+		current, err := env.store.Get(session.ID)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		env.reconcile([]beads.Bead{current})
+	}
+
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status == "closed" {
+		t.Fatalf("session closed before reaching defaultMaxUnknownStateSkips (skip_count=%s)", got.Metadata[unknownStateSkipCountKey])
+	}
+	wantCount := strconv.Itoa(defaultMaxUnknownStateSkips - 1)
+	if got.Metadata[unknownStateSkipCountKey] != wantCount {
+		t.Errorf("skip_count = %q, want %q", got.Metadata[unknownStateSkipCountKey], wantCount)
+	}
+	if len(rec.events) != 0 {
+		t.Errorf("expected no events before threshold, got %d", len(rec.events))
+	}
+}
+
+// TestUnknownStateSkip_EscalatesToCloseAfterThreshold verifies that once a
+// session bead has been skipped for defaultMaxUnknownStateSkips consecutive
+// ticks with its unrecognized state, the reconciler closes it (mirroring
+// what "gc session close" already does manually) and emits exactly one
+// session.unknown_state_persisted event (#1497).
+func TestUnknownStateSkip_EscalatesToCloseAfterThreshold(t *testing.T) {
+	env := newReconcilerTestEnv()
+	rec := &capturingRecorder{}
+	env.rec = rec
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	env.addDesired("worker", "worker", false)
+
+	session := env.createSessionBead("worker", "worker")
+	env.setSessionMetadata(&session, map[string]string{"state": "draining"})
+
+	for i := 0; i < defaultMaxUnknownStateSkips; i++ {
+		current, err := env.store.Get(session.ID)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		env.reconcile([]beads.Bead{current})
+	}
+
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("expected session closed after %d consecutive unknown-state skips, got status=%q skip_count=%q",
+			defaultMaxUnknownStateSkips, got.Status, got.Metadata[unknownStateSkipCountKey])
+	}
+	if got.Metadata["state"] != "unknown-state" {
+		t.Errorf("state = %q, want %q", got.Metadata["state"], "unknown-state")
+	}
+
+	var unknownStateEvents []events.Event
+	for _, e := range rec.events {
+		if e.Type == events.SessionUnknownStatePersisted {
+			unknownStateEvents = append(unknownStateEvents, e)
+		}
+	}
+	if len(unknownStateEvents) != 1 {
+		t.Fatalf("expected exactly 1 session.unknown_state_persisted event, got %d", len(unknownStateEvents))
+	}
+	if unknownStateEvents[0].SessionID != session.ID {
+		t.Errorf("event SessionID = %q, want %q", unknownStateEvents[0].SessionID, session.ID)
+	}
+}
+
+// TestUnknownStateSkip_AssignedWorkDefersCloseButStillEmitsOnce verifies the
+// safety guard: a session stuck in an unrecognized state with open assigned
+// work is NOT closed (closing would orphan the work), but the escalation
+// event still fires exactly once so the persisted skip stays observable
+// even while the close is deferred (#1497).
+func TestUnknownStateSkip_AssignedWorkDefersCloseButStillEmitsOnce(t *testing.T) {
+	env := newReconcilerTestEnv()
+	rec := &capturingRecorder{}
+	env.rec = rec
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	env.addDesired("worker", "worker", false)
+
+	session := env.createSessionBead("worker", "worker")
+	env.setSessionMetadata(&session, map[string]string{"state": "draining"})
+
+	task, err := env.store.Create(beads.Bead{
+		Title:    "assigned task",
+		Type:     "task",
+		Status:   "open",
+		Assignee: session.ID,
+	})
+	if err != nil {
+		t.Fatalf("Create(task): %v", err)
+	}
+
+	for i := 0; i < defaultMaxUnknownStateSkips+2; i++ {
+		current, err := env.store.Get(session.ID)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		env.reconcile([]beads.Bead{current})
+	}
+
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status == "closed" {
+		t.Fatalf("session with open assigned work must not be auto-closed, got status=%q", got.Status)
+	}
+
+	assignedTask, err := env.store.Get(task.ID)
+	if err != nil {
+		t.Fatalf("Get(task): %v", err)
+	}
+	if assignedTask.Assignee != session.ID {
+		t.Errorf("assigned task lost its assignee: %q", assignedTask.Assignee)
+	}
+
+	var unknownStateEvents []events.Event
+	for _, e := range rec.events {
+		if e.Type == events.SessionUnknownStatePersisted {
+			unknownStateEvents = append(unknownStateEvents, e)
+		}
+	}
+	if len(unknownStateEvents) != 1 {
+		t.Fatalf("expected exactly 1 session.unknown_state_persisted event even across repeated deferred-close ticks, got %d", len(unknownStateEvents))
+	}
+}
+
+// TestUnknownStateSkip_ResetsOnRecoveryBeforeNewEpisode verifies that a
+// session bead which recovers to a known state clears its unknown-state skip
+// counter and event-emitted marker, so a later, distinct unknown-state
+// episode on the same bead starts counting from zero instead of inheriting
+// the prior episode's count — and gets its own escalation event rather than
+// having it silently suppressed by the still-set throttle marker (#1497).
+func TestUnknownStateSkip_ResetsOnRecoveryBeforeNewEpisode(t *testing.T) {
+	env := newReconcilerTestEnv()
+	rec := &capturingRecorder{}
+	env.rec = rec
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	env.addDesired("worker", "worker", false)
+
+	session := env.createSessionBead("worker", "worker")
+	env.setSessionMetadata(&session, map[string]string{"state": "draining"})
+
+	// First episode: accrue skips just below the close threshold.
+	for i := 0; i < defaultMaxUnknownStateSkips-1; i++ {
+		current, err := env.store.Get(session.ID)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		env.reconcile([]beads.Bead{current})
+	}
+	mid, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	wantMid := strconv.Itoa(defaultMaxUnknownStateSkips - 1)
+	if mid.Metadata[unknownStateSkipCountKey] != wantMid {
+		t.Fatalf("skip_count before recovery = %q, want %q", mid.Metadata[unknownStateSkipCountKey], wantMid)
+	}
+
+	// Recovery: the bead's state becomes recognized again for one tick.
+	env.setSessionMetadata(&mid, map[string]string{"state": "asleep"})
+	env.reconcile([]beads.Bead{mid})
+
+	healed, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if healed.Metadata[unknownStateSkipCountKey] != "" {
+		t.Fatalf("skip_count after recovery = %q, want cleared", healed.Metadata[unknownStateSkipCountKey])
+	}
+	if healed.Metadata[unknownStateEventEmittedKey] != "" {
+		t.Fatalf("event-emitted marker after recovery = %q, want cleared", healed.Metadata[unknownStateEventEmittedKey])
+	}
+
+	// New, distinct episode: flips back to an unrecognized state. One tick
+	// must not be enough to close — the counter should restart at 1, not
+	// resume from the prior episode's near-threshold count.
+	env.setSessionMetadata(&healed, map[string]string{"state": "draining"})
+	env.reconcile([]beads.Bead{healed})
+
+	afterOneTick, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if afterOneTick.Status == "closed" {
+		t.Fatalf("new unknown-state episode closed after just 1 tick — counter did not reset on recovery")
+	}
+	if afterOneTick.Metadata[unknownStateSkipCountKey] != "1" {
+		t.Errorf("skip_count for new episode = %q, want %q", afterOneTick.Metadata[unknownStateSkipCountKey], "1")
+	}
+
+	// Drive the new episode to its own threshold and confirm it gets its own
+	// escalation event rather than the marker from the first episode
+	// silently suppressing it.
+	for i := 1; i < defaultMaxUnknownStateSkips; i++ {
+		current, err := env.store.Get(session.ID)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		env.reconcile([]beads.Bead{current})
+	}
+	final, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if final.Status != "closed" {
+		t.Fatalf("expected the new episode to close after its own %d ticks, got status=%q", defaultMaxUnknownStateSkips, final.Status)
+	}
+	var unknownStateEvents []events.Event
+	for _, e := range rec.events {
+		if e.Type == events.SessionUnknownStatePersisted {
+			unknownStateEvents = append(unknownStateEvents, e)
+		}
+	}
+	if len(unknownStateEvents) != 1 {
+		t.Fatalf("expected exactly 1 session.unknown_state_persisted event for the new episode, got %d", len(unknownStateEvents))
 	}
 }
 
