@@ -304,6 +304,19 @@ func doRigAddWithResult(fs fsys.FS, cityPath, rigPath string, includes []string,
 		break
 	}
 
+	// Gate NEW registrations only (gascity#3109): an invalid name yields a
+	// session name the tmux runtime rejects, so rig-scoped agents could never
+	// spawn. Re-adds of a legacy invalid-named rig stay allowed so path /
+	// default-branch backfill and --adopt repairs keep working on existing
+	// cities; gc start surfaces the advisory for those via RigNameWarnings.
+	if !reAdd {
+		if err := config.ValidateRigName(name); err != nil {
+			fmt.Fprintf(stderr, "gc rig add: %v\n", err)                                          //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "gc rig add: use --name to choose a valid rig name explicitly\n") //nolint:errcheck // best-effort stderr
+			return config.Rig{}, 1
+		}
+	}
+
 	var prefix string
 	switch {
 	case reAdd:

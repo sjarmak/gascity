@@ -1490,6 +1490,13 @@ func (cs *controllerState) DeleteAgent(name string) error {
 
 // CreateRig adds a new rig to city.toml.
 func (cs *controllerState) CreateRig(r config.Rig) error {
+	// Same registration gate as gc rig add (gascity#3109): an invalid name
+	// yields a session name the tmux runtime rejects, so rig-scoped agents
+	// could never spawn. Checked before initializeRigStoreForCreate so a
+	// rejected create leaves no initialized store behind.
+	if err := config.ValidateRigName(r.Name); err != nil {
+		return fmt.Errorf("%w: %w", configedit.ErrValidation, err)
+	}
 	r = detectRigDefaultBranch(cs.cityPath, r)
 	if err := cs.initializeRigStoreForCreate(r); err != nil {
 		return err
