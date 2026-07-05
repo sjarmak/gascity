@@ -938,6 +938,46 @@ func TestControllerStateCreateRigRejectsDuplicateName(t *testing.T) {
 	}
 }
 
+// POST /v0/rigs is the second rig-registration entry point after gc rig add;
+// it must apply the same name gate (gascity#3109) BEFORE the rig store is
+// initialized, and the error must map to a 400 via configedit.ErrValidation.
+func TestControllerStateCreateRigRejectsInvalidName(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+
+	cityDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"city1\"\n"), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "city1"},
+	}
+	cs := newControllerState(context.Background(), cfg, runtime.NewFake(), events.NewFake(), "city1", cityDir)
+	cs.pokeCh = make(chan struct{}, 1)
+	cs.configDirty = &atomic.Bool{}
+
+	rigDir := t.TempDir()
+	err := cs.CreateRig(config.Rig{Name: "TS Server", Path: rigDir})
+	if err == nil {
+		t.Fatal("CreateRig with invalid name = nil, want error")
+	}
+	if !errors.Is(err, configedit.ErrValidation) {
+		t.Fatalf("CreateRig error = %v, want errors.Is(..., configedit.ErrValidation)", err)
+	}
+
+	select {
+	case <-cs.pokeCh:
+		t.Fatal("CreateRig poked the reconciler despite rejected rig name")
+	default:
+	}
+	if got := cs.Config(); got != nil && len(got.Rigs) != 0 {
+		t.Fatalf("Config() rigs = %+v, want no rig registered", got.Rigs)
+	}
+	if entries, err := os.ReadDir(filepath.Join(rigDir, ".beads")); err == nil && len(entries) > 0 {
+		t.Fatalf("rig store was initialized (%d entries) despite rejected rig name", len(entries))
+	}
+}
+
 func TestControllerStateCreateRigDetectsDefaultBranch(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_DOLT", "skip")

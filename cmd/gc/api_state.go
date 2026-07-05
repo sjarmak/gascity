@@ -1783,6 +1783,13 @@ func (cs *controllerState) CreateRig(r config.Rig) error {
 	if rigPath == "" {
 		return fmt.Errorf("%w: rig path is required", configedit.ErrValidation)
 	}
+	// Same registration gate as gc rig add (gascity#3109): an invalid name
+	// yields a session name the tmux runtime rejects, so rig-scoped agents
+	// could never spawn. Checked before provisionRigLocked so a rejected
+	// create leaves no initialized store behind.
+	if err := config.ValidateRigName(r.Name); err != nil {
+		return fmt.Errorf("%w: %w", configedit.ErrValidation, err)
+	}
 	// Resolve against the city dir, never the daemon CWD, so a same-named rig
 	// in the controller's working directory can never win.
 	r.Path = resolveStoreScopeRoot(cs.cityPath, rigPath)

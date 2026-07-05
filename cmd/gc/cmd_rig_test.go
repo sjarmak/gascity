@@ -109,6 +109,92 @@ func TestDoRigAdd_Basic(t *testing.T) {
 	}
 }
 
+// A rig name with a space can never spawn rig-scoped agent sessions (the
+// derived tmux session name fails validateSessionName — gascity#3109), so
+// registration rejects it before any state is written.
+func TestDoRigAdd_RejectsInvalidName(t *testing.T) {
+	cityPath := t.TempDir()
+	writeSchema2RigCity(t, cityPath, "test-city", "[workspace]\n", "")
+
+	rigPath := filepath.Join(t.TempDir(), "backend")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_BEADS", "bd")
+
+	before, err := os.ReadFile(filepath.Join(cityPath, "city.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "TS Server", "", "", false, false, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("doRigAdd with name %q returned 0, want non-zero; stdout: %s", "TS Server", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "TS Server") {
+		t.Errorf("stderr = %q, want mention of the rejected name", stderr.String())
+	}
+
+	after, err := os.ReadFile(filepath.Join(cityPath, "city.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("city.toml was modified despite rejected rig name:\n%s", after)
+	}
+}
+
+// Re-adding a rig that is ALREADY registered under an invalid legacy name
+// stays allowed: the gate applies to new registrations only, so path /
+// default-branch backfill and --adopt repairs keep working on existing
+// cities (the reviewer-flagged legacy-compat case for gascity#3109).
+func TestDoRigAdd_ReAddOfLegacyInvalidNameAllowed(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(t.TempDir(), "backend")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cityToml := fmt.Sprintf("[workspace]\n\n[[rigs]]\nname = \"TS Server\"\npath = %q\nprefix = \"ts\"\n", rigPath)
+	writeSchema2RigCity(t, cityPath, "test-city", cityToml, "")
+
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_BEADS", "bd")
+
+	var stdout, stderr bytes.Buffer
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "TS Server", "", "", false, false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("re-add of legacy invalid-named rig returned %d, want 0; stderr: %s", code, stderr.String())
+	}
+}
+
+// The directory-basename default flows through the same gate: adding a rig
+// from a space-named directory without --name errors instead of registering a
+// rig whose agents can never spawn.
+func TestDoRigAdd_RejectsInvalidBasenameDefault(t *testing.T) {
+	cityPath := t.TempDir()
+	writeSchema2RigCity(t, cityPath, "test-city", "[workspace]\n", "")
+
+	rigPath := filepath.Join(t.TempDir(), "TS Server")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_BEADS", "bd")
+
+	var stdout, stderr bytes.Buffer
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "", "", false, false, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("doRigAdd from dir %q returned 0, want non-zero; stdout: %s", rigPath, stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "--name") {
+		t.Errorf("stderr = %q, want guidance to pass --name", stderr.String())
+	}
+}
+
 func TestDoRigAdd_PreservesComments(t *testing.T) {
 	cityPath := t.TempDir()
 	cityToml := `# This is a city-level rationale comment.

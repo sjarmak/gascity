@@ -699,6 +699,12 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	for _, w := range config.ReservedPrefixWarnings(cfg.Rigs, config.EffectiveHQPrefix(cfg)) {
 		fmt.Fprintf(stderr, "gc start: warning: %s\n", w) //nolint:errcheck // best-effort stderr
 	}
+	// Invalid rig names (spaces etc.) are a non-fatal advisory for the same
+	// reason: an existing city must keep starting even though its rig-scoped
+	// agents cannot spawn (gascity#3109). gc rig add rejects new ones.
+	for _, w := range config.RigNameWarnings(cfg.Rigs) {
+		fmt.Fprintf(stderr, "gc start: warning: %s\n", w) //nolint:errcheck // best-effort stderr
+	}
 	if err := config.ValidateServices(cfg.Services); err != nil {
 		fmt.Fprintf(stderr, "gc start: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1

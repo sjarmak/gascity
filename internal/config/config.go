@@ -4144,6 +4144,43 @@ func ValidateRigs(rigs []Rig, hqPrefix string) error {
 	return nil
 }
 
+// rigNamePattern is the alphabet for rig names. A rig name is a structural
+// identifier: it becomes the dir component of qualified agent names
+// ("<rig>/<agent>"), a work_dir path component, and — after the qualified-name
+// session encoding ('.'→"__"; letters, digits, '_', '-' pass through) — a tmux
+// session name, which the tmux runtime validates against ^[a-zA-Z0-9_-]+$.
+// Every character accepted here must land in that alphabet after encoding;
+// anything else (spaces above all) produces a session name the runtime rejects
+// before any pane spawns, so rig-scoped agents cycle start-pending →
+// failed-create forever (gascity#3109).
+var rigNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// ValidateRigName reports whether name is usable as a rig identifier.
+// It is enforced at registration (gc rig add), not in ValidateRigs: making it
+// fatal at load would break gc start and config reload for an existing city
+// that already carries such a rig (same rationale as reserved class prefixes
+// in ValidateRigs). RigNameWarnings surfaces the load-time advisory instead.
+func ValidateRigName(name string) error {
+	if rigNamePattern.MatchString(name) {
+		return nil
+	}
+	return fmt.Errorf("rig %q: name must start with a letter or digit and contain only letters, digits, '.', '_', '-' (no spaces); the tmux runtime rejects session names derived from anything else, so rig-scoped agent sessions could never spawn", name)
+}
+
+// RigNameWarnings returns non-fatal advisories for configured rigs whose names
+// fail ValidateRigName. Callers surface these at gc start / config reload so
+// operators of existing cities learn why rig-scoped agents never materialize
+// (gascity#3109) while the city itself keeps starting.
+func RigNameWarnings(rigs []Rig) []string {
+	var warnings []string
+	for _, r := range rigs {
+		if ValidateRigName(r.Name) != nil {
+			warnings = append(warnings, fmt.Sprintf("rig %q: name is not a valid session identifier; rig-scoped agent sessions cannot spawn under the tmux runtime (start-pending → failed-create loop, gascity#3109). Rename the rig to use only letters, digits, '.', '_', '-'", r.Name))
+		}
+	}
+	return warnings
+}
+
 // ReservedPrefixWarnings returns advisory warnings for any effective HQ or rig
 // work-store prefix that shadows a reserved coordination-class id-prefix
 // (gcg/gcm/gcs/gco/gcn). The relocated SQLite class stores that mint these

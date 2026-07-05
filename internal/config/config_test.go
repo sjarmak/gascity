@@ -6,10 +6,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/fsys"
 )
@@ -4849,6 +4851,108 @@ func TestReservedPrefixWarnings_NonReservedNoWarnings(t *testing.T) {
 	}
 	if warnings := ReservedPrefixWarnings(rigs, "hq"); len(warnings) != 0 {
 		t.Errorf("ReservedPrefixWarnings = %v, want no warnings for non-reserved prefixes", warnings)
+	}
+}
+
+func TestValidateRigName(t *testing.T) {
+	valid := []string{
+		"gascity",
+		"TS-Server",
+		"my.rig",
+		"a_b",
+		"r2d2",
+		"A",
+		"9lives",
+	}
+	for _, name := range valid {
+		if err := ValidateRigName(name); err != nil {
+			t.Errorf("ValidateRigName(%q) = %v, want nil", name, err)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"TS Server",
+		" leading",
+		"trailing ",
+		"tab\tname",
+		"colon:name",
+		`quote"name`,
+		"semi;name",
+		"slash/name",
+		"-leading-dash",
+		".leading-dot",
+		"_leading-underscore",
+	}
+	for _, name := range invalid {
+		if err := ValidateRigName(name); err == nil {
+			t.Errorf("ValidateRigName(%q) = nil, want error", name)
+		}
+	}
+}
+
+// ValidateRigName errors name the offending rig and the allowed alphabet so
+// the operator can act without reading source.
+func TestValidateRigName_ErrorMentionsAllowedChars(t *testing.T) {
+	err := ValidateRigName("TS Server")
+	if err == nil {
+		t.Fatal("ValidateRigName(\"TS Server\") = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "TS Server") {
+		t.Errorf("error = %q, want mention of the rejected name", err)
+	}
+	if !strings.Contains(err.Error(), "letter or digit") {
+		t.Errorf("error = %q, want mention of the allowed alphabet", err)
+	}
+}
+
+// Rigs with names that cannot become valid tmux session names get a non-fatal
+// advisory (mirroring ReservedPrefixWarnings) instead of a load-time error, so
+// existing cities keep starting.
+func TestRigNameWarnings_InvalidName(t *testing.T) {
+	rigs := []Rig{
+		{Name: "TS Server", Path: "/a"},
+		{Name: "gascity", Path: "/b"},
+	}
+	warnings := RigNameWarnings(rigs)
+	if len(warnings) != 1 {
+		t.Fatalf("RigNameWarnings = %v, want exactly one warning", warnings)
+	}
+	if !strings.Contains(warnings[0], "TS Server") {
+		t.Errorf("warning = %q, want mention of the rig name", warnings[0])
+	}
+	if !strings.Contains(warnings[0], "cannot spawn") {
+		t.Errorf("warning = %q, want mention of the spawn consequence", warnings[0])
+	}
+}
+
+func TestRigNameWarnings_AllValidNoWarnings(t *testing.T) {
+	rigs := []Rig{
+		{Name: "my-cloud", Path: "/a"},
+		{Name: "gas.city", Path: "/b"},
+	}
+	if warnings := RigNameWarnings(rigs); len(warnings) != 0 {
+		t.Errorf("RigNameWarnings = %v, want no warnings for valid names", warnings)
+	}
+}
+
+// Every rig name ValidateRigName accepts must encode (via the qualified-name
+// session replacer) into the alphabet the tmux runtime enforces on session
+// names (validSessionNameRe in internal/runtime/tmux — ^[a-zA-Z0-9_-]+$).
+// This is the generator/validator contract whose absence caused gascity#3109:
+// a space-named rig produced a session name tmux rejected before any pane
+// spawned.
+func TestValidateRigName_AcceptedNamesYieldTmuxSafeSessionNames(t *testing.T) {
+	tmuxSafe := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	names := []string{"gascity", "TS-Server", "my.rig", "a_b", "r2d2", "A"}
+	for _, name := range names {
+		if err := ValidateRigName(name); err != nil {
+			t.Fatalf("ValidateRigName(%q) = %v, want nil", name, err)
+		}
+		sess := agent.SessionNameFor("city", name+"/polecat", "")
+		if !tmuxSafe.MatchString(sess) {
+			t.Errorf("SessionNameFor for rig %q = %q, not tmux-safe (%s)", name, sess, tmuxSafe)
+		}
 	}
 }
 
