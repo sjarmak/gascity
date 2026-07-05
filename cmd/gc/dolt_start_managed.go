@@ -161,6 +161,45 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 		timeout = 30 * time.Second
 	}
 	report := managedDoltStartReport{}
+
+	// Lifecycle-lock singleton guard (gastownhall/gascity#2130). Only
+	// recoverManagedDoltProcess used to acquire managedDoltLifecycleLock;
+	// two overlapping `gc dolt start` invocations raced past it entirely,
+	// each spawning its own `dolt sql-server` and colliding on the
+	// configured port. Serialize here exactly as recover does: acquire the
+	// lock, or if another start/recover already holds it, wait for either
+	// the lock to free up or the concurrent starter's server to become
+	// ready and reuse it.
+	lockFile, _, lockErr := openManagedDoltLifecycleLock(cityPath)
+	if lockErr != nil {
+		return report, lockErr
+	}
+	defer func() {
+		if lockFile != nil {
+			_ = lockFile.Close()
+		}
+	}()
+	locked, lockErr := tryManagedDoltLifecycleLock(lockFile)
+	if lockErr != nil {
+		return report, lockErr
+	}
+	if !locked {
+		observed, acquired, waitErr := waitForManagedDoltStartLifecycleOrReady(cityPath, host, port, user, timeout, lockFile, &report)
+		if waitErr != nil {
+			return report, waitErr
+		}
+		if observed {
+			lockFile = nil
+			return report, nil
+		}
+		locked = acquired
+	}
+	if !locked {
+		return report, fmt.Errorf("managed dolt lifecycle lock not acquired")
+	}
+	defer releaseManagedDoltLifecycleLock(lockFile)
+	lockFile = nil
+
 	doltConfig, err := resolveManagedDoltConfigForStart(cityPath, archiveLevel)
 	if err != nil {
 		return report, err
@@ -298,6 +337,41 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 	}
 
 	return report, fmt.Errorf("dolt server could not find a free port after repeated address-in-use failures (last port %d)", report.Port)
+}
+
+// waitForManagedDoltStartLifecycleOrReady waits for a concurrent `gc dolt
+// start`/`gc dolt recover` invocation to either release the managed-dolt
+// lifecycle lock (so this caller can acquire it and start its own server) or
+// bring an existing managed server to a reusable, ready state (so this caller
+// can adopt it instead of starting a second one). Mirrors
+// waitForManagedDoltLifecycleOrReady in dolt_recover_managed.go, reporting
+// into a managedDoltStartReport instead of a managedDoltRecoverReport.
+func waitForManagedDoltStartLifecycleOrReady(cityPath, host, port, user string, timeout time.Duration, lockFile *os.File, report *managedDoltStartReport) (bool, bool, error) {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		if report != nil {
+			if existing, err := assessExistingManagedDolt(cityPath, host, port, user, time.Second); err == nil && existing.Reusable && existing.StatePort > 0 {
+				report.Ready = true
+				report.PID = existing.ManagedPID
+				report.Port = existing.StatePort
+				return true, false, nil
+			}
+		}
+		locked, err := tryManagedDoltLifecycleLock(lockFile)
+		if err != nil {
+			return false, false, err
+		}
+		if locked {
+			return false, true, nil
+		}
+		if time.Now().After(deadline) {
+			return false, false, fmt.Errorf("timed out waiting for concurrent managed dolt lifecycle to finish")
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 // managedDoltLockReleaseTimeoutFn resolves the configured wait window for

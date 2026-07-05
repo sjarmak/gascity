@@ -254,6 +254,97 @@ func TestGCBeadsBDScript_InitForcesReinitOverPreSeededMetadata(t *testing.T) {
 	}
 }
 
+// TestStartManagedDoltProcessReturnsWhenConcurrentStarterBecomesReady covers
+// gastownhall/gascity#2130: startManagedDoltProcessWithOptions did not
+// acquire the managed-dolt lifecycle lock (only recoverManagedDoltProcess
+// did), so two overlapping `gc dolt start` invocations raced past each other
+// and both spawned their own `dolt sql-server`, colliding on the configured
+// port. This asserts a starter that finds the lifecycle lock already held
+// waits for the concurrent starter's server to become ready and adopts it
+// instead of spawning a second one.
+func TestStartManagedDoltProcessReturnsWhenConcurrentStarterBecomesReady(t *testing.T) {
+	cityPath := t.TempDir()
+	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
+	if err != nil {
+		t.Fatalf("resolveManagedDoltRuntimeLayout: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(layout.PIDFile), 0o755); err != nil {
+		t.Fatalf("MkdirAll(runtime dir): %v", err)
+	}
+	if err := os.MkdirAll(layout.DataDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(data dir): %v", err)
+	}
+
+	port := reserveRandomTCPPort(t)
+	starter := startLockedDelayedTCPListenerProcessInDir(t, layout.LockFile, port, layout.DataDir, 600*time.Millisecond)
+	defer func() {
+		_ = starter.Process.Kill()
+		_ = starter.Wait()
+	}()
+
+	if err := os.WriteFile(layout.PIDFile, []byte(strconv.Itoa(starter.Process.Pid)+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(pid): %v", err)
+	}
+	if err := writeDoltRuntimeStateFile(layout.StateFile, doltRuntimeState{
+		Running:   true,
+		PID:       starter.Process.Pid,
+		Port:      port,
+		DataDir:   layout.DataDir,
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatalf("writeDoltRuntimeStateFile: %v", err)
+	}
+
+	t.Setenv("GC_DOLT_PASSWORD", "test-password")
+	oldQueryProbeDirect := managedDoltQueryProbeDirectFn
+	oldReadOnlyDirect := managedDoltReadOnlyStateDirectFn
+	oldConnectionCountDirect := managedDoltConnectionCountDirectFn
+	managedDoltQueryProbeDirectFn = func(_, _, _ string) error { return nil }
+	managedDoltReadOnlyStateDirectFn = func(_, _, _ string) (string, error) { return "false", nil }
+	managedDoltConnectionCountDirectFn = func(_, _, _ string) (string, error) { return "1", nil }
+	defer func() {
+		managedDoltQueryProbeDirectFn = oldQueryProbeDirect
+		managedDoltReadOnlyStateDirectFn = oldReadOnlyDirect
+		managedDoltConnectionCountDirectFn = oldConnectionCountDirect
+	}()
+
+	oldStartSQLServerFn := managedDoltStartSQLServerFn
+	managedDoltStartSQLServerFn = func(_, _, _ string, _ *os.File) (managedDoltStartedProcess, error) {
+		t.Fatal("managedDoltStartSQLServerFn called: startManagedDoltProcessWithOptions should have adopted the concurrent starter's server instead of spawning a second one")
+		return managedDoltStartedProcess{}, nil
+	}
+	defer func() { managedDoltStartSQLServerFn = oldStartSQLServerFn }()
+
+	report, err := startManagedDoltProcessWithOptions(cityPath, "127.0.0.1", strconv.Itoa(port), "root", "warning", -1, 3*time.Second, true)
+	if err != nil {
+		t.Fatalf("startManagedDoltProcessWithOptions() error = %v", err)
+	}
+	if !report.Ready {
+		t.Fatalf("startManagedDoltProcessWithOptions().Ready = false, want true")
+	}
+	if report.PID != starter.Process.Pid {
+		t.Fatalf("startManagedDoltProcessWithOptions().PID = %d, want %d", report.PID, starter.Process.Pid)
+	}
+	if report.Port != port {
+		t.Fatalf("startManagedDoltProcessWithOptions().Port = %d, want %d", report.Port, port)
+	}
+
+	probeLock, _, err := openManagedDoltLifecycleLock(cityPath)
+	if err != nil {
+		t.Fatalf("openManagedDoltLifecycleLock: %v", err)
+	}
+	locked, err := tryManagedDoltLifecycleLock(probeLock)
+	if err != nil {
+		_ = probeLock.Close()
+		t.Fatalf("tryManagedDoltLifecycleLock: %v", err)
+	}
+	if locked {
+		releaseManagedDoltLifecycleLock(probeLock)
+		t.Fatal("startManagedDoltProcessWithOptions() returned after concurrent starter released the lifecycle lock, want success while the concurrent starter still owns it")
+	}
+	_ = probeLock.Close()
+}
+
 func TestManagedDoltStartFields(t *testing.T) {
 	report := managedDoltStartReport{
 		Ready:        true,
