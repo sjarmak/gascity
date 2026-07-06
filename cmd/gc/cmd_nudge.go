@@ -627,6 +627,10 @@ func resolveNudgePollInterval(cityPath string, flagValue time.Duration, flagExpl
 	return flagValue
 }
 
+var nudgePollSleep = time.Sleep
+
+var deliverQueuedNudgesByPoller = tryDeliverQueuedNudgesByPoller
+
 func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.Duration, intervalExplicit bool, _ io.Writer, stderr io.Writer) int {
 	targetID := os.Getenv("GC_ALIAS")
 	if targetID == "" {
@@ -705,7 +709,7 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 				if missingSince.IsZero() {
 					missingSince = now
 				}
-				time.Sleep(interval)
+				nudgePollSleep(interval)
 				continue
 			}
 			return 1
@@ -716,20 +720,22 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 				if missingSince.IsZero() {
 					missingSince = now
 				}
-				time.Sleep(interval)
+				nudgePollSleep(interval)
 				continue
 			}
 			return 0
 		}
 		missingSince = time.Time{}
-		delivered, pollErr := tryDeliverQueuedNudgesByPoller(target, store.Store, cliSessionStore(store.Store, target.cfg, target.cityPath), sp, quiescence, obs)
+		_, pollErr := deliverQueuedNudgesByPoller(target, store.Store, cliSessionStore(store.Store, target.cfg, target.cityPath), sp, quiescence, obs)
 		if pollErr != nil {
 			fmt.Fprintf(stderr, "gc nudge poll: %v\n", pollErr) //nolint:errcheck
 		}
-		if delivered {
-			continue
-		}
-		time.Sleep(interval)
+		// Always back off at least `interval` between iterations, including on
+		// the delivered path. Without this, a delivery that keeps reporting
+		// success (e.g. the ack/clear failed and the same nudge stays PENDING
+		// and re-delivers) tight-spins, opening a fresh Dolt connection every
+		// iteration and saturating the handshake path (gcy-5b1).
+		nudgePollSleep(interval)
 	}
 }
 
