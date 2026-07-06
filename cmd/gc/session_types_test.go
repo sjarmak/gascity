@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beads"
 	sessions "github.com/gastownhall/gascity/internal/session"
 )
 
@@ -124,6 +125,39 @@ func TestDrainTracker_UnknownStateWarned_NilSafe(t *testing.T) {
 		t.Error("nil drainTracker should fail open and report a new incident")
 	}
 	dt.clearUnknownStateWarned("bead-1") // must not panic
+}
+
+func TestClearMissingDrainTrackerState(t *testing.T) {
+	dt := newDrainTracker()
+
+	dt.markResetStall("gone-1")
+	dt.bumpSuspendDeferral("gone-2")
+	dt.markUnknownStateWarned("gone-3")
+	dt.markResetStall("kept")
+	dt.bumpSuspendDeferral("kept")
+	dt.markUnknownStateWarned("kept")
+
+	beadByID := map[string]*beads.Bead{
+		"kept": {ID: "kept"},
+	}
+
+	clearMissingDrainTrackerState(dt, beadByID)
+
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	for _, id := range []string{"gone-1", "gone-2", "gone-3"} {
+		if dt.resetStalls[id] || dt.suspendDeferrals[id] != 0 || dt.unknownStateWarned[id] {
+			t.Errorf("expected all state for vanished bead %q to be cleared", id)
+		}
+	}
+	if !dt.resetStalls["kept"] || dt.suspendDeferrals["kept"] == 0 || !dt.unknownStateWarned["kept"] {
+		t.Error("expected state for still-present bead to survive the sweep")
+	}
+}
+
+func TestClearMissingDrainTrackerState_NilSafe(_ *testing.T) {
+	var dt *drainTracker
+	clearMissingDrainTrackerState(dt, nil) // must not panic
 }
 
 func TestExecSpec_ZeroValue(t *testing.T) {

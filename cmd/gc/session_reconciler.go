@@ -2738,6 +2738,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	}
 	advanceSessionDrainsWithSessionsTraced(dt, sp, store, sessionLookup, ordered, wakeEvals, cfg, poolDesired, nil, readyWaitSet, clk, trace)
 	clearMissingIdleProbes(dt, beadByID)
+	clearMissingDrainTrackerState(dt, beadByID)
 	recordPhase(TraceSiteSessionReconcileDrainAdvance, "session_reconcile.advance_drains", phaseStart, map[string]any{
 		"ordered_session_count": len(ordered),
 		"wake_eval_count":       len(wakeEvals),
@@ -3852,6 +3853,34 @@ func clearMissingIdleProbes(dt *drainTracker, beadByID map[string]*beads.Bead) {
 	dt.mu.Unlock()
 	for _, id := range stale {
 		dt.clearIdleProbe(id)
+	}
+}
+
+// clearMissingDrainTrackerState sweeps resetStalls, suspendDeferrals, and
+// unknownStateWarned for session bead IDs that have vanished entirely (e.g.
+// bd delete of a stuck bead) without going through remove()'s drain/close/
+// orphan path. Mirrors clearMissingIdleProbes for the idleProbes map (gc-s65td,
+// follow-up from the #2085 fix in dde194bfe).
+func clearMissingDrainTrackerState(dt *drainTracker, beadByID map[string]*beads.Bead) {
+	if dt == nil {
+		return
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	for id := range dt.resetStalls {
+		if beadByID[id] == nil {
+			delete(dt.resetStalls, id)
+		}
+	}
+	for id := range dt.suspendDeferrals {
+		if beadByID[id] == nil {
+			delete(dt.suspendDeferrals, id)
+		}
+	}
+	for id := range dt.unknownStateWarned {
+		if beadByID[id] == nil {
+			delete(dt.unknownStateWarned, id)
+		}
 	}
 }
 
