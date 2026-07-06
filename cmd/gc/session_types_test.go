@@ -96,6 +96,36 @@ func TestDrainTracker(t *testing.T) {
 	}
 }
 
+func TestDrainTracker_UnknownStateWarned(t *testing.T) {
+	dt := newDrainTracker()
+
+	if !dt.markUnknownStateWarned("bead-1") {
+		t.Fatal("expected first mark to report a new incident")
+	}
+	if dt.markUnknownStateWarned("bead-1") {
+		t.Error("expected repeat mark for the same incident to report already-warned")
+	}
+
+	dt.clearUnknownStateWarned("bead-1")
+	if !dt.markUnknownStateWarned("bead-1") {
+		t.Error("expected mark after clear to re-arm as a new incident")
+	}
+
+	// Independent bead IDs track separately.
+	if !dt.markUnknownStateWarned("bead-2") {
+		t.Error("expected a different bead ID to warn independently")
+	}
+}
+
+func TestDrainTracker_UnknownStateWarned_NilSafe(t *testing.T) {
+	var dt *drainTracker
+
+	if !dt.markUnknownStateWarned("bead-1") {
+		t.Error("nil drainTracker should fail open and report a new incident")
+	}
+	dt.clearUnknownStateWarned("bead-1") // must not panic
+}
+
 func TestExecSpec_ZeroValue(t *testing.T) {
 	var spec ExecSpec
 	if spec.Path != "" || spec.WorkDir != "" {

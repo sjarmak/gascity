@@ -2507,6 +2507,33 @@ func TestForwardCompatibility_UnknownState(t *testing.T) {
 	}
 }
 
+// TestForwardCompatibility_UnknownState_WarnsOncePerIncident verifies the
+// unknown-state log is loud (ERROR-level, names the bead + a recovery
+// command) but fires once per stalled incident rather than every tick (#2085:
+// the prior unconditional per-tick log both spammed supervisor.log and stayed
+// invisible to gc status, so operators had no clear signal to act on).
+func TestForwardCompatibility_UnknownState_WarnsOncePerIncident(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	env.addDesired("worker", "worker", false)
+
+	session := env.createSessionBead("worker", "worker")
+	_ = env.store.SetMetadata(session.ID, "state", "draining")
+	session.Metadata["state"] = "draining"
+
+	for i := 0; i < 3; i++ {
+		env.reconcile([]beads.Bead{session})
+	}
+
+	got := strings.Count(env.stderr.String(), "ERROR session reconciler")
+	if got != 1 {
+		t.Errorf("expected exactly 1 ERROR-level unknown-state warning across 3 ticks, got %d: %s", got, env.stderr.String())
+	}
+	if !strings.Contains(env.stderr.String(), "bd delete "+session.ID) {
+		t.Errorf("expected recovery command referencing bead %s in stderr, got: %s", session.ID, env.stderr.String())
+	}
+}
+
 // TestReconcileSessionBeads_FailedCreateDesiredTargetNotStarted verifies that
 // state=failed-create cannot reach the provider start path even if a stale
 // desired-state entry points at that session_name.

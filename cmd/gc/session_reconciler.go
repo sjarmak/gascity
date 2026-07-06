@@ -1183,8 +1183,13 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// rollback: if a newer version writes "draining" or "archived", the
 		// older reconciler ignores those beads rather than crashing.
 		if !isKnownState(*session) {
-			fmt.Fprintf(stderr, "session reconciler: skipping %s with unknown state %q\n", //nolint:errcheck // best-effort stderr
-				session.Metadata["session_name"], session.Metadata["state"])
+			// Loud ERROR once per stalled incident, not every tick (#2085):
+			// the skip is silent otherwise (gc status shows nothing) and the
+			// occupied pool slot compounds as the city ages.
+			if dt != nil && dt.markUnknownStateWarned(session.ID) {
+				fmt.Fprintf(stderr, "ERROR session reconciler: session bead %s (%s) stuck with unknown state %q — pool slot held indefinitely, gc restart will NOT clear it. Recovery: bd delete %s --force && gc restart.\n", //nolint:errcheck // best-effort stderr
+					session.ID, session.Metadata["session_name"], session.Metadata["state"], session.ID)
+			}
 			if trace != nil {
 				trace.recordDecision("reconciler.session.unknown_state", session.Metadata["template"], session.Metadata["session_name"], "unknown_state_skipped", "skipped", traceRecordPayload{
 					"state": session.Metadata["state"],
@@ -1192,6 +1197,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			}
 			continue
 		}
+		dt.clearUnknownStateWarned(session.ID)
 
 		// Orphan/suspended: bead exists but not in desired state.
 		// Handle BEFORE heal/stability to avoid false crash detection —

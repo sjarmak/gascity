@@ -72,20 +72,22 @@ type idleProbeState struct {
 
 // drainTracker manages in-memory drain states for all sessions.
 type drainTracker struct {
-	mu               sync.Mutex
-	drains           map[string]*drainState     // session bead ID -> drain state
-	idleProbes       map[string]*idleProbeState // session bead ID -> async idle probe
-	resetStalls      map[string]bool            // session bead ID -> reset stall event emitted
-	suspendDeferrals map[string]int             // session bead ID -> consecutive ticks a named session has been suspend-drain-eligible with its spec absent (#3630)
-	idleProbeCursor  int
+	mu                 sync.Mutex
+	drains             map[string]*drainState     // session bead ID -> drain state
+	idleProbes         map[string]*idleProbeState // session bead ID -> async idle probe
+	resetStalls        map[string]bool            // session bead ID -> reset stall event emitted
+	suspendDeferrals   map[string]int             // session bead ID -> consecutive ticks a named session has been suspend-drain-eligible with its spec absent (#3630)
+	unknownStateWarned map[string]bool            // session bead ID -> unknown-state ERROR already emitted (#2085)
+	idleProbeCursor    int
 }
 
 func newDrainTracker() *drainTracker {
 	return &drainTracker{
-		drains:           make(map[string]*drainState),
-		idleProbes:       make(map[string]*idleProbeState),
-		resetStalls:      make(map[string]bool),
-		suspendDeferrals: make(map[string]int),
+		drains:             make(map[string]*drainState),
+		idleProbes:         make(map[string]*idleProbeState),
+		resetStalls:        make(map[string]bool),
+		suspendDeferrals:   make(map[string]int),
+		unknownStateWarned: make(map[string]bool),
 	}
 }
 
@@ -106,6 +108,7 @@ func (dt *drainTracker) remove(beadID string) {
 	defer dt.mu.Unlock()
 	delete(dt.drains, beadID)
 	delete(dt.suspendDeferrals, beadID)
+	delete(dt.unknownStateWarned, beadID)
 }
 
 // bumpSuspendDeferral increments and returns the consecutive-tick count for a
@@ -238,6 +241,35 @@ func (dt *drainTracker) clearResetStall(beadID string) {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
 	delete(dt.resetStalls, beadID)
+}
+
+// markUnknownStateWarned records that the reconciler has already emitted the
+// unknown-state ERROR for this session bead, and reports whether this is the
+// first time (so the caller logs loudly exactly once per stalled incident
+// instead of every tick — #2085).
+func (dt *drainTracker) markUnknownStateWarned(beadID string) bool {
+	if dt == nil || strings.TrimSpace(beadID) == "" {
+		return true
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	if dt.unknownStateWarned[beadID] {
+		return false
+	}
+	dt.unknownStateWarned[beadID] = true
+	return true
+}
+
+// clearUnknownStateWarned resets the warned flag once a session bead's state
+// becomes recognized again, so a later genuine unknown-state incident on the
+// same bead ID re-arms the loud warning instead of staying suppressed.
+func (dt *drainTracker) clearUnknownStateWarned(beadID string) {
+	if dt == nil || strings.TrimSpace(beadID) == "" {
+		return
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	delete(dt.unknownStateWarned, beadID)
 }
 
 // Reconciler tuning defaults.
