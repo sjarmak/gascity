@@ -2525,6 +2525,7 @@ func TestReconcile_InterruptedCloseStateReaped(t *testing.T) {
 		"duplicate", "stale-session", "gc_swept", "idle-timeout",
 		"idle", "no-wake-reason", "config-drift", "city-stop",
 		"user-hold", "wait-hold", "rate_limit", "provider-terminal-error",
+		"reconfigured", "dead-runtime", sleepReasonRuntimeMissing,
 	}
 	for _, state := range states {
 		t.Run(state, func(t *testing.T) {
