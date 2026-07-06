@@ -389,35 +389,82 @@ func (c *client) deliverStartupTurn(ctx context.Context, paneID, text string) er
 // pasteAndSubmit is the unregistered-pane delivery: paste, confirm the paste
 // landed, submit. `pane run` reports success even when the paste never lands
 // (empty output → nil) — a shell→TUI handoff still settling swallows it,
-// leaving an empty box that no Enter can ever submit. So each attempt
-// snapshots the visible screen, pastes, and re-reads: a paste that landed
-// changes the screen, a swallowed one leaves it identical and we re-paste on
-// the next attempt. Only once the paste is visibly in the box do we spend an
-// Enter. Bounded so a nudge that legitimately produces no work cannot spin.
+// leaving an empty box that no Enter can ever submit. Delivery runs as two
+// separately-verified phases whose retry actions differ, because their
+// failure costs differ:
+//
+//   - Paste phase: snapshot the visible screen, paste, re-read. A paste that
+//     landed changes the screen (its text, or a "[Pasted text]" pill); a
+//     swallowed one leaves it identical, so re-paste next attempt. Verifying
+//     the paste landed doubles as the input-readiness gate the bare idle
+//     check lacked — we never Enter into a dead box.
+//
+//   - Submit phase: spend an Enter, then re-read the screen. If it still
+//     matches the pasted state, retry the Enter ONLY — never the paste. A
+//     screen that has moved on means the box consumed the paste, i.e. the
+//     submit landed (an extra Enter on an already-empty box is a no-op, so
+//     over-Entering is safe where over-pasting is not).
+//
+// Bounded so a nudge that legitimately produces no work cannot spin.
 func (c *client) pasteAndSubmit(ctx context.Context, paneID, text string) error {
 	var lastErr error
-	for attempt := 0; attempt < submitMaxAttempts; attempt++ {
-		before, rerr := c.paneRead(ctx, paneID, "visible", 0)
-		if rerr != nil {
-			lastErr = rerr // transient read failure; retry within the bound
+	// Paste phase: re-paste only while the screen provably didn't take it. A
+	// failed verification read is not proof — re-verify on the next attempt
+	// rather than re-pasting into a box that may already hold the text.
+	pasted := false
+	var pasteScreen string // pre-submit baseline: the screen with the paste in the box
+	needPaste := true
+	var before string
+	for attempt := 0; attempt < submitMaxAttempts && !pasted; attempt++ {
+		if needPaste {
+			b, rerr := c.paneRead(ctx, paneID, "visible", 0)
+			if rerr != nil {
+				lastErr = rerr // transient read failure; retry within the bound
+			}
+			before = strings.TrimSpace(b)
+			if err := c.paneRun(ctx, paneID, text); err != nil {
+				return err
+			}
+			needPaste = false
 		}
-		if err := c.paneRun(ctx, paneID, text); err != nil {
-			return err
-		}
-		time.Sleep(c.settleDelay)
+		time.Sleep(submitSettleDelay) // let the paste commit before we check it
 		after, rerr := c.paneRead(ctx, paneID, "visible", 0)
 		if rerr != nil {
-			lastErr = rerr // transient read failure; retry within the bound
+			lastErr = rerr // can't verify this paste; re-verify next attempt
+			continue
 		}
-		if strings.TrimSpace(before) == strings.TrimSpace(after) {
-			continue // paste swallowed — pane not input-ready yet; re-paste next attempt
+		if strings.TrimSpace(after) != before {
+			pasted = true
+			pasteScreen = strings.TrimSpace(after)
+		} else {
+			needPaste = true // provably swallowed — pane not input-ready yet; re-paste
 		}
-		return c.sendKeys(ctx, paneID, "Enter")
+	}
+	if !pasted {
+		if lastErr != nil {
+			return fmt.Errorf("herdr pasteAndSubmit: %q paste never landed after %d attempts: %w", paneID, submitMaxAttempts, lastErr)
+		}
+		return fmt.Errorf("herdr pasteAndSubmit: %q paste never landed after %d attempts", paneID, submitMaxAttempts)
+	}
+	// Submit phase: retry the Enter only — a re-paste here duplicates the turn.
+	for attempt := 0; attempt < submitMaxAttempts; attempt++ {
+		if err := c.sendKeys(ctx, paneID, "Enter"); err != nil {
+			lastErr = err // transient send failure; verify + retry within the bound
+		}
+		time.Sleep(submitSettleDelay)
+		cur, rerr := c.paneRead(ctx, paneID, "visible", 0)
+		if rerr != nil {
+			lastErr = rerr
+			continue // can't tell whether the box consumed it; another Enter is safe
+		}
+		if strings.TrimSpace(cur) != pasteScreen {
+			return nil // box consumed the paste → submit landed
+		}
 	}
 	if lastErr != nil {
-		return fmt.Errorf("herdr pasteAndSubmit: %q not confirmed after %d attempts: %w", paneID, submitMaxAttempts, lastErr)
+		return fmt.Errorf("herdr pasteAndSubmit: %q submit not confirmed after %d attempts: %w", paneID, submitMaxAttempts, lastErr)
 	}
-	return fmt.Errorf("herdr pasteAndSubmit: %q paste never landed after %d attempts", paneID, submitMaxAttempts)
+	return fmt.Errorf("herdr pasteAndSubmit: %q still idle after %d attempts (submit unconfirmed)", paneID, submitMaxAttempts)
 }
 
 // isAgentNotFound reports whether err is herdr's missing-agent rejection
@@ -433,17 +480,22 @@ func isAgentNotFound(err error) bool {
 	return strings.Contains(err.Error(), "not_found") || strings.Contains(err.Error(), "not found")
 }
 
-// submitSettleDelay is how long the unregistered-pane fallback waits for a
-// `pane run` paste to commit before the submit Enter (a submit racing the
-// paste is swallowed).
-const submitSettleDelay = 1 * time.Second
+// submitSettleDelay is how long pasteAndSubmit waits for a `pane run` paste to
+// commit before the submit Enter (a submit racing the paste is swallowed), and
+// before re-reading the screen to confirm the submit landed. A submit that
+// races the paste is swallowed; ~1s clears it with margin even under the
+// concurrent boot load of a town-wide restart.
+// Var (not const) so tests can shrink it; production code never writes it.
+var submitSettleDelay = 1 * time.Second
 
-// submitMaxAttempts bounds pasteAndSubmit's closed-loop paste confirmation:
-// ~submitMaxAttempts·settleDelay is the worst-case latency before it gives up
-// and returns an error. Sized to cover a slow shell→TUI handoff under
-// restart-time load without spinning on a nudge that legitimately leaves the
-// agent idle.
-const submitMaxAttempts = 5
+// submitMaxAttempts bounds each of pasteAndSubmit's two phases independently
+// (paste-until-landed, then Enter-until-confirmed): with one settle wait per
+// attempt, ~2·submitMaxAttempts·settle is the worst-case latency before
+// pasteAndSubmit gives up and returns an error. Sized to cover a slow
+// shell→TUI handoff under restart-time load without spinning on a nudge that
+// legitimately leaves the agent idle.
+// Var (not const) so tests can shrink it; production code never writes it.
+var submitMaxAttempts = 5
 
 // closePane → `herdr pane close <paneID>`.
 func (c *client) closePane(ctx context.Context, paneID string) error {
