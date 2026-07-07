@@ -67,6 +67,22 @@ func processRetryControl(store beads.Store, bead beads.Bead, opts ProcessOptions
 		return ControlResult{}, ErrControlPending
 	}
 
+	if drained, live, err := attemptScopeDrained(store, bead, attempt); err != nil {
+		return ControlResult{}, fmt.Errorf("%s: verifying attempt drain for %s: %w", bead.ID, attempt.ID, err)
+	} else if !drained {
+		for _, member := range live {
+			if err := ensureBlockingDependency(store, bead.ID, member.ID); err != nil {
+				if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
+					return ControlResult{}, ErrControlPending
+				}
+				return ControlResult{}, fmt.Errorf("%s: blocking on undrained attempt member %s: %w", bead.ID, member.ID, err)
+			}
+		}
+		opts.tracef("process-control bead=%s kind=retry pending reason=attempt-undrained attempt=%s live=%d",
+			bead.ID, attempt.ID, len(live))
+		return ControlResult{}, ErrControlPending
+	}
+
 	attemptNum, _ := strconv.Atoi(attempt.Metadata[beadmeta.AttemptMetadataKey])
 	result, err := classifyRetryAttemptWithPostconditions(store, attempt, opts)
 	if err != nil {
@@ -198,6 +214,22 @@ func processRalphControl(store beads.Store, bead beads.Bead, opts ProcessOptions
 		return ControlResult{}, ErrControlPending
 	}
 
+	if drained, live, err := attemptScopeDrained(store, bead, iteration); err != nil {
+		return ControlResult{}, fmt.Errorf("%s: verifying iteration drain for %s: %w", bead.ID, iteration.ID, err)
+	} else if !drained {
+		for _, member := range live {
+			if err := ensureBlockingDependency(store, bead.ID, member.ID); err != nil {
+				if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
+					return ControlResult{}, ErrControlPending
+				}
+				return ControlResult{}, fmt.Errorf("%s: blocking on undrained iteration member %s: %w", bead.ID, member.ID, err)
+			}
+		}
+		opts.tracef("process-control bead=%s kind=ralph pending reason=iteration-undrained iteration=%s live=%d",
+			bead.ID, iteration.ID, len(live))
+		return ControlResult{}, ErrControlPending
+	}
+
 	iterationNum, _ := strconv.Atoi(iteration.Metadata[beadmeta.AttemptMetadataKey])
 
 	// Propagate non-gc metadata from the iteration to the ralph control
@@ -279,6 +311,45 @@ func processRalphControl(store beads.Store, bead beads.Bead, opts ProcessOptions
 	}
 
 	return ControlResult{Processed: true, Action: "retry", Created: 1}, nil
+}
+
+// attemptScopeDrained reports whether every live descendant of a closed
+// retry/ralph attempt's scope has finished. A scope bead can flip to closed
+// while beads inside its scope (on_complete fanout instances, scope-checks,
+// members still in_progress/blocked) are still draining — the status gate
+// above only checks the scope bead's own bit, not its contents. Unlike
+// hasOpenScopeMembers (which only counts status=="open" members, missing
+// claimed/in_progress work), this counts every non-closed status via
+// listActiveByWorkflowRootAndScope, mirroring the exclusions
+// hasOpenScopeMembers applies (spec sidecars, body/teardown roles). See
+// gastownhall/gascity#2519.
+func attemptScopeDrained(store beads.Store, control, attempt beads.Bead) (bool, []beads.Bead, error) {
+	rootID := control.Metadata[beadmeta.RootBeadIDMetadataKey]
+	if rootID == "" {
+		rootID = control.ID
+	}
+	scopeRef := attempt.Metadata[beadmeta.StepRefMetadataKey]
+	if scopeRef == "" {
+		return false, nil, fmt.Errorf("%s: attempt %s missing gc.step_ref, cannot verify scope drain", control.ID, attempt.ID)
+	}
+
+	members, err := listActiveByWorkflowRootAndScope(store, rootID, scopeRef)
+	if err != nil {
+		return false, nil, err
+	}
+
+	var live []beads.Bead
+	for _, member := range members {
+		if member.Metadata[beadmeta.KindMetadataKey] == beadmeta.KindSpec {
+			continue
+		}
+		switch member.Metadata[beadmeta.ScopeRoleMetadataKey] {
+		case beadmeta.ScopeRoleBody, beadmeta.ScopeRoleTeardown:
+			continue
+		}
+		live = append(live, member)
+	}
+	return len(live) == 0, live, nil
 }
 
 func ensureBlockingDependency(store beads.Store, issueID, dependsOnID string) error {

@@ -1998,6 +1998,420 @@ func TestProcessRalphControlPendingIterationAddsBlockingDep(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// gastownhall/gascity#2519: ralph/retry advance must wait for full scope
+// drain, not just the scope bead's own closed bit. A scope bead can close
+// while on_complete fanout instances, scope-checks, or claimed members inside
+// it are still live.
+// ---------------------------------------------------------------------------
+
+// newUndrainedRalphFixture builds a ralph control whose iteration-1 scope
+// body has closed while three kinds of scope member are still live: one
+// untouched "open" member, one claimed "in_progress" member (the case
+// hasOpenScopeMembers's status=="open" filter misses), and one gc.kind=fanout
+// member (the shape from the reporter's trace).
+func newUndrainedRalphFixture(t *testing.T, store beads.Store) (control beads.Bead, live []beads.Bead) {
+	t.Helper()
+	root := mustCreate(t, store, beads.Bead{
+		Title:    "workflow",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	control = mustCreate(t, store, beads.Bead{
+		Title: "review loop",
+		Metadata: map[string]string{
+			"gc.kind":         "ralph",
+			"gc.root_bead_id": root.ID,
+			"gc.step_ref":     "mol-test.review-loop",
+			"gc.step_id":      "review-loop",
+			"gc.max_attempts": "2",
+		},
+	})
+	iteration := mustCreate(t, store, beads.Bead{
+		Title: "review loop iteration 1",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.root_bead_id": root.ID,
+			"gc.step_ref":     "mol-test.review-loop.iteration.1",
+			"gc.scope_role":   "body",
+			"gc.attempt":      "1",
+		},
+	})
+	mustClose(t, store, iteration.ID)
+	mustDep(t, store, control.ID, iteration.ID, "blocks")
+
+	openMember := mustCreate(t, store, beads.Bead{
+		Title: "member still open",
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID,
+			"gc.scope_ref":    "mol-test.review-loop.iteration.1",
+			"gc.scope_role":   "member",
+		},
+	})
+	inProgressMember := mustCreate(t, store, beads.Bead{
+		Title: "member claimed",
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID,
+			"gc.scope_ref":    "mol-test.review-loop.iteration.1",
+			"gc.scope_role":   "member",
+		},
+	})
+	inProgress := "in_progress"
+	if err := store.Update(inProgressMember.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("set in_progress: %v", err)
+	}
+	fanoutMember := mustCreate(t, store, beads.Bead{
+		Title: "on_complete fanout instance",
+		Metadata: map[string]string{
+			"gc.kind":         "fanout",
+			"gc.root_bead_id": root.ID,
+			"gc.scope_ref":    "mol-test.review-loop.iteration.1",
+		},
+	})
+
+	return control, []beads.Bead{
+		mustGet(t, store, openMember.ID),
+		mustGet(t, store, inProgressMember.ID),
+		mustGet(t, store, fanoutMember.ID),
+	}
+}
+
+func TestProcessRalphControlBlocksAdvanceOnUndrainedIterationMembers(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+	control, _ := newUndrainedRalphFixture(t, store)
+
+	_, err := processRalphControl(store, mustGet(t, store, control.ID), ProcessOptions{})
+	if !errors.Is(err, ErrControlPending) {
+		t.Fatalf("error = %v, want %v", err, ErrControlPending)
+	}
+
+	all, err := store.List(beads.ListQuery{
+		Metadata:      map[string]string{"gc.root_bead_id": control.Metadata["gc.root_bead_id"]},
+		IncludeClosed: true,
+	})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, b := range all {
+		if strings.HasPrefix(b.Metadata["gc.step_ref"], "mol-test.review-loop.iteration.2") {
+			t.Fatalf("iteration 2 bead %s spawned while iteration 1 members are still live", b.ID)
+		}
+	}
+}
+
+func TestProcessRalphControlAddsBlockingDepsOnUndrainedMembers(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+	control, live := newUndrainedRalphFixture(t, store)
+
+	_, err := processRalphControl(store, mustGet(t, store, control.ID), ProcessOptions{})
+	if !errors.Is(err, ErrControlPending) {
+		t.Fatalf("error = %v, want %v", err, ErrControlPending)
+	}
+
+	deps, err := store.DepList(control.ID, "down")
+	if err != nil {
+		t.Fatalf("DepList: %v", err)
+	}
+	got := make(map[string]bool, len(deps))
+	for _, dep := range deps {
+		if dep.Type == "blocks" {
+			got[dep.DependsOnID] = true
+		}
+	}
+	for _, m := range live {
+		if !got[m.ID] {
+			t.Fatalf("deps = %#v, want a blocks dep on live member %s", deps, m.ID)
+		}
+	}
+
+	ready, err := store.Ready()
+	if err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	for _, bead := range ready {
+		if bead.ID == control.ID {
+			t.Fatalf("control bead stayed ready while iteration members are still live")
+		}
+	}
+}
+
+func TestProcessRalphControlAdvancesAfterMembersDrain(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+
+	root := mustCreate(t, store, beads.Bead{
+		Title:    "workflow",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	control := mustCreate(t, store, beads.Bead{
+		Title: "review loop",
+		Metadata: map[string]string{
+			"gc.kind":             "ralph",
+			"gc.root_bead_id":     root.ID,
+			"gc.step_ref":         "mol-test.review-loop",
+			"gc.step_id":          "review-loop",
+			"gc.max_attempts":     "3",
+			"gc.source_step_spec": `{"id":"review-loop","title":"Review loop","type":"task","ralph":{"max_attempts":3,"check":{"mode":"exec","path":"unused.sh"}}}`,
+			"gc.control_epoch":    "1",
+		},
+	})
+	iteration := mustCreate(t, store, beads.Bead{
+		Title: "review loop iteration 1",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.root_bead_id": root.ID,
+			"gc.step_ref":     "mol-test.review-loop.iteration.1",
+			"gc.scope_role":   "body",
+			"gc.attempt":      "1",
+			"gc.outcome":      "fail",
+		},
+	})
+	mustClose(t, store, iteration.ID)
+	mustDep(t, store, control.ID, iteration.ID, "blocks")
+
+	member := mustCreate(t, store, beads.Bead{
+		Title: "fanout instance still draining",
+		Metadata: map[string]string{
+			"gc.kind":         "fanout",
+			"gc.root_bead_id": root.ID,
+			"gc.scope_ref":    "mol-test.review-loop.iteration.1",
+		},
+	})
+
+	if _, err := processRalphControl(store, mustGet(t, store, control.ID), ProcessOptions{}); !errors.Is(err, ErrControlPending) {
+		t.Fatalf("first process error = %v, want %v", err, ErrControlPending)
+	}
+
+	mustClose(t, store, member.ID)
+
+	result, err := processRalphControl(store, mustGet(t, store, control.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("processRalphControl after drain: %v", err)
+	}
+	if !result.Processed || result.Action != "retry" {
+		t.Fatalf("result = %+v, want processed retry (iteration 2 spawned now that iteration 1 fully drained)", result)
+	}
+}
+
+func TestProcessRalphControlDrainExcludesSpecAndTeardownMembers(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+
+	root := mustCreate(t, store, beads.Bead{
+		Title:    "workflow",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	control := mustCreate(t, store, beads.Bead{
+		Title: "review loop",
+		Metadata: map[string]string{
+			"gc.kind":             "ralph",
+			"gc.root_bead_id":     root.ID,
+			"gc.step_ref":         "mol-test.review-loop",
+			"gc.step_id":          "review-loop",
+			"gc.max_attempts":     "1",
+			"gc.source_step_spec": `{"id":"review-loop","title":"Review loop","type":"task","ralph":{"max_attempts":1,"check":{"mode":"exec","path":"unused.sh"}}}`,
+			"gc.control_epoch":    "1",
+		},
+	})
+	iteration := mustCreate(t, store, beads.Bead{
+		Title: "review loop iteration 1",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.root_bead_id": root.ID,
+			"gc.step_ref":     "mol-test.review-loop.iteration.1",
+			"gc.scope_role":   "body",
+			"gc.attempt":      "1",
+			"gc.outcome":      "fail",
+		},
+	})
+	mustClose(t, store, iteration.ID)
+	mustDep(t, store, control.ID, iteration.ID, "blocks")
+
+	mustCreate(t, store, beads.Bead{
+		Title: "generated spec sidecar",
+		Metadata: map[string]string{
+			"gc.kind":         "spec",
+			"gc.root_bead_id": root.ID,
+			"gc.scope_ref":    "mol-test.review-loop.iteration.1",
+		},
+	})
+	mustCreate(t, store, beads.Bead{
+		Title: "teardown step",
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID,
+			"gc.scope_ref":    "mol-test.review-loop.iteration.1",
+			"gc.scope_role":   "teardown",
+		},
+	})
+
+	result, err := processRalphControl(store, mustGet(t, store, control.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("processRalphControl: %v", err)
+	}
+	if !result.Processed || result.Action != "fail" {
+		t.Fatalf("result = %+v, want processed fail (exhausted at max_attempts=1); spec/teardown members must not block advance", result)
+	}
+}
+
+// TestProcessRalphControlGatesUndrainedIterationBeforeCheckRuns proves the
+// drain gate runs before runRalphCheck, not just before a failure path: the
+// control bead here carries no check config at all, so if the gate did not
+// short-circuit first, runRalphCheck would return a plain "missing
+// gc.check_path" error instead of ErrControlPending.
+func TestProcessRalphControlGatesUndrainedIterationBeforeCheckRuns(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+
+	root := mustCreate(t, store, beads.Bead{
+		Title:    "workflow",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	control := mustCreate(t, store, beads.Bead{
+		Title: "review loop",
+		Metadata: map[string]string{
+			"gc.kind":         "ralph",
+			"gc.root_bead_id": root.ID,
+			"gc.step_ref":     "mol-test.review-loop",
+			"gc.step_id":      "review-loop",
+			"gc.max_attempts": "2",
+		},
+	})
+	iteration := mustCreate(t, store, beads.Bead{
+		Title: "review loop iteration 1",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.root_bead_id": root.ID,
+			"gc.step_ref":     "mol-test.review-loop.iteration.1",
+			"gc.scope_role":   "body",
+			"gc.attempt":      "1",
+		},
+	})
+	mustClose(t, store, iteration.ID)
+	mustDep(t, store, control.ID, iteration.ID, "blocks")
+
+	mustCreate(t, store, beads.Bead{
+		Title: "member still open",
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID,
+			"gc.scope_ref":    "mol-test.review-loop.iteration.1",
+			"gc.scope_role":   "member",
+		},
+	})
+
+	_, err := processRalphControl(store, mustGet(t, store, control.ID), ProcessOptions{})
+	if !errors.Is(err, ErrControlPending) {
+		t.Fatalf("error = %v, want %v (drain gate must fire before the check pipeline runs)", err, ErrControlPending)
+	}
+}
+
+func TestProcessRetryControlBlocksOnUndrainedScopedChild(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+
+	root := mustCreate(t, store, beads.Bead{
+		Title:    "workflow",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	control := mustCreate(t, store, beads.Bead{
+		Title: "apply fixes",
+		Metadata: map[string]string{
+			"gc.kind":         "retry",
+			"gc.root_bead_id": root.ID,
+			"gc.step_ref":     "mol-test.apply-fixes",
+			"gc.step_id":      "apply-fixes",
+			"gc.max_attempts": "3",
+		},
+	})
+	attempt := mustCreate(t, store, beads.Bead{
+		Title: "apply fixes attempt 1",
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID,
+			"gc.step_ref":     "mol-test.apply-fixes.attempt.1",
+			"gc.attempt":      "1",
+		},
+	})
+	mustClose(t, store, attempt.ID)
+	mustDep(t, store, control.ID, attempt.ID, "blocks")
+
+	child := mustCreate(t, store, beads.Bead{
+		Title: "attempt 1 lingering child",
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID,
+			"gc.scope_ref":    "mol-test.apply-fixes.attempt.1",
+			"gc.scope_role":   "member",
+		},
+	})
+	inProgress := "in_progress"
+	if err := store.Update(child.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("set in_progress: %v", err)
+	}
+
+	_, err := processRetryControl(store, mustGet(t, store, control.ID), ProcessOptions{})
+	if !errors.Is(err, ErrControlPending) {
+		t.Fatalf("error = %v, want %v", err, ErrControlPending)
+	}
+
+	deps, err := store.DepList(control.ID, "down")
+	if err != nil {
+		t.Fatalf("DepList: %v", err)
+	}
+	var blocksChild bool
+	for _, dep := range deps {
+		if dep.DependsOnID == child.ID && dep.Type == "blocks" {
+			blocksChild = true
+		}
+	}
+	if !blocksChild {
+		t.Fatalf("deps = %#v, want a blocks dep on lingering child %s", deps, child.ID)
+	}
+}
+
+// TestProcessRetryControlChildlessAttemptAdvancesUnchanged guards against
+// over-blocking: a retry attempt with no scoped children (the common case)
+// must classify and advance exactly as before the drain gate was added.
+func TestProcessRetryControlChildlessAttemptAdvancesUnchanged(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+
+	root := mustCreate(t, store, beads.Bead{
+		Title:    "workflow",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	control := mustCreate(t, store, beads.Bead{
+		Title: "apply fixes",
+		Metadata: map[string]string{
+			"gc.kind":         "retry",
+			"gc.root_bead_id": root.ID,
+			"gc.step_ref":     "mol-test.apply-fixes",
+			"gc.step_id":      "apply-fixes",
+			"gc.max_attempts": "3",
+			"gc.on_exhausted": "hard_fail",
+		},
+	})
+	attempt := mustCreate(t, store, beads.Bead{
+		Title: "apply fixes attempt 1",
+		Metadata: map[string]string{
+			"gc.root_bead_id":   root.ID,
+			"gc.step_ref":       "mol-test.apply-fixes.attempt.1",
+			"gc.attempt":        "1",
+			"gc.outcome":        "fail",
+			"gc.failure_class":  "hard",
+			"gc.failure_reason": "missing_review_artifact",
+		},
+	})
+	mustClose(t, store, attempt.ID)
+	mustDep(t, store, control.ID, attempt.ID, "blocks")
+
+	result, err := processRetryControl(store, mustGet(t, store, control.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("processRetryControl: %v", err)
+	}
+	if !result.Processed || result.Action != "hard-fail" {
+		t.Fatalf("result = %+v, want processed hard-fail (childless attempt must advance unblocked)", result)
+	}
+}
+
 // TestReconcileClosedScopeMemberRalphPass covers the pass-side symmetry of
 // TestProcessRalphControlClosesEnclosingScopeOnIterationFailure: when a scoped
 // ralph control closes with gc.outcome=pass, reconcileClosedScopeMember must
