@@ -200,7 +200,9 @@ func recordResetStallIfDue(
 	info sessionpkg.Info,
 	template string,
 	name string,
+	running bool,
 	alive bool,
+	runtimeHasOutput bool,
 	startupTimeout time.Duration,
 	now time.Time,
 	dt *drainTracker,
@@ -220,6 +222,53 @@ func recordResetStallIfDue(
 	}
 	elapsed := now.Sub(committedAt)
 	if elapsed <= startupTimeout {
+		return
+	}
+	// A reset that has already produced a *running* runtime that is still
+	// producing pane output is not a stalled reset: the runtime came up and the
+	// agent is still finishing startup (e.g. a slow `gc prime` under DoltLite
+	// store load), and it typically reaches ready shortly after. Firing
+	// session.reset_stalled here mislabels a slow start as a failed reset — the
+	// false-positive storm behind ga-y8s9 / upstream #4081. Skip the alarm, and
+	// record the exemption for observability — though the exempt decision only
+	// surfaces when detail tracing is already armed for this template:
+	// TraceOutcomeExempt does not auto-arm the way the Failed reset_stalled it
+	// replaces (TraceOutcomeFailed) does.
+	//
+	// The exemption requires runtimeHasOutput: the caller peeks the pane once
+	// and passes whether a running-but-not-alive runtime is producing
+	// scrollback. Non-empty output is affirmative evidence the runtime is doing
+	// something — a live slow start, or a crashy pane that the zombie-capture
+	// path below captures as SessionCrashed / a terminal-provider-error mark (a
+	// rate-limit screen is a rate-limit condition, not a stalled reset). An empty
+	// or erroring peek (runtimeHasOutput == false) is a silent running-but-dead
+	// zombie with NO other signal; it falls through and still fires the
+	// reset_stalled fallback below, preserving the pre-exemption behavior for
+	// that class. A reset that produced NO running runtime likewise falls through
+	// (the genuine "reset failed to bring the session up" signal). markResetStall
+	// is intentionally NOT consumed on the exempt path, so a slow start that
+	// later loses its runtime is still reported as a real stall.
+	//
+	// This branch is a no-op without process-name liveness tracking: `running`
+	// only diverges from `alive` when Hints.ProcessNames is configured (a plain
+	// IsRunning provider reports running==alive), and this path is reached only
+	// when !alive.
+	if running && runtimeHasOutput {
+		if trace != nil {
+			trace.RecordDecision(
+				TraceSiteReconcilerProgressStallExempt,
+				TraceReasonRuntimeStarting,
+				TraceOutcomeExempt,
+				template,
+				name,
+				map[string]any{
+					"bead_id":            info.ID,
+					"elapsed_s":          int(elapsed / time.Second),
+					"reset_committed_at": resetCommittedAt,
+					"startup_timeout_s":  int(startupTimeout / time.Second),
+				},
+			)
+		}
 		return
 	}
 	if dt != nil && !dt.markResetStall(info.ID) {
@@ -2055,7 +2104,24 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			shadowTick.captureRuntime(id, "observeRuntimeProviderLiveness", name, triFromBool(running), triFromBool(alive))
 		}
 		peek := cachedSessionPeek(cityPath, store, sp, cfg, id, tp.Hints.ProcessNames)
-		recordResetStallIfDue(infoByID[id], tp.TemplateName, name, alive, startupTimeout, clk.Now().UTC(), dt, rec, stderr, trace)
+		// A running-but-not-alive runtime feeds both the reset-stall exemption
+		// (recordResetStallIfDue) and zombie capture below. Peek the pane once,
+		// up front, and share the result. Non-empty output is affirmative
+		// evidence the runtime is producing scrollback (a slow start, or a crashy
+		// pane that zombie capture below signals), so the exemption may skip the
+		// reset_stalled alarm. An empty or erroring peek is a silent stuck runtime
+		// with no other signal, so the exemption must not apply and reset_stalled
+		// still fires. peek runs only when running && !alive, so alive sessions
+		// are never peeked here.
+		var (
+			zombieOutput string
+			zombieErr    error
+		)
+		if running && !alive {
+			zombieOutput, zombieErr = peek(rateLimitPeekLines)
+		}
+		runtimeHasOutput := zombieErr == nil && zombieOutput != ""
+		recordResetStallIfDue(infoByID[id], tp.TemplateName, name, running, alive, runtimeHasOutput, startupTimeout, clk.Now().UTC(), dt, rec, stderr, trace)
 
 		// Zombie capture: session exists but process dead — grab scrollback for forensics.
 		// markProviderTerminalError persists + folds its write onto the snapshot in one
@@ -2063,7 +2129,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// snapshot Info unchanged, so this assignment is a no-op exactly when the raw
 		// bead was left untouched.
 		if running && !alive {
-			if output, err := peek(rateLimitPeekLines); err == nil && output != "" {
+			if output, err := zombieOutput, zombieErr; err == nil && output != "" {
 				if reason := runtime.ProviderTerminalErrorReason(output); reason != "" {
 					markInfo, markErr := markProviderTerminalError(infoByID[id], sessFront, clk, reason)
 					if markErr != nil {

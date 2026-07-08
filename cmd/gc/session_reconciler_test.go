@@ -9761,7 +9761,7 @@ func TestReconcileSessionBeads_RecordsResetStallDiagnostic(t *testing.T) {
 	}
 
 	env.stderr.Reset()
-	recordResetStallIfDue(sessiontest.SeedBead(t, session), "worker", "worker", false, env.cfg.Session.StartupTimeoutDuration(), env.clk.Now().UTC(), env.dt, rec, &env.stderr, trace)
+	recordResetStallIfDue(sessiontest.SeedBead(t, session), "worker", "worker", false, false, false, env.cfg.Session.StartupTimeoutDuration(), env.clk.Now().UTC(), env.dt, rec, &env.stderr, trace)
 	if got := strings.TrimSpace(env.stderr.String()); got != "" {
 		t.Fatalf("second stalled pass stderr = %q, want debounce silence", got)
 	}
@@ -9773,18 +9773,180 @@ func TestReconcileSessionBeads_RecordsResetStallDiagnostic(t *testing.T) {
 		"continuation_reset_pending":   "",
 		sessionpkg.ResetCommittedAtKey: "",
 	})
-	recordResetStallIfDue(sessiontest.SeedBead(t, session), "worker", "worker", false, env.cfg.Session.StartupTimeoutDuration(), env.clk.Now().UTC(), env.dt, rec, &env.stderr, trace)
+	recordResetStallIfDue(sessiontest.SeedBead(t, session), "worker", "worker", false, false, false, env.cfg.Session.StartupTimeoutDuration(), env.clk.Now().UTC(), env.dt, rec, &env.stderr, trace)
 	env.setSessionMetadata(&session, map[string]string{
 		"continuation_reset_pending":   "true",
 		sessionpkg.ResetCommittedAtKey: committedAt,
 	})
 	env.stderr.Reset()
-	recordResetStallIfDue(sessiontest.SeedBead(t, session), "worker", "worker", false, env.cfg.Session.StartupTimeoutDuration(), env.clk.Now().UTC(), env.dt, rec, &env.stderr, trace)
+	recordResetStallIfDue(sessiontest.SeedBead(t, session), "worker", "worker", false, false, false, env.cfg.Session.StartupTimeoutDuration(), env.clk.Now().UTC(), env.dt, rec, &env.stderr, trace)
 	if got := strings.TrimSpace(env.stderr.String()); got != wantMessage {
 		t.Fatalf("re-stalled pass stderr = %q, want %q", got, wantMessage)
 	}
 	if len(rec.Events) != 2 {
 		t.Fatalf("recorded events after reset clear = %d, want 2", len(rec.Events))
+	}
+}
+
+// TestRecordResetStallIfDue_ExemptsStillStartingRuntime pins the ga-y8s9 /
+// upstream #4081 fix: a reset whose runtime is already *running* AND producing
+// pane output (the agent is just finishing a slow startup, e.g. a crawling
+// `gc prime` under DoltLite store load) is a slow start, NOT a stalled reset,
+// and must not emit session.reset_stalled. A reset that produced no running
+// runtime is a genuine stall and must still fire — and the exempt path must not
+// swallow the dedup token that a later genuine stall depends on.
+func TestRecordResetStallIfDue_ExemptsStillStartingRuntime(t *testing.T) {
+	env := newReconcilerTestEnv()
+	rec := events.NewFake()
+	env.cfg = &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{{Name: "worker", StartCommand: "true", MaxActiveSessions: intPtr(2)}},
+		Session:   config.SessionConfig{StartupTimeout: "60s"},
+	}
+	session := env.createSessionBead("worker", "worker")
+	committedAt := env.clk.Now().Add(-75 * time.Second).UTC().Format(time.RFC3339)
+	env.setSessionMetadata(&session, map[string]string{
+		"continuation_reset_pending":   "true",
+		sessionpkg.ResetCommittedAtKey: committedAt,
+	})
+
+	tracer := newSessionReconcilerTracer(t.TempDir(), "test-city", io.Discard)
+	t.Cleanup(func() { _ = tracer.Close() })
+	trace := tracer.BeginCycle(TraceTickTriggerPatrol, "", env.clk.Now().UTC(), env.cfg)
+	// Arm detail AFTER BeginCycle: BeginCycle's syncArms re-derives tracer.detail
+	// from cfg, and the startup-exempt decision uses TraceOutcomeExempt, which
+	// (unlike the Failed reset_stalled) does not auto-arm — so the template must
+	// be in detail mode for RecordDecision to keep the record.
+	tracer.detail = map[string]TraceSource{"worker": TraceSourceManual}
+
+	// running=true, alive=false, runtimeHasOutput=true (the pane is producing
+	// scrollback), elapsed(75s) > startup_timeout(60s): the reset brought a
+	// runtime up and the agent is still starting — no alarm.
+	recordResetStallIfDue(sessiontest.SeedBead(t, session), "worker", "worker", true, false, true, env.cfg.Session.StartupTimeoutDuration(), env.clk.Now().UTC(), env.dt, rec, &env.stderr, trace)
+	if len(rec.Events) != 0 {
+		t.Fatalf("still-starting runtime fired %d events, want 0: %#v", len(rec.Events), rec.Events)
+	}
+	if got := strings.TrimSpace(env.stderr.String()); got != "" {
+		t.Fatalf("still-starting runtime wrote stderr %q, want silence", got)
+	}
+	foundExempt := false
+	for _, r := range trace.records {
+		if r.SiteCode == TraceSiteReconcilerProgressStallExempt && r.ReasonCode == TraceReasonRuntimeStarting {
+			foundExempt = true
+			break
+		}
+	}
+	if !foundExempt {
+		t.Fatalf("startup-progress exemption trace not recorded; records=%+v", trace.records)
+	}
+
+	// A later tick where the runtime is GONE (running=false) is a genuine
+	// stalled reset and must fire — proving the exempt path did not consume the
+	// per-session dedup token.
+	env.stderr.Reset()
+	recordResetStallIfDue(sessiontest.SeedBead(t, session), "worker", "worker", false, false, false, env.cfg.Session.StartupTimeoutDuration(), env.clk.Now().UTC(), env.dt, rec, &env.stderr, trace)
+	if len(rec.Events) != 1 {
+		t.Fatalf("genuine stall (no running runtime) fired %d events, want 1", len(rec.Events))
+	}
+	if rec.Events[0].Type != events.SessionResetStalled {
+		t.Fatalf("event type = %q, want %q", rec.Events[0].Type, events.SessionResetStalled)
+	}
+}
+
+// TestRecordResetStallIfDue_FiresWhenRunningButNoScrollback is the regression
+// guard for the exemption's blind spot: the still-starting exemption applies
+// only when the running-but-not-alive runtime is producing pane output
+// (runtimeHasOutput=true), because a non-empty pane is already covered by
+// another signal — zombie capture's SessionCrashed / terminal-provider-error
+// mark, or the rate-limit path. A permanent running-but-dead zombie whose
+// scrollback is EMPTY or whose peek errors (runtimeHasOutput=false) has NO other
+// signal, so it must NOT be silently exempted: session.reset_stalled still
+// fires, preserving the pre-exemption fallback for that class of stuck session.
+func TestRecordResetStallIfDue_FiresWhenRunningButNoScrollback(t *testing.T) {
+	env := newReconcilerTestEnv()
+	rec := events.NewFake()
+	env.cfg = &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{{Name: "worker", StartCommand: "true", MaxActiveSessions: intPtr(2)}},
+		Session:   config.SessionConfig{StartupTimeout: "60s"},
+	}
+	session := env.createSessionBead("worker", "worker")
+	committedAt := env.clk.Now().Add(-75 * time.Second).UTC().Format(time.RFC3339)
+	env.setSessionMetadata(&session, map[string]string{
+		"continuation_reset_pending":   "true",
+		sessionpkg.ResetCommittedAtKey: committedAt,
+	})
+
+	// running=true, alive=false, runtimeHasOutput=false (empty or erroring peek),
+	// elapsed(75s) > startup_timeout(60s): a silent running-but-dead zombie. The
+	// exemption must NOT apply — reset_stalled is the only remaining signal.
+	recordResetStallIfDue(sessiontest.SeedBead(t, session), "worker", "worker", true, false, false, env.cfg.Session.StartupTimeoutDuration(), env.clk.Now().UTC(), env.dt, rec, &env.stderr, nil)
+	if len(rec.Events) != 1 {
+		t.Fatalf("running-but-silent zombie fired %d events, want 1 (reset_stalled fallback must survive): %#v", len(rec.Events), rec.Events)
+	}
+	if rec.Events[0].Type != events.SessionResetStalled {
+		t.Fatalf("event type = %q, want %q", rec.Events[0].Type, events.SessionResetStalled)
+	}
+}
+
+// TestReconcileSessionBeads_ResetStallFiresForSilentZombie is the end-to-end
+// wiring guard for the reset-stall exemption: the reconciler peeks a
+// running-but-not-alive pane once and passes runtimeHasOutput into
+// recordResetStallIfDue. A zombie with an EMPTY pane (SetPeekOutput "") whose
+// reset has been pending past startup_timeout has no scrollback for zombie
+// capture to emit, so session.reset_stalled must still fire — the exemption must
+// not silently swallow it. This exercises the caller wiring the unit tests
+// cannot reach (peek result -> runtimeHasOutput -> exemption decision).
+func TestReconcileSessionBeads_ResetStallFiresForSilentZombie(t *testing.T) {
+	env := newReconcilerTestEnv()
+	rec := events.NewFake()
+	env.rec = rec
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+
+	// ProcessNames so ProcessAlive distinguishes the zombie (running && !alive).
+	tp := TemplateParams{
+		Command:      "test-cmd",
+		SessionName:  "worker",
+		TemplateName: "worker",
+		Hints:        agent.StartupHints{ProcessNames: []string{"test-cmd"}},
+	}
+	env.desiredState["worker"] = tp
+	_ = env.sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"})
+
+	// Zombie: tmux session exists (running) but process is dead (!alive), and the
+	// pane is silent (empty peek) so zombie capture emits nothing.
+	env.sp.Zombies["worker"] = true
+	env.sp.SetPeekOutput("worker", "")
+
+	session := env.createSessionBead("worker", "worker")
+	committedAt := env.clk.Now().Add(-75 * time.Second).UTC().Format(time.RFC3339)
+	env.setSessionMetadata(&session, map[string]string{
+		"continuation_reset_pending":   "true",
+		sessionpkg.ResetCommittedAtKey: committedAt,
+	})
+
+	cfgNames := configuredSessionNames(env.cfg, "", env.store)
+	reconcileSessionBeads(
+		context.Background(), []beads.Bead{session}, env.desiredState, cfgNames,
+		env.cfg, env.sp, env.store, nil, nil, nil, env.dt, map[string]int{}, false, nil, "",
+		nil, env.clk, rec, 60*time.Second, 0, &env.stdout, &env.stderr,
+	)
+
+	sawResetStalled := false
+	sawCrash := false
+	for _, e := range rec.Events {
+		switch e.Type {
+		case events.SessionResetStalled:
+			sawResetStalled = true
+		case events.SessionCrashed:
+			sawCrash = true
+		}
+	}
+	if !sawResetStalled {
+		t.Fatalf("silent running-but-dead zombie did not emit session.reset_stalled; events=%#v", rec.Events)
+	}
+	if sawCrash {
+		t.Fatalf("empty-pane zombie unexpectedly emitted SessionCrashed (peek was empty); events=%#v", rec.Events)
 	}
 }
 
