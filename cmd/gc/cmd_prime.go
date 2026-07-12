@@ -242,6 +242,10 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 	}
 	resolveRigPaths(cityPath, cfg.Rigs)
 
+	if suppressHookPrompt && startupPromptDeliveredMarkerStale(cityPath) {
+		suppressHookPrompt = false
+	}
+
 	if citySuspended(cfg) {
 		// Suspended is a legitimate quiet state, not a strict failure —
 		// keep hook behavior consistent with non-strict (which already
@@ -553,6 +557,42 @@ func primeHookHasLiveManagedSession(cityPath string) bool {
 	default:
 		return false
 	}
+}
+
+// startupPromptDeliveredMarkerStale reports whether the pane-stamped
+// GC_STARTUP_PROMPT_DELIVERED marker predates the session's current
+// continuation epoch. The marker (and GC_CONTINUATION_EPOCH) is written once
+// into the pane/session environment at pane creation; an in-pane agent
+// restart after a continuation-epoch bump (drain handoff, config-drift reset,
+// crash-loop recovery) re-fires the SessionStart hook with the stale marker
+// still set, which would suppress the prime prompt for a fresh conversation
+// that never received it. A newer epoch on the session bead means the marker
+// belongs to a previous incarnation, so the prompt must be delivered.
+// Fail-safe: any missing value, parse failure, or store error preserves the
+// existing suppression.
+func startupPromptDeliveredMarkerStale(cityPath string) bool {
+	sessionID := strings.TrimSpace(os.Getenv("GC_SESSION_ID"))
+	if sessionID == "" {
+		return false
+	}
+	paneEpoch, err := strconv.Atoi(strings.TrimSpace(os.Getenv("GC_CONTINUATION_EPOCH")))
+	if err != nil {
+		return false
+	}
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		return false
+	}
+	cfg, _ := loadCityConfigWithoutBuiltinPackRefresh(cityPath, io.Discard)
+	info, err := sessionFrontDoor(cliSessionStore(store, cfg, cityPath)).Get(sessionID)
+	if err != nil {
+		return false
+	}
+	beadEpoch, err := strconv.Atoi(strings.TrimSpace(info.ContinuationEpoch))
+	if err != nil {
+		return false
+	}
+	return beadEpoch > paneEpoch
 }
 
 func writePrimePromptWithFormat(stdout io.Writer, cityName, agentName, prompt string, hookMode bool, hookFormat string, suppressPrompt bool, hookContextSuffix string, afterDelivery func()) {
