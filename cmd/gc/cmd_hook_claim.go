@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -22,10 +23,17 @@ var hookClaimMutationTimeout = 10 * time.Second
 type hookClaimOptions struct {
 	Assignee           string
 	IdentityCandidates []string
-	RouteTargets       []string
-	Env                []string
-	DrainAck           bool
-	JSON               bool
+	// SessionIdentities is the session-UNIQUE subset of IdentityCandidates
+	// (GC_SESSION_ID / GC_SESSION_NAME). Adoption of in_progress work matched
+	// only through a shared identity (alias, agent name) must first prove the
+	// current holder is not a different live session (gc-9647d); a candidate
+	// assigned to one of these needs no such proof — no other session ever
+	// answers to them.
+	SessionIdentities []string
+	RouteTargets      []string
+	Env               []string
+	DrainAck          bool
+	JSON              bool
 }
 
 type hookClaimOps struct {
@@ -33,7 +41,23 @@ type hookClaimOps struct {
 	Claim              hookClaimFunc
 	ListContinuation   hookListContinuationFunc
 	AssignContinuation hookAssignContinuationFunc
-	DrainAck           hookDrainAckFunc
+	// Get re-reads one bead after a preassign write so the hook can verify the
+	// assignment durably stuck. The continuation preassign is a raw update with
+	// no store-level CAS, so a concurrent claimant (or another preassigner) can
+	// win the read→write window; the re-read detects the loss instead of
+	// advertising a sibling this session does not durably own (gc-9647d).
+	Get hookGetBeadFunc
+	// ResolveWorkerDir returns the agent process working directory recorded on
+	// the session bead at claim time (worker_dir, gc-9647d). The hook runs as a
+	// subprocess of the agent, so its own cwd is the ground truth the session
+	// registry otherwise never learns. Empty result skips the stamp.
+	ResolveWorkerDir func() string
+	// ListLiveSessions returns the sessions the controller currently considers
+	// live, for the adoption liveness guard (gc-9647d). An error means liveness
+	// is unknowable (controller down, API-less context) — the guard fails open
+	// so dead-holder crash recovery keeps working.
+	ListLiveSessions hookListLiveSessionsFunc
+	DrainAck         hookDrainAckFunc
 	// EmitClaimRejected publishes a bead.claim_rejected event when a claim is
 	// lost to a different live claimant (ADR-0009). Best-effort.
 	EmitClaimRejected hookEmitClaimRejectedFunc
@@ -54,12 +78,31 @@ type (
 	hookClaimFunc                 func(context.Context, string, []string, string, string) (beads.Bead, bool, error)
 	hookListContinuationFunc      func(context.Context, string, []string, string, string) ([]beads.Bead, error)
 	hookAssignContinuationFunc    func(context.Context, string, []string, string, string) error
+	hookGetBeadFunc               func(ctx context.Context, dir string, env []string, beadID string) (beads.Bead, error)
+	hookListLiveSessionsFunc      func() ([]hookLiveSession, error)
 	hookDrainAckFunc              func(io.Writer) error
 	hookEmitClaimRejectedFunc     func(beadID, existingClaimant, attemptedClaimant string)
 	hookResolveWorkBranchFunc     func(dir string) string
 	hookStampWorkBranchFunc       func(ctx context.Context, dir string, env []string, beadID, assignee, branch string) error
-	hookRecordSessionPointersFunc func(ctx context.Context, dir string, env []string, assignee, sessionBeadID, runID, stepID string) error
+	hookRecordSessionPointersFunc func(ctx context.Context, dir string, env []string, assignee, sessionBeadID, runID, stepID, workerDir string) error
 )
+
+// hookLiveSession is the identity triple of one live session, as reported by
+// the controller, that a claim assignee string can answer to.
+type hookLiveSession struct {
+	ID    string
+	Name  string
+	Alias string
+}
+
+// answersTo reports whether identity names this session — its bead id, its
+// runtime session name, or its alias.
+func (s hookLiveSession) answersTo(identity string) bool {
+	return identity != "" &&
+		(identity == strings.TrimSpace(s.ID) ||
+			identity == strings.TrimSpace(s.Name) ||
+			identity == strings.TrimSpace(s.Alias))
+}
 
 type hookClaimJSONResult struct {
 	SchemaVersion        string   `json:"schema_version"`
@@ -112,6 +155,10 @@ func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps,
 func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimOps, stdout, stderr io.Writer) hookClaimResult {
 	opts.Assignee = strings.TrimSpace(opts.Assignee)
 	opts.IdentityCandidates = hookClaimIdentityCandidates(append([]string{opts.Assignee}, opts.IdentityCandidates...)...)
+	// SessionIdentities deliberately gets no Assignee prepend: Assignee can
+	// fall back to a shared identity (alias, agent name) when the session env
+	// is absent, and a shared value here would defeat the liveness guard.
+	opts.SessionIdentities = hookClaimIdentityCandidates(opts.SessionIdentities...)
 	opts.RouteTargets = hookClaimRouteTargets(opts.RouteTargets...)
 	if opts.Assignee == "" {
 		fmt.Fprintln(stderr, "gc hook --claim: assignee not specified (set $GC_SESSION_NAME or $GC_SESSION_ID)") //nolint:errcheck
@@ -147,7 +194,7 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 		return hookClaimResult{}
 	}
 
-	if result, bead, ok := hookClaimExistingOrAssigned(candidates, *opts); ok {
+	if result, bead, ok := hookClaimExistingOrAssigned(candidates, *opts, *ops, stderr); ok {
 		return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, bead, *opts, *ops, dir, stdout, stderr)}
 	}
 
@@ -166,6 +213,15 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.AssignContinuation == nil {
 		ops.AssignContinuation = hookAssignContinuationWithBdStore
+	}
+	if ops.Get == nil {
+		ops.Get = hookGetBeadWithBdStore
+	}
+	if ops.ResolveWorkerDir == nil {
+		ops.ResolveWorkerDir = hookResolveWorkerDir
+	}
+	if ops.ListLiveSessions == nil {
+		ops.ListLiveSessions = hookListLiveSessionsViaAPI
 	}
 	if ops.DrainAck == nil {
 		ops.DrainAck = hookRuntimeDrainAck
@@ -271,10 +327,13 @@ func reportHookClaimRejected(candidate, claimed beads.Bead, opts hookClaimOption
 	ops.EmitClaimRejected(candidate.ID, existing, opts.Assignee)
 }
 
-func hookClaimExistingOrAssigned(candidates []beads.Bead, opts hookClaimOptions) (hookClaimJSONResult, beads.Bead, bool) {
+func hookClaimExistingOrAssigned(candidates []beads.Bead, opts hookClaimOptions, ops hookClaimOps, stderr io.Writer) (hookClaimJSONResult, beads.Bead, bool) {
 	for _, candidate := range candidates {
 		if strings.EqualFold(strings.TrimSpace(candidate.Status), "in_progress") &&
 			hookClaimHasIdentity(candidate.Assignee, opts.IdentityCandidates) {
+			if !hookAdoptionAllowed(candidate, opts, ops, stderr) {
+				continue
+			}
 			result := hookClaimJSONResult{
 				SchemaVersion: "1",
 				OK:            true,
@@ -307,10 +366,44 @@ func hookClaimExistingOrAssigned(candidates []beads.Bead, opts hookClaimOptions)
 	return hookClaimJSONResult{}, beads.Bead{}, false
 }
 
+// hookAdoptionAllowed reports whether an identity-matched in_progress
+// candidate may be adopted. Adoption is a pure identity-string match with no
+// store-level CAS, so a shared identity (alias, agent name — anything beyond
+// GC_SESSION_ID/GC_SESSION_NAME) lets a second live session adopt work the
+// first is still executing: the gc-9647d duplicate-dispatch vector. The guard
+// consults the controller's live-session set and refuses when a DIFFERENT
+// live session answers to the candidate's assignee; a dead holder adopts as
+// before (crash recovery), and a lookup failure fails open — an unreachable
+// controller must not strand recovery in API-less contexts.
+func hookAdoptionAllowed(candidate beads.Bead, opts hookClaimOptions, ops hookClaimOps, stderr io.Writer) bool {
+	if hookClaimHasIdentity(candidate.Assignee, opts.SessionIdentities) {
+		return true
+	}
+	sessions, err := ops.ListLiveSessions()
+	if err != nil {
+		return true
+	}
+	assignee := strings.TrimSpace(candidate.Assignee)
+	for _, session := range sessions {
+		if !session.answersTo(assignee) {
+			continue
+		}
+		if hookClaimHasIdentity(session.ID, opts.SessionIdentities) ||
+			hookClaimHasIdentity(session.Name, opts.SessionIdentities) {
+			continue // the answering live session is this one
+		}
+		fmt.Fprintf(stderr, "gc hook --claim: refusing to adopt %s: assignee %q answers to live session %s\n", //nolint:errcheck
+			candidate.ID, assignee, strings.TrimSpace(session.ID))
+		ops.EmitClaimRejected(candidate.ID, assignee, opts.Assignee)
+		return false
+	}
+	return true
+}
+
 func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stdout, stderr io.Writer) int {
 	stampHookWorkBranch(bead, opts, ops, dir, stderr)
 	recordHookClaimSessionPointers(bead, opts, ops, dir, stderr)
-	assigned, err := preassignHookContinuationGroup(bead, opts, ops, dir)
+	assigned, err := preassignHookContinuationGroup(bead, opts, ops, dir, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc hook --claim: preassigning continuation group for %s: %v\n", bead.ID, err) //nolint:errcheck
 		return 1
@@ -363,7 +456,7 @@ func writeHookClaimNoWork(opts hookClaimOptions, ops hookClaimOps, claimsErrored
 	return 1
 }
 
-func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string) ([]string, error) {
+func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stderr io.Writer) ([]string, error) {
 	rootID := strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
 	group := strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey])
 	if rootID == "" || group == "" {
@@ -387,9 +480,50 @@ func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops 
 		if err := ops.AssignContinuation(ctx, dir, opts.Env, sibling.ID, opts.Assignee); err != nil {
 			return assigned, fmt.Errorf("assigning %s: %w", sibling.ID, err)
 		}
+		if !verifyHookPreassignStuck(ctx, sibling, opts, ops, dir, stderr) {
+			continue
+		}
 		assigned = append(assigned, sibling.ID)
 	}
 	return assigned, nil
+}
+
+// verifyHookPreassignStuck re-reads a just-preassigned sibling and reports
+// whether this session durably owns it. The preassign is a raw assignee update
+// with no store-level CAS, so the open+unassigned check above can go stale in
+// the read→write window (gc-9647d duplicate dispatch):
+//
+//   - Re-read fails: ownership is unprovable — do not advertise the sibling;
+//     the durable state wins on the next hook either way.
+//   - Assignee is someone else: a later writer overwrote us — report the lost
+//     race (bead.claim_rejected, ADR-0009) and skip.
+//   - Assignee is us but status is no longer open: our write overwrote a claim
+//     that landed inside the window (the claimant's bd --claim flipped status
+//     before our raw update replaced its assignee). Repair by clearing the
+//     assignee so the true claimant's next hook re-establishes ownership via
+//     the unassigned-in_progress recovery path, and skip.
+//
+// Verification failures never fail the primary claim: the claimed bead itself
+// was won through the store's atomic claim, only the sibling advertisement is
+// withheld.
+func verifyHookPreassignStuck(ctx context.Context, sibling beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stderr io.Writer) bool {
+	current, err := ops.Get(ctx, dir, opts.Env, sibling.ID)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc hook --claim: verifying preassign of %s: %v (not advertising)\n", sibling.ID, err) //nolint:errcheck
+		return false
+	}
+	if !hookClaimHasIdentity(current.Assignee, []string{opts.Assignee}) {
+		reportHookClaimRejected(sibling, current, opts, ops)
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(current.Status), "open") {
+		if err := ops.AssignContinuation(ctx, dir, opts.Env, sibling.ID, ""); err != nil {
+			fmt.Fprintf(stderr, "gc hook --claim: releasing stomped claim on %s: %v\n", sibling.ID, err) //nolint:errcheck
+		}
+		fmt.Fprintf(stderr, "gc hook --claim: preassign of %s overwrote a concurrent claim (status %s); released\n", sibling.ID, current.Status) //nolint:errcheck
+		return false
+	}
+	return true
 }
 
 func hookClaimWithBdStore(_ context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, bool, error) {
@@ -476,19 +610,87 @@ func recordHookClaimSessionPointers(bead beads.Bead, opts hookClaimOptions, ops 
 	// work has no formula step (ad-hoc/manual) — which clears any prior step.
 	runID := beadmeta.ResolveRunID(bead.Metadata, bead.ID, sessionBeadID)
 	stepID := strings.TrimSpace(bead.Metadata[beadmeta.StepIDMetadataKey])
+	workerDir := strings.TrimSpace(ops.ResolveWorkerDir())
 	ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
 	defer cancel()
-	if err := ops.RecordSessionPointers(ctx, dir, opts.Env, opts.Assignee, sessionBeadID, runID, stepID); err != nil {
+	if err := ops.RecordSessionPointers(ctx, dir, opts.Env, opts.Assignee, sessionBeadID, runID, stepID, workerDir); err != nil {
 		fmt.Fprintf(stderr, "gc hook --claim: recording session pointers on session bead %s: %v\n", sessionBeadID, err) //nolint:errcheck
 	}
 }
 
-func hookRecordSessionPointersWithBdStore(ctx context.Context, dir string, env []string, assignee, sessionBeadID, runID, stepID string) error {
+func hookRecordSessionPointersWithBdStore(ctx context.Context, dir string, env []string, assignee, sessionBeadID, runID, stepID, workerDir string) error {
 	store := hookClaimBdStoreContext(ctx, dir, env, assignee)
-	return store.Update(sessionBeadID, beads.UpdateOpts{Metadata: map[string]string{
+	metadata := map[string]string{
 		beadmeta.CurrentRunIDMetadataKey:   runID,
 		beadmeta.ActiveWorkBeadMetadataKey: stepID,
-	}})
+	}
+	// worker_dir is the claim-time ground truth of where the agent process
+	// actually runs (gc-9647d): the hook is an agent subprocess, so its cwd is
+	// the agent's cwd, refreshed on every claim. Empty (Getwd failure) skips
+	// the key so a prior true value is never clobbered with emptiness.
+	if workerDir != "" {
+		metadata[beadmeta.WorkerDirMetadataKey] = workerDir
+	}
+	return store.Update(sessionBeadID, beads.UpdateOpts{Metadata: metadata})
+}
+
+// hookResolveWorkerDir returns the hook process working directory — the agent's
+// own cwd, since gc hook runs as an agent subprocess with no chdir. Empty on
+// resolution failure.
+func hookResolveWorkerDir() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(wd)
+}
+
+// hookGetBeadWithBdStore re-reads one bead for post-write claim verification.
+// The read is actorless — it must observe the store's durable state, not this
+// session's write intent.
+func hookGetBeadWithBdStore(ctx context.Context, dir string, env []string, beadID string) (beads.Bead, error) {
+	return hookClaimBdStoreContext(ctx, dir, env, "").Get(beadID)
+}
+
+// hookSessionStateTerminal reports whether a controller-reported session state
+// means the session can never act on its work again. Only these states count
+// as dead for the adoption liveness guard; anything else — including states
+// this binary does not know yet — is treated as live, so an unknown state
+// strands work visibly rather than manufacturing a duplicate dispatch.
+func hookSessionStateTerminal(state string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "closed", "closing", "drained", "stopped", "archived", "orphaned", "failed-create":
+		return true
+	default:
+		return false
+	}
+}
+
+// hookListLiveSessionsViaAPI resolves the controller's current non-terminal
+// session set for the adoption liveness guard (gc-9647d). It errors when no
+// controller API is reachable — the guard fails open on error, preserving
+// dead-holder crash recovery in API-less contexts.
+func hookListLiveSessionsViaAPI() ([]hookLiveSession, error) {
+	cityPath, err := resolveCity()
+	if err != nil {
+		return nil, err
+	}
+	client := apiClient(cityPath)
+	if client == nil {
+		return nil, fmt.Errorf("controller API unavailable: %s", apiClientFallbackReason(cityPath))
+	}
+	list, err := client.ListSessions("", "", false)
+	if err != nil {
+		return nil, err
+	}
+	sessions := make([]hookLiveSession, 0, len(list.Body))
+	for _, view := range list.Body {
+		if hookSessionStateTerminal(view.State) {
+			continue
+		}
+		sessions = append(sessions, hookLiveSession{ID: view.ID, Name: view.SessionName, Alias: view.Alias})
+	}
+	return sessions, nil
 }
 
 // hookClaimSessionID returns the session bead id (GC_SESSION_ID) from the claim

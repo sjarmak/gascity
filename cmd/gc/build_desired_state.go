@@ -4050,7 +4050,8 @@ func stampRunSessionIdentity(workBeads []beads.Bead, workStores []beads.Store, s
 		if sessionName != "" && strings.TrimSpace(wb.Metadata[beadmeta.SessionNameMetadataKey]) != sessionName {
 			patch[beadmeta.SessionNameMetadataKey] = sessionName
 		}
-		if workDir != "" && strings.TrimSpace(wb.Metadata[beadmeta.WorkDirMetadataKey]) != workDir {
+		if workDir != "" && strings.TrimSpace(wb.Metadata[beadmeta.WorkDirMetadataKey]) != workDir &&
+			!worktreeRecordedWorkDir(wb.Metadata) {
 			patch[beadmeta.WorkDirMetadataKey] = workDir
 		}
 		if len(patch) > 0 {
@@ -4065,6 +4066,20 @@ func stampRunSessionIdentity(workBeads []beads.Bead, workStores []beads.Store, s
 		// worked step back-fills its root via gc.root_bead_id. (#2843)
 		stampRunRootFromStep(store, wb, sessionName, workDir, stampedRoots, stderr)
 	}
+}
+
+// worktreeRecordedWorkDir reports whether a bead's gc.work_dir records the
+// bead's actual created worktree rather than a session-derived guess: the
+// worktree-creating step stamps BOTH gc.work_dir and the legacy work_dir key
+// with the created path, so agreement between the two marks the value as the
+// durable worktree record. The session-identity stamp must not overwrite it —
+// the close gate reads gc.work_dir as the repo dir holding gc.work_branch,
+// and clobbering it with the session home was one leg of the gc-9647d
+// metadata self-disagreement incident. A bead without the legacy key (or with
+// diverged keys) keeps today's refresh-from-session behavior.
+func worktreeRecordedWorkDir(meta map[string]string) bool {
+	canonical := strings.TrimSpace(meta[beadmeta.WorkDirMetadataKey])
+	return canonical != "" && canonical == strings.TrimSpace(meta[beadmeta.LegacyWorkDirMetadataKey])
 }
 
 // stampRunRootFromStep copies a step's resolved session_name/work_dir onto its
@@ -4091,7 +4106,8 @@ func stampRunRootFromStep(store beads.Store, step beads.Bead, sessionName, workD
 	if sessionName != "" && strings.TrimSpace(root.Metadata[beadmeta.SessionNameMetadataKey]) != sessionName {
 		patch[beadmeta.SessionNameMetadataKey] = sessionName
 	}
-	if workDir != "" && strings.TrimSpace(root.Metadata[beadmeta.WorkDirMetadataKey]) != workDir {
+	if workDir != "" && strings.TrimSpace(root.Metadata[beadmeta.WorkDirMetadataKey]) != workDir &&
+		!worktreeRecordedWorkDir(root.Metadata) {
 		patch[beadmeta.WorkDirMetadataKey] = workDir
 	}
 	if len(patch) == 0 {

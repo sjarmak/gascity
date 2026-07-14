@@ -96,11 +96,25 @@ if [ -z "$WORK_BEAD_ID" ]; then
   echo "mol-scoped-work requires an input convoy with exactly one tracked member" >&2
   exit 1
 fi
-WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // empty')
+WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata["gc.work_dir"] // .[0].metadata.work_dir // empty')
 if [ -z "$WORKTREE" ]; then
-  WORKTREE_PATH=$(pwd)/worktrees/"$WORK_BEAD_ID"
+  # Anchor on the session spawn dir (GC_DIR), never the step cwd: a reused
+  # session's cwd drifts into whatever worktree the previous bead used, which
+  # nested worktrees inside worktrees (gc-9647d). If the anchor is itself a
+  # git worktree, place the new one beside that worktree's toplevel instead of
+  # inside it.
+  ANCHOR="${GC_DIR:-$(pwd)}"
+  if TOPLEVEL=$(git -C "$ANCHOR" rev-parse --show-toplevel 2>/dev/null); then
+    BASE_DIR=$(dirname "$TOPLEVEL")
+  else
+    BASE_DIR="$ANCHOR"
+  fi
+  WORKTREE_PATH="$BASE_DIR"/worktrees/"$WORK_BEAD_ID"
   git worktree add "$WORKTREE_PATH" --detach origin/{{base_branch}}
-  gc bd update "$WORK_BEAD_ID" --set-metadata work_dir="$WORKTREE_PATH"
+  # Stamp BOTH work-dir keys with the created path so the canonical key and
+  # the legacy key can never disagree about where this bead's worktree lives
+  # (gc-9647d metadata self-disagreement).
+  gc bd update "$WORK_BEAD_ID" --set-metadata gc.work_dir="$WORKTREE_PATH" --set-metadata work_dir="$WORKTREE_PATH"
   WORKTREE="$WORKTREE_PATH"
 fi
 cd "$WORKTREE"
@@ -202,11 +216,11 @@ if [ -z "$WORK_BEAD_ID" ]; then
   echo "mol-scoped-work requires an input convoy with exactly one tracked member" >&2
   exit 1
 fi
-WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // empty')
+WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata["gc.work_dir"] // .[0].metadata.work_dir // empty')
 if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
   git worktree remove --force "$WORKTREE" || rm -rf "$WORKTREE"
 fi
-gc bd update "$WORK_BEAD_ID" --unset-metadata work_dir
+gc bd update "$WORK_BEAD_ID" --unset-metadata gc.work_dir --unset-metadata work_dir
 ```
 """
 metadata = { "gc.kind" = "cleanup", "gc.scope_ref" = "body", "gc.scope_role" = "teardown" }

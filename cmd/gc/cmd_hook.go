@@ -442,10 +442,14 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 				alias,
 				agentForQuery,
 			),
-			RouteTargets: hookClaimRouteTargets(hookClaimPrimaryRouteTarget(&a), resolvedAgentName, strings.TrimSpace(overrides["GC_TEMPLATE"])),
-			Env:          queryEnv,
-			DrainAck:     opts.DrainAck,
-			JSON:         opts.JSON,
+			// SessionIdentities is the session-UNIQUE subset: adoption of
+			// in_progress work matched only through the shared identities above
+			// (alias, agent name) must first pass the liveness guard (gc-9647d).
+			SessionIdentities: hookClaimIdentityCandidates(sessionID, sessionName),
+			RouteTargets:      hookClaimRouteTargets(hookClaimPrimaryRouteTarget(&a), resolvedAgentName, strings.TrimSpace(overrides["GC_TEMPLATE"])),
+			Env:               queryEnv,
+			DrainAck:          opts.DrainAck,
+			JSON:              opts.JSON,
 		}
 		return claimHookWork(workQuery, workDir, queryEnv, stores, claimOpts, emitQueryFailure, stdout, stderr)
 	}

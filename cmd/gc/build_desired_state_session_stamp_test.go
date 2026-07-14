@@ -204,6 +204,65 @@ func TestStampRunSessionIdentityReassignmentRestamps(t *testing.T) {
 	}
 }
 
+func TestStampRunSessionIdentityPreservesWorktreeRecordedWorkDir(t *testing.T) {
+	// gc-9647d: a work bead whose gc.work_dir agrees with its legacy work_dir
+	// records the bead's actual created worktree (the formula stamps both keys
+	// with the created path). The reconciler's session copy must not clobber
+	// that with the session's home dir — the close gate reads gc.work_dir as
+	// the repo dir holding gc.work_branch. session_name still refreshes.
+	const worktree = "/home/ds/gascity-worktrees/polecat/worktrees/gc-lc3g4"
+	run := beads.Bead{
+		ID: "co-run3", Type: "molecule", Status: "in_progress", Assignee: "worker-b",
+		Metadata: map[string]string{
+			"gc.session_name": "worker-a",
+			"gc.work_dir":     worktree,
+			"work_dir":        worktree,
+		},
+	}
+	mem := beads.NewMemStoreFrom(0, []beads.Bead{run}, nil)
+	store := &countingStore{Store: mem}
+	sessions := newSessionBeadSnapshot([]beads.Bead{stampTestSession("worker-b", "/home/ds/gascity-worktrees/polecat/gc-jlt8c")})
+
+	stampRunSessionIdentity([]beads.Bead{run}, []beads.Store{store}, sessions, io.Discard)
+
+	got, _ := mem.Get("co-run3")
+	if got.Metadata["gc.session_name"] != "worker-b" {
+		t.Errorf("gc.session_name = %q, want worker-b (identity must refresh)", got.Metadata["gc.session_name"])
+	}
+	if got.Metadata["gc.work_dir"] != worktree {
+		t.Errorf("gc.work_dir = %q, want %q (worktree-recorded path must not be clobbered)", got.Metadata["gc.work_dir"], worktree)
+	}
+}
+
+func TestStampRunRootFromStepPreservesWorktreeRecordedWorkDir(t *testing.T) {
+	// Root-propagation analog of the worktree-recorded guard: a root whose
+	// gc.work_dir agrees with its legacy work_dir keeps it; session_name
+	// still propagates from the worked step.
+	const worktree = "/home/ds/gascity-worktrees/polecat/worktrees/gc-lc3g4"
+	root := beads.Bead{
+		ID: "gpk-root2", Type: "molecule", Status: "in_progress",
+		Metadata: map[string]string{
+			"gc.kind":     "workflow",
+			"gc.work_dir": worktree,
+			"work_dir":    worktree,
+		},
+	}
+	step := beads.Bead{ID: "gpk-step2", Type: "step", Status: "in_progress", Assignee: "worker-b", Metadata: map[string]string{"gc.root_bead_id": "gpk-root2"}}
+	mem := beads.NewMemStoreFrom(0, []beads.Bead{root, step}, nil)
+	store := &countingStore{Store: mem}
+	sessions := newSessionBeadSnapshot([]beads.Bead{stampTestSession("worker-b", "/home/ds/gascity-worktrees/polecat/gc-jlt8c")})
+
+	stampRunSessionIdentity([]beads.Bead{step}, []beads.Store{store}, sessions, io.Discard)
+
+	gotRoot, _ := mem.Get("gpk-root2")
+	if gotRoot.Metadata["gc.session_name"] != "worker-b" {
+		t.Errorf("root gc.session_name = %q, want worker-b", gotRoot.Metadata["gc.session_name"])
+	}
+	if gotRoot.Metadata["gc.work_dir"] != worktree {
+		t.Errorf("root gc.work_dir = %q, want %q (worktree-recorded path must not be clobbered)", gotRoot.Metadata["gc.work_dir"], worktree)
+	}
+}
+
 func TestStampRunSessionIdentitySkipsNonExecuting(t *testing.T) {
 	sessions := newSessionBeadSnapshot([]beads.Bead{stampTestSession("worker-x", "/wd")})
 

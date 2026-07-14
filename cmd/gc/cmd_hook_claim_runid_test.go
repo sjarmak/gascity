@@ -11,22 +11,23 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 )
 
-// recordRunIDSpy captures the (assignee, sessionBeadID, runID, stepID) a claim
-// records in one update, and lets a test inject a write error to prove the
+// recordRunIDSpy captures the (assignee, sessionBeadID, runID, stepID, workerDir)
+// a claim records in one update, and lets a test inject a write error to prove the
 // decoration never fails the claim. assignee is captured to pin actor parity with
 // the work_branch stamp.
 type recordRunIDSpy struct {
-	calls    int
-	assignee string
-	session  string
-	runID    string
-	stepID   string
-	err      error
+	calls     int
+	assignee  string
+	session   string
+	runID     string
+	stepID    string
+	workerDir string
+	err       error
 }
 
-func (s *recordRunIDSpy) fn(_ context.Context, _ string, _ []string, assignee, sessionBeadID, runID, stepID string) error {
+func (s *recordRunIDSpy) fn(_ context.Context, _ string, _ []string, assignee, sessionBeadID, runID, stepID, workerDir string) error {
 	s.calls++
-	s.assignee, s.session, s.runID, s.stepID = assignee, sessionBeadID, runID, stepID
+	s.assignee, s.session, s.runID, s.stepID, s.workerDir = assignee, sessionBeadID, runID, stepID, workerDir
 	return s.err
 }
 
@@ -42,6 +43,7 @@ func claimOpsForRunID(beadID string, claimedMeta map[string]string, spy *recordR
 			return beads.Bead{ID: id, Status: "in_progress", Assignee: assignee, Metadata: claimedMeta}, true, nil
 		},
 		ResolveWorkBranch:     func(string) string { return "" }, // suppress work_branch stamp
+		ResolveWorkerDir:      func() string { return "/agent/cwd" },
 		RecordSessionPointers: spy.fn,
 	}
 	opts := hookClaimOptions{
@@ -52,6 +54,47 @@ func claimOpsForRunID(beadID string, claimedMeta map[string]string, spy *recordR
 		JSON:               true,
 	}
 	return ops, opts
+}
+
+// TestDoHookClaimRecordsWorkerDirOnSessionBead: the claim-time session-pointer
+// update also records the agent process cwd as worker_dir (gc-9647d) — the
+// first ground-truth writer of the canonical agent-cwd key, so the session
+// registry reflects where the agent actually operates rather than only the
+// spawn-time template path.
+func TestDoHookClaimRecordsWorkerDirOnSessionBead(t *testing.T) {
+	spy := &recordRunIDSpy{}
+	ops, opts := claimOpsForRunID("hw-cwd", map[string]string{
+		"gc.routed_to": "worker",
+	}, spy)
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if spy.calls != 1 || spy.workerDir != "/agent/cwd" {
+		t.Fatalf("record = {calls:%d workerDir:%q}, want {1 /agent/cwd}", spy.calls, spy.workerDir)
+	}
+}
+
+// TestDoHookClaimWorkerDirResolutionFailureStillRecordsPointers: an empty
+// worker-dir resolution (Getwd failure) records the run/step pointers with an
+// empty workerDir — the store layer skips the key so a stale-but-true prior
+// value is never clobbered with emptiness, and the claim never fails.
+func TestDoHookClaimWorkerDirResolutionFailureStillRecordsPointers(t *testing.T) {
+	spy := &recordRunIDSpy{}
+	ops, opts := claimOpsForRunID("hw-nocwd", map[string]string{
+		"gc.routed_to":    "worker",
+		"gc.root_bead_id": "root-R1",
+	}, spy)
+	ops.ResolveWorkerDir = func() string { return "" }
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if spy.calls != 1 || spy.runID != "root-R1" || spy.workerDir != "" {
+		t.Fatalf("record = {calls:%d runID:%q workerDir:%q}, want {1 root-R1 \"\"}", spy.calls, spy.runID, spy.workerDir)
+	}
 }
 
 // TestDoHookClaimRecordsRunIDFromRunChain: a claimed run bead stamps the session

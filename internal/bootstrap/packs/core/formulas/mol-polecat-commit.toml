@@ -55,9 +55,10 @@ fi
 
 **2. Ensure worktree exists.**
 
-Check if `metadata.work_dir` already records your worktree path:
+Check if the bead already records your worktree path (canonical key first,
+legacy fallback):
 ```bash
-WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // empty')
+WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata["gc.work_dir"] // .[0].metadata.work_dir // empty')
 ```
 
 **If worktree path exists in metadata** — reuse it:
@@ -67,15 +68,27 @@ git pull --rebase origin {{base_branch}}  # Catch up to latest
 ```
 If the directory is missing, fall through to create a new one.
 
-**If no worktree** — create one:
+**If no worktree** — create one. Anchor on the session spawn dir (GC_DIR),
+never the step cwd: a reused session's cwd drifts into whatever worktree the
+previous bead used, which nested worktrees inside worktrees (gc-9647d). If
+the anchor is itself a git worktree, place the new one beside that worktree's
+toplevel instead of inside it:
 ```bash
-WORKTREE_PATH=$(pwd)/worktrees/"$WORK_BEAD_ID"
+ANCHOR="${GC_DIR:-$(pwd)}"
+if TOPLEVEL=$(git -C "$ANCHOR" rev-parse --show-toplevel 2>/dev/null); then
+  BASE_DIR=$(dirname "$TOPLEVEL")
+else
+  BASE_DIR="$ANCHOR"
+fi
+WORKTREE_PATH="$BASE_DIR"/worktrees/"$WORK_BEAD_ID"
 git worktree add "$WORKTREE_PATH" --detach origin/{{base_branch}}
 cd "$WORKTREE_PATH"
 ```
-Record immediately so restarts and witness recovery can find it:
+Record immediately so restarts and witness recovery can find it — BOTH
+work-dir keys get the created path so they can never disagree (gc-9647d
+metadata self-disagreement):
 ```bash
-gc bd update "$WORK_BEAD_ID" --set-metadata work_dir="$WORKTREE_PATH"
+gc bd update "$WORK_BEAD_ID" --set-metadata gc.work_dir="$WORKTREE_PATH" --set-metadata work_dir="$WORKTREE_PATH"
 ```
 
 **3. Ensure clean working state:**
@@ -138,7 +151,7 @@ done
 WORKTREE_PATH=$(pwd)
 cd ..
 git worktree remove "$WORKTREE_PATH" --force
-gc bd update "$WORK_BEAD_ID" --unset-metadata work_dir
+gc bd update "$WORK_BEAD_ID" --unset-metadata gc.work_dir --unset-metadata work_dir
 ```
 
 **4. Close the bead:**

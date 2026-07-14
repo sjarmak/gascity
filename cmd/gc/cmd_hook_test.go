@@ -909,6 +909,10 @@ func TestDoHookClaimPreassignsContinuationGroupSiblings(t *testing.T) {
 			assigned = append(assigned, beadID+"="+assignee)
 			return nil
 		},
+		Get: func(_ context.Context, _ string, _ []string, beadID string) (beads.Bead, error) {
+			// Post-write verify (gc-9647d): the write stuck — assigned to us, still open.
+			return beads.Bead{ID: beadID, Status: "open", Assignee: "worker-1"}, nil
+		},
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -931,6 +935,303 @@ func TestDoHookClaimPreassignsContinuationGroupSiblings(t *testing.T) {
 	}
 	if got := strings.Join(result.ContinuationAssigned, ","); got != "hw-4" {
 		t.Fatalf("continuation assigned in result = %q, want hw-4", got)
+	}
+}
+
+// preassignRaceOps builds the claim seam for the gc-9647d preassign TOCTOU
+// tests: one claimed bead (hw-3) in continuation group "body" with one open
+// unassigned sibling (hw-4), the post-write re-read (Get) injected per case.
+func preassignRaceOps(get hookGetBeadFunc, assigned *[]string, rejected *[]string) hookClaimOps {
+	return hookClaimOps{
+		Runner: func(string, string) (string, error) {
+			return `[{"id":"hw-3","status":"open","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}}]`, nil
+		},
+		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
+			return beads.Bead{
+				ID:       beadID,
+				Status:   "in_progress",
+				Assignee: assignee,
+				Metadata: map[string]string{
+					"gc.routed_to":          "worker",
+					"gc.root_bead_id":       "root-1",
+					"gc.continuation_group": "body",
+				},
+			}, true, nil
+		},
+		ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
+			return []beads.Bead{
+				{ID: "hw-4", Status: "open", Metadata: map[string]string{"gc.routed_to": "worker"}},
+			}, nil
+		},
+		AssignContinuation: func(_ context.Context, _ string, _ []string, beadID, assignee string) error {
+			*assigned = append(*assigned, beadID+"="+assignee)
+			return nil
+		},
+		Get: get,
+		EmitClaimRejected: func(beadID, existing, attempted string) {
+			*rejected = append(*rejected, beadID+":"+existing+"->"+attempted)
+		},
+	}
+}
+
+func preassignRaceOpts() hookClaimOptions {
+	return hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"worker"},
+		JSON:               true,
+	}
+}
+
+// TestDoHookClaimPreassignDropsSiblingLostToOtherWriter: the raw preassign
+// write raced another writer and the re-read shows a different assignee — the
+// sibling must NOT be advertised in ContinuationAssigned, and the loss is
+// surfaced as a bead.claim_rejected event (gc-9647d duplicate-dispatch guard).
+func TestDoHookClaimPreassignDropsSiblingLostToOtherWriter(t *testing.T) {
+	var assigned, rejected []string
+	ops := preassignRaceOps(func(_ context.Context, _ string, _ []string, beadID string) (beads.Bead, error) {
+		return beads.Bead{ID: beadID, Status: "open", Assignee: "other-session"}, nil
+	}, &assigned, &rejected)
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/tmp/work", preassignRaceOpts(), ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0 (lost preassign must not fail the claim); stderr=%s", code, stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if len(result.ContinuationAssigned) != 0 {
+		t.Fatalf("ContinuationAssigned = %v, want empty (sibling lost to other-session)", result.ContinuationAssigned)
+	}
+	if got := strings.Join(rejected, ","); got != "hw-4:other-session->worker-1" {
+		t.Fatalf("claim_rejected events = %q, want hw-4:other-session->worker-1", got)
+	}
+}
+
+// TestDoHookClaimPreassignRepairsStompedLiveClaim: the re-read shows OUR
+// assignee but status already in_progress — the raw write overwrote a claim
+// that landed inside the read→write window. The hook must release its stamp
+// (clear the assignee) and not advertise the sibling, so the true claimant's
+// next hook can re-establish ownership (gc-9647d worktree-cross-contamination
+// setup).
+func TestDoHookClaimPreassignRepairsStompedLiveClaim(t *testing.T) {
+	var assigned, rejected []string
+	ops := preassignRaceOps(func(_ context.Context, _ string, _ []string, beadID string) (beads.Bead, error) {
+		return beads.Bead{ID: beadID, Status: "in_progress", Assignee: "worker-1"}, nil
+	}, &assigned, &rejected)
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/tmp/work", preassignRaceOpts(), ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0 (repair must not fail the claim); stderr=%s", code, stderr.String())
+	}
+	if got := strings.Join(assigned, ","); got != "hw-4=worker-1,hw-4=" {
+		t.Fatalf("assign calls = %q, want preassign then clearing repair (hw-4=worker-1,hw-4=)", got)
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if len(result.ContinuationAssigned) != 0 {
+		t.Fatalf("ContinuationAssigned = %v, want empty (stomped claim repaired)", result.ContinuationAssigned)
+	}
+	if !strings.Contains(stderr.String(), "hw-4") {
+		t.Fatalf("stderr = %q, want stomped-claim repair note mentioning hw-4", stderr.String())
+	}
+}
+
+// TestDoHookClaimPreassignVerifyErrorSkipsAdvertising: when the post-write
+// re-read fails, the hook cannot prove the assignment stuck, so the sibling is
+// not advertised — but the primary claim still succeeds.
+func TestDoHookClaimPreassignVerifyErrorSkipsAdvertising(t *testing.T) {
+	var assigned, rejected []string
+	ops := preassignRaceOps(func(context.Context, string, []string, string) (beads.Bead, error) {
+		return beads.Bead{}, fmt.Errorf("dolt boom")
+	}, &assigned, &rejected)
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/tmp/work", preassignRaceOpts(), ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0 (verify error must not fail the claim); stderr=%s", code, stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if len(result.ContinuationAssigned) != 0 {
+		t.Fatalf("ContinuationAssigned = %v, want empty (unverified preassign)", result.ContinuationAssigned)
+	}
+	if len(rejected) != 0 {
+		t.Fatalf("claim_rejected events = %v, want none for a verify error", rejected)
+	}
+}
+
+// adoptionLivenessOps builds the claim seam for the gc-9647d adoption
+// liveness-guard tests: one in_progress candidate assigned to assignee, with
+// the live-session lookup injected per case.
+func adoptionLivenessOps(assignee string, list hookListLiveSessionsFunc, rejected *[]string) hookClaimOps {
+	return hookClaimOps{
+		Runner: func(string, string) (string, error) {
+			return fmt.Sprintf(`[{"id":"hw-adopt","status":"in_progress","assignee":%q,"metadata":{"gc.routed_to":"worker"}}]`, assignee), nil
+		},
+		ListLiveSessions: list,
+		EmitClaimRejected: func(beadID, existing, attempted string) {
+			*rejected = append(*rejected, beadID+":"+existing+"->"+attempted)
+		},
+	}
+}
+
+// adoptionLivenessOpts models a suffixed pool worker whose identity set still
+// carries a shared identity ("builder" — an alias or agent name other
+// sessions can also answer to) alongside its session-unique pair.
+func adoptionLivenessOpts() hookClaimOptions {
+	return hookClaimOptions{
+		Assignee:           "builder-1",
+		IdentityCandidates: []string{"builder-1", "session-1", "builder"},
+		SessionIdentities:  []string{"session-1", "builder-1"},
+		RouteTargets:       []string{"worker"},
+		JSON:               true,
+	}
+}
+
+// TestDoHookClaimAdoptionRefusedWhenDifferentLiveSessionAnswersToIdentity: an
+// in_progress candidate matched only through a shared identity must NOT be
+// adopted while a DIFFERENT live session answers to that identity — adoption
+// without a liveness check is the gc-9647d duplicate-dispatch vector (two live
+// polecats working one bead). The refusal drains no_work and surfaces a
+// bead.claim_rejected event.
+func TestDoHookClaimAdoptionRefusedWhenDifferentLiveSessionAnswersToIdentity(t *testing.T) {
+	var rejected []string
+	ops := adoptionLivenessOps("builder", func() ([]hookLiveSession, error) {
+		return []hookLiveSession{{ID: "session-2", Name: "builder-2", Alias: "builder"}}, nil
+	}, &rejected)
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/tmp/work", adoptionLivenessOpts(), ops, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("doHookClaim = %d, want 1 (drain after refused adoption); stderr=%s", code, stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if result.Action != "drain" {
+		t.Fatalf("Action = %q (reason %q), want drain (adoption must be refused)", result.Action, result.Reason)
+	}
+	if got := strings.Join(rejected, ","); got != "hw-adopt:builder->builder-1" {
+		t.Fatalf("claim_rejected events = %q, want hw-adopt:builder->builder-1", got)
+	}
+	if !strings.Contains(stderr.String(), "hw-adopt") {
+		t.Fatalf("stderr = %q, want refusal note mentioning hw-adopt", stderr.String())
+	}
+}
+
+// TestDoHookClaimAdoptionProceedsWhenHolderSessionDead: no live session
+// answers to the candidate's assignee identity — the holder crashed or was
+// reaped — so adoption proceeds (crash recovery preserved).
+func TestDoHookClaimAdoptionProceedsWhenHolderSessionDead(t *testing.T) {
+	var rejected []string
+	ops := adoptionLivenessOps("builder", func() ([]hookLiveSession, error) {
+		return []hookLiveSession{{ID: "session-9", Name: "unrelated-9", Alias: "unrelated"}}, nil
+	}, &rejected)
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/tmp/work", adoptionLivenessOpts(), ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0 (dead holder adoption); stderr=%s", code, stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if result.Reason != "existing_assignment" || result.BeadID != "hw-adopt" {
+		t.Fatalf("result = %+v, want existing_assignment of hw-adopt", result)
+	}
+	if len(rejected) != 0 {
+		t.Fatalf("claim_rejected events = %v, want none for a dead holder", rejected)
+	}
+}
+
+// TestDoHookClaimAdoptionFailsOpenOnLiveSessionLookupError: an unreachable
+// controller must not strand crash recovery — the guard fails open and the
+// adoption proceeds, matching the pre-guard behavior in API-less contexts.
+func TestDoHookClaimAdoptionFailsOpenOnLiveSessionLookupError(t *testing.T) {
+	var rejected []string
+	ops := adoptionLivenessOps("builder", func() ([]hookLiveSession, error) {
+		return nil, fmt.Errorf("controller down")
+	}, &rejected)
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/tmp/work", adoptionLivenessOpts(), ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0 (fail-open adoption); stderr=%s", code, stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if result.Reason != "existing_assignment" || result.BeadID != "hw-adopt" {
+		t.Fatalf("result = %+v, want existing_assignment of hw-adopt (fail-open)", result)
+	}
+	if len(rejected) != 0 {
+		t.Fatalf("claim_rejected events = %v, want none on lookup error", rejected)
+	}
+}
+
+// TestDoHookClaimAdoptionSkipsLivenessLookupForSessionUniqueIdentity: a
+// candidate assigned to one of this session's OWN unique identities
+// (GC_SESSION_ID / GC_SESSION_NAME) is unambiguously ours — the guard must
+// not spend a controller round-trip on it.
+func TestDoHookClaimAdoptionSkipsLivenessLookupForSessionUniqueIdentity(t *testing.T) {
+	var rejected []string
+	lookups := 0
+	ops := adoptionLivenessOps("builder-1", func() ([]hookLiveSession, error) {
+		lookups++
+		return nil, nil
+	}, &rejected)
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/tmp/work", adoptionLivenessOpts(), ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if result.Reason != "existing_assignment" || result.BeadID != "hw-adopt" {
+		t.Fatalf("result = %+v, want existing_assignment of hw-adopt", result)
+	}
+	if lookups != 0 {
+		t.Fatalf("live-session lookups = %d, want 0 for a session-unique assignee", lookups)
+	}
+}
+
+// TestDoHookClaimAdoptionProceedsWhenAnsweringLiveSessionIsSelf: the live
+// session answering to the shared identity is THIS session (the named-holder
+// shape: assignee is our own alias) — adoption proceeds.
+func TestDoHookClaimAdoptionProceedsWhenAnsweringLiveSessionIsSelf(t *testing.T) {
+	var rejected []string
+	ops := adoptionLivenessOps("builder", func() ([]hookLiveSession, error) {
+		return []hookLiveSession{{ID: "session-1", Name: "builder-1", Alias: "builder"}}, nil
+	}, &rejected)
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/tmp/work", adoptionLivenessOpts(), ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0 (self-answering adoption); stderr=%s", code, stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if result.Reason != "existing_assignment" || result.BeadID != "hw-adopt" {
+		t.Fatalf("result = %+v, want existing_assignment of hw-adopt", result)
+	}
+	if len(rejected) != 0 {
+		t.Fatalf("claim_rejected events = %v, want none when the answering session is self", rejected)
 	}
 }
 
@@ -1321,6 +1622,11 @@ case "$*" in
     ;;
   *"update --json hw-next --assignee worker-1"*)
     printf '[{"id":"hw-next","status":"open","assignee":"worker-1","metadata":{"gc.routed_to":"worker"}}]'
+    ;;
+  *"show --json hw-next"*)
+    # Post-write preassign verify (gc-9647d): the write stuck — still open,
+    # assigned to this session — so the sibling may be advertised.
+    printf '[{"id":"hw-next","status":"open","assignee":"worker-1","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}}]'
     ;;
   *"query --json ephemeral=true AND status=open --limit 0"*)
     printf '[]'
