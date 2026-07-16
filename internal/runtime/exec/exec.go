@@ -231,10 +231,12 @@ func (p *Provider) dismissStartupDialogs(ctx context.Context, name string, cfg r
 	}
 
 	dialogTimeout := runtime.StartupDialogTimeout()
-	// Gate external-CLAUDE.md-import auto-acceptance to imports within this
-	// session's own repository; an import that escapes the repo (a third-party
-	// or system path) is left for a human rather than auto-trusted.
-	trustRoot := runtime.WithTrustedImportRoot(runtime.WorkspaceImportTrustRoot(ctx, cfg.WorkDir))
+	// Gate external-CLAUDE.md-import auto-acceptance to imports within a working
+	// tree of this session's own repository — the main tree or any linked
+	// worktree, since a worker running in a worktree imports that worktree's own
+	// instruction files. An import that escapes them all (a third-party or system
+	// path) is left for a human rather than auto-trusted.
+	trustRoot := runtime.WithTrustedImportRoots(runtime.WorkspaceImportTrustRoots(ctx, cfg.WorkDir)...)
 	snapshots, closeWatch, ok, err := p.startStartupWatch(ctx, name, startupWatchFirstEventTimeout())
 	if err != nil {
 		return err

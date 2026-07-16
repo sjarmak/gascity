@@ -46,6 +46,72 @@ func TestWorkspaceImportTrustRoot(t *testing.T) {
 	}
 }
 
+// TestWorkspaceImportTrustRootsCoversSiblingWorktrees pins the layout that
+// wedged live pool workers on 2026-07-16: the worker runs in a linked worktree
+// that lives OUTSIDE the main repository directory, and the instruction file it
+// imports belongs to another working tree of the same repository. Trusting only
+// the main tree leaves that import untrusted, so the external-imports modal is
+// never auto-accepted and the unattended worker sits at the prompt forever.
+func TestWorkspaceImportTrustRootsCoversSiblingWorktrees(t *testing.T) {
+	t.Parallel()
+
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	runGit(t, repo, "init", "-q")
+	runGit(t, repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit",
+		"--allow-empty", "-q", "-m", "init")
+
+	// The deployed shape: worktrees live beside the repo, not under it, and one
+	// worktree nests inside another (`<base>/wt/worktrees/nested`).
+	outer := filepath.Join(base, "wt")
+	runGit(t, repo, "worktree", "add", "-q", "--detach", outer)
+	nested := filepath.Join(outer, "worktrees", "nested")
+	runGit(t, repo, "worktree", "add", "-q", "--detach", nested)
+
+	roots := WorkspaceImportTrustRoots(context.Background(), nested)
+	for _, want := range []string{repo, outer, nested} {
+		if !containsResolved(t, roots, want) {
+			t.Errorf("WorkspaceImportTrustRoots(%q) = %v, want it to include %q", nested, roots, want)
+		}
+	}
+
+	// The outer worktree's AGENTS.md is what the live modal listed as external.
+	agents := filepath.Join(outer, "AGENTS.md")
+	if !anyRootFirstParty(agents, roots) {
+		t.Errorf("import %q not first-party under roots %v; the live modal would wedge the worker", agents, roots)
+	}
+
+	// A path outside every working tree stays untrusted so a human decides.
+	if anyRootFirstParty(filepath.Join(base, "elsewhere", "AGENTS.md"), roots) {
+		t.Error("a path outside every working tree must not be trusted")
+	}
+
+	if got := WorkspaceImportTrustRoots(context.Background(), t.TempDir()); len(got) != 0 {
+		t.Errorf("WorkspaceImportTrustRoots(non-git dir) = %v, want none", got)
+	}
+	if got := WorkspaceImportTrustRoots(context.Background(), ""); len(got) != 0 {
+		t.Errorf("WorkspaceImportTrustRoots(empty) = %v, want none", got)
+	}
+}
+
+func containsResolved(t *testing.T, roots []string, want string) bool {
+	t.Helper()
+	wantResolved := evalSymlinks(t, want)
+	for _, root := range roots {
+		if evalSymlinks(t, root) == wantResolved {
+			return true
+		}
+	}
+	return false
+}
+
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
