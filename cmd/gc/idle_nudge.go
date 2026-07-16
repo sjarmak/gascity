@@ -140,6 +140,9 @@ func nudgeStalledPoolClaims(
 // waiting to be claimed: status open and not already assigned to this slot
 // (a non-empty assignee equal to the session means the claim is mid-flight).
 func isUnclaimedTrigger(w beads.Bead, sessName string) bool {
+	if beadmeta.IsDisarmed(w.Metadata) {
+		return false // durable do-not-execute: never re-advertise, at any status
+	}
 	if !strings.EqualFold(strings.TrimSpace(w.Status), "open") {
 		return false // in_progress / closed / blocked → not ours to nudge
 	}
