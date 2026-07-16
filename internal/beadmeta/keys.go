@@ -53,6 +53,7 @@ const (
 	ClosedByAttemptMetadataKey           = "gc.closed_by_attempt"
 	ContinuationGroupMetadataKey         = "gc.continuation_group"
 	ControlDispatcherFallbackMetadataKey = "gc.control_dispatcher_fallback"
+	DisarmedMetadataKey                  = "gc.disarmed"
 	ControlEpochMetadataKey              = "gc.control_epoch"
 	ControlForMetadataKey                = "gc.control_for"
 	ControlQuarantineReasonMetadataKey   = "gc.control_quarantine_reason"

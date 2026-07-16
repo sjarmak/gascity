@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 )
@@ -750,6 +751,9 @@ func filterUnreadyHookCandidates(output string, now time.Time) string {
 		if isClosedHookCandidate(obj) {
 			continue
 		}
+		if isDisarmedHookCandidate(obj) {
+			continue
+		}
 		if isFutureDeferredHookCandidate(obj, now) {
 			continue
 		}
@@ -820,6 +824,25 @@ func isSelfBlockedHookCandidate(item map[string]any) bool {
 		return true
 	}
 	return false
+}
+
+// isDisarmedHookCandidate reports whether a candidate carries the durable
+// gc.disarmed do-not-execute flag. status=blocked is only a soft disarm — a
+// status transition or a cache reconcile can flip a step back to open, after
+// which every claim tier offers it again — so the flag is checked independently
+// of status and assignee.
+//
+// The value arrives here as bd emitted it: `--set-metadata gc.disarmed=true`
+// type-infers to a JSON boolean, so beadmeta.IsDisarmedRaw accepts bool as well
+// as string. A metadata blob we cannot address at all is treated as no marker,
+// mirroring the absent-key rule; only a readable key with an unreadable value
+// fails closed.
+func isDisarmedHookCandidate(item map[string]any) bool {
+	md, ok := item["metadata"].(map[string]any)
+	if !ok {
+		return false
+	}
+	return beadmeta.IsDisarmedRaw(md)
 }
 
 // isClosedHookCandidate reports whether item is a closed bead. Defense-in-depth
