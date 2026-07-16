@@ -35,11 +35,11 @@ type StartupDialogOption func(*startupDialogConfig)
 
 // startupDialogConfig holds resolved optional startup-dialog policy.
 type startupDialogConfig struct {
-	// trustedImportRoot gates auto-acceptance of the "Allow external CLAUDE.md
-	// file imports?" modal. When set, only imports within this first-party
-	// workspace tree are accepted automatically; when empty the modal is left
-	// for a human. See externalImportsTrusted.
-	trustedImportRoot string
+	// trustedImportRoots gates auto-acceptance of the "Allow external CLAUDE.md
+	// file imports?" modal. When set, only imports within one of these
+	// first-party workspace trees are accepted automatically; when empty the
+	// modal is left for a human. See externalImportsTrusted.
+	trustedImportRoots []string
 }
 
 // WithTrustedImportRoot restricts external-CLAUDE.md-import auto-acceptance to
@@ -49,7 +49,23 @@ type startupDialogConfig struct {
 // from outside the repository would trust files the worker was never meant to
 // read.
 func WithTrustedImportRoot(dir string) StartupDialogOption {
-	return func(c *startupDialogConfig) { c.trustedImportRoot = dir }
+	return WithTrustedImportRoots(dir)
+}
+
+// WithTrustedImportRoots is WithTrustedImportRoot over every working tree of the
+// repository (resolve them with WorkspaceImportTrustRoots). An import is
+// auto-accepted when it is first-party under any one of them, which is what a
+// worker running in a linked worktree needs: its own instruction files live in
+// that worktree, not in the main tree. Empty entries are ignored.
+func WithTrustedImportRoots(dirs ...string) StartupDialogOption {
+	return func(c *startupDialogConfig) {
+		c.trustedImportRoots = nil
+		for _, dir := range dirs {
+			if strings.TrimSpace(dir) != "" {
+				c.trustedImportRoots = append(c.trustedImportRoots, dir)
+			}
+		}
+	}
 }
 
 func newStartupDialogConfig(opts []StartupDialogOption) startupDialogConfig {
@@ -151,7 +167,7 @@ func AcceptStartupDialogsFromStreamWithStatus(
 	if err := ctx.Err(); err != nil {
 		return observed, err
 	}
-	phaseObserved, err = acceptExternalImportsDialogFromStream(ctx, timeout, stream, trackingSendKeys, cfg.trustedImportRoot)
+	phaseObserved, err = acceptExternalImportsDialogFromStream(ctx, timeout, stream, trackingSendKeys, cfg.trustedImportRoots)
 	if err != nil {
 		return observed, fmt.Errorf("external imports dialog: %w", err)
 	}
@@ -254,7 +270,7 @@ func AcceptStartupDialogsWithTimeout(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := acceptExternalImportsDialog(ctx, timeout, peek, sendKeys, cfg.trustedImportRoot); err != nil {
+	if err := acceptExternalImportsDialog(ctx, timeout, peek, sendKeys, cfg.trustedImportRoots); err != nil {
 		return fmt.Errorf("external imports dialog: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -542,7 +558,7 @@ func acceptExternalImportsDialog(
 	timeout time.Duration,
 	peek func(lines int) (string, error),
 	sendKeys func(keys ...string) error,
-	trustedRoot string,
+	trustedRoots []string,
 ) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -555,7 +571,7 @@ func acceptExternalImportsDialog(
 			return err
 		}
 
-		if containsExternalImportsDialog(content) && externalImportsTrusted(content, trustedRoot) {
+		if containsExternalImportsDialog(content) && externalImportsTrusted(content, trustedRoots...) {
 			if err := sendKeys("Enter"); err != nil {
 				return err
 			}
@@ -585,11 +601,11 @@ func acceptExternalImportsDialogFromStream(
 	timeout time.Duration,
 	snapshots *replayableSnapshotCursor,
 	sendKeys func(keys ...string) error,
-	trustedRoot string,
+	trustedRoots []string,
 ) (bool, error) {
 	return acceptDialogFromStream(ctx, timeout, snapshots, sendKeys, streamDialogSpec{
 		match: func(content string) bool {
-			return containsExternalImportsDialog(content) && externalImportsTrusted(content, trustedRoot)
+			return containsExternalImportsDialog(content) && externalImportsTrusted(content, trustedRoots...)
 		},
 		matchKeys:   []string{"Enter"},
 		matchDelay:  startupDialogAcceptDelay,
@@ -612,31 +628,43 @@ func containsPostExternalImportsStartupDialog(content string) bool {
 }
 
 // externalImportsTrusted reports whether every path listed in the "Allow
-// external CLAUDE.md file imports?" modal is a first-party file inside
-// trustRoot, the root of the repository the worker runs in (see
-// WorkspaceImportTrustRoot). The modal fires because a project CLAUDE.md
-// @-imports a file outside the working directory — for this fork, the
-// repository's own AGENTS.md, which a worktree subdirectory sees as external.
-// That file still lives inside the repository root, so it is first-party; an
-// import that escapes the repository root (a sibling repo, a parent directory, a
-// home or system path) is not, and neither is an in-root path that descends
+// external CLAUDE.md file imports?" modal is a first-party file inside one of
+// trustRoots, the working trees of the repository the worker runs in (see
+// WorkspaceImportTrustRoots). The modal fires because a project CLAUDE.md
+// @-imports a file outside the working directory — for this fork, a working
+// tree's own AGENTS.md, which a nested worktree sees as external. That file
+// still lives inside a working tree of the repository, so it is first-party; an
+// import that escapes every root (a sibling repo, an unrelated parent directory,
+// a home or system path) is not, and neither is an in-root path that descends
 // through a repository metadata or runtime directory such as .git or .gc (see
-// importPathFirstParty). An empty trustRoot, or a modal with no parseable import
-// path, trusts nothing so a human decides.
-func externalImportsTrusted(content, trustRoot string) bool {
-	if strings.TrimSpace(trustRoot) == "" {
-		return false
-	}
+// importPathFirstParty). No roots, or a modal with no parseable import path,
+// trusts nothing so a human decides.
+func externalImportsTrusted(content string, trustRoots ...string) bool {
 	imports := parseExternalImportPaths(content)
 	if len(imports) == 0 {
 		return false
 	}
 	for _, importPath := range imports {
-		if !importPathFirstParty(importPath, trustRoot) {
+		if !anyRootFirstParty(importPath, trustRoots) {
 			return false
 		}
 	}
 	return true
+}
+
+// anyRootFirstParty reports whether importPath is a first-party instruction file
+// under at least one of roots. Empty roots are ignored, so an unresolved
+// workspace (no roots, or only empty ones) trusts nothing.
+func anyRootFirstParty(importPath string, roots []string) bool {
+	for _, root := range roots {
+		if strings.TrimSpace(root) == "" {
+			continue
+		}
+		if importPathFirstParty(importPath, root) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseExternalImportPaths returns the absolute filesystem paths the external

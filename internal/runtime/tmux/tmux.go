@@ -1991,12 +1991,14 @@ func (t *Tmux) AcceptStartupDialogs(ctx context.Context, sess string) error {
 // DismissKnownDialogs dismisses known trust, permissions, and rate-limit
 // dialogs using a bounded timeout.
 func (t *Tmux) DismissKnownDialogs(ctx context.Context, sess string, timeout time.Duration) error {
-	// Gate external-CLAUDE.md-import auto-acceptance to imports within the
-	// pane's own repository; an import that escapes the repo is left for a
-	// human. Both lookups are best-effort: if either fails, the trust root
-	// stays empty and the external-imports modal is left unaccepted.
+	// Gate external-CLAUDE.md-import auto-acceptance to imports within a working
+	// tree of the pane's own repository — the main tree or any linked worktree,
+	// since a pane running in a worktree imports that worktree's own instruction
+	// files. An import that escapes them all is left for a human. Both lookups
+	// are best-effort: if either fails, the trust roots stay empty and the
+	// external-imports modal is left unaccepted.
 	paneDir, _ := t.GetPaneWorkDir(sess)
-	trustRoot := runtime.WorkspaceImportTrustRoot(ctx, paneDir)
+	trustRoots := runtime.WorkspaceImportTrustRoots(ctx, paneDir)
 	return runtime.AcceptStartupDialogsWithTimeout(ctx, timeout,
 		func(lines int) (string, error) { return t.CapturePane(sess, lines) },
 		func(keys ...string) error {
@@ -2007,7 +2009,7 @@ func (t *Tmux) DismissKnownDialogs(ctx context.Context, sess string, timeout tim
 			}
 			return nil
 		},
-		runtime.WithTrustedImportRoot(trustRoot),
+		runtime.WithTrustedImportRoots(trustRoots...),
 	)
 }
 
