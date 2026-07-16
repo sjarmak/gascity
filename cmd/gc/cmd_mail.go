@@ -972,6 +972,25 @@ func resolveMailIdentityWithConfigCached(cityPath string, cfg *config.City, stor
 	return resolveMailIdentityCached(store, identifier, cache)
 }
 
+// authorizeMailFromOverride rejects a `gc mail send --from` override whose
+// resolved sender identity does not match the calling session's own mail
+// identity. It closes the #4070 gap where any session could resolve, and then
+// send as, any other live named identity with no authentication. The caller's
+// authorized identity is derived exactly as the default-sender path derives it
+// (GC_SESSION_ID / GC_ALIAS / GC_AGENT), so a session naming its own identity
+// via --from is always allowed. Reserved identities (human / controller) are
+// handled by the caller and never reach here.
+func authorizeMailFromOverride(cityPath string, cfg *config.City, store beads.Store, resolvedSender string, cache *mailIdentitySessionCache) error {
+	callerIdentity, ok := resolveDefaultMailSenderForCommandCached(cityPath, cfg, store, io.Discard, "gc mail send", cache)
+	if !ok {
+		return fmt.Errorf("not authorized to send with --from %q: this session has no resolvable mail identity to authorize the override", resolvedSender)
+	}
+	if callerIdentity != resolvedSender {
+		return fmt.Errorf("not authorized to send as %q: this session's mail identity is %q (--from may only name your own identity)", resolvedSender, callerIdentity)
+	}
+	return nil
+}
+
 func resolveMailRecipientIdentity(cityPath string, cfg *config.City, store beads.Store, identifier string) (string, error) {
 	return resolveMailRecipientIdentityCached(cityPath, cfg, store, identifier, nil)
 }
@@ -1707,11 +1726,26 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 			sender = defaultMailIdentity()
 		}
 	} else if sender != "human" && store != nil {
-		sender, err = resolveMailIdentityWithConfigCached(cityPath, cfg, store, sender, idCache)
-		if err != nil {
-			fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", sender, err) //nolint:errcheck // best-effort stderr
+		requested := sender
+		resolved, resolveErr := resolveMailIdentityWithConfigCached(cityPath, cfg, store, requested, idCache)
+		if resolveErr != nil {
+			fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", requested, resolveErr) //nolint:errcheck // best-effort stderr
 			return 1
 		}
+		// A --from override that names a non-reserved identity (a live session,
+		// a configured named target, or a mailbox address) must belong to the
+		// calling session. Without this check any session could forge mail whose
+		// structured FROM field claims another live identity, including a
+		// privileged coordinator role. Reserved identities (human / controller)
+		// short-circuit resolution and remain an intentional, separate escape
+		// hatch — they are not the live-identity spoofing vector this closes.
+		if _, reserved := reservedMailSenderIdentity(requested); !reserved {
+			if authErr := authorizeMailFromOverride(cityPath, cfg, store, resolved, idCache); authErr != nil {
+				fmt.Fprintf(stderr, "gc mail send: %v\n", authErr) //nolint:errcheck // best-effort stderr
+				return 1
+			}
+		}
+		sender = resolved
 	}
 
 	var nf nudgeFunc
