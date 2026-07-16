@@ -115,6 +115,73 @@ func TestNudgeStalledPoolClaims_GivesUpAtCap(t *testing.T) {
 	}
 }
 
+// A step pinned to another live session must never be nudged as "unclaimed"
+// (gc-zf4). In the live repro the pinned step's assignee was empty and its
+// gc.routed_to was still the shared pool template, so it looked unclaimed to
+// every slot while the pinned session was actively executing it.
+func TestNudgeStalledPoolClaims_SkipsWorkPinnedToAnotherSession(t *testing.T) {
+	sp := runningFake(t)
+	cfg := idleClaimTestCfg()
+	sessions := []beads.Bead{idleClaimPoolSession()}
+	work := []beads.Bead{{ID: "w-1", Status: "open", Metadata: map[string]string{
+		beadmeta.SessionAffinityMetadataKey: beadmeta.SessionAffinityRequire,
+		beadmeta.SessionNameMetadataKey:     "worker-9",
+	}}}
+	store := beads.SessionStore{Store: beads.NewMemStoreFrom(0, sessions, nil)}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var out bytes.Buffer
+
+	nudgeStalledPoolClaims(sp, cfg, store, sessions, work, base, &out)
+	nudgeStalledPoolClaims(sp, cfg, store, sessions, work, base.Add(time.Hour), &out)
+	if out.Len() != 0 {
+		t.Fatalf("must not nudge a slot toward work pinned to worker-9: %q", out.String())
+	}
+	if got := sessions[0].Metadata[idleClaimNudgeTriggerKey]; got != "" {
+		t.Fatalf("marker should stay clear for pinned-elsewhere work, got %q", got)
+	}
+}
+
+// The pinned session itself still gets its nudge — the gate hides the step from
+// OTHER slots, it does not disable the backstop for its owner.
+func TestNudgeStalledPoolClaims_NudgesSessionItIsPinnedTo(t *testing.T) {
+	sp := runningFake(t)
+	cfg := idleClaimTestCfg()
+	sessions := []beads.Bead{idleClaimPoolSession()}
+	work := []beads.Bead{{ID: "w-1", Status: "open", Metadata: map[string]string{
+		beadmeta.SessionAffinityMetadataKey: beadmeta.SessionAffinityRequire,
+		beadmeta.SessionNameMetadataKey:     "worker-1",
+	}}}
+	store := beads.SessionStore{Store: beads.NewMemStoreFrom(0, sessions, nil)}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var out bytes.Buffer
+
+	nudgeStalledPoolClaims(sp, cfg, store, sessions, work, base, &out)
+	nudgeStalledPoolClaims(sp, cfg, store, sessions, work, base.Add(idleClaimNudgeGrace+time.Second), &out)
+	if !bytes.Contains(out.Bytes(), []byte("nudged worker-1 to claim w-1")) {
+		t.Fatalf("expected the pinned session to still be nudged, got: %q", out.String())
+	}
+}
+
+// Unbound affinity (no gc.session_name) is ordinary fresh pool work: graphroute
+// stamps affinity=require at route time and binds a session only at claim.
+func TestNudgeStalledPoolClaims_NudgesUnboundSessionAffineWork(t *testing.T) {
+	sp := runningFake(t)
+	cfg := idleClaimTestCfg()
+	sessions := []beads.Bead{idleClaimPoolSession()}
+	work := []beads.Bead{{ID: "w-1", Status: "open", Metadata: map[string]string{
+		beadmeta.SessionAffinityMetadataKey: beadmeta.SessionAffinityRequire,
+	}}}
+	store := beads.SessionStore{Store: beads.NewMemStoreFrom(0, sessions, nil)}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var out bytes.Buffer
+
+	nudgeStalledPoolClaims(sp, cfg, store, sessions, work, base, &out)
+	nudgeStalledPoolClaims(sp, cfg, store, sessions, work, base.Add(idleClaimNudgeGrace+time.Second), &out)
+	if !bytes.Contains(out.Bytes(), []byte("nudged worker-1 to claim w-1")) {
+		t.Fatalf("expected unbound affinity to stay nudgeable, got: %q", out.String())
+	}
+}
+
 // A non-pool session is ignored entirely.
 func TestNudgeStalledPoolClaims_SkipsNonPool(t *testing.T) {
 	sp := runningFake(t)

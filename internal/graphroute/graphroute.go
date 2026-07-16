@@ -193,7 +193,7 @@ func ApplyGraphRouteBinding(step *formula.RecipeStep, binding GraphRouteBinding)
 		// pre-assigns all molecule steps to the claiming slot, preventing scatter
 		// across pool slots (fixes #2978).
 		step.Metadata[beadmeta.ContinuationGroupMetadataKey] = poolWorkflowContinuationGroup
-		step.Metadata[beadmeta.SessionAffinityMetadataKey] = "require"
+		step.Metadata[beadmeta.SessionAffinityMetadataKey] = beadmeta.SessionAffinityRequire
 		step.Assignee = ""
 		return
 	}

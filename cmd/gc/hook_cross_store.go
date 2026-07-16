@@ -149,6 +149,12 @@ func rigScopedHookRig(cfg *config.City, agentIdentity string) string {
 // normalize + unready-filter that doHook uses, so a store with only
 // deferred/blocked rows is not treated as a hit). run is injectable for tests.
 //
+// identities applies the same session-affinity gate the claim uses, so a store
+// holding only steps pinned to OTHER sessions is not a hit either. Selection has
+// to agree with claimability: otherwise this returns a store whose rows the
+// caller will filter away, reporting "no work" while a later federated store
+// still has claimable work (gc-zf4).
+//
 // When no store has ready work, an error on the agent's OWN store (identified by
 // primary, not by slice position) is surfaced so emitCityWorkQueryFailure can
 // classify it — preserving the single-store emit-on-timeout contract (a
@@ -159,14 +165,14 @@ func rigScopedHookRig(cfg *config.City, agentIdentity string) string {
 // federated claim loop reselects over a shrinking store set: once the primary
 // store has been dropped it is no longer in stores, so no later federated store
 // may inherit its emit-on-timeout semantics.
-func firstStoreWithWork(command string, stores []hookStore, primary hookStore, run hookStoreRunner) (string, hookStore, error) {
+func firstStoreWithWork(command string, stores []hookStore, primary hookStore, identities []string, run hookStoreRunner) (string, hookStore, error) {
 	var lastOut string
 	var ownStoreOut string
 	var ownStoreErr error
 	for _, st := range stores {
 		out, err := run(command, st.dir, st.env)
 		if err == nil {
-			ready := filterUnreadyHookCandidates(normalizeWorkQueryOutput(strings.TrimSpace(out)), time.Now())
+			ready := hookStoreReadyRows(out, identities)
 			if workQueryHasReadyWork(ready) {
 				return out, st, nil
 			}
@@ -199,19 +205,19 @@ func firstStoreWithWork(command string, stores []hookStore, primary hookStore, r
 // is the primary (own) store; a federated store erroring at claim time is
 // best-effort and falls through to re-selection, mirroring firstStoreWithWork's
 // emit-on-timeout contract so a flaky rig store can't wedge the claim.
-func claimStoreWithFallback(command string, stores []hookStore, selected, primary hookStore, run hookStoreRunner) (string, hookStore, error) {
+func claimStoreWithFallback(command string, stores []hookStore, selected, primary hookStore, identities []string, run hookStoreRunner) (string, hookStore, error) {
 	selectedOut, err := run(command, selected.dir, selected.env)
 	if err != nil {
 		if sameHookStore(selected, primary) {
 			return "", hookStore{}, err
 		}
-		return firstStoreWithWork(command, stores, primary, run)
+		return firstStoreWithWork(command, stores, primary, identities, run)
 	}
-	ready := filterUnreadyHookCandidates(normalizeWorkQueryOutput(strings.TrimSpace(selectedOut)), time.Now())
+	ready := hookStoreReadyRows(selectedOut, identities)
 	if workQueryHasReadyWork(ready) {
 		return selectedOut, selected, nil
 	}
-	return firstStoreWithWork(command, stores, primary, run)
+	return firstStoreWithWork(command, stores, primary, identities, run)
 }
 
 // isZeroHookStore reports whether s is the zero hookStore that firstStoreWithWork
@@ -249,4 +255,13 @@ func sameHookStore(a, b hookStore) bool {
 		}
 	}
 	return true
+}
+
+// hookStoreReadyRows reduces a store's raw work-query output to the rows this
+// session could actually act on: ready by bd semantics AND not pinned to
+// another session. Store selection and claim eligibility must apply the same
+// two gates or selection lands on a store with nothing claimable in it.
+func hookStoreReadyRows(out string, identities []string) string {
+	ready := filterUnreadyHookCandidates(normalizeWorkQueryOutput(strings.TrimSpace(out)), time.Now())
+	return filterSessionAffineHookCandidates(ready, identities)
 }

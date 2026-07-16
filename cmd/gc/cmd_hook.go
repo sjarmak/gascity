@@ -414,16 +414,25 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 		emitCityWorkQueryFailure(cityPath, stderr,
 			os.Getenv("GC_SESSION_ID"), failureTemplate, command, err)
 	}
+	sessionID := strings.TrimSpace(overrides["GC_SESSION_ID"])
+	sessionName := strings.TrimSpace(sessionForQuery)
+	alias := strings.TrimSpace(overrides["GC_ALIAS"])
+	assignee := firstNonEmptyHookValue(sessionName, sessionID, alias, agentForQuery, resolvedAgentName)
+	// Shared by the claim and discovery paths so a step is hidden from exactly
+	// the slots that cannot claim it (gc-zf4).
+	identityCandidates := hookClaimIdentityCandidates(
+		assignee,
+		sessionID,
+		sessionName,
+		alias,
+		agentForQuery,
+	)
 	runner := func(command, _ string) (string, error) {
-		out, _, err := firstStoreWithWork(command, stores, stores[0], shellWorkQueryWithEnv)
+		out, _, err := firstStoreWithWork(command, stores, stores[0], identityCandidates, shellWorkQueryWithEnv)
 		emitQueryFailure(command, err)
 		return out, err
 	}
 	if opts.Claim {
-		sessionID := strings.TrimSpace(overrides["GC_SESSION_ID"])
-		sessionName := strings.TrimSpace(sessionForQuery)
-		alias := strings.TrimSpace(overrides["GC_ALIAS"])
-		assignee := firstNonEmptyHookValue(sessionName, sessionID, alias, agentForQuery, resolvedAgentName)
 		claimOpts := hookClaimOptions{
 			Assignee: assignee,
 			// IdentityCandidates governs ADOPTION of already-owned in_progress/open
@@ -436,21 +445,15 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 			// bare template stays in RouteTargets, which governs FRESH claims of
 			// UNASSIGNED routed work. The canonical slot / named holder keep it via
 			// `alias` (GC_ALIAS == qualified bare name); only suffixed workers drop it.
-			IdentityCandidates: hookClaimIdentityCandidates(
-				assignee,
-				sessionID,
-				sessionName,
-				alias,
-				agentForQuery,
-			),
-			RouteTargets: hookClaimRouteTargets(hookClaimPrimaryRouteTarget(&a), resolvedAgentName, strings.TrimSpace(overrides["GC_TEMPLATE"])),
-			Env:          queryEnv,
-			DrainAck:     opts.DrainAck,
-			JSON:         opts.JSON,
+			IdentityCandidates: identityCandidates,
+			RouteTargets:       hookClaimRouteTargets(hookClaimPrimaryRouteTarget(&a), resolvedAgentName, strings.TrimSpace(overrides["GC_TEMPLATE"])),
+			Env:                queryEnv,
+			DrainAck:           opts.DrainAck,
+			JSON:               opts.JSON,
 		}
 		return claimHookWork(workQuery, workDir, queryEnv, stores, claimOpts, emitQueryFailure, stdout, stderr)
 	}
-	return doHook(workQuery, workDir, false, runner, stdout, stderr)
+	return doHook(workQuery, workDir, false, identityCandidates, runner, stdout, stderr)
 }
 
 // claimHookWork claims routed work for gc hook --claim from the federated store
@@ -491,7 +494,7 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 	// report claims_errored instead of laundering a write failure into no_work.
 	claimsErrored := false
 	for len(remaining) > 0 {
-		_, selected, err := firstStoreWithWork(workQuery, remaining, primary, run)
+		_, selected, err := firstStoreWithWork(workQuery, remaining, primary, claimOpts.IdentityCandidates, run)
 		if err != nil {
 			emitFailure(workQuery, err)
 			fmt.Fprintf(stderr, "gc hook --claim: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -500,7 +503,7 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 		if isZeroHookStore(selected) {
 			break // no remaining store has ready work
 		}
-		claimOutput, claimStore, err := claimStoreWithFallback(workQuery, remaining, selected, primary, run)
+		claimOutput, claimStore, err := claimStoreWithFallback(workQuery, remaining, selected, primary, claimOpts.IdentityCandidates, run)
 		if err != nil {
 			emitFailure(workQuery, err)
 			fmt.Fprintf(stderr, "gc hook --claim: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -668,7 +671,12 @@ func workQueryEnvForDir(env []string, dir string) []string {
 // results based on mode. Without inject: prints normalized ready-only output,
 // returns 0 if work exists, 1 if empty. With inject: skips the work query and
 // returns 0.
-func doHook(workQuery, dir string, inject bool, runner WorkQueryRunner, stdout, stderr io.Writer) int {
+//
+// identities is this session's own runtime identity set, used to hide steps
+// pinned to a different session. An empty set hides every pinned step: a caller
+// that cannot name itself cannot be the session a step is pinned to. Unpinned
+// work is unaffected either way.
+func doHook(workQuery, dir string, inject bool, identities []string, runner WorkQueryRunner, stdout, stderr io.Writer) int {
 	if inject {
 		return 0
 	}
@@ -685,6 +693,7 @@ func doHook(workQuery, dir string, inject bool, runner WorkQueryRunner, stdout, 
 	trimmed := strings.TrimSpace(output)
 	normalized := normalizeWorkQueryOutput(trimmed)
 	normalized = filterUnreadyHookCandidates(normalized, time.Now())
+	normalized = filterSessionAffineHookCandidates(normalized, identities)
 	hasWork := workQueryHasReadyWork(normalized)
 
 	// Non-inject mode: print normalized, ready-only output. Return 0 only when work exists.
@@ -729,6 +738,34 @@ func workQueryHasReadyWork(output string) bool {
 // it cannot progress.
 // Pure function over JSON; takes time.Time so tests stay deterministic.
 func filterUnreadyHookCandidates(output string, now time.Time) string {
+	return filterHookCandidateRows(output, func(obj map[string]any) bool {
+		return isClosedHookCandidate(obj) ||
+			isFutureDeferredHookCandidate(obj, now) ||
+			isDepBlockedHookCandidate(obj) ||
+			isSelfBlockedHookCandidate(obj)
+	})
+}
+
+// filterSessionAffineHookCandidates strips rows pinned to a session other than
+// this one, so `gc hook` never advertises another session's step as available
+// work (gc.session_affinity=require + a bound gc.session_name). Route metadata
+// cannot express this: a pinned step keeps gc.routed_to on the shared pool
+// template, so it matches every slot in the pool (gc-zf4).
+//
+// Ownership is deliberately a separate pass from filterUnreadyHookCandidates:
+// that one answers "can this bead progress at all" (bd ready semantics), this
+// one answers "is it mine to progress".
+func filterSessionAffineHookCandidates(output string, identities []string) string {
+	return filterHookCandidateRows(output, func(obj map[string]any) bool {
+		return sessionAffinityExcludes(hookCandidateMetadata(obj), identities...)
+	})
+}
+
+// filterHookCandidateRows re-encodes output with every row drop reports true
+// for removed. Output that is not a JSON array, and non-object rows within one,
+// pass through untouched — a shape this filter does not understand must never
+// be silently emptied. Pure function over JSON.
+func filterHookCandidateRows(output string, drop func(map[string]any) bool) string {
 	if output == "" {
 		return output
 	}
@@ -747,16 +784,7 @@ func filterUnreadyHookCandidates(output string, now time.Time) string {
 			filtered = append(filtered, item)
 			continue
 		}
-		if isClosedHookCandidate(obj) {
-			continue
-		}
-		if isFutureDeferredHookCandidate(obj, now) {
-			continue
-		}
-		if isDepBlockedHookCandidate(obj) {
-			continue
-		}
-		if isSelfBlockedHookCandidate(obj) {
+		if drop(obj) {
 			continue
 		}
 		filtered = append(filtered, obj)
@@ -766,6 +794,24 @@ func filterUnreadyHookCandidates(output string, now time.Time) string {
 		return output
 	}
 	return string(reencoded)
+}
+
+// hookCandidateMetadata lifts a work-query row's metadata object into the
+// map[string]string shape the shared bead predicates read. Non-string values
+// are skipped rather than coerced: gc routing metadata is string-typed, so a
+// non-string here is foreign data, not a value to guess at.
+func hookCandidateMetadata(item map[string]any) map[string]string {
+	raw, ok := item["metadata"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	md := make(map[string]string, len(raw))
+	for key, value := range raw {
+		if s, ok := value.(string); ok {
+			md[key] = s
+		}
+	}
+	return md
 }
 
 func isFutureDeferredHookCandidate(item map[string]any, now time.Time) bool {

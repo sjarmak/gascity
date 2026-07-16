@@ -137,11 +137,20 @@ func nudgeStalledPoolClaims(
 }
 
 // isUnclaimedTrigger reports whether the pool slot's trigger bead is still
-// waiting to be claimed: status open and not already assigned to this slot
-// (a non-empty assignee equal to the session means the claim is mid-flight).
+// waiting to be claimed BY THIS SLOT: status open, not pinned to another
+// session, and not already assigned to this slot (a non-empty assignee equal to
+// the session means the claim is mid-flight).
 func isUnclaimedTrigger(w beads.Bead, sessName string) bool {
 	if !strings.EqualFold(strings.TrimSpace(w.Status), "open") {
 		return false // in_progress / closed / blocked → not ours to nudge
+	}
+	// Work pinned to another session is not unclaimed — it is claimed by
+	// someone else, whatever the assignee column says. The pinned session can
+	// hold a step open with an empty assignee (routed_to stays the shared pool
+	// template), which is exactly what made this bead look nudgeable to every
+	// slot in the live repro (gc-zf4).
+	if sessionAffinityExcludes(w.Metadata, sessName) {
+		return false
 	}
 	if assignee := strings.TrimSpace(w.Assignee); assignee != "" && assignee == sessName {
 		return false

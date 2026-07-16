@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/agentutil"
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
@@ -636,5 +637,39 @@ func TestResolveTaskWorkDirIncludesAssignedWisp(t *testing.T) {
 
 	if got := resolveTaskWorkDir("", store, "worker-session"); got != workDir {
 		t.Fatalf("resolveTaskWorkDir = %q, want assigned wisp work_dir %q", got, workDir)
+	}
+}
+
+// TestFilterAssignedWorkBeadsForPoolDemandCountsSessionAffineWork pins the half
+// of gc-zf4 that must NOT change. Hook discovery and the idle-claim nudge hide a
+// session-pinned step from every other slot, but shared-pool demand counting
+// still counts it: demand answers "does this template have work to stay alive
+// for", which is true no matter which session owns the step. Filtering it here
+// would shrink the pool out from under work that is actively running.
+func TestFilterAssignedWorkBeadsForPoolDemandCountsSessionAffineWork(t *testing.T) {
+	cfg := &config.City{Agents: []config.Agent{{Name: "polecat"}}}
+	sessions := []beads.Bead{{
+		ID:     "session-1",
+		Status: "open",
+		Type:   sessionBeadType,
+		Metadata: map[string]string{
+			"template":     "polecat",
+			"session_name": "polecat-gc-504481",
+		},
+	}}
+	work := []beads.Bead{{
+		ID:     "gc-jqt",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.RoutedToMetadataKey:        "polecat",
+			beadmeta.SessionAffinityMetadataKey: beadmeta.SessionAffinityRequire,
+			beadmeta.SessionNameMetadataKey:     "polecat-gc-504481",
+		},
+	}}
+
+	got := filterAssignedWorkBeadsForPoolDemand(cfg, "", sessionInfosFromBeads(sessions), work, []string{""})
+
+	if len(got) != 1 || got[0].ID != "gc-jqt" {
+		t.Fatalf("filtered work = %#v, want the session-pinned step still counted for demand", got)
 	}
 }

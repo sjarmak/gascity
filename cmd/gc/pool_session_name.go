@@ -422,11 +422,18 @@ func releaseOrphanedPoolAssignment(store beads.Store, wb beads.Bead, clearDetach
 // gc.continuation_group + gc.root_bead_id. Routing these beads through
 // releasePoolAssignmentWithRecheck clears status, assignee, and the affinity
 // metadata in a single Update, so the group is never visible on a claimable
-// bead. gc.session_affinity is an advisory marker no routing path reads (see the
-// beadmeta.SessionAffinityMetadataKeys doc), so it needs no such guard and the
-// CAS path still clears it. Lift this once bd's native conditional-release verb
-// can clear the metadata in the same guarded write (BdStore.ReleaseIfCurrent
-// SEAM).
+// bead.
+//
+// gc.session_affinity is a routing vector too since gc-zf4 (beadmeta.
+// PinnedSessionName hides a pinned step from every other session), but it needs
+// no guard of its own: both writers stamp it in the same breath as the group
+// (graphroute.ApplyGraphRouteBinding, dispatch's shared-drain decoration), so
+// every affinity-pinned bead already qualifies for the recheck path here. Were
+// one to reach the CAS path regardless, that path's two-write gap fails safe for
+// affinity — a bead still carrying its pin is hidden from other slots until the
+// clear lands, rather than exposed to them. Lift this once bd's native
+// conditional-release verb can clear the metadata in the same guarded write
+// (BdStore.ReleaseIfCurrent SEAM).
 func beadHasActiveContinuationGroup(wb beads.Bead) bool {
 	return strings.TrimSpace(wb.Metadata[beadmeta.ContinuationGroupMetadataKey]) != ""
 }

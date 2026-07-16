@@ -199,7 +199,7 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 	defer cancel()
 	claimsErrored := false
 	for _, candidate := range candidates {
-		if !hookCandidateClaimable(candidate, opts.RouteTargets) {
+		if !hookCandidateClaimable(candidate, opts.RouteTargets, opts.IdentityCandidates) {
 			continue
 		}
 		if ctx.Err() != nil {
@@ -252,11 +252,17 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 }
 
 // hookCandidateClaimable reports whether a work-query candidate is eligible for a
-// fresh claim: it has an id, is currently unassigned, and matches one of this
-// session's route targets.
-func hookCandidateClaimable(candidate beads.Bead, routeTargets []string) bool {
+// fresh claim: it has an id, is currently unassigned, is not pinned to another
+// session, and matches one of this session's route targets.
+//
+// The affinity gate is separate from the route match on purpose. routeTargets
+// carries the bare pool template, which every slot shares, so a step pinned to
+// one session still matches every slot's route — routing says "which pool may
+// run this", affinity says "which session already owns it" (gc-zf4).
+func hookCandidateClaimable(candidate beads.Bead, routeTargets, identities []string) bool {
 	return strings.TrimSpace(candidate.ID) != "" &&
 		strings.TrimSpace(candidate.Assignee) == "" &&
+		!sessionAffinityExcludes(candidate.Metadata, identities...) &&
 		hookClaimMatchesRoute(candidate, routeTargets)
 }
 
@@ -381,6 +387,11 @@ func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops 
 			sibling.ID == bead.ID ||
 			strings.TrimSpace(sibling.Assignee) != "" ||
 			!strings.EqualFold(strings.TrimSpace(sibling.Status), "open") ||
+			// A sibling already pinned to another session is that session's
+			// work; vacuuming it here would hand the same step to two slots
+			// (gc-zf4). Route-time siblings carry no bound session, so the
+			// ordinary scatter-prevention vacuum is untouched.
+			sessionAffinityExcludes(sibling.Metadata, opts.IdentityCandidates...) ||
 			!hookClaimMatchesRoute(sibling, opts.RouteTargets) {
 			continue
 		}

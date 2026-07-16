@@ -141,6 +141,11 @@ const (
 	DrainContextShared   = "shared"
 )
 
+// SessionAffinityRequire is the sole value of SessionAffinityMetadataKey
+// ("gc.session_affinity"). Paired with a bound SessionNameMetadataKey it pins a
+// step to one session; PinnedSessionName is the only reader of that contract.
+const SessionAffinityRequire = "require"
+
 // Values of DrainMemberAccessMetadataKey ("gc.drain_member_access").
 const (
 	DrainMemberAccessRead      = "read"

@@ -455,12 +455,18 @@ var KnownMetadataPrefixes = []string{
 // single list so a new affinity key cannot silently fix one clear path while
 // leaving another stale.
 //
-// Of these keys, ContinuationGroupMetadataKey is the active routing vector: the
-// hook claim path reads it to vacuum open, unassigned sibling work onto the
-// claiming session. SessionAffinityMetadataKey is currently an advisory marker —
-// it is written (e.g. internal/dispatch/drain.go) but no Go routing path reads
-// it yet, so it is cleared alongside the group for hygiene and future-proofing
-// rather than because it gates routing today.
+// Both keys are active routing vectors. ContinuationGroupMetadataKey is read by
+// the hook claim path to vacuum open, unassigned sibling work onto the claiming
+// session. SessionAffinityMetadataKey, paired with a bound SessionNameMetadataKey,
+// is read by PinnedSessionName to hide a step from every session except the one
+// it is pinned to (gc-zf4); before that it was an advisory marker no routing
+// path read.
+//
+// Clearing them together is therefore load-bearing in both directions. Leaving
+// the group set re-vacuums the bead onto an unrelated session; leaving affinity
+// set while SessionNameMetadataKey still holds its stale back-reference (release
+// paths deliberately do not clear that key, #2843) hides the released bead from
+// the entire pool, stranding it on a session that has already exited.
 var SessionAffinityMetadataKeys = []string{
 	SessionAffinityMetadataKey,
 	ContinuationGroupMetadataKey,

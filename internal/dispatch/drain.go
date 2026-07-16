@@ -1183,7 +1183,7 @@ func stampDrainItemRecipe(recipe *formula.Recipe, control, unit, member beads.Be
 				step.Metadata = make(map[string]string)
 			}
 			step.Metadata[beadmeta.ContinuationGroupMetadataKey] = group
-			step.Metadata[beadmeta.SessionAffinityMetadataKey] = "require"
+			step.Metadata[beadmeta.SessionAffinityMetadataKey] = beadmeta.SessionAffinityRequire
 		}
 	}
 }
