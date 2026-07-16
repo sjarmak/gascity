@@ -150,6 +150,138 @@ func TestBuildWorkflowRunProjectionsKeepsInProgressChildrenOnHistoryFailure(t *t
 	}
 }
 
+// A blocked or deferred bead is not active work, so it must not reach the
+// projection snapshot that feeds spawn selection — even while it still carries
+// stale gc.routed_to routing metadata.
+func TestListActiveWorkflowProjectionBeadsExcludesInactiveStatuses(t *testing.T) {
+	mem := beads.NewMemStore()
+
+	idByStatus := make(map[string]string)
+	for _, status := range []string{"open", "in_progress", "blocked", "deferred", "closed"} {
+		bead := createBeadWithStatus(t, mem, beads.Bead{
+			Title:    status + " root",
+			Metadata: map[string]string{"gc.routed_to": "polecat-1"},
+		}, status)
+		idByStatus[status] = bead.ID
+	}
+
+	got, err := listActiveWorkflowProjectionBeads(mem)
+	if err != nil {
+		t.Fatalf("listActiveWorkflowProjectionBeads: %v", err)
+	}
+	inSnapshot := make(map[string]bool, len(got))
+	for _, bead := range got {
+		inSnapshot[bead.ID] = true
+	}
+
+	for _, status := range []string{"open", "in_progress"} {
+		if !inSnapshot[idByStatus[status]] {
+			t.Errorf("status %q absent from active snapshot, want present", status)
+		}
+	}
+	for _, status := range []string{"blocked", "deferred", "closed"} {
+		if inSnapshot[idByStatus[status]] {
+			t.Errorf("status %q present in active snapshot, want absent", status)
+		}
+	}
+}
+
+// When the closed-root history scan fails, both builders rebuild roots from the
+// active snapshot. A blocked root must not be resurrected into the feed by that
+// fallback just because it still carries gc.routed_to.
+func TestBuildWorkflowRunProjectionsDropBlockedRootOnHistoryFailure(t *testing.T) {
+	builders := map[string]func(State, string, string) (workflowRunProjectionResult, error){
+		"full": func(state State, scopeKind, scopeRef string) (workflowRunProjectionResult, error) {
+			return buildWorkflowRunProjections(state, scopeKind, scopeRef, "")
+		},
+		"rootOnly": buildWorkflowRunProjectionsRootOnly,
+	}
+
+	for name, build := range builders {
+		t.Run(name, func(t *testing.T) {
+			state := newFakeState(t)
+			mem := beads.NewMemStore()
+			state.stores = map[string]beads.Store{
+				"myrig": &workflowRootHistoryFailStore{MemStore: mem},
+			}
+
+			// An active root alongside the blocked one keeps the builders on the
+			// reconstruction path: without it, rootOnly reports the underlying
+			// store failure instead of an empty result.
+			active := createBeadWithStatus(t, mem, beads.Bead{
+				Title: "Active deploy",
+				Type:  "workflow",
+				Metadata: map[string]string{
+					"gc.kind":             "workflow",
+					"gc.formula_contract": "graph.v2",
+					"gc.routed_to":        "polecat-1",
+				},
+			}, "in_progress")
+			blocked := createBeadWithStatus(t, mem, beads.Bead{
+				Title: "Blocked deploy",
+				Type:  "workflow",
+				Metadata: map[string]string{
+					"gc.kind":             "workflow",
+					"gc.formula_contract": "graph.v2",
+					"gc.routed_to":        "polecat-1",
+				},
+			}, "blocked")
+
+			got, err := build(state, "rig", "myrig")
+			if err != nil {
+				t.Fatalf("build projections: %v", err)
+			}
+			if len(got.Items) != 1 {
+				t.Fatalf("items = %d, want 1 (only the active root)", len(got.Items))
+			}
+			if got.Items[0].RootBeadID != active.ID {
+				t.Fatalf("projected root = %q, want active root %q (blocked root %q must not be resurrected)",
+					got.Items[0].RootBeadID, active.ID, blocked.ID)
+			}
+		})
+	}
+}
+
+// A blocked child is not active work, so it must not advance the run's
+// freshness timestamp.
+func TestBuildWorkflowRunProjectionsIgnoreBlockedChildFreshness(t *testing.T) {
+	state := newFakeState(t)
+	mem := beads.NewMemStore()
+	state.stores = map[string]beads.Store{
+		"myrig": &workflowProjectionStore{MemStore: mem},
+	}
+
+	root, err := mem.Create(beads.Bead{
+		Title: "Deploy",
+		Type:  "workflow",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	createBeadWithStatus(t, mem, beads.Bead{
+		Title:    "Blocked step",
+		Type:     "task",
+		Metadata: map[string]string{"gc.root_bead_id": root.ID},
+	}, "blocked")
+
+	got, err := buildWorkflowRunProjections(state, "rig", "myrig", "")
+	if err != nil {
+		t.Fatalf("buildWorkflowRunProjections: %v", err)
+	}
+	if len(got.Items) != 1 {
+		t.Fatalf("items = %d, want 1", len(got.Items))
+	}
+	if !got.Items[0].UpdatedAt.Equal(root.CreatedAt) {
+		t.Fatalf("updatedAt = %s, want root timestamp %s (blocked child must not count as activity)",
+			got.Items[0].UpdatedAt, root.CreatedAt)
+	}
+}
+
 func TestBuildOrderRunFeedItemsUsesAllOrdersForDisabledExecMetadata(t *testing.T) {
 	state := newFakeState(t)
 	state.cityBeadStore = beads.NewMemStore()
@@ -212,6 +344,38 @@ func TestOrderTrackingUpdatedAtLogsLookupFailure(t *testing.T) {
 
 type workflowProjectionStore struct {
 	*beads.MemStore
+}
+
+// workflowRootHistoryFailStore fails the closed-root history scan so the
+// projection builders fall back to reconstructing roots from the active
+// snapshot.
+type workflowRootHistoryFailStore struct {
+	*beads.MemStore
+}
+
+func (s *workflowRootHistoryFailStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.IncludeClosed && query.Metadata["gc.kind"] == "workflow" {
+		return nil, errors.New("history unavailable")
+	}
+	return s.MemStore.List(query)
+}
+
+// createBeadWithStatus creates a bead and moves it to status, which MemStore
+// forces to "open" on create.
+func createBeadWithStatus(t *testing.T, mem *beads.MemStore, bead beads.Bead, status string) beads.Bead {
+	t.Helper()
+	created, err := mem.Create(bead)
+	if err != nil {
+		t.Fatalf("create %q bead: %v", status, err)
+	}
+	if status == "open" {
+		return created
+	}
+	if err := mem.Update(created.ID, beads.UpdateOpts{Status: &status}); err != nil {
+		t.Fatalf("update bead to %q: %v", status, err)
+	}
+	created.Status = status
+	return created
 }
 
 type labelFailListStore struct {

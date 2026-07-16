@@ -289,12 +289,37 @@ func buildWorkflowRunProjectionsRootOnly(state State, requestedScopeKind, reques
 	}, nil
 }
 
+// activeWorkflowProjectionStatuses are the bead statuses that count as active
+// work for workflow projection and spawn selection. It is an allowlist so an
+// unrecognized status is treated as inactive rather than silently spawning
+// against it. These are the non-terminal statuses of the graph.v2 workflow
+// lifecycle that molecule.WorkflowStatus maps onto pending/active.
+var activeWorkflowProjectionStatuses = map[string]bool{
+	"open":        true,
+	"in_progress": true,
+}
+
 func listActiveWorkflowProjectionBeads(store beads.Store) ([]beads.Bead, error) {
-	// Preserve the old ListOpen() semantics as a single active snapshot. A
-	// union of separate open/in_progress queries can miss beads that change
-	// status between reads, so this is one of the intentional raw scans until
-	// ListQuery grows a multi-status selector.
-	return store.List(beads.ListQuery{AllowScan: true})
+	// One scan, then filter in memory. A union of separate per-status queries
+	// can miss beads that change status between reads, and ListQuery.Status is
+	// scalar, so this stays a single raw scan until ListQuery grows a
+	// multi-status selector.
+	//
+	// The scan excludes closed, but blocked and deferred beads still come back
+	// carrying whatever gc.routed_to they were last routed with. Emitting those
+	// as active re-routes work that is deliberately parked, so gate on status
+	// here rather than trusting routing metadata to have been cleared.
+	snapshot, err := store.List(beads.ListQuery{AllowScan: true})
+	if err != nil {
+		return nil, err
+	}
+	active := make([]beads.Bead, 0, len(snapshot))
+	for _, bead := range snapshot {
+		if activeWorkflowProjectionStatuses[strings.TrimSpace(bead.Status)] {
+			active = append(active, bead)
+		}
+	}
+	return active, nil
 }
 
 func buildOrderRunFeedItems(state State, requestedScopeKind, requestedScopeRef string) (orderRunFeedResult, error) {
