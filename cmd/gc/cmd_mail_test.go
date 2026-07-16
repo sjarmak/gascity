@@ -677,6 +677,152 @@ func TestCmdMailSendFromControllerCreatesMessage(t *testing.T) {
 	}
 }
 
+// TestCmdMailSendFromForeignLiveIdentityIsRejected pins the #4070 fix: a
+// --from override that names a live named identity the calling session does
+// not own must be rejected before any message bead is created. Otherwise any
+// session could forge mail whose structured FROM field claims a privileged
+// identity (e.g. a coordinator/lead role).
+func TestCmdMailSendFromForeignLiveIdentityIsRejected(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_AGENT", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	// The privileged identity the attacker wants to spoof.
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			namedSessionIdentityMetadata: "test-city/mayor",
+			"alias":                      "mayor",
+			"session_name":               "mayor-session",
+		},
+	}); err != nil {
+		t.Fatalf("Create mayor: %v", err)
+	}
+	// The calling session — a different, non-privileged identity.
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "attacker",
+			"session_name": "attacker-session",
+		},
+	}); err != nil {
+		t.Fatalf("Create attacker: %v", err)
+	}
+
+	// The caller authenticates as "attacker" but passes --from mayor.
+	t.Setenv("GC_ALIAS", "attacker")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"human"}, false, false, "mayor", "", "forged", "trust me", &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("cmdMailSend(--from mayor as attacker) = 0, want failure; stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "not authorized") {
+		t.Fatalf("stderr = %q, want 'not authorized'", stderr.String())
+	}
+
+	storeAfter, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt after send: %v", err)
+	}
+	all, err := storeAfter.List(beads.ListQuery{
+		Type:      "message",
+		Status:    "open",
+		TierMode:  beads.TierBoth,
+		AllowScan: true,
+	})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	for _, b := range all {
+		if b.Type == "message" {
+			t.Fatalf("no message bead should be created for a forged --from override: %#v", b)
+		}
+	}
+}
+
+// TestCmdMailSendFromOwnLiveIdentitySucceeds pins the other side of the #4070
+// fix: naming your own identity via --from is always allowed and must not be
+// blocked by the authorization check.
+func TestCmdMailSendFromOwnLiveIdentitySucceeds(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_AGENT", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			namedSessionIdentityMetadata: "test-city/mayor",
+			"alias":                      "mayor",
+			"session_name":               "mayor-session",
+		},
+	}); err != nil {
+		t.Fatalf("Create mayor: %v", err)
+	}
+
+	// The caller *is* mayor and names its own identity via --from.
+	t.Setenv("GC_ALIAS", "mayor")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"human"}, false, false, "mayor", "", "status", "on it", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend(--from mayor as mayor) = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	storeAfter, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt after send: %v", err)
+	}
+	all, err := storeAfter.List(beads.ListQuery{
+		Type:     "message",
+		Status:   "open",
+		TierMode: beads.TierBoth,
+	})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	var msg beads.Bead
+	found := false
+	for _, b := range all {
+		if b.Type == "message" {
+			msg = b
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("message bead not found; beads=%#v", all)
+	}
+	if msg.From != "mayor" {
+		t.Fatalf("message From = %q, want mayor", msg.From)
+	}
+}
+
 func TestCmdMailSendToControllerRecipientIsRejected(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_MAIL", "")
