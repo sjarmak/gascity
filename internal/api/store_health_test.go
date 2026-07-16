@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -84,6 +86,47 @@ func TestCachedStoreHealthDoesNotHoldMutexDuringRefreshCompute(t *testing.T) {
 	_ = s.cachedStoreHealth(context.Background(), time.Unix(1_000_000, 0))
 	if !<-canLockDuringCompute {
 		t.Fatal("cachedStoreHealth held storeHealthMu while running the refresh computer")
+	}
+}
+
+func TestCachedStoreHealthSingleflightsConcurrentMisses(t *testing.T) {
+	s := &Server{}
+	var calls int32
+	release := make(chan struct{})
+	started := make(chan struct{}, 64)
+	s.storeHealthComputer = func(context.Context) *StatusStoreHealth {
+		atomic.AddInt32(&calls, 1)
+		started <- struct{}{}
+		<-release
+		return &StatusStoreHealth{SizeBytes: 7}
+	}
+
+	now := time.Unix(1_000_000, 0)
+	const n = 16
+	var wg sync.WaitGroup
+	results := make([]*StatusStoreHealth, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = s.cachedStoreHealth(context.Background(), now)
+		}(i)
+	}
+
+	// Wait until one goroutine is inside compute, give the rest a moment to
+	// pile onto the singleflight (or the freshly-cached entry), then release.
+	<-started
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("compute called %d times under concurrent misses, want 1 (singleflight)", got)
+	}
+	for i, r := range results {
+		if r == nil || r.SizeBytes != 7 {
+			t.Fatalf("result[%d] = %+v, want SizeBytes=7", i, r)
+		}
 	}
 }
 

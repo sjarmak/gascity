@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/storehealth"
 )
 
@@ -15,7 +16,14 @@ import (
 const storeHealthCacheTTL = 30 * time.Second
 
 // cachedStoreHealth returns the memoized StoreHealth block, refreshing
-// when the TTL has elapsed. Safe for concurrent callers.
+// when the TTL has elapsed. Safe for concurrent callers. Concurrent
+// cache-miss callers collapse onto a single recompute via singleflight so
+// a burst of dashboard polls after the TTL boundary runs the disk-size
+// walk + row count + maintenance read once, not once per caller — the
+// missing dedup that let a /status poll storm each re-trigger the same
+// expensive computation. The compute runs without
+// storeHealthMu held so a concurrent reader of the cache is never blocked
+// behind it.
 func (s *Server) cachedStoreHealth(ctx context.Context, now time.Time) *StatusStoreHealth {
 	s.storeHealthMu.Lock()
 	if s.storeHealthEntry != nil && now.Before(s.storeHealthExpires) {
@@ -29,16 +37,26 @@ func (s *Server) cachedStoreHealth(ctx context.Context, now time.Time) *StatusSt
 	}
 	s.storeHealthMu.Unlock()
 
-	h := compute(ctx)
+	v, _, _ := s.storeHealthSF.Do("storehealth", func() (interface{}, error) {
+		// Re-check under the flight: the entry may have been refreshed while
+		// this caller waited for the singleflight leader on an earlier burst.
+		s.storeHealthMu.Lock()
+		if s.storeHealthEntry != nil && now.Before(s.storeHealthExpires) {
+			entry := s.storeHealthEntry
+			s.storeHealthMu.Unlock()
+			return entry, nil
+		}
+		s.storeHealthMu.Unlock()
 
-	s.storeHealthMu.Lock()
-	defer s.storeHealthMu.Unlock()
-	if s.storeHealthEntry != nil && now.Before(s.storeHealthExpires) {
-		return s.storeHealthEntry
-	}
-	s.storeHealthEntry = h
-	s.storeHealthExpires = now.Add(storeHealthCacheTTL)
-	return h
+		h := compute(ctx)
+
+		s.storeHealthMu.Lock()
+		s.storeHealthEntry = h
+		s.storeHealthExpires = now.Add(storeHealthCacheTTL)
+		s.storeHealthMu.Unlock()
+		return h, nil
+	})
+	return v.(*StatusStoreHealth)
 }
 
 // computeStoreHealth measures the Dolt store on disk and the latest
@@ -55,7 +73,11 @@ func (s *Server) computeStoreHealth(ctx context.Context) *StatusStoreHealth {
 	// in profiles.
 	size := storehealth.WalkSize(storehealth.StorePath(cityPath))
 	rows := countBeadStoreRows(ctx, s.state, s.state.CityBeadStore())
-	lastAt, lastStatus := storehealth.LastMaintenance(s.state.EventProvider())
+	// SeedMaintenanceProjection (not LastMaintenance) is used here because the
+	// supervisor is the single process permitted to persist the projection
+	// sidecar; the CLI fallback reads it without writing. This first-read seed
+	// keeps the supervisor's steady-state read O(1) after one bounded scan.
+	lastAt, lastStatus := storehealth.SeedMaintenanceProjection(fsys.OSFS{}, cityPath, s.state.EventProvider())
 	h := storehealth.Compute(cityPath, size, rows, lastAt, lastStatus)
 	return statusStoreHealthFromDomain(h)
 }

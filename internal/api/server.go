@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/molecule"
@@ -108,6 +110,11 @@ type Server struct {
 	storeHealthEntry    *StatusStoreHealth
 	storeHealthExpires  time.Time
 	storeHealthComputer func(ctx context.Context) *StatusStoreHealth
+	// storeHealthSF collapses concurrent cache-miss recomputes onto one
+	// call so a burst of /status polls after the TTL expires runs the
+	// disk-size walk + row count + maintenance read once, not once per
+	// caller.
+	storeHealthSF singleflight.Group
 
 	// componentVersions caches the dolt engine and bd CLI versions the
 	// supervisor drives for /v0/status. Binary versions are immutable for
