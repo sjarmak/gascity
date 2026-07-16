@@ -887,13 +887,31 @@ func nextWorkflowServeBeads(workQuery, dir string, env map[string]string) ([]hoo
 	}
 	var beadsOut []hookBead
 	if err := json.Unmarshal([]byte(trimmed), &beadsOut); err == nil {
-		return beadsOut, nil
+		return filterDisarmedServeBeads(beadsOut), nil
 	}
 	var bead hookBead
 	if err := json.Unmarshal([]byte(trimmed), &bead); err == nil {
-		return []hookBead{bead}, nil
+		return filterDisarmedServeBeads([]hookBead{bead}), nil
 	}
 	return nil, fmt.Errorf("unexpected work query output: %s", trimmed)
+}
+
+// filterDisarmedServeBeads drops beads carrying the durable gc.disarmed flag.
+// Control beads reach a worker on this path without crossing the hook's claim
+// filter (filterUnreadyHookCandidates), so without this a disarmed control bead
+// would still be served and executed.
+//
+// Scoped to disarm deliberately: the hook's other predicates (blocked, deferred,
+// closed) are NOT applied here, so non-disarmed serve behavior is unchanged.
+func filterDisarmedServeBeads(in []hookBead) []hookBead {
+	out := make([]hookBead, 0, len(in))
+	for _, b := range in {
+		if beadmeta.IsDisarmed(b.Metadata) {
+			continue
+		}
+		out = append(out, b)
+	}
+	return out
 }
 
 // dispatchWakeFile returns the path of the dispatch-wake sentinel file.
