@@ -1572,6 +1572,14 @@ func defaultScaleCheckCountsAndDemand(targets []defaultScaleCheckTarget, caches 
 			if strings.TrimSpace(b.Assignee) != "" {
 				continue
 			}
+			// A disarmed bead is still status=open with no open deps, so bd
+			// reports it Ready. Counting it here would spawn a pool slot and
+			// hand the worker a bead ID the hook then refuses to claim — a
+			// spin/strand loop. Demand and claim must agree on what is
+			// executable (see workquery.go's routed-predicate note).
+			if beadmeta.IsDisarmed(b.Metadata) {
+				continue
+			}
 			template := controllerDemandRouteTarget(b, group.templates)
 			if _, ok := group.templates[template]; !ok {
 				continue
