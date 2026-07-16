@@ -452,7 +452,7 @@ func mergeCacheEventPatch(base, patch Bead, fields map[string]json.RawMessage) B
 		merged.Labels = slices.Clone(patch.Labels)
 	}
 	if hasCacheEventField(fields, "metadata") {
-		merged.Metadata = maps.Clone(patch.Metadata)
+		merged.Metadata = mergeCacheMetadataPreservingDisarm(merged.Metadata, patch.Metadata)
 	}
 	if hasCacheEventField(fields, "dependencies") {
 		merged.Dependencies = slices.Clone(patch.Dependencies)
@@ -467,6 +467,32 @@ func mergeCacheEventPatch(base, patch Bead, fields map[string]json.RawMessage) B
 		merged.IsBlocked = cloneBoolPtr(patch.IsBlocked)
 	}
 	return merged
+}
+
+// mergeCacheMetadataPreservingDisarm applies a metadata patch to a cached bead.
+// A metadata event carries the whole map, so the patch replaces it wholesale —
+// except for the durable gc.disarmed flag.
+//
+// This cache feeds the controller's demand snapshot, so an event whose payload
+// carries a partial metadata map would drop the flag and re-advertise a bead an
+// operator marked do-not-execute. bd stays authoritative, which makes preserving
+// the safe direction: a stale disarm only withholds demand until the next
+// authoritative read, whereas a dropped one hands the bead to a worker.
+//
+// An explicit key in the patch always wins, so the flag remains clearable.
+func mergeCacheMetadataPreservingDisarm(current, patch StringMap) StringMap {
+	next := maps.Clone(patch)
+	if !beadmeta.IsDisarmed(current) {
+		return next
+	}
+	if _, ok := patch[beadmeta.DisarmedMetadataKey]; ok {
+		return next
+	}
+	if next == nil {
+		next = make(StringMap, 1)
+	}
+	next[beadmeta.DisarmedMetadataKey] = current[beadmeta.DisarmedMetadataKey]
+	return next
 }
 
 func cacheEventConflictsCurrent(current, patch Bead, fields map[string]json.RawMessage) bool {

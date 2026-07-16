@@ -42,6 +42,35 @@ func bdReadyPoolDemandShell(limitFlag string, includeEphemeralReady bool) string
 	return `bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --metadata-field "` + beadmeta.RoutedToMetadataKey + `=$target" --unassigned --exclude-type=epic --json ` + limitFlag
 }
 
+// notDisarmedFilterJQ renders the jq filter that drops beads carrying the
+// durable gc.disarmed do-not-execute flag. bd has no negative metadata filter,
+// so the exclusion runs in jq over the returned rows.
+//
+// It mirrors beadmeta.IsDisarmedRaw exactly, and the parity matters: the
+// reconciler must not count demand the worker's claim path will refuse, or the
+// pool spawns slots forever for work nobody can take (the protocol-mismatch
+// class this file's routed-predicate note warns about).
+//   - metadata absent, or the key absent -> kept (not disarmed). Every non-bd
+//     work_query override omits the key; failing closed would strand the fleet.
+//   - bd type-infers `--set-metadata gc.disarmed=true` into a JSON boolean, so
+//     false and the "false"/"" string spellings are the only kept values.
+//   - key present with any other value (including an explicit null) -> dropped.
+//     has() is what lets jq tell "absent" from "present and null"; without it the
+//     shell would disagree with the Go readers on that shape.
+func notDisarmedFilterJQ() string {
+	k := beadmeta.DisarmedMetadataKey
+	v := `(.metadata["` + k + `"])`
+	return `[.[] | select((.metadata|type) != "object" or (.metadata|has("` + k + `")|not) or (` + v +
+		` as $d | $d == false or (($d|type) == "string" and (($d|ascii_downcase|gsub("^\\s+|\\s+$";"")) | . == "" or . == "false"))))]`
+}
+
+// bdReadyPoolDemandNotDisarmedShell is bdReadyPoolDemandShell with the disarm
+// filter applied.
+func bdReadyPoolDemandNotDisarmedShell(limitFlag string, includeEphemeralReady bool) string {
+	return bdReadyPoolDemandShell(limitFlag, includeEphemeralReady) +
+		` | ` + shellquote.Join([]string{"jq", notDisarmedFilterJQ()})
+}
+
 // bdReadyPoolDemandMigrationShell is a temporary raw compatibility probe for
 // graph.v2 workflow roots created before gc.routed_to root stamping shipped.
 // It is scoped to workflow roots so gc.run_target remains an authoring hint
@@ -146,7 +175,7 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
 // (TestEffectiveScaleCheckUsesReadyOnly).
 func poolDemandCountShell(target string, includeEphemeralReady bool) string {
 	script := `target="$1"; ` +
-		`ready_json=$(` + bdReadyPoolDemandShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
+		`ready_json=$(` + bdReadyPoolDemandNotDisarmedShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + `) || exit $?; ` +
 		`legacy_ephemeral_json=$(` + legacyEphemeralPoolDemandShell(0, includeEphemeralReady, false) + `); ` +
