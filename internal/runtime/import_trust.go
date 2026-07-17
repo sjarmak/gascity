@@ -18,6 +18,18 @@ import (
 // pass the result straight to WithTrustedImportRoot, so an empty result simply
 // leaves the external-imports modal for a human instead of auto-accepting.
 func WorkspaceImportTrustRoot(ctx context.Context, dir string) string {
+	common := gitCommonDir(ctx, dir)
+	if common == "" {
+		return ""
+	}
+	return filepath.Dir(common)
+}
+
+// gitCommonDir returns the absolute common git directory shared by every working
+// tree of the repository that contains dir, or "" when dir is empty or is not
+// inside a git repository. Two directories belong to the same repository exactly
+// when this agrees, which is what makes it the identity check for a trust root.
+func gitCommonDir(ctx context.Context, dir string) string {
 	if strings.TrimSpace(dir) == "" {
 		return ""
 	}
@@ -35,7 +47,16 @@ func WorkspaceImportTrustRoot(ctx context.Context, dir string) string {
 	if !filepath.IsAbs(common) {
 		common = filepath.Join(dir, common)
 	}
-	return filepath.Dir(filepath.Clean(common))
+	return resolvePath(common)
+}
+
+// resolvePath resolves symlinks in path so two names for the same directory
+// compare equal, falling back to a lexical clean when the path does not exist.
+func resolvePath(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return filepath.Clean(path)
 }
 
 // WorkspaceImportTrustRoots returns every working tree of the repository that
@@ -55,26 +76,42 @@ func WorkspaceImportTrustRoot(ctx context.Context, dir string) string {
 // all of them, or descend through repository metadata, still fail closed
 // (see importPathFirstParty).
 func WorkspaceImportTrustRoots(ctx context.Context, dir string) []string {
-	main := WorkspaceImportTrustRoot(ctx, dir)
-	if main == "" {
+	common := gitCommonDir(ctx, dir)
+	if common == "" {
 		return nil // not a git repository: trust nothing
 	}
+	main := filepath.Dir(common)
 	roots := []string{main}
 	seen := map[string]bool{main: true}
 
 	// --git-common-dir already proved dir is in a repository, so a failure here
 	// is a degraded git; fall back to the main tree rather than trusting nothing.
-	out, err := exec.CommandContext(ctx, "git", "-C", dir, "worktree", "list", "--porcelain").Output()
+	//
+	// -z is load-bearing, not a detail: a path may legally contain a newline, and
+	// the plain porcelain form does not escape it, so the tail of such a path
+	// renders as its own line and parses as a `worktree <path>` record git never
+	// registered. NUL framing keeps every path in exactly one field, so one
+	// ordinary `git worktree add` cannot fabricate a trust root.
+	out, err := exec.CommandContext(ctx, "git", "-C", dir, "worktree", "list", "--porcelain", "-z").Output()
 	if err != nil {
 		return roots
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		path, ok := strings.CutPrefix(strings.TrimSpace(line), "worktree ")
+	for _, field := range strings.Split(string(out), "\x00") {
+		path, ok := strings.CutPrefix(field, "worktree ")
 		if !ok {
 			continue
 		}
-		path = filepath.Clean(strings.TrimSpace(path))
+		path = filepath.Clean(path)
 		if !filepath.IsAbs(path) || seen[path] {
+			continue
+		}
+		// Trust the working tree, not the registration. Git keeps listing a
+		// worktree whose directory was removed by anything other than
+		// `git worktree remove`/`prune`, and this fork reaps worktree
+		// directories exactly that way — so a listed path may hold no working
+		// tree at all, or hold whatever someone since put there. Only a path
+		// that still resolves to this same repository is first-party.
+		if gitCommonDir(ctx, path) != common {
 			continue
 		}
 		seen[path] = true

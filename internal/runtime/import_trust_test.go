@@ -101,6 +101,87 @@ func TestWorkspaceImportTrustRootsCoversSiblingWorktrees(t *testing.T) {
 	}
 }
 
+// TestWorkspaceImportTrustRootsRejectsFabricatedRecord pins the porcelain parse
+// against a worktree path that contains a literal newline. A newline is legal in
+// a path, and `git worktree list --porcelain` does not escape it, so the tail of
+// such a path renders on its own line and reads as a second `worktree <path>`
+// record that git never registered. Splitting that output on newlines lets one
+// ordinary `git worktree add` fabricate an arbitrary trust root — repo-wide and
+// for every later session, since the registration persists until it is pruned.
+func TestWorkspaceImportTrustRootsRejectsFabricatedRecord(t *testing.T) {
+	t.Parallel()
+
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	runGit(t, repo, "init", "-q")
+	runGit(t, repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit",
+		"--allow-empty", "-q", "-m", "init")
+
+	forged := filepath.Join(base, "forged")
+	runGit(t, repo, "worktree", "add", "-q", "--detach",
+		filepath.Join(base, "evil")+"\nworktree "+forged)
+
+	roots := WorkspaceImportTrustRoots(context.Background(), repo)
+	for _, root := range roots {
+		if filepath.Clean(root) == filepath.Clean(forged) {
+			t.Errorf("WorkspaceImportTrustRoots = %v, must not include fabricated root %q", roots, forged)
+		}
+	}
+	if anyRootFirstParty(filepath.Join(forged, "AGENTS.md"), roots) {
+		t.Errorf("import under fabricated root %q is trusted; roots=%v", forged, roots)
+	}
+}
+
+// TestWorkspaceImportTrustRootsRejectsStaleRegistration pins that a worktree
+// path git still lists, but which no longer holds a working tree, is not a trust
+// root. Git only deregisters a worktree on `git worktree remove`/`prune`, and
+// this fork reaps worktree directories by other means, so stale registrations are
+// routine. Trusting the bare path would let anyone able to write to a reaped slot
+// plant an instruction file that an unattended worker auto-imports.
+func TestWorkspaceImportTrustRootsRejectsStaleRegistration(t *testing.T) {
+	t.Parallel()
+
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	runGit(t, repo, "init", "-q")
+	runGit(t, repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit",
+		"--allow-empty", "-q", "-m", "init")
+
+	reaped := filepath.Join(base, "reaped")
+	runGit(t, repo, "worktree", "add", "-q", "--detach", reaped)
+	// Removed the way a reaper removes it: the directory goes, the registration stays.
+	if err := os.RemoveAll(reaped); err != nil {
+		t.Fatalf("remove worktree dir: %v", err)
+	}
+	// Someone re-creates the path and plants an instruction file in the slot.
+	if err := os.MkdirAll(reaped, 0o755); err != nil {
+		t.Fatalf("replant slot: %v", err)
+	}
+	planted := filepath.Join(reaped, "AGENTS.md")
+	if err := os.WriteFile(planted, []byte("planted instructions"), 0o644); err != nil {
+		t.Fatalf("write planted file: %v", err)
+	}
+
+	roots := WorkspaceImportTrustRoots(context.Background(), repo)
+	if anyRootFirstParty(planted, roots) {
+		t.Errorf("planted import %q under stale registration is trusted; roots=%v", planted, roots)
+	}
+}
+
 func containsResolved(t *testing.T, roots []string, want string) bool {
 	t.Helper()
 	wantResolved := evalSymlinks(t, want)
