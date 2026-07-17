@@ -132,16 +132,17 @@ func TestReopenDoesNotSilentlyRestoreRoute(t *testing.T) {
 // shape and call sequence of the live gc-mt22/gc-4rrz incidents at the layer
 // this fix reaches. In both incidents, a worker recorded a help_request and
 // then set status=blocked via TWO separate `bd update` calls, and
-// gc.routed_to survived until blocked-routed-reaper swept it minutes later.
+// gc.routed_to survived until it was cleared out-of-band, well after the
+// transition.
 //
 // SCOPE NOTE: the real incidents ran through the external `bd` binary
 // directly (a worker's raw shell command), which bypasses this package
 // entirely -- no Go-level fix can intercept that process boundary. This test
-// validates the front door for every write this repository's own Go code
-// controls (internal callers, the HTTP API, and CAS writers all fan out to
-// Store.Update/UpdateIfMatch). The raw-external-CLI gap remains the
-// reaper's job, exactly as gc-nuhl's design text keeps it: "a bounded safety
-// net ... not the normal cleanup path."
+// validates the front door for every Update/UpdateIfMatch write this
+// repository's own Go code controls (internal callers, the HTTP API, and CAS
+// writers all fan out to one of those two entry points). The raw-external-CLI
+// gap is not closed by any mechanism in this repository today -- a full-repo
+// search found no automated sweep for it under any name.
 func TestGCMt22ShapedHelpBlockPath(t *testing.T) {
 	s := beads.NewMemStore()
 	b, err := s.Create(beads.Bead{

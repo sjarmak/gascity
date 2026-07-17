@@ -13,6 +13,8 @@ import (
 	"time"
 
 	beadslib "github.com/steveyegge/beads"
+
+	"github.com/gastownhall/gascity/internal/beadmeta"
 )
 
 func TestNativeDoltStoreCreateDelegatesToUpstreamStorage(t *testing.T) {
@@ -1356,6 +1358,104 @@ func TestNativeDoltStoreUpdateRollsBackScalarOnLabelFailure(t *testing.T) {
 	}
 	if slices.Contains(got.Labels, "new-label") || !slices.Contains(got.Labels, "keep") {
 		t.Fatalf("Labels after failed update = %#v, want original labels", got.Labels)
+	}
+}
+
+// TestNativeDoltStoreUpdateDisarmsRouteOnNonRunnableTransition is gc-nuhl's
+// end-to-end NativeDoltStore regression: Update through the public API
+// followed by Get must observe the routes cleared. Uses the same
+// newNativeDoltMemStorage/newNativeDoltStoreForTest harness as
+// TestNativeDoltStoreUpdateRollsBackScalarOnLabelFailure above.
+//
+// This does NOT, by itself, isolate nativeUpdates's own gate call: the
+// nativeDoltMemStorage double's UpdateIssue delegates to a backing *MemStore
+// (nativeDoltMemUpdateOpts -> store.Update), and MemStore.Update applies the
+// SAME gate independently (memstore.go). Removing the gate call from
+// nativeUpdates alone -- verified by temporarily commenting it out -- does
+// NOT turn this test red, because the backing MemStore's own gate still
+// clears the routes before Get ever sees them. This test still pins the
+// public Update->Get contract (a real regression if BOTH gates were
+// removed); TestNativeUpdatesDisarmsRouteOnNonRunnableTransition below
+// isolates nativeUpdates's own call in the way
+// TestApplyUpdateOptsToBeadDisarmsRouteOnNonRunnableTransition
+// (route_transition_internal_test.go) isolates applyUpdateOptsToBead for
+// the identical reason.
+//
+// Does not assert on got.Status: beadFromNativeIssue runs every native
+// status through mapBdStatus, which collapses "blocked" (and "deferred") to
+// "open" on read (see route_transition.go's nonRunnableBeadStatuses comment)
+// -- the raw "blocked" string is only ever visible to the gate at write time,
+// via opts.Status, never on a subsequent Get.
+func TestNativeDoltStoreUpdateDisarmsRouteOnNonRunnableTransition(t *testing.T) {
+	store := newNativeDoltStoreForTest(newNativeDoltMemStorage())
+	b, err := store.Create(Bead{
+		Title:  "routed work",
+		Status: "in_progress",
+		Metadata: map[string]string{
+			beadmeta.RoutedToMetadataKey:          "/home/ds/gascity/polecat",
+			beadmeta.ExecutionRoutedToMetadataKey: "/home/ds/gascity/polecat-3",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := store.Update(b.ID, UpdateOpts{Status: strptr("blocked")}); err != nil {
+		t.Fatalf("Update to blocked: %v", err)
+	}
+
+	got, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if v := got.Metadata[beadmeta.RoutedToMetadataKey]; v != "" {
+		t.Errorf("gc.routed_to = %q, want cleared", v)
+	}
+	if v := got.Metadata[beadmeta.ExecutionRoutedToMetadataKey]; v != "" {
+		t.Errorf("gc.execution_routed_to = %q, want cleared", v)
+	}
+}
+
+// TestNativeUpdatesDisarmsRouteOnNonRunnableTransition calls nativeUpdates
+// directly, bypassing the backing MemStore double that otherwise masks
+// whether this specific call site's own gate call fired (see the comment on
+// TestNativeDoltStoreUpdateDisarmsRouteOnNonRunnableTransition above). This
+// is the only test that goes genuinely RED if the
+// disarmRouteOnNonRunnableTransition call inside nativeUpdates is removed --
+// confirmed by temporarily commenting out that call and observing this test
+// fail while the black-box test above kept passing.
+func TestNativeUpdatesDisarmsRouteOnNonRunnableTransition(t *testing.T) {
+	storage := newNativeDoltMemStorage()
+	store := newNativeDoltStoreForTest(storage)
+	b, err := store.Create(Bead{
+		Title:  "routed work",
+		Status: "in_progress",
+		Metadata: map[string]string{
+			beadmeta.RoutedToMetadataKey:          "/home/ds/gascity/polecat",
+			beadmeta.ExecutionRoutedToMetadataKey: "/home/ds/gascity/polecat-3",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	updates, err := store.nativeUpdates(context.Background(), storage, b.ID, UpdateOpts{Status: strptr("blocked")})
+	if err != nil {
+		t.Fatalf("nativeUpdates: %v", err)
+	}
+	raw, ok := updates["metadata"].(json.RawMessage)
+	if !ok {
+		t.Fatalf("updates[metadata] type = %T, want json.RawMessage (gate did not run: opts.Metadata was empty)", updates["metadata"])
+	}
+	metadata, err := metadataMapFromNative(raw)
+	if err != nil {
+		t.Fatalf("metadataMapFromNative: %v", err)
+	}
+	if v := metadata[beadmeta.RoutedToMetadataKey]; v != "" {
+		t.Errorf("gc.routed_to = %q, want cleared", v)
+	}
+	if v := metadata[beadmeta.ExecutionRoutedToMetadataKey]; v != "" {
+		t.Errorf("gc.execution_routed_to = %q, want cleared", v)
 	}
 }
 
