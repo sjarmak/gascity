@@ -223,8 +223,11 @@ func isOwnershipTransition(oldStatus, oldAssignee string, opts UpdateOpts) bool 
 // stamps UpdatedAt, bumps the revision, and — when the update is an ownership
 // transition (assignee change or reopen) — bumps the ownership fence. The
 // caller must hold m.mu. It is shared by Update and UpdateIfMatch so both bump
-// identically.
+// identically, and by the same token both go through
+// disarmRouteOnNonRunnableTransition's gc-nuhl invariant from this single
+// call site.
 func (m *MemStore) applyUpdateLocked(i int, opts UpdateOpts) {
+	opts = disarmRouteOnNonRunnableTransition(opts)
 	oldStatus, oldAssignee := m.beads[i].Status, m.beads[i].Assignee
 	if opts.Title != nil {
 		m.beads[i].Title = *opts.Title
