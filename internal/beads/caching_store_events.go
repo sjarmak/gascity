@@ -482,10 +482,8 @@ func mergeCacheEventPatch(base, patch Bead, fields map[string]json.RawMessage) B
 // An explicit key in the patch always wins, so the flag remains clearable.
 func mergeCacheMetadataPreservingDisarm(current, patch StringMap) StringMap {
 	next := maps.Clone(patch)
-	if !beadmeta.IsDisarmed(current) {
-		return next
-	}
-	if _, ok := patch[beadmeta.DisarmedMetadataKey]; ok {
+	_, explicit := patch[beadmeta.DisarmedMetadataKey]
+	if explicit || !beadmeta.IsDisarmed(current) {
 		return next
 	}
 	if next == nil {
