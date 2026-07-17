@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/importtrust"
 	"github.com/gastownhall/gascity/internal/sessionlog"
 	"github.com/gastownhall/gascity/internal/shellquote"
 )
@@ -1998,7 +1999,7 @@ func (t *Tmux) DismissKnownDialogs(ctx context.Context, sess string, timeout tim
 	// are best-effort: if either fails, the trust roots stay empty and the
 	// external-imports modal is left unaccepted.
 	paneDir, _ := t.GetPaneWorkDir(sess)
-	trustRoots := runtime.WorkspaceImportTrustRoots(ctx, paneDir)
+	importRoots := importtrust.WorkspaceImportRoots(ctx, paneDir)
 	return runtime.AcceptStartupDialogsWithTimeout(ctx, timeout,
 		func(lines int) (string, error) { return t.CapturePane(sess, lines) },
 		func(keys ...string) error {
@@ -2009,7 +2010,8 @@ func (t *Tmux) DismissKnownDialogs(ctx context.Context, sess string, timeout tim
 			}
 			return nil
 		},
-		runtime.WithTrustedImportRoots(trustRoots...),
+		runtime.WithTrustedImportRoots(importRoots.Trusted...),
+		runtime.WithUntrustedImportRoots(importRoots.Untrusted...),
 	)
 }
 

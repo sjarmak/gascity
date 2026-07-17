@@ -99,7 +99,11 @@ fi
 WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // empty')
 if [ -z "$WORKTREE" ]; then
   WORKTREE_PATH=$(pwd)/worktrees/"$WORK_BEAD_ID"
-  git worktree add "$WORKTREE_PATH" --detach origin/{{base_branch}}
+  # gc worktree create, not git worktree add: it records that this tree was
+  # created from a base we control, which is what later lets an unattended
+  # session auto-accept its instruction-file imports. A tree made by bare git
+  # carries no such record and its worker parks at the import prompt.
+  gc worktree create "$WORKTREE_PATH" --base origin/{{base_branch}} --class managed
   gc bd update "$WORK_BEAD_ID" --set-metadata work_dir="$WORKTREE_PATH"
   WORKTREE="$WORKTREE_PATH"
 fi

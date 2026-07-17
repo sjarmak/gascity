@@ -335,6 +335,7 @@ func newRootCmdWithOptions(stdout, stderr io.Writer, options rootCommandOptions)
 		newTraceCmd(stdout, stderr),
 		newOrderCmd(stdout, stderr),
 		newImportCmd(stdout, stderr),
+		newWorktreeCmd(stdout, stderr),
 		newConfigCmd(stdout, stderr),
 		newPackCmd(stdout, stderr),
 		newLintCmd(stdout, stderr),

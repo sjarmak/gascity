@@ -86,6 +86,7 @@ gc [flags]
 | [gc version](#gc-version) | Print gc version |
 | [gc wait](#gc-wait) | Inspect and manage durable session waits |
 | [gc whoami](#gc-whoami) | Show the authenticated hosted Gas City account |
+| [gc worktree](#gc-worktree) | Create and classify git worktrees |
 
 ## gc agent
 
@@ -4665,3 +4666,96 @@ gc whoami [flags]
 |------|------|---------|-------------|
 | `--at` | string |  | service base URL; defaults to GC_SERVICE_URL, the stored default, then https://gascity.com |
 | `--token` | string |  | API token to check; defaults to GC_SERVICE_TOKEN or the stored login |
+
+## gc worktree
+
+Create git worktrees through the front door that records their provenance.
+
+Whether an unattended agent may auto-accept a worktree's CLAUDE.md/AGENTS.md
+imports depends on where the tree came from, and nothing about a live worktree
+reveals that: a tree staged to review an incoming pull request is as much a
+worktree of this repository as one the pool created, and neither its path nor
+its checked-out ref is evidence. The class is recorded when the tree is created
+and read back when trust is decided.
+
+```
+gc worktree
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| [gc worktree create](#gc-worktree-create) | Create a worktree and record its provenance |
+| [gc worktree provenance](#gc-worktree-provenance) | Inspect and record worktree provenance |
+
+## gc worktree create
+
+Create a git worktree and record, as one operation, whether its content is
+first-party.
+
+  --class managed          created from a base this orchestration controls;
+                           its instruction files may be auto-accepted
+  --class external-review  staged to review a ref from outside (a PR head);
+                           its instruction files are left for a human
+
+The class is required and has no default. A worktree created any other way —
+including by a bare "git worktree add" — carries no class, and an unclassified
+worktree is never trusted.
+
+```
+gc worktree create <path> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--base` | string |  | ref to check out (default: HEAD) |
+| `--branch` | string |  | create this branch at --base instead of checking out detached |
+| `--class` | string |  | provenance class: managed \| external-review (required) |
+| `--note` | string |  | evidence behind the classification |
+
+## gc worktree provenance
+
+Inspect and record worktree provenance
+
+```
+gc worktree provenance
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| [gc worktree provenance list](#gc-worktree-provenance-list) | List every worktree of this repository and its recorded provenance |
+| [gc worktree provenance set](#gc-worktree-provenance-set) | Record the provenance of an existing worktree |
+
+## gc worktree provenance list
+
+List each working tree of this repository with the provenance on record.
+
+Worktrees reported as "unclassified" predate the front door or were created by
+bare "git worktree add". They are not trusted, which for a pool worker shows up
+as an unattended session parked at the external-imports prompt. Classify the
+ones this orchestration actually created with "gc worktree provenance set".
+
+```
+gc worktree provenance list
+```
+
+## gc worktree provenance set
+
+Record the provenance of a worktree that has none.
+
+This is the migration path for worktrees created before the front door existed.
+It is deliberately manual: the classification cannot be derived from the tree
+itself — path shape and current ref are not evidence, since a review tree may
+sit anywhere and hold any ref — so an operator must supply what they know.
+
+--note is required and records that evidence. Marking a tree managed tells every
+future unattended session that its instruction files may be auto-accepted
+without a human, so the reason belongs on the record.
+
+```
+gc worktree provenance set <path> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--class` | string |  | provenance class: managed \| external-review (required) |
+| `--note` | string |  | evidence for the classification (required) |

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/importtrust"
 )
 
 // Provider implements [runtime.Provider] by delegating each operation to
@@ -236,7 +237,7 @@ func (p *Provider) dismissStartupDialogs(ctx context.Context, name string, cfg r
 	// worktree, since a worker running in a worktree imports that worktree's own
 	// instruction files. An import that escapes them all (a third-party or system
 	// path) is left for a human rather than auto-trusted.
-	trustRoot := runtime.WithTrustedImportRoots(runtime.WorkspaceImportTrustRoots(ctx, cfg.WorkDir)...)
+	importRoots := importtrust.WorkspaceImportRoots(ctx, cfg.WorkDir)
 	snapshots, closeWatch, ok, err := p.startStartupWatch(ctx, name, startupWatchFirstEventTimeout())
 	if err != nil {
 		return err
@@ -244,7 +245,8 @@ func (p *Provider) dismissStartupDialogs(ctx context.Context, name string, cfg r
 	if ok {
 		streamObserved, streamErr := runtime.AcceptStartupDialogsFromStreamWithStatus(ctx, dialogTimeout, snapshots,
 			func(keys ...string) error { return p.SendKeys(name, keys...) },
-			trustRoot,
+			runtime.WithTrustedImportRoots(importRoots.Trusted...),
+			runtime.WithUntrustedImportRoots(importRoots.Untrusted...),
 		)
 		closeErr := closeWatch()
 		switch {
@@ -256,7 +258,8 @@ func (p *Provider) dismissStartupDialogs(ctx context.Context, name string, cfg r
 			return runtime.AcceptStartupDialogs(ctx,
 				func(lines int) (string, error) { return p.Peek(name, lines) },
 				func(keys ...string) error { return p.SendKeys(name, keys...) },
-				trustRoot,
+				runtime.WithTrustedImportRoots(importRoots.Trusted...),
+				runtime.WithUntrustedImportRoots(importRoots.Untrusted...),
 			)
 		}
 	}
@@ -264,7 +267,8 @@ func (p *Provider) dismissStartupDialogs(ctx context.Context, name string, cfg r
 	return runtime.AcceptStartupDialogs(ctx,
 		func(lines int) (string, error) { return p.Peek(name, lines) },
 		func(keys ...string) error { return p.SendKeys(name, keys...) },
-		trustRoot,
+		runtime.WithTrustedImportRoots(importRoots.Trusted...),
+		runtime.WithUntrustedImportRoots(importRoots.Untrusted...),
 	)
 }
 

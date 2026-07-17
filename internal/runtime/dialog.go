@@ -35,16 +35,49 @@ type StartupDialogOption func(*startupDialogConfig)
 
 // startupDialogConfig holds resolved optional startup-dialog policy.
 type startupDialogConfig struct {
-	// trustedImportRoots gates auto-acceptance of the "Allow external CLAUDE.md
-	// file imports?" modal. When set, only imports within one of these
-	// first-party workspace trees are accepted automatically; when empty the
-	// modal is left for a human. See externalImportsTrusted.
-	trustedImportRoots []string
+	// importRoots gates auto-acceptance of the "Allow external CLAUDE.md
+	// file imports?" modal. When it holds no trusted tree the modal is left
+	// for a human. See externalImportsTrusted.
+	importRoots importRoots
+}
+
+// importRoots is the trust classification of the workspace's working trees.
+//
+// Two lists are needed, not one, because working trees nest: this fork checks
+// out a worktree inside another (the pack formulas create them at
+// `$(pwd)/worktrees/<bead>`). Trust is a path-prefix test, so a tree that sits
+// inside a trusted tree inherits its trust from the enclosing directory alone —
+// which would silently re-trust a tree staged to review an outside ref, the
+// exact case provenance exists to catch. Naming the untrusted trees lets that
+// inheritance be cut.
+type importRoots struct {
+	// trusted are working trees whose content may be auto-accepted.
+	trusted []string
+	// untrusted are working trees of the same repository whose content may
+	// not be, even when they sit inside a trusted tree.
+	untrusted []string
+}
+
+// firstParty reports whether importPath is a first-party instruction file the
+// worker may auto-import. An untrusted tree wins over any trusted tree
+// containing it: content is attributed to the innermost working tree that holds
+// it, and no enclosing directory can vouch for a tree that was never vouched
+// for itself.
+func (r importRoots) firstParty(importPath string) bool {
+	for _, root := range r.untrusted {
+		if strings.TrimSpace(root) == "" {
+			continue
+		}
+		if pathWithinTrustRoot(importPath, root) {
+			return false
+		}
+	}
+	return anyRootFirstParty(importPath, r.trusted)
 }
 
 // WithTrustedImportRoot restricts external-CLAUDE.md-import auto-acceptance to
 // imports that resolve within dir, the root of the repository the session runs
-// in (resolve it with WorkspaceImportTrustRoot). Without it, the external-imports
+// in (resolve it with importtrust.WorkspaceImportRoots). Without it, the external-imports
 // modal is left unaccepted so a human can decide, because auto-accepting imports
 // from outside the repository would trust files the worker was never meant to
 // read.
@@ -53,19 +86,37 @@ func WithTrustedImportRoot(dir string) StartupDialogOption {
 }
 
 // WithTrustedImportRoots is WithTrustedImportRoot over every working tree of the
-// repository (resolve them with WorkspaceImportTrustRoots). An import is
+// repository (resolve them with importtrust.WorkspaceImportRoots). An import is
 // auto-accepted when it is first-party under any one of them, which is what a
 // worker running in a linked worktree needs: its own instruction files live in
 // that worktree, not in the main tree. Empty entries are ignored.
 func WithTrustedImportRoots(dirs ...string) StartupDialogOption {
 	return func(c *startupDialogConfig) {
-		c.trustedImportRoots = nil
-		for _, dir := range dirs {
-			if strings.TrimSpace(dir) != "" {
-				c.trustedImportRoots = append(c.trustedImportRoots, dir)
-			}
+		c.importRoots.trusted = nonEmpty(dirs)
+	}
+}
+
+// WithUntrustedImportRoots names working trees whose content must not be
+// auto-accepted even though it sits inside a trusted tree — a tree staged to
+// review an outside ref, or one whose provenance was never recorded (resolve
+// them with importtrust.WorkspaceImportRoots). Without it, a review tree
+// checked out inside the repository inherits the enclosing tree's trust and its
+// own instruction files auto-accept. Empty entries are ignored.
+func WithUntrustedImportRoots(dirs ...string) StartupDialogOption {
+	return func(c *startupDialogConfig) {
+		c.importRoots.untrusted = nonEmpty(dirs)
+	}
+}
+
+// nonEmpty returns dirs without blank entries.
+func nonEmpty(dirs []string) []string {
+	var out []string
+	for _, dir := range dirs {
+		if strings.TrimSpace(dir) != "" {
+			out = append(out, dir)
 		}
 	}
+	return out
 }
 
 func newStartupDialogConfig(opts []StartupDialogOption) startupDialogConfig {
@@ -167,7 +218,7 @@ func AcceptStartupDialogsFromStreamWithStatus(
 	if err := ctx.Err(); err != nil {
 		return observed, err
 	}
-	phaseObserved, err = acceptExternalImportsDialogFromStream(ctx, timeout, stream, trackingSendKeys, cfg.trustedImportRoots)
+	phaseObserved, err = acceptExternalImportsDialogFromStream(ctx, timeout, stream, trackingSendKeys, cfg.importRoots)
 	if err != nil {
 		return observed, fmt.Errorf("external imports dialog: %w", err)
 	}
@@ -270,7 +321,7 @@ func AcceptStartupDialogsWithTimeout(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := acceptExternalImportsDialog(ctx, timeout, peek, sendKeys, cfg.trustedImportRoots); err != nil {
+	if err := acceptExternalImportsDialog(ctx, timeout, peek, sendKeys, cfg.importRoots); err != nil {
 		return fmt.Errorf("external imports dialog: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -558,7 +609,7 @@ func acceptExternalImportsDialog(
 	timeout time.Duration,
 	peek func(lines int) (string, error),
 	sendKeys func(keys ...string) error,
-	trustedRoots []string,
+	roots importRoots,
 ) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -571,7 +622,7 @@ func acceptExternalImportsDialog(
 			return err
 		}
 
-		if containsExternalImportsDialog(content) && externalImportsTrusted(content, trustedRoots...) {
+		if containsExternalImportsDialog(content) && externalImportsTrusted(content, roots) {
 			if err := sendKeys("Enter"); err != nil {
 				return err
 			}
@@ -601,11 +652,11 @@ func acceptExternalImportsDialogFromStream(
 	timeout time.Duration,
 	snapshots *replayableSnapshotCursor,
 	sendKeys func(keys ...string) error,
-	trustedRoots []string,
+	roots importRoots,
 ) (bool, error) {
 	return acceptDialogFromStream(ctx, timeout, snapshots, sendKeys, streamDialogSpec{
 		match: func(content string) bool {
-			return containsExternalImportsDialog(content) && externalImportsTrusted(content, trustedRoots...)
+			return containsExternalImportsDialog(content) && externalImportsTrusted(content, roots)
 		},
 		matchKeys:   []string{"Enter"},
 		matchDelay:  startupDialogAcceptDelay,
@@ -637,15 +688,18 @@ func containsPostExternalImportsStartupDialog(content string) bool {
 // import that escapes every root (a sibling repo, an unrelated parent directory,
 // a home or system path) is not, and neither is an in-root path that descends
 // through a repository metadata or runtime directory such as .git or .gc (see
-// importPathFirstParty). No roots, or a modal with no parseable import path,
-// trusts nothing so a human decides.
-func externalImportsTrusted(content string, trustRoots ...string) bool {
+// importPathFirstParty). An import inside a working tree that was never vouched
+// for — one staged to review an outside ref, or one with no recorded provenance
+// — is not first-party either, even when that tree sits inside a trusted one
+// (see importRoots.firstParty). No roots, or a modal with no parseable import
+// path, trusts nothing so a human decides.
+func externalImportsTrusted(content string, roots importRoots) bool {
 	imports := parseExternalImportPaths(content)
 	if len(imports) == 0 {
 		return false
 	}
 	for _, importPath := range imports {
-		if !anyRootFirstParty(importPath, trustRoots) {
+		if !roots.firstParty(importPath) {
 			return false
 		}
 	}

@@ -204,7 +204,10 @@
               "context-use",
               "login",
               "logout",
-              "whoami"
+              "whoami",
+              "worktree-create",
+              "worktree-provenance-list",
+              "worktree-provenance-set"
             ]
           },
           "event_id": {

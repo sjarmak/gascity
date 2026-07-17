@@ -6,9 +6,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/git"
 )
 
-func TestWorkspaceImportTrustRoot(t *testing.T) {
+// TestWorkspaceImportRootsAnchorsOnMainTree pins that every working tree of a
+// repository resolves back to the same main tree: a linked worktree under
+// `<repo>/.gc/worktrees/<id>` maps to `<repo>`, the tree holding the
+// repository's own AGENTS.md, which a session inside the worktree sees as an
+// external import. Outside a repository nothing is trusted at all.
+func TestWorkspaceImportRootsAnchorsOnMainTree(t *testing.T) {
 	t.Parallel()
 
 	if _, err := exec.LookPath("git"); err != nil {
@@ -20,9 +27,6 @@ func TestWorkspaceImportTrustRoot(t *testing.T) {
 	runGit(t, repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit",
 		"--allow-empty", "-q", "-m", "init")
 
-	// A linked worktree under the repo must resolve back to the main repo root,
-	// so an import of the repo-root AGENTS.md (seen as external from the
-	// worktree subdirectory) is recognized as first-party.
 	wtParent := filepath.Join(repo, ".gc", "worktrees")
 	if err := os.MkdirAll(wtParent, 0o755); err != nil {
 		t.Fatalf("mkdir worktrees: %v", err)
@@ -30,19 +34,18 @@ func TestWorkspaceImportTrustRoot(t *testing.T) {
 	wt := filepath.Join(wtParent, "wt")
 	runGit(t, repo, "worktree", "add", "-q", "--detach", wt)
 
-	wantRoot := evalSymlinks(t, repo)
-
 	for _, dir := range []string{repo, wt} {
-		if got := evalSymlinks(t, WorkspaceImportTrustRoot(context.Background(), dir)); got != wantRoot {
-			t.Errorf("WorkspaceImportTrustRoot(%q) = %q, want repo root %q", dir, got, wantRoot)
+		roots := importRootsFor(context.Background(), dir)
+		if !containsResolved(t, roots.trusted, repo) {
+			t.Errorf("import roots from %q = %v, want the main tree %q", dir, roots.trusted, repo)
 		}
 	}
 
-	if got := WorkspaceImportTrustRoot(context.Background(), t.TempDir()); got != "" {
-		t.Errorf("WorkspaceImportTrustRoot(non-git dir) = %q, want empty", got)
-	}
-	if got := WorkspaceImportTrustRoot(context.Background(), ""); got != "" {
-		t.Errorf("WorkspaceImportTrustRoot(empty) = %q, want empty", got)
+	for _, dir := range []string{t.TempDir(), ""} {
+		roots := importRootsFor(context.Background(), dir)
+		if len(roots.trusted) != 0 || len(roots.untrusted) != 0 {
+			t.Errorf("import roots from non-repository %q = %+v, want none", dir, roots)
+		}
 	}
 }
 
@@ -52,52 +55,38 @@ func TestWorkspaceImportTrustRoot(t *testing.T) {
 // imports belongs to another working tree of the same repository. Trusting only
 // the main tree leaves that import untrusted, so the external-imports modal is
 // never auto-accepted and the unattended worker sits at the prompt forever.
+//
+// The trees are created through the provenance front door because that is now
+// what separates them from a tree staged to review an outside ref; the wedge
+// must stay fixed for the managed case without trusting the review case.
 func TestWorkspaceImportTrustRootsCoversSiblingWorktrees(t *testing.T) {
 	t.Parallel()
 
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not available")
-	}
-
-	base := t.TempDir()
-	repo := filepath.Join(base, "repo")
-	if err := os.MkdirAll(repo, 0o755); err != nil {
-		t.Fatalf("mkdir repo: %v", err)
-	}
-	runGit(t, repo, "init", "-q")
-	runGit(t, repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit",
-		"--allow-empty", "-q", "-m", "init")
+	base, repo := initProvenanceRepo(t)
 
 	// The deployed shape: worktrees live beside the repo, not under it, and one
 	// worktree nests inside another (`<base>/wt/worktrees/nested`).
 	outer := filepath.Join(base, "wt")
-	runGit(t, repo, "worktree", "add", "-q", "--detach", outer)
+	addWorktree(t, repo, outer, git.ProvenanceManaged)
 	nested := filepath.Join(outer, "worktrees", "nested")
-	runGit(t, repo, "worktree", "add", "-q", "--detach", nested)
+	addWorktree(t, repo, nested, git.ProvenanceManaged)
 
-	roots := WorkspaceImportTrustRoots(context.Background(), nested)
+	roots := importRootsFor(context.Background(), nested)
 	for _, want := range []string{repo, outer, nested} {
-		if !containsResolved(t, roots, want) {
+		if !containsResolved(t, roots.trusted, want) {
 			t.Errorf("WorkspaceImportTrustRoots(%q) = %v, want it to include %q", nested, roots, want)
 		}
 	}
 
 	// The outer worktree's AGENTS.md is what the live modal listed as external.
 	agents := filepath.Join(outer, "AGENTS.md")
-	if !anyRootFirstParty(agents, roots) {
+	if !roots.firstParty(agents) {
 		t.Errorf("import %q not first-party under roots %v; the live modal would wedge the worker", agents, roots)
 	}
 
 	// A path outside every working tree stays untrusted so a human decides.
-	if anyRootFirstParty(filepath.Join(base, "elsewhere", "AGENTS.md"), roots) {
+	if roots.firstParty(filepath.Join(base, "elsewhere", "AGENTS.md")) {
 		t.Error("a path outside every working tree must not be trusted")
-	}
-
-	if got := WorkspaceImportTrustRoots(context.Background(), t.TempDir()); len(got) != 0 {
-		t.Errorf("WorkspaceImportTrustRoots(non-git dir) = %v, want none", got)
-	}
-	if got := WorkspaceImportTrustRoots(context.Background(), ""); len(got) != 0 {
-		t.Errorf("WorkspaceImportTrustRoots(empty) = %v, want none", got)
 	}
 }
 
@@ -128,13 +117,13 @@ func TestWorkspaceImportTrustRootsRejectsFabricatedRecord(t *testing.T) {
 	runGit(t, repo, "worktree", "add", "-q", "--detach",
 		filepath.Join(base, "evil")+"\nworktree "+forged)
 
-	roots := WorkspaceImportTrustRoots(context.Background(), repo)
-	for _, root := range roots {
+	roots := importRootsFor(context.Background(), repo)
+	for _, root := range roots.trusted {
 		if filepath.Clean(root) == filepath.Clean(forged) {
 			t.Errorf("WorkspaceImportTrustRoots = %v, must not include fabricated root %q", roots, forged)
 		}
 	}
-	if anyRootFirstParty(filepath.Join(forged, "AGENTS.md"), roots) {
+	if roots.firstParty(filepath.Join(forged, "AGENTS.md")) {
 		t.Errorf("import under fabricated root %q is trusted; roots=%v", forged, roots)
 	}
 }
@@ -176,8 +165,8 @@ func TestWorkspaceImportTrustRootsRejectsStaleRegistration(t *testing.T) {
 		t.Fatalf("write planted file: %v", err)
 	}
 
-	roots := WorkspaceImportTrustRoots(context.Background(), repo)
-	if anyRootFirstParty(planted, roots) {
+	roots := importRootsFor(context.Background(), repo)
+	if roots.firstParty(planted) {
 		t.Errorf("planted import %q under stale registration is trusted; roots=%v", planted, roots)
 	}
 }
