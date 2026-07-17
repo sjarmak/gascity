@@ -1165,7 +1165,6 @@ func (s *NativeDoltStore) Ready(queries ...ReadyQuery) ([]Bead, error) {
 		var beads []Bead
 		seen := make(map[string]bool)
 		now := time.Now().UTC()
-	statusLoop:
 		for _, status := range nativeDoltOpenReadyStatuses {
 			filter := beadslib.WorkFilter{Status: status}
 			if q.TierMode == TierBoth || q.TierMode == TierWisps {
@@ -1188,9 +1187,6 @@ func (s *NativeDoltStore) Ready(queries ...ReadyQuery) ([]Bead, error) {
 				}
 				seen[bead.ID] = true
 				beads = append(beads, bead)
-				if q.Limit > 0 && len(beads) >= q.Limit {
-					break statusLoop
-				}
 			}
 		}
 		out = beads
@@ -1198,6 +1194,17 @@ func (s *NativeDoltStore) Ready(queries ...ReadyQuery) ([]Bead, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	// GetReadyWork satisfies a dependency on any closed blocker, so a
+	// hard-failed step would unlock everything behind it. Gate on the blocker's
+	// outcome before the limit, so gated steps cannot consume the caller's
+	// slots and starve genuinely ready work (gc-d58o).
+	out, err = rejectTerminallyFailedBlocked(s, out)
+	if err != nil {
+		return nil, err
+	}
+	if q.Limit > 0 && len(out) > q.Limit {
+		out = out[:q.Limit]
 	}
 	return out, nil
 }

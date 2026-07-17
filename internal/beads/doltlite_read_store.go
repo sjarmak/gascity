@@ -327,9 +327,22 @@ func (s *DoltliteReadStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 	// alignment because honoring rq.TierMode here also needs the wisp
 	// dependency graph modeled in the ready blocker predicate. Tracked as
 	// follow-up ga-4ax9bj.
-	out, err := s.queryIssuesOrderedInTables(q, []doltliteTableSet{doltliteIssueTables}, readyWhere, readyArgs, q.Limit, "ORDER BY COALESCE(i.priority, 2) ASC, i.created_at ASC, i.id ASC")
+	// The ready predicate above satisfies a dependency on any closed blocker,
+	// so a hard-failed step would unlock everything behind it. The outcome gate
+	// lives in Go rather than SQL because it reads gc.* keys out of the
+	// metadata JSON blob. Fetch unlimited and cut after gating: applying the
+	// SQL LIMIT first would let gated steps consume the caller's slots and
+	// starve genuinely ready work (gc-d58o).
+	out, err := s.queryIssuesOrderedInTables(q, []doltliteTableSet{doltliteIssueTables}, readyWhere, readyArgs, 0, "ORDER BY COALESCE(i.priority, 2) ASC, i.created_at ASC, i.id ASC")
 	if err != nil {
 		return nil, err
+	}
+	out, err = rejectTerminallyFailedBlocked(s, out)
+	if err != nil {
+		return nil, err
+	}
+	if q.Limit > 0 && len(out) > q.Limit {
+		out = out[:q.Limit]
 	}
 	s.readyMu.Lock()
 	if hash != "" {

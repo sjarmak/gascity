@@ -252,7 +252,7 @@ func (c *CachingStore) cachedReadyCompleteOnly(ctx context.Context, query ReadyQ
 		return nil, fmt.Errorf("reading complete ready projection from cache: %w", ErrCacheUnavailable)
 	}
 
-	statusByID := make(map[string]string, len(c.beads))
+	blockersByID := make(map[string]blockerState, len(c.beads))
 	openBeads := make([]Bead, 0, len(c.beads))
 	now := time.Now().UTC()
 	for _, b := range c.beads {
@@ -260,7 +260,7 @@ func (c *CachingStore) cachedReadyCompleteOnly(ctx context.Context, query ReadyQ
 			c.mu.RUnlock()
 			return nil, err
 		}
-		statusByID[b.ID] = b.Status
+		blockersByID[b.ID] = blockerStateOf(b)
 		if !IsReadyCandidateForTier(b, now, query.TierMode) {
 			continue
 		}
@@ -281,7 +281,7 @@ func (c *CachingStore) cachedReadyCompleteOnly(ctx context.Context, query ReadyQ
 
 	// The maps above are a consistent snapshot, so sorting and dependency
 	// evaluation need not hold the cache lock or delay writers.
-	return cachedReadyRows(ctx, query, statusByID, openBeads, depsByID, true)
+	return cachedReadyRows(ctx, query, blockersByID, openBeads, depsByID, true)
 }
 
 func (c *CachingStore) cachedReadyLocked(query ReadyQuery) ([]Bead, error) {
@@ -289,11 +289,11 @@ func (c *CachingStore) cachedReadyLocked(query ReadyQuery) ([]Bead, error) {
 		return nil, fmt.Errorf("reading ready beads from cache: %w", ErrCacheUnavailable)
 	}
 
-	statusByID := make(map[string]string, len(c.beads))
+	blockersByID := make(map[string]blockerState, len(c.beads))
 	openBeads := make([]Bead, 0, len(c.beads))
 	now := time.Now().UTC()
 	for _, b := range c.beads {
-		statusByID[b.ID] = b.Status
+		blockersByID[b.ID] = blockerStateOf(b)
 		if !IsReadyCandidateForTier(b, now, query.TierMode) {
 			continue
 		}
@@ -302,13 +302,13 @@ func (c *CachingStore) cachedReadyLocked(query ReadyQuery) ([]Bead, error) {
 		}
 		openBeads = append(openBeads, cloneBead(b))
 	}
-	return cachedReadyRows(context.Background(), query, statusByID, openBeads, c.deps, c.depsComplete)
+	return cachedReadyRows(context.Background(), query, blockersByID, openBeads, c.deps, c.depsComplete)
 }
 
 func cachedReadyRows(
 	ctx context.Context,
 	query ReadyQuery,
-	statusByID map[string]string,
+	blockersByID map[string]blockerState,
 	openBeads []Bead,
 	depsByID map[string][]Dep,
 	depsComplete bool,
@@ -338,7 +338,7 @@ func cachedReadyRows(
 		default:
 			return nil, fmt.Errorf("reading ready deps from cache: %w", ErrCacheUnavailable)
 		}
-		if !cachedBeadReady(b, statusByID, deps) {
+		if !cachedBeadReady(b, blockersByID, deps) {
 			continue
 		}
 		result = append(result, cloneBead(b))

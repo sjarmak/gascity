@@ -787,20 +787,11 @@ func beadOutcomeFailed(subject beads.Bead) bool {
 	}
 }
 
+// isRetryAttemptSubject reports whether a bead is a retry-managed attempt.
+// Readiness gates on the same classification, so the rule has one home in
+// beads: the two must never disagree about what a retry attempt is.
 func isRetryAttemptSubject(subject beads.Bead) bool {
-	if subject.Metadata[beadmeta.LogicalBeadIDMetadataKey] == "" {
-		return false
-	}
-	// v1 pattern: attempt beads have gc.kind "retry-run" or "retry-eval".
-	switch subject.Metadata[beadmeta.KindMetadataKey] {
-	case "retry-run", "retry-eval":
-		return true
-	}
-	// v2 pattern: attempt beads keep their original kind but carry gc.attempt.
-	if subject.Metadata[beadmeta.AttemptMetadataKey] != "" {
-		return true
-	}
-	return false
+	return beads.IsRetryAttemptSubject(subject)
 }
 
 func processWorkflowFinalize(store beads.Store, bead beads.Bead, opts ProcessOptions) (ControlResult, error) {

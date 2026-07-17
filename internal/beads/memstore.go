@@ -354,12 +354,12 @@ func (m *MemStore) readyLocked(ctx context.Context, q ReadyQuery) ([]Bead, error
 		return ctx.Err()
 	}
 
-	statusByID := make(map[string]string, len(m.beads))
+	blockersByID := make(map[string]blockerState, len(m.beads))
 	for _, bead := range m.beads {
 		if err := contextErr(); err != nil {
 			return nil, err
 		}
-		statusByID[bead.ID] = bead.Status
+		blockersByID[bead.ID] = blockerStateOf(bead)
 	}
 
 	var result []Bead
@@ -387,7 +387,9 @@ func (m *MemStore) readyLocked(ctx context.Context, q ReadyQuery) ([]Bead, error
 			default:
 				continue
 			}
-			if statusByID[dep.DependsOnID] != "closed" {
+			// A blocker satisfies its dependents only by closing successfully.
+			// An unresolvable blocker keeps its dependents blocked, as before.
+			if !blockersByID[dep.DependsOnID].satisfies() {
 				blocked = true
 				break
 			}

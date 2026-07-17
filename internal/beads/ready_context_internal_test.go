@@ -142,10 +142,10 @@ func TestCachedReadyRowsBackgroundUsesCanonicalOrderWithoutErrChecks(t *testing.
 		{ID: "gc-b", Status: "open", Priority: &priorityZero, CreatedAt: created.Add(time.Minute)},
 		{ID: "gc-a", Status: "open", Priority: &priorityZero, CreatedAt: created},
 	}
-	statusByID := map[string]string{"gc-a": "open", "gc-b": "open", "gc-c": "open"}
+	blockersByID := map[string]blockerState{"gc-a": {status: "open"}, "gc-b": {status: "open"}, "gc-c": {status: "open"}}
 	ctx := &countingErrContext{Context: context.Background()}
 
-	rows, err := cachedReadyRows(ctx, ReadyQuery{Limit: 2}, statusByID, openBeads, nil, true)
+	rows, err := cachedReadyRows(ctx, ReadyQuery{Limit: 2}, blockersByID, openBeads, nil, true)
 	if err != nil {
 		t.Fatalf("cachedReadyRows: %v", err)
 	}
