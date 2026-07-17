@@ -47,7 +47,12 @@ func TestIsDisarmedRaw(t *testing.T) {
 		// Absent -> NOT disarmed. Required: every non-bd work_query override and
 		// test fixture omits the key; failing closed here would strand the fleet.
 		{name: "key absent", set: false, want: false},
-		{name: "explicit JSON null", val: nil, set: true, want: true},
+		// Explicit null -> NOT disarmed. Required for the same reason, one layer
+		// down: the string-shaped decoders collapse null to "" (proven by
+		// beads.TestStringMapCollapsesJSONNullToPresentEmpty), so failing closed
+		// here would be reachable only on the raw side — demand would count the
+		// bead while claim refused it, which is the spawn loop itself.
+		{name: "explicit JSON null", val: nil, set: true, want: false},
 		// Present but unreadable -> disarmed (fail closed). Someone deliberately
 		// wrote a do-not-execute marker we could not parse; executing anyway is
 		// the exact failure this contract exists to prevent.
@@ -113,14 +118,27 @@ func TestIsDisarmedNilMaps(t *testing.T) {
 	}
 }
 
-// TestDisarmedDecodersAgree is the cross-decoder invariant: the same bd value,
-// read through either decoder, must mean the same thing. This is the property
-// that the original plan violated.
+// TestDisarmedDecodersAgree is a local unit pin on the cross-decoder invariant:
+// the same bd value, read through either decoder, must mean the same thing.
+//
+// It is deliberately limited to the shapes its hand-rolled mirror below can
+// represent faithfully — string, bool, and nil. beadmeta cannot import beads to
+// use the real StringMap (beads imports beadmeta, so that would cycle), and a
+// mirror is exactly what let the null gap through: it modeled bool and string
+// and silently defaulted everything else to "". Do not extend this table with
+// numbers or objects; the mirror would render them "" and report a disagreement
+// production does not have.
+//
+// beads.TestDisarmDecoderParityThroughRealDecoders is the authoritative parity
+// test — it feeds raw JSON through the production decoders and covers the full
+// shape table.
 func TestDisarmedDecodersAgree(t *testing.T) {
-	for _, raw := range []any{true, false, "true", "false", "", "banana"} {
+	for _, raw := range []any{true, false, "true", "false", "", "banana", nil} {
 		rawMD := map[string]any{DisarmedMetadataKey: raw}
 
-		// Mirror StringMap's coercion: booleans render as "true"/"false".
+		// Mirror the string decoders' coercion: booleans render as
+		// "true"/"false", and a JSON null collapses to "" (the zero value left
+		// by encoding/json's no-op null unmarshal).
 		var coerced string
 		switch v := raw.(type) {
 		case bool:

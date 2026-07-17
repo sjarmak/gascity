@@ -53,7 +53,6 @@ const (
 	ClosedByAttemptMetadataKey           = "gc.closed_by_attempt"
 	ContinuationGroupMetadataKey         = "gc.continuation_group"
 	ControlDispatcherFallbackMetadataKey = "gc.control_dispatcher_fallback"
-	DisarmedMetadataKey                  = "gc.disarmed"
 	ControlEpochMetadataKey              = "gc.control_epoch"
 	ControlForMetadataKey                = "gc.control_for"
 	ControlQuarantineReasonMetadataKey   = "gc.control_quarantine_reason"
@@ -81,6 +80,7 @@ const (
 	DeferredRoutedToMetadataKey          = "gc.deferred_routed_to"
 	DeferredTypeMetadataKey              = "gc.deferred_type"
 	DetachedMetadataKey                  = "gc.detached"
+	DisarmedMetadataKey                  = "gc.disarmed"
 	DrainContextMetadataKey              = "gc.drain_context"
 	DrainContinuationGroupMetadataKey    = "gc.drain_continuation_group"
 	DrainControlIDMetadataKey            = "gc.drain_control_id"
@@ -323,6 +323,7 @@ var KnownMetadataKeys = []string{
 	DeferredRoutedToMetadataKey,
 	DeferredTypeMetadataKey,
 	DetachedMetadataKey,
+	DisarmedMetadataKey,
 	DrainContextMetadataKey,
 	DrainContinuationGroupMetadataKey,
 	DrainControlIDMetadataKey,

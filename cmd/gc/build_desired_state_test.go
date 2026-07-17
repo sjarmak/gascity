@@ -1150,6 +1150,101 @@ func TestDefaultScaleCheckCountsCountsUnassignedRoutedPoolWork(t *testing.T) {
 	}
 }
 
+// TestDefaultScaleCheckCountsSkipsDisarmedRoutedWork covers the primary
+// production demand path: with a store present and no custom scale_check, this
+// Go-native reader is what decides whether the pool spawns, and the shell probe
+// is bypassed entirely.
+//
+// A disarmed bead is still status=open with no open deps, so bd reports it
+// Ready and it arrives here looking exactly like the countable bead in the test
+// above. Counting it spawns a slot the hook then refuses to serve, so the
+// session idle-exits and the next tick repeats it.
+func TestDefaultScaleCheckCountsSkipsDisarmedRoutedWork(t *testing.T) {
+	const template = "gascity/reviewer"
+	backing := beads.NewMemStore()
+	if _, err := backing.Create(beads.Bead{
+		Title:  "disarmed routed pool work",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to": template,
+			// bd type-infers --set-metadata gc.disarmed=true to a JSON boolean;
+			// StringMap coerces it to "true" on the way to this reader.
+			beadmeta.DisarmedMetadataKey: "true",
+		},
+	}); err != nil {
+		t.Fatalf("create disarmed bead: %v", err)
+	}
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+
+	counts, demand, _, errs := defaultScaleCheckCountsAndDemand([]defaultScaleCheckTarget{{
+		template: template,
+		storeKey: "rig:gascity",
+		store:    cache,
+	}})
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCountsAndDemand errs = %v", errs)
+	}
+	if got := counts[template]; got != 0 {
+		t.Fatalf("counts[%q] = %d, want 0 for a disarmed bead", template, got)
+	}
+	if entry := demand[template]; entry.Count != 0 || len(entry.WorkBeadIDs) != 0 {
+		t.Fatalf("demand[%q] = %+v, want no counted work for a disarmed bead", template, entry)
+	}
+}
+
+// TestDefaultScaleCheckCountsCountsArmedPeerOfDisarmedRoutedWork guards the
+// other direction: the skip drops only the disarmed bead, and armed work on the
+// same route still raises demand.
+func TestDefaultScaleCheckCountsCountsArmedPeerOfDisarmedRoutedWork(t *testing.T) {
+	const template = "gascity/reviewer"
+	backing := beads.NewMemStore()
+	if _, err := backing.Create(beads.Bead{
+		Title:  "disarmed routed pool work",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to":               template,
+			beadmeta.DisarmedMetadataKey: "true",
+		},
+	}); err != nil {
+		t.Fatalf("create disarmed bead: %v", err)
+	}
+	armed, err := backing.Create(beads.Bead{
+		Title:  "armed routed pool work",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to": template,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create armed bead: %v", err)
+	}
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+
+	counts, demand, _, errs := defaultScaleCheckCountsAndDemand([]defaultScaleCheckTarget{{
+		template: template,
+		storeKey: "rig:gascity",
+		store:    cache,
+	}})
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCountsAndDemand errs = %v", errs)
+	}
+	if got := counts[template]; got != 1 {
+		t.Fatalf("counts[%q] = %d, want 1 (armed peer only)", template, got)
+	}
+	if ids := demand[template].WorkBeadIDs; len(ids) != 1 || ids[0] != armed.ID {
+		t.Fatalf("demand[%q].WorkBeadIDs = %v, want only the armed bead %q", template, ids, armed.ID)
+	}
+}
+
 func TestDefaultScaleCheckCountsCountsRoutedVaporWispViaReady(t *testing.T) {
 	const template = "maintenance.dog"
 	backing := &demandListCountingStore{Store: beads.NewMemStore()}
@@ -11911,6 +12006,84 @@ func TestOpenControlDispatcherDemandHonorsBareLegacyRoute(t *testing.T) {
 	demand := openControlDispatcherDemand(cfg, work)
 	if !demand["core.control-dispatcher"] {
 		t.Fatalf("openControlDispatcherDemand = %v, want demand keyed by qualified name from bare route", demand)
+	}
+}
+
+// TestOpenControlDispatcherDemandSkipsDisarmed pins the interlock on the raw
+// List(status=open) demand path. It is fed by collectOpenUnassignedRoutedWork
+// and never passes through Ready(), so it needs its own disarm skip; its result
+// then FORCES the template's scale-check count to 1, overriding the Ready-backed
+// tally. Without the skip a single disarmed control bead spawns a session the
+// hook refuses to serve, which idle-exits and respawns on the next tick.
+func TestOpenControlDispatcherDemandSkipsDisarmed(t *testing.T) {
+	maxActive := 1
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              config.ControlDispatcherAgentName,
+			BindingName:       "core",
+			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+			MaxActiveSessions: &maxActive,
+		}},
+	}
+	// Both route spellings, so the skip cannot be satisfied by a route miss.
+	for _, route := range []string{
+		config.ControlDispatcherAgentName,
+		"core." + config.ControlDispatcherAgentName,
+	} {
+		t.Run(route, func(t *testing.T) {
+			work := []beads.Bead{{
+				Status: "open",
+				Metadata: map[string]string{
+					"gc.kind":      "retry",
+					"gc.routed_to": route,
+					// bd type-infers --set-metadata gc.disarmed=true to a JSON
+					// boolean; StringMap coerces it to "true".
+					beadmeta.DisarmedMetadataKey: "true",
+				},
+			}}
+			if demand := openControlDispatcherDemand(cfg, work); len(demand) != 0 {
+				t.Fatalf("openControlDispatcherDemand = %v, want no demand for a disarmed bead", demand)
+			}
+		})
+	}
+}
+
+// TestOpenControlDispatcherDemandCountsArmedPeerOfDisarmed guards the other
+// direction: the skip must drop only the disarmed bead, not starve the armed
+// work sharing its route.
+func TestOpenControlDispatcherDemandCountsArmedPeerOfDisarmed(t *testing.T) {
+	maxActive := 1
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              config.ControlDispatcherAgentName,
+			BindingName:       "core",
+			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+			MaxActiveSessions: &maxActive,
+		}},
+	}
+	work := []beads.Bead{
+		{
+			ID:     "disarmed",
+			Status: "open",
+			Metadata: map[string]string{
+				"gc.kind":                    "retry",
+				"gc.routed_to":               config.ControlDispatcherAgentName,
+				beadmeta.DisarmedMetadataKey: "true",
+			},
+		},
+		{
+			ID:     "armed",
+			Status: "open",
+			Metadata: map[string]string{
+				"gc.kind":      "retry",
+				"gc.routed_to": config.ControlDispatcherAgentName,
+			},
+		},
+	}
+	if demand := openControlDispatcherDemand(cfg, work); !demand["core.control-dispatcher"] {
+		t.Fatalf("openControlDispatcherDemand = %v, want demand from the armed peer", demand)
 	}
 }
 

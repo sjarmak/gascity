@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
@@ -284,8 +285,10 @@ func TestNotDisarmedFilterJQMatchesGoDecoder(t *testing.T) {
 		{"string yes", map[string]any{"id": "b1", "metadata": map[string]any{k: "yes"}}},
 		{"number", map[string]any{"id": "b1", "metadata": map[string]any{k: 1}}},
 		{"object", map[string]any{"id": "b1", "metadata": map[string]any{k: map[string]any{"nested": true}}}},
-		// has() is what lets jq tell an explicit null from an absent key. Without
-		// it these two rows would collide, and every unmarked bead would strand.
+		// An explicit null and an absent key deliberately collide: the Go string
+		// decoders collapse null to "", so both mean not-disarmed and both are
+		// kept (see beadmeta/disarm.go). wantKept below derives from the Go
+		// reader, so this row pins jq to whatever beadmeta decides.
 		{"explicit null", map[string]any{"id": "b1", "metadata": map[string]any{k: nil}}},
 		{"key absent", map[string]any{"id": "b1", "metadata": map[string]any{"gc.other": "x"}}},
 		// Structural shapes: every non-bd work_query override omits metadata.
@@ -294,8 +297,8 @@ func TestNotDisarmedFilterJQMatchesGoDecoder(t *testing.T) {
 		{"metadata null", map[string]any{"id": "b1", "metadata": nil}},
 	}
 
-	// Quote the filter exactly as bdReadyPoolDemandNotDisarmedShell does, so
-	// this covers the shell quoting too, not just the jq expression.
+	// Run the filter as its own quoted jq stage so this covers the shell quoting
+	// too, not just the jq expression.
 	jqStage := shellquote.Join([]string{"jq", notDisarmedFilterJQ()})
 
 	for _, tc := range cases {
@@ -329,6 +332,121 @@ func TestNotDisarmedFilterJQMatchesGoDecoder(t *testing.T) {
 			if gotKept := len(kept) == 1; gotKept != wantKept {
 				t.Errorf("jq and Go disagree for %s\n jq kept=%v\n Go kept=%v\n input=%s\n jq out=%s",
 					tc.name, gotKept, wantKept, raw, out)
+			}
+		})
+	}
+}
+
+// TestPoolDemandCountShellExcludesDisarmedFromEverySource executes the real
+// generated count-form against a stub bd and asserts the disarm exclusion holds
+// for every source it unions, not just the canonical ready tier.
+//
+// The count-form pulls from three probes — the canonical routed ready tier, the
+// gc.run_target migration probe for pre-gc.routed_to workflow roots, and the
+// legacy ephemeral query — and adds them together. The filter used to sit on the
+// canonical tier alone, so a disarmed legacy root or ephemeral bead reached the
+// union unfiltered and counted as demand the claim path then refused.
+//
+// TestNotDisarmedFilterJQMatchesGoDecoder pins what the filter decides per row;
+// this pins where it runs. Neither is redundant: the goldens freeze the script
+// text but re-record with -update, so only executing the thing catches a filter
+// that is correct in isolation and attached to the wrong pipe.
+func TestPoolDemandCountShellExcludesDisarmedFromEverySource(t *testing.T) {
+	for _, bin := range []string{"jq", "sh"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not installed", bin)
+		}
+	}
+
+	const target = "worker"
+	disarmed := map[string]any{beadmeta.DisarmedMetadataKey: true}
+	legacyRoot := func(id string, extra map[string]any) map[string]any {
+		md := map[string]any{
+			beadmeta.RunTargetMetadataKey: target,
+			beadmeta.KindMetadataKey:      beadmeta.KindWorkflow,
+		}
+		for k, v := range extra {
+			md[k] = v
+		}
+		return map[string]any{"id": id, "metadata": md}
+	}
+	routedBead := func(id string, extra map[string]any) map[string]any {
+		md := map[string]any{beadmeta.RoutedToMetadataKey: target}
+		for k, v := range extra {
+			md[k] = v
+		}
+		return map[string]any{"id": id, "metadata": md}
+	}
+
+	cases := []struct {
+		name      string
+		routed    []any // canonical `bd ready --metadata-field gc.routed_to=...`
+		legacy    []any // migration `bd ready --metadata-field gc.run_target=...`
+		ephemeral []any // legacy `bd query ephemeral=true AND status=open`
+		want      string
+	}{
+		// The two gaps measured on the rejected revision: each returned 1.
+		{name: "disarmed legacy workflow root", legacy: []any{legacyRoot("L1", disarmed)}, want: "0"},
+		{name: "disarmed legacy ephemeral", ephemeral: []any{routedBead("E1", disarmed)}, want: "0"},
+		// The tier that was already filtered, kept as a regression pin.
+		{name: "disarmed canonical ready", routed: []any{routedBead("R1", disarmed)}, want: "0"},
+		// The filter must not over-drop: armed work on every source still counts.
+		{name: "armed legacy workflow root", legacy: []any{legacyRoot("L2", nil)}, want: "1"},
+		{name: "armed legacy ephemeral", ephemeral: []any{routedBead("E2", nil)}, want: "1"},
+		{name: "armed canonical ready", routed: []any{routedBead("R2", nil)}, want: "1"},
+		{name: "cleared flag re-arms", routed: []any{routedBead("R3", map[string]any{beadmeta.DisarmedMetadataKey: ""})}, want: "1"},
+		// An armed bead must survive a disarmed sibling on the same source.
+		{name: "armed peer of disarmed legacy root", legacy: []any{legacyRoot("L3", disarmed), legacyRoot("L4", nil)}, want: "1"},
+		// Fail-closed survives the move to the union.
+		{name: "unparseable value fails closed", routed: []any{routedBead("R4", map[string]any{beadmeta.DisarmedMetadataKey: "banana"})}, want: "0"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeJSON := func(name string, rows []any) {
+				if rows == nil {
+					rows = []any{}
+				}
+				raw, err := json.Marshal(rows)
+				if err != nil {
+					t.Fatalf("marshal %s: %v", name, err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, name), raw, 0o600); err != nil {
+					t.Fatalf("write %s: %v", name, err)
+				}
+			}
+			writeJSON("routed.json", tc.routed)
+			writeJSON("legacy.json", tc.legacy)
+			writeJSON("ephemeral.json", tc.ephemeral)
+
+			// Stub bd dispatches on the flags each probe is built with. The
+			// canonical probe is the only one carrying gc.routed_to, and the
+			// migration probe the only one carrying gc.run_target, so matching on
+			// those keys routes each probe to its own fixture.
+			stub := "#!/bin/sh\ncase \"$*\" in\n" +
+				"  *" + beadmeta.RoutedToMetadataKey + "=" + target + "*) cat " + filepath.Join(dir, "routed.json") + " ;;\n" +
+				"  *" + beadmeta.RunTargetMetadataKey + "=" + target + "*) cat " + filepath.Join(dir, "legacy.json") + " ;;\n" +
+				"  *ephemeral=true*) cat " + filepath.Join(dir, "ephemeral.json") + " ;;\n" +
+				"  *) printf '[]' ;;\nesac\n"
+			binDir := filepath.Join(dir, "bin")
+			if err := os.MkdirAll(binDir, 0o755); err != nil {
+				t.Fatalf("mkdir bin: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(stub), 0o700); err != nil {
+				t.Fatalf("write stub bd: %v", err)
+			}
+
+			// includeEphemeralReady=false keeps the legacy ephemeral probe live;
+			// the true form short-circuits it to printf "[]".
+			cmd := exec.Command("sh", "-c", poolDemandCountShell(target, false))
+			cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("run count shell: %v\nscript=%s", err, poolDemandCountShell(target, false))
+			}
+			if got := strings.TrimSpace(string(out)); got != tc.want {
+				t.Errorf("demand count = %s, want %s\n(a disarmed bead counted as demand spawns a slot the claim path refuses)", got, tc.want)
 			}
 		})
 	}

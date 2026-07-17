@@ -381,6 +381,11 @@ func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops 
 			sibling.ID == bead.ID ||
 			strings.TrimSpace(sibling.Assignee) != "" ||
 			!strings.EqualFold(strings.TrimSpace(sibling.Status), "open") ||
+			// The claim path drops a disarmed bead anyway, so stamping an
+			// assignee on one changes no execution — it just leaves a durable
+			// do-not-execute bead looking owned to every operator and query
+			// that reads assignee.
+			beadmeta.IsDisarmed(sibling.Metadata) ||
 			!hookClaimMatchesRoute(sibling, opts.RouteTargets) {
 			continue
 		}
