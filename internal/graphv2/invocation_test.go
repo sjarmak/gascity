@@ -60,7 +60,10 @@ title = "Inspect {{convoy_id}}"
 	if created.Type != "convoy" {
 		t.Fatalf("input convoy type = %q, want convoy", created.Type)
 	}
-	wantMetadata := map[string]string{"gc.synthetic": "true"}
+	wantMetadata := map[string]string{
+		"gc.synthetic":              "true",
+		"gc.graphv2_invocation_key": "graphv2-input-convoy:" + target.ID + ":work",
+	}
 	if !maps.Equal(created.Metadata, wantMetadata) {
 		t.Fatalf("input convoy metadata = %+v, want %+v", created.Metadata, wantMetadata)
 	}
@@ -69,13 +72,197 @@ title = "Inspect {{convoy_id}}"
 	if err != nil {
 		t.Fatalf("PrepareInvocation again: %v", err)
 	}
-	if again.InputConvoy == inv.InputConvoy {
-		t.Fatalf("input convoy was reused: first=%s second=%s", inv.InputConvoy, again.InputConvoy)
+	if again.InputConvoy != inv.InputConvoy {
+		t.Fatalf("input convoy = %s, want the live one already tracking %s (%s)", again.InputConvoy, target.ID, inv.InputConvoy)
+	}
+}
+
+// TestNormalizeInputConvoyReusesLiveSyntheticConvoy pins the stable-identity
+// half of RootKey. RootKey is documented as stable and varsFingerprint already
+// excludes convoy_id to keep it so, but a freshly minted convoy per invocation
+// put a different ID in the key's leading segment, so two dispatches of the
+// same formula at the same target produced two different keys and therefore two
+// live roots (gc-28jm).
+func TestNormalizeInputConvoyReusesLiveSyntheticConvoy(t *testing.T) {
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+
+	first, err := NormalizeInputConvoy(store, target.ID, "work")
+	if err != nil {
+		t.Fatalf("NormalizeInputConvoy: %v", err)
+	}
+	second, err := NormalizeInputConvoy(store, target.ID, "work")
+	if err != nil {
+		t.Fatalf("NormalizeInputConvoy again: %v", err)
+	}
+	if first != second {
+		t.Fatalf("input convoy = %s then %s, want one stable convoy per target", first, second)
+	}
+
+	convoys, err := convoycore.TrackingConvoysForItem(store, target.ID)
+	if err != nil {
+		t.Fatalf("TrackingConvoysForItem: %v", err)
+	}
+	if len(convoys) != 1 {
+		t.Fatalf("tracking convoys = %d, want exactly one (no orphan litter); convoys=%+v", len(convoys), convoys)
+	}
+	members, err := convoycore.Members(store, second, true)
+	if err != nil {
+		t.Fatalf("Members: %v", err)
+	}
+	if len(members) != 1 || members[0].ID != target.ID {
+		t.Fatalf("members = %+v, want the reused convoy to still track %s exactly once", members, target.ID)
+	}
+}
+
+// TestNormalizeInputConvoyRepairsMissingTrackOnReuse covers the convoy that
+// exists but tracks nothing, which reuse newly makes reachable: creating the
+// convoy and tracking its target are separate writes, so a failure between them
+// leaves one behind, and handing it back untouched would run a formula against
+// an empty input.
+func TestNormalizeInputConvoyRepairsMissingTrackOnReuse(t *testing.T) {
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+	// A convoy stamped with the invocation key but never tracked — the shape a
+	// crash between Create and TrackItem leaves behind.
+	stranded, err := store.Create(beads.Bead{
+		Title: "input convoy for " + target.ID,
+		Type:  "convoy",
+		Metadata: map[string]string{
+			syntheticMetadataKey: "true",
+			graphV2InvocationKey: InputConvoyInvocationKey(target.ID, "work"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create stranded convoy: %v", err)
+	}
+
+	got, err := NormalizeInputConvoy(store, target.ID, "work")
+	if err != nil {
+		t.Fatalf("NormalizeInputConvoy: %v", err)
+	}
+	if got != stranded.ID {
+		t.Fatalf("input convoy = %q, want the stranded convoy %q reused", got, stranded.ID)
+	}
+	members, err := convoycore.Members(store, got, true)
+	if err != nil {
+		t.Fatalf("Members: %v", err)
+	}
+	if len(members) != 1 || members[0].ID != target.ID {
+		t.Fatalf("members = %+v, want the track to %s repaired", members, target.ID)
+	}
+}
+
+// TestNormalizeInputConvoySeparatesFormulasOnSameTarget keeps reuse scoped to
+// one formula. The formula-cook path rejects any second live graph.v2 root
+// sharing an input convoy, so a convoy shared across formulas would turn a
+// legitimate second formula at the same target into a spurious conflict.
+func TestNormalizeInputConvoySeparatesFormulasOnSameTarget(t *testing.T) {
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+
+	work, err := NormalizeInputConvoy(store, target.ID, "work")
+	if err != nil {
+		t.Fatalf("NormalizeInputConvoy(work): %v", err)
+	}
+	review, err := NormalizeInputConvoy(store, target.ID, "review")
+	if err != nil {
+		t.Fatalf("NormalizeInputConvoy(review): %v", err)
+	}
+	if work == review {
+		t.Fatalf("both formulas share input convoy %s, want one per (target, formula)", work)
+	}
+}
+
+// TestNormalizeInputConvoyDoesNotReuseTerminalConvoy keeps a retry legitimate:
+// a closed convoy is spent, so the next invocation must mint a fresh one rather
+// than resurrect it.
+func TestNormalizeInputConvoyDoesNotReuseTerminalConvoy(t *testing.T) {
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+	first, err := NormalizeInputConvoy(store, target.ID, "work")
+	if err != nil {
+		t.Fatalf("NormalizeInputConvoy: %v", err)
+	}
+	if err := store.Close(first); err != nil {
+		t.Fatalf("Close(%s): %v", first, err)
+	}
+
+	second, err := NormalizeInputConvoy(store, target.ID, "work")
+	if err != nil {
+		t.Fatalf("NormalizeInputConvoy after close: %v", err)
+	}
+	if second == first {
+		t.Fatalf("input convoy = %s, want a fresh convoy after the previous one closed", second)
+	}
+}
+
+// TestNormalizeInputConvoyConcurrentCallersConverge covers the simultaneous
+// shape the sequential lookup alone cannot: several callers that all miss the
+// lookup must still agree on one convoy, because RootKey stability — and so the
+// root file lock downstream — depends on every caller deriving the same ID.
+func TestNormalizeInputConvoyConcurrentCallersConverge(t *testing.T) {
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+
+	const n = 8
+	var wg sync.WaitGroup
+	ids := make([]string, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ids[i], errs[i] = NormalizeInputConvoy(store, target.ID, "work")
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("NormalizeInputConvoy %d: %v", i, err)
+		}
+		if ids[i] != ids[0] {
+			t.Fatalf("caller %d convoy = %q, want the shared winner %q", i, ids[i], ids[0])
+		}
+	}
+}
+
+// TestNormalizeInputConvoyPassesThroughConvoyTarget keeps an explicit convoy
+// target on its existing path: it is already a stable identity and must not be
+// wrapped in a synthetic convoy.
+func TestNormalizeInputConvoyPassesThroughConvoyTarget(t *testing.T) {
+	store := beads.NewMemStore()
+	convoy, err := store.Create(beads.Bead{Title: "input", Type: "convoy"})
+	if err != nil {
+		t.Fatalf("Create convoy: %v", err)
+	}
+	got, err := NormalizeInputConvoy(store, convoy.ID, "work")
+	if err != nil {
+		t.Fatalf("NormalizeInputConvoy: %v", err)
+	}
+	if got != convoy.ID {
+		t.Fatalf("input convoy = %q, want the target convoy %q", got, convoy.ID)
 	}
 }
 
 func TestNormalizeInputConvoyRejectsNilStore(t *testing.T) {
-	_, err := NormalizeInputConvoy(nil, "target")
+	_, err := NormalizeInputConvoy(nil, "target", "work")
 	if err == nil {
 		t.Fatal("NormalizeInputConvoy succeeded, want nil-store error")
 	}
@@ -85,7 +272,7 @@ func TestNormalizeInputConvoyRejectsNilStore(t *testing.T) {
 }
 
 func TestCreateSingleItemInputConvoyRejectsNilStore(t *testing.T) {
-	_, err := CreateSingleItemInputConvoy(nil, beads.Bead{ID: "target", Status: "open"})
+	_, err := CreateSingleItemInputConvoy(nil, beads.Bead{ID: "target", Status: "open"}, InputConvoyInvocationKey("target", "work"))
 	if err == nil {
 		t.Fatal("CreateSingleItemInputConvoy succeeded, want nil-store error")
 	}
