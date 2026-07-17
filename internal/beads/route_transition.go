@@ -42,13 +42,18 @@ var routeDisarmMetadataKeys = []string{
 // the UpdateIfMatch (CAS) path -- both route through the same inner helper
 // per backend.
 //
-// This covers every write this Go codebase controls: internal callers, the
-// HTTP API, and CAS writers (they all fan out to Store.Update/UpdateIfMatch).
-// It does NOT reach a worker invoking the external `bd` binary directly in a
-// shell -- that process bypasses this package entirely. Closing that gap
-// remains the reaper's job (blocked-routed-reaper), exactly as gc-nuhl's own
-// design text keeps it: "a bounded safety net ... not the normal cleanup
-// path."
+// This covers every Update/UpdateIfMatch write this Go codebase controls:
+// internal callers, the HTTP API, and CAS writers all fan out to one of those
+// two entry points. It does NOT cover forward-routing writers that call
+// Store.SetMetadata/SetMetadataBatch directly instead of Update -- e.g.
+// cmd/gc/cmd_sling.go's cliBeadRouter.Route, internal/api/handler_sling.go,
+// cmd/gc/cmd_convoy_dispatch.go, and cmd/gc/doctor_run_target_backfill.go all
+// write gc.routed_to via SetMetadata and carry no status field, so this gate
+// never sees them. Nor does it reach a worker invoking the external `bd`
+// binary directly in a shell -- that process bypasses this package entirely.
+// No mechanism in this repository closes either gap today; both remain open
+// until a caller routes those writes through Update/UpdateIfMatch or a
+// dedicated sweep is built.
 //
 // The caller's opts.Metadata map is never mutated in place (house style:
 // immutability by default) -- this returns a copy with the routes forced to
