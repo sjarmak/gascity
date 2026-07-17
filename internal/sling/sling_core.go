@@ -398,20 +398,43 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 	a := opts.Target
 	formulaVars := BuildSlingFormulaVars(formulaName, beadID, opts.Vars, a, deps)
 	searchPaths := SlingFormulaSearchPaths(deps, a)
-	graphInv, isGraph, err := prepareGraphV2FormulaInvocation(context.Background(), formulaName, beadID, opts, deps, a)
+
+	// isGraph must be known before deciding whether to take the source-bead
+	// lock below, but the input-convoy race that lock exists to close only
+	// exists for graph.v2 formulas — this is a plain formula-file check with
+	// no store interaction, so it's safe to run unlocked. Do NOT replace this
+	// with prepareGraphV2FormulaInvocation's isGraph return: that call also
+	// performs the store-touching, racy convoy normalization as one atomic
+	// step, which is exactly what needs to happen after the lock is held, not
+	// before (see the isGraph branch below).
+	isGraph, _, err := graphv2.IsGraphV2Formula(formulaName, searchPaths)
 	if err != nil {
 		return result, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
 	}
 	if isGraph {
-		formulaVars = graphInv.Vars
-		result.Deprecations = append(result.Deprecations, graphInv.Deprecations...)
-		if err := validateSlingFormulaRuntimeVars(context.Background(), formulaName, searchPaths, molecule.Options{
-			Title: opts.Title,
-			Vars:  formulaVars,
-		}); err != nil {
-			return result, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
-		}
 		return withGraphV2SourceWorkflowLock(context.Background(), deps, beadID, func() (SlingResult, error) {
+			// NormalizeInputConvoy's lookup-then-create-then-reresolve dance
+			// only converges two racing callers on the same convoy (and so the
+			// same downstream RootKey) if both observe each other's writes —
+			// an assumption a store with cross-connection read lag (Dolt) can
+			// violate. Running it inside this cross-process file lock, rather
+			// than before acquiring it, removes the race entirely instead of
+			// depending on that assumption: only one caller per source bead
+			// ever executes this block at a time, matching the ordering
+			// `gc formula cook --attach` already uses (cmd_formula.go, lock
+			// first, then graphv2.PrepareInvocation inside it).
+			graphInv, _, err := prepareGraphV2FormulaInvocation(context.Background(), formulaName, beadID, opts, deps, a)
+			if err != nil {
+				return result, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
+			}
+			formulaVars := graphInv.Vars
+			result.Deprecations = append(result.Deprecations, graphInv.Deprecations...)
+			if err := validateSlingFormulaRuntimeVars(context.Background(), formulaName, searchPaths, molecule.Options{
+				Title: opts.Title,
+				Vars:  formulaVars,
+			}); err != nil {
+				return result, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
+			}
 			if err := CheckNoMoleculeChildrenAllowLiveWorkflow(querier, beadID, deps.Store, &result); err != nil {
 				return result, fmt.Errorf("%w", err)
 			}

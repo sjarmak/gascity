@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/citylayout"
@@ -347,6 +349,94 @@ func TestAttachFormulaToBeadForceCreatesParallelRoot(t *testing.T) {
 	}
 	if live := liveGraphV2Roots(t, deps.Store); len(live) != 2 {
 		t.Fatalf("live graph roots = %d, want 2 (the original plus the forced parallel run): %+v", len(live), live)
+	}
+}
+
+// createOverlapDetector wraps a beads.Store and records whether two Create
+// calls were ever concurrently in flight. NormalizeInputConvoy's own
+// lookup-then-create-then-reresolve dance only converges racing callers on
+// the same convoy if every caller observes every other caller's writes — an
+// assumption a store with cross-connection read lag (Dolt) is not guaranteed
+// to satisfy. attachFormulaToBead closes that gap architecturally instead of
+// depending on the assumption: it now acquires the cross-process
+// per-source-bead file lock (immune to store read lag, since it's plain
+// flock) BEFORE calling into convoy normalization, so at most one caller
+// should ever be inside a Create call for a given source bead at a time. The
+// short sleep while "inside" widens the detection window — MemStore's
+// critical sections are otherwise fast enough that concurrent goroutines
+// rarely truly overlap regardless of whether serialization is enforced (see
+// the probe behind TestNormalizeInputConvoyClosesOrphanedConvoyAfterLostRace,
+// which found 0/160 unassisted trials produced contention).
+type createOverlapDetector struct {
+	beads.Store
+	mu         sync.Mutex
+	inside     bool
+	overlapped atomic.Bool
+}
+
+func (d *createOverlapDetector) Create(b beads.Bead) (beads.Bead, error) {
+	d.mu.Lock()
+	if d.inside {
+		d.overlapped.Store(true)
+	}
+	d.inside = true
+	d.mu.Unlock()
+
+	time.Sleep(5 * time.Millisecond)
+
+	d.mu.Lock()
+	d.inside = false
+	d.mu.Unlock()
+
+	return d.Store.Create(b)
+}
+
+// TestAttachFormulaToBeadSerializesConvoyCreationPerSourceBead proves the
+// fix for the race Codex's review flagged: acquiring
+// withGraphV2SourceWorkflowLock before prepareGraphV2FormulaInvocation (not
+// after, as the code read before this test) means concurrent gc sling
+// dispatches at the same bead target never have two Create calls in flight
+// at once, so NormalizeInputConvoy's oldest-wins convergence never has to
+// rely on cross-connection read-after-write visibility to begin with — the
+// race window is closed, not just usually avoided.
+func TestAttachFormulaToBeadSerializesConvoyCreationPerSourceBead(t *testing.T) {
+	formulaDir := t.TempDir()
+	writeGraphV2ConvoyFormula(t, formulaDir)
+	cfg := graphV2SlingTestConfig(t, formulaDir)
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	deps.CityPath = t.TempDir()
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+
+	target, err := deps.Store.Create(beads.Bead{Title: "work bead", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	detector := &createOverlapDetector{Store: deps.Store}
+	deps.Store = detector
+
+	const n = 4
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = DoSling(SlingOpts{Target: a, BeadOrFormula: target.ID, OnFormula: "graph-work"}, deps, deps.Store)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("DoSling %d: %v", i, err)
+		}
+	}
+	if detector.overlapped.Load() {
+		t.Fatal("two Create calls overlapped for the same source bead — the source-bead lock did not serialize convoy creation")
+	}
+	if live := liveGraphV2Roots(t, deps.Store); len(live) != 1 {
+		t.Fatalf("live graph roots = %d, want exactly 1", len(live))
 	}
 }
 
