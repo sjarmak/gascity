@@ -238,8 +238,12 @@ func standardAssignedWorkQueryScript(includeEphemeralReady bool) string {
 // head has other assigned work to fall through to is tracked separately
 // (gc-ewk4) — this fix only stops the disarmed row itself from being served,
 // matching AC1 ("excluded from claims in every tier").
+//
+// The jq rerun only fires when $r actually holds a row: an empty or "[]" $r
+// (bd found nothing) already reads back as itself, so forking jq to filter it
+// would be a no-op subprocess on every skipped identity/tier candidate.
 func assignedRowDisarmFilterScript() string {
-	return `r=$(printf "%s" "$r" | jq -c '` + notDisarmedFilterJQ() + `' 2>/dev/null); `
+	return `[ -n "$r" ] && [ "$r" != "[]" ] && r=$(printf "%s" "$r" | jq -c '` + notDisarmedFilterJQ() + `' 2>/dev/null); `
 }
 
 func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
