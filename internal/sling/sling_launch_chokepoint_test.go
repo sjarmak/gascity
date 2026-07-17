@@ -310,6 +310,46 @@ func TestLaunchWorkflowLegitimateDistinctLaunchesAllowed(t *testing.T) {
 	}
 }
 
+// TestAttachFormulaToBeadForceCreatesParallelRoot covers gc-mrh0 AC5 at the
+// real gc sling --force entry point: --force is the explicit escape hatch
+// that permits a second, independent workflow run in parallel with an
+// existing live one, rather than the default converge-on-one-root behavior
+// every other test in this file pins. It exercises the full DoSling ->
+// attachFormulaToBead path (not the lower-level launchForBeadTarget helper),
+// so it also proves opts.Force actually reaches
+// graphv2.PrepareInvocationForced through prepareGraphV2FormulaInvocation.
+func TestAttachFormulaToBeadForceCreatesParallelRoot(t *testing.T) {
+	formulaDir := t.TempDir()
+	writeGraphV2ConvoyFormula(t, formulaDir)
+	cfg := graphV2SlingTestConfig(t, formulaDir)
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	deps.CityPath = t.TempDir()
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+
+	target, err := deps.Store.Create(beads.Bead{Title: "work bead", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := DoSling(SlingOpts{Target: a, BeadOrFormula: target.ID, OnFormula: "graph-work"}, deps, deps.Store)
+	if err != nil {
+		t.Fatalf("DoSling (first): %v", err)
+	}
+	second, err := DoSling(SlingOpts{Target: a, BeadOrFormula: target.ID, OnFormula: "graph-work", Force: true}, deps, deps.Store)
+	if err != nil {
+		t.Fatalf("DoSling --force: %v", err)
+	}
+	if second.WorkflowID == "" {
+		t.Fatal("forced dispatch produced no workflow root")
+	}
+	if second.WorkflowID == first.WorkflowID {
+		t.Fatalf("forced dispatch reused root %q, want an independent parallel root", first.WorkflowID)
+	}
+	if live := liveGraphV2Roots(t, deps.Store); len(live) != 2 {
+		t.Fatalf("live graph roots = %d, want 2 (the original plus the forced parallel run): %+v", len(live), live)
+	}
+}
+
 // TestInstantiateCompiledSlingFormulaAcceptsPrecompiledRecipe pins the
 // compile-once primitive: a recipe compiled by the caller is instantiated
 // without a second disk compile, materializing the same graph root.

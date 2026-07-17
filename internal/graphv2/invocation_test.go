@@ -183,6 +183,99 @@ func TestNormalizeInputConvoySeparatesFormulasOnSameTarget(t *testing.T) {
 	}
 }
 
+// TestNormalizeInputConvoyForcedSkipsReuse covers gc-mrh0 AC5: --force is the
+// explicit escape hatch that permits a second, independent workflow run in
+// parallel with an existing live one at the same (target, formula) rather than
+// converging on it. A forced call must mint its own convoy even though a live
+// one already exists, and must mark it as forced so the parallel run is
+// auditable via bd show rather than silently indistinguishable from a race.
+func TestNormalizeInputConvoyForcedSkipsReuse(t *testing.T) {
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+
+	first, err := NormalizeInputConvoy(store, target.ID, "work")
+	if err != nil {
+		t.Fatalf("NormalizeInputConvoy: %v", err)
+	}
+	forced, err := NormalizeInputConvoyForced(store, target.ID, "work")
+	if err != nil {
+		t.Fatalf("NormalizeInputConvoyForced: %v", err)
+	}
+	if forced == first {
+		t.Fatalf("forced call reused live convoy %s, want an independent fresh convoy", first)
+	}
+
+	forcedBead, err := store.Get(forced)
+	if err != nil {
+		t.Fatalf("Get(forced): %v", err)
+	}
+	if forcedBead.Metadata["gc.graphv2_convoy_forced"] != "true" {
+		t.Fatalf("forced convoy metadata = %+v, want gc.graphv2_convoy_forced=true for audit", forcedBead.Metadata)
+	}
+	if forcedBead.Status == "closed" {
+		t.Fatalf("forced convoy %s was closed, want it live: --force is not a race loser", forced)
+	}
+
+	// Neither the pre-existing convoy nor the forced one is an orphan: both are
+	// genuinely in use, so neither may be closed as a side effect of forcing.
+	invocationKey := InputConvoyInvocationKey(target.ID, "work")
+	matches, err := store.ListByMetadata(map[string]string{graphV2InvocationKey: invocationKey}, 0)
+	if err != nil {
+		t.Fatalf("ListByMetadata: %v", err)
+	}
+	live := 0
+	for _, convoy := range matches {
+		if !convoycore.IsTerminalStatus(convoy.Status) {
+			live++
+		}
+	}
+	if live != 2 {
+		t.Fatalf("live synthetic input convoys for %s = %d, want 2 (the original plus the forced parallel run): %+v", invocationKey, live, matches)
+	}
+}
+
+// TestPrepareInvocationForcedProducesIndependentInputConvoy pins the
+// PrepareInvocation-level entry point gc sling --force actually calls: it must
+// thread through to the same skip-reuse behavior as
+// NormalizeInputConvoyForced, not just the lower-level primitive.
+func TestPrepareInvocationForcedProducesIndependentInputConvoy(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeFormula(t, dir, "work.formula.toml", `
+formula = "work"
+version = 1
+contract = "graph.v2"
+type = "workflow"
+
+[[steps]]
+id = "inspect"
+title = "Inspect {{convoy_id}}"
+`)
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+
+	first, err := PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, nil)
+	if err != nil {
+		t.Fatalf("PrepareInvocation: %v", err)
+	}
+	forced, err := PrepareInvocationForced(context.Background(), store, "work", []string{dir}, target.ID, nil)
+	if err != nil {
+		t.Fatalf("PrepareInvocationForced: %v", err)
+	}
+	if forced.InputConvoy == first.InputConvoy {
+		t.Fatalf("PrepareInvocationForced reused input convoy %s, want an independent one", first.InputConvoy)
+	}
+	if got := forced.Vars[ConvoyIDVar]; got != forced.InputConvoy {
+		t.Fatalf("forced vars[%s] = %q, want %q", ConvoyIDVar, got, forced.InputConvoy)
+	}
+}
+
 // TestNormalizeInputConvoyDoesNotReuseTerminalConvoy keeps a retry legitimate:
 // a closed convoy is spent, so the next invocation must mint a fresh one rather
 // than resurrect it.
@@ -213,6 +306,12 @@ func TestNormalizeInputConvoyDoesNotReuseTerminalConvoy(t *testing.T) {
 // shape the sequential lookup alone cannot: several callers that all miss the
 // lookup must still agree on one convoy, because RootKey stability — and so the
 // root file lock downstream — depends on every caller deriving the same ID.
+// Real interleaving is scheduler luck (MemStore's single global mutex makes
+// the whole lookup-create-reresolve sequence complete in well under a
+// microsecond, so 8 goroutines on 16 cores still routinely produce zero
+// contention — see TestNormalizeInputConvoyClosesOrphanedConvoyAfterLostRace
+// for a deterministic reproduction of the specific race window this
+// depends on): this asserts the invariant holds whenever it does fire.
 func TestNormalizeInputConvoyConcurrentCallersConverge(t *testing.T) {
 	store := beads.NewMemStore()
 	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
@@ -240,6 +339,134 @@ func TestNormalizeInputConvoyConcurrentCallersConverge(t *testing.T) {
 		if ids[i] != ids[0] {
 			t.Fatalf("caller %d convoy = %q, want the shared winner %q", i, ids[i], ids[0])
 		}
+	}
+
+	invocationKey := InputConvoyInvocationKey(target.ID, "work")
+	matches, err := store.ListByMetadata(map[string]string{graphV2InvocationKey: invocationKey}, 0, beads.IncludeClosed)
+	if err != nil {
+		t.Fatalf("ListByMetadata: %v", err)
+	}
+	live := 0
+	for _, convoy := range matches {
+		if !convoycore.IsTerminalStatus(convoy.Status) {
+			live++
+		}
+	}
+	if live != 1 {
+		t.Fatalf("live synthetic input convoys for %s = %d, want exactly 1; every race loser must self-close (found %d total incl. closed): %+v", invocationKey, live, len(matches), matches)
+	}
+}
+
+// gatedMetadataListStore wraps a beads.Store and rendezvous-blocks its first
+// two ListByMetadata calls: both callers' reads complete (each correctly
+// observing the pre-race empty state) before either is allowed to return and
+// proceed to CreateSingleItemInputConvoy. NormalizeInputConvoy's "did a live
+// convoy already exist" lookup is itself a ListByMetadata call, so this forces
+// two callers' initial lookups to witness the same empty state
+// deterministically. A simpler one-shot gate (close a channel on the second
+// arrival, let both proceed) is not enough: it only synchronizes arrival at
+// the call, not completion of it, so the second caller can race ahead and
+// finish its entire create-and-track sequence before the first caller's read
+// (woken from a channel receive, and so at the mercy of goroutine
+// rescheduling latency) actually executes — at which point it just finds and
+// reuses the already-created convoy, and only one ever gets minted. A
+// WaitGroup rendezvous (each caller reads, signals Done, then Waits) closes
+// that gap: neither read returns to its caller until both have happened.
+// TestNormalizeInputConvoyConcurrentCallersConverge depends on scheduler luck
+// for this same race; the probe behind this fix showed it essentially never
+// fires unassisted on a fast in-memory store (0/160 trials produced a second
+// convoy).
+type gatedMetadataListStore struct {
+	beads.Store
+	mu      sync.Mutex
+	count   int
+	arrived sync.WaitGroup
+}
+
+func newGatedMetadataListStore(base beads.Store) *gatedMetadataListStore {
+	g := &gatedMetadataListStore{Store: base}
+	g.arrived.Add(2)
+	return g
+}
+
+func (g *gatedMetadataListStore) ListByMetadata(filters map[string]string, limit int, opts ...beads.QueryOpt) ([]beads.Bead, error) {
+	g.mu.Lock()
+	g.count++
+	n := g.count
+	g.mu.Unlock()
+	if n > 2 {
+		return g.Store.ListByMetadata(filters, limit, opts...)
+	}
+	result, err := g.Store.ListByMetadata(filters, limit, opts...)
+	g.arrived.Done()
+	g.arrived.Wait()
+	return result, err
+}
+
+// TestNormalizeInputConvoyClosesOrphanedConvoyAfterLostRace deterministically
+// reproduces gc-mrh0's reported shape and its AC6: a losing caller mints its
+// own convoy before its re-resolve discovers a concurrent caller's older one
+// won, and that redundant convoy must not linger open, still tracking target,
+// as an orphan nothing will ever use — the production incident this bead
+// reports needed exactly that hand-cleaned ("contained before claim by
+// deleting ub8v0/zn49w").
+func TestNormalizeInputConvoyClosesOrphanedConvoyAfterLostRace(t *testing.T) {
+	base := beads.NewMemStore()
+	target, err := base.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+	store := newGatedMetadataListStore(base)
+
+	const n = 2
+	var wg sync.WaitGroup
+	ids := make([]string, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ids[i], errs[i] = NormalizeInputConvoy(store, target.ID, "work")
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("NormalizeInputConvoy %d: %v", i, err)
+		}
+	}
+	if ids[0] != ids[1] {
+		t.Fatalf("caller 0 convoy = %q, caller 1 convoy = %q, want both to converge on the same winner", ids[0], ids[1])
+	}
+
+	invocationKey := InputConvoyInvocationKey(target.ID, "work")
+	matches, err := base.ListByMetadata(map[string]string{graphV2InvocationKey: invocationKey}, 0, beads.IncludeClosed)
+	if err != nil {
+		t.Fatalf("ListByMetadata: %v", err)
+	}
+	if len(matches) != n {
+		t.Fatalf("total synthetic input convoys (incl. closed) = %d, want %d — one per racing caller: %+v", len(matches), n, matches)
+	}
+	live, closed := 0, 0
+	for _, convoy := range matches {
+		if convoycore.IsTerminalStatus(convoy.Status) {
+			closed++
+			if convoy.Metadata["close_reason"] == "" {
+				t.Errorf("closed orphan convoy %s has no close_reason, want one for audit", convoy.ID)
+			}
+			continue
+		}
+		live++
+		if convoy.ID != ids[0] {
+			t.Errorf("live convoy = %s, want the shared winner %s", convoy.ID, ids[0])
+		}
+	}
+	if live != 1 {
+		t.Fatalf("live synthetic input convoys = %d, want exactly 1 (the winner)", live)
+	}
+	if closed != n-1 {
+		t.Fatalf("closed synthetic input convoys = %d, want %d (every race loser self-closed)", closed, n-1)
 	}
 }
 

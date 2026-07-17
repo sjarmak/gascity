@@ -48,6 +48,11 @@ const (
 	// inputConvoyInvocationPrefix namespaces the stable per-(target, formula)
 	// identity stamped on a synthetic input convoy.
 	inputConvoyInvocationPrefix = "graphv2-input-convoy:"
+
+	// inputConvoyOrphanedCloseReason is stamped on a synthetic input convoy a
+	// caller created but lost the reuse race for: some concurrent caller's
+	// convoy was older and every observer converges on it instead.
+	inputConvoyOrphanedCloseReason = "graphv2 input convoy superseded by concurrent invocation reuse"
 )
 
 // Invocation describes a normalized graph.v2 formula invocation.
@@ -94,8 +99,23 @@ func IsGraphV2Formula(formulaName string, searchPaths []string) (bool, *formula.
 }
 
 // PrepareInvocation validates and normalizes a graph.v2 invocation. Non-graph
-// formulas are returned with Formula set and no input convoy.
+// formulas are returned with Formula set and no input convoy. The target's
+// live input convoy for (targetID, formulaName) is reused when one already
+// exists, per NormalizeInputConvoy.
 func PrepareInvocation(ctx context.Context, store beads.Store, formulaName string, searchPaths []string, targetID string, vars map[string]string) (Invocation, error) {
+	return prepareInvocation(ctx, store, formulaName, searchPaths, targetID, vars, false)
+}
+
+// PrepareInvocationForced behaves like PrepareInvocation but skips input-convoy
+// reuse unconditionally — see NormalizeInputConvoyForced. This is the
+// gc sling --force escape hatch for a caller that explicitly wants a second,
+// independent workflow run in parallel with an existing one at the same
+// target, rather than converging on it.
+func PrepareInvocationForced(ctx context.Context, store beads.Store, formulaName string, searchPaths []string, targetID string, vars map[string]string) (Invocation, error) {
+	return prepareInvocation(ctx, store, formulaName, searchPaths, targetID, vars, true)
+}
+
+func prepareInvocation(ctx context.Context, store beads.Store, formulaName string, searchPaths []string, targetID string, vars map[string]string, force bool) (Invocation, error) {
 	resolved, parser, err := loadFormulaWithParser(formulaName, searchPaths)
 	if err != nil {
 		return Invocation{}, err
@@ -160,7 +180,7 @@ func PrepareInvocation(ctx context.Context, store beads.Store, formulaName strin
 	if store == nil {
 		return Invocation{}, fmt.Errorf("v2 formula %q requires a bead store to normalize target %s", formulaName, targetID)
 	}
-	convoyID, err := NormalizeInputConvoy(store, targetID, formulaName)
+	convoyID, err := normalizeInputConvoy(store, targetID, formulaName, force)
 	if err != nil {
 		return Invocation{}, err
 	}
@@ -371,6 +391,22 @@ func InputConvoyInvocationKey(targetID, formulaName string) string {
 // the live-root dedupe key off that. A fresh convoy here means a second live
 // workflow root downstream.
 func NormalizeInputConvoy(store beads.Store, targetID, formulaName string) (string, error) {
+	return normalizeInputConvoy(store, targetID, formulaName, false)
+}
+
+// NormalizeInputConvoyForced behaves like NormalizeInputConvoy but skips reuse
+// unconditionally, minting a fresh input convoy even when a live one already
+// exists for (targetID, formulaName). This is the gc sling --force escape
+// hatch: a caller that explicitly wants a second, independent workflow run in
+// parallel with an existing one, rather than converging on it. The fresh
+// convoy still carries the ordinary invocationKey, so a later non-forced call
+// may reuse it in turn, plus an explicit Graphv2ConvoyForcedMetadataKey marker
+// so the parallel run is auditable via bd show.
+func NormalizeInputConvoyForced(store beads.Store, targetID, formulaName string) (string, error) {
+	return normalizeInputConvoy(store, targetID, formulaName, true)
+}
+
+func normalizeInputConvoy(store beads.Store, targetID, formulaName string, force bool) (string, error) {
 	targetID = strings.TrimSpace(targetID)
 	if store == nil {
 		return "", fmt.Errorf("formulas v2 invocation requires a bead store")
@@ -392,25 +428,49 @@ func NormalizeInputConvoy(store beads.Store, targetID, formulaName string) (stri
 		return target.ID, nil
 	}
 	invocationKey := InputConvoyInvocationKey(target.ID, formulaName)
-	convoyID, err := liveInputConvoyFor(store, invocationKey)
-	if err != nil {
-		return "", err
-	}
-	if convoyID == "" {
-		if _, err := CreateSingleItemInputConvoy(store, target, invocationKey); err != nil {
-			return "", err
-		}
-		// Re-resolve instead of returning the convoy just created: a caller that
-		// raced this lookup created one too, and both must settle on the same ID
-		// or the RootKeys they derive diverge exactly as before.
-		// liveInputConvoyFor picks oldest-wins, a total order both observe
-		// identically.
+	var convoyID string
+	if !force {
 		convoyID, err = liveInputConvoyFor(store, invocationKey)
 		if err != nil {
 			return "", err
 		}
-		if convoyID == "" {
-			return "", fmt.Errorf("input convoy for %s is missing immediately after creation", target.ID)
+	}
+	if convoyID == "" {
+		created, err := CreateSingleItemInputConvoy(store, target, invocationKey)
+		if err != nil {
+			return "", err
+		}
+		switch {
+		case force:
+			// Explicitly opted out of reuse: keep our own convoy outright, no
+			// re-resolve/oldest-wins convergence. Stamp it so the parallel run
+			// is auditable via bd show.
+			if err := store.SetMetadata(created.ID, beadmeta.Graphv2ConvoyForcedMetadataKey, "true"); err != nil {
+				return "", fmt.Errorf("stamping forced input convoy %s for %s: %w", created.ID, target.ID, err)
+			}
+			convoyID = created.ID
+		default:
+			// Re-resolve instead of returning the convoy just created: a caller
+			// that raced this lookup created one too, and both must settle on
+			// the same ID or the RootKeys they derive diverge exactly as before.
+			// liveInputConvoyFor picks oldest-wins, a total order both observe
+			// identically.
+			convoyID, err = liveInputConvoyFor(store, invocationKey)
+			if err != nil {
+				return "", err
+			}
+			if convoyID == "" {
+				return "", fmt.Errorf("input convoy for %s is missing immediately after creation", target.ID)
+			}
+			if convoyID != created.ID {
+				// Lost the race: every observer converges on the older convoy
+				// some concurrent caller created instead. Close ours so it
+				// doesn't linger open, still tracking target, as an orphan no
+				// invocation will ever use (gastownhall/gascity gc-mrh0 AC6).
+				if _, err := store.CloseAll([]string{created.ID}, map[string]string{"close_reason": inputConvoyOrphanedCloseReason}); err != nil {
+					return "", fmt.Errorf("closing orphaned input convoy %s for %s: %w", created.ID, target.ID, err)
+				}
+			}
 		}
 	}
 	// Creating a convoy and tracking its item are two writes, so a failure

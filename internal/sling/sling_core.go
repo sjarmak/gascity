@@ -1130,7 +1130,20 @@ func isGraphSlingFormula(ctx context.Context, formulaName string, searchPaths []
 func prepareGraphV2FormulaInvocation(ctx context.Context, formulaName, targetID string, opts SlingOpts, deps SlingDeps, a config.Agent) (graphv2.Invocation, bool, error) {
 	searchPaths := SlingFormulaSearchPaths(deps, a)
 	vars := buildGraphV2SlingFormulaVars(formulaName, targetID, opts.Vars, a, deps)
-	inv, err := graphv2.PrepareInvocation(ctx, deps.Store, formulaName, searchPaths, targetID, vars)
+	// --force means "run a second, independent workflow in parallel" here, at
+	// the input-convoy layer: a fresh convoy gets a fresh RootKey (RootKey
+	// leads with the convoy ID), so the downstream root-conflict guards see no
+	// collision and simply create a new root alongside the live one. This is
+	// deliberately a different --force meaning than opts.Force's other use
+	// a few lines down in this same call chain (forceGraphV2Replace: close the
+	// existing root, then create a new one) — that only fires once an existing
+	// root is actually found under the SAME RootKey, which a forced fresh
+	// convoy avoids by construction.
+	prepare := graphv2.PrepareInvocation
+	if opts.Force {
+		prepare = graphv2.PrepareInvocationForced
+	}
+	inv, err := prepare(ctx, deps.Store, formulaName, searchPaths, targetID, vars)
 	if err != nil {
 		return graphv2.Invocation{}, false, err
 	}
