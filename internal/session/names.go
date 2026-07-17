@@ -401,6 +401,18 @@ func failedCreateIdentityReleased(b beads.Bead) bool {
 	return strings.TrimSpace(b.Metadata["state"]) == string(StateFailedCreate)
 }
 
+// runtimeMissingIdentityReleased reports whether b is an asleep session bead
+// whose runtime was confirmed missing (e.g. the tmux server crashed) rather
+// than deliberately stopped. Such a bead cannot come back on its own and must
+// not block a fresh claim on its alias/session_name/agent_name, or the
+// reconciler retries forever against a ghost (#3689). Gating on the specific
+// runtime-missing reason — not bare StateAsleep — keeps every deliberate
+// sleep reason (idle-timeout, user-hold, wait-hold, ...) protected.
+func runtimeMissingIdentityReleased(b beads.Bead) bool {
+	return strings.TrimSpace(b.Metadata["state"]) == string(StateAsleep) &&
+		strings.TrimSpace(b.Metadata["sleep_reason"]) == string(SleepReasonRuntimeMissing)
+}
+
 func continuityIneligibleConfiguredOwner(b beads.Bead, selfOwner string) bool {
 	if failedCreateIdentityReleased(b) {
 		return false
@@ -602,6 +614,9 @@ func ensureSessionAliasAvailable(store beads.Store, cfg *config.City, alias, sel
 			continue
 		}
 		if failedCreateIdentityReleased(b) {
+			continue
+		}
+		if runtimeMissingIdentityReleased(b) {
 			continue
 		}
 		if b.Status == "closed" {
