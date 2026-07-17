@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -37,10 +38,10 @@ type hookClaimOps struct {
 	// EmitClaimRejected publishes a bead.claim_rejected event when a claim is
 	// lost to a different live claimant (ADR-0009). Best-effort.
 	EmitClaimRejected hookEmitClaimRejectedFunc
-	// ResolveWorkBranch returns the git branch of the worker's own worktree —
-	// the bead's gc.work_dir, never the store directory — stamped onto the bead
-	// as gc.work_branch at claim time. Empty result (no repo / detached HEAD)
-	// skips the stamp.
+	// ResolveWorkBranch returns the git branch of a checkout the bead records as
+	// its own (hookClaimWorkerDirs), never the store directory, to stamp as
+	// gc.work_branch at claim time. Empty result (missing path / no repo /
+	// detached HEAD) marks that candidate unusable.
 	ResolveWorkBranch hookResolveWorkBranchFunc
 	// StampWorkBranch writes gc.work_branch onto the claimed bead. Best-effort.
 	StampWorkBranch hookStampWorkBranchFunc
@@ -57,7 +58,7 @@ type (
 	hookAssignContinuationFunc    func(context.Context, string, []string, string, string) error
 	hookDrainAckFunc              func(io.Writer) error
 	hookEmitClaimRejectedFunc     func(beadID, existingClaimant, attemptedClaimant string)
-	hookResolveWorkBranchFunc     func(dir string) string
+	hookResolveWorkBranchFunc     func(workerDir string) string
 	hookStampWorkBranchFunc       func(ctx context.Context, dir string, env []string, beadID, assignee, branch string) error
 	hookRecordSessionPointersFunc func(ctx context.Context, dir string, env []string, assignee, sessionBeadID, runID, stepID string) error
 )
@@ -418,49 +419,73 @@ func hookClaimWithBdStore(_ context.Context, dir string, env []string, beadID, a
 	return claimed, true, nil
 }
 
-// hookClaimWorkerDir returns the claiming worker's authoritative checkout for
-// bead: the gc.work_dir its workspace provisioner recorded on the bead itself.
+// hookClaimWorkerDirs returns the checkouts bead records for its own work, most
+// authoritative first: the canonical gc.work_dir, then the legacy work_dir.
 //
-// This is deliberately NOT the store directory the claim was answered from. The
-// two are independent inputs that a federated claim routinely disagrees on: the
-// store is selected by where the WORK QUERY found the bead, which for a
-// rig-scoped worker is the shared rig checkout — a tree the worker never commits
-// to and which sits on whatever branch someone last left it on (gc-j4sr:
-// _pr1945_check was stamped onto a workflow running in its own worktree).
+// These are deliberately NOT the store directory the claim was answered from.
+// Store and workspace are independent inputs that a federated claim routinely
+// disagrees on: the store is selected by where the WORK QUERY found the bead,
+// which for a rig-scoped worker is the shared rig checkout — a tree the worker
+// never commits to and which sits on whatever branch someone last left it on
+// (gc-j4sr: _pr1945_check was stamped onto a workflow running in its own
+// worktree).
 //
-// It reads the same key the work-record close gate resolves its repo from
-// (work_record_gate.go), so the branch stamped at claim time and the branch a
-// commit is validated against at close time always name the same tree. Empty
-// result means no authoritative checkout is recorded and the caller must leave
-// gc.work_branch unset rather than infer one.
-//
-// Deliberately no fallback to the legacy work_dir key, matching
-// contract.ArtifactDirFromMetadata rather than contract.WorkerDirFromMetadata:
-// the legacy key means "agent process cwd" only on SESSION beads, while on the
-// task beads claimed here it historically meant the artifact directory. Reading
-// it would resolve a branch from a tree that is not the worker's checkout —
-// the same conflation this function exists to end — and would break the
-// stamp/gate symmetry above, since the gate resolves gc.work_dir alone.
-func hookClaimWorkerDir(bead beads.Bead) string {
-	return strings.TrimSpace(bead.Metadata[beadmeta.WorkDirMetadataKey])
+// The canonical key comes first because it is the one the work-record close gate
+// resolves its repo from (work_record_gate.go). That alignment is a tiebreak,
+// not a guarantee the two always read the same tree: the gate falls back to its
+// scope root where this declines to stamp at all, and a branch name resolved
+// from any worktree is reachable from every other worktree of the same repo,
+// since they share one object store. The claim-side rule stands on its own —
+// resolve from what the bead records, never from what the store happens to be
+// on. The legacy key follows because
+// it is not reliably dead data here: this fork's provisioner writes gc.work_dir
+// as the per-bead worktree path it INTENDS, which may never be created, while
+// work_dir still records the tree the worker actually used (gc-6mdz: gc.work_dir
+// named a nonexistent path, work_dir named the worktree on the bead's own
+// branch). Reading it is safe because the caller validates each candidate by
+// resolving a branch from it rather than trusting it: a legacy value written
+// under the old artifact-dir semantics (contract.ArtifactDirFromMetadata) is not
+// a repo, so it yields no branch and is skipped like any other unusable
+// candidate.
+func hookClaimWorkerDirs(bead beads.Bead) []string {
+	dirs := make([]string, 0, 2)
+	for _, key := range []string{beadmeta.WorkDirMetadataKey, beadmeta.LegacyWorkDirMetadataKey} {
+		v := strings.TrimSpace(bead.Metadata[key])
+		if v != "" && !slices.Contains(dirs, v) {
+			dirs = append(dirs, v)
+		}
+	}
+	return dirs
+}
+
+// hookClaimWorkerBranch returns the branch of the first checkout bead records
+// that resolves to one, or "" when it records no usable checkout at all. resolve
+// is the validating step: it yields "" for a path that is missing, is not a
+// repo, or has a detached HEAD, so an unusable candidate falls through to the
+// next rather than being stamped.
+func hookClaimWorkerBranch(bead beads.Bead, resolve hookResolveWorkBranchFunc) string {
+	for _, dir := range hookClaimWorkerDirs(bead) {
+		if branch := strings.TrimSpace(resolve(dir)); branch != "" {
+			return branch
+		}
+	}
+	return ""
 }
 
 // stampHookWorkBranch records the claiming worker's git branch on the bead as
 // gc.work_branch — the durable handle from the bead to its work that the close
-// gate later reads (ADR-0009). The branch comes from the worker's own checkout
-// (hookClaimWorkerDir); dir names the store the write is addressed to and is
-// never used as a branch source. Idempotent (skips when already current) and
-// best-effort: an unrecorded worker checkout, a missing repo, a detached HEAD,
-// or a write error leaves the stamp unset and never blocks the claim. An unset
-// gc.work_branch is the honest outcome — the close gate fails loudly on a
-// shipped bead that lacks one, which is strictly better than validating its
-// commit against a branch the work never touched.
+// gate later reads (ADR-0009). The branch comes from a checkout the bead itself
+// records (hookClaimWorkerBranch); dir names the store the write is addressed to
+// and is never used as a branch source. Idempotent (skips when already current)
+// and best-effort: a bead recording no usable checkout, or a write error, leaves
+// the stamp unset and never blocks the claim.
+//
+// An unset gc.work_branch is the honest outcome, not a gap. A bead is routinely
+// claimed before its worktree exists, and no branch is knowable then; the close
+// gate fails loudly on a shipped bead that lacks one, which is strictly better
+// than validating its commit against a branch the work never touched.
 func stampHookWorkBranch(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stderr io.Writer) {
-	workerDir := hookClaimWorkerDir(bead)
-	if workerDir == "" {
-		return
-	}
-	branch := strings.TrimSpace(ops.ResolveWorkBranch(workerDir))
+	branch := hookClaimWorkerBranch(bead, ops.ResolveWorkBranch)
 	if branch == "" {
 		return
 	}
@@ -541,13 +566,15 @@ func hookClaimSessionID(env []string) string {
 	return strings.TrimSpace(sessionID)
 }
 
-// hookResolveWorkBranch returns the current git branch of dir, or "" when dir
-// is not a worktree or HEAD is detached (no meaningful branch to stamp).
-func hookResolveWorkBranch(dir string) string {
-	if strings.TrimSpace(dir) == "" {
+// hookResolveWorkBranch returns the current git branch of workerDir — a checkout
+// the bead records as its own, never the claim's store dir — or "" when the path
+// is missing, is not a worktree, or has a detached HEAD (no meaningful branch to
+// stamp). The empty result is what makes an unusable candidate skippable.
+func hookResolveWorkBranch(workerDir string) string {
+	if strings.TrimSpace(workerDir) == "" {
 		return ""
 	}
-	out, err := exec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	out, err := exec.Command("git", "-C", workerDir, "rev-parse", "--abbrev-ref", "HEAD").Output()
 	if err != nil {
 		return ""
 	}

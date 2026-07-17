@@ -78,7 +78,7 @@ func initRepoOnBranch(t *testing.T, dir, branch string) string {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("creating repo dir %s: %v", dir, err)
 	}
-	mustGit(t, dir, "init", "--quiet", dir)
+	mustGit(t, dir, "init", "--quiet")
 	if err := os.WriteFile(filepath.Join(dir, "seed.txt"), []byte("seed\n"), 0o644); err != nil {
 		t.Fatalf("seeding repo %s: %v", dir, err)
 	}
@@ -163,6 +163,99 @@ func TestHookClaimSkipsStampWithoutAuthoritativeWorkerCheckout(t *testing.T) {
 				t.Fatalf("stamp writes = %d (branch %q), want 0: no authoritative worker checkout exists, so the store branch must never be inferred", probe.calls, probe.branch)
 			}
 		})
+	}
+}
+
+// TestHookClaimFallsBackToLegacyWorkDir covers the beads this fork actually
+// produces: gc.work_dir holds the canonical per-bead worktree path the workspace
+// provisioner intends, which may never have been created, while the legacy
+// work_dir still records the tree the worker really used (observed live on
+// gc-6mdz: gc.work_dir named a path that does not exist, work_dir named the
+// worktree on the bead's own branch). Falling back recovers that provenance.
+// The fallback is self-validating rather than trusting: a legacy value written
+// under the old artifact-dir semantics is not a repo, so it resolves to no
+// branch and is skipped like any other unusable candidate.
+func TestHookClaimFallsBackToLegacyWorkDir(t *testing.T) {
+	root := t.TempDir()
+	storeDir := initRepoOnBranch(t, filepath.Join(root, "rig-store"), "_pr1945_check")
+	realWorktree := initRepoOnBranch(t, filepath.Join(root, "polecat-4-6mdz"), "bd-gc-6mdz")
+	artifactDir := filepath.Join(root, "artifacts")
+	if err := os.MkdirAll(artifactDir, 0o755); err != nil {
+		t.Fatalf("creating artifact dir: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		workDir    string
+		legacyDir  string
+		wantBranch string
+	}{
+		{
+			name:       "canonical work_dir never created, legacy holds the real worktree",
+			workDir:    filepath.Join(root, "polecat", "gc-6mdz"), // never provisioned
+			legacyDir:  realWorktree,
+			wantBranch: "bd-gc-6mdz",
+		},
+		{
+			name:       "canonical work_dir absent entirely, legacy holds the real worktree",
+			workDir:    "",
+			legacyDir:  realWorktree,
+			wantBranch: "bd-gc-6mdz",
+		},
+		{
+			name:       "legacy value is an artifact dir, not a repo: no branch to recover",
+			workDir:    filepath.Join(root, "polecat", "gc-6mdz"),
+			legacyDir:  artifactDir,
+			wantBranch: "", // no stamp
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			meta := map[string]string{beadmeta.RoutedToMetadataKey: "worker"}
+			if tc.workDir != "" {
+				meta[beadmeta.WorkDirMetadataKey] = tc.workDir
+			}
+			meta[beadmeta.LegacyWorkDirMetadataKey] = tc.legacyDir
+
+			probe := runClaimForWorkBranch(t, beads.Bead{
+				ID: "wb-legacy", Status: "open", Metadata: meta,
+			}, storeDir)
+
+			if tc.wantBranch == "" {
+				if probe.calls != 0 {
+					t.Fatalf("stamp writes = %d (branch %q), want 0", probe.calls, probe.branch)
+				}
+				return
+			}
+			if probe.branch != tc.wantBranch {
+				t.Errorf("stamped %q, want %q", probe.branch, tc.wantBranch)
+			}
+			if probe.branch == "_pr1945_check" {
+				t.Errorf("fell through to the STORE branch %q", probe.branch)
+			}
+		})
+	}
+}
+
+// TestHookClaimPrefersCanonicalWorkDirOverLegacy pins the precedence: when both
+// keys name a usable repo, the canonical gc.work_dir wins. The legacy key is a
+// recovery path for beads the canonical key fails to resolve, never an override.
+func TestHookClaimPrefersCanonicalWorkDirOverLegacy(t *testing.T) {
+	root := t.TempDir()
+	storeDir := initRepoOnBranch(t, filepath.Join(root, "rig-store"), "_pr1945_check")
+	canonical := initRepoOnBranch(t, filepath.Join(root, "canonical"), "bd-canonical")
+	legacy := initRepoOnBranch(t, filepath.Join(root, "legacy"), "bd-legacy")
+
+	probe := runClaimForWorkBranch(t, beads.Bead{
+		ID: "wb-prec", Status: "open",
+		Metadata: map[string]string{
+			beadmeta.RoutedToMetadataKey:      "worker",
+			beadmeta.WorkDirMetadataKey:       canonical,
+			beadmeta.LegacyWorkDirMetadataKey: legacy,
+		},
+	}, storeDir)
+
+	if probe.branch != "bd-canonical" {
+		t.Errorf("stamped %q, want bd-canonical (canonical gc.work_dir takes precedence)", probe.branch)
 	}
 }
 
