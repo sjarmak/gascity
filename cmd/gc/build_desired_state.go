@@ -931,34 +931,45 @@ func buildDesiredStateWithSessionBeads(
 	// Raw gc.routed_to metadata is intentionally NOT treated as direct named
 	// demand here. The controller only uses assignment/readiness state; routed
 	// metadata is consumed by the agent-side gc hook path.
-	for identity, spec := range namedSpecs {
-		for i, wb := range assignedWorkBeads {
-			// in_progress work is always actionable; open work is direct named
-			// demand only when it passed the store's readiness/deps gate. Without
-			// the readiness check, an open assigned bead that entered the snapshot
-			// via the open-routed orphan-release pass (no deps gate) would keep an
-			// on-demand named session awake forever even while blocked.
-			switch wb.Status {
-			case "in_progress":
-			case "open":
-				ref := ""
-				if i < len(assignedWorkStoreRefs) {
-					ref = assignedWorkStoreRefs[i]
-				}
-				if !readyAssigned[storeScopedBeadKey{StoreRef: ref, ID: wb.ID}] {
-					continue
-				}
-			default:
+	// Precompute demand-eligibility (status/readiness gate + disarm check) once
+	// per bead rather than once per (identity, bead) pair below — this check
+	// does not depend on identity/spec, so re-deciding it inside the outer
+	// namedSpecs loop was redundant work repeated for every named session.
+	eligibleAssignedWork := make([]bool, len(assignedWorkBeads))
+	for i, wb := range assignedWorkBeads {
+		// in_progress work is always actionable; open work is direct named
+		// demand only when it passed the store's readiness/deps gate. Without
+		// the readiness check, an open assigned bead that entered the snapshot
+		// via the open-routed orphan-release pass (no deps gate) would keep an
+		// on-demand named session awake forever even while blocked.
+		switch wb.Status {
+		case "in_progress":
+		case "open":
+			ref := ""
+			if i < len(assignedWorkStoreRefs) {
+				ref = assignedWorkStoreRefs[i]
+			}
+			if !readyAssigned[storeScopedBeadKey{StoreRef: ref, ID: wb.ID}] {
 				continue
 			}
-			// Same interlock as the other two demand paths in this file: a
-			// disarmed bead is still status=open/in_progress with Assignee
-			// set, so without this check it would set namedWorkReady=true,
-			// spawn the named on_demand session, and the hook would then
-			// refuse to serve the disarmed bead — the session idle-exits and
-			// the reconciler respawns it next tick, just relocated to named
-			// sessions instead of the pool/control-dispatcher paths.
-			if beadmeta.IsDisarmed(wb.Metadata) {
+		default:
+			continue
+		}
+		// Same interlock as the other two demand paths in this file: a
+		// disarmed bead is still status=open/in_progress with Assignee
+		// set, so without this check it would set namedWorkReady=true,
+		// spawn the named on_demand session, and the hook would then
+		// refuse to serve the disarmed bead — the session idle-exits and
+		// the reconciler respawns it next tick, just relocated to named
+		// sessions instead of the pool/control-dispatcher paths.
+		if beadmeta.IsDisarmed(wb.Metadata) {
+			continue
+		}
+		eligibleAssignedWork[i] = true
+	}
+	for identity, spec := range namedSpecs {
+		for i, wb := range assignedWorkBeads {
+			if !eligibleAssignedWork[i] {
 				continue
 			}
 			assignee := strings.TrimSpace(wb.Assignee)
