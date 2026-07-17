@@ -151,10 +151,10 @@ type hookClaimOps struct {
 	// EmitClaimRejected publishes a bead.claim_rejected event when a claim is
 	// lost to a different live claimant (ADR-0009). Best-effort.
 	EmitClaimRejected hookEmitClaimRejectedFunc
-	// ResolveWorkBranch returns the git branch of the worker's worktree (dir),
-	// stamped onto the bead as gc.work_branch at claim time. Empty result (no
-	// repo / detached HEAD) omits the branch key — the session back-reference is
-	// still stamped.
+	// ResolveWorkBranch returns the git branch of the worker's own worktree —
+	// the bead's gc.work_dir, never the store directory — stamped onto the bead
+	// as gc.work_branch at claim time. Empty result (no repo / detached HEAD)
+	// omits the branch key — the session back-reference is still stamped.
 	ResolveWorkBranch hookResolveWorkBranchFunc
 	// StampWorkMeta writes the claim-time execution-identity metadata patch
 	// (gc.work_branch and/or the durable session back-reference gc.session_id /
@@ -1048,6 +1048,33 @@ func hookClaimThroughStore(beadID, assignee string, claim func() (beads.Bead, bo
 	return canonical, true, nil
 }
 
+// hookClaimWorkerDir returns the claiming worker's authoritative checkout for
+// bead: the gc.work_dir its workspace provisioner recorded on the bead itself.
+//
+// This is deliberately NOT the store directory the claim was answered from. The
+// two are independent inputs that a federated claim routinely disagrees on: the
+// store is selected by where the WORK QUERY found the bead, which for a
+// rig-scoped worker is the shared rig checkout — a tree the worker never commits
+// to and which sits on whatever branch someone last left it on (gc-j4sr:
+// _pr1945_check was stamped onto a workflow running in its own worktree).
+//
+// It reads the same key the work-record close gate resolves its repo from
+// (work_record_gate.go), so the branch stamped at claim time and the branch a
+// commit is validated against at close time always name the same tree. Empty
+// result means no authoritative checkout is recorded and the caller must leave
+// gc.work_branch unset rather than infer one.
+//
+// Deliberately no fallback to the legacy work_dir key, matching
+// contract.ArtifactDirFromMetadata rather than contract.WorkerDirFromMetadata:
+// the legacy key means "agent process cwd" only on SESSION beads, while on the
+// task beads claimed here it historically meant the artifact directory. Reading
+// it would resolve a branch from a tree that is not the worker's checkout —
+// the same conflation this function exists to end — and would break the
+// stamp/gate symmetry above, since the gate resolves gc.work_dir alone.
+func hookClaimWorkerDir(bead beads.Bead) string {
+	return strings.TrimSpace(bead.Metadata[beadmeta.WorkDirMetadataKey])
+}
+
 // stampHookClaimIdentity records the claiming worker's execution identity on the
 // claimed bead in ONE metadata write: gc.work_branch (the durable handle from the
 // bead to its work that the close gate later reads, ADR-0009) plus the durable
@@ -1069,7 +1096,7 @@ func hookClaimThroughStore(beadID, assignee string, claim func() (beads.Bead, bo
 // stamped only when absent, never touched again once set. Best-effort: a missing
 // repo, detached HEAD, absent session, or write error never blocks the claim.
 func stampHookClaimIdentity(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stderr io.Writer) (beads.Bead, bool) {
-	patch := hookClaimIdentityPatch(bead, opts, ops, dir)
+	patch := hookClaimIdentityPatch(bead, opts, ops)
 	sessionID := hookClaimSessionID(opts.Env)
 	needsLifecycleIdentity := sessionID != "" && !beadmeta.IsControlKind(strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey]))
 	if len(patch) == 0 {
@@ -1141,11 +1168,13 @@ func hookClaimLifecycleCandidate(bead beads.Bead, opts hookClaimOptions) bool {
 //
 // An empty result means every key is already current, so the caller issues no
 // write.
-func hookClaimIdentityPatch(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string) map[string]string {
+func hookClaimIdentityPatch(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps) map[string]string {
 	patch := map[string]string{}
-	if branch := strings.TrimSpace(ops.ResolveWorkBranch(dir)); branch != "" &&
-		strings.TrimSpace(bead.Metadata[beadmeta.WorkBranchMetadataKey]) != branch {
-		patch[beadmeta.WorkBranchMetadataKey] = branch
+	if workerDir := hookClaimWorkerDir(bead); workerDir != "" {
+		if branch := strings.TrimSpace(ops.ResolveWorkBranch(workerDir)); branch != "" &&
+			strings.TrimSpace(bead.Metadata[beadmeta.WorkBranchMetadataKey]) != branch {
+			patch[beadmeta.WorkBranchMetadataKey] = branch
+		}
 	}
 	if sessionID := hookClaimSessionID(opts.Env); sessionID != "" &&
 		!beadmeta.IsControlKind(strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey])) {

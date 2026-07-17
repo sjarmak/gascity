@@ -752,18 +752,20 @@ func TestDoHookClaimEmitsRejectedOnLostClaim(t *testing.T) {
 }
 
 // TestDoHookClaimStampsWorkBranch covers ADR-0009 acceptance (d): the worker's
-// branch is stamped onto the bead as gc.work_branch at claim time.
+// branch is stamped onto the bead as gc.work_branch at claim time. The branch is
+// resolved from the bead's own gc.work_dir, never the store dir (gc-j4sr) — see
+// cmd_hook_claim_work_branch_test.go for the provenance regressions.
 func TestDoHookClaimStampsWorkBranch(t *testing.T) {
-	var stampedBead, stampedBranch, stampedAssignee string
+	var stampedBead, stampedBranch, stampedAssignee, resolvedDir string
 	runner := func(string, string) (string, error) {
-		return `[{"id":"hw-stamp","status":"open","metadata":{"gc.routed_to":"worker"}}]`, nil
+		return `[{"id":"hw-stamp","status":"open","metadata":{"gc.routed_to":"worker","gc.work_dir":"/tmp/worker-checkout"}}]`, nil
 	}
 	ops := hookClaimOps{
 		Runner: runner,
 		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
-			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker"}}, true, nil
+			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker", "gc.work_dir": "/tmp/worker-checkout"}}, true, nil
 		},
-		ResolveWorkBranch: func(string) string { return "bd-hw-stamp" },
+		ResolveWorkBranch: func(dir string) string { resolvedDir = dir; return "bd-hw-stamp" },
 		StampWorkMeta: func(_ context.Context, _ string, _ []string, beadID, assignee string, patch map[string]string) error {
 			stampedBead, stampedAssignee, stampedBranch = beadID, assignee, patch["gc.work_branch"]
 			return nil
@@ -784,6 +786,9 @@ func TestDoHookClaimStampsWorkBranch(t *testing.T) {
 	if stampedBead != "hw-stamp" || stampedBranch != "bd-hw-stamp" || stampedAssignee != "worker-1" {
 		t.Fatalf("stamp = bead %q branch %q assignee %q, want hw-stamp/bd-hw-stamp/worker-1", stampedBead, stampedBranch, stampedAssignee)
 	}
+	if resolvedDir != "/tmp/worker-checkout" {
+		t.Errorf("branch resolved from %q, want the bead's gc.work_dir /tmp/worker-checkout (not the store dir /tmp/work)", resolvedDir)
+	}
 }
 
 // TestDoHookClaimSkipsStampWhenBranchUnchanged guards the idempotent path: a
@@ -794,12 +799,12 @@ func TestDoHookClaimStampsWorkBranch(t *testing.T) {
 func TestDoHookClaimSkipsStampWhenBranchUnchanged(t *testing.T) {
 	var stampCalls int
 	runner := func(string, string) (string, error) {
-		return `[{"id":"hw-idem","status":"open","metadata":{"gc.routed_to":"worker","gc.work_branch":"bd-hw-idem","gc.claimed_at":"2026-01-01T00:00:00Z"}}]`, nil
+		return `[{"id":"hw-idem","status":"open","metadata":{"gc.routed_to":"worker","gc.work_branch":"bd-hw-idem","gc.work_dir":"/tmp/worker-checkout","gc.claimed_at":"2026-01-01T00:00:00Z"}}]`, nil
 	}
 	ops := hookClaimOps{
 		Runner: runner,
 		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
-			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker", "gc.work_branch": "bd-hw-idem", "gc.claimed_at": "2026-01-01T00:00:00Z"}}, true, nil
+			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker", "gc.work_branch": "bd-hw-idem", "gc.work_dir": "/tmp/worker-checkout", "gc.claimed_at": "2026-01-01T00:00:00Z"}}, true, nil
 		},
 		ResolveWorkBranch: func(string) string { return "bd-hw-idem" },
 		StampWorkMeta: func(_ context.Context, _ string, _ []string, _, _ string, _ map[string]string) error {

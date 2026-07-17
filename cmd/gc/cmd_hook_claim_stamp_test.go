@@ -146,8 +146,8 @@ func poolClaimOpts() hookClaimOptions {
 func TestDoHookClaimStampsSessionIdentity(t *testing.T) {
 	spy := &stampMetaSpy{}
 	ops := poolClaimOps(
-		`[{"id":"hw-pool","status":"open","metadata":{"gc.routed_to":"worker"}}]`,
-		map[string]string{"gc.routed_to": "worker"},
+		`[{"id":"hw-pool","status":"open","metadata":{"gc.routed_to":"worker","gc.work_dir":"/tmp/worker-checkout"}}]`,
+		map[string]string{"gc.routed_to": "worker", "gc.work_dir": "/tmp/worker-checkout"},
 		"bd-hw-pool",
 		spy,
 	)
@@ -280,13 +280,14 @@ func TestDoHookClaimStampsOnlyChangedIdentityKeys(t *testing.T) {
 	spy := &stampMetaSpy{}
 	current := map[string]string{
 		"gc.routed_to":    "worker",
+		"gc.work_dir":     "/tmp/worker-checkout",
 		"gc.work_branch":  "bd-old",
 		"gc.session_id":   "mc-sess1",
 		"gc.session_name": "gc__role-mc-sess1",
 		"gc.claimed_at":   "2026-01-01T00:00:00Z",
 	}
 	ops := poolClaimOps(
-		`[{"id":"hw-partial","status":"open","metadata":{"gc.routed_to":"worker","gc.work_branch":"bd-old","gc.session_id":"mc-sess1","gc.session_name":"gc__role-mc-sess1","gc.claimed_at":"2026-01-01T00:00:00Z"}}]`,
+		`[{"id":"hw-partial","status":"open","metadata":{"gc.routed_to":"worker","gc.work_dir":"/tmp/worker-checkout","gc.work_branch":"bd-old","gc.session_id":"mc-sess1","gc.session_name":"gc__role-mc-sess1","gc.claimed_at":"2026-01-01T00:00:00Z"}}]`,
 		current,
 		"bd-new",
 		spy,
@@ -314,8 +315,8 @@ func TestDoHookClaimStampsOnlyChangedIdentityKeys(t *testing.T) {
 func TestDoHookClaimSkipsSessionIdentityForControlBead(t *testing.T) {
 	spy := &stampMetaSpy{}
 	ops := poolClaimOps(
-		`[{"id":"hc-check","status":"open","metadata":{"gc.routed_to":"worker","gc.kind":"check"}}]`,
-		map[string]string{"gc.routed_to": "worker", "gc.kind": "check"},
+		`[{"id":"hc-check","status":"open","metadata":{"gc.routed_to":"worker","gc.kind":"check","gc.work_dir":"/tmp/worker-checkout"}}]`,
+		map[string]string{"gc.routed_to": "worker", "gc.kind": "check", "gc.work_dir": "/tmp/worker-checkout"},
 		"bd-hc-check",
 		spy,
 	)
@@ -341,8 +342,8 @@ func TestDoHookClaimSkipsSessionIdentityForControlBead(t *testing.T) {
 func TestDoHookClaimSkipsSessionIdentityWhenNoSessionID(t *testing.T) {
 	spy := &stampMetaSpy{}
 	ops := poolClaimOps(
-		`[{"id":"hw-nosess","status":"open","metadata":{"gc.routed_to":"worker"}}]`,
-		map[string]string{"gc.routed_to": "worker"},
+		`[{"id":"hw-nosess","status":"open","metadata":{"gc.routed_to":"worker","gc.work_dir":"/tmp/worker-checkout"}}]`,
+		map[string]string{"gc.routed_to": "worker", "gc.work_dir": "/tmp/worker-checkout"},
 		"bd-hw-nosess",
 		spy,
 	)
