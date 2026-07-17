@@ -1053,6 +1053,7 @@ export const zAgentPatch = z.object({
     Provider: z.string().nullable(),
     ResumeCommand: z.string().nullable(),
     ScaleCheck: z.string().nullable(),
+    SchedulingPolicy: z.string().nullable(),
     Scope: z.string().nullable(),
     Session: z.string().nullable(),
     SessionLive: z.array(z.string()).nullable(),

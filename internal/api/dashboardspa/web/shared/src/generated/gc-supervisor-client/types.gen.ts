@@ -96,6 +96,7 @@ export type AgentPatch = {
     Provider: string | null;
     ResumeCommand: string | null;
     ScaleCheck: string | null;
+    SchedulingPolicy: string | null;
     Scope: string | null;
     Session: string | null;
     SessionLive: Array<string> | null;
