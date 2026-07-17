@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 )
 
@@ -192,6 +193,65 @@ func TestDoHookClaimUsesSelectedStoreContextForMutationAndContinuation(t *testin
 	}
 	if assignedBead != "sib-1" {
 		t.Fatalf("assignedBead = %q, want sib-1", assignedBead)
+	}
+}
+
+// TestPreassignHookContinuationGroupSkipsDisarmedSibling covers the preassign
+// path's disarm skip. Claiming a bead stamps its continuation-group siblings
+// with the same assignee so they stay on one worker; a disarmed sibling must not
+// get stamped.
+//
+// Nothing executes either way — the claim path drops a disarmed bead regardless.
+// The cost is bookkeeping: a durable do-not-execute bead that reads as owned to
+// every operator and query that looks at assignee, and an assignee that outlives
+// the session that wrote it.
+func TestPreassignHookContinuationGroupSkipsDisarmedSibling(t *testing.T) {
+	routed := map[string]string{beadmeta.RoutedToMetadataKey: "route-1"}
+	withDisarm := func(md map[string]string) map[string]string {
+		out := map[string]string{beadmeta.DisarmedMetadataKey: "true"}
+		for k, v := range md {
+			out[k] = v
+		}
+		return out
+	}
+
+	claimed := beads.Bead{
+		ID: "bead-1",
+		Metadata: map[string]string{
+			beadmeta.RoutedToMetadataKey:          "route-1",
+			beadmeta.RootBeadIDMetadataKey:        "root-1",
+			beadmeta.ContinuationGroupMetadataKey: "group-a",
+		},
+	}
+	siblings := []beads.Bead{
+		{ID: "sib-disarmed", Status: "open", Metadata: withDisarm(routed)},
+		{ID: "sib-armed", Status: "open", Metadata: routed},
+	}
+
+	var assigned []string
+	ops := hookClaimOps{
+		ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
+			return siblings, nil
+		},
+		AssignContinuation: func(_ context.Context, _ string, _ []string, beadID, _ string) error {
+			assigned = append(assigned, beadID)
+			return nil
+		},
+	}
+
+	got, err := preassignHookContinuationGroup(claimed, hookClaimOptions{
+		Assignee:     "worker-1",
+		RouteTargets: []string{"route-1"},
+	}, ops, "store-dir")
+	if err != nil {
+		t.Fatalf("preassignHookContinuationGroup: %v", err)
+	}
+	want := []string{"sib-armed"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("preassigned = %v, want %v (the disarmed sibling must not be stamped)", got, want)
+	}
+	if !reflect.DeepEqual(assigned, want) {
+		t.Errorf("AssignContinuation called for %v, want %v", assigned, want)
 	}
 }
 
