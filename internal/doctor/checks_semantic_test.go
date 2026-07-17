@@ -3,6 +3,7 @@ package doctor
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -615,7 +616,7 @@ type fakeGitWorktree struct {
 	unpushedErr map[string]error
 	stashed     map[string]bool
 	stashedErr  map[string]error
-	removeCalls *[]string // path argument of each WorktreeRemove call
+	removeCalls *[]string // path argument of each WorktreeRemoveAndRevoke call
 	removeFrom  *[]string // currentPath (cwd-equivalent) at each remove call
 	removeErr   map[string]error
 	currentPath string
@@ -644,7 +645,7 @@ func (f *fakeGitWorktree) HasStashesResult() (bool, error) {
 	return f.stashed[f.currentPath], nil
 }
 
-func (f *fakeGitWorktree) WorktreeRemove(path string, _ bool) error {
+func (f *fakeGitWorktree) WorktreeRemoveAndRevoke(path string, _ bool) error {
 	if f.removeCalls != nil {
 		*f.removeCalls = append(*f.removeCalls, path)
 	}
@@ -1229,7 +1230,7 @@ func TestNestedWorktreePruneCheck_FixUsesParentForGitContext(t *testing.T) {
 		t.Fatalf("Fix: %v", err)
 	}
 	if len(removeFrom) != 1 || removeFrom[0] != home {
-		t.Errorf("WorktreeRemove ran from %v, want exactly [%q] (parent home, not the worktree being removed)",
+		t.Errorf("WorktreeRemoveAndRevoke ran from %v, want exactly [%q] (parent home, not the worktree being removed)",
 			removeFrom, home)
 	}
 }
@@ -1273,6 +1274,105 @@ func TestNestedWorktreePruneCheck_BrokenRepoGate(t *testing.T) {
 	}
 	if c.findings[0].reason != "git status unreadable" {
 		t.Errorf("reason = %q, want %q", c.findings[0].reason, "git status unreadable")
+	}
+}
+
+// TestNestedWorktreePruneCheck_FixRevokesProvenanceOnRealNestedWorktree pins
+// gc-1fbg/AC#5 against a real repository, not the fake gitWorktree the other
+// cases in this file use: NestedWorktreePruneCheck.Fix — after migrating from
+// git.WorktreeRemove to git.WorktreeRemoveAndRevoke — still correctly tears
+// down a nested worktree created the way the pack formulas actually nest
+// them ($(pwd)/worktrees/<bead>, inside whatever tree the pool checked out),
+// and doing so does not disturb the enclosing managed worktree it sits in.
+func TestNestedWorktreePruneCheck_FixRevokesProvenanceOnRealNestedWorktree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	base := t.TempDir()
+	origin := filepath.Join(base, "origin.git")
+	if err := os.MkdirAll(origin, 0o755); err != nil {
+		t.Fatalf("mkdir origin: %v", err)
+	}
+	runRealGit(t, origin, "init", "-q", "--bare")
+
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	runRealGit(t, repo, "init", "-q")
+	runRealGit(t, repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", "init")
+	runRealGit(t, repo, "remote", "add", "origin", origin)
+	runRealGit(t, repo, "push", "-q", "origin", "HEAD:refs/heads/main")
+
+	cityPath := filepath.Join(base, "city")
+	home := filepath.Join(cityPath, ".gc", "worktrees", "rig-a", "polecat-1")
+	if err := git.New(repo).WorktreeAdd(git.WorktreeAddOptions{
+		Path:       home,
+		Base:       "HEAD",
+		Provenance: git.ProvenanceManaged,
+	}); err != nil {
+		t.Fatalf("WorktreeAdd(home): %v", err)
+	}
+
+	nested := filepath.Join(home, "worktrees", "gc-1fbg")
+	if err := git.New(home).WorktreeAdd(git.WorktreeAddOptions{
+		Path:       nested,
+		Base:       "HEAD",
+		Provenance: git.ProvenanceManaged,
+	}); err != nil {
+		t.Fatalf("WorktreeAdd(nested): %v", err)
+	}
+	nestedAdmin, err := git.New(nested).WorktreeAdminDir()
+	if err != nil {
+		t.Fatalf("WorktreeAdminDir(nested): %v", err)
+	}
+
+	c := NewNestedWorktreePruneCheck(config.DoctorConfig{NestedWorktreePrune: true})
+	r := c.Run(&CheckContext{CityPath: cityPath})
+	if r.Status != StatusError {
+		t.Fatalf("Run status = %d, want Error (a safely-prunable nested worktree exists); message=%q details=%v", r.Status, r.Message, r.Details)
+	}
+	if len(c.findings) != 1 || !c.findings[0].safeToRm {
+		t.Fatalf("findings = %+v, want exactly one safe-to-remove nested worktree", c.findings)
+	}
+
+	if err := c.Fix(&CheckContext{CityPath: cityPath}); err != nil {
+		t.Fatalf("Fix: %v", err)
+	}
+
+	if _, statErr := os.Stat(nested); !os.IsNotExist(statErr) {
+		t.Errorf("nested worktree %q survived Fix (stat err=%v)", nested, statErr)
+	}
+	if _, statErr := os.Stat(nestedAdmin); !os.IsNotExist(statErr) {
+		t.Errorf("nested worktree's admin dir %q survived Fix (stat err=%v); its stamp is still reachable for a replant", nestedAdmin, statErr)
+	}
+
+	// The enclosing managed worktree must be untouched: still on disk, still a
+	// valid repo, and still carrying its own "managed" provenance.
+	if _, statErr := os.Stat(home); statErr != nil {
+		t.Fatalf("enclosing worktree %q was disturbed by pruning its nested child: %v", home, statErr)
+	}
+	if !git.New(home).IsRepo() {
+		t.Fatal("enclosing worktree is no longer a valid git repo after pruning its nested child")
+	}
+	p, err := git.New(home).ReadWorktreeProvenance()
+	if err != nil {
+		t.Fatalf("enclosing worktree's own provenance unreadable after pruning its nested child: %v", err)
+	}
+	if p.Class != git.ProvenanceManaged {
+		t.Errorf("enclosing worktree provenance = %q, want %q", p.Class, git.ProvenanceManaged)
+	}
+}
+
+// runRealGit runs a real git command, unlike the fakeGitWorktree-oriented
+// helpers elsewhere in this file.
+func runRealGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 }
 

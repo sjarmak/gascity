@@ -13,9 +13,9 @@ import (
 )
 
 // fakeGitProbe is a hand-rolled gitProbe stub. Each field controls one
-// probe; WorktreeRemoveErr controls the destructive call, and removed
-// records the (path, force) of every WorktreeRemove invocation so tests
-// can assert which directory the removal targeted.
+// probe; worktreeRemove controls the destructive call, and removed
+// records the (path, force) of every WorktreeRemoveAndRevoke invocation so
+// tests can assert which directory the removal targeted.
 type fakeGitProbe struct {
 	isRepo         bool
 	hasUncommitted bool
@@ -35,7 +35,7 @@ func (f *fakeGitProbe) HasUnpushedCommitsResult() (bool, error) {
 	return f.hasUnpushed, f.unpushedErr
 }
 func (f *fakeGitProbe) HasStashesResult() (bool, error) { return f.hasStashes, f.stashesErr }
-func (f *fakeGitProbe) WorktreeRemove(path string, force bool) error {
+func (f *fakeGitProbe) WorktreeRemoveAndRevoke(path string, force bool) error {
 	f.removeInvoked = true
 	f.removedPath = path
 	f.removedForce = force

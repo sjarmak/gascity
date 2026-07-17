@@ -24,7 +24,7 @@ and read back when trust is decided.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			if len(args) == 0 {
-				fmt.Fprintln(stderr, "gc worktree: missing subcommand (create, provenance)") //nolint:errcheck // best-effort stderr
+				fmt.Fprintln(stderr, "gc worktree: missing subcommand (create, remove, provenance)") //nolint:errcheck // best-effort stderr
 			} else {
 				fmt.Fprintf(stderr, "gc worktree: unknown subcommand %q\n", args[0]) //nolint:errcheck // best-effort stderr
 			}
@@ -32,6 +32,7 @@ and read back when trust is decided.`,
 		},
 	}
 	cmd.AddCommand(newWorktreeCreateCmd(stdout, stderr))
+	cmd.AddCommand(newWorktreeRemoveCmd(stdout, stderr))
 	cmd.AddCommand(newWorktreeProvenanceCmd(stdout, stderr))
 	return cmd
 }
@@ -75,6 +76,44 @@ worktree is never trusted.`,
 	cmd.Flags().StringVar(&class, "class", "", "provenance class: managed | external-review (required)")
 	cmd.Flags().StringVar(&note, "note", "", "evidence behind the classification")
 	_ = cmd.MarkFlagRequired("class")
+	return cmd
+}
+
+func newWorktreeRemoveCmd(stdout, stderr io.Writer) *cobra.Command {
+	var force bool
+
+	cmd := &cobra.Command{
+		Use:   "remove <path>",
+		Short: "Tear down a worktree and revoke its recorded provenance",
+		Long: `Remove a git worktree and revoke its provenance stamp as one operation.
+
+This is the sole supported way to tear down a worktree this orchestration
+created. Deleting the directory directly (rm -rf) — including the
+"git worktree remove || rm -rf" fallback pattern — leaves the worktree's admin
+directory, and the provenance stamp inside it, behind: anything able to write
+the reaped path can then replant a forged .git pointer back at the orphaned
+admin directory, and the stale stamp vouches for content this orchestration
+never created (gc-1fbg).
+
+The stamp is revoked before git is asked to deregister the tree, so a crash
+between the two still fails closed: the path stops being able to vouch for
+anything at the very first step, whatever state the deregistration was left
+in.
+
+Run this from the main tree or another worktree of the same repository, not
+from inside the worktree being removed.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			path := args[0]
+			if err := git.New(".").WorktreeRemoveAndRevoke(path, force); err != nil {
+				fmt.Fprintf(stderr, "gc worktree remove: %v\n", err) //nolint:errcheck // best-effort stderr
+				return errExit
+			}
+			fmt.Fprintf(stdout, "removed %s\n", path) //nolint:errcheck // best-effort stdout
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "remove even with uncommitted changes")
 	return cmd
 }
 

@@ -23,7 +23,7 @@ type gitProbe interface {
 	HasUncommittedWork() bool
 	HasUnpushedCommitsResult() (bool, error)
 	HasStashesResult() (bool, error)
-	WorktreeRemove(path string, force bool) error
+	WorktreeRemoveAndRevoke(path string, force bool) error
 }
 
 // newGitProbe returns a gitProbe scoped to the given directory. Indirected
@@ -110,7 +110,7 @@ func pruneAgentHomeWorktreeIfSafe(session beads.Bead, cityPath string, cfg *conf
 		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: rig path unresolved\n", workerDir) //nolint:errcheck
 		return false
 	}
-	if err := newGitProbe(rigRoot).WorktreeRemove(workerDir, true); err != nil {
+	if err := newGitProbe(rigRoot).WorktreeRemoveAndRevoke(workerDir, true); err != nil {
 		fmt.Fprintf(stderr, "session reconciler: pruning worker_dir %s: %v\n", workerDir, err) //nolint:errcheck
 		return false
 	}
@@ -178,7 +178,7 @@ func pruneAgentHomeWorktreeIfSafeInfo(info sessionpkg.Info, cityPath string, cfg
 		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: rig path unresolved\n", workerDir) //nolint:errcheck
 		return
 	}
-	if err := newGitProbe(rigRoot).WorktreeRemove(workerDir, true); err != nil {
+	if err := newGitProbe(rigRoot).WorktreeRemoveAndRevoke(workerDir, true); err != nil {
 		fmt.Fprintf(stderr, "session reconciler: pruning worker_dir %s: %v\n", workerDir, err) //nolint:errcheck
 		return
 	}

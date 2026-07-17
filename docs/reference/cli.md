@@ -4686,6 +4686,7 @@ gc worktree
 |------------|-------------|
 | [gc worktree create](#gc-worktree-create) | Create a worktree and record its provenance |
 | [gc worktree provenance](#gc-worktree-provenance) | Inspect and record worktree provenance |
+| [gc worktree remove](#gc-worktree-remove) | Tear down a worktree and revoke its recorded provenance |
 
 ## gc worktree create
 
@@ -4759,3 +4760,31 @@ gc worktree provenance set <path> [flags]
 |------|------|---------|-------------|
 | `--class` | string |  | provenance class: managed \| external-review (required) |
 | `--note` | string |  | evidence for the classification (required) |
+
+## gc worktree remove
+
+Remove a git worktree and revoke its provenance stamp as one operation.
+
+This is the sole supported way to tear down a worktree this orchestration
+created. Deleting the directory directly (rm -rf) — including the
+"git worktree remove || rm -rf" fallback pattern — leaves the worktree's admin
+directory, and the provenance stamp inside it, behind: anything able to write
+the reaped path can then replant a forged .git pointer back at the orphaned
+admin directory, and the stale stamp vouches for content this orchestration
+never created (gc-1fbg).
+
+The stamp is revoked before git is asked to deregister the tree, so a crash
+between the two still fails closed: the path stops being able to vouch for
+anything at the very first step, whatever state the deregistration was left
+in.
+
+Run this from the main tree or another worktree of the same repository, not
+from inside the worktree being removed.
+
+```
+gc worktree remove <path> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--force` | bool |  | remove even with uncommitted changes |

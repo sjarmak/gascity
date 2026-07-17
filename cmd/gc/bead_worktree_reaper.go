@@ -124,10 +124,12 @@ func reapClosedBeadWorktrees(
 			// Capture branch before removal — the worktree dir will be gone after.
 			branch, _ := wg.CurrentBranch()
 
-			// Remove the worktree. git worktree remove must be run from the
-			// main repo root, not from within the worktree being removed.
+			// Remove the worktree through the front door that also revokes its
+			// import-trust provenance (gc-1fbg): git worktree remove must be
+			// run from the main repo root, not from within the worktree being
+			// removed.
 			mainRepo := git.New(cityPath)
-			if err := mainRepo.WorktreeRemove(worktreePath, false); err != nil {
+			if err := mainRepo.WorktreeRemoveAndRevoke(worktreePath, false); err != nil {
 				fmt.Fprintf(stderr, "reapClosedBeadWorktrees: removing %s: %v\n", worktreePath, err) //nolint:errcheck
 				continue
 			}

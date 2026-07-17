@@ -376,7 +376,7 @@ type gitWorktree interface {
 	HasUncommittedWork() bool
 	HasUnpushedCommitsResult() (bool, error)
 	HasStashesResult() (bool, error)
-	WorktreeRemove(path string, force bool) error
+	WorktreeRemoveAndRevoke(path string, force bool) error
 }
 
 // NestedWorktreePruneCheck identifies nested git worktrees inside agent
@@ -604,7 +604,7 @@ func (c *NestedWorktreePruneCheck) Fix(_ *CheckContext) error {
 			continue
 		}
 		gw := c.newGit(f.parent)
-		if err := gw.WorktreeRemove(f.path, true); err != nil {
+		if err := gw.WorktreeRemoveAndRevoke(f.path, true); err != nil {
 			errs = append(errs, fmt.Errorf("removing nested worktree %s: %w", f.path, err))
 		}
 	}

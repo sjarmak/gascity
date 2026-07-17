@@ -208,7 +208,7 @@ if [ -z "$WORK_BEAD_ID" ]; then
 fi
 WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // empty')
 if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
-  git worktree remove --force "$WORKTREE" || rm -rf "$WORKTREE"
+  gc worktree remove "$WORKTREE" --force
 fi
 gc bd update "$WORK_BEAD_ID" --unset-metadata work_dir
 ```

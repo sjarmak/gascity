@@ -196,6 +196,7 @@ const (
 	productMetricsGeneratedCommandID195 productMetricsCommandID = 195
 	productMetricsGeneratedCommandID196 productMetricsCommandID = 196
 	productMetricsGeneratedCommandID197 productMetricsCommandID = 197
+	productMetricsGeneratedCommandID198 productMetricsCommandID = 198
 )
 
 var generatedProductMetricsGlobalConditionalModes = []productMetricsConditionalMode{productMetricsConditionalGenericMachineOutput, productMetricsConditionalManagedContext, productMetricsConditionalProviderHook}
@@ -489,6 +490,7 @@ var generatedProductMetricsCommandCensus = []productMetricsCommandCensusEntry{
 	{Path: "gc worktree provenance", Aliases: []string{}, ConditionalModes: []productMetricsConditionalMode{}, Hidden: false, EffectiveHidden: false, DisableFlagParsing: false, Shape: productMetricsShapeRunnableGroup, Classification: "unknown", Mode: productMetricsModeStandard, Notice: productMetricsNoticeEligible, Recording: productMetricsRecordingRecordable, Owner: productMetricsOwnerDeferred, Resolver: productMetricsResolverGroupDispatch, DeferredDefault: productMetricsDeferredUnknown, ID: productMetricsCommandUnknown},
 	{Path: "gc worktree provenance list", Aliases: []string{}, ConditionalModes: []productMetricsConditionalMode{}, Hidden: false, EffectiveHidden: false, DisableFlagParsing: false, Shape: productMetricsShapeRunnable, Classification: "worktree-provenance-list", Mode: productMetricsModeStandard, Notice: productMetricsNoticeEligible, Recording: productMetricsRecordingRecordable, Owner: productMetricsOwnerImmediate, ID: productMetricsGeneratedCommandID196},
 	{Path: "gc worktree provenance set", Aliases: []string{}, ConditionalModes: []productMetricsConditionalMode{}, Hidden: false, EffectiveHidden: false, DisableFlagParsing: false, Shape: productMetricsShapeRunnable, Classification: "worktree-provenance-set", Mode: productMetricsModeStandard, Notice: productMetricsNoticeEligible, Recording: productMetricsRecordingRecordable, Owner: productMetricsOwnerImmediate, ID: productMetricsGeneratedCommandID197},
+	{Path: "gc worktree remove", Aliases: []string{}, ConditionalModes: []productMetricsConditionalMode{}, Hidden: false, EffectiveHidden: false, DisableFlagParsing: false, Shape: productMetricsShapeRunnable, Classification: "worktree-remove", Mode: productMetricsModeStandard, Notice: productMetricsNoticeEligible, Recording: productMetricsRecordingRecordable, Owner: productMetricsOwnerImmediate, ID: productMetricsGeneratedCommandID198},
 }
 
 var generatedProductMetricsSyntheticCensus = []productMetricsSyntheticCensusEntry{
