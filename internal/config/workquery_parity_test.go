@@ -1,8 +1,10 @@
 package config
 
 import (
+	"encoding/json"
 	"flag"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -239,6 +241,96 @@ func TestOnDeathOnBootFlagBlind(t *testing.T) {
 	}
 	if a.EffectiveOnBootForBeads(bd105) != a.EffectiveOnBoot() {
 		t.Error("EffectiveOnBootForBeads must equal EffectiveOnBoot (flag-blind)")
+	}
+}
+
+// TestNotDisarmedFilterJQMatchesGoDecoder pins the one predicate in this file
+// that has no Go oracle above: notDisarmedFilterJQ re-implements
+// beadmeta.IsDisarmedRaw in jq, and the two must agree row for row.
+//
+// TestWorkQueryGolden below cannot catch drift here. It pins the filter's
+// source text, so a semantically wrong rewrite still passes once the golden is
+// re-recorded with -update. This test pins the behavior instead, feeding both
+// implementations the same JSON and comparing their verdicts.
+//
+// The stakes are the reason it exists: if the shell filter and the Go claim
+// path ever disagree, the reconciler counts demand the worker then refuses, and
+// the pool spawns slots forever for work nobody can take — the exact
+// spin/strand loop the disarm flag was added to close.
+func TestNotDisarmedFilterJQMatchesGoDecoder(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not installed")
+	}
+
+	k := beadmeta.DisarmedMetadataKey
+	cases := []struct {
+		name string
+		row  map[string]any
+	}{
+		// Shapes bd actually emits: --set-metadata gc.disarmed=true type-infers
+		// to a JSON boolean; StringMap-coerced rows carry the string spellings.
+		{"bool true", map[string]any{"id": "b1", "metadata": map[string]any{k: true}}},
+		{"bool false", map[string]any{"id": "b1", "metadata": map[string]any{k: false}}},
+		{"string true", map[string]any{"id": "b1", "metadata": map[string]any{k: "true"}}},
+		{"string false", map[string]any{"id": "b1", "metadata": map[string]any{k: "false"}}},
+		{"string empty", map[string]any{"id": "b1", "metadata": map[string]any{k: ""}}},
+		// Case-fold and trim: both sides normalize, in opposite orders.
+		{"string TRUE uppercase", map[string]any{"id": "b1", "metadata": map[string]any{k: "TRUE"}}},
+		{"string FALSE uppercase", map[string]any{"id": "b1", "metadata": map[string]any{k: "FALSE"}}},
+		{"string true padded", map[string]any{"id": "b1", "metadata": map[string]any{k: " true "}}},
+		{"string false padded", map[string]any{"id": "b1", "metadata": map[string]any{k: " false "}}},
+		// Unrecognized values fail closed on both sides.
+		{"string unrecognized", map[string]any{"id": "b1", "metadata": map[string]any{k: "banana"}}},
+		{"string yes", map[string]any{"id": "b1", "metadata": map[string]any{k: "yes"}}},
+		{"number", map[string]any{"id": "b1", "metadata": map[string]any{k: 1}}},
+		{"object", map[string]any{"id": "b1", "metadata": map[string]any{k: map[string]any{"nested": true}}}},
+		// has() is what lets jq tell an explicit null from an absent key. Without
+		// it these two rows would collide, and every unmarked bead would strand.
+		{"explicit null", map[string]any{"id": "b1", "metadata": map[string]any{k: nil}}},
+		{"key absent", map[string]any{"id": "b1", "metadata": map[string]any{"gc.other": "x"}}},
+		// Structural shapes: every non-bd work_query override omits metadata.
+		{"metadata absent", map[string]any{"id": "b1"}},
+		{"metadata not an object", map[string]any{"id": "b1", "metadata": "nope"}},
+		{"metadata null", map[string]any{"id": "b1", "metadata": nil}},
+	}
+
+	// Quote the filter exactly as bdReadyPoolDemandNotDisarmedShell does, so
+	// this covers the shell quoting too, not just the jq expression.
+	jqStage := shellquote.Join([]string{"jq", notDisarmedFilterJQ()})
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal([]any{tc.row})
+			if err != nil {
+				t.Fatalf("marshal row: %v", err)
+			}
+
+			// Round-trip before consulting the Go decoder so it sees the same
+			// decoded types the hook path does (a JSON number lands as float64).
+			var decoded []map[string]any
+			if err := json.Unmarshal(raw, &decoded); err != nil {
+				t.Fatalf("unmarshal row: %v", err)
+			}
+			md, addressable := decoded[0]["metadata"].(map[string]any)
+			// Mirrors isDisarmedHookCandidate: metadata we cannot address at all
+			// is no marker, so the row is kept.
+			wantKept := !addressable || !beadmeta.IsDisarmedRaw(md)
+
+			script := "printf '%s' " + shellquote.Quote(string(raw)) + " | " + jqStage
+			out, err := exec.Command("sh", "-c", script).Output()
+			if err != nil {
+				t.Fatalf("run jq filter: %v (script=%s)", err, script)
+			}
+			var kept []map[string]any
+			if err := json.Unmarshal(out, &kept); err != nil {
+				t.Fatalf("unmarshal jq output %q: %v", out, err)
+			}
+
+			if gotKept := len(kept) == 1; gotKept != wantKept {
+				t.Errorf("jq and Go disagree for %s\n jq kept=%v\n Go kept=%v\n input=%s\n jq out=%s",
+					tc.name, gotKept, wantKept, raw, out)
+			}
+		})
 	}
 }
 
