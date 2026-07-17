@@ -156,7 +156,14 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
 	// self-blocked head (is_blocked / status==blocked) has Ready routed work
 	// behind it to fall through to instead of idle-exiting; the hook layer
 	// (filterUnreadyHookCandidates) strips the blocked head from the result.
-	return bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) + ` 2>/dev/null`
+	//
+	// The disarm filter runs here too, not just in poolDemandCountShell: this
+	// command backs EffectiveWorkQuery/EffectiveRoutedPoolQuery, which prompt
+	// templates can (and do) run directly, bypassing gc hook's own Go-side
+	// filterUnreadyHookCandidates. Without an in-shell filter, a template
+	// that runs the query itself would receive a disarmed bead raw (gc-u6an).
+	return bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) +
+		` 2>/dev/null | jq -c '` + notDisarmedFilterJQ() + `' 2>/dev/null`
 }
 
 // poolDemandCountShell emits the reconciler count-form for target: it counts
@@ -200,10 +207,24 @@ func standardAssignedWorkQueryScript(includeEphemeralReady bool) string {
 		standardAssignedReadyWorkQueryScript(includeEphemeralReady)
 }
 
+// assignedRowDisarmFilterScript renders the shell fragment that reruns the
+// captured single-row bd result ($r) through notDisarmedFilterJQ. Unlike the
+// pool-demand tiers, the assigned tiers query with --limit=1: if that one row
+// is a disarmed bead assigned to this agent, the raw row would otherwise
+// short-circuit the tier and hand the worker a bead the claim path then
+// refuses to serve (gc-u6an). Widening these tiers past limit=1 so a disarmed
+// head has other assigned work to fall through to is tracked separately
+// (gc-ewk4) — this fix only stops the disarmed row itself from being served,
+// matching AC1 ("excluded from claims in every tier").
+func assignedRowDisarmFilterScript() string {
+	return `r=$(printf "%s" "$r" | jq -c '` + notDisarmedFilterJQ() + `' 2>/dev/null); `
+}
+
 func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`r=$(bd list --status in_progress --assignee="$id" --json --limit=1 2>/dev/null); ` +
+		assignedRowDisarmFilterScript() +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("id", includeEphemeralReady) +
 		`done; `
@@ -213,6 +234,7 @@ func standardAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json --limit=1 2>/dev/null); ` +
+		assignedRowDisarmFilterScript() +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedReadyProbeScript("id", includeEphemeralReady) +
 		`done; `
@@ -230,6 +252,7 @@ func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool) 
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
 		`r=$(bd list --status in_progress --assignee="$cand" --json --limit=1 2>/dev/null); ` +
+		assignedRowDisarmFilterScript() +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("cand", includeEphemeralReady) +
 		`done; ` +
@@ -243,6 +266,7 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
 		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json --limit=1 2>/dev/null); ` +
+		assignedRowDisarmFilterScript() +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedReadyProbeScript("cand", includeEphemeralReady) +
 		`done; ` +

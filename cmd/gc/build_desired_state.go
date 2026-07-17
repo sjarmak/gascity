@@ -951,6 +951,16 @@ func buildDesiredStateWithSessionBeads(
 			default:
 				continue
 			}
+			// Same interlock as the other two demand paths in this file: a
+			// disarmed bead is still status=open/in_progress with Assignee
+			// set, so without this check it would set namedWorkReady=true,
+			// spawn the named on_demand session, and the hook would then
+			// refuse to serve the disarmed bead — the session idle-exits and
+			// the reconciler respawns it next tick, just relocated to named
+			// sessions instead of the pool/control-dispatcher paths.
+			if beadmeta.IsDisarmed(wb.Metadata) {
+				continue
+			}
 			assignee := strings.TrimSpace(wb.Assignee)
 			if assignee != identity {
 				continue
