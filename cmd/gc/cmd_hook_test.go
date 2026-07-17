@@ -1839,7 +1839,11 @@ max = 5
 	}
 
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'pwd=%s\nstore_root=%s\nstore_scope=%s\nprefix=%s\nrig=%s\nrig_root=%s\nargs=%s\n' \"$PWD\" \"${GC_STORE_ROOT:-}\" \"${GC_STORE_SCOPE:-}\" \"${GC_BEADS_PREFIX:-}\" \"${GC_RIG:-}\" \"${GC_RIG_ROOT:-}\" \"$*\"\n"
+	// The work_query row-returning tiers pipe bd's output through jq (the
+	// gc.disarmed exclusion filter, gc-u6an), so a fake bd standing in for
+	// --json must emit valid JSON like the real binary does. The env/arg
+	// values under test are embedded in a string field.
+	script := "#!/bin/sh\nprintf '[{\"id\":\"probe\",\"fields\":\"pwd=%s store_root=%s store_scope=%s prefix=%s rig=%s rig_root=%s args=%s\"}]' \"$PWD\" \"${GC_STORE_ROOT:-}\" \"${GC_STORE_SCOPE:-}\" \"${GC_BEADS_PREFIX:-}\" \"${GC_RIG:-}\" \"${GC_RIG_ROOT:-}\" \"$*\"\n"
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1923,7 +1927,9 @@ dir = "myrig"
 	}
 
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'beads_dir=%s\\nrig_root=%s\\nrig=%s\\n' \"$BEADS_DIR\" \"$GC_RIG_ROOT\" \"$GC_RIG\"\n"
+	// See gc-u6an: bd's JSON-only rows now flow through a jq disarm filter,
+	// so a fake bd standing in for --json must emit valid JSON.
+	script := "#!/bin/sh\nprintf '[{\"id\":\"probe\",\"fields\":\"beads_dir=%s rig_root=%s rig=%s\"}]' \"$BEADS_DIR\" \"$GC_RIG_ROOT\" \"$GC_RIG\"\n"
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -2064,7 +2070,9 @@ dir = "myrig"
 	}
 
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'beads_dir=%s\\nrig_root=%s\\nrig=%s\\n' \"$BEADS_DIR\" \"$GC_RIG_ROOT\" \"$GC_RIG\"\n"
+	// See gc-u6an: bd's JSON-only rows now flow through a jq disarm filter,
+	// so a fake bd standing in for --json must emit valid JSON.
+	script := "#!/bin/sh\nprintf '[{\"id\":\"probe\",\"fields\":\"beads_dir=%s rig_root=%s rig=%s\"}]' \"$BEADS_DIR\" \"$GC_RIG_ROOT\" \"$GC_RIG\"\n"
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -2172,7 +2180,9 @@ dir = "workdir"
 	}
 
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'beads_dir=%s\\nrig_root=%s\\n' \"$BEADS_DIR\" \"$GC_RIG_ROOT\"\n"
+	// See gc-u6an: bd's JSON-only rows now flow through a jq disarm filter,
+	// so a fake bd standing in for --json must emit valid JSON.
+	script := "#!/bin/sh\nprintf '[{\"id\":\"probe\",\"fields\":\"beads_dir=%s rig_root=%s\"}]' \"$BEADS_DIR\" \"$GC_RIG_ROOT\"\n"
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -2191,9 +2201,11 @@ dir = "workdir"
 	if !strings.Contains(out, "beads_dir="+wantBeads) {
 		t.Fatalf("stdout = %q, want BEADS_DIR=%s (city store), non-rig agent must not be pointed at <dir>/.beads", out, wantBeads)
 	}
-	// Non-rig agents must not receive GC_RIG_ROOT. doHook strips trailing
-	// whitespace, so the empty value lands at the very end of the output.
-	if !strings.HasSuffix(out, "rig_root=") {
+	// Non-rig agents must not receive GC_RIG_ROOT: the "fields" JSON string
+	// value ends in "rig_root=" immediately before its closing quote when
+	// empty. jq does not preserve object key order, so this checks the
+	// string's own terminator rather than the whole output's suffix.
+	if !strings.Contains(out, `rig_root="`) {
 		t.Fatalf("stdout = %q, want empty GC_RIG_ROOT for non-rig agent", out)
 	}
 }
@@ -2236,7 +2248,9 @@ max = 5
 	}
 
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'pwd=%s\\nargs=%s\\n' \"$PWD\" \"$*\"\n"
+	// See gc-u6an: bd's JSON-only rows now flow through a jq disarm filter,
+	// so a fake bd standing in for --json must emit valid JSON.
+	script := "#!/bin/sh\nprintf '[{\"id\":\"probe\",\"fields\":\"pwd=%s args=%s\"}]' \"$PWD\" \"$*\"\n"
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -2312,7 +2326,9 @@ name = "worker"
 	}
 
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'agent=%s\\nsession=%s\\nargs=%s\\n' \"$GC_AGENT\" \"$GC_SESSION_NAME\" \"$*\"\n"
+	// See gc-u6an: bd's JSON-only rows now flow through a jq disarm filter,
+	// so a fake bd standing in for --json must emit valid JSON.
+	script := "#!/bin/sh\nprintf '[{\"id\":\"probe\",\"fields\":\"agent=%s session=%s args=%s\"}]' \"$GC_AGENT\" \"$GC_SESSION_NAME\" \"$*\"\n"
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -2369,7 +2385,9 @@ dir = "myrig"
 	}
 
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'agent=%s\\nsession=%s\\nargs=%s\\n' \"$GC_AGENT\" \"$GC_SESSION_NAME\" \"$*\"\n"
+	// See gc-u6an: bd's JSON-only rows now flow through a jq disarm filter,
+	// so a fake bd standing in for --json must emit valid JSON.
+	script := "#!/bin/sh\nprintf '[{\"id\":\"probe\",\"fields\":\"agent=%s session=%s args=%s\"}]' \"$GC_AGENT\" \"$GC_SESSION_NAME\" \"$*\"\n"
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

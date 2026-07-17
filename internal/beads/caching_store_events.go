@@ -479,7 +479,21 @@ func mergeCacheEventPatch(base, patch Bead, fields map[string]json.RawMessage) B
 // the safe direction: a stale disarm only withholds demand until the next
 // authoritative read, whereas a dropped one hands the bead to a worker.
 //
-// An explicit key in the patch always wins, so the flag remains clearable.
+// A patch that carries the key explicitly (present, any value) always wins, so
+// overwriting gc.disarmed to a new value (including an explicit "false") stays
+// clearable.
+//
+// KNOWN GAP (gc-efqz, split out of gc-u6an cycle-2 review finding 4): an
+// operator's `bd update <id> --unset-metadata gc.disarmed` removes the key
+// rather than setting it, so its event payload is wire-identical to a patch
+// that simply never touched gc.disarmed — key-absent-from-patch is ambiguous
+// between "untouched" and "explicitly cleared," and this function cannot tell
+// them apart with the information it has. It resolves the ambiguity toward the
+// safe direction documented above (preserve), so a genuine operator clear is
+// silently defeated until the next full reconcile re-reads bd directly. See
+// TestApplyEventOperatorUnsetDisarmedIsNotReflectedUntilReconcile
+// (disarm_parity_test.go), which pins this as current, intentional behavior,
+// not a silently-shipped bug.
 func mergeCacheMetadataPreservingDisarm(current, patch StringMap) StringMap {
 	next := maps.Clone(patch)
 	_, explicit := patch[beadmeta.DisarmedMetadataKey]

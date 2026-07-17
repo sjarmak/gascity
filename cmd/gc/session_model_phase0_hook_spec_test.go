@@ -156,7 +156,12 @@ start_command = "true"
 	}
 
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'id=%s\\nname=%s\\nalias=%s\\nagent=%s\\norigin=%s\\ntemplate=%s\\nargs=%s\\n' \"$GC_SESSION_ID\" \"$GC_SESSION_NAME\" \"$GC_ALIAS\" \"$GC_AGENT\" \"$GC_SESSION_ORIGIN\" \"$GC_TEMPLATE\" \"$*\"\n"
+	// The work_query row-returning tiers pipe bd's output through jq (the
+	// gc.disarmed exclusion filter, gc-u6an), so a fake bd standing in for
+	// --json must emit valid JSON like the real binary does. The env/arg
+	// values under test are embedded in a string field instead of the
+	// previous bare key=value text dump.
+	script := "#!/bin/sh\nprintf '[{\"id\":\"probe\",\"fields\":\"id=%s name=%s alias=%s agent=%s origin=%s template=%s args=%s\"}]' \"$GC_SESSION_ID\" \"$GC_SESSION_NAME\" \"$GC_ALIAS\" \"$GC_AGENT\" \"$GC_SESSION_ORIGIN\" \"$GC_TEMPLATE\" \"$*\"\n"
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
