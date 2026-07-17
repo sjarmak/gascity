@@ -50,25 +50,22 @@ func bdReadyPoolDemandShell(limitFlag string, includeEphemeralReady bool) string
 // reconciler must not count demand the worker's claim path will refuse, or the
 // pool spawns slots forever for work nobody can take (the protocol-mismatch
 // class this file's routed-predicate note warns about).
-//   - metadata absent, or the key absent -> kept (not disarmed). Every non-bd
-//     work_query override omits the key; failing closed would strand the fleet.
+//   - metadata absent, the key absent, or the key present holding null -> kept
+//     (not disarmed). Every non-bd work_query override omits the key; failing
+//     closed would strand the fleet. null joins them because the Go string
+//     decoders collapse it to "" and cannot tell it from a cleared flag, so the
+//     raw reader matches them rather than disagree (see beadmeta/disarm.go).
 //   - bd type-infers `--set-metadata gc.disarmed=true` into a JSON boolean, so
-//     false and the "false"/"" string spellings are the only kept values.
-//   - key present with any other value (including an explicit null) -> dropped.
-//     has() is what lets jq tell "absent" from "present and null"; without it the
-//     shell would disagree with the Go readers on that shape.
+//     false and the "false"/"" string spellings are the only other kept values.
+//   - key present with any other value -> dropped (fail closed).
+//
+// The metadata type guard stays: indexing a non-object (e.g. "nope"["k"]) is a
+// jq error, and the or-chain short-circuits before that can happen.
 func notDisarmedFilterJQ() string {
 	k := beadmeta.DisarmedMetadataKey
 	v := `(.metadata["` + k + `"])`
-	return `[.[] | select((.metadata|type) != "object" or (.metadata|has("` + k + `")|not) or (` + v +
-		` as $d | $d == false or (($d|type) == "string" and (($d|ascii_downcase|gsub("^\\s+|\\s+$";"")) | . == "" or . == "false"))))]`
-}
-
-// bdReadyPoolDemandNotDisarmedShell is bdReadyPoolDemandShell with the disarm
-// filter applied.
-func bdReadyPoolDemandNotDisarmedShell(limitFlag string, includeEphemeralReady bool) string {
-	return bdReadyPoolDemandShell(limitFlag, includeEphemeralReady) +
-		` | ` + shellquote.Join([]string{"jq", notDisarmedFilterJQ()})
+	return `[.[] | select((.metadata|type) != "object" or (` + v +
+		` as $d | $d == null or $d == false or (($d|type) == "string" and (($d|ascii_downcase|gsub("^\\s+|\\s+$";"")) | . == "" or . == "false"))))]`
 }
 
 // bdReadyPoolDemandMigrationShell is a temporary raw compatibility probe for
@@ -173,13 +170,20 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
 // masquerade as "no demand", which would silently stop the pool from spawning.
 // The && chain ensures any non-zero bd exit short-circuits the whole expression
 // (TestEffectiveScaleCheckUsesReadyOnly).
+//
+// The disarm filter runs once, on the assembled union, rather than per source.
+// All three sources are unlimited (--limit 0), so filtering after the union is
+// equivalent to filtering each — and it makes "demand never counts a disarmed
+// bead" hold for every source structurally, including the two legacy probes that
+// each missed it while only the canonical tier was filtered.
 func poolDemandCountShell(target string, includeEphemeralReady bool) string {
 	script := `target="$1"; ` +
-		`ready_json=$(` + bdReadyPoolDemandNotDisarmedShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
+		`ready_json=$(` + bdReadyPoolDemandShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + `) || exit $?; ` +
 		`legacy_ephemeral_json=$(` + legacyEphemeralPoolDemandShell(0, includeEphemeralReady, false) + `); ` +
-		`printf "%s\n%s\n%s\n" "$ready_json" "$legacy_json" "$legacy_ephemeral_json" | jq -s "(add // []) | unique_by(.id) | length"`
+		`printf "%s\n%s\n%s\n" "$ready_json" "$legacy_json" "$legacy_ephemeral_json" | jq -s '(add // []) | ` +
+		notDisarmedFilterJQ() + ` | unique_by(.id) | length'`
 	return shellquote.Join([]string{"sh", "-c", script, "--", target})
 }
 

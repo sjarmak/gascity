@@ -1673,6 +1673,15 @@ func openControlDispatcherDemand(cfg *config.City, workBeads []beads.Bead) map[s
 		if wb.Status != "open" || strings.TrimSpace(wb.Assignee) != "" {
 			continue
 		}
+		// Same interlock as the Ready-backed demand path: this one reads a raw
+		// List(status=open) that never passes through Ready(), so it needs its
+		// own skip. Counting a disarmed bead here is worse than elsewhere —
+		// the caller FORCES the template's scale-check count to 1, overriding
+		// the demand path's own tally — so a single disarmed control bead
+		// respawns a session the hook then refuses to serve, forever.
+		if beadmeta.IsDisarmed(wb.Metadata) {
+			continue
+		}
 		for _, candidate := range controllerDemandRouteCandidates(wb) {
 			if canonical, ok := aliasToCanonical[candidate]; ok {
 				demand[canonical] = true

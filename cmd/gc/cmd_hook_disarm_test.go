@@ -71,6 +71,11 @@ func TestFilterUnreadyHookCandidatesKeepsNonDisarmed(t *testing.T) {
 		{name: "explicit boolean false", row: `{"id":"keep","status":"open","metadata":{"gc.disarmed":false}}`},
 		{name: "explicit string false", row: `{"id":"keep","status":"open","metadata":{"gc.disarmed":"false"}}`},
 		{name: "cleared to empty", row: `{"id":"keep","status":"open","metadata":{"gc.disarmed":""}}`},
+		// Explicit null is kept, not failed closed: the Go string decoders
+		// collapse it to "" and cannot tell it from the cleared row above, so
+		// failing closed here would be reachable only on this raw path — demand
+		// would count the bead while claim refused it, which is the spawn loop.
+		{name: "explicit null", row: `{"id":"keep","status":"open","metadata":{"gc.disarmed":null}}`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -90,7 +95,7 @@ func TestFilterUnreadyHookCandidatesDisarmFailsClosed(t *testing.T) {
 	for _, row := range []string{
 		`{"id":"x","status":"open","metadata":{"gc.disarmed":"yes"}}`,
 		`{"id":"x","status":"open","metadata":{"gc.disarmed":1}}`,
-		`{"id":"x","status":"open","metadata":{"gc.disarmed":null}}`,
+		`{"id":"x","status":"open","metadata":{"gc.disarmed":{"nested":true}}}`,
 	} {
 		out := filterUnreadyHookCandidates("["+row+"]", time.Now())
 		if ids := hookRowIDs(t, out); len(ids) != 0 {
