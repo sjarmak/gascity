@@ -518,6 +518,90 @@ esac
 	}
 }
 
+// TestEffectiveRoutedPoolQueryExcludesDisarmedRow_FallbackTiers is the
+// fallback-tier sibling of TestEffectiveRoutedPoolQueryExcludesDisarmedRow.
+// That test only exercised the canonical gc.routed_to tier; a code-reviewer
+// and security-reviewer pass on this bead's cycle-3 fix independently found
+// (with runnable repros) that the two sibling fallback probes in the same
+// probe_pool_demand function — the gc.run_target migration probe and the
+// legacy ephemeral-store probe — were left unfiltered, reproducing the exact
+// gap this bead exists to close on two call sites instead of one. Both
+// probes only fire when the canonical tier returns no rows.
+func TestEffectiveRoutedPoolQueryExcludesDisarmedRow_FallbackTiers(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+
+	t.Run("migration probe", func(t *testing.T) {
+		out := runShellWithFakeBd(t, a.EffectiveRoutedPoolQuery(), nil, `#!/bin/sh
+set -eu
+case "$*" in
+  *"--metadata-field gc.routed_to=hello-world/worker"*) printf '[]' ;;
+  *"--metadata-field gc.run_target=hello-world/worker"*)
+    printf '[{"id":"disarmed-legacy-root","metadata":{"gc.run_target":"hello-world/worker","gc.kind":"workflow","gc.disarmed":true}},{"id":"armed-legacy-root","metadata":{"gc.run_target":"hello-world/worker","gc.kind":"workflow"}}]'
+    ;;
+  *) printf '[]' ;;
+esac
+`)
+		if got := strings.TrimSpace(out); !strings.Contains(got, "armed-legacy-root") || strings.Contains(got, "disarmed-legacy-root") {
+			t.Fatalf("EffectiveRoutedPoolQuery() migration fallback = %q, want disarmed-legacy-root excluded and armed-legacy-root kept", got)
+		}
+	})
+
+	t.Run("ephemeral probe", func(t *testing.T) {
+		out := runShellWithFakeBd(t, a.EffectiveRoutedPoolQuery(), nil, `#!/bin/sh
+set -eu
+case "$*" in
+  *"--metadata-field gc.routed_to=hello-world/worker"*) printf '[]' ;;
+  *"--metadata-field gc.run_target=hello-world/worker"*) printf '[]' ;;
+  query*"ephemeral=true AND status=open"*)
+    printf '[{"id":"disarmed-ephemeral","assignee":"","status":"open","metadata":{"gc.routed_to":"hello-world/worker","gc.disarmed":true}}]'
+    ;;
+  *) printf '[]' ;;
+esac
+`)
+		if got := strings.TrimSpace(out); got != "[]" {
+			t.Fatalf("EffectiveRoutedPoolQuery() ephemeral fallback = %q, want disarmed-ephemeral excluded", got)
+		}
+	})
+}
+
+// TestEffectiveAssignedTiersExcludeDisarmedRow_EphemeralFallback is the
+// ephemeral-fallback sibling of TestEffectiveAssignedTiersExcludeDisarmedRow.
+// That test only exercised the primary bd list/ready --limit=1 row; the
+// ephemeral probe each assigned tier falls through to when that row is empty
+// (bd query ephemeral=true AND status=...) was left unfiltered — reachable
+// through the same EffectiveAssignedInProgressQuery/EffectiveAssignedReadyQuery
+// commands a prompt template can run directly.
+func TestEffectiveAssignedTiersExcludeDisarmedRow_EphemeralFallback(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	env := map[string]string{"GC_SESSION_NAME": "worker-session"}
+
+	cases := []struct {
+		name      string
+		query     func(*Agent) string
+		primaryBd string
+		ephStatus string
+	}{
+		{"AssignedInProgress", (*Agent).EffectiveAssignedInProgressQuery, "list --status in_progress --assignee=worker-session --json --limit=1", "in_progress"},
+		{"AssignedReady", (*Agent).EffectiveAssignedReadyQuery, "ready --assignee=worker-session --json --limit=1", "open"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bdScript := "#!/bin/sh\nset -eu\ncase \"$*\" in\n" +
+				"  \"" + tc.primaryBd + "\") printf '[]' ;;\n" +
+				"  query*\"ephemeral=true AND status=" + tc.ephStatus + "\"*)\n" +
+				"    printf '[{\"id\":\"disarmed-ephemeral\",\"assignee\":\"worker-session\",\"status\":\"" + tc.ephStatus + "\",\"metadata\":{\"gc.disarmed\":true}}]'\n" +
+				"    ;;\n" +
+				"  *) printf '[]' ;;\n" +
+				"esac\n"
+
+			out := runShellWithFakeBd(t, tc.query(&a), env, bdScript)
+			if got := strings.TrimSpace(out); got != "[]" {
+				t.Fatalf("%s ephemeral fallback = %q, want disarmed-ephemeral excluded", tc.name, got)
+			}
+		})
+	}
+}
+
 // TestWorkQueryGolden pins the literal generated shell per kind × flag ×
 // {normal, pool, legacy-control} so accidental script drift shows up as
 // golden churn in the diff. Run with -update to regenerate.

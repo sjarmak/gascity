@@ -62,10 +62,18 @@ func bdReadyPoolDemandShell(limitFlag string, includeEphemeralReady bool) string
 // The metadata type guard stays: indexing a non-object (e.g. "nope"["k"]) is a
 // jq error, and the or-chain short-circuits before that can happen.
 func notDisarmedFilterJQ() string {
+	return `[.[] | select(` + notDisarmedSelectPredicateJQ() + `)]`
+}
+
+// notDisarmedSelectPredicateJQ is the bare boolean expression behind
+// notDisarmedFilterJQ, for callers that need to AND it into an existing
+// select(...) predicate (e.g. a fallback probe that already filters on
+// assignee or route) rather than wrap a fresh array construction around it.
+func notDisarmedSelectPredicateJQ() string {
 	k := beadmeta.DisarmedMetadataKey
 	v := `(.metadata["` + k + `"])`
-	return `[.[] | select((.metadata|type) != "object" or (` + v +
-		` as $d | $d == null or $d == false or (($d|type) == "string" and (($d|ascii_downcase|gsub("^\\s+|\\s+$";"")) | . == "" or . == "false"))))]`
+	return `((.metadata|type) != "object" or (` + v +
+		` as $d | $d == null or $d == false or (($d|type) == "string" and (($d|ascii_downcase|gsub("^\\s+|\\s+$";"")) | . == "" or . == "false"))))`
 }
 
 // bdReadyPoolDemandMigrationShell is a temporary raw compatibility probe for
@@ -81,7 +89,12 @@ func bdReadyPoolDemandMigrationShell(limitFlag string, includeEphemeralReady boo
 }
 
 func poolDemandMigrationFilterJQ(limit int) string {
-	filter := `[.[] | select(` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == "")]`
+	// The disarm predicate is ANDed in here (not applied as a separate outer
+	// filter) so this stays correct both as a row-returning probe (gc-u6an:
+	// poolDemandFirstRowFunctionScript's Tier 2) and as a demand source
+	// poolDemandCountShell unions and filters again downstream — the same
+	// bead being checked twice is harmless.
+	filter := `[.[] | select((` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == "") and ` + notDisarmedSelectPredicateJQ() + `)]`
 	if limit > 0 {
 		filter += ` | .[:` + strconv.Itoa(limit) + `]`
 	}
@@ -97,8 +110,17 @@ func bdQueryEphemeralStatusQuietShell(status string) string {
 }
 
 func legacyEphemeralReadyFilterJQ(selector string, limit int) string {
+	// The disarm select is ANDed into the same chain as the epic/dependency
+	// checks (not applied separately) so it covers this filter's two callers
+	// uniformly: legacyEphemeralPoolDemandShell (row-returning Tier 3 of
+	// poolDemandFirstRowFunctionScript, and a poolDemandCountShell source
+	// already re-filtered downstream — harmless double-check) and
+	// ephemeralAssignedReadyProbeScript (gc-u6an: both are row-returning
+	// fallbacks that back EffectiveWorkQuery/EffectiveAssignedReadyQuery,
+	// which prompt templates can run directly).
 	filter := `[.[] | ` + selector +
 		` | select(((.issue_type // .type // "") != "epic"))` +
+		` | select(` + notDisarmedSelectPredicateJQ() + `)` +
 		` | select(([ (.dependencies // [])[]` +
 		` | select((.type // .dep_type // "") as $t | ($t == "blocks" or $t == "waits-for" or $t == "conditional-blocks"))` +
 		` | select((.status // .depends_on_status // "") != "closed") ] | length) == 0)]` +
@@ -275,8 +297,14 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
 
 func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralReady bool) string {
 	_ = includeEphemeralReady
+	// The disarm select is ANDed into the same select() as the assignee
+	// match (gc-u6an): this fallback backs EffectiveAssignedInProgressQuery/
+	// EffectiveWorkQuery, which prompt templates can run directly, and runs
+	// unconditionally (unlike the ready-tier sibling, it ignores
+	// includeEphemeralReady), so it needs the same filter as the primary row
+	// this function is a fallback for.
 	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
-		`jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)] | .[:1]' 2>/dev/null); ` +
+		`jq --arg id "$` + shellVar + `" '[.[] | select(((.assignee // "") == $id) and ` + notDisarmedSelectPredicateJQ() + `)] | .[:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }
 

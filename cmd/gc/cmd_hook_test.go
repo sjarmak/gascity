@@ -2203,8 +2203,10 @@ dir = "workdir"
 	}
 	// Non-rig agents must not receive GC_RIG_ROOT: the "fields" JSON string
 	// value ends in "rig_root=" immediately before its closing quote when
-	// empty. jq does not preserve object key order, so this checks the
-	// string's own terminator rather than the whole output's suffix.
+	// empty. cmdHook round-trips the row through filterUnreadyHookCandidates
+	// (map[string]any -> json.Marshal), which sorts object keys
+	// alphabetically, so this checks the string's own terminator rather than
+	// the whole output's suffix.
 	if !strings.Contains(out, `rig_root="`) {
 		t.Fatalf("stdout = %q, want empty GC_RIG_ROOT for non-rig agent", out)
 	}
