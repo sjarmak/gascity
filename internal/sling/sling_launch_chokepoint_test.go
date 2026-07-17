@@ -11,10 +11,155 @@ import (
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/formula"
+	"github.com/gastownhall/gascity/internal/graphv2"
 	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 )
+
+// launchForBeadTarget runs the dispatcher's bead-target launch: normalize the
+// target into an input convoy, then instantiate through the chokepoint. Every
+// existing chokepoint test hands in a convoy it made itself, which skips
+// normalization — the one step that decided the RootKey in gc-28jm.
+func launchForBeadTarget(t *testing.T, formulaDir, formulaName, targetID string, a config.Agent, deps SlingDeps) string {
+	t.Helper()
+	inv, err := graphv2.PrepareInvocation(context.Background(), deps.Store, formulaName, []string{formulaDir}, targetID, nil)
+	if err != nil {
+		t.Fatalf("PrepareInvocation(%s): %v", targetID, err)
+	}
+	res, err := InstantiateSlingFormula(context.Background(), formulaName, []string{formulaDir}, molecule.Options{Vars: inv.Vars}, "", "default", "", a, deps)
+	if err != nil {
+		t.Fatalf("InstantiateSlingFormula(%s): %v", targetID, err)
+	}
+	return res.RootID
+}
+
+// TestLaunchWorkflowBeadTargetDoubleSlingCreatesOneRoot is the gc-28jm
+// regression. Production dispatched mol-focus-review at gc-89e twice, 33s
+// apart, and got roots gc-5wse and gc-r7c6 — keys identical but for their
+// leading convoy segment, because each dispatch minted its own input convoy.
+// Both guards behaved correctly; they were handed two different keys. Sequential
+// is the real shape here: the first root had been committed for 33 seconds.
+func TestLaunchWorkflowBeadTargetDoubleSlingCreatesOneRoot(t *testing.T) {
+	formulaDir := t.TempDir()
+	writeGraphV2ConvoyFormula(t, formulaDir)
+	cfg := graphV2SlingTestConfig(t, formulaDir)
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	deps.CityPath = t.TempDir()
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+
+	target, err := deps.Store.Create(beads.Bead{Title: "work bead", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := launchForBeadTarget(t, formulaDir, "graph-work", target.ID, a, deps)
+	afterFirst := beadCount(t, deps.Store)
+	second := launchForBeadTarget(t, formulaDir, "graph-work", target.ID, a, deps)
+
+	if first != second {
+		t.Fatalf("root = %q then %q, want the second dispatch to reuse the first root (I10)", first, second)
+	}
+	if live := liveGraphV2Roots(t, deps.Store); len(live) != 1 {
+		t.Fatalf("live graph roots = %d, want exactly one for one target+formula (I1); roots=%+v", len(live), live)
+	}
+	// The loser must report the existing root and write nothing: no second root,
+	// no duplicate step beads, and no orphan input convoy.
+	if afterSecond := beadCount(t, deps.Store); afterSecond != afterFirst {
+		t.Fatalf("bead count = %d after the second dispatch, want %d unchanged; the loser materialized beads instead of reusing the root", afterSecond, afterFirst)
+	}
+}
+
+// beadCount returns every bead in store across both tiers.
+func beadCount(t *testing.T, store beads.Store) int {
+	t.Helper()
+	all, err := store.List(beads.ListQuery{
+		IncludeClosed: true,
+		AllowScan:     true,
+		TierMode:      beads.TierBoth,
+	})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	return len(all)
+}
+
+// TestLaunchWorkflowBeadTargetConcurrentSlingCreatesOneRoot covers the
+// simultaneous shape: callers that all miss the convoy lookup must still land on
+// one root, since converging on a convoy is what puts them behind one file lock.
+func TestLaunchWorkflowBeadTargetConcurrentSlingCreatesOneRoot(t *testing.T) {
+	formulaDir := t.TempDir()
+	writeGraphV2ConvoyFormula(t, formulaDir)
+	cfg := graphV2SlingTestConfig(t, formulaDir)
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	deps.CityPath = t.TempDir()
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+
+	target, err := deps.Store.Create(beads.Bead{Title: "work bead", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 6
+	var wg sync.WaitGroup
+	ids := make([]string, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ids[i] = launchForBeadTarget(t, formulaDir, "graph-work", target.ID, a, deps)
+		}(i)
+	}
+	wg.Wait()
+
+	for i := range ids {
+		if ids[i] != ids[0] {
+			t.Fatalf("launch %d root = %q, want the shared winner %q", i, ids[i], ids[0])
+		}
+	}
+	if live := liveGraphV2Roots(t, deps.Store); len(live) != 1 {
+		t.Fatalf("live graph roots = %d, want exactly one (I1); roots=%+v", len(live), live)
+	}
+}
+
+// TestLaunchWorkflowBeadTargetDistinctLaunchesStillAllowed keeps the gate from
+// over-reaching: one convoy per target must not collapse separate formulas into
+// one root, strand a different target, or block a retry once the root is closed.
+func TestLaunchWorkflowBeadTargetDistinctLaunchesStillAllowed(t *testing.T) {
+	formulaDir := t.TempDir()
+	writeGraphV2ConvoyFormula(t, formulaDir)
+	writeNamedGraphV2ConvoyFormula(t, formulaDir, "graph-other")
+	cfg := graphV2SlingTestConfig(t, formulaDir)
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	deps.CityPath = t.TempDir()
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+
+	target, err := deps.Store.Create(beads.Bead{Title: "work bead", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := deps.Store.Create(beads.Bead{Title: "other bead", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	root := launchForBeadTarget(t, formulaDir, "graph-work", target.ID, a, deps)
+
+	if got := launchForBeadTarget(t, formulaDir, "graph-other", target.ID, a, deps); got == root {
+		t.Fatalf("a second formula at the same target reused root %q; different formulas are independent (I6)", got)
+	}
+	if got := launchForBeadTarget(t, formulaDir, "graph-work", other.ID, a, deps); got == root {
+		t.Fatalf("a different target reused root %q; distinct targets are independent (I6)", got)
+	}
+
+	// A closed root is spent, not a permanent veto on the same target+formula.
+	if err := deps.Store.Close(root); err != nil {
+		t.Fatalf("Close(%s): %v", root, err)
+	}
+	if got := launchForBeadTarget(t, formulaDir, "graph-work", target.ID, a, deps); got == root || got == "" {
+		t.Fatalf("relaunch after close returned %q, want a fresh root (I7)", got)
+	}
+}
 
 // liveGraphV2Roots returns the non-closed graph.v2 workflow roots in store.
 func liveGraphV2Roots(t *testing.T, store beads.Store) []beads.Bead {

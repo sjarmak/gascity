@@ -737,7 +737,12 @@ func runGitForFormulaTest(t *testing.T, dir string, args ...string) {
 	}
 }
 
-func TestFormulaCookAttachGraphV2CreatesFreshRootForBareBeadTarget(t *testing.T) {
+// TestFormulaCookAttachGraphV2ReusesLiveRootForBareBeadTarget pins cook-attach
+// reuse for a bare bead target. Cooking the same formula at the same target
+// twice must land on one root: d2ff1d189 gave each cook its own input convoy,
+// and since the input convoy leads the RootKey, the second cook derived a key
+// the first root could not match and stood up a rival root (gc-28jm).
+func TestFormulaCookAttachGraphV2ReusesLiveRootForBareBeadTarget(t *testing.T) {
 	formulatest.EnableV2ForTest(t)
 	t.Setenv("GC_HOME", t.TempDir())
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
@@ -799,8 +804,8 @@ title = "Do work for {{convoy_id}}"
 	if err != nil {
 		t.Fatalf("list workflow roots: %v", err)
 	}
-	if len(roots) != 2 {
-		t.Fatalf("workflow roots = %+v, want two independent graph.v2 attach roots", roots)
+	if len(roots) != 1 {
+		t.Fatalf("workflow roots = %+v, want the second cook to reuse the first root", roots)
 	}
 	for _, root := range roots {
 		if root.Metadata["gc.graphv2_root_key"] == "" {
