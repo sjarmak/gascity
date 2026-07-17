@@ -1496,6 +1496,9 @@ type nativeIssueGetter interface {
 }
 
 func (s *NativeDoltStore) nativeUpdates(ctx context.Context, storage nativeIssueGetter, id string, opts UpdateOpts) (map[string]interface{}, error) {
+	// Shared by applyUpdateInTx, which backs both the standalone Update and
+	// the Store.Tx (nativeDoltTx.Update) path, so gating here covers both.
+	opts = disarmRouteOnNonRunnableTransition(opts)
 	updates := make(map[string]interface{})
 	if opts.Title != nil {
 		updates["title"] = *opts.Title

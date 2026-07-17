@@ -131,8 +131,11 @@ func (m *MemStore) indexOfLocked(id string) int {
 
 // applyUpdateLocked applies the non-nil fields of opts to the bead at index i,
 // stamps UpdatedAt, and bumps the revision. The caller must hold m.mu. It is
-// shared by Update and UpdateIfMatch so both bump identically.
+// shared by Update and UpdateIfMatch so both bump identically, and by the
+// same token both go through disarmRouteOnNonRunnableTransition's gc-nuhl
+// invariant from this single call site.
 func (m *MemStore) applyUpdateLocked(i int, opts UpdateOpts) {
+	opts = disarmRouteOnNonRunnableTransition(opts)
 	if opts.Title != nil {
 		m.beads[i].Title = *opts.Title
 	}

@@ -1133,6 +1133,11 @@ func (c *CachingStore) snapshotBeadBeforeDelete(id string) (Bead, bool) {
 }
 
 func applyUpdateOptsToBead(bead Bead, opts UpdateOpts) Bead {
+	// Backs both bdStoreTx's in-memory staging and CachingStore's
+	// Get-after-Update fallback simulation (caching_store_writes.go); gating
+	// here keeps the simulated view consistent with the real backing write's
+	// gc-nuhl disarm invariant even when that fallback path is taken.
+	opts = disarmRouteOnNonRunnableTransition(opts)
 	if opts.Title != nil {
 		bead.Title = *opts.Title
 	}

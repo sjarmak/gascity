@@ -1093,6 +1093,10 @@ func (s *BdStore) Get(id string) (Bead, error) {
 // unconditional Update and the fenced UpdateIfMatch so a new UpdateOpts field is
 // wired into both paths from one place.
 func bdUpdateArgs(id string, opts UpdateOpts) []string {
+	// Shared by the unconditional Update and the fenced UpdateIfMatch (both
+	// call this), so gating here applies gc-nuhl's disarm invariant to both
+	// write paths from one place.
+	opts = disarmRouteOnNonRunnableTransition(opts)
 	args := []string{"update", "--json", id}
 	if opts.Title != nil {
 		args = append(args, "--title", *opts.Title)
@@ -1390,6 +1394,11 @@ func (s *BdStore) UpdateAll(ids []string, opts UpdateOpts) (int, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
+	// A batch transition to blocked/deferred must disarm routing on every
+	// member exactly like the single-bead Update path (bdUpdateArgs) does —
+	// this builds its own argv rather than sharing bdUpdateArgs, so it needs
+	// its own call to the same gate.
+	opts = disarmRouteOnNonRunnableTransition(opts)
 	args := append([]string{"update", "--json"}, ids...)
 	baseLen := len(args)
 	if opts.Title != nil {
