@@ -1493,6 +1493,15 @@ func deleteWorkflowBead(store beads.Store, id string) error {
 		removedUp = append(removedUp, dep)
 	}
 	if err := store.Delete(id); err != nil {
+		// An already-absent bead is the outcome this call exists to produce, so
+		// report success and keep the edge removals above. Those edges are the
+		// orphaned rows a sweep is draining; restoring them would re-create the
+		// orphan on every pass and stall the sweep on the same id forever. This
+		// mirrors the tolerance beads.BatchDeleter documents for ids that are
+		// already gone, which this path is the fallback for.
+		if errors.Is(err, beads.ErrNotFound) {
+			return nil
+		}
 		return withWorkflowDeleteRestoreError(
 			fmt.Errorf("delete bead: %w", err),
 			restoreWorkflowDeleteDeps(store, removedDown, removedUp),

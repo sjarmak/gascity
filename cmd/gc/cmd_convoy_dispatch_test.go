@@ -6273,6 +6273,68 @@ func (s *failingDeleteStore) DepAdd(issueID, dependsOnID, depType string) error 
 	return s.MemStore.DepAdd(issueID, dependsOnID, depType)
 }
 
+func TestDeleteWorkflowBeadTreatsMissingBeadAsDeleted(t *testing.T) {
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{Title: "workflow root", Type: "task", Status: "closed"})
+	if err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+	orphan, err := store.Create(beads.Bead{Title: "orphaned tracking wisp", Type: "task", Status: "closed"})
+	if err != nil {
+		t.Fatalf("Create(orphan): %v", err)
+	}
+	if err := store.DepAdd(orphan.ID, root.ID, "blocks"); err != nil {
+		t.Fatalf("DepAdd(orphan->root): %v", err)
+	}
+	// Seed the orphan shape an interrupted sweep leaves behind: the bead row is
+	// already gone while its dependency rows survive.
+	if err := store.Delete(orphan.ID); err != nil {
+		t.Fatalf("Delete(orphan) seeding: %v", err)
+	}
+
+	if err := deleteWorkflowBead(store, orphan.ID); err != nil {
+		t.Fatalf("deleteWorkflowBead(orphan) = %v, want nil (already-absent bead is the desired end state)", err)
+	}
+	// The removed edges are the orphan rows the sweep exists to drain; restoring
+	// them would re-create the orphan on every pass.
+	if down, err := store.DepList(orphan.ID, "down"); err != nil {
+		t.Fatalf("DepList(orphan, down): %v", err)
+	} else if len(down) != 0 {
+		t.Fatalf("orphan down deps = %#v, want drained", down)
+	}
+	if up, err := store.DepList(root.ID, "up"); err != nil {
+		t.Fatalf("DepList(root, up): %v", err)
+	} else if len(up) != 0 {
+		t.Fatalf("root up deps = %#v, want drained", up)
+	}
+}
+
+func TestDeleteWorkflowBeadsBatchFallbackToleratesMissingBead(t *testing.T) {
+	// MemStore does not implement beads.BatchDeleter, so this exercises the
+	// per-bead fallback, which must match the BatchDeleter contract's documented
+	// tolerance for ids that are already gone.
+	store := beads.NewMemStore()
+	orphan, err := store.Create(beads.Bead{Title: "orphaned tracking wisp", Type: "task", Status: "closed"})
+	if err != nil {
+		t.Fatalf("Create(orphan): %v", err)
+	}
+	live, err := store.Create(beads.Bead{Title: "closed tracking wisp", Type: "task", Status: "closed"})
+	if err != nil {
+		t.Fatalf("Create(live): %v", err)
+	}
+	if err := store.Delete(orphan.ID); err != nil {
+		t.Fatalf("Delete(orphan) seeding: %v", err)
+	}
+
+	if err := deleteWorkflowBeadsBatch(store, []string{orphan.ID, live.ID}); err != nil {
+		t.Fatalf("deleteWorkflowBeadsBatch = %v, want nil", err)
+	}
+	// A leading orphan must not strand the rest of the batch.
+	if _, err := store.Get(live.ID); !errors.Is(err, beads.ErrNotFound) {
+		t.Fatalf("Get(live) after batch = %v, want ErrNotFound (bead should have been deleted)", err)
+	}
+}
+
 func TestDeleteWorkflowBeadsRestoresDepsOnDeleteFailure(t *testing.T) {
 	base := beads.NewMemStore()
 	root, err := base.Create(beads.Bead{Title: "workflow root", Type: "task", Status: "closed"})
