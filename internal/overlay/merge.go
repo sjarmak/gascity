@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 )
 
 // mergeablePaths is the set of relative paths that get JSON-level merge
@@ -21,9 +22,12 @@ var mergeablePaths = map[string]bool{
 }
 
 // wrapBareHookPaths is the set of settings files whose top-level hook entries
-// must use the wrapped {"matcher": ..., "hooks": [...]} shape. For these files
-// a bare entry such as {"type": "command", "command": "..."} is schema-invalid
-// at the top level, so it is normalized into wrapped form during merge.
+// must carry a "hooks" array. For these files a bare entry such as
+// {"type": "command", "command": "..."} is schema-invalid at the top level, so
+// it is normalized into wrapped form during merge. The "matcher" key is
+// optional — omitting it activates the group on every occurrence of the event —
+// and the normalized form deliberately leaves it out so the entry keys on its
+// command content rather than claiming the shared matcher-"" identity slot.
 //
 // Only Claude Code's .claude/settings.json is included here. Codex and Cursor
 // hooks.json legitimately use bare {"command": ...}/{"bash": ...} entries and
@@ -51,7 +55,7 @@ func IsMergeablePath(relPath string) bool {
 
 // WrapsBareHooks reports whether relPath is a settings file that requires
 // wrapped hook entries, so bare/flat entries should be normalized into
-// {"matcher": "", "hooks": [entry]} form during merge.
+// {"hooks": [entry]} form during merge.
 func WrapsBareHooks(relPath string) bool {
 	return wrapBareHookPaths[filepath.Clean(relPath)]
 }
@@ -65,7 +69,7 @@ type mergeConfig struct {
 
 // WithWrapBareHooks normalizes bare/flat hook entries (e.g.
 // {"type": "command", "command": "..."}) into the wrapped
-// {"matcher": "", "hooks": [entry]} shape that Claude settings require. Pass it
+// {"hooks": [entry]} shape that Claude settings require. Pass it
 // when merging a .claude/settings.json (see WrapsBareHooks). Without it the
 // merge preserves entry shapes verbatim, which is correct for Codex/Cursor
 // hooks.json.
@@ -90,10 +94,17 @@ func WithWrapBareHooks() MergeOption {
 //     overlay re-projecting an already-present command is a no-op instead of
 //     an unbounded append.
 //     5. else → no identity, always append
-//   - With WithWrapBareHooks, a final pass over the merged hooks normalizes any
-//     bare entry (one with neither a "matcher" nor a "hooks" key) into
-//     {"matcher": "", "hooks": [entry]}. This runs after the keyed merge so no
-//     entries are dropped or reordered; it only fixes the shape Claude requires.
+//   - With WithWrapBareHooks, bare entries (those with neither a "matcher" nor
+//     a "hooks" key) in BOTH documents are normalized into {"hooks": [entry]}
+//     BEFORE the keyed merge. Pre-merge wrapping means a bare overlay entry and
+//     its wrapped on-disk form share the same content identity (rule 4), so a
+//     re-projected pack hook replaces its prior copy instead of appending a new
+//     one on every reconcile tick (#3862). The matcherless target shape keeps
+//     bare pack hooks out of the matcher-"" identity slot, which core gc hooks
+//     use for same-matcher replacement.
+//   - Byte-identical duplicates of identity-keyed base entries collapse to one:
+//     same identity already means "one entry", so exact copies are residue from
+//     the pre-fix append loop and merging them away self-heals bloated files.
 //
 // Returns pretty-printed JSON.
 func MergeSettingsJSON(base, overlay []byte, opts ...MergeOption) ([]byte, error) {
@@ -111,6 +122,19 @@ func MergeSettingsJSON(base, overlay []byte, opts ...MergeOption) ([]byte, error
 		return nil, err
 	}
 
+	// For wrap-style providers, normalize bare hook entries in both documents
+	// before merging so a bare overlay entry keys identically to its wrapped
+	// on-disk form. Wrapping after the merge left the two shapes with distinct
+	// identities, and every re-projection appended another copy (#3862).
+	if cfg.wrapBareHooks {
+		if h, ok := baseDoc["hooks"].(map[string]any); ok {
+			baseDoc["hooks"] = wrapBareHookEntries(h)
+		}
+		if h, ok := overDoc["hooks"].(map[string]any); ok {
+			overDoc["hooks"] = wrapBareHookEntries(h)
+		}
+	}
+
 	// Start with a copy of base, then apply overlay on top.
 	result := make(map[string]any, len(baseDoc)+len(overDoc))
 	for k, v := range baseDoc {
@@ -125,15 +149,6 @@ func MergeSettingsJSON(base, overlay []byte, opts ...MergeOption) ([]byte, error
 		} else {
 			// Non-hook keys: last writer wins.
 			result[k] = v
-		}
-	}
-
-	// For wrap-style providers, normalize any bare hook entry into wrapped form.
-	// Done after the merge so identity/merge semantics, ordering, and entry
-	// count are untouched — this only fixes the shape (Claude validity).
-	if cfg.wrapBareHooks {
-		if hooks, ok := result["hooks"].(map[string]any); ok {
-			result["hooks"] = wrapBareHookEntries(hooks)
 		}
 	}
 
@@ -203,19 +218,45 @@ func mergeHooksMap(base, over map[string]any) map[string]any {
 // mergeHookArray merges two arrays of hook entries by identity key.
 // Entries with the same identity → overlay replaces base in-place.
 // New entries → appended.
+//
+// While copying base, byte-identical duplicates of identity-keyed entries
+// collapse to their first occurrence. Same identity already means "one entry",
+// so exact copies carry no information — they are the residue the pre-fix
+// append loop accumulated (#3862: thousands of identical wrapped pack hooks),
+// and collapsing them lets bloated settings files converge on the next merge.
+// Entries without an identity key keep their documented always-append
+// semantics and are never collapsed.
 func mergeHookArray(base, over []any) []any {
-	// Build ordered result starting from base entries.
-	result := make([]any, len(base))
-	copy(result, base)
-
-	// Index base entries by identity for in-place replacement.
+	// Build ordered result from base entries, indexed by identity for
+	// in-place replacement.
+	result := make([]any, 0, len(base))
 	baseIdx := make(map[string]int) // identity → index in result
-	for i, entry := range result {
-		if m, ok := entry.(map[string]any); ok {
-			if key, hasKey := hookEntryKey(m); hasKey {
-				baseIdx[key] = i
-			}
+	seen := make(map[string]bool)   // canonical JSON of identity-keyed entries
+	for _, entry := range base {
+		m, ok := entry.(map[string]any)
+		if !ok {
+			result = append(result, entry)
+			continue
 		}
+		key, hasKey := hookEntryKey(m)
+		if !hasKey {
+			result = append(result, entry)
+			continue
+		}
+		// An entry that cannot be canonicalized has no comparable form, so it
+		// cannot be proven a duplicate. Keep it: dropping an entry we failed to
+		// read would lose a hook, and collapsing is only ever an optimization
+		// over the correct always-keep behavior. Unreachable in practice —
+		// these entries were just unmarshaled from JSON.
+		if canon, err := MarshalCanonicalJSON(m); err == nil {
+			c := string(canon)
+			if seen[c] {
+				continue
+			}
+			seen[c] = true
+		}
+		result = append(result, entry)
+		baseIdx[key] = len(result) - 1
 	}
 
 	for _, entry := range over {
@@ -230,9 +271,29 @@ func mergeHookArray(base, over []any) []any {
 			result = append(result, entry)
 			continue
 		}
-		if idx, found := baseIdx[key]; found {
+		idx, found := baseIdx[key]
+		if !found && strings.HasPrefix(key, "inner:") {
+			// A content-keyed wrapper also unifies with a legacy
+			// {"matcher": "", "hooks": [...]} twin carrying the same inner
+			// hooks: matcher "" and no matcher are equivalent (both match
+			// everything), and the pre-#3862 wrap normalization stamped
+			// matcher "" onto bare pack entries. Replacing the twin migrates
+			// it to the content-keyed shape.
+			if tidx, ok := emptyMatcherTwin(result, key); ok {
+				idx, found = tidx, true
+				// The migrated entry no longer carries matcher "". Drop the
+				// matcher-"" index only when it pointed at that entry, so a
+				// core hook holding the slot elsewhere in this category still
+				// replaces in place instead of appending a stale duplicate.
+				if slot, ok := baseIdx[""]; ok && slot == tidx {
+					delete(baseIdx, "")
+				}
+			}
+		}
+		if found {
 			// Same identity → replace in-place.
 			result[idx] = entry
+			baseIdx[key] = idx
 		} else {
 			// New identity → append.
 			result = append(result, entry)
@@ -240,6 +301,31 @@ func mergeHookArray(base, over []any) []any {
 		}
 	}
 	return result
+}
+
+// emptyMatcherTwin locates an entry carrying matcher "" whose inner hooks match
+// innerKey. Such an entry is the same hook as a content-keyed wrapper — only its
+// shape differs. Entries are scanned by content rather than through the
+// matcher-"" index, which holds just one entry per category and may point at an
+// unrelated core hook.
+func emptyMatcherTwin(result []any, innerKey string) (int, bool) {
+	for i, entry := range result {
+		m, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		if matcher, ok := m["matcher"].(string); !ok || matcher != "" {
+			continue
+		}
+		inner, ok := m["hooks"]
+		if !ok {
+			continue
+		}
+		if key, ok := innerHooksKey(inner); ok && key == innerKey {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 // hookEntryKey extracts the identity key from a hook entry.
@@ -299,7 +385,7 @@ func innerHooksKey(inner any) (string, bool) {
 // wrapBareHookEntries returns a copy of a hooks map in which every bare
 // top-level entry — one with neither a "matcher" nor a "hooks" key, e.g.
 // {"type": "command", "command": "..."} — is normalized into the wrapped
-// {"matcher": "", "hooks": [entry]} shape that Claude settings require.
+// {"hooks": [entry]} shape that Claude settings require.
 // Already-wrapped entries are left unchanged. No entries are added or removed.
 func wrapBareHookEntries(hooks map[string]any) map[string]any {
 	out := make(map[string]any, len(hooks))
@@ -318,9 +404,17 @@ func wrapBareHookEntries(hooks map[string]any) map[string]any {
 	return out
 }
 
-// normalizeHookEntry wraps a bare hook entry into {"matcher": "", "hooks":
-// [entry]} form. Entries that already carry a "matcher" or "hooks" key (or are
-// not JSON objects) are returned unchanged.
+// normalizeHookEntry wraps a bare hook entry into {"hooks": [entry]} form.
+// Entries that already carry a "matcher" or "hooks" key (or are not JSON
+// objects) are returned unchanged.
+//
+// The wrapped form deliberately omits "matcher" (Claude treats an absent
+// matcher and matcher "" identically — both match everything): a matcherless
+// wrapper keys on its inner command content (see hookEntryKey), so identical
+// re-projections replace instead of append and distinct bare hooks coexist.
+// Stamping matcher "" instead would put every bare pack hook in the single
+// matcher-"" identity slot that core gc hooks use for same-matcher
+// replacement — colliding with them and with each other.
 func normalizeHookEntry(entry any) any {
 	m, ok := entry.(map[string]any)
 	if !ok {
@@ -333,8 +427,7 @@ func normalizeHookEntry(entry any) any {
 		return entry
 	}
 	return map[string]any{
-		"matcher": "",
-		"hooks":   []any{entry},
+		"hooks": []any{entry},
 	}
 }
 
