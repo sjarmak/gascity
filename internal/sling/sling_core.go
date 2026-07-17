@@ -1131,14 +1131,26 @@ func prepareGraphV2FormulaInvocation(ctx context.Context, formulaName, targetID 
 	searchPaths := SlingFormulaSearchPaths(deps, a)
 	vars := buildGraphV2SlingFormulaVars(formulaName, targetID, opts.Vars, a, deps)
 	// --force means "run a second, independent workflow in parallel" here, at
-	// the input-convoy layer: a fresh convoy gets a fresh RootKey (RootKey
-	// leads with the convoy ID), so the downstream root-conflict guards see no
-	// collision and simply create a new root alongside the live one. This is
-	// deliberately a different --force meaning than opts.Force's other use
-	// a few lines down in this same call chain (forceGraphV2Replace: close the
-	// existing root, then create a new one) — that only fires once an existing
-	// root is actually found under the SAME RootKey, which a forced fresh
-	// convoy avoids by construction.
+	// the input-convoy layer, but ONLY for a bead target: a fresh synthetic
+	// convoy gets a fresh RootKey (RootKey leads with the convoy ID), so the
+	// downstream root-conflict guards see no collision and simply create a new
+	// root alongside the live one. This is deliberately a different --force
+	// meaning than opts.Force's other use a few lines down in this same call
+	// chain (forceGraphV2Replace: close the existing root, then create a new
+	// one) — that only fires once an existing root is actually found under the
+	// SAME RootKey, which a forced fresh convoy avoids by construction for a
+	// bead target.
+	//
+	// A convoy target is a different story: NormalizeInputConvoyForced returns
+	// target.ID unchanged regardless of force — there is no separate synthetic
+	// convoy to fork, the target already IS the shared convoy identity, so
+	// forcing it can't mint an independent one. --force against a convoy
+	// target therefore keeps its pre-existing meaning further down this call
+	// chain: forceGraphV2Replace's close-and-recreate, unchanged by this
+	// function. DoSlingBatch reaches this function with a convoy bead as
+	// targetID (container/convoy expansion), so this is a live path, not a
+	// hypothetical — see TestInstantiateSlingFormulaForceReplacesGraphV2Root
+	// and TestNormalizeInputConvoyForcedIsNoOpForConvoyTarget.
 	prepare := graphv2.PrepareInvocation
 	if opts.Force {
 		prepare = graphv2.PrepareInvocationForced

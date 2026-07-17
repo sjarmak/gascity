@@ -488,6 +488,34 @@ func TestNormalizeInputConvoyPassesThroughConvoyTarget(t *testing.T) {
 	}
 }
 
+// TestNormalizeInputConvoyForcedIsNoOpForConvoyTarget pins the scope of the
+// gc-mrh0 AC5 --force parallel-run behavior: it applies only to a bead
+// target, where NormalizeInputConvoyForced controls which synthetic convoy
+// gets minted. A convoy target has no separate synthetic convoy to fork — the
+// target already IS the shared convoy identity — so force must return it
+// unchanged, exactly like the unforced path, rather than attempting (and
+// failing) to fabricate an independent one. --force against a convoy target
+// therefore keeps its pre-existing meaning further down the sling call chain
+// (forceGraphV2Replace's close-and-recreate on a RootKey collision, pinned by
+// TestInstantiateSlingFormulaForceReplacesGraphV2Root in internal/sling),
+// unaffected by this function. This is a live path, not a hypothetical:
+// DoSlingBatch's convoy/container expansion calls PrepareInvocation with a
+// convoy bead as the target.
+func TestNormalizeInputConvoyForcedIsNoOpForConvoyTarget(t *testing.T) {
+	store := beads.NewMemStore()
+	convoy, err := store.Create(beads.Bead{Title: "input", Type: "convoy"})
+	if err != nil {
+		t.Fatalf("Create convoy: %v", err)
+	}
+	got, err := NormalizeInputConvoyForced(store, convoy.ID, "work")
+	if err != nil {
+		t.Fatalf("NormalizeInputConvoyForced: %v", err)
+	}
+	if got != convoy.ID {
+		t.Fatalf("forced input convoy = %q, want the target convoy %q unchanged (force has no separate convoy to fork for a convoy target)", got, convoy.ID)
+	}
+}
+
 func TestNormalizeInputConvoyRejectsNilStore(t *testing.T) {
 	_, err := NormalizeInputConvoy(nil, "target", "work")
 	if err == nil {

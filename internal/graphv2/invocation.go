@@ -110,7 +110,10 @@ func PrepareInvocation(ctx context.Context, store beads.Store, formulaName strin
 // reuse unconditionally — see NormalizeInputConvoyForced. This is the
 // gc sling --force escape hatch for a caller that explicitly wants a second,
 // independent workflow run in parallel with an existing one at the same
-// target, rather than converging on it.
+// target, rather than converging on it. Only effective for a bead target: a
+// convoy target has no separate synthetic convoy to fork (the target already
+// IS the shared convoy identity), so this is a no-op for one — see
+// NormalizeInputConvoyForced.
 func PrepareInvocationForced(ctx context.Context, store beads.Store, formulaName string, searchPaths []string, targetID string, vars map[string]string) (Invocation, error) {
 	return prepareInvocation(ctx, store, formulaName, searchPaths, targetID, vars, true)
 }
@@ -402,6 +405,17 @@ func NormalizeInputConvoy(store beads.Store, targetID, formulaName string) (stri
 // convoy still carries the ordinary invocationKey, so a later non-forced call
 // may reuse it in turn, plus an explicit Graphv2ConvoyForcedMetadataKey marker
 // so the parallel run is auditable via bd show.
+//
+// A convoy target is passed through unchanged regardless of force (see the
+// target.Type == "convoy" branch below): there is no separate synthetic
+// convoy to fork when the target already IS the shared convoy identity, so
+// forcing it cannot mint an independent one. --force against a convoy target
+// therefore falls through to its pre-existing meaning further down the sling
+// call chain (forceGraphV2Replace's close-and-recreate on a RootKey
+// collision) rather than this function's parallel-run behavior. This is a
+// live path, not a hypothetical: gc sling's convoy/container expansion
+// (DoSlingBatch) calls PrepareInvocation/PrepareInvocationForced with a
+// convoy bead as the target.
 func NormalizeInputConvoyForced(store beads.Store, targetID, formulaName string) (string, error) {
 	return normalizeInputConvoy(store, targetID, formulaName, true)
 }
@@ -427,51 +441,11 @@ func normalizeInputConvoy(store beads.Store, targetID, formulaName string, force
 	if target.Type == "convoy" {
 		return target.ID, nil
 	}
+
 	invocationKey := InputConvoyInvocationKey(target.ID, formulaName)
-	var convoyID string
-	if !force {
-		convoyID, err = liveInputConvoyFor(store, invocationKey)
-		if err != nil {
-			return "", err
-		}
-	}
-	if convoyID == "" {
-		created, err := CreateSingleItemInputConvoy(store, target, invocationKey)
-		if err != nil {
-			return "", err
-		}
-		switch {
-		case force:
-			// Explicitly opted out of reuse: keep our own convoy outright, no
-			// re-resolve/oldest-wins convergence. Stamp it so the parallel run
-			// is auditable via bd show.
-			if err := store.SetMetadata(created.ID, beadmeta.Graphv2ConvoyForcedMetadataKey, "true"); err != nil {
-				return "", fmt.Errorf("stamping forced input convoy %s for %s: %w", created.ID, target.ID, err)
-			}
-			convoyID = created.ID
-		default:
-			// Re-resolve instead of returning the convoy just created: a caller
-			// that raced this lookup created one too, and both must settle on
-			// the same ID or the RootKeys they derive diverge exactly as before.
-			// liveInputConvoyFor picks oldest-wins, a total order both observe
-			// identically.
-			convoyID, err = liveInputConvoyFor(store, invocationKey)
-			if err != nil {
-				return "", err
-			}
-			if convoyID == "" {
-				return "", fmt.Errorf("input convoy for %s is missing immediately after creation", target.ID)
-			}
-			if convoyID != created.ID {
-				// Lost the race: every observer converges on the older convoy
-				// some concurrent caller created instead. Close ours so it
-				// doesn't linger open, still tracking target, as an orphan no
-				// invocation will ever use (gastownhall/gascity gc-mrh0 AC6).
-				if _, err := store.CloseAll([]string{created.ID}, map[string]string{"close_reason": inputConvoyOrphanedCloseReason}); err != nil {
-					return "", fmt.Errorf("closing orphaned input convoy %s for %s: %w", created.ID, target.ID, err)
-				}
-			}
-		}
+	convoyID, err := resolveInputConvoy(store, target, invocationKey, force)
+	if err != nil {
+		return "", err
 	}
 	// Creating a convoy and tracking its item are two writes, so a failure
 	// between them leaves a convoy carrying the invocation key and tracking
@@ -480,6 +454,60 @@ func normalizeInputConvoy(store beads.Store, targetID, formulaName string, force
 	// here instead.
 	if err := ensureTrack(store, convoyID, target.ID); err != nil {
 		return "", err
+	}
+	return convoyID, nil
+}
+
+// resolveInputConvoy returns the convoy ID this invocation should use: the
+// live one already carrying invocationKey when force is false and one
+// exists, or a freshly minted one otherwise.
+//
+// A forced convoy is kept outright — no re-resolve, no oldest-wins
+// convergence — and stamped for audit. An unforced convoy that loses the
+// create race to an older concurrent caller's convoy is closed so it doesn't
+// linger open as an orphan nothing will ever use (gastownhall/gascity gc-mrh0
+// AC6); see liveInputConvoyFor for the oldest-wins convergence this depends
+// on to agree with every other racing caller on the same winner.
+func resolveInputConvoy(store beads.Store, target beads.Bead, invocationKey string, force bool) (string, error) {
+	if !force {
+		convoyID, err := liveInputConvoyFor(store, invocationKey)
+		if err != nil {
+			return "", err
+		}
+		if convoyID != "" {
+			return convoyID, nil
+		}
+	}
+
+	created, err := CreateSingleItemInputConvoy(store, target, invocationKey)
+	if err != nil {
+		return "", err
+	}
+	if force {
+		if err := store.SetMetadata(created.ID, beadmeta.Graphv2ConvoyForcedMetadataKey, "true"); err != nil {
+			return "", fmt.Errorf("stamping forced input convoy %s for %s: %w", created.ID, target.ID, err)
+		}
+		return created.ID, nil
+	}
+
+	// Re-resolve instead of returning the convoy just created: a caller that
+	// raced this lookup created one too, and both must settle on the same ID
+	// or the RootKeys they derive diverge exactly as before. liveInputConvoyFor
+	// picks oldest-wins, a total order both observe identically.
+	convoyID, err := liveInputConvoyFor(store, invocationKey)
+	if err != nil {
+		return "", err
+	}
+	if convoyID == "" {
+		return "", fmt.Errorf("input convoy for %s is missing immediately after creation", target.ID)
+	}
+	if convoyID != created.ID {
+		// Lost the race: every observer converges on the older convoy some
+		// concurrent caller created instead. Close ours so it doesn't linger
+		// open, still tracking target, as an orphan no invocation will ever use.
+		if _, err := store.CloseAll([]string{created.ID}, map[string]string{"close_reason": inputConvoyOrphanedCloseReason}); err != nil {
+			return "", fmt.Errorf("closing orphaned input convoy %s for %s: %w", created.ID, target.ID, err)
+		}
 	}
 	return convoyID, nil
 }
