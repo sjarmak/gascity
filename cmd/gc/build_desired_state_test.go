@@ -6282,6 +6282,106 @@ func TestBuildDesiredState_OnDemandNamedSession_DirectAssigneeMaterializes(t *te
 	}
 }
 
+// TestBuildDesiredState_OnDemandNamedSession_DisarmedAssigneeDoesNotMaterialize
+// is the named-session sibling of TestOpenControlDispatcherDemandSkipsDisarmed
+// and TestDefaultScaleCheckCountsSkipsDisarmedRoutedWork. A gc.disarmed=true
+// bead assigned to an on_demand named session must not count as direct named
+// demand: without the skip, namedWorkReady[identity]=true spawns the session,
+// the hook then refuses to serve the disarmed bead, and the session idle-exits
+// only for the reconciler to respawn it next tick (gc-u6an).
+func TestBuildDesiredState_OnDemandNamedSession_DisarmedAssigneeDoesNotMaterialize(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:    "disarmed assigned mayor work",
+		Type:     "task",
+		Status:   "open",
+		Assignee: "mayor",
+		Metadata: map[string]string{
+			// bd type-infers --set-metadata gc.disarmed=true to a JSON boolean;
+			// StringMap coerces it to "true".
+			beadmeta.DisarmedMetadataKey: "true",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              "mayor",
+			StartCommand:      "true",
+			MaxActiveSessions: intPtr(1),
+			WorkQuery:         "printf ''",
+		}},
+		NamedSessions: []config.NamedSession{{
+			Template: "mayor",
+			Mode:     "on_demand",
+		}},
+	}
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+	for _, tp := range dsResult.State {
+		if tp.TemplateName == "mayor" {
+			t.Fatalf("disarmed assignee must not materialize on-demand named session, got state=%+v", dsResult.State)
+		}
+	}
+	if dsResult.NamedSessionDemand["mayor"] {
+		t.Fatal("NamedSessionDemand should not record a disarmed assignee as demand for mayor")
+	}
+}
+
+// TestBuildDesiredState_OnDemandNamedSession_ArmedPeerOfDisarmedAssigneeMaterializes
+// guards the other direction: the skip must drop only the disarmed bead, not
+// starve an armed bead sharing the same assignee identity.
+func TestBuildDesiredState_OnDemandNamedSession_ArmedPeerOfDisarmedAssigneeMaterializes(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:    "disarmed assigned mayor work",
+		Type:     "task",
+		Status:   "open",
+		Assignee: "mayor",
+		Metadata: map[string]string{
+			beadmeta.DisarmedMetadataKey: "true",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:    "armed assigned mayor work",
+		Type:     "task",
+		Status:   "open",
+		Assignee: "mayor",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              "mayor",
+			StartCommand:      "true",
+			MaxActiveSessions: intPtr(1),
+			WorkQuery:         "printf ''",
+		}},
+		NamedSessions: []config.NamedSession{{
+			Template: "mayor",
+			Mode:     "on_demand",
+		}},
+	}
+
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+	found := false
+	for _, tp := range dsResult.State {
+		if tp.TemplateName == "mayor" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("armed peer of a disarmed assignee should still materialize the on-demand named session")
+	}
+}
+
 // TestBuildDesiredState_NamedBackingPoolNoCap_RoutedDemandDoesNotSpawnPhantoms
 // is the ga-xq1fsv regression repro (molecule-patrol demand ratchet, healthy
 // reads). A [[named_session]] backed by a pool-capable agent template that has

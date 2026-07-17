@@ -452,6 +452,72 @@ func TestPoolDemandCountShellExcludesDisarmedFromEverySource(t *testing.T) {
 	}
 }
 
+// TestEffectiveAssignedTiersExcludeDisarmedRow is the assigned-tier sibling
+// of TestPoolDemandCountShellExcludesDisarmedFromEverySource. Unlike the pool
+// tiers, these run bd with --limit=1, so filtering the single returned row IS
+// the whole fix: a disarmed bead must not be served as this session's own
+// assigned work. There is deliberately no "armed peer falls through" case
+// here — with limit=1 there is no second row within this tier to fall
+// through to; widening past limit=1 so a disarmed head has assigned work
+// behind it to serve instead is tracked separately (gc-ewk4), not by this
+// bead.
+func TestEffectiveAssignedTiersExcludeDisarmedRow(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	const disarmedRow = `[{"id":"assigned-row","metadata":{"gc.disarmed":true}}]`
+	const armedRow = `[{"id":"assigned-row"}]`
+
+	cases := []struct {
+		name    string
+		query   func(*Agent) string
+		bdMatch string
+	}{
+		{"AssignedReady", (*Agent).EffectiveAssignedReadyQuery, `"ready --assignee=worker-session --json --limit=1"`},
+		{"AssignedInProgress", (*Agent).EffectiveAssignedInProgressQuery, `"list --status in_progress --assignee=worker-session --json --limit=1"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bdScript := func(row string) string {
+				return "#!/bin/sh\nset -eu\ncase \"$*\" in\n  " + tc.bdMatch + ") printf '" + row + "' ;;\n  *) printf '[]' ;;\nesac\n"
+			}
+			env := map[string]string{"GC_SESSION_NAME": "worker-session"}
+
+			out := runShellWithFakeBd(t, tc.query(&a), env, bdScript(disarmedRow))
+			if got := strings.TrimSpace(out); got != "[]" {
+				t.Fatalf("%s must exclude a disarmed assignee row, got %q", tc.name, got)
+			}
+
+			out = runShellWithFakeBd(t, tc.query(&a), env, bdScript(armedRow))
+			if got := strings.TrimSpace(out); got != armedRow {
+				t.Fatalf("%s must still serve an armed assignee row, got %q want %q", tc.name, got, armedRow)
+			}
+		})
+	}
+}
+
+// TestEffectiveRoutedPoolQueryExcludesDisarmedRow is the row-returning
+// sibling of TestPoolDemandCountShellExcludesDisarmedFromEverySource: it pins
+// where notDisarmedFilterJQ runs for the tier that backs
+// EffectiveWorkQuery/EffectiveRoutedPoolQuery — the query a prompt template
+// can run directly, bypassing gc hook's own Go-side
+// filterUnreadyHookCandidates (gc-u6an finding 3).
+func TestEffectiveRoutedPoolQueryExcludesDisarmedRow(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	got := a.EffectiveRoutedPoolQuery()
+
+	out := runShellWithFakeBd(t, got, nil, `#!/bin/sh
+set -eu
+case "$*" in
+  ready*"--metadata-field gc.routed_to=hello-world/worker"*)
+    printf '[{"id":"disarmed","metadata":{"gc.disarmed":true}},{"id":"armed"}]'
+    ;;
+  *) printf '[]' ;;
+esac
+`)
+	if got := strings.TrimSpace(out); got != `[{"id":"armed"}]` {
+		t.Fatalf("EffectiveRoutedPoolQuery() = %q, want only the armed peer of a disarmed row", got)
+	}
+}
+
 // TestWorkQueryGolden pins the literal generated shell per kind × flag ×
 // {normal, pool, legacy-control} so accidental script drift shows up as
 // golden churn in the diff. Run with -update to regenerate.

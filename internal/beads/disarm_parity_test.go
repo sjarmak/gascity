@@ -1,6 +1,7 @@
 package beads
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
@@ -87,5 +88,163 @@ func TestDisarmDecoderParityThroughRealDecoders(t *testing.T) {
 					tc.val, demand, claim)
 			}
 		})
+	}
+}
+
+// TestMergeCacheMetadataPreservingDisarm is the direct unit test for the
+// cache-merge function underlying AC3 (gc-u6an): "reconciliation cannot erase
+// a durable disarm." It covers the normal-preserve path (a metadata patch
+// that never mentions gc.disarmed must not drop a cached disarm) and the
+// explicit-overwrite path (a patch that carries the key, any value, always
+// wins) side by side, since a fix to one that breaks the other reproduces
+// exactly the class of gap the gc-u6an review cycles kept finding.
+func TestMergeCacheMetadataPreservingDisarm(t *testing.T) {
+	tests := []struct {
+		name    string
+		current StringMap
+		patch   StringMap
+		want    StringMap
+	}{
+		{
+			name:    "unrelated key patch preserves cached disarm",
+			current: StringMap{beadmeta.DisarmedMetadataKey: "true"},
+			patch:   StringMap{"gc.other": "x"},
+			want:    StringMap{"gc.other": "x", beadmeta.DisarmedMetadataKey: "true"},
+		},
+		{
+			name:    "nil patch preserves cached disarm",
+			current: StringMap{beadmeta.DisarmedMetadataKey: "true"},
+			patch:   nil,
+			want:    StringMap{beadmeta.DisarmedMetadataKey: "true"},
+		},
+		{
+			name:    "explicit overwrite to empty clears",
+			current: StringMap{beadmeta.DisarmedMetadataKey: "true"},
+			patch:   StringMap{beadmeta.DisarmedMetadataKey: ""},
+			want:    StringMap{beadmeta.DisarmedMetadataKey: ""},
+		},
+		{
+			name:    "explicit overwrite to false clears",
+			current: StringMap{beadmeta.DisarmedMetadataKey: "true"},
+			patch:   StringMap{beadmeta.DisarmedMetadataKey: "false"},
+			want:    StringMap{beadmeta.DisarmedMetadataKey: "false"},
+		},
+		{
+			name:    "not currently disarmed, unrelated patch stays untouched",
+			current: StringMap{"gc.other": "old"},
+			patch:   StringMap{"gc.other": "new"},
+			want:    StringMap{"gc.other": "new"},
+		},
+		{
+			// This is the wire shape of `bd update <id> --unset-metadata
+			// gc.disarmed`: the key is removed, so the patch omits it — the
+			// exact same shape as the first case above. mergeCacheMetadataPreservingDisarm
+			// cannot distinguish the two, and resolves toward the documented
+			// safe direction (preserve). See
+			// TestApplyEventOperatorUnsetDisarmedIsNotReflectedUntilReconcile
+			// for the end-to-end version and gc-efqz for the tracked gap.
+			name:    "unset-shaped patch cannot be told apart from untouched (gc-efqz)",
+			current: StringMap{beadmeta.DisarmedMetadataKey: "true"},
+			patch:   StringMap{"gc.other": "x"},
+			want:    StringMap{"gc.other": "x", beadmeta.DisarmedMetadataKey: "true"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mergeCacheMetadataPreservingDisarm(tc.current, tc.patch)
+			if len(got) != len(tc.want) {
+				t.Fatalf("mergeCacheMetadataPreservingDisarm() = %v, want %v", got, tc.want)
+			}
+			for k, v := range tc.want {
+				if got[k] != v {
+					t.Errorf("mergeCacheMetadataPreservingDisarm()[%q] = %q, want %q (full got=%v)", k, got[k], v, got)
+				}
+			}
+		})
+	}
+}
+
+// TestApplyEventPreservesDisarmedAcrossUnrelatedMetadataPatch is the
+// end-to-end (ApplyEvent) version of AC3: a metadata-touching cache event for
+// an unrelated key must not silently drop a cached gc.disarmed=true, since
+// that cache feeds the controller's demand snapshot and a dropped flag hands
+// the bead to a worker (gc-u6an).
+func TestApplyEventPreservesDisarmedAcrossUnrelatedMetadataPatch(t *testing.T) {
+	backing := NewMemStore()
+	created, err := backing.Create(Bead{
+		Title:  "disarmed work",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.DisarmedMetadataKey: "true",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	cs := NewCachingStoreForTest(backing, nil)
+	if err := cs.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	cs.ApplyEvent("bead.updated", json.RawMessage(`{"id":"`+created.ID+`","status":"open","metadata":{"gc.other":"x"}}`))
+
+	got, err := cs.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !beadmeta.IsDisarmed(got.Metadata) {
+		t.Fatalf("gc.disarmed dropped by an unrelated metadata patch: metadata=%v", got.Metadata)
+	}
+}
+
+// TestApplyEventOperatorUnsetDisarmedIsNotReflectedUntilReconcile pins the
+// gc-efqz gap (split out of gc-u6an cycle-2 review finding 4): a metadata
+// event whose payload is wire-identical to an operator's genuine
+// `bd update <id> --unset-metadata gc.disarmed` (key absent from the patch)
+// is indistinguishable, at this cache layer, from a patch that simply never
+// touched gc.disarmed. mergeCacheMetadataPreservingDisarm resolves that
+// ambiguity toward the safe direction (preserve), so the cache keeps serving
+// disarmed=true here — the clear only takes effect once a full reconcile
+// re-reads bd directly (or once ApplyEvent sees the key with an explicit
+// overwrite value, e.g. an operator using `--set-metadata gc.disarmed=false`
+// instead of `--unset-metadata`).
+//
+// This test intentionally pins the CURRENT behavior, not the desired end
+// state — see gc-efqz for the design work needed (an UpdatedAt-based
+// staleness comparison or an explicit-deletion wire signal from bd) before
+// this can safely flip to "trust the absence."
+func TestApplyEventOperatorUnsetDisarmedIsNotReflectedUntilReconcile(t *testing.T) {
+	backing := NewMemStore()
+	created, err := backing.Create(Bead{
+		Title:  "disarmed work",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.DisarmedMetadataKey: "true",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	cs := NewCachingStoreForTest(backing, nil)
+	if err := cs.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	// Simulate bd's hook payload for `bd update <id> --unset-metadata
+	// gc.disarmed`: the key is removed rather than set, so the event's
+	// metadata object is present but does not carry gc.disarmed at all —
+	// wire-identical to a patch that simply never touched the flag.
+	cs.ApplyEvent("bead.updated", json.RawMessage(`{"id":"`+created.ID+`","status":"open","metadata":{}}`))
+
+	got, err := cs.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !beadmeta.IsDisarmed(got.Metadata) {
+		t.Fatalf("expected the known gc-efqz gap (cache still reports disarmed after an unset-shaped event); "+
+			"metadata=%v — if this now fails, the gap may be fixed: update this test and close gc-efqz instead of loosening it", got.Metadata)
 	}
 }
