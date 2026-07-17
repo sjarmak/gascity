@@ -4028,7 +4028,7 @@ func TestSweepClosedOrderTrackingRetentionKeepsLatestTenPerOrderAcrossTiers(t *t
 	)
 	store := beads.NewMemStoreFrom(100, seed, nil)
 
-	deleted, err := sweepClosedOrderTrackingRetention(store, now, orderTrackingRetentionPolicy{
+	deleted, _, err := sweepClosedOrderTrackingRetention(store, now, orderTrackingRetentionPolicy{
 		deleteAfterClose: 24 * time.Hour,
 		retainLast:       minClosedOrderTrackingRetained,
 	}, nil)
@@ -4084,7 +4084,7 @@ func TestSweepClosedOrderTrackingRetentionPrunesLegacyUnscopedTracking(t *testin
 	}
 	store := beads.NewMemStoreFrom(100, seed, nil)
 
-	deleted, err := sweepClosedOrderTrackingRetention(store, now, orderTrackingRetentionPolicy{
+	deleted, _, err := sweepClosedOrderTrackingRetention(store, now, orderTrackingRetentionPolicy{
 		deleteAfterClose: 24 * time.Hour,
 		retainLast:       minClosedOrderTrackingRetained,
 	}, nil)
@@ -4125,7 +4125,7 @@ func TestSweepClosedOrderTrackingRetentionRanksLatestByClosedReferenceTime(t *te
 	seed[0].UpdatedAt = now.Add(-25 * time.Hour)
 	store := beads.NewMemStoreFrom(100, seed, nil)
 
-	deleted, err := sweepClosedOrderTrackingRetention(store, now, orderTrackingRetentionPolicy{
+	deleted, _, err := sweepClosedOrderTrackingRetention(store, now, orderTrackingRetentionPolicy{
 		deleteAfterClose: 24 * time.Hour,
 		retainLast:       minClosedOrderTrackingRetained,
 	}, nil)
@@ -4179,6 +4179,160 @@ func TestSweepClosedOrderTrackingRetentionAcrossStoresTracksSuccessfulStores(t *
 	}
 }
 
+// orphanedDeleteStore models the orphaned rows behind gastownhall/gascity#3926:
+// the closed-tracking list is label-driven, so it keeps naming an id whose bead
+// row is already gone, and Delete reports ErrNotFound for it. The bead stays in
+// the underlying MemStore listing exactly as the real residual does, so a sweep
+// that mistakes the orphan for a deletion would keep reporting it forever.
+type orphanedDeleteStore struct {
+	*beads.MemStore
+	orphanIDs map[string]error
+}
+
+func (s *orphanedDeleteStore) Delete(id string) error {
+	if err, ok := s.orphanIDs[id]; ok {
+		return fmt.Errorf("delete bead %q: %w", id, err)
+	}
+	return s.MemStore.Delete(id)
+}
+
+// closedOrderTrackingSeed builds two more closed tracking beads for order than
+// the retain floor keeps, oldest at index 0, all closed long enough ago to be
+// past a 24h retention TTL — so exactly order-01 and order-00 are prunable.
+func closedOrderTrackingSeed(order string, now time.Time) []beads.Bead {
+	n := minClosedOrderTrackingRetained + 2
+	seed := make([]beads.Bead, 0, n)
+	for i := range n {
+		seed = append(seed, beads.Bead{
+			ID:        fmt.Sprintf("%s-%02d", order, i),
+			Title:     "order:" + order,
+			Status:    "closed",
+			Type:      "task",
+			CreatedAt: now.Add(-48*time.Hour + time.Duration(i)*time.Minute),
+			UpdatedAt: now.Add(-48*time.Hour + time.Duration(i)*time.Minute),
+			Labels:    []string{"order-run:" + order, labelOrderTracking},
+			Ephemeral: true,
+		})
+	}
+	return seed
+}
+
+func TestSweepClosedOrderTrackingRetentionSkipsOrphanedRuns(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	// 12 closed runs, retain floor 10 => orphan-01 then orphan-00 are prunable.
+	// The orphan sorts first, so a sweep that gives up on it never reaches the
+	// healthy run behind it.
+	store := &orphanedDeleteStore{
+		MemStore:  beads.NewMemStoreFrom(100, closedOrderTrackingSeed("orphan", now), nil),
+		orphanIDs: map[string]error{"orphan-01": beads.ErrNotFound},
+	}
+	policy := orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}
+
+	deleted, orphaned, err := sweepClosedOrderTrackingRetention(store, now, policy, nil)
+	if err != nil {
+		t.Fatalf("sweepClosedOrderTrackingRetention: %v, want nil (orphan must not fail the sweep)", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1 (the healthy run behind the orphan)", deleted)
+	}
+	if orphaned != 1 {
+		t.Fatalf("orphaned = %d, want 1", orphaned)
+	}
+	if _, err := store.Get("orphan-00"); !errors.Is(err, beads.ErrNotFound) {
+		t.Fatalf("Get(orphan-00) err = %v, want ErrNotFound; the sweep must continue past the orphan", err)
+	}
+
+	// The orphan's residual still lists, so a second sweep must report it as an
+	// orphan again rather than counting a deletion that never happened.
+	deleted, orphaned, err = sweepClosedOrderTrackingRetention(store, now, policy, nil)
+	if err != nil {
+		t.Fatalf("second sweep: %v, want nil", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("second sweep deleted = %d, want 0; an orphan must never be counted as a deletion", deleted)
+	}
+	if orphaned != 1 {
+		t.Fatalf("second sweep orphaned = %d, want 1", orphaned)
+	}
+}
+
+func TestSweepClosedOrderTrackingRetentionTreatsIDCollisionAsFailure(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	// ErrIDCollision wraps ErrNotFound, but it means bd resolved a *different*
+	// bead — never a row that is already gone. It stays a hard failure.
+	store := &orphanedDeleteStore{
+		MemStore:  beads.NewMemStoreFrom(100, closedOrderTrackingSeed("collide", now), nil),
+		orphanIDs: map[string]error{"collide-01": beads.ErrIDCollision},
+	}
+
+	deleted, orphaned, err := sweepClosedOrderTrackingRetention(store, now, orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}, nil)
+	if !errors.Is(err, beads.ErrIDCollision) {
+		t.Fatalf("err = %v, want ErrIDCollision to stay a real failure", err)
+	}
+	if orphaned != 0 {
+		t.Fatalf("orphaned = %d, want 0; a collision is not an orphan", orphaned)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1 (the healthy run is still pruned)", deleted)
+	}
+}
+
+func TestSweepClosedOrderTrackingRetentionAcrossStoresSweepsOrphanTolerantStore(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	store := &orphanedDeleteStore{
+		MemStore:  beads.NewMemStoreFrom(100, closedOrderTrackingSeed("orphan", now), nil),
+		orphanIDs: map[string]error{"orphan-01": beads.ErrNotFound},
+	}
+
+	result, err := sweepClosedOrderTrackingRetentionAcrossStores([]beads.Store{store}, now, orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}, nil)
+	if err != nil {
+		t.Fatalf("sweepClosedOrderTrackingRetentionAcrossStores: %v, want nil", err)
+	}
+	// storesSwept drives orderTrackingSweepErrorIsFatal: an orphan-only store
+	// that reports 0 swept stores is what makes `gc order sweep-tracking` exit 1.
+	if result.storesSwept != 1 {
+		t.Fatalf("storesSwept = %d, want 1; an orphan must not mark the store unswept", result.storesSwept)
+	}
+	if result.deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", result.deleted)
+	}
+	if result.orphaned != 1 {
+		t.Fatalf("orphaned = %d, want 1", result.orphaned)
+	}
+}
+
+func TestSweepClosedOrderTrackingRetentionBoundedSkipsOrphanedRuns(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	store := &orphanedDeleteStore{
+		MemStore:  beads.NewMemStoreFrom(100, closedOrderTrackingSeed("orphan", now), nil),
+		orphanIDs: map[string]error{"orphan-01": beads.ErrNotFound},
+	}
+
+	// Budget of 1: the orphan must not spend it, so the healthy run still drains.
+	deleted, orphaned, err := sweepClosedOrderTrackingRetentionBounded(store, now, orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}, nil, 1)
+	if err != nil {
+		t.Fatalf("sweepClosedOrderTrackingRetentionBounded: %v, want nil", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1; the orphan must not consume the delete budget", deleted)
+	}
+	if orphaned != 1 {
+		t.Fatalf("orphaned = %d, want 1", orphaned)
+	}
+}
+
 func TestSweepClosedOrderTrackingRetentionDeletesForAnyConfiguredStorageTarget(t *testing.T) {
 	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
 	storages := []string{
@@ -4214,7 +4368,7 @@ func TestSweepClosedOrderTrackingRetentionDeletesForAnyConfiguredStorageTarget(t
 			}
 			store := beads.NewMemStoreFrom(100, seed, nil)
 
-			deleted, err := sweepClosedOrderTrackingRetention(store, now, policy, nil)
+			deleted, _, err := sweepClosedOrderTrackingRetention(store, now, policy, nil)
 			if err != nil {
 				t.Fatalf("sweepClosedOrderTrackingRetention: %v", err)
 			}

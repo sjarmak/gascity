@@ -1643,6 +1643,12 @@ func cmdOrderSweepTrackingWithOptions(staleAfter time.Duration, includeWisps, dr
 	if !quiet {
 		verb := "closed"
 		deletedClause := fmt.Sprintf(", deleted %d closed order-tracking bead(s)", result.trackingDeleted)
+		if retentionResult.orphaned > 0 {
+			// Orphans are skipped, not deleted, and their residual re-lists on
+			// every sweep — report them so a store that needs repair is visible
+			// rather than looking like a clean drain.
+			deletedClause += fmt.Sprintf(", skipped %d orphaned", retentionResult.orphaned)
+		}
 		if dryRun {
 			verb = "would close"
 			deletedClause = ""
