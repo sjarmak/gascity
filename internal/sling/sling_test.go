@@ -2714,7 +2714,17 @@ func TestInstantiateGraphFormulaPreservesMaterializationWhenProjectionFails(t *t
 	}
 }
 
-func TestSlingAttachGraphFormulaCreatesFreshRootForBareBeadTarget(t *testing.T) {
+// TestSlingAttachGraphFormulaReusesLiveRootForBareBeadTarget pins reuse for a
+// bare bead target: re-attaching the same formula returns the live root instead
+// of standing up a second one.
+//
+// This assertion is inverted from the one d2ff1d189 ("Simplify graph v2 input
+// convoy normalization") left behind. That commit dropped EnsureSingletonConvoy,
+// whose contract was "creates or reuses", and the test moved with it from
+// "singleton not reused" to requiring a fresh root — turning an invariant into
+// its opposite. A fresh convoy per attach means a fresh RootKey, which is how
+// gc-89e ended up under two live roots (gc-28jm).
+func TestSlingAttachGraphFormulaReusesLiveRootForBareBeadTarget(t *testing.T) {
 	formulaDir := t.TempDir()
 	writeGraphV2ConvoyFormula(t, formulaDir)
 	cfg := graphV2SlingTestConfig(t, formulaDir)
@@ -2736,8 +2746,8 @@ func TestSlingAttachGraphFormulaCreatesFreshRootForBareBeadTarget(t *testing.T) 
 	if err != nil {
 		t.Fatalf("second AttachFormula: %v", err)
 	}
-	if second.WorkflowID == first.WorkflowID {
-		t.Fatalf("WorkflowID = %q, want fresh root for fresh input convoy", second.WorkflowID)
+	if second.WorkflowID != first.WorkflowID {
+		t.Fatalf("WorkflowID = %q, want the live root %q already attached to %s", second.WorkflowID, first.WorkflowID, source.ID)
 	}
 }
 
