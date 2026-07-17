@@ -677,6 +677,224 @@ func TestCmdMailSendFromControllerCreatesMessage(t *testing.T) {
 	}
 }
 
+// TestCmdMailSendFromRejectsImpersonationOfLiveSession pins the fix for
+// gh-4070: a session with its own live identity must not be able to send
+// mail with --from set to a *different* live session's identity. Before the
+// fix, resolveMailIdentityWithConfigCached only translated the --from string
+// to a mailbox address; it never compared that address against the caller's
+// own resolved identity.
+func TestCmdMailSendFromRejectsImpersonationOfLiveSession(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "attacker",
+			"session_name": "attacker-gc-1",
+		},
+	}); err != nil {
+		t.Fatalf("Create attacker: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "mayor",
+			"session_name": "mayor-gc-1",
+		},
+	}); err != nil {
+		t.Fatalf("Create mayor: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "recipient",
+			"session_name": "recipient-gc-1",
+		},
+	}); err != nil {
+		t.Fatalf("Create recipient: %v", err)
+	}
+
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_ALIAS", "attacker")
+	_ = os.Unsetenv("GC_AGENT")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"recipient", "forged approval"}, false, false, "mayor", "", "", "", &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("cmdMailSend() = 0, want failure (attacker must not send as mayor); stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+
+	storeAfter, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt after send: %v", err)
+	}
+	all, err := storeAfter.List(beads.ListQuery{
+		Type:     "message",
+		Status:   "open",
+		TierMode: beads.TierBoth,
+	})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	for _, b := range all {
+		if b.Type == "message" && b.From == "mayor" {
+			t.Fatalf("message forged as mayor should not have been created: %#v", b)
+		}
+	}
+}
+
+// TestCmdMailSendFromRejectsWhenCallerIdentityUnresolvable covers the fail-closed
+// branch: if the caller's own identity can't be resolved at all (every
+// candidate env var is stale/unknown), a non-reserved --from must still be
+// refused rather than let through by default.
+func TestCmdMailSendFromRejectsWhenCallerIdentityUnresolvable(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "victim",
+			"session_name": "victim-gc-1",
+		},
+	}); err != nil {
+		t.Fatalf("Create victim: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "recipient",
+			"session_name": "recipient-gc-1",
+		},
+	}); err != nil {
+		t.Fatalf("Create recipient: %v", err)
+	}
+
+	t.Setenv("GC_SESSION_ID", "gc-does-not-exist")
+	_ = os.Unsetenv("GC_ALIAS")
+	_ = os.Unsetenv("GC_AGENT")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"recipient", "forged approval"}, false, false, "victim", "", "", "", &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("cmdMailSend() = 0, want failure (caller identity unresolvable); stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+
+	storeAfter, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt after send: %v", err)
+	}
+	all, err := storeAfter.List(beads.ListQuery{
+		Type:     "message",
+		Status:   "open",
+		TierMode: beads.TierBoth,
+	})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	for _, b := range all {
+		if b.Type == "message" && b.From == "victim" {
+			t.Fatalf("message forged as victim should not have been created: %#v", b)
+		}
+	}
+}
+
+// TestCmdMailSendFromAllowsSelfSend pins that a session may still explicitly
+// pass --from naming its own live identity (not just the implicit default).
+func TestCmdMailSendFromAllowsSelfSend(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "sender",
+			"session_name": "sender-gc-1",
+		},
+	}); err != nil {
+		t.Fatalf("Create sender: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "recipient",
+			"session_name": "recipient-gc-1",
+		},
+	}); err != nil {
+		t.Fatalf("Create recipient: %v", err)
+	}
+
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_ALIAS", "sender")
+	_ = os.Unsetenv("GC_AGENT")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"recipient", "hello"}, false, false, "sender", "", "", "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend() = %d, want 0 for self --from; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	storeAfter, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt after send: %v", err)
+	}
+	all, err := storeAfter.List(beads.ListQuery{
+		Type:     "message",
+		Status:   "open",
+		TierMode: beads.TierBoth,
+	})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	found := false
+	for _, b := range all {
+		if b.Type == "message" && b.From == "sender" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected message From=sender to be created; beads=%#v", all)
+	}
+}
+
 func TestCmdMailSendToControllerRecipientIsRejected(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_MAIL", "")

@@ -1434,7 +1434,7 @@ Use --all to broadcast to all live sessions (excluding sender and "human").`,
 	cmd.Flags().BoolVar(&notify, "nudge", false, "alias for --notify")
 	_ = cmd.Flags().MarkHidden("nudge")
 	cmd.Flags().BoolVar(&all, "all", false, "broadcast to all live sessions (excludes sender and human)")
-	cmd.Flags().StringVar(&from, "from", "", "sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or \"human\")")
+	cmd.Flags().StringVar(&from, "from", "", "sender identity; must match your own resolved identity unless \"human\" or \"controller\" (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or \"human\")")
 	cmd.Flags().StringVar(&to, "to", "", "recipient address (alternative to positional argument)")
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "message subject line")
 	cmd.Flags().StringVarP(&message, "message", "m", "", "message body text")
@@ -1707,11 +1707,24 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 			sender = defaultMailIdentity()
 		}
 	} else if sender != "human" && store != nil {
-		sender, err = resolveMailIdentityWithConfigCached(cityPath, cfg, store, sender, idCache)
-		if err != nil {
-			fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", sender, err) //nolint:errcheck // best-effort stderr
+		resolved, resolveErr := resolveMailIdentityWithConfigCached(cityPath, cfg, store, sender, idCache)
+		if resolveErr != nil {
+			fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", sender, resolveErr) //nolint:errcheck // best-effort stderr
 			return 1
 		}
+		// A non-reserved --from must match the calling session's own resolved
+		// identity — otherwise any session could forge mail as any other live
+		// identity, including a privileged coordinator role (gh-4070). Reserved
+		// identities ("human", "controller") have no backing live session to
+		// impersonate and stay unrestricted.
+		if _, reserved := reservedMailSenderIdentity(sender); !reserved {
+			callerIdentity, ok := resolveDefaultMailSenderForCommandCached(cityPath, cfg, store, io.Discard, "gc mail send", idCache)
+			if !ok || callerIdentity != resolved {
+				fmt.Fprintf(stderr, "gc mail send: refusing --from %q: does not match the calling session's own mail identity\n", from) //nolint:errcheck // best-effort stderr
+				return 1
+			}
+		}
+		sender = resolved
 	}
 
 	var nf nudgeFunc
