@@ -972,6 +972,50 @@ func resolveMailIdentityWithConfigCached(cityPath string, cfg *config.City, stor
 	return resolveMailIdentityCached(store, identifier, cache)
 }
 
+// errMailSenderNotAuthorized reports a --from override that names an identity
+// the calling session does not own.
+var errMailSenderNotAuthorized = errors.New("sender identity is not this session's own")
+
+// authorizeMailSenderOverride resolves an explicit --from identity and confirms
+// that the calling session owns it, returning the resolved mailbox address.
+//
+// Sender resolution alone answers "does this name an identity?", never "may the
+// caller claim it?" (gastownhall/gascity#4070). The comparison is between
+// resolved mailbox addresses rather than raw flag strings, so a caller naming
+// itself by session ID, alias, or agent name stays authorized. It fails closed:
+// a caller whose own identity resolves to nothing may not claim a live session.
+//
+// The reserved identities are deliberately exempt. Pack scripts run inside an
+// ordinary session and attribute city-level alerts to the controller — see
+// examples/bd/dolt/commands/compact/run.sh, pinned by dog_exec_scripts_test.go.
+// Nothing at this boundary distinguishes such a script from a forgery, so
+// closing that arm needs an authenticated controller channel rather than a
+// caller-supplied flag. This function therefore closes only the live-session
+// impersonation arm of #4070; the reserved arm remains open by design.
+func authorizeMailSenderOverride(cityPath string, cfg *config.City, store beads.Store, requested string, cache *mailIdentitySessionCache) (string, error) {
+	if sender, ok := reservedMailSenderIdentity(requested); ok {
+		return sender, nil
+	}
+	resolved, err := resolveMailIdentityWithConfigCached(cityPath, cfg, store, requested, cache)
+	if err != nil {
+		return "", err
+	}
+	candidates := defaultMailIdentityCandidates()
+	for _, candidate := range candidates {
+		own, err := resolveMailIdentityWithConfigCached(cityPath, cfg, store, candidate, cache)
+		if err != nil {
+			if errors.Is(err, session.ErrSessionNotFound) {
+				continue
+			}
+			return "", err
+		}
+		if own == resolved {
+			return resolved, nil
+		}
+	}
+	return "", fmt.Errorf("%w: %q resolves to %q, but this session is %s", errMailSenderNotAuthorized, requested, resolved, strings.Join(candidates, "/"))
+}
+
 func resolveMailRecipientIdentity(cityPath string, cfg *config.City, store beads.Store, identifier string) (string, error) {
 	return resolveMailRecipientIdentityCached(cityPath, cfg, store, identifier, nil)
 }
@@ -1405,7 +1449,8 @@ func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
 
 Creates a message bead addressed to the recipient. The sender defaults
 to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --notify to nudge
-the recipient after sending. Use --from to override the sender identity.
+the recipient after sending. Use --from to name the sender identity; it may only
+name your own session (by id, alias, or agent name) or a reserved identity.
 Use --to as an alternative to the positional <to> argument.
 Use -s/--subject for the summary line and -m/--message for the body text.
 Use --all to broadcast to all live sessions (excluding sender and "human").`,
@@ -1706,10 +1751,10 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 		} else {
 			sender = defaultMailIdentity()
 		}
-	} else if sender != "human" && store != nil {
-		sender, err = resolveMailIdentityWithConfigCached(cityPath, cfg, store, sender, idCache)
+	} else if store != nil {
+		sender, err = authorizeMailSenderOverride(cityPath, cfg, store, from, idCache)
 		if err != nil {
-			fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", sender, err) //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", from, err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
 	}

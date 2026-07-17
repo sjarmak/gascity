@@ -4623,3 +4623,137 @@ func TestCmdMailSendAllFlagBodyWinsOverPositional(t *testing.T) {
 		t.Errorf("Description = %q, want %q (--all -m flag body should win over positional)", msg.Description, "flag body")
 	}
 }
+
+// mailSenderAuthzTestCity stands up a city store holding two live named
+// sessions and points the ambient session env at the caller. It returns the
+// city path, config, store and the caller session's bead ID.
+func mailSenderAuthzTestCity(t *testing.T) (string, *config.City, beads.Store, string) {
+	t.Helper()
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	caller, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "gascity/worker-1",
+			"session_name": "workers__worker-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create caller session: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "gascity/overseer",
+			"session_name": "workers__overseer",
+		},
+	}); err != nil {
+		t.Fatalf("Create overseer session: %v", err)
+	}
+	cfg, _ := loadCityConfig(cityPath)
+	return cityPath, cfg, store, caller.ID
+}
+
+// TestAuthorizeMailSenderOverrideRejectsForeignIdentity is the regression test
+// for gastownhall/gascity#4070: `gc mail send --from <identity>` resolved any
+// live identity to its mailbox without ever comparing it against the calling
+// session, so any session could forge mail from any other live identity.
+func TestAuthorizeMailSenderOverrideRejectsForeignIdentity(t *testing.T) {
+	cityPath, cfg, store, callerID := mailSenderAuthzTestCity(t)
+	t.Setenv("GC_SESSION_ID", callerID)
+	t.Setenv("GC_ALIAS", "gascity/worker-1")
+	t.Setenv("GC_AGENT", "gascity/worker-1")
+
+	for _, from := range []string{"gascity/overseer", "overseer"} {
+		t.Run(from, func(t *testing.T) {
+			sender, err := authorizeMailSenderOverride(cityPath, cfg, store, from, &mailIdentitySessionCache{})
+			if err == nil {
+				t.Fatalf("authorizeMailSenderOverride(%q) = %q, want error: a session must not claim another identity's mailbox", from, sender)
+			}
+			if !errors.Is(err, errMailSenderNotAuthorized) {
+				t.Fatalf("authorizeMailSenderOverride(%q) error = %v, want errMailSenderNotAuthorized", from, err)
+			}
+		})
+	}
+}
+
+// TestAuthorizeMailSenderOverrideAllowsReservedIdentities pins the deliberate
+// carve-out in the #4070 fix, and the reason for it: pack scripts run inside an
+// ordinary session and attribute city-level alerts to the controller
+// (examples/bd/dolt/commands/compact/run.sh, pinned by dog_exec_scripts_test.go).
+// Rejecting a reserved sender here would break those packs fleet-wide.
+//
+// This is the known remaining arm of #4070 — the reserved identities stay
+// forgeable until the controller has an authenticated channel to send on. If
+// that lands, this test is the one to invert.
+func TestAuthorizeMailSenderOverrideAllowsReservedIdentities(t *testing.T) {
+	cityPath, cfg, store, callerID := mailSenderAuthzTestCity(t)
+	t.Setenv("GC_SESSION_ID", callerID)
+	t.Setenv("GC_ALIAS", "gascity/worker-1")
+	t.Setenv("GC_AGENT", "gascity/worker-1")
+
+	for _, from := range []string{"human", controllerMailIdentity} {
+		t.Run(from, func(t *testing.T) {
+			sender, err := authorizeMailSenderOverride(cityPath, cfg, store, from, &mailIdentitySessionCache{})
+			if err != nil {
+				t.Fatalf("authorizeMailSenderOverride(%q): %v; reserved senders must stay claimable for pack alert scripts", from, err)
+			}
+			if sender != from {
+				t.Fatalf("sender = %q, want %q", sender, from)
+			}
+		})
+	}
+}
+
+// TestAuthorizeMailSenderOverrideAllowsOwnIdentity pins the non-breaking half
+// of #4070: naming yourself stays legal however you spell it, because the
+// check compares resolved mailbox addresses rather than raw flag strings.
+func TestAuthorizeMailSenderOverrideAllowsOwnIdentity(t *testing.T) {
+	cityPath, cfg, store, callerID := mailSenderAuthzTestCity(t)
+	t.Setenv("GC_SESSION_ID", callerID)
+	t.Setenv("GC_ALIAS", "gascity/worker-1")
+	t.Setenv("GC_AGENT", "gascity/worker-1")
+
+	for _, from := range []string{callerID, "gascity/worker-1", "worker-1"} {
+		t.Run(from, func(t *testing.T) {
+			sender, err := authorizeMailSenderOverride(cityPath, cfg, store, from, &mailIdentitySessionCache{})
+			if err != nil {
+				t.Fatalf("authorizeMailSenderOverride(%q): %v; naming your own identity must stay authorized", from, err)
+			}
+			if sender != "gascity/worker-1" {
+				t.Fatalf("sender = %q, want gascity/worker-1 (display alias)", sender)
+			}
+		})
+	}
+}
+
+// TestAuthorizeMailSenderOverrideAllowsHumanWithoutSessionIdentity pins that
+// the #4070 fix does not break the plain-terminal path: with no ambient
+// session env the caller's own identity IS "human", so --from human matches.
+func TestAuthorizeMailSenderOverrideAllowsHumanWithoutSessionIdentity(t *testing.T) {
+	cityPath, cfg, store, _ := mailSenderAuthzTestCity(t)
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_AGENT", "")
+
+	sender, err := authorizeMailSenderOverride(cityPath, cfg, store, "human", &mailIdentitySessionCache{})
+	if err != nil {
+		t.Fatalf("authorizeMailSenderOverride(human) with no session identity: %v; the terminal path must keep working", err)
+	}
+	if sender != "human" {
+		t.Fatalf("sender = %q, want human", sender)
+	}
+}

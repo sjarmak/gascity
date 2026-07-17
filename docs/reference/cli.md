@@ -2375,7 +2375,8 @@ Send a message to a session alias or human.
 
 Creates a message bead addressed to the recipient. The sender defaults
 to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --notify to nudge
-the recipient after sending. Use --from to override the sender identity.
+the recipient after sending. Use --from to name the sender identity; it may only
+name your own session (by id, alias, or agent name) or a reserved identity.
 Use --to as an alternative to the positional &lt;to&gt; argument.
 Use -s/--subject for the summary line and -m/--message for the body text.
 Use --all to broadcast to all live sessions (excluding sender and "human").
