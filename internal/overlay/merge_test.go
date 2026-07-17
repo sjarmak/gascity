@@ -571,6 +571,10 @@ func TestMergeSettingsJSON_MatcherlessWrapper_RealWorldRecovery(t *testing.T) {
 	// Reproduce the observed corrupt state: a Stop array already bloated with
 	// many identical matcherless entries. One merge must collapse the
 	// byte-identical duplicates back to a single entry (self-heal, #3862).
+	// The pack overlay carrying this shape projects onto .claude/settings.json,
+	// so production always merges it with WithWrapBareHooks (overlay.go,
+	// hooks.go) — the self-heal is scoped to that path and leaves the additive
+	// Codex/Cursor merge alone.
 	bloat := make([]string, 50)
 	for i := range bloat {
 		bloat[i] = maHookEntry
@@ -578,7 +582,7 @@ func TestMergeSettingsJSON_MatcherlessWrapper_RealWorldRecovery(t *testing.T) {
 	base := `{"hooks":{"Stop":[` + joinJSON(bloat) + `]}}`
 	over := `{"hooks":{"Stop":[` + maHookEntry + `]}}`
 
-	result, err := MergeSettingsJSON([]byte(base), []byte(over))
+	result, err := MergeSettingsJSON([]byte(base), []byte(over), WithWrapBareHooks())
 	if err != nil {
 		t.Fatalf("MergeSettingsJSON: %v", err)
 	}
@@ -948,5 +952,45 @@ func TestMergeSettingsJSON_WrapBareHooks_TwinMigratesWhenNotInMatcherSlot(t *tes
 	}
 	if copies != 1 {
 		t.Errorf("packcmd copies = %d, want 1 (legacy twin must migrate, not duplicate)", copies)
+	}
+}
+
+func TestMergeSettingsJSON_NoWrap_KeepsDuplicateBaseEntries(t *testing.T) {
+	// The duplicate collapse is a Claude-settings self-heal for #3862. Codex and
+	// Cursor hooks.json must keep the merge's documented additive behavior, so
+	// without WithWrapBareHooks even byte-identical base entries survive.
+	base := `{"hooks":{"PreToolUse":[{"command":"same"},{"command":"same"}]}}`
+	over := `{"hooks":{"PreToolUse":[]}}`
+
+	result, err := MergeSettingsJSON([]byte(base), []byte(over))
+	if err != nil {
+		t.Fatalf("MergeSettingsJSON: %v", err)
+	}
+	if got := len(preToolUse(t, result)); got != 2 {
+		t.Errorf("PreToolUse entries = %d, want 2 (no-wrap path must be unchanged)", got)
+	}
+}
+
+func TestMergeSettingsJSON_WrapBareHooks_TwinDropsWhenMatcherlessCopyExists(t *testing.T) {
+	// A staged rollout can leave both shapes on disk: a new binary writes the
+	// matcherless entry, an older one re-appends the legacy matcher-"" twin.
+	// The twin is redundant with the matcherless copy and must not survive, or
+	// the pack hook fires twice on every event forever.
+	base := `{"hooks":{"Stop":[` +
+		`{"matcher":"","hooks":[{"type":"command","command":"pack"}]},` +
+		`{"hooks":[{"type":"command","command":"pack"}]}` +
+		`]}}`
+	over := []byte(`{"hooks":{"Stop":[{"type":"command","command":"pack"}]}}`)
+
+	result, err := MergeSettingsJSON([]byte(base), over, WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("MergeSettingsJSON: %v", err)
+	}
+	arr := stopEntries(t, result)
+	if len(arr) != 1 {
+		t.Fatalf("Stop entries = %d, want 1 (legacy twin must not survive beside its matcherless copy)\n%s", len(arr), result)
+	}
+	if _, hasMatcher := arr[0].(map[string]any)["matcher"]; hasMatcher {
+		t.Errorf("surviving entry should be the matcherless form, got %v", arr[0])
 	}
 }
