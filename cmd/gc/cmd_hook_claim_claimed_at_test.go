@@ -38,7 +38,7 @@ func TestHookClaimIdentityPatchStampsClaimedAtWhenAbsent(t *testing.T) {
 	}}
 	opts := hookClaimOptions{Env: []string{"GC_SESSION_ID=mc-sess1", "GC_SESSION_NAME=gc__role-mc-sess1"}}
 
-	patch := hookClaimIdentityPatch(bead, opts, claimedAtNoWorktreeOps(), "/tmp/work")
+	patch := hookClaimIdentityPatch(bead, opts, claimedAtNoWorktreeOps())
 
 	raw, ok := patch[beadmeta.ClaimedAtMetadataKey]
 	if !ok {
@@ -64,7 +64,7 @@ func TestHookClaimIdentityPatchClaimedAtWriteOnce(t *testing.T) {
 	opts := hookClaimOptions{Env: []string{"GC_SESSION_ID=mc-sess1", "GC_SESSION_NAME=gc__role-mc-sess1"}}
 	ops := claimedAtNoWorktreeOps()
 
-	first := hookClaimIdentityPatch(bead, opts, ops, "/tmp/work")
+	first := hookClaimIdentityPatch(bead, opts, ops)
 	stamped, ok := first[beadmeta.ClaimedAtMetadataKey]
 	if !ok {
 		t.Fatalf("first call patch = %v, want gc.claimed_at present", first)
@@ -73,7 +73,7 @@ func TestHookClaimIdentityPatchClaimedAtWriteOnce(t *testing.T) {
 	// Simulate the store now holding the value the first call decided.
 	bead.Metadata[beadmeta.ClaimedAtMetadataKey] = stamped
 
-	second := hookClaimIdentityPatch(bead, opts, ops, "/tmp/work")
+	second := hookClaimIdentityPatch(bead, opts, ops)
 	if _, ok := second[beadmeta.ClaimedAtMetadataKey]; ok {
 		t.Fatalf("second call patch = %v, want gc.claimed_at ABSENT (write-once; no re-stamp once set)", second)
 	}
@@ -93,7 +93,7 @@ func TestHookClaimIdentityPatchClaimedAtForControlBead(t *testing.T) {
 	}}
 	opts := hookClaimOptions{Env: []string{"GC_SESSION_ID=mc-sess1", "GC_SESSION_NAME=gc__role-mc-sess1"}}
 
-	patch := hookClaimIdentityPatch(bead, opts, claimedAtNoWorktreeOps(), "/tmp/work")
+	patch := hookClaimIdentityPatch(bead, opts, claimedAtNoWorktreeOps())
 
 	raw, ok := patch[beadmeta.ClaimedAtMetadataKey]
 	if !ok {
@@ -115,7 +115,7 @@ func TestHookClaimIdentityPatchClaimedAtWithoutSessionOrWorktree(t *testing.T) {
 	}}
 	opts := hookClaimOptions{} // no GC_SESSION_ID, no GC_SESSION_NAME
 
-	patch := hookClaimIdentityPatch(bead, opts, claimedAtNoWorktreeOps(), "/tmp/work")
+	patch := hookClaimIdentityPatch(bead, opts, claimedAtNoWorktreeOps())
 
 	if len(patch) != 1 {
 		t.Fatalf("patch = %v, want exactly gc.claimed_at (no session, no branch)", patch)
@@ -135,6 +135,7 @@ func TestHookClaimIdentityPatchClaimedAtWithoutSessionOrWorktree(t *testing.T) {
 func TestHookClaimIdentityPatchClaimedAtDoesNotDisturbExistingKeys(t *testing.T) {
 	bead := beads.Bead{ID: "hw-mixed", Status: "open", Metadata: map[string]string{
 		beadmeta.KindMetadataKey:        "worker",
+		beadmeta.WorkDirMetadataKey:     "/tmp/worker-checkout",
 		beadmeta.WorkBranchMetadataKey:  "bd-old",
 		beadmeta.SessionIDMetadataKey:   "mc-sess1",
 		beadmeta.SessionNameMetadataKey: "gc__role-mc-sess1",
@@ -143,7 +144,7 @@ func TestHookClaimIdentityPatchClaimedAtDoesNotDisturbExistingKeys(t *testing.T)
 	opts := hookClaimOptions{Env: []string{"GC_SESSION_ID=mc-sess1", "GC_SESSION_NAME=gc__role-mc-sess1"}}
 	ops := hookClaimOps{ResolveWorkBranch: func(string) string { return "bd-new" }}
 
-	patch := hookClaimIdentityPatch(bead, opts, ops, "/tmp/work")
+	patch := hookClaimIdentityPatch(bead, opts, ops)
 
 	want := map[string]string{beadmeta.WorkBranchMetadataKey: "bd-new"}
 	if len(patch) != len(want) || patch[beadmeta.WorkBranchMetadataKey] != want[beadmeta.WorkBranchMetadataKey] {
