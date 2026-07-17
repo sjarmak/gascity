@@ -1883,7 +1883,7 @@ max = 5
 		t.Fatalf("stdout = %q, want GC_RIG_ROOT=%q", out, rigDir)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=1") {
+	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=20") {
 		t.Fatalf("stdout = %q, want pool work_query args", out)
 	}
 }
@@ -2266,7 +2266,7 @@ max = 5
 		t.Fatalf("stdout = %q, want command to run from rig root %q", out, rigDir)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=1") {
+	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=20") {
 		t.Fatalf("stdout = %q, want pool template work_query args", out)
 	}
 }
@@ -2334,7 +2334,7 @@ name = "worker"
 		t.Fatalf("stdout = %q, want GC_SESSION_NAME=host-session", out)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=1`) {
+	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=20`) {
 		t.Fatalf("stdout = %q, want metadata-routed work query", out)
 	}
 }
@@ -2395,7 +2395,7 @@ dir = "myrig"
 		t.Fatalf("stdout = %q, want GC_SESSION_NAME=%s", out, wantSession)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=1`) {
+	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=20`) {
 		t.Fatalf("stdout = %q, want metadata-routed work query", out)
 	}
 }
@@ -2602,5 +2602,31 @@ func TestFilterUnreadyHookCandidatesExcludesClosedBeadsFromReworkDrift(t *testin
 	}
 	if len(items) != 0 {
 		t.Fatalf("filterUnreadyHookCandidates returned %d items for closed bead, want 0; got %q", len(items), got)
+	}
+}
+
+// TestDoHookAssignedTierSurvivesUnreadyHeadOfLine is a regression test for
+// gc-ewk4: before the assigned work_query tiers were widened past a single
+// row (--limit=1 -> --limit=20), a self-blocked head-of-line bead assigned to
+// an identity (e.g. one carrying gc.disarmed) hid every other bead assigned
+// to that same identity from gc hook, since the tier short-circuited on the
+// single raw row before filterUnreadyHookCandidates ever saw a second
+// candidate to fall through to. With the tier now returning up to 20
+// candidates, the genuinely ready bead behind the unready head must surface.
+func TestDoHookAssignedTierSurvivesUnreadyHeadOfLine(t *testing.T) {
+	runner := func(string, string) (string, error) {
+		return `[{"id":"gc-blocked-head","status":"blocked","is_blocked":true},{"id":"gc-ready-behind","status":"open"}]`, nil
+	}
+	var stdout, stderr bytes.Buffer
+	code := doHook("bd list --status in_progress --assignee=worker --json --limit=20", "", false, runner, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHook() = %d, want 0 (ready work exists behind unready head); stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "gc-ready-behind") {
+		t.Fatalf("stdout = %q, want the ready bead behind the unready head to surface", out)
+	}
+	if strings.Contains(out, "gc-blocked-head") {
+		t.Fatalf("stdout = %q, want the self-blocked head stripped", out)
 	}
 }
