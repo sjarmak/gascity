@@ -140,7 +140,7 @@ done
 ```bash
 WORKTREE_PATH=$(pwd)
 cd ..
-git worktree remove "$WORKTREE_PATH" --force
+gc worktree remove "$WORKTREE_PATH" --force
 gc bd update "$WORK_BEAD_ID" --unset-metadata work_dir
 ```
 

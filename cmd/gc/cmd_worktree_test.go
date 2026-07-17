@@ -86,6 +86,39 @@ func TestWorktreeCreateRequiresClass(t *testing.T) {
 	}
 }
 
+// TestWorktreeRemoveRevokesProvenanceAndDeregisters pins gc-1fbg's front door
+// end to end through the CLI surface the pack formulas actually call: after
+// `gc worktree remove`, neither the checkout nor the admin directory (and the
+// stamp inside it) survive, so a later replant at the same path has nothing
+// to forge a trust root out of.
+func TestWorktreeRemoveRevokesProvenanceAndDeregisters(t *testing.T) {
+	repo := initWorktreeCmdRepo(t)
+	wt := filepath.Join(t.TempDir(), "wt")
+
+	if _, stderr, err := runWorktreeCmd(t, repo, "create", wt, "--base", "HEAD", "--class", "managed"); err != nil {
+		t.Fatalf("create: %v stderr=%q", err, stderr)
+	}
+	admin, err := git.New(wt).WorktreeAdminDir()
+	if err != nil {
+		t.Fatalf("WorktreeAdminDir: %v", err)
+	}
+
+	stdout, stderr, err := runWorktreeCmd(t, repo, "remove", wt, "--force")
+	if err != nil {
+		t.Fatalf("remove: %v stderr=%q", err, stderr)
+	}
+	if !strings.Contains(stdout, wt) {
+		t.Errorf("stdout = %q, want it to report the removed path", stdout)
+	}
+
+	if _, statErr := os.Stat(wt); !os.IsNotExist(statErr) {
+		t.Errorf("checkout %q survived gc worktree remove (stat err=%v)", wt, statErr)
+	}
+	if _, statErr := os.Stat(admin); !os.IsNotExist(statErr) {
+		t.Errorf("admin dir %q survived gc worktree remove (stat err=%v); its stamp is still reachable for a replant", admin, statErr)
+	}
+}
+
 func TestWorktreeProvenanceListClassifies(t *testing.T) {
 	repo := initWorktreeCmdRepo(t)
 	base := t.TempDir()

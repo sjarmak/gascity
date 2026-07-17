@@ -117,11 +117,16 @@ func (g *Git) CheckoutDetach(ref string) error {
 // WorktreeRemove removes a worktree. If force is true, removes even with
 // uncommitted changes.
 func (g *Git) WorktreeRemove(path string, force bool) error {
+	return g.WorktreeRemoveCtx(context.Background(), path, force)
+}
+
+// WorktreeRemoveCtx is like WorktreeRemove but accepts a context.
+func (g *Git) WorktreeRemoveCtx(ctx context.Context, path string, force bool) error {
 	args := []string{"worktree", "remove", path}
 	if force {
 		args = append(args, "--force")
 	}
-	_, err := g.run(args...)
+	_, err := g.runCtx(ctx, args...)
 	if err != nil {
 		return fmt.Errorf("removing worktree %q: %w", path, err)
 	}

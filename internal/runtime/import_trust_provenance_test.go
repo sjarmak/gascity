@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/git"
@@ -158,6 +159,147 @@ func TestWorkspaceImportTrustRootsIgnoresForgedInTreeMarker(t *testing.T) {
 	}
 	if roots.firstParty(filepath.Join(review, "AGENTS.md")) {
 		t.Error("a forged in-tree marker made the reviewed ref's own import first-party")
+	}
+}
+
+// adminDirFor returns the absolute git admin directory for a worktree,
+// resolved while the worktree still exists — the same mechanism a forged
+// `.git` pointer targets in the tests below.
+func adminDirFor(t *testing.T, path string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", path, "rev-parse", "--absolute-git-dir").Output()
+	if err != nil {
+		t.Fatalf("resolving admin dir for %q: %v", path, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// replant recreates dir with a forged `.git` file pointing at admin — exactly
+// what an attacker (or an unrelated process) with write access to a reaped
+// path can produce on their own, with no cooperation from git.
+func replant(t *testing.T, dir, admin string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %q: %v", dir, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: "+admin+"\n"), 0o644); err != nil {
+		t.Fatalf("forge .git pointer at %q: %v", dir, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("MALICIOUS"), 0o644); err != nil {
+		t.Fatalf("write replanted AGENTS.md: %v", err)
+	}
+}
+
+// TestWorkspaceImportTrustRootsTrustsReplantAfterRawRemoval pins gc-1fbg's
+// exploit: this fork's legacy reap pattern deletes a worktree's checkout
+// directory directly (os.RemoveAll, or a shell `rm -rf` fallback) instead of
+// deregistering it with git. That leaves the admin directory — and the
+// provenance stamp inside it — behind. Anything able to write the reaped path
+// can then replant a forged `.git` pointer back at the orphaned admin
+// directory, and the surviving "managed" stamp vouches for content this
+// orchestration never created.
+//
+// This test intentionally reproduces the raw-removal reap pattern rather than
+// calling a "fixed" API: it pins that provenance is only as strong as
+// teardown discipline, and it is the regression guard for every call site
+// migrated to WorktreeRemoveAndRevoke in this same change (gc-1fbg) — a
+// caller that reverts to raw removal reopens exactly what this test catches.
+func TestWorkspaceImportTrustRootsTrustsReplantAfterRawRemoval(t *testing.T) {
+	t.Parallel()
+
+	base, repo := initProvenanceRepo(t)
+
+	reaped := filepath.Join(base, "reaped")
+	addWorktree(t, repo, reaped, git.ProvenanceManaged)
+	admin := adminDirFor(t, reaped)
+
+	if err := os.RemoveAll(reaped); err != nil {
+		t.Fatalf("RemoveAll(%q): %v", reaped, err)
+	}
+	if _, err := os.Stat(admin); err != nil {
+		t.Fatalf("admin dir %q did not survive a raw removal (err=%v); the exploit precondition does not hold", admin, err)
+	}
+
+	replant(t, reaped, admin)
+
+	roots := importRootsFor(context.Background(), reaped)
+	if !containsResolved(t, roots.trusted, reaped) {
+		t.Fatalf("WorkspaceImportTrustRoots(%q) = %v, want the replant trusted — this pins that raw removal is the exploit, not that it is safe", reaped, roots)
+	}
+	if !roots.firstParty(filepath.Join(reaped, "AGENTS.md")) {
+		t.Fatal("replanted AGENTS.md is not first-party; the raw-removal reap pattern is not actually exploitable here, so it is not the mechanism this test documents")
+	}
+}
+
+// TestWorkspaceImportTrustRootsRejectsReplantAfterRemoveAndRevoke pins the fix
+// for gc-1fbg: tearing a managed worktree down through
+// git.WorktreeRemoveAndRevoke — the front door every production reaper now
+// routes through — removes the admin directory (and the stamp inside it)
+// before the path can be reused, so a replant has no orphaned admin directory
+// left to forge a `.git` pointer at and is not recognized as part of the
+// repository at all.
+func TestWorkspaceImportTrustRootsRejectsReplantAfterRemoveAndRevoke(t *testing.T) {
+	t.Parallel()
+
+	base, repo := initProvenanceRepo(t)
+
+	reaped := filepath.Join(base, "reaped-clean")
+	addWorktree(t, repo, reaped, git.ProvenanceManaged)
+	admin := adminDirFor(t, reaped)
+
+	if err := git.New(repo).WorktreeRemoveAndRevoke(reaped, true); err != nil {
+		t.Fatalf("WorktreeRemoveAndRevoke(%q): %v", reaped, err)
+	}
+	if _, err := os.Stat(admin); !os.IsNotExist(err) {
+		t.Fatalf("admin dir %q survived WorktreeRemoveAndRevoke (stat err=%v); the stamp is still reachable for a replant", admin, err)
+	}
+
+	replant(t, reaped, admin)
+
+	roots := importRootsFor(context.Background(), reaped)
+	if containsResolved(t, roots.trusted, reaped) {
+		t.Errorf("WorkspaceImportTrustRoots(%q) = %v, a replant onto a properly torn-down worktree must not be trusted", reaped, roots)
+	}
+	if roots.firstParty(filepath.Join(reaped, "AGENTS.md")) {
+		t.Error("replanted AGENTS.md onto a properly torn-down worktree is first-party")
+	}
+}
+
+// TestWorktreeRemoveAndRevokeFailsClosedWhenRemovalNeverRuns pins the ordering
+// half of the fix: revoke happens before deregistration specifically so a
+// crash between the two still fails closed. This does not exercise
+// WorktreeRemoveAndRevoke itself — it isolates the property the ordering
+// exists for, by revoking and then simulating the removal call never
+// completing (process killed, deregistration erroring out): even then, the
+// path cannot be trusted, because nothing about trust decisions depends on
+// git's own bookkeeping succeeding — only on whether a stamp is readable.
+func TestWorktreeRemoveAndRevokeFailsClosedWhenRemovalNeverRuns(t *testing.T) {
+	t.Parallel()
+
+	base, repo := initProvenanceRepo(t)
+
+	reaped := filepath.Join(base, "reaped-crash")
+	addWorktree(t, repo, reaped, git.ProvenanceManaged)
+	admin := adminDirFor(t, reaped)
+
+	// Revoke only — simulating a crash after the stamp is gone but before
+	// `git worktree remove` ran at all. The admin directory and git's own
+	// registration are untouched.
+	if err := git.New(reaped).RevokeWorktreeProvenance(); err != nil {
+		t.Fatalf("RevokeWorktreeProvenance: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(admin, "gc-provenance.json")); !os.IsNotExist(err) {
+		t.Fatalf("stamp survived RevokeWorktreeProvenance (stat err=%v)", err)
+	}
+
+	if err := os.RemoveAll(reaped); err != nil {
+		t.Fatalf("RemoveAll(%q): %v", reaped, err)
+	}
+	replant(t, reaped, admin)
+
+	roots := importRootsFor(context.Background(), reaped)
+	if containsResolved(t, roots.trusted, reaped) {
+		t.Errorf("WorkspaceImportTrustRoots(%q) = %v, a revoked-but-not-yet-deregistered path must still fail closed", reaped, roots)
 	}
 }
 

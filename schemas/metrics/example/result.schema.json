@@ -207,7 +207,8 @@
               "whoami",
               "worktree-create",
               "worktree-provenance-list",
-              "worktree-provenance-set"
+              "worktree-provenance-set",
+              "worktree-remove"
             ]
           },
           "event_id": {

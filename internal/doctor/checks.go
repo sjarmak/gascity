@@ -1587,6 +1587,17 @@ func (c *WorktreeCheck) Run(ctx *CheckContext) *CheckResult {
 func (c *WorktreeCheck) CanFix() bool { return true }
 
 // Fix removes broken worktree directories found by the last Run.
+//
+// This is a raw filesystem removal, not git.WorktreeRemoveAndRevoke, and that
+// is deliberate rather than an oversight (see gc-1fbg): "broken" here means
+// the checkout's own `.git` pointer targets an admin directory that no longer
+// exists (isWorktreeValid). git's own registration for a worktree lives
+// entirely inside that admin directory, so by the time an entry reaches this
+// list, git has nothing left to deregister and there is no provenance stamp
+// left for anything to replant a forged pointer at — the exposure
+// WorktreeRemoveAndRevoke exists to close never opens for this corruption
+// direction. Routing this through WorktreeRemoveAndRevoke would only fail:
+// `git rev-parse` cannot resolve a checkout whose gitdir target is gone.
 func (c *WorktreeCheck) Fix(_ *CheckContext) error {
 	for _, wtPath := range c.broken {
 		if err := os.RemoveAll(wtPath); err != nil {
