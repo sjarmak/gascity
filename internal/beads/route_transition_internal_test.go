@@ -7,8 +7,6 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 )
 
-func strPtr(s string) *string { return &s }
-
 // TestDisarmRouteOnNonRunnableTransition pins gc-nuhl's core invariant: a
 // transition to a non-runnable status clears the executable routes and
 // leaves everything else (including gc.run_target) untouched.
@@ -20,27 +18,27 @@ func TestDisarmRouteOnNonRunnableTransition(t *testing.T) {
 	}{
 		{
 			name:       "blocked clears routes",
-			opts:       UpdateOpts{Status: strPtr("blocked")},
+			opts:       UpdateOpts{Status: strptr("blocked")},
 			wantRouted: true,
 		},
 		{
 			name:       "deferred clears routes",
-			opts:       UpdateOpts{Status: strPtr("deferred")},
+			opts:       UpdateOpts{Status: strptr("deferred")},
 			wantRouted: true,
 		},
 		{
 			name:       "open is untouched",
-			opts:       UpdateOpts{Status: strPtr("open")},
+			opts:       UpdateOpts{Status: strptr("open")},
 			wantRouted: false,
 		},
 		{
 			name:       "in_progress is untouched",
-			opts:       UpdateOpts{Status: strPtr("in_progress")},
+			opts:       UpdateOpts{Status: strptr("in_progress")},
 			wantRouted: false,
 		},
 		{
 			name:       "closed is untouched",
-			opts:       UpdateOpts{Status: strPtr("closed")},
+			opts:       UpdateOpts{Status: strptr("closed")},
 			wantRouted: false,
 		},
 		{
@@ -75,7 +73,7 @@ func TestDisarmRouteOnNonRunnableTransition(t *testing.T) {
 // claim, per gc-nuhl's design text.
 func TestDisarmRouteOnNonRunnableTransitionPreservesRunTargetAndOtherKeys(t *testing.T) {
 	opts := UpdateOpts{
-		Status: strPtr("blocked"),
+		Status: strptr("blocked"),
 		Metadata: map[string]string{
 			beadmeta.RunTargetMetadataKey: "/home/ds/gascity/polecat",
 			"help_request":                "missing worktree",
@@ -100,7 +98,7 @@ func TestDisarmRouteOnNonRunnableTransitionPreservesRunTargetAndOtherKeys(t *tes
 // route a bead that is simultaneously being marked non-runnable.
 func TestDisarmRouteOnNonRunnableTransitionOverridesExplicitRoute(t *testing.T) {
 	opts := UpdateOpts{
-		Status: strPtr("blocked"),
+		Status: strptr("blocked"),
 		Metadata: map[string]string{
 			beadmeta.RoutedToMetadataKey: "/home/ds/gascity/polecat",
 		},
@@ -119,7 +117,7 @@ func TestDisarmRouteOnNonRunnableTransitionDoesNotMutateCallerMap(t *testing.T) 
 	original := map[string]string{
 		beadmeta.RoutedToMetadataKey: "/home/ds/gascity/polecat",
 	}
-	opts := UpdateOpts{Status: strPtr("blocked"), Metadata: original}
+	opts := UpdateOpts{Status: strptr("blocked"), Metadata: original}
 	_ = disarmRouteOnNonRunnableTransition(opts)
 	if original[beadmeta.RoutedToMetadataKey] != "/home/ds/gascity/polecat" {
 		t.Errorf("caller's original map was mutated: %v", original)
@@ -131,7 +129,7 @@ func TestDisarmRouteOnNonRunnableTransitionDoesNotMutateCallerMap(t *testing.T) 
 // UpdateIfMatch (bdstore.go, bdstore_conditional.go), so gating it there
 // covers both write paths for the bd-backed store without a live bd binary.
 func TestBdUpdateArgsDisarmsRouteOnNonRunnableTransition(t *testing.T) {
-	args := bdUpdateArgs("gc-x", UpdateOpts{Status: strPtr("blocked")})
+	args := bdUpdateArgs("gc-x", UpdateOpts{Status: strptr("blocked")})
 
 	// --set-metadata flags are emitted in sorted key order (bdUpdateArgs
 	// sorts keys before appending), so assert on adjacent pairs rather than
@@ -191,7 +189,7 @@ func TestApplyUpdateOptsToBeadDisarmsRouteOnNonRunnableTransition(t *testing.T) 
 			beadmeta.RoutedToMetadataKey: "/home/ds/gascity/polecat",
 		},
 	}
-	got := applyUpdateOptsToBead(bead, UpdateOpts{Status: strPtr("blocked")})
+	got := applyUpdateOptsToBead(bead, UpdateOpts{Status: strptr("blocked")})
 	if got.Status != "blocked" {
 		t.Errorf("Status = %q, want blocked", got.Status)
 	}

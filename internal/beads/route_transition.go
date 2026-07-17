@@ -1,6 +1,12 @@
 package beads
 
-import "github.com/gastownhall/gascity/internal/beadmeta"
+import (
+	"maps"
+
+	beadslib "github.com/steveyegge/beads"
+
+	"github.com/gastownhall/gascity/internal/beadmeta"
+)
 
 // nonRunnableBeadStatuses are the raw bd status strings a bead must not carry
 // an executable route under (gc-nuhl). Bead.Status collapses these (and
@@ -8,8 +14,8 @@ import "github.com/gastownhall/gascity/internal/beadmeta"
 // below fires on the literal string an Update/UpdateIfMatch call writes,
 // never on a later read of the resulting Bead.
 var nonRunnableBeadStatuses = map[string]bool{
-	"blocked":  true,
-	"deferred": true,
+	string(beadslib.StatusBlocked):  true,
+	string(beadslib.StatusDeferred): true,
 }
 
 // routeDisarmMetadataKeys are the executable pool-claim / step-execution
@@ -54,9 +60,9 @@ func disarmRouteOnNonRunnableTransition(opts UpdateOpts) UpdateOpts {
 	if opts.Status == nil || !nonRunnableBeadStatuses[*opts.Status] {
 		return opts
 	}
-	merged := make(map[string]string, len(opts.Metadata)+len(routeDisarmMetadataKeys))
-	for k, v := range opts.Metadata {
-		merged[k] = v
+	merged := maps.Clone(opts.Metadata)
+	if merged == nil {
+		merged = make(map[string]string, len(routeDisarmMetadataKeys))
 	}
 	for _, key := range routeDisarmMetadataKeys {
 		merged[key] = ""
