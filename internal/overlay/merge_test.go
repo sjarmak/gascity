@@ -705,6 +705,59 @@ func TestMergeSettingsJSON_WrapBareHooks_NormalizesOverlayBareEntry(t *testing.T
 	}
 }
 
+func TestMergeSettingsJSON_WrapBareHooks_ReprojectionIsIdempotent(t *testing.T) {
+	// The ubs pack ships a bare {type,command} entry, which the merge rewrites
+	// into wrapped {"matcher":"","hooks":[...]} form on disk. Every reconcile
+	// tick re-projects that same bare overlay onto the file it wrote last tick,
+	// so the wrapped entry and the bare entry it wraps must share one identity.
+	// Otherwise each tick appends another copy and PreToolUse grows without
+	// bound (5,760 entries / 1.4 MB observed).
+	over := `{"hooks":{"PreToolUse":[{"type":"command","command":"ubs --staged"}]}}`
+
+	settings := []byte(`{}`)
+	for tick := 1; tick <= 5; tick++ {
+		var err error
+		settings, err = MergeSettingsJSON(settings, []byte(over), WithWrapBareHooks())
+		if err != nil {
+			t.Fatalf("tick %d: MergeSettingsJSON: %v", tick, err)
+		}
+		arr := preToolUse(t, settings)
+		if len(arr) != 1 {
+			t.Fatalf("tick %d: PreToolUse entries = %d, want 1 (re-projection must be idempotent)", tick, len(arr))
+		}
+		if got := innerCommand(t, arr[0]); got != "ubs --staged" {
+			t.Fatalf("tick %d: inner command = %q, want %q", tick, got, "ubs --staged")
+		}
+	}
+}
+
+func TestMergeSettingsJSON_WrapBareHooks_ReprojectionPreservesDistinctBareEntries(t *testing.T) {
+	// Two distinct bare commands shipped by one overlay must both survive every
+	// re-projection: stable at two entries, with neither collapsed into the
+	// other by the shared empty matcher their wrapped forms carry.
+	over := `{"hooks":{"PreToolUse":[{"type":"command","command":"a"},{"type":"command","command":"b"}]}}`
+
+	settings := []byte(`{}`)
+	for tick := 1; tick <= 3; tick++ {
+		var err error
+		settings, err = MergeSettingsJSON(settings, []byte(over), WithWrapBareHooks())
+		if err != nil {
+			t.Fatalf("tick %d: MergeSettingsJSON: %v", tick, err)
+		}
+		arr := preToolUse(t, settings)
+		if len(arr) != 2 {
+			t.Fatalf("tick %d: PreToolUse entries = %d, want 2 (no growth, no data loss)", tick, len(arr))
+		}
+		seen := map[string]bool{}
+		for _, e := range arr {
+			seen[innerCommand(t, e)] = true
+		}
+		if !seen["a"] || !seen["b"] {
+			t.Fatalf("tick %d: expected commands a and b preserved, got %v", tick, seen)
+		}
+	}
+}
+
 func TestMergeSettingsJSON_WrapBareHooks_NormalizesBaseBareEntry(t *testing.T) {
 	// Models the accumulated agent file: a stale bare entry already in the
 	// destination (base) plus the overlay's wrapped entry. After merge both

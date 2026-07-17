@@ -217,6 +217,21 @@ func mergeHookArray(base, over []any) []any {
 			}
 		}
 	}
+	// Also index each wrapped entry under the identity of the bare entry it
+	// wraps, without shadowing any primary identity. The merged result is
+	// rewritten into wrapped form before it lands on disk, so the next tick
+	// re-projects the overlay's still-bare entry against its own wrapped form;
+	// the alias is what lets the two resolve to one identity instead of
+	// appending a fresh copy every tick (gastownhall/gascity#3862).
+	for i, entry := range result {
+		if m, ok := entry.(map[string]any); ok {
+			if alias, hasAlias := hookEntryAliasKey(m); hasAlias {
+				if _, taken := baseIdx[alias]; !taken {
+					baseIdx[alias] = i
+				}
+			}
+		}
+	}
 
 	for _, entry := range over {
 		m, ok := entry.(map[string]any)
@@ -278,6 +293,27 @@ func hookEntryKey(entry map[string]any) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// hookEntryAliasKey returns the secondary identity a wrapped hook entry may also
+// be addressed by: the key of the single bare entry it wraps. Only empty-matcher
+// wrappers alias — a real matcher is an identity in its own right, and an
+// overlay entry declaring one is meant to replace the whole matcher.
+// Returns false for any entry that is not a single-command empty-matcher wrapper.
+func hookEntryAliasKey(entry map[string]any) (string, bool) {
+	matcher, ok := entry["matcher"].(string)
+	if !ok || matcher != "" {
+		return "", false
+	}
+	inner, ok := toSliceAny(entry["hooks"])
+	if !ok || len(inner) != 1 {
+		return "", false
+	}
+	bare, ok := inner[0].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	return hookEntryKey(bare)
 }
 
 // innerHooksKey derives a stable identity from the inner "hooks" array of a
