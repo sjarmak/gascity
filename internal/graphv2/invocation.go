@@ -42,7 +42,12 @@ const (
 	RuntimeVarsMetadataKey = beadmeta.RuntimeVarsMetadataKey
 
 	syntheticMetadataKey     = beadmeta.SyntheticMetadataKey
+	graphV2InvocationKey     = beadmeta.Graphv2InvocationKeyMetadataKey
 	previewInputConvoyPrefix = "preview-input-convoy:"
+
+	// inputConvoyInvocationPrefix namespaces the stable per-(target, formula)
+	// identity stamped on a synthetic input convoy.
+	inputConvoyInvocationPrefix = "graphv2-input-convoy:"
 )
 
 // Invocation describes a normalized graph.v2 formula invocation.
@@ -155,7 +160,7 @@ func PrepareInvocation(ctx context.Context, store beads.Store, formulaName strin
 	if store == nil {
 		return Invocation{}, fmt.Errorf("v2 formula %q requires a bead store to normalize target %s", formulaName, targetID)
 	}
-	convoyID, err := NormalizeInputConvoy(store, targetID)
+	convoyID, err := NormalizeInputConvoy(store, targetID, formulaName)
 	if err != nil {
 		return Invocation{}, err
 	}
@@ -347,9 +352,25 @@ func ValidateNoReservedUserVars(vars map[string]string) error {
 	return nil
 }
 
+// InputConvoyInvocationKey returns the stable identity of the synthetic input
+// convoy for a (target, formula) pair. The formula belongs in the key because
+// the formula-cook path treats the input convoy as its exclusivity scope: one
+// convoy per target alone would make a second formula at the same target look
+// like a competing workflow and be rejected.
+func InputConvoyInvocationKey(targetID, formulaName string) string {
+	return inputConvoyInvocationPrefix + strings.TrimSpace(targetID) + ":" + strings.TrimSpace(formulaName)
+}
+
 // NormalizeInputConvoy returns targetID when it is already a convoy, otherwise
-// it creates a visible system-created one-item convoy tracking targetID.
-func NormalizeInputConvoy(store beads.Store, targetID string) (string, error) {
+// it reuses the live system-created one-item convoy for the (targetID,
+// formulaName) invocation, creating one only when none exists.
+//
+// Reuse is load-bearing, not an optimization: RootKey leads with the input
+// convoy ID, so a convoy minted per invocation gives two dispatches of the same
+// formula at the same target two different keys, and both the root file lock and
+// the live-root dedupe key off that. A fresh convoy here means a second live
+// workflow root downstream.
+func NormalizeInputConvoy(store beads.Store, targetID, formulaName string) (string, error) {
 	targetID = strings.TrimSpace(targetID)
 	if store == nil {
 		return "", fmt.Errorf("formulas v2 invocation requires a bead store")
@@ -370,16 +391,90 @@ func NormalizeInputConvoy(store beads.Store, targetID string) (string, error) {
 	if target.Type == "convoy" {
 		return target.ID, nil
 	}
-	inputConvoy, err := CreateSingleItemInputConvoy(store, target)
+	invocationKey := InputConvoyInvocationKey(target.ID, formulaName)
+	convoyID, err := liveInputConvoyFor(store, invocationKey)
 	if err != nil {
 		return "", err
 	}
-	return inputConvoy.ID, nil
+	if convoyID == "" {
+		if _, err := CreateSingleItemInputConvoy(store, target, invocationKey); err != nil {
+			return "", err
+		}
+		// Re-resolve instead of returning the convoy just created: a caller that
+		// raced this lookup created one too, and both must settle on the same ID
+		// or the RootKeys they derive diverge exactly as before.
+		// liveInputConvoyFor picks oldest-wins, a total order both observe
+		// identically.
+		convoyID, err = liveInputConvoyFor(store, invocationKey)
+		if err != nil {
+			return "", err
+		}
+		if convoyID == "" {
+			return "", fmt.Errorf("input convoy for %s is missing immediately after creation", target.ID)
+		}
+	}
+	// Creating a convoy and tracking its item are two writes, so a failure
+	// between them leaves a convoy carrying the invocation key and tracking
+	// nothing. Reuse would hand that empty convoy to the invocation, where the
+	// missing member only surfaces later as a formula with no work; repair it
+	// here instead.
+	if err := ensureTrack(store, convoyID, target.ID); err != nil {
+		return "", err
+	}
+	return convoyID, nil
+}
+
+// ensureTrack re-establishes the input convoy's tracking dependency on its
+// target when it is absent, and is a no-op when it is already there.
+func ensureTrack(store beads.Store, convoyID, itemID string) error {
+	hasTrack, err := convoycore.HasTrack(store, convoyID, itemID)
+	if err != nil {
+		return fmt.Errorf("checking track dependency %s -> %s: %w", convoyID, itemID, err)
+	}
+	if hasTrack {
+		return nil
+	}
+	if err := convoycore.TrackItem(store, convoyID, itemID); err != nil {
+		return fmt.Errorf("repairing track dependency %s -> %s: %w", convoyID, itemID, err)
+	}
+	return nil
+}
+
+// liveInputConvoyFor returns the oldest non-terminal synthetic input convoy
+// carrying invocationKey, or "" when there is none. Callers that raced each
+// other into creating one apiece must all pick the same convoy, so the choice
+// is oldest-wins on a total order every caller observes identically rather than
+// a lock — the striped mutex this package offers is process-local, and the CLI
+// and controller are separate processes.
+func liveInputConvoyFor(store beads.Store, invocationKey string) (string, error) {
+	matches, err := store.ListByMetadata(map[string]string{graphV2InvocationKey: invocationKey}, 0)
+	if err != nil {
+		return "", fmt.Errorf("looking up input convoy %s: %w", invocationKey, err)
+	}
+	live := make([]beads.Bead, 0, len(matches))
+	for _, convoy := range matches {
+		if convoy.Type != "convoy" || convoycore.IsTerminalStatus(convoy.Status) {
+			continue
+		}
+		live = append(live, convoy)
+	}
+	if len(live) == 0 {
+		return "", nil
+	}
+	sort.SliceStable(live, func(i, j int) bool {
+		if live[i].CreatedAt.Equal(live[j].CreatedAt) {
+			return live[i].ID < live[j].ID
+		}
+		return live[i].CreatedAt.Before(live[j].CreatedAt)
+	})
+	return live[0].ID, nil
 }
 
 // CreateSingleItemInputConvoy creates a system-created one-item convoy for a
-// graph.v2 invocation target.
-func CreateSingleItemInputConvoy(store beads.Store, target beads.Bead) (beads.Bead, error) {
+// graph.v2 invocation target, stamped with invocationKey so a later invocation
+// of the same (target, formula) finds and reuses it instead of minting a second
+// one. Prefer NormalizeInputConvoy, which reuses before it creates.
+func CreateSingleItemInputConvoy(store beads.Store, target beads.Bead, invocationKey string) (beads.Bead, error) {
 	if store == nil {
 		return beads.Bead{}, fmt.Errorf("formulas v2 invocation requires a bead store")
 	}
@@ -389,8 +484,12 @@ func CreateSingleItemInputConvoy(store beads.Store, target beads.Bead) (beads.Be
 	if strings.TrimSpace(target.ID) == "" {
 		return beads.Bead{}, fmt.Errorf("input convoy target id is empty")
 	}
+	if strings.TrimSpace(invocationKey) == "" {
+		return beads.Bead{}, fmt.Errorf("input convoy invocation key for %s is empty", target.ID)
+	}
 	metadata := map[string]string{
 		syntheticMetadataKey: "true",
+		graphV2InvocationKey: invocationKey,
 	}
 	created, err := store.Create(beads.Bead{
 		Title:    "input convoy for " + target.ID,
