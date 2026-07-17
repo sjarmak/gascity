@@ -106,7 +106,14 @@ func TestMergeCacheMetadataPreservingDisarm(t *testing.T) {
 		want    StringMap
 	}{
 		{
-			name:    "unrelated key patch preserves cached disarm",
+			// This is also the wire shape of `bd update <id> --unset-metadata
+			// gc.disarmed`: the key is removed, so the patch omits it — the
+			// same shape as an unrelated touch. mergeCacheMetadataPreservingDisarm
+			// cannot distinguish the two, and resolves toward the documented
+			// safe direction (preserve). See
+			// TestApplyEventOperatorUnsetDisarmedIsNotReflectedUntilReconcile
+			// for the end-to-end version and gc-efqz for the tracked gap.
+			name:    "unrelated key patch preserves cached disarm (also the unset-metadata wire shape, gc-efqz)",
 			current: StringMap{beadmeta.DisarmedMetadataKey: "true"},
 			patch:   StringMap{"gc.other": "x"},
 			want:    StringMap{"gc.other": "x", beadmeta.DisarmedMetadataKey: "true"},
@@ -134,19 +141,6 @@ func TestMergeCacheMetadataPreservingDisarm(t *testing.T) {
 			current: StringMap{"gc.other": "old"},
 			patch:   StringMap{"gc.other": "new"},
 			want:    StringMap{"gc.other": "new"},
-		},
-		{
-			// This is the wire shape of `bd update <id> --unset-metadata
-			// gc.disarmed`: the key is removed, so the patch omits it — the
-			// exact same shape as the first case above. mergeCacheMetadataPreservingDisarm
-			// cannot distinguish the two, and resolves toward the documented
-			// safe direction (preserve). See
-			// TestApplyEventOperatorUnsetDisarmedIsNotReflectedUntilReconcile
-			// for the end-to-end version and gc-efqz for the tracked gap.
-			name:    "unset-shaped patch cannot be told apart from untouched (gc-efqz)",
-			current: StringMap{beadmeta.DisarmedMetadataKey: "true"},
-			patch:   StringMap{"gc.other": "x"},
-			want:    StringMap{"gc.other": "x", beadmeta.DisarmedMetadataKey: "true"},
 		},
 	}
 
