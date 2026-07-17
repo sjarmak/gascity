@@ -569,8 +569,8 @@ func TestMergeSettingsJSON_MatcherlessWrapper_PreservesCoreHook(t *testing.T) {
 
 func TestMergeSettingsJSON_MatcherlessWrapper_RealWorldRecovery(t *testing.T) {
 	// Reproduce the observed corrupt state: a Stop array already bloated with
-	// many identical matcherless entries. Re-projecting the overlay must not
-	// grow it further (the fix is forward-looking; it stops accumulation).
+	// many identical matcherless entries. One merge must collapse the
+	// byte-identical duplicates back to a single entry (self-heal, #3862).
 	bloat := make([]string, 50)
 	for i := range bloat {
 		bloat[i] = maHookEntry
@@ -582,10 +582,8 @@ func TestMergeSettingsJSON_MatcherlessWrapper_RealWorldRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MergeSettingsJSON: %v", err)
 	}
-	// The overlay's single copy collapses into the existing duplicates: count
-	// must not increase past the pre-existing bloat (no new append).
-	if got := len(stopEntries(t, result)); got > 50 {
-		t.Errorf("Stop entries = %d, want <= 50 (overlay must not append to existing bloat)", got)
+	if got := len(stopEntries(t, result)); got != 1 {
+		t.Errorf("Stop entries = %d, want 1 (byte-identical bloat must collapse)", got)
 	}
 }
 
@@ -697,8 +695,11 @@ func TestMergeSettingsJSON_WrapBareHooks_NormalizesOverlayBareEntry(t *testing.T
 		t.Fatalf("PreToolUse entries = %d, want 1", len(arr))
 	}
 	entry := arr[0].(map[string]any)
-	if entry["matcher"] != "" {
-		t.Errorf("matcher = %v, want empty string", entry["matcher"])
+	if _, hasMatcher := entry["matcher"]; hasMatcher {
+		// The wrapped form omits "matcher" so the entry keys on its inner
+		// command content — a matcher-"" stamp would collide with the core
+		// hooks' matcher-"" identity slot and with other bare pack hooks.
+		t.Errorf("wrapped entry carries matcher %v, want matcherless wrapper", entry["matcher"])
 	}
 	if got := innerCommand(t, entry); got != "scan" {
 		t.Errorf("inner command = %q, want scan", got)
@@ -783,5 +784,169 @@ func TestMergeSettingsJSON_NoWrap_LeavesBareEntries(t *testing.T) {
 	}
 	if _, wrapped := arr[0].(map[string]any)["hooks"]; wrapped {
 		t.Errorf("bare entry was wrapped without WithWrapBareHooks: %v", arr[0])
+	}
+}
+
+// ubsBareEntry is the bare {type,command} shape the ubs pack ships. Reconcile
+// re-projects it into .claude/settings.json on every tick (#3862).
+const ubsBareEntry = `{"type":"command","command":"if echo \"$TOOL_INPUT\" | grep -q 'git commit'; then ubs --staged --format=json 2>/dev/null || true; fi"}`
+
+func TestMergeSettingsJSON_WrapBareHooks_BareOverlayIdempotentAcrossTicks(t *testing.T) {
+	// #3862: each reconcile tick merges the pack's bare entry into the file the
+	// previous tick wrote. The bare shape and its wrapped on-disk form must
+	// share an identity, or the file grows by one entry per tick without bound
+	// (observed: 5,760 identical entries / 1.4 MB on a 5-day session).
+	over := []byte(`{"hooks":{"PreToolUse":[` + ubsBareEntry + `]}}`)
+	merged := []byte(`{}`)
+	for i := 0; i < 25; i++ {
+		var err error
+		merged, err = MergeSettingsJSON(merged, over, WithWrapBareHooks())
+		if err != nil {
+			t.Fatalf("merge tick %d: %v", i, err)
+		}
+	}
+	if got := len(preToolUse(t, merged)); got != 1 {
+		t.Errorf("PreToolUse entries after 25 ticks = %d, want 1 (idempotent re-projection)", got)
+	}
+}
+
+func TestMergeSettingsJSON_WrapBareHooks_LegacyWrappedBloatSelfHeals(t *testing.T) {
+	// A file already bloated by the pre-fix append loop holds N byte-identical
+	// {"matcher":"","hooks":[...]} copies of the pack hook. One merge tick must
+	// converge the category back to a single entry: duplicates collapse, and
+	// the surviving legacy twin unifies with the re-projected bare entry.
+	legacy := `{"matcher":"","hooks":[` + ubsBareEntry + `]}`
+	bloat := make([]string, 40)
+	for i := range bloat {
+		bloat[i] = legacy
+	}
+	base := `{"hooks":{"PreToolUse":[` + joinJSON(bloat) + `]}}`
+	over := `{"hooks":{"PreToolUse":[` + ubsBareEntry + `]}}`
+
+	result, err := MergeSettingsJSON([]byte(base), []byte(over), WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("MergeSettingsJSON: %v", err)
+	}
+	arr := preToolUse(t, result)
+	if len(arr) != 1 {
+		t.Fatalf("PreToolUse entries = %d, want 1 (bloat must self-heal)", len(arr))
+	}
+	if got, want := innerCommand(t, arr[0]), `if echo "$TOOL_INPUT" | grep -q 'git commit'; then ubs --staged --format=json 2>/dev/null || true; fi`; got != want {
+		t.Errorf("surviving command = %q, want the ubs command", got)
+	}
+}
+
+func TestMergeSettingsJSON_WrapBareHooks_CoreHookSurvivesBarePackHook(t *testing.T) {
+	// A category can hold both a core gc hook (matcher "") and a pack's bare
+	// hook. The bare entry must not claim the matcher-"" identity slot: the
+	// core hook survives, the pack hook lands exactly once, and re-projection
+	// stays stable.
+	base := `{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"gc hook --inject"}]}]}}`
+	over := []byte(`{"hooks":{"Stop":[{"type":"command","command":"pack-cleanup.sh"}]}}`)
+
+	result, err := MergeSettingsJSON([]byte(base), over, WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("MergeSettingsJSON: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		result, err = MergeSettingsJSON(result, over, WithWrapBareHooks())
+		if err != nil {
+			t.Fatalf("re-merge %d: %v", i, err)
+		}
+	}
+	arr := stopEntries(t, result)
+	if len(arr) != 2 {
+		t.Fatalf("Stop entries = %d, want 2 (core + pack)", len(arr))
+	}
+	core := arr[0].(map[string]any)
+	if core["matcher"] != "" {
+		t.Errorf("first entry matcher = %v, want core entry with matcher \"\"", core["matcher"])
+	}
+	if got := innerCommand(t, arr[0]); got != "gc hook --inject" {
+		t.Errorf("core command = %q, want gc hook --inject (core hook must survive)", got)
+	}
+	if got := innerCommand(t, arr[1]); got != "pack-cleanup.sh" {
+		t.Errorf("pack command = %q, want pack-cleanup.sh", got)
+	}
+}
+
+func TestMergeSettingsJSON_DedupKeepsDistinctSameKeyEntries(t *testing.T) {
+	// Exact-duplicate collapse must not touch entries that share an identity
+	// key but differ in content (e.g. a hand-added second Bash-matcher hook).
+	base := `{"hooks":{"PreToolUse":[
+		{"matcher":"Bash","hooks":[{"type":"command","command":"a"}]},
+		{"matcher":"Bash","hooks":[{"type":"command","command":"b"}]}
+	]}}`
+	result, err := MergeSettingsJSON([]byte(base), []byte(`{}`), WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("MergeSettingsJSON: %v", err)
+	}
+	if got := len(preToolUse(t, result)); got != 2 {
+		t.Errorf("PreToolUse entries = %d, want 2 (distinct content must survive dedup)", got)
+	}
+}
+
+func TestMergeSettingsJSON_WrapBareHooks_CoreMatcherReplacedOnUpgrade(t *testing.T) {
+	// The core gc hooks in internal/hooks/config/claude.json occupy the
+	// matcher-"" slot (PreCompact, UserPromptSubmit) and reach the merge with
+	// WithWrapBareHooks via installClaude. Keeping bare pack hooks out of that
+	// slot is what preserves same-matcher replacement here: when a release
+	// changes the command, the new entry must replace the old one rather than
+	// append beside it, or the stale command keeps firing forever.
+	// TestMergeSettingsJSON_SameMatcherReplacement covers the no-wrap path only.
+	base := `{"hooks":{"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"gc nudge drain --old"}]}]}}`
+	over := `{"hooks":{"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"gc nudge drain --new"}]}]}}`
+
+	result, err := MergeSettingsJSON([]byte(base), []byte(over), WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("MergeSettingsJSON: %v", err)
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(result, &doc); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	arr := doc["hooks"].(map[string]any)["UserPromptSubmit"].([]any)
+	if len(arr) != 1 {
+		t.Fatalf("UserPromptSubmit entries = %d, want 1 (stale core hook must not linger)", len(arr))
+	}
+	if got := innerCommand(t, arr[0]); got != "gc nudge drain --new" {
+		t.Errorf("command = %q, want gc nudge drain --new", got)
+	}
+}
+
+func TestMergeSettingsJSON_WrapBareHooks_TwinMigratesWhenNotInMatcherSlot(t *testing.T) {
+	// A category can hold several matcher-"" entries, but the identity index
+	// tracks only the last one. When the legacy twin is not the entry holding
+	// that slot, it must still be found by content — otherwise the pack hook
+	// migrates alongside its own legacy copy and fires twice on every tool call,
+	// forever.
+	base := `{"hooks":{"UserPromptSubmit":[` +
+		`{"matcher":"","hooks":[{"type":"command","command":"packcmd"}]},` +
+		`{"matcher":"","hooks":[{"type":"command","command":"gc hook --inject"}]}` +
+		`]}}`
+	over := []byte(`{"hooks":{"UserPromptSubmit":[{"type":"command","command":"packcmd"}]}}`)
+
+	result, err := MergeSettingsJSON([]byte(base), over, WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("MergeSettingsJSON: %v", err)
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(result, &doc); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	arr := doc["hooks"].(map[string]any)["UserPromptSubmit"].([]any)
+	if len(arr) != 2 {
+		t.Fatalf("UserPromptSubmit entries = %d, want 2 (pack hook + core hook)", len(arr))
+	}
+	copies := 0
+	for _, e := range arr {
+		if innerCommand(t, e) == "packcmd" {
+			copies++
+		}
+	}
+	if copies != 1 {
+		t.Errorf("packcmd copies = %d, want 1 (legacy twin must migrate, not duplicate)", copies)
 	}
 }
