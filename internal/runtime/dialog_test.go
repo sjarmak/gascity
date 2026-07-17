@@ -542,18 +542,18 @@ func TestPathWithinTrustRoot(t *testing.T) {
 func TestExternalImportsTrusted(t *testing.T) {
 	t.Parallel()
 
-	if !externalImportsTrusted(externalImportsDialogFixture(), trustedImportRootFixture) {
+	if !externalImportsTrusted(externalImportsDialogFixture(), importRoots{trusted: []string{trustedImportRootFixture}}) {
 		t.Error("first-party import within an enclosing repo should be trusted")
 	}
-	if externalImportsTrusted(externalImportsDialogFixture(), "/tmp/other/wt") {
+	if externalImportsTrusted(externalImportsDialogFixture(), importRoots{trusted: []string{"/tmp/other/wt"}}) {
 		t.Error("import outside the trust root must not be trusted")
 	}
-	if externalImportsTrusted(externalImportsDialogFixture(), "") {
+	if externalImportsTrusted(externalImportsDialogFixture(), importRoots{trusted: []string{""}}) {
 		t.Error("empty trust root must trust nothing")
 	}
 	// A modal with no parseable "External imports:" list is unverifiable and
 	// must fail closed even when a trust root is supplied.
-	if externalImportsTrusted("Allow external CLAUDE.md ... allow external imports", trustedImportRootFixture) {
+	if externalImportsTrusted("Allow external CLAUDE.md ... allow external imports", importRoots{trusted: []string{trustedImportRootFixture}}) {
 		t.Error("unparseable import list must not be trusted")
 	}
 	// If any listed import escapes the trust root, the whole modal is untrusted.
@@ -561,7 +561,7 @@ func TestExternalImportsTrusted(t *testing.T) {
 		"External imports:\n" +
 		"  /data/projects/gascity/AGENTS.md\n" +
 		"  /home/attacker/evil.md\n"
-	if externalImportsTrusted(mixed, trustedImportRootFixture) {
+	if externalImportsTrusted(mixed, importRoots{trusted: []string{trustedImportRootFixture}}) {
 		t.Error("a single untrusted import must make the modal untrusted")
 	}
 	// An in-root import that points at repository metadata or runtime state
@@ -573,7 +573,7 @@ func TestExternalImportsTrusted(t *testing.T) {
 	} {
 		modal := "Allow external CLAUDE.md file imports?\nallow external imports\n" +
 			"External imports:\n  " + runtimePath + "\n"
-		if externalImportsTrusted(modal, trustedImportRootFixture) {
+		if externalImportsTrusted(modal, importRoots{trusted: []string{trustedImportRootFixture}}) {
 			t.Errorf("import of repository runtime path %q must not be trusted", runtimePath)
 		}
 	}

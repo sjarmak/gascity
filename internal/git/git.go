@@ -2,6 +2,7 @@
 package git
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -424,6 +425,28 @@ func (g *Git) runCtx(ctx context.Context, args ...string) (string, error) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git %s: %s: %w", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
+	}
+	return string(out), nil
+}
+
+// runPathCtx executes a git command and returns its stdout only.
+//
+// runCtx folds stderr into the result, which is right for commands whose output
+// is only ever read back in an error message, and wrong for plumbing whose
+// output is consumed as a value: git may print a warning or hint on an
+// otherwise-successful call, and CombinedOutput would splice it into the path.
+// The provenance lookups use the resulting path to decide whether a working
+// tree's instruction files may be auto-accepted, so a spliced path must not be
+// mistaken for a real one.
+func (g *Git) runPathCtx(ctx context.Context, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = g.workDir
+	cmd.Env = sanitizeGitEnv(os.Environ())
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git %s: %s: %w", strings.Join(args, " "), strings.TrimSpace(stderr.String()), err)
 	}
 	return string(out), nil
 }

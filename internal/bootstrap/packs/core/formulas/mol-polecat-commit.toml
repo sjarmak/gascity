@@ -67,10 +67,13 @@ git pull --rebase origin {{base_branch}}  # Catch up to latest
 ```
 If the directory is missing, fall through to create a new one.
 
-**If no worktree** — create one:
+**If no worktree** — create one with `gc worktree create`, never bare
+`git worktree add`. It records that the tree came from a base we control, which
+is what lets your session auto-accept its own instruction-file imports; a tree
+created by bare git carries no such record and parks at the import prompt.
 ```bash
 WORKTREE_PATH=$(pwd)/worktrees/"$WORK_BEAD_ID"
-git worktree add "$WORKTREE_PATH" --detach origin/{{base_branch}}
+gc worktree create "$WORKTREE_PATH" --base origin/{{base_branch}} --class managed
 cd "$WORKTREE_PATH"
 ```
 Record immediately so restarts and witness recovery can find it:
