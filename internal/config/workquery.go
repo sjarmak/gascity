@@ -167,27 +167,27 @@ func standardAssignedWorkQueryScript(includeEphemeralReady bool) string {
 		standardAssignedReadyWorkQueryScript(includeEphemeralReady)
 }
 
+// assignedTierWidenLimit widens the assigned work_query tiers past a single
+// row so an unready head bead (e.g. gc.disarmed) has other assigned work
+// behind it to fall through to instead of hiding it entirely; mirrors
+// routedReadyTierCommand's existing limit=20 precedent. The hook layer
+// (filterUnreadyHookCandidates / claimFirstEligibleHookCandidate) already
+// iterates the full candidate array generically.
+const assignedTierWidenLimit = "--limit=20"
+
 func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
-	// Widened past a single row (limit=20, not limit=1) so an unready head
-	// bead (e.g. gc.disarmed) has other assigned in-progress work behind it
-	// to fall through to instead of hiding it entirely; mirrors
-	// routedReadyTierCommand's existing limit=20 precedent. The hook layer
-	// (filterUnreadyHookCandidates / claimFirstEligibleHookCandidate)
-	// already iterates the full candidate array generically.
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$id" --json --limit=20 2>/dev/null); ` +
+		`r=$(bd list --status in_progress --assignee="$id" --json ` + assignedTierWidenLimit + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("id", includeEphemeralReady) +
 		`done; `
 }
 
 func standardAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
-	// See standardAssignedInProgressWorkQueryScript: widened for the same
-	// unready-head-of-line reason.
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json --limit=20 2>/dev/null); ` +
+		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json ` + assignedTierWidenLimit + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedReadyProbeScript("id", includeEphemeralReady) +
 		`done; `
@@ -199,14 +199,12 @@ func legacyControlAssignedWorkQueryScript(includeEphemeralReady bool) string {
 }
 
 func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
-	// See standardAssignedInProgressWorkQueryScript: widened for the same
-	// unready-head-of-line reason.
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$cand" --json --limit=20 2>/dev/null); ` +
+		`r=$(bd list --status in_progress --assignee="$cand" --json ` + assignedTierWidenLimit + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("cand", includeEphemeralReady) +
 		`done; ` +
@@ -214,14 +212,12 @@ func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool) 
 }
 
 func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
-	// See standardAssignedInProgressWorkQueryScript: widened for the same
-	// unready-head-of-line reason.
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json --limit=20 2>/dev/null); ` +
+		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json ` + assignedTierWidenLimit + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedReadyProbeScript("cand", includeEphemeralReady) +
 		`done; ` +
