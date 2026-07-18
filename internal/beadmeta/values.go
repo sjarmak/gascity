@@ -55,6 +55,15 @@ const (
 	// root vanished from the store (see closeOrphanedControl in
 	// internal/dispatch/runtime.go).
 	OutcomeMissingRoot = "missing_root"
+
+	// OutcomeBranchReady marks a bead a formula halted at the branch-ready
+	// publication gate (auto_push=false): work exists on a branch but stops
+	// short of push/PR pending human review. Unlike the other values in this
+	// block, it is stamped on a bead that reopens (status stays/returns to
+	// open) rather than one that closes — see beads.BranchReadyMetadataKey,
+	// the sibling signal for the same halt recorded under a distinct
+	// metadata key.
+	OutcomeBranchReady = "branch-ready"
 )
 
 // Values of the CoordinatorOutcomeProducerDispositionMetadataKey typed-close

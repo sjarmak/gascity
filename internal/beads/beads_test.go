@@ -198,6 +198,41 @@ func TestIsSchedulerDispatchable(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "gc.outcome=branch-ready halt is not dispatchable",
+			bead: Bead{Status: "open", Type: "task", Metadata: StringMap{"gc.outcome": "branch-ready"}},
+			want: false,
+		},
+		{
+			name: "gc.outcome=pass does not exclude",
+			bead: Bead{Status: "open", Type: "task", Metadata: StringMap{"gc.outcome": "pass"}},
+			want: true,
+		},
+		{
+			name: "rollup type is not dispatchable",
+			bead: Bead{Status: "open", Type: "rollup"},
+			want: false,
+		},
+		{
+			name: "rollup label is not dispatchable",
+			bead: Bead{Status: "open", Type: "task", Labels: []string{"rollup"}},
+			want: false,
+		},
+		{
+			name: "epic label is not dispatchable",
+			bead: Bead{Status: "open", Type: "task", Labels: []string{"epic"}},
+			want: false,
+		},
+		{
+			name: "explicit dispatch-gate label is not dispatchable",
+			bead: Bead{Status: "open", Type: "task", Labels: []string{"needs-decision"}},
+			want: false,
+		},
+		{
+			name: "branch-ready label is not dispatchable",
+			bead: Bead{Status: "open", Type: "task", Labels: []string{"branch-ready"}},
+			want: false,
+		},
+		{
 			name: "unrelated label does not exclude",
 			bead: Bead{Status: "open", Type: "task", Labels: []string{"priority/p1"}},
 			want: true,
@@ -209,6 +244,81 @@ func TestIsSchedulerDispatchable(t *testing.T) {
 				t.Fatalf("IsSchedulerDispatchable(%+v) = %v, want %v", tt.bead, got, tt.want)
 			}
 		})
+	}
+}
+
+// dispatchabilityJQContractDispatchable reimplements bin/dispatchability.jq's
+// scheduler_dispatchable predicate (dr-zkmc, 2026-07-18) directly from a
+// bead's raw fields, independently of IsSchedulerDispatchable. It exists only
+// as a parity oracle for TestIsSchedulerDispatchableMatchesDispatchabilityContract
+// so the two definitions cannot silently drift.
+func dispatchabilityJQContractDispatchable(b Bead) bool {
+	dispatchGateLabels := map[string]bool{
+		"needs-decision":   true,
+		"needs-human":      true,
+		"needs/stephanie":  true,
+		"deferred":         true,
+		"icebox":           true,
+		"gated":            true,
+		"blocked-external": true,
+		"upstream-gated":   true,
+		"branch-ready":     true,
+		"parked":           true,
+		"dispatch-blocked": true,
+	}
+	hasGateLabel, structuralLabel := false, false
+	for _, label := range b.Labels {
+		if dispatchGateLabels[label] {
+			hasGateLabel = true
+		}
+		if label == "rollup" || label == "epic" {
+			structuralLabel = true
+		}
+	}
+	structuralType := b.Type == "epic" || b.Type == "convoy" || b.Type == "rollup"
+	status := b.Status
+	if status == "" {
+		status = "open"
+	}
+	return status == "open" &&
+		b.Assignee == "" &&
+		b.Metadata["gc.routed_to"] == "" &&
+		b.Metadata["gc.outcome"] != "branch-ready" &&
+		!structuralType &&
+		!structuralLabel &&
+		!hasGateLabel
+}
+
+func TestIsSchedulerDispatchableMatchesDispatchabilityContract(t *testing.T) {
+	fixtures := []Bead{
+		{Status: "open", Type: "task"},
+		{Status: "open", Type: "task", Assignee: "polecat-1"},
+		{Status: "open", Type: "task", Metadata: StringMap{"gc.routed_to": "/home/ds/gascity/polecat-1"}},
+		{Status: "open", Type: "epic"},
+		{Status: "open", Type: "convoy"},
+		{Status: "open", Type: "rollup"},
+		{Status: "open", Type: "task", Labels: []string{"rollup"}},
+		{Status: "open", Type: "task", Labels: []string{"epic"}},
+		{Status: "open", Type: "task", Labels: []string{"needs-decision"}},
+		{Status: "open", Type: "task", Labels: []string{"needs-human"}},
+		{Status: "open", Type: "task", Labels: []string{"needs/stephanie"}},
+		{Status: "open", Type: "task", Labels: []string{"deferred"}},
+		{Status: "open", Type: "task", Labels: []string{"icebox"}},
+		{Status: "open", Type: "task", Labels: []string{"gated"}},
+		{Status: "open", Type: "task", Labels: []string{"blocked-external"}},
+		{Status: "open", Type: "task", Labels: []string{"upstream-gated"}},
+		{Status: "open", Type: "task", Labels: []string{"branch-ready"}},
+		{Status: "open", Type: "task", Labels: []string{"parked"}},
+		{Status: "open", Type: "task", Labels: []string{"dispatch-blocked"}},
+		{Status: "open", Type: "task", Metadata: StringMap{"gc.outcome": "branch-ready"}},
+		{Status: "open", Type: "task", Metadata: StringMap{"gc.outcome": "pass"}},
+		{Status: "open", Type: "task", Labels: []string{"priority/p1"}},
+	}
+	for _, b := range fixtures {
+		want := dispatchabilityJQContractDispatchable(b)
+		if got := IsSchedulerDispatchable(b); got != want {
+			t.Errorf("IsSchedulerDispatchable(%+v) = %v, want %v (bin/dispatchability.jq parity)", b, got, want)
+		}
 	}
 }
 
