@@ -208,8 +208,18 @@ type StatusRigCounts struct {
 // StatusWorkCounts holds work item counts for the status endpoint.
 type StatusWorkCounts struct {
 	InProgress int `json:"in_progress" doc:"Number of in-progress work items."`
-	Ready      int `json:"ready" doc:"Number of ready work items."`
-	Open       int `json:"open" doc:"Number of open work items."`
+	// Ready is preserved unchanged for existing consumers: it is the same
+	// dependency-derived count DependencyReady names explicitly below.
+	Ready int `json:"ready" doc:"Number of ready work items. Deprecated: identical to dependency_ready; kept for existing consumers, prefer dependency_ready or scheduler_dispatchable for new integrations."`
+	// DependencyReady is Ready under an explicit name: beads whose
+	// dependencies are all satisfied (status=open, non-structural type, no
+	// excluded label, no future defer_until). It says nothing about whether
+	// the bead is currently assignable — see SchedulerDispatchable.
+	DependencyReady int `json:"dependency_ready" doc:"Number of beads with all dependencies satisfied. Equal to ready; may include epics, gated, assigned/routed, or branch-ready beads that are not currently assignable."`
+	// SchedulerDispatchable is the subset of DependencyReady that could be
+	// handed to an agent right now: see beads.IsSchedulerDispatchable.
+	SchedulerDispatchable int `json:"scheduler_dispatchable" doc:"Subset of dependency_ready excluding already-assigned/routed beads, structural epic/container/molecule beads, beads with an unresolved gate label, and beads halted at branch-ready. This is the executable queue depth."`
+	Open                  int `json:"open" doc:"Number of open work items."`
 }
 
 // StatusMailCounts holds mail counts for the status endpoint.

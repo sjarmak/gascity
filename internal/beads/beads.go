@@ -6,7 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/beadmeta"
 )
 
 // ErrNotFound is returned when a bead ID does not exist in the store.
@@ -496,6 +499,66 @@ func HasReadyExcludedLabel(b Bead) bool {
 		}
 	}
 	return false
+}
+
+// BranchReadyMetadataKey marks a bead a formula halted at the branch-ready
+// publication gate (auto_push=false): work exists on a branch but stops short
+// of push/PR pending human review, so the bead deliberately reopens
+// unassigned and unrouted for a human or the refinery to find rather than
+// closing. See mol-pr-from-issue / mol-polecat-work's halt-at-branch-ready
+// contract.
+const BranchReadyMetadataKey = "branch_ready"
+
+// schedulerDispatchableExcludeTypes enumerates structural bead types that are
+// dependency-ready (all dependencies satisfied) but are never themselves a
+// directly assignable unit of work: an epic rolls up child beads rather than
+// representing actionable work, and containers/molecules group beads without
+// being one. Mirrors the epic exclusion applied at dispatch time (e.g.
+// cmd/gc's controlReadyExcludeType and the bd CLI's --exclude-type=epic).
+func isSchedulerDispatchableExcludedType(t string) bool {
+	return t == "epic" || IsContainerType(t) || IsMoleculeType(t)
+}
+
+// hasGateLabel reports whether a bead carries a "gate:"-prefixed label. These
+// are minted by formula compilation (compile.go's WaitsFor handling and
+// controlflow.go's applyGatesWithMap) onto the step a gate condition guards;
+// a label surviving means the patrol executor has not yet cleared it. This is
+// distinct from IsReadyExcludedType's type=="gate" case, which excludes the
+// wait-condition bead itself rather than the step it gates.
+func hasGateLabel(b Bead) bool {
+	for _, label := range b.Labels {
+		if strings.HasPrefix(label, "gate:") {
+			return true
+		}
+	}
+	return false
+}
+
+// IsBranchReady reports whether a bead was halted by a formula at the
+// branch-ready publication gate. See BranchReadyMetadataKey.
+func IsBranchReady(b Bead) bool {
+	return b.Metadata[BranchReadyMetadataKey] == "true"
+}
+
+// IsSchedulerDispatchable reports whether a dependency-ready bead (see
+// IsReadyCandidate) is also actionable right now: not already assigned or
+// routed to a worker, not a structural epic/container/molecule bead, not
+// waiting on an unresolved gate label, and not halted at branch-ready. Every
+// dispatchable bead is dependency-ready, but not every dependency-ready bead
+// is dispatchable — e.g. an open epic with satisfied dependencies is
+// dependency-ready but rolls up child work rather than being assignable
+// itself.
+func IsSchedulerDispatchable(b Bead) bool {
+	if b.Assignee != "" || b.Metadata[beadmeta.RoutedToMetadataKey] != "" {
+		return false
+	}
+	if isSchedulerDispatchableExcludedType(b.Type) {
+		return false
+	}
+	if hasGateLabel(b) {
+		return false
+	}
+	return !IsBranchReady(b)
 }
 
 // IsDeferred reports whether a bead is hidden by a future defer_until,

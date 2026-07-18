@@ -146,6 +146,72 @@ func TestIsReadyCandidate(t *testing.T) {
 	}
 }
 
+func TestIsSchedulerDispatchable(t *testing.T) {
+	tests := []struct {
+		name string
+		bead Bead
+		want bool
+	}{
+		{
+			name: "open unassigned task is dispatchable",
+			bead: Bead{Status: "open", Type: "task"},
+			want: true,
+		},
+		{
+			name: "assigned bead is not dispatchable",
+			bead: Bead{Status: "open", Type: "task", Assignee: "polecat-1"},
+			want: false,
+		},
+		{
+			name: "routed-but-unassigned bead is not dispatchable",
+			bead: Bead{Status: "open", Type: "task", Metadata: StringMap{"gc.routed_to": "/home/ds/gascity/polecat-1"}},
+			want: false,
+		},
+		{
+			name: "epic is dependency-ready but not dispatchable",
+			bead: Bead{Status: "open", Type: "epic"},
+			want: false,
+		},
+		{
+			name: "convoy container is not dispatchable",
+			bead: Bead{Status: "open", Type: "convoy"},
+			want: false,
+		},
+		{
+			name: "molecule is not dispatchable",
+			bead: Bead{Status: "open", Type: "molecule"},
+			want: false,
+		},
+		{
+			name: "unresolved gate label is not dispatchable",
+			bead: Bead{Status: "open", Type: "task", Labels: []string{"gate:{\"condition\":\"...\"}"}},
+			want: false,
+		},
+		{
+			name: "branch-ready halt is not dispatchable",
+			bead: Bead{Status: "open", Type: "task", Metadata: StringMap{"branch_ready": "true"}},
+			want: false,
+		},
+		{
+			name: "branch_ready=false does not exclude",
+			bead: Bead{Status: "open", Type: "task", Metadata: StringMap{"branch_ready": "false"}},
+			want: true,
+		},
+		{
+			name: "unrelated label does not exclude",
+			bead: Bead{Status: "open", Type: "task", Labels: []string{"priority/p1"}},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsSchedulerDispatchable(tt.bead); got != tt.want {
+				t.Fatalf("IsSchedulerDispatchable(%+v) = %v, want %v", tt.bead, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestTierWispsIncludesNoHistoryRows(t *testing.T) {
 	items := []Bead{
 		{ID: "issue", Title: "issue", Status: "open", Type: "task"},

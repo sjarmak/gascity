@@ -4872,6 +4872,10 @@ export type StatusStoreHealth = {
 
 export type StatusWorkCounts = {
     /**
+     * Number of beads with all dependencies satisfied. Equal to ready; may include epics, gated, assigned/routed, or branch-ready beads that are not currently assignable.
+     */
+    dependency_ready: number;
+    /**
      * Number of in-progress work items.
      */
     in_progress: number;
@@ -4880,9 +4884,13 @@ export type StatusWorkCounts = {
      */
     open: number;
     /**
-     * Number of ready work items.
+     * Number of ready work items. Deprecated: identical to dependency_ready; kept for existing consumers, prefer dependency_ready or scheduler_dispatchable for new integrations.
      */
     ready: number;
+    /**
+     * Subset of dependency_ready excluding already-assigned/routed beads, structural epic/container/molecule beads, beads with an unresolved gate label, and beads halted at branch-ready. This is the executable queue depth.
+     */
+    scheduler_dispatchable: number;
 };
 
 export type StorageBindingOutcomePayload = {
