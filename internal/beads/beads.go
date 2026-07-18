@@ -511,12 +511,33 @@ const BranchReadyMetadataKey = "branch_ready"
 
 // schedulerDispatchableExcludeTypes enumerates structural bead types that are
 // dependency-ready (all dependencies satisfied) but are never themselves a
-// directly assignable unit of work: an epic rolls up child beads rather than
-// representing actionable work, and containers/molecules group beads without
-// being one. Mirrors the epic exclusion applied at dispatch time (e.g.
-// cmd/gc's controlReadyExcludeType and the bd CLI's --exclude-type=epic).
+// directly assignable unit of work: an epic or rollup rolls up child beads
+// rather than representing actionable work, and containers/molecules group
+// beads without being one. Mirrors the epic exclusion applied at dispatch
+// time (e.g. cmd/gc's controlReadyExcludeType and the bd CLI's
+// --exclude-type=epic) and the issue_type leg of dispatch_structural in the
+// city's bin/dispatchability.jq contract (dr-zkmc, 2026-07-18).
 func isSchedulerDispatchableExcludedType(t string) bool {
-	return t == "epic" || IsContainerType(t) || IsMoleculeType(t)
+	return t == "epic" || t == "rollup" || IsContainerType(t) || IsMoleculeType(t)
+}
+
+// dispatchStructuralLabels enumerates labels that mark a bead as structural
+// rollup/grouping work rather than an actionable unit, mirroring the label
+// leg of dispatch_structural in bin/dispatchability.jq. A bead can carry
+// these labels regardless of its issue_type, so this check is independent of
+// isSchedulerDispatchableExcludedType.
+var dispatchStructuralLabels = map[string]bool{
+	"rollup": true,
+	"epic":   true,
+}
+
+func hasDispatchStructuralLabel(b Bead) bool {
+	for _, label := range b.Labels {
+		if dispatchStructuralLabels[label] {
+			return true
+		}
+	}
+	return false
 }
 
 // hasGateLabel reports whether a bead carries a "gate:"-prefixed label. These
@@ -534,28 +555,63 @@ func hasGateLabel(b Bead) bool {
 	return false
 }
 
+// dispatchGateLabels enumerates the explicit labels bin/dispatchability.jq's
+// dispatch_gate_labels checks (dr-zkmc, 2026-07-18): a bead carrying any of
+// these is not scheduler-dispatchable even though it may be dependency-ready.
+// Keep this set in exact sync with the jq contract; per that file's header,
+// it is a city-local stand-in retired once every consumer migrates to this
+// API-exposed predicate.
+var dispatchGateLabels = map[string]bool{
+	"needs-decision":   true,
+	"needs-human":      true,
+	"needs/stephanie":  true,
+	"deferred":         true,
+	"icebox":           true,
+	"gated":            true,
+	"blocked-external": true,
+	"upstream-gated":   true,
+	"branch-ready":     true,
+	"parked":           true,
+	"dispatch-blocked": true,
+}
+
+func hasDispatchGateLabel(b Bead) bool {
+	for _, label := range b.Labels {
+		if dispatchGateLabels[label] {
+			return true
+		}
+	}
+	return false
+}
+
 // IsBranchReady reports whether a bead was halted by a formula at the
-// branch-ready publication gate. See BranchReadyMetadataKey.
+// branch-ready publication gate. See BranchReadyMetadataKey. A bead can also
+// signal the same halt via metadata gc.outcome=branch-ready (see
+// beadmeta.OutcomeBranchReady); both are checked.
 func IsBranchReady(b Bead) bool {
-	return b.Metadata[BranchReadyMetadataKey] == "true"
+	return b.Metadata[BranchReadyMetadataKey] == "true" ||
+		b.Metadata[beadmeta.OutcomeMetadataKey] == beadmeta.OutcomeBranchReady
 }
 
 // IsSchedulerDispatchable reports whether a dependency-ready bead (see
 // IsReadyCandidate) is also actionable right now: not already assigned or
-// routed to a worker, not a structural epic/container/molecule bead, not
-// waiting on an unresolved gate label, and not halted at branch-ready. Every
-// dispatchable bead is dependency-ready, but not every dependency-ready bead
-// is dispatchable — e.g. an open epic with satisfied dependencies is
+// routed to a worker, not a structural epic/rollup/container/molecule bead
+// (by type or label), not carrying an explicit dispatch-gate label or an
+// unresolved gate: label, and not halted at branch-ready. Every dispatchable
+// bead is dependency-ready, but not every dependency-ready bead is
+// dispatchable — e.g. an open epic with satisfied dependencies is
 // dependency-ready but rolls up child work rather than being assignable
-// itself.
+// itself. Mirrors bin/dispatchability.jq's scheduler_dispatchable contract
+// (dr-zkmc, 2026-07-18); see TestIsSchedulerDispatchableMatchesDispatchabilityContract
+// for the parity fixture.
 func IsSchedulerDispatchable(b Bead) bool {
 	if b.Assignee != "" || b.Metadata[beadmeta.RoutedToMetadataKey] != "" {
 		return false
 	}
-	if isSchedulerDispatchableExcludedType(b.Type) {
+	if isSchedulerDispatchableExcludedType(b.Type) || hasDispatchStructuralLabel(b) {
 		return false
 	}
-	if hasGateLabel(b) {
+	if hasGateLabel(b) || hasDispatchGateLabel(b) {
 		return false
 	}
 	return !IsBranchReady(b)
