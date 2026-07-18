@@ -882,6 +882,18 @@ func TestControllerStateCreateRigPokesReconciler(t *testing.T) {
 	}
 }
 
+// setControllerStateRigTestEnv sets the env trio nearly every controllerState
+// rig-add test needs: file-backed beads, skip Dolt, no scope-root override.
+// Shared so additional tests route through one call site instead of growing
+// the untagged cmd/gc environment-mutation census
+// (internal/testpolicy/resourcecensus).
+func setControllerStateRigTestEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+}
+
 // TestControllerStateCreateRigRejectsDuplicateName pins the API's
 // ErrAlreadyExists (409) contract that the retired configedit CreateRig test
 // covered: a second CreateRig with an already-registered name must fail rather
@@ -891,9 +903,7 @@ func TestControllerStateCreateRigPokesReconciler(t *testing.T) {
 // and refreshed by the first create), so the name guard is actually reached
 // rather than skipped on a nil config.
 func TestControllerStateCreateRigRejectsDuplicateName(t *testing.T) {
-	t.Setenv("GC_BEADS", "file")
-	t.Setenv("GC_DOLT", "skip")
-	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+	setControllerStateRigTestEnv(t)
 
 	cityDir := t.TempDir()
 	tomlPath := filepath.Join(cityDir, "city.toml")
@@ -942,8 +952,7 @@ func TestControllerStateCreateRigRejectsDuplicateName(t *testing.T) {
 // it must apply the same name gate (gascity#3109) BEFORE the rig store is
 // initialized, and the error must map to a 400 via configedit.ErrValidation.
 func TestControllerStateCreateRigRejectsInvalidName(t *testing.T) {
-	t.Setenv("GC_BEADS", "file")
-	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+	setControllerStateRigTestEnv(t)
 
 	cityDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"city1\"\n"), 0o644); err != nil {

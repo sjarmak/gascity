@@ -70,6 +70,16 @@ func writeSchema2RigCityFS(t *testing.T, f *fsys.Fake, cityPath, workspaceName, 
 	f.Files[config.SiteBindingPath(cityPath)] = []byte(fmt.Sprintf("workspace_name = %q\n", workspaceName))
 }
 
+// setRigAddTestEnv sets the env pair nearly every doRigAdd test needs: skip
+// Dolt entirely and force the bd-backed beads provider. Shared so additional
+// tests route through one call site instead of growing the untagged cmd/gc
+// environment-mutation census (internal/testpolicy/resourcecensus).
+func setRigAddTestEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_BEADS", "bd")
+}
+
 func TestDoRigAdd_Basic(t *testing.T) {
 	cityPath := t.TempDir()
 	writeSchema2RigCity(t, cityPath, "test-city", "[workspace]\n", "")
@@ -79,8 +89,7 @@ func TestDoRigAdd_Basic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Setenv("GC_DOLT", "skip")
-	t.Setenv("GC_BEADS", "bd")
+	setRigAddTestEnv(t)
 
 	var stdout, stderr bytes.Buffer
 	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "", "", false, false, &stdout, &stderr)
@@ -121,8 +130,7 @@ func TestDoRigAdd_RejectsInvalidName(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Setenv("GC_DOLT", "skip")
-	t.Setenv("GC_BEADS", "bd")
+	setRigAddTestEnv(t)
 
 	before, err := os.ReadFile(filepath.Join(cityPath, "city.toml"))
 	if err != nil {
@@ -160,8 +168,7 @@ func TestDoRigAdd_ReAddOfLegacyInvalidNameAllowed(t *testing.T) {
 	cityToml := fmt.Sprintf("[workspace]\n\n[[rigs]]\nname = \"TS Server\"\npath = %q\nprefix = \"ts\"\n", rigPath)
 	writeSchema2RigCity(t, cityPath, "test-city", cityToml, "")
 
-	t.Setenv("GC_DOLT", "skip")
-	t.Setenv("GC_BEADS", "bd")
+	setRigAddTestEnv(t)
 
 	var stdout, stderr bytes.Buffer
 	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "TS Server", "", "", false, false, &stdout, &stderr)
@@ -182,8 +189,7 @@ func TestDoRigAdd_RejectsInvalidBasenameDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Setenv("GC_DOLT", "skip")
-	t.Setenv("GC_BEADS", "bd")
+	setRigAddTestEnv(t)
 
 	var stdout, stderr bytes.Buffer
 	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "", "", false, false, &stdout, &stderr)
@@ -212,8 +218,7 @@ source = ".gc/system/packs/core"
 		t.Fatal(err)
 	}
 
-	t.Setenv("GC_DOLT", "skip")
-	t.Setenv("GC_BEADS", "bd")
+	setRigAddTestEnv(t)
 
 	var stdout, stderr bytes.Buffer
 	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "", "", false, false, &stdout, &stderr)
