@@ -187,6 +187,30 @@ func TestProvisionRigFromGitRejectsPreexistingPath(t *testing.T) {
 	}
 }
 
+// TestProvisionRigFromGitRejectsInvalidName proves the async git_url path
+// (gascity#3109) gates the rig name the same way CreateRig does. Before this
+// gate, a name accepted by the handler-edge internal/api.validateRigName
+// charset (^[A-Za-z0-9._-]{1,64}$, which permits a leading '.', '_', or '-')
+// but rejected by config.ValidateRigName's stricter tmux-session-safety
+// alphabet would clone before failing — registering a rig whose agents could
+// never spawn. No network call should occur: the gate runs before the clone.
+func TestProvisionRigFromGitRejectsInvalidName(t *testing.T) {
+	cs := &controllerState{cityPath: t.TempDir()}
+	manifested := false
+	_, err := cs.ProvisionRigFromGit(context.Background(),
+		config.Rig{Name: "-team"},
+		"https://example.com/r.git",
+		nil,
+		func(api.RigProvisionManifest) error { manifested = true; return nil },
+	)
+	if err == nil || !errors.Is(err, configedit.ErrValidation) {
+		t.Fatalf("ProvisionRigFromGit invalid name = %v, want a validation error", err)
+	}
+	if manifested {
+		t.Fatal("manifest callback ran for an invalid name (clone would have run before the gate)")
+	}
+}
+
 // TestProvisionRigFromGitManifestsThenWrapsCloneError proves two C4c behaviors
 // in one no-network flow: the created_dir manifest is reported BEFORE the clone
 // (record-then-create), and a git.Clone failure is wrapped with rig.ErrCloneFailed

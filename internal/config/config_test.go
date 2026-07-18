@@ -4921,7 +4921,7 @@ func TestRigNameWarnings_InvalidName(t *testing.T) {
 	if !strings.Contains(warnings[0], "TS Server") {
 		t.Errorf("warning = %q, want mention of the rig name", warnings[0])
 	}
-	if !strings.Contains(warnings[0], "cannot spawn") {
+	if !strings.Contains(warnings[0], "could never spawn") {
 		t.Errorf("warning = %q, want mention of the spawn consequence", warnings[0])
 	}
 }

@@ -4174,8 +4174,8 @@ func ValidateRigName(name string) error {
 func RigNameWarnings(rigs []Rig) []string {
 	var warnings []string
 	for _, r := range rigs {
-		if ValidateRigName(r.Name) != nil {
-			warnings = append(warnings, fmt.Sprintf("rig %q: name is not a valid session identifier; rig-scoped agent sessions cannot spawn under the tmux runtime (start-pending → failed-create loop, gascity#3109). Rename the rig to use only letters, digits, '.', '_', '-'", r.Name))
+		if err := ValidateRigName(r.Name); err != nil {
+			warnings = append(warnings, err.Error())
 		}
 	}
 	return warnings

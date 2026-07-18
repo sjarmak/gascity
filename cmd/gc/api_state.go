@@ -1821,6 +1821,15 @@ func (cs *controllerState) ProvisionRigFromGit(ctx context.Context, r config.Rig
 	if gitURL == "" {
 		return config.Rig{}, fmt.Errorf("%w: git_url is required", configedit.ErrValidation)
 	}
+	// Same registration gate as CreateRig (gascity#3109): the handler-edge
+	// internal/api.validateRigName charset (^[A-Za-z0-9._-]{1,64}$) permits a
+	// leading '.', '_', or '-' that this stricter tmux-session-safety gate
+	// rejects, so a name like "-team" would otherwise clone before failing.
+	// Checked before any I/O (clone, manifest) so a rejected name never costs
+	// a network fetch or leaves a partial directory to roll back.
+	if err := config.ValidateRigName(r.Name); err != nil {
+		return config.Rig{}, fmt.Errorf("%w: %w", configedit.ErrValidation, err)
+	}
 	rawPath := strings.TrimSpace(r.Path)
 	if rawPath == "" {
 		// Server-derived clone destination for git_url adds: rigs/<name> under
