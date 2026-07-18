@@ -2474,6 +2474,68 @@ func TestClearSessionUnknownStateMarkers_RecurrenceReemitsAfterRecovery(t *testi
 	}
 }
 
+// TestReconcileSessionBeads_RuntimeMissingPoolSlotFreesDespiteWakeDemand
+// pins gastownhall/gascity#3689: a pool-managed session bead whose runtime
+// vanished (state=asleep, sleep_reason=runtime-missing — e.g. its tmux
+// server crashed) must free its slot even when the reconciler ALSO wants to
+// wake a replacement for the same alias in this tick.
+//
+// Before the fix, poolFreeable required !shouldWake, so active demand for
+// the dead alias kept the stale bead open forever: a replacement session
+// can only be created under a fresh bead ID (CreateSession has no self to
+// exempt), and ensureSessionAliasAvailable permanently rejected it with
+// "alias already exists" because the old bead was never closed.
+func TestReconcileSessionBeads_RuntimeMissingPoolSlotFreesDespiteWakeDemand(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	env.addDesired("worker", "worker", false) // desired but not running: runtime is gone
+	session := env.createSessionBead("worker", "worker")
+	env.setSessionMetadata(&session, map[string]string{
+		"state":                "asleep",
+		"sleep_reason":         "runtime-missing",
+		poolManagedMetadataKey: boolMetadata(true),
+	})
+
+	reconcileSessionBeadsAtPath(
+		context.Background(),
+		"",
+		[]beads.Bead{session},
+		env.desiredState,
+		map[string]bool{"worker": true},
+		env.cfg,
+		env.sp,
+		env.store,
+		newFakeDrainOps(),
+		nil,
+		nil,
+		map[string]bool{session.ID: true}, // durable wait-ready demand: forces ShouldWake=true for this exact bead
+		env.dt,
+		map[string]int{"worker": 1}, // active demand for the same alias
+		false,
+		nil,
+		"",
+		nil,
+		env.clk,
+		env.rec,
+		0,
+		0,
+		&env.stdout,
+		&env.stderr,
+	)
+
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get(session): %v", err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("session bead status = %q, want closed — a runtime-missing pool slot must free even under active wake demand so a replacement can claim its alias (gastownhall/gascity#3689)", got.Status)
+	}
+	const wantCloseReason = "session terminated: runtime-missing"
+	if got.Metadata["close_reason"] != wantCloseReason {
+		t.Errorf("close_reason = %q, want %q (original sleep_reason preserved as the close reason)", got.Metadata["close_reason"], wantCloseReason)
+	}
+}
+
 // TestReconcileSessionBeads_PoolSlotWithStrandedWorkEmitsDiagnostic
 // covers issue #1424: when a pool-managed session is observed
 // asleep + not-alive AND still has open in-progress work assigned, the

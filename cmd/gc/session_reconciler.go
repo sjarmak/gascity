@@ -3496,8 +3496,22 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// are disposable; singleton/named controller-managed identities must
 		// keep the same bead so later wake/restart happens in place instead
 		// of minting a fresh canonical owner.
+		//
+		// shouldWake normally blocks freeing: renewed demand means the
+		// reconciler intends to resume this exact bead in place, so closing
+		// it here would race that resume. That assumption does not hold for
+		// sleep_reason=runtime-missing — the bead's runtime process is
+		// confirmed gone, so "resume in place" is impossible and any wake
+		// for this alias necessarily mints a fresh bead. Gated on
+		// !shouldWake alone, the stale bead's alias metadata never released
+		// while demand existed, so ensureSessionAliasAvailable permanently
+		// rejected the replacement once the runtime provider (e.g. tmux)
+		// itself had crashed and every session on it went runtime-missing at
+		// once (gastownhall/gascity#3689). Free it unconditionally so the
+		// replacement can claim the alias in the same tick.
 		hasAssignedWork := false
-		poolFreeable := !shouldWake && !target.alive && isPoolSessionSlotFreeableInfo(info) && isPoolManagedSessionInfo(info)
+		runtimeConfirmedGone := info.SleepReason == string(sessionpkg.SleepReasonRuntimeMissing)
+		poolFreeable := (!shouldWake || runtimeConfirmedGone) && !target.alive && isPoolSessionSlotFreeableInfo(info) && isPoolManagedSessionInfo(info)
 		if poolFreeable {
 			var assignedErr error
 			hasAssignedWork, assignedErr = sessionHasOpenAssignedWorkForReachableStore(cityPath, cfg, store, rigStores, info)
