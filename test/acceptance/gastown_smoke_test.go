@@ -311,4 +311,25 @@ func TestGastownSmoke_WithRig(t *testing.T) {
 		t.Fatal("no rig-scoped agents found after rig add")
 	}
 	t.Logf("rig-scoped agents: %v", rigAgentNames)
+
+	// Regression guard for #1689: a rig-scoped control-dispatcher injected by
+	// a real pack import must satisfy IsDeterministicControlDispatcher, the
+	// predicate that suppresses its "Run `gc prime`" startup beacon (it's the
+	// built-in convoy-control binary, not an LLM session). Without this, the
+	// dispatcher never primes and beads routed to the rig strand silently.
+	var rigDispatcher *config.Agent
+	for i := range cfg.Agents {
+		a := &cfg.Agents[i]
+		if a.Name == config.ControlDispatcherAgentName && a.Dir != "" {
+			rigDispatcher = a
+			break
+		}
+	}
+	if rigDispatcher == nil {
+		t.Fatal("no rig-scoped control-dispatcher agent found after rig add")
+	}
+	if !config.IsDeterministicControlDispatcher(rigDispatcher) {
+		t.Errorf("rig-scoped control-dispatcher %q is not recognized as deterministic — "+
+			"it will get a startup prime prompt/nudge it can never answer (#1689)", rigDispatcher.Name)
+	}
 }
