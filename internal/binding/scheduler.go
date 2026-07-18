@@ -112,8 +112,17 @@ func (s *Scheduler) Bind(ctx context.Context, req BindRequest) (*Binding, error)
 	candidates := slices.Clone(req.Candidates)
 	sortCandidates(candidates)
 
+	// One unlocked read serves every candidate's phase-1 pre-check: the store
+	// only changes on a successful commit, which ends this loop immediately, so
+	// every candidate in one pass sees the same state. Phase 3 stays the
+	// authority under the lock; this snapshot is advisory, same as before.
+	state, err := LoadState(s.cityPath)
+	if err != nil {
+		return nil, err
+	}
+
 	for _, w := range candidates {
-		b, err := s.tryBind(ctx, w, req.Caps)
+		b, err := s.tryBind(ctx, w, req.Caps, &state)
 		if errors.Is(err, errSkipCandidate) {
 			continue
 		}
@@ -153,7 +162,7 @@ func (s *Scheduler) Release(workloadID string) error {
 // tryBind runs the three-phase bind for one candidate, mirroring the ledger's
 // own reserve: a cheap unlocked pre-check, the slow work outside every lock,
 // then a locked re-check that is the authority.
-func (s *Scheduler) tryBind(ctx context.Context, w ReadyWorkload, caps capacity.Caps) (*Binding, error) {
+func (s *Scheduler) tryBind(ctx context.Context, w ReadyWorkload, caps capacity.Caps, state *State) (*Binding, error) {
 	// The health gate sits in front of the reservation so a candidate bound for
 	// a sick provider never spends a unit to discover it.
 	if s.health != nil {
@@ -165,11 +174,7 @@ func (s *Scheduler) tryBind(ctx context.Context, w ReadyWorkload, caps capacity.
 	// Phase 1 (unlocked): an already-bound workload is not a candidate. This is
 	// only an optimization — phase 3 re-checks under the lock — so a stale read
 	// here costs a wasted reservation, never a double bind.
-	state, err := LoadState(s.cityPath)
-	if err != nil {
-		return nil, err
-	}
-	if _, bound := findLive(&state, w.ID); bound {
+	if _, bound := findLive(state, w.ID); bound {
 		return nil, fmt.Errorf("%w: workload %q is already bound", errSkipCandidate, w.ID)
 	}
 
@@ -200,12 +205,10 @@ func (s *Scheduler) tryBind(ctx context.Context, w ReadyWorkload, caps capacity.
 func (s *Scheduler) commit(w ReadyWorkload, rsv capacity.Reservation) (*Binding, error) {
 	var (
 		out    Binding
-		lost   bool
 		strand bool
 	)
 	err := WithState(s.cityPath, func(st *State) error {
 		if existing, ok := findLive(st, w.ID); ok {
-			lost = true
 			// Only release a unit that is not the winner's. The ledger's
 			// per-workload idempotence hands concurrent binders the same
 			// reservation, so releasing it blindly here would strip the unit
@@ -235,6 +238,7 @@ func (s *Scheduler) commit(w ReadyWorkload, rsv capacity.Reservation) (*Binding,
 		return nil
 	})
 	if err != nil {
+		lost := errors.Is(err, errLostRace)
 		if !lost || strand {
 			if relErr := s.ledger.Release(rsv.ID); relErr != nil {
 				return nil, fmt.Errorf("releasing reservation %q after a refused bind of workload %q: %w", rsv.ID, w.ID, relErr)
