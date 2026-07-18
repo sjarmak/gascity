@@ -11385,6 +11385,11 @@
       "StatusWorkCounts": {
         "additionalProperties": false,
         "properties": {
+          "dependency_ready": {
+            "description": "Number of beads with all dependencies satisfied. Equal to ready; may include epics, gated, assigned/routed, or branch-ready beads that are not currently assignable.",
+            "format": "int64",
+            "type": "integer"
+          },
           "in_progress": {
             "description": "Number of in-progress work items.",
             "format": "int64",
@@ -11396,7 +11401,12 @@
             "type": "integer"
           },
           "ready": {
-            "description": "Number of ready work items.",
+            "description": "Number of ready work items. Deprecated: identical to dependency_ready; kept for existing consumers, prefer dependency_ready or scheduler_dispatchable for new integrations.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "scheduler_dispatchable": {
+            "description": "Subset of dependency_ready excluding already-assigned/routed beads, structural epic/container/molecule beads, beads with an unresolved gate label, and beads halted at branch-ready. This is the executable queue depth.",
             "format": "int64",
             "type": "integer"
           }
@@ -11404,6 +11414,8 @@
         "required": [
           "in_progress",
           "ready",
+          "dependency_ready",
+          "scheduler_dispatchable",
           "open"
         ],
         "type": "object"

@@ -575,9 +575,9 @@ func (s *Server) statusSessionSnapshot(ctx context.Context) statusSessionSnapsho
 
 // statusWorkResult is one store's contribution to the work counts.
 type statusWorkResult struct {
-	wc       workCounts
-	readyIDs []string
-	errs     []string
+	wc        workCounts
+	readyRows []beads.Bead
+	errs      []string
 }
 
 // statusWorkCounts tallies persisted open/in_progress work across BeadStores
@@ -655,12 +655,16 @@ func (s *Server) statusWorkCounts(ctx context.Context, cacheColdRigs map[string]
 	for _, r := range results {
 		wc.Open += r.wc.Open
 		wc.InProgress += r.wc.InProgress
-		for _, id := range r.readyIDs {
-			if seenReady[id] {
+		for _, row := range r.readyRows {
+			if seenReady[row.ID] {
 				continue
 			}
-			seenReady[id] = true
+			seenReady[row.ID] = true
 			wc.Ready++
+			wc.DependencyReady++
+			if beads.IsSchedulerDispatchable(row) {
+				wc.SchedulerDispatchable++
+			}
 		}
 		errs = append(errs, r.errs...)
 	}
@@ -749,10 +753,13 @@ func statusStoreWorkCountsFor(
 	}
 	if ready.err == nil || (beads.IsPartialResult(ready.err) && len(ready.rows) > 0) {
 		result.wc.Ready = len(ready.rows)
-		result.readyIDs = make([]string, 0, len(ready.rows))
+		result.wc.DependencyReady = len(ready.rows)
 		for _, row := range ready.rows {
-			result.readyIDs = append(result.readyIDs, row.ID)
+			if beads.IsSchedulerDispatchable(row) {
+				result.wc.SchedulerDispatchable++
+			}
 		}
+		result.readyRows = ready.rows
 	}
 	return result
 }
