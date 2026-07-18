@@ -510,6 +510,50 @@ func TestEnsureSessionNameAvailable_AllowsFailedCreateIdentity(t *testing.T) {
 	}
 }
 
+func TestEnsureSessionNameAvailable_AllowsRuntimeMissingIdentity(t *testing.T) {
+	store := beads.NewMemStore()
+	_, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name": "mayor-2",
+			"alias":        "mayor-2",
+			"agent_name":   "mayor-2",
+			"state":        string(StateAsleep),
+			"sleep_reason": string(SleepReasonRuntimeMissing),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := ensureSessionNameAvailable(store, "mayor-2"); err != nil {
+		t.Fatalf("ensureSessionNameAvailable(runtime-missing identity) = %v, want nil", err)
+	}
+}
+
+func TestEnsureSessionNameAvailable_RejectsAsleepIdentityWithOtherSleepReason(t *testing.T) {
+	store := beads.NewMemStore()
+	_, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name": "mayor-2",
+			"alias":        "mayor-2",
+			"agent_name":   "mayor-2",
+			"state":        string(StateAsleep),
+			"sleep_reason": string(SleepReasonIdleTimeout),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := ensureSessionNameAvailable(store, "mayor-2"); !errors.Is(err, ErrSessionNameExists) {
+		t.Fatalf("ensureSessionNameAvailable(asleep/idle-timeout identity) error = %v, want %v", err, ErrSessionNameExists)
+	}
+}
+
 func TestContinuityIneligibleConfiguredOwnerAllowsFailedCreateIdentity(t *testing.T) {
 	bead := beads.Bead{Metadata: map[string]string{
 		"state":                      string(StateFailedCreate),

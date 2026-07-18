@@ -345,6 +345,9 @@ func ensureSessionNameAvailableForSelfAndOwner(store beads.Store, name, selfID, 
 		if failedCreateIdentityReleased(b) {
 			continue
 		}
+		if runtimeMissingIdentityReleased(b) {
+			continue
+		}
 		// Explicit session names are permanent identities; once claimed by any
 		// session bead, including a closed one, they are never reused.
 		//
