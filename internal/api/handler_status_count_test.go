@@ -185,6 +185,37 @@ func TestHandleStatusWorkCountsUseCounterStores(t *testing.T) {
 	}
 }
 
+func TestHandleStatusDependencyReadyAndSchedulerDispatchable(t *testing.T) {
+	state := newFakeState(t)
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{Type: "task", Title: "claimable work"}); err != nil {
+		t.Fatalf("Create claimable work: %v", err)
+	}
+	// Dependency-ready (deps satisfied, non-excluded type) but structurally
+	// not assignable: an epic rolls up child work rather than being a unit of
+	// work itself. readyExcludeTypes deliberately does not exclude epic (so
+	// gc doctor's backlog-depth classification can still see it as ready),
+	// which is exactly why dependency_ready and scheduler_dispatchable must
+	// diverge here rather than collapse into one count.
+	if _, err := store.Create(beads.Bead{Type: "epic", Title: "rollup epic"}); err != nil {
+		t.Fatalf("Create epic: %v", err)
+	}
+	state.stores["myrig"] = store
+	state.cityBeadStore = store
+
+	resp := getStatus(t, state)
+
+	if resp.Work.Ready != 2 {
+		t.Fatalf("Work.Ready = %d, want 2 (unchanged canonical semantics)", resp.Work.Ready)
+	}
+	if resp.Work.DependencyReady != resp.Work.Ready {
+		t.Fatalf("Work.DependencyReady = %d, want equal to Work.Ready (%d)", resp.Work.DependencyReady, resp.Work.Ready)
+	}
+	if resp.Work.SchedulerDispatchable != 1 {
+		t.Fatalf("Work.SchedulerDispatchable = %d, want 1 (epic excluded)", resp.Work.SchedulerDispatchable)
+	}
+}
+
 func TestHandleStatusCounterUnsupportedFallsBackToList(t *testing.T) {
 	state := newFakeState(t)
 	mem := beads.NewMemStore()

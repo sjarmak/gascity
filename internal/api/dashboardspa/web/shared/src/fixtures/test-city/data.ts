@@ -357,6 +357,8 @@ export function buildTestCitySupervisorData(nowMs: number = Date.now()): TestCit
     work: {
       open: countByStatus(beads, 'open'),
       ready: countByStatus(beads, 'open'),
+      dependency_ready: countByStatus(beads, 'open'),
+      scheduler_dispatchable: countByStatus(beads, 'open'),
       in_progress: countByStatus(beads, 'in_progress'),
     },
   };

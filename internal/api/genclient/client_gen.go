@@ -4968,14 +4968,20 @@ type StatusStoreHealth struct {
 
 // StatusWorkCounts defines model for StatusWorkCounts.
 type StatusWorkCounts struct {
+	// DependencyReady Number of beads with all dependencies satisfied. Equal to ready; may include epics, gated, assigned/routed, or branch-ready beads that are not currently assignable.
+	DependencyReady int64 `json:"dependency_ready"`
+
 	// InProgress Number of in-progress work items.
 	InProgress int64 `json:"in_progress"`
 
 	// Open Number of open work items.
 	Open int64 `json:"open"`
 
-	// Ready Number of ready work items.
+	// Ready Number of ready work items. Deprecated: identical to dependency_ready; kept for existing consumers, prefer dependency_ready or scheduler_dispatchable for new integrations.
 	Ready int64 `json:"ready"`
+
+	// SchedulerDispatchable Subset of dependency_ready excluding already-assigned/routed beads, structural epic/container/molecule beads, beads with an unresolved gate label, and beads halted at branch-ready. This is the executable queue depth.
+	SchedulerDispatchable int64 `json:"scheduler_dispatchable"`
 }
 
 // StoreDiskCriticalPayload defines model for StoreDiskCriticalPayload.

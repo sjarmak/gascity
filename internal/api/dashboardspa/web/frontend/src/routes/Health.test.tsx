@@ -711,6 +711,8 @@ function baseStatus(): StatusBody {
     work: {
       open: 5,
       ready: 3,
+      dependency_ready: 3,
+      scheduler_dispatchable: 3,
       in_progress: 1,
     },
   };
