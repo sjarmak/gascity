@@ -4980,7 +4980,7 @@ type StatusWorkCounts struct {
 	// Ready Number of ready work items. Deprecated: identical to dependency_ready; kept for existing consumers, prefer dependency_ready or scheduler_dispatchable for new integrations.
 	Ready int64 `json:"ready"`
 
-	// SchedulerDispatchable Subset of dependency_ready excluding already-assigned/routed beads, structural epic/container/molecule beads, beads with an unresolved gate label, and beads halted at branch-ready. This is the executable queue depth.
+	// SchedulerDispatchable Subset of dependency_ready excluding already-assigned/routed beads, structural epic/rollup/convoy/molecule beads (by type or label), beads with an unresolved gate: label or an explicit dispatch-gate label (e.g. needs-decision, deferred, icebox, parked), and beads halted at branch-ready. This is the executable queue depth.
 	SchedulerDispatchable int64 `json:"scheduler_dispatchable"`
 }
 
