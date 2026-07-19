@@ -24,12 +24,17 @@ type managedDoltRecoverReport struct {
 type managedDoltRecoveryOps struct {
 	queryProbe       func(host, port, user string) error
 	healthCheck      func(host, port, user string) (managedDoltSQLHealthReport, error)
+	contended        func()
 	stop             func(cityPath, port string) (managedDoltStopReport, error)
 	preflightCleanup func(cityPath string) error
 	start            func(cityPath, host, port, user, logLevel string, timeout time.Duration) (managedDoltStartReport, error)
 	publish          func(cityPath string) error
 	failedCleanup    func(cityPath string, pid, port int, cause error) error
 }
+
+// recoverManagedDoltStopFn is the lock-safe stop used by recovery.
+// Stubbable for tests. Tests that swap it MUST NOT call t.Parallel().
+var recoverManagedDoltStopFn = stopManagedDoltProcessWithOptions
 
 func defaultManagedDoltRecoveryOps() managedDoltRecoveryOps {
 	return managedDoltRecoveryOps{
@@ -38,7 +43,7 @@ func defaultManagedDoltRecoveryOps() managedDoltRecoveryOps {
 			return managedDoltHealthCheck(host, port, user, true)
 		},
 		stop: func(cityPath, port string) (managedDoltStopReport, error) {
-			return stopManagedDoltProcessWithOptions(cityPath, port, false)
+			return recoverManagedDoltStopFn(cityPath, port, false)
 		},
 		preflightCleanup: managedDoltPreflightCleanupFn,
 		start: func(cityPath, host, port, user, logLevel string, timeout time.Duration) (managedDoltStartReport, error) {
@@ -49,11 +54,26 @@ func defaultManagedDoltRecoveryOps() managedDoltRecoveryOps {
 	}
 }
 
-func recoverManagedDoltProcess(cityPath, host, port, user, logLevel string, timeout time.Duration) (managedDoltRecoverReport, error) {
-	return recoverManagedDoltProcessWithOps(cityPath, host, port, user, logLevel, timeout, defaultManagedDoltRecoveryOps())
+// managedDoltRecoverOptions selects between automatic recovery (the default:
+// supervisor, health patrol, convoy, and bd-retry processes funneling through
+// the provider script) and explicit operator recovery.
+type managedDoltRecoverOptions struct {
+	// Operator marks an explicit human-initiated recovery: it waits for and
+	// takes over the lifecycle lock from a finishing owner, and bypasses the
+	// automatic-recovery circuit. Automatic recovery never queues for
+	// ownership and is paced by the persisted per-city circuit.
+	Operator bool
 }
 
 func recoverManagedDoltProcessWithOps(cityPath, host, port, user, logLevel string, timeout time.Duration, ops managedDoltRecoveryOps) (managedDoltRecoverReport, error) {
+	return recoverManagedDoltProcessWithOptionsAndOps(cityPath, host, port, user, logLevel, timeout, managedDoltRecoverOptions{}, ops)
+}
+
+func recoverManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel string, timeout time.Duration, opts managedDoltRecoverOptions) (managedDoltRecoverReport, error) {
+	return recoverManagedDoltProcessWithOptionsAndOps(cityPath, host, port, user, logLevel, timeout, opts, defaultManagedDoltRecoveryOps())
+}
+
+func recoverManagedDoltProcessWithOptionsAndOps(cityPath, host, port, user, logLevel string, timeout time.Duration, opts managedDoltRecoverOptions, ops managedDoltRecoveryOps) (managedDoltRecoverReport, error) {
 	if strings.TrimSpace(cityPath) == "" {
 		return managedDoltRecoverReport{}, fmt.Errorf("missing city path")
 	}
@@ -86,14 +106,14 @@ func recoverManagedDoltProcessWithOps(cityPath, host, port, user, logLevel strin
 		return report, err
 	}
 	if !locked {
-		observed, acquired, waitErr := waitForManagedDoltLifecycleOrReady(cityPath, host, port, user, timeout, lockFile, layout, &report)
-		if waitErr != nil {
-			return report, waitErr
+		if ops.contended != nil {
+			ops.contended()
 		}
-		if observed {
-			if err := ops.publish(cityPath); err != nil {
-				return report, fmt.Errorf("publish managed dolt runtime state: %w", err)
-			}
+		acquired, done, contendErr := resolveManagedDoltRecoveryContention(cityPath, host, port, user, timeout, opts.Operator, lockFile, ops.publish, &report)
+		if contendErr != nil {
+			return report, contendErr
+		}
+		if done {
 			lockFile = nil
 			return report, nil
 		}
@@ -116,6 +136,7 @@ func recoverManagedDoltProcessWithOps(cityPath, host, port, user, logLevel strin
 			if err := ops.publish(cityPath); err != nil {
 				return report, fmt.Errorf("publish managed dolt runtime state: %w", err)
 			}
+			clearManagedDoltRecoveryCircuitBestEffort(layout)
 			return report, nil
 		}
 	}
@@ -134,8 +155,25 @@ func recoverManagedDoltProcessWithOps(cityPath, host, port, user, logLevel strin
 				return report, fmt.Errorf("publish managed dolt runtime state: %w", err)
 			}
 			recoverManagedDoltPopulateReportFromRuntimeState(cityPath, port, &report)
+			clearManagedDoltRecoveryCircuitBestEffort(layout)
 			return report, nil
 		}
+	}
+
+	// Everything below is the destructive phase (stop → preflight → start).
+	// It is paced by the persisted per-city circuit so independent automatic
+	// callers coalesce across processes; the gate and stamp both run under
+	// the exclusive lifecycle flock held above.
+	if err := beginManagedDoltRecoveryAttempt(layout, opts.Operator, cityPath, port); err != nil {
+		return report, err
+	}
+	// failRecovery closes out a failed attempt in the circuit before
+	// surfacing the cause, so the next automatic caller backs off.
+	failRecovery := func(cause error) error {
+		if recErr := recordManagedDoltRecoveryFailure(layout, cause, false); recErr != nil {
+			return errors.Join(cause, recErr)
+		}
+		return cause
 	}
 
 	stopReport, stopErr := ops.stop(cityPath, port)
@@ -144,11 +182,25 @@ func recoverManagedDoltProcessWithOps(cityPath, host, port, user, logLevel strin
 	if stopReport.PID > 0 {
 		report.PID = stopReport.PID
 	}
-	// Match shell recover semantics: stop is best-effort before restart.
-	_ = stopErr
+	if stopErr != nil {
+		// The stop contract means success == the data dir was released
+		// (gastownhall/gascity#3174). On failure the old server, or a
+		// flushing descendant, may still own the store; proceeding to
+		// preflight/start would bind a second server onto a live data dir.
+		// Fail closed. Deliberately NOT cleanupFailedManagedDoltRecovery:
+		// it would SIGKILL a possibly mid-flush PID and clear the runtime
+		// state the next attempt needs to rediscover the process. The
+		// published state may keep advertising Running=true for a dying
+		// server until then — observers must probe, not trust it.
+		abortErr := fmt.Errorf("aborting managed dolt recovery for %s: lock-safe stop failed and the data directory was not released: %w", cityPath, stopErr)
+		if recErr := recordManagedDoltRecoveryFailure(layout, abortErr, true); recErr != nil {
+			return report, errors.Join(abortErr, recErr)
+		}
+		return report, abortErr
+	}
 
 	if err := ops.preflightCleanup(cityPath); err != nil {
-		return report, ops.failedCleanup(cityPath, report.PID, report.Port, err)
+		return report, failRecovery(ops.failedCleanup(cityPath, report.PID, report.Port, err))
 	}
 
 	startReport, err := ops.start(cityPath, host, port, user, logLevel, timeout)
@@ -163,25 +215,71 @@ func recoverManagedDoltProcessWithOps(cityPath, host, port, user, logLevel strin
 		report.Port = portNum
 	}
 	if err != nil {
-		return report, err
+		return report, failRecovery(err)
 	}
 
 	health, err := ops.healthCheck(host, strconv.Itoa(report.Port), user)
 	if err != nil {
-		return report, ops.failedCleanup(cityPath, report.PID, report.Port, err)
+		return report, failRecovery(ops.failedCleanup(cityPath, report.PID, report.Port, err))
 	}
 	if health.ReadOnly == "true" {
 		report.Healthy = false
-		return report, ops.failedCleanup(cityPath, report.PID, report.Port, fmt.Errorf("dolt server on %s:%d is still read-only after recovery", managedDoltConnectHost(host), report.Port))
+		return report, failRecovery(ops.failedCleanup(cityPath, report.PID, report.Port, fmt.Errorf("dolt server on %s:%d is still read-only after recovery", managedDoltConnectHost(host), report.Port)))
 	}
 	report.Healthy = health.QueryReady
 	if !report.Healthy {
-		return report, ops.failedCleanup(cityPath, report.PID, report.Port, fmt.Errorf("dolt server on %s:%d is not query-ready after recovery", managedDoltConnectHost(host), report.Port))
+		return report, failRecovery(ops.failedCleanup(cityPath, report.PID, report.Port, fmt.Errorf("dolt server on %s:%d is not query-ready after recovery", managedDoltConnectHost(host), report.Port)))
 	}
 	if err := ops.publish(cityPath); err != nil {
-		return report, ops.failedCleanup(cityPath, report.PID, report.Port, fmt.Errorf("publish managed dolt runtime state: %w", err))
+		return report, failRecovery(ops.failedCleanup(cityPath, report.PID, report.Port, fmt.Errorf("publish managed dolt runtime state: %w", err)))
 	}
+	clearManagedDoltRecoveryCircuitBestEffort(layout)
 	return report, nil
+}
+
+// resolveManagedDoltRecoveryContention handles a lost lifecycle-lock race.
+// Operator recovery serializes behind a finishing owner: it keeps polling for
+// the lock (or a healthy server) until the deadline. Automatic recovery is
+// single-owner across processes: losers only observe. They either see the
+// winner produce a healthy server, or return a distinct in-progress result —
+// they never queue for the lock, so an unhealthy winner cannot hand ownership
+// down a line of waiting processes (recovery storm).
+//
+// Returns acquired=true when the caller now owns the lock (operator takeover),
+// done=true when recovery finished by observing another owner's healthy server.
+func resolveManagedDoltRecoveryContention(cityPath, host, port, user string, timeout time.Duration, operator bool, lockFile *os.File, publish func(string) error, report *managedDoltRecoverReport) (acquired, done bool, err error) {
+	if operator {
+		observed, took, waitErr := waitForManagedDoltLifecycleOrReady(cityPath, host, port, user, timeout, lockFile, report)
+		if waitErr != nil {
+			return false, false, waitErr
+		}
+		if observed {
+			if err := publish(cityPath); err != nil {
+				return false, false, fmt.Errorf("publish managed dolt runtime state: %w", err)
+			}
+			return false, true, nil
+		}
+		return took, false, nil
+	}
+	if observeManagedDoltRecoveryUntilReady(cityPath, host, port, user, timeout, report) {
+		if err := publish(cityPath); err != nil {
+			return false, false, fmt.Errorf("publish managed dolt runtime state: %w", err)
+		}
+		return false, true, nil
+	}
+	return false, false, fmt.Errorf("%w for %s; not queuing for ownership (rerun with --operator to take over explicitly)", errManagedDoltRecoveryInProgress, cityPath)
+}
+
+// clearManagedDoltRecoveryCircuitBestEffort clears the recovery circuit after
+// a healthy outcome. Best-effort by design: the circuit is advisory pacing
+// state whose read side already fails open, so a failed clear must never turn
+// an already-successful recovery into a reported failure. Worst case a stale
+// window defers the next automatic attempt by at most the backoff cap; the
+// warning goes to stderr so the condition stays visible to operators.
+func clearManagedDoltRecoveryCircuitBestEffort(layout managedDoltRuntimeLayout) {
+	if err := markManagedDoltRecoveryHealthy(layout); err != nil {
+		fmt.Fprintf(os.Stderr, "gc dolt-state recover-managed: warning: failed to clear recovery circuit: %v\n", err) //nolint:errcheck
+	}
 }
 
 func cleanupFailedManagedDoltRecovery(cityPath string, pid, port int, cause error) error {
@@ -325,7 +423,12 @@ func recoverManagedDoltRuntimeStateMatchesRequest(cityPath, requestedPort string
 	return true
 }
 
-func waitForManagedDoltLifecycleOrReady(cityPath, host, port, user string, timeout time.Duration, lockFile *os.File, _ managedDoltRuntimeLayout, report *managedDoltRecoverReport) (bool, bool, error) {
+// waitForManagedDoltLifecycleOrReady is the OPERATOR contention path: it
+// polls for either a healthy server produced by the current lock owner, or
+// for the lock itself so the operator can take over once the owner finishes.
+// Automatic recovery must never use this — queued lock waiters becoming the
+// next owner after an unhealthy winner is the recovery-storm failure mode.
+func waitForManagedDoltLifecycleOrReady(cityPath, host, port, user string, timeout time.Duration, lockFile *os.File, report *managedDoltRecoverReport) (bool, bool, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
@@ -345,6 +448,27 @@ func waitForManagedDoltLifecycleOrReady(cityPath, host, port, user string, timeo
 		}
 		if time.Now().After(deadline) {
 			return false, false, fmt.Errorf("timed out waiting for concurrent managed dolt lifecycle to finish")
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// observeManagedDoltRecoveryUntilReady is the AUTOMATIC contention path: the
+// loser only watches for the lock winner to produce a healthy server. It
+// never attempts lock acquisition, so a loser can never become the next
+// recovery owner. Returns false once the budget elapses without observing
+// health; the caller reports the distinct in-progress result.
+func observeManagedDoltRecoveryUntilReady(cityPath, host, port, user string, timeout time.Duration, report *managedDoltRecoverReport) bool {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		if ready := observeExistingManagedDoltForRecovery(cityPath, host, port, user, time.Second, report); ready {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
 		}
 		time.Sleep(250 * time.Millisecond)
 	}

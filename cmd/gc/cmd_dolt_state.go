@@ -431,13 +431,14 @@ func newDoltStateCmd(stdout, stderr io.Writer) *cobra.Command {
 	_ = startManaged.MarkFlagRequired("port")
 	cmd.AddCommand(startManaged)
 
+	operatorRecover := false
 	recoverManaged := &cobra.Command{
 		Use:    "recover-managed",
 		Short:  "Recover or reuse the managed Dolt process for a city",
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			report, err := recoverManagedDoltProcess(cityPath, hostText, portText, userText, logLevel, time.Duration(timeoutMS)*time.Millisecond)
+			report, err := recoverManagedDoltProcessWithOptions(cityPath, hostText, portText, userText, logLevel, time.Duration(timeoutMS)*time.Millisecond, managedDoltRecoverOptions{Operator: operatorRecover})
 			for _, line := range managedDoltRecoverFields(report) {
 				if _, writeErr := fmt.Fprintln(stdout, line); writeErr != nil {
 					fmt.Fprintf(stderr, "gc dolt-state recover-managed: %v\n", writeErr) //nolint:errcheck
@@ -457,6 +458,7 @@ func newDoltStateCmd(stdout, stderr io.Writer) *cobra.Command {
 	recoverManaged.Flags().StringVar(&userText, "user", "", "Dolt user")
 	recoverManaged.Flags().StringVar(&logLevel, "log-level", "warning", "Dolt log level")
 	recoverManaged.Flags().IntVar(&timeoutMS, "timeout-ms", 30000, "readiness timeout in milliseconds")
+	recoverManaged.Flags().BoolVar(&operatorRecover, "operator", false, "explicit operator recovery: wait to take over the lifecycle lock and bypass the automatic-recovery cooldown circuit")
 	_ = recoverManaged.MarkFlagRequired("city")
 	_ = recoverManaged.MarkFlagRequired("port")
 	cmd.AddCommand(recoverManaged)

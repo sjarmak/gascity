@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -150,15 +152,14 @@ func TestRecoverManagedDoltProcessWithOps(t *testing.T) {
 			wantOps:      []string{queryOp, stopOp, preflight, startOp, healthOp, publishOp},
 		},
 		{
-			name:         "stop error is ignored and report is retained",
-			stopReport:   managedDoltStopReport{HadPID: true, PID: 111, Forced: true},
-			stopErr:      stopErr,
-			startReport:  baseStart,
-			healthReport: managedDoltSQLHealthReport{QueryReady: true, ReadOnly: "false"},
+			name:       "stop error aborts before preflight and retains stop report",
+			stopReport: managedDoltStopReport{HadPID: true, PID: 111, Forced: true},
+			stopErr:    stopErr,
 			wantReport: managedDoltRecoverReport{
-				HadPID: true, Forced: true, Ready: true, PID: 222, Port: 4407, Healthy: true, Restarted: true,
+				HadPID: true, Forced: true, PID: 111, Port: 3306,
 			},
-			wantOps: []string{queryOp, stopOp, preflight, startOp, healthOp, publishOp},
+			wantErrIs: stopErr,
+			wantOps:   []string{queryOp, stopOp},
 		},
 		{
 			name:         "preflight failure cleans stopped process at requested port",
@@ -432,6 +433,15 @@ func TestRecoverManagedDoltObservedRebindPossible(t *testing.T) {
 	})
 }
 
+// recoverManagedDoltProcess is a test convenience over
+// recoverManagedDoltProcessWithOptions: automatic (non-operator) recovery
+// against the loopback host with the fixed root/warning test identity. It
+// lives in the test file because production code has no non-operator wrapper
+// caller left; keeping it in the shipped source trips unparam.
+func recoverManagedDoltProcess(cityPath, port string, timeout time.Duration) (managedDoltRecoverReport, error) {
+	return recoverManagedDoltProcessWithOptions(cityPath, "127.0.0.1", port, "root", "warning", timeout, managedDoltRecoverOptions{})
+}
+
 func setupRecoveryTestCity(t *testing.T) string {
 	t.Helper()
 	cityPath := t.TempDir()
@@ -464,21 +474,9 @@ func writeRecoveryRuntimeState(t *testing.T, cityPath string, pid, port int) {
 func TestRecoverManagedDolt_SkipsRestartWhenProbeHealthy(t *testing.T) {
 	cityPath := setupRecoveryTestCity(t)
 	writeRecoveryRuntimeState(t, cityPath, 4321, 3306)
+	stubHealthyManagedDoltProbes(t)
 
-	oldProbe := managedDoltQueryProbeDirectFn
-	oldReadOnly := managedDoltReadOnlyStateDirectFn
-	oldConnCount := managedDoltConnectionCountDirectFn
-	t.Cleanup(func() {
-		managedDoltQueryProbeDirectFn = oldProbe
-		managedDoltReadOnlyStateDirectFn = oldReadOnly
-		managedDoltConnectionCountDirectFn = oldConnCount
-	})
-
-	managedDoltQueryProbeDirectFn = func(_, _, _ string) error { return nil }
-	managedDoltReadOnlyStateDirectFn = func(_, _, _ string) (string, error) { return "false", nil }
-	managedDoltConnectionCountDirectFn = func(_, _, _ string) (string, error) { return "5", nil }
-
-	report, err := recoverManagedDoltProcess(cityPath, "127.0.0.1", "3306", "root", "warning", 10*time.Second)
+	report, err := recoverManagedDoltProcess(cityPath, "3306", 10*time.Second)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -526,7 +524,7 @@ func TestRecoverManagedDolt_ProceedsWhenReadOnly(t *testing.T) {
 		return fmt.Errorf("stop: expected — no real dolt process")
 	}
 
-	report, err := recoverManagedDoltProcess(cityPath, "127.0.0.1", "3306", "root", "warning", 10*time.Second)
+	report, err := recoverManagedDoltProcess(cityPath, "3306", 10*time.Second)
 	if err == nil {
 		t.Fatal("expected error when read-only server recovery proceeds to stop/start")
 	}
@@ -556,7 +554,7 @@ func TestRecoverManagedDolt_ProceedsWhenProbeUnreachable(t *testing.T) {
 		return preflightErr
 	}
 
-	report, err := recoverManagedDoltProcess(cityPath, "127.0.0.1", "3306", "root", "warning", 10*time.Second)
+	report, err := recoverManagedDoltProcess(cityPath, "3306", 10*time.Second)
 	if !errors.Is(err, preflightErr) {
 		t.Fatalf("recoverManagedDoltProcess error = %v, want preflight cleanup sentinel", err)
 	}
@@ -588,7 +586,7 @@ func TestRecoverManagedDolt_ProceedsWhenReadOnlyUnknown(t *testing.T) {
 		return fmt.Errorf("stop: expected - no real dolt process")
 	}
 
-	report, err := recoverManagedDoltProcess(cityPath, "127.0.0.1", "3306", "root", "warning", 10*time.Second)
+	report, err := recoverManagedDoltProcess(cityPath, "3306", 10*time.Second)
 	if err == nil {
 		t.Fatal("expected error when read-only state is unknown and recovery proceeds to stop/start")
 	}
@@ -620,11 +618,428 @@ func TestRecoverManagedDolt_ProceedsWhenHealthCheckErrors(t *testing.T) {
 		return fmt.Errorf("stop: expected — no real dolt process")
 	}
 
-	report, err := recoverManagedDoltProcess(cityPath, "127.0.0.1", "3306", "root", "warning", 10*time.Second)
+	report, err := recoverManagedDoltProcess(cityPath, "3306", 10*time.Second)
 	if err == nil {
 		t.Fatal("expected error when health check fails and recovery proceeds to stop/start")
 	}
 	if report.Ready {
 		t.Error("expected Ready=false when health check errors")
+	}
+}
+
+func stubRecoverManagedDoltStop(t *testing.T, fn func(cityPath, port string, clearPublishedState bool) (managedDoltStopReport, error)) *atomic.Int32 {
+	t.Helper()
+	old := recoverManagedDoltStopFn
+	calls := &atomic.Int32{}
+	recoverManagedDoltStopFn = func(cityPath, port string, clearPublishedState bool) (managedDoltStopReport, error) {
+		calls.Add(1)
+		return fn(cityPath, port, clearPublishedState)
+	}
+	t.Cleanup(func() { recoverManagedDoltStopFn = old })
+	return calls
+}
+
+func holdManagedDoltLifecycleLock(t *testing.T, cityPath string) func() {
+	t.Helper()
+	lockFile, _, err := openManagedDoltLifecycleLock(cityPath)
+	if err != nil {
+		t.Fatalf("openManagedDoltLifecycleLock: %v", err)
+	}
+	locked, err := tryManagedDoltLifecycleLock(lockFile)
+	if err != nil || !locked {
+		_ = lockFile.Close()
+		t.Fatalf("tryManagedDoltLifecycleLock: locked=%v err=%v", locked, err)
+	}
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { releaseManagedDoltLifecycleLock(lockFile) })
+	}
+	t.Cleanup(release)
+	return release
+}
+
+func stubUnreachableManagedDoltProbe(t *testing.T) {
+	t.Helper()
+	oldProbe := managedDoltQueryProbeDirectFn
+	managedDoltQueryProbeDirectFn = func(_, _, _ string) error {
+		return fmt.Errorf("connection refused")
+	}
+	t.Cleanup(func() { managedDoltQueryProbeDirectFn = oldProbe })
+}
+
+// stubHealthyManagedDoltProbes makes the direct probes report a healthy,
+// writable, query-ready server.
+func stubHealthyManagedDoltProbes(t *testing.T) {
+	t.Helper()
+	oldProbe := managedDoltQueryProbeDirectFn
+	oldReadOnly := managedDoltReadOnlyStateDirectFn
+	oldConnCount := managedDoltConnectionCountDirectFn
+	t.Cleanup(func() {
+		managedDoltQueryProbeDirectFn = oldProbe
+		managedDoltReadOnlyStateDirectFn = oldReadOnly
+		managedDoltConnectionCountDirectFn = oldConnCount
+	})
+	managedDoltQueryProbeDirectFn = func(_, _, _ string) error { return nil }
+	managedDoltReadOnlyStateDirectFn = func(_, _, _ string) (string, error) { return "false", nil }
+	managedDoltConnectionCountDirectFn = func(_, _, _ string) (string, error) { return "5", nil }
+}
+
+func stubManagedDoltPreflight(t *testing.T, fn func(cityPath string) error) {
+	t.Helper()
+	old := managedDoltPreflightCleanupFn
+	managedDoltPreflightCleanupFn = fn
+	t.Cleanup(func() { managedDoltPreflightCleanupFn = old })
+}
+
+func TestRecoverManagedDolt_AutomaticLoserFailsFastWhenLockHeld(t *testing.T) {
+	cityPath := setupRecoveryTestCity(t)
+	holdManagedDoltLifecycleLock(t, cityPath)
+	stubUnreachableManagedDoltProbe(t)
+	stopCalls := stubRecoverManagedDoltStop(t, func(_, _ string, _ bool) (managedDoltStopReport, error) {
+		return managedDoltStopReport{}, nil
+	})
+
+	start := time.Now()
+	report, err := recoverManagedDoltProcess(cityPath, "3306", time.Second)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, errManagedDoltRecoveryInProgress) {
+		t.Fatalf("automatic loser error = %v, want errManagedDoltRecoveryInProgress", err)
+	}
+	if report.Healthy || report.Ready {
+		t.Errorf("in-progress recovery must never be reported healthy/ready, got %+v", report)
+	}
+	if stopCalls.Load() != 0 {
+		t.Errorf("automatic loser must never run the stop/start owner path, stop calls = %d", stopCalls.Load())
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("loser lifetime = %v, want bounded near the 1s timeout", elapsed)
+	}
+
+	// The loser must not have queued for ownership: the lock holder still
+	// owns the lifecycle, and a fresh probe must succeed once released.
+	probe, _, err := openManagedDoltLifecycleLock(cityPath)
+	if err != nil {
+		t.Fatalf("openManagedDoltLifecycleLock: %v", err)
+	}
+	defer probe.Close() //nolint:errcheck
+	locked, err := tryManagedDoltLifecycleLock(probe)
+	if err != nil {
+		t.Fatalf("tryManagedDoltLifecycleLock: %v", err)
+	}
+	if locked {
+		releaseManagedDoltLifecycleLock(probe)
+		t.Fatal("lifecycle lock was free after loser returned; expected the original holder to still own it")
+	}
+}
+
+func TestRecoverManagedDolt_OperatorAcquiresAfterWinnerReleases(t *testing.T) {
+	cityPath := setupRecoveryTestCity(t)
+	release := holdManagedDoltLifecycleLock(t, cityPath)
+	contended := make(chan struct{})
+	stopErrSentinel := fmt.Errorf("stop sentinel: operator reached the owner path")
+	var stopCalls atomic.Int32
+	ops := defaultManagedDoltRecoveryOps()
+	ops.contended = func() { close(contended) }
+	ops.queryProbe = func(_, _, _ string) error { return fmt.Errorf("connection refused") }
+	ops.stop = func(_, _ string) (managedDoltStopReport, error) {
+		stopCalls.Add(1)
+		return managedDoltStopReport{}, stopErrSentinel
+	}
+
+	type result struct {
+		err error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		_, err := recoverManagedDoltProcessWithOptionsAndOps(cityPath, "127.0.0.1", "3306", "root", "warning", 10*time.Second, managedDoltRecoverOptions{Operator: true}, ops)
+		resultCh <- result{err: err}
+	}()
+
+	select {
+	case <-contended:
+		release()
+	case <-time.After(5 * time.Second):
+		t.Fatal("operator never reached the held lifecycle lock")
+	}
+	var err error
+	select {
+	case got := <-resultCh:
+		err = got.err
+	case <-time.After(5 * time.Second):
+		t.Fatal("operator did not acquire the released lifecycle lock")
+	}
+	if err == nil || !strings.Contains(err.Error(), "stop sentinel") {
+		t.Fatalf("operator recovery error = %v, want the owner-path stop sentinel (proves the operator serialized behind the winner and acquired ownership)", err)
+	}
+	if stopCalls.Load() != 1 {
+		t.Errorf("stop calls = %d, want 1", stopCalls.Load())
+	}
+}
+
+func TestRecoverManagedDolt_AbortsBeforeStartWhenStopFails(t *testing.T) {
+	cityPath := setupRecoveryTestCity(t)
+	stubUnreachableManagedDoltProbe(t)
+	stubRecoverManagedDoltStop(t, func(_, _ string, _ bool) (managedDoltStopReport, error) {
+		return managedDoltStopReport{HadPID: true, PID: 4242}, fmt.Errorf("data dir still locked by flushing descendant")
+	})
+	preflightCalls := 0
+	stubManagedDoltPreflight(t, func(_ string) error {
+		preflightCalls++
+		return nil
+	})
+
+	report, err := recoverManagedDoltProcess(cityPath, "3306", 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "data directory was not released") {
+		t.Fatalf("error = %v, want fail-closed stop abort", err)
+	}
+	if preflightCalls != 0 {
+		t.Errorf("preflight ran %d times after a failed stop; recovery must abort before preflight/start", preflightCalls)
+	}
+	if report.Restarted {
+		t.Errorf("report.Restarted = true, want false when recovery aborts on stop failure")
+	}
+
+	layout, layoutErr := resolveManagedDoltRuntimeLayout(cityPath)
+	if layoutErr != nil {
+		t.Fatalf("resolveManagedDoltRuntimeLayout: %v", layoutErr)
+	}
+	circuit := readManagedDoltRecoveryCircuit(layout)
+	if circuit.OpenUntil.IsZero() {
+		t.Error("stop abort must leave a pacing window so the next automatic attempt is deferred")
+	}
+	if circuit.ConsecutiveFailures != 0 {
+		t.Errorf("ConsecutiveFailures = %d, want 0 (stop abort must not escalate the breaker)", circuit.ConsecutiveFailures)
+	}
+	if circuit.AttemptPID != 0 {
+		t.Errorf("AttemptPID = %d, want cleared after abort", circuit.AttemptPID)
+	}
+}
+
+func TestRecoverManagedDolt_AutomaticBlockedByOpenCircuit(t *testing.T) {
+	cityPath := setupRecoveryTestCity(t)
+	stubUnreachableManagedDoltProbe(t)
+	stopCalls := stubRecoverManagedDoltStop(t, func(_, _ string, _ bool) (managedDoltStopReport, error) {
+		return managedDoltStopReport{}, nil
+	})
+	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
+	if err != nil {
+		t.Fatalf("resolveManagedDoltRuntimeLayout: %v", err)
+	}
+	if err := writeManagedDoltRecoveryCircuit(layout, managedDoltRecoveryCircuit{
+		ConsecutiveFailures: 2,
+		LastFailureAt:       time.Now(),
+		OpenUntil:           time.Now().Add(time.Hour),
+		LastError:           "prior recovery failed",
+	}); err != nil {
+		t.Fatalf("writeManagedDoltRecoveryCircuit: %v", err)
+	}
+
+	_, err = recoverManagedDoltProcess(cityPath, "3306", 5*time.Second)
+	if !errors.Is(err, errManagedDoltRecoveryCircuitOpen) {
+		t.Fatalf("error = %v, want errManagedDoltRecoveryCircuitOpen", err)
+	}
+	if stopCalls.Load() != 0 {
+		t.Errorf("stop calls = %d, want 0 while the circuit is open", stopCalls.Load())
+	}
+}
+
+func TestRecoverManagedDolt_OperatorBypassesOpenCircuit(t *testing.T) {
+	cityPath := setupRecoveryTestCity(t)
+	stubUnreachableManagedDoltProbe(t)
+	stopCalls := stubRecoverManagedDoltStop(t, func(_, _ string, _ bool) (managedDoltStopReport, error) {
+		return managedDoltStopReport{}, nil
+	})
+	stubManagedDoltPreflight(t, func(_ string) error {
+		return fmt.Errorf("preflight sentinel: operator passed the circuit gate")
+	})
+	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
+	if err != nil {
+		t.Fatalf("resolveManagedDoltRuntimeLayout: %v", err)
+	}
+	if err := writeManagedDoltRecoveryCircuit(layout, managedDoltRecoveryCircuit{
+		ConsecutiveFailures: 5,
+		LastFailureAt:       time.Now(),
+		OpenUntil:           time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("writeManagedDoltRecoveryCircuit: %v", err)
+	}
+
+	_, err = recoverManagedDoltProcessWithOptions(cityPath, "127.0.0.1", "3306", "root", "warning", 5*time.Second, managedDoltRecoverOptions{Operator: true})
+	if err == nil || !strings.Contains(err.Error(), "preflight sentinel") {
+		t.Fatalf("operator error = %v, want the preflight sentinel past the circuit gate", err)
+	}
+	if stopCalls.Load() != 1 {
+		t.Errorf("stop calls = %d, want 1 (operator must reach the owner path)", stopCalls.Load())
+	}
+}
+
+func TestRecoverManagedDolt_FailedAttemptOpensCircuitForNextAutomatic(t *testing.T) {
+	cityPath := setupRecoveryTestCity(t)
+	stubUnreachableManagedDoltProbe(t)
+	stopCalls := stubRecoverManagedDoltStop(t, func(_, _ string, _ bool) (managedDoltStopReport, error) {
+		return managedDoltStopReport{}, nil
+	})
+	stubManagedDoltPreflight(t, func(_ string) error {
+		return fmt.Errorf("preflight boom")
+	})
+
+	if _, err := recoverManagedDoltProcess(cityPath, "3306", 5*time.Second); err == nil {
+		t.Fatal("first attempt: expected preflight failure")
+	}
+	if stopCalls.Load() != 1 {
+		t.Fatalf("stop calls after first attempt = %d, want 1", stopCalls.Load())
+	}
+
+	_, err := recoverManagedDoltProcess(cityPath, "3306", 5*time.Second)
+	if !errors.Is(err, errManagedDoltRecoveryCircuitOpen) {
+		t.Fatalf("second automatic attempt error = %v, want errManagedDoltRecoveryCircuitOpen", err)
+	}
+	if stopCalls.Load() != 1 {
+		t.Errorf("stop calls after blocked second attempt = %d, want still 1", stopCalls.Load())
+	}
+}
+
+func TestRecoverManagedDolt_HealthyProbeClearsOpenWindowKeepsFailureMemory(t *testing.T) {
+	cityPath := setupRecoveryTestCity(t)
+	writeRecoveryRuntimeState(t, cityPath, 4321, 3306)
+	stubHealthyManagedDoltProbes(t)
+
+	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
+	if err != nil {
+		t.Fatalf("resolveManagedDoltRuntimeLayout: %v", err)
+	}
+	lastFailure := time.Now().Add(-time.Minute)
+	if err := writeManagedDoltRecoveryCircuit(layout, managedDoltRecoveryCircuit{
+		ConsecutiveFailures: 2,
+		LastFailureAt:       lastFailure,
+		OpenUntil:           time.Now().Add(time.Hour),
+		LastError:           "prior failure",
+	}); err != nil {
+		t.Fatalf("writeManagedDoltRecoveryCircuit: %v", err)
+	}
+
+	report, err := recoverManagedDoltProcess(cityPath, "3306", 5*time.Second)
+	if err != nil {
+		t.Fatalf("recoverManagedDoltProcess = %v, want healthy-probe success even while the circuit is open (health resets availability)", err)
+	}
+	if !report.Healthy {
+		t.Error("report.Healthy = false, want true")
+	}
+	circuit := readManagedDoltRecoveryCircuit(layout)
+	if !circuit.OpenUntil.IsZero() {
+		t.Errorf("OpenUntil = %v, want cleared after a healthy outcome", circuit.OpenUntil)
+	}
+	if circuit.ConsecutiveFailures != 2 || !circuit.LastFailureAt.Equal(lastFailure) {
+		t.Errorf("failure memory = %+v, want failures=2 at %v kept for flap hysteresis", circuit, lastFailure)
+	}
+}
+
+func TestRecoverManagedDolt_HealthySuccessSurvivesCircuitWriteFailure(t *testing.T) {
+	cityPath := setupRecoveryTestCity(t)
+	writeRecoveryRuntimeState(t, cityPath, 4321, 3306)
+	stubHealthyManagedDoltProbes(t)
+
+	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
+	if err != nil {
+		t.Fatalf("resolveManagedDoltRuntimeLayout: %v", err)
+	}
+	if err := writeManagedDoltRecoveryCircuit(layout, managedDoltRecoveryCircuit{
+		ConsecutiveFailures: 1,
+		LastFailureAt:       time.Now().Add(-time.Minute),
+		OpenUntil:           time.Now().Add(time.Hour),
+		LastError:           "prior failure",
+	}); err != nil {
+		t.Fatalf("writeManagedDoltRecoveryCircuit: %v", err)
+	}
+
+	oldWrite := writeManagedDoltRecoveryCircuitFn
+	writeManagedDoltRecoveryCircuitFn = func(_ managedDoltRuntimeLayout, _ managedDoltRecoveryCircuit) error {
+		return fmt.Errorf("disk full")
+	}
+	t.Cleanup(func() { writeManagedDoltRecoveryCircuitFn = oldWrite })
+
+	report, err := recoverManagedDoltProcess(cityPath, "3306", 5*time.Second)
+	if err != nil {
+		t.Fatalf("recoverManagedDoltProcess = %v, want nil: a failed circuit clear must not turn a successful recovery into a reported failure", err)
+	}
+	if !report.Healthy || !report.Ready {
+		t.Errorf("report = %+v, want Healthy=true Ready=true", report)
+	}
+}
+
+// TestRecoverManagedDolt_AutomaticStormHasAtMostOneOwner storms concurrent
+// automatic recoveries at one city. The flock coalesces concurrent callers
+// (losers observe and never queue for ownership) and the circuit stamped by
+// the first owner's attempt gates any straggler that grabs the freed lock, so
+// the destructive stop path must run exactly once and every caller must
+// return, non-healthy, within its own wait budget.
+//
+// The stop stub holds the owner until every other caller observes the held
+// flock, making the contention deterministic. The circuit still protects a caller scheduled
+// after the flock is released; that gate is pinned directly by
+// TestRecoverManagedDolt_FailedAttemptOpensCircuitForNextAutomatic.
+func TestRecoverManagedDolt_AutomaticStormHasAtMostOneOwner(t *testing.T) {
+	cityPath := setupRecoveryTestCity(t)
+	const stormSize = 8
+	var contendedCalls atomic.Int32
+	allContended := make(chan struct{})
+	var allContendedOnce sync.Once
+	ops := defaultManagedDoltRecoveryOps()
+	ops.queryProbe = func(_, _, _ string) error { return fmt.Errorf("connection refused") }
+	ops.contended = func() {
+		if contendedCalls.Add(1) >= stormSize-1 {
+			allContendedOnce.Do(func() { close(allContended) })
+		}
+	}
+
+	var stopCalls atomic.Int32
+	ops.stop = func(_, _ string) (managedDoltStopReport, error) {
+		stopCalls.Add(1)
+		// Keep the owner in the destructive phase until every caller has
+		// observed the held flock. Losers therefore contend while this owner
+		// still holds the flock, without relying on scheduler timing.
+		select {
+		case <-allContended:
+		case <-time.After(5 * time.Second):
+			return managedDoltStopReport{}, fmt.Errorf("storm: callers did not rendezvous")
+		}
+		return managedDoltStopReport{}, fmt.Errorf("storm: data dir still held")
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, stormSize)
+	reports := make([]managedDoltRecoverReport, stormSize)
+	start := time.Now()
+	for i := 0; i < stormSize; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			reports[i], errs[i] = recoverManagedDoltProcessWithOptionsAndOps(cityPath, "127.0.0.1", "3306", "root", "warning", 2*time.Second, managedDoltRecoverOptions{}, ops)
+		}(i)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	if got := stopCalls.Load(); got != 1 {
+		t.Errorf("stop ran %d times, want exactly one automatic owner across the storm", got)
+	}
+	if elapsed > 15*time.Second {
+		t.Errorf("storm drained in %v, want every loser bounded near its own 2s budget", elapsed)
+	}
+	for i := 0; i < stormSize; i++ {
+		if errs[i] == nil {
+			t.Fatalf("caller %d returned nil error; no storm caller can succeed", i)
+		}
+		if reports[i].Healthy || reports[i].Ready {
+			t.Errorf("caller %d reported healthy/ready during in-progress recovery: %+v", i, reports[i])
+		}
+		switch {
+		case errors.Is(errs[i], errManagedDoltRecoveryInProgress):
+		case errors.Is(errs[i], errManagedDoltRecoveryCircuitOpen):
+		case strings.Contains(errs[i].Error(), "storm: data dir still held"):
+		default:
+			t.Errorf("caller %d error = %v, want owner stop-abort, in-progress, or circuit-open", i, errs[i])
+		}
 	}
 }

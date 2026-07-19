@@ -230,7 +230,7 @@ func TestRecoverManagedDoltProcessWithPasswordReusesHealthyRealServer(t *testing
 		t.Fatalf("writeDoltRuntimeStateFile: %v", err)
 	}
 
-	report, err := recoverManagedDoltProcess(cityPath, "127.0.0.1", fmt.Sprintf("%d", port), "root", "warning", 10*time.Second)
+	report, err := recoverManagedDoltProcess(cityPath, fmt.Sprintf("%d", port), 10*time.Second)
 	if err != nil {
 		t.Fatalf("recoverManagedDoltProcess() error = %v", err)
 	}
