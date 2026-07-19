@@ -122,6 +122,9 @@ func WithState(cityPath string, fn func(*State) error) error {
 	if err := fn(&state); err != nil {
 		return err
 	}
+	if err := validateState(&state); err != nil {
+		return fmt.Errorf("validate mutated binding store: %w", err)
+	}
 	SortState(&state)
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {

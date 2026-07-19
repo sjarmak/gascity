@@ -80,6 +80,33 @@ func TestWithState_ErrorAbortsWrite(t *testing.T) {
 	}
 }
 
+func TestWithState_RejectsInvalidMutationWithoutWrite(t *testing.T) {
+	city := t.TempDir()
+	if err := WithState(city, func(s *State) error {
+		s.Bound = append(s.Bound, Binding{
+			WorkloadID: "gc-keep", Agent: "worker", ReservationRef: "rsv-keep",
+			Generation: 1, Attempt: 1, BoundAt: testTime(),
+		})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := WithState(city, func(s *State) error {
+		s.Bound[0].Generation = 0
+		return nil
+	}); err == nil {
+		t.Fatal("WithState error = nil, want post-callback validation error")
+	}
+	got, err := LoadState(city)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Bound) != 1 || got.Bound[0].Generation != 1 {
+		t.Fatalf("state = %+v, want original valid state", got)
+	}
+}
+
 func TestLoadState_CorruptFileErrors(t *testing.T) {
 	city := t.TempDir()
 	if err := WithState(city, func(_ *State) error { return nil }); err != nil {

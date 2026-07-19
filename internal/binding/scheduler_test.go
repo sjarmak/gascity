@@ -481,6 +481,46 @@ func TestRelease_StaleGenerationDoesNotRemoveRebind(t *testing.T) {
 	}
 }
 
+func TestRelease_RejectsActiveReservationOwnershipMismatch(t *testing.T) {
+	s, ledger, city := newTestScheduler(t)
+	b, err := s.Bind(context.Background(), BindRequest{Candidates: []ReadyWorkload{workload("gc-1", 1, 0)}, Caps: unlimited()})
+	if err != nil || b == nil {
+		t.Fatalf("Bind = %+v, err=%v", b, err)
+	}
+	if err := capacity.WithState(city, func(st *capacity.State) error {
+		st.Consumed[0].Agent = "other-worker"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Release(b.WorkloadID, b.Generation); err == nil {
+		t.Fatal("Release error = nil, want ownership mismatch")
+	}
+	state, stateErr := LoadState(city)
+	snap, snapErr := ledger.Snapshot()
+	if stateErr != nil || snapErr != nil {
+		t.Fatalf("reload: state err=%v ledger err=%v", stateErr, snapErr)
+	}
+	if len(state.Bound) != 1 || len(snap.Consumed) != 1 {
+		t.Fatalf("mismatched release mutated state: binding=%+v ledger=%+v", state, snap)
+	}
+}
+
+func TestBind_TimeNowClockPromotesSerializedIntent(t *testing.T) {
+	city := t.TempDir()
+	ledger := capacity.NewLedger(city)
+	s := NewScheduler(city, ledger, WithClock(time.Now))
+	b, err := s.Bind(context.Background(), BindRequest{Candidates: []ReadyWorkload{workload("gc-1", 1, 0)}, Caps: unlimited()})
+	if err != nil || b == nil {
+		t.Fatalf("Bind = %+v, err=%v", b, err)
+	}
+	state, err := LoadState(city)
+	if err != nil || len(state.Pending) != 0 || len(state.Bound) != 1 || !bindingsEqual(state.Bound[0], *b) {
+		t.Fatalf("state = %+v, err=%v; want promoted binding %+v", state, err, b)
+	}
+}
+
 // The Binding is durable: a scheduler that did not write it still sees it and
 // refuses to bind the workload a second time.
 func TestBind_BindingSurvivesFreshScheduler(t *testing.T) {
@@ -664,6 +704,8 @@ func TestBind_RequiresWorkloadIDAndAgent(t *testing.T) {
 		{"no id", ReadyWorkload{Agent: "worker"}},
 		{"no agent", ReadyWorkload{ID: "gc-1"}},
 		{"blank id", ReadyWorkload{ID: "  ", Agent: "worker"}},
+		{"negative prior generation", ReadyWorkload{ID: "gc-1", Agent: "worker", PriorGeneration: -1}},
+		{"negative prior attempt", ReadyWorkload{ID: "gc-1", Agent: "worker", PriorAttempt: -1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := s.Bind(context.Background(), BindRequest{
@@ -673,5 +715,32 @@ func TestBind_RequiresWorkloadIDAndAgent(t *testing.T) {
 				t.Fatal("Bind error = nil, want a validation error")
 			}
 		})
+	}
+}
+
+func TestBind_InvalidCandidateDoesNotRecoverOrConsumePendingIntent(t *testing.T) {
+	city := t.TempDir()
+	ledger := capacity.NewLedger(city, capacity.WithClock(testTime))
+	r, err := ledger.Reserve(context.Background(), capacity.ReserveRequest{WorkloadID: "gc-pending", Agent: "worker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WithState(city, func(st *State) error {
+		st.Pending = append(st.Pending, Binding{WorkloadID: "gc-pending", Agent: "worker", ReservationRef: r.ID, Generation: 1, Attempt: 1, BoundAt: testTime()})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s := NewScheduler(city, ledger, WithClock(testTime))
+	if _, err := s.Bind(context.Background(), BindRequest{Candidates: []ReadyWorkload{{ID: "gc-invalid", Agent: "worker", PriorGeneration: -1}}}); err == nil {
+		t.Fatal("Bind error = nil, want invalid candidate")
+	}
+	state, stateErr := LoadState(city)
+	snap, snapErr := ledger.Snapshot()
+	if stateErr != nil || snapErr != nil {
+		t.Fatalf("reload: state err=%v ledger err=%v", stateErr, snapErr)
+	}
+	if len(state.Pending) != 1 || len(state.Bound) != 0 || len(snap.Held) != 1 || len(snap.Consumed) != 0 {
+		t.Fatalf("invalid candidate mutated recovery state: binding=%+v ledger=%+v", state, snap)
 	}
 }

@@ -118,11 +118,11 @@ func NewScheduler(cityPath string, ledger *capacity.Ledger, opts ...Option) *Sch
 // batch, and a pass that binds one workload and loses the rest is exactly the
 // partial state this transition exists to make unreachable.
 func (s *Scheduler) Bind(ctx context.Context, req BindRequest) (*Binding, error) {
-	if err := s.Recover(); err != nil {
-		return nil, fmt.Errorf("recovering pending bindings: %w", err)
-	}
 	if err := validate(req.Candidates); err != nil {
 		return nil, err
+	}
+	if err := s.Recover(); err != nil {
+		return nil, fmt.Errorf("recovering pending bindings: %w", err)
 	}
 	// Clone before sorting: the caller's slice is theirs.
 	candidates := slices.Clone(req.Candidates)
@@ -167,6 +167,17 @@ func (s *Scheduler) Release(workloadID string, generation int) error {
 		b, ok := findBound(st, workloadID, generation)
 		if !ok {
 			return nil
+		}
+		snap, err := s.ledger.Snapshot()
+		if err != nil {
+			return fmt.Errorf("reading reservation %q for workload %q: %w", b.ReservationRef, workloadID, err)
+		}
+		r, ok := activeReservationByID(snap, b.ReservationRef)
+		if !ok {
+			return fmt.Errorf("binding: active reservation %q for workload %q is missing", b.ReservationRef, workloadID)
+		}
+		if !reservationOwnsBinding(r, b) {
+			return fmt.Errorf("binding: active reservation %q ownership contradicts workload %q generation %d", b.ReservationRef, workloadID, generation)
 		}
 		// Capacity's lock is taken inside this one, never the reverse. Ordering
 		// the release this way also means a failure here leaves the Binding
@@ -300,7 +311,7 @@ func (s *Scheduler) promote(want Binding) error {
 			if b.ReservationRef != want.ReservationRef {
 				continue
 			}
-			if b != want {
+			if !bindingsEqual(b, want) {
 				return fmt.Errorf("binding: pending reservation %q does not match generation being promoted", want.ReservationRef)
 			}
 			st.Pending = append(st.Pending[:i], st.Pending[i+1:]...)
@@ -308,7 +319,7 @@ func (s *Scheduler) promote(want Binding) error {
 			return nil
 		}
 		for _, b := range st.Bound {
-			if b == want {
+			if bindingsEqual(b, want) {
 				return nil // exact generation already promoted: recovery is idempotent
 			}
 		}
@@ -337,7 +348,7 @@ func (s *Scheduler) Recover() error {
 	}
 	for _, b := range state.Pending {
 		r, exists := reservations[b.ReservationRef]
-		if exists && (r.WorkloadID != b.WorkloadID || r.Agent != b.Agent || r.Rig != b.Rig || r.Provider != b.Provider) {
+		if exists && !reservationOwnsBinding(r, b) {
 			return fmt.Errorf("pending reservation %q is owned by workload %q at agent %q rig %q provider %q, not binding workload %q at agent %q rig %q provider %q",
 				b.ReservationRef, r.WorkloadID, r.Agent, r.Rig, r.Provider, b.WorkloadID, b.Agent, b.Rig, b.Provider)
 		}
@@ -380,6 +391,9 @@ func validate(ws []ReadyWorkload) error {
 		}
 		if strings.TrimSpace(w.Agent) == "" {
 			return fmt.Errorf("binding: candidate %q requires an agent", w.ID)
+		}
+		if w.PriorGeneration < 0 || w.PriorAttempt < 0 {
+			return fmt.Errorf("binding: candidate %q has negative prior generation %d or attempt %d", w.ID, w.PriorGeneration, w.PriorAttempt)
 		}
 	}
 	return nil
@@ -426,6 +440,30 @@ func findBound(s *State, workloadID string, generation int) (Binding, bool) {
 		}
 	}
 	return Binding{}, false
+}
+
+func bindingsEqual(a, b Binding) bool {
+	return a.WorkloadID == b.WorkloadID &&
+		a.Agent == b.Agent &&
+		a.Rig == b.Rig &&
+		a.Provider == b.Provider &&
+		a.ReservationRef == b.ReservationRef &&
+		a.Generation == b.Generation &&
+		a.Attempt == b.Attempt &&
+		a.BoundAt.Equal(b.BoundAt)
+}
+
+func reservationOwnsBinding(r capacity.Reservation, b Binding) bool {
+	return r.WorkloadID == b.WorkloadID && r.Agent == b.Agent && r.Rig == b.Rig && r.Provider == b.Provider
+}
+
+func activeReservationByID(snap capacity.Snapshot, id string) (capacity.Reservation, bool) {
+	for _, r := range snap.Consumed {
+		if r.ID == id {
+			return r, true
+		}
+	}
+	return capacity.Reservation{}, false
 }
 
 func removeGeneration(bs []Binding, workloadID string, generation int) []Binding {
