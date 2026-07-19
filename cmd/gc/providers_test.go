@@ -311,6 +311,67 @@ provider = "file"
 	}
 }
 
+// TestAuthoritativeBeadsProviderForScopeDetectsBdMetadataDespiteScopePinnedFile
+// reproduces the reopened gc-qxem regression: the live mayor environment
+// inherits BOTH GC_BEADS=file AND GC_BEADS_SCOPE_ROOT=<cityRoot> as ambient
+// session context. That non-empty scope pin matches the HQ bead's own resolved
+// store root, so the scoped override fired and returned "file" -- masking the
+// Dolt-backed HQ store and making `gc sling <bead> dr-*` report "bead not
+// found in city". Authoritative arbitrary-bead resolution must honor the
+// on-disk store identity even when an inherited session env scope-pins the
+// city provider. The earlier fix only covered the empty-scope-root case.
+func TestAuthoritativeBeadsProviderForScopeDetectsBdMetadataDespiteScopePinnedFile(t *testing.T) {
+	cityDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]
+name = "hq-demo"
+
+[beads]
+provider = "file"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"gc"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Non-empty scope pin matching the city root -- the exact live env shape.
+	setScopedBeadsProviderForTest(t, cityDir, "file")
+
+	if got := authoritativeBeadsProviderForScope(cityDir, cityDir); got != "bd" {
+		t.Fatalf("authoritativeBeadsProviderForScope(cityRoot) = %q, want bd metadata to outrank a scope-pinned ambient GC_BEADS=file", got)
+	}
+}
+
+// TestAuthoritativeBeadsProviderForScopePreservesCustomExecScopePin guards the
+// other side of the fix: a scope-pinned CUSTOM exec provider is a deliberate,
+// non-inferrable selection and must retain precedence even in authoritative
+// mode, regardless of any on-disk store marker at the scope root.
+func TestAuthoritativeBeadsProviderForScopePreservesCustomExecScopePin(t *testing.T) {
+	cityDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]
+name = "hq-demo"
+
+[beads]
+provider = "file"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"gc"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const customExec = "exec:/opt/custom/store.sh"
+	setScopedBeadsProviderForTest(t, cityDir, customExec)
+
+	if got := authoritativeBeadsProviderForScope(cityDir, cityDir); got != customExec {
+		t.Fatalf("authoritativeBeadsProviderForScope(cityRoot) = %q, want deliberate custom exec %q preserved", got, customExec)
+	}
+}
+
 // TestRawBeadsProviderForScopeCityRootWithoutMarkersKeepsConfiguredDefault is
 // the regression guard alongside the fix above: a city root that carries no
 // on-disk store marker at all (the common case -- no separate HQ Dolt store)

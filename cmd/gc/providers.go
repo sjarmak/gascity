@@ -575,6 +575,23 @@ func configuredBeadsProviderValue(cityPath string) string {
 	return strings.TrimSpace(peekBeadsProvider(filepath.Join(cityPath, "city.toml")))
 }
 
+// honorScopedOverride decides whether a matching GC_BEADS scope override wins
+// over the store's on-disk identity.
+//
+// Non-authoritative resolution describes the caller's own command scope, so a
+// matching override always wins. Authoritative resolution picks a store from an
+// arbitrary bead ID; there an inherited session env (GC_BEADS=file +
+// GC_BEADS_SCOPE_ROOT=<cityRoot>) is ambient context, not a statement about the
+// selected bead's store, and must not mask a Dolt-backed HQ store. A custom exec
+// provider is the exception: it is a deliberate, non-inferrable selection with
+// no on-disk marker to fall back to, so it retains precedence in both modes.
+func honorScopedOverride(cityPath, provider string, authoritative bool) bool {
+	if !authoritative {
+		return true
+	}
+	return strings.HasPrefix(normalizeRawBeadsProvider(cityPath, provider), "exec:")
+}
+
 func scopedBeadsProviderOverride(cityPath, scopeRoot string) (string, bool) {
 	provider := strings.TrimSpace(os.Getenv("GC_BEADS"))
 	if provider == "" {
@@ -675,7 +692,7 @@ func resolveRawBeadsProviderForScope(scopeRoot, cityPath string, authoritative b
 		runtimeCityPath = cityForStoreDir(scopeRoot)
 	}
 	resolvedScopeRoot := resolveStoreScopeRoot(runtimeCityPath, scopeRoot)
-	if explicit, ok := scopedBeadsProviderOverride(runtimeCityPath, resolvedScopeRoot); ok && (!authoritative || strings.TrimSpace(os.Getenv("GC_BEADS_SCOPE_ROOT")) != "") {
+	if explicit, ok := scopedBeadsProviderOverride(runtimeCityPath, resolvedScopeRoot); ok && honorScopedOverride(runtimeCityPath, explicit, authoritative) {
 		return normalizeRawBeadsProvider(runtimeCityPath, explicit)
 	}
 	provider := rawBeadsProvider(runtimeCityPath)
