@@ -111,11 +111,10 @@ func TestSortState_DeterministicOrder(t *testing.T) {
 }
 
 func TestStatePath_UsesCityRuntimeRoot(t *testing.T) {
-	// Sibling of the nudge queue's .gc/nudges, per citylayout.RuntimeRoot.
-	if got := StatePath("/city"); got != "/city/.gc/capacity/state.json" {
+	if got := StatePath("/city"); got != "/city/.gc/runtime/capacity/state.json" {
 		t.Fatalf("StatePath = %q", got)
 	}
-	if got := LockPath("/city"); got != "/city/.gc/capacity/state.lock" {
+	if got := LockPath("/city"); got != "/city/.gc/runtime/capacity/state.lock" {
 		t.Fatalf("LockPath = %q", got)
 	}
 }

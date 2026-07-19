@@ -261,6 +261,7 @@ func (l *Ledger) commit(req ReserveRequest, account string) (Reservation, error)
 func (l *Ledger) Consume(id string) error {
 	var missing bool
 	err := WithState(l.cityPath, func(s *State) error {
+		reclaimExpired(s, l.now())
 		for _, r := range s.Consumed {
 			if r.ID == id {
 				return nil // already consumed
@@ -323,6 +324,7 @@ func (l *Ledger) Snapshot() (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
+	reclaimExpired(&state, l.now())
 	snap := Snapshot{
 		Held:      state.Held,
 		Consumed:  state.Consumed,
@@ -435,7 +437,7 @@ func reclaimExpired(s *State, now time.Time) []Reservation {
 		reclaimed []Reservation
 	)
 	for _, r := range s.Held {
-		if !r.ExpiresAt.IsZero() && now.After(r.ExpiresAt) {
+		if !r.ExpiresAt.IsZero() && !now.Before(r.ExpiresAt) {
 			reclaimed = append(reclaimed, r)
 			continue
 		}

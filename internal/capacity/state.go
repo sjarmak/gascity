@@ -140,10 +140,10 @@ func LoadState(cityPath string) (State, error) {
 
 // StatePath returns the persisted ledger path for a city.
 func StatePath(cityPath string) string {
-	return citylayout.RuntimePath(cityPath, "capacity", "state.json")
+	return citylayout.RuntimePath(cityPath, "runtime", "capacity", "state.json")
 }
 
 // LockPath returns the ledger lock path for a city.
 func LockPath(cityPath string) string {
-	return citylayout.RuntimePath(cityPath, "capacity", "state.lock")
+	return citylayout.RuntimePath(cityPath, "runtime", "capacity", "state.lock")
 }

@@ -284,6 +284,26 @@ func TestConsume_IsIdempotent(t *testing.T) {
 	}
 }
 
+func TestConsume_ExpiredReservationErrors(t *testing.T) {
+	l, clk := newTestLedger(t, WithTTL(time.Minute))
+	r, err := l.Reserve(context.Background(), req("gc-1", "worker", Caps{}))
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	clk.advance(time.Minute)
+
+	if err := l.Consume(r.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Consume expired reservation: err = %v, want ErrNotFound", err)
+	}
+	snap, err := l.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snap.Total != 0 {
+		t.Fatalf("Total = %d, want 0 after expired consume", snap.Total)
+	}
+}
+
 func TestRelease_FreesCapacity(t *testing.T) {
 	l, _ := newTestLedger(t)
 	ctx := context.Background()
@@ -496,6 +516,22 @@ func TestSnapshot_CountsByScope(t *testing.T) {
 	}
 	if snap.ByRig["gascity"] != 2 || snap.ByRig["beads"] != 1 {
 		t.Fatalf("ByRig = %v", snap.ByRig)
+	}
+}
+
+func TestSnapshot_ExcludesExpiredHolds(t *testing.T) {
+	l, clk := newTestLedger(t, WithTTL(time.Minute))
+	if _, err := l.Reserve(context.Background(), req("gc-1", "worker", Caps{})); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	clk.advance(time.Minute)
+
+	snap, err := l.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snap.Total != 0 || len(snap.Held) != 0 {
+		t.Fatalf("snapshot = %+v, want expired hold excluded", snap)
 	}
 }
 
