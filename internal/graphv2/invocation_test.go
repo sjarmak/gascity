@@ -119,6 +119,19 @@ func TestNormalizeInputConvoyReusesLiveSyntheticConvoy(t *testing.T) {
 	}
 }
 
+func TestInputConvoyLockKeyMatchesPersistedIdentity(t *testing.T) {
+	base := InputConvoyLockKey(" target ", " work ")
+	if base != InputConvoyLockKey("target", "work") {
+		t.Fatal("lock key does not canonicalize the persisted target+formula identity")
+	}
+	if base == InputConvoyLockKey("target:work", "") {
+		t.Fatal("lock key aliases distinct target+formula tuples")
+	}
+	if base == InputConvoyLockKey("target", "other") {
+		t.Fatal("lock key does not distinguish formulas")
+	}
+}
+
 // TestNormalizeInputConvoyRepairsMissingTrackOnReuse covers the convoy that
 // exists but tracks nothing, which reuse newly makes reachable: creating the
 // convoy and tracking its target are separate writes, so a failure between them

@@ -1155,7 +1155,7 @@ func prepareGraphV2FormulaInvocation(ctx context.Context, formulaName, targetID 
 		// section. Root materialization has its own RootKey lock downstream;
 		// this earlier chokepoint ensures every caller derives that same key.
 		err = sourceworkflow.WithLock(ctx, deps.CityPath, sourceWorkflowLockScope(deps),
-			graphv2.InputConvoyLockKey(targetID, formulaName, opts.ScopeKind, opts.ScopeRef), prepare)
+			graphv2.InputConvoyLockKey(targetID, formulaName), prepare)
 	}
 	if err != nil {
 		return graphv2.Invocation{}, false, err
