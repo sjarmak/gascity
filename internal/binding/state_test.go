@@ -1,8 +1,10 @@
 package binding
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -54,7 +56,7 @@ func TestWithState_ErrorAbortsWrite(t *testing.T) {
 	now := testTime()
 
 	if err := WithState(city, func(s *State) error {
-		s.Bound = append(s.Bound, Binding{WorkloadID: "gc-keep", BoundAt: now})
+		s.Bound = append(s.Bound, Binding{WorkloadID: "gc-keep", Agent: "worker", ReservationRef: "rsv-keep", Generation: 1, Attempt: 1, BoundAt: now})
 		return nil
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -62,7 +64,7 @@ func TestWithState_ErrorAbortsWrite(t *testing.T) {
 
 	sentinel := errors.New("boom")
 	err := WithState(city, func(s *State) error {
-		s.Bound = append(s.Bound, Binding{WorkloadID: "gc-discard", BoundAt: now})
+		s.Bound = append(s.Bound, Binding{WorkloadID: "gc-discard", Agent: "worker", ReservationRef: "rsv-discard", Generation: 1, Attempt: 1, BoundAt: now})
 		return sentinel
 	})
 	if !errors.Is(err, sentinel) {
@@ -88,6 +90,40 @@ func TestLoadState_CorruptFileErrors(t *testing.T) {
 	}
 	if _, err := LoadState(city); err == nil {
 		t.Fatal("LoadState error = nil, want parse error (must not silently unbind every workload)")
+	}
+}
+
+func TestLoadState_RejectsContradictoryState(t *testing.T) {
+	valid := func(workload, reservation string) Binding {
+		return Binding{WorkloadID: workload, Agent: "worker", ReservationRef: reservation, Generation: 1, Attempt: 1, BoundAt: testTime()}
+	}
+	for _, tc := range []struct {
+		name  string
+		state State
+	}{
+		{"duplicate reservation refs", State{Bound: []Binding{valid("gc-1", "rsv-1"), valid("gc-2", "rsv-1")}}},
+		{"duplicate workload in bucket", State{Bound: []Binding{valid("gc-1", "rsv-1"), valid("gc-1", "rsv-2")}}},
+		{"duplicate workload across buckets", State{Pending: []Binding{valid("gc-1", "rsv-1")}, Bound: []Binding{valid("gc-1", "rsv-2")}}},
+		{"missing required field", State{Bound: []Binding{{WorkloadID: "gc-1", Agent: "worker", Generation: 1, Attempt: 1, BoundAt: testTime()}}}},
+		{"invalid generation", State{Bound: []Binding{{WorkloadID: "gc-1", Agent: "worker", ReservationRef: "rsv-1", Attempt: 1, BoundAt: testTime()}}}},
+		{"invalid attempt", State{Bound: []Binding{{WorkloadID: "gc-1", Agent: "worker", ReservationRef: "rsv-1", Generation: 1, BoundAt: testTime()}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			city := t.TempDir()
+			if err := os.MkdirAll(filepath.Dir(StatePath(city)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			data, err := json.Marshal(tc.state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(StatePath(city), data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadState(city); err == nil {
+				t.Fatalf("LoadState(%s) error = nil, want fail-closed validation", data)
+			}
+		})
 	}
 }
 

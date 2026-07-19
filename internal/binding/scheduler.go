@@ -150,16 +150,21 @@ func (s *Scheduler) Bind(ctx context.Context, req BindRequest) (*Binding, error)
 	return nil, nil
 }
 
-// Release drops a workload's Binding and returns its unit of capacity. It is
+// Release drops the named generation of a workload's active Binding and
+// returns its unit of capacity. It is
 // the seam a terminal outcome or a retry calls; the decision to call it
 // belongs to those paths, not to this one.
 //
 // Release is idempotent and treats an unbound workload as success: the
 // recovery scan that calls it is at-least-once, and failing a second call
 // would turn a healthy repair into a spurious error.
-func (s *Scheduler) Release(workloadID string) error {
+// A stale release cannot remove a later generation, and an in-flight pending
+// generation is not executable yet, so Release does not cancel it. This makes
+// a successful Bind return a fence that no concurrent release issued before
+// promotion can invalidate.
+func (s *Scheduler) Release(workloadID string, generation int) error {
 	return WithState(s.cityPath, func(st *State) error {
-		b, ok := findLive(st, workloadID)
+		b, ok := findBound(st, workloadID, generation)
 		if !ok {
 			return nil
 		}
@@ -170,8 +175,7 @@ func (s *Scheduler) Release(workloadID string) error {
 		if err := s.ledger.Release(b.ReservationRef); err != nil {
 			return fmt.Errorf("releasing reservation %q for workload %q: %w", b.ReservationRef, workloadID, err)
 		}
-		st.Pending = removeByWorkload(st.Pending, workloadID)
-		st.Bound = removeByWorkload(st.Bound, workloadID)
+		st.Bound = removeGeneration(st.Bound, workloadID, generation)
 		return nil
 	})
 }
@@ -274,7 +278,7 @@ func (s *Scheduler) commit(w ReadyWorkload, rsv capacity.Reservation) (*Binding,
 	if err := s.hit(crashAfterConsume); err != nil {
 		return nil, err
 	}
-	if err := s.promote(rsv.ID); err != nil {
+	if err := s.promote(out); err != nil {
 		return nil, err
 	}
 	if err := s.hit(crashAfterActive); err != nil {
@@ -290,19 +294,25 @@ func (s *Scheduler) hit(point crashPoint) error {
 	return s.crash(point)
 }
 
-func (s *Scheduler) promote(reservationID string) error {
+func (s *Scheduler) promote(want Binding) error {
 	return WithState(s.cityPath, func(st *State) error {
 		for i, b := range st.Pending {
-			if b.ReservationRef != reservationID {
+			if b.ReservationRef != want.ReservationRef {
 				continue
 			}
-			st.Pending = append(st.Pending[:i], st.Pending[i+1:]...)
-			if _, exists := findLive(st, b.WorkloadID); !exists {
-				st.Bound = append(st.Bound, b)
+			if b != want {
+				return fmt.Errorf("binding: pending reservation %q does not match generation being promoted", want.ReservationRef)
 			}
+			st.Pending = append(st.Pending[:i], st.Pending[i+1:]...)
+			st.Bound = append(st.Bound, b)
 			return nil
 		}
-		return nil // already promoted: recovery is idempotent
+		for _, b := range st.Bound {
+			if b == want {
+				return nil // exact generation already promoted: recovery is idempotent
+			}
+		}
+		return fmt.Errorf("binding: reservation %q has neither its pending nor exact active generation", want.ReservationRef)
 	})
 }
 
@@ -314,7 +324,32 @@ func (s *Scheduler) Recover() error {
 	if err != nil {
 		return err
 	}
+	snap, err := s.ledger.Snapshot()
+	if err != nil {
+		return fmt.Errorf("reading capacity reservations: %w", err)
+	}
+	reservations := make(map[string]capacity.Reservation, snap.Total)
+	for _, r := range append(slices.Clone(snap.Held), snap.Consumed...) {
+		if _, duplicate := reservations[r.ID]; duplicate {
+			return fmt.Errorf("capacity reservation %q appears more than once", r.ID)
+		}
+		reservations[r.ID] = r
+	}
 	for _, b := range state.Pending {
+		r, exists := reservations[b.ReservationRef]
+		if exists && (r.WorkloadID != b.WorkloadID || r.Agent != b.Agent || r.Rig != b.Rig || r.Provider != b.Provider) {
+			return fmt.Errorf("pending reservation %q is owned by workload %q at agent %q rig %q provider %q, not binding workload %q at agent %q rig %q provider %q",
+				b.ReservationRef, r.WorkloadID, r.Agent, r.Rig, r.Provider, b.WorkloadID, b.Agent, b.Rig, b.Provider)
+		}
+		if !exists {
+			if err := WithState(s.cityPath, func(st *State) error {
+				st.Pending = removeByReservation(st.Pending, b.ReservationRef)
+				return nil
+			}); err != nil {
+				return err
+			}
+			continue
+		}
 		err := s.ledger.Consume(b.ReservationRef)
 		if errors.Is(err, capacity.ErrNotFound) {
 			if err := WithState(s.cityPath, func(st *State) error {
@@ -328,7 +363,7 @@ func (s *Scheduler) Recover() error {
 		if err != nil {
 			return fmt.Errorf("consuming pending reservation %q: %w", b.ReservationRef, err)
 		}
-		if err := s.promote(b.ReservationRef); err != nil {
+		if err := s.promote(b); err != nil {
 			return fmt.Errorf("promoting pending reservation %q: %w", b.ReservationRef, err)
 		}
 	}
@@ -384,10 +419,19 @@ func isCapacityRejection(err error) bool {
 	return false
 }
 
-func removeByWorkload(bs []Binding, workloadID string) []Binding {
+func findBound(s *State, workloadID string, generation int) (Binding, bool) {
+	for _, b := range s.Bound {
+		if b.WorkloadID == workloadID && b.Generation == generation {
+			return b, true
+		}
+	}
+	return Binding{}, false
+}
+
+func removeGeneration(bs []Binding, workloadID string, generation int) []Binding {
 	out := bs[:0]
 	for _, b := range bs {
-		if b.WorkloadID != workloadID {
+		if b.WorkloadID != workloadID || b.Generation != generation {
 			out = append(out, b)
 		}
 	}

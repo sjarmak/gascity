@@ -343,7 +343,7 @@ func TestRelease_ReturnsCapacityAndAllowsRebind(t *testing.T) {
 		t.Fatal("Bind = nil, want a binding")
 	}
 
-	if err := s.Release("gc-1"); err != nil {
+	if err := s.Release("gc-1", first.Generation); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 
@@ -380,7 +380,7 @@ func TestRelease_ReturnsCapacityAndAllowsRebind(t *testing.T) {
 func TestRelease_UnknownWorkloadIsNoOp(t *testing.T) {
 	s, _, _ := newTestScheduler(t)
 
-	if err := s.Release("gc-never-bound"); err != nil {
+	if err := s.Release("gc-never-bound", 1); err != nil {
 		t.Fatalf("Release unknown: %v", err)
 	}
 
@@ -394,11 +394,90 @@ func TestRelease_UnknownWorkloadIsNoOp(t *testing.T) {
 	if got == nil {
 		t.Fatal("Bind = nil, want a binding")
 	}
-	if err := s.Release("gc-1"); err != nil {
+	if err := s.Release("gc-1", got.Generation); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
-	if err := s.Release("gc-1"); err != nil {
+	if err := s.Release("gc-1", got.Generation); err != nil {
 		t.Fatalf("second Release: %v", err)
+	}
+}
+
+func TestBind_ConcurrentReleaseAfterConsumeCannotInvalidateReturn(t *testing.T) {
+	city := t.TempDir()
+	ledger := capacity.NewLedger(city, capacity.WithClock(testTime))
+	consumed := make(chan struct{})
+	resume := make(chan struct{})
+	s := NewScheduler(city, ledger, WithClock(testTime), withCrashHook(func(point crashPoint) error {
+		if point == crashAfterConsume {
+			close(consumed)
+			<-resume
+		}
+		return nil
+	}))
+
+	type result struct {
+		binding *Binding
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		b, err := s.Bind(context.Background(), BindRequest{
+			Candidates: []ReadyWorkload{workload("gc-1", 1, 0)},
+			Caps:       unlimited(),
+		})
+		done <- result{binding: b, err: err}
+	}()
+	<-consumed
+
+	// Generation 1 exists only as pending at this point. It is not executable,
+	// so a terminal release cannot legitimately target it and must not cancel
+	// the promotion that makes Bind's return value usable.
+	if err := s.Release("gc-1", 1); err != nil {
+		t.Fatalf("Release during promotion: %v", err)
+	}
+	close(resume)
+	got := <-done
+	if got.err != nil || got.binding == nil {
+		t.Fatalf("Bind = %+v, err=%v", got.binding, got.err)
+	}
+	state, err := LoadState(city)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Pending) != 0 || len(state.Bound) != 1 || state.Bound[0] != *got.binding {
+		t.Fatalf("state = %+v, want exact returned binding active", state)
+	}
+	snap, err := ledger.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Consumed) != 1 || snap.Consumed[0].ID != got.binding.ReservationRef {
+		t.Fatalf("ledger = %+v, want returned binding's consumed reservation", snap)
+	}
+}
+
+func TestRelease_StaleGenerationDoesNotRemoveRebind(t *testing.T) {
+	s, _, _ := newTestScheduler(t)
+	req := BindRequest{Candidates: []ReadyWorkload{workload("gc-1", 1, 0)}, Caps: unlimited()}
+	first, err := s.Bind(context.Background(), req)
+	if err != nil || first == nil {
+		t.Fatalf("first Bind = %+v, err=%v", first, err)
+	}
+	if err := s.Release("gc-1", first.Generation); err != nil {
+		t.Fatal(err)
+	}
+	req.Candidates[0].PriorGeneration = first.Generation
+	req.Candidates[0].PriorAttempt = first.Attempt
+	second, err := s.Bind(context.Background(), req)
+	if err != nil || second == nil {
+		t.Fatalf("second Bind = %+v, err=%v", second, err)
+	}
+	if err := s.Release("gc-1", first.Generation); err != nil {
+		t.Fatal(err)
+	}
+	state, err := LoadState(s.cityPath)
+	if err != nil || len(state.Bound) != 1 || state.Bound[0] != *second {
+		t.Fatalf("state after stale release = %+v, err=%v; want generation %d", state, err, second.Generation)
 	}
 }
 
@@ -544,6 +623,34 @@ func TestRecover_ReclaimedPendingIntentAllowsFreshBind(t *testing.T) {
 	state, err = LoadState(city)
 	if err != nil || len(state.Pending) != 0 || len(state.Bound) != 1 {
 		t.Fatalf("recovered state = %+v, err=%v", state, err)
+	}
+}
+
+func TestRecover_RejectsPendingReservationOwnedByDifferentPlacementWithoutMutation(t *testing.T) {
+	city := t.TempDir()
+	ledger := capacity.NewLedger(city, capacity.WithClock(testTime), capacity.WithIDFunc(func() (string, error) { return "rsv-1", nil }))
+	r, err := ledger.Reserve(context.Background(), capacity.ReserveRequest{WorkloadID: "gc-owner", Agent: "owner", Rig: "rig-a", Provider: "provider-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WithState(city, func(st *State) error {
+		st.Pending = append(st.Pending, Binding{WorkloadID: "gc-other", Agent: "other", Rig: "rig-b", Provider: "provider-b", ReservationRef: r.ID, Generation: 1, Attempt: 1, BoundAt: testTime()})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewScheduler(city, ledger, WithClock(testTime))
+	if err := s.Recover(); err == nil {
+		t.Fatal("Recover error = nil, want ownership mismatch")
+	}
+	state, stateErr := LoadState(city)
+	snap, snapErr := ledger.Snapshot()
+	if stateErr != nil || snapErr != nil {
+		t.Fatalf("reload: state err=%v ledger err=%v", stateErr, snapErr)
+	}
+	if len(state.Pending) != 1 || len(state.Bound) != 0 || len(snap.Held) != 1 || len(snap.Consumed) != 0 {
+		t.Fatalf("ambiguous recovery mutated state: binding=%+v ledger=%+v", state, snap)
 	}
 }
 

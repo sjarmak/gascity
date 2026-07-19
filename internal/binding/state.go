@@ -88,6 +88,9 @@ func sortBindings(bindings []Binding) {
 // WithState locks, loads, mutates, and atomically rewrites the binding store.
 // A non-nil error from fn abandons the write entirely, which is the rollback
 // primitive Bind relies on to refuse a binding without disturbing the store.
+// The atomic rename protects readers and process-crash recovery; this package
+// does not claim power-loss durability because WriteFileAtomic does not fsync
+// the file and containing directory.
 //
 // Callers that also take the capacity ledger's lock must take this one first.
 // The lock order is binding outer, capacity inner, never reversed.
@@ -148,8 +151,36 @@ func LoadState(cityPath string) (State, error) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return State{}, fmt.Errorf("parse binding store: %w", err)
 	}
+	if err := validateState(&state); err != nil {
+		return State{}, fmt.Errorf("validate binding store: %w", err)
+	}
 	SortState(&state)
 	return state, nil
+}
+
+func validateState(state *State) error {
+	workloads := make(map[string]string, len(state.Pending)+len(state.Bound))
+	reservations := make(map[string]string, len(state.Pending)+len(state.Bound))
+	for bucket, bindings := range map[string][]Binding{"pending": state.Pending, "bound": state.Bound} {
+		for i, b := range bindings {
+			where := fmt.Sprintf("%s[%d]", bucket, i)
+			if b.WorkloadID == "" || b.Agent == "" || b.ReservationRef == "" || b.BoundAt.IsZero() {
+				return fmt.Errorf("%s is missing a required field", where)
+			}
+			if b.Generation < 1 || b.Attempt < 1 {
+				return fmt.Errorf("%s has invalid generation %d or attempt %d", where, b.Generation, b.Attempt)
+			}
+			if prior, ok := workloads[b.WorkloadID]; ok {
+				return fmt.Errorf("workload %q appears in both %s and %s", b.WorkloadID, prior, where)
+			}
+			workloads[b.WorkloadID] = where
+			if prior, ok := reservations[b.ReservationRef]; ok {
+				return fmt.Errorf("reservation %q appears in both %s and %s", b.ReservationRef, prior, where)
+			}
+			reservations[b.ReservationRef] = where
+		}
+	}
+	return nil
 }
 
 // StatePath returns the persisted binding store path for a city.
