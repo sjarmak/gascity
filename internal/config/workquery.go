@@ -430,14 +430,18 @@ var queryTable = map[queryKind]querySpec{
 // stores) — while gc.disarmed is an operator-set do-not-execute flag that
 // must hold over any shape.
 //
-// Non-array output passes through untouched (the guard cannot know a custom
-// shape), and an override failure propagates its own exit code instead of
-// being masked by the jq stage. jq errors deliberately stay on stderr: this
-// is a trust boundary, and a malformed row set should surface, not read as
-// "no work".
+// Output the guard cannot filter passes through untouched: non-array JSON via
+// the jq conditional, and non-JSON via the fallback when jq fails — some bd
+// versions print a plain-text "No ready work found" line with exit 0 instead
+// of "[]" (see workQueryHasReadyWork in cmd/gc), and that documented no-work
+// signal must survive the guard rather than become a jq parse error. The jq
+// stage is silenced and failure-tolerant like the built-in tiers' jq stages;
+// an override failure still propagates its own exit code before jq runs.
 func disarmGuardedOverride(override string) string {
 	filter := `if type == "array" then [.[] | select(` + notDisarmedSelectPredicateJQ() + `)] else . end`
-	script := `out=$(` + override + `) || exit $?; printf "%s" "$out" | jq -c ` + shellquote.Quote(filter)
+	script := `out=$(` + override + `) || exit $?; ` +
+		`filtered=$(printf "%s" "$out" | jq -c ` + shellquote.Quote(filter) + ` 2>/dev/null) && ` +
+		`printf "%s" "$filtered" || printf "%s" "$out"`
 	return shellquote.Join([]string{"sh", "-c", script})
 }
 

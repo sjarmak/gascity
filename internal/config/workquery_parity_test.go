@@ -804,6 +804,17 @@ func TestRowQueryOverrideGuardShape(t *testing.T) {
 		}
 	})
 
+	t.Run("plain-text no-work passthrough", func(t *testing.T) {
+		// Some bd versions print this literal with exit 0 instead of "[]";
+		// workQueryHasReadyWork (cmd/gc) treats it as a no-work signal. The
+		// guard must pass it through, not turn it into a jq parse failure.
+		a := &Agent{Name: "worker", WorkQuery: `printf '%s' 'No ready work found'`}
+		out := runShellWithFakeBd(t, a.EffectiveWorkQuery(), nil, "#!/bin/sh\nprintf '[]'\n")
+		if got := strings.TrimSpace(out); got != "No ready work found" {
+			t.Fatalf("plain-text override output = %q, want the bd no-work line passed through", got)
+		}
+	})
+
 	t.Run("failure propagates", func(t *testing.T) {
 		a := &Agent{Name: "worker", WorkQuery: "exit 3"}
 		err := exec.Command("sh", "-c", a.EffectiveWorkQuery()).Run()
