@@ -358,7 +358,7 @@ func ValidateNoReservedUserVars(vars map[string]string) error {
 // convoy per target alone would make a second formula at the same target look
 // like a competing workflow and be rejected.
 func InputConvoyInvocationKey(targetID, formulaName string) string {
-	return inputConvoyInvocationPrefix + strings.TrimSpace(targetID) + ":" + strings.TrimSpace(formulaName)
+	return inputConvoyInvocationPrefix + inputConvoyTupleHash(targetID, formulaName)
 }
 
 // InputConvoyLockKey is the cross-process launch-lock identity for the same
@@ -366,6 +366,10 @@ func InputConvoyInvocationKey(targetID, formulaName string) string {
 // deliberately does not participate: it differentiates workflow RootKeys,
 // while every such workflow shares one synthetic input convoy.
 func InputConvoyLockKey(targetID, formulaName string) string {
+	return inputConvoyInvocationPrefix + "lock:" + inputConvoyTupleHash(targetID, formulaName)
+}
+
+func inputConvoyTupleHash(targetID, formulaName string) string {
 	targetID = strings.TrimSpace(targetID)
 	formulaName = strings.TrimSpace(formulaName)
 	h := sha256.New()
@@ -375,7 +379,7 @@ func InputConvoyLockKey(targetID, formulaName string) string {
 		_, _ = fmt.Fprintf(h, "%d:", len(value))
 		_, _ = h.Write([]byte(value))
 	}
-	return inputConvoyInvocationPrefix + "lock:" + hex.EncodeToString(h.Sum(nil))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // NormalizeInputConvoy returns targetID when it is already a convoy, otherwise

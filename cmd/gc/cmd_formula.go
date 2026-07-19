@@ -673,54 +673,56 @@ conflicting live workflow from the same source is an error.`,
 						if err := decorateFormulaCookGraphV2Recipe(recipe, cookVars, storeRef, scope.rig, store, loadedCityName(cfg, cityPath), cityPath, cfg); err != nil {
 							return fmt.Errorf("decorate formulas v2 recipe: %w", err)
 						}
-						if graphRootKey != "" {
-							unlock := graphv2.LockKey(graphRootKey)
-							defer unlock()
-						}
-						if err := closeFormulaCookFailedGraphV2Roots(store, recipe); err != nil {
-							return err
-						}
-						existing, err := existingFormulaCookGraphV2Root(store, recipe)
-						if err != nil {
-							return err
-						}
-						if existing != nil {
-							result = existing
+						// Match sling's cross-process RootKey lock. The outer input-convoy
+						// lock makes convoy selection atomic; this inner lock makes the
+						// existing-root check and materialization atomic with sling and
+						// other CLI processes.
+						return sourceworkflow.WithLock(cmd.Context(), cityPath, sourceWorkflowLockScopeForStoreRef(cityPath, cfg, scope.storeRoot, storeRef), graphRootKey, func() error {
+							if err := closeFormulaCookFailedGraphV2Roots(store, recipe); err != nil {
+								return err
+							}
+							existing, err := existingFormulaCookGraphV2Root(store, recipe)
+							if err != nil {
+								return err
+							}
+							if existing != nil {
+								result = existing
+								return ensureFormulaCookAttachDep(store, attach, result.RootID)
+							}
+							if roots, err := formulaCookLiveInputConvoyGraphRoots(store, inv.InputConvoy, graphRootKey); err != nil {
+								return err
+							} else if len(roots) > 0 {
+								return &sourceworkflow.ConflictError{
+									SourceBeadID: attach,
+									WorkflowIDs:  sourceworkflow.BlockingWorkflowIDs(roots),
+								}
+							}
+							if roots, err := sourceworkflow.ListLiveRoots(store, attach, storeRef, storeRef); err != nil {
+								return fmt.Errorf("checking live workflows for %s: %w", attach, err)
+							} else if len(roots) > 0 {
+								return &sourceworkflow.ConflictError{
+									SourceBeadID: attach,
+									WorkflowIDs:  sourceworkflow.BlockingWorkflowIDs(roots),
+								}
+							}
+							source, err := store.Get(attach)
+							if err != nil {
+								return fmt.Errorf("attach bead %s: %w", attach, err)
+							}
+							result, err = molecule.Instantiate(cmd.Context(), store, recipe, molecule.Options{
+								Title:            title,
+								Vars:             cookVars,
+								IdempotencyKey:   graphRootKey,
+								PriorityOverride: cloneFormulaCookPriority(source.Priority),
+							})
+							if err != nil {
+								if cleanupErr := closeFormulaCookFailedGraphV2Roots(store, recipe); cleanupErr != nil {
+									return errors.Join(err, cleanupErr)
+								}
+								return err
+							}
 							return ensureFormulaCookAttachDep(store, attach, result.RootID)
-						}
-						if roots, err := formulaCookLiveInputConvoyGraphRoots(store, inv.InputConvoy, graphRootKey); err != nil {
-							return err
-						} else if len(roots) > 0 {
-							return &sourceworkflow.ConflictError{
-								SourceBeadID: attach,
-								WorkflowIDs:  sourceworkflow.BlockingWorkflowIDs(roots),
-							}
-						}
-						if roots, err := sourceworkflow.ListLiveRoots(store, attach, storeRef, storeRef); err != nil {
-							return fmt.Errorf("checking live workflows for %s: %w", attach, err)
-						} else if len(roots) > 0 {
-							return &sourceworkflow.ConflictError{
-								SourceBeadID: attach,
-								WorkflowIDs:  sourceworkflow.BlockingWorkflowIDs(roots),
-							}
-						}
-						source, err := store.Get(attach)
-						if err != nil {
-							return fmt.Errorf("attach bead %s: %w", attach, err)
-						}
-						result, err = molecule.Instantiate(cmd.Context(), store, recipe, molecule.Options{
-							Title:            title,
-							Vars:             cookVars,
-							IdempotencyKey:   graphRootKey,
-							PriorityOverride: cloneFormulaCookPriority(source.Priority),
 						})
-						if err != nil {
-							if cleanupErr := closeFormulaCookFailedGraphV2Roots(store, recipe); cleanupErr != nil {
-								return errors.Join(err, cleanupErr)
-							}
-							return err
-						}
-						return ensureFormulaCookAttachDep(store, attach, result.RootID)
 					})
 					if err != nil {
 						return formulaCommandError(stderr, "gc formula cook", jsonOutput, err)
