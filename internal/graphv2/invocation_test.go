@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	convoycore "github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/formulatest"
@@ -209,37 +210,54 @@ func TestNormalizeInputConvoyDoesNotReuseTerminalConvoy(t *testing.T) {
 	}
 }
 
-// TestNormalizeInputConvoyConcurrentCallersConverge covers the simultaneous
-// shape the sequential lookup alone cannot: several callers that all miss the
-// lookup must still agree on one convoy, because RootKey stability — and so the
-// root file lock downstream — depends on every caller deriving the same ID.
-func TestNormalizeInputConvoyConcurrentCallersConverge(t *testing.T) {
+// TestNormalizeInputConvoyRejectsMultipleLiveCandidates proves normalization
+// no longer performs an unstable CreatedAt/ID election. Cross-process callers
+// are serialized before this function; if legacy corruption presents two live
+// candidates, their clock and ID ordering must not select a winner.
+func TestNormalizeInputConvoyRejectsMultipleLiveCandidates(t *testing.T) {
 	store := beads.NewMemStore()
 	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
 	if err != nil {
 		t.Fatalf("Create target: %v", err)
 	}
-
-	const n = 8
-	var wg sync.WaitGroup
-	ids := make([]string, n)
-	errs := make([]error, n)
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			ids[i], errs[i] = NormalizeInputConvoy(store, target.ID, "work")
-		}(i)
+	key := InputConvoyInvocationKey(target.ID, "work")
+	for _, id := range []string{"zz-later-lexically", "aa-earlier-lexically"} {
+		if _, err := store.Create(beads.Bead{ID: id, Title: "candidate", Type: "convoy", Metadata: map[string]string{
+			graphV2InvocationKey: key,
+		}}); err != nil {
+			t.Fatalf("Create(%s): %v", id, err)
+		}
 	}
-	wg.Wait()
+	if _, err := NormalizeInputConvoy(store, target.ID, "work"); err == nil || !strings.Contains(err.Error(), "multiple reusable convoys") {
+		t.Fatalf("NormalizeInputConvoy error = %v, want deterministic corruption error instead of clock/ID election", err)
+	}
+}
 
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("NormalizeInputConvoy %d: %v", i, err)
-		}
-		if ids[i] != ids[0] {
-			t.Fatalf("caller %d convoy = %q, want the shared winner %q", i, ids[i], ids[0])
-		}
+func TestNormalizeInputConvoyReusesClosedConvoyWhileRootLive(t *testing.T) {
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	convoyID, err := NormalizeInputConvoy(store, target.ID, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(beads.Bead{Title: "live root", Type: "task", Metadata: map[string]string{
+		beadmeta.InputConvoyIDMetadataKey:   convoyID,
+		beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(convoyID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := NormalizeInputConvoy(store, target.ID, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != convoyID {
+		t.Fatalf("input convoy = %q, want closed convoy %q retained while its root is live", got, convoyID)
 	}
 }
 
