@@ -433,17 +433,13 @@ func TestPoolDemandCountShellExcludesDisarmedFromEverySource(t *testing.T) {
 
 // TestEffectiveAssignedTiersExcludeDisarmedRow is the assigned-tier sibling
 // of TestPoolDemandCountShellExcludesDisarmedFromEverySource. Unlike the pool
-// tiers, these run bd with --limit=20, so filtering the single returned row IS
-// the whole fix: a disarmed bead must not be served as this session's own
-// assigned work. There is deliberately no "armed peer falls through" case
-// here — with limit=1 there is no second row within this tier to fall
-// through to; widening past limit=1 so a disarmed head has assigned work
-// behind it to serve instead is tracked separately (gc-ewk4), not by this
-// bead.
+// tiers, these run bd with --limit=20 so a disarmed head can be filtered while
+// an armed assigned peer in the same batch still falls through to the hook.
 func TestEffectiveAssignedTiersExcludeDisarmedRow(t *testing.T) {
 	a := Agent{Name: "worker", Dir: "hello-world"}
 	const disarmedRow = `[{"id":"assigned-row","metadata":{"gc.disarmed":true}}]`
 	const armedRow = `[{"id":"assigned-row"}]`
+	const mixedRows = `[{"id":"disarmed-head","metadata":{"gc.disarmed":true}},{"id":"armed-peer"}]`
 
 	cases := []struct {
 		name    string
@@ -468,6 +464,11 @@ func TestEffectiveAssignedTiersExcludeDisarmedRow(t *testing.T) {
 			out = runShellWithFakeBd(t, tc.query(&a), env, bdScript(armedRow))
 			if got := strings.TrimSpace(out); got != armedRow {
 				t.Fatalf("%s must still serve an armed assignee row, got %q want %q", tc.name, got, armedRow)
+			}
+
+			out = runShellWithFakeBd(t, tc.query(&a), env, bdScript(mixedRows))
+			if got := strings.TrimSpace(out); got != `[{"id":"armed-peer"}]` {
+				t.Fatalf("%s must select the armed peer behind a disarmed head, got %q", tc.name, got)
 			}
 		})
 	}

@@ -2435,6 +2435,27 @@ func TestDoHookNormalizesSingleObjectOutputToArray(t *testing.T) {
 	}
 }
 
+// TestDoHookAssignedTierSurvivesUnreadyHeadOfLine is a regression test for
+// gc-ewk4: assigned tiers use --limit=20 so disarmed or blocked head rows do
+// not hide an armed assigned peer from the Go-side readiness filter.
+func TestDoHookAssignedTierSurvivesUnreadyHeadOfLine(t *testing.T) {
+	runner := func(string, string) (string, error) {
+		return `[{"id":"gc-disarmed-head","status":"open","metadata":{"gc.disarmed":true}},{"id":"gc-blocked-head","status":"blocked","is_blocked":true},{"id":"gc-ready-behind","status":"open"}]`, nil
+	}
+	var stdout, stderr bytes.Buffer
+	code := doHook("bd list --status in_progress --assignee=worker --json --limit=20", "", false, runner, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHook() = %d, want 0 (armed assigned work exists behind unready heads); stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "gc-ready-behind") {
+		t.Fatalf("stdout = %q, want the armed assigned peer behind the unready heads", out)
+	}
+	if strings.Contains(out, "gc-disarmed-head") || strings.Contains(out, "gc-blocked-head") {
+		t.Fatalf("stdout = %q, want disarmed and blocked heads stripped", out)
+	}
+}
+
 func TestDoHookClaimSkipsUnclaimableCandidateError(t *testing.T) {
 	// A candidate whose claim errors (e.g. a routed id that no longer resolves
 	// in the store this context can reach) must not wedge the whole hook: log
