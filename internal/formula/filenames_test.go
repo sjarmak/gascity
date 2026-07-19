@@ -27,3 +27,26 @@ func TestTrimTOMLFilenameStripsSupportedSuffixes(t *testing.T) {
 		})
 	}
 }
+
+func TestCanonicalNameCollapsesAcceptedSpellings(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "bare name unchanged", in: "build-review", want: "build-review"},
+		{name: "plain TOML", in: "build-review.toml", want: "build-review"},
+		{name: "infixed TOML", in: "build-review.formula.toml", want: "build-review"},
+		{name: "legacy JSON", in: "build-review.formula.json", want: "build-review"},
+		{name: "idempotent", in: "build-review", want: "build-review"},
+		{name: "unknown suffix kept", in: "build-review.md", want: "build-review.md"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := CanonicalName(tc.in); got != tc.want {
+				t.Fatalf("CanonicalName(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}

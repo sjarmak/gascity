@@ -139,6 +139,30 @@ func TestInputConvoyLockKeyMatchesPersistedIdentity(t *testing.T) {
 	}
 }
 
+// TestInputConvoyKeysCanonicalizeFormulaAliases pins alias convergence:
+// resolution accepts "work", "work.toml", "work.formula.toml", and
+// "work.formula.json" as one formula, so every identity derived from the name
+// must collapse the spellings or aliased launches mint rival convoys and roots.
+func TestInputConvoyKeysCanonicalizeFormulaAliases(t *testing.T) {
+	base := InputConvoyLockKey("target", "work")
+	invocationBase := InputConvoyInvocationKey("target", "work")
+	rootBase := RootKey("convoy-1", "work", nil, "rig", "alpha")
+	for _, alias := range []string{"work.toml", "work.formula.toml", "work.formula.json"} {
+		if InputConvoyLockKey("target", alias) != base {
+			t.Fatalf("lock key for alias %q differs from bare name", alias)
+		}
+		if InputConvoyInvocationKey("target", alias) != invocationBase {
+			t.Fatalf("invocation key for alias %q differs from bare name", alias)
+		}
+		if RootKey("convoy-1", alias, nil, "rig", "alpha") != rootBase {
+			t.Fatalf("root key for alias %q differs from bare name", alias)
+		}
+	}
+	if InputConvoyLockKey("target", "workshop") == base {
+		t.Fatal("canonicalization must not alias distinct formula names")
+	}
+}
+
 // TestNormalizeInputConvoyRepairsMissingTrackOnReuse covers the convoy that
 // exists but tracks nothing, which reuse newly makes reachable: creating the
 // convoy and tracking its target are separate writes, so a failure between them

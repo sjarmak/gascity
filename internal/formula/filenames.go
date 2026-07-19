@@ -32,3 +32,15 @@ func TrimTOMLFilename(path string) (string, bool) {
 		return "", false
 	}
 }
+
+// CanonicalName returns the symbolic formula name for any accepted spelling:
+// resolution treats "work", "work.toml", "work.formula.toml", and
+// "work.formula.json" as the same formula, so every identity derived from a
+// formula name (locks, convoy invocation keys, workflow root keys) must go
+// through this same strip or aliased spellings fracture the identity.
+func CanonicalName(name string) string {
+	if trimmed, ok := TrimTOMLFilename(name); ok {
+		return trimmed
+	}
+	return strings.TrimSuffix(name, FormulaExtJSON)
+}

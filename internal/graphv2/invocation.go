@@ -372,7 +372,10 @@ func InputConvoyLockKey(targetID, formulaName string) string {
 
 func inputConvoyTupleHash(targetID, formulaName string) string {
 	targetID = strings.TrimSpace(targetID)
-	formulaName = strings.TrimSpace(formulaName)
+	// Resolution accepts "work", "work.toml", and "work.formula.toml" as one
+	// formula; hash the canonical spelling or aliased launches take different
+	// locks and mint rival convoys.
+	formulaName = formula.CanonicalName(strings.TrimSpace(formulaName))
 	h := sha256.New()
 	for _, value := range []string{targetID, formulaName} {
 		// Length framing makes tuples such as ("a:b", "c") and
@@ -680,9 +683,11 @@ func lockStripe(key string) uint8 {
 }
 
 // RootKey returns the stable graph.v2 workflow root key for an input convoy and
-// invocation variables.
+// invocation variables. The formula segment is canonicalized for the same
+// reason as inputConvoyTupleHash: aliased extension spellings resolve to one
+// formula and must derive one root key.
 func RootKey(inputConvoyID, formulaName string, vars map[string]string, scopeKind, scopeRef string) string {
-	return "graphv2-root:" + strings.TrimSpace(inputConvoyID) + ":" + strings.TrimSpace(formulaName) + ":" + varsFingerprint(vars) + ":" + dispatchScope(scopeKind, scopeRef)
+	return "graphv2-root:" + strings.TrimSpace(inputConvoyID) + ":" + formula.CanonicalName(strings.TrimSpace(formulaName)) + ":" + varsFingerprint(vars) + ":" + dispatchScope(scopeKind, scopeRef)
 }
 
 func varsFingerprint(vars map[string]string) string {

@@ -1139,6 +1139,10 @@ func isGraphSlingFormula(ctx context.Context, formulaName string, searchPaths []
 }
 
 func prepareGraphV2FormulaInvocation(ctx context.Context, formulaName, targetID string, opts SlingOpts, deps SlingDeps, a config.Agent) (graphv2.Invocation, bool, error) {
+	// Canonicalize before vars are built: name-gated vars (base_branch,
+	// target_branch) feed the RootKey fingerprint, so an aliased extension
+	// spelling here would fracture the root identity even with canonical keys.
+	formulaName = formula.CanonicalName(formulaName)
 	searchPaths := SlingFormulaSearchPaths(deps, a)
 	vars := buildGraphV2SlingFormulaVars(formulaName, targetID, opts.Vars, a, deps)
 	var inv graphv2.Invocation
