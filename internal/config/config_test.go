@@ -4936,12 +4936,15 @@ func TestRigNameWarnings_AllValidNoWarnings(t *testing.T) {
 	}
 }
 
-// Every rig name ValidateRigName accepts must encode (via the qualified-name
-// session replacer) into the alphabet the tmux runtime enforces on session
-// names (validSessionNameRe in internal/runtime/tmux — ^[a-zA-Z0-9_-]+$).
-// This is the generator/validator contract whose absence caused gascity#3109:
-// a space-named rig produced a session name tmux rejected before any pane
-// spawned.
+// Under the DEFAULT session naming (the sanitized qualified name), every rig
+// name ValidateRigName accepts must encode (via the qualified-name session
+// replacer) into the alphabet the tmux runtime enforces on session names
+// (validSessionNameRe in internal/runtime/tmux — ^[a-zA-Z0-9_-]+$). This is
+// the generator/validator contract whose absence caused gascity#3109: a
+// space-named rig produced a session name tmux rejected before any pane
+// spawned. A custom session_template that interpolates the raw {{.Dir}}
+// component can still leak a '.' into the session name; that pre-existing
+// template-authoring hazard is outside this contract.
 func TestValidateRigName_AcceptedNamesYieldTmuxSafeSessionNames(t *testing.T) {
 	tmuxSafe := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 	names := []string{"gascity", "TS-Server", "my.rig", "a_b", "r2d2", "A"}

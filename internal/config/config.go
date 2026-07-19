@@ -4149,10 +4149,14 @@ func ValidateRigs(rigs []Rig, hqPrefix string) error {
 // ("<rig>/<agent>"), a work_dir path component, and — after the qualified-name
 // session encoding ('.'→"__"; letters, digits, '_', '-' pass through) — a tmux
 // session name, which the tmux runtime validates against ^[a-zA-Z0-9_-]+$.
-// Every character accepted here must land in that alphabet after encoding;
-// anything else (spaces above all) produces a session name the runtime rejects
-// before any pane spawns, so rig-scoped agents cycle start-pending →
-// failed-create forever (gascity#3109).
+// Every character in the class survives that encoding into the tmux alphabet;
+// anything outside it (spaces above all) does not, producing a session name
+// the runtime rejects before any pane spawns, so rig-scoped agents cycle
+// start-pending → failed-create forever (gascity#3109).
+// The leading character is additionally restricted to a letter or digit — not
+// for tmux safety (a leading '_' or '-' would encode fine) but for identifier
+// hygiene: rig names become on-disk directory names (a leading '.' hides
+// them) and CLI arguments (a leading '-' reads as a flag).
 var rigNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // ValidateRigName reports whether name is usable as a rig identifier.
@@ -4164,13 +4168,15 @@ func ValidateRigName(name string) error {
 	if rigNamePattern.MatchString(name) {
 		return nil
 	}
-	return fmt.Errorf("rig %q: name must start with a letter or digit and contain only letters, digits, '.', '_', '-' (no spaces); the tmux runtime rejects session names derived from anything else, so rig-scoped agent sessions could never spawn", name)
+	return fmt.Errorf("rig %q: name must start with a letter or digit and contain only letters, digits, '.', '_', '-'; characters outside that set (spaces above all) derive tmux session names the runtime rejects, so rig-scoped agent sessions could never spawn, and a leading '.', '_', or '-' is rejected for identifier hygiene (hidden directories, option-like arguments)", name)
 }
 
 // RigNameWarnings returns non-fatal advisories for configured rigs whose names
 // fail ValidateRigName. Callers surface these at gc start / config reload so
-// operators of existing cities learn why rig-scoped agents never materialize
-// (gascity#3109) while the city itself keeps starting.
+// operators of existing cities learn that a rig name violates the
+// registration rule — and, for names outside the session alphabet (spaces
+// above all), why rig-scoped agents never materialize (gascity#3109) — while
+// the city itself keeps starting.
 func RigNameWarnings(rigs []Rig) []string {
 	var warnings []string
 	for _, r := range rigs {

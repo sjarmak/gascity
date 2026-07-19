@@ -1783,10 +1783,12 @@ func (cs *controllerState) CreateRig(r config.Rig) error {
 	if rigPath == "" {
 		return fmt.Errorf("%w: rig path is required", configedit.ErrValidation)
 	}
-	// Same registration gate as gc rig add (gascity#3109): an invalid name
-	// yields a session name the tmux runtime rejects, so rig-scoped agents
-	// could never spawn. Checked before provisionRigLocked so a rejected
-	// create leaves no initialized store behind.
+	// Same registration gate as gc rig add (gascity#3109): a name outside the
+	// session alphabet (a space, above all) yields a session name the tmux
+	// runtime rejects, so rig-scoped agents could never spawn; the stricter
+	// leading-character rule is identifier hygiene (see config.rigNamePattern).
+	// Checked before provisionRigLocked so a rejected create leaves no
+	// initialized store behind.
 	if err := config.ValidateRigName(r.Name); err != nil {
 		return fmt.Errorf("%w: %w", configedit.ErrValidation, err)
 	}
@@ -1823,10 +1825,11 @@ func (cs *controllerState) ProvisionRigFromGit(ctx context.Context, r config.Rig
 	}
 	// Same registration gate as CreateRig (gascity#3109): the handler-edge
 	// internal/api.validateRigName charset (^[A-Za-z0-9._-]{1,64}$) permits a
-	// leading '.', '_', or '-' that this stricter tmux-session-safety gate
-	// rejects, so a name like "-team" would otherwise clone before failing.
-	// Checked before any I/O (clone, manifest) so a rejected name never costs
-	// a network fetch or leaves a partial directory to roll back.
+	// leading '.', '_', or '-' that this stricter gate rejects for identifier
+	// hygiene (see config.rigNamePattern), so without the check here such a
+	// name would clone and register despite violating the shared registration
+	// rule. Checked before any I/O (clone, manifest) so a rejected name never
+	// costs a network fetch or leaves a partial directory to roll back.
 	if err := config.ValidateRigName(r.Name); err != nil {
 		return config.Rig{}, fmt.Errorf("%w: %w", configedit.ErrValidation, err)
 	}
