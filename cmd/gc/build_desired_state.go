@@ -862,6 +862,14 @@ func buildDesiredStateWithSessionBeads(
 				continue
 			}
 		}
+		if hasCanonical {
+			// Named counterpart of the pool clear arm (#4373): the pool path
+			// reconciles the trigger stamp every tick via
+			// bindPoolSessionTriggerBead, the named path only ever wrote it. A
+			// parked (blocked) or closed trigger otherwise re-aims every
+			// re-materialized seat indefinitely.
+			canonicalInfo = clearStaleNamedTriggerBinding(bp, rigStores, canonicalInfo, stderr)
+		}
 		if spec.Mode != "always" && !hasCanonical && !namedWorkReady[identity] {
 			continue
 		}
@@ -2794,6 +2802,18 @@ func computePoolTriggerBindingPatch(info session.Info, request SessionRequest, w
 		// does not inherit the prior fork's "warm" provenance, its parent sid.
 		if strings.TrimSpace(info.TriggerBeadID) != "" {
 			metadata[beadmeta.TriggerBeadIDMetadataKey] = ""
+			// The recorded work dir was derived for that trigger and literally
+			// names it (triggerBeadPathSlug), so a seat that starts in it re-aims
+			// itself at the stale bead with no Env stamp involved (#4373
+			// Carrier 2). Drop it with the stamp. Scoped to the stamped-trigger
+			// case: with no stamp there is no evidence the recorded dir is
+			// trigger-derived, so a configured work dir survives a no-work clear.
+			if strings.TrimSpace(info.WorkDirCanonical) != "" {
+				metadata[beadmeta.WorkDirMetadataKey] = ""
+			}
+			if strings.TrimSpace(info.WorkDir) != "" {
+				metadata[beadmeta.LegacyWorkDirMetadataKey] = ""
+			}
 		}
 		if strings.TrimSpace(info.TriggerBeadStoreRef) != "" {
 			metadata[beadmeta.TriggerBeadStoreRefMetadataKey] = ""
@@ -2894,6 +2914,76 @@ func bindPoolSessionTriggerBead(bp *agentBuildParams, cfgAgent *config.Agent, qu
 		return info, err
 	}
 	return boundInfo, nil
+}
+
+// triggerStoreForRef resolves a session bead's trigger store-ref to the store
+// it names: the city store for "" / "city", the rig store for "rig:<name>".
+// Unknown refs (or an unregistered rig) resolve to nil; callers treat that as
+// "cannot verify the target".
+func triggerStoreForRef(cityStore beads.Store, rigStores map[string]beads.Store, storeRef string) beads.Store {
+	ref := strings.TrimSpace(storeRef)
+	switch {
+	case ref == "" || ref == "city":
+		return cityStore
+	case strings.HasPrefix(ref, "rig:"):
+		return rigStores[strings.TrimPrefix(ref, "rig:")]
+	default:
+		return nil
+	}
+}
+
+// clearStaleNamedTriggerBinding is the named-session counterpart of the pool
+// path's bindPoolSessionTriggerBead clear arm (#4373). A named session bead's
+// trigger stamp is written at dispatch and previously had no clear path:
+// resolveTemplateForSessionBeadInfo replays it into GC_TRIGGER_BEAD_ID on every
+// re-materialization without re-validating the target, and the trigger-derived
+// gc.work_dir re-aims the seat even with the Env stamp gone. When the stamped
+// trigger bead is definitively not workable — absent from its store, closed, or
+// blocked — this clears the trigger/store-ref/brain-parent stamp and the
+// trigger-derived work dir in one patch through the session front door. Any
+// other status (open, in_progress) keeps the stamp: an open routed bead is
+// legitimate aim for the next seat, and readiness beyond lifecycle status is
+// the agent-side hook's judgment, not the controller's. Lookup failures other
+// than not-found keep the stamp (fail-open: never clear on a flaky read). The
+// in-memory session-bead snapshot for the current tick is not rewritten; the
+// durable clear converges every replay site from the next snapshot on.
+func clearStaleNamedTriggerBinding(bp *agentBuildParams, rigStores map[string]beads.Store, info session.Info, stderr io.Writer) session.Info {
+	triggerID := strings.TrimSpace(info.TriggerBeadID)
+	if info.ID == "" || triggerID == "" || bp == nil {
+		return info
+	}
+	triggerStore := triggerStoreForRef(bp.beadStore, rigStores, info.TriggerBeadStoreRef)
+	if triggerStore == nil {
+		return info
+	}
+	trigger, err := triggerStore.Get(triggerID)
+	stale := false
+	switch {
+	case err == nil:
+		stale = trigger.Status == "closed" || trigger.Status == "blocked"
+	case errors.Is(err, beads.ErrNotFound):
+		stale = true
+	default:
+		fmt.Fprintf(stderr, "buildDesiredState: named session %s trigger %s: %v (keeping stamp)\n", info.ID, triggerID, err) //nolint:errcheck
+		return info
+	}
+	if !stale {
+		return info
+	}
+	patch := computePoolTriggerBindingPatch(info, SessionRequest{}, "")
+	if len(patch) == 0 {
+		return info
+	}
+	if bp.beadStore == nil {
+		return info.ApplyPatch(patch)
+	}
+	cleared, err := sessionFrontDoor(bp.beadStore).UpdateMetadataInfo(info, patch)
+	if err != nil {
+		fmt.Fprintf(stderr, "buildDesiredState: named session %s clearing stale trigger %s: %v\n", info.ID, triggerID, err) //nolint:errcheck
+		return info
+	}
+	fmt.Fprintf(stderr, "buildDesiredState: named session %s cleared stale trigger %s (status=%q)\n", info.ID, triggerID, trigger.Status) //nolint:errcheck
+	return cleared
 }
 
 func poolTriggerWorkDir(bp *agentBuildParams, cfgAgent *config.Agent, qualifiedName string, request SessionRequest) string {

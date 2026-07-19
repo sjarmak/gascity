@@ -176,6 +176,13 @@ func rawPoolTriggerBindingPatchRef(sb beads.Bead, request SessionRequest, workDi
 	if workBeadID == "" {
 		if strings.TrimSpace(sb.Metadata[beadmeta.TriggerBeadIDMetadataKey]) != "" {
 			metadata[beadmeta.TriggerBeadIDMetadataKey] = ""
+			// #4373 Carrier 2: the trigger-derived work dir clears with the stamp.
+			if strings.TrimSpace(sb.Metadata[beadmeta.WorkDirMetadataKey]) != "" {
+				metadata[beadmeta.WorkDirMetadataKey] = ""
+			}
+			if strings.TrimSpace(sb.Metadata[beadmeta.LegacyWorkDirMetadataKey]) != "" {
+				metadata[beadmeta.LegacyWorkDirMetadataKey] = ""
+			}
 		}
 		if strings.TrimSpace(sb.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey]) != "" {
 			metadata[beadmeta.TriggerBeadStoreRefMetadataKey] = ""
