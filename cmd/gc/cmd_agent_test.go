@@ -74,8 +74,14 @@ sling_query = "bd update {} --set-metadata gc.routed_to=frontend/worker"
 	if worker.QualifiedName != "frontend/worker" || !worker.Suspended {
 		t.Fatalf("worker item = %+v, want suspended frontend/worker", worker)
 	}
-	if worker.WorkQuery != "bd ready --label=frontend" || worker.SlingQuery == "" {
+	// WorkQuery reports the effective command — the configured override
+	// wrapped in the durable-disarm guard (gc-cg89) — while
+	// ConfiguredWorkQuery preserves the raw config value.
+	if !strings.Contains(worker.WorkQuery, "out=$(bd ready --label=frontend)") || worker.SlingQuery == "" {
 		t.Fatalf("worker routing fields = %+v", worker)
+	}
+	if worker.ConfiguredWorkQuery != "bd ready --label=frontend" {
+		t.Fatalf("worker ConfiguredWorkQuery = %q, want the raw override", worker.ConfiguredWorkQuery)
 	}
 }
 

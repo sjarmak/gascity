@@ -851,11 +851,11 @@ func TestResolveTemplateExpandsPromptCommandTemplates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveTemplate: %v", err)
 	}
-	if !strings.Contains(tp.Prompt, "Work=echo demo-city demo worker") {
-		t.Fatalf("Prompt missing expanded WorkQuery: %q", tp.Prompt)
+	if !strings.Contains(tp.Prompt, "Work=sh -c 'out=$(echo demo-city demo worker)") {
+		t.Fatalf("Prompt missing expanded WorkQuery inside the disarm guard: %q", tp.Prompt)
 	}
-	if !strings.Contains(tp.Prompt, "Assigned=echo demo-city demo worker") {
-		t.Fatalf("Prompt missing expanded AssignedReadyQuery: %q", tp.Prompt)
+	if !strings.Contains(tp.Prompt, "Assigned=sh -c 'out=$(echo demo-city demo worker)") {
+		t.Fatalf("Prompt missing expanded AssignedReadyQuery inside the disarm guard: %q", tp.Prompt)
 	}
 	if strings.Contains(tp.Prompt, "gc.routed_to") {
 		t.Fatalf("Prompt assigned-ready query should not include routed pool demand: %q", tp.Prompt)

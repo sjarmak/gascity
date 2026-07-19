@@ -437,9 +437,15 @@ var queryTable = map[queryKind]querySpec{
 // signal must survive the guard rather than become a jq parse error. The jq
 // stage is silenced and failure-tolerant like the built-in tiers' jq stages;
 // an override failure still propagates its own exit code before jq runs.
+//
+// The capture is a plain assignment with an explicit status check, NOT
+// `out=$(...) || exit $?`: a ||-list puts the substitution in a checked
+// context, where bash (POSIX mode included) suppresses errexit inside it, so
+// an override using its own `set -e` would have a failed bd call masked as
+// clean no-work output on bash hosts while dash propagates it.
 func disarmGuardedOverride(override string) string {
 	filter := `if type == "array" then [.[] | select(` + notDisarmedSelectPredicateJQ() + `)] else . end`
-	script := `out=$(` + override + `) || exit $?; ` +
+	script := `out=$(` + override + `); rc=$?; if [ "$rc" -ne 0 ]; then exit "$rc"; fi; ` +
 		`filtered=$(printf "%s" "$out" | jq -c ` + shellquote.Quote(filter) + ` 2>/dev/null) && ` +
 		`printf "%s" "$filtered" || printf "%s" "$out"`
 	return shellquote.Join([]string{"sh", "-c", script})

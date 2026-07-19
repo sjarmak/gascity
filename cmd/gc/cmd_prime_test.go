@@ -43,17 +43,17 @@ func TestBuildPrimeContextExpandsTemplateCommands(t *testing.T) {
 		SlingQuery: "dispatch {} --route={{.Rig}}/{{.AgentBase}} --city={{.CityName}}",
 	}, rigs, nil)
 
-	if ctx.WorkQuery != "echo demo-city demo worker" {
-		t.Fatalf("WorkQuery = %q, want %q", ctx.WorkQuery, "echo demo-city demo worker")
-	}
-	if ctx.AssignedInProgressQuery != "echo demo-city demo worker" {
-		t.Fatalf("AssignedInProgressQuery = %q, want expanded custom query", ctx.AssignedInProgressQuery)
-	}
-	if ctx.AssignedReadyQuery != "echo demo-city demo worker" {
-		t.Fatalf("AssignedReadyQuery = %q, want expanded custom query", ctx.AssignedReadyQuery)
-	}
-	if ctx.RoutedPoolQuery != "echo demo-city demo worker" {
-		t.Fatalf("RoutedPoolQuery = %q, want expanded custom query", ctx.RoutedPoolQuery)
+	// A custom work_query resolves to the expanded command wrapped in the
+	// durable-disarm guard (gc-cg89); the expansion must happen inside it.
+	for name, got := range map[string]string{
+		"WorkQuery":               ctx.WorkQuery,
+		"AssignedInProgressQuery": ctx.AssignedInProgressQuery,
+		"AssignedReadyQuery":      ctx.AssignedReadyQuery,
+		"RoutedPoolQuery":         ctx.RoutedPoolQuery,
+	} {
+		if !strings.Contains(got, "out=$(echo demo-city demo worker)") {
+			t.Fatalf("%s = %q, want the expanded custom query inside the disarm guard", name, got)
+		}
 	}
 	if ctx.SlingQuery != "dispatch {} --route=demo/worker --city=demo-city" {
 		t.Fatalf("SlingQuery = %q, want %q", ctx.SlingQuery, "dispatch {} --route=demo/worker --city=demo-city")
@@ -83,8 +83,8 @@ func TestBuildPrimeContextLogsTemplateExpansionWarning(t *testing.T) {
 		WorkQuery: "echo {{.Rig",
 	}, nil, &stderr)
 
-	if ctx.WorkQuery != "echo {{.Rig" {
-		t.Fatalf("WorkQuery = %q, want raw command fallback", ctx.WorkQuery)
+	if !strings.Contains(ctx.WorkQuery, "out=$(echo {{.Rig)") {
+		t.Fatalf("WorkQuery = %q, want raw command fallback inside the disarm guard", ctx.WorkQuery)
 	}
 	if !strings.Contains(stderr.String(), "work_query") {
 		t.Fatalf("stderr missing field name: %q", stderr.String())

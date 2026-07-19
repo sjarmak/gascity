@@ -169,8 +169,11 @@ work_query = "kill -9 $$"
 	if payload.Template != "worker" {
 		t.Fatalf("payload Template = %q, want current session template", payload.Template)
 	}
-	if payload.Reason != "work query killed (signal: killed)" {
-		t.Fatalf("payload Reason = %q, want work query killed (signal: killed)", payload.Reason)
+	// The disarm guard (gc-cg89) runs a custom work query one shell level
+	// deeper, so the killed process is a grandchild: the outer sh reports
+	// exit 137, which the failure classifier maps to the same SIGKILL reason.
+	if payload.Reason != "work query killed (exit status 137 / SIGKILL)" {
+		t.Fatalf("payload Reason = %q, want work query killed (exit status 137 / SIGKILL)", payload.Reason)
 	}
 }
 

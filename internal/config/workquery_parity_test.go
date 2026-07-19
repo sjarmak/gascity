@@ -824,6 +824,28 @@ func TestRowQueryOverrideGuardShape(t *testing.T) {
 		}
 	})
 
+	t.Run("internal set -e failure propagates", func(t *testing.T) {
+		// The capture must not sit in a checked context (`|| exit $?`): bash,
+		// POSIX mode included, suppresses errexit inside a substitution that a
+		// ||-list checks, so an override relying on its own `set -e` would
+		// mask a failed bd call as clean no-work output. Pinned under both sh
+		// and bash because dash propagates either way and would hide the
+		// regression on dash-only hosts.
+		a := &Agent{Name: "worker", WorkQuery: `set -e; false; printf '%s' '[{"id":"survived"}]'`}
+		q := a.EffectiveWorkQuery()
+		shells := [][]string{{"sh", "-c"}}
+		if _, err := exec.LookPath("bash"); err == nil {
+			shells = append(shells, []string{"bash", "--posix", "-c"})
+		}
+		for _, sh := range shells {
+			out, err := exec.Command(sh[0], append(sh[1:], q)...).CombinedOutput()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				t.Errorf("%s: guarded override with internal set -e failure = %v (out=%q), want a nonzero exit instead of the masked row", sh[0], err, out)
+			}
+		}
+	})
+
 	t.Run("count-form override stays verbatim", func(t *testing.T) {
 		a := &Agent{Name: "worker", ScaleCheck: "custom-scale"}
 		if got := a.EffectivePoolDemandQuery(); got != "custom-scale" {

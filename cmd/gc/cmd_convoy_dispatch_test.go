@@ -5053,8 +5053,8 @@ name = "frontend"
 	if err == nil || !strings.Contains(err.Error(), os.ErrDeadlineExceeded.Error()) {
 		t.Fatalf("runWorkflowServe error = %v, want wrapped %v", err, os.ErrDeadlineExceeded)
 	}
-	if gotQuery != "bd demo-city frontend worker" {
-		t.Fatalf("workflowServe query = %q, want %q", gotQuery, "bd demo-city frontend worker")
+	if !strings.Contains(gotQuery, "out=$(bd demo-city frontend worker)") {
+		t.Fatalf("workflowServe query = %q, want the expanded custom query inside the disarm guard", gotQuery)
 	}
 }
 
