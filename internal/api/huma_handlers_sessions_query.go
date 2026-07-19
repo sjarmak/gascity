@@ -73,16 +73,33 @@ func (s *Server) humaHandleSessionList(_ context.Context, input *SessionListInpu
 	nextCursor := mintKeysetNextCursor(pageIdx, infoKey, hasMore)
 
 	wantPeek := input.Peek
+	// enrich=false serves a read-model roster with zero runtime calls: the
+	// per-session live-state probe (via SessionProvider), the active-bead
+	// search, and transcript-path resolution (which can probe dated
+	// directories) are all skipped, so response time stays flat instead of
+	// growing O(active sessions) apiserver GETs and timing out at fleet scale.
+	// Scalar state still comes from the read model. enrich defaults to true
+	// (see SessionListInput), preserving the historical fully-enriched response.
+	enrich := input.Enrich
 	hasDeferredQueue := strings.TrimSpace(s.state.CityPath()) != ""
 	pageSessions := make([]session.Info, len(pageIdx))
 	for j, i := range pageIdx {
 		pageSessions[j] = sessions[i]
 	}
-	keyedTranscriptPaths := session.ResolveKeyedTranscriptPaths(sessionTranscriptLookupCandidates(pageSessions), s.sessionLogPaths(), sessionTranscriptProviderFallback(cfg))
+	var keyedTranscriptPaths map[string]string
+	if enrich {
+		keyedTranscriptPaths = session.ResolveKeyedTranscriptPaths(sessionTranscriptLookupCandidates(pageSessions), s.sessionLogPaths(), sessionTranscriptProviderFallback(cfg))
+	}
 	page := make([]sessionResponse, len(pageSessions))
 	for j, sess := range pageSessions {
-		page[j] = sessionResponseWithReason(sess, responseByID[sess.ID], cfg, s.state.SessionProvider(), hasDeferredQueue)
-		s.enrichSessionResponseWithKeyedPaths(&page[j], sess, cfg, s.runtimeSessionResponseHandle(sess), wantPeek, false, false, 0, keyedTranscriptPaths)
+		var sp runtime.Provider
+		if enrich {
+			sp = s.state.SessionProvider()
+		}
+		page[j] = sessionResponseWithReason(sess, responseByID[sess.ID], cfg, sp, hasDeferredQueue)
+		if enrich {
+			s.enrichSessionResponseWithKeyedPaths(&page[j], sess, cfg, s.runtimeSessionResponseHandle(sess), wantPeek, false, false, 0, keyedTranscriptPaths)
+		}
 	}
 	return &ListOutput[sessionResponse]{
 		Index:     s.latestIndex(),

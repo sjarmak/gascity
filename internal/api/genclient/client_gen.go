@@ -7788,6 +7788,9 @@ type GetV0CityByCityNameSessionsParams struct {
 
 	// Peek Include last output preview.
 	Peek *bool `form:"peek,omitempty" json:"peek,omitempty"`
+
+	// Enrich Enrich each session with live runtime state and active-bead lookups. Defaults to true. Pass enrich=false for a cheap read-model roster with no runtime calls.
+	Enrich *bool `form:"enrich,omitempty" json:"enrich,omitempty"`
 }
 
 // CreateSessionParams defines parameters for CreateSession.
@@ -26611,6 +26614,22 @@ func NewGetV0CityByCityNameSessionsRequest(server string, cityName string, param
 		if params.Peek != nil {
 
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "peek", *params.Peek, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "boolean", Format: ""}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
+		if params.Enrich != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "enrich", *params.Enrich, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "boolean", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
 				return nil, err

@@ -40828,6 +40828,17 @@
               "description": "Include last output preview.",
               "type": "boolean"
             }
+          },
+          {
+            "description": "Enrich each session with live runtime state and active-bead lookups. Defaults to true. Pass enrich=false for a cheap read-model roster with no runtime calls.",
+            "explode": false,
+            "in": "query",
+            "name": "enrich",
+            "schema": {
+              "default": true,
+              "description": "Enrich each session with live runtime state and active-bead lookups. Defaults to true. Pass enrich=false for a cheap read-model roster with no runtime calls.",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {

@@ -911,6 +911,78 @@ func TestHandleSessionListActiveBeadUsesCachedLookup(t *testing.T) {
 	}
 }
 
+// TestHandleSessionListEnrichFalseServesRoster proves the enrich=false roster
+// mode (issue #4390): the default list enriches each session with live runtime
+// state and an active-bead search, but enrich=false returns the read-model
+// roster only — scalar state survives while the O(active sessions) runtime
+// probes are skipped entirely.
+func TestHandleSessionListEnrichFalseServesRoster(t *testing.T) {
+	fs := newSessionFakeState(t)
+	backing := beads.NewMemStore()
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	fs.stores["myrig"] = cache
+	srv := New(fs)
+	h := newTestCityHandlerWith(t, fs, srv)
+
+	info := createTestSession(t, fs.cityBeadStore, fs.sp, "My Session")
+	work, err := backing.Create(beads.Bead{Title: "active work"})
+	if err != nil {
+		t.Fatalf("Create(work): %v", err)
+	}
+	status := "in_progress"
+	assignee := info.ID
+	if err := backing.Update(work.ID, beads.UpdateOpts{Status: &status, Assignee: &assignee}); err != nil {
+		t.Fatalf("Update(work): %v", err)
+	}
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	listOne := func(t *testing.T, query string) sessionResponse {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", cityURL(fs, "/sessions")+query, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var resp struct {
+			Items []sessionResponse `json:"items"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(resp.Items) != 1 || resp.Items[0].ID != info.ID {
+			t.Fatalf("items = %#v, want single session %s", resp.Items, info.ID)
+		}
+		return resp.Items[0]
+	}
+
+	// Default (enrich omitted → true): full runtime enrichment.
+	enriched := listOne(t, "")
+	if enriched.State != "active" {
+		t.Fatalf("default State = %q, want active", enriched.State)
+	}
+	if !enriched.Running {
+		t.Error("default Running = false, want true (runtime enrichment expected)")
+	}
+	if enriched.ActiveBead != work.ID {
+		t.Errorf("default ActiveBead = %q, want %q", enriched.ActiveBead, work.ID)
+	}
+
+	// enrich=false: read-model roster. Scalar state survives, but the runtime
+	// running probe and the active-bead search are both skipped.
+	roster := listOne(t, "?enrich=false")
+	if roster.State != "active" {
+		t.Fatalf("roster State = %q, want active", roster.State)
+	}
+	if roster.Running {
+		t.Error("roster Running = true, want false (runtime enrichment must be skipped)")
+	}
+	if roster.ActiveBead != "" {
+		t.Errorf("roster ActiveBead = %q, want empty (active-bead search must be skipped)", roster.ActiveBead)
+	}
+}
+
 func TestHandleSessionListUsesCachedSessionBeadsWhenAvailable(t *testing.T) {
 	fs := newSessionFakeState(t)
 	store := &cachedOnlyListStoreForSessionTest{MemStore: beads.NewMemStore()}

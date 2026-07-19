@@ -18,6 +18,13 @@ type SessionListInput struct {
 	State    string `query:"state" required:"false" doc:"Filter by session state (e.g. active, closed)."`
 	Template string `query:"template" required:"false" doc:"Filter by session template (agent qualified name)."`
 	Peek     bool   `query:"peek" required:"false" doc:"Include last output preview."`
+	// Enrich toggles per-session live runtime enrichment (runtime state
+	// probes plus active-bead searches). It defaults to true, preserving the
+	// historical fully-enriched response. Pass enrich=false for a cheap
+	// read-model roster (alias/state/template) that issues zero runtime
+	// calls — the roster stays flat as the fleet grows, where the enriched
+	// list is O(active sessions) apiserver GETs and times out at scale.
+	Enrich bool `query:"enrich" default:"true" required:"false" doc:"Enrich each session with live runtime state and active-bead lookups. Defaults to true. Pass enrich=false for a cheap read-model roster with no runtime calls."`
 }
 
 // CityPendingInput is the Huma input for GET /v0/city/{cityName}/pending.

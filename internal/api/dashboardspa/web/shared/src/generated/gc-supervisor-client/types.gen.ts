@@ -16137,6 +16137,10 @@ export type GetV0CityByCityNameSessionsData = {
          * Include last output preview.
          */
         peek?: boolean;
+        /**
+         * Enrich each session with live runtime state and active-bead lookups. Defaults to true. Pass enrich=false for a cheap read-model roster with no runtime calls.
+         */
+        enrich?: boolean;
     };
     url: '/v0/city/{cityName}/sessions';
 };
