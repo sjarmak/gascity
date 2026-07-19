@@ -794,9 +794,10 @@ store, copy them into the binding with
 					// its execution-fact legs are the same value: the root, its
 					// steps and the input convoy are all minted here.
 					storeRef := workflowStoreRefForDir(scope.storeRoot, cityPath, loadedCityName(cfg, cityPath), cfg)
+					lockScope := sourceWorkflowLockScopeForStoreRef(cityPath, cfg, scope.storeRoot, storeRef)
 					var result *molecule.Result
 					var syntheticInputConvoyID string
-					err := sourceworkflow.WithLock(cmd.Context(), cityPath, sourceWorkflowLockScopeForStoreRef(cityPath, cfg, scope.storeRoot, storeRef), graphv2.InputConvoyLockKey(attach, args[0]), func() error {
+					err := sourceworkflow.WithLock(cmd.Context(), cityPath, lockScope, graphv2.InputConvoyLockKey(attach, args[0]), func() error {
 						inv, err := graphv2.PrepareInvocation(cmd.Context(), store, args[0], scope.searchPaths, attach, cookVars)
 						if err != nil {
 							return fmt.Errorf("prepare formulas v2 invocation: %w", err)
@@ -822,7 +823,7 @@ store, copy them into the binding with
 						// lock makes convoy selection atomic; this inner lock makes the
 						// existing-root check and materialization atomic with sling and
 						// other CLI processes.
-						return sourceworkflow.WithLock(cmd.Context(), cityPath, sourceWorkflowLockScopeForStoreRef(cityPath, cfg, scope.storeRoot, storeRef), graphRootKey, func() error {
+						return sourceworkflow.WithLock(cmd.Context(), cityPath, lockScope, graphRootKey, func() error {
 							if err := closeFormulaCookFailedGraphV2Roots(store, recipe); err != nil {
 								return err
 							}
