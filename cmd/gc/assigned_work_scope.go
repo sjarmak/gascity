@@ -116,11 +116,22 @@ func filterAssignedWorkBeadsForPoolDemand(
 	assignedWorkBeads []beads.Bead,
 	assignedWorkStoreRefs []string,
 ) []beads.Bead {
+	filtered, _ := filterAssignedWorkForPoolDemand(cfg, cityPath, sessionInfos, assignedWorkBeads, assignedWorkStoreRefs)
+	return filtered
+}
+
+func filterAssignedWorkForPoolDemand(
+	cfg *config.City,
+	cityPath string,
+	sessionInfos []sessionpkg.Info,
+	assignedWorkBeads []beads.Bead,
+	assignedWorkStoreRefs []string,
+) ([]beads.Bead, []string) {
 	if len(assignedWorkBeads) == 0 || len(assignedWorkStoreRefs) == 0 {
-		return assignedWorkBeads
+		return assignedWorkBeads, assignedWorkStoreRefs
 	}
 	if cfg == nil {
-		return assignedWorkBeads
+		return assignedWorkBeads, assignedWorkStoreRefs
 	}
 	assigneeToSessionBeadID := make(map[string]string)
 	sessionBeadTemplate := make(map[string]string)
@@ -140,6 +151,7 @@ func filterAssignedWorkBeadsForPoolDemand(
 		}
 	}
 	filtered := make([]beads.Bead, 0, len(assignedWorkBeads))
+	filteredStoreRefs := make([]string, 0, len(assignedWorkBeads))
 	for i, wb := range assignedWorkBeads {
 		template := routedToOrLegacyWorkflowTarget(wb)
 		if template == "" {
@@ -159,9 +171,10 @@ func filterAssignedWorkBeadsForPoolDemand(
 		}
 		if assignedWorkIndexReachableFromAgent(cityPath, cfg, agentCfg, assignedWorkStoreRefs, i) {
 			filtered = append(filtered, wb)
+			filteredStoreRefs = append(filteredStoreRefs, assignedWorkStoreRefs[i])
 		}
 	}
-	return filtered
+	return filtered, filteredStoreRefs
 }
 
 // filterAssignedWorkBeadsForSessionWake resolves work through assignment

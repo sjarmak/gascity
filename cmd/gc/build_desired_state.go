@@ -1004,11 +1004,11 @@ func buildDesiredStateWithSessionBeads(
 		if len(scaleCheckPartialTemplates) > 0 {
 			fmt.Fprintf(stderr, "scaleCheck: PARTIAL — scale_check failed for %s, retaining affected sessions\n", strings.Join(sortedBoolMapKeys(scaleCheckPartialTemplates), ",")) //nolint:errcheck
 		}
-		poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, sessionBeads.OpenInfos(), assignedWorkBeads, assignedWorkStoreRefs)
+		poolWorkBeads, poolWorkStoreRefs := filterAssignedWorkForPoolDemand(cfg, cityPath, sessionBeads.OpenInfos(), assignedWorkBeads, assignedWorkStoreRefs)
 		bp.assignedWorkBeads = poolWorkBeads
 		bp.poolScaleCheckPartialTemplates = poolScaleCheckPartialTemplates
 		bp.providerHealthSnapshot = loadProviderHealthSnapshot(cityPath)
-		poolDesiredStates := ComputePoolDesiredStatesWithDemandTraced(cfg, poolWorkBeads, sessionBeads.OpenInfos(), scaleCheckCounts, scaleCheckDemandByTemplate, trace)
+		poolDesiredStates := computePoolDesiredStatesWithAssignedStoreRefs(cfg, poolWorkBeads, poolWorkStoreRefs, sessionBeads.OpenInfos(), scaleCheckCounts, scaleCheckDemandByTemplate, trace)
 		bp.configurePoolSessionCreateFairShare(poolDesiredStates)
 		for _, poolState := range poolDesiredStates {
 			cfgAgent := findAgentByTemplate(cfg, poolState.Template)
@@ -1665,7 +1665,6 @@ func defaultScaleCheckCountsAndDemand(targets []defaultScaleCheckTarget, caches 
 		return counts, demand, nil, nil
 	}
 	candidates := make(map[string][]scaleCheckCandidate, len(targets))
-	seenRows := make(map[string]map[string]beads.Bead, len(targets))
 
 	type scaleStoreGroup struct {
 		store     beads.Store
@@ -1692,13 +1691,10 @@ func defaultScaleCheckCountsAndDemand(targets []defaultScaleCheckTarget, caches 
 			partialTemplates = markScaleCheckPartialTemplate(partialTemplates, template)
 			continue
 		}
-		key := strings.TrimSpace(target.storeKey)
-		if key == "" {
-			key = fmt.Sprintf("%p", target.store)
-		}
+		key := actualStoreIdentity(target.store)
 		group := groups[key]
 		if group == nil {
-			group = &scaleStoreGroup{store: target.store, storeKey: key, templates: make(map[string]struct{})}
+			group = &scaleStoreGroup{store: target.store, storeKey: strings.TrimSpace(target.storeKey), templates: make(map[string]struct{})}
 			groups[key] = group
 		}
 		group.templates[template] = struct{}{}
@@ -1716,7 +1712,7 @@ func defaultScaleCheckCountsAndDemand(targets []defaultScaleCheckTarget, caches 
 		// beads remain hidden by readyExcludeTypes.
 		ready, readyErr := cache.controllerDemandReady(group.store)
 		if readyErr != nil {
-			errs = append(errs, fmt.Errorf("default scale_check %s templates=%s: Ready(): %w", key, strings.Join(sortedStringSet(group.templates), ","), readyErr))
+			errs = append(errs, fmt.Errorf("default scale_check %s templates=%s: Ready(): %w", group.storeKey, strings.Join(sortedStringSet(group.templates), ","), readyErr))
 			partialTemplates = markScaleCheckPartialSet(partialTemplates, group.templates)
 			if !beads.IsPartialResult(readyErr) {
 				ready = nil
@@ -1730,15 +1726,6 @@ func defaultScaleCheckCountsAndDemand(targets []defaultScaleCheckTarget, caches 
 			if _, ok := group.templates[template]; !ok {
 				continue
 			}
-			seen := seenRows[template]
-			if seen == nil {
-				seen = make(map[string]beads.Bead)
-				seenRows[template] = seen
-			}
-			if prior, ok := seen[b.ID]; ok && reflect.DeepEqual(prior, b) {
-				continue
-			}
-			seen[b.ID] = b
 			counts[template]++
 			candidates[template] = append(candidates[template], scaleCheckCandidate{bead: b, storeRef: group.storeKey})
 		}
@@ -1747,6 +1734,39 @@ func defaultScaleCheckCountsAndDemand(targets []defaultScaleCheckTarget, caches 
 		demand[template] = scaleCheckDemandFromCandidates(rows)
 	}
 	return counts, demand, partialTemplates, errs
+}
+
+// actualStoreIdentity identifies the physical store behind a view. Candidate
+// aliases are collapsed before any rows are read, so row identity remains the
+// canonical (storeRef, beadID) pair and never depends on payload equality.
+func actualStoreIdentity(store beads.Store) string {
+	for {
+		backed, ok := store.(interface{ Backing() beads.Store })
+		if ok && backed.Backing() != nil {
+			store = backed.Backing()
+			continue
+		}
+		value := reflect.ValueOf(store)
+		if value.Kind() == reflect.Struct {
+			var embedded beads.Store
+			for i := 0; i < value.NumField(); i++ {
+				field := value.Type().Field(i)
+				if !field.Anonymous || !value.Field(i).CanInterface() {
+					continue
+				}
+				if candidate, ok := value.Field(i).Interface().(beads.Store); ok {
+					embedded = candidate
+					break
+				}
+			}
+			if embedded != nil {
+				store = embedded
+				continue
+			}
+		}
+		break
+	}
+	return fmt.Sprintf("%T:%p", store, store)
 }
 
 // sortedStoreGroupKeys returns the store keys of groups in a stable order.

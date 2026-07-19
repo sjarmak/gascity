@@ -82,5 +82,23 @@ func TestWakeDedupCarriesTheWinningBeadsContext(t *testing.T) {
 	}
 }
 
+func TestWakeDedupCarriesWinningSameIDStoreRef(t *testing.T) {
+	created := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	cfg := &config.City{Agents: []config.Agent{poolAgent("claude", "rig", nil, 0)}}
+	work := []beads.Bead{
+		wakeWorkBead("dup", "in_progress", 1, created),
+		wakeWorkBead("dup", "in_progress", 1, created),
+	}
+	closed := closedPoolSessionBead()
+
+	states := computePoolDesiredStatesWithAssignedStoreRefs(
+		cfg, work, []string{"rig:zeta", "rig:alpha"}, sessionInfosFromBeads([]beads.Bead{closed}), nil, nil, nil,
+	)
+	req := wakeRequestFor(t, states, "rig/claude")
+	if req.WorkBeadID != "dup" || req.WorkStoreRef != "rig:alpha" {
+		t.Fatalf("winning wake request = %+v, want deterministic exact rig:alpha/dup binding", req)
+	}
+}
+
 // Under fifo the best bead is the oldest one, not the most urgent — dedup must
 // resolve through the pool's policy rather than a hardcoded priority order.

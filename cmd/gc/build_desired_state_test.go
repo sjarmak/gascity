@@ -907,6 +907,44 @@ func TestDefaultScaleCheckDemandCarriesTriggerBeadID(t *testing.T) {
 	}
 }
 
+func TestDefaultScaleCheckDemandUsesPhysicalStoreIdentityBeforeCollectingRows(t *testing.T) {
+	const template = "worker"
+	createdAt := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	priority := 1
+	newStore := func(t *testing.T) beads.Store {
+		t.Helper()
+		store := beads.NewMemStore()
+		if _, err := store.Create(beads.Bead{
+			ID: "same", Title: "identical", Type: "task", Status: "open",
+			Priority: &priority, CreatedAt: createdAt,
+			Metadata: map[string]string{"gc.routed_to": template},
+		}); err != nil {
+			t.Fatalf("create work: %v", err)
+		}
+		return store
+	}
+
+	first := newStore(t)
+	second := newStore(t)
+	targets := []defaultScaleCheckTarget{
+		{template: template, storeKey: "city", store: first},
+		{template: template, storeKey: "rig:other", store: second},
+	}
+	counts, demand, _, errs := defaultScaleCheckCountsAndDemand(targets)
+	if len(errs) != 0 || counts[template] != 2 || len(demand[template].WorkItems) != 2 {
+		t.Fatalf("independent identical stores: counts=%v demand=%#v errs=%v, want both rows", counts, demand, errs)
+	}
+
+	targets[1].store = first
+	counts, demand, _, errs = defaultScaleCheckCountsAndDemand(targets)
+	if len(errs) != 0 || counts[template] != 1 || len(demand[template].WorkItems) != 1 {
+		t.Fatalf("aliased physical store: counts=%v demand=%#v errs=%v, want one canonical row", counts, demand, errs)
+	}
+	if got := demand[template].WorkItems[0].StoreRef; got != "city" {
+		t.Fatalf("aliased row store ref = %q, want first canonical ref city", got)
+	}
+}
+
 func TestMergeScaleCheckDemandPreservesPriorityAndCreationTime(t *testing.T) {
 	createdAt := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	incoming := scaleCheckDemand{

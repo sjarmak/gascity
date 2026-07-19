@@ -108,9 +108,33 @@ func ComputePoolDesiredStatesWithDemandTraced(
 	return computePoolDesiredStates(cfg, assignedWorkBeads, sessionInfos, scaleCheckCounts, scaleCheckDemand, trace)
 }
 
+func computePoolDesiredStatesWithAssignedStoreRefs(
+	cfg *config.City,
+	assignedWorkBeads []beads.Bead,
+	assignedWorkStoreRefs []string,
+	sessionInfos []sessionpkg.Info,
+	scaleCheckCounts map[string]int,
+	scaleCheckDemand map[string]scaleCheckDemand,
+	trace *sessionReconcilerTraceCycle,
+) []PoolDesiredState {
+	return computePoolDesiredStatesByStore(cfg, assignedWorkBeads, assignedWorkStoreRefs, sessionInfos, scaleCheckCounts, scaleCheckDemand, trace)
+}
+
 func computePoolDesiredStates(
 	cfg *config.City,
 	assignedWorkBeads []beads.Bead,
+	sessionInfos []sessionpkg.Info,
+	scaleCheckCounts map[string]int,
+	scaleCheckDemand map[string]scaleCheckDemand,
+	trace *sessionReconcilerTraceCycle,
+) []PoolDesiredState {
+	return computePoolDesiredStatesByStore(cfg, assignedWorkBeads, nil, sessionInfos, scaleCheckCounts, scaleCheckDemand, trace)
+}
+
+func computePoolDesiredStatesByStore(
+	cfg *config.City,
+	assignedWorkBeads []beads.Bead,
+	assignedWorkStoreRefs []string,
 	sessionInfos []sessionpkg.Info,
 	scaleCheckCounts map[string]int,
 	scaleCheckDemand map[string]scaleCheckDemand,
@@ -166,7 +190,11 @@ func computePoolDesiredStates(
 
 		// Resume tier: actionable assigned work beads whose assignee resolves
 		// to a non-closed session bead. These sessions must stay alive.
-		for _, wb := range assignedWorkBeads {
+		for workIndex, wb := range assignedWorkBeads {
+			workStoreRef := ""
+			if workIndex < len(assignedWorkStoreRefs) {
+				workStoreRef = strings.TrimSpace(assignedWorkStoreRefs[workIndex])
+			}
 			routedTo := routedToOrLegacyWorkflowTarget(wb)
 			if wb.Status != "in_progress" && wb.Status != "open" {
 				continue
@@ -208,6 +236,7 @@ func computePoolDesiredStates(
 					Tier:           "resume",
 					SessionBeadID:  sessionBeadID,
 					WorkBeadID:     wb.ID,
+					WorkStoreRef:   workStoreRef,
 					WorkCreatedAt:  wb.CreatedAt,
 					WorkPack:       strings.TrimSpace(wb.Metadata[beadmeta.PackMetadataKey]),
 					WorkWorkspace:  strings.TrimSpace(wb.Metadata[beadmeta.PackWorkspaceMetadataKey]),
@@ -229,6 +258,7 @@ func computePoolDesiredStates(
 				BeadPriority:   beadPriority(wb),
 				Tier:           "wake-known-identity",
 				WorkBeadID:     wb.ID,
+				WorkStoreRef:   workStoreRef,
 				WorkCreatedAt:  wb.CreatedAt,
 				WorkPack:       strings.TrimSpace(wb.Metadata[beadmeta.PackMetadataKey]),
 				WorkWorkspace:  strings.TrimSpace(wb.Metadata[beadmeta.PackWorkspaceMetadataKey]),
@@ -650,10 +680,16 @@ func newNestedCapUsage() nestedCapUsage {
 // admits before b's, under policy. Wake requests always carry a real work bead
 // (id and creation time), so the bead comparator applies directly.
 func wakeCandidateLess(a, b SessionRequest) bool {
-	return beads.ReadyLess(
+	if less := beads.ReadyLess(
 		beads.Bead{ID: a.WorkBeadID, Priority: a.BeadPriority, CreatedAt: a.WorkCreatedAt},
 		beads.Bead{ID: b.WorkBeadID, Priority: b.BeadPriority, CreatedAt: b.WorkCreatedAt},
-	)
+	); less || beads.ReadyLess(
+		beads.Bead{ID: b.WorkBeadID, Priority: b.BeadPriority, CreatedAt: b.WorkCreatedAt},
+		beads.Bead{ID: a.WorkBeadID, Priority: a.BeadPriority, CreatedAt: a.WorkCreatedAt},
+	) {
+		return less
+	}
+	return a.WorkStoreRef < b.WorkStoreRef
 }
 
 func acceptedNestedCapUsage(limits nestedCapLimits, requests []SessionRequest) nestedCapUsage {

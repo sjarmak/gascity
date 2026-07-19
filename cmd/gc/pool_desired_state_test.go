@@ -1058,6 +1058,21 @@ func TestComputePoolDesiredStates_OpenAssignedWorkResumes(t *testing.T) {
 	}
 }
 
+func TestComputePoolDesiredStates_ResumePreservesAssignedWorkStoreRef(t *testing.T) {
+	cfg := &config.City{Agents: []config.Agent{poolAgent("claude", "", intPtr(5), 0)}}
+	work := []beads.Bead{workBead("dup", "claude", "sess-1", "in_progress", 2)}
+	sessions := sessionInfosFromBeads([]beads.Bead{sessionBead("sess-1", "open")})
+
+	result := computePoolDesiredStatesWithAssignedStoreRefs(cfg, work, []string{"rig:svc"}, sessions, nil, nil, nil)
+	if len(result) != 1 || len(result[0].Requests) != 1 {
+		t.Fatalf("result = %#v, want one resume request", result)
+	}
+	req := result[0].Requests[0]
+	if req.Tier != "resume" || req.WorkBeadID != "dup" || req.WorkStoreRef != "rig:svc" {
+		t.Fatalf("resume request = %+v, want exact rig:svc/dup binding", req)
+	}
+}
+
 // --- Regression tests: these define the consolidated demand behavior ---
 
 // Regression: resume preserves assigned session even when scale_check is 0.
