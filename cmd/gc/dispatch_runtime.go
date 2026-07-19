@@ -736,11 +736,10 @@ func workflowServeControlReadyQueryForBeads(agentCfg config.Agent, beadsCfg conf
 	if beadsCfg.UsesBD105ReadySemantics() {
 		includeEphemeral = " --include-ephemeral"
 	}
-	// Dedupe, then impose the agent's admission order and take the scan window
-	// HERE rather than letting bd order a truncated fetch: no bd --sort
-	// reproduces priority_fifo (beads.AdmissionPolicy.BdSortFlagFor), so a
-	// bd-chosen window can drop an aged P0 that this lane would then never see.
-	// The routed probes fetch unbounded for the same reason.
+	// Ask bd for a bounded priority-first window, then impose the canonical
+	// priority_fifo created-at/id tie-break after merging aliases. --sort
+	// priority is the only bounded provider order that cannot hide a P0 behind
+	// lower-priority rows; hybrid is deliberately not used here.
 	jqFilter := fmt.Sprintf(
 		`reduce add[] as $item ([]; if (($item.metadata // {})[%q] // "") != "" then . elif any(.[]; .id == $item.id) then . else . + [$item] end) | sort_by(%s) | .[:%s]`,
 		beadmeta.InstantiatingMetadataKey,
@@ -770,10 +769,10 @@ func workflowServeControlReadyQueryForBeads(agentCfg config.Agent, beadsCfg conf
 		`tmp=$(mktemp); seen="$tmp.seen"; err="$tmp.err"; : > "$seen"; trap "rm -f \"$tmp\" \"$seen\" \"$err\"" EXIT; ` +
 		`emit_ready() { r=$("$@" 2>"$err") || { status=$?; [ -n "$r" ] && printf "%s\n" "$r" >&2; cat "$err" >&2; return "$status"; }; [ -n "$r" ] && [ "$r" != "[]" ] && printf "%s\n" "$r" >> "$tmp"; return 0; }; ` +
 		`assignee_ready() { cand="$1"; [ -z "$cand" ] && return 0; if grep -Fxq "$cand" "$seen"; then return 0; fi; printf "%s\n" "$cand" >> "$seen"; ` +
-		`emit_ready bd --readonly --sandbox ready` + includeEphemeral + ` --assignee="$cand" --exclude-type=epic --json --limit=` + limit + `; }; ` +
+		`emit_ready bd --readonly --sandbox ready` + includeEphemeral + ` --assignee="$cand" --exclude-type=epic --json --sort priority --limit=` + limit + `; }; ` +
 		`routed_ready() { route="$1"; [ -z "$route" ] && return 0; ` +
-		`emit_ready bd --readonly --sandbox ready` + includeEphemeral + ` --metadata-field "` + beadmeta.RunTargetMetadataKey + `=$route" --unassigned --exclude-type=epic --json --limit=0; ` +
-		`emit_ready bd --readonly --sandbox ready` + includeEphemeral + ` --metadata-field "` + beadmeta.RoutedToMetadataKey + `=$route" --unassigned --exclude-type=epic --json --limit=0; ` +
+		`emit_ready bd --readonly --sandbox ready` + includeEphemeral + ` --metadata-field "` + beadmeta.RunTargetMetadataKey + `=$route" --unassigned --exclude-type=epic --json --sort priority --limit=` + limit + `; ` +
+		`emit_ready bd --readonly --sandbox ready` + includeEphemeral + ` --metadata-field "` + beadmeta.RoutedToMetadataKey + `=$route" --unassigned --exclude-type=epic --json --sort priority --limit=` + limit + `; ` +
 		`}; ` +
 		`for id in "$GC_CONTROL_SESSION_NAME" "$GC_SESSION_NAME" "$GC_ALIAS" "$GC_CONTROL_TARGET" "$GC_SESSION_ID"; do ` +
 		`[ -z "$id" ] && continue; ` +

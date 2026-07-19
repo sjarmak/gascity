@@ -1553,6 +1553,34 @@ func TestComputePoolDesiredStates_InFlightReuseSkipsDemandByIdentityNotIndex(t *
 	}
 }
 
+func TestComputePoolDesiredStates_SameIDAcrossStoresPreservesBothAndSubtractsExactBinding(t *testing.T) {
+	cfg := &config.City{Agents: []config.Agent{poolAgent("claude", "", intPtr(10), 0)}}
+	created := time.Date(2026, 7, 19, 8, 0, 0, 0, time.UTC)
+	session := inFlightPoolSessionBoundTo("sess-rig", "dup")
+	session.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey] = "rig:svc"
+	demand := map[string]scaleCheckDemand{"claude": {
+		Count: 2,
+		WorkItems: []scaleCheckWork{
+			{BeadID: "dup", StoreRef: "city", Priority: 0, CreatedAt: created, Title: "city-p0", Pack: "city-pack", Workspace: "city-ws", BrainParentSID: "city-brain"},
+			{BeadID: "dup", StoreRef: "rig:svc", Priority: 2, CreatedAt: created.Add(-time.Hour), Title: "rig-p2"},
+		},
+	}}
+
+	states := ComputePoolDesiredStatesWithDemandTraced(cfg, nil, sessionInfosFromBeads([]beads.Bead{session}), map[string]int{"claude": 2}, demand, nil)
+	if len(states) != 1 || len(states[0].Requests) != 2 {
+		t.Fatalf("states = %#v, want one in-flight and one fresh request", states)
+	}
+	var fresh SessionRequest
+	for _, req := range states[0].Requests {
+		if req.SessionBeadID == "" {
+			fresh = req
+		}
+	}
+	if fresh.WorkBeadID != "dup" || fresh.WorkStoreRef != "city" || fresh.WorkBeadTitle != "city-p0" || beads.PriorityValue(fresh.BeadPriority) != 0 || fresh.WorkPack != "city-pack" || fresh.WorkWorkspace != "city-ws" || fresh.BrainParentSID != "city-brain" {
+		t.Fatalf("fresh request = %+v, want full city/dup context; rig binding must suppress only rig:svc/dup", fresh)
+	}
+}
+
 func TestComputePoolDesiredStates_InFlightDemandRecordsTrace(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{poolAgent("claude", "", intPtr(10), 0)},

@@ -130,7 +130,26 @@ func TestFilterReadyByAssigneeRespectsLimit(t *testing.T) {
 	}
 }
 
-func TestFilterReadyByRouteRequiresUnassignedAndSortsOldestFirst(t *testing.T) {
+func TestEvaluateControlReadyMixedWindowKeepsP0Visible(t *testing.T) {
+	p2 := 2
+	p0 := 0
+	target := "core/control-dispatcher"
+	ready := make([]beads.Bead, 0, workflowServeScanLimit+6)
+	for i := 0; i < workflowServeScanLimit+5; i++ {
+		ready = append(ready, beads.Bead{ID: fmt.Sprintf("p2-%02d", i), Priority: &p2, CreatedAt: time.Unix(int64(i), 0), Metadata: map[string]string{beadmeta.RoutedToMetadataKey: target}})
+	}
+	ready = append(ready, beads.Bead{ID: "p0-visible", Priority: &p0, CreatedAt: time.Unix(999, 0), Metadata: map[string]string{beadmeta.RoutedToMetadataKey: target}})
+	beads.SortBeadsReadyOrder(ready)
+	got := evaluateControlReady(ready, parsedControlReadyQuery{target: target}, nil)
+	if len(got) != workflowServeScanLimit {
+		t.Fatalf("len(got) = %d, want %d", len(got), workflowServeScanLimit)
+	}
+	if got[0].ID != "p0-visible" {
+		t.Fatalf("first result = %q, want p0-visible from >20 mixed rows", got[0].ID)
+	}
+}
+
+func TestFilterReadyByRouteRequiresUnassignedAndSortsPriorityFIFO(t *testing.T) {
 	newer := time.Unix(200, 0)
 	older := time.Unix(100, 0)
 	ready := []beads.Bead{

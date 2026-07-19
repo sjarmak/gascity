@@ -2998,9 +2998,9 @@ func TestWorkflowServeControlReadyQueryUsesControlTiers(t *testing.T) {
 		t.Fatalf("workflowServeControlReadyQuery should disable bd auto-export: %q", query)
 	}
 	for _, want := range []string{
-		`bd --readonly --sandbox ready --assignee="$cand" --exclude-type=epic --json --limit=20`,
-		`bd --readonly --sandbox ready --metadata-field "gc.run_target=$route" --unassigned --exclude-type=epic --json --limit=0`,
-		`bd --readonly --sandbox ready --metadata-field "gc.routed_to=$route" --unassigned --exclude-type=epic --json --limit=0`,
+		`bd --readonly --sandbox ready --assignee="$cand" --exclude-type=epic --json --sort priority --limit=20`,
+		`bd --readonly --sandbox ready --metadata-field "gc.run_target=$route" --unassigned --exclude-type=epic --json --sort priority --limit=20`,
+		`bd --readonly --sandbox ready --metadata-field "gc.routed_to=$route" --unassigned --exclude-type=epic --json --sort priority --limit=20`,
 		`routed_ready "$GC_CONTROL_TARGET"`,
 		`routed_ready "${GC_CONTROL_LEGACY_TARGET:-}"`,
 	} {
@@ -3010,6 +3010,9 @@ func TestWorkflowServeControlReadyQueryUsesControlTiers(t *testing.T) {
 	}
 	if !strings.Contains(query, `--limit=20`) {
 		t.Fatalf("workflowServeControlReadyQuery missing scan limit: %q", query)
+	}
+	if strings.Contains(query, "--limit=0") || strings.Contains(query, "--limit 0") || strings.Contains(query, "--sort hybrid") {
+		t.Fatalf("workflowServeControlReadyQuery must use only bounded priority-first provider reads: %q", query)
 	}
 	if strings.Contains(query, "--include-ephemeral") {
 		t.Fatalf("workflowServeControlReadyQuery default must stay bd 1.0.4-compatible: %q", query)
@@ -3193,9 +3196,9 @@ func TestWorkflowServeControlReadyQueryBD105IncludesEphemeral(t *testing.T) {
 		config.BeadsConfig{BDCompatibility: config.BeadsBDCompatibility105},
 	)
 	for _, want := range []string{
-		`bd --readonly --sandbox ready --include-ephemeral --assignee="$cand" --exclude-type=epic --json --limit=20`,
-		`bd --readonly --sandbox ready --include-ephemeral --metadata-field "gc.run_target=$route" --unassigned --exclude-type=epic --json --limit=0`,
-		`bd --readonly --sandbox ready --include-ephemeral --metadata-field "gc.routed_to=$route" --unassigned --exclude-type=epic --json --limit=0`,
+		`bd --readonly --sandbox ready --include-ephemeral --assignee="$cand" --exclude-type=epic --json --sort priority --limit=20`,
+		`bd --readonly --sandbox ready --include-ephemeral --metadata-field "gc.run_target=$route" --unassigned --exclude-type=epic --json --sort priority --limit=20`,
+		`bd --readonly --sandbox ready --include-ephemeral --metadata-field "gc.routed_to=$route" --unassigned --exclude-type=epic --json --sort priority --limit=20`,
 	} {
 		if !strings.Contains(query, want) {
 			t.Fatalf("workflowServeControlReadyQueryForBeads(bd-1.0.5) missing %q in %q", want, query)

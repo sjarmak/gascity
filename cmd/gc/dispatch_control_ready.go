@@ -201,7 +201,9 @@ func filterReadyByAssignee(ready []beads.Bead, assignee string, limit int) []bea
 	return out
 }
 
-// filterReadyByRoute mirrors `bd ready --metadata-field $metadataKey=$route --unassigned --exclude-type=epic --sort oldest --limit=N`.
+// filterReadyByRoute applies the lane's fixed priority_fifo policy before its
+// bounded window, matching the provider query's priority-first guarantee and
+// adding the canonical created-at/id tie-break in process.
 func filterReadyByRoute(ready []beads.Bead, metadataKey, route string, limit int) []beads.Bead {
 	var matched []beads.Bead
 	for _, b := range ready {
@@ -213,7 +215,7 @@ func filterReadyByRoute(ready []beads.Bead, metadataKey, route string, limit int
 		}
 		matched = append(matched, b)
 	}
-	beads.SortBeads(matched, beads.SortCreatedAsc)
+	beads.SortBeadsReadyOrder(matched)
 	if limit > 0 && len(matched) > limit {
 		matched = matched[:limit]
 	}

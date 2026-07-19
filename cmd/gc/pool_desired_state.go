@@ -304,22 +304,22 @@ func computePoolDesiredStates(
 			// low-ranked work push the materializer past higher-ranked demand:
 			// it would re-create the bead the session already owns and drop the
 			// urgent bead's request metadata on the floor.
-			boundWorkBeadIDs := make(map[string]struct{}, inFlightCount)
+			boundWork := make(map[workIdentity]struct{}, inFlightCount)
 			for j := 0; j < inFlightCount; j++ {
 				req := inFlight[j]
-				if workBeadID := strings.TrimSpace(req.WorkBeadID); workBeadID != "" {
-					boundWorkBeadIDs[workBeadID] = struct{}{}
+				if identity, ok := requestWorkIdentity(req); ok {
+					boundWork[identity] = struct{}{}
 				}
 				allRequests = append(allRequests, req)
 			}
 			demand := scaleCheckDemand[template]
-			remaining := unboundDemandWorkBeadIDs(demand, boundWorkBeadIDs)
+			remaining := unboundDemandWork(demand, boundWork)
 			for j := 0; j < newCount-inFlightCount; j++ {
-				workBeadID := ""
+				var work scaleCheckWork
 				if j < len(remaining) {
-					workBeadID = remaining[j]
+					work = remaining[j]
 				}
-				allRequests = append(allRequests, newDemandSessionRequest(template, workBeadID, demand))
+				allRequests = append(allRequests, newDemandSessionRequest(template, work, demand))
 			}
 		}
 	}
@@ -332,20 +332,37 @@ func computePoolDesiredStates(
 // from this list in order, so the highest-ranked work no session already owns
 // always gets materialized first. Blank IDs are dropped rather than allowed to
 // occupy a slot: they carry no work to launch against.
-func unboundDemandWorkBeadIDs(demand scaleCheckDemand, bound map[string]struct{}) []string {
-	if len(demand.WorkBeadIDs) == 0 {
-		return nil
+type workIdentity struct{ StoreRef, BeadID string }
+
+func requestWorkIdentity(req SessionRequest) (workIdentity, bool) {
+	id := workIdentity{StoreRef: strings.TrimSpace(req.WorkStoreRef), BeadID: strings.TrimSpace(req.WorkBeadID)}
+	return id, id.BeadID != ""
+}
+
+func demandWorkItems(demand scaleCheckDemand) []scaleCheckWork {
+	if len(demand.WorkItems) > 0 {
+		return demand.WorkItems
 	}
-	remaining := make([]string, 0, len(demand.WorkBeadIDs))
+	items := make([]scaleCheckWork, 0, len(demand.WorkBeadIDs))
 	for _, id := range demand.WorkBeadIDs {
-		workBeadID := strings.TrimSpace(id)
-		if workBeadID == "" {
+		items = append(items, scaleCheckWork{BeadID: id, Title: demand.Titles[id], Priority: demand.Priorities[id], CreatedAt: demand.CreatedAt[id], Pack: demand.Packs[id], Workspace: demand.Workspaces[id], StoreRef: demand.StoreRefs[id], BrainParentSID: demand.ParentSIDs[id]})
+	}
+	return items
+}
+
+func unboundDemandWork(demand scaleCheckDemand, bound map[workIdentity]struct{}) []scaleCheckWork {
+	items := demandWorkItems(demand)
+	remaining := make([]scaleCheckWork, 0, len(items))
+	for _, work := range items {
+		work.BeadID = strings.TrimSpace(work.BeadID)
+		work.StoreRef = strings.TrimSpace(work.StoreRef)
+		if work.BeadID == "" {
 			continue
 		}
-		if _, ok := bound[workBeadID]; ok {
+		if _, ok := bound[workIdentity{StoreRef: work.StoreRef, BeadID: work.BeadID}]; ok {
 			continue
 		}
-		remaining = append(remaining, workBeadID)
+		remaining = append(remaining, work)
 	}
 	return remaining
 }
@@ -354,13 +371,25 @@ func unboundDemandWorkBeadIDs(demand scaleCheckDemand, bound map[string]struct{}
 // carrying workBeadID's launch context from demand. An empty workBeadID yields
 // an anonymous request: scale_check reported demand that no bead in the demand
 // map accounts for, so the slot is filled without work metadata.
-func newDemandSessionRequest(template, workBeadID string, demand scaleCheckDemand) SessionRequest {
+func newDemandSessionRequest(template string, work scaleCheckWork, demand scaleCheckDemand) SessionRequest {
+	workBeadID := strings.TrimSpace(work.BeadID)
 	req := SessionRequest{
 		Template:   template,
 		Tier:       "new",
 		WorkBeadID: workBeadID,
 	}
 	if workBeadID == "" {
+		return req
+	}
+	if len(demand.WorkItems) > 0 {
+		req.WorkBeadTitle = work.Title
+		priority := work.Priority
+		req.BeadPriority = &priority
+		req.WorkCreatedAt = work.CreatedAt
+		req.WorkPack = work.Pack
+		req.WorkWorkspace = work.Workspace
+		req.WorkStoreRef = work.StoreRef
+		req.BrainParentSID = work.BrainParentSID
 		return req
 	}
 	if demand.Titles != nil {
@@ -702,6 +731,9 @@ func sessionRequestLess(left, right SessionRequest) bool {
 	}
 	if left.WorkBeadID != right.WorkBeadID {
 		return left.WorkBeadID < right.WorkBeadID
+	}
+	if left.WorkStoreRef != right.WorkStoreRef {
+		return left.WorkStoreRef < right.WorkStoreRef
 	}
 	// Total tie-break on stable identity. Without it two distinct requests
 	// could compare equal in both directions and leave the sort input-order

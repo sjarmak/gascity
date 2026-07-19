@@ -114,16 +114,31 @@ type defaultScaleCheckTarget struct {
 type scaleCheckDemand struct {
 	Count       int
 	WorkBeadIDs []string
-	Titles      map[string]string
-	Priorities  map[string]int
-	CreatedAt   map[string]time.Time
-	Packs       map[string]string
-	Workspaces  map[string]string
-	StoreRefs   map[string]string
+	// WorkItems is the canonical representation. WorkBeadIDs and the maps
+	// below remain as compatibility projections for callers/tests that build
+	// demand by hand, but cannot identify same-ID work from independent stores.
+	WorkItems  []scaleCheckWork
+	Titles     map[string]string
+	Priorities map[string]int
+	CreatedAt  map[string]time.Time
+	Packs      map[string]string
+	Workspaces map[string]string
+	StoreRefs  map[string]string
 	// ParentSIDs maps work-bead id → gc.brain_parent_sid, carrying the fork
 	// parent through to the new pool session bead so the launch path can fork
 	// the warm arm off its pre-built brain.
 	ParentSIDs map[string]string
+}
+
+type scaleCheckWork struct {
+	BeadID         string
+	Title          string
+	Priority       int
+	CreatedAt      time.Time
+	Pack           string
+	Workspace      string
+	StoreRef       string
+	BrainParentSID string
 }
 
 // scaleCheckCandidate is one demand row before it is merged into a template's
@@ -152,6 +167,14 @@ type poolSessionCreateBudget struct {
 	templateRemaining map[string]int
 	spare             int
 }
+
+// This remains separate from internal/poolplan.CreateBudget because the
+// reconciler budget now allocates recovery before fresh demand and orders each
+// fresh round by the next request's priority band. poolplan.CreateBudget only
+// accepts aggregate fresh counts plus a floor bit; adapting to it would discard
+// the work-level ordering this admission path is specifically required to
+// preserve. Consolidation should happen by moving this richer pure planner into
+// poolplan, not by projecting it back to the older lossy input shape.
 
 func newPoolSessionCreateBudget(limit int) *poolSessionCreateBudget {
 	if limit <= 0 {
@@ -1759,15 +1782,10 @@ func sortScaleCheckCandidates(rows []scaleCheckCandidate) {
 // scaleCheckDemandFromCandidates builds a template's demand entry from the rows
 // collected across its probed stores.
 //
-// A bead ID that appears in more than one independent store keeps only its most
-// urgent row. The entry's metadata is keyed by bare bead ID (the hazard
-// storeScopedBeadKey documents for wake readiness), so two rows sharing an ID
-// cannot both be described: whichever store was visited last would define the
-// priority, created_at, title and store ref of both, letting a real P0 be
-// dispatched as the P2 it collided with and binding its session to the other
-// store's work. The dropped row's demand still survives in Count and in counts,
-// which spawns an anonymous session that claims its own work — no demand is
-// lost, and no session is aimed at the wrong store.
+// WorkItems preserves the complete (canonical store ref, bead ID) identity.
+// The legacy ID-keyed projections intentionally describe only the first row
+// for a duplicate ID; all planning paths consume WorkItems and never downgrade
+// the other store's row to anonymous demand.
 func scaleCheckDemandFromCandidates(rows []scaleCheckCandidate) scaleCheckDemand {
 	sortScaleCheckCandidates(rows)
 	entry := scaleCheckDemand{
@@ -1779,6 +1797,14 @@ func scaleCheckDemandFromCandidates(rows []scaleCheckCandidate) scaleCheckDemand
 	}
 	for _, row := range rows {
 		b := row.bead
+		item := scaleCheckWork{
+			BeadID: b.ID, Title: b.Title, Priority: beads.PriorityValue(b.Priority),
+			CreatedAt: b.CreatedAt, StoreRef: row.storeRef,
+			Pack:           strings.TrimSpace(b.Metadata[beadmeta.PackMetadataKey]),
+			Workspace:      strings.TrimSpace(b.Metadata[beadmeta.PackWorkspaceMetadataKey]),
+			BrainParentSID: strings.TrimSpace(b.Metadata[beadmeta.BrainParentSIDMetadataKey]),
+		}
+		entry.WorkItems = append(entry.WorkItems, item)
 		if _, seen := entry.Priorities[b.ID]; seen {
 			continue
 		}
@@ -1810,7 +1836,15 @@ func scaleCheckDemandFromCandidates(rows []scaleCheckCandidate) scaleCheckDemand
 }
 
 func mergeScaleCheckDemand(existing, incoming scaleCheckDemand, count int) scaleCheckDemand {
-	if count <= 0 || len(incoming.WorkBeadIDs) == 0 {
+	if count <= 0 || (len(incoming.WorkItems) == 0 && len(incoming.WorkBeadIDs) == 0) {
+		return existing
+	}
+	if len(incoming.WorkItems) > 0 {
+		limit := minInt(count, len(incoming.WorkItems))
+		existing.WorkItems = append(existing.WorkItems, incoming.WorkItems[:limit]...)
+		if existing.Count < count {
+			existing.Count = count
+		}
 		return existing
 	}
 	limit := count

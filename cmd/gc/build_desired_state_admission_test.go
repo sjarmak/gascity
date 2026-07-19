@@ -187,8 +187,17 @@ func TestDefaultScaleCheckDemandKeepsSameIDStoresApart(t *testing.T) {
 			t.Fatalf("attempt %d: counts[%q] = %d, want 2 (both stores' rows are real demand)", attempt, template, got)
 		}
 		entry := demand[template]
+		if got := len(entry.WorkItems); got != 2 {
+			t.Fatalf("attempt %d: WorkItems len = %d, want 2", attempt, got)
+		}
+		if got := entry.WorkItems[0]; got.BeadID != sharedID || got.StoreRef != "city" || got.Priority != p0 || got.Title != "city urgent work" || !got.CreatedAt.Equal(cityCreated) {
+			t.Fatalf("attempt %d: WorkItems[0] = %+v, want full city P0 identity/context", attempt, got)
+		}
+		if got := entry.WorkItems[1]; got.BeadID != sharedID || got.StoreRef != "rig:svc" || got.Priority != p2 || got.Title != "rig routine work" || !got.CreatedAt.Equal(rigCreated) {
+			t.Fatalf("attempt %d: WorkItems[1] = %+v, want full rig P2 identity/context", attempt, got)
+		}
 		if got := len(entry.WorkBeadIDs); got != 1 || entry.WorkBeadIDs[0] != sharedID {
-			t.Fatalf("attempt %d: WorkBeadIDs = %v, want exactly one %q row (an ID-keyed entry cannot represent two)", attempt, entry.WorkBeadIDs, sharedID)
+			t.Fatalf("attempt %d: compatibility WorkBeadIDs = %v, want exactly one %q projection", attempt, entry.WorkBeadIDs, sharedID)
 		}
 		// The surviving row is the most urgent one, and every piece of its
 		// metadata describes that same bead in that same store.
