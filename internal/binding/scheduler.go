@@ -20,6 +20,15 @@ var errSkipCandidate = errors.New("skip candidate")
 // never escapes commit.
 var errLostRace = errors.New("bound concurrently")
 
+type crashPoint string
+
+const (
+	crashAfterReserve crashPoint = "after-reserve"
+	crashAfterPending crashPoint = "after-pending"
+	crashAfterConsume crashPoint = "after-consume"
+	crashAfterActive  crashPoint = "after-active"
+)
+
 // HealthCheck reports whether a provider is fit to receive work.
 //
 // It returns (healthy, present). A present=false answer means the health
@@ -64,6 +73,7 @@ type Scheduler struct {
 	ledger   *capacity.Ledger
 	now      func() time.Time
 	health   HealthCheck
+	crash    func(crashPoint) error
 }
 
 // Option configures a Scheduler.
@@ -75,6 +85,9 @@ func WithClock(fn func() time.Time) Option { return func(s *Scheduler) { s.now =
 // WithHealthCheck supplies the provider health gate. Without one the scheduler
 // has no health dimension and every candidate's provider is treated as fit.
 func WithHealthCheck(fn HealthCheck) Option { return func(s *Scheduler) { s.health = fn } }
+
+// withCrashHook is a deterministic test seam for process-death boundaries.
+func withCrashHook(fn func(crashPoint) error) Option { return func(s *Scheduler) { s.crash = fn } }
 
 // NewScheduler returns a scheduler binding workloads against ledger for the
 // city at cityPath.
@@ -105,6 +118,9 @@ func NewScheduler(cityPath string, ledger *capacity.Ledger, opts ...Option) *Sch
 // batch, and a pass that binds one workload and loses the rest is exactly the
 // partial state this transition exists to make unreachable.
 func (s *Scheduler) Bind(ctx context.Context, req BindRequest) (*Binding, error) {
+	if err := s.Recover(); err != nil {
+		return nil, fmt.Errorf("recovering pending bindings: %w", err)
+	}
 	if err := validate(req.Candidates); err != nil {
 		return nil, err
 	}
@@ -154,6 +170,7 @@ func (s *Scheduler) Release(workloadID string) error {
 		if err := s.ledger.Release(b.ReservationRef); err != nil {
 			return fmt.Errorf("releasing reservation %q for workload %q: %w", b.ReservationRef, workloadID, err)
 		}
+		st.Pending = removeByWorkload(st.Pending, workloadID)
 		st.Bound = removeByWorkload(st.Bound, workloadID)
 		return nil
 	})
@@ -196,12 +213,17 @@ func (s *Scheduler) tryBind(ctx context.Context, w ReadyWorkload, caps capacity.
 		}
 		return nil, fmt.Errorf("reserving capacity for workload %q: %w", w.ID, err)
 	}
+	if err := s.hit(crashAfterReserve); err != nil {
+		return nil, err
+	}
 
 	// Phase 3 (locked): re-check against the present store and commit.
 	return s.commit(w, rsv)
 }
 
-// commit writes the Binding under the lock, or writes nothing.
+// commit durably records intent, consumes its reservation, then promotes the
+// intent to active. The pending record closes the cross-file crash gap: every
+// consumed reservation is referenced by durable binding state.
 func (s *Scheduler) commit(w ReadyWorkload, rsv capacity.Reservation) (*Binding, error) {
 	var (
 		out    Binding
@@ -216,14 +238,6 @@ func (s *Scheduler) commit(w ReadyWorkload, rsv capacity.Reservation) (*Binding,
 			strand = existing.ReservationRef != rsv.ID
 			return errLostRace
 		}
-		// Consuming inside this lock is the interlock that makes the bind
-		// fail-closed: it proves the unit is still ours. A hold that expired
-		// and was reclaimed while phase 2 ran fails here, and the closure's
-		// error abandons the write, so no Binding is ever fenced to capacity
-		// the ledger has already given away.
-		if err := s.ledger.Consume(rsv.ID); err != nil {
-			return fmt.Errorf("consuming reservation %q for workload %q: %w", rsv.ID, w.ID, err)
-		}
 		out = Binding{
 			WorkloadID:     w.ID,
 			Agent:          w.Agent,
@@ -234,7 +248,7 @@ func (s *Scheduler) commit(w ReadyWorkload, rsv capacity.Reservation) (*Binding,
 			Attempt:        w.PriorAttempt + 1,
 			BoundAt:        s.now(),
 		}
-		st.Bound = append(st.Bound, out)
+		st.Pending = append(st.Pending, out)
 		return nil
 	})
 	if err != nil {
@@ -249,7 +263,76 @@ func (s *Scheduler) commit(w ReadyWorkload, rsv capacity.Reservation) (*Binding,
 		}
 		return nil, err
 	}
+	if err := s.hit(crashAfterPending); err != nil {
+		return nil, err
+	}
+	if err := s.ledger.Consume(rsv.ID); err != nil {
+		// Keep the pending intent. Recovery fails closed and can distinguish a
+		// transient persistence failure from a reclaimed hold.
+		return nil, fmt.Errorf("consuming reservation %q for workload %q: %w", rsv.ID, w.ID, err)
+	}
+	if err := s.hit(crashAfterConsume); err != nil {
+		return nil, err
+	}
+	if err := s.promote(rsv.ID); err != nil {
+		return nil, err
+	}
+	if err := s.hit(crashAfterActive); err != nil {
+		return nil, err
+	}
 	return &out, nil
+}
+
+func (s *Scheduler) hit(point crashPoint) error {
+	if s.crash == nil {
+		return nil
+	}
+	return s.crash(point)
+}
+
+func (s *Scheduler) promote(reservationID string) error {
+	return WithState(s.cityPath, func(st *State) error {
+		for i, b := range st.Pending {
+			if b.ReservationRef != reservationID {
+				continue
+			}
+			st.Pending = append(st.Pending[:i], st.Pending[i+1:]...)
+			if _, exists := findLive(st, b.WorkloadID); !exists {
+				st.Bound = append(st.Bound, b)
+			}
+			return nil
+		}
+		return nil // already promoted: recovery is idempotent
+	})
+}
+
+// Recover finishes durable pending transitions. A missing reservation means
+// an unconsumed hold was reclaimed; its intent is removed. Any other ledger
+// failure leaves the intent in place and stops scheduling (fail closed).
+func (s *Scheduler) Recover() error {
+	state, err := LoadState(s.cityPath)
+	if err != nil {
+		return err
+	}
+	for _, b := range state.Pending {
+		err := s.ledger.Consume(b.ReservationRef)
+		if errors.Is(err, capacity.ErrNotFound) {
+			if err := WithState(s.cityPath, func(st *State) error {
+				st.Pending = removeByReservation(st.Pending, b.ReservationRef)
+				return nil
+			}); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("consuming pending reservation %q: %w", b.ReservationRef, err)
+		}
+		if err := s.promote(b.ReservationRef); err != nil {
+			return fmt.Errorf("promoting pending reservation %q: %w", b.ReservationRef, err)
+		}
+	}
+	return nil
 }
 
 // validate rejects a malformed candidate. A candidate with no identity is a
@@ -305,6 +388,16 @@ func removeByWorkload(bs []Binding, workloadID string) []Binding {
 	out := bs[:0]
 	for _, b := range bs {
 		if b.WorkloadID != workloadID {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+func removeByReservation(bs []Binding, reservationID string) []Binding {
+	out := bs[:0]
+	for _, b := range bs {
+		if b.ReservationRef != reservationID {
 			out = append(out, b)
 		}
 	}

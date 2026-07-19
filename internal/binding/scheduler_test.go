@@ -2,6 +2,7 @@ package binding
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -433,6 +434,116 @@ func TestBind_BindingSurvivesFreshScheduler(t *testing.T) {
 	}
 	if len(state.Bound) != 1 || state.Bound[0].ReservationRef != first.ReservationRef {
 		t.Fatalf("Bound = %+v, want the original binding %+v", state.Bound, first)
+	}
+}
+
+func TestBind_CrashTransitionsRecoverWithoutLeakOrDuplicate(t *testing.T) {
+	crashed := errors.New("simulated process death")
+	for _, tc := range []struct {
+		point                          crashPoint
+		held, consumed, pending, bound int
+	}{
+		{crashAfterReserve, 1, 0, 0, 0},
+		{crashAfterPending, 1, 0, 1, 0},
+		{crashAfterConsume, 0, 1, 1, 0},
+		{crashAfterActive, 0, 1, 0, 1},
+	} {
+		t.Run(string(tc.point), func(t *testing.T) {
+			city := t.TempDir()
+			ledger := capacity.NewLedger(city, capacity.WithClock(testTime))
+			injected := false
+			s := NewScheduler(city, ledger, WithClock(testTime), withCrashHook(func(got crashPoint) error {
+				if got == tc.point && !injected {
+					injected = true
+					return crashed
+				}
+				return nil
+			}))
+			req := BindRequest{Candidates: []ReadyWorkload{workload("gc-1", 1, 0)}, Caps: unlimited()}
+
+			if _, err := s.Bind(context.Background(), req); !errors.Is(err, crashed) {
+				t.Fatalf("Bind error = %v, want simulated crash at %s", err, tc.point)
+			}
+			crashState, err := LoadState(city)
+			if err != nil {
+				t.Fatalf("LoadState at crash: %v", err)
+			}
+			crashSnap, err := ledger.Snapshot()
+			if err != nil {
+				t.Fatalf("Snapshot at crash: %v", err)
+			}
+			if len(crashSnap.Held) != tc.held || len(crashSnap.Consumed) != tc.consumed ||
+				len(crashState.Pending) != tc.pending || len(crashState.Bound) != tc.bound {
+				t.Fatalf("crash state ledger=%+v binding=%+v, want held=%d consumed=%d pending=%d bound=%d",
+					crashSnap, crashState, tc.held, tc.consumed, tc.pending, tc.bound)
+			}
+
+			// A fresh scheduler models restart. Recovery is also called twice to
+			// prove replay itself is harmless before scheduling resumes.
+			fresh := NewScheduler(city, ledger, WithClock(testTime))
+			if err := fresh.Recover(); err != nil {
+				t.Fatalf("Recover: %v", err)
+			}
+			if err := fresh.Recover(); err != nil {
+				t.Fatalf("second Recover: %v", err)
+			}
+			if _, err := fresh.Bind(context.Background(), req); err != nil {
+				t.Fatalf("Bind after restart: %v", err)
+			}
+
+			state, err := LoadState(city)
+			if err != nil {
+				t.Fatalf("LoadState: %v", err)
+			}
+			if len(state.Pending) != 0 || len(state.Bound) != 1 {
+				t.Fatalf("state = %+v, want one active binding and no pending intent", state)
+			}
+			snap, err := ledger.Snapshot()
+			if err != nil {
+				t.Fatalf("Snapshot: %v", err)
+			}
+			if snap.Total != 1 || len(snap.Consumed) != 1 || len(snap.Held) != 0 {
+				t.Fatalf("ledger = %+v, want one consumed unit and no leaked hold", snap)
+			}
+			if state.Bound[0].ReservationRef != snap.Consumed[0].ID {
+				t.Fatalf("binding reservation = %q, consumed = %q", state.Bound[0].ReservationRef, snap.Consumed[0].ID)
+			}
+		})
+	}
+}
+
+func TestRecover_ReclaimedPendingIntentAllowsFreshBind(t *testing.T) {
+	city := t.TempDir()
+	ledger := capacity.NewLedger(city, capacity.WithClock(testTime))
+	crashed := errors.New("simulated process death")
+	s := NewScheduler(city, ledger, WithClock(testTime), withCrashHook(func(point crashPoint) error {
+		if point == crashAfterPending {
+			return crashed
+		}
+		return nil
+	}))
+	req := BindRequest{Candidates: []ReadyWorkload{workload("gc-1", 1, 0)}, Caps: unlimited()}
+	if _, err := s.Bind(context.Background(), req); !errors.Is(err, crashed) {
+		t.Fatalf("Bind error = %v, want simulated crash", err)
+	}
+	state, err := LoadState(city)
+	if err != nil || len(state.Pending) != 1 {
+		t.Fatalf("pending state = %+v, err=%v", state, err)
+	}
+	// Release models TTL reclamation of the still-held reservation.
+	if err := ledger.Release(state.Pending[0].ReservationRef); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	fresh := NewScheduler(city, ledger, WithClock(testTime))
+	if err := fresh.Recover(); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if got, err := fresh.Bind(context.Background(), req); err != nil || got == nil {
+		t.Fatalf("Bind after reclamation = %+v, err=%v", got, err)
+	}
+	state, err = LoadState(city)
+	if err != nil || len(state.Pending) != 0 || len(state.Bound) != 1 {
+		t.Fatalf("recovered state = %+v, err=%v", state, err)
 	}
 }
 

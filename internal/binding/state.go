@@ -63,16 +63,25 @@ type Binding struct {
 // recovery scan's to record, and inventing their storage here would be
 // guessing at their shape.
 type State struct {
-	Bound []Binding `json:"bound,omitempty"`
+	// Pending is the durable intent written before its reservation is
+	// consumed. Recovery either finishes that transition or removes the intent
+	// if the still-held reservation was reclaimed.
+	Pending []Binding `json:"pending,omitempty"`
+	Bound   []Binding `json:"bound,omitempty"`
 }
 
 // SortState orders Bindings deterministically.
 func SortState(state *State) {
-	sort.SliceStable(state.Bound, func(i, j int) bool {
-		if !state.Bound[i].BoundAt.Equal(state.Bound[j].BoundAt) {
-			return state.Bound[i].BoundAt.Before(state.Bound[j].BoundAt)
+	sortBindings(state.Pending)
+	sortBindings(state.Bound)
+}
+
+func sortBindings(bindings []Binding) {
+	sort.SliceStable(bindings, func(i, j int) bool {
+		if !bindings[i].BoundAt.Equal(bindings[j].BoundAt) {
+			return bindings[i].BoundAt.Before(bindings[j].BoundAt)
 		}
-		return state.Bound[i].WorkloadID < state.Bound[j].WorkloadID
+		return bindings[i].WorkloadID < bindings[j].WorkloadID
 	})
 }
 
@@ -157,6 +166,11 @@ func LockPath(cityPath string) string {
 // rather than a pointer into the state so callers cannot mutate the pending
 // transaction through it.
 func findLive(s *State, workloadID string) (Binding, bool) {
+	for _, b := range s.Pending {
+		if b.WorkloadID == workloadID {
+			return b, true
+		}
+	}
 	for _, b := range s.Bound {
 		if b.WorkloadID == workloadID {
 			return b, true
