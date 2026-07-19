@@ -611,8 +611,6 @@ func hookQueryEnv(cityPath string, cfg *config.City, a *config.Agent) (map[strin
 	return env, nil
 }
 
-// WorkQueryRunner runs a work query command and returns its stdout.
-// dir sets the command's working directory.
 // latchClaimBand fixes the priority band a federated claim loop is working in.
 //
 // Once a scan has observed a claimable bead at some band, a later scan in the
@@ -631,6 +629,8 @@ func latchClaimBand(current *int, rank hookClaimCandidateRank) *int {
 	return &priority
 }
 
+// WorkQueryRunner runs a work query command and returns its stdout.
+// dir sets the command's working directory.
 type WorkQueryRunner func(command, dir string) (string, error)
 
 // hookWorkQueryTimeout caps the work-query subprocess that `gc hook` and the

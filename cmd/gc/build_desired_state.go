@@ -252,11 +252,6 @@ func poolSessionCreateDemands(states []PoolDesiredState) []poolCreateDemand {
 	return demands
 }
 
-// poolCreateBand reports the ordering band of a fresh create request: the
-// driving work bead's priority under a banded policy, and one flat band
-// otherwise. A policy without bands must keep the pure seed-rotated
-// round-robin, or the budget would order pools by a priority its own admission
-// policy ignores.
 // nextFreshBand reports the band of d's next unfunded fresh request, or a band
 // weaker than any real one once d's fresh demand is fully funded.
 func nextFreshBand(d poolCreateDemand, funded int) int {
@@ -1782,10 +1777,9 @@ func sortedStoreGroupKeys[T any](groups map[string]T) []string {
 // sortScaleCheckCandidates orders a template's demand rows in the order its
 // pool actually admits work — the same comparator the worker claims with, so
 // the reconciler's view of "most urgent demand" cannot disagree with the
-// worker's view of "next bead to claim". The policy is resolved by the caller
-// rather than hardcoded: a fifo pool must rank its demand by age, not band.
-// The store ref breaks the final tie, because independent stores can present
-// two distinct beads that agree on all of the above.
+// worker's view of "next bead to claim". The store ref breaks the final tie,
+// because independent stores can present two distinct beads that agree on all
+// of the above.
 func sortScaleCheckCandidates(rows []scaleCheckCandidate) {
 	sort.SliceStable(rows, func(i, j int) bool {
 		left, right := rows[i], rows[j]
