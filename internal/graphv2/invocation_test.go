@@ -63,7 +63,7 @@ title = "Inspect {{convoy_id}}"
 	}
 	wantMetadata := map[string]string{
 		"gc.synthetic":              "true",
-		"gc.graphv2_invocation_key": "graphv2-input-convoy:" + target.ID + ":work",
+		"gc.graphv2_invocation_key": InputConvoyInvocationKey(target.ID, "work"),
 	}
 	if !maps.Equal(created.Metadata, wantMetadata) {
 		t.Fatalf("input convoy metadata = %+v, want %+v", created.Metadata, wantMetadata)
@@ -124,8 +124,15 @@ func TestInputConvoyLockKeyMatchesPersistedIdentity(t *testing.T) {
 	if base != InputConvoyLockKey("target", "work") {
 		t.Fatal("lock key does not canonicalize the persisted target+formula identity")
 	}
+	invocationBase := InputConvoyInvocationKey(" target ", " work ")
+	if invocationBase != InputConvoyInvocationKey("target", "work") {
+		t.Fatal("invocation key does not canonicalize the persisted target+formula identity")
+	}
 	if base == InputConvoyLockKey("target:work", "") {
 		t.Fatal("lock key aliases distinct target+formula tuples")
+	}
+	if invocationBase == InputConvoyInvocationKey("target:work", "") {
+		t.Fatal("invocation key aliases distinct target+formula tuples")
 	}
 	if base == InputConvoyLockKey("target", "other") {
 		t.Fatal("lock key does not distinguish formulas")
