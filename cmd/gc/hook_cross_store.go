@@ -265,9 +265,10 @@ func hookClaimRank(candidate beads.Bead, opts hookClaimOptions, requiredFreshPri
 	case status == "open" && hookClaimHasIdentity(candidate.Assignee, opts.IdentityCandidates):
 		return hookClaimCandidateRank{tier: 1, bead: candidate}, true
 	case hookCandidateClaimable(candidate, opts.RouteTargets):
-		priority := beads.PriorityValue(candidate.Priority)
-		if requiredFreshPriority != nil && priority != *requiredFreshPriority {
-			return hookClaimCandidateRank{}, false
+		if requiredFreshPriority != nil {
+			if beads.PriorityValue(candidate.Priority) != *requiredFreshPriority {
+				return hookClaimCandidateRank{}, false
+			}
 		}
 		return hookClaimCandidateRank{tier: 2, bead: candidate}, true
 	default:
@@ -275,6 +276,10 @@ func hookClaimRank(candidate beads.Bead, opts hookClaimOptions, requiredFreshPri
 	}
 }
 
+// hookClaimRankLess orders claim candidates: recovery tier first (tiers 0/1,
+// work this session already owns), then the pool's policy within a tier. The
+// tier comparison precedes the policy comparison, which is what keeps
+// recovery-first true under every policy.
 func hookClaimRankLess(left, right hookClaimCandidateRank) bool {
 	if left.tier != right.tier {
 		return left.tier < right.tier
