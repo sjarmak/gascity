@@ -256,7 +256,7 @@ regressions.
     3 first-row form) MUST derive their `bd ready --include-ephemeral
     --metadata-field gc.routed_to=<target> --unassigned --exclude-type=epic
     --json` canonical predicate from the same target-resolution helper and
-    `bdReadyPoolDemandShell` helper in `internal/config/config.go`. The
+    `bdReadyPoolDemandShell` helper in `internal/config/workquery.go`. The
     worker and reconciler must also share the temporary migration predicate
     for `gc.run_target=<target>` on `gc.kind=workflow` roots with empty
     `gc.routed_to`; only the worker's first-row form adds native
