@@ -1783,10 +1783,11 @@ func (cs *controllerState) CreateRig(r config.Rig) error {
 	if rigPath == "" {
 		return fmt.Errorf("%w: rig path is required", configedit.ErrValidation)
 	}
-	// Same registration gate as gc rig add (gascity#3109): a name outside the
-	// session alphabet (a space, above all) yields a session name the tmux
-	// runtime rejects, so rig-scoped agents could never spawn; the stricter
-	// leading-character rule is identifier hygiene (see config.rigNamePattern).
+	// Same registration gate as gc rig add (gascity#3109): a name the session
+	// encoding cannot make tmux-safe (a space, above all) yields a session
+	// name the runtime rejects, so rig-scoped agents could never spawn; '/'
+	// is the qualified-name separator, and the stricter leading-character
+	// rule is identifier hygiene (see config.rigNamePattern).
 	// Checked before provisionRigLocked so a rejected create leaves no
 	// initialized store behind.
 	if err := config.ValidateRigName(r.Name); err != nil {

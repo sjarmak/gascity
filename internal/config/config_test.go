@@ -4906,9 +4906,9 @@ func TestValidateRigName_ErrorMentionsAllowedChars(t *testing.T) {
 	}
 }
 
-// Rigs with names that cannot become valid tmux session names get a non-fatal
-// advisory (mirroring ReservedPrefixWarnings) instead of a load-time error, so
-// existing cities keep starting.
+// Rigs whose names fail ValidateRigName get a non-fatal advisory (mirroring
+// ReservedPrefixWarnings) instead of a load-time error, so existing cities
+// keep starting.
 func TestRigNameWarnings_InvalidName(t *testing.T) {
 	rigs := []Rig{
 		{Name: "TS Server", Path: "/a"},

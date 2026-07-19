@@ -4149,10 +4149,12 @@ func ValidateRigs(rigs []Rig, hqPrefix string) error {
 // ("<rig>/<agent>"), a work_dir path component, and — after the qualified-name
 // session encoding ('.'→"__"; letters, digits, '_', '-' pass through) — a tmux
 // session name, which the tmux runtime validates against ^[a-zA-Z0-9_-]+$.
-// Every character in the class survives that encoding into the tmux alphabet;
-// anything outside it (spaces above all) does not, producing a session name
-// the runtime rejects before any pane spawns, so rig-scoped agents cycle
-// start-pending → failed-create forever (gascity#3109).
+// Every character in the class survives that encoding into the tmux alphabet.
+// A character with no encoding (a space, above all) reaches the session name
+// raw, and the runtime rejects it before any pane spawns, so rig-scoped
+// agents cycle start-pending → failed-create forever (gascity#3109). '/' does
+// encode ('/'→"--") but is rejected anyway: it is the qualified-name
+// separator and a path component, so it can never be part of a rig name.
 // The leading character is additionally restricted to a letter or digit — not
 // for tmux safety (a leading '_' or '-' would encode fine) but for identifier
 // hygiene: rig names become on-disk directory names (a leading '.' hides
@@ -4168,7 +4170,7 @@ func ValidateRigName(name string) error {
 	if rigNamePattern.MatchString(name) {
 		return nil
 	}
-	return fmt.Errorf("rig %q: name must start with a letter or digit and contain only letters, digits, '.', '_', '-'; characters outside that set (spaces above all) derive tmux session names the runtime rejects, so rig-scoped agent sessions could never spawn, and a leading '.', '_', or '-' is rejected for identifier hygiene (hidden directories, option-like arguments)", name)
+	return fmt.Errorf("rig %q: name must start with a letter or digit and contain only letters, digits, '.', '_', '-'; a space or other character the session encoding cannot make tmux-safe derives a session name the runtime rejects, so rig-scoped agent sessions could never spawn; '/' is reserved as the rig/agent separator, and a leading '.', '_', or '-' is rejected for identifier hygiene (hidden directories, option-like arguments)", name)
 }
 
 // RigNameWarnings returns non-fatal advisories for configured rigs whose names

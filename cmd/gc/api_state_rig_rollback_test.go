@@ -207,7 +207,7 @@ func TestProvisionRigFromGitRejectsInvalidName(t *testing.T) {
 		t.Fatalf("ProvisionRigFromGit invalid name = %v, want a validation error", err)
 	}
 	if manifested {
-		t.Fatal("manifest callback ran for an invalid name (clone would have run before the gate)")
+		t.Fatal("manifest callback ran for an invalid name (provisioning started before the gate)")
 	}
 }
 
