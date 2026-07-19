@@ -135,6 +135,84 @@ func TestSweepStaleNudgeMail_InFlightExclusion(t *testing.T) {
 	t.Errorf("in-flight nudge bead was swept; it should be skipped")
 }
 
+// nudgeSeedWithExpiry builds an open, still-queued nudge shadow bead carrying an
+// explicit expires_at. It models a nudge that is queued and undelivered (riding
+// its own TTL) — the case the flat creation-age retention window destroys in
+// #4299.
+func nudgeSeedWithExpiry(id, nudgeID string, createdAt, expiresAt time.Time) beads.Bead {
+	b := nudgeSeed(id, nudgeID, createdAt)
+	b.Metadata["expires_at"] = expiresAt.UTC().Format(time.RFC3339)
+	return b
+}
+
+// TestSweepStaleNudgeMail_QueuedUnexpiredNotSwept proves the retention sweep no
+// longer destroys a still-queued nudge before its own expires_at (#4299). A
+// queued nudge whose creation age exceeds the flat nudge TTL but whose
+// expires_at is still in the future must be left open; only a queued nudge that
+// is genuinely past its expires_at may be swept.
+func TestSweepStaleNudgeMail_QueuedUnexpiredNotSwept(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	seed := []beads.Bead{
+		// Queued, past the 10-minute creation-age TTL, but expires 23h from now —
+		// an undelivered nudge for a busy session. Must NOT be swept.
+		nudgeSeedWithExpiry("bead-unexpired", "nudge-unexpired",
+			now.Add(-nudgeTTL-time.Minute), now.Add(23*time.Hour)),
+		// Queued, past both the TTL and its own expires_at — genuinely stale.
+		// Must be swept.
+		nudgeSeedWithExpiry("bead-expired", "nudge-expired",
+			now.Add(-25*time.Hour), now.Add(-time.Hour)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NudgeClosed != 1 {
+		t.Errorf("NudgeClosed = %d, want 1 (only the genuinely-expired nudge)", result.NudgeClosed)
+	}
+
+	open, _ := store.ListOpen()
+	var unexpiredOpen bool
+	for _, b := range open {
+		if b.Metadata["nudge_id"] == "nudge-unexpired" {
+			unexpiredOpen = true
+		}
+		if b.Metadata["nudge_id"] == "nudge-expired" {
+			t.Errorf("genuinely-expired queued nudge should have been swept but is still open")
+		}
+	}
+	if !unexpiredOpen {
+		t.Errorf("queued nudge with a future expires_at was swept; it must ride its own TTL")
+	}
+}
+
+// TestCountStaleNudgeMail_QueuedUnexpiredNotCounted proves the dry-run twin
+// mirrors the sweep guard: a queued, unexpired nudge is not counted as a
+// sweep candidate (#4299).
+func TestCountStaleNudgeMail_QueuedUnexpiredNotCounted(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	seed := []beads.Bead{
+		nudgeSeedWithExpiry("bead-unexpired", "nudge-unexpired",
+			now.Add(-nudgeTTL-time.Minute), now.Add(23*time.Hour)),
+		nudgeSeedWithExpiry("bead-expired", "nudge-expired",
+			now.Add(-25*time.Hour), now.Add(-time.Hour)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	counts, err := countStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if counts.NudgeClosed != 1 {
+		t.Errorf("dry-run NudgeClosed = %d, want 1 (only the genuinely-expired nudge)", counts.NudgeClosed)
+	}
+}
+
 func TestSweepStaleNudgeMail_OpenStatusFilter(t *testing.T) {
 	// AC2: already-closed mail beads do not produce a false failure.
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)

@@ -34,10 +34,27 @@ type nudgeMailSweepResult struct {
 	MailClosed  int
 }
 
+// queuedNudgeUnexpired reports whether shadow is a still-queued nudge that has
+// not yet reached its own expires_at. Such a nudge is genuinely pending
+// delivery — a human->agent notification riding its full TTL because turn-start
+// delivery was skipped for a busy target session — and must never be closed by
+// the flat creation-age retention window. Sweeping it destroys an undelivered
+// nudge up to ~23.8h before its real expiry (#4299). The comparison is a pure
+// instant comparison (time.Time.After), so it is immune to the local-vs-UTC
+// clock mix the flat-age window is vulnerable to. Terminalized shadows carry a
+// non-"queued" state and are still swept as before; a queued shadow with no
+// parseable expires_at (ExpiresAt zero) is not protected, so leaked malformed
+// beads are still reaped.
+func queuedNudgeUnexpired(shadow nudgequeue.NudgeShadow, now time.Time) bool {
+	return shadow.State == "queued" && !shadow.ExpiresAt.IsZero() && shadow.ExpiresAt.After(now)
+}
+
 // sweepStaleNudgeMail closes stale consumed nudge beads and read mail beads.
 //
 // Nudge candidates are open beads with label gc:nudge created before now-nudgeTTL
-// whose nudge_id is not present in nudgeState.Pending or nudgeState.InFlight.
+// whose nudge_id is not present in nudgeState.Pending or nudgeState.InFlight, and
+// which are not still-queued nudges with a future expires_at (see
+// queuedNudgeUnexpired — those ride their own TTL and are never swept early).
 // Terminal metadata is stamped via nudgequeue.Store.SweepStale before each close
 // so the bead audit trail is intact.
 //
@@ -72,6 +89,9 @@ func sweepStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 			break
 		}
 		if !shadow.Open {
+			continue
+		}
+		if queuedNudgeUnexpired(shadow, now) {
 			continue
 		}
 		if err := nq.SweepStale(shadow.BeadID, nudgeMailSweepNudgeCloseReason, now); err != nil {
@@ -126,6 +146,9 @@ func countStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 			break
 		}
 		if !shadow.Open {
+			continue
+		}
+		if queuedNudgeUnexpired(shadow, now) {
 			continue
 		}
 		result.NudgeClosed++
