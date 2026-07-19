@@ -361,6 +361,19 @@ func InputConvoyInvocationKey(targetID, formulaName string) string {
 	return inputConvoyInvocationPrefix + strings.TrimSpace(targetID) + ":" + strings.TrimSpace(formulaName)
 }
 
+// InputConvoyLockKey is the cross-process launch-lock identity for a targeted
+// graph.v2 invocation. Scope is part of the identity because the same target
+// and formula may be launched independently in distinct logical scopes.
+func InputConvoyLockKey(targetID, formulaName, scopeKind, scopeRef string) string {
+	return strings.Join([]string{
+		inputConvoyInvocationPrefix + "lock",
+		strings.TrimSpace(targetID),
+		strings.TrimSpace(formulaName),
+		strings.TrimSpace(scopeKind),
+		strings.TrimSpace(scopeRef),
+	}, ":")
+}
+
 // NormalizeInputConvoy returns targetID when it is already a convoy, otherwise
 // it reuses the live system-created one-item convoy for the (targetID,
 // formulaName) invocation, creating one only when none exists.
@@ -392,26 +405,16 @@ func NormalizeInputConvoy(store beads.Store, targetID, formulaName string) (stri
 		return target.ID, nil
 	}
 	invocationKey := InputConvoyInvocationKey(target.ID, formulaName)
-	convoyID, err := liveInputConvoyFor(store, invocationKey)
+	convoyID, err := reusableInputConvoyFor(store, invocationKey)
 	if err != nil {
 		return "", err
 	}
 	if convoyID == "" {
-		if _, err := CreateSingleItemInputConvoy(store, target, invocationKey); err != nil {
-			return "", err
-		}
-		// Re-resolve instead of returning the convoy just created: a caller that
-		// raced this lookup created one too, and both must settle on the same ID
-		// or the RootKeys they derive diverge exactly as before.
-		// liveInputConvoyFor picks oldest-wins, a total order both observe
-		// identically.
-		convoyID, err = liveInputConvoyFor(store, invocationKey)
+		created, err := CreateSingleItemInputConvoy(store, target, invocationKey)
 		if err != nil {
 			return "", err
 		}
-		if convoyID == "" {
-			return "", fmt.Errorf("input convoy for %s is missing immediately after creation", target.ID)
-		}
+		convoyID = created.ID
 	}
 	// Creating a convoy and tracking its item are two writes, so a failure
 	// between them leaves a convoy carrying the invocation key and tracking
@@ -440,34 +443,44 @@ func ensureTrack(store beads.Store, convoyID, itemID string) error {
 	return nil
 }
 
-// liveInputConvoyFor returns the oldest non-terminal synthetic input convoy
-// carrying invocationKey, or "" when there is none. Callers that raced each
-// other into creating one apiece must all pick the same convoy, so the choice
-// is oldest-wins on a total order every caller observes identically rather than
-// a lock — the striped mutex this package offers is process-local, and the CLI
-// and controller are separate processes.
-func liveInputConvoyFor(store beads.Store, invocationKey string) (string, error) {
-	matches, err := store.ListByMetadata(map[string]string{graphV2InvocationKey: invocationKey}, 0)
+// reusableInputConvoyFor returns the sole live synthetic input convoy carrying
+// invocationKey. When its convoy was closed prematurely but its workflow root
+// remains live, it returns that convoy as well: retry must converge on the live
+// root rather than rolling over to a second RootKey. Callers hold the
+// cross-process InputConvoyLockKey lock, so multiple live matches indicate
+// pre-existing corruption rather than an election to resolve here.
+func reusableInputConvoyFor(store beads.Store, invocationKey string) (string, error) {
+	matches, err := store.ListByMetadata(map[string]string{graphV2InvocationKey: invocationKey}, 0, beads.IncludeClosed)
 	if err != nil {
 		return "", fmt.Errorf("looking up input convoy %s: %w", invocationKey, err)
 	}
-	live := make([]beads.Bead, 0, len(matches))
+	var reusable []string
 	for _, convoy := range matches {
-		if convoy.Type != "convoy" || convoycore.IsTerminalStatus(convoy.Status) {
+		if convoy.Type != "convoy" {
 			continue
 		}
-		live = append(live, convoy)
-	}
-	if len(live) == 0 {
-		return "", nil
-	}
-	sort.SliceStable(live, func(i, j int) bool {
-		if live[i].CreatedAt.Equal(live[j].CreatedAt) {
-			return live[i].ID < live[j].ID
+		if !convoycore.IsTerminalStatus(convoy.Status) {
+			reusable = append(reusable, convoy.ID)
+			continue
 		}
-		return live[i].CreatedAt.Before(live[j].CreatedAt)
-	})
-	return live[0].ID, nil
+		roots, err := store.ListByMetadata(map[string]string{beadmeta.InputConvoyIDMetadataKey: convoy.ID}, 0, beads.IncludeClosed, beads.WithBothTiers)
+		if err != nil {
+			return "", fmt.Errorf("looking up live roots for terminal input convoy %s: %w", convoy.ID, err)
+		}
+		for _, root := range roots {
+			if !convoycore.IsTerminalStatus(root.Status) {
+				reusable = append(reusable, convoy.ID)
+				break
+			}
+		}
+	}
+	if len(reusable) > 1 {
+		return "", fmt.Errorf("input convoy invocation %s has multiple reusable convoys: %s", invocationKey, strings.Join(reusable, ", "))
+	}
+	if len(reusable) == 1 {
+		return reusable[0], nil
+	}
+	return "", nil
 }
 
 // CreateSingleItemInputConvoy creates a system-created one-item convoy for a

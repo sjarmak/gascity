@@ -1141,7 +1141,22 @@ func isGraphSlingFormula(ctx context.Context, formulaName string, searchPaths []
 func prepareGraphV2FormulaInvocation(ctx context.Context, formulaName, targetID string, opts SlingOpts, deps SlingDeps, a config.Agent) (graphv2.Invocation, bool, error) {
 	searchPaths := SlingFormulaSearchPaths(deps, a)
 	vars := buildGraphV2SlingFormulaVars(formulaName, targetID, opts.Vars, a, deps)
-	inv, err := graphv2.PrepareInvocation(ctx, deps.Store, formulaName, searchPaths, targetID, vars)
+	var inv graphv2.Invocation
+	prepare := func() error {
+		var err error
+		inv, err = graphv2.PrepareInvocation(ctx, deps.Store, formulaName, searchPaths, targetID, vars)
+		return err
+	}
+	var err error
+	if strings.TrimSpace(targetID) == "" {
+		err = prepare()
+	} else {
+		// Input-convoy lookup and creation are one cross-process critical
+		// section. Root materialization has its own RootKey lock downstream;
+		// this earlier chokepoint ensures every caller derives that same key.
+		err = sourceworkflow.WithLock(ctx, deps.CityPath, sourceWorkflowLockScope(deps),
+			graphv2.InputConvoyLockKey(targetID, formulaName, opts.ScopeKind, opts.ScopeRef), prepare)
+	}
 	if err != nil {
 		return graphv2.Invocation{}, false, err
 	}

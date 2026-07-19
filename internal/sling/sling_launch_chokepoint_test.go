@@ -7,11 +7,12 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
+	convoycore "github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/formula"
-	"github.com/gastownhall/gascity/internal/graphv2"
 	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
@@ -23,7 +24,7 @@ import (
 // normalization — the one step that decided the RootKey in gc-28jm.
 func launchForBeadTarget(t *testing.T, formulaDir, formulaName, targetID string, a config.Agent, deps SlingDeps) string {
 	t.Helper()
-	inv, err := graphv2.PrepareInvocation(context.Background(), deps.Store, formulaName, []string{formulaDir}, targetID, nil)
+	inv, _, err := prepareGraphV2FormulaInvocation(context.Background(), formulaName, targetID, SlingOpts{ScopeKind: "default"}, deps, a)
 	if err != nil {
 		t.Fatalf("PrepareInvocation(%s): %v", targetID, err)
 	}
@@ -103,13 +104,21 @@ func TestLaunchWorkflowBeadTargetConcurrentSlingCreatesOneRoot(t *testing.T) {
 	const n = 6
 	var wg sync.WaitGroup
 	ids := make([]string, n)
+	ready := make(chan struct{}, n)
+	start := make(chan struct{})
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			ready <- struct{}{}
+			<-start
 			ids[i] = launchForBeadTarget(t, formulaDir, "graph-work", target.ID, a, deps)
 		}(i)
 	}
+	for range n {
+		<-ready
+	}
+	close(start)
 	wg.Wait()
 
 	for i := range ids {
@@ -119,6 +128,27 @@ func TestLaunchWorkflowBeadTargetConcurrentSlingCreatesOneRoot(t *testing.T) {
 	}
 	if live := liveGraphV2Roots(t, deps.Store); len(live) != 1 {
 		t.Fatalf("live graph roots = %d, want exactly one (I1); roots=%+v", len(live), live)
+	}
+	convoys, err := convoycore.TrackingConvoysForItem(deps.Store, target.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(convoys) != 1 {
+		t.Fatalf("live input convoys = %d, want exactly one; convoys=%+v", len(convoys), convoys)
+	}
+	members, err := convoycore.Members(deps.Store, convoys[0].ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 1 || members[0].ID != target.ID {
+		t.Fatalf("input convoy members = %+v, want exactly one tracking edge to %s", members, target.ID)
+	}
+	beforeRetry := beadCount(t, deps.Store)
+	if got := launchForBeadTarget(t, formulaDir, "graph-work", target.ID, a, deps); got != ids[0] {
+		t.Fatalf("post-race retry root = %q, want %q", got, ids[0])
+	}
+	if got := beadCount(t, deps.Store); got != beforeRetry {
+		t.Fatalf("post-race retry changed bead count from %d to %d; loser steps/orphans were materialized", beforeRetry, got)
 	}
 }
 
@@ -158,6 +188,40 @@ func TestLaunchWorkflowBeadTargetDistinctLaunchesStillAllowed(t *testing.T) {
 	}
 	if got := launchForBeadTarget(t, formulaDir, "graph-work", target.ID, a, deps); got == root || got == "" {
 		t.Fatalf("relaunch after close returned %q, want a fresh root (I7)", got)
+	}
+}
+
+func TestLaunchWorkflowClosedConvoyWithLiveRootDoesNotRollover(t *testing.T) {
+	formulaDir := t.TempDir()
+	writeGraphV2ConvoyFormula(t, formulaDir)
+	deps := testDeps(graphV2SlingTestConfig(t, formulaDir), runtime.NewFake(), newFakeRunner().run)
+	deps.CityPath = t.TempDir()
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	target, err := deps.Store.Create(beads.Bead{Title: "work bead", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootID := launchForBeadTarget(t, formulaDir, "graph-work", target.ID, a, deps)
+	root, err := deps.Store.Get(rootID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	convoyID := root.Metadata[beadmeta.InputConvoyIDMetadataKey]
+	if err := deps.Store.Close(convoyID); err != nil {
+		t.Fatal(err)
+	}
+	before := beadCount(t, deps.Store)
+	if got := launchForBeadTarget(t, formulaDir, "graph-work", target.ID, a, deps); got != rootID {
+		t.Fatalf("retry root = %q, want live root %q despite closed input convoy", got, rootID)
+	}
+	if got := beadCount(t, deps.Store); got != before {
+		t.Fatalf("retry after premature convoy close changed bead count from %d to %d", before, got)
+	}
+	if err := deps.Store.Close(rootID); err != nil {
+		t.Fatal(err)
+	}
+	if got := launchForBeadTarget(t, formulaDir, "graph-work", target.ID, a, deps); got == rootID {
+		t.Fatalf("retry after both convoy and root terminal reused %q, want rollover", got)
 	}
 }
 
