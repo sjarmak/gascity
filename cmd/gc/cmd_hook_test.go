@@ -1887,7 +1887,7 @@ max = 5
 		t.Fatalf("stdout = %q, want GC_RIG_ROOT=%q", out, rigDir)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=1") {
+	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=20") {
 		t.Fatalf("stdout = %q, want pool work_query args", out)
 	}
 }
@@ -2282,7 +2282,7 @@ max = 5
 		t.Fatalf("stdout = %q, want command to run from rig root %q", out, rigDir)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=1") {
+	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=20") {
 		t.Fatalf("stdout = %q, want pool template work_query args", out)
 	}
 }
@@ -2352,7 +2352,7 @@ name = "worker"
 		t.Fatalf("stdout = %q, want GC_SESSION_NAME=host-session", out)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=1`) {
+	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=20`) {
 		t.Fatalf("stdout = %q, want metadata-routed work query", out)
 	}
 }
@@ -2415,7 +2415,7 @@ dir = "myrig"
 		t.Fatalf("stdout = %q, want GC_SESSION_NAME=%s", out, wantSession)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=1`) {
+	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=20`) {
 		t.Fatalf("stdout = %q, want metadata-routed work query", out)
 	}
 }

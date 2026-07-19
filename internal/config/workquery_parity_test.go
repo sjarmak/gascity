@@ -454,7 +454,7 @@ func TestPoolDemandCountShellExcludesDisarmedFromEverySource(t *testing.T) {
 
 // TestEffectiveAssignedTiersExcludeDisarmedRow is the assigned-tier sibling
 // of TestPoolDemandCountShellExcludesDisarmedFromEverySource. Unlike the pool
-// tiers, these run bd with --limit=1, so filtering the single returned row IS
+// tiers, these run bd with --limit=20, so filtering the single returned row IS
 // the whole fix: a disarmed bead must not be served as this session's own
 // assigned work. There is deliberately no "armed peer falls through" case
 // here — with limit=1 there is no second row within this tier to fall
@@ -471,8 +471,8 @@ func TestEffectiveAssignedTiersExcludeDisarmedRow(t *testing.T) {
 		query   func(*Agent) string
 		bdMatch string
 	}{
-		{"AssignedReady", (*Agent).EffectiveAssignedReadyQuery, `"ready --assignee=worker-session --json --limit=1"`},
-		{"AssignedInProgress", (*Agent).EffectiveAssignedInProgressQuery, `"list --status in_progress --assignee=worker-session --json --limit=1"`},
+		{"AssignedReady", (*Agent).EffectiveAssignedReadyQuery, `"ready --assignee=worker-session --json --limit=20"`},
+		{"AssignedInProgress", (*Agent).EffectiveAssignedInProgressQuery, `"list --status in_progress --assignee=worker-session --json --limit=20"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -566,7 +566,7 @@ esac
 
 // TestEffectiveAssignedTiersExcludeDisarmedRow_EphemeralFallback is the
 // ephemeral-fallback sibling of TestEffectiveAssignedTiersExcludeDisarmedRow.
-// That test only exercised the primary bd list/ready --limit=1 row; the
+// That test only exercised the primary bd list/ready --limit=20 row; the
 // ephemeral probe each assigned tier falls through to when that row is empty
 // (bd query ephemeral=true AND status=...) was left unfiltered — reachable
 // through the same EffectiveAssignedInProgressQuery/EffectiveAssignedReadyQuery
@@ -581,8 +581,8 @@ func TestEffectiveAssignedTiersExcludeDisarmedRow_EphemeralFallback(t *testing.T
 		primaryBd string
 		ephStatus string
 	}{
-		{"AssignedInProgress", (*Agent).EffectiveAssignedInProgressQuery, "list --status in_progress --assignee=worker-session --json --limit=1", "in_progress"},
-		{"AssignedReady", (*Agent).EffectiveAssignedReadyQuery, "ready --assignee=worker-session --json --limit=1", "open"},
+		{"AssignedInProgress", (*Agent).EffectiveAssignedInProgressQuery, "list --status in_progress --assignee=worker-session --json --limit=20", "in_progress"},
+		{"AssignedReady", (*Agent).EffectiveAssignedReadyQuery, "ready --assignee=worker-session --json --limit=20", "open"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
