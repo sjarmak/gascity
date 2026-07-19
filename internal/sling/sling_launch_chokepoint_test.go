@@ -187,20 +187,7 @@ func TestLaunchWorkflowBeadTargetConcurrentSlingCreatesOneRoot(t *testing.T) {
 	if live := liveGraphV2Roots(t, deps.Store); len(live) != 1 {
 		t.Fatalf("live graph roots = %d, want exactly one (I1); roots=%+v", len(live), live)
 	}
-	convoys, err := convoycore.TrackingConvoysForItem(deps.Store, target.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(convoys) != 1 {
-		t.Fatalf("live input convoys = %d, want exactly one; convoys=%+v", len(convoys), convoys)
-	}
-	members, err := convoycore.Members(deps.Store, convoys[0].ID, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(members) != 1 || members[0].ID != target.ID {
-		t.Fatalf("input convoy members = %+v, want exactly one tracking edge to %s", members, target.ID)
-	}
+	assertOneSyntheticInputConvoy(t, deps.Store, target.ID)
 	beforeRetry := beadCount(t, deps.Store)
 	if got := launchForBeadTarget(t, formulaDir, "graph-work", target.ID, a, deps); got != ids[0] {
 		t.Fatalf("post-race retry root = %q, want %q", got, ids[0])
