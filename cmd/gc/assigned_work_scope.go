@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/agentutil"
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
@@ -141,6 +142,9 @@ func filterAssignedWorkBeadsForPoolDemand(
 	}
 	filtered := make([]beads.Bead, 0, len(assignedWorkBeads))
 	for i, wb := range assignedWorkBeads {
+		if beadmeta.IsDisarmed(wb.Metadata) {
+			continue
+		}
 		template := routedToOrLegacyWorkflowTarget(wb)
 		if template == "" {
 			if sessionBeadID := assigneeToSessionBeadID[strings.TrimSpace(wb.Assignee)]; sessionBeadID != "" {
@@ -241,6 +245,9 @@ func filterAssignedWorkBeadsForSessionWake(
 	filteredRefs := make([]string, 0, len(assignedWorkBeads))
 	for i, wb := range assignedWorkBeads {
 		if i >= len(assignedWorkStoreRefs) {
+			continue
+		}
+		if beadmeta.IsDisarmed(wb.Metadata) {
 			continue
 		}
 		assignee := strings.TrimSpace(wb.Assignee)
