@@ -4,10 +4,23 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
 )
+
+// truePath resolves the no-op `true` utility from PATH. The path differs
+// across platforms (/bin/true on Linux, /usr/bin/true on macOS), so tests
+// must not hardcode it.
+func truePath(t *testing.T) string {
+	t.Helper()
+	p, err := exec.LookPath("true")
+	if err != nil {
+		t.Fatalf("locating `true` on PATH: %v", err)
+	}
+	return p
+}
 
 // trackingReader counts how many bytes were read from the wrapped reader, so a
 // test can assert gc hook run fully consumed the provider's hook stdin.
@@ -32,10 +45,11 @@ func (t *trackingReader) Read(p []byte) (int, error) {
 //
 // gc hook run must fully consume its stdin so the provider's write always
 // completes, regardless of whether the wrapped command reads it. The wrapped
-// executable here is /bin/true, which exits 0 without reading stdin.
+// executable here is `true`, which exits 0 without reading stdin.
 func TestHookRunConsumesStdinWhenWrappedCommandIgnoresIt(t *testing.T) {
+	exe := truePath(t)
 	orig := hookRunExecutable
-	hookRunExecutable = func() (string, error) { return "/bin/true", nil }
+	hookRunExecutable = func() (string, error) { return exe, nil }
 	t.Cleanup(func() { hookRunExecutable = orig })
 
 	payload := strings.Repeat("x", 8192)
@@ -84,8 +98,9 @@ func (b *blockingReader) Read(p []byte) (int, error) {
 // drain must stay bounded by ctx so gc hook run always fails open within the
 // configured timeout instead of wedging before it spawns the child.
 func TestHookRunReturnsWithinTimeoutWhenStdinNeverEOFs(t *testing.T) {
+	exe := truePath(t)
 	orig := hookRunExecutable
-	hookRunExecutable = func() (string, error) { return "/bin/true", nil }
+	hookRunExecutable = func() (string, error) { return exe, nil }
 	t.Cleanup(func() { hookRunExecutable = orig })
 
 	release := make(chan struct{})
@@ -129,7 +144,7 @@ func TestHookRunReturnsWithinTimeoutWhenStdinNeverEOFs(t *testing.T) {
 // A PTY master from /dev/ptmx is the terminal proxy: it is a char-device
 // *os.File whose Read blocks forever with no EOF while no slave writes to it,
 // which is exactly the shape of os.Stdin on a real terminal. The wrapped
-// executable is /bin/true, which exits 0 without reading stdin.
+// executable is `true`, which exits 0 without reading stdin.
 func TestHookRunSkipsStdinDrainForTerminal(t *testing.T) {
 	tty, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
 	if err != nil {
@@ -143,8 +158,9 @@ func TestHookRunSkipsStdinDrainForTerminal(t *testing.T) {
 		t.Skipf("/dev/ptmx is not a char device here (mode=%v err=%v); cannot model terminal stdin", st.Mode(), err)
 	}
 
+	exe := truePath(t)
 	orig := hookRunExecutable
-	hookRunExecutable = func() (string, error) { return "/bin/true", nil }
+	hookRunExecutable = func() (string, error) { return exe, nil }
 	t.Cleanup(func() { hookRunExecutable = orig })
 
 	var stdout, stderr bytes.Buffer
