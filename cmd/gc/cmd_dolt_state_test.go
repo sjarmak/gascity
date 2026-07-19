@@ -2969,7 +2969,7 @@ func TestRecoverManagedDoltProcessReturnsWhenConcurrentStarterBecomesReady(t *te
 		managedDoltConnectionCountDirectFn = oldConnectionCountDirect
 	}()
 
-	report, err := recoverManagedDoltProcess(cityPath, "127.0.0.1", strconv.Itoa(port), "root", "warning", 3*time.Second)
+	report, err := recoverManagedDoltProcess(cityPath, strconv.Itoa(port), 3*time.Second)
 	if err != nil {
 		t.Fatalf("recoverManagedDoltProcess() error = %v", err)
 	}
@@ -3101,7 +3101,7 @@ esac
 		managedDoltConnectionCountDirectFn = oldConnectionCountDirect
 	}()
 
-	report, err := recoverManagedDoltProcess(cityPath, "127.0.0.1", strconv.Itoa(oldPort), "root", "warning", 2*time.Second)
+	report, err := recoverManagedDoltProcess(cityPath, strconv.Itoa(oldPort), 2*time.Second)
 	if err != nil {
 		t.Fatalf("recoverManagedDoltProcess() error = %v", err)
 	}
