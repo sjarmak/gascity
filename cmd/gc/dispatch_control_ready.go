@@ -251,6 +251,14 @@ func mergeControlReadyGroups(groups ...[]beads.Bead) []beads.Bead {
 // aliasing, and instantiating-metadata dedup that
 // workflowServeControlReadyQueryForBeads encodes as shell.
 func evaluateControlReady(ready []beads.Bead, parsed parsedControlReadyQuery, envList []string) []beads.Bead {
+	armed := make([]beads.Bead, 0, len(ready))
+	for _, b := range ready {
+		if !beadmeta.IsDisarmed(b.Metadata) {
+			armed = append(armed, b)
+		}
+	}
+	ready = armed
+
 	var groups [][]beads.Bead
 	for _, cand := range controlReadyCandidates(parsed, envList) {
 		groups = append(groups, filterReadyByAssignee(ready, cand, workflowServeScanLimit))

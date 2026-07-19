@@ -320,6 +320,10 @@ func TestTryControlReadyFromCacheOrFallbackAnswersFromCacheWithZeroSubprocessCal
 	noBDOnPathForTest(t)
 
 	target := "gascity/control-dispatcher"
+	disarmed, err := store.Create(beads.Bead{Assignee: target, Type: "task", Metadata: map[string]string{beadmeta.DisarmedMetadataKey: "true"}})
+	if err != nil {
+		t.Fatalf("create disarmed bead: %v", err)
+	}
 	ready, err := store.Create(beads.Bead{Assignee: target, Type: "task"})
 	if err != nil {
 		t.Fatalf("create ready bead: %v", err)
@@ -350,7 +354,7 @@ func TestTryControlReadyFromCacheOrFallbackAnswersFromCacheWithZeroSubprocessCal
 	}
 	wantIDs := []string{ready.ID, routed.ID}
 	if !stringSlicesEqual(gotIDs, wantIDs) {
-		t.Fatalf("queue ids = %#v, want %#v (epic bead %s must be excluded)", gotIDs, wantIDs, epic.ID)
+		t.Fatalf("queue ids = %#v, want %#v (disarmed bead %s and epic bead %s must be excluded)", gotIDs, wantIDs, disarmed.ID, epic.ID)
 	}
 }
 
@@ -390,13 +394,13 @@ case "$1" in
 esac
 case "$*" in
   "--readonly --sandbox ready --json --exclude-type=epic --limit=%d")
-    printf '[{"id":"ga-fallback-ready","assignee":"%s"}]'
+    printf '[{"id":"ga-fallback-disarmed","assignee":"%s","metadata":{"gc.disarmed":true}},{"id":"ga-fallback-ready","assignee":"%s"}]'
     ;;
   *)
     printf '[]'
     ;;
 esac
-`, logPath, controlReadyFallbackLimit, target)
+`, logPath, controlReadyFallbackLimit, target, target)
 	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake bd: %v", err)
 	}
