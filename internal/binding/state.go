@@ -68,12 +68,17 @@ type State struct {
 	// if the still-held reservation was reclaimed.
 	Pending []Binding `json:"pending,omitempty"`
 	Bound   []Binding `json:"bound,omitempty"`
+	// Releasing is the durable intent to remove an active binding. It is
+	// written before capacity is returned, so recovery can finish either half
+	// of a release interrupted by process death.
+	Releasing []Binding `json:"releasing,omitempty"`
 }
 
 // SortState orders Bindings deterministically.
 func SortState(state *State) {
 	sortBindings(state.Pending)
 	sortBindings(state.Bound)
+	sortBindings(state.Releasing)
 }
 
 func sortBindings(bindings []Binding) {
@@ -162,9 +167,9 @@ func LoadState(cityPath string) (State, error) {
 }
 
 func validateState(state *State) error {
-	workloads := make(map[string]string, len(state.Pending)+len(state.Bound))
-	reservations := make(map[string]string, len(state.Pending)+len(state.Bound))
-	for bucket, bindings := range map[string][]Binding{"pending": state.Pending, "bound": state.Bound} {
+	workloads := make(map[string]string, len(state.Pending)+len(state.Bound)+len(state.Releasing))
+	reservations := make(map[string]string, len(state.Pending)+len(state.Bound)+len(state.Releasing))
+	for bucket, bindings := range map[string][]Binding{"pending": state.Pending, "bound": state.Bound, "releasing": state.Releasing} {
 		for i, b := range bindings {
 			where := fmt.Sprintf("%s[%d]", bucket, i)
 			if b.WorkloadID == "" || b.Agent == "" || b.ReservationRef == "" || b.BoundAt.IsZero() {
@@ -206,6 +211,11 @@ func findLive(s *State, workloadID string) (Binding, bool) {
 		}
 	}
 	for _, b := range s.Bound {
+		if b.WorkloadID == workloadID {
+			return b, true
+		}
+	}
+	for _, b := range s.Releasing {
 		if b.WorkloadID == workloadID {
 			return b, true
 		}

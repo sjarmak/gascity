@@ -402,6 +402,78 @@ func TestRelease_UnknownWorkloadIsNoOp(t *testing.T) {
 	}
 }
 
+func TestRelease_CrashTransitionsRecoverWithoutStrandedFenceOrReservation(t *testing.T) {
+	crashed := errors.New("simulated process death")
+	for _, point := range []crashPoint{
+		crashBeforeReleaseIntent,
+		crashAfterReleaseIntent,
+		crashAfterCapacityRelease,
+		crashAfterBindingRelease,
+	} {
+		t.Run(string(point), func(t *testing.T) {
+			city := t.TempDir()
+			ledger := capacity.NewLedger(city, capacity.WithClock(testTime))
+			base := NewScheduler(city, ledger, WithClock(testTime))
+			first, err := base.Bind(context.Background(), BindRequest{
+				Candidates: []ReadyWorkload{workload("gc-1", 1, 0)},
+				Caps:       unlimited(),
+			})
+			if err != nil || first == nil {
+				t.Fatalf("Bind = %+v, err=%v", first, err)
+			}
+
+			faulted := false
+			s := NewScheduler(city, ledger, WithClock(testTime), withCrashHook(func(got crashPoint) error {
+				if got == point && !faulted {
+					faulted = true
+					return crashed
+				}
+				return nil
+			}))
+			if err := s.Release(first.WorkloadID, first.Generation); !errors.Is(err, crashed) {
+				t.Fatalf("Release error = %v, want crash at %s", err, point)
+			}
+
+			fresh := NewScheduler(city, ledger, WithClock(testTime))
+			if err := fresh.Recover(); err != nil {
+				t.Fatalf("Recover: %v", err)
+			}
+			if err := fresh.Release(first.WorkloadID, first.Generation); err != nil {
+				t.Fatalf("retry Release: %v", err)
+			}
+			if err := fresh.Recover(); err != nil {
+				t.Fatalf("second Recover: %v", err)
+			}
+
+			state, stateErr := LoadState(city)
+			snap, snapErr := ledger.Snapshot()
+			if stateErr != nil || snapErr != nil {
+				t.Fatalf("reload: state err=%v ledger err=%v", stateErr, snapErr)
+			}
+			if len(state.Pending) != 0 || len(state.Bound) != 0 || len(state.Releasing) != 0 || snap.Total != 0 {
+				t.Fatalf("release stranded state: binding=%+v ledger=%+v", state, snap)
+			}
+
+			// A stale replay after a newer generation exists must not release it.
+			nextReq := BindRequest{Candidates: []ReadyWorkload{workload("gc-1", 1, 0)}, Caps: unlimited()}
+			nextReq.Candidates[0].PriorGeneration = first.Generation
+			nextReq.Candidates[0].PriorAttempt = first.Attempt
+			second, err := fresh.Bind(context.Background(), nextReq)
+			if err != nil || second == nil {
+				t.Fatalf("rebind = %+v, err=%v", second, err)
+			}
+			if err := fresh.Release(first.WorkloadID, first.Generation); err != nil {
+				t.Fatalf("stale Release: %v", err)
+			}
+			state, stateErr = LoadState(city)
+			snap, snapErr = ledger.Snapshot()
+			if stateErr != nil || snapErr != nil || len(state.Bound) != 1 || !bindingsEqual(state.Bound[0], *second) || snap.Total != 1 || snap.Consumed[0].ID != second.ReservationRef {
+				t.Fatalf("stale replay affected newer generation: binding=%+v ledger=%+v stateErr=%v snapErr=%v", state, snap, stateErr, snapErr)
+			}
+		})
+	}
+}
+
 func TestBind_ConcurrentReleaseAfterConsumeCannotInvalidateReturn(t *testing.T) {
 	city := t.TempDir()
 	ledger := capacity.NewLedger(city, capacity.WithClock(testTime))
@@ -497,12 +569,15 @@ func TestRelease_RejectsActiveReservationOwnershipMismatch(t *testing.T) {
 	if err := s.Release(b.WorkloadID, b.Generation); err == nil {
 		t.Fatal("Release error = nil, want ownership mismatch")
 	}
+	if err := NewScheduler(city, ledger).Recover(); err == nil {
+		t.Fatal("Recover error = nil, want release-intent ownership mismatch")
+	}
 	state, stateErr := LoadState(city)
 	snap, snapErr := ledger.Snapshot()
 	if stateErr != nil || snapErr != nil {
 		t.Fatalf("reload: state err=%v ledger err=%v", stateErr, snapErr)
 	}
-	if len(state.Bound) != 1 || len(snap.Consumed) != 1 {
+	if len(state.Bound) != 0 || len(state.Releasing) != 1 || len(snap.Consumed) != 1 {
 		t.Fatalf("mismatched release mutated state: binding=%+v ledger=%+v", state, snap)
 	}
 }

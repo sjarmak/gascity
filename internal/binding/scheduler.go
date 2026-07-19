@@ -23,10 +23,14 @@ var errLostRace = errors.New("bound concurrently")
 type crashPoint string
 
 const (
-	crashAfterReserve crashPoint = "after-reserve"
-	crashAfterPending crashPoint = "after-pending"
-	crashAfterConsume crashPoint = "after-consume"
-	crashAfterActive  crashPoint = "after-active"
+	crashAfterReserve         crashPoint = "after-reserve"
+	crashAfterPending         crashPoint = "after-pending"
+	crashAfterConsume         crashPoint = "after-consume"
+	crashAfterActive          crashPoint = "after-active"
+	crashBeforeReleaseIntent  crashPoint = "before-release-intent"
+	crashAfterReleaseIntent   crashPoint = "after-release-intent"
+	crashAfterCapacityRelease crashPoint = "after-capacity-release"
+	crashAfterBindingRelease  crashPoint = "after-binding-release"
 )
 
 // HealthCheck reports whether a provider is fit to receive work.
@@ -163,30 +167,75 @@ func (s *Scheduler) Bind(ctx context.Context, req BindRequest) (*Binding, error)
 // a successful Bind return a fence that no concurrent release issued before
 // promotion can invalidate.
 func (s *Scheduler) Release(workloadID string, generation int) error {
-	return WithState(s.cityPath, func(st *State) error {
+	if err := s.hit(crashBeforeReleaseIntent); err != nil {
+		return err
+	}
+	var intent Binding
+	if err := WithState(s.cityPath, func(st *State) error {
 		b, ok := findBound(st, workloadID, generation)
 		if !ok {
+			for _, releasing := range st.Releasing {
+				if releasing.WorkloadID == workloadID && releasing.Generation == generation {
+					intent = releasing
+				}
+			}
 			return nil
 		}
-		snap, err := s.ledger.Snapshot()
-		if err != nil {
-			return fmt.Errorf("reading reservation %q for workload %q: %w", b.ReservationRef, workloadID, err)
-		}
-		r, ok := activeReservationByID(snap, b.ReservationRef)
-		if !ok {
-			return fmt.Errorf("binding: active reservation %q for workload %q is missing", b.ReservationRef, workloadID)
-		}
-		if !reservationOwnsBinding(r, b) {
-			return fmt.Errorf("binding: active reservation %q ownership contradicts workload %q generation %d", b.ReservationRef, workloadID, generation)
-		}
-		// Capacity's lock is taken inside this one, never the reverse. Ordering
-		// the release this way also means a failure here leaves the Binding
-		// intact and the whole call retryable, rather than dropping the fence
-		// while the unit stays booked.
-		if err := s.ledger.Release(b.ReservationRef); err != nil {
-			return fmt.Errorf("releasing reservation %q for workload %q: %w", b.ReservationRef, workloadID, err)
-		}
 		st.Bound = removeGeneration(st.Bound, workloadID, generation)
+		st.Releasing = append(st.Releasing, b)
+		intent = b
+		return nil
+	}); err != nil {
+		return err
+	}
+	if intent.WorkloadID == "" {
+		return nil
+	}
+	if err := s.hit(crashAfterReleaseIntent); err != nil {
+		return err
+	}
+	if err := s.finishRelease(intent); err != nil {
+		return err
+	}
+	if err := s.hit(crashAfterCapacityRelease); err != nil {
+		return err
+	}
+	if err := s.removeReleaseIntent(intent); err != nil {
+		return err
+	}
+	return s.hit(crashAfterBindingRelease)
+}
+
+func (s *Scheduler) finishRelease(b Binding) error {
+	snap, err := s.ledger.Snapshot()
+	if err != nil {
+		return fmt.Errorf("reading reservation %q for workload %q: %w", b.ReservationRef, b.WorkloadID, err)
+	}
+	if r, ok := activeReservationByID(snap, b.ReservationRef); ok {
+		if !reservationOwnsBinding(r, b) {
+			return fmt.Errorf("binding: active reservation %q ownership contradicts workload %q generation %d", b.ReservationRef, b.WorkloadID, b.Generation)
+		}
+		if err := s.ledger.Release(b.ReservationRef); err != nil && !errors.Is(err, capacity.ErrNotFound) {
+			return fmt.Errorf("releasing reservation %q for workload %q: %w", b.ReservationRef, b.WorkloadID, err)
+		}
+		return nil
+	}
+	for _, r := range snap.Held {
+		if r.ID == b.ReservationRef {
+			return fmt.Errorf("binding: releasing reservation %q for workload %q is held, not consumed", b.ReservationRef, b.WorkloadID)
+		}
+	}
+	return nil // capacity deletion was already persisted
+}
+
+func (s *Scheduler) removeReleaseIntent(want Binding) error {
+	return WithState(s.cityPath, func(st *State) error {
+		for _, b := range st.Releasing {
+			if b.ReservationRef == want.ReservationRef && !bindingsEqual(b, want) {
+				return fmt.Errorf("binding: release intent %q contradicts generation being completed", want.ReservationRef)
+			}
+		}
+		st.Releasing = removeByReservation(st.Releasing, want.ReservationRef)
 		return nil
 	})
 }
@@ -345,6 +394,17 @@ func (s *Scheduler) Recover() error {
 			return fmt.Errorf("capacity reservation %q appears more than once", r.ID)
 		}
 		reservations[r.ID] = r
+	}
+	for _, b := range state.Releasing {
+		if r, exists := reservations[b.ReservationRef]; exists && !reservationOwnsBinding(r, b) {
+			return fmt.Errorf("releasing reservation %q ownership contradicts workload %q generation %d", b.ReservationRef, b.WorkloadID, b.Generation)
+		}
+		if err := s.finishRelease(b); err != nil {
+			return fmt.Errorf("recovering release intent %q: %w", b.ReservationRef, err)
+		}
+		if err := s.removeReleaseIntent(b); err != nil {
+			return fmt.Errorf("completing release intent %q: %w", b.ReservationRef, err)
+		}
 	}
 	for _, b := range state.Pending {
 		r, exists := reservations[b.ReservationRef]
