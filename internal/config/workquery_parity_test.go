@@ -320,10 +320,7 @@ func TestNotDisarmedFilterJQMatchesGoDecoder(t *testing.T) {
 			wantKept := !addressable || !beadmeta.IsDisarmedRaw(md)
 
 			script := "printf '%s' " + shellquote.Quote(string(raw)) + " | " + jqStage
-			out, err := exec.Command("sh", "-c", script).Output()
-			if err != nil {
-				t.Fatalf("run jq filter: %v (script=%s)", err, script)
-			}
+			out := []byte(runShellWithFakeBd(t, script, nil, "#!/bin/sh\nprintf '[]'\n"))
 			var kept []map[string]any
 			if err := json.Unmarshal(out, &kept); err != nil {
 				t.Fatalf("unmarshal jq output %q: %v", out, err)
@@ -403,8 +400,7 @@ func TestPoolDemandCountShellExcludesDisarmedFromEverySource(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			writeJSON := func(name string, rows []any) {
+			marshalRows := func(name string, rows []any) string {
 				if rows == nil {
 					rows = []any{}
 				}
@@ -412,40 +408,23 @@ func TestPoolDemandCountShellExcludesDisarmedFromEverySource(t *testing.T) {
 				if err != nil {
 					t.Fatalf("marshal %s: %v", name, err)
 				}
-				if err := os.WriteFile(filepath.Join(dir, name), raw, 0o600); err != nil {
-					t.Fatalf("write %s: %v", name, err)
-				}
+				return shellquote.Quote(string(raw))
 			}
-			writeJSON("routed.json", tc.routed)
-			writeJSON("legacy.json", tc.legacy)
-			writeJSON("ephemeral.json", tc.ephemeral)
 
 			// Stub bd dispatches on the flags each probe is built with. The
 			// canonical probe is the only one carrying gc.routed_to, and the
 			// migration probe the only one carrying gc.run_target, so matching on
 			// those keys routes each probe to its own fixture.
 			stub := "#!/bin/sh\ncase \"$*\" in\n" +
-				"  *" + beadmeta.RoutedToMetadataKey + "=" + target + "*) cat " + filepath.Join(dir, "routed.json") + " ;;\n" +
-				"  *" + beadmeta.RunTargetMetadataKey + "=" + target + "*) cat " + filepath.Join(dir, "legacy.json") + " ;;\n" +
-				"  *ephemeral=true*) cat " + filepath.Join(dir, "ephemeral.json") + " ;;\n" +
+				"  *" + beadmeta.RoutedToMetadataKey + "=" + target + "*) printf '%s' " + marshalRows("routed rows", tc.routed) + " ;;\n" +
+				"  *" + beadmeta.RunTargetMetadataKey + "=" + target + "*) printf '%s' " + marshalRows("legacy rows", tc.legacy) + " ;;\n" +
+				"  *ephemeral=true*) printf '%s' " + marshalRows("ephemeral rows", tc.ephemeral) + " ;;\n" +
 				"  *) printf '[]' ;;\nesac\n"
-			binDir := filepath.Join(dir, "bin")
-			if err := os.MkdirAll(binDir, 0o755); err != nil {
-				t.Fatalf("mkdir bin: %v", err)
-			}
-			if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(stub), 0o700); err != nil {
-				t.Fatalf("write stub bd: %v", err)
-			}
 
 			// includeEphemeralReady=false keeps the legacy ephemeral probe live;
 			// the true form short-circuits it to printf "[]".
-			cmd := exec.Command("sh", "-c", poolDemandCountShell(target, false))
-			cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-			out, err := cmd.Output()
-			if err != nil {
-				t.Fatalf("run count shell: %v\nscript=%s", err, poolDemandCountShell(target, false))
-			}
-			if got := strings.TrimSpace(string(out)); got != tc.want {
+			out := runShellWithFakeBd(t, poolDemandCountShell(target, false), nil, stub)
+			if got := strings.TrimSpace(out); got != tc.want {
 				t.Errorf("demand count = %s, want %s\n(a disarmed bead counted as demand spawns a slot the claim path refuses)", got, tc.want)
 			}
 		})
