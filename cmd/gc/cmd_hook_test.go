@@ -2604,3 +2604,43 @@ func TestFilterUnreadyHookCandidatesExcludesClosedBeadsFromReworkDrift(t *testin
 		t.Fatalf("filterUnreadyHookCandidates returned %d items for closed bead, want 0; got %q", len(items), got)
 	}
 }
+
+// TestFilterUnreadyHookCandidatesExcludesMessageBeads verifies that a mail
+// message bead (issue_type "message"), which carries the recipient's address as
+// its assignee, is stripped from work_query output. Without this, the
+// by-assignee adoption path in hookClaimExistingOrAssigned returns an unread
+// message to the session as its work item — ahead of the session's real routed
+// work, by construction (#4419).
+func TestFilterUnreadyHookCandidatesExcludesMessageBeads(t *testing.T) {
+	now := time.Now()
+	input := `[{"id":"ra-wisp-qgcfg1","status":"open","issue_type":"message","ephemeral":true,"assignee":"ra-9w9c","title":"HANDOFF: ra-w2rg fixed+verified"},{"id":"gc-work","status":"open","issue_type":"task","title":"Real routed work"}]`
+	got := filterUnreadyHookCandidates(input, now)
+
+	var items []map[string]any
+	if err := json.Unmarshal([]byte(got), &items); err != nil {
+		t.Fatalf("unmarshal result: %v; raw=%q", err, got)
+	}
+	if len(items) != 1 {
+		t.Fatalf("filterUnreadyHookCandidates returned %d items, want 1; got %q", len(items), got)
+	}
+	if id, _ := items[0]["id"].(string); id != "gc-work" {
+		t.Fatalf("remaining bead id = %q, want gc-work", id)
+	}
+}
+
+// TestFilterUnreadyHookCandidatesExcludesMessageBeadsLegacyTypeKey covers the
+// defensive `.issue_type // .type` spelling used by the work_query jq: a message
+// bead that carries its class under the bare "type" key is stripped too.
+func TestFilterUnreadyHookCandidatesExcludesMessageBeadsLegacyTypeKey(t *testing.T) {
+	now := time.Now()
+	input := `[{"id":"m-1","status":"open","type":"message","assignee":"sess-1"}]`
+	got := filterUnreadyHookCandidates(input, now)
+
+	var items []map[string]any
+	if err := json.Unmarshal([]byte(got), &items); err != nil {
+		t.Fatalf("unmarshal result: %v; raw=%q", err, got)
+	}
+	if len(items) != 0 {
+		t.Fatalf("filterUnreadyHookCandidates returned %d items for message bead, want 0; got %q", len(items), got)
+	}
+}

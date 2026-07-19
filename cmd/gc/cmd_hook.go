@@ -723,7 +723,9 @@ func workQueryHasReadyWork(output string) bool {
 
 // filterUnreadyHookCandidates strips beads from work_query output that fail
 // bd ready semantics: future defer_until, any open blocking dep in the row's
-// blocked_by array, or the row's own is_blocked / status=="blocked" marker.
+// blocked_by array, or the row's own is_blocked / status=="blocked" marker. It
+// also strips mail message beads, which are not work but carry the recipient's
+// address as their assignee and would otherwise be adopted as work (#4419).
 // The work_query is expected to gate these, but defensive filtering here
 // prevents a single broken query from cascading into agent action on a bead
 // it cannot progress.
@@ -748,6 +750,9 @@ func filterUnreadyHookCandidates(output string, now time.Time) string {
 			continue
 		}
 		if isClosedHookCandidate(obj) {
+			continue
+		}
+		if isMessageHookCandidate(obj) {
 			continue
 		}
 		if isFutureDeferredHookCandidate(obj, now) {
@@ -828,6 +833,24 @@ func isSelfBlockedHookCandidate(item map[string]any) bool {
 func isClosedHookCandidate(item map[string]any) bool {
 	status, ok := item["status"].(string)
 	return ok && strings.EqualFold(strings.TrimSpace(status), "closed")
+}
+
+// isMessageHookCandidate reports whether item is a mail message bead (bead
+// class "message"). Mail beads are ephemeral and carry the recipient's address
+// as their assignee, so the by-assignee adoption path in
+// hookClaimExistingOrAssigned would otherwise return an unread message to a
+// session as its work item — ahead of the session's actual routed work, by
+// construction (that adoption path runs before the route-claim path). The bead
+// class travels under "issue_type" in bd's wire format; the bare "type"
+// fallback mirrors the work_query jq's defensive `.issue_type // .type`
+// spelling (#4419).
+func isMessageHookCandidate(item map[string]any) bool {
+	for _, key := range []string{"issue_type", "type"} {
+		if class, ok := item[key].(string); ok && strings.EqualFold(strings.TrimSpace(class), "message") {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeWorkQueryOutput(output string) string {
