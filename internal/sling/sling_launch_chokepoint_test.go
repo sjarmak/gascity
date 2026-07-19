@@ -2,6 +2,7 @@ package sling
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -29,15 +30,26 @@ func launchForBeadTarget(t *testing.T, formulaDir, formulaName, targetID string,
 
 func launchForBeadTargetInScope(t *testing.T, formulaDir, formulaName, targetID, scopeKind, scopeRef string, a config.Agent, deps SlingDeps) string {
 	t.Helper()
+	rootID, err := tryLaunchForBeadTargetInScope(formulaDir, formulaName, targetID, scopeKind, scopeRef, a, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rootID
+}
+
+// tryLaunchForBeadTargetInScope is the error-returning form for callers on
+// spawned goroutines: t.Fatalf is only defined on the test goroutine, so
+// concurrent tests must collect errors and fail after they rejoin.
+func tryLaunchForBeadTargetInScope(formulaDir, formulaName, targetID, scopeKind, scopeRef string, a config.Agent, deps SlingDeps) (string, error) {
 	inv, _, err := prepareGraphV2FormulaInvocation(context.Background(), formulaName, targetID, SlingOpts{ScopeKind: scopeKind, ScopeRef: scopeRef}, deps, a)
 	if err != nil {
-		t.Fatalf("PrepareInvocation(%s): %v", targetID, err)
+		return "", fmt.Errorf("prepare invocation for %s: %w", targetID, err)
 	}
 	res, err := InstantiateSlingFormula(context.Background(), formulaName, []string{formulaDir}, molecule.Options{Vars: inv.Vars}, "", scopeKind, scopeRef, a, deps)
 	if err != nil {
-		t.Fatalf("InstantiateSlingFormula(%s): %v", targetID, err)
+		return "", fmt.Errorf("instantiate sling formula for %s: %w", targetID, err)
 	}
-	return res.RootID
+	return res.RootID, nil
 }
 
 // TestLaunchWorkflowDifferentLogicalScopesShareInputConvoyRace forces two
@@ -58,17 +70,23 @@ func TestLaunchWorkflowDifferentLogicalScopesShareInputConvoyRace(t *testing.T) 
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	roots := make([]string, 2)
+	errs := make([]error, 2)
 	scopes := [][2]string{{"rig", "alpha"}, {"rig", "beta"}}
 	for i := range scopes {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			roots[i] = launchForBeadTargetInScope(t, formulaDir, "graph-work", target.ID, scopes[i][0], scopes[i][1], a, deps)
+			roots[i], errs[i] = tryLaunchForBeadTargetInScope(formulaDir, "graph-work", target.ID, scopes[i][0], scopes[i][1], a, deps)
 		}(i)
 	}
 	close(start)
 	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("scope %v launch: %v", scopes[i], err)
+		}
+	}
 	if roots[0] == roots[1] {
 		t.Fatalf("different logical scopes reused root %q; scope must differentiate RootKey", roots[0])
 	}
@@ -129,6 +147,36 @@ func TestLaunchWorkflowBeadTargetDoubleSlingCreatesOneRoot(t *testing.T) {
 	}
 }
 
+// TestLaunchWorkflowBeadTargetAliasSpellingReusesRoot pins alias convergence
+// end to end. Formula resolution accepts "graph-work", "graph-work.toml", and
+// "graph-work.formula.toml" as one formula (#3704), so a dispatch under any
+// spelling must land on the same input convoy and live root — otherwise the
+// aliases re-open the same duplicate-root hole this fix closes (gc-28jm), no
+// race required.
+func TestLaunchWorkflowBeadTargetAliasSpellingReusesRoot(t *testing.T) {
+	formulaDir := t.TempDir()
+	writeGraphV2ConvoyFormula(t, formulaDir)
+	deps := testDeps(graphV2SlingTestConfig(t, formulaDir), runtime.NewFake(), newFakeRunner().run)
+	deps.CityPath = t.TempDir()
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	target, err := deps.Store.Create(beads.Bead{Title: "work bead", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := launchForBeadTarget(t, formulaDir, "graph-work", target.ID, a, deps)
+	before := beadCount(t, deps.Store)
+	for _, alias := range []string{"graph-work.toml", "graph-work.formula.toml"} {
+		if got := launchForBeadTarget(t, formulaDir, alias, target.ID, a, deps); got != first {
+			t.Fatalf("alias %q stood up root %q, want reuse of %q", alias, got, first)
+		}
+	}
+	if got := beadCount(t, deps.Store); got != before {
+		t.Fatalf("alias dispatches changed bead count from %d to %d; an alias minted a rival convoy or root", before, got)
+	}
+	assertOneSyntheticInputConvoy(t, deps.Store, target.ID)
+}
+
 // beadCount returns every bead in store across both tiers.
 func beadCount(t *testing.T, store beads.Store) int {
 	t.Helper()
@@ -162,6 +210,7 @@ func TestLaunchWorkflowBeadTargetConcurrentSlingCreatesOneRoot(t *testing.T) {
 	const n = 6
 	var wg sync.WaitGroup
 	ids := make([]string, n)
+	errs := make([]error, n)
 	ready := make(chan struct{}, n)
 	start := make(chan struct{})
 	for i := 0; i < n; i++ {
@@ -170,7 +219,7 @@ func TestLaunchWorkflowBeadTargetConcurrentSlingCreatesOneRoot(t *testing.T) {
 			defer wg.Done()
 			ready <- struct{}{}
 			<-start
-			ids[i] = launchForBeadTarget(t, formulaDir, "graph-work", target.ID, a, deps)
+			ids[i], errs[i] = tryLaunchForBeadTargetInScope(formulaDir, "graph-work", target.ID, "default", "", a, deps)
 		}(i)
 	}
 	for range n {
@@ -179,6 +228,11 @@ func TestLaunchWorkflowBeadTargetConcurrentSlingCreatesOneRoot(t *testing.T) {
 	close(start)
 	wg.Wait()
 
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("launch %d: %v", i, err)
+		}
+	}
 	for i := range ids {
 		if ids[i] != ids[0] {
 			t.Fatalf("launch %d root = %q, want the shared winner %q", i, ids[i], ids[0])
