@@ -3256,10 +3256,10 @@ case "$*" in
   "--readonly --sandbox ready --assignee=gascity--control-dispatcher --json --limit=20")
     printf '[{"id":"ga-epic-leak"}]'
     ;;
-  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
+  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --sort priority --limit=20")
     printf '[{"id":"ga-ready"}]'
     ;;
-  "--readonly --sandbox ready --metadata-field gc.run_target=gascity/control-dispatcher --unassigned --exclude-type=epic --json --limit=0")
+  "--readonly --sandbox ready --metadata-field gc.run_target=gascity/control-dispatcher --unassigned --exclude-type=epic --json --sort priority --limit=20")
     printf '[{"id":"ga-routed"}]'
     ;;
   *)
@@ -3278,10 +3278,10 @@ func TestWorkflowServeControlReadyQueryIncludesMetadataRoutedWorkAfterAssignedPe
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
+  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --sort priority --limit=20")
     printf '[{"id":"ga-pending","metadata":{"gc.kind":"retry"}}]'
     ;;
-  "--readonly --sandbox ready --metadata-field gc.run_target=gascity/control-dispatcher --unassigned --exclude-type=epic --json --limit=0")
+  "--readonly --sandbox ready --metadata-field gc.run_target=gascity/control-dispatcher --unassigned --exclude-type=epic --json --sort priority --limit=20")
     printf '[{"id":"ga-ready","metadata":{"gc.kind":"scope-check"}}]'
     ;;
   *)
@@ -3300,7 +3300,7 @@ func TestWorkflowServeControlReadyQueryIncludesCanonicalRoutedControlWork(t *tes
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "--readonly --sandbox ready --metadata-field gc.routed_to=gascity/control-dispatcher --unassigned --exclude-type=epic --json --limit=0")
+  "--readonly --sandbox ready --metadata-field gc.routed_to=gascity/control-dispatcher --unassigned --exclude-type=epic --json --sort priority --limit=20")
     printf '[{"id":"ga-control-routed","metadata":{"gc.routed_to":"gascity/control-dispatcher","gc.kind":"workflow-finalize"}}]'
     ;;
   *)
@@ -3319,10 +3319,10 @@ func TestWorkflowServeControlReadyQuerySkipsInstantiatingBeads(t *testing.T) {
 	}, fmt.Sprintf(`#!/bin/sh
 set -eu
 case "$*" in
-  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
+  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --sort priority --limit=20")
     printf '[{"id":"ga-instantiating-assigned","metadata":{"%s":"true"}},{"id":"ga-assigned","metadata":{"gc.kind":"retry"}}]'
     ;;
-  "--readonly --sandbox ready --metadata-field gc.run_target=gascity/control-dispatcher --unassigned --exclude-type=epic --json --limit=0")
+  "--readonly --sandbox ready --metadata-field gc.run_target=gascity/control-dispatcher --unassigned --exclude-type=epic --json --sort priority --limit=20")
     printf '[{"id":"ga-instantiating-routed","metadata":{"%s":"true"}},{"id":"ga-routed","metadata":{"gc.kind":"scope-check"}}]'
     ;;
   *)
@@ -3341,13 +3341,13 @@ func TestWorkflowServeControlReadyQueryAppliesCanonicalPolicyWhenMerging(t *test
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
+  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --sort priority --limit=20")
     printf '[{"id":"ga-z-assigned"},{"id":"ga-dup","source":"assigned"}]'
     ;;
-  "--readonly --sandbox ready --metadata-field gc.run_target=gascity/control-dispatcher --unassigned --exclude-type=epic --json --limit=0")
+  "--readonly --sandbox ready --metadata-field gc.run_target=gascity/control-dispatcher --unassigned --exclude-type=epic --json --sort priority --limit=20")
     printf '[{"id":"ga-a-routed"},{"id":"ga-route-dup","source":"run-target"}]'
     ;;
-  "--readonly --sandbox ready --metadata-field gc.routed_to=gascity/control-dispatcher --unassigned --exclude-type=epic --json --limit=0")
+  "--readonly --sandbox ready --metadata-field gc.routed_to=gascity/control-dispatcher --unassigned --exclude-type=epic --json --sort priority --limit=20")
     printf '[{"id":"ga-route-dup","source":"routed-to"}]'
     ;;
   *)
@@ -3371,7 +3371,7 @@ func TestWorkflowServeControlReadyQueryUsesConfiguredRuntimeNameWhenEnvIsManualS
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
+  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --sort priority --limit=20")
     printf '[{"id":"ga-control-ready"}]'
     ;;
   *)
@@ -3435,7 +3435,7 @@ func TestWorkflowServeControlReadyQueryKeepsSuccessfulBDStderrOutOfJSON(t *testi
 set -eu
 printf '%s\n' "$*" >> "$BD_LOG"
 case "$*" in
-  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
+  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --sort priority --limit=20")
     printf '[{"id":"ga-control-ready"}]'
     printf 'notice: refreshed export metadata\n' >&2
     ;;
@@ -3468,7 +3468,7 @@ func TestWorkflowServeControlReadyQueryFailsOnMalformedBDJSON(t *testing.T) {
 	if err := os.WriteFile(bdPath, []byte(`#!/bin/sh
 set -eu
 case "$*" in
-  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
+  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --sort priority --limit=20")
     printf 'not-json'
     ;;
   *)
@@ -3504,7 +3504,7 @@ set -eu
 }
 printf '%s\n' "$*" >> "$BD_LOG"
 case "$*" in
-  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
+  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --sort priority --limit=20")
     printf '[{"id":"ga-control-ready"}]'
     ;;
   *)
@@ -3531,7 +3531,7 @@ esac
 		t.Fatalf("read bd log: %v", err)
 	}
 	firstCall, _, _ := strings.Cut(strings.TrimSpace(string(logData)), "\n")
-	if want := "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20"; firstCall != want {
+	if want := "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --sort priority --limit=20"; firstCall != want {
 		t.Fatalf("first bd call = %q, want %q; all calls:\n%s", firstCall, want, string(logData))
 	}
 }
@@ -3548,7 +3548,7 @@ func TestWorkflowServeControlReadyQueryDeduplicatesAssigneeProbes(t *testing.T) 
 set -eu
 printf '%s\n' "$*" >> "$BD_LOG"
 case "$*" in
-  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
+  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --sort priority --limit=20")
     printf '[{"id":"ga-control-ready"}]'
     ;;
   *)
@@ -3589,7 +3589,7 @@ func TestWorkflowServeControlReadyQueryQuotesMetadataFallbackTarget(t *testing.T
 		"BD_MATCHED_ARGS": argsPath,
 	}, `#!/bin/sh
 set -eu
-if [ "$#" -eq 9 ] &&
+if [ "$#" -eq 11 ] &&
    [ "$1" = "--readonly" ] &&
    [ "$2" = "--sandbox" ] &&
    [ "$3" = "ready" ] &&
@@ -3598,7 +3598,9 @@ if [ "$#" -eq 9 ] &&
    [ "$6" = "--unassigned" ] &&
    [ "$7" = "--exclude-type=epic" ] &&
    [ "$8" = "--json" ] &&
-   [ "$9" = "--limit=0" ]; then
+   [ "$9" = "--sort" ] &&
+   [ "${10}" = "priority" ] &&
+   [ "${11}" = "--limit=20" ]; then
   printf '%s\n' "$@" > "$BD_MATCHED_ARGS"
   printf '[{"id":"ga-routed"}]'
   exit 0
@@ -3611,7 +3613,7 @@ printf '[]'
 		t.Fatalf("read matched args: %v", err)
 	}
 	gotArgs := strings.Split(strings.TrimSpace(string(argsData)), "\n")
-	wantArgs := []string{"--readonly", "--sandbox", "ready", "--metadata-field", "gc.run_target=my rig/control-dispatcher", "--unassigned", "--exclude-type=epic", "--json", "--limit=0"}
+	wantArgs := []string{"--readonly", "--sandbox", "ready", "--metadata-field", "gc.run_target=my rig/control-dispatcher", "--unassigned", "--exclude-type=epic", "--json", "--sort", "priority", "--limit=20"}
 	if !slices.Equal(gotArgs, wantArgs) {
 		t.Fatalf("matched bd args = %#v, want %#v", gotArgs, wantArgs)
 	}
@@ -3626,7 +3628,7 @@ func TestWorkflowServeControlReadyQueryUsesLegacyRouteForNamedSessions(t *testin
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "--readonly --sandbox ready --metadata-field gc.run_target=gascity/workflow-control --unassigned --exclude-type=epic --json --limit=0")
+  "--readonly --sandbox ready --metadata-field gc.run_target=gascity/workflow-control --unassigned --exclude-type=epic --json --sort priority --limit=20")
     printf '[{"id":"ga-legacy-route"}]'
     ;;
   *)
