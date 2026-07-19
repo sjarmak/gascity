@@ -361,17 +361,21 @@ func InputConvoyInvocationKey(targetID, formulaName string) string {
 	return inputConvoyInvocationPrefix + strings.TrimSpace(targetID) + ":" + strings.TrimSpace(formulaName)
 }
 
-// InputConvoyLockKey is the cross-process launch-lock identity for a targeted
-// graph.v2 invocation. Scope is part of the identity because the same target
-// and formula may be launched independently in distinct logical scopes.
-func InputConvoyLockKey(targetID, formulaName, scopeKind, scopeRef string) string {
-	return strings.Join([]string{
-		inputConvoyInvocationPrefix + "lock",
-		strings.TrimSpace(targetID),
-		strings.TrimSpace(formulaName),
-		strings.TrimSpace(scopeKind),
-		strings.TrimSpace(scopeRef),
-	}, ":")
+// InputConvoyLockKey is the cross-process launch-lock identity for the same
+// (target, formula) tuple persisted by InputConvoyInvocationKey. Logical scope
+// deliberately does not participate: it differentiates workflow RootKeys,
+// while every such workflow shares one synthetic input convoy.
+func InputConvoyLockKey(targetID, formulaName string) string {
+	targetID = strings.TrimSpace(targetID)
+	formulaName = strings.TrimSpace(formulaName)
+	h := sha256.New()
+	for _, value := range []string{targetID, formulaName} {
+		// Length framing makes tuples such as ("a:b", "c") and
+		// ("a", "b:c") unambiguous before hashing.
+		_, _ = fmt.Fprintf(h, "%d:", len(value))
+		_, _ = h.Write([]byte(value))
+	}
+	return inputConvoyInvocationPrefix + "lock:" + hex.EncodeToString(h.Sum(nil))
 }
 
 // NormalizeInputConvoy returns targetID when it is already a convoy, otherwise
