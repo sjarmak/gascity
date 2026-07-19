@@ -128,7 +128,7 @@ func LoadState(cityPath string) (State, error) {
 		return State{}, fmt.Errorf("read capacity ledger: %w", err)
 	}
 	if len(data) == 0 {
-		return State{}, nil
+		return State{}, errors.New("parse capacity ledger: empty file")
 	}
 	var state State
 	if err := json.Unmarshal(data, &state); err != nil {

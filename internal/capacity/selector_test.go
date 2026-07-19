@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // recordingRunner captures the env a selector command would receive.
@@ -122,6 +125,30 @@ func TestCommandSelector_PropagatesRunnerError(t *testing.T) {
 	_, err := sel.Pick(context.Background(), PickRequest{Agent: "worker"})
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want wrapped runner error", err)
+	}
+}
+
+func TestShellRunnerDoesNotStartWithCanceledContext(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "started")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := shellRunner(ctx, fmt.Sprintf("touch %q", marker), nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("shellRunner error = %v, want context.Canceled", err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("marker stat error = %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestShellRunnerReturnsDeadlineExceeded(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	_, err := shellRunner(ctx, "sleep 10 & wait", nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shellRunner error = %v, want context.DeadlineExceeded", err)
 	}
 }
 

@@ -3,6 +3,7 @@ package capacity
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -88,6 +89,20 @@ func TestLoadState_CorruptFileErrors(t *testing.T) {
 	}
 	if _, err := LoadState(city); err == nil {
 		t.Fatal("LoadState error = nil, want parse error (must not silently reset the ledger)")
+	}
+}
+
+func TestLoadState_EmptyFileErrors(t *testing.T) {
+	city := t.TempDir()
+	path := StatePath(city)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatalf("write empty state: %v", err)
+	}
+	if _, err := LoadState(city); err == nil {
+		t.Fatal("LoadState error = nil, want empty-file corruption error")
 	}
 }
 

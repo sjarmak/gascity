@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/processgroup"
 )
 
 // Environment variables a selector command receives. The command is free to
@@ -123,7 +125,14 @@ func parseAccountPick(command, out string) (string, error) {
 // shellRunner is the production CommandRunner: sh -c, inheriting the
 // environment with the selector variables merged in.
 func shellRunner(ctx context.Context, command string, env map[string]string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	processgroup.StartCommandInNewGroup(cmd)
+	cmd.Cancel = func() error {
+		return processgroup.TerminateCommand(cmd, 0, 500*time.Millisecond, processgroup.Options{})
+	}
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = os.Environ()
 	for k, v := range env {
@@ -131,6 +140,9 @@ func shellRunner(ctx context.Context, command string, env map[string]string) (st
 	}
 	out, err := cmd.Output()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", fmt.Errorf("running command %q: %w", command, err)
 	}
 	return string(out), nil
