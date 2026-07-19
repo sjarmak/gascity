@@ -94,12 +94,12 @@ func (w workAssignment) ReadyAssignedTo(assignee string, tierMode beads.TierMode
 	return beads.ReadyLive(store, beads.ReadyQuery{Assignee: assignee, TierMode: tierMode})
 }
 
-// HasNonSessionWork reports whether any bead in items is non-session WORK
-// (skipping session beads and repairable session beads). Shared filter for the
-// boolean readiness/open probes.
+// HasNonSessionWork reports whether items contain executable non-session WORK.
+// Disarmed work remains visible to lifecycle cleanup, but must not wake or
+// retain a session through the reconciler's boolean assignment probes.
 func (w workAssignment) HasNonSessionWork(items []beads.Bead) bool {
 	for _, item := range items {
-		if sessionpkg.IsSessionBeadOrRepairable(item) {
+		if sessionpkg.IsSessionBeadOrRepairable(item) || beadmeta.IsDisarmed(item.Metadata) {
 			continue
 		}
 		return true

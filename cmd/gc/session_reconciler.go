@@ -3913,7 +3913,7 @@ func firstOpenAssignedWorkBeadInStoreByIdentifiers(store beads.Store, identifier
 				return beads.Bead{}, false, err
 			}
 			for _, item := range items {
-				if sessionpkg.IsSessionBeadOrRepairable(item) {
+				if sessionpkg.IsSessionBeadOrRepairable(item) || beadmeta.IsDisarmed(item.Metadata) {
 					continue
 				}
 				return item, true, nil

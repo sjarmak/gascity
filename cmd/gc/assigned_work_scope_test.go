@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/agentutil"
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
@@ -25,6 +26,36 @@ func sessionInfosFromBeads(bs []beads.Bead) []sessionpkg.Info {
 		infos[i] = seedSessionInfo(b)
 	}
 	return infos
+}
+
+func TestAssignedWorkOrchestrationFiltersSkipDisarmed(t *testing.T) {
+	cfg := &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	work := []beads.Bead{
+		{ID: "disarmed", Assignee: "worker-1", Metadata: map[string]string{
+			beadmeta.RoutedToMetadataKey: "worker",
+			beadmeta.DisarmedMetadataKey: "true",
+		}},
+		{ID: "armed", Assignee: "worker-1", Metadata: map[string]string{
+			beadmeta.RoutedToMetadataKey: "worker",
+		}},
+	}
+	refs := []string{"", ""}
+
+	pool := filterAssignedWorkBeadsForPoolDemand(cfg, "", nil, work, refs)
+	if len(pool) != 1 || pool[0].ID != "armed" {
+		t.Fatalf("pool demand work = %#v, want only armed", pool)
+	}
+
+	sessions := []sessionpkg.Info{{ID: "session-1", SessionNameMetadata: "worker-1", Template: "worker"}}
+	wake, wakeRefs := filterAssignedWorkBeadsForSessionWake(cfg, "", sessions, work, refs)
+	if len(wake) != 1 || wake[0].ID != "armed" || len(wakeRefs) != 1 {
+		t.Fatalf("session wake work = %#v refs=%#v, want only armed", wake, wakeRefs)
+	}
+
+	wa := workAssignmentForStore(beads.WorkStore{Store: beads.NewMemStore()})
+	if !wa.HasNonSessionWork(work[1:]) || wa.HasNonSessionWork(work[:1]) {
+		t.Fatal("assigned-work boolean probes must count armed work and ignore disarmed work")
+	}
 }
 
 func TestFilterAssignedWorkBeadsForSessionWakeKeepsOnlyReachableAssigneeSources(t *testing.T) {
