@@ -828,20 +828,27 @@ func TestRowQueryOverrideGuardShape(t *testing.T) {
 		// The capture must not sit in a checked context (`|| exit $?`): bash,
 		// POSIX mode included, suppresses errexit inside a substitution that a
 		// ||-list checks, so an override relying on its own `set -e` would
-		// mask a failed bd call as clean no-work output. Pinned under both sh
-		// and bash because dash propagates either way and would hide the
-		// regression on dash-only hosts.
+		// mask a failed bd call as clean no-work output. dash propagates
+		// either way, so the sh arm alone would hide the regression on
+		// dash-/bin/sh hosts; the bash arm rewrites the guard's own `sh -c`
+		// launcher to `bash --posix -c` so the script body itself — not just
+		// the outer wrapper — executes under bash semantics.
 		a := &Agent{Name: "worker", WorkQuery: `set -e; false; printf '%s' '[{"id":"survived"}]'`}
 		q := a.EffectiveWorkQuery()
-		shells := [][]string{{"sh", "-c"}}
-		if _, err := exec.LookPath("bash"); err == nil {
-			shells = append(shells, []string{"bash", "--posix", "-c"})
+		if !strings.HasPrefix(q, "sh -c ") {
+			t.Fatalf("guarded override = %q, want the sh -c launcher this test rewrites", q)
 		}
-		for _, sh := range shells {
-			out, err := exec.Command(sh[0], append(sh[1:], q)...).CombinedOutput()
+		commands := []struct{ name, cmd string }{{"sh", q}}
+		if _, err := exec.LookPath("bash"); err == nil {
+			commands = append(commands, struct{ name, cmd string }{
+				"bash", "bash --posix -c " + strings.TrimPrefix(q, "sh -c "),
+			})
+		}
+		for _, tc := range commands {
+			out, err := exec.Command("sh", "-c", tc.cmd).CombinedOutput()
 			var exitErr *exec.ExitError
 			if !errors.As(err, &exitErr) {
-				t.Errorf("%s: guarded override with internal set -e failure = %v (out=%q), want a nonzero exit instead of the masked row", sh[0], err, out)
+				t.Errorf("%s: guarded override with internal set -e failure = %v (out=%q), want a nonzero exit instead of the masked row", tc.name, err, out)
 			}
 		}
 	})
