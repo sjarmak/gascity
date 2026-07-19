@@ -1887,7 +1887,7 @@ max = 5
 		t.Fatalf("stdout = %q, want GC_RIG_ROOT=%q", out, rigDir)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=20") {
+	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=0") {
 		t.Fatalf("stdout = %q, want pool work_query args", out)
 	}
 }
@@ -2282,7 +2282,7 @@ max = 5
 		t.Fatalf("stdout = %q, want command to run from rig root %q", out, rigDir)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=20") {
+	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=0") {
 		t.Fatalf("stdout = %q, want pool template work_query args", out)
 	}
 }
@@ -2352,7 +2352,7 @@ name = "worker"
 		t.Fatalf("stdout = %q, want GC_SESSION_NAME=host-session", out)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=20`) {
+	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=0`) {
 		t.Fatalf("stdout = %q, want metadata-routed work query", out)
 	}
 }
@@ -2415,7 +2415,7 @@ dir = "myrig"
 		t.Fatalf("stdout = %q, want GC_SESSION_NAME=%s", out, wantSession)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=20`) {
+	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=0`) {
 		t.Fatalf("stdout = %q, want metadata-routed work query", out)
 	}
 }
@@ -2436,14 +2436,15 @@ func TestDoHookNormalizesSingleObjectOutputToArray(t *testing.T) {
 }
 
 // TestDoHookAssignedTierSurvivesUnreadyHeadOfLine is a regression test for
-// gc-ewk4: assigned tiers use --limit=20 so disarmed or blocked head rows do
-// not hide an armed assigned peer from the Go-side readiness filter.
+// gc-ewk4: assigned tiers return a widened candidate array (fetch unlimited,
+// cap after the disarm filter since gc-cg89) so disarmed or blocked head rows
+// do not hide an armed assigned peer from the Go-side readiness filter.
 func TestDoHookAssignedTierSurvivesUnreadyHeadOfLine(t *testing.T) {
 	runner := func(string, string) (string, error) {
 		return `[{"id":"gc-disarmed-head","status":"open","metadata":{"gc.disarmed":true}},{"id":"gc-blocked-head","status":"blocked","is_blocked":true},{"id":"gc-ready-behind","status":"open"}]`, nil
 	}
 	var stdout, stderr bytes.Buffer
-	code := doHook("bd list --status in_progress --assignee=worker --json --limit=20", "", false, runner, &stdout, &stderr)
+	code := doHook("bd list --status in_progress --assignee=worker --json --limit=0", "", false, runner, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doHook() = %d, want 0 (armed assigned work exists behind unready heads); stderr=%s", code, stderr.String())
 	}

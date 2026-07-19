@@ -64,6 +64,21 @@ is still an execution path; it may not return or count a disarmed row. Queries
 that inspect multiple rows must retain an armed peer behind a disarmed head
 rather than treating the first excluded row as an empty tier.
 
+Row limits apply after the disarm filter, never before. A store-side fetch
+limit runs ahead of any filter, so a run of disarmed rows at least as long as
+the limit hides every armed row behind it — permanently, because disarmed rows
+are durable and accumulate at the head of an oldest-first sort. Worker tiers
+therefore fetch unlimited, filter, and then cap the filtered result; a capped
+fetch on one side of the claim/demand pair recreates the spawn/idle-exit loop
+described above (gc-cg89).
+
+Configured work-query overrides are inside the contract for row-returning
+queries: the command an override resolves to is wrapped in the same disarm
+exclusion the built-in tiers use, matching the Go-side hook filter that
+already applies to override output. Count-form overrides (`scale_check`) emit
+a number and cannot be row-filtered; keeping a custom count consistent with
+the guarded work query remains the override author's responsibility.
+
 ## Cache and reconciliation safety
 
 The backing bead store is authoritative. Cache event payloads may contain only

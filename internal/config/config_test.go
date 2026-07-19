@@ -1829,13 +1829,13 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
 	if strings.Contains(got, `--include-ephemeral`) {
 		t.Errorf("EffectiveWorkQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
 	}
-	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json --sort oldest --limit=20`) {
+	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json --sort oldest --limit 0`) {
 		t.Errorf("EffectiveWorkQuery() missing tier 3 pool-demand probe: %q", got)
 	}
 	if !strings.Contains(got, "-- mayor") {
 		t.Errorf("EffectiveWorkQuery() missing tier 3 target argument: %q", got)
 	}
-	if !strings.Contains(got, `bd ready --metadata-field "gc.run_target=$target" --metadata-field "gc.kind=workflow" --unassigned --exclude-type=epic --json --sort oldest --limit=20`) {
+	if !strings.Contains(got, `bd ready --metadata-field "gc.run_target=$target" --metadata-field "gc.kind=workflow" --unassigned --exclude-type=epic --json --sort oldest --limit 0`) {
 		t.Errorf("EffectiveWorkQuery() missing run_target migration fallback: %q", got)
 	}
 	for _, want := range []string{`.metadata`, `.[:1]`} {
@@ -1851,10 +1851,10 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
 func TestEffectiveWorkQueryBD105CompatibilityOptIn(t *testing.T) {
 	a := Agent{Name: "mayor"}
 	got := a.EffectiveWorkQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
-	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json --sort oldest --limit=20`) {
+	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json --sort oldest --limit 0`) {
 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral routed probe: %q", got)
 	}
-	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=20`) {
+	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=0`) {
 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral assigned probe: %q", got)
 	}
 }
@@ -1933,9 +1933,23 @@ esac
 func TestEffectiveWorkQueryCustom(t *testing.T) {
 	a := Agent{Name: "mayor", WorkQuery: "bd ready --label=pool:polecats"}
 	got := a.EffectiveWorkQuery()
-	want := "bd ready --label=pool:polecats"
-	if got != want {
+	// The override replaces the default discovery contract entirely; it is
+	// returned wrapped only in the durable-disarm guard (gc-cg89).
+	if want := disarmGuardedOverride("bd ready --label=pool:polecats"); got != want {
 		t.Errorf("EffectiveWorkQuery() = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "gc.routed_to") {
+		t.Errorf("EffectiveWorkQuery() must not mix default tiers into a custom override: %q", got)
+	}
+
+	out := runShellWithFakeBd(t, got, nil, `#!/bin/sh
+case "$*" in
+  "ready --label=pool:polecats") printf '[{"id":"custom-row"}]' ;;
+  *) printf '[]' ;;
+esac
+`)
+	if strings.TrimSpace(out) != `[{"id":"custom-row"}]` {
+		t.Errorf("EffectiveWorkQuery() custom output = %q, want the override's armed rows passed through", out)
 	}
 }
 
@@ -1945,7 +1959,7 @@ func TestEffectiveAssignedReadyQueryDefault(t *testing.T) {
 	if strings.Contains(got, `--include-ephemeral`) {
 		t.Fatalf("EffectiveAssignedReadyQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
 	}
-	if !strings.Contains(got, `bd ready --assignee="$id" --json --limit=20`) {
+	if !strings.Contains(got, `bd ready --assignee="$id" --json --limit=0`) {
 		t.Fatalf("EffectiveAssignedReadyQuery() missing assigned-ready tier: %q", got)
 	}
 	if strings.Contains(got, "gc.routed_to") {
@@ -1957,7 +1971,7 @@ func TestEffectiveAssignedReadyQueryDefault(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "ready --assignee=worker-session --json --limit=20") printf '[{"id":"assigned-ready"}]' ;;
+  "ready --assignee=worker-session --json --limit=0") printf '[{"id":"assigned-ready"}]' ;;
   *) printf '[]' ;;
 esac
 `)
@@ -1969,7 +1983,7 @@ esac
 func TestEffectiveAssignedReadyQueryForBeadsBD105Compatibility(t *testing.T) {
 	a := Agent{Name: "worker", Dir: "hello-world"}
 	got := a.EffectiveAssignedReadyQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
-	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=20`) {
+	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=0`) {
 		t.Fatalf("EffectiveAssignedReadyQueryForBeads(bd-1.0.5) missing include-ephemeral assigned-ready tier: %q", got)
 	}
 }
@@ -1979,7 +1993,7 @@ func TestEffectiveAssignedInProgressQueryDefault(t *testing.T) {
 	got := a.EffectiveAssignedInProgressQuery()
 	for _, want := range []string{
 		`"$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"`,
-		`bd list --status in_progress --assignee="$id" --json --limit=20`,
+		`bd list --status in_progress --assignee="$id" --json --limit=0`,
 		`ephemeral=true AND status=in_progress`,
 	} {
 		if !strings.Contains(got, want) {
@@ -1995,7 +2009,7 @@ func TestEffectiveAssignedInProgressQueryDefault(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"assigned-in-progress","ephemeral":true}]' ;;
+  "list --status in_progress --assignee=worker-bead --json --limit=0") printf '[{"id":"assigned-in-progress","ephemeral":true}]' ;;
   *) printf '[]' ;;
 esac
 `)
@@ -2007,14 +2021,17 @@ esac
 func TestEffectiveAssignedReadyQueryCustomPreservesOverride(t *testing.T) {
 	const custom = "custom work query"
 	a := Agent{Name: "worker", WorkQuery: custom}
-	if got := a.EffectiveAssignedInProgressQuery(); got != custom {
-		t.Fatalf("EffectiveAssignedInProgressQuery() = %q, want custom override %q", got, custom)
+	// Every split-tier accessor resolves the same custom command, wrapped
+	// only in the durable-disarm guard (gc-cg89) — no default tiers mixed in.
+	want := disarmGuardedOverride(custom)
+	if got := a.EffectiveAssignedInProgressQuery(); got != want {
+		t.Fatalf("EffectiveAssignedInProgressQuery() = %q, want guarded custom override %q", got, want)
 	}
-	if got := a.EffectiveAssignedReadyQuery(); got != custom {
-		t.Fatalf("EffectiveAssignedReadyQuery() = %q, want custom override %q", got, custom)
+	if got := a.EffectiveAssignedReadyQuery(); got != want {
+		t.Fatalf("EffectiveAssignedReadyQuery() = %q, want guarded custom override %q", got, want)
 	}
-	if got := a.EffectiveRoutedPoolQuery(); got != custom {
-		t.Fatalf("EffectiveRoutedPoolQuery() = %q, want custom override %q", got, custom)
+	if got := a.EffectiveRoutedPoolQuery(); got != want {
+		t.Fatalf("EffectiveRoutedPoolQuery() = %q, want guarded custom override %q", got, want)
 	}
 }
 
@@ -2070,12 +2087,12 @@ func TestEffectiveAssignedReadyQueryControlDispatcherClaimsLegacyAssignedWork(t 
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "ready --assignee=gascity--control-dispatcher --json --limit=20"|\
-  "ready --assignee=gascity/control-dispatcher --json --limit=20")
+  "ready --assignee=gascity--control-dispatcher --json --limit=0"|\
+  "ready --assignee=gascity/control-dispatcher --json --limit=0")
     printf '[]'
     ;;
-  "ready --assignee=gascity--workflow-control --json --limit=20"|\
-  "ready --assignee=gascity/workflow-control --json --limit=20")
+  "ready --assignee=gascity--workflow-control --json --limit=0"|\
+  "ready --assignee=gascity/workflow-control --json --limit=0")
     printf '[{"id":"ga-legacy-ready"}]'
     ;;
   *)
@@ -2199,14 +2216,14 @@ func TestEffectiveWorkQueryControlDispatcherClaimsLegacyAssignedWork(t *testing.
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "list --status in_progress --assignee=gascity--control-dispatcher --json --limit=20"|\
-  "list --status in_progress --assignee=gascity/control-dispatcher --json --limit=20"|\
-  "list --status in_progress --assignee=gascity--workflow-control --json --limit=20"|\
-  "list --status in_progress --assignee=gascity/workflow-control --json --limit=20")
+  "list --status in_progress --assignee=gascity--control-dispatcher --json --limit=0"|\
+  "list --status in_progress --assignee=gascity/control-dispatcher --json --limit=0"|\
+  "list --status in_progress --assignee=gascity--workflow-control --json --limit=0"|\
+  "list --status in_progress --assignee=gascity/workflow-control --json --limit=0")
     printf '[]'
     ;;
-  "ready --assignee=gascity--workflow-control --json --limit=20"|\
-  "ready --assignee=gascity/workflow-control --json --limit=20")
+  "ready --assignee=gascity--workflow-control --json --limit=0"|\
+  "ready --assignee=gascity/workflow-control --json --limit=0")
     printf '[{"id":"ga-legacy-ready"}]'
     ;;
   *)
@@ -2224,13 +2241,13 @@ func TestEffectiveWorkQueryControlDispatcherClaimsLegacyUnassignedRoute(t *testi
 	out := runEffectiveWorkQuery(t, a, nil, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[]'
     ;;
-  *"ready --metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[]'
     ;;
-  *"ready --metadata-field gc.routed_to=gascity/workflow-control"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.routed_to=gascity/workflow-control"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[{"id":"ga-legacy-route"}]'
     ;;
   *)
@@ -2259,7 +2276,7 @@ func TestEffectiveWorkQueryRoutedQueueUsesNativeOldestSortAcrossReadyTiers(t *te
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --json --sort oldest --limit=20")
+  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --json --sort oldest --limit 0")
     printf '[{"id":"older-no-history","priority":2,"created_at":"2026-05-20T06:09:30Z","no_history":true}]'
     ;;
   *)
@@ -2304,7 +2321,7 @@ func TestEffectiveWorkQueryRoutedQueueUsesOldestBeforePriority(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[{"id":"older-p2","priority":2,"created_at":"2026-05-20T06:09:30Z"}]'
     ;;
   *)
@@ -2327,10 +2344,10 @@ func TestEffectiveWorkQueryRoutedFallbackUsesNativeOldestSort(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[]'
     ;;
-  *"ready --metadata-field gc.run_target=hello-world/worker"*"--metadata-field gc.kind=workflow"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.run_target=hello-world/worker"*"--metadata-field gc.kind=workflow"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[{"id":"older-fallback","priority":2,"created_at":"2026-05-20T06:09:30Z","metadata":{"gc.kind":"workflow","gc.run_target":"hello-world/worker"}}]'
     ;;
   *)
@@ -2454,12 +2471,26 @@ esac
 // TestEffectiveWorkQueryCustomPreservesOverride verifies that an agent
 // that explicitly opts into epic-handling (e.g. an oversight role that
 // closes epics once their children complete) can do so via a custom
-// work_query — the explicit-override path required by gc-udx.
+// work_query — the explicit-override path required by gc-udx. The override
+// owns the discovery shape; the durable-disarm guard it is wrapped in
+// (gc-cg89) filters only gc.disarmed, so epic rows still flow.
 func TestEffectiveWorkQueryCustomPreservesOverride(t *testing.T) {
 	custom := "bd ready --type=epic --assignee=closer --json --limit=1"
 	a := Agent{Name: "closer", WorkQuery: custom}
-	if got := a.EffectiveWorkQuery(); got != custom {
-		t.Errorf("EffectiveWorkQuery() = %q, want %q (custom override must pass through unmodified)", got, custom)
+	got := a.EffectiveWorkQuery()
+	if want := disarmGuardedOverride(custom); got != want {
+		t.Errorf("EffectiveWorkQuery() = %q, want %q (custom override wrapped only in the disarm guard)", got, want)
+	}
+
+	out := runShellWithFakeBd(t, got, nil, `#!/bin/sh
+case "$*" in
+  "ready --type=epic --assignee=closer --json --limit=1")
+    printf '[{"id":"epic-root","issue_type":"epic"}]' ;;
+  *) printf '[]' ;;
+esac
+`)
+	if strings.TrimSpace(out) != `[{"id":"epic-root","issue_type":"epic"}]` {
+		t.Errorf("EffectiveWorkQuery() epic override output = %q, want the epic row preserved through the guard", out)
 	}
 }
 
@@ -2724,11 +2755,11 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			wq := tt.agent.EffectiveWorkQuery()
 			demand := tt.agent.EffectivePoolDemandQuery()
-			workPredicate := bdReadyPoolDemandShell("--sort oldest --limit=20", false)
+			workPredicate := bdReadyPoolDemandShell("--sort oldest --limit 0", false)
 			if !strings.Contains(wq, workPredicate) {
 				t.Errorf("EffectiveWorkQuery() missing shared predicate %q in %q", workPredicate, wq)
 			}
-			migrationWorkPredicate := bdReadyPoolDemandMigrationShell("--limit=20", false)
+			migrationWorkPredicate := bdReadyPoolDemandMigrationShell(false)
 			if !strings.Contains(wq, migrationWorkPredicate) {
 				t.Errorf("EffectiveWorkQuery() missing shared migration predicate %q in %q", migrationWorkPredicate, wq)
 			}
@@ -2741,7 +2772,7 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
 			if !strings.Contains(demand, countPredicate) {
 				t.Errorf("EffectivePoolDemandQuery() missing shared predicate %q in %q", countPredicate, demand)
 			}
-			migrationCountPredicate := bdReadyPoolDemandMigrationShell("--limit 0", false)
+			migrationCountPredicate := bdReadyPoolDemandMigrationShell(false)
 			if !strings.Contains(demand, migrationCountPredicate) {
 				t.Errorf("EffectivePoolDemandQuery() missing shared migration predicate %q in %q", migrationCountPredicate, demand)
 			}

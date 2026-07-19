@@ -2,7 +2,9 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +22,9 @@ var updateGolden = flag.Bool("update", false, "update workquery golden files")
 // resolvers as they existed before S04b's table-driven refactor. The
 // oldEffective* functions are verbatim copies of the pre-refactor private
 // method bodies (override check + poolDemandTarget + build-script dance).
+// One deliberate behavior change is mirrored into the oracles rather than
+// frozen: gc-cg89 wraps row-returning WorkQuery overrides in
+// disarmGuardedOverride, so the four row-kind oracles wrap too.
 // TestEffectiveQueryParity asserts that every exported Effective*Query and
 // Effective*QueryForBeads accessor produces byte-identical output versus its
 // frozen oracle for a matrix of agent shapes and both flag values. When the
@@ -28,7 +33,7 @@ var updateGolden = flag.Bool("update", false, "update workquery golden files")
 
 func oldEffectiveWorkQuery(a *Agent, includeEphemeralReady bool) string {
 	if a.WorkQuery != "" {
-		return a.WorkQuery
+		return disarmGuardedOverride(a.WorkQuery)
 	}
 	target := a.poolDemandTarget()
 	legacyTarget := legacyWorkflowControlQualifiedName(target)
@@ -51,7 +56,7 @@ func oldEffectiveWorkQuery(a *Agent, includeEphemeralReady bool) string {
 
 func oldEffectiveAssignedInProgressQuery(a *Agent, includeEphemeralReady bool) string {
 	if a.WorkQuery != "" {
-		return a.WorkQuery
+		return disarmGuardedOverride(a.WorkQuery)
 	}
 	target := a.poolDemandTarget()
 	if legacyWorkflowControlQualifiedName(target) != "" {
@@ -62,7 +67,7 @@ func oldEffectiveAssignedInProgressQuery(a *Agent, includeEphemeralReady bool) s
 
 func oldEffectiveAssignedReadyQuery(a *Agent, includeEphemeralReady bool) string {
 	if a.WorkQuery != "" {
-		return a.WorkQuery
+		return disarmGuardedOverride(a.WorkQuery)
 	}
 	target := a.poolDemandTarget()
 	if legacyWorkflowControlQualifiedName(target) != "" {
@@ -73,7 +78,7 @@ func oldEffectiveAssignedReadyQuery(a *Agent, includeEphemeralReady bool) string
 
 func oldEffectiveRoutedPoolQuery(a *Agent, includeEphemeralReady bool) string {
 	if a.WorkQuery != "" {
-		return a.WorkQuery
+		return disarmGuardedOverride(a.WorkQuery)
 	}
 	target := a.poolDemandTarget()
 	legacyTarget := legacyWorkflowControlQualifiedName(target)
@@ -433,7 +438,8 @@ func TestPoolDemandCountShellExcludesDisarmedFromEverySource(t *testing.T) {
 
 // TestEffectiveAssignedTiersExcludeDisarmedRow is the assigned-tier sibling
 // of TestPoolDemandCountShellExcludesDisarmedFromEverySource. Unlike the pool
-// tiers, these run bd with --limit=20 so a disarmed head can be filtered while
+// tiers, these fetch unlimited and cap after the filter (gc-cg89), so a
+// disarmed head can be filtered while
 // an armed assigned peer in the same batch still falls through to the hook.
 func TestEffectiveAssignedTiersExcludeDisarmedRow(t *testing.T) {
 	a := Agent{Name: "worker", Dir: "hello-world"}
@@ -446,8 +452,8 @@ func TestEffectiveAssignedTiersExcludeDisarmedRow(t *testing.T) {
 		query   func(*Agent) string
 		bdMatch string
 	}{
-		{"AssignedReady", (*Agent).EffectiveAssignedReadyQuery, `"ready --assignee=worker-session --json --limit=20"`},
-		{"AssignedInProgress", (*Agent).EffectiveAssignedInProgressQuery, `"list --status in_progress --assignee=worker-session --json --limit=20"`},
+		{"AssignedReady", (*Agent).EffectiveAssignedReadyQuery, `"ready --assignee=worker-session --json --limit=0"`},
+		{"AssignedInProgress", (*Agent).EffectiveAssignedInProgressQuery, `"list --status in_progress --assignee=worker-session --json --limit=0"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -546,7 +552,7 @@ esac
 
 // TestEffectiveAssignedTiersExcludeDisarmedRow_EphemeralFallback is the
 // ephemeral-fallback sibling of TestEffectiveAssignedTiersExcludeDisarmedRow.
-// That test only exercised the primary bd list/ready --limit=20 row; the
+// That test only exercised the primary widened bd list/ready row; the
 // ephemeral probe each assigned tier falls through to when that row is empty
 // (bd query ephemeral=true AND status=...) was left unfiltered — reachable
 // through the same EffectiveAssignedInProgressQuery/EffectiveAssignedReadyQuery
@@ -561,8 +567,8 @@ func TestEffectiveAssignedTiersExcludeDisarmedRow_EphemeralFallback(t *testing.T
 		primaryBd string
 		ephStatus string
 	}{
-		{"AssignedInProgress", (*Agent).EffectiveAssignedInProgressQuery, "list --status in_progress --assignee=worker-session --json --limit=20", "in_progress"},
-		{"AssignedReady", (*Agent).EffectiveAssignedReadyQuery, "ready --assignee=worker-session --json --limit=20", "open"},
+		{"AssignedInProgress", (*Agent).EffectiveAssignedInProgressQuery, "list --status in_progress --assignee=worker-session --json --limit=0", "in_progress"},
+		{"AssignedReady", (*Agent).EffectiveAssignedReadyQuery, "ready --assignee=worker-session --json --limit=0", "open"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -622,4 +628,195 @@ func TestWorkQueryGolden(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestWorkerTiersSurfaceArmedRowBehindDisarmedRun pins the gc-cg89 fix for
+// filter-after-limit starvation. Disarmed beads are durable — never claimed,
+// never closed — so they accumulate at the head of every oldest-first tier.
+// When a row-returning worker tier let bd apply its row limit before the
+// disarm filter ran, a run of >= limit disarmed rows hid every armed row
+// behind it: the worker read [] and idle-exited while the reconciler's
+// count-form (unlimited fetch, filter on the union) still counted the armed
+// row, wedging the pool in a spawn/idle-exit loop. Each subtest builds
+// tierWidenRowCap disarmed rows ahead of one armed row and asserts the armed
+// row survives the generated query.
+//
+// The stub bd is strict about limit semantics: it returns the full row set
+// only for an explicit unlimited fetch (--limit 0 / --limit=0) and the first
+// tierWidenRowCap rows otherwise. A regression back to a bd-side capped (or
+// default-capped) fetch therefore hides the armed row again and fails here.
+func TestWorkerTiersSurfaceArmedRowBehindDisarmedRun(t *testing.T) {
+	for _, bin := range []string{"jq", "sh"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not installed", bin)
+		}
+	}
+
+	marshalRows := func(t *testing.T, armedID string) (all, head string) {
+		t.Helper()
+		rows := make([]map[string]any, 0, tierWidenRowCap+1)
+		for i := 0; i < tierWidenRowCap; i++ {
+			rows = append(rows, map[string]any{
+				"id":       fmt.Sprintf("disarmed-%02d", i),
+				"metadata": map[string]any{beadmeta.DisarmedMetadataKey: true},
+			})
+		}
+		rows = append(rows, map[string]any{"id": armedID})
+		allRaw, err := json.Marshal(rows)
+		if err != nil {
+			t.Fatalf("marshal rows: %v", err)
+		}
+		headRaw, err := json.Marshal(rows[:tierWidenRowCap])
+		if err != nil {
+			t.Fatalf("marshal head rows: %v", err)
+		}
+		return string(allRaw), string(headRaw)
+	}
+
+	// limitDispatch renders the stub's inner case that picks the full or the
+	// truncated fixture by the limit flag on the wire.
+	limitDispatch := func(all, head string) string {
+		return "case \"$*\" in\n" +
+			"      *'--limit 0'*|*'--limit=0'*) printf '%s' " + shellquote.Quote(all) + " ;;\n" +
+			"      *) printf '%s' " + shellquote.Quote(head) + " ;;\n" +
+			"    esac"
+	}
+
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	const target = "hello-world/worker"
+
+	t.Run("routed pool tier", func(t *testing.T) {
+		all, head := marshalRows(t, "armed-tail")
+		stub := "#!/bin/sh\ncase \"$*\" in\n" +
+			"  ready*'--metadata-field gc.routed_to=" + target + "'*)\n    " + limitDispatch(all, head) + " ;;\n" +
+			"  *) printf '[]' ;;\nesac\n"
+
+		out := runShellWithFakeBd(t, a.EffectiveRoutedPoolQuery(), nil, stub)
+		if got := strings.TrimSpace(out); got != `[{"id":"armed-tail"}]` {
+			t.Errorf("worker routed tier = %q, want the armed row behind %d disarmed rows", got, tierWidenRowCap)
+		}
+
+		// The reconciler's count-form sees the same armed row: if the worker
+		// tier hides it while this counts 1, the pool spawns workers that
+		// idle-exit forever (the demand-shape invariant this file pins).
+		count := runShellWithFakeBd(t, poolDemandCountShell(target, false), nil, stub)
+		if got := strings.TrimSpace(count); got != "1" {
+			t.Errorf("count-form = %q, want 1 (stub or predicate drift breaks the starvation pin)", got)
+		}
+	})
+
+	t.Run("migration tier", func(t *testing.T) {
+		all, head := marshalRows(t, "armed-root")
+		stub := "#!/bin/sh\ncase \"$*\" in\n" +
+			"  *'--metadata-field gc.routed_to=" + target + "'*) printf '[]' ;;\n" +
+			"  *'--metadata-field gc.run_target=" + target + "'*)\n    " + limitDispatch(all, head) + " ;;\n" +
+			"  *) printf '[]' ;;\nesac\n"
+
+		out := runShellWithFakeBd(t, a.EffectiveRoutedPoolQuery(), nil, stub)
+		// The migration filter's jq stage is not -c, so parse instead of
+		// matching bytes.
+		var got []map[string]any
+		if err := json.Unmarshal([]byte(out), &got); err != nil {
+			t.Fatalf("unmarshal migration tier output %q: %v", out, err)
+		}
+		if len(got) != 1 || got[0]["id"] != "armed-root" {
+			t.Errorf("worker migration tier = %q, want only the armed root behind %d disarmed roots", strings.TrimSpace(out), tierWidenRowCap)
+		}
+	})
+
+	env := map[string]string{"GC_SESSION_NAME": "worker-session"}
+
+	t.Run("assigned ready tier", func(t *testing.T) {
+		all, head := marshalRows(t, "armed-tail")
+		stub := "#!/bin/sh\ncase \"$*\" in\n" +
+			"  ready*'--assignee=worker-session'*)\n    " + limitDispatch(all, head) + " ;;\n" +
+			"  *) printf '[]' ;;\nesac\n"
+
+		out := runShellWithFakeBd(t, a.EffectiveAssignedReadyQuery(), env, stub)
+		if got := strings.TrimSpace(out); got != `[{"id":"armed-tail"}]` {
+			t.Errorf("assigned ready tier = %q, want the armed row behind %d disarmed rows", got, tierWidenRowCap)
+		}
+	})
+
+	t.Run("assigned in-progress tier", func(t *testing.T) {
+		all, head := marshalRows(t, "armed-tail")
+		stub := "#!/bin/sh\ncase \"$*\" in\n" +
+			"  list*'--status in_progress'*'--assignee=worker-session'*)\n    " + limitDispatch(all, head) + " ;;\n" +
+			"  *) printf '[]' ;;\nesac\n"
+
+		out := runShellWithFakeBd(t, a.EffectiveAssignedInProgressQuery(), env, stub)
+		if got := strings.TrimSpace(out); got != `[{"id":"armed-tail"}]` {
+			t.Errorf("assigned in-progress tier = %q, want the armed row behind %d disarmed rows", got, tierWidenRowCap)
+		}
+	})
+}
+
+// TestRowQueryOverridesFilterDisarmedRows pins the gc-cg89 override guard.
+// gc hook strips disarmed rows from a configured work_query's output in Go
+// (filterUnreadyHookCandidates), and prompt templates run the same command
+// directly, so the shell form has to filter too or the two consumers of one
+// override disagree about whether a disarmed bead is work. The override still
+// owns the discovery contract (which beads constitute work); gc.disarmed is an
+// operator-set do-not-execute flag that must hold over any shape.
+func TestRowQueryOverridesFilterDisarmedRows(t *testing.T) {
+	for _, bin := range []string{"jq", "sh"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not installed", bin)
+		}
+	}
+
+	const override = `printf '%s' '[{"id":"disarmed","metadata":{"gc.disarmed":true}},{"id":"armed"}]'`
+	a := &Agent{Name: "worker", WorkQuery: override}
+	for _, v := range []struct {
+		name  string
+		query func(*Agent) string
+	}{
+		{"Work", (*Agent).EffectiveWorkQuery},
+		{"AssignedInProgress", (*Agent).EffectiveAssignedInProgressQuery},
+		{"AssignedReady", (*Agent).EffectiveAssignedReadyQuery},
+		{"RoutedPool", (*Agent).EffectiveRoutedPoolQuery},
+	} {
+		t.Run(v.name, func(t *testing.T) {
+			out := runShellWithFakeBd(t, v.query(a), nil, "#!/bin/sh\nprintf '[]'\n")
+			if got := strings.TrimSpace(out); got != `[{"id":"armed"}]` {
+				t.Fatalf("%s override output = %q, want the disarmed row filtered out", v.name, got)
+			}
+		})
+	}
+}
+
+// TestRowQueryOverrideGuardShape pins the guard's contract with the override
+// it wraps: non-array output passes through untouched (the filter cannot know
+// a custom shape), and the override's own failure exit code propagates rather
+// than being masked by the jq stage.
+func TestRowQueryOverrideGuardShape(t *testing.T) {
+	for _, bin := range []string{"jq", "sh"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not installed", bin)
+		}
+	}
+
+	t.Run("non-array passthrough", func(t *testing.T) {
+		a := &Agent{Name: "worker", WorkQuery: `printf '%s' '{"id":"single"}'`}
+		out := runShellWithFakeBd(t, a.EffectiveWorkQuery(), nil, "#!/bin/sh\nprintf '[]'\n")
+		if got := strings.TrimSpace(out); got != `{"id":"single"}` {
+			t.Fatalf("non-array override output = %q, want it passed through untouched", got)
+		}
+	})
+
+	t.Run("failure propagates", func(t *testing.T) {
+		a := &Agent{Name: "worker", WorkQuery: "exit 3"}
+		err := exec.Command("sh", "-c", a.EffectiveWorkQuery()).Run()
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
+			t.Fatalf("override failure exit = %v, want exit code 3 to propagate", err)
+		}
+	})
+
+	t.Run("count-form override stays verbatim", func(t *testing.T) {
+		a := &Agent{Name: "worker", ScaleCheck: "custom-scale"}
+		if got := a.EffectivePoolDemandQuery(); got != "custom-scale" {
+			t.Fatalf("EffectivePoolDemandQuery() = %q, want the count-form override verbatim (a count has no rows to filter)", got)
+		}
+	})
 }

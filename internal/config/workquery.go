@@ -84,8 +84,11 @@ func notDisarmedSelectPredicateJQ() string {
 // visible once a root carries gc.routed_to. This retirement-window fallback
 // requires jq in the default worker/reconciler environment; remove it with the
 // Go-side legacy candidates after the backfill completion tracked by ga-dhf44.
-func bdReadyPoolDemandMigrationShell(limitFlag string, includeEphemeralReady bool) string {
-	return `bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --metadata-field "` + beadmeta.RunTargetMetadataKey + `=$target" --metadata-field "` + beadmeta.KindMetadataKey + `=` + beadmeta.KindWorkflow + `" --unassigned --exclude-type=epic --json --sort oldest ` + limitFlag
+// The fetch is always unlimited: callers filter (and, for the row-returning
+// probe, slice) in jq afterward, and a bd-side limit ahead of the filter is
+// the gc-cg89 starvation shape.
+func bdReadyPoolDemandMigrationShell(includeEphemeralReady bool) string {
+	return `bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --metadata-field "` + beadmeta.RunTargetMetadataKey + `=$target" --metadata-field "` + beadmeta.KindMetadataKey + `=` + beadmeta.KindWorkflow + `" --unassigned --exclude-type=epic --json --sort oldest --limit 0`
 }
 
 func poolDemandMigrationFilterJQ(limit int) string {
@@ -155,13 +158,19 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
 // reads the first ready, unassigned, routed bead for the supplied target,
 // prints it, and exits 0. The caller appends a terminal fallthrough
 // (printf "[]") for the empty case.
+//
+// Every row-returning probe here fetches unlimited and filters before any
+// row cap (gc-cg89; see routedReadyTierCommand): the migration probe fetches
+// --limit 0 and poolDemandMigrationFilterJQ slices after its filter, and the
+// legacy ephemeral probe's bd query was already unlimited with the slice
+// inside its jq filter.
 func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
 	return `probe_pool_demand() { ` +
 		`target="$1"; ` +
 		`[ -z "$target" ] && return 1; ` +
 		`r=$(` + routedReadyTierCommand(includeEphemeralReady) + `); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
-		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit=20", includeEphemeralReady) + ` 2>/dev/null); ` +
+		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell(includeEphemeralReady) + ` 2>/dev/null); ` +
 		`r=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(1) + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`legacy_ephemeral_candidates=$(` + legacyEphemeralPoolDemandShell(20, includeEphemeralReady, true) + `); ` +
@@ -171,10 +180,22 @@ func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
 		`}; `
 }
 
+// tierWidenRowCap caps how many rows a widened row-returning worker tier
+// hands the hook layer after disarm filtering. It preserves the tier width
+// the former bd-side --limit=20 provided, without letting bd apply the cap
+// before the filter runs.
+const tierWidenRowCap = 20
+
+// tierWidenSliceJQ renders the jq slice that cuts a filtered tier result to
+// tierWidenRowCap rows, for appending after notDisarmedFilterJQ.
+func tierWidenSliceJQ() string {
+	return ` | .[:` + strconv.Itoa(tierWidenRowCap) + `]`
+}
+
 func routedReadyTierCommand(includeEphemeralReady bool) string {
 	// The shared predicate stays order-free so the count-form does no wasted
 	// sorting; the worker first-row path asks bd for the oldest candidates.
-	// The tier is widened past a single row (limit=20, not limit=1) so a
+	// The tier is widened past a single row (tierWidenRowCap, not 1) so a
 	// self-blocked head (is_blocked / status==blocked) has Ready routed work
 	// behind it to fall through to instead of idle-exiting; the hook layer
 	// (filterUnreadyHookCandidates) strips the blocked head from the result.
@@ -184,8 +205,16 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
 	// templates can (and do) run directly, bypassing gc hook's own Go-side
 	// filterUnreadyHookCandidates. Without an in-shell filter, a template
 	// that runs the query itself would receive a disarmed bead raw (gc-u6an).
-	return bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) +
-		` 2>/dev/null | jq -c '` + notDisarmedFilterJQ() + `' 2>/dev/null`
+	//
+	// The fetch is unlimited and the tier cap is applied in jq after the
+	// disarm filter (gc-cg89): a bd-side limit runs before the filter can,
+	// so once >= cap disarmed rows sat at the head of the oldest-first order
+	// — and disarmed beads are durable, they only accumulate — every armed
+	// row behind them was invisible here while poolDemandCountShell
+	// (unlimited fetch, filter on the union) still counted it, wedging the
+	// pool in a spawn/idle-exit loop.
+	return bdReadyPoolDemandShell("--sort oldest --limit 0", includeEphemeralReady) +
+		` 2>/dev/null | jq -c '` + notDisarmedFilterJQ() + tierWidenSliceJQ() + `' 2>/dev/null`
 }
 
 // poolDemandCountShell emits the reconciler count-form for target: it counts
@@ -208,7 +237,7 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
 func poolDemandCountShell(target string, includeEphemeralReady bool) string {
 	script := `target="$1"; ` +
 		`ready_json=$(` + bdReadyPoolDemandShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
-		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
+		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell(includeEphemeralReady) + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + `) || exit $?; ` +
 		`legacy_ephemeral_json=$(` + legacyEphemeralPoolDemandShell(0, includeEphemeralReady, false) + `); ` +
 		`printf "%s\n%s\n%s\n" "$ready_json" "$legacy_json" "$legacy_ephemeral_json" | jq -s '(add // []) | ` +
@@ -229,28 +258,34 @@ func standardAssignedWorkQueryScript(includeEphemeralReady bool) string {
 		standardAssignedReadyWorkQueryScript(includeEphemeralReady)
 }
 
-// assignedTierWidenLimit widens assigned work_query tiers past a single row
-// so an unready head bead (including gc.disarmed) has other assigned work
-// behind it to fall through to. This mirrors routedReadyTierCommand's limit.
-// The hook layer iterates the returned candidate array generically.
-const assignedTierWidenLimit = "--limit=20"
+// assignedTierFetchLimit fetches assigned work_query tiers unlimited so the
+// disarm filter in assignedRowDisarmFilterScript sees every assigned row
+// before the tier is cut to tierWidenRowCap. A bd-side limit here dropped
+// armed rows behind >= cap disarmed ones before the filter could run
+// (gc-cg89), the same starvation routedReadyTierCommand guards against. The
+// tier stays widened past a single row so an unready head bead (including
+// gc.disarmed) has other assigned work behind it to fall through to; the
+// hook layer iterates the returned candidate array generically.
+const assignedTierFetchLimit = "--limit=0"
 
 // assignedRowDisarmFilterScript renders the shell fragment that reruns the
-// captured bd result ($r) through notDisarmedFilterJQ. Assigned tiers are
-// deliberately widened, so filtering removes disarmed rows while preserving
-// eligible peers later in the same result instead of hiding the whole tier.
+// captured bd result ($r) through notDisarmedFilterJQ and cuts the survivors
+// to tierWidenRowCap. Assigned tiers fetch unlimited, so filtering first
+// removes disarmed rows while preserving eligible peers anywhere in the
+// assignee's queue; the cap after the filter keeps the tier's output width
+// bounded (capping before it reintroduces the gc-cg89 starvation).
 //
 // The jq rerun only fires when $r actually holds a row: an empty or "[]" $r
 // (bd found nothing) already reads back as itself, so forking jq to filter it
 // would be a no-op subprocess on every skipped identity/tier candidate.
 func assignedRowDisarmFilterScript() string {
-	return `[ -n "$r" ] && [ "$r" != "[]" ] && r=$(printf "%s" "$r" | jq -c '` + notDisarmedFilterJQ() + `' 2>/dev/null); `
+	return `[ -n "$r" ] && [ "$r" != "[]" ] && r=$(printf "%s" "$r" | jq -c '` + notDisarmedFilterJQ() + tierWidenSliceJQ() + `' 2>/dev/null); `
 }
 
 func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$id" --json ` + assignedTierWidenLimit + ` 2>/dev/null); ` +
+		`r=$(bd list --status in_progress --assignee="$id" --json ` + assignedTierFetchLimit + ` 2>/dev/null); ` +
 		assignedRowDisarmFilterScript() +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("id", includeEphemeralReady) +
@@ -260,7 +295,7 @@ func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) strin
 func standardAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json ` + assignedTierWidenLimit + ` 2>/dev/null); ` +
+		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json ` + assignedTierFetchLimit + ` 2>/dev/null); ` +
 		assignedRowDisarmFilterScript() +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedReadyProbeScript("id", includeEphemeralReady) +
@@ -278,7 +313,7 @@ func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool) 
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$cand" --json ` + assignedTierWidenLimit + ` 2>/dev/null); ` +
+		`r=$(bd list --status in_progress --assignee="$cand" --json ` + assignedTierFetchLimit + ` 2>/dev/null); ` +
 		assignedRowDisarmFilterScript() +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("cand", includeEphemeralReady) +
@@ -292,7 +327,7 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json ` + assignedTierWidenLimit + ` 2>/dev/null); ` +
+		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json ` + assignedTierFetchLimit + ` 2>/dev/null); ` +
 		assignedRowDisarmFilterScript() +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedReadyProbeScript("cand", includeEphemeralReady) +
@@ -363,6 +398,10 @@ type querySpec struct {
 	// override returns the user-supplied command that replaces the
 	// default entirely, or "" when the default applies.
 	override func(*Agent) string
+	// guardOverride wraps a non-empty override in disarmGuardedOverride.
+	// Row-returning kinds set it; the count-form (queryPoolDemand) and the
+	// lifecycle hooks emit no bead rows to filter, so they stay verbatim.
+	guardOverride bool
 	// build returns the default command. includeEphemeralReady carries
 	// beads.UsesBD105ReadySemantics(); the onDeath/onBoot builders ignore
 	// it today and MUST keep ignoring it (S04b invariant I6).
@@ -372,21 +411,45 @@ type querySpec struct {
 // queryTable maps every query kind to its override field and default
 // builder. It is populated once at init and only read afterward.
 var queryTable = map[queryKind]querySpec{
-	queryWork:               {override: func(a *Agent) string { return a.WorkQuery }, build: buildWorkQuery},
-	queryAssignedInProgress: {override: func(a *Agent) string { return a.WorkQuery }, build: buildAssignedInProgressQuery},
-	queryAssignedReady:      {override: func(a *Agent) string { return a.WorkQuery }, build: buildAssignedReadyQuery},
-	queryRoutedPool:         {override: func(a *Agent) string { return a.WorkQuery }, build: buildRoutedPoolQuery},
+	queryWork:               {override: func(a *Agent) string { return a.WorkQuery }, guardOverride: true, build: buildWorkQuery},
+	queryAssignedInProgress: {override: func(a *Agent) string { return a.WorkQuery }, guardOverride: true, build: buildAssignedInProgressQuery},
+	queryAssignedReady:      {override: func(a *Agent) string { return a.WorkQuery }, guardOverride: true, build: buildAssignedReadyQuery},
+	queryRoutedPool:         {override: func(a *Agent) string { return a.WorkQuery }, guardOverride: true, build: buildRoutedPoolQuery},
 	queryPoolDemand:         {override: func(a *Agent) string { return a.ScaleCheck }, build: buildPoolDemandQuery},
 	queryOnDeath:            {override: func(a *Agent) string { return a.OnDeath }, build: buildOnDeath},
 	queryOnBoot:             {override: func(a *Agent) string { return a.OnBoot }, build: buildOnBoot},
 }
 
+// disarmGuardedOverride wraps a configured row-returning query override so
+// its output passes through the same durable gc.disarmed exclusion as the
+// built-in tiers. gc hook already strips disarmed rows from override output
+// in Go (filterUnreadyHookCandidates), and prompt templates run the same
+// command directly, so an unguarded shell form made one override yield
+// disarmed rows on one path and not the other (gc-cg89). The override still
+// owns the discovery contract — which beads constitute work (epics, labels,
+// stores) — while gc.disarmed is an operator-set do-not-execute flag that
+// must hold over any shape.
+//
+// Non-array output passes through untouched (the guard cannot know a custom
+// shape), and an override failure propagates its own exit code instead of
+// being masked by the jq stage. jq errors deliberately stay on stderr: this
+// is a trust boundary, and a malformed row set should surface, not read as
+// "no work".
+func disarmGuardedOverride(override string) string {
+	filter := `if type == "array" then [.[] | select(` + notDisarmedSelectPredicateJQ() + `)] else . end`
+	script := `out=$(` + override + `) || exit $?; printf "%s" "$out" | jq -c ` + shellquote.Quote(filter)
+	return shellquote.Join([]string{"sh", "-c", script})
+}
+
 // effectiveQuery is the single resolver behind every Effective*Query
-// accessor: the kind's user override verbatim if set, else the kind's
-// default builder.
+// accessor: the kind's user override if set (row-returning kinds wrap it in
+// the disarm guard), else the kind's default builder.
 func (a *Agent) effectiveQuery(kind queryKind, includeEphemeralReady bool) string {
 	spec := queryTable[kind]
 	if o := spec.override(a); o != "" {
+		if spec.guardOverride {
+			return disarmGuardedOverride(o)
+		}
 		return o
 	}
 	return spec.build(a, includeEphemeralReady)
@@ -399,8 +462,9 @@ func (a *Agent) effectiveQueryForBeads(kind queryKind, beads BeadsConfig) string
 }
 
 // EffectiveWorkQuery returns the work query command for this agent.
-// If WorkQuery is set, returns it as-is. Otherwise returns the default
-// three-tier query with multi-identifier assignee resolution.
+// If WorkQuery is set, returns it wrapped in the durable-disarm guard
+// (disarmGuardedOverride). Otherwise returns the default three-tier query
+// with multi-identifier assignee resolution.
 //
 // Assignee resolution order: $GC_SESSION_ID (bead ID) > $GC_SESSION_NAME
 // (tmux session name) > $GC_ALIAS (named identity / qualified name).
@@ -467,7 +531,8 @@ func buildWorkQuery(a *Agent, includeEphemeralReady bool) string {
 // EffectiveAssignedInProgressQuery returns the assigned-in-progress-only command
 // for prompt templates that spell out crash recovery as a separate startup tier.
 // A custom WorkQuery is treated as the caller-owned full discovery contract, so
-// split-tier prompts may run that same custom command in each query slot.
+// split-tier prompts may run that same custom command (disarm-guarded) in each
+// query slot.
 func (a *Agent) EffectiveAssignedInProgressQuery() string {
 	return a.effectiveQuery(queryAssignedInProgress, false)
 }
@@ -489,7 +554,8 @@ func buildAssignedInProgressQuery(a *Agent, includeEphemeralReady bool) string {
 // EffectiveAssignedReadyQuery returns the assigned-ready-only command for
 // prompt templates that spell out claim-first startup in separate tiers. A
 // custom WorkQuery is treated as the caller-owned full discovery contract, so
-// split-tier prompts may run that same custom command in each query slot.
+// split-tier prompts may run that same custom command (disarm-guarded) in each
+// query slot.
 func (a *Agent) EffectiveAssignedReadyQuery() string {
 	return a.effectiveQuery(queryAssignedReady, false)
 }
@@ -571,7 +637,12 @@ func (a *Agent) DefaultSlingQuery() string {
 // simultaneously.
 //
 // If ScaleCheck is set (user override), it takes precedence and is
-// returned as-is. Otherwise the default count-form is returned.
+// returned as-is: a count-form emits a number, not bead rows, so the
+// disarm guard applied to row-returning overrides cannot run here. A
+// configured ScaleCheck that counts disarmed beads therefore overcounts
+// demand the claim path refuses; keeping its count aligned with the
+// (guarded) work query is the override author's contract.
+// Otherwise the default count-form is returned.
 //
 // Assigned in-progress work is resumed from session beads, so it must
 // not create additional generic pool demand here.
