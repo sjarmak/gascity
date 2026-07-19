@@ -402,6 +402,31 @@ func TestRelease_UnknownWorkloadIsNoOp(t *testing.T) {
 	}
 }
 
+func TestRelease_MissingConsumedReservationPreservesBoundFence(t *testing.T) {
+	s, ledger, city := newTestScheduler(t)
+	b, err := s.Bind(context.Background(), BindRequest{
+		Candidates: []ReadyWorkload{workload("gc-1", 1, 0)},
+		Caps:       unlimited(),
+	})
+	if err != nil || b == nil {
+		t.Fatalf("Bind = %+v, err=%v", b, err)
+	}
+	if err := ledger.Release(b.ReservationRef); err != nil {
+		t.Fatalf("delete consumed reservation: %v", err)
+	}
+
+	if err := s.Release(b.WorkloadID, b.Generation); err == nil {
+		t.Fatal("Release error = nil, want missing reservation error")
+	}
+	state, err := LoadState(city)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(state.Bound) != 1 || !bindingsEqual(state.Bound[0], *b) || len(state.Releasing) != 0 {
+		t.Fatalf("state = %+v, want original Bound fence and no release intent", state)
+	}
+}
+
 func TestRelease_CrashTransitionsRecoverWithoutStrandedFenceOrReservation(t *testing.T) {
 	crashed := errors.New("simulated process death")
 	for _, point := range []crashPoint{
@@ -569,15 +594,12 @@ func TestRelease_RejectsActiveReservationOwnershipMismatch(t *testing.T) {
 	if err := s.Release(b.WorkloadID, b.Generation); err == nil {
 		t.Fatal("Release error = nil, want ownership mismatch")
 	}
-	if err := NewScheduler(city, ledger).Recover(); err == nil {
-		t.Fatal("Recover error = nil, want release-intent ownership mismatch")
-	}
 	state, stateErr := LoadState(city)
 	snap, snapErr := ledger.Snapshot()
 	if stateErr != nil || snapErr != nil {
 		t.Fatalf("reload: state err=%v ledger err=%v", stateErr, snapErr)
 	}
-	if len(state.Bound) != 0 || len(state.Releasing) != 1 || len(snap.Consumed) != 1 {
+	if len(state.Bound) != 1 || len(state.Releasing) != 0 || len(snap.Consumed) != 1 {
 		t.Fatalf("mismatched release mutated state: binding=%+v ledger=%+v", state, snap)
 	}
 }

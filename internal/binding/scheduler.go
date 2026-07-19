@@ -181,6 +181,14 @@ func (s *Scheduler) Release(workloadID string, generation int) error {
 			}
 			return nil
 		}
+		// A new release intent may only replace a fence that still has its
+		// exact consumed capacity reservation. This check runs while holding
+		// the binding lock and takes capacity's lock inside it, preserving the
+		// established binding -> capacity lock order. Missing capacity is only
+		// evidence of a completed deletion when Releasing was already durable.
+		if err := s.requireConsumedReservation(b); err != nil {
+			return err
+		}
 		st.Bound = removeGeneration(st.Bound, workloadID, generation)
 		st.Releasing = append(st.Releasing, b)
 		intent = b
@@ -204,6 +212,25 @@ func (s *Scheduler) Release(workloadID string, generation int) error {
 		return err
 	}
 	return s.hit(crashAfterBindingRelease)
+}
+
+func (s *Scheduler) requireConsumedReservation(b Binding) error {
+	snap, err := s.ledger.Snapshot()
+	if err != nil {
+		return fmt.Errorf("reading reservation %q for workload %q: %w", b.ReservationRef, b.WorkloadID, err)
+	}
+	if r, ok := activeReservationByID(snap, b.ReservationRef); ok {
+		if !reservationOwnsBinding(r, b) {
+			return fmt.Errorf("binding: active reservation %q ownership contradicts workload %q generation %d", b.ReservationRef, b.WorkloadID, b.Generation)
+		}
+		return nil
+	}
+	for _, r := range snap.Held {
+		if r.ID == b.ReservationRef {
+			return fmt.Errorf("binding: active reservation %q for workload %q is held, not consumed", b.ReservationRef, b.WorkloadID)
+		}
+	}
+	return fmt.Errorf("binding: active reservation %q for workload %q is missing", b.ReservationRef, b.WorkloadID)
 }
 
 func (s *Scheduler) finishRelease(b Binding) error {
