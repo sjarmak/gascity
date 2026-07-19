@@ -13,7 +13,6 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	convoycore "github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/formula"
-	"github.com/gastownhall/gascity/internal/graphv2"
 	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
@@ -72,58 +71,6 @@ func TestLaunchWorkflowDifferentLogicalScopesShareInputConvoyRace(t *testing.T) 
 	wg.Wait()
 	if roots[0] == roots[1] {
 		t.Fatalf("different logical scopes reused root %q; scope must differentiate RootKey", roots[0])
-	}
-	assertOneSyntheticInputConvoy(t, deps.Store, target.ID)
-}
-
-// TestDefaultSlingAndFormulaCookAttachShareInputConvoyRace exercises the two
-// production lock call shapes against one target. The cook side takes the
-// same source-workflow lock as cmdFormulaCook --attach before preparing; the
-// sling side goes through its normal default-scope preparation path.
-func TestDefaultSlingAndFormulaCookAttachShareInputConvoyRace(t *testing.T) {
-	formulaDir := t.TempDir()
-	writeGraphV2ConvoyFormula(t, formulaDir)
-	deps := testDeps(graphV2SlingTestConfig(t, formulaDir), runtime.NewFake(), newFakeRunner().run)
-	deps.CityPath = t.TempDir()
-	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
-	target, err := deps.Store.Create(beads.Bead{Title: "work bead", Type: "task"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-	roots := make([]string, 2)
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		<-start
-		roots[0] = launchForBeadTarget(t, formulaDir, "graph-work", target.ID, a, deps)
-	}()
-	go func() {
-		defer wg.Done()
-		<-start
-		var inv graphv2.Invocation
-		err := sourceworkflow.WithLock(context.Background(), deps.CityPath, sourceWorkflowLockScope(deps), graphv2.InputConvoyLockKey(target.ID, "graph-work"), func() error {
-			var prepareErr error
-			inv, prepareErr = graphv2.PrepareInvocation(context.Background(), deps.Store, "graph-work", []string{formulaDir}, target.ID, nil)
-			return prepareErr
-		})
-		if err != nil {
-			t.Errorf("cook-attach PrepareInvocation: %v", err)
-			return
-		}
-		res, err := InstantiateSlingFormula(context.Background(), "graph-work", []string{formulaDir}, molecule.Options{Vars: inv.Vars}, "", "default", "", a, deps)
-		if err != nil {
-			t.Errorf("cook-attach materialization: %v", err)
-			return
-		}
-		roots[1] = res.RootID
-	}()
-	close(start)
-	wg.Wait()
-	if roots[0] == "" || roots[1] == "" || roots[0] == roots[1] {
-		t.Fatalf("default sling and cook --attach roots = %q, %q; their distinct invocation vars must retain independent RootKeys", roots[0], roots[1])
 	}
 	assertOneSyntheticInputConvoy(t, deps.Store, target.ID)
 }

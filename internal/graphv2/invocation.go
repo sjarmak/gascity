@@ -476,7 +476,9 @@ func reusableInputConvoyFor(store beads.Store, invocationKey string) (string, er
 			return "", fmt.Errorf("looking up live roots for terminal input convoy %s: %w", convoy.ID, err)
 		}
 		for _, root := range roots {
-			if !convoycore.IsTerminalStatus(root.Status) {
+			isWorkflowRoot := strings.EqualFold(strings.TrimSpace(root.Metadata[beadmeta.KindMetadataKey]), beadmeta.KindWorkflow) ||
+				strings.EqualFold(strings.TrimSpace(root.Metadata[beadmeta.FormulaContractMetadataKey]), beadmeta.FormulaContractGraphV2)
+			if isWorkflowRoot && !convoycore.IsTerminalStatus(root.Status) {
 				reusable = append(reusable, convoy.ID)
 				break
 			}
