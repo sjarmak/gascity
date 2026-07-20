@@ -310,10 +310,11 @@ func (s *Store) SweepStale(beadID, closeReason string, now time.Time) error {
 // StaleShadowsBefore lists stale nudge shadows created before `before`, oldest
 // first, EXCLUDING any whose durable nudge id is in liveExcludeIDs — the live
 // flock-queue set (nudgequeue.State Pending/InFlight ids) a caller must never
-// sweep. It is the typed read behind the retention sweep and its dry-run twin:
-// callers iterate the returned NudgeShadow values, reading shadow.Open in place
-// of a raw b.Status crack and shadow.BeadID for the close target, instead of
-// holding raw beads and calling the deleted DecodeShadow.
+// sweep — and any still-queued shadow whose own expires_at has not yet elapsed
+// as of `now`. It is the typed read behind the retention sweep and its dry-run
+// twin: callers iterate the returned NudgeShadow values, reading shadow.Open in
+// place of a raw b.Status crack and shadow.BeadID for the close target, instead
+// of holding raw beads and calling the deleted DecodeShadow.
 //
 // The query is byte-identical to the prior StaleCandidatesBefore (the gc:nudge
 // label, CreatedBefore cutoff, oldest-first sort, both storage tiers), so the
@@ -322,7 +323,17 @@ func (s *Store) SweepStale(beadID, closeReason string, now time.Time) error {
 // cross-phase close budget on top, so the live exclusion moving inside here does
 // not alter which beads the budget-limited loop closes. It is nil-receiver safe
 // and callable inside the withNudgeQueueState flock transaction.
-func (s *Store) StaleShadowsBefore(before time.Time, limit int, liveExcludeIDs map[string]bool) ([]NudgeShadow, error) {
+//
+// The unexpired-queued guard (#4299) is the durable backstop to the in-memory
+// liveExcludeIDs set: a non-terminal (queued) shadow whose expires_at is still
+// in the future is not stale, even when it is older than the created-before
+// cutoff and absent from the flock set (e.g. queued for delivery to a busy
+// session whose turn-start delivery has not fired). Sweeping it would destroy an
+// undelivered notification long before its TTL. Terminal (consumed) shadows —
+// and queued shadows already past their own expiry — remain sweep candidates, so
+// consumed-nudge retention is unchanged. expires_at is stamped and compared in
+// UTC, so the guard is immune to the host-timezone skew #4299 suspected.
+func (s *Store) StaleShadowsBefore(before, now time.Time, limit int, liveExcludeIDs map[string]bool) ([]NudgeShadow, error) {
 	if s == nil || s.store.Store == nil {
 		return nil, nil
 	}
@@ -343,6 +354,9 @@ func (s *Store) StaleShadowsBefore(before time.Time, limit int, liveExcludeIDs m
 	for _, b := range candidates {
 		shadow := decodeNudgeItem(b)
 		if id := strings.TrimSpace(shadow.ID); id != "" && liveExcludeIDs[id] {
+			continue
+		}
+		if !isTerminalNudgeState(shadow.State) && !shadow.ExpiresAt.IsZero() && shadow.ExpiresAt.After(now) {
 			continue
 		}
 		shadows = append(shadows, shadow)

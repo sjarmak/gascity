@@ -361,7 +361,7 @@ func TestStaleShadowsBeforeQueryShape(t *testing.T) {
 	st := NewStore(beads.NudgesStore{Store: capture})
 	cutoff := time.Date(2026, 6, 2, 9, 0, 0, 0, time.UTC)
 
-	if _, err := st.StaleShadowsBefore(cutoff, -1, nil); err != nil {
+	if _, err := st.StaleShadowsBefore(cutoff, cutoff, -1, nil); err != nil {
 		t.Fatalf("StaleShadowsBefore err = %v", err)
 	}
 	if len(capture.queries) != 1 {
@@ -395,7 +395,7 @@ func TestStaleShadowsBeforeDecodesAndExcludesLive(t *testing.T) {
 	}
 	st := NewStore(beads.NudgesStore{Store: capture})
 
-	shadows, err := st.StaleShadowsBefore(time.Now(), 10, map[string]bool{"c": true})
+	shadows, err := st.StaleShadowsBefore(time.Now(), time.Now(), 10, map[string]bool{"c": true})
 	if err != nil {
 		t.Fatalf("StaleShadowsBefore err = %v", err)
 	}
@@ -410,12 +410,51 @@ func TestStaleShadowsBeforeDecodesAndExcludesLive(t *testing.T) {
 	}
 }
 
+// TestStaleShadowsBeforeExcludesUnexpiredQueued proves the retention sweep never
+// returns a still-queued nudge shadow whose own expires_at is in the future,
+// even when it is older than the created-before cutoff and absent from the live
+// flock-queue set — the #4299 guard against destroying an undelivered nudge ~23h
+// before its TTL. Terminal (consumed) shadows and shadows already past their own
+// expiry remain sweep candidates, so consumed-nudge retention is unchanged.
+func TestStaleShadowsBeforeExcludesUnexpiredQueued(t *testing.T) {
+	now := time.Date(2026, 6, 2, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour).Format(time.RFC3339)
+	past := now.Add(-time.Hour).Format(time.RFC3339)
+	capture := &listCaptureNudgeStore{
+		Store: beads.NewMemStore(),
+		result: []beads.Bead{
+			{ID: "nb-queued-fresh", Status: "open", Metadata: map[string]string{"nudge_id": "qf", "state": "queued", "expires_at": future}},
+			{ID: "nb-queued-expired", Status: "open", Metadata: map[string]string{"nudge_id": "qe", "state": "queued", "expires_at": past}},
+			{ID: "nb-terminal", Status: "open", Metadata: map[string]string{"nudge_id": "tm", "state": "injected", "expires_at": future}},
+			{ID: "nb-noexpiry", Status: "open", Metadata: map[string]string{"nudge_id": "ne", "state": "queued"}},
+		},
+	}
+	st := NewStore(beads.NudgesStore{Store: capture})
+
+	shadows, err := st.StaleShadowsBefore(now, now, 10, nil)
+	if err != nil {
+		t.Fatalf("StaleShadowsBefore err = %v", err)
+	}
+	got := make(map[string]bool, len(shadows))
+	for _, s := range shadows {
+		got[s.BeadID] = true
+	}
+	if got["nb-queued-fresh"] {
+		t.Error("StaleShadowsBefore returned a still-queued nudge before its expires_at (#4299 regression)")
+	}
+	for _, want := range []string{"nb-queued-expired", "nb-terminal", "nb-noexpiry"} {
+		if !got[want] {
+			t.Errorf("candidate %s missing: expired, terminal, and no-expiry shadows must stay sweepable", want)
+		}
+	}
+}
+
 // TestStaleShadowsBeforePropagatesListError proves a store List failure surfaces
 // to the caller (which wraps it as a fatal listing error).
 func TestStaleShadowsBeforePropagatesListError(t *testing.T) {
 	capture := &listCaptureNudgeStore{Store: beads.NewMemStore(), err: errors.New("list boom")}
 	st := NewStore(beads.NudgesStore{Store: capture})
-	if _, err := st.StaleShadowsBefore(time.Now(), 0, nil); err == nil {
+	if _, err := st.StaleShadowsBefore(time.Now(), time.Now(), 0, nil); err == nil {
 		t.Fatal("StaleShadowsBefore err = nil, want the store List error propagated")
 	}
 }
@@ -425,11 +464,11 @@ func TestStaleShadowsBeforePropagatesListError(t *testing.T) {
 // shadows without touching a store.
 func TestStaleShadowsBeforeNilStoreIsNoOp(t *testing.T) {
 	var s *Store // nil receiver: shadow bead store unavailable
-	if shadows, err := s.StaleShadowsBefore(time.Now(), 0, nil); err != nil || shadows != nil {
+	if shadows, err := s.StaleShadowsBefore(time.Now(), time.Now(), 0, nil); err != nil || shadows != nil {
 		t.Errorf("StaleShadowsBefore on nil store = (%v,%v), want (nil,nil)", shadows, err)
 	}
 	empty := NewStore(beads.NudgesStore{}) // Store over a nil embedded store
-	if shadows, err := empty.StaleShadowsBefore(time.Now(), 0, nil); err != nil || shadows != nil {
+	if shadows, err := empty.StaleShadowsBefore(time.Now(), time.Now(), 0, nil); err != nil || shadows != nil {
 		t.Errorf("StaleShadowsBefore on nil embedded store = (%v,%v), want (nil,nil)", shadows, err)
 	}
 }
