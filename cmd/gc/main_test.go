@@ -3907,6 +3907,47 @@ func TestInitWizardConfigNormalizesBootstrapAliases(t *testing.T) {
 
 // --- cmdInitFromTOMLFile ---
 
+// A --file template carrying a [[rigs]] entry whose name can never spawn
+// rig-scoped agents (gascity#3109) still initializes — init adopts an
+// already-authored config document, so like gc start it advises rather than
+// rejects — but the operator learns at creation time, not at first spawn.
+func TestCmdInitFromTOMLFileWarnsOnInvalidRigName(t *testing.T) {
+	setControllerStateRigTestEnv(t)
+	configureIsolatedRuntimeEnv(t)
+
+	dir := t.TempDir()
+	cityPath := filepath.Join(dir, "bright-lights")
+	if err := os.MkdirAll(cityPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rigDir := filepath.Join(dir, "rig")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	src := filepath.Join(dir, "my-config.toml")
+	tomlContent := []byte(withBuiltinProviderAliasesTOMLForTest(fmt.Sprintf(`[workspace]
+name = "placeholder"
+provider = "claude"
+
+[[rigs]]
+name = "TS Server"
+path = %q
+`, rigDir), "claude"))
+	if err := os.WriteFile(src, tomlContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdInitFromTOMLFile(fsys.OSFS{}, src, cityPath, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdInitFromTOMLFile = %d, want 0 (advisory must not block init); stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "gc init: warning:") || !strings.Contains(stderr.String(), "TS Server") {
+		t.Errorf("stderr = %q, want a rig-name advisory mentioning %q", stderr.String(), "TS Server")
+	}
+}
+
 func TestCmdInitFromTOMLFileSuccess(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_DOLT", "skip")
@@ -4436,6 +4477,46 @@ func TestRunInitFromFileAlreadyInitializedPropagatesExitCode(t *testing.T) {
 }
 
 // --- gc init --from tests ---
+
+// Copied-directory init adopts an existing city's config wholesale; a rig
+// name that can never spawn rig-scoped agents (gascity#3109) surfaces the
+// same non-fatal advisory as the --file path instead of blocking the copy.
+func TestDoInitFromDirWarnsOnInvalidRigName(t *testing.T) {
+	setControllerStateRigTestEnv(t)
+	configureIsolatedRuntimeEnv(t)
+
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "my-template")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rigDir := filepath.Join(dir, "rig")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cityToml := fmt.Sprintf("[workspace]\nname = \"template\"\nprovider = \"claude\"\n\n[providers.claude]\nbase = \"builtin:claude\"\n\n[[rigs]]\nname = \"TS Server\"\npath = %q\n", rigDir)
+	if err := os.WriteFile(filepath.Join(srcDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "pack.toml"),
+		[]byte("[pack]\nname = \"template\"\nschema = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cityPath := filepath.Join(dir, "bright-lights")
+	if err := os.MkdirAll(cityPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doInitFromDir(srcDir, cityPath, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doInitFromDir = %d, want 0 (advisory must not block init); stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "gc init: warning:") || !strings.Contains(stderr.String(), "TS Server") {
+		t.Errorf("stderr = %q, want a rig-name advisory mentioning %q", stderr.String(), "TS Server")
+	}
+}
 
 func TestDoInitFromDirSuccess(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")

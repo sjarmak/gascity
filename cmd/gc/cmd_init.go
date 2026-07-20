@@ -1126,6 +1126,13 @@ func cmdInitFromTOMLFileWithOptionsInternal(fs fsys.FS, tomlSrc, cityPath, nameO
 		fmt.Fprintln(stderr, "gc init: [formulas].dir is no longer supported; use the well-known formulas/ directory") //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	// A template can carry [[rigs]] entries, so init is a rig-registration
+	// surface like gc rig add — but it adopts an already-authored config
+	// document, so an invalid rig name is the same non-fatal advisory as at
+	// gc start / config reload (gascity#3109), not a registration rejection.
+	for _, w := range config.RigNameWarnings(cfg.Rigs) {
+		fmt.Fprintf(stderr, "gc init: warning: %s\n", w) //nolint:errcheck // best-effort stderr
+	}
 
 	// --file creates a new city from a template; default to target dir name.
 	cityName := resolveCityName(nameOverride, "", cityPath)
@@ -1772,6 +1779,12 @@ func doInitFromDirWithOptionsFSInternal(fs fsys.FS, srcDir, cityPath, nameOverri
 	if err != nil {
 		fmt.Fprintf(stderr, "gc init: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+	// Copied-directory init adopts an existing city's config wholesale; an
+	// invalid rig name gets the same non-fatal advisory as the --file
+	// template path and gc start (gascity#3109).
+	for _, w := range config.RigNameWarnings(cfg.Rigs) {
+		fmt.Fprintf(stderr, "gc init: warning: %s\n", w) //nolint:errcheck // best-effort stderr
 	}
 	if persistSiteIdentity {
 		if err := persistInitWorkspaceIdentity(fs, cityPath, copiedToml, cfg, cityName, cityPrefix); err != nil {

@@ -610,6 +610,22 @@ func requireBootstrappedCity(dir string) (string, error) {
 	return cityPath, nil
 }
 
+// printRigConfigAdvisories writes the non-fatal rig-config advisories to w,
+// one "<owner>: warning: <text>" line each: reserved coordination-class
+// prefixes (advisory until per-class stores activate) and invalid rig names
+// (an existing city must keep starting even when a rig name derives a session
+// name tmux rejects so its agents cannot spawn — gascity#3109; gc rig add
+// rejects new ones). Shared by the standalone start and supervisor prep paths
+// so supervisor-managed cities surface the same advisories in their logs.
+func printRigConfigAdvisories(w io.Writer, owner string, cfg *config.City) {
+	for _, warn := range config.ReservedPrefixWarnings(cfg.Rigs, config.EffectiveHQPrefix(cfg)) {
+		fmt.Fprintf(w, "%s: warning: %s\n", owner, warn) //nolint:errcheck // best-effort stderr
+	}
+	for _, warn := range config.RigNameWarnings(cfg.Rigs) {
+		fmt.Fprintf(w, "%s: warning: %s\n", owner, warn) //nolint:errcheck // best-effort stderr
+	}
+}
+
 // doStartStandalone boots an existing city in the legacy per-city mode.
 // If a path is given, operates there; otherwise uses cwd. When controllerMode
 // is true, enters a persistent reconciliation loop instead of one-shot start.
@@ -694,18 +710,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		fmt.Fprintf(stderr, "gc start: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	// Reserved coordination-class prefixes are a non-fatal advisory until
-	// per-class stores activate; warn but do not block startup.
-	for _, w := range config.ReservedPrefixWarnings(cfg.Rigs, config.EffectiveHQPrefix(cfg)) {
-		fmt.Fprintf(stderr, "gc start: warning: %s\n", w) //nolint:errcheck // best-effort stderr
-	}
-	// Invalid rig names are a non-fatal advisory for the same reason: an
-	// existing city must keep starting even when a rig name (e.g. one with a
-	// space) derives a session name tmux rejects so its agents cannot spawn
-	// (gascity#3109). gc rig add rejects new ones.
-	for _, w := range config.RigNameWarnings(cfg.Rigs) {
-		fmt.Fprintf(stderr, "gc start: warning: %s\n", w) //nolint:errcheck // best-effort stderr
-	}
+	printRigConfigAdvisories(stderr, "gc start", cfg)
 	if err := config.ValidateServices(cfg.Services); err != nil {
 		fmt.Fprintf(stderr, "gc start: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1

@@ -2501,6 +2501,11 @@ func prepareCityForSupervisor(cityPath, cityName string, cfg *config.City, stder
 	if err := config.ValidateRigs(cfg.Rigs, config.EffectiveHQPrefix(cfg)); err != nil {
 		return fmt.Errorf("validate rigs: %w", err)
 	}
+	// The default gc start hands the city to the supervisor without loading
+	// config itself, so the non-fatal advisories doStartStandalone prints
+	// (reserved prefixes, invalid rig names — gascity#3109) must surface here
+	// or supervisor-managed cities never see them.
+	printRigConfigAdvisories(stderr, fmt.Sprintf("gc supervisor: city '%s'", cityName), cfg)
 	if err := config.ValidateServices(cfg.Services); err != nil {
 		return fmt.Errorf("validate services: %w", err)
 	}

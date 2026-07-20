@@ -4161,12 +4161,20 @@ func ValidateRigs(rigs []Rig, hqPrefix string) error {
 // them) and CLI arguments (a leading '-' reads as a flag).
 var rigNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
+// rigNameMaxLen caps rig-name length, matching the handler-edge API charset
+// bound (internal/api validateRigName's {1,64}) so the CLI and API paths
+// agree on the registration contract.
+const rigNameMaxLen = 64
+
 // ValidateRigName reports whether name is usable as a rig identifier.
 // It is enforced at registration (gc rig add), not in ValidateRigs: making it
 // fatal at load would break gc start and config reload for an existing city
 // that already carries such a rig (same rationale as reserved class prefixes
 // in ValidateRigs). RigNameWarnings surfaces the load-time advisory instead.
 func ValidateRigName(name string) error {
+	if len(name) > rigNameMaxLen {
+		return fmt.Errorf("rig name %q: must be at most %d characters (got %d)", name, rigNameMaxLen, len(name))
+	}
 	if rigNamePattern.MatchString(name) {
 		return nil
 	}

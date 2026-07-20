@@ -2002,3 +2002,35 @@ func TestDoStart_FlagValidationRunsBeforeDriftCheck(t *testing.T) {
 		t.Errorf("supervisor restart attempted despite flag rejection:\n%s", stdout.String())
 	}
 }
+
+// printRigConfigAdvisories is the shared advisory emitter for the standalone
+// start and supervisor prep paths (gascity#3109): every invalid rig name gets
+// one owner-prefixed warning line, and a clean config emits nothing.
+func TestPrintRigConfigAdvisories(t *testing.T) {
+	cfg := config.DefaultCity("advisory-city")
+	cfg.Rigs = []config.Rig{
+		{Name: "TS Server", Path: "/a"},
+		{Name: "backend", Path: "/b"},
+	}
+
+	var buf bytes.Buffer
+	printRigConfigAdvisories(&buf, "gc supervisor: city 'advisory-city'", &cfg)
+
+	out := buf.String()
+	if !strings.Contains(out, "gc supervisor: city 'advisory-city': warning:") {
+		t.Errorf("output = %q, want owner-prefixed warning line", out)
+	}
+	if !strings.Contains(out, "TS Server") {
+		t.Errorf("output = %q, want mention of the invalid rig name", out)
+	}
+	if strings.Contains(out, "backend") {
+		t.Errorf("output = %q, must not warn about the valid rig name", out)
+	}
+
+	cfg.Rigs = []config.Rig{{Name: "backend", Path: "/b"}}
+	buf.Reset()
+	printRigConfigAdvisories(&buf, "gc start", &cfg)
+	if got := buf.String(); got != "" {
+		t.Errorf("clean config output = %q, want empty", got)
+	}
+}

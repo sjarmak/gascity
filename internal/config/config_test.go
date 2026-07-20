@@ -4863,6 +4863,7 @@ func TestValidateRigName(t *testing.T) {
 		"r2d2",
 		"A",
 		"9lives",
+		strings.Repeat("a", 64),
 	}
 	for _, name := range valid {
 		if err := ValidateRigName(name); err != nil {
@@ -4883,11 +4884,25 @@ func TestValidateRigName(t *testing.T) {
 		"-leading-dash",
 		".leading-dot",
 		"_leading-underscore",
+		strings.Repeat("a", 65),
 	}
 	for _, name := range invalid {
 		if err := ValidateRigName(name); err == nil {
 			t.Errorf("ValidateRigName(%q) = nil, want error", name)
 		}
+	}
+}
+
+// The 64-character cap matches the handler-edge API charset bound
+// (internal/api validateRigName's {1,64}) so a name accepted by gc rig add is
+// never rejected by POST /v0/rigs for length, and the error says the limit.
+func TestValidateRigName_LengthBound(t *testing.T) {
+	err := ValidateRigName(strings.Repeat("a", 65))
+	if err == nil {
+		t.Fatal("ValidateRigName(65 chars) = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "64") {
+		t.Errorf("error = %q, want mention of the 64-character limit", err)
 	}
 }
 
