@@ -27,6 +27,15 @@ func nudgeSeed(id, nudgeID string, createdAt time.Time) beads.Bead {
 	}
 }
 
+// nudgeSeedWithExpiry builds a seed Bead like nudgeSeed but also stamps the
+// nudge's own expires_at, so tests can exercise the retention sweep's
+// per-nudge-expiry guard.
+func nudgeSeedWithExpiry(id, nudgeID string, createdAt, expiresAt time.Time) beads.Bead {
+	b := nudgeSeed(id, nudgeID, createdAt)
+	b.Metadata["expires_at"] = expiresAt.UTC().Format(time.RFC3339)
+	return b
+}
+
 // mailSeed builds a seed Bead for NewMemStoreFrom representing an open read mail bead.
 // id must be unique within the seed slice.
 func mailSeed(id string, createdAt time.Time) beads.Bead {
@@ -63,6 +72,87 @@ func TestSweepStaleNudgeMail_TTLBoundaries(t *testing.T) {
 	}
 	if result.MailClosed != 1 {
 		t.Errorf("MailClosed = %d, want 1", result.MailClosed)
+	}
+}
+
+func TestSweepStaleNudgeMail_UnexpiredNudgeNotSwept(t *testing.T) {
+	// Regression for #4299: an open, still-queued nudge that is older than the
+	// creation-age retention window (nudgeTTL, ~10m) but whose own expires_at is
+	// still in the future must NOT be swept. Its own 24h TTL governs its life;
+	// the short retention window only reaps genuinely-aged shadows.
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	const unexpiredID = "nudge-unexpired"
+	const agedID = "nudge-aged"
+	seed := []beads.Bead{
+		// Created 11 min ago (past the retention window) but expires in 24h.
+		nudgeSeedWithExpiry("bead-unexpired", unexpiredID, now.Add(-nudgeTTL-time.Minute), now.Add(24*time.Hour)),
+		// Created 11 min ago and already past its own expiry — genuinely stale.
+		nudgeSeedWithExpiry("bead-aged", agedID, now.Add(-nudgeTTL-time.Minute), now.Add(-time.Minute)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NudgeClosed != 1 {
+		t.Errorf("NudgeClosed = %d, want 1 (only the expired nudge; the unexpired one must be spared)", result.NudgeClosed)
+	}
+
+	// The unexpired nudge bead must remain open; the aged one must be closed.
+	open, _ := store.ListOpen()
+	openIDs := make(map[string]bool)
+	for _, b := range open {
+		openIDs[b.Metadata["nudge_id"]] = true
+	}
+	if !openIDs[unexpiredID] {
+		t.Errorf("unexpired nudge %s was swept before its expires_at; it must be spared", unexpiredID)
+	}
+	if openIDs[agedID] {
+		t.Errorf("aged nudge %s past its expires_at should be swept", agedID)
+	}
+}
+
+func TestCountStaleNudgeMail_ExcludesUnexpired(t *testing.T) {
+	// The dry-run twin must report the same exclusion as the live sweep: an
+	// unexpired nudge is not a close candidate (#4299).
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	seed := []beads.Bead{
+		nudgeSeedWithExpiry("bead-unexpired", "nudge-unexpired", now.Add(-nudgeTTL-time.Minute), now.Add(24*time.Hour)),
+		nudgeSeedWithExpiry("bead-aged", "nudge-aged", now.Add(-nudgeTTL-time.Minute), now.Add(-time.Minute)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	counts, err := countStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if counts.NudgeClosed != 1 {
+		t.Errorf("count NudgeClosed = %d, want 1 (unexpired nudge excluded)", counts.NudgeClosed)
+	}
+}
+
+func TestSweepStaleNudgeMail_NoExpiryFieldStillSwept(t *testing.T) {
+	// Backward compatibility: a legacy open nudge shadow with no expires_at
+	// metadata keeps the old creation-age behavior and is swept once aged.
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	seed := []beads.Bead{
+		nudgeSeed("bead-legacy", "nudge-legacy", now.Add(-nudgeTTL-time.Minute)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NudgeClosed != 1 {
+		t.Errorf("NudgeClosed = %d, want 1 (legacy nudge without expires_at is swept)", result.NudgeClosed)
 	}
 }
 

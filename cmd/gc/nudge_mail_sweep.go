@@ -74,6 +74,9 @@ func sweepStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		if !shadow.Open {
 			continue
 		}
+		if nudgeShadowUnexpired(shadow, now) {
+			continue
+		}
 		if err := nq.SweepStale(shadow.BeadID, nudgeMailSweepNudgeCloseReason, now); err != nil {
 			beadErrs = append(beadErrs, err)
 			continue
@@ -128,6 +131,9 @@ func countStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		if !shadow.Open {
 			continue
 		}
+		if nudgeShadowUnexpired(shadow, now) {
+			continue
+		}
 		result.NudgeClosed++
 	}
 
@@ -145,6 +151,21 @@ func countStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		result.MailClosed += mailCount
 	}
 	return result, nil
+}
+
+// nudgeShadowUnexpired reports whether an open nudge shadow still carries a
+// future expires_at and must be spared by the retention sweep.
+//
+// A nudge's own TTL (typically 24h) governs its lifetime. The creation-age
+// retention window (nudgeTTL, ~10m) exists only to reap shadows that have
+// outlived their usefulness, not to shorten a still-pending nudge's TTL. Without
+// this guard a queued, undelivered nudge — one whose live flock-queue entry has
+// dropped out of Pending/InFlight (e.g. delivery deferred for a busy session) —
+// is swept ~11 minutes after creation, ~23.8h before its own expiry, silently
+// destroying a human->agent notification (#4299). Legacy shadows with no
+// expires_at (zero value) keep the prior creation-age behavior.
+func nudgeShadowUnexpired(shadow nudgequeue.NudgeShadow, now time.Time) bool {
+	return !shadow.ExpiresAt.IsZero() && now.Before(shadow.ExpiresAt)
 }
 
 // liveNudgeIDSet returns the set of nudge IDs currently in pending or in-flight state.
