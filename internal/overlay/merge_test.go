@@ -785,3 +785,65 @@ func TestMergeSettingsJSON_NoWrap_LeavesBareEntries(t *testing.T) {
 		t.Errorf("bare entry was wrapped without WithWrapBareHooks: %v", arr[0])
 	}
 }
+
+// ubsBareEntry is the exact shape the ubs pack ships: a bare {type,command}
+// PreToolUse entry with no matcher. Under WithWrapBareHooks it is stored wrapped
+// ({matcher:"", hooks:[...]}), so the next reconcile re-merges the still-bare
+// overlay entry against the wrapped stored form — the #3862 feedback loop.
+const ubsBareEntry = `{"type":"command","command":"if echo \"$TOOL_INPUT\" | grep -q 'git commit'; then ubs --staged --format=json 2>/dev/null || true; fi"}`
+
+func TestMergeSettingsJSON_WrapBareHooks_BareReprojectionIsIdempotent(t *testing.T) {
+	// Regression for gastownhall/gascity#3862: a bare pack hook re-projected onto
+	// its own wrapped stored form must not accumulate. Simulate the reconciler
+	// feeding each merge's output back as the next tick's base.
+	overlaySrc := []byte(`{"hooks":{"PreToolUse":[` + ubsBareEntry + `]}}`)
+	base := []byte(`{}`)
+	for tick := 1; tick <= 25; tick++ {
+		merged, err := MergeSettingsJSON(base, overlaySrc, WithWrapBareHooks())
+		if err != nil {
+			t.Fatalf("tick %d: %v", tick, err)
+		}
+		if got := len(preToolUse(t, merged)); got != 1 {
+			t.Fatalf("tick %d: PreToolUse entries = %d, want 1 (unbounded append regression)", tick, got)
+		}
+		base = merged // feed back as next tick's base (reconciler behavior)
+	}
+}
+
+func TestMergeSettingsJSON_WrapBareHooks_DistinctBareCoexistAcrossTicks(t *testing.T) {
+	// Two distinct bare commands from different overlays must both survive the
+	// bare→wrapped round-trip and stay at exactly one copy each across ticks —
+	// idempotency must not come at the cost of the dedup collapsing distinct
+	// commands.
+	overA := []byte(`{"hooks":{"PreToolUse":[{"type":"command","command":"a"}]}}`)
+	overB := []byte(`{"hooks":{"PreToolUse":[{"type":"command","command":"b"}]}}`)
+
+	base, err := MergeSettingsJSON([]byte(`{}`), overA, WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("seed a: %v", err)
+	}
+	base, err = MergeSettingsJSON(base, overB, WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("seed b: %v", err)
+	}
+	// Re-project both several more times; both must persist, neither must grow.
+	for tick := 0; tick < 10; tick++ {
+		if base, err = MergeSettingsJSON(base, overA, WithWrapBareHooks()); err != nil {
+			t.Fatalf("tick %d a: %v", tick, err)
+		}
+		if base, err = MergeSettingsJSON(base, overB, WithWrapBareHooks()); err != nil {
+			t.Fatalf("tick %d b: %v", tick, err)
+		}
+	}
+	arr := preToolUse(t, base)
+	if len(arr) != 2 {
+		t.Fatalf("PreToolUse entries = %d, want 2 (distinct commands must coexist and not grow)", len(arr))
+	}
+	seen := map[string]bool{}
+	for _, e := range arr {
+		seen[innerCommand(t, e)] = true
+	}
+	if !seen["a"] || !seen["b"] {
+		t.Errorf("expected both commands a and b preserved, got %v", seen)
+	}
+}

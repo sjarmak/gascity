@@ -79,17 +79,22 @@ func WithWrapBareHooks() MergeOption {
 // Merge semantics:
 //   - Non-hook top-level keys: last writer (overlay) wins.
 //   - Hook categories (keys under "hooks"): union across layers.
-//   - Entries within a hook category: merged by identity key.
-//     Same identity → overlay replaces base entry. New identity → appended.
-//   - Identity key extraction:
-//     1. "matcher" key → identity is the matcher value
-//     2. "command" key → identity is "cmd:<value>"
-//     3. "bash" key → identity is "bash:<value>"
-//     4. nested "hooks" array (Claude/Gemini wrapper shape with no top-level
+//   - Entries within a hook category: merged by identity key. An entry may
+//     carry more than one key so the same logical hook dedupes across the
+//     bare/wrapped shape boundary (see hookEntryKeys). Overlay entry matching
+//     any of a base entry's keys replaces it in place; otherwise it is appended.
+//   - Identity key extraction (see hookEntryKeys):
+//     1. non-empty "matcher" → identity is the matcher value
+//     2. empty "matcher" ("") → the wrapped form of a bare/managed entry: keys
+//     under "" (the managed-slot identity) AND each inner "cmd:"/"bash:" body,
+//     so a re-projected BARE overlay entry resolves to it instead of appending.
+//     3. "command" key → identity is "cmd:<value>"
+//     4. "bash" key → identity is "bash:<value>"
+//     5. nested "hooks" array (Claude/Gemini wrapper shape with no top-level
 //     matcher/command) → identity is "inner:<canonical inner hooks>", so an
 //     overlay re-projecting an already-present command is a no-op instead of
 //     an unbounded append.
-//     5. else → no identity, always append
+//     6. else → no identity, always append
 //   - With WithWrapBareHooks, a final pass over the merged hooks normalizes any
 //     bare entry (one with neither a "matcher" nor a "hooks" key) into
 //     {"matcher": "", "hooks": [entry]}. This runs after the keyed merge so no
@@ -203,18 +208,28 @@ func mergeHooksMap(base, over map[string]any) map[string]any {
 // mergeHookArray merges two arrays of hook entries by identity key.
 // Entries with the same identity → overlay replaces base in-place.
 // New entries → appended.
+//
+// A hook entry can carry more than one identity key: the wrapped form of a
+// bare command entry ({matcher:"", hooks:[{command:X}]}) is indexed under both
+// its empty-matcher key ("") AND its inner "cmd:X" key, so a re-projected
+// overlay in EITHER shape — the raw bare form the pack ships, or the wrapped
+// managed form already stored — resolves to the same base entry instead of
+// being appended. Without this, WithWrapBareHooks turned a bare overlay entry
+// (identity "cmd:X") into a stored wrapped entry (identity ""), so every
+// reconcile tick re-appended the still-bare overlay entry unboundedly
+// (gastownhall/gascity#3862).
 func mergeHookArray(base, over []any) []any {
 	// Build ordered result starting from base entries.
 	result := make([]any, len(base))
 	copy(result, base)
 
-	// Index base entries by identity for in-place replacement.
+	// Index base entries by every identity key they carry, for in-place
+	// replacement. First writer wins per key so the earliest base entry owns a
+	// shared key (e.g. the empty-matcher managed slot).
 	baseIdx := make(map[string]int) // identity → index in result
 	for i, entry := range result {
 		if m, ok := entry.(map[string]any); ok {
-			if key, hasKey := hookEntryKey(m); hasKey {
-				baseIdx[key] = i
-			}
+			indexHookKeys(baseIdx, hookEntryKeys(m), i)
 		}
 	}
 
@@ -224,47 +239,89 @@ func mergeHookArray(base, over []any) []any {
 			result = append(result, entry)
 			continue
 		}
-		key, hasKey := hookEntryKey(m)
-		if !hasKey {
+		keys := hookEntryKeys(m)
+		if len(keys) == 0 {
 			// No identity → always append.
 			result = append(result, entry)
 			continue
 		}
-		if idx, found := baseIdx[key]; found {
+		if idx, found := firstMatchingIndex(baseIdx, keys); found {
 			// Same identity → replace in-place.
 			result[idx] = entry
 		} else {
-			// New identity → append.
+			// New identity → append and index under all its keys.
 			result = append(result, entry)
-			baseIdx[key] = len(result) - 1
+			indexHookKeys(baseIdx, keys, len(result)-1)
 		}
 	}
 	return result
 }
 
-// hookEntryKey extracts the identity key from a hook entry.
-// Returns the key string and true if an identity was found.
-func hookEntryKey(entry map[string]any) (string, bool) {
+// indexHookKeys records idx for each key not already present (first writer wins).
+func indexHookKeys(baseIdx map[string]int, keys []string, idx int) {
+	for _, key := range keys {
+		if _, seen := baseIdx[key]; !seen {
+			baseIdx[key] = idx
+		}
+	}
+}
+
+// firstMatchingIndex returns the index recorded for the first of keys already
+// present in baseIdx. Keys are tried in the priority order hookEntryKeys emits.
+func firstMatchingIndex(baseIdx map[string]int, keys []string) (int, bool) {
+	for _, key := range keys {
+		if idx, found := baseIdx[key]; found {
+			return idx, true
+		}
+	}
+	return 0, false
+}
+
+// hookEntryKeys returns the identity keys for a hook entry, in priority order.
+// An entry may carry more than one key so the same logical hook dedupes across
+// the bare/wrapped shape boundary (see mergeHookArray).
+//
+// Priority:
+//  1. A non-empty "matcher" is the sole identity.
+//  2. An empty "matcher" ("") is the wrapped form of a bare/managed entry: it
+//     keys under "" (the managed-slot identity used to override city hooks)
+//     AND under each inner "cmd:"/"bash:" body, so a bare overlay
+//     re-projection resolves to it.
+//  3. A top-level "command" → "cmd:<value>".
+//  4. A top-level "bash" → "bash:<value>".
+//  5. A matcherless wrapper ({hooks:[...]}) → "inner:<canonical inner hooks>".
+//  6. Otherwise → no identity (always append).
+func hookEntryKeys(entry map[string]any) []string {
 	if v, ok := entry["matcher"]; ok {
 		s, sok := v.(string)
 		if !sok {
-			return "", false
+			return nil
 		}
-		return s, true
+		keys := []string{s}
+		if s == "" {
+			// Wrapped form of a bare/managed entry. Also index by each inner
+			// command/bash body so a re-projected BARE overlay entry (which
+			// keys on "cmd:"/"bash:") dedupes against it instead of appending
+			// unboundedly (gastownhall/gascity#3862).
+			if inner, iok := entry["hooks"]; iok {
+				keys = append(keys, innerBodyKeys(inner)...)
+			}
+		}
+		return keys
 	}
 	if v, ok := entry["command"]; ok {
 		s, sok := v.(string)
 		if !sok {
-			return "", false
+			return nil
 		}
-		return "cmd:" + s, true
+		return []string{"cmd:" + s}
 	}
 	if v, ok := entry["bash"]; ok {
 		s, sok := v.(string)
 		if !sok {
-			return "", false
+			return nil
 		}
-		return "bash:" + s, true
+		return []string{"bash:" + s}
 	}
 	// Claude/Gemini wrapper shape: { "hooks": [ {type, command}, ... ] } with
 	// no top-level matcher/command. Pack overlays (e.g. model-advisor's
@@ -274,10 +331,37 @@ func hookEntryKey(entry map[string]any) (string, bool) {
 	// the same command(s) is idempotent (dedup by inner command content).
 	if v, ok := entry["hooks"]; ok {
 		if key, kok := innerHooksKey(v); kok {
-			return key, true
+			return []string{key}
 		}
 	}
-	return "", false
+	return nil
+}
+
+// innerBodyKeys derives per-command identity keys ("cmd:"/"bash:") from the
+// inner "hooks" array of a wrapped entry, so a wrapped empty-matcher entry
+// dedupes against the bare form of the same command(s). Inner shapes without a
+// command/bash body contribute no key (the entry still carries its "" matcher
+// key).
+func innerBodyKeys(inner any) []string {
+	arr, ok := inner.([]any)
+	if !ok {
+		return nil
+	}
+	var keys []string
+	for _, e := range arr {
+		m, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		if c, ok := m["command"].(string); ok {
+			keys = append(keys, "cmd:"+c)
+			continue
+		}
+		if b, ok := m["bash"].(string); ok {
+			keys = append(keys, "bash:"+b)
+		}
+	}
+	return keys
 }
 
 // innerHooksKey derives a stable identity from the inner "hooks" array of a
