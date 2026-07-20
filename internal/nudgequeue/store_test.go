@@ -361,7 +361,7 @@ func TestStaleShadowsBeforeQueryShape(t *testing.T) {
 	st := NewStore(beads.NudgesStore{Store: capture})
 	cutoff := time.Date(2026, 6, 2, 9, 0, 0, 0, time.UTC)
 
-	if _, err := st.StaleShadowsBefore(cutoff, -1, nil); err != nil {
+	if _, err := st.StaleShadowsBefore(cutoff, -1, nil, cutoff); err != nil {
 		t.Fatalf("StaleShadowsBefore err = %v", err)
 	}
 	if len(capture.queries) != 1 {
@@ -395,7 +395,7 @@ func TestStaleShadowsBeforeDecodesAndExcludesLive(t *testing.T) {
 	}
 	st := NewStore(beads.NudgesStore{Store: capture})
 
-	shadows, err := st.StaleShadowsBefore(time.Now(), 10, map[string]bool{"c": true})
+	shadows, err := st.StaleShadowsBefore(time.Now(), 10, map[string]bool{"c": true}, time.Now())
 	if err != nil {
 		t.Fatalf("StaleShadowsBefore err = %v", err)
 	}
@@ -410,12 +410,52 @@ func TestStaleShadowsBeforeDecodesAndExcludesLive(t *testing.T) {
 	}
 }
 
+// TestStaleShadowsBeforeProtectsUnexpiredQueued proves the retention read never
+// hands back a still-live (non-terminal) nudge whose own expires_at is still in
+// the future — the reap regression in gastownhall/gascity#4299, where a queued,
+// undelivered nudge absent from the in-memory live set was swept ~23h before its
+// own expiry by the much shorter retention window. Terminal (consumed) beads and
+// non-terminal beads already past their expiry (or carrying no expiry) stay
+// reapable, so retention still drains what it is meant to.
+func TestStaleShadowsBeforeProtectsUnexpiredQueued(t *testing.T) {
+	now := time.Date(2026, 7, 10, 6, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour).Format(time.RFC3339)
+	past := now.Add(-time.Hour).Format(time.RFC3339)
+	capture := &listCaptureNudgeStore{
+		Store: beads.NewMemStore(),
+		result: []beads.Bead{
+			// queued + unexpired → protected (the #4299 loss case).
+			{ID: "nb-q-live", Status: "open", Metadata: map[string]string{"nudge_id": "q-live", "state": "queued", "expires_at": future}},
+			// queued but already past its own expiry → reapable.
+			{ID: "nb-q-exp", Status: "open", Metadata: map[string]string{"nudge_id": "q-exp", "state": "queued", "expires_at": past}},
+			// terminal (consumed) → reapable regardless of expiry.
+			{ID: "nb-injected", Status: "closed", Metadata: map[string]string{"nudge_id": "injected", "state": "injected", "expires_at": future}},
+			// queued with no expiry to honor → reapable by the retention window (prior behavior).
+			{ID: "nb-q-noexp", Status: "open", Metadata: map[string]string{"nudge_id": "q-noexp", "state": "queued"}},
+		},
+	}
+	st := NewStore(beads.NudgesStore{Store: capture})
+
+	shadows, err := st.StaleShadowsBefore(now.Add(-10*time.Minute), 0, nil, now)
+	if err != nil {
+		t.Fatalf("StaleShadowsBefore err = %v", err)
+	}
+	got := make([]string, len(shadows))
+	for i, s := range shadows {
+		got[i] = s.BeadID
+	}
+	want := []string{"nb-q-exp", "nb-injected", "nb-q-noexp"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("returned beads = %v, want %v (nb-q-live must be protected until its expiry)", got, want)
+	}
+}
+
 // TestStaleShadowsBeforePropagatesListError proves a store List failure surfaces
 // to the caller (which wraps it as a fatal listing error).
 func TestStaleShadowsBeforePropagatesListError(t *testing.T) {
 	capture := &listCaptureNudgeStore{Store: beads.NewMemStore(), err: errors.New("list boom")}
 	st := NewStore(beads.NudgesStore{Store: capture})
-	if _, err := st.StaleShadowsBefore(time.Now(), 0, nil); err == nil {
+	if _, err := st.StaleShadowsBefore(time.Now(), 0, nil, time.Now()); err == nil {
 		t.Fatal("StaleShadowsBefore err = nil, want the store List error propagated")
 	}
 }
@@ -425,11 +465,11 @@ func TestStaleShadowsBeforePropagatesListError(t *testing.T) {
 // shadows without touching a store.
 func TestStaleShadowsBeforeNilStoreIsNoOp(t *testing.T) {
 	var s *Store // nil receiver: shadow bead store unavailable
-	if shadows, err := s.StaleShadowsBefore(time.Now(), 0, nil); err != nil || shadows != nil {
+	if shadows, err := s.StaleShadowsBefore(time.Now(), 0, nil, time.Now()); err != nil || shadows != nil {
 		t.Errorf("StaleShadowsBefore on nil store = (%v,%v), want (nil,nil)", shadows, err)
 	}
 	empty := NewStore(beads.NudgesStore{}) // Store over a nil embedded store
-	if shadows, err := empty.StaleShadowsBefore(time.Now(), 0, nil); err != nil || shadows != nil {
+	if shadows, err := empty.StaleShadowsBefore(time.Now(), 0, nil, time.Now()); err != nil || shadows != nil {
 		t.Errorf("StaleShadowsBefore on nil embedded store = (%v,%v), want (nil,nil)", shadows, err)
 	}
 }

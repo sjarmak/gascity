@@ -62,7 +62,8 @@ func sweepStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 	// inside StaleShadowsBefore; the cross-phase close budget stays in this loop.
 	nudgeCutoff := now.Add(-nudgeTTL)
 	// nudge/mail beads are NoHistory (wisp-tier); StaleShadowsBefore reads both tiers.
-	nudgeShadows, err := nq.StaleShadowsBefore(nudgeCutoff, limit, liveIDs)
+	// now protects still-live nudges whose own expires_at has not yet passed.
+	nudgeShadows, err := nq.StaleShadowsBefore(nudgeCutoff, limit, liveIDs, now)
 	if err != nil {
 		return result, fmt.Errorf("nudge-mail-sweep: listing stale nudge beads: %w", err)
 	}
@@ -117,7 +118,7 @@ func countStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 
 	// Dry-run twin of the sweep: same typed read, same cross-phase budget, no writes.
 	nudgeCutoff := now.Add(-nudgeTTL)
-	nudgeShadows, err := nq.StaleShadowsBefore(nudgeCutoff, limit, liveIDs)
+	nudgeShadows, err := nq.StaleShadowsBefore(nudgeCutoff, limit, liveIDs, now)
 	if err != nil {
 		return result, fmt.Errorf("nudge-mail-sweep (dry-run): listing stale nudge beads: %w", err)
 	}
