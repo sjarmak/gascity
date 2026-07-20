@@ -74,6 +74,9 @@ func sweepStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		if !shadow.Open {
 			continue
 		}
+		if nudgeWithinOwnExpiry(shadow, now) {
+			continue
+		}
 		if err := nq.SweepStale(shadow.BeadID, nudgeMailSweepNudgeCloseReason, now); err != nil {
 			beadErrs = append(beadErrs, err)
 			continue
@@ -128,6 +131,9 @@ func countStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		if !shadow.Open {
 			continue
 		}
+		if nudgeWithinOwnExpiry(shadow, now) {
+			continue
+		}
 		result.NudgeClosed++
 	}
 
@@ -145,6 +151,19 @@ func countStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		result.MailClosed += mailCount
 	}
 	return result, nil
+}
+
+// nudgeWithinOwnExpiry reports whether shadow is a still-queued nudge whose own
+// expires_at has not yet passed at now. Such a nudge must never be retention-swept
+// as stale: its lifetime is bounded by its own TTL (expires_at), not by the short
+// consumed-nudge sweep window (nudgeTTL). A queued nudge can reach the stale set
+// when it is absent from the in-memory live queue (e.g. persisted-but-not-loaded
+// after a restart), leaving the created_at staleness test as its only other gate;
+// without this guard a short-window or clock-skewed compare destroys an undelivered
+// nudge long before its expiry (issue #4299). Terminal/consumed nudges, and queued
+// nudges with no or already-passed expiry, are not protected.
+func nudgeWithinOwnExpiry(shadow nudgequeue.NudgeShadow, now time.Time) bool {
+	return shadow.State == "queued" && !shadow.ExpiresAt.IsZero() && now.Before(shadow.ExpiresAt)
 }
 
 // liveNudgeIDSet returns the set of nudge IDs currently in pending or in-flight state.

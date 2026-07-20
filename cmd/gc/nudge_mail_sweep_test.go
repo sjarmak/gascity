@@ -27,6 +27,15 @@ func nudgeSeed(id, nudgeID string, createdAt time.Time) beads.Bead {
 	}
 }
 
+// nudgeSeedWithExpiry builds an open nudge seed bead with an explicit lifecycle
+// state and expires_at, for exercising the within-expiry retention guard.
+func nudgeSeedWithExpiry(id, nudgeID, state string, createdAt, expiresAt time.Time) beads.Bead {
+	b := nudgeSeed(id, nudgeID, createdAt)
+	b.Metadata["state"] = state
+	b.Metadata["expires_at"] = expiresAt.UTC().Format(time.RFC3339)
+	return b
+}
+
 // mailSeed builds a seed Bead for NewMemStoreFrom representing an open read mail bead.
 // id must be unique within the seed slice.
 func mailSeed(id string, createdAt time.Time) beads.Bead {
@@ -133,6 +142,98 @@ func TestSweepStaleNudgeMail_InFlightExclusion(t *testing.T) {
 		}
 	}
 	t.Errorf("in-flight nudge bead was swept; it should be skipped")
+}
+
+func TestSweepStaleNudgeMail_QueuedNudgeWithinExpiryNotSwept(t *testing.T) {
+	// Regression for #4299: a still-queued nudge that is past the short consumed-nudge
+	// sweep TTL but whose own expires_at is still in the future must NOT be swept.
+	// nudgeState is nil, so the nudge is absent from the live queue (the exact
+	// condition — persisted-but-not-loaded — that lets a queued nudge reach the
+	// stale set) and the created_at staleness test is its only other gate.
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	seed := []beads.Bead{
+		// Queued, created 11 min ago (past the 10-min TTL), expires in 23h — must survive.
+		nudgeSeedWithExpiry("nudge-queued", "nudge-queued", "queued", now.Add(-nudgeTTL-time.Minute), now.Add(23*time.Hour)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NudgeClosed != 0 {
+		t.Errorf("NudgeClosed = %d, want 0 (queued nudge within its own expiry must not be swept)", result.NudgeClosed)
+	}
+	open, _ := store.ListOpen()
+	for _, b := range open {
+		if b.Metadata["nudge_id"] == "nudge-queued" {
+			return // still open — correct
+		}
+	}
+	t.Errorf("queued nudge within its own expiry was swept; it should be protected until expires_at")
+}
+
+func TestSweepStaleNudgeMail_QueuedNudgePastExpirySwept(t *testing.T) {
+	// The expiry guard must not over-protect: a queued nudge whose expires_at has
+	// already passed is genuinely stale and must still be swept.
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	seed := []beads.Bead{
+		nudgeSeedWithExpiry("nudge-expired", "nudge-expired", "queued", now.Add(-2*time.Hour), now.Add(-time.Minute)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NudgeClosed != 1 {
+		t.Errorf("NudgeClosed = %d, want 1 (queued nudge past its own expiry is stale)", result.NudgeClosed)
+	}
+}
+
+func TestSweepStaleNudgeMail_ConsumedNudgeWithFutureExpirySwept(t *testing.T) {
+	// The expiry guard is scoped to still-queued nudges. A consumed/terminal nudge
+	// (state != "queued") is retention garbage regardless of a lingering expires_at
+	// and must still be swept once past the sweep TTL.
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	seed := []beads.Bead{
+		nudgeSeedWithExpiry("nudge-injected", "nudge-injected", "injected", now.Add(-nudgeTTL-time.Minute), now.Add(23*time.Hour)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NudgeClosed != 1 {
+		t.Errorf("NudgeClosed = %d, want 1 (consumed nudge is retention garbage even with a future expiry)", result.NudgeClosed)
+	}
+}
+
+func TestCountStaleNudgeMail_QueuedNudgeWithinExpiryNotCounted(t *testing.T) {
+	// The dry-run twin must mirror the sweep: a queued nudge within its own expiry
+	// is not a close candidate.
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	seed := []beads.Bead{
+		nudgeSeedWithExpiry("nudge-queued", "nudge-queued", "queued", now.Add(-nudgeTTL-time.Minute), now.Add(23*time.Hour)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	counts, err := countStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if counts.NudgeClosed != 0 {
+		t.Errorf("count: NudgeClosed = %d, want 0 (queued nudge within expiry not a candidate)", counts.NudgeClosed)
+	}
 }
 
 func TestSweepStaleNudgeMail_OpenStatusFilter(t *testing.T) {
