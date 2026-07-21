@@ -1,0 +1,24 @@
+# mayor-health-surfacer — twice-daily mayor mailbox/queue/bead-state anomaly
+# surfacer (migrated from a two-shot systemd timer).
+#
+# Merged 2026-07-21 from mayor-health-surfacer-am.toml + -pm.toml (order-layer
+# consolidation, city audit sec 2.1 + epic gc-28w2): the halves were
+# exec-identical ('mayor-health-surfacer --nudge-mayor', 5m timeout); only
+# the schedule differed. Cron hour lists take ONE minute value, so the PM leg
+# moves 17:00 -> 17:45 (deliberate: also un-stacks the 17:00 slot shared with
+# executive-status-sync's 17:10 composition window). Undo: restore the two
+# single-hour files from this commit's parent in git if the 17:00 slot
+# matters.
+#
+# NOTE zero-lastRun bootstrap: this merged NAME has never fired, and checkCron
+# skips catch-up when lastRun is zero — first fire happens only when an
+# evaluator tick lands exactly in a scheduled minute (self-heals after the
+# first fire). To force-seed after the cleanup pause: temporarily set schedule
+# to "* * * * *", wait for one controller fire, restore. Not seeded during
+# the 07-21 pause (it nudges the mayor).
+[order]
+description = "Daily 09:45 + 17:45 EDT: surface mayor mailbox/queue/bead-state anomalies. Merged am/pm two-shot."
+trigger = "cron"
+schedule = "45 9,17 * * *"
+exec = "/home/ds/gas-city/bin/mayor-health-surfacer --nudge-mayor"
+timeout = "5m"
