@@ -27,6 +27,11 @@
 #   present after STALL_WATCH_REALERT_HOURS (default 6). Resolved findings
 #   are dropped from state silently. One post per channel per run, max.
 #
+#   Detector failure (2026-07-21, audit sec 4.2, gc-f5zg): if the surfacer
+#   exits non-zero or emits garbage, that is escalated as DETECTOR-FAILED to
+#   MAINT_CHANNEL — never reported as "no stalls". One alert per failure
+#   episode (state: stall-watch-detector-state.json); a healthy run re-arms.
+#
 # Usage:
 #   stall-watch              # dry-run: print what WOULD be pushed, no post
 #   stall-watch --push       # live: post new/re-alert findings to the channels
@@ -84,15 +89,95 @@ while [[ $# -gt 0 ]]; do
 done
 
 NOW_EPOCH=$(date +%s)
-MAINT_MSG=$(mktemp); CITY_MSG=$(mktemp); FINDINGS_RAW=$(mktemp)
+MAINT_MSG=$(mktemp); CITY_MSG=$(mktemp); FINDINGS_RAW=$(mktemp); DETECTOR_MSG=$(mktemp)
 MAINT_CAND="$MAINT_STATE.candidate"; CITY_CAND="$CITY_STATE.candidate"
-trap 'rm -f "$MAINT_MSG" "$CITY_MSG" "$FINDINGS_RAW" "$MAINT_CAND" "$CITY_CAND"' EXIT
+DETECTOR_KEY="detector:mayor-health-surfacer"
+DETECTOR_STATE="$STATE_DIR/stall-watch-detector-state.json"
+DETECTOR_CAND="$DETECTOR_STATE.candidate"
+trap 'rm -f "$MAINT_MSG" "$CITY_MSG" "$FINDINGS_RAW" "$MAINT_CAND" "$CITY_CAND" "$DETECTOR_MSG" "$DETECTOR_CAND"' EXIT
+
+ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+
+# Post one channel's message (if any) and commit its state independently.
+post_route() {
+  local label="$1" channel="$2" msg="$3" state="$4" cand="$5"
+  if [[ ! -s "$msg" ]]; then
+    [[ -f "$cand" ]] && mv -f "$cand" "$state"   # prune resolved keys
+    return 0
+  fi
+  if (( ! PUSH )); then
+    echo "=== stall-watch DRY-RUN ($label -> $channel) ==="
+    cat "$msg"
+    echo "=== state NOT modified (dry-run) ==="
+    return 0
+  fi
+  if gc slack publish-to-channel --conversation-id "$channel" --kind room \
+       ${PUBLISH_SID:+--session "$PUBLISH_SID"} \
+       --body-file "$msg" >/dev/null 2>&1; then
+    mv -f "$cand" "$state"
+    echo "$(ts) pushed $label $(wc -l < "$msg") line(s) to $channel" >> "$AUDIT_LOG"
+    gc session nudge mayor "stall-watch pushed to $label:
+$(cat "$msg")" >/dev/null 2>&1 || true
+  else
+    echo "$(ts) ERROR: publish $label -> $channel failed; state NOT advanced (will retry)" >> "$AUDIT_LOG"
+    return 1
+  fi
+}
 
 # Detect (reuse the proven surfacer). Findings travel via a file, NOT stdin:
 # the python program is fed on stdin via the heredoc, so piping findings to
 # stdin too would let the heredoc win and silently swallow them.
 STALLED_HOURS="$STALLED_HOURS" MAYOR_STALE_HOURS="$MAYOR_STALE_HOURS" \
-  timeout 240 "$SURFACER" --json > "$FINDINGS_RAW" 2>/dev/null || true
+  timeout 240 "$SURFACER" --json > "$FINDINGS_RAW" 2>/dev/null
+SURFACER_RC=$?
+
+# ---- Detector-failure gate (2026-07-21, audit sec 4.2, gc-f5zg) -------------
+# The old `|| true` here made a crashed or hung detector indistinguishable from
+# "no stalls": stall-watch reported clean forever while detection was down —
+# the 07-15 host-death / 07-16 Temporal failure shape (liveness green, outcomes
+# dark). Now: rc!=0, or non-empty output containing no valid JSON line, is a
+# DETECTOR-FAILED condition. It escalates through the same post/dedup path as
+# stalls — one alert per failure episode (state file below), re-armed by the
+# next healthy run — and leaves the per-channel stall state UNTOUCHED, because
+# findings are unknown, not resolved. A clean rc-0 empty run stays silent
+# exactly as before.
+detector_reason=""
+if (( SURFACER_RC != 0 )); then
+  if (( SURFACER_RC == 124 )); then detector_reason="timed out after 240s"
+  else detector_reason="exited rc=$SURFACER_RC"; fi
+elif grep -q '[^[:space:]]' "$FINDINGS_RAW" 2>/dev/null; then
+  valid=0
+  while IFS= read -r line; do
+    [[ -z "${line// }" ]] && continue
+    jq -e . >/dev/null 2>&1 <<<"$line" && { valid=1; break; }
+  done < "$FINDINGS_RAW"
+  (( valid )) || detector_reason="emitted no valid JSON (head: $(head -c 80 "$FINDINGS_RAW" | tr -d '\n'))"
+fi
+
+if [[ -n "$detector_reason" ]]; then
+  echo "$(ts) detector_failed: $SURFACER $detector_reason; stall detection DID NOT RUN (stall state untouched)" >> "$AUDIT_LOG"
+  ongoing=$(jq -r --arg k "$DETECTOR_KEY" '.[$k].first_seen // empty' "$DETECTOR_STATE" 2>/dev/null)
+  if [[ -n "$ongoing" ]]; then
+    exit 1   # already alerted for this episode; logged above, no re-post
+  fi
+  jq -n --arg k "$DETECTOR_KEY" --arg reason "$detector_reason" --argjson now "$NOW_EPOCH" \
+    '{($k): {first_seen: $now, reason: $reason}}' > "$DETECTOR_CAND"
+  {
+    printf ':rotating_light: *Stall watch DETECTOR FAILED* — mayor-health-surfacer %s.\n' "$detector_reason"
+    printf 'Stall detection is DOWN: "no stalls" cannot be trusted until it recovers.\n'
+    printf 'Repro: `%s --json`; audit: `%s`. One alert per failure episode; a healthy run re-arms.\n' "$SURFACER" "$AUDIT_LOG"
+  } > "$DETECTOR_MSG"
+  post_route "detector-failed" "$MAINT_CHANNEL" "$DETECTOR_MSG" "$DETECTOR_STATE" "$DETECTOR_CAND"
+  exit 1
+fi
+
+# Healthy detector run: close any open failure episode so the NEXT one
+# re-alerts (dedup is per-episode, not forever). Recovery itself is silent,
+# matching how resolved stall findings are dropped from state.
+if [[ -s "$DETECTOR_STATE" ]]; then
+  echo "$(ts) detector_recovered: $SURFACER healthy again" >> "$AUDIT_LOG"
+  rm -f "$DETECTOR_STATE"
+fi
 
 FINDINGS_FILE="$FINDINGS_RAW" NOW_EPOCH="$NOW_EPOCH" REALERT_HOURS="$REALERT_HOURS" \
   ESCALATE_STALLED_HOURS="$ESCALATE_STALLED_HOURS" \
@@ -219,34 +304,6 @@ def process(bucket, state_path, cand_path, msg_path):
 process(maint_bucket, os.environ["MAINT_STATE"], os.environ["MAINT_CAND"], maint_msg)
 process(city_bucket, os.environ["CITY_STATE"], os.environ["CITY_CAND"], city_msg)
 PYEOF
-
-ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
-
-# Post one channel's message (if any) and commit its state independently.
-post_route() {
-  local label="$1" channel="$2" msg="$3" state="$4" cand="$5"
-  if [[ ! -s "$msg" ]]; then
-    [[ -f "$cand" ]] && mv -f "$cand" "$state"   # prune resolved keys
-    return 0
-  fi
-  if (( ! PUSH )); then
-    echo "=== stall-watch DRY-RUN ($label -> $channel) ==="
-    cat "$msg"
-    echo "=== state NOT modified (dry-run) ==="
-    return 0
-  fi
-  if gc slack publish-to-channel --conversation-id "$channel" --kind room \
-       ${PUBLISH_SID:+--session "$PUBLISH_SID"} \
-       --body-file "$msg" >/dev/null 2>&1; then
-    mv -f "$cand" "$state"
-    echo "$(ts) pushed $label $(wc -l < "$msg") line(s) to $channel" >> "$AUDIT_LOG"
-    gc session nudge mayor "stall-watch pushed to $label:
-$(cat "$msg")" >/dev/null 2>&1 || true
-  else
-    echo "$(ts) ERROR: publish $label -> $channel failed; state NOT advanced (will retry)" >> "$AUDIT_LOG"
-    return 1
-  fi
-}
 
 rc=0
 post_route "#gascity-maintenance" "$MAINT_CHANNEL" "$MAINT_MSG" "$MAINT_STATE" "$MAINT_CAND" || rc=1

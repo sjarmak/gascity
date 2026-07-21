@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# stall-watch.test — behavioural cover for stall-watch's detector-failure gate.
+#
+# Hermetic: stubs `gc` and the surfacer on PATH / via env, and points state,
+# audit log and Slack "posts" at mktemp paths. No real detection runs, no
+# channel is touched, no session is nudged.
+#
+# Asserts the properties that keep "no stalls" trustworthy (audit sec 4.2,
+# gc-f5zg — the 07-15 host-death / 07-16 Temporal shape: detector dead,
+# report green):
+#   1. surfacer rc!=0    -> DETECTOR-FAILED escalation + non-zero exit,
+#                           never a clean "no stalls" report
+#   2. garbage JSON      -> same
+#   3. healthy empty run -> silent, rc 0 (unchanged behavior)
+#   4. dedup: a second consecutive failure does not re-post; a healthy run
+#      re-arms so the next failure episode alerts again
+#   5. a real finding still flows through the normal stall pipeline
+#   6. a detector failure leaves the per-channel stall state untouched
+set -uo pipefail
+
+WATCH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/stall-watch"
+WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+BIN="$WORK/bin"; mkdir -p "$BIN" "$WORK/state"
+export PATH="$BIN:$PATH"
+
+fails=0
+check() { # check <desc> <condition-rc>
+  if (( $2 == 0 )); then echo "  ok   $1"; else echo "  FAIL $1"; fails=$((fails+1)); fi
+}
+
+# --- stubs -------------------------------------------------------------------
+# gc: record every invocation; capture any --body-file content as the "post".
+cat > "$BIN/gc" <<'STUB'
+#!/usr/bin/env bash
+echo "$@" >> "$GC_CALLS"
+if [[ "${1:-}" == "slack" ]]; then
+  prev=""
+  for a in "$@"; do
+    [[ "$prev" == "--body-file" ]] && cat "$a" >> "$GC_POSTS"
+    prev="$a"
+  done
+fi
+exit 0
+STUB
+chmod +x "$BIN/gc"
+
+# surfacer: behavior driven by SURFACER_MODE (die | garbage | empty | finding).
+cat > "$BIN/surfacer-stub" <<'STUB'
+#!/usr/bin/env bash
+case "${SURFACER_MODE:-empty}" in
+  die)     echo "boom: store unreachable" >&2; exit 3 ;;
+  garbage) echo "this is not json"; exit 0 ;;
+  empty)   exit 0 ;;
+  finding) printf '{"category":"WORK_STALLED","key":"stall:gc-tst1","scope":"gascity","id":"gc-tst1","hours":9,"title":"test stall"}\n'; exit 0 ;;
+esac
+STUB
+chmod +x "$BIN/surfacer-stub"
+
+export GC_CALLS="$WORK/gc-calls.txt";  : > "$GC_CALLS"
+export GC_POSTS="$WORK/gc-posts.txt";  : > "$GC_POSTS"
+export STALL_WATCH_SURFACER="$BIN/surfacer-stub"
+export STALL_WATCH_STATE_DIR="$WORK/state"
+export STALL_WATCH_AUDIT_LOG="$WORK/audit.log"
+export GC_SESSION_ID="test-mayor"
+
+MAINT_STATE="$WORK/state/stall-watch-state.json"
+DET_STATE="$WORK/state/stall-watch-detector-state.json"
+
+run() { SURFACER_MODE="$1" bash "$WATCH" "${@:2}" 2>&1; }
+n_posts() { grep -c "DETECTOR FAILED" "$GC_POSTS" || true; }
+
+# --- 1. surfacer crash -> detector-failed, not "no stalls" -------------------
+echo "case 1: surfacer rc!=0 fails loud"
+echo '{"stall:gc-old": {"first_seen": 1, "tier": 0}}' > "$MAINT_STATE"   # for case 6
+out=$(run die --push); rc=$?
+(( rc != 0 )); check "exits non-zero when the detector is down" $?
+[[ "$(n_posts)" == "1" ]]; check "DETECTOR-FAILED escalation was posted" $?
+grep -q "rc=3" "$GC_POSTS"; check "post names the surfacer exit code" $?
+grep -q "detector_failed" "$WORK/audit.log"; check "detector_failed event logged" $?
+! grep -q "clean: no pushable stalls" "$WORK/audit.log"
+check "does NOT log a clean run on detector failure" $?
+
+# --- 6. stall state untouched by a detector failure --------------------------
+echo "case 6: detector failure never clobbers stall state"
+grep -q "stall:gc-old" "$MAINT_STATE"; check "pre-seeded stall key survives" $?
+
+# --- 4. dedup: one alert per failure episode ---------------------------------
+echo "case 4: dedup across a failure episode"
+out=$(run die --push); rc=$?
+(( rc != 0 )); check "second failing run still exits non-zero" $?
+[[ "$(n_posts)" == "1" ]]; check "second consecutive failure does NOT re-post" $?
+[[ "$(grep -c detector_failed "$WORK/audit.log")" == "2" ]]
+check "every failing tick is still logged" $?
+out=$(run empty --push); rc=$?
+(( rc == 0 )); check "healthy run after the episode exits 0" $?
+[[ ! -s "$DET_STATE" ]]; check "healthy run clears the episode state" $?
+grep -q "detector_recovered" "$WORK/audit.log"; check "recovery logged (not posted)" $?
+out=$(run die --push)
+[[ "$(n_posts)" == "2" ]]; check "next failure episode re-alerts" $?
+
+# --- 2. garbage output -> same escalation ------------------------------------
+echo "case 2: invalid JSON fails loud"
+rm -f "$DET_STATE"; : > "$GC_POSTS"
+out=$(run garbage --push); rc=$?
+(( rc != 0 )); check "exits non-zero on garbage output" $?
+grep -q "no valid JSON" "$GC_POSTS"; check "post says the output was not JSON" $?
+
+# --- 3. healthy empty run stays silent ---------------------------------------
+echo "case 3: healthy empty run is silent"
+rm -f "$DET_STATE"; : > "$GC_POSTS"; : > "$WORK/audit.log"
+out=$(run empty --push); rc=$?
+(( rc == 0 )); check "exits 0 on a clean run" $?
+[[ ! -s "$GC_POSTS" ]]; check "nothing posted on a clean run" $?
+! grep -q "detector" "$WORK/audit.log"; check "no detector event on a clean run" $?
+
+# --- 5. real findings still flow ---------------------------------------------
+echo "case 5: normal stall pipeline intact"
+rm -f "$MAINT_STATE"
+out=$(run finding); rc=$?   # dry-run
+(( rc == 0 )); check "dry-run with a finding exits 0" $?
+grep -q "stall-watch DRY-RUN" <<<"$out"; check "finding reaches the dry-run report" $?
+grep -q "gc-tst1" <<<"$out"; check "the stalled bead is named" $?
+
+echo
+if (( fails > 0 )); then echo "stall-watch.test: $fails assertion(s) FAILED"; exit 1; fi
+echo "stall-watch.test: all assertions passed"

@@ -67,6 +67,14 @@
 # count outgrows the order timeout instead of failing silently. Keep BUDGET
 # equal to `timeout` whenever either changes.
 #
+# 2026-07-21 later (audit sec 4.2, gc-f5zg): bin/stall-watch.test added (20th
+# suite — detector-failure gate: a crashed/hung mayor-health-surfacer now
+# escalates DETECTOR-FAILED instead of reading as "no stalls"). 20 x 60 =
+# 1200s, exactly equal to the 1200s timeout — the same exact-fill trap the
+# 2026-07-16 note above calls out, and the preflight's strict `>` does not
+# warn at equality. Raised to 1500s (covers 25 suites at 60s each). Measured
+# real total across all twenty: ~31s (pytest-suites dominates).
+#
 # Escalation: posts NEW failures and RECOVERED transitions to
 # #gascity-maintenance (C0B25SS12CD), same channel and mechanism as stall-watch.
 # Dedup'd against .gc/city-selftest-state.json; re-alerts at most daily while a
@@ -83,14 +91,14 @@ description = "Every 6h: run the bin/*.test regression suites (the only cover fo
 trigger = "cooldown"
 interval = "6h"
 exec = "/home/ds/gas-city/bin/city-selftest --push"
-timeout = "1200s"
+timeout = "1500s"
 idempotent = true
 
 [order.env]
-# Per-suite cap. 19 suites x 60s = 1140s < the 1200s order timeout above.
+# Per-suite cap. 20 suites x 60s = 1200s < the 1500s order timeout above.
 CITY_SELFTEST_TIMEOUT = "60"
 # The order timeout, handed to the script so its preflight checks the REAL
 # ceiling rather than a second copy of the number. Keep equal to `timeout`.
-CITY_SELFTEST_BUDGET = "1200"
+CITY_SELFTEST_BUDGET = "1500"
 # While a suite stays red, re-alert at most once a day rather than every tick.
 CITY_SELFTEST_REALERT_HOURS = "24"
