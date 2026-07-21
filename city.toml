@@ -1,4 +1,5 @@
 [workspace]
+provider = "claude-4"
 max_active_sessions = 80
 
 [providers]
