@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Regression gate for prompt-template fragment includes (gc-28w2 item 3).
+#
+# A `{{ template "name" . }}` whose define is missing renders as a hard
+# template error at agent spawn — and PLs are usually suspended when prompts
+# are edited, so the breakage would only surface at resume. This test fails
+# fast at selftest time instead:
+#
+#   1. every fragment name referenced from agents/*/prompt.template.md,
+#      prompts/*.template.md, or a fragment file itself has a matching
+#      {{ define "name" }} in the city's template-fragments/ or in a
+#      city.toml-imported pack's template-fragments/ / prompts/shared/;
+#   2. no fragment name is defined twice (silent last-wins shadowing).
+
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+# --- collect define names (city + city.toml-imported pack dirs) -------------
+frag_dirs=("$ROOT/template-fragments")
+while IFS= read -r src; do
+  frag_dirs+=("$src/template-fragments" "$src/prompts/shared")
+done < <(sed -n 's/^source = "\(.*\)"$/\1/p' "$ROOT/city.toml" | sort -u)
+
+defines=$(
+  for d in "${frag_dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    grep -rhoE '\{\{-? *define +"[^"]+"' "$d" 2>/dev/null || true
+  done | grep -oE '"[^"]+"' | tr -d '"' | sort
+)
+
+[[ -n "$defines" ]] || { echo "FAIL: no template defines found" >&2; exit 1; }
+
+dupes=$(uniq -d <<<"$defines")
+[[ -z "$dupes" ]] || {
+  echo "FAIL: fragment name defined more than once (last-wins shadowing):" >&2
+  echo "$dupes" >&2
+  exit 1
+}
+
+# --- collect referenced names ----------------------------------------------
+refs=$(
+  {
+    cat "$ROOT"/agents/*/prompt.template.md 2>/dev/null || true
+    cat "$ROOT"/prompts/*.template.md 2>/dev/null || true
+    cat "$ROOT"/template-fragments/*.template.md 2>/dev/null || true
+  } | { grep -oE '\{\{ *template +"[^"]+"' || true; } |
+    grep -oE '"[^"]+"' | tr -d '"' | sort -u
+)
+
+[[ -n "$refs" ]] || { echo "OK: no fragment references found"; exit 0; }
+
+missing=$(comm -23 <(printf '%s\n' "$refs") <(uniq <<<"$defines"))
+[[ -z "$missing" ]] || {
+  echo "FAIL: referenced fragment(s) with no define:" >&2
+  echo "$missing" >&2
+  exit 1
+}
+
+echo "OK: $(wc -l <<<"$refs") referenced fragment names all resolve, no duplicate defines"
