@@ -32,6 +32,10 @@ DEFAULT_THRESHOLDS = {0: 3600, 1: 4 * 3600, 2: 12 * 3600, 3: 24 * 3600, 4: 48 * 
 EXEMPT_LABELS = frozenset({"health-soak", "human-wip"})
 
 
+class ScopeError(RuntimeError):
+    """The requested scope resolves to no store; nothing can be scanned."""
+
+
 class Action(str, enum.Enum):
     NONE = "none"
     EXEMPT = "exempt"
@@ -418,33 +422,55 @@ class Reconciler:
         for issue in issues:
             self.apply_decision(store, issue, decide(issue, self.now, self.config))
 
+    def enumerate_rigs(self) -> list[Store] | None:
+        """Rig stores from `gc rig list`, or None when enumeration failed.
+
+        Failure is logged as rig_enum_failed and counted, never raised: rig
+        enumeration must not be able to abort a run (audit 1.2 — a 60s rig-list
+        timeout used to kill the whole run, city store included).
+        """
+        try:
+            payload = load_json_command(["gc", "rig", "list", "--json"], 60)
+            rigs = payload.get("rigs") if isinstance(payload, dict) else None
+            if not isinstance(rigs, list):
+                raise RuntimeError("gc rig list returned no rigs array")
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            self.result.errors += 1
+            self.log("rig_enum_failed", Store("rigs", None), "", error=str(exc))
+            return None
+        return [
+            Store(str(rig["name"]), str(rig["name"]))
+            for rig in rigs
+            if isinstance(rig, dict) and rig.get("name") not in {None, "ds-research"}
+        ]
+
+    def run_scope(self, scope: str) -> None:
+        city = Store("city", None)
+        if scope == "city":
+            self.run_store(city)
+            return
+        if scope == "all":
+            # City first and unconditionally: it needs no rig list, and a
+            # rig-list hang or failure must never starve the city scan.
+            self.run_store(city)
+            for store in self.enumerate_rigs() or []:
+                self.run_store(store)
+            return
+        rig_stores = self.enumerate_rigs()
+        if rig_stores is None:
+            return
+        selected = [store for store in rig_stores if store.name == scope]
+        if not selected:
+            raise ScopeError(f"unknown scope {scope!r}")
+        for store in selected:
+            self.run_store(store)
+
     def finish(self) -> None:
         if not self.apply or not self.nudge_mayor or not self.mayor_messages:
             return
         body = "[completion-reconciler]\n" + "\n".join(f"- {line}" for line in self.mayor_messages)
         if not self.nudge("mayor", body):
             self.log("mayor_nudge_failed", Store("city", None), "", count=len(self.mayor_messages))
-
-
-def stores_for(scope: str) -> list[Store]:
-    city = Store("city", None)
-    if scope == "city":
-        return [city]
-    payload = load_json_command(["gc", "rig", "list", "--json"], 60)
-    rigs = payload.get("rigs") if isinstance(payload, dict) else None
-    if not isinstance(rigs, list):
-        raise RuntimeError("gc rig list returned no rigs array")
-    stores = [
-        Store(str(rig["name"]), str(rig["name"]))
-        for rig in rigs
-        if isinstance(rig, dict) and rig.get("name") not in {None, "ds-research"}
-    ]
-    if scope == "all":
-        return [city, *stores]
-    selected = [store for store in stores if store.name == scope]
-    if not selected:
-        raise RuntimeError(f"unknown scope {scope!r}")
-    return selected
 
 
 def config_from_env(args: argparse.Namespace) -> Config:
@@ -490,9 +516,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        stores = stores_for(args.scope)
         config = config_from_env(args)
-    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+    except ValueError as exc:
         print(f"completion-reconciler: {exc}", file=sys.stderr)
         return 2
 
@@ -503,8 +528,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("completion-reconciler: another run is active; skipping")
             return 0
         runner = Reconciler(config, now, args.apply, args.nudge_mayor, audit)
-        for store in stores:
-            runner.run_store(store)
+        try:
+            runner.run_scope(args.scope)
+        except ScopeError as exc:
+            print(f"completion-reconciler: {exc}", file=sys.stderr)
+            return 2
         runner.finish()
 
     mode = "APPLY" if args.apply else "DRY-RUN"

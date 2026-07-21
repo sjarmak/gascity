@@ -191,6 +191,9 @@ import json, os, sys
 with open(os.environ["MOCK_CALLS"], "a") as fh:
     fh.write(json.dumps(["gc", *sys.argv[1:]]) + "\\n")
 if sys.argv[1:3] == ["rig", "list"]:
+    if os.environ.get("MOCK_RIG_LIST_FAIL") == "1":
+        print("rig list unavailable", file=sys.stderr)
+        raise SystemExit(1)
     print('{"rigs":[]}')
 elif sys.argv[1:3] == ["session", "nudge"]:
     pass
@@ -278,6 +281,7 @@ def _run_main(
     tmp_path: Path,
     initial: dict[str, object],
     *args: str,
+    scope: str = "city",
     **extra_env: str,
 ) -> tuple[int, dict[str, object], list[list[str]], Path]:
     env, calls = _mock_cli(tmp_path, initial)
@@ -287,7 +291,7 @@ def _run_main(
     rc = reconciler.main(
         [
             "--scope",
-            "city",
+            scope,
             "--now",
             "2026-07-18T14:00:00Z",
             "--checkpoint-grace",
@@ -395,6 +399,82 @@ def test_main_reports_unknown_scope_and_invalid_now(
         monkeypatch.setenv(key, value)
     assert reconciler.main(["--scope", "missing"]) == 2
     assert reconciler.main(["--scope", "city", "--now", "bad"]) == 2
+
+
+def test_scope_all_scans_city_despite_rig_enum_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    audit = tmp_path / "audit.jsonl"
+    runner = reconciler.Reconciler(config(), NOW, apply=False, nudge_mayor=False, audit_log=audit)
+
+    def fake_load(argv: object, timeout: int = 30) -> object:
+        command = list(argv)  # type: ignore[call-overload]
+        if command[:3] == ["gc", "rig", "list"]:
+            raise subprocess.TimeoutExpired(command, timeout)
+        if command[:2] == ["bd", "list"]:
+            return [issue()]
+        raise AssertionError(f"unexpected command {command}")
+
+    monkeypatch.setattr(reconciler, "load_json_command", fake_load)
+    runner.run_scope("all")
+
+    assert runner.result.scanned == 1
+    assert runner.result.errors == 1
+    text = audit.read_text()
+    assert '"event":"rig_enum_failed"' in text
+    assert '"event":"scan_failed"' not in text
+
+
+def test_partial_rig_failure_skips_only_that_rig(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    audit = tmp_path / "audit.jsonl"
+    runner = reconciler.Reconciler(config(), NOW, apply=False, nudge_mayor=False, audit_log=audit)
+
+    def fake_load(argv: object, timeout: int = 30) -> object:
+        command = list(argv)  # type: ignore[call-overload]
+        if command[:3] == ["gc", "rig", "list"]:
+            return {"rigs": [{"name": "alpha"}, {"name": "beta"}, {"name": "ds-research"}]}
+        if command[:2] == ["bd", "list"]:
+            return [issue(id="city-1")]
+        if command[:5] == ["gc", "bd", "--rig", "alpha", "list"]:
+            raise RuntimeError("alpha dolt endpoint unreachable")
+        if command[:5] == ["gc", "bd", "--rig", "beta", "list"]:
+            return [issue(id="beta-1")]
+        raise AssertionError(f"unexpected command {command}")
+
+    monkeypatch.setattr(reconciler, "load_json_command", fake_load)
+    runner.run_scope("all")
+
+    assert runner.result.scanned == 2  # city + beta; alpha alone is skipped
+    assert runner.result.errors == 1
+    text = audit.read_text()
+    assert '"event":"scan_failed"' in text
+    assert '"store":"alpha"' in text
+    assert '"store":"beta"' not in text
+    assert '"event":"rig_enum_failed"' not in text
+
+
+def test_main_scope_all_recovers_city_despite_rig_enum_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rc, state, _, audit = _run_main(
+        monkeypatch, tmp_path, issue(), "--apply", scope="all", MOCK_RIG_LIST_FAIL="1"
+    )
+    assert rc == 1  # enumeration failure stays loud, but the run completes
+    assert reconciler.CHECKPOINT_REQUESTED_AT in state["metadata"]
+    text = audit.read_text()
+    assert '"event":"checkpoint_requested"' in text
+    assert '"event":"rig_enum_failed"' in text
+
+
+def test_main_scope_all_clean_run_emits_no_enum_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rc, state, _, audit = _run_main(monkeypatch, tmp_path, issue(), "--apply", scope="all")
+    assert rc == 0
+    assert reconciler.CHECKPOINT_REQUESTED_AT in state["metadata"]
+    assert '"event":"rig_enum_failed"' not in audit.read_text()
 
 
 @pytest.mark.parametrize(
