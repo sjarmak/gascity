@@ -1,7 +1,0 @@
-[order]
-description = "Periodic rig patrol — scan for idle/blocked/completed work and report to human"
-formula = "mol-patrol"
-pool = "mayor"
-gate = "cooldown"
-interval = "30m"
-timeout = "5m"
