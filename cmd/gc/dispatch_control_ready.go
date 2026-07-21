@@ -20,9 +20,10 @@ import (
 // control-dispatcher's per-tick readiness scan (workflowServeControlReadyQueryForBeads,
 // dispatch_runtime.go) builds a shell script that fork-execs up to ~9
 // bd/jq processes per agent per tick. Wire that same readiness evaluation to
-// answer from an in-process CachingStore snapshot first, falling back to
-// exactly one batched `bd ready --json` call when the snapshot can't answer,
-// instead of the shell script's N separate `bd` invocations.
+// exactly one batched `bd ready --json` call for bd-backed stores instead of
+// priming a process-local cache whose refresh itself fans out into several bd
+// subprocesses. Non-bd stores retain the in-process cache because the bd
+// fallback cannot query them.
 //
 // Why this hooks into nextWorkflowServeBeads (the default workflowServeList
 // implementation) rather than drainWorkflowServeWork: workflowServeList is a
@@ -46,19 +47,6 @@ const controlReadyQueryMarkerPrefix = "BD_EXPORT_AUTO=false GC_CONTROL_TARGET="
 
 // controlReadyExcludeType mirrors the shell script's --exclude-type=epic.
 const controlReadyExcludeType = "epic"
-
-// controlReadyFallbackLimit bounds the single batched bd ready call issued
-// when the cache can't answer. It must be generous enough that per-candidate/
-// per-route filtering in Go (each capped at workflowServeScanLimit) is never
-// starved by an earlier truncation at the bd layer -- unlike the shell script
-// this replaces (which ran each candidate/route's own independently-capped bd
-// call), this single batched call's cap is shared across every candidate and
-// route, so it must hold a whole city's ready set even during the write
-// bursts that make the cache dirty in the first place. It costs one bd call
-// regardless of value, so err on the generous side; controlReadyFallbackReady
-// also logs if a response ever comes back exactly at this limit, so silent
-// truncation is at least observable.
-const controlReadyFallbackLimit = 5000
 
 // controlReadyCacheTTL bounds how long a primed control-ready snapshot is
 // reused before the next tick re-primes it. A fresh CachingStore is built
@@ -270,13 +258,14 @@ func beadsToHookBeads(items []beads.Bead) []hookBead {
 	return out
 }
 
-// controlReadyFallbackReady issues exactly one batched `bd ready --json`
-// call covering the whole active ready set (no --assignee/--metadata-field
-// filter), for evaluateControlReady to filter in Go. Used when the in-process
-// cache can't answer: dirty, still priming, or the rig's bd compatibility
-// mode requires --include-ephemeral (a tier CachedReady can't serve).
+// controlReadyFallbackReady issues exactly one unbounded batched
+// `bd ready --json` call covering the whole active ready set (no
+// --assignee/--metadata-field filter), for evaluateControlReady to filter in
+// Go. The result must be unbounded because unrelated higher-ranked ready work
+// must not starve a control bead before filtering. Used for bd-backed stores
+// and when the rig's bd compatibility mode requires --include-ephemeral.
 func controlReadyFallbackReady(dir string, env map[string]string, includeEphemeral bool) ([]beads.Bead, error) {
-	query := fmt.Sprintf("bd --readonly --sandbox ready --json --exclude-type=%s --limit=%d", controlReadyExcludeType, controlReadyFallbackLimit)
+	query := fmt.Sprintf("bd --readonly --sandbox ready --json --exclude-type=%s --limit=0", controlReadyExcludeType)
 	if includeEphemeral {
 		query += " --include-ephemeral"
 	}
@@ -291,9 +280,6 @@ func controlReadyFallbackReady(dir string, env map[string]string, includeEphemer
 	var result []beads.Bead
 	if err := json.Unmarshal([]byte(trimmed), &result); err != nil {
 		return nil, fmt.Errorf("control-ready fallback: unexpected bd ready output: %s", trimmed)
-	}
-	if len(result) == controlReadyFallbackLimit {
-		log.Printf("control-ready fallback: bd ready for %s returned exactly the %d-item limit -- city-wide ready set may be truncated, some candidates/routes could see fewer beads than are actually ready", dir, controlReadyFallbackLimit)
 	}
 	beads.SortBeadsReadyOrder(result)
 	return result, nil
@@ -367,10 +353,18 @@ func tryControlReadyFromCacheOrFallback(workQuery, dir string, env map[string]st
 	}
 
 	cityPath := cityForStoreDir(dir)
-	cfg, _ := loadCityConfig(cityPath, io.Discard)
 	envList := mergeRuntimeEnv(os.Environ(), env)
 
-	if !parsed.includeEphemeral {
+	// A process-local PrimeActive cache is counterproductive for BdStore here:
+	// every dispatcher process refreshes it independently, and each refresh
+	// expands into status lists, a ready projection, and dependency reads. The
+	// existing fallback is one bounded bd call and applies identical filtering
+	// below. File and custom exec stores cannot be queried by that fallback, so
+	// keep their zero-subprocess cache path.
+	scopeRoot := resolveStoreScopeRoot(cityPath, dir)
+	provider := rawBeadsProviderForScope(scopeRoot, cityPath)
+	if !parsed.includeEphemeral && !providerUsesBdStoreContract(provider) {
+		cfg, _ := loadCityConfig(cityPath, io.Discard)
 		if cache := controlReadyCacheFor(dir, cityPath, cfg); cache != nil {
 			if ready, ok := cache.CachedReady(); ok {
 				return beadsToHookBeads(evaluateControlReady(ready, parsed, envList)), true, nil
