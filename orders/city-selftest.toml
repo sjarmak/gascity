@@ -57,9 +57,15 @@
 # deadlock liveness sensor). This fills the 660s cover exactly (11 x 60 = 660).
 # The suite drives the real sensor ~24x against fixtures (stubbed gc + fixture
 # session/claims/peek dirs); measured ~0.6s alone, full eleven-suite total ~8.2s.
-# THE TIMEOUT IS NOW AT ITS DOCUMENTED CEILING: a 12th suite MUST raise timeout
-# (at 60s/suite, 12 suites need 720s) or a single hung suite could eat the order
-# with nothing escalated — the exact silent-failure this order exists to catch.
+# 2026-07-21 (audit sec 4.1, gc-f5zg): the "a 12th suite MUST raise timeout"
+# instruction above was breached — the glob reached 16 suites while timeout still
+# read 660s (worst case 16 x 60 = 960s). That is the second time this invariant
+# slipped, because a comment asking a human to redo arithmetic is not an
+# enforcement mechanism. Fixed two ways: timeout raised to 1200s (16 x 60 = 960s
+# plus headroom for ~4 more suites), and bin/city-selftest now performs its own
+# budget preflight from CITY_SELFTEST_BUDGET below, escalating when the suite
+# count outgrows the order timeout instead of failing silently. Keep BUDGET
+# equal to `timeout` whenever either changes.
 #
 # Escalation: posts NEW failures and RECOVERED transitions to
 # #gascity-maintenance (C0B25SS12CD), same channel and mechanism as stall-watch.
@@ -77,11 +83,14 @@ description = "Every 6h: run the bin/*.test regression suites (the only cover fo
 trigger = "cooldown"
 interval = "6h"
 exec = "/home/ds/gas-city/bin/city-selftest --push"
-timeout = "660s"
+timeout = "1200s"
 idempotent = true
 
 [order.env]
-# Per-suite cap. 10 suites x 60s = 600s < the 660s order timeout above.
+# Per-suite cap. 16 suites x 60s = 960s < the 1200s order timeout above.
 CITY_SELFTEST_TIMEOUT = "60"
+# The order timeout, handed to the script so its preflight checks the REAL
+# ceiling rather than a second copy of the number. Keep equal to `timeout`.
+CITY_SELFTEST_BUDGET = "1200"
 # While a suite stays red, re-alert at most once a day rather than every tick.
 CITY_SELFTEST_REALERT_HOURS = "24"

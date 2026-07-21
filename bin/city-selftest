@@ -75,6 +75,29 @@ report=""     # accumulated escalation lines
 ran=0; failed=0
 
 shopt -s nullglob
+
+# Budget preflight (2026-07-21, audit sec 4.1). The order's `timeout` must cover
+# suite_count x PER_TIMEOUT, or one hung suite eats the whole run, the order is
+# killed, and NOTHING escalates — the exact silent failure this script exists to
+# prevent. That invariant lived only in a TOML comment saying "a 12th suite MUST
+# raise timeout", and it was breached twice: the glob reached 16 suites against a
+# 660s ceiling (worst case 960s). A comment is not an enforcement mechanism.
+#
+# The order passes its own timeout as CITY_SELFTEST_BUDGET so the check is real
+# rather than a second copy of the number. When it does not fit we escalate that
+# fact instead of discovering it as an unexplained missing report.
+suite_total=0
+for _t in "$TEST_DIR"/*.test; do suite_total=$((suite_total + 1)); done
+worst_case=$(( suite_total * PER_TIMEOUT ))
+budget="${CITY_SELFTEST_BUDGET:-0}"
+if (( budget > 0 && worst_case > budget )); then
+  budget_warning="suite budget exceeded: ${suite_total} suites x ${PER_TIMEOUT}s = ${worst_case}s > ${budget}s order timeout. Raise \`timeout\` in orders/city-selftest.toml (or lower CITY_SELFTEST_TIMEOUT). Until then a hung suite kills this run silently."
+  report+="⚠️ ${budget_warning}"$'\n'
+  log_event "budget_exceeded" "-" "$(jq -cn --argjson s "$suite_total" --argjson p "$PER_TIMEOUT" \
+      --argjson w "$worst_case" --argjson b "$budget" \
+      '{suites:$s, per_timeout:$p, worst_case:$w, budget:$b}')"
+  echo "city-selftest: $budget_warning" >&2
+fi
 for t in "$TEST_DIR"/*.test; do
   name=$(basename "$t" .test)
   [[ -n "$ONLY" && "$name" != "$ONLY" ]] && continue
