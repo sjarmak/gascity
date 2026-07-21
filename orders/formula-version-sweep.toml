@@ -1,0 +1,35 @@
+# formula-version-sweep — daily read-only sensor: which in-flight molecules
+# are running formula text that has since been edited?
+#
+# Wired 2026-07-21 (gc-28w2 item 6, city audit sec 3 wire-or-delete; sensor
+# built 2026-07-17 under dr-9t3r and never wired). WHY: gc stamps
+# gc.formula_hash at sling time but provides no read-back — a formula edit
+# does not heal molecules already in flight, and nothing answered "which
+# running molecules were built from a superseded formula?" That gap cost a
+# 4-day 100%-deadlocked EnterpriseBench pool and three stale cross-rig
+# "it's still broken" reports on 2026-07-15. First wired run (2026-07-21)
+# found 76 in-flight beads on stale formula text, so the signal is real.
+#
+# REPORT-ONLY: exec omits --exit-code, so the order always exits 0 and the
+# findings land in the order log. Deliberately no Slack/nudge leg yet.
+# Exit condition for the calibration phase (no open-ended report-only
+# phases, audit sec 3): once the paused rigs resume, either (a) the mayor
+# confirms the daily report is being consumed and promotes alerting by
+# adding --exit-code plus a notify leg, or (b) nobody has consumed it
+# within ~2 weeks of resume and the order is retired to .disabled with
+# that recorded. Promotion is a human/mayor call, not automatic.
+#
+# The city's own store shows as "unreachable rig ds-research" in the report:
+# expected — gc bd refuses the city's file-backend store; rig stores resolve
+# via gc's own rig config (immune to the order controller pinning BEADS_DIR
+# to the city store, which only affects cwd-walk-up bd calls).
+[order]
+description = "Daily read-only sweep: recompute sha256 of each in-flight molecule's gc.formula_source and compare to its sling-time gc.formula_hash; report molecules running stale/superseded formula text (dr-9t3r sensor; the 2026-07-15 EnterpriseBench 4-day pool deadlock is the incident this detects early). Report-only — findings go to the order log, no alert leg until promoted."
+trigger = "cooldown"
+interval = "24h"
+exec = "/home/ds/gas-city/bin/formula-version-sweep"
+timeout = "120s"
+# Fail OPEN on open-work-gate timeout (gastownhall/gascity#2893): the sweep is
+# read-only and deterministic (pure content-addressed comparison); a re-fire
+# re-reads and re-reports, mutating nothing.
+idempotent = true
