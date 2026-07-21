@@ -54,12 +54,31 @@ done
 
 # Default coverage = the unrotated growth paths found by the 2026-07-03 leak
 # census. events.jsonl and beads.json are deliberately absent (see header).
+#
+# 2026-07-21 (audit sec 4.3, gc-pif5): the census covered only the five paths
+# below, so the ~35 append-forever logs that order scripts write into
+# /home/ds/gas-city/.gc/*.log were covered by NOTHING. stale-worktree-reaper.log
+# had reached 30MB accumulating since 2026-05-04 and codegraph-sync.log 20MB,
+# with the root filesystem at 89%. Broadened to whole-directory globs so a NEW
+# order script is covered the day it starts writing, rather than the day someone
+# notices the file. The events.jsonl/beads.json refusals at the rotate_one case
+# statement still protect those two by name regardless of what a glob matches.
+#
+# The removed glob was `runtime/*--control-dispatcher-trace.log`, which matched
+# ZERO files: the dispatchers write `<rig>--core.control-dispatcher-trace.log`
+# (note the `core.`). Dispatcher trace rotation had therefore never once run,
+# which is why 500MB+ of live traces and 1.6GB of orphaned .log.1/.log.2
+# remnants were sitting in runtime/. A glob that silently matches nothing is
+# indistinguishable from a glob with nothing to do; `runtime/*.log` cannot fail
+# that way. First real run: 8 files, ~500MB.
 default_globs() {
   cat <<'EOF'
 /home/ds/.gc/supervisor.log
 /home/ds/.gc/slack-handle-alias-reaper.log
 /home/ds/.gc/slack-adapter-autorestart.log
-/home/ds/gas-city/.gc/runtime/*--control-dispatcher-trace.log
+/home/ds/.gc/codegraph-sync.log
+/home/ds/gas-city/.gc/*.log
+/home/ds/gas-city/.gc/runtime/*.log
 /home/ds/gas-city/.beads/dolt-server.log
 EOF
 }
