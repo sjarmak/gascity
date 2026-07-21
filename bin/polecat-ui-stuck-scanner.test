@@ -20,6 +20,8 @@
 #      scan 1 silent (two-scan confirm), scan 2 alerts once with the reset
 #      command, NO reset/kill ever issued (surface-only), active spinner
 #      variant does not classify, cleared fingerprint resolves with one mail
+#   9. transient 529 single-sighting (alerts_sent=0) clears SILENTLY —
+#      no RESOLVED mail for an episode that never alerted, key still dropped
 #
 # Strategy: stub `gc` on PATH. The stub serves one stuck pool session for
 # `gc session list --json`, serves peek output from $FIXTURE_PEEK_FILE, records
@@ -185,6 +187,24 @@ with open(sys.argv[1]) as f: st = json.load(f)
 sys.exit(1 if any("e529" in k for k in st.get("entries", {})) else 0)
 PYEOF
 check "resolved 529 key dropped from state" 0 "$?"
+
+# --- 9. transient 529 single-sighting clears silently ------------------------
+# A 529 seen ONCE sits in the two-scan confirm window (E529_ALERT_COUNTS starts
+# at 2) with alerts_sent=0. When it clears next scan, there is no alert to
+# close, so no RESOLVED mail may be sent — the key just drops.
+rm -f "$STATE" "$MAIL_LOG" "$ACTION_LOG"
+printf 'API Error: 529 Overloaded\n%s Worked for 3m\n❯ \n' '✻' > "$PEEK_FILE"
+run_scanner   # scan 1: count=1, alerts_sent=0 (confirm window, log-only)
+check "transient 529 scan 1 silent" 0 "$(mails)"
+printf '$ idle, waiting for work\n' > "$PEEK_FILE"
+run_scanner   # fingerprint cleared: episode resolves with alerts_sent=0
+check "transient 529 clears silently (no RESOLVED mail)" 0 "$(mails)"
+python3 - "$STATE" <<'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f: st = json.load(f)
+sys.exit(1 if any("e529" in k for k in st.get("entries", {})) else 0)
+PYEOF
+check "transient 529 key dropped despite silent resolve" 0 "$?"
 
 if [ "$FAILED" -eq 0 ]; then
   echo "ALL PASS"

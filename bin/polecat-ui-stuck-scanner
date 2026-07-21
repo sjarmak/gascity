@@ -140,7 +140,9 @@ E529_ALERT_COUNTS = (2, 4, 16, 64)
 # flood. Now: one entry per session+signature, alert on NEW, re-alert only at
 # the scan counts below (at the 5m cadence: ~0m / 15m / 75m / ~5h15m — max 4
 # alerts per episode), then log-only until the signature clears, which emits
-# exactly one RESOLVED mail. Recovery actions (reset/kill) fire at the same
+# exactly one RESOLVED mail — but only for episodes that actually alerted
+# (alerts_sent > 0); a transient sighting that never reached an alert count
+# clears silently. Recovery actions (reset/kill) fire at the same
 # points, so a failed heal is retried on the escalation schedule, not never.
 ESCALATION_ALERT_COUNTS = (1, 4, 16, 64)
 # Entries whose signature has not been seen for this long are pruned (log-only).
@@ -697,8 +699,11 @@ def main() -> int:
 
     # Resolution + prune. A tracked key not observed this scan resolves ONLY if
     # its session was positively examined clean (gone from the list, active
-    # again, or peeked without the signature): exactly one RESOLVED mail, then
-    # the key drops. Keys whose session could NOT be examined (list failure,
+    # again, or peeked without the signature): exactly one RESOLVED mail if the
+    # episode ever alerted (alerts_sent > 0 — an e529 single sighting sits in
+    # its two-scan confirm window with zero alerts, so a RESOLVED mail would
+    # close an alert the mayor never got), then the key drops. Keys whose
+    # session could NOT be examined (list failure,
     # peek timeout, beyond the auth peek cap) are carried untouched — a
     # transient blind spot must not fake a resolution, which would re-alert the
     # same wedge as NEW next scan (mail churn, the flood in a new shape).
@@ -746,10 +751,12 @@ def main() -> int:
                 resolved = False
             if resolved:
                 resolved_count += 1
+                alerts_sent = int(entry.get("alerts_sent") or 0)
                 log_line({"event": "would-resolve" if DRY_RUN else "resolved",
                           "key": key, "count": entry.get("count"),
-                          "alerts_sent": entry.get("alerts_sent")})
-                if not DRY_RUN:
+                          "alerts_sent": alerts_sent,
+                          "mailed": (not DRY_RUN) and alerts_sent > 0})
+                if not DRY_RUN and alerts_sent > 0:
                     mail_resolved(key, entry)
                 del entries[key]
                 continue
