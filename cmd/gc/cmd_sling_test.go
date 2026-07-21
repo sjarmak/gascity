@@ -450,6 +450,36 @@ func TestSlingJSONFromResult(t *testing.T) {
 	}
 }
 
+func TestWriteSlingJSONResultIncludesDeploymentReceipt(t *testing.T) {
+	result := sling.SlingResult{
+		Target:     "repo-a/polecat",
+		Method:     "bead",
+		BeadID:     "repo-a-1",
+		Routed:     1,
+		NudgeAgent: &config.Agent{Name: "polecat", Dir: "repo-a"},
+	}
+	receipt := &slingDeployReceipt{
+		RequestID:   "nudge-1",
+		Target:      "repo-a/polecat-2",
+		SessionID:   "gc-session-2",
+		SessionName: "repo-a__polecat-2",
+		Reference:   nudgeReference{Kind: "bead", ID: "repo-a-1"},
+		Queued:      true,
+		Outcome:     "queued",
+	}
+	var stdout, stderr bytes.Buffer
+	if code := writeSlingJSONResult(result, receipt, "", &stdout, &stderr); code != 0 {
+		t.Fatalf("writeSlingJSONResult = %d, stderr=%s", code, stderr.String())
+	}
+	var got slingJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if got.Deployment == nil || got.Deployment.RequestID != receipt.RequestID || got.Deployment.Outcome != "queued" || !got.Queued {
+		t.Fatalf("payload = %+v, want queued deployment receipt", got)
+	}
+}
+
 func TestDoSlingBeadToFixedAgent(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
@@ -1041,6 +1071,9 @@ func TestDoSlingNudgeFixedAgent(t *testing.T) {
 	if pending[0].Source != "sling" {
 		t.Fatalf("source = %q, want sling", pending[0].Source)
 	}
+	if pending[0].Reference == nil || pending[0].Reference.Kind != "bead" || pending[0].Reference.ID != "BL-1" {
+		t.Fatalf("reference = %+v, want bead BL-1", pending[0].Reference)
+	}
 	if !strings.Contains(stdout.String(), "Queued nudge for mayor") {
 		t.Errorf("stdout = %q, want queue confirmation", stdout.String())
 	}
@@ -1086,8 +1119,8 @@ func TestDoSlingNudgeSuspended(t *testing.T) {
 	opts.Force = true
 	code := doSling(opts, deps, nil, stdout, stderr)
 
-	if code != 0 {
-		t.Fatalf("doSling returned %d, want 0", code)
+	if code != 1 {
+		t.Fatalf("doSling returned %d, want 1 because suspended work was not deployed", code)
 	}
 	if !strings.Contains(stderr.String(), "cannot nudge") {
 		t.Errorf("stderr = %q, want 'cannot nudge: suspended' warning", stderr.String())
@@ -1231,7 +1264,7 @@ func TestDoSlingNudgePoolBeadDerivedSession(t *testing.T) {
 	startNudgePoller = func(_, _, _ string) error { return nil }
 	t.Cleanup(func() { startNudgePoller = prev })
 
-	doSlingNudge(&a, deps.CityName, deps.CityPath, cfg, sp, deps.Store, stdout, stderr)
+	_, _ = doSlingNudge(&a, deps.CityName, deps.CityPath, cfg, sp, deps.Store, "BL-1", stdout, stderr)
 	if strings.Contains(stdout.String(), "No running sessions") || strings.Contains(stderr.String(), "poke failed") {
 		t.Fatalf("sling nudge missed live bead-derived pool session; stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
@@ -1299,7 +1332,7 @@ func TestDoSlingNudgePoolUsesCityStoreForSessionBeads(t *testing.T) {
 	startNudgePoller = func(_, _, _ string) error { return nil }
 	t.Cleanup(func() { startNudgePoller = prevPoller })
 
-	doSlingNudge(&a, deps.CityName, deps.CityPath, cfg, sp, deps.Store, stdout, stderr)
+	_, _ = doSlingNudge(&a, deps.CityName, deps.CityPath, cfg, sp, deps.Store, "BL-1", stdout, stderr)
 	if strings.Contains(stdout.String(), "No running sessions") || strings.Contains(stderr.String(), "poke failed") {
 		t.Fatalf("sling nudge missed live city-store pool session; stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}

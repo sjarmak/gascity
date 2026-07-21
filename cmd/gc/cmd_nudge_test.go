@@ -47,6 +47,59 @@ type providerMissNudgeProvider struct {
 	*runtime.Fake
 }
 
+type enqueueObservingNudgeProvider struct {
+	*runtime.Fake
+	cityPath string
+	queued   queuedNudge
+}
+
+func (p *enqueueObservingNudgeProvider) NudgeNow(name string, content []runtime.ContentBlock) error {
+	state, err := nudgequeue.LoadState(p.cityPath)
+	if err == nil && len(state.InFlight) == 1 {
+		p.queued = state.InFlight[0]
+	}
+	return p.Fake.NudgeNow(name, content)
+}
+
+type corruptingProviderMissNudgeProvider struct {
+	*runtime.Fake
+	cityPath string
+}
+
+func (p *corruptingProviderMissNudgeProvider) NudgeNow(name string, content []runtime.ContentBlock) error {
+	_ = p.Fake.NudgeNow(name, content)
+	if err := os.WriteFile(nudgequeue.StatePath(p.cityPath), []byte("{not-valid-json"), 0o644); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: provider does not own %q", runtime.ErrSessionNotFound, name)
+}
+
+type terminalFailingNudgeProvider struct {
+	*runtime.Fake
+	cityPath string
+	store    *failingTerminalNudgeStore
+}
+
+func (p *terminalFailingNudgeProvider) NudgeNow(name string, content []runtime.ContentBlock) error {
+	state, err := nudgequeue.LoadState(p.cityPath)
+	if err == nil && len(state.InFlight) == 1 {
+		p.store.failID = state.InFlight[0].BeadID
+	}
+	return p.Fake.NudgeNow(name, content)
+}
+
+type queueWriteFailingNudgeProvider struct {
+	*runtime.Fake
+	cityPath string
+}
+
+func (p *queueWriteFailingNudgeProvider) NudgeNow(name string, content []runtime.ContentBlock) error {
+	if err := os.Chmod(filepath.Dir(nudgequeue.StatePath(p.cityPath)), 0o555); err != nil {
+		return err
+	}
+	return p.Fake.NudgeNow(name, content)
+}
+
 type activitylessTimedOnlyNudgeProvider struct {
 	*runtime.Fake
 }
@@ -3135,7 +3188,7 @@ func TestDeliverSlingNudgeWaitIdleWrapsInSystemReminder(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	deliverSlingNudge(target, fake, store, dir, &stdout, &stderr)
+	_, _ = deliverSlingNudge(target, fake, store, dir, "gc-work", &stdout, &stderr)
 
 	var nudgeNowCalls int
 	var delivered string
@@ -3155,6 +3208,261 @@ func TestDeliverSlingNudgeWaitIdleWrapsInSystemReminder(t *testing.T) {
 		t.Fatalf("delivered message = %q, want sling reminder content", delivered)
 	}
 	assertSessionLastNudgeDeliveredAtStamped(t, store, info.ID)
+}
+
+func TestDeliverSlingNudgePersistsReferencedRequestBeforeImmediateDelivery(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	provider := &enqueueObservingNudgeProvider{Fake: runtime.NewFake(), cityPath: dir}
+
+	mgr := newSessionManagerWithConfig(dir, store, provider, nil)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "worker", Title: "Worker", Command: "claude", WorkDir: dir, Provider: "claude", Env: nil, Resume: session.ProviderResume{}, Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	provider.WaitForIdleErrors[info.SessionName] = nil
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker"},
+		resolved:    &config.ResolvedProvider{Name: "claude"},
+		sessionID:   info.ID,
+		sessionName: info.SessionName,
+	}
+
+	var stdout, stderr bytes.Buffer
+	receipt, err := deliverSlingNudge(target, provider, store, dir, "gc-work", &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("deliverSlingNudge: %v", err)
+	}
+	if provider.queued.ID == "" || provider.queued.LeaseUntil.IsZero() {
+		t.Fatal("provider observed no durably claimed request before delivery")
+	}
+	if provider.queued.Source != "sling" || provider.queued.Reference == nil || provider.queued.Reference.Kind != "bead" || provider.queued.Reference.ID != "gc-work" {
+		t.Fatalf("queued request = %+v, want sling bead reference gc-work", provider.queued)
+	}
+	if receipt.RequestID != provider.queued.ID || receipt.Outcome != "delivered" || receipt.Queued {
+		t.Fatalf("receipt = %+v, want matching delivered receipt", receipt)
+	}
+	state, err := nudgequeue.LoadState(dir)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(state.Pending) != 0 || len(state.InFlight) != 0 {
+		t.Fatalf("queue after delivery = %+v, want no live request", state)
+	}
+}
+
+func TestDeliverSlingNudgeReleasesClaimWhenImmediateProviderDeclines(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	provider := &providerMissNudgeProvider{Fake: runtime.NewFake()}
+
+	mgr := newSessionManagerWithConfig(dir, store, provider, nil)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "worker", Title: "Worker", Command: "claude", WorkDir: dir, Provider: "claude", Env: nil, Resume: session.ProviderResume{}, Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	provider.WaitForIdleErrors[info.SessionName] = nil
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker"},
+		resolved:    &config.ResolvedProvider{Name: "claude"},
+		sessionID:   info.ID,
+		sessionName: info.SessionName,
+	}
+	prevPoller := startNudgePoller
+	startNudgePoller = func(_, _, _ string) error { return nil }
+	t.Cleanup(func() { startNudgePoller = prevPoller })
+
+	var stdout, stderr bytes.Buffer
+	receipt, err := deliverSlingNudge(target, provider, store, dir, "gc-work", &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("deliverSlingNudge: %v", err)
+	}
+	if !receipt.Queued || receipt.Outcome != "queued" {
+		t.Fatalf("receipt = %+v, want queued fallback", receipt)
+	}
+	state, err := nudgequeue.LoadState(dir)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(state.Pending) != 1 || state.Pending[0].ID != receipt.RequestID || len(state.InFlight) != 0 {
+		t.Fatalf("queue after provider decline = %+v, want released pending request %s", state, receipt.RequestID)
+	}
+}
+
+func TestDeliverSlingNudgeQueueFailureSkipsProviderDelivery(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	writeCorruptNudgeQueueState(t, dir)
+	provider := runtime.NewFake()
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker"},
+		resolved:    &config.ResolvedProvider{Name: "claude"},
+		sessionID:   "gc-worker",
+		sessionName: "worker-session",
+	}
+
+	var stdout, stderr bytes.Buffer
+	_, err := deliverSlingNudge(target, provider, beads.NewMemStore(), dir, "gc-work", &stdout, &stderr)
+	if err == nil {
+		t.Fatal("deliverSlingNudge error = nil, want durable enqueue failure")
+	}
+	for _, call := range provider.Calls {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
+			t.Fatalf("provider delivery occurred before durable enqueue: %+v", provider.Calls)
+		}
+	}
+}
+
+func TestDeliverSlingNudgeReleaseFailureDoesNotReportQueuedSuccess(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	provider := &corruptingProviderMissNudgeProvider{Fake: runtime.NewFake(), cityPath: dir}
+
+	mgr := newSessionManagerWithConfig(dir, store, provider, nil)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "worker", Title: "Worker", Command: "claude", WorkDir: dir, Provider: "claude", Env: nil, Resume: session.ProviderResume{}, Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	provider.WaitForIdleErrors[info.SessionName] = nil
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker"},
+		resolved:    &config.ResolvedProvider{Name: "claude"},
+		sessionID:   info.ID,
+		sessionName: info.SessionName,
+	}
+
+	var stdout, stderr bytes.Buffer
+	receipt, err := deliverSlingNudge(target, provider, store, dir, "gc-work", &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("deliverSlingNudge = %+v, nil; want release failure", receipt)
+	}
+	if !strings.Contains(err.Error(), "releasing declined deploy request") {
+		t.Fatalf("error = %v, want release failure context", err)
+	}
+}
+
+func TestDeliverSlingNudgeShadowFailureCannotLeaveRetryableDuplicate(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	backing := &failingTerminalNudgeStore{MemStore: beads.NewMemStore()}
+	store := beads.NudgesStore{Store: backing}
+	provider := &terminalFailingNudgeProvider{Fake: runtime.NewFake(), cityPath: dir, store: backing}
+
+	mgr := newSessionManagerWithConfig(dir, store, provider, nil)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "worker", Title: "Worker", Command: "claude", WorkDir: dir, Provider: "claude", Env: nil, Resume: session.ProviderResume{}, Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	provider.WaitForIdleErrors[info.SessionName] = nil
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker"},
+		resolved:    &config.ResolvedProvider{Name: "claude"},
+		sessionID:   info.ID,
+		sessionName: info.SessionName,
+	}
+
+	var stdout, stderr bytes.Buffer
+	_, err = deliverSlingNudge(target, provider, store, dir, "gc-work", &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "dolt connection refused") {
+		t.Fatalf("deliverSlingNudge error = %v, want observable shadow failure", err)
+	}
+	state, loadErr := nudgequeue.LoadState(dir)
+	if loadErr != nil {
+		t.Fatalf("LoadState: %v", loadErr)
+	}
+	if len(state.Pending) != 0 || len(state.InFlight) != 0 {
+		t.Fatalf("queue after delivered shadow failure = %+v, want no retryable request", state)
+	}
+}
+
+func TestDeliveredSlingNudgeStateWriteFailureRecoversFromTerminalShadow(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	backing := beads.NewMemStore()
+	store := beads.NudgesStore{Store: backing}
+	prevOpen := openNudgeBeadStore
+	openNudgeBeadStore = func(string) beads.NudgesStore { return store }
+	t.Cleanup(func() { openNudgeBeadStore = prevOpen })
+	provider := &queueWriteFailingNudgeProvider{Fake: runtime.NewFake(), cityPath: dir}
+
+	mgr := newSessionManagerWithConfig(dir, store, provider, nil)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "worker", Title: "Worker", Command: "claude", WorkDir: dir, Provider: "claude", Env: nil, Resume: session.ProviderResume{}, Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	provider.WaitForIdleErrors[info.SessionName] = nil
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker"},
+		resolved:    &config.ResolvedProvider{Name: "claude"},
+		sessionID:   info.ID,
+		sessionName: info.SessionName,
+	}
+
+	var stdout, stderr bytes.Buffer
+	_, err = deliverSlingNudge(target, provider, store, dir, "gc-work", &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "write nudge queue") {
+		t.Fatalf("deliverSlingNudge error = %v, want authoritative state write failure", err)
+	}
+	queueDir := filepath.Dir(nudgequeue.StatePath(dir))
+	if chmodErr := os.Chmod(queueDir, 0o755); chmodErr != nil {
+		t.Fatalf("restore queue dir mode: %v", chmodErr)
+	}
+	state, loadErr := nudgequeue.LoadState(dir)
+	if loadErr != nil {
+		t.Fatalf("LoadState before recovery: %v", loadErr)
+	}
+	if len(state.InFlight) != 1 {
+		t.Fatalf("queue before recovery = %+v, want persisted in-flight request", state)
+	}
+	pending, inFlight, _, listErr := listQueuedNudges(dir, "worker", time.Now().Add(defaultQueuedNudgeClaimTTL+time.Second))
+	if listErr != nil {
+		t.Fatalf("listQueuedNudges recovery: %v", listErr)
+	}
+	if len(pending) != 0 || len(inFlight) != 0 {
+		t.Fatalf("queue after terminal-shadow recovery = pending:%+v in-flight:%+v", pending, inFlight)
+	}
 }
 
 func TestDeliverSlingNudgeQueuesFencedReminderAndStartsPollerForAsleepSession(t *testing.T) {
@@ -3186,7 +3494,7 @@ func TestDeliverSlingNudgeQueuesFencedReminderAndStartsPollerForAsleepSession(t 
 	t.Cleanup(func() { startNudgePoller = prev })
 
 	var stdout, stderr bytes.Buffer
-	deliverSlingNudge(target, fake, store, dir, &stdout, &stderr)
+	_, _ = deliverSlingNudge(target, fake, store, dir, "gc-work", &stdout, &stderr)
 
 	pending, inFlight, dead, err := listQueuedNudges(dir, target.agent.QualifiedName(), time.Now())
 	if err != nil {
@@ -4364,6 +4672,68 @@ func TestEnqueueSupersedes_SameAgentSourceReference(t *testing.T) {
 		if got := b.TerminalReason; got != "superseded" {
 			t.Fatalf("superseded shadow terminal_reason = %q, want \"superseded\"", got)
 		}
+	}
+}
+
+func TestEnqueueSupersedesSlingRequestBySourceAndReferenceAcrossTargets(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	now := time.Now()
+	reference := &nudgeReference{Kind: "bead", ID: "gc-work"}
+	first := newQueuedNudgeWithOptions("rig/worker-1", "first", "sling", now, queuedNudgeOptions{
+		ID:        "n-first-target",
+		Reference: reference,
+	})
+	second := newQueuedNudgeWithOptions("rig/worker-2", "second", "sling", now.Add(time.Second), queuedNudgeOptions{
+		ID:        "n-second-target",
+		Reference: reference,
+	})
+	if err := enqueueQueuedNudge(dir, first); err != nil {
+		t.Fatalf("enqueue first: %v", err)
+	}
+	if err := enqueueQueuedNudge(dir, second); err != nil {
+		t.Fatalf("enqueue second: %v", err)
+	}
+	state, err := nudgequeue.LoadState(dir)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(state.Pending) != 1 || state.Pending[0].ID != second.ID {
+		t.Fatalf("pending = %+v, want only replacement request", state.Pending)
+	}
+	if len(state.Dead) != 1 || state.Dead[0].ID != first.ID || state.Dead[0].LastError != "superseded" {
+		t.Fatalf("dead = %+v, want superseded first request", state.Dead)
+	}
+}
+
+func TestEnqueuePreservesNonSlingRequestsForDifferentTargets(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	now := time.Now()
+	reference := &nudgeReference{Kind: "bead", ID: "gc-work"}
+	first := newQueuedNudgeWithOptions("rig/worker-1", "first", "session", now, queuedNudgeOptions{
+		ID:        "n-first-target",
+		Reference: reference,
+	})
+	second := newQueuedNudgeWithOptions("rig/worker-2", "second", "session", now.Add(time.Second), queuedNudgeOptions{
+		ID:        "n-second-target",
+		Reference: reference,
+	})
+	if err := enqueueQueuedNudge(dir, first); err != nil {
+		t.Fatalf("enqueue first: %v", err)
+	}
+	if err := enqueueQueuedNudge(dir, second); err != nil {
+		t.Fatalf("enqueue second: %v", err)
+	}
+	state, err := nudgequeue.LoadState(dir)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(state.Pending) != 2 {
+		t.Fatalf("pending = %+v, want both target-scoped requests", state.Pending)
+	}
+	if len(state.Dead) != 0 {
+		t.Fatalf("dead = %+v, want no cross-target supersession", state.Dead)
 	}
 }
 
