@@ -29,3 +29,6 @@ gc-*-or-independent-*/
 
 # Reports are regenerated; keep the dir, ignore bulk
 .gc-reports/*.tmp
+
+# macOS Finder droppings (synced over from the Mac)
+.DS_Store
