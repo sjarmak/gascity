@@ -825,6 +825,19 @@ enabled = false
 name = "vault-status-mirror"
 enabled = false
 
+# Retired 2026-07-21 (order-layer consolidation, city audit sec 3 + epic
+# gc-28w2): zero detections since 2026-05-25 — state file
+# .gc/runtime/packs/maintenance/spawn-storm-counts.json is `{}` with a
+# creation-date mtime. The local orders/spawn-storm-detect.toml was renamed
+# .toml.disabled, but the name is ALSO defined by the embedded core pack
+# (gc cache internal/bootstrap/packs/core), which kept firing every ~5m;
+# this override is what actually silences it. Remove the override AND
+# restore the local .toml if reset-to-pool crash-loops recur without
+# reaper coverage (orphaned-molecule-reaper + 07-21 stuck-state sweeper).
+[[orders.overrides]]
+name = "spawn-storm-detect"
+enabled = false
+
 [api]
 port = 9443
 bind = "127.0.0.1"

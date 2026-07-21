@@ -1,0 +1,18 @@
+# RETIRED 2026-07-21 (order-layer consolidation, city audit sec 3 + epic gc-28w2).
+# Evidence: cooldown 5m since 2026-05-25 (~12 fires/hour, 8 weeks); state file
+# .gc/runtime/packs/maintenance/spawn-storm-counts.json is `{}` with an mtime
+# of its creation date (2026-05-25 21:21) — ZERO detections ever. The pool-wedge
+# class it watched for is now covered by the reaper suite (orphaned-molecule-reaper
+# + the 07-21 stuck-state sweeper, commit 157a332).
+# Undo: rename back to .toml if bead reset-to-pool crash-loops recur without
+# reaper coverage; scripts/gastown-maintenance/spawn-storm-detect.sh is retained.
+# Adopted from gastownhall/gascity examples/gastown/packs/maintenance/orders/spawn-storm-detect.toml (2026-05-25).
+# Detects beads stuck in a recovery loop (polecat crash-loop indicator).
+# Counts bead.updated events with the "reset to pool" signature; escalates
+# to mayor via mail when a single bead exceeds the threshold (default 2).
+# State file at .gc/runtime/packs/maintenance/spawn-storm-counts.json.
+[order]
+description = "Detect beads repeatedly bouncing back to pool (spawn storm)"
+trigger = "cooldown"
+interval = "5m"
+exec = "/home/ds/gas-city/scripts/gastown-maintenance/spawn-storm-detect.sh"

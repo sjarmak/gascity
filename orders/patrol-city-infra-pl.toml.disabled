@@ -1,0 +1,26 @@
+# RETIRED 2026-07-21 (order-layer consolidation, city audit sec 2.1 + epic gc-28w2).
+# Evidence: this order is a bare 15m `gc session nudge` with no payload.
+# mechanic-cycle.toml's own header records that bare nudges are unreliable
+# (hang intermittently, "must NOT be the kick mechanism" per the overnight
+# directive) and that mechanic-cycle fires on its own cadence with a
+# self-contained priority-ranked payload, doing real work even when the
+# patrol nudge is a no-op. Note: that header calls the two "complementary"
+# (patrol = liveness ping), not "superseded" as the 07-21 audit paraphrased;
+# retirement stands because the liveness-ping role rides the exact mechanism
+# the directive rejects, and mechanic-cycle covers the queue without it.
+# Undo: rename back to .toml if city-infra-pl liveness needs an independent
+# ping that mechanic-cycle's 20m payload tick does not provide;
+# bin/nudge-city-infra-pl.sh is retained on disk.
+# patrol-city-infra-pl — periodic triage/work tick for the city-infra mechanic PL.
+#
+# The pack's patrol-project-leads order only nudges sessions whose template is
+# "oversight-rig.project-lead"; the city-infra-pl is a city-scoped agent with a
+# different template, so it needs its own tick. Pure plumbing: the script just
+# nudges the active city-infra-pl session — all judgment stays with the PL.
+
+[order]
+description = "Every 15m: nudge the city-infra-pl to triage city-infra health and work ready in-place city-root beads."
+trigger = "cooldown"
+interval = "15m"
+exec = "/home/ds/gas-city/bin/nudge-city-infra-pl.sh"
+timeout = "2m"

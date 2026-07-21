@@ -1,6 +1,0 @@
-[order]
-description = "Every 2m: detect PL sessions wedged on Claude API 529 Overloaded errors and auto-reset them. Scans `gc session peek` output for the 529 error text + idle prompt + no thinking-spinner; requires two-scan confirmation (≥90s) so Claude Code's transient retry path has time to succeed; per-session cooldown of 10m. Mayor is excluded from the reset scope. Mails mayor on every action."
-trigger = "cron"
-schedule = "*/2 * * * *"
-exec = "/home/ds/gas-city/bin/pl-529-recovery"
-timeout = "2m"

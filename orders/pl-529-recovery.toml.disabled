@@ -1,0 +1,16 @@
+# RETIRED 2026-07-21 (order-layer consolidation, city audit sec 3 + epic gc-28w2).
+# Evidence: cron */2 since 2026-05-20 (~40,000 scans of every PL session);
+# state file /home/ds/.gc/pl-529-recovery-state.json is `{}` as of 2026-07-21
+# 08:00 — ZERO detections in 2 months. The scan cost (session peek fan-out
+# every 2m) was part of the ~850 execs/hour that starved the floor.
+# The 529-signature matcher survives as a SURFACE-ONLY classifier inside
+# bin/polecat-ui-stuck-scanner (no kill/reset authority; see that script).
+# Undo: rename back to .toml if 529-wedge resets are ever needed again AND
+# the surface-only classifier in polecat-ui-stuck-scanner proves insufficient;
+# bin/pl-529-recovery is retained on disk.
+[order]
+description = "Every 2m: detect PL sessions wedged on Claude API 529 Overloaded errors and auto-reset them. Scans `gc session peek` output for the 529 error text + idle prompt + no thinking-spinner; requires two-scan confirmation (≥90s) so Claude Code's transient retry path has time to succeed; per-session cooldown of 10m. Mayor is excluded from the reset scope. Mails mayor on every action."
+trigger = "cron"
+schedule = "*/2 * * * *"
+exec = "/home/ds/gas-city/bin/pl-529-recovery"
+timeout = "2m"

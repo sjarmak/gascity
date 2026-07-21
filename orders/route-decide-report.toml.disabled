@@ -1,3 +1,10 @@
+# RETIRED 2026-07-21 (order-layer consolidation, city audit sec 3 + epic gc-28w2).
+# Evidence: weekly cron since 2026-05-28; NEVER produced an artifact
+# (ls /home/ds/.gc/routing-report-* -> no matches, 2026-07-21). The FCTR
+# Phase-2 consumer it measured for never shipped; Phase 1 was measure-only.
+# Undo: rename back to .toml if the FCTR Phase-2 routing consumer ships and
+# the ship gate (stamped Haiku share >= 25%) needs measuring again;
+# bin/route-decide-report is retained on disk.
 # Weekly routing-decision distribution report.
 #
 # Aggregates routing.* metadata stamped by the Formula-Compile-Time
