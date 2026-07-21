@@ -14,6 +14,21 @@ that have been parked for at least STUCK_THRESHOLD_SEC seconds.
 Detection is mechanical pattern-matching against a fixed marker list — no
 semantic judgment. Every action is logged + mayor is mailed.
 
+2026-07-21 (order-layer consolidation, city audit sec 2.1 + epic gc-28w2):
+  - The wedged-dispatcher pass (DISPATCHER_STALE_SEC + kill) was DELETED:
+    that signal is owned by dispatcher-liveness-sensor (detector) +
+    dispatcher-watchdog (kill actuator, idle>=5h OR conversion-stall) — the
+    scanner's 6h-idle kill was a redundant third threshold for the same
+    condition. Undo: restore from this commit's parent in git.
+  - A 529-wedge classifier was folded IN from the retired pl-529-recovery
+    order (its own state file was {} after ~40k scans, but the signature is
+    real; see orders/pl-529-recovery.toml.disabled). SURFACE-ONLY: it mails
+    the mayor with the reset command — unlike the original, it has NO
+    kill/reset authority. It rides the existing shared peek fan-out, so it
+    adds zero peeks. Two-scan confirm is preserved by alerting from the 2nd
+    consecutive sighting (Claude Code's transient 529-retry path gets a full
+    scan interval to recover, >= the original 90s confirm gap).
+
 Env:
   STUCK_THRESHOLD_SEC    auto-reset cutoff in seconds (default 600 = 10m)
   POLECAT_POOLS_CSV      comma-separated pool template paths to scan
@@ -104,11 +119,21 @@ AUTH_WEDGE_MAX_PEEKS = int(os.environ.get("AUTH_WEDGE_MAX_PEEKS", "40"))
 # serial latency: ~11s/peek under load makes serial peeking blow the 2m order
 # timeout, which is exactly what happened for 2+ days before 2026-07-19.
 AUTH_WEDGE_PEEK_WORKERS = int(os.environ.get("AUTH_WEDGE_PEEK_WORKERS", "6"))
-# A control-dispatcher reads `active` (runtime alive) but processes routed-bead
-# nudges; if it sits idle past this it is wedged (a healthy dispatcher acts
-# promptly or goes asleep) and routed-bead-nudger hammers it forever while its
-# pool work strands. High threshold (6h) keeps transient idleness from flagging.
-DISPATCHER_STALE_SEC = int(os.environ.get("DISPATCHER_STALE_SEC", "21600"))
+# 529-wedge fingerprint (ported from bin/pl-529-recovery 2026-07-21): Claude
+# API can return 529 Overloaded during peak load; Claude Code retries ~2-3
+# times, and if all retries fail the final assistant turn is the literal error
+# message and the REPL sits idle at the prompt — reading `active` while
+# silently dropping every inbound. All three must hold: the error text is
+# present, the tail shows an idle `❯` prompt, and no ACTIVE thinking spinner
+# (the `·` separator inside the trailing parenthesized expression like
+# `✻ Mustering… (3m 5s · ↓ 9.1k tokens)`; post-completion `✻ Worked for ...`
+# lines must NOT count as thinking — that is exactly the wedged fingerprint).
+E529_ERROR_TEXT = "API Error: 529 Overloaded"
+E529_IDLE_PROMPT_RE = re.compile(r"^❯ *$", re.MULTILINE)
+E529_THINKING_RE = re.compile(r"^[✻*✶✷⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] .*\([^)]*·", re.MULTILINE)
+# Alert from the SECOND consecutive sighting (two-scan confirm): scan 1 is
+# log-only so the transient-retry path has a full scan interval to succeed.
+E529_ALERT_COUNTS = (2, 4, 16, 64)
 # Level-triggered dedup state (dr-phcu). The old scheme was keyed by session-id
 # only and merely rate-limited (re-mail every 4h FOREVER while stuck) — a
 # week-long wedge produced ~40 identical mails; across sessions, a 474-alert
@@ -323,12 +348,14 @@ def _save_state(entries: dict) -> None:
         log_line({"event": "state-save-failed", "error": str(e)[:200]})
 
 
-def observe_key(entries: dict, key: str, signature: str, state_error: bool = False) -> tuple[bool, dict]:
+def observe_key(entries: dict, key: str, signature: str, state_error: bool = False,
+                alert_counts: tuple = ESCALATION_ALERT_COUNTS) -> tuple[bool, dict]:
     """Record 'this signature is present this scan'; return (should_alert, entry).
 
-    Alerts fire at ESCALATION_ALERT_COUNTS then never again for this episode
-    (log-only) until the key resolves. state_error=True forces should_alert:
-    a broken state file must flood (the old behavior), never suppress.
+    Alerts fire at alert_counts (default ESCALATION_ALERT_COUNTS) then never
+    again for this episode (log-only) until the key resolves. state_error=True
+    forces should_alert: a broken state file must flood (the old behavior),
+    never suppress.
     """
     now = now_iso()
     prior = entries.get(key)
@@ -338,7 +365,7 @@ def observe_key(entries: dict, key: str, signature: str, state_error: bool = Fal
     else:
         entry = {"first_seen": now, "last_seen": now, "count": 1,
                  "alerts_sent": 0, "sig": signature}
-    should_alert = state_error or entry["count"] in ESCALATION_ALERT_COUNTS
+    should_alert = state_error or entry["count"] in alert_counts
     if should_alert:
         entry["alerts_sent"] = int(entry.get("alerts_sent", 0)) + 1
     entries[key] = entry
@@ -356,23 +383,17 @@ def episode_line(entry: dict) -> str:
     )
 
 
-def filter_stale_dispatchers(active: list[dict]) -> list[dict]:
-    """Active control-dispatcher sessions idle past DISPATCHER_STALE_SEC.
-
-    These are wedged: alive but not converting routed-bead nudges. The id check
-    spans alias/name/target/template since the dispatcher handle varies by wire."""
-    out = []
-    for s in active:
-        ident = " ".join(
-            str(s.get(k) or "") for k in ("alias", "name", "target", "template")
-        )
-        if "control-dispatcher" not in ident:
-            continue
-        age = parse_age_seconds(s.get("last_active") or s.get("activity_age") or "-")
-        if age < DISPATCHER_STALE_SEC:
-            continue
-        out.append({**s, "_age_sec": age, "_ident": ident.strip()})
-    return out
+def is_529_stuck(peek_output: str) -> bool:
+    """The 529-wedged fingerprint (ported from bin/pl-529-recovery): error
+    text present, idle prompt at the tail, no ACTIVE thinking spinner."""
+    if E529_ERROR_TEXT not in peek_output:
+        return False
+    tail = "\n".join(peek_output.splitlines()[-15:])
+    if E529_THINKING_RE.search(tail):
+        return False
+    if not E529_IDLE_PROMPT_RE.search(tail):
+        return False
+    return True
 
 
 def nudge_session(session_id: str) -> tuple[bool, str]:
@@ -391,21 +412,6 @@ def nudge_session(session_id: str) -> tuple[bool, str]:
 def reset_session(session_id: str) -> tuple[bool, str]:
     result = subprocess.run(
         ["gc", "session", "reset", session_id],
-        capture_output=True, text=True, timeout=30,
-    )
-    return result.returncode == 0, (result.stdout + result.stderr).strip()
-
-
-def kill_session(session_id: str) -> tuple[bool, str]:
-    """Kill a session — the ONLY recovery that clears a wedged dispatcher.
-
-    A wedged control-dispatcher trips the named-session circuit breaker, so
-    `gc session reset`/`wake` SILENTLY NO-OP (the recurring band-aid that never
-    stuck). Only `gc session kill` clears the breaker; the supervisor then
-    respawns the dispatcher fresh. Used for the wedged-dispatcher pass only.
-    """
-    result = subprocess.run(
-        ["gc", "session", "kill", session_id],
         capture_output=True, text=True, timeout=30,
     )
     return result.returncode == 0, (result.stdout + result.stderr).strip()
@@ -474,7 +480,6 @@ def main() -> int:
     # state save, no dedup, no resolution.
     all_list = fetch_active_sessions()
     ui_list = filter_pool_sessions(all_list) if all_list is not None else None
-    disp_list = filter_stale_dispatchers(all_list) if all_list is not None else None
     auth_candidates = [
         s for s in all_list or []
         if parse_age_seconds(s.get("last_active") or s.get("activity_age") or "-")
@@ -582,39 +587,33 @@ def main() -> int:
                        f"nudge ({'ok' if ok else 'failed'}) — surface-only, no reset",
                        entry)
         actioned += 1
-    # Wedged-dispatcher pass. A nudge won't help (the dispatcher is ALREADY
-    # being over-nudged by routed-bead-nudger — that's the symptom) and a reset
-    # NO-OPs (the wedge trips the named-session circuit breaker). The only
-    # recovery that works is `gc session kill` (clears the breaker -> supervisor
-    # respawns fresh). Every item here came from filter_stale_dispatchers(), which
-    # already matched the control-dispatcher CLASS ("control-dispatcher" in
-    # ident) — so this pass auto-kills its own class even when the global
-    # AUTO_RESET flag is off (mirrors the ui-modal `selector_hit or AUTO_RESET`
-    # gate). A dispatcher kill is cheap (a fresh respawn, no work lost).
+    # 529-wedge pass (ported from the retired pl-529-recovery order,
+    # 2026-07-21). SURFACE-ONLY by design: the original auto-reset PLs; this
+    # classifier has NO kill/reset authority — the mayor gets the fingerprint
+    # and the exact reset command and decides. Rides the shared peek fan-out:
+    # a 529-wedged session sits idle at the prompt, so its last_active goes
+    # stale and it lands in the auth-candidate peek set; zero extra peeks.
     # Persist dedup progress between passes: alerts have already gone out, so
     # their counts must survive even if a later pass hits the order timeout.
     if not DRY_RUN:
         _save_state(entries)
-    dispatchers_seen = 0
-    for d in disp_list or []:
-        dispatchers_seen += 1
-        sid = d.get("id") or ""
-        target = (
-            d.get("alias") or d.get("name") or d.get("target")
-            or d.get("template") or d["_ident"]
-        )
-        age_sec = d["_age_sec"]
-        reason = (
-            f"wedged dispatcher: active but idle {age_sec // 3600}h — routed-bead "
-            f"nudges are looping unconverted (its pool work is stranding)"
-        )
-        key = state_key("disp", sid, "wedged-dispatcher")
+    e529_seen = 0
+    sessions_by_id = {s.get("id") or "": s for s in all_list or []}
+    for sid, peek in peeks.items():
+        if not peek or not is_529_stuck(peek):
+            continue
+        e529_seen += 1
+        s = sessions_by_id.get(sid, {})
+        target = s.get("target") or s.get("template") or sid
+        age_sec = parse_age_seconds(s.get("last_active") or s.get("activity_age") or "-")
+        reason = "529-wedge: final turn is the 529 error, REPL idle at prompt (retries exhausted)"
+        key = state_key("e529", sid, "529-overloaded")
         observed.add(key)
-        should_alert, entry = observe_key(entries, key, "wedged-dispatcher", state_error)
+        should_alert, entry = observe_key(entries, key, "529-overloaded",
+                                          state_error, E529_ALERT_COUNTS)
         log_line({
-            "event": "stuck-dispatcher-detected",
-            "session_id": sid, "target": target, "age_sec": age_sec,
-            "count": entry["count"], "alert": should_alert,
+            "event": "529-wedge-detected", "session_id": sid, "target": target,
+            "age_sec": age_sec, "count": entry["count"], "alert": should_alert,
         })
         if DRY_RUN:
             log_line({"event": "would-alert" if should_alert else "dedup-suppressed",
@@ -623,33 +622,20 @@ def main() -> int:
                 actioned += 1
             continue
         if not should_alert:
+            # count==1 is the two-scan confirm window (transient retry may
+            # still land); later suppressions are the escalation schedule.
             log_line({"event": "dedup-suppressed", "session_id": sid,
                       "key": key, "count": entry["count"]})
             continue
-        # The control-dispatcher class auto-acts on its own (it is the specific
-        # wedge this scanner exists to heal); honor the global AUTO_RESET too.
-        is_wedged_dispatcher = "control-dispatcher" in (d.get("_ident") or "")
-        if is_wedged_dispatcher or AUTO_RESET:
-            ok, msg = kill_session(sid)
-            log_line({
-                "event": "kill" if ok else "kill-failed",
-                "session_id": sid, "ok": ok, "msg": msg[:200],
-                "trigger": "wedged-dispatcher" if is_wedged_dispatcher else "auto_reset",
-            })
-            mail_mayor(
-                sid, target, reason, age_sec,
-                f"kill ({'ok' if ok else 'failed'}) — wedge trips the circuit "
-                "breaker so reset/wake no-op; kill clears it and the supervisor "
-                "respawns the dispatcher fresh",
-                entry,
-            )
-        else:
-            mail_mayor(
-                sid, target, reason, age_sec,
-                "surface-only (no kill) — mayor: verify the pool has routed/open "
-                "work, then `gc session kill` the dispatcher if wedged",
-                entry,
-            )
+        mail_mayor(
+            sid, target, reason, age_sec,
+            f"surface-only (no reset) — 529-WEDGE: the session's last turn is "
+            f"the literal 529 error and the REPL sits idle, silently dropping "
+            f"every inbound. Confirmed across >=2 scans (transient-retry window "
+            f"passed). FIX: `gc session reset {sid}` — fresh REPL exec, resume "
+            f"picks up from the transcript. Skip if the session is mid-recovery.",
+            entry,
+        )
         actioned += 1
 
     # Auth-wedge pass. Scans EVERY active session (not just pools) for the OAuth
@@ -730,18 +716,32 @@ def main() -> int:
                 del entries[key]
                 continue
             pass_name, sid, _sig = (key.split("|", 2) + ["", ""])[:3]
+            if pass_name == "disp":
+                # Pass retired 2026-07-21 (dispatcher-liveness-sensor +
+                # dispatcher-watchdog own the signal). Drop legacy keys
+                # log-only — no resolved mail for a pass that no longer scans.
+                log_line({"event": "state-pruned", "key": key, "why": "pass-retired"})
+                del entries[key]
+                continue
             if pass_name == "ui":
                 resolved = ui_list is not None and (
                     sid not in ui_sids or sid in ui_clear or sid in ui_examined
                 )
-            elif pass_name == "disp":
-                # filter_stale_dispatchers() returns the whole wedged set, so a
-                # tracked dispatcher absent from it recovered or was killed.
-                resolved = disp_list is not None
-            elif pass_name == "auth":
+            elif pass_name in ("auth", "e529"):
+                # Both classes are peek-signature based: resolved when the
+                # session is gone or was peeked clean this scan. e529 keys
+                # additionally resolve on fresh activity (the REPL advanced,
+                # so it is no longer sitting on the dead 529 turn) — that is
+                # exactly what a successful `gc session reset` produces.
                 resolved = all_list is not None and (
                     sid not in all_sids or sid in auth_examined
                 )
+                if (not resolved and pass_name == "e529" and all_list is not None
+                        and sid in all_sids):
+                    s = next((x for x in all_list if (x.get("id") or "") == sid), {})
+                    age = parse_age_seconds(
+                        s.get("last_active") or s.get("activity_age") or "-")
+                    resolved = age < AUTH_WEDGE_THRESHOLD_SEC
             else:
                 resolved = False
             if resolved:
@@ -769,16 +769,16 @@ def main() -> int:
         _save_state(entries)
     log_line({
         "event": "scan-summary",
-        "scanned": seen, "dispatchers_scanned": dispatchers_seen,
+        "scanned": seen, "e529_wedges": e529_seen,
         "auth_wedges": auth_seen, "actioned": actioned,
         "resolved": resolved_count, "tracked": len(entries),
-        "threshold_sec": THRESHOLD_SEC, "dispatcher_stale_sec": DISPATCHER_STALE_SEC,
+        "threshold_sec": THRESHOLD_SEC,
         "auto_reset": AUTO_RESET, "dry_run": DRY_RUN,
     })
     print(
-        f"polecat-ui-stuck-scanner: scanned={seen} auth_wedges={auth_seen} "
-        f"actioned={actioned} resolved={resolved_count} threshold={THRESHOLD_SEC}s "
-        f"auto_reset={AUTO_RESET} dry_run={DRY_RUN}"
+        f"polecat-ui-stuck-scanner: scanned={seen} e529_wedges={e529_seen} "
+        f"auth_wedges={auth_seen} actioned={actioned} resolved={resolved_count} "
+        f"threshold={THRESHOLD_SEC}s auto_reset={AUTO_RESET} dry_run={DRY_RUN}"
     )
     return 0
 

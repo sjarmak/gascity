@@ -1,5 +1,13 @@
+# 2026-07-21 (order-layer consolidation, city audit sec 2.1 + epic gc-28w2):
+# the wedged-dispatcher pass (DISPATCHER_STALE_SEC + kill) was DELETED from
+# the scanner — dispatcher-liveness-sensor (detector) + dispatcher-watchdog
+# (kill actuator: idle>=5h OR conversion-stall) own that signal; the
+# scanner's 6h-idle kill was a redundant third threshold. A 529-wedge
+# classifier was folded IN from the retired pl-529-recovery order,
+# SURFACE-ONLY (no kill/reset authority), riding the existing peek fan-out.
+# See bin/polecat-ui-stuck-scanner header; undo via git.
 [order]
-description = "Every 5m: detect agent-pool sessions blocked waiting on input — both UI modals (slash/model/theme selectors) AND supervisor pending-interactions (permission/approval prompts; added 2026-06-03) — that read as 'active' but are unreachable for routed work. Surfaces each to the mayor (no agent should sit blocked on a human prompt; mayor triages, auto-handles routine/permission cases, escalates only genuine decisions to Stephanie). ALSO (2026-06-03) detects WEDGED CONTROL-DISPATCHERS: a dispatcher that reads 'active' but has been idle past DISPATCHER_STALE_SEC (default 6h) is wedged — routed-bead-nudger hammers it forever while its pool work strands (cf. the codeprobe-4cl6 loop). Surfaces to mayor (no nudge — it's already over-nudged; reset only with AUTO_RESET). AUTO_RESET off by default (surface-only; reset is destructive — cf. mayor-watchdog reset-storm). Implements gc-492g2."
+description = "Every 5m: detect sessions blocked waiting on input — UI modals (slash/model/theme selectors), supervisor pending-interactions (permission/approval prompts), auth-wedges (OAuth login screens), and 529-wedges (final turn is the literal 529 error, REPL idle; two-scan confirmed, surface-only) — that read as 'active' but are unreachable for routed work. Surfaces each to the mayor (no agent should sit blocked on a human prompt; mayor triages, auto-handles routine/permission cases, escalates only genuine decisions to Stephanie). AUTO_RESET off by default (surface-only except modal SELECTORS, which a text nudge provably cannot clear — cf. mayor-watchdog reset-storm). Implements gc-492g2."
 trigger = "cooldown"
 interval = "5m"
 exec = "/home/ds/gas-city/bin/polecat-ui-stuck-scanner"

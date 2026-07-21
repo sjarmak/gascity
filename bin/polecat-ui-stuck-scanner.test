@@ -16,6 +16,10 @@
 #   5. peek failure (not examined)   -> state carried, NO false resolve
 #   6. corrupt state file            -> FAIL-OPEN: alert anyway, state rewritten
 #   7. legacy v1 state (sid->iso)    -> no crash, treated as fresh (alerts NEW)
+#   8. 529-wedge classifier (folded in from pl-529-recovery 2026-07-21):
+#      scan 1 silent (two-scan confirm), scan 2 alerts once with the reset
+#      command, NO reset/kill ever issued (surface-only), active spinner
+#      variant does not classify, cleared fingerprint resolves with one mail
 #
 # Strategy: stub `gc` on PATH. The stub serves one stuck pool session for
 # `gc session list --json`, serves peek output from $FIXTURE_PEEK_FILE, records
@@ -145,6 +149,42 @@ check "corrupt state rewritten as v2" 0 "$?"
 echo "{\"$SID\": \"2026-06-01T00:00:00+00:00\"}" > "$STATE"
 run_scanner
 check "legacy v1 state alerts as NEW" 5 "$(mails)"
+
+# --- 8. 529-wedge classifier (surface-only) ----------------------------------
+# Fresh slate: the 529 assertions count mails/actions from zero.
+rm -f "$STATE" "$MAIL_LOG" "$ACTION_LOG"
+# The wedged fingerprint: 529 error text + idle ❯ prompt, no active spinner.
+printf 'API Error: 529 Overloaded\n%s Worked for 3m\n❯ \n' '✻' > "$PEEK_FILE"
+run_scanner   # scan 1: two-scan confirm window, no mail
+check "529 scan 1 silent (two-scan confirm)" 0 "$(mails)"
+run_scanner   # scan 2: confirmed -> exactly one alert
+check "529 scan 2 alerts once" 1 "$(mails)"
+grep -q "529" "$MAIL_LOG" && echo "PASS: 529 alert names the signature" \
+  || { echo "FAIL: 529 alert missing signature"; FAILED=1; }
+grep -q "session reset" "$MAIL_LOG" && echo "PASS: 529 alert carries the reset command" \
+  || { echo "FAIL: 529 alert missing reset command"; FAILED=1; }
+# Surface-only: the scanner must never have reset/killed/nudged for the 529.
+if [ -s "$ACTION_LOG" ]; then
+  echo "FAIL: 529 pass took an action ($(cat "$ACTION_LOG" | tr '\n' ';'))"; FAILED=1
+else
+  echo "PASS: 529 pass is surface-only (no reset/kill/nudge)"
+fi
+run_scanner   # scan 3: same signature, between escalation points
+check "529 scan 3 suppressed" 1 "$(mails)"
+# Active thinking spinner (the `·` inside the trailing parens) must NOT
+# classify: the agent is processing, not wedged. The fingerprint clearing also
+# resolves the tracked episode with exactly one resolved mail.
+printf 'API Error: 529 Overloaded\n%s Mustering… (3m 5s · 9.1k tokens)\n❯ \n' '✻' > "$PEEK_FILE"
+run_scanner
+check "active spinner does not classify; episode resolves with one mail" 2 "$(mails)"
+grep -qi "resolved" "$MAIL_LOG" && echo "PASS: 529 resolution mail says resolved" \
+  || { echo "FAIL: no 529 resolution mail"; FAILED=1; }
+python3 - "$STATE" <<'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f: st = json.load(f)
+sys.exit(1 if any("e529" in k for k in st.get("entries", {})) else 0)
+PYEOF
+check "resolved 529 key dropped from state" 0 "$?"
 
 if [ "$FAILED" -eq 0 ]; then
   echo "ALL PASS"
