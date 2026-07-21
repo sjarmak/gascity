@@ -24,48 +24,23 @@ Env contract (set by orders/github-mirror.toml):
 
 import json
 import os
-import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 
-from github_mirror_common import repositories_with_completed_transfers
+from github_mirror_common import (
+    bd_json,
+    is_wisp,
+    repositories_with_completed_transfers,
+    rig_env,
+    run,
+)
 
 CHUNK = 100  # bead IDs per bd invocation; post-#4329 re-listing a pushed bead is API-free
 CENTRAL_VIEW_REPOSITORY = "sjarmak/gas-city-beads"
 MIGRATION_STATE_PATH = "/home/ds/gas-city/.gc/github-central-mirror-migration-state.json"
 
-WISP_META_KEYS = ("gc.step_ref", "gc.root_bead_id")
 ACTIVE_STATUSES = "open,in_progress,blocked,deferred,hooked"
-
-
-def run(cmd, cwd, env=None):
-    return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
-
-
-def rig_env(rig, base=None):
-    """bd must target the rig's store explicitly: the gc order controller pins
-    BEADS_DIR to the CITY .beads in every exec env, which silently redirects
-    cwd-based resolution to the city store (found 2026-07-19, first order fire)."""
-    env = dict(base or os.environ)
-    env["BEADS_DIR"] = os.path.join(rig, ".beads")
-    return env
-
-
-def bd_json(args, cwd):
-    proc = run(["bd"] + args + ["--json"], cwd, env=rig_env(cwd))
-    if proc.returncode != 0:
-        raise RuntimeError(f"bd {' '.join(args)} failed in {cwd}: {proc.stderr.strip()}")
-    return json.loads(proc.stdout or "[]")
-
-
-def is_wisp(bead):
-    meta = bead.get("metadata") or {}
-    if any(meta.get(k) for k in WISP_META_KEYS):
-        return True
-    if meta.get("gc.synthetic") == "true" or meta.get("gc.formula_name") or meta.get("gc.kind") == "workflow":
-        return True
-    return bead.get("issue_type") == "convoy"
 
 
 def mirror_set(rig):

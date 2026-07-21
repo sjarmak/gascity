@@ -675,3 +675,20 @@ def test_malformed_remote_issue_and_state_fail_closed():
             central.TARGET_REPOSITORY,
             [{"number": 1, "url": "https://github.com/other/repo/issues/1", "title": "x", "body": "", "state": "open", "labels": []}],
         )
+
+
+def test_all_three_mirror_scripts_resolve_is_wisp_from_common():
+    """The wisp filter must have exactly one implementation. A divergent
+    per-script copy leaks synthetic beads (formula wisps) to GitHub — the
+    mirror family's own stated failure mode."""
+    import github_mirror_common as common
+
+    for module_name, filename in (
+        ("github_mirror_wisp_identity_test", "github-mirror"),
+        ("github_central_wisp_identity_test", "github-central-mirror"),
+        ("github_reconcile_wisp_identity_test", "github-mirror-reconcile"),
+    ):
+        module = load_script(module_name, filename)
+        assert module.is_wisp is common.is_wisp, (
+            f"{filename} carries its own wisp filter instead of the shared one"
+        )

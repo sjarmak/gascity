@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 
 GITHUB_ISSUE_PATH = re.compile(r"^/([^/]+)/([^/]+)/issues/[1-9][0-9]*$")
+WISP_META_KEYS = ("gc.step_ref", "gc.root_bead_id")
 CENTRAL_MARKER_SENTINEL = "<!-- gas-city-bead "
 CENTRAL_MARKER = re.compile(r"^<!-- gas-city-bead (\{[^\r\n]+\}) -->$", re.MULTILINE)
 LEGACY_TRANSFER_REPOSITORIES = frozenset(
@@ -67,13 +69,67 @@ def split_repository(repository: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
+def run(cmd, cwd="/", env=None, input_text=None):
+    """One subprocess idiom for the whole mirror family."""
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        input=input_text,
+        capture_output=True,
+        text=True,
+    )
+
+
+def rig_env(
+    rig_path: str,
+    base: dict[str, str] | None = None,
+    repository: str | None = None,
+) -> dict[str, str]:
+    """bd must target the rig's store explicitly: the gc order controller pins
+    BEADS_DIR to the CITY .beads in every exec env, which silently redirects
+    cwd-based resolution to the city store (found 2026-07-19, first order fire)."""
+    env = dict(base or os.environ)
+    env["BEADS_DIR"] = os.path.join(rig_path, ".beads")
+    if repository:
+        env["BEADS_GITHUB_REPOSITORY"] = repository
+    return env
+
+
 def rig_environment(
     spec: RigSpec,
     base: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    env = dict(base or os.environ)
-    env["BEADS_DIR"] = os.path.join(spec.path, ".beads")
-    return env
+    return rig_env(spec.path, base)
+
+
+def is_wisp(bead) -> bool:
+    """The one wisp filter for every GitHub mirror leg. Formula wisps
+    (gc.step_ref / gc.root_bead_id / gc.synthetic / gc.formula_name /
+    gc.kind=workflow / type=convoy) must never reach GitHub; a divergence
+    between copies of this filter leaks synthetic beads to the mirror,
+    the family's own stated failure mode."""
+    meta = bead.get("metadata") or {}
+    if any(meta.get(key) for key in WISP_META_KEYS):
+        return True
+    if meta.get("gc.synthetic") == "true" or meta.get("gc.formula_name"):
+        return True
+    if meta.get("gc.kind") == "workflow":
+        return True
+    return bead.get("issue_type") == "convoy"
+
+
+def bd_json(args, rig_path, base: dict[str, str] | None = None):
+    """Run `bd <args> --json` against a rig's store and parse the result."""
+    proc = run(["bd", *args, "--json"], cwd=rig_path, env=rig_env(rig_path, base))
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"bd {' '.join(args)} failed in {rig_path}: {proc.stderr.strip()[:300]}"
+        )
+    try:
+        return json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"bd returned malformed JSON in {rig_path}") from exc
 
 
 def repository_from_issue_url(ref: str) -> str | None:

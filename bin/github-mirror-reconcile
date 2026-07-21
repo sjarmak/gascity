@@ -27,49 +27,26 @@ Env contract (set by orders/github-mirror-reconcile.toml):
 
 import json
 import os
-import subprocess
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 
 from github_mirror_common import (
     flatten_issue_pages,
+    is_wisp,
     parse_json_lines,
     repositories_with_completed_transfers,
+    rig_env,
+    run,
 )
 
 CITY = "/home/ds/gas-city"
 AUDIT_LOG = f"{CITY}/.gc/github-mirror-reconcile.log"
 STATE_PATH = f"{CITY}/.gc/github-mirror-reconcile-state.json"
 
-WISP_META_KEYS = ("gc.step_ref", "gc.root_bead_id")
 ACTIVE = {"open", "in_progress", "blocked", "deferred", "hooked"}
 CENTRAL_VIEW_REPOSITORY = "sjarmak/gas-city-beads"
 MIGRATION_STATE_PATH = f"{CITY}/.gc/github-central-mirror-migration-state.json"
-
-
-def run(cmd, cwd="/", env=None):
-    return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
-
-
-def rig_env(rig, base=None, repository=None):
-    """bd must target the rig's store explicitly: the gc order controller pins
-    BEADS_DIR to the CITY .beads in every exec env, which silently redirects
-    cwd-based resolution to the city store (found 2026-07-19, first order fire)."""
-    env = dict(base or os.environ)
-    env["BEADS_DIR"] = os.path.join(rig, ".beads")
-    if repository:
-        env["BEADS_GITHUB_REPOSITORY"] = repository
-    return env
-
-
-def is_wisp(bead):
-    meta = bead.get("metadata") or {}
-    if any(meta.get(k) for k in WISP_META_KEYS):
-        return True
-    if meta.get("gc.synthetic") == "true" or meta.get("gc.formula_name") or meta.get("gc.kind") == "workflow":
-        return True
-    return bead.get("issue_type") == "convoy"
 
 
 def parse_ts(s):

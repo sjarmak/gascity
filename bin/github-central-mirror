@@ -32,7 +32,6 @@ import hashlib
 import json
 import math
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -43,13 +42,15 @@ from pathlib import Path
 
 from github_mirror_common import (
     LEGACY_TRANSFER_REPOSITORIES,
+    bd_json as common_bd_json,
     build_central_plan,
     flatten_issue_pages,
+    is_wisp,
     marker_key,
     parse_rig_specs,
     parse_json_lines,
     repository_from_issue_url,
-    rig_environment,
+    run,
     split_repository,
 )
 
@@ -62,21 +63,9 @@ LEGACY_REPOSITORY_RIGS = {
 }
 ACTIVE_STATUSES = "open,in_progress,blocked,deferred,hooked"
 KNOWN_STATUSES = frozenset((*ACTIVE_STATUSES.split(","), "closed"))
-WISP_META_KEYS = ("gc.step_ref", "gc.root_bead_id")
 CHUNK = 100
 PILOT_LOCK_PATH = CITY / ".gc/github-mirror-pilot.lock"
 MIGRATION_STATE_PATH = CITY / ".gc/github-central-mirror-migration-state.json"
-
-
-def run(cmd, cwd="/", env=None, input_text=None):
-    return subprocess.run(
-        cmd,
-        cwd=cwd,
-        env=env,
-        input=input_text,
-        capture_output=True,
-        text=True,
-    )
 
 
 @contextmanager
@@ -143,33 +132,10 @@ def require_legacy_order_disabled():
         raise RuntimeError("legacy github-mirror order is still enabled")
 
 
-def is_wisp(bead):
-    meta = bead.get("metadata") or {}
-    if any(meta.get(key) for key in WISP_META_KEYS):
-        return True
-    if meta.get("gc.synthetic") == "true" or meta.get("gc.formula_name"):
-        return True
-    if meta.get("gc.kind") == "workflow":
-        return True
-    return bead.get("issue_type") == "convoy"
-
-
 def bd_json(spec, args):
     if not args or args[0] not in {"list", "show"}:
         raise RuntimeError("central mirror bd access is read-only (list/show only)")
-    proc = run(
-        ["bd", *args, "--json"],
-        cwd=spec.path,
-        env=rig_environment(spec),
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"bd {' '.join(args)} failed in {spec.path}: {proc.stderr.strip()[:300]}"
-        )
-    try:
-        rows = json.loads(proc.stdout or "[]")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"bd returned malformed JSON in {spec.path}") from exc
+    rows = common_bd_json(args, spec.path)
     validate_beads(spec, rows)
     return rows
 
