@@ -1,3 +1,15 @@
+# RETIRED 2026-07-21 (gc-28w2 item 5, city audit sec 2.2 double-schedule):
+# bin/nudge-poll-reaper was running on TWO 2m schedulers — this order AND the
+# gascity-nudge-poll-reaper systemd user timer (enabled, Persistent=true).
+# The timer exists precisely because order-firing itself can stall (the
+# 2026-07-06/07-10 incidents: the runaways this reaper kills are what starve
+# the order-firing floor, so the order-leg deadlocks exactly when it is
+# needed). The systemd timer is therefore the DURABLE leg and stays; this
+# order was the redundant leg and is retired to .disabled.
+# Re-enable condition: only if the systemd timer is ever removed — verify
+# with `systemctl --user is-enabled gascity-nudge-poll-reaper.timer` first;
+# running both double-fires the reaper every 2m.
+#
 # nudge-poll-reaper — every 2m, reap leaked busy-looping 'gc nudge poll'
 # sidecars (gc-b9w88). After a session restart the old poll can orphan and spin
 # at multi-core CPU instead of sleeping (4 such procs burned ~735% CPU and were
