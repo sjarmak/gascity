@@ -58,19 +58,34 @@ run_age_rule() {
   local state="$CITY/.gc/stale-attention-reaper.state"
   log() { echo "$(ts) [age] $*" >> "$audit_log"; }
 
-  local now cutoff beads
+  local now cutoff raw rc beads
   now=$(date +%s)
   cutoff=$(( TTL_DAYS * 86400 ))
 
   # Pull open beads carrying the attention label, oldest-touched first. Use
   # updated_at when present (the real signal — last movement), else created_at.
-  beads=$(gc bd --rig "$RIG" list --status open --json --limit=0 2>/dev/null | jq -c \
-    --arg lbl "$LABEL" '
+  # A store we cannot read is NOT an all-clear (cf. bin/needs-recovery-reaper's
+  # scan_failed handling): clearing state on a transient failure would re-alert
+  # every candidate on the next successful run. Fail loud, leave state alone.
+  raw=$(gc bd --rig "$RIG" list --status open --json --limit=0 2>/dev/null)
+  rc=$?
+  if (( rc != 0 )); then
+    log "scan_failed: gc bd list rc=$rc — scan did NOT run, state untouched"
+    echo "stale-attention-reaper[age]: gc bd list failed (rc=$rc) — scan did NOT run" >&2
+    return 1
+  fi
+  if ! beads=$(jq -c --arg lbl "$LABEL" '
     [ .[] | select((.labels // []) | index($lbl)) ]
     | sort_by(.updated_at // .created_at)
-    | .[] | {id, title, touched: (.updated_at // .created_at)}' 2>/dev/null)
+    | .[] | {id, title, touched: (.updated_at // .created_at)}' <<<"$raw" 2>/dev/null); then
+    log "scan_failed: gc bd list output unparseable — scan did NOT run, state untouched"
+    echo "stale-attention-reaper[age]: gc bd list output unparseable — scan did NOT run" >&2
+    return 1
+  fi
 
   if [[ -z "$beads" ]]; then
+    # Confirmed-successful empty scan (gc bd rc=0, parseable output): the
+    # candidate set is genuinely empty, so the change-dedup state may clear.
     log "skip: no open $LABEL beads on rig $RIG"
     [[ "$DRY_RUN" == "1" ]] || rm -f "$state"
     return 0
@@ -139,11 +154,23 @@ run_resolved_subject_rule() {
 
   command -v gh >/dev/null 2>&1 || { log "skip: gh not available"; return 0; }
 
-  local decs
-  decs=$(gc bd --rig "$RIG" list --status open --json --limit=0 2>/dev/null | jq -c \
-    --arg lbl "$LABEL" '
+  # Same fail-loud contract as Rule A: a failed or unparseable gc bd list is
+  # NOT an empty candidate set — leave the dedup state untouched and fail.
+  local raw rc decs
+  raw=$(gc bd --rig "$RIG" list --status open --json --limit=0 2>/dev/null)
+  rc=$?
+  if (( rc != 0 )); then
+    log "scan_failed: gc bd list rc=$rc — scan did NOT run, state untouched"
+    echo "stale-attention-reaper[dec]: gc bd list failed (rc=$rc) — scan did NOT run" >&2
+    return 1
+  fi
+  if ! decs=$(jq -c --arg lbl "$LABEL" '
     [ .[] | select((.labels // []) | index($lbl)) ]
-    | sort_by(.created_at) | .[] | {id, title, description}' 2>/dev/null)
+    | sort_by(.created_at) | .[] | {id, title, description}' <<<"$raw" 2>/dev/null); then
+    log "scan_failed: gc bd list output unparseable — scan did NOT run, state untouched"
+    echo "stale-attention-reaper[dec]: gc bd list output unparseable — scan did NOT run" >&2
+    return 1
+  fi
 
   [[ -z "$decs" ]] && { log "skip: no open $LABEL decs"; [[ "$DRY_RUN" == "1" ]] || rm -f "$state"; return 0; }
 
