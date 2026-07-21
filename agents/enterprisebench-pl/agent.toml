@@ -1,12 +1,11 @@
-work_dir = "/home/ds/projects/EnterpriseBench"
-# 2026-07-18 per Stephanie: project leads run through Amp's medium profile.
-# Revert from the sibling pre-migration snapshot if binding or resume regresses.
-provider = "amp-medium"
-min_active_sessions = 0
-max_active_sessions = 1
-wake_mode = "resume"
 idle_timeout = "1h"
+max_active_sessions = 1
+min_active_sessions = 0
+provider = "amp-medium"
+suspended = true
+wake_mode = "resume"
+work_dir = "/home/ds/projects/EnterpriseBench"
 
 [env]
-GC_CITY = "/home/ds/gas-city"
-GC_BEADS = "bd"
+  GC_BEADS = "bd"
+  GC_CITY = "/home/ds/gas-city"
