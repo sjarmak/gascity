@@ -1,18 +1,33 @@
-# Stale-attention reaper -> mayor. Stephanie 2026-06-30: "some back from may 12
-# showing up as 'need me' but I'm sure that work is stale; need an automated way
-# to handle that." The dashboard "need me" view surfaces open beads needing her;
-# the existing janitors only PRUNE CLOSED beads — nothing ages stale-but-OPEN
-# attention. This order is that missing path.
+# Stale-attention reaper -> mayor: ONE surface-only scanner, TWO rules, both
+# against open `needs/stephanie` beads on the decisions rig.
+#   Rule A (AGE): no movement past STALE_ATTENTION_TTL_DAYS. Stephanie
+#     2026-06-30: "some back from may 12 showing up as 'need me' but I'm sure
+#     that work is stale; need an automated way to handle that."
+#   Rule B (RESOLVED SUBJECT): referenced PR merged/closed or referenced
+#     source bead closed. Stephanie 2026-06-13: "handle stale decision beads
+#     where I've closed it out already from working directly with a rig
+#     agent." (Formerly the separate decision-staleness-reaper order.)
 #
-# Fires on AGE only (no movement past the TTL), complementing
-# decision-staleness-reaper (which fires on a resolved subject PR/bead). Both
-# are surface-only: the close/keep judgment stays with the mayor (ZFC) — see
-# bin/stale-attention-reaper header. Change-dedup'd, so an unchanged candidate
-# set is not re-mailed.
-# trigger=cooldown (no zero-lastRun bootstrap trap; mirrors decision-staleness-reaper).
+# Merged 2026-07-21 (order-layer consolidation, city audit sec 2.1 + epic
+# gc-28w2): the two orders scanned the same rig, same label, same mail
+# target, same surface-only + change-dedup contract. Cadence 1h keeps Rule
+# B's pre-merge detection latency; Rule A is change-dedup'd so the extra
+# hourly evaluations are cheap skips (2 execs -> 1/h net of the old 1h+24h
+# pair). Each rule keeps its original state/log files, so dedup carried
+# across the merge. Undo: restore decision-staleness-reaper.toml +
+# bin/decision-staleness-reaper from this commit's parent in git.
+#
+# Both rules surface-only: the close/keep judgment stays with the mayor
+# (ZFC) — see bin/stale-attention-reaper header.
+# trigger=cooldown (no zero-lastRun bootstrap trap).
 [order]
-description = "Daily: flag open needs/stephanie beads idle >21d to the mayor to re-confirm or close (surface-only, change-dedup'd)."
+description = "Every 1h: flag open needs/stephanie beads that are stale by AGE (>21d idle) or by RESOLVED SUBJECT (referenced PR merged/closed or source bead closed) to the mayor. Surface-only, change-dedup'd per rule."
 trigger = "cooldown"
-interval = "24h"
+interval = "1h"
 exec = "/home/ds/gas-city/bin/stale-attention-reaper"
-timeout = "3m"
+timeout = "5m"
+
+[order.env]
+# Rule A age threshold (days). Rule B has no TTL — it keys on subject
+# resolution, not age.
+STALE_ATTENTION_TTL_DAYS = "21"
