@@ -1,0 +1,14 @@
+# disk-pressure-guard — mayor gc-431237 (pre-cleared). Root hit 100% today; go-build
+# regrows ~4-8G/cycle. Every 30m: if root free < threshold (default 30G), delete the
+# CONTENTS of a hardcoded allowlist of REGENERABLE caches (go-build, golangci-lint,
+# staticcheck, pip, uv) — they rebuild on next use. HARD RULES: never `go clean -cache`
+# (banned, corrupts fleet GOCACHE); never touch .cache/huggingface or .ollama (active
+# data — off the allowlist + a defensive protected-path assert). Trims only cache
+# CHILDREN. No-op when free is fine or caches are empty. Audited; nudges mayor when it
+# frees >=0.5G. Stopgap for the home-dir side (the ~1.5T outside /home/ds is Stephanie's).
+[order]
+description = "Every 30m: if root free < 30G, trim regenerable caches (go-build/golangci-lint/staticcheck/pip/uv contents via rm — never go clean -cache; never huggingface/ollama). No-op when disk is fine. Audited; nudges mayor on a real reclaim."
+trigger = "cron"
+schedule = "*/30 * * * *"
+exec = "/home/ds/gas-city/bin/disk-pressure-guard --apply --nudge-mayor"
+timeout = "5m"

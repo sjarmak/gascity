@@ -1,0 +1,681 @@
+#!/usr/bin/env python3
+"""Show account capacity and rebalance agents across Claude accounts.
+
+Reads ~/.claude-usage/usage_cache.json (populated by `csu`) and cross-references
+with each agent's provider pin in agents/<name>/agent.toml to show which agents
+are on hot vs cool accounts, and optionally rebalance them.
+
+An agent that sets `pin = true` in its agent.toml is never auto-moved by
+--rebalance (and `--rebalance <pinned-agent>` is refused) — the pin is an
+explicit operator decision that overrides heat-based balancing.
+
+Usage:
+    gc-capacity                          # show capacity dashboard
+    gc-capacity --refresh                # run csu first, then show
+    gc-capacity --rebalance mayor        # move mayor to coolest account
+    gc-capacity --rebalance auto         # rebalance all agents optimally
+    gc-capacity --rebalance auto --dry-run
+    gc-capacity --json                   # machine-readable output
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+CITY_ROOT = Path(__file__).resolve().parent.parent
+CITY_TOML = CITY_ROOT / "city.toml"
+AGENTS_DIR = CITY_ROOT / "agents"
+USAGE_CACHE = Path.home() / ".claude-usage" / "usage_cache.json"
+
+PROVIDER_TO_ACCOUNT = {
+    "claude-1": "account1",
+    "claude-2": "account2",
+    "claude-3": "account3",
+    "claude-4": "account4",
+    "claude-5": "account5",
+}
+ACCOUNT_TO_PROVIDER = {v: k for k, v in PROVIDER_TO_ACCOUNT.items()}
+
+# Thresholds for display coloring and recommendations
+THRESHOLD_HOT = 60.0    # 5h utilization above this = hot
+THRESHOLD_WARM = 30.0   # 5h utilization above this = warm
+THRESHOLD_7D_MAXED = 95.0  # 7d utilization at/above this = weekly quota exhausted;
+                           # the account rejects new work even when its 5h window reads cool
+THRESHOLD_7D_HOT = 75.0    # 7d utilization at/above this = drain line: stop routing new
+                           # load here and move non-pinned agents off. Added 2026-07-05
+                           # after account4 climbed to 92% 7d while reading COOL on 5h —
+                           # workers throttled into silent no-op loops before the 95%
+                           # cliff ever tripped. Matches account-quota-warning's WARN_PCT.
+
+
+def _band_7d(acct: "AccountUsage") -> int:
+    """Quantize 7d utilization into 25-point bands for target ranking.
+
+    Banding (0-25, 25-50, 50-75) makes 7d headroom the PRIMARY move-target
+    criterion without letting a few points of 7d noise override the agent-count
+    and 5h balance within a band. Pre-2026-07-05 ranking was agent-count-first,
+    which happily piled agents onto a 64%-7d account over a 20% one.
+    """
+    return int((acct.seven_d or 0.0) // 25)
+
+
+# ── Data structures ──────────────────────────────────────────────────────────
+
+@dataclass
+class AccountUsage:
+    name: str
+    provider: str
+    email: str = ""
+    five_h: float | None = None
+    seven_d: float | None = None
+    five_h_reset: str | None = None
+    seven_d_reset: str | None = None
+    error: str | None = None
+
+    @property
+    def healthy(self) -> bool:
+        return self.error is None and self.five_h is not None
+
+    @property
+    def heat_label(self) -> str:
+        if not self.healthy:
+            return "DOWN"
+        if self.seven_d is not None and self.seven_d >= THRESHOLD_7D_MAXED:
+            return "MAXED"
+        if self.seven_d is not None and self.seven_d >= THRESHOLD_7D_HOT:
+            return "7D-HOT"
+        if self.five_h >= THRESHOLD_HOT:
+            return "HOT"
+        if self.five_h >= THRESHOLD_WARM:
+            return "WARM"
+        return "COOL"
+
+
+@dataclass
+class AgentConfig:
+    name: str
+    provider: str
+    scope: str = ""
+    dir: str = ""
+    suspended: bool = False
+    pin: bool = False  # operator-fixed provider; never auto-rebalanced
+
+
+@dataclass
+class RebalancePlan:
+    moves: list[tuple[str, str, str]] = field(default_factory=list)  # (agent, old_provider, new_provider)
+
+
+# ── Parsing ──────────────────────────────────────────────────────────────────
+
+def load_usage() -> dict[str, AccountUsage]:
+    """Load usage cache into a dict keyed by account name."""
+    if not USAGE_CACHE.exists():
+        print(f"ERROR: Usage cache not found at {USAGE_CACHE}", file=sys.stderr)
+        print("Run `csu` first to populate it.", file=sys.stderr)
+        sys.exit(1)
+
+    data = json.loads(USAGE_CACHE.read_text())
+    result = {}
+    for acct in data.get("accounts", []):
+        name = acct.get("name", "")
+        provider = ACCOUNT_TO_PROVIDER.get(name, "?")
+        five_h_data = acct.get("five_hour") or {}
+        seven_d_data = acct.get("seven_day") or {}
+        result[name] = AccountUsage(
+            name=name,
+            provider=provider,
+            email=acct.get("email", ""),
+            five_h=five_h_data.get("utilization"),
+            seven_d=seven_d_data.get("utilization"),
+            five_h_reset=five_h_data.get("resets_at"),
+            seven_d_reset=seven_d_data.get("resets_at"),
+            error=acct.get("error"),
+        )
+    return result
+
+
+def parse_agents() -> list[AgentConfig]:
+    """Discover agents from agents/<name>/agent.toml.
+
+    Each agent's provider, scope, suspended flag, and pin marker live in its
+    own agent.toml — city.toml carries no [[agent]] blocks in this deployment.
+    Reading the per-agent files is what lets the rebalancer see (and honor)
+    explicit provider pins. Dirs whose name starts with '_' or '.' are
+    archived/hidden and skipped.
+    """
+    ws_provider = _parse_workspace_provider()
+
+    agents = []
+    for toml_path in sorted(AGENTS_DIR.glob("*/agent.toml")):
+        name = toml_path.parent.name
+        if name.startswith(("_", ".")):
+            continue
+        try:
+            data = tomllib.loads(toml_path.read_text())
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            print(f"WARNING: skipping {toml_path}: {exc}", file=sys.stderr)
+            continue
+        agents.append(AgentConfig(
+            name=name,
+            provider=data.get("provider", "") or ws_provider,
+            scope=data.get("scope", ""),
+            dir=data.get("dir", ""),
+            suspended=bool(data.get("suspended", False)),
+            pin=bool(data.get("pin", False)),
+        ))
+
+    return agents
+
+
+def _parse_workspace_provider() -> str:
+    """Get the workspace-level default provider from city.toml."""
+    try:
+        data = tomllib.loads(CITY_TOML.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return ""
+    return data.get("workspace", {}).get("provider", "")
+
+
+def update_agent_provider(agent_name: str, new_provider: str) -> None:
+    """Set a specific agent's provider in agents/<name>/agent.toml.
+
+    Edits the top-level `provider` key line-by-line so existing comments and
+    formatting survive. If the agent has no provider line yet (it was relying
+    on the workspace default), one is inserted in the top-level section, before
+    the first sub-table (e.g. [env]).
+    """
+    path = AGENTS_DIR / agent_name / "agent.toml"
+    if not path.exists():
+        print(f"WARNING: no agent.toml for agent '{agent_name}' at {path}", file=sys.stderr)
+        return
+
+    lines = path.read_text().splitlines()
+    result: list[str] = []
+    written = False
+
+    for line in lines:
+        stripped = line.strip()
+        # Entered the first sub-table without having seen a provider key:
+        # insert one here so it stays in the top-level section.
+        if not written and stripped.startswith("["):
+            result.append(f'provider = "{new_provider}"')
+            written = True
+        if not written and re.match(r'^provider\s*=', stripped):
+            result.append(f'provider = "{new_provider}"')
+            written = True
+            continue
+        result.append(line)
+
+    if not written:
+        result.append(f'provider = "{new_provider}"')
+
+    path.write_text("\n".join(result) + "\n")
+
+
+def update_patch_provider(agent_name: str, new_provider: str) -> bool:
+    """Update the provider in a city.toml [[patches.agent]] block, if one exists.
+
+    A [[patches.agent]] block OVERRIDES the agent's own agent.toml provider at
+    launch, so for any patched agent (e.g. mayor) the agent.toml edit alone is a
+    silent no-op — the live session keeps launching on the old account. This
+    edits the matching patch block in place. Returns True if a patch block for
+    the agent was found and updated, False otherwise (caller falls back to the
+    agent.toml edit being authoritative).
+    """
+    if not CITY_TOML.exists():
+        return False
+
+    lines = CITY_TOML.read_text().splitlines()
+    # Find the [[patches.agent]] block whose `name = "<agent>"` matches.
+    block_start = None
+    for i, line in enumerate(lines):
+        if line.strip() == "[[patches.agent]]":
+            block_start = i
+            continue
+        if block_start is not None:
+            stripped = line.strip()
+            # New table/array-table ends the current patch block.
+            if stripped.startswith("["):
+                block_start = None
+                continue
+            m = re.match(r'^name\s*=\s*"([^"]*)"', stripped)
+            if m and m.group(1) == agent_name:
+                # Found the block; rewrite its provider line (or insert one).
+                end = len(lines)
+                for j in range(i + 1, len(lines)):
+                    if lines[j].strip().startswith("["):
+                        end = j
+                        break
+                for k in range(block_start + 1, end):
+                    if re.match(r'^\s*provider\s*=', lines[k]):
+                        lines[k] = f'provider = "{new_provider}"'
+                        CITY_TOML.write_text("\n".join(lines) + "\n")
+                        return True
+                # No provider line in the block — insert right after name.
+                lines.insert(i + 1, f'provider = "{new_provider}"')
+                CITY_TOML.write_text("\n".join(lines) + "\n")
+                return True
+    return False
+
+
+def live_provider(agent_name: str) -> str | None:
+    """Read the GC_PROVIDER of the agent's live tmux pane, or None if not found.
+
+    Used to verify a rebalance actually moved the running session — `gc session
+    reset` can silently no-op (the pane keeps the old PID and provider), which
+    otherwise makes the rebalance look successful when nothing moved.
+    """
+    try:
+        panes = subprocess.run(
+            ["tmux", "-L", "ds-research", "list-panes", "-a",
+             "-F", "#{pane_pid} #{session_name}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if panes.returncode != 0:
+        return None
+    pid = None
+    for row in panes.stdout.splitlines():
+        parts = row.split()
+        if len(parts) == 2 and parts[1] == agent_name:
+            pid = parts[0]
+            break
+    if pid is None:
+        return None
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return None
+    for entry in environ.split("\0"):
+        if entry.startswith("GC_PROVIDER="):
+            return entry[len("GC_PROVIDER="):]
+    return None
+
+
+# ── Display ──────────────────────────────────────────────────────────────────
+
+def show_dashboard(accounts: dict[str, AccountUsage], agents: list[AgentConfig]) -> None:
+    """Print the capacity dashboard."""
+    # Group agents by provider
+    agents_by_provider: dict[str, list[str]] = {}
+    for a in agents:
+        prov = a.provider
+        label = a.name
+        if a.suspended:
+            label += " (suspended)"
+        elif a.pin:
+            label += " (pinned)"
+        agents_by_provider.setdefault(prov, []).append(label)
+
+    # Header
+    fetched_at = ""
+    if USAGE_CACHE.exists():
+        data = json.loads(USAGE_CACHE.read_text())
+        fetched_at = data.get("fetched_at", "")
+    if fetched_at:
+        print(f"Usage data from: {fetched_at}")
+    print()
+
+    # Table
+    print(f"{'ACCOUNT':<12} {'PROVIDER':<10} {'5h%':>5} {'7d%':>5}  {'STATUS':<6}  AGENTS")
+    print(f"{'─'*12} {'─'*10} {'─'*5} {'─'*5}  {'─'*6}  {'─'*40}")
+
+    for acct_name in sorted(accounts.keys()):
+        acct = accounts[acct_name]
+        prov = acct.provider
+        five = f"{acct.five_h:5.1f}" if acct.five_h is not None else "  — "
+        seven = f"{acct.seven_d:5.1f}" if acct.seven_d is not None else "  — "
+        status = acct.heat_label
+        agent_list = ", ".join(agents_by_provider.get(prov, ["(none)"]))
+        err_note = f"  [{acct.error}]" if acct.error else ""
+
+        print(f"{acct_name:<12} {prov:<10} {five} {seven}  {status:<6}  {agent_list}{err_note}")
+
+    # Unaccounted providers (e.g., codex)
+    known_providers = {a.provider for a in accounts.values()}
+    for prov, agent_names in agents_by_provider.items():
+        if prov not in known_providers:
+            agent_list = ", ".join(agent_names)
+            print(f"{'—':<12} {prov:<10} {'—':>5} {'—':>5}  {'—':<6}  {agent_list}")
+
+    print()
+
+    # Recommendations
+    maxed = [a for a in accounts.values() if a.heat_label == "MAXED"]
+    seven_d_hot = [a for a in accounts.values() if a.heat_label == "7D-HOT"]
+    hot = [a for a in accounts.values() if a.heat_label == "HOT"]
+    cool = [a for a in accounts.values()
+            if a.healthy and a.five_h < THRESHOLD_WARM
+            and a.heat_label not in ("MAXED", "7D-HOT")]
+
+    if maxed:
+        maxed_names = ", ".join(f"{a.provider} (7d {a.seven_d:.0f}%)" for a in maxed)
+        print(f"MAXED accounts — 7d quota exhausted, drain agents off: {maxed_names}")
+    if seven_d_hot:
+        names = ", ".join(f"{a.provider} (7d {a.seven_d:.0f}%)" for a in seven_d_hot)
+        print(f"7D-HOT accounts — weekly quota past the {THRESHOLD_7D_HOT:.0f}% drain line, "
+              f"run `gc-capacity --rebalance auto`: {names}")
+    if hot:
+        hot_names = ", ".join(f"{a.provider} ({a.five_h:.0f}%)" for a in hot)
+        print(f"Hot accounts: {hot_names}")
+        if cool:
+            cool_names = ", ".join(f"{a.provider} ({a.five_h:.0f}%)" for a in cool)
+            print(f"Cool accounts: {cool_names}")
+
+            # Suggest moves for agents on hot providers
+            for h in hot:
+                hot_agents = agents_by_provider.get(h.provider, [])
+                if len(hot_agents) > 1:
+                    movable = [a for a in hot_agents if "suspended" not in a]
+                    if len(movable) > 1:
+                        print(f"  Suggestion: {h.provider} has {len(movable)} active agents — consider moving some to a cool account")
+    if not maxed and not seven_d_hot and not hot:
+        print("All accounts are within normal utilization.")
+    print()
+
+
+def show_json(accounts: dict[str, AccountUsage], agents: list[AgentConfig]) -> None:
+    """Print machine-readable JSON."""
+    agents_by_provider: dict[str, list[str]] = {}
+    for a in agents:
+        agents_by_provider.setdefault(a.provider, []).append(a.name)
+
+    output = {
+        "accounts": [
+            {
+                "name": a.name,
+                "provider": a.provider,
+                "email": a.email,
+                "five_h_pct": a.five_h,
+                "seven_d_pct": a.seven_d,
+                "status": a.heat_label,
+                "error": a.error,
+                "agents": agents_by_provider.get(a.provider, []),
+            }
+            for a in accounts.values()
+        ]
+    }
+    print(json.dumps(output, indent=2))
+
+
+# ── Rebalance ────────────────────────────────────────────────────────────────
+
+def plan_rebalance_single(
+    agent_name: str,
+    agents: list[AgentConfig],
+    accounts: dict[str, AccountUsage],
+    avoid_providers: set[str] | None = None,
+    force: bool = False,
+) -> RebalancePlan:
+    """Plan moving a single agent to the coolest available account.
+
+    With --force, always moves even if already on coolest account.
+    With --avoid, excludes specific providers from consideration.
+    A pinned agent is refused — pins override heat-based balancing, including
+    --force. Remove `pin = true` from its agent.toml to rebalance it.
+    """
+    plan = RebalancePlan()
+
+    agent = next((a for a in agents if a.name == agent_name), None)
+    if agent is None:
+        print(f"ERROR: agent '{agent_name}' not found in {AGENTS_DIR}", file=sys.stderr)
+        sys.exit(1)
+
+    if agent.pin:
+        print(
+            f"ERROR: agent '{agent_name}' is pinned (pin=true in its agent.toml); "
+            "refusing to move it. Remove the pin to rebalance.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    current_prov = agent.provider
+    avoid = avoid_providers or set()
+
+    # Rank healthy accounts by 7d headroom band first, then 5h — excluding
+    # avoided accounts and anything at/over the 7d drain line (idle now but
+    # burning weekly quota we're trying to protect).
+    ranked = sorted(
+        [a for a in accounts.values() if a.healthy and a.provider not in avoid
+         and not (a.seven_d is not None and a.seven_d >= THRESHOLD_7D_HOT)],
+        key=lambda a: (_band_7d(a), a.five_h, a.seven_d or 0),
+    )
+    if not ranked:
+        print("ERROR: no healthy accounts available (after exclusions)", file=sys.stderr)
+        sys.exit(1)
+
+    best = ranked[0]
+    if best.provider == current_prov and not force:
+        return plan  # already on coolest
+
+    # With --force, pick the best account that ISN'T the current one
+    if best.provider == current_prov:
+        if len(ranked) < 2:
+            print("ERROR: no alternative accounts available", file=sys.stderr)
+            sys.exit(1)
+        best = ranked[1]
+
+    plan.moves.append((agent_name, current_prov, best.provider))
+    return plan
+
+
+def plan_rebalance_auto(
+    agents: list[AgentConfig],
+    accounts: dict[str, AccountUsage],
+    avoid_providers: set[str] | None = None,
+) -> RebalancePlan:
+    """Plan rebalancing agents that are on DOWN, 7d-hot, or 5h-HOT accounts.
+
+    Strategy: only move agents whose current account is unhealthy (DOWN),
+    at/over the 7d drain line (THRESHOLD_7D_HOT — the weekly quota is what
+    actually exhausts; 5h can read cool the whole way to the cliff, which is
+    how account4 reached 92% on 2026-07-05 with the planner refusing to act),
+    over the 5h HOT threshold, or on an avoided provider. Agents on healthy
+    accounts stay put. Pinned agents never move (their provider is an explicit
+    operator decision) but still reserve load on their account so others
+    aren't piled onto it. Moved agents go to the account with the most 7d
+    headroom (25-point bands), tie-broken by fewest agents, then lowest 5h.
+    """
+    plan = RebalancePlan()
+    avoid = avoid_providers or set()
+
+    claude_agents = [a for a in agents if a.provider in PROVIDER_TO_ACCOUNT and not a.suspended]
+    healthy_accounts = {
+        a.provider: a for a in accounts.values()
+        if a.healthy and a.provider not in avoid
+        # Never move an agent ONTO an account at/over the 7d drain line.
+        and not (a.seven_d is not None and a.seven_d >= THRESHOLD_7D_HOT)
+        # Never move an agent ONTO a hot account. Without this, a low-population
+        # but hot account (e.g. the mayor's own pinned account with 1 agent) wins
+        # the fewest-agents tiebreak below and gets piled on despite being maxed.
+        and not (a.five_h is not None and a.five_h >= THRESHOLD_HOT)
+    }
+
+    if not healthy_accounts:
+        print("ERROR: no healthy accounts available", file=sys.stderr)
+        sys.exit(1)
+
+    # Count current agents per healthy provider (only counting agents that will STAY)
+    provider_load: dict[str, int] = {prov: 0 for prov in healthy_accounts}
+
+    # Identify which agents need to move
+    needs_move: list[AgentConfig] = []
+    for agent in claude_agents:
+        if agent.pin:
+            # Pinned — never move; reserve its load if its provider is healthy.
+            if agent.provider in provider_load:
+                provider_load[agent.provider] += 1
+            continue
+
+        acct_name = PROVIDER_TO_ACCOUNT.get(agent.provider)
+        acct = accounts.get(acct_name) if acct_name else None
+
+        if acct is None or not acct.healthy:
+            # DOWN account — must move
+            needs_move.append(agent)
+        elif agent.provider in avoid:
+            # Explicitly avoided — must move
+            needs_move.append(agent)
+        elif acct.seven_d is not None and acct.seven_d >= THRESHOLD_7D_HOT:
+            # At/over the 7d drain line — move BEFORE the weekly cap hits.
+            # Past ~90% workers throttle into silent no-op loops (execute
+            # steps close pass with zero diff) long before 95% MAXED trips.
+            needs_move.append(agent)
+        elif acct.five_h is not None and acct.five_h >= THRESHOLD_HOT:
+            # HOT account — should move
+            needs_move.append(agent)
+        else:
+            # WARM or COOL — stays put, counts toward load
+            if agent.provider in provider_load:
+                provider_load[agent.provider] += 1
+
+    if not needs_move:
+        return plan
+
+    # Sort: mayor first, then by current heat descending
+    def sort_key(a: AgentConfig) -> tuple:
+        is_mayor = 0 if a.scope == "city" else 1
+        acct_name = PROVIDER_TO_ACCOUNT.get(a.provider)
+        acct = accounts.get(acct_name) if acct_name else None
+        heat = acct.five_h if (acct and acct.five_h is not None) else 100.0
+        return (is_mayor, -heat)
+
+    needs_move.sort(key=sort_key)
+
+    for agent in needs_move:
+        best_prov = min(
+            provider_load.keys(),
+            key=lambda p: (_band_7d(healthy_accounts[p]),
+                           provider_load[p],
+                           healthy_accounts[p].five_h),
+        )
+        provider_load[best_prov] += 1
+
+        if best_prov != agent.provider:
+            plan.moves.append((agent.name, agent.provider, best_prov))
+
+    return plan
+
+
+def execute_plan(plan: RebalancePlan, dry_run: bool = False, reset: bool = True) -> None:
+    """Execute a rebalance plan: update city.toml and optionally reset sessions."""
+    if not plan.moves:
+        print("No moves needed — agents are already well-distributed.")
+        return
+
+    print(f"\nRebalance plan ({len(plan.moves)} move{'s' if len(plan.moves) != 1 else ''}):\n")
+    for agent_name, old_prov, new_prov in plan.moves:
+        print(f"  {agent_name}: {old_prov} -> {new_prov}")
+
+    if dry_run:
+        print("\n(dry run — no changes made)")
+        return
+
+    print()
+
+    # Apply provider changes. agent.toml is always updated; if the agent also has
+    # a city.toml [[patches.agent]] override, that one takes effect at launch and
+    # must be updated too — otherwise the rebalance is a silent no-op.
+    for agent_name, old_prov, new_prov in plan.moves:
+        update_agent_provider(agent_name, new_prov)
+        patched = update_patch_provider(agent_name, new_prov)
+        where = "agent.toml + city.toml patch" if patched else "agent.toml"
+        print(f"  Updated {where}: {agent_name} -> {new_prov}")
+
+    # Reset affected sessions, then verify the live pane actually moved.
+    if reset:
+        print()
+        for agent_name, _, new_prov in plan.moves:
+            print(f"  Resetting {agent_name}...", end=" ", flush=True)
+            result = subprocess.run(
+                ["gc", "session", "reset", agent_name],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                if "not found" in stderr.lower() or "no session" in stderr.lower():
+                    print("(no active session)")
+                else:
+                    print(f"FAILED: {stderr[:100]}")
+                continue
+            # reset returns 0 even when it silently no-ops — verify the move.
+            # Respawn is async, so poll briefly before deciding.
+            live = None
+            for _ in range(6):
+                time.sleep(5)
+                live = live_provider(agent_name)
+                if live == new_prov:
+                    break
+            if live is None:
+                print("OK (live provider unverifiable)")
+            elif live == new_prov:
+                print("OK")
+            else:
+                print(f"NO-OP: still on {live}; run `gc session kill {agent_name}` "
+                      f"to force respawn on {new_prov}")
+
+    print("\nDone.")
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--refresh", action="store_true",
+                        help="Run csu to refresh usage data first")
+    parser.add_argument("--rebalance", metavar="TARGET",
+                        help="Rebalance: agent name, or 'auto' for all agents")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show plan without making changes")
+    parser.add_argument("--no-reset", action="store_true",
+                        help="Update city.toml but don't reset sessions")
+    parser.add_argument("--force", action="store_true",
+                        help="Force move even if tool thinks current account is fine "
+                             "(use when agent is rate-limited but csu doesn't see it)")
+    parser.add_argument("--avoid", metavar="N", type=int, action="append", default=[],
+                        help="Exclude account N from selection (repeatable, e.g. --avoid 3 --avoid 2)")
+    parser.add_argument("--json", dest="as_json", action="store_true",
+                        help="Machine-readable JSON output")
+    args = parser.parse_args()
+
+    if args.refresh:
+        print("Refreshing usage data...\n")
+        subprocess.run(["csu"], check=True)
+        print()
+
+    accounts = load_usage()
+    agents = parse_agents()
+
+    avoid_providers = {f"claude-{n}" for n in args.avoid}
+
+    if args.rebalance:
+        if args.rebalance == "auto":
+            plan = plan_rebalance_auto(agents, accounts, avoid_providers=avoid_providers)
+        else:
+            plan = plan_rebalance_single(
+                args.rebalance, agents, accounts,
+                avoid_providers=avoid_providers, force=args.force,
+            )
+        # Show dashboard first for context
+        show_dashboard(accounts, agents)
+        execute_plan(plan, dry_run=args.dry_run, reset=not args.no_reset)
+    elif args.as_json:
+        show_json(accounts, agents)
+    else:
+        show_dashboard(accounts, agents)
+
+
+if __name__ == "__main__":
+    main()

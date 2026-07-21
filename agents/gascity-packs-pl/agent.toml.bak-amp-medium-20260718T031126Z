@@ -1,0 +1,10 @@
+work_dir = "/home/ds/gascity-packs-main"
+provider = "claude-3"
+min_active_sessions = 0
+max_active_sessions = 1
+wake_mode = "resume"
+idle_timeout = "1h"
+
+[env]
+GC_CITY = "/home/ds/gas-city"
+GC_BEADS = "bd"

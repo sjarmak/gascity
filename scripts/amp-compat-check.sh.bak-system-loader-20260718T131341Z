@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly AMP_SETTINGS="${HOME}/.config/amp/settings.json"
+readonly AMP_GUIDANCE="${HOME}/.config/amp/AGENTS.md"
+
+fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+require_file() {
+  local path=$1
+  [ -f "$path" ] || fail "missing $path"
+}
+
+require_file "$AMP_SETTINGS"
+require_file "$AMP_GUIDANCE"
+require_file ".amp/plugins/gas-city.ts"
+require_file "${HOME}/.config/amp/plugins/agent-compat.ts"
+
+jq -e '
+  .["amp.skills.disableClaudeCodeSkills"] == false and
+  (.["amp.skills.path"] | contains(".codex/skills")) and
+  .["amp.thread.autoArchiveOnQuit"] == false and
+  .["amp.git.commit.ampThread.enabled"] == false and
+  .["amp.git.commit.coauthor.enabled"] == false and
+  .["amp.dangerouslyAllowAll"] == true and
+  (.["amp.permissions"][0].tool == "shell_command") and
+  (.["amp.permissions"][0].action == "ask") and
+  any(.["amp.permissions"][0].matches.command[]; . == "*git*push*") and
+  any(.["amp.permissions"][0].matches.command[]; . == "*gh*pr*create*") and
+  any(.["amp.permissions"][0].matches.command[]; . == "*gh*pr*review*") and
+  any(.["amp.permissions"][0].matches.command[]; . == "*rm*rf*") and
+  (.["amp.permissions"][1] == {"tool":"shell_command","action":"allow"}) and
+  (.["amp.permissions"][-1] == {"tool":"*","action":"allow"})
+' "$AMP_SETTINGS" >/dev/null || fail "Amp settings do not preserve shared skills and long-running threads"
+
+rg -q '@~/.claude/rules/common/house-rules.md' "$AMP_GUIDANCE" ||
+  fail "Amp guidance does not include the shared house rules"
+rg -q 'coherent mission' "$AMP_GUIDANCE" ||
+  fail "Amp guidance does not define the long-running thread boundary"
+
+skill_json=$(amp skill list --json)
+jq -e '.errors | length == 0' <<<"$skill_json" >/dev/null ||
+  fail "Amp still reports malformed skills"
+jq -e '
+  [.skills[].name] as $names |
+  ($names | index("gascity-check")) != null and
+  ($names | index("api-design")) != null and
+  ($names | index("cityops-mail-and-coordination")) != null
+' <<<"$skill_json" >/dev/null || fail "Amp did not load Claude, Codex, and project skill sources"
+
+tool_list=$(amp tools list)
+rg -q 'delegate_specialist' <<<"$tool_list" ||
+  fail "Amp specialist compatibility tool is not loaded"
+
+mcp_json=$(amp mcp list --json)
+jq -e '
+  [.[].name] as $names |
+  ($names | index("codegraph")) != null and
+  ($names | index("sourcegraph")) != null and
+  ($names | index("scix")) == null
+' <<<"$mcp_json" >/dev/null ||
+  fail "Amp MCP compatibility or project scoping is incorrect"
+
+permission_result=$(amp permissions test shell_command --command 'gc mail count' --json || true)
+jq -e '.action == "allow"' <<<"$permission_result" >/dev/null ||
+  fail "routine Gas City commands still require approval"
+
+permission_result=$(amp permissions test shell_command --command 'rm -rf /tmp/amp-compat-fixture' --json || true)
+jq -e '.action == "ask"' <<<"$permission_result" >/dev/null ||
+  fail "destructive rm -rf commands do not require approval"
+
+permission_result=$(amp permissions test shell_command --command 'cd /tmp && git push origin main' --json || true)
+jq -e '.action == "ask"' <<<"$permission_result" >/dev/null ||
+  fail "nested git push commands do not require approval"
+
+resolved=$(gc config show --json)
+jq -e '
+  .config.Providers.amp.Args == ["--no-ide", "--mode", "high"] and
+  .config.Providers.amp.SupportsHooks == true and
+  (.config.Providers.amp.ResumeCommand | contains("threads continue"))
+' <<<"$resolved" >/dev/null || fail "Gas City Amp provider is not configured for high-mode resumable orchestration"
+
+if rg -q -- '--dangerously-allow-all' agents/mayor/agent.toml city.toml; then
+  fail "mayor configuration still enables Amp dangerously-allow-all"
+fi
+
+printf 'Amp compatibility checks passed.\n'

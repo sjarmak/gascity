@@ -1,0 +1,9 @@
+scope = "city"
+# Unpinned 2026-07-05 (Stephanie: accounts are fungible, handled by quota) —
+# mayor rebalances like everyone else now. gc-capacity updates BOTH this line
+# and the city.toml [[patches.agent]] mayor block on a move (the patch is what
+# takes effect at launch). Cost of a move: the session cycles and resumes in a
+# different account home without its transcript — mayor's handoff covers it.
+provider = "claude-2"
+max_active_sessions = 1
+idle_timeout = "30m"

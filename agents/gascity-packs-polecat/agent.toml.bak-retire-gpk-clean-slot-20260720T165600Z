@@ -1,0 +1,39 @@
+dir = "/home/ds/gascity-packs"
+work_dir = "/home/ds/gascity-packs-worktrees/{{.AgentBase}}"
+# 2026-07-14 mayor: codex pilot — offload account1 (71% 7d, climbing) to Codex Pro.
+# PILOT: does codex `exec` run our mol-focus-review convoys? Verify before expanding
+# to heavier pools (gascity polecat/6). Revert to claude-1 if convoys don't execute.
+#
+# 2026-07-15 mayor: PILOT REVERTED — its own gate fired. Convoys do NOT execute.
+# Evidence (packs PL, gc-494197/gc-494229, ground-truthed + independently
+# corroborated by `gc session list`): pool at 0/2 live, ~17h zero worker output
+# since the 01:36Z switch; both slots churn spawn -> active -> asleep ->
+# dead-runtime -> respawn in ~90s under new session ids. NOT the codex binary:
+# `codex exec` with this pool's exact command line returns PROBE_OK exit 0
+# (codex-cli 0.144.4, gpt-5.5). Failure is in the session-lifecycle integration
+# for provider=codex, tracked at dr-nxtu. Do NOT re-pilot codex on any pool until
+# dr-nxtu lands — it fails SILENTLY (sessions reach active, then die, never claim).
+# Reverting to claude-2, NOT claude-1 as the gate says: account1 is at 79% 7d and
+# orders/account-quota-warning.toml (QUOTA_AUTO_DRAIN=1, every 30m) drains
+# non-pinned agents off any account >75%, so claude-1 would be flipped back off
+# within the hour. account2 (34%) is the only headroom.
+provider = "claude-2"
+# 2026-07-20 mayor auto-approved 2→3 under the +2 worker-pool flex after
+# gc-524491 proved both existing slots were durably bound to held PR #217 work
+# and the isolated gpk-wi3dh workflow had no safe claim target. Return to 2/2
+# once that repair is branch-ready and the two stale slot bindings are repaired.
+min_active_sessions = 3
+max_active_sessions = 3
+wake_mode = "fresh"
+# 2026-05-29: bumped 2h→6h. Multi-step mol-focus-review convoys (design memos,
+# investigations) run long single Claude turns that emit no bead activity, so
+# the reconciler's idle detector reaped them mid-run at 2h; wake_mode=fresh then
+# replaced the worker fresh and orphaned the convoy (routed_to=NONE, 0 progress).
+# 6h gives long convoys runway to finish before any idle reap. Deeper idle-detect
+# gap (active Claude work counted as idle) tracked at gpk-me1h.
+idle_timeout = "6h"
+
+[env]
+GC_CITY = "/home/ds/gas-city"
+GC_BEADS = "bd"
+CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = "1"

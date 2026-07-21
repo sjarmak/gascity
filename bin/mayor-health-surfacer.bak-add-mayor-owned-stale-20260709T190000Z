@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# mayor-health-surfacer: scan for stalled work, capacity issues, and stuck
+# sessions; nudge mayor with a structured report when there are findings.
+#
+# Designed to fix the "oh XYZ broke and no work has been happening" surprise:
+# silent failures get proactively surfaced instead of discovered ad hoc.
+#
+# Findings are bucketed by category, NOT severity — mayor decides what to
+# surface to the user. Empty report = exit silent (no spam).
+#
+# Categories:
+#   WORK_STALLED     in_progress beads with no recent activity
+#   CAPACITY         accounts hot/down with active worker assignments
+#   SESSIONS         sessions in degraded/blocked/asleep beyond threshold
+#   INFRA            recent mayor-watchdog recoveries (last hour)
+#
+# Usage:
+#   mayor-health-surfacer                   # report only
+#   mayor-health-surfacer --nudge-mayor     # report + nudge mayor on findings
+#   mayor-health-surfacer --stalled-hours N # bead-stale threshold (default 4)
+
+set -uo pipefail
+
+CITY=/home/ds/gas-city
+WATCHDOG_LOG="$CITY/.gc/mayor-watchdog.log"
+STALLED_HOURS="${STALLED_HOURS:-4}"
+NUDGE_MAYOR=0
+
+# Assignees to treat as humans — beads assigned to them are skipped in
+# WORK_STALLED (long-running human work isn't a stall). Override with
+# HUMAN_ASSIGNEES env var (JSON array of strings) if the list changes.
+HUMAN_ASSIGNEES_JSON="${HUMAN_ASSIGNEES:-[\"sjarmak\",\"sjarmak@users.noreply.github.com\"]}"
+JSON_MODE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --nudge-mayor)    NUDGE_MAYOR=1; shift ;;
+    --stalled-hours)  STALLED_HOURS="$2"; shift 2 ;;
+    --json)           JSON_MODE=1; shift ;;
+    -h|--help) sed -n 's/^# \{0,1\}//p' "$0" | head -19; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+NOW_EPOCH=$(date +%s)
+STALL_CUTOFF=$(( NOW_EPOCH - STALLED_HOURS * 3600 ))
+WATCHDOG_LOOKBACK=$(( NOW_EPOCH - 3600 ))
+
+mapfile -t RIGS < <(gc rig list 2>/dev/null | awk '
+  /^  [a-zA-Z][a-zA-Z0-9_-]+/ {
+    suspended = 0
+    for (i = 1; i <= NF; i++) if ($i ~ /suspended/) suspended = 1
+    if (suspended) next
+    name = $1
+    sub(/:$/, "", name)
+    if (name != "ds-research") print name
+  }')
+
+# ---- WORK_STALLED ---------------------------------------------------------
+declare -a STALLED=()
+
+scan_stalled() {
+  local scope=$1 ip
+  if [[ "$scope" == "city" ]]; then
+    ip=$(bd list --status=in_progress --json --limit=0 2>/dev/null || echo '[]')
+  else
+    ip=$(gc bd --rig "$scope" list --status=in_progress --json --limit=0 2>/dev/null || echo '[]')
+  fi
+  jq -r --argjson cutoff "$STALL_CUTOFF" --arg scope "$scope" --argjson humans "$HUMAN_ASSIGNEES_JSON" '
+    .[] |
+    (.updated_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $upd |
+    (.assignee // "") as $a |
+    (.labels // []) as $lbls |
+    select($upd < $cutoff) |
+    select($a != "") |
+    select(($humans | index($a)) | not) |
+    select($lbls | index("human-wip") | not) |
+    [$scope, .id, ((.updated_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601)), (.title // "")] | @tsv
+  ' <<<"$ip" 2>/dev/null || true
+}
+
+while IFS= read -r row; do [[ -n "$row" ]] && STALLED+=("$row"); done < <(scan_stalled city)
+for r in "${RIGS[@]}"; do
+  while IFS= read -r row; do [[ -n "$row" ]] && STALLED+=("$row"); done < <(scan_stalled "$r")
+done
+
+# ---- CAPACITY -------------------------------------------------------------
+declare -a CAPACITY=()
+caps_json=$(gc-capacity --json 2>/dev/null || echo '{"accounts":[]}')
+while IFS= read -r row; do [[ -n "$row" ]] && CAPACITY+=("$row"); done < <(
+  jq -r '.accounts[] |
+    select(
+      (.status == "DOWN") or
+      ((.five_h_pct // 0) >= 80) or
+      (((.seven_d_pct // 0) >= 80) and ((.five_h_pct // 0) >= 50))
+    ) |
+    [.name, .status, ((.five_h_pct // 0) | tostring), ((.seven_d_pct // 0) | tostring), ((.agents // []) | join(","))] | @tsv
+  ' <<<"$caps_json" 2>/dev/null
+)
+
+# ---- SESSIONS -------------------------------------------------------------
+declare -a SESSIONS=()
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  state=$(awk '{print $3}' <<<"$line")
+  case "$state" in
+    degraded|blocked|asleep|creating|suspended) SESSIONS+=("$line") ;;
+  esac
+done < <(gc session list 2>/dev/null | tail -n +2 | awk 'NF>3' | head -50)
+
+# ---- INFRA (watchdog recoveries in past hour) ----------------------------
+declare -a INFRA=()
+if [[ -f "$WATCHDOG_LOG" ]]; then
+  while IFS= read -r evt; do
+    [[ -z "$evt" ]] && continue
+    INFRA+=("$evt")
+  done < <(
+    jq -r --argjson cutoff "$WATCHDOG_LOOKBACK" '
+      select(.event | test("recovery|problems_detected")) |
+      select((.ts | fromdateiso8601) >= $cutoff) |
+      [.ts, .event, .detail] | @tsv
+    ' < "$WATCHDOG_LOG" 2>/dev/null
+  )
+fi
+
+# ---- Aggregate ------------------------------------------------------------
+total=$(( ${#STALLED[@]} + ${#CAPACITY[@]} + ${#SESSIONS[@]} + ${#INFRA[@]} ))
+
+if (( total == 0 )); then
+  exit 0
+fi
+
+# ---- JSON mode (machine-readable findings, one object per line) -----------
+# Used by bin/stall-watch for dedup + eager push. Additive: does not affect
+# the default human-readable report or --nudge-mayor behavior.
+if (( JSON_MODE )); then
+  for row in "${STALLED[@]}"; do
+    IFS=$'\t' read -r scope id upd title <<<"$row"
+    hours=$(( (NOW_EPOCH - upd) / 3600 ))
+    jq -nc --arg key "stall:$id" --arg scope "$scope" --arg id "$id" \
+           --argjson hours "$hours" --arg title "$title" \
+      '{category:"WORK_STALLED",key:$key,scope:$scope,id:$id,hours:$hours,title:$title}'
+  done
+  for row in "${CAPACITY[@]}"; do
+    IFS=$'\t' read -r name status p5h p7d agents <<<"$row"
+    jq -nc --arg key "cap:$name" --arg name "$name" --arg status "$status" \
+           --arg p5h "$p5h" --arg p7d "$p7d" --arg agents "$agents" \
+      '{category:"CAPACITY",key:$key,name:$name,status:$status,five_h:$p5h,seven_d:$p7d,agents:$agents}'
+  done
+  for line in "${SESSIONS[@]}"; do
+    sid=$(awk '{print $1}' <<<"$line")
+    sstate=$(awk '{print $3}' <<<"$line")
+    stmpl=$(awk '{print $2}' <<<"$line")
+    jq -nc --arg key "sess:$sid" --arg id "$sid" --arg state "$sstate" --arg tmpl "$stmpl" \
+      '{category:"SESSIONS",key:$key,id:$id,state:$state,template:$tmpl}'
+  done
+  for evt in "${INFRA[@]}"; do
+    IFS=$'\t' read -r ts event detail <<<"$evt"
+    jq -nc --arg key "infra:$ts" --arg ts "$ts" --arg event "$event" --arg detail "$detail" \
+      '{category:"INFRA",key:$key,ts:$ts,event:$event,detail:$detail}'
+  done
+  exit 0
+fi
+
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
+
+{
+  echo "Health surfacer report — $(date '+%Y-%m-%d %H:%M %Z')"
+  echo "Findings: ${#STALLED[@]} stalled / ${#CAPACITY[@]} capacity / ${#SESSIONS[@]} sessions / ${#INFRA[@]} infra recoveries"
+  echo
+
+  if (( ${#STALLED[@]} > 0 )); then
+    echo "[WORK_STALLED]  beads in_progress > ${STALLED_HOURS}h with no updates"
+    for row in "${STALLED[@]}"; do
+      IFS=$'\t' read -r scope id upd_epoch title <<<"$row"
+      hours=$(( (NOW_EPOCH - upd_epoch) / 3600 ))
+      printf '  %-25s %-22s %4dh  %.60s\n' "$scope" "$id" "$hours" "$title"
+    done
+    echo
+  fi
+
+  if (( ${#CAPACITY[@]} > 0 )); then
+    echo "[CAPACITY]      accounts DOWN or >=80%"
+    for row in "${CAPACITY[@]}"; do
+      IFS=$'\t' read -r name status p5h p7d agents <<<"$row"
+      printf '  %-12s %-6s 5h=%-5s 7d=%-5s agents=%s\n' "$name" "$status" "$p5h%" "$p7d%" "$agents"
+    done
+    echo
+  fi
+
+  if (( ${#SESSIONS[@]} > 0 )); then
+    echo "[SESSIONS]      not in 'active' state"
+    for line in "${SESSIONS[@]}"; do
+      printf '  %s\n' "$line"
+    done
+    echo
+  fi
+
+  if (( ${#INFRA[@]} > 0 )); then
+    echo "[INFRA]         mayor-watchdog events (last hour)"
+    for evt in "${INFRA[@]}"; do
+      IFS=$'\t' read -r ts event detail <<<"$evt"
+      printf '  %s  %-22s %s\n' "$ts" "$event" "$detail"
+    done
+    echo
+  fi
+} > "$out"
+
+cat "$out"
+
+if (( NUDGE_MAYOR )); then
+  msg="mayor-health-surfacer
+$(cat "$out")
+
+Read each finding and decide: act now, schedule, or defer. Surface anything human-relevant to stephanie at next interaction."
+  gc session nudge mayor "$msg" 2>/dev/null || \
+    echo "warn: gc session nudge mayor failed (mayor may be asleep); report still in journal" >&2
+fi
+
+exit 0

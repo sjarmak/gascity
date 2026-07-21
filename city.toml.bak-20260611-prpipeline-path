@@ -1,0 +1,342 @@
+[workspace]
+provider = "claude-4"
+includes = [".gc/system/packs/core"]
+
+[providers]
+[providers.claude-1]
+display_name = "Claude (Account 1)"
+command = "/home/ds/gas-city/bin/claude-account"
+args = ["1"]
+prompt_mode = "arg"
+ready_delay_ms = 0
+ready_prompt_prefix = "❯"
+process_names = ["claude"]
+supports_hooks = true
+instructions_file = "CLAUDE.md"
+resume_flag = "--resume"
+resume_style = "flag"
+session_id_flag = "--session-id"
+[providers.claude-1.env]
+DISABLE_INTERACTIVITY = "1"
+[providers.claude-2]
+display_name = "Claude (Account 2)"
+command = "/home/ds/gas-city/bin/claude-account"
+args = ["2"]
+prompt_mode = "arg"
+ready_delay_ms = 0
+ready_prompt_prefix = "❯"
+process_names = ["claude"]
+supports_hooks = true
+instructions_file = "CLAUDE.md"
+resume_flag = "--resume"
+resume_style = "flag"
+session_id_flag = "--session-id"
+[providers.claude-2.env]
+DISABLE_INTERACTIVITY = "1"
+[providers.claude-3]
+display_name = "Claude (Account 3)"
+command = "/home/ds/gas-city/bin/claude-account"
+args = ["3"]
+prompt_mode = "arg"
+ready_delay_ms = 0
+ready_prompt_prefix = "❯"
+process_names = ["claude"]
+supports_hooks = true
+instructions_file = "CLAUDE.md"
+resume_flag = "--resume"
+resume_style = "flag"
+session_id_flag = "--session-id"
+[providers.claude-3.env]
+DISABLE_INTERACTIVITY = "1"
+[providers.claude-4]
+display_name = "Claude (Account 4)"
+command = "/home/ds/gas-city/bin/claude-account"
+args = ["4"]
+prompt_mode = "arg"
+ready_delay_ms = 0
+ready_prompt_prefix = "❯"
+process_names = ["claude"]
+supports_hooks = true
+instructions_file = "CLAUDE.md"
+resume_flag = "--resume"
+resume_style = "flag"
+session_id_flag = "--session-id"
+[providers.claude-4.env]
+DISABLE_INTERACTIVITY = "1"
+[providers.claude-5]
+display_name = "Claude (Account 5)"
+command = "/home/ds/gas-city/bin/claude-account"
+args = ["5"]
+prompt_mode = "arg"
+ready_delay_ms = 0
+ready_prompt_prefix = "❯"
+process_names = ["claude"]
+supports_hooks = true
+instructions_file = "CLAUDE.md"
+resume_flag = "--resume"
+resume_style = "flag"
+session_id_flag = "--session-id"
+[providers.claude-5.env]
+DISABLE_INTERACTIVITY = "1"
+[providers.claude-auto]
+display_name = "Claude (auto-balanced via csu)"
+command = "/home/ds/gas-city/bin/claude-account"
+args = ["auto"]
+prompt_mode = "arg"
+ready_delay_ms = 0
+ready_prompt_prefix = "❯"
+process_names = ["claude"]
+supports_hooks = true
+instructions_file = "CLAUDE.md"
+resume_flag = "--resume"
+resume_style = "flag"
+session_id_flag = "--session-id"
+[providers.claude-auto.env]
+DISABLE_INTERACTIVITY = "1"
+[providers.codex]
+base = "builtin:codex"
+display_name = "Codex CLI"
+command = "/home/ds/.nvm/versions/node/v22.22.2/bin/codex"
+args = ["exec", "--sandbox=danger-full-access"]
+prompt_mode = "arg"
+ready_delay_ms = 0
+ready_prompt_prefix = ">"
+process_names = ["codex"]
+resume_command = "/home/ds/.nvm/versions/node/v22.22.2/bin/codex resume {{.SessionKey}}"
+
+[imports]
+[imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+[imports.slack]
+source = "/home/ds/gascity-packs/slack-pack"
+
+[[named_session]]
+template = "mayor"
+mode = "always"
+
+[[rigs]]
+name = "codescalebench"
+prefix = "co"
+[rigs.imports]
+[rigs.imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+
+[[rigs.overrides]]
+agent = "project-lead"
+provider = "claude-auto"
+
+[[rigs]]
+name = "enterprisebench"
+prefix = "EnterpriseBench"
+[rigs.imports]
+[rigs.imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+
+[[rigs.overrides]]
+agent = "project-lead"
+suspended = true
+provider = "claude-auto"
+
+[[rigs]]
+name = "codeprobe"
+prefix = "codeprobe"
+[rigs.imports]
+[rigs.imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+
+[[rigs.overrides]]
+agent = "project-lead"
+suspended = true
+provider = "claude-auto"
+
+[[rigs]]
+name = "agent-diagnostics"
+prefix = "agent-diagnostics"
+suspended_on_start = true
+[rigs.imports]
+[rigs.imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+
+[[rigs.overrides]]
+agent = "project-lead"
+provider = "claude-auto"
+
+[[rigs]]
+name = "scix-experiments"
+prefix = "scix_experiments"
+[rigs.imports]
+[rigs.imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+
+[[rigs.overrides]]
+agent = "project-lead"
+suspended = true
+provider = "claude-auto"
+
+[[rigs]]
+name = "background-agents"
+prefix = "background-agents"
+suspended_on_start = true
+[rigs.imports]
+[rigs.imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+
+[[rigs.overrides]]
+agent = "project-lead"
+provider = "claude-auto"
+
+[[rigs]]
+name = "geo"
+prefix = "GEO"
+suspended_on_start = true
+[rigs.imports]
+[rigs.imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+
+[[rigs.overrides]]
+agent = "project-lead"
+provider = "claude-auto"
+
+[[rigs]]
+name = "mcp-ax"
+prefix = "mcp-ax"
+suspended_on_start = true
+[rigs.imports]
+[rigs.imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+
+[[rigs.overrides]]
+agent = "project-lead"
+provider = "claude-auto"
+
+[[rigs]]
+name = "live_docs"
+prefix = "live_docs"
+suspended_on_start = true
+[rigs.imports]
+[rigs.imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+
+[[rigs.overrides]]
+agent = "project-lead"
+provider = "claude-auto"
+
+[[rigs]]
+name = "code-intelligence-digest"
+prefix = "code-intel-digest"
+suspended_on_start = true
+[rigs.imports]
+[rigs.imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+
+[[rigs.overrides]]
+agent = "project-lead"
+provider = "claude-auto"
+
+[[rigs]]
+name = "gascity"
+prefix = "gc"
+default_sling_target = "polecat"
+[rigs.imports]
+[rigs.imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+[rigs.imports.pr-pipeline]
+source = "/home/ds/gascity-packs-main/pr-pipeline"
+[rigs.imports.pr-review]
+source = "/home/ds/gascity-packs-main/pr-review"
+
+[[rigs.overrides]]
+agent = "project-lead"
+suspended = true
+provider = "claude-auto"
+
+[[rigs]]
+name = "zeldascension"
+prefix = "zeldascension"
+[rigs.imports]
+[rigs.imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+
+[[rigs.overrides]]
+agent = "project-lead"
+provider = "claude-auto"
+wake_mode = "fresh"
+
+[[rigs]]
+name = "migration-evals"
+prefix = "migration_evals"
+[rigs.imports]
+[rigs.imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+
+[[rigs.overrides]]
+agent = "project-lead"
+suspended = true
+provider = "claude-auto"
+
+[[rigs]]
+name = "gascity-packs"
+prefix = "gpk"
+[rigs.imports]
+[rigs.imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+[rigs.imports.pr-pipeline]
+source = "/home/ds/gascity-packs-main/pr-pipeline"
+
+[[rigs]]
+name = "gascity-dashboard"
+prefix = "gascity-dashboard"
+default_branch = "main"
+[rigs.imports]
+[rigs.imports.oversight-rig]
+source = "/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig"
+
+[[rigs.overrides]]
+agent = "project-lead"
+suspended = true
+provider = "claude-auto"
+
+[[rigs]]
+name = "decisions"
+prefix = "dec"
+
+[[rigs]]
+name = "mem"
+
+[patches]
+
+[[patches.agent]]
+dir = ""
+name = "chief-of-staff"
+suspended = true
+
+[[patches.agent]]
+dir = ""
+name = "mayor"
+provider = "claude-auto"
+
+[beads]
+provider = "file"
+
+[session]
+startup_timeout = "30m"
+
+[daemon]
+formula_v2 = true
+patrol_interval = "2m"
+max_restarts = 5
+restart_window = "1h"
+observe_paths = ["/home/ds/.claude/projects/-home-ds-CodeScaleBench", "/home/ds/.claude/projects/-home-ds-EnterpriseBench", "/home/ds/.claude/projects/-home-ds-codeprobe", "/home/ds/.claude/projects/-home-ds-agent-diagnostics", "/home/ds/.claude/projects/-home-ds-background-agents", "/home/ds/.claude/projects/-home-ds-scix-experiments", "/home/ds/.claude/projects/-home-ds-GEO", "/home/ds/.claude/projects/-home-ds-mcp-ax", "/home/ds/.claude/projects/-home-ds-gascity"]
+max_wakes_per_tick = 15
+
+[api]
+port = 9443
+bind = "127.0.0.1"
+
+[convergence]
+max_per_agent = 2
+max_total = 10
+
+[agent_defaults]
+wake_mode = "resume"
+default_sling_formula = "mol-focus-review"

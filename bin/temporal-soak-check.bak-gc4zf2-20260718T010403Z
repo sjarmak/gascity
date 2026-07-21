@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# temporal-soak-check — watch the P5 Temporal-only soak for OUTCOME, not liveness.
+#
+# Why this exists (2026-07-16, epic gc-4zf / gate bead gc-372): the P5 gate is
+# "one clean week of Temporal-only operation", and NOTHING measured it. Every
+# liveness signal was already green during the 07-16 incident in which zero work
+# dispatched for hours: systemd active, workflows reporting Completed, worker
+# healthy. A human reading journals was the only detector. The epic's own
+# finding is that the city's covers check LIVENESS and not OUTCOME, and that a
+# failed cycle erases its own evidence — the next fire gets a fresh per-fire
+# cycleKey and looks perfectly healthy. So this checks what actually came out:
+# did cycles fire, did they dispatch beads, did any drop on the floor.
+#
+# The five checks, each tied to observed evidence:
+#   A schedule-paused    the pipeline is simply off (rollback left it disarmed)
+#   B workflow-failed    gc-4zf.4's exact signature: a crash mid-sling FAILS the
+#                        workflow, leaves a poisoned pending claim, and escalates
+#                        NOTHING. Proven by chaos test 2026-07-16.
+#   C no-recent-fire     gc-qo3's blind spot: maintenance-cycle sat de-registered
+#                        for 10 DAYS unnoticed. Formulated as the epic prescribes
+#                        — "did this fire within 2x its cadence?" — which is
+#                        level-triggered and cannot drift.
+#   D orphan-bead        a cycle bead left open with routed_to unset = a dropped
+#                        dispatch (gc-4qz, gc-s5c, gc-q4s all sat this way; the
+#                        07-16 chaos test produced one and nothing noticed).
+#   E nothing-flowing    THE most important class: cycles Completed but dispatched
+#                        zero beads across the window. Green everywhere, no work.
+#
+# Scope: reports, never repairs. A red soak is a human's call — same contract as
+# Track B's harness (gc-4zf.2) and city-selftest. It creates nothing, closes
+# nothing, and re-arms nothing.
+#
+# Read-only: every call is a query (temporal schedule describe / workflow list /
+# workflow show, gc bd list). Safe to re-fire; fail-open on timeout
+# (gastownhall/gascity#2893) — a killed run escalates nothing and the next tick
+# retries rather than blocking other work.
+#
+# KNOWN GAP, recorded deliberately: this watcher is an ORDER, and the epic's
+# corollary is that orders are what silently dies. If the order system stops,
+# this check dies with it and the soak goes unwatched — exactly the substrate
+# question Track A (gc-4zf.1) must answer. It is not circular (the order system
+# watches Temporal, an independent failure domain, not itself), but it is not
+# immune either. That gap is evidence for the epic, not a reason to skip the check.
+#
+# Usage:
+#   temporal-soak-check              # dry-run: print what would be posted
+#   temporal-soak-check --push       # live: post to #gascity-maintenance
+#
+# Env:
+#   TEMPORAL_SOAK_ADDRESS       Temporal gRPC (default 127.0.0.1:7233)
+#   TEMPORAL_SOAK_NAMESPACE     namespace (default maintenance)
+#   TEMPORAL_SOAK_SCHEDULE      schedule id (default maintenance-cycle)
+#   TEMPORAL_SOAK_CADENCE_MIN   schedule cadence in minutes (default 120)
+#   TEMPORAL_SOAK_WINDOW_HOURS  lookback for B/E (default 24)
+#   TEMPORAL_SOAK_ORPHAN_MIN    bead age before routed_to unset is a drop (default 15)
+#   TEMPORAL_SOAK_MAX_SHOW      cap on per-cycle result fetches (default 12)
+#   TEMPORAL_SOAK_REALERT_HOURS re-alert window while red (default 24)
+#   TEMPORAL_SOAK_CHANNEL       Slack channel (default C0B25SS12CD)
+
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${TEMPORAL_SOAK_AUDIT_LOG:-${CITY}/.gc/temporal-soak-check.log}"
+STATE_FILE="${TEMPORAL_SOAK_STATE:-${CITY}/.gc/temporal-soak-check-state.json}"
+ADDRESS="${TEMPORAL_SOAK_ADDRESS:-127.0.0.1:7233}"
+NAMESPACE="${TEMPORAL_SOAK_NAMESPACE:-maintenance}"
+SCHEDULE="${TEMPORAL_SOAK_SCHEDULE:-maintenance-cycle}"
+CADENCE_MIN="${TEMPORAL_SOAK_CADENCE_MIN:-120}"
+WINDOW_HOURS="${TEMPORAL_SOAK_WINDOW_HOURS:-24}"
+ORPHAN_MIN="${TEMPORAL_SOAK_ORPHAN_MIN:-15}"
+REALERT_HOURS="${TEMPORAL_SOAK_REALERT_HOURS:-24}"
+CHANNEL="${TEMPORAL_SOAK_CHANNEL:-C0B25SS12CD}"
+RIG="${TEMPORAL_SOAK_RIG:-gascity}"
+CALL_TIMEOUT="${TEMPORAL_SOAK_CALL_TIMEOUT:-20}"
+MAX_SHOW="${TEMPORAL_SOAK_MAX_SHOW:-12}"   # cap on per-cycle result fetches; see timeout math in the order
+
+# The CLI is a go install; an order's PATH is not a login shell's.
+export PATH="$PATH:${HOME}/go/bin"
+TCTL="${TEMPORAL_SOAK_CLI:-temporal}"
+
+PUSH=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --push) PUSH=1; shift ;;
+    -h|--help) sed -n 's/^# \{0,1\}//p' "$0" | head -60; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+now_epoch=$(date +%s)
+
+log_event() { # log_event <event> <check> [extra-json]
+  [[ -d "${AUDIT_LOG%/*}" ]] || return 0
+  local extra=${3:-}
+  [[ -n "$extra" ]] || extra='{}'   # a quoted default reaches jq as invalid JSON
+  jq -cn --arg ts "$(ts)" --arg event "$1" --arg check "$2" --argjson extra "$extra" \
+    '{ts:$ts, event:$event, check:$check} + $extra' >> "$AUDIT_LOG" 2>/dev/null || true
+}
+
+tq() { timeout "$CALL_TIMEOUT" "$TCTL" "$@" --address "$ADDRESS" --namespace "$NAMESPACE" 2>/dev/null; }
+
+# Findings accumulate as JSON, not delimited lines: a finding's text is
+# deliberately multi-line (code fences, id lists), so any newline-separated
+# record format splits one finding into several bogus ones — each fence line
+# then reports as its own NEW alert. Caught on the first live dry-run.
+#
+# Optional 4th arg is a FINGERPRINT of the finding's subject (e.g. the set of
+# failed workflow ids). Without it a coarse key masks new evidence: while
+# "workflow-failed" sits red for a known failure, a BRAND NEW failed cycle
+# would not re-alert until the re-alert window elapsed — the check would go
+# quiet exactly when something new broke, which is the silent-failure shape
+# this whole epic is about. A changed fingerprint re-alerts immediately.
+findings='[]'
+add_finding() {
+  findings=$(jq -c --arg k "$1" --arg e "$2" --arg t "$3" --arg f "${4:-}" \
+    '. + [{key:$k, emoji:$e, text:$t, fingerprint:$f}]' <<<"$findings")
+}
+
+# ---------------------------------------------------------------- A: schedule
+sched=$(tq schedule describe --schedule-id "$SCHEDULE" -o json)
+if [[ -z "$sched" ]]; then
+  add_finding "schedule-missing" "🔴" "Schedule *${SCHEDULE}* not found in namespace \`${NAMESPACE}\` — the soak is not running. (Rollback leaves it deleted; re-arm with deploy/schedule-arm.sh.)"
+else
+  paused=$(jq -r '.schedule.state.paused // false' <<<"$sched" 2>/dev/null)
+  if [[ "$paused" == "true" ]]; then
+    note=$(jq -r '.schedule.state.notes // ""' <<<"$sched" 2>/dev/null)
+    add_finding "schedule-paused" "🔴" "Schedule *${SCHEDULE}* is PAUSED — no cycles will fire. Note: ${note:-<none>}"
+  fi
+fi
+
+# ------------------------------------------------- workflow window (B, C, E)
+cutoff_epoch=$(( now_epoch - WINDOW_HOURS * 3600 ))
+wf_json=$(tq workflow list --limit 100 -o json)
+
+if [[ -z "$wf_json" ]] || ! jq -e . >/dev/null 2>&1 <<<"$wf_json"; then
+  # Fail-open: an unreachable server is reported, not silently treated as green.
+  add_finding "temporal-unreachable" "🔴" "Cannot reach Temporal at \`${ADDRESS}\` (namespace \`${NAMESPACE}\`) — soak state UNKNOWN, not green."
+  log_event "unreachable" "-" "$(jq -cn --arg a "$ADDRESS" '{address:$a}')"
+else
+  # Only real cycles: the deploy-smoke workflow shares the type but is not a fire.
+  cycles=$(jq -c --argjson cut "$cutoff_epoch" '
+    [ .[]
+      | select(.execution.workflowId | startswith("maintenance-cycle-"))
+      | {id: .execution.workflowId,
+         status: (.status | sub("WORKFLOW_EXECUTION_STATUS_";"")),
+         start: .startTime}
+      | select((.start | sub("\\.[0-9]+";"") | fromdateiso8601) >= $cut)
+    ]' <<<"$wf_json" 2>/dev/null)
+  [[ -n "$cycles" ]] || cycles='[]'
+
+  n_total=$(jq 'length' <<<"$cycles")
+  n_bad=$(jq '[.[] | select(.status == "FAILED" or .status == "TERMINATED" or .status == "TIMED_OUT")] | length' <<<"$cycles")
+  n_done=$(jq '[.[] | select(.status == "COMPLETED")] | length' <<<"$cycles")
+
+  # B — a failed cycle escalates nothing today. That is gc-4zf.4.
+  if (( n_bad > 0 )); then
+    bad_ids=$(jq -r '[.[] | select(.status == "FAILED" or .status == "TERMINATED" or .status == "TIMED_OUT") | "\(.id) [\(.status)]"] | .[0:4] | join("\n")' <<<"$cycles")
+    bad_fp=$(jq -r '[.[] | select(.status == "FAILED" or .status == "TERMINATED" or .status == "TIMED_OUT") | .id] | sort | join(",")' <<<"$cycles")
+    add_finding "workflow-failed" "🔴" "*${n_bad}* cycle(s) FAILED/TERMINATED in the last ${WINDOW_HOURS}h — a dropped cycle escalates nothing on its own (gc-4zf.4). Check for a poisoned pending claim + an orphan bead:"$'\n'"\`\`\`"$'\n'"${bad_ids}"$'\n'"\`\`\`" "$bad_fp"
+  fi
+
+  # C — "did it fire within 2x its cadence?" (gc-qo3's 10-day blind spot).
+  stale_min=$(( CADENCE_MIN * 2 ))
+  last_start=$(jq -r 'sort_by(.start) | last | .start // ""' <<<"$cycles")
+  if [[ -z "$last_start" ]]; then
+    add_finding "no-recent-fire" "🔴" "NO cycle fired in the last ${WINDOW_HOURS}h. Expected roughly every ${CADENCE_MIN}m. This is the gc-qo3 shape — maintenance sat de-registered 10 days before a human noticed."
+  else
+    last_epoch=$(date -u -d "$(sed -E 's/\.[0-9]+//' <<<"$last_start")" +%s 2>/dev/null || echo 0)
+    age_min=$(( (now_epoch - last_epoch) / 60 ))
+    if (( last_epoch > 0 && age_min > stale_min )); then
+      add_finding "no-recent-fire" "🔴" "Last cycle fired *${age_min}m* ago — past 2x the ${CADENCE_MIN}m cadence (${stale_min}m). The schedule is armed but not producing."
+    fi
+  fi
+
+  # E — Completed but dispatched nothing: green everywhere, no work.
+  # Bounded: one `workflow show` per completed cycle, capped so a hung Temporal
+  # cannot eat the order timeout (worst case MAX_SHOW * CALL_TIMEOUT). The cap
+  # is logged, never silent — a truncated scan that reports "green" would be the
+  # very false-green this check exists to prevent.
+  dispatched_total=0
+  outcomes=""
+  n_show=0   # fetches ATTEMPTED (bounds the cap)
+  n_ok=0     # results actually DECODED (bounds the verdict)
+  if (( n_done > MAX_SHOW )); then
+    log_event "capped" "nothing-flowing" "$(jq -cn --argjson d "$n_done" --argjson m "$MAX_SHOW" \
+      '{completed:$d, inspected:$m, note:"outcome scan capped; newest first"}')"
+  fi
+  for wid in $(jq -r '[.[] | select(.status == "COMPLETED")] | sort_by(.start) | reverse | .[].id' <<<"$cycles"); do
+    (( n_show >= MAX_SHOW )) && break
+    n_show=$(( n_show + 1 ))
+    res=$(tq workflow show --workflow-id "$wid" -o json \
+      | jq -r '[.events[] | select(.workflowExecutionCompletedEventAttributes)]
+               | .[0].workflowExecutionCompletedEventAttributes.result.payloads[0].data // ""' 2>/dev/null)
+    [[ -n "$res" ]] || continue
+    decoded=$(base64 -d <<<"$res" 2>/dev/null) || continue
+    jq -e . >/dev/null 2>&1 <<<"$decoded" || continue
+    n_ok=$(( n_ok + 1 ))
+    n_beads=$(jq -r '(.bead_ids // []) | length' <<<"$decoded" 2>/dev/null || echo 0)
+    outcome=$(jq -r '.terminal_outcome // "?"' <<<"$decoded" 2>/dev/null || echo "?")
+    dispatched_total=$(( dispatched_total + n_beads ))
+    outcomes+="${outcome}:${n_beads} "
+  done
+
+  # n_ok, not n_show: a result we could not fetch is UNKNOWN, not evidence of
+  # zero dispatch. Judging on attempts would turn a read failure into a false
+  # "nothing flowing" red — crying wolf on the one check that must be believed.
+  if (( n_ok >= 2 && dispatched_total == 0 )); then
+    add_finding "nothing-flowing" "🔴" "*${n_ok}* of ${n_done} completed cycles inspected in the last ${WINDOW_HOURS}h dispatched *ZERO* beads. Every liveness signal is green and no work is flowing — the 2026-07-16 shape. Outcomes: \`${outcomes:-none}\`"
+  fi
+
+  log_event "window" "-" "$(jq -cn --argjson t "$n_total" --argjson b "$n_bad" \
+    --argjson d "$n_done" --argjson beads "$dispatched_total" --argjson ok "${n_ok:-0}" \
+    '{cycles:$t, failed:$b, completed:$d, inspected:$ok, beads_dispatched:$beads}')"
+fi
+
+# ------------------------------------------------------------- D: orphan bead
+# A cycle bead open with routed_to unset past ORPHAN_MIN = a dropped dispatch.
+orphans=$(timeout "$CALL_TIMEOUT" gc bd --rig "$RIG" list --label maintenance-cycle --status open --json 2>/dev/null \
+  | jq -r --argjson cut "$(( now_epoch - ORPHAN_MIN * 60 ))" '
+      [ .[]
+        | select((.metadata["gc.routed_to"] // "") == "")
+        | select(((.created // .updated // "") | sub("\\.[0-9]+";"") | sub("Z$";"Z")
+                  | try fromdateiso8601 catch 0) <= $cut)
+        | .id ]
+      | join(", ")' 2>/dev/null)
+
+if [[ -n "$orphans" && "$orphans" != "null" ]]; then
+  add_finding "orphan-bead" "🔴" "Cycle bead(s) open with *routed_to unset* for >${ORPHAN_MIN}m — created but never slung (a dropped dispatch): \`${orphans}\`" "$orphans"
+fi
+
+# ------------------------------------------------------------------ dedup+post
+[[ -f "$STATE_FILE" ]] || echo '{}' > "$STATE_FILE"
+state=$(cat "$STATE_FILE" 2>/dev/null); [[ -n "$state" ]] || state='{}'
+jq -e . >/dev/null 2>&1 <<<"$state" || state='{}'   # corrupt state -> start clean
+new_state="$state"
+
+report=""
+seen_keys=""
+n_findings=$(jq 'length' <<<"$findings")
+for i in $(seq 0 $(( n_findings - 1 )) 2>/dev/null); do
+  key=$(jq -r --argjson i "$i" '.[$i].key' <<<"$findings")
+  emoji=$(jq -r --argjson i "$i" '.[$i].emoji' <<<"$findings")
+  text=$(jq -r --argjson i "$i" '.[$i].text' <<<"$findings")
+  fp=$(jq -r --argjson i "$i" '.[$i].fingerprint // ""' <<<"$findings")
+  [[ -n "$key" ]] || continue
+  seen_keys+="$key "
+  prev=$(jq -r --arg k "$key" '.[$k].status // "green"' <<<"$state")
+  prev_fp=$(jq -r --arg k "$key" '.[$k].fingerprint // ""' <<<"$state")
+  last_alert=$(jq -r --arg k "$key" '.[$k].last_alert // 0' <<<"$state")
+  kind=""
+  if [[ "$prev" != "red" ]]; then
+    kind="NEW"
+  elif [[ -n "$fp" && "$fp" != "$prev_fp" ]]; then
+    kind="NEW EVIDENCE"                                   # same check, new subject
+  elif (( now_epoch - last_alert >= REALERT_HOURS * 3600 )); then
+    kind="STILL RED"
+  fi
+  [[ -n "$kind" ]] && report+="${emoji} *${key}* — ${kind}"$'\n'"${text}"$'\n\n'
+  new_state=$(jq --arg k "$key" --arg f "$fp" --argjson t "$now_epoch" \
+    '.[$k] = {status:"red",
+              fingerprint:$f,
+              since:(if (.[$k].status // "") == "red" then (.[$k].since // $t) else $t end),
+              last_alert:(.[$k].last_alert // 0)}' <<<"$new_state")
+  log_event "red" "$key" "$(jq -cn --arg f "$fp" '{fingerprint:$f}')"
+done
+
+# Recovery: a key that was red and is not in this tick's findings has cleared.
+# The type guard is load-bearing: the state file is hand-editable (it carries a
+# seeded "_note" string), and a non-object value would otherwise abort this loop
+# with a jq error — silently skipping every RECOVERED transition.
+for k in $(jq -rn --argjson s "$new_state" \
+    '$s | to_entries[] | select((.value | type) == "object") | select(.value.status == "red") | .key'); do
+  case " $seen_keys " in
+    *" $k "*) ;;
+    *) report+="✅ *${k}* — RECOVERED"$'\n\n'
+       new_state=$(jq --arg k "$k" 'del(.[$k])' <<<"$new_state")
+       log_event "recovered" "$k" "" ;;
+  esac
+done
+
+n_red=$(wc -w <<<"$seen_keys" | tr -d ' ')
+log_event "tick" "-" "$(jq -cn --argjson r "${n_red:-0}" '{red:$r}')"
+
+if [[ -z "$report" ]]; then
+  echo "$(ts) temporal-soak-check: ${n_red:-0} red check(s), nothing new to escalate"
+  echo "$new_state" > "$STATE_FILE"
+  exit 0
+fi
+
+msg=$(mktemp); trap 'rm -f "$msg"' EXIT
+{
+  echo "*temporal-soak-check* — P5 Temporal-only soak (gate bead gc-372, epic gc-4zf)"
+  echo ""
+  echo "$report"
+  echo "_This reports only; it never re-arms or repairs. Inspect:_ \`temporal workflow list --namespace ${NAMESPACE} --address ${ADDRESS}\`"
+} > "$msg"
+
+if (( ! PUSH )); then
+  echo "=== temporal-soak-check DRY-RUN (would post to $CHANNEL) ==="
+  cat "$msg"
+  echo "=== state NOT advanced (dry-run) ==="
+  exit 0
+fi
+
+if gc slack publish-to-channel --conversation-id "$CHANNEL" --kind room \
+     --body-file "$msg" >/dev/null 2>&1; then
+  # Only now advance last_alert, so a failed post retries next tick.
+  for k in $seen_keys; do
+    new_state=$(jq --arg k "$k" --argjson t "$now_epoch" '.[$k].last_alert = $t' <<<"$new_state")
+  done
+  echo "$new_state" > "$STATE_FILE"
+  log_event "pushed" "-" "$(jq -cn --arg c "$CHANNEL" '{channel:$c}')"
+  gc session nudge mayor "temporal-soak-check: soak state changed
+$(cat "$msg")" >/dev/null 2>&1 || true
+else
+  # State NOT advanced: retry next tick rather than swallow the finding.
+  log_event "push-failed" "-" "$(jq -cn --arg c "$CHANNEL" '{channel:$c, note:"state not advanced; will retry"}')"
+  echo "$(ts) temporal-soak-check: ERROR publish -> $CHANNEL failed; will retry" >&2
+  exit 1
+fi

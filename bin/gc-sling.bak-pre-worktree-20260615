@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# gc-sling: thin wrapper around `gc sling` that auto-injects `--on <formula>`
+# when the bead ID matches a rule in .gc/sling-intercept.yaml.
+#
+# Default-safe: if no rule matches, or the caller has already specified
+# --on / --formula / --no-formula, this is a pure pass-through.
+#
+# Use this instead of raw `gc sling` for any dispatch where a bead prefix
+# implies a specific review/evidence formula (e.g. codeprobe-br7).
+#
+# Adoption is by convention — CLAUDE.md documents which dispatches should
+# use gc-sling. The log at .gc/sling-intercept.log records every decision,
+# so mayor-pattern-miner can surface how often the intercept fires.
+#
+# Usage: gc-sling [target] <bead-or-formula-or-text> [flags...]
+# Flags: exactly the same as `gc sling`. Run `gc sling --help` for details.
+
+set -euo pipefail
+
+CONFIG="${GC_SLING_INTERCEPT_CONFIG:-/home/ds/gas-city/.gc/sling-intercept.yaml}"
+LOG="${GC_SLING_INTERCEPT_LOG:-/home/ds/gas-city/.gc/sling-intercept.log}"
+
+log_event() {
+  # log_event <event> <bead> <target> <formula> <reason>
+  local ts event bead target formula reason
+  # UTC Z-form so jq fromdateiso8601 can parse (local offsets silently break it).
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  event=$1; bead=$2; target=$3; formula=$4; reason=$5
+  [[ -d "${LOG%/*}" ]] || return 0
+  jq -cn --arg ts "$ts" \
+         --arg event "$event" \
+         --arg bead "$bead" \
+         --arg target "$target" \
+         --arg formula "$formula" \
+         --arg reason "$reason" \
+    '{ts:$ts, event:$event, bead:$bead, target:$target, formula:$formula, reason:$reason}' \
+    >> "$LOG" 2>/dev/null || true
+}
+
+if [[ $# -eq 0 ]]; then
+  exec gc sling "$@"
+fi
+
+# Pass --help straight through.
+case "${1:-}" in
+  -h|--help)
+    gc sling --help
+    echo
+    echo "gc-sling: thin intercept wrapper. See $CONFIG for auto-injection rules."
+    echo "         Pass-through in all cases except bead matches a rule AND no"
+    echo "         formula flag is present."
+    exit 0 ;;
+esac
+
+# Parse args to find: target (first positional), bead (second positional),
+# and whether any formula-intent or nudge flag is already set.
+args=("$@")
+has_on=0
+has_formula=0
+has_no_formula=0
+has_nudge=0
+has_no_nudge=0   # wrapper-only flag — opt out of default --nudge injection
+target=""
+bead=""
+prev=""
+
+# Flags that take a value after them (so the following token is NOT positional).
+value_taking_flags=("--on" "-t" "--title" "--var" "--scope-kind" "--scope-ref" \
+                    "--merge" "--city" "--rig")
+
+is_value_for_prev() {
+  local p=$1
+  for f in "${value_taking_flags[@]}"; do
+    [[ "$p" == "$f" ]] && return 0
+  done
+  return 1
+}
+
+for a in "${args[@]}"; do
+  case "$a" in
+    --on|--on=*)                has_on=1 ;;
+    -f|--formula|--formula=*)   has_formula=1 ;;
+    --no-formula)               has_no_formula=1 ;;
+    --nudge)                    has_nudge=1 ;;
+    --no-nudge)                 has_no_nudge=1 ;;
+    --)                         break ;;
+    -*)                         : ;;
+    *)
+      if is_value_for_prev "$prev"; then
+        :
+      elif [[ -z "$target" ]]; then
+        target="$a"
+      elif [[ -z "$bead" ]]; then
+        bead="$a"
+      fi ;;
+  esac
+  prev="$a"
+done
+
+# Pre-flight dead-target guard. Routing to a target whose pool has zero live
+# sessions (a mistyped target, or a min=0 pool with no worker that won't spawn
+# — e.g. `gascity/codex`, which has no workers) silently strands the bead:
+# `gc sling` exits 0, the bead is stamped gc.routed_to, and nothing ever claims
+# it. This turns that silent strand into a loud warning at dispatch time.
+# gascity-rig code work belongs on target `polecat`, not `gascity/codex`.
+if [[ -n "$target" ]]; then
+  # The sling target is an alias (e.g. `polecat`); sessions are stored under the
+  # resolved template path (e.g. `/home/ds/gascity/polecat`), so an exact
+  # --template match on the alias misses live sessions. Match on the target's
+  # basename (slot suffix stripped) against each session's template/work_dir
+  # basename in a single list call.
+  tbase="${target##*/}"; tbase="${tbase%-[0-9]*}"
+  live=$(gc session list --json 2>/dev/null | jq -r --arg t "$target" --arg tb "$tbase" '
+    [ ((.sessions // .) // [])[]
+      | select(((.state // .State // "") | ascii_downcase) != "closed")
+      | select(
+          ((.template // .Template // "") == $t)
+          or (((.template // .Template // "") | split("/") | last | sub("-[0-9]+$";"")) == $tb)
+          or (((.work_dir // .WorkDir // "") | split("/") | last | sub("-[0-9]+$";"")) == $tb)
+        )
+    ] | length' 2>/dev/null || echo 0)
+  if [[ "${live:-0}" -eq 0 ]]; then
+    echo "gc-sling: WARN target '$target' has 0 live sessions — slung work may strand unclaimed (no worker to claim it)." >&2
+    echo "gc-sling: WARN verify the bead reaches in_progress; gascity-rig code work uses target 'polecat'." >&2
+    log_event "dead-target-warn" "${bead:-}" "$target" "" "0 live sessions for target"
+  fi
+fi
+
+# Strip --no-nudge from "$@" before any exec — it's a wrapper-only flag
+# that `gc sling` doesn't recognize and would error on. Then build the
+# nudge_args array we append to every exec.
+#
+# Why default-on: `gc sling` alone leaves warm pool workers idle
+# (gascity#1129) so beads sit unclaimed against warm-idle workers until
+# something else wakes them. Auto-injecting --nudge avoids the stall.
+# Pass --no-nudge to opt out (e.g. cold-pool dispatches where you
+# explicitly don't want a wake signal).
+filtered_args=()
+for a in "$@"; do
+  [[ "$a" == "--no-nudge" ]] && continue
+  filtered_args+=("$a")
+done
+set -- "${filtered_args[@]}"
+
+nudge_args=()
+if (( has_nudge == 0 && has_no_nudge == 0 )); then
+  nudge_args=("--nudge")
+fi
+
+# Pass through if caller has specified formula intent or no bead.
+if (( has_on )); then
+  log_event "passthrough" "$bead" "$target" "" "--on already set"
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+if (( has_formula )); then
+  log_event "passthrough" "$bead" "$target" "" "--formula already set"
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+if (( has_no_formula )); then
+  log_event "passthrough" "$bead" "$target" "" "--no-formula set"
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+if [[ -z "$bead" ]]; then
+  # Inline text or formula-instantiation with --formula already handled above.
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+
+# Heuristic: bead IDs look like <prefix>-<suffix>. Anything without a dash
+# is almost certainly inline text — pass through without logging (too noisy).
+if [[ "$bead" != *-* ]]; then
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+
+# Load config and resolve formula for this bead. Rules may match on
+# id_pattern and/or title_pattern; title lookup requires a `bd show` call
+# against the correct rig, so we derive the rig from the bead prefix.
+if [[ ! -r "$CONFIG" ]]; then
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+
+# Quick id-only match first (cheap, avoids bd show for rules that only use id).
+formula_and_rule=$(python3 - "$CONFIG" "$bead" <<'PYEOF' 2>/dev/null || true
+import re, sys, yaml
+cfg_path, bead = sys.argv[1], sys.argv[2]
+try:
+    with open(cfg_path, "rb") as f:
+        cfg = yaml.safe_load(f) or {}
+except Exception:
+    sys.exit(0)
+for rule in (cfg.get("rules") or []):
+    pat = rule.get("id_pattern") or ""
+    if not pat:
+        continue
+    try:
+        if re.match(pat, bead):
+            print(f"{rule.get('id','')}\t{rule.get('formula','')}")
+            break
+    except re.error:
+        continue
+PYEOF
+)
+
+# Title-pattern fallback for rules that declare title_pattern + scope.
+if [[ -z "$formula_and_rule" ]]; then
+  # Bead prefix = everything before the first '-'.
+  bead_prefix="${bead%%-*}"
+  # Map prefix to rig name. For city-level beads (prefix is city's own prefix)
+  # we'd fetch from plain `bd`. For rig beads we use `gc bd --rig <name>`.
+  # Start with the common case: the prefix matches a rig name that we use.
+  title=""
+  # Try rig lookup first (prefix often matches rig name directly)
+  if title_json=$(gc bd --rig "$bead_prefix" show "$bead" --json 2>/dev/null); then
+    title=$(jq -r 'if type=="array" then .[0] else . end | .title // ""' <<<"$title_json" 2>/dev/null)
+  fi
+  if [[ -n "$title" ]]; then
+    formula_and_rule=$(python3 - "$CONFIG" "$bead" "$bead_prefix" "$title" <<'PYEOF' 2>/dev/null || true
+import re, sys, yaml
+cfg_path, bead, prefix, title = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+try:
+    with open(cfg_path, "rb") as f:
+        cfg = yaml.safe_load(f) or {}
+except Exception:
+    sys.exit(0)
+for rule in (cfg.get("rules") or []):
+    tpat = rule.get("title_pattern") or ""
+    scope = rule.get("scope") or ""
+    if not tpat:
+        continue
+    # If scope is set, bead's prefix (rig) must match.
+    if scope and scope != prefix:
+        continue
+    try:
+        if re.match(tpat, title):
+            print(f"{rule.get('id','')}\t{rule.get('formula','')}")
+            break
+    except re.error:
+        continue
+PYEOF
+)
+  fi
+fi
+
+if [[ -z "$formula_and_rule" ]]; then
+  # No rule matches — pass through silently (don't log routine dispatches).
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+
+rule_id="${formula_and_rule%%$'\t'*}"
+formula="${formula_and_rule##*$'\t'}"
+
+if [[ -z "$formula" ]]; then
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+
+echo "gc-sling: bead $bead matches rule '$rule_id' — injecting --on $formula" >&2
+log_event "formula_injected" "$bead" "$target" "$formula" "rule=$rule_id"
+
+exec gc sling "$@" --on "$formula" "${nudge_args[@]}"

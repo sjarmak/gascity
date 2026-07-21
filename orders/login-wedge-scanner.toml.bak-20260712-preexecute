@@ -1,0 +1,47 @@
+# login-wedge-scanner — detect + (staged) recycle sessions wedged at Claude
+# Code's interactive LOGIN-METHOD selector.
+#
+# ADDED 2026-07-12 (Stephanie, via mayor). Evidence: gc-453107
+# (aoa/oversight-rig.project-lead) read "idle 6 days" but was actually hung at
+# "Select login method: 1. Claude account with subscription 2. Anthropic Console
+# account". It reads `active` (tmux alive) and its idle clock churns on the retry
+# prompt, so liveness checks miss it; the mayor only found it by peeking. This
+# has bitten a PL/worker repeatedly ("yet another time a Claude login issue has
+# wedged a PL").
+#
+# WHY A NEW ORDER (not a polecat-ui-stuck-scanner marker add): that scanner's
+# ui-modal pass is POOL-SCOPED and skips named sessions (the AOA PL is named);
+# its auth-wedge pass scans all sessions but matches the later paste-code OAuth
+# screen, not this login-METHOD selector (it has fired 0x). This order targets
+# the login-method selector across ALL active sessions and is the only one that
+# recycles this class.
+#
+# CHANGE-CONTROL / DRY-RUN->APPLY: this is a DESTRUCTIVE mechanism (it can
+# `gc session kill`). It ships DRY-RUN: with LOGIN_WEDGE_EXECUTE unset it only
+# peeks + mails the mayor a report, it NEVER kills. The dry-run mails ARE the
+# report a human reviews before promotion. To PROMOTE after reviewing clean
+# dry-run reports, add under [order.env] (do NOT flip it from the script):
+#   LOGIN_WEDGE_EXECUTE = "1"   # flipped by Stephanie <date> after clean dry-run review
+# Safety guards retained even after promotion: attached-human skip, mayor
+# protect-list, two-scan confirmation, per-tick recycle cap (2), and a
+# per-session recycle-attempt cap that ESCALATES to an account-level fix
+# (/ds-cred / re-pin) instead of looping kill->respawn->re-wedge on bad creds.
+#
+# UNDO: to pause, add an [[orders.overrides]] enabled=false block in city.toml
+# with a dated reason (temporary), or rename this file to
+# orders/login-wedge-scanner.toml.disabled (retirement). Retire outright only
+# once Claude Code stops dropping gc-launched agents onto the interactive login
+# screen (the upstream fix that makes this class impossible).
+#
+# NOT COVERED (separate follow-up): the oversight-rig PL dormancy class
+# (reset-pending/runtime-missing -> asleep for days) is downstream — those
+# sessions are not `active`, have no runtime to peek/recycle, and a kill does
+# not respawn them. Recycle alone is insufficient for that class; it needs a
+# supervisor-level respawn path. The mayor report calls this out.
+[order]
+description = "Every 5m: peek every ACTIVE session (named + pool) for Claude Code's login-METHOD selector ('Select login method' / 'Claude account with subscription' — authoritative, never appears in a healthy session) and surface each wedge to the mayor. DRY-RUN by default (report only, no kill). Fills the gap polecat-ui-stuck-scanner leaves: its ui-modal pass skips named PLs and its auth-wedge pass matches the paste-code screen, not the login-method selector (gc-453107, 2026-07-12). Recycle (gc session kill) is gated behind LOGIN_WEDGE_EXECUTE, promoted by a human per the dry-run->apply convention, with attached-human/mayor/two-scan/per-tick-cap/re-wedge-escalation guards."
+trigger = "cooldown"
+interval = "5m"
+exec = "/home/ds/gas-city/bin/login-wedge-scanner"
+timeout = "2m"
+idempotent = true

@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# gc-sling: thin wrapper around `gc sling` that auto-injects `--on <formula>`
+# when the bead ID matches a rule in .gc/sling-intercept.yaml.
+#
+# Default-safe: if no rule matches, or the caller has already specified
+# --on / --formula / --no-formula, this is a pure pass-through.
+#
+# Use this instead of raw `gc sling` for any dispatch where a bead prefix
+# implies a specific review/evidence formula (e.g. codeprobe-br7).
+#
+# Adoption is by convention — CLAUDE.md documents which dispatches should
+# use gc-sling. The log at .gc/sling-intercept.log records every decision,
+# so mayor-pattern-miner can surface how often the intercept fires.
+#
+# Usage: gc-sling [target] <bead-or-formula-or-text> [flags...]
+# Flags: exactly the same as `gc sling`. Run `gc sling --help` for details.
+
+set -euo pipefail
+
+CONFIG="${GC_SLING_INTERCEPT_CONFIG:-/home/ds/gas-city/.gc/sling-intercept.yaml}"
+LOG="${GC_SLING_INTERCEPT_LOG:-/home/ds/gas-city/.gc/sling-intercept.log}"
+
+log_event() {
+  # log_event <event> <bead> <target> <formula> <reason>
+  local ts event bead target formula reason
+  # UTC Z-form so jq fromdateiso8601 can parse (local offsets silently break it).
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  event=$1; bead=$2; target=$3; formula=$4; reason=$5
+  [[ -d "${LOG%/*}" ]] || return 0
+  jq -cn --arg ts "$ts" \
+         --arg event "$event" \
+         --arg bead "$bead" \
+         --arg target "$target" \
+         --arg formula "$formula" \
+         --arg reason "$reason" \
+    '{ts:$ts, event:$event, bead:$bead, target:$target, formula:$formula, reason:$reason}' \
+    >> "$LOG" 2>/dev/null || true
+}
+
+if [[ $# -eq 0 ]]; then
+  exec gc sling "$@"
+fi
+
+# Pass --help straight through.
+case "${1:-}" in
+  -h|--help)
+    gc sling --help
+    echo
+    echo "gc-sling: thin intercept wrapper. See $CONFIG for auto-injection rules."
+    echo "         Pass-through in all cases except bead matches a rule AND no"
+    echo "         formula flag is present."
+    exit 0 ;;
+esac
+
+# Parse args to find: target (first positional), bead (second positional),
+# and whether any formula-intent or nudge flag is already set.
+args=("$@")
+has_on=0
+has_formula=0
+has_no_formula=0
+has_nudge=0
+has_no_nudge=0   # wrapper-only flag — opt out of default --nudge injection
+target=""
+bead=""
+prev=""
+
+# Flags that take a value after them (so the following token is NOT positional).
+value_taking_flags=("--on" "-t" "--title" "--var" "--scope-kind" "--scope-ref" \
+                    "--merge" "--city" "--rig")
+
+is_value_for_prev() {
+  local p=$1
+  for f in "${value_taking_flags[@]}"; do
+    [[ "$p" == "$f" ]] && return 0
+  done
+  return 1
+}
+
+for a in "${args[@]}"; do
+  case "$a" in
+    --on|--on=*)                has_on=1 ;;
+    -f|--formula|--formula=*)   has_formula=1 ;;
+    --no-formula)               has_no_formula=1 ;;
+    --nudge)                    has_nudge=1 ;;
+    --no-nudge)                 has_no_nudge=1 ;;
+    --)                         break ;;
+    -*)                         : ;;
+    *)
+      if is_value_for_prev "$prev"; then
+        :
+      elif [[ -z "$target" ]]; then
+        target="$a"
+      elif [[ -z "$bead" ]]; then
+        bead="$a"
+      fi ;;
+  esac
+  prev="$a"
+done
+
+# Pre-flight dead-target guard. Routing to a target whose pool has zero live
+# sessions (a mistyped target, or a min=0 pool with no worker that won't spawn
+# — e.g. `gascity/codex`, which has no workers) silently strands the bead:
+# `gc sling` exits 0, the bead is stamped gc.routed_to, and nothing ever claims
+# it. This turns that silent strand into a loud warning at dispatch time.
+# gascity-rig code work belongs on target `polecat`, not `gascity/codex`.
+if [[ -n "$target" ]]; then
+  # The sling target is an alias (e.g. `polecat`); sessions are stored under the
+  # resolved template path (e.g. `/home/ds/gascity/polecat`), so an exact
+  # --template match on the alias misses live sessions. Match on the target's
+  # basename (slot suffix stripped) against each session's template/work_dir
+  # basename in a single list call.
+  tbase="${target##*/}"; tbase="${tbase%-[0-9]*}"
+  # Timeout-guarded like every other gc call here. Unguarded, this probe blocks
+  # dispatch indefinitely whenever gc is slow: a memory-throttled caller cgroup
+  # stalled it past a 5m deadline and killed the sling mid-flight (2026-07-16).
+  # An unreachable probe means UNKNOWN, not dead — stay quiet rather than cry
+  # wolf, since the warning claims work will strand.
+  sess_json=$(timeout 10 gc session list --json 2>/dev/null) || sess_json=""
+  if [[ -z "$sess_json" ]]; then
+    log_event "dead-target-unknown" "${bead:-}" "$target" "" "session probe failed or timed out"
+  else
+    live=$(printf '%s' "$sess_json" | jq -r --arg t "$target" --arg tb "$tbase" '
+      [ ((.sessions // .) // [])[]
+        | select(((.state // .State // "") | ascii_downcase) != "closed")
+        | select(
+            ((.template // .Template // "") == $t)
+            or (((.template // .Template // "") | split("/") | last | sub("-[0-9]+$";"")) == $tb)
+            or (((.work_dir // .WorkDir // "") | split("/") | last | sub("-[0-9]+$";"")) == $tb)
+          )
+      ] | length' 2>/dev/null || echo "")
+    if [[ "$live" =~ ^[0-9]+$ && "$live" -eq 0 ]]; then
+      echo "gc-sling: WARN target '$target' has 0 live sessions — slung work may strand unclaimed (no worker to claim it)." >&2
+      echo "gc-sling: WARN verify the bead reaches in_progress; gascity-rig code work uses target 'polecat'." >&2
+      log_event "dead-target-warn" "${bead:-}" "$target" "" "0 live sessions for target"
+    fi
+  fi
+fi
+
+# --- Per-bead worktree guard -------------------------------------------------
+# Beads dispatched to a rig pool whose default formula has no worktree step
+# (e.g. mol-focus-review) otherwise run in the SHARED rig main tree and pile WIP
+# onto whatever branch the last bead left checked out (the scix o835 pile-up,
+# 2026-06-14). This ensures a per-bead `git worktree add <rig-repo>-<beadshort>`
+# exists and records it on work_dir (legacy key read by worktree-aware formulas
+# and the mol-focus-review load-context `cd`) + gc.work_dir (canonical).
+# Best-effort AND timeout-guarded: any failure or slow dolt call logs and falls
+# through to a normal sling — it never blocks dispatch. Kill-switch:
+# GC_SLING_NO_WORKTREE=1 (zero-edit). Dry-run: GC_SLING_DRYRUN=1.
+WORKTREE_BASE_BRANCH="${GC_SLING_BASE_BRANCH:-main}"
+ensure_bead_worktree() {
+  local bead=$1 target=$2
+  [[ "${GC_SLING_NO_WORKTREE:-0}" == "1" ]] && return 0
+  [[ -z "$bead" || -z "$target" ]] && return 0
+  [[ "$bead" == *-* ]] || return 0
+
+  # dr-h6ze: dr- beads are city HQ tracking beads worked IN-PLACE in the (non-git)
+  # city root — never per-rig code work, so they must not get a rig worktree. Skip
+  # the guard outright. Otherwise the rig lookup below resolves "dr" (not a real
+  # rig, per this fix's own note), the `gc bd --rig dr` metadata writes silently
+  # no-op under the ambient file provider WHILE logging worktree-recorded success,
+  # and — if the target session happens to sit inside an unrelated rig checkout —
+  # a stray per-bead worktree gets cut under THAT repo for an HQ bead. No worktree
+  # is the correct outcome for dr- beads (code-reviewer, 2026-07-18; same
+  # dr-isn't-a-rig root cause as the sling-exec fix below).
+  [[ "$bead" == dr-* ]] && { log_event "worktree-skip" "$bead" "$target" "" "dr- HQ tracking bead — no per-rig worktree"; return 0; }
+
+  local beadshort="${bead#*-}"
+  [[ -n "$beadshort" ]] || return 0
+
+  # Resolve the rig NAME from the bead prefix. `gc bd --rig` takes the rig NAME,
+  # but the prefix is NOT the name for most rigs (gc->gascity, co->codescalebench,
+  # gpk->gascity-packs, EnterpriseBench->enterprisebench, ...). Deriving --rig from
+  # ${bead%%-*} made every `gc bd` call below fail silently for such rigs — the
+  # existing-check never short-circuited (orphan worktrees) and the metadata writes
+  # no-op'd while "worktree-recorded" logged success (gc-na2o). Fail-safe: fall back
+  # to the raw prefix if the lookup is unavailable, so this is never worse than before.
+  local rig_name
+  rig_name=$(timeout 10 gc rig list --json 2>/dev/null \
+    | jq -r --arg p "${bead%%-*}" '(.rigs // [])[] | select(.prefix==$p) | .name' 2>/dev/null | head -1)
+  [[ -n "$rig_name" ]] || rig_name="${bead%%-*}"
+
+  local tb repo
+  tb="${target##*/}"; tb="${tb%-[0-9]*}"
+  repo=$(timeout 10 gc session list --json 2>/dev/null | jq -r --arg t "$target" --arg tb "$tb" '
+    [ ((.sessions // .) // [])[]
+      | select(((.state // .State // "") | ascii_downcase) != "closed")
+      | select(
+          ((.template // .Template // "") == $t)
+          or (((.template // .Template // "") | split("/") | last | sub("-[0-9]+$";"")) == $tb)
+          or (((.work_dir // .WorkDir // "") | split("/") | last | sub("-[0-9]+$";"")) == $tb)
+        )
+      | (.work_dir // .WorkDir // "")
+    ] | map(select(. != "")) | first // ""' 2>/dev/null || echo "")
+  [[ -n "$repo" ]] || { log_event "worktree-skip" "$bead" "$target" "" "no live work_dir for target"; return 0; }
+
+  git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || { log_event "worktree-skip" "$bead" "$target" "" "$repo not a git repo"; return 0; }
+  local toplevel; toplevel=$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null) || return 0
+  local wt_path="${toplevel}-${beadshort}"
+
+  # dr-vn1i: authoritative per-rig base ref. A per-bead worktree created from a
+  # MUTABLE local branch inherits whatever that branch happens to point at — for
+  # gascity-packs, local main is a fork 40 commits behind canonical, so identical
+  # dispatches silently start from different bases and can reintroduce deleted
+  # code. If the rig has an entry in .gc/sling-base-refs.conf, fetch + resolve the
+  # exact remote-tracking SHA and build the worktree from THAT (recorded on the
+  # bead). If an authoritative base is configured but cannot be resolved, SKIP the
+  # worktree rather than create a wrong-base one (do not silently fall back to a
+  # stale local branch). Rigs with no entry keep the default branch base.
+  local base_committish="$WORKTREE_BASE_BRANCH" base_ref="$WORKTREE_BASE_BRANCH" base_sha=""
+  local _brc="${GC_SLING_BASE_REFS_CONF:-/home/ds/gas-city/.gc/sling-base-refs.conf}"
+  if [[ -r "$_brc" ]]; then
+    local _spec; _spec=$(awk -v r="$rig_name" '$1!~/^#/ && $1==r {print $2; exit}' "$_brc" 2>/dev/null)
+    if [[ -n "$_spec" ]]; then
+      local _remote="${_spec%%/*}" _ref="${_spec#*/}"
+      timeout 60 git -C "$toplevel" fetch --quiet "$_remote" "$_ref" 2>/dev/null || true
+      base_sha=$(git -C "$toplevel" rev-parse --verify --quiet "${_spec}^{commit}" 2>/dev/null || echo "")
+      if [[ -n "$base_sha" ]]; then
+        base_committish="$base_sha"; base_ref="$_spec"
+      else
+        log_event "worktree-baseref-fail" "$bead" "$target" "" "authoritative base $_spec for rig $rig_name unresolvable — refusing worktree AND dispatch (fail-closed, dr-vn1i)"
+        return 3   # dr-vn1i: distinct 'authoritative base unresolvable' code -> caller FAILS CLOSED (aborts the sling). Only this path is fail-closed; all other returns stay fail-open (return 0) so a transient issue never blocks dispatch.
+      fi
+    fi
+  fi
+
+  local existing
+  existing=$(timeout 10 gc bd --rig "$rig_name" show "$bead" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.metadata."work_dir" // .metadata."gc.work_dir" // "")' 2>/dev/null || echo "")
+  if [[ -n "$existing" ]]; then
+    log_event "worktree-exists" "$bead" "$target" "" "work_dir already set: $existing"
+    return 0
+  fi
+
+  if [[ "${GC_SLING_DRYRUN:-0}" == "1" ]]; then
+    echo "gc-sling: DRYRUN would: git worktree add $wt_path $base_committish (repo $toplevel); set work_dir=$wt_path on $bead" >&2
+    log_event "worktree-dryrun" "$bead" "$target" "" "$wt_path"
+    return 0
+  fi
+
+  if ! git -C "$toplevel" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $wt_path"; then
+    if [[ -e "$wt_path" ]]; then
+      log_event "worktree-skip" "$bead" "$target" "" "path exists, not a worktree: $wt_path"
+    else
+      if timeout 30 git -C "$toplevel" worktree add --detach "$wt_path" "$base_committish" >/dev/null 2>&1; then
+        echo "gc-sling: created per-bead worktree $wt_path (base $base_ref${base_sha:+ @ $base_sha})" >&2
+        log_event "worktree-created" "$bead" "$target" "" "$wt_path base=$base_ref sha=$base_sha"
+      else
+        log_event "worktree-fail" "$bead" "$target" "" "git worktree add failed for $wt_path"
+        return 0
+      fi
+    fi
+  fi
+
+  if [[ -d "$wt_path" ]]; then
+    timeout 10 gc bd --rig "$rig_name" update "$bead" --set-metadata "work_dir=$wt_path" >/dev/null 2>&1 || true
+    timeout 10 gc bd --rig "$rig_name" update "$bead" --set-metadata "gc.work_dir=$wt_path" >/dev/null 2>&1 || true
+    # dr-vn1i: record the authoritative base the worktree was cut from, so a
+    # divergent base is auditable (and future finalize/land can verify against it).
+    timeout 10 gc bd --rig "$rig_name" update "$bead" --set-metadata "gc.base_ref=$base_ref" >/dev/null 2>&1 || true
+    [[ -n "$base_sha" ]] && timeout 10 gc bd --rig "$rig_name" update "$bead" --set-metadata "gc.base_sha=$base_sha" >/dev/null 2>&1 || true
+    log_event "worktree-recorded" "$bead" "$target" "" "$wt_path base=$base_ref sha=$base_sha"
+  fi
+}
+
+_ebw_rc=0
+ensure_bead_worktree "$bead" "$target" || _ebw_rc=$?
+if [[ "$_ebw_rc" == "3" ]]; then
+  # dr-vn1i FAIL-CLOSED: an authoritative-base rig whose base couldn't be resolved
+  # would otherwise dispatch onto a wrong/stale base and silently corrupt work
+  # (gascity-packs local main is a 40-behind fork). Refuse to dispatch. This is
+  # SCOPED to that one case — every other worktree outcome is best-effort/fail-open,
+  # so a transient issue never blocks the fleet.
+  echo "gc-sling: FAIL-CLOSED — refusing to dispatch $bead: its rig's authoritative base ref could not be resolved (fetch/access?), and a wrong-base per-bead worktree silently corrupts work (dr-vn1i)." >&2
+  echo "gc-sling: fix the base-ref config (.gc/sling-base-refs.conf) or the remote fetch access, then re-sling." >&2
+  log_event "sling-fail-closed" "$bead" "$target" "" "authoritative base unresolvable; dispatch aborted (dr-vn1i)"
+  exit 1
+fi
+
+# Strip --no-nudge from "$@" before any exec — it's a wrapper-only flag
+# that `gc sling` doesn't recognize and would error on. Then build the
+# nudge_args array we append to every exec.
+#
+# Why default-on: `gc sling` alone leaves warm pool workers idle
+# (gascity#1129) so beads sit unclaimed against warm-idle workers until
+# something else wakes them. Auto-injecting --nudge avoids the stall.
+# Pass --no-nudge to opt out (e.g. cold-pool dispatches where you
+# explicitly don't want a wake signal).
+filtered_args=()
+for a in "$@"; do
+  [[ "$a" == "--no-nudge" ]] && continue
+  filtered_args+=("$a")
+done
+set -- "${filtered_args[@]}"
+
+nudge_args=()
+if (( has_nudge == 0 && has_no_nudge == 0 )); then
+  nudge_args=("--nudge")
+fi
+
+# Pass through if caller has specified formula intent or no bead.
+if (( has_on )); then
+  log_event "passthrough" "$bead" "$target" "" "--on already set"
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+if (( has_formula )); then
+  log_event "passthrough" "$bead" "$target" "" "--formula already set"
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+if (( has_no_formula )); then
+  log_event "passthrough" "$bead" "$target" "" "--no-formula set"
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+if [[ -z "$bead" ]]; then
+  # Inline text or formula-instantiation with --formula already handled above.
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+
+# Heuristic: bead IDs look like <prefix>-<suffix>. Anything without a dash
+# is almost certainly inline text — pass through without logging (too noisy).
+if [[ "$bead" != *-* ]]; then
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+
+# Load config and resolve formula for this bead. Rules may match on
+# id_pattern and/or title_pattern; title lookup requires a `bd show` call
+# against the correct rig, so we derive the rig from the bead prefix.
+if [[ ! -r "$CONFIG" ]]; then
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+
+# Quick id-only match first (cheap, avoids bd show for rules that only use id).
+formula_and_rule=$(python3 - "$CONFIG" "$bead" <<'PYEOF' 2>/dev/null || true
+import re, sys, yaml
+cfg_path, bead = sys.argv[1], sys.argv[2]
+try:
+    with open(cfg_path, "rb") as f:
+        cfg = yaml.safe_load(f) or {}
+except Exception:
+    sys.exit(0)
+for rule in (cfg.get("rules") or []):
+    pat = rule.get("id_pattern") or ""
+    if not pat:
+        continue
+    try:
+        if re.match(pat, bead):
+            print(f"{rule.get('id','')}\t{rule.get('formula','')}")
+            break
+    except re.error:
+        continue
+PYEOF
+)
+
+# Title-pattern fallback for rules that declare title_pattern + scope.
+if [[ -z "$formula_and_rule" ]]; then
+  # Bead prefix = everything before the first '-'.
+  bead_prefix="${bead%%-*}"
+  title=""
+  if [[ "$bead" == dr-* ]]; then
+    # dr-h6ze: dr- beads live in the city HQ Dolt store, not a rig. `gc bd --rig
+    # dr` would fail (dr is not a registered rig) and silently drop any dr- title
+    # rule — the same silent-store-miss this bead exists to kill. Reach the HQ
+    # store via the bd provider directly (no --rig; dr IS the default gc bd store
+    # when GC_BEADS=bd), scoped to this one lookup like the sling exec above.
+    if title_json=$(GC_BEADS=bd timeout 10 gc bd show "$bead" --json 2>/dev/null); then
+      title=$(jq -r 'if type=="array" then .[0] else . end | .title // ""' <<<"$title_json" 2>/dev/null)
+    fi
+  else
+    # Map prefix to rig NAME (prefix != name for most rigs; gc->gascity etc. —
+    # same gc-na2o bug class as the worktree guard above). Fail-safe to the raw
+    # prefix so this is never worse than the old direct-prefix lookup.
+    bead_rig=$(timeout 10 gc rig list --json 2>/dev/null \
+      | jq -r --arg p "$bead_prefix" '(.rigs // [])[] | select(.prefix==$p) | .name' 2>/dev/null | head -1)
+    [[ -n "$bead_rig" ]] || bead_rig="$bead_prefix"
+    # Try rig lookup first (resolved rig name).
+    if title_json=$(gc bd --rig "$bead_rig" show "$bead" --json 2>/dev/null); then
+      title=$(jq -r 'if type=="array" then .[0] else . end | .title // ""' <<<"$title_json" 2>/dev/null)
+    fi
+  fi
+  if [[ -n "$title" ]]; then
+    formula_and_rule=$(python3 - "$CONFIG" "$bead" "$bead_prefix" "$title" <<'PYEOF' 2>/dev/null || true
+import re, sys, yaml
+cfg_path, bead, prefix, title = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+try:
+    with open(cfg_path, "rb") as f:
+        cfg = yaml.safe_load(f) or {}
+except Exception:
+    sys.exit(0)
+for rule in (cfg.get("rules") or []):
+    tpat = rule.get("title_pattern") or ""
+    scope = rule.get("scope") or ""
+    if not tpat:
+        continue
+    # If scope is set, bead's prefix (rig) must match.
+    if scope and scope != prefix:
+        continue
+    try:
+        if re.match(tpat, title):
+            print(f"{rule.get('id','')}\t{rule.get('formula','')}")
+            break
+    except re.error:
+        continue
+PYEOF
+)
+  fi
+fi
+
+if [[ -z "$formula_and_rule" ]]; then
+  # No rule matches — pass through silently (don't log routine dispatches).
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+
+rule_id="${formula_and_rule%%$'\t'*}"
+formula="${formula_and_rule##*$'\t'}"
+
+if [[ -z "$formula" ]]; then
+  exec gc sling "$@" "${nudge_args[@]}"
+fi
+
+echo "gc-sling: bead $bead matches rule '$rule_id' — injecting --on $formula" >&2
+log_event "formula_injected" "$bead" "$target" "$formula" "rule=$rule_id"
+
+exec gc sling "$@" --on "$formula" "${nudge_args[@]}"

@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""account-keepalive: refresh Claude account OAuth tokens before they rot.
+
+csu_pick.sh's rot-preference term keeps accounts warm by steering organic
+`claude-auto` launches toward whichever account is nearest expiry. This
+script is the safety net for the gap the picker cannot cover: a stretch
+with no organic launch at all (e.g. an overnight lull), during which an
+account's token would silently expire.
+
+For each account whose token is still valid but within CRITICAL_HOURS of
+expiry, attempt a headless keepalive launch, then verify the token's
+`expiresAt` actually advanced. If a launch cannot refresh it (or the token
+has already expired), mail mayor so a human can run `/ds-cred <account>`
+from the Mac.
+
+The verify-then-escalate design is deliberate: a headless `claude -p`
+launch is not guaranteed to run the OAuth refresh flow. This script never
+assumes the refresh worked — it checks, and its run log records, per
+account, whether `-p` refreshed a near-expiry token. That empirically
+settles the open question rather than relying on a blind ping.
+
+Env:
+  KEEPALIVE_CRITICAL_HOURS - act when 0 < hours_to_expiry < this (default 1)
+"""
+import json
+import os
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOMES = Path.home() / ".claude-homes"
+CLAUDE_ACCOUNT = Path.home() / "gas-city" / "bin" / "claude-account"
+CRITICAL_HOURS = float(os.environ.get("KEEPALIVE_CRITICAL_HOURS", "1"))
+
+
+def expiry_epoch(account_dir: Path) -> float | None:
+    """OAuth token expiry as a unix epoch (seconds), or None if unreadable."""
+    creds = account_dir / ".claude" / ".credentials.json"
+    if not creds.exists():
+        return None
+    try:
+        oauth = json.loads(creds.read_text()).get("claudeAiOauth", {})
+        exp = oauth.get("expiresAt")
+        return exp / 1000 if exp else None
+    except Exception:
+        return None
+
+
+def mail_mayor(subject: str, body: str) -> None:
+    try:
+        subprocess.run(
+            ["gc", "mail", "send", "--to", "mayor",
+             "-s", subject, "-m", body, "--notify"],
+            check=False, capture_output=True, timeout=30)
+    except Exception:
+        pass
+
+
+def main() -> None:
+    now = datetime.now(timezone.utc).timestamp()
+    acted: list[str] = []
+
+    for account_dir in sorted(HOMES.glob("account*")):
+        num = account_dir.name[len("account"):]
+        if not num.isdigit():
+            continue
+        exp = expiry_epoch(account_dir)
+        if exp is None:
+            continue
+        hte = (exp - now) / 3600
+
+        if hte <= 0:
+            mail_mayor(
+                f"account{num} token EXPIRED — needs /ds-cred",
+                f"account{num}'s OAuth token expired {-hte:.1f}h ago. A "
+                f"headless launch cannot refresh an already-expired token "
+                f"(it 401s). Run `/ds-cred account{num}` from the Mac to "
+                f"push fresh credentials.")
+            acted.append(f"account{num}: EXPIRED {-hte:.1f}h -> mailed mayor")
+            continue
+
+        if hte >= CRITICAL_HOURS:
+            continue  # healthy — nothing to do
+
+        # Valid but rotting: attempt a headless keepalive launch, then
+        # verify the token's expiry actually advanced.
+        before = exp
+        try:
+            subprocess.run(
+                [str(CLAUDE_ACCOUNT), num, "-p", "ok"],
+                check=False, capture_output=True, timeout=120)
+        except Exception as exc:
+            acted.append(f"account{num}: launch error {exc}")
+
+        after = expiry_epoch(account_dir)
+        if after and after > before + 60:
+            acted.append(
+                f"account{num}: refreshed ({hte:.1f}h -> "
+                f"{(after - now) / 3600:.1f}h)")
+        else:
+            mail_mayor(
+                f"account{num} rotting — keepalive launch did not refresh",
+                f"account{num}'s token has {hte:.1f}h left and a headless "
+                f"`claude-account {num} -p` launch did NOT advance its "
+                f"expiry. `-p` mode does not run the OAuth refresh flow. "
+                f"The token will expire unless a real agent session lands "
+                f"on the account, or you run `/ds-cred account{num}` from "
+                f"the Mac.")
+            acted.append(
+                f"account{num}: keepalive INEFFECTIVE -> mailed mayor")
+
+    if acted:
+        print("account-keepalive: " + "; ".join(acted))
+    else:
+        print("account-keepalive: all accounts healthy "
+              f"(none within {CRITICAL_HOURS}h of token expiry)")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+# approved-pr-automerge-packs — packs sibling of approved-pr-automerge (Stephanie
+# directive 2026-07-03: packs was uncovered, so our packs PRs never auto-reviewed
+# or auto-merged and rotted as manual-only for days). Same bin, same deterministic
+# ZFC-clean logic, parameterized for gastownhall/gascity-packs:
+#   - review beads created/listed in the gascity-packs rig (APPROVED_AUTOMERGE_RIG)
+#   - dispatched to the packs polecat pool (APPROVED_AUTOMERGE_POLECAT)
+#   - review records namespaced pr-packs-<N>.md in the shared reviews dir (no
+#     collision with gascity pr-<N>.md; gascity #1300+, packs #<200)
+# NEVER merges directly; only ENABLES GitHub auto-merge on a CURRENT Codex-inclusive
+# approve record. Staggered off the gascity tick (:07/:22/:37/:52). Fully audited.
+[order]
+description = "Every 15m (staggered): packs sibling of approved-pr-automerge — ENABLE GitHub auto-merge on gastownhall/gascity-packs PRs with a CURRENT Codex-inclusive approve record; DISPATCH a bounded mol-pr-review to the packs polecat for github-approved-but-no-Codex PRs. Only ENABLES auto-merge; GitHub merges when checks pass. Codex-gated, azanar-excluded, idempotent, audited."
+trigger = "cron"
+schedule = "7,22,37,52 * * * *"
+exec = "/bin/sh -c 'APPROVED_AUTOMERGE_REPO=gastownhall/gascity-packs APPROVED_AUTOMERGE_RIG=gascity-packs APPROVED_AUTOMERGE_POLECAT=/home/ds/gascity-packs/gascity-packs-polecat exec /home/ds/gas-city/bin/approved-pr-automerge --apply --nudge-mayor'"
+timeout = "5m"

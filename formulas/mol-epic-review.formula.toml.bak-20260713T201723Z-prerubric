@@ -1,0 +1,168 @@
+description = """
+Epic-level external review formula — runs at epic boundaries to grade the
+aggregate of all child beads' work against the epic's acceptance criteria.
+This is the city-wide review pattern (since 2026-04-21); individual bead
+closes are no longer gated.
+
+Self-healing loop with max_passes=3:
+1. Review current state of the epic + aggregate diff
+2. Pass: write evidence metadata, close epic, clear review_in_flight
+3. Reject: set rejection_reason, create follow-up beads for each failing
+   criterion, increment review_pass_count, clear review_in_flight.
+   The sweeper will re-dispatch once all follow-ups close. After 3 rejections
+   the sweeper stops dispatching and mails the human.
+
+This formula runs in the reviewer agent's session (typically codex-reviewer
+on a different provider than the implementers, per
+feedback_codeprobe_validation_gate.md).
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| issue    | caller | The epic bead ID being reviewed |
+"""
+formula = "mol-epic-review"
+phase = "vapor"
+version = 1
+
+[vars]
+[vars.issue]
+description = "The epic bead ID being reviewed"
+required = true
+
+[[steps]]
+id = "load-epic-context"
+title = "Load epic + all child bead work + aggregate diff"
+description = """
+Initialize your session as the epic reviewer.
+
+```bash
+gc prime
+bd prime
+bd show {{issue}}                    # the epic
+bd children {{issue}}                # any bd-linked children
+```
+
+Your responsibility: grade the aggregate of all member-bead work against
+the epic's acceptance criteria. You are NOT re-reviewing individual beads
+(they self-reviewed and closed). You are reviewing the epic as a whole.
+
+If the epic's metadata has `rejection_reason` or `review_pass_count > 0`,
+a prior review round rejected. Read the rejection_reason carefully — the
+follow-up beads that got created on that rejection have now all closed,
+and you should grade whether the new state addresses those failing
+criteria (in addition to the original acceptance criteria).
+
+Member-bead enumeration is title/id-pattern-based, not strict bd-children.
+Check the epic's description for the scope convention (e.g., br7 epic
+includes codeprobe-br7.N and codeprobe-<alias> beads whose titles start
+with "br7.N"). The sweeper dispatched you because ALL members are closed.
+
+**Aggregate diff:** compute the diff of the rig's base branch vs its
+current state, or the diff since the epic was opened. Read the commit
+messages for context on what each member contributed.
+
+**Exit criteria:** You have the epic's acceptance criteria, prior
+rejection history (if any), and the aggregate diff loaded."""
+
+[[steps]]
+id = "grade"
+title = "Grade per-criterion against the aggregate diff"
+needs = ["load-epic-context"]
+description = """
+For EACH acceptance criterion in the epic's description, produce a
+verdict line:
+
+  criterion #N: PASS — <one-line justification>
+  criterion #N: FAIL — <specific gap: what's missing, what to fix>
+
+Write the full grading as a `bd update --notes` interaction on the epic.
+
+Verdict rules:
+- ANY criterion FAIL → the whole epic review fails
+- ALL criteria PASS → the whole epic review passes
+- Do not soften fails to "partial pass" — that's the tri-state judgement
+  we want to avoid. Either the aggregate code does the thing or it
+  doesn't.
+
+**Do NOT close the epic at this step.** The next step branches on pass
+vs fail and handles close or follow-up creation.
+
+**Exit criteria:** Per-criterion verdict written as a bead interaction,
+and you have identified an overall verdict: PASS or REJECT."""
+
+[[steps]]
+id = "act"
+title = "On PASS: close with evidence. On REJECT: follow-ups + re-queue."
+needs = ["grade"]
+description = """
+Branch on your grading verdict.
+
+## On PASS
+
+Write the evidence metadata and close the epic. The close-gate-reaper's
+epic rule (.gc/close-gates.yaml) will PASS once these fields are present.
+
+```bash
+# 1. Write artifact directory with the grading writeup
+ARTIFACT_DIR=".beads/artifacts/epic-{{issue}}/$(date -u +%Y-%m-%dT%H%M%SZ)"
+mkdir -p "$ARTIFACT_DIR"
+# Write your per-criterion grading into $ARTIFACT_DIR/verdict.md
+
+# 2. Evidence metadata
+bd update {{issue}} --set-metadata evidence.artifact_path="$ARTIFACT_DIR"
+bd update {{issue}} --set-metadata evidence.reviewer_verdict=pass
+bd update {{issue}} --set-metadata evidence.reviewer_agent="$GC_AGENT"
+
+# 3. Clear in-flight flag
+bd update {{issue}} --set-metadata review_in_flight=false
+
+# 4. Close the epic
+bd close {{issue}} --reason "Epic review PASS — per-criterion grading at $ARTIFACT_DIR/verdict.md"
+
+# 5. Drain
+gc runtime drain-ack
+```
+
+## On REJECT
+
+Do NOT close the epic. Do NOT mail the human from this formula — the
+sweeper decides when to mail (at review_pass_count >= 3). Your job is
+to record the rejection and create follow-up beads for each failing
+criterion. Workers will pick up the follow-ups via the normal flow;
+the sweeper re-dispatches this formula when all follow-ups close.
+
+```bash
+# 1. Read current pass count (default 0 if unset)
+PREV_COUNT=$(bd show {{issue}} --json | jq -r '.[0].metadata.review_pass_count // 0')
+NEW_COUNT=$((PREV_COUNT + 1))
+
+# 2. Record the rejection
+bd update {{issue}} --set-metadata review_pass_count="$NEW_COUNT"
+bd update {{issue}} --set-metadata rejection_reason="<concise summary of failing criteria, e.g. 'criterion 2 (UX error handling) incomplete; criterion 4 (next-steps block) missing'>"
+
+# 3. For EACH failing criterion, create a follow-up bead linked to the epic
+#    via bd dep add. The new bead's description must be concrete enough for
+#    a fresh worker to implement without re-reading your review (SRP — the
+#    bead is the canonical artifact).
+for each failing criterion:
+  NEW_ID=$(bd create --title "<epic-id> follow-up: <criterion short name>" \\
+                      --description "<what must be added/fixed to pass>" \\
+                      --type task --priority 2 --json | jq -r '.id')
+  bd dep add "$NEW_ID" {{issue}}  # follow-up depends on epic staying open
+
+# 4. Clear in-flight flag so the sweeper's next tick can re-evaluate
+bd update {{issue}} --set-metadata review_in_flight=false
+
+# 5. Drain
+gc runtime drain-ack
+```
+
+Leave the epic open/in_progress. The next pool-claim cycle will pick up
+the follow-up beads. When all of them close, epic-review-sweeper will
+re-dispatch this formula (as long as review_pass_count < max_passes).
+
+**Exit criteria:** Either (epic closed + evidence written + drained) OR
+(rejection recorded + follow-ups created + review_in_flight cleared +
+drained)."""

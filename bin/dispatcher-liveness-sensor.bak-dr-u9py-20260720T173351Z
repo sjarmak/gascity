@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""dispatcher-liveness-sensor — out-of-band LOG-based liveness sensor for the
+control-dispatcher (gc-yn516). Catches the port-0 wedge class (gc-74rxa /
+gc-462084) and the silent-hang class in MINUTES, not 27h.
+
+A bead-STATE health check structurally cannot see this: the dispatcher looks
+"active", roots look routed, but its work-query resolves Dolt at 127.0.0.1:0 (or
+the serve loop hangs) so zero work is read. Only the trace LOG shows it. This
+greps the trace for two independent failure signatures and mails the mayor
+(cooldown-deduped) when either fires:
+
+  1. PORT-0 WEDGE: >= PORT0_MIN "127.0.0.1:0" lines in the last WINDOW_MIN minutes.
+  2. SILENT HANG: newest trace line older than STALE_MIN minutes (serve loop stuck).
+
+Usage: dispatcher-liveness-sensor [--nudge-mayor] [--json]
+Exit: 0 always (a sensor must never break the order loop).
+"""
+import calendar, json, os, re, sys, time, subprocess
+
+CITY = "/home/ds/gas-city"
+TRACE = os.environ.get("DISPATCHER_LIVENESS_TRACE",
+                       os.path.join(CITY, ".gc", "runtime", "core.control-dispatcher-trace.log"))
+STATE = os.environ.get("DISPATCHER_LIVENESS_STATE",
+                       os.path.join(CITY, ".gc", "observability", "dispatcher-liveness-state.json"))
+COOLDOWN_MIN = 30      # re-alert a standing wedge at most twice an hour
+WINDOW_MIN = 6         # look at roughly the last 6 minutes of trace
+STALE_MIN = 12         # newest trace line older than this = hung serve loop
+PORT0_MIN = 5          # this many :0 errors in the window = wedge
+
+TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+
+
+def _epoch(line):
+    m = TS_RE.match(line)
+    if not m:
+        return None
+    try:
+        # Trace timestamps are UTC (Z). calendar.timegm is deliberately used
+        # instead of mktime: mktime interprets one tuple as local DST while
+        # time.gmtime() carries tm_isdst=0, creating an exact one-hour phantom
+        # age during daylight-saving time.
+        return calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def _tail(path, n):
+    try:
+        out = subprocess.run(["tail", "-n", str(n), path], capture_output=True,
+                             text=True, timeout=20).stdout
+        return out.splitlines()
+    except Exception:
+        return []
+
+
+def evaluate():
+    lines = _tail(TRACE, 800)
+    if not lines:
+        return {"ok": False, "reason": "trace unreadable/empty", "alerts": []}
+    now = time.time()
+    # newest timestamped line -> heartbeat freshness
+    newest = None
+    for ln in reversed(lines):
+        e = _epoch(ln)
+        if e:
+            newest = e
+            break
+    # port-0 rate within the window (count :0 lines whose ts is within WINDOW_MIN of newest)
+    ref = newest or now
+    port0 = 0
+    for ln in lines:
+        if "127.0.0.1:0" in ln:
+            e = _epoch(ln)
+            if e is None or (ref - e) <= WINDOW_MIN * 60:
+                port0 += 1
+    alerts = []
+    if port0 >= PORT0_MIN:
+        alerts.append(("port0_wedge",
+                       f"control-dispatcher PORT-0 WEDGE: {port0} '127.0.0.1:0' work-query errors in last ~{WINDOW_MIN}m (gc-74rxa/gc-462084 class). Work-query can't reach Dolt -> zero P1 dispatch."))
+    # hang: newest line stale. Trace ts is UTC; compare against UTC now to avoid tz skew.
+    if newest is not None:
+        age_min = (now - newest) / 60.0
+        if age_min > STALE_MIN:
+            alerts.append(("silent_hang",
+                           f"control-dispatcher SILENT HANG: newest trace line {round(age_min)}m old (serve loop stuck, no heartbeat)."))
+    return {"ok": True, "port0": port0, "alerts": alerts,
+            "trace": TRACE,
+            "newest_age_min": round((now - newest) / 60.0, 1) if newest else None}
+
+
+def main():
+    argv = sys.argv[1:]
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    r = evaluate()
+    try:
+        st = json.load(open(STATE))
+    except (OSError, ValueError):
+        st = {}
+    now = time.time()
+    fresh = [(k, m) for k, m in r.get("alerts", []) if now - st.get(k, 0) > COOLDOWN_MIN * 60]
+    if fresh and "--nudge-mayor" in argv:
+        body = "dispatcher-liveness-sensor (gc-yn516):\n" + "\n".join(f"- {m}" for _, m in fresh) \
+               + f"\n\nTrace: {TRACE}\nCheck the LOG, not bead roots — this class is invisible to bead-state health."
+        try:
+            subprocess.run(["gc", "mail", "send", "mayor", "-s",
+                            f"dispatcher-liveness: {len(fresh)} signature(s) — control-dispatcher wedge/hang",
+                            "-m", body], timeout=120)
+        except Exception:
+            pass
+    for k, _ in fresh:
+        st[k] = now
+    try:
+        json.dump(st, open(STATE, "w"))
+    except OSError:
+        pass
+    if "--json" in argv:
+        print(json.dumps({**r, "alerted": [m for _, m in fresh]}, indent=2))
+    else:
+        print(f"port0={r.get('port0')} newest_age_min={r.get('newest_age_min')} "
+              f"alerts={len(r.get('alerts', []))} alerted={len(fresh)}")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

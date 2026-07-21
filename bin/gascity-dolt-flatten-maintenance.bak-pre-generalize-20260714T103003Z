@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+#
+# gascity-dolt-flatten-maintenance: weekly threshold-triggered Dolt history
+# flatten for the gascity beads database. Recurring version of the manual fix
+# run 2026-06-17 (convoy list 68s -> 11s after flattening 12,865 commits -> 1).
+#
+# Why this exists: the gascity db auto-commits one Dolt commit per write, so
+# commit-HISTORY depth grows unbounded. Past a few thousand commits the
+# workflow/convoy queries slow enough to blow the 30s sling sub-timeout and
+# kill dispatches. dolt-gc-maintenance (online CALL DOLT_GC) can't fix this —
+# the history is reachable, not garbage. bd compact fails on this store (its
+# cherry-pick replays a historical FK-violating intermediate). bd flatten
+# squashes all history off the CLEAN current HEAD with no replay, which works.
+#
+# Order: threshold-gate -> quiescence guard -> snapshot-first+verify ->
+# flatten -> rotate snapshots (keep newest 1) -> reclaim disk. Never silent.
+# NEVER deletes a bead; preserves all rows. Runs against the live server
+# endpoint (never `dolt` inside .beads/dolt while the server holds the LOCK).
+#
+# Does NOT touch the manual recovery ref 'pre-compact-20260617' (different
+# prefix) — that one is reclaimed by hand once flatten is proven stable.
+#
+set -euo pipefail
+
+# --- config (review before install) -----------------------------------------
+STORE_DIR="/home/ds/gascity"        # dir whose .beads/ the bd commands target
+DB="gascity"                        # dolt database to flatten
+INFO_FILE="/home/ds/gas-city/.beads/dolt/.dolt/sql-server.info"  # pid:port:uuid
+DOLT_BIN="/home/ds/.local/bin/dolt"
+BD="/home/ds/.local/bin/bd"
+GC="/home/ds/.local/bin/gc"         # for the chronic-bloat surface mail
+THRESHOLD=5000                      # flatten only above this commit depth
+HIGH_WATER=10000                    # quiescence-abort above this => surface to mayor
+SNAPSHOT_KEEP=1                     # keep most-recent N pre-flatten snapshots
+SNAP_PREFIX="pre-flatten-"
+QUIESCE_WAIT=30                     # seconds to watch for active writes
+LOG="$HOME/.gc/dolt-flatten-maintenance.log"   # off the gascity source tree
+# ----------------------------------------------------------------------------
+
+mkdir -p "$(dirname "$LOG")"
+log() { echo "$(date -Iseconds) $*" | tee -a "$LOG" >&2; }
+
+# best-effort surface to mayor; never let a notify failure crash the run
+notify_mayor() {
+  "$GC" mail send mayor --from dolt-flatten-maintenance -s "$1" -m "$2" \
+    >>"$LOG" 2>&1 || log "WARN: notify_mayor failed (mail unavailable in this context)"
+}
+
+log "=== flatten-maintenance run start ==="
+
+# derive the live server port (robust against restarts), like dolt-gc-maintenance
+if [[ ! -f "$INFO_FILE" ]]; then
+  log "ERROR: sql-server.info not found at $INFO_FILE — is the managed dolt server up?"
+  exit 1
+fi
+PORT="$(cut -d: -f2 "$INFO_FILE")"
+if [[ ! "$PORT" =~ ^[0-9]+$ ]]; then
+  log "ERROR: could not parse port from $INFO_FILE (got '$PORT')"
+  exit 1
+fi
+DOLT=("$DOLT_BIN" --host 127.0.0.1 --port "$PORT" --user root --no-tls --password '' --use-db "$DB")
+
+# single numeric scalar from a dolt ASCII-table result (data on line 4)
+sql_num() { "${DOLT[@]}" sql -q "$1" | awk 'NR==4 {gsub(/[^0-9]/,""); print; exit}'; }
+
+# 0. server reachable?
+if ! "${DOLT[@]}" sql -q "SELECT 1;" >/dev/null 2>&1; then
+  log "ERROR: dolt server 127.0.0.1:${PORT} unreachable"
+  exit 1
+fi
+
+# 1. threshold gate
+DEPTH="$(sql_num "SELECT COUNT(*) FROM dolt_log;")"
+log "commit depth=${DEPTH:-?} threshold=${THRESHOLD}"
+if [ "${DEPTH:-0}" -le "$THRESHOLD" ]; then
+  log "below threshold; no flatten needed; done"
+  exit 0
+fi
+
+# 2. quiescence guard (clear-window proxy): depth must be stable across the window
+sleep "$QUIESCE_WAIT"
+DEPTH2="$(sql_num "SELECT COUNT(*) FROM dolt_log;")"
+if [ "${DEPTH2:-0}" -ne "${DEPTH:-0}" ]; then
+  log "store not quiescent (depth ${DEPTH}->${DEPTH2} in ${QUIESCE_WAIT}s); skip this cycle"
+  # chronic-bloat surface: if we keep skipping AND depth is past the high-water,
+  # the store never quiesces and slings will hit the 30s cliff again — tell mayor.
+  if [ "${DEPTH2:-0}" -gt "$HIGH_WATER" ]; then
+    notify_mayor "dolt flatten SKIPPED — gascity store never quiesces (depth=${DEPTH2} > ${HIGH_WATER})" \
+"gascity-dolt-flatten-maintenance aborted on the quiescence guard while commit depth=${DEPTH2} is past the high-water (${HIGH_WATER}). The store is being written continuously, so the weekly flatten can't get a clear swap window. Dispatch will slide back toward the 30s sling timeout. Needs a maintenance pause or a wider guard window — manual flatten in a deliberately-quiesced window may be required. Log: ${LOG}"
+  fi
+  exit 0
+fi
+log "quiescent: depth stable at ${DEPTH2} over ${QUIESCE_WAIT}s"
+
+# 3. snapshot FIRST, then verify it resolves to the full pre-flatten tip
+SNAP="${SNAP_PREFIX}$(date -u +%Y%m%d-%H%M%S)"
+"${DOLT[@]}" sql -q "CALL DOLT_BRANCH('${SNAP}');" >/dev/null
+SNAP_DEPTH="$(sql_num "SELECT COUNT(*) FROM dolt_log AS OF '${SNAP}';")"
+if [ "${SNAP_DEPTH:-0}" -ne "${DEPTH:-0}" ]; then
+  log "ERROR: snapshot ${SNAP} depth ${SNAP_DEPTH} != pre-flatten depth ${DEPTH}; NOT flattening"
+  exit 1
+fi
+log "snapshot ${SNAP} verified (${SNAP_DEPTH} commits) — safety net in place"
+
+# 4. flatten main (off the clean current HEAD; never deletes a bead)
+( cd "$STORE_DIR" && "$BD" flatten --force ) >>"$LOG" 2>&1
+NEW_DEPTH="$(sql_num "SELECT COUNT(*) FROM dolt_log;")"
+log "flatten done; main depth now ${NEW_DEPTH:-?}"
+
+# 5. rotate: keep most-recent SNAPSHOT_KEEP pre-flatten snapshots, drop the rest
+i=0
+while read -r b; do
+  [ -z "$b" ] && continue
+  i=$((i+1))
+  if [ "$i" -gt "$SNAPSHOT_KEEP" ]; then
+    "${DOLT[@]}" sql -q "CALL DOLT_BRANCH('-D', '${b}');" >/dev/null
+    log "rotated out old snapshot ${b}"
+  fi
+done < <("${DOLT[@]}" sql -q "SELECT name FROM dolt_branches WHERE name LIKE '${SNAP_PREFIX}%' ORDER BY name DESC;" \
+           | grep -oE "${SNAP_PREFIX}[0-9-]+")
+
+# 6. reclaim disk now that rotated-out snapshots are unreferenced
+( cd "$STORE_DIR" && "$BD" gc --skip-decay --force ) >>"$LOG" 2>&1
+log "dolt gc complete; run end"

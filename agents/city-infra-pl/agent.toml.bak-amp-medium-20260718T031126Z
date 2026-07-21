@@ -1,0 +1,5 @@
+scope = "city"
+provider = "claude-1"
+max_active_sessions = 1
+idle_timeout = "1h"
+default_sling_formula = "mol-do-work"

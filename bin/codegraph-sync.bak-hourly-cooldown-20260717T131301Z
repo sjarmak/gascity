@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# codegraph-sync: keep the per-rig CodeGraph indexes fresh.
+#
+# Why this exists: nothing auto-updates the `.codegraph/` semantic indexes.
+# Explore agents treat CodeGraph as their PRIMARY, authoritative source, so a
+# stale index silently makes them reason on old code. As of 2026-06-14 the
+# gascity index was ~18d stale and several rigs ~34d; the dashboard rig had
+# none. This order is the scheduled refresh that closes that gap.
+#
+# Daily: `codegraph sync` (incremental — changes since last index, cheap).
+# Sunday (or FULL=1): `codegraph index` (full re-index) to repair any drift
+# that incremental sync can miss (deletes/renames/moved symbols).
+#
+# A full re-index is CPU/RAM-heavy (gascity ~1,500 files / ~108MB index), so
+# every codegraph invocation is wrapped in `scix-batch` — a transient cgroup
+# with an OOM ceiling — so a re-index can never OOM-kill the mayor or the
+# supervisor (the systemd-oomd collateral-kill failure mode).
+set -uo pipefail
+
+LOG="$HOME/.gc/codegraph-sync.log"
+mkdir -p "$(dirname "$LOG")"
+log() { echo "$(date -Iseconds) $*" | tee -a "$LOG" >&2; }
+
+CODEGRAPH="$(command -v codegraph || true)"
+if [[ -z "$CODEGRAPH" ]]; then
+    log "ERROR: codegraph not on PATH — cannot sync"
+    exit 1
+fi
+
+# scix-batch wraps heavy work in a memory-capped transient cgroup. If it is
+# unavailable, fall back to a direct call rather than skipping the refresh.
+if command -v scix-batch >/dev/null 2>&1; then
+    RUN=(scix-batch)
+else
+    log "WARN: scix-batch not found — running codegraph unwrapped (no OOM ceiling)"
+    RUN=()
+fi
+
+# Mode: full re-index on Sunday or when FULL=1; incremental sync otherwise.
+MODE="sync"
+if [[ "${FULL:-0}" == "1" || "$(date +%u)" == "7" ]]; then
+    MODE="index"
+fi
+
+# Candidate roots: every registered rig Path, plus the known CodeGraph trees
+# that are not gc rigs (the gascity contributor tree, the city root, the
+# dashboard tree). We sync any path that actually has a .codegraph/.
+mapfile -t RIG_PATHS < <(gc rig list 2>/dev/null | sed -n 's/^[[:space:]]*Path:[[:space:]]*//p')
+CANDIDATES=(
+    "${RIG_PATHS[@]}"
+    /home/ds/gascity
+    /home/ds/gas-city
+    /home/ds/gascity-dashboard
+)
+
+# Dedup while preserving order.
+declare -A seen=()
+PATHS=()
+for p in "${CANDIDATES[@]}"; do
+    [[ -n "$p" && -z "${seen[$p]:-}" ]] || continue
+    seen[$p]=1
+    PATHS+=("$p")
+done
+
+log "starting codegraph $MODE across ${#PATHS[@]} candidate paths"
+synced=0 skipped=0 failed=0
+for path in "${PATHS[@]}"; do
+    if [[ ! -d "$path/.codegraph" ]]; then
+        log "  skip $path (no .codegraph — run 'codegraph init' to enroll)"
+        skipped=$((skipped + 1))
+        continue
+    fi
+    if "${RUN[@]}" "$CODEGRAPH" "$MODE" "$path" >>"$LOG" 2>&1; then
+        log "  ok   $path ($MODE)"
+        synced=$((synced + 1))
+    else
+        log "  FAIL $path ($MODE) — see log above"
+        failed=$((failed + 1))
+    fi
+done
+
+log "codegraph $MODE complete: $synced ok, $skipped skipped, $failed failed"
+exit "$failed"

@@ -1,0 +1,297 @@
+import type { PluginAPI } from '@ampcode/plugin'
+import { spawn } from 'node:child_process'
+
+const CITY_ROOT = '/home/ds/gas-city'
+const GC = '/home/ds/.local/bin/gc'
+const HOOK_ROOT = '/home/ds/.claude/hooks'
+const HOOK_TIMEOUT_MS = 20_000
+const verificationContinuations = new Set<string>()
+
+type CommandResult = {
+  code: number
+  stdout: string
+  stderr: string
+}
+
+type RunOptions = {
+  cwd?: string
+  env?: NodeJS.ProcessEnv
+  input?: string
+  timeoutMs?: number
+}
+
+function runCommand(
+  command: string,
+  args: string[],
+  options: RunOptions = {},
+): Promise<CommandResult> {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd ?? CITY_ROOT,
+      env: { ...process.env, ...options.env },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    const stdout: Buffer[] = []
+    const stderr: Buffer[] = []
+    let timedOut = false
+    const timeout = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGTERM')
+    }, options.timeoutMs ?? HOOK_TIMEOUT_MS)
+
+    child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk))
+    child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk))
+    child.on('error', (error) => {
+      clearTimeout(timeout)
+      resolve({ code: 1, stdout: '', stderr: error.message })
+    })
+    child.on('close', (code) => {
+      clearTimeout(timeout)
+      resolve({
+        code: timedOut ? 124 : (code ?? 1),
+        stdout: Buffer.concat(stdout).toString().trim(),
+        stderr: timedOut
+          ? 'command timed out'
+          : Buffer.concat(stderr).toString().trim(),
+      })
+    })
+    child.stdin.end(options.input ?? '')
+  })
+}
+
+function managedSession(): boolean {
+  return Boolean(process.env.GC_SESSION_ID?.trim())
+}
+
+function workspacePath(amp: PluginAPI): string {
+  const root = amp.system.workspaceRoot
+  return root ? amp.helpers.filePathFromURI(root) : CITY_ROOT
+}
+
+function hookInput(
+  command: string,
+  cwd: string,
+  extra: Record<string, unknown> = {},
+): string {
+  return JSON.stringify({
+    cwd,
+    tool_input: { command },
+    ...extra,
+  })
+}
+
+async function bindAmpThread(threadID: string, amp: PluginAPI): Promise<void> {
+  if (!managedSession()) return
+  const result = await runCommand(
+    GC,
+    ['--city', CITY_ROOT, 'prime', '--hook'],
+    {
+      env: {
+        GC_HOOK_EVENT_NAME: 'SessionStart',
+        GC_MANAGED_SESSION_HOOK: '1',
+        GC_PROVIDER_SESSION_ID: threadID,
+        GC_PROVIDER_SESSION_ID_REQUIRED: 'amp',
+      },
+    },
+  )
+  if (result.code !== 0) {
+    amp.logger.log(`Failed to bind Amp thread ${threadID}: ${result.stderr}`)
+  }
+}
+
+async function changedFilesContext(cwd: string): Promise<string> {
+  const changed = await runCommand(
+    'git',
+    ['-C', cwd, 'diff', '--name-only', 'HEAD'],
+    { cwd },
+  )
+  const untracked = await runCommand(
+    'git',
+    ['-C', cwd, 'ls-files', '--others', '--exclude-standard'],
+    { cwd },
+  )
+  if (changed.code !== 0 || untracked.code !== 0) return ''
+  const sections = [
+    changed.stdout ? `Changed files since the last commit:\n${changed.stdout}` : '',
+    untracked.stdout ? `Untracked files:\n${untracked.stdout}` : '',
+  ].filter(Boolean)
+  return sections.join('\n\n')
+}
+
+async function coordinationContext(amp: PluginAPI): Promise<string> {
+  if (!managedSession()) return ''
+  const [nudge, mail] = await Promise.all([
+    runCommand(
+      GC,
+      [
+        '--city',
+        CITY_ROOT,
+        'hook',
+        'run',
+        '--timeout',
+        '15s',
+        '--timeout-exit-code',
+        '0',
+        '--',
+        'nudge',
+        'drain',
+        '--inject',
+      ],
+    ),
+    runCommand(
+      GC,
+      ['--city', CITY_ROOT, 'mail', 'check', '--inject'],
+    ),
+  ])
+  for (const [name, result] of [
+    ['nudge drain', nudge],
+    ['mail check', mail],
+  ] as const) {
+    if (result.code !== 0) {
+      amp.logger.log(`${name} exited ${result.code}: ${result.stderr}`)
+    }
+  }
+  return [nudge.stdout, mail.stdout].filter(Boolean).join('\n\n')
+}
+
+async function guardShellCommand(
+  command: string,
+  cwd: string,
+): Promise<CommandResult> {
+  return runCommand(
+    `${HOOK_ROOT}/guard-shared-worktree.py`,
+    [],
+    { cwd, input: hookInput(command, cwd) },
+  )
+}
+
+async function guardModifiedFiles(
+  files: string[],
+  cwd: string,
+): Promise<CommandResult | undefined> {
+  for (const file of files) {
+    const result = await runCommand(
+      `${HOOK_ROOT}/guard-worktree-edit.sh`,
+      [],
+      {
+        cwd,
+        input: JSON.stringify({
+          cwd,
+          tool_input: { file_path: file },
+        }),
+      },
+    )
+    if (result.code !== 0) return result
+  }
+  return undefined
+}
+
+async function runPostShellHooks(
+  command: string,
+  cwd: string,
+  event: unknown,
+  amp: PluginAPI,
+): Promise<void> {
+  const input = hookInput(command, cwd, { tool_response: event })
+  for (const hook of [
+    'validate-bead.sh',
+    'validate-bead-close.sh',
+    'capture-provenance.sh',
+  ]) {
+    const result = await runCommand(`${HOOK_ROOT}/${hook}`, [], {
+      cwd,
+      input,
+    })
+    if (result.code !== 0) {
+      amp.logger.log(`${hook} exited ${result.code}: ${result.stderr}`)
+    }
+  }
+}
+
+export default function gasCityAmpRuntime(amp: PluginAPI) {
+  amp.on('session.start', async (event) => {
+    await bindAmpThread(event.thread.id, amp)
+  })
+
+  amp.on('agent.start', async (_event, ctx) => {
+    const cwd = workspacePath(amp)
+    const [changes, coordination] = await Promise.all([
+      changedFilesContext(cwd),
+      coordinationContext(amp),
+    ])
+    const content = [changes, coordination].filter(Boolean).join('\n\n')
+    return content ? { message: { content } } : {}
+  })
+
+  amp.on('tool.call', async (event) => {
+    const shell = amp.helpers.shellCommandFromToolCall(event)
+    if (shell) {
+      const cwd = shell.dir ?? workspacePath(amp)
+      const guarded = await guardShellCommand(shell.command, cwd)
+      if (guarded.code !== 0) {
+        return {
+          action: 'reject-and-continue',
+          message: guarded.stderr || 'Shared-worktree safety guard rejected this command.',
+        }
+      }
+    }
+
+    const uris = amp.helpers.filesModifiedByToolCall(
+      event,
+      amp.system.workspaceRoot ?? undefined,
+    )
+    const files = (uris ?? []).map((uri) => amp.helpers.filePathFromURI(uri))
+    const rejected = await guardModifiedFiles(files, workspacePath(amp))
+    if (rejected) {
+      return {
+        action: 'reject-and-continue',
+        message: rejected.stderr || 'Worktree-isolation guard rejected this edit.',
+      }
+    }
+    return { action: 'allow' }
+  })
+
+  amp.on('tool.result', async (event) => {
+    const shell = amp.helpers.shellCommandFromToolCall(event)
+    if (shell) {
+      await runPostShellHooks(
+        shell.command,
+        shell.dir ?? workspacePath(amp),
+        event,
+        amp,
+      )
+    }
+  })
+
+  amp.on('agent.end', async (_event, ctx) => {
+    const threadID = ctx.thread.id
+    await runCommand(`${HOOK_ROOT}/ready-notify.sh`, [], {
+      cwd: workspacePath(amp),
+    })
+    if (verificationContinuations.has(threadID)) {
+      verificationContinuations.delete(threadID)
+      return { action: 'done' }
+    }
+
+    const verification = await runCommand(
+      `${HOOK_ROOT}/verify-stop.sh`,
+      [],
+      {
+        cwd: workspacePath(amp),
+        input: JSON.stringify({ stop_hook_active: false }),
+      },
+    )
+    if (verification.code === 2) {
+      verificationContinuations.add(threadID)
+      return {
+        action: 'continue',
+        userMessage:
+          '[amp-runtime:verification] Resolve these verification failures before finishing:\n' +
+          verification.stderr,
+      }
+    }
+    return { action: 'done' }
+  })
+
+  amp.logger.log('Loaded Gas City lifecycle, coordination, and safety adapters.')
+}

@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""polecat-ui-stuck-scanner: auto-detect + reset sessions wedged at a UI modal.
+
+Some agent runtimes (Claude Code's slash-command selector, model picker, theme
+picker, etc.) park the process at an interactive prompt that is NOT a "safe
+boundary" for queued message delivery. The session reads as `active` in
+`gc session list` (the runtime is alive) but it is unreachable for routed
+work — effectively offline.
+
+This scanner peeks every active session in the configured pools, matches the
+trailing prompt against a set of UI-modal markers, and auto-resets sessions
+that have been parked for at least STUCK_THRESHOLD_SEC seconds.
+
+Detection is mechanical pattern-matching against a fixed marker list — no
+semantic judgment. Every action is logged + mayor is mailed.
+
+Env:
+  STUCK_THRESHOLD_SEC    auto-reset cutoff in seconds (default 600 = 10m)
+  POLECAT_POOLS_CSV      comma-separated pool template paths to scan
+                         (default: /home/ds/gascity/polecat,/home/ds/gascity-packs/gascity-packs-polecat)
+  LOG_PATH               default: /home/ds/.gc/polecat-ui-stuck.log
+  AUTO_RESET             non-empty = reset stuck sessions (destructive). Default
+                         OFF: surface-only (nudge + mail mayor), never reset.
+  DRY_RUN                non-empty = detect + log only, no nudge/mail/reset
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Supervisor API — used to detect permission/approval "pending interactions"
+# (e.g. Claude Code "Do you want to allow…" prompts) that the UI-modal marker
+# list does NOT catch. The supervisor already detects these per session; we
+# surface them to the mayor exactly like a parked UI modal.
+API_BASE = os.environ.get("GC_API_BASE_URL", "http://127.0.0.1:8372").rstrip("/")
+CITY_NAME = os.environ.get("GC_CITY_NAME", "ds-research")
+
+# High-precision modal-selector markers only. "esc to interrupt" is deliberately
+# EXCLUDED: it shows while the agent is ACTIVELY processing a long tool call, so
+# pairing it with a stale last_active would false-positive on healthy long work.
+UI_MODAL_MARKERS = [
+    "Enter to select",
+    "↑/↓ to navigate",
+    "Esc to cancel",
+    "Type something",
+    "Select model",
+    "Select theme",
+    "Choose a",
+    "/help for help",
+]
+# Strong modal-SELECTOR markers: an interactive picker the agent is parked at,
+# which a text nudge provably CANNOT clear (a TUI selector eats the keystroke as
+# navigation, not a prompt). Only these justify an auto-reset. The weaker markers
+# above ("Type something", "/help for help") also appear in a HEALTHY idle prompt
+# placeholder, so they stay surface-only — resetting on them would kill idle-but-
+# fine workers (cf. mayor-watchdog reset-storm). Reset clears the wedge; the
+# session respawns clean (which is how these self-heal today, just faster).
+SELECTOR_MARKERS = [
+    "Enter to select",
+    "↑/↓ to navigate",
+    "Select model",
+    "Select theme",
+    "Choose a",
+]
+THRESHOLD_SEC = int(os.environ.get("STUCK_THRESHOLD_SEC", "600"))
+# A control-dispatcher reads `active` (runtime alive) but processes routed-bead
+# nudges; if it sits idle past this it is wedged (a healthy dispatcher acts
+# promptly or goes asleep) and routed-bead-nudger hammers it forever while its
+# pool work strands. High threshold (6h) keeps transient idleness from flagging.
+DISPATCHER_STALE_SEC = int(os.environ.get("DISPATCHER_STALE_SEC", "21600"))
+# Per-session surfacing cooldown: a persistently-wedged dispatcher would
+# otherwise be re-mailed every 5-min cycle (it flooded the mayor inbox 78x
+# overnight). Surface each session at most once per COOLDOWN_SEC (default 4h).
+COOLDOWN_SEC = int(os.environ.get("STUCK_COOLDOWN_SEC", "14400"))
+COOLDOWN_PATH = os.environ.get(
+    "STUCK_COOLDOWN_PATH", "/home/ds/.gc/stuck-scanner-cooldown.json"
+)
+POOLS_CSV = os.environ.get(
+    "POLECAT_POOLS_CSV",
+    "/home/ds/gascity/polecat,/home/ds/gascity-packs/gascity-packs-polecat",
+)
+POOLS = [p.strip() for p in POOLS_CSV.split(",") if p.strip()]
+# Auto-cover every pool by naming convention: a pool worker's template basename
+# ends in "worker" or "polecat", optionally with a numbered slot suffix
+# (e.g. zeldascension-worker, scix-worker-3, gascity-packs-polecat, .../polecat).
+# Named sessions (mayor, control-dispatcher, *.project-lead) do not match, so
+# they are never actioned. New rigs are scanned without touching POLECAT_POOLS_CSV.
+POOL_SUFFIX_RX = re.compile(r"(?:worker|polecat)(?:-\d+)?$")
+LOG_PATH = Path(os.environ.get("LOG_PATH", "/home/ds/.gc/polecat-ui-stuck.log"))
+AUTO_RESET = bool(os.environ.get("AUTO_RESET", "").strip())
+DRY_RUN = bool(os.environ.get("DRY_RUN", "").strip())
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def log_line(payload: dict) -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_PATH.open("a") as f:
+        f.write(json.dumps({"ts": now_iso(), **payload}) + "\n")
+
+
+def parse_age_seconds(age_str: str) -> int:
+    """Seconds since last activity.
+
+    `gc session list --json` emits `last_active` as an RFC3339 timestamp
+    (e.g. '2026-06-01T23:10:08-04:00'); the human table emits relative
+    strings ('5h ago'). Handle both — RFC3339 first, relative as fallback.
+    """
+    if not age_str or age_str == "-":
+        return 0
+    s = age_str.strip()
+    # RFC3339 timestamp (the --json shape the scanner actually receives).
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+    except ValueError:
+        pass
+    # Relative-age fallback ('5h ago', '36m ago', '12s ago').
+    m = re.match(r"^(\d+)([smhd])\b", s)
+    if not m:
+        return 0
+    n = int(m.group(1))
+    unit = m.group(2)
+    return {"s": n, "m": n * 60, "h": n * 3600, "d": n * 86400}[unit]
+
+
+def list_active_sessions() -> list[dict]:
+    """Return active sessions whose template path matches one of the configured pools."""
+    result = subprocess.run(
+        ["gc", "session", "list", "--json"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        return []
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    raw_sessions = data.get("sessions") if isinstance(data, dict) else data
+    if not isinstance(raw_sessions, list):
+        return []
+    matched = []
+    for s in raw_sessions:
+        if s.get("state") != "active":
+            continue
+        template = s.get("template") or ""
+        basename = template.rsplit("/", 1)[-1]
+        if not (
+            any(template == pool or template.endswith(pool) for pool in POOLS)
+            or POOL_SUFFIX_RX.search(basename)
+        ):
+            continue
+        matched.append(s)
+    return matched
+
+
+def peek_session(session_id: str) -> str:
+    """Return the trailing prompt output from `gc session peek`."""
+    result = subprocess.run(
+        ["gc", "session", "peek", session_id],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout or ""
+
+
+def detect_markers(peek_output: str) -> list[str]:
+    return [m for m in UI_MODAL_MARKERS if m in peek_output]
+
+
+def session_pending(session_id: str) -> dict | None:
+    """The supervisor's pending-interaction for a session, or None.
+
+    This is a permission/approval prompt (the runtime is blocked waiting on a
+    human answer) — a class the UI-modal markers miss. Authoritative + purely
+    mechanical: we surface whatever the supervisor reports, no guessing.
+    """
+    url = f"{API_BASE}/v0/city/{CITY_NAME}/session/{urllib.parse.quote(session_id, safe='')}/pending"
+    try:
+        req = urllib.request.Request(url, headers={"X-GC-Request": "1"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.load(r)
+    except (urllib.error.URLError, json.JSONDecodeError, OSError):
+        return None
+    pending = data.get("pending") if isinstance(data, dict) else None
+    return pending if isinstance(pending, dict) else None
+
+
+def _load_cooldown() -> dict:
+    try:
+        with open(COOLDOWN_PATH) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_cooldown(state: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(COOLDOWN_PATH), exist_ok=True)
+        with open(COOLDOWN_PATH, "w") as f:
+            json.dump(state, f)
+    except OSError:
+        pass
+
+
+def _recently_surfaced(state: dict, sid: str) -> bool:
+    """True if this session was surfaced within COOLDOWN_SEC (avoid re-flooding)."""
+    last = state.get(sid)
+    if not last:
+        return False
+    try:
+        dt = datetime.fromisoformat(last)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds() < COOLDOWN_SEC
+    except ValueError:
+        return False
+
+
+def list_stale_dispatchers() -> list[dict]:
+    """Active control-dispatcher sessions idle past DISPATCHER_STALE_SEC.
+
+    These are wedged: alive but not converting routed-bead nudges. The id check
+    spans alias/name/target/template since the dispatcher handle varies by wire.
+    """
+    result = subprocess.run(
+        ["gc", "session", "list", "--json"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        return []
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    raw_sessions = data.get("sessions") if isinstance(data, dict) else data
+    if not isinstance(raw_sessions, list):
+        return []
+    out = []
+    for s in raw_sessions:
+        if s.get("state") != "active":
+            continue
+        ident = " ".join(
+            str(s.get(k) or "") for k in ("alias", "name", "target", "template")
+        )
+        if "control-dispatcher" not in ident:
+            continue
+        age = parse_age_seconds(s.get("last_active") or s.get("activity_age") or "-")
+        if age < DISPATCHER_STALE_SEC:
+            continue
+        out.append({**s, "_age_sec": age, "_ident": ident.strip()})
+    return out
+
+
+def nudge_session(session_id: str) -> tuple[bool, str]:
+    result = subprocess.run(
+        ["gc", "session", "nudge", session_id],
+        capture_output=True, text=True, timeout=30,
+    )
+    return result.returncode == 0, (result.stdout + result.stderr).strip()
+
+
+def reset_session(session_id: str) -> tuple[bool, str]:
+    result = subprocess.run(
+        ["gc", "session", "reset", session_id],
+        capture_output=True, text=True, timeout=30,
+    )
+    return result.returncode == 0, (result.stdout + result.stderr).strip()
+
+
+def kill_session(session_id: str) -> tuple[bool, str]:
+    """Kill a session — the ONLY recovery that clears a wedged dispatcher.
+
+    A wedged control-dispatcher trips the named-session circuit breaker, so
+    `gc session reset`/`wake` SILENTLY NO-OP (the recurring band-aid that never
+    stuck). Only `gc session kill` clears the breaker; the supervisor then
+    respawns the dispatcher fresh. Used for the wedged-dispatcher pass only.
+    """
+    result = subprocess.run(
+        ["gc", "session", "kill", session_id],
+        capture_output=True, text=True, timeout=30,
+    )
+    return result.returncode == 0, (result.stdout + result.stderr).strip()
+
+
+def mail_mayor(session_id: str, target: str, reason: str, age_sec: int, action: str) -> None:
+    subject = f"stuck agent session: {session_id} ({target}) — {reason[:60]}"
+    body = (
+        f"polecat-ui-stuck-scanner: an agent session is blocked waiting on input.\n"
+        f"No agent should sit blocked on a human prompt — triage this, auto-handle\n"
+        f"routine/permission cases, and escalate only a genuine decision to Stephanie.\n\n"
+        f"session: {session_id}\n"
+        f"target: {target}\n"
+        f"blocked on: {reason}\n"
+        f"idle: {age_sec}s (threshold: {THRESHOLD_SEC}s)\n"
+        f"action taken: {action}\n"
+        f"auto_reset_enabled: {AUTO_RESET}\n"
+        f"Triage: peek `gc session peek {session_id}`; respond/approve, or "
+        f"reset `gc session reset {session_id}` if genuinely wedged.\n"
+    )
+    subprocess.run(
+        ["gc", "mail", "send", "mayor/", "-s", subject, "-m", body],
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+def main() -> int:
+    # Shared surfacing cooldown across BOTH passes (ui-modal + dispatcher). The
+    # ui-modal pass used to re-mail every 5-min cycle with no cooldown — that is
+    # the 100+/night mayor-inbox flood. Gate every surface on COOLDOWN_SEC.
+    cooldown = _load_cooldown()
+    sessions = list_active_sessions()
+    actioned = 0
+    seen = 0
+    for s in sessions:
+        seen += 1
+        sid = s.get("id") or ""
+        target = s.get("target") or s.get("template") or ""
+        last_active = s.get("last_active") or s.get("activity_age") or "-"
+        age_sec = parse_age_seconds(last_active)
+        if age_sec < THRESHOLD_SEC:
+            continue
+        peek = peek_session(sid)
+        markers = detect_markers(peek)
+        pending = session_pending(sid)
+        if not markers and pending is None:
+            continue
+        # Build a human reason from whichever signal(s) fired. UI-modal markers
+        # (slash/model/theme selectors) and supervisor pending-interactions
+        # (permission/approval prompts) are independent stuck classes.
+        reason_parts: list[str] = []
+        if markers:
+            reason_parts.append("ui-modal: " + ", ".join(markers))
+        if pending is not None:
+            kind = pending.get("kind") or "interaction"
+            prompt = (pending.get("prompt") or "")[:140]
+            reason_parts.append(f"pending {kind}: {prompt}".rstrip(": "))
+        reason = "; ".join(reason_parts)
+        log_line({
+            "event": "stuck-detected",
+            "session_id": sid, "target": target,
+            "age_sec": age_sec, "markers": markers,
+            "pending_kind": (pending or {}).get("kind"),
+        })
+        if DRY_RUN:
+            log_line({"event": "dry-run-skip-action", "session_id": sid})
+            actioned += 1
+            continue
+        # Cooldown: surface (and act on) each stuck session at most once per
+        # COOLDOWN_SEC. A genuine wedge persists across cycles; without this the
+        # ui-modal pass re-mailed it every 5 minutes (the flood). A reset already
+        # respawns the session, so re-detecting the SAME sid before the cooldown
+        # lapses means the prior action is still settling — skip silently.
+        if _recently_surfaced(cooldown, sid):
+            log_line({"event": "ui-modal-cooldown-skip", "session_id": sid})
+            continue
+        cooldown[sid] = now_iso()
+        # A real modal SELECTOR cannot be cleared by a text nudge (the TUI eats
+        # the keystroke as navigation), so for that high-precision class we reset
+        # to actually clear the wedge — regardless of the global AUTO_RESET flag.
+        # Pending-permission-only or weak-placeholder matches stay surface-only
+        # (a permission prompt may want a real mayor answer, not a blind reset).
+        selector_hit = any(m in markers for m in SELECTOR_MARKERS)
+        if selector_hit or AUTO_RESET:
+            ok, msg = reset_session(sid)
+            log_line({
+                "event": "reset" if ok else "reset-failed",
+                "session_id": sid, "ok": ok, "msg": msg[:200],
+                "trigger": "selector" if selector_hit else "auto_reset",
+            })
+            mail_mayor(sid, target, reason, age_sec,
+                       f"reset ({'ok' if ok else 'failed'}) — modal selector, nudge can't clear")
+        else:
+            ok, msg = nudge_session(sid)
+            log_line({
+                "event": "nudge" if ok else "nudge-failed",
+                "session_id": sid, "ok": ok, "msg": msg[:200],
+            })
+            mail_mayor(sid, target, reason, age_sec, f"nudge ({'ok' if ok else 'failed'}) — surface-only, no reset")
+        actioned += 1
+    # Wedged-dispatcher pass. A nudge won't help (the dispatcher is ALREADY
+    # being over-nudged by routed-bead-nudger — that's the symptom) and a reset
+    # NO-OPs (the wedge trips the named-session circuit breaker). The only
+    # recovery that works is `gc session kill` (clears the breaker -> supervisor
+    # respawns fresh). Every item here came from list_stale_dispatchers(), which
+    # already matched the control-dispatcher CLASS ("control-dispatcher" in
+    # ident) — so this pass auto-kills its own class even when the global
+    # AUTO_RESET flag is off (mirrors the ui-modal `selector_hit or AUTO_RESET`
+    # gate). A dispatcher kill is cheap (a fresh respawn, no work lost).
+    dispatchers_seen = 0
+    for d in list_stale_dispatchers():
+        dispatchers_seen += 1
+        sid = d.get("id") or ""
+        target = (
+            d.get("alias") or d.get("name") or d.get("target")
+            or d.get("template") or d["_ident"]
+        )
+        age_sec = d["_age_sec"]
+        reason = (
+            f"wedged dispatcher: active but idle {age_sec // 3600}h — routed-bead "
+            f"nudges are looping unconverted (its pool work is stranding)"
+        )
+        log_line({
+            "event": "stuck-dispatcher-detected",
+            "session_id": sid, "target": target, "age_sec": age_sec,
+        })
+        # Cooldown: a persistent wedge is real, but don't re-mail it every cycle.
+        if not DRY_RUN and _recently_surfaced(cooldown, sid):
+            log_line({"event": "dispatcher-cooldown-skip", "session_id": sid})
+            continue
+        cooldown[sid] = now_iso()
+        if DRY_RUN:
+            log_line({"event": "dry-run-skip-action", "session_id": sid})
+            actioned += 1
+            continue
+        # The control-dispatcher class auto-acts on its own (it is the specific
+        # wedge this scanner exists to heal); honor the global AUTO_RESET too.
+        is_wedged_dispatcher = "control-dispatcher" in (d.get("_ident") or "")
+        if is_wedged_dispatcher or AUTO_RESET:
+            ok, msg = kill_session(sid)
+            log_line({
+                "event": "kill" if ok else "kill-failed",
+                "session_id": sid, "ok": ok, "msg": msg[:200],
+                "trigger": "wedged-dispatcher" if is_wedged_dispatcher else "auto_reset",
+            })
+            mail_mayor(
+                sid, target, reason, age_sec,
+                f"kill ({'ok' if ok else 'failed'}) — wedge trips the circuit "
+                "breaker so reset/wake no-op; kill clears it and the supervisor "
+                "respawns the dispatcher fresh",
+            )
+        else:
+            mail_mayor(
+                sid, target, reason, age_sec,
+                "surface-only (no kill) — mayor: verify the pool has routed/open "
+                "work, then `gc session kill` the dispatcher if wedged",
+            )
+        actioned += 1
+
+    if not DRY_RUN:
+        _save_cooldown(cooldown)
+    log_line({
+        "event": "scan-summary",
+        "scanned": seen, "dispatchers_scanned": dispatchers_seen, "actioned": actioned,
+        "threshold_sec": THRESHOLD_SEC, "dispatcher_stale_sec": DISPATCHER_STALE_SEC,
+        "auto_reset": AUTO_RESET, "dry_run": DRY_RUN,
+    })
+    print(
+        f"polecat-ui-stuck-scanner: scanned={seen} actioned={actioned} "
+        f"threshold={THRESHOLD_SEC}s auto_reset={AUTO_RESET} dry_run={DRY_RUN}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
