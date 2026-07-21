@@ -157,14 +157,15 @@ resource-sweep.
 - **Pause via override, not deletion.** The live mechanism is a
   `[[orders.overrides]]` block in `city.toml` with `name = "<order>"` and
   `enabled = false`, preceded by a comment naming the RCA beads and the
-  explicit re-enable condition. Live example (2026-07-06): `maintenance-cycle`
-  is paused at `city.toml` ~line 449 because the shared mol-formula
-  worktree-provisioning bug (RCA gc-454658/gc-454686) sent every polecat into
-  a broken no-.git worktree and pegged the supervisor ~360%; the comment says
-  exactly when to flip it back. Hard-disable by renaming to `.toml.disabled`
-  is the heavier form, used when the order shape itself is broken
-  (`rig-patrol.toml.disabled` — the only native formula+pool order; that shape
-  is regressed upstream, gascity#1440).
+  explicit exit condition. Live example: `maintenance-cycle` — originally a
+  2026-07-06 pause, now a **permanent retirement**: the Temporal
+  maintenance-Run Schedule is the sole driver of maintenance-cycle dispatch
+  since the gc-372 P5 cutover (2026-07-16), and re-enabling the order would
+  double-dispatch. Never flip it back; per the comment (RCA gc-qo3) the file
+  moves to `.toml.disabled` after a clean Temporal week (~2026-07-23).
+  Hard-disable by renaming to `.toml.disabled` is the heavier form, used when
+  the order shape itself is broken (`rig-patrol.toml.disabled` — the only
+  native formula+pool order; that shape is regressed upstream, gascity#1440).
 - **The comment header is the changelog.** Every non-trivial order file opens
   with why it exists, the incident/bead IDs, cadence-change history, and (for
   mitigations) the un-install condition. When you edit an order, extend the
@@ -199,7 +200,7 @@ the full story; this table is the retirement index (verified in-file
 | `blocked-routed-reaper` (15m)                                  | Workflow-root spawn path reads an unfiltered projection (`orders_feed.go:292`) and respawns no-op polecats for blocked routed beads (gc-nby7oo class, RCA gc-453188) | Upstream status-gate lands in gascity source                                                                   |
 | `nudge-poll-reaper` (2m)                                       | Leaked `gc nudge poll` sidecars busy-loop at 300–650% CPU after session restarts (gc-b9w88; caused the 2026-06-24 all-day nudge hangs)                               | gc-source poll backoff ships (gc-b9w88, held needs-source-impl)                                                |
 | `nudge-on-route` (event) + `routed-bead-nudger` (15m)          | `gc sling` does not wake warm/asleep pools (gascity#1129, by-design); event handler covers active sessions, the 15m sweep covers asleep pools                        | #1129 behavior changes upstream (do not hold your breath: by-design)                                           |
-| `morning-triage-cycle`, `maintenance-cycle` exec-wrapper shape | Native formula+pool orders regressed upstream (#1440); cycles exec-wrap `gc-sling` instead                                                                           | gastownhall/gascity#1986 lands + supervisor restarts; then restore the `rig-patrol.toml.disabled` native shape |
+| `morning-triage-cycle` exec-wrapper shape (`maintenance-cycle` retired — Temporal Schedule drives it since 2026-07-16; file → `.toml.disabled` ~07-23) | Native formula+pool orders regressed upstream (#1440); cycles exec-wrap `gc-sling` instead                                                                           | gastownhall/gascity#1986 lands + supervisor restarts; then restore the `rig-patrol.toml.disabled` native shape |
 | `pl-529-recovery` (2m)                                         | PL sessions wedge on Claude API 529 Overloaded; two-scan confirmation, mayor excluded                                                                                | Claude Code retry path stops wedging sessions                                                                  |
 | `dispatcher-watchdog` (30m)                                    | control-dispatcher (gc-2790) wedges ~6h after reset; only `gc session kill` clears the tripped circuit breaker                                                       | Upstream dispatcher fix                                                                                        |
 | `escalate-surfacer` (15m)                                      | oversight-rig pack's `escalate-rollups` only resolves pack-named PL sessions; bespoke-PL rigs' escalate rollups rot undelivered                                      | Pack resolver becomes naming-independent                                                                       |
@@ -287,7 +288,7 @@ and are revisable by Stephanie. Re-verify volatile facts:
 | ---------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | 89 enabled + 2 disabled files in `orders/`     | `command ls /home/ds/gas-city/orders/ \| wc -l` and `command ls /home/ds/gas-city/orders/*.disabled` |
 | 97 distinct live orders, ~135 rows             | `gc order list \| tail -n +2 \| awk '{print $1}' \| sort -u \| wc -l`                                |
-| maintenance-cycle paused via override          | `grep -n -A2 '\[\[orders.overrides\]\]' /home/ds/gas-city/city.toml`                                 |
+| maintenance-cycle retired via override (Temporal drives it) | `grep -n -A2 '\[\[orders.overrides\]\]' /home/ds/gas-city/city.toml`                                 |
 | 9 pack/built-in orders without files           | `gc order show orphan-sweep \| grep Source:` (and compare list vs `orders/` basenames)               |
 | `gc order check` latency (1m46s on 2026-07-07) | `time gc order check >/dev/null`                                                                     |
 | idempotent=true set on 5 orders                | `grep -l '^idempotent = true' /home/ds/gas-city/orders/*.toml`                                       |

@@ -17,8 +17,8 @@ skills = [
     "verification-loop",
     "strategic-compact",
     "security-review",
-    "code-review",
+    "review",       # was "code-review", which does not exist
     "simplify",
     "review-pr",
-    "de-slopify",
+    "slop-check",   # was "de-slopify", which does not exist
 ]

@@ -265,12 +265,15 @@ gc-453622 Part 1, durable perf bead gc-g421k).
 
 **Resolution.** Reap the runaways (reaper handles it); then stop the storm at
 its source — city.toml gained `[[orders.overrides]] name = "maintenance-cycle"
-/ enabled = false` (bak-before-flip snapshot taken first; that convention is
-owned by `cityops-city-change-control`). Residual: the demand-computation
-stall is pre-gate and needs an upstream pprof session, so as of 2026-07-07 the
-OOM loop had recurred the same evening. Until the provisioning fix lands and
-the override is removed, treat any new supervisor oom-kill as this incident
-continuing, not a fresh mystery.
+/ enabled = false` (pre-flip state captured first; that convention is owned
+by `cityops-city-change-control`). Epilogue: the override is now a
+**permanent retirement**, not a pause awaiting the provisioning fix — the
+Temporal maintenance-Run Schedule is the sole driver of maintenance-cycle
+dispatch since the gc-372 P5 cutover (2026-07-16), re-enabling would
+double-dispatch, and the file moves to `.toml.disabled` after a clean
+Temporal week (~2026-07-23). Residual: the demand-computation stall is
+pre-gate and needs an upstream pprof session, so as of 2026-07-07 the OOM
+loop had recurred the same evening.
 
 **Lessons.** `Restart=always` hides loops — count kills, don't check
 liveness. A reaper can mask a storm's source indefinitely; disable at the
@@ -347,7 +350,7 @@ their one-line re-verification commands:
 | ~7 non-canonical dolt servers; cleanup pending decision                                                | `pgrep -af "dolt sql-server"`                                         |
 | 9 supervisor oom-kills in journal (6 on 2026-07-06)                                                    | `journalctl --user -u gascity-supervisor \| grep -c oom-kill`         |
 | 9 supervisor drop-ins incl. `10-dolt-port.conf` (port 29620), `orphan-guard.conf`, `stop-catcher.conf` | `ls /home/ds/.config/systemd/user/gascity-supervisor.service.d/`      |
-| `maintenance-cycle` disabled via `[[orders.overrides]]`                                                | `grep -A2 'name = "maintenance-cycle"' /home/ds/gas-city/city.toml`   |
+| `maintenance-cycle` retired via `[[orders.overrides]]` (Temporal drives it)                            | `grep -A2 'name = "maintenance-cycle"' /home/ds/gas-city/city.toml`   |
 | `gc session kill` restarts / `close` ends permanently                                                  | `gc session kill --help; gc session close --help`                     |
 | dispatcher-watchdog wedge signals + kill recovery                                                      | `head -30 /home/ds/gas-city/bin/dispatcher-watchdog`                  |
 | reap-worktrees.sh safety model, default repos, TTL 14d                                                 | `head -30 /home/ds/bin/reap-worktrees.sh`                             |

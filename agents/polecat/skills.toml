@@ -17,8 +17,8 @@ skills = [
     "verification-loop",  # quality gate before close
     "strategic-compact",  # session hygiene
     "security-review",    # PR safety
-    "code-review",        # peer review on PR diffs
+    "review",             # multi-model review of uncommitted changes (was "code-review", which does not exist)
     "simplify",           # already used by mol-adopt-pr workflow
     "review-pr",          # multi-model review
-    "de-slopify",         # writeup polish
+    "slop-check",         # erosion/verbosity scan (was "de-slopify", which does not exist)
 ]

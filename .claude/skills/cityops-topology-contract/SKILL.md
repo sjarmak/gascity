@@ -113,24 +113,24 @@ the rot issue clears, because it also keeps auto-launched PLs/workers off
 mayor's account. Removing entries from this list is not a cleanup; it is a
 credential-safety change.
 
-## The mayor provider pin: three layers, one stale comment
+## The mayor provider pin: three layers, read all of them
 
 This is the canonical example of why you read all three layers before
-believing any one of them. State verified 2026-07-06:
+believing any one of them. State verified 2026-07-21:
 
-| Layer                                      | Says                                                                           | Status                              |
-| ------------------------------------------ | ------------------------------------------------------------------------------ | ----------------------------------- |
-| `city.toml [[patches.agent]]` (name=mayor) | `provider = "claude-5"`                                                        | **takes effect at launch**          |
-| `agents/mayor/agent.toml`                  | `provider = "claude-5"`, comment "Unpinned 2026-07-05 … accounts are fungible" | agrees with patch                   |
-| Comment above the patch in `city.toml`     | "claude-3 is mayor's dedicated account (relocated 2026-07-04 from claude-5 …)" | **stale** — contradicts both values |
+| Layer                                      | Says                                                                          | Status                     |
+| ------------------------------------------ | ----------------------------------------------------------------------------- | -------------------------- |
+| `city.toml [[patches.agent]]` (name=mayor) | `provider = "amp"` ("2026-07-17: trial the logged-in Amp account")            | **takes effect at launch** |
+| `agents/mayor/agent.toml`                  | `provider = "amp"`, same 2026-07-17 trial comment                             | agrees with patch          |
 
-The comment/value contradiction is a flagged open item for Stephanie
-(morning ledger 2026-07-07, city-ops Q4: NO CHANGE MADE). Do not "fix" the
-comment or the value yourself. `bin/gc-capacity` updates BOTH the agent.toml
-line and the city.toml patch on a rebalance move; a hand edit that touches
-only one re-creates the divergence. Historical trap: gc-capacity once missed
-per-agent agent.toml provider pins entirely (improvement-program P0, the
-"zelda freeze").
+The mayor has run on the **amp provider since 2026-07-17** — it is NOT on a
+claude-N account, and the account-fungibility story below does not currently
+apply to it. The earlier claude-5/claude-3 lore (stale claude-3 comment,
+morning-ledger 2026-07-07 Q4) is history; the layers agree today.
+`bin/gc-capacity` updates BOTH the agent.toml line and the city.toml patch on
+a rebalance move; a hand edit that touches only one re-creates divergence.
+Historical trap: gc-capacity once missed per-agent agent.toml provider pins
+entirely (improvement-program P0, the "zelda freeze").
 
 ## Rigs as-built
 
@@ -192,10 +192,10 @@ right now" is `gc rig list` (or the state file directly), never the
 
 `gc config explain` prints every agent's effective fields with a source
 annotation. Use it for **values**, not for **edit locations**: on 2026-07-06
-it attributed mayor's `provider = claude-5` to `pack.toml`, even though the
-operative declarations live in `city.toml [[patches.agent]]` and
-`agents/mayor/agent.toml`. To find where to edit, grep the three layers in
-the file map above.
+it attributed mayor's provider (then `claude-5`, `amp` since 2026-07-17) to
+`pack.toml`, even though the operative declarations live in
+`city.toml [[patches.agent]]` and `agents/mayor/agent.toml`. To find where to
+edit, grep the three layers in the file map above.
 
 Under current load, prefer `gc config explain` piped through `grep -A8
 'Agent: <name>'`; full output is thousands of lines. Note that `gc order
@@ -205,17 +205,20 @@ breakage.
 
 ## Live order overrides (topology state, dated)
 
-As of 2026-07-06 exactly one `[[orders.overrides]]` block is live:
-`maintenance-cycle` `enabled = false`. The comment block above it carries the
-full RCA chain (mayor mail gc-454759; RCA gc-454658/gc-454686; perf bead
-gc-g421k) and the re-enable condition: remove the override once the shared
-mol-formula worktree-provisioning fix lands, then re-dispatch the preserved
-#2713 candidate. Do not re-enable it just because the city looks calm.
+Exactly one `[[orders.overrides]]` block is live: `maintenance-cycle`
+`enabled = false`. This is a **permanent retirement, not a pause**: since the
+gc-372 P5 cutover (armed 2026-07-16), the Temporal maintenance-Run Schedule
+is the sole driver of maintenance-cycle dispatch, and re-enabling the order
+would double-dispatch. Never remove this override. The retirement plan
+(city.toml comment, RCA gc-qo3): after a clean Temporal week (~2026-07-23),
+`mv orders/maintenance-cycle.toml` to `.toml.disabled`.
 
 Other daemon-level knobs currently set (all in `city.toml`):
 `max_wakes_per_tick = 15` (wake-storm cap), `[dolt] read_timeout_millis =
 60000` (net_read_timeout EOF RCA 2026-06-21 — owned in detail by
-compass-dolt), `[api] port = 9443` bound to 127.0.0.1, `[session]
+compass-dolt), `[api] port = 9443` bound to 127.0.0.1 (**port drift, known
+issue**: the running supervisor API actually listens on **8372** — configured
+9443, live 8372; verify with `ss -tlnp | grep 8372`), `[session]
 startup_timeout = "30m"`, `[agent_defaults] wake_mode = "resume"` with
 `default_sling_formula = "mol-focus-review"` and `append_fragments =
 ["cass-search"]`, `[beads] provider = "file"` (which is why `gc bd` errors
@@ -267,13 +270,13 @@ each drift-prone claim:
 | 21 declared rigs                        | `grep -c '^\[\[rigs\]\]' /home/ds/gas-city/city.toml`                                    |
 | Rig prefixes / live suspension          | `gc rig list` (run from `/home/ds/gas-city`)                                             |
 | Runtime suspension layer                | `cat /home/ds/gas-city/.gc/runtime/suspension-state.json`                                |
-| Mayor pin value (patch)                 | `grep -B2 -A4 'patches.agent' /home/ds/gas-city/city.toml \| tail -20`                   |
-| Mayor pin value (agent.toml)            | `grep provider /home/ds/gas-city/agents/mayor/agent.toml`                                |
-| Effective mayor provider                | `gc config explain \| grep -A8 'Agent: mayor'`                                           |
+| Mayor pin value (patch; `amp` 07-17)    | `grep -B2 -A4 'patches.agent' /home/ds/gas-city/city.toml \| tail -20`                   |
+| Mayor pin value (agent.toml; `amp`)     | `grep provider /home/ds/gas-city/agents/mayor/agent.toml`                                |
+| Effective mayor provider (`amp`)        | `gc config explain \| grep -A8 'Agent: mayor'`                                           |
 | Provider roster                         | `grep '^\[providers\.' /home/ds/gas-city/city.toml`                                      |
 | CSU_PICK_EXCLUDE contents (both copies) | `grep -n CSU_PICK_EXCLUDE /home/ds/gas-city/bin/csu_pick.sh /home/ds/gas-city/city.toml` |
 | Live order overrides                    | `sed -n '/^\[orders\]/,$p' /home/ds/gas-city/city.toml`                                  |
-| API port (9443)                         | `grep -A2 '^\[api\]' /home/ds/gas-city/city.toml`                                        |
+| API port (configured 9443, live 8372)   | `grep -A2 '^\[api\]' /home/ds/gas-city/city.toml; ss -tlnp \| grep -E '8372\|9443'`      |
 | Order file count (89 + 2 disabled)      | `ls /home/ds/gas-city/orders \| wc -l` (91 entries incl. `.disabled`)                    |
 | Snapshot inventory                      | `ls /home/ds/gas-city/city.toml*`                                                        |
 | Core pack sha pin                       | `grep sha: /home/ds/gas-city/pack.toml`                                                  |

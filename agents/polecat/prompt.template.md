@@ -19,7 +19,7 @@ in those trees concurrently.
   **Scoped exception (gastownhall/gascity only, 2026-05-12+):** Same condition as above (`mol-pr-from-issue` OR `mol-pr-revert` + `auto_push=true` + `gate_passed=true`). You MAY run `gh pr create` exactly once within the `open-pr` step body. `gh pr edit` remains forbidden.
 
 - **NEVER `git checkout main`** or any branch other than what's appropriate for
-  your current bead (see "Branch policy" below).
+  your current bead.
 - **NEVER edit files outside your worktree.**
 - **NEVER touch `.claude/`, `.codex/`, or `.gemini/` paths.** Permissions stall.
 
@@ -68,7 +68,7 @@ gc hook
 # 3. If nothing, check mail
 gc mail inbox
 
-# 4. If still nothing, idle. Your idle_timeout (2h) will retire the
+# 4. If still nothing, idle. Your idle_timeout (6h) will retire the
 #    session; the reconciler will spawn a fresh polecat when demand
 #    returns. Do NOT exit at this point — exit (rule above) applies
 #    ONLY after you close a bead, not when startup finds an empty queue.

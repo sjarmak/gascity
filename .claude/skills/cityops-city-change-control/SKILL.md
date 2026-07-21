@@ -5,7 +5,7 @@ description: >-
   orders/*.toml, agents/*/agent.toml, or a supervisor systemd drop-in;
   before pausing/adding an order; before promoting a janitor dry-run to
   --apply; or when deciding if a change needs Stephanie's approval. Covers
-  bak-before-flip, comment-as-changelog, overrides vs .disabled. Not
+  commit-before-flip, comment-as-changelog, overrides vs .disabled. Not
   topology (cityops-topology-contract).
 ---
 
@@ -27,18 +27,25 @@ This skill owns the change **process**; it does not own the config **content**
 | Supervisor/tmux restart sequence after a service-level change | `compass-tmux-supervisor`, `docs/conventions/tmux-supervisor.md`                        |
 | Ad-hoc guest-session conduct (may you edit at all?)           | `docs/conventions/guest-session-primer.md` + sibling `cityops-guest-session-discipline` |
 
-## The ground rule: no git, so discipline substitutes for it
+## The ground rule: git is the change-control layer (since 2026-07-21)
 
-`/home/ds/gas-city` is **not a git repository** (verified 2026-07-07: no
-`.git` directory). There is no `git log`, no `git revert`, no blame. Three
-conventions replace version control, and every change here uses all three:
+`/home/ds/gas-city` **became a git repository on 2026-07-21** (baseline
+commit `d65a5bc`). `git log`, `git revert`, and blame now exist here. The
+old `.bak-*` sibling snapshots were retired the same day — their content is
+preserved permanently in commit `4d457f8` (retrieve with
+`git show 4d457f8:<path>`). Three conventions govern every change:
 
-1. **Snapshot before the flip** — copy the file to a dated `.bak-*` sibling
-   immediately (seconds, not minutes) before editing.
-2. **Comment as changelog** — the rationale lives in a comment block at the
-   edit site: date, RCA/bead IDs, approver, and the condition for undoing it.
-3. **One concern per flip** — a snapshot-to-live diff must read as exactly
-   one change. Never batch an unrelated "cleanup" into the same edit.
+1. **Commit before the flip** — `git commit` the file's current state
+   immediately before editing if it has uncommitted changes, so the pre-flip
+   state is always recoverable; commit the edit itself right after, with a
+   body that explains WHY with evidence.
+2. **Comment as changelog** — the rationale still lives in a comment block at
+   the edit site: date, RCA/bead IDs, approver, and the condition for undoing
+   it. Git history supplements this; it does not replace it (comments are
+   what the next session reads at the edit site).
+3. **One concern per flip** — a commit diff must read as exactly one change.
+   Never batch an unrelated "cleanup" into the same edit. Stage only your own
+   files (`git add <paths>`; other agents commit concurrently).
 
 ## The change loop
 
@@ -50,59 +57,61 @@ Run every config change through this checklist:
 2. **Read the comments at the edit site.** city.toml comments carry RCA bead
    IDs and dates; values that look like cruft are usually load-bearing (see
    the trap table below).
-3. **Snapshot.**
+3. **Commit the pre-flip state** if the file has uncommitted changes:
    ```bash
-   cp /home/ds/gas-city/city.toml \
-      /home/ds/gas-city/city.toml.bak-<label>-$(date -u +%Y%m%dT%H%M%SZ)
+   cd /home/ds/gas-city && git add <file> && git commit -m "chore: pre-flip state of <file>" -- <file>
    ```
-4. **Edit, with the comment contract** (next section).
+4. **Edit, with the comment contract** (next section), then commit the edit
+   (one concern, WHY in the body).
 5. **Let it take effect** — no supervisor restart for city.toml or
    `orders/*.toml` edits (see "Take-effect model").
 6. **Verify with a read command**, not by assumption (see verification table).
-7. **Confirm the diff is one concern:** `diff <newest .bak> city.toml`.
+7. **Confirm the diff is one concern:** `git show HEAD -- <file>` (or
+   `git diff HEAD~1 HEAD -- <file>`).
 
-## Snapshot convention
+## Snapshot convention (historical) → git commits (current)
 
-Live snapshots on host (5 as of 2026-07-07): naming drifted early
-(`bak-20260529T151405`, `pre-freshwake`, `bak-20260611-prpipeline-path`,
-`bak-pre-pl-20260615-2112`) and converged on
-**`city.toml.bak-<label>-<UTC timestamp>`**, e.g.
-`city.toml.bak-pause-maintenance-cycle-20260706T175816Z`. Use that shape:
-the label says what the flip was; the timestamp orders the archaeology.
+The pre-git convention was a dated `.bak-*` sibling copied seconds before
+each flip (`city.toml.bak-<label>-<UTC timestamp>`, e.g.
+`city.toml.bak-pause-maintenance-cycle-20260706T175816Z`). Those snapshots
+were **retired on 2026-07-21** when the workspace became a git repo: all 142
+legacy `.bak*`/`.PROPOSED` files were committed once in `4d457f8` (retrieve
+any with `git show 4d457f8:<path>`) and then deleted from the working tree.
+Do not create new `.bak` siblings — they are gitignored and invisible to
+history; commit instead.
 
-"Immediately before" is literal: the newest snapshot's mtime is
-`2026-07-06 13:58:16 EDT` and the live city.toml's is `13:58:33` — a
-17-second gap. The snapshot captures the exact pre-flip state, not a state
-from earlier in the day.
-
-Snapshot any file this skill covers, not just city.toml (`orders/*.toml`,
-`agents/*/agent.toml`), when the edit changes behavior. Reading a past change
-back out of the snapshots is covered in `cityops-topology-contract`
-("reading a topology change from its snapshot").
+The discipline the snapshots encoded carries over: the pre-flip state must be
+recoverable (commit-before-flip), and the flip label/rationale must be
+findable (commit subject + the comment contract). For archaeology older than
+the baseline commit `d65a5bc`, `4d457f8` is the time machine.
 
 ## The comment contract
 
 Every behavior-changing edit carries an adjacent comment with four parts.
-The live `[orders]` block in city.toml is the canonical shape:
+The live `[orders]` block in city.toml is the canonical shape (this override
+began life as a temporary pause on 2026-07-06 and was later made permanent —
+the Temporal maintenance-Run Schedule is now the sole driver of
+maintenance-cycle dispatch, so re-enabling would double-dispatch):
 
 ```toml
-# Paused 2026-07-06 per mayor mail gc-454759: the shared mol-formula
-# worktree-provisioning bug (RCA gc-454658/gc-454686, durable perf bead
-# gc-g421k, ...) ... Re-firing while the bug is live is net-negative.
-# Remove this override (or flip enabled = true) once the
-# worktree-provisioning fix lands, then re-dispatch the preserved #2713
-# candidate ...
+# Deliberately paused 2026-07-06 ..., NOT a registration bug — the loader
+# honors enabled=false ... Kept disabled: the Temporal maintenance-Run
+# Schedule is the sole driver of maintenance-cycle dispatch as of the gc-372
+# P5 cutover (armed 2026-07-16, 120m Skip-overlap, dispatch-only).
+# Re-enabling here would double-dispatch. Legacy retirement plan (gc-372):
+# after a clean Temporal week (~2026-07-23), mv orders/maintenance-cycle.toml
+# to .toml.disabled. RCA: gc-qo3.
 [[orders.overrides]]
 name = "maintenance-cycle"
 enabled = false
 ```
 
-| Part                 | In the example above                                      |
-| -------------------- | --------------------------------------------------------- |
-| Date                 | "Paused 2026-07-06"                                       |
-| Authority / evidence | "per mayor mail gc-454759", RCA beads gc-454658/gc-454686 |
-| Why                  | the spawn-storm mechanism, "net-negative" judgment        |
-| Undo condition       | "Remove this override once the … fix lands, then …"       |
+| Part                     | In the example above                                     |
+| ------------------------ | -------------------------------------------------------- |
+| Date                     | "paused 2026-07-06", "armed 2026-07-16"                  |
+| Authority / evidence     | epic gc-372 P5 cutover, RCA gc-qo3                       |
+| Why                      | Temporal Schedule is sole driver; would double-dispatch  |
+| Exit / follow-up plan    | "after a clean Temporal week (~2026-07-23), mv … to `.toml.disabled`" |
 
 Two cautions. Comments are the changelog but **not** current state — the
 mayor-pin comment in the same file is stale against its own value (details in
@@ -114,21 +123,28 @@ a booby trap for whoever finds it in six months.
 
 Two live patterns in this city; pick by intent:
 
-| Intent                                    | Mechanism                                                                                            | Live examples (2026-07-07)                               |
+| Intent                                    | Mechanism                                                                                            | Live examples (2026-07-21)                               |
 | ----------------------------------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| **Temporary pause**, undo condition known | `[[orders.overrides]]` block with `enabled = false` at the bottom of city.toml; order file untouched | `maintenance-cycle`                                      |
-| **Indefinite retirement**                 | rename the file to `orders/<name>.toml.disabled`                                                     | `bead-janitor.toml.disabled`, `rig-patrol.toml.disabled` |
+| **Temporary pause**, undo condition known | `[[orders.overrides]]` block with `enabled = false` at the bottom of city.toml; order file untouched | (none currently)                                         |
+| **Retirement**                            | rename the file to `orders/<name>.toml.disabled`                                                     | `bead-janitor.toml.disabled`, `rig-patrol.toml.disabled` |
+
+`maintenance-cycle` uses the override mechanism but is a **retirement, not a
+pause**: the Temporal maintenance-Run Schedule has been the sole driver of
+its dispatch since the gc-372 P5 cutover (2026-07-16); re-enabling the order
+would double-dispatch. Per the override comment (RCA gc-qo3), after a clean
+Temporal week (~2026-07-23) the file itself moves to `.toml.disabled`.
 
 The override keeps the order's definition intact and puts the RCA comment at
 the flip site in city.toml, where the next operator will look. The `.disabled`
 rename removes the order from the controller's scan entirely; the retirement
-rationale then has to live in the file's own header. Do not delete an order
-file outright — there is no git to recover it from.
+rationale then has to live in the file's own header. Deleting an order file
+outright is recoverable via git since 2026-07-21, but the rename is still
+preferred: it keeps the retirement visible in the directory.
 
-Re-enabling is a change too: snapshot, remove the override (or flip
-`enabled = true`), and honor the undo condition in the comment — for
-maintenance-cycle that includes re-dispatching the preserved #2713 candidate,
-not just un-pausing.
+Re-enabling a paused order is a change too: commit first, remove the override
+(or flip `enabled = true`), and honor the undo condition in the comment. This
+does NOT apply to maintenance-cycle — never re-enable it; the Temporal
+Schedule drives it.
 
 ## Dry-run → apply promotion (janitors and reapers)
 
@@ -187,7 +203,7 @@ by `docs/conventions/tmux-supervisor.md`). Verify with a read command instead.
 | Effective provider chain                 | `gc config explain --provider <name>`                         |                                                                            |
 | An order file edit was picked up         | `gc order show <name>`                                        | shows description/trigger/exec/Source; does **NOT** display override state |
 | A pause actually stopped fires           | `gc order history <name>`                                     | silence after the flip timestamp is the proof                              |
-| One-concern diff                         | `diff <newest .bak> /home/ds/gas-city/city.toml`              |                                                                            |
+| One-concern diff                         | `git -C /home/ds/gas-city diff HEAD -- <file>` (pre-commit) / `git show HEAD -- <file>` |                                                                            |
 | General health after a change            | `gc doctor`                                                   | recovery ladder owned by CLAUDE.md                                         |
 
 **Trap:** `gc order check` (the due/not-due enumerator) is not a reliable
@@ -202,20 +218,24 @@ when you actually want a fire.
 Some values exist in two files and must move together. The known pair: the
 mayor provider lives in **both** `agents/mayor/agent.toml` (`provider = ...`)
 and the `[[patches.agent]]` mayor block in city.toml (the patch is what takes
-effect at launch). `bin/gc-capacity` updates both on a rebalance move; a hand
-edit that touches only one re-creates the divergence that produced the stale
-mayor-pin comment. Rule: provider moves go through `gc-capacity`, not hand
-edits. Full three-layer story in `cityops-topology-contract`.
+effect at launch). Both say `provider = "amp"` since 2026-07-17 — the mayor
+runs on the Amp account, not a claude-N account, so `gc-capacity` rebalancing
+does not apply to it while that pin holds. For claude-N agents the rule
+stands: `bin/gc-capacity` updates both files on a rebalance move; a hand edit
+that touches only one re-creates divergence. Provider moves go through
+`gc-capacity`, not hand edits. Full three-layer story in
+`cityops-topology-contract`.
 
 ## Import-path changes
 
 Pack `source =` paths are a recurring breakage class: the pr-pipeline import
-path was changed and reverted between the 2026-06-11 and 2026-06-15 snapshots
-(the `bak-20260611-prpipeline-path` snapshot exists because of it), and
-pointing oversight-rig at the contributor tree is a documented city-breaker
-(the Don't lives in CLAUDE.md). Change-control rule: an import may only point
-at a **stable, branch-pinned worktree** (`/home/ds/gascity-packs-worktrees/*`
-or `/home/ds/gascity-packs/*`), and an import-path edit gets its own snapshot
+path was changed and reverted between the 2026-06-11 and 2026-06-15 legacy
+snapshots (the `bak-20260611-prpipeline-path` snapshot, preserved in
+`4d457f8`, exists because of it), and pointing oversight-rig at the
+contributor tree is a documented city-breaker (the Don't lives in CLAUDE.md).
+Change-control rule: an import may only point at a **stable, branch-pinned
+worktree** (`/home/ds/gascity-packs-worktrees/*` or
+`/home/ds/gascity-packs/*`), and an import-path edit gets its own commit
 and comment like any other flip.
 
 ## Cron-order edits: two traps with existing homes
@@ -232,8 +252,10 @@ operator lore apply; their homes are the order headers, read them there:
   `orders/overnight-digest.toml`.
 
 Cadence doctrine (cooldown vs cron) is also recorded in order headers
-(`orders/decision-ledger-push.toml`, `orders/maintenance-cycle.toml`): prefer
-`cooldown` for must-just-work recurring orders — no bootstrap trap, self-pacing.
+(`orders/decision-ledger-push.toml`; `orders/maintenance-cycle.toml` too,
+though that order is retired — the Temporal Schedule drives its dispatch):
+prefer `cooldown` for must-just-work recurring orders — no bootstrap trap,
+self-pacing.
 
 ## systemd drop-in changes
 
@@ -280,30 +302,38 @@ if you act on delegated authority, the comment must cite it.
 
 ## Worked example: the 2026-07-06 maintenance-cycle pause, maker's side
 
-This skill OWNS the maintenance-cycle pause story; sibling skills cite it and
-carry only a live-state check (`grep -A2 'orders.overrides' city.toml`). When
-the override is lifted, update this section first.
+This skill OWNS the maintenance-cycle override story; sibling skills cite it
+and carry only a live-state check (`grep -A2 'orders.overrides' city.toml`).
+Epilogue first, so nobody acts on the original undo condition: the pause was
+**permanently superseded** — since the gc-372 P5 cutover (2026-07-16) the
+Temporal maintenance-Run Schedule is the sole driver of maintenance-cycle
+dispatch, re-enabling the order would double-dispatch, and the file itself
+moves to `.toml.disabled` after a clean Temporal week (~2026-07-23). The
+override stays. What follows is the change-control template the original
+pause demonstrated, kept because the *shape* is still the standard.
 
-The full loop, reconstructed from host evidence and re-verifiable:
+The full loop, reconstructed from host evidence:
 
 1. **Authority**: mayor mail gc-454759; RCA beads gc-454658/gc-454686
    (worktree-provisioning bug re-spawning polecats, supervisor pegged ~360%).
-2. **Snapshot**: `city.toml.bak-pause-maintenance-cycle-20260706T175816Z`
-   created 13:58:16 EDT.
-3. **Edit** 17 seconds later (city.toml mtime 13:58:33 EDT): a new `[orders]`
-   section with the 8-line RCA comment + 3-line override, nothing else —
-   `diff` shows 13 added lines, 0 removed. One concern.
+2. **Pre-flip state captured**: then a `.bak` snapshot
+   (`bak-pause-maintenance-cycle-20260706T175816Z`, taken 17 seconds before
+   the edit; preserved today in commit `4d457f8`) — under git, a pre-flip
+   commit serves the same role.
+3. **Edit**: a new `[orders]` section with the RCA comment + 3-line override,
+   nothing else — the diff showed 13 added lines, 0 removed. One concern.
 4. **Took effect without a restart**: `gc order history maintenance-cycle`
-   shows the last fire at `2026-07-06T11:57:25-04:00` and none after, despite
-   a 120m cooldown cadence (verified 2026-07-07, ~34h of silence). The
+   showed the last fire at `2026-07-06T11:57:25-04:00` and none after,
+   despite a 120m cooldown cadence (~34h of silence at verification). The
    supervisor's own restart came hours later (23:56 EDT) and is unrelated.
-5. **Undo condition recorded** in the comment: remove the override once the
-   worktree-provisioning fix lands, then re-dispatch the preserved #2713
-   candidate.
+5. **Exit condition recorded** in the comment — originally "remove once the
+   worktree-provisioning fix lands"; later rewritten in place when the
+   Temporal cutover made the retirement permanent. The comment at the flip
+   site was updated as intent changed; that is the contract working.
 
-That is the template. If your change cannot produce this shape — a snapshot,
-a one-concern diff, a four-part comment, and a read-command proof it took —
-it is not ready to make.
+That is the template. If your change cannot produce this shape — a
+recoverable pre-flip state, a one-concern diff, a four-part comment, and a
+read-command proof it took — it is not ready to make.
 
 ## Provenance and maintenance
 
@@ -312,12 +342,11 @@ re-checks for the drift-prone facts:
 
 | Claim                                  | Re-verify with                                                                                        |
 | -------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| City root is not a git repo            | `ls -d /home/ds/gas-city/.git` (expect: No such file or directory)                                    |
-| 5 city.toml snapshots; newest name     | `ls /home/ds/gas-city/city.toml*`                                                                     |
-| 17s snapshot-to-edit gap               | `stat -c '%y %n' /home/ds/gas-city/city.toml{,.bak-pause-maintenance-cycle-20260706T175816Z}`         |
+| City root IS a git repo (2026-07-21)   | `git -C /home/ds/gas-city log --oneline \| tail -1` (baseline `d65a5bc`)                              |
+| Legacy `.bak` content in `4d457f8`     | `git -C /home/ds/gas-city show --stat 4d457f8 \| head`                                                |
 | Exactly one live order override        | `sed -n '/^\[orders\]/,$p' /home/ds/gas-city/city.toml`                                               |
-| maintenance-cycle still silent         | `gc order history maintenance-cycle` (last fire 2026-07-06T11:57:25-04:00)                            |
-| 91 order files, 2 `.disabled`          | `ls /home/ds/gas-city/orders/ \| wc -l; ls /home/ds/gas-city/orders/*.disabled`                       |
+| maintenance-cycle retired (Temporal)   | `grep -B10 'name = "maintenance-cycle"' /home/ds/gas-city/city.toml` (comment names the P5 cutover)   |
+| Order file census                      | `ls /home/ds/gas-city/orders/*.toml \| wc -l; ls /home/ds/gas-city/orders/*.disabled \| wc -l`        |
 | Janitor promotion annotations          | `grep -n "flipped by Stephanie" /home/ds/gas-city/orders/janitor-*.toml`                              |
 | 9 supervisor drop-ins                  | `ls ~/.config/systemd/user/gascity-supervisor.service.d/`                                             |
 | `gc order check` still slow (>90s)     | `timeout 90 gc order check; echo $?` (143 = still timing out)                                         |

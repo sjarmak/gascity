@@ -234,9 +234,13 @@ fix lands.
 - `maintenance-cycle` disabled via `[[orders.overrides]]` in city.toml (with a
   bak snapshot 17 s prior): a separate worktree-provisioning bug sent every
   maintenance polecat into a broken no-`.git` worktree, re-spawning endlessly
-  and pegging the supervisor ~360%. The override comment names its own
+  and pegging the supervisor ~360%. The override comment named its own
   re-enable condition — that pattern (exit criteria written at pause time) is
-  the house style. **Still disabled as of 2026-07-07.**
+  the house style. Epilogue: the pause was **permanently superseded** — the
+  Temporal maintenance-Run Schedule is the sole driver of maintenance-cycle
+  dispatch since the gc-372 P5 cutover (2026-07-16); re-enabling would
+  double-dispatch, and the order file moves to `.toml.disabled` after a clean
+  Temporal week (~2026-07-23). RCA gc-qo3.
 - Recovery of the wedge itself required
   `systemctl --user restart gascity-supervisor`; `gc doctor --fix` did NOT
   clear it. The escalation ladder lives in CLAUDE.md, not here.
@@ -346,7 +350,7 @@ during authoring. Volatile facts and their one-line re-verification:
 | dolt-state.json healthy (data_dir canonical)            | `jq -r .data_dir /home/ds/gas-city/.gc/runtime/packs/dolt/dolt-state.json`                |
 | 43 stop captures in stop-caller log                     | `grep -c "STOP triggered" /tmp/supervisor-stop-caller.log`                                |
 | 9 supervisor drop-ins; 10-dolt-port.conf says 29620     | `ls /home/ds/.config/systemd/user/gascity-supervisor.service.d/`                          |
-| maintenance-cycle disabled via orders.overrides         | `grep -A2 'name = "maintenance-cycle"' /home/ds/gas-city/city.toml`                       |
+| maintenance-cycle retired via orders.overrides (Temporal drives it) | `grep -A2 'name = "maintenance-cycle"' /home/ds/gas-city/city.toml`                       |
 | gc-74rxa open; gc-typpc closed                          | dolt TCP query on the `gascity` db (recipe in "Bead forensics")                           |
 | All 9 ADRs status:proposed                              | `grep -l '\*\*Status\*\*: proposed' /home/ds/gas-city/docs/adr/0*.md \| wc -l` (expect 9) |
 | journal reaches back only to 2026-07-01                 | `journalctl --user --list-boots`                                                          |

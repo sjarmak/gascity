@@ -158,14 +158,15 @@ owned by `docs/conventions/capacity.md`.
 - A provider change only takes effect via `gc session reset <agent>` — the
   session cycles and resumes in the new account home **without its
   transcript** (mayor's context handoff covers that for mayor).
-- **Mayor pin state (RESOLVED by Stephanie 2026-07-07):** the mayor's account
-  assignment is intentionally arbitrary — accounts are identical except for
-  accumulated usage, so which one hosts the mayor "shouldn't matter." The
-  operative rule is quota-spreading: prioritize balancing consumption across
-  the five accounts over any per-agent affinity. The stale claude-3 comment
-  in city.toml is historical, not intent (`gc-capacity` updates value lines
-  on a move but not comments — read comments as changelog, never as current
-  state).
+- **Mayor provider (since 2026-07-17): `amp`**, not a claude-N account — set
+  in both `agents/mayor/agent.toml` and the `city.toml [[patches.agent]]`
+  mayor block ("trial the logged-in Amp account for the always-on mayor").
+  The account-fungibility / quota-spreading rule (RESOLVED by Stephanie
+  2026-07-07: assignment among claude accounts is intentionally arbitrary,
+  balance consumption over affinity) still governs the claude-N agents, but
+  the mayor sits outside that pool while the amp pin holds. Read comments as
+  changelog, never as current state (`gc-capacity` updates value lines on a
+  move but not comments).
 - **Auto-drain is live:** `orders/account-quota-warning.toml` runs every 30
   min with `QUOTA_AUTO_DRAIN=1` (added 2026-07-05 after account4 coasted to
   92% 7-day while the order was alert-only and workers throttled into silent
@@ -266,7 +267,7 @@ re-verification line per drift-prone claim:
 | Refresh actually working                                       | `tail -8 /home/ds/logs/claude-refresh.log` (expect `REFRESHED expiry=8.0h rc=0` x5)                                                               |
 | Expiry recovery cadence and alert policy                       | `grep -n 'schedule\|description' /home/ds/gas-city/orders/account-keepalive.toml; grep -n 'hte > 0\|alert already sent' /home/ds/gas-city/bin/account-keepalive` |
 | Token expiry ground truth                                      | the 5-account one-liner in §3                                                                                                                     |
-| Mayor provider (claude-5 in both files as of 2026-07-07)       | `grep -n 'provider' /home/ds/gas-city/agents/mayor/agent.toml; grep -A4 '\[\[patches.agent\]\]' /home/ds/gas-city/city.toml`                      |
+| Mayor provider (`amp` in both files since 2026-07-17)          | `grep -n 'provider' /home/ds/gas-city/agents/mayor/agent.toml; grep -A4 '\[\[patches.agent\]\]' /home/ds/gas-city/city.toml`                      |
 | Auto-drain armed                                               | `grep -n 'QUOTA_AUTO_DRAIN' /home/ds/gas-city/orders/account-quota-warning.toml`                                                                  |
 | Idle reaper still report-only                                  | `grep -n 'REPORT-ONLY\|NOT wired' /home/ds/gas-city/orders/idle-session-report.toml`                                                              |
 | Supervisor's account home (account4)                           | `systemctl --user cat gascity-supervisor \| grep CLAUDE_CONFIG_DIR`                                                                               |

@@ -170,15 +170,18 @@ the spawned sessions** — the reconciler just re-creates them. Worked example
 from this host, 2026-07-06: a shared mol-formula worktree-provisioning bug
 sent every maintenance-cycle polecat into a broken no-`.git` worktree, which
 re-spawned endlessly and kept the supervisor pegged ~360% CPU. The fix was a
-config pause, done in the house style (snapshot first, comment carries the RCA
-and the un-pause condition). The quoted override block and the maker's-side
-walkthrough are owned by sibling `cityops-city-change-control` ("Worked
-example: the 2026-07-06 maintenance-cycle pause") — cite it, don't copy it.
-Check live state (`grep -A2 'orders.overrides' /home/ds/gas-city/city.toml`)
-before re-enabling anything maintenance-cycle-shaped. The bak-before-flip
-convention also belongs to change-control; what matters for capacity is the
-_shape_ of the response: identify the feeder (order, formula, or pool),
-`enabled = false` it via `[[orders.overrides]]`, and let the reconciler drain.
+config pause, done in the house style (pre-flip state captured, comment
+carries the RCA and the exit condition). Epilogue: that pause became a
+**permanent retirement** — the Temporal maintenance-Run Schedule is the sole
+driver of maintenance-cycle dispatch since the gc-372 P5 cutover
+(2026-07-16); re-enabling the order would double-dispatch, and the file moves
+to `.toml.disabled` after a clean Temporal week (~2026-07-23). Never
+re-enable it. The override block and the maker's-side walkthrough are owned
+by sibling `cityops-city-change-control` — cite it, don't copy it. The
+commit-before-flip convention also belongs to change-control; what matters
+for capacity is the _shape_ of the response: identify the feeder (order,
+formula, or pool), `enabled = false` it via `[[orders.overrides]]`, and let
+the reconciler drain.
 
 ## Disk and memory pressure
 
@@ -239,7 +242,7 @@ drift-prone claim:
 | Wake budget 15 / patrol 2m     | `grep -e max_wakes_per_tick -e patrol_interval /home/ds/gas-city/city.toml`                                       |
 | Pool floors/ceilings table     | `grep -H _active_sessions /home/ds/gas-city/agents/*/agent.toml`                                                  |
 | Effective rig suspension       | `gc rig list` (and `cat /home/ds/gas-city/.gc/runtime/suspension-state.json`)                                     |
-| maintenance-cycle still paused | `grep -A2 "orders.overrides" /home/ds/gas-city/city.toml`                                                         |
+| maintenance-cycle retired (Temporal drives it) | `grep -A2 "orders.overrides" /home/ds/gas-city/city.toml`                                                         |
 | +2-workers policy wording      | `grep -n "auto-approve" /home/ds/gas-city/agents/mayor/prompt.template.md`                                                 |
 | Disk headroom / 30G threshold  | `df -h /` and `head -12 /home/ds/gas-city/orders/disk-pressure-guard.toml`                                        |
 | Janitor execute-mode flags     | `grep JANITOR /home/ds/gas-city/orders/janitor-log-rotate.toml /home/ds/gas-city/orders/janitor-worktree-gc.toml` |

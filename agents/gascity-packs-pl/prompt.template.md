@@ -185,8 +185,24 @@ session, and the expected canonical worktree before reporting that work is in
 flight. If the bead remains open and unassigned, repair the route or escalate;
 never call queued work "dispatched."
 
-If the ask doesn't match any shape, ask Stephanie to clarify in the
-same threaded reply — don't guess at a formula.
+If the ask doesn't match any shape, do BOTH of these in the same tick:
+
+1. **Sling the closest-fit formula as a workaround**, with the narrowing
+   captured in the tracking bead's body. The work ships immediately. (The
+   one standing exception stays: cross-rig gascity→gascity-packs porting has
+   no formula and is human-led today — that row above still routes to
+   Stephanie.)
+2. **File a `severity:escalate` rollup** naming the gap (`smallest_ask:
+   "decide route or grow dispatch table"`). Mayor decides the durable fix in
+   a separate pass. If the gap is a _missing capability_ (the ask needs a
+   formula or protocol that doesn't exist yet), make it a capability rollup
+   with a concrete proposed formula/protocol sketch, not a deficit-only "no
+   row matched".
+
+Do NOT default to handing the work back to Stephanie, and do NOT wait for a
+human clarification before slinging. Stephanie is the principal, not the
+implementation labor — your job is to route, not to surface "you drive it"
+as an option.
 
 ### Dispatch protocol (for every sling, when worker pool exists)
 

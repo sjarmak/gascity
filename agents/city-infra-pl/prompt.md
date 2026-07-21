@@ -37,9 +37,11 @@ bd show <id>                      # detail; bd update / bd close to work them
 
 1. `gc mail count` — if any unread, `gc mail inbox` and triage before anything
    else (human handoffs, worker stall reports, mayor messages).
-2. Survey your domain: open city-infra beads (`gc bd list --status open`,
-   `--status in_progress`, `--status blocked`), the city's health
-   (`gc doctor`), and the order schedule (`gc order check`) when relevant.
+2. Survey your domain: open city-infra beads (`bd list --label city-infra
+   --status open`, `--status in_progress`, `--status blocked` — plain `bd`,
+   per the store-scope rule above; `gc bd` cannot see them), the city's
+   health (`gc doctor`), and the order schedule (`gc order check`) when
+   relevant.
 3. Do the ready, in-scope work. Surface what you can't.
 
 ## Two bead classes you execute (in-place)

@@ -34,7 +34,7 @@ you. If it isn't, mail mayor and stop — do NOT cross-rig in one bead.
   was garbage-collected off origin, destroying ~26 days of tested work.
 - **NEVER `gh pr create` or `gh pr edit`.** PR opening is human-gated.
 - **NEVER `git checkout main`** or any branch other than what's appropriate for
-  your current bead (see "Branch policy" below).
+  your current bead.
 - **NEVER edit files outside your worktree.**
 - **NEVER `bd dolt push`.** Beads-data push is human-gated for this repo (per
   gastownhall/gascity-packs CLAUDE.md). You commit beads locally only.
@@ -85,7 +85,7 @@ gc hook
 # 3. If nothing, check mail
 gc mail inbox
 
-# 4. If still nothing, idle. Your idle_timeout (2h) will retire the
+# 4. If still nothing, idle. Your idle_timeout (6h) will retire the
 #    session; the reconciler will spawn a fresh gascity-packs-polecat
 #    when demand returns. Do NOT exit at this point — exit (rule above)
 #    applies ONLY after you close a bead, not when startup finds an

@@ -4,13 +4,13 @@ Failure modes covered: rate-limited agent silently stalling because `csu` only s
 
 ## Setup
 
-5 Claude accounts (`claude-1` through `claude-5`) mapped in each `agents/<name>/agent.toml` via `provider = "claude-N"`. Workspace default is `claude-1`. Plus Codex.
+5 Claude accounts (`claude-1` through `claude-5`) mapped in each `agents/<name>/agent.toml` via `provider = "claude-N"`. Workspace default is `claude-1`. Plus Codex. Exception: the mayor runs on the `amp` provider since 2026-07-17 and sits outside the claude-account pool (see the rebalance note below).
 
 ## Tools
 
 - **`csu`** — refreshes `~/.claude-usage/usage_cache.json` by probing each account's API rate-limit headers.
 - **`gc-capacity`** — dashboard + rebalancer that cross-references usage data with agent→provider mappings in `agents/*/agent.toml`.
-- **`mayor-failover`** — convenience alias for `gc-capacity --rebalance mayor`.
+- **`mayor-failover`** — convenience alias for `gc-capacity --rebalance mayor`. Inoperative while the mayor runs on the `amp` provider (since 2026-07-17, set in `city.toml [[patches.agent]]` + `agents/mayor/agent.toml`): rebalancing moves agents among the claude-N accounts, so running it would move the mayor OFF amp — a provider change, not a rebalance.
 
 ## API vs consumer-subscription limits
 
@@ -21,7 +21,7 @@ Failure modes covered: rate-limited agent silently stalling because `csu` only s
 ```bash
 gc-capacity                                                # dashboard
 gc-capacity --refresh                                      # refresh usage data first, then show
-gc-capacity --rebalance mayor                              # move to coolest account (auto-detected)
+gc-capacity --rebalance mayor                              # move to coolest account (auto-detected) — inoperative while mayor = amp (2026-07-17+), see Tools above
 gc-capacity --rebalance scix-worker-3                      # specific agent
 gc-capacity --rebalance mayor --force                      # when tool can't detect the rate limit
 gc-capacity --rebalance mayor --force --avoid 3            # exclude known-bad accounts

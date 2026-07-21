@@ -131,13 +131,6 @@ ready_prompt_prefix = ">"
 process_names = ["codex"]
 resume_command = "/home/ds/.nvm/versions/node/v22.22.2/bin/codex resume {{.SessionKey}}"
 
-[providers.codex-mayor]
-base = "builtin:codex"
-args = []
-[providers.codex-mayor.option_defaults]
-model = "gpt-5.6-sol"
-effort = "high"
-
 [imports]
 [imports.cass]
 source = "/home/ds/gascity-packs-worktrees/cass/cass"

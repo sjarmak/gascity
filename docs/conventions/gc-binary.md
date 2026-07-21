@@ -27,7 +27,7 @@ The oversight-rig pack is not yet on upstream `main` and does not live in `gasci
 | ------------------------------------------------ | ------------ | ---------------------------------------------------- |
 | `/home/ds/gascity-packs-worktrees/oversight-rig` | `gascity-pr` | The only path `city.toml` references for this pack.  |
 
-All `city.toml` references use `/home/ds/gascity-packs-worktrees/oversight-rig/examples/oversight-rig` (12 lines: one in `[imports]`, ten per-rig `[rigs.imports.oversight-rig]` blocks, one inside a `[[rigs]].includes` array). Do NOT swap them back to `/home/ds/gascity/examples/oversight-rig` — that breaks the city every time the contributor tree gets swung off a branch with the pack.
+All `city.toml` references use `/home/ds/gascity-packs-worktrees/oversight-rig/oversight-rig` (21 lines as of 2026-07-21: one in `[imports]`, twenty per-rig `[rigs.imports.oversight-rig]` blocks; count with `grep -c 'packs-worktrees/oversight-rig/oversight-rig' city.toml`). Do NOT swap them back to `/home/ds/gascity/examples/oversight-rig` — that breaks the city every time the contributor tree gets swung off a branch with the pack.
 
 Recreate the worktree if missing:
 

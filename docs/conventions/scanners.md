@@ -2,9 +2,9 @@
 
 Failure modes covered: abandoned worker process leaving a bead claim stuck in `in_progress` (orphan-sweep only catches dead agent names, not dead worker processes for live names); abandoned Claude Code processes accumulating until systemd-oomd kills `user@1000`; slack bindings orphaning after a pool respawn so the channel goes silent; mail to `human`/`stephanie`/`sjarmak` sitting dead-letter in mayor's inbox; beads closed without required evidence metadata; CLAUDE.md / mayor-memory references to GitHub issues that have since been resolved; epic-level review fragmenting into per-bead reviews.
 
-## Order table (current)
+## Order table (selection)
 
-Eleven `gc order` definitions in `orders/`:
+The `orders/` directory has grown far past this table (~110 enabled `.toml` definitions as of 2026-07-21; count with `ls orders/*.toml | wc -l`, or `gc order check` for the live schedule). The rows below are the founding scanner set this doc explains, not a census:
 
 | Order                              | Trigger              | Driver                                            |
 | ---------------------------------- | -------------------- | ------------------------------------------------- |

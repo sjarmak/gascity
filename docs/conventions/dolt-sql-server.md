@@ -8,22 +8,16 @@ One dolt sql-server serves the entire city. Owned by gc's runtime pack (`.gc/run
 
 DO NOT run `bd dolt start|stop|status` from this workspace — bd has no knowledge of the gc-managed server and `bd dolt status` will KILL the live server as a "drift recovery" side effect. Upstream tracking: gascity#506, #245, #323.
 
-Port is deterministic — `gc-beads-bd` hashes it from the city path, so it's stable across restarts unless the workspace moves. Override by exporting `GC_DOLT_PORT` before the supervisor starts.
+**Never trust a port literal in a doc — read the live port from `.beads/dolt/.dolt/sql-server.info`** (`PID:PORT:UUID`). The port is NOT reliably stable: it can change when the server is killed or restarted (e.g. the 2026-07-21 memcg kills each flipped it), and a stale literal is exactly the drift that froze order-firing (gc-74rxa: the supervisor exports `GC_DOLT_PORT` only when it *starts* dolt, not when it *adopts* one; the `10-dolt-port.conf` drop-in pins the env as a stopgap and must be updated if the port changes). Override by exporting `GC_DOLT_PORT` before the supervisor starts.
 
 ## Databases (one per scope on the shared server)
 
-| Database            | Purpose                                            | Scope |
-| ------------------- | -------------------------------------------------- | ----- |
-| `gc`                | city sessions AND city work beads (`dr-*` prefix)  | city  |
-| `codeprobe`         | codeprobe rig                                      | rig   |
-| `CodeScaleBench`    | CodeScaleBench rig                                 | rig   |
-| `EnterpriseBench`   | EnterpriseBench rig                                | rig   |
-| `live_docs`         | live_docs rig                                      | rig   |
-| `agent_diagnostics` | agent-diagnostics rig                              | rig   |
-| `background_agents` | background-agents rig                              | rig   |
-| `GEO`               | GEO rig                                            | rig   |
-| `mcp_ax`            | mcp-ax rig                                         | rig   |
-| `code_intel_digest` | code-intelligence-digest rig                       | rig   |
+One database per scope: `gc` holds city sessions AND city work beads (`dr-*` prefix); each rig gets its own database named after the rig (~23 rig DBs as of 2026-07-21, plus shared/system DBs). Do not trust any static list here — enumerate live:
+
+```bash
+PORT=$(cut -d: -f2 .beads/dolt/.dolt/sql-server.info)
+dolt --host 127.0.0.1 --port "$PORT" --user root --no-tls --password '' sql -q 'SHOW DATABASES'
+```
 
 Adding a new rig: `gc rig add <path>` (or `--adopt` for existing `.beads/`). Any other path bypasses drift checks.
 
@@ -94,7 +88,7 @@ cat .beads/dolt/.dolt/sql-server.info        # PID:PORT — ground truth
 In order:
 
 1. `gc doctor --fix` — reconciles most drift (types, split-stores, endpoint mirrors) automatically
-2. `systemctl --user restart gascity-supervisor` — rehydrates runtime pack, brings dolt back on its deterministic port
+2. `systemctl --user restart gascity-supervisor` — rehydrates runtime pack, brings dolt back up (re-read the port from `sql-server.info` afterwards; it can change)
 3. True emergency where neither helps: full sequence in `tmux-supervisor.md`
 
 DO NOT try to "fix" things by adding `dolt.port` / `dolt.host` to rig config.yamls. Under `managed_city`, rigs must not track the endpoint — gc does it for them.
