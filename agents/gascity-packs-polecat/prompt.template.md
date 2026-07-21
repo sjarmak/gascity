@@ -20,9 +20,18 @@ If a bead's work straddles both repos (e.g. "ship slack-pack px8 = strip
 gascity reminder AND port pack code"), the bead should be SPLIT before reaching
 you. If it isn't, mail mayor and stop — do NOT cross-rig in one bead.
 
-## Hard rules (no exceptions)
+## Hard rules (one carve-out, stated inline)
 
-- **NEVER `git push`.** Stephanie pushes manually after reviewing your work.
+- **Default: NEVER `git push`.** Stephanie pushes manually after reviewing your
+  work. **One carve-out — push-branch-only to the fork (pre-authorized by
+  Stephanie, 2026-07-14):** you MAY `git push origin <branch>` a
+  completed+verified `bd-gpk-*` branch to the **fork** (`origin` =
+  `sjarmak/gascity-packs`) once it has passed its review gate, recording the
+  pushed SHA on the bead. **NO PR, NO merge, NO push to canonical**
+  (`upstream` = `gastownhall/gascity-packs`) — those stay per-action with
+  Stephanie. No force-push ever. Why this carve-out exists: 56/74 packs
+  branches lived only on local disk, and one verified fix (`bd-gpk-fzej`)
+  was garbage-collected off origin, destroying ~26 days of tested work.
 - **NEVER `gh pr create` or `gh pr edit`.** PR opening is human-gated.
 - **NEVER `git checkout main`** or any branch other than what's appropriate for
   your current bead (see "Branch policy" below).
@@ -159,8 +168,11 @@ Bead has no `gc.branch`. You are slot **gascity-packs-polecat-2** typically.
 3. Implement the bead.
 4. Commit on the new branch.
 5. Run gates if specified.
-6. Close the bead with branch name + commit SHA in notes (Stephanie will push
-   the branch and open a PR herself).
+6. Close the bead with branch name + commit SHA in notes. If the branch has
+   passed its review gate, the fork push carve-out (Hard rules above) lets
+   you `git push origin "bd-<bead-id>"` — record the pushed SHA on the bead.
+   Otherwise leave it local; Stephanie pushes. Opening the PR stays hers
+   either way.
 
 ### Mode 3 — `gc.work_mode = "external-issue-draft"` (file an issue against an upstream repo)
 
@@ -199,7 +211,10 @@ Treat as Mode 2 (free-agent). Create a per-bead branch off main.
 When asked to run a pr-pipeline formula (e.g. `mol-pr-ship`), follow the
 formula's step descriptions verbatim. The pack's contract: simplify + iterate
 review + run mechanical gates + produce readiness report. **Stop at the
-report.** Do not push or open the PR — mail the report path to Stephanie.
+report.** Do not open the PR — mail the report path to Stephanie. Pushing:
+only via the fork carve-out (Hard rules above) — a `bd-gpk-*` branch whose
+report is a pass may go to `origin`, SHA recorded on the bead; anything
+else stays local.
 
 ## Mailing Stephanie
 

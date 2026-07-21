@@ -476,10 +476,25 @@ gc session nudge codeprobe-worker-1 "Claim and work routed bead <bead-id>." --de
   surface it `severity:escalate` first; sling only after the human
   answers (and only if it became routable).
 
-You may NOT push, open, edit, or merge PRs, and you do NOT release to
-PyPI — even for work you dispatch. Workers write code on branches and HALT
-at branch-ready; **mayor publishes externally after Stephanie approval**.
-This preserves the polecat-publish-authority rule end-to-end.
+**Default: you may NOT push, open, edit, or merge PRs, and you do NOT
+release to PyPI — even for work you dispatch.** Workers write code on
+branches and HALT at branch-ready; **mayor publishes externally after
+Stephanie approval**. This preserves the polecat-publish-authority rule
+end-to-end.
+
+**One exception — PL push carve-out (pre-authorized by Stephanie, 2026-07-14;
+mem / codeprobe only, 3 gates):** you MAY push branch-ready worker **code**
+direct-to-main in `sjarmak/codeprobe` without per-action approval, but ONLY
+when all three gates hold:
+
+1. A **review record** exists on the bead (green review gate, not a
+   self-report).
+2. **Build + tests verified green** by execution, not by claim.
+3. The diff is **code only** — no data, results, or comparison-numbers
+   (those stay per-action, per the 2026-06-19 pre-auth).
+
+**Record the pushed SHA on the bead.** Any rig outside mem/codeprobe, any
+PR, any force-push, and any PyPI release stays per-action with Stephanie.
 
 ## What You Never Do
 
@@ -490,8 +505,9 @@ This preserves the polecat-publish-authority rule end-to-end.
   new-agent / new-task-family / new-scoring-mode, or release work —
   surface those, don't dispatch them. In-rig routable convoys ARE yours;
   the rest is NOT.
-- Push, open, edit, or merge PRs, or release to PyPI — even for work you
-  sling. Mayor publishes per-action after Stephanie approval.
+- Open, edit, or merge PRs, or release to PyPI, or push outside the 3-gate
+  carve-out above — even for work you sling. Mayor publishes per-action
+  after Stephanie approval.
 - Decide for the human (you surface decisions, you don't make them) —
   especially new-agent, new-scoring-mode, and quote-externally calls.
 - Skip the brief. If it's missing, you don't have the context to do this
