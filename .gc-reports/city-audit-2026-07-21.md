@@ -460,3 +460,103 @@ full-parse path, docs/skills ownership split (§ config audit: mayor is `amp`, n
 ## 10. Wave 3 (Temporal external-mutation lane)
 
 Per §6, gated on the memory arithmetic being fixed and on the 07-23 soak gate.
+
+---
+
+# APPENDIX — what was actually applied, 2026-07-21
+
+Written after the audit, once Stephanie redirected: *"the city isn't really
+functioning well as is anyway so optimize for long term robust fixes dont worry
+about what issues you might cause in the interim with throughput we are pausing
+to focus on cleaning up."* That authorized both gated decisions in §7 and shifted
+the order of work to stabilize-first.
+
+## A. The box was stabilized
+
+| Metric | Before | After |
+|---|---|---|
+| gascity.slice | 31.1 GB (pinned at its 32 GB max) | 13.3 GB |
+| MemAvailable | 6.5 GB | 20 GB |
+| memcg OOM kills | 24 → 37 during the audit, 2-7 per 10 min | 37, flat for ~50 min |
+| canonical dolt | killed 3x (07:52, 09:28, 09:42) | one process, 30+ min uptime |
+| sessions | 87 | draining through 48 |
+| order floor | hours behind | firing on cadence |
+
+Sequence: rebound the supervisor's dolt-port drop-in 29621 → 29620 to match
+`sql-server.info` (breaker went open → closed on every rig, 51,155 stale events
+stopped); reaped 4 zombie test dolts with deleted cwds; zeroed all 39 pool
+`min_active_sessions`; suspended 23 city-level PLs via `gc agent suspend`;
+suspended the 20 active pack-defined pool agents via `[[patches.agent]]`
+(`gc agent suspend` refuses pack-defined agents); closed the surplus sessions.
+Mayor left running.
+
+**The pause is reversible and its procedure is written down**: bead gc-x77t is
+the resume checklist. Do not resume piecemeal — floors, PL suspends, and the
+city.toml patch block were changed together. And do not resume before the memory
+arithmetic is fixed, or the same churn returns immediately.
+
+## B. Git is now the change-control layer
+
+`git init` + baseline (778 files; `.env`, `.gc/`, `.beads/` ignored — `.env`
+holds a live `CLAUDE_OAUTH_TOKEN` and was verified unstaged before the first
+commit). The 142 `.bak`/`.PROPOSED` files were **committed once and then
+deleted**, rather than deleted outright as the approved plan allowed: they were
+the only record of prior versions, and throwing that away at the moment of
+adopting a tool that could keep it would have been the wrong trade. Content is
+recoverable with `git show 4d457f8:<path>`.
+
+`cityops-city-change-control`'s bak-before-flip step should now read
+commit-before-flip.
+
+## C. Fixes applied, each verified by execution
+
+1. **`pour = true` on `mol-pr-from-issue`** — closes the armed RootOnly strand
+   (§1.3). Formula parses, 7 steps.
+2. **`needs-recovery-reaper`** (new script + order + 12-assertion test) — sweeps
+   the two states designed to be reaper-visible that had no consumer (§1.1).
+   **First run found 27 stuck beads across 8 stores**, invisible for over a day.
+   The one that justifies it: `EnterpriseBench-rryas.12`, `review_verdict=pass`
+   with `land_failed_reason=ff_only_collision` — work that passed review, could
+   not land, and nothing was watching. Triage tracked in gc-82r4.
+   Surface-only by design; fails loud on an unreadable store rather than
+   reporting a clean scan. Mutation-tested: removing fail-loud breaks 3
+   assertions and the suite exits 1.
+3. **Log rotation** — found a second silent defect: the glob
+   `runtime/*--control-dispatcher-trace.log` **matched zero files** because the
+   real names are `*--core.control-dispatcher-trace.log`. Dispatcher trace
+   rotation had never run. Replaced with directory-wide globs. First execute:
+   8 files, ~500 MB.
+4. **`city-selftest` budget enforcement** — the "a 12th suite MUST raise timeout"
+   instruction had been breached to 16 suites against a 660s ceiling, for the
+   second time. Timeout → 1200s, and the script now performs its own preflight
+   from `CITY_SELFTEST_BUDGET`, escalating when the suite count outgrows the
+   order timeout. Verified firing at budget=100 and silent at 1200.
+5. **20 orphaned pytest suites wired in** (170 tests, invoked by nothing — no
+   order, cron, or CI). They covered `completion-reconciler`, which mutates bead
+   state every 15m and was found *failed*. All green; now watched.
+6. **Prompt fixes** — `gascity-packs-polecat` escalated into a dead-letter
+   mailbox on every blocker (ported the canonical `terminal-worker-escalation`
+   block); `/caveman lite` removed from 9 prompts (skill pruned 2026-06-22);
+   dead `~/.claude/rules/common/` paths repointed to `rules-reference/` (the
+   mayor had been failing to read its own standing rules at every session start).
+7. **Fable pins** in `account3`/`account4` `settings.json` → `opus[1m]`.
+8. **.gc retention** — 8.5 GB → 5.1 GB.
+
+Suite count 16 → 18, all green.
+
+## D. One audit finding did not survive verification
+
+The prompt audit reported that `gascity-packs-polecat`'s note about slack-pack
+living on `feat/import-slack-pack` pending PR #8 was stale, "merged, on main".
+Checked before editing: the branch still exists, `c0894a3` is not an ancestor of
+`origin/main`, and `origin/main` carries `slack-channel`/`slack-full`/
+`slack-mini` rather than `slack-pack`. **The prompt's claim stands and was left
+alone.** Recorded because the same class of error — a confident secondhand claim
+about another repo's state — is what the evidence gate for cross-repo assertions
+exists to catch.
+
+## E. Still open
+
+Decisions 2 (demand reduction as a permanent posture) and 3 (postgres
+`shared_buffers`) in §7 remain yours. The pause bought headroom; it did not
+change the arithmetic. Waves 2 and 3 are filed and held: gc-28w2, gc-5kgl.
