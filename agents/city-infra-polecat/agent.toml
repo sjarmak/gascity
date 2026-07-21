@@ -1,20 +1,20 @@
-# DEPRECATED 2026-05-29: wrong model — cwd /home/ds/gas-city resolves the
-# file-backed CITY store, so its `gc hook` can't see gascity-rig (dolt) beads
-# routed to it (the drain-rate stall). City-infra work now routes to the
-# gascity polecat pool (/home/ds/gascity/polecat), which is store-matched and
-# has host access to edit /home/ds/gas-city files per the bead. Suspended +
-# min=0 so it idles out and doesn't hold a warm slot.
+# city-infra-polecat: the live city-infra execution lane. Works dr-* beads
+# (city-infra queue) with host access to edit /home/ds/gas-city files.
+# History: deprecated 2026-05-29 for a store-mismatch (file-backed city store
+# vs dolt gascity-rig beads), then reinstated once city-infra work moved to
+# the dr- store this agent can see; the 2026-07-14 floor comments below track
+# that era. Currently suspended = true via the cleanup-pause [[patches.agent]]
+# override in city.toml (2026-07-21) — the patch wins over the value here;
+# remove the patch, not this file, to resume the lane.
 suspended = false
 dir = "/home/ds/gas-city"
 work_dir = "/home/ds/gas-city"
 provider = "claude-2"
-# Queue-floor reverted 2026-07-14 (city-infra-polecat gc-483862): the 2026-07-13
-# floor's recorded undo condition is met — dr-7mb, dr-rz3, dr-jeu all CLOSED
-# (verified via bd show). Floor was mayor-set to hold 1 warm session while that
-# queue drained; leaving it pins a permanent city-infra slot (dr-8sy NOTES call
-# this out as unwanted). Re-raise to 1 if a new city-infra queue forms while
-# session-create budget defers on-demand spawns.
-# 2026-07-14 mayor: 0->1 — floor auto-reverted (gc-483890) before new P0s landed; queue now holds dr-3sz + dr-6dc (P0) + dr-5bk/dr-oj4 (P1); revert to 0 when drained
+# Queue floor: 0 = no warm slot pinned; spawns on demand up to max 3.
+# Raise to 1 only while a P0 city-infra queue is actively draining, and
+# revert to 0 when drained (dr-8sy NOTES: a permanent warm city-infra slot
+# is unwanted). Floor history: 2026-07-13 set to 1 for dr-7mb/dr-rz3/dr-jeu,
+# auto-reverted 2026-07-14 when all three closed (gc-483862/gc-483890).
 min_active_sessions = 0
 max_active_sessions = 3
 wake_mode = "fresh"
