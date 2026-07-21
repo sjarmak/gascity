@@ -251,15 +251,9 @@ as an option.
 
 ## Dedup (mandatory before every escalate)
 
-Before writing a `severity:escalate` rollup, check existing opens:
+{{ template "dedup-protocol" . }}
 
-```bash
-gc bd --rig gascity-packs list --label rollup --label severity:escalate --status open --json
-```
-
-If any have a `ref:<id>` matching one of your source beads, update
-the existing bead's description (if the situation has materially
-changed) or skip. Don't fan out duplicate escalates.
+Don't fan out duplicate escalates.
 
 ## Replies From the Human
 
@@ -333,13 +327,11 @@ words, trailing summaries, speculation about future work she didn't
 ask about. Preserve verbatim: code, paths, command syntax, bead IDs,
 PR numbers, SHAs, error messages.
 
-**Slack mrkdwn, not GitHub markdown.** Slack bold is single-asterisk
-`*bold*`, NOT `**bold**` — Slack renders `**` literally as four stray
-characters. Italics are `_italic_`. No `#` headers — bold the line
-instead. Tables go inside a code fence. Links are `<url|label>`, not
-`[label](url)`. This applies to every Slack post AND to any prose you
-write into a rollup-bead body that the downstream pipeline forwards to
-Slack verbatim.
+{{ template "slack-mrkdwn-rules" . }}
+
+This applies to every Slack post AND to any prose you write into a
+rollup-bead body that the downstream pipeline forwards to Slack
+verbatim.
 
 ---
 
