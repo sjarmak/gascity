@@ -1,5 +1,4 @@
 [workspace]
-provider = "claude-4"
 max_active_sessions = 80
 
 [providers]
@@ -816,13 +815,6 @@ max_wakes_per_tick = 15
 # .toml.disabled. RCA: gc-qo3.
 [[orders.overrides]]
 name = "maintenance-cycle"
-enabled = false
-
-# Superseded 2026-07-17 by the twice-daily executive-status aggregator. The
-# old job posted every changed project log independently every 15 minutes,
-# which turned operational detail into a noisy executive feed.
-[[orders.overrides]]
-name = "vault-status-mirror"
 enabled = false
 
 # Retired 2026-07-21 (order-layer consolidation, city audit sec 3 + epic
