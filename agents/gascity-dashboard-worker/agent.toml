@@ -7,7 +7,7 @@
 # .claude/skills/search-sessions/ until the tracked-.gitignore PR lands.
 dir = "/home/ds/gascity-dashboard"
 provider = "claude-3"
-min_active_sessions = 3
+min_active_sessions = 0
 max_active_sessions = 3
 wake_mode = "fresh"
 

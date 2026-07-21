@@ -7,7 +7,7 @@ provider = "claude-3"
 # (fork resumes the parent SID's transcript from that account's home) — co-move
 # or temporarily re-pin both for the run's duration.
 # 2026-07-14 mayor: 4->6 per mem PL +2 request gc-484141 (4/4 claimed, 13 ready unassigned); auto-approve <= +2/PL
-min_active_sessions = 6
+min_active_sessions = 0
 max_active_sessions = 6
 wake_mode = "fresh"
 

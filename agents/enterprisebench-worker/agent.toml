@@ -2,7 +2,7 @@ dir = "/home/ds/projects/EnterpriseBench"
 provider = "claude-2"
 # 2026-07-14 mayor: 6->8 per EB PL +2 capacity request (gc-482863/gc-482562), 100-deep P0 ready queue; auto-approve <= +2/PL
 # 2026-07-14 mayor: 8->10 second +2 same day (Slack C0B1NSHTSKT), pool 8/8 hot on P0 scoring-integrity; account1 5h=11% ample; cumulative +4/day flagged to Stephanie
-min_active_sessions = 10
+min_active_sessions = 0
 max_active_sessions = 10
 wake_mode = "fresh"
 

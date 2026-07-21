@@ -1,5 +1,5 @@
 dir = "/home/ds/projects/zeldascension"
 provider = "claude-5"
-min_active_sessions = 1
+min_active_sessions = 0
 wake_mode = "fresh"
 idle_timeout = "6h"

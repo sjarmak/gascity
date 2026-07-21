@@ -23,7 +23,7 @@ provider = "claude-4"
 # its target/workflow/child are dispatch-blocked. Return to 2/2 avoids an idle
 # Amp/MCP set while swap is exhausted (gc-524686). Re-expand only after gc-xgo4
 # verifies exact routing and the PL again proves both incumbent slots are bound.
-min_active_sessions = 2
+min_active_sessions = 0
 max_active_sessions = 2
 wake_mode = "fresh"
 # 2026-05-29: bumped 2h→6h. Multi-step mol-focus-review convoys (design memos,
