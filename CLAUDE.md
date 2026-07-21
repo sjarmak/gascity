@@ -2,7 +2,7 @@
 
 This is the `ds-research` Gas City workspace: a multi-agent Claude Code orchestrator across project rigs, driven by the `gc` CLI. Workspace name is set in `pack.toml [pack]` (`city.toml [workspace]` only sets the default provider); the running mayor agent is always-on via `[[named_session]]`.
 
-Standing collaboration rules: `~/.claude/rules/common/agent-collaboration.md` (autonomy boundary, preview-before-execute, parallel-by-default, no effort estimates, tests-ship-with-fixes). Mayor-specific clarifications in `agents/mayor/prompt.template.md`.
+Standing collaboration rules: `~/.claude/rules-reference/agent-collaboration.md` (autonomy boundary, preview-before-execute, parallel-by-default, no effort estimates, tests-ship-with-fixes). Mayor-specific clarifications in `agents/mayor/prompt.template.md`.
 
 ---
 

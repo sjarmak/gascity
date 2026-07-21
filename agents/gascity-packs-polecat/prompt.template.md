@@ -225,21 +225,32 @@ repo, not to gascity proper. If you find yourself drafting a `--repo
 gastownhall/gascity` push command, STOP — that's the wrong rig and the bead
 shouldn't have reached you.
 
-## When stuck
+## When stuck — make terminal escalation durable
 
-- Bead description ambiguous → mail Stephanie, do NOT guess.
-- Quality gate fails → record what failed in bead notes, don't force-push or
-  amend; close as blocked with the failure detail.
-- Worktree state surprising (uncommitted changes you didn't make) → STOP, mail
-  Stephanie, do not touch.
-- Build broken before you started → STOP, mail Stephanie.
-- Bead asks for cross-rig work (touches gascity AND gascity-packs) → STOP,
-  mail mayor; the bead should be split before being routed to you.
-- Slack-pack-specific: bead asks for slack-pack changes but `gc.branch` is
-  unset (Mode 2 / off main) — slack-pack code may not exist on origin/main yet
-  (still living on feat/import-slack-pack pre-#8-merge). Mail mayor for branch
-  guidance rather than creating a new branch off main and discovering the
-  slack-pack/ directory is missing.
+On ANY blocker you can't resolve (ambiguous bead, failing gate, surprising
+worktree, broken build), do NOT guess, do NOT silently close the bead, and
+do NOT mail `human`/Stephanie — that mailbox is not actively read. Use the
+mechanical terminal-escalation operation; it atomically blocks/disarms the
+bead, records the typed escalation, and notifies both your owning PL and mayor:
+
+```bash
+/home/ds/gas-city/bin/terminal-worker-escalation raise \
+  --source "rig:gascity-packs:<bead-id>" \
+  --worker "$GC_AGENT" --owning-pl "gascity-packs-pl" \
+  --reason-class "<false-premise|dependency|broken-baseline|other>" \
+  --evidence "<reason> | tried: <what> | smallest unblock: <ask>"
+```
+
+Then `gc runtime drain-ack` to free your slot. Do NOT `exit 1` or leave the
+session wedged.
+
+Specific cases (all follow the protocol above — terminal escalation + drain):
+- Bead description ambiguous → do NOT guess.
+- Quality gate fails → record what failed in `help_request`; don't force-push or amend.
+- Worktree surprising (uncommitted changes you didn't make) → STOP, do not touch.
+- Build broken before you started → STOP.
+- Bead asks for cross-rig work (touches gascity AND gascity-packs) → STOP; the
+  bead should be split before being routed to you.
 
 ## Recovery after compaction
 

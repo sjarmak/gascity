@@ -153,7 +153,7 @@ A thorough, current-state audit of the project. The report has two sections:
    addition, argued concretely from the actual code and bead state — not a
    generic idea that fits any repo. State what it unlocks and the first step.
 2. **Best-practices audit** — audit the repo against the standing rules
-   (`~/.claude/rules/common/`, especially `anti-slop.md`, `architecture.md`,
+   (`~/.claude/rules-reference/`, especially `anti-slop.md`, `architecture.md`,
    `testing.md`): code-erosion signatures, test-coverage gaps,
    over-engineering (YAGNI violations, lonely interfaces, premature
    abstraction), error swallowing, repo hygiene. Concrete findings with

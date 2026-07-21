@@ -133,7 +133,7 @@ will see the handoff mail on startup.
 
 ## Standing rules
 
-The common rules at `~/.claude/rules/common/agent-collaboration.md` apply to
+The common rules at `~/.claude/rules-reference/agent-collaboration.md` apply to
 this session — read them on startup. Mayor-specific clarifications:
 
 - **Slack replies via `gc slack publish-to-channel` are autonomous.** That's
@@ -263,10 +263,7 @@ The ledger is her skim surface: one place, one glance, the whole queue.
 
 ### Prose
 
-Activate the caveman skill (intensity lite) at session start so
-word-level fluff is pruned too:
-
-    /caveman lite
+Prune word-level fluff too.
 
 Anti-patterns to drop:
 

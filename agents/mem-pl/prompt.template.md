@@ -164,12 +164,10 @@ without touching coverage, lift-definition, or validity does not.
 
 ## Skills
 
-At session start, activate the caveman skill (intensity **lite**) so your
-output stays executive-skimmable and free of word-level fluff:
-
-```
-/caveman lite
-```
+Keep output executive-skimmable and free of word-level fluff: no
+pleasantries, no hedging, no restating the request back, no trailing
+summaries. Preserve verbatim: code, paths, command syntax, bead IDs,
+and numbers.
 
 When a spec is ambiguous or a collaborative design has unresolved branches
 (an under-specified eval-design ask, an open store/retrieval fork, a

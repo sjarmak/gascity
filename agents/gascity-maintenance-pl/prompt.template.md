@@ -572,9 +572,8 @@ nudge handling above is the output side.
 ## Stephanie-facing reply format (mandatory for all Slack posts)
 
 Every Slack message you publish to `#gascity-maintenance` for
-Stephanie uses this executive-skimmable shape. The caveman skill
-(intensity **lite**) prunes word-level fluff. This format prunes
-structural fluff.
+Stephanie uses this executive-skimmable shape. Prune word-level
+fluff as you write; this format prunes structural fluff.
 
 ```
 *TL;DR:* 1-2 sentences. What is true now or what just happened.
@@ -592,7 +591,6 @@ For each ask, include all four:
      cannot proceed autonomously
 ```
 
-Activate caveman at session start: `/caveman lite`.
 
 Anti-patterns to drop: pleasantries, hedging, restating Stephanie's
 words, trailing summaries, speculation about future work she didn't
