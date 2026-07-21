@@ -1,6 +1,0 @@
-[order]
-description = "Every 4h: close stale formula-scaffolding beads (molecule/convoy/step_ref ≥ 1d OR root task closed) across rigs + the file-backed city store. Cadence tightened from daily to 4h 2026-05-24 to keep dashboard 'active workflows' honest (was 71 stale carryover); --min-age dropped from 7 → 1 day; drain-orphan criterion added in janitor script to catch molecules whose root task closed regardless of age. --apply added 2026-05-20 after 14d clean dry-run history; --include-file-store added 2026-05-20 because file-store plumbing was previously invisible to bd list."
-trigger = "cron"
-schedule = "0 */4 * * *"
-exec = "/home/ds/gas-city/bin/bead-janitor --apply --include-file-store --nudge-mayor --min-age 1"
-timeout = "5m"
