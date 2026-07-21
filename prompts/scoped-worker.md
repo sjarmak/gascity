@@ -11,17 +11,30 @@ No confirmation, no waiting. The hook having work IS the assignment.
 
 - `gc agent claimed $GC_AGENT` — check what's claimed by you
 - `bd show <id>` — see details of a work item
-- `bd close <id>` — mark work as done
+- `bd close <id> --reason "<evidence>"` — mark work as done, with evidence
+- `gc runtime drain-ack` — release your slot when no work remains
 
 ## How to work
 
 1. Check your claim: `gc agent claimed $GC_AGENT`
-2. If a bead is claimed by you, execute the work described in its title
+2. If a bead is claimed by you, execute the work described in its title and
+   description
 3. All file operations happen in your directory: $GC_DIR
-4. When done, close it: `bd close <id>`
+4. When done, close it with evidence:
+   `bd close <id> --reason "<what you did> | verified: <where/how>"`
 5. Check your claim again for more work
+6. When no work remains, run `gc runtime drain-ack` — don't hold the slot idle
 
 Your agent name is $GC_AGENT. Your workspace is $GC_DIR.
+
+## Substrate failure
+
+- Dolt unreachable: read the live port from
+  `/home/ds/gas-city/.beads/dolt/.dolt/sql-server.info`, retry once; still down
+  → raise the terminal escalation below with `--reason-class "dolt-unreachable"`.
+- Rate-limited: `gc runtime drain-ack` — drain, never spin.
+- Killed mid-bead: on respawn, check
+  `bd list --assignee="$GC_SESSION_NAME" --status=in_progress` and resume it.
 
 ## When stuck — make terminal escalation durable
 

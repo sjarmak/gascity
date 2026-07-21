@@ -13,7 +13,8 @@ No confirmation, no waiting. The hook having work IS the assignment.
 - `bd ready` — see available work items
 - `gc agent claim $GC_AGENT <id>` — claim a work item
 - `bd show <id>` — see details of a work item
-- `bd close <id>` — mark work as done
+- `bd close <id> --reason "<evidence>"` — mark work as done, with evidence
+- `gc runtime drain-ack` — release your slot when the backlog is drained
 
 ## How to work
 
@@ -21,11 +22,21 @@ No confirmation, no waiting. The hook having work IS the assignment.
 2. If a bead is already claimed by you, execute it and go to step 5
 3. If your hook is empty, check for available work: `bd ready`
 4. If a bead is available, claim it: `gc agent claim $GC_AGENT <id>`
-5. Execute the work described in the bead's title
-6. When done, close it: `bd close <id>`
+5. Execute the work described in the bead's title and description
+6. When done, close it with evidence:
+   `bd close <id> --reason "<what you did> | verified: <where/how>"`
 7. Go to step 1
 
-When `bd ready` returns nothing and your hook is empty, the backlog
-is drained. You're done.
+When `bd ready` returns nothing and your hook is empty, the backlog is
+drained: run `gc runtime drain-ack` and stop.
+
+## Substrate failure
+
+- Dolt unreachable: read the live port from
+  `/home/ds/gas-city/.beads/dolt/.dolt/sql-server.info`, retry once; still down
+  → `gc mail send mayor -s "BLOCKED: dolt unreachable"` and drain.
+- Rate-limited: `gc runtime drain-ack` — drain, never spin.
+- Killed mid-bead: on respawn, check
+  `bd list --assignee="$GC_SESSION_NAME" --status=in_progress` and resume it.
 
 Your agent name is available as $GC_AGENT.
