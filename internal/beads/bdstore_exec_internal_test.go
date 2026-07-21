@@ -97,6 +97,39 @@ func TestExecCommandRunnerWithEnvContextTimeoutReportsCallerDeadline(t *testing.
 	}
 }
 
+func TestAcquireBDCommandSlotBoundsConcurrencyAndHonorsContext(t *testing.T) {
+	slots := make(chan struct{}, 2)
+	release1, err := acquireBDCommandSlot(context.Background(), "bd", slots)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	defer release1()
+	release2, err := acquireBDCommandSlot(context.Background(), "bd", slots)
+	if err != nil {
+		t.Fatalf("second acquire: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := acquireBDCommandSlot(ctx, "bd", slots); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("third acquire error = %v, want context deadline", err)
+	}
+
+	release2()
+	release3, err := acquireBDCommandSlot(context.Background(), "bd", slots)
+	if err != nil {
+		t.Fatalf("acquire after release: %v", err)
+	}
+	release3()
+
+	// Non-bd commands do not consume the bd budget.
+	releaseOther, err := acquireBDCommandSlot(ctx, "git", slots)
+	if err != nil {
+		t.Fatalf("non-bd acquire: %v", err)
+	}
+	releaseOther()
+}
+
 func TestBDCommandTimeoutForReadCommands(t *testing.T) {
 	if got := bdCommandTimeoutFor("bd", []string{"list", "--json"}); got != bdReadCommandTimeout {
 		t.Fatalf("bd list timeout = %s, want %s", got, bdReadCommandTimeout)

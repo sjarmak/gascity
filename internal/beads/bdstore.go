@@ -22,6 +22,10 @@ import (
 const (
 	bdParentProjectionPollInterval = 50 * time.Millisecond
 	bdTxProjectionTimeout          = 5 * time.Second
+	// bdMaxConcurrentCommands bounds the memory and connection footprint of
+	// bd subprocess bursts within one gc process. Each subprocess is relatively
+	// heavy and may remain live until its command timeout under Dolt contention.
+	bdMaxConcurrentCommands = 6
 )
 
 // CommandRunner executes a command in the given directory and returns stdout bytes.
@@ -29,6 +33,8 @@ const (
 type CommandRunner func(dir, name string, args ...string) ([]byte, error)
 
 var (
+	bdCommandSlots = make(chan struct{}, bdMaxConcurrentCommands)
+
 	bdCommandTimeout = 120 * time.Second
 	// bdReadCommandTimeout bounds bd read-only subcommands (count, list,
 	// ready, show, sql, stats, version). Default matches bdCommandTimeout to preserve
@@ -76,10 +82,18 @@ func ExecCommandRunnerWithEnvContext(ctx context.Context, env map[string]string)
 
 func execCommandRunnerWithEnv(parent context.Context, env map[string]string) CommandRunner {
 	return func(dir, name string, args ...string) ([]byte, error) {
-		start := time.Now()
-		trace := newBDExecTrace(start, dir, name, args)
+		traceStart := time.Now()
+		trace := newBDExecTrace(traceStart, dir, name, args)
 		trace("start", nil)
 
+		release, err := acquireBDCommandSlot(parent, name, bdCommandSlots)
+		if err != nil {
+			return nil, fmt.Errorf("waiting for %s execution slot: %w", name, err)
+		}
+		releaseOnce := sync.OnceFunc(release)
+		defer releaseOnce()
+
+		start := time.Now()
 		timeout := bdCommandTimeoutFor(name, args)
 		ctx, cancel := context.WithTimeout(parent, timeout)
 		defer cancel()
@@ -104,6 +118,7 @@ func execCommandRunnerWithEnv(parent context.Context, env map[string]string) Com
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		out, err := cmd.Output()
+		releaseOnce()
 
 		recordBDExecTelemetry(name, dir, args, start, out, stderr.String(), err)
 
@@ -111,6 +126,18 @@ func execCommandRunnerWithEnv(parent context.Context, env map[string]string) Com
 			parent, ctx, name, timeout, start, out, stderr.String(), err)
 		trace(status, traceErr)
 		return out, resultErr
+	}
+}
+
+func acquireBDCommandSlot(ctx context.Context, name string, slots chan struct{}) (func(), error) {
+	if name != "bd" {
+		return func() {}, nil
+	}
+	select {
+	case slots <- struct{}{}:
+		return func() { <-slots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
@@ -462,6 +489,13 @@ func (s *BdStore) Purge(beadsDir string, dryRun bool) (PurgeResult, error) {
 
 // execPurge runs bd purge via exec.CommandContext with a 60-second timeout.
 func execPurge(dir string, env, args []string) ([]byte, error) {
+	release, err := acquireBDCommandSlot(context.Background(), "bd", bdCommandSlots)
+	if err != nil {
+		return nil, fmt.Errorf("waiting for bd execution slot: %w", err)
+	}
+	releaseOnce := sync.OnceFunc(release)
+	defer releaseOnce()
+
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -474,7 +508,8 @@ func execPurge(dir string, env, args []string) ([]byte, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err = cmd.Run()
+	releaseOnce()
 	traceExit := 0
 	if err != nil {
 		var exitErr *exec.ExitError
