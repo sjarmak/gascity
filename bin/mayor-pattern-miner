@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # mayor-pattern-miner: weekly digest of infrastructure patterns from
-# watchdog + surfacer + janitor + close-gate-reaper logs. Surfaces recurring
+# watchdog + surfacer + close-gate-reaper logs. Surfaces recurring
 # failure modes that warrant upstream issues filed against gastownhall/gascity.
 #
 # Goal (from gc-autonomous-orchestration memory): every infrastructure
@@ -90,25 +90,6 @@ trap 'rm -f "$out"' EXIT
     ' <<<"$surfacer_lines"
   else
     echo "  (no surfacer findings — surveyed period was clean)"
-  fi
-  echo
-
-  # ---- Janitor findings ------------------------------------------------
-  echo "## bead-janitor findings"
-  janitor_lines=$(journalctl --user -u bead-janitor.service \
-    --since "$SINCE" --no-pager 2>/dev/null | grep -oE "[0-9]+ orphan formula scaffolding beads" | head -50)
-  if [[ -n "$janitor_lines" ]]; then
-    total=$(awk '{s+=$1} END{print s+0}' <<<"$janitor_lines")
-    runs=$(wc -l <<<"$janitor_lines")
-    avg=$(( runs > 0 ? total / runs : 0 ))
-    echo "  Runs: $runs   Total candidates surfaced: $total   Avg per run: $avg"
-    if (( avg >= 3 )); then
-      echo "  ⚠ Sustained orphan-bead production rate."
-      echo "  → Possible cause: formulas dispatched without phase=vapor, or worker drains mid-formula."
-      echo "  → Candidate upstream issue: formula step bead lifecycle / worker drain hooks"
-    fi
-  else
-    echo "  (janitor not yet run, or no findings)"
   fi
   echo
 
