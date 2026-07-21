@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# pytest-suites.test — run the bin/ pytest suites under city-selftest.
+#
+# Why this exists (2026-07-21, audit sec 4.1, gc-f5zg): bin/ holds two families
+# of regression cover. The 16 bash `*.test` suites were picked up by
+# city-selftest's glob and ran every 6h. The 20 pytest-style suites
+# (test_*.py + mem_brain_arm_select_test.py) were invoked by NOTHING — no order,
+# no cron, no wrapper, no CI. 170 tests, never run on a schedule.
+#
+# That is the same shape as the incident city-selftest was created for: a check
+# nobody runs is not a check. It mattered more here than usual, because the
+# unwatched set covers the highest-blast-radius scripts in the city, including
+# completion-reconciler (mutates bead state every 15m from a systemd timer, and
+# was found in a `failed` state during the audit) and dispatcher-watchdog
+# (kills sessions).
+#
+# All 170 were green when this shim was added, so it starts silent — it exists to
+# catch the day one of them goes red, not to report a backlog.
+#
+# Contract with city-selftest: a `.test` file is a bash script that exits 0 on
+# pass and non-zero on fail; its stdout is captured and shown only on failure.
+# Runs under the same per-suite timeout as every other suite
+# (CITY_SELFTEST_TIMEOUT, 60s in the order; measured runtime ~10s).
+#
+# Hermeticity: the pytest suites use tmp_path fixtures and stub gc/gh on PATH,
+# matching the bash suites' discipline. `-p no:cacheprovider` keeps them from
+# writing .pytest_cache into bin/ on every tick.
+#
+# Run by hand:
+#   bash /home/ds/gas-city/bin/pytest-suites.test
+#   cd /home/ds/gas-city/bin && python3 -m pytest -q .      # same thing, verbose
+set -uo pipefail
+
+BIN_DIR="${PYTEST_SUITES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+
+if ! python3 -c 'import pytest' >/dev/null 2>&1; then
+  # Absence of the runner is a real failure, not a silent skip: these suites are
+  # the only cover for the scripts above, and "pytest vanished" must be as loud
+  # as "a test went red".
+  echo "pytest-suites: python3 -m pytest unavailable — 20 suites (170 tests) are UNCOVERED"
+  exit 1
+fi
+
+out=$(cd "$BIN_DIR" && python3 -m pytest -q -p no:cacheprovider . 2>&1)
+rc=$?
+
+if (( rc != 0 )); then
+  echo "pytest-suites: FAILED (rc=$rc)"
+  # Trim to the parts a human acts on: the per-test failure lines and the final
+  # summary. Anchored to line start — an unanchored /error/ also matches source
+  # lines quoted in tracebacks, which buried the real list in the first version.
+  echo "$out" | grep -E '^(FAILED|ERROR) ' | head -30
+  echo "$out" | tail -1
+  echo "--- re-run: cd $BIN_DIR && python3 -m pytest -q . ---"
+  exit 1
+fi
+
+echo "pytest-suites: $(echo "$out" | tail -1)"
+exit 0
