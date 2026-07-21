@@ -1,0 +1,25 @@
+# pl-status-update — twice-daily executive-status inputs from every live PL.
+# Each live PL writes one concise structured input to Obsidian; the
+# executive-status-sync order aggregates those inputs into one portfolio
+# brief and one Slack post 40 minutes later. Stephanie 2026-06-12.
+#
+# Merged 2026-07-21 from pl-status-update-am.toml + -pm.toml (order-layer
+# consolidation, city audit sec 2.1 + epic gc-28w2): the halves were
+# exec-identical; only the hour differed. Cron hour lists are the proven
+# pattern here (mem-digest '30 8,15 * * *'). Undo: restore the two
+# single-hour files from this commit's parent in git if per-leg scheduling
+# ever needs to diverge.
+#
+# NOTE zero-lastRun bootstrap: this merged NAME has never fired, and
+# checkCron skips catch-up when lastRun is zero — first fire happens only
+# when an evaluator tick lands exactly in a scheduled minute (self-heals
+# after the first fire; catch-up applies from then on). To force-seed after
+# the cleanup pause: temporarily set schedule to "* * * * *", wait for one
+# controller fire, restore. Not seeded during the 07-21 pause (it nudges
+# every live PL).
+[order]
+description = "Daily 9:30 + 16:30 EDT: every live PL updates its CEO-level Obsidian input; executive-status-sync publishes the aggregated portfolio brief 40m later."
+trigger = "cron"
+schedule = "30 9,16 * * *"
+exec = "/home/ds/gas-city/bin/pl-periodic-directive EXECUTIVE_STATUS"
+timeout = "5m"
