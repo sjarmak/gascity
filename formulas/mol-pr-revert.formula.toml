@@ -294,12 +294,31 @@ bd update "$ROOT_ID" --set-metadata "evidence.carve_out_verified=true" \\
                       --set-metadata "evidence.carve_out_path=$CARVE_PATH"
 ```
 
-**3. Confirm tree is clean before creating the branch:**
+**3. Stage a dedicated per-PR worktree:**
+
+Do NOT `git checkout -B` in place — when this molecule is slung against a
+generic polecat pool slot, an in-place checkout clobbers the slot's idle
+branch and the polecat halts (gastownhall/gascity#2451 follow-up; the same
+wedge mol-pr-iterate was patched for). Stage a dedicated worktree off the
+canonical repo and create the revert branch there. Reuse an already-staged
+worktree if one exists. Record the path in `metadata.work_dir` so a
+crash-resumed polecat lands in the same place.
+```bash
+PR_WORKTREE="/home/ds/gascity-worktrees/revert-pr-{{pr}}"
+if ! git -C "$PR_WORKTREE" rev-parse --git-dir >/dev/null 2>&1; then
+    git worktree add --detach "$PR_WORKTREE"
+fi
+cd "$PR_WORKTREE"
+bd update "$ROOT_ID" --set-metadata "work_dir=$PR_WORKTREE"
+```
+
+Confirm the worktree is clean before creating the branch (a reused
+worktree may hold leftovers from an interrupted run):
 ```bash
 if [ -n "$(git status --porcelain | grep -v '^??')" ]; then
     bd update "$ROOT_ID" \\
       --set-metadata "gc.halt_chain=true" \\
-      --set-metadata "summary_for_human=Refusing to revert PR #{{pr}}: working tree is dirty. Commit or stash before retrying."
+      --set-metadata "summary_for_human=Refusing to revert PR #{{pr}}: worktree $PR_WORKTREE is dirty. Commit or stash there before retrying."
     bd close "$ROOT_ID" --reason "dirty working tree"
     exit 0
 fi

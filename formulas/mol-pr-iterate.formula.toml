@@ -183,7 +183,7 @@ each step runs in a fresh shell that otherwise lands in the polecat's slot
 worktree:
 ```bash
 ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-cd "$(bd show "$ROOT_ID" --json | jq -r '.metadata.work_dir // empty')" || { echo "work_dir not set — intake did not complete"; exit 1; }
+cd "$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata.work_dir // empty')" || { echo "work_dir not set — intake did not complete"; exit 1; }
 ```
 
 **7. Display summary:**
@@ -212,7 +212,7 @@ or content too vague to plan from), halt-and-mail-mayor with reason
 **1. Read root bead notes and enter the PR worktree:**
 ```bash
 ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-cd "$(bd show "$ROOT_ID" --json | jq -r '.metadata.work_dir // empty')" || { echo "work_dir not set — intake did not complete"; exit 1; }
+cd "$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata.work_dir // empty')" || { echo "work_dir not set — intake did not complete"; exit 1; }
 ```
 
 **2. Dispatch on `feedback_source`:**
@@ -308,7 +308,7 @@ Halt-and-mail-mayor if the plan exceeds 200 LOC.
 **1. Read root bead notes and enter the PR worktree:**
 ```bash
 ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-cd "$(bd show "$ROOT_ID" --json | jq -r '.metadata.work_dir // empty')" || { echo "work_dir not set — intake did not complete"; exit 1; }
+cd "$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata.work_dir // empty')" || { echo "work_dir not set — intake did not complete"; exit 1; }
 ```
 Extract `parsed_feedback`, `pr_number`, `repo`, `base_sha`.
 
@@ -366,7 +366,7 @@ commit on the PR branch with a conventional message. Do NOT push.
 **1. Read root bead notes and enter the PR worktree:**
 ```bash
 ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-cd "$(bd show "$ROOT_ID" --json | jq -r '.metadata.work_dir // empty')" || { echo "work_dir not set — intake did not complete"; exit 1; }
+cd "$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata.work_dir // empty')" || { echo "work_dir not set — intake did not complete"; exit 1; }
 ```
 Extract `plan_path`, `pr_number`, `head_ref`, `iteration`.
 
@@ -396,7 +396,8 @@ fi
 
 The polecat reads `$plan_path` and edits files according to the Diff sketch.
 Edits should match the plan; if the polecat discovers the plan is wrong
-mid-implementation, revert local changes and halt-and-mail-mayor with
+mid-implementation, stash local changes (same `git stash push -u` shape as
+the build-failure path below) and halt-and-mail-mayor with
 "plan vs. reality mismatch".
 
 **5. Run build verification.**
@@ -409,11 +410,11 @@ consuming pack for hints, or run the repo's standard quality gates:
 
 If build fails:
 ```bash
-git checkout -- .  # revert the unsuccessful changes
+git stash push -u -m "iterate-buildfail-$ROOT_ID"  # preserve the failed attempt — destroy nothing
 bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
-                     --set-metadata "summary_for_human=Build failed after apply for PR #{{pr}}. Plan at $plan_path may need revision. Worktree reverted."
+                     --set-metadata "summary_for_human=Build failed after apply for PR #{{pr}}. Plan at $plan_path may need revision. Changes preserved in git stash iterate-buildfail-$ROOT_ID in the PR worktree."
 gc mail send mayor -s "mol-pr-iterate halt: pr-{{pr}} (build failed)" \\
-                    -m "Root bead $ROOT_ID. apply succeeded in editing files but build verification failed. Worktree reverted."
+                    -m "Root bead $ROOT_ID. apply succeeded in editing files but build verification failed. Changes preserved in git stash iterate-buildfail-$ROOT_ID in the PR worktree."
 bd close "$ROOT_ID" --reason "build failed after apply"
 exit 1
 ```
@@ -451,7 +452,7 @@ halt-and-mail-mayor.
 **1. Read root bead notes and enter the PR worktree:**
 ```bash
 ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
-cd "$(bd show "$ROOT_ID" --json | jq -r '.metadata.work_dir // empty')" || { echo "work_dir not set — intake did not complete"; exit 1; }
+cd "$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata.work_dir // empty')" || { echo "work_dir not set — intake did not complete"; exit 1; }
 ```
 Extract `feedback_source`, `feedback_ref`, `pr_number`, `repo`, `iteration`,
 `last_apply_commit`, `plan_path`.

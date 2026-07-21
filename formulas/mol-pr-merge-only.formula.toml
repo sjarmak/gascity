@@ -12,10 +12,15 @@ bead needed.
 
 ## Contract
 
-1. Caller slings with `--var pr=<url-or-number>` (and optionally `--var skip_gemini=true` for compat)
+1. Caller slings with `--var pr=<url-or-number>` AND
+   `--metadata evidence.human_approved=true` — the finalize merge gate
+   requires that evidence (optionally `--var skip_gemini=true` for compat)
 2. Polecat reads steps, executes each in order
 3. After rebase-check, polecat proceeds directly to finalize (NO review, NO human-gate)
 4. Polecat finalizes via Path A: squash merge
+5. Every halt sets `gc.halt_chain=true` + `metadata.summary_for_human` on
+   the root bead before closing it, so the loop-close handler can surface
+   the outcome
 
 ## Variables
 
@@ -29,9 +34,11 @@ bead needed.
 | Situation | Action |
 |-----------|--------|
 | gh command fails | Check `gh auth status`, report error, stop |
-| Rebase has complex conflicts | Abort rebase, post comment, close root bead, stop |
+| Rebase has complex conflicts | Abort rebase, post comment, halt visibly, close root bead |
 | Push fails | Report error, stop. User resolves manually |
 | CI fails | Report failure, stop, wait for nudge |
+| CI watch exceeds 30 min | Stamp root blocked + summary_for_human, exit (frees the pool slot) |
+| evidence.human_approved != true | Halt before merge; summary_for_human explains the gate |
 
 ## Difference from mol-adopt-pr
 
@@ -87,7 +94,12 @@ the described scope (e.g., a "fix typo" PR that touches dozens of packages),
 the branch has diverged from main. **STOP immediately:**
 - Post a scope mismatch comment asking the contributor to rebase
 - Request changes: `gh pr review <number> --request-changes --body "Branch has diverged from main"`
-- Close the root bead: `bd close $ROOT_ID --reason "scope mismatch"`
+- Halt visibly, then close the root bead:
+  ```bash
+  bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
+                       --set-metadata "summary_for_human=PR #<N> halted at intake: changed files diverge from the described scope (branch diverged from main). Requested changes from the contributor. No merge performed."
+  bd close $ROOT_ID --reason "scope mismatch"
+  ```
 - Exit
 
 **5. Check maintainer edits:**
@@ -95,9 +107,23 @@ Record in root bead notes: `maintainer_edits: true` or `maintainer_edits: false`
 If false, warn but continue — finalize will still use Path A since no review
 was performed (no maintainer fixup commits are expected in this flow).
 
-**6. Checkout the PR branch:**
+**6. Stage a dedicated per-PR worktree and check out the branch there:**
+
+Do NOT `gh pr checkout` in place — when this molecule is slung against a
+generic polecat pool slot, an in-place checkout clobbers the slot's idle
+branch and the polecat halts (gastownhall/gascity#2451 follow-up; the same
+wedge mol-pr-iterate was patched for). Stage a dedicated worktree off the
+canonical repo and run the checkout there. Reuse an already-staged worktree
+if one exists. Record the path in `metadata.work_dir` so every later step
+operates in the same place.
 ```bash
+PR_WORKTREE="/home/ds/gascity-worktrees/merge-pr-<number>"
+if ! git -C "$PR_WORKTREE" rev-parse --git-dir >/dev/null 2>&1; then
+  git worktree add --detach "$PR_WORKTREE"
+fi
+cd "$PR_WORKTREE"
 gh pr checkout <number>
+bd update "$ROOT_ID" --set-metadata "work_dir=$PR_WORKTREE"
 ```
 
 **7. Record state in root bead notes:**
@@ -110,9 +136,18 @@ pr_author: <author.login>
 head_ref: <headRefName>
 base_branch: <baseRefName>
 maintainer_edits: <true|false>
+work_dir: $PR_WORKTREE
 original_head: pending
 rebase_status: pending
 merge_path: A"
+```
+
+**Every subsequent step MUST start by cd-ing into the recorded worktree** —
+each step runs in a fresh shell that otherwise lands in the polecat's slot
+worktree:
+```bash
+ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+cd "$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata.work_dir // empty')" || { echo "work_dir not set — intake did not complete"; exit 1; }
 ```
 
 **8. Display summary:**
@@ -135,9 +170,10 @@ description = """
 Check mergeable status and handle conflicts. Auto-rebase straightforward
 cases; abort on complex conflicts that need the contributor.
 
-**1. Read root bead notes for PR metadata:**
+**1. Read root bead notes and enter the PR worktree:**
 ```bash
 ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+cd "$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata.work_dir // empty')" || { echo "work_dir not set — intake did not complete"; exit 1; }
 ```
 
 **2. Check merge status:**
@@ -153,7 +189,12 @@ MERGEABLE=$(gh pr view <number> --json mergeable --jq '.mergeable')
 If `maintainer_edits` is false → **STOP**:
 - Post conflict comment asking author to rebase
 - Add label: `gh pr edit <number> --add-label "status/needs-info"`
-- Close root bead: `bd close $ROOT_ID --reason "conflicts, maintainerCanModify=false"`
+- Halt visibly, then close the root bead:
+  ```bash
+  bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
+                       --set-metadata "summary_for_human=PR #<N> halted at rebase-check: conflicts with <baseRefName> and maintainerCanModify=false, so the polecat cannot rebase it. Asked the author to rebase; labeled status/needs-info. No merge performed."
+  bd close $ROOT_ID --reason "conflicts, maintainerCanModify=false"
+  ```
 - Exit
 
 **4. Fetch upstream base:**
@@ -190,6 +231,8 @@ If complex conflicts found:
 git rebase --abort
 gh pr comment <number> --body "<conflict comment asking author to rebase>"
 gh pr edit <number> --add-label "status/needs-info"
+bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
+                     --set-metadata "summary_for_human=PR #<N> halted at rebase-check: modify/modify conflicts need the contributor. Rebase aborted; author asked to rebase; labeled status/needs-info. No merge performed."
 bd close $ROOT_ID --reason "complex merge conflicts"
 ```
 Exit.
@@ -214,9 +257,10 @@ Skip-review finalize: post a minimal merge-only ack, wait for CI, push if
 rebased, squash-merge. This is Path A from mol-adopt-pr.finalize with the
 synthesis-comment machinery pruned (no review_run_dir to read from).
 
-**1. Read root bead notes:**
+**1. Read root bead notes and enter the PR worktree:**
 ```bash
 ROOT_ID=$(bd mol current --json | jq -r '.molecule_id')
+cd "$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata.work_dir // empty')" || { echo "work_dir not set — intake did not complete"; exit 1; }
 ```
 Extract state: `pr_number`, `repo`, `base_branch`, `original_head`,
 `head_ref`, `rebase_status`, `pr_title`, `pr_author`.
@@ -226,7 +270,12 @@ Extract state: `pr_number`, `repo`, `base_branch`, `original_head`,
 PR_STATE=$(gh pr view <number> --json state --jq '.state')
 ```
 
-If `MERGED` → done, close root bead with "PR already merged", exit.
+If `MERGED` → done. Record the outcome so the loop-close handler surfaces
+it (normal completion — no `gc.halt_chain`), close, exit:
+```bash
+bd update "$ROOT_ID" --set-metadata "summary_for_human=PR #<N> was already merged before finalize ran. Nothing to do."
+bd close $ROOT_ID --reason "PR already merged"
+```
 
 **3. Determine merge path:**
 
@@ -238,10 +287,13 @@ MAINTAINER_COMMIT_COUNT=$(git rev-list --count $ORIGINAL_HEAD..HEAD)
 ```
 - `MAINTAINER_COMMIT_COUNT == 0` → continue with Path A.
 - `MAINTAINER_COMMIT_COUNT > 0` → **STOP**. mol-pr-merge-only does not
-  handle maintainer fixup commits. Record the unexpected state and exit:
+  handle maintainer fixup commits. Record the unexpected state, halt
+  visibly, and exit:
   ```bash
   bd update $ROOT_ID --notes "<existing notes>
   unexpected_state: maintainer commits present in merge-only flow ($MAINTAINER_COMMIT_COUNT)"
+  bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
+                       --set-metadata "summary_for_human=PR #<N> halted at finalize: $MAINTAINER_COMMIT_COUNT maintainer commit(s) found on the branch, which the merge-only flow does not handle. Re-sling under mol-adopt-pr. No merge performed."
   bd close $ROOT_ID --reason "merge-only flow saw maintainer commits; re-sling under mol-adopt-pr"
   ```
 
@@ -277,11 +329,20 @@ gh pr checks <number>
 If no checks reported → **STOP**, print message telling maintainer to approve
 GitHub Actions workflow run. Wait for nudge.
 
-Once checks exist:
+Once checks exist, watch them with a 30-minute ceiling — an unbounded
+watch holds a pool slot forever when a check wedges:
 ```bash
-gh pr checks <number> --watch
+timeout 1800 gh pr checks <number> --watch
+CI_RC=$?
+if [ "$CI_RC" -eq 124 ]; then
+  bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
+                       --set-metadata "summary_for_human=PR #<N> halted at finalize: CI still running after 30 minutes (watch timeout). Not merged; root bead marked blocked. Investigate the wedged check, then re-sling."
+  bd update "$ROOT_ID" --status blocked
+  exit 1
+fi
 ```
-If CI fails → **STOP**, report failure, wait for nudge.
+If CI fails (`CI_RC` non-zero, not 124) → **STOP**, report failure, wait
+for nudge.
 
 **A.3: Push rebased branch (if applicable).**
 If rebase was performed (`rebase_status` is not `not_needed`):
@@ -289,14 +350,31 @@ If rebase was performed (`rebase_status` is not `not_needed`):
 git push --force-with-lease
 ```
 
-**A.4: Squash merge:**
+**A.4: Evidence gate — verify recorded human approval before merging.**
+
+The squash merge is an external write and this formula skips review, so
+"the maintainer already eyeballed it" must be evidence, not convention.
+The caller records the approval at sling time via
+`--metadata evidence.human_approved=true`. Verify it on the root bead:
+```bash
+HUMAN_APPROVED=$(bd show "$ROOT_ID" --json | jq -r '.[0].metadata."evidence.human_approved" // "false"')
+if [ "$HUMAN_APPROVED" != "true" ]; then
+  bd update "$ROOT_ID" --set-metadata "gc.halt_chain=true" \\
+                       --set-metadata "summary_for_human=Refusing to squash-merge PR #<N>: evidence.human_approved is not true on the root bead. mol-pr-merge-only skips review, so the merge requires explicit human approval recorded at sling time (--metadata evidence.human_approved=true). Branch is rebased and CI-green; re-sling with the approval metadata to merge."
+  bd close $ROOT_ID --reason "human-approval evidence missing"
+  exit 0
+fi
+```
+
+**A.5: Squash merge:**
 ```bash
 gh pr merge <number> --squash
 ```
 
-**A.5: Cleanup:**
+**A.6: Cleanup:**
 ```bash
 git update-ref -d refs/adopt-pr/upstream-base 2>/dev/null || true
+bd update "$ROOT_ID" --set-metadata "summary_for_human=Squash-merged PR #<N> (<title>, by <author.login>). rebase_status: <rebase_status>. CI green; human-approval evidence verified."
 bd update $ROOT_ID --notes "<notes with merge_path: A, status: merged>"
 ```
 
