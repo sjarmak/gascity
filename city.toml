@@ -684,6 +684,7 @@ suspended = true
 [[patches.agent]]
 dir = "/home/ds/gascity-dashboard"
 name = "gascity-dashboard-worker"
+provider = "claude-4"
 suspended = true
 
 [[patches.agent]]
@@ -694,11 +695,13 @@ suspended = true
 [[patches.agent]]
 dir = "/home/ds/gascity"
 name = "polecat"
+provider = "claude-5"
 suspended = true
 
 [[patches.agent]]
 dir = "/home/ds/projects/CodeScaleBench"
 name = "codescalebench-worker"
+provider = "claude-2"
 suspended = true
 
 [[patches.agent]]
@@ -734,6 +737,7 @@ suspended = true
 [[patches.agent]]
 dir = "/home/ds/projects/live_docs"
 name = "live_docs-worker"
+provider = "claude-4"
 suspended = true
 
 [[patches.agent]]
@@ -749,11 +753,13 @@ suspended = true
 [[patches.agent]]
 dir = "/home/ds/projects/mem"
 name = "mem-worker"
+provider = "claude-4"
 suspended = true
 
 [[patches.agent]]
 dir = "/home/ds/projects/migration-evals"
 name = "migration-evals-worker"
+provider = "claude-3"
 suspended = true
 
 [[patches.agent]]
@@ -764,6 +770,7 @@ suspended = true
 [[patches.agent]]
 dir = "/home/ds/projects/scix_experiments"
 name = "meta-reviewer"
+provider = "claude-3"
 suspended = true
 
 [[patches.agent]]
@@ -774,6 +781,7 @@ suspended = true
 [[patches.agent]]
 dir = "/home/ds/projects/zeldascension"
 name = "zeldascension-worker"
+provider = "claude-3"
 suspended = true
 
 [beads]
