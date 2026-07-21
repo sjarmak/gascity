@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# needs-recovery-reaper.test — behavioural cover for the needs-recovery reaper.
+#
+# Hermetic: stubs `dolt`, `gc`, `jq` passthrough is real, and points the reaper
+# at mktemp state/log paths. No real store is queried and no bead is touched.
+#
+# Asserts the four properties that make this reaper trustworthy:
+#   1. it finds both marker states (gc.needs_recovery + review_verdict=escalate)
+#   2. it NEVER mutates a bead (surface-only is the whole contract)
+#   3. an unreadable store FAILS LOUD instead of reporting "0 offenders"
+#   4. dedup: a repeat run is silent, and a bead that leaves and returns re-alerts
+set -uo pipefail
+
+REAPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/needs-recovery-reaper"
+WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+BIN="$WORK/bin"; mkdir -p "$BIN"
+export PATH="$BIN:$PATH"
+
+fails=0
+check() { # check <desc> <condition-rc>
+  if (( $2 == 0 )); then echo "  ok   $1"; else echo "  FAIL $1"; fails=$((fails+1)); fi
+}
+
+# --- stubs -------------------------------------------------------------------
+# dolt: SHOW DATABASES -> one db; the offender SELECT -> rows from $DOLT_ROWS.
+cat > "$BIN/dolt" <<'STUB'
+#!/usr/bin/env bash
+q="${@: -1}"
+if [[ -n "${DOLT_DIE:-}" ]]; then exit 1; fi
+if [[ "$q" == *"SHOW DATABASES"* ]]; then
+  printf 'Database\ngascity\n'; exit 0
+fi
+if [[ "$q" == *"issues"* ]]; then
+  printf 'id,kind,reason\n'
+  [[ -n "${DOLT_ROWS:-}" ]] && printf '%s\n' "$DOLT_ROWS"
+  exit 0
+fi
+exit 0
+STUB
+chmod +x "$BIN/dolt"
+
+# gc: record every invocation so we can assert no mutating verb is ever used.
+cat > "$BIN/gc" <<'STUB'
+#!/usr/bin/env bash
+echo "$@" >> "$GC_CALLS"
+exit 0
+STUB
+chmod +x "$BIN/gc"
+
+export GC_CALLS="$WORK/gc-calls.txt"; : > "$GC_CALLS"
+export NEEDS_RECOVERY_AUDIT_LOG="$WORK/audit.log"
+export NEEDS_RECOVERY_NOTIFY_STATE="$WORK/notified"
+
+run() { DOLT_ROWS="$1" bash "$REAPER" "${@:2}" 2>&1; }
+
+# --- 1. detects both marker states -------------------------------------------
+echo "case 1: detects both marker states"
+out=$(run 'gc-aaa,land_failed,ff_only_collision
+gc-bbb,review_escalate,')
+grep -q "2 blocked bead" <<<"$out"; check "reports both offenders" $?
+grep -q "gc-aaa" <<<"$out"; check "names the land_failed bead" $?
+grep -q "gc-bbb" <<<"$out"; check "names the escalate bead" $?
+grep -q "ff_only_collision" <<<"$out"; check "surfaces the land-failure reason" $?
+
+# --- 2. never mutates ---------------------------------------------------------
+echo "case 2: surface-only (no mutation)"
+! grep -qE '(^| )bd .*(update|close|reopen)|--set-metadata|--unset-metadata|--status' "$GC_CALLS"
+check "no bead-mutating gc/bd call was issued" $?
+
+# --- 3. unreadable store fails loud ------------------------------------------
+echo "case 3: unreadable store fails loud"
+out=$(DOLT_DIE=1 DOLT_ROWS='' bash "$REAPER" 2>&1); rc=$?
+(( rc != 0 )); check "exits non-zero when the store cannot be enumerated" $?
+grep -qi "did NOT run\|FAILED to enumerate" <<<"$out"; check "says the scan did not run" $?
+! grep -q "^needs-recovery-reaper: 0 blocked" <<<"$out"
+check "does NOT report a clean scan on failure" $?
+
+# --- 4. dedup -----------------------------------------------------------------
+echo "case 4: dedup"
+: > "$NEEDS_RECOVERY_NOTIFY_STATE"
+first=$(run 'gc-ccc,review_escalate,')
+grep -q "new since last run: 1" <<<"$first"; check "first sighting is new" $?
+second=$(run 'gc-ccc,review_escalate,')
+! grep -q "new since last run" <<<"$second"; check "repeat sighting is silent" $?
+cleared=$(run '')
+grep -q "0 blocked bead" <<<"$cleared"; check "offender leaving the set is reported clear" $?
+again=$(run 'gc-ccc,review_escalate,')
+grep -q "new since last run: 1" <<<"$again"; check "returning offender re-alerts" $?
+
+echo
+if (( fails > 0 )); then echo "needs-recovery-reaper.test: $fails assertion(s) FAILED"; exit 1; fi
+echo "needs-recovery-reaper.test: all assertions passed"

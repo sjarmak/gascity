@@ -1,0 +1,64 @@
+# needs-recovery-reaper — surface blocked beads stuck in a state nothing sweeps.
+# Order name comes from the file basename: needs-recovery-reaper.
+#
+# Created 2026-07-21. Authority: Stephanie, in-session (city design audit;
+# .gc-reports/city-audit-2026-07-21.md sec 1.1, bead gc-xplm).
+#
+# Why: mol-focus-review records two stuck states and its own comment at
+# formulas/mol-focus-review.formula.toml:838 describes one of them as
+# "queryable by a reaper". No reaper ever queried it.
+#
+#   gc.needs_recovery=true  — land_fail(): the bead PASSED review but its branch
+#                             could not fast-forward-land. Commits stay intact on
+#                             work/<id>; the bead goes blocked. Recovery rode on a
+#                             single best-effort `gc session nudge mayor` at
+#                             failure time. Miss that nudge and verified work is
+#                             stranded indefinitely.
+#   review_verdict=escalate — the review escalate path blocks the bead and writes
+#                             a note but sends NO nudge and NO mail at all.
+#
+# No existing sweep covers either: work-landing-reaper scans CLOSED beads,
+# stale-claim-reaper only reopens in_progress, orphaned-molecule-reaper triggers
+# on roots whose work bead is closed. These are blocked and open, so they fall
+# between all three.
+#
+# First run (2026-07-21) found 27 offenders across 8 stores, the oldest blocked
+# since 07-20. One, EnterpriseBench-rryas.12, carried review_verdict=pass with
+# land_failed_reason=ff_only_collision: work that passed review, could not land,
+# and had been invisible for over a day. That bead is the reason this order
+# exists.
+#
+# Surface-only, never mutates. Both states mean a human or the mayor must decide
+# (rebase/land, requeue, or a judgment call); an automated close or reopen would
+# destroy the distinction the formula worked to record. Unlike
+# blocked-routed-reaper, there is no --apply mode to promote.
+#
+# Fail-loud, not fail-open: if the dolt store cannot be enumerated the script
+# exits 1 having reported nothing rather than printing "0 offenders". A scan that
+# did not run must not read as a clean scan — that is the stall-watch defect the
+# same audit fixed (sec 4.2).
+#
+# Dedup: alerts once per offender. State is rewritten to the CURRENT offender set
+# each run, so a bead that leaves and later returns alerts again as a new
+# incident. Silent when the set is unchanged.
+#
+# Cadence: 15m, matching blocked-routed-reaper. The states are rare and durable
+# (a blocked bead stays blocked), so this is about bounding discovery latency,
+# not catching a transient.
+#
+# Undo: rename to needs-recovery-reaper.toml.disabled with the reason in its
+# header, or add an [[orders.overrides]] entry in city.toml. The report still
+# runs by hand:
+#   bash /home/ds/gas-city/bin/needs-recovery-reaper
+
+[order]
+description = "Every 15m: surface blocked beads carrying gc.needs_recovery=true (review passed but the branch would not land) or review_verdict=escalate. Both states were designed to be reaper-visible and had no consumer. Surface-only; nudges mayor and posts new offenders to #gascity-maintenance."
+trigger = "cooldown"
+interval = "15m"
+exec = "/home/ds/gas-city/bin/needs-recovery-reaper --nudge-mayor --push"
+timeout = "180s"
+idempotent = true
+
+[order.env]
+# #gascity-maintenance, same channel as stall-watch and city-selftest.
+NEEDS_RECOVERY_CHANNEL = "C0B25SS12CD"

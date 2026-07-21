@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# needs-recovery-reaper: surface blocked beads carrying a stuck-state marker
+# that was DESIGNED to be reaper-visible but never had a consumer.
+#
+# WHY (audit 2026-07-21 sec 1.1, gc-xplm). Two states in mol-focus-review:
+#
+#   gc.needs_recovery=true   land_fail() sets it (formula line ~840) on work that
+#                            PASSED review but could not fast-forward-land. The
+#                            formula comment at line 838 calls the state
+#                            "queryable by a reaper". A grep across bin/, orders/
+#                            and .gc/*.yaml found ZERO consumers. Recovery rode
+#                            entirely on one best-effort `gc session nudge mayor`
+#                            at failure time; miss that nudge and verified-passing
+#                            work sits blocked forever with its commits stranded
+#                            on work/<id>.
+#
+#   review_verdict=escalate  the review escalate path (formula line ~567) blocks
+#                            the bead and writes a note, but unlike land_fail
+#                            sends NO nudge and NO mail at all. Nothing swept it.
+#
+# work-landing-reaper cannot cover either: it scans CLOSED beads for unlanded
+# branches, and these are BLOCKED and open. stale-claim-reaper only reopens
+# in_progress. orphaned-molecule-reaper triggers on roots whose work bead is
+# closed. The states fall between every existing sweep.
+#
+# SURFACE-ONLY BY DESIGN. Both states mean "a human or the mayor must decide":
+# land_fail needs a rebase/land or a requeue, escalate needs a judgment call.
+# Auto-closing or auto-reopening either one would destroy the distinction the
+# formula worked to record. This reaper therefore never mutates a bead — it
+# reports, dedups, and routes an alert. That is deliberately unlike
+# blocked-routed-reaper (which clears a metadata key), and matches
+# stale-worktree-reaper / decision-staleness-reaper.
+#
+# Dedup: an offender is alerted once. State lives in the notify file; a bead
+# leaving the offender set is dropped from state so a recurrence re-alerts.
+#
+# Usage:
+#   needs-recovery-reaper                # report (default)
+#   needs-recovery-reaper --nudge-mayor  # + nudge mayor for newly-seen offenders
+#   needs-recovery-reaper --push         # + post new offenders to Slack
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${NEEDS_RECOVERY_AUDIT_LOG:-${CITY}/.gc/needs-recovery-reaper.log}"
+NOTIFY_STATE="${NEEDS_RECOVERY_NOTIFY_STATE:-${CITY}/.gc/needs-recovery-reaper.notified}"
+DOLT_PORT="${GC_DOLT_PORT:-29620}"
+CHANNEL="${NEEDS_RECOVERY_CHANNEL:-C0B25SS12CD}"   # #gascity-maintenance
+
+NUDGE_MAYOR=0
+PUSH=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --nudge-mayor) NUDGE_MAYOR=1; shift ;;
+    --push)        PUSH=1; shift ;;
+    -h|--help)     sed -n 's/^# \{0,1\}//p' "$0" | head -40; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$(dirname "$AUDIT_LOG")"
+
+dolt_q() {
+  dolt --host 127.0.0.1 --port "$DOLT_PORT" --user root --no-tls --password '' \
+    sql --result-format csv -q "$1" 2>/dev/null
+}
+
+log_event() {
+  local event=$1 db=$2 bead=$3 extra=${4:-'{}'} ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  jq -cn --arg ts "$ts" --arg event "$event" --arg db "$db" --arg bead "$bead" \
+     --argjson extra "$extra" \
+    '{ts:$ts, event:$event, db:$db, bead:$bead} + $extra' >> "$AUDIT_LOG" 2>/dev/null || true
+}
+
+# db name -> rig name (aliases where they differ). Same table as
+# blocked-routed-reaper; kept in sync by hand until a shared lib exists.
+db_to_rig() {
+  case "$1" in
+    code_intel_digest)  echo "code-intelligence-digest" ;;
+    migration_evals)    echo "migration-evals" ;;
+    scix_experiments)   echo "scix-experiments" ;;
+    EnterpriseBench)    echo "enterprisebench" ;;
+    CodeScaleBench)     echo "codescalebench" ;;
+    gascity_dashboard)  echo "gascity-dashboard" ;;
+    tom_swe)            echo "tom-swe" ;;
+    *)                  echo "$1" ;;
+  esac
+}
+
+dbs=$(dolt_q "SHOW DATABASES;" | grep -vE '^Database$|^information_schema$|^mysql$|^dolt$')
+if [[ -z "$dbs" ]]; then
+  # A store we cannot read is NOT an all-clear. Saying "0 offenders" here would
+  # reproduce the stall-watch defect this audit also fixed, where a dead detector
+  # was indistinguishable from a clean scan.
+  echo "needs-recovery-reaper: FAILED to enumerate databases at 127.0.0.1:${DOLT_PORT} — scan did NOT run" >&2
+  log_event "scan_failed" "-" "-" "$(jq -cn --arg p "$DOLT_PORT" '{port:$p}')"
+  exit 1
+fi
+
+offenders=()   # db|bead|kind|reason
+for db in $dbs; do
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == id,* ]] && continue
+    IFS=, read -r bead kind reason <<<"$line"
+    [[ -z "$bead" || "$bead" == "id" ]] && continue
+    offenders+=("$db|$bead|${kind:-unknown}|${reason:-}")
+  done < <(dolt_q "
+    SELECT id,
+           CASE
+             WHEN JSON_UNQUOTE(JSON_EXTRACT(metadata,'\$.\"gc.needs_recovery\"')) = 'true' THEN 'land_failed'
+             ELSE 'review_escalate'
+           END AS kind,
+           REPLACE(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(metadata,'\$.\"gc.land_failed_reason\"')),''),',',';') AS reason
+    FROM \`$db\`.issues
+    WHERE status = 'blocked'
+      AND ( JSON_UNQUOTE(JSON_EXTRACT(metadata,'\$.\"gc.needs_recovery\"')) = 'true'
+         OR JSON_UNQUOTE(JSON_EXTRACT(metadata,'\$.review_verdict')) = 'escalate' );" 2>/dev/null)
+done
+
+count=${#offenders[@]}
+echo "needs-recovery-reaper: ${count} blocked bead(s) in an unreaped stuck state"
+
+if (( count > 0 )); then
+  printf '%-22s %-14s %-16s %s\n' DB BEAD KIND REASON
+  printf '%-22s %-14s %-16s %s\n' -- ---- ---- ------
+  for row in "${offenders[@]}"; do
+    IFS='|' read -r db bead kind reason <<<"$row"
+    printf '%-22s %-14s %-16s %s\n' "$db" "$bead" "$kind" "${reason:0:60}"
+  done
+  echo
+  echo "Surface-only: these need a decision (rebase/land, requeue, or judgment), never an automated close."
+fi
+
+# --- dedup + alert -----------------------------------------------------------
+prev=""
+[[ -f "$NOTIFY_STATE" ]] && prev=$(cat "$NOTIFY_STATE" 2>/dev/null)
+
+current=()
+for row in "${offenders[@]}"; do
+  IFS='|' read -r db bead _ _ <<<"$row"
+  current+=("$db|$bead")
+done
+
+new_offenders=()
+for key in "${current[@]:-}"; do
+  [[ -z "$key" ]] && continue
+  grep -qxF "$key" <<<"$prev" || new_offenders+=("$key")
+done
+
+# Rewrite state to the CURRENT set (not a union): a bead that leaves the set and
+# later returns is a new incident and should alert again.
+tmp=$(mktemp "${NOTIFY_STATE}.tmp.XXXXXX") || exit 1
+printf '%s\n' "${current[@]:-}" | sed '/^$/d' | sort -u > "$tmp"
+mv "$tmp" "$NOTIFY_STATE"
+
+if (( ${#new_offenders[@]} == 0 )); then
+  exit 0
+fi
+
+echo "new since last run: ${#new_offenders[@]}"
+for key in "${new_offenders[@]}"; do
+  IFS='|' read -r db bead <<<"$key"
+  log_event "surfaced" "$db" "$bead" "$(jq -cn --arg r "$(db_to_rig "$db")" '{rig:$r}')"
+done
+
+summary=$(printf '%s\n' "${new_offenders[@]}" | sed 's/|/ /' | paste -sd', ' -)
+
+if (( NUDGE_MAYOR )); then
+  gc session nudge mayor \
+    "needs-recovery-reaper: ${#new_offenders[@]} blocked bead(s) in an unreaped stuck state (${summary}). These are land_failed (review passed, branch would not land — commits intact on work/<id>) or review_verdict=escalate. Both need a decision; neither is swept by any other reaper. Report: bash /home/ds/gas-city/bin/needs-recovery-reaper" \
+    >/dev/null 2>&1 || log_event "nudge_failed" "-" "-"
+fi
+
+if (( PUSH )); then
+  body="*needs-recovery-reaper* — ${#new_offenders[@]} blocked bead(s) in an unreaped stuck state
+${summary}
+_land_failed = review passed but the branch would not land; commits are intact on work/<id>. review_verdict=escalate = review asked for a human call._
+_Re-run:_ \`bash /home/ds/gas-city/bin/needs-recovery-reaper\`"
+  gc slack publish-to-channel --channel "$CHANNEL" --text "$body" >/dev/null 2>&1 \
+    || log_event "publish_failed" "-" "-" "$(jq -cn --arg c "$CHANNEL" '{channel:$c}')"
+fi
