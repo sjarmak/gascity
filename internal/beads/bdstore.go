@@ -487,9 +487,16 @@ func (s *BdStore) Purge(beadsDir string, dryRun bool) (PurgeResult, error) {
 	return PurgeResult{Purged: purged}, nil
 }
 
-// execPurge runs bd purge via exec.CommandContext with a 60-second timeout.
+// execPurge runs bd purge via exec.CommandContext with a 60-second timeout
+// covering both limiter queueing and command execution.
 func execPurge(dir string, env, args []string) ([]byte, error) {
-	release, err := acquireBDCommandSlot(context.Background(), "bd", bdCommandSlots)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return execPurgeWithContext(ctx, dir, env, args, bdCommandSlots)
+}
+
+func execPurgeWithContext(ctx context.Context, dir string, env, args []string, slots chan struct{}) ([]byte, error) {
+	release, err := acquireBDCommandSlot(ctx, "bd", slots)
 	if err != nil {
 		return nil, fmt.Errorf("waiting for bd execution slot: %w", err)
 	}
@@ -497,9 +504,6 @@ func execPurge(dir string, env, args []string) ([]byte, error) {
 	defer releaseOnce()
 
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
 	cmd := exec.CommandContext(ctx, "bd", args...)
 	cmd.Dir = dir
 	cmd.Env = env

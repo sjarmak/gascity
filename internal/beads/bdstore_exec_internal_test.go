@@ -130,6 +130,18 @@ func TestAcquireBDCommandSlotBoundsConcurrencyAndHonorsContext(t *testing.T) {
 	releaseOther()
 }
 
+func TestExecPurgeSlotWaitHonorsContext(t *testing.T) {
+	slots := make(chan struct{}, 1)
+	slots <- struct{}{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := execPurgeWithContext(ctx, t.TempDir(), nil, nil, slots)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("execPurgeWithContext error = %v, want context cancellation", err)
+	}
+}
+
 func TestBDCommandTimeoutForReadCommands(t *testing.T) {
 	if got := bdCommandTimeoutFor("bd", []string{"list", "--json"}); got != bdReadCommandTimeout {
 		t.Fatalf("bd list timeout = %s, want %s", got, bdReadCommandTimeout)
