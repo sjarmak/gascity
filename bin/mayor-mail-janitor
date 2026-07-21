@@ -1,40 +1,82 @@
 #!/usr/bin/env python3
-"""mayor-mail-janitor: archive mayor-addressed message beads older than 7 days.
+"""mayor-mail-janitor: mayor-mailbox hygiene — age-out + duplicate collapse.
 
-The mail-redirect-to-mayor order surfaces agent-written mail to mayor when
-it was addressed to a dead-letter recipient (human, stephanie, sjarmak).
-Combined with direct agent→mayor mail, mayor's inbox accumulates hundreds
-of historical status reports, handoff notes, and [redirect] copies — none
-of which need a response after a day or two.
+Two rules over open mayor-addressed message beads, one beads.json parse:
 
-This janitor archives any message bead where:
-  - status is open or in_progress
-  - assignee or owner is "mayor"
-  - issue_type is "message"
-  - created_at is more than RETAIN_DAYS old (default 7)
+  Rule 1 (AGE): archive message beads older than RETAIN_DAYS (default 7).
+    The mail-redirect-to-mayor order surfaces agent-written mail to mayor when
+    it was addressed to a dead-letter recipient (human, stephanie, sjarmak).
+    Combined with direct agent->mayor mail, mayor's inbox accumulates hundreds
+    of historical status reports, handoff notes, and [redirect] copies — none
+    of which need a response after a day or two (488 -> 0 sweep 2026-05-20).
 
-Archive is reversible (the bead is closed, not deleted); rationale lives
-in the existing `gc mail archive` semantics.
+  Rule 2 (DUPES): group by (recipient, subject, sha256(body)) and archive all
+    but the newest in each group. Some scheduled escalators (mol-dog-reaper,
+    etc.) fire a body-identical mail every interval against a backlog
+    condition that won't resolve until an upstream schema migration; triage
+    burns time on copies with zero new info. The newest stays visible.
+
+Merged 2026-07-21 (order-layer consolidation, city audit sec 2.1 + 4.4, epic
+gc-28w2): Rule 2 was bin/mail-dupe-dedupe, a separate HOURLY order whose full
+json.loads of the 62MB .gc/beads.json cost ~0.5-1GB transient RSS 24x/day on
+a box where oomd kills bystanders. Same mailbox, same archive mechanism —
+one janitor, two rules, one parse per day. Duplicate collapse latency moves
+from 1h to the daily 04:00 run; dups are cosmetic queue noise, not actions.
+Undo: restore bin/mail-dupe-dedupe + its order from this commit's parent in
+git if hourly dedup latency ever matters again.
+
+Archive is reversible (the bead is closed, not deleted); rationale lives in
+the existing `gc mail archive` semantics.
 
 Env:
   JANITOR_RETAIN_DAYS - archive items older than this in days (default 7)
+  JANITOR_MIN_DUPES   - only act on dupe groups with >= this many (default 2)
+  JANITOR_RECIPIENT   - dupe-rule recipient filter (default "mayor")
   JANITOR_DRY_RUN     - any non-empty value = list IDs but don't archive
   JANITOR_MAX_BATCH   - chunk size for `gc mail archive` (default 50)
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 BEADS_PATH = Path("/home/ds/gas-city/.gc/beads.json")
 RETAIN_DAYS = float(os.environ.get("JANITOR_RETAIN_DAYS", "7"))
+MIN_DUPES = int(os.environ.get("JANITOR_MIN_DUPES", "2"))
+RECIPIENT = os.environ.get("JANITOR_RECIPIENT", "mayor")
 DRY_RUN = bool(os.environ.get("JANITOR_DRY_RUN", "").strip())
 MAX_BATCH = int(os.environ.get("JANITOR_MAX_BATCH", "50"))
+
+
+def load_mayor_messages() -> list[dict]:
+    """One parse of beads.json, shared by both rules. Fails loudly: a load
+    error must read as janitor-failed, not inbox-clean (audit 4.2 class)."""
+    if not BEADS_PATH.exists():
+        print(f"mayor-mail-janitor: {BEADS_PATH} missing — nothing to do")
+        return []
+    try:
+        data = json.loads(BEADS_PATH.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"mayor-mail-janitor: FAILED to load {BEADS_PATH}: {e}", file=sys.stderr)
+        raise
+    beads = data.get("beads", []) if isinstance(data, dict) else data
+    out = []
+    for b in beads:
+        if b.get("status") not in ("open", "in_progress"):
+            continue
+        if b.get("issue_type") != "message":
+            continue
+        if b.get("assignee") != RECIPIENT and b.get("owner") != RECIPIENT:
+            continue
+        out.append(b)
+    return out
 
 
 def age_days(b: dict, now: datetime) -> float:
@@ -48,24 +90,33 @@ def age_days(b: dict, now: datetime) -> float:
         return 0.0
 
 
-def collect_targets() -> list[str]:
-    if not BEADS_PATH.exists():
-        return []
-    data = json.loads(BEADS_PATH.read_text())
-    beads = data.get("beads", []) if isinstance(data, dict) else data
+def aged_targets(messages: list[dict]) -> list[str]:
+    """Rule 1: older than RETAIN_DAYS."""
     now = datetime.now(timezone.utc)
-    targets = []
-    for b in beads:
-        if b.get("status") not in ("open", "in_progress"):
+    return [b["id"] for b in messages if age_days(b, now) >= RETAIN_DAYS]
+
+
+def body_sha(body: str) -> str:
+    return hashlib.sha256((body or "").encode("utf-8", errors="ignore")).hexdigest()
+
+
+def dupe_targets(messages: list[dict]) -> tuple[list[str], int]:
+    """Rule 2: all but the newest per (recipient, subject, body-sha) group.
+    Returns (ids, group_count)."""
+    groups: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+    for b in messages:
+        subject = b.get("title", "") or ""
+        body = b.get("description", "") or ""
+        groups[(RECIPIENT, subject, body_sha(body))].append(b)
+    ids: list[str] = []
+    group_count = 0
+    for beads in groups.values():
+        if len(beads) < MIN_DUPES:
             continue
-        if b.get("issue_type") != "message":
-            continue
-        if b.get("assignee") != "mayor" and b.get("owner") != "mayor":
-            continue
-        if age_days(b, now) < RETAIN_DAYS:
-            continue
-        targets.append(b["id"])
-    return targets
+        group_count += 1
+        beads_sorted = sorted(beads, key=lambda b: b.get("created_at", ""))
+        ids.extend(b["id"] for b in beads_sorted[:-1])
+    return ids, group_count
 
 
 def archive_batches(ids: list[str]) -> tuple[int, int]:
@@ -95,19 +146,34 @@ def archive_batches(ids: list[str]) -> tuple[int, int]:
 
 
 def main() -> int:
-    targets = collect_targets()
+    messages = load_mayor_messages()
+    aged = aged_targets(messages)
+    dupes, dupe_groups = dupe_targets(messages)
+    # Union, aged first; a bead can be both aged and a dupe — archive once.
+    seen = set()
+    targets = [i for i in aged + dupes if not (i in seen or seen.add(i))]
     if not targets:
-        print(f"mayor-mail-janitor: 0 items older than {RETAIN_DAYS}d — nothing to do")
+        print(
+            f"mayor-mail-janitor: nothing to do "
+            f"(0 older than {RETAIN_DAYS}d, 0 duplicates at min_dupes={MIN_DUPES})"
+        )
         return 0
     if DRY_RUN:
-        print(f"mayor-mail-janitor [DRY RUN]: would archive {len(targets)} item(s)")
+        print(
+            f"mayor-mail-janitor [DRY RUN]: would archive {len(targets)} item(s) "
+            f"({len(aged)} aged >{RETAIN_DAYS}d, {len(dupes)} dupes in {dupe_groups} group(s))"
+        )
         for t in targets[:20]:
             print(f"  {t}")
         if len(targets) > 20:
             print(f"  ... +{len(targets) - 20} more")
         return 0
     archived, failed = archive_batches(targets)
-    print(f"mayor-mail-janitor: archived {archived} item(s), {failed} failed (target={len(targets)}, retain={RETAIN_DAYS}d)")
+    print(
+        f"mayor-mail-janitor: archived {archived} item(s), {failed} failed "
+        f"(aged={len(aged)}, dupes={len(dupes)} in {dupe_groups} group(s), "
+        f"retain={RETAIN_DAYS}d)"
+    )
     return 1 if failed else 0
 
 
