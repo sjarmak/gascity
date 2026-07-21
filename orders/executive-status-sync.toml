@@ -1,0 +1,28 @@
+# executive-status-sync — twice-daily CEO-level portfolio brief (Obsidian +
+# one Slack post when content changed). Aggregates the 09:30/16:30
+# project-lead inputs after a 40-minute composition window. This is the only
+# routine portfolio Slack post; urgent decisions remain event-driven and
+# separate.
+#
+# Merged 2026-07-21 from executive-status-sync-am.toml + -pm.toml (order-layer
+# consolidation, city audit sec 2.1 + epic gc-28w2): the halves were
+# exec-identical (same binary, same flags, same timeout); only the hour
+# differed. Cron hour lists are the proven pattern here (mem-digest
+# '30 8,15 * * *'). Undo: restore the two single-hour files from this
+# commit's parent in git if per-leg scheduling ever needs to diverge.
+#
+# NOTE zero-lastRun bootstrap: this merged NAME has never fired, and
+# checkCron skips catch-up when lastRun is zero — the first fire happens only
+# when an evaluator tick lands exactly in a scheduled minute (tick jitter is
+# ~5-9m, so expect the first fire within a day or two of resume; every fire
+# after that gets full catch-up). To force-seed after the cleanup pause:
+# temporarily set schedule to "* * * * *", wait for one controller fire,
+# restore. Seeding was deliberately NOT done during the 07-21 pause (it
+# executes a Slack-posting run).
+[order]
+description = "Daily 10:10 + 17:10 EDT: build/refresh the CEO-level Obsidian portfolio brief and publish it once to Slack when content changed."
+trigger = "cron"
+schedule = "10 10,17 * * *"
+exec = "/home/ds/gas-city/bin/executive-status-sync"
+timeout = "3m"
+idempotent = true

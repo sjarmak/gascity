@@ -1,8 +1,0 @@
-# Aggregate the 16:30 project-lead inputs after a 40-minute composition window.
-[order]
-description = "Daily 17:10 EDT: refresh the CEO-level Obsidian portfolio brief and publish it once to Slack when content changed."
-trigger = "cron"
-schedule = "10 17 * * *"
-exec = "/home/ds/gas-city/bin/executive-status-sync"
-timeout = "3m"
-idempotent = true
