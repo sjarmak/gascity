@@ -902,6 +902,120 @@ func TestCityRuntimeEnsureManagedDoltPublishedForTickSkipsHealthWhenManagedPortP
 	}
 }
 
+// TestCityRuntimeEnsureManagedDoltPublishedForTickExportsAdoptedPort covers
+// the supervisor-restart adopt path: the managed Dolt survived (its port
+// resolves from published state without any health recovery), and the tick
+// must project that port into the supervisor's own process env so ambient
+// consumers (ambientDoltConnectionQueryPrefix, bd hook subprocesses) do not
+// depend on per-poll re-resolution. Before this export, a restart that
+// adopted a surviving Dolt left the fresh supervisor process without
+// GC_DOLT_PORT and bd transiently resolved 127.0.0.1:0, freezing order
+// firing (gc-74rxa).
+func TestCityRuntimeEnsureManagedDoltPublishedForTickExportsAdoptedPort(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	clearAmbientDoltPortEnvForTest(t)
+	enableSupervisorAmbientDoltPortExportForTest(t)
+
+	healthCalls := 0
+	cr := &CityRuntime{
+		cityPath: "/tmp/test-city",
+		stderr:   io.Discard,
+		managedDoltHealth: func(string) error {
+			healthCalls++
+			return nil
+		},
+		managedDoltOwned: func(string) (bool, error) {
+			return true, nil
+		},
+		managedDoltPort: func(string) string {
+			return "43307"
+		},
+	}
+	cr.ensureManagedDoltPublishedForTick()
+
+	if healthCalls != 0 {
+		t.Fatalf("healthCalls = %d, want 0", healthCalls)
+	}
+	if got := os.Getenv("GC_DOLT_PORT"); got != "43307" {
+		t.Fatalf("GC_DOLT_PORT = %q, want %q", got, "43307")
+	}
+	if got := os.Getenv("BEADS_DOLT_SERVER_PORT"); got != "43307" {
+		t.Fatalf("BEADS_DOLT_SERVER_PORT = %q, want %q", got, "43307")
+	}
+}
+
+// TestCityRuntimeEnsureManagedDoltPublishedForTickExportsRecoveredPort
+// verifies the start/recovery path exports on the same tick: when the port
+// only becomes resolvable after the health preflight (re)starts the managed
+// Dolt, the fresh port must land in the ambient env immediately instead of
+// waiting for the next tick.
+func TestCityRuntimeEnsureManagedDoltPublishedForTickExportsRecoveredPort(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	clearAmbientDoltPortEnvForTest(t)
+	enableSupervisorAmbientDoltPortExportForTest(t)
+
+	recovered := false
+	cr := &CityRuntime{
+		cityPath: "/tmp/test-city",
+		stderr:   io.Discard,
+		managedDoltHealth: func(string) error {
+			recovered = true
+			return nil
+		},
+		managedDoltOwned: func(string) (bool, error) {
+			return true, nil
+		},
+		managedDoltPort: func(string) string {
+			if !recovered {
+				return ""
+			}
+			return "43308"
+		},
+	}
+	cr.ensureManagedDoltPublishedForTick()
+
+	if !recovered {
+		t.Fatal("health preflight was not invoked")
+	}
+	if got := os.Getenv("GC_DOLT_PORT"); got != "43308" {
+		t.Fatalf("GC_DOLT_PORT = %q, want %q", got, "43308")
+	}
+	if got := os.Getenv("BEADS_DOLT_SERVER_PORT"); got != "43308" {
+		t.Fatalf("BEADS_DOLT_SERVER_PORT = %q, want %q", got, "43308")
+	}
+}
+
+// TestCityRuntimeEnsureManagedDoltPublishedForTickNoExportWhenUnowned pins
+// that a city whose Dolt lifecycle is not managed-local (external endpoint,
+// doltlite, postgres) never projects a port into the process env.
+func TestCityRuntimeEnsureManagedDoltPublishedForTickNoExportWhenUnowned(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	clearAmbientDoltPortEnvForTest(t)
+	enableSupervisorAmbientDoltPortExportForTest(t)
+
+	cr := &CityRuntime{
+		cityPath: "/tmp/test-city",
+		stderr:   io.Discard,
+		managedDoltHealth: func(string) error {
+			return nil
+		},
+		managedDoltOwned: func(string) (bool, error) {
+			return false, nil
+		},
+		managedDoltPort: func(string) string {
+			return "43309"
+		},
+	}
+	cr.ensureManagedDoltPublishedForTick()
+
+	if _, ok := os.LookupEnv("GC_DOLT_PORT"); ok {
+		t.Fatal("GC_DOLT_PORT exported for an unowned dolt lifecycle")
+	}
+	if _, ok := os.LookupEnv("BEADS_DOLT_SERVER_PORT"); ok {
+		t.Fatal("BEADS_DOLT_SERVER_PORT exported for an unowned dolt lifecycle")
+	}
+}
+
 func TestCityRuntimeEnsureManagedDoltPublishedForTickLogsOwnershipError(t *testing.T) {
 	t.Setenv("GC_BEADS", "bd")
 
