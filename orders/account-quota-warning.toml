@@ -1,7 +1,12 @@
 [order]
 description = "Every 30m: silently capacity-balance non-pinned Claude agents across healthy accounts and slack-ping gascity-maintenance only when an account's 7-day quota exceeds 75% (QUOTA_WARN_PCT). Balance = gc-capacity --rebalance auto --no-reset + gc reload, weighted by remaining 5h/7d quota and stable once converged; hot accounts receive no movable workers. Pinned agents are never auto-moved and are called out explicitly for hand relocation. Per-account alert dedupe follows the 7d reset window; routine balancing produces no Slack/mail noise."
 trigger = "cron"
-schedule = "*/30 * * * *"
+# Restaggered */30 -> :03/:33 2026-07-21 (herd de-stack, city audit sec 4.6 +
+# epic gc-28w2): four 30m crons co-fired at :00/:30 on a ~455MB-RSS-floor
+# toolchain; approved-pr-automerge-packs' header documents the stagger
+# precedent (:07/:22/:37/:52). Same cadence, same coverage. Undo: restore
+# */30 if the offset ever matters to quota-warning latency.
+schedule = "3,33 * * * *"
 exec = "/home/ds/gas-city/bin/account-quota-warning"
 timeout = "180s"
 

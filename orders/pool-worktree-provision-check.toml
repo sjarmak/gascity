@@ -11,6 +11,9 @@
 [order]
 description = "Every 30m: flag any LIVE pool member on an unprovisioned base worktree (no .git — code beads strand on env, gc-dvvym class). Report-only; mails mayor only when the unprovisioned set changes. Never provisions/drains."
 trigger = "cron"
-schedule = "*/30 * * * *"
+# Restaggered */30 -> :26/:56 2026-07-21 (herd de-stack, city audit sec 4.6 +
+# epic gc-28w2; stagger precedent in approved-pr-automerge-packs). Same
+# cadence, same coverage.
+schedule = "26,56 * * * *"
 exec = "/home/ds/gas-city/bin/pool-worktree-provision-check --nudge-mayor"
 timeout = "2m"

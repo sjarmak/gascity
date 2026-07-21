@@ -15,6 +15,9 @@
 [order]
 description = "Every 30m: warn/action/critical below 300/200/100G free or at 85/90/95% inode use; trim allowlisted regenerable caches and disabled bd telemetry over 1G allocated. Never go clean -cache; never huggingface/ollama. Audited; nudges mayor on real reclaim."
 trigger = "cron"
-schedule = "*/30 * * * *"
+# Restaggered */30 -> :11/:41 2026-07-21 (herd de-stack, city audit sec 4.6 +
+# epic gc-28w2; stagger precedent in approved-pr-automerge-packs). Same
+# cadence, same coverage.
+schedule = "11,41 * * * *"
 exec = "/home/ds/gas-city/bin/disk-pressure-guard --apply --nudge-mayor"
 timeout = "5m"

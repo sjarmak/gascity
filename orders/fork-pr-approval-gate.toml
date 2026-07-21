@@ -8,6 +8,9 @@
 [order]
 description = "Every 30m: detect open gastownhall/gascity PRs with REQUIRED checks (CI/CodeQL) stuck in GitHub 'action_required' and alert mayor with the list + one-command approve. Detect-only; approval is human-directed (write-access, no Julian). Signature-deduped."
 trigger = "cron"
-schedule = "*/30 * * * *"
+# Restaggered */30 -> :18/:48 2026-07-21 (herd de-stack, city audit sec 4.6 +
+# epic gc-28w2; stagger precedent in approved-pr-automerge-packs). Same
+# cadence, same coverage.
+schedule = "18,48 * * * *"
 exec = "/home/ds/gas-city/bin/fork-pr-approval-gate --nudge-mayor"
 timeout = "3m"
