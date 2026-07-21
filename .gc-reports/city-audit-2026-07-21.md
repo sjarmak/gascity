@@ -560,3 +560,83 @@ exists to catch.
 Decisions 2 (demand reduction as a permanent posture) and 3 (postgres
 `shared_buffers`) in §7 remain yours. The pause bought headroom; it did not
 change the arithmetic. Waves 2 and 3 are filed and held: gc-28w2, gc-5kgl.
+
+---
+
+# APPENDIX 2 — the ultracode finalize run (afternoon, 2026-07-21)
+
+Stephanie's directive: stop filing beads into a broken process; finalize directly. A 20-agent
+workflow executed the remaining remediation during the pause. All gates green at the end:
+**21 selftest suites 0 failing, pytest green, config clean, no confirmed-high review findings.**
+~35 further commits (`git log c9931e5..HEAD`).
+
+## Recovered work (the silent-loss payoff)
+
+- **EnterpriseBench-rryas.12 LANDED.** main fast-forwarded to `9979faf` (2 commits of
+  review-passed work). Root cause was NOT the recorded single-path hint: the shared base tree
+  carried uncommitted WIP on **four** paths the branch touches. Test evidence: failure sets
+  identical to base name-by-name, +28 net new passing tests. The displaced WIP (an unbeaded
+  ~900-line variant-label feature) is preserved on `wip/base-tree-variant-label-20260721`.
+- **gc-5cgt cluster resolved**: the P0 fix itself was already complete out-of-band
+  (`work/gc-5cgt` @ `e192a24`, local only); gc-y51u/gc-lbj1 closed as superseded (plus 5 orphan
+  step wisps), gc-xgo4 requeued cold with its `dispatch-blocked` hold retained.
+- **All 23 review_escalate beads triaged to resolution** — requeues with residue cleared,
+  evidence-cited closes, and 8 genuinely-human calls consolidated into the ledger below.
+  Notably, every escalate note checked out accurate on re-verification; the failure was purely
+  that nothing ever routed them.
+
+## Process fixes landed
+
+gc-2lab complete city-side (worktree stanzas, halt visibility, `evidence.human_approved` merge
+gate, watch timeout, iterate stash-not-discard). completion-reconciler no longer aborts whole
+runs on rig-list timeout (city store always scanned; tests extended). stall-watch now
+distinguishes detector-failed from no-stalls (+ test). The **gc source fix for the adopt-path
+port export is authored and verified** on `fix/supervisor-adopt-dolt-port` @ `ec9d45c5f`
+(worktree `gascity-worktrees/gc-qaid-adopt-port`; 2 new tests + ambient suite green; converges
+on mid-life port changes, which the static drop-in cannot). Push is gated.
+
+## Consolidation landed
+
+am/pm twins collapsed (6 orders → 3, hour-list crons), the four `*/30` herd orders staggered,
+decision-staleness merged into stale-attention, mail-dupe-dedupe merged into mayor-mail-janitor
+(kills the hourly 62 MB full parse), polecat-ui-stuck-scanner dieted (dispatcher pass out, 529
+classifier in — pl-529-recovery retired after 2 months of zero detections), 4 zero-yield orders
+retired, 7 orphan scripts and 5 dead formulas and 2 agent dirs deleted, github-mirror `is_wisp`
+triplication folded into the common lib, weekly flatten de-double-scheduled,
+formula-version-sweep finally wired (daily, report-only), 6 PL prompt fragments extracted (8
+prompts converted), worker templates hardened (drain/substrate-failure/evidence-close),
+push carve-outs encoded into the three prompts that hold the authority, docs swept twice.
+
+## Corrections to Appendix 1
+
+- **C.7 was wrong about account3**: only account4 is `opus[1m]`. account3 reads
+  `claude-fable-5[1m]` because **Stephanie set it via `/model` the same day** — Fable access is
+  restored and that pin is her choice, not drift. Memory updated so nobody "fixes" it back.
+- **The 156 bak count was off**: exactly 142 files were preserved+deleted; tree verified clean.
+- **jsonl-archive (2.1 GB) is OFF the retention list**: it is an active git-backed hourly
+  bead-export mirror, not a passive archive. A blanket gzip pass here briefly compressed its
+  git internals — fully reversed the same hour, fsck clean, zero loss (and a lesson recorded:
+  the retention sweep now touches nothing that contains a `.git`).
+
+## Still open (tracked, not lost)
+
+gc-28w2 remainder (login-wedge/pool-liveness merge, dispatcher-watchdog trim, resource-sweep
+fold, mol-pr-base extraction, slack channel registry, packs SSOT incl. the pack-side `pour`
+gap, per-run-scope MemoryHigh), gc-f5zg item 4 (tests for the four bead-mutating reapers),
+gc-qaid unit leg, and the three merged cron orders' first fires (zero lastRun — they
+self-heal at the first exact-minute evaluator hit; verify they fired on day one after resume).
+
+## Ledger — decisions only Stephanie can make
+
+1. **Push `fix/supervisor-adopt-dolt-port` @ ec9d45c5f** (gascity) and, after deploy, retire
+   `10-dolt-port.conf`. 2. **Adopt gc-5cgt**: push/land `work/gc-5cgt` @ `e192a24`, rebuild gc,
+   run the post-adoption census, then decide the `dispatch-blocked` holds (gc-xgo4 et al).
+3. **EB no-landing hold**: stands or lifts? (Its cited RCA doc never existed; main took daily
+   landings 07-15→07-19. Gates s1o2n + o4ary.) 4. **EB per-bead calls**: d900w fix fork, qx4pg
+   AC amendment, fsb4d DEFAULT_KEYS home. 5. **dashboard-wdb1 rig-hue**: upstream gascity fix
+   (needs an issue filed — gated) vs dashboard heuristic interim. 6. **co-j2de IR basis**:
+   accept staged Option-1 GT remap @ `3db41235` or pick an alternative. 7. **Orphaned
+   variant-label WIP** (EnterpriseBench, ~900 lines, semantic conflict with landed main): bead
+   it, fold it, or drop it. 8. **mol-pr-merge-only's new merge gate** (`evidence.human_approved`)
+   — confirm the contract. 9. Resume timing: gc-x77t five-step checklist; not before the memory
+   arithmetic (Decisions 2/3 of §7) is settled.
