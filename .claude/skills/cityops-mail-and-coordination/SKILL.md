@@ -171,20 +171,20 @@ acts on wake. The coordination-relevant event orders:
 ## Mail hygiene: the inbox is not an archive
 
 - `mayor-mail-janitor` (daily 04:00 EDT) archives mayor-addressed mail older
-  than 7 days. Do not park anything in mayor's inbox as long-term state; use
-  beads or docs.
-- `mail-dupe-dedupe` (hourly) archives duplicate mayor mail by
-  (recipient, subject, body-sha), keeping the newest. Recurring escalators
-  firing identical bodies get collapsed; your mail surviving dedup means it
-  carried new content.
+  than 7 days AND collapses duplicate mayor mail by (recipient, subject,
+  body-sha), keeping the newest (the dupe rule was the separate hourly
+  `mail-dupe-dedupe` order until 2026-07-21; dedup latency is now the daily
+  run). Do not park anything in mayor's inbox as long-term state; use beads
+  or docs. Recurring escalators firing identical bodies get collapsed; your
+  mail surviving dedup means it carried new content.
 
 ## Coordination cadence (all times EDT, host-local cron; verified 2026-07-06)
 
 | When                | Order                            | What lands where                                                                        |
 | ------------------- | -------------------------------- | --------------------------------------------------------------------------------------- |
 | 06:30 daily         | `overnight-digest`               | overnight bead-close digest mailed to mayor `--notify`, surfaced to Slack on first wake |
-| 09:30 + 16:30 daily | `pl-status-update-am/pm`         | every live PL posts State/Blockers/Decisions-needed to its channel                      |
-| 09:45 + 17:00 daily | `mayor-health-surfacer-am/pm`    | mailbox/queue/bead anomalies nudged to mayor                                            |
+| 09:30 + 16:30 daily | `pl-status-update`               | every live PL posts State/Blockers/Decisions-needed to its channel (am/pm merged 2026-07-21) |
+| 09:45 + 17:45 daily | `mayor-health-surfacer`          | mailbox/queue/bead anomalies nudged to mayor (am/pm merged 2026-07-21; pm 17:00 → 17:45) |
 | Mon 10:00 weekly    | `pl-deep-audit-weekly`           | DEEP_AUDIT → `<rig>/.gc-reports/` + condensed channel post + BLOCKED_CHECK              |
 | continuous          | Tier-1/Tier-2 surfacing contract | see `template-fragments/pl-periodic-directives.template.md` (SSOT)                      |
 
@@ -238,8 +238,8 @@ claim:
 | Rebuild parked on dec-44y                       | `tail -3 /home/ds/.gc/slack-adapter-rebuild.log`                                                                                                                                                                            |
 | Channel bindings (17 rooms @ 2026-07-06)        | the python one-liner in the health ladder                                                                                                                                                                                   |
 | Subteam aliases (7)                             | `cat /home/ds/gas-city/.gc/slack/subteam-aliases.json`                                                                                                                                                                      |
-| Cadence times                                   | `grep -H schedule /home/ds/gas-city/orders/pl-status-update-*.toml /home/ds/gas-city/orders/overnight-digest.toml /home/ds/gas-city/orders/mayor-health-surfacer-*.toml /home/ds/gas-city/orders/pl-deep-audit-weekly.toml` |
-| Janitor windows (7d archive, hourly dedup)      | `grep -H description /home/ds/gas-city/orders/mayor-mail-janitor.toml /home/ds/gas-city/orders/mail-dupe-dedupe.toml`                                                                                                       |
+| Cadence times                                   | `grep -H schedule /home/ds/gas-city/orders/pl-status-update.toml /home/ds/gas-city/orders/overnight-digest.toml /home/ds/gas-city/orders/mayor-health-surfacer.toml /home/ds/gas-city/orders/pl-deep-audit-weekly.toml` |
+| Janitor windows (7d archive + daily dedup)      | `grep -H description /home/ds/gas-city/orders/mayor-mail-janitor.toml`                                                                                                                                                      |
 | Tier-1/Tier-2 contract text                     | open `template-fragments/pl-periodic-directives.template.md`                                                                                                                                                                |
 | Escalate channel id C0B25SS12CD                 | `grep C0B25SS12CD /home/ds/gas-city/orders/escalate-surfacer.toml`                                                                                                                                                          |
 | Mayor binding discrepancy still open            | compare `config.json` default_handles vs `agents/mayor/prompt.template.md` "not bound to any Slack channel"                                                                                                                          |

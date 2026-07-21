@@ -45,9 +45,11 @@ internals or the machinery index.
 
 Three different numbers are all "correct". Know which one you are looking at:
 
-- **`orders/` directory**: 89 enabled `.toml` files + 2 hard-disabled
-  (`bead-janitor.toml.disabled`, `rig-patrol.toml.disabled`) = 91 entries.
-  Renaming to `.toml.disabled` is the hard-disable mechanism.
+- **`orders/` directory**: 89 enabled `.toml` files + 2 hard-disabled = 91
+  entries as of this census (the 2026-07-21 order-layer consolidation deleted
+  or retired many; recount with `ls orders/*.toml orders/*.toml.disabled`).
+  Renaming to `.toml.disabled` is the hard-disable mechanism — current
+  examples: `nudge-poll-reaper.toml.disabled`, `pl-529-recovery.toml.disabled`.
 - **`gc order list`**: 97 distinct live orders. That is 88 file-backed
   (89 minus `maintenance-cycle`, disabled via a `[[orders.overrides]]` block in
   `city.toml`, see Change control below) plus 9 with **no file in `orders/`**:
@@ -113,7 +115,8 @@ daily-at-9:30 order can sit inert for days. Seed it once:
 
 Or sidestep entirely: use cooldown. Order headers that made this choice say so
 (`dispatcher-watchdog.toml`: "trigger=cooldown (no zero-lastRun bootstrap
-trap)"). Lore source: `orders/pl-status-update-am.toml` header.
+trap)"). Lore source: `orders/pl-status-update.toml` header (am/pm twins
+merged into it 2026-07-21).
 
 ### Trap 2 — cron evaluates in host-local time (EDT)
 
@@ -164,8 +167,11 @@ resource-sweep.
   double-dispatch. Never flip it back; per the comment (RCA gc-qo3) the file
   moves to `.toml.disabled` after a clean Temporal week (~2026-07-23).
   Hard-disable by renaming to `.toml.disabled` is the heavier form, used when
-  the order shape itself is broken (`rig-patrol.toml.disabled` — the only
-  native formula+pool order; that shape is regressed upstream, gascity#1440).
+  the order shape itself is broken or the order is retired with a re-enable
+  condition (current examples: `nudge-poll-reaper.toml.disabled`,
+  `pl-529-recovery.toml.disabled`; `rig-patrol.toml.disabled` — the only
+  native formula+pool order, shape regressed upstream gascity#1440 — was
+  deleted outright 2026-07-21, its story lives in git).
 - **The comment header is the changelog.** Every non-trivial order file opens
   with why it exists, the incident/bead IDs, cadence-change history, and (for
   mitigations) the un-install condition. When you edit an order, extend the
@@ -198,10 +204,10 @@ the full story; this table is the retirement index (verified in-file
 | Order                                                          | Covers                                                                                                                                                               | Retire when                                                                                                    |
 | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | `blocked-routed-reaper` (15m)                                  | Workflow-root spawn path reads an unfiltered projection (`orders_feed.go:292`) and respawns no-op polecats for blocked routed beads (gc-nby7oo class, RCA gc-453188) | Upstream status-gate lands in gascity source                                                                   |
-| `nudge-poll-reaper` (2m)                                       | Leaked `gc nudge poll` sidecars busy-loop at 300–650% CPU after session restarts (gc-b9w88; caused the 2026-06-24 all-day nudge hangs)                               | gc-source poll backoff ships (gc-b9w88, held needs-source-impl)                                                |
+| `gascity-nudge-poll-reaper` systemd user timer (2m; the order leg retired to `.toml.disabled` 2026-07-21 — the timer fires independent of order-firing stalls) | Leaked `gc nudge poll` sidecars busy-loop at 300–650% CPU after session restarts (gc-b9w88; caused the 2026-06-24 all-day nudge hangs)                               | gc-source poll backoff ships (gc-b9w88, held needs-source-impl)                                                |
 | `nudge-on-route` (event) + `routed-bead-nudger` (15m)          | `gc sling` does not wake warm/asleep pools (gascity#1129, by-design); event handler covers active sessions, the 15m sweep covers asleep pools                        | #1129 behavior changes upstream (do not hold your breath: by-design)                                           |
-| `morning-triage-cycle` exec-wrapper shape (`maintenance-cycle` retired — Temporal Schedule drives it since 2026-07-16; file → `.toml.disabled` ~07-23) | Native formula+pool orders regressed upstream (#1440); cycles exec-wrap `gc-sling` instead                                                                           | gastownhall/gascity#1986 lands + supervisor restarts; then restore the `rig-patrol.toml.disabled` native shape |
-| `pl-529-recovery` (2m)                                         | PL sessions wedge on Claude API 529 Overloaded; two-scan confirmation, mayor excluded                                                                                | Claude Code retry path stops wedging sessions                                                                  |
+| `morning-triage-cycle` exec-wrapper shape (`maintenance-cycle` retired — Temporal Schedule drives it since 2026-07-16; file → `.toml.disabled` ~07-23) | Native formula+pool orders regressed upstream (#1440); cycles exec-wrap `gc-sling` instead                                                                           | gastownhall/gascity#1986 lands + supervisor restarts; then restore the native formula+pool shape (ex-`rig-patrol.toml.disabled`, deleted 2026-07-21 — recover from git) |
+| 529-wedge classifier inside `polecat-ui-stuck-scanner` (5m; the `pl-529-recovery` order retired to `.toml.disabled` 2026-07-21 after 2 months / zero detections — classifier is surface-only, no auto-reset) | PL sessions wedge on Claude API 529 Overloaded; two-scan confirmation, mayor excluded                                                                                | Claude Code retry path stops wedging sessions                                                                  |
 | `dispatcher-watchdog` (30m)                                    | control-dispatcher (gc-2790) wedges ~6h after reset; only `gc session kill` clears the tripped circuit breaker                                                       | Upstream dispatcher fix                                                                                        |
 | `escalate-surfacer` (15m)                                      | oversight-rig pack's `escalate-rollups` only resolves pack-named PL sessions; bespoke-PL rigs' escalate rollups rot undelivered                                      | Pack resolver becomes naming-independent                                                                       |
 | `gascity-main-pin-guard` (15m)                                 | A detached `/home/ds/gascity-main` silently freezes the installed binary (4-day incident 2026-05-25)                                                                 | Never — cheap permanent guard                                                                                  |

@@ -16,9 +16,8 @@ The `orders/` directory has grown far past this table (~110 enabled `.toml` defi
 | `slack-binding-reaper`             | cooldown 5m          | `bin/slack-binding-reaper --apply --nudge-mayor`  |
 | `claude-zombie-report`             | cron `0 9 * * *`     | `bin/claude-zombie-report --nudge-mayor`          |
 | `memory-audit-issues`              | cron `15 9 * * *`    | `bin/memory-audit-issues --nudge-mayor`           |
-| `bead-janitor`                     | cron `30 9 * * *`    | `bin/bead-janitor --nudge-mayor`                  |
 | `mail-redirect-to-mayor`           | event `mail.sent`    | `bin/mail-redirect-to-mayor`                      |
-| `mayor-health-surfacer-am` / `-pm` | cron `45 9` / `0 17` | `bin/mayor-health-surfacer --nudge-mayor`         |
+| `mayor-health-surfacer`            | cron `45 9,17 * * *` | `bin/mayor-health-surfacer --nudge-mayor`         |
 | `mayor-pattern-miner`              | cron `30 8 * * 1`    | `bin/mayor-pattern-miner --nudge-mayor`           |
 | `cross-rig-handoff-patrol`         | cooldown 2m          | `bin/cross-rig-handoff scan --apply --nudge-mayor` |
 | `terminal-escalation-patrol`       | cooldown 2m          | `bin/terminal-worker-escalation scan --apply`     |

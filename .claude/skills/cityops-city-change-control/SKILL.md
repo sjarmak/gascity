@@ -125,8 +125,8 @@ Two live patterns in this city; pick by intent:
 
 | Intent                                    | Mechanism                                                                                            | Live examples (2026-07-21)                               |
 | ----------------------------------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| **Temporary pause**, undo condition known | `[[orders.overrides]]` block with `enabled = false` at the bottom of city.toml; order file untouched | (none currently)                                         |
-| **Retirement**                            | rename the file to `orders/<name>.toml.disabled`                                                     | `bead-janitor.toml.disabled`, `rig-patrol.toml.disabled` |
+| **Temporary pause**, undo condition known | `[[orders.overrides]]` block with `enabled = false` at the bottom of city.toml; order file untouched | `spawn-storm-detect` (the name is ALSO defined by the embedded core pack, so only the override silences it) |
+| **Retirement**                            | rename the file to `orders/<name>.toml.disabled`                                                     | `nudge-poll-reaper.toml.disabled`, `pl-529-recovery.toml.disabled` |
 
 `maintenance-cycle` uses the override mechanism but is a **retirement, not a
 pause**: the Temporal maintenance-Run Schedule has been the sole driver of
@@ -162,8 +162,9 @@ and is promoted by a human after a clean report. The convention, as practiced:
    ```
    (both live in `orders/janitor-worktree-gc.toml` /
    `orders/janitor-log-rotate.toml`, verified 2026-07-07). Longer soak
-   periods appear too: `bead-janitor.toml.disabled` records "--apply added
-   2026-05-20 after 14d clean dry-run history".
+   periods appear too: the retired bead-janitor recorded "--apply added
+   2026-05-20 after 14d clean dry-run history" (file deleted 2026-07-21;
+   git holds it).
 4. Destructive orders keep **blast-radius caps** even after promotion:
    `JANITOR_MAX_REMOVE = "25"` per tick, `JANITOR_MIN_AGE_DAYS = "3"`,
    protected-path regexes, and hard-refused files (the log-rotate script
@@ -174,7 +175,9 @@ annotation must name her. This is a standing pattern, not just history —
 apply it to any new janitor you stage. Related: orders that are safe to
 re-fire mark `idempotent = true` with a comment tying the fail-open behavior
 to gastownhall/gascity#2893 (see `orders/gate-sweep.toml`,
-`orders/nudge-poll-reaper.toml`).
+`orders/nudge-poll-reaper.toml.disabled` — order retired 2026-07-21, the
+gascity-nudge-poll-reaper systemd user timer is the live leg; the
+annotation survives in the .disabled file).
 
 ## Take-effect model
 
@@ -245,7 +248,8 @@ operator lore apply; their homes are the order headers, read them there:
 
 - **Zero-lastRun bootstrap trap** — a never-fired cron order must be seeded
   once or it never fires. Procedure in the header of
-  `orders/pl-status-update-am.toml`.
+  `orders/pl-status-update.toml` (the am/pm twins merged into it 2026-07-21;
+  the merged NAME is itself unseeded until its first fire).
 - **Host-local timezone** — gc cron evaluates in the host's local tz
   (EDT), not UTC; a past UTC assumption fired orders 4h late. Documented in
   the `schedule` comments of `orders/morning-triage-cycle.toml` and

@@ -204,7 +204,8 @@ verify-revertable false-negatives.
 `grounded_review` (Codex), `human_gate` — for a Formula-Compile-Time Router.
 The as-verified state (2026-07-07):
 
-- Phase 1 is **measure-only by design**: `orders/route-decide-report.toml`
+- Phase 1 is **measure-only by design**: `orders/route-decide-report.toml.disabled`
+  (order retired 2026-07-21 — weekly since 05-28, never produced an artifact)
   says "formulas do not yet consume the stamped tier".
 - Even the measuring side shows nothing: **zero `routing.*` metadata stamps**
   exist in the city store or any rig store (checked `beads`, `gascity`,

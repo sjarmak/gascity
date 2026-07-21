@@ -354,7 +354,7 @@ their one-line re-verification commands:
 | `gc session kill` restarts / `close` ends permanently                                                  | `gc session kill --help; gc session close --help`                     |
 | dispatcher-watchdog wedge signals + kill recovery                                                      | `head -30 /home/ds/gas-city/bin/dispatcher-watchdog`                  |
 | reap-worktrees.sh safety model, default repos, TTL 14d                                                 | `head -30 /home/ds/bin/reap-worktrees.sh`                             |
-| nudge-poll-reaper cadence 2m, idempotent=true rationale                                                | `cat /home/ds/gas-city/orders/nudge-poll-reaper.toml`                 |
+| nudge-poll-reaper cadence 2m, idempotent=true rationale (order retired 2026-07-21; systemd timer is the live leg) | `cat /home/ds/gas-city/orders/nudge-poll-reaper.toml.disabled`        |
 | `.beads/dolt-server.pid` stale (dead pid 4663)                                                         | `p=$(cat /home/ds/gas-city/.beads/dolt-server.pid); ls /proc/$p 2>&1` |
 | gc read commands stall under load (doctor >120s)                                                       | `time timeout 300 gc doctor >/dev/null`                               |
 
