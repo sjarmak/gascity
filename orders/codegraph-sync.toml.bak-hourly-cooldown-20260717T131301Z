@@ -1,6 +1,0 @@
-[order]
-description = "Daily off-hours refresh of the per-rig CodeGraph semantic indexes. Nothing else updates them, and Explore agents treat CodeGraph as their PRIMARY authoritative source — so a stale index silently makes them reason on old code (as of 2026-06-14 the gascity index was ~18d stale, several rigs ~34d). Runs incremental `codegraph sync` daily; the script auto-promotes to a full `codegraph index` on Sundays to repair drift incremental sync can miss. Every codegraph call is wrapped in scix-batch (memory-capped transient cgroup) so a full re-index can't OOM-kill the mayor/supervisor."
-trigger = "cron"
-schedule = "0 5 * * *"
-exec = "/home/ds/gas-city/bin/codegraph-sync"
-timeout = "60m"

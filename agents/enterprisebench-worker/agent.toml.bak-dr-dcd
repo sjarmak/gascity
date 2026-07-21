@@ -1,8 +1,0 @@
-dir = "/home/ds/projects/EnterpriseBench"
-provider = "claude-5"
-min_active_sessions = 6
-max_active_sessions = 6
-wake_mode = "fresh"
-
-[env]
-CLAUDE_BINARY = "claude-auto"

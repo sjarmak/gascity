@@ -1,6 +1,0 @@
-[order]
-description = "Weekly: audit MCP fan-out. For each configured MCP server, compare live process count + RSS (summed across all sessions that spawn a copy) against actual mcp__<server>__ tool-call usage in recent logs. Flags servers with procs+RAM but ZERO calls (dead weight loaded by every session — e.g. code-intel-copilot was 151 procs/5.2G at 0 calls, trimmed 2026-06-16). Report-only; trimming the config is a mayor decision."
-trigger = "cooldown"
-interval = "168h"
-exec = "/home/ds/gas-city/bin/mcp-audit --nudge-mayor"
-timeout = "120s"

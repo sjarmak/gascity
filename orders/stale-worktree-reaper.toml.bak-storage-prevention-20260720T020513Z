@@ -1,6 +1,0 @@
-[order]
-description = "Hourly: remove locked-and-abandoned git worktrees and their branches across rigs (clean working tree, ≥24h stale, branch merged into default). Companion to stale-claim-reaper. Local fallback for worktree side of gascity gc-1b2."
-trigger = "cooldown"
-interval = "1h"
-exec = "/home/ds/gas-city/bin/stale-worktree-reaper --apply --nudge-mayor"
-timeout = "5m"
