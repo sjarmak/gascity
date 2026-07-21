@@ -12,7 +12,11 @@
 # The case block is extracted from the shipped formula rather than duplicated, so
 # this check goes stale loudly instead of silently.
 #
-# Usage: formula-run-tests-guard-check.sh [path/to/mol-focus-review.formula.toml]
+# Lives in bin/ as a *.test so bin/city-selftest picks it up on its 6h order — a
+# check nobody runs is not a check. Hermetic: reads the formula, sources the case
+# block in a subshell, and no scenario reaches the arm that evals $TC.
+#
+# Usage: mol-focus-review-runtests-guard.test [path/to/mol-focus-review.formula.toml]
 
 set -u
 
@@ -29,9 +33,9 @@ grep -q '^esac$' "$CASE" || {
 
 fail=0
 
-# check <label> <want-rc> <must-match> <must-not-match|""> <TC> <CODE_BEARING>
+# check <label> <want-rc> <TC> <CODE_BEARING> <must-match> [must-not-match]
 check() {
-  local label="$1" want_rc="$2" want="$3" reject="$4" tc="$5" cb="$6"
+  local label="$1" want_rc="$2" tc="$3" cb="$4" want="$5" reject="${6:-}"
   local out rc ok=1
   out=$( TC="$tc" CODE_BEARING="$cb"; . "$CASE" 2>&1 ); rc=$?
   [ "$rc" = "$want_rc" ] || { ok=0; echo "  ! exit $rc, want $want_rc"; }
@@ -48,26 +52,24 @@ check() {
 
 # Unresolved var on code-bearing work: hard fail that names the real cause and
 # refuses to dangle SKIP: as the escape.
-check "unset + code -> names non-resolution" 1 \
-  "did not resolve for this rig" "" "<unset>" 1
-check "unset + code -> not reported as an EMPTY value" 1 \
-  "rendered the '<unset>' default" "test_command is EMPTY but" "<unset>" 1
-check "unset + code -> SKIP: not offered as the remedy" 1 \
-  "Do NOT declare SKIP:" "declare test_command='SKIP:<reason>' if there genuinely" "<unset>" 1
-check "unset + no code -> informational, no failure" 0 \
-  "test_command unresolved and no code detected" "" "<unset>" 0
+check "unset + code -> names non-resolution, not an EMPTY value" 1 "<unset>" 1 \
+  "did not resolve for this rig" "test_command is EMPTY but"
+check "unset + code -> SKIP: not offered as the remedy" 1 "<unset>" 1 \
+  "Do NOT declare SKIP:" "declare test_command='SKIP:<reason>' if there genuinely"
+check "unset + no code -> informational, no failure" 0 "<unset>" 0 \
+  "test_command unresolved and no code detected"
 
 # Deliberate empty keeps its own wording: there, config-or-SKIP really is right.
-check "empty + code -> distinct wording" 1 \
-  "explicitly EMPTY" "did not resolve for this rig" "" 1
-check "empty + code -> config/SKIP remedy retained" 1 \
-  "declare test_command='SKIP:<reason>'" "" "" 1
-check "empty + no code -> informational, no failure" 0 \
-  "no test_command and no code detected" "" "" 0
+check "empty + code -> distinct wording" 1 "" 1 \
+  "explicitly EMPTY" "did not resolve for this rig"
+check "empty + code -> config/SKIP remedy retained" 1 "" 1 \
+  "declare test_command='SKIP:<reason>'"
+check "empty + no code -> informational, no failure" 0 "" 0 \
+  "no test_command and no code detected"
 
 # Explicit skip still honoured.
-check "SKIP: declaration honoured" 0 \
-  "explicit validated skip — no rust tests" "" "SKIP:no rust tests" 1
+check "SKIP: declaration honoured" 0 "SKIP:no rust tests" 1 \
+  "explicit validated skip — no rust tests"
 
 [ "$fail" = 0 ] && echo "guard check: all scenarios passed ($FORMULA)"
 exit "$fail"

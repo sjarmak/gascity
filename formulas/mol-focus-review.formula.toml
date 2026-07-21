@@ -336,25 +336,18 @@ case "$TC" in
     echo "run-tests: explicit validated skip — ${TC#SKIP:}"
     ;;
   "<unset>")
-    # The var never resolved for this rig — this is the rendered default, not a
-    # configured value. Do NOT reuse the explicit-empty wording below: it tells the
-    # worker to "set a real test command in the rig config" when the config is
-    # frequently already correct (aoa-k6nm: the aoa rig defines test_command, the
-    # beads slung before it was added still render stale), and it dangles SKIP: as
-    # the way out. A worker who edits correct config, finds nothing to change, and
-    # is offered SKIP: is one rationalization from a false green on code-bearing
-    # work — the precise failure this guard exists to stop (dr-5lub).
+    # The var never resolved for this rig — the rendered default, not a configured
+    # value. Its wording must stay distinct from the explicit-empty arm below:
+    # pointing a worker at already-correct config and dangling SKIP: is one
+    # rationalization from a false green (aoa-k6nm, dr-5lub).
+    # Enforced by bin/mol-focus-review-runtests-guard.test.
     if [ "$CODE_BEARING" = "1" ]; then
       echo "FATAL: test_command did not resolve for this rig — it rendered the '<unset>' default." >&2
       echo "  Read this rig's [rigs.formula_vars] test_command in 'gc config show' BEFORE editing anything:" >&2
       echo "    - absent      -> add it; this work was slung with no test command." >&2
-      echo "    - ALREADY set -> the config is correct and the value did not reach this step." >&2
-      echo "                     A bead slung before the rig gained test_command keeps the stale" >&2
-      echo "                     render, so re-sling it; if a freshly slung bead still renders" >&2
-      echo "                     '<unset>', that is an interpolation bug — report it (aoa-k6nm)." >&2
-      echo "  Either way this is code-bearing work and MUST be verified. Do NOT declare SKIP: to" >&2
-      echo "  clear this guard — SKIP: is for work that genuinely has no tests, and using it to get" >&2
-      echo "  past an unresolved config manufactures the false green (dr-5lub)." >&2
+      echo "    - ALREADY set -> the bead was slung before the rig gained it; re-sling it. If a freshly" >&2
+      echo "                     slung bead still renders '<unset>', that is an interpolation bug (aoa-k6nm)." >&2
+      echo "  This is code-bearing work and MUST be verified. Do NOT declare SKIP: to clear this guard (dr-5lub)." >&2
       exit 1
     fi
     echo "run-tests: test_command unresolved and no code detected — nothing to verify."

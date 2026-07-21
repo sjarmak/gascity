@@ -87,7 +87,7 @@ timeout = "1200s"
 idempotent = true
 
 [order.env]
-# Per-suite cap. 18 suites x 60s = 1080s < the 1200s order timeout above.
+# Per-suite cap. 19 suites x 60s = 1140s < the 1200s order timeout above.
 CITY_SELFTEST_TIMEOUT = "60"
 # The order timeout, handed to the script so its preflight checks the REAL
 # ceiling rather than a second copy of the number. Keep equal to `timeout`.
