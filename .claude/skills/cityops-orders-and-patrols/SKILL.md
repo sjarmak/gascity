@@ -149,11 +149,12 @@ Under open-work-gate contention/timeout (gastownhall/gascity#2893),
 `idempotent = true` lets an order run anyway (fail OPEN). Set it **only** when
 a duplicate run is provably harmless, and say why in a comment — every current
 use does (re-clearing a cleared label, re-killing a dead PID). The
-`nudge-poll-reaper.toml` header records the sharpest case: the gate can be
-starved BY the very CPU runaways that reaper kills, so failing closed would be
-a deadlock (mayor, 2026-07-06). Current `idempotent = true` orders:
-blocked-routed-reaper, nudge-poll-reaper, gate-sweep, idle-session-report,
-resource-sweep.
+`nudge-poll-reaper.toml.disabled` header records the sharpest case (order
+retired 2026-07-21; the gascity-nudge-poll-reaper systemd timer is the live
+leg): the gate can be starved BY the very CPU runaways that reaper kills, so
+failing closed would be a deadlock (mayor, 2026-07-06). The set has grown far
+past the founding five (26 live orders as of 2026-07-21); enumerate with
+`grep -l 'idempotent = true' orders/*.toml`.
 
 ## Change control for orders
 
