@@ -1,5 +1,5 @@
 dir = "/home/ds/projects/mem"
-provider = "claude-3"
+provider = "claude-4"
 # Unpinned 2026-07-05 (Stephanie: accounts are fungible, handled by quota).
 # fork_flag is now uniform across all claude providers in city.toml, so the old
 # claude-3-only premise is gone. ONE residual coupling: while a warm-vs-cold

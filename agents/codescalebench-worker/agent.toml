@@ -1,5 +1,5 @@
 dir = "/home/ds/projects/CodeScaleBench"
-provider = "claude-3"
+provider = "claude-2"
 min_active_sessions = 0
 max_active_sessions = 3
 

@@ -6,7 +6,7 @@
 # dirty-tree class (qxuv) is held off by a local self-ignoring .gitignore in
 # .claude/skills/search-sessions/ until the tracked-.gitignore PR lands.
 dir = "/home/ds/gascity-dashboard"
-provider = "claude-3"
+provider = "claude-4"
 min_active_sessions = 0
 max_active_sessions = 3
 wake_mode = "fresh"

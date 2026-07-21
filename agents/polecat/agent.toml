@@ -1,6 +1,6 @@
 dir = "/home/ds/gascity"
 work_dir = "/home/ds/gascity-worktrees/{{.AgentBase}}"
-provider = "claude-3"
+provider = "claude-5"
 min_active_sessions = 0
 max_active_sessions = 6
 wake_mode = "fresh"
