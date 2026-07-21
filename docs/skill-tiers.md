@@ -41,7 +41,7 @@ May fail or degrade under `DISABLE_INTERACTIVITY=1`.
 gc sling <rig>/<agent> "/prd-build --dry-run <path>"
 ```
 
-If Tier 2 fails under Gas City, fall back to formula translation (`mol-skill-work.formula.toml`).
+If Tier 2 fails under Gas City, fall back to formula translation (`mol-do-work.toml`).
 
 ## Tier Classification Criteria
 
