@@ -1,0 +1,6 @@
+[order]
+description = "Companion cooldown re-tick for pl-human-gate-surface. The event trigger (bead.created) catches gates at creation, but if the gate's status starts as 'open' before originating_slack is fully written to the root, the initial pass misses. This re-tick at 1m catches stragglers. Idempotent via metadata.gate_surfaced_at."
+trigger = "cooldown"
+interval = "1m"
+exec = "/home/ds/gas-city/bin/pl-human-gate-surface"
+timeout = "120s"

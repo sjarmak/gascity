@@ -1,0 +1,14 @@
+# issue-design-digest — issue-hygiene piece 6 (mayor gc-429253). Weekly: batch the
+# open kind/design issues and dispatch a worker to produce a morning-ledger-style
+# digest (decision + options + recommendation each), surfaced for the maintainer's
+# picks. NEVER auto-comments/closes — models recommend, humans decide. ZFC: the
+# script gathers + dispatches; the polecat does the reasoning.
+#
+# LANDED IN DRY-RUN + nudge-mayor: gathers + composes the bead, does NOT dispatch.
+# Go-live toggle = append `--apply` (slings the digest bead) — a maintainer call.
+[order]
+description = "Weekly (Wed): gather open gastownhall/gascity kind/design issues and (dry-run) compose a design-decision digest bead for the gascity polecat (options + recommendation each, surfaced for Stephanie's picks). --apply dispatches it. Never auto-comments/closes."
+trigger = "cron"
+schedule = "0 14 * * 3"
+exec = "/home/ds/gas-city/bin/issue-design-digest --apply --nudge-mayor"
+timeout = "5m"

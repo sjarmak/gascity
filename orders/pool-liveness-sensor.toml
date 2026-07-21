@@ -1,0 +1,53 @@
+# pool-liveness-sensor — detect a worker pool deadlocked on non-advancing claims
+# (bead dr-t4w0). Created 2026-07-19 by city-infra-polecat-1.
+#
+# WHY: EnterpriseBench's pool was 100% deadlocked for FOUR DAYS on 2026-07-15 —
+# every worker pinned on a stale open+assigned step, the tiered claim predicate
+# re-serving each worker its own corpse, and nothing alarmed (the rig reported
+# "9 idle workers", which read as spare capacity). This sensor is the local
+# detection half; the durable fix (a step closing itself on every terminal path
+# incl. reject/drain) is upstream and gated with Stephanie.
+#
+# HOW (never keyed on bead status — busy and stuck are indistinguishable from the
+# bookkeeping): a worker with a fresh cheap signal (session last_active OR the
+# pinned bead's work_dir mtime) is ADVANCING. A worker with all cheap signals
+# stale is peeked; its terminal-output hash is compared across ticks — output
+# that MOVES => alive, output FROZEN for MIN_STALE_PEEK_TICKS consecutive ticks
+# => a confirmed corpse. A pool is flagged only when every pinned worker is a
+# confirmed corpse and NO worker is advancing. This peek-diff is what keeps the
+# busy-16-subagent worker (fresh output, stale timestamp) from being paged as
+# dead — the false positive the bead calls "worse than nothing".
+#
+# SURFACE-ONLY: mails the mayor, deduplicated, with a resolved note when it
+# clears. It NEVER resets/kills/re-slings — re-slinging a busy worker
+# manufactures a duplicate convoy (the 2026-07-15 mistake, made twice). A flag
+# is a human triage signal (`gc session peek <worker>`), not an automated action.
+#
+# DETECTION LATENCY (deliberate): a worker must be cheap-stale (STALE_SEC=45m)
+# before it is peeked, then its peek must be frozen across MIN_STALE_PEEK_TICKS
+# ticks. At 10m cadence that is ~45m + ~30m ~= 75m from a worker going quiet to
+# a flag. That couple-of-cycles debounce is the price of never paging on healthy
+# work; the enemy is the four-DAY gap, not minutes. Tune via STALE_SEC /
+# MIN_STALE_PEEK_TICKS if the corpse/live split on a rig proves different.
+#
+# PEEK COST: peeks fire ONLY for suspect workers in candidate-deadlocked pools
+# (no worker cheap-fresh AND >=1 pinned) — a healthy pool needs zero peeks
+# (measured 2026-07-19: full live scan 6s, 0 peeks). MAX_PEEKS caps the fan-out.
+#
+# KNOWN LIMITATION: the city-infra-polecat pool's claims live in the HQ store,
+# not a `gc bd --rig` rig, so it logs "rig-unresolved" and is not assessed. That
+# pool is small and human-watched; the rig pools (where the silent 4-day
+# deadlock happened) are covered. Extending to the HQ store is a follow-up.
+#
+# Undo: delete this file, or rename to pool-liveness-sensor.toml.disabled with a
+# reason in its header. Run by hand:
+#   DRY_RUN=1 /home/ds/gas-city/bin/pool-liveness-sensor    # detect + log only
+#   bash /home/ds/gas-city/bin/pool-liveness-sensor.test    # regression suite
+
+[order]
+description = "Every 10m: detect a worker pool deadlocked on non-advancing claims (every pinned worker a confirmed corpse by peek-diff, none advancing) and mail the mayor. Reads artifacts not bead status; surface-only, never acts; dedup'd with a resolved note. Implements dr-t4w0."
+trigger = "cooldown"
+interval = "10m"
+exec = "/home/ds/gas-city/bin/pool-liveness-sensor"
+timeout = "4m"
+idempotent = true

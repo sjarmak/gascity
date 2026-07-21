@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# stale-attention-reaper: detect open Stephanie-attention beads that have gone
+# STALE (no movement in N days) and flag them to the mayor to re-confirm or
+# close.
+#
+# Why: Stephanie 2026-06-30 — "there were some back from may 12 showing up as
+# 'need me' but I'm sure that work is stale; need an automated way to handle
+# that." The dashboard's "need me" view surfaces open beads needing her; the
+# existing janitors only PRUNE CLOSED beads (bead-prune-reaper) — nothing ages
+# stale-but-OPEN attention. This is that missing attention-aging path.
+#
+# Complements decision-staleness-reaper, which fires on a RESOLVED SUBJECT (a
+# referenced PR merged / source bead closed). This one fires purely on AGE, so
+# it catches the class that never produced a resolved-subject signal — an item
+# that just sat untouched. Same surface (decisions-rig needs/stephanie), same
+# discipline:
+#   - Surface-only (ZFC): the close/keep judgment stays with the mayor (a
+#     model). A stale item may still be genuinely pending — only a read decides.
+#   - Change-dedup'd: an unchanged candidate set is not re-mailed every run.
+#
+# Tunables (env):
+#   STALE_ATTENTION_TTL_DAYS  age threshold in days (default 21)
+#   STALE_ATTENTION_RIG       rig to scan (default decisions)
+#   STALE_ATTENTION_LABEL     required label (default needs/stephanie)
+#   STALE_ATTENTION_MAYOR     mail target (default mayor)
+
+set -uo pipefail
+
+CITY=/home/ds/gas-city
+AUDIT_LOG="$CITY/.gc/stale-attention-reaper.log"
+STATE="$CITY/.gc/stale-attention-reaper.state"
+TTL_DAYS="${STALE_ATTENTION_TTL_DAYS:-21}"
+RIG="${STALE_ATTENTION_RIG:-decisions}"
+LABEL="${STALE_ATTENTION_LABEL:-needs/stephanie}"
+MAYOR="${STALE_ATTENTION_MAYOR:-mayor}"
+
+ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+log() { echo "$(ts) $*" >> "$AUDIT_LOG"; }
+
+now=$(date +%s)
+cutoff=$(( TTL_DAYS * 86400 ))
+
+# Pull open beads carrying the attention label, oldest-touched first. Use
+# updated_at when present (the real signal — last movement), else created_at.
+beads=$(gc bd --rig "$RIG" list --status open --json --limit=0 2>/dev/null | jq -c \
+  --arg lbl "$LABEL" '
+  [ .[] | select((.labels // []) | index($lbl)) ]
+  | sort_by(.updated_at // .created_at)
+  | .[] | {id, title, touched: (.updated_at // .created_at)}' 2>/dev/null)
+
+if [[ -z "$beads" ]]; then
+  log "skip: no open $LABEL beads on rig $RIG"
+  rm -f "$STATE"
+  exit 0
+fi
+
+candidates=""
+count=0
+while IFS= read -r b; do
+  [[ -z "$b" ]] && continue
+  id=$(echo "$b" | jq -r '.id')
+  title=$(echo "$b" | jq -r '.title')
+  touched=$(echo "$b" | jq -r '.touched')
+  [[ -z "$touched" || "$touched" == "null" ]] && continue
+  t_epoch=$(date -d "$touched" +%s 2>/dev/null) || continue
+  age=$(( now - t_epoch ))
+  (( age < cutoff )) && continue
+  days=$(( age / 86400 ))
+  candidates+="- \`${id}\` — ${title} _(stale ${days}d, last touched ${touched:0:10})_\n"
+  count=$(( count + 1 ))
+done <<< "$beads"
+
+if (( count == 0 )); then
+  log "no stale candidates (none older than ${TTL_DAYS}d)"
+  rm -f "$STATE"
+  exit 0
+fi
+
+# Change-dedup: key on the candidate ID set, not the rendered text (the day
+# counters tick every run and would defeat dedup otherwise).
+content_hash=$(printf '%b' "$candidates" | grep -oE '`[^`]+`' | sort | sha256sum | cut -d' ' -f1)
+last_hash=""; [[ -f "$STATE" ]] && last_hash=$(cat "$STATE" 2>/dev/null)
+if [[ "$content_hash" == "$last_hash" ]]; then
+  log "skip: candidate set unchanged ($count stale)"
+  exit 0
+fi
+
+body=$(printf 'Stale-attention candidates — these `%s` items on the `%s` rig have had no movement in over %s days, so they are likely the "need me" backlog Stephanie sees as stale. Re-confirm each still needs her, or `gc bd --rig %s close <id>` the ones that are done.\n\n%b\n_Detected mechanically on AGE only (no movement past the %sd threshold). A stale item may still be genuinely pending — the close/keep judgment is yours._' \
+  "$LABEL" "$RIG" "$TTL_DAYS" "$RIG" "$candidates" "$TTL_DAYS")
+
+if gc mail send "$MAYOR" -s "stale-attention candidates: $count $LABEL item(s) idle >${TTL_DAYS}d" -m "$body" --notify >/dev/null 2>&1; then
+  echo "$content_hash" > "$STATE"
+  log "flagged $count stale candidate(s) to $MAYOR (ttl=${TTL_DAYS}d)"
+else
+  log "ERROR: mail to $MAYOR failed"
+  exit 1
+fi

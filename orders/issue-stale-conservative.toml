@@ -1,0 +1,17 @@
+# issue-stale-conservative — issue-hygiene piece 5 (mayor gc-429253). Open issues
+# idle >90d get status/stale + a maintainer digest. The ONLY auto-close is
+# deterministic — an issue that ALREADY carries a maintainer close-eligible label
+# (not-planned/wontfix/duplicate/invalid). Idle TIME alone NEVER closes a bug.
+# Complements the repo's close-stale-needs Action (14d needs-info close). Excludes
+# status/stale + status/paused. The repo defines no close-eligible labels today, so
+# the auto-close path is dormant — stale-label + digest is the live behavior.
+#
+# LANDED IN DRY-RUN + nudge-mayor: reports stale candidates + digests, writes
+# nothing. Go-live toggle = append `--apply` (adds status/stale; closes ONLY the
+# deterministically-labeled) — a maintainer call.
+[order]
+description = "Weekly (Tue): label open gastownhall/gascity issues idle >90d with status/stale + digest them to mayor; auto-close ONLY issues already carrying a deterministic close-eligible label. Never time-closes a valid bug (dry-run until --apply)."
+trigger = "cron"
+schedule = "0 14 * * 2"
+exec = "/home/ds/gas-city/bin/issue-stale-conservative --apply --nudge-mayor"
+timeout = "5m"

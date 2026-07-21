@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""pool-worktree-provision-check: REPORT-ONLY detector for pool members whose
+base worktree was never `git worktree add`-ed (the gc-dvvym strand class).
+
+Why: this city's pool base worktrees must be PRE-CREATED manually — pre_start
+template substitution is incomplete for city-level rig-scoped pool agents
+(feedback_pre_start_template_substitution / feedback_pool_workdir_template), so
+the reconciler seeds a member's dir (.gc/settings.json/.claude) but never runs
+`git worktree add`. A code bead routed to such a member strands on ENVIRONMENT,
+not judgment (gc-dvvym: polecat-5/6 sat unprovisioned for 2 days). This detector
+catches the next scale-up in minutes instead of days.
+
+Signal (mechanical, ZFC-clean — IO + a `.git` existence check, no judgment): a
+LIVE tmux session on the city socket whose pane CWD is a pool base worktree
+(`<...>/gascity-worktrees/<name>` with no `-<ephemeral-suffix>`) that lacks a
+`.git` entry. Ephemeral per-bead worktrees (`polecat-1-ab3cd`) and dirs without
+a live session are out of scope (the stale-worktree-reaper owns abandoned dirs).
+
+This tool NEVER drains, kills, provisions, or writes into any worktree. It only
+reports + (optionally) nudges the mayor, who owns the drain lever. Provisioning
+is a deliberate drain→`git worktree add`→respawn (gc-dvvym), not an auto-action.
+
+Usage: pool-worktree-provision-check [--json] [--nudge-mayor]
+Env:   POOL_WT_TMUX_SOCKET (default ds-research)
+       POOL_WT_ROOT_RE     (default '/gascity-worktrees/')
+"""
+import sys, os, re, json, time, subprocess
+
+CITY = "/home/ds/gas-city"
+AUDIT_LOG = os.path.join(CITY, ".gc", "pool-worktree-provision-check.log")
+NUDGE_STATE = os.path.join(CITY, ".gc", "pool-worktree-provision-check-nudged.json")
+TMUX_SOCKET = os.environ.get("POOL_WT_TMUX_SOCKET", "ds-research")
+ROOT_RE = os.environ.get("POOL_WT_ROOT_RE", "/gascity-worktrees/")
+# A base pool member dir leaf is exactly "<agent>-<N>" (agent name + numeric slot),
+# e.g. polecat-5 / claude-3. Positive match (not exclude-by-suffix) so every
+# ephemeral form is out of scope regardless of its tail: per-bead hash worktrees
+# (polecat-1-4dni6) AND formula-named ones (polecat-1-adopt-pr, whose "-pr" tail a
+# {5,}-char suffix rule would miss and misflag as a base member).
+BASE_MEMBER_RE = re.compile(r"[a-z][a-z0-9]*-[0-9]+")
+GC_ID_RE = re.compile(r"(gc-[a-z0-9]+)")
+GC_ID_RE = re.compile(r"(gc-[a-z0-9]+)")
+
+
+def tmux_panes():
+    """[(tmux_session, pane_cwd)] for every session on the city socket. Empty on
+    any tmux error (fail-safe: nothing to flag rather than a false alarm)."""
+    try:
+        out = subprocess.run(
+            ["tmux", "-L", TMUX_SOCKET, "list-sessions",
+             "-F", "#{session_name}\t#{pane_current_path}"],
+            capture_output=True, text=True, timeout=30).stdout
+    except (subprocess.SubprocessError, OSError):
+        return []
+    panes = []
+    for line in out.splitlines():
+        if "\t" in line:
+            name, path = line.split("\t", 1)
+            panes.append((name.strip(), path.strip()))
+    return panes
+
+
+def is_base_pool_worktree(path):
+    """True iff path is a pool BASE worktree dir under the worktrees root and is
+    not an ephemeral per-bead worktree."""
+    if ROOT_RE not in path:
+        return False
+    leaf = path.rstrip("/").rsplit("/", 1)[-1]
+    return BASE_MEMBER_RE.fullmatch(leaf) is not None
+
+
+def main():
+    json_out = "--json" in sys.argv
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    flagged = []
+    checked = 0
+    for name, path in tmux_panes():
+        if not is_base_pool_worktree(path):
+            continue
+        checked += 1
+        # Provisioned iff a .git entry exists (file for a worktree, dir for a
+        # primary clone). Missing => seeded-but-never-worktree-added.
+        if os.path.exists(os.path.join(path, ".git")):
+            continue
+        m = GC_ID_RE.search(name)
+        flagged.append({
+            "tmux_session": name,
+            "gc_id": m.group(1) if m else None,
+            "path": path,
+            "has_git": False,
+        })
+
+    flagged.sort(key=lambda r: r["path"])
+    audit = {"ts": now, "base_worktrees_checked": checked, "unprovisioned": len(flagged)}
+    try:
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps({**audit, "flagged": flagged}) + "\n")
+    except OSError:
+        pass
+
+    # Dedup: only nudge when the unprovisioned SET changes vs the last nudge, so a
+    # standing-but-known strand (already surfaced) doesn't re-mail every tick, while
+    # a NEW member stranding on a future scale-up alerts promptly. State = sorted ids.
+    cur_ids = sorted(r["gc_id"] or r["path"] for r in flagged)
+    try:
+        prev_ids = json.load(open(NUDGE_STATE)).get("ids", []) if os.path.exists(NUDGE_STATE) else []
+    except (OSError, ValueError):
+        prev_ids = []
+    set_changed = cur_ids != prev_ids
+
+    if "--nudge-mayor" in sys.argv and flagged and set_changed:
+        lines = [f"pool-worktree-provision-check: {len(flagged)} LIVE pool "
+                 f"member(s) on an UNPROVISIONED base worktree (no .git — code "
+                 f"beads routed there strand on env, gc-dvvym class):"]
+        for r in flagged:
+            lines.append(f"  {r['gc_id'] or r['tmux_session']}  {r['path']}")
+        lines.append("Fix = drain the member(s) → `git worktree add` the base → "
+                     "respawn (REPORT-ONLY; not auto-provisioned). Log: " + AUDIT_LOG)
+        try:
+            subprocess.run(["gc", "mail", "send", "mayor",
+                            "-s", f"pool-worktree-provision-check: {len(flagged)} unprovisioned pool member(s)",
+                            "-m", "\n".join(lines)], timeout=30, capture_output=True)
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+    # Persist the observed set under the nudging order so the next run can dedup
+    # (write only when --nudge-mayor drives the order, so an ad-hoc CLI run with
+    # no flag never advances the dedup state and masks a real future alert).
+    if "--nudge-mayor" in sys.argv:
+        try:
+            with open(NUDGE_STATE, "w") as f:
+                json.dump({"ts": now, "ids": cur_ids}, f)
+        except OSError:
+            pass
+
+    if json_out:
+        print(json.dumps({"summary": audit, "flagged": flagged}, indent=2))
+        return 0
+
+    print(f"pool-worktree-provision-check (REPORT-ONLY)  {now}")
+    print(f"base pool worktrees checked={checked}  unprovisioned={len(flagged)}")
+    for r in flagged:
+        print(f"  UNPROVISIONED  {r['gc_id'] or '?':<12}  {r['path']}")
+    if not flagged and checked:
+        print("  all live pool base worktrees have .git — clean")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

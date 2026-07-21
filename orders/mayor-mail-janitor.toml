@@ -1,0 +1,6 @@
+[order]
+description = "Daily 04:00 EDT: archive mayor-addressed message beads older than 7 days. Mayor accumulates hundreds of [redirect] copies + agent status reports + handoff notes that don't need post-read action; without a janitor, the inbox grows unbounded (488 → 0 sweep on 2026-05-20). Separate from bead-janitor.toml, which targets formula-scaffolding (molecule/convoy)."
+trigger = "cron"
+schedule = "0 4 * * *"
+exec = "/home/ds/gas-city/bin/mayor-mail-janitor"
+timeout = "5m"

@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Write a bounded daily JSON storage inventory for the Gas City fleet.
+
+Reports root/NAS capacity and inodes, bd telemetry allocation, registered git
+worktrees by rig, conservative clean+merged+stale worktree potential, and
+generated dependency/build directory totals. This scanner is read-only except
+for appending its JSONL audit record.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import time
+from typing import Iterable
+
+CITY = Path("/home/ds/gas-city")
+AUDIT_LOG = CITY / ".gc/storage-ledger.log"
+TELEMETRY = Path("/home/ds/.beads/eventsData")
+NAS = Path("/mnt")
+GENERATED_NAMES = {"node_modules", ".venv", "target", ".next", "dist", "build"}
+SKIP_NAMES = {".git", ".jj", ".cache", ".beads"}
+MEASUREMENT_ERRORS: list[dict] = []
+
+
+def run(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, text=True, capture_output=True, timeout=timeout, check=False)
+
+
+def fs_stats(path: Path) -> dict:
+    try:
+        st = os.statvfs(path)
+    except OSError as exc:
+        return {"path": str(path), "available": False, "error": str(exc)}
+    inode_used = st.f_files - st.f_ffree
+    return {
+        "path": str(path), "available": True,
+        "total_bytes": st.f_blocks * st.f_frsize,
+        "free_bytes": st.f_bavail * st.f_frsize,
+        "used_pct": round(100 * (st.f_blocks - st.f_bfree) / st.f_blocks, 1) if st.f_blocks else 0,
+        "inode_used": inode_used,
+        "inode_used_pct": round(100 * inode_used / st.f_files, 1) if st.f_files else 0,
+    }
+
+
+def allocated_bytes(path: Path, timeout: int = 60) -> int:
+    if not path.exists():
+        return 0
+    try:
+        cp = run(["du", "-sk", "--", str(path)], timeout)
+        if cp.returncode == 0:
+            return int(cp.stdout.split()[0]) * 1024
+        MEASUREMENT_ERRORS.append({"probe": "du", "path": str(path), "returncode": cp.returncode})
+        return 0
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
+        MEASUREMENT_ERRORS.append({"probe": "du", "path": str(path), "error": str(exc)})
+        return 0
+
+
+def parse_worktree_paths(porcelain: str) -> list[Path]:
+    return [Path(line[len("worktree "):]) for line in porcelain.splitlines()
+            if line.startswith("worktree ")]
+
+
+def default_branch(repo: Path) -> str | None:
+    cp = run(["git", "-C", str(repo), "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
+    if cp.returncode == 0 and cp.stdout.strip():
+        return cp.stdout.strip().rsplit("/", 1)[-1]
+    for name in ("main", "master"):
+        if run(["git", "-C", str(repo), "show-ref", "--verify", "--quiet",
+               f"refs/heads/{name}"]).returncode == 0:
+            return name
+    return None
+
+
+def conservative_stale_merged(wt: Path, primary: Path, branch: str | None,
+                              cutoff: int) -> bool:
+    """Informational potential only; the reaper performs stronger live gates."""
+    if wt == primary or not branch:
+        return False
+    status = run(["git", "-C", str(wt), "status", "--porcelain"])
+    if status.returncode != 0 or status.stdout.strip():
+        return False
+    epoch = run(["git", "-C", str(wt), "log", "-1", "--format=%ct", "HEAD"])
+    if epoch.returncode != 0 or not epoch.stdout.strip().isdigit() or int(epoch.stdout) >= cutoff:
+        return False
+    tip = run(["git", "-C", str(primary), "rev-parse", branch])
+    default = default_branch(primary)
+    return bool(default and tip.returncode == 0 and
+                run(["git", "-C", str(primary), "merge-base", "--is-ancestor",
+                     tip.stdout.strip(), default]).returncode == 0)
+
+
+def discover_generated(roots: Iterable[Path]) -> list[Path]:
+    found: list[Path] = []
+    seen: set[str] = set()
+    roots = list(roots)
+    root_keys = {str(root.resolve(strict=False)) for root in roots}
+    for root in roots:
+        key = str(root.resolve(strict=False))
+        if key in seen or not root.is_dir():
+            continue
+        seen.add(key)
+        for current, dirs, _files in os.walk(root, topdown=True, followlinks=False):
+            keep = []
+            for name in dirs:
+                child = Path(current) / name
+                child_key = str(child.resolve(strict=False))
+                if child_key in root_keys and child_key != key:
+                    # A nested registered worktree is scanned as its own root.
+                    continue
+                if name in GENERATED_NAMES:
+                    found.append(child)
+                elif name not in SKIP_NAMES:
+                    keep.append(name)
+            dirs[:] = keep
+    return found
+
+
+def load_previous(path: Path) -> dict | None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        return json.loads(lines[-1]) if lines else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def collect(rig_data: dict, now: int | None = None) -> dict:
+    MEASUREMENT_ERRORS.clear()
+    now = now or int(time.time())
+    worktrees: list[dict] = []
+    scan_roots: list[Path] = []
+    rig_totals: dict[str, int] = {}
+    potential = 0
+    for rig in rig_data.get("rigs", []):
+        if rig.get("hq"):
+            continue
+        primary = Path(rig["path"])
+        cp = run(["git", "-C", str(primary), "worktree", "list", "--porcelain"], 30)
+        if cp.returncode != 0:
+            MEASUREMENT_ERRORS.append({"probe": "git-worktree-list", "rig": rig.get("name"),
+                                       "path": str(primary), "returncode": cp.returncode})
+            continue
+        branch_by_path: dict[Path, str | None] = {}
+        current: Path | None = None
+        for line in cp.stdout.splitlines():
+            if line.startswith("worktree "):
+                current = Path(line[len("worktree "):])
+                branch_by_path[current] = None
+            elif current and line.startswith("branch refs/heads/"):
+                branch_by_path[current] = line[len("branch refs/heads/"):]
+        for wt, branch in branch_by_path.items():
+            stale = conservative_stale_merged(wt, primary, branch, now - 3 * 86400)
+            worktrees.append({"rig": rig["name"], "path": str(wt),
+                              "allocated_subtree_bytes": allocated_bytes(wt),
+                              "branch": branch, "clean_merged_stale": stale})
+            scan_roots.append(wt)
+    # A common layout nests linked worktree directories beneath the primary
+    # checkout. `du` on the primary includes those children, so subtract each
+    # immediate registered descendant to report mutually exclusive bytes.
+    by_path = {Path(item["path"]): item for item in worktrees}
+    for path, item in by_path.items():
+        descendants = []
+        for other in by_path:
+            if other == path:
+                continue
+            try:
+                other.relative_to(path)
+            except ValueError:
+                continue
+            # Only subtract nearest registered descendants; their subtree size
+            # already includes any worktrees nested below them.
+            between = False
+            for candidate in by_path:
+                if candidate in (path, other):
+                    continue
+                try:
+                    candidate.relative_to(path)
+                    other.relative_to(candidate)
+                    between = True
+                    break
+                except ValueError:
+                    pass
+            if not between:
+                descendants.append(other)
+        exclusive = item["allocated_subtree_bytes"] - sum(
+            by_path[child]["allocated_subtree_bytes"] for child in descendants)
+        item["bytes"] = max(0, exclusive)
+        rig = item["rig"]
+        rig_totals[rig] = rig_totals.get(rig, 0) + item["bytes"]
+        potential += item["bytes"] if item["clean_merged_stale"] else 0
+    generated = discover_generated(scan_roots)
+    generated_totals = {name: 0 for name in sorted(GENERATED_NAMES)}
+    for path in generated:
+        generated_totals[path.name] += allocated_bytes(path)
+    worktrees.sort(key=lambda item: item["bytes"], reverse=True)
+    return {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "root": fs_stats(Path("/")), "nas": fs_stats(NAS),
+        "telemetry_bytes": allocated_bytes(TELEMETRY),
+        "worktree_total_bytes": sum(item["bytes"] for item in worktrees),
+        "clean_merged_stale_potential_bytes": potential,
+        "worktree_bytes_by_rig": dict(sorted(rig_totals.items(), key=lambda item: item[1], reverse=True)),
+        "largest_worktrees": worktrees[:25],
+        "generated_bytes_by_kind": generated_totals,
+        "generated_total_bytes": sum(generated_totals.values()),
+        "generated_directory_count": len(generated),
+        "complete": not MEASUREMENT_ERRORS,
+        "errors": list(MEASUREMENT_ERRORS),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--audit-log", type=Path, default=AUDIT_LOG)
+    args = parser.parse_args()
+    cp = run(["gc", "rig", "list", "--json"], 30)
+    if cp.returncode != 0:
+        print("storage-ledger: gc rig list --json failed", file=os.sys.stderr)
+        return 1
+    report = collect(json.loads(cp.stdout))
+    previous = load_previous(args.audit_log)
+    if previous and previous.get("complete") and report["complete"]:
+        report["delta"] = {
+            "root_free_bytes": report["root"].get("free_bytes", 0) - previous.get("root", {}).get("free_bytes", 0),
+            "worktree_total_bytes": report["worktree_total_bytes"] - previous.get("worktree_total_bytes", 0),
+            "generated_total_bytes": report["generated_total_bytes"] - previous.get("generated_total_bytes", 0),
+        }
+    args.audit_log.parent.mkdir(parents=True, exist_ok=True)
+    with args.audit_log.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(report, sort_keys=True) + "\n")
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        gib = 1024 ** 3
+        print(f"storage-ledger: root-free={report['root'].get('free_bytes', 0)/gib:.1f}GiB "
+              f"inodes={report['root'].get('inode_used_pct', 0):.1f}% "
+              f"worktrees={report['worktree_total_bytes']/gib:.1f}GiB "
+              f"stale-potential={report['clean_merged_stale_potential_bytes']/gib:.1f}GiB "
+              f"generated={report['generated_total_bytes']/gib:.1f}GiB")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

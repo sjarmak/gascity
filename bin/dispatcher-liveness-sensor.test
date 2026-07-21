@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+TRACE_DIR="$WORK/runtime"
+SESSIONS="$WORK/sessions.json"
+STATE="$WORK/state.json"
+mkdir -p "$TRACE_DIR"
+
+run_sensor() {
+  DISPATCHER_LIVENESS_TRACE_DIR="$TRACE_DIR" \
+  DISPATCHER_LIVENESS_SESSIONS="$SESSIONS" \
+  DISPATCHER_LIVENESS_STATE="$STATE" \
+    "$HERE/dispatcher-liveness-sensor" --json
+}
+
+# Each active dispatcher has one canonical target/session and one exact trace.
+cat > "$SESSIONS" <<'JSON'
+{"sessions":[
+  {"id":"gc-root","alias":"core.control-dispatcher","state":"active"},
+  {"id":"gc-aoa","alias":"aoa/core.control-dispatcher","state":"active"},
+  {"id":"gc-mem","alias":"mem/core.control-dispatcher","state":"active"},
+  {"id":"gc-worker","alias":"mem/worker","state":"active"},
+  {"id":"gc-closed","alias":"old/core.control-dispatcher","state":"closed"}
+]}
+JSON
+
+now="$(date -u +%Y-%m-%dT%H:%M:%S.000000000Z)"
+old="$(date -u -d '20 minutes ago' +%Y-%m-%dT%H:%M:%S.000000000Z)"
+printf '%s serve wait agent=core.control-dispatcher\n' "$now" > "$TRACE_DIR/core.control-dispatcher-trace.log"
+printf '%s serve wait agent=aoa/core.control-dispatcher\n' "$now" > "$TRACE_DIR/aoa--core.control-dispatcher-trace.log"
+printf '%s serve wait agent=mem/core.control-dispatcher\n' "$old" > "$TRACE_DIR/mem--core.control-dispatcher-trace.log"
+
+# One genuinely stopped dispatcher alerts with exact target, session, and path;
+# fresh peers remain independently attributable. Non-dispatcher/closed sessions
+# do not enter the target set.
+for _ in 1 2 3 4 5; do
+  printf '%s connect agent=mem/core.control-dispatcher address=127.0.0.1:0\n' "$old"
+done > "$TRACE_DIR/mem--core.control-dispatcher-trace.log"
+out=$(run_sensor)
+jq -e --arg trace "$TRACE_DIR/mem--core.control-dispatcher-trace.log" \
+  '.ok == true and (.targets | length) == 3
+   and any(.targets[]; .target == "mem/core.control-dispatcher"
+       and .session_id == "gc-mem" and .trace == $trace and .status == "stale" and .port0 == 0)
+   and any(.alerts[]; .[0] == "silent_hang:gc-mem"
+       and (.[1] | contains("mem/core.control-dispatcher") and contains("gc-mem")))' \
+  <<<"$out" >/dev/null
+# A non-nudging JSON inspection must not consume the delivery cooldown.
+jq -e 'has("silent_hang:gc-mem") | not' "$STATE" >/dev/null
+
+# A bounded all-dispatcher overload gap that later resumes is green: newest
+# target-specific heartbeats win, and there is no arbitrary kill recommendation.
+for target in core.control-dispatcher aoa/core.control-dispatcher mem/core.control-dispatcher; do
+  file="${target//\//--}-trace.log"
+  printf '%s serve wait agent=%s\n%s serve wait agent=%s\n' \
+    "$old" "$target" "$now" "$target" > "$TRACE_DIR/$file"
+done
+out=$(run_sensor)
+jq -e '.ok == true and (.alerts | length) == 0
+       and all(.targets[]; .status == "ok" and .newest_age_min < 1)' \
+  <<<"$out" >/dev/null
+
+# Two simultaneously stale dispatchers are classified as a shared stall with
+# exact evidence and an explicit no-arbitrary-kill recommendation.
+printf '%s serve wait agent=aoa/core.control-dispatcher\n' "$old" > "$TRACE_DIR/aoa--core.control-dispatcher-trace.log"
+printf '%s serve wait agent=mem/core.control-dispatcher\n' "$old" > "$TRACE_DIR/mem--core.control-dispatcher-trace.log"
+out=$(run_sensor)
+jq -e 'any(.alerts[]; .[0] == "shared_stall:gc-aoa,gc-mem"
+       and (.[1] | contains("aoa/core.control-dispatcher")
+           and contains("mem/core.control-dispatcher")
+           and contains("do not kill an arbitrary dispatcher")))
+       and all(.alerts[]; .[0] != "silent_hang:gc-aoa" and .[0] != "silent_hang:gc-mem")' \
+  <<<"$out" >/dev/null
+
+# Malformed and out-of-window port-0 lines cannot manufacture a wedge.
+printf '%s serve wait agent=aoa/core.control-dispatcher\n' "$now" > "$TRACE_DIR/aoa--core.control-dispatcher-trace.log"
+printf '%s serve wait agent=mem/core.control-dispatcher\n' "$now" > "$TRACE_DIR/mem--core.control-dispatcher-trace.log"
+{
+  printf '%s serve wait agent=core.control-dispatcher\n' "$now"
+  for _ in 1 2 3 4 5; do printf 'not-a-timestamp connect 127.0.0.1:0\n'; done
+  printf '%s connect 127.0.0.1:0\n' "$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%S.000000000Z)"
+} > "$TRACE_DIR/core.control-dispatcher-trace.log"
+out=$(run_sensor)
+jq -e '.ok == true and (.alerts | length) == 0
+       and any(.targets[]; .target == "core.control-dispatcher" and .port0 == 0)' \
+  <<<"$out" >/dev/null
+
+# Current unattributed lines cannot borrow a stale identity to prove health or
+# manufacture a current wedge.
+{
+  printf '%s serve wait agent=core.control-dispatcher\n' "$old"
+  for _ in 1 2 3 4 5; do printf '%s connect 127.0.0.1:0\n' "$now"; done
+} > "$TRACE_DIR/core.control-dispatcher-trace.log"
+out=$(run_sensor)
+jq -e '.ok == true
+       and any(.targets[]; .target == "core.control-dispatcher"
+           and .status == "stale" and .port0 == 0)
+       and any(.alerts[]; .[0] == "silent_hang:gc-root")
+       and all(.alerts[]; .[0] != "port0_wedge:gc-root")' <<<"$out" >/dev/null
+
+# Current port-0 evidence carrying the exact target identity is attributable.
+for _ in 1 2 3 4 5; do
+  printf '%s connect agent=core.control-dispatcher address=127.0.0.1:0\n' "$now"
+done > "$TRACE_DIR/core.control-dispatcher-trace.log"
+out=$(run_sensor)
+jq -e '.ok == true
+       and any(.targets[]; .target == "core.control-dispatcher"
+           and .status == "ok" and .port0 == 5)
+       and any(.alerts[]; .[0] == "port0_wedge:gc-root")' <<<"$out" >/dev/null
+
+# A malformed line cannot establish identity over valid contrary evidence.
+{
+  printf '%s serve wait agent=other/core.control-dispatcher\n' "$now"
+  printf 'not-a-timestamp serve wait agent=core.control-dispatcher\n'
+} > "$TRACE_DIR/core.control-dispatcher-trace.log"
+out=$(run_sensor)
+jq -e '.ok == false and (.alerts | length) == 0
+       and any(.targets[]; .target == "core.control-dispatcher"
+           and (.error | contains("identity mismatch")))' <<<"$out" >/dev/null
+
+# Even a near-future heartbeat is malformed evidence, not proof of health.
+future="$(date -u -d '30 seconds' +%Y-%m-%dT%H:%M:%S.000000000Z)"
+printf '%s serve wait agent=core.control-dispatcher\n' "$future" > "$TRACE_DIR/core.control-dispatcher-trace.log"
+out=$(run_sensor)
+jq -e '.ok == false and (.alerts | length) == 0
+       and any(.targets[]; .target == "core.control-dispatcher"
+           and (.error | contains("in the future")))' \
+  <<<"$out" >/dev/null
+
+# Timestamp-like garbage is not valid heartbeat evidence.
+printf '%s.garbage serve wait agent=core.control-dispatcher\n' "$now" > "$TRACE_DIR/core.control-dispatcher-trace.log"
+out=$(run_sensor)
+jq -e '.ok == false and (.alerts | length) == 0
+       and any(.targets[]; .target == "core.control-dispatcher"
+           and .error == "trace has no valid timestamp")' \
+  <<<"$out" >/dev/null
+
+# Failed mail and non-nudging runs preserve cooldown eligibility; only a
+# successful delivery records the exact alert key.
+printf '%s serve wait agent=core.control-dispatcher\n' "$now" > "$TRACE_DIR/core.control-dispatcher-trace.log"
+printf '%s serve wait agent=mem/core.control-dispatcher\n' "$old" > "$TRACE_DIR/mem--core.control-dispatcher-trace.log"
+# Structurally malformed but syntactically valid state must fail safe rather
+# than crashing the order; it is normalized to an empty object.
+printf '[]\n' > "$STATE"
+mkdir -p "$WORK/failbin" "$WORK/passbin"
+printf '#!/usr/bin/env sh\nexit 1\n' > "$WORK/failbin/gc"
+printf '#!/usr/bin/env sh\nexit 0\n' > "$WORK/passbin/gc"
+chmod +x "$WORK/failbin/gc" "$WORK/passbin/gc"
+PATH="$WORK/failbin:$PATH" DISPATCHER_LIVENESS_TRACE_DIR="$TRACE_DIR" \
+  DISPATCHER_LIVENESS_SESSIONS="$SESSIONS" DISPATCHER_LIVENESS_STATE="$STATE" \
+  "$HERE/dispatcher-liveness-sensor" --json --nudge-mayor >/dev/null
+jq -e 'has("silent_hang:gc-mem") | not' "$STATE" >/dev/null
+PATH="$WORK/passbin:$PATH" DISPATCHER_LIVENESS_TRACE_DIR="$TRACE_DIR" \
+  DISPATCHER_LIVENESS_SESSIONS="$SESSIONS" DISPATCHER_LIVENESS_STATE="$STATE" \
+  "$HERE/dispatcher-liveness-sensor" --json --nudge-mayor >/dev/null
+jq -e 'has("silent_hang:gc-mem")' "$STATE" >/dev/null
+
+# Missing/malformed target evidence fails safe: report the exact target error,
+# emit no recovery alert, and never guess another dispatcher.
+rm "$TRACE_DIR/aoa--core.control-dispatcher-trace.log"
+printf '%s serve wait agent=some-other-dispatcher\n' "$now" > "$TRACE_DIR/mem--core.control-dispatcher-trace.log"
+out=$(run_sensor)
+jq -e '.ok == false and (.alerts | length) == 0
+       and any(.targets[]; .target == "aoa/core.control-dispatcher" and .status == "error")
+       and any(.targets[]; .target == "mem/core.control-dispatcher" and .status == "error")' \
+  <<<"$out" >/dev/null
+
+# A canonical dispatcher with a non-string session ID fails the census closed
+# without reaching shared-stall key construction.
+cat > "$SESSIONS" <<'JSON'
+{"sessions":[
+  {"id":{"bad":"id"},"alias":"core.control-dispatcher","state":"active"},
+  {"id":"gc-mem","alias":"mem/core.control-dispatcher","state":"active"}
+]}
+JSON
+out=$(run_sensor)
+jq -e '.ok == false and (.alerts | length) == 0
+       and (.reason | contains("missing or invalid alias/id"))' <<<"$out" >/dev/null
+
+echo "PASS: dispatcher-liveness attributes exact targets and fails safe under shared stalls"

@@ -1,0 +1,14 @@
+idle_timeout = "1h"
+max_active_sessions = 1
+min_active_sessions = 0
+prompt_template = "prompts/dedicated-project-lead.template.md"
+provider = "amp-medium"
+suspended = true
+wake_mode = "resume"
+work_dir = "/home/ds/projects/background-agents"
+
+[env]
+  GC_BEADS = "bd"
+  GC_CITY = "/home/ds/gas-city"
+  GC_RIG = "background-agents"
+  GC_RIG_ROOT = "/home/ds/projects/background-agents"

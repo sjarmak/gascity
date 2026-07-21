@@ -1,0 +1,7 @@
+scope = "city"
+# 2026-07-18 per Stephanie: project leads run through Amp's medium profile.
+# Revert from the sibling pre-migration snapshot if binding or resume regresses.
+provider = "amp-medium"
+max_active_sessions = 1
+idle_timeout = "1h"
+default_sling_formula = "mol-do-work"

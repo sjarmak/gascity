@@ -1,0 +1,24 @@
+# skills.toml — gascity polecat
+#
+# INFORMATIONAL ALLOWLIST for v1.5. See agents/gascity-maintenance-pl/
+# skills.toml for the convention rationale.
+#
+# Tracked in dr-45le2r.
+
+skills = [
+    "focus",              # one-task-at-a-time inside each step
+    "diverge-prototype",  # for mol-take-all-paths (gpk-g5d, future)
+    "premortem",          # pre-PR-open failure forecasting
+    "brainstorm",         # issue scoping
+    "scaffold",           # build-order planning
+    "bisect",             # root-cause loops on PR diffs
+    "stress-test",        # adversarial review pass
+    "tdd-workflow",       # test-first for any new code
+    "verification-loop",  # quality gate before close
+    "strategic-compact",  # session hygiene
+    "security-review",    # PR safety
+    "code-review",        # peer review on PR diffs
+    "simplify",           # already used by mol-adopt-pr workflow
+    "review-pr",          # multi-model review
+    "de-slopify",         # writeup polish
+]

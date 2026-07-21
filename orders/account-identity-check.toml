@@ -1,0 +1,14 @@
+# account-identity-check — fast read-only OAuth-identity guard (dr-qfw layer #2,
+# mayor gc-470459). The heavy 6h refresh (claude-refresh-all) already runs the
+# same identity assertion, but a wrong-twin /ds-cred push can wedge up to 6h
+# before that cron fires — this closes the window to ~12m. Read-only: asserts
+# each slot's oauthAccount.emailAddress + access-token-sha against the shared
+# SSOT map (~/.gc/account-identity.map); mails mayor with the exact re-cred
+# instruction on any cross/duplicate, cooldown-deduped. No writes, no refresh.
+[order]
+description = "Every 12m: assert the 5 Claude slots' OAuth identities (email + token-sha) against the shared SSOT map; mail mayor the exact re-cred instruction on any identity-cross or duplicate. Fast-detection layer so a wrong-twin /ds-cred push is caught in minutes, not up to 6h (the account1->gibsonsteph42 cross that reached Stephanie first). Read-only; writes only the cross-signal file consumed by the blast-radius drain."
+trigger = "cooldown"
+interval = "12m"
+exec = "/home/ds/gas-city/bin/account-identity-check"
+timeout = "60s"
+idempotent = true

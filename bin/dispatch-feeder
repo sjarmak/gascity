@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# dispatch-feeder: mechanical pool-feeder (bead dr-b8y). Every run, for each
+# configured rig with mode != disabled (and not held), sling the top-K ready +
+# unassigned + unrouted + non-structural beads straight to the rig's worker
+# pool. PL-churn-proof: it targets the pool, never a project-lead session.
+#
+# This complements dispatch-patrol: patrol NUDGES a rig's PL to route backlog
+# (and depends on a live PL); this feeder routes mechanically when no PL is
+# doing it. Modes are per-rig in .gc/dispatch-feeder.yaml; a rig in
+# .gc/dispatch-holds.yaml is never fed (logged as held_skip).
+#
+# Config: /home/ds/gas-city/.gc/dispatch-feeder.yaml
+# Holds:  /home/ds/gas-city/.gc/dispatch-holds.yaml
+# Audit:  /home/ds/gas-city/.gc/dispatch-feeder.log (JSONL)
+#
+# Usage:
+#   dispatch-feeder                 # honor per-rig modes from config
+#   dispatch-feeder --force-dry-run # treat every rig as dry_run (safe manual run)
+#   dispatch-feeder --rig NAME      # restrict to one rig (repeatable)
+#   dispatch-feeder --nudge-mayor   # mail mayor a summary if anything slung/failed
+#
+# SHIP STATE: the order (orders/dispatch-feeder.toml.disabled) is DISABLED and
+# both pilot rigs are dry_run. See .gc/dispatch-feeder.yaml for the rollout.
+
+set -euo pipefail
+
+CITY="${GC_CITY_ROOT:-/home/ds/gas-city}"
+DISPATCHABILITY_DIR="${DISPATCHABILITY_DIR:-$CITY/bin}"
+CONFIG="${DISPATCH_FEEDER_CONFIG:-/home/ds/gas-city/.gc/dispatch-feeder.yaml}"
+HOLDS="${DISPATCH_FEEDER_HOLDS:-/home/ds/gas-city/.gc/dispatch-holds.yaml}"
+AUDIT_LOG="${DISPATCH_FEEDER_AUDIT_LOG:-/home/ds/gas-city/.gc/dispatch-feeder.log}"
+
+FORCE_DRY=0
+NUDGE_MAYOR=0
+RIG_FILTER=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force-dry-run) FORCE_DRY=1; shift ;;
+    --nudge-mayor)   NUDGE_MAYOR=1; shift ;;
+    --rig)           RIG_FILTER+=("$2"); shift 2 ;;
+    --config)        CONFIG="$2"; shift 2 ;;
+    --holds)         HOLDS="$2"; shift 2 ;;
+    -h|--help)       sed -n 's/^# \{0,1\}//p' "$0" | head -28; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ -r "$CONFIG" ]] || { echo "dispatch-feeder: config not readable: $CONFIG" >&2; exit 2; }
+mkdir -p "$(dirname "$AUDIT_LOG")"
+
+CONFIG_JSON=$(python3 -c '
+import json, sys, yaml
+with open(sys.argv[1], "rb") as f: print(json.dumps(yaml.safe_load(f) or {}))
+' "$CONFIG")
+
+HOLDS_JSON='{"holds":[]}'
+if [[ -r "$HOLDS" ]]; then
+  HOLDS_JSON=$(python3 -c '
+import json, sys, yaml
+with open(sys.argv[1], "rb") as f: print(json.dumps(yaml.safe_load(f) or {"holds":[]}))
+' "$HOLDS")
+fi
+
+kill_switch=$(jq -r '.kill_switch // false' <<<"$CONFIG_JSON")
+default_k=$(jq -r '.default_k // 3' <<<"$CONFIG_JSON")
+
+is_held() {
+  local rig=$1
+  jq -e --arg r "$rig" '(.holds // [])[] | select(.rig == $r)' <<<"$HOLDS_JSON" >/dev/null 2>&1
+}
+
+log_event() {
+  # log_event <event> <rig> <bead> <extra-json>
+  local event=$1 rig=$2 bead=$3 extra=${4:-'{}'} ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  jq -cn --arg ts "$ts" --arg event "$event" --arg rig "$rig" --arg bead "$bead" \
+         --argjson extra "$extra" \
+    '{ts:$ts, event:$event, rig:$rig, bead:$bead} + $extra' >> "$AUDIT_LOG"
+}
+
+# Emit ONE summary line per rig per cycle: how many ready beads were considered
+# and why each was dropped. dr-5dy (Stephanie 2026-07-15).
+#
+# Every filter in this script is a silent drop — select_candidates() discards
+# beads inside a jq select() with no record, so "why isn't my bead moving?" is
+# unanswerable from the log. This makes exclusion observable.
+#
+# Deliberately a SUMMARY, not a per-bead log: under the fail-closed rule ~465
+# undeclared beads x 48 cycles/day = ~22k events/day. The existing dry-run log
+# already proves that failure mode — 372 events collapse to 19 distinct beads,
+# because dry_run never stamps routed_to so the same top-K re-selects forever.
+# Per-bead "why" is bin/bd-why's job, on demand.
+#
+# NOTE: the `excluded` sub-counts OVERLAP and are NOT a partition — one bead can
+# be both assigned and structural. They will not sum to
+# (ready_total - dispatchable). `dispatchable` imports the exact predicate used
+# by selection and dispatch-patrol
+# (dr-zkmc, 2026-07-18). Remove the import only after an upstream API owns the
+# predicate and all three consumers migrate together.
+summarize_rig() {
+  local rig=$1 k=$2 selected=$3
+  local counts
+  counts=$(gc bd --rig "$rig" ready --json --limit=0 2>/dev/null \
+    | jq -L "$DISPATCHABILITY_DIR" -c 'include "dispatchability"; {
+        ready_total: length,
+        excluded: {
+          assigned:    [ .[] | select((.assignee // "") != "") ] | length,
+          routed:      [ .[] | select((.metadata."gc.routed_to" // "") != "") ] | length,
+          structural:  [ .[] | select(dispatch_structural) ] | length,
+          label_gated: [ .[] | select(has_dispatch_gate) ] | length,
+          branch_ready:[ .[] | select((.metadata."gc.outcome" // "") == "branch-ready") ] | length
+        },
+        dispatchable: [ .[] | select(scheduler_dispatchable) ] | length
+      }' 2>/dev/null || true)
+  [[ -z "$counts" ]] && return 0
+  log_event "cycle_summary" "$rig" "" \
+    "$(jq -cn --argjson c "$counts" --argjson k "$k" --argjson sel "$selected" \
+        '$c + {k_limit:$k, selected:$sel}')"
+}
+
+would_sling=()   # rig|bead|target
+slung=()         # rig|bead|target
+failed=()        # rig|bead|target
+held=()          # rig|reason
+
+# Select top-K scheduler-dispatchable beads from the dependency-ready set.
+# The imported predicate is shared with summarize_rig() and dispatch-patrol;
+# dependency-ready and scheduler-dispatchable are intentionally distinct.
+# Sorted by priority (asc) then created_at (asc, oldest first).
+select_candidates() {
+  local rig=$1 k=$2
+  gc bd --rig "$rig" ready --json --limit=0 2>/dev/null \
+    | jq -L "$DISPATCHABILITY_DIR" -r --argjson k "$k" 'include "dispatchability";
+        [ .[] | select(scheduler_dispatchable) ]
+        | sort_by([(.priority // 99), (.created_at // "")])
+        | .[:$k] | .[].id' 2>/dev/null || true
+}
+
+process_rig() {
+  local rig=$1 target=$2 mode=$3 k=$4
+
+  if is_held "$rig"; then
+    local reason
+    reason=$(jq -r --arg r "$rig" '(.holds // [])[] | select(.rig == $r) | .reason' <<<"$HOLDS_JSON" | head -1)
+    held+=("$rig|$reason")
+    log_event "held_skip" "$rig" "" "$(jq -cn --arg m "$mode" '{configured_mode:$m}')"
+    return 0
+  fi
+
+  # --force-dry-run downgrades live to dry_run for a safe manual invocation.
+  (( FORCE_DRY )) && mode="dry_run"
+
+  if [[ "$mode" != "dry_run" && "$mode" != "live" ]]; then
+    return 0   # disabled / unknown
+  fi
+
+  if [[ "$mode" == "live" && ( -z "$target" || "$target" == "null" ) ]]; then
+    echo "dispatch-feeder: rig '$rig' is live but has no target — skipping" >&2
+    log_event "no_target_skip" "$rig" "" '{}'
+    return 0
+  fi
+
+  local id _selected=0
+  local _cands
+  _cands=$(select_candidates "$rig" "$k")
+  [[ -n "$_cands" ]] && _selected=$(printf '%s\n' "$_cands" | grep -c . || true)
+  summarize_rig "$rig" "$k" "$_selected"
+
+  while IFS= read -r id; do
+    [[ -z "$id" ]] && continue
+    if [[ "$mode" == "dry_run" ]]; then
+      would_sling+=("$rig|$id|$target")
+      log_event "would_sling" "$rig" "$id" "$(jq -cn --arg t "$target" '{target:$t}')"
+    else
+      # live: gc-sling wrapper injects --nudge and the default formula.
+      if gc-sling "$target" "$id" >/dev/null 2>&1; then
+        slung+=("$rig|$id|$target")
+        log_event "slung" "$rig" "$id" "$(jq -cn --arg t "$target" '{target:$t}')"
+      else
+        failed+=("$rig|$id|$target")
+        log_event "sling_failed" "$rig" "$id" "$(jq -cn --arg t "$target" '{target:$t}')"
+      fi
+    fi
+  done <<< "$_cands"
+  # Fed from the captured $_cands, NOT a second select_candidates call: calling
+  # it twice would double the bd queries and race — the ready set can change
+  # between the summary and the loop, so the log would describe a different
+  # cycle than the one that ran.
+}
+
+if [[ "$kill_switch" == "true" ]]; then
+  echo "dispatch-feeder: kill_switch=true — no-op."
+  log_event "kill_switch_noop" "" "" '{}'
+  exit 0
+fi
+
+num_rigs=$(jq '(.rigs // []) | length' <<<"$CONFIG_JSON")
+for i in $(seq 0 $((num_rigs - 1))); do
+  [[ "$num_rigs" -eq 0 ]] && break
+  rig=$(jq -r ".rigs[$i].name" <<<"$CONFIG_JSON")
+  target=$(jq -r ".rigs[$i].target // \"\"" <<<"$CONFIG_JSON")
+  mode=$(jq -r ".rigs[$i].mode // \"disabled\"" <<<"$CONFIG_JSON")
+  k=$(jq -r ".rigs[$i].k // ${default_k}" <<<"$CONFIG_JSON")
+  if (( ${#RIG_FILTER[@]} > 0 )); then
+    match=0; for f in "${RIG_FILTER[@]}"; do [[ "$f" == "$rig" ]] && match=1; done
+    (( match )) || continue
+  fi
+  process_rig "$rig" "$target" "$mode" "$k"
+done
+
+# Report.
+build_report() {
+  printf 'dispatch-feeder: %d would-sling (dry_run), %d slung (live), %d failed, %d held\n' \
+    "${#would_sling[@]}" "${#slung[@]}" "${#failed[@]}" "${#held[@]}"
+  emit() {
+    local title=$1; shift; (( $# > 0 )) || return 0
+    echo; echo "$title"
+    local row rig bead target
+    for row in "$@"; do IFS='|' read -r rig bead target <<<"$row"
+      printf '  %-18s %-26s -> %s\n' "$rig" "$bead" "$target"; done
+  }
+  (( ${#slung[@]}       )) && emit "SLUNG (live):" "${slung[@]}"
+  (( ${#failed[@]}      )) && emit "FAILED:" "${failed[@]}"
+  (( ${#would_sling[@]} )) && emit "WOULD SLING (dry_run — nothing dispatched):" "${would_sling[@]}"
+  if (( ${#held[@]} > 0 )); then
+    echo; echo "HELD (dispatch-holds.yaml — never fed):"
+    local row rig reason
+    for row in "${held[@]}"; do IFS='|' read -r rig reason <<<"$row"
+      printf '  %-18s %s\n' "$rig" "$reason"; done
+  fi
+  return 0
+}
+
+REPORT=$(build_report)
+printf '%s\n' "$REPORT"
+
+if (( NUDGE_MAYOR )) && (( ${#slung[@]} + ${#failed[@]} > 0 )); then
+  gc session nudge mayor "$REPORT" >/dev/null 2>&1 || true
+fi
+
+exit 0

@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""likec4-orient — mechanically derive a compact (~2K-token) orientation summary
+from a rig's LikeC4 architecture model (Design A prototype, mayor gc-422942 /
+docs/design/likec4-context-governance-scoping.md).
+
+Transforms `npx likec4 export json` output into a derived summary an agent loads
+at dispatch to orient off the high-altitude map (container/component tree +
+edges + source links) instead of cold grep-walking an unfamiliar tree. Then the
+agent targeted-reads only the files the map points at.
+
+ZFC-clean: pure mechanical transform of the JSON export — element tree, one-line
+descriptions, relation edges, resolved source links. NO model reasoning, no
+scoring, no semantic classification. Styles/layout/fonts are stripped.
+
+Usage:
+  likec4-orient <rig-dir-or-architecture-dir> [--json <cached-export.json>]
+  likec4-orient --json <cached-export.json>     # transform a pre-exported JSON
+
+Output: the derived summary (markdown) to stdout, plus a token estimate to stderr.
+"""
+import sys, os, json, subprocess, tempfile
+
+
+def find_architecture_dir(path):
+    path = os.path.abspath(path)
+    if os.path.basename(path) == "architecture" and os.path.isdir(path):
+        return path
+    cand = os.path.join(path, "architecture")
+    return cand if os.path.isdir(cand) else None
+
+
+def export_json(arch_dir):
+    """Run `npx likec4 export json` in the rig and return the parsed JSON."""
+    out = os.path.join(tempfile.gettempdir(), f"likec4-{os.getpid()}.json")
+    rig_root = os.path.dirname(arch_dir)
+    try:
+        subprocess.run(
+            ["npx", "-y", "likec4@latest", "export", "json", "architecture", "-o", out],
+            cwd=rig_root, capture_output=True, text=True, timeout=180, check=True)
+        with open(out) as f:
+            return json.load(f)
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
+        print(f"likec4-orient: export failed for {rig_root}: {e}", file=sys.stderr)
+        return None
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+
+
+def desc_txt(d, oneline=True, limit=110):
+    if isinstance(d, dict):
+        t = (d.get("txt") or "").strip()
+    elif isinstance(d, str):
+        t = d.strip()
+    else:
+        return ""
+    if not oneline:
+        return t
+    # Collapse to a single orientation line: first sentence, capped.
+    t = " ".join(t.split())
+    cut = t.find(". ")
+    if 0 < cut <= limit:
+        return t[:cut + 1]
+    return t if len(t) <= limit else t[:limit - 1].rstrip() + "…"
+
+
+def tag_list(tags):
+    if not tags:
+        return []
+    out = []
+    for t in tags:
+        if isinstance(t, dict):
+            out.append(str(t.get("id") or t.get("tag") or t))
+        else:
+            out.append(str(t))
+    return [t if t.startswith("#") else "#" + t for t in out]
+
+
+def link_paths(links):
+    if not links:
+        return []
+    out = []
+    for l in links:
+        if isinstance(l, dict):
+            out.append(l.get("url") or l.get("relative") or "")
+        else:
+            out.append(str(l))
+    return [p for p in out if p]
+
+
+def render(model, project_label):
+    elements = model.get("elements", {}) or {}
+    relations = model.get("relations", {}) or {}
+    # elements/relations may be dict (id->obj) or list.
+    els = list(elements.values()) if isinstance(elements, dict) else list(elements)
+    rels = list(relations.values()) if isinstance(relations, dict) else list(relations)
+
+    lines = [f"# Architecture orientation — {project_label}",
+             "",
+             "_Mechanically derived from the LikeC4 model (`likec4 export json`). "
+             "High-altitude map only — names every subsystem, its purpose, delivery "
+             "state, and exact source path so you targeted-read instead of grep-walking. "
+             "For symbol-level depth, hand a source link below to an Explore/CodeGraph agent._",
+             "",
+             f"## Subsystems ({len(els)} elements)", ""]
+
+    # Tree by dot-hierarchical id: sort lexically (parent sorts before children).
+    for el in sorted(els, key=lambda e: str(e.get("id", ""))):
+        eid = str(el.get("id", ""))
+        depth = eid.count(".")
+        indent = "  " * depth
+        title = (el.get("title") or eid.split(".")[-1]).strip()
+        kind = el.get("kind", "")
+        tags = " ".join(tag_list(el.get("tags")))
+        d = desc_txt(el.get("description"))
+        links = link_paths(el.get("links"))
+        head = f"{indent}- **{title}** ({kind})"
+        if tags:
+            head += f" {tags}"
+        lines.append(head)
+        if d:
+            lines.append(f"{indent}  {d}")
+        if links:
+            lines.append(f"{indent}  ↳ `{', '.join(links)}`")
+
+    lines += ["", f"## Connections ({len(rels)} edges)", ""]
+    for r in rels:
+        src = (r.get("source") or {}).get("model", "?") if isinstance(r.get("source"), dict) else r.get("source", "?")
+        tgt = (r.get("target") or {}).get("model", "?") if isinstance(r.get("target"), dict) else r.get("target", "?")
+        label = (r.get("title") or "").strip()
+        lines.append(f"- `{src}` → `{tgt}`" + (f": {label}" if label else ""))
+
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    args = sys.argv[1:]
+    json_cache = None
+    rig = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--json":
+            json_cache = args[i + 1]; i += 2
+        elif args[i] in ("-h", "--help"):
+            print(__doc__); return 0
+        else:
+            rig = args[i]; i += 1
+
+    if json_cache:
+        with open(json_cache) as f:
+            model = json.load(f)
+        label = model.get("projectId") or model.get("project") or os.path.basename(json_cache)
+    elif rig:
+        arch = find_architecture_dir(rig)
+        if not arch:
+            print(f"likec4-orient: no architecture/ dir under {rig}", file=sys.stderr)
+            return 1
+        model = export_json(arch)
+        if model is None:
+            return 1
+        # Prefer the rig dir name; projectId is often the generic "default".
+        label = os.path.basename(os.path.dirname(arch)) or model.get("projectId", "")
+    else:
+        print(__doc__, file=sys.stderr); return 2
+
+    summary = render(model, label)
+    sys.stdout.write(summary)
+    print(f"likec4-orient: {len(summary)} chars (~{len(summary)//4} tokens)", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

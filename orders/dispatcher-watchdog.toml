@@ -1,0 +1,13 @@
+# Self-heal wedged control-dispatchers. The city control-dispatcher (gc-2790)
+# recurrently wedges ~6h after reset (active but no longer converting routed
+# beads, looping nudges); the fix is `gc session kill` to clear the tripped
+# named-session circuit breaker (reset/wake silently no-op), after which the
+# supervisor respawns it fresh. Stephanie 2026-06-13: "build an auto-reset
+# watchdog so it self heals." See bin/dispatcher-watchdog header.
+# trigger=cooldown (no zero-lastRun bootstrap trap; mirrors decision-ledger-push).
+[order]
+description = "Every 30m: kill any control-dispatcher that is active but wedged, so the supervisor respawns it fresh. Two OR'd signals: (1) idle >= 5h; (2) conversion-stall — the SAME set of routed/open control beads stays unconverted >= 90m (nudge-robust; catches a wedge whose last_active still ticks under the routed-bead-nudger loop). Notifies mayor on action."
+trigger = "cooldown"
+interval = "30m"
+exec = "/home/ds/gas-city/bin/dispatcher-watchdog"
+timeout = "2m"

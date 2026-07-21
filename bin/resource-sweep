@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# resource-sweep: daily memory/resource observability sweep.
+#
+# This sweep NEVER kills. Auto-reclaim of unambiguous dead-parent orphans is
+# delegated to the targeted reapers (e.g. stale-scix-mcp-reaper, hourly). This
+# sweep's job is the part that needs human/mayor judgment:
+#   1. Summarize memory + swap pressure and the top consumers by class.
+#   2. Flag AMBIGUOUS reclaim candidates — processes with a LIVE parent that
+#      merely look unneeded (big swap hoarders, long-running dev servers). These
+#      are NOT safe to auto-kill (could be a needed service or a live session),
+#      so they are surfaced to mayor to clear with judgment.
+#
+# Nudges mayor only under genuine pressure (MemAvailable < AVAIL_MIN_GB) or when
+# a candidate is flagged — not on every run (swap sitting full is steady-state
+# here, not news).
+#
+# Usage:
+#   resource-sweep                 # report to stdout + audit log
+#   resource-sweep --nudge-mayor   # also nudge mayor when pressure/candidates
+
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${RESOURCE_SWEEP_AUDIT_LOG:-${CITY}/.gc/resource-sweep.log}"
+AVAIL_MIN_GB="${RESOURCE_SWEEP_AVAIL_MIN_GB:-4}"
+SWAP_FLAG_MB="${RESOURCE_SWEEP_SWAP_FLAG_MB:-500}"
+AGE_FLAG_DAYS="${RESOURCE_SWEEP_AGE_FLAG_DAYS:-5}"
+# Disk: the box has a single shared volume (root + dolt + every worktree), so a
+# fill is a city-wide outage. This is a big disk (~1.9T) that sits ~96% full of
+# legitimate project data steady-state, so % is the wrong signal — flag on
+# absolute FREE space (the 2026-06-19 incident bottomed at 16G free). Reclaim is
+# delegated to tmp-reaper (auto, /tmp workspaces); this surfaces the pressure.
+DISK_MIN_FREE_GB="${RESOURCE_SWEEP_DISK_MIN_FREE_GB:-25}"
+# Long-running dev/web servers that are commonly left abandoned.
+DEVSERVER_RE='next-server|vite|webpack|jupyter|ng serve|rollup'
+# Load-bearing core services — never "reclaim candidates", exclude from flagging
+# so the daily nudge fires only on genuinely actionable processes.
+EXCLUDE_RE='qdrant|postgres|dolt|^gc$|gc-slack-adapter'
+
+NUDGE_MAYOR=0
+[[ "${1:-}" == "--nudge-mayor" ]] && NUDGE_MAYOR=1
+
+mkdir -p "$(dirname "$AUDIT_LOG")"
+ppid_of() { awk '/^PPid:/{print $2}' "/proc/$1/status" 2>/dev/null; }
+
+avail_gb=$(awk '/MemAvailable/{printf "%.1f",$2/1048576}' /proc/meminfo)
+read -r sw_total sw_free < <(awk '/SwapTotal/{t=$2}/SwapFree/{f=$2}END{print t" "f}' /proc/meminfo)
+sw_used_pct=0; [[ "$sw_total" -gt 0 ]] && sw_used_pct=$(( (sw_total - sw_free) * 100 / sw_total ))
+
+# Disk pressure on the volume holding the city store (single shared volume).
+read -r disk_pct disk_free_gb < <(df -P "$CITY" 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); printf "%s %.0f", $5, $4/1048576}')
+disk_pct="${disk_pct:-0}"; disk_free_gb="${disk_free_gb:-0}"
+
+# RSS grouped by class.
+rss_table=$(ps -eo rss,comm 2>/dev/null | awk '
+{ c=$2;
+  if(c~/postgres/)k="postgres"; else if(c=="claude")k="claude(agents)";
+  else if(c=="gc")k="gc"; else if(c~/python/)k="python";
+  else if(c~/qdrant/)k="qdrant"; else if(c~/dolt/)k="dolt";
+  else if(c~/node/)k="node"; else k="other";
+  s[k]+=$1 }
+END{ for(k in s) printf "  %7.1fG  %s\n", s[k]/1048576, k }' | sort -rn)
+
+# Flag ambiguous candidates: live-parent swap hoarders + old dev servers.
+flagged=()
+for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+  sw=$(awk '/^VmSwap:/{print $2}' "/proc/$p/status" 2>/dev/null) || continue
+  [[ -n "$sw" ]] || continue
+  comm=$(cat "/proc/$p/comm" 2>/dev/null) || continue
+  echo "$comm" | grep -qE "$EXCLUDE_RE" && continue   # core services are never candidates
+  args=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+  pp=$(ppid_of "$p"); [[ "$pp" == "1" || -z "$pp" ]] && continue   # orphans are the reapers' job
+  [[ -d "/proc/$pp" ]] || continue                                  # parent gone => orphan-ish, skip
+  age_d=$(( $(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ' || echo 0) / 86400 ))
+  reason=""
+  if (( sw / 1024 >= SWAP_FLAG_MB )); then reason="swap=$((sw/1024))M"; fi
+  if echo "$comm $args" | grep -qiE "$DEVSERVER_RE" && (( age_d >= AGE_FLAG_DAYS )); then
+    reason="${reason:+$reason, }devserver age=${age_d}d"
+  fi
+  [[ -z "$reason" ]] && continue
+  cwd=$(readlink "/proc/$p/cwd" 2>/dev/null)
+  flagged+=("$p|$comm|$((sw/1024))M|${age_d}d|$pp|$cwd|$reason")
+done
+
+# Pool lever (report-only): rigs with warm worker sessions but ZERO in-progress
+# work are reclaim candidates. We surface `gc rig suspend <rig>` for judgment —
+# NEVER auto-suspend (per-worker suspend thrashes via the min-active floor, and
+# blind rig-suspend would dark a city where every rig is momentarily idle).
+idle_rigs=()
+while read -r rig; do
+  [[ -n "$rig" ]] || continue
+  workers=$(gc session list 2>/dev/null | grep -c -E "/${rig}/.*worker|${rig}-worker" || true)
+  (( workers > 0 )) || continue
+  inprog=$(gc bd --rig "$rig" list --status in_progress --json 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
+  [[ "$inprog" == "0" ]] && idle_rigs+=("$rig|$workers")
+done < <(gc rig list 2>/dev/null | awk '/^  [a-zA-Z][a-zA-Z0-9_-]+:/ {n=$1; sub(/:$/,"",n); print n}')
+
+# Output.
+{
+  echo "resource-sweep: MemAvailable ${avail_gb}G | swap ${sw_used_pct}% used | disk ${disk_pct}% used, ${disk_free_gb}G free | $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if (( disk_free_gb < DISK_MIN_FREE_GB )); then
+    echo "  !! DISK PRESSURE: only ${disk_free_gb}G free (< ${DISK_MIN_FREE_GB}G) on the shared volume (${disk_pct}% used)."
+    echo "     Reclaim: tmp-reaper --apply (dead /tmp workspaces); regenerable caches: go clean -cache (~/.cache/go-build), ~/.cache/huggingface if models are stale."
+  fi
+  echo "Top RSS by class:"; echo "$rss_table"
+  if (( ${#idle_rigs[@]} > 0 )); then
+    echo
+    echo "Idle warm rigs (0 in-progress work; suspend candidates — mayor judgment, NOT auto-suspended):"
+    for row in "${idle_rigs[@]}"; do
+      IFS='|' read -r rig workers <<<"$row"
+      printf '  %-22s %s warm worker(s)  ->  gc rig suspend %s\n' "$rig" "$workers" "$rig"
+    done
+  fi
+  if (( ${#flagged[@]} > 0 )); then
+    echo
+    echo "Ambiguous reclaim candidates (LIVE parent — mayor judgment, NOT auto-killed):"
+    printf '  %-8s %-16s %-7s %-6s %-8s %s\n' PID COMM SWAP AGE PPID 'CWD / REASON'
+    for row in "${flagged[@]}"; do
+      IFS='|' read -r p comm sw age pp cwd reason <<<"$row"
+      printf '  %-8s %-16s %-7s %-6s %-8s %s\n' "$p" "$comm" "$sw" "$age" "$pp" "$cwd  [$reason]"
+    done
+  else
+    echo "No ambiguous reclaim candidates."
+  fi
+}
+
+# Audit log (one json line per run).
+flagged_json=$(printf '%s\n' "${flagged[@]:-}" | jq -R 'select(length>0)|split("|")|{pid:.[0],comm:.[1],swap:.[2],age:.[3],ppid:.[4],cwd:.[5],reason:.[6]}' 2>/dev/null | jq -sc . 2>/dev/null || echo '[]')
+idle_rigs_json=$(printf '%s\n' "${idle_rigs[@]:-}" | jq -R 'select(length>0)|split("|")|{rig:.[0],warm_workers:(.[1]|tonumber)}' 2>/dev/null | jq -sc . 2>/dev/null || echo '[]')
+jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg avail "$avail_gb" \
+       --argjson swpct "$sw_used_pct" --argjson diskpct "${disk_pct:-0}" --argjson diskfree "${disk_free_gb:-0}" \
+       --argjson flagged "$flagged_json" --argjson idle_rigs "$idle_rigs_json" \
+  '{ts:$ts, mem_available_gb:($avail|tonumber), swap_used_pct:$swpct, disk_used_pct:$diskpct, disk_free_gb:$diskfree, flagged:$flagged, idle_warm_rigs:$idle_rigs}' >> "$AUDIT_LOG"
+
+# Nudge only under pressure or with candidates.
+pressure=0
+awk "BEGIN{exit !($avail_gb < $AVAIL_MIN_GB)}" && pressure=1
+disk_pressure=0
+(( disk_free_gb < DISK_MIN_FREE_GB )) && { pressure=1; disk_pressure=1; }
+# Nudge only on genuine RAM pressure (< AVAIL_MIN_GB) or low disk (< DISK_MIN_FREE_GB).
+# The flagged hoarders + idle rigs are persistent/known (already in the morning
+# ledger) — reporting them every run is fine, but nudging on them would spam, so
+# they ride along in the message only when a real-pressure nudge fires.
+if (( NUDGE_MAYOR )) && (( pressure )); then
+  msg="resource-sweep: MemAvailable ${avail_gb}G | swap ${sw_used_pct}% | disk ${disk_pct}% used, ${disk_free_gb}G free."
+  (( disk_pressure )) && msg="${msg} DISK PRESSURE (<${DISK_MIN_FREE_GB}G free) — tmp-reaper --apply + check regenerable caches."
+  msg="${msg} ${#flagged[@]} hoarder candidate(s), ${#idle_rigs[@]} idle warm rig(s). See $AUDIT_LOG"
+  gc session nudge mayor "$msg" 2>/dev/null \
+    || echo "warn: gc session nudge mayor failed (mayor may be asleep); report is in audit log" >&2
+fi

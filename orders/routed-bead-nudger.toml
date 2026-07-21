@@ -1,0 +1,19 @@
+# Routed-bead nudger — periodic backstop for the warm-pool-idle stall.
+#
+# `gc sling` stamps gc.routed_to but does not wake a warm/asleep pool
+# (gastownhall/gascity#1129, by-design). The event-triggered
+# bin/nudge-on-route only nudges sessions already in 'active' state and
+# is idempotent-once, so a bead routed to an asleep pool sits unclaimed.
+# This order is the periodic sweep: every 15m it groups routed-but-
+# unclaimed beads by pool and wakes+nudges each stalled pool once.
+# It also refreshes the csu usage cache so gc-capacity stays current.
+#
+# Greenlit by Stephanie 2026-05-16 after the stall hit zelda, codeprobe,
+# geo, and the gascity polecats. Tracking bead dr-rddkqk.
+
+[order]
+description = "Every 15m: wake + nudge worker/dispatcher pools holding routed-but-unclaimed beads; refresh the csu usage cache. Periodic backstop for the warm-pool-idle stall (gascity#1129)."
+trigger = "cooldown"
+interval = "15m"
+exec = "/home/ds/gas-city/bin/routed-bead-nudger --apply"
+timeout = "5m"

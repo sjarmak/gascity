@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# decision-ledger-push: post the Open-Decisions ledger to #gascity-maintenance
+# whenever it CHANGES (plus a 12h heartbeat while non-empty).
+#
+# Why: pending-Stephanie decisions live in the mayor's tmux conversation; when
+# the mayor floods, items stall silently and Stephanie has to ask "what's
+# waiting on me". The decisions rig is the SSOT (mayor mirrors every 🔴 there
+# BEFORE surfacing it); this order makes that SSOT visible in Slack
+# mechanically, immune to mayor load. ZFC: pure structural data (IDs, titles,
+# ages) — no composition judgment.
+#
+# Requested by Stephanie 2026-06-12 ("more regularly routed to slack").
+
+set -uo pipefail
+
+CITY=/home/ds/gas-city
+CHANNEL="${LEDGER_PUSH_CHANNEL:-C0B0TQMQF2B}"
+STATE="$CITY/.gc/decision-ledger-push.state"
+AUDIT_LOG="$CITY/.gc/decision-ledger-push.log"
+HEARTBEAT_SECS=$(( 12 * 3600 ))
+
+ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+
+# publish-to-channel attributes to --session (default $GC_SESSION_ID). The
+# supervisor runs this order detached with $GC_SESSION_ID unset, so the publish
+# failed fast — the ledger push to Slack silently rotted (972 fails vs 4 ok).
+# Resolve a stable session: prefer $GC_SESSION_ID (interactive), else pinned mayor.
+resolve_publish_sid() {
+  if [[ -n "${GC_SESSION_ID:-}" ]]; then
+    printf '%s' "$GC_SESSION_ID"; return 0
+  fi
+  gc session list 2>/dev/null | awk '$2=="mayor" && /pin/{print $1; exit}'
+}
+PUBLISH_SID="$(resolve_publish_sid)"
+log() { echo "$(ts) $*" >> "$AUDIT_LOG"; }
+
+items=$(gc bd --rig decisions list --status open --json --limit=0 2>/dev/null | jq -r '
+  [ .[] | select((.labels // []) | index("needs/stephanie")) ] | sort_by(.created_at) | .[]
+  | "\(.id)\t\(.title)\t\(.created_at)"' 2>/dev/null)
+
+now=$(date +%s)
+MSG=$(mktemp); trap 'rm -f "$MSG"' EXIT
+
+if [[ -z "$items" ]]; then
+  body=":white_check_mark: *Open-Decisions ledger: EMPTY* — nothing waiting on you."
+else
+  body=$( {
+    echo ":ledger: *Open-Decisions ledger* — waiting on you ($(date '+%H:%M %Z')):"
+    n=0
+    while IFS=$'\t' read -r id title created; do
+      n=$((n+1))
+      age_h=$(( (now - $(date -d "$created" +%s 2>/dev/null || echo "$now")) / 3600 ))
+      stale=""
+      (( age_h >= 24 )) && stale=" :warning: *${age_h}h old*"
+      printf '%d. `%s` — %s (raised %dh ago)%s\n' "$n" "$id" "$title" "$age_h" "$stale"
+    done <<<"$items"
+    echo
+    echo "_Auto-posted on change + 12h heartbeat. Full Decide/Options/Recommend blocks: ask mayor._"
+  } )
+fi
+
+# Hash EXCLUDES ages/timestamps so unchanged ledgers don't repost hourly.
+content_hash=$(echo "$items" | awk -F'\t' '{print $1"\t"$2}' | sha256sum | cut -d' ' -f1)
+last_hash=""; last_post=0
+[[ -f "$STATE" ]] && { last_hash=$(sed -n 1p "$STATE"); last_post=$(sed -n 2p "$STATE"); }
+
+if [[ "$content_hash" == "$last_hash" ]]; then
+  if [[ -z "$items" ]]; then
+    log "skip: empty ledger unchanged"; exit 0
+  fi
+  if (( now - ${last_post:-0} < HEARTBEAT_SECS )); then
+    log "skip: unchanged, heartbeat not due"; exit 0
+  fi
+fi
+
+echo "$body" > "$MSG"
+if gc slack publish-to-channel --conversation-id "$CHANNEL" --kind room ${PUBLISH_SID:+--session "$PUBLISH_SID"} --body-file "$MSG" >/dev/null 2>&1; then
+  printf '%s\n%s\n' "$content_hash" "$now" > "$STATE"
+  log "posted ledger ($(echo "$items" | grep -c . ) item(s)) to $CHANNEL"
+else
+  log "ERROR: publish to $CHANNEL failed"
+  exit 1
+fi

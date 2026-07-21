@@ -1,0 +1,3 @@
+dir = "/home/ds/projects/code-intelligence-digest"
+provider = "claude-1"
+suspended = true

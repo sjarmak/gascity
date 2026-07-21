@@ -1,0 +1,22 @@
+# orphaned-molecule-reaper — force-close workflow roots stranded in_progress by
+# the graph.v2 / mol-do-work finalize gap (bead dr-rz3).
+#
+# The workflow engine sometimes honors an authored drain step's `gc runtime
+# drain-ack` before running the auto-injected workflow-finalize step, so the
+# root (gc.kind=workflow) + its finalize step never close even though the work
+# bead (gc.var.issue) did. The supervisor then orphan-drains the session and the
+# stranded in_progress root orphans every subsequent single-slot spawn → churn
+# (city-infra-polecat, 2026-07-13). The engine ordering is a gc-binary bug; this
+# controller-side reaper is the durable backstop (same lesson as dr-7mb: reap in
+# code, not prompt text).
+#
+# SHIPPED ENABLED with --apply: it is a safe, reversible cleanup — it only
+# closes roots whose work bead is already closed, that are past a 20m grace, and
+# whose owning session is dead. Verified on real strandeds (gascity gc-irfwa,
+# website sjai-3jg) 2026-07-13. Runs every 10m so churn is killed in minutes.
+[order]
+description = "Every 10m: force-close workflow roots stranded in_progress by the graph.v2/mol-do-work finalize gap (work bead closed, session dead, past grace; dr-rz3). Reversible; nudges mayor on reap."
+trigger = "cooldown"
+interval = "10m"
+exec = "/home/ds/gas-city/bin/orphaned-molecule-reaper --apply --nudge-mayor"
+timeout = "5m"

@@ -1,0 +1,15 @@
+# Twice-daily executive-status inputs, morning leg (pair: pl-status-update-pm).
+# Each live PL writes one concise structured input to Obsidian. A later order
+# aggregates those inputs into one portfolio brief and one Slack post.
+# Stephanie 2026-06-12.
+#
+# NOTE zero-lastRun bootstrap trap: a never-fired cron order only fires on an
+# exact-minute eval match (internal/orders/triggers.go skips catch-up when
+# lastRun is zero). New cron orders must be seeded once: temporarily set
+# schedule to "* * * * *", wait for one controller fire, restore.
+[order]
+description = "Daily 9:30 EDT: every live PL updates its CEO-level Obsidian input; one later order publishes the aggregated portfolio brief."
+trigger = "cron"
+schedule = "30 9 * * *"
+exec = "/home/ds/gas-city/bin/pl-periodic-directive EXECUTIVE_STATUS"
+timeout = "5m"

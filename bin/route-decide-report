@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# route-decide-report — weekly aggregation of FCTR routing decisions
+# stamped on beads in the city + all rigs over a configurable window.
+#
+# Measures Phase 1 effectiveness: how many beads got which model_tier,
+# grounded_review, and human_gate decisions, sliced by formula+step.
+#
+# Reads routing.* metadata from the issues table directly via dolt sql
+# (cheaper than `bd list --json` for aggregation queries).
+#
+# Output: JSON to stdout, or to --output PATH.
+#
+# Usage:
+#   route-decide-report                  # last 7d, JSON to stdout
+#   route-decide-report --window 14d     # custom window
+#   route-decide-report --output FILE    # write to file
+#   route-decide-report --rig gascity    # single-rig scope
+#   route-decide-report --human          # human-readable table to stdout
+
+set -euo pipefail
+
+WINDOW="${ROUTE_REPORT_WINDOW:-7d}"
+OUTPUT=""
+RIG_FILTER=""
+HUMAN_FORMAT=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --window)  WINDOW="$2"; shift 2 ;;
+    --output)  OUTPUT="$2"; shift 2 ;;
+    --rig)     RIG_FILTER="$2"; shift 2 ;;
+    --human)   HUMAN_FORMAT=1; shift ;;
+    -h|--help) sed -n 's/^# \{0,1\}//p' "$0" | head -20; exit 0 ;;
+    *) echo "route-decide-report: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+dur_to_sql_bound() {
+  local w="$1" num unit
+  num="${w%[smhd]}"
+  unit="${w##*[0-9]}"
+  case "$unit" in
+    h) date -u -d "$num hours ago" +'%Y-%m-%d %H:%M:%S' ;;
+    d) date -u -d "$num days ago"  +'%Y-%m-%d %H:%M:%S' ;;
+    *) echo "route-decide-report: bad window '$w' (use e.g. 7d, 24h)" >&2; exit 2 ;;
+  esac
+}
+
+SINCE=$(dur_to_sql_bound "$WINDOW")
+
+dolt_endpoint() {
+  local rig_root="$1"
+  local info="$rig_root/.beads/dolt/.dolt/sql-server.info"
+  if [[ -f "$info" ]]; then
+    awk -F: '{ printf "127.0.0.1:%s\n", $2 }' "$info"
+  fi
+}
+
+query_one() {
+  local scope="$1" endpoint="$2" db="$3"
+  local host="${endpoint%:*}" port="${endpoint##*:}"
+  [[ -z "$port" || "$port" == "$endpoint" ]] && return 0
+
+  dolt --host "$host" --port "$port" --user root --no-tls --password '' \
+       --use-db "$db" sql --result-format json -q "
+    SELECT
+      JSON_VALUE(metadata_json, '\$.\"gc.formula\"') AS formula,
+      JSON_VALUE(metadata_json, '\$.\"gc.step_id\"') AS step,
+      COALESCE(JSON_VALUE(metadata_json, '\$.\"routing.model_tier\"'), 'unstamped') AS model_tier,
+      COALESCE(JSON_VALUE(metadata_json, '\$.\"routing.grounded_review\"'), 'unstamped') AS grounded_review,
+      COALESCE(JSON_VALUE(metadata_json, '\$.\"routing.human_gate\"'), 'unstamped') AS human_gate,
+      COUNT(*) AS n
+    FROM (
+      SELECT i.id,
+             (SELECT JSON_OBJECTAGG(m.\`key\`, m.value)
+              FROM issue_metadata m WHERE m.issue_id = i.id) AS metadata_json
+      FROM issues i
+      WHERE i.created_at >= '$SINCE'
+    ) AS j
+    GROUP BY formula, step, model_tier, grounded_review, human_gate
+    ORDER BY n DESC;
+  " 2>/dev/null \
+  | jq -c --arg scope "$scope" \
+       '.rows[]? // empty | . + {scope: $scope}' \
+  || true
+}
+
+collect_jsonl() {
+  if [[ -z "$RIG_FILTER" || "$RIG_FILTER" == "city" || "$RIG_FILTER" == "ds-research" ]]; then
+    local city_ep
+    city_ep=$(dolt_endpoint "/home/ds/gas-city")
+    [[ -n "$city_ep" ]] && query_one "city:ds-research" "$city_ep" "beads"
+  fi
+
+  while IFS= read -r rig; do
+    [[ -z "$rig" ]] && continue
+    [[ -n "$RIG_FILTER" && "$rig" != "$RIG_FILTER" ]] && continue
+
+    local rig_root
+    rig_root=$(gc rig list --json 2>/dev/null \
+               | jq -r --arg r "$rig" '.rigs[] | select(.name == $r) | .root // empty')
+    [[ -z "$rig_root" ]] && continue
+
+    local ep
+    ep=$(dolt_endpoint "$rig_root")
+    [[ -n "$ep" ]] && query_one "rig:$rig" "$ep" "beads"
+  done < <(gc rig list --json 2>/dev/null | jq -r '.rigs[].name' 2>/dev/null || echo "")
+}
+
+JSONL=$(collect_jsonl)
+
+if [[ -z "$JSONL" ]]; then
+  echo "route-decide-report: no data in window $WINDOW (since $SINCE UTC)" >&2
+  exit 0
+fi
+
+REPORT=$(jq -s --arg window "$WINDOW" --arg since "$SINCE" '
+  {
+    window: $window,
+    since_utc: $since,
+    generated_at: (now | strftime("%Y-%m-%dT%H:%M:%SZ")),
+    total_stamped: ([.[] | select(.model_tier != "unstamped") | .n | tonumber] | add // 0),
+    total_unstamped: ([.[] | select(.model_tier == "unstamped") | .n | tonumber] | add // 0),
+    by_tier: ([group_by(.model_tier)[] | {tier: .[0].model_tier, n: ([.[].n | tonumber] | add)}]),
+    by_formula_step: .,
+  }' <<<"$JSONL")
+
+if [[ $HUMAN_FORMAT -eq 1 ]]; then
+  jq -r '
+    "=== Routing report (window: \(.window), since \(.since_utc)) ===",
+    "",
+    "Stamped: \(.total_stamped)   Unstamped: \(.total_unstamped)",
+    "",
+    "By tier:",
+    (.by_tier[] | "  \(.tier): \(.n)"),
+    "",
+    "By formula+step (top 30):",
+    (.by_formula_step | sort_by(-(.n | tonumber)) | .[0:30][] |
+       "  \(.scope) | \(.formula // "?")/\(.step // "?") | tier=\(.model_tier) gr=\(.grounded_review) hg=\(.human_gate) | n=\(.n)")
+  ' <<<"$REPORT"
+elif [[ -n "$OUTPUT" ]]; then
+  echo "$REPORT" > "$OUTPUT"
+  echo "route-decide-report: wrote $(jq -r '.total_stamped' <<<"$REPORT") stamped + $(jq -r '.total_unstamped' <<<"$REPORT") unstamped to $OUTPUT" >&2
+else
+  echo "$REPORT"
+fi

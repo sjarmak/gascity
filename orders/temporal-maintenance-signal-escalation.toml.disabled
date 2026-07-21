@@ -1,0 +1,9 @@
+# Temporal-maintenance Signal bridge — bead.created (escalation) -> workflow Signal.
+# Promotion Phase 3 (bead gc-z5k). DISARMED until Phase 4 (see the bead-closed
+# sibling order). Enable by dropping the .disabled suffix once Temporal is deployed.
+[order]
+description = "When a maintenance-cycle escalation-step bead is created, forward an agent.escalation Signal to its MaintenanceCycleWorkflow (the pl-human-gate-surface analog for the Temporal cycle)."
+trigger = "event"
+on = "bead.created"
+exec = "/home/ds/gas-city/bin/temporal-maintenance-signal-escalation"
+timeout = "120s"

@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Focused regression fixture for the shared scheduler-dispatchability contract.
+# Covers the six gascity-dashboard classes from dr-zkmc without title/note scans.
+
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+fixture='[
+  {"id":"executable","status":"open","issue_type":"bug","labels":[],"metadata":{}},
+  {"id":"assigned","status":"open","issue_type":"bug","labels":[],"assignee":"worker","metadata":{}},
+  {"id":"routed","status":"open","issue_type":"bug","labels":[],"metadata":{"gc.routed_to":"worker"}},
+  {"id":"blocked-status","status":"blocked","issue_type":"bug","labels":[],"metadata":{}},
+  {"id":"deferred-status","status":"deferred","issue_type":"bug","labels":[],"metadata":{}},
+  {"id":"planning-rollup","status":"open","issue_type":"task","labels":["rollup"],"metadata":{}},
+  {"id":"epic-label","status":"open","issue_type":"task","labels":["epic"],"metadata":{}},
+  {"id":"typed-epic","status":"open","issue_type":"epic","labels":[],"metadata":{}},
+  {"id":"typed-rollup","status":"open","issue_type":"rollup","labels":[],"metadata":{}},
+  {"id":"human-gated","status":"open","issue_type":"task","labels":["needs-human"],"metadata":{}},
+  {"id":"upstream-gated","status":"open","issue_type":"task","labels":["upstream-gated"],"metadata":{}},
+  {"id":"deferred","status":"open","issue_type":"task","labels":["deferred"],"metadata":{}},
+  {"id":"synthetic-container","status":"open","issue_type":"convoy","labels":[],"metadata":{}},
+  {"id":"branch-ready-outcome","status":"open","issue_type":"feature","labels":[],"metadata":{"gc.outcome":"branch-ready"}},
+  {"id":"branch-ready-label","status":"open","issue_type":"feature","labels":["branch-ready"],"metadata":{}},
+  {"id":"parked-notes-hold","status":"open","issue_type":"task","labels":["parked"],"metadata":{}}
+]'
+
+actual=$(jq -L "$ROOT/bin" -c 'include "dispatchability";
+  [.[] | select(scheduler_dispatchable) | .id]' <<<"$fixture")
+[[ "$actual" == '["executable"]' ]] || {
+  echo "FAIL: expected only executable, got $actual" >&2
+  exit 1
+}
+
+gate_leaks=$(jq -L "$ROOT/bin" -cn 'include "dispatchability";
+  [dispatch_gate_labels[] as $label
+   | {status:"open", issue_type:"task", labels:[$label], metadata:{}}
+   | select(scheduler_dispatchable)
+   | $label]')
+[[ "$gate_leaks" == '[]' ]] || {
+  echo "FAIL: declared gate labels leaked through: $gate_leaks" >&2
+  exit 1
+}
+
+[[ $(grep -c 'select(scheduler_dispatchable)' "$ROOT/bin/dispatch-feeder") -eq 2 ]] || {
+  echo "FAIL: feeder summary and selector must both use the shared predicate" >&2
+  exit 1
+}
+[[ $(grep -c 'select(scheduler_dispatchable)' "$ROOT/bin/dispatch-patrol") -eq 1 ]] || {
+  echo "FAIL: patrol must use the shared predicate exactly once" >&2
+  exit 1
+}
+
+echo "PASS: six queue classes use one contract; only executable is dispatchable"

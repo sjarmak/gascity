@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# overnight-digest — scan bead closes from the last ~12h, categorize for
+# Stephanie's morning skim, mail mayor with --notify so mayor surfaces to
+# Slack #gascity-maintenance on first wake.
+#
+# Categories (in surface order):
+#   1. Halted with summary_for_human — needs Stephanie's decision NOW
+#   2. Branch-ready (needs Stephanie's push) — auto_push=false halts
+#   3. Auto-pushed (PR opened by polecat) — needs Stephanie's merge call
+#   4. Investigation/blast-radius reports — needs review
+#   5. Cleanly closed informational — no action, count only
+#
+# Audit JSONL at .gc/overnight-digest.log
+
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${CITY}/.gc/overnight-digest.log"
+SINCE_HOURS="${OVERNIGHT_DIGEST_SINCE_HOURS:-14}"
+DRY_RUN="${OVERNIGHT_DIGEST_DRY_RUN:-false}"
+
+mkdir -p "$(dirname "$AUDIT_LOG")"
+
+log_event() {
+    local event="$1" detail="${2:-}"
+    printf '{"ts":"%s","event":"%s","detail":%s}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$(printf '%s' "$detail" | jq -Rs .)" \
+        >> "$AUDIT_LOG"
+}
+
+log_event "start" "since=${SINCE_HOURS}h dry_run=${DRY_RUN}"
+
+# Cutoff timestamp (seconds since epoch)
+NOW_TS=$(date -u +%s)
+CUTOFF_TS=$((NOW_TS - SINCE_HOURS * 3600))
+CUTOFF_ISO=$(date -u -d "@$CUTOFF_TS" +%Y-%m-%dT%H:%M:%SZ)
+
+# Per-rig scan — only rigs where mayor cares about polecat output.
+# (city + gascity + gascity-packs cover the polecat pools + my slung work.)
+SCOPES=(
+    "city:GC_BEADS=bd gc bd list --status closed --limit 0 --json"
+    "gascity:gc bd --rig gascity list --status closed --limit 0 --json"
+    "gascity-packs:gc bd --rig gascity-packs list --status closed --limit 0 --json"
+)
+
+# Collect candidates closed since cutoff
+ALL_BEADS_JSON=$(mktemp -t overnight-digest-beads.XXXXXX.json)
+echo "[]" > "$ALL_BEADS_JSON"
+
+for scope_spec in "${SCOPES[@]}"; do
+    scope_name="${scope_spec%%:*}"
+    scope_cmd="${scope_spec#*:}"
+    raw=$(eval "$scope_cmd" 2>/dev/null || echo "[]")
+    if [[ -z "$raw" ]] || [[ "$raw" == "null" ]]; then
+        log_event "scope_empty" "$scope_name"
+        continue
+    fi
+    # Guard against malformed JSON — bd output occasionally contains
+    # embedded backticks/quotes that break jq parse. Skip the scope
+    # rather than abort the whole run.
+    if ! filtered=$(printf '%s' "$raw" | jq --arg cutoff "$CUTOFF_ISO" --arg scope "$scope_name" \
+        '[.[] | select(.closed_at != null and .closed_at >= $cutoff) | . + {_scope: $scope}]' 2>/dev/null); then
+        log_event "scope_parse_error" "$scope_name"
+        continue
+    fi
+    scope_count=$(printf '%s' "$filtered" | jq 'length')
+    log_event "scope_loaded" "$scope_name count=$scope_count"
+    ALL_BEADS_JSON_NEW=$(mktemp -t overnight-digest-merge.XXXXXX.json)
+    jq -s '.[0] + .[1]' "$ALL_BEADS_JSON" <(printf '%s' "$filtered") > "$ALL_BEADS_JSON_NEW"
+    mv "$ALL_BEADS_JSON_NEW" "$ALL_BEADS_JSON"
+done
+
+TOTAL=$(jq 'length' "$ALL_BEADS_JSON")
+log_event "candidates" "total=$TOTAL"
+
+if [[ "$TOTAL" -eq 0 ]]; then
+    log_event "skip_empty" "no beads closed since $CUTOFF_ISO"
+    exit 0
+fi
+
+# Filter out scaffold beads (molecule roots, convoys, sub-step wisps) — keep
+# only user-facing work beads. Scaffold titles match the formula name or
+# are generic step titles inherited from the formula template.
+SCAFFOLD_FILE=$(mktemp -t overnight-digest-filter.XXXXXX.json)
+jq '[.[] | select(
+    (.issue_type // "" | IN("molecule", "convoy", "wisp") | not)
+    and (.title // "" | test("^mol-(pr-from-issue|pr-ship|adopt-pr|pr-review|pr-blast-radius|pr-triage|do-work|focus-review|epic-review|patrol)$") | not)
+    and (.title // "" | test("^(Write the blast-radius report|Resolve scope|Map direct callers|Trace config field reach|Identify concurrency surfaces|Establish working state|Pull open issues|Classify each issue|Surface report path|Signal completion|Parse PR and checkout|Check and resolve conflicts|Human review checkpoint|Cleanup|Push, post synthesis, merge|Run multi-model review|sling-)") | not)
+)]' "$ALL_BEADS_JSON" > "$SCAFFOLD_FILE"
+mv "$SCAFFOLD_FILE" "$ALL_BEADS_JSON"
+TOTAL=$(jq 'length' "$ALL_BEADS_JSON")
+log_event "filtered_scaffold" "remaining=$TOTAL"
+
+if [[ "$TOTAL" -eq 0 ]]; then
+    log_event "skip_post_filter_empty" "no user-facing closes since $CUTOFF_ISO"
+    exit 0
+fi
+
+# Categorize. Each bead is mutually exclusive — first matching category wins.
+classify_bead() {
+    local bead_json="$1"
+    local notes
+    notes=$(printf '%s' "$bead_json" | jq -r '.notes // ""')
+    local close_reason
+    close_reason=$(printf '%s' "$bead_json" | jq -r '.close_reason // ""')
+    local metadata
+    metadata=$(printf '%s' "$bead_json" | jq -r '.metadata // {}')
+
+    # 1. Halted with summary_for_human
+    if printf '%s' "$notes" | grep -q "^summary_for_human:" \
+       || printf '%s' "$close_reason" | grep -qi "halted\|halt"; then
+        echo "halted"
+        return
+    fi
+
+    # 2. Auto-pushed (PR opened — close_reason contains PR url)
+    if printf '%s' "$close_reason" | grep -qE "https://github.com/.+/pull/[0-9]+|PR #[0-9]+ open"; then
+        echo "auto_pushed"
+        return
+    fi
+
+    # 3. Branch-ready (waiting for mayor's push)
+    if printf '%s' "$notes" | grep -q "ready_for_push: yes\|status: ready_for_mayor_push\|branch-ready" \
+       || printf '%s' "$close_reason" | grep -qi "branch-ready\|ready for.*push"; then
+        echo "branch_ready"
+        return
+    fi
+
+    # 4. Investigation/blast-radius reports
+    if printf '%s' "$close_reason" | grep -qiE "blast.?radius|investigation|triage.complete|report at"; then
+        echo "investigation"
+        return
+    fi
+
+    # 5. Cleanly closed — no action
+    echo "informational"
+}
+
+# Group beads by category
+HALTED_FILE=$(mktemp); BRANCH_READY_FILE=$(mktemp); AUTO_PUSHED_FILE=$(mktemp)
+INVESTIGATION_FILE=$(mktemp); INFORMATIONAL_FILE=$(mktemp)
+for f in "$HALTED_FILE" "$BRANCH_READY_FILE" "$AUTO_PUSHED_FILE" "$INVESTIGATION_FILE" "$INFORMATIONAL_FILE"; do
+    echo "[]" > "$f"
+done
+
+i=0
+while [[ $i -lt $TOTAL ]]; do
+    bead=$(jq ".[$i]" "$ALL_BEADS_JSON")
+    cat=$(classify_bead "$bead")
+    target="${cat^^}_FILE"
+    target_file="${!target}"
+    if [[ -z "$target_file" ]]; then
+        case "$cat" in
+            halted) target_file="$HALTED_FILE" ;;
+            branch_ready) target_file="$BRANCH_READY_FILE" ;;
+            auto_pushed) target_file="$AUTO_PUSHED_FILE" ;;
+            investigation) target_file="$INVESTIGATION_FILE" ;;
+            informational|*) target_file="$INFORMATIONAL_FILE" ;;
+        esac
+    fi
+    new=$(mktemp)
+    jq -s '.[0] + [.[1]]' "$target_file" <(printf '%s' "$bead") > "$new"
+    mv "$new" "$target_file"
+    i=$((i+1))
+done
+
+N_HALTED=$(jq 'length' "$HALTED_FILE")
+N_BRANCH=$(jq 'length' "$BRANCH_READY_FILE")
+N_AUTOPUSH=$(jq 'length' "$AUTO_PUSHED_FILE")
+N_INVEST=$(jq 'length' "$INVESTIGATION_FILE")
+N_INFO=$(jq 'length' "$INFORMATIONAL_FILE")
+
+log_event "categorized" "halted=$N_HALTED branch_ready=$N_BRANCH auto_pushed=$N_AUTOPUSH investigation=$N_INVEST informational=$N_INFO"
+
+# Build digest body (Slack mrkdwn)
+DIGEST=$(mktemp)
+{
+    echo "*TL;DR:* Overnight digest — $TOTAL beads closed in last ${SINCE_HOURS}h."
+    echo "Halted: $N_HALTED. Branch-ready (need push): $N_BRANCH. Auto-pushed (need merge call): $N_AUTOPUSH. Investigations: $N_INVEST. Informational: $N_INFO."
+    echo ""
+
+    render_bead_line() {
+        local bead_json="$1"
+        local id title close_reason
+        id=$(printf '%s' "$bead_json" | jq -r '.id')
+        title=$(printf '%s' "$bead_json" | jq -r '.title | .[:80]')
+        close_reason=$(printf '%s' "$bead_json" | jq -r '.close_reason // "" | .[:120]')
+        printf '• \`%s\` — %s\n  _%s_\n' "$id" "$title" "$close_reason"
+    }
+
+    if [[ $N_HALTED -gt 0 ]]; then
+        echo "*Halted with summary_for_human (decision needed):*"
+        jq -c '.[]' "$HALTED_FILE" | while read -r bead; do
+            render_bead_line "$bead"
+        done
+        echo ""
+    fi
+
+    if [[ $N_BRANCH -gt 0 ]]; then
+        echo "*Branch-ready (need your push approval):*"
+        jq -c '.[]' "$BRANCH_READY_FILE" | while read -r bead; do
+            render_bead_line "$bead"
+        done
+        echo ""
+    fi
+
+    if [[ $N_AUTOPUSH -gt 0 ]]; then
+        echo "*Auto-pushed PRs (need merge call):*"
+        jq -c '.[]' "$AUTO_PUSHED_FILE" | while read -r bead; do
+            render_bead_line "$bead"
+        done
+        echo ""
+    fi
+
+    if [[ $N_INVEST -gt 0 ]]; then
+        echo "*Investigation reports (need review):*"
+        jq -c '.[]' "$INVESTIGATION_FILE" | while read -r bead; do
+            render_bead_line "$bead"
+        done
+        echo ""
+    fi
+
+    if [[ $N_INFO -gt 0 ]]; then
+        echo "*Informational (count only):* $N_INFO clean closes — see \`gc mail inbox\` for details."
+    fi
+} > "$DIGEST"
+
+if [[ "$DRY_RUN" == "true" ]]; then
+    log_event "dry_run_output" "$(cat "$DIGEST")"
+    cat "$DIGEST"
+    exit 0
+fi
+
+# Mail mayor with --notify so it surfaces to Slack on next wake
+SUBJECT="overnight-digest: $TOTAL closed (halt=$N_HALTED bp=$N_BRANCH ap=$N_AUTOPUSH inv=$N_INVEST info=$N_INFO)"
+if gc mail send mayor -s "$SUBJECT" -m "$(cat "$DIGEST")" --notify >/dev/null 2>&1; then
+    log_event "mailed" "subject=$SUBJECT"
+else
+    log_event "mail_failed" "subject=$SUBJECT"
+    exit 1
+fi
+
+# Cleanup tmp files
+rm -f "$ALL_BEADS_JSON" "$HALTED_FILE" "$BRANCH_READY_FILE" "$AUTO_PUSHED_FILE" "$INVESTIGATION_FILE" "$INFORMATIONAL_FILE" "$DIGEST"
+
+exit 0

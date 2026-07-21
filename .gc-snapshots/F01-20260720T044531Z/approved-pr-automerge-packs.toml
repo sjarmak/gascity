@@ -1,0 +1,22 @@
+# approved-pr-automerge-packs — packs sibling of approved-pr-automerge (Stephanie
+# directive 2026-07-03: packs was uncovered, so our packs PRs never auto-reviewed
+# or auto-merged and rotted as manual-only for days). Same bin, same deterministic
+# ZFC-clean logic, parameterized for gastownhall/gascity-packs:
+#   - review beads created/listed in the gascity-packs rig (APPROVED_AUTOMERGE_RIG)
+#   - dispatched to the packs polecat pool (APPROVED_AUTOMERGE_POLECAT)
+#   - review records namespaced pr-packs-<N>.md in the shared reviews dir (no
+#     collision with gascity pr-<N>.md; gascity #1300+, packs #<200)
+# NEVER merges directly; only ENABLES GitHub auto-merge on a CURRENT Codex-inclusive
+# approve record. Staggered off the gascity tick (:07/:22/:37/:52). Fully audited.
+# FAIL-CLOSED CONTAINMENT 2026-07-20 by mayor, audit F01 / mail gc-520531:
+# the shared parser accepted records that explicitly said Codex did not run,
+# used file mtime instead of exact head SHA, and consumed no action-specific
+# merge approval. Keep this order dry-run until structured exact-head Codex PASS
+# evidence AND separate current action authorization are enforced by executable
+# tests; then restore --apply through the normal reviewed change-control path.
+[order]
+description = "FAIL-CLOSED DRY-RUN: inspect gascity-packs merge-queue candidates only; no review dispatch or auto-merge enablement until exact-head Codex PASS and action-specific authorization gates are repaired (audit F01)."
+trigger = "cron"
+schedule = "7,22,37,52 * * * *"
+exec = "/bin/sh -c 'APPROVED_AUTOMERGE_REPO=gastownhall/gascity-packs APPROVED_AUTOMERGE_RIG=gascity-packs APPROVED_AUTOMERGE_POLECAT=/home/ds/gascity-packs/gascity-packs-polecat exec /home/ds/gas-city/bin/approved-pr-automerge --nudge-mayor'"
+timeout = "5m"

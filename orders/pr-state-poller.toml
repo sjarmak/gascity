@@ -1,0 +1,6 @@
+[order]
+description = "Phase 4 of dr-s0xu73 end-to-end PR loop: poll our open PRs every 15min, dispatch mol-pr-iterate on new copilot reviews with inline comments. Idempotent via .gc/pr-state-cache/. Closes the gap surfaced 2026-05-12: copilot comments sitting unaddressed."
+trigger = "cooldown"
+interval = "15m"
+exec = "/home/ds/gas-city/bin/pr-state-poller"
+timeout = "5m"

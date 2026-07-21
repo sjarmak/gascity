@@ -1,0 +1,4 @@
+dir = "/home/ds/projects/live_docs"
+provider = "claude-3"
+min_active_sessions = 1
+wake_mode = "fresh"

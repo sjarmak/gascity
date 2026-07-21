@@ -1,0 +1,9 @@
+# Adopted from gastownhall/gascity examples/gastown/packs/maintenance/orders/prune-branches.toml (2026-05-25).
+# Cleans stale local `gc/*` worktree-isolation branches across all rigs
+# after their remote refs are deleted. Only touches the gc/* prefix —
+# does NOT prune ship/*, bd-*, fix/*, feat/*, mayor/*, etc.
+[order]
+description = "Clean stale gc/* branches from all rigs"
+trigger = "cooldown"
+interval = "6h"
+exec = "/home/ds/gas-city/scripts/gastown-maintenance/prune-branches.sh"

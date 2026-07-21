@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# temporal-maintenance-signal-escalation — bead.created -> Temporal escalation
+# Signal for the maintenance Run provider (promotion Phase 3, bead gc-z5k).
+#
+# The agent.escalation analog of pl-human-gate-surface: fires on bead.created and
+# forwards an agent.escalation Signal for any newly created maintenance-cycle
+# escalation-step bead, so the workflow marks the branch escalated. Idempotent via
+# a state file; fail-soft when Temporal is unreachable.
+#
+# METADATA CONTRACT (fulfilled by Phase 4): an escalation bead carries
+#   gc.metadata.temporal.repo, gc.metadata.temporal.cycle_key, gc.metadata.temporal.branch
+# plus label "temporal-escalation". Until then no bead matches and this no-ops.
+#
+# DISARMED until Phase 4 (paired .toml.disabled order). See
+# bin/temporal-maintenance-signal-bead-closed for the sibling handler.
+# Fail-soft: NOT `set -e` (see the bead-closed sibling for the rationale).
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+STATE_FILE="${CITY}/.gc/temporal-maintenance-escalation-state.json"
+AUDIT_LOG="${CITY}/.gc/temporal-maintenance-signal.log"
+SINCE_MIN="${TEMPORAL_MAINT_SIGNAL_SINCE_MIN:-10}"
+ADDRESS="${TEMPORAL_ADDRESS:-127.0.0.1:7233}"
+SIGNAL_BIN="${TEMPORAL_SIGNAL_BIN:-${CITY}/services/temporal-maintenance/bin/temporal-signal}"
+RIG="${TEMPORAL_MAINT_RIG:-gascity}"
+
+mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
+[[ -f "$STATE_FILE" ]] || echo '{"signalled":[]}' >"$STATE_FILE" 2>/dev/null || true
+
+log_event() {
+  printf '{"ts":"%s","event":"%s",%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >>"$AUDIT_LOG" 2>/dev/null || true
+}
+already_signalled() { jq -e --arg id "$1" '.signalled | index($id)' "$STATE_FILE" >/dev/null 2>&1; }
+mark_signalled() {
+  local tmp
+  tmp=$(mktemp) || return 0
+  # Keep most-recent 500 by insertion order (no `unique`, which sorts).
+  if jq --arg id "$1" '.signalled = ((.signalled + [$id]) | .[-500:])' "$STATE_FILE" >"$tmp" 2>/dev/null; then
+    mv "$tmp" "$STATE_FILE" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# `bd list` has no --since; use --created-after with an absolute RFC3339 cutoff.
+cutoff=$(date -u -d "-${SINCE_MIN} minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+if ! raw=$(gc bd --rig "$RIG" list --status open --created-after "$cutoff" --json 2>&1); then
+  log_event "list_failed" "\"err\":$(jq -Rn --arg e "$raw" '$e' 2>/dev/null || echo '""')"
+  exit 0
+fi
+mapfile -t rows < <(
+  jq -rc '.[]? | select((.labels // []) | index("temporal-escalation"))
+          | select(.metadata.temporal.cycle_key and .metadata.temporal.repo and .metadata.temporal.branch)
+          | {id, repo: .metadata.temporal.repo, cycle: .metadata.temporal.cycle_key, branch: .metadata.temporal.branch}' <<<"$raw" 2>/dev/null || true
+)
+
+for row in "${rows[@]}"; do
+  [[ -z "$row" ]] && continue
+  id=$(jq -r '.id' <<<"$row")
+  repo=$(jq -r '.repo' <<<"$row")
+  cycle=$(jq -r '.cycle' <<<"$row")
+  branch=$(jq -r '.branch' <<<"$row")
+  already_signalled "$id" && continue
+
+  if "$SIGNAL_BIN" --address "$ADDRESS" --repo "$repo" --cycle "$cycle" \
+    --signal escalation --branch "$branch" >>"$AUDIT_LOG" 2>&1; then
+    mark_signalled "$id"
+    log_event "escalated" "\"bead\":\"$id\",\"repo\":\"$repo\",\"cycle\":\"$cycle\",\"branch\":\"$branch\""
+  else
+    log_event "escalation_skipped" "\"bead\":\"$id\",\"repo\":\"$repo\",\"cycle\":\"$cycle\",\"branch\":\"$branch\""
+  fi
+done
+
+exit 0

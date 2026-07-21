@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+mkdir -p "$TMP/bin" "$TMP/city/.gc"
+cat > "$TMP/bin/gc" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\t%s\n' "${MODE:?}" "$*" >> "${CALL_LOG:?}"
+
+if [[ "$1 $2" == "rig list" ]]; then
+    cat <<'OUT'
+  research:
+    Prefix: dr
+OUT
+    exit 0
+fi
+
+if [[ "$1" == "events" ]]; then
+    if [[ "$MODE" == help ]]; then
+        printf '%s\n' '{"subject":"dr-help"}'
+    else
+        printf '%s\n' '{"subject":"dr-blocker"}'
+    fi
+    exit 0
+fi
+
+if [[ "$1 $2 $3 $4" == "bd --rig research show" ]]; then
+    if [[ "$MODE" == help ]]; then
+        if [[ -f "$HELP_SURFACED" ]]; then
+            printf '%s\n' '[{"id":"dr-help","status":"blocked","metadata":{"help_request":"Need operator input","gc.help_surfaced_at":"delivered"}}]'
+        else
+            printf '%s\n' '[{"id":"dr-help","status":"blocked","metadata":{"help_request":"Need operator input"}}]'
+        fi
+    else
+        printf '%s\n' '[{"id":"dr-blocker","status":"closed","created_by":"research-pl-gc-owner","assignee":"worker-gc-1","title":"Repair blocker","metadata":{}}]'
+    fi
+    exit 0
+fi
+
+if [[ "$1 $2 $3 $4" == "bd --rig research dep" ]]; then
+    printf '%s\n' '[{"id":"dr-dependent","status":"deferred","title":"Resume validation"}]'
+    exit 0
+fi
+
+if [[ "$1 $2 $3 $4" == "bd --rig research update" ]]; then
+    : > "$HELP_SURFACED"
+    exit 0
+fi
+
+if [[ "$1 $2" == "session nudge" ]]; then
+    target="$3"
+    if [[ ",${FAIL_TARGETS:-}," == *",${target},"* ]]; then
+        exit 1
+    fi
+    exit 0
+fi
+
+echo "unexpected gc invocation: $*" >&2
+exit 2
+EOF
+chmod +x "$TMP/bin/gc"
+
+export PATH="$TMP/bin:$PATH"
+export CALL_LOG="$TMP/calls.log"
+export HELP_SURFACED="$TMP/help-surfaced"
+
+count_calls() {
+    local pattern="$1"
+    grep -c -- "$pattern" "$CALL_LOG" 2>/dev/null || true
+}
+
+# A failed help nudge must not stamp delivery; the next invocation retries.
+export MODE=help
+export GC_STORE_ROOT="$TMP/city"
+export FAIL_TARGETS=mayor
+: > "$CALL_LOG"
+"$ROOT/bin/help-request-surface" 2>"$TMP/help-fail.err"
+[[ ! -e "$HELP_SURFACED" ]]
+[[ $(count_calls $'help\tsession nudge mayor') -eq 1 ]]
+[[ $(count_calls $'help\tbd --rig research update') -eq 0 ]]
+
+export FAIL_TARGETS=
+"$ROOT/bin/help-request-surface"
+[[ -e "$HELP_SURFACED" ]]
+[[ $(count_calls $'help\tsession nudge mayor') -eq 2 ]]
+[[ $(count_calls $'help\tbd --rig research update') -eq 1 ]]
+
+# Once acknowledged and stamped, the quiet path sends nothing further.
+"$ROOT/bin/help-request-surface"
+[[ $(count_calls $'help\tsession nudge mayor') -eq 2 ]]
+echo "ok: help request failure remains retryable; acknowledged delivery advances dedup"
+
+# One failed recipient must retry while another recipient's acknowledged
+# delivery remains deduplicated.
+export MODE=wake
+export FAIL_TARGETS=mayor
+STATE="$TMP/city/.gc/wake-mayor-on-blocker-close-state.json"
+: > "$CALL_LOG"
+"$ROOT/bin/wake-mayor-on-blocker-close" 2>"$TMP/wake-fail.err"
+jq -e 'has("creator::dr-blocker::gc-owner")' "$STATE" >/dev/null
+jq -e 'has("dr-blocker::dr-dependent") | not' "$STATE" >/dev/null
+[[ $(count_calls $'wake\tsession nudge mayor') -eq 1 ]]
+[[ $(count_calls $'wake\tsession nudge gc-owner') -eq 1 ]]
+
+# Mayor retries; the already acknowledged owner does not.
+"$ROOT/bin/wake-mayor-on-blocker-close" 2>>"$TMP/wake-fail.err"
+[[ $(count_calls $'wake\tsession nudge mayor') -eq 2 ]]
+[[ $(count_calls $'wake\tsession nudge gc-owner') -eq 1 ]]
+
+export FAIL_TARGETS=
+"$ROOT/bin/wake-mayor-on-blocker-close"
+jq -e 'has("creator::dr-blocker::gc-owner") and has("dr-blocker::dr-dependent")' "$STATE" >/dev/null
+[[ $(count_calls $'wake\tsession nudge mayor') -eq 3 ]]
+[[ $(count_calls $'wake\tsession nudge gc-owner') -eq 1 ]]
+
+# Both recipients are now quiet.
+"$ROOT/bin/wake-mayor-on-blocker-close"
+[[ $(count_calls $'wake\tsession nudge mayor') -eq 3 ]]
+[[ $(count_calls $'wake\tsession nudge gc-owner') -eq 1 ]]
+echo "ok: blocker-close dedup advances per recipient only after acknowledged delivery"
+echo "PASS: F10 delivery-acknowledged dedup fixtures"

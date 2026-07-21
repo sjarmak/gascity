@@ -1,0 +1,25 @@
+# blocked-routed-reaper — every 15m, clear gc.routed_to on non-workable beads
+# (status=blocked/deferred) so the workflow-root / GC_TRIGGER_BEAD_ID spawn path
+# stops respawning no-op polecats for them (gc-nby7oo class, RCA gc-453188).
+#
+# ROOT (gascity-source, upstream-gated): the canonical pool demand query
+# `bd ready --metadata-field gc.routed_to` correctly gates status (A/B repro:
+# blocked+deferred excluded), BUT the workflow-root dispatch reads
+# listActiveWorkflowProjectionBeads (internal/api/orders_feed.go:292 = raw
+# store.List(AllowScan:true), NO status filter) and spawns roots by gc.routed_to
+# without re-checking status. A blocked workflow root that still carries
+# gc.routed_to therefore respawns workers that drain no-op + poison work_dirs.
+# This reaper is the in-floor MITIGATION until the source gate lands; clearing
+# routed_to removes the bead from the spawn selection (it is re-routed when it
+# reopens). Recurrence is fast (5 offenders re-accumulated within ~1h of a manual
+# sweep on 2026-07-05), so this runs on a tight cooldown.
+[order]
+description = "Every 15m: clear gc.routed_to on blocked/deferred beads fleet-wide (gc-nby7oo class, gc-453188 mitigation). Clearing routed_to prevents no-op worker selection while the writer that re-stamps blocked roots is identified and status-gated (gc-4zb); the read-side projection fix gc-w3q does not stop that writer. Audits every repair in .gc/blocked-routed-reaper.log, but nudges mayor only once per newly seen offender; recurring known beads stay silent. Manual sweep cleared 20 on 2026-07-05; 5 re-accumulated within the hour, hence the standing reaper."
+trigger = "cooldown"
+interval = "15m"
+exec = "/home/ds/gas-city/bin/blocked-routed-reaper --apply --nudge-mayor"
+timeout = "120s"
+# Fail OPEN on open-work-gate timeout (gastownhall/gascity#2893): unsetting
+# gc.routed_to on already-blocked beads is idempotent (re-clear is a no-op), so a
+# duplicate run under gate contention is harmless.
+idempotent = true

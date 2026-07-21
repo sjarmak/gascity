@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""issue-merge-watcher: close covered issues whose fixing PR has merged.
+
+Part of the issue-hygiene routine (mayor gc-429253, piece 2). The repo's native
+auto-close only fires when a merged PR carries a `Closes #N` keyword targeting the
+default branch; many fixes merged WITHOUT the keyword, leaving the issue open
+(17 such in the 2026-06 triage). This reconciles a human-verified covered-map
+(issue -> PR) by closing the mapped issue once — and only once — its PR is MERGED.
+
+DETERMINISTIC ONLY (ZFC): the sole auto-act signal is "mapped PR is merged" on a
+human-verified pair. No heuristics, no semantic judgement, never a time-based
+close. An OPEN/CLOSED-unmerged PR never triggers a close. Idempotent: already-
+closed issues are skipped, so re-runs are safe.
+
+Closing an issue is an external GitHub write -> default is DRY-RUN (report only).
+--apply performs the closes. Wire the order with --apply only after the dry-run
+is reviewed (the go-live toggle is a maintainer call).
+
+Config: the covered-map (default .gc/issue-hygiene-covered-map.txt), lines
+  "#<issue> -> PR#<pr>"  (blank lines / # comments ignored).
+Audit:  .gc/issue-merge-watcher.log (JSONL).
+
+Usage: issue-merge-watcher [--apply] [--nudge-mayor] [--map PATH] [--repo R] [--json]
+Env:   ISSUE_HYGIENE_REPO (default gastownhall/gascity)
+"""
+import sys, os, re, json, time, subprocess
+
+CITY = "/home/ds/gas-city"
+DEFAULT_MAP = os.path.join(CITY, ".gc", "issue-hygiene-covered-map.txt")
+AUDIT_LOG = os.path.join(CITY, ".gc", "issue-merge-watcher.log")
+REPO = os.environ.get("ISSUE_HYGIENE_REPO", "gastownhall/gascity")
+PAIR_RE = re.compile(r"#(\d+)\s*->\s*PR#(\d+)")
+
+
+def gh_json(args, timeout=60):
+    """Run a gh command returning parsed JSON, or None on any failure (fail-safe:
+    an unreadable PR/issue is treated as 'unknown' and never triggers a close)."""
+    try:
+        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout)
+    except (ValueError, TypeError):
+        return None
+
+
+def load_map(path):
+    """[(issue, pr)] from the covered-map; skips blanks/comments/malformed."""
+    pairs = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") and "->" not in line:
+                continue
+            m = PAIR_RE.search(line)
+            if m:
+                pairs.append((int(m.group(1)), int(m.group(2))))
+    return pairs
+
+
+def main():
+    argv = sys.argv[1:]
+    apply = "--apply" in argv
+    nudge = "--nudge-mayor" in argv
+    json_out = "--json" in argv
+    map_path = argv[argv.index("--map") + 1] if "--map" in argv else DEFAULT_MAP
+    repo = argv[argv.index("--repo") + 1] if "--repo" in argv else REPO
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+
+    try:
+        pairs = load_map(map_path)
+    except OSError as e:
+        print(f"issue-merge-watcher: cannot read map: {e}", file=sys.stderr)
+        return 1
+
+    # Resolve each PR's merge state once (PRs can map to several issues).
+    pr_merged = {}
+    for _, pr in pairs:
+        if pr in pr_merged:
+            continue
+        d = gh_json(["pr", "view", str(pr), "--repo", repo, "--json", "state,mergedAt"])
+        pr_merged[pr] = bool(d and d.get("state") == "MERGED")
+
+    closed, skipped, candidates = [], [], []
+    for issue, pr in pairs:
+        if not pr_merged.get(pr):
+            skipped.append({"issue": issue, "pr": pr, "why": "pr-not-merged"})
+            continue
+        iv = gh_json(["issue", "view", str(issue), "--repo", repo, "--json", "state,title"])
+        if iv is None:
+            skipped.append({"issue": issue, "pr": pr, "why": "issue-unreadable"})
+            continue
+        if iv.get("state") != "OPEN":
+            skipped.append({"issue": issue, "pr": pr, "why": "issue-already-closed"})
+            continue
+        cand = {"issue": issue, "pr": pr, "title": (iv.get("title") or "")[:80]}
+        candidates.append(cand)
+        if apply:
+            comment = (f"Resolved by merged #{pr}. Auto-closed by the issue-hygiene "
+                       f"merge-watcher (human-verified covered-map).")
+            rc = subprocess.run(
+                ["gh", "issue", "close", str(issue), "--repo", repo, "--reason", "completed",
+                 "--comment", comment], capture_output=True, text=True, timeout=60).returncode
+            (closed if rc == 0 else skipped).append(
+                {**cand, **({} if rc == 0 else {"why": "gh-close-failed"})})
+
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    summary = {"ts": ts, "repo": repo, "pairs": len(pairs), "merged_prs": sum(pr_merged.values()),
+               "candidates": len(candidates), "closed": len(closed), "apply": apply}
+    try:
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps({**summary, "detail": candidates}) + "\n")
+    except OSError:
+        pass
+
+    if nudge and candidates and not apply:
+        lines = [f"issue-merge-watcher: {len(candidates)} covered issue(s) whose PR has "
+                 f"MERGED but the issue is still OPEN (DRY-RUN — not closed):"]
+        lines += [f"  #{c['issue']} <- merged #{c['pr']}  {c['title']}" for c in candidates]
+        lines.append("Flip the order to --apply to auto-close these (deterministic merge "
+                     "signal, human-verified map). Log: " + AUDIT_LOG)
+        subprocess.run(["gc", "mail", "send", "mayor", "-s",
+                        f"issue-merge-watcher: {len(candidates)} merged-but-open covered issue(s)",
+                        "-m", "\n".join(lines)], capture_output=True, timeout=30)
+
+    if json_out:
+        print(json.dumps({"summary": summary, "candidates": candidates, "skipped": skipped}, indent=2))
+        return 0
+
+    mode = "APPLY" if apply else "DRY-RUN"
+    print(f"issue-merge-watcher ({mode})  repo={repo}  pairs={len(pairs)} "
+          f"merged-PRs={summary['merged_prs']}  candidates={len(candidates)} closed={len(closed)}")
+    for c in candidates:
+        verb = "CLOSED" if (apply and c in closed) else ("would-close" if not apply else "FAILED")
+        print(f"  {verb:<11} #{c['issue']} <- merged #{c['pr']}  {c['title']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

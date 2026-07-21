@@ -1,0 +1,11 @@
+# 2026-07-20 dr-u9py, authorized by mayor mail gc-524817: enumerate each active
+# canonical dispatcher target/session and verify its own trace identity. A shared
+# host/Dolt stall must never recommend an arbitrary kill. Retire this local census
+# only when gc exposes an equivalent canonical target/session heartbeat API.
+[order]
+description = "Every 5m: map active canonical control-dispatcher targets/sessions to their exact trace; detect per-target port-0 wedges and stopped heartbeats; classify simultaneous staleness as a shared host/Dolt stall with no arbitrary-kill recommendation. Alerts mayor cooldown-deduped; malformed/missing identity fails safe (dr-u9py, gc-yn516)."
+trigger = "cooldown"
+interval = "5m"
+exec = "/home/ds/gas-city/bin/dispatcher-liveness-sensor --nudge-mayor"
+timeout = "60s"
+idempotent = true

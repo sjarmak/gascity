@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# maintenance-cycle — unified UPSTREAM-MAINTAINER cycle for gastownhall/gascity.
+#
+# OWNER: gascity-maintenance-pl (the upstream-repo maintainer PL). This is the
+# centerpiece order that walks the upstream queue BY PRIORITY and does BOTH
+# halves of maintainer work on every tick:
+#
+#   (1) REVIEW the top-priority open CONTRIBUTOR PR that needs review.
+#   (2) AUTHOR a PR for the top-priority authorable OPEN issue (mol-pr-from-issue).
+#
+# It UNIFIES the previously-scattered pieces:
+#   - ABSORBS the staged author-cycle (the issue-authoring half).
+#   - COMPLEMENTS pr-state-poller (which stays as the fast 15m loop that iterates
+#     copilot reviews on OUR OWN open PRs — a different, narrower job).
+#   - CONSUMES the morning briefing that morning-triage-cycle produces at 7am
+#     (/home/ds/gas-city/.gc/pr-pipeline/morning-briefing/<date>.md) as the priority-ranked map.
+#
+# WHY ZFC (selection delegated to the polecat, NOT hardcoded here)
+#   "Which PR is highest-priority to review" and "which issue is the top
+#   authorable one" are semantic JUDGMENTS. Per the workspace ZFC rule, this
+#   exec does ONLY mechanism: create tracking beads, sling, dedup structurally,
+#   log. The polecat reads the briefing + live `gh`/`gc bd list` state and picks.
+#   No keyword/priority scoring lives in this script.
+#
+# WHY EXEC-BASED (not a native formula+pool order)
+#   Same as morning-triage-cycle / author-cycle: formula+pool orders are
+#   silently broken upstream (gastownhall/gascity#1440 — wisp roots stamp
+#   `order-run:` which trips hasOpenWorkStrict; fix in flight as PR #1986).
+#   The exec wrapper sidesteps that gating. Replace with a native formula+pool
+#   order once #1986 lands + supervisor restarts.
+#
+# WHY PLAIN BEAD ROUTING (--no-formula --nudge, not --on <molecule>)
+#   1. Both picks are SELF-SELECTED by the polecat, so no fixed `pr`/`issue` var
+#      exists at exec time to pass to --on.
+#   2. v2-workflow formula instantiation is currently DARK (control-dispatcher
+#      agent not found — D-I gc-hkoup). Plain bead routing is the reliable path;
+#      the polecat invokes the inner mol-pr-review / mol-pr-from-issue itself.
+#   --nudge is required to wake warm-idle workers (gascity#1129); the gc-sling
+#   wrapper auto-injects it, but we pass it explicitly here for clarity.
+#
+# CONSERVATIVE OVERNIGHT POSTURE (Stephanie is away)
+#   - Authoring: straightforward -> auto_push; bounded -> branch-ready-HALT;
+#     needs-decision -> do NOT author, escalate to the morning ledger.
+#   - Review: POSTING a review on an incoming contributor PR is fine. But
+#     auto-APPROVE / merge is NEVER done by this cycle — the polecat produces a
+#     verdict and, for approve/merge, escalates to the morning ledger for a
+#     human/review-record gate. NO auto-merge is ever designed in.
+#
+# USAGE
+#   maintenance-cycle              # create review + author beads, sling both
+#   maintenance-cycle --dry-run    # report what would happen, no side effects
+#   maintenance-cycle --review-only
+#   maintenance-cycle --author-only
+
+set -uo pipefail
+
+# Force the city's native (file-backed) beads store, same reason as
+# pr-state-poller: an inherited GC_BEADS=bd would misfile sling-created beads
+# in the bd-default store where city-store sling routing can't reach them.
+unset GC_BEADS
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${CITY}/.gc/maintenance-cycle.log"
+POLECAT_TARGET="${MAINTENANCE_CYCLE_POLECAT:-/home/ds/gascity/polecat}"
+# Top-level post to #gascity-maintenance via the PL (loop_close_top_level=true),
+# same routing as morning-triage-cycle / author-cycle.
+TARGET_CHANNEL="${MAINTENANCE_CYCLE_TARGET_CHANNEL:-C0B25SS12CD}"
+TARGET_PL_AGENT="${MAINTENANCE_CYCLE_PL_AGENT:-gascity-maintenance-pl}"
+
+DRY_RUN=0
+DO_REVIEW=1
+DO_AUTHOR=1
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)     DRY_RUN=1; shift ;;
+    --review-only) DO_AUTHOR=0; shift ;;
+    --author-only) DO_REVIEW=0; shift ;;
+    -h|--help)     sed -n 's/^# \{0,1\}//p' "$0" | head -60; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+log_event() {
+  local event="$1" detail="${2:-}"
+  local ts
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq -nc --arg ts "$ts" --arg event "$event" --arg detail "$detail" \
+    '{ts: $ts, event: $event, detail: $detail}' >> "$AUDIT_LOG"
+}
+
+# Structural in-flight guard (mechanism, not judgment): print 0 and return 0 if
+# an OPEN maintenance-cycle bead of this half already exists, so we never stack
+# a second review/author bead while the prior one is still working. The polecat
+# also dedups semantically against live PR/issue state (already-open PRs, beads
+# referencing the same #N) — this guard just prevents same-half pileup across
+# ticks. We match on the half label we stamp at create time.
+open_half_inflight() {
+  local half_label="$1"   # maintenance-cycle:review | maintenance-cycle:author
+  gc bd list --rig gascity --status open --json 2>/dev/null \
+    | jq -e --arg lbl "$half_label" \
+        '[.[]? | select((.labels // []) | index($lbl))] | length > 0' \
+        >/dev/null 2>&1
+}
+
+DATE_TAG=$(date -u +%Y%m%d)
+TS_TAG=$(date -u +%Y%m%dT%H%M%SZ)
+
+# Shared loop-close metadata builder: top-level post to TARGET_CHANNEL via PL.
+build_loop_close_metadata() {
+  local asked_at
+  asked_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq -nc \
+    --arg channel "$TARGET_CHANNEL" \
+    --arg asked_at "$asked_at" \
+    --arg pl "$TARGET_PL_AGENT" \
+    '{originating_slack: {channel_id: $channel, thread_ts: "", asked_at: $asked_at, user_id: ""},
+      originating_pl_agent: $pl,
+      loop_close_top_level: "true"}'
+}
+
+# create_and_sling <half_label> <priority> <title> <body>
+# Mechanism only: create the tracking bead, stamp loop-close metadata, sling
+# plain (--no-formula --nudge). Returns the bead id on stdout, empty on failure.
+create_and_sling() {
+  local half_label="$1" priority="$2" title="$3" body="$4"
+  local bead_id
+  # Canonical `gc bd --rig gascity create` form — bare `bd create` fails under
+  # the controller exec context (see morning-triage-cycle note).
+  bead_id=$(gc bd --rig gascity create "$title" \
+    --priority "$priority" \
+    --label "maintenance-cycle,${half_label},rig:gascity" \
+    --body-file - <<EOF 2>&1 | grep -oE 'gc-[a-z0-9]+' | head -1
+$body
+EOF
+)
+  if [[ -z "$bead_id" ]]; then
+    log_event "bead_create_failed" "half=$half_label"
+    return 1
+  fi
+  log_event "bead_created" "half=$half_label bead=$bead_id"
+
+  local meta
+  meta=$(build_loop_close_metadata)
+  if ! gc bd --rig gascity update "$bead_id" --metadata "$meta" >/dev/null 2>&1; then
+    log_event "loop_close_metadata_failed" "bead=$bead_id"
+    # Non-fatal: bead + sling still useful; result recoverable manually.
+  fi
+
+  if gc-sling "$POLECAT_TARGET" "$bead_id" --no-formula --nudge >/dev/null 2>&1; then
+    log_event "slung" "half=$half_label bead=$bead_id pool=$POLECAT_TARGET"
+    echo "$bead_id"
+    return 0
+  fi
+  log_event "sling_failed" "half=$half_label bead=$bead_id"
+  return 1
+}
+
+# ---- REVIEW half --------------------------------------------------------------
+
+read -r -d '' REVIEW_BODY <<'BODY'
+You are a polecat doing UPSTREAM-MAINTAINER REVIEW for gastownhall/gascity.
+Do this for ONE pass:
+
+1. SELECT (judgment — this is yours, not the script's).
+   Read the latest morning briefing (newest by date) at
+   /home/ds/gas-city/.gc/pr-pipeline/morning-briefing/<latest>.md. Its "IN-FLIGHT — community PRs
+   covering P1 issues (your review/merge queue)" section is the priority-ranked
+   review queue. Cross-check against LIVE state:
+     gh pr list --repo gastownhall/gascity --state open \
+       --json number,title,labels,reviewDecision,updatedAt
+   Pick the SINGLE highest-priority OPEN contributor PR that NEEDS review and is
+   NOT one we authored (ours go through the OUR-PR copilot loop, pr-state-poller).
+   Prefer: covers a P1 issue, no current maintainer review on the latest commit,
+   not blocked on the author. If NOTHING qualifies, exit clean: set
+   summary_for_human="no contributor PR needs review this cycle", close the bead.
+   Do NOT force a pick.
+
+2. DEDUP (judgment). Skip a PR if an open review bead already targets it, or if
+   it already carries a fresh maintainer verdict on its latest commit. One PR
+   per cycle.
+
+3. REVIEW. Run the upstream review path (mol-pr-review, or the
+   /gascity-review-incoming-pr building blocks) on the selected PR. Produce a
+   maintainer-grade verdict: approve / request-changes / close, with file:line
+   reasoning.
+   ISSUE LINKAGE (advisory finding, NOT a blocker — Stephanie 2026-06-28, replaces
+   the reverted CI gate): note whether the PR links/covers an issue — a closing
+   keyword (Closes/Fixes/Resolves #N) in the body, OR a brief note that none
+   applies. Missing linkage is a review FINDING to flag (so the issue self-closes
+   on merge and the merge-watcher can map it), never a merge gate or a nag.
+   COVERS-ISSUE EMIT (ZFC: YOUR model judgment is the coverage signal): when you
+   determine this PR fixes/covers issue(s) #N that it does NOT already close via a
+   keyword, WRITE a structured line `covers_issue: #N` (one per covered issue, or
+   `covers_issue: #N, #M`) into the review record /home/ds/gas-city/.gc/pr-pipeline/reviews/pr-<PR>.md.
+   The covered-map feeder ingests it into the canonical map so the merge-watcher
+   auto-closes the issue when the PR merges — no contributor-facing CI, no body
+   keyword-scanning. Emit ONLY for genuine coverage you'd stake a maintainer review
+   on; omit when unsure (the map only acts on a real merge).
+
+4. CONSERVATIVE POSTING GATE (Stephanie is AWAY).
+   - Posting "request changes" or non-approving review COMMENTS on an incoming
+     contributor PR is FINE — post them.
+   - Do NOT auto-APPROVE and do NOT MERGE. If your verdict is approve/merge,
+     do NOT submit the approval or merge — instead record the recommendation
+     (PR #, verdict, rationale) for the MORNING LEDGER so a human / review-record
+     gate clears it. NEVER auto-merge.
+
+5. REPORT. Set summary_for_human on this bead (PR #, verdict, what you posted vs
+   what you escalated) so loop-close surfaces it to #gascity-maintenance.
+BODY
+
+# ---- AUTHOR half --------------------------------------------------------------
+
+read -r -d '' AUTHOR_BODY <<'BODY'
+You are a polecat doing UPSTREAM-MAINTAINER AUTHORING for gastownhall/gascity.
+Do this for ONE pass:
+
+1. SELECT (judgment — yours, not the script's).
+   Read the latest morning briefing (newest by date) at
+   /home/ds/gas-city/.gc/pr-pipeline/morning-briefing/<latest>.md. The dispatch-candidate /
+   uncovered-P1 sections are the priority-ranked authoring queue. Cross-check
+   against LIVE state:
+     gh issue list --repo gastownhall/gascity --state open \
+       --json number,title,labels,assignees
+     gh pr list  --repo gastownhall/gascity --state open --json number,title,body
+   Pick the SINGLE highest-priority OPEN issue that ALL hold for:
+   - NOT already in-flight (no open authoring bead referencing it).
+   - NOT already covered by an open PR (no PR with Fixes #N / Closes #N).
+   - Passes the STRAIGHTFORWARD or BOUNDED bar in step 2 (skip needs-decision).
+   If NO issue qualifies, exit clean: set summary_for_human="no authorable issue
+   this cycle", close the bead. Do NOT force a pick.
+
+2. CLASSIFY (auto-push classifier — apply to the selected issue):
+   - straightforward -> auto_push=true. ALL must hold: single/sibling-file diff
+     (no cross-cutting refactor language); no label in breaking-change /
+     requires-design / requires-discussion / epic / tracking / arch /
+     discussion-needed / policy; issue OPEN; no open PR with Fixes/Closes #N;
+     no design-doc (ADR/RFC) reference; <=3 acceptance criteria (or absent).
+   - bounded -> auto_push=false (ship to branch-ready, HALT). Touches cmd/gc
+     non-protected; 4+ criteria; multiple subsystems.
+   - needs-decision -> do NOT author; escalate to the MORNING LEDGER (design-doc/
+     ADR/RFC ref; any requires-* / breaking-change label; discuss-y language).
+   Default on ambiguity: bounded. (CONSERVATIVE: Stephanie is AWAY — only
+   straightforward auto-pushes; everything else halts or escalates.)
+
+3. AUTHOR. Run mol-pr-from-issue --var issue_number=<selected> with auto_push set per
+   step 2. (Inner v2 formula strands until D-I gc-hkoup lands+deploys; if it
+   strands, band-aid per the proven --no-formula path and log.) NEVER auto-merge
+   the resulting PR.
+
+4. CHAINED REVIEW. On a successful PR open, the resulting PR MUST go through
+   mol-pr-review before any ready-for-review. Surface the verdict; for any
+   approve/merge, escalate to the morning ledger (no auto-merge).
+
+5. REPORT. Set summary_for_human on this bead (issue picked, classification,
+   PR/branch result) so loop-close surfaces it to #gascity-maintenance.
+BODY
+
+if (( DRY_RUN )); then
+  echo "[dry-run] maintenance-cycle ${TS_TAG}"
+  (( DO_REVIEW )) && echo "[dry-run] REVIEW half: create bead + sling (--no-formula --nudge) -> $POLECAT_TARGET; polecat self-selects top contributor PR to review; post request-changes OK, escalate approve/merge to morning ledger"
+  (( DO_AUTHOR )) && echo "[dry-run] AUTHOR half: create bead + sling (--no-formula --nudge) -> $POLECAT_TARGET; polecat self-selects top authorable issue; straightforward->auto_push, bounded->branch-ready-halt, needs-decision->escalate"
+  echo "[dry-run] in-flight guards would skip a half whose prior bead is still open"
+  exit 0
+fi
+
+rc=0
+
+if (( DO_REVIEW )); then
+  if open_half_inflight "maintenance-cycle:review"; then
+    log_event "skip_review_inflight" "an open review bead already exists"
+  else
+    REVIEW_TITLE="Maintenance cycle ${DATE_TAG} — review top-priority contributor PR"
+    if ! create_and_sling "maintenance-cycle:review" 2 "$REVIEW_TITLE" "$REVIEW_BODY" >/dev/null; then
+      rc=1
+    fi
+  fi
+fi
+
+if (( DO_AUTHOR )); then
+  if open_half_inflight "maintenance-cycle:author"; then
+    log_event "skip_author_inflight" "an open author bead already exists"
+  else
+    AUTHOR_TITLE="Maintenance cycle ${DATE_TAG} — author PR for top-priority issue"
+    if ! create_and_sling "maintenance-cycle:author" 2 "$AUTHOR_TITLE" "$AUTHOR_BODY" >/dev/null; then
+      rc=1
+    fi
+  fi
+fi
+
+log_event "tick" "review=$DO_REVIEW author=$DO_AUTHOR rc=$rc"
+exit "$rc"

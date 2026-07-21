@@ -1,0 +1,20 @@
+# tmux-refresh-failure-sensor — ~45min early-warning for host death by memory
+# exhaustion (dr-59p; RCA docs/rca-host-death-2026-07-15-memory-exhaustion.md).
+# On 2026-07-15 the host hard-died (~85m city outage) with no guard firing:
+# resource-sweep gates on MemAvailable < 4G but MemAvailable never fell below
+# 9.9G while swap sat at 0MB free for hours. The one sharp, non-chronic, ~zero-
+# false-positive signal was the supervisor's own 'tmux state cache: refresh
+# failed in <duration>' line, which appeared ~45min before the death (07:26 at
+# 3m14s, escalating to 18m22s at 07:49). This order tails supervisor.log for
+# over-threshold refresh failures and mails mayor, fingerprint-deduped so a
+# persistent condition mails once while an escalation re-alerts. Read-only;
+# writes only its own dedup-state file. NOT a memory-threshold sensor: swap/
+# commit were chronic and would fire every run (the alert fatigue resource-
+# sweep deliberately avoids).
+[order]
+description = "Every 5m: watch supervisor.log for 'tmux state cache: refresh failed' over 60s (default) within the last 30m and mail mayor. A multi-minute 'tmux -u' is never steady-state; it was the ~45min early-warning signal before the 2026-07-15 host-death outage (3m14s escalating to 18m22s). Fingerprint-deduped so a persistent stall mails once, an escalating worst-case re-alerts. Read-only over the log; deliberately NOT a memory-level threshold (swap/commit are chronic on this box and would fire every run)."
+trigger = "cooldown"
+interval = "5m"
+exec = "/home/ds/gas-city/bin/tmux-refresh-failure-sensor"
+timeout = "60s"
+idempotent = true

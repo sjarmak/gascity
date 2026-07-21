@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""dispatcher-liveness-sensor — out-of-band LOG-based liveness sensor for
+canonical control-dispatcher targets (gc-yn516). Catches the port-0 wedge class
+(gc-74rxa / gc-462084) and the silent-hang class in MINUTES, not 27h.
+
+A bead-STATE health check structurally cannot see this: the dispatcher looks
+"active", roots look routed, but its work-query resolves Dolt at 127.0.0.1:0 (or
+the serve loop hangs) so zero work is read. Only the trace LOG shows it. This
+greps the trace for two independent failure signatures and mails the mayor
+(cooldown-deduped) when either fires:
+
+  1. PORT-0 WEDGE: >= PORT0_MIN "127.0.0.1:0" lines in one target's trace window.
+  2. SILENT HANG: one target's newest trace line is older than STALE_MIN minutes.
+
+Every trace must agree with an active `gc session list` target/session. Multiple
+simultaneously stale targets are reported as a shared host/Dolt stall and never
+as grounds to kill an arbitrary dispatcher.
+
+Usage: dispatcher-liveness-sensor [--nudge-mayor] [--json]
+Exit: 0 always (a sensor must never break the order loop).
+"""
+import calendar
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+CITY = "/home/ds/gas-city"
+TRACE_DIR = os.environ.get("DISPATCHER_LIVENESS_TRACE_DIR",
+                           os.path.join(CITY, ".gc", "runtime"))
+SESSIONS_FILE = os.environ.get("DISPATCHER_LIVENESS_SESSIONS")
+STATE = os.environ.get("DISPATCHER_LIVENESS_STATE",
+                       os.path.join(CITY, ".gc", "observability", "dispatcher-liveness-state.json"))
+COOLDOWN_MIN = 30      # re-alert a standing wedge at most twice an hour
+WINDOW_MIN = 6         # look at roughly the last 6 minutes of trace
+STALE_MIN = 12         # newest trace line older than this = hung serve loop
+PORT0_MIN = 5          # this many :0 errors in the window = wedge
+
+TS_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z(?=\s|$)"
+)
+AGENT_RE = re.compile(r"(?:^|\s)agent=([^\s]+)")
+
+
+def _epoch(line):
+    m = TS_RE.match(line)
+    if not m:
+        return None
+    try:
+        # Trace timestamps are UTC (Z). calendar.timegm is deliberately used
+        # instead of mktime: mktime interprets one tuple as local DST while
+        # time.gmtime() carries tm_isdst=0, creating an exact one-hour phantom
+        # age during daylight-saving time.
+        fraction = int((m.group(2) or "0").ljust(9, "0")) / 1_000_000_000
+        return calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")) + fraction
+    except ValueError:
+        return None
+
+
+def _tail(path, n):
+    try:
+        out = subprocess.run(["tail", "-n", str(n), path], capture_output=True,
+                             text=True, timeout=20).stdout
+        return out.splitlines()
+    except Exception:
+        return []
+
+
+def _load_sessions():
+    """Return active canonical dispatcher sessions or a fail-closed error."""
+    try:
+        if SESSIONS_FILE:
+            with open(SESSIONS_FILE) as f:
+                data = json.load(f)
+        else:
+            proc = subprocess.run(["gc", "session", "list", "--json"],
+                                  capture_output=True, text=True, timeout=30)
+            if proc.returncode != 0:
+                return [], f"gc session list failed (exit {proc.returncode})"
+            data = json.loads(proc.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        return [], f"session census unreadable: {exc}"
+
+    rows = data.get("sessions") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return [], "session census missing sessions list"
+
+    sessions = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict) or row.get("state") != "active":
+            continue
+        target = row.get("alias") or row.get("name")
+        if target != "core.control-dispatcher" and not str(target).endswith("/core.control-dispatcher"):
+            continue
+        session_id = row.get("id")
+        if (not isinstance(target, str) or not target
+                or not isinstance(session_id, str) or not session_id):
+            return [], "active dispatcher session missing or invalid alias/id"
+        if target in seen:
+            return [], f"duplicate active dispatcher target: {target}"
+        seen.add(target)
+        sessions.append({"target": target, "session_id": session_id})
+    if not sessions:
+        return [], "no active canonical dispatcher sessions"
+    return sessions, None
+
+
+def _trace_path(target):
+    return os.path.join(TRACE_DIR, target.replace("/", "--") + "-trace.log")
+
+
+def _evaluate_target(session):
+    target = session["target"]
+    trace = _trace_path(target)
+    result = {**session, "trace": trace, "status": "error", "port0": 0,
+              "newest_age_min": None}
+    lines = _tail(trace, 800)
+    now = time.time()
+    if not lines:
+        result["error"] = "trace unreadable/empty"
+        return result
+
+    # Use the maximum valid timestamp rather than assuming file order. A
+    # partially interleaved writer must not make an older trailing line look
+    # like the newest heartbeat.
+    evidence = [(e, line) for line in lines if (e := _epoch(line)) is not None]
+    if not evidence:
+        result["error"] = "trace has no valid timestamp"
+        return result
+
+    identities = {match.group(1) for _, line in evidence
+                  if (match := AGENT_RE.search(line)) is not None}
+    result["observed_target"] = target if identities == {target} else sorted(identities)
+    if identities != {target}:
+        observed = ",".join(sorted(identities)) if identities else "none"
+        result["error"] = f"trace identity mismatch: expected {target}, observed {observed}"
+        return result
+
+    attributed = [(e, line) for e, line in evidence
+                  if (match := AGENT_RE.search(line)) is not None
+                  and match.group(1) == target]
+    newest = max(e for e, _ in attributed)
+    age_sec = now - newest
+    if age_sec < 0:
+        result["error"] = f"trace timestamp is {round(-age_sec)}s in the future"
+        return result
+
+    # Port-0 is a current rate signal. A historical cluster beside a stale
+    # heartbeat is not a present wedge, so anchor this window to wall clock.
+    port0 = 0
+    for e, line in attributed:
+        if "127.0.0.1:0" in line:
+            delta = now - e
+            if delta is not None and 0 <= delta <= WINDOW_MIN * 60:
+                port0 += 1
+    age_min = age_sec / 60.0
+    result.update({"status": "stale" if age_min > STALE_MIN else "ok",
+                   "port0": port0, "newest_age_min": round(age_min, 1)})
+    return result
+
+
+def evaluate():
+    sessions, census_error = _load_sessions()
+    if census_error:
+        return {"ok": False, "reason": census_error, "targets": [], "alerts": []}
+
+    targets = [_evaluate_target(session) for session in sessions]
+    errors = [target for target in targets if target["status"] == "error"]
+    if errors:
+        return {"ok": False, "reason": "target evidence incomplete/malformed",
+                "targets": targets, "alerts": []}
+
+    alerts = []
+    for target in targets:
+        if target["port0"] >= PORT0_MIN:
+            alerts.append((f"port0_wedge:{target['session_id']}",
+                           f"PORT-0 WEDGE target={target['target']} session={target['session_id']}: "
+                           f"{target['port0']} '127.0.0.1:0' errors in ~{WINDOW_MIN}m; "
+                           f"trace={target['trace']} (gc-74rxa/gc-462084 class)."))
+
+    stale = [target for target in targets if target["status"] == "stale"]
+    if len(stale) == 1:
+        target = stale[0]
+        alerts.append((f"silent_hang:{target['session_id']}",
+                       f"SILENT HANG target={target['target']} session={target['session_id']}: "
+                       f"newest trace line {round(target['newest_age_min'])}m old; "
+                       f"trace={target['trace']}. Exact-session evidence only; no auto-kill gate exists."))
+    elif len(stale) > 1:
+        evidence = ", ".join(
+            f"{target['target']}({target['session_id']},{round(target['newest_age_min'])}m)"
+            for target in stale)
+        shared_key = "shared_stall:" + ",".join(sorted(target["session_id"] for target in stale))
+        alerts.append((shared_key,
+                       f"SHARED DISPATCHER STALL across {len(stale)} targets: {evidence}. "
+                       "Likely host/Dolt overload; recheck for resumed heartbeats and do not kill an arbitrary dispatcher."))
+    return {"ok": True, "targets": targets, "alerts": alerts}
+
+
+def main():
+    argv = sys.argv[1:]
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    r = evaluate()
+    try:
+        st = json.load(open(STATE))
+    except (OSError, ValueError):
+        st = {}
+    if not isinstance(st, dict):
+        st = {}
+    now = time.time()
+    fresh = []
+    for key, message in r.get("alerts", []):
+        last_delivery = st.get(key)
+        if not isinstance(last_delivery, (int, float)) or isinstance(last_delivery, bool):
+            last_delivery = 0
+        if now - last_delivery > COOLDOWN_MIN * 60:
+            fresh.append((key, message))
+    delivered = []
+    if fresh and "--nudge-mayor" in argv:
+        body = "dispatcher-liveness-sensor (gc-yn516):\n" + "\n".join(f"- {m}" for _, m in fresh) \
+               + "\n\nEach target/session is verified against its own trace. " \
+                 "No dispatcher kill is authorized without a separately reviewed exact-session gate."
+        try:
+            sent = subprocess.run(["gc", "mail", "send", "mayor", "-s",
+                                   f"dispatcher-liveness: {len(fresh)} signature(s) — control-dispatcher wedge/hang",
+                                   "-m", body], timeout=120)
+            if sent.returncode == 0:
+                delivered = fresh
+        except Exception:
+            pass
+    for k, _ in delivered:
+        st[k] = now
+    try:
+        json.dump(st, open(STATE, "w"))
+    except OSError:
+        pass
+    if "--json" in argv:
+        print(json.dumps({**r, "alerted": [m for _, m in delivered]}, indent=2))
+    else:
+        print(f"ok={r.get('ok')} targets={len(r.get('targets', []))} "
+              f"alerts={len(r.get('alerts', []))} alerted={len(delivered)}")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

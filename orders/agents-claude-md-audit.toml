@@ -1,0 +1,18 @@
+# Weekly AGENTS.md + CLAUDE.md hygiene audit
+#
+# Keeps per-project agent context docs aligned with codebase reality.
+# The order is mechanical plumbing only — it slings a polecat to do the
+# actual LLM judgment work (does this doc drift from main? are best-practice
+# sections present? are file refs still valid?). Polecat halts at report-
+# ready; mayor reviews + decides which findings to action.
+#
+# Cadence: weekly on Monday 09:00 EDT — quiet hour, ahead of the 7:00 ET
+# morning-triage and after pl-nightly-cycle at 4:00 EDT. Greenlit by
+# Stephanie 2026-05-26.
+
+[order]
+description = "Weekly: audit AGENTS.md + CLAUDE.md across all rigs for staleness, drift from codebase, missing best-practice sections"
+trigger = "cron"
+schedule = "0 9 * * 1"
+exec = "/home/ds/gas-city/scripts/agents-claude-md-audit.sh"
+timeout = "10m"

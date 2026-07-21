@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""resource-creep-report — daily monotonic-growth detector over the observability
+time-series (gc-457861 Part B3). Diffs the latest per-MCP-server RSS + supervisor
+cgroup against a ~7-day baseline and flags anything trending UP — the signal that
+would have caught code-intel-copilot climbing back to 5GB over three weeks unnoticed.
+
+Produces ONE summary line + any creep flags and mails the mayor (who routes the
+morning digest to #all-agent-city — city-infra-pl does not post Slack directly).
+
+Usage: resource-creep-report [--nudge-mayor] [--days N]
+Exit: 0 always.
+"""
+import json, os, sys, time
+
+CITY = "/home/ds/gas-city"
+METRICS = os.path.join(CITY, ".gc", "observability", "resource-metrics.jsonl")
+GROWTH_FLAG_PCT = 25.0   # flag a server/cgroup up >25% vs baseline
+MIN_RSS_G = 0.5          # ignore trivially small servers
+
+
+def _load():
+    try:
+        with open(METRICS) as f:
+            return [json.loads(l) for l in f if l.strip()]
+    except (OSError, ValueError):
+        return []
+
+
+def _parse_ts(s):
+    # "2026-07-07T12:34:56-0400" -> epoch (best-effort, tz-naive fallback)
+    try:
+        return time.mktime(time.strptime(s.split("+")[0].split("-04")[0].split("-05")[0], "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return None
+
+
+def main():
+    argv = sys.argv[1:]
+    days = 7
+    if "--days" in argv:
+        try:
+            days = int(argv[argv.index("--days") + 1])
+        except (ValueError, IndexError):
+            pass
+    rows = _load()
+    if len(rows) < 2:
+        line = f"resource-creep: insufficient history ({len(rows)} samples) — baseline builds over ~{days}d."
+        print(line)
+        sys.exit(0)
+
+    latest = rows[-1]
+    now = _parse_ts(latest["ts"]) or time.time()
+    target = now - days * 86400
+    # baseline = the oldest sample within the window, else the very first sample
+    baseline = rows[0]
+    for r in rows:
+        t = _parse_ts(r["ts"])
+        if t and t >= target:
+            baseline = r
+            break
+
+    def mcp_rss(sample):
+        return {k: v.get("rss_g", 0) for k, v in (sample.get("mcp_servers") or {}).items()}
+
+    b, l = mcp_rss(baseline), mcp_rss(latest)
+    flags = []
+    for srv, cur in l.items():
+        if cur < MIN_RSS_G:
+            continue
+        base = b.get(srv, 0)
+        if base <= 0:
+            flags.append(f"{srv}: NEW {cur}G (absent at baseline)")
+        elif (cur - base) / base * 100 >= GROWTH_FLAG_PCT:
+            flags.append(f"{srv}: {base}G -> {cur}G (+{round((cur-base)/base*100)}%)")
+    cg_b, cg_l = baseline.get("supervisor_cgroup_g"), latest.get("supervisor_cgroup_g")
+    if cg_b and cg_l and (cg_l - cg_b) / cg_b * 100 >= GROWTH_FLAG_PCT:
+        flags.append(f"supervisor cgroup: {cg_b}G -> {cg_l}G (+{round((cg_l-cg_b)/cg_b*100)}%)")
+
+    span_h = round((now - (_parse_ts(baseline['ts']) or now)) / 3600, 1)
+    top_mcp = sorted(l.items(), key=lambda kv: kv[1], reverse=True)[:3]
+    summary = ("resource-creep " + time.strftime("%Y-%m-%d") +
+               f" (vs {span_h}h baseline): MemAvail={latest['mem_available_g']}G "
+               f"cgroup={latest.get('supervisor_cgroup_g')}G top-mcp=" +
+               ",".join(f"{k}={v}G" for k, v in top_mcp) +
+               (f" | CREEP: {'; '.join(flags)}" if flags else " | no creep flagged"))
+    print(summary)
+
+    if flags and "--nudge-mayor" in argv:
+        try:
+            import subprocess
+            subprocess.run(["gc", "mail", "send", "mayor", "-s",
+                            f"resource-creep: {len(flags)} growth flag(s) (route to #all-agent-city)",
+                            "-m", summary], timeout=120)
+        except Exception:
+            pass
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+# Open-Decisions ledger -> #gascity-maintenance, mechanically (Stephanie
+# 2026-06-12: "more regularly routed to slack" — mayor floods drown key items
+# in tmux). Posts ONLY when the ledger changes, plus a 12h heartbeat while
+# non-empty; empty-transition posts once. SSOT = decisions rig (mayor mirrors
+# every red-banner decision there BEFORE surfacing — see
+# feedback_decision_mirror_before_red memory).
+# trigger=cooldown deliberately: cooldown orders have no zero-lastRun
+# bootstrap trap (cron orders need seeding; see pl-status-update-am.toml).
+[order]
+description = "Every 30m: post Open-Decisions ledger to #gascity-maintenance when changed (+12h heartbeat). Change-dedup'd — actual posts are rare."
+trigger = "cooldown"
+interval = "30m"
+exec = "/home/ds/gas-city/bin/decision-ledger-push"
+timeout = "2m"

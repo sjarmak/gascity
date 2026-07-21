@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# nudge-on-route — nudges the target session when a bead's gc.routed_to
+# is newly set or changed. Workaround for gc sling intentionally not
+# waking warm-idle workers (gastownhall/gascity#1129, closed as by-design
+# per Julian Knutsen 2026-04-23). Idempotent: a given (bead, routed_to)
+# pair is only nudged once; state lives in .gc/nudge-on-route-state.json.
+set -euo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+STATE_FILE="${CITY}/.gc/nudge-on-route-state.json"
+SINCE="${NUDGE_ON_ROUTE_SINCE:-2m}"
+
+mkdir -p "$(dirname "$STATE_FILE")"
+[[ -f "$STATE_FILE" ]] || echo '{}' > "$STATE_FILE"
+
+# Build a prefix -> rig-name map (longest-prefix match resolves a bead ID
+# to its rig so we can call `gc bd --rig <name> show`).
+declare -A PREFIX_TO_RIG
+while IFS=$'\t' read -r rig prefix; do
+    [[ -n "$prefix" ]] && PREFIX_TO_RIG["$prefix"]="$rig"
+done < <(gc rig list 2>/dev/null | awk '
+    /^  [a-zA-Z][a-zA-Z0-9_-]+:/ {
+        name = $1; sub(/:$/, "", name); current_rig = name
+    }
+    /^    Prefix:/ {
+        gsub(/^    Prefix:[ \t]+/, ""); print current_rig "\t" $0
+    }')
+
+rig_for_bead() {
+    local bead_id="$1" prefix rig
+    # Longest-prefix match: try progressively shorter prefix splits
+    for prefix in "${!PREFIX_TO_RIG[@]}"; do
+        [[ "$bead_id" == "$prefix-"* ]] && echo "${PREFIX_TO_RIG[$prefix]}" && return
+    done
+    return 1
+}
+
+bead_ids=$(gc events --type bead.updated --since "$SINCE" 2>/dev/null \
+    | jq -r '.subject // empty' \
+    | awk 'NF' \
+    | sort -u)
+
+[[ -z "$bead_ids" ]] && exit 0
+
+state=$(cat "$STATE_FILE")
+
+while IFS= read -r bead_id; do
+    [[ -z "$bead_id" ]] && continue
+
+    rig=$(rig_for_bead "$bead_id") || continue
+    bead_json=$(gc bd --rig "$rig" show "$bead_id" --json 2>/dev/null || echo "[]")
+    status=$(echo "$bead_json" | jq -r '.[0].status // empty' 2>/dev/null || echo "")
+    [[ "$status" == "closed" || "$status" == "resolved" ]] && continue
+    current=$(echo "$bead_json" | jq -r '.[0].metadata."gc.routed_to" // empty' 2>/dev/null || echo "")
+    [[ -z "$current" ]] && continue
+
+    previous=$(echo "$state" | jq -r --arg id "$bead_id" '.[$id].routed_to // ""')
+
+    if [[ "$current" != "$previous" ]]; then
+        # routed_to may be a template path (e.g. /home/ds/.../scix-worker) or
+        # an alias (e.g. "mayor"). Resolve to active session IDs, then nudge
+        # each. If no active sessions, skip — there's nothing to wake.
+        # 2026-05-24 fix: slot-suffixed routed_to (e.g. .../polecat-1) doesn't
+        # exact-match session beads stored under the base template
+        # (.../polecat). Compute effective template by stripping trailing
+        # -<digits> as a fallback target for queries below.
+        effective="$current"
+        base="${current%-[0-9]*}"
+        session_ids=$(gc session list --template "$current" --state active --json 2>/dev/null \
+            | jq -r '.[].ID' 2>/dev/null | awk 'NF')
+        if [[ -z "$session_ids" && "$base" != "$current" ]]; then
+            session_ids=$(gc session list --template "$base" --state active --json 2>/dev/null \
+                | jq -r '.[].ID' 2>/dev/null | awk 'NF')
+            [[ -n "$session_ids" ]] && effective="$base"
+        fi
+        if [[ -z "$session_ids" ]]; then
+            # No active session for this pool. gc sling won't wake warm
+            # pools (gastownhall/gascity#1129), so wake an asleep/drained
+            # session for the template and nudge it. Last resort: treat
+            # $current as a direct alias (mayor etc.).
+            sleeping_id=$(gc session list --template "$effective" --json 2>/dev/null \
+                | jq -r '.[].ID' 2>/dev/null | awk 'NF' | head -1)
+            if [[ -z "$sleeping_id" && "$base" != "$current" && "$effective" == "$current" ]]; then
+                sleeping_id=$(gc session list --template "$base" --json 2>/dev/null \
+                    | jq -r '.[].ID' 2>/dev/null | awk 'NF' | head -1)
+            fi
+            nudged_fallback=0
+            if [[ -n "$sleeping_id" ]]; then
+                gc session wake "$sleeping_id" >/dev/null 2>&1
+                gc session nudge "$sleeping_id" "Bead ${bead_id} routed to you — claim queue" >/dev/null 2>&1 && nudged_fallback=1
+            elif gc session nudge "$current" "Bead ${bead_id} routed to you — claim queue" >/dev/null 2>&1; then
+                nudged_fallback=1
+            fi
+            if [[ $nudged_fallback -eq 1 ]]; then
+                state=$(echo "$state" | jq --arg id "$bead_id" --arg r "$current" \
+                    '.[$id] = {routed_to: $r, nudged_at: (now | todate)}')
+            fi
+            continue
+        fi
+        nudged_any=0
+        while IFS= read -r sid; do
+            [[ -z "$sid" ]] && continue
+            gc session nudge "$sid" "Bead ${bead_id} routed to you — claim queue" >/dev/null 2>&1 && nudged_any=1
+        done <<< "$session_ids"
+        if [[ $nudged_any -eq 1 ]]; then
+            state=$(echo "$state" | jq --arg id "$bead_id" --arg r "$current" \
+                '.[$id] = {routed_to: $r, nudged_at: (now | todate)}')
+        fi
+    fi
+done <<< "$bead_ids"
+
+echo "$state" > "$STATE_FILE"

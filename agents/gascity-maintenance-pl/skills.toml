@@ -1,0 +1,25 @@
+# skills.toml — gascity-maintenance-pl
+#
+# INFORMATIONAL ALLOWLIST for v1.5. Skills are currently installed
+# globally per claude-home (all 5 accounts have all 69 skills); this
+# file documents which skills this agent is EXPECTED to invoke so
+# that:
+#   1. Future per-agent narrowing (v2.0 — skills as a first-class
+#      primitive) has a starting point.
+#   2. Mayor-pattern-miner can compare invocation telemetry against
+#      this allowlist to detect skill scope drift.
+#   3. New agents authored from this template inherit a deliberate
+#      curated set rather than the full account skill firehose.
+#
+# Tracked in dr-45le2r.
+
+skills = [
+    "focus",             # one-task-at-a-time discipline; canonical for PL ticks
+    "distill",           # tighten rollup writeups
+    "verification-loop", # quality gate before posting
+    "strategic-compact", # session hygiene under busy slack threads
+    "review-pr",         # surface multi-model review opportunities
+    "iterative-retrieval", # subagent context for cross-bead reads
+    "security-review",   # PR safety
+    "context-budget",    # session hygiene
+]

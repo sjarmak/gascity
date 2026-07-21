@@ -1,0 +1,20 @@
+# resource-observability — proactive resource early-warning (gc-457861, spec
+# docs/design/resource-observability-layer.md). Durable complement to the reactive
+# reapers after the 2026-07-07 memory-saturation incident: every 5m it snapshots box
+# + fleet resource state to .gc/observability/resource-metrics.jsonl and fires
+# cooldown-deduped threshold alerts (mail mayor) so creep is caught DAYS before
+# saturation. The single most valuable NEW signal is per-MCP-server proc-count +
+# summed RSS — the fan-out metric that would have caught code-intel-copilot regrowing
+# to 5GB unnoticed. Thresholds: MemAvail<3G, SwapFree<300M plus >=64M active
+# swap I/O over one 5m sample, any MCP >2.5G or >60
+# procs, any proc >200% CPU(x2), supervisor cgroup >8G (gc-g421k O(n^2) creep).
+[order]
+description = "Every 5m: snapshot box + fleet resource metrics to .gc/observability/resource-metrics.jsonl + fire cooldown-deduped threshold alerts to mayor (MemAvail<3G, per-MCP fan-out >60procs/>2.5G, hot-loop >200%CPU, supervisor cgroup >8G). Proactive early-warning layer; complements (does not replace) the curative reapers. gc-457861."
+trigger = "cooldown"
+interval = "5m"
+exec = "/home/ds/gas-city/bin/resource-observability-sample --nudge-mayor"
+timeout = "90s"
+# Fail OPEN on open-work-gate timeout (#2893): the sampler is read-only (metrics +
+# alert), so a duplicate run is harmless — and it's exactly during degradation that
+# the early-warning must keep firing.
+idempotent = true

@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+"""or-replay — read-only fixed-trace discrete-event replay simulator over this
+city's event bus (.gc/events.jsonl + .gc/events.jsonl.archive-*.gz).
+
+First artifact of the OR adoption path. Spec:
+  docs/design/fable-plans/2026-07-11/or-phase1-dispatch-priority-index.md  (§3, accept §3.4)
+  aoa/docs/or-for-software-factories.md
+Bead: dr-8sy (P0).
+
+What it does
+------------
+1. EXTRACT per-pool work-bead traces from the event log:
+   arrival / claim / complete / trace-fixed service / features (priority,
+   created_at, blocks-dep graph). dependent_count is RECOMPUTED from the
+   evolving dep graph, never trusted from the (often-null) bd field.
+2. REPLAY the identical fixed trace (same arrivals, same service durations,
+   same server count per pool) under FOUR claim policies:
+     oldest   = current fleet FCFS: bd ready --sort oldest (priority-blind)
+     hybrid   = bd ready --sort hybrid  (priority band, oldest-within-band)
+     priority = bd ready --sort priority(priority band, newest-within-band)
+     index    = phase-1 index S(b)=1.00*f_prio+0.10*f_due+0.08*f_unblock+0.06*f_age
+   The ONLY degree of freedom is claim order; everything else is trace-fixed.
+3. REPORT per policy: F_w (priority-weighted mean flow time, w=2^(4-p)),
+   unblocking-value throughput, per-class p95 flow tails, completion parity.
+4. `test` subcommand: LCO-style known-optimum fixtures as unit self-tests.
+
+READ-ONLY. It never writes to the event log, bd, or any config. No config
+flips (the live oldest->hybrid decision is HELD pending these numbers).
+
+Weights/constants version: or-p1-w1  (1.00, 0.10, 0.08, 0.06 ; W_due=72h, C_dep=5, A_max=14d)
+
+Usage
+-----
+  bin/or-replay run   [--all|--archives N] [--pool SUBSTR] [--by-week] [--json OUT]
+  bin/or-replay test
+  bin/or-replay extract [--all|--archives N] [--json OUT]      # dump traces only
+
+Default `run` reads only the live .gc/events.jsonl (fast). --archives N adds the
+N most-recent archives; --all reads every archive (~1.4GB, minutes).
+"""
+import sys, os, gzip, json, glob, argparse, heapq, math
+from datetime import datetime, timezone
+
+CITY = os.environ.get("GC_CITY", "/home/ds/gas-city")
+EVENTS_DIR = os.path.join(CITY, ".gc")
+LIVE = os.path.join(EVENTS_DIR, "events.jsonl")
+
+# ---- weights / constants (or-p1-w1) --------------------------------------
+W_PRIO, W_DUE, W_UNBLOCK, W_AGE = 1.00, 0.10, 0.08, 0.06
+W_DUE_WINDOW = 72 * 3600.0        # seconds
+C_DEP = 5.0                       # unblocking-credit saturation
+A_MAX = 14 * 86400.0             # anti-starvation horizon, seconds
+
+
+def clampp(p):
+    if p is None:
+        p = 2
+    return 0 if p < 0 else 4 if p > 4 else p
+
+
+def prio_weight(p):
+    return 2 ** (4 - clampp(p))   # 16,8,4,2,1 for P0..P4
+
+
+# ---- timestamp parsing ----------------------------------------------------
+def parse_ts(s):
+    """RFC3339 (Z or offset, ns or us) -> epoch seconds (float, UTC). None on fail."""
+    if not s:
+        return None
+    try:
+        t = s.strip()
+        if t.endswith("Z"):
+            t = t[:-1] + "+00:00"
+        # truncate fractional seconds to 6 digits (python fromisoformat limit pre-3.11 robustness)
+        if "." in t:
+            head, frac = t.split(".", 1)
+            # frac may carry an offset: digits then +/-hh:mm
+            off = ""
+            for i, c in enumerate(frac):
+                if c in "+-":
+                    off = frac[i:]
+                    frac = frac[:i]
+                    break
+            frac = frac[:6]
+            t = f"{head}.{frac}{off}"
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def iso_week(epoch):
+    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    y, w, _ = dt.isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+# ---- event streaming ------------------------------------------------------
+def event_files(archives):
+    """Return event files in seq order. archives: 0 (live only), N (N newest+live), 'all'."""
+    arcs = sorted(glob.glob(os.path.join(EVENTS_DIR, "events.jsonl.archive-*")))
+    if archives == "all":
+        chosen = arcs
+    elif archives and archives > 0:
+        chosen = arcs[-archives:]
+    else:
+        chosen = []
+    files = list(chosen)
+    if os.path.exists(LIVE):
+        files.append(LIVE)
+    return files
+
+
+def stream_events(files):
+    n = 0
+    for fp in files:
+        opener = gzip.open if fp.endswith(".gz") else open
+        try:
+            with opener(fp, "rt", errors="replace") as fh:
+                for line in fh:
+                    # fast pre-filter: only bead lifecycle events matter
+                    if '"bead.' not in line:
+                        continue
+                    n += 1
+                    if n % 200000 == 0:
+                        sys.stderr.write(f"  ...{n} bead events parsed\n")
+                        sys.stderr.flush()
+                    try:
+                        yield json.loads(line)
+                    except Exception:
+                        continue
+        except Exception as e:
+            sys.stderr.write(f"WARN: cannot read {fp}: {e}\n")
+
+
+# ---- exclusions -----------------------------------------------------------
+EXCLUDE_TYPES = {"session", "epic", "convoy", "event", "message", "gate",
+                 "agent", "role", "rig", "spec", "convergence", "order",
+                 "merge-request"}
+EXCLUDE_LABELS = {"gc:session", "order-tracking", "order-run", "exec",
+                  "patrol", "wisp", "order-fired"}
+
+
+def excluded(pl):
+    it = pl.get("issue_type") or ""
+    if it in EXCLUDE_TYPES:
+        return True
+    bid = pl.get("id") or ""
+    if "wisp" in bid or bid.endswith("-session"):
+        return True
+    labels = pl.get("labels") or []
+    if any(l in EXCLUDE_LABELS for l in labels):
+        return True
+    md = pl.get("metadata") or {}
+    if md.get("gc.kind") == "workflow":     # molecule root
+        return True
+    return False
+
+
+# ---- trace extraction -----------------------------------------------------
+class Bead:
+    __slots__ = ("id", "pool", "created_at", "priority", "arrival",
+                 "claim_ts", "complete_ts", "service", "due", "blockers",
+                 "issue_type")
+
+    def __init__(self, bid):
+        self.id = bid
+        self.pool = None
+        self.created_at = None
+        self.priority = None
+        self.arrival = None
+        self.claim_ts = None
+        self.complete_ts = None
+        self.service = None
+        self.due = None
+        self.blockers = set()   # in-'blocks' upstream ids (this bead waits on them)
+        self.issue_type = None
+
+
+def extract(files):
+    beads = {}
+    real_complete = {}   # id -> real complete epoch (for external-dep unblock timing)
+    for ev in stream_events(files):
+        et = ev.get("type", "")
+        if not et.startswith("bead."):
+            continue
+        pl = ev.get("payload") or {}
+        bid = pl.get("id") or ev.get("subject")
+        if not bid:
+            continue
+        ets = parse_ts(ev.get("ts"))
+        status = pl.get("status")
+        assignee = pl.get("assignee")
+        md = pl.get("metadata") or {}
+        routed = md.get("gc.routed_to")
+
+        # record real completion time for every bead (used for cross-pool dep unblock)
+        if et == "bead.closed" and ets is not None:
+            real_complete[bid] = ets
+
+        if excluded(pl):
+            continue
+
+        b = beads.get(bid)
+        if b is None:
+            b = Bead(bid)
+            beads[bid] = b
+
+        if b.issue_type is None and pl.get("issue_type"):
+            b.issue_type = pl.get("issue_type")
+        ca = parse_ts(pl.get("created_at"))
+        if ca is not None and b.created_at is None:
+            b.created_at = ca
+        if pl.get("priority") is not None:
+            # freeze priority at claim; until claim, track latest
+            if b.claim_ts is None:
+                b.priority = pl.get("priority")
+        if routed:
+            b.pool = routed
+        if md.get("gc.due"):
+            b.due = parse_ts(md.get("gc.due"))
+        # accumulate blocks-dependencies seen up to (and incl.) claim
+        deps = pl.get("dependencies")
+        if deps and (b.claim_ts is None or et == "bead.updated"):
+            for d in deps:
+                if d.get("type") == "blocks":
+                    dep_on = d.get("depends_on_id")
+                    if dep_on and dep_on != bid:
+                        b.blockers.add(dep_on)
+
+        # arrival: first routed + open + unassigned snapshot
+        if routed and status == "open" and not assignee and ets is not None:
+            if b.arrival is None:
+                b.arrival = ets
+        # claim: first in_progress + assignee
+        if status == "in_progress" and assignee and ets is not None:
+            if b.claim_ts is None:
+                b.claim_ts = ets
+        # complete
+        if et == "bead.closed" and ets is not None:
+            if b.complete_ts is None:
+                b.complete_ts = ets
+
+    # finalize: keep fully-observed, routed work beads (claim + complete + pool)
+    pops = {}   # pool -> list[Bead]
+    for b in beads.values():
+        if not b.pool or b.claim_ts is None or b.complete_ts is None:
+            continue
+        # arrival fallback: created_at, else claim_ts
+        if b.arrival is None:
+            b.arrival = b.created_at if b.created_at is not None else b.claim_ts
+        if b.created_at is None:
+            b.created_at = b.arrival
+        # sanity: arrival must precede claim; clamp pathological clock skew
+        if b.arrival > b.claim_ts:
+            b.arrival = b.claim_ts
+        b.service = b.complete_ts - b.claim_ts
+        if b.service <= 0:
+            b.service = 1.0        # floor: sub-second / clock-skew closes
+        b.priority = clampp(b.priority)
+        pops.setdefault(b.pool, []).append(b)
+    return pops, real_complete
+
+
+# ---- policies -------------------------------------------------------------
+def make_scorer(policy):
+    """Return f(bead, t, open_dep_count) -> sort key (lower = claimed first)."""
+    if policy == "oldest":
+        return lambda b, t, dc: (b.created_at, b.id)
+    if policy == "hybrid":
+        return lambda b, t, dc: (b.priority, b.created_at, b.id)
+    if policy == "priority":
+        return lambda b, t, dc: (b.priority, -b.created_at, b.id)
+    if policy == "index":
+        def key(b, t, dc):
+            f_prio = (4 - b.priority) / 4.0
+            if b.due:
+                f_due = min(1.0, max(0.0, 1 - (b.due - t) / W_DUE_WINDOW))
+            else:
+                f_due = 0.0
+            f_unblock = min(dc, C_DEP) / C_DEP
+            f_age = min(max(t - b.created_at, 0.0), A_MAX) / A_MAX
+            S = (W_PRIO * f_prio + W_DUE * f_due +
+                 W_UNBLOCK * f_unblock + W_AGE * f_age)
+            return (-S, b.created_at, b.id)
+        return key
+    raise ValueError(policy)
+
+
+POLICIES = ["oldest", "hybrid", "priority", "index"]
+
+
+# ---- discrete-event simulator (per pool, G/G/S, fixed trace) --------------
+def observed_max_concurrency(beads):
+    """Max simultaneous real in-flight claims -> server count S for the pool."""
+    evs = []
+    for b in beads:
+        evs.append((b.claim_ts, 1))
+        evs.append((b.complete_ts, -1))
+    evs.sort(key=lambda x: (x[0], x[1]))   # completions(-1) before claims(+1) at tie
+    cur = mx = 0
+    for _, d in evs:
+        cur += d
+        mx = max(mx, cur)
+    return max(1, mx)
+
+
+def simulate(beads, policy, slots=None):
+    """Replay `beads` under `policy` on a FIXED server-availability schedule.
+
+    Claim-slot model (the spec's "replay observed concurrency; only claim order
+    is free"): the pool's REAL claim timestamps are the moments a server became
+    free. We hold that schedule fixed and let the policy pick which *currently
+    ready* bead fills each freed slot. This reproduces the real capacity/timing
+    profile (a deep real backlog => dense slots => the policy actually chooses),
+    while the ONLY degree of freedom across policies is claim order.
+
+    Fixed per bead: arrival, service duration, dependencies. In-population
+    blocks-deps gate readiness (a dependent cannot be claimed until its blocker's
+    counterfactual completion); blockers outside the population unblock at their
+    real completion time. `slots` overrides the schedule (used by unit fixtures);
+    default = sorted real claim times, one slot per bead.
+    """
+    if not beads:
+        return {"results": {}, "servers": 0, "unfinished": 0}
+    idset = {b.id for b in beads}
+    bymap = {b.id: b for b in beads}
+    scorer = make_scorer(policy)
+
+    remaining = {}          # bead id -> count of in-pop blockers not yet complete
+    dependents = {}         # blocker id -> set of downstream bead ids (in pop)
+    ext_ready = {}          # bead id -> latest real-complete of EXTERNAL blockers
+    for b in beads:
+        rem = 0
+        ext = b.arrival
+        for dep in b.blockers:
+            if dep in idset:
+                rem += 1
+                dependents.setdefault(dep, set()).add(b.id)
+            else:
+                rc = REAL_COMPLETE.get(dep)
+                if rc is not None:
+                    ext = max(ext, rc)
+        remaining[b.id] = rem
+        ext_ready[b.id] = ext
+
+    if slots is None:
+        slots = sorted(b.claim_ts for b in beads)
+
+    completed = {}          # id -> cf complete time
+    sim = {}                # id -> (cf_claim, cf_complete)
+    released_count = {}     # id -> #dependents unblocked at its completion
+
+    # event heap: (time, order, kind, payload)
+    #   'slot' server-free tick (adds 1 idle capacity), 'arr' arrival,
+    #   'ext' external-dep ready, 'done' cf completion (unblocks dependents).
+    heap = []
+    seq = 0
+
+    def push(t, kind, bid):
+        nonlocal seq
+        heapq.heappush(heap, (t, seq, kind, bid)); seq += 1
+
+    for b in beads:
+        push(b.arrival, "arr", b.id)
+        if ext_ready[b.id] > b.arrival:
+            push(ext_ready[b.id], "ext", b.id)
+    for st in slots:
+        push(st, "slot", None)
+
+    arrived = set()
+    ready = set()
+    claimed = set()
+    idle = 0                # server-free slots accumulated, not yet consumed
+
+    def try_ready(bid, t):
+        if bid in arrived and bid not in claimed and remaining[bid] == 0 \
+           and t >= ext_ready[bid]:
+            ready.add(bid)
+
+    def place(t):
+        nonlocal idle
+        while idle > 0 and ready:
+            best = None; bestkey = None
+            for rid in ready:
+                dc = sum(1 for d in dependents.get(rid, ()) if d not in completed)
+                k = scorer(bymap[rid], t, dc)
+                if bestkey is None or k < bestkey:
+                    bestkey = k; best = rid
+            ready.discard(best); claimed.add(best); idle -= 1
+            b = bymap[best]
+            cdone = t + b.service
+            sim[best] = (t, cdone)
+            push(cdone, "done", best)
+
+    # Batch simultaneous events, apply state changes, then place once.
+    while heap:
+        t = heap[0][0]
+        batch = []
+        while heap and heap[0][0] == t:
+            batch.append(heapq.heappop(heap))
+        for _tt, _s, kind, bid in batch:
+            if kind == "done":
+                completed[bid] = t
+                rel = 0
+                for d in dependents.get(bid, ()):
+                    if remaining.get(d, 0) > 0:
+                        remaining[d] -= 1
+                        rel += 1
+                        if remaining[d] == 0:
+                            try_ready(d, t)
+                released_count[bid] = rel
+        for _tt, _s, kind, bid in batch:
+            if kind == "slot":
+                idle += 1
+            elif kind == "arr":
+                arrived.add(bid); try_ready(bid, t)
+            elif kind == "ext":
+                try_ready(bid, t)
+        place(t)
+
+    unfinished = sum(1 for b in beads if b.id not in sim)
+    results = {}
+    for b in beads:
+        if b.id in sim:
+            cs, cd = sim[b.id]
+            results[b.id] = {
+                "priority": b.priority,
+                "arrival": b.arrival,
+                "sim_claim": cs,
+                "sim_complete": cd,
+                "flow": cd - b.arrival,
+                "released": released_count.get(b.id, 0),
+            }
+    return {"results": results, "servers": observed_max_concurrency(beads),
+            "unfinished": unfinished}
+
+
+REAL_COMPLETE = {}   # module-global, set in main() before simulate()
+
+
+# ---- metrics --------------------------------------------------------------
+def p95(vals):
+    if not vals:
+        return None
+    xs = sorted(vals)
+    idx = min(len(xs) - 1, int(math.ceil(0.95 * len(xs)) - 1))
+    return xs[idx]
+
+
+def metrics_for(sim_results_list):
+    """Aggregate per-bead results across pools for one policy."""
+    flows, wsum, fwsum = [], 0.0, 0.0
+    byclass = {p: [] for p in range(5)}
+    T_start = None; T_end = None
+    released_events = []   # (complete_time, released_count)
+    unfinished = 0
+    n = 0
+    for sr in sim_results_list:
+        unfinished += sr["unfinished"]
+        for bid, r in sr["results"].items():
+            n += 1
+            f = r["flow"]
+            flows.append(f)
+            w = prio_weight(r["priority"])
+            wsum += w; fwsum += w * f
+            byclass[clampp(r["priority"])].append(f)
+            a = r["arrival"]; c = r["sim_complete"]
+            T_start = a if T_start is None else min(T_start, a)
+            T_end = c if T_end is None else max(T_end, c)
+            released_events.append((c, r["released"]))
+    F_w = (fwsum / wsum) if wsum else 0.0
+    # unblocking throughput: time-average of cumulative released-work curve
+    if T_end and T_start and T_end > T_start:
+        horizon = T_end - T_start
+        area = sum(rc * (T_end - ct) for ct, rc in released_events)
+        unblock_tput = area / horizon
+    else:
+        unblock_tput = 0.0
+    return {
+        "n": n,
+        "F_w": F_w,
+        "unblock_tput": unblock_tput,
+        "p95": {p: p95(byclass[p]) for p in range(5)},
+        "class_n": {p: len(byclass[p]) for p in range(5)},
+        "unfinished": unfinished,
+    }
+
+
+def hms(seconds):
+    if seconds is None:
+        return "   -   "
+    h = seconds / 3600.0
+    if h >= 48:
+        return f"{h/24:6.1f}d"
+    return f"{h:6.2f}h"
+
+
+def run_replay(pops, label=""):
+    """Run all 4 policies over all pools, return {policy: metrics}."""
+    out = {}
+    for pol in POLICIES:
+        sims = [simulate(beads, pol) for beads in pops.values()]
+        out[pol] = metrics_for(sims)
+    return out
+
+
+def print_table(res, pops, title):
+    total_beads = sum(len(v) for v in pops.values())
+    print(f"\n{'='*78}")
+    print(f" {title}")
+    print(f" pools={len(pops)}  replayed_beads={total_beads}")
+    print(f"{'='*78}")
+    base = res["oldest"]["F_w"]
+    hdr = f"{'policy':<10} {'n':>6} {'F_w':>10} {'vs oldest':>10} {'unblkTput':>10}  {'parity':>7}"
+    print(hdr)
+    print("-" * len(hdr))
+    for pol in POLICIES:
+        m = res[pol]
+        delta = ((base - m["F_w"]) / base * 100) if base else 0.0
+        par = "OK" if m["unfinished"] == 0 else f"{m['unfinished']}!"
+        print(f"{pol:<10} {m['n']:>6} {hms(m['F_w'])} {delta:>+9.1f}% {m['unblock_tput']:>10.2f}  {par:>7}")
+    # per-class p95
+    print(f"\n  per-class p95 flow time (starvation guard):")
+    print(f"  {'policy':<10} " + " ".join(f"{'P'+str(p):>9}" for p in range(5)))
+    for pol in POLICIES:
+        m = res[pol]
+        cells = " ".join(f"{hms(m['p95'][p]):>9}" for p in range(5))
+        print(f"  {pol:<10} {cells}")
+    print(f"  class n:   " + " ".join(f"{res['oldest']['class_n'][p]:>9}" for p in range(5)))
+    # acceptance-style deltas (§3.4, adapted to fixed-policy set)
+    print(f"\n  index vs oldest (FCFS):   {pct(res,'oldest'):+.1f}% F_w"
+          f"   |  index vs priority: {pct(res,'priority'):+.1f}% F_w"
+          f"   |  index vs hybrid: {pct(res,'hybrid'):+.1f}% F_w")
+
+
+def pct(res, base_pol):
+    b = res[base_pol]["F_w"]; i = res["index"]["F_w"]
+    return ((b - i) / b * 100) if b else 0.0
+
+
+# ---- LCO-style known-optimum fixtures (unit self-tests) -------------------
+def mkbead(bid, pool, prio, created, arrival, service, blockers=()):
+    b = Bead(bid)
+    b.pool = pool; b.priority = prio; b.created_at = created
+    b.arrival = arrival; b.service = service
+    b.claim_ts = arrival; b.complete_ts = arrival + service
+    b.blockers = set(blockers)
+    return b
+
+
+def run_tests():
+    global REAL_COMPLETE
+    REAL_COMPLETE = {}
+    passed = []; failed = []
+
+    def check(name, cond, detail=""):
+        (passed if cond else failed).append((name, detail))
+
+    # Fixture 1 — LCO oversubscribed, 1-server capacity, one genuine decision.
+    # BLK-P2 and ISO-P2 are BOTH ready at t0 (same arrival); the five P1s are
+    # blocked by BLK-P2 so they are NOT ready yet. At t0 the policy must pick
+    # between two P2s: one that gates five P1s vs one isolated. ISO-P2 has the
+    # oldest created_at, so FCFS-oldest picks it (known-BAD); the index lifts the
+    # blocker via f_unblock (5 dependents) and picks it (known-GOOD). Capacity is
+    # one server (slots spaced 100s = the service time) so choices serialize.
+    base = 1_000_000.0
+    blocker = mkbead("BLK-P2", "poolA", 2, base - 5, base, 100)           # arrives t0
+    isolated = mkbead("ISO-P2", "poolA", 2, base - 10, base, 100)         # oldest created, arrives t0
+    p1s = [mkbead(f"P1-{i}", "poolA", 1, base + 1 + i, base, 50,
+                  blockers=["BLK-P2"]) for i in range(5)]                 # arrive t0 but blocked
+    fix1 = [blocker, isolated] + p1s
+    slots1 = [base + 100 * k for k in range(7)]                          # 1 server, 7 slots
+
+    for pol in POLICIES:
+        r = simulate(fix1, pol, slots=slots1)["results"]
+        first = min(r.items(), key=lambda kv: kv[1]["sim_claim"])[0]
+        if pol == "oldest":
+            check("f1.oldest-claims-isolated-first", first == "ISO-P2", f"got {first}")
+        if pol == "index":
+            check("f1.index-blocker-before-isolated",
+                  r["BLK-P2"]["sim_claim"] < r["ISO-P2"]["sim_claim"],
+                  f"blk={r['BLK-P2']['sim_claim']} iso={r['ISO-P2']['sim_claim']}")
+            check("f1.index-claims-blocker-first", first == "BLK-P2", f"got {first}")
+
+    # Fixture 1 headline: index finishes the five P1s earlier than FCFS.
+    def mean_p1_flow(pol):
+        sim = simulate(fix1, pol, slots=slots1)["results"]
+        fs = [sim[f"P1-{i}"]["flow"] for i in range(5)]
+        return sum(fs) / len(fs)
+    check("f1.index-beats-oldest-on-P1-flow",
+          mean_p1_flow("index") < mean_p1_flow("oldest"),
+          f"index={mean_p1_flow('index'):.0f}s oldest={mean_p1_flow('oldest'):.0f}s")
+
+    # Fixture 2 — priority dominance. Two beads both ready at t0, 1-server slot:
+    # P0 must precede P2 under every priority-aware policy; oldest ignores priority.
+    b_p0 = mkbead("A-P0", "poolB", 0, base + 200, base, 30)     # newer created
+    b_p2 = mkbead("B-P2", "poolB", 2, base + 100, base, 30)     # older created
+    fix2 = [b_p0, b_p2]
+    slots2 = [base, base + 100]
+    for pol in POLICIES:
+        r = simulate(fix2, pol, slots=slots2)["results"]
+        first = min(r.items(), key=lambda kv: kv[1]["sim_claim"])[0]
+        if pol in ("hybrid", "priority", "index"):
+            check(f"f2.{pol}-P0-first", first == "A-P0", f"got {first}")
+        if pol == "oldest":
+            check("f2.oldest-older-first", first == "B-P2", f"got {first}")
+
+    # Fixture 3 — F_w monotonicity under contention: 20 beads all ready at t0,
+    # 2-server capacity (paired slots). Priority-weighting the flow, index must
+    # not be worse than FCFS-oldest (it front-loads high-priority work).
+    beads3 = [mkbead(f"m{i}", "poolC", i % 5, base, base, 40) for i in range(20)]
+    slots3 = [base + 40 * (k // 2) for k in range(20)]          # 2 servers
+    f_index = metrics_for([simulate(beads3, "index", slots=slots3)])["F_w"]
+    f_oldest = metrics_for([simulate(beads3, "oldest", slots=slots3)])["F_w"]
+    check("f3.index-Fw-lt-oldest-under-contention", f_index < f_oldest,
+          f"index={f_index:.1f} oldest={f_oldest:.1f}")
+
+    # report
+    print(f"\n{'='*60}\n LCO known-optimum fixtures\n{'='*60}")
+    for name, _ in passed:
+        print(f"  PASS  {name}")
+    for name, detail in failed:
+        print(f"  FAIL  {name}   [{detail}]")
+    print(f"\n  {len(passed)} passed, {len(failed)} failed")
+    return len(failed) == 0
+
+
+# ---- CLI ------------------------------------------------------------------
+def main():
+    global REAL_COMPLETE
+    ap = argparse.ArgumentParser(prog="or-replay")
+    sub = ap.add_subparsers(dest="cmd")
+
+    def add_src(p):
+        g = p.add_mutually_exclusive_group()
+        g.add_argument("--all", action="store_true", help="read every archive (~1.4GB)")
+        g.add_argument("--archives", type=int, default=0, help="read N newest archives + live")
+        p.add_argument("--pool", default=None, help="only pools whose target contains SUBSTR")
+
+    pr = sub.add_parser("run"); add_src(pr)
+    pr.add_argument("--by-week", action="store_true")
+    pr.add_argument("--json", default=None)
+    pe = sub.add_parser("extract"); add_src(pe)
+    pe.add_argument("--json", default=None)
+    sub.add_parser("test")
+    args = ap.parse_args()
+
+    if args.cmd == "test":
+        sys.exit(0 if run_tests() else 1)
+    if args.cmd is None:
+        ap.print_help(); sys.exit(0)
+
+    archives = "all" if getattr(args, "all", False) else getattr(args, "archives", 0)
+    files = event_files(archives)
+    sys.stderr.write(f"reading {len(files)} event file(s)"
+                     f" ({'live only' if archives in (0,None) else archives})...\n")
+    pops, REAL_COMPLETE = extract(files)
+    # module global for simulate()
+    globals()["REAL_COMPLETE"] = REAL_COMPLETE
+
+    if args.pool:
+        pops = {k: v for k, v in pops.items() if args.pool in k}
+
+    total = sum(len(v) for v in pops.values())
+    span_lo = min((b.arrival for v in pops.values() for b in v), default=None)
+    span_hi = max((b.complete_ts for v in pops.values() for b in v), default=None)
+    sys.stderr.write(f"extracted {total} replayable work beads across {len(pops)} pools\n")
+    if span_lo:
+        sys.stderr.write(f"trace span: {datetime.fromtimestamp(span_lo,timezone.utc).date()}"
+                         f" -> {datetime.fromtimestamp(span_hi,timezone.utc).date()}\n")
+
+    if args.cmd == "extract":
+        dump = {pool: [{"id": b.id, "priority": b.priority, "arrival": b.arrival,
+                        "claim": b.claim_ts, "complete": b.complete_ts,
+                        "service": b.service, "created_at": b.created_at,
+                        "blockers": sorted(b.blockers)} for b in v]
+                for pool, v in pops.items()}
+        out = args.json or "/dev/stdout"
+        with open(out, "w") as fh:
+            json.dump(dump, fh, indent=0)
+        sys.stderr.write(f"wrote traces -> {out}\n")
+        return
+
+    # run: overall + per-pool
+    res = run_replay(pops)
+    print_table(res, pops, "OVERALL — all pools, all policies")
+
+    # per-pool breakdown (largest pools first)
+    print(f"\n{'#'*78}\n PER-POOL BREAKDOWN\n{'#'*78}")
+    for pool in sorted(pops, key=lambda p: -len(pops[p])):
+        if len(pops[pool]) < 5:
+            continue
+        sub_res = run_replay({pool: pops[pool]})
+        short = pool.split("/")[-1] if "/" in pool else pool
+        print_table(sub_res, {pool: pops[pool]}, f"POOL: {short}")
+
+    if args.by_week:
+        print(f"\n{'#'*78}\n PER-WEEK FOLDS (F_w by policy)\n{'#'*78}")
+        weeks = {}
+        for pool, v in pops.items():
+            for b in v:
+                weeks.setdefault(iso_week(b.arrival), {}).setdefault(pool, []).append(b)
+        print(f"  {'week':<10} " + " ".join(f"{p:>10}" for p in POLICIES) + f"  {'idx_vs_old':>10}")
+        for wk in sorted(weeks):
+            wpops = weeks[wk]
+            if sum(len(x) for x in wpops.values()) < 10:
+                continue
+            wr = run_replay(wpops)
+            cells = " ".join(f"{hms(wr[p]['F_w']):>10}" for p in POLICIES)
+            print(f"  {wk:<10} {cells}  {pct(wr,'oldest'):>+9.1f}%")
+
+    if args.json:
+        with open(args.json, "w") as fh:
+            json.dump({p: res[p] for p in POLICIES}, fh, indent=2, default=str)
+        sys.stderr.write(f"wrote metrics -> {args.json}\n")
+
+
+if __name__ == "__main__":
+    main()

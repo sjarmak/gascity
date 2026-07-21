@@ -1,0 +1,22 @@
+# Overnight digest — daily at 6:30 EDT (10:30 UTC during DST). Fires
+# before morning-triage-cycle (7:00 EDT / 11:00 UTC) so the digest is
+# in mayor's inbox before Stephanie's morning skim.
+#
+# Scans bead closes from the last 14h across city + gascity +
+# gascity-packs, filters out scaffold beads (molecules/convoys/wisps +
+# generic step titles), categorizes into 5 buckets (halted /
+# branch-ready / auto-pushed / investigation / informational), and
+# mails mayor with --notify so mayor surfaces to #gascity-maintenance
+# on first wake.
+#
+# Default since-window is 14h, configurable via
+# OVERNIGHT_DIGEST_SINCE_HOURS env. Dry-run mode via
+# OVERNIGHT_DIGEST_DRY_RUN=true (prints digest to stdout instead of
+# mailing).
+
+[order]
+description = "Daily 6:30 EDT: digest of overnight bead closes — halted / branch-ready / auto-pushed / investigation / informational. Mails mayor with --notify."
+trigger = "cron"
+schedule = "30 6 * * *"   # 6:30 — gc cron evaluates in the host's LOCAL tz (EDT). Was '30 10' on the mistaken UTC assumption; that fired at 10:30 EDT, 4h late.
+exec = "/home/ds/gas-city/bin/overnight-digest"
+timeout = "120s"

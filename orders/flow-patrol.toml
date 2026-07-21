@@ -1,0 +1,21 @@
+# Flow-patrol — per-rig pipeline FLOW digest to #all-agent-city.
+#
+# The positive-assurance complement to stall-watch (which only fires on
+# breakage). Cherry-picked from gastown's witness/deacon flow model WITHOUT
+# adopting the pack (Stephanie 2026-06-08, after gastown proved non-drop-in:
+# it requires an unpublished maintenance/dog pack). Gives the human proactive
+# "is work flowing across the rigs" confidence without having to ask.
+#
+# Reports per rig: open (actionable) / in_progress / closed-last-24h / blocked
+# / oldest-open age; flags rigs with a backlog but nothing moving. The "morning
+# cross-rig update" lands in #all-agent-city (C0B0TQMQF2B) per Stephanie's
+# channel-scoping; urgent stalls still go through stall-watch.
+#
+# Runs twice daily (7:15 + 14:15 EDT — gc cron evaluates in host local tz).
+
+[order]
+description = "Twice daily (7:15 + 14:15 EDT): post per-rig pipeline flow digest (open/in_progress/closed-24h/blocked, flagging stalled rigs) to #all-agent-city."
+trigger = "cron"
+schedule = "15 7,14 * * *"
+exec = "/home/ds/gas-city/bin/flow-patrol --push"
+timeout = "5m"

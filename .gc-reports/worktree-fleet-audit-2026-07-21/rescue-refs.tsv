@@ -1,0 +1,9 @@
+repo	ref	head_sha	worktree_paths	action
+EnterpriseBench	refs/heads/rescue/detached-20260721/50195775c257	50195775c257a5241bf444b7a2458ba99e174c27	/home/ds/projects/EnterpriseBench-4sif	created
+EnterpriseBench	refs/heads/rescue/detached-20260721/916003a3707d	916003a3707de1781a7fd3a63ec93cb1d6fca3ab	/home/ds/projects/EnterpriseBench-30d6	created
+EnterpriseBench	refs/heads/rescue/detached-20260721/d45a4ea1d7e8	d45a4ea1d7e8f0a758696e8cb698bca3583b8fc8	/tmp/claude-1000/-home-ds-projects-EnterpriseBench-enterprisebench-lo104/04f28748-63a8-4a8e-9d48-d3648f920515/scratchpad/branch-d45a4ea	created
+mem	refs/heads/rescue/detached-20260721/24d527450d78	24d527450d78ae396e76e812723bb542d621c396	/home/ds/projects/mem-lug	created
+mem	refs/heads/rescue/detached-20260721/27f6db483b71	27f6db483b712d4b1b2115974da49d3ac42fe1be	/home/ds/projects/mem-hd7f	created
+mem	refs/heads/rescue/detached-20260721/dfe1eb267793	dfe1eb267793a6d75ffded4a515abef1510f034e	/home/ds/projects/mem-3ab	created
+migration-evals	refs/heads/rescue/detached-20260721/d51cd0765b87	d51cd0765b878b493ae71baa1dfea89266047baf	/home/ds/projects/migration-evals-cut	created
+scix_experiments	refs/heads/rescue/detached-20260721/56cdab93a295	56cdab93a295741ab274b5b528a8d7baf72217ab	/home/ds/projects/scix_experiments-xoas.1;/home/ds/projects/scix_experiments-xoas.2	created

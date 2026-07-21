@@ -1,0 +1,6 @@
+[order]
+description = "Every 10m: dispatch epic-level external review when chunk members close. Migrated from systemd timer."
+trigger = "cooldown"
+interval = "10m"
+exec = "/home/ds/gas-city/bin/epic-review-sweeper --apply"
+timeout = "5m"

@@ -1,0 +1,35 @@
+# mechanic-cycle — scheduled priority-walk of the INFRA queue for city-infra-pl.
+#
+# Companion to gascity-maintenance-pl's authoring/review cycles, but for the
+# OTHER queue: the city-instance plumbing (dispatch-strand, nudge busy-loop,
+# dolt, supervisor, slack-adapter, gcsync, pool/worktree, honesty-gate
+# instrumentation, doctor checks) — beads labelled `city-infra` in the city
+# Dolt store (prefix `dr`).
+#
+# WHY THIS EXISTS ALONGSIDE patrol-city-infra-pl.toml
+#   patrol-city-infra-pl only sends a bare `gc session nudge` every 15m and
+#   leaves ALL of "is there work / what is it / in what order" to a nudge the
+#   PL may or may not act on. Per the overnight directive, nudges are
+#   unreliable (hang intermittently) and must NOT be the kick mechanism. This
+#   order fires on the runner's OWN cadence and injects a self-contained,
+#   priority-ranked work payload naming the exact top bead, so a tick does real
+#   work even if the generic patrol nudge was a no-op. The two are
+#   complementary: patrol = liveness ping; mechanic-cycle = the actual
+#   priority-walk of the queue.
+#
+# SHAPE: exec-based, NOT formula+pool.
+#   1. The city-infra-pl executes beads IN-PLACE itself (it is the Tier-1
+#      fixer, not a dispatcher to a polecat pool). So there is no `pool` to
+#      sling into the way pr-state-poller/author-cycle sling to a rig polecat.
+#   2. Same gastownhall/gascity#1440 formula+pool order regression that
+#      morning-triage-cycle / author-cycle work around.
+#
+# trigger=cooldown @ 20m: matches the reliable ~15-20min real tick cadence and
+# the existing patrol interval; slow enough that the PL finishes a bead between
+# ticks, fast enough to keep the small infra queue moving overnight.
+[order]
+description = "Every 20m: walk the city-infra queue by priority and inject the top open city-infra bead into the active city-infra-pl session for in-place execution. Exec does IO + deterministic ranking only; WHICH fix / HOW stays with the PL (ZFC). Reliable scheduled cadence — does not depend on a separate nudge landing."
+trigger = "cooldown"
+interval = "20m"
+exec = "/home/ds/gas-city/bin/mechanic-cycle"
+timeout = "2m"

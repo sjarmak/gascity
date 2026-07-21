@@ -1,0 +1,152 @@
+description = """
+Mayor-delegated ad-hoc work formula — the dispatch escape valve.
+
+When a Slack ask doesn't match any PL dispatch-table row, the PL
+escalates to mayor via a severity:escalate rollup AND slings the
+closest-fit workaround. Mayor reads the escalation and may delegate
+the ad-hoc work via this formula: file a bead with the precise
+workflow procedure in the body, set metadata.delegated_by_mayor=true,
+and sling a polecat with `--on mol-ad-hoc-from-mayor`.
+
+The contract is:
+- Mayor authors the procedure inline in the tracking bead body.
+- Worker reads the procedure + executes step-by-step using its
+  installed skills (focus, distill, verification-loop, code-review,
+  simplify, etc.).
+- Worker writes evidence.* + summary_for_human on close per the
+  standard close protocol.
+- Audit log entry per execution lets mayor-pattern-miner detect when
+  the same ask-shape recurs (>3 times = candidate for a proper
+  narrow formula per gc-mq4d's playbook).
+
+This formula is NEVER picked from the PL dispatch table by a Slack
+ask. It is invoked exclusively by mayor session-message → gc-sling
+with delegated_by_mayor metadata pre-set. The PL stays narrow and
+safe; mayor is the accountability boundary for ad-hoc improvisation.
+
+Documented in dr-45le2r. Parent: dr-i06w09 4th first-ship candidate.
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| issue | caller (mayor) | The tracking bead ID, which carries the workflow procedure in its description |
+"""
+formula = "mol-ad-hoc-from-mayor"
+phase = "vapor"
+version = 1
+
+[vars]
+[vars.issue]
+description = "The tracking bead ID. The bead's description carries the workflow procedure mayor wants executed."
+required = true
+
+[[steps]]
+id = "verify-mayor-delegation"
+title = "Verify the delegation gate"
+description = """
+This formula is mayor-only. Verify the gate before doing anything:
+
+```bash
+bd show {{issue}} --json | jq -r '.[0].metadata.delegated_by_mayor // "false"'
+```
+
+If the value is not `"true"`, halt immediately:
+
+```bash
+bd update {{issue}} --status=closed --notes "mol-ad-hoc-from-mayor invoked WITHOUT metadata.delegated_by_mayor=true. Refused. This formula is mayor-only — never slung from PL dispatch tables for Slack asks."
+```
+
+And drain via `gc runtime drain-ack`. Do not proceed to the work step.
+
+If the gate value IS `"true"`, log a mayor-delegation audit event:
+
+```bash
+echo '{"ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","event":"mayor_delegation","bead":"{{issue}}"}' \
+  >> /home/ds/gas-city/.gc/mol-ad-hoc-from-mayor.log
+```
+
+Then proceed to the do-work step.
+"""
+
+[[steps]]
+id = "do-work"
+title = "Execute mayor's workflow procedure"
+needs = ["verify-mayor-delegation"]
+description = """
+Read the bead's description — mayor has embedded the precise workflow
+procedure there:
+
+```bash
+bd show {{issue}}
+```
+
+Execute the procedure step-by-step. You have all standard skills
+installed (focus, distill, verification-loop, code-review, simplify,
+security-review, premortem, brainstorm, scaffold, bisect, etc.) — use
+them as the procedure indicates or as judgment suggests.
+
+**Constraints (apply regardless of what the procedure says):**
+
+- **No remote git ops.** Per `feedback_no_remote_ops` — local work
+  only. Never `git push` / `gh pr create` / `gh pr merge`. Mayor or
+  Stephanie handles push.
+- **Stay in your rig.** Cross-rig writes (e.g. editing
+  `/home/ds/gas-city/` from a gascity polecat) require a separate
+  dispatch. If the procedure asks you to edit outside your rig, halt
+  and surface to mayor via mail.
+- **Respect rig CLAUDE.md.** Every rig has close-gate evidence
+  requirements (commit hash + verdict + reviewer). Honor them.
+
+**Close protocol (REQUIRED before drain):**
+
+1. Write structured evidence:
+   ```bash
+   bd update {{issue}} \\
+     --set-metadata "evidence.artifact_path=<commit-sha-or-writeup-path>" \\
+     --set-metadata "evidence.reviewer_verdict=<pass|fail|pass-with-caveats>" \\
+     --set-metadata "evidence.reviewer_agent=<your-session-name>"
+   ```
+
+2. **Check whether this bead is slack-originated** (mayor may have set
+   originating_slack.* when delegating from a Stephanie ask):
+   ```bash
+   bd show {{issue}} --json | jq -r '.[0].metadata.originating_slack // empty'
+   ```
+   If non-empty, write a conversational `summary_for_human` — the
+   PL-loop-close handler will surface it back to the Slack thread:
+   ```bash
+   bd update {{issue}} \\
+     --set-metadata "summary_for_human=<1-3 plain sentences naming what mayor asked for and what you delivered>"
+   ```
+
+3. Close with a clear close_reason citing the mayor-delegation:
+   ```bash
+   bd update {{issue}} --status=closed --notes "Executed mayor-delegated ad-hoc workflow. <brief outcome summary>"
+   ```
+
+**Halt conditions:**
+
+If the procedure asks for something out of scope (remote ops, cross-rig
+edits, formula-authoring, mayor-only decisions), halt with a
+`bd update {{issue}} --status=blocked --notes "<reason>"` and mail
+mayor:
+```bash
+gc mail send mayor --from $GC_SESSION_ID --subject "halted: {{issue}}" --message "<reason + what's needed>"
+```
+
+Exit criteria: bead closed with evidence + (if slack-originated)
+summary_for_human, or blocked with a clear halt reason.
+"""
+
+[[steps]]
+id = "drain"
+title = "Signal completion"
+needs = ["do-work"]
+description = """
+Work complete. Drain:
+
+```bash
+gc runtime drain-ack
+```
+"""

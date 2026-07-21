@@ -1,0 +1,6 @@
+[order]
+description = "When a polecat creates a human-gate step bead under a molecule whose root work bead has originating_slack.* metadata, post a notification to the originating Slack thread. dr-xbs45x."
+trigger = "event"
+on = "bead.created"
+exec = "/home/ds/gas-city/bin/pl-human-gate-surface"
+timeout = "120s"

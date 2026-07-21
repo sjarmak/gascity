@@ -1,0 +1,91 @@
+description = """
+Brainstorm phase — generate N ideas for a solution space, seeded by research
+findings from the convoy root bead.
+
+Reads prior research notes from the bead, runs /brainstorm N, and appends
+the top candidates back as bead notes. No separate files.
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| issue    | caller | The convoy root bead (should already have research notes) |
+| count    | caller | Number of ideas to generate (default 30) |
+"""
+formula = "mol-brainstorm"
+phase = "liquid"
+version = 1
+
+[vars]
+[vars.issue]
+description = "The convoy root bead ID (should have research notes from mol-research)"
+required = true
+
+[vars.count]
+description = "Number of ideas to brainstorm"
+default = "30"
+
+[[steps]]
+id = "brainstorm"
+title = "Generate and evaluate solution ideas"
+description = """
+You are brainstorming solutions for the topic described in bead {{issue}}.
+
+**1. Read the bead and its research notes:**
+```bash
+bd show {{issue}}
+```
+
+The NOTES section contains research findings from a prior phase. Use these
+to seed your brainstorming — the exclusion zones and constraints come from
+the premortem risks and convergence decisions.
+
+**2. Run brainstorm:**
+
+/brainstorm {{count}}
+
+When the skill asks for a topic, use the bead title. When it asks for context,
+reference the research findings from the bead notes — specifically the
+recommended approach, risks to avoid, and convergence decisions.
+
+**3. Capture results as bead notes:**
+
+After brainstorming completes, synthesize the output:
+
+```bash
+bd note {{issue}} --file /dev/stdin <<'NOTE'
+## Brainstorm Results ({{count}} ideas generated)
+
+### Top Candidates
+[List the top 5-7 ideas that survived shape-uniqueness filtering]
+[For each: one-line description + why it's promising given the research constraints]
+
+### Exclusion Zones
+[What prior art and patterns were explicitly avoided]
+
+### Selected Direction
+[Which candidate(s) best fit the research findings and risk profile]
+[Justify against the premortem risks — does this approach survive them?]
+NOTE
+```
+
+**4. Update metadata:**
+```bash
+bd update {{issue}} --set-metadata phase=brainstorm_complete
+bd update {{issue}} --append-notes "Brainstorm phase complete. $(date -Iseconds)"
+```
+
+Do NOT close the bead."""
+
+[[steps]]
+id = "drain"
+title = "Signal completion"
+needs = ["brainstorm"]
+description = """
+Work is done. Signal the controller to reclaim this session:
+
+```bash
+gc runtime drain-ack
+```
+
+Run this command and nothing else."""

@@ -1,0 +1,31 @@
+# Secrets — NEVER track
+.env
+.env.*
+.beads-credential-key
+*.pem
+*.key
+
+# Runtime state (8.5G: beads.json + baks, events.jsonl + archives, traces, locks)
+.gc/
+
+# Bead store (dolt server data dir)
+.beads/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+
+# Legacy change-control artifacts — git is the history from 2026-07-21 onward
+*.bak
+*.bak-*
+*.bak.*
+*.PROPOSED-*
+__pycache__/
+.pytest_cache/
+
+# Stray bead worktrees that squat in the city root
+gc-*-load-context-*/
+gc-*-or-independent-*/
+
+# Reports are regenerated; keep the dir, ignore bulk
+.gc-reports/*.tmp

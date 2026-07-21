@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# bead-janitor: close orphaned formula scaffolding beads across city + rigs.
+#
+# Targets stale beads across two criteria:
+#
+# Age-based (>= MIN_AGE_DAYS, default 7):
+#   1. Type molecule or convoy (formula wrappers)
+#   2. Beads with metadata.gc.step_ref (formula step beads — definitive signal)
+#   3. Beads whose title is exactly a formula name (^mol-... or ^sling-...)
+#
+# Drain-orphan (any age, on by default):
+#   4. Open molecule/convoy whose `tracks` dep root bead is already CLOSED
+#      — catches the mol-do-work drain-orphan pattern (codex closes work bead
+#      via bd update but skips drain-ack, leaving scaffolding orphaned).
+#
+# Default mode is DRY-RUN. Pass --apply to actually close.
+#
+# Usage:
+#   bead-janitor                                # dry-run report only
+#   bead-janitor --apply                        # actually close (bd-backed stores)
+#   bead-janitor --include-file-store           # also scan /home/ds/gas-city/.gc/beads.json
+#   bead-janitor --nudge-mayor                  # also nudge mayor when findings
+#   bead-janitor --min-age 14                   # 14-day age threshold
+#   bead-janitor --no-include-drain-orphans     # disable the drain-orphan scan
+
+set -euo pipefail
+
+MIN_AGE_DAYS="${MIN_AGE_DAYS:-7}"
+APPLY=0
+NUDGE_MAYOR=0
+INCLUDE_FILE_STORE=0
+INCLUDE_DRAIN_ORPHANS=1
+FILE_STORE_HELPER="/home/ds/gas-city/bin/bead-janitor-file-store-helper.py"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --min-age) MIN_AGE_DAYS="$2"; shift 2 ;;
+    --apply) APPLY=1; shift ;;
+    --include-file-store) INCLUDE_FILE_STORE=1; shift ;;
+    --include-drain-orphans) INCLUDE_DRAIN_ORPHANS=1; shift ;;
+    --no-include-drain-orphans) INCLUDE_DRAIN_ORPHANS=0; shift ;;
+    --nudge-mayor) NUDGE_MAYOR=1; shift ;;
+    -h|--help)
+      sed -n 's/^# \{0,1\}//p' "$0" | head -24
+      exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+NOW_EPOCH=$(date +%s)
+CUTOFF_EPOCH=$((NOW_EPOCH - MIN_AGE_DAYS * 86400))
+
+# Collect non-suspended rig names
+mapfile -t RIGS < <(gc rig list 2>/dev/null | awk '
+  /^  [a-zA-Z][a-zA-Z0-9_-]+/ {
+    suspended = 0
+    for (i = 1; i <= NF; i++) if ($i ~ /suspended/) suspended = 1
+    if (suspended) next
+    name = $1
+    sub(/:$/, "", name)
+    # 2026-05-24: re-included gascity (was excluded as contributor-worktree
+    # convention, but our slings + polecat scaffolding land there and accumulate
+    # drain-orphans; with the drain-orphan signal added to FILTER, including it
+    # is safe — only molecules with closed root tasks get closed).
+    if (name != "ds-research") print name
+  }')
+
+# Age-based filter spec for jq (used per scope). Outputs TSV: id type title updated_at reason
+FILTER='
+  .[] |
+  . as $b |
+  (.updated_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $upd |
+  select($upd < $cutoff) |
+  (
+    if (.issue_type == "molecule" or .issue_type == "convoy") then
+      "molecule_or_convoy"
+    elif ((.metadata // {}) | has("gc.step_ref")) then
+      "step_ref"
+    elif ((.title // "") | test("^(mol-|sling-)[a-z][a-z0-9_.-]*$")) then
+      "formula_title"
+    else
+      empty
+    end
+  ) as $reason |
+  [.id, (.issue_type // "?"), (.title // ""), .updated_at, $reason] | @tsv
+'
+
+# Drain-orphan filter: for every open/in_progress molecule|convoy, emit one
+# row per `tracks` dep with the dep id in a special field. Aggregator below
+# joins against the closed-id set and only emits rows where ALL tracked deps
+# are closed (default-deny on unknown).
+# Outputs TSV: id type title updated_at reason tracked_id
+DRAIN_FILTER='
+  .[] |
+  select(.issue_type == "molecule" or .issue_type == "convoy") |
+  . as $b |
+  (.dependencies // [] | map(select(.type == "tracks") | .depends_on_id)) as $tracks |
+  select(($tracks | length) > 0) |
+  [.id, (.issue_type // "?"), (.title // ""), .updated_at, "drain_orphan", ($tracks | join(","))] | @tsv
+'
+
+# fetch_status_sets <scope> populates three globals:
+#   _SCOPE_OPEN   — combined open + in_progress list (json array)
+#   _SCOPE_CLOSED_IDS — newline-separated id list of closed beads
+# Default-deny: if any fetch fails, _SCOPE_CLOSED_IDS stays empty so no
+# drain-orphan candidate can match (its tracked root status is "unknown").
+fetch_status_sets() {
+  local scope=$1
+  local open in_progress closed
+  if [[ "$scope" == "city" ]]; then
+    open=$(bd list --status=open --json --limit=0 2>/dev/null || echo '[]')
+    in_progress=$(bd list --status=in_progress --json --limit=0 2>/dev/null || echo '[]')
+    closed=$(bd list --status=closed --json --limit=0 2>/dev/null || echo '[]')
+  else
+    open=$(gc bd --rig "$scope" list --status=open --json --limit=0 2>/dev/null || echo '[]')
+    in_progress=$(gc bd --rig "$scope" list --status=in_progress --json --limit=0 2>/dev/null || echo '[]')
+    closed=$(gc bd --rig "$scope" list --status=closed --json --limit=0 2>/dev/null || echo '[]')
+  fi
+  _SCOPE_OPEN=$(jq -s 'add // []' <<<"$open"$'\n'"$in_progress")
+  _SCOPE_CLOSED_IDS=$(jq -r '.[] | .id' <<<"$closed" 2>/dev/null || true)
+}
+
+list_candidates() {
+  jq -r --argjson cutoff "$CUTOFF_EPOCH" "$FILTER" <<<"$_SCOPE_OPEN" 2>/dev/null || true
+}
+
+list_drain_orphans() {
+  # No-op if disabled or no closed-set available (default-deny).
+  (( INCLUDE_DRAIN_ORPHANS )) || return 0
+  [[ -z "$_SCOPE_CLOSED_IDS" ]] && return 0
+
+  # Build a tmpfile of closed ids for grep-based membership tests.
+  local closed_file
+  closed_file=$(mktemp)
+  printf '%s\n' "$_SCOPE_CLOSED_IDS" | sort -u > "$closed_file"
+
+  # Emit raw rows (one per molecule/convoy with tracks deps) then filter:
+  # keep only rows where every tracked id is in the closed set.
+  jq -r "$DRAIN_FILTER" <<<"$_SCOPE_OPEN" 2>/dev/null | while IFS=$'\t' read -r id type title updated reason tracks_csv; do
+    [[ -z "$id" ]] && continue
+    local all_closed=1
+    local t
+    IFS=',' read -ra tarr <<<"$tracks_csv"
+    for t in "${tarr[@]}"; do
+      if ! grep -qxF "$t" "$closed_file"; then
+        all_closed=0
+        break
+      fi
+    done
+    if (( all_closed )); then
+      printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$type" "$title" "$updated" "$reason"
+    fi
+  done
+
+  rm -f "$closed_file"
+}
+
+# Dedupe by scope|id; first reason wins (age-based scan runs first).
+declare -A SEEN=()
+add_row() {
+  local scope=$1 row=$2
+  [[ -z "$row" ]] && return
+  local id="${row%%$'\t'*}"
+  local key="$scope|$id"
+  [[ -n "${SEEN[$key]:-}" ]] && return
+  SEEN[$key]=1
+  ALL+=("$scope|$row")
+}
+
+declare -a ALL=()
+extra_msg=""
+(( INCLUDE_DRAIN_ORPHANS )) && extra_msg=" + drain-orphans"
+echo "Scanning city + ${#RIGS[@]} active rigs (age cutoff: $MIN_AGE_DAYS days${extra_msg})..." >&2
+
+for scope in city "${RIGS[@]}"; do
+  fetch_status_sets "$scope"
+  while IFS= read -r row; do
+    add_row "$scope" "$row"
+  done < <(list_candidates)
+  while IFS= read -r row; do
+    add_row "$scope" "$row"
+  done < <(list_drain_orphans)
+done
+
+count=${#ALL[@]}
+
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
+
+{
+  echo "Bead-janitor: $count orphan formula scaffolding beads"
+  if (( count > 0 )); then
+    # Breakdown by reason class.
+    declare -A REASON_COUNTS=()
+    for row in "${ALL[@]}"; do
+      IFS=$'\t' read -r _id _type _title _updated reason <<<"${row#*|}"
+      REASON_COUNTS[$reason]=$(( ${REASON_COUNTS[$reason]:-0} + 1 ))
+    done
+    echo "  (age cutoff: $MIN_AGE_DAYS days; drain-orphan scan: $( ((INCLUDE_DRAIN_ORPHANS)) && echo on || echo off ))"
+    echo "  By reason:"
+    for r in molecule_or_convoy step_ref formula_title drain_orphan; do
+      c=${REASON_COUNTS[$r]:-0}
+      (( c > 0 )) && echo "    $r: $c"
+    done
+    echo
+    printf '%-22s %-22s %-12s %-20s %s\n' SCOPE ID TYPE REASON TITLE
+    printf '%-22s %-22s %-12s %-20s %s\n' ------ -- ---- ------ -----
+    for row in "${ALL[@]}"; do
+      # row format: <scope>|<id>\t<type>\t<title>\t<updated>\t<reason>
+      # FILTER emits TSV; we prepend "<scope>|" when collecting into ALL.
+      scope="${row%%|*}"
+      IFS=$'\t' read -r id type title updated reason <<<"${row#*|}"
+      printf '%-22s %-22s %-12s %-20s %.60s\n' "$scope" "$id" "$type" "$reason" "$title"
+    done
+    echo
+    if (( APPLY )); then
+      echo "Mode: APPLY (closing all candidates)"
+    else
+      echo "Mode: DRY-RUN (re-run with --apply to close)"
+    fi
+  fi
+} > "$out"
+
+cat "$out"
+
+closed=0
+if (( APPLY )) && (( count > 0 )); then
+  age_reason="bead-janitor: orphaned formula scaffolding (>= $MIN_AGE_DAYS days stale)"
+  drain_reason="bead-janitor: drain-orphan (tracks-root closed, scaffold left open)"
+  for row in "${ALL[@]}"; do
+    # row format: <scope>|<id>\t<type>\t<title>\t<updated>\t<reason>
+    # Parse scope as the first field before "|", then take only the
+    # first TSV field (id) from the rest. The previous form
+    # `IFS='|' read -r scope id _` swallowed the entire tab-separated
+    # tail into $id, which made bd reject the close as ambiguous.
+    scope="${row%%|*}"
+    rest="${row#*|}"
+    id="${rest%%$'\t'*}"
+    # Extract reason (5th TSV field) to pick the right close message.
+    IFS=$'\t' read -r _id _type _title _updated row_reason <<<"$rest"
+    if [[ "$row_reason" == "drain_orphan" ]]; then
+      close_reason="$drain_reason"
+    else
+      close_reason="$age_reason"
+    fi
+    if [[ "$scope" == "city" ]]; then
+      bd close --force "$id" --reason="$close_reason" >/dev/null 2>&1 && closed=$((closed+1)) || true
+    else
+      gc bd --rig "$scope" close --force "$id" --reason="$close_reason" >/dev/null 2>&1 && closed=$((closed+1)) || true
+    fi
+  done
+  echo
+  echo "Closed $closed of $count beads."
+fi
+
+file_store_summary=""
+if (( INCLUDE_FILE_STORE )); then
+  if [[ -x "$FILE_STORE_HELPER" ]]; then
+    echo
+    echo "--- file-backed city store (/home/ds/gas-city/.gc/beads.json) ---"
+    if (( APPLY )); then
+      JANITOR_APPLY=1 JANITOR_MIN_AGE_DAYS="$MIN_AGE_DAYS" "$FILE_STORE_HELPER" 2>&1 | tee -a "$out" || true
+    else
+      JANITOR_MIN_AGE_DAYS="$MIN_AGE_DAYS" "$FILE_STORE_HELPER" 2>&1 | tee -a "$out" || true
+    fi
+  else
+    echo "warn: file-store helper not executable: $FILE_STORE_HELPER" >&2
+  fi
+fi
+
+if (( NUDGE_MAYOR )) && (( count > 0 )); then
+  msg="bead-janitor report
+$(cat "$out")
+
+Run 'bead-janitor --apply' to clean these up if they look right.
+Surface to stephanie at next interaction."
+  gc session nudge mayor "$msg" 2>/dev/null || \
+    echo "warn: gc session nudge mayor failed (mayor may be asleep); report still in journal" >&2
+fi
+
+# Exit 0 even if findings — this is not a failure mode
+exit 0

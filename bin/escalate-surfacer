@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# escalate-surfacer: deliver undelivered severity:escalate rollups to Slack,
+# regardless of the rig's project-lead session naming.
+#
+# Why this exists:
+#
+#   The oversight-rig pack's `escalate-rollups` order delivers escalate
+#   rollups by resolving the rig's project-lead session under the pack
+#   naming `<rig>/oversight-rig.project-lead`, reading its active Slack
+#   binding, and publishing through that. Rigs with bespoke PLs
+#   (codeprobe, gascity-dashboard, scix-experiments, enterprisebench,
+#   mem, gascity-maintenance) fail that resolver — their
+#   `severity:escalate` rollup beads never get delivered and rot OPEN,
+#   silently. The human never sees them.
+#
+#   This closes that last mile with a naming-independent path: for EVERY
+#   rig in the city, find OPEN escalate rollup beads NOT yet labeled
+#   `delivered`, and post each straight to #gascity-maintenance using the
+#   SAME direct slack-adapter publish path bin/stall-watch uses
+#   (`gc slack publish-to-channel`). On a successful post, stamp the bead
+#   `delivered` so it is never re-posted. This is a backstop that runs
+#   independently of PL naming — it does not replace the pack order's
+#   per-rig routing, it catches what that order drops.
+#
+#   Dedup is the `delivered` label itself (same contract the pack uses):
+#   a bead is queried with --exclude-label delivered, so an already-
+#   delivered bead is never re-posted. Per-bead fail-safe: one failed
+#   post leaves that bead UNSTAMPED (retried next tick) and does not
+#   abort the rest.
+#
+# Usage:
+#   escalate-surfacer              # DRY-RUN (default): list what WOULD be
+#                                  #   delivered; post nothing, stamp nothing
+#   escalate-surfacer --post       # LIVE: post undelivered escalates and
+#                                  #   stamp delivered on success
+#   escalate-surfacer --dry-run    # explicit dry-run (same as default)
+#
+# Env:
+#   ESCALATE_SURFACER_CHANNEL   target Slack channel (default C0B0TQMQF2B,
+#                               #gascity-maintenance — same as stall-watch)
+#   ESCALATE_SURFACER_AUDIT_LOG audit log path (default .gc/escalate-surfacer.log)
+#   ESCALATE_SURFACER_DRY_RUN   set to 1 to force dry-run even with --post
+
+set -euo pipefail
+
+CITY=/home/ds/gas-city
+CHANNEL="${ESCALATE_SURFACER_CHANNEL:-C0B0TQMQF2B}"
+AUDIT_LOG="${ESCALATE_SURFACER_AUDIT_LOG:-$CITY/.gc/escalate-surfacer.log}"
+
+# `gc slack publish-to-channel` attributes the post to --session, defaulting to
+# $GC_SESSION_ID. The supervisor runs this order detached, where $GC_SESSION_ID
+# is unset, so the publish has no session to attribute and fails fast — silently
+# rotting every escalate rollup. Resolve a stable mayor session explicitly:
+# prefer $GC_SESSION_ID when present (interactive run), else the pinned mayor.
+resolve_publish_sid() {
+  if [[ -n "${GC_SESSION_ID:-}" ]]; then
+    printf '%s' "$GC_SESSION_ID"; return 0
+  fi
+  gc session list 2>/dev/null | awk '$2=="mayor" && /pin/{print $1; exit}'
+}
+PUBLISH_SID="$(resolve_publish_sid)"
+
+# Dry-run is the SAFE DEFAULT. Only --post (and not the env override) goes live.
+DRY_RUN=1
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --post)    DRY_RUN=0; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) sed -n 's/^# \{0,1\}//p' "$0" | head -45; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+# Env override can force dry-run on but never off (fail-safe).
+[[ "${ESCALATE_SURFACER_DRY_RUN:-0}" == "1" ]] && DRY_RUN=1
+
+ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+
+# Append one JSONL audit record. Never let a logging failure abort delivery.
+audit() {
+  local event="$1" rig="$2" bead="$3" detail="${4:-}"
+  jq -cn \
+    --arg ts "$(ts)" --arg event "$event" --arg rig "$rig" \
+    --arg bead "$bead" --arg detail "$detail" --argjson dry "$DRY_RUN" \
+    '{ts:$ts, event:$event, rig:$rig, bead:$bead, detail:$detail, dry_run:($dry==1)}' \
+    >> "$AUDIT_LOG" 2>/dev/null || true
+}
+
+# Enumerate active (non-suspended) rigs, excluding the ds-research HQ which is
+# file-backed and never carries oversight rollups. Same awk shape that
+# mayor-health-surfacer / flow-patrol use against `gc rig list`.
+mapfile -t RIGS < <(gc rig list 2>/dev/null | awk '
+  /^  [a-zA-Z][a-zA-Z0-9_-]+/ {
+    suspended = 0
+    for (i = 1; i <= NF; i++) if ($i ~ /suspended/) suspended = 1
+    if (suspended) next
+    name = $1; sub(/:$/, "", name)
+    if (name != "ds-research") print name
+  }')
+
+# Extract the "Smallest ask" line from a rollup description, if present.
+# Falls back to empty (caller omits the line) — never invents one.
+smallest_ask() {
+  local desc="$1"
+  printf '%s\n' "$desc" | { grep -iE '^[[:space:]]*Smallest ask:' || true; } | head -1 \
+    | sed -E 's/^[[:space:]]*//'
+}
+
+deliver_count=0
+post_count=0
+fail_count=0
+rc=0
+
+for rig in "${RIGS[@]}"; do
+  # Undelivered = open + rollup + severity:escalate + NOT labeled delivered.
+  # The exclude-label IS the dedup: delivered beads never reach this loop.
+  beads_json=$(gc bd --rig "$rig" list \
+      --label rollup --label severity:escalate \
+      --status open --exclude-label delivered \
+      --json --limit=0 2>/dev/null || echo '[]')
+
+  mapfile -t bead_ids < <(jq -r '.[].id' <<<"$beads_json" 2>/dev/null || true)
+  [[ ${#bead_ids[@]} -eq 0 ]] && continue
+
+  for id in "${bead_ids[@]}"; do
+    deliver_count=$((deliver_count + 1))
+
+    title=$(jq -r --arg id "$id" '.[] | select(.id==$id) | .title // ""' <<<"$beads_json")
+    desc=$(jq -r --arg id "$id" '.[] | select(.id==$id) | .description // ""' <<<"$beads_json")
+    ask=$(smallest_ask "$desc")
+
+    # Slack mrkdwn: *bold* (single asterisk), code span for the bead id.
+    msg=$(mktemp)
+    {
+      printf ':rotating_light: *Escalate — %s*\n' "$rig"
+      printf '*%s*\n' "$title"
+      [[ -n "$ask" ]] && printf '\n%s\n' "$ask"
+      printf '\n`%s` · rig: %s\n' "$id" "$rig"
+    } > "$msg"
+
+    if (( DRY_RUN )); then
+      echo "=== escalate-surfacer DRY-RUN ($rig / $id -> $CHANNEL) ==="
+      cat "$msg"
+      echo "=== would stamp 'delivered'; NOTHING posted or stamped (dry-run) ==="
+      audit "would_deliver" "$rig" "$id" "$title"
+      rm -f "$msg"
+      continue
+    fi
+
+    if gc slack publish-to-channel --conversation-id "$CHANNEL" --kind room \
+         ${PUBLISH_SID:+--session "$PUBLISH_SID"} \
+         --body-file "$msg" >/dev/null 2>&1; then
+      # Stamp only AFTER a confirmed post. If stamping fails, the bead will
+      # re-post next tick (at-least-once) rather than silently rotting.
+      if gc bd --rig "$rig" update "$id" --add-label delivered >/dev/null 2>&1; then
+        post_count=$((post_count + 1))
+        echo "$(ts) delivered $id ($rig) -> $CHANNEL" >> "$AUDIT_LOG"
+        audit "delivered" "$rig" "$id" "$title"
+      else
+        fail_count=$((fail_count + 1)); rc=1
+        echo "$(ts) WARN posted $id ($rig) but stamp failed; may re-post next tick" >> "$AUDIT_LOG"
+        audit "stamp_failed" "$rig" "$id" "$title"
+      fi
+    else
+      fail_count=$((fail_count + 1)); rc=1
+      echo "$(ts) ERROR publish $id ($rig) -> $CHANNEL failed; left unstamped (will retry)" >> "$AUDIT_LOG"
+      audit "post_failed" "$rig" "$id" "$title"
+    fi
+    rm -f "$msg"
+  done
+done
+
+if (( DRY_RUN )); then
+  echo "=== escalate-surfacer DRY-RUN summary: $deliver_count undelivered escalate(s) across ${#RIGS[@]} rig(s) ==="
+else
+  echo "$(ts) run: $deliver_count undelivered, $post_count posted, $fail_count failed" >> "$AUDIT_LOG"
+  (( deliver_count == 0 )) && echo "$(ts) clean: no undelivered escalates" >> "$AUDIT_LOG"
+fi
+
+exit $rc

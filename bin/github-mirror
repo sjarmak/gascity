@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""github-mirror — push-mirror real work beads from rig beads DBs to their GitHub repos.
+
+Staged 2026-07-18 (Stephanie-approved pilot: beads→GitHub Issues mirror, see
+docs/design/github-mirror-pilot.md). Runs `bd github sync --push-only` with a
+wrapper-computed --issues list so formula wisps (gc.step_ref / gc.root_bead_id /
+gc.synthetic / type=convoy) and the closed backlog never reach GitHub. Requires
+the patched bd 1.1.0 (56e6f65da, gastownhall/beads#4329 cherry-pick) for the
+content-hash push short-circuit; on stock 1.1.0 every listed bead re-PATCHes
+each run (#4214) — check `bd version` before promoting to --execute.
+Undo: remove the github-mirror order, `bd config unset github.repository` per
+rig. Mirrored issues on GitHub stay (close by hand if a pilot is abandoned).
+
+Env contract (set by orders/github-mirror.toml):
+  MIRROR_RIGS            space-separated rig paths (required)
+  MIRROR_MODE            "--dry-run" (default) | "--execute"
+  MIRROR_REPO_ALLOWLIST  comma-separated owner/ prefixes; default "sjarmak/"
+  MIRROR_MAX_CREATE      abort a rig if new-issue creations would exceed this (default 300)
+  MIRROR_CLOSED_DAYS     re-push window for closed-but-mirrored beads (default 14)
+  MIRROR_AUDIT_LOG       default /home/ds/gas-city/.gc/github-mirror-audit.log
+  MIRROR_PROJECT_OWNER   Projects v2 board owner (default sjarmak)
+  MIRROR_PROJECT_NUMBER  board number; board step skipped if unset (execute mode only)
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+from github_mirror_common import repositories_with_completed_transfers
+
+CHUNK = 100  # bead IDs per bd invocation; post-#4329 re-listing a pushed bead is API-free
+CENTRAL_VIEW_REPOSITORY = "sjarmak/gas-city-beads"
+MIGRATION_STATE_PATH = "/home/ds/gas-city/.gc/github-central-mirror-migration-state.json"
+
+WISP_META_KEYS = ("gc.step_ref", "gc.root_bead_id")
+ACTIVE_STATUSES = "open,in_progress,blocked,deferred,hooked"
+
+
+def run(cmd, cwd, env=None):
+    return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+
+
+def rig_env(rig, base=None):
+    """bd must target the rig's store explicitly: the gc order controller pins
+    BEADS_DIR to the CITY .beads in every exec env, which silently redirects
+    cwd-based resolution to the city store (found 2026-07-19, first order fire)."""
+    env = dict(base or os.environ)
+    env["BEADS_DIR"] = os.path.join(rig, ".beads")
+    return env
+
+
+def bd_json(args, cwd):
+    proc = run(["bd"] + args + ["--json"], cwd, env=rig_env(cwd))
+    if proc.returncode != 0:
+        raise RuntimeError(f"bd {' '.join(args)} failed in {cwd}: {proc.stderr.strip()}")
+    return json.loads(proc.stdout or "[]")
+
+
+def is_wisp(bead):
+    meta = bead.get("metadata") or {}
+    if any(meta.get(k) for k in WISP_META_KEYS):
+        return True
+    if meta.get("gc.synthetic") == "true" or meta.get("gc.formula_name") or meta.get("gc.kind") == "workflow":
+        return True
+    return bead.get("issue_type") == "convoy"
+
+
+def mirror_set(rig):
+    """Real active beads, plus already-mirrored beads closed recently (closes must propagate).
+
+    Beads labeled gh-closed-pending-triage are excluded: a human closed the issue
+    on GitHub and pushing would revert that close (field ownership — see
+    bin/github-mirror-reconcile, which sets the label)."""
+    active = [b for b in bd_json(["list", "--status", ACTIVE_STATUSES, "--limit", "0"], rig)
+              if not is_wisp(b) and "gh-closed-pending-triage" not in (b.get("labels") or [])]
+    cutoff = datetime.now(timezone.utc) - timedelta(days=int(os.environ.get("MIRROR_CLOSED_DAYS", "14")))
+    closed = [b for b in bd_json(["list", "--status", "closed", "--limit", "0"], rig)
+              if b.get("external_ref")
+              and datetime.fromisoformat(b["updated_at"].replace("Z", "+00:00")) >= cutoff]
+    return active, closed
+
+
+STATUS_TO_COLUMN = {"open": "Todo", "in_progress": "In Progress", "hooked": "In Progress",
+                    "blocked": "Blocked", "deferred": "Blocked", "closed": "Done"}
+
+
+def issue_url(external_ref, repo):
+    if external_ref.startswith("http"):
+        return external_ref
+    if external_ref.startswith("github:"):
+        return f"https://github.com/{repo}/issues/{external_ref.split(':')[-1]}"
+    return None
+
+
+def board_meta(owner, number):
+    view = run(["gh", "project", "view", str(number), "--owner", owner, "--format", "json"], cwd="/")
+    fields = run(["gh", "project", "field-list", str(number), "--owner", owner, "--format", "json"], cwd="/")
+    if view.returncode != 0 or fields.returncode != 0:
+        raise RuntimeError(f"board lookup failed: {(view.stderr or fields.stderr).strip()}")
+    project_id = json.loads(view.stdout)["id"]
+    status = next(f for f in json.loads(fields.stdout)["fields"] if f["name"] == "Status")
+    options = {o["name"]: o["id"] for o in status["options"]}
+    return {"project_id": project_id, "number": str(number), "owner": owner,
+            "field_id": status["id"], "options": options}
+
+
+def sync_board(beads, repo, meta, state):
+    """Ensure each mirrored bead is on the board with the right Status. Returns (updated, errors)."""
+    updated, errors = 0, 0
+    for b in beads:
+        ref = b.get("external_ref")
+        url = issue_url(ref, repo) if ref else None
+        if not url:
+            continue
+        column = STATUS_TO_COLUMN.get(b.get("status"))
+        cached = state.get(b["id"], {})
+        if not column or column not in meta["options"] or cached.get("status") == column:
+            continue
+        item_id = cached.get("item")
+        if not item_id:
+            add = run(["gh", "project", "item-add", meta["number"], "--owner", meta["owner"],
+                       "--url", url, "--format", "json"], cwd="/")
+            time.sleep(0.15)
+            if add.returncode != 0:
+                errors += 1
+                continue
+            item_id = json.loads(add.stdout)["id"]
+        edit = run(["gh", "project", "item-edit", "--id", item_id,
+                    "--project-id", meta["project_id"], "--field-id", meta["field_id"],
+                    "--single-select-option-id", meta["options"][column]], cwd="/")
+        time.sleep(0.15)
+        if edit.returncode != 0:
+            errors += 1
+            continue
+        state[b["id"]] = {"item": item_id, "status": column}
+        updated += 1
+    return updated, errors
+
+
+def main():
+    rigs = os.environ.get("MIRROR_RIGS", "").split()
+    if not rigs:
+        sys.exit("MIRROR_RIGS is required (space-separated rig paths)")
+    mode = os.environ.get("MIRROR_MODE", "--dry-run")
+    if mode not in ("--dry-run", "--execute"):
+        sys.exit(f"MIRROR_MODE must be --dry-run or --execute, got {mode!r}")
+    allowlist = [p.strip() for p in os.environ.get("MIRROR_REPO_ALLOWLIST", "sjarmak/").split(",") if p.strip()]
+    max_create = int(os.environ.get("MIRROR_MAX_CREATE", "300"))
+    audit_path = os.environ.get("MIRROR_AUDIT_LOG", "/home/ds/gas-city/.gc/github-mirror-audit.log")
+    try:
+        migrated_repositories = repositories_with_completed_transfers(
+            MIGRATION_STATE_PATH
+        )
+    except ValueError as exc:
+        sys.exit(str(exc))
+
+    env = dict(os.environ)
+    if not env.get("GITHUB_TOKEN"):
+        tok = run(["gh", "auth", "token"], cwd="/")
+        if tok.returncode != 0:
+            sys.exit(f"no GITHUB_TOKEN and `gh auth token` failed: {tok.stderr.strip()}")
+        env["GITHUB_TOKEN"] = tok.stdout.strip()
+
+    failures = 0
+    for rig in rigs:
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        repo_proc = run(["bd", "config", "get", "github.repository"], rig, env=rig_env(rig))
+        repo = repo_proc.stdout.strip()
+        if repo_proc.returncode != 0 or not repo or repo.endswith("(not set)"):
+            print(f"[{rig}] SKIP: github.repository not configured")
+            failures += 1
+            continue
+        if repo == CENTRAL_VIEW_REPOSITORY:
+            print(
+                f"[{rig}] REFUSED: {repo} is the one-way central view; "
+                "legacy bd sync must never target it"
+            )
+            failures += 1
+            continue
+        if repo in migrated_repositories:
+            print(
+                f"[{rig}] REFUSED: {repo} has completed central transfers; "
+                "legacy sync is permanently fenced"
+            )
+            failures += 1
+            continue
+        if not any(repo.startswith(p) for p in allowlist):
+            print(f"[{rig}] REFUSED: {repo} not under allowlist {allowlist} — never mirror to unowned upstreams")
+            failures += 1
+            continue
+
+        try:
+            active, closed = mirror_set(rig)
+        except (RuntimeError, json.JSONDecodeError, KeyError, ValueError) as e:
+            print(f"[{rig}] SKIP: {e}")
+            failures += 1
+            continue
+
+        ids = [b["id"] for b in active + closed]
+        creates = [b["id"] for b in active if not b.get("external_ref")]
+        if len(creates) > max_create:
+            print(f"[{rig}] ABORT: {len(creates)} would-be creations exceeds MIRROR_MAX_CREATE={max_create}; "
+                  f"raise the cap deliberately for initial population")
+            failures += 1
+            continue
+        if not ids:
+            print(f"[{rig}] nothing to mirror")
+            continue
+
+        pushed, errors = 0, 0
+        for i in range(0, len(ids), CHUNK):
+            chunk = ids[i:i + CHUNK]
+            cmd = ["bd", "github", "sync", "--push-only", "--issues", ",".join(chunk)]
+            if mode == "--dry-run":
+                cmd.append("--dry-run")
+            proc = run(cmd, rig, env=rig_env(rig, env))
+            if proc.returncode != 0:
+                errors += 1
+                print(f"[{rig}] chunk {i // CHUNK} FAILED: {proc.stderr.strip()[-500:]}")
+                break  # rate-limit aborts etc.: stop this rig, keep going with the next
+            pushed += len(chunk)
+
+        board_note = ""
+        project_number = os.environ.get("MIRROR_PROJECT_NUMBER")
+        if project_number and mode == "--execute" and not errors:
+            try:
+                meta = board_meta(os.environ.get("MIRROR_PROJECT_OWNER", "sjarmak"), project_number)
+                state_path = "/home/ds/gas-city/.gc/github-mirror-board-state.json"
+                state = {}
+                if os.path.exists(state_path):
+                    with open(state_path) as f:
+                        state = json.load(f)
+                fresh_active, fresh_closed = mirror_set(rig)  # re-read: push just wrote external_refs
+                board_updated, board_errors = sync_board(fresh_active + fresh_closed, repo, meta, state)
+                with open(state_path, "w") as f:
+                    json.dump(state, f)
+                board_note = f" board_updated={board_updated} board_errors={board_errors}"
+                failures += board_errors
+            except (RuntimeError, StopIteration, json.JSONDecodeError, KeyError) as e:
+                board_note = f" board_step_FAILED: {e}"
+                failures += 1
+
+        line = (f"{stamp} rig={rig} repo={repo} mode={mode} set={len(ids)} "
+                f"(active={len(active)} recent_closed={len(closed)} new_creates={len(creates)}) "
+                f"pushed={pushed} chunk_errors={errors}{board_note}")
+        print(line)
+        os.makedirs(os.path.dirname(audit_path), exist_ok=True)
+        with open(audit_path, "a") as f:
+            f.write(line + "\n")
+        failures += errors
+
+    sys.exit(1 if failures else 0)
+
+
+if __name__ == "__main__":
+    main()

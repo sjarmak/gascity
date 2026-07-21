@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# gc-pipeline: kick off the full research → brainstorm → decompose → dispatch
+# pipeline for a feature/project on a rig.
+#
+# Usage:
+#   gc-pipeline <rig> "<topic>" [--skip-brainstorm] [--perspectives N] [--ideas N] [--worker AGENT]
+#
+# Example:
+#   gc-pipeline codeprobe "New parser architecture with separate lexer and evaluator"
+#   gc-pipeline enterprisebench "Automated task validation pipeline" --perspectives 5 --ideas 50
+#   gc-pipeline geo "Expand prompt coverage" --worker geo-worker
+#
+# Creates a convoy root bead with the topic, then slings research to start.
+# Research uses mol-research formula (not raw skill invocation).
+# The note-back bead (blocked by research) auto-dispatches when research closes.
+# Decompose bead (blocked by note-back) auto-dispatches after that.
+#
+# Phases:
+#   1a. Research   → mol-research formula (diverge → converge → premortem)
+#   1b. Note-back  → copies PRD to root bead notes (auto after 1a)
+#   2.  Brainstorm → /brainstorm N ideas (optional, skip with --skip-brainstorm)
+#   3.  Decompose  → work beads with acceptance criteria + review chain
+set -euo pipefail
+
+CITY_TOML="/home/ds/gas-city/city.toml"
+
+RIG="${1:?Usage: gc-pipeline <rig> \"<topic>\" [--skip-brainstorm] [--perspectives N] [--ideas N] [--worker AGENT]}"
+TOPIC="${2:?Usage: gc-pipeline <rig> \"<topic>\"}"
+shift 2
+
+PERSPECTIVES=3
+IDEAS=30
+SKIP_BRAINSTORM=false
+WORKER=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --skip-brainstorm) SKIP_BRAINSTORM=true; shift ;;
+    --perspectives) PERSPECTIVES="$2"; shift 2 ;;
+    --ideas) IDEAS="$2"; shift 2 ;;
+    --worker) WORKER="$2"; shift 2 ;;
+    *) echo "Unknown flag: $1" >&2; exit 1 ;;
+  esac
+done
+
+# --- Resolve worker agent for this rig from city.toml ---
+resolve_worker() {
+  local rig="$1"
+  # Look for an [[agent]] block whose dir matches the rig path
+  local rig_path
+  rig_path=$(python3 -c "
+import tomllib, sys
+with open('$CITY_TOML', 'rb') as f:
+    cfg = tomllib.load(f)
+for r in cfg.get('rigs', []):
+    if r['name'] == '$rig':
+        print(r.get('path', ''))
+        sys.exit(0)
+print('')
+")
+
+  if [ -z "$rig_path" ]; then
+    echo "ERROR: Rig '$rig' not found in city.toml" >&2
+    return 1
+  fi
+
+  # Find a worker agent whose dir matches the rig path
+  python3 -c "
+import tomllib, sys
+with open('$CITY_TOML', 'rb') as f:
+    cfg = tomllib.load(f)
+for a in cfg.get('agent', []):
+    if a.get('dir', '') == '$rig_path':
+        print(a['name'])
+        sys.exit(0)
+print('')
+"
+}
+
+if [ -z "$WORKER" ]; then
+  WORKER=$(resolve_worker "$RIG")
+  if [ -z "$WORKER" ]; then
+    echo "ERROR: No worker agent found for rig '$RIG' in city.toml." >&2
+    echo "Either add an [[agent]] with dir matching the rig path, or pass --worker <agent-name>." >&2
+    exit 1
+  fi
+  echo "Resolved worker agent: $WORKER"
+fi
+
+# Create convoy root bead
+ROOT_ID=$(gc bd --rig "$RIG" create "$TOPIC" \
+  --type epic \
+  --metadata "{\"gc.pipeline\": \"research\", \"gc.rig\": \"$RIG\", \"gc.perspectives\": \"$PERSPECTIVES\", \"gc.ideas\": \"$IDEAS\", \"gc.skip_brainstorm\": \"$SKIP_BRAINSTORM\"}" \
+  --silent)
+
+echo "Created convoy root: $ROOT_ID"
+echo "  Topic: $TOPIC"
+echo "  Rig: $RIG"
+echo "  Worker: $WORKER"
+echo "  Perspectives: $PERSPECTIVES"
+echo "  Ideas: $IDEAS"
+echo "  Skip brainstorm: $SKIP_BRAINSTORM"
+echo ""
+
+# Create convoy
+gc convoy create "pipeline-$ROOT_ID" --rig "$RIG" 2>/dev/null || true
+
+# --- Phase 1a: Research via mol-research formula ---
+echo "Creating Phase 1: Research + Note-back"
+
+RESEARCH_ID=$(gc bd --rig "$RIG" create "Research: $TOPIC" \
+  --parent "$ROOT_ID" \
+  --metadata '{"gc.phase": "research", "gc.pipeline_root": "'"$ROOT_ID"'"}' \
+  --body-file /dev/stdin \
+  --silent <<RESEARCHEOF
+You are conducting structured research on the topic in bead $ROOT_ID for rig $RIG.
+
+**1. Read the topic:**
+\`\`\`bash
+bd show $ROOT_ID
+\`\`\`
+
+The bead title is your research topic. The description has additional context.
+
+**2. Run the research-project pipeline as a SKILL:**
+
+Execute the full diverge → converge → premortem pipeline. Use $PERSPECTIVES perspectives.
+
+/research-project
+
+When the skill asks for a topic, use the bead title from $ROOT_ID.
+When it asks for number of perspectives, use $PERSPECTIVES.
+
+**3. Capture findings as bead notes on $ROOT_ID:**
+
+After the pipeline completes, write findings to the convoy root bead:
+
+\`\`\`bash
+bd note $ROOT_ID --file /dev/stdin <<'NOTE'
+## Research Findings
+
+### Divergent Perspectives
+[Summarize each perspective's key findings]
+
+### Convergence Decisions
+[List the decisions reached during structured debate]
+
+### Premortem Risks
+[List failure narratives with severity and likelihood]
+
+### Recommended Approach
+[The approach that survived convergence and premortem scrutiny]
+NOTE
+\`\`\`
+
+**4. Update metadata and close this bead:**
+\`\`\`bash
+bd update $ROOT_ID --set-metadata phase=research_complete
+bd close <your-bead-id> -r "Research complete"
+gc runtime drain-ack
+\`\`\`
+
+Do NOT close the convoy root ($ROOT_ID) — only your assigned research bead.
+RESEARCHEOF
+)
+
+# --- Phase 2: Decompose (blocked by research, auto-dispatches when research closes) ---
+DECOMPOSE_ID=$(gc bd --rig "$RIG" create "Decompose: $TOPIC" \
+  --parent "$ROOT_ID" \
+  --deps "blocks:$RESEARCH_ID" \
+  --metadata '{"gc.phase": "decompose", "gc.pipeline_root": "'"$ROOT_ID"'"}' \
+  --body-file /dev/stdin \
+  --silent <<DECOMPOSEEOF
+Decompose $ROOT_ID into work beads for rig $RIG.
+
+1. Read the full research context:
+   bd show $ROOT_ID
+   (All findings are in the NOTES section)
+
+2. Create child beads with:
+   - Clear title describing the work
+   - Acceptance criteria in the description
+   - Tag gc.routing=criteria-only for flexible work
+   - Tag gc.routing=prescriptive for exact/mechanical tasks
+
+3. Wire dependencies between beads:
+   bd dep add <child> <depends-on>
+
+4. Update convoy root:
+   bd update $ROOT_ID --set-metadata phase=decompose_complete
+
+5. Close and drain (find your bead ID from your assignment):
+   bd close <your-bead-id> -r "Decomposed into N work beads"
+   gc runtime drain-ack
+DECOMPOSEEOF
+)
+
+echo "Created research bead: $RESEARCH_ID"
+echo "Created decompose bead: $DECOMPOSE_ID (blocked by $RESEARCH_ID)"
+
+# --- Sling research with raw bead description (no formula wrapper) ---
+gc sling --no-formula --no-convoy --force "$WORKER" "$RESEARCH_ID"
+
+echo ""
+echo "Phase 1 dispatched."
+echo "  Research agent: $WORKER"
+echo "  Decompose auto-dispatches when research closes."
+echo ""
+echo "Monitor:"
+echo "  gc session list"
+echo "  gc session peek <id>"
+echo "  gc bd --rig $RIG show $ROOT_ID"

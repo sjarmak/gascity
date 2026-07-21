@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""eval-runner — report-only nightly eval harness (gc-xd77u pilot).
+
+Judges candidate traces against the task corpus (evals/tasks/*.yaml) and writes a
+JSONL report to .gc/evals-report.log. REPORT-ONLY: it never gates, promotes, or
+mutates anything. The promotion gate (gc-xd77u phase 4/5) is deliberately not
+wired until a stable shadow week.
+
+Judges per task:
+  - rule_judge  : deterministic structural checks (ZFC-allowed) —
+                  tool_calls <= max_tool_calls, build_green, violations <= baseline.
+  - rubric_judge: delegated quality call to a model (ZFC). OFF by default (cheap,
+                  deterministic nightly run); enable with --rubric, which invokes
+                  `claude -p`. Any failure/timeout -> rubric: SKIPPED; the run
+                  still completes (report-only never blocks).
+
+GUARDRAIL (gc-xd77u, non-negotiable): the private held-out set (evals/golden/) is
+hashed before and after; a mismatch ABORTS loudly. Eval agents never edit golden
+data. Golden contents are never printed.
+
+Usage: eval-runner [--rubric] [--tasks DIR] [--json]
+Exit:  0 always in report-only mode (unless the golden guard trips -> 3).
+"""
+import sys, os, json, hashlib, glob, subprocess, time, io
+
+CITY = "/home/ds/gas-city"
+TASKS_DIR = os.path.join(CITY, "evals", "tasks")
+GOLDEN_DIR = os.path.join(CITY, "evals", "golden")
+REPORT_LOG = os.path.join(CITY, ".gc", "evals-report.log")
+
+try:
+    import yaml
+except ImportError:
+    print("eval-runner: PyYAML required", file=sys.stderr); sys.exit(2)
+
+
+def golden_hash(d):
+    """Stable hash over the held-out set's file contents (names + bytes).
+    Uses os.walk (not glob) so dotfiles are included — an agent must not be able
+    to slip a change past the guard via a hidden file."""
+    h = hashlib.sha256()
+    if not os.path.isdir(d):
+        return "no-golden-dir"
+    for root, dirs, files in os.walk(d):
+        dirs.sort()
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            h.update(os.path.relpath(path, d).encode())
+            with open(path, "rb") as f:
+                h.update(f.read())
+    return h.hexdigest()
+
+
+def rule_judge(rj, cand):
+    """Deterministic. Returns (passed, reasons[])."""
+    reasons = []
+    tc, mx = cand.get("tool_calls"), rj.get("max_tool_calls")
+    if mx is not None and isinstance(tc, int) and tc > mx:
+        reasons.append(f"tool_calls {tc} > max {mx}")
+    if rj.get("require_build_green") and not cand.get("build_green", False):
+        reasons.append("build not green")
+    if rj.get("no_new_violations"):
+        v, base = cand.get("violations", 0), cand.get("baseline_violations", 0)
+        if isinstance(v, int) and isinstance(base, int) and v > base:
+            reasons.append(f"violations {v} > baseline {base}")
+    return (len(reasons) == 0, reasons)
+
+
+def rubric_judge(criteria, cand, enabled):
+    """Delegated to a model via `claude -p`. OFF by default. Never raises."""
+    if not enabled:
+        return "SKIPPED", "rubric disabled (--rubric to enable)"
+    prompt = (
+        "You are an eval rubric judge. Given the criteria and the candidate run "
+        "output, respond with exactly one token: PASS or FAIL.\n\n"
+        f"CRITERIA:\n{criteria}\n\nCANDIDATE OUTPUT:\n{cand.get('output','')}\n\n"
+        "Answer PASS or FAIL:"
+    )
+    try:
+        r = subprocess.run(["claude", "-p", prompt], capture_output=True,
+                           text=True, timeout=120)
+        out = (r.stdout or "").strip().upper()
+        if "PASS" in out and "FAIL" not in out:
+            return "PASS", out[:80]
+        if "FAIL" in out:
+            return "FAIL", out[:80]
+        return "SKIPPED", f"unparseable verdict: {out[:60]}"
+    except Exception as e:  # timeout, no auth, etc. — never block the report run
+        return "SKIPPED", f"model unreachable: {type(e).__name__}"
+
+
+def load_candidate(task, task_path):
+    cand_ref = task.get("candidate")
+    if not cand_ref:
+        return None, "no candidate ref"
+    p = cand_ref if os.path.isabs(cand_ref) else os.path.join(CITY, cand_ref)
+    try:
+        with open(p) as f:
+            return json.load(f), None
+    except Exception as e:
+        return None, f"candidate load failed: {e}"
+
+
+def main():
+    argv = sys.argv[1:]
+    rubric_on = "--rubric" in argv
+    json_out = "--json" in argv
+    tasks_dir = TASKS_DIR
+    if "--tasks" in argv:
+        tasks_dir = argv[argv.index("--tasks") + 1]
+
+    pre = golden_hash(GOLDEN_DIR)
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    results = []
+    for tp in sorted(glob.glob(os.path.join(tasks_dir, "*.yaml"))):
+        try:
+            task = yaml.safe_load(open(tp))
+        except Exception as e:
+            results.append({"task": os.path.basename(tp), "verdict": "ERROR",
+                            "error": f"task parse: {e}"})
+            continue
+        cand, err = load_candidate(task, tp)
+        if cand is None:
+            results.append({"task": task.get("id"), "verdict": "ERROR", "error": err})
+            continue
+        rp, rreasons = rule_judge(task.get("rule_judge", {}), cand)
+        rv, rnote = rubric_judge(task.get("rubric_judge", {}).get("criteria", ""),
+                                 cand, rubric_on)
+        verdict = "PASS" if (rp and rv in ("PASS", "SKIPPED")) else "FAIL"
+        results.append({
+            "task": task.get("id"), "source": task.get("source"),
+            "rule": "pass" if rp else "fail", "rule_reasons": rreasons,
+            "rubric": rv.lower(), "rubric_note": rnote, "verdict": verdict,
+        })
+
+    post = golden_hash(GOLDEN_DIR)
+    if pre != post:
+        print(f"eval-runner: GOLDEN SET MODIFIED during run (pre={pre[:12]} "
+              f"post={post[:12]}) — ABORT. Golden data must not be edited.",
+              file=sys.stderr)
+        sys.exit(3)
+
+    npass = sum(1 for r in results if r.get("verdict") == "PASS")
+    report = {"ts": ts, "report_only": True, "rubric_enabled": rubric_on,
+              "golden_hash": pre[:16], "total": len(results), "passed": npass,
+              "results": results}
+    try:
+        os.makedirs(os.path.dirname(REPORT_LOG), exist_ok=True)
+        with open(REPORT_LOG, "a") as f:
+            f.write(json.dumps(report) + "\n")
+    except OSError:
+        pass
+
+    if json_out:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"eval-runner (REPORT-ONLY): {npass}/{len(results)} pass "
+              f"[rubric {'on' if rubric_on else 'off'}, golden {pre[:12]}]")
+        for r in results:
+            note = "; ".join(r.get("rule_reasons", [])) or r.get("error", "")
+            print(f"  {r.get('verdict','?'):5} {r.get('task','?'):32} "
+                  f"rule={r.get('rule','?')} rubric={r.get('rubric','?')}"
+                  + (f"  ({note})" if note else ""))
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""fork-pr-approval-gate: detect (and, on request, approve) open PRs whose REQUIRED
+status checks (CI, CodeQL) are stuck in GitHub Actions 'action_required' — the
+fork / outside-contributor workflow-approval gate that silently blocks merges.
+
+Stephanie directive 2026-07-03 (option a: alert-then-approve). DEFAULT mode DETECTS
+and (with --nudge-mayor) alerts mayor. --approve APPROVES the required-check runs on
+the given PRs (or all detected) — this needs WRITE access only (which our token has),
+NOT admin, so an agent can do it on Stephanie's say-so. Julian/admin is needed ONLY
+for the permanent repo Actions-setting change; the per-run approval is not.
+
+Only CI + CodeQL are approved: they emit the ruleset's required contexts (Check +
+Analyze (...)). The non-required workflows (Mac Regression, etc.) are left alone.
+
+Usage:
+  fork-pr-approval-gate [--json] [--nudge-mayor]   # detect + (optionally) alert mayor
+  fork-pr-approval-gate --approve [PR ...]          # approve required runs (all detected if no PR given)
+Env: FORK_PR_GATE_REPO (default gastownhall/gascity)
+"""
+import sys, os, json, subprocess
+
+REPO = os.environ.get("FORK_PR_GATE_REPO", "gastownhall/gascity")
+CITY = "/home/ds/gas-city"
+REQUIRED_WORKFLOWS = {"CI", "CodeQL"}  # emit the required contexts Check + Analyze(...)
+STATE = os.path.join(CITY, ".gc", "fork-pr-approval-gate-alerted.txt")
+
+
+def gh_json(args, timeout=90):
+    try:
+        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+        return json.loads(out.stdout) if out.returncode == 0 and out.stdout else None
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def open_pr_heads():
+    """{head_sha12: (number, ref)} for open non-draft PRs (REST — GraphQL is flaky)."""
+    prs = gh_json(["api", f"repos/{REPO}/pulls?state=open&per_page=100"])
+    heads = {}
+    for p in (prs or []):
+        if p.get("draft"):
+            continue
+        sha = (p.get("head") or {}).get("sha", "")
+        if sha:
+            heads[sha[:12]] = (p["number"], (p.get("head") or {}).get("ref", ""))
+    return heads
+
+
+def stuck_runs():
+    """[(run_id, workflow, sha12, ref, pr)] — action_required CI/CodeQL runs whose
+    head is a CURRENT open-PR head (so we never approve stale-commit runs)."""
+    heads = open_pr_heads()
+    out = []
+    for page in range(1, 6):  # paginate; a run may be older than page 1
+        data = gh_json(["api",
+                        f"repos/{REPO}/actions/runs?status=action_required&per_page=100&page={page}"])
+        runs = (data or {}).get("workflow_runs", [])
+        for r in runs:
+            if r.get("name") not in REQUIRED_WORKFLOWS:
+                continue
+            sha12 = (r.get("head_sha") or "")[:12]
+            if sha12 in heads:
+                pr, ref = heads[sha12]
+                out.append((r["id"], r["name"], sha12, ref, pr))
+        if len(runs) < 100:
+            break
+    return out
+
+
+def dedup(runs):
+    """one run per (sha, workflow), highest id — avoids double-approving a re-run."""
+    seen, keep = set(), []
+    for rid, wf, sha, ref, pr in sorted(runs, key=lambda x: -x[0]):
+        k = (sha, wf)
+        if k not in seen:
+            seen.add(k)
+            keep.append((rid, wf, sha, ref, pr))
+    return keep
+
+
+def main():
+    argv = sys.argv[1:]
+    approve = "--approve" in argv
+    json_out = "--json" in argv
+    nudge = "--nudge-mayor" in argv
+    explicit = {int(a.lstrip("#")) for a in argv if a.lstrip("#").isdigit()}
+
+    runs_all = stuck_runs()
+    runs = dedup(runs_all)                       # deduped view for detect/alert
+    prs = sorted({pr for *_, pr in runs})
+
+    if approve:
+        # Approve EVERY action_required required run for the targets (not the deduped
+        # view) — duplicate re-runs on the same head would otherwise linger in
+        # action_required and cause false "still stuck" re-alerts.
+        targets = explicit if explicit else set(prs)
+        approved, failed = [], []
+        for rid, wf, sha, ref, pr in runs_all:
+            if pr not in targets:
+                continue
+            r = subprocess.run(["gh", "api", "-X", "POST",
+                                f"repos/{REPO}/actions/runs/{rid}/approve"],
+                               capture_output=True, text=True, timeout=60)
+            (approved if r.returncode == 0 else failed).append(
+                {"pr": pr, "wf": wf, "run": rid,
+                 "err": (r.stderr.strip()[:100] if r.returncode else "")})
+        done_prs = sorted({a["pr"] for a in approved})
+        if json_out:
+            print(json.dumps({"approved": approved, "failed": failed, "prs": done_prs}, indent=2))
+        else:
+            print(f"fork-pr-approval-gate: approved {len(approved)} run(s) across PRs {done_prs}"
+                  + (f"; {len(failed)} FAILED" if failed else ""))
+        return 0 if not failed else 1
+
+    # DETECT mode
+    by_pr = {}
+    for rid, wf, sha, ref, pr in runs:
+        by_pr.setdefault(pr, {"ref": ref, "wfs": set()})["wfs"].add(wf)
+    report = [{"pr": pr, "ref": v["ref"], "stuck": sorted(v["wfs"])}
+              for pr, v in sorted(by_pr.items())]
+
+    if json_out:
+        print(json.dumps({"repo": REPO, "stuck_prs": report}, indent=2))
+    elif report:
+        print(f"fork-pr-approval-gate: {len(report)} PR(s) with required checks awaiting approval:")
+        for r in report:
+            print(f"  #{r['pr']} ({r['ref']}) — stuck: {', '.join(r['stuck'])}")
+    else:
+        print("fork-pr-approval-gate: no PRs stuck awaiting workflow approval")
+
+    # Alert mayor, deduped on the PR-set signature (don't re-mail an unchanged set).
+    if nudge and report:
+        sig = ",".join(str(r["pr"]) for r in report)
+        last = ""
+        try:
+            with open(STATE) as f:
+                last = f.read().strip()
+        except OSError:
+            pass
+        if sig != last:
+            body = ("Fork / outside-contributor PRs with REQUIRED checks (CI/CodeQL) stuck in "
+                    "GitHub 'action_required' — they cannot merge until the workflow runs are "
+                    "approved. This needs write access only (no Julian / admin):\n"
+                    + "\n".join(f"  #{r['pr']} ({r['ref']}) — {', '.join(r['stuck'])}" for r in report)
+                    + "\n\nApprove all:  fork-pr-approval-gate --approve"
+                    + "\nApprove subset:  fork-pr-approval-gate --approve <PR> [<PR> ...]"
+                    + "\n\nRelay to Stephanie for her go before approving (option-a: human-directed).")
+            subprocess.run(["gc", "mail", "send", "mayor", "-s",
+                            f"fork-pr-approval-gate: {len(report)} PR(s) awaiting workflow approval",
+                            "-m", body], capture_output=True, timeout=30)
+            try:
+                with open(STATE, "w") as f:
+                    f.write(sig)
+            except OSError:
+                pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

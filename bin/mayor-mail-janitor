@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""mayor-mail-janitor: archive mayor-addressed message beads older than 7 days.
+
+The mail-redirect-to-mayor order surfaces agent-written mail to mayor when
+it was addressed to a dead-letter recipient (human, stephanie, sjarmak).
+Combined with direct agent→mayor mail, mayor's inbox accumulates hundreds
+of historical status reports, handoff notes, and [redirect] copies — none
+of which need a response after a day or two.
+
+This janitor archives any message bead where:
+  - status is open or in_progress
+  - assignee or owner is "mayor"
+  - issue_type is "message"
+  - created_at is more than RETAIN_DAYS old (default 7)
+
+Archive is reversible (the bead is closed, not deleted); rationale lives
+in the existing `gc mail archive` semantics.
+
+Env:
+  JANITOR_RETAIN_DAYS - archive items older than this in days (default 7)
+  JANITOR_DRY_RUN     - any non-empty value = list IDs but don't archive
+  JANITOR_MAX_BATCH   - chunk size for `gc mail archive` (default 50)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+BEADS_PATH = Path("/home/ds/gas-city/.gc/beads.json")
+RETAIN_DAYS = float(os.environ.get("JANITOR_RETAIN_DAYS", "7"))
+DRY_RUN = bool(os.environ.get("JANITOR_DRY_RUN", "").strip())
+MAX_BATCH = int(os.environ.get("JANITOR_MAX_BATCH", "50"))
+
+
+def age_days(b: dict, now: datetime) -> float:
+    c = b.get("created_at")
+    if not c:
+        return 0.0
+    try:
+        dt = datetime.fromisoformat(c.replace("Z", "+00:00"))
+        return (now - dt).total_seconds() / 86400
+    except ValueError:
+        return 0.0
+
+
+def collect_targets() -> list[str]:
+    if not BEADS_PATH.exists():
+        return []
+    data = json.loads(BEADS_PATH.read_text())
+    beads = data.get("beads", []) if isinstance(data, dict) else data
+    now = datetime.now(timezone.utc)
+    targets = []
+    for b in beads:
+        if b.get("status") not in ("open", "in_progress"):
+            continue
+        if b.get("issue_type") != "message":
+            continue
+        if b.get("assignee") != "mayor" and b.get("owner") != "mayor":
+            continue
+        if age_days(b, now) < RETAIN_DAYS:
+            continue
+        targets.append(b["id"])
+    return targets
+
+
+def archive_batches(ids: list[str]) -> tuple[int, int]:
+    """Returns (archived_count, failed_count)."""
+    archived = 0
+    failed = 0
+    for i in range(0, len(ids), MAX_BATCH):
+        chunk = ids[i : i + MAX_BATCH]
+        # `gc mail archive` runs ~5s per bead against the shared Dolt server,
+        # so scale the timeout to the chunk size; a fixed 120s tripped on full
+        # batches and crashed the run before anything was archived.
+        try:
+            result = subprocess.run(
+                ["gc", "mail", "archive", *chunk],
+                capture_output=True, text=True, timeout=60 + 10 * len(chunk),
+            )
+        except subprocess.TimeoutExpired:
+            failed += len(chunk)
+            print(f"batch timed out ({len(chunk)} ids)", file=sys.stderr)
+            continue
+        if result.returncode == 0:
+            archived += sum(1 for line in result.stdout.splitlines() if "Archived" in line)
+        else:
+            failed += len(chunk)
+            print(f"batch failed: {result.stderr.strip()[:200]}", file=sys.stderr)
+    return archived, failed
+
+
+def main() -> int:
+    targets = collect_targets()
+    if not targets:
+        print(f"mayor-mail-janitor: 0 items older than {RETAIN_DAYS}d — nothing to do")
+        return 0
+    if DRY_RUN:
+        print(f"mayor-mail-janitor [DRY RUN]: would archive {len(targets)} item(s)")
+        for t in targets[:20]:
+            print(f"  {t}")
+        if len(targets) > 20:
+            print(f"  ... +{len(targets) - 20} more")
+        return 0
+    archived, failed = archive_batches(targets)
+    print(f"mayor-mail-janitor: archived {archived} item(s), {failed} failed (target={len(targets)}, retain={RETAIN_DAYS}d)")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

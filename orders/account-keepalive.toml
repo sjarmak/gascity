@@ -1,0 +1,6 @@
+[order]
+description = "Every 15m: leave valid Claude OAuth tokens alone; after expiry, attempt headless recovery and mail mayor only if recovery fails. Failed-recovery alerts are deduplicated by account and expiry epoch."
+trigger = "cron"
+schedule = "*/15 * * * *"
+exec = "/home/ds/gas-city/bin/account-keepalive"
+timeout = "12m"

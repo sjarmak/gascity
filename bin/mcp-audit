@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# mcp-audit: surface MCP fan-out waste. For every configured MCP server, compare
+# what it COSTS (live process count + RSS, summed across all sessions that
+# spawned a copy) against what it's USED for (actual mcp__<server>__ tool calls
+# in recent session logs). A server with many procs + real RAM but ZERO calls is
+# dead weight configured globally — every session spawns it for nothing.
+#
+# Report-only. Trimming is a config edit (remove from /home/ds/.claude.json or a
+# rig .mcp.json) — a human/mayor decision, not this tool's. The 2026-06-16 sweep
+# that motivated this found code-intel-copilot at 151 procs / 5.2G with 0 calls.
+#
+# Usage:
+#   mcp-audit                  # report to stdout + audit log
+#   mcp-audit --days 14        # usage window (default 7)
+#   mcp-audit --nudge-mayor    # nudge if any DEAD server found
+
+set -uo pipefail
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${MCP_AUDIT_LOG:-${CITY}/.gc/mcp-audit.log}"
+DAYS=7
+NUDGE_MAYOR=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --days) DAYS="$2"; shift 2 ;;
+    --nudge-mayor) NUDGE_MAYOR=1; shift ;;
+    -h|--help) sed -n 's/^# \{0,1\}//p' "$0" | head -18; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+mkdir -p "$(dirname "$AUDIT_LOG")"
+
+# Configured MCP servers: global config + every rig .mcp.json.
+mapfile -t SERVERS < <(
+  { jq -r '.mcpServers // {} | keys[]' /home/ds/.claude.json 2>/dev/null
+    find /home/ds/projects -maxdepth 2 -name '.mcp.json' 2>/dev/null \
+      -exec jq -r '.mcpServers // {} | keys[]' {} \; 2>/dev/null
+  } | sort -u)
+
+# Usage counts: mcp__<server>__ calls across recent session logs (normalize
+# server token by stripping non-alnum so code-intel-copilot -> codeintelcopilot).
+usage_blob=$(find /home/ds/.claude-homes/*/.claude/projects /home/ds/.claude/projects \
+  -name '*.jsonl' -mtime -"$DAYS" 2>/dev/null \
+  | xargs grep -hoE 'mcp__[a-zA-Z0-9_-]+__' 2>/dev/null \
+  | sed -E 's/^mcp__//; s/__$//' | tr 'A-Z' 'a-z' | tr -d '_-' | sort | uniq -c)
+
+norm() { echo "$1" | tr 'A-Z' 'a-z' | tr -d '_-'; }
+calls_for() { local k; k=$(norm "$1"); awk -v k="$k" '{g=$2; gsub(/[_-]/,"",g); if(g==k) s+=$1} END{print s+0}' <<<"$usage_blob"; }
+
+# Process cost: procs whose cmdline contains the server name (best-effort).
+declare -A P_N P_R
+for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+  cmd=$(cat "/proc/$p/cmdline" 2>/dev/null | tr '\0' ' ') || continue
+  [[ -n "$cmd" ]] || continue
+  [[ "$cmd" == *mcp* || "$cmd" == *codegraph* || "$cmd" == *sourcegraph* ]] || continue
+  r=$(awk '/^VmRSS/{print $2}' "/proc/$p/status" 2>/dev/null || echo 0)
+  for s in "${SERVERS[@]}"; do
+    if [[ "$cmd" == *"$s"* ]]; then P_N[$s]=$(( ${P_N[$s]:-0} + 1 )); P_R[$s]=$(( ${P_R[$s]:-0} + r )); fi
+  done
+done
+
+dead=()
+printf '%-22s %-8s %-7s %-8s %s\n' SERVER PROCS RSS CALLS VERDICT
+printf '%-22s %-8s %-7s %-8s %s\n' ------ ----- --- ----- -------
+for s in "${SERVERS[@]}"; do
+  n=${P_N[$s]:-0}; rss=$(( ${P_R[$s]:-0} / 1024 )); calls=$(calls_for "$s")
+  if (( calls == 0 && n > 0 )); then verdict="DEAD — remove from config"; dead+=("$s|$n|${rss}M"); else verdict="ok"; fi
+  printf '%-22s %-8s %-7s %-8s %s\n' "$s" "$n" "${rss}M" "$calls" "$verdict"
+done
+
+jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson days "$DAYS" \
+       --argjson dead "$(printf '%s\n' "${dead[@]:-}" | jq -R 'select(length>0)|split("|")|{server:.[0],procs:(.[1]|tonumber),rss:.[2]}' | jq -sc .)" \
+  '{ts:$ts, window_days:$days, dead:$dead}' >> "$AUDIT_LOG"
+
+if (( NUDGE_MAYOR )) && (( ${#dead[@]} > 0 )); then
+  gc session nudge mayor "mcp-audit: ${#dead[@]} configured MCP server(s) with procs+RAM but 0 calls in ${DAYS}d — remove from config. See $AUDIT_LOG" 2>/dev/null || true
+fi

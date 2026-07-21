@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""issue-dedup-intake: suggest possible duplicates for newly-opened issues.
+
+Issue-hygiene piece 4 (mayor gc-429253). For each issue opened since the last
+run, flags the most title-similar already-open issue(s) as a "possible duplicate
+of #N" SUGGESTION. NEVER auto-closes — a human decides; false positives are
+low-harm (a label + a comment a maintainer can dismiss).
+
+ZFC: duplicate detection by a *calibrated mechanical threshold* is the explicitly
+allowed exception (mechanical comparison, not semantic judgement) — so this stays
+in code. Similarity = Jaccard overlap of significant title tokens (stopwords +
+repo-common terms dropped), gated by a conservative threshold to keep suggestions
+high-precision. It only SUGGESTS; the model-driven triage (piece 3) and a human
+make the real duplicate call.
+
+Posting a label/comment is an external write -> default DRY-RUN. --apply adds the
+status/dup-suspect label + a suggestion comment on the NEW issue (never the older
+one, never a close).
+
+Watermark: .gc/issue-dedup-watermark.txt (ISO date; default = 2d ago).
+Audit:     .gc/issue-dedup-intake.log (JSONL).
+
+Usage: issue-dedup-intake [--apply] [--nudge-mayor] [--since DATE] [--threshold F] [--json]
+Env:   ISSUE_HYGIENE_REPO (default gastownhall/gascity)
+"""
+import sys, os, re, json, time, datetime, subprocess
+
+CITY = "/home/ds/gas-city"
+WATERMARK = os.path.join(CITY, ".gc", "issue-dedup-watermark.txt")
+AUDIT_LOG = os.path.join(CITY, ".gc", "issue-dedup-intake.log")
+REPO = os.environ.get("ISSUE_HYGIENE_REPO", "gastownhall/gascity")
+DEFAULT_THRESHOLD = 0.5
+
+# Tokens that carry no disambiguating signal in this repo's issue titles.
+STOP = set("""a an the of to for in on with and or is are be it this that into from at by
+bug feat fix chore docs test refactor gc dolt bd issue pr support add update fix fixes
+fixing make should does when cannot can not no error fail fails failing""".split())
+TOK_RE = re.compile(r"[a-z0-9]+")
+
+
+def gh_json(args, timeout=90):
+    try:
+        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+        return json.loads(out.stdout) if out.returncode == 0 else None
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def sig_tokens(title):
+    """Significant title tokens: lowercased alphanumerics, length>=3, not stopwords."""
+    return {t for t in TOK_RE.findall((title or "").lower()) if len(t) >= 3 and t not in STOP}
+
+
+def jaccard(a, b):
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    return inter / len(a | b) if inter else 0.0
+
+
+def read_watermark(override):
+    if override:
+        return override
+    try:
+        with open(WATERMARK) as f:
+            wm = f.read().strip()
+            if wm:
+                return wm
+    except OSError:
+        pass
+    return (datetime.date.today() - datetime.timedelta(days=2)).isoformat()
+
+
+def main():
+    argv = sys.argv[1:]
+    apply = "--apply" in argv
+    nudge = "--nudge-mayor" in argv
+    json_out = "--json" in argv
+    since = argv[argv.index("--since") + 1] if "--since" in argv else None
+    threshold = float(argv[argv.index("--threshold") + 1]) if "--threshold" in argv else DEFAULT_THRESHOLD
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+
+    wm = read_watermark(since)
+    corpus = gh_json(["issue", "list", "--repo", REPO, "--state", "open",
+                      "--json", "number,title", "--limit", "1000"])
+    if corpus is None:
+        print("issue-dedup-intake: gh issue list failed", file=sys.stderr)
+        return 1
+    toks = {i["number"]: sig_tokens(i["title"]) for i in corpus}
+    titles = {i["number"]: i["title"] for i in corpus}
+    # New issues = open issues created since the watermark (one search, not N views).
+    new_issues = gh_json(["issue", "list", "--repo", REPO, "--state", "open",
+                          "--search", f"created:>={wm}", "--json", "number,title",
+                          "--limit", "200"]) or []
+
+    suggestions = []
+    for ni in new_issues:
+        n = ni["number"]
+        best = sorted(
+            ((m, jaccard(toks[n], toks[m])) for m in toks if m != n),
+            key=lambda kv: kv[1], reverse=True)
+        if best and best[0][1] >= threshold:
+            m, score = best[0]
+            suggestions.append({"issue": n, "dup_of": m, "score": round(score, 2),
+                                "title": titles[n][:70], "dup_title": titles[m][:70]})
+            if apply:
+                comment = (f"Possible duplicate of #{m} (automated title-similarity suggestion, "
+                           f"{int(score*100)}% token overlap). A maintainer should confirm or "
+                           f"dismiss — not auto-closed.")
+                subprocess.run(["gh", "issue", "edit", str(n), "--repo", REPO,
+                                "--add-label", "status/dup-suspect"], capture_output=True, timeout=60)
+                subprocess.run(["gh", "issue", "comment", str(n), "--repo", REPO,
+                                "--body", comment], capture_output=True, timeout=60)
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    if apply:
+        try:
+            with open(WATERMARK, "w") as f:
+                f.write(datetime.date.today().isoformat())
+        except OSError:
+            pass
+    summary = {"ts": now, "repo": REPO, "since": wm, "threshold": threshold,
+               "new_issues": len(new_issues), "suggestions": len(suggestions), "apply": apply}
+    try:
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps({**summary, "detail": suggestions}) + "\n")
+    except OSError:
+        pass
+
+    if nudge and suggestions and not apply:
+        lines = [f"issue-dedup-intake (DRY-RUN): {len(suggestions)} new issue(s) look like possible "
+                 f"duplicates (title-similarity >= {threshold}; SUGGESTION only, never auto-closed):"]
+        lines += [f"  #{s['issue']} ~ #{s['dup_of']} ({int(s['score']*100)}%)  {s['title']}"
+                  for s in suggestions]
+        subprocess.run(["gc", "mail", "send", "mayor", "-s",
+                        f"issue-dedup-intake: {len(suggestions)} possible-duplicate suggestion(s)",
+                        "-m", "\n".join(lines)], capture_output=True, timeout=30)
+
+    if json_out:
+        print(json.dumps({"summary": summary, "suggestions": suggestions}, indent=2))
+        return 0
+    mode = "APPLY" if apply else "DRY-RUN"
+    print(f"issue-dedup-intake ({mode})  repo={REPO}  since={wm}  new={len(new_issues)} "
+          f"suggestions={len(suggestions)} (threshold {threshold})")
+    for s in suggestions:
+        verb = "labeled+commented" if apply else "would-suggest"
+        print(f"  {verb}: #{s['issue']} ~ #{s['dup_of']} ({int(s['score']*100)}%)  {s['title']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

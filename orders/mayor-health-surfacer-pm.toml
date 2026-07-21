@@ -1,0 +1,6 @@
+[order]
+description = "Daily 17:00 (PM run): surface mayor mailbox/queue/bead-state anomalies. Migrated from systemd timer (two-shot, PM half)."
+trigger = "cron"
+schedule = "0 17 * * *"
+exec = "/home/ds/gas-city/bin/mayor-health-surfacer --nudge-mayor"
+timeout = "5m"

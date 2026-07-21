@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""codebase-audit-dispatch: nudge the mayor to run the gascity-codebase-audit
+workflow on its periodic cadence.
+
+Mayor gc-431375 (Stephanie GO): make the codebase-audit primitive repeatable. The
+audit IS the saved workflow .claude/workflows/gascity-codebase-audit.js (33 model
+auditors -> adversarial verify -> one prioritized report). A gc order can't invoke
+the Workflow tool itself (orders exec a shell command; Workflow is an agent-loop
+tool), so this nudges the mayor — who has the Workflow tool + ultracode — to run it
+and do the deterministic post-run steps (save report, update RFC #3789, post Slack).
+
+--focus full  (default): the full subsystem + cross-cutting audit (monthly).
+--focus ci             : a cross-only CI + guardrails review (more frequent), via
+                         args {units:[], cross:[CI, Guardrails]}.
+
+Audit: .gc/codebase-audit-dispatch.log (JSONL).
+
+Usage: codebase-audit-dispatch [--focus full|ci] [--dry-run]
+Env:   CODEBASE_AUDIT_REPO (default /home/ds/gascity-main)
+"""
+import sys, os, json, time, subprocess
+
+CITY = "/home/ds/gas-city"
+AUDIT_LOG = os.path.join(CITY, ".gc", "codebase-audit-dispatch.log")
+REPO = os.environ.get("CODEBASE_AUDIT_REPO", "/home/ds/gascity-main")
+
+FULL_MSG = (
+    "MONTHLY CODEBASE AUDIT due — run the durable audit primitive:\n"
+    "  Workflow({ name: 'gascity-codebase-audit', args: { repo: '%s' } })\n"
+    "(12 subsystem + 4 cross-cutting + approved-PR auditors -> adversarial verify "
+    "-> one prioritized report; ~33 agents, ultracode-class.) After it returns:\n"
+    "  1. Save report.full_report_md to docs/audits/<YYYY-MM-DD>-codebase-audit.md.\n"
+    "  2. Update RFC #3789 (gastownhall/gascity) with the synthesis — the ship-now "
+    "(deterministic) vs needs-decision split; surface needs-decision items to Stephanie.\n"
+    "  3. Post report.slack_summary to #gascity-maintenance.\n"
+    "Stephanie greenlit this primitive (gc-431375)." % REPO
+)
+CI_MSG = (
+    "CI-HARDENING review due — run the cross-only CI + guardrails pass:\n"
+    "  Workflow({ name: 'gascity-codebase-audit', args: { repo: '%s', units: [], "
+    "cross: [ {label:'CI', prompt:'...'}, {label:'Guardrails', prompt:'...'} ] } })\n"
+    "(or just run the full audit if a monthly isn't due soon). Focus: CI build-time + "
+    "validity gaps + deterministic guardrails to add. After: fold the ship-now guardrail/CI "
+    "items into RFC #3789 + post a short digest to #gascity-maintenance. (gc-431375 companion.)" % REPO
+)
+
+
+def main():
+    argv = sys.argv[1:]
+    dry = "--dry-run" in argv
+    focus = argv[argv.index("--focus") + 1] if "--focus" in argv else "full"
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+    msg = CI_MSG if focus == "ci" else FULL_MSG
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps({"ts": now, "focus": focus, "repo": REPO, "dry_run": dry}) + "\n")
+    except OSError:
+        pass
+    if dry:
+        print(f"codebase-audit-dispatch (dry-run, focus={focus}) — would nudge mayor:\n{msg}")
+        return 0
+    rc = subprocess.run(["gc", "session", "nudge", "mayor", msg], capture_output=True, timeout=30).returncode
+    print(f"codebase-audit-dispatch (focus={focus}): nudged mayor (rc={rc})")
+    return 0 if rc == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

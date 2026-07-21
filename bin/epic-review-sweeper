@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+# epic-review-sweeper: detect chunks ready for epic-level external review
+# and dispatch them. Pure rule-driven (no LLM judgement in this layer).
+#
+# Rules are in .gc/epic-review-rules.yaml. Each rule defines a chunk by
+# patterns and names an epic bead + reviewer agent. A chunk is "ready" when:
+#   - all chunk members are closed
+#   - the epic is open OR in_progress
+#   - epic has no active review in flight (metadata.review_in_flight != true)
+#   - review_pass_count < max_passes
+#   - either no prior review dispatch OR new member closes since last dispatch
+#
+# On dispatch, the sweeper marks the epic with review_in_flight + a timestamp,
+# then `gc sling <reviewer> <epic> --on mol-epic-review`. Audit JSONL at
+# .gc/epic-review-sweeper.log.
+#
+# Usage:
+#   epic-review-sweeper               # dry-run report
+#   epic-review-sweeper --apply       # actually dispatch
+#   epic-review-sweeper --nudge-mayor # nudge mayor if any dispatch
+
+set -euo pipefail
+
+CONFIG="${EPIC_REVIEW_CONFIG:-/home/ds/gas-city/.gc/epic-review-rules.yaml}"
+LOG="${EPIC_REVIEW_LOG:-/home/ds/gas-city/.gc/epic-review-sweeper.log}"
+
+APPLY=0
+NUDGE_MAYOR=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)       APPLY=1; shift ;;
+    --nudge-mayor) NUDGE_MAYOR=1; shift ;;
+    --config)      CONFIG="$2"; shift 2 ;;
+    -h|--help)
+      sed -n 's/^# \{0,1\}//p' "$0" | head -20
+      exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ ! -r "$CONFIG" ]]; then
+  echo "epic-review-sweeper: config not readable: $CONFIG" >&2
+  exit 2
+fi
+
+CONFIG_JSON=$(python3 -c '
+import json, sys, yaml
+with open(sys.argv[1], "rb") as f:
+    data = yaml.safe_load(f) or {}
+json.dump(data, sys.stdout)
+' "$CONFIG")
+
+log_event() {
+  # log_event <event> <rule> <epic> <extra-json>
+  local event=$1 rule=$2 epic=$3 extra=${4:-'{}'}
+  local ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  [[ -d "${LOG%/*}" ]] || return 0
+  jq -cn --arg ts "$ts" \
+         --arg event "$event" \
+         --arg rule "$rule" \
+         --arg epic "$epic" \
+         --argjson extra "$extra" \
+    '{ts:$ts, event:$event, rule:$rule, epic:$epic} + $extra' \
+    >> "$LOG" 2>/dev/null || true
+}
+
+# fetch_bead_json <scope> <bead-id>  →  JSON object, or empty if the bead is
+# missing/pruned. Never propagates a non-zero exit: a pruned bead makes
+# `bd show` exit non-zero, and under `set -euo pipefail` that would abort the
+# whole sweep at the caller's command substitution — skipping every later
+# rule. Swallow it here and strip the `{"error":...}` shape to empty so the
+# caller's epic-not-found guard handles it.
+fetch_bead_json() {
+  local scope=$1 bead=$2 raw
+  if [[ "$scope" == "city" ]]; then
+    raw=$(bd show "$bead" --json 2>/dev/null) || true
+  else
+    raw=$(gc bd --rig "$scope" show "$bead" --json 2>/dev/null) || true
+  fi
+  jq -e 'if type=="array" then .[0] else . end | select(has("error") | not)' \
+    <<<"$raw" 2>/dev/null || true
+}
+
+# list_bead_json <scope>  →  JSON array of all beads in scope (any status)
+list_all_beads_json() {
+  local scope=$1
+  if [[ "$scope" == "city" ]]; then
+    # Concatenate all statuses because bd list --status=all isn't available
+    local open closed inp
+    open=$(bd list --status=open --json --limit=0 2>/dev/null || echo '[]')
+    inp=$(bd list --status=in_progress --json --limit=0 2>/dev/null || echo '[]')
+    closed=$(bd list --status=closed --json --limit=0 2>/dev/null || echo '[]')
+    jq -s 'add // []' <<<"$open"$'\n'"$inp"$'\n'"$closed"
+  else
+    local open closed inp
+    open=$(gc bd --rig "$scope" list --status=open --json --limit=0 2>/dev/null || echo '[]')
+    inp=$(gc bd --rig "$scope" list --status=in_progress --json --limit=0 2>/dev/null || echo '[]')
+    closed=$(gc bd --rig "$scope" list --status=closed --json --limit=0 2>/dev/null || echo '[]')
+    jq -s 'add // []' <<<"$open"$'\n'"$inp"$'\n'"$closed"
+  fi
+}
+
+# bd_update_meta <scope> <bead> <key> <value>
+bd_update_meta() {
+  local scope=$1 bead=$2 key=$3 value=$4
+  if [[ "$scope" == "city" ]]; then
+    bd update "$bead" --set-metadata "$key=$value" >/dev/null 2>&1
+  else
+    gc bd --rig "$scope" update "$bead" --set-metadata "$key=$value" >/dev/null 2>&1
+  fi
+}
+
+dispatched=()   # rule|epic
+skipped=()      # rule|epic|reason
+
+process_rule() {
+  local rule_json=$1
+  local rule_id scope epic_id member_id_pat member_title_pat reviewer max_passes
+  rule_id=$(jq -r '.id' <<<"$rule_json")
+  scope=$(jq -r '.scope // "city"' <<<"$rule_json")
+  epic_id=$(jq -r '.epic_id' <<<"$rule_json")
+  member_id_pat=$(jq -r '.member_id_pattern // ""' <<<"$rule_json")
+  member_title_pat=$(jq -r '.member_title_pattern // ""' <<<"$rule_json")
+  reviewer=$(jq -r '.reviewer' <<<"$rule_json")
+  max_passes=$(jq -r '.max_passes // 3' <<<"$rule_json")
+
+  # Fetch epic bead
+  local epic_json
+  epic_json=$(fetch_bead_json "$scope" "$epic_id")
+  if [[ -z "$epic_json" || "$epic_json" == "null" ]]; then
+    skipped+=("$rule_id|$epic_id|epic-not-found")
+    log_event "skip" "$rule_id" "$epic_id" "$(jq -cn '{reason:"epic-not-found"}')"
+    return 0
+  fi
+
+  local epic_status pass_count in_flight last_dispatch
+  epic_status=$(jq -r '.status' <<<"$epic_json")
+  pass_count=$(jq -r '.metadata.review_pass_count // 0' <<<"$epic_json")
+  in_flight=$(jq -r '.metadata.review_in_flight // false' <<<"$epic_json")
+  last_dispatch=$(jq -r '.metadata.last_review_dispatched_at // ""' <<<"$epic_json")
+
+  # Skip if epic is closed
+  if [[ "$epic_status" == "closed" ]]; then
+    skipped+=("$rule_id|$epic_id|epic-already-closed")
+    return 0
+  fi
+
+  # Skip if review is in flight
+  if [[ "$in_flight" == "true" ]]; then
+    skipped+=("$rule_id|$epic_id|review-in-flight")
+    return 0
+  fi
+
+  # Skip if pass count exceeded. Mail the human once per stuck epic (the
+  # only human-attention escape valve in the whole flow).
+  if (( pass_count >= max_passes )); then
+    skipped+=("$rule_id|$epic_id|max-passes-reached:$pass_count/$max_passes")
+    local mailed
+    mailed=$(jq -r '.metadata.max_passes_mailed // false' <<<"$epic_json")
+    if [[ "$mailed" != "true" ]] && (( APPLY )); then
+      local subj="Epic review stuck: $epic_id after $pass_count passes"
+      local body="Epic $epic_id has been reviewed $pass_count times (cap=$max_passes) and is still failing."
+      body+=$'\n\n'"Rule: $rule_id"
+      body+=$'\n'"Latest rejection_reason: $(jq -r '.metadata.rejection_reason // "(none)"' <<<"$epic_json")"
+      body+=$'\n\n'"The sweeper will not dispatch further reviews on this epic until you intervene. Options: reset metadata.review_pass_count to re-enable the loop; close the epic manually with evidence; or redesign scope."
+      gc mail send human -s "$subj" -m "$body" >/dev/null 2>&1 || true
+      bd_update_meta "$scope" "$epic_id" max_passes_mailed true
+      log_event "mailed_human" "$rule_id" "$epic_id" \
+        "$(jq -cn --argjson pc "$pass_count" '{pass_count:$pc}')"
+    else
+      log_event "skip_max_passes" "$rule_id" "$epic_id" \
+        "$(jq -cn --argjson pc "$pass_count" --argjson mp "$max_passes" '{pass_count:$pc, max_passes:$mp}')"
+    fi
+    return 0
+  fi
+
+  # Enumerate members of this chunk.
+  local all_beads
+  all_beads=$(list_all_beads_json "$scope")
+  local members
+  members=$(jq -c --arg id_re "$member_id_pat" \
+                  --arg title_re "$member_title_pat" '
+    [ .[] |
+      select(
+        ($id_re != "" and (.id | test($id_re))) or
+        ($title_re != "" and ((.title // "") | test($title_re)))
+      ) |
+      {id, status, updated_at}
+    ]' <<<"$all_beads")
+
+  local total_members open_members
+  total_members=$(jq 'length' <<<"$members")
+  open_members=$(jq '[.[] | select(.status != "closed")] | length' <<<"$members")
+
+  if (( open_members > 0 )); then
+    skipped+=("$rule_id|$epic_id|members-not-all-closed:$open_members/$total_members")
+    return 0
+  fi
+
+  # All members closed. If we previously dispatched, require at least one
+  # member's updated_at to be after last_dispatch (i.e. new closed work since
+  # last review). Otherwise we'd re-dispatch on every sweep.
+  if [[ -n "$last_dispatch" ]]; then
+    local new_closes
+    new_closes=$(jq --arg since "$last_dispatch" '
+      [ .[] |
+        select(.status == "closed") |
+        select(((.updated_at // "1970-01-01T00:00:00Z") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) >
+               (($since | sub("\\.[0-9]+Z$"; "Z")) | fromdateiso8601))
+      ] | length' <<<"$members")
+    if (( new_closes == 0 )); then
+      skipped+=("$rule_id|$epic_id|no-new-closes-since-last-review")
+      return 0
+    fi
+  fi
+
+  # Ready to dispatch.
+  local now_ts
+  now_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  dispatched+=("$rule_id|$epic_id|$reviewer|$now_ts")
+  log_event "ready" "$rule_id" "$epic_id" \
+    "$(jq -cn --argjson pc "$pass_count" --arg rv "$reviewer" '{pass_count:$pc, reviewer:$rv}')"
+
+  if (( APPLY )); then
+    bd_update_meta "$scope" "$epic_id" review_in_flight true
+    bd_update_meta "$scope" "$epic_id" epic_review_dispatched true
+    bd_update_meta "$scope" "$epic_id" last_review_dispatched_at "$now_ts"
+    # Dispatch via proxy-bead + wisp: gc sling rejects beads of type=epic
+    # ("first-class support is for convoys only"), so we wrap the epic in a
+    # regular task bead in the same rig, embed instructions to walk the
+    # mol-epic-review formula against the epic, and sling the PROXY. The wisp
+    # attached to the proxy enforces plan/execute/test/simplify/review/close
+    # discipline — the review step verifies the proxy's acceptance criteria
+    # (which require the epic to be closed-with-evidence or rejected with
+    # follow-ups), so a worker can't drain-ack the proxy without doing real
+    # epic-side work first.
+
+    proxy_title="[Review proxy] ${epic_id} per mol-epic-review (rule ${rule_id}, pass $((pass_count + 1)))"
+    proxy_body="## Context
+
+Auto-filed by epic-review-sweeper rule \`${rule_id}\` (pass $((pass_count + 1)) of ${max_passes}) to review epic **${epic_id}**.
+
+The mol-epic-review formula at \`.beads/formulas/mol-epic-review.formula.toml\` defines the workflow. Read it and follow its three steps (load-epic-context → grade → act) verbatim against ${epic_id}.
+
+## Acceptance for THIS proxy
+
+You close THIS proxy with notes summarizing the verdict + the epic-side actions you took. The proxy MUST NOT be closed until the upstream review is actually done.
+
+**PASS path** — epic ${epic_id} closed with all three evidence fields set:
+- \`evidence.artifact_path\` (a directory with verdict.md)
+- \`evidence.reviewer_verdict = pass\`
+- \`evidence.reviewer_agent = <your session id or alias>\`
+
+**REJECT path** — epic ${epic_id} stays open, with these metadata changes:
+- \`review_pass_count\` incremented
+- \`rejection_reason\` set to a concise summary
+- One follow-up bead per failing criterion, each linked via \`bd dep add\`
+- \`review_in_flight = false\`
+
+Either way, close THIS proxy with notes referencing what happened (verdict.md path on PASS; follow-up bead IDs + rejection_reason on REJECT). The mol-focus-review wisp's self-review step will verify your acceptance against this body before letting you close.
+
+## Why a proxy
+
+\`gc sling\` refuses to dispatch beads of type=\`epic\`. Without a wisp, your session has no formula gate enforcing each step, and historical data shows that produces empty \"close-without-doing-the-work\" outcomes. The proxy gets the wisp; the epic gets the real review."
+
+    # Create proxy
+    proxy_create_out=$(gc bd --rig "$scope" create "$proxy_title" --priority 1 --type task --description "$proxy_body" 2>&1)
+    proxy_id=$(echo "$proxy_create_out" | grep -oE 'Created issue: ([^[:space:]]+)' | awk '{print $3}' | head -1)
+
+    if [[ -z "$proxy_id" ]]; then
+      log_event "dispatch_failed" "$rule_id" "$epic_id" \
+        "$(jq -cn --arg msg "proxy creation failed: $proxy_create_out" '{reason:"proxy_creation_failed", details:$msg}')"
+      bd_update_meta "$scope" "$epic_id" review_in_flight false
+      return 0
+    fi
+
+    # Tag proxy with parent epic for traceability
+    gc bd --rig "$scope" update "$proxy_id" --metadata "$(jq -cn --arg ep "$epic_id" --arg rl "$rule_id" --argjson pc "$((pass_count + 1))" '{parent_epic:$ep, epic_review_proxy:true, review_rule_id:$rl, review_pass_count:$pc}')" >/dev/null 2>&1
+
+    # Sling the proxy with the default formula (mol-focus-review). The wisp
+    # gates each step; the review step verifies acceptance against the proxy body.
+    if gc sling "$reviewer" "$proxy_id" --nudge 2>&1 | tail -3; then
+      log_event "dispatched" "$rule_id" "$epic_id" \
+        "$(jq -cn --arg rv "$reviewer" --arg pid "$proxy_id" '{reviewer:$rv, proxy_id:$pid, mechanism:"proxy_bead_wisp"}')"
+    else
+      log_event "dispatch_failed" "$rule_id" "$epic_id" \
+        "$(jq -cn --arg rv "$reviewer" --arg pid "$proxy_id" '{reason:"sling_proxy_failed", reviewer:$rv, proxy_id:$pid}')"
+      bd_update_meta "$scope" "$epic_id" review_in_flight false
+    fi
+  fi
+}
+
+# Iterate rules
+num_rules=$(jq '.rules | length' <<<"$CONFIG_JSON")
+for i in $(seq 0 $((num_rules - 1))); do
+  rule=$(jq -c ".rules[$i]" <<<"$CONFIG_JSON")
+  process_rule "$rule"
+done
+
+report=$(mktemp)
+trap 'rm -f "$report"' EXIT
+
+{
+  printf 'epic-review-sweeper: %d dispatched, %d skipped\n' \
+    "${#dispatched[@]}" "${#skipped[@]}"
+  if (( ${#dispatched[@]} > 0 )); then
+    echo
+    echo "Dispatched:"
+    printf '%-30s %-22s %s\n' RULE EPIC REVIEWER
+    for row in "${dispatched[@]}"; do
+      IFS='|' read -r rule epic rv ts <<<"$row"
+      printf '  %-28s %-22s %s\n' "$rule" "$epic" "$rv"
+    done
+  fi
+  if (( ${#skipped[@]} > 0 )); then
+    echo
+    echo "Skipped:"
+    for row in "${skipped[@]}"; do
+      IFS='|' read -r rule epic reason <<<"$row"
+      printf '  %-28s %-22s %s\n' "$rule" "$epic" "$reason"
+    done
+  fi
+  echo
+  if (( APPLY )); then
+    echo "Mode: APPLY"
+  else
+    echo "Mode: DRY-RUN (re-run with --apply to dispatch)"
+  fi
+} > "$report"
+
+cat "$report"
+
+if (( NUDGE_MAYOR )) && (( ${#dispatched[@]} > 0 )); then
+  msg="epic-review-sweeper dispatched ${#dispatched[@]} epic review(s)
+$(cat "$report")"
+  gc session nudge mayor "$msg" >/dev/null 2>&1 || true
+fi
+
+exit 0

@@ -1,0 +1,16 @@
+# issue-dedup-intake — issue-hygiene piece 4 (mayor gc-429253). For issues opened
+# since the last run, suggest the most title-similar open issue as a "possible
+# duplicate of #N". SUGGESTION ONLY — never auto-closes (a human confirms or
+# dismisses). ZFC: mechanical similarity with a calibrated threshold is the allowed
+# dup-detection exception; the model-driven triage (piece 3) + a human make the
+# real call. Conservative threshold keeps suggestions high-precision.
+#
+# LANDED IN DRY-RUN + nudge-mayor: reports candidate dup pairs, posts nothing.
+# Go-live toggle = append `--apply` (adds status/dup-suspect + a suggestion comment
+# on the NEW issue) — a maintainer call, since it writes to GitHub.
+[order]
+description = "Every 6h: for gastownhall/gascity issues opened since the last run, suggest the most title-similar open issue as a possible duplicate (dry-run report; --apply labels+comments the new issue). Suggestion only — never auto-closes."
+trigger = "cron"
+schedule = "15 */6 * * *"
+exec = "/home/ds/gas-city/bin/issue-dedup-intake --apply --nudge-mayor"
+timeout = "5m"

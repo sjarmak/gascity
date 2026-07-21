@@ -1,0 +1,813 @@
+#!/usr/bin/env python3
+"""Mirror every real Gas City work bead into one private GitHub Issues repo.
+
+Unlike bd's tracker integration, this citywide view does not consume or mutate
+the bead's single external_ref. Identity is a hidden (rig, bead ID) marker in
+the GitHub body, recovered from GitHub on every run. Beads remains canonical.
+
+Dry-run is the default. Execute mode is externally gated and rate-capped.
+
+Required env:
+  MIRROR_RIGS        space-separated name=/absolute/path tokens
+  MIRROR_REPOSITORY  central owner/repo (for example sjarmak/gas-city-beads)
+
+Optional env:
+  MIRROR_MODE             --dry-run (default) | --execute
+  MIRROR_LEGACY_REPOS     comma-separated pilot repos eligible for transfer
+  MIRROR_MAX_CREATE       execute cap per run (default 50)
+  MIRROR_MAX_UPDATE       execute cap per run (default 200)
+  MIRROR_MAX_TRANSFER     execute cap per run (default 0; explicit promotion)
+  MIRROR_MAX_LABEL_CREATE execute cap per run (default 0; explicit promotion)
+  MIRROR_CREATE_DELAY     seconds between creates (default 1.0)
+  MIRROR_PLAN_DIR         default /home/ds/gas-city/.gc-reports
+  MIRROR_AUDIT_LOG        default /home/ds/gas-city/.gc/github-central-mirror.log
+  MIRROR_LOCK_PATH        default /home/ds/gas-city/.gc/github-central-mirror.lock
+  MIRROR_PILOT_LOCK_WAIT  seconds to wait for in-flight pilot drain (default 30)
+"""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import math
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from collections import Counter, defaultdict
+from contextlib import contextmanager, nullcontext
+from datetime import datetime, timezone
+from pathlib import Path
+
+from github_mirror_common import (
+    LEGACY_TRANSFER_REPOSITORIES,
+    build_central_plan,
+    flatten_issue_pages,
+    marker_key,
+    parse_rig_specs,
+    parse_json_lines,
+    repository_from_issue_url,
+    rig_environment,
+    split_repository,
+)
+
+
+CITY = Path("/home/ds/gas-city")
+TARGET_REPOSITORY = "sjarmak/gas-city-beads"
+LEGACY_REPOSITORY_RIGS = {
+    "sjarmak/mem-beads": "mem",
+    "sjarmak/codeprobe-beads": "codeprobe",
+}
+ACTIVE_STATUSES = "open,in_progress,blocked,deferred,hooked"
+KNOWN_STATUSES = frozenset((*ACTIVE_STATUSES.split(","), "closed"))
+WISP_META_KEYS = ("gc.step_ref", "gc.root_bead_id")
+CHUNK = 100
+PILOT_LOCK_PATH = CITY / ".gc/github-mirror-pilot.lock"
+MIGRATION_STATE_PATH = CITY / ".gc/github-central-mirror-migration-state.json"
+
+
+def run(cmd, cwd="/", env=None, input_text=None):
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        input=input_text,
+        capture_output=True,
+        text=True,
+    )
+
+
+@contextmanager
+def process_lock(path):
+    """Serialize the complete remote-read/plan/apply cycle."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(f"central mirror is already running (lock {path})") from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()}\n")
+        handle.flush()
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def pilot_handoff_lock(path=PILOT_LOCK_PATH):
+    """Wait boundedly for any in-flight legacy reconcile→push cycle to drain."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    timeout = float(os.environ.get("MIRROR_PILOT_LOCK_WAIT", "30"))
+    if not math.isfinite(timeout) or timeout < 0:
+        raise RuntimeError("MIRROR_PILOT_LOCK_WAIT must be finite and non-negative")
+    deadline = time.monotonic() + timeout
+    with path.open("a+") as handle:
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"legacy mirror cycle did not drain within {timeout}s"
+                    ) from exc
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def require_legacy_order_disabled():
+    proc = run(["gc", "order", "list", "--json"], cwd=str(CITY))
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"cannot verify legacy mirror order state: {proc.stderr.strip()[:300]}"
+        )
+    try:
+        payload = json.loads(proc.stdout)
+        orders = payload["orders"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError("cannot verify legacy mirror order state: malformed gc output") from exc
+    matches = [order for order in orders if order.get("name") == "github-mirror"]
+    if len(matches) > 1:
+        raise RuntimeError("cannot verify legacy mirror order state: duplicate orders")
+    if matches and matches[0].get("enabled") is not False:
+        raise RuntimeError("legacy github-mirror order is still enabled")
+
+
+def is_wisp(bead):
+    meta = bead.get("metadata") or {}
+    if any(meta.get(key) for key in WISP_META_KEYS):
+        return True
+    if meta.get("gc.synthetic") == "true" or meta.get("gc.formula_name"):
+        return True
+    if meta.get("gc.kind") == "workflow":
+        return True
+    return bead.get("issue_type") == "convoy"
+
+
+def bd_json(spec, args):
+    if not args or args[0] not in {"list", "show"}:
+        raise RuntimeError("central mirror bd access is read-only (list/show only)")
+    proc = run(
+        ["bd", *args, "--json"],
+        cwd=spec.path,
+        env=rig_environment(spec),
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"bd {' '.join(args)} failed in {spec.path}: {proc.stderr.strip()[:300]}"
+        )
+    try:
+        rows = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"bd returned malformed JSON in {spec.path}") from exc
+    validate_beads(spec, rows)
+    return rows
+
+
+def validate_beads(spec, beads):
+    if not isinstance(beads, list):
+        raise RuntimeError(f"bd returned a non-list payload in {spec.path}")
+    seen = set()
+    for index, bead in enumerate(beads):
+        where = f"{spec.path} bead row {index}"
+        if not isinstance(bead, dict):
+            raise RuntimeError(f"{where} is not an object")
+        bead_id = bead.get("id")
+        if not isinstance(bead_id, str) or not bead_id:
+            raise RuntimeError(f"{where} has no valid id")
+        if bead_id in seen:
+            raise RuntimeError(f"{spec.path} returned duplicate bead id {bead_id}")
+        seen.add(bead_id)
+        if bead.get("status") not in KNOWN_STATUSES:
+            raise RuntimeError(f"{where} has unexpected status {bead.get('status')!r}")
+        if not isinstance(bead.get("title"), str):
+            raise RuntimeError(f"{where} has a non-string title")
+        if bead.get("description") is not None and not isinstance(bead["description"], str):
+            raise RuntimeError(f"{where} has a non-string description")
+        if not isinstance(bead.get("issue_type"), str) or not bead["issue_type"]:
+            raise RuntimeError(f"{where} has no valid issue_type")
+        priority = bead.get("priority")
+        if isinstance(priority, bool) or not isinstance(priority, int) or priority not in range(5):
+            raise RuntimeError(f"{where} has invalid priority {priority!r}")
+        if bead.get("labels") is not None and not isinstance(bead["labels"], list):
+            raise RuntimeError(f"{where} has non-list labels")
+        if bead.get("metadata") is not None and not isinstance(bead["metadata"], dict):
+            raise RuntimeError(f"{where} has non-object metadata")
+        if bead.get("external_ref") is not None and not isinstance(bead["external_ref"], str):
+            raise RuntimeError(f"{where} has non-string external_ref")
+
+
+def list_remote_issues(repository):
+    proc = run([
+        "gh", "api", "--paginate", "--jq", ".[] | @json",
+        f"repos/{repository}/issues?state=all&per_page=100",
+    ])
+    if proc.returncode != 0:
+        raise RuntimeError(f"GitHub issue listing failed: {proc.stderr.strip()[:300]}")
+    try:
+        issues = flatten_issue_pages([parse_json_lines(proc.stdout)])
+    except (json.JSONDecodeError, AttributeError, TypeError) as exc:
+        raise RuntimeError("GitHub returned malformed issue data") from exc
+    validate_remote_issues(repository, issues)
+    return issues
+
+
+def validate_remote_issues(repository, issues):
+    if not isinstance(issues, list):
+        raise RuntimeError("GitHub issue payload is not a list")
+    seen_numbers = set()
+    for index, issue in enumerate(issues):
+        where = f"GitHub issue row {index}"
+        if not isinstance(issue, dict):
+            raise RuntimeError(f"{where} is not an object")
+        number = issue.get("number")
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+            raise RuntimeError(f"{where} has invalid number {number!r}")
+        if number in seen_numbers:
+            raise RuntimeError(f"GitHub returned duplicate issue number {number}")
+        seen_numbers.add(number)
+        url = issue.get("url")
+        if repository_from_issue_url(url) != repository:
+            raise RuntimeError(f"{where} URL is outside target repository: {url!r}")
+        if issue_number(url) != number:
+            raise RuntimeError(f"{where} URL number does not match {number}")
+        if not isinstance(issue.get("title"), str) or not isinstance(issue.get("body"), str):
+            raise RuntimeError(f"{where} has non-string title or body")
+        state = issue.get("state")
+        if state not in {"open", "closed"}:
+            raise RuntimeError(f"{where} has unexpected state {state!r}")
+        labels = issue.get("labels")
+        if not isinstance(labels, list) or not all(
+            isinstance(label, str) and label for label in labels
+        ):
+            raise RuntimeError(f"{where} has malformed labels")
+        try:
+            marker_key(issue["body"])
+        except ValueError as exc:
+            raise RuntimeError(f"{where} has malformed central marker: {exc}") from exc
+
+
+def load_records(specs, remote_issues, legacy_repositories):
+    tracked = defaultdict(set)
+    legacy_rig_names = {
+        repository.rsplit("/", 1)[-1].removesuffix("-beads")
+        for repository in legacy_repositories
+    }
+    for issue in remote_issues:
+        key = marker_key(issue.get("body") or "")
+        if key:
+            tracked[key[0]].add(key[1])
+
+    records = []
+    missing_tracked = []
+    for spec in specs:
+        active = [
+            bead
+            for bead in bd_json(
+                spec,
+                ["list", "--status", ACTIVE_STATUSES, "--limit", "0"],
+            )
+            if not is_wisp(bead)
+            and "gh-closed-pending-triage" not in (bead.get("labels") or [])
+        ]
+        by_id = {bead["id"]: bead for bead in active}
+
+        # Preserve and transfer the complete pilot history, not just active work.
+        # Only the two pilot stores need the otherwise-expensive closed scan.
+        if spec.name in legacy_rig_names:
+            closed = bd_json(spec, ["list", "--status", "closed", "--limit", "0"])
+            for bead in closed:
+                if repository_from_issue_url(bead.get("external_ref") or "") in legacy_repositories:
+                    by_id.setdefault(bead["id"], bead)
+
+        unresolved = sorted(tracked.get(spec.name, set()) - set(by_id))
+        for start in range(0, len(unresolved), CHUNK):
+            ids = unresolved[start:start + CHUNK]
+            shown = bd_json(spec, ["show", *ids]) if ids else []
+            for bead in shown:
+                by_id[bead["id"]] = bead
+        missing_tracked.extend(
+            (spec.name, bead_id)
+            for bead_id in sorted(tracked.get(spec.name, set()) - set(by_id))
+        )
+
+        for bead in by_id.values():
+            records.append((spec, bead))
+
+    status_rank = {"in_progress": 0, "hooked": 1, "blocked": 2, "open": 3, "deferred": 4, "closed": 5}
+    records.sort(
+        key=lambda item: (
+            int(item[1].get("priority", 2)),
+            status_rank.get(item[1].get("status"), 9),
+            item[1].get("created_at") or "",
+            item[0].name,
+            item[1]["id"],
+        )
+    )
+    return records, missing_tracked
+
+
+def list_remote_labels(repository):
+    proc = run([
+        "gh", "api", "--paginate", "--jq", ".[] | @json",
+        f"repos/{repository}/labels?per_page=100",
+    ])
+    if proc.returncode != 0:
+        raise RuntimeError(f"GitHub label listing failed: {proc.stderr.strip()[:300]}")
+    try:
+        labels = parse_json_lines(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("GitHub returned malformed label JSON") from exc
+    if not all(
+        isinstance(label, dict)
+        and isinstance(label.get("name"), str)
+        and label["name"]
+        for label in labels
+    ):
+        raise RuntimeError("GitHub returned malformed label data")
+    return {label["name"] for label in labels}
+
+
+def serialize_action(action):
+    remote = action.get("remote") or {}
+    bead = action["bead"]
+    return {
+        "kind": action["kind"],
+        "rig": action["spec"].name,
+        "path": action["spec"].path,
+        "bead_id": bead["id"],
+        "title": bead.get("title") or bead["id"],
+        "status": bead.get("status"),
+        "priority": bead.get("priority"),
+        "external_ref_preserved": bead.get("external_ref"),
+        "source_issue": bead.get("external_ref") if action["kind"] == "transfer" else None,
+        "target_issue": remote.get("url"),
+        "labels": action["desired"]["labels"],
+        "body_utf8_bytes": len(action["desired"]["body"].encode("utf-8")),
+        "error": action.get("error"),
+    }
+
+
+def write_plan(repository, specs, actions, remote_issues, missing_labels, missing_tracked):
+    now = datetime.now(timezone.utc)
+    plan_dir = Path(os.environ.get("MIRROR_PLAN_DIR", str(CITY / ".gc-reports")))
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    path = plan_dir / f"github-central-mirror-plan-{now.strftime('%Y%m%dT%H%M%SZ')}.json"
+    unmanaged = [
+        {"number": issue["number"], "url": issue["url"], "title": issue["title"]}
+        for issue in remote_issues
+        if marker_key(issue.get("body") or "") is None
+    ]
+    payload = {
+        "generated_at": now.isoformat(timespec="seconds"),
+        "target_repository": repository,
+        "source_of_truth": "beads",
+        "external_ref_policy": "preserve; central identity uses hidden rig+bead marker",
+        "rigs": [{"name": spec.name, "path": spec.path} for spec in specs],
+        "counts": dict(sorted(Counter(action["kind"] for action in actions).items())),
+        "labels_to_create": sorted(missing_labels),
+        "missing_tracked_beads": [
+            {"rig": rig, "bead_id": bead_id} for rig, bead_id in missing_tracked
+        ],
+        "unmanaged_remote_issues": unmanaged,
+        "actions": [serialize_action(action) for action in actions],
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return path, payload
+
+
+def api_json(method, endpoint, payload=None):
+    cmd = ["gh", "api", "--method", method, endpoint]
+    input_text = None
+    if payload is not None:
+        cmd.extend(["--input", "-"])
+        input_text = json.dumps(payload)
+    proc = run(cmd, input_text=input_text)
+    if proc.returncode != 0:
+        raise RuntimeError(f"gh api {method} {endpoint} failed: {proc.stderr.strip()[:300]}")
+    try:
+        result = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"gh api {method} {endpoint} returned malformed JSON") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError(f"gh api {method} {endpoint} returned a non-object payload")
+    return result
+
+
+def preflight_private_repository(repository):
+    info = api_json("GET", f"repos/{repository}")
+    if info.get("full_name") != repository:
+        raise RuntimeError(
+            f"repository preflight identity mismatch: expected {repository}, "
+            f"got {info.get('full_name')!r}"
+        )
+    if info.get("private") is not True:
+        raise RuntimeError(f"repository {repository} is not private; refusing mirror access")
+    if info.get("has_issues") is not True:
+        raise RuntimeError(f"repository {repository} does not have Issues enabled")
+
+
+def preflight_target_repository(repository):
+    if repository != TARGET_REPOSITORY:
+        raise RuntimeError(
+            f"central mirror target must be exactly {TARGET_REPOSITORY}, got {repository!r}"
+        )
+    preflight_private_repository(repository)
+
+
+def parse_legacy_repositories(value):
+    repositories = frozenset(
+        repository.strip() for repository in value.split(",") if repository.strip()
+    )
+    if repositories != LEGACY_TRANSFER_REPOSITORIES:
+        raise ValueError(
+            "legacy transfer repositories must be exactly "
+            f"{sorted(LEGACY_TRANSFER_REPOSITORIES)}, got {sorted(repositories)}"
+        )
+    return repositories
+
+
+def label_color(label):
+    if label.startswith("rig:"):
+        return "5319E7", "Canonical Gas City rig"
+    if label.startswith("type::"):
+        return "1D76DB", "Canonical bead type"
+    if label.startswith("priority::"):
+        return "D93F0B", "Canonical bead priority"
+    return "FBCA04", "Canonical bead status"
+
+
+def create_labels(repository, labels):
+    for label in sorted(labels):
+        color, description = label_color(label)
+        proc = run([
+            "gh", "label", "create", label, "--repo", repository,
+            "--color", color, "--description", description,
+        ])
+        if proc.returncode != 0:
+            raise RuntimeError(f"creating label {label!r} failed: {proc.stderr.strip()[:300]}")
+
+
+def issue_number(url):
+    try:
+        return int(url.rstrip("/").rsplit("/", 1)[1])
+    except (AttributeError, ValueError, IndexError) as exc:
+        raise RuntimeError(f"cannot parse GitHub issue number from {url!r}") from exc
+
+
+def transfer_binding_digest(source_url, node_id):
+    return hashlib.sha256(f"{source_url}\0{node_id}".encode()).hexdigest()
+
+
+def validate_migration_state(state, path):
+    if (
+        not isinstance(state, dict)
+        or set(state) != {"transfers"}
+        or not isinstance(state["transfers"], dict)
+    ):
+        raise RuntimeError(f"invalid migration state structure at {path}")
+    for old_url, entry in state["transfers"].items():
+        source_repo = repository_from_issue_url(old_url)
+        try:
+            source_number = issue_number(old_url)
+        except RuntimeError as exc:
+            raise RuntimeError(f"invalid migration state source at {path}: {old_url!r}") from exc
+        if (
+            source_repo not in LEGACY_TRANSFER_REPOSITORIES
+            or old_url != f"https://github.com/{source_repo}/issues/{source_number}"
+            or not isinstance(entry, dict)
+            or set(entry) != {"binding", "new_url", "node_id", "source_url"}
+        ):
+            raise RuntimeError(f"invalid migration state entry for {old_url} at {path}")
+        node_id = entry["node_id"]
+        if (
+            entry["source_url"] != old_url
+            or not isinstance(node_id, str)
+            or not node_id
+            or entry["binding"] != transfer_binding_digest(old_url, node_id)
+        ):
+            raise RuntimeError(f"migration state binding mismatch for {old_url} at {path}")
+        new_url = entry["new_url"]
+        if new_url is not None:
+            try:
+                new_number = issue_number(new_url)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"invalid migration destination for {old_url} at {path}"
+                ) from exc
+            if new_url != f"https://github.com/{TARGET_REPOSITORY}/issues/{new_number}":
+                raise RuntimeError(f"invalid migration destination for {old_url} at {path}")
+
+
+def load_state(path):
+    if not path.exists():
+        return {"transfers": {}}
+    try:
+        state = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"malformed migration state at {path}") from exc
+    validate_migration_state(state, path)
+    return state
+
+
+def save_state(path, state):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as handle:
+        json.dump(state, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        temp = Path(handle.name)
+    temp.replace(path)
+
+
+def resolve_node_url(node_id):
+    query = "query($id:ID!){node(id:$id){... on Issue{url}}}"
+    proc = run([
+        "gh", "api", "graphql", "-f", f"query={query}", "-F", f"id={node_id}",
+        "--jq", ".data.node.url",
+    ])
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise RuntimeError(f"resolving transferred issue node failed: {proc.stderr.strip()[:300]}")
+    return proc.stdout.strip()
+
+
+def preflight_transfer(action, repository, state_path, state):
+    old_url = action["bead"].get("external_ref") or ""
+    source_repo = repository_from_issue_url(old_url)
+    if source_repo not in LEGACY_TRANSFER_REPOSITORIES:
+        raise RuntimeError(f"transfer source is not an approved legacy repo: {old_url!r}")
+    source_number = issue_number(old_url)
+    if old_url != f"https://github.com/{source_repo}/issues/{source_number}":
+        raise RuntimeError(f"transfer source URL is not canonical: {old_url!r}")
+    expected_rig = LEGACY_REPOSITORY_RIGS[source_repo]
+    if action["spec"].name != expected_rig:
+        raise RuntimeError(
+            f"transfer source {source_repo} belongs to rig {expected_rig}, "
+            f"not {action['spec'].name}"
+        )
+
+    entry = state["transfers"].get(old_url)
+    if entry is None:
+        source = api_json("GET", f"repos/{source_repo}/issues/{source_number}")
+        node_id = source.get("node_id")
+        if (
+            source.get("html_url") != old_url
+            or source.get("number") != source_number
+            or not isinstance(node_id, str)
+            or not node_id
+        ):
+            raise RuntimeError(f"source issue identity mismatch for {old_url}")
+        current_url = resolve_node_url(node_id)
+        if current_url != old_url:
+            raise RuntimeError(
+                f"source issue node does not resolve to its declared URL: {old_url} -> {current_url}"
+            )
+        entry = {
+            "binding": transfer_binding_digest(old_url, node_id),
+            "new_url": None,
+            "node_id": node_id,
+            "source_url": old_url,
+        }
+        state["transfers"][old_url] = entry
+        save_state(state_path, state)
+    else:
+        if not isinstance(entry, dict) or set(entry) != {
+            "binding", "new_url", "node_id", "source_url"
+        }:
+            raise RuntimeError(f"invalid migration state entry for {old_url}")
+        node_id = entry["node_id"]
+        if (
+            entry["source_url"] != old_url
+            or not isinstance(node_id, str)
+            or not node_id
+            or entry["binding"] != transfer_binding_digest(old_url, node_id)
+        ):
+            raise RuntimeError(f"migration state binding mismatch for {old_url}")
+        current_url = resolve_node_url(node_id)
+
+    current_repo = repository_from_issue_url(current_url)
+    if current_url != old_url and current_repo != repository:
+        raise RuntimeError(f"bound issue node resolved outside source/target: {current_url}")
+    if current_repo == repository:
+        current_number = issue_number(current_url)
+        if current_url != f"https://github.com/{repository}/issues/{current_number}":
+            raise RuntimeError(f"bound target issue URL is not canonical: {current_url}")
+    new_url = entry["new_url"]
+    if new_url is not None:
+        if (
+            not isinstance(new_url, str)
+            or repository_from_issue_url(new_url) != repository
+            or new_url != current_url
+        ):
+            raise RuntimeError(f"migration destination binding mismatch for {old_url}")
+    return current_url
+
+
+def transfer_issue(action, repository, state_path, state):
+    old_url = action["bead"].get("external_ref") or ""
+    current_url = preflight_transfer(action, repository, state_path, state)
+    entry = state["transfers"][old_url]
+    node_id = entry["node_id"]
+    if current_url == old_url:
+        proc = run(["gh", "issue", "transfer", old_url, repository])
+        if proc.returncode != 0:
+            raise RuntimeError(f"transferring {old_url} failed: {proc.stderr.strip()[:300]}")
+        current_url = resolve_node_url(node_id)
+    if (
+        repository_from_issue_url(current_url) != repository
+        or current_url
+        != f"https://github.com/{repository}/issues/{issue_number(current_url)}"
+    ):
+        raise RuntimeError(f"transferred node resolved outside target: {current_url}")
+    entry["new_url"] = current_url
+    save_state(state_path, state)
+    remote = api_json(
+        "PATCH",
+        f"repos/{repository}/issues/{issue_number(current_url)}",
+        action["desired"],
+    )
+    return remote
+
+
+def apply_plan(repository, actions, missing_labels):
+    # Defense in depth: callers cannot bypass the exact private-repository
+    # preflight and reach a mutating helper directly.
+    preflight_target_repository(repository)
+    max_create = int(os.environ.get("MIRROR_MAX_CREATE", "50"))
+    max_update = int(os.environ.get("MIRROR_MAX_UPDATE", "200"))
+    max_transfer = int(os.environ.get("MIRROR_MAX_TRANSFER", "0"))
+    max_label_create = int(os.environ.get("MIRROR_MAX_LABEL_CREATE", "0"))
+    delay = float(os.environ.get("MIRROR_CREATE_DELAY", "1.0"))
+    caps = {
+        "create": max_create,
+        "update": max_update,
+        "transfer": max_transfer,
+    }
+    if any(cap < 0 for cap in (*caps.values(), max_label_create)):
+        raise RuntimeError("mirror mutation caps must be non-negative")
+    if not math.isfinite(delay) or delay < 0:
+        raise RuntimeError("MIRROR_CREATE_DELAY must be a finite non-negative number")
+    if len(missing_labels) > max_label_create:
+        raise RuntimeError(
+            f"planned {len(missing_labels)} label creations exceeds "
+            f"MIRROR_MAX_LABEL_CREATE={max_label_create}"
+        )
+
+    selected = []
+    selected_counts = Counter()
+    for action in actions:
+        kind = action.get("kind")
+        if kind in {"noop", "deferred"}:
+            continue
+        if kind not in caps:
+            raise RuntimeError(f"unexpected action kind in executable plan: {kind!r}")
+        if selected_counts[kind] < caps[kind]:
+            selected.append(action)
+            selected_counts[kind] += 1
+
+    selected_transfers = [action for action in selected if action["kind"] == "transfer"]
+    transfer_sources = {
+        repository_from_issue_url(action["bead"].get("external_ref") or "")
+        for action in selected_transfers
+    }
+    for source in sorted(transfer_sources):
+        if source not in LEGACY_TRANSFER_REPOSITORIES:
+            raise RuntimeError(f"unapproved transfer source in plan: {source!r}")
+        preflight_private_repository(source)
+
+    state_path = MIGRATION_STATE_PATH
+    state = load_state(state_path)
+    owner, repo = split_repository(repository)
+    for action in selected_transfers:
+        preflight_transfer(action, repository, state_path, state)
+
+    applied = Counter()
+    handoff = pilot_handoff_lock() if selected_transfers else nullcontext()
+    with handoff:
+        if selected_transfers:
+            require_legacy_order_disabled()
+
+        # Every input and precondition is checked before the first remote mutation.
+        create_labels(repository, missing_labels)
+
+        for action in selected:
+            kind = action["kind"]
+            if kind == "create":
+                api_json("POST", f"repos/{owner}/{repo}/issues", action["desired"])
+                time.sleep(delay)
+            elif kind == "update":
+                api_json(
+                    "PATCH",
+                    f"repos/{owner}/{repo}/issues/{action['remote']['number']}",
+                    action["desired"],
+                )
+            elif kind == "transfer":
+                transfer_issue(action, repository, state_path, state)
+            applied[kind] += 1
+    return applied
+
+
+def run_cycle(specs, repository, mode, legacy):
+    preflight_target_repository(repository)
+    remote = list_remote_issues(repository)
+    configured_rigs = {spec.name for spec in specs}
+    tracked_rigs = {
+        key[0]
+        for issue in remote
+        if (key := marker_key(issue.get("body") or "")) is not None
+    }
+    unknown_rigs = sorted(tracked_rigs - configured_rigs)
+    if unknown_rigs:
+        raise RuntimeError(
+            f"central issues reference rigs missing from MIRROR_RIGS: {unknown_rigs}"
+        )
+    records, missing_tracked = load_records(specs, remote, legacy)
+    actions = build_central_plan(records, remote, legacy)
+    existing_labels = list_remote_labels(repository)
+    desired_labels = {
+        label for action in actions for label in action["desired"]["labels"]
+    }
+    missing_labels = desired_labels - existing_labels
+    path, payload = write_plan(
+        repository, specs, actions, remote, missing_labels, missing_tracked
+    )
+    counts = payload["counts"]
+    print(
+        f"central mirror plan: target={repository} mode={mode} records={len(records)} "
+        + " ".join(
+            f"{kind}={counts.get(kind, 0)}"
+            for kind in ("create", "transfer", "deferred", "update", "noop")
+        )
+        + f" labels_to_create={len(missing_labels)} unmanaged={len(payload['unmanaged_remote_issues'])}"
+    )
+    print(f"plan: {path}")
+
+    applied = Counter()
+    if mode == "--execute":
+        invalid = [action for action in actions if action["kind"] == "invalid"]
+        if invalid:
+            raise RuntimeError(
+                f"refusing execute: {len(invalid)} invalid issue rendering(s); see {path}"
+            )
+        if missing_tracked:
+            raise RuntimeError(
+                f"refusing execute: {len(missing_tracked)} tracked bead(s) could not be read; see {path}"
+            )
+        applied = apply_plan(repository, actions, missing_labels)
+        print("applied: " + " ".join(f"{kind}={applied[kind]}" for kind in ("create", "transfer", "update")))
+
+    audit_path = Path(
+        os.environ.get("MIRROR_AUDIT_LOG", str(CITY / ".gc/github-central-mirror.log"))
+    )
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    with audit_path.open("a") as handle:
+        handle.write(
+            f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} target={repository} "
+            f"mode={mode} records={len(records)} counts={json.dumps(counts, sort_keys=True)} "
+            f"labels_to_create={len(missing_labels)} applied={json.dumps(applied, sort_keys=True)} "
+            f"plan={path}\n"
+        )
+
+
+def main():
+    try:
+        specs = parse_rig_specs(os.environ.get("MIRROR_RIGS", ""))
+        repository = os.environ["MIRROR_REPOSITORY"].strip()
+        split_repository(repository)
+        legacy = parse_legacy_repositories(
+            os.environ.get(
+                "MIRROR_LEGACY_REPOS",
+                "sjarmak/mem-beads,sjarmak/codeprobe-beads",
+            )
+        )
+    except (KeyError, ValueError) as exc:
+        sys.exit(f"invalid central mirror configuration: {exc}")
+    if not specs:
+        sys.exit("MIRROR_RIGS is required")
+    mode = os.environ.get("MIRROR_MODE", "--dry-run")
+    if mode not in ("--dry-run", "--execute"):
+        sys.exit(f"MIRROR_MODE must be --dry-run or --execute, got {mode!r}")
+
+    lock_path = Path(
+        os.environ.get(
+            "MIRROR_LOCK_PATH", str(CITY / ".gc/github-central-mirror.lock")
+        )
+    )
+    try:
+        with process_lock(lock_path):
+            run_cycle(specs, repository, mode, legacy)
+    except (OSError, RuntimeError, ValueError) as exc:
+        sys.exit(str(exc))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+dir = "/home/ds/gascity"
+work_dir = "/home/ds/gascity-worktrees/{{.AgentBase}}"
+provider = "claude-3"
+min_active_sessions = 6
+max_active_sessions = 6
+wake_mode = "fresh"
+idle_timeout = "6h"
+
+[env]
+GC_CITY = "/home/ds/gas-city"
+GC_BEADS = "bd"
+CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = "1"

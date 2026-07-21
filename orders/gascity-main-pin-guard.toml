@@ -1,0 +1,6 @@
+[order]
+description = "Keep /home/ds/gascity-main pinned to main. gcsync builds the installed gc binary from this tree and refuses (silently) when it's off-main — so a ship/test that borrows the tree and leaves it detached freezes the binary indefinitely (4-day incident 2026-05-25). This guard self-heals STALE off-main state (HEAD idle >30m: stashes any dirty tree non-destructively, then checks out main) and nudges mayor on every recovery so a recurring leak can't stay silent. Fresh checkouts (<30m, active PR-test) are left alone. Runs just before gcsync's window so the sync unblocks on the same cycle."
+trigger = "cooldown"
+interval = "15m"
+exec = "/home/ds/gas-city/bin/gascity-main-pin-guard"
+timeout = "120s"

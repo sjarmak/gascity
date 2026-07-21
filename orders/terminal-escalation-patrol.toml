@@ -1,0 +1,11 @@
+# Added 2026-07-18 for dr-80uo after gascity-dashboard-1rey/gc-512184:
+# terminal escalation state must not depend on edge-triggered unread mail.
+# Remove when the native scheduler owns atomic terminal escalation,
+# acknowledgement/disposition, and retryable coordinator delivery.
+[order]
+description = "Reconcile terminal worker escalations and retry coordinator notification"
+trigger = "cooldown"
+interval = "2m"
+exec = "/home/ds/gas-city/bin/terminal-worker-escalation scan --apply"
+timeout = "5m"
+idempotent = true

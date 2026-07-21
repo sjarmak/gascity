@@ -1,0 +1,6 @@
+[order]
+description = "Twice-daily (08:30 + 15:30) mem rig digest for Stephanie: per-epic subtask status (open/in-progress/closed) + deliverable verification (phantom/unstamped closes) + shared-root hygiene. Nudges mayor; mayor relays to Stephanie."
+trigger = "cron"
+schedule = "30 8,15 * * *"
+exec = "/home/ds/gas-city/bin/mem-digest --nudge-mayor"
+timeout = "5m"

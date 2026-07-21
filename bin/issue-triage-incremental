@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""issue-triage-incremental: weekly DELTA triage of gastownhall/gascity issues.
+
+Issue-hygiene piece 3 (mayor gc-429253). Re-runs the classify sweep over only the
+issues created/changed since the last run (delta, not the full 343), so triage
+stays current cheaply. ZFC: this script is MECHANISM ONLY — it computes the delta,
+dedups, and dispatches a triage bead to the gascity polecat pool; the polecat does
+the model classification (covered / close / needs-pr / needs-comment), applies ONLY
+mechanical labels, and digests judgment items. No classification in code.
+
+Mechanical labels the worker may auto-apply (deterministic, verdict-driven):
+clear status/needs-triage once classified; tag status/covered, status/dup-suspect,
+status/stale. Everything needing a human call (needs-comment, pick-one designs,
+low-confidence) goes to a maintainer DIGEST — never auto-commented or auto-closed.
+
+Dispatching gascity work is gated -> default DRY-RUN (compute delta + compose the
+bead + nudge mayor). --apply slings it (the go-live toggle) and advances the
+watermark. Dedup: skips if a prior incremental-triage bead is still open.
+
+Watermark: .gc/issue-triage-watermark.txt (ISO date; default = 7d ago if absent).
+Audit:     .gc/issue-triage-incremental.log (JSONL).
+
+Usage: issue-triage-incremental [--apply] [--nudge-mayor] [--since DATE] [--json]
+Env:   ISSUE_HYGIENE_REPO (default gastownhall/gascity)
+       ISSUE_TRIAGE_POLECAT (default /home/ds/gascity/polecat)
+"""
+import sys, os, re, json, time, subprocess, datetime
+
+CITY = "/home/ds/gas-city"
+WATERMARK = os.path.join(CITY, ".gc", "issue-triage-watermark.txt")
+AUDIT_LOG = os.path.join(CITY, ".gc", "issue-triage-incremental.log")
+REPO = os.environ.get("ISSUE_HYGIENE_REPO", "gastownhall/gascity")
+POLECAT = os.environ.get("ISSUE_TRIAGE_POLECAT", "/home/ds/gascity/polecat")
+
+RUBRIC = (
+    "Triage each OPEN gastownhall/gascity issue below into exactly one verdict: "
+    "covered (an open PR already addresses it — set the PR#), close "
+    "(resolved/duplicate/not-planned/obsolete — be CONSERVATIVE, prefer needs-comment when torn), "
+    "needs-pr (valid+bounded, no PR yet), needs-comment (needs a maintainer call first). "
+    "Spot-check ambiguous covered/duplicate calls with a bounded `gh issue view` / `gh pr list --search`."
+)
+POLICY = (
+    "AUTO-APPLY ONLY mechanical labels (deterministic, from your verdict): clear status/needs-triage "
+    "once classified; add status/covered (covered), status/dup-suspect (duplicate), status/stale "
+    "(obsolete). DO NOT auto-close or auto-comment. Put every needs-comment / pick-one-design / "
+    "low-confidence item into a DIGEST and mail it to mayor for human judgment. ZFC: you classify; "
+    "humans decide closes/comments."
+)
+
+
+def gh_json(args, timeout=90):
+    try:
+        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+        return json.loads(out.stdout) if out.returncode == 0 else None
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def read_watermark(override):
+    if override:
+        return override
+    try:
+        with open(WATERMARK) as f:
+            wm = f.read().strip()
+            if wm:
+                return wm
+    except OSError:
+        pass
+    return (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
+
+
+def prior_triage_open():
+    """True if a prior incremental-triage bead is still open (dedup gate)."""
+    try:
+        out = subprocess.run(
+            ["gc", "bd", "--rig", "gascity", "list", "--status", "open", "--json", "--limit", "0"],
+            capture_output=True, text=True, timeout=60).stdout
+        beads = json.loads(out or "[]")
+        beads = beads if isinstance(beads, list) else beads.get("issues", [])
+        return any("issue-hygiene triage" in (b.get("title") or "") for b in beads)
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return False
+
+
+def main():
+    argv = sys.argv[1:]
+    apply = "--apply" in argv
+    nudge = "--nudge-mayor" in argv
+    json_out = "--json" in argv
+    since = argv[argv.index("--since") + 1] if "--since" in argv else None
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+
+    wm = read_watermark(since)
+    delta = gh_json(["issue", "list", "--repo", REPO, "--state", "open",
+                     "--search", f"updated:>={wm}", "--json", "number,title,updatedAt,labels",
+                     "--limit", "200"])
+    if delta is None:
+        print("issue-triage-incremental: gh issue list failed", file=sys.stderr)
+        return 1
+
+    nums = sorted(i["number"] for i in delta)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    summary = {"ts": now, "repo": REPO, "since": wm, "delta": len(nums), "apply": apply,
+               "dispatched": False, "skipped_reason": None}
+
+    if not nums:
+        summary["skipped_reason"] = "no-delta"
+    elif prior_triage_open():
+        summary["skipped_reason"] = "prior-triage-bead-open"
+    elif apply:
+        title = f"issue-hygiene triage: {len(nums)} new/changed issues (since {wm})"
+        body = (f"{RUBRIC}\n\nISSUES (open, updated since {wm}): "
+                + ", ".join(f"#{n}" for n in nums)
+                + f"\n\n{POLICY}\n\nWhen done, mail mayor the digest of judgment items + a count of "
+                f"labels applied. This is incremental triage piece 3 of the issue-hygiene routine.")
+        try:
+            create = subprocess.run(
+                ["gc", "bd", "--rig", "gascity", "create", title, "--description", body,
+                 "-l", "issue-triage"], capture_output=True, text=True, timeout=60)
+            m = re.search(r"gc-[a-z0-9]+", create.stdout) if create.returncode == 0 else None
+            bid = m.group(0) if m else ""
+            if bid:
+                subprocess.run(["gc-sling", POLECAT, bid, "--no-formula", "--nudge"],
+                               capture_output=True, timeout=60)
+                with open(WATERMARK, "w") as f:
+                    f.write(datetime.date.today().isoformat())
+                summary["dispatched"] = True
+                summary["bead"] = bid
+        except (subprocess.SubprocessError, OSError) as e:
+            summary["skipped_reason"] = f"dispatch-error: {e}"
+
+    try:
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps({**summary, "issues": nums}) + "\n")
+    except OSError:
+        pass
+
+    if nudge and nums and not apply:
+        lines = [f"issue-triage-incremental (DRY-RUN): {len(nums)} issue(s) created/changed since "
+                 f"{wm} await triage. Flip the order to --apply to dispatch a triage bead to the "
+                 f"gascity polecat (mechanical labels only; judgment items digested). Issues: "
+                 + ", ".join(f"#{n}" for n in nums[:30]) + (" …" if len(nums) > 30 else "")]
+        subprocess.run(["gc", "mail", "send", "mayor", "-s",
+                        f"issue-triage-incremental: {len(nums)} issue(s) to triage (dry-run)",
+                        "-m", "\n".join(lines)], capture_output=True, timeout=30)
+
+    if json_out:
+        print(json.dumps({"summary": summary, "issues": nums}, indent=2))
+        return 0
+    mode = "APPLY" if apply else "DRY-RUN"
+    print(f"issue-triage-incremental ({mode})  repo={REPO}  since={wm}  delta={len(nums)}"
+          + (f"  dispatched={summary.get('bead','-')}" if summary["dispatched"]
+             else f"  ({summary['skipped_reason'] or 'dry-run'})"))
+    if nums and not apply:
+        print("  would dispatch a triage bead for: " + ", ".join(f"#{n}" for n in nums[:40])
+              + (" …" if len(nums) > 40 else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

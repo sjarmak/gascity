@@ -1,0 +1,7 @@
+dir = "/home/ds/projects/CodeScaleBench"
+provider = "claude-3"
+min_active_sessions = 2
+max_active_sessions = 3
+
+[env]
+CLAUDE_BINARY = "claude-auto"

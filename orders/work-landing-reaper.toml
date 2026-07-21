@@ -1,0 +1,22 @@
+# work-landing-reaper — controller-side landing backstop for the
+# mol-focus-review no-landing defect. RCA: docs/rca-eb-merge-gap-2026-07-12.md §4b.
+# Bead: dr-7mb (2026-07-13).
+#
+# SHIPS IN REPORT MODE (no --apply): scans configured rigs (.gc/work-landing.yaml)
+# for CLOSED beads whose work branch is unlanded (not an ancestor of, nor
+# patch-equivalent to, the base branch) and nudges the mayor once a day with the
+# strand. It does NOT auto-merge anything in this mode.
+#
+# ENABLEMENT (mayor/Stephanie-gated): to turn on auto-landing of the trustworthy
+# subset (review_verdict=pass, hard test gate green), change exec to add --apply:
+#   exec = "/home/ds/gas-city/bin/work-landing-reaper --apply --nudge-mayor"
+# Auto-land rebases onto the base tip under the shared mol-focus-merge.lock and
+# ff-only merges into the base worktree; on rebase conflict or red tests it sets
+# the bead blocked and mails the mayor. Never forces, never pushes to a remote.
+# A rig with no test_command in .gc/work-landing.yaml is never auto-landed.
+[order]
+description = "Daily: report closed-but-unlanded beads (mol-focus-review no-landing defect, RCA §4b). Report/nudge only; auto-land is --apply, mayor-gated."
+trigger = "cron"
+schedule = "35 13 * * *"
+exec = "/home/ds/gas-city/bin/work-landing-reaper --nudge-mayor"
+timeout = "20m"

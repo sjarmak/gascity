@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# account-identity-check — fast, read-only OAuth-identity guard for the 5 DS
+# Claude slots. Layer #2 of the auth durable fix (dr-qfw / mayor gc-470459).
+#
+# WHY separate from claude-refresh-all: that guard only runs on the heavy 6h
+# refresh cron (01/07/13/19), so a wrong-twin /ds-cred push can wedge up to 6h
+# before it alerts (exactly how the account1->gibsonsteph42 cross reached
+# Stephanie first). This is a lightweight order (~12m cooldown) that does the
+# identity+token assertion ONLY — no token refresh, no writes — so a cross is
+# caught in minutes.
+#
+# Checks, per slot, against the shared SSOT map (~/.gc/account-identity.map):
+#   - oauthAccount.emailAddress (.claude/.claude.json) == map[accountN]
+#   - no two slots share an email
+#   - no two slots share an access-token sha (.claude/.credentials.json)
+# On any violation: mail mayor with the exact re-cred instruction. Read-only;
+# exits 0 always (a guard that crashes is a guard that goes silent).
+
+set -u
+PATH=/home/ds/.local/bin:/usr/local/bin:/usr/bin:/bin
+export PATH
+
+ROOT=/home/ds/.claude-homes
+GC_BIN=/home/ds/.local/bin/gc
+CITY=/home/ds/gas-city
+IDENTITY_MAP="${ACCOUNT_IDENTITY_MAP:-/home/ds/.gc/account-identity.map}"
+STATE=/home/ds/.gc/account-identity-check-state.json
+ts() { date "+%Y-%m-%d %H:%M:%S %Z"; }
+
+declare -A PIN_EMAIL SEEN_EMAIL SEEN_TOK
+ALERTS=()
+
+# Load the SSOT map (shared with claude-refresh-all).
+if [[ -f "$IDENTITY_MAP" ]]; then
+  while IFS='=' read -r slot email; do
+    [[ "$slot" =~ ^[[:space:]]*# || -z "${slot// }" ]] && continue
+    slot="${slot//[[:space:]]/}"; email="${email//[[:space:]]/}"
+    [[ -n "$slot" && -n "$email" ]] && PIN_EMAIL[$slot]="$email"
+  done < "$IDENTITY_MAP"
+else
+  echo "[$(ts)] FATAL identity map missing: $IDENTITY_MAP"
+  ALERTS+=("identity map missing ($IDENTITY_MAP) — fast-detection cannot verify slots; restore the SSOT map")
+fi
+
+for n in 1 2 3 4 5; do
+  acct="account$n"
+  cj="$ROOT/$acct/.claude/.claude.json"
+  cred="$ROOT/$acct/.claude/.credentials.json"
+  expected="${PIN_EMAIL[$acct]:-}"
+
+  if [[ ! -f "$cj" ]]; then
+    echo "[$(ts)] $acct IDENTITY_UNVERIFIABLE no .claude.json"
+    ALERTS+=("$acct: identity file absent ($cj) — cannot verify slot identity")
+    continue
+  fi
+  email=$(jq -r '.oauthAccount.emailAddress // ""' "$cj" 2>/dev/null)
+  if [[ -z "$email" ]]; then
+    echo "[$(ts)] $acct IDENTITY_UNVERIFIABLE no-email-field"
+    ALERTS+=("$acct: no oauthAccount.emailAddress in .claude.json — cannot verify slot identity")
+    continue
+  fi
+
+  # 1) email == pinned identity for this slot
+  if [[ -n "$expected" && "$email" != "$expected" ]]; then
+    echo "[$(ts)] IDENTITY_CROSS $acct has=$email expected=$expected"
+    ALERTS+=("$acct crossed: has $email, expected $expected; re-cred on Mac logged into $expected")
+  else
+    echo "[$(ts)] $acct identity OK ($email)"
+  fi
+
+  # 2) no two slots share an email (actual, regardless of expected)
+  other="${SEEN_EMAIL[$email]:-}"
+  if [[ -n "$other" ]]; then
+    echo "[$(ts)] DUPLICATE_IDENTITY $acct == $other (both $email)"
+    ALERTS+=("$acct crossed: has $email, expected ${expected:-?}; colliding with $other; re-cred on Mac logged into ${expected:-the correct twin}")
+  else
+    SEEN_EMAIL[$email]="$acct"
+  fi
+
+  # 3) no two slots share an access-token sha (a live cross even if metadata lags)
+  if [[ -f "$cred" ]]; then
+    tok=$(jq -r '.claudeAiOauth.accessToken // ""' "$cred" 2>/dev/null | sha256sum 2>/dev/null | cut -c1-16)
+    if [[ -n "$tok" ]]; then
+      otok="${SEEN_TOK[$tok]:-}"
+      if [[ -n "$otok" ]]; then
+        echo "[$(ts)] DUPLICATE_TOKEN $acct == $otok"
+        ALERTS+=("$acct and $otok share one access token (live account cross); re-cred the wrong-twin slot on the Mac")
+      else
+        SEEN_TOK[$tok]="$acct"
+      fi
+    fi
+  fi
+done
+
+# Write a detection signal (consumed by the blast-radius drain, layer #3) and
+# alert mayor. Dedupe the mail on the alert set so a persistent cross doesn't
+# re-mail every 12m, but always refresh the signal file.
+crossed=()
+for a in "${ALERTS[@]}"; do crossed+=("$a"); done
+sig="/home/ds/.gc/account-identity-cross.signal"
+if (( ${#ALERTS[@]} > 0 )); then
+  printf '%s\n' "${ALERTS[@]}" > "$sig"
+  echo "[$(ts)] GUARD TRIPPED: ${#ALERTS[@]} issue(s)"
+  # Dedupe on a hash of the sorted alert set.
+  fp=$(printf '%s\n' "${ALERTS[@]}" | sort | sha256sum | cut -c1-16)
+  last=$(jq -r '.last_fp // ""' "$STATE" 2>/dev/null || echo "")
+  if [[ "$fp" != "$last" ]]; then
+    body="account-identity-check tripped at $(ts) — ${#ALERTS[@]} issue(s):"$'\n'
+    for a in "${ALERTS[@]}"; do body+="- $a"$'\n'; done
+    body+=$'\n'"Signal: $sig  |  Log: /home/ds/logs/account-identity-check.log"
+    if [[ -x "$GC_BIN" ]]; then
+      timeout 30 "$GC_BIN" --city "$CITY" mail send --to mayor \
+        -s "[identity-guard] ${#ALERTS[@]} account identity issue(s)" -m "$body" >/dev/null 2>&1 \
+        && echo "[$(ts)] alert mailed to mayor" || echo "[$(ts)] alert mail FAILED"
+    fi
+    mkdir -p "$(dirname "$STATE")"
+    printf '{"last_fp":"%s","last_ts":"%s"}\n' "$fp" "$(ts)" > "$STATE"
+  else
+    echo "[$(ts)] same alert set as last run — mail deduped"
+  fi
+else
+  rm -f "$sig"
+  echo "[$(ts)] all 5 slots identity-clean"
+fi
+
+exit 0

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# github-mirror-cycle — one mirror tick: reconcile FIRST, then push+board.
+# Order matters (2026-07-19, found in phase-3 e2e test): reconcile labels
+# gh-closed-pending-triage beads so the push step cannot revert a human's
+# GitHub-side close. Running push first would reopen human-closed issues.
+# Env: see bin/github-mirror-reconcile and bin/github-mirror headers.
+# RIGS: single source is MIRROR_RIGS; reconcile receives it as RECONCILE_RIGS.
+set -uo pipefail
+
+PILOT_LOCK=/home/ds/gas-city/.gc/github-mirror-pilot.lock
+mkdir -p "$(dirname "$PILOT_LOCK")"
+exec 9>"$PILOT_LOCK"
+if ! flock -n 9; then
+  echo "github-mirror-cycle: another pilot/cutover cycle holds $PILOT_LOCK" >&2
+  exit 1
+fi
+
+RECONCILE_RIGS="${MIRROR_RIGS:?MIRROR_RIGS required}" /home/ds/gas-city/bin/github-mirror-reconcile
+rc1=$?
+/home/ds/gas-city/bin/github-mirror
+rc2=$?
+exit $(( rc1 > rc2 ? rc1 : rc2 ))

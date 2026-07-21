@@ -1,0 +1,9 @@
+# Added 2026-07-20 after root reached 99% and millions of tiny telemetry files
+# plus duplicated result-heavy worktrees escaped existing visibility. Read-only
+# inventory; remove this order to roll back without affecting stored reports.
+[order]
+description = "Daily bounded storage ledger: root/NAS capacity+inodes, bd telemetry, registered worktrees, conservative clean+merged stale potential, and generated dependency/build totals. JSONL audit in .gc/storage-ledger.log."
+trigger = "cron"
+schedule = "20 7 * * *"
+exec = "/home/ds/gas-city/bin/storage-ledger"
+timeout = "30m"

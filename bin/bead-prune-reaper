@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# bead-prune-reaper: delete closed non-ephemeral beads older than N days across
+# every rig bead store, to trim the live working set and shrink JSONL exports.
+#
+# Wraps `bd prune --older-than <N>` per store (bd skips pinned, open/in-progress
+# and ephemeral beads — only closed regular beads match). Deletion is a Dolt
+# commit, so pruned beads stay recoverable via `bd restore` / Dolt history until
+# a SEPARATE, deliberate `bd flatten` + Dolt GC collapses history. This reaper
+# never flattens: flatten loses ALL commit history for a db and is gated on an
+# explicit human call.
+#
+# Stores are addressed by path (`bd -C <path>`), not `gc bd --rig <name>`,
+# because the HQ store (the `gc` db, which holds the bulk of closed beads) is
+# not addressable by rig name through gc.
+#
+# Default mode is DRY-RUN. Pass --apply to actually prune.
+#
+# Usage:
+#   bead-prune-reaper                   # dry-run: prunable counts per store
+#   bead-prune-reaper --apply           # prune closed >30d everywhere
+#   bead-prune-reaper --older-than 60d  # custom window (default 30d)
+#   bead-prune-reaper --rig gc --apply  # scope to one store (by gc rig name)
+#   bead-prune-reaper --apply --nudge-mayor
+
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${BEAD_PRUNE_AUDIT_LOG:-${CITY}/.gc/bead-prune-reaper.log}"
+OLDER_THAN="${BEAD_PRUNE_OLDER_THAN:-30d}"
+export BEADS_ACTOR="${BEADS_ACTOR:-bead-prune-reaper}"
+
+APPLY=0
+NUDGE_MAYOR=0
+ONLY_RIG=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)       APPLY=1; shift ;;
+    --nudge-mayor) NUDGE_MAYOR=1; shift ;;
+    --older-than)  OLDER_THAN="${2:?--older-than needs a value}"; shift 2 ;;
+    --rig)         ONLY_RIG="${2:?--rig needs a value}"; shift 2 ;;
+    -h|--help)     sed -n '2,25p' "$0"; exit 0 ;;
+    *) echo "bead-prune-reaper: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$(dirname "$AUDIT_LOG")"
+
+log_event() {
+  # log_event <event> <rig> <extra-json>
+  local event=$1 rig=$2 extra=${3:-'{}'} ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  jq -cn --arg ts "$ts" --arg event "$event" --arg rig "$rig" \
+         --arg older "$OLDER_THAN" --argjson extra "$extra" \
+    '{ts:$ts, event:$event, rig:$rig, older_than:$older} + $extra' >> "$AUDIT_LOG"
+}
+
+# (rig name, store path) for every rig including the HQ store. JSON because the
+# text rig-list parser drops "(HQ)"/"(suspended)" rows.
+declare -A RIG_PATHS
+while IFS=$'\t' read -r rig path; do
+  [[ -n "$rig" && -n "$path" && -d "$path/.beads" ]] && RIG_PATHS["$rig"]="$path"
+done < <(gc rig list --json 2>/dev/null | jq -r '(.rigs // .items // [])[] | [.name, .path] | @tsv')
+
+if [[ ${#RIG_PATHS[@]} -eq 0 ]]; then
+  echo "bead-prune-reaper: no rig stores discovered (gc rig list --json failed?)" >&2
+  exit 1
+fi
+
+# Parse "Would prune N" (dry-run) or "Found N closed" (preview) from bd prune.
+prune_preview_count() {
+  grep -oE 'Would prune [0-9]+|Found [0-9]+ closed' | grep -oE '[0-9]+' | head -1
+}
+
+total=0
+mode_label=$([[ $APPLY -eq 1 ]] && echo PRUNED || echo "WOULD-PRUNE")
+printf '%-24s %s\n' "STORE" "$mode_label"
+printf '%-24s %s\n' "-----" "----------"
+
+for rig in $(printf '%s\n' "${!RIG_PATHS[@]}" | sort); do
+  [[ -n "$ONLY_RIG" && "$rig" != "$ONLY_RIG" ]] && continue
+  path=${RIG_PATHS[$rig]}
+
+  n=$(bd -C "$path" prune --older-than "$OLDER_THAN" --dry-run 2>/dev/null | prune_preview_count)
+  n=${n:-0}
+  [[ "$n" -eq 0 ]] && continue
+
+  if [[ "$APPLY" -eq 1 ]]; then
+    if bd -C "$path" prune --older-than "$OLDER_THAN" --force >/dev/null 2>&1; then
+      log_event prune "$rig" "{\"pruned\":$n,\"path\":\"$path\"}"
+    else
+      log_event prune_failed "$rig" "{\"attempted\":$n,\"path\":\"$path\"}"
+      printf '%-24s %s\n' "$rig" "FAILED ($n)" >&2
+      continue
+    fi
+  fi
+
+  printf '%-24s %s\n' "$rig" "$n"
+  total=$((total + n))
+done
+
+printf '%-24s %s\n' "-----" "----------"
+printf '%-24s %s\n' "TOTAL" "$total"
+
+if [[ $APPLY -eq 1 ]]; then
+  log_event summary "_all" "{\"total_pruned\":$total}"
+  echo
+  echo "Pruned beads remain recoverable via Dolt history (bd restore) until a"
+  echo "deliberate 'bd flatten' + Dolt GC. Run dolt-gc-maintenance / flatten"
+  echo "separately to reclaim disk and collapse the history."
+fi
+
+if [[ $APPLY -eq 1 && $NUDGE_MAYOR -eq 1 && $total -gt 0 ]]; then
+  gc session nudge mayor \
+    "bead-prune-reaper pruned ${total} closed bead(s) >${OLDER_THAN}; audit ${AUDIT_LOG}" 2>/dev/null \
+    || echo "warn: mayor nudge failed (asleep?); result is in the audit log" >&2
+fi

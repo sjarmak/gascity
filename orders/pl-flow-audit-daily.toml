@@ -1,0 +1,12 @@
+# Daily flow check -> deep audit on stall. For each rig with backlog but
+# nothing moving (open>0, wip=0, closed24h=0 — flow-patrol definition), the
+# rig's PL is triggered to run DEEP_AUDIT: diagnose the stall, answer the
+# smartest-addition question, audit vs best practices, and raise
+# BLOCKED-ON-HUMAN loudly if mechanically blocked. Stephanie 2026-06-12.
+# Seeding note: see pl-status-update-am.toml (zero-lastRun trap).
+[order]
+description = "Daily 11:00 EDT: per-rig flow check; stalled rigs trigger their PL's DEEP_AUDIT (stall diagnosis + smartest-addition + best-practices + blocked-on-human escalation)."
+trigger = "cron"
+schedule = "0 11 * * *"
+exec = "/home/ds/gas-city/bin/pl-periodic-directive DEEP_AUDIT --stalled"
+timeout = "5m"

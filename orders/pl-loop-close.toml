@@ -1,0 +1,6 @@
+[order]
+description = "When a PL-slung tracking bead closes with originating_slack metadata, post a threaded reply to the originating Slack thread with the completion summary + evidence. Closes the loop-back gap Stephanie reported 2026-05-11. dr-1lf4h3."
+trigger = "event"
+on = "bead.closed"
+exec = "/home/ds/gas-city/bin/pl-loop-close"
+timeout = "120s"

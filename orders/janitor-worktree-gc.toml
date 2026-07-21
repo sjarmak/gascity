@@ -1,0 +1,35 @@
+# Janitor patrol 1/2: worktree GC.
+# STAGED PROPOSAL - install by copying into <city>/orders/ (see README.md).
+# Order name comes from the file basename: janitor-worktree-gc.
+#
+# Exec order: runs on the orchestrator, no agent, no LLM (right shape for
+# purely mechanical work per Tutorial 07). Ships in DRY-RUN mode; a human
+# flips JANITOR_MODE to "--execute" only after reviewing dry-run reports.
+#
+# NOTE on timeout: a full classification pass over ~350 worktrees takes a few
+# minutes. The default exec-order timeout is 300s, so this sets 1200s; if
+# city.toml has [orders] max_timeout below that, raise it or the run is
+# killed mid-pass (classification is read-only, so a kill is safe but the
+# report will be truncated).
+
+[order]
+description = "Janitor: classify gascity worktrees and GC CLEAN_MERGED ones (dry-run until JANITOR_MODE flipped)"
+trigger = "cron"
+schedule = "20 4 * * *"          # daily 04:20, off-peak
+exec = "/home/ds/gas-city/scripts/gc-janitor.sh"   # city-relative; script resolves config from env below
+timeout = "1200s"
+
+[order.env]
+JANITOR_REPO = "/home/ds/gascity"
+JANITOR_WORKTREE_DIR = "/home/ds/gascity-worktrees"
+JANITOR_BASE_REF = "origin/main"
+# Returned to dry-run 2026-07-20 with Stephanie's approval in the mayor thread.
+# RCA dr-6dc / source P0 gc-r9fx found two overlapping cleanup owners and this
+# janitor lacks the newer reaper's live-process and active-bead reference gates.
+# Restore --execute only after one cleanup owner has those gates, a current
+# fleet report passes review, and Stephanie separately approves re-promotion.
+JANITOR_MODE = "--dry-run"
+JANITOR_MAX_REMOVE = "25"        # per-tick blast-radius cap
+JANITOR_MIN_AGE_DAYS = "3"
+# JANITOR_PROTECT_RE defaults to '^polecat-[0-9]$|^polecat(/.*)?$'
+# (active pool worktrees + live rig infra under polecat/).

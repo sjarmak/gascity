@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+# pl-loop-close — when a PL-slung tracking bead closes with originating
+# Slack metadata, route the completion to the originating thread.
+#
+# Phase 2 (PL-mediated, current): the handler nudges the originating
+# PL session with bead context. The PL composes a conversational reply
+# in its voice and posts via gc slack publish-to-channel. If the PL
+# doesn't post within 5 minutes (or no live PL session exists), the
+# handler falls back to a direct machine-formatted post.
+#
+# Phase 1 fallback path remains intact so the loop closes even when
+# the PL is down. Audit log distinguishes:
+#   - nudged: PL was notified, awaiting its post
+#   - posted_pl: PL completed a threaded post (handler sees loop_close_posted_at)
+#   - posted_top_level: PL completed a top-level post for a cron-triggered
+#     dispatch (bead carries loop_close_top_level=true; no originating thread)
+#   - fallback_posted: direct post after PL nudge timed out
+#   - posted: direct post (no PL session at all)
+#   - skip_mode / skip_already_posted / failed: standard outcomes
+#
+# Documented in dr-1lf4h3 (Phase 2 design appended 2026-05-11).
+
+set -euo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${CITY}/.gc/pl-loop-close.log"
+SINCE="${PL_LOOP_CLOSE_SINCE:-10m}"
+NUDGE_TIMEOUT_SECONDS="${PL_LOOP_CLOSE_NUDGE_TIMEOUT:-300}"   # 5 minutes
+
+# Resolve a stable session for slack attribution: $GC_SESSION_ID (interactive)
+# else the pinned mayor. Detached order runs strip GC_SESSION_ID, so the direct
+# surfacer publishes below would fail fast without this. (The heredoc'd PL
+# templates run in-session where GC_SESSION_ID is set, so they don't need it.)
+resolve_publish_sid() {
+  if [[ -n "${GC_SESSION_ID:-}" ]]; then
+    printf '%s' "$GC_SESSION_ID"; return 0
+  fi
+  gc session list 2>/dev/null | awk '$2=="mayor" && /pin/{print $1; exit}'
+}
+PUBLISH_SID="$(resolve_publish_sid)"
+
+mkdir -p "$(dirname "$AUDIT_LOG")"
+
+log_event() {
+    local event="$1"; shift
+    local extra="$1"
+    printf '{"ts":"%s","event":"%s",%s}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$extra" >> "$AUDIT_LOG"
+}
+
+# Build prefix -> rig-name map for cross-rig bd lookups.
+declare -A PREFIX_TO_RIG
+while IFS=$'\t' read -r rig prefix; do
+    [[ -n "$prefix" ]] && PREFIX_TO_RIG["$prefix"]="$rig"
+done < <(gc rig list 2>/dev/null | awk '
+    /^  [a-zA-Z][a-zA-Z0-9_-]+:/ {
+        name = $1; sub(/:$/, "", name); current_rig = name
+    }
+    /^    Prefix:/ {
+        gsub(/^    Prefix:[ \t]+/, ""); print current_rig "\t" $0
+    }')
+
+rig_for_bead() {
+    local bead_id="$1" prefix
+    for prefix in "${!PREFIX_TO_RIG[@]}"; do
+        [[ "$bead_id" == "$prefix-"* ]] && echo "${PREFIX_TO_RIG[$prefix]}" && return
+    done
+    return 1
+}
+
+bd_show() {
+    local bead_id="$1" rig out
+    if rig=$(rig_for_bead "$bead_id"); then
+        out=$(gc bd --rig "$rig" show "$bead_id" --json 2>/dev/null || true)
+    else
+        out=$(gc bd show "$bead_id" --json 2>/dev/null || true)
+    fi
+    # gc bd show returns an error OBJECT ({"error": "..."}) when the bead
+    # isn't in the routed rig — e.g. a city-level gc-NNNN bead colliding
+    # with the gascity rig's gc- prefix. Downstream indexes with .[0],
+    # which crashes on an object ("Cannot index object with number") and,
+    # under set -e, kills the whole order. Emit only a valid array;
+    # anything else becomes empty so the caller's [[ -z ]] guard skips it.
+    printf '%s' "$out" | jq -c 'if type == "array" then . else empty end' 2>/dev/null || true
+}
+
+bd_update_metadata() {
+    local bead_id="$1" patch="$2" rig
+    if rig=$(rig_for_bead "$bead_id"); then
+        gc bd --rig "$rig" update "$bead_id" --metadata "$patch" 2>&1 || true
+    else
+        gc bd update "$bead_id" --metadata "$patch" 2>&1 || true
+    fi
+}
+
+# Resolve current active session for a given agent name. Agent names
+# are stable across respawns; session IDs change. Returns the session
+# ID on stdout, or empty if no live session exists.
+find_session_for_agent() {
+    local agent_name="$1"
+    # Sessions' `Title` field carries the short agent name (e.g.
+    # "gascity-maintenance-pl"). `AgentName` is the slotted pool
+    # address (e.g. "/home/ds/gascity-main/gascity-maintenance-pl-1")
+    # which we don't want to match against.
+    gc session list --json 2>/dev/null \
+        | jq -r --arg name "$agent_name" '
+            .[]
+            | select(.Title == $name)
+            | select(.State == "active")
+            | .ID' \
+        | head -1
+}
+
+# Compose and send the loop-close nudge to a PL session. The nudge
+# tells the PL what bead closed, where to post, and how to mark done.
+nudge_pl_session() {
+    local pl_session_id="$1"
+    local bead_id="$2"
+    local rig="$3"
+    local channel_id="$4"
+    local thread_ts="$5"
+    local user_id="$6"
+    local summary="$7"
+    local outcome="$8"
+    local artifact="$9"
+    local top_level="${10:-false}"
+
+    local rig_flag=""
+    [[ -n "$rig" ]] && rig_flag="--rig $rig "
+
+    # The nudge body uses heredoc-safe single-quoting via printf to
+    # avoid interpretation of bead text. Bead descriptions may
+    # contain backticks, variables, etc.
+    local nudge_body
+    if [[ "$top_level" == "true" ]]; then
+        # Cron-triggered unsolicited dispatch (e.g. morning-triage-cycle).
+        # No originating human thread; post top-level to the channel so
+        # the result is visible in the channel-level view, not buried
+        # in a stale thread.
+        nudge_body=$(cat <<EOF
+[loop-close] Bead ${bead_id} closed (cron-triggered dispatch — post top-level, not threaded).
+
+Context:
+- Bead: ${bead_id} (outcome: ${outcome})
+- Target channel: ${channel_id} (top-level — no originating thread)
+- Worker summary: ${summary:-"(worker did not write summary_for_human)"}
+- Evidence: ${artifact:-"(none)"}
+
+Action:
+1. Read the bead in full for context: gc bd ${rig_flag}show ${bead_id}
+2. Compose a CONVERSATIONAL reply IN YOUR VOICE. Lead with the outcome, give 2-4 bullets of key findings, propose 2-3 concrete next-step options, invite direction. No flat data dumps.
+3. Post the reply as a TOP-LEVEL message (not threaded — omit --thread-ts):
+   tmpfile=\$(mktemp); cat > "\$tmpfile" <<REPLY
+   <your reply>
+   REPLY
+   gc slack publish-to-channel --conversation-id ${channel_id} --body-file "\$tmpfile"
+4. Mark the bead as posted (otherwise handler will fall back to a flat direct-post after ${NUDGE_TIMEOUT_SECONDS}s):
+   gc bd ${rig_flag}update ${bead_id} --set-metadata "loop_close_posted_at=\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+If you can't compose right now (rate limited, mid-other-work), do nothing — the fallback path will direct-post after the timeout.
+EOF
+)
+    else
+        nudge_body=$(cat <<EOF
+[loop-close] Bead ${bead_id} closed and needs surfacing back to the originating Slack thread.
+
+Context:
+- Bead: ${bead_id} (outcome: ${outcome})
+- Originating thread: channel=${channel_id} thread_ts=${thread_ts} user=${user_id}
+- Worker summary: ${summary:-"(worker did not write summary_for_human)"}
+- Evidence: ${artifact:-"(none)"}
+
+Action:
+1. Read the bead in full for context: gc bd ${rig_flag}show ${bead_id}
+2. Compose a CONVERSATIONAL reply IN YOUR VOICE. Lead with the outcome, give 2-4 bullets of key findings, propose 2-3 concrete next-step options, invite direction. No flat data dumps.
+3. Post the reply as a threaded reply:
+   tmpfile=\$(mktemp); cat > "\$tmpfile" <<REPLY
+   <your reply>
+   REPLY
+   gc slack publish-to-channel --conversation-id ${channel_id} --thread-ts ${thread_ts} --body-file "\$tmpfile"
+4. Mark the bead as posted (otherwise handler will fall back to a flat direct-post after ${NUDGE_TIMEOUT_SECONDS}s):
+   gc bd ${rig_flag}update ${bead_id} --set-metadata "loop_close_posted_at=\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+If you can't compose right now (rate limited, mid-other-work), do nothing — the fallback path will direct-post after the timeout.
+EOF
+)
+    fi
+
+    gc session nudge "$pl_session_id" "$nudge_body" >/dev/null 2>&1
+}
+
+# Direct-post (Phase 1 fallback path). Returns 0 on success.
+# When top_level=="true", omits --thread-ts so the post lands at the
+# channel level rather than nested under a (likely stale) thread.
+direct_post_to_slack() {
+    local bead_id="$1"
+    local channel_id="$2"
+    local thread_ts="$3"
+    local user_id="$4"
+    local summary="$5"
+    local outcome="$6"
+    local artifact="$7"
+    local pl_agent="$8"
+    local top_level="${9:-false}"
+
+    local tmpfile
+    tmpfile=$(mktemp /tmp/pl-loop-close-XXXXXX.txt)
+    {
+        if [[ -n "$user_id" ]]; then
+            printf '<@%s> %s\n\n' "$user_id" "$summary"
+        else
+            printf '%s\n\n' "$summary"
+        fi
+        printf 'Bead: %s (%s)\n' "$bead_id" "$outcome"
+        [[ -n "$artifact" ]] && printf 'Evidence: %s\n' "$artifact"
+        printf 'Slung by: %s\n' "$pl_agent"
+    } > "$tmpfile"
+
+    local result=1
+    if [[ "$top_level" == "true" ]]; then
+        if gc slack publish-to-channel \
+            --conversation-id "$channel_id" \
+            ${PUBLISH_SID:+--session "$PUBLISH_SID"} \
+            --body-file "$tmpfile" >/dev/null 2>&1
+        then
+            result=0
+        fi
+    else
+        if gc slack publish-to-channel \
+            --conversation-id "$channel_id" \
+            --thread-ts "$thread_ts" \
+            ${PUBLISH_SID:+--session "$PUBLISH_SID"} \
+            --body-file "$tmpfile" >/dev/null 2>&1
+        then
+            result=0
+        fi
+    fi
+
+    rm -f "$tmpfile"
+    return $result
+}
+
+# Compute seconds since an ISO-8601 timestamp.
+elapsed_seconds_since() {
+    local iso_ts="$1"
+    local then_epoch
+    then_epoch=$(date -d "$iso_ts" +%s 2>/dev/null || echo "")
+    [[ -z "$then_epoch" ]] && echo "0" && return
+    local now_epoch
+    now_epoch=$(date -u +%s)
+    echo "$((now_epoch - then_epoch))"
+}
+
+# Collect bead IDs from recent bead.closed and bead.updated events.
+mapfile -t bead_ids < <(
+    {
+        gc events --type bead.closed --since "$SINCE" 2>/dev/null
+        gc events --type bead.updated --since "$SINCE" 2>/dev/null
+    } | jq -r '.subject // empty' \
+      | awk 'NF' \
+      | sort -u
+)
+
+[[ ${#bead_ids[@]} -eq 0 ]] && exit 0
+
+nudged=0
+posted=0
+posted_pl=0
+posted_top_level=0
+skipped=0
+failed=0
+fallback=0
+
+for bead_id in "${bead_ids[@]}"; do
+    bead_json=$(bd_show "$bead_id")
+    [[ -z "$bead_json" ]] && continue
+
+    # Filter: only closed beads.
+    status=$(echo "$bead_json" | jq -r '.[0].status // empty')
+    [[ "$status" != "closed" ]] && continue
+
+    # Filter: must have originating_slack.channel_id. thread_ts is
+    # required for threaded replies but optional when the bead carries
+    # loop_close_top_level=true (cron-triggered unsolicited dispatches
+    # like morning-triage-cycle that have no originating human thread).
+    channel_id=$(echo "$bead_json" | jq -r '.[0].metadata.originating_slack.channel_id // empty')
+    thread_ts=$(echo "$bead_json" | jq -r '.[0].metadata.originating_slack.thread_ts // empty')
+    top_level=$(echo "$bead_json" | jq -r '.[0].metadata.loop_close_top_level // "false"')
+    if [[ -z "$channel_id" ]]; then
+        continue
+    fi
+    if [[ -z "$thread_ts" && "$top_level" != "true" ]]; then
+        continue
+    fi
+
+    # Filter: loop_close mode (default auto).
+    mode=$(echo "$bead_json" | jq -r '.[0].metadata.loop_close // "auto"')
+    if [[ "$mode" == "suppress" || "$mode" == "manual" ]]; then
+        log_event "skip_mode" "\"bead\":\"$bead_id\",\"mode\":\"$mode\""
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    # Idempotence: skip if we've already posted.
+    posted_at=$(echo "$bead_json" | jq -r '.[0].metadata.loop_close_posted_at // empty')
+    if [[ -n "$posted_at" ]]; then
+        # PL stamped posted_at out-of-band (composed + posted in response
+        # to a prior nudge). Surface it in the audit so the tick summary
+        # reflects PL-mediated posts; otherwise the loop appears dead even
+        # when it's healthy (per dr-6vhzid investigation).
+        nudged_at=$(echo "$bead_json" | jq -r '.[0].metadata.loop_close_nudged_at // empty')
+        fallback_at=$(echo "$bead_json" | jq -r '.[0].metadata.loop_close_fallback // empty')
+        if [[ -n "$nudged_at" && -z "$fallback_at" ]]; then
+            if [[ "$top_level" == "true" ]]; then
+                log_event "posted_top_level" "\"bead\":\"$bead_id\",\"posted_at\":\"$posted_at\""
+                posted_top_level=$((posted_top_level + 1))
+            else
+                log_event "posted_pl" "\"bead\":\"$bead_id\",\"posted_at\":\"$posted_at\""
+                posted_pl=$((posted_pl + 1))
+            fi
+        fi
+        continue
+    fi
+
+    # Pull reply fields.
+    user_id=$(echo "$bead_json" | jq -r '.[0].metadata.originating_slack.user_id // empty')
+    summary=$(echo "$bead_json" | jq -r '.[0].metadata.summary_for_human // empty')
+    outcome=$(echo "$bead_json" | jq -r '.[0].metadata."gc.outcome" // .[0].metadata.gc.outcome // "unspecified"')
+    artifact=$(echo "$bead_json" | jq -r '.[0].metadata."evidence.artifact_path" // .[0].metadata.evidence.artifact_path // empty')
+    pl_agent=$(echo "$bead_json" | jq -r '.[0].metadata.originating_pl_agent // empty')
+
+    # Default summary if worker didn't write summary_for_human (for
+    # direct-post fallback). The PL-mediated path passes raw to the PL
+    # so it can compose around the gap.
+    summary_for_direct_post="$summary"
+    if [[ -z "$summary_for_direct_post" ]]; then
+        summary_for_direct_post="(worker did not write metadata.summary_for_human — close evidence only)"
+    fi
+
+    rig=$(rig_for_bead "$bead_id" 2>/dev/null || echo "")
+
+    # ---- Phase 2: PL-mediated path ----
+    nudged_at=$(echo "$bead_json" | jq -r '.[0].metadata.loop_close_nudged_at // empty')
+
+    if [[ -n "$pl_agent" ]]; then
+        pl_session=$(find_session_for_agent "$pl_agent")
+
+        if [[ -z "$nudged_at" ]]; then
+            # First time we see this closed bead. Try to nudge PL.
+            if [[ -n "$pl_session" ]]; then
+                if nudge_pl_session \
+                    "$pl_session" \
+                    "$bead_id" \
+                    "$rig" \
+                    "$channel_id" \
+                    "$thread_ts" \
+                    "$user_id" \
+                    "$summary" \
+                    "$outcome" \
+                    "$artifact" \
+                    "$top_level"
+                then
+                    now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                    bd_update_metadata "$bead_id" \
+                        "{\"loop_close_nudged_at\":\"$now_iso\",\"loop_close_nudged_session\":\"$pl_session\"}" >/dev/null
+                    log_event "nudged" "\"bead\":\"$bead_id\",\"pl_agent\":\"$pl_agent\",\"pl_session\":\"$pl_session\""
+                    nudged=$((nudged + 1))
+                    continue
+                fi
+                # Nudge failed — fall through to direct-post.
+                log_event "nudge_failed" "\"bead\":\"$bead_id\",\"pl_agent\":\"$pl_agent\",\"pl_session\":\"$pl_session\""
+            else
+                log_event "no_live_pl" "\"bead\":\"$bead_id\",\"pl_agent\":\"$pl_agent\""
+            fi
+            # No PL session OR nudge failed → fall through to direct-post.
+        else
+            # Already nudged. Check timeout.
+            elapsed=$(elapsed_seconds_since "$nudged_at")
+            if (( elapsed < NUDGE_TIMEOUT_SECONDS )); then
+                # Still waiting on PL. Log and continue.
+                log_event "waiting_on_pl" "\"bead\":\"$bead_id\",\"elapsed_sec\":$elapsed"
+                continue
+            fi
+            # Timeout exceeded → fall through to direct-post fallback.
+            log_event "nudge_timeout" "\"bead\":\"$bead_id\",\"elapsed_sec\":$elapsed"
+        fi
+    fi
+    # ---- end Phase 2 path ----
+
+    # ---- Phase 1 direct-post path (always runs when we reach here) ----
+    if direct_post_to_slack \
+        "$bead_id" \
+        "$channel_id" \
+        "$thread_ts" \
+        "$user_id" \
+        "$summary_for_direct_post" \
+        "$outcome" \
+        "$artifact" \
+        "${pl_agent:-PL}" \
+        "$top_level"
+    then
+        now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        is_fallback="false"
+        if [[ -n "$nudged_at" ]]; then
+            is_fallback="true"
+            fallback=$((fallback + 1))
+            bd_update_metadata "$bead_id" \
+                "{\"loop_close_posted_at\":\"$now_iso\",\"loop_close_fallback\":true}" >/dev/null
+            log_event "fallback_posted" "\"bead\":\"$bead_id\",\"channel\":\"$channel_id\",\"thread_ts\":\"$thread_ts\""
+        else
+            posted=$((posted + 1))
+            bd_update_metadata "$bead_id" \
+                "{\"loop_close_posted_at\":\"$now_iso\"}" >/dev/null
+            log_event "posted" "\"bead\":\"$bead_id\",\"channel\":\"$channel_id\",\"thread_ts\":\"$thread_ts\""
+        fi
+    else
+        log_event "failed" "\"bead\":\"$bead_id\",\"channel\":\"$channel_id\""
+        failed=$((failed + 1))
+    fi
+done
+
+log_event "tick" "\"scanned\":${#bead_ids[@]},\"nudged\":$nudged,\"posted\":$posted,\"posted_pl\":$posted_pl,\"posted_top_level\":$posted_top_level,\"fallback\":$fallback,\"skipped\":$skipped,\"failed\":$failed"
+
+exit 0

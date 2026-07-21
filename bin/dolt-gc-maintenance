@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# dolt-gc-maintenance: reclaim uncollected noms garbage from the managed
+# dolt sql-server's databases by running online CALL DOLT_GC() per database.
+#
+# Why this exists: the managed dolt config sets dolt_auto_gc_enabled=OFF
+# (working around dolt#10944 load-avg gating) on the assumption that a
+# "compaction-driven scheduled GC" replaces it. That replacement was never
+# wired up here, so the city bead store grew to multiple GB of uncollected
+# garbage — which made every teardown slow enough to blow past systemd's
+# stop timeout and get SIGKILL'd. This script is that scheduled GC.
+#
+# Runs against the live server endpoint (never `dolt sql` inside .beads/dolt
+# while the server holds the LOCK). Meant to run off-hours: CALL DOLT_GC()
+# rewrites the chunk store and can briefly stall concurrent clients.
+set -euo pipefail
+
+INFO_FILE="/home/ds/gas-city/.beads/dolt/.dolt/sql-server.info"
+LOG="$HOME/.gc/dolt-gc-maintenance.log"
+
+log() { echo "$(date -Iseconds) $*" | tee -a "$LOG" >&2; }
+
+if [[ ! -f "$INFO_FILE" ]]; then
+    log "ERROR: sql-server.info not found at $INFO_FILE — is the managed dolt server up?"
+    exit 1
+fi
+
+# Format is pid:port:uuid
+PORT="$(cut -d: -f2 "$INFO_FILE")"
+if [[ ! "$PORT" =~ ^[0-9]+$ ]]; then
+    log "ERROR: could not parse port from $INFO_FILE (got '$PORT')"
+    exit 1
+fi
+
+DOLT=(dolt --host 127.0.0.1 --port "$PORT" --user root --no-tls --password '')
+
+# Real bead databases only — skip dolt/mysql system schemas and the probe db.
+mapfile -t DBS < <("${DOLT[@]}" sql -q "SHOW DATABASES;" -r csv 2>/dev/null \
+    | tail -n +2 \
+    | grep -ivE '^(information_schema|mysql|__gc_probe|Database)$')
+
+if [[ ${#DBS[@]} -eq 0 ]]; then
+    log "ERROR: no databases returned from server on port $PORT"
+    exit 1
+fi
+
+log "starting dolt GC sweep across ${#DBS[@]} databases on port $PORT"
+failed=0
+for db in "${DBS[@]}"; do
+    before="$(du -sh "/home/ds/gas-city/.beads/dolt/$db" 2>/dev/null | cut -f1 || echo '?')"
+    if "${DOLT[@]}" sql -q "USE \`$db\`; CALL DOLT_GC();" >/dev/null 2>>"$LOG"; then
+        after="$(du -sh "/home/ds/gas-city/.beads/dolt/$db" 2>/dev/null | cut -f1 || echo '?')"
+        log "  ok   $db: $before -> $after"
+    else
+        log "  FAIL $db (see log above)"
+        failed=$((failed + 1))
+    fi
+done
+
+log "dolt GC sweep complete: $(( ${#DBS[@]} - failed ))/${#DBS[@]} succeeded"
+exit "$failed"

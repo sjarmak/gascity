@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# slack-adapter-rebuild: keep the running slack adapter in sync with the fork's
+# main (origin/main) AND keep /home/ds/gascity-packs-main resting on a ref that
+# carries the fork-local pack folders.
+#
+# Problem 1 (staleness): the slack adapter binary at
+# /home/ds/gascity-packs/slack-pack/adapter/gc-slack-adapter is built from
+# whatever branch was checked out at the moment of last build. Since /home/ds/
+# gascity-packs is the canonical packs worktree and frequently sits on
+# contributor PR branches (bd-gpk-*), main never gets the rebuild. Merges to the
+# fork's main land adapter code that never reaches the running adapter —
+# silently — until something visibly breaks (e.g. @mayor: address-by-handle
+# missed PR #19 routing 2026-05-20).
+#
+# Problem 2 (pack-import breakage): city.toml imports pr-pipeline + pr-review
+# from /home/ds/gascity-packs-main's WORKING TREE. Those packs are fork-local —
+# they exist on origin/main (sjarmak fork) but were REMOVED from upstream/main
+# (gastownhall) by commit c888727 "chore: remove unpublished pack folders". An
+# earlier version of this script did `git checkout --detach upstream/main`,
+# which landed -main on a ref WITHOUT the packs and broke every gc command that
+# loads city config (`gc session attach mayor`: "loading pack.toml: ... no such
+# file or directory"). 2026-05-30 incident.
+#
+# Why origin/main is the correct ref for BOTH concerns:
+#   - origin/main carries the fork-local packs (pr-pipeline, pr-review); upstream
+#     does not. Resting -main here keeps city config loadable.
+#   - The slack-pack/adapter subtree is identical on origin/main and upstream/main
+#     today, and the fork's main is where our slack-pack work (slack-mini,
+#     slack-channel) integrates — so origin/main is the canonical adapter source.
+#     Building from upstream/main would risk silently dropping fork adapter work.
+#
+# This order:
+#   1. Fetches origin in /home/ds/gascity-packs-main.
+#   2. Detached-checks-out origin/main ALWAYS — self-heals -main back onto the
+#      pack-carrying ref even on no-op runs (doubles as the packs-main currency
+#      keeper; no separate ff order needed).
+#   3. Drift signal = the slack-pack/adapter SUBTREE sha on origin/main (not the
+#      whole-repo HEAD), so unrelated packs/docs churn does not force rebuilds.
+#      Compares to the sha recorded in
+#      /home/ds/.gc/slack-adapter-last-built.txt.
+#   4. On adapter drift: go build the adapter, replace the running binary in
+#      /home/ds/gascity-packs/slack-pack/adapter/gc-slack-adapter, restart the
+#      adapter via the supervisor API, update the sentinel.
+#   5. Idempotent: re-runs at the same adapter subtree sha are no-ops (but still
+#      self-heal the checkout in step 2).
+#
+# Safe for concurrent contributor branches in /home/ds/gascity-packs because
+# this script only touches /home/ds/gascity-packs-main (purpose-named for the
+# main branch) for building. It replaces the binary in /home/ds/gascity-packs/
+# but does not touch source files there.
+#
+# Exit 0 on success or no-op; non-zero on build failure (caught by order
+# timeout otherwise).
+
+set -euo pipefail
+
+PACKS_MAIN="/home/ds/gascity-packs-main"
+ADAPTER_SUBPATH="slack-pack/adapter"
+ADAPTER_DEST="/home/ds/gascity-packs/slack-pack/adapter/gc-slack-adapter"
+SENTINEL="/home/ds/.gc/slack-adapter-last-built.txt"
+SUPERVISOR_API="${GC_SUPERVISOR_API:-http://127.0.0.1:8372}"
+CITY="${GC_CITY:-ds-research}"
+LOG="/home/ds/.gc/slack-adapter-rebuild.log"
+
+mkdir -p "$(dirname "$LOG")"
+
+log() {
+  printf '%s %s\n' "$(date -Iseconds)" "$*" >> "$LOG"
+}
+
+log "=== run start ==="
+
+if [[ ! -d "$PACKS_MAIN/.git" ]] && [[ ! -f "$PACKS_MAIN/.git" ]]; then
+  log "FATAL: $PACKS_MAIN is not a git worktree"
+  exit 1
+fi
+
+# Fetch the fork (suppress noisy output)
+git -C "$PACKS_MAIN" fetch origin 2>&1 | tail -3 >> "$LOG" || {
+  log "FATAL: git fetch origin failed"
+  exit 1
+}
+
+origin_head=$(git -C "$PACKS_MAIN" rev-parse origin/main 2>/dev/null || true)
+if [[ -z "$origin_head" ]]; then
+  log "FATAL: cannot resolve origin/main"
+  exit 1
+fi
+
+# Self-heal: always rest -main on origin/main (the pack-carrying ref). This
+# restores pr-pipeline/pr-review even on no-op runs and corrects any drift left
+# by other processes. Detached so it never disturbs a feature branch elsewhere.
+git -C "$PACKS_MAIN" checkout --detach "$origin_head" 2>&1 | tail -3 >> "$LOG" || {
+  log "FATAL: checkout origin/main failed"
+  exit 1
+}
+
+# PARKED (dec-44y, Stephanie 2026-06-12): upstream renamed slack-pack -> slack-full
+# and the trees diverged (contributor slack-pack has local-only confined_open.go /
+# dispatch_drops.go; upstream slack-full has user_alias_map.go we lack). Rebuilding
+# from -main would silently drop the local features. Keep the checkout self-heal
+# above; skip the rebuild until the divergence is reconciled (upstream the local
+# files, then repoint ADAPTER_SUBPATH to slack-full/adapter and delete this gate).
+log "parked: rebuild skipped pending slack-pack/slack-full reconciliation (dec-44y); -main rested on origin/main $origin_head"
+exit 0
+
+# Drift signal: the adapter SUBTREE sha, so unrelated packs/docs commits on the
+# fork's main do not force needless rebuilds.
+adapter_sha=$(git -C "$PACKS_MAIN" rev-parse "origin/main:$ADAPTER_SUBPATH" 2>/dev/null || true)
+if [[ -z "$adapter_sha" ]]; then
+  log "FATAL: cannot resolve origin/main:$ADAPTER_SUBPATH"
+  exit 1
+fi
+
+current_built=""
+[[ -f "$SENTINEL" ]] && current_built=$(cat "$SENTINEL")
+
+if [[ "$adapter_sha" == "$current_built" ]]; then
+  log "no-op: adapter already built from subtree $adapter_sha (-main rested on origin/main $origin_head)"
+  exit 0
+fi
+
+log "adapter drift detected: subtree=$adapter_sha built=$current_built (origin/main=$origin_head)"
+
+# Build into a tempfile then replace, so a build failure doesn't corrupt the
+# running binary's path.
+tmp_binary=$(mktemp)
+trap 'rm -f "$tmp_binary"' EXIT
+
+if ! (cd "$PACKS_MAIN/$ADAPTER_SUBPATH" && go build -o "$tmp_binary" . 2>>"$LOG"); then
+  log "FATAL: go build failed"
+  exit 2
+fi
+
+if [[ ! -s "$tmp_binary" ]]; then
+  log "FATAL: built binary is empty"
+  exit 2
+fi
+
+cp -f "$tmp_binary" "$ADAPTER_DEST"
+chmod +x "$ADAPTER_DEST"
+log "binary replaced: $ADAPTER_DEST (size=$(stat -c%s "$ADAPTER_DEST"))"
+
+# Restart via supervisor API
+restart_response=$(curl -sS -X POST -H "X-GC-Request: 1" \
+  "$SUPERVISOR_API/v0/city/$CITY/service/slack/restart" 2>&1 || true)
+log "restart response: $restart_response"
+
+if ! grep -q '"status":"ok"' <<<"$restart_response"; then
+  log "WARN: restart did not return status=ok"
+  # Don't exit non-zero — binary is replaced, autorestart hook will pick up
+fi
+
+# Update sentinel only after successful build + restart attempt
+echo "$adapter_sha" > "$SENTINEL"
+log "sentinel updated: $adapter_sha"
+
+log "=== run end (rebuilt + restarted) ==="
+exit 0

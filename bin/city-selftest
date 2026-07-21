@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# city-selftest — run every bin/*.test suite and escalate regressions.
+#
+# Why this exists (2026-07-16): the bin/*.test files are the only regression
+# cover for the city's backstop scripts, and NOTHING ran them. They executed
+# when a human remembered. On 2026-07-14 the gc-xk1hg readiness gate landed in
+# routed-bead-nudger; its stub was not updated, so `gc bd ... ready` returned
+# '[]', READY_SET emptied, every candidate was filtered, and all four
+# behavioural assertions went red — on the LIVE backstop for the
+# warm-pool-idle stall (the "bead never claimed" leak). It stayed red for two
+# days and nothing noticed. A check nobody runs is not a check.
+#
+# Scope: runs the suites, reports, escalates. It does NOT fix or quarantine —
+# a red suite is a human's call, not an automated mutation.
+#
+# Safety: every bin/*.test is hermetic (mktemp -d fixtures + `gc`/`gh` stubs on
+# PATH; tmp-reaper.test sources its reaper with TMP_REAPER_LIB=1 so no real
+# scan runs). Verified 2026-07-16 before this order was created. A NEW .test
+# that touches real state would be a bug in that test — this runner grants it
+# no isolation of its own.
+#
+# Dedup: escalates on pass->fail (NEW) and fail->pass (RECOVERED, once). While
+# a suite stays red it re-alerts at most every CITY_SELFTEST_REALERT_HOURS
+# (default 24) so a known-red suite does not nag every tick. Silent when green.
+#
+# Usage:
+#   city-selftest              # dry-run: print what would be posted
+#   city-selftest --push       # live: post to #gascity-maintenance
+#   city-selftest --only NAME  # run one suite (basename, no .test)
+#
+# Env:
+#   CITY_SELFTEST_REALERT_HOURS   re-alert window while red (default 24)
+#   CITY_SELFTEST_TIMEOUT         per-suite timeout in seconds (default 180)
+#   CITY_SELFTEST_CHANNEL         Slack channel (default C0B25SS12CD)
+
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${CITY_SELFTEST_AUDIT_LOG:-${CITY}/.gc/city-selftest.log}"
+STATE_FILE="${CITY_SELFTEST_STATE:-${CITY}/.gc/city-selftest-state.json}"
+TEST_DIR="${CITY_SELFTEST_TEST_DIR:-${CITY}/bin}"
+CHANNEL="${CITY_SELFTEST_CHANNEL:-C0B25SS12CD}"
+REALERT_HOURS="${CITY_SELFTEST_REALERT_HOURS:-24}"
+PER_TIMEOUT="${CITY_SELFTEST_TIMEOUT:-180}"
+
+PUSH=0
+ONLY=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --push)   PUSH=1; shift ;;
+    --only)   ONLY="$2"; shift 2 ;;
+    -h|--help) sed -n 's/^# \{0,1\}//p' "$0" | head -34; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+now_epoch=$(date +%s)
+
+log_event() { # log_event <event> <suite> [extra-json]
+  [[ -d "${AUDIT_LOG%/*}" ]] || return 0
+  local extra=${3:-}
+  [[ -n "$extra" ]] || extra='{}'   # a quoted default would reach jq as invalid JSON
+  jq -cn --arg ts "$(ts)" --arg event "$1" --arg suite "$2" \
+         --argjson extra "$extra" \
+    '{ts:$ts, event:$event, suite:$suite} + $extra' >> "$AUDIT_LOG" 2>/dev/null || true
+}
+
+[[ -f "$STATE_FILE" ]] || echo '{}' > "$STATE_FILE"
+state=$(cat "$STATE_FILE" 2>/dev/null); [[ -n "$state" ]] || state='{}'
+jq -e . >/dev/null 2>&1 <<<"$state" || state='{}'   # corrupt state -> start clean
+
+new_state="$state"
+report=""     # accumulated escalation lines
+ran=0; failed=0
+
+shopt -s nullglob
+for t in "$TEST_DIR"/*.test; do
+  name=$(basename "$t" .test)
+  [[ -n "$ONLY" && "$name" != "$ONLY" ]] && continue
+  ran=$((ran + 1))
+
+  out=$(timeout "$PER_TIMEOUT" bash "$t" 2>&1); rc=$?
+  if (( rc == 0 )); then status="pass"; else status="fail"; fi
+  (( rc == 124 )) && status="fail"   # timeout is a failure, not a pass
+  [[ "$status" == "fail" ]] && failed=$((failed + 1))
+
+  prev=$(jq -r --arg n "$name" '.[$n].status // "unknown"' <<<"$state")
+  last_alert=$(jq -r --arg n "$name" '.[$n].last_alert // 0' <<<"$state")
+  alert=0; kind=""
+
+  if [[ "$status" == "fail" ]]; then
+    if [[ "$prev" != "fail" ]]; then
+      alert=1; kind="NEW"                                   # pass/unknown -> fail
+    elif (( now_epoch - last_alert >= REALERT_HOURS * 3600 )); then
+      alert=1; kind="STILL RED"                             # re-alert window
+    fi
+  elif [[ "$status" == "pass" && "$prev" == "fail" ]]; then
+    alert=1; kind="RECOVERED"
+  fi
+
+  log_event "suite-$status" "$name" "$(jq -cn --argjson rc "$rc" --arg prev "$prev" '{rc:$rc, prev:$prev}')"
+
+  if (( alert )); then
+    if [[ "$kind" == "RECOVERED" ]]; then
+      report+="✅ *${name}* — RECOVERED"$'\n'
+    else
+      # Last few lines carry the failing assertions; full output is local only.
+      tail=$(grep -E "^(FAIL|RESULT|FAILED)" <<<"$out" | head -4)
+      [[ -z "$tail" ]] && tail=$(tail -3 <<<"$out")
+      report+="🔴 *${name}* — ${kind} (exit ${rc})"$'\n'"\`\`\`"$'\n'"${tail}"$'\n'"\`\`\`"$'\n'
+    fi
+  fi
+
+  # Advance status now; last_alert is carried through untouched and only moves
+  # after a successful post (below), so a failed publish re-alerts next tick.
+  new_state=$(jq --arg n "$name" --arg s "$status" --argjson t "$now_epoch" \
+    '.[$n] = {status:$s,
+              since:(if (.[$n].status // "") == $s then (.[$n].since // $t) else $t end),
+              last_alert:(.[$n].last_alert // 0)}' \
+    <<<"$new_state")
+done
+
+log_event "tick" "-" "$(jq -cn --argjson r "$ran" --argjson f "$failed" '{ran:$r, failed:$f}')"
+
+if [[ -z "$report" ]]; then
+  echo "$(ts) city-selftest: $ran suite(s), $failed failing, nothing to escalate"
+  echo "$new_state" > "$STATE_FILE"
+  exit 0
+fi
+
+msg=$(mktemp); trap 'rm -f "$msg"' EXIT
+{
+  echo "*city-selftest* — bin/*.test regression cover"
+  echo "$report"
+  echo "_Re-run locally:_ \`bash /home/ds/gas-city/bin/<suite>.test\`"
+} > "$msg"
+
+if (( ! PUSH )); then
+  echo "=== city-selftest DRY-RUN (would post to $CHANNEL) ==="
+  cat "$msg"
+  echo "=== state NOT advanced (dry-run) ==="
+  exit 0
+fi
+
+if gc slack publish-to-channel --conversation-id "$CHANNEL" --kind room \
+     --body-file "$msg" >/dev/null 2>&1; then
+  # Only now advance last_alert, so a failed post retries next tick.
+  for n in $(jq -rn --argjson s "$new_state" '$s | keys[]'); do
+    grep -q "\*${n}\*" "$msg" && new_state=$(jq --arg n "$n" --argjson t "$now_epoch" \
+      '.[$n].last_alert = $t' <<<"$new_state")
+  done
+  echo "$new_state" > "$STATE_FILE"
+  log_event "pushed" "-" "$(jq -cn --arg c "$CHANNEL" '{channel:$c}')"
+  gc session nudge mayor "city-selftest: $(grep -c '^🔴\|^✅' "$msg") suite change(s)
+$(cat "$msg")" >/dev/null 2>&1 || true
+else
+  # State NOT advanced: retry next tick rather than swallow the regression.
+  log_event "push-failed" "-" "$(jq -cn --arg c "$CHANNEL" '{channel:$c, note:"state not advanced; will retry"}')"
+  echo "$(ts) city-selftest: ERROR publish -> $CHANNEL failed; will retry" >&2
+  exit 1
+fi

@@ -1,0 +1,38 @@
+# mem-arm — ephemeral per-bead dispatch target for the mem-0rrf warm-vs-cold
+# experiment (mayor gc-ebngi / handoff mem-0rrf-force-fresh-build.md). Each arm
+# bead routed here spawns a FRESH session: warm beads (gc.brain_parent_sid set)
+# fork at firstStart (--resume <parent_sid> --fork-session); cold beads spawn
+# fresh, no fork.
+#
+# THE FORK NEEDS TWO CONDITIONS (both verified against session_reconciler.go +
+# session_lifecycle_parallel.go validateForkLaunch, 2026-06-30):
+#   1. firstStart=true  <- min_active_sessions = 0. No idle pool member exists to
+#      CLAIM a routed bead (claiming resumes PAST firstStart and skips the fork),
+#      so every routed bead forces a fresh scale-check spawn AT firstStart.
+#   2. forceFresh=false <- wake_mode = "resume". With wake_mode=fresh, a session
+#      carrying gc.brain_parent_sid hits the validateForkLaunch guard
+#      "wake_mode=fresh would discard the fork (warm->cold mislabel)" and HARD-
+#      ERRORS. fresh is the WRONG knob here — an earlier note had this backwards.
+# Plus the provider must declare fork_flag (added to claude-3 in city.toml).
+# Cold beads (no parentSID) take the plain fresh-session-id branch -> stay cold.
+# Distinct from mem-worker (persistent claim-pool, min_active=4) on the SAME rig
+# dir; a bead routed_to=mem-arm only matches mem-arm sessions.
+#
+# WORKTREE: a routed warm bead spawns with WorkBeadID set, so poolTriggerWorkDir
+# resolves the session CWD to <work_dir base>/<bead-slug>. session_setup creates
+# that as a real git worktree off main, so the forked brain operates on a fresh
+# src tree instead of the bare-scaffolding main dir the pre-fix smoke landed in.
+dir = "/home/ds/projects/mem"
+provider = "claude-4"
+# Unpinned 2026-07-05 (Stephanie: accounts are fungible, handled by quota).
+# fork_flag is now uniform across all claude providers, so any account can host
+# forks. RESIDUAL COUPLING: a warm fork resumes the PARENT session's transcript
+# from the parent's account home, so during a live warm-vs-cold run this agent
+# and mem-worker must be on the SAME provider — co-move or temporarily re-pin
+# both for the run's duration.
+min_active_sessions = 0
+max_active_sessions = 2
+wake_mode = "resume"
+
+[env]
+CLAUDE_BINARY = "claude-auto"

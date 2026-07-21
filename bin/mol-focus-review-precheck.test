@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Hermetic regression for gc-5cgt: mol-focus-review must reject an open bead
+# carrying dispatch-blocked while preserving ordinary open-bead behavior.
+set -euo pipefail
+
+CITY="${GC_CITY_ROOT:-/home/ds/gas-city}"
+FORMULA="$CITY/formulas/mol-focus-review.formula.toml"
+[ -r "$FORMULA" ] || { echo "FAIL: formula not readable at $FORMULA"; exit 1; }
+
+WORK=$(mktemp -d -p /var/tmp mfr-precheck.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+
+awk '
+  /^focus_block_reason\(\) \{/ {f=1}
+  f {print}
+  /^focus_precheck\(\) \{/ {p=1}
+  p && /^}$/ {exit}
+' "$FORMULA" > "$WORK/precheck.fn"
+grep -q 'dispatch-blocked' "$WORK/precheck.fn" || {
+  echo "FAIL: could not extract dispatch-blocked precheck from formula" >&2
+  exit 1
+}
+# shellcheck disable=SC1090,SC1091
+source "$WORK/precheck.fn"
+
+assert_reason() {
+  local name=$1 fixture=$2 want=$3 got
+  got=$(printf '%s' "$fixture" | focus_block_reason)
+  if [ "$got" != "$want" ]; then
+    echo "FAIL: $name: got '$got', want '$want'" >&2
+    exit 1
+  fi
+}
+
+assert_reason "open dispatch-blocked bead" \
+  '[{"id":"held","status":"open","labels":["dispatch","dispatch-blocked"]}]' \
+  'dispatch-blocked'
+assert_reason "ordinary open bead" \
+  '[{"id":"ordinary","status":"open","labels":["dispatch","fail-closed"]}]' \
+  ''
+assert_reason "ordinary open bead with omitted labels" \
+  '[{"id":"ordinary","status":"open"}]' \
+  ''
+assert_reason "blocked status remains rejected" \
+  '[{"id":"blocked","status":"blocked","labels":[]}]' \
+  'blocked'
+assert_reason "closed status remains rejected" \
+  '[{"id":"closed","status":"closed","labels":[]}]' \
+  'closed'
+
+assert_rejected_state() {
+  local name=$1 fixture=$2
+  if printf '%s' "$fixture" | focus_block_reason >/dev/null 2>&1; then
+    echo "FAIL: $name: malformed state was accepted" >&2
+    exit 1
+  fi
+}
+
+assert_rejected_state "malformed JSON" '{'
+assert_rejected_state "missing status" '[{"id":"held","labels":[]}]'
+assert_rejected_state "malformed labels" '[{"id":"held","status":"open","labels":"dispatch-blocked"}]'
+assert_rejected_state "null labels" '[{"id":"held","status":"open","labels":null}]'
+assert_rejected_state "non-string label" '[{"id":"held","status":"open","labels":[17]}]'
+
+bd() { return 17; }
+if focus_precheck held >/dev/null 2>&1; then
+  echo "FAIL: bd show failure was accepted" >&2
+  exit 1
+fi
+
+echo "PASS: mol-focus-review rejects dispatch-blocked and unknown state without changing ordinary open behavior"

@@ -1,0 +1,14 @@
+[order]
+description = "Unified upstream-maintainer cycle for gastownhall/gascity, owned by gascity-maintenance-pl. Every tick (cooldown), slings ONE polecat that walks the upstream queue BY PRIORITY and does BOTH halves of maintainer work: (1) REVIEW the highest-priority open contributor PR that needs review, and (2) AUTHOR a PR for the highest-priority authorable OPEN issue (mol-pr-from-issue). Selection is delegated to the polecat (ZFC) — it reads the latest morning briefing + live PR/issue state. Conservative overnight: straightforward->auto_push, bounded->branch-ready-halt, needs-decision->escalate to morning ledger; NEVER auto-merge. Exec-wrapper shape mirrors morning-triage-cycle/author-cycle (gastownhall/gascity#1440 formula+pool order regression workaround). Unifies the scattered pieces: ABSORBS the staged author-cycle (authoring half) and complements pr-state-poller (which stays as the fast OUR-PR copilot-iterate poller); both feed the same morning briefing produced by morning-triage-cycle."
+trigger = "cooldown"
+# Cooldown (not cron): self-paces on the runner's own ~15-20min actual tick, so
+# it survives a missed/late tick gracefully (cron would skip a fixed slot).
+# 120m cooldown = roughly one full review+author pass every 2h during the day,
+# naturally lighter overnight because each pass does bounded work and HALTS
+# (no auto-merge) — see SPEC §Schedule. The daytime authoring cadence the old
+# author-cycle gave at 9/12/15/18 is preserved-or-better (every 2h vs 4 fixed
+# slots); the review side is unchanged in spirit from pr-state-poller's 15m
+# OUR-PR loop, which keeps running independently for fast copilot turnarounds.
+interval = "120m"
+exec = "/home/ds/gas-city/bin/maintenance-cycle"
+timeout = "5m"

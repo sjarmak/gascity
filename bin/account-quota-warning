@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""account-quota-warning: slack-ping when a Claude account's 7-day quota is
+approaching exhaustion — the quota analog of account-keepalive (which watches
+OAuth expiry, not utilization).
+
+This exists because nothing else watches quota heat. Static account pins are
+never rebalanced, so a long-lived session (mayor, always-on PLs) rides its pinned
+account's 7d quota up until it hits the 95% MAXED cliff and the agent starts
+getting rate-limited — exactly how mayor ended up stuck on a maxed account.
+Alerting at a WARN line (default 75%, well before the cliff) gives runway to
+relocate by hand before anything is rate-limited.
+
+A pinned/always-on agent sitting on a warming account is called out explicitly,
+since that's the high-cost-of-failure case (gc-capacity won't auto-move a pinned
+agent — a human has to).
+
+Reads ~/.claude-usage/usage_cache.json (populated by csu). Per-account dedupe in
+/home/ds/.gc/account-quota-warning-state.json keyed on the 7d resets_at window,
+so it re-alerts at most once per quota window per account.
+
+Posts to gascity-maintenance Slack (C0B25SS12CD) via the slack adapter, falling
+back to mayor mail if the post fails.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+CITY_ROOT = Path(__file__).resolve().parent.parent
+AGENTS_DIR = CITY_ROOT / "agents"
+USAGE_CACHE = Path.home() / ".claude-usage" / "usage_cache.json"
+STATE_PATH = Path.home() / ".gc" / "account-quota-warning-state.json"
+WARN_PCT = float(os.environ.get("QUOTA_WARN_PCT", "75"))
+CHANNEL = os.environ.get("WARN_SLACK_CHANNEL", "C0B25SS12CD")
+# Self-healing (2026-07-05, the account4-at-92% incident): when enabled, any
+# account over WARN_PCT is drained via `gc-capacity --rebalance auto` instead
+# of only being announced. Default OFF in code; the order toml turns it on
+# explicitly so the behavior is visible in config. Idempotent — once drained,
+# subsequent runs plan zero moves.
+AUTO_DRAIN = os.environ.get("QUOTA_AUTO_DRAIN", "0") == "1"
+
+PROVIDER_TO_ACCOUNT = {f"claude-{n}": f"account{n}" for n in range(1, 6)}
+ACCOUNT_TO_PROVIDER = {v: k for k, v in PROVIDER_TO_ACCOUNT.items()}
+
+
+def load_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+def pinned_or_always_agents_by_account() -> dict[str, list[str]]:
+    """Map accountN -> [agent names that are pinned or always-on there].
+
+    These are the agents a quota warning matters most for: they don't get
+    rebalanced automatically, so a human must move them before the account maxes.
+    """
+    out: dict[str, list[str]] = {}
+    for toml_path in sorted(AGENTS_DIR.glob("*/agent.toml")):
+        name = toml_path.parent.name
+        if name.startswith(("_", ".")):
+            continue
+        try:
+            data = tomllib.loads(toml_path.read_text())
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        if not data.get("pin", False):
+            continue
+        acct = PROVIDER_TO_ACCOUNT.get(data.get("provider", ""))
+        if acct:
+            out.setdefault(acct, []).append(name)
+    return out
+
+
+def slack_post(body: str) -> bool:
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+        f.write(body)
+        tmp = f.name
+    try:
+        result = subprocess.run(
+            ["gc", "slack", "publish-to-channel",
+             "--conversation-id", CHANNEL, "--body-file", tmp],
+            capture_output=True, text=True, timeout=30,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def mail_mayor(subject: str, body: str) -> None:
+    subprocess.run(
+        ["gc", "mail", "send", "mayor", subject, body],
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+def auto_balance() -> list[str]:
+    """Balance accounts via gc-capacity; return the applied move lines.
+
+    Uses --no-reset: agent.toml providers are rewritten, then a `gc reload`
+    lets the supervisor cycle drifted sessions on its own staggered cadence
+    (max_wakes_per_tick) instead of a per-agent reset storm inside this
+    order's timeout. Empty list = nothing needed moving (gc-capacity's auto
+    planner gives hot accounts zero target capacity and distributes the rest
+    by remaining 5h/7d quota. Pinned agents are never touched.
+    """
+    try:
+        result = subprocess.run(
+            [str(CITY_ROOT / "bin" / "gc-capacity"), "--rebalance", "auto", "--no-reset"],
+            capture_output=True, text=True, timeout=90,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        print(f"auto-drain failed: {exc}", file=sys.stderr)
+        return []
+    moves = [ln.strip() for ln in result.stdout.splitlines()
+             if " -> " in ln and ": " in ln]
+    if moves:
+        subprocess.run(["gc", "reload"], capture_output=True, text=True, timeout=60)
+    return moves
+
+
+def main() -> int:
+    usage = load_json(USAGE_CACHE)
+    if not usage:
+        print("no usage cache; nothing to do", file=sys.stderr)
+        return 0
+
+    state = load_json(STATE_PATH)
+    pinned = pinned_or_always_agents_by_account()
+    now_ms = int(time.time() * 1000)
+    alerts: list[tuple[str, float, str, list[str]]] = []  # (acct, pct, window, agents)
+
+    any_hot = False
+    for a in usage.get("accounts", []):
+        name = a.get("name", "")
+        if not name.startswith("account"):
+            continue
+        seven = (a.get("seven_day") or {}).get("utilization")
+        if seven is None or float(seven) < WARN_PCT:
+            continue
+        any_hot = True
+        window = (a.get("seven_day") or {}).get("resets_at") or ""
+        # Dedupe: only re-alert when the quota window has advanced.
+        if state.get(name, {}).get("last_window") == window:
+            continue
+        alerts.append((name, float(seven), window, pinned.get(name, [])))
+
+    # Balance every cycle, including when all accounts are cool. Restricting
+    # this to hot-account incidents made allocation a one-way ratchet: drained
+    # workers stayed concentrated forever after the other accounts recovered.
+    moves: list[str] = []
+    if AUTO_DRAIN:
+        moves = auto_balance()
+
+    if not alerts:
+        if moves:
+            # Routine capacity convergence is expected operation, not an alert.
+            print(f"capacity-balanced {len(moves)} agent(s), no quota alert")
+        return 0
+
+    lines = [f":rotating_light: *Claude account 7-day quota over {WARN_PCT:.0f}%*"]
+    for acct, pct, _, agents in sorted(alerts, key=lambda x: -x[1]):
+        prov = ACCOUNT_TO_PROVIDER.get(acct, acct)
+        tag = f" — pinned: {', '.join(agents)}" if agents else ""
+        lines.append(f"• `{acct}` ({prov}): 7d {pct:.0f}%{tag}")
+    if moves:
+        lines.append("")
+        lines.append(":recycle: *Capacity-balanced* (non-pinned agents redistributed, "
+                     "sessions cycle on the reconciler's cadence):")
+        lines.extend(f"• `{m}`" for m in moves)
+    if any(agents for *_, agents in alerts):
+        lines.append("")
+        lines.append("Pinned agents won't auto-rebalance. To relocate one: clear "
+                     "`pin` in its agent.toml + city.toml patch, `gc-capacity "
+                     "--rebalance <agent>`, then restore the pin on the new account.")
+    elif not moves:
+        lines.append("")
+        lines.append("Drain with `gc-capacity --rebalance auto` before it hits the "
+                     "95% MAXED cliff." if not AUTO_DRAIN else
+                     "Auto-drain found nothing movable (all agents on this account "
+                     "are pinned or suspended).")
+    body = "\n".join(lines)
+
+    posted = slack_post(body)
+    if not posted:
+        mail_mayor(f"[ALERT] {len(alerts)} Claude account(s) over {WARN_PCT:.0f}% 7d "
+                   f"quota — slack post failed", body)
+
+    for acct, _, window, _ in alerts:
+        state[acct] = {"last_window": window, "last_alerted_at_ms": now_ms}
+    save_state(state)
+    print(f"alerted: {[a for a, *_ in alerts]} (slack_ok={posted})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

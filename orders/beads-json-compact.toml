@@ -1,0 +1,48 @@
+# Durable fix for the 2026-07-14 order-firing stall (RCA: dr-7smz8,
+# docs/rca-order-firing-stall-filestore-bloat-2026-07-14.md).
+#
+# WHY: the gc file store (.gc/beads.json) has no reaper. bead-prune-reaper is
+# Dolt-only and bead-janitor is .disabled, so closed NON-order-tracking beads —
+# gc's own session records — accumulate forever. Every order SetCursor/CreateRun
+# does a FileStore.reloadFromDisk (full-file json.Unmarshal) under the
+# flock+mutex, so once the file is large enough the order dispatcher starves:
+# on 2026-07-14 at 168MB/79K beads, orders ran 10-30x overdue until a manual
+# compaction. The manual run is not a fix — the store regrew from 82MB to 105MB
+# in the 6h after it, ~3.7MB/h, and returns to stall size in about a day.
+#
+# WINDOW: 7d, matching the TTL the primary (order-tracking) pass already uses
+# and gc's own sweepClosedOrderTrackingRetentionBounded policy. NOT 30d: the
+# store re-bloats to stall size in ~1 day, so a 30d window releases nothing for
+# weeks. Measured on the live store 2026-07-14: 30d deletes 828 of 55,272 beads
+# (1.5%, a no-op); 7d deletes 26,621 (48%), leaving a ~28.6K-bead steady state.
+#
+# SAFETY: closed-only (a non-closed bead in the delete set aborts the write);
+# retains the 10 most recent order-tracking beads per order regardless of age;
+# LOCK_EX on the same beads.json.lock every FileStore write takes; backup +
+# atomic rename. The identical operation ran against 24,550 beads on 2026-07-14
+# with no fallout (16 orders fired in the following 15 min).
+#
+# SHIPS IN DRY-RUN. Per the city's janitor convention, a human reviews at least
+# one dry-run report and flips COMPACT_APPLY to "1" here, annotated with who and
+# when. Until then this order only reports what it would remove.
+#
+# UNDO: retire this order if gc upstream grows a retention policy for closed
+# non-order-tracking beads in the file store, or if the city's own beads
+# provider moves off the file backend.
+
+[order]
+description = "Janitor: compact closed beads out of the gc file store (.gc/beads.json) so order dispatch doesn't starve on reloadFromDisk (dry-run until enabled)"
+trigger = "cooldown"
+interval = "24h"
+exec = "/home/ds/gas-city/bin/beads-json-compact-order-tracking.py"
+timeout = "300s"
+# Re-running is a no-op re-evaluation: a pass that finds nothing past the TTL
+# deletes nothing and does not write. Safe to fire even when starved
+# (gastownhall/gascity#2893 fail-open).
+idempotent = true
+
+[order.env]
+COMPACT_APPLY = "1"              # PROMOTED (Stephanie, 2026-07-14, via mayor) after reviewing the clean dry-run: 26,603 delete / 28,653 keep, deps 60->31, no non-closed beads in the delete set
+COMPACT_CLOSED_ANY_DAYS = "7"    # the knob that actually holds the file down (see WINDOW above)
+COMPACT_TTL_DAYS = "7"           # order-tracking pass; mirrors gc's own retention watchdog
+COMPACT_RETAIN_LAST = "10"       # keep the 10 newest tracking beads per order regardless of age

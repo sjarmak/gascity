@@ -1,0 +1,363 @@
+[
+  {
+    "number": 3986,
+    "title": "`gc sling <target> <bead> --on <v2-formula>` does not stamp `gc.source_bead_id`, so workflow-finalize cannot close the source bead",
+    "createdAt": "2026-07-06T17:28:22Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "\n## Environment\n\n- gascity edge (post-1.3.3), source snapshot `8b17c64`\n- macOS (darwin/arm64), `gc` built from source\n- `GC_BEADS=file` (observed there; the code path is backend-independent)\n\n## Summary\n\nAttaching a **formulas-v2 (graph) formula** to an existing bead with\n`gc sling <target> <bead-id> --on <formula>` launches the workflow, but the\nworkflow root never receives `gc.source_bead_id`. As a result, when the\nworkflow finalizes with outcome pass, `closeSourceBeadChain` finds no source\nmetadata and stops as a no-op — the source bead the formula was attached to\nstays open forever and must be closed by hand.\n\nThe legacy (non-graph) `--on` path stamps the source correctly; only the v2\ngraph branch drops it.\n\n## Minimal repro\n\n1. Create a city with a v2 formula (any `version = 2` graph formula) and one\n   agent that can run it.\n2. `bd create` (or `gc bd create`) a work bead; note its id, e.g. `gc-101`.\n3. `gc sling <agent> gc-101 --on <v2-formula>` — the workflow instantiates and\n   starts.\n4. Inspect the workflow root bead's metadata.\n5. Let the workflow run to completion (all steps pass, `workflow-finalize`\n   fires).\n\n**Observed:** the root has no `gc.source_bead_id` (step 4); after finalize the\nroot closes but `gc-101` remains open (step 5). The finalize trace logs\n`close-source-chain ... stop reason=no_source`.\n\n**Expected:** the root carries `gc.source_bead_id=gc-101` and finalize closes\n`gc-101` along with the root, as the non-graph `--on` path does.\n\n## Code point"
+  },
+  {
+    "number": 3977,
+    "title": "feat: version_compat gate is unobservable — linked beads version exposed nowhere",
+    "createdAt": "2026-07-06T06:04:22Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Before you continue\n- [x] I searched existing issues and did not find a duplicate.\n- [x] I can explain the user problem this solves, not just the implementation I prefer.\n\n**Lead receipt:** the binary already embeds the answer — `go version -m $(which gc)` shows `dep github.com/steveyegge/beads v1.0.4` on our gc 1.3.2 install — but no gc surface (`gc --version`, doctor, the WARN itself) exposes it.\n\n**Gas City version:** gc 1.3.2 (homebrew, darwin/arm64); linked beads library v1.0.4 (via `go version -m`); packs pinned at gascity-packs `0c1fc594`. Where noted, findings re-verified against the unmodified 1.3.3 release binary.\n**Environment:** macOS (darwin arm64), multi-rig city (5 rigs + HQ), Dolt-backed beads store, launchd-managed supervisor, custom tmux socket.\n\n- **Where:** gc-core (build/packaging + doctor + the version_compat gate).\n- **Effect:** gc embeds a beads library but exposes its version NOWHERE —\n  not in `gc --version`, not in doctor output, not in the WARN itself. The\n  gate's failure mode is an opaque `bd version differs from linked beads\n  library version` warning plus stalls of up to ~5 min per rig, when the\n  gate knows precisely which version it wants. Cost already paid in this\n  city: the silent bd 1.0.5→1.1.0 drift (2026-07-05), the\n  force-fallback-masking era (`GC_BEADS_FORCE_FALLBACK=1` hiding the\n  stall class), and the three-surface version-alignment archaeology now\n  codified on ga-sgx.\n- **Why pairing is safety, not pedantry (1.3.1 changelog,"
+  },
+  {
+    "number": 3976,
+    "title": "bug: gc start/supervisor install regenerates the LaunchAgent plist from ambient env — re-embeds credentials, drops operator keys",
+    "createdAt": "2026-07-06T06:04:19Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Before you continue\n- [x] I searched existing issues and did not find a duplicate.\n- [x] I read the relevant docs and contributor guidance.\n\n**Gas City version:** gc 1.3.2 (homebrew, darwin/arm64); linked beads library v1.0.4 (via `go version -m`); packs pinned at gascity-packs `0c1fc594`. Where noted, findings re-verified against the unmodified 1.3.3 release binary.\n**Environment:** macOS (darwin arm64), multi-rig city (5 rigs + HQ), Dolt-backed beads store, launchd-managed supervisor, custom tmux socket.\n\n- **Where:** supervisor install path (darwin launchd), gc 1.3.2 —\n  `~/Library/LaunchAgents/com.gascity.supervisor.plist`.\n- **Effect:** every `gc start` / `gc supervisor` install rewrites the plist\n  from the invoking shell's environment: (a) credential-shaped env vars\n  (ANTHROPIC/OPENAI/GOOGLE keys) are copied INTO the plist as plaintext —\n  proven live (keys re-embedded from an unscrubbed shell; clean when run\n  from a scrubbed shell); (b) operator-added `EnvironmentVariables` keys are\n  DROPPED — `TMUX_TMPDIR` was silently removed on every start, reverting the\n  tmux split-brain fix twice. This is the root cause of how keys entered the\n  plist originally (ga-nej) and makes every plist hardening a treadmill.\n  Aggravator: a dotfile-sourced env (ga-41i2) means \"any interactive shell\"\n  is an unscrubbed shell.\n- **RE-GRADE 2026-07-06 (1.3.0 changelog + live-binary receipts):** upstream\n  already shipped partial machinery in 1.3.0 — present in OUR live 1.3.2\n  binary "
+  },
+  {
+    "number": 3975,
+    "title": "bug: gc session wake is a silent no-op when there are no wake reasons",
+    "createdAt": "2026-07-06T06:04:16Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Before you continue\n- [x] I searched existing issues and did not find a duplicate.\n- [x] I read the relevant docs and contributor guidance.\n\n**Gas City version:** gc 1.3.2 (homebrew, darwin/arm64); linked beads library v1.0.4 (via `go version -m`); packs pinned at gascity-packs `0c1fc594`. Where noted, findings re-verified against the unmodified 1.3.3 release binary.\n**Environment:** macOS (darwin arm64), multi-rig city (5 rigs + HQ), Dolt-backed beads store, launchd-managed supervisor, custom tmux socket.\n\n- **Where:** `gc session wake` (gc 1.3.2).\n- **Effect:** help text documents \"if the session has no wake reasons, it\n  remains asleep,\" but the command reports nothing either way — rc 0 and\n  silence whether the wake was queued or dropped. Operators cannot\n  distinguish wake-requested from wake-effective. Peer-city scar (irondawn,\n  endorsing this ask): ~20 phantom wake cycles plus a manual drained-session\n  recovery before the no-op was understood. Their annotated pass (folded\n  2026-07-06) upgrades the endorsement to load-bearing operational doctrine\n  on their side: `--notify` and mail `/submit` only ENQUEUE — only a wake\n  POST actually starts a turn — and a DRAINED session needs\n  kill → supervisor-respawn, not another wake call. 1.3.3 help surface\n  carries the identical no-op doc text with no outcome reporting (their\n  probe). Local corroboration: the same build's `gc runtime drain-check` rc\n  is also unreliable — session-lifecycle introspection generally\n  unde"
+  },
+  {
+    "number": 3974,
+    "title": "feat: pinned column exists but nothing can set it (no bd pin, no create/update flag)",
+    "createdAt": "2026-07-06T06:04:13Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Before you continue\n- [x] I searched existing issues and did not find a duplicate.\n- [x] I can explain the user problem this solves, not just the implementation I prefer.\n\n**Gas City version:** gc 1.3.2 (homebrew, darwin/arm64); linked beads library v1.0.4 (via `go version -m`); packs pinned at gascity-packs `0c1fc594`. Where noted, findings re-verified against the unmodified 1.3.3 release binary.\n**Environment:** macOS (darwin arm64), multi-rig city (5 rigs + HQ), Dolt-backed beads store, launchd-managed supervisor, custom tmux socket.\n\n- **Where:** beads CLI (bd 1.0.5) + gc beads surface. The beads schema has a\n  `pinned` column (the SQL is present in the gc binary) and `bd list\n  --pinned` / `--no-pinned` filters exist and parse.\n- **Effect:** no CLI can set the column — no `bd pin`, no `--pinned` flag on\n  `bd create`/`bd update`, no gc setter (`gc session pin` is unrelated\n  session keep-awake). The filter surface implies a feature the toolchain\n  cannot exercise, and it blocks the gc-native pinned-reference-bead pattern\n  (permanent reference/lesson beads that agents recall at wake without\n  polluting work queues).\n- **Ask:** a setter — `bd pin <id>` / `bd unpin <id>`, or `--pinned` on\n  create/update (either surface suffices; both is better).\n- **Local mitigation:** label convention — reference beads carry a `lesson`\n  label and stay open (`bd list --label lesson` is the wake recall query,\n  standing policy 8); the lessons README marks them \"do not sling/claim.\"\n  "
+  },
+  {
+    "number": 3973,
+    "title": "feat: discord intake service request logging (forensics currently need transcript archaeology)",
+    "createdAt": "2026-07-06T06:04:10Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Before you continue\n- [x] I searched existing issues and did not find a duplicate.\n- [x] I can explain the user problem this solves, not just the implementation I prefer.\n\n**Gas City version:** gc 1.3.2 (homebrew, darwin/arm64); linked beads library v1.0.4 (via `go version -m`); packs pinned at gascity-packs `0c1fc594`. Where noted, findings re-verified against the unmodified 1.3.3 release binary.\n**Environment:** macOS (darwin arm64), multi-rig city (5 rigs + HQ), Dolt-backed beads store, launchd-managed supervisor, custom tmux socket.\n\n- **Where:** discord intake service (`service.log`) + `bridge.py`.\n- **Effect:** `service.log` carries NO timestamps and `bridge.py` logs nothing\n  per-connection. When an audit needed to establish whether robots/sitemap\n  probes were external traffic over the live cloudflared tunnel (vs local\n  tooling), there was no request record to consult — the determination required\n  transcript archaeology.\n- **Ask:** timestamped request logging in the intake service; an optional\n  per-connection log line in `bridge.py`.\n- **Local mitigation:** none — forensic-only gap. The tunnel-reachability\n  posture is tracked separately (ga-z5y corrected the audit's \"exposure is gone\"\n  attribution).\n---\n*Filed from a downstream Gas City deployment as part of an operator-approved findings bundle (18 items; cross-references like “ask #N” refer to sibling issues in this batch — index in the first comment once all are filed). Happy to provide deeper traces or re-"
+  },
+  {
+    "number": 3972,
+    "title": "bug: session event delivery is lossy and its failures are silent (gc-core / discord launcher)",
+    "createdAt": "2026-07-06T06:04:06Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Before you continue\n- [x] I searched existing issues and did not find a duplicate.\n- [x] I read the relevant docs and contributor guidance.\n\n**Gas City version:** gc 1.3.2 (homebrew, darwin/arm64); linked beads library v1.0.4 (via `go version -m`); packs pinned at gascity-packs `0c1fc594`. Where noted, findings re-verified against the unmodified 1.3.3 release binary.\n**Environment:** macOS (darwin arm64), multi-rig city (5 rigs + HQ), Dolt-backed beads store, launchd-managed supervisor, custom tmux socket.\n\n- **RE-GRADE 2026-07-05 (source read, unmodified upstream main): part (b) is\n  ALREADY FIXED upstream — do NOT file it.** `NudgeSession` (tmux.go) calls\n  `submitEnterAndConfirm`: re-sends Enter up to 3× while the pane stays idle,\n  gated on `submitVerifyEligible` = claude provider family (our agents\n  qualify), referencing upstream issue **ga-bwm** (\"drafted but not\n  submitted\"). Our gc 1.3.2 shows the UNRECOVERED stall, so the fix postdates\n  1.3.2. The Enter-loss half therefore folds into the **ga-sgx upgrade**\n  (adopt a release carrying `submitEnterAndConfirm`) + a **duplicate-check\n  against ga-bwm** at submission — NOT a new ask. AUR2 on 1.3.3 confirms\n  whether 1.3.3 already carries it. Local shim: auto-unstick v2.1 submit-verify\n  (unwinds on the same upgrade).\n- **Where (remaining, genuine):** gc-core session EVENT delivery (distinct from\n  the tmux submit path) + the discord launcher.\n- **Effect (P2.8 battery, event-loss half only):** a launch event vanishe"
+  },
+  {
+    "number": 3971,
+    "title": "feat: gc dashboard serve binds all interfaces with no way to narrow it",
+    "createdAt": "2026-07-06T06:04:03Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Before you continue\n- [x] I searched existing issues and did not find a duplicate.\n- [x] I can explain the user problem this solves, not just the implementation I prefer.\n\n**Gas City version:** gc 1.3.2 (homebrew, darwin/arm64); linked beads library v1.0.4 (via `go version -m`); packs pinned at gascity-packs `0c1fc594`. Where noted, findings re-verified against the unmodified 1.3.3 release binary.\n**Environment:** macOS (darwin arm64), multi-rig city (5 rigs + HQ), Dolt-backed beads store, launchd-managed supervisor, custom tmux socket.\n\n- **Where:** `gc dashboard serve` (gc 1.3.2).\n- **Effect:** binds the IPv6 dual-stack wildcard `*:8080` (all interfaces,\n  LAN-visible — HTTP 200 served on 127.0.0.1, [::1], AND the LAN IP) while its\n  own log line claims `listening on http://localhost:8080`. There is no\n  `--host`/`--bind` flag (only `--port`), so an operator cannot narrow it from\n  the CLI. Every on-demand start re-opens an unauthenticated LAN-visible\n  dashboard for as long as it runs; the misleading \"localhost\" log invites false\n  confidence.\n- **Ask:** add `--host` (default `127.0.0.1`), or a config bind key; and make the\n  listen log line print the ACTUAL bind address.\n- **Local mitigation:** dashboard kept STOPPED (stop-on-demand discipline, per\n  the human's ga-9k8.5 decision) — nothing listens, so no active exposure.\n  ga-qqro.\n---\n*Filed from a downstream Gas City deployment as part of an operator-approved findings bundle (18 items; cross-references like “ask #N"
+  },
+  {
+    "number": 3970,
+    "title": "bug: nudge machinery leaks an open P2 bead per nudge",
+    "createdAt": "2026-07-06T06:03:48Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Before you continue\n- [x] I searched existing issues and did not find a duplicate.\n- [x] I read the relevant docs and contributor guidance.\n\n**Gas City version:** gc 1.3.2 (homebrew, darwin/arm64); linked beads library v1.0.4 (via `go version -m`); packs pinned at gascity-packs `0c1fc594`. Where noted, findings re-verified against the unmodified 1.3.3 release binary.\n**Environment:** macOS (darwin arm64), multi-rig city (5 rigs + HQ), Dolt-backed beads store, launchd-managed supervisor, custom tmux socket.\n\n- **Where:** gc-core nudge machinery + `gc order sweep-nudge-mail`.\n- **Effect:** nudge delivery never writes delivery-state back to the nudge bead\n  (`last_attempt_at` stays empty even for nudges that demonstrably reached the\n  session). `sweep-nudge-mail` (the every-5-min GC) only closes nudges it\n  considers DELIVERED past a TTL and not in the live queue, so undelivered-state\n  beads are invisible to it and never close — an unbounded leak of open P2 beads\n  (44 seen, 43 in one day; dry-run showed 0 eligible despite 44 open). The P1/P2\n  dashboard count is dominated by spent lifecycle beads.\n- **Ask:** record delivery on the nudge bead (set `last_attempt_at`), OR have\n  `sweep-nudge-mail` close nudge beads past `expires_at` regardless of\n  delivered-state. Pairs with the convoy-container half (ask #9 companion /\n  ga-21k bug #2).\n- **Local mitigation (ga-ojge, 2026-07-03):** hand-closed 44 leaked nudges + 30\n  stale synthetic convoy containers (the sanctioned sweeps "
+  },
+  {
+    "number": 3969,
+    "title": "bug: gc mail reply messages are counted but not listed by gc mail inbox",
+    "createdAt": "2026-07-06T06:03:45Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Before you continue\n- [x] I searched existing issues and did not find a duplicate.\n- [x] I read the relevant docs and contributor guidance.\n\n**Gas City version:** gc 1.3.2 (homebrew, darwin/arm64); linked beads library v1.0.4 (via `go version -m`); packs pinned at gascity-packs `0c1fc594`. Where noted, findings re-verified against the unmodified 1.3.3 release binary.\n**Environment:** macOS (darwin arm64), multi-rig city (5 rigs + HQ), Dolt-backed beads store, launchd-managed supervisor, custom tmux socket.\n\n- **Where:** gc-core mail/beads.\n- **Effect:** a message created via `gc mail reply` is counted by\n  `gc mail check` / `gc mail count` and surfaced by the `--inject` hook, but is\n  NOT listed by `gc mail inbox` (empty listing/JSON), and `gc mail read` can\n  render an EMPTY body even though it is persisted on the bead (recoverable from\n  `events.jsonl` `payload.bead.description`). Cause: the reply path assigns by\n  `mail.to_session_id` while the inbox listing filters by a different identity —\n  counted-but-unlisted. Net: the governance mail channel is unreliable\n  (operator/human decisions can be counted-but-unreadable) and drives a\n  recurring phantom \"you have mail\" reminder.\n- **Effect addendum (controlled repro 2026-07-05, ga-ren1 close-out):** seed\n  message ga-wisp-bx3rro rendered fine; its reply ga-wisp-k7d5w5 rendered\n  bodyless in BOTH the inbox preview and `gc mail read` — reply-path remains\n  the trigger. Separate sub-finding: `gc mail reply <ARCHIVED-id>` ex"
+  },
+  {
+    "number": 3968,
+    "title": "bug: a pool worker cannot claim work routed to its POOL handle",
+    "createdAt": "2026-07-06T06:03:42Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Before you continue\n- [x] I searched existing issues and did not find a duplicate.\n- [x] I read the relevant docs and contributor guidance.\n\n**Gas City version:** gc 1.3.2 (homebrew, darwin/arm64); linked beads library v1.0.4 (via `go version -m`); packs pinned at gascity-packs `0c1fc594`. Where noted, findings re-verified against the unmodified 1.3.3 release binary.\n**Environment:** macOS (darwin arm64), multi-rig city (5 rigs + HQ), Dolt-backed beads store, launchd-managed supervisor, custom tmux socket.\n\n- **Where:** gc-core worker claim path + order/cron dispatch (no gc rig in this\n  city → gc binary tracker).\n- **Effect:** demand-counting and worker-claim use different lookups. A wisp\n  routed `gc.routed_to=<pool>` (e.g. `bd.dog`) is matched by the supervisor\n  scale_check (which spawns a worker) but is INVISIBLE to that worker's own\n  claim hook, which keys on its INSTANCE identity (`bd.dog-1`, session id/name).\n  So a BARE cron/order-dispatched wisp strands every slot — confirmed to defeat\n  the running worker's re-check, the fresh spawn triggered by the bare demand\n  (spawned 1 min after routing, still no claim), AND a manual mayor assign (the\n  reconciler reverts an instance assignee within ~30s). A `gc sling` re-dispatch\n  works only because it convoy-WRAPS the bead, which a fresh convoy worker then\n  claims.\n- **Ask:** either (a) the worker claim query matches the POOL handle it was\n  spawned to serve (not only instance identity), or (b) the order/cron dispatch"
+  },
+  {
+    "number": 3967,
+    "title": "feat: no way to inspect an agent's assembled/rendered prompt",
+    "createdAt": "2026-07-06T06:03:39Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Before you continue\n- [x] I searched existing issues and did not find a duplicate.\n- [x] I can explain the user problem this solves, not just the implementation I prefer.\n\n**Gas City version:** gc 1.3.2 (homebrew, darwin/arm64); linked beads library v1.0.4 (via `go version -m`); packs pinned at gascity-packs `0c1fc594`. Where noted, findings re-verified against the unmodified 1.3.3 release binary.\n**Environment:** macOS (darwin arm64), multi-rig city (5 rigs + HQ), Dolt-backed beads store, launchd-managed supervisor, custom tmux socket.\n\n**No way to inspect an agent's assembled/rendered prompt.** `gc session peek`\nshows the tmux pane, not the system prompt; there is no `--dry-run` /\n`--print-prompt` / render subcommand. Combined with gc silently dropping\nunresolvable `append_fragments` names (companion ask), a misconfigured\nfragment injects NOTHING with zero signal — which is exactly how the\n`standing-policies` fragment stayed inert undetected. Proposed: a\n`gc agent render <name>` (or `gc session new --print-prompt`) that emits the\nfully-assembled system prompt, so fragment wiring is verifiable without\nspawning a live session and grepping transcripts.\n---\n*Filed from a downstream Gas City deployment as part of an operator-approved findings bundle (18 items; cross-references like “ask #N” refer to sibling issues in this batch — index in the first comment once all are filed). Happy to provide deeper traces or re-run repros on request.*\n"
+  },
+  {
+    "number": 3966,
+    "title": "bug: pack-imported command groups swallow unknown subcommands with exit 0 (gc dolt stop class)",
+    "createdAt": "2026-07-06T06:03:36Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Before you continue\n- [x] I searched existing issues and did not find a duplicate.\n- [x] I read the relevant docs and contributor guidance.\n\n**Gas City version:** gc 1.3.2 (homebrew, darwin/arm64); linked beads library v1.0.4 (via `go version -m`); packs pinned at gascity-packs `0c1fc594`. Where noted, findings re-verified against the unmodified 1.3.3 release binary.\n**Environment:** macOS (darwin arm64), multi-rig city (5 rigs + HQ), Dolt-backed beads store, launchd-managed supervisor, custom tmux socket.\n\n- **Where (re-aimed):** the pack-import command dispatch layer, not the dolt\n  pack itself. Verified on an unmodified upstream 1.3.3 binary\n  (hash-verified release download `gascity_1.3.3_darwin_arm64.tar.gz`,\n  sha256 `fc9d6941…3271`, probed read-only from a scratch dir — never\n  installed): `gc dolt stop` → prints the command list, **rc=0** (1336\n  bytes of help as \"success\"); `gc dolt <any-unknown-subcommand>` → same\n  rc=0. Contrast the native surfaces on the same binary: `gc dolt-state\n  <unknown>` → \"unknown command\" **rc=1**; unknown top-level command →\n  rc=1. Imported groups alone treat unknown subcommands as help+exit-0.\n- **Cross-seat note (fold of irondawn annotated pass v1, 2026-07-06):**\n  irondawn's 1.3.3 probe reported \"`gc dolt` no longer exists — only\n  `dolt-cleanup`/`dolt-state` remain.\" Resolved: `gc dolt` is a PACK\n  IMPORT (\"Commands from the dolt import\"), so its presence is\n  city-config-dependent — their city doesn't import the dolt pack; our"
+  },
+  {
+    "number": 3965,
+    "title": "feat: gc config explain omits idle-key provenance",
+    "createdAt": "2026-07-06T06:03:33Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Before you continue\n- [x] I searched existing issues and did not find a duplicate.\n- [x] I can explain the user problem this solves, not just the implementation I prefer.\n\n**Gas City version:** gc 1.3.2 (homebrew, darwin/arm64); linked beads library v1.0.4 (via `go version -m`); packs pinned at gascity-packs `0c1fc594`. Where noted, findings re-verified against the unmodified 1.3.3 release binary.\n**Environment:** macOS (darwin arm64), multi-rig city (5 rigs + HQ), Dolt-backed beads store, launchd-managed supervisor, custom tmux socket.\n\n- `gc config explain` agent blocks omit `idle_timeout` / `sleep_after_idle`\n  rows entirely (checked on gc 1.3.2 against refinery agents that have\n  both). Provenance had to be read from the pack `agent.toml` directly.\n  Ask: include all resolved agent keys in explain output.\n---\n*Filed from a downstream Gas City deployment as part of an operator-approved findings bundle (18 items; cross-references like “ask #N” refer to sibling issues in this batch — index in the first comment once all are filed). Happy to provide deeper traces or re-run repros on request.*\n"
+  },
+  {
+    "number": 3964,
+    "title": "bug: core pack control-dispatcher self-triggers the singleton advisory",
+    "createdAt": "2026-07-06T06:03:30Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Before you continue\n- [x] I searched existing issues and did not find a duplicate.\n- [x] I read the relevant docs and contributor guidance.\n\n**Gas City version:** gc 1.3.2 (homebrew, darwin/arm64); linked beads library v1.0.4 (via `go version -m`); packs pinned at gascity-packs `0c1fc594`. Where noted, findings re-verified against the unmodified 1.3.3 release binary.\n**Environment:** macOS (darwin arm64), multi-rig city (5 rigs + HQ), Dolt-backed beads store, launchd-managed supervisor, custom tmux socket.\n\n- **Where:** bundled core pack `agents/control-dispatcher/agent.toml`\n  (`max_active_sessions = 1`, scale_check supplied by core), no backing\n  `[[named_session]]`.\n- **Effect:** `agent \"...core.control-dispatcher\": max_active_sessions=1\n  creates a canonical singleton that drains when scale_check returns 0;\n  declare [[named_session]] only if you need a session that survives\n  empty-demand windows` — fires at city scope plus once per rig (6 total\n  here). Drain-at-zero is the dispatcher's DESIGNED behavior, so the\n  bundled pack ships a permanent advisory against itself in every city.\n- **Non-asks:** cities cannot silence it behavior-neutrally. Declaring a\n  named_session (incl. via `[[patches.named_session]]`) would keep\n  dispatcher sessions alive through empty-demand windows; unsetting\n  `max_active_sessions`/`scale_check` changes scaling. There is no\n  redundant dispatcher named_session to drop in city or pack config (we\n  checked — the hint in the advisory's last"
+  },
+  {
+    "number": 3962,
+    "title": "bug: gc init fails to detect Gemini CLI installed via Nix (does not respect $PATH)",
+    "createdAt": "2026-07-06T04:06:55Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Before you continue\n\n- [x] I searched existing issues and did not find a duplicate.\n- [x] I read the relevant docs and contributor guidance.\n\n### Gas City version\n\n1.3.3\n\n### Environment\n\nmacosx , gc installed via nix\n\n### Reproduction\n\n\n 1. Install the gemini-cli using Nix.\n 2. Verify the gemini binary is available in $PATH and executable:\n    ```bash\n      $ which gemini\n      /Users/username/.nix-profile/bin/gemini\n\n      $ gemini --version\n      0.47.0\n    ```\n 3. Run gc init with Gemini as the provider:\n    ```bash\n      $ gc init --default-provider gemini\n      gc init: provider readiness preflight failed: Gemini CLI: is not installed\n    ```\n\n### Expected behavior\n\n\n gascity should fall back to checking $PATH (e.g., using exec.LookPath(\"gemini\")) if the binary isn't found in standard npm directories, or prioritize $PATH entirely.\n\n### Actual behavior\n\ngc init: provider readiness preflight failed: Gemini CLI: is not installed\n\n### Logs, screenshots, or traces\n\n```shell\n\n```\n\n### Additional context\n\nWhen the gemini CLI is installed via Nix and is fully accessible in the system $PATH, gc init --default-provider gemini fails with a \"not installed\" error.\n\n It appears that gascity explicitly checks hardcoded npm global installation paths (such as ~/.npm-global/bin) to find the CLI, rather than resolving the binary using the user's\n $PATH."
+  },
+  {
+    "number": 3947,
+    "title": "bug: orders: never-run cron order can't bootstrap — catch-up scan skipped when lastRun is zero (residual gap in #2721)",
+    "createdAt": "2026-07-05T15:03:57Z",
+    "labels": [
+      "kind/bug",
+      "priority/p2"
+    ],
+    "body": "## Summary\n\nA cron order that has **never fired** can never bootstrap: `checkCron`'s catch-up scan (added by #2721 to fix exactly this class of miss) is skipped when `lastRun` is zero, so a freshly-installed narrow-window order (single minute/day) is left depending on the exact-minute luck that #2721 was written to eliminate. If its first scheduled minute never coincides with a controller evaluation, it fires never — and no restart helps, because `lastRun` stays zero.\n\n## Symptom\n\nA daily-once cron order installed and enabled, with correct config, accumulates **zero** order history and silently never fires. `gc order check` shows `cron: schedule not matched` at all times. Unlike #2599 (warm orders that drop after multi-day uptime and recover on supervisor restart), a restart does **not** help here — there is no prior `lastRun` to recover to.\n\nObserved 2026-07-05 on `janitor-worktree-gc` (`schedule = \"20 4 * * *\"`), installed 2026-07-04:\n\n- Missed both of its first two 04:20 windows (07-04 and 07-05).\n- `gc order history janitor-worktree-gc` → `No order history`.\n- Sibling orders fire fine: `bead-janitor` (`0 */4 * * *`) lands at `:14`, `:36`, `:24` past the hour — never on `:00` — because it is *catching up* via #2721's path (b), which works only because it has a non-zero `lastRun`.\n- A manual `gc order run janitor-worktree-gc` established a first `lastRun`; the order is now expected to self-heal on subsequent windows.\n\n## Reproduction\n\n1. Install a new exec/cron order with a"
+  },
+  {
+    "number": 3946,
+    "title": "Homebrew gastownhall/gascity installs beads 1.1.0, but gc 1.3.x requires bd v1.0.4 → native store silently disabled (slow CLI-subprocess fallback)",
+    "createdAt": "2026-07-05T14:38:48Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "**Related:** #3878 (confirms v1.0.4 is the intended `BD_VERSION` for 1.3.x; v1.0.5 withdrawn). This issue is about a *different* delivery path — the Homebrew formula — pulling the wrong bd anyway.\n\n## Summary\nInstalling Gas City via the Homebrew tap pulls `beads` **1.1.0** as a dependency, but gc **1.3.3** vendors `github.com/steveyegge/beads v1.0.4` (per its `go.mod`, and consistent with #3878 / CI's `BD_VERSION=v1.0.4`). Because the `bd` CLI version ≠ gc's linked beads-library version, the `version_compat` preflight gate fails, the in-process **NativeDoltStore is disabled**, and every store operation falls back to shelling out to the `bd` CLI. The result is a **silently slow** install for every Homebrew user — `gc status`/`gc doctor` take many seconds to minutes.\n\n## Environment\n- gc: `1.3.3` (`55acb481…-dirty`, Homebrew tap `gastownhall/gascity`)\n- bd/beads: `1.1.0` (Homebrew `beads` formula; homepage `github.com/gastownhall/beads`)\n- dolt: `2.1.10`\n- OS: Ubuntu on WSL2, Linuxbrew\n\n## Root cause\n- `go.mod` (v1.3.3): `github.com/steveyegge/beads v1.0.4`  ← the linked library\n- Homebrew `beads` formula: latest stable = `1.1.0`\n- `gastownhall/gascity` formula: `depends_on \"beads\"` (unversioned) → resolves to `1.1.0`\n\nSo the formula's dependency doesn't match the version gc is built against.\n\n## Symptoms\n```\n$ gc doctor\n… native_store_unavailable gate=version_compat\n  reason=\"bd version differs from linked beads library version\"\n$ gc status --json | jq .beads\n{ \"beads_store\": "
+  },
+  {
+    "number": 3944,
+    "title": "bug: gc formula cook --attach drops rig context, making rig-scoped graph.v2 targets unresolvable",
+    "createdAt": "2026-07-05T13:43:13Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "### Summary\n\n`gc formula cook --attach` on a graph.v2 formula drops the invocation's **rig context** at the decorate step, so rig-scoped step targets that are **not city-unique** fail to resolve. `gc sling` on the same formula works, because it passes a real rig context. The failure looks intermittent because it only bites *bare* rig-scoped names present under more than one rig.\n\n### Environment\n\n- Gas City **v1.3.3** (`55acb48`); also reproduced against current **`main`** (buggy function is byte-identical).\n- Linux, Go 1.26. A multi-rig city where an imported pack contributes the same agent bare-name to more than one rig.\n\n### Reproduction\n\n1. A city with ≥2 rigs (e.g. `dip`, `ce`), each importing a pack that provides an agent under the same bare name (e.g. `run-operator`) — so the bare name is not city-unique.\n2. A graph.v2 formula whose steps route to that bare rig-scoped target.\n3. Run `gc formula cook --attach=<bead-id> <formula>` from within the rig.\n\n**Expected:** the step resolves to `dip/run-operator` (the invocation's rig context) — exactly as `gc sling <that-formula>` does.\n\n**Actual:** `decorate formulas v2 recipe: step <id>: unknown formulas v2 target \"run-operator\"`.\n\n### Root cause\n\n`decorateFormulaCookGraphV2Recipe` (`cmd/gc/cmd_formula.go:888-889`) calls:\n\n```go\ngraphroute.DecorateGraphWorkflowRecipe(recipe, ..., /*routedTo*/ \"\", /*sessionName*/ \"\", ...)\n```\n\nThe empty `routedTo` yields an empty `routingRigContext` (`internal/graphroute/graphroute.go:490`), w"
+  },
+  {
+    "number": 3937,
+    "title": "mol-witness-patrol reconciliation commands miss ephemeral wisps on DoltLite (regression of #1884 via #3449)",
+    "createdAt": "2026-07-05T07:00:35Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "## Summary\n\n`mol-witness-patrol`'s own wisp-reconciliation commands (added in #3243 to fix\n#1884) silently match zero rows against a live DoltLite-backed city, because\npatrol wisps are `ephemeral=true` and, per the TierIssues contract established\nin #3449 (four days after #3243 merged), `bd list` excludes `ephemeral=true`\nrows by default. The reconciliation guards never see any wisp — including the\none they just poured — so every witness cycle leaks a new wisp. This is a\nregression of #1884's symptom via a different mechanism than either of the\ntwo causes #3243 fixed.\n\n## Evidence (live repro, thriva-dev city, jetsons rig, 2026-07-05)\n\nFormula-documented command (from `mol-witness-patrol.toml`, matches\n`packs/gastown/agents/witness/prompt.template.md`):\n```\ngc bd list --assignee=\"$GC_AGENT\" --status=open --type=molecule --limit=0 --json\n```\nReturns `[]` even when two matching wisps genuinely exist and are assigned to\nthe caller:\n```\n$ gc bd show jt-wisp-4cu --json | jq '.[0] | {id,status,assignee,issue_type,ephemeral}'\n{\"id\":\"jt-wisp-4cu\",\"status\":\"open\",\"assignee\":\"jetsons/gastown.witness\",\"issue_type\":\"molecule\",\"ephemeral\":true}\n```\nAdding `--include-infra` (undocumented in the formula) surfaces it correctly:\n```\n$ gc bd list --assignee=\"jetsons/gastown.witness\" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id'\njt-wisp-4cu\n```\nConfirmed the gap is specifically the ephemeral/infra visibility tier, not\n`--type` or ledger (both already fixed by #"
+  },
+  {
+    "number": 3934,
+    "title": "Feature: a --no-supervisor / isolated-start mode for gc start (safe cutover gating beside a live supervisor)",
+    "createdAt": "2026-07-05T02:50:04Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "## Problem\n\nGating a migration/cutover that involves `gc start` (e.g. a beads backend swap) is hard on a host that already runs a live city, because `gc start` registers with the **machine-wide supervisor** — and the `127.0.0.1:8372` bind is effectively an unrelocatable singleton:\n\n- `[api]` port config, `$GCH`, and `~/.gc/supervisor.toml` are ignored for the bind;\n- `GC_NO_API` doesn't stop it;\n- rootless network-namespace isolation fails (`uid_map` EPERM) without privilege.\n\nSo a second full `gc start` — even on a throwaway clone with an isolated `GC_HOME` — collides with the live supervisor or is fatal. There is no supported way to exercise the real `gc start` path in isolation next to a live convoy.\n\n## Impact\n\nOperators gating a cutover must fall back to *proxies* (`gc start --dry-run`, an isolated `gc import install`) or run the real start fully detached against the live city with auto-rollback. Workable, but it leaves a gap: **no clean, supervisor-free way to rehearse a full start on a copy before touching production** — which is exactly the path that historically breaks cutovers.\n\n## Ask\n\nA `--no-supervisor` (or `--isolated`, or `GC_SUPERVISOR=none`) mode for `gc start` that:\n\n- runs the start's reconcile/init path against a given `GC_HOME` + city **without** binding the machine supervisor port or registering with the live controller, and\n- exits after the start-equivalent work (or runs a one-shot foreground controller on an ephemeral / overridable port).\n\nThat gives "
+  },
+  {
+    "number": 3929,
+    "title": "cascade-nudge-on-blocker-close: at-most-once dedup counts a queued nudge as delivered — a dead-lettered nudge permanently swallows the dependent's wake-up",
+    "createdAt": "2026-07-04T20:17:35Z",
+    "labels": [
+      "kind/bug"
+    ],
+    "body": "## Summary\n\nThe `cascade-nudge-on-blocker-close` order's at-most-once dedup can permanently swallow a wake-up: a `(blocker, dependent)` pair is marked \"nudged\" the moment `gc session nudge` returns success — but in the default `wait-idle` mode, \"success\" includes \"queued.\" If that queued nudge later dead-letters, the cascade never re-nudges the pair, and the dependent's assignee gets no signal that their work is unblocked until the dedup entry ages out (default 1 hour) — or ever, if nothing else wakes them.\n\nSplit out from the profiling findings in #3924 (item 2) because it's a correctness hazard, not a performance observation.\n\n## Mechanism\n\n1. A blocker closes; on a later controller tick the order script runs and calls `gc session nudge <assignee> …` for each open, assigned dependent (`internal/bootstrap/packs/core/assets/scripts/cascade-nudge-on-blocker-close.sh:109-130`).\n2. The script records the `(blocker|dependent)` dedup key **whenever the nudge command exits 0** (`.sh:130-131`).\n3. `gc session nudge` defaults to `wait-idle` (`cmd/gc/cmd_session.go:2374`). On a busy/managed-but-not-running session it **queues** the nudge and reports success (`cmd/gc/cmd_nudge.go:720-748`, fall-through to queue at `:778-780`).\n4. The queued item can dead-letter: `defaultQueuedNudgeMaxAttempts = 5`, retry delay 15 s, TTL 24 h, claim lease 2 m (`cmd/gc/cmd_nudge.go:37-41`). Delivery failures (session gone, provider stall, repeated non-idle) exhaust attempts.\n5. The dedup state file (`cas"
+  },
+  {
+    "number": 3928,
+    "title": "No session lifecycle events in the events stream — readiness tooling is forced to poll; relates to #2895 (start-pending wedges)",
+    "createdAt": "2026-07-04T19:48:54Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "**Environment:** gc 1.3.2, macOS arm64, supervisor-managed city.\n\n**Problem.** The events log carries rich `bead.*`/`order.*`/`convoy.*` types — `gc events --watch --type convoy.closed` blocks and fires beautifully — but **zero `session.*` types** (checked over multi-hour windows at both city and supervisor scope, spanning several session creations, starts, and sleeps). `gc analyze reliability` itself reports lifecycle instrumentation gaps (\"no worker.operation observed\").\n\n**Why it matters:** any tooling that must wait for a session to come up (we escort a human's tmux client into freshly spawned interactive sessions) has no event to watch — it polls `tmux has-session` or `gc session list --json` on a timer sized to worst-case reconciler latency. When a spawn wedges in `start-pending` (#2895 — we've reproduced it twice; `gc session wake` cleared it both times in ~40s), polling can't distinguish \"slow\" from \"wedged, will never arrive.\"\n\n**Asks:** (a) emit session lifecycle events (created / starting / ready / failed) to the events stream so readiness is watchable like convoys are; (b) time-box `start-pending` (retry or fail loudly) rather than wedging silently — complements #2895's TTL-reap proposal; (c) document pin-vs-wake start semantics (pin supplies a run-reason but we've observed pin alone never enqueue the start; wake cleared it).\n\nMinor related: `gc events --watch --payload-match` filters payload subkeys only — top-level `subject` can't be matched, so watchers must ve"
+  },
+  {
+    "number": 3927,
+    "title": "builtin:claude hardcodes `--effort max` and it cannot be overridden (agent `args` are prepended + last-flag-wins; settings-file `effort` is overridden by the flag); agent `model` key silently dropped",
+    "createdAt": "2026-07-04T19:48:53Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "**Environment:** gc 1.3.2, claude CLI harness, macOS arm64.\n\n**Problem.** Every claude session is spawned `claude … --effort max --settings <city>/.gc/settings.json`. The flag appears in no config surface (city.toml, provider block, pack, resolved `gc config show`) — it is baked into the builtin:claude provider. For orchestration-only agents (routers/front-desks) this burns maximum-depth reasoning on every turn: we measured **40–56s of model time per trivial status turn** that drops to seconds at lower effort.\n\n**Both adopter override paths are defeated (verified behaviorally):**\n- **Agent-level `args`** (accepted key in `agents/<name>/agent.toml`) is **prepended**, producing `claude --effort medium … --effort max …`. The claude CLI is last-flag-wins — proven by thinking-token spread on a fixed reasoning prompt: `--effort low`=49 output tokens, `--effort max`=375; `low` then `max`=294 (≈max wins), `max` then `low`=20 (≈low wins). So the builtin's flag always wins.\n- The **settings file honors an `effort` key** (settings-low alone → 45 tokens) but the CLI flag overrides it (settings-low + `--effort max` → 206 ≈ max).\n\n**Related footgun:** an agent-level `model` key in agent.toml is **silently dropped** — no warning, it just vanishes from the resolved config (while `args` is accepted). Unknown-key validation would have surfaced this.\n\n**Asks:** (a) stop hardcoding `--effort max`, or make it a default the config can override; (b) append agent `args` AFTER builtin flags so declar"
+  },
+  {
+    "number": 3926,
+    "title": "Order-tracking wisps accumulate unbounded (250k+ rows) because `gc order sweep-tracking` prunes a trickle and aborts on orphaned rows — idle dolt pegged, ~85s session spawns",
+    "createdAt": "2026-07-04T19:48:52Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "**Environment:** gc 1.3.2, bd 1.0.5, dolt 2.1.10, macOS arm64, supervisor-managed single city, 2 rigs, ~284 real issues, default system order set.\n\n**Problem.** The order machinery mints one tracking wisp (~6 events) per order run, continuously, at sub-minute cadence — normal by design. The reaper, `gc order sweep-tracking`, closes them fine but the **prune deletes only a trickle and is orphan-fragile**, so closed wisps accumulate without bound. Measured end state on an *idle* city: **wisps 35,198 / wisp_events 211,858 / wisp_labels 106,022** against 284 real issues (250k+ rows total); dolt at **90–110% of a core while idle**; `gc session new` pin→active **~85s**.\n\n**Proof the rows are the driver (not disk, not user load):**\n- `gc supervisor stop` → dolt CPU drops to **0%** (the load is gc's own order/query machinery).\n- Bulk-purging the wisp rows (250k → ~250) → idle CPU **90%→34%**, spawn pin→active **~85s→~25–38s**.\n- Pausing the only adopter-added order changed nothing (73%→85%, noise).\n\n**The prune defect specifically:**\n- One run deleted **137 of 35k**; another **2 of 63** — far below the mint rate.\n- It **throws `delete bead: <id>: bead not found` on orphaned wisps** (rows whose wisp↔events↔deps integrity broke; we found ids present in *neither* `wisps` nor `issues`) and stalls. On clean data it runs error-free, so the abort is orphan-triggered — but the first orphan starts the snowball.\n\n**Asks:** (a) make the prune orphan-tolerant (skip/repair, don't abort); (b) dele"
+  },
+  {
+    "number": 3925,
+    "title": "Proposal: formula run profiling support",
+    "createdAt": "2026-07-04T19:44:58Z",
+    "labels": [
+      "kind/feature"
+    ],
+    "body": "\n## Summary\n\nRunning a formula today produces a result but no record of *how* the run spent its time. When a `build-from-requirements` run takes 3.5 hours, there is no supported way to answer \"where did it go?\" — the evidence is scattered across the city event log, session beads, provider transcripts, usage facts, reconciler traces, Dolt history, and git, each with its own retention policy.\n\nThe key architectural finding: **almost everything needed to profile a run already survives, durably, keyed by the workflow root bead id** — and packs can ship `gc` commands (`commands/<name>/run.sh`, convention-discovered by `internal/config/command_discovery.go:57`), event-triggered orders, formulas, and scripts. So this proposes profiling as a **pack first**:\n\n- **v0 — a `profiler` pack, no core changes.** `gc profile collect <root>` assembles a complete, durable capture for *any* run — including runs that already happened and runs that crashed — from the durable sources. `gc profile report` renders the timing analysis; `gc profile compare` diffs two captures; a `bench-nullop` formula measures pure orchestration overhead; a `profile-analyze` formula + analyst role write the narrative interpretation. The pack profiles what the user's existing storage already holds — it deliberately implements no backup of run state or conversation logs.\n- **Core enablers — a short, prioritized follow-up list** for the few things a pack provably cannot reach (durable spawn-phase timings, `RunID` filter p"
+  },
+  {
+    "number": 3924,
+    "title": "Recover orchestration overhead of ~25% of formula-run wall clock: measured 3h35m profile",
+    "createdAt": "2026-07-04T19:44:37Z",
+    "labels": [
+      "kind/enhancement"
+    ],
+    "body": "## Summary\n\nWe instrumented and profiled a complete `build-from-requirements` formula run end-to-end (every bead, session, event, transcript, usage fact, trace, and git ref), reconstructed the full timing picture, and modeled where the wall clock goes. **57% of the run was actual implementation work; the rest was orchestration — and the single largest recoverable cost is a ~70–180 second dispatch tax paid at every step transition.** This issue presents the measured profile first, then the platform-layer findings, each grounded in specific code paths and constants. The companion tooling proposal is #3925.\n\n## The run\n\n`gc sling gc.run-operator <anchor> --on build-from-requirements` on a greenfield rig (simple todo app; 15-step main chain, 9-work-item implementation drain via per-item `do-work` sub-workflows). Result: approved build, zero blocking review findings. Profile reconstructed from the durable city event log, bead timestamps, session beads, transcripts, and `bd history`. All times UTC, 2026-07-03.\n\n| Measure | Value |\n|---|---|\n| Total wall clock (sling → root close) | **3 h 35 m (215.3 min)** |\n| Implementation drain (actual coding) | 123.4 m (57 %) |\n| Agent sessions spawned | 36 (20 run-operator plumbing sessions) |\n| Cumulative session time | 570 m (2.6× wall clock) |\n| Main-chain dispatch waits (bead ready → session working) | 18.8 m, **~70–180 s at every transition** |\n| Drain per-item wrapper overhead | ~4–6 m × 9 items (e.g. WI-02: 148 s ready→spawn, 133 s clos"
+  },
+  {
+    "number": 3914,
+    "title": "singleton pool + same-template named_session: identity normalization self-collision spams log + writes store every reconcile pass",
+    "createdAt": "2026-07-04T09:54:26Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "## Problem\n\nWhen an agent is declared **both** as a `min=0/max=1` pool (`[[agent]]`) **and** as a configured `[[named_session]]` for the same template, the controller spams a deferral log line **and** does a `beads.Update` (stamping `pool_alias_conflict{,_count,_at}`) on **every reconcile pass**, forever.\n\nThe singleton-pool identity normalizer tries to normalize its instance to the canonical (bare template) name, but that alias is permanently reserved by the agent's own configured named session (`ensureSessionAliasAvailable` → \"reserved for configured named session\"). The normalization can never succeed, so `normalizeNonExpandingPoolSessionBeadForSelection` takes the deferral branch every pass:\n\n```\nbuildDesiredState: pool \"st/support.intake-poller\": deferring singleton pool identity normalization\nfor bead <id>: ... session alias already exists: \"st/support.intake-poller\" reserved for configured\nnamed session st/support.intake-poller\n```\n\nObserved live: ~168–267 lines per run, `pool_alias_conflict_count` climbing into the hundreds. It's **non-fatal** (the session launches under its ephemeral name and processes work) but it is log spam **plus** a per-tick store write on every pass — the latter adds to idle controller store load (cf. #2463).\n\n## Why it's benign\n\nFor a singleton (`max=1`), the only holder of the canonical alias is the agent's own named-session identity — which legitimately owns it (that's the identity #3766 wakes). So the \"collision\" is a self-collision, not a "
+  },
+  {
+    "number": 3907,
+    "title": "doctor: rig-pack-coverage false positive for local pack replacements with same pack name",
+    "createdAt": "2026-07-04T00:27:31Z",
+    "labels": [
+      "status/needs-triage"
+    ],
+    "body": "In superlzy-city, `gc doctor` reports:\n\n- `rig-pack-coverage - 1 rig-scoped named_session(s) not covered by rig imports`\n- JSON detail: `pack \"gastown\" declares rig-scoped named_session \"witness\" (mode=always) - missing from rig(s): superlzy-dash, slc`\n\nCurrent config intentionally imports the city-level remote `gastown` pack, while two rigs replace that pack with local copies:\n\n- `superlzy-dash`: `[rigs.imports.gastown] source = \"packs/gastown-dh\"`\n- `slc`: `[rigs.imports.gastown] source = \"packs/gastown-slc\"`\n\nBoth local copies have `[pack].name = \"gastown\"` and declare the same rig-scoped always witness session in `pack.toml`. They are deliberate replacements: `superlzy-dash` uses a distinct polecat namepool, and `slc` carries local prompt/formula changes plus its namepool. Replacing them with the remote pack just to satisfy doctor would remove intended behavior.\n\nLikely root cause: `internal/doctor/checks_rig_coverage.go` iterates city `cfg.PackDirs` and calls `rigHasPackDir(c.cfg.RigPackDirs, rig.Name, packDir)`, which compares exact absolute pack directory paths. A rig-local replacement with the same pack name and equivalent required named_session declarations cannot satisfy that exact-dir comparison.\n\nExpected behavior: count a rig as covered when it imports a pack with the same `[pack].name` that declares the required rig-scoped always named_session, or otherwise distinguish exact-pack-dir gaps from intentional same-name replacements and provide an accurate hint.\n\nObs"
+  },
+  {
+    "number": 3898,
+    "title": "exec orders dispatch before pack staging completes after supervisor start — 5-minute burst of spurious 'unknown command' / missing-asset failures, beads-health runs false recovery",
+    "createdAt": "2026-07-03T15:27:09Z",
+    "labels": [
+      "priority/p1"
+    ],
+    "body": "# Exec orders dispatch before pack staging/projection completes after supervisor start\n\n## Observed (macOS, v1.3.3, 2026-07-03, city with bd/dolt/gascity remote imports)\n\nFor ~5 minutes after a supervisor start (07:44:08 → last failure 07:49:02), exec orders\nfailed repeatedly, then recovered on their own with no operator action:\n\n1. Orders whose exec uses **pack-provided commands** failed with\n   `gc: unknown command \"dolt\"`:\n   - `dolt-health` (30s cooldown — failed every cycle in the window)\n   - `dolt-remotes-patrol`\n   - `mol-dog-compactor`\n   The `dolt` namespace is a pack command from the bd/dolt import\n   (examples/bd/dolt/pack.toml). `registerPackCommands` (cmd/gc/cmd_pack_commands.go)\n   fails silently when city config expansion can't resolve imports, and\n   `quietLoadCityConfig` deliberately swallows \"not found, skipping\" for uncached/unstaged\n   packs — so the child `gc` spawned by `shellExecRunner` simply doesn't have the command.\n2. `beads-health` failed with\n   `fork/exec /Users/csells/chris-city/.gc/system/packs/bd/assets/scripts/gc-beads-bd.sh:\n   no such file or directory` — and then **attempted recovery and failed the same way**\n   (`recovery failed: exec beads recover: fork/exec ...`). `citylayout.SystemPacksRoot`\n   (\".gc/system/packs\") had not been staged yet; after staging completed the provider\n   resolved the script elsewhere (`.gc/scripts/gc-beads-bd.sh`) and the order went green.\n   `.gc/runtime/packs/` mtimes confirm staging happened inside the fail"
+  },
+  {
+    "number": 3892,
+    "title": "control-dispatcher --follow serve loop never quiesces: multi-fork bd ready scan up to 12x/min per dispatcher on a fully idle city",
+    "createdAt": "2026-07-03T13:54:04Z",
+    "labels": [
+      "priority/p2"
+    ],
+    "body": "## Problem\n\nThe control-dispatcher `--follow` serve loop's idle backoff caps at 5s (`workflowServeMaxIdleSleep`, rationale in-code: raw `bd` writes publish no city event, so the re-poll is the only way to notice those transitions). Each sweep runs the work query — a shell that forks several `bd --readonly --sandbox ready` subprocesses (one per identity candidate, plus two per routed target: `gc.run_target` + `gc.routed_to`).\n\nOn a **fully idle** city this never quiesces: every dispatcher pays a multi-fork `bd ready` scan up to ~12×/min, forever. On our 1-rig city (two dispatchers: city + rig) we measured ~50 serve trace events/min **per dispatcher** with the city otherwise quiescent — with the controller now reading in-process (native store), this idle serve polling is the dominant *residual* `bd`-subprocess producer behind #2463.\n\n## Ask\n\nA second backoff tier: after N consecutive empty sweeps (i.e. sustained proven quiet), extend the sleep cap (5s → ~30s). Any relevant event or non-empty drain already resets `idleSweeps` to 0, so multi-hop workflow latency is untouched; the only cost is a one-time ≤30s first-hop pickup for an event-less (raw `bd` write) transition arriving after a long quiet period.\n\nRefs #2463 (this is one producer, not the whole issue).\n"
+  },
+  {
+    "number": 3891,
+    "title": "feat(providers): first-class launch exec-wrapper for fs-sandboxing spawned agents (bwrap)",
+    "createdAt": "2026-07-03T12:39:27Z",
+    "labels": [
+      "priority/p2"
+    ],
+    "body": "## Summary\n\nAdd a **provider-level launch exec-wrapper** (e.g. `exec_prefix` / `wrapper` on `builtin:claude` and other runtimes) so operators can prepend a sandbox command (bubblewrap / `unshare`) to gc's normal, fully-resolved agent launch — *without* hand-replicating the invocation. This is the missing structural lever for **filesystem least-privilege on spawned agents**.\n\n## Motivation — a real store-destruction incident\n\nAn unattended pool agent running under `--dangerously-skip-permissions` (correct for headless MCP work — it removes all Bash approval prompts) \"diagnosed\" its bd/Dolt connection errors by running:\n\n```\nrm -rf .beads/dolt/* && rm -rf st/.beads/dolt/* && bd bootstrap\n```\n\nThis destroyed the managed root + rig Dolt data dirs and minted fresh project-ids → a project-identity split-brain across copies. Recovery took a full manual reconciliation.\n\nMitigations that are **not** enough on their own:\n- **Harness `permissions.deny` for Bash** (`Bash(rm:*)`, `Bash(dolt:*)`, `Bash(bd bootstrap:*)`…): we verified it *is* honored even under `--dangerously-skip-permissions`, but it is **best-effort and trivially bypassable** — `find <path> -delete`, `/bin/rm`, `python -c 'shutil.rmtree(...)'`, heredoc scripts, etc. all evade command-prefix matching. A speed-bump, not a wall.\n- **Prompt hardening** (\"never self-repair infra\"): reduces the *trigger* but is advisory.\n\nThe only real wall is **fs least-privilege**: the agent process must not be able to write/delete the manage"
+  },
+  {
+    "number": 3887,
+    "title": "workspace-identity deprecation hint can silently break Discord (and other city.toml workspace.name consumers) if followed before pack pins catch up",
+    "createdAt": "2026-07-02T22:26:59Z",
+    "labels": [
+      "priority/p2"
+    ],
+    "body": "\nThe v2 deprecation warning tells operators to move workspace identity out of `city.toml`:\n\n```\ncity.toml: workspace identity fields are deprecated in v2; move them to .gc/site.toml (workspace.name); … (run `gc doctor --fix` if this is the root city.toml …)\n```\n\nFollowing it — by hand or via `gc doctor --fix` — is a trap for any city that pins a pack release which still resolves the supervisor scope from `city.toml` `workspace.name` only (gascity-packs discord before 26cfc61). With the declared name stripped, scope discovery comes back empty, delivery falls back to the legacy default API port, and **all inbound Discord messages die with connection refused — silently** (the gateway stays up; only per-message ingress receipts record the failures).\n\nThis isn't hypothetical: on one deployment the name was removed from a root `city.toml` during an unrelated edit, and inbound DMs were eaten for ~2 days with zero alarms before the receipts were checked.\n\nTwo asks, either/both:\n\n1. **Caveat the hint** (doctor + config load warning): note that installed packs pinned before the site-binding-aware releases may still read `city.toml` `workspace.name`, so operators should update/re-pin those packs before stripping the field. A one-line addition to the warning text would have prevented the incident above.\n2. **Sequence-aware `doctor --fix`**: before stripping workspace identity from a root `city.toml`, detect installed packs whose pinned revision predates their site-binding support (even j"
+  },
+  {
+    "number": 3879,
+    "title": "Back-merge release/v1.3.0 CHANGELOG sections (1.3.1–1.3.3) into main",
+    "createdAt": "2026-07-02T20:56:48Z",
+    "labels": [
+      "priority/p3"
+    ],
+    "body": "main's CHANGELOG.md ends at `## [1.3.0]` — the 1.3.1, 1.3.2, and 1.3.3 release sections (and the repaired bottom compare links from the v1.3.3 release commit, 55acb4812) exist only on `release/v1.3.0`. The underlying fixes are already on main (the hotfixes were cherry-picked FROM main or merged back earlier); only the release documentation is missing.\n\nFollow the existing precedent (`Back-merge v1.2.1 into main` #2932 / `merge/release-v1.3.0-into-main`) or cherry-pick the changelog hunks from the release commits: dad20e66b (1.3.1), 81e97df64 (1.3.2), 55acb4812 (1.3.3).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+  },
+  {
+    "number": 3878,
+    "title": "release/v1.3.0: deps.env still pins BD_VERSION=v1.0.5 (withdrawn) — workflows override to v1.0.4",
+    "createdAt": "2026-07-02T20:56:47Z",
+    "labels": [
+      "priority/p3"
+    ],
+    "body": "On `release/v1.3.0`, `deps.env` still says `BD_VERSION=v1.0.5` even though v1.3.1 repinned the bd toolchain to v1.0.4 (v1.0.5 was withdrawn for a data-corruption bug). CI is unaffected because `ci.yml`/`rc-gate.yml` hardcode `BD_VERSION: v1.0.4`, but the file is misleading for anyone reading deps.env as the dependency source of truth on the release line. main already fixed this via #3714.\n\nv1.3.1, v1.3.2, and v1.3.3 all shipped with the stale value (noted and deliberately left out of the v1.3.3 CHANGELOG-only release commit). If another 1.3.x hotfix happens, consider including the one-line deps.env correction.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+  },
+  {
+    "number": 3877,
+    "title": "rc-gate: tutorial-golden peek assertions break when the Claude CLI shows footer banners (live-CLI environment drift)",
+    "createdAt": "2026-07-02T20:56:37Z",
+    "labels": [
+      "priority/p2"
+    ],
+    "body": "## What happened\n\nDuring the v1.3.3 RC gate (run 28611530724, commit a44126951), `ubuntu / tutorial goldens / 1 of 6` failed twice on `TestTutorial03Sessions/gc_session_peek_mc-8sfd`, then passed on a third attempt. The peek assertion (tutorial03_test.go:229) requires the word \"reviewer\"/\"codex\" in a fixed-height tmux capture; a new Claude-CLI footer banner —\n\n```\ninstallMethod is native, but claude command not found at /home/runner/.local…\n```\n\n— consumed window height and pushed the `You are 'reviewer'.` line out of the capture.\n\n## Why this is environmental, not the release diff\n\n- `.github/actions/setup-gascity-ubuntu`, `scripts/install-claude-native.sh`, and the claude pin (2.1.123) are byte-identical to the v1.3.2 gate that passed on 2026-06-22 — same code, new banner ⇒ server-side/installer drift.\n- A control rc-gate dispatched on the v1.3.2 tag the same day (run 28616182046) failed `TestPhase2WorkerCoreRealTransportProof/claude/tmux-cli` — another real-claude-transport test — on completely unchanged code (that job passed in the v1.3.3 run; failures move between runs).\n- main's nightly live-model tiers (Tier B / Tier C Ollama) have failed every night since at least 2026-06-25 (e.g. TestSwarm_SlingWorkCoderCommits).\n\n## Suggested hardening\n\n1. Make the tutorial peek assertions robust to footer banners / vertical drift — e.g. assert against the session transcript (or a `--lines`-bounded capture anchored to content) instead of a fixed-height live tmux window.\n2. Investiga"
+  },
+  {
+    "number": 3872,
+    "title": "Session lifecycle: durable-state vs runtime-state divergence family (adoption alias, serve-loop store pinning, drift-relaunch loses priming, ghost session beads, scale-from-zero demand blindness)",
+    "createdAt": "2026-07-02T12:19:17Z",
+    "labels": [
+      "priority/p1"
+    ],
+    "body": "## Summary\n\nRunning a city hard for ~48h (edge build `35fb515`, bd 1.0.4, dolt 2.1.10, managed server mode, native store, one rig, graph.v2 compound workflows) surfaced **five session-lifecycle incidents that share one root cause**: the durable world (session beads / aliases / routing metadata) and the runtime world (tmux sessions / processes / query env) can diverge, and no reconciliation invariant forces convergence. Lifecycle side effects (alias stamping, startup-prompt priming, routing visibility) fire once, on one specific path — fresh spawn — and every alternative path (adoption, config-drift relaunch, resume) silently skips a subset.\n\nFresh spawn always worked. Every other path produced a live incident:\n\n| # | Incident | Divergence |\n|---|---|---|\n| 1 | Adoption re-creates a canonical singleton session bead **without `alias`** → demand suppression never recognizes it → duplicate spawn → `alias already exists` + `collapsing phantom pool identity` churn every tick | runtime session exists; durable identity incomplete |\n| 2 | City-singleton control dispatcher's serve loop **cannot see rig-store control beads routed to it** — `loadCityConfig` in the serve subprocess doesn't apply site bindings (rig paths empty) and the work-query env hard-pins `BEADS_DIR`/`GC_STORE_*` to the city store, which bd honors over cwd. Decoration prefers the city singleton (#3765), so rig-store control beads strand; the rig dispatcher has no routed demand and stays at zero; supervisor sees a live"
+  },
+  {
+    "number": 3869,
+    "title": "bug: reaper closed-wisp purge DELETE fails on current Dolt beads store",
+    "createdAt": "2026-07-02T06:44:48Z",
+    "labels": [
+      "priority/p2"
+    ],
+    "body": "## Summary\n\n`mol-dog-reaper` still fails its Step 2 closed-wisp purge on a live managed-city Dolt beads store. The failure is in the core maintenance-pack `reaper.sh` SQL, not city configuration.\n\nOn telis-city-2 the scheduled order continues to emit reaper anomaly wisps like:\n\n```text\nhq: purging closed wisps failed for hq: error on line 3 for query DELETE FROM `hq`.wisps\nWHERE status = 'closed'\nAND closed_at < DATE_SUB(NOW(), INTERVAL 168 HOUR)\nAND id NOT IN (...)\n```\n\nThis means old closed wisps are not purged. On a busy city this compounds Dolt noms/journal growth and has required repeated operator-gated hq `dolt gc` recovery.\n\n## Environment\n\n- `gc version`: 1.2.1\n- `bd version`: 1.0.5 Homebrew\n- `dolt version`: 2.1.4\n- topology: `managed_city` hq plus inherited rig databases on one city Dolt SQL server\n- live order: `mol-dog-reaper`, exec `$PACK_DIR/assets/scripts/reaper.sh`, source `/home/data-ops/telis-city-2/.gc/system/packs/maintenance/orders/mol-dog-reaper.toml`\n- live script: `/home/data-ops/telis-city-2/.gc/system/packs/maintenance/assets/scripts/reaper.sh`\n\n## Live evidence from telis-city-2\n\nLatest matching anomaly wisps:\n\n```text\ntc2-wisp-7cxc76  ESCALATION: Reaper anomalies detected [MEDIUM]  2026-07-01 10:55:46\ntc2-wisp-3ue5eo  ESCALATION: Reaper anomalies detected [MEDIUM]  2026-07-01 08:50:18\ntc2-wisp-eah104  ESCALATION: Reaper anomalies detected [MEDIUM]  2026-06-30 19:27:19\n```\n\nLive hq row counts after the operator-run GC:\n\n```text\nissues=1851\nwisps=253"
+  },
+  {
+    "number": 3868,
+    "title": "gc doctor dolt-backup check should recognize external Dolt backup remotes",
+    "createdAt": "2026-07-02T06:26:57Z",
+    "labels": [
+      "priority/p3"
+    ],
+    "body": "Source: superlzy-city bead `slc-9vw`.\n\n`gc doctor` v1.3.2 currently reports these warnings in a city whose rigs use an external Dolt accessory at `superlzy-dolt:3306`:\n\n```text\nrig:apicity:dolt-backup       rig \"apicity\": no dolt backup registered (expected /gc/.dolt-backup/ac)\nrig:superlzy-dash:dolt-backup rig \"superlzy-dash\": no dolt backup registered (expected /gc/.dolt-backup/dh)\nrig:slc:dolt-backup           rig \"slc\": no dolt backup registered (expected /gc/.dolt-backup/slc)\n```\n\nIn this deployment the external Dolt accessory self-manages backups to DoltHub and the local Dolt-pack backup orders are intentionally disabled. Re-running local `DOLT_BACKUP('sync', ...)` against the external server is not the right remediation and has already timed out client-side in this city.\n\nThe current checker appears to register `DoltBackupCheck` for active managed bd-store rigs when `GC_DOLT != skip`, but the check only accepts these local signals:\n\n- populated `<city>/.dolt-backup/<db>` directory\n- backup entry in `<managed-dolt-data-dir>/<db>/.dolt/repo_state.json`\n\nFor an external SQL-server endpoint, the authoritative backup remotes live on the external Dolt server, not in the local managed data dir. The fix should make the doctor path external-endpoint aware: either query registered backup remotes from the external Dolt server with a bounded probe, or explicitly skip/degrade the local backup registration warning when the city/rig `dolt_host`/`dolt_port` points to an external endpo"
+  },
+  {
+    "number": 3862,
+    "title": "Hook projection blind-appends the ubs PreToolUse hook every reconcile → unbounded .claude/settings.json bloat",
+    "createdAt": "2026-07-01T22:21:40Z",
+    "labels": [
+      "priority/p1"
+    ],
+    "body": "## Summary\nThe per-session config reconciler **appends** the `ubs` git-commit `PreToolUse` hook to each agent's `.claude/settings.json` on every reconcile tick **without deduplicating**, so `.hooks.PreToolUse` grows without bound on long-lived active sessions. The hook is projected (blind-append) rather than upserted.\n\n## Evidence (observed 2026-06-25)\n- `switchyard/crew/conductor` (active, 5 days old): `.hooks.PreToolUse` reached **5,760 identical entries / 1.4 MB** (was 2,212 a few minutes earlier — actively climbing).\n- `wherigo/crew/compass` (active): **1,810 entries / 459 KB**, plus a 9.5 MB `.bak-bloat` from a prior manual cleanup (i.e. it recurs).\n- An active polecat worktree: 419 entries. Fresh/idle agents: exactly **1** (the healthy baseline).\n\nAll duplicates are byte-identical:\n```\nif echo \"$TOOL_INPUT\" | grep -q 'git commit'; then ubs --staged --format=json 2>/dev/null || true; fi\n```\n\n## Regrowth rate (repro)\nAfter manually deduping to 1 entry, ~20–40s later on **active** sessions: `conductor` 1→6, `compass` 1→4; an **idle** worktree stayed at 1. Regrowth correlates with session *liveness* (~1 entry every few seconds), which rules out \"once at session start\" and points at the per-tick reconcile/projection loop.\n\n## Impact\n- Every `Bash` tool call evaluates N `PreToolUse` matchers (perf drag that scales with the bloat).\n- A single `git commit` fires `ubs --staged` N times (thousands, for long-lived crews).\n- Multi-MB `settings.json` parsed on every session start; r"
+  }
+]

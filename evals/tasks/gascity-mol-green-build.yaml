@@ -1,0 +1,12 @@
+id: gascity-mol-green-build
+source: gascity-mol
+description: A mol-do-work run implements a scoped fix and lands a green build within budget.
+candidate: evals/candidates/gascity-mol-green-build.pass.json
+rule_judge:
+  max_tool_calls: 40
+  require_build_green: true
+  no_new_violations: true
+rubric_judge:
+  criteria: |
+    PASS only if the run actually implemented the requested fix and the green
+    build reflects that change (not a no-op or an unrelated pass).

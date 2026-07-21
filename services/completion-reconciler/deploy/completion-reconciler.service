@@ -1,0 +1,28 @@
+[Unit]
+Description=Gas City completion reconciler
+Documentation=file://%h/gas-city/docs/conventions/completion-reconciler.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/gas-city
+Environment=PATH=%h/.local/bin:%h/go/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/usr/bin/test -x %h/gas-city/bin/completion-reconciler
+ExecStart=%h/gas-city/bin/completion-reconciler --apply --nudge-mayor --scope all
+TimeoutStartSec=10m
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/gas-city/.gc %h/gas-city/.beads %h/.gc
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+

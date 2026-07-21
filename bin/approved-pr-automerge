@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""approved-pr-automerge: enable GitHub auto-merge on PRs that passed OUR
+Codex-inclusive review.
+
+Stephanie directive (mayor gc-429887, AMENDED gc-429945): a PR may enter the
+merge queue ONLY if it passed our review setup INCLUDING a Codex adversarial pass.
+A bare GitHub APPROVED review is NOT sufficient. This NEVER merges directly — it
+only ENABLES auto-merge; GitHub merges when required checks pass.
+
+DETERMINISTIC + ZFC-clean — no semantic judgement. Per open, non-draft,
+non-conflicting, non-azanar PR with auto-merge currently off:
+
+  A) ENABLE auto-merge iff a CURRENT Codex-inclusive approve record exists:
+       a local review record .gc/pr-pipeline/reviews/pr-<N>.md that (i) is
+       Codex-inclusive (mentions `codex` — our multi-model setup ran the Codex
+       pass) AND (ii) has an overall verdict in {approve, take-the-good} (the
+       bolded token under `## Verdict`, or an explicit `verdict: …` marker), AND
+       (iii) is CURRENT — file mtime >= the PR's latest commit committedDate.
+
+  B) Else, if a CURRENT maintainer GitHub APPROVED review exists but NO Codex
+     record yet -> DO NOT enable. DISPATCH our review (a polecat runs the
+     multi-model mol-pr-review incl Codex), bounded + deduped, so a later tick
+     enables once the Codex artifact lands.
+
+  B') Else, if the PR is OUR OWN (author in SELF_AUTHORS, default sjarmak) with no
+     review record -> DISPATCH the review directly (our own PRs never receive a
+     maintainer GitHub approval, so they self-trigger). Same bounded/deduped/Codex-
+     gated path as (B); Codex approve still required before any auto-merge.
+
+  C) Else -> skip.
+
+CURRENCY is the key safety mitigation: a commit landed after the review => stale,
+never enabled (re-review needed); logged. Hard carve-out: azanar PRs never
+auto-merge. Idempotent (skips auto-merge-already-on). Squash is our style.
+
+Audit: .gc/pr-pipeline/approved-pr-automerge.log (JSONL, every enable/dispatch/skip).
+
+Usage: approved-pr-automerge [--apply] [--nudge-mayor] [--max-dispatch N] [--json]
+Env:   APPROVED_AUTOMERGE_REPO (default gastownhall/gascity)
+       APPROVED_AUTOMERGE_RIG (default gascity — bd rig for review beads)
+       APPROVED_AUTOMERGE_MAINTAINER_ASSOC (default "OWNER,MEMBER")
+       APPROVED_AUTOMERGE_SELF_AUTHORS (default sjarmak — self-trigger review)
+       APPROVED_AUTOMERGE_POLECAT (default /home/ds/gascity/polecat)
+"""
+import sys, os, re, json, time, glob, subprocess
+
+CITY = "/home/ds/gas-city"
+AUDIT_LOG = os.path.join(CITY, ".gc", "pr-pipeline", "approved-pr-automerge.log")
+REVIEWS_DIR = os.path.join(CITY, ".gc", "pr-pipeline", "reviews")
+REPO = os.environ.get("APPROVED_AUTOMERGE_REPO",
+                      os.environ.get("ISSUE_HYGIENE_REPO", "gastownhall/gascity"))
+MAINTAINER_ASSOC = set(os.environ.get("APPROVED_AUTOMERGE_MAINTAINER_ASSOC",
+                                      "OWNER,MEMBER").split(","))
+# Authors whose PRs must NEVER be auto-merged regardless of approval — a hard
+# carve-out (azanar: review/approve as normal but never merge; park for Julian).
+NEVER_AUTHORS = set(a for a in os.environ.get("APPROVED_AUTOMERGE_NEVER_AUTHORS",
+                                              "azanar").split(",") if a)
+POLECAT = os.environ.get("APPROVED_AUTOMERGE_POLECAT", "/home/ds/gascity/polecat")
+# OUR OWN authors — PRs we authored never receive a maintainer GitHub approval, so
+# they self-trigger the review path (entry-trigger, Stephanie directive 2026-07-03).
+# Codex approve is still required before any auto-merge; azanar (NEVER_AUTHORS) wins.
+SELF_AUTHORS = set(a for a in os.environ.get("APPROVED_AUTOMERGE_SELF_AUTHORS",
+                                             "sjarmak").split(",") if a)
+# Rig whose bd store holds the merge-queue review beads (dispatch target). Default
+# gascity; a packs instance sets APPROVED_AUTOMERGE_RIG=gascity-packs.
+RIG = os.environ.get("APPROVED_AUTOMERGE_RIG", "gascity")
+# Review-record filename prefix, namespaced per repo so gascity (#1300+) and packs
+# (#<200) can't collide in the shared REVIEWS_DIR. Default repo keeps the bare
+# "pr-<N>.md" for backward-compat with existing records; others get "pr-<slug>-<N>.md".
+_DEFAULT_REPO = "gastownhall/gascity"
+if REPO == _DEFAULT_REPO:
+    RECORD_PREFIX = "pr-"
+else:
+    _slug = REPO.split("/")[-1]
+    _slug = _slug[len("gascity-"):] if _slug.startswith("gascity-") else _slug
+    RECORD_PREFIX = f"pr-{_slug}-"
+DEFAULT_MAX_DISPATCH = 3
+# Approve verdict tokens (the bolded token under `## Verdict`, or a verdict: marker).
+APPROVE_VERDICTS = {"approve", "approved", "take-the-good", "take_the_good", "takethegood"}
+VERDICT_HEADER_RE = re.compile(r"##\s*Verdict\s*\n+\s*\*\*([a-z_-]+)\*\*", re.IGNORECASE)
+VERDICT_MARK_RE = re.compile(r"\bverdict\s*[:=]\s*([a-z_-]+)", re.IGNORECASE)
+CODEX_RE = re.compile(r"codex", re.IGNORECASE)
+
+
+def gh_json(args, timeout=90):
+    try:
+        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+        return json.loads(out.stdout) if out.returncode == 0 else None
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def latest_commit_date(commits):
+    dates = [c.get("committedDate") for c in (commits or []) if c.get("committedDate")]
+    return max(dates) if dates else None
+
+
+def github_approval(reviews):
+    """submittedAt of the most recent maintainer APPROVED review, or None."""
+    appr = [r.get("submittedAt") for r in (reviews or [])
+            if r.get("state") == "APPROVED" and r.get("authorAssociation") in MAINTAINER_ASSOC
+            and r.get("submittedAt")]
+    return max(appr) if appr else None
+
+
+def record_verdict(text):
+    """The overall verdict token from a review record (## Verdict bolded token,
+    else a `verdict:` marker), lowercased, or None."""
+    m = VERDICT_HEADER_RE.search(text) or VERDICT_MARK_RE.search(text)
+    return m.group(1).lower() if m else None
+
+
+def review_record(pr):
+    """(codex_record_exists, codex_approve_mtime|None). codex_record_exists is True
+    iff a Codex-inclusive review record exists (any verdict — a Codex pass ran).
+    codex_approve_mtime is its ISO mtime iff that record's verdict is an approve
+    verdict; else None. A non-Codex record reads as no Codex review (-> dispatch)."""
+    path = os.path.join(REVIEWS_DIR, f"{RECORD_PREFIX}{pr}.md")
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return (False, None)
+    if not CODEX_RE.search(text):
+        return (False, None)  # record exists but Codex did not run -> needs Codex review
+    if record_verdict(text) in APPROVE_VERDICTS:
+        return (True, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.path.getmtime(path))))
+    return (True, None)  # Codex reviewed, verdict not approve -> do not enable, do not re-dispatch
+
+
+def inflight_review_prs():
+    """Set of PR numbers with an open Codex-review-for-merge-queue bead (dedup)."""
+    try:
+        out = subprocess.run(
+            ["gc", "bd", "--rig", RIG, "list", "--status", "open", "--json", "--limit", "0"],
+            capture_output=True, text=True, timeout=60).stdout
+        beads = json.loads(out or "[]")
+        beads = beads if isinstance(beads, list) else beads.get("issues", [])
+        prs = set()
+        for b in beads:
+            m = re.search(r"Codex review for merge-queue: PR #(\d+)", b.get("title") or "")
+            if m:
+                prs.add(int(m.group(1)))
+        return prs
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return set()
+
+
+CODEX_LOG_GLOB = os.path.expanduser("~/.codex/sessions/*/*/*/*.jsonl")
+PRIMARY_RE = re.compile(r'"primary":\{"used_percent":([0-9.]+),"window_minutes":\d+,"resets_at":(\d+)\}')
+
+
+def codex_limited():
+    """(limited, reset_ts). Reads the CURRENT primary rate-limit window from recent
+    codex session logs (quota-free — no Codex call). Scans the freshest several logs
+    (a session's primary line may be absent, so the single freshest file isn't
+    enough), takes the latest window (max resets_at) and its max used_percent.
+    Limited iff used_percent >= 99 AND now < resets_at. Fail-open: nothing readable
+    -> (False, None) so dispatch proceeds (we defer only on a positive detection)."""
+    base = os.path.expanduser("~/.codex/sessions")
+    dirs = [os.path.join(base, time.strftime("%Y/%m/%d", time.localtime(time.time() - off)))
+            for off in (0, 86400)]  # today + yesterday (a 5h window can't span more)
+    dirs = [d for d in dirs if os.path.isdir(d)]
+    if not dirs:
+        return (False, None)
+    try:
+        out = subprocess.run(
+            ["grep", "-rhoE",
+             r'"primary":\{"used_percent":[0-9.]+,"window_minutes":[0-9]+,"resets_at":[0-9]+\}', *dirs],
+            capture_output=True, text=True, timeout=30).stdout
+    except (subprocess.SubprocessError, OSError):
+        return (False, None)
+    best_reset, best_used = 0, 0.0
+    for m in PRIMARY_RE.finditer(out):
+        used, reset = float(m.group(1)), int(m.group(2))
+        if reset > best_reset:
+            best_reset, best_used = reset, used    # newer window
+        elif reset == best_reset:
+            best_used = max(best_used, used)        # same window, higher fill
+    if not best_reset:
+        return (False, None)
+    return (best_used >= 99.0 and int(time.time()) < best_reset, best_reset)
+
+
+def blocked_review_beads():
+    """[(bead_id, pr)] for status=blocked Codex-review-for-merge-queue beads —
+    the ones stuck on a prior Codex-limit hit, to re-nudge once Codex is back."""
+    out = []
+    try:
+        raw = subprocess.run(
+            ["gc", "bd", "--rig", RIG, "list", "--status", "blocked", "--json", "--limit", "0"],
+            capture_output=True, text=True, timeout=60).stdout
+        beads = json.loads(raw or "[]")
+        beads = beads if isinstance(beads, list) else beads.get("issues", [])
+        for b in beads:
+            m = re.search(r"Codex review for merge-queue: PR #(\d+)", b.get("title") or "")
+            if m:
+                out.append((b.get("id"), int(m.group(1))))
+    except (subprocess.SubprocessError, OSError, ValueError):
+        pass
+    return out
+
+
+def dispatch_review(pr, title):
+    """Sling a mol-pr-review (multi-model incl Codex) bead for pr. Returns bead id or ''."""
+    record_path = os.path.join(REVIEWS_DIR, f"{RECORD_PREFIX}{pr}.md")
+    body = (f"Run our upstream review path mol-pr-review (multi-model, INCLUDING the Codex "
+            f"adversarial pass) on {REPO} PR #{pr} ({title}). Write the review "
+            f"record to the ABSOLUTE path {record_path} with a `## Verdict` section (bolded "
+            f"verdict token) and the per-model line including Codex. The approved-pr-automerge "
+            f"order will enable auto-merge on the next tick IF the verdict is approve/take-the-good "
+            f"and the Codex pass ran. Do NOT merge or enable auto-merge yourself.")
+    try:
+        create = subprocess.run(
+            ["gc", "bd", "--rig", RIG, "create", f"Codex review for merge-queue: PR #{pr}",
+             "--description", body, "-l", "merge-queue-review"],
+            capture_output=True, text=True, timeout=60)
+        # Extract the created bead id by pattern (the create output is prose, NOT
+        # "id last"); .split()[-1] grabbed a title word and the sling never routed.
+        m = re.search(r"gc-[a-z0-9]+", create.stdout) if create.returncode == 0 else None
+        bid = m.group(0) if m else ""
+        if bid:
+            subprocess.run(["gc-sling", POLECAT, bid, "--no-formula", "--nudge"],
+                           capture_output=True, timeout=60)
+        return bid
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def main():
+    argv = sys.argv[1:]
+    apply = "--apply" in argv
+    nudge = "--nudge-mayor" in argv
+    json_out = "--json" in argv
+    max_dispatch = int(argv[argv.index("--max-dispatch") + 1]) if "--max-dispatch" in argv else DEFAULT_MAX_DISPATCH
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+
+    prs = gh_json(["pr", "list", "--repo", REPO, "--state", "open", "--limit", "200",
+                   "--json", "number,isDraft,mergeable,autoMergeRequest,author"])
+    if prs is None:
+        print("approved-pr-automerge: gh pr list failed", file=sys.stderr)
+        return 1
+    inflight = inflight_review_prs()
+    cdx_limited, cdx_reset = codex_limited()
+
+    enabled, dispatched, deferred, resumed, skipped = [], [], [], [], []
+    budget = max_dispatch
+    for p in prs:
+        n = p["number"]
+        if p.get("isDraft") or p.get("autoMergeRequest") is not None or p.get("mergeable") == "CONFLICTING":
+            continue  # not a candidate (draft / already-on / conflicting) — silent
+        author = (p.get("author") or {}).get("login", "")
+        if author in NEVER_AUTHORS:
+            skipped.append({"pr": n, "why": "never-automerge-author", "author": author})
+            continue  # hard carve-out (e.g. azanar) — never auto-merge even if approved
+        detail = gh_json(["pr", "view", str(n), "--repo", REPO, "--json", "reviews,commits,title"])
+        if detail is None:
+            skipped.append({"pr": n, "why": "detail-unreadable"})
+            continue
+        title = (detail.get("title") or "")[:70]
+        latest = latest_commit_date(detail.get("commits"))
+        codex_exists, codex_mtime = review_record(n)
+
+        # A) CURRENT Codex-inclusive approve record -> ENABLE auto-merge.
+        if codex_mtime:
+            if latest and codex_mtime < latest:
+                skipped.append({"pr": n, "why": "stale-codex-approval",
+                                "approval": codex_mtime, "latest_commit": latest})
+                continue
+            rec = {"pr": n, "source": "codex-review", "approval_ts": codex_mtime,
+                   "latest_commit": latest, "title": title}
+            if apply:
+                rc = subprocess.run(["gh", "pr", "merge", str(n), "--repo", REPO, "--squash", "--auto"],
+                                    capture_output=True, text=True, timeout=60)
+                (enabled if rc.returncode == 0 else skipped).append(
+                    rec if rc.returncode == 0 else {**rec, "why": "gh-merge-auto-failed",
+                                                    "err": rc.stderr.strip()[:160]})
+            else:
+                enabled.append(rec)
+            continue
+
+        # B) CURRENT maintainer GitHub approval but NO Codex approve record.
+        gh_appr = github_approval(detail.get("reviews"))
+        if gh_appr:
+            if latest and gh_appr < latest:
+                skipped.append({"pr": n, "why": "stale-github-approval",
+                                "approval": gh_appr, "latest_commit": latest})
+            elif codex_exists:  # Codex reviewed, verdict not approve -> don't enable, don't re-dispatch
+                skipped.append({"pr": n, "why": "codex-reviewed-not-approve"})
+            elif n in inflight:  # a Codex review is already dispatched -> wait
+                skipped.append({"pr": n, "why": "codex-review-in-flight"})
+            elif cdx_limited:  # Codex usage-limited -> defer (do NOT churn new reviews)
+                deferred.append({"pr": n, "title": title})
+            elif budget > 0:  # github-approved, no Codex review yet -> dispatch one
+                bid = dispatch_review(n, title) if apply else "(dry-run)"
+                dispatched.append({"pr": n, "title": title, "bead": bid})
+                budget -= 1
+            else:
+                skipped.append({"pr": n, "why": "dispatch-budget-exhausted"})
+            continue
+
+        # B') OUR OWN PRs (self-authored): no maintainer GitHub approval will ever
+        # arrive, so trigger the review directly — same bounded / deduped / Codex-
+        # gated path as (B), keyed on authorship instead of a GH approval. Codex
+        # approve is still required before any auto-merge (path A); azanar excluded
+        # above. Stephanie directive 2026-07-03 (entry-trigger, option a).
+        if author in SELF_AUTHORS:
+            if codex_exists:  # Codex reviewed, verdict not approve -> don't re-dispatch
+                skipped.append({"pr": n, "why": "codex-reviewed-not-approve"})
+            elif n in inflight:  # a Codex review is already dispatched -> wait
+                skipped.append({"pr": n, "why": "codex-review-in-flight"})
+            elif cdx_limited:  # Codex usage-limited -> defer (no churn)
+                deferred.append({"pr": n, "title": title})
+            elif budget > 0:  # our own PR, no review yet -> dispatch one
+                bid = dispatch_review(n, title) if apply else "(dry-run)"
+                dispatched.append({"pr": n, "title": title, "bead": bid, "trigger": "self-authored"})
+                budget -= 1
+            else:
+                skipped.append({"pr": n, "why": "dispatch-budget-exhausted"})
+            continue
+        # C) no approval at all, not ours -> skip silently
+
+    # AUTO-RESUME: once Codex is back, re-nudge blocked merge-queue reviews. The
+    # inflight dedup means a blocked review never resumes on its own; re-slinging it
+    # (--no-formula --nudge) wakes a polecat to retry now that the limit reset.
+    # Capped per tick; only when NOT limited.
+    if not cdx_limited:
+        for bid, pr in blocked_review_beads()[:max_dispatch]:
+            if apply and bid:
+                subprocess.run(["gc-sling", POLECAT, bid, "--no-formula", "--nudge"],
+                               capture_output=True, timeout=60)
+            resumed.append({"bead": bid, "pr": pr})
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    summary = {"ts": now, "repo": REPO, "open_prs": len(prs), "enabled": len(enabled),
+               "dispatched_codex_review": len(dispatched), "deferred_codex_limited": len(deferred),
+               "resumed_blocked": len(resumed), "codex_limited": cdx_limited,
+               "codex_reset_ts": cdx_reset,
+               "skipped_stale": sum(1 for s in skipped if s.get("why", "").startswith("stale-")),
+               "apply": apply}
+    try:
+        os.makedirs(os.path.dirname(AUDIT_LOG), exist_ok=True)
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps({**summary, "enabled_detail": enabled, "dispatched": dispatched,
+                                "deferred": deferred, "resumed": resumed, "skipped": skipped}) + "\n")
+    except OSError:
+        pass
+
+    # Defer-nudge dedup: while Codex is limited every tick would re-report the same
+    # defer; nudge about it once per reset window (track the last-nudged reset_ts).
+    DEFER_STATE = os.path.join(CITY, ".gc", "approved-pr-automerge-defer-nudged.txt")
+    last_defer = ""
+    try:
+        with open(DEFER_STATE) as f:
+            last_defer = f.read().strip()
+    except OSError:
+        pass
+    new_defer = bool(deferred) and str(cdx_reset) != last_defer
+    if apply and deferred:
+        try:
+            with open(DEFER_STATE, "w") as f:
+                f.write(str(cdx_reset))
+        except OSError:
+            pass
+
+    if nudge and (enabled or dispatched or resumed or new_defer):
+        verb = "ENABLED auto-merge on" if apply else "would enable auto-merge on"
+        lines = [f"approved-pr-automerge: {verb} {len(enabled)} Codex-approved PR(s); "
+                 f"{'dispatched' if apply else 'would dispatch'} {len(dispatched)} Codex review(s)."]
+        if cdx_limited:
+            rt = time.strftime("%H:%M UTC", time.gmtime(cdx_reset)) if cdx_reset else "?"
+            lines.append(f"CODEX RATE-LIMITED (resets ~{rt}): DEFERRED {len(deferred)} new review(s) "
+                         f"this tick (no churn). Enabling already-Codex-approved PRs continues.")
+        if resumed:
+            lines.append(f"RESUMED {len(resumed)} blocked review(s) (Codex back): "
+                         + ", ".join(f"#{r['pr']}" for r in resumed))
+        lines += [f"  ENABLE #{e['pr']} (Codex-approved {e['approval_ts']})  {e['title']}" for e in enabled]
+        lines += [f"  DISPATCH-review #{d['pr']}  {d['title']}" for d in dispatched]
+        stale = [s for s in skipped if s.get("why", "").startswith("stale-")]
+        if stale:
+            lines.append("Stale-skip (commit after approval): " + ", ".join(f"#{s['pr']}" for s in stale))
+        subprocess.run(["gc", "mail", "send", "mayor", "-s",
+                        f"approved-pr-automerge: {len(enabled)} enabled, {len(dispatched)} dispatched, "
+                        f"{len(deferred)} codex-deferred, {len(resumed)} resumed",
+                        "-m", "\n".join(lines)], capture_output=True, timeout=30)
+
+    if json_out:
+        print(json.dumps({"summary": summary, "enabled": enabled,
+                          "dispatched": dispatched, "skipped": skipped}, indent=2))
+        return 0
+    mode = "APPLY" if apply else "DRY-RUN"
+    cstate = ("CODEX-LIMITED (reset " + (time.strftime("%H:%MZ", time.gmtime(cdx_reset)) if cdx_reset else "?") + ")") if cdx_limited else "codex-ok"
+    print(f"approved-pr-automerge ({mode})  repo={REPO}  open={len(prs)}  {cstate}  enabled={len(enabled)}  "
+          f"dispatched={len(dispatched)}  deferred={len(deferred)}  resumed={len(resumed)}  "
+          f"stale-skip={summary['skipped_stale']}")
+    for e in enabled:
+        print(f"  {'ENABLED' if apply else 'would-enable'}: #{e['pr']} [Codex-approved @ {e['approval_ts']}]  {e['title']}")
+    for d in dispatched:
+        print(f"  {'dispatched' if apply else 'would-dispatch'} Codex review: #{d['pr']}  {d['title']}")
+    for s in skipped:
+        if s.get("why", "").startswith("stale-"):
+            print(f"  skip {s['why']}: #{s['pr']} (approved {s.get('approval')} < commit {s.get('latest_commit')})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

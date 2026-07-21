@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# gc-focus: convenience wrapper to sling a /focus invocation to a rig.
+# Usage: gc-focus <rig> <bead-id>
+# Example: gc-focus codeprobe cp-a3f2
+#
+# Picks claude-1 as default agent. Use GC_FOCUS_AGENT to override.
+set -euo pipefail
+
+RIG="${1:?Usage: gc-focus <rig> <bead-id>}"
+BEAD="${2:?Usage: gc-focus <rig> <bead-id>}"
+AGENT="${GC_FOCUS_AGENT:-claude-1}"
+
+exec gc sling --no-formula "${RIG}/${AGENT}" "Run /focus ${BEAD}"

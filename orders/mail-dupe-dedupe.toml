@@ -1,0 +1,6 @@
+[order]
+description = "Hourly: archive duplicate mayor-addressed message beads (same recipient + subject + body sha). Keeps newest in each group; suppresses recurring escalator spam without hiding new anomaly content. Triggered by mol-dog-reaper firing 'ESCALATION: Reaper anomalies detected [MEDIUM]' every 30m for backlog conditions that require upstream schema migration (dependencies table split target columns; ≥15 rigs)."
+trigger = "cooldown"
+interval = "1h"
+exec = "/home/ds/gas-city/bin/mail-dupe-dedupe"
+timeout = "5m"

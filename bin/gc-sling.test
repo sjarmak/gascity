@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# Regression test for gc-sling's city HQ routing behavior (dr-h6ze).
+#
+# The source bug was fixed upstream by making `gc sling` resolve the selected
+# bead store from its authoritative on-disk identity instead of ambient
+# GC_BEADS. The floor-local wrapper must therefore remain a pass-through: a
+# reintroduced `GC_BEADS=bd` override would hide regressions in the source fix
+# and revive the persistent-provider divergence this wrapper must avoid.
+#
+# Strategy: stub `gc` on PATH and record the provider environment seen by every
+# `gc sling` call. The stub models the corrected source behavior: routing is
+# authoritative and independent of the ambient provider.
+#
+# Asserts:
+#   1. dr- bead    -> stub `gc sling` sees ambient GC_BEADS=file and routes
+#   2. non-dr bead -> stub `gc sling` sees GC_BEADS=file AND result=ROUTED
+#                     (ambient provider untouched for every bead)
+#   3. dr- bead    -> default --nudge is still injected (existing contract kept)
+#   4. dr- bead    -> no stray per-rig worktree is created
+#
+# dr-vn1i AC1 — authoritative per-rig base ref (resolve_authoritative_base), the
+# two-slot RED fixture. Sources the REAL helper (GC_SLING_LIB_ONLY=1 seam, no
+# logic copy => no drift) and asserts:
+#   5a. TWO SLOTS whose MUTABLE local default branch sits at DIFFERENT commits
+#       both resolve to the SAME pinned upstream SHA (the split-base bug).
+#   5b. a configured-but-unresolvable ref FAILS CLOSED (rc 3).
+#   5c. an unconfigured rig falls through to the default branch (rc 0, fail-open).
+#
+# Run:  bash /home/ds/gas-city/bin/gc-sling.test
+
+set -uo pipefail
+
+SLING="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gc-sling"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+TARGET="city-infra-polecat"
+SLING_LOG="$WORK/sling.log"
+
+# --- fixture intercept config: rules:[] exercises the REAL live code path ------
+# (empty ruleset => id/title match miss => the terminal `exec ... gc sling`,
+# which is exactly the exec the fix patches).
+CFG="$WORK/sling-intercept.yaml"
+printf 'rules: []\n' > "$CFG"
+
+# --- stub `gc` on PATH --------------------------------------------------------
+STUB="$WORK/stubbin"
+mkdir -p "$STUB"
+cat > "$STUB/gc" <<EOF
+#!/usr/bin/env bash
+# Minimal gc stub for gc-sling.test. Records sling calls and models corrected
+# authoritative store resolution, which is independent of ambient GC_BEADS.
+SLING_LOG="$SLING_LOG"
+TARGET="$TARGET"
+EOF
+cat >> "$STUB/gc" <<'EOF'
+sub="${1:-}"; shift || true
+case "$sub" in
+  session)
+    # `gc session list --json` -> one live session for TARGET so the dead-target
+    # guard sees a claimant and stays quiet. The session's work_dir defaults to
+    # the (non-git) city root path but can be pointed at a real git checkout via
+    # STUB_SESSION_WORKDIR, to exercise the worktree guard (assertion 4).
+    if [[ "${1:-}" == "list" ]]; then
+      wd="${STUB_SESSION_WORKDIR:-/home/ds/gas-city/$TARGET}"
+      printf '{"sessions":[{"template":"/home/ds/gas-city/%s","work_dir":"%s","state":"idle"}]}\n' "$TARGET" "$wd"
+    fi
+    ;;
+  rig)
+    [[ "${1:-}" == "list" ]] && printf '{"rigs":[]}\n'
+    ;;
+  bd)
+    # Title-lookup path. Emit a bead so a title exists; rules:[] means it is
+    # never matched, but the call must not error.
+    printf '[{"id":"stub","title":"stub bead"}]\n'
+    ;;
+  sling)
+    # bead = the SECOND positional (first is the target, which itself contains
+    # dashes — e.g. city-infra-polecat — so a "first token with a dash" scan would
+    # wrongly grab the target). The test never passes value-taking flags, so a
+    # plain positional counter over non-flag args is sufficient.
+    bead=""; pos=0
+    for a in "$@"; do
+      [[ "$a" == -* ]] && continue
+      pos=$((pos + 1))
+      [[ $pos -eq 2 ]] && { bead="$a"; break; }
+    done
+    gcb="${GC_BEADS:-unset}"
+    nudged="no"; for a in "$@"; do [[ "$a" == "--nudge" ]] && nudged="yes"; done
+    printf 'ROUTED bead=%s GC_BEADS=%s nudge=%s\n' "$bead" "$gcb" "$nudged" >> "$SLING_LOG"
+    exit 0
+    ;;
+esac
+exit 0
+EOF
+chmod +x "$STUB/gc"
+
+run_sling() { # run_sling <bead>
+  PATH="$STUB:$PATH" \
+  GC_BEADS=file \
+  GC_SLING_NO_WORKTREE=1 \
+  GC_SLING_INTERCEPT_CONFIG="$CFG" \
+  GC_SLING_INTERCEPT_LOG="$WORK/intercept.log" \
+    bash "$SLING" "$TARGET" "$1" >/dev/null 2>&1
+}
+
+# run_sling_wt <bead> <session-workdir> : worktree guard ENABLED (no
+# GC_SLING_NO_WORKTREE), with the target session rooted at a real git checkout.
+run_sling_wt() {
+  PATH="$STUB:$PATH" \
+  GC_BEADS=file \
+  STUB_SESSION_WORKDIR="$2" \
+  GC_SLING_INTERCEPT_CONFIG="$CFG" \
+  GC_SLING_INTERCEPT_LOG="$WORK/intercept.log" \
+    bash "$SLING" "$TARGET" "$1" >/dev/null 2>&1
+}
+
+fail() { echo "FAIL: $1" >&2; echo "  sling.log:"; sed 's/^/    /' "$SLING_LOG" 2>/dev/null >&2; exit 1; }
+
+# --- assertion 1: dr- bead keeps ambient provider; source resolves the store ----
+: > "$SLING_LOG"
+run_sling "dr-80uo"
+line=$(grep 'bead=dr-80uo' "$SLING_LOG" 2>/dev/null | head -1)
+[[ -n "$line" ]] || fail "no sling recorded for dr-80uo"
+[[ "$line" == ROUTED* ]] || fail "dr- bead did not route: $line"
+[[ "$line" == *"GC_BEADS=file"* ]] || fail "dr- sling overrode ambient provider: $line"
+
+# --- assertion 2: non-dr bead keeps the ambient provider (no over-broadening) --
+: > "$SLING_LOG"
+run_sling "gc-abc12"
+line=$(grep 'bead=gc-abc12' "$SLING_LOG" 2>/dev/null | head -1)
+[[ -n "$line" ]] || fail "no sling recorded for gc-abc12"
+[[ "$line" == ROUTED* ]] || fail "non-dr bead did not route: $line"
+[[ "$line" == *"GC_BEADS=file"* ]] || fail "non-dr sling had provider overridden (over-broad): $line"
+
+# --- assertion 3: dr- bead still gets the default --nudge injection ------------
+: > "$SLING_LOG"
+run_sling "dr-80uo"
+line=$(grep 'bead=dr-80uo' "$SLING_LOG" 2>/dev/null | head -1)
+[[ "$line" == *"nudge=yes"* ]] || fail "dr- sling lost default --nudge injection: $line"
+
+# --- assertion 4: worktree guard cuts NO stray worktree for a dr- bead --------
+# The guard runs before the store fix and, absent the dr- short-circuit, would
+# resolve rig "dr" (not a real rig), silently no-op its metadata writes, and —
+# when the target session sits inside a real rig checkout — cut a stray per-bead
+# worktree under THAT repo for a city-HQ tracking bead (code-reviewer, dr-h6ze).
+# Set up a real git checkout as the session work_dir, run with the guard ENABLED,
+# and assert (a) the bead still routes via the bd store and (b) no
+# <repo>-<beadshort> worktree was created.
+GITREPO="$WORK/rigcheckout"
+git init -q -b main "$GITREPO"
+git -C "$GITREPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+: > "$SLING_LOG"
+run_sling_wt "dr-80uo" "$GITREPO"
+line=$(grep 'bead=dr-80uo' "$SLING_LOG" 2>/dev/null | head -1)
+[[ "$line" == ROUTED*"GC_BEADS=file"* ]] || fail "dr- sling broke or overrode provider with worktree guard enabled: $line"
+[[ ! -e "${GITREPO}-80uo" ]] || fail "stray worktree cut for dr- bead under rig checkout: ${GITREPO}-80uo"
+[[ -z "$(git -C "$GITREPO" worktree list --porcelain 2>/dev/null | grep -F '80uo')" ]] \
+  || fail "dr- bead registered a worktree in the rig checkout"
+
+# --- dr-vn1i AC1: authoritative per-rig base ref (resolve_authoritative_base) --
+# The two-slot RED fixture. A worktree cut from a MUTABLE local branch drifts as
+# that branch moves; the authoritative base must stay pinned to the resolved
+# remote-tracking SHA regardless. We test the REAL helper (sourced via the
+# GC_SLING_LIB_ONLY seam) so the fixture can never drift from shipped logic.
+
+# rab <rig> <toplevel> <default_branch> -> echoes "<rc>\t<stdout>" of the real helper.
+# The helper runs in a bash -c subshell (source sets `set -euo pipefail`, isolated
+# from this file's `set -uo pipefail`); rc 3 (fail-closed) is captured via `|| _rc`.
+rab() {
+  local _rc=0 _out
+  _out=$(GC_SLING_LIB_ONLY=1 GC_SLING_BASE_REFS_CONF="$BRC" \
+         bash -c 'source "$0"; resolve_authoritative_base "$1" "$2" "$3"' \
+         "$SLING" "$1" "$2" "$3" 2>/dev/null) || _rc=$?
+  printf '%s\t%s' "$_rc" "$_out"
+}
+
+# Canonical "upstream" with two commits — the authoritative base.
+UP="$WORK/upstream"
+git init -q -b main "$UP"
+git -C "$UP" -c user.email=t@t -c user.name=t commit -q --allow-empty -m up1
+git -C "$UP" -c user.email=t@t -c user.name=t commit -q --allow-empty -m up2
+UP_SHA=$(git -C "$UP" rev-parse HEAD)
+
+# Two pool slots: independent clones with an 'upstream' remote pointing at UP.
+SLOT1="$WORK/slot1"; SLOT2="$WORK/slot2"
+for s in "$SLOT1" "$SLOT2"; do
+  git clone -q "$UP" "$s"
+  git -C "$s" remote rename origin upstream
+  git -C "$s" fetch -q upstream
+done
+# Drive each slot's MUTABLE local main to a DIFFERENT commit (the split-base bug:
+# identical dispatches would otherwise start from whatever the local branch holds).
+git -C "$SLOT1" -c user.email=t@t -c user.name=t commit -q --allow-empty -m slot1-drift
+git -C "$SLOT2" -c user.email=t@t -c user.name=t commit -q --allow-empty -m slot2-a
+git -C "$SLOT2" -c user.email=t@t -c user.name=t commit -q --allow-empty -m slot2-b
+[[ "$(git -C "$SLOT1" rev-parse main)" != "$(git -C "$SLOT2" rev-parse main)" ]] \
+  || fail "AC1 setup: the two slots' local mains should differ"
+
+BRC="$WORK/base.conf"
+
+# --- assertion 5a: two divergent slots resolve to the SAME pinned upstream SHA -
+printf 'testrig upstream/main\n' > "$BRC"
+r1=$(rab testrig "$SLOT1" main); rc1="${r1%%$'\t'*}"; out1="${r1#*$'\t'}"
+r2=$(rab testrig "$SLOT2" main); rc2="${r2%%$'\t'*}"; out2="${r2#*$'\t'}"
+[[ "$rc1" == 0 && "$rc2" == 0 ]] || fail "AC1a: authoritative resolve returned nonzero (rc1=$rc1 rc2=$rc2)"
+sha1=$(awk '{print $3}' <<<"$out1"); sha2=$(awk '{print $3}' <<<"$out2")
+committish1=$(awk '{print $1}' <<<"$out1"); ref1=$(awk '{print $2}' <<<"$out1")
+[[ "$sha1" == "$UP_SHA" && "$sha2" == "$UP_SHA" ]] \
+  || fail "AC1a: slots did not pin to upstream SHA (sha1=$sha1 sha2=$sha2 want=$UP_SHA)"
+[[ "$sha1" == "$sha2" ]] || fail "AC1a: two slots resolved DIFFERENT base SHAs ($sha1 vs $sha2) — split-base bug"
+[[ "$committish1" == "$UP_SHA" ]] || fail "AC1a: worktree committish is not the pinned SHA (got '$committish1')"
+[[ "$ref1" == "upstream/main" ]] || fail "AC1a: recorded base ref is not the authoritative ref (got '$ref1')"
+
+# --- assertion 5b: configured-but-unresolvable ref FAILS CLOSED (rc 3) ---------
+printf 'testrig upstream/does-not-exist\n' > "$BRC"
+rb=$(rab testrig "$SLOT1" main); rcb="${rb%%$'\t'*}"
+[[ "$rcb" == 3 ]] || fail "AC1b: unresolvable configured base did not fail closed (rc=$rcb, want 3)"
+
+# --- assertion 5c: unconfigured rig falls through to default branch (rc 0) -----
+printf 'testrig upstream/main\n' > "$BRC"   # entry exists for testrig, NOT otherrig
+rc=$(rab otherrig "$SLOT1" main); rcc="${rc%%$'\t'*}"; outc="${rc#*$'\t'}"
+[[ "$rcc" == 0 ]] || fail "AC1c: unconfigured rig did not fall through (rc=$rcc)"
+[[ "$(awk '{print $1}' <<<"$outc")" == "main" ]] \
+  || fail "AC1c: unconfigured rig base is not the default branch (got '$outc')"
+
+echo "PASS: provider/nudge/no-stray-worktree contract holds, and resolve_authoritative_base pins two divergent slots to one upstream SHA, fails closed on an unresolvable ref, and falls through for unconfigured rigs"

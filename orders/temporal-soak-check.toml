@@ -1,0 +1,75 @@
+# temporal-soak-check — measure the P5 Temporal-only soak by OUTCOME.
+# Order name comes from the file basename: temporal-soak-check.
+#
+# Created 2026-07-16. Authority: Stephanie, in-session (approved the gc-4zf
+# epic-review actions; this was recommendation #2 of five).
+#
+# Why: gc-372's P5 gate is "one clean week of Temporal-only operation" and
+# NOTHING measured it. The week started 2026-07-16 and its verdict rested on a
+# human happening to read journals. That is the exact hole the parent epic
+# (gc-4zf) exists to study: on 07-16 every liveness signal was green — systemd
+# active, workflows reporting Completed, worker healthy — while ZERO work
+# dispatched for hours. Worse, a failed cycle erases its own evidence: the next
+# fire gets a fresh per-fire cycleKey and looks perfectly healthy, so a silent
+# drop inside the soak week would leave the gate reading "clean". A gate nobody
+# measures is not a gate.
+#
+# It checks what came OUT, not what is UP:
+#   schedule-paused / schedule-missing  the pipeline is off
+#   workflow-failed                     gc-4zf.4's signature; escalates nothing today
+#   no-recent-fire                      "fired within 2x its cadence?" (gc-qo3's 10-day blind spot)
+#   orphan-bead                         open + routed_to unset = a dropped dispatch
+#   nothing-flowing                     cycles Completed, zero beads out — the 07-16 shape
+#
+# Read-only and idempotent: every call is a query (temporal schedule describe /
+# workflow list / workflow show, gc bd list). It reports and never repairs — it
+# does not re-arm the schedule, close beads, or quarantine claims. A red soak is
+# Stephanie's call, same contract as Track B's harness (gc-4zf.2) and
+# city-selftest. Fail-open on timeout (gastownhall/gascity#2893): a killed run
+# escalates nothing and the next tick retries.
+#
+# Cadence: 2h, matching the 120m schedule. A daily check would bound detection
+# at 24h; the epic's headline metric IS detection latency (07-16's was infinite),
+# so paying ~0.6s every 2h to bound it at ~2-4h is the cheap side of that trade.
+# Dedup keeps it quiet: silent while green, at most one re-alert/day while red,
+# and an immediate re-alert when the evidence CHANGES (a new failed cycle while
+# an old one is still red would otherwise be masked).
+#
+# Timeout math: MAX_SHOW=12 result fetches x CALL_TIMEOUT=10s = 120s worst case,
+# plus schedule+list+bd (3 x 10s) = 150s, under the 300s order timeout. Measured
+# runtime against the live soak: 0.6s. Raising MAX_SHOW or CALL_TIMEOUT without
+# raising `timeout` would let a hung Temporal eat the order and escalate nothing
+# — the exact silent-failure shape this order exists to catch.
+#
+# Escalation: posts to #gascity-maintenance (C0B25SS12CD), same channel and
+# mechanism as stall-watch and city-selftest, plus a mayor nudge.
+#
+# Regression cover: bin/temporal-soak-check.test (24 assertions; every check has
+# a RED proof — the assertion is run against a deliberately broken script and
+# watched to fail, per gc-4zf.2's rule that an unproven negative is vacuous).
+# orders/city-selftest.toml runs it every 6h.
+#
+# Undo (EXPECTED ~2026-07-23, this order is deliberately temporary): when the
+# P5 soak closes, either rename to temporal-soak-check.toml.disabled with the
+# outcome in its header, or fold these five checks into Track B's fault-injection
+# harness (gc-4zf.2), which is their permanent home. Do not leave it running
+# unexamined after the gate resolves — a patrol nobody reads is how the city
+# accumulates orders that die silently.
+
+[order]
+description = "Every 2h during the P5 soak: check the Temporal maintenance pipeline by OUTCOME (fired? dispatched? dropped?) rather than liveness, and push NEW/CHANGED findings to #gascity-maintenance. Dedup'd; silent when green. Reports only. Retire when gc-372's gate closes (~2026-07-23)."
+trigger = "cooldown"
+interval = "2h"
+exec = "/home/ds/gas-city/bin/temporal-soak-check --push"
+timeout = "300s"
+idempotent = true
+
+[order.env]
+# Per-call cap. 12 fetches x 10s + 3 x 10s = 150s < the 300s order timeout above.
+TEMPORAL_SOAK_CALL_TIMEOUT = "10"
+TEMPORAL_SOAK_MAX_SHOW = "12"
+# The soak's own parameters: 120m Skip-overlap Schedule in the `maintenance` ns.
+TEMPORAL_SOAK_CADENCE_MIN = "120"
+TEMPORAL_SOAK_WINDOW_HOURS = "24"
+# While a check stays red, re-alert at most once a day rather than every tick.
+TEMPORAL_SOAK_REALERT_HOURS = "24"

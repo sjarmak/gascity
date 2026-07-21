@@ -1,0 +1,14 @@
+[order]
+description = "Every 5m: detect agent-pool sessions blocked waiting on input — both UI modals (slash/model/theme selectors) AND supervisor pending-interactions (permission/approval prompts; added 2026-06-03) — that read as 'active' but are unreachable for routed work. Surfaces each to the mayor (no agent should sit blocked on a human prompt; mayor triages, auto-handles routine/permission cases, escalates only genuine decisions to Stephanie). ALSO (2026-06-03) detects WEDGED CONTROL-DISPATCHERS: a dispatcher that reads 'active' but has been idle past DISPATCHER_STALE_SEC (default 6h) is wedged — routed-bead-nudger hammers it forever while its pool work strands (cf. the codeprobe-4cl6 loop). Surfaces to mayor (no nudge — it's already over-nudged; reset only with AUTO_RESET). AUTO_RESET off by default (surface-only; reset is destructive — cf. mayor-watchdog reset-storm). Implements gc-492g2."
+trigger = "cooldown"
+interval = "5m"
+exec = "/home/ds/gas-city/bin/polecat-ui-stuck-scanner"
+# 2026-07-19 (dr-phcu, city-infra-polecat-1): raised 2m -> 4m. The fleet grew
+# to ~70 active sessions and `gc session peek` costs ~11s under load; every
+# run since 07-17 03:47 was killed at 2m before completing (no scan-summary in
+# ~/.gc/polecat-ui-stuck.log for 2+ days — alerts mid-run still fired, but
+# state never saved and resolution never ran). The scanner now fetches the
+# session list once and peeks in one parallel fan-out (measured full scan:
+# 1m43s); 4m gives ~2x headroom for further fleet growth. Undo: drop back to
+# 2m only if the measured scan time falls well under 60s.
+timeout = "4m"

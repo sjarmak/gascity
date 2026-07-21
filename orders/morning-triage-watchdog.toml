@@ -1,0 +1,13 @@
+# Watchdog for morning-triage-cycle. Fires at 8:00 EDT — one hour after
+# the triage's 7:00 EDT slot. If the triage produced no 'slung' event
+# in its audit log today, mails mayor so a silent miss is caught.
+#
+# Motivated by the 2026-05-14 silent miss (triage didn't fire, left no
+# log entry at all).
+
+[order]
+description = "8:00 EDT watchdog: mail mayor if morning-triage-cycle did not complete its 7:00 EDT run today."
+trigger = "cron"
+schedule = "0 8 * * *"   # 8:00 — gc cron is host-local (EDT)
+exec = "/home/ds/gas-city/bin/morning-triage-watchdog"
+timeout = "60s"

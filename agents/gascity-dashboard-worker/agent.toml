@@ -1,0 +1,15 @@
+# gascity-dashboard-worker — persistent claim-pool for the gascity-dashboard rig.
+# Added 2026-06-30 (mayor, qxuv): the rig had NO worker agent — work was routed to
+# drained ad-hoc claude-1 sessions (0 live claimers = dead target). Mirrors
+# codeprobe-worker. Binds to the gascity-dashboard rig via `dir`; auto-discovered
+# from agents/<name>/ (no city.toml entry needed). The search-sessions regen
+# dirty-tree class (qxuv) is held off by a local self-ignoring .gitignore in
+# .claude/skills/search-sessions/ until the tracked-.gitignore PR lands.
+dir = "/home/ds/gascity-dashboard"
+provider = "claude-3"
+min_active_sessions = 3
+max_active_sessions = 3
+wake_mode = "fresh"
+
+[env]
+CLAUDE_BINARY = "claude-auto"

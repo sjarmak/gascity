@@ -1,0 +1,114 @@
+description = """
+Idle-rig research — when a rig has no active beads, explore its codebase
+and produce improvement suggestions as beads.
+
+Dispatched by the deacon patrol when it detects a rig with zero open or
+in_progress beads. The agent reads the codebase, identifies improvement
+opportunities, and creates prioritized beads for each suggestion.
+
+This is lightweight exploration, NOT the full gc-pipeline research→brainstorm
+→decompose flow. The goal is to keep rigs productive by seeding their
+backlogs when they run dry.
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| rig      | caller | Rig name to research |
+| rig_path | caller | Absolute path to the rig's repo |
+"""
+formula = "mol-idle-rig-research"
+phase = "vapor"
+version = 1
+
+[vars]
+[vars.rig]
+description = "Rig name (used for bead creation and metadata)"
+required = true
+
+[vars.rig_path]
+description = "Absolute path to the rig's repository"
+required = true
+
+[[steps]]
+id = "explore"
+title = "Explore the codebase and identify improvements"
+description = """
+You are researching the codebase at {{rig_path}} to find improvement
+opportunities because the rig "{{rig}}" has no active work.
+
+**1. Orient yourself:**
+```bash
+cd "{{rig_path}}"
+git log --oneline -20
+```
+
+Read the README, CLAUDE.md, and any architecture docs to understand the
+project's purpose and current state.
+
+**2. Explore the codebase:**
+
+Look for concrete improvement opportunities across these dimensions:
+- **Code quality**: dead code, duplication, overly complex functions,
+  missing error handling, inconsistent patterns
+- **Testing gaps**: untested critical paths, missing edge cases,
+  low coverage areas
+- **Performance**: obvious bottlenecks, N+1 queries, unnecessary
+  allocations, missing caching opportunities
+- **Documentation**: outdated docs, missing API docs, unclear README
+- **Dependencies**: outdated packages, security vulnerabilities,
+  unused dependencies
+- **Architecture**: coupling issues, missing abstractions, unclear
+  boundaries
+
+Use Grep, Glob, and Read to explore. Be systematic but time-boxed —
+spend no more than 10-15 minutes exploring.
+
+**3. Create improvement beads:**
+
+For each concrete improvement found (aim for 3-7), create a bead:
+
+```bash
+gc bd --rig {{rig}} create "<concise title>" \
+  --type task \
+  --priority 3 \
+  --body "<what to change, why it matters, and where in the code>"
+```
+
+Priority guidelines:
+- P2: security issues, broken functionality, test failures
+- P3: code quality, testing gaps, performance improvements
+- P4: documentation, minor cleanup, nice-to-haves
+
+Tag each bead with metadata so we know it came from idle research:
+```bash
+gc bd --rig {{rig}} update <id> --set-metadata gc.source=idle-research
+```
+
+**4. Record findings on the dispatch bead:**
+
+Write a summary of what you found and created. This goes to the bead
+that triggered this formula (available as $GC_BEAD or the current mol's
+root bead).
+
+If you found NOTHING worth improving, that's a valid outcome — note it
+and move on. Don't create work for the sake of creating work.
+
+**5. Update metadata and close:**
+```bash
+bd close <this-bead> -r "Created N improvement beads for {{rig}}"
+```
+"""
+
+[[steps]]
+id = "drain"
+title = "Signal completion"
+needs = ["explore"]
+description = """
+Work is done. Signal the controller to reclaim this session:
+
+```bash
+gc runtime drain-ack
+```
+
+Run this command and nothing else."""

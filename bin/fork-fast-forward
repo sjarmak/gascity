@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# fork-fast-forward — keep our upstream-tracked forks in sync.
+#
+# For each registered repo, fetches upstream + fork, checks whether
+# fork's main is PURELY BEHIND upstream's main, and fast-forwards if
+# safe. REFUSES to push if fork has commits not on upstream (would
+# lose work). Idempotent: no-op when fork already matches.
+#
+# Why this exists: PRs we merge into upstream don't auto-propagate
+# to our fork. When the fork's main drifts behind upstream, branches
+# off origin/main miss recent dependencies (e.g. pr-pipeline pack
+# missing from sjarmak/gascity-packs:main before 2026-05-11 sync).
+# This handler keeps the fork current.
+#
+# Trigger: gc order cooldown 30m.
+# Audit log: .gc/fork-fast-forward.log (JSONL: synced, skip_fork_ahead,
+# skip_already_current, fetch_failed, push_failed).
+
+set -euo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+LOG="${CITY}/.gc/fork-fast-forward.log"
+mkdir -p "$(dirname "$LOG")"
+
+log_event() {
+    local event="$1"; shift
+    local extra="$1"
+    printf '{"ts":"%s","event":"%s",%s}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$extra" >> "$LOG"
+}
+
+# Tree-spec: tuples of "repo-path upstream-remote fork-remote branch"
+#
+# Add a new line per fork to keep synced. Order doesn't matter; each
+# repo is processed independently.
+#
+# Notably NOT in this list:
+#   /home/ds/gascity — fork (sjarmak/gascity) has commits AHEAD of
+#   upstream (livedocs workflow customizations on fork/main). Cannot
+#   be fast-forwarded without rebase. Manual sync only.
+TREES=(
+    "/home/ds/gascity-packs upstream origin main"
+)
+
+for spec in "${TREES[@]}"; do
+    read -r repo upstream_remote fork_remote branch <<< "$spec"
+    [[ ! -d "$repo/.git" && ! -f "$repo/.git" ]] && {
+        log_event "skip_not_a_repo" "\"repo\":\"$repo\""
+        continue
+    }
+
+    cd "$repo"
+
+    if ! git fetch "$upstream_remote" "$branch" --quiet 2>/dev/null; then
+        log_event "fetch_failed" "\"repo\":\"$repo\",\"remote\":\"$upstream_remote\""
+        continue
+    fi
+    if ! git fetch "$fork_remote" "$branch" --quiet 2>/dev/null; then
+        log_event "fetch_failed" "\"repo\":\"$repo\",\"remote\":\"$fork_remote\""
+        continue
+    fi
+
+    upstream_sha=$(git rev-parse "$upstream_remote/$branch")
+    fork_sha=$(git rev-parse "$fork_remote/$branch")
+
+    if [[ "$upstream_sha" == "$fork_sha" ]]; then
+        # Already in sync; quiet no-op (don't log every tick)
+        continue
+    fi
+
+    # Refuse if fork has any commit not on upstream.
+    ahead=$(git rev-list --count "$upstream_remote/$branch..$fork_remote/$branch" 2>/dev/null || echo 0)
+    if [[ "$ahead" != "0" ]]; then
+        log_event "skip_fork_ahead" "\"repo\":\"$repo\",\"fork_commits_not_on_upstream\":$ahead"
+        continue
+    fi
+
+    behind=$(git rev-list --count "$fork_remote/$branch..$upstream_remote/$branch" 2>/dev/null || echo 0)
+    if [[ "$behind" == "0" ]]; then
+        continue
+    fi
+
+    # Safe to fast-forward push.
+    if git push "$fork_remote" "$upstream_remote/$branch:$branch" 2>/dev/null; then
+        log_event "synced" "\"repo\":\"$repo\",\"from\":\"$fork_sha\",\"to\":\"$upstream_sha\",\"commits\":$behind"
+    else
+        log_event "push_failed" "\"repo\":\"$repo\",\"upstream_sha\":\"$upstream_sha\",\"fork_sha\":\"$fork_sha\""
+    fi
+done
+
+exit 0

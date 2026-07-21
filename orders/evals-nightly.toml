@@ -1,0 +1,13 @@
+# evals-nightly — REPORT-ONLY nightly eval harness (gc-xd77u pilot). Runs
+# bin/eval-runner over evals/tasks/*.yaml, judging candidate traces with a
+# deterministic rule judge (+ optional LLM rubric); writes .gc/evals-report.log.
+# NO promotion gate is wired — the gate flips on only after a stable shadow week
+# (gc-xd77u phase 5). Guardrail: the runner hashes evals/golden/ before+after and
+# aborts on any modification. The rubric LLM is OFF here (cheap deterministic
+# nightly); enable per-run with `bin/eval-runner --rubric`.
+[order]
+description = "Nightly (report-only): run the evals-as-CI task corpus via bin/eval-runner; write .gc/evals-report.log. No gating until a stable shadow week (gc-xd77u)."
+trigger = "cron"
+schedule = "0 3 * * *"
+exec = "/home/ds/gas-city/bin/eval-runner"
+timeout = "10m"

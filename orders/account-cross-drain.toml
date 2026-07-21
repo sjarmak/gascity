@@ -1,0 +1,19 @@
+# account-cross-drain — blast-radius limiter for account identity-cross / dead
+# token (dr-qfw layer #3, mayor gc-470459). Consumes the detection signal from
+# account-identity-check (layer #2) and drains the crossed slot's non-pinned
+# agents onto a VERIFIED-HEALTHY slot (every crossed slot passed as --avoid, so
+# targets are identity-correct + not crossed; gc-capacity's coolest pick keeps
+# them off over-quota accounts). Reuses the gc-capacity drain engine, not a new
+# mover; pinned agents are never moved.
+#
+# ARMING: default is PLAN-ONLY (mails mayor the plan, moves nothing). To arm the
+# automatic drain, add  CROSS_AUTO_DRAIN = "1"  under [order.env] below — mirrors
+# account-quota-warning's QUOTA_AUTO_DRAIN pattern (behavior explicit in config).
+# On a clean fleet (no cross signal) this order no-ops silently — no mail.
+[order]
+description = "Every 12m: if account-identity-check flagged an identity-cross/dead-token, plan (or, when armed via CROSS_AUTO_DRAIN, execute) a guarded drain of the crossed slot's non-pinned agents onto a verified-healthy slot, avoiding every crossed slot as a target. Blast-radius cap while Stephanie re-creds (the account1->gibsonsteph42 cross silently wedged ~16 agents). Plan-only until armed; silent no-op when the fleet is clean."
+trigger = "cooldown"
+interval = "12m"
+exec = "/home/ds/gas-city/bin/account-cross-drain"
+timeout = "120s"
+idempotent = true

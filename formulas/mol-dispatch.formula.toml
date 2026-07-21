@@ -1,0 +1,112 @@
+description = """
+Dispatch phase — read child beads of a convoy root and route each to the
+appropriate agent based on gc.routing metadata.
+
+Routing rules:
+  - gc.routing=criteria-only  → Claude Opus agent (any claude-1..5)
+  - gc.routing=prescriptive   → Codex agent
+
+Only dispatches beads whose dependencies are satisfied (ready state).
+Beads with unsatisfied deps (reviews, meta-reviews) will become ready
+automatically when their blocking work completes — the mayor or a
+subsequent dispatch run picks them up.
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| issue    | caller | The convoy root bead (parent of all work/review beads) |
+| rig      | caller | The rig name for routing targets |
+"""
+formula = "mol-dispatch"
+phase = "vapor"
+version = 1
+
+[vars]
+[vars.issue]
+description = "The convoy root bead ID"
+required = true
+
+[vars.rig]
+description = "The rig name for agent routing"
+required = true
+
+[[steps]]
+id = "dispatch"
+title = "Route work beads to agents based on routing metadata"
+description = """
+You are dispatching work from convoy root bead {{issue}}.
+
+**1. List all child beads:**
+```bash
+bd children {{issue}}
+```
+
+**2. For each READY child bead (no unsatisfied blockers), check its routing:**
+```bash
+bd show <child-id>
+```
+
+Look at the METADATA section for `gc.routing` and `gc.unit_type`.
+
+**3. Route based on metadata:**
+
+For each ready bead:
+
+- `gc.routing=criteria-only` + `gc.unit_type=work`:
+  ```bash
+  gc sling --no-formula {{rig}}/claude-1 "Implement the work described in bead <id>. Read the bead with 'bd show <id>'. The acceptance criteria in the bead are your spec. Implement to pass ALL criteria. When done, write your implementation summary as a note on the bead and close it with 'bd close <id>'."
+  ```
+  Distribute across claude-1 through claude-5 to parallelize.
+
+- `gc.routing=prescriptive` + `gc.unit_type=work`:
+  ```bash
+  gc sling --no-formula {{rig}}/codex "Implement the work described in bead <id>. Read the bead with 'bd show <id>'. Follow the description EXACTLY as specified. The acceptance criteria must all pass. When done, close the bead."
+  ```
+
+- `gc.unit_type=review` or `gc.unit_type=meta-review`:
+  Skip if blocked. These become ready when their dependency closes.
+  When they ARE ready, route to Codex:
+  ```bash
+  gc sling --no-formula {{rig}}/codex "Read bead <id> with 'bd show <id>' and execute the review procedure described there. Write your findings as notes on the bead. Close with PASS or FAIL verdict in the reason."
+  ```
+
+**4. Record dispatch summary:**
+```bash
+bd note {{issue}} --file /dev/stdin <<'NOTE'
+## Dispatch Summary
+
+### Routed
+[List each bead ID, where it was routed, and why]
+
+### Pending (blocked)
+[List review/meta-review beads still waiting on dependencies]
+NOTE
+```
+
+**5. Update metadata:**
+```bash
+bd update {{issue}} --set-metadata phase=dispatched
+```
+
+**NOTE:** Reviews and meta-reviews will need a SECOND dispatch run after work
+beads complete. The mayor should monitor the convoy and re-run dispatch when
+new beads become ready. Alternatively, send mail to the mayor:
+```bash
+gc mail send mayor -s "Convoy {{issue}} dispatched" -m "Work beads routed. Monitor for review beads becoming ready and re-dispatch."
+```
+
+Do NOT close the root bead."""
+
+[[steps]]
+id = "drain"
+title = "Signal completion"
+needs = ["dispatch"]
+description = """
+Work is done. Signal the controller to reclaim this session:
+
+```bash
+gc runtime drain-ack
+```
+
+Run this command and nothing else."""

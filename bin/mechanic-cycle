@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# mechanic-cycle — scheduled priority-walk of the INFRA queue for city-infra-pl.
+#
+# WHAT IT DOES (per tick)
+#   1. Find the active city-infra-pl session (the in-place Tier-1 fixer).
+#   2. Read the OPEN city-infra beads from the city Dolt store via plain `bd`
+#      (the PL's beads live under the bd/Dolt provider, label `city-infra` —
+#      NOT the gc file store; see agents/city-infra-pl/prompt.md).
+#   3. Rank them DETERMINISTICALLY (priority asc, then created asc = oldest
+#      first). This is mechanical ordering, NOT semantic selection — allowed
+#      under ZFC (deterministic ranking with explicit tiebreaker). WHICH fix to
+#      actually do, and HOW, stays with the PL: the payload hands it the ranked
+#      queue + names the top bead, but the PL decides scope/safety/halt.
+#   4. Inject a self-contained work payload into the PL session so the tick does
+#      real work on the runner's own cadence, independent of whether a generic
+#      patrol nudge landed (nudges hang intermittently — directive 2026-06-24).
+#
+# WHAT IT DOES NOT DO
+#   - Does NOT sling to a polecat pool. city-infra-pl executes in-place in
+#     /home/ds/gas-city (not a git repo); there is no dispatch target. (The
+#     suspended city-infra-polecat pool is dormant; raising it is a separate
+#     rollout decision — see mechanic-cycle.SPEC.md.)
+#   - Does NOT decide which bead is "important" beyond priority+age arithmetic.
+#   - Does NOT touch external artifacts. The PL's own hard floor (no git push /
+#     gh / slack / mail-to-human; halt-and-surface DECISION: to mayor) governs
+#     execution. Conservative overnight posture is inherited from the PL prompt;
+#     this exec adds no authoring/merge behavior of its own.
+#
+# WHY EXEC-BASED (not native formula+pool order)
+#   Same gastownhall/gascity#1440 formula+pool regression worked around by
+#   morning-triage-cycle / author-cycle; and there is no pool to target anyway.
+#
+# Usage:
+#   mechanic-cycle              # rank queue + inject payload into the PL session
+#   mechanic-cycle --dry-run    # report ranked queue + payload, no injection
+
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${CITY}/.gc/mechanic-cycle.log"
+TEMPLATE="city-infra-pl"
+# How many ranked beads to name in the payload (the PL still works one at a
+# time; the list gives it next-up context without re-querying).
+QUEUE_PREVIEW="${MECHANIC_CYCLE_PREVIEW:-5}"
+
+DRY_RUN=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) sed -n 's/^# \{0,1\}//p' "$0" | head -40; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+log_event() {
+  local event="$1" detail="${2:-}"
+  local ts
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq -nc --arg ts "$ts" --arg event "$event" --arg detail "$detail" \
+    '{ts: $ts, event: $event, detail: $detail}' >> "$AUDIT_LOG"
+}
+
+# --- 1. ranked open infra queue (plain bd; bd/Dolt provider, NOT gc file store)
+# Deterministic order: priority asc (P0 first), then created asc (oldest first).
+# Drop beads that are not in-floor work for this walk (mayor gc-414841):
+#   needs-source-impl = held for the gascity-source-edit re-scope decision;
+#   delivered         = already shipped, non-actionable rollup tail.
+queue_json=$(gc bd list --rig gascity --label city-infra --status open --json 2>/dev/null \
+  | jq -c '[ .[] | select((.labels // []) | (index("needs-source-impl") or index("delivered")) | not) ]
+           | sort_by(.priority, .id)') || queue_json=""
+
+if [[ -z "$queue_json" || "$queue_json" == "[]" || "$queue_json" == "null" ]]; then
+  log_event "empty_queue" "no open city-infra beads"
+  echo "no open city-infra beads — nothing to walk"
+  exit 0
+fi
+
+top_id=$(echo "$queue_json" | jq -r '.[0].id')
+top_title=$(echo "$queue_json" | jq -r '.[0].title')
+top_pri=$(echo "$queue_json" | jq -r '.[0].priority')
+queue_count=$(echo "$queue_json" | jq -r 'length')
+preview=$(echo "$queue_json" | jq -r --argjson n "$QUEUE_PREVIEW" \
+  '.[:$n] | to_entries[] | "  \(.key+1). \(.value.id) P\(.value.priority) \(.value.title)"')
+
+# --- 2. self-contained payload (the PL's work instruction for this tick) ------
+read -r -d '' PAYLOAD <<EOF || true
+Mechanic tick — infra queue priority-walk ($queue_count open city-infra bead(s)).
+
+FIRST: gc mail count; if unread, triage before anything else.
+
+Ranked queue (priority, then oldest-first):
+$preview
+
+Top of queue: $top_id (P$top_pri) — $top_title
+
+Work the top READY in-scope bead IN-PLACE in /home/ds/gas-city (not a git repo:
+no branches/commits/PRs). If the top bead is blocked, spec-gapped, or out of
+your floor, skip to the next ranked bead and surface the blocker. Make the
+smallest correct change; verify (bash -n / gc config show / gc order check /
+TOML parse) before close; close with file:line + verification command + result.
+
+HARD FLOOR (unchanged): no external artifacts (git push / gh / slack / mail to
+human). Anything external, rig-source, or beyond a smallest-safe supervisor/dolt
+change -> halt and mail mayor DECISION:. Conservative overnight posture —
+Stephanie is away; when in doubt, surface rather than act.
+EOF
+
+if (( DRY_RUN )); then
+  echo "[dry-run] active $TEMPLATE session would receive:"
+  echo "----"
+  echo "$PAYLOAD"
+  echo "----"
+  exit 0
+fi
+
+# --- 3. find the active PL session --------------------------------------------
+mapfile -t session_ids < <(
+  gc session list --json 2>/dev/null \
+    | jq -r --arg t "$TEMPLATE" '.sessions[] | select(.template == $t and .state == "active") | .id'
+)
+
+if [[ ${#session_ids[@]} -eq 0 ]]; then
+  log_event "no_active_session" "template=$TEMPLATE top=$top_id queue=$queue_count"
+  echo "no active $TEMPLATE session — queue has $queue_count open bead(s), top=$top_id" >&2
+  # Not an error: the named_session may be mid-restart. Next tick retries.
+  exit 0
+fi
+
+# --- 4. inject the payload ----------------------------------------------------
+injected=0
+for sid in "${session_ids[@]}"; do
+  if gc session nudge "$sid" "$PAYLOAD" --delivery wait-idle >/dev/null 2>&1; then
+    injected=$((injected + 1))
+  else
+    log_event "inject_failed" "session=$sid top=$top_id"
+    echo "inject failed for $sid" >&2
+  fi
+done
+
+log_event "tick" "injected=$injected top=$top_id pri=$top_pri queue=$queue_count"
+echo "injected priority-walk into $injected $TEMPLATE session(s); top=$top_id (P$top_pri), queue=$queue_count"
+exit 0

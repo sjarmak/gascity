@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+# slack-binding-reaper: detect stale Slack bindings on pool-spawned sessions
+# and rebind them to the live session in the same agent slot.
+#
+# Why this exists:
+#
+#   Slack bindings on named sessions (mode="always" / scope="city") survive
+#   respawn because the API stores their stable qualified name (e.g.
+#   "oversight-rig.cos") and resolves it on every notify.
+#
+#   Pool-spawned sessions (like gascity-maintenance-pl) don't have a stable
+#   identity — `gc slack bind-room` stores the raw session ID (gc-XXXXX) in
+#   the binding record. When the pool respawns (supervisor restart, idle
+#   timeout, drain), the new session gets a fresh ID and inbounds keep
+#   routing to the closed predecessor. Symptoms: no eyes-react on Stack
+#   posts in that channel; supervisor.log shows
+#   `extmsg: notify gc-XXXXX failed: session is closed`.
+#
+#   This reaper closes the gap by:
+#     1. Reading .gc/services/slack/data/config.json for all room/DM bindings.
+#     2. For each binding whose SessionID is a raw gc-NNNN that's not in the
+#        live session list, finding the live session for the same agent slot.
+#     3. POST /extmsg/unbind on the stale binding, POST /extmsg/bind on the new.
+#     4. Updating config.json so local CLI tools (gc slack status etc.) agree.
+#
+#   Upstream tracking — the real fix is to make pool bindings store a
+#   stable identifier (template path or agent name) and resolve at notify
+#   time. See companion bead filed locally + the upstream gascity issue we
+#   open from it.
+#
+# Usage:
+#   slack-binding-reaper                  # dry-run report
+#   slack-binding-reaper --apply          # actually rebind
+#   slack-binding-reaper --nudge-mayor    # mail mayor if anything reaped
+#   slack-binding-reaper --verbose        # log every binding inspected
+
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${SLACK_BINDING_REAPER_AUDIT_LOG:-${CITY}/.gc/slack-binding-reaper.log}"
+CONFIG_FILE="${CITY}/.gc/services/slack/data/config.json"
+API_BASE="${GC_API_BASE_URL:-http://127.0.0.1:8372}"
+CITY_NAME="${GC_CITY_NAME:-ds-research}"
+
+APPLY=0
+NUDGE_MAYOR=0
+VERBOSE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)        APPLY=1; shift ;;
+    --nudge-mayor)  NUDGE_MAYOR=1; shift ;;
+    --verbose)      VERBOSE=1; shift ;;
+    -h|--help)
+      sed -n '1,40p' "$0" | sed -n '/^# Usage:/,/^$/p'
+      exit 0
+      ;;
+    *)
+      echo "slack-binding-reaper: unknown flag $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "slack-binding-reaper: jq is required" >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$AUDIT_LOG")"
+
+log_event() {
+  local event="$1"
+  shift
+  local payload="$1"
+  local ts
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '%s\n' "$(jq -n --arg ts "$ts" --arg event "$event" --argjson payload "$payload" \
+    '{ts: $ts, event: $event} + $payload')" >> "$AUDIT_LOG"
+}
+
+verbose() {
+  [[ $VERBOSE -eq 1 ]] && echo "[verbose] $*" >&2
+  return 0
+}
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "slack-binding-reaper: no slack config at $CONFIG_FILE — nothing to reap" >&2
+  exit 0
+fi
+
+# Snapshot current live sessions: id, alias, template path
+SESSIONS_JSON="$(curl -sS "${API_BASE}/v0/city/${CITY_NAME}/sessions" 2>/dev/null)"
+if [[ -z "$SESSIONS_JSON" ]] || ! echo "$SESSIONS_JSON" | jq -e .items >/dev/null 2>&1; then
+  echo "slack-binding-reaper: failed to fetch sessions from ${API_BASE}/v0/city/${CITY_NAME}/sessions" >&2
+  exit 1
+fi
+
+# Build a lookup: template_path -> first live session id (state=active, running=true)
+declare -A TEMPLATE_TO_LIVE
+while IFS=$'\t' read -r tpl sid; do
+  [[ -z "$tpl" || -z "$sid" ]] && continue
+  # First wins (sessions list is sorted by creation desc).
+  if [[ -z "${TEMPLATE_TO_LIVE[$tpl]+x}" ]]; then
+    TEMPLATE_TO_LIVE["$tpl"]="$sid"
+  fi
+done < <(echo "$SESSIONS_JSON" | jq -r '.items[] | select(.state=="active" and .running==true) | "\(.template)\t\(.id)"')
+
+# Build a set of live session IDs for quick membership test
+ALL_LIVE_IDS="$(echo "$SESSIONS_JSON" | jq -r '.items[] | select(.state=="active" and .running==true) | .id' | tr '\n' '|')"
+
+is_live_id() {
+  local id="$1"
+  [[ -z "$id" ]] && return 1
+  [[ "|$ALL_LIVE_IDS" == *"|$id|"* ]]
+}
+
+# A raw session ID looks like gc-<chars>. Named identities like
+# "oversight-rig.cos" contain a dot or slash.
+looks_like_raw_session_id() {
+  local id="$1"
+  [[ "$id" =~ ^gc-[A-Za-z0-9]+$ ]]
+}
+
+REAPS=0
+INSPECTED=0
+SKIPS=0
+
+# Iterate over each binding in config.json
+while IFS= read -r binding; do
+  INSPECTED=$((INSPECTED + 1))
+
+  binding_key="$(echo "$binding" | jq -r '.key')"
+  ssid="$(echo "$binding" | jq -r '.binding_owner // .participants[0].session_name // ""')"
+  conv_id="$(echo "$binding" | jq -r '.conversation.conversation_id // ""')"
+  account_id="$(echo "$binding" | jq -r '.conversation.account_id // ""')"
+  scope_id="$(echo "$binding" | jq -r '.conversation.scope_id // ""')"
+  kind="$(echo "$binding" | jq -r '.conversation.kind // "room"')"
+
+  if [[ -z "$ssid" || -z "$conv_id" || -z "$account_id" ]]; then
+    verbose "skip $binding_key — incomplete metadata"
+    continue
+  fi
+
+  if ! looks_like_raw_session_id "$ssid"; then
+    verbose "skip $binding_key — bound to stable identity '$ssid' (named/aliased, not raw ID)"
+    continue
+  fi
+
+  if is_live_id "$ssid"; then
+    verbose "skip $binding_key — session $ssid is alive"
+    continue
+  fi
+
+  # Stale binding: ssid is a raw gc-ID that isn't currently live.
+  # Find current live session for the same agent slot by matching participant
+  # handle -> agent name -> agent.toml dir -> session template path.
+  handle="$(echo "$binding" | jq -r '.default_handle // .participants[0].handle // ""')"
+  agent_toml="${CITY}/agents/${handle}/agent.toml"
+
+  if [[ ! -f "$agent_toml" ]]; then
+    verbose "skip $binding_key — handle '$handle' has no matching agent.toml at $agent_toml"
+    SKIPS=$((SKIPS + 1))
+    continue
+  fi
+
+  template_dir="$(awk -F' = ' '$1=="dir"{gsub(/"/, "", $2); print $2; exit}' "$agent_toml")"
+  if [[ -z "$template_dir" ]]; then
+    verbose "skip $binding_key — agent '$handle' has no 'dir' field in agent.toml"
+    SKIPS=$((SKIPS + 1))
+    continue
+  fi
+
+  # Resolve template path: gc constructs it as <dir>/<agent-name>
+  template_path="${template_dir}/${handle}"
+
+  new_sid="${TEMPLATE_TO_LIVE[$template_path]:-}"
+  if [[ -z "$new_sid" ]]; then
+    verbose "skip $binding_key — no live session found for template $template_path"
+    SKIPS=$((SKIPS + 1))
+    log_event "skip_no_live_target" "$(jq -n \
+      --arg binding_key "$binding_key" \
+      --arg stale_sid "$ssid" \
+      --arg template "$template_path" \
+      '{binding_key: $binding_key, stale_session_id: $stale_sid, template_path: $template}')"
+    continue
+  fi
+
+  # Found a stale config.json binding. Before reaping, check the live API:
+  # after #1953 the cascade may have already closed the API binding (so the
+  # channel just needs a fresh bind to the live successor), OR the API may
+  # have already been rebound to the live successor by an earlier pass /
+  # manual fix (so the only drift is config.json staleness and we just
+  # need to resync the local file).
+  conv_body="$(jq -n \
+    --arg provider slack \
+    --arg account_id "$account_id" \
+    --arg conv_id "$conv_id" \
+    --arg scope_id "$scope_id" \
+    --arg kind "$kind" \
+    '{provider: $provider, account_id: $account_id, conversation_id: $conv_id, scope_id: $scope_id, kind: $kind}')"
+
+  # Check the API's current binding for the live target.
+  live_binding_json="$(curl -sS "${API_BASE}/v0/city/${CITY_NAME}/extmsg/bindings?session_id=${new_sid}" 2>/dev/null)"
+  live_binding_record="$(echo "$live_binding_json" | jq -r --arg conv "$conv_id" '
+    .items[]? | select(.Status=="active" and .Conversation.conversation_id==$conv) | .ID
+  ' 2>/dev/null | head -1)"
+
+  if [[ -n "$live_binding_record" ]]; then
+    # API is already bound to the live successor — only config.json drift to fix.
+    if [[ $APPLY -eq 0 ]]; then
+      echo "config-only drift: $binding_key (conv=$conv_id) — API already bound to $new_sid (record $live_binding_record); config.json says $ssid" >&2
+      REAPS=$((REAPS + 1))
+      log_event "config_drift_detected" "$(jq -n \
+        --arg binding_key "$binding_key" \
+        --arg stale_sid "$ssid" \
+        --arg new_sid "$new_sid" \
+        --arg new_record "$live_binding_record" \
+        '{binding_key: $binding_key, stale_session_id: $stale_sid, replacement_session_id: $new_sid, new_binding_record: $new_record}')"
+      continue
+    fi
+    bind_resp='{"ID":"'"$live_binding_record"'","SessionID":"'"$new_sid"'","Status":"active"}'
+    bind_status="active"
+    log_event "config_drift_resynced" "$(jq -n \
+      --arg binding_key "$binding_key" \
+      --arg stale_sid "$ssid" \
+      --arg new_sid "$new_sid" \
+      --arg new_record "$live_binding_record" \
+      '{binding_key: $binding_key, stale_session_id: $stale_sid, replacement_session_id: $new_sid, new_binding_record: $new_record}')"
+    echo "config-drift resynced: $binding_key → $new_sid (existing API record $live_binding_record)" >&2
+  else
+    # Standard reap path: stale binding, no live API binding yet. Report and apply if --apply.
+    echo "stale binding: $binding_key (conv=$conv_id) bound to $ssid (closed) — live replacement gc-$(echo "$new_sid" | sed 's/^gc-//')" >&2
+
+    log_event "stale_binding_detected" "$(jq -n \
+      --arg binding_key "$binding_key" \
+      --arg stale_sid "$ssid" \
+      --arg new_sid "$new_sid" \
+      --arg conv_id "$conv_id" \
+      '{binding_key: $binding_key, stale_session_id: $stale_sid, replacement_session_id: $new_sid, conversation_id: $conv_id}')"
+
+    if [[ $APPLY -eq 0 ]]; then
+      REAPS=$((REAPS + 1))
+      continue
+    fi
+
+    unbind_body="$(jq -n \
+      --arg session_id "$ssid" \
+      --argjson conv "$conv_body" \
+      '{session_id: $session_id, conversation: $conv}')"
+
+    # Unbind. Tolerate 422 ("no active binding") — after #1953 the cascade
+    # may have already closed the API binding when the session retired,
+    # so unbind here is a no-op rather than a failure. Surface only
+    # non-422 errors via the audit log.
+    unbind_http_code="$(curl -sS -o /tmp/.slack-reaper-unbind.$$ -w '%{http_code}' \
+      -X POST "${API_BASE}/v0/city/${CITY_NAME}/extmsg/unbind" \
+      -H 'Content-Type: application/json' \
+      -H 'X-GC-Request: 1' \
+      -d "$unbind_body" 2>/dev/null)"
+    unbind_resp="$(cat /tmp/.slack-reaper-unbind.$$ 2>/dev/null)"
+    rm -f /tmp/.slack-reaper-unbind.$$
+    if [[ "$unbind_http_code" != "200" && "$unbind_http_code" != "422" ]]; then
+      log_event "unbind_unexpected_status" "$(jq -n \
+        --arg binding_key "$binding_key" \
+        --arg stale_sid "$ssid" \
+        --arg http_code "$unbind_http_code" \
+        --arg resp "$unbind_resp" \
+        '{binding_key: $binding_key, stale_session_id: $stale_sid, http_code: $http_code, response: $resp}')"
+    fi
+
+    bind_body="$(jq -n \
+      --arg session_id "$new_sid" \
+      --argjson conv "$conv_body" \
+      '{session_id: $session_id, conversation: $conv}')"
+
+    bind_resp="$(curl -sS -X POST "${API_BASE}/v0/city/${CITY_NAME}/extmsg/bind" \
+      -H 'Content-Type: application/json' \
+      -H 'X-GC-Request: 1' \
+      -d "$bind_body" 2>&1)"
+
+    bind_status="$(echo "$bind_resp" | jq -r '.Status // .status // ""' 2>/dev/null)"
+  fi
+
+  if [[ "$bind_status" == "active" ]]; then
+    new_binding_id="$(echo "$bind_resp" | jq -r '.ID // ""')"
+    REAPS=$((REAPS + 1))
+
+    # Update local config.json so CLI tools agree
+    tmp="$(mktemp)"
+    jq --arg key "$binding_key" --arg new_sid "$new_sid" --arg new_record "$new_binding_id" '
+      .bindings[$key].binding_owner = $new_sid
+      | .bindings[$key].binding_record = $new_record
+      | (.bindings[$key].participants[] | select(.handle == .bindings[$key].default_handle).session_name) |= $new_sid
+      | .bindings[$key].participants |= map(if .session_name and (.session_name | test("^gc-[A-Za-z0-9]+$")) and (.session_name != $new_sid) then . else . end)
+    ' "$CONFIG_FILE" > "$tmp" 2>/dev/null
+    if [[ -s "$tmp" ]] && jq empty "$tmp" >/dev/null 2>&1; then
+      # Simpler safe update — only touch the binding_owner/binding_record + matching participant
+      jq --arg key "$binding_key" --arg new_sid "$new_sid" --arg new_record "$new_binding_id" --arg old_sid "$ssid" '
+        .bindings[$key].binding_owner = $new_sid
+        | .bindings[$key].binding_record = $new_record
+        | .bindings[$key].participants |= map(if .session_name == $old_sid then .session_name = $new_sid else . end)
+      ' "$CONFIG_FILE" > "$tmp"
+      if [[ -s "$tmp" ]] && jq empty "$tmp" >/dev/null 2>&1; then
+        mv "$tmp" "$CONFIG_FILE"
+      else
+        rm -f "$tmp"
+      fi
+    fi
+
+    log_event "rebound" "$(jq -n \
+      --arg binding_key "$binding_key" \
+      --arg stale_sid "$ssid" \
+      --arg new_sid "$new_sid" \
+      --arg new_record "$new_binding_id" \
+      '{binding_key: $binding_key, stale_session_id: $stale_sid, replacement_session_id: $new_sid, new_binding_record: $new_record}')"
+
+    echo "  -> rebound $binding_key to $new_sid (record $new_binding_id)" >&2
+  else
+    log_event "rebind_failed" "$(jq -n \
+      --arg binding_key "$binding_key" \
+      --arg stale_sid "$ssid" \
+      --arg new_sid "$new_sid" \
+      --arg unbind_resp "$unbind_resp" \
+      --arg bind_resp "$bind_resp" \
+      '{binding_key: $binding_key, stale_session_id: $stale_sid, replacement_session_id: $new_sid, unbind_response: $unbind_resp, bind_response: $bind_resp}')"
+    echo "  !! rebind failed for $binding_key — see audit log" >&2
+  fi
+done < <(jq -c '.bindings | to_entries[] | {key: .key} + .value' "$CONFIG_FILE")
+
+if [[ $REAPS -gt 0 && $NUDGE_MAYOR -eq 1 ]]; then
+  gc mail send mayor \
+    --from slack-binding-reaper \
+    --subject "slack-binding-reaper reaped $REAPS stale binding(s)" \
+    -m "Reaped $REAPS stale Slack binding(s). See $AUDIT_LOG for the rebind details. Inspected $INSPECTED total bindings; $SKIPS skipped (no live replacement)." >/dev/null 2>&1 || true
+fi
+
+if [[ $APPLY -eq 0 && $REAPS -gt 0 ]]; then
+  echo
+  echo "Dry-run: $REAPS stale binding(s) found. Re-run with --apply to rebind." >&2
+fi
+
+verbose "inspected=$INSPECTED reaps=$REAPS skips=$SKIPS"

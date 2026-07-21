@@ -1,0 +1,10 @@
+[order]
+description = "Daily 7am EDT triage → PR cycle. Wraps the sling of mol-pr-triage in an exec script (workaround for #1440 formula+pool order regression; restore native formula+pool shape once gastownhall/gascity#1986 lands + supervisor restarts)."
+trigger = "cron"
+schedule = "0 7 * * *"   # 7:00 — gc cron evaluates in the host's LOCAL tz (EDT), confirmed via claude-zombie-report '0 9' firing at 09:00 EDT. Was '0 11' on the mistaken assumption cron is UTC; that fired at 11:00 EDT, 4h late.
+exec = "/home/ds/gas-city/bin/morning-triage-cycle"
+# 60s was too tight: the mol-pr-triage sling routinely takes ~42s and crossed
+# 60s under load on 2026-07-04 — the exec was killed after gc-sling dispatched
+# but before the "slung" audit line was written, so the sling succeeded yet the
+# watchdog false-alarmed on the missing event (gc-450571). 180s gives headroom.
+timeout = "180s"

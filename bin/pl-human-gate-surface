@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# pl-human-gate-surface — when a polecat creates a human-gate step bead
+# under a molecule whose root work bead carries originating_slack.*
+# metadata, post a notification to the originating Slack thread so the
+# human knows their input is needed.
+#
+# Closes the gap where polecats pause at human-gate steps and the
+# human has no signal beyond an idle session (live example: gc-t1cb4
+# on PR 1969 review, 2026-05-11 — sat idle ~6min until mayor noticed).
+#
+# Trigger: gc order on bead.created event + cooldown re-tick for any
+# gates missed by the event path.
+#
+# Detection: gate beads have metadata.gc.step_ref matching
+# *.human-gate. Root work bead is found by:
+#   1. step.parent → molecule (e.g. mol-adopt-pr)
+#   2. find bead in same rig where metadata.molecule_id == <molecule>
+#      (the work bead carries this back-reference; step beads don't)
+#
+# Idempotent via metadata.gate_surfaced_at on the gate bead.
+# Documented in dr-xbs45x.
+
+set -euo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${CITY}/.gc/pl-human-gate-surface.log"
+SINCE="${PL_HUMAN_GATE_SURFACE_SINCE:-15m}"
+
+# Resolve a stable session for slack attribution: $GC_SESSION_ID (interactive)
+# else the pinned mayor. Detached order runs strip GC_SESSION_ID, so publish
+# would fail fast ("pass --session explicitly") without this.
+resolve_publish_sid() {
+  if [[ -n "${GC_SESSION_ID:-}" ]]; then
+    printf '%s' "$GC_SESSION_ID"; return 0
+  fi
+  gc session list 2>/dev/null | awk '$2=="mayor" && /pin/{print $1; exit}'
+}
+PUBLISH_SID="$(resolve_publish_sid)"
+
+mkdir -p "$(dirname "$AUDIT_LOG")"
+
+log_event() {
+    local event="$1"; shift
+    local extra="$1"
+    printf '{"ts":"%s","event":"%s",%s}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$extra" >> "$AUDIT_LOG"
+}
+
+# Build prefix -> rig-name map for cross-rig bd lookups.
+declare -A PREFIX_TO_RIG
+while IFS=$'\t' read -r rig prefix; do
+    [[ -n "$prefix" ]] && PREFIX_TO_RIG["$prefix"]="$rig"
+done < <(gc rig list 2>/dev/null | awk '
+    /^  [a-zA-Z][a-zA-Z0-9_-]+:/ {
+        name = $1; sub(/:$/, "", name); current_rig = name
+    }
+    /^    Prefix:/ {
+        gsub(/^    Prefix:[ \t]+/, ""); print current_rig "\t" $0
+    }')
+
+rig_for_bead() {
+    local bead_id="$1" prefix
+    for prefix in "${!PREFIX_TO_RIG[@]}"; do
+        [[ "$bead_id" == "$prefix-"* ]] && echo "${PREFIX_TO_RIG[$prefix]}" && return
+    done
+    return 1
+}
+
+bd_show() {
+    local bead_id="$1" rig out
+    if rig=$(rig_for_bead "$bead_id"); then
+        out=$(gc bd --rig "$rig" show "$bead_id" --json 2>/dev/null || true)
+    else
+        out=$(gc bd show "$bead_id" --json 2>/dev/null || true)
+    fi
+    # gc bd show returns an error OBJECT ({"error": "..."}) when the bead
+    # isn't in the routed rig — e.g. a city-level gc-NNNN bead colliding
+    # with the gascity rig's gc- prefix. Downstream indexes with .[0],
+    # which crashes on an object ("Cannot index object with number") and,
+    # under set -e, kills the whole order. Emit only a valid array;
+    # anything else becomes empty so the caller's [[ -z ]] guard skips it.
+    printf '%s' "$out" | jq -c 'if type == "array" then . else empty end' 2>/dev/null || true
+}
+
+bd_update_metadata() {
+    local bead_id="$1" patch="$2" rig
+    if rig=$(rig_for_bead "$bead_id"); then
+        gc bd --rig "$rig" update "$bead_id" --metadata "$patch" 2>&1 || true
+    else
+        gc bd update "$bead_id" --metadata "$patch" 2>&1 || true
+    fi
+}
+
+# Find the root work bead for a given molecule id. The work bead's
+# metadata.molecule_id points back to the molecule; step beads do
+# not carry this back-reference. So we filter the rig's bead list by
+# the molecule_id field.
+find_root_for_molecule() {
+    local molecule_id="$1"
+    local rig="$2"
+    [[ -z "$molecule_id" || -z "$rig" ]] && return
+    gc bd --rig "$rig" list --json 2>/dev/null \
+        | jq -r --arg mol "$molecule_id" '
+            .[]
+            | select(.metadata.molecule_id == $mol)
+            | .id' \
+        | head -1
+}
+
+# Collect bead IDs from recent bead.created and bead.updated events.
+# bead.created catches new gate beads; bead.updated catches state
+# transitions (e.g. assignee write) on existing gates.
+mapfile -t bead_ids < <(
+    {
+        gc events --type bead.created --since "$SINCE" 2>/dev/null
+        gc events --type bead.updated --since "$SINCE" 2>/dev/null
+    } | jq -r '.subject // empty' \
+      | awk 'NF' \
+      | sort -u
+)
+
+[[ ${#bead_ids[@]} -eq 0 ]] && exit 0
+
+posted=0
+skipped=0
+failed=0
+no_root=0
+
+for bead_id in "${bead_ids[@]}"; do
+    bead_json=$(bd_show "$bead_id")
+    [[ -z "$bead_json" ]] && continue
+
+    # Filter: step_ref matches *.human-gate.
+    step_ref=$(echo "$bead_json" | jq -r '.[0].metadata."gc.step_ref" // empty')
+    [[ ! "$step_ref" =~ \.human-gate$ ]] && continue
+
+    # Filter: status is open or in_progress (live gate, not yet closed).
+    status=$(echo "$bead_json" | jq -r '.[0].status // empty')
+    if [[ "$status" != "open" && "$status" != "in_progress" ]]; then
+        continue
+    fi
+
+    # Idempotence: skip if already surfaced.
+    surfaced_at=$(echo "$bead_json" | jq -r '.[0].metadata.gate_surfaced_at // empty')
+    if [[ -n "$surfaced_at" ]]; then
+        continue
+    fi
+
+    # Find the molecule (the gate's parent) and the root work bead.
+    molecule_id=$(echo "$bead_json" | jq -r '.[0].parent // empty')
+    if [[ -z "$molecule_id" ]]; then
+        log_event "skip_no_molecule" "\"bead\":\"$bead_id\""
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    rig=$(rig_for_bead "$bead_id" 2>/dev/null || echo "")
+    if [[ -z "$rig" ]]; then
+        log_event "skip_no_rig" "\"bead\":\"$bead_id\""
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    root_id=$(find_root_for_molecule "$molecule_id" "$rig")
+    if [[ -z "$root_id" ]]; then
+        log_event "skip_no_root" "\"bead\":\"$bead_id\",\"molecule\":\"$molecule_id\""
+        no_root=$((no_root + 1))
+        continue
+    fi
+
+    root_json=$(bd_show "$root_id")
+    [[ -z "$root_json" ]] && continue
+
+    # Filter: root must carry originating_slack.*.
+    channel_id=$(echo "$root_json" | jq -r '.[0].metadata.originating_slack.channel_id // empty')
+    thread_ts=$(echo "$root_json" | jq -r '.[0].metadata.originating_slack.thread_ts // empty')
+    if [[ -z "$channel_id" || -z "$thread_ts" ]]; then
+        log_event "skip_root_no_slack" "\"bead\":\"$bead_id\",\"root\":\"$root_id\""
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    user_id=$(echo "$root_json" | jq -r '.[0].metadata.originating_slack.user_id // empty')
+    gate_title=$(echo "$bead_json" | jq -r '.[0].title // empty')
+    gate_desc_first_line=$(echo "$bead_json" | jq -r '.[0].description // empty' | head -1 | cut -c1-200)
+
+    # Compose reply body. Plain text, conversational, no markdown
+    # headers (matches loop-close voice convention).
+    tmpfile=$(mktemp /tmp/pl-human-gate-XXXXXX.txt)
+    {
+        if [[ -n "$user_id" ]]; then
+            printf '<@%s> Polecat needs your input on %s.\n\n' "$user_id" "$gate_title"
+        else
+            printf 'Polecat needs your input on %s.\n\n' "$gate_title"
+        fi
+        printf 'Gate: %s\n' "$bead_id"
+        printf 'Root work bead: %s\n' "$root_id"
+        [[ -n "$gate_desc_first_line" ]] && printf 'Context: %s\n' "$gate_desc_first_line"
+        printf '\nResume polecat:\n'
+        printf '  gc bd --rig %s update %s --status=closed --notes "<your decision>"\n' "$rig" "$bead_id"
+        printf '\nOr reply in-thread with the decision (manual relay until thread-watching is wired).\n'
+    } > "$tmpfile"
+
+    # POST to slack thread.
+    if gc slack publish-to-channel \
+        --conversation-id "$channel_id" \
+        --thread-ts "$thread_ts" \
+        ${PUBLISH_SID:+--session "$PUBLISH_SID"} \
+        --body-file "$tmpfile" >/dev/null 2>&1
+    then
+        now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        bd_update_metadata "$bead_id" \
+            "{\"gate_surfaced_at\":\"$now_iso\"}" >/dev/null
+        log_event "posted" "\"bead\":\"$bead_id\",\"root\":\"$root_id\",\"channel\":\"$channel_id\",\"thread_ts\":\"$thread_ts\""
+        posted=$((posted + 1))
+    else
+        log_event "failed" "\"bead\":\"$bead_id\",\"channel\":\"$channel_id\""
+        failed=$((failed + 1))
+    fi
+
+    rm -f "$tmpfile"
+done
+
+log_event "tick" "\"scanned\":${#bead_ids[@]},\"posted\":$posted,\"skipped\":$skipped,\"no_root\":$no_root,\"failed\":$failed"
+
+exit 0

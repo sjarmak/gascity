@@ -1,0 +1,9 @@
+[pack]
+  name = "ds-research"
+  version = ""
+  schema = 1
+
+[imports]
+  [imports.core]
+    source = "https://github.com/gastownhall/gascity.git//internal/bootstrap/packs/core"
+    version = "sha:f895c0ff47d6ee9334ed282a416387eb5b084d24"

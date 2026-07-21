@@ -1,0 +1,6 @@
+[order]
+description = "Mayor session/tmux/supervisor watchdog (auto-recover). Migrated from systemd timer."
+trigger = "cooldown"
+interval = "1m"
+exec = "/home/ds/gas-city/bin/mayor-watchdog"
+timeout = "60s"

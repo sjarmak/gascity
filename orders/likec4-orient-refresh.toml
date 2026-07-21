@@ -1,0 +1,12 @@
+# likec4-orient-refresh — daily: regenerate the LikeC4 orientation summary
+# (architecture/exports/orient.md) for each tracked-model rig so dispatched
+# agents orient off the compact map instead of cold grep-walking the tree
+# (Design A rollout, mayor gc-423468 [C]). Mechanical regen of a generated file
+# only — never commits/pushes, never touches source. Scope = tracked-model rigs
+# (memo §1.3: mem, tom-swe, code-intelligence-digest, website, embertide).
+[order]
+description = "Daily: regenerate architecture/exports/orient.md (derived ~2-5K-token LikeC4 orientation summary) for the tracked-model rigs via bin/likec4-orient. Generated-file refresh only — no commit/push, no source writes. Keeps the dispatch-time orientation map fresh on the model's cadence."
+trigger = "cron"
+schedule = "30 6 * * *"
+exec = "/home/ds/gas-city/bin/likec4-orient-refresh"
+timeout = "5m"

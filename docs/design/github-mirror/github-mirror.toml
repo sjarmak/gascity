@@ -1,0 +1,30 @@
+# github-mirror — push-mirror real work beads to each pilot rig's GitHub repo.
+# STAGED PROPOSAL 2026-07-18; INSTALLED 2026-07-19 as orders/github-mirror.toml
+# with MIRROR_MODE=--execute (Stephanie session approval) plus board env
+# (MIRROR_PROJECT_OWNER/NUMBER) and PRIVATE mirror-repo targets. The live
+# order file is authoritative; this copy is the design-time reference.
+#
+# Context + evidence: docs/design/github-mirror-pilot.md. Requires patched
+# bd 1.1.0 (56e6f65da, beads#4329 cherry-pick); on stock 1.1.0 the #4214 bug
+# re-PATCHes every listed bead each run and burns API quota.
+#
+# Exec order: runs on the orchestrator, no agent, no LLM (mechanical work).
+# Cooldown (not cron) per cadence doctrine: no bootstrap trap, self-pacing.
+# Undo: remove this file from orders/; then per rig `bd config unset
+# github.repository`. Already-mirrored GitHub issues remain (close by hand
+# if the pilot is abandoned).
+
+[order]
+description = "Mirror real work beads to GitHub Issues on pilot rigs (dry-run until MIRROR_MODE flipped)"
+trigger = "cooldown"
+interval = "45m"
+exec = "/home/ds/gas-city/bin/github-mirror"
+timeout = "900s"                 # initial population ~153 creates on mem, chunked; steady-state runs are seconds
+idempotent = true                # re-fire safe: #4329 content-hash skips already-pushed beads without API calls
+
+[order.env]
+MIRROR_RIGS = "/home/ds/projects/mem /home/ds/projects/codeprobe"
+MIRROR_MODE = "--dry-run"        # flip to "--execute" ONLY with promotion annotation naming who/when
+MIRROR_REPO_ALLOWLIST = "sjarmak/"   # hard guard: never mirror to gastownhall/* or other unowned upstreams
+MIRROR_MAX_CREATE = "300"        # abort a rig if new-issue creations would exceed this (blast-radius cap)
+MIRROR_CLOSED_DAYS = "14"        # closed-but-mirrored beads re-pushed within this window so closes propagate

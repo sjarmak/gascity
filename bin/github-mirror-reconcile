@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""github-mirror-reconcile — phase 3 of the beads→GitHub mirror (docs/design/github-mirror-pilot.md).
+
+Two jobs, both read-heavy, run per mirror rig:
+1. INTAKE: open issues on the (private) mirror repo that no bead references are
+   human-filed. Ingest via selective `bd github pull <url>`, then gate behind
+   triage: status=deferred + label origin:github. Triage (human/mayor) flips
+   to open; only then is it dispatchable. Selective pull only — a bulk pull
+   would let GitHub-side echoes overwrite beads (beads is the source of truth).
+2. LOSS/DRIFT SWEEP: mirrored bead whose issue vanished; issue closed on
+   GitHub while the bead is active (human close = triage signal, never
+   auto-applied); real active bead that has stayed unpushed past a threshold
+   (mirror gap). Findings are reported, not auto-fixed.
+
+Reports: audit log always; Slack #gascity-maintenance + mayor nudge when
+findings are new (same idiom as bin/stall-watch), deduped by fingerprint for
+RECONCILE_REALERT_HOURS. Silent when clean.
+
+Env contract (set by orders/github-mirror-reconcile.toml):
+  RECONCILE_RIGS            space-separated rig paths (required)
+  RECONCILE_SLACK           "1" post to Slack (default) | "0" report to stdout/audit only
+  RECONCILE_CHANNEL         default C0B0TQMQF2B (#gascity-maintenance)
+  RECONCILE_REALERT_HOURS   dedup window for repeat findings (default 24)
+  RECONCILE_UNPUSHED_HOURS  age before an unpushed active bead is a mirror gap (default 2)
+  RECONCILE_REPO_ALLOWLIST  default "sjarmak/"
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
+
+from github_mirror_common import (
+    flatten_issue_pages,
+    parse_json_lines,
+    repositories_with_completed_transfers,
+)
+
+CITY = "/home/ds/gas-city"
+AUDIT_LOG = f"{CITY}/.gc/github-mirror-reconcile.log"
+STATE_PATH = f"{CITY}/.gc/github-mirror-reconcile-state.json"
+
+WISP_META_KEYS = ("gc.step_ref", "gc.root_bead_id")
+ACTIVE = {"open", "in_progress", "blocked", "deferred", "hooked"}
+CENTRAL_VIEW_REPOSITORY = "sjarmak/gas-city-beads"
+MIGRATION_STATE_PATH = f"{CITY}/.gc/github-central-mirror-migration-state.json"
+
+
+def run(cmd, cwd="/", env=None):
+    return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+
+
+def rig_env(rig, base=None, repository=None):
+    """bd must target the rig's store explicitly: the gc order controller pins
+    BEADS_DIR to the CITY .beads in every exec env, which silently redirects
+    cwd-based resolution to the city store (found 2026-07-19, first order fire)."""
+    env = dict(base or os.environ)
+    env["BEADS_DIR"] = os.path.join(rig, ".beads")
+    if repository:
+        env["BEADS_GITHUB_REPOSITORY"] = repository
+    return env
+
+
+def is_wisp(bead):
+    meta = bead.get("metadata") or {}
+    if any(meta.get(k) for k in WISP_META_KEYS):
+        return True
+    if meta.get("gc.synthetic") == "true" or meta.get("gc.formula_name") or meta.get("gc.kind") == "workflow":
+        return True
+    return bead.get("issue_type") == "convoy"
+
+
+def parse_ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def configured_repository(rig):
+    return run(
+        ["bd", "config", "get", "github.repository"],
+        cwd=rig,
+        env=rig_env(rig),
+    ).stdout.strip()
+
+
+def list_repo_issues(repo):
+    """Read every issue page, without the old 1,000-item central-repo ceiling."""
+    gh = run([
+        "gh", "api", "--paginate", "--jq", ".[] | @json",
+        f"repos/{repo}/issues?state=all&per_page=100",
+    ])
+    if gh.returncode != 0:
+        raise RuntimeError(f"gh issue list failed: {gh.stderr.strip()[:200]}")
+    return flatten_issue_pages([parse_json_lines(gh.stdout)])
+
+
+def reconcile_rig(rig, env, now, findings, migrated_repositories):
+    repo_out = configured_repository(rig)
+    allow = [p.strip() for p in os.environ.get("RECONCILE_REPO_ALLOWLIST", "sjarmak/").split(",") if p.strip()]
+    if repo_out == CENTRAL_VIEW_REPOSITORY:
+        findings.append(
+            f"[{rig}] CONFIG: central view {repo_out!r} refuses legacy intake/sync — rig skipped"
+        )
+        return
+    if repo_out in migrated_repositories:
+        findings.append(
+            f"[{rig}] CONFIG: {repo_out!r} has completed central transfers; "
+            "legacy reconciliation is permanently fenced"
+        )
+        return
+    if repo_out.endswith("(not set)") or not any(repo_out.startswith(p) for p in allow):
+        findings.append(f"[{rig}] CONFIG: repo {repo_out!r} unset or outside allowlist — rig skipped")
+        return
+    repo = repo_out
+
+    try:
+        issue_list = list_repo_issues(repo)
+        bd = run(
+            ["bd", "list", "--limit", "0", "--json"],
+            cwd=rig,
+            env=rig_env(rig),
+        )
+        if bd.returncode != 0:
+            raise RuntimeError(f"bd list failed: {bd.stderr.strip()[:200]}")
+        beads = json.loads(bd.stdout or "[]")
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        findings.append(f"[{rig}] ERROR: {exc}")
+        return
+    issues = {issue["url"]: issue for issue in issue_list}
+    by_ref = {b["external_ref"]: b for b in beads if b.get("external_ref", "").startswith("http")}
+    unpushed_h = int(os.environ.get("RECONCILE_UNPUSHED_HOURS", "2"))
+
+    for b in beads:
+        status = b.get("status")
+        ref = b.get("external_ref") or ""
+        if ref.startswith("https://github.com/") and ref not in issues:
+            findings.append(f"[{rig}] ISSUE-MISSING: {b['id']} ({status}) references {ref} but the issue is gone")
+        if (status in ACTIVE and not is_wisp(b) and not ref
+                and now - parse_ts(b["created_at"]) > timedelta(hours=unpushed_h)):
+            findings.append(f"[{rig}] UNPUSHED: {b['id']} ({status}) \"{b['title'][:60]}\" active >{unpushed_h}h with no mirror issue")
+
+    for url, issue in issues.items():
+        bead = by_ref.get(url)
+        if bead is None:
+            if issue["state"].lower() == "open":
+                ingest(rig, repo, url, issue, env, findings)
+            continue  # closed unmatched = cleanup artifact, ignore
+        if issue["state"].lower() == "closed" and bead["status"] in ACTIVE:
+            if "gh-closed-pending-triage" not in (bead.get("labels") or []):
+                run(
+                    ["bd", "update", bead["id"], "--add-label", "gh-closed-pending-triage"],
+                    cwd=rig,
+                    env=rig_env(rig),
+                )
+            findings.append(
+                f"[{rig}] GH-CLOSED: issue #{issue['number']} closed on GitHub but "
+                f"{bead['id']} is {bead['status']} — labeled gh-closed-pending-triage "
+                "(push paused); triage: close bead or remove label to reopen"
+            )
+
+
+def ingest(rig, repo, url, issue, env, findings):
+    # Selective pull takes a bare issue number; URL/github:N forms fail Atoi parsing.
+    # Exit code is 0 even on a failed fetch, so success is verified by the
+    # external_ref lookup below, not the return code.
+    pull = run(
+        ["bd", "github", "pull", str(issue["number"])],
+        cwd=rig,
+        env=rig_env(rig, env, repo),
+    )
+    if pull.returncode != 0:
+        findings.append(f"[{rig}] INTAKE-FAILED: pull #{issue['number']}: {pull.stderr.strip()[:200]}")
+        return
+    lookup = run(
+        ["bd", "list", "--limit", "0", "--json"],
+        cwd=rig,
+        env=rig_env(rig),
+    )
+    bead = next((b for b in json.loads(lookup.stdout or "[]") if b.get("external_ref") == url), None)
+    if bead is None:
+        findings.append(f"[{rig}] INTAKE-FAILED: pulled {url} but no bead carries that external_ref")
+        return
+    gate = run(
+        ["bd", "update", bead["id"], "--status", "deferred", "--add-label", "origin:github"],
+        cwd=rig,
+        env=rig_env(rig),
+    )
+    gated = "deferred+origin:github" if gate.returncode == 0 else f"GATE-FAILED: {gate.stderr.strip()[:120]}"
+    findings.append(f"[{rig}] INGESTED: {bead['id']} <- issue #{issue['number']} \"{issue['title'][:60]}\" ({gated}) — triage to dispatch")
+
+
+def publish(lines):
+    channel = os.environ.get("RECONCILE_CHANNEL", "C0B0TQMQF2B")
+    sid = os.environ.get("GC_SESSION_ID")
+    if not sid:
+        ses = run(["gc", "session", "list"], cwd=CITY)
+        sid = next((line.split()[0] for line in ses.stdout.splitlines()
+                    if len(line.split()) > 1 and line.split()[1] == "mayor" and "pin" in line), None)
+    body = "github-mirror-reconcile findings:\n" + "\n".join(lines)
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write(body)
+        path = f.name
+    cmd = ["gc", "slack", "publish-to-channel", "--conversation-id", channel, "--kind", "room"]
+    if sid:
+        cmd += ["--session", sid]
+    ok = run(cmd + ["--body-file", path], cwd=CITY).returncode == 0
+    run(["gc", "session", "nudge", "mayor", body], cwd=CITY)
+    os.unlink(path)
+    return ok
+
+
+def main():
+    rigs = os.environ.get("RECONCILE_RIGS", "").split()
+    if not rigs:
+        sys.exit("RECONCILE_RIGS is required")
+    now = datetime.now(timezone.utc)
+    try:
+        migrated_repositories = repositories_with_completed_transfers(
+            MIGRATION_STATE_PATH
+        )
+    except ValueError as exc:
+        sys.exit(str(exc))
+
+    env = dict(os.environ)
+    if not env.get("GITHUB_TOKEN"):
+        env["GITHUB_TOKEN"] = run(["gh", "auth", "token"]).stdout.strip()
+
+    findings = []
+    for rig in rigs:
+        reconcile_rig(rig, env, now, findings, migrated_repositories)
+
+    state = {}
+    if os.path.exists(STATE_PATH):
+        with open(STATE_PATH) as f:
+            state = json.load(f)
+    realert = timedelta(hours=int(os.environ.get("RECONCILE_REALERT_HOURS", "24")))
+    fresh = [line for line in findings
+             if line.startswith(("[", "I"))
+             and (line not in state or now - parse_ts(state[line]) > realert)]
+    for line in fresh:
+        state[line] = now.isoformat()
+    state = {k: v for k, v in state.items() if now - parse_ts(v) <= 2 * realert}
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f)
+
+    stamp = now.isoformat(timespec="seconds")
+    os.makedirs(os.path.dirname(AUDIT_LOG), exist_ok=True)
+    with open(AUDIT_LOG, "a") as f:
+        f.write(f"{stamp} findings={len(findings)} fresh={len(fresh)}\n")
+        for line in findings:
+            f.write(f"  {line}\n")
+
+    if findings:
+        print("\n".join(findings))
+    else:
+        print("clean")
+    if fresh and os.environ.get("RECONCILE_SLACK", "1") == "1":
+        if not publish(fresh):
+            print("WARNING: slack publish failed (findings still in audit log)", file=sys.stderr)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

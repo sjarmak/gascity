@@ -1,0 +1,6 @@
+[order]
+description = "Daily 09:15: scan workspace memory for refs to upstream issues now closed/merged. Migrated from systemd timer."
+trigger = "cron"
+schedule = "15 9 * * *"
+exec = "/home/ds/gas-city/bin/memory-audit-issues --nudge-mayor"
+timeout = "5m"

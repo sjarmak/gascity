@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# pr-merge-notifier: detect newly-merged PRs Stephanie authored on
+# gastownhall/gascity and surface to slack #gascity-maintenance + mayor mail
+# the moment they land. Real-time, not batched — volume is low enough
+# (2026-05-12: ~5 PRs/day at peak).
+#
+# Why this exists:
+#
+#   Stephanie wants instant confirmation when one of her PRs merges so she
+#   isn't sitting wondering whether to push the next one. Without this,
+#   merges silently happen and only get noticed when she manually checks
+#   `gh pr list --state merged` or a Slack reviewer-bot fires.
+#
+# Usage:
+#   pr-merge-notifier                    # detect + post + mail
+#   pr-merge-notifier --dry-run          # report only, no post/mail
+#   pr-merge-notifier --backfill 7       # consider merges in the last N days
+#                                          (default 1d; useful after outages)
+#
+# State: $CITY/.gc/pr-merge-notifier-state.json — tracks acknowledged Slack
+# and mayor-mail delivery per PR. A PR is globally notified only after both.
+
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+STATE_FILE="${CITY}/.gc/pr-merge-notifier-state.json"
+AUDIT_LOG="${CITY}/.gc/pr-merge-notifier.log"
+SLACK_CHANNEL="${GASCITY_MAINTENANCE_CHANNEL:-C0B25SS12CD}"
+REPO="${GASCITY_REPO:-gastownhall/gascity}"
+
+# Resolve a maintenance session to attribute slack posts to. gc order's
+# exec context strips GC_SESSION_ID/GC_SESSION_NAME, which makes the
+# slack-pack `current_session_id()` lookup bail (see gc-fue0). Pass
+# --session explicitly so the publish payload has the identity it needs.
+# Mayor is preferred; PL is the fallback. Empty string keeps the call
+# shape unchanged — the underlying failure will surface in the audit log
+# via the captured stderr added below.
+# The --json schema this jq targeted was wrong (element indexing errored, so the
+# expr returned empty and every publish failed with "pass --session explicitly";
+# see .gc/pr-merge-notifier.log, PRs 3768/3769/4145). Use the proven text lookup
+# for the pinned mayor, matching escalate-surfacer / flow-patrol / stall-watch.
+PUBLISH_SESSION_ID=$(gc session list 2>/dev/null | awk '$2=="mayor" && /pin/{print $1; exit}')
+
+DRY_RUN=0
+BACKFILL_DAYS=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)   DRY_RUN=1; shift ;;
+    --backfill)  BACKFILL_DAYS="$2"; shift 2 ;;
+    -h|--help)   sed -n 's/^# \{0,1\}//p' "$0" | head -20; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$(dirname "$STATE_FILE")"
+[[ -f "$STATE_FILE" ]] || echo '{"notified_prs":[],"slack_notified_prs":[],"mail_notified_prs":[]}' > "$STATE_FILE"
+
+log_event() {
+  local event="$1" pr="$2" detail="${3:-}"
+  local ts
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq -nc --arg ts "$ts" --arg event "$event" --argjson pr "$pr" --arg detail "$detail" \
+    '{ts: $ts, event: $event, pr: $pr, detail: $detail}' >> "$AUDIT_LOG"
+}
+
+mark_delivered() {
+  local field="$1" pr="$2"
+  if jq --arg field "$field" --argjson pr "$pr" \
+      '.[$field] = ((.[$field] // []) + [$pr] | unique)' \
+      < "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"; then
+    return 0
+  fi
+  rm -f "${STATE_FILE}.tmp"
+  log_event "state_failed" "$pr" "could not persist ${field} acknowledgement"
+  return 1
+}
+
+# Pull recently-merged PRs we authored (or are tagged as author via reviewer credentials).
+SINCE=$(date -u -d "$BACKFILL_DAYS days ago" +%Y-%m-%d)
+RECENT=$(gh pr list --repo "$REPO" --author '@me' --state merged \
+  --search "merged:>=$SINCE" \
+  --json number,title,url,mergedAt,headRefName,mergeCommit,body \
+  --limit 30 2>/dev/null || echo '[]')
+
+if [[ "$RECENT" == "[]" ]]; then
+  exit 0
+fi
+
+NEW_COUNT=0
+echo "$RECENT" | jq -c '.[]' | while read -r pr; do
+  NUM=$(echo "$pr" | jq -r .number)
+  # Legacy notified_prs entries count as both recipients acknowledged. New
+  # entries also retain this global completion marker for compatibility.
+  if jq -e --argjson pr "$NUM" '(.notified_prs // []) | index($pr) != null' "$STATE_FILE" >/dev/null; then
+    continue
+  fi
+  SLACK_DONE=0
+  MAIL_DONE=0
+  if jq -e --argjson pr "$NUM" '(.slack_notified_prs // []) | index($pr) != null' "$STATE_FILE" >/dev/null; then
+    SLACK_DONE=1
+  fi
+  if jq -e --argjson pr "$NUM" '(.mail_notified_prs // []) | index($pr) != null' "$STATE_FILE" >/dev/null; then
+    MAIL_DONE=1
+  fi
+
+  TITLE=$(echo "$pr" | jq -r .title)
+  URL=$(echo "$pr" | jq -r .url)
+  MERGED_AT=$(echo "$pr" | jq -r .mergedAt)
+  HEAD=$(echo "$pr" | jq -r .headRefName)
+  SHA=$(echo "$pr" | jq -r '.mergeCommit.oid // "?"' | head -c 8)
+  CLOSES=$(echo "$pr" | jq -r '.body // ""' | grep -oE '(Closes|Fixes) #[0-9]+' | head -3 | paste -sd ', ' -)
+
+  BODY="✓ MERGED: PR #${NUM} — ${TITLE}
+  Branch: ${HEAD}
+  Merge SHA: ${SHA}
+  Merged at: ${MERGED_AT}
+  ${CLOSES:+Issues closed: ${CLOSES}}
+  URL: ${URL}"
+
+  log_event "merge_detected" "$NUM" "$TITLE"
+
+  if (( DRY_RUN )); then
+    echo "[dry-run] would notify: PR #${NUM} — ${TITLE}"
+  else
+    if (( ! SLACK_DONE )); then
+      # Post to slack channel.
+      TMPFILE=$(mktemp)
+      PUBLISH_STDERR=$(mktemp)
+      echo "$BODY" > "$TMPFILE"
+      if gc slack publish-to-channel \
+           --conversation-id "$SLACK_CHANNEL" \
+           ${PUBLISH_SESSION_ID:+--session "$PUBLISH_SESSION_ID"} \
+           --body-file "$TMPFILE" 2>"$PUBLISH_STDERR" >/dev/null; then
+        if mark_delivered slack_notified_prs "$NUM"; then
+          SLACK_DONE=1
+          log_event "slack_posted" "$NUM" ""
+        fi
+      else
+        detail=$(head -c 200 "$PUBLISH_STDERR" | tr '\n' ' ')
+        log_event "slack_failed" "$NUM" "publish-to-channel returned non-zero: ${detail}"
+      fi
+      rm -f "$TMPFILE" "$PUBLISH_STDERR"
+    fi
+
+    if (( ! MAIL_DONE )); then
+      # Mail mayor (mayor's auto-mail-check on wakeup picks this up).
+      if gc mail send mayor -s "PR #${NUM} merged: ${TITLE}" -m "$BODY" >/dev/null 2>&1; then
+        if mark_delivered mail_notified_prs "$NUM"; then
+          MAIL_DONE=1
+          log_event "mail_sent" "$NUM" ""
+        fi
+      else
+        log_event "mail_failed" "$NUM" "gc mail send returned non-zero"
+      fi
+    fi
+  fi
+
+  # The declared order contract requires both recipients. Keep partial
+  # acknowledgement per recipient and globally deduplicate only after both.
+  if ! (( DRY_RUN )) && (( SLACK_DONE && MAIL_DONE )); then
+    mark_delivered notified_prs "$NUM" || true
+  fi
+
+  NEW_COUNT=$((NEW_COUNT + 1))
+done
+
+exit 0

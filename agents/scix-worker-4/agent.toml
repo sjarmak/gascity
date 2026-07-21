@@ -1,0 +1,5 @@
+dir = "/home/ds/projects/scix_experiments"
+provider = "claude-5"
+
+[env]
+CLAUDE_BINARY = "claude-auto"

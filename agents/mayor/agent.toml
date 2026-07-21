@@ -1,0 +1,5 @@
+scope = "city"
+# 2026-07-17: trial the logged-in Amp account for the always-on mayor.
+provider = "amp"
+max_active_sessions = 1
+idle_timeout = "30m"

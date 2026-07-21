@@ -1,0 +1,10 @@
+# codebase-audit-monthly — mayor gc-431375 (Stephanie GO). Monthly: nudge the mayor
+# to run the durable gascity-codebase-audit workflow primitive (.claude/workflows/
+# gascity-codebase-audit.js) + the deterministic post-run steps (save report, update
+# RFC #3789, post Slack). ZFC-clean: the auditor MODELS judge; this order just paces.
+[order]
+description = "Monthly (1st): nudge mayor to run the gascity-codebase-audit workflow (12 subsystem + 4 cross-cutting + approved-PR auditors -> verify -> prioritized report) and update RFC #3789 + post the Slack digest. The audit primitive is a saved workflow; the order paces it."
+trigger = "cron"
+schedule = "0 9 1 * *"
+exec = "/home/ds/gas-city/bin/codebase-audit-dispatch --focus full"
+timeout = "2m"

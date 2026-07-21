@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# gc-clear-locks: remove stale dolt LOCK files across all rigs.
+# Safe to run when no bd processes are active. The controller
+# should be stopped first (gc stop) for a clean sweep.
+set -euo pipefail
+
+RIGS=(CodeScaleBench EnterpriseBench codeprobe agent-diagnostics scix_experiments background-agents GEO mcp-ax sourcegraph)
+
+# Kill any lingering bd processes
+bd_count=$(pgrep -c bd 2>/dev/null || echo 0)
+if [ "$bd_count" -gt 0 ]; then
+  echo "Killing $bd_count stale bd processes..."
+  pkill -9 -f "bd " 2>/dev/null || true
+  sleep 1
+fi
+
+cleared=0
+for rig in "${RIGS[@]}"; do
+  locks=$(find "/home/ds/$rig/.beads" -name "LOCK" -o -name "*.lock" 2>/dev/null | grep -v "dolt-server.lock" || true)
+  if [ -n "$locks" ]; then
+    echo "$rig:"
+    echo "$locks" | while read -r f; do
+      rm -f "$f"
+      echo "  removed $f"
+      cleared=$((cleared + 1))
+    done
+  fi
+done
+
+echo "Done. Cleared locks in ${#RIGS[@]} rigs."

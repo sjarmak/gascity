@@ -1,0 +1,787 @@
+#!/usr/bin/env python3
+"""polecat-ui-stuck-scanner: auto-detect + reset sessions wedged at a UI modal.
+
+Some agent runtimes (Claude Code's slash-command selector, model picker, theme
+picker, etc.) park the process at an interactive prompt that is NOT a "safe
+boundary" for queued message delivery. The session reads as `active` in
+`gc session list` (the runtime is alive) but it is unreachable for routed
+work — effectively offline.
+
+This scanner peeks every active session in the configured pools, matches the
+trailing prompt against a set of UI-modal markers, and auto-resets sessions
+that have been parked for at least STUCK_THRESHOLD_SEC seconds.
+
+Detection is mechanical pattern-matching against a fixed marker list — no
+semantic judgment. Every action is logged + mayor is mailed.
+
+Env:
+  STUCK_THRESHOLD_SEC    auto-reset cutoff in seconds (default 600 = 10m)
+  POLECAT_POOLS_CSV      comma-separated pool template paths to scan
+                         (default: /home/ds/gascity/polecat,/home/ds/gascity-packs/gascity-packs-polecat)
+  LOG_PATH               default: /home/ds/.gc/polecat-ui-stuck.log
+  AUTO_RESET             non-empty = reset stuck sessions (destructive). Default
+                         OFF: surface-only (nudge + mail mayor), never reset.
+  DRY_RUN                non-empty = detect + log only, no nudge/mail/reset
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Supervisor API — used to detect permission/approval "pending interactions"
+# (e.g. Claude Code "Do you want to allow…" prompts) that the UI-modal marker
+# list does NOT catch. The supervisor already detects these per session; we
+# surface them to the mayor exactly like a parked UI modal.
+API_BASE = os.environ.get("GC_API_BASE_URL", "http://127.0.0.1:8372").rstrip("/")
+CITY_NAME = os.environ.get("GC_CITY_NAME", "ds-research")
+
+# High-precision modal-selector markers only. "esc to interrupt" is deliberately
+# EXCLUDED: it shows while the agent is ACTIVELY processing a long tool call, so
+# pairing it with a stale last_active would false-positive on healthy long work.
+UI_MODAL_MARKERS = [
+    "Enter to select",
+    "↑/↓ to navigate",
+    "Esc to cancel",
+    "Type something",
+    "Select model",
+    "Select theme",
+    "Choose a",
+    "/help for help",
+]
+# Strong modal-SELECTOR markers: an interactive picker the agent is parked at,
+# which a text nudge provably CANNOT clear (a TUI selector eats the keystroke as
+# navigation, not a prompt). Only these justify an auto-reset. The weaker markers
+# above ("Type something", "/help for help") also appear in a HEALTHY idle prompt
+# placeholder, so they stay surface-only — resetting on them would kill idle-but-
+# fine workers (cf. mayor-watchdog reset-storm). Reset clears the wedge; the
+# session respawns clean (which is how these self-heal today, just faster).
+SELECTOR_MARKERS = [
+    "Enter to select",
+    "↑/↓ to navigate",
+    "Select model",
+    "Select theme",
+    "Choose a",
+]
+# Auth-wedge markers: a session dropped into Claude Code's interactive OAuth
+# LOGIN flow. A headless agent cannot complete an interactive login, so it hangs
+# here forever while still reading `active` (tmux alive) — the silent multi-hour
+# stall class (city-infra-pl, 2026-07-10). These strings NEVER appear in a
+# healthy running session, so a single match is authoritative. Unlike a UI modal,
+# a reset does NOT fix this: the session respawns onto the SAME bad-cred account
+# and re-wedges. The only real fix is account-level (/ds-cred the account or
+# re-pin the agent to a healthy account), so this class is surface+escalate, and
+# it scans EVERY session (PLs/named too), not just the polecat pools.
+AUTH_WEDGE_MARKERS = [
+    "Paste code here",
+    "oauth/authorize",
+    "Browser didn't open? Use the url below to sign in",
+    "OAuth error: Invalid code",
+    "Please make sure the full code was copied",
+]
+THRESHOLD_SEC = int(os.environ.get("STUCK_THRESHOLD_SEC", "600"))
+# An OAuth-login screen persisting even briefly means a headless agent is wedged
+# (it can't self-complete the login). Low threshold: catch it in minutes, not the
+# 6h idle window — a wedged agent often keeps a fresh last_active churning the
+# retry prompt, so the idle-based threshold would never fire.
+AUTH_WEDGE_THRESHOLD_SEC = int(os.environ.get("AUTH_WEDGE_THRESHOLD_SEC", "120"))
+# Bound the all-sessions peek fan-out so the pass stays cheap even under heavy
+# gc load (peeks are serial + can be slow). More than the fleet's session count;
+# if hit, the remaining sessions are covered next cycle.
+AUTH_WEDGE_MAX_PEEKS = int(os.environ.get("AUTH_WEDGE_MAX_PEEKS", "40"))
+# Concurrency for the shared peek fan-out (ui-modal + auth-wedge passes peek
+# each unique session once). Gentle on the slow gc API while still collapsing
+# serial latency: ~11s/peek under load makes serial peeking blow the 2m order
+# timeout, which is exactly what happened for 2+ days before 2026-07-19.
+AUTH_WEDGE_PEEK_WORKERS = int(os.environ.get("AUTH_WEDGE_PEEK_WORKERS", "6"))
+# A control-dispatcher reads `active` (runtime alive) but processes routed-bead
+# nudges; if it sits idle past this it is wedged (a healthy dispatcher acts
+# promptly or goes asleep) and routed-bead-nudger hammers it forever while its
+# pool work strands. High threshold (6h) keeps transient idleness from flagging.
+DISPATCHER_STALE_SEC = int(os.environ.get("DISPATCHER_STALE_SEC", "21600"))
+# Level-triggered dedup state (dr-phcu). The old scheme was keyed by session-id
+# only and merely rate-limited (re-mail every 4h FOREVER while stuck) — a
+# week-long wedge produced ~40 identical mails; across sessions, a 474-alert
+# flood. Now: one entry per session+signature, alert on NEW, re-alert only at
+# the scan counts below (at the 5m cadence: ~0m / 15m / 75m / ~5h15m — max 4
+# alerts per episode), then log-only until the signature clears, which emits
+# exactly one RESOLVED mail. Recovery actions (reset/kill) fire at the same
+# points, so a failed heal is retried on the escalation schedule, not never.
+ESCALATION_ALERT_COUNTS = (1, 4, 16, 64)
+# Entries whose signature has not been seen for this long are pruned (log-only).
+# Normal exit is resolution (session gone / peeked clean); the TTL only catches
+# entries whose session can never be examined again (e.g. peek hangs forever).
+STATE_TTL_SEC = int(os.environ.get("STUCK_STATE_TTL_SEC", str(7 * 86400)))
+COOLDOWN_PATH = os.environ.get(
+    "STUCK_COOLDOWN_PATH", "/home/ds/.gc/stuck-scanner-cooldown.json"
+)
+POOLS_CSV = os.environ.get(
+    "POLECAT_POOLS_CSV",
+    "/home/ds/gascity/polecat,/home/ds/gascity-packs/gascity-packs-polecat",
+)
+POOLS = [p.strip() for p in POOLS_CSV.split(",") if p.strip()]
+# Auto-cover every pool by naming convention: a pool worker's template basename
+# ends in "worker" or "polecat", optionally with a numbered slot suffix
+# (e.g. zeldascension-worker, scix-worker-3, gascity-packs-polecat, .../polecat).
+# Named sessions (mayor, control-dispatcher, *.project-lead) do not match, so
+# they are never actioned. New rigs are scanned without touching POLECAT_POOLS_CSV.
+POOL_SUFFIX_RX = re.compile(r"(?:worker|polecat)(?:-\d+)?$")
+LOG_PATH = Path(os.environ.get("LOG_PATH", "/home/ds/.gc/polecat-ui-stuck.log"))
+AUTO_RESET = bool(os.environ.get("AUTO_RESET", "").strip())
+DRY_RUN = bool(os.environ.get("DRY_RUN", "").strip())
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def log_line(payload: dict) -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_PATH.open("a") as f:
+        f.write(json.dumps({"ts": now_iso(), **payload}) + "\n")
+
+
+def parse_age_seconds(age_str: str) -> int:
+    """Seconds since last activity.
+
+    `gc session list --json` emits `last_active` as an RFC3339 timestamp
+    (e.g. '2026-06-01T23:10:08-04:00'); the human table emits relative
+    strings ('5h ago'). Handle both — RFC3339 first, relative as fallback.
+    """
+    if not age_str or age_str == "-":
+        return 0
+    s = age_str.strip()
+    # RFC3339 timestamp (the --json shape the scanner actually receives).
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+    except ValueError:
+        pass
+    # Relative-age fallback ('5h ago', '36m ago', '12s ago').
+    m = re.match(r"^(\d+)([smhd])\b", s)
+    if not m:
+        return 0
+    n = int(m.group(1))
+    unit = m.group(2)
+    return {"s": n, "m": n * 60, "h": n * 3600, "d": n * 86400}[unit]
+
+
+def fetch_active_sessions() -> list[dict] | None:
+    """Every active session, fetched ONCE per scan (a `gc session list` costs
+    ~7s under load; the three passes used to each pay it).
+
+    None (not []) on a failed/unparseable list: the dedup's resolution pass
+    must treat that as 'not examined' and carry state, or a transient list
+    failure would false-resolve every open episode."""
+    try:
+        result = subprocess.run(
+            ["gc", "session", "list", "--json"],
+            capture_output=True, text=True, timeout=45,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    raw_sessions = data.get("sessions") if isinstance(data, dict) else data
+    if not isinstance(raw_sessions, list):
+        return None
+    return [s for s in raw_sessions if s.get("state") == "active"]
+
+
+def filter_pool_sessions(active: list[dict]) -> list[dict]:
+    """Sessions whose template path matches one of the configured pools."""
+    matched = []
+    for s in active:
+        template = s.get("template") or ""
+        basename = template.rsplit("/", 1)[-1]
+        if not (
+            any(template == pool or template.endswith(pool) for pool in POOLS)
+            or POOL_SUFFIX_RX.search(basename)
+        ):
+            continue
+        matched.append(s)
+    return matched
+
+
+def peek_session(session_id: str, timeout: int = 30) -> str:
+    """Return the trailing prompt output from `gc session peek`."""
+    try:
+        result = subprocess.run(
+            ["gc", "session", "peek", session_id],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout or ""
+
+
+def detect_markers(peek_output: str) -> list[str]:
+    return [m for m in UI_MODAL_MARKERS if m in peek_output]
+
+
+def detect_auth_markers(peek_output: str) -> list[str]:
+    return [m for m in AUTH_WEDGE_MARKERS if m in peek_output]
+
+
+def resolve_account(session: dict) -> str | None:
+    """Best-effort map a session to its pinned Claude account number via the
+    agent's provider (claude-N). Returns 'N' or None if unresolvable."""
+    agents_dir = Path("/home/ds/gas-city/agents")
+    cands = []
+    for k in ("alias", "name", "target", "template"):
+        v = session.get(k) or ""
+        if v:
+            cands.append(v.rsplit("/", 1)[-1])
+    seen = set()
+    for cand in cands:
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        toml = agents_dir / cand / "agent.toml"
+        try:
+            text = toml.read_text()
+        except OSError:
+            continue
+        m = re.search(r'provider\s*=\s*"claude-(\w+)"', text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def session_pending(session_id: str) -> dict | None:
+    """The supervisor's pending-interaction for a session, or None.
+
+    This is a permission/approval prompt (the runtime is blocked waiting on a
+    human answer) — a class the UI-modal markers miss. Authoritative + purely
+    mechanical: we surface whatever the supervisor reports, no guessing.
+    """
+    url = f"{API_BASE}/v0/city/{CITY_NAME}/session/{urllib.parse.quote(session_id, safe='')}/pending"
+    try:
+        req = urllib.request.Request(url, headers={"X-GC-Request": "1"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.load(r)
+    except (urllib.error.URLError, json.JSONDecodeError, OSError):
+        return None
+    pending = data.get("pending") if isinstance(data, dict) else None
+    return pending if isinstance(pending, dict) else None
+
+
+def state_key(pass_name: str, sid: str, signature: str) -> str:
+    return f"{pass_name}|{sid}|{signature}"
+
+
+def _load_state() -> tuple[dict, bool]:
+    """Return (entries, load_error).
+
+    entries: {key: {first_seen, last_seen, count, alerts_sent, sig}} where
+    key = 'pass|sid|signature'. FAIL-OPEN by design: on a parse error return
+    ({}, True) — the caller must then alert unconditionally (never silently
+    suppress) and skip resolution (no reliable prior); the next save rewrites
+    a clean v2 file. The legacy v1 shape (sid -> iso string) maps to empty
+    entries: currently-stuck sessions re-alert once as NEW, then dedup resumes.
+    """
+    try:
+        with open(COOLDOWN_PATH) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return {}, False
+    except (OSError, json.JSONDecodeError):
+        return {}, True
+    if isinstance(raw, dict) and raw.get("v") == 2 and isinstance(raw.get("entries"), dict):
+        return raw["entries"], False
+    if isinstance(raw, dict):  # legacy v1 (sid -> iso timestamp)
+        return {}, False
+    return {}, True
+
+
+def _save_state(entries: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(COOLDOWN_PATH), exist_ok=True)
+        with open(COOLDOWN_PATH, "w") as f:
+            json.dump({"v": 2, "entries": entries}, f)
+    except OSError as e:
+        # Losing the save degrades to re-alerting next scan (fail-open), never
+        # to suppression — but it must be visible, not swallowed.
+        log_line({"event": "state-save-failed", "error": str(e)[:200]})
+
+
+def observe_key(entries: dict, key: str, signature: str, state_error: bool = False) -> tuple[bool, dict]:
+    """Record 'this signature is present this scan'; return (should_alert, entry).
+
+    Alerts fire at ESCALATION_ALERT_COUNTS then never again for this episode
+    (log-only) until the key resolves. state_error=True forces should_alert:
+    a broken state file must flood (the old behavior), never suppress.
+    """
+    now = now_iso()
+    prior = entries.get(key)
+    if isinstance(prior, dict):
+        entry = {**prior, "last_seen": now, "count": int(prior.get("count", 0)) + 1,
+                 "sig": signature}
+    else:
+        entry = {"first_seen": now, "last_seen": now, "count": 1,
+                 "alerts_sent": 0, "sig": signature}
+    should_alert = state_error or entry["count"] in ESCALATION_ALERT_COUNTS
+    if should_alert:
+        entry["alerts_sent"] = int(entry.get("alerts_sent", 0)) + 1
+    entries[key] = entry
+    return should_alert, entry
+
+
+def episode_line(entry: dict) -> str:
+    """One aggregated line for mail bodies: how long, how many scans, how many
+    alerts — the level-triggered replacement for a fresh full report each time."""
+    return (
+        f"episode: seen {entry.get('count', '?')} scan(s), "
+        f"first_seen {entry.get('first_seen', '?')}, last_seen {entry.get('last_seen', '?')}, "
+        f"alerts {entry.get('alerts_sent', '?')}/{len(ESCALATION_ALERT_COUNTS)} "
+        f"(further alerts suppressed until the state changes)"
+    )
+
+
+def filter_stale_dispatchers(active: list[dict]) -> list[dict]:
+    """Active control-dispatcher sessions idle past DISPATCHER_STALE_SEC.
+
+    These are wedged: alive but not converting routed-bead nudges. The id check
+    spans alias/name/target/template since the dispatcher handle varies by wire."""
+    out = []
+    for s in active:
+        ident = " ".join(
+            str(s.get(k) or "") for k in ("alias", "name", "target", "template")
+        )
+        if "control-dispatcher" not in ident:
+            continue
+        age = parse_age_seconds(s.get("last_active") or s.get("activity_age") or "-")
+        if age < DISPATCHER_STALE_SEC:
+            continue
+        out.append({**s, "_age_sec": age, "_ident": ident.strip()})
+    return out
+
+
+def nudge_session(session_id: str) -> tuple[bool, str]:
+    # `gc session nudge` REQUIRES a message (id alone errors with "requires at
+    # least 2 arg(s)") — every surface-only nudge silently failed until
+    # 2026-07-19 because of the missing arg.
+    result = subprocess.run(
+        ["gc", "session", "nudge", session_id,
+         "polecat-ui-stuck-scanner: this session appears parked at a prompt; "
+         "if you are waiting on input, dismiss it and continue your work."],
+        capture_output=True, text=True, timeout=30,
+    )
+    return result.returncode == 0, (result.stdout + result.stderr).strip()
+
+
+def reset_session(session_id: str) -> tuple[bool, str]:
+    result = subprocess.run(
+        ["gc", "session", "reset", session_id],
+        capture_output=True, text=True, timeout=30,
+    )
+    return result.returncode == 0, (result.stdout + result.stderr).strip()
+
+
+def kill_session(session_id: str) -> tuple[bool, str]:
+    """Kill a session — the ONLY recovery that clears a wedged dispatcher.
+
+    A wedged control-dispatcher trips the named-session circuit breaker, so
+    `gc session reset`/`wake` SILENTLY NO-OP (the recurring band-aid that never
+    stuck). Only `gc session kill` clears the breaker; the supervisor then
+    respawns the dispatcher fresh. Used for the wedged-dispatcher pass only.
+    """
+    result = subprocess.run(
+        ["gc", "session", "kill", session_id],
+        capture_output=True, text=True, timeout=30,
+    )
+    return result.returncode == 0, (result.stdout + result.stderr).strip()
+
+
+def mail_mayor(session_id: str, target: str, reason: str, age_sec: int, action: str,
+               entry: dict | None = None) -> None:
+    subject = f"stuck agent session: {session_id} ({target}) — {reason[:60]}"
+    episode = (episode_line(entry) + "\n") if entry else ""
+    body = (
+        f"polecat-ui-stuck-scanner: an agent session is blocked waiting on input.\n"
+        f"No agent should sit blocked on a human prompt — triage this, auto-handle\n"
+        f"routine/permission cases, and escalate only a genuine decision to Stephanie.\n\n"
+        f"session: {session_id}\n"
+        f"target: {target}\n"
+        f"blocked on: {reason}\n"
+        f"idle: {age_sec}s (threshold: {THRESHOLD_SEC}s)\n"
+        f"{episode}"
+        f"action taken: {action}\n"
+        f"auto_reset_enabled: {AUTO_RESET}\n"
+        f"Triage: peek `gc session peek {session_id}`; respond/approve, or "
+        f"reset `gc session reset {session_id}` if genuinely wedged.\n"
+    )
+    subprocess.run(
+        ["gc", "mail", "send", "mayor/", "-s", subject, "-m", body],
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+def mail_resolved(key: str, entry: dict) -> None:
+    """Exactly one closing mail when a tracked signature clears (session became
+    active / peeked clean / closed) — lets the mayor tie off the episode."""
+    pass_name, sid, sig = (key.split("|", 2) + ["", ""])[:3]
+    subject = f"resolved: stuck session {sid} ({pass_name}) — {sig[:50]}"
+    body = (
+        f"polecat-ui-stuck-scanner: a previously-reported stuck signature has cleared.\n\n"
+        f"session: {sid}\n"
+        f"class: {pass_name}\n"
+        f"signature: {sig}\n"
+        f"{episode_line(entry)}\n"
+        f"No action needed — this closes the earlier alert(s) for this episode.\n"
+    )
+    subprocess.run(
+        ["gc", "mail", "send", "mayor/", "-s", subject, "-m", body],
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+def main() -> int:
+    # Level-triggered dedup state shared across all three passes (dr-phcu):
+    # one entry per session+signature, bounded escalation, one resolved mail
+    # when the signature clears. state_error=True means the state file was
+    # unreadable — FAIL-OPEN: alert everything detected this scan (worst case
+    # is the old flood, never a silently-missed stuck session) and skip
+    # resolution (no reliable prior); the save rewrites a clean v2 file.
+    entries, state_error = _load_state()
+    if state_error:
+        log_line({"event": "state-load-error", "path": COOLDOWN_PATH,
+                  "note": "fail-open: alerting without dedup this scan"})
+    observed: set[str] = set()
+    # ONE `gc session list` (~7s under load) feeds all three passes, and ONE
+    # parallel fan-out peeks every unique session the ui + auth passes need.
+    # Peeks cost ~11s each under load; the old shape (3 list calls + up to ~29
+    # SERIAL ui peeks + a separate auth fan-out) blew the order's 2m timeout on
+    # every run once the fleet grew — no completed scan for 2+ days, so no
+    # state save, no dedup, no resolution.
+    all_list = fetch_active_sessions()
+    ui_list = filter_pool_sessions(all_list) if all_list is not None else None
+    disp_list = filter_stale_dispatchers(all_list) if all_list is not None else None
+    auth_candidates = [
+        s for s in all_list or []
+        if parse_age_seconds(s.get("last_active") or s.get("activity_age") or "-")
+        >= AUTH_WEDGE_THRESHOLD_SEC
+    ][:AUTH_WEDGE_MAX_PEEKS]
+    ui_clear: set[str] = set()      # active again (age < threshold) => modal gone
+    ui_stale: list[dict] = []       # pool sessions past the ui threshold (peeked)
+    for s in ui_list or []:
+        sid = s.get("id") or ""
+        age_sec = parse_age_seconds(s.get("last_active") or s.get("activity_age") or "-")
+        if age_sec < THRESHOLD_SEC:
+            # Fresh activity: a parked modal produces none, so any prior
+            # ui-episode for this session has cleared.
+            ui_clear.add(sid)
+        else:
+            ui_stale.append(s)
+    peek_sids = list(dict.fromkeys(
+        [s.get("id") or "" for s in ui_stale]
+        + [s.get("id") or "" for s in auth_candidates]
+    ))
+    peeks: dict[str, str] = {}
+    if peek_sids:
+        with ThreadPoolExecutor(max_workers=AUTH_WEDGE_PEEK_WORKERS) as ex:
+            futs = {ex.submit(peek_session, psid, 25): psid for psid in peek_sids}
+            for f, psid in futs.items():
+                try:
+                    peeks[psid] = f.result()
+                except Exception:
+                    peeks[psid] = ""
+    ui_examined: set[str] = set()   # peeked with real output this scan
+    actioned = 0
+    seen = len(ui_list or [])
+    for s in ui_stale:
+        sid = s.get("id") or ""
+        target = s.get("target") or s.get("template") or ""
+        last_active = s.get("last_active") or s.get("activity_age") or "-"
+        age_sec = parse_age_seconds(last_active)
+        peek = peeks.get(sid, "")
+        if peek:
+            ui_examined.add(sid)
+        markers = detect_markers(peek)
+        pending = session_pending(sid)
+        if not markers and pending is None:
+            continue
+        # Build a human reason from whichever signal(s) fired. UI-modal markers
+        # (slash/model/theme selectors) and supervisor pending-interactions
+        # (permission/approval prompts) are independent stuck classes.
+        reason_parts: list[str] = []
+        sig_parts: list[str] = sorted(markers)
+        if markers:
+            reason_parts.append("ui-modal: " + ", ".join(markers))
+        if pending is not None:
+            kind = pending.get("kind") or "interaction"
+            prompt = (pending.get("prompt") or "")[:140]
+            reason_parts.append(f"pending {kind}: {prompt}".rstrip(": "))
+            sig_parts.append(f"pending:{kind}")
+        reason = "; ".join(reason_parts)
+        sig = ":".join(sig_parts)
+        key = state_key("ui", sid, sig)
+        observed.add(key)
+        should_alert, entry = observe_key(entries, key, sig, state_error)
+        log_line({
+            "event": "stuck-detected",
+            "session_id": sid, "target": target,
+            "age_sec": age_sec, "markers": markers,
+            "pending_kind": (pending or {}).get("kind"),
+            "count": entry["count"], "alert": should_alert,
+        })
+        if DRY_RUN:
+            log_line({"event": "would-alert" if should_alert else "dedup-suppressed",
+                      "session_id": sid, "key": key, "dry_run": True})
+            if should_alert:
+                actioned += 1
+            continue
+        if not should_alert:
+            # Same signature between escalation points: log-only. The next
+            # alert (and heal retry) fires at the next escalation count; a
+            # RESOLVED mail fires when the signature clears.
+            log_line({"event": "dedup-suppressed", "session_id": sid,
+                      "key": key, "count": entry["count"]})
+            continue
+        # A real modal SELECTOR cannot be cleared by a text nudge (the TUI eats
+        # the keystroke as navigation), so for that high-precision class we reset
+        # to actually clear the wedge — regardless of the global AUTO_RESET flag.
+        # Pending-permission-only or weak-placeholder matches stay surface-only
+        # (a permission prompt may want a real mayor answer, not a blind reset).
+        selector_hit = any(m in markers for m in SELECTOR_MARKERS)
+        if selector_hit or AUTO_RESET:
+            ok, msg = reset_session(sid)
+            log_line({
+                "event": "reset" if ok else "reset-failed",
+                "session_id": sid, "ok": ok, "msg": msg[:200],
+                "trigger": "selector" if selector_hit else "auto_reset",
+            })
+            mail_mayor(sid, target, reason, age_sec,
+                       f"reset ({'ok' if ok else 'failed'}) — modal selector, nudge can't clear",
+                       entry)
+        else:
+            ok, msg = nudge_session(sid)
+            log_line({
+                "event": "nudge" if ok else "nudge-failed",
+                "session_id": sid, "ok": ok, "msg": msg[:200],
+            })
+            mail_mayor(sid, target, reason, age_sec,
+                       f"nudge ({'ok' if ok else 'failed'}) — surface-only, no reset",
+                       entry)
+        actioned += 1
+    # Wedged-dispatcher pass. A nudge won't help (the dispatcher is ALREADY
+    # being over-nudged by routed-bead-nudger — that's the symptom) and a reset
+    # NO-OPs (the wedge trips the named-session circuit breaker). The only
+    # recovery that works is `gc session kill` (clears the breaker -> supervisor
+    # respawns fresh). Every item here came from filter_stale_dispatchers(), which
+    # already matched the control-dispatcher CLASS ("control-dispatcher" in
+    # ident) — so this pass auto-kills its own class even when the global
+    # AUTO_RESET flag is off (mirrors the ui-modal `selector_hit or AUTO_RESET`
+    # gate). A dispatcher kill is cheap (a fresh respawn, no work lost).
+    # Persist dedup progress between passes: alerts have already gone out, so
+    # their counts must survive even if a later pass hits the order timeout.
+    if not DRY_RUN:
+        _save_state(entries)
+    dispatchers_seen = 0
+    for d in disp_list or []:
+        dispatchers_seen += 1
+        sid = d.get("id") or ""
+        target = (
+            d.get("alias") or d.get("name") or d.get("target")
+            or d.get("template") or d["_ident"]
+        )
+        age_sec = d["_age_sec"]
+        reason = (
+            f"wedged dispatcher: active but idle {age_sec // 3600}h — routed-bead "
+            f"nudges are looping unconverted (its pool work is stranding)"
+        )
+        key = state_key("disp", sid, "wedged-dispatcher")
+        observed.add(key)
+        should_alert, entry = observe_key(entries, key, "wedged-dispatcher", state_error)
+        log_line({
+            "event": "stuck-dispatcher-detected",
+            "session_id": sid, "target": target, "age_sec": age_sec,
+            "count": entry["count"], "alert": should_alert,
+        })
+        if DRY_RUN:
+            log_line({"event": "would-alert" if should_alert else "dedup-suppressed",
+                      "session_id": sid, "key": key, "dry_run": True})
+            if should_alert:
+                actioned += 1
+            continue
+        if not should_alert:
+            log_line({"event": "dedup-suppressed", "session_id": sid,
+                      "key": key, "count": entry["count"]})
+            continue
+        # The control-dispatcher class auto-acts on its own (it is the specific
+        # wedge this scanner exists to heal); honor the global AUTO_RESET too.
+        is_wedged_dispatcher = "control-dispatcher" in (d.get("_ident") or "")
+        if is_wedged_dispatcher or AUTO_RESET:
+            ok, msg = kill_session(sid)
+            log_line({
+                "event": "kill" if ok else "kill-failed",
+                "session_id": sid, "ok": ok, "msg": msg[:200],
+                "trigger": "wedged-dispatcher" if is_wedged_dispatcher else "auto_reset",
+            })
+            mail_mayor(
+                sid, target, reason, age_sec,
+                f"kill ({'ok' if ok else 'failed'}) — wedge trips the circuit "
+                "breaker so reset/wake no-op; kill clears it and the supervisor "
+                "respawns the dispatcher fresh",
+                entry,
+            )
+        else:
+            mail_mayor(
+                sid, target, reason, age_sec,
+                "surface-only (no kill) — mayor: verify the pool has routed/open "
+                "work, then `gc session kill` the dispatcher if wedged",
+                entry,
+            )
+        actioned += 1
+
+    # Auth-wedge pass. Scans EVERY active session (not just pools) for the OAuth
+    # login screen — the silent stall that hung city-infra-pl for hours while it
+    # read `active`. Surface+escalate only: a reset respawns onto the SAME
+    # bad-cred account and re-wedges, so the fix is account-level (/ds-cred or
+    # re-pin). Never auto-resets, regardless of AUTO_RESET.
+    if not DRY_RUN:
+        _save_state(entries)
+    auth_seen = 0
+    # Candidates were computed up top (age past the auth threshold, capped) and
+    # their peeks came from the shared fan-out — no second list, no re-peek.
+    # Examined = peeked with real output; only those may resolve an auth
+    # episode (an auth-wedged session can keep last_active fresh by churning
+    # the retry prompt, so 'became active' proves nothing for this class).
+    auth_examined = {psid for psid, p in peeks.items() if p}
+    for s in auth_candidates:
+        sid = s.get("id") or ""
+        age_sec = parse_age_seconds(s.get("last_active") or s.get("activity_age") or "-")
+        auth_markers = detect_auth_markers(peeks.get(sid, ""))
+        if not auth_markers:
+            continue
+        auth_seen += 1
+        target = s.get("target") or s.get("template") or sid
+        acct = resolve_account(s)
+        acct_str = f"account{acct}" if acct else "unknown-account (check the agent's provider pin)"
+        reason = f"auth-wedge (OAuth login screen) on {acct_str}: " + ", ".join(auth_markers)
+        sig = ":".join(sorted(auth_markers))
+        key = state_key("auth", sid, sig)
+        observed.add(key)
+        should_alert, entry = observe_key(entries, key, sig, state_error)
+        log_line({
+            "event": "auth-wedge-detected", "session_id": sid, "target": target,
+            "account": acct, "age_sec": age_sec, "markers": auth_markers,
+            "count": entry["count"], "alert": should_alert,
+        })
+        if DRY_RUN:
+            log_line({"event": "would-alert" if should_alert else "dedup-suppressed",
+                      "session_id": sid, "key": key, "dry_run": True})
+            if should_alert:
+                actioned += 1
+            continue
+        if not should_alert:
+            log_line({"event": "dedup-suppressed", "session_id": sid,
+                      "key": key, "count": entry["count"]})
+            continue
+        mail_mayor(
+            sid, target, reason, age_sec,
+            f"surface+escalate — AUTH-WEDGE on {acct_str}: the session is hung at "
+            f"the OAuth login screen and cannot self-recover (a headless agent "
+            f"can't complete an interactive login). A `gc session reset` RE-WEDGES "
+            f"on the same bad-cred account. FIX: /ds-cred {acct_str} (usually a "
+            f"stale/rotated refresh token) OR re-pin the agent to a healthy account "
+            f"(agents/<name>/agent.toml provider), then `gc session kill {sid}` so "
+            f"it respawns clean.",
+            entry,
+        )
+        actioned += 1
+
+    # Resolution + prune. A tracked key not observed this scan resolves ONLY if
+    # its session was positively examined clean (gone from the list, active
+    # again, or peeked without the signature): exactly one RESOLVED mail, then
+    # the key drops. Keys whose session could NOT be examined (list failure,
+    # peek timeout, beyond the auth peek cap) are carried untouched — a
+    # transient blind spot must not fake a resolution, which would re-alert the
+    # same wedge as NEW next scan (mail churn, the flood in a new shape).
+    resolved_count = 0
+    if not state_error:
+        ui_sids = {s.get("id") or "" for s in ui_list} if ui_list is not None else set()
+        all_sids = {s.get("id") or "" for s in all_list} if all_list is not None else set()
+        now_ts = datetime.now(timezone.utc)
+        for key in list(entries):
+            if key in observed:
+                continue
+            entry = entries[key]
+            if not isinstance(entry, dict):
+                log_line({"event": "state-pruned", "key": key, "why": "malformed"})
+                del entries[key]
+                continue
+            pass_name, sid, _sig = (key.split("|", 2) + ["", ""])[:3]
+            if pass_name == "ui":
+                resolved = ui_list is not None and (
+                    sid not in ui_sids or sid in ui_clear or sid in ui_examined
+                )
+            elif pass_name == "disp":
+                # filter_stale_dispatchers() returns the whole wedged set, so a
+                # tracked dispatcher absent from it recovered or was killed.
+                resolved = disp_list is not None
+            elif pass_name == "auth":
+                resolved = all_list is not None and (
+                    sid not in all_sids or sid in auth_examined
+                )
+            else:
+                resolved = False
+            if resolved:
+                resolved_count += 1
+                log_line({"event": "would-resolve" if DRY_RUN else "resolved",
+                          "key": key, "count": entry.get("count"),
+                          "alerts_sent": entry.get("alerts_sent")})
+                if not DRY_RUN:
+                    mail_resolved(key, entry)
+                del entries[key]
+                continue
+            # TTL prune: an entry whose session can never be examined again
+            # would otherwise live forever. Log-only, no mail.
+            try:
+                last_seen = datetime.fromisoformat(entry.get("last_seen") or "")
+                if last_seen.tzinfo is None:
+                    last_seen = last_seen.replace(tzinfo=timezone.utc)
+                stale = (now_ts - last_seen).total_seconds() > STATE_TTL_SEC
+            except ValueError:
+                stale = True
+            if stale:
+                log_line({"event": "state-pruned", "key": key, "why": "ttl"})
+                del entries[key]
+    if not DRY_RUN:
+        _save_state(entries)
+    log_line({
+        "event": "scan-summary",
+        "scanned": seen, "dispatchers_scanned": dispatchers_seen,
+        "auth_wedges": auth_seen, "actioned": actioned,
+        "resolved": resolved_count, "tracked": len(entries),
+        "threshold_sec": THRESHOLD_SEC, "dispatcher_stale_sec": DISPATCHER_STALE_SEC,
+        "auto_reset": AUTO_RESET, "dry_run": DRY_RUN,
+    })
+    print(
+        f"polecat-ui-stuck-scanner: scanned={seen} auth_wedges={auth_seen} "
+        f"actioned={actioned} resolved={resolved_count} threshold={THRESHOLD_SEC}s "
+        f"auto_reset={AUTO_RESET} dry_run={DRY_RUN}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

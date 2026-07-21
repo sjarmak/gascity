@@ -1,0 +1,673 @@
+#!/usr/bin/env python3
+"""pool-liveness-sensor: detect a worker pool deadlocked on non-advancing claims.
+
+THE GAP THIS CLOSES (dr-t4w0, lesson from 2026-07-15). Nothing detected a claim
+that had stopped making progress. EnterpriseBench's pool was 100% deadlocked for
+FOUR DAYS — every worker pinned on a stale open+assigned step, the claim
+predicate re-serving each worker its own corpse (tier2 `bd ready --assignee`
+fires before tier3 `bd ready --unassigned`, so a pinned worker never reaches
+fresh routed work). The rig reported "9 idle workers", which read as spare
+capacity rather than a dead pool. Nothing alarmed.
+
+THE HARD DESIGN RULE — DO NOT KEY THIS SENSOR ON BEAD STATUS. Verified both ways
+on 2026-07-15: a busy worker running 16 subagents read status=open+assigned
+(looks pinned/stalled), and convoy roots read in_progress over never-started
+leaves. BUSY AND STUCK ARE INDISTINGUISHABLE FROM THE BOOKKEEPING. This sensor
+reads ARTIFACTS, and — because a status-keyed OR a naive last_active sensor both
+false-positive on the busy-16-subagent case — it confirms liveness by whether
+the session's terminal output is still MOVING, not merely by a timestamp.
+
+LIVENESS MODEL (three verdicts per worker):
+  - cheap RELIABLE-POSITIVE signals: session `last_active` age and the pinned
+    bead's work_dir newest-mtime. FRESH (within STALE_SEC) ⇒ ADVANCING, no peek
+    needed. These are trustworthy when fresh but NOT when stale: last_active is a
+    turn-boundary proxy that goes stale during a healthy long tool call / a
+    read-heavy subagent fan-out (see polecat-ui-stuck-scanner's `esc to
+    interrupt` exclusion), and a read-only burst writes nothing under work_dir.
+  - for a worker whose cheap signals are all stale (a SUSPECT), the authoritative
+    test is a PEEK-DIFF across ticks: hash the trailing lines of `gc session
+    peek`; if the hash changed since last tick the terminal is producing output
+    ⇒ ADVANCING; if it is unchanged across MIN_STALE_PEEK_TICKS peek OBSERVATIONS
+    ⇒ STALLED (a real corpse holds a static prompt). A tick on which a pool is not
+    peeked (some worker was cheap-fresh, so it couldn't be deadlocked anyway)
+    carries the streak rather than extending it; an identical hash across such a
+    gap is still genuine evidence of a frozen terminal. A peek we cannot get
+    leaves the worker UNKNOWN — never assumed dead.
+
+WHAT IT REPORTS. A pool is flagged only when: at least one worker is PINNED, NO
+worker is ADVANCING, and EVERY pinned worker is confirmed STALLED. One advancing
+worker (fresh cheap signal or a moving peek) vetoes the flag. An unpinned-stale
+worker is itself a corpse, not an escape valve, so it does not rescue the pool;
+but an unpinned-FRESH worker does (it can claim the fresh routed work). This is
+deliberately conservative — a sensor that pages on healthy work trains everyone
+to ignore it, which is exactly what the 270-mail ui-modal storm already did.
+
+SURFACE-ONLY. It logs and mails the mayor; it NEVER resets, kills, or re-slings.
+Re-slinging a worker that is actually busy manufactures a duplicate convoy (the
+2026-07-15 mistake, made twice). The durable fix (a step closing itself on every
+terminal path incl. reject/drain) is upstream and gated with Stephanie.
+
+Env:
+  STALE_SEC              cheap signal counts as fresh if newer than this
+                         (default 2700 = 45m).
+  MIN_STALE_PEEK_TICKS   consecutive frozen-peek ticks before a suspect is
+                         confirmed STALLED (default 2).
+  PEEK_TRAIL_LINES       trailing peek lines hashed for the diff (default 40).
+  MAX_PEEKS              cap peeks per scan to bound the order runtime
+                         (default 40).
+  WORKDIR_SCAN_MAX       max files stat'd under a work_dir (default 4000).
+  STATE_PATH             dedup + peek-history state (default
+                         /home/ds/.gc/pool-liveness-sensor-state.json).
+  LOG_PATH               default /home/ds/.gc/pool-liveness-sensor.log
+  DRY_RUN                non-empty = detect + log only, no mail, no state write.
+
+Test seams (unit-testing only; see the .test suite):
+  POOL_LIVENESS_SESSIONS_FIXTURE  JSON session list
+  POOL_LIVENESS_CLAIMS_FIXTURE    {rig: [beads]} claim map
+  POOL_LIVENESS_RIGS_FIXTURE      JSON array of rig names
+  POOL_LIVENESS_PEEK_DIR          dir of <session-id>.peek files (per-tick peek)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+
+STALE_SEC = int(os.environ.get("STALE_SEC", "2700"))
+MIN_STALE_PEEK_TICKS = int(os.environ.get("MIN_STALE_PEEK_TICKS", "2"))
+PEEK_TRAIL_LINES = int(os.environ.get("PEEK_TRAIL_LINES", "40"))
+MAX_PEEKS = int(os.environ.get("MAX_PEEKS", "40"))
+WORKDIR_SCAN_MAX = int(os.environ.get("WORKDIR_SCAN_MAX", "4000"))
+# Peek-history and carried-flag entries older than this are pruned each scan.
+# Session ids are per-spawn, so without a TTL the state file would grow one
+# object per worker ever peeked, forever. 7 days >> any real flag lifetime.
+STATE_TTL_SEC = int(os.environ.get("STATE_TTL_SEC", str(7 * 86400)))
+PEEK_WORKERS = int(os.environ.get("PEEK_WORKERS", "6"))
+CLAIM_FETCH_WORKERS = int(os.environ.get("CLAIM_FETCH_WORKERS", "6"))
+STATE_PATH = os.environ.get("STATE_PATH", "/home/ds/.gc/pool-liveness-sensor-state.json")
+LOG_PATH = Path(os.environ.get("LOG_PATH", "/home/ds/.gc/pool-liveness-sensor.log"))
+DRY_RUN = bool(os.environ.get("DRY_RUN", "").strip())
+
+# A pool worker's template basename ends in worker/polecat, optionally with a
+# numbered slot suffix. Named sessions (mayor, *-pl, control-dispatcher) do not
+# match, so a PL holding a long-lived bead is never treated as a corpse.
+POOL_SUFFIX_RX = re.compile(r"(?:worker|polecat)(?:-\d+)?$")
+DEFAULT_POOLS = "/home/ds/gascity/polecat,/home/ds/gascity-packs/gascity-packs-polecat"
+POOLS = [p.strip() for p in os.environ.get("POLECAT_POOLS_CSV", DEFAULT_POOLS).split(",") if p.strip()]
+
+SESSIONS_FIXTURE = os.environ.get("POOL_LIVENESS_SESSIONS_FIXTURE", "")
+CLAIMS_FIXTURE = os.environ.get("POOL_LIVENESS_CLAIMS_FIXTURE", "")
+RIGS_FIXTURE = os.environ.get("POOL_LIVENESS_RIGS_FIXTURE", "")
+PEEK_DIR = os.environ.get("POOL_LIVENESS_PEEK_DIR", "")
+
+# scix and a couple of rigs alias between the pool-dir name and the registered
+# rig name. Extend only with verified aliases (see reference_rig_name_aliases).
+RIG_ALIASES = {"scix-agent": "scix-experiments", "scix": "scix-experiments"}
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def log_line(payload: dict) -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_PATH.open("a") as f:
+        f.write(json.dumps({"ts": now_iso(), **payload}) + "\n")
+
+
+def age_seconds(ts: str | None) -> int | None:
+    # gc emits last_active as an RFC3339 string, but the type is whatever the
+    # JSON carried — an int/None/garbage must degrade to "unknown", never crash
+    # this sensor (a monitor that dies on a shape variation is the failure it
+    # exists to catch). fromisoformat raises TypeError on non-str, ValueError on
+    # a bad str; both mean "cannot age".
+    if not isinstance(ts, str) or not ts or ts == "-":
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+    except (ValueError, TypeError):
+        return None
+
+
+def list_active_pool_workers() -> list[dict] | None:
+    """Active pool-worker sessions. None on a failed/unparseable list (carry
+    state — a transient list blip must not read as 'all pools recovered')."""
+    if SESSIONS_FIXTURE:
+        raw = json.loads(Path(SESSIONS_FIXTURE).read_text())
+        sessions = raw.get("sessions") if isinstance(raw, dict) else raw
+    else:
+        try:
+            result = subprocess.run(
+                ["gc", "session", "list", "--json"],
+                capture_output=True, text=True, timeout=45,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None
+        sessions = data.get("sessions") if isinstance(data, dict) else data
+    if not isinstance(sessions, list):
+        return None
+    out = []
+    for s in sessions:
+        if not isinstance(s, dict):
+            continue  # a stray non-dict element must not crash the whole scan
+        if s.get("state") != "active":
+            continue
+        template = s.get("template") or ""
+        basename = template.rsplit("/", 1)[-1]
+        if any(template == p or template.endswith(p) for p in POOLS) or POOL_SUFFIX_RX.search(basename):
+            out.append(s)
+    return out
+
+
+def rig_names() -> set[str] | None:
+    """Canonical rig names. None on failure — the caller must carry state and
+    skip, NOT proceed with an empty set (empty => every pool reads
+    rig-unresolved => the sensor silently assesses nothing, a blind failure)."""
+    if RIGS_FIXTURE:
+        return set(json.loads(Path(RIGS_FIXTURE).read_text()))
+    try:
+        result = subprocess.run(
+            ["gc", "rig", "list", "--json"], capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout)
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, (list, dict)):
+        return None
+    rigs = data if isinstance(data, list) else data.get("rigs", [])
+    if not isinstance(rigs, list):
+        return None
+    return {r.get("name") for r in rigs if isinstance(r, dict) and r.get("name")}
+
+
+def derive_rig(template: str, work_dir: str, known: set[str]) -> str | None:
+    # Match case-INSENSITIVELY: pool dirs are CamelCase where the rig name is
+    # lower (the canonical case is /home/ds/projects/EnterpriseBench/... vs rig
+    # 'enterprisebench' — an exact match would silently fail to resolve THE rig
+    # this sensor exists for). Rig names here are unique up to case, so this is
+    # safe; return the registered spelling, not the path spelling.
+    lower = {k.lower(): k for k in known}
+    for path in (template, work_dir):
+        if not path:
+            continue
+        for seg in reversed([p for p in path.split("/") if p][:-1]):
+            for cand in (RIG_ALIASES.get(seg.lower(), None), seg):
+                if cand and cand.lower() in lower:
+                    return lower[cand.lower()]
+    return None
+
+
+def worker_claim_handle(s: dict) -> str:
+    """The assignee a pool worker stamps on its claims: '{template_basename}-{id}'
+    (verified against live rig stores: enterprisebench-worker-gc-509870,
+    mem-worker-gc-510287). This is the join key for the PINNED test."""
+    template_base = (s.get("template") or "").rsplit("/", 1)[-1]
+    sid = s.get("id") or ""
+    return f"{template_base}-{sid}" if template_base and sid else sid
+
+
+def fetch_rig_claims(rig: str) -> list[dict] | None:
+    """Open/in_progress beads in a rig that carry an assignee. None on failure."""
+    if CLAIMS_FIXTURE:
+        raw = json.loads(Path(CLAIMS_FIXTURE).read_text())
+        return raw.get(rig, [])
+    out: list[dict] = []
+    for status in ("in_progress", "open"):
+        try:
+            result = subprocess.run(
+                ["gc", "bd", "--rig", rig, "list", "--status", status, "--json", "--limit", "0"],
+                capture_output=True, text=True, timeout=45,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            data = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            return None
+        beads = data if isinstance(data, list) else data.get("issues", [])
+        if not isinstance(beads, list):
+            return None
+        for b in beads:
+            if isinstance(b, dict) and b.get("assignee"):
+                out.append(b)
+    return out
+
+
+def bead_workdir(bead: dict) -> str | None:
+    md = bead.get("metadata") or {}
+    return md.get("gc.work_dir") if isinstance(md, dict) else None
+
+
+def workdir_newest_age_sec(work_dir: str | None) -> int | None:
+    """Seconds since newest mtime under work_dir; None if absent/empty. Bounded.
+    Secondary reliable-POSITIVE signal only (fresh ⇒ advancing); frequently None
+    (per-bead worktree not yet created) and stale even for live workers."""
+    if not work_dir or not os.path.isdir(work_dir):
+        return None
+    newest = 0.0
+    seen = 0
+    dirs_seen = 0
+    skip = {".git", "node_modules", ".venv", "__pycache__", ".mypy_cache"}
+    for root, dirs, files in os.walk(work_dir):
+        dirs[:] = [d for d in dirs if d not in skip]
+        # Count directories too: WORKDIR_SCAN_MAX on files alone does not bound a
+        # subtree of many empty dirs (a build-artifact / runaway-mkdir tree),
+        # which would walk in full and stall the scan for every other pool.
+        dirs_seen += 1
+        if dirs_seen >= WORKDIR_SCAN_MAX:
+            break
+        for f in files:
+            try:
+                m = os.path.getmtime(os.path.join(root, f))
+                if m > newest:
+                    newest = m
+            except OSError:
+                pass
+            seen += 1
+            if seen >= WORKDIR_SCAN_MAX:
+                break
+        if seen >= WORKDIR_SCAN_MAX:
+            break
+    return None if newest == 0.0 else max(0, int(time.time() - newest))
+
+
+def peek_observation(session_id: str) -> tuple[str, bool] | None:
+    """Trailing-output hash plus whether Claude is at its ready-input prompt.
+
+    A changed hash means the terminal is producing output. An unchanged hash
+    alone does not prove a corpse: a healthy worker can remain indefinitely at
+    Claude's ready prompt while waiting for its next instruction. Require both
+    the prompt glyph and the live TUI status footer so quoted/historical prompt
+    text in ordinary output is not mistaken for a ready session.
+    """
+    if PEEK_DIR:
+        p = Path(PEEK_DIR) / f"{session_id}.peek"
+        if not p.exists():
+            return None
+        text = p.read_text()
+    else:
+        try:
+            result = subprocess.run(
+                ["gc", "session", "peek", session_id],
+                capture_output=True, text=True, timeout=25,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        text = result.stdout or ""
+    if not text.strip():
+        return None
+    trail_lines = text.splitlines()[-PEEK_TRAIL_LINES:]
+    trail = "\n".join(trail_lines)
+    ready_prompt = (
+        any(re.match(r"^\s*❯(?:\s|$)", line) for line in trail_lines)
+        and any("bypass permissions on" in line or "for agents" in line for line in trail_lines[-8:])
+    )
+    return hashlib.sha256(trail.encode("utf-8", "replace")).hexdigest(), ready_prompt
+
+
+def _load_state() -> tuple[dict, dict, bool]:
+    """(pools_flagged, workers_peek, load_error). FAIL-OPEN on parse error."""
+    try:
+        with open(STATE_PATH) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return {}, {}, False
+    except (OSError, json.JSONDecodeError):
+        return {}, {}, True
+    if isinstance(raw, dict) and raw.get("v") == 2:
+        pools = raw.get("pools") if isinstance(raw.get("pools"), dict) else {}
+        workers = raw.get("workers") if isinstance(raw.get("workers"), dict) else {}
+        return pools, workers, False
+    return {}, {}, True
+
+
+def _save_state(pools: dict, workers: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        with open(STATE_PATH, "w") as f:
+            json.dump({"v": 2, "pools": pools, "workers": workers}, f)
+    except OSError as e:
+        log_line({"event": "state-save-failed", "error": str(e)[:200]})
+
+
+def _within_ttl(last_seen: str | None) -> bool:
+    """Keep an entry iff its last_seen is within STATE_TTL_SEC. A missing/legacy
+    timestamp is kept (it gets one the next time the entry is touched)."""
+    age = age_seconds(last_seen)
+    return age is None or age < STATE_TTL_SEC
+
+
+def mail_mayor(subject: str, body: str) -> bool:
+    """True iff the mail was accepted. A failed send must NOT be recorded as
+    delivered — otherwise the first alert of a real deadlock is lost forever
+    (is_new goes False on retry and it never fires again)."""
+    try:
+        result = subprocess.run(
+            ["gc", "mail", "send", "mayor/", "-s", subject, "-m", body],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        log_line({"event": "mail-failed", "subject": subject[:80], "error": str(e)[:200]})
+        return False
+    if result.returncode != 0:
+        log_line({"event": "mail-failed", "subject": subject[:80],
+                  "rc": result.returncode, "err": (result.stderr or "")[:200]})
+        return False
+    return True
+
+
+def main() -> int:
+    pools_state, workers_state, state_error = _load_state()
+    if state_error:
+        log_line({"event": "state-load-error", "path": STATE_PATH,
+                  "note": "fail-open: peek history reset; alert without dedup this scan"})
+
+    workers = list_active_pool_workers()
+    if workers is None:
+        log_line({"event": "session-list-failed", "note": "carry state, no scan"})
+        print("pool-liveness-sensor: session list unavailable; skipped")
+        return 0
+
+    known = rig_names()
+    if known is None:
+        # No rig list ⇒ every pool would read rig-unresolved and the sensor would
+        # silently assess nothing (a blind failure). Carry state, skip this scan.
+        log_line({"event": "rig-list-failed", "note": "carry state, no scan"})
+        print("pool-liveness-sensor: rig list unavailable; skipped")
+        return 0
+
+    pools: dict[str, list[dict]] = {}
+    for w in workers:
+        pools.setdefault(w.get("template") or "?", []).append(w)
+
+    pool_rig = {pk: derive_rig(pk, (m[0].get("work_dir") or ""), known) for pk, m in pools.items()}
+    rigs_needed = {r for r in pool_rig.values() if r}
+    rig_claims: dict[str, list[dict] | None] = {}
+    if rigs_needed:
+        with ThreadPoolExecutor(max_workers=CLAIM_FETCH_WORKERS) as ex:
+            futs = {ex.submit(fetch_rig_claims, r): r for r in rigs_needed}
+            for f, r in futs.items():
+                try:
+                    rig_claims[r] = f.result()
+                except Exception as e:
+                    log_line({"event": "claims-fetch-error", "rig": r, "error": str(e)[:200]})
+                    rig_claims[r] = None
+
+    # Pass 1 (cheap, no peeks): per pool, classify each worker as ADVANCING (fresh
+    # cheap signal) or SUSPECT (all cheap signals stale). Build the peek worklist
+    # only for SUSPECT workers in pools that could possibly be deadlocked (no
+    # worker already ADVANCING and ≥1 pinned) — a healthy pool needs zero peeks.
+    assigned_by_rig = {
+        r: {b.get("assignee") for b in c if b.get("assignee")}
+        for r, c in rig_claims.items() if c is not None
+    }
+    # assignee -> a work_dir from any of its claims. Prefer a NON-None value: a
+    # worker's in_progress claim (fetched first) may lack gc.work_dir while an
+    # open one has it; setdefault would lock in the None and discard a real
+    # reliable-positive signal, needlessly pushing the worker to the peek path.
+    claim_wd_by_handle: dict[str, str | None] = {}
+    for r, c in rig_claims.items():
+        if c is None:
+            continue
+        for b in c:
+            handle = b.get("assignee")
+            if not handle:
+                continue
+            wd = bead_workdir(b)
+            if claim_wd_by_handle.get(handle) is None:
+                claim_wd_by_handle[handle] = wd
+
+    pool_ctx: dict[str, dict] = {}
+    peek_needed: list[str] = []
+    for pool_key, members in pools.items():
+        rig = pool_rig[pool_key]
+        if rig is None:
+            log_line({"event": "rig-unresolved", "pool": pool_key,
+                      "note": "cannot map pool to a rig; cannot assess, skipped"})
+            continue
+        claims = rig_claims.get(rig)
+        if claims is None:
+            log_line({"event": "claims-unavailable", "pool": pool_key, "rig": rig,
+                      "note": "claim query failed; cannot assess, carry state"})
+            continue
+        assigned = assigned_by_rig.get(rig, set())
+        ws = []
+        any_advancing = False
+        any_pinned = False
+        for w in members:
+            handle = worker_claim_handle(w)
+            pinned = handle in assigned
+            any_pinned = any_pinned or pinned
+            sess_age = age_seconds(w.get("last_active") or w.get("activity_age"))
+            wd = claim_wd_by_handle.get(handle) or (w.get("work_dir") or "")
+            wd_age = workdir_newest_age_sec(wd)
+            fresh = (sess_age is not None and sess_age < STALE_SEC) or (wd_age is not None and wd_age < STALE_SEC)
+            if fresh:
+                any_advancing = True
+            ws.append({"s": w, "handle": handle, "pinned": pinned,
+                       "sess_age": sess_age, "wd_age": wd_age, "fresh": fresh})
+        pool_ctx[pool_key] = {"rig": rig, "ws": ws, "any_advancing": any_advancing, "any_pinned": any_pinned}
+        # Peek only when the pool is a deadlock candidate: nobody cheap-fresh and
+        # at least one pinned worker. Then every non-fresh worker needs a verdict.
+        if not any_advancing and any_pinned:
+            for wr in ws:
+                if not wr["fresh"]:
+                    peek_needed.append(wr["s"].get("id") or "")
+
+    # Peek the suspects concurrently, capped.
+    peek_needed = [p for p in dict.fromkeys(peek_needed) if p][:MAX_PEEKS]
+    peek_observations: dict[str, tuple[str, bool] | None] = {}
+    if peek_needed:
+        with ThreadPoolExecutor(max_workers=PEEK_WORKERS) as ex:
+            futs = {ex.submit(peek_observation, sid): sid for sid in peek_needed}
+            for f, sid in futs.items():
+                try:
+                    peek_observations[sid] = f.result()
+                except Exception as e:
+                    log_line({"event": "peek-error", "session": sid, "error": str(e)[:200]})
+                    peek_observations[sid] = None
+
+    # Pass 2: resolve verdicts, update peek history, decide per pool.
+    new_workers_state: dict[str, dict] = {}
+    flagged_now: dict[str, dict] = {}
+    scanned_pool_info: dict[str, dict] = {}
+    resolved = 0
+    pools_scanned = 0
+    now_key = now_iso()
+
+    def verdict(wr: dict) -> str:
+        # Fresh cheap signal is a reliable positive ⇒ ADVANCING, no peek needed.
+        if wr["fresh"]:
+            return "ADVANCING"
+        sid = wr["s"].get("id") or ""
+        if sid not in peek_observations:
+            return "UNKNOWN"  # not peeked this scan (e.g. cap) — cannot assess
+        observation = peek_observations[sid]
+        prev = workers_state.get(sid) if not state_error else None
+        prev_hash = prev.get("peek_hash") if isinstance(prev, dict) else None
+        prev_stale = int(prev.get("stale_ticks", 0)) if isinstance(prev, dict) else 0
+        if observation is None:
+            # Peek unavailable this tick: cannot confirm frozen. Preserve the
+            # prior count untouched — never advance a stall on a failed peek.
+            new_workers_state[sid] = {"peek_hash": prev_hash, "stale_ticks": prev_stale, "last_seen": now_key}
+            return "UNKNOWN"
+        h, ready_prompt = observation
+        if ready_prompt:
+            # A stable ready-input screen is coherent and usable, not a frozen
+            # corpse. Treat it as positive responsiveness and reset any stale
+            # streak so a previously false-flagged pool can resolve.
+            new_workers_state[sid] = {"peek_hash": h, "stale_ticks": 0, "last_seen": now_key}
+            return "RESPONSIVE"
+        if prev_hash is None:
+            # First observation: a baseline, not evidence of movement or freeze.
+            new_workers_state[sid] = {"peek_hash": h, "stale_ticks": 0, "last_seen": now_key}
+            return "UNKNOWN"
+        if h != prev_hash:
+            # Terminal output moved since last tick ⇒ genuinely alive.
+            new_workers_state[sid] = {"peek_hash": h, "stale_ticks": 0, "last_seen": now_key}
+            return "ADVANCING"
+        stale_ticks = prev_stale + 1  # frozen again
+        new_workers_state[sid] = {"peek_hash": h, "stale_ticks": stale_ticks, "last_seen": now_key}
+        return "STALLED" if stale_ticks >= MIN_STALE_PEEK_TICKS else "UNKNOWN"
+
+    for pool_key, ctx in pool_ctx.items():
+        pools_scanned += 1
+        rig = ctx["rig"]
+        ws = ctx["ws"]
+        verdicts = []
+        for wr in ws:
+            v = verdict(wr)
+            wr["verdict"] = v
+            verdicts.append(v)
+        pinned = [wr for wr in ws if wr["pinned"]]
+        deadlocked = (
+            len(pinned) >= 1
+            and "ADVANCING" not in verdicts
+            and all(wr["verdict"] == "STALLED" for wr in pinned)
+        )
+        # Recovery is CONFIRMED only by positive evidence — a worker advancing,
+        # a worker coherently waiting at its ready prompt, or no pinned worker
+        # left. "Not deadlocked because a pinned worker is UNKNOWN this tick"
+        # (a transient peek/claim failure) is NOT a recovery; treating it as one
+        # would fire a false "resolved" mail and reset the debounce on a
+        # still-frozen corpse.
+        recovery_confirmed = (
+            "ADVANCING" in verdicts
+            or "RESPONSIVE" in verdicts
+            or len(pinned) == 0
+        )
+        scanned_pool_info[pool_key] = {"deadlocked": deadlocked, "recovery_confirmed": recovery_confirmed}
+        log_line({
+            "event": "pool-scanned", "pool": pool_key, "rig": rig,
+            "workers": len(ws), "pinned": len(pinned), "deadlocked": deadlocked,
+            "recovery_confirmed": recovery_confirmed,
+            "detail": [{"worker": (wr["s"].get("alias") or wr["s"].get("id") or "?").rsplit("/", 1)[-1],
+                        "pinned": wr["pinned"], "verdict": wr["verdict"],
+                        "sess_age": wr["sess_age"], "wd_age": wr["wd_age"]} for wr in ws],
+        })
+        if not deadlocked:
+            continue
+        prior = pools_state.get(pool_key)
+        since = prior.get("since") if isinstance(prior, dict) else now_key
+        prior_alerted = bool(prior.get("alerted")) if isinstance(prior, dict) else False
+        entry = {"since": since, "rig": rig, "workers": len(ws), "pinned": len(pinned),
+                 "last_seen": now_key, "alerted": prior_alerted,
+                 "mails_sent": int(prior.get("mails_sent", 0)) if isinstance(prior, dict) else 0}
+        flagged_now[pool_key] = entry
+        # Alert on a new deadlock, when the prior alert was never delivered, or
+        # when state was unreadable (fail-open). A delivered alert must gate on
+        # actual send success (C1): recording alerted=True on a failed send would
+        # lose the first alert of a real deadlock forever.
+        need_alert = (not prior_alerted) or state_error
+        if need_alert:
+            log_line({"event": "pool-deadlock-alert", "pool": pool_key, "rig": rig, "since": since})
+            if DRY_RUN:
+                entry["alerted"] = True
+            else:
+                body = (
+                    f"pool-liveness-sensor: a worker pool appears DEADLOCKED — every "
+                    f"pinned worker is a confirmed corpse (terminal output frozen across "
+                    f"{MIN_STALE_PEEK_TICKS}+ ticks) and NO worker is advancing.\n\n"
+                    f"pool: {pool_key}\nrig: {rig}\nworkers: {len(ws)} ({len(pinned)} pinned)\n"
+                    f"deadlocked since: {since}\n\n"
+                    f"per-worker (artifacts, NOT bead status):\n"
+                    + "\n".join(
+                        f"  {(wr['s'].get('alias') or wr['s'].get('id') or '?').rsplit('/',1)[-1]}: "
+                        f"verdict={wr['verdict']} pinned={wr['pinned']} "
+                        f"last_active={wr['sess_age']}s work_dir_mtime={wr['wd_age']}s"
+                        for wr in ws
+                    )
+                    + "\n\nDETECTION ONLY. Do NOT blind re-sling — re-slinging a busy worker "
+                    "manufactures a duplicate convoy (the 2026-07-15 mistake). Triage: "
+                    "`gc session peek <worker>` each one. If any is genuinely mid-work it is a "
+                    "false positive (raise STALE_SEC or check the peek). If they are real "
+                    "corpses, the pinned claims must be closed and the sessions recycled so the "
+                    "pool can reach fresh routed work.\n"
+                )
+                if mail_mayor(f"pool DEADLOCK: {rig} — {len(pinned)} workers pinned on frozen claims", body):
+                    entry["alerted"] = True
+                    entry["mails_sent"] += 1
+                # else: alerted stays False ⇒ retried next scan (C1).
+        else:
+            log_line({"event": "pool-deadlock-persist", "pool": pool_key, "since": since})
+
+    # Resolution: only a CONFIRMED recovery clears a flag. A previously-flagged
+    # pool scanned this cycle that is no longer deadlocked resolves ONLY if its
+    # recovery was positively confirmed (a worker advancing, or no pins left).
+    # If it is merely indeterminate this tick (a pinned worker UNKNOWN from a
+    # transient peek/claim failure), carry the flag untouched — never fire a
+    # false "resolved" (C2). A pool not scanned at all is likewise carried.
+    if not state_error:
+        for pool_key, prior in pools_state.items():
+            if pool_key in flagged_now:
+                continue
+            info = scanned_pool_info.get(pool_key)
+            if info is None or not info["recovery_confirmed"]:
+                flagged_now[pool_key] = prior  # not examined, or not a confirmed recovery
+                continue
+            resolved += 1
+            log_line({"event": "pool-deadlock-resolved", "pool": pool_key, "since": prior.get("since")})
+            if not DRY_RUN and prior.get("alerted"):
+                mail_mayor(
+                    f"resolved: pool {prior.get('rig','?')} deadlock cleared",
+                    f"pool-liveness-sensor: {pool_key} is no longer deadlocked (flagged since "
+                    f"{prior.get('since')}). A worker is advancing again or the pinned claims "
+                    f"cleared. No action needed — this closes the earlier alert.",
+                )
+
+    # Carry peek history for workers not re-examined this scan (so a mid-stale
+    # streak survives a scan where the pool briefly looked healthy), then prune
+    # both maps by TTL so per-spawn session ids and stale flags never accumulate
+    # without bound.
+    for sid, st in workers_state.items():
+        if sid not in new_workers_state and isinstance(st, dict):
+            new_workers_state[sid] = st
+    new_workers_state = {sid: st for sid, st in new_workers_state.items()
+                         if _within_ttl(st.get("last_seen"))}
+    pruned = {}
+    for pool_key, entry in flagged_now.items():
+        if _within_ttl(entry.get("last_seen")):
+            pruned[pool_key] = entry
+        else:
+            log_line({"event": "flag-pruned-ttl", "pool": pool_key, "since": entry.get("since")})
+    flagged_now = pruned
+
+    if not DRY_RUN:
+        _save_state(flagged_now, new_workers_state)
+    log_line({
+        "event": "scan-summary", "pools": len(pools), "pools_scanned": pools_scanned,
+        "peeked": len(peek_needed), "flagged": len(flagged_now), "resolved": resolved,
+        "stale_sec": STALE_SEC, "min_stale_peek_ticks": MIN_STALE_PEEK_TICKS, "dry_run": DRY_RUN,
+    })
+    print(
+        f"pool-liveness-sensor: pools={len(pools)} scanned={pools_scanned} peeked={len(peek_needed)} "
+        f"flagged={len(flagged_now)} resolved={resolved} dry_run={DRY_RUN}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

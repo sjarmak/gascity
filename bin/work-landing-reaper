@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+# work-landing-reaper: controller-side landing backstop for the mol-focus-review
+# no-landing defect. RCA: /home/ds/gas-city/docs/rca-eb-merge-gap-2026-07-12.md §4b.
+#
+# The problem: a perfect mol-focus-review run commits to work/<bead-id>, closes
+# the bead, and drains. Nothing merges that branch to the rig's base branch, so
+# genuinely-passing work strands on work/* while the bead reads DONE. A land
+# step was later added to the formula itself (mol-focus-review.formula.toml:354)
+# but it is prompt-level: a worker can skip it, concurrent finalizes race, and
+# it does not cover branches from any other workflow. This reaper is the
+# deterministic controller-side backstop the RCA calls the "recommended primary."
+#
+# Two responsibilities:
+#   REPORT (default): list CLOSED beads whose work/<id> branch is neither an
+#     ancestor of the base branch nor patch-equivalent to it (git cherry) —
+#     i.e. closed-but-unlanded. This is the loud signal for RCA's §5 invariant
+#     ("a bead may not close as done while its artifact is unreachable from
+#     main"). Zero side effects; safe on the live city.
+#   LAND (--apply): for the trustworthy subset (review_verdict=pass), rebase
+#     onto the base tip under the shared mol-focus-merge.lock and ff-only merge
+#     into the base worktree, gated on the rig's test_command. On success record
+#     landed_at/landed_sha. On rebase conflict or red tests, set the bead
+#     blocked with an escalation note and mail the mayor. Never force, never
+#     push to a remote.
+#
+# SAFETY (RCA §4b: auto-merge needs a hard test gate + conflict-means-stop):
+#   - A rig with an empty/missing test_command in .gc/work-landing.yaml is
+#     NEVER auto-landed even under --apply; it is report-only.
+#   - Only review_verdict=pass beads are auto-land candidates. No-verdict
+#     closes are coada-era-untrusted (RCA Defect B) — reported for human
+#     re-review, never auto-landed.
+#   - Landing mirrors the formula's own land step exactly (rebase onto base
+#     under $GITDIR/mol-focus-merge.lock, then ff-only into the base worktree)
+#     so the reaper and in-formula land never corrupt each other.
+#
+# Config: /home/ds/gas-city/.gc/work-landing.yaml
+# Audit:  /home/ds/gas-city/.gc/work-landing-reaper.log (JSONL)
+#
+# Usage:
+#   work-landing-reaper                 # dry-run report (all configured rigs)
+#   work-landing-reaper --apply         # perform landings for verdict=pass beads
+#   work-landing-reaper --rig NAME      # restrict to one rig (repeatable)
+#   work-landing-reaper --nudge-mayor   # mail mayor a summary if findings
+#
+# The order ships in REPORT mode (no --apply). Flipping to --apply is a
+# mayor/Stephanie-gated enablement — see .gc/work-landing.yaml.
+
+set -euo pipefail
+
+# --- pure git helpers (loadable standalone: WORK_LANDING_REAPER_LIB=1 source) --
+
+# landing_status <rig_path> <branch> <base>
+# Prints one of: no_branch | landed | patch_equiv | unmerged:<n-ahead>
+landing_status() {
+  local rig_path=$1 branch=$2 base=$3
+  if ! git -C "$rig_path" show-ref --verify --quiet "refs/heads/$branch"; then
+    echo "no_branch"; return
+  fi
+  local tip
+  tip=$(git -C "$rig_path" rev-parse "$branch" 2>/dev/null) || { echo "no_branch"; return; }
+  if git -C "$rig_path" merge-base --is-ancestor "$tip" "$base" 2>/dev/null; then
+    echo "landed"; return
+  fi
+  local ahead
+  ahead=$(git -C "$rig_path" cherry "$base" "$branch" 2>/dev/null | grep -c '^+' || true)
+  if [[ "${ahead:-0}" == "0" ]]; then echo "patch_equiv"; else echo "unmerged:$ahead"; fi
+}
+
+# recorded_landed_status <rig_path> <landed_sha> <base>
+# Validates a bead's recorded landed_sha. A cherry-pick with conflict-adjusted
+# content makes git cherry report '+' even though the work already shipped, so
+# ancestry/patch-equivalence alone misclassifies it as unlanded (dr-gkq4).
+# Never trust the metadata alone: the value must resolve to a commit reachable
+# from the configured base.
+# Prints one of: verified | missing_commit | not_commit | not_ancestor
+recorded_landed_status() {
+  local rig_path=$1 sha=$2 base=$3 resolved
+  [[ "$sha" =~ ^[0-9a-fA-F]{7,40}$ ]] || { echo "not_commit"; return; }
+  if ! resolved=$(git -C "$rig_path" rev-parse --verify --quiet "$sha^{commit}" 2>/dev/null); then
+    echo "missing_commit"; return
+  fi
+  if git -C "$rig_path" merge-base --is-ancestor "$resolved" "$base" 2>/dev/null; then
+    echo "verified"
+  else
+    echo "not_ancestor"
+  fi
+}
+
+if [[ "${WORK_LANDING_REAPER_LIB:-0}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+CONFIG="${WORK_LANDING_CONFIG:-/home/ds/gas-city/.gc/work-landing.yaml}"
+AUDIT_LOG="${WORK_LANDING_AUDIT_LOG:-/home/ds/gas-city/.gc/work-landing-reaper.log}"
+
+APPLY=0
+NUDGE_MAYOR=0
+RIG_FILTER=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)       APPLY=1; shift ;;
+    --nudge-mayor) NUDGE_MAYOR=1; shift ;;
+    --rig)         RIG_FILTER+=("$2"); shift 2 ;;
+    --config)      CONFIG="$2"; shift 2 ;;
+    -h|--help)     sed -n 's/^# \{0,1\}//p' "$0" | head -52; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ ! -r "$CONFIG" ]]; then
+  echo "work-landing-reaper: config not readable: $CONFIG" >&2
+  exit 2
+fi
+
+mkdir -p "$(dirname "$AUDIT_LOG")"
+
+CONFIG_JSON=$(python3 -c '
+import json, sys, yaml
+with open(sys.argv[1], "rb") as f:
+    data = yaml.safe_load(f)
+json.dump(data or {}, sys.stdout)
+' "$CONFIG")
+
+# Map rig name -> checkout path. Use the structured `--json` output; the
+# text `gc rig list` parse mis-attributes paths when a name line carries a
+# "(suspended)"/"(HQ)" suffix (that line fails a bare `name:` regex, so the
+# following Path attaches to the previous rig — an off-by-one that would be
+# catastrophic for an auto-merge). JSON has an explicit name/path per rig.
+declare -A RIG_PATHS
+while IFS=$'\t' read -r rig path; do
+  [[ -n "$rig" && -n "$path" ]] && RIG_PATHS["$rig"]="$path"
+done < <(gc rig list --json 2>/dev/null \
+           | jq -r '.rigs[]? | [.name, .path] | @tsv')
+
+default_branch() {
+  local rig_path=$1 sym
+  sym=$(git -C "$rig_path" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null) || true
+  if [[ -n "$sym" ]]; then echo "${sym##*/}"; return; fi
+  if git -C "$rig_path" show-ref --verify --quiet refs/heads/main; then echo "main"; return; fi
+  if git -C "$rig_path" show-ref --verify --quiet refs/heads/master; then echo "master"; return; fi
+  echo "main"
+}
+
+log_event() {
+  # log_event <event> <rig> <bead> <branch> <extra-json>
+  local event=$1 rig=$2 bead=$3 branch=$4 extra=${5:-'{}'} ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  jq -cn --arg ts "$ts" --arg event "$event" --arg rig "$rig" \
+         --arg bead "$bead" --arg branch "$branch" --argjson extra "$extra" \
+    '{ts:$ts, event:$event, rig:$rig, bead:$bead, branch:$branch} + $extra' \
+    >> "$AUDIT_LOG"
+}
+
+# base_worktree <rig_path> <base> — prints the worktree path that holds <base>.
+base_worktree() {
+  local rig_path=$1 base=$2
+  git -C "$rig_path" worktree list --porcelain 2>/dev/null \
+    | grep -B2 "^branch refs/heads/$base$" | sed -n 's/^worktree //p' | head -1
+}
+
+# escalate_block <rig> <bead> <branch> <reason> — set bead blocked + mail mayor.
+escalate_block() {
+  local rig=$1 bead=$2 branch=$3 reason=$4
+  gc bd --rig "$rig" update "$bead" --status blocked \
+    --set-metadata "landing_blocked_reason=$reason" >/dev/null 2>&1 || true
+  gc mail send mayor --notify \
+    -s "work-landing-reaper: $bead ($rig) needs manual landing" \
+    -m "Branch $branch could not be auto-landed onto its base: $reason. Bead set blocked. Resolve the divergence by hand (rebase/re-review) then close; nothing was forced or pushed." \
+    >/dev/null 2>&1 || true
+  log_event "blocked_escalated" "$rig" "$bead" "$branch" \
+    "$(jq -cn --arg r "$reason" '{reason:$r}')"
+}
+
+# attempt_land <rig> <rig_path> <bead> <branch> <base> <test_command>
+# Returns 0 and prints "landed:<sha>" on success; 1 on failure (already
+# escalated). Mirrors the formula's land step: rebase onto base under the
+# shared lock, ff-only into the base worktree, gated on tests.
+attempt_land() {
+  local rig=$1 rig_path=$2 bead=$3 branch=$4 base=$5 test_cmd=$6
+  local gitdir lock tmp rebased base_wt base_before base_after ts
+  gitdir=$(git -C "$rig_path" rev-parse --git-common-dir 2>/dev/null) || { escalate_block "$rig" "$bead" "$branch" "no git-common-dir"; return 1; }
+  # git-common-dir may be relative to the rig path.
+  case "$gitdir" in /*) : ;; *) gitdir="$rig_path/$gitdir" ;; esac
+  lock="$gitdir/mol-focus-merge.lock"
+
+  exec 9>"$lock"
+  flock 9
+
+  base_before=$(git -C "$rig_path" rev-parse "$base" 2>/dev/null || true)
+  base_wt=$(base_worktree "$rig_path" "$base")
+  if [[ -z "$base_wt" ]]; then
+    flock -u 9
+    escalate_block "$rig" "$bead" "$branch" "no worktree holds base branch $base"
+    return 1
+  fi
+
+  # Ephemeral detached worktree at the branch tip; rebase it onto the base tip.
+  tmp="$rig_path/.work-landing-$bead"
+  git -C "$rig_path" worktree remove --force "$tmp" >/dev/null 2>&1 || true
+  if ! git -C "$rig_path" worktree add --detach "$tmp" "$branch" >/dev/null 2>&1; then
+    flock -u 9
+    escalate_block "$rig" "$bead" "$branch" "could not create landing worktree"
+    return 1
+  fi
+
+  if ! git -C "$tmp" rebase "$base" >/dev/null 2>&1; then
+    git -C "$tmp" rebase --abort >/dev/null 2>&1 || true
+    git -C "$rig_path" worktree remove --force "$tmp" >/dev/null 2>&1 || true
+    flock -u 9
+    escalate_block "$rig" "$bead" "$branch" "rebase onto $base conflicts"
+    return 1
+  fi
+  rebased=$(git -C "$tmp" rev-parse HEAD)
+
+  # Hard test gate on the rebased tree BEFORE advancing base.
+  if ! ( cd "$tmp" && eval "$test_cmd" ) >/dev/null 2>&1; then
+    git -C "$rig_path" worktree remove --force "$tmp" >/dev/null 2>&1 || true
+    flock -u 9
+    escalate_block "$rig" "$bead" "$branch" "test_command failed on rebased tree ($test_cmd)"
+    return 1
+  fi
+
+  # CAS: base must not have moved (we hold the lock, so it should not have).
+  base_after=$(git -C "$rig_path" rev-parse "$base" 2>/dev/null || true)
+  if [[ "$base_after" != "$base_before" ]]; then
+    git -C "$rig_path" worktree remove --force "$tmp" >/dev/null 2>&1 || true
+    flock -u 9
+    log_event "base_moved_retry_next_cycle" "$rig" "$bead" "$branch" \
+      "$(jq -cn --arg b "$base_before" --arg a "$base_after" '{base_before:$b,base_after:$a}')"
+    return 1
+  fi
+
+  # ff-only advance base to the rebased tip (base is now its ancestor).
+  if ! git -C "$base_wt" merge --ff-only "$rebased" >/dev/null 2>&1; then
+    git -C "$rig_path" worktree remove --force "$tmp" >/dev/null 2>&1 || true
+    flock -u 9
+    escalate_block "$rig" "$bead" "$branch" "ff-only merge into $base failed (dirty base tree?)"
+    return 1
+  fi
+
+  git -C "$rig_path" worktree remove --force "$tmp" >/dev/null 2>&1 || true
+  flock -u 9
+
+  local landed_sha
+  landed_sha=$(git -C "$rig_path" rev-parse "$base")
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  gc bd --rig "$rig" update "$bead" \
+    --set-metadata "landed_at=$ts" \
+    --set-metadata "landed_sha=$landed_sha" >/dev/null 2>&1 || true
+  echo "landed:$landed_sha"
+  return 0
+}
+
+# Findings buckets.
+report_landable=()   # rig|bead|branch|ahead   (verdict=pass, would land / landed under --apply)
+report_untrusted=()  # rig|bead|branch|ahead   (no verdict — human re-review, never auto-land)
+report_nogate=()     # rig|bead|branch|ahead   (verdict=pass but rig has no test_command)
+report_suspect=()    # rig|bead|branch|reason:sha (landed_sha recorded but not verifiable on base)
+landed=()            # rig|bead|branch|sha
+blocked=()           # rig|bead|branch|reason
+
+process_rig() {
+  local rig=$1 base=$2 test_cmd=$3 require_verdict=$4
+  local rig_path=${RIG_PATHS[$rig]:-}
+  if [[ -z "$rig_path" ]]; then
+    echo "work-landing-reaper: rig '$rig' has no path (suspended/unknown?) — skipping" >&2
+    return 0
+  fi
+  [[ -d "$rig_path/.git" || -f "$rig_path/.git" ]] || { echo "work-landing-reaper: '$rig_path' not a git repo — skipping" >&2; return 0; }
+
+  [[ -z "$base" || "$base" == "null" ]] && base=$(default_branch "$rig_path")
+
+  # Preload existing branch refs so we skip the ~1000 no-branch closed beads
+  # (formula step-beads etc.) without a git call each.
+  local -A HAVE_BRANCH=()
+  while IFS= read -r ref; do
+    [[ -n "$ref" ]] && HAVE_BRANCH["$ref"]=1
+  done < <(git -C "$rig_path" for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null)
+
+  local closed_json
+  closed_json=$(gc bd --rig "$rig" list --status=closed --json --limit=0 2>/dev/null || echo '[]')
+
+  while IFS= read -r bead_json; do
+    [[ -z "$bead_json" ]] && continue
+    local id branch verdict
+    id=$(jq -r '.id' <<<"$bead_json")
+    branch=$(jq -r '(.metadata // {}).work_branch // ""' <<<"$bead_json")
+    [[ -z "$branch" || "$branch" == "null" ]] && branch="work/$id"
+    # Cheap prefilter: skip beads whose branch does not exist locally.
+    [[ -n "${HAVE_BRANCH[$branch]:-}" ]] || continue
+
+    local status
+    status=$(landing_status "$rig_path" "$branch" "$base")
+    case "$status" in
+      no_branch|landed|patch_equiv) continue ;;
+    esac
+    local ahead=${status#unmerged:}
+
+    # Honor a recorded landed_sha before classifying as unlanded (dr-gkq4):
+    # a conflict-adjusted cherry-pick defeats git cherry, but a verified
+    # landed_sha on the base proves the work already shipped. Verified -> skip
+    # entirely (never re-land). Recorded-but-unverifiable -> flag SUSPECT and
+    # continue through normal artifact inspection.
+    local landed_sha rls
+    landed_sha=$(jq -r '(.metadata // {}) | .landed_sha // .["gc.landed_sha"] // ""' <<<"$bead_json")
+    if [[ -n "$landed_sha" && "$landed_sha" != "null" ]]; then
+      rls=$(recorded_landed_status "$rig_path" "$landed_sha" "$base")
+      if [[ "$rls" == "verified" ]]; then
+        log_event "skipped_recorded_landed_sha" "$rig" "$id" "$branch" \
+          "$(jq -cn --arg s "$landed_sha" '{landed_sha:$s}')"
+        continue
+      fi
+      report_suspect+=("$rig|$id|$branch|$rls:$landed_sha")
+      log_event "landed_sha_suspect" "$rig" "$id" "$branch" \
+        "$(jq -cn --arg s "$landed_sha" --arg r "$rls" '{landed_sha:$s,reason:$r}')"
+    fi
+
+    verdict=$(jq -r '(.metadata // {}).review_verdict // ""' <<<"$bead_json")
+
+    if [[ "$require_verdict" != "" && "$require_verdict" != "null" && "$verdict" != "$require_verdict" ]]; then
+      report_untrusted+=("$rig|$id|$branch|$ahead")
+      log_event "unlanded_untrusted" "$rig" "$id" "$branch" \
+        "$(jq -cn --argjson a "$ahead" --arg v "$verdict" '{ahead:$a,verdict:$v}')"
+      continue
+    fi
+
+    # Trustworthy (verdict matches). Auto-land only if apply + test gate present.
+    if [[ -z "$test_cmd" || "$test_cmd" == "null" ]]; then
+      report_nogate+=("$rig|$id|$branch|$ahead")
+      log_event "unlanded_no_test_gate" "$rig" "$id" "$branch" \
+        "$(jq -cn --argjson a "$ahead" '{ahead:$a}')"
+      continue
+    fi
+
+    if (( ! APPLY )); then
+      report_landable+=("$rig|$id|$branch|$ahead")
+      log_event "unlanded_landable" "$rig" "$id" "$branch" \
+        "$(jq -cn --argjson a "$ahead" '{ahead:$a}')"
+      continue
+    fi
+
+    # --apply: attempt the landing.
+    local out
+    if out=$(attempt_land "$rig" "$rig_path" "$id" "$branch" "$base" "$test_cmd"); then
+      local sha=${out#landed:}
+      landed+=("$rig|$id|$branch|$sha")
+      log_event "landed" "$rig" "$id" "$branch" \
+        "$(jq -cn --arg s "$sha" '{landed_sha:$s}')"
+    else
+      blocked+=("$rig|$id|$branch|see-audit-log")
+    fi
+  done < <(jq -c '.[]' <<<"$closed_json")
+}
+
+# Iterate configured rigs (optionally filtered by --rig).
+num_rigs=$(jq '(.rigs // []) | length' <<<"$CONFIG_JSON")
+for i in $(seq 0 $((num_rigs - 1))); do
+  [[ "$num_rigs" -eq 0 ]] && break
+  rig=$(jq -r ".rigs[$i].name" <<<"$CONFIG_JSON")
+  base=$(jq -r ".rigs[$i].base_branch // \"\"" <<<"$CONFIG_JSON")
+  test_cmd=$(jq -r ".rigs[$i].test_command // \"\"" <<<"$CONFIG_JSON")
+  require_verdict=$(jq -r ".rigs[$i].require_verdict // \"pass\"" <<<"$CONFIG_JSON")
+  if (( ${#RIG_FILTER[@]} > 0 )); then
+    local_match=0
+    for f in "${RIG_FILTER[@]}"; do [[ "$f" == "$rig" ]] && local_match=1; done
+    (( local_match )) || continue
+  fi
+  process_rig "$rig" "$base" "$test_cmd" "$require_verdict"
+done
+
+# Report.
+total_unlanded=$(( ${#report_landable[@]} + ${#report_untrusted[@]} + ${#report_nogate[@]} ))
+
+emit_rows() {
+  local title=$1; shift
+  (( $# > 0 )) || return 0
+  echo; echo "$title"
+  printf '  %-26s %-34s %s\n' BEAD BRANCH AHEAD
+  local row rg id br extra
+  for row in "$@"; do
+    IFS='|' read -r rg id br extra <<<"$row"
+    printf '  %-26s %-34s %s\n' "$id" "$br" "$extra"
+  done
+}
+
+build_report() {
+  if (( APPLY )); then
+    printf 'work-landing-reaper: APPLY — %d landed, %d blocked, %d untrusted/no-gate reported\n' \
+      "${#landed[@]}" "${#blocked[@]}" "$(( ${#report_untrusted[@]} + ${#report_nogate[@]} ))"
+  else
+    printf 'work-landing-reaper: DRY-RUN — %d closed-but-unlanded bead(s) [%d landable, %d untrusted, %d no-test-gate]\n' \
+      "$total_unlanded" "${#report_landable[@]}" "${#report_untrusted[@]}" "${#report_nogate[@]}"
+  fi
+  (( ${#landed[@]}          )) && emit_rows "LANDED (base advanced, landed_sha recorded):" "${landed[@]}"
+  (( ${#blocked[@]}         )) && emit_rows "BLOCKED (escalated to mayor — see audit log):" "${blocked[@]}"
+  (( ${#report_landable[@]} )) && emit_rows "LANDABLE (verdict=pass; run --apply to land):" "${report_landable[@]}"
+  (( ${#report_nogate[@]}   )) && emit_rows "NO TEST GATE (verdict=pass; configure test_command to enable auto-land):" "${report_nogate[@]}"
+  (( ${#report_untrusted[@]})) && emit_rows "UNTRUSTED (no review_verdict=pass — human re-review before landing):" "${report_untrusted[@]}"
+  (( ${#report_suspect[@]}  )) && emit_rows "SUSPECT landed_sha (recorded but not a verified commit on base — investigate the stamp):" "${report_suspect[@]}"
+  if (( ! APPLY )) && (( total_unlanded > 0 )); then
+    echo; echo "Mode: DRY-RUN (re-run with --apply to land verdict=pass beads that have a test gate)"
+  fi
+  return 0
+}
+
+REPORT=$(build_report)
+printf '%s\n' "$REPORT"
+
+# Mayor summary nudge when there is anything to see.
+if (( NUDGE_MAYOR )) && (( total_unlanded + ${#landed[@]} + ${#blocked[@]} > 0 )); then
+  gc session nudge mayor "$REPORT" >/dev/null 2>&1 || true
+fi
+
+exit 0

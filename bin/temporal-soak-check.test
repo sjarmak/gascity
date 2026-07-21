@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+# Standalone test for temporal-soak-check's five soak assertions.
+#
+# What is under test: the check must report OUTCOME, not liveness. Its whole
+# reason to exist is that on 2026-07-16 every liveness signal was green while
+# zero work dispatched, so a "healthy" verdict against a broken soak is the
+# exact failure being prevented.
+#
+# METHOD (gc-4zf.2's one methodological rule): a negative assertion must be
+# PROVEN TO FAIL against the broken system, or it is vacuous. "Zero findings"
+# passes both when the check works and when the check is silently broken —
+# that is precisely how routed-bead-nudger.test hid a real regression for two
+# days while printing PASS. So every check below gets a RED fixture (break it,
+# watch it fire) AND the green fixture proves it stays quiet otherwise.
+#
+# Asserts:
+#   1. all healthy            -> ZERO findings, exit 0 (no false alarm)
+#   2. schedule paused        -> schedule-paused          [RED proof, check A]
+#   3. schedule missing       -> schedule-missing         [RED proof, check A]
+#   4. workflow FAILED        -> workflow-failed          [RED proof, check B]
+#   5. last fire > 2x cadence -> no-recent-fire           [RED proof, check C]
+#   6. no fires at all        -> no-recent-fire           [RED proof, check C]
+#   7. orphan bead routed_to unset -> orphan-bead         [RED proof, check D]
+#   8. completed but 0 beads  -> nothing-flowing          [RED proof, check E]
+#   9. temporal unreachable   -> temporal-unreachable (NOT silent green)
+#  10. dry-run never posts and never advances state
+#  11. Slack failure sends one deduped durable mayor fallback while Slack retries
+#
+# Strategy: stub `temporal` and `gc` on PATH. The temporal stub serves fixture
+# JSON from $FIXTURE_* env vars; the gc stub serves bead JSON and records any
+# `gc slack publish-to-channel` to $POST_LOG (which must stay EMPTY — this
+# script is report-only and every case here runs dry-run).
+#
+# Hermetic: mktemp -d for state/audit/fixtures, stubs on PATH, no real Temporal
+# and no real bead store is touched. Safe for orders/city-selftest.toml.
+#
+# Run:  bash /home/ds/gas-city/bin/temporal-soak-check.test
+
+set -uo pipefail
+
+CHECK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/temporal-soak-check"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+STUB="$WORK/stubbin"
+mkdir -p "$STUB"
+POST_LOG="$WORK/posts.log"
+MAYOR_LOG="$WORK/mayor.log"
+: > "$POST_LOG"
+: > "$MAYOR_LOG"
+
+# --- Stub `temporal` --------------------------------------------------------
+# Serves whatever the fixture files hold. Absent/empty file => empty output,
+# which is how a real unreachable server presents to the script.
+cat > "$STUB/temporal" <<'EOF'
+#!/usr/bin/env bash
+sub="$1"; shift
+case "$sub" in
+  schedule)
+    [[ -s "${FIXTURE_SCHEDULE:-}" ]] && cat "$FIXTURE_SCHEDULE"
+    ;;
+  workflow)
+    case "${1:-}" in
+      list) [[ -s "${FIXTURE_WFLIST:-}" ]] && cat "$FIXTURE_WFLIST" ;;
+      show)
+        wid=""
+        while [[ $# -gt 0 ]]; do
+          [[ "$1" == "--workflow-id" ]] && wid="$2"
+          shift
+        done
+        f="${FIXTURE_WFSHOW_DIR:-}/${wid}.json"
+        [[ -s "$f" ]] && cat "$f"
+        ;;
+    esac
+    ;;
+esac
+exit 0
+EOF
+chmod +x "$STUB/temporal"
+
+# --- Stub `gc` --------------------------------------------------------------
+cat > "$STUB/gc" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  bd)
+    # gc bd --rig <rig> list --label ... --status open --json
+    for a in "$@"; do [[ "$a" == "list" ]] && { [[ -s "${FIXTURE_BEADS:-}" ]] && cat "$FIXTURE_BEADS" || echo '[]'; exit 0; }; done
+    echo '[]'
+    ;;
+  slack)
+    echo "PUBLISH $*" >> "${POST_LOG:?}"   # must never fire in dry-run
+    [[ "${SLACK_FAIL:-0}" == "1" ]] && exit 1
+    ;;
+  mail)
+    echo "MAIL $*" >> "${MAYOR_LOG:?}"
+    ;;
+  session) : ;;                            # nudge mayor: no-op
+esac
+exit 0
+EOF
+chmod +x "$STUB/gc"
+
+export PATH="$STUB:$PATH"
+export POST_LOG MAYOR_LOG
+
+# --- Fixture builders -------------------------------------------------------
+iso() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%S.000000Z; }
+NOW=$(date +%s)
+
+FIXTURE_WFSHOW_DIR="$WORK/wfshow"; mkdir -p "$FIXTURE_WFSHOW_DIR"
+export FIXTURE_WFSHOW_DIR
+
+sched_ok()      { echo '{"schedule":{"state":{"paused":false,"notes":""}}}' > "$WORK/sched.json"; }
+sched_paused()  { echo '{"schedule":{"state":{"paused":true,"notes":"disarmed for rollback"}}}' > "$WORK/sched.json"; }
+sched_missing() { : > "$WORK/sched.json"; }
+
+# wf_entry <id> <status> <start-epoch>
+wf_entry() {
+  jq -cn --arg id "$1" --arg st "WORKFLOW_EXECUTION_STATUS_$2" --arg t "$(iso "$3")" \
+    '{execution:{workflowId:$id}, status:$st, startTime:$t, closeTime:$t}'
+}
+
+# wf_result <id> <terminal_outcome> <bead-count>
+wf_result() {
+  local beads="[]"
+  (( $3 > 0 )) && beads=$(jq -cn --argjson n "$3" '[range($n) | "gc-fake\(.)"]')
+  local payload
+  payload=$(jq -cn --arg o "$2" --argjson b "$beads" '{terminal_outcome:$o, bead_ids:$b, phase:"done"}' | base64 -w0)
+  jq -n --arg d "$payload" \
+    '{events:[{workflowExecutionCompletedEventAttributes:{result:{payloads:[{data:$d}]}}}]}' \
+    > "$FIXTURE_WFSHOW_DIR/$1.json"
+}
+
+reset_fixtures() {
+  sched_ok
+  : > "$WORK/beads.json"; echo '[]' > "$WORK/beads.json"
+  rm -f "$FIXTURE_WFSHOW_DIR"/*.json
+  rm -f "$WORK/state.json"
+  : > "$POST_LOG"
+  : > "$MAYOR_LOG"
+  # Healthy default: two recent cycles, both dispatching two beads.
+  local a b
+  a="maintenance-cycle-A"; b="maintenance-cycle-B"
+  jq -cn --argjson x "$(wf_entry "$a" COMPLETED $(( NOW - 3600 )))" \
+         --argjson y "$(wf_entry "$b" COMPLETED $(( NOW - 60 )))" '[$x,$y]' > "$WORK/wflist.json"
+  wf_result "$a" dispatched 2
+  wf_result "$b" dispatched 2
+}
+
+run_check() {
+  FIXTURE_SCHEDULE="$WORK/sched.json" \
+  FIXTURE_WFLIST="$WORK/wflist.json" \
+  FIXTURE_BEADS="$WORK/beads.json" \
+  TEMPORAL_SOAK_STATE="$WORK/state.json" \
+  TEMPORAL_SOAK_AUDIT_LOG="$WORK/audit.log" \
+  TEMPORAL_SOAK_CLI=temporal \
+  GC_STORE_ROOT="$WORK" \
+    bash "$CHECK" 2>&1
+}
+
+PASS=0; FAIL=0
+ok()   { echo "  ok: $1"; PASS=$((PASS+1)); }
+bad()  { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
+
+# assert_finding <desc> <expected-key>   (empty key = expect NO findings)
+assert_finding() {
+  local desc=$1 want=$2 out
+  out=$(run_check)
+  if [[ -z "$want" ]]; then
+    if grep -q 'DRY-RUN' <<<"$out"; then bad "$desc — expected silence, got: $(grep -oE '\*[a-z-]+\*' <<<"$out" | head -2 | tr '\n' ' ')"
+    else ok "$desc"; fi
+  else
+    if grep -q "\*${want}\*" <<<"$out"; then ok "$desc"
+    else bad "$desc — expected '${want}', got: $(head -6 <<<"$out" | tr '\n' ' ')"; fi
+  fi
+}
+
+echo "== temporal-soak-check"
+
+# 1. GREEN — the check must not cry wolf, or it will be ignored when it matters.
+reset_fixtures
+assert_finding "healthy soak -> no findings" ""
+
+# 2/3. RED proof, check A — schedule off.
+reset_fixtures; sched_paused
+assert_finding "schedule paused -> schedule-paused" "schedule-paused"
+
+reset_fixtures; sched_missing
+assert_finding "schedule missing -> schedule-missing" "schedule-missing"
+
+# 4. RED proof, check B — gc-4zf.4's signature: a FAILED cycle escalates nothing today.
+reset_fixtures
+jq -cn --argjson x "$(wf_entry maintenance-cycle-A COMPLETED $(( NOW - 3600 )))" \
+       --argjson y "$(wf_entry maintenance-cycle-C FAILED $(( NOW - 120 )))" '[$x,$y]' > "$WORK/wflist.json"
+wf_result maintenance-cycle-A dispatched 2
+assert_finding "failed cycle -> workflow-failed" "workflow-failed"
+
+# 5. RED proof, check C — armed but not producing (gc-qo3's 10-day blind spot).
+reset_fixtures
+jq -cn --argjson x "$(wf_entry maintenance-cycle-A COMPLETED $(( NOW - 5 * 3600 )))" '[$x]' > "$WORK/wflist.json"
+wf_result maintenance-cycle-A dispatched 2
+assert_finding "last fire 5h ago (>2x 120m) -> no-recent-fire" "no-recent-fire"
+
+# 6. RED proof, check C — nothing fired at all in the window.
+reset_fixtures
+echo '[]' > "$WORK/wflist.json"
+assert_finding "no fires in window -> no-recent-fire" "no-recent-fire"
+
+# 7. RED proof, check D — created but never slung (gc-4qz's shape).
+reset_fixtures
+jq -cn --arg t "$(iso $(( NOW - 3600 )))" \
+  '[{id:"gc-orph1", created:$t, metadata:{}}]' > "$WORK/beads.json"
+assert_finding "open bead, routed_to unset, 60m old -> orphan-bead" "orphan-bead"
+
+# 7b. A JUST-created unrouted bead is in-flight, not an orphan — no false alarm.
+reset_fixtures
+jq -cn --arg t "$(iso $(( NOW - 60 )))" \
+  '[{id:"gc-fresh", created:$t, metadata:{}}]' > "$WORK/beads.json"
+assert_finding "unrouted bead 1m old -> not yet an orphan" ""
+
+# 7c. A routed bead is not an orphan however old.
+reset_fixtures
+jq -cn --arg t "$(iso $(( NOW - 7200 )))" \
+  '[{id:"gc-routed", created:$t, metadata:{"gc.routed_to":"/home/ds/gascity/polecat"}}]' > "$WORK/beads.json"
+assert_finding "routed bead -> not an orphan" ""
+
+# 8. RED proof, check E — THE case: all green, nothing flowing.
+reset_fixtures
+wf_result maintenance-cycle-A skipped 0
+wf_result maintenance-cycle-B skipped 0
+assert_finding "2 completed cycles, 0 beads -> nothing-flowing" "nothing-flowing"
+
+# 8b. REGRESSION (found on the first live dry-run, 2026-07-16): a finding's text
+#     is multi-line (code fence + one line per failed workflow id). The dedup
+#     loop originally read newline-delimited records, so ONE finding split into
+#     SEVEN — the ``` fence and each workflow id each reported as their own NEW
+#     alert. Assert one multi-line finding produces exactly ONE report entry.
+reset_fixtures
+jq -cn --argjson x "$(wf_entry maintenance-cycle-A COMPLETED $(( NOW - 3600 )))" \
+       --argjson y "$(wf_entry maintenance-cycle-C FAILED $(( NOW - 300 )))" \
+       --argjson z "$(wf_entry maintenance-cycle-D FAILED $(( NOW - 240 )))" '[$x,$y,$z]' > "$WORK/wflist.json"
+wf_result maintenance-cycle-A dispatched 2
+out=$(run_check)
+# Count the alert MARKER, not the emoji: a split record loses its emoji field
+# and renders as "  *```* — NEW", so an emoji-anchored grep misses exactly the
+# bug under test and passes against the broken code. (First draft of this
+# assertion did that and was vacuous — verified by running it against the
+# pre-fix script, where it wrongly passed.)
+n_alerts=$(grep -cE '\*.*\* — (NEW|STILL RED|RECOVERED)' <<<"$out")
+if (( n_alerts == 1 )); then ok "multi-line finding -> exactly ONE alert entry"
+else bad "multi-line finding split into ${n_alerts} alerts (expected 1)"; fi
+# The fence must survive as content, not become its own finding key.
+if grep -qE '\*```\* — ' <<<"$out"; then bad "code fence leaked as a finding key"
+else ok "code fence stays inside the finding body"; fi
+
+# 8c. Dedup must not MASK new evidence. While workflow-failed sits red for a
+#     known failure, a BRAND NEW failed cycle must still alert — otherwise the
+#     check goes quiet exactly when something new breaks. Three sequential
+#     ticks against a persistent state file:
+#       tick 1: failure C          -> NEW
+#       tick 2: same failure C     -> silent (dedup works)
+#       tick 3: failures C + D     -> NEW EVIDENCE (fingerprint changed)
+reset_fixtures
+run_tick_push() {   # push mode so state advances, but slack stub records only
+  FIXTURE_SCHEDULE="$WORK/sched.json" FIXTURE_WFLIST="$WORK/wflist.json" \
+  FIXTURE_BEADS="$WORK/beads.json" TEMPORAL_SOAK_STATE="$WORK/state.json" \
+  TEMPORAL_SOAK_AUDIT_LOG="$WORK/audit.log" TEMPORAL_SOAK_CLI=temporal \
+  GC_STORE_ROOT="$WORK" bash "$CHECK" --push 2>&1
+}
+set_failures() {   # set_failures <id>...
+  local entries=() id
+  entries+=("$(wf_entry maintenance-cycle-A COMPLETED $(( NOW - 3600 )))")
+  for id in "$@"; do entries+=("$(wf_entry "$id" FAILED $(( NOW - 300 )))"); done
+  printf '%s\n' "${entries[@]}" | jq -cs '.' > "$WORK/wflist.json"
+  wf_result maintenance-cycle-A dispatched 2
+}
+: > "$POST_LOG"; rm -f "$WORK/state.json"
+set_failures maintenance-cycle-C; run_tick_push >/dev/null
+n1=$(grep -c PUBLISH "$POST_LOG")
+set_failures maintenance-cycle-C; run_tick_push >/dev/null
+n2=$(grep -c PUBLISH "$POST_LOG")
+set_failures maintenance-cycle-C maintenance-cycle-D; run_tick_push >/dev/null
+n3=$(grep -c PUBLISH "$POST_LOG")
+(( n1 == 1 )) && ok "tick 1: new failure alerts" || bad "tick 1: expected 1 post, got $n1"
+(( n2 == 1 )) && ok "tick 2: same failure dedup'd (silent)" || bad "tick 2: expected no new post, got $n2"
+(( n3 == 2 )) && ok "tick 3: NEW failure while red still alerts (no masking)" \
+              || bad "tick 3: new evidence MASKED — expected 2 posts, got $n3"
+
+# 8d. A result we cannot READ is UNKNOWN, not "dispatched zero beads". Cycles
+#     completed but every `workflow show` comes back empty -> must NOT cry
+#     nothing-flowing. This check is the one that must be believed when it
+#     fires, so a read failure must not forge it.
+reset_fixtures
+rm -f "$FIXTURE_WFSHOW_DIR"/*.json     # list still shows 2 COMPLETED; results unreadable
+assert_finding "completed cycles, results unreadable -> no false nothing-flowing" ""
+
+# 8e. The state file is hand-editable and ships with a seeded "_note" string.
+#     A non-object value must not break the recovery scan (it did: jq aborted
+#     with "Cannot index string with string \"status\"", which would silently
+#     skip every RECOVERED transition). Assert recovery still fires alongside one.
+reset_fixtures
+jq -n --argjson t "$(( NOW - 100000 ))" '{
+  "_note": "a human-written string, not an object",
+  "schedule-paused": {status:"red", fingerprint:"", since:$t, last_alert:$t}
+}' > "$WORK/state.json"
+out=$(run_check 2>&1)
+if grep -q 'Cannot index string' <<<"$out"; then bad "non-object state key crashes the recovery scan"
+else ok "non-object state key tolerated"; fi
+if grep -q '✅ \*schedule-paused\* — RECOVERED' <<<"$out"; then ok "recovery fires past a non-object state key"
+else bad "RECOVERED missed — got: $(head -5 <<<"$out" | tr '\n' ' ')"; fi
+
+# 9. Unreachable must be reported as UNKNOWN, never as green.
+reset_fixtures
+: > "$WORK/wflist.json"
+assert_finding "temporal unreachable -> temporal-unreachable" "temporal-unreachable"
+
+# 10. Dry-run posts nothing and advances no state (state is the dedup memory;
+#     advancing it on a dry run would silence the first real alert).
+reset_fixtures; sched_paused
+run_check >/dev/null
+if [[ -s "$POST_LOG" ]]; then bad "dry-run must not publish to slack"; else ok "dry-run publishes nothing"; fi
+if [[ -f "$WORK/state.json" ]] && jq -e '.["schedule-paused"]' "$WORK/state.json" >/dev/null 2>&1; then
+  bad "dry-run must not advance state"
+else ok "dry-run does not advance state"; fi
+
+# 11. Slack failure still reaches one durable mayor path, while identical
+# evidence remains deduped and Slack remains retryable on the next tick.
+reset_fixtures; sched_paused
+SLACK_FAIL=1 run_tick_push >/dev/null 2>&1 || true
+SLACK_FAIL=1 run_tick_push >/dev/null 2>&1 || true
+n_posts=$(grep -c PUBLISH "$POST_LOG")
+n_mail=$(grep -c MAIL "$MAYOR_LOG")
+if (( n_posts == 2 )); then ok "Slack failure remains retryable"
+else bad "expected two Slack attempts, got $n_posts"; fi
+if (( n_mail == 1 )); then ok "identical Slack failures produce one durable mayor fallback"
+else bad "expected one deduped mayor fallback, got $n_mail"; fi
+if jq -e '.["schedule-paused"] | .last_alert == 0 and .mayor_last_alert > 0' "$WORK/state.json" >/dev/null; then
+  ok "fallback dedup state is independent from Slack delivery state"
+else bad "fallback state advanced or lost Slack retry state"; fi
+
+echo
+echo "RESULT: $PASS passed, $FAIL failed"
+(( FAIL == 0 )) || { echo "FAILED"; exit 1; }

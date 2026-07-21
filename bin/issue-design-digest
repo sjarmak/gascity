@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""issue-design-digest: weekly maintainer digest of the pick-one design issues.
+
+Issue-hygiene piece 6 (mayor gc-429253). Batches the open kind/design issues (the
+"Design / Product questions we need to resolve" queue) and dispatches a worker to
+produce a morning-ledger-style digest — for each issue: the decision, the options,
+and a recommendation — surfaced to the maintainer. NEVER auto-comments or
+auto-closes; humans decide. Models surface + recommend; humans pick.
+
+ZFC: this script is MECHANISM ONLY — it gathers the kind/design issues, dedups,
+and dispatches a digest bead to the gascity polecat; the polecat does the model
+reasoning (options + recommendation per issue). No reasoning in code.
+
+Dispatching gascity work is gated -> default DRY-RUN (gather + compose the bead +
+nudge mayor). --apply slings it. Dedup: skips if a prior design-digest bead is
+still open.
+
+Source label: kind/design (override --label). Audit: .gc/issue-design-digest.log.
+
+Usage: issue-design-digest [--apply] [--nudge-mayor] [--label L] [--json]
+Env:   ISSUE_HYGIENE_REPO (default gastownhall/gascity)
+       ISSUE_TRIAGE_POLECAT (default /home/ds/gascity/polecat)
+"""
+import sys, os, re, json, time, subprocess
+
+CITY = "/home/ds/gas-city"
+AUDIT_LOG = os.path.join(CITY, ".gc", "issue-design-digest.log")
+REPO = os.environ.get("ISSUE_HYGIENE_REPO", "gastownhall/gascity")
+POLECAT = os.environ.get("ISSUE_TRIAGE_POLECAT", "/home/ds/gascity/polecat")
+DEFAULT_LABEL = "kind/design"
+
+INSTRUCT = (
+    "Produce a maintainer DESIGN-DECISION DIGEST for the gastownhall/gascity issues below "
+    "(all labeled kind/design — open pick-one design questions). For EACH issue write a "
+    "morning-ledger-style entry: the decision to make, the realistic options (2-4), and a "
+    "single clear RECOMMENDATION with one line of why. Read each issue (gh issue view) for "
+    "context. Then mail the whole digest to mayor for Stephanie's picks. NEVER comment on or "
+    "close any issue — you surface + recommend; humans decide. ZFC: this is judgment-support, "
+    "not auto-action."
+)
+
+
+def gh_json(args, timeout=90):
+    try:
+        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+        return json.loads(out.stdout) if out.returncode == 0 else None
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def prior_digest_open():
+    try:
+        out = subprocess.run(
+            ["gc", "bd", "--rig", "gascity", "list", "--status", "open", "--json", "--limit", "0"],
+            capture_output=True, text=True, timeout=60).stdout
+        beads = json.loads(out or "[]")
+        beads = beads if isinstance(beads, list) else beads.get("issues", [])
+        return any("design-decision digest" in (b.get("title") or "") for b in beads)
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return False
+
+
+def main():
+    argv = sys.argv[1:]
+    apply = "--apply" in argv
+    nudge = "--nudge-mayor" in argv
+    json_out = "--json" in argv
+    label = argv[argv.index("--label") + 1] if "--label" in argv else DEFAULT_LABEL
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+
+    issues = gh_json(["issue", "list", "--repo", REPO, "--state", "open", "--label", label,
+                      "--json", "number,title", "--limit", "200"])
+    if issues is None:
+        print("issue-design-digest: gh issue list failed", file=sys.stderr)
+        return 1
+    nums = sorted(i["number"] for i in issues)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    summary = {"ts": now, "repo": REPO, "label": label, "count": len(nums),
+               "apply": apply, "dispatched": False, "skipped_reason": None}
+
+    if not nums:
+        summary["skipped_reason"] = "no-design-issues"
+    elif prior_digest_open():
+        summary["skipped_reason"] = "prior-digest-bead-open"
+    elif apply:
+        title = f"issue-hygiene design-decision digest: {len(nums)} kind/design issues"
+        body = (f"{INSTRUCT}\n\nISSUES (label {label}): " + ", ".join(f"#{n}" for n in nums)
+                + "\n\nThis is piece 6 of the issue-hygiene routine.")
+        try:
+            create = subprocess.run(
+                ["gc", "bd", "--rig", "gascity", "create", title, "--description", body,
+                 "-l", "design-digest"], capture_output=True, text=True, timeout=60)
+            m = re.search(r"gc-[a-z0-9]+", create.stdout) if create.returncode == 0 else None
+            bid = m.group(0) if m else ""
+            if bid:
+                subprocess.run(["gc-sling", POLECAT, bid, "--no-formula", "--nudge"],
+                               capture_output=True, timeout=60)
+                summary["dispatched"] = True
+                summary["bead"] = bid
+        except (subprocess.SubprocessError, OSError) as e:
+            summary["skipped_reason"] = f"dispatch-error: {e}"
+
+    try:
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps({**summary, "issues": nums}) + "\n")
+    except OSError:
+        pass
+
+    if nudge and nums and not apply:
+        lines = [f"issue-design-digest (DRY-RUN): {len(nums)} open {label} issue(s) await a "
+                 f"design-decision digest. Flip the order to --apply to dispatch a digest bead to "
+                 f"the gascity polecat (options + recommendation each; surfaced for Stephanie's "
+                 f"picks, never auto-acted). Issues: " + ", ".join(f"#{n}" for n in nums)]
+        subprocess.run(["gc", "mail", "send", "mayor", "-s",
+                        f"issue-design-digest: {len(nums)} design issue(s) to digest (dry-run)",
+                        "-m", "\n".join(lines)], capture_output=True, timeout=30)
+
+    if json_out:
+        print(json.dumps({"summary": summary, "issues": nums}, indent=2))
+        return 0
+    mode = "APPLY" if apply else "DRY-RUN"
+    print(f"issue-design-digest ({mode})  repo={REPO}  label={label}  count={len(nums)}"
+          + (f"  dispatched={summary.get('bead','-')}" if summary["dispatched"]
+             else f"  ({summary['skipped_reason'] or 'dry-run'})"))
+    if nums and not apply:
+        print("  would dispatch a digest bead for: " + ", ".join(f"#{n}" for n in nums))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

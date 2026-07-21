@@ -1,0 +1,12 @@
+[order]
+description = "Hourly REPORT-ONLY calibration for the transcript-sustained-idle session reaper (Stephanie-approved report-only phase; mayor spec gc-414556). NEVER kills/closes/suspends/nudges-to-reap — it only records, per live agent session, transcript-JSONL idle minutes (the corrected criterion) vs gc's last_active (dashboard-idle), plus would_reap(idle>=240m) and cross-checks (tmux-attached, role, held in-progress bead). Writes the full per-session distribution to .gc/idle-session-report.log every run; nudges the mayor ONLY when a session crosses the 4h transcript-idle line so the auto-kill threshold can be calibrated from data BEFORE any auto-action (which stays Stephanie-gated). Auto-KILL is intentionally NOT wired."
+trigger = "cooldown"
+interval = "1h"
+exec = "/home/ds/gas-city/bin/idle-session-report --nudge-mayor"
+timeout = "5m"
+# Fail OPEN on open-work-gate timeout (gastownhall/gascity#2893): report-only
+# (never kills/nudges-to-reap — only records the per-session idle distribution),
+# so a duplicate run is a harmless re-report. CRITICAL that it keeps firing during
+# floor degradation — that's exactly when an emergency fleet-drain needs a CURRENT
+# would_reap list (mayor gc-456423). Without this it fails-closed + goes stale.
+idempotent = true

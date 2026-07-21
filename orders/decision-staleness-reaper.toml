@@ -1,0 +1,15 @@
+# Stale-decision reaper -> mayor. Stephanie 2026-06-13: she often resolves a
+# decision out-of-band (works directly with a rig agent, or merges/closes the
+# PR herself), but the `dec-` mirror on the decisions rig stays OPEN and keeps
+# getting pushed by decision-ledger-push. This order detects decs whose subject
+# PR/bead is already resolved and flags them to the mayor for a one-step close.
+# Surface-only (no auto-close): the close judgment stays with the mayor (a
+# model), per ZFC — see bin/decision-staleness-reaper header. Change-dedup'd, so
+# an unchanged candidate set is not re-mailed.
+# trigger=cooldown (no zero-lastRun bootstrap trap; mirrors decision-ledger-push).
+[order]
+description = "Every 1h: flag open needs/stephanie decs whose subject PR/bead is already resolved to the mayor (surface-only, change-dedup'd)."
+trigger = "cooldown"
+interval = "1h"
+exec = "/home/ds/gas-city/bin/decision-staleness-reaper"
+timeout = "3m"

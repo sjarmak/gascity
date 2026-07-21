@@ -1,0 +1,11 @@
+idle_timeout = "1h"
+max_active_sessions = 1
+min_active_sessions = 0
+provider = "amp-medium"
+suspended = true
+wake_mode = "resume"
+work_dir = "/home/ds/projects/scix_experiments"
+
+[env]
+  GC_BEADS = "bd"
+  GC_CITY = "/home/ds/gas-city"

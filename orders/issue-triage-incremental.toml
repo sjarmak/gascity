@@ -1,0 +1,16 @@
+# issue-triage-incremental — issue-hygiene piece 3 (mayor gc-429253). Weekly DELTA
+# triage: classify only issues created/changed since the last run (not the full
+# 343). ZFC: the script is mechanism-only (compute delta + dispatch a triage bead
+# to the gascity polecat); the polecat does the model classification, auto-applies
+# ONLY mechanical labels, and digests judgment items for a human. Never auto-closes.
+#
+# LANDED IN DRY-RUN + nudge-mayor: reports the delta + composes the bead, does NOT
+# dispatch. Go-live toggle = append `--apply` to exec (then it slings the triage
+# bead + advances the watermark) — a maintainer call, since it dispatches gascity
+# work + drives mechanical-label writes.
+[order]
+description = "Weekly (Mon): compute the delta of new/changed open gastownhall/gascity issues since the last run and (dry-run) compose a triage bead for the gascity polecat — mechanical labels only, judgment items digested. --apply dispatches it. Never time-closes; classification delegated to the polecat (ZFC)."
+trigger = "cron"
+schedule = "0 13 * * 1"
+exec = "/home/ds/gas-city/bin/issue-triage-incremental --apply --nudge-mayor"
+timeout = "5m"

@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# mem-brain-ab-dispatch — dispatch-side wiring for the mem-0ut warm-vs-cold
+# brain A/B (GREENLIT by Stephanie via gc-421287; mayor owns cross-rig arm
+# execution, mem owns measurement).
+#
+# WHAT IT DOES (mechanism only, ZFC-clean):
+#   1. loads one or more brain manifests (<repo>/.claude/brains/<name>.json),
+#      gating each through `brain check` (a STALE brain is refused — a
+#      confidently stale memory is worse than a cold start; rebuild first);
+#   2. loads candidate exploration-heavy beads + their blast-radius (concrete
+#      repo-relative paths) from the mem rig (metadata key gc.blast_radius) or
+#      a --candidates JSON file;
+#   3. calls mem_brain_arm_select.py to assign each bead an arm by set
+#      intersection (brain scope-manifest ∩ bead blast-radius) + deterministic
+#      alternation, building the EXACT contract metadata blob per bead;
+#   4. DRY-RUN (default): prints the plan + the exact stamp/sling commands.
+#      --commit: stamps gc.brain_* keys, then routes COLD beads to a fresh
+#      polecat. WARM routing requires a brain-forked session (see SAFETY) and
+#      goes through the loud `warm_launch` seam.
+#
+# SAFETY NET (dispatch mirror of the read-side fork_warnings):
+#   * A warm bead is NEVER routed to a plain fresh polecat — that would be a
+#     mislabeled warm run that silently inverts the headline metric. If the
+#     warm-fork launch binding is unavailable, the warm path FAILS LOUD.
+#   * The three warm keys are validated (presence + ISO parse) by the selector;
+#     a brain missing sessionId/builtAt aborts the whole run.
+#
+# This is INVESTIGATION/branch-ready wiring. It does NOT auto-activate: --commit
+# is gated behind an explicit env flag and is not run by any order/hook yet.
+#
+# Usage:
+#   mem-brain-ab-dispatch --brain <name> [--brain <name>...] \
+#       --repo /home/ds/projects/mem [--rig mem] \
+#       [--candidates candidates.json] [--target mem/mem-worker] \
+#       [--min-per-arm 10] [--commit]
+#
+#   candidates.json: [{"bead_id":"mem-xxxx","blast_radius":["src/a.ts",...]}, ...]
+#   When --candidates is omitted, candidates are read from the rig: every open
+#   bead carrying a gc.blast_radius metadata array.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELECTOR="${HERE}/mem_brain_arm_select.py"
+
+REPO="/home/ds/projects/mem"
+RIG="mem"
+TARGET="mem/mem-worker"
+CANDIDATES_FILE=""
+MIN_PER_ARM=10
+COMMIT=0
+declare -a BRAINS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --brain)        BRAINS+=("$2"); shift 2 ;;
+    --repo)         REPO="$2"; shift 2 ;;
+    --rig)          RIG="$2"; shift 2 ;;
+    --target)       TARGET="$2"; shift 2 ;;
+    --candidates)   CANDIDATES_FILE="$2"; shift 2 ;;
+    --min-per-arm)  MIN_PER_ARM="$2"; shift 2 ;;
+    --commit)       COMMIT=1; shift ;;
+    -h|--help)      sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *) echo "mem-brain-ab-dispatch: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ ${#BRAINS[@]} -ge 1 ]] || { echo "ERROR: at least one --brain required" >&2; exit 2; }
+
+# `brain` CLI: prefer PATH, fall back to the built dist/cli.js.
+brain_cli() {
+  if command -v brain >/dev/null 2>&1; then brain "$@";
+  else node /home/ds/projects/brains/dist/cli.js "$@"; fi
+}
+
+# --- 1. staleness gate + manifest paths -------------------------------------
+declare -a MANIFESTS=()
+for name in "${BRAINS[@]}"; do
+  mpath="${REPO}/.claude/brains/${name}.json"
+  [[ -r "$mpath" ]] || { echo "ERROR: no brain manifest: $mpath" >&2; exit 1; }
+  if ! brain_cli check "$name" --repo "$REPO" >/dev/null 2>&1; then
+    echo "ERROR: brain '$name' is STALE (or check failed) — rebuild before dispatch" >&2
+    echo "       a stale brain must be regenerated, never forked as-is" >&2
+    exit 1
+  fi
+  MANIFESTS+=("$mpath")
+done
+
+# --- 2. candidate beads + blast-radius --------------------------------------
+if [[ -z "$CANDIDATES_FILE" ]]; then
+  CANDIDATES_FILE="$(mktemp)"
+  trap 'rm -f "$CANDIDATES_FILE"' EXIT
+  gc bd --rig "$RIG" list --status open --json 2>/dev/null \
+    | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+items = d if isinstance(d, list) else d.get("issues", d.get("beads", []))
+out = []
+for it in items:
+    md = it.get("metadata") or {}
+    br = md.get("gc.blast_radius")
+    if isinstance(br, str):
+        try: br = json.loads(br)
+        except Exception: br = [s for s in br.replace(",", "\n").split() if s]
+    if isinstance(br, list) and br:
+        out.append({"bead_id": it.get("id"), "blast_radius": [str(x) for x in br]})
+json.dump(out, sys.stdout)
+' > "$CANDIDATES_FILE"
+fi
+
+NCAND=$(python3 -c "import json;print(len(json.load(open('$CANDIDATES_FILE'))))")
+if [[ "$NCAND" -eq 0 ]]; then
+  echo "No candidate beads with a gc.blast_radius. Nothing to dispatch." >&2
+  echo "Tag exploration-heavy beads with gc.blast_radius (JSON array of repo-relative paths) first." >&2
+  exit 1
+fi
+
+# --- 3. arm selection (delegated to the ZFC selector) -----------------------
+PLAN="$(python3 - "$SELECTOR" "$CANDIDATES_FILE" "$MIN_PER_ARM" "${MANIFESTS[@]}" <<'PYEOF'
+import importlib.util, json, sys
+from pathlib import Path
+
+selector_path, cand_path, min_per_arm, *manifests = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("sel", selector_path)
+sel = importlib.util.module_from_spec(spec)
+sys.modules["sel"] = sel  # dataclass annotation resolution needs it registered
+spec.loader.exec_module(sel)
+
+brains = [sel.load_brain(Path(p)) for p in manifests]
+raw = json.load(open(cand_path))
+cands = [sel.Candidate(bead_id=c["bead_id"], blast_radius=frozenset(c["blast_radius"])) for c in raw]
+
+assignments = sel.select_arms(cands, brains, min_per_arm=int(min_per_arm))
+print(json.dumps([
+    {"bead_id": a.bead_id, "arm": a.arm, "selection": a.selection,
+     "brain_name": a.brain_name, "metadata": dict(a.metadata)}
+    for a in assignments
+]))
+PYEOF
+)"
+
+WARM_N=$(jq '[.[]|select(.arm=="warm")]|length' <<<"$PLAN")
+COLD_N=$(jq '[.[]|select(.arm=="cold")]|length' <<<"$PLAN")
+echo "=== mem-0ut arm plan: warm=$WARM_N cold=$COLD_N (min/arm=$MIN_PER_ARM, brains: ${BRAINS[*]}) ==="
+jq -r '.[]|"  \(.bead_id)  \(.arm)  \(.selection)  brain=\(.brain_name//"-")"' <<<"$PLAN"
+
+# --- 4. dispatch ------------------------------------------------------------
+# The warm-fork launch seam. A warm bead must be assigned to a polecat session
+# that IS a fork of the brain (claude --resume <parent_sid> --fork-session), so
+# mem ingest resolves bead.assignee -> that forked transcript. Binding a forked
+# session as a gc-managed polecat is NOT something gc dispatch exposes today
+# (see report); until that binding is wired, the warm path fails loud rather
+# than mislabel. Override with GC_MEM_WARM_LAUNCH=<cmd> once the binding exists;
+# it is invoked as: <cmd> <bead_id> <brain_name> <parent_sid> <repo>.
+warm_launch() {
+  local bead="$1" brain="$2" sid="$3"
+  if [[ -n "${GC_MEM_WARM_LAUNCH:-}" ]]; then
+    GC_MEM_WARM_LAUNCH_BEAD="$bead" "$GC_MEM_WARM_LAUNCH" "$bead" "$brain" "$sid" "$REPO"
+    return $?
+  fi
+  echo "ERROR: warm bead $bead needs a brain-forked polecat (brain=$brain sid=$sid)" >&2
+  echo "       no warm-fork launch binding (GC_MEM_WARM_LAUNCH) — refusing to route a" >&2
+  echo "       mislabeled warm run. See the dispatch report for the two binding options." >&2
+  return 3
+}
+
+stamp_keys() {
+  local bead="$1"; shift
+  local -a args=(); local kv
+  for kv in "$@"; do args+=(--set-metadata "$kv"); done
+  gc bd --rig "$RIG" update "$bead" "${args[@]}"
+}
+
+if [[ "$COMMIT" -eq 0 ]]; then
+  echo
+  echo "DRY-RUN (no mutation). Per-bead commands --commit would run:"
+  jq -c '.[]' <<<"$PLAN" | while read -r row; do
+    bead=$(jq -r '.bead_id' <<<"$row")
+    arm=$(jq -r '.arm' <<<"$row")
+    kvs=$(jq -r '.metadata|to_entries|map("\(.key)=\(.value)")|join(" ")' <<<"$row")
+    echo "  gc bd --rig $RIG update $bead $(sed 's/[^ ]*=/--set-metadata &/g' <<<"$kvs")"
+    if [[ "$arm" == "warm" ]]; then
+      brain=$(jq -r '.brain_name' <<<"$row")
+      sid=$(jq -r '.metadata."gc.brain_parent_sid"' <<<"$row")
+      echo "  warm_launch $bead $brain $sid   # fork polecat from brain, set as assignee"
+    else
+      echo "  gc-sling $TARGET $bead --no-nudge   # fresh (cold) polecat"
+    fi
+  done
+  echo
+  echo "Re-run with --commit to execute (NOT auto-activated; mayor review first)."
+  exit 0
+fi
+
+# --- live path (only with --commit) -----------------------------------------
+echo
+echo "COMMIT: stamping keys and routing $NCAND beads..."
+jq -c '.[]' <<<"$PLAN" | while read -r row; do
+  bead=$(jq -r '.bead_id' <<<"$row")
+  arm=$(jq -r '.arm' <<<"$row")
+  mapfile -t kvs < <(jq -r '.metadata|to_entries[]|"\(.key)=\(.value)"' <<<"$row")
+  stamp_keys "$bead" "${kvs[@]}"
+  if [[ "$arm" == "warm" ]]; then
+    brain=$(jq -r '.brain_name' <<<"$row")
+    sid=$(jq -r '.metadata."gc.brain_parent_sid"' <<<"$row")
+    warm_launch "$bead" "$brain" "$sid"   # fails loud if no binding
+  else
+    gc-sling "$TARGET" "$bead" --no-nudge
+  fi
+done
+echo "done."

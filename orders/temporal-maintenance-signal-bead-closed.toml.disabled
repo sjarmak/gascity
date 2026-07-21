@@ -1,0 +1,11 @@
+# Temporal-maintenance Signal bridge — bead.closed -> workflow Signal.
+# Promotion Phase 3 (bead gc-z5k). DISARMED (.disabled) until Phase 4 deploys the
+# Temporal server + arms the Schedule; enabling it earlier is a harmless no-op
+# (no bead carries the temporal.cycle_key metadata yet; the exec fail-soft-dials).
+# Enable at P4 by renaming to drop the .disabled suffix.
+[order]
+description = "When a maintenance-cycle bead closes, forward a bead.closed Signal to its MaintenanceCycleWorkflow so the cycle advances without polling. Interim event-bus bridge; GitHub webhooks replace the ci/review side at P5."
+trigger = "event"
+on = "bead.closed"
+exec = "/home/ds/gas-city/bin/temporal-maintenance-signal-bead-closed"
+timeout = "60s"

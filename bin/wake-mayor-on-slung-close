@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# wake-mayor-on-slung-close — when a bead owned by mayor closes, nudge
+# mayor so it can follow through without the human having to ask.
+#
+# Why this exists (Stephanie 2026-05-12):
+#
+#   Memory rules like "mayor proactively polls slung work" aren't
+#   enforceable — they depend on mayor remembering. The actual
+#   enforcement has to be mechanical: a handler that fires when any
+#   bead mayor slung closes, and nudges mayor with the result.
+#
+#   Without this, every mayor-slung bead requires a human prompt
+#   ("check on the polecat") to surface its outcome — defeats the
+#   point of slinging it in the first place.
+#
+# Filter: bead has owner == the human account email (mayor session runs
+# with Stephanie's credentials, so beads filed by mayor or by Stephanie
+# both record her email as owner), AND assignee starts with "polecat-"
+# (a polecat-class worker completed it). This catches the canonical
+# "delegated polecat work just finished" pattern. PL-slung beads have
+# PL session IDs as owner and are filtered out — they have their own
+# loop-close surfacing.
+# Idempotent via state file.
+#
+# Pairs with: bin/wake-mayor-on-blocker-close (different shape — that
+# one fires on dependency-graph closes).
+
+set -euo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+STATE_FILE="${CITY}/.gc/wake-mayor-on-slung-close-state.json"
+AUDIT_LOG="${CITY}/.gc/wake-mayor-on-slung-close.log"
+SINCE="${WAKE_MAYOR_ON_SLUNG_CLOSE_SINCE:-10m}"
+
+mkdir -p "$(dirname "$STATE_FILE")"
+[[ -f "$STATE_FILE" ]] || echo '{"nudged":[]}' > "$STATE_FILE"
+
+log_event() {
+    local event="$1"; shift
+    local extra="$1"
+    printf '{"ts":"%s","event":"%s",%s}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$extra" >> "$AUDIT_LOG"
+}
+
+# Build prefix -> rig-name map for routing bd lookups.
+declare -A PREFIX_TO_RIG
+while IFS=$'\t' read -r rig prefix; do
+    [[ -n "$prefix" ]] && PREFIX_TO_RIG["$prefix"]="$rig"
+done < <(gc rig list 2>/dev/null | awk '
+    /^  [a-zA-Z][a-zA-Z0-9_-]+:/ {
+        name = $1; sub(/:$/, "", name); current_rig = name
+    }
+    /^    Prefix:/ {
+        gsub(/^    Prefix:[ \t]+/, ""); print current_rig "\t" $0
+    }')
+
+rig_for_bead() {
+    local bead_id="$1" prefix
+    for prefix in "${!PREFIX_TO_RIG[@]}"; do
+        [[ "$bead_id" == "$prefix-"* ]] && echo "${PREFIX_TO_RIG[$prefix]}" && return
+    done
+    return 1
+}
+
+bd_show() {
+    local bead_id="$1" rig out
+    if rig=$(rig_for_bead "$bead_id"); then
+        out=$(gc bd --rig "$rig" show "$bead_id" --json 2>/dev/null || true)
+    else
+        out=$(gc bd show "$bead_id" --json 2>/dev/null || true)
+    fi
+    # gc bd show returns an error OBJECT ({"error": "..."}) when the bead
+    # isn't in the routed rig — e.g. a city-level gc-NNNN bead colliding
+    # with the gascity rig's gc- prefix. Downstream indexes with .[0],
+    # which crashes on an object ("Cannot index object with number") and,
+    # under set -e, kills the whole order. Emit only a valid array;
+    # anything else becomes empty so the caller's [[ -z ]] guard skips it.
+    printf '%s' "$out" | jq -c 'if type == "array" then . else empty end' 2>/dev/null || true
+}
+
+# Get all recently-closed bead IDs (closed since SINCE).
+mapfile -t bead_ids < <(
+    gc events --type bead.closed --since "$SINCE" 2>/dev/null \
+        | jq -r '.subject // empty' \
+        | awk NF \
+        | sort -u
+)
+
+[[ ${#bead_ids[@]} -eq 0 ]] && { log_event "tick" "\"scanned\":0"; exit 0; }
+
+# Find mayor's active session ID for the nudge target.
+MAYOR_SESSION=$(gc session list --json 2>/dev/null \
+    | jq -r '.sessions[] | select(.template == "mayor") | select(.state == "active") | .id' \
+    | head -1)
+
+if [[ -z "$MAYOR_SESSION" ]]; then
+    log_event "skip_no_mayor" "\"scanned\":${#bead_ids[@]}"
+    exit 0
+fi
+
+nudged=0
+skipped=0
+ineligible=0
+
+for bead_id in "${bead_ids[@]}"; do
+    # Idempotence: skip if we've already nudged for this close.
+    if jq -e --arg b "$bead_id" '.nudged | index($b)' < "$STATE_FILE" >/dev/null; then
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    bead_json=$(bd_show "$bead_id")
+    [[ -z "$bead_json" ]] && { ineligible=$((ineligible + 1)); continue; }
+
+    # Filter: status must be closed (events stream can lag).
+    status=$(echo "$bead_json" | jq -r '.[0].status // empty')
+    [[ "$status" != "closed" ]] && { ineligible=$((ineligible + 1)); continue; }
+
+    # Filter: owner must be set AND must contain "@" (i.e., a human account
+    # email — mayor session runs with Stephanie's credentials, so mayor-filed
+    # beads carry her email). PL/worker sessions own beads via their session
+    # IDs (gc-XXXXX), which don't contain "@".
+    owner=$(echo "$bead_json" | jq -r '.[0].owner // empty')
+    [[ -z "$owner" || "$owner" != *"@"* ]] && { ineligible=$((ineligible + 1)); continue; }
+
+    # Filter: assignee must be a polecat-class worker (so this was delegated,
+    # not closed by the filer themselves).
+    assignee=$(echo "$bead_json" | jq -r '.[0].assignee // empty')
+    [[ "$assignee" != polecat-* ]] && { ineligible=$((ineligible + 1)); continue; }
+
+    title=$(echo "$bead_json" | jq -r '.[0].title // ""')
+    close_reason=$(echo "$bead_json" | jq -r '.[0].close_reason // empty')
+    summary=$(echo "$bead_json" | jq -r '.[0].metadata.summary_for_human // empty')
+    escalate=$(echo "$bead_json" | jq -r '.[0].metadata."gc.escalate_to" // empty')
+
+    # Compose the nudge body.
+    nudge_body=$(cat <<EOF
+[slung-bead-close] ${bead_id} closed — your slung work has a result.
+
+Title: ${title}
+Close reason: ${close_reason:-"(none)"}
+${summary:+Summary for human: $summary}
+${escalate:+Escalation target: $escalate}
+
+Read full detail: gc bd show ${bead_id}
+
+Next action depends on the close:
+- If polecat halted to mayor (gc.escalate_to=mayor): act on it now.
+- If polecat closed clean with a fix: verify + surface to operator if needed.
+- If polecat closed without a fix or with follow-ups proposed: decide next step.
+
+Do not wait for a human prompt to surface this — that's why this handler exists.
+EOF
+)
+
+    if gc session nudge "$MAYOR_SESSION" "$nudge_body" >/dev/null 2>&1; then
+        log_event "nudged" "\"bead\":\"$bead_id\",\"close_reason\":$(jq -nc --arg c "${close_reason:-}" '$c')"
+        # Append to state file (idempotent).
+        jq --arg b "$bead_id" '.nudged = (.nudged + [$b] | unique)' \
+            < "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+        nudged=$((nudged + 1))
+    else
+        log_event "nudge_failed" "\"bead\":\"$bead_id\""
+    fi
+done
+
+log_event "tick" "\"scanned\":${#bead_ids[@]},\"nudged\":$nudged,\"skipped\":$skipped,\"ineligible\":$ineligible"
+
+exit 0

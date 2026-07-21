@@ -1,0 +1,20 @@
+# nudge-poll-reaper — every 2m, reap leaked busy-looping 'gc nudge poll'
+# sidecars (gc-b9w88). After a session restart the old poll can orphan and spin
+# at multi-core CPU instead of sleeping (4 such procs burned ~735% CPU and were
+# the root of the all-day nudge-hangs on 2026-06-24). A healthy poll uses ~0%
+# CPU, so the reaper kills ONLY `gc nudge poll` procs sustained above 50% CPU
+# and older than 60s (rules out startup spikes) — never claude sessions, the
+# supervisor, or anything interactive. The durable root-cause fix (poll should
+# exit/sleep on restart) is gc SOURCE, held needs-source-impl; this stops the
+# recurring drain in-place until that lands.
+[order]
+description = "Every 2m: reap leaked busy-looping 'gc nudge poll' sidecar procs (gc-b9w88 in-floor mitigation). Kills only gc-nudge-poll procs >50% CPU and >60s old (a healthy poll is ~0%); never touches sessions/supervisor. Writes .gc/nudge-poll-reaper.log. Tightened 10m->5m 2026-06-25, then 5m->2m + age 120s->60s 2026-06-29: leak still recurring (3x in one session, batches of 6-7 sidecars at 300-560% CPU accumulating between runs -> load 20+); faster cadence keeps fewer hot-loopers accumulating. Durable cure is gc-source backoff (gc-b9w88, held needs-source-impl)."
+trigger = "cooldown"
+interval = "2m"
+exec = "/home/ds/gas-city/bin/nudge-poll-reaper"
+timeout = "60s"
+# Fail OPEN on open-work-gate timeout (gastownhall/gascity#2893): killing runaway
+# >50%-CPU poll sidecars is idempotent (re-kill of a dead proc is a no-op). CRITICAL
+# that this survives the gate starvation — if the gate is starved BY the CPU
+# runaways this reaper kills, failing closed is a deadlock (mayor 2026-07-06).
+idempotent = true

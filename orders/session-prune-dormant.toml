@@ -1,0 +1,6 @@
+[order]
+description = "Daily hygiene: close the genuinely-dormant session tail (asleep/drained/suspended older than 14d — e.g. city-stop control-dispatchers for inactive rigs). Removes stale list noise that hides live idle sessions. Active sessions are NEVER pruned (gc refuses); gc respawns a dispatcher if its rig reactivates. Not a RAM lever — these are already drained."
+trigger = "cooldown"
+interval = "24h"
+exec = "gc session prune --state asleep,drained,suspended --before 14d"
+timeout = "60s"

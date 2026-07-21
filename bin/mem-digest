@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+# mem-digest: per-epic status + verification digest for the mem rig.
+#
+# Answers two operator questions in one cadence:
+#   1. "keep tabs" — per-epic counts (open / in-progress / closed) so the
+#      many subtasks are visible at a glance.
+#   2. "verify it's doing expected work" — for every CLOSED bead, confirm a
+#      real deliverable exists: gc.commit is recorded AND (if the bead's
+#      worktree is on disk) that commit is actually reachable on its HEAD.
+#      Closed beads with no recorded/reachable commit are PHANTOM CLOSES.
+#
+# Plus a lightweight hygiene line (shared-root WIP, orphan worktrees) — the
+# class of drift that produced the ltte.5 triple-dispatch race.
+#
+# Mechanical only (counts + git reachability checks) — no semantic judgment.
+# Surfaces to mayor via `gc session nudge mayor`; mayor relays to Stephanie.
+#
+# Usage:
+#   mem-digest                 # print report to stdout
+#   mem-digest --nudge-mayor   # print + nudge mayor with the digest
+
+import collections
+import json
+import os
+import subprocess
+import sys
+
+RIG = "mem"
+MEM_ROOT = "/home/ds/projects/mem"
+PROJECTS = "/home/ds/projects"
+NUDGE = "--nudge-mayor" in sys.argv[1:]
+
+
+def sh(args, timeout=60):
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+
+
+def beads():
+    # --all includes closed beads (the default filter hides them, which would
+    # make the whole verification pass blind to phantom closes).
+    r = sh(["gc", "bd", "--rig", RIG, "list", "--all", "--json"])
+    return json.loads(r.stdout or "[]")
+
+
+def is_wrapper(b):
+    # mol-focus-review (and kin) are dispatch wrappers, not deliverables; they
+    # legitimately carry no gc.commit, so they must not count as phantom closes.
+    return b.get("title", "").strip() == "mol-focus-review" or b.get("issue_type") in ("convoy",)
+
+
+def is_subtask(bead_id):
+    s = bead_id[len("mem-"):] if bead_id.startswith("mem-") else bead_id
+    return "." in s
+
+
+def meta(b, key):
+    return (b.get("metadata") or {}).get(key)
+
+
+def epic_of(bead_id):
+    s = bead_id[len("mem-"):] if bead_id.startswith("mem-") else bead_id
+    return s.split(".")[0]
+
+
+def is_closed(b):
+    return str(b.get("status", "")).lower() in ("closed", "done", "resolved")
+
+
+def is_in_progress(b):
+    return str(b.get("status", "")).lower() in ("in_progress", "in-progress", "started")
+
+
+def worktree_for(bead_id):
+    p = os.path.join(PROJECTS, bead_id)  # /home/ds/projects/mem-ltte.5
+    return p if os.path.isdir(p) else None
+
+
+def repo_path(b):
+    """Repo a bead's deliverable lands in — gc.repo (e.g. 'brains') overrides
+    the default mem repo. Some mem-rig beads commit into sibling repos."""
+    r = meta(b, "gc.repo")
+    if r:
+        p = os.path.join(PROJECTS, r)
+        if os.path.isdir(p):
+            return p
+    return MEM_ROOT
+
+
+def commit_on_a_branch(commit, repo=MEM_ROOT):
+    """Is this commit durable — reachable from ANY branch in `repo`?"""
+    r = sh(["git", "-C", repo, "branch", "-a", "--contains", commit], timeout=20)
+    return r.returncode == 0 and r.stdout.strip() != ""
+
+
+def verify_deliverable(b):
+    """(status, reason) for a CLOSED bead.
+
+    'ok'       — recorded commit is durable on a branch, or worktree is ahead of main.
+    'phantom'  — a commit is recorded but it's on NO branch (lost/dangling). High signal.
+    'unstamped'— code bead with no commit recorded and no worktree-ahead. Can't confirm.
+    'skip'     — non-code bead (rollup / analysis / decision). Not flagged.
+    """
+    bid = b.get("id", "")
+    commit = meta(b, "gc.commit")
+    wd = meta(b, "gc.work_dir") or worktree_for(bid)
+    has_setup = bool(commit or meta(b, "gc.branch") or wd)
+    if not has_setup:
+        return "skip", "no worktree/commit (rollup/analysis bead)"
+
+    if commit:
+        repo = repo_path(b)
+        if commit_on_a_branch(commit, repo):
+            tag = "" if repo == MEM_ROOT else f" [{os.path.basename(repo)}]"
+            return "ok", f"{commit}{tag}"
+        return "phantom", f"gc.commit {commit} on NO branch in {os.path.basename(repo)} (lost)"
+
+    # no recorded commit — is the bead's own worktree ahead of main?
+    bwt = worktree_for(bid)
+    if bwt:
+        r = sh(["git", "-C", bwt, "rev-list", "--count", "main..HEAD"], timeout=20)
+        n = int(r.stdout.strip() or "0") if r.returncode == 0 else 0
+        if n > 0:
+            return "ok", f"committed ({n} ahead of main, no gc.commit stamp)"
+    return "unstamped", "no gc.commit + no worktree ahead of main"
+
+
+def worktrees():
+    r = sh(["git", "-C", MEM_ROOT, "worktree", "list", "--porcelain"], timeout=20)
+    paths = []
+    for line in r.stdout.splitlines():
+        if line.startswith("worktree "):
+            paths.append(line[len("worktree "):])
+    return paths
+
+
+def main():
+    data = beads()
+    by_epic = collections.defaultdict(lambda: {"open": 0, "in_progress": 0, "closed": 0})
+    standalone = {"open": 0, "in_progress": 0, "closed": 0}
+    phantom = []    # recorded commit on NO branch — high-signal (work lost)
+    unstamped = []  # code bead, no commit + no worktree-ahead — can't confirm
+    counts = {"verified": 0, "skipped": 0}
+
+    def bucket(target, b):
+        if is_closed(b):
+            target["closed"] += 1
+            st, reason = verify_deliverable(b)
+            row = (b.get("id", ""), b.get("title", "")[:48], reason)
+            if st == "phantom":
+                phantom.append(row)
+            elif st == "unstamped":
+                unstamped.append(row)
+            else:
+                counts["verified" if st == "ok" else "skipped"] += 1
+        elif is_in_progress(b):
+            target["in_progress"] += 1
+        else:
+            target["open"] += 1
+
+    for b in data:
+        bid = b.get("id", "")
+        if b.get("issue_type") == "epic" or is_wrapper(b):
+            continue  # epic roots are containers; wrappers carry no deliverable
+        if is_subtask(bid):
+            bucket(by_epic[epic_of(bid)], b)
+        else:
+            bucket(standalone, b)
+
+    # hygiene: shared-root WIP + orphan worktrees
+    dirty_main = len(sh(["git", "-C", MEM_ROOT, "status", "-s"], timeout=20).stdout.splitlines())
+    known = {b.get("id", "") for b in data}
+    orphans = []
+    for wt in worktrees():
+        base = os.path.basename(wt)
+        if base == os.path.basename(MEM_ROOT) or not base.startswith("mem-"):
+            continue
+        # worktrees are slug-named (mem-zt1c-confusion-staleness -> bead mem-zt1c),
+        # so match a known bead id as an exact or dash-delimited prefix.
+        if not any(base == k or base.startswith(k + "-") for k in known):
+            orphans.append(base)
+
+    lines = []
+    lines.append("[EPICS]  per-epic subtask status (open / in-progress / closed)")
+    for e in sorted(by_epic):
+        c = by_epic[e]
+        lines.append(f"  mem-{e:<8} open={c['open']:<3} in_prog={c['in_progress']:<3} closed={c['closed']}")
+    s = standalone
+    lines.append(f"  {'(standalone)':<12} open={s['open']:<3} in_prog={s['in_progress']:<3} closed={s['closed']}")
+
+    lines.append("")
+    lines.append(
+        f"[VERIFY]  {counts['verified']} verified · {len(phantom)} PHANTOM · "
+        f"{len(unstamped)} unstamped · {counts['skipped']} non-code skipped"
+    )
+    if phantom:
+        lines.append("  PHANTOM (commit recorded but on NO branch — work lost):")
+        for bid, title, reason in phantom:
+            lines.append(f"    {bid:<16} {reason:<34} {title}")
+    if unstamped:
+        lines.append("  UNSTAMPED (closed, no commit + no worktree-ahead — can't confirm; mostly a work-record gap):")
+        for bid, title, reason in unstamped[:8]:
+            lines.append(f"    {bid:<16} {title}")
+        if len(unstamped) > 8:
+            lines.append(f"    … +{len(unstamped) - 8} more")
+    if not phantom and not unstamped:
+        lines.append("  clean — every closed code-bead carries a durable committed deliverable")
+
+    hy = []
+    if dirty_main:
+        hy.append(f"{dirty_main} uncommitted files in SHARED ROOT ({MEM_ROOT}) — collision/WIP risk")
+    if orphans:
+        hy.append(f"{len(orphans)} orphan worktree(s) (no matching bead): {', '.join(orphans[:6])}")
+    if hy:
+        lines.append("")
+        lines.append("[HYGIENE]")
+        for h in hy:
+            lines.append(f"  {h}")
+
+    report = "\n".join(lines)
+    header = "mem-digest — per-epic status + deliverable verification"
+    print(header)
+    print(report)
+
+    if NUDGE:
+        flag = ""
+        if phantom:
+            flag = f"  ({len(phantom)} unverified close(s) — check these)"
+        msg = (
+            f"{header}{flag}\n\n{report}\n\n"
+            "This is the scheduled mem subtask digest for Stephanie. Relay it to her: "
+            "per-epic progress + any CLOSED beads whose deliverable can't be verified "
+            "(phantom closes she'd want to know about) + shared-root hygiene."
+        )
+        r = sh(["gc", "session", "nudge", "mayor", msg], timeout=30)
+        if r.returncode != 0:
+            sys.stderr.write("warn: gc session nudge mayor failed (mayor may be asleep); report on stdout\n")
+
+
+if __name__ == "__main__":
+    main()

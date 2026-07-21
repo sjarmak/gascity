@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# likec4-orient-refresh — regenerate the derived LikeC4 orientation summary
+# (architecture/exports/orient.md) for each tracked-model rig, so a dispatched
+# agent orients off the compact map instead of cold grep-walking the tree
+# (Design A rollout, mayor gc-423468 [C] / docs/design/likec4-orient-prototype.md).
+#
+# Writes only the generated file architecture/exports/orient.md in each rig (the
+# rig's CLAUDE.md @imports it). Does NOT commit/push — persistence is the rig's
+# concern (its likec4-pages CI / a commit step). Mechanical regen only.
+#
+# Scope = the tracked-model rigs whose architecture/ is committed to git
+# (per the scoping memo §1.3); untracked-model rigs are out of scope until they
+# commit architecture/.
+#
+# Usage: likec4-orient-refresh [--rigs "name=path name=path ..."] [--dry-run]
+set -uo pipefail
+CITY=/home/ds/gas-city
+TOOL="$CITY/bin/likec4-orient"
+AUDIT_LOG="${LIKEC4_ORIENT_AUDIT_LOG:-$CITY/.gc/likec4-orient-refresh.log}"
+
+# Tracked-model rigs (memo §1.3). Override via --rigs for testing.
+# Wired rigs only (mayor gc-423659): tom-swe dropped → small-codebase, the
+# always-@import nets negative (~27% saving, ~3.2K/session load); on-demand orient
+# skill is the small-rig pattern. website held (Stephanie deploy sign-off);
+# embertide pending dirty-tree retry — both stay listed so their generated
+# orient.md is kept fresh for when their @import lands.
+RIGS_DEFAULT="mem=/home/ds/projects/mem code-intelligence-digest=/home/ds/projects/code-intelligence-digest website=/home/ds/projects/website embertide=/home/ds/projects/embertide"
+RIGS="$RIGS_DEFAULT"
+DRY_RUN=0
+while [[ $# -gt 0 ]]; do case "$1" in
+  --rigs) RIGS="$2"; shift 2;;
+  --dry-run) DRY_RUN=1; shift;;
+  -h|--help) sed -n 's/^# \{0,1\}//p' "$0" | head -18; exit 0;;
+  *) echo "unknown arg: $1" >&2; exit 2;; esac; done
+
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+ok=0; skipped=0
+for pair in $RIGS; do
+  name="${pair%%=*}"; dir="${pair#*=}"
+  if [[ ! -d "$dir/architecture" ]]; then
+    echo "skip $name: no architecture/ dir"; skipped=$((skipped+1)); continue
+  fi
+  out="$dir/architecture/exports/orient.md"
+  if (( DRY_RUN )); then
+    echo "would-refresh $name -> $out"; continue
+  fi
+  mkdir -p "$dir/architecture/exports"
+  if "$TOOL" "$dir" > "$out.tmp" 2>/dev/null && [[ -s "$out.tmp" ]]; then
+    mv "$out.tmp" "$out"
+    tok=$(( $(wc -c < "$out") / 4 ))
+    echo "refreshed $name -> $out (~${tok} tokens)"
+    printf '{"ts":"%s","rig":"%s","out":"%s","tokens":%d}\n' "$(ts)" "$name" "$out" "$tok" >> "$AUDIT_LOG" 2>/dev/null
+    ok=$((ok+1))
+  else
+    rm -f "$out.tmp"
+    echo "FAILED $name: likec4-orient export/transform error" >&2
+    skipped=$((skipped+1))
+  fi
+done
+echo "refreshed $ok rig(s), skipped $skipped"

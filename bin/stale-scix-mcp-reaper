@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# stale-scix-mcp-reaper: reap ORPHANED `scix.mcp_server` processes left behind
+# by Claude sessions that have ended. When a session exits, its MCP child is
+# reparented to init (PID 1) and lingers, hoarding swap (~300-580 MiB each);
+# they accumulate over days. Agent *suspends* do NOT free them, only reaping.
+#
+# Deterministic stale rule (ALL must hold):
+#   - command matches `scix.mcp_server`
+#   - process age >= $MIN_AGE (default 10m) — avoids a startup race
+#   - the process is ORPHANED: parent is PID 1, or the parent no longer exists
+#
+# Why orphan-only: a scix.mcp_server with ANY live parent (gc-managed worker OR
+# an ad-hoc human session over mosh/ssh in some other tree) is IN USE — reaping
+# it would kill the MCP out from under a live session. Only a dead parent is an
+# unambiguous, always-safe reap. Ambiguous "alive but looks abandoned" cases are
+# left for a human (do not guess in an hourly automation).
+#
+# Default mode is DRY-RUN. Pass --apply to actually reap (SIGTERM, then SIGKILL).
+#
+# Usage:
+#   stale-scix-mcp-reaper                 # dry-run report
+#   stale-scix-mcp-reaper --apply         # actually reap
+#   stale-scix-mcp-reaper --apply --nudge-mayor
+#   stale-scix-mcp-reaper --min-age 30m   # custom minimum process age
+
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${STALE_SCIX_MCP_AUDIT_LOG:-${CITY}/.gc/stale-scix-mcp-reaper.log}"
+MIN_AGE="${STALE_SCIX_MCP_MIN_AGE:-10m}"
+PROC_MATCH="scix.mcp_server"
+
+APPLY=0
+NUDGE_MAYOR=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)       APPLY=1; shift ;;
+    --nudge-mayor) NUDGE_MAYOR=1; shift ;;
+    --min-age)     MIN_AGE="$2"; shift 2 ;;
+    -h|--help)     sed -n 's/^# \{0,1\}//p' "$0" | head -27; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$(dirname "$AUDIT_LOG")"
+
+threshold_to_seconds() {
+  local t="$1" num unit
+  num="${t%[a-z]}"; unit="${t##*[0-9]}"
+  case "$unit" in
+    s) echo "$num" ;;
+    m) echo $((num * 60)) ;;
+    h) echo $((num * 3600)) ;;
+    d) echo $((num * 86400)) ;;
+    *) echo "stale-scix-mcp-reaper: bad min-age '$t' (use e.g. 10m, 1h)" >&2; exit 2 ;;
+  esac
+}
+MIN_AGE_SECONDS=$(threshold_to_seconds "$MIN_AGE")
+
+log_event() {
+  # log_event <event> <pid> <extra-json>
+  local event=$1 pid=$2 extra=${3:-'{}'} ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  jq -cn --arg ts "$ts" --arg event "$event" --arg pid "$pid" --argjson extra "$extra" \
+    '{ts:$ts, event:$event, pid:($pid|tonumber)} + $extra' >> "$AUDIT_LOG"
+}
+
+ppid_of() { awk '/^PPid:/{print $2}' "/proc/$1/status" 2>/dev/null; }
+
+# Orphaned: parent is init (1), or parent is empty, or parent process is gone.
+is_orphan() {
+  local pp; pp=$(ppid_of "$1")
+  [[ -z "$pp" || "$pp" == "1" || ! -d "/proc/$pp" ]]
+}
+
+candidates=()   # pid|age_s|rss_mb|swap_mb|ppid
+scanned=0
+
+for pid in $(pgrep -f "$PROC_MATCH" 2>/dev/null); do
+  [[ -d "/proc/$pid" ]] || continue
+  scanned=$((scanned + 1))
+  age_s=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+  [[ -n "$age_s" ]] || continue
+  (( age_s < MIN_AGE_SECONDS )) && continue
+  is_orphan "$pid" || continue            # live parent → in use → keep
+
+  pp=$(ppid_of "$pid")
+  rss_mb=$(( $(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null || echo 0) / 1024 ))
+  swap_mb=$(( $(awk '/^VmSwap:/{print $2}' "/proc/$pid/status" 2>/dev/null || echo 0) / 1024 ))
+  candidates+=("$pid|$age_s|$rss_mb|$swap_mb|${pp:-gone}")
+  log_event "stale_detected" "$pid" \
+    "$(jq -cn --argjson a "$age_s" --argjson r "$rss_mb" --argjson s "$swap_mb" --arg pp "${pp:-gone}" \
+       '{age_s:$a, rss_mb:$r, swap_mb:$s, ppid:$pp, reason:"orphaned"}')"
+done
+
+count=${#candidates[@]}
+{
+  echo "stale-scix-mcp-reaper: ${count} orphaned scix.mcp_server (scanned: $scanned, min-age: $MIN_AGE)"
+  if (( count > 0 )); then
+    echo
+    printf '%-8s %-8s %-8s %-9s %s\n' PID AGE RSS SWAP PPID
+    printf '%-8s %-8s %-8s %-9s %s\n' --- --- --- ---- ----
+    for row in "${candidates[@]}"; do
+      IFS='|' read -r pid age rss swap pp <<<"$row"
+      printf '%-8s %-8s %-7sM %-8sM %s\n' "$pid" "$((age/60))m" "$rss" "$swap" "$pp"
+    done
+    echo
+    (( APPLY )) && echo "Mode: APPLY (reaping all candidates)" || echo "Mode: DRY-RUN (re-run with --apply to reap)"
+  fi
+}
+
+reaped=0
+total_swap_mb=0
+if (( APPLY )) && (( count > 0 )); then
+  for row in "${candidates[@]}"; do
+    IFS='|' read -r pid age rss swap pp <<<"$row"
+    kill -TERM "$pid" 2>/dev/null
+    for _ in 1 2 3; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    if ! kill -0 "$pid" 2>/dev/null; then
+      reaped=$((reaped + 1)); total_swap_mb=$((total_swap_mb + swap))
+      log_event "reaped" "$pid" "$(jq -cn --argjson s "$swap" '{swap_mb:$s}')"
+    else
+      log_event "reap_failed" "$pid" '{}'
+    fi
+  done
+  echo
+  echo "Reaped $reaped of $count orphaned scix.mcp_server (~${total_swap_mb}M swap reclaimable)."
+fi
+
+if (( NUDGE_MAYOR )) && (( APPLY )) && (( reaped > 0 )); then
+  msg="stale-scix-mcp-reaper: reaped $reaped orphaned scix.mcp_server (~${total_swap_mb}M swap). See $AUDIT_LOG"
+  gc session nudge mayor "$msg" 2>/dev/null \
+    || echo "warn: gc session nudge mayor failed (mayor may be asleep); reaps are in audit log" >&2
+fi

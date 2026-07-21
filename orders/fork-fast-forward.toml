@@ -1,0 +1,6 @@
+[order]
+description = "Keep upstream-tracked forks in sync. Fetches upstream + fork, fast-forwards fork's main to upstream's main when safe (no fork-side commits at risk). No-op when already current. Refuses if fork has commits not on upstream. Registered repos in bin/fork-fast-forward TREES[]."
+trigger = "cooldown"
+interval = "30m"
+exec = "/home/ds/gas-city/bin/fork-fast-forward"
+timeout = "120s"

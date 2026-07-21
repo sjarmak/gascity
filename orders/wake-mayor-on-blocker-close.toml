@@ -1,0 +1,6 @@
+[order]
+description = "Nudge mayor when a blocker bead transitions to closed and has open dependents (linked via `bd dep <blocker> --blocks <dependent>`). Lets mayor follow through on deferred continuation work without the human having to ping."
+trigger = "event"
+on = "bead.updated"
+exec = "/home/ds/gas-city/bin/wake-mayor-on-blocker-close"
+timeout = "60s"

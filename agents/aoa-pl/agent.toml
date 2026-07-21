@@ -1,0 +1,15 @@
+work_dir = "/home/ds/projects/aoa"
+prompt_template = "prompts/dedicated-project-lead.template.md"
+# 2026-07-18 per Stephanie: project leads run through Amp's medium profile.
+# Revert from the sibling pre-migration snapshot if binding or resume regresses.
+provider = "amp-medium"
+min_active_sessions = 0
+max_active_sessions = 1
+wake_mode = "resume"
+idle_timeout = "1h"
+
+[env]
+GC_CITY = "/home/ds/gas-city"
+GC_BEADS = "bd"
+GC_RIG = "aoa"
+GC_RIG_ROOT = "/home/ds/projects/aoa"

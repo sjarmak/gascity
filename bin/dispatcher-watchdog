@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# dispatcher-watchdog: self-heal wedged control-dispatchers.
+#
+# Why: the city control-dispatcher (gc-2790) recurrently wedges ~6h after a
+# reset — it stays in `active` state but stops converting routed beads, looping
+# routed-bead nudges that never land. Observed 3x on 2026-06-13 alone. The
+# recovery is non-obvious: `gc session reset`/`wake` SILENTLY NO-OP because the
+# wedge trips the named-session circuit breaker; only `gc session kill` clears
+# the breaker, after which the supervisor respawns the dispatcher fresh.
+# Stephanie 2026-06-13: "build an auto-reset watchdog so it self heals."
+#
+# What it does: finds control-dispatcher sessions that are `active` and wedged,
+# and `kill`s them (clears the breaker -> supervisor respawns fresh). Two
+# independent wedge signals, OR'd:
+#
+#   1. IDLE-THRESHOLD: active but last_active >= IDLE_THRESHOLD_SECS. A healthy
+#      dispatcher heartbeats well under the threshold, so a long idle is the
+#      practical wedge signal.
+#   2. CONVERSION-STALL (nudge-robust): the SAME set of routed/open control beads
+#      stays UNCONVERTED for >= CONVERSION_STALL_SECS. This catches a wedge whose
+#      last_active still ticks (the 9fa6b7fec rig-scoped-route strand: the session
+#      looks busy being re-nudged but never converts). It replaces the earlier
+#      PANE-FROZEN conjunct, which no-op'd: the routed-bead-nudger writes the
+#      dispatcher's pane more often than any freeze window, so the pane hash never
+#      stayed frozen (gc-z4gf7). The predicate is AND-guarded inside
+#      conversion_stalled — an empty control queue or a dispatcher that IS
+#      converting (its pending set changes) is never killed.
+#
+# A kill of a merely-quiet dispatcher is cheap (a fresh respawn, no work lost),
+# so the action is safe even on a false positive. Asleep/city-stop dispatchers
+# (dormant rigs) are left alone. Change-logged; notifies mayor on action.
+#
+# DRY_RUN=1 reports targets without killing.
+
+set -uo pipefail
+
+CITY="${DISPATCHER_WATCHDOG_CITY:-/home/ds/gas-city}"
+AUDIT_LOG="${DISPATCHER_WATCHDOG_AUDIT_LOG:-$CITY/.gc/dispatcher-watchdog.log}"
+CONVERSION_STATE_FILE="${DISPATCHER_WATCHDOG_CONVERSION_STATE_FILE:-$CITY/.gc/dispatcher-watchdog-conversion.json}"
+MAYOR="${DISPATCHER_WATCHDOG_MAYOR:-mayor}"
+IDLE_THRESHOLD_SECS="${DISPATCHER_WATCHDOG_IDLE_SECS:-$(( 5 * 3600 ))}"  # 5h
+# Signal 2 trips when the SAME set of routed/open control beads stays unconverted
+# this long (>= ~3 watchdog runs at the 30m order cadence). Catches the wedge well
+# before signal 1's 5h idle threshold; long enough that normal conversion latency
+# never trips it.
+CONVERSION_STALL_SECS="${DISPATCHER_WATCHDOG_CONVERSION_STALL_SECS:-5400}"  # 90m
+DRY_RUN="${DRY_RUN:-0}"
+
+ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+log() { echo "$(ts) $*" >> "$AUDIT_LOG"; }
+
+now="${DISPATCHER_WATCHDOG_NOW:-$(date +%s)}"
+
+# dispatcher_target <session-name> -> stable canonical target identity. This is
+# intentionally independent of the ephemeral gc-NNN session ID so a replacement
+# cannot reset an unchanged target's conversion clock.
+dispatcher_target() {
+  local name="$1" rig
+  case "$name" in
+    control-dispatcher|core.control-dispatcher)
+      echo "core.control-dispatcher"
+      ;;
+    */control-dispatcher|*/core.control-dispatcher)
+      rig="${name%%/*}"
+      [[ -n "$rig" && "$name" != */*/* ]] && echo "$rig/core.control-dispatcher"
+      ;;
+  esac
+}
+
+# control_pending_set <target> -> echoes the sorted, comma-joined set of READY,
+# unassigned control-bead ids owned by exactly that city/rig dispatcher, or "" if
+# none. This mirrors the dispatcher's processable universe: dependency-blocked
+# beads and epics are excluded by `bd ready`; gc.instantiating beads are excluded
+# below. Control beads carry gc.routed_to / gc.run_target. Historical bare/dotted
+# spellings normalize to the canonical target, but substring matches do not
+# establish ownership.
+# Fail safe: any error returns nonzero, so callers preserve the clock without
+# aging or acting on a signal they cannot read.
+control_pending_set() {
+  local target="$1" rig json ids
+  if [[ "$target" == */* ]]; then
+    rig="${target%%/*}"
+    json=$(gc bd --rig "$rig" ready --unassigned --exclude-type=epic --json --limit=0 2>/dev/null) \
+      || return 1
+  else
+    json=$(cd "$CITY" && bd ready --unassigned --exclude-type=epic --json --limit=0 2>/dev/null) \
+      || return 1
+  fi
+  jq -e 'type=="array"' >/dev/null 2>&1 <<<"$json" || return 1
+  if ! ids=$(jq -r --arg target "$target" '
+      def canonical_target:
+        if . == "control-dispatcher" or . == "core.control-dispatcher" then
+          "core.control-dispatcher"
+        elif test("^[^/]+/(core\\.)?control-dispatcher$") then
+          (capture("^(?<rig>[^/]+)/").rig + "/core.control-dispatcher")
+        else "" end;
+      .[]
+      | select((.assignee // "") == "")
+      | (.metadata // {}) as $m
+      | select(($m."gc.instantiating" // "") == "")
+      | select(
+          (($m."gc.routed_to"  // "") | canonical_target) == $target or
+          (($m."gc.run_target" // "") | canonical_target) == $target
+        )
+      | .id
+      | if type == "string" and length > 0 then . else error("invalid bead id") end' \
+      <<<"$json" 2>/dev/null); then
+    return 1
+  fi
+  [[ -z "$ids" ]] && { echo ""; return 0; }
+  printf '%s\n' "$ids" | grep -v '^$' | sort -u | paste -sd, - 2>/dev/null
+}
+
+# conversion_stalled <target> <id> -> exit 0 (stalled) / 1 (not). The nudge-ROBUST signal
+# (replaces the defeated pane-frozen one — the routed-bead-nudger writes the pane
+# more often than any freeze window, so pane-hash never froze): a dispatcher is
+# wedged iff the SAME set of routed/open control beads stays UNCONVERTED for
+# >= CONVERSION_STALL_SECS. Tracks per-target {set,since,session_id} state; the
+# session ID is observability/action metadata, not the stall identity.
+# AND-guarded so a healthy dispatcher is never killed:
+#   - empty control queue   -> clear state, NOT stalled (nothing to convert).
+#   - set changed since last -> the dispatcher IS converting (beads closed) or new
+#                               work arrived -> reset the clock, NOT stalled.
+#   - same non-empty set, held >= CONVERSION_STALL_SECS -> STALLED.
+conversion_stalled() {
+  local target="$1" id="$2" cur state next_state stored_set stored_since stalled=1
+  # An unreadable store is unknown, not empty. Preserve its clock without aging
+  # or acting; partial jq output must never become kill evidence.
+  cur=$(control_pending_set "$target") || return 1
+  state=$(cat "$CONVERSION_STATE_FILE" 2>/dev/null)
+  [[ -z "$state" ]] && state='{}'
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$state" || state='{}'
+  stored_set=$(jq -r --arg target "$target" '.[$target].set // ""' <<<"$state" 2>/dev/null)
+  stored_since=$(jq -r --arg target "$target" '.[$target].since // 0' <<<"$state" 2>/dev/null)
+
+  if [[ -z "$cur" ]]; then
+    # Empty control queue -> healthy; drop any stale clock.
+    if next_state=$(jq --arg target "$target" 'del(.[$target])' <<<"$state" 2>/dev/null); then
+      state="$next_state"
+    fi
+  elif [[ "$cur" == "$stored_set" && "$stored_since" =~ ^[0-9]+$ && "$stored_since" -gt 0 ]]; then
+    # Same unconverted set as last run -> keep `since`, check the duration.
+    (( now - stored_since >= CONVERSION_STALL_SECS )) && stalled=0
+    if next_state=$(jq --arg target "$target" --arg id "$id" --arg s "$cur" --argjson since "$stored_since" \
+      '.[$target] = {set:$s, since:$since, session_id:$id}' <<<"$state" 2>/dev/null); then
+      state="$next_state"
+    fi
+  else
+    # Set changed (converted / new work) -> progress; reset the clock.
+    if next_state=$(jq --arg target "$target" --arg id "$id" --arg s "$cur" --argjson since "$now" \
+      '.[$target] = {set:$s, since:$since, session_id:$id}' <<<"$state" 2>/dev/null); then
+      state="$next_state"
+    fi
+  fi
+  # Persist (skip in DRY_RUN so a dry run never advances the stall clock).
+  if [[ "$DRY_RUN" != "1" && -n "$state" ]]; then
+    echo "$state" > "$CONVERSION_STATE_FILE"
+  fi
+  return "$stalled"
+}
+
+# kill_dispatcher <id> <human-reason> <subject> <body>
+kill_dispatcher() {
+  local id="$1" reason="$2" subject="$3" body="$4"
+  if gc session kill "$id" >/dev/null 2>&1; then
+    log "killed $id ($reason) — cleared circuit breaker, supervisor will respawn"
+    gc mail send "$MAYOR" -s "$subject" -m "$body" >/dev/null 2>&1
+    return 0
+  fi
+  log "ERROR: kill $id failed ($reason)"
+  return 1
+}
+
+# Emit "id<TAB>name<TAB>last_active" for every ACTIVE control-dispatcher.
+# ROOT CAUSE of the watchdog no-op (2026-06-27): since 9fa6b7fec the live
+# dispatcher is the bound `core.control-dispatcher`, but the old anchored regex
+# `(^|/)control-dispatcher$` only matched bare or `<rig>/`-scoped names — the
+# `.` namespace separator was not an allowed prefix, so the watchdog skipped the
+# real session entirely and reported "no active control-dispatchers" while the
+# scanner (which uses a substring match) correctly saw it idle 6h. `[/.]` admits
+# the dotted namespaced form too.
+rows=$(gc session list --json 2>/dev/null | jq -r '
+  .sessions[]
+  | select(.state == "active")
+  | select((.name // "") | test("(^|[/.])control-dispatcher$"))
+  | "\(.id)\t\(.name)\t\(.last_active)"' 2>/dev/null)
+
+[[ -z "$rows" ]] && { log "skip: no active control-dispatchers"; exit 0; }
+
+acted=0
+while IFS=$'\t' read -r id name last_active; do
+  [[ -z "$id" ]] && continue
+  target=$(dispatcher_target "$name")
+  [[ -z "$target" ]] && { log "skip: cannot canonicalize dispatcher target for $id ($name)"; continue; }
+  if ! la=$(date -d "$last_active" +%s 2>/dev/null); then
+    log "skip idle signal: cannot parse last_active for $id ($last_active)"
+    la="$now"
+  fi
+  # last_active of 0001-01-01 (never active) parses to a huge-negative age; a
+  # genuinely never-active dispatcher in `active` state is itself wedged.
+  idle=$(( now - la ))
+  idle_h=$(( idle / 3600 ))
+
+  # Signal 1 — idle threshold (unchanged behavior).
+  if (( idle >= IDLE_THRESHOLD_SECS )); then
+    if [[ "$DRY_RUN" == "1" ]]; then
+      log "DRY_RUN: would kill $id (idle ${idle_h}h >= threshold)"
+      echo "would kill $id (idle ${idle_h}h, signal=idle-threshold)"
+      continue
+    fi
+    kill_dispatcher "$id" "idle ${idle_h}h" \
+      "dispatcher-watchdog: auto-reset $id (wedged ${idle_h}h)" \
+      "Control-dispatcher $id was active but idle ${idle_h}h (wedge signature). Killed to clear the named-session circuit breaker; supervisor respawns it fresh. No action needed — informational." \
+      && acted=$(( acted + 1 ))
+    continue
+  fi
+
+  # Signal 2 — conversion-stall (nudge-ROBUST). Independent of last_active AND of
+  # pane content (both kept fresh by the routed-bead-nudger loop): catches the
+  # dispatcher that looks busy being re-nudged but converts nothing — the SAME set
+  # of routed/open control beads unconverted >= CONVERSION_STALL_SECS. The AND-guard
+  # lives inside conversion_stalled (empty queue / changing set never trips).
+  if conversion_stalled "$target" "$id"; then
+    reason="control beads unconverted >= $(( CONVERSION_STALL_SECS / 60 ))m (conversion-stall)"
+    if [[ "$DRY_RUN" == "1" ]]; then
+      log "DRY_RUN: would kill $id ($reason)"
+      echo "would kill $id (signal=conversion-stall)"
+      continue
+    fi
+    kill_dispatcher "$id" "$reason" \
+      "dispatcher-watchdog: auto-reset $id (conversion-stall wedge)" \
+      "Control-dispatcher $id was active but the SAME set of routed control beads stayed UNCONVERTED >= $(( CONVERSION_STALL_SECS / 60 ))m (last_active + pane both kept fresh by the nudge loop — this is the nudge-robust conversion-stall signal that replaces the defeated pane-frozen conjunct). Killed to clear the named-session circuit breaker; supervisor respawns it fresh. No action needed — informational." \
+      && acted=$(( acted + 1 ))
+  fi
+done <<< "$rows"
+
+(( acted == 0 )) && [[ "$DRY_RUN" != "1" ]] && log "checked active dispatchers; none wedged (idle or conversion-stall)"
+exit 0

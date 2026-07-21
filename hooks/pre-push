@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# CodeScaleBench pre-push leak guard.
+#
+# Runs gitleaks over the pushed commit range using THIS repo's .gitleaks.toml,
+# whose allowlist suppresses the pinned commit-SHA / sg-evals mirror false
+# positives that the default ruleset flags. Activate with:
+#   git config core.hooksPath .githooks
+#
+# (The stray Gas City hook under .git/hooks/pre-push runs gitleaks WITHOUT
+# --config and false-positives on those SHAs; this replaces it.)
+set -euo pipefail
+
+command -v gitleaks >/dev/null || { echo "pre-push: gitleaks not installed" >&2; exit 1; }
+ROOT="$(git rev-parse --show-toplevel)"
+CONFIG="$ROOT/.gitleaks.toml"
+[ -f "$CONFIG" ] || { echo "pre-push: $CONFIG missing" >&2; exit 1; }
+
+ZERO="0000000000000000000000000000000000000000"
+while read -r local_ref local_oid remote_ref remote_oid; do
+  [ "$local_oid" = "$ZERO" ] && continue                 # branch/tag delete
+  if [ "$remote_oid" = "$ZERO" ]; then range="$local_oid"; else range="${remote_oid}..${local_oid}"; fi
+  if ! gitleaks git --log-opts="$range" --config "$CONFIG" --no-banner --redact; then
+    echo "" >&2
+    echo "pre-push: SECRET DETECTED under the repo config — push blocked." >&2
+    echo "If it is a verified false positive, extend .gitleaks.toml allowlist (do not blanket --no-verify)." >&2
+    exit 1
+  fi
+done

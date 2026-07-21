@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# mayor-watchdog: probe tmux + supervisor + mayor session, recover on failure.
+#
+# Runs cheaply via systemd timer (default every 60s). When a check fails,
+# attempts the recovery sequence from CLAUDE.md (start tmux, restart
+# supervisor). All events go to a JSONL log for later pattern mining.
+#
+# Usage:
+#   mayor-watchdog                  # probe + auto-recover (default systemd mode)
+#   mayor-watchdog --probe-only     # just probe + log, never recover
+#   mayor-watchdog --force-recover  # bypass cooldown
+#
+# Log: /home/ds/gas-city/.gc/mayor-watchdog.log (JSONL)
+
+set -uo pipefail
+
+CITY=/home/ds/gas-city
+SOCKET=ds-research
+LOG="$CITY/.gc/mayor-watchdog.log"
+COOLDOWN_FILE="$CITY/.gc/mayor-watchdog.last-action"
+COOLDOWN_SEC="${COOLDOWN_SEC:-300}"
+RECOVER=1
+FORCE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --probe-only)    RECOVER=0; shift ;;
+    --force-recover) FORCE=1; shift ;;
+    -h|--help) sed -n 's/^# \{0,1\}//p' "$0" | head -16; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$(dirname "$LOG")"
+
+log_event() {
+  local event=$1 detail=$2
+  printf '{"ts":"%s","event":"%s","detail":"%s"}\n' \
+    "$(date -Iseconds)" "$event" "$detail" >> "$LOG"
+}
+
+in_cooldown() {
+  [[ -f "$COOLDOWN_FILE" ]] || return 1
+  local last
+  last=$(cat "$COOLDOWN_FILE")
+  local age=$(( $(date +%s) - last ))
+  [[ $age -lt $COOLDOWN_SEC ]]
+}
+
+mark_action() {
+  date +%s > "$COOLDOWN_FILE"
+}
+
+tmux_alive()        { tmux -L "$SOCKET" list-sessions >/dev/null 2>&1; }
+supervisor_active() { systemctl --user is-active --quiet gascity-supervisor; }
+# A mode="always" mayor idle-sleeps between events; `asleep` is a healthy,
+# wake-on-event state, NOT a failure. Only states outside {active,asleep}
+# (missing, start-pending stuck, dead-pane crash loop) warrant recovery.
+# Treating `asleep` as a problem caused a destructive reset storm (the reset
+# clears the session key + wipes the conversation) that saturated the wake
+# budget and kept the pane dying every ~5m.
+mayor_session_ok()  { gc session list 2>/dev/null | awk '$2=="mayor" && ($3=="active" || $3=="asleep")' | grep -q .; }
+
+# Probe
+problems=()
+tmux_alive        || problems+=("tmux_dead")
+supervisor_active || problems+=("supervisor_inactive")
+mayor_session_ok  || problems+=("mayor_session_not_active")
+
+if [[ ${#problems[@]} -eq 0 ]]; then
+  exit 0
+fi
+
+if (( RECOVER == 0 )); then
+  log_event "probe_only_problems" "${problems[*]}"
+  exit 0
+fi
+
+if (( FORCE == 0 )) && in_cooldown; then
+  log_event "skip_cooldown" "${problems[*]}"
+  exit 0
+fi
+
+log_event "problems_detected" "${problems[*]}"
+mark_action
+
+# Recover
+took_action=0
+
+if ! tmux_alive; then
+  tmux -L "$SOCKET" new-session -d -s placeholder "sleep infinity" 2>/dev/null || true
+  log_event "recovery" "started_tmux_placeholder"
+  took_action=1
+fi
+
+# Restart supervisor if it's down OR if we just resurrected tmux (so it
+# picks up the live tmux server per CLAUDE.md).
+if ! supervisor_active || (( took_action == 1 )); then
+  systemctl --user restart gascity-supervisor 2>&1 | head -3 | while read -r ln; do
+    log_event "recovery" "restart_supervisor: $ln"
+  done
+  log_event "recovery" "restart_supervisor_issued"
+  sleep 30
+  took_action=1
+fi
+
+# If supervisor is healthy but mayor is dead, reset the mayor session
+# rather than restarting the whole supervisor. A dead mayor pane usually
+# means a stale session_key (the Claude Code conversation file is gone),
+# so claude --resume <id> exits 1 every boot. `gc session reset` clears
+# the key so the next wake starts a fresh conversation.
+if (( took_action == 0 )) && ! mayor_session_ok; then
+  gc session reset mayor 2>&1 | head -3 | while read -r ln; do
+    log_event "recovery" "reset_mayor: $ln"
+  done
+  log_event "recovery" "reset_mayor_issued"
+  sleep 15
+  took_action=1
+fi
+
+# Verify
+post=()
+tmux_alive        || post+=("tmux_dead")
+supervisor_active || post+=("supervisor_inactive")
+mayor_session_ok  || post+=("mayor_session_not_active")
+
+if [[ ${#post[@]} -eq 0 ]]; then
+  log_event "recovery_complete" "all_healthy"
+else
+  log_event "recovery_partial" "${post[*]}"
+fi
+
+exit 0

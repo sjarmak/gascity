@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# pr-state-poller — detect new review activity on our open PRs and
+# dispatch mol-pr-iterate / mol-pr-ci-diagnose / mol-pr-merge-only as
+# appropriate. Closes the gap Stephanie pointed at 2026-05-12: copilot
+# comments sat unaddressed for hours because no polling layer existed.
+#
+# What this polls (Phase 4 of dr-s0xu73 end-to-end PR loop):
+#   - Open PRs Stephanie authored on gastownhall/{gascity,gascity-packs,beads}
+#   - For each: diffs current state (CI rollup, copilot review IDs, codecov
+#     comments) against .gc/pr-state-cache/<repo>-<pr>.json
+#   - On NEW signal, slings mol-pr-iterate in one shot — `gc sling --stdin
+#     --on mol-pr-iterate` creates the molecule root bead in the city store
+#     AND routes it to the rig polecat pool atomically. (Earlier versions
+#     created the bead via `cd <rig> && bd create` then slung by id; that
+#     misfiled the bead in the rig store where city-store sling routing
+#     couldn't reach it, orphaning the dispatch. See dr-sbnpi0 / gc-0zx0b.)
+#
+# Iteration budget (circuit breaker):
+#   - Max 3 iterate dispatches per copilot review per PR
+#   - Tracked in cache: iterate_dispatched_for_review_id
+#   - On budget hit: halt + mail mayor; do NOT re-dispatch
+#
+# Idempotence:
+#   - Cache holds last-seen copilot review IDs per PR; new review = new
+#     review_id; same review re-displayed by GitHub doesn't re-trigger
+#   - Secondary in-store guard: before slinging, scan open convoys in the
+#     city store for a molecule root bead whose title already targets this
+#     exact review_id (covers the crash-before-cache-write window)
+#
+# Usage:
+#   pr-state-poller                    # detect + dispatch
+#   pr-state-poller --dry-run          # report-only
+#   pr-state-poller --pr <N>           # poll a single PR (debug)
+
+set -uo pipefail
+
+# Force the city's native (file-backed) beads store. An inherited
+# GC_BEADS=bd (e.g. from a mayor or polecat session that exports it)
+# would route `gc sling` bead creation into the bd-default store, where
+# city-store sling routing can't reach the bead — exactly the misfile this
+# poller exists to avoid. Unset it so every gc bead op below targets the
+# city store regardless of caller environment.
+unset GC_BEADS
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+CACHE_DIR="${CITY}/.gc/pr-state-cache"
+AUDIT_LOG="${CITY}/.gc/pr-state-poller.log"
+
+# Repos to poll — owned/co-maintained by Stephanie.
+REPOS=(
+  "gastownhall/gascity"
+  "gastownhall/gascity-packs"
+)
+# Note: gastownhall/beads omitted by default — separate upstream, no
+# local rig pool to dispatch iterate work into. Add manually if needed.
+
+DRY_RUN=0
+SINGLE_PR=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --pr)      SINGLE_PR="$2"; shift 2 ;;
+    -h|--help) sed -n 's/^# \{0,1\}//p' "$0" | head -25; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$CACHE_DIR"
+
+log_event() {
+  local event="$1"; shift
+  local extra="$1"
+  printf '{"ts":"%s","event":"%s",%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$extra" >> "$AUDIT_LOG"
+}
+
+# Map repo → rig label (for logging) and polecat pool target (sling target).
+# The pool path is the `gc sling` target; the rig label is informational.
+rig_for_repo() {
+  case "$1" in
+    gastownhall/gascity)        echo "gascity /home/ds/gascity/polecat" ;;
+    gastownhall/gascity-packs)  echo "gascity-packs /home/ds/gascity-packs/gascity-packs-polecat" ;;
+    *)                          return 1 ;;
+  esac
+}
+
+# Idempotency guard against the city store. Prints the bead id and returns
+# 0 when an OPEN molecule already targets this exact copilot review — the
+# molecule root bead title embeds repo + PR + review_id. Scans open convoys
+# only: a completed iterate has a closed convoy and won't match, which is
+# correct because the handled_review_ids cache already prevents re-dispatch
+# of a review whose iterate finished. This guard covers the narrow window
+# where a sling succeeded but the script died before the cache was written.
+existing_iterate_bead() {
+  local repo="$1" pr_num="$2" review_id="$3"
+  local marker="Iterate copilot review $review_id on $repo PR #$pr_num"
+  local child_ids cid title
+  child_ids=$(gc convoy list --city "$CITY" --json 2>/dev/null \
+    | jq -r '.convoys[]?.child_ids[]?' 2>/dev/null) || return 1
+  for cid in $child_ids; do
+    title=$(gc bd show "$cid" --city "$CITY" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | .title // empty' 2>/dev/null)
+    if [[ "$title" == *"$marker"* ]]; then
+      echo "$cid"
+      return 0
+    fi
+  done
+  return 1
+}
+
+dispatch_iterate() {
+  local repo="$1" pr_num="$2" review_id="$3" comment_count="$4"
+  local rig_info pool
+  rig_info=$(rig_for_repo "$repo") || { log_event "skip_no_rig_mapping" "\"repo\":\"$repo\""; return 1; }
+  pool=$(echo "$rig_info" | awk '{print $2}')
+
+  if (( DRY_RUN )); then
+    echo "[dry-run] would sling mol-pr-iterate for $repo#$pr_num (review=$review_id, comments=$comment_count) → $pool"
+    return 0
+  fi
+
+  # Secondary idempotency: skip if an open molecule already targets this
+  # exact review (covers a crash between a successful sling and the cache
+  # write). Treat as already-handled so handled_ids advances.
+  local existing
+  if existing=$(existing_iterate_bead "$repo" "$pr_num" "$review_id"); then
+    log_event "skip_existing_bead" "\"repo\":\"$repo\",\"pr\":$pr_num,\"review_id\":\"$review_id\",\"existing_bead\":\"$existing\""
+    return 0
+  fi
+
+  # `gc sling --stdin`: first line = bead title, remaining lines = body.
+  local payload
+  payload=$(cat <<EOF
+Iterate copilot review $review_id on $repo PR #$pr_num — $comment_count comments
+Auto-dispatched by bin/pr-state-poller: copilot review (id=$review_id) on $repo PR #$pr_num has $comment_count inline comments.
+
+vars: pr=$pr_num, feedback_source=copilot, feedback_ref=review:$review_id
+
+Polecat task: apply fixes per the copilot review, commit fixup, halt at branch-ready. Mayor pushes after close.
+
+If a comment is non-actionable note in report but don't apply. If iteration budget (3 per review) hit, halt + escalate to mayor.
+
+Source: bin/pr-state-poller; review_id=$review_id; comments=$comment_count.
+EOF
+)
+
+  # One-shot: create the molecule root bead in the city store, attach the
+  # mol-pr-iterate wisp, route to the pool, and nudge the warm pool —
+  # atomically in a single sling. No separate `bd create` + sling-by-id:
+  # that split created the bead in the rig store, out of reach of city-store
+  # sling routing, which is what orphaned the dispatch (gc-0zx0b/dr-sbnpi0).
+  # --nudge is explicit here (raw `gc sling` does not auto-nudge like the
+  # gc-sling wrapper); without it warm-idle workers leave the bead unclaimed
+  # (gascity#1129).
+  gc sling "$pool" --stdin \
+    --city "$CITY" \
+    --on mol-pr-iterate \
+    --var "pr=$pr_num" \
+    --var "feedback_source=copilot" \
+    --var "feedback_ref=review:$review_id" \
+    --nudge <<<"$payload" >/dev/null 2>&1
+  local rc=$?
+  if (( rc == 0 )); then
+    log_event "iterate_dispatched" "\"repo\":\"$repo\",\"pr\":$pr_num,\"review_id\":\"$review_id\",\"comments\":$comment_count"
+    return 0
+  fi
+  log_event "sling_failed" "\"repo\":\"$repo\",\"pr\":$pr_num,\"review_id\":\"$review_id\",\"exit\":$rc"
+  return 1
+}
+
+poll_pr() {
+  local repo="$1" pr_num="$2"
+  local cache_file="$CACHE_DIR/${repo//\//-}-${pr_num}.json"
+
+  # Fetch current state
+  local reviews
+  reviews=$(gh api "repos/${repo}/pulls/${pr_num}/reviews" \
+    --jq '[.[] | select(.user.login | test("copilot"; "i")) | {id: .id, state: .state, submitted_at: .submitted_at}]' \
+    2>/dev/null) || reviews="[]"
+
+  # Copilot inline comments, each tagged with the review it belongs to.
+  # /pulls/{pr}/comments returns EVERY copilot inline comment on the PR, so a
+  # PR-wide count cannot gate a per-review decision: a later summary-only review
+  # inherits an earlier review's comments and dispatches a spurious iterate
+  # (found 2026-07-16 — the old code counted PR-wide while this comment claimed
+  # per-review). Emit one parent review id per line: streaming jq keeps
+  # --paginate correct, where a per-page array would concatenate, not merge.
+  local copilot_review_ids
+  copilot_review_ids=$(gh api "repos/${repo}/pulls/${pr_num}/comments" --paginate \
+    --jq '.[] | select(.user.login | test("copilot"; "i")) | .pull_request_review_id' \
+    2>/dev/null) || copilot_review_ids=""
+
+  # PR-wide total: recorded in the cache for humans, never a dispatch gate.
+  local copilot_comment_count=0
+  [[ -n "$copilot_review_ids" ]] && copilot_comment_count=$(grep -c . <<<"$copilot_review_ids")
+
+  # Read previously-handled review IDs from cache
+  local handled_ids='[]'
+  if [[ -f "$cache_file" ]]; then
+    handled_ids=$(jq -c '.handled_review_ids // []' < "$cache_file")
+  fi
+
+  # For each copilot review not in handled_ids AND with comments > 0: dispatch
+  # Use process substitution (not pipe-into-while) so handled_ids updates
+  # propagate out of the loop — bash subshell scoping gotcha.
+  local new_dispatched=0
+  while read -r review; do
+    [[ -z "$review" ]] && continue
+    local rid
+    rid=$(echo "$review" | jq -r '.id | tostring')
+    if echo "$handled_ids" | jq -e --arg id "$rid" '. | index($id | tonumber)' >/dev/null 2>&1; then
+      continue   # already handled
+    fi
+
+    # Inline comments belonging to THIS review — the actionable-feedback gate.
+    local rid_comment_count=0
+    [[ -n "$copilot_review_ids" ]] && rid_comment_count=$(grep -cxF -- "$rid" <<<"$copilot_review_ids")
+
+    # Skip if no inline comments — pure top-level review (summary), no actionable feedback
+    if (( rid_comment_count == 0 )); then
+      log_event "skip_no_inline_comments" "\"repo\":\"$repo\",\"pr\":$pr_num,\"review_id\":\"$rid\""
+      # Still mark handled so we don't keep checking
+      handled_ids=$(echo "$handled_ids" | jq --arg id "$rid" '. + [($id | tonumber)] | unique')
+      continue
+    fi
+
+    if dispatch_iterate "$repo" "$pr_num" "$rid" "$rid_comment_count"; then
+      handled_ids=$(echo "$handled_ids" | jq --arg id "$rid" '. + [($id | tonumber)] | unique')
+      new_dispatched=$((new_dispatched + 1))
+    fi
+  done < <(echo "$reviews" | jq -c '.[]')
+
+  # Write back cache (regardless of new dispatch — keeps last-seen timestamp current)
+  if ! (( DRY_RUN )); then
+    jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --argjson reviews "$reviews" \
+      --argjson handled "$handled_ids" \
+      --argjson comments "$copilot_comment_count" \
+      '{last_polled: $ts, reviews: $reviews, handled_review_ids: $handled, copilot_comment_count: $comments}' \
+      > "$cache_file"
+  fi
+}
+
+# Main loop
+total_polled=0
+for repo in "${REPOS[@]}"; do
+  # Get open PRs we authored
+  prs=$(gh pr list --repo "$repo" --author '@me' --state open --json number --jq '.[].number' 2>/dev/null || echo "")
+  for pr_num in $prs; do
+    if [[ -n "$SINGLE_PR" && "$pr_num" != "$SINGLE_PR" ]]; then continue; fi
+    poll_pr "$repo" "$pr_num"
+    total_polled=$((total_polled + 1))
+  done
+done
+
+log_event "tick" "\"scanned\":$total_polled"
+exit 0

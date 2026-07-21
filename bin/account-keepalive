@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Recover expired Claude OAuth tokens and alert only on recovery failure.
+
+Claude does not necessarily rotate a still-valid access token during a
+headless launch. Treating an unchanged pre-expiry token as a failed refresh
+therefore creates false alarms. This order leaves valid tokens alone, checks
+frequently enough to catch expiry promptly, and then verifies that a headless
+launch recovered the token before asking a human to run ``/ds-cred``.
+
+Failed-recovery alerts are deduplicated by account and expiry epoch. A later
+token expiry is a new incident and can alert again.
+"""
+import json
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOMES = Path.home() / ".claude-homes"
+CLAUDE_ACCOUNT = Path.home() / "gas-city" / "bin" / "claude-account"
+STATE_PATH = Path.home() / ".gc" / "account-keepalive-state.json"
+
+
+def expiry_epoch(account_dir: Path) -> float | None:
+    """OAuth token expiry as a unix epoch (seconds), or None if unreadable."""
+    creds = account_dir / ".claude" / ".credentials.json"
+    if not creds.exists():
+        return None
+    try:
+        oauth = json.loads(creds.read_text()).get("claudeAiOauth", {})
+        exp = oauth.get("expiresAt")
+        return exp / 1000 if exp else None
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def load_state() -> dict[str, int]:
+    if not STATE_PATH.exists():
+        return {}
+    try:
+        data = json.loads(STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {
+        account: expiry
+        for account, expiry in data.items()
+        if isinstance(account, str) and isinstance(expiry, int)
+    }
+
+
+def save_state(state: dict[str, int]) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = STATE_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    temporary.replace(STATE_PATH)
+
+
+def mail_mayor(subject: str, body: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["gc", "mail", "send", "--to", "mayor",
+             "-s", subject, "-m", body, "--notify"],
+            check=False, capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def main() -> None:
+    now = datetime.now(timezone.utc).timestamp()
+    state = load_state()
+    acted: list[str] = []
+    valid_count = 0
+
+    for account_dir in sorted(HOMES.glob("account*")):
+        num = account_dir.name[len("account"):]
+        if not num.isdigit():
+            continue
+        exp = expiry_epoch(account_dir)
+        if exp is None:
+            continue
+        hte = (exp - now) / 3600
+
+        if hte > 0:
+            valid_count += 1
+            continue
+
+        # An expired access token can still be recovered from its refresh
+        # token. Verified on account3 and account5 on 2026-07-15.
+        before = exp
+        try:
+            subprocess.run(
+                [str(CLAUDE_ACCOUNT), num, "-p", "ok"],
+                check=False, capture_output=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            acted.append(f"account{num}: expired-recover launch error {exc}")
+
+        after = expiry_epoch(account_dir)
+        if after and after > now + 60:
+            acted.append(
+                f"account{num}: EXPIRED {-hte:.1f}h -> recovered "
+                f"({(after - now) / 3600:.1f}h left)")
+            continue
+
+        account = f"account{num}"
+        expiry_ms = int(before * 1000)
+        if state.get(account) == expiry_ms:
+            acted.append(
+                f"{account}: EXPIRED {-hte:.1f}h -> alert already sent")
+            continue
+
+        sent = mail_mayor(
+            f"{account} token EXPIRED — refresh failed, needs /ds-cred",
+            f"{account}'s OAuth token expired {-hte:.1f}h ago and a headless "
+            f"`claude-account {num} -p` launch did NOT recover it. Run "
+            f"`/ds-cred {account}` from the Mac to push fresh credentials.")
+        if sent:
+            state = {**state, account: expiry_ms}
+            save_state(state)
+            acted.append(f"{account}: EXPIRED {-hte:.1f}h -> mailed mayor")
+        else:
+            acted.append(
+                f"{account}: EXPIRED {-hte:.1f}h -> mayor mail failed")
+
+    if acted:
+        print("account-keepalive: " + "; ".join(acted))
+    else:
+        print(f"account-keepalive: {valid_count} account token(s) valid; "
+              "no recovery needed")
+
+
+if __name__ == "__main__":
+    main()

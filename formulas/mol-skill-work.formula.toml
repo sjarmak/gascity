@@ -1,0 +1,63 @@
+description = """
+Skill invocation formula — execute a Claude Code skill on a bead.
+
+Instead of "read bead, do what it says" (mol-do-work), this formula tells
+the agent to invoke a specific skill (e.g. /focus, /bisect, /scaffold)
+with the routed bead as the argument.
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| issue    | caller | The work bead ID to pass to the skill |
+| skill    | caller | The skill to invoke (e.g. "focus", "bisect", "scaffold") |
+"""
+formula = "mol-skill-work"
+phase = "vapor"
+version = 1
+
+[vars]
+[vars.issue]
+description = "The work bead ID to pass to the skill"
+required = true
+
+[vars.skill]
+description = "The skill to invoke (without leading slash)"
+required = true
+
+[[steps]]
+id = "run-skill"
+title = "Invoke skill on bead"
+description = """
+You have been assigned a bead and a skill to execute on it.
+
+**Invoke the skill:**
+
+Run the /{{skill}} command with bead ID {{issue}}:
+
+/{{skill}} {{issue}}
+
+Follow the skill's instructions completely. The skill manages its own
+lifecycle (planning, execution, review, close). Do not override the
+skill's workflow.
+
+If the skill asks you to close the bead, close it. If it doesn't,
+close it yourself when the skill completes:
+
+```bash
+bd close {{issue}} --reason "Completed via /{{skill}}"
+```
+"""
+
+[[steps]]
+id = "drain"
+title = "Signal completion"
+needs = ["run-skill"]
+description = """
+Work is done. Signal the controller to reclaim this session:
+
+```bash
+gc runtime drain-ack
+```
+
+Run this command and nothing else."""

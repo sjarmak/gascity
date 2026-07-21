@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# mail-redirect-to-mayor — when an agent sends mail to a dead-letter
+# recipient (human, stephanie, sjarmak), repost a notification copy to
+# mayor so it actually gets surfaced.
+#
+# Why this exists (dr-o3he9r): Stephanie doesn't read gc mail — she gets
+# alerted only via slack. Polecats / PLs / workers that mail "human" or
+# "stephanie" assume they're reaching her, but the mail is dead-letter.
+# Mayor scans her inbox on wakeup but those mails sit there unsurfaced.
+#
+# This handler bridges the gap: any mail to a dead-letter recipient also
+# gets reposted to mayor with a header annotating the original sender,
+# original recipient, and the original mail ID for audit. Mayor then
+# surfaces to the relevant slack channel / rig PL on next interaction.
+#
+# Trigger: gc order on mail.sent event. Idempotent via state file
+# tracking already-redirected mail IDs.
+
+set -euo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+STATE_FILE="${CITY}/.gc/mail-redirect-to-mayor-state.json"
+SINCE="${MAIL_REDIRECT_SINCE:-5m}"
+
+# Dead-letter recipients — mail to these goes nowhere humans actually
+# read. Add new aliases here as they surface. Keep it explicit; broader
+# heuristics (e.g. "any non-agent") would over-trigger.
+DEAD_LETTER_RECIPIENTS=("human" "stephanie" "sjarmak")
+
+mkdir -p "$(dirname "$STATE_FILE")"
+[[ -f "$STATE_FILE" ]] || echo '{}' > "$STATE_FILE"
+
+is_dead_letter() {
+    local recipient="$1"
+    for dlr in "${DEAD_LETTER_RECIPIENTS[@]}"; do
+        [[ "$recipient" == "$dlr" ]] && return 0
+    done
+    return 1
+}
+
+# Collect recent mail.sent events. Each event payload carries the full
+# message, so we don't need a follow-up gc mail peek.
+state=$(cat "$STATE_FILE")
+redirected=0
+
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+
+    # Parse one event. Skip on malformed JSON.
+    msg_id=$(echo "$line" | jq -r '.payload.message.id // empty' 2>/dev/null)
+    msg_to=$(echo "$line" | jq -r '.payload.message.to // empty' 2>/dev/null)
+    msg_from=$(echo "$line" | jq -r '.payload.message.from // empty' 2>/dev/null)
+    msg_subject=$(echo "$line" | jq -r '.payload.message.subject // empty' 2>/dev/null)
+    msg_body=$(echo "$line" | jq -r '.payload.message.body // empty' 2>/dev/null)
+    msg_created=$(echo "$line" | jq -r '.payload.message.created_at // empty' 2>/dev/null)
+
+    [[ -z "$msg_id" || -z "$msg_to" ]] && continue
+
+    # Skip if recipient isn't dead-letter.
+    is_dead_letter "$msg_to" || continue
+
+    # Skip if already redirected (idempotent).
+    already=$(echo "$state" | jq -r --arg k "$msg_id" '.[$k] // empty')
+    [[ -n "$already" ]] && continue
+
+    # Skip mail FROM mayor (no point — mayor wrote it; redirecting back
+    # to mayor would just notify on its own outbound).
+    if [[ "$msg_from" == "mayor" ]]; then
+        state=$(echo "$state" | jq --arg k "$msg_id" --arg ts "$(date -Is)" '.[$k] = ("skip-from-mayor:" + $ts)')
+        continue
+    fi
+
+    # Compose redirect copy.
+    redirect_subject="[redirect] (to ${msg_to}) ${msg_subject}"
+    redirect_body=$(cat <<HEADER
+[mail-redirect-to-mayor: original mail addressed to "${msg_to}" — surfacing for action since that recipient doesn't read gc mail]
+
+ORIGINAL SENDER:    ${msg_from}
+ORIGINAL RECIPIENT: ${msg_to}
+ORIGINAL MAIL ID:   ${msg_id}
+ORIGINAL CREATED:   ${msg_created}
+
+--- ORIGINAL BODY ---
+${msg_body}
+HEADER
+)
+
+    # Send the redirect. We can't pass --from for a synthetic identity
+    # (gc mail send validates sender against known sessions); instead the
+    # disambiguation lives in the [redirect] subject prefix and the
+    # ORIGINAL SENDER / RECIPIENT / MAIL ID header in the body. The
+    # default-sender fallback ("human") is fine — handler skips mail
+    # from "mayor" to avoid loops, and incoming TO mayor isn't a
+    # dead-letter so won't re-trigger.
+    if gc mail send mayor \
+        --subject "$redirect_subject" \
+        --message "$redirect_body" \
+        2>/dev/null; then
+        state=$(echo "$state" | jq --arg k "$msg_id" --arg ts "$(date -Is)" '.[$k] = $ts')
+        redirected=$((redirected + 1))
+        echo "redirected: $msg_id (from=$msg_from to=$msg_to subject='$msg_subject')" >&2
+    else
+        echo "warn: gc mail send mayor failed for $msg_id" >&2
+    fi
+done < <(gc events --type mail.sent --since "$SINCE" 2>/dev/null)
+
+echo "$state" > "$STATE_FILE"
+[[ "$redirected" -gt 0 ]] && echo "mail-redirect-to-mayor: redirected $redirected message(s)" >&2
+exit 0

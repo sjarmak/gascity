@@ -1,0 +1,8 @@
+dir = "/home/ds/projects/migration-evals"
+provider = "claude-4"
+min_active_sessions = 1
+wake_mode = "fresh"
+idle_timeout = "6h"
+
+[env]
+CLAUDE_BINARY = "claude-auto"

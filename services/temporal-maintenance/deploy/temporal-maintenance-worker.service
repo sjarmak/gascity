@@ -1,0 +1,42 @@
+[Unit]
+Description=temporal-maintenance — shadow worker (binds DryRunAdapter: records mutations, executes nothing)
+Documentation=file://%h/gas-city/docs/design/temporal-maintenance-promotion-plan.md
+After=temporal-server.service
+Wants=temporal-server.service
+# Depends on the server unit but is NOT a supervisor drop-in.
+
+[Service]
+Type=simple
+WorkingDirectory=%h/gas-city/services/temporal-maintenance
+Environment=PATH=%h/.local/bin:%h/go/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TEMPORAL_ADDRESS=127.0.0.1:7233
+Environment=TEMPORAL_NAMESPACE=maintenance
+ExecStartPre=/bin/sh -c 'test -x %h/gas-city/services/temporal-maintenance/bin/maintenance-worker || { echo "maintenance-worker binary missing — run make build in services/temporal-maintenance" >&2; exit 1; }'
+# No namespace-readiness probe: the worker dials on start and exits if the server
+# is not up yet; Restart=always then retries. After=/Wants=temporal-server orders
+# the first start after the server, and RestartSec bounds the retry during the
+# server's first-boot sqlite init.
+ExecStart=%h/gas-city/services/temporal-maintenance/bin/maintenance-worker
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+MemoryHigh=256M
+MemoryMax=384M
+
+NoNewPrivileges=true
+ProtectSystem=strict
+# Read-only home is enough for the shadow worker (DryRunAdapter writes nothing to
+# disk); the P5 armed worker will add ReadWritePaths for its persisted KeyStore.
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# claude-zombie-report: find stale non-gc Claude Code processes.
+#
+# Scans for `claude` / `claude/versions/*` processes that have been running
+# longer than MIN_AGE_SECONDS (default 3 days) and that are NOT gc-managed.
+#
+# A process is gc-managed (excluded) if EITHER:
+#   1) GC_SESSION_ID is set in its env, OR
+#   2) it (or any ancestor) is a live tmux pane on the ds-research socket.
+# Regression (2026-06-28, mayor gc-429945): the env-only check (1) false-flagged
+# 6 LIVE gc workers (enterprisebench-worker-gc-404898, mem-worker-gc-*, city-
+# infra-pl) whose flagged PID didn't carry GC_SESSION_ID in its readable environ.
+# The tmux cross-reference (2) associates those PIDs with their gc pane so only
+# truly unmatched, aged, interactive procs are reported.
+#
+# Usage:
+#   claude-zombie-report                # print report to stdout only
+#   claude-zombie-report --nudge-mayor  # also send to mayor when non-empty
+#   claude-zombie-report --min-age 432000  # 5 days, in seconds
+# Env: ZOMBIE_TMUX_SOCKET (default ds-research)
+
+set -euo pipefail
+
+MIN_AGE_SECONDS="${MIN_AGE_SECONDS:-259200}"  # 3 days
+TMUX_SOCKET="${ZOMBIE_TMUX_SOCKET:-ds-research}"
+NUDGE_MAYOR=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --min-age) MIN_AGE_SECONDS="$2"; shift 2 ;;
+    --nudge-mayor) NUDGE_MAYOR=1; shift ;;
+    -h|--help)
+      sed -n 's/^# \{0,1\}//p' "$0" | head -12
+      exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+fmt_age() {
+  local s=$1
+  if   (( s >= 86400 )); then printf '%dd%dh' $((s/86400)) $(((s%86400)/3600))
+  elif (( s >= 3600  )); then printf '%dh%dm' $((s/3600))  $(((s%3600)/60))
+  else                        printf '%dm'    $((s/60))
+  fi
+}
+
+fmt_rss() {
+  local kb=$1
+  if   (( kb >= 1048576 )); then awk -v k="$kb" 'BEGIN{printf "%.1fG", k/1048576}'
+  elif (( kb >= 1024    )); then awk -v k="$kb" 'BEGIN{printf "%dM",  k/1024}'
+  else                           printf '%dK' "$kb"
+  fi
+}
+
+is_gc_managed() {
+  tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | grep -q '^GC_SESSION_ID='
+}
+
+# Live gc tmux pane PIDs on the ds-research socket (empty if tmux is down -> the
+# cross-reference is simply skipped, falling back to the env check).
+declare -A GC_PANE_PID_SET=()
+while read -r _pp; do
+  [[ "$_pp" =~ ^[0-9]+$ ]] && GC_PANE_PID_SET["$_pp"]=1
+done < <(tmux -L "$TMUX_SOCKET" list-panes -a -F '#{pane_pid}' 2>/dev/null || true)
+
+# is_in_gc_tmux <pid>: true iff the pid or any ancestor is a live gc pane pid.
+# Walks the parent chain (ps -o ppid handles /proc/stat's parenthesised comm),
+# bounded so a cycle/odd tree can't loop forever.
+is_in_gc_tmux() {
+  local p=$1 depth=0
+  while [[ -n "$p" && "$p" -gt 1 && $depth -lt 40 ]]; do
+    [[ -n "${GC_PANE_PID_SET[$p]:-}" ]] && return 0
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    depth=$((depth + 1))
+  done
+  return 1
+}
+
+describe_proc() {
+  local pid=$1 cmd agent cwd
+  cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+  agent=$(grep -oE -- '--agent-name [^ ]+' <<<"$cmd" | awk '{print $2}' | head -1 || true)
+  cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
+  if [[ -z "$agent" ]]; then
+    if [[ "$cmd" == *" --resume"* ]]; then agent="(resumed)"; else agent="(interactive)"; fi
+  fi
+  printf '%s | %s' "$agent" "${cwd:-?}"
+}
+
+rows=()
+total_rss=0
+
+while read -r pid; do
+  [[ -d /proc/$pid ]] || continue
+  # etimes, rss: space-padded single-line output
+  read -r etimes rss < <(ps -o etimes=,rss= -p "$pid" 2>/dev/null || true)
+  [[ -n "${etimes:-}" ]] || continue
+  (( etimes >= MIN_AGE_SECONDS )) || continue
+  { is_gc_managed "$pid" || is_in_gc_tmux "$pid"; } && continue
+  rows+=("$etimes|$rss|$pid")
+  total_rss=$((total_rss + rss))
+done < <(ps -eo pid=,comm= |
+         awk '$2 == "claude" || $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ {print $1}')
+
+count=${#rows[@]}
+header="Stale Claude Code processes (age >= $(fmt_age "$MIN_AGE_SECONDS"), non-gc): $count"
+
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
+
+{
+  echo "$header"
+  if (( count > 0 )); then
+    printf '%-8s %-8s %-8s %s\n' AGE RSS PID "AGENT | CWD"
+    while IFS= read -r row; do
+      IFS='|' read -r etimes rss pid <<<"$row"
+      printf '%-8s %-8s %-8s %s\n' \
+        "$(fmt_age "$etimes")" "$(fmt_rss "$rss")" "$pid" "$(describe_proc "$pid")"
+    done < <(printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1 -n -r)
+    echo "TOTAL RSS: $(fmt_rss "$total_rss")"
+  fi
+} > "$out"
+
+cat "$out"
+
+if (( NUDGE_MAYOR )) && (( count > 0 )); then
+  msg="claude-zombie-report
+$(cat "$out")
+
+Please surface this to stephanie next interaction with a short read (ok/attention/act). Do not kill unilaterally."
+  gc session nudge mayor "$msg" || echo "warn: gc session nudge mayor failed (mayor may be asleep); report still in journal" >&2
+fi

@@ -1,0 +1,14 @@
+# velocity-audit-sensor — Stephanie 2026-07-10: pace the continuous-improvement
+# audits (arch-review-loop + bead-goal-audit skills) by CHANGE VELOCITY, not
+# wall clock. The sensor counts commits / bead churn per rig since the last
+# dispatch and mails the mayor one consolidated, change-dedup'd nudge when
+# thresholds cross (arch: 25 commits or 45d backstop; beads: 40 created or 14d
+# backstop — env-tunable). Mayor verifies not-in-flight and slings the skill
+# run (--no-formula). ZFC: sensor is deterministic counting; routing judgment
+# stays with the mayor. Surface-only — never touches work beads itself.
+[order]
+description = "Hourly: per-rig commit/bead-churn velocity sensor; mails mayor consolidated arch-review-loop / bead-goal-audit dispatch nudges when thresholds cross (change-dedup'd, staleness backstops)."
+trigger = "cooldown"
+interval = "1h"
+exec = "/home/ds/gas-city/bin/velocity-audit-sensor"
+timeout = "3m"

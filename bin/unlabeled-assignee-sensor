@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""unlabeled-assignee-sensor — detect city beads that are ASSIGNED to a
+label-pulling consumer but LACK that consumer's pulling label (dr-2d9c).
+
+THE HOLE (measured 2026-07-15): 9 of 11 beads assigned to city-infra-pl had no
+labels, making them invisible to that PL's ONLY work-discovery query
+(agents/city-infra-pl/prompt.md -> `bd list --label city-infra`). Both of its
+P0s were among the invisible; one had sat unreachable since 2026-07-14.
+
+WHY BEAD-STATE HEALTH CANNOT SEE THIS: `assigned + unlabeled` is the worst
+reachable state in the store. It LOOKS owned — the assignee is set, so every
+rollup and every human read counts it as handled — while being unreachable by
+the consumer, and NOTHING raises an error. It ages forever, silently. It even
+produced a false fleet-wide diagnosis ("city-infra-pl is capacity-bound, 11
+beads queue behind max_active_sessions=1") when capacity was never the
+constraint: 9 of 11 were simply invisible to the query that feeds it.
+
+WHAT THIS DOES: for each label-pulling consumer, list its open/in_progress
+beads and flag any that lack the pulling label. Mail mayor + the PL,
+cooldown-deduped per bead, with the one-line fix. Deterministic, additive, no
+behaviour change. Mirrors the sensor pattern (dispatcher-liveness-sensor) and
+reuses the label-puller model from bin/bd-why (LABEL_PULLERS).
+
+Usage: unlabeled-assignee-sensor [--nudge-mayor] [--json]
+Exit: 0 always (a sensor must never break the order loop).
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+CITY = "/home/ds/gas-city"
+STATE = os.path.join(CITY, ".gc", "observability", "unlabeled-assignee-sensor-state.json")
+COOLDOWN_MIN = 360  # a slow-moving condition; re-alert a standing miss at most every 6h
+
+# Consumers that pull work by LABEL, keyed by the assignee that owns that queue.
+# Mirrors bin/bd-why LABEL_PULLERS. The city dolt store (dr-*) is pulled by
+# exactly one label-puller today; add rows here if another PL adopts the
+# label-pull model. Override for tests via GC_UNLABELED_PULLERS="assignee=label,...".
+PULLERS = {"city-infra-pl": "city-infra"}
+
+
+def _pullers():
+    env = os.environ.get("GC_UNLABELED_PULLERS", "").strip()
+    if not env:
+        return dict(PULLERS)
+    out = {}
+    for pair in env.split(","):
+        pair = pair.strip()
+        if "=" in pair:
+            a, l = pair.split("=", 1)
+            out[a.strip()] = l.strip()
+    return out or dict(PULLERS)
+
+
+def _bd_list(assignee):
+    """Open + in_progress beads for one assignee, from the city (dolt) store."""
+    try:
+        p = subprocess.run(
+            ["bd", "list", "--assignee", assignee, "--status", "open,in_progress",
+             "--json", "--limit", "0"],
+            cwd=CITY, capture_output=True, text=True, timeout=90)
+        if p.returncode != 0:
+            return None
+        d = json.loads(p.stdout or "[]")
+        return d if isinstance(d, list) else []
+    except Exception:
+        return None
+
+
+def evaluate():
+    pullers = _pullers()
+    misses = []          # (assignee, label, bead_id, priority, title)
+    errors = []
+    for assignee, label in pullers.items():
+        beads = _bd_list(assignee)
+        if beads is None:
+            errors.append(f"bd list --assignee {assignee} failed/unreadable")
+            continue
+        for b in beads:
+            labels = b.get("labels") or []
+            if label not in labels:
+                misses.append((assignee, label, b.get("id"),
+                               b.get("priority"), (b.get("title") or "")[:70]))
+    return {"ok": not errors, "errors": errors, "misses": misses,
+            "pullers": pullers}
+
+
+def _mail(misses):
+    lines = []
+    for assignee, label, bid, prio, title in misses:
+        lines.append(f"- {bid} (P{prio}) assigned to {assignee} but missing label "
+                     f"\"{label}\" — invisible to `bd list --label {label}`.\n"
+                     f"    fix: bd update {bid} --add-label {label}")
+    body = ("unlabeled-assignee-sensor (dr-2d9c):\n"
+            f"{len(misses)} bead(s) are ASSIGNED to a label-pulling consumer but LACK its "
+            "pulling label — they look owned in every rollup while being invisible to their "
+            "only consumer, and nothing else raises an error.\n\n"
+            + "\n".join(lines))
+    subject = f"unlabeled-assignee: {len(misses)} bead(s) assigned-but-unreachable"
+    for target in ("mayor", "city-infra-pl"):
+        try:
+            subprocess.run(["gc", "mail", "send", target, "-s", subject, "-m", body],
+                           cwd=CITY, timeout=120)
+        except Exception:
+            pass
+
+
+def main():
+    argv = sys.argv[1:]
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    r = evaluate()
+    try:
+        st = json.load(open(STATE))
+    except (OSError, ValueError):
+        st = {}
+    now = time.time()
+
+    # cooldown-dedup per (assignee, bead)
+    fresh = []
+    for m in r["misses"]:
+        key = f"{m[0]}:{m[2]}"
+        if now - st.get(key, 0) > COOLDOWN_MIN * 60:
+            fresh.append(m)
+
+    if fresh and "--nudge-mayor" in argv:
+        _mail(fresh)
+        for m in fresh:
+            st[f"{m[0]}:{m[2]}"] = now
+        try:
+            json.dump(st, open(STATE, "w"))
+        except OSError:
+            pass
+
+    if "--json" in argv:
+        print(json.dumps({
+            "ok": r["ok"], "errors": r["errors"],
+            "misses": [{"assignee": a, "label": l, "id": i, "priority": p, "title": t}
+                       for a, l, i, p, t in r["misses"]],
+            "alerted": [m[2] for m in fresh],
+        }, indent=2))
+    else:
+        print(f"pullers={list(r['pullers'])} misses={len(r['misses'])} "
+              f"alerted={len(fresh)} errors={len(r['errors'])}")
+        for a, l, i, p, t in r["misses"]:
+            print(f"  MISS {i} (P{p}) assignee={a} missing label \"{l}\": {t}")
+        for e in r["errors"]:
+            print(f"  ERR {e}")
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

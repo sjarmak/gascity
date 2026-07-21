@@ -1,0 +1,13 @@
+# Adopted from gastownhall/gascity examples/gastown/packs/maintenance/orders/gate-sweep.toml (2026-05-25).
+# Gate evaluation is mechanical (timer comparison + GitHub API status decoding).
+# Complements ds-research's close-gate-reaper (which reopens corrupt closures
+# missing evidence) by handling forward gate-close evaluation.
+[order]
+description = "Evaluate and close pending gates (timer, GitHub)"
+trigger = "cooldown"
+interval = "30s"
+exec = "/home/ds/gas-city/scripts/gastown-maintenance/gate-sweep.sh"
+# Fail OPEN on open-work-gate timeout (gastownhall/gascity#2893): `bd gate check
+# --escalate` only acts on gates that are currently ready, so a repeat pass is a
+# no-op re-evaluation — safe to fire even when the gate is starved.
+idempotent = true

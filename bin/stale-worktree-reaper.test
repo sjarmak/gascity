@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Standalone test for stale-worktree-reaper's worktree_emptiness decision.
+#
+# Asserts:
+#   1. A git worktree with uncommitted changes is NOT reapable      (-> dirty)
+#   2. An empty git worktree IS reapable                            (-> clean)
+#   3. jj fail-closed: an errored/ambiguous jj probe is NOT reapable (-> unknown)
+#
+# jj is NOT installed on this machine, so case 3 stubs `jj` + `command` on PATH
+# to force the jj-aware branch and make the probe error, proving the decision
+# function classifies an errored probe as "unknown" (caller fails closed).
+#
+# Run:  bash /home/ds/gas-city/bin/stale-worktree-reaper.test
+
+set -uo pipefail
+
+REAPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/stale-worktree-reaper"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# Source the reaper in library mode so only its functions load (no scan).
+export STALE_WORKTREE_REAPER_LIB=1
+# shellcheck source=/dev/null
+source "$REAPER"
+
+fail=0
+check() {
+  local name=$1 expected=$2 actual=$3
+  if [[ "$actual" == "$expected" ]]; then
+    echo "PASS: $name (got '$actual')"
+  else
+    echo "FAIL: $name (expected '$expected', got '$actual')"
+    fail=1
+  fi
+}
+
+# --- Case 1: git worktree with uncommitted changes -> dirty (NOT reapable) ---
+GIT_DIRTY="$WORK/git-dirty"
+git init -q "$GIT_DIRTY"
+git -C "$GIT_DIRTY" config user.email t@t && git -C "$GIT_DIRTY" config user.name t
+echo seed > "$GIT_DIRTY/seed.txt"
+git -C "$GIT_DIRTY" add -A && git -C "$GIT_DIRTY" commit -qm seed
+echo "live edit" > "$GIT_DIRTY/work.txt"   # uncommitted change
+check "git dirty -> not reapable" "dirty" "$(worktree_emptiness "$GIT_DIRTY")"
+
+# --- Case 2: empty (clean) git worktree -> clean (reapable) ---
+GIT_CLEAN="$WORK/git-clean"
+git init -q "$GIT_CLEAN"
+git -C "$GIT_CLEAN" config user.email t@t && git -C "$GIT_CLEAN" config user.name t
+echo seed > "$GIT_CLEAN/seed.txt"
+git -C "$GIT_CLEAN" add -A && git -C "$GIT_CLEAN" commit -qm seed
+check "git clean -> reapable" "clean" "$(worktree_emptiness "$GIT_CLEAN")"
+
+# --- Case 3: jj branch fails closed when the probe errors -> unknown ----------
+# Create a worktree that looks like a jj repo, and stub jj+command so the
+# jj-aware branch is taken and every jj invocation errors (non-zero, no output).
+JJ_WT="$WORK/jj-wt"
+mkdir -p "$JJ_WT/.jj"
+
+STUB="$WORK/stubbin"
+mkdir -p "$STUB"
+cat > "$STUB/jj" <<'EOF'
+#!/usr/bin/env bash
+# Simulate `jj log` failing mid auto-import: non-zero, no usable output.
+echo "Error: concurrent operation, retry" >&2
+exit 1
+EOF
+chmod +x "$STUB/jj"
+
+UNKNOWN=$(
+  PATH="$STUB:$PATH"
+  # Override `command` so `command -v jj` succeeds (jj "present") for the probe.
+  command() {
+    if [[ "$1" == "-v" && "$2" == "jj" ]]; then echo "$STUB/jj"; return 0; fi
+    builtin command "$@"
+  }
+  worktree_emptiness "$JJ_WT"
+)
+check "jj errored probe -> unknown (fail closed)" "unknown" "$UNKNOWN"
+
+# --- Case 4: rig discovery uses JSON and includes suspended rigs --------------
+STUB_GC="$STUB/gc"
+cat > "$STUB_GC" <<EOF
+#!/usr/bin/env bash
+cat <<'JSON'
+{"rigs":[{"name":"hq","path":"/city","hq":true},{"name":"cold-rig","path":"$WORK/cold","hq":false,"suspended":true}]}
+JSON
+EOF
+chmod +x "$STUB_GC"
+RIG_PATHS=()
+PATH="$STUB:$PATH" load_rig_paths
+check "JSON discovery includes suspended rig" "$WORK/cold" "${RIG_PATHS[cold-rig]:-}"
+check "JSON discovery excludes HQ" "" "${RIG_PATHS[hq]:-}"
+
+# active_workdir_state must cache in the current shell. A command substitution
+# here would silently lose associative-array updates and re-query once/tree.
+calls=0
+load_active_workdirs() {
+  calls=$((calls + 1))
+  ACTIVE_WORKDIRS[demo]="/tmp/owned"$'\n'
+  ACTIVE_WORKDIRS_OK[demo]=1
+}
+unset 'ACTIVE_WORKDIRS_OK[demo]'
+active_workdir_state demo /tmp/repo /tmp/owned
+check "active workdir recognized" "active" "$ACTIVE_REF_STATE"
+active_workdir_state demo /tmp/repo /tmp/other
+check "active workdir query cached" "1" "$calls"
+check "unreferenced workdir clear" "clear" "$ACTIVE_REF_STATE"
+
+echo
+if (( fail )); then
+  echo "RESULT: FAIL"
+  exit 1
+fi
+echo "RESULT: PASS"

@@ -1,0 +1,21 @@
+# Janitor patrol 2/2: size-based log rotation.
+# STAGED PROPOSAL - install by copying into <city>/orders/ (see README.md).
+# Order name comes from the file basename: janitor-log-rotate.
+#
+# Exec order, no agent. Ships in DRY-RUN mode; a human flips
+# JANITOR_LOG_EXECUTE to "1" after reviewing one dry-run report.
+# Coverage (from the 2026-07-03 leak census): supervisor.log, the two slack
+# adapter logs, all *--control-dispatcher-trace.log files, dolt-server.log.
+# events.jsonl and beads.json are hard-refused by the script by design.
+
+[order]
+description = "Janitor: rotate oversized city logs (copy+truncate+gzip, keep N archives; dry-run until enabled)"
+trigger = "cooldown"
+interval = "6h"
+exec = "/home/ds/gas-city/scripts/gc-logrotate.sh"
+timeout = "120s"
+
+[order.env]
+JANITOR_LOG_EXECUTE = "1"        # flipped by Stephanie 2026-07-04 after clean dry-run review
+JANITOR_LOG_MAX_MB = "32"        # rotate any covered log over 32MB
+JANITOR_LOG_KEEP = "5"           # keep the 5 newest .janitor-*.gz per file

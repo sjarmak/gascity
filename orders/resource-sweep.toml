@@ -1,0 +1,10 @@
+[order]
+description = "Daily memory/disk/resource observability sweep. Reports memory+swap pressure, shared-volume disk free space, and the top consumers by class; flags AMBIGUOUS reclaim candidates (live-parent swap hoarders / long-running dev servers) to mayor for judgment. Never kills — unambiguous dead-parent orphans are auto-reaped by the targeted reapers (stale-scix-mcp-reaper); dead /tmp workspaces by tmp-reaper. Nudges mayor only under real pressure (MemAvailable < 4G or disk free < 25G) or when a candidate is flagged."
+trigger = "cooldown"
+interval = "3h"
+exec = "/home/ds/gas-city/bin/resource-sweep --nudge-mayor"
+timeout = "120s"
+# Fail OPEN on open-work-gate timeout (gastownhall/gascity#2893): report-only
+# (never kills; only nudges mayor under real pressure), so a duplicate run is a
+# harmless re-report.
+idempotent = true

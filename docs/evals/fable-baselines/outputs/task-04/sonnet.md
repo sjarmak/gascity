@@ -1,0 +1,63 @@
+# PR #4006 Maintainer Decision Report
+
+`fix(control-dispatcher): prefer rig-scoped dispatcher for its own scope (revert #3765's static city-preference)`
+
+## 1. What the PR actually changes vs. what it claims
+
+The description is accurate and the diff matches it exactly. Verified against the checkout at `/tmp/fable-baseline-task04` (main @ `ee616a7e4`):
+
+- `internal/config/config.go:105-128` — `PreferredDeterministicControlDispatcher` is rewritten to prefer a rig-scoped deterministic dispatcher (`Dir == rigContext`, non-empty) over the city-level singleton (`Dir == ""`), inverting the preference introduced by commit `41785d976` ("fix(control-dispatcher): namespace-aware resolution + singleton-consistent routing (#3765)", confirmed present in `git log`). City-level remains the fallback when the rig runs none of its own.
+- Both call sites the PR names are real and are the only two call sites of the function: `internal/dispatch/control.go:1058` (attempt-time re-route) and `internal/graphroute/graphroute.go:331` (graph.v2 instantiation-time decoration). No other caller exists (`grep -rn "PreferredDeterministicControlDispatcher"` returns exactly these two non-test hits).
+- Test diff is a faithful mechanical mirror of the source-code flip: one table case in `config_test.go` inverted, one binding test in `graphroute_test.go` inverted (both-scope table), one integration test in `control_integration_test.go` inverted, one brand-new instantiation-level test added in `graphroute_test.go`. No hidden scope expansion, no unrelated changes.
+- No gap between description and diff. The "why" narrative (separating static ownership from runtime liveness, crediting #3454's `ControlDispatcherRuntimeMissing` demotion for the dynamic half) is also accurate as far as it goes — see §3 for where it stops being accurate.
+
+## 2. Correctness — traced against the checkout
+
+I reproduced the exact "before" state by reading `internal/config/config.go:95-128`, `internal/graphroute/graphroute.go:279-340`, and `internal/dispatch/control.go:1044-1066` on unmodified main; all three match the diff's "before" hunks byte-for-byte, so the diff is applying cleanly against what it claims to.
+
+I then hand-applied the full diff (source + tests) to a throwaway copy at `/tmp/claude-1000/.../scratchpad/pr4006-verify` (not the read-only checkout) and ran the actual Go toolchain:
+
+- `go build ./...` — success.
+- `go test ./internal/config/... ./internal/graphroute/... ./internal/dispatch/...` with the fix applied — **2106 passed, 0 failed**.
+- Then I reverted only the source change in `config.go` back to the old city-first logic while keeping the PR's test diff intact, and re-ran the same three packages: **2100 passed, 6 failed** — all six failures are exactly the four tests the PR touches/adds (`TestPreferredDeterministicControlDispatcher/rig_copy_preferred...`, `TestControlDispatcherBinding_PrefersRigScopedOverCitySingleton` + its `rigContext=fixture` subtest, `TestApplyAttemptControlStepRoute_PrefersRigScopedOverCitySingleton`, `TestDecorateGraphWorkflowRecipe_ControlStepPrefersRigScopedDispatcher`), each failing with the exact pre-fix symptom described in the PR body (`gc.routed_to = "core.control-dispatcher", want ... fixture/core.control-dispatcher`).
+
+This is a fully corroborated fix, not just an asserted one: the described strand reproduces on unfixed logic and disappears with the fix, across both the instantiation path and the attempt-time re-route path.
+
+I also confirmed the `#3454` claim the PR leans on is real, not aspirational: `internal/graphroute/graphroute.go:47-54` and `:279-311` implement `ControlDispatcherRuntimeMissing`-gated demotion, it is wired up at the cmd/API layer (`cmd/gc/cmd_sling.go:583`, `cmd/gc/dispatch_runtime.go:34`, `internal/api/handler_sling.go:112`, `internal/sling/sling.go:143-177`), and it is documented in `engdocs/architecture/dispatch.md:279-319` as a real, shipped mechanism ("Evaluated at sling time only (per molecule)").
+
+## 3. Blast radius the author did not mention
+
+The PR's central architectural claim — "no static liveness preference is re-added... the dynamic question is already answered downstream by #3454's demotion" — is **only true for one of the two call sites this PR modifies**.
+
+- `internal/graphroute/graphroute.go`'s `ControlDispatcherBinding` (instantiation path) does carry the `ControlDispatcherRuntimeMissing` liveness check (lines 290-311) and correctly demotes to the city dispatcher when the rig-local one is asleep with `runtime-missing`.
+- `internal/dispatch/control.go`'s `controlDispatcherTargetForExecutionTarget` (the attempt-time re-route path — the PR's own description names this as covering Check/Retry/Fanout/ScopeCheck/WorkflowFinalize/Ralph) has **no equivalent check at all**. I grepped for `RuntimeMissing` across `internal/dispatch/*.go` (all non-test) and got zero hits; the function's signature (`executionTarget, rigContext string, cfg *config.City`) doesn't even carry the `beads.Store` needed to look up session liveness, even though its caller (`applyAttemptControlStepRoute`, `internal/dispatch/control.go:1010`, and `internal/dispatch/fanout.go:318`) does have a `store` in scope and simply never threads it into the control-target decision.
+
+Before this PR, that gap was harmless: the old logic always preferred the city singleton whenever one existed, so the attempt-time path never had occasion to pick a possibly-dead rig-scoped dispatcher in the multi-rig-with-city-singleton shape. After this PR, the attempt-time path will now route to the rig-scoped dispatcher whenever one is configured for that rig — with zero fallback if that dispatcher later goes to sleep (`runtime-missing`) mid-molecule. Concretely: a molecule instantiated while `dip/core.control-dispatcher` is healthy (correctly routed by the now-fixed graphroute path), whose rig dispatcher later dies, will have every subsequent Check/Retry/Fanout control step re-stamped by `dispatch/control.go` to the dead rig-scoped route forever — the exact stranding failure mode this PR exists to fix, just reintroduced via the sibling code path it explicitly claims is protected. `engdocs/architecture/dispatch.md:285-290` documents that a rig-local dispatcher "can sit that way for weeks" once asleep, which is the live-fire scenario for this gap, not a hypothetical.
+
+This is a real, unaddressed regression risk in a change whose entire premise is "we already have downstream liveness protection so we don't need it here." It's also within the explicit test-coverage scope the PR claims (`TestApplyAttemptControlStepRoute_...`, the dispatch package) — the shipped test only exercises the "rig dispatcher is configured and implicitly assumed healthy" case, never the "rig dispatcher exists in config but is runtime-missing" case, so no test would catch this even by accident. Zero `RuntimeMissing`/`runtime-missing` string in any `internal/dispatch/*_test.go`.
+
+Secondary, lower-severity note: the preference flip applies to _every_ rig that happens to have a `core.control-dispatcher` agent entry in config, whether or not that entry corresponds to a dispatcher anyone actually runs (e.g. a stale pack-inherited entry). Any such rig silently stops using the previously-working city singleton the moment this merges. That's arguably the correct new default per the PR's ownership model, but it's a behavior change for every multi-rig city, not just `dip`, and isn't called out as such.
+
+## 4. Test adequacy
+
+Yes — the shipped tests genuinely pin the bug and would fail on unfixed main, confirmed by actual execution (not just static reading), see §2. All four assertions the PR revises/adds fail identically and specifically on the pre-fix selection logic, and pass with the fix. The broader suite (`go test ./internal/config/... ./internal/graphroute/... ./internal/dispatch/...`, 2106 tests) is green with the fix applied, matching the PR's stated test plan.
+
+What's _not_ covered, per §3: no test exercises `dispatch/control.go`'s attempt-time path with a rig-scoped dispatcher that is `runtime-missing`. That's the gap, not a test-quality problem with what was written — the tests that exist are correct and sufficient for the claim actually being tested; they just don't test the claim the PR's prose makes about downstream liveness protection being universal.
+
+## 5. Decision: REQUEST CHANGES
+
+The `graphroute`/`config` half of this fix is correct, well-tested, and should ship — it fixes a real, reproduced stranding bug with a clean, symmetric change and doesn't regress any of the three documented deployment shapes (verified all three by code trace and, for the two with tests, by execution). But the PR's safety argument for removing the static city-preference rests on a claim that doesn't hold for `internal/dispatch/control.go`, and merging as-is reopens the exact stranding bug class for any rig whose dispatcher becomes asleep _after_ a molecule is already in flight (Check/Retry/Fanout re-routes), which the PR itself identifies as depending on this same helper.
+
+Concrete, actionable requests for the contributor:
+
+1. **Wire the same liveness demotion into the attempt-time path.** `controlDispatcherTargetForExecutionTarget` (`internal/dispatch/control.go:1044`) needs access to the same `ControlDispatcherRuntimeMissing`-style check `graphroute.ControlDispatcherBinding` uses, and its callers (`applyAttemptControlStepRoute`, `internal/dispatch/control.go:1010` and `internal/dispatch/fanout.go:318`) already have `store beads.Store` in scope to supply it. Mirror the fallback shape at `graphroute.go:290-311`: resolve the rig-scoped preference first, and if the resolved dispatcher is runtime-missing, re-resolve with an empty rig context and use the city fallback instead, recording the fallback the way `ControlFallbackFrom`/`gc.control_dispatcher_fallback` already does for observability parity.
+2. **Add a regression test for that gap specifically**: a rig-scoped dispatcher configured but marked `runtime-missing` (or the equivalent seam this repo uses to simulate that in `dispatch` tests), asserting the attempt-time control step falls back to the city singleton rather than re-stranding on the dead rig route.
+3. If, after investigation, the contributor determines the attempt-time path genuinely cannot regress in practice (for example, if there's a reason a molecule's rig-local dispatcher can never go from healthy-at-sling-time to `runtime-missing` mid-flight that I'm not seeing), that reasoning needs to be stated explicitly in the PR body and reviewed on its own — it isn't currently argued, only assumed away by "the dynamic question is already answered downstream," which is false for this call site.
+
+Everything else in the diff (the `config.go` rewrite, the four flipped/added tests, the doc comments) is fine to keep as-is once item 1 lands; this isn't a request to redesign the fix, just to close the specific hole it opens in its sibling path.
+
+## 6. Remaining uncertainty / what I'd run to resolve it
+
+- I have not run this against a live multi-rig deployment, so I can't directly observe how often a rig-local control-dispatcher actually transitions to `runtime-missing` _after_ a molecule is already mid-flight in practice (vs. always being either healthy for the molecule's whole lifetime, or dead from the start, which the graphroute path already handles). The engdocs note it "can sit that way for weeks," which describes the state, not the transition-timing distribution. I'd want to check production incident history (if any exists) for `gc.control_dispatcher_fallback` stamps that occurred on already-running molecules, or an issue tracker search for `runtime-missing` occurring mid-molecule, to size how live this specific risk is versus theoretical.
+- I did not execute the "Live corroboration" claim in the PR body (manually re-prefixing 70 stranded routes on the affected `dip` deployment) — that's an operational fact about a system I don't have access to from this checkout, and I'm treating it as the author's first-hand account rather than something I verified.
+- I have not audited whether other in-repo callers construct `config.City` values with rig-scoped `core.control-dispatcher` agents for reasons unrelated to actually running a dispatcher (e.g., a shared pack template that just happens to define one per rig). If common, the "silently switches routing for every multi-rig city" note in §3 would be a bigger practical footprint than the PR's single named `dip` example suggests; I'd grep production/example configs across the org (not present in this checkout) for `core.control-dispatcher` agent entries with non-empty `Dir` to confirm scope.

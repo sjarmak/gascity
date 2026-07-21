@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# Standalone test for routed-bead-nudger's just-in-time assignee recheck.
+#
+# The hardening under test: between the start-of-tick scan and the actual
+# nudge, a warm slot may have claimed the routed bead (self-poll, or a prior
+# tick's nudge). The recheck re-queries the rig RIGHT BEFORE nudging and skips
+# the pool when nothing is still-unclaimed, so we never nudge a slot toward an
+# already-claimed bead.
+#
+# Asserts:
+#   1. still-unclaimed bead  -> exactly ONE nudge, log event 'wake-and-nudge'
+#                               or 'nudge-active' (NOT 'all-claimed-skip')
+#   2. already-claimed bead  -> ZERO nudges, log event 'all-claimed-skip'
+#
+# Strategy: stub `gc` (and `csu`) on PATH. The stub serves bead JSON for
+# `gc bd ... list`, a single sleeping session for `gc session list`, and records
+# every `gc session nudge` to $NUDGE_LOG.
+#
+# Key: the start-of-tick scan and the just-in-time recheck are SEPARATE
+# `gc bd list` calls. The stub counts invocations: it serves the bead as
+# UNCLAIMED on call #1 (scan, so the bead becomes a candidate) and serves the
+# assignee from $FIXTURE_RECHECK_ASSIGNEE on call #2+ (the recheck). That models
+# a slot claiming the bead in the window between scan and nudge, which is exactly
+# what the recheck must catch.
+#
+# Run:  bash /home/ds/gas-city/bin/routed-bead-nudger.test
+
+set -uo pipefail
+
+NUDGER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/routed-bead-nudger"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+POOL="/home/ds/gascity/polecat"
+RIG="gascity"
+BEAD="gc-test01"
+
+# --- Build a stub `gc` (and `csu`) on PATH -----------------------------------
+STUB="$WORK/stubbin"
+mkdir -p "$STUB"
+
+cat > "$STUB/gc" <<'EOF'
+#!/usr/bin/env bash
+# Minimal `gc` stub for the routed-bead-nudger test.
+emit_bead() {
+  # emit_bead <assignee> : one routed root bead, stale (updated_at far in the
+  # past). If GATE_PARENT is set, ALSO emit an OPEN human-gate step bead whose
+  # .parent is that root — modelling a molecule parked at the human-review
+  # checkpoint (gc.step_ref ~ .human-gate, closed only by a human).
+  local gate=""
+  if [[ -n "${GATE_PARENT:-}" ]]; then
+    gate=$(cat <<JSON
+  ,{
+    "id": "gc-gate01",
+    "assignee": "",
+    "status": "open",
+    "updated_at": "2020-01-01T00:00:00Z",
+    "parent": "$GATE_PARENT",
+    "metadata": { "gc.step_ref": "mol-adopt-pr.human-gate" }
+  }
+JSON
+)
+  fi
+  cat <<JSON
+[
+  {
+    "id": "$BEAD_ID",
+    "assignee": "$1",
+    "status": "open",
+    "updated_at": "2020-01-01T00:00:00Z",
+    "metadata": { "gc.routed_to": "$POOL_NAME"${NUDGE_HOLD:+, "gc.nudge_hold": "$NUDGE_HOLD"} }
+  }
+$gate
+]
+JSON
+}
+sub="${1:-}"; shift || true
+case "$sub" in
+  rig)
+    # `gc rig list` -> the nudger parses lines like "  gascity:"
+    [[ "${1:-}" == "list" ]] && printf '  %s:\n' "$RIG_NAME"
+    ;;
+  bd)
+    # `gc bd --rig <rig> list --status=open --json --limit=0`
+    # Call #1 == start-of-tick scan: bead is UNCLAIMED (becomes a candidate).
+    # Call #2+ == just-in-time recheck: bead carries $FIXTURE_RECHECK_ASSIGNEE,
+    # modelling a slot that claimed it in the scan->nudge window.
+    if [[ "$*" == *ready* ]]; then
+      # Readiness gate (gc-xk1hg, added to the nudger 2026-07-14): scan_rig and
+      # recheck_pool_unclaimed build a READY_SET from `gc bd --rig <rig> ready
+      # --json` and drop every bead not in it ('open' is not 'claimable'). This
+      # branch must come FIRST: `ready` calls also carry --json/--limit, and an
+      # earlier catch-all returning '[]' empties READY_SET, which silently
+      # filters out every candidate and makes the whole suite look broken.
+      # Only .id is read from this output, so the assignee here is irrelevant —
+      # claimed-ness is modelled by the `list` calls below. Deliberately does
+      # NOT touch $BD_CALL_COUNT: that counter models the scan->recheck window
+      # for `list` only, and incrementing it here would shift the window.
+      if [[ -n "${FIXTURE_NOT_READY:-}" ]]; then
+        echo '[]'          # bead is open but NOT ready — must not be nudged
+      else
+        emit_bead ""
+      fi
+    elif [[ "$*" == *list* ]]; then
+      n=$(cat "$BD_CALL_COUNT" 2>/dev/null || echo 0)
+      n=$((n + 1)); echo "$n" > "$BD_CALL_COUNT"
+      if (( n == 1 )); then
+        emit_bead ""
+      else
+        emit_bead "$FIXTURE_RECHECK_ASSIGNEE"
+      fi
+    else
+      echo '[]'
+    fi
+    ;;
+  session)
+    case "${1:-}" in
+      list)
+        # One sleeping session whose work_dir basename matches the base pool.
+        cat <<JSON
+{"schema_version":1,"sessions":[{"id":"sess-1","state":"sleeping","work_dir":"/home/ds/gascity/polecat"}]}
+JSON
+        ;;
+      wake)  : ;;  # no-op
+      nudge)
+        # `gc session nudge <target> <msg> --delivery immediate`
+        echo "NUDGE target=${2:-} msg=${3:-}" >> "$NUDGE_LOG"
+        ;;
+    esac
+    ;;
+  mail) : ;;
+  *) : ;;
+esac
+exit 0
+EOF
+chmod +x "$STUB/gc"
+
+cat > "$STUB/csu" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$STUB/csu"
+
+# --- run_nudger <recheck_assignee> -> path to the audit log it wrote ----------
+# recheck_assignee = what the bead's assignee becomes on the recheck query:
+#   ""           -> still unclaimed at nudge time  (should nudge)
+#   "polecat-2"  -> claimed since the scan         (should skip)
+run_nudger() {
+  local recheck_assignee="$1"
+  local nudge_hold="${2:-}"
+  local gate_parent="${3:-}"
+  local not_ready="${4:-}"
+  # Fresh state per run so cooldown never suppresses the nudge.
+  local statefile="$WORK/state.json"; echo '{}' > "$statefile"
+  local auditlog="$WORK/audit.log"; : > "$auditlog"
+  echo 0 > "$BD_CALL_COUNT"
+  : > "$NUDGE_LOG"
+
+  PATH="$STUB:$PATH" \
+  RIG_NAME="$RIG" \
+  BEAD_ID="$BEAD" \
+  POOL_NAME="$POOL" \
+  BD_CALL_COUNT="$BD_CALL_COUNT" \
+  FIXTURE_RECHECK_ASSIGNEE="$recheck_assignee" \
+  FIXTURE_NOT_READY="$not_ready" \
+  NUDGE_HOLD="$nudge_hold" \
+  GATE_PARENT="$gate_parent" \
+  NUDGE_LOG="$NUDGE_LOG" \
+  ROUTED_NUDGER_STATE="$statefile" \
+  ROUTED_NUDGER_AUDIT_LOG="$auditlog" \
+  ROUTED_NUDGER_THRESHOLD="1s" \
+  ROUTED_NUDGER_COOLDOWN="1s" \
+    bash "$NUDGER" --apply --no-csu >/dev/null 2>&1
+  echo "$auditlog"
+}
+
+export NUDGE_LOG="$WORK/nudge.log"
+export BD_CALL_COUNT="$WORK/bd_calls"
+
+# count_matches <pattern> <file> : print number of matching lines (0 on none).
+# `grep -c` already prints a count and exits 1 on zero matches, so we discard
+# its exit status rather than appending a second "0" via `|| echo 0`.
+count_matches() {
+  local n
+  n=$(grep -c "$1" "$2" 2>/dev/null)
+  echo "${n:-0}"
+}
+
+fail=0
+check() {
+  local name=$1 expected=$2 actual=$3
+  if [[ "$actual" == "$expected" ]]; then
+    echo "PASS: $name (got '$actual')"
+  else
+    echo "FAIL: $name (expected '$expected', got '$actual')"
+    fail=1
+  fi
+}
+
+# --- Case 1: still-unclaimed at nudge time -> exactly ONE nudge --------------
+AUDIT1=$(run_nudger "")
+check "still-unclaimed -> exactly one nudge"        "1" "$(count_matches '^NUDGE ' "$NUDGE_LOG")"
+check "still-unclaimed -> no all-claimed-skip"      "0" "$(count_matches '"all-claimed-skip"' "$AUDIT1")"
+check "still-unclaimed -> logged wake-and-nudge"    "1" "$(count_matches '"wake-and-nudge"' "$AUDIT1")"
+
+# --- Case 2: claimed between scan and nudge -> ZERO nudges, all-claimed-skip --
+AUDIT2=$(run_nudger "polecat-2")
+check "already-claimed -> zero nudges"              "0" "$(count_matches '^NUDGE ' "$NUDGE_LOG")"
+check "already-claimed -> logged all-claimed-skip"  "1" "$(count_matches '"all-claimed-skip"' "$AUDIT2")"
+
+# --- Case 3: operator-held (gc.nudge_hold set) -> ZERO nudges ----------------
+# A routed+unclaimed bead carrying gc.nudge_hold is held on purpose (e.g. a
+# pre-authorized convoy parked pending a human go-ahead). It must never be
+# nudged: skipped at scan time, so no pool is queued and no all-claimed-skip
+# is logged either (it never became a candidate).
+AUDIT3=$(run_nudger "" "true")
+check "nudge_hold -> zero nudges"                   "0" "$(count_matches '^NUDGE ' "$NUDGE_LOG")"
+check "nudge_hold -> not even a candidate"          "0" "$(count_matches '"all-claimed-skip"' "$AUDIT3")"
+
+# --- Case 4: molecule parked at a human gate -> ZERO nudges, parked-skip -----
+# The routed root has an OPEN child step bead with gc.step_ref ~ .human-gate
+# (a human-review checkpoint only a human closes). Re-waking a polecat is futile
+# — it re-reads `bd mol current`, sees the gate, and idles again (dr-azyap). The
+# sweep must skip the root. Self-healing: once the human closes the gate the
+# child is gone and nudging resumes (finalize is picked up "when nudged"), so we
+# do NOT mutate the root's status.
+AUDIT4=$(run_nudger "" "" "$BEAD")
+check "human-gate parked -> zero nudges"           "0" "$(count_matches '^NUDGE ' "$NUDGE_LOG")"
+check "human-gate parked -> logged parked-skip"    "1" "$(count_matches '"human-gate-parked-skip"' "$AUDIT4")"
+check "human-gate parked -> no all-claimed-skip"   "0" "$(count_matches '"all-claimed-skip"' "$AUDIT4")"
+
+# --- Case 5: routed + unclaimed + stale, but NOT ready -> ZERO nudges --------
+# The readiness gate (gc-xk1hg): 'open' is not 'claimable'. A step bead whose
+# dependencies are unmet is open but blocked; nudging a polecat at it produces
+# a no-op agent that idles or force-runs a step outside its molecule order. The
+# bead is absent from `gc bd --rig <rig> ready`, so it must never become a
+# candidate — no nudge, and no all-claimed-skip (it never got that far).
+#
+# This case exists because the gate landed in the nudger on 2026-07-14 with no
+# test, and the stub answered '[]' to the new `ready` call — emptying READY_SET
+# and silently filtering out EVERY candidate. All four behavioural assertions
+# above went to zero and stayed red for two days on a live backstop. Pin the
+# gate directly so the next change to it fails loudly instead of drifting.
+AUDIT5=$(run_nudger "" "" "" "true")
+check "not-ready -> zero nudges"                   "0" "$(count_matches '^NUDGE ' "$NUDGE_LOG")"
+check "not-ready -> not even a candidate"          "0" "$(count_matches '"all-claimed-skip"' "$AUDIT5")"
+
+echo
+if (( fail )); then
+  echo "RESULT: FAIL"
+  exit 1
+fi
+echo "RESULT: PASS"

@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# nudge-poll-reaper — reap leaked, busy-looping 'gc nudge poll' sidecar procs.
+#
+# In-floor mitigation for gc-b9w88: after a session restart, the old
+# `gc nudge poll --session X` sidecar can be orphaned (reparented to init /
+# the systemd user manager) and spin at multi-core CPU instead of sleeping.
+# Four such procs were burning ~735% CPU on 2026-06-24 and were the root of
+# the all-day nudge-hangs (mail --notify hanging). The DURABLE fix (the poll
+# should exit/sleep on session restart) is gc SOURCE — held needs-source-impl.
+# This reaper stops the recurring drain in-place.
+#
+# SAFE KILL SIGNAL: a correctly-functioning nudge poll waits on events and uses
+# ~0% CPU. So a `gc nudge poll` proc with sustained CPU above a threshold AND
+# old enough to rule out a startup spike is unambiguously the busy-loop bug.
+# We do NOT key on the session being dead (the leaked poll often outlives a
+# restart while the session id stays "active"); the busy-loop itself is the
+# malfunction. Only `gc nudge poll` procs are ever touched — never claude
+# sessions, never the supervisor, never anything interactive.
+#
+# Usage:  nudge-poll-reaper [--dry-run]
+# Env:    NUDGE_POLL_CPU_MIN  (default 50)  min %CPU to consider busy-looping
+#         NUDGE_POLL_AGE_MIN  (default 60)  min age in seconds (rule out spikes)
+set -uo pipefail
+CITY=/home/ds/gas-city
+AUDIT_LOG="${NUDGE_POLL_REAPER_AUDIT_LOG:-$CITY/.gc/nudge-poll-reaper.log}"
+CPU_MIN="${NUDGE_POLL_CPU_MIN:-50}"
+# 60s (was 120): a healthy poll is ~0% CPU from birth, so >50% is pathological
+# regardless of age; the floor only rules out a transient startup spike. Halved
+# 2026-06-29 to catch a respawned hot-looper one cycle sooner (gc-b9w88 recurs
+# faster than the old 120s+5m gate could contain; see .gc/nudge-poll-reaper.log).
+AGE_MIN="${NUDGE_POLL_AGE_MIN:-60}"
+DRY_RUN=0
+[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { sed -n 's/^# \{0,1\}//p' "$0" | head -22; exit 0; }
+
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+reaped=0 total_cpu=0
+
+# Columns: pid pcpu(int) etimes args... ; match only `gc nudge poll`.
+while read -r pid pcpu etimes rest; do
+  [[ "$rest" == *"gc nudge poll"* ]] || continue
+  # pcpu may exceed 100 (multi-core); compare integer part.
+  cpu_int=${pcpu%.*}
+  (( cpu_int >= CPU_MIN )) || continue
+  (( etimes >= AGE_MIN )) || continue
+  sess=$(sed -E 's/.*--session ([^ ]+ [^ ]+).*/\1/' <<<"$rest")
+  if (( DRY_RUN )); then
+    echo "WOULD-REAP pid=$pid cpu=${pcpu}% age=${etimes}s session=$sess"
+  else
+    if kill -TERM "$pid" 2>/dev/null; then
+      echo "REAPED pid=$pid cpu=${pcpu}% age=${etimes}s session=$sess"
+      jq -nc --arg ts "$(ts)" --arg pid "$pid" --arg cpu "$pcpu" --arg age "$etimes" \
+        --arg sess "$sess" '{ts:$ts, event:"reaped", pid:$pid, cpu:$cpu, age:$age, session:$sess}' \
+        >> "$AUDIT_LOG" 2>/dev/null
+    else
+      echo "kill failed pid=$pid" >&2
+    fi
+  fi
+  reaped=$((reaped + 1))
+  total_cpu=$((total_cpu + cpu_int))
+done < <(ps -eo pid,pcpu,etimes,args --no-headers 2>/dev/null)
+
+# SIGKILL any that survived SIGTERM (busy-loops can ignore TERM).
+if (( ! DRY_RUN && reaped > 0 )); then
+  sleep 2
+  while read -r pid pcpu etimes rest; do
+    [[ "$rest" == *"gc nudge poll"* ]] || continue
+    cpu_int=${pcpu%.*}
+    (( cpu_int >= CPU_MIN )) && (( etimes >= AGE_MIN )) && kill -KILL "$pid" 2>/dev/null \
+      && echo "SIGKILL (survived TERM) pid=$pid"
+  done < <(ps -eo pid,pcpu,etimes,args --no-headers 2>/dev/null)
+fi
+
+if (( reaped == 0 )); then
+  echo "no leaked nudge-poll procs (cpu>=${CPU_MIN}% age>=${AGE_MIN}s)"
+else
+  echo "$([[ $DRY_RUN == 1 ]] && echo would-reap || echo reaped) $reaped proc(s), ~${total_cpu}% CPU"
+fi

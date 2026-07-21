@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# morning-triage-watchdog — fires at 8:00 EDT, after morning-triage-cycle's
+# 7:00 EDT slot. If morning-triage-cycle has no fire-event dated today,
+# mail mayor so a silent miss is caught instead of going unnoticed.
+#
+# Motivated by the 2026-05-14 silent miss: morning-triage-cycle did not
+# fire and produced no audit-log entry at all — distinct from the
+# 2026-05-13 / 2026-05-15 "bead_create_failed" runs which at least logged.
+# A watchdog converts a silent gap into a visible mayor nudge.
+#
+# Audit JSONL at .gc/morning-triage-watchdog.log
+
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${CITY}/.gc/morning-triage-watchdog.log"
+TRIAGE_LOG="${CITY}/.gc/morning-triage-cycle.log"
+
+mkdir -p "$(dirname "$AUDIT_LOG")"
+
+log_event() {
+    local event="$1" detail="${2:-}"
+    printf '{"ts":"%s","event":"%s","detail":%s}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$(printf '%s' "$detail" | jq -Rs .)" \
+        >> "$AUDIT_LOG"
+}
+
+TODAY=$(date -u +%Y-%m-%d)
+log_event "start" "checking morning-triage-cycle for a $TODAY fire"
+
+# A healthy morning-triage-cycle run logs a "slung" event today. Check the
+# audit log for any line whose ts starts with today's date AND event=slung.
+FIRED_OK=false
+if [[ -f "$TRIAGE_LOG" ]]; then
+    if grep -F "\"ts\":\"${TODAY}T" "$TRIAGE_LOG" 2>/dev/null | grep -q '"event":"slung"'; then
+        FIRED_OK=true
+    fi
+fi
+
+if [[ "$FIRED_OK" == "true" ]]; then
+    log_event "ok" "morning-triage-cycle slung a bead today"
+    exit 0
+fi
+
+# Determine the failure shape for a more useful nudge.
+DETAIL="no morning-triage-cycle 'slung' event for $TODAY"
+if [[ -f "$TRIAGE_LOG" ]]; then
+    LAST_TODAY=$(grep -F "\"ts\":\"${TODAY}T" "$TRIAGE_LOG" 2>/dev/null | tail -1)
+    if [[ -n "$LAST_TODAY" ]]; then
+        DETAIL="morning-triage-cycle ran today but did not reach 'slung' — last event: $LAST_TODAY"
+    fi
+fi
+log_event "miss_detected" "$DETAIL"
+
+BODY="*TL;DR:* morning-triage-cycle did not complete its 7:00 EDT run today ($TODAY).
+
+*Context:*
+- Watchdog check at 8:00 EDT found no 'slung' event in .gc/morning-triage-cycle.log for today.
+- Detail: $DETAIL
+
+*Asks:*
+1. Re-fire the triage manually?
+   - Paths: (a) \`gc order run morning-triage-cycle\` now / (b) skip today, investigate why the cron missed.
+   - Recommended: (a) — get Stephanie her briefing, then investigate the miss.
+   - Why your call: deciding whether today's briefing still matters vs. just fixing the cron."
+
+if gc mail send mayor -s "WATCHDOG: morning-triage-cycle missed its $TODAY run" -m "$BODY" --notify >/dev/null 2>&1; then
+    log_event "mailed_mayor" "$DETAIL"
+else
+    log_event "mail_failed" "$DETAIL"
+    exit 1
+fi
+
+exit 0

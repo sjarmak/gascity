@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Gas City shared pre-commit hook — gitleaks secret scanning
+# Installed by gas-city across all rigs
+
+set -euo pipefail
+
+if ! command -v gitleaks &>/dev/null; then
+  echo "ERROR: gitleaks not found. Install it: https://github.com/gitleaks/gitleaks#installing"
+  exit 1
+fi
+
+# Scan only staged changes (fast, no full-repo scan)
+gitleaks git --pre-commit --staged --no-banner 2>&1
+exit_code=$?
+
+if [ $exit_code -ne 0 ]; then
+  echo ""
+  echo "SECRET DETECTED — commit blocked."
+  echo "If this is a false positive, add a .gitleaksignore entry or use:"
+  echo "  git commit --no-verify  (use with caution)"
+  exit 1
+fi
+
+# jj-aware branch: under a jj-colocated repo there is no staging area and jj
+# auto-snapshots untracked files into the working-copy commit, so the --staged
+# scan above can miss a secret jj already swallowed. Scan the working tree
+# directly (gitleaks dir includes untracked files) to catch it. Dormant when
+# jj is absent or the repo is not jj-colocated.
+if command -v jj >/dev/null 2>&1 && [ -d .jj ]; then
+  gitleaks dir --no-banner . 2>&1
+  jj_exit_code=$?
+
+  if [ $jj_exit_code -ne 0 ]; then
+    echo ""
+    echo "SECRET DETECTED in jj working copy (incl. untracked/auto-snapshotted files) — commit blocked."
+    echo "If this is a false positive, add a .gitleaksignore entry or use:"
+    echo "  git commit --no-verify  (use with caution)"
+    exit 1
+  fi
+fi

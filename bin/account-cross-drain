@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""account-cross-drain: blast-radius limiter for account identity-cross / dead
+token (dr-qfw layer #3, mayor gc-470459).
+
+Consumes the detection signal written by bin/account-identity-check
+(~/.gc/account-identity-cross.signal). When a slot is crossed (wrong OAuth
+identity) or its token is dead, its non-pinned agents keep hammering a slot that
+is about to be revoked — today's cross silently wedged ~16 claude-5 agents. This
+drains those agents onto a VERIFIED-HEALTHY slot while Stephanie re-creds.
+
+Reuses the existing drain engine (bin/gc-capacity --rebalance), NOT a new mover.
+Guard: every crossed/dead slot is passed as --avoid, so agents can only land on
+a slot whose identity is correct per the SSOT map AND is not itself crossed;
+gc-capacity's coolest-target pick keeps them off over-quota accounts. Pinned
+agents are never moved (gc-capacity refuses them) and are named for hand
+relocation.
+
+ARMING: like account-quota-warning's AUTO_DRAIN, the actual move is behind an
+env flag (CROSS_AUTO_DRAIN=1, set in the order toml) so the behavior is explicit
+in config. Default OFF = plan + alert only. Read-only otherwise.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+CITY_ROOT = Path(__file__).resolve().parent.parent
+AGENTS_DIR = CITY_ROOT / "agents"
+SIGNAL = Path.home() / ".gc" / "account-identity-cross.signal"
+IDENTITY_MAP = Path(os.environ.get("ACCOUNT_IDENTITY_MAP", str(Path.home() / ".gc" / "account-identity.map")))
+GC_BIN = "/home/ds/.local/bin/gc"
+AUTO_DRAIN = os.environ.get("CROSS_AUTO_DRAIN", "0") == "1"
+
+PROVIDER_TO_ACCOUNT = {f"claude-{n}": f"account{n}" for n in range(1, 6)}
+
+
+def crossed_accounts() -> set[str]:
+    """Account slots named in the detection signal (e.g. 'account4 crossed: ...').
+
+    Every accountN token on any signal line is treated as implicated — both the
+    crossed slot and any slot it collides with must be avoided as drain targets.
+    """
+    if not SIGNAL.exists():
+        return set()
+    try:
+        text = SIGNAL.read_text()
+    except OSError:
+        return set()
+    return set(re.findall(r"\baccount[1-5]\b", text))
+
+
+def agents_by_account() -> dict[str, list[tuple[str, bool]]]:
+    """accountN -> [(agent_name, pinned)] from agents/*/agent.toml provider pins."""
+    out: dict[str, list[tuple[str, bool]]] = {}
+    for toml_path in sorted(AGENTS_DIR.glob("*/agent.toml")):
+        name = toml_path.parent.name
+        if name.startswith(("_", ".")):
+            continue
+        try:
+            data = tomllib.loads(toml_path.read_text())
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        acct = PROVIDER_TO_ACCOUNT.get(data.get("provider", ""))
+        if acct:
+            out.setdefault(acct, []).append((name, bool(data.get("pin", False))))
+    return out
+
+
+def mail_mayor(subject: str, body: str) -> None:
+    subprocess.run([GC_BIN, "--city", str(CITY_ROOT), "mail", "send", "--to", "mayor",
+                    "-s", subject, "-m", body], capture_output=True, text=True, timeout=30)
+
+
+def rebalance(agent: str, avoid: list[str], dry: bool) -> str:
+    cmd = [str(CITY_ROOT / "bin" / "gc-capacity"), "--rebalance", agent, "--no-reset"]
+    for n in avoid:
+        cmd += ["--avoid", n]
+    if dry:
+        cmd.append("--dry-run")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        return f"rebalance {agent} failed: {exc}"
+    out = r.stdout or r.stderr
+    # Trim gc-capacity's full dashboard to just the move / no-move line.
+    for ln in out.splitlines():
+        s = ln.strip()
+        if "->" in s and agent in s:
+            return s
+    for ln in out.splitlines():
+        s = ln.strip().lower()
+        if "no move" in s or "already" in s or "nothing" in s or "within normal" in s:
+            return "no move needed"
+    return "no eligible target (all healthy slots avoided/over-quota)"
+
+
+def main() -> int:
+    crossed = crossed_accounts()
+    if not crossed:
+        print("no identity-cross signal; nothing to drain")
+        return 0
+
+    # Avoid-set = every implicated slot (as bare account numbers for --avoid N).
+    avoid_nums = sorted(a.replace("account", "") for a in crossed)
+    by_acct = agents_by_account()
+
+    movable: list[str] = []
+    pinned_stuck: list[str] = []
+    for acct in sorted(crossed):
+        for name, pinned in by_acct.get(acct, []):
+            (pinned_stuck if pinned else movable).append(f"{name} ({acct})")
+
+    if not movable and not pinned_stuck:
+        print(f"crossed slots {sorted(crossed)} carry no agents; nothing to drain")
+        return 0
+
+    dry = not AUTO_DRAIN
+    plan: list[str] = []
+    for entry in movable:
+        agent = entry.split(" ")[0]
+        plan.append(f"{entry}: {rebalance(agent, avoid_nums, dry)}")
+    if AUTO_DRAIN and movable:
+        subprocess.run([GC_BIN, "reload"], capture_output=True, text=True, timeout=60)
+
+    verb = "DRAINED" if AUTO_DRAIN else "WOULD DRAIN (plan-only; set CROSS_AUTO_DRAIN=1 to arm)"
+    lines = [f"[account-cross-drain] {verb} off crossed slot(s) {sorted(crossed)}, "
+             f"avoiding {['account'+n for n in avoid_nums]} as targets:"]
+    lines += [f"- {p}" for p in plan] or ["- (no non-pinned agents to move)"]
+    if pinned_stuck:
+        lines.append("PINNED (not auto-moved — relocate by hand): " + ", ".join(pinned_stuck))
+    body = "\n".join(lines)
+    print(body)
+    mail_mayor(f"[cross-drain] {'drained' if AUTO_DRAIN else 'plan'} "
+               f"{len(movable)} agent(s) off crossed slot(s)", body)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

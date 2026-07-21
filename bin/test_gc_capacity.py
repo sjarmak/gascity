@@ -1,0 +1,370 @@
+"""Tests for gc-capacity agent discovery, pin handling, and provider writes.
+
+Run with: python3 -m pytest bin/test_gc_capacity.py
+
+gc-capacity is a hyphenated executable (no .py extension), so it is loaded as
+a module via importlib. Module-level path constants (AGENTS_DIR, CITY_TOML) are
+monkeypatched onto a temp city so tests never touch the real deployment.
+"""
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import sys
+from pathlib import Path
+
+import pytest
+
+_SCRIPT = Path(__file__).resolve().parent / "gc-capacity"
+
+
+def _load_module():
+    loader = importlib.machinery.SourceFileLoader("gccap_under_test", str(_SCRIPT))
+    spec = importlib.util.spec_from_loader("gccap_under_test", loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["gccap_under_test"] = module
+    loader.exec_module(module)
+    return module
+
+
+gc = _load_module()
+
+
+def _write_agent(agents_dir: Path, name: str, body: str) -> None:
+    d = agents_dir / name
+    d.mkdir(parents=True)
+    (d / "agent.toml").write_text(body)
+
+
+@pytest.fixture
+def city(tmp_path, monkeypatch):
+    """A temp city with agents/ and a city.toml workspace default."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    city_toml = tmp_path / "city.toml"
+    city_toml.write_text('[workspace]\nprovider = "claude-4"\n')
+    monkeypatch.setattr(gc, "AGENTS_DIR", agents_dir)
+    monkeypatch.setattr(gc, "CITY_TOML", city_toml)
+    return tmp_path, agents_dir
+
+
+def _account(provider: str, five_h: float) -> "gc.AccountUsage":
+    acct = gc.PROVIDER_TO_ACCOUNT[provider]
+    return gc.AccountUsage(name=acct, provider=provider, five_h=five_h, seven_d=0.0)
+
+
+def _accounts(**provider_to_heat) -> dict:
+    return {
+        gc.PROVIDER_TO_ACCOUNT[p]: _account(p, h)
+        for p, h in provider_to_heat.items()
+    }
+
+
+# ── Discovery ────────────────────────────────────────────────────────────────
+
+def test_parse_agents_reads_per_agent_toml_provider(city):
+    """The regression: providers live in agents/<name>/agent.toml, not city.toml."""
+    _, agents_dir = city
+    _write_agent(agents_dir, "zeldascension-worker", 'dir = "/x"\nprovider = "claude-3"\n')
+    _write_agent(agents_dir, "needs-default", 'dir = "/y"\n')  # no provider
+
+    agents = {a.name: a for a in gc.parse_agents()}
+
+    assert agents["zeldascension-worker"].provider == "claude-3"
+    # falls back to workspace default when the agent pins nothing
+    assert agents["needs-default"].provider == "claude-4"
+
+
+def test_parse_agents_skips_archived_and_hidden_dirs(city):
+    _, agents_dir = city
+    _write_agent(agents_dir, "live", 'provider = "claude-1"\n')
+    _write_agent(agents_dir, "_archived-stub", 'provider = "claude-2"\n')
+    _write_agent(agents_dir, ".hidden", 'provider = "claude-2"\n')
+
+    names = {a.name for a in gc.parse_agents()}
+    assert names == {"live"}
+
+
+def test_parse_agents_reads_pin_and_suspended(city):
+    _, agents_dir = city
+    _write_agent(agents_dir, "pinned", 'provider = "claude-1"\npin = true\n')
+    _write_agent(agents_dir, "asleep", 'provider = "claude-2"\nsuspended = true\n')
+
+    agents = {a.name: a for a in gc.parse_agents()}
+    assert agents["pinned"].pin is True and agents["pinned"].suspended is False
+    assert agents["asleep"].suspended is True and agents["asleep"].pin is False
+
+
+# ── Pin honored on rebalance ───────────────────────────────────────────────────
+
+def test_auto_rebalance_never_moves_pinned_agent(city):
+    agents = [
+        gc.AgentConfig(name="pinned", provider="claude-1", pin=True),
+        gc.AgentConfig(name="mover", provider="claude-1"),
+    ]
+    # claude-1 is HOT; claude-2 is COOL.
+    accounts = _accounts(**{"claude-1": 90.0, "claude-2": 5.0})
+
+    plan = gc.plan_rebalance_auto(agents, accounts)
+    moved = {m[0] for m in plan.moves}
+
+    assert "pinned" not in moved
+    assert "mover" in moved
+
+
+def test_pinned_agent_reserves_load_so_others_avoid_its_account(city):
+    """A pinned agent's account counts as occupied for load-balancing."""
+    agents = [
+        gc.AgentConfig(name="pinned", provider="claude-2", pin=True),
+        gc.AgentConfig(name="mover", provider="claude-1"),
+    ]
+    # claude-1 HOT (mover must move). claude-2 and claude-3 both COOL, but
+    # claude-2 already hosts the pinned agent, so mover should land on claude-3.
+    accounts = _accounts(**{"claude-1": 90.0, "claude-2": 5.0, "claude-3": 5.0})
+
+    plan = gc.plan_rebalance_auto(agents, accounts)
+    moves = {m[0]: m[2] for m in plan.moves}
+
+    assert moves["mover"] == "claude-3"
+
+
+def test_single_rebalance_refuses_pinned_agent(city):
+    agents = [gc.AgentConfig(name="pinned", provider="claude-1", pin=True)]
+    accounts = _accounts(**{"claude-1": 90.0, "claude-2": 5.0})
+
+    with pytest.raises(SystemExit):
+        gc.plan_rebalance_single("pinned", agents, accounts, force=True)
+
+
+# ── Provider writes target agent.toml ──────────────────────────────────────────
+
+def test_update_agent_provider_replaces_existing_line(city):
+    _, agents_dir = city
+    _write_agent(agents_dir, "w", 'dir = "/x"\nprovider = "claude-3"\nsuspended = false\n')
+
+    gc.update_agent_provider("w", "claude-5")
+
+    text = (agents_dir / "w" / "agent.toml").read_text()
+    assert 'provider = "claude-5"' in text
+    assert 'provider = "claude-3"' not in text
+    # other keys preserved
+    assert 'dir = "/x"' in text and "suspended = false" in text
+
+
+def test_update_agent_provider_inserts_when_absent_before_subtable(city):
+    _, agents_dir = city
+    _write_agent(agents_dir, "w", 'dir = "/x"\n\n[env]\nFOO = "bar"\n')
+
+    gc.update_agent_provider("w", "claude-2")
+
+    text = (agents_dir / "w" / "agent.toml").read_text()
+    # provider lands in the top-level section, before [env]
+    assert text.index('provider = "claude-2"') < text.index("[env]")
+    assert 'FOO = "bar"' in text
+
+
+# ── 7d-maxed accounts (COOL-label bug fix) ───────────────────────────────────
+
+def _acct_7d(provider: str, five_h: float, seven_d: float) -> "gc.AccountUsage":
+    return gc.AccountUsage(
+        name=gc.PROVIDER_TO_ACCOUNT[provider],
+        provider=provider,
+        five_h=five_h,
+        seven_d=seven_d,
+    )
+
+
+def test_heat_label_maxed_when_7d_exhausted_even_if_5h_cool():
+    """The bug: an account idle in its 5h window but at 100% 7d read COOL,
+    so the rate-limiter advertised it as available when the next request
+    would hit the weekly cap."""
+    assert _acct_7d("claude-1", five_h=0.0, seven_d=100.0).heat_label == "MAXED"
+    assert _acct_7d("claude-1", five_h=8.0, seven_d=99.0).heat_label == "MAXED"
+
+
+def test_heat_label_unchanged_when_7d_has_headroom():
+    """Regression guard: the new tier must not relabel normal accounts."""
+    assert _acct_7d("claude-1", five_h=5.0, seven_d=20.0).heat_label == "COOL"
+    assert _acct_7d("claude-1", five_h=40.0, seven_d=50.0).heat_label == "WARM"
+    assert _acct_7d("claude-1", five_h=70.0, seven_d=50.0).heat_label == "HOT"
+
+
+def test_auto_rebalance_moves_agent_off_7d_maxed_account():
+    """--rebalance auto must drain a 7d-maxed account even though its 5h is cool
+    (previously it judged only 5h and left the agent stranded)."""
+    agents = [gc.AgentConfig(name="mover", provider="claude-1")]
+    accounts = {
+        gc.PROVIDER_TO_ACCOUNT["claude-1"]: _acct_7d("claude-1", 0.0, 100.0),
+        gc.PROVIDER_TO_ACCOUNT["claude-2"]: _acct_7d("claude-2", 5.0, 20.0),
+    }
+    plan = gc.plan_rebalance_auto(agents, accounts)
+    assert ("mover", "claude-1", "claude-2") in plan.moves
+
+
+def test_rebalance_never_targets_a_7d_maxed_account():
+    """A 7d-maxed account is idle (5h=0) so it would rank as 'coolest' target —
+    it must be excluded so we don't move work onto an account that will reject it."""
+    agents = [gc.AgentConfig(name="mover", provider="claude-1")]
+    accounts = {
+        gc.PROVIDER_TO_ACCOUNT["claude-1"]: _acct_7d("claude-1", 90.0, 50.0),   # HOT, must move
+        gc.PROVIDER_TO_ACCOUNT["claude-2"]: _acct_7d("claude-2", 0.0, 100.0),   # MAXED — not a target
+        gc.PROVIDER_TO_ACCOUNT["claude-3"]: _acct_7d("claude-3", 10.0, 30.0),   # the only valid target
+    }
+    plan = gc.plan_rebalance_auto(agents, accounts)
+    targets = {m[2] for m in plan.moves}
+    assert targets == {"claude-3"}
+
+    single = gc.plan_rebalance_single("mover", agents, accounts, force=True)
+    assert single.moves and single.moves[0][2] == "claude-3"
+
+
+# ── 7d drain line (2026-07-05 account4 regression) ───────────────────────────
+# account4 climbed to 92% 7d while reading COOL (5h=6%): workers throttled into
+# silent no-op loops (execute steps closing pass with zero diff) well before
+# the 95% MAXED cliff, and `--rebalance auto --force` refused to plan a single
+# move. These tests replay that day.
+
+
+def test_heat_label_7d_hot_between_drain_line_and_cliff():
+    assert _acct_7d("claude-4", five_h=6.0, seven_d=92.0).heat_label == "7D-HOT"
+    assert _acct_7d("claude-4", five_h=6.0, seven_d=75.0).heat_label == "7D-HOT"
+    # Below the drain line stays label-stable.
+    assert _acct_7d("claude-4", five_h=6.0, seven_d=74.9).heat_label == "COOL"
+
+
+def test_auto_rebalance_drains_7d_hot_before_the_maxed_cliff():
+    """The account4 replay: 92% 7d / 6% 5h must be drained, not left to coast
+    into the cliff."""
+    agents = [gc.AgentConfig(name="eb-worker", provider="claude-4")]
+    accounts = {
+        gc.PROVIDER_TO_ACCOUNT["claude-4"]: _acct_7d("claude-4", 6.0, 92.0),
+        gc.PROVIDER_TO_ACCOUNT["claude-1"]: _acct_7d("claude-1", 7.0, 20.0),
+    }
+    plan = gc.plan_rebalance_auto(agents, accounts)
+    assert ("eb-worker", "claude-4", "claude-1") in plan.moves
+
+
+def test_auto_rebalance_routes_healthy_worker_to_account_with_more_capacity():
+    agents = [gc.AgentConfig(name="worker", provider="claude-4")]
+    accounts = {
+        gc.PROVIDER_TO_ACCOUNT["claude-4"]: _acct_7d("claude-4", 6.0, 74.0),
+        gc.PROVIDER_TO_ACCOUNT["claude-1"]: _acct_7d("claude-1", 7.0, 20.0),
+    }
+    assert gc.plan_rebalance_auto(agents, accounts).moves == [
+        ("worker", "claude-4", "claude-1")
+    ]
+
+
+def test_auto_rebalance_spreads_workers_across_equal_capacity_accounts():
+    agents = [
+        gc.AgentConfig(name=f"worker-{i:02d}", provider="claude-1")
+        for i in range(10)
+    ]
+    accounts = {
+        gc.PROVIDER_TO_ACCOUNT[f"claude-{i}"]: _acct_7d(f"claude-{i}", 0.0, 0.0)
+        for i in range(1, 6)
+    }
+
+    plan = gc.plan_rebalance_auto(agents, accounts)
+    final = {provider: 0 for provider in (f"claude-{i}" for i in range(1, 6))}
+    moves = {name: new for name, _, new in plan.moves}
+    for agent in agents:
+        final[moves.get(agent.name, agent.provider)] += 1
+
+    assert final == {
+        "claude-1": 2,
+        "claude-2": 2,
+        "claude-3": 2,
+        "claude-4": 2,
+        "claude-5": 2,
+    }
+
+
+def test_auto_rebalance_weights_targets_by_remaining_quota_capacity():
+    agents = [
+        gc.AgentConfig(name=f"worker-{i:02d}", provider="claude-1")
+        for i in range(10)
+    ]
+    accounts = {
+        gc.PROVIDER_TO_ACCOUNT["claude-1"]: _acct_7d("claude-1", 10.0, 10.0),
+        gc.PROVIDER_TO_ACCOUNT["claude-2"]: _acct_7d("claude-2", 10.0, 70.0),
+    }
+
+    plan = gc.plan_rebalance_auto(agents, accounts)
+    final = {"claude-1": 0, "claude-2": 0}
+    moves = {name: new for name, _, new in plan.moves}
+    for agent in agents:
+        final[moves.get(agent.name, agent.provider)] += 1
+
+    assert final == {"claude-1": 8, "claude-2": 2}
+
+
+def test_auto_rebalance_does_not_shuffle_an_already_weighted_distribution():
+    agents = [
+        *(gc.AgentConfig(name=f"one-{i}", provider="claude-1") for i in range(8)),
+        *(gc.AgentConfig(name=f"two-{i}", provider="claude-2") for i in range(2)),
+    ]
+    accounts = {
+        gc.PROVIDER_TO_ACCOUNT["claude-1"]: _acct_7d("claude-1", 10.0, 10.0),
+        gc.PROVIDER_TO_ACCOUNT["claude-2"]: _acct_7d("claude-2", 10.0, 70.0),
+    }
+
+    assert gc.plan_rebalance_auto(agents, accounts).moves == []
+
+
+def test_auto_rebalance_still_never_moves_pinned_off_7d_hot():
+    agents = [gc.AgentConfig(name="mayor", provider="claude-4", pin=True)]
+    accounts = {
+        gc.PROVIDER_TO_ACCOUNT["claude-4"]: _acct_7d("claude-4", 6.0, 92.0),
+        gc.PROVIDER_TO_ACCOUNT["claude-1"]: _acct_7d("claude-1", 7.0, 20.0),
+    }
+    assert gc.plan_rebalance_auto(agents, accounts).moves == []
+
+
+def test_auto_target_gives_quota_deep_account_proportionally_less_load():
+    """A 64%-used account may help, but must receive less work than the
+    account with 80% quota headroom instead of becoming the empty-account
+    target for every move."""
+    agents = [
+        gc.AgentConfig(name="mover", provider="claude-4"),
+        # claude-1 is busier by population...
+        gc.AgentConfig(name="r1", provider="claude-1"),
+        gc.AgentConfig(name="r2", provider="claude-1"),
+        gc.AgentConfig(name="r3", provider="claude-1"),
+        # ...claude-2 is empty but deep into its weekly quota.
+    ]
+    accounts = {
+        gc.PROVIDER_TO_ACCOUNT["claude-4"]: _acct_7d("claude-4", 6.0, 92.0),
+        gc.PROVIDER_TO_ACCOUNT["claude-1"]: _acct_7d("claude-1", 7.0, 20.0),
+        gc.PROVIDER_TO_ACCOUNT["claude-2"]: _acct_7d("claude-2", 1.0, 64.0),
+    }
+    plan = gc.plan_rebalance_auto(agents, accounts)
+    moves = {name: new for name, _, new in plan.moves}
+    final = {"claude-1": 0, "claude-2": 0}
+    for agent in agents:
+        final[moves.get(agent.name, agent.provider)] += 1
+    assert final == {"claude-1": 3, "claude-2": 1}
+
+
+def test_single_rebalance_ranks_targets_by_7d_band_not_5h_alone():
+    """Old single-agent key was (5h, 7d): a quota-deep account with an idle 5h
+    window won. Banded 7d must come first."""
+    agents = [gc.AgentConfig(name="mover", provider="claude-4")]
+    accounts = {
+        gc.PROVIDER_TO_ACCOUNT["claude-4"]: _acct_7d("claude-4", 6.0, 92.0),
+        gc.PROVIDER_TO_ACCOUNT["claude-2"]: _acct_7d("claude-2", 1.0, 64.0),  # idle but quota-deep
+        gc.PROVIDER_TO_ACCOUNT["claude-1"]: _acct_7d("claude-1", 7.0, 20.0),
+    }
+    plan = gc.plan_rebalance_single("mover", agents, accounts)
+    assert plan.moves and plan.moves[0][2] == "claude-1"
+
+
+def test_single_rebalance_never_targets_a_7d_hot_account():
+    agents = [gc.AgentConfig(name="mover", provider="claude-1")]
+    accounts = {
+        gc.PROVIDER_TO_ACCOUNT["claude-1"]: _acct_7d("claude-1", 90.0, 50.0),  # 5h-HOT, must move
+        gc.PROVIDER_TO_ACCOUNT["claude-4"]: _acct_7d("claude-4", 0.0, 80.0),   # idle but past drain line
+        gc.PROVIDER_TO_ACCOUNT["claude-3"]: _acct_7d("claude-3", 10.0, 30.0),
+    }
+    plan = gc.plan_rebalance_single("mover", agents, accounts, force=True)
+    assert plan.moves and plan.moves[0][2] == "claude-3"

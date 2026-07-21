@@ -1,0 +1,6 @@
+[order]
+description = "Hourly: unclaim in_progress beads abandoned by dead worker processes (no commits since claim, updated_at > 24h ago). Local fallback for the upstream proposal at gascity gc-1b2."
+trigger = "cooldown"
+interval = "1h"
+exec = "/home/ds/gas-city/bin/stale-claim-reaper --apply --nudge-mayor"
+timeout = "5m"

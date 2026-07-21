@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# Standalone test for polecat-ui-stuck-scanner's stateful mail dedup (dr-phcu).
+#
+# The hardening under test: the old cooldown was keyed by session-id only and
+# merely RATE-LIMITED — a week-long wedge re-mailed the mayor every 4h forever
+# (474-alert flood). The scanner is now level-triggered and stateful, keyed by
+# session+signature: alert on NEW, escalate on a bounded exponential schedule
+# (scan counts 1,4,16,64 — max 4 alerts per episode), then log-only until the
+# signature clears, at which point exactly ONE resolved mail is sent.
+#
+# Asserts:
+#   1. NEW signature                 -> exactly ONE alert mail (count=1)
+#   2. same signature repeated       -> suppressed (scans 2,3), re-alert at 4
+#   3. beyond the escalation cap     -> log-only, zero mail (seeded count=64)
+#   4. signature disappears          -> exactly ONE resolved mail, key dropped
+#   5. peek failure (not examined)   -> state carried, NO false resolve
+#   6. corrupt state file            -> FAIL-OPEN: alert anyway, state rewritten
+#   7. legacy v1 state (sid->iso)    -> no crash, treated as fresh (alerts NEW)
+#
+# Strategy: stub `gc` on PATH. The stub serves one stuck pool session for
+# `gc session list --json`, serves peek output from $FIXTURE_PEEK_FILE, records
+# every `gc mail send` to $MAIL_LOG and every reset/kill/nudge to $ACTION_LOG.
+# The supervisor pending-API points at a dead port (connection refused -> None).
+#
+# Run:  bash /home/ds/gas-city/bin/polecat-ui-stuck-scanner.test
+
+set -uo pipefail
+
+SCANNER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/polecat-ui-stuck-scanner"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+SID="gc-test-stuck-1"
+STATE="$WORK/state.json"
+MAIL_LOG="$WORK/mail.log"
+ACTION_LOG="$WORK/action.log"
+SCAN_LOG="$WORK/scan.jsonl"
+PEEK_FILE="$WORK/peek.txt"
+SESSIONS_FILE="$WORK/sessions.json"
+
+# --- Fixtures ----------------------------------------------------------------
+# One active pool session, last_active far in the past (>> STUCK_THRESHOLD_SEC).
+cat > "$SESSIONS_FILE" <<EOF
+{"sessions": [{"id": "$SID", "state": "active", "template": "/home/ds/gascity/polecat", "target": "polecat-1", "last_active": "2026-01-01T00:00:00+00:00"}]}
+EOF
+# A modal SELECTOR peek (reset-class wedge).
+printf 'Select model\n%s to navigate\nEnter to select\n' '↑/↓' > "$PEEK_FILE"
+
+# --- Stub `gc` on PATH -------------------------------------------------------
+STUB="$WORK/stubbin"
+mkdir -p "$STUB"
+cat > "$STUB/gc" <<'STUBEOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "session list")  cat "$FIXTURE_SESSIONS_FILE" ;;
+  "session peek")
+    if [ -n "${FIXTURE_PEEK_FAIL:-}" ]; then exit 1; fi
+    cat "$FIXTURE_PEEK_FILE" ;;
+  "session reset"|"session kill"|"session nudge")
+    echo "$1 $2 $3" >> "$ACTION_LOG" ;;
+  "mail send")     printf '%s' "$*" | tr '\n' '~' >> "$MAIL_LOG"; printf '\n' >> "$MAIL_LOG" ;;
+  *) exit 0 ;;
+esac
+exit 0
+STUBEOF
+chmod +x "$STUB/gc"
+
+run_scanner() {
+  PATH="$STUB:$PATH" \
+  FIXTURE_SESSIONS_FILE="$SESSIONS_FILE" FIXTURE_PEEK_FILE="$PEEK_FILE" \
+  FIXTURE_PEEK_FAIL="${FIXTURE_PEEK_FAIL:-}" \
+  MAIL_LOG="$MAIL_LOG" ACTION_LOG="$ACTION_LOG" \
+  STUCK_COOLDOWN_PATH="$STATE" LOG_PATH="$SCAN_LOG" \
+  GC_API_BASE_URL="http://127.0.0.1:1" \
+  STUCK_THRESHOLD_SEC=600 AUTH_WEDGE_MAX_PEEKS=5 \
+  python3 "$SCANNER" > /dev/null 2>&1
+}
+
+mails()   { [ -f "$MAIL_LOG" ] && wc -l < "$MAIL_LOG" || echo 0; }
+FAILED=0
+check() { # check <desc> <expected> <actual>
+  if [ "$2" = "$3" ]; then
+    echo "PASS: $1"
+  else
+    echo "FAIL: $1 (expected=$2 actual=$3)"
+    FAILED=1
+  fi
+}
+
+# --- 1. NEW signature -> exactly one alert -----------------------------------
+run_scanner
+check "new signature alerts once" 1 "$(mails)"
+grep -q "seen 1 scan" "$MAIL_LOG" && echo "PASS: alert carries episode count 1" \
+  || { echo "FAIL: alert missing episode count 1"; FAILED=1; }
+
+# --- 2. repeats suppressed until scan #4 -------------------------------------
+run_scanner   # scan 2
+run_scanner   # scan 3
+check "scans 2-3 suppressed" 1 "$(mails)"
+run_scanner   # scan 4 -> escalation point
+check "scan 4 re-alerts" 2 "$(mails)"
+grep -q "seen 4 scan" "$MAIL_LOG" && echo "PASS: re-alert carries episode count 4" \
+  || { echo "FAIL: re-alert missing episode count 4"; FAILED=1; }
+
+# --- 3. beyond the cap: log-only ---------------------------------------------
+# Seed the entry past the last escalation point (64) and scan: no mail.
+python3 - "$STATE" <<'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f: st = json.load(f)
+for k in st["entries"]: st["entries"][k]["count"] = 64
+with open(sys.argv[1], "w") as f: json.dump(st, f)
+PYEOF
+run_scanner   # count becomes 65 -> beyond schedule
+check "beyond cap is log-only" 2 "$(mails)"
+
+# --- 5 (before 4). peek failure -> state carried, no false resolve -----------
+FIXTURE_PEEK_FAIL=1 run_scanner
+check "peek failure sends no mail" 2 "$(mails)"
+python3 - "$STATE" "$SID" <<'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f: st = json.load(f)
+keys = [k for k in st["entries"] if sys.argv[2] in k]
+sys.exit(0 if keys else 1)
+PYEOF
+check "peek failure carries state (no false resolve)" 0 "$?"
+
+# --- 4. signature disappears -> exactly one resolved mail --------------------
+printf '$ idle, waiting for work\n' > "$PEEK_FILE"
+run_scanner
+check "clear peek resolves with one mail" 3 "$(mails)"
+grep -qi "resolved" "$MAIL_LOG" && echo "PASS: resolution mail says resolved" \
+  || { echo "FAIL: no resolution mail"; FAILED=1; }
+run_scanner
+check "resolved key stays silent" 3 "$(mails)"
+
+# --- 6. corrupt state -> fail-open (alert, never suppress) -------------------
+printf 'Select model\n%s to navigate\nEnter to select\n' '↑/↓' > "$PEEK_FILE"
+echo '{not json' > "$STATE"
+run_scanner
+check "corrupt state fails open (alerts)" 4 "$(mails)"
+python3 -c 'import json,sys; st=json.load(open(sys.argv[1])); sys.exit(0 if st.get("v")==2 else 1)' "$STATE"
+check "corrupt state rewritten as v2" 0 "$?"
+
+# --- 7. legacy v1 state -> fresh start, no crash -----------------------------
+echo "{\"$SID\": \"2026-06-01T00:00:00+00:00\"}" > "$STATE"
+run_scanner
+check "legacy v1 state alerts as NEW" 5 "$(mails)"
+
+if [ "$FAILED" -eq 0 ]; then
+  echo "ALL PASS"
+  exit 0
+fi
+echo "SUITE FAILED"
+exit 1

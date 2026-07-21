@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""issue-stale-conservative: label long-idle issues stale + digest them. NEVER
+time-closes a valid bug.
+
+Issue-hygiene piece 5 (mayor gc-429253). Open issues with no activity in >90d get
+the status/stale label + a maintainer digest entry. The ONLY auto-close path is
+deterministic: an issue that ALREADY carries a maintainer close-eligible label
+(not-planned / wontfix / duplicate / invalid) — i.e. a human already judged it
+closeable and just left it open. Idle TIME alone NEVER closes anything.
+
+Complements the repo's existing close-stale-needs Action (which 14d-closes
+needs-info/needs-repro). Excludes status/stale (already labeled) and status/paused
+(intentionally parked). NOTE: this repo currently defines none of the close-
+eligible labels, so the auto-close path is dormant today — stale-label + digest is
+the entire live behavior, which is the intended conservative posture.
+
+External writes (label/close) -> default DRY-RUN. --apply adds status/stale (and
+closes ONLY the deterministically-labeled ones). --nudge-mayor digests to mayor.
+
+Audit: .gc/issue-stale-conservative.log (JSONL).
+
+Usage: issue-stale-conservative [--apply] [--nudge-mayor] [--days N] [--json]
+Env:   ISSUE_HYGIENE_REPO (default gastownhall/gascity)
+"""
+import sys, os, json, time, datetime, subprocess
+
+CITY = "/home/ds/gas-city"
+AUDIT_LOG = os.path.join(CITY, ".gc", "issue-stale-conservative.log")
+REPO = os.environ.get("ISSUE_HYGIENE_REPO", "gastownhall/gascity")
+DEFAULT_DAYS = 90
+STALE_LABEL = "status/stale"
+EXCLUDE_LABELS = ["status/stale", "status/paused"]
+# Deterministic close-eligible labels (a human already marked it closeable). None
+# exist in gastownhall/gascity today -> auto-close path is dormant-safe.
+CLOSE_LABELS = {"not-planned", "wontfix", "duplicate", "invalid",
+                "status/wontfix", "status/duplicate", "status/not-planned"}
+
+
+def gh_json(args, timeout=90):
+    try:
+        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+        return json.loads(out.stdout) if out.returncode == 0 else None
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def main():
+    argv = sys.argv[1:]
+    apply = "--apply" in argv
+    nudge = "--nudge-mayor" in argv
+    json_out = "--json" in argv
+    days = int(argv[argv.index("--days") + 1]) if "--days" in argv else DEFAULT_DAYS
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+
+    cutoff = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+    search = f"updated:<={cutoff} " + " ".join(f'-label:"{l}"' for l in EXCLUDE_LABELS)
+    idle = gh_json(["issue", "list", "--repo", REPO, "--state", "open", "--search", search,
+                    "--json", "number,title,labels,updatedAt", "--limit", "500"])
+    if idle is None:
+        print("issue-stale-conservative: gh issue list failed", file=sys.stderr)
+        return 1
+
+    to_label, to_close = [], []
+    for i in idle:
+        labels = {l["name"] for l in (i.get("labels") or [])}
+        rec = {"issue": i["number"], "title": (i.get("title") or "")[:70],
+               "updated": (i.get("updatedAt") or "")[:10]}
+        if labels & CLOSE_LABELS:
+            rec["close_label"] = sorted(labels & CLOSE_LABELS)[0]
+            to_close.append(rec)
+        else:
+            to_label.append(rec)
+
+    if apply:
+        for r in to_label:
+            subprocess.run(["gh", "issue", "edit", str(r["issue"]), "--repo", REPO,
+                            "--add-label", STALE_LABEL], capture_output=True, timeout=60)
+        for r in to_close:
+            subprocess.run(["gh", "issue", "close", str(r["issue"]), "--repo", REPO,
+                            "--reason", "not planned",
+                            "--comment", f"Closing: carries the '{r['close_label']}' label and has "
+                            f"been idle >{days}d (deterministic close — not a time-based close)."],
+                           capture_output=True, timeout=60)
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    summary = {"ts": now, "repo": REPO, "days": days, "idle": len(idle),
+               "stale_labeled": len(to_label), "det_closed": len(to_close), "apply": apply}
+    try:
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps({**summary, "to_label": to_label, "to_close": to_close}) + "\n")
+    except OSError:
+        pass
+
+    if nudge and (to_label or to_close) and not apply:
+        lines = [f"issue-stale-conservative (DRY-RUN, >{days}d idle): {len(to_label)} to stale-label "
+                 f"+ digest; {len(to_close)} deterministically closeable (already carry a "
+                 f"close-eligible label). NEVER time-closes a valid bug. Top stale:"]
+        lines += [f"  #{r['issue']} (idle since {r['updated']})  {r['title']}" for r in to_label[:25]]
+        if to_close:
+            lines.append("Deterministic-close candidates:")
+            lines += [f"  #{r['issue']} [{r['close_label']}]  {r['title']}" for r in to_close]
+        subprocess.run(["gc", "mail", "send", "mayor", "-s",
+                        f"issue-stale-conservative: {len(to_label)} stale, {len(to_close)} det-closeable",
+                        "-m", "\n".join(lines)], capture_output=True, timeout=30)
+
+    if json_out:
+        print(json.dumps({"summary": summary, "to_label": to_label, "to_close": to_close}, indent=2))
+        return 0
+    mode = "APPLY" if apply else "DRY-RUN"
+    print(f"issue-stale-conservative ({mode})  repo={REPO}  >{days}d-idle={len(idle)}  "
+          f"stale-label={len(to_label)}  det-close={len(to_close)}")
+    for r in to_label[:15]:
+        print(f"  {'labeled' if apply else 'would-label'} stale: #{r['issue']} (since {r['updated']})  {r['title']}")
+    for r in to_close:
+        print(f"  {'CLOSED' if apply else 'would-close'} [{r['close_label']}]: #{r['issue']}  {r['title']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

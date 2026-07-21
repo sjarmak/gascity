@@ -1,0 +1,25 @@
+# approved-pr-automerge — Stephanie directive (mayor gc-429887). Whenever WE
+# approve a gastownhall/gascity PR, enable GitHub auto-merge so it enters the merge
+# queue (GitHub merges when checks pass) — never hand-merge again. NEVER merges
+# directly; only ENABLES auto-merge. Deterministic + ZFC-clean.
+#
+# Hard gate (AMENDED gc-429945 — Codex-inclusive review required): ENABLE auto-merge
+# only on a CURRENT Codex-inclusive APPROVE record (.gc/pr-pipeline/reviews/pr-<N>.md
+# that mentions codex AND has an approve/take-the-good verdict, mtime >= latest
+# commit). A bare GitHub approval is NOT sufficient -> instead DISPATCH our
+# multi-model mol-pr-review (incl Codex), bounded + deduped, so a later tick enables
+# once the Codex artifact lands. CURRENCY mitigation: commit after the review => skip.
+# Hard carve-out: azanar PRs never auto-merge. Idempotent. Audit: every action.
+#
+# FAIL-CLOSED CONTAINMENT 2026-07-20 by mayor, audit F01 / mail gc-520531:
+# the parser accepted records that explicitly said Codex did not run, used file
+# mtime instead of exact head SHA, and consumed no action-specific merge approval.
+# Keep this order dry-run until structured exact-head Codex PASS evidence AND a
+# separate current action authorization are enforced by executable tests. Then
+# restore --apply through the normal reviewed change-control path.
+[order]
+description = "FAIL-CLOSED DRY-RUN: inspect gascity merge-queue candidates only; no review dispatch or auto-merge enablement until exact-head Codex PASS and action-specific authorization gates are repaired (audit F01)."
+trigger = "cron"
+schedule = "*/15 * * * *"
+exec = "/home/ds/gas-city/bin/approved-pr-automerge --nudge-mayor"
+timeout = "5m"

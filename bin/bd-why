@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""bd-why: explain why a bead is (or is not) reachable by a worker.
+
+Answers the question that currently costs a human ~20 tool calls of forensics:
+"why isn't this bead moving?"
+
+Every filter in the dispatch path is a silent drop. `bd ready` is a passive SQL
+predicate; bin/dispatch-feeder's select_candidates() discards beads inside a jq
+select() with no logging; a label-pulling PL simply never sees an unlabelled
+bead. None of these raise an error, so a stalled bead is indistinguishable from
+a healthy one. This walks the same path and names the first thing that stops it.
+
+Deterministic by construction: it runs the real predicates and reports which one
+fired. It makes no judgement about whether a bead SHOULD move — that is a
+model's call, and deliberately not this tool's.
+
+`bd ready` membership is the ORACLE. Field checks only explain the oracle's
+answer; they never override it. This matters because `bd show --json` is
+omitempty — an absent field means "not set", not "false", and several fields
+(is_blocked, pinned, ephemeral, metadata) are never emitted at all.
+
+Usage:
+  bd-why <bead-id> [--rig <rig>]
+
+Exit: 0 routable · 1 blocked · 2 not found / error
+"""
+import json
+import subprocess
+import sys
+
+CITY = "/home/ds/gas-city"
+
+# Mirrors sqlbuild.ReadyWorkExcludeTypes + the feeder's own structural excludes.
+EXCLUDED_TYPES = {"merge-request", "gate", "molecule", "epic", "convoy", "rollup"}
+
+# Edges that block THIS bead. Deliberately EXCLUDES parent-child: that edge
+# blocks the PARENT (an epic cannot close until its children do), not the child.
+# Verified 2026-07-15 — mem-rk41.3's only dependency is parent-child to an OPEN
+# parent (mem-rk41) and it sits in `bd ready`. Treating parent-child as blocking
+# made this tool report a false blocker on every child of an open epic.
+BLOCKING_DEPS = {"blocks", "conditional-blocks", "waits-for"}
+LINEAGE_DEPS = {"parent-child", "discovered-from"}
+
+# Consumers that pull by label rather than by routing. An unlabelled bead is
+# invisible to these with no error raised anywhere — the dr-785 failure.
+LABEL_PULLERS = {"city-infra": "city-infra-pl (pulls via `bd list --label city-infra`)"}
+
+OK, BAD, INFO = "  ok ", "  X  ", "  -  "
+
+
+def run(args):
+    try:
+        p = subprocess.run(args, cwd=CITY, capture_output=True, text=True, timeout=90)
+        return p.stdout if p.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def as_obj(raw):
+    if not raw.strip():
+        return None
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return None
+    if isinstance(d, dict) and "error" in d:
+        return None
+    if isinstance(d, list):
+        return d[0] if d else None
+    return d
+
+
+def fetch(bead, rig):
+    """Resolve a bead from the city (dolt) store or a rig store."""
+    if rig:
+        base = ["gc", "bd", "--rig", rig]
+    else:
+        obj = as_obj(run(["bd", "show", bead, "--json"]))
+        if obj:
+            return obj, ["bd"], "city (dolt)"
+        base = ["gc", "bd"]
+    obj = as_obj(run(base + ["show", bead, "--json"]))
+    return (obj, base, f"rig {rig}" if rig else "rig (auto)") if obj else (None, base, None)
+
+
+def ready_ids(base):
+    d = run(base + ["ready", "--json", "--limit=0"])
+    try:
+        return {b["id"] for b in json.loads(d)}
+    except Exception:
+        return None
+
+
+def main():
+    args = [a for a in sys.argv[1:]]
+    rig = None
+    if "--rig" in args:
+        i = args.index("--rig")
+        rig = args[i + 1]
+        del args[i:i + 2]
+    if not args:
+        print(__doc__.strip().split("Usage:")[1].strip(), file=sys.stderr)
+        return 2
+    bead = args[0]
+
+    obj, base, store = fetch(bead, rig)
+    if not obj:
+        print(f"{bead}: not found in any reachable store.")
+        print(f"{INFO}city beads (dr-*) live in the DOLT store, reached with plain `bd`.")
+        print(f"{INFO}rig beads are reached with `gc bd --rig <rig>`.")
+        print(f"{INFO}NOTE: city.toml sets [beads] provider = \"file\", so `gc`'s own")
+        print(f"{INFO}dispatch path CANNOT bind a dr- bead. City work is pulled by")
+        print(f"{INFO}label, never slung. See dr-79o for what happens if you try.")
+        return 2
+
+    title = (obj.get("title") or "")[:64]
+    status = obj.get("status")
+    prio = obj.get("priority")
+    labels = obj.get("labels") or []
+    meta = obj.get("metadata") or {}
+    assignee = obj.get("assignee") or ""
+    deps = obj.get("dependencies") or []
+    itype = obj.get("issue_type") or obj.get("type") or "task"
+
+    print(f"{bead}  \"{title}\"")
+    print(f"  [P{prio} · {status} · type={itype} · store={store}]")
+    print()
+
+    blockers, notes = [], []
+
+    # --- Stage 2: ready predicate. bd ready is the oracle.
+    rset = ready_ids(base)
+    in_ready = (rset is not None) and (bead in rset)
+
+    if status in ("closed",):
+        blockers.append(("status=closed", "Closed beads are excluded from every consumer."))
+    elif status == "blocked":
+        blockers.append(("status=blocked",
+                         "Excluded from `bd ready` natively. NOTE: beads has no blocked_reason "
+                         "field, so WHY it is blocked is not queryable — check notes by hand. "
+                         "This is how jn73.1 sat 5 days."))
+    else:
+        notes.append(f"status={status}")
+
+    defer = obj.get("defer_until")
+    if defer:
+        if not in_ready:
+            blockers.append((f"deferred until {defer}",
+                             "Hidden from `bd ready` until that date. If this is a real gate, "
+                             "that is correct and intentional. Clear with: "
+                             f"bd update {bead} --defer \"\""))
+        else:
+            notes.append(f"defer_until={defer} (already passed)")
+
+    def dtype(d):
+        return d.get("dependency_type") or d.get("type") or ""
+
+    for d in deps:
+        t, st = dtype(d), (d.get("status") or "")
+        if t in BLOCKING_DEPS and st not in ("closed",):
+            blockers.append((f"blocked by {d.get('id')} ({t}, {st})",
+                             f"\"{(d.get('title') or '')[:56]}\""))
+        elif t in LINEAGE_DEPS:
+            # Lineage, not a gate — shown so the reader knows the edge exists and
+            # is NOT what is holding the bead.
+            notes.append(f"{t} -> {d.get('id')} ({st}) — lineage only, does NOT block this bead")
+
+    if itype in EXCLUDED_TYPES:
+        blockers.append((f"issue_type={itype}",
+                         "Structural type — excluded from ready-work by "
+                         "sqlbuild.ReadyWorkExcludeTypes and by the feeder."))
+
+    # Oracle disagreement is itself a finding: is_blocked is a DENORMALIZED
+    # column maintained by local write paths, so federation merge/pull can leave
+    # it stale. A stale 1 makes a bead invisible to every consumer, forever, with
+    # no error. If nothing above explains a bd-ready miss, suspect exactly that.
+    if rset is not None and not in_ready and not blockers:
+        blockers.append(("NOT in `bd ready`, and no field explains it",
+                         "Suspect a STALE is_blocked column (denormalized, not a live join; "
+                         "federation merge bypasses the recompute hook). This is a silent, "
+                         "permanent exclusion. Try: bd update " + bead + " --status open"))
+    if rset is not None and in_ready and blockers:
+        notes.append("WARNING: bead IS in `bd ready` despite the blocker(s) above — "
+                     "the ready predicate and the bead's own fields disagree.")
+
+    # --- Stage 3: routing / availability to a pool.
+    routed = meta.get("gc.routed_to") or ""
+    if assignee:
+        notes.append(f"assignee={assignee} -> claimed in the ASSIGNED tier "
+                     f"(bd ready --assignee), which runs BEFORE pool-demand and is sorted by "
+                     f"priority. Assignment is the only lever that currently honors priority.")
+    if routed:
+        notes.append(f"gc.routed_to={routed} -> already routed; the feeder skips routed beads.")
+    if not assignee and not routed:
+        notes.append("unassigned + unrouted -> reachable by a pool ONLY if something routes it.")
+
+    for bad in ("rollup", "epic"):
+        if bad in labels:
+            blockers.append((f"label \"{bad}\"",
+                             "bin/dispatch-feeder excludes rollup/epic labels structurally."))
+    if "needs-human" in labels:
+        blockers.append(("label \"needs-human\"",
+                         "Gated: a human must clear this before a machine routes it. Working "
+                         "as intended."))
+
+    # --- Visibility: the silent killer. A label-pulling consumer never errors,
+    # so this is a REACHABILITY blocker, not a footnote. It must be computed
+    # before the verdict prints — an "unreachable" bead that reports "no
+    # blockers" is worse than no tool at all.
+    vis = []
+    seen = False
+    for lab, who in LABEL_PULLERS.items():
+        if lab in labels:
+            vis.append(f"{OK}label \"{lab}\" -> {who} CAN see it.")
+            seen = True
+    if store and store.startswith("city") and not seen:
+        blockers.append((
+            f"NO label from {sorted(LABEL_PULLERS)} — invisible to every consumer",
+            "city-infra-pl pulls work via `bd list --label city-infra`. Without it this bead "
+            "is invisible to its ONLY consumer and NO error is raised anywhere; it ages "
+            f"forever. fix: bd update {bead} --add-label city-infra"))
+        vis.append(f"{BAD}no pulling label -> NOTHING can see this bead.")
+
+    print("REACHABILITY")
+    if blockers:
+        print(f"  NOT reachable — {len(blockers)} blocker(s):")
+        for b, why in blockers:
+            print(f"{BAD}{b}")
+            print(f"       -> {why}")
+    else:
+        print("  reachable — no blockers.")
+    print()
+    for n in notes:
+        print(f"{INFO}{n}")
+
+    print()
+    print("VISIBILITY (who can actually see this bead)")
+    for v in vis:
+        print(v)
+    print(f"{INFO}labels: {labels if labels else '(none)'}")
+
+    return 1 if blockers else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

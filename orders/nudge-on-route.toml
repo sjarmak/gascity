@@ -1,0 +1,6 @@
+[order]
+description = "Nudge target session when a bead's gc.routed_to is set or changed — workaround for gc sling intentionally not auto-waking warm-idle workers (gastownhall/gascity#1129, by-design)"
+trigger = "event"
+on = "bead.updated"
+exec = "/home/ds/gas-city/bin/nudge-on-route"
+timeout = "60s"

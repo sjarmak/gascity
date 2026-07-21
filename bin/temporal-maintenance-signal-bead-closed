@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# temporal-maintenance-signal-bead-closed — bead.closed -> Temporal Signal bridge
+# for the maintenance Run provider (promotion Phase 3, bead gc-z5k).
+#
+# Fires on the bead.closed event (like wake-mayor-on-slung-close). Scans recently
+# closed beads that carry the maintenance-cycle Temporal marking and forwards a
+# bead.closed Signal to the owning MaintenanceCycleWorkflow, so the workflow
+# advances without a poll. Idempotent via a state file; fail-soft when Temporal is
+# unreachable (logs and exits 0) so a not-yet-deployed server never wedges the
+# order system.
+#
+# METADATA CONTRACT (fulfilled by Phase 4's real DispatchSelection): a bead that
+# belongs to a cycle carries metadata:
+#   gc.metadata.temporal.repo       e.g. gastownhall-gascity   (workflow-id repo token)
+#   gc.metadata.temporal.cycle_key  e.g. 2026-07-16T09
+# Until that wiring lands no bead is tagged, so this handler is a correct no-op.
+#
+# DISARMED until Phase 4: the paired order ships as .toml.disabled because no
+# Temporal server is deployed yet. Enabling it before P4 is harmless (no tagged
+# beads, fail-soft dial) but pointless.
+# Fail-soft: NOT `set -e`. A bookkeeping or transient error must never wedge the
+# order; genuine breakage is surfaced in the audit log, then we still exit 0.
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+STATE_FILE="${CITY}/.gc/temporal-maintenance-signal-state.json"
+AUDIT_LOG="${CITY}/.gc/temporal-maintenance-signal.log"
+SINCE_MIN="${TEMPORAL_MAINT_SIGNAL_SINCE_MIN:-10}"
+ADDRESS="${TEMPORAL_ADDRESS:-127.0.0.1:7233}"
+SIGNAL_BIN="${TEMPORAL_SIGNAL_BIN:-${CITY}/services/temporal-maintenance/bin/temporal-signal}"
+RIG="${TEMPORAL_MAINT_RIG:-gascity}"
+
+mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
+[[ -f "$STATE_FILE" ]] || echo '{"signalled":[]}' >"$STATE_FILE" 2>/dev/null || true
+
+log_event() {
+  printf '{"ts":"%s","event":"%s",%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >>"$AUDIT_LOG" 2>/dev/null || true
+}
+
+already_signalled() { jq -e --arg id "$1" '.signalled | index($id)' "$STATE_FILE" >/dev/null 2>&1; }
+mark_signalled() {
+  local tmp
+  tmp=$(mktemp) || return 0
+  # Append and keep the most-recent 500 by INSERTION order (no `unique`, which
+  # sorts and would drop the lexicographically-smallest ids rather than the oldest).
+  if jq --arg id "$1" '.signalled = ((.signalled + [$id]) | .[-500:])' "$STATE_FILE" >"$tmp" 2>/dev/null; then
+    mv "$tmp" "$STATE_FILE" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# Recently closed beads carrying the temporal marking. `bd list` has no --since;
+# the correct filter is --closed-after with an absolute RFC3339 cutoff.
+cutoff=$(date -u -d "-${SINCE_MIN} minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+if ! raw=$(gc bd --rig "$RIG" list --status closed --closed-after "$cutoff" --json 2>&1); then
+  log_event "list_failed" "\"err\":$(jq -Rn --arg e "$raw" '$e' 2>/dev/null || echo '""')"
+  exit 0
+fi
+mapfile -t rows < <(
+  jq -rc '.[]? | select(.metadata.temporal.cycle_key and .metadata.temporal.repo)
+          | {id, repo: .metadata.temporal.repo, cycle: .metadata.temporal.cycle_key}' <<<"$raw" 2>/dev/null || true
+)
+
+for row in "${rows[@]}"; do
+  [[ -z "$row" ]] && continue
+  id=$(jq -r '.id' <<<"$row")
+  repo=$(jq -r '.repo' <<<"$row")
+  cycle=$(jq -r '.cycle' <<<"$row")
+  already_signalled "$id" && continue
+
+  if "$SIGNAL_BIN" --address "$ADDRESS" --repo "$repo" --cycle "$cycle" \
+    --signal bead-closed --bead "$id" >>"$AUDIT_LOG" 2>&1; then
+    mark_signalled "$id"
+    log_event "signalled" "\"bead\":\"$id\",\"repo\":\"$repo\",\"cycle\":\"$cycle\""
+  else
+    # Fail-soft: workflow may have already completed, or Temporal is down. Do not
+    # mark, so a later run retries; never fail the order.
+    log_event "signal_skipped" "\"bead\":\"$id\",\"repo\":\"$repo\",\"cycle\":\"$cycle\""
+  fi
+done
+
+exit 0

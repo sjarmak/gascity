@@ -1,0 +1,6 @@
+[order]
+description = "When a worker raises a help request (bead -> status=blocked with metadata.help_request, per the 'When stuck' worker protocol), actively nudge the mayor so the ask is processed promptly instead of waiting for the next mail scan. Idempotent via gc.help_surfaced_at."
+trigger = "event"
+on = "bead.updated"
+exec = "/home/ds/gas-city/bin/help-request-surface"
+timeout = "60s"

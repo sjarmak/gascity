@@ -1,0 +1,10 @@
+# ci-hardening-check — mayor gc-431375 companion (gc-430901). Twice a month: nudge the
+# mayor to run the cross-only CI + guardrails pass of the codebase-audit workflow —
+# CI build-time/validity gaps + deterministic guardrails to add — folded into RFC #3789.
+# Lighter + more frequent than the full monthly audit.
+[order]
+description = "Twice a month (1st + 15th): nudge mayor to run the CI + guardrails cross-cut of the codebase-audit workflow (build-time + validity gaps + deterministic guardrails) and fold ship-now items into RFC #3789. Companion to the monthly full audit."
+trigger = "cron"
+schedule = "0 10 1,15 * *"
+exec = "/home/ds/gas-city/bin/codebase-audit-dispatch --focus ci"
+timeout = "2m"

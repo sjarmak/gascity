@@ -1,0 +1,6 @@
+[order]
+description = "Every 30m: fetch origin on gascity-packs-main, detached-checkout origin/main (self-heals -main onto the fork's pack-carrying ref — pr-pipeline/pr-review exist on origin/main but were removed from upstream/main), then rebuild + restart the slack adapter if the slack-pack/adapter SUBTREE sha on origin/main differs from the sentinel at ~/.gc/slack-adapter-last-built.txt. Idempotent: no-op (but still self-heals checkout) when the adapter subtree is unchanged. Motivated by PR #19 silent-staleness 2026-05-20 (adapter ran 11d-old code) + the 2026-05-30 pack-import breakage (old version checked out upstream/main, which lacks the fork-local packs, breaking gc session attach mayor)."
+trigger = "cooldown"
+interval = "30m"
+exec = "/home/ds/gas-city/bin/slack-adapter-rebuild"
+timeout = "5m"

@@ -1,0 +1,13 @@
+# resource-creep-report — daily monotonic-growth detector over the observability
+# time-series (gc-457861 Part B3). Diffs latest per-MCP RSS + supervisor cgroup vs a
+# ~7-day baseline; flags anything trending up >25% (the signal that would have caught
+# code-intel-copilot regrowing to 5GB over 3 weeks). Mails the mayor a one-line
+# summary ONLY on a creep flag (mayor routes to #all-agent-city morning digest;
+# city-infra-pl does not post Slack directly).
+[order]
+description = "Daily 07:10 EDT: monotonic-growth (creep) report over .gc/observability/resource-metrics.jsonl — per-MCP RSS + supervisor cgroup vs 7-day baseline, flags >25% growth, mails mayor for the #all-agent-city digest only when creep is found. gc-457861 B3."
+trigger = "cron"
+schedule = "10 7 * * *"
+exec = "/home/ds/gas-city/bin/resource-creep-report --nudge-mayor"
+timeout = "60s"
+idempotent = true

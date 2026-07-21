@@ -1,0 +1,23 @@
+# F01 pre-edit snapshot
+snapshot_utc: 20260720T044531Z
+epoch: 1784522731
+host: ds-5090  bead: dr-xe5k  source: rig:gascity:gc-wc3f
+
+## sha256 (pre-edit originals)
+b226dc9e148c0ac4fb36eb722d7db79e0361ac7dd03fbcca7815827c5c5dca6b  bin/approved-pr-automerge
+5d23ae7bf9811b02800992eb49d9de812111e914e335a8a491065be19cb5f37f  orders/approved-pr-automerge.toml
+3d5e5aa3a9a8649539fd2f5d16e08a02039a7d3e3c593ed68a7797226c3308d7  orders/approved-pr-automerge-packs.toml
+2e5b813dcf870ca347f561556f2a58843f17d1cbd69cd16d9d3bd1c6384d2144  /home/ds/gas-city-f01-dev/test_approved_pr_automerge_f01.py
+
+## sha256 (snapshot copies)
+b226dc9e148c0ac4fb36eb722d7db79e0361ac7dd03fbcca7815827c5c5dca6b  .gc-snapshots/F01-20260720T044531Z/approved-pr-automerge
+3d5e5aa3a9a8649539fd2f5d16e08a02039a7d3e3c593ed68a7797226c3308d7  .gc-snapshots/F01-20260720T044531Z/approved-pr-automerge-packs.toml
+5d23ae7bf9811b02800992eb49d9de812111e914e335a8a491065be19cb5f37f  .gc-snapshots/F01-20260720T044531Z/approved-pr-automerge.toml
+51e565cf0aff74251ee5bcf234c8baecf3d07d3e007625a8ec9bedd3f1e31646  .gc-snapshots/F01-20260720T044531Z/MANIFEST.txt
+2e5b813dcf870ca347f561556f2a58843f17d1cbd69cd16d9d3bd1c6384d2144  .gc-snapshots/F01-20260720T044531Z/test_approved_pr_automerge_f01.py.reference
+
+## mtimes (pre-edit originals)
+2026-07-03 13:00:18.398891407 -0400  bin/approved-pr-automerge
+2026-07-19 23:46:31.804088907 -0400  orders/approved-pr-automerge.toml
+2026-07-19 23:46:31.808987474 -0400  orders/approved-pr-automerge-packs.toml
+2026-07-20 00:37:39.126491624 -0400  /home/ds/gas-city-f01-dev/test_approved_pr_automerge_f01.py

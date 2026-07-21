@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""issue-covered-map-feeder: grow the covered-map from reviewer coverage judgments.
+
+Issue-hygiene covered-map feeder (mayor gc-430447, Stephanie GO). Closes the
+"fix merged, PR didn't say Closes, issue stayed open" gap WITHOUT contributor-
+facing CI. ZFC split: the reviewer MODEL judges coverage and emits a structured
+`covers_issue: #N` line into its review record; THIS script (mechanism) ingests
+those pairs into the canonical covered-map; the merge-watcher then auto-closes the
+issue when the PR merges. No keyword-scanning of PR bodies for meaning — the
+review record's explicit covers_issue field is the only signal read.
+
+Source: .gc/pr-pipeline/reviews/pr-<PR>.md — a `covers_issue: #N` (or `#N, #M`)
+line means "this PR (PR# from the filename) covers issue #N without a closing
+keyword." Appends `#<issue> -> PR#<pr>` rows to the CANONICAL covered-map
+(.gc/issue-hygiene-covered-map.txt — the file bin/issue-merge-watcher reads),
+deduped against existing rows. Idempotent: re-runs append nothing new.
+
+Default DRY-RUN (report would-append). --apply writes the rows.
+Audit: .gc/issue-covered-map-feeder.log (JSONL — source record + pair + ts).
+
+Usage: issue-covered-map-feeder [--apply] [--nudge-mayor] [--map PATH] [--reviews DIR] [--json]
+"""
+import sys, os, re, json, time, glob
+
+CITY = "/home/ds/gas-city"
+DEFAULT_MAP = os.path.join(CITY, ".gc", "issue-hygiene-covered-map.txt")
+REVIEWS_DIR = os.path.join(CITY, ".gc", "pr-pipeline", "reviews")
+AUDIT_LOG = os.path.join(CITY, ".gc", "issue-covered-map-feeder.log")
+COVERS_RE = re.compile(r"covers_issue\s*:\s*(.+)", re.IGNORECASE)
+ISSUE_RE = re.compile(r"#(\d+)")
+PR_FROM_NAME_RE = re.compile(r"pr-(\d+)\.md$")
+MAP_PAIR_RE = re.compile(r"#(\d+)\s*->\s*PR#(\d+)")
+
+
+def existing_pairs(map_path):
+    """Set of (issue, pr) already in the map."""
+    pairs = set()
+    try:
+        with open(map_path) as f:
+            for line in f:
+                m = MAP_PAIR_RE.search(line)
+                if m:
+                    pairs.add((int(m.group(1)), int(m.group(2))))
+    except OSError:
+        pass
+    return pairs
+
+
+def scan_reviews(reviews_dir):
+    """[(issue, pr, source_file)] from covers_issue: lines in review records."""
+    out = []
+    for path in sorted(glob.glob(os.path.join(reviews_dir, "pr-*.md"))):
+        mname = PR_FROM_NAME_RE.search(os.path.basename(path))
+        if not mname:
+            continue
+        pr = int(mname.group(1))
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError:
+            continue
+        for m in COVERS_RE.finditer(text):
+            for iss in ISSUE_RE.findall(m.group(1)):
+                out.append((int(iss), pr, os.path.basename(path)))
+    return out
+
+
+def main():
+    argv = sys.argv[1:]
+    apply = "--apply" in argv
+    nudge = "--nudge-mayor" in argv
+    json_out = "--json" in argv
+    map_path = argv[argv.index("--map") + 1] if "--map" in argv else DEFAULT_MAP
+    reviews_dir = argv[argv.index("--reviews") + 1] if "--reviews" in argv else REVIEWS_DIR
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+
+    have = existing_pairs(map_path)
+    found = scan_reviews(reviews_dir)
+    # New, deduped (against the map AND within this batch).
+    new, seen = [], set()
+    for issue, pr, src in found:
+        key = (issue, pr)
+        if key in have or key in seen:
+            continue
+        seen.add(key)
+        new.append({"issue": issue, "pr": pr, "source": src})
+
+    if apply and new:
+        try:
+            with open(map_path, "a") as f:
+                for n in new:
+                    f.write(f"#{n['issue']} -> PR#{n['pr']}\n")
+        except OSError as e:
+            print(f"issue-covered-map-feeder: append failed: {e}", file=sys.stderr)
+            return 1
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    summary = {"ts": now, "map": map_path, "review_pairs_found": len(found),
+               "existing_rows": len(have), "new_count": len(new), "apply": apply}
+    try:
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps({**summary, "new": new}) + "\n")
+    except OSError:
+        pass
+
+    if nudge and new and apply:
+        lines = [f"issue-covered-map-feeder: appended {len(new)} reviewer covers_issue pair(s) to "
+                 f"the covered-map (merge-watcher will auto-close on merge):"]
+        lines += [f"  #{n['issue']} -> PR#{n['pr']}  (from {n['source']})" for n in new]
+        import subprocess
+        subprocess.run(["gc", "mail", "send", "mayor", "-s",
+                        f"issue-covered-map-feeder: +{len(new)} covered pair(s)",
+                        "-m", "\n".join(lines)], capture_output=True, timeout=30)
+
+    if json_out:
+        print(json.dumps({"summary": summary, "new": new}, indent=2))
+        return 0
+    mode = "APPLY" if apply else "DRY-RUN"
+    print(f"issue-covered-map-feeder ({mode})  map={map_path}  covers_issue-pairs={len(found)}  "
+          f"existing={len(have)}  {'appended' if apply else 'would-append'}={len(new)}")
+    for n in new:
+        print(f"  {'appended' if apply else 'would-append'}: #{n['issue']} -> PR#{n['pr']}  (from {n['source']})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

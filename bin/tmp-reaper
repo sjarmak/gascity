@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# tmp-reaper: remove abandoned benchmark workspaces under /tmp.
+#
+# Benchmark/eval runs (scix, codeprobe, eb, mem, go builds) create multi-GB
+# scratch dirs under /tmp and routinely never clean them up. On a shared box
+# with a single disk volume (root + dolt + every worktree), that accumulation
+# is a real outage risk — on 2026-06-19 it reached 100% / 16G free with ~130G
+# of uncleaned /tmp workspaces. This reaper removes ONLY the unambiguous-dead
+# ones; ambiguous disk pressure is surfaced to mayor by resource-sweep.
+#
+# Selection criteria (ALL must hold for an entry to be reaped):
+#   - It is a DIRECTORY directly under the scan root (default /tmp)
+#   - Its basename matches the workspace allowlist (tmp.*, go-build*, mcp_*,
+#     plus $TMP_REAPER_EXTRA_GLOBS) — never arbitrary /tmp content
+#   - It is NOT a system dir (.X11-unix, .ICE-unix, systemd-private-*, …)
+#   - It is NOT a registered git worktree (those are stale-worktree-reaper's job)
+#   - Its mtime is older than $TMP_REAPER_THRESHOLD (default 24h) — beyond any
+#     active run's write cadence
+#   - No live process holds an open file under it (lsof guard)
+#
+# Action: rm -rf the directory. Every removal is audit-logged with size + age.
+#
+# Default mode is DRY-RUN. Pass --apply to actually remove.
+#
+# Companion to resource-sweep (surfaces ambiguous disk pressure, never deletes)
+# and stale-worktree-reaper (reaps git worktrees, which this reaper skips).
+#
+# Usage:
+#   tmp-reaper                  # dry-run report
+#   tmp-reaper --apply          # actually reap
+#   tmp-reaper --nudge-mayor    # nudge mayor when a reap happened (or under pressure)
+#   tmp-reaper --threshold 12h  # custom age threshold
+#
+# Library mode: set TMP_REAPER_LIB=1 to source only the functions (no scan),
+# for the standalone test.
+
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${TMP_REAPER_AUDIT_LOG:-${CITY}/.gc/tmp-reaper.log}"
+THRESHOLD="${TMP_REAPER_THRESHOLD:-24h}"
+SCAN_ROOT="${TMP_REAPER_SCAN_ROOT:-/tmp}"
+# Basename globs for benchmark/build scratch dirs. Conservative on purpose.
+ALLOW_GLOBS=(${TMP_REAPER_GLOBS:-'tmp.*' 'go-build*' 'mcp_*' 'mcp-*'} ${TMP_REAPER_EXTRA_GLOBS:-})
+# System dirs that live under /tmp and must never be touched.
+SYSTEM_RE='^(systemd-private-.*|\.X11-unix|\.XIM-unix|\.font-unix|\.ICE-unix|\.Test-unix|snap.*|ssh-.*|dbus-.*)$'
+
+threshold_to_seconds() {
+  local t="$1" num unit
+  num="${t%[smhd]}"; unit="${t##*[0-9]}"
+  case "$unit" in
+    s) echo "$num" ;;
+    m) echo "$((num * 60))" ;;
+    h) echo "$((num * 3600))" ;;
+    d) echo "$((num * 86400))" ;;
+    *) echo "$((num * 3600))" ;;  # bare number => hours
+  esac
+}
+
+# True if $1 (basename) matches any allowlist glob.
+_matches_allowlist() {
+  local base="$1" g
+  for g in "${ALLOW_GLOBS[@]}"; do
+    # shellcheck disable=SC2053
+    [[ "$base" == $g ]] && return 0
+  done
+  return 1
+}
+
+# INUSE_SET: newline-separated absolute paths under SCAN_ROOT that a live
+# process currently holds (cwd or any open fd). Built ONCE per run from a
+# single /proc pass — `lsof +D` per dir is O(filecount) and unusably slow on
+# multi-GB workspaces. Populate before scanning; classify_entry reads it.
+INUSE_SET=""
+_build_inuse_set() {
+  local pid
+  INUSE_SET="$(
+    for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+      readlink "/proc/$pid/cwd" 2>/dev/null
+      readlink /proc/"$pid"/fd/* 2>/dev/null
+    done | grep -aF "${SCAN_ROOT}/" | sort -u
+  )"
+}
+
+# True if a live process holds the dir $1 itself or anything beneath it.
+# Bash-native (no awk fork) — INUSE_SET is small (one entry per held path).
+_has_open_handle() {
+  [[ -n "$INUSE_SET" ]] || return 1
+  local p
+  while IFS= read -r p; do
+    [[ "$p" == "$1" || "$p" == "$1/"* ]] && return 0
+  done <<<"$INUSE_SET"
+  return 1
+}
+
+# True if $1 is a registered git worktree (skip — stale-worktree-reaper owns it).
+_is_git_worktree() {
+  [[ -e "$1/.git" ]]
+}
+
+# classify_entry <path> <now_epoch> <threshold_seconds>
+# Echoes one of: reap | keep:system | keep:pattern | keep:worktree |
+#                keep:recent | keep:in-use | keep:not-dir
+classify_entry() {
+  local path="$1" now="$2" thresh="$3" base mtime age
+  base="${path##*/}"               # no fork (vs basename)
+  [[ -d "$path" ]]                 || { echo "keep:not-dir";   return; }
+  [[ "$base" =~ $SYSTEM_RE ]]      && { echo "keep:system";    return; }
+  _matches_allowlist "$base"       || { echo "keep:pattern";   return; }
+  _is_git_worktree "$path"         && { echo "keep:worktree";  return; }
+  mtime="$(stat -c %Y "$path" 2>/dev/null)" || { echo "keep:recent"; return; }
+  age=$(( now - mtime ))
+  (( age < thresh ))               && { echo "keep:recent";    return; }
+  _has_open_handle "$path"         && { echo "keep:in-use";    return; }
+  echo "reap"
+}
+
+# Guard: when sourced as a library (by the test), stop here.
+[[ "${TMP_REAPER_LIB:-0}" == "1" ]] && return 0 2>/dev/null
+
+# ---- scan / act ----------------------------------------------------------
+APPLY=0
+NUDGE_MAYOR=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)       APPLY=1; shift ;;
+    --nudge-mayor) NUDGE_MAYOR=1; shift ;;
+    --threshold)   THRESHOLD="$2"; shift 2 ;;
+    -h|--help)     sed -n 's/^# \{0,1\}//p' "$0" | head -34; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$(dirname "$AUDIT_LOG")"
+now=$(date +%s)
+thresh=$(threshold_to_seconds "$THRESHOLD")
+ts="$(date -Iseconds)"
+
+_build_inuse_set   # one /proc pass; classify_entry reads INUSE_SET
+
+# Iterate ONLY the allowlisted globs, not all of $SCAN_ROOT — /tmp routinely
+# holds hundreds of thousands of unrelated entries, and a subshell per entry
+# would take minutes. nullglob => non-matching patterns vanish.
+shopt -s nullglob
+candidates=()
+for g in "${ALLOW_GLOBS[@]}"; do candidates+=( "$SCAN_ROOT"/$g ); done
+shopt -u nullglob
+
+reaped=0
+freed_kb=0
+report=""
+for path in "${candidates[@]}"; do
+  decision="$(classify_entry "$path" "$now" "$thresh")"
+  [[ "$decision" == "reap" ]] || continue
+  size_kb=$(du -sk "$path" 2>/dev/null | cut -f1); size_kb=${size_kb:-0}
+  age_h=$(( (now - $(stat -c %Y "$path" 2>/dev/null || echo "$now")) / 3600 ))
+  line="$(printf '%-7s %6.1fG  age=%sh  %s' "$([[ $APPLY == 1 ]] && echo REAPED || echo WOULD)" "$(awk "BEGIN{print $size_kb/1048576}")" "$age_h" "$path")"
+  report+="$line"$'\n'
+  if [[ $APPLY == 1 ]]; then
+    rm -rf "$path" 2>/dev/null && { echo "$ts REAPED $size_kb KB age=${age_h}h $path" >>"$AUDIT_LOG"; }
+  fi
+  reaped=$((reaped + 1))
+  freed_kb=$((freed_kb + size_kb))
+done
+
+freed_g=$(awk "BEGIN{printf \"%.1f\", $freed_kb/1048576}")
+disk_use=$(df -h "$SCAN_ROOT" | awk 'NR==2{print $5" used, "$4" free"}')
+summary="tmp-reaper: $([[ $APPLY == 1 ]] && echo reaped || echo "would reap (dry-run)") ${reaped} workspace(s), ${freed_g}G — ${SCAN_ROOT} now ${disk_use}"
+echo "$summary"
+[[ -n "$report" ]] && echo "$report"
+[[ $APPLY == 1 && $reaped -gt 0 ]] && echo "$ts SUMMARY ${reaped} dirs ${freed_g}G | $disk_use" >>"$AUDIT_LOG"
+
+if [[ $NUDGE_MAYOR == 1 && $reaped -gt 0 && $APPLY == 1 ]]; then
+  gc mail send --to mayor -s "tmp-reaper: reclaimed ${freed_g}G from ${reaped} dead /tmp workspace(s)" \
+    -m "$summary"$'\n\n'"$report" >/dev/null 2>&1 || true
+fi
+
+exit 0

@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/ds/gas-city/bin/mayor-context-handoff-check"
+          }
+        ]
+      }
+    ]
+  }
+}

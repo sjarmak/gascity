@@ -1,0 +1,115 @@
+description = """
+Simple work formula — read the bead, do what it says, close it.
+
+This is the minimal work lifecycle for coding agents. No git branching,
+no worktree isolation, no refinery handoff. The agent reads the bead's
+description, implements the solution in the current working directory,
+and closes the bead when done.
+
+Use this for demos and simple single-agent workflows. For production
+multi-agent setups with branch isolation and merge review, use
+mol-polecat-work instead.
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| issue | caller | The work bead ID assigned to this agent |
+"""
+formula = "mol-do-work"
+phase = "vapor"
+# pour=true: eager-materialize graph.v2 steps; without it vapor+graph.v2 strands
+# (compile.go:325 RootOnly bug). Verified 2026-06-30.
+pour = true
+version = 2
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars]
+[vars.issue]
+description = "The work bead ID assigned to this agent"
+required = true
+
+[[steps]]
+id = "do-work"
+title = "Read assignment, implement, and close"
+description = """
+You have been assigned a work bead. Read it, do the work, and close it.
+
+**1. Read your assignment:**
+```bash
+bd show {{issue}}
+```
+
+Read the bead's title and description carefully. This is your task.
+
+**2. Implement the solution:**
+
+Do exactly what the bead describes. Follow existing codebase conventions.
+Make atomic, focused commits as you work:
+```bash
+git add <files>
+git commit -m "<type>: <description>"
+```
+
+**3. Close the bead when done:**
+
+First check whether your rig has a close-gate policy that requires evidence metadata before close — read your rig's `CLAUDE.md` for a "Bead Close Ritual" section. If one exists, set the required `evidence.*` fields before the status update. Example shape (specifics vary per rig):
+
+```bash
+bd update {{issue}} \
+  --set-metadata "evidence.artifact_path=git:<commit-sha>" \
+  --set-metadata "evidence.reviewer_verdict=<pass|fail|pass-with-caveats>" \
+  --set-metadata "evidence.reviewer_agent=<your-agent-name>"
+```
+
+**Critical:** if you reference a `git:<sha>` as evidence, the commit MUST be reachable from your rig's default branch (typically `main` or `master`). A feature-branch-only commit is NOT shipped. Verify before close:
+
+```bash
+git merge-base --is-ancestor <commit-sha> main && echo "OK: merged" || echo "NOT MERGED — do not close yet"
+```
+
+**3a. Loop-close summary (REQUIRED when bead has `metadata.originating_slack.*`)**
+
+Check whether this bead was slung in response to a Slack ask:
+
+```bash
+bd show {{issue}} --json | jq -r '.[0].metadata.originating_slack // empty'
+```
+
+If the output is non-empty, you MUST write `metadata.summary_for_human` before closing. The PL loop-close handler (`bin/pl-loop-close`, gc order `pl-loop-close`) reads this field and posts it as a threaded reply to the originating Slack thread. Format: 1-3 plain sentences, no markdown, no emoji. Say what the human asked for and what you delivered (or why you couldn't):
+
+```bash
+bd update {{issue}} \
+  --set-metadata "summary_for_human=Reviewed PR #1969. Verdict: pass-with-caveats — the CI fix is correct but one test assertion is too loose; recommended a follow-up. Full scorecard in evidence path."
+```
+
+If you omit this on a slack-originated bead, the handler posts a degraded reply naming the gap.
+
+Then close:
+```bash
+bd update {{issue}} --status=closed --notes "Done: <brief summary of what you did>"
+```
+
+If your close gets reopened within an hour, the close-gate-reaper rejected your close — re-read the rig's `CLAUDE.md` for the required metadata fields and re-close with them set.
+
+If you get stuck or need clarification, check your inbox:
+```bash
+gc mail inbox
+```
+
+**Exit criteria:** The work described in the bead is complete and the bead is closed."""
+
+[[steps]]
+id = "drain"
+title = "Signal completion"
+needs = ["do-work"]
+description = """
+Work is done. Signal the controller to reclaim this session:
+
+```bash
+gc runtime drain-ack
+```
+
+Run this command and nothing else."""

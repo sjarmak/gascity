@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# morning-triage-cycle: daily 7am EDT trigger for the triage → PR loop.
+#
+# Slings mol-pr-triage to the gascity polecat pool. The polecat produces a
+# 3-section briefing (in-flight / needs-your-call / skipped) and the
+# loop-close handler posts it to slack #gascity-maintenance via the PL.
+#
+# Why exec-based instead of formula+pool order shape:
+#
+#   Orders with `formula = "..." + pool = "..."` are silently broken upstream
+#   (gastownhall/gascity#1440 — wisp roots stamp `order-run:` label which
+#   trips hasOpenWorkStrict on subsequent ticks; fix in flight as PR #1986).
+#   Until #1986 lands + supervisor restarts pick up the new binary, every
+#   formula+pool order silently stops firing after the first execution.
+#
+#   Workaround: wrap the sling in an exec-based script. The order machinery
+#   only sees an exec invocation; wisp roots created by the inner gc-sling
+#   call don't propagate back to the order's gating logic.
+#
+# Once #1986 is merged + supervisor restarted, this can be replaced with
+# a native formula+pool order; the wrapper becomes vestigial.
+#
+# Usage:
+#   morning-triage-cycle                # sling triage
+#   morning-triage-cycle --dry-run      # report only
+
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${CITY}/.gc/morning-triage-cycle.log"
+POLECAT_TARGET="${MORNING_TRIAGE_POLECAT:-/home/ds/gascity/polecat}"
+LIMIT="${MORNING_TRIAGE_LIMIT:-30}"
+# Cron-triggered dispatch: post results top-level to the gascity-maintenance
+# channel rather than threaded into a stale @mayor message. The handler at
+# bin/pl-loop-close branches on loop_close_top_level.
+TARGET_CHANNEL="${MORNING_TRIAGE_TARGET_CHANNEL:-C0B25SS12CD}"
+TARGET_PL_AGENT="${MORNING_TRIAGE_PL_AGENT:-gascity-maintenance-pl}"
+
+DRY_RUN=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) sed -n 's/^# \{0,1\}//p' "$0" | head -25; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+log_event() {
+  local event="$1" detail="${2:-}"
+  local ts
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq -nc --arg ts "$ts" --arg event "$event" --arg detail "$detail" \
+    '{ts: $ts, event: $event, detail: $detail}' >> "$AUDIT_LOG"
+}
+
+DATE_TAG=$(date -u +%Y%m%d)
+BEAD_TITLE="Morning triage cycle ${DATE_TAG} — briefing for Stephanie"
+
+if (( DRY_RUN )); then
+  echo "[dry-run] would create bead: $BEAD_TITLE"
+  echo "[dry-run] would sling to: $POLECAT_TARGET via mol-pr-triage --var limit=$LIMIT"
+  exit 0
+fi
+
+# Create a tracking bead in the gascity rig so the polecat can attach the
+# briefing as evidence + loop-close fires on close.
+#
+# Use the canonical `gc bd --rig gascity create` form, NOT `cd /home/ds/gascity
+# && bd create`. The bare-bd form failed under the controller's exec context
+# (2026-05-13 + 2026-05-15: "bead_create_failed: couldn't extract bead id")
+# while working under an interactive shell — gc resolves the rig + provider
+# correctly from any exec context, bare bd does not.
+BEAD_ID=$(gc bd --rig gascity create "$BEAD_TITLE" \
+  --priority 2 \
+  --label "morning-triage-cycle,rig:gascity" \
+  --body-file - <<EOF 2>&1 | grep -oE 'gc-[a-z0-9]+' | head -1
+Daily 7am EDT triage cycle. Polecat runs mol-pr-triage, produces the 3-section
+briefing (in-flight / needs-your-call / skipped) per dr-s0xu73 design, writes
+result to /home/ds/gas-city/.gc/pr-pipeline/morning-briefing/${DATE_TAG}.md, and surfaces via
+loop-close to slack #gascity-maintenance.
+
+vars: limit=$LIMIT, category=all
+EOF
+)
+
+if [[ -z "$BEAD_ID" ]]; then
+  log_event "bead_create_failed" "couldn't extract bead id"
+  exit 1
+fi
+
+log_event "bead_created" "$BEAD_ID"
+
+# Stamp loop-close metadata so pl-loop-close routes the close back to
+# slack as a TOP-LEVEL post on TARGET_CHANNEL (not a threaded reply to
+# some stale message). originating_slack.thread_ts is intentionally
+# empty — loop_close_top_level=true relaxes the threaded-reply gate
+# in the handler.
+ASKED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+LOOP_CLOSE_METADATA=$(jq -nc \
+  --arg channel "$TARGET_CHANNEL" \
+  --arg asked_at "$ASKED_AT" \
+  --arg pl "$TARGET_PL_AGENT" \
+  '{originating_slack: {channel_id: $channel, thread_ts: "", asked_at: $asked_at, user_id: ""},
+    originating_pl_agent: $pl,
+    loop_close_top_level: "true"}')
+
+if ! gc bd --rig gascity update "$BEAD_ID" --metadata "$LOOP_CLOSE_METADATA" >/dev/null 2>&1; then
+  log_event "loop_close_metadata_failed" "bead=$BEAD_ID"
+  # Don't exit — the bead and sling are still useful even without
+  # the loop-close routing. The polecat will produce the report and
+  # mayor can pick it up manually.
+fi
+
+# Sling to polecat (gc-sling wrapper auto-injects --nudge to wake idle pool)
+if gc-sling "$POLECAT_TARGET" "$BEAD_ID" \
+     --on mol-pr-triage \
+     --var "limit=$LIMIT" \
+     --var "category=all" >/dev/null 2>&1; then
+  log_event "slung" "bead=$BEAD_ID pool=$POLECAT_TARGET"
+else
+  log_event "sling_failed" "bead=$BEAD_ID"
+  exit 1
+fi
+
+exit 0

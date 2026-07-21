@@ -1,0 +1,25 @@
+# unlabeled-assignee-sensor — durable guard for dr-2d9c (mayor, 2026-07-15).
+#
+# WHY: `assigned + unlabeled` is the worst reachable state in the city dolt
+# store. A bead assigned to a label-pulling consumer (city-infra-pl) but
+# lacking that consumer's pulling label (`city-infra`) LOOKS owned in every
+# rollup while being invisible to `bd list --label city-infra` — the PL's ONLY
+# work-discovery query — and NOTHING raises an error. Measured 2026-07-15: 9 of
+# 11 city-infra-pl beads were unlabeled, both its P0s among them, one stranded
+# since 2026-07-14. It even produced a false fleet-wide "PL is capacity-bound"
+# diagnosis. Hand-remediated that tick; this order is the durable detector.
+#
+# WHAT: lists each label-puller's open/in_progress beads, flags any missing the
+# pulling label, mails mayor + the PL cooldown-deduped (6h/bead) with the
+# one-line fix. Read-only + mail; no destructive action, so no dry-run gate.
+# Detection verified 2026-07-16 against a deliberately-unlabeled test bead.
+#
+# UNDO: retire (rename to .disabled) only if the label-pull discovery model is
+# replaced (see agents/city-infra-pl/prompt.md); the sensor is moot then.
+[order]
+description = "Every 30m: flag city dolt beads that are assigned to a label-pulling consumer (city-infra-pl) but lack its pulling label (city-infra) — the assigned-but-unreachable class that looks owned in every rollup while being invisible to the PL's only work query and raising no error (dr-2d9c). Mails mayor + the PL, cooldown-deduped per bead."
+trigger = "cooldown"
+interval = "30m"
+exec = "/home/ds/gas-city/bin/unlabeled-assignee-sensor --nudge-mayor"
+timeout = "90s"
+idempotent = true

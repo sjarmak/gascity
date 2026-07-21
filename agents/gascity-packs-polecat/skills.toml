@@ -1,0 +1,24 @@
+# skills.toml — gascity-packs-polecat
+#
+# INFORMATIONAL ALLOWLIST for v1.5. Same convention as
+# agents/gascity-maintenance-pl/skills.toml.
+#
+# Tracked in dr-45le2r.
+
+skills = [
+    "focus",
+    "diverge-prototype",
+    "premortem",
+    "brainstorm",
+    "scaffold",
+    "bisect",
+    "stress-test",
+    "tdd-workflow",
+    "verification-loop",
+    "strategic-compact",
+    "security-review",
+    "code-review",
+    "simplify",
+    "review-pr",
+    "de-slopify",
+]

@@ -1,0 +1,6 @@
+[order]
+description = "Weekly Monday 08:30: aggregated digest of recurring infrastructure failures from watchdog/surfacer/janitor/reaper logs. Migrated from systemd timer."
+trigger = "cron"
+schedule = "30 8 * * 1"
+exec = "/home/ds/gas-city/bin/mayor-pattern-miner --nudge-mayor"
+timeout = "5m"

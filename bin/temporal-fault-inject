@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# temporal-fault-inject — RED-proof fault-injection harness for the Temporal
+# maintenance soak's OUTCOME detector (bin/temporal-soak-check). gc-4zf.2 Track B.
+#
+# Injects ONE controlled fault against a THROWAWAY artifact and proves three
+# things about the detector, in the two directions that make the proof non-vacuous:
+#   1. DETECT      — with the fault present, check D goes RED and names it.
+#   2. LIVE-SAFE   — the real (--push) order EXCLUDES the test artifact, so a
+#                    live soak run could never escalate it to the mayor.
+#   3. RESTORE     — with the fault removed, the detector goes green on it again.
+# Each phase records a latency (ms).
+#
+# RED-proof rule (gc-4zf.2, non-negotiable): a detector assertion is vacuous
+# unless the detector is shown to FAIL against the broken system AND pass against
+# the healthy one. Phase 1 is the "fires" direction; phases 2 and 3 are the two
+# "does-not-fire" directions.
+#
+# SAFE BY CONSTRUCTION:
+#   * the only artifact created is a throwaway gascity bead tagged
+#     `soak-shadow-throwaway`, which check D excludes from the LIVE order, so even
+#     a leftover never escalates;
+#   * soak-check is invoked WITHOUT --push (dry-run: prints, never posts to Slack
+#     or nudges the mayor) against an ISOLATED state file + audit log in a scratch
+#     dir, so the live order's dedup state is never perturbed;
+#   * the throwaway is DELETED unconditionally on exit (trap);
+#   * it never kills a worker, never restarts the supervisor/city, never touches a
+#     real maintenance cycle.
+set -euo pipefail
+
+CITY="${GC_CITY_ROOT:-/home/ds/gas-city}"
+SOAK="${CITY}/bin/temporal-soak-check"
+RIG="${TEMPORAL_FAULT_RIG:-gascity}"
+INJECTION="${1:-orphan-bead}"
+
+command -v gc >/dev/null 2>&1 || { echo "FATAL: gc not on PATH" >&2; exit 1; }
+[[ -x "$SOAK" ]] || { echo "FATAL: soak-check not executable at $SOAK" >&2; exit 1; }
+
+case "$INJECTION" in
+  orphan-bead) ;;
+  *) echo "FATAL: unsupported injection '$INJECTION' (supported: orphan-bead)" >&2; exit 2 ;;
+esac
+
+ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
+now() { date +%s%3N; }   # epoch milliseconds
+
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/temporal-fault-inject.XXXXXX")"
+STATE="${SCRATCH}/state.json"; echo '{}' > "$STATE"
+ALOG="${SCRATCH}/audit.log"
+
+THROWAWAY=""
+cleanup() {
+  local rc=$?
+  if [[ -n "$THROWAWAY" ]]; then
+    if gc bd --rig "$RIG" delete "$THROWAWAY" --force >/dev/null 2>&1; then
+      echo "$(ts) cleanup: deleted throwaway $THROWAWAY"
+    else
+      echo "$(ts) cleanup: WARN could not delete $THROWAWAY — closing as fallback" >&2
+      gc bd --rig "$RIG" close "$THROWAWAY" >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -rf "$SCRATCH"
+}
+trap cleanup EXIT
+
+# soak_run <include_shadow 0|1> -> prints the dry-run findings block.
+# No --push => dry-run: prints, never posts/nudges. ORPHAN_MIN=0 so a freshly
+# created throwaway already counts as "past the orphan threshold".
+soak_run() {
+  local incl="$1"
+  TEMPORAL_SOAK_STATE="$STATE" \
+  TEMPORAL_SOAK_AUDIT_LOG="$ALOG" \
+  TEMPORAL_SOAK_ORPHAN_MIN=0 \
+  TEMPORAL_SOAK_CALL_TIMEOUT="${TEMPORAL_FAULT_CALL_TIMEOUT:-8}" \
+  TEMPORAL_SOAK_INCLUDE_SHADOW="$incl" \
+    "$SOAK" 2>/dev/null || true   # dry-run always exits 0; tolerate regardless
+}
+
+fail() { echo "❌ RED-PROOF FAILED: $*" >&2; exit 1; }
+
+echo "== temporal-fault-inject: injection=$INJECTION rig=$RIG =="
+
+# Phase 0 — baseline hygiene. A leftover throwaway from a prior crashed run would
+# make the proof ambiguous; surface it (do not auto-delete another run's state).
+pre=$(gc bd --rig "$RIG" list --label soak-shadow-throwaway --status open --json 2>/dev/null \
+        | jq -r '.[].id' 2>/dev/null | tr '\n' ' ' | sed 's/ *$//' || true)
+[[ -z "$pre" ]] || echo "$(ts) WARN pre-existing soak-shadow-throwaway bead(s): $pre" >&2
+
+# Phase 1 — INJECT then DETECT (the "detector fires" direction).
+t0=$(now)
+THROWAWAY=$(gc bd --rig "$RIG" q \
+  "SOAK-SHADOW throwaway: orphan-bead fault injection (gc-4zf.2) — auto-deleted" \
+  -t task -p 3 -l maintenance-cycle,soak-shadow-throwaway 2>/dev/null | tr -d '[:space:]')
+[[ -n "$THROWAWAY" ]] || fail "could not create throwaway bead"
+echo "$(ts) injected orphan throwaway: $THROWAWAY"
+
+det_out="$(soak_run 1)"
+t1=$(now)
+grep -q "$THROWAWAY" <<<"$det_out" \
+  || fail "detector did NOT flag injected orphan $THROWAWAY (check D blind)"
+lat_detect=$(( t1 - t0 ))
+echo "✅ DETECTED: check D flagged $THROWAWAY  (latency ${lat_detect}ms)"
+
+# Phase 2 — LIVE-SAFETY (a "detector does NOT fire" direction). With shadow
+# EXCLUDED — exactly what the real --push order does — the throwaway must not
+# appear, proving a live run would never escalate a test artifact.
+safe_out="$(soak_run 0)"
+if grep -q "$THROWAWAY" <<<"$safe_out"; then
+  fail "live (--push) order would ESCALATE throwaway $THROWAWAY (exclusion broken)"
+fi
+echo "✅ LIVE-SAFE: real order excludes $THROWAWAY (no false escalation)"
+
+# Phase 3 — RESTORE (the second "detector does NOT fire" direction). Remove the
+# fault; the detector must go green on it again.
+gone="$THROWAWAY"
+if ! gc bd --rig "$RIG" delete "$gone" --force >/dev/null 2>&1; then
+  # delete needs --force to actually remove (without it the CLI only previews);
+  # close is the fallback — it also drops the bead from check D's --status open scan.
+  gc bd --rig "$RIG" close "$gone" >/dev/null 2>&1 || fail "could not remove throwaway $gone"
+fi
+THROWAWAY=""   # removed; disarm the trap's re-delete
+t2=$(now)
+rest_out="$(soak_run 1)"
+grep -q "$gone" <<<"$rest_out" \
+  && fail "detector still flags $gone after removal (no restoration)"
+lat_restore=$(( $(now) - t2 ))
+echo "✅ RESTORED: $gone gone from detector  (latency ${lat_restore}ms)"
+
+echo "== PASS: orphan-bead RED-proof complete (detect ${lat_detect}ms, restore ${lat_restore}ms) =="

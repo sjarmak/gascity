@@ -1,0 +1,10 @@
+# Added 2026-07-18 for dr-wjza: mechanically reconcile persisted cross-rig
+# handoffs and reopen prematurely closed sources. Remove when a native Gas City
+# cross-store handoff primitive provides equivalent materialization and gating.
+[order]
+description = "Reconcile persisted cross-rig handoffs and enforce source close gates"
+trigger = "cooldown"
+interval = "2m"
+exec = "/home/ds/gas-city/bin/cross-rig-handoff scan --apply --nudge-mayor"
+timeout = "5m"
+idempotent = true

@@ -1,0 +1,6 @@
+[order]
+description = "When an agent mails a dead-letter recipient (human, stephanie, sjarmak), repost a copy to mayor so the message actually gets surfaced via slack. dr-o3he9r."
+trigger = "event"
+on = "mail.sent"
+exec = "/home/ds/gas-city/bin/mail-redirect-to-mayor"
+timeout = "60s"

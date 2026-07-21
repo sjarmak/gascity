@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""F01 focused negative-test artifact for approved-pr-automerge.
+
+Covers the full REJECTION MATRIX (structured quality evidence + separate action
+authorization) plus the POSITIVE two-gate case, per gc-wc3f acceptance criteria.
+
+Isolation: every fixture writes only to a per-run temp dir. The review and
+authorization roots are overridden via env / explicit args, so NO fixture can
+read or write the live city's .gc. Part C asserts that override actually holds.
+
+Run (exact command):
+    cd /home/ds/gas-city-f01-dev && python3 test_approved_pr_automerge_f01.py
+
+Also usable under pytest:
+    cd /home/ds/gas-city-f01-dev && python3 -m pytest -q test_approved_pr_automerge_f01.py
+"""
+import importlib.util
+import json
+import os
+import tempfile
+import time
+from importlib.machinery import SourceFileLoader
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCRIPT = os.path.join(HERE, "approved-pr-automerge")
+
+
+def _load(mod_name):
+    """Load the hyphenated, extension-less script as a fresh module (explicit
+    loader — spec_from_file_location can't infer one without a .py suffix)."""
+    loader = SourceFileLoader(mod_name, SCRIPT)
+    spec = importlib.util.spec_from_loader(mod_name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+apm = _load("apm_f01")
+
+REPO = "gastownhall/gascity"
+PR = 1300
+HEAD = "a" * 40           # exact current remote head SHA
+OLD = "b" * 40            # a superseded (stale) head SHA
+NOW = 1_800_000_000       # fixed reference "now" (deterministic)
+FUTURE = NOW + 3600
+PAST = NOW - 3600
+
+
+def _iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def evidence(**over):
+    e = {"schema": apm.QUALITY_SCHEMA, "repository": REPO, "pr": PR,
+         "head_sha": HEAD, "codex_ran": True,
+         "reviewer": {"identity": "gascity-review-mol", "provider": "codex+claude"},
+         "verdict": "PASS"}
+    e.update(over)
+    return e
+
+
+def authz(**over):
+    a = {"schema": apm.AUTHZ_SCHEMA, "repository": REPO, "pr": PR,
+         "head_sha": HEAD, "action": "merge",
+         "expires_at": _iso(FUTURE), "authorized_by": "gascity-maintenance-pl"}
+    a.update(over)
+    return a
+
+
+# (name, evidence|None, authz|None, current_head, expect_decision, expect_reason)
+MATRIX = [
+    # --- Gate 1: structured quality evidence ---
+    ("codex-did-not-run",        evidence(codex_ran=False), authz(), HEAD, "reject", "codex-did-not-run"),
+    ("mere-codex-mention",       None,                      authz(), HEAD, "reject", "no-structured-evidence"),
+    ("wrong-repo",               evidence(repository="octocat/hello"), authz(), HEAD, "reject", "wrong-repo"),
+    ("wrong-pr",                  evidence(pr=9999),         authz(), HEAD, "reject", "wrong-pr"),
+    ("head-sha-missing",         evidence(head_sha=""),     authz(), HEAD, "reject", "head-sha-missing"),
+    ("head-sha-mismatch",        evidence(head_sha=OLD),    authz(), HEAD, "reject", "head-sha-mismatch"),
+    ("stale-head-vs-current",    evidence(head_sha=HEAD),   authz(), OLD,  "reject", "head-sha-mismatch"),
+    ("verdict-not-pass",         evidence(verdict="FAIL"),  authz(), HEAD, "reject", "verdict-not-pass"),
+    ("reviewer-identity-missing", evidence(reviewer={}),    authz(), HEAD, "reject", "reviewer-identity-missing"),
+    ("unknown-evidence-schema",  evidence(schema="bogus/v9"), authz(), HEAD, "reject", "evidence-schema-unknown"),
+    # quality-first ordering: quality fails AND authz missing -> quality reason wins
+    ("quality-first-ordering",   evidence(codex_ran=False), None,    HEAD, "reject", "codex-did-not-run"),
+    # --- Gate 2: separate action authorization (quality already passes) ---
+    ("authorization-missing",    evidence(),                None,    HEAD, "reject", "authorization-missing"),
+    ("authorization-expired",    evidence(),                authz(expires_at=_iso(PAST)), HEAD, "reject", "authorization-expired"),
+    ("authorization-wrong-action", evidence(),              authz(action="close"), HEAD, "reject", "authorization-wrong-action"),
+    ("authorization-repo-mismatch", evidence(),             authz(repository="octocat/hello"), HEAD, "reject", "authorization-mismatch"),
+    ("authorization-pr-mismatch", evidence(),               authz(pr=9999), HEAD, "reject", "authorization-mismatch"),
+    ("authorization-head-mismatch", evidence(),             authz(head_sha=OLD), HEAD, "reject", "authorization-mismatch"),
+    ("authorization-no-expiry",  evidence(),                authz(expires_at=None), HEAD, "reject", "authorization-no-expiry"),
+    ("authorization-unknown-schema", evidence(),            authz(schema="bogus/v9"), HEAD, "reject", "authorization-schema-unknown"),
+    # --- Positive: exact-head Codex PASS + separate matching current authorization ---
+    ("positive-two-gate",        evidence(),                authz(), HEAD, "enable", "two-gate-pass"),
+]
+
+
+def run_matrix():
+    results = []
+    for name, ev, az, head, exp_dec, exp_reason in MATRIX:
+        dec, reason = apm.two_gate_enable(ev, az, REPO, PR, head, NOW)
+        ok = (dec == exp_dec and reason == exp_reason)
+        results.append((name, ok, exp_dec, exp_reason, dec, reason))
+    return results
+
+
+def run_file_and_root_override():
+    """Exercise read_evidence/read_authorization through the overridable roots,
+    and prove file mtime does NOT confer currency (fresh mtime, stale head SHA)."""
+    results = []
+    with tempfile.TemporaryDirectory(prefix="apm-f01-") as td:
+        reviews = os.path.join(td, "reviews")
+        authzs = os.path.join(td, "authorizations")
+        os.makedirs(reviews)
+        os.makedirs(authzs)
+        rec = os.path.join(reviews, f"{apm.RECORD_PREFIX}{PR}.md")
+
+        # (a) prose-only "codex" mention, no structured block -> no evidence
+        with open(rec, "w") as f:
+            f.write("# Review\nCodex looked at this and it seems fine. approve.\n")
+        ev = apm.read_evidence(PR, reviews_dir=reviews)
+        results.append(("file:prose-mention-no-block", ev is None, "None", "None",
+                        "None" if ev is None else "dict", ""))
+
+        # (b) fresh mtime on a STALE-head structured review -> still rejected.
+        block = ("<!--automerge-quality-evidence\n"
+                 + json.dumps(evidence(head_sha=OLD)) + "\nautomerge-quality-evidence-->\n")
+        with open(rec, "w") as f:
+            f.write("# Review\n" + block)
+        os.utime(rec, (time.time(), time.time()))     # touch to NOW (freshest possible)
+        ev = apm.read_evidence(PR, reviews_dir=reviews)
+        dec, reason = apm.two_gate_enable(ev, authz(), REPO, PR, HEAD, NOW)
+        ok = (dec == "reject" and reason == "head-sha-mismatch")
+        results.append(("file:fresh-mtime-stale-head", ok, "reject", "head-sha-mismatch", dec, reason))
+
+        # (c) positive round-trip via files in the overridden roots
+        with open(rec, "w") as f:
+            f.write("# Review\n<!--automerge-quality-evidence\n"
+                    + json.dumps(evidence()) + "\nautomerge-quality-evidence-->\n")
+        with open(os.path.join(authzs, f"{apm.RECORD_PREFIX}{PR}.json"), "w") as f:
+            json.dump(authz(), f)
+        ev = apm.read_evidence(PR, reviews_dir=reviews)
+        az = apm.read_authorization(PR, authz_dir=authzs)
+        dec, reason = apm.two_gate_enable(ev, az, REPO, PR, HEAD, NOW)
+        ok = (dec == "enable" and reason == "two-gate-pass")
+        results.append(("file:positive-round-trip", ok, "enable", "two-gate-pass", dec, reason))
+    return results
+
+
+def run_root_isolation():
+    """Assert the env overrides actually relocate the roots off the live city."""
+    results = []
+    with tempfile.TemporaryDirectory(prefix="apm-f01-city-") as td:
+        saved = dict(os.environ)
+        try:
+            os.environ["APPROVED_AUTOMERGE_CITY"] = td
+            os.environ.pop("APPROVED_AUTOMERGE_REVIEWS_DIR", None)
+            os.environ.pop("APPROVED_AUTOMERGE_AUTHORIZATIONS_DIR", None)
+            mod = _load("apm_f01_iso")
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+        under_td = mod.REVIEWS_DIR.startswith(td) and mod.AUTHORIZATIONS_DIR.startswith(td)
+        off_live = ("/home/ds/gas-city/.gc" not in mod.REVIEWS_DIR
+                    and "/home/ds/gas-city/.gc" not in mod.AUTHORIZATIONS_DIR)
+        results.append(("root-override-relocates-off-live", bool(under_td and off_live),
+                        "under-tmp", "under-tmp",
+                        "under-tmp" if under_td else mod.REVIEWS_DIR,
+                        "off-live" if off_live else "TOUCHES-LIVE"))
+    return results
+
+
+def all_results():
+    return run_matrix() + run_file_and_root_override() + run_root_isolation()
+
+
+# --- pytest entry points ------------------------------------------------------
+def test_full_rejection_matrix_and_positive():
+    for name, ok, exp_dec, exp_reason, dec, reason in all_results():
+        assert ok, f"{name}: expected ({exp_dec},{exp_reason}) got ({dec},{reason})"
+
+
+# --- standalone runner (prints per-case results) ------------------------------
+def _main():
+    rows = all_results()
+    width = max(len(r[0]) for r in rows)
+    passed = 0
+    print(f"F01 negative-test matrix  script={SCRIPT}")
+    print("-" * (width + 48))
+    for name, ok, exp_dec, exp_reason, dec, reason in rows:
+        status = "PASS" if ok else "FAIL"
+        if ok:
+            passed += 1
+        print(f"  [{status}] {name.ljust(width)}  -> ({dec},{reason})"
+              + ("" if ok else f"   EXPECTED ({exp_dec},{exp_reason})"))
+    print("-" * (width + 48))
+    print(f"{passed}/{len(rows)} cases passed")
+    return 0 if passed == len(rows) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

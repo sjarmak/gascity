@@ -1,0 +1,583 @@
+goroutine 4234 [running]:
+runtime/pprof.writeGoroutineStacks({0x672d7a0, 0x1264ea14000})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/runtime/pprof/pprof.go:819 +0x6b
+runtime/pprof.writeGoroutine({0x672d7a0?, 0x1264ea14000?}, 0x126a8a807b8?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/runtime/pprof/pprof.go:782 +0x25
+runtime/pprof.(*Profile).WriteTo(0x9ee4310?, {0x672d7a0?, 0x1264ea14000?}, 0xc?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/runtime/pprof/pprof.go:408 +0x149
+net/http/pprof.handler.ServeHTTP({0x126668143d1, 0x9}, {0x677a700, 0x1264ea14000}, 0x1265f8b5180)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/http/pprof/pprof.go:273 +0x52a
+net/http/pprof.Index({0x677a700, 0x1264ea14000}, 0x1265f8b5180?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/http/pprof/pprof.go:397 +0xda
+net/http.HandlerFunc.ServeHTTP(0x1264eb50300?, {0x677a700?, 0x1264ea14000?}, 0x826776?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/http/server.go:2286 +0x29
+net/http.(*ServeMux).ServeHTTP(0x48d919?, {0x677a700, 0x1264ea14000}, 0x1265f8b5180)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/http/server.go:2828 +0x1c7
+net/http.serverHandler.ServeHTTP({0x1268808fe00?}, {0x677a700?, 0x1264ea14000?}, 0x1?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/http/server.go:3311 +0x8e
+net/http.(*conn).serve(0x1265b856510, {0x6788188, 0x1264e4e6120})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/http/server.go:2073 +0x650
+created by net/http.(*Server).Serve in goroutine 84
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/http/server.go:3464 +0x485
+
+goroutine 1 [select]:
+main.runSupervisor({0x6729ac0, 0x1264ddf2160}, {0x67298e0, 0x1264d4d8060})
+	/home/ds/gascity-main/cmd/gc/cmd_supervisor.go:1507 +0x1ebd
+main.doSupervisorRun({0x6729ac0, 0x1264ddf2160}, {0x67298e0, 0x1264d4d8060})
+	/home/ds/gascity-main/cmd/gc/cmd_supervisor_lifecycle.go:462 +0x4a
+main.newSupervisorCmd.newSupervisorRunCmd.func2(0x1264dd77b08?, {0xb634940?, 0x0?, 0x0?})
+	/home/ds/gascity-main/cmd/gc/cmd_supervisor_lifecycle.go:446 +0x25
+github.com/spf13/cobra.(*Command).execute(0x1264dd77b08, {0xb634940, 0x0, 0x0})
+	/home/ds/go/pkg/mod/github.com/spf13/cobra@v1.10.2/command.go:1015 +0xb14
+github.com/spf13/cobra.(*Command).ExecuteC(0x1264d96c308)
+	/home/ds/go/pkg/mod/github.com/spf13/cobra@v1.10.2/command.go:1148 +0x465
+github.com/spf13/cobra.(*Command).Execute(...)
+	/home/ds/go/pkg/mod/github.com/spf13/cobra@v1.10.2/command.go:1071
+main.run({0x1264d54a2b0, 0x2, 0x2}, {0x67298e0, 0x1264d4d8058}, {0x67298e0, 0x1264d4d8060})
+	/home/ds/gascity-main/cmd/gc/main.go:173 +0x5f6
+main.main()
+	/home/ds/gascity-main/cmd/gc/main.go:31 +0x5e
+
+goroutine 66 [select, 3 minutes]:
+github.com/dolthub/dolt/go/libraries/events.(*sendingThread).run(0x1264e18f1f0)
+	/home/ds/go/pkg/mod/github.com/dolthub/dolt/go@v0.40.5-0.20260605230755-1bf533220ab0/libraries/events/collector.go:173 +0x125
+created by github.com/dolthub/dolt/go/libraries/events.(*sendingThread).start in goroutine 1
+	/home/ds/go/pkg/mod/github.com/dolthub/dolt/go@v0.40.5-0.20260605230755-1bf533220ab0/libraries/events/collector.go:148 +0x65
+
+goroutine 67 [chan receive, 3 minutes]:
+github.com/dolthub/dolt/go/libraries/events.NewCollector.func1()
+	/home/ds/go/pkg/mod/github.com/dolthub/dolt/go@v0.40.5-0.20260605230755-1bf533220ab0/libraries/events/collector.go:90 +0x75
+created by github.com/dolthub/dolt/go/libraries/events.NewCollector in goroutine 1
+	/home/ds/go/pkg/mod/github.com/dolthub/dolt/go@v0.40.5-0.20260605230755-1bf533220ab0/libraries/events/collector.go:88 +0xfa
+
+goroutine 38 [syscall, 3 minutes]:
+os/signal.signal_recv()
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/runtime/sigqueue.go:152 +0x98
+os/signal.loop()
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/os/signal/signal_unix.go:23 +0x13
+created by os/signal.Notify.func1.1 in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/os/signal/signal.go:152 +0x1f
+
+goroutine 83 [select, 3 minutes]:
+main.supervisorSignalLoop(0x1264df902a0, 0x1264e11a230, 0x1264e682bd0, 0x1264d875b80, {0x67298e0, 0x1264d4d8060})
+	/home/ds/gascity-main/cmd/gc/cmd_supervisor.go:520 +0xb7
+created by main.runSupervisor in goroutine 1
+	/home/ds/gascity-main/cmd/gc/cmd_supervisor.go:1314 +0x9dc
+
+goroutine 84 [IO wait]:
+internal/poll.runtime_pollWait(0x78f919acf600, 0x72)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0x1264eab5780?, 0x900000036?, 0x0)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Accept(0x1264eab5780)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_unix.go:613 +0x28c
+net.(*netFD).accept(0x1264eab5780)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/fd_unix.go:150 +0x29
+net.(*TCPListener).accept(0x1264ead6a40)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/tcpsock_posix.go:159 +0x1b
+net.(*TCPListener).Accept(0x1264ead6a40)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/tcpsock.go:387 +0x30
+net/http.(*Server).Serve(0x1264eb56100, {0x677a050, 0x1264ead6a40})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/http/server.go:3434 +0x30c
+github.com/gastownhall/gascity/internal/api.StartPprof.func1()
+	/home/ds/gascity-main/internal/api/supervisor.go:385 +0x25
+created by github.com/gastownhall/gascity/internal/api.StartPprof in goroutine 1
+	/home/ds/gascity-main/internal/api/supervisor.go:384 +0x1fa
+
+goroutine 85 [IO wait]:
+internal/poll.runtime_pollWait(0x78f919acf400, 0x72)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0x1264eab5800?, 0x900000036?, 0x0)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Accept(0x1264eab5800)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_unix.go:613 +0x28c
+net.(*netFD).accept(0x1264eab5800)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/fd_unix.go:150 +0x29
+net.(*TCPListener).accept(0x1264ead6a80)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/tcpsock_posix.go:159 +0x1b
+net.(*TCPListener).Accept(0x1264ead6a80)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/tcpsock.go:387 +0x30
+net/http.(*Server).Serve(0x1264eb56000, {0x677a050, 0x1264ead6a80})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/http/server.go:3434 +0x30c
+github.com/gastownhall/gascity/internal/api.(*SupervisorMux).Serve(...)
+	/home/ds/gascity-main/internal/api/supervisor.go:395
+main.runSupervisor.func4()
+	/home/ds/gascity-main/cmd/gc/cmd_supervisor.go:1412 +0x3c
+created by main.runSupervisor in goroutine 1
+	/home/ds/gascity-main/cmd/gc/cmd_supervisor.go:1411 +0x15b1
+
+goroutine 86 [IO wait, 3 minutes]:
+internal/poll.runtime_pollWait(0x78f919acf200, 0x72)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0x1264eab5880?, 0x20?, 0x0)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Accept(0x1264eab5880)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_unix.go:613 +0x28c
+net.(*netFD).accept(0x1264eab5880)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/fd_unix.go:150 +0x29
+net.(*UnixListener).accept(0x4634a0?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/unixsock_posix.go:172 +0x16
+net.(*UnixListener).Accept(0x1264eb524e0)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/unixsock.go:267 +0x30
+main.startSupervisorSocket.func1()
+	/home/ds/gascity-main/cmd/gc/cmd_supervisor.go:629 +0x59
+created by main.startSupervisorSocket in goroutine 1
+	/home/ds/gascity-main/cmd/gc/cmd_supervisor.go:627 +0x148
+
+goroutine 2096 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x1265cf531e0, {0x67881c0, 0x1264da7a6e0})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 1989 [select]:
+database/sql.(*DB).connectionCleaner(0x1265a339040, 0x1264de100a0?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1104 +0x9e
+created by database/sql.(*DB).startCleanerLocked in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1091 +0x105
+
+goroutine 2551 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x12650238820, {0x67881c0, 0x1265f1b3860})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 3059 [select, 2 minutes]:
+main.watchConfigTargets.func4()
+	/home/ds/gascity-main/cmd/gc/controller.go:794 +0x139
+created by main.watchConfigTargets in goroutine 3047
+	/home/ds/gascity-main/cmd/gc/controller.go:785 +0x45e
+
+goroutine 2665 [select]:
+database/sql.(*DB).connectionCleaner(0x12652b7dd40, 0x1266122cbe0?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1104 +0x9e
+created by database/sql.(*DB).startCleanerLocked in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1091 +0x105
+
+goroutine 4235 [runnable]:
+syscall.Syscall(0x0, 0x13, 0x1268808fe21, 0x1)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/syscall/syscall_linux.go:74 +0x25
+syscall.read(0x126bc1ea880?, {0x1268808fe21?, 0x1265857ae00?, 0x126abc23ed0?})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/syscall/zsyscall_linux_amd64.go:736 +0x38
+syscall.Read(...)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/syscall/syscall_unix.go:183
+internal/poll.ignoringEINTRIO(...)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_unix.go:738
+internal/poll.(*FD).Read(0x126bc1ea880, {0x1268808fe21, 0x1, 0x1})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_unix.go:161 +0x21d
+net.(*netFD).Read(0x126bc1ea880, {0x1268808fe21?, 0x560ec40?, 0x126abc23f70?})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/fd_posix.go:68 +0x25
+net.(*conn).Read(0x126a4497d98, {0x1268808fe21?, 0x126abc23f01?, 0x126abc23fb8?})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/net.go:196 +0x45
+net/http.(*connReader).backgroundRead(0x1268808fe00)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/http/server.go:702 +0x33
+created by net/http.(*connReader).startBackgroundRead in goroutine 4234
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/http/server.go:698 +0xb6
+
+goroutine 2809 [select]:
+github.com/gastownhall/gascity/internal/events.(*fileWatcher).Next(0x1264dc804d0)
+	/home/ds/gascity-main/internal/events/recorder.go:600 +0x449
+main.(*controllerState).startBeadEventWatcher.func1()
+	/home/ds/gascity-main/cmd/gc/api_state.go:411 +0x270
+created by main.(*controllerState).startBeadEventWatcher in goroutine 1
+	/home/ds/gascity-main/cmd/gc/api_state.go:395 +0xde
+
+goroutine 2642 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x12651867d40, {0x67881c0, 0x1264fc821e0})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 4554 [select]:
+github.com/go-sql-driver/mysql.(*mysqlConn).startWatcher.func1()
+	/home/ds/go/pkg/mod/github.com/go-sql-driver/mysql@v1.9.3/connection.go:658 +0x9a
+created by github.com/go-sql-driver/mysql.(*mysqlConn).startWatcher in goroutine 2506
+	/home/ds/go/pkg/mod/github.com/go-sql-driver/mysql@v1.9.3/connection.go:655 +0xfa
+
+goroutine 4595 [select]:
+github.com/go-sql-driver/mysql.(*mysqlConn).startWatcher.func1()
+	/home/ds/go/pkg/mod/github.com/go-sql-driver/mysql@v1.9.3/connection.go:658 +0x9a
+created by github.com/go-sql-driver/mysql.(*mysqlConn).startWatcher in goroutine 2834
+	/home/ds/go/pkg/mod/github.com/go-sql-driver/mysql@v1.9.3/connection.go:655 +0xfa
+
+goroutine 3060 [select, 2 minutes]:
+main.(*CityRuntime).startupReadinessWatchdog(0x12671195208, {0x67881c0, 0x1264dde4730}, 0x126ab02b180, 0x22ecb25c00, 0x45d964b800)
+	/home/ds/gascity-main/cmd/gc/city_runtime.go:818 +0xff
+created by main.(*CityRuntime).run in goroutine 3047
+	/home/ds/gascity-main/cmd/gc/city_runtime.go:425 +0x6b0
+
+goroutine 1729 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x1265b1b6b60, {0x67881c0, 0x1264dde4370})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 2046 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x1265bad4dd0, {0x67881c0, 0x1264dde5090})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 2268 [select]:
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).reconcileLoop(0x1265d7d0788, {0x67881c0, 0x1265e0fe690}, 0x3c93b2b40?)
+	/home/ds/gascity-main/internal/beads/caching_store_reconcile.go:78 +0x19b
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler.func1()
+	/home/ds/gascity-main/internal/beads/caching_store.go:1108 +0x58
+created by github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler in goroutine 2402
+	/home/ds/gascity-main/internal/beads/caching_store.go:1106 +0x32f
+
+goroutine 2305 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x1265eba3790, {0x67881c0, 0x1264f770a00})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 2762 [select]:
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).reconcileLoop(0x1265237e788, {0x67881c0, 0x1264dd42050}, 0x3c93b2b40?)
+	/home/ds/gascity-main/internal/beads/caching_store_reconcile.go:78 +0x19b
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler.func1()
+	/home/ds/gascity-main/internal/beads/caching_store.go:1108 +0x58
+created by github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler in goroutine 2703
+	/home/ds/gascity-main/internal/beads/caching_store.go:1106 +0x32f
+
+goroutine 2147 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x1265cdf00d0, {0x67881c0, 0x1264e02dea0})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 2358 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x1266011d5f0, {0x67881c0, 0x1265f1b2730})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 366 [chan receive, 2 minutes]:
+main.(*SessionReconcilerTracer).runFlushLoop(0x1264f80ab00, 0x1264e114a10)
+	/home/ds/gascity-main/cmd/gc/session_reconciler_trace_collector.go:177 +0x125
+created by main.newSessionReconcilerTracer in goroutine 1
+	/home/ds/gascity-main/cmd/gc/session_reconciler_trace_collector.go:134 +0x5f9
+
+goroutine 2723 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x12652b7dd40, {0x67881c0, 0x1266122cd70})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 1974 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x1265a339040, {0x67881c0, 0x1264dee8e10})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 2018 [select]:
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).reconcileLoop(0x12654e25b88, {0x67881c0, 0x1264dd95040}, 0x3c93b2b40?)
+	/home/ds/gascity-main/internal/beads/caching_store_reconcile.go:78 +0x19b
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler.func1()
+	/home/ds/gascity-main/internal/beads/caching_store.go:1108 +0x58
+created by github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler in goroutine 2007
+	/home/ds/gascity-main/internal/beads/caching_store.go:1106 +0x32f
+
+goroutine 2576 [select]:
+database/sql.(*DB).connectionCleaner(0x12650b549c0, 0x0?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1104 +0x9e
+created by database/sql.(*DB).startCleanerLocked in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1091 +0x105
+
+goroutine 2591 [select]:
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).reconcileLoop(0x1264e0b3b88, {0x67881c0, 0x1264dee2af0}, 0x3c93b2b40?)
+	/home/ds/gascity-main/internal/beads/caching_store_reconcile.go:78 +0x19b
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler.func1()
+	/home/ds/gascity-main/internal/beads/caching_store.go:1108 +0x58
+created by github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler in goroutine 2525
+	/home/ds/gascity-main/internal/beads/caching_store.go:1106 +0x32f
+
+goroutine 2594 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x12650b549c0, {0x67881c0, 0x1265f1b3e50})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 2087 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x1265b3fde10, {0x67881c0, 0x1264dee99f0})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 2506 [select]:
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).reconcileLoop(0x1264d7d2f08, {0x67881c0, 0x1267f240cd0}, 0x3c93b2b40?)
+	/home/ds/gascity-main/internal/beads/caching_store_reconcile.go:78 +0x19b
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler.func1()
+	/home/ds/gascity-main/internal/beads/caching_store.go:1108 +0x58
+created by github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler in goroutine 2545
+	/home/ds/gascity-main/internal/beads/caching_store.go:1106 +0x32f
+
+goroutine 1684 [select]:
+database/sql.(*DB).connectionCleaner(0x1267f212270, 0x1264ead3880?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1104 +0x9e
+created by database/sql.(*DB).startCleanerLocked in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1091 +0x105
+
+goroutine 1737 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x126597cbad0, {0x67881c0, 0x1264dee8050})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 2622 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x126521ed860, {0x67881c0, 0x1264f771540})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 2463 [select]:
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).reconcileLoop(0x1264f824288, {0x67881c0, 0x1265e0feb40}, 0x3c93b2b40?)
+	/home/ds/gascity-main/internal/beads/caching_store_reconcile.go:78 +0x19b
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler.func1()
+	/home/ds/gascity-main/internal/beads/caching_store.go:1108 +0x58
+created by github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler in goroutine 2472
+	/home/ds/gascity-main/internal/beads/caching_store.go:1106 +0x32f
+
+goroutine 2450 [select]:
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).reconcileLoop(0x1265d7d0c88, {0x67881c0, 0x1267db89810}, 0x3c93b2b40?)
+	/home/ds/gascity-main/internal/beads/caching_store_reconcile.go:78 +0x19b
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler.func1()
+	/home/ds/gascity-main/internal/beads/caching_store.go:1108 +0x58
+created by github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler in goroutine 1882
+	/home/ds/gascity-main/internal/beads/caching_store.go:1106 +0x32f
+
+goroutine 4300 [select]:
+database/sql.(*DB).connectionCleaner(0x12651867d40, 0x12657918200?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1104 +0x9e
+created by database/sql.(*DB).startCleanerLocked in goroutine 3047
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1091 +0x105
+
+goroutine 2292 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x1265eba2a90, {0x67881c0, 0x1264f770230})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 2347 [select]:
+database/sql.(*DB).connectionCleaner(0x1266011d5f0, 0x1264def85f0?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1104 +0x9e
+created by database/sql.(*DB).startCleanerLocked in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1091 +0x105
+
+goroutine 2498 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x1264f67b790, {0x67881c0, 0x1267f2408c0})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 2763 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x126515ee0d0, {0x67881c0, 0x1264dd42190})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 4410 [select]:
+database/sql.(*DB).connectionCleaner(0x126521ed860, 0x1264eb820c0?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1104 +0x9e
+created by database/sql.(*DB).startCleanerLocked in goroutine 3047
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1091 +0x105
+
+goroutine 2233 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x1265e0ea000, {0x67881c0, 0x1264ddb9090})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 4419 [select]:
+database/sql.(*DB).connectionCleaner(0x12650238820, 0x126c2d85680?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1104 +0x9e
+created by database/sql.(*DB).startCleanerLocked in goroutine 3047
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1091 +0x105
+
+goroutine 2478 [select]:
+database/sql.(*DB).connectionCleaner(0x1264f67b790, 0x1265e0feb90?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1104 +0x9e
+created by database/sql.(*DB).startCleanerLocked in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1091 +0x105
+
+goroutine 2834 [select]:
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).reconcileLoop(0x12652dd4788, {0x67881c0, 0x1264dd6a730}, 0x3c93b2b40?)
+	/home/ds/gascity-main/internal/beads/caching_store_reconcile.go:78 +0x19b
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler.func1()
+	/home/ds/gascity-main/internal/beads/caching_store.go:1108 +0x58
+created by github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler in goroutine 2823
+	/home/ds/gascity-main/internal/beads/caching_store.go:1106 +0x32f
+
+goroutine 3058 [IO wait, 2 minutes]:
+internal/poll.runtime_pollWait(0x78f86fc2c800, 0x72)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0x126aafd4de0?, 0x126ab20fe53?, 0x1)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0x126aafd4de0, {0x126ab20fe53, 0x10000, 0x10000})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_unix.go:165 +0x2ae
+os.(*File).read(...)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/os/file_posix.go:30
+os.(*File).Read(0x126a8c6dcf8, {0x126ab20fe53?, 0x0?, 0x0?})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/os/file.go:144 +0x4f
+github.com/fsnotify/fsnotify.(*inotify).readEvents(0x126a80e9400)
+	/home/ds/go/pkg/mod/github.com/fsnotify/fsnotify@v1.9.0/backend_inotify.go:357 +0xcf
+created by github.com/fsnotify/fsnotify.newBackend in goroutine 3047
+	/home/ds/go/pkg/mod/github.com/fsnotify/fsnotify@v1.9.0/backend_inotify.go:155 +0x1f6
+
+goroutine 2753 [select]:
+database/sql.(*DB).connectionCleaner(0x126515ee0d0, 0x1264d90e960?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1104 +0x9e
+created by database/sql.(*DB).startCleanerLocked in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1091 +0x105
+
+goroutine 2411 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x1266121fa00, {0x67881c0, 0x1266122c000})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 68 [select, 2 minutes]:
+database/sql.(*DB).connectionOpener(0x1267f212270, {0x67881c0, 0x1267f240000})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:1261 +0x89
+created by database/sql.OpenDB in goroutine 1
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/database/sql/sql.go:841 +0x130
+
+goroutine 71 [select]:
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).reconcileLoop(0x12650c44288, {0x67881c0, 0x126a4c99810}, 0x3c93b2b40?)
+	/home/ds/gascity-main/internal/beads/caching_store_reconcile.go:78 +0x19b
+github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler.func1()
+	/home/ds/gascity-main/internal/beads/caching_store.go:1108 +0x58
+created by github.com/gastownhall/gascity/internal/beads.(*CachingStore).StartReconciler in goroutine 2808
+	/home/ds/gascity-main/internal/beads/caching_store.go:1106 +0x32f
+
+goroutine 3046 [IO wait]:
+internal/poll.runtime_pollWait(0x78f885893200, 0x72)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0x126a9e74f00?, 0x20?, 0x0)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Accept(0x126a9e74f00)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/poll/fd_unix.go:613 +0x28c
+net.(*netFD).accept(0x126a9e74f00)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/fd_unix.go:150 +0x29
+net.(*UnixListener).accept(0x4634a0?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/unixsock_posix.go:172 +0x16
+net.(*UnixListener).Accept(0x126aab96210)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/net/unixsock.go:267 +0x30
+main.startControllerSocket.func1()
+	/home/ds/gascity-main/cmd/gc/controller.go:146 +0xb9
+created by main.startControllerSocket in goroutine 1
+	/home/ds/gascity-main/cmd/gc/controller.go:144 +0x2b7
+
+goroutine 3047 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x0?, 0x0?, 0x0?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0x1264da460e8)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/sync/mutex.go:46
+github.com/gastownhall/gascity/internal/beads.(*FileStore).Create(_, {{0x0, 0x0}, {0x12668326090, 0x14}, {0x0, 0x0}, {0x0, 0x0}, 0x0, ...})
+	/home/ds/gascity-main/internal/beads/filestore.go:186 +0x95
+main.createWithStoragePolicy({_, _}, {{0x0, 0x0}, {0x12668326090, 0x14}, {0x0, 0x0}, {0x0, 0x0}, ...}, ...)
+	/home/ds/gascity-main/cmd/gc/bead_policy_store.go:382 +0x65e
+main.(*beadPolicyStore).Create(_, {{0x0, 0x0}, {0x12668326090, 0x14}, {0x0, 0x0}, {0x0, 0x0}, 0x0, ...})
+	/home/ds/gascity-main/cmd/gc/bead_policy_store.go:75 +0x225
+github.com/gastownhall/gascity/internal/orders.(*Store).CreateRun(0x1271f772b08, {0x12671022750, 0xe}, {0x1271f772aaa?})
+	/home/ds/gascity-main/internal/orders/store.go:252 +0x4a3
+main.(*memoryOrderDispatcher).launchResolvedDispatch(_, {_, _}, {_, _}, {{0x1264d80ec15, 0x11}, {0x5d64cd7, 0x4}, {0x1269089e018, ...}, ...}, ...)
+	/home/ds/gascity-main/cmd/gc/order_dispatch.go:725 +0x13a
+main.(*memoryOrderDispatcher).dispatch(0x1264e6c80e0, {0x67881c0, 0x1264dde4730}, {0x1264d80ec15, 0x11}, {0x3?, 0x0?, 0xb60adc0?})
+	/home/ds/gascity-main/cmd/gc/order_dispatch.go:653 +0x2550
+main.(*CityRuntime).dispatchOrders(0x12671195208, {0x67881c0, 0x1264dde4730}, {0x1264d80ec15, 0x11})
+	/home/ds/gascity-main/cmd/gc/city_runtime.go:1315 +0x15b
+main.(*CityRuntime).run.func7()
+	/home/ds/gascity-main/cmd/gc/city_runtime.go:519 +0x27
+main.(*CityRuntime).safeTick(0x5d83fef?, 0xd?, {0x5d88f98?, 0x1264ea98b68?})
+	/home/ds/gascity-main/cmd/gc/city_runtime.go:805 +0x64
+main.(*CityRuntime).run(0x12671195208, {0x67881c0, 0x1264dde4730})
+	/home/ds/gascity-main/cmd/gc/city_runtime.go:518 +0x9be
+main.reconcileCities.func28({0x1264d80ec32?, 0x0?}, {0x1264d80ec15?, 0x0?}, 0x1?, {0x6779ca0, 0x126aab96210}, {0x126a9e43f50, 0x25}, {0x67a4308, ...}, ...)
+	/home/ds/gascity-main/cmd/gc/cmd_supervisor.go:2345 +0x249
+created by main.reconcileCities in goroutine 1
+	/home/ds/gascity-main/cmd/gc/cmd_supervisor.go:2246 +0x307f
+
+goroutine 4512 [select]:
+github.com/go-sql-driver/mysql.(*mysqlConn).startWatcher.func1()
+	/home/ds/go/pkg/mod/github.com/go-sql-driver/mysql@v1.9.3/connection.go:658 +0x9a
+created by github.com/go-sql-driver/mysql.(*mysqlConn).startWatcher in goroutine 2463
+	/home/ds/go/pkg/mod/github.com/go-sql-driver/mysql@v1.9.3/connection.go:655 +0xfa
+
+goroutine 4527 [select]:
+github.com/go-sql-driver/mysql.(*mysqlConn).startWatcher.func1()
+	/home/ds/go/pkg/mod/github.com/go-sql-driver/mysql@v1.9.3/connection.go:658 +0x9a
+created by github.com/go-sql-driver/mysql.(*mysqlConn).startWatcher in goroutine 2762
+	/home/ds/go/pkg/mod/github.com/go-sql-driver/mysql@v1.9.3/connection.go:655 +0xfa
+
+goroutine 4643 [runnable]:
+encoding/json.stateInString(0x12668c66928?, 0x63?)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/encoding/json/scanner.go:339 +0x171
+encoding/json.checkValid({0x126b5c68700, 0x372, 0x10?}, 0x12668c66928)
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/encoding/json/scanner.go:37 +0x9d
+encoding/json.Unmarshal({0x126b5c68700, 0x372, 0x380}, {0x4fc6f20, 0x126685f0d90})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/encoding/json/decode.go:107 +0x54
+github.com/gastownhall/gascity/internal/beads.(*StringMap).UnmarshalJSON(0x126b388d5f8, {0x127053b39e2, 0xbe9, 0x72b9fb0})
+	/home/ds/gascity-main/internal/beads/bdstore.go:582 +0x16b
+encoding/json.(*decodeState).object(0x126540acbd0, {0x558a000?, 0x126b388d5f8?, 0x0?})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/encoding/json/decode.go:610 +0x68e
+encoding/json.(*decodeState).value(0x126540acbd0, {0x558a000?, 0x126b388d5f8?, 0x8?})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/encoding/json/decode.go:380 +0x3e
+encoding/json.(*decodeState).object(0x126540acbd0, {0x5c63340?, 0x126b388d500?, 0x502d980?})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/encoding/json/decode.go:767 +0xd65
+encoding/json.(*decodeState).value(0x126540acbd0, {0x5c63340?, 0x126b388d500?, 0x4b71?})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/encoding/json/decode.go:380 +0x3e
+encoding/json.(*decodeState).array(0x126540acbd0, {0x502d980?, 0x126afdbb5c8?, 0xa819987?})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/encoding/json/decode.go:561 +0x4db
+encoding/json.(*decodeState).value(0x126540acbd0, {0x502d980?, 0x126afdbb5c8?, 0x413400?})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/encoding/json/decode.go:370 +0x74
+encoding/json.(*decodeState).object(0x126540acbd0, {0x4fbe920?, 0x126afdbb5c0?, 0x0?})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/encoding/json/decode.go:767 +0xd65
+encoding/json.(*decodeState).value(0x126540acbd0, {0x4fbe920?, 0x126afdbb5c0?, 0x48eb65?})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/encoding/json/decode.go:380 +0x3e
+encoding/json.(*decodeState).unmarshal(0x126540acbd0, {0x4fbe920?, 0x126afdbb5c0?})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/encoding/json/decode.go:183 +0x11e
+encoding/json.Unmarshal({0x12701e54000, 0xa819991, 0xa819992}, {0x4fbe920, 0x126afdbb5c0})
+	/home/ds/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.5.linux-amd64/src/encoding/json/decode.go:113 +0xf9
+github.com/gastownhall/gascity/internal/beads.(*FileStore).reloadFromDisk(0x1264da460e0)
+	/home/ds/gascity-main/internal/beads/filestore.go:120 +0x14b
+github.com/gastownhall/gascity/internal/beads.(*FileStore).Update(0x1264da460e0, {0x1269089e720, 0x9}, {0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, ...})
+	/home/ds/gascity-main/internal/beads/filestore.go:216 +0x117
+github.com/gastownhall/gascity/internal/orders.(*Store).SetCursor(0x12658059a78, {0x1269089e720, 0x9}, {0x12656c6e1e0, 0x1e}, 0xb6391c0?)
+	/home/ds/gascity-main/internal/orders/store.go:287 +0x1b3
+main.(*memoryOrderDispatcher).dispatchExec(_, {_, _}, _, {{0x1264d80ec15, 0x11}, {0x5d64cd7, 0x4}, {0x126a5baa058, 0x2}, ...}, ...)
+	/home/ds/gascity-main/cmd/gc/order_dispatch.go:1326 +0x511
+main.(*memoryOrderDispatcher).dispatchOne(_, {_, _}, {_, _}, {{0x1264d80ec15, 0x11}, {0x5d64cd7, 0x4}, {0x126a5baa058, ...}, ...}, ...)
+	/home/ds/gascity-main/cmd/gc/order_dispatch.go:1182 +0x532
+main.(*memoryOrderDispatcher).runDispatchGuarded(_, {_, _}, {_, _}, {{0x1264d80ec15, 0x11}, {0x5d64cd7, 0x4}, {0x126a5baa058, ...}, ...}, ...)
+	/home/ds/gascity-main/cmd/gc/order_dispatch.go:711 +0x167
+main.(*memoryOrderDispatcher).launchDispatchOne.func3()
+	/home/ds/gascity-main/cmd/gc/order_dispatch.go:694 +0x1b1
+created by main.(*memoryOrderDispatcher).launchDispatchOne in goroutine 3047
+	/home/ds/gascity-main/cmd/gc/order_dispatch.go:687 +0x365
+
+goroutine 4568 [select]:
+github.com/go-sql-driver/mysql.(*mysqlConn).startWatcher.func1()
+	/home/ds/go/pkg/mod/github.com/go-sql-driver/mysql@v1.9.3/connection.go:658 +0x9a
+created by github.com/go-sql-driver/mysql.(*mysqlConn).startWatcher in goroutine 2591
+	/home/ds/go/pkg/mod/github.com/go-sql-driver/mysql@v1.9.3/connection.go:655 +0xfa
+
+goroutine 4188 [select]:
+github.com/go-sql-driver/mysql.(*mysqlConn).startWatcher.func1()
+	/home/ds/go/pkg/mod/github.com/go-sql-driver/mysql@v1.9.3/connection.go:658 +0x9a
+created by github.com/go-sql-driver/mysql.(*mysqlConn).startWatcher in goroutine 2268
+	/home/ds/go/pkg/mod/github.com/go-sql-driver/mysql@v1.9.3/connection.go:655 +0xfa

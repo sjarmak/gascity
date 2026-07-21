@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""pl-529-recovery: detect and recover PLs wedged on Claude API 529 errors.
+
+Claude API can return 529 Overloaded during peak load. Claude Code retries
+~2-3 times automatically; if all retries fail, the final assistant turn is
+the literal error message and the REPL sits idle at the prompt waiting for
+a human to type. A bound PL in that state silently drops every inbound
+(dispatcher delivers; the wedged REPL never advances). Resolution is a
+`gc session reset <pl>` — fresh REPL exec, resume picks back up from the
+conversation transcript, retry fires on the next inbound.
+
+This order scans PL sessions periodically. For any whose `gc session peek`
+output matches all of:
+
+  - "API Error: 529 Overloaded" appears in the last ~30 lines
+  - the bottom shows an idle prompt (no thinking-spinner `✻` and no typed
+    text after the `❯` indicator)
+  - the same state was observed on the PREVIOUS run too (two-scan confirm,
+    gives Claude Code's transient-retry path time to recover)
+
+…the order issues `gc session reset <pl>` and mails mayor with the action.
+
+Mayor is intentionally excluded from the reset scope in v1 — Stephanie sees
+mayor 529s directly in the REPL; auto-resetting mid-conversation is too
+disruptive. PL sessions are the high-throughput, low-attention surface
+where this matters.
+
+State file: /home/ds/.gc/pl-529-recovery-state.json
+  Per session:
+    first_seen_at_ms   — when the 529-stuck state first appeared
+    last_reset_at_ms   — last time we issued reset (cooldown lock)
+    reset_count        — total resets ever (for telemetry)
+
+Env:
+  RECOVERY_CONFIRM_GAP_SEC - require state persists ≥ this many seconds
+                              across scans before resetting (default 90)
+  RECOVERY_COOLDOWN_SEC    - skip if last reset was within this window
+                              (default 600 = 10 min)
+  RECOVERY_DRY_RUN         - non-empty = log what would reset, don't act
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE_PATH = Path.home() / ".gc" / "pl-529-recovery-state.json"
+CONFIRM_GAP_SEC = float(os.environ.get("RECOVERY_CONFIRM_GAP_SEC", "90"))
+COOLDOWN_SEC = float(os.environ.get("RECOVERY_COOLDOWN_SEC", "600"))
+DRY_RUN = bool(os.environ.get("RECOVERY_DRY_RUN", "").strip())
+
+# Session-name patterns that indicate a PL.
+PL_NAME_PATTERNS = [
+    re.compile(r".*-pl$"),
+    re.compile(r".*-pl-[0-9a-z]+$"),
+    re.compile(r"^chief-of-staff(\s|$)"),
+    re.compile(r"^cos$"),
+    re.compile(r".*oversight-rig\.project-lead.*"),
+    re.compile(r".*project-lead.*"),
+    re.compile(r"^maintenance-pl$"),
+]
+
+# Hard exclusions: never reset these even if they match a PL pattern.
+NEVER_RESET = {
+    "mayor",
+    "control-dispatcher",
+}
+
+ERROR_TEXT = "API Error: 529 Overloaded"
+IDLE_PROMPT_RE = re.compile(r"^❯ *$", re.MULTILINE)
+# Active-thinking spinner has the in-flight tick form like
+# `✻ Mustering… (3m 5s · ↓ 9.1k tokens)` — the `·` separator inside
+# the trailing parenthesized expression is the reliable signal. The
+# `✻ Worked for ...` / `✻ Baked for ...` / `✻ Sautéed for ...` lines
+# are post-completion idle indicators and must NOT count as thinking —
+# that's exactly the wedged-on-529 fingerprint.
+THINKING_RE = re.compile(r"^[✻*✶✷⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] .*\([^)]*·", re.MULTILINE)
+
+
+def load_state() -> dict:
+    if not STATE_PATH.exists():
+        return {}
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+def list_pl_sessions() -> list[str]:
+    """Returns session aliases (column 6 of `gc session list`) that look like PLs."""
+    try:
+        result = subprocess.run(
+            ["gc", "session", "list"], capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    if result.returncode != 0:
+        return []
+    sessions: list[str] = []
+    for line in result.stdout.splitlines()[1:]:  # skip header
+        cols = line.split()
+        if len(cols) < 6:
+            continue
+        if cols[2] != "active":
+            continue
+        alias = cols[5]
+        if alias in NEVER_RESET:
+            continue
+        if any(p.match(alias) for p in PL_NAME_PATTERNS):
+            sessions.append(alias)
+    return sessions
+
+
+def peek_session(alias: str) -> str:
+    """Returns the last ~50 lines of session output, or '' on error."""
+    try:
+        result = subprocess.run(
+            ["gc", "session", "peek", alias],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    # Keep only the tail — peek can be verbose
+    lines = result.stdout.splitlines()
+    return "\n".join(lines[-50:])
+
+
+def is_529_stuck(peek_output: str) -> bool:
+    """Pattern match for the 529-wedged state."""
+    if ERROR_TEXT not in peek_output:
+        return False
+    # Look at the trailing 15 lines for idle-prompt + no-thinking-spinner
+    tail = "\n".join(peek_output.splitlines()[-15:])
+    if THINKING_RE.search(tail):
+        return False
+    if not IDLE_PROMPT_RE.search(tail):
+        return False
+    return True
+
+
+def find_asleep_beads_for_alias(alias: str) -> list[str]:
+    """Returns bead IDs of asleep sessions whose target matches `alias`.
+
+    Used as a fallback after `gc session kill`: a named-session circuit
+    breaker can prevent the reconciler from auto-spawning a fresh runtime
+    after kill. Explicit `gc session reset <sleeper-bead-id>` clears the
+    breaker and triggers the spawn. Empirically observed on the
+    gascity-maintenance-pl during the 2026-05-20 529 incident — kill
+    succeeded, no respawn for >30s, reset on the asleep bead immediately
+    transitioned to `creating`.
+    """
+    try:
+        result = subprocess.run(
+            ["gc", "session", "list"], capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    if result.returncode != 0:
+        return []
+    beads: list[str] = []
+    for line in result.stdout.splitlines()[1:]:
+        cols = line.split()
+        if len(cols) < 6:
+            continue
+        if cols[2] != "asleep":
+            continue
+        if cols[5] != alias and not cols[5].startswith(alias + "-"):
+            continue
+        beads.append(cols[0])
+    return beads
+
+
+def has_active_session(alias: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["gc", "session", "list"], capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.splitlines()[1:]:
+        cols = line.split()
+        if len(cols) < 6:
+            continue
+        if cols[5] != alias and not cols[5].startswith(alias + "-"):
+            continue
+        if cols[2] in ("active", "creating"):
+            return True
+    return False
+
+
+def reset_session(alias: str) -> tuple[bool, str]:
+    """Force-kill the wedged REPL; on the named-session no-respawn edge case,
+    follow up with `gc session reset` on any asleep bead for the same alias.
+
+    Two-step recovery (empirically required for named sessions; pool slots
+    usually respawn after kill alone):
+
+      1. `gc session kill <alias>` — terminates the wedged runtime; for a
+         pool slot the reconciler immediately spawns a replacement.
+
+      2. Wait briefly. If no active runtime appears within 20s, the
+         named-session respawn circuit breaker is the most likely cause.
+         Issue `gc session reset` on every asleep bead for this alias
+         (reset's help: "For named sessions, reset also clears any tripped
+         named-session respawn circuit breaker before requesting the
+         fresh restart.").
+
+    Returns (overall_success, detail). overall_success requires the alias
+    to have an active or creating session by the time the function exits.
+    """
+    detail_parts: list[str] = []
+    try:
+        kill = subprocess.run(
+            ["gc", "session", "kill", alias],
+            capture_output=True, text=True, timeout=30,
+        )
+        detail_parts.append(f"kill rc={kill.returncode}")
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return False, f"kill failed: {e}"
+
+    # Give the reconciler a chance to spawn naturally (pool slot case).
+    for _ in range(7):
+        time.sleep(3)
+        if has_active_session(alias):
+            return True, " ".join(detail_parts) + " (reconciler respawned)"
+
+    # Named-session breaker fallback.
+    sleepers = find_asleep_beads_for_alias(alias)
+    detail_parts.append(f"sleepers={len(sleepers)}")
+    for sid in sleepers:
+        try:
+            r = subprocess.run(
+                ["gc", "session", "reset", sid],
+                capture_output=True, text=True, timeout=20,
+            )
+            detail_parts.append(f"reset({sid})={r.returncode}")
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            detail_parts.append(f"reset({sid}) failed: {e}")
+
+    # One more confirmation window after reset.
+    for _ in range(7):
+        time.sleep(3)
+        if has_active_session(alias):
+            return True, " ".join(detail_parts) + " (post-reset respawn)"
+
+    return False, " ".join(detail_parts) + " (no respawn within window)"
+
+
+def mail_mayor(subject: str, body: str) -> None:
+    subprocess.run(
+        ["gc", "mail", "send", "mayor", subject, body],
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+def main() -> int:
+    state = load_state()
+    now_ms = int(time.time() * 1000)
+    confirm_gap_ms = int(CONFIRM_GAP_SEC * 1000)
+    cooldown_ms = int(COOLDOWN_SEC * 1000)
+
+    sessions = list_pl_sessions()
+    if not sessions:
+        return 0
+
+    active_set = set(sessions)
+    stuck_now: list[str] = []
+
+    for alias in sessions:
+        peek = peek_session(alias)
+        if not peek:
+            continue
+        if is_529_stuck(peek):
+            stuck_now.append(alias)
+            entry = state.setdefault(alias, {})
+            if "first_seen_at_ms" not in entry:
+                entry["first_seen_at_ms"] = now_ms
+        else:
+            # Recovered or never stuck — clear first_seen but keep reset_count
+            if alias in state and "first_seen_at_ms" in state[alias]:
+                del state[alias]["first_seen_at_ms"]
+
+    # Drop state for sessions that no longer exist
+    for alias in list(state):
+        if alias not in active_set:
+            del state[alias]
+
+    actions: list[tuple[str, bool, str]] = []  # (alias, success, detail)
+    for alias in stuck_now:
+        entry = state.get(alias, {})
+        first_seen = entry.get("first_seen_at_ms", now_ms)
+        last_reset = entry.get("last_reset_at_ms", 0)
+        if now_ms - first_seen < confirm_gap_ms:
+            continue  # first-scan detection — wait for confirmation
+        if now_ms - last_reset < cooldown_ms:
+            continue  # cooldown lock
+        if DRY_RUN:
+            actions.append((alias, True, "[dry-run] would reset"))
+            continue
+        ok, detail = reset_session(alias)
+        if ok:
+            entry["last_reset_at_ms"] = now_ms
+            entry["reset_count"] = entry.get("reset_count", 0) + 1
+            entry.pop("first_seen_at_ms", None)
+        actions.append((alias, ok, detail))
+
+    save_state(state)
+
+    if actions:
+        lines = [f"pl-529-recovery: {len(actions)} action(s) at {time.strftime('%Y-%m-%d %H:%M:%S')}"]
+        for alias, ok, detail in actions:
+            mark = "OK " if ok else "FAIL"
+            lines.append(f"  [{mark}] {alias}: {detail}")
+        body = "\n".join(lines)
+        print(body)
+        if not DRY_RUN:
+            mail_mayor(f"[pl-529-recovery] reset {len(actions)} PL(s) wedged on Claude 529", body)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,6 @@
+[order]
+description = "Every 3h: reap abandoned benchmark workspaces under /tmp (tmp.*/go-build*/mcp_* dirs older than 24h with no live process holding them; git worktrees + system dirs skipped). Auto-removes only the unambiguous-dead; ambiguous disk pressure is surfaced to mayor by resource-sweep. Nudges mayor only when it actually reaps. Born 2026-06-19 after /tmp churn drove the shared disk to 100% / 16G free with ~130G of uncleaned run dirs."
+trigger = "cooldown"
+interval = "3h"
+exec = "/home/ds/gas-city/bin/tmp-reaper --apply --nudge-mayor"
+timeout = "5m"

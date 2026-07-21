@@ -1,0 +1,6 @@
+[order]
+description = "Hourly: reopen recently-closed beads matching evidence-gate rules but lacking required metadata. Migrated from systemd timer."
+trigger = "cron"
+schedule = "5 * * * *"
+exec = "/home/ds/gas-city/bin/close-gate-reaper --apply --nudge-mayor"
+timeout = "5m"

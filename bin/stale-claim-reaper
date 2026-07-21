@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# stale-claim-reaper: unclaim in_progress beads whose worker process
+# almost certainly died.
+#
+# Selection criteria (ALL must hold):
+#   - status = in_progress
+#   - assignee is non-empty
+#   - updated_at older than $STALE_THRESHOLD (default 24h)
+#   - no commit in the rig's git log mentions the bead ID
+#   - bead does NOT have metadata.long_running = "true"
+#
+# Action: bd update --status=open --assignee="" (NOT close — work may still
+# be valid, just let another worker pick it up).
+#
+# Default mode is DRY-RUN. Pass --apply to actually unclaim.
+#
+# Local fallback for the upstream stale-claim reaper proposal
+# (see gascity gc-1b2). Until that lands, this script does the same job
+# locally for our city.
+#
+# Usage:
+#   stale-claim-reaper                    # dry-run report
+#   stale-claim-reaper --apply            # actually unclaim
+#   stale-claim-reaper --nudge-mayor      # nudge mayor if reaps happen
+#   stale-claim-reaper --threshold 12h    # custom staleness threshold
+#   stale-claim-reaper --rig zeldascension # scope to one rig
+
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${STALE_CLAIM_AUDIT_LOG:-${CITY}/.gc/stale-claim-reaper.log}"
+STALE_THRESHOLD="${STALE_CLAIM_THRESHOLD:-24h}"
+
+APPLY=0
+NUDGE_MAYOR=0
+ONLY_RIG=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)         APPLY=1; shift ;;
+    --nudge-mayor)   NUDGE_MAYOR=1; shift ;;
+    --threshold)     STALE_THRESHOLD="$2"; shift 2 ;;
+    --rig)           ONLY_RIG="$2"; shift 2 ;;
+    -h|--help)
+      sed -n 's/^# \{0,1\}//p' "$0" | head -25
+      exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$(dirname "$AUDIT_LOG")"
+
+# Convert threshold (Nh / Nd / Nm) to seconds.
+threshold_to_seconds() {
+  local t="$1" num unit
+  num="${t%[a-z]}"
+  unit="${t##*[0-9]}"
+  case "$unit" in
+    s) echo "$num" ;;
+    m) echo $((num * 60)) ;;
+    h) echo $((num * 3600)) ;;
+    d) echo $((num * 86400)) ;;
+    *) echo "stale-claim-reaper: bad threshold '$t' (use e.g. 24h, 7d, 30m)" >&2; exit 2 ;;
+  esac
+}
+
+THRESHOLD_SECONDS=$(threshold_to_seconds "$STALE_THRESHOLD")
+NOW_EPOCH=$(date +%s)
+CUTOFF_EPOCH=$((NOW_EPOCH - THRESHOLD_SECONDS))
+
+log_event() {
+  # log_event <event> <rig> <bead> <extra-json>
+  local event=$1 rig=$2 bead=$3 extra=${4:-'{}'}
+  local ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  jq -cn --arg ts "$ts" \
+         --arg event "$event" \
+         --arg rig "$rig" \
+         --arg bead "$bead" \
+         --argjson extra "$extra" \
+    '{ts:$ts, event:$event, rig:$rig, bead:$bead} + $extra' \
+    >> "$AUDIT_LOG"
+}
+
+# Build (rig name, rig path) pairs from gc rig list.
+declare -A RIG_PATHS
+while IFS=$'\t' read -r rig path; do
+  [[ -n "$path" ]] && RIG_PATHS["$rig"]="$path"
+done < <(gc rig list 2>/dev/null | awk '
+  /^  [a-zA-Z][a-zA-Z0-9_-]+:/ {
+    name=$1; sub(/:$/,"",name); current=name
+  }
+  /^    Path:/ {
+    sub(/^    Path:[ \t]+/,""); print current "\t" $0
+  }')
+
+# bead_committed: returns 0 if any commit in the rig path mentions the bead ID,
+# 1 otherwise. Defends against rig paths that aren't git repos.
+bead_committed() {
+  local rig_path=$1 bead_id=$2
+  [[ -d "$rig_path/.git" || -f "$rig_path/.git" ]] || return 1
+  # -c log.showSignature=false avoids GPG output mixing with the count.
+  # --all so we cover work on feature branches too.
+  local matches
+  matches=$(git -C "$rig_path" -c log.showSignature=false log --all \
+              --grep="$bead_id" --pretty=oneline 2>/dev/null | head -1)
+  [[ -n "$matches" ]]
+}
+
+reaped=()    # rig|bead|assignee|updated_at
+candidates=0
+
+scan_rig() {
+  local rig=$1
+  local path=${RIG_PATHS[$rig]:-}
+  [[ -n "$path" ]] || return 0
+
+  local in_progress
+  in_progress=$(gc bd --rig "$rig" list --status=in_progress --json --limit=0 2>/dev/null || echo '[]')
+  [[ -z "$in_progress" || "$in_progress" == "[]" ]] && return 0
+
+  while IFS= read -r bead_json; do
+    [[ -z "$bead_json" ]] && continue
+    local bead_id assignee updated_at long_running hold_reason upd_epoch
+    bead_id=$(jq -r '.id' <<<"$bead_json")
+    assignee=$(jq -r '.assignee // ""' <<<"$bead_json")
+    updated_at=$(jq -r '.updated_at // ""' <<<"$bead_json")
+    long_running=$(jq -r '(.metadata // {}) | (.long_running // "")' <<<"$bead_json")
+    hold_reason=$(jq -r '(.metadata // {}) | (."gc.hold_reason" // .hold_reason // "")' <<<"$bead_json")
+
+    [[ -z "$assignee" ]] && continue
+    [[ "$long_running" == "true" ]] && continue
+    # Intentional holds (gc.hold_reason set) are NOT stale claims. Unclaiming a
+    # held bead risks it becoming an unassigned OPEN and getting mis-dispatched —
+    # e.g. an OOM-tipping heavy phase auto-routed to a worker. gc-xd77u (a
+    # box-health hold on the evals trace-mining phase) hit exactly this 2026-07-04.
+    if [[ -n "$hold_reason" ]]; then
+      log_event "skipped_held" "$rig" "$bead_id" \
+        "$(jq -cn --arg a "$assignee" --arg h "$hold_reason" '{assignee:$a, hold_reason:$h}')"
+      continue
+    fi
+    [[ -z "$updated_at" ]] && continue
+
+    upd_epoch=$(date -d "$updated_at" +%s 2>/dev/null) || continue
+    (( upd_epoch >= CUTOFF_EPOCH )) && continue
+
+    candidates=$((candidates + 1))
+
+    if bead_committed "$path" "$bead_id"; then
+      log_event "skipped_has_commit" "$rig" "$bead_id" \
+        "$(jq -cn --arg a "$assignee" --arg u "$updated_at" '{assignee:$a, updated_at:$u}')"
+      continue
+    fi
+
+    reaped+=("$rig|$bead_id|$assignee|$updated_at")
+    log_event "stale_claim_detected" "$rig" "$bead_id" \
+      "$(jq -cn --arg a "$assignee" --arg u "$updated_at" --arg t "$STALE_THRESHOLD" \
+         '{assignee:$a, updated_at:$u, threshold:$t}')"
+  done < <(jq -c '.[]' <<<"$in_progress")
+}
+
+if [[ -n "$ONLY_RIG" ]]; then
+  scan_rig "$ONLY_RIG"
+else
+  for rig in "${!RIG_PATHS[@]}"; do
+    scan_rig "$rig"
+  done
+fi
+
+count=${#reaped[@]}
+
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
+{
+  echo "stale-claim-reaper: ${count} stale claim(s) detected (threshold: $STALE_THRESHOLD, candidates scanned: $candidates)"
+  if (( count > 0 )); then
+    echo
+    printf '%-22s %-30s %-25s %s\n' RIG BEAD ASSIGNEE UPDATED
+    printf '%-22s %-30s %-25s %s\n' --- ---- -------- -------
+    for row in "${reaped[@]}"; do
+      IFS='|' read -r rig bead assignee updated <<<"$row"
+      printf '%-22s %-30s %-25s %s\n' "$rig" "$bead" "$assignee" "$updated"
+    done
+    echo
+    if (( APPLY )); then
+      echo "Mode: APPLY (unclaiming all candidates)"
+    else
+      echo "Mode: DRY-RUN (re-run with --apply to unclaim)"
+    fi
+  fi
+} > "$out"
+
+cat "$out"
+
+reaped_count=0
+if (( APPLY )) && (( count > 0 )); then
+  for row in "${reaped[@]}"; do
+    IFS='|' read -r rig bead assignee updated <<<"$row"
+    if gc bd --rig "$rig" update "$bead" --status=open --assignee="" >/dev/null 2>&1; then
+      reaped_count=$((reaped_count + 1))
+      log_event "stale_claim_reaped" "$rig" "$bead" \
+        "$(jq -cn --arg a "$assignee" --arg u "$updated" '{old_assignee:$a, was_updated_at:$u}')"
+    else
+      log_event "reap_failed" "$rig" "$bead" \
+        "$(jq -cn --arg a "$assignee" '{assignee:$a}')"
+    fi
+  done
+  echo
+  echo "Reaped $reaped_count of $count stale claim(s)."
+fi
+
+if (( NUDGE_MAYOR )) && (( count > 0 )); then
+  msg="stale-claim-reaper: $count stale claim(s) detected
+$(cat "$out")
+
+Likely cause: worker process died between bd --claim and bd close.
+Run 'stale-claim-reaper --apply' if these look correctly identified.
+Tracking upstream as gascity gc-1b2."
+  gc session nudge mayor "$msg" 2>/dev/null \
+    || echo "warn: gc session nudge mayor failed (mayor may be asleep); report still in audit log" >&2
+fi
+
+exit 0

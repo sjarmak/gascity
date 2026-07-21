@@ -1,0 +1,6 @@
+Consumer-eval blinding (de-blind only in verdict synthesis):
+task-01: X=with-skill Y=without
+task-02: X=without Y=with-skill
+task-03: X=with-skill Y=without
+task-04: X=without Y=with-skill
+task-05: X=with-skill Y=without

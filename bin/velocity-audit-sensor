@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""velocity-audit-sensor: dispatch arch-review-loop / bead-goal-audit runs
+paced by CHANGE VELOCITY, not wall clock.
+
+Stephanie 2026-07-10: continuous-improvement audits (arch-review-loop,
+bead-goal-audit skills in ~/.claude/skills/) should be "handled with orders in
+gas city and on a much more frequent cadence based on code change velocity".
+Busy rigs get audited every few days; quiet rigs are left alone.
+
+Mechanical detection only (ZFC — routing judgment stays with the mayor):
+  Per non-HQ, non-suspended rig:
+    ARCH signal — commits on the rig checkout since the last-dispatched SHA.
+      Fires at >= ARCH_COMMITS (default 25), or >= 1 commit after
+      ARCH_MAX_DAYS (default 45) as a staleness backstop.
+    BEAD signal — beads created in the rig store since the last dispatch ts
+      (gc bd count --created-after). Fires at >= BEAD_CHURN (default 40), or
+      any churn after BEAD_MAX_DAYS (default 14).
+  Due signals are mailed to the mayor in ONE consolidated message
+  (change-dedup'd on the due-set) with evidence counts and a suggested
+  `gc sling --no-formula` per rig; the mayor verifies and dispatches
+  (skill runs route per the tested --no-formula pattern — formulas don't
+  survive pool-worker routing).
+
+State advances on MAIL, not completion — the staleness backstop re-fires if
+a dispatch is dropped. Surface-only: this script never creates or closes
+work beads itself.
+
+State: .gc/velocity-audit-sensor.state (JSON per rig)
+Audit: .gc/velocity-audit-sensor.log (JSONL)
+Env:   ARCH_COMMITS, ARCH_MAX_DAYS, BEAD_CHURN, BEAD_MAX_DAYS, VAS_MAYOR
+Usage: velocity-audit-sensor [--dry-run]
+"""
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+
+CITY = "/home/ds/gas-city"
+STATE_PATH = os.path.join(CITY, ".gc", "velocity-audit-sensor.state")
+AUDIT_LOG = os.path.join(CITY, ".gc", "velocity-audit-sensor.log")
+
+ARCH_COMMITS = int(os.environ.get("ARCH_COMMITS", "25"))
+ARCH_MAX_DAYS = int(os.environ.get("ARCH_MAX_DAYS", "45"))
+BEAD_CHURN = int(os.environ.get("BEAD_CHURN", "40"))
+BEAD_MAX_DAYS = int(os.environ.get("BEAD_MAX_DAYS", "14"))
+MAYOR = os.environ.get("VAS_MAYOR", "mayor")
+
+DAY = 86400
+
+
+def log(event: dict) -> None:
+    event["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    with open(AUDIT_LOG, "a") as f:
+        f.write(json.dumps(event) + "\n")
+
+
+def run(cmd: list, cwd: str | None = None) -> str | None:
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=60)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def load_state() -> dict:
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, STATE_PATH)
+
+
+def rigs() -> list:
+    out = run(["gc", "--city", CITY, "rig", "list", "--json"])
+    if not out:
+        return []
+    try:
+        parsed = json.loads(out)["rigs"]
+    except (json.JSONDecodeError, KeyError):
+        return []
+    return [
+        {"name": r["name"], "path": r["path"]}
+        for r in parsed
+        if not r.get("hq") and not r.get("suspended")
+    ]
+
+
+def git_head(path: str) -> str | None:
+    return run(["git", "-C", path, "rev-parse", "HEAD"])
+
+
+def commits_since(path: str, sha: str) -> int | None:
+    out = run(["git", "-C", path, "rev-list", "--count", f"{sha}..HEAD"])
+    try:
+        return int(out) if out is not None else None
+    except ValueError:
+        return None
+
+
+def beads_created_after(rig: str, iso_ts: str) -> int | None:
+    # list (not count): count includes infra/scaffolding noise (message/agent/
+    # molecule beads), list defaults to the real working set.
+    out = run(["gc", "--city", CITY, "bd", "--rig", rig, "list",
+               "--created-after", iso_ts, "--json", "--limit=0"])
+    if out is None:
+        return None
+    try:
+        return len(json.loads(out))
+    except json.JSONDecodeError:
+        return None
+
+
+def main() -> int:
+    dry = "--dry-run" in sys.argv[1:]
+    now = time.time()
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    state = load_state()
+    due = []  # (rig, kind, evidence)
+
+    for rig in rigs():
+        name, path = rig["name"], rig["path"]
+        st = state.setdefault(name, {})
+
+        # --- ARCH signal ---
+        head = git_head(path)
+        if head:
+            last_sha = st.get("arch_sha")
+            last_ts = st.get("arch_ts", 0)
+            if not last_sha:
+                # bootstrap: record HEAD, never dispatch on first sight
+                st["arch_sha"], st["arch_ts"] = head, now
+            else:
+                n = commits_since(path, last_sha)
+                if n is None:
+                    # marker no longer reachable (rebase/gc) — re-baseline
+                    st["arch_sha"], st["arch_ts"] = head, now
+                    log({"event": "rebaseline", "rig": name})
+                else:
+                    days = (now - last_ts) / DAY
+                    if n >= ARCH_COMMITS or (n >= 1 and days >= ARCH_MAX_DAYS):
+                        due.append((name, "arch-review-loop",
+                                    f"{n} commits since last review "
+                                    f"({days:.0f}d ago)"))
+
+        # --- BEAD signal ---
+        last_bead_ts = st.get("bead_ts", 0)
+        if not last_bead_ts:
+            st["bead_ts"] = now  # bootstrap
+        else:
+            iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(last_bead_ts))
+            n = beads_created_after(name, iso)
+            if n is not None:
+                days = (now - last_bead_ts) / DAY
+                if n >= BEAD_CHURN or (n >= 1 and days >= BEAD_MAX_DAYS):
+                    due.append((name, "bead-goal-audit",
+                                f"{n} beads created since last audit "
+                                f"({days:.0f}d ago)"))
+
+    if not due:
+        save_state(state)
+        log({"event": "tick", "due": 0, "dry": dry})
+        return 0
+
+    # change-dedup: don't re-mail an identical due-set
+    due_key = hashlib.sha256(
+        json.dumps(sorted((r, k) for r, k, _ in due)).encode()).hexdigest()
+    if state.get("_last_mail_key") == due_key:
+        log({"event": "dedup-skip", "due": len(due)})
+        return 0
+
+    lines = ["VELOCITY-PACED AUDITS DUE (velocity-audit-sensor):", ""]
+    for name, kind, evidence in due:
+        lines.append(f"- {name}: {kind} — {evidence}")
+        lines.append(f"    suggested: gc sling --no-formula <{name} worker> "
+                     f"\"Run the {kind} skill for the {name} rig\"")
+    lines += ["",
+              "Verify each is not already in flight (open bead labeled "
+              "arch-review-loop / bead-goal-audit in that rig), then dispatch "
+              "either way: (a) session-message the rig PL with 'DIRECTIVE: "
+              "VELOCITY_AUDIT (arch|beads)' — the PL prompt carries the "
+              "contract — or (b) sling a worker directly with the suggested "
+              "command. Skill runs need --no-formula (formulas don't survive "
+              "pool-worker routing). Reports land in ~/.claude/arch/reports/ "
+              "and ~/.claude/beads/; bead mutations stay behind the "
+              "decisions-needed gate."]
+    body = "\n".join(lines)
+
+    if dry:
+        print(body)
+        log({"event": "dry-run", "due": len(due)})
+        return 0
+
+    sent = run(["gc", "--city", CITY, "mail", "send", MAYOR,
+                "--from", "velocity-audit-sensor", "--notify",
+                "-s", f"{len(due)} velocity-paced audit(s) due",
+                "-m", body])
+    if sent is None:
+        log({"event": "mail-failed", "due": len(due)})
+        return 1
+
+    # advance markers only for the signals we actually dispatched
+    for name, kind, _ in due:
+        st = state[name]
+        if kind == "arch-review-loop":
+            head = git_head(next(r["path"] for r in rigs() if r["name"] == name))
+            if head:
+                st["arch_sha"], st["arch_ts"] = head, now
+        else:
+            st["bead_ts"] = now
+    state["_last_mail_key"] = due_key
+    save_state(state)
+    log({"event": "dispatched", "due": len(due),
+         "rigs": [f"{r}:{k}" for r, k, _ in due]})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

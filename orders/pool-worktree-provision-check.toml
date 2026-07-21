@@ -1,0 +1,16 @@
+# pool-worktree-provision-check — REPORT-ONLY detector for the gc-dvvym strand
+# class: a LIVE pool member whose base worktree was never `git worktree add`-ed
+# (seeded dir, no .git), so any code bead routed there strands on ENVIRONMENT.
+# This city's pool base worktrees must be pre-created manually (pre_start
+# template substitution is incomplete for city-level rig-scoped pool agents);
+# the reconciler does not self-heal a missing worktree, so polecat-5/6 sat
+# unprovisioned for 2 days before detection. This catches the next scale-up in
+# minutes. NEVER drains/kills/provisions — flags only; the fix is a deliberate
+# drain → `git worktree add` → respawn. Mails mayor only when the unprovisioned
+# SET changes (dedup), so a known strand doesn't re-nudge every tick.
+[order]
+description = "Every 30m: flag any LIVE pool member on an unprovisioned base worktree (no .git — code beads strand on env, gc-dvvym class). Report-only; mails mayor only when the unprovisioned set changes. Never provisions/drains."
+trigger = "cron"
+schedule = "*/30 * * * *"
+exec = "/home/ds/gas-city/bin/pool-worktree-provision-check --nudge-mayor"
+timeout = "2m"

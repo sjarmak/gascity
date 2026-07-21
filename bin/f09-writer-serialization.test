@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK/bin"
+
+ok() { printf 'ok: %s\n' "$1"; }
+fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
+
+# login-wedge-scanner: first process crosses the lock and blocks in session
+# enumeration; the concurrent process must skip before invoking gc. Once
+# released, the first process reaches exactly one bounded kill.
+cat >"$WORK/bin/gc" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1 $2 $3" in
+  "session list --json")
+    printf 'list\n' >>"$CALLS"
+    : >"$ENTERED"
+    while [[ ! -e "$RELEASE" ]]; do sleep 0.02; done
+    printf '%s\n' '[{"id":"gc-test","alias":"worker","state":"active","attached":false}]'
+    ;;
+  "session peek gc-test")
+    printf '%s\n' 'Select login method: Claude account with subscription'
+    ;;
+  "session kill gc-test")
+    printf 'kill\n' >>"$CALLS"
+    ;;
+  "mail send mayor/") : ;;
+  *) printf 'unexpected gc call: %q ' "$@" >&2; exit 2 ;;
+esac
+EOF
+chmod +x "$WORK/bin/gc"
+export PATH="$WORK/bin:$PATH"
+export CALLS="$WORK/login.calls" ENTERED="$WORK/login.entered" RELEASE="$WORK/login.release"
+printf '%s' '{"gc-test":{"first_seen":1}}' >"$WORK/login.state"
+
+login_env=(
+  LOGIN_WEDGE_EXECUTE=1 LOGIN_WEDGE_CONFIRM_SEC=0
+  LOGIN_WEDGE_LOCK="$WORK/login.lock"
+  LOGIN_WEDGE_LOG="$WORK/login.log"
+  LOGIN_WEDGE_STATE="$WORK/login.state"
+)
+env "${login_env[@]}" "$HERE/login-wedge-scanner" --json >"$WORK/login.first.out" &
+first=$!
+for _ in $(seq 1 200); do [[ -e "$ENTERED" ]] && break; sleep 0.01; done
+[[ -e "$ENTERED" ]] || fail "login first writer did not enter"
+env "${login_env[@]}" "$HERE/login-wedge-scanner" --json >"$WORK/login.second.out"
+touch "$RELEASE"
+wait "$first"
+[[ "$(grep -c '^list$' "$CALLS")" -eq 1 ]] || fail "concurrent login scanner entered gc session list"
+[[ "$(grep -c '^kill$' "$CALLS")" -eq 1 ]] || fail "login scanner did not perform exactly one kill"
+jq -e '.event == "scan-skipped-lock" and .recycled == 0' "$WORK/login.second.out" >/dev/null \
+  || fail "login contention was not an audited no-mutation skip"
+grep -q '"event": "scan-skipped-lock"' "$WORK/login.log" \
+  || fail "login lock contention missing from JSONL audit"
+ok "login scanner admits one mutation writer; contender is audited skipped-lock"
+
+# Dolt flatten: fixture stops immediately after the lock boundary, before any
+# server or store command. Two overlapping invocations must produce one entry.
+flatten_env=(
+  DOLT_FLATTEN_LOCK="$WORK/flatten.lock"
+  DOLT_FLATTEN_TEST_ENTER_FILE="$WORK/flatten.entered"
+  DOLT_FLATTEN_TEST_HOLD_SEC=1
+  DOLT_FLATTEN_TEST_EXIT_AFTER_LOCK=1
+  HOME="$WORK/home"
+)
+mkdir -p "$WORK/home/.gc"
+env "${flatten_env[@]}" "$HERE/dolt-flatten-maintenance" 2>"$WORK/flatten.first.log" &
+first=$!
+for _ in $(seq 1 200); do [[ -s "$WORK/flatten.entered" ]] && break; sleep 0.01; done
+[[ -s "$WORK/flatten.entered" ]] || fail "flatten first writer did not enter"
+env "${flatten_env[@]}" "$HERE/dolt-flatten-maintenance" 2>"$WORK/flatten.second.log"
+wait "$first"
+[[ "$(wc -l <"$WORK/flatten.entered")" -eq 1 ]] || fail "concurrent flatten crossed lock boundary"
+grep -q 'SKIP lock-busy' "$WORK/flatten.second.log" \
+  || fail "flatten contention was not audited as lock-busy"
+ok "flatten admits one operation writer; contender is audited skipped-lock"
+
+echo "PASS: F09 whole-operation concurrent serialization fixtures"

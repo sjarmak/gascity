@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""disk-pressure-guard: detect disk pressure early and trim bounded,
+REGENERABLE data when the action threshold is crossed.
+
+Mayor gc-431237 (pre-cleared): root hit 100% today (fleet-wide write failures).
+go-build regrows ~4-8G/cycle, so it re-fills. When root free < THRESHOLD_GB this
+deletes the CONTENTS of a hardcoded allowlist of regenerable caches (go-build,
+golangci-lint, staticcheck, pip, uv). The caches simply rebuild on the next use.
+
+HARD RULES (safety):
+- NEVER `go clean -cache` (incident vp-g96b corrupts the fleet GOCACHE — audit
+  ban-list). This trims via direct rm of the cache dir's children only.
+- NEVER touch /home/ds/.cache/huggingface (active models) or /home/ds/.ollama
+  (ollama serve + RC-gate). They are NOT on the allowlist and a defensive assert
+  refuses any target under a protected path.
+- Only trims the CHILDREN of an allowlisted cache dir (keeps the dir itself).
+
+The guard also contains the bd telemetry incident class: if anonymous metrics
+are disabled but ~/.beads/eventsData grows beyond a bounded threshold, the
+queue is disposable and is atomically detached before deletion. If metrics are
+enabled, the same queue is report-only.
+
+Default DRY-RUN (report would-trim). --apply trims. --nudge-mayor reports freed
+GB when it acts. Audit: .gc/disk-pressure-guard.log (JSONL — free/inodes
+before/after, pressure level, freed data, trigger).
+
+Usage: disk-pressure-guard [--apply] [--nudge-mayor] [--threshold-gb N] [--json]
+Env:   DISK_GUARD_ACTION_GB (default 200), DISK_GUARD_WARN_GB (default 300),
+       DISK_GUARD_CRITICAL_GB (default 100), DISK_GUARD_TELEMETRY_GB (default 1)
+       DISK_GUARD_INODE_ACTION_PCT (default 90)
+"""
+import sys, os, json, time, shutil, subprocess, re, glob, stat
+
+CITY = "/home/ds/gas-city"
+AUDIT_LOG = os.path.join(CITY, ".gc", "disk-pressure-guard.log")
+ROOT = "/"
+HOME = "/home/ds"
+# Regenerable caches — safe to delete contents; rebuild on next use.
+CACHES = [os.path.join(HOME, c) for c in (
+    ".cache/go-build", ".cache/golangci-lint", ".cache/staticcheck",
+    ".cache/pip", ".cache/uv")]
+# Never trim these (active data) — a defensive guard, also simply absent above.
+PROTECTED = [os.path.join(HOME, p) for p in (".cache/huggingface", ".ollama")]
+BD_CONFIG = os.path.join(HOME, ".config", "bd", "config.yaml")
+BD_EVENTS = os.path.join(HOME, ".beads", "eventsData")
+GB = 1024 ** 3
+
+
+def free_gb(path=ROOT):
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize / GB
+
+
+def inode_used_pct(path=ROOT):
+    st = os.statvfs(path)
+    return 100.0 * (st.f_files - st.f_ffree) / st.f_files if st.f_files else 0.0
+
+
+def pressure_level(free, inode_pct, warn=300, action=200, critical=100,
+                   inode_warn=85, inode_action=90, inode_critical=95):
+    if free < critical or inode_pct >= inode_critical:
+        return "critical"
+    if free < action or inode_pct >= inode_action:
+        return "action"
+    if free < warn or inode_pct >= inode_warn:
+        return "warning"
+    return "ok"
+
+
+def dir_gb(path):
+    size, _ok = measured_dir_gb(path)
+    return size
+
+
+def measured_dir_gb(path):
+    try:
+        # Allocated blocks, not apparent bytes: the telemetry incident was
+        # millions of sub-block files whose apparent size hid the real cost.
+        out = subprocess.run(["du", "-sk", path], capture_output=True, text=True, timeout=120)
+        if out.returncode != 0:
+            return 0.0, False
+        return int(out.stdout.split()[0]) * 1024 / GB, True
+    except (subprocess.SubprocessError, OSError, ValueError, IndexError):
+        return 0.0, False
+
+
+def is_protected(path):
+    rp = os.path.realpath(path)
+    if rp in (ROOT, HOME, os.path.realpath(HOME)):
+        return True
+    return any(rp == os.path.realpath(p) or rp.startswith(os.path.realpath(p) + os.sep)
+               for p in PROTECTED)
+
+
+def trim_cache(cache):
+    """Delete the CHILDREN of an allowlisted cache dir. Returns GB freed (approx).
+    Refuses any protected/realpath-escaping target."""
+    if cache not in CACHES or is_protected(cache) or not os.path.isdir(cache):
+        return 0.0
+    before = dir_gb(cache)
+    for name in os.listdir(cache):
+        child = os.path.join(cache, name)
+        if is_protected(child):
+            continue  # never cross into a protected path
+        try:
+            if os.path.islink(child) or os.path.isfile(child):
+                os.unlink(child)
+            elif os.path.isdir(child):
+                shutil.rmtree(child, ignore_errors=True)
+        except OSError:
+            continue
+    return max(0.0, before - dir_gb(cache))
+
+
+def metrics_disabled(config_path=BD_CONFIG):
+    """Read only the user-global metrics.disabled setting, defaulting safely."""
+    try:
+        text = open(config_path, encoding="utf-8").read()
+    except OSError:
+        return False
+    block = re.search(r"(?ms)^metrics:\s*\n((?:^[ \t]+.*\n?)*)", text)
+    return bool(block and re.search(r"(?m)^\s+disabled:\s*true\s*$", block.group(1)))
+
+
+def trim_telemetry_queue(path=BD_EVENTS):
+    """Atomically detach and delete a disabled bd telemetry queue."""
+    if not os.path.isdir(path):
+        return 0.0
+    before = dir_gb(path)
+    detached = f"{path}.reclaim-{os.getpid()}-{time.time_ns()}"
+    try:
+        os.rename(path, detached)
+        os.mkdir(path, 0o700)
+    except OSError:
+        # If detach succeeded but replacement creation failed, restore the
+        # original queue rather than leaving producers without their path.
+        if os.path.isdir(detached) and not os.path.exists(path):
+            try:
+                os.rename(detached, path)
+            except OSError:
+                pass
+        return 0.0
+    try:
+        shutil.rmtree(detached)
+    except OSError:
+        # Keep the detached path visible for the next operator/retry; never
+        # disguise a partial cleanup as success.
+        return max(0.0, before - dir_gb(detached))
+    return before
+
+
+def trim_detached_telemetry(path=BD_EVENTS):
+    """Retry exact residual queues left by an interrupted prior deletion."""
+    freed = 0.0
+    parent = os.path.realpath(os.path.dirname(path))
+    for candidate in glob.glob(f"{path}.reclaim-*"):
+        try:
+            mode = os.lstat(candidate).st_mode
+        except OSError:
+            continue
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            continue
+        if os.path.realpath(os.path.dirname(candidate)) != parent:
+            continue
+        before, ok = measured_dir_gb(candidate)
+        if not ok:
+            continue
+        try:
+            shutil.rmtree(candidate)
+        except OSError:
+            continue
+        freed += before
+    return freed
+
+
+def detached_telemetry_gb(path=BD_EVENTS):
+    total = 0.0
+    for candidate in glob.glob(f"{path}.reclaim-*"):
+        try:
+            mode = os.lstat(candidate).st_mode
+        except OSError:
+            continue
+        if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
+            size, ok = measured_dir_gb(candidate)
+            if not ok:
+                return total, False
+            total += size
+    return total, True
+
+
+def main():
+    argv = sys.argv[1:]
+    apply = "--apply" in argv
+    nudge = "--nudge-mayor" in argv
+    json_out = "--json" in argv
+    action_gb = float(argv[argv.index("--threshold-gb") + 1]) if "--threshold-gb" in argv \
+        else float(os.environ.get("DISK_GUARD_ACTION_GB", "200"))
+    warn_gb = float(os.environ.get("DISK_GUARD_WARN_GB", "300"))
+    critical_gb = float(os.environ.get("DISK_GUARD_CRITICAL_GB", "100"))
+    telemetry_gb = float(os.environ.get("DISK_GUARD_TELEMETRY_GB", "1"))
+    inode_warn_pct = float(os.environ.get("DISK_GUARD_INODE_WARN_PCT", "85"))
+    inode_action_pct = float(os.environ.get("DISK_GUARD_INODE_ACTION_PCT", "90"))
+    inode_critical_pct = float(os.environ.get("DISK_GUARD_INODE_CRITICAL_PCT", "95"))
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+
+    free_before = free_gb()
+    inodes_before = inode_used_pct()
+    pressure = pressure_level(free_before, inodes_before, warn_gb, action_gb,
+                              critical_gb, inode_warn_pct, inode_action_pct,
+                              inode_critical_pct)
+    pressure_triggered = pressure in ("critical", "action")
+    trimmed, total_freed = [], 0.0
+    if pressure_triggered:
+        for cache in CACHES:
+            if not os.path.isdir(cache):
+                continue
+            sz = dir_gb(cache)
+            if sz <= 0.01:
+                continue
+            if apply:
+                freed = trim_cache(cache)
+                total_freed += freed
+                trimmed.append({"cache": cache, "freed_gb": round(freed, 2)})
+            else:
+                trimmed.append({"cache": cache, "would_free_gb": round(sz, 2)})
+                total_freed += sz
+
+    telemetry_current, telemetry_measurement_ok = measured_dir_gb(BD_EVENTS)
+    telemetry_detached, detached_measurement_ok = detached_telemetry_gb()
+    telemetry_measurement_ok = telemetry_measurement_ok and detached_measurement_ok
+    telemetry_size = telemetry_current + telemetry_detached
+    telemetry_disabled = metrics_disabled()
+    telemetry_triggered = telemetry_measurement_ok and telemetry_size >= telemetry_gb
+    if not telemetry_measurement_ok:
+        trimmed.append({"cache": BD_EVENTS, "report_only_gb": round(telemetry_size, 2),
+                        "reason": "measurement-failed"})
+    elif telemetry_triggered:
+        if telemetry_disabled:
+            if apply:
+                # Retry interrupted detached deletion first. Detach the live
+                # queue only when it independently exceeds the bound.
+                freed = trim_detached_telemetry()
+                if telemetry_current >= telemetry_gb:
+                    freed += trim_telemetry_queue()
+                total_freed += freed
+                trimmed.append({"cache": BD_EVENTS, "freed_gb": round(freed, 2),
+                                "reason": "metrics-disabled"})
+            else:
+                total_freed += telemetry_size
+                trimmed.append({"cache": BD_EVENTS, "would_free_gb": round(telemetry_size, 2),
+                                "reason": "metrics-disabled"})
+        else:
+            trimmed.append({"cache": BD_EVENTS, "report_only_gb": round(telemetry_size, 2),
+                            "reason": "metrics-enabled"})
+    free_after = free_gb()
+    inodes_after = inode_used_pct()
+    triggered = pressure_triggered or telemetry_triggered
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    summary = {"ts": now, "warn_gb": warn_gb, "action_gb": action_gb,
+               "critical_gb": critical_gb, "pressure": pressure,
+               "inode_warn_pct": inode_warn_pct,
+               "inode_action_pct": inode_action_pct,
+               "inode_critical_pct": inode_critical_pct,
+               "free_before_gb": round(free_before, 1),
+               "free_after_gb": round(free_after, 1), "triggered": triggered,
+               "inode_used_before_pct": round(inodes_before, 1),
+               "inode_used_after_pct": round(inodes_after, 1),
+               "telemetry_gb": round(telemetry_size, 2),
+               "telemetry_detached_gb": round(telemetry_detached, 2),
+               "telemetry_measurement_ok": telemetry_measurement_ok,
+               "telemetry_triggered": telemetry_triggered,
+               "telemetry_metrics_disabled": telemetry_disabled,
+               "freed_gb": round(total_freed, 2), "apply": apply}
+    try:
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps({**summary, "trimmed": trimmed}) + "\n")
+    except OSError:
+        pass
+
+    if nudge and apply and triggered and total_freed >= 0.5:
+        lines = [f"disk-pressure-guard: pressure={pressure}; root free {free_before:.0f}G, "
+                 f"inodes used {inodes_before:.0f}% -> reclaimed {total_freed:.1f}G "
+                 f"({free_after:.0f}G free now)."]
+        lines += [f"  {t['cache']}: "
+                  f"{t.get('freed_gb', t.get('report_only_gb', 0))}G" for t in trimmed]
+        subprocess.run(["gc", "mail", "send", "mayor", "-s",
+                        f"disk-pressure-guard: freed {total_freed:.1f}G (root {free_after:.0f}G free)",
+                        "-m", "\n".join(lines)], capture_output=True, timeout=30)
+
+    if json_out:
+        print(json.dumps({"summary": summary, "trimmed": trimmed}, indent=2))
+        return 0
+    mode = "APPLY" if apply else "DRY-RUN"
+    verb = "freed" if apply else "would-free"
+    print(f"disk-pressure-guard ({mode})  pressure={pressure} root-free={free_before:.0f}G "
+          f"inodes-used={inodes_before:.0f}% action={action_gb:.0f}G  "
+          f"triggered={triggered}  {verb}={total_freed:.1f}G  free-after={free_after:.0f}G")
+    for t in trimmed:
+        amount = t.get('freed_gb', t.get('would_free_gb', t.get('report_only_gb')))
+        print(f"  {t['cache']}: {amount}G ({t.get('reason', 'regenerable-cache')})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

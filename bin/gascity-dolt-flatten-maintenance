@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# DEPRECATED 2026-07-14: generalized to bin/dolt-flatten-maintenance (all
+# managed dbs above the depth threshold, not just gascity) per mayor scope-add
+# nudge gc-481831 on dr-84l. The gascity-only original is preserved as the
+# .bak-pre-generalize-* sibling. This shim keeps any manual invocation working;
+# remove it once nothing has hit it for a while (invocations are logged by the
+# target script to ~/.gc/dolt-flatten-maintenance.log).
+exec /home/ds/gas-city/bin/dolt-flatten-maintenance "$@"

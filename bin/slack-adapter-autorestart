@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Wait for the city to finish startup, then restart the slack adapter.
+#
+# Reason: under supervisor mode, restarting gascity-supervisor kills the slack
+# adapter process tree but does not respawn it. The adapter has no readiness
+# loop pointed at /v0/cities, so even if it were respawned it would 404 during
+# the adopting_sessions phase. This script bridges the gap from a systemd
+# ExecStartPost hook on gascity-supervisor.service.
+#
+# Behavior:
+#  - Poll /v0/cities for running:true (max ~5 min)
+#  - Once running, POST /service/slack/restart with the required CSRF header
+#  - Logs to ~/.gc/slack-adapter-autorestart.log (append-only, JSONL-ish)
+#  - Exit 0 always; this hook must never fail the supervisor unit
+
+set -u
+
+# GC_CITY can arrive as a city PATH (e.g. /home/ds/gas-city) under some launch
+# contexts, which broke auto-recovery on 2026-06-04 (the poll never matched the
+# city NAME "ds-research" and timed out). Never trust GC_CITY as the name —
+# resolve the running city's name from the API below. Keep a sanitized fallback.
+FALLBACK_CITY="${GC_CITY:-ds-research}"
+case "$FALLBACK_CITY" in /*) FALLBACK_CITY="ds-research" ;; esac
+API="${GC_SUPERVISOR_API:-http://127.0.0.1:8372}"
+LOG="${HOME}/.gc/slack-adapter-autorestart.log"
+MAX_POLL_SECONDS=300
+POLL_INTERVAL=3
+
+mkdir -p "$(dirname "$LOG")"
+
+log() {
+  printf '{"ts":"%s","event":"%s","detail":%s}\n' \
+    "$(date -Iseconds)" "$1" "${2:-null}" >> "$LOG"
+}
+
+log "start" "\"resolving running city (fallback=$FALLBACK_CITY)\""
+
+# Resolve the running city's NAME from the API rather than trusting GC_CITY.
+deadline=$(( $(date +%s) + MAX_POLL_SECONDS ))
+CITY=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  body=$(curl -sS --max-time 5 "$API/v0/cities" 2>/dev/null || true)
+  CITY=$(printf '%s' "$body" | jq -r '.items[]? | select(.running==true) | .name' 2>/dev/null | head -1)
+  if [ -n "$CITY" ] && [ "$CITY" != "null" ]; then
+    break
+  fi
+  CITY=""
+  sleep "$POLL_INTERVAL"
+done
+
+if [ -z "$CITY" ]; then
+  log "timeout" "\"no city reached running:true within ${MAX_POLL_SECONDS}s\""
+  exit 0
+fi
+
+log "city_running" "\"city=$CITY\""
+
+# Check if slack adapter is already healthy. If so, skip restart.
+adapters=$(curl -sS --max-time 5 "$API/v0/city/$CITY/extmsg/adapters" 2>/dev/null || true)
+if printf '%s' "$adapters" | grep -q '"provider":"slack"'; then
+  log "skip_already_healthy" "null"
+  exit 0
+fi
+
+resp=$(curl -sS --max-time 10 -X POST -H "X-GC-Request: 1" \
+  "$API/v0/city/$CITY/service/slack/restart" 2>/dev/null || true)
+log "restart_response" "$(printf '%s' "$resp" | jq -Rs . 2>/dev/null || echo '"<no jq>"')"
+
+# Verify
+sleep 3
+adapters_after=$(curl -sS --max-time 5 "$API/v0/city/$CITY/extmsg/adapters" 2>/dev/null || true)
+if printf '%s' "$adapters_after" | grep -q '"provider":"slack"'; then
+  log "verified_healthy" "null"
+else
+  log "verify_failed" "$(printf '%s' "$adapters_after" | jq -Rs . 2>/dev/null || echo '"<no jq>"')"
+fi
+
+exit 0

@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# close-gate-reaper: reopen recently-closed beads that match a configured
+# evidence rule but lack required metadata.
+#
+# Config: /home/ds/gas-city/.gc/close-gates.yaml
+# Audit:  /home/ds/gas-city/.gc/close-gate-reaper.log (JSONL)
+#
+# Usage:
+#   close-gate-reaper                  # dry-run report
+#   close-gate-reaper --apply          # actually reopen offenders
+#   close-gate-reaper --nudge-mayor    # also mail mayor if findings
+#
+# Runs hourly from close-gate-reaper.timer. Safe to run ad hoc.
+
+set -euo pipefail
+
+CONFIG="${CLOSE_GATES_CONFIG:-/home/ds/gas-city/.gc/close-gates.yaml}"
+AUDIT_LOG="${CLOSE_GATE_AUDIT_LOG:-/home/ds/gas-city/.gc/close-gate-reaper.log}"
+
+APPLY=0
+NUDGE_MAYOR=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)        APPLY=1; shift ;;
+    --nudge-mayor)  NUDGE_MAYOR=1; shift ;;
+    --config)       CONFIG="$2"; shift 2 ;;
+    -h|--help)
+      sed -n 's/^# \{0,1\}//p' "$0" | head -14
+      exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ ! -r "$CONFIG" ]]; then
+  echo "close-gate-reaper: config not readable: $CONFIG" >&2
+  exit 2
+fi
+
+# Parse YAML via python (available on this host; no yq dependency).
+CONFIG_JSON=$(python3 -c '
+import json, sys, yaml
+with open(sys.argv[1], "rb") as f:
+    data = yaml.safe_load(f)
+json.dump(data, sys.stdout)
+' "$CONFIG")
+
+enabled_since=$(jq -r '.enabled_since // "1970-01-01T00:00:00Z"' <<<"$CONFIG_JSON")
+bypass_key=$(jq -r '.bypass_metadata_key // "gate_bypass"' <<<"$CONFIG_JSON")
+grace_seconds=$(jq -r '.grace_seconds // 0' <<<"$CONFIG_JSON")
+
+enabled_epoch=$(date -d "$enabled_since" +%s)
+now_epoch=$(date +%s)
+cutoff_close_epoch=$((now_epoch - grace_seconds))
+
+log_event() {
+  # log_event <event> <rule> <bead> <scope> <extra-json>
+  local event=$1 rule=$2 bead=$3 scope=$4 extra=${5:-'{}'}
+  local ts
+  # UTC Z-form so jq fromdateiso8601 can parse (local offsets silently break it).
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  jq -cn --arg ts "$ts" \
+         --arg event "$event" \
+         --arg rule "$rule" \
+         --arg bead "$bead" \
+         --arg scope "$scope" \
+         --argjson extra "$extra" \
+    '{ts:$ts, event:$event, rule:$rule, bead:$bead, scope:$scope} + $extra' \
+    >> "$AUDIT_LOG"
+}
+
+# Returns 0 if a matching bypass_respected event for this (rule, bead, reason)
+# already exists in the audit log. Same reason → no re-emit (fixes hourly
+# rescan amplification of bypass_respected counts in the pattern miner).
+already_logged_bypass() {
+  local rule=$1 bead=$2 reason=$3
+  [[ -f "$AUDIT_LOG" ]] || return 1
+  grep -F '"event":"bypass_respected"' "$AUDIT_LOG" 2>/dev/null \
+    | jq -e --arg r "$rule" --arg b "$bead" --arg reason "$reason" \
+        'select(.rule == $r and .bead == $b and .bypass_reason == $reason)' \
+        >/dev/null 2>&1
+}
+
+# --- unmerged-branch check support (RCA docs/rca-eb-merge-gap-2026-07-12.md §4c) ---
+# A closed bead whose work/<id> branch head is neither an ancestor of the rig's
+# base branch nor patch-equivalent to it has unlanded content — "closed" != it
+# landed. These helpers back the `check: unmerged_branch` rule type below.
+
+# Rig name -> checkout path, from structured JSON (the text `gc rig list` parse
+# mis-attributes paths when a name line carries a "(suspended)"/"(HQ)" suffix).
+declare -A RIG_PATHS
+while IFS=$'\t' read -r _rig _path; do
+  [[ -n "$_rig" && -n "$_path" ]] && RIG_PATHS["$_rig"]="$_path"
+done < <(gc rig list --json 2>/dev/null | jq -r '.rigs[]? | [.name, .path] | @tsv')
+
+default_branch() {
+  local rig_path=$1 sym
+  sym=$(git -C "$rig_path" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null) || true
+  if [[ -n "$sym" ]]; then echo "${sym##*/}"; return; fi
+  if git -C "$rig_path" show-ref --verify --quiet refs/heads/main; then echo "main"; return; fi
+  if git -C "$rig_path" show-ref --verify --quiet refs/heads/master; then echo "master"; return; fi
+  echo "main"
+}
+
+# landing_status <rig_path> <branch> <base> ->
+#   no_branch | landed | patch_equiv | unmerged:<n-ahead>
+landing_status() {
+  local rig_path=$1 branch=$2 base=$3 tip ahead
+  git -C "$rig_path" show-ref --verify --quiet "refs/heads/$branch" || { echo "no_branch"; return; }
+  tip=$(git -C "$rig_path" rev-parse "$branch" 2>/dev/null) || { echo "no_branch"; return; }
+  if git -C "$rig_path" merge-base --is-ancestor "$tip" "$base" 2>/dev/null; then echo "landed"; return; fi
+  ahead=$(git -C "$rig_path" cherry "$base" "$branch" 2>/dev/null | grep -c '^+' || true)
+  if [[ "${ahead:-0}" == "0" ]]; then echo "patch_equiv"; else echo "unmerged:$ahead"; fi
+}
+
+# process_unmerged_rule <rule_json>: flag closed beads in the rule's scope whose
+# work branch is unlanded. With `reopen: true` the offenders join `findings`
+# (reopened + nudged like any gate failure); otherwise they go to `flagged`
+# (reported + audit-logged only) — the safe default until the work-landing-reaper
+# is the active fixer, so we never reopen beads into a queue with no landing path.
+process_unmerged_rule() {
+  local rule_json=$1
+  local rule_id scope base rig_path reopen_flag reopen_reason
+  rule_id=$(jq -r '.id' <<<"$rule_json")
+  scope=$(jq -r '.scope // "city"' <<<"$rule_json")
+  base=$(jq -r '.base_branch // ""' <<<"$rule_json")
+  reopen_flag=$(jq -r '.reopen // false' <<<"$rule_json")
+  reopen_reason=$(jq -r '.reopen_reason // "closed bead has unlanded commits — not reachable from base branch"' <<<"$rule_json")
+  rig_path=${RIG_PATHS[$scope]:-}
+  if [[ -z "$rig_path" || ! ( -d "$rig_path/.git" || -f "$rig_path/.git" ) ]]; then
+    return 0
+  fi
+  [[ -z "$base" || "$base" == "null" ]] && base=$(default_branch "$rig_path")
+
+  local -A HAVE_BRANCH=()
+  while IFS= read -r ref; do [[ -n "$ref" ]] && HAVE_BRANCH["$ref"]=1; done \
+    < <(git -C "$rig_path" for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null)
+
+  local closed_json candidates
+  closed_json=$(gc bd --rig "$scope" list --status=closed --json --limit=0 2>/dev/null || echo '[]')
+  candidates=$(jq -c --argjson enabled "$enabled_epoch" --argjson cutoff "$cutoff_close_epoch" '
+    .[] |
+    select(((.updated_at // "1970-01-01T00:00:00Z") | sub("\\.[0-9]+Z$";"Z") | fromdateiso8601) >= $enabled) |
+    select(((.updated_at // "1970-01-01T00:00:00Z") | sub("\\.[0-9]+Z$";"Z") | fromdateiso8601) <= $cutoff) |
+    {id, metadata}
+  ' <<<"$closed_json")
+
+  while IFS= read -r bead_json; do
+    [[ -z "$bead_json" ]] && continue
+    local id branch bypass status ahead
+    id=$(jq -r '.id' <<<"$bead_json")
+    bypass=$(jq -r --arg k "$bypass_key" '(.metadata // {})[$k] // ""' <<<"$bead_json")
+    [[ -n "$bypass" ]] && continue
+    branch=$(jq -r '(.metadata // {}).work_branch // ""' <<<"$bead_json")
+    [[ -z "$branch" || "$branch" == "null" ]] && branch="work/$id"
+    [[ -n "${HAVE_BRANCH[$branch]:-}" ]] || continue
+    status=$(landing_status "$rig_path" "$branch" "$base")
+    case "$status" in unmerged:*) : ;; *) continue ;; esac
+    ahead=${status#unmerged:}
+    if [[ "$reopen_flag" == "true" ]]; then
+      local miss; miss=$(jq -cn --arg s "unmerged branch $branch ($ahead ahead of $base)" '[$s]')
+      findings+=("$id|$scope|$rule_id|$miss")
+      log_event "evidence_missing" "$rule_id" "$id" "$scope" \
+        "$(jq -cn --arg br "$branch" --argjson a "$ahead" '{unmerged_branch:$br, ahead:$a}')"
+    else
+      flagged+=("$id|$scope|$rule_id|$branch|$ahead")
+      log_event "unmerged_branch_flagged" "$rule_id" "$id" "$scope" \
+        "$(jq -cn --arg br "$branch" --argjson a "$ahead" '{branch:$br, ahead:$a}')"
+    fi
+  done <<<"$candidates"
+}
+
+# evaluate_bead prints offending field paths (one per line) if the bead is
+# missing required metadata, empty otherwise. Emits "__BYPASS__:..." on bypass
+# or "__OUT_OF_SCOPE__:<reason>" when the rule's preconditions are not met.
+evaluate_bead() {
+  local bead_json=$1
+  local required_paths=$2      # JSON array of {path, hint}
+  local require_paths=$3       # JSON array of {path, value} — metadata preconditions
+  local require_mol_formula=$4 # string — molecule's formula title must equal this
+  local scope_for_mol=$5       # rig name for the bead, used to fetch molecule
+
+  # Short-circuit on bypass.
+  local bypass
+  bypass=$(jq -r --arg k "$bypass_key" '(.metadata // {}) | (.[$k] // "")' <<<"$bead_json")
+  if [[ -n "$bypass" ]]; then
+    echo "__BYPASS__:$bypass"
+    return 0
+  fi
+
+  # Precondition: require_molecule_formula — bead.metadata.molecule_id must
+  # point to a wisp whose title matches the given formula name. This is the
+  # dispatch-side truth signal (set when gc-sling attaches the wisp), not
+  # dependent on the worker successfully executing formula steps.
+  if [[ -n "$require_mol_formula" && "$require_mol_formula" != "null" && "$require_mol_formula" != "" ]]; then
+    local mol_id
+    mol_id=$(jq -r '(.metadata // {}).molecule_id // ""' <<<"$bead_json")
+    if [[ -z "$mol_id" ]]; then
+      echo "__OUT_OF_SCOPE__:no-molecule-id"
+      return 0
+    fi
+    local mol_title
+    if [[ "$scope_for_mol" == "city" ]]; then
+      mol_title=$(bd show "$mol_id" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .title // ""')
+    else
+      mol_title=$(gc bd --rig "$scope_for_mol" show "$mol_id" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .title // ""')
+    fi
+    if [[ "$mol_title" != "$require_mol_formula" ]]; then
+      echo "__OUT_OF_SCOPE__:molecule-title=${mol_title:-missing}"
+      return 0
+    fi
+  fi
+
+  # Precondition check: all `require_metadata` entries must match. If any
+  # fails, the bead is out of scope for this rule (e.g. never went through
+  # the formula that would have marked it). Print __OUT_OF_SCOPE__ and stop.
+  #
+  # Lookup tries the flat dotted key first ($bead.metadata["evidence.artifact_path"])
+  # because that's what `bd update --set-metadata evidence.artifact_path=value`
+  # actually writes. Falls back to nested traversal so legacy or
+  # ergonomically-nested metadata still works.
+  if [[ -n "$require_paths" && "$require_paths" != "null" && "$require_paths" != "[]" ]]; then
+    local miss
+    miss=$(jq -r --argjson require "$require_paths" '
+      . as $bead |
+      $require[] |
+      .path as $p |
+      .value as $expected |
+      ((($bead.metadata // {})[$p]) //
+       (($p | split(".")) as $parts |
+        reduce $parts[] as $seg (($bead.metadata // {}); .[$seg]?))) as $val |
+      if ($expected == null) then
+        # No value specified: just require presence (non-null, non-empty).
+        if ($val == null or $val == "" or $val == false) then $p else empty end
+      else
+        if ($val != $expected) then $p else empty end
+      end
+    ' <<<"$bead_json")
+    if [[ -n "$miss" ]]; then
+      echo "__OUT_OF_SCOPE__:$(tr '\n' ',' <<<"$miss" | sed 's/,$//')"
+      return 0
+    fi
+  fi
+
+  jq -r --argjson required "$required_paths" '
+    . as $bead |
+    $required[] |
+    .path as $p |
+    ((($bead.metadata // {})[$p]) //
+     (($p | split(".")) as $parts |
+      reduce $parts[] as $seg (($bead.metadata // {}); .[$seg]?))) as $val |
+    if ($val == null or $val == "" or $val == false) then $p else empty end
+  ' <<<"$bead_json"
+}
+
+# Process one rule.
+findings=()   # id|scope|rule|reason
+bypasses=()   # id|scope|rule|bypass_reason
+flagged=()    # id|scope|rule|branch|ahead  (unmerged_branch, informational)
+
+process_rule() {
+  local rule_json=$1
+  local rule_id
+  rule_id=$(jq -r '.id' <<<"$rule_json")
+
+  # Route the git-based unmerged-branch check to its own evaluator; the
+  # metadata path below is untouched for all existing rules.
+  local check_type
+  check_type=$(jq -r '.check // "metadata"' <<<"$rule_json")
+  if [[ "$check_type" == "unmerged_branch" ]]; then
+    process_unmerged_rule "$rule_json"
+    return
+  fi
+  local scope
+  scope=$(jq -r '.scope // "city"' <<<"$rule_json")
+  local id_pattern
+  id_pattern=$(jq -r '.id_pattern // ""' <<<"$rule_json")
+  local title_pattern
+  title_pattern=$(jq -r '.title_pattern // ""' <<<"$rule_json")
+  local required_paths
+  required_paths=$(jq -c '.required_metadata' <<<"$rule_json")
+  local require_paths
+  require_paths=$(jq -c '.require_metadata // []' <<<"$rule_json")
+  local require_mol_formula
+  require_mol_formula=$(jq -r '.require_molecule_formula // ""' <<<"$rule_json")
+  local reopen_reason
+  reopen_reason=$(jq -r '.reopen_reason' <<<"$rule_json")
+
+  # Fetch closed beads in this scope. Use a large limit; 0 = no limit per bd CLI.
+  local closed_json
+  if [[ "$scope" == "city" ]]; then
+    closed_json=$(bd list --status=closed --json --limit=0 2>/dev/null || echo '[]')
+  else
+    closed_json=$(gc bd --rig "$scope" list --status=closed --json --limit=0 2>/dev/null || echo '[]')
+  fi
+
+  # Filter to candidates: id matches id_pattern OR title matches title_pattern,
+  # AND updated_at is in the enabled window, AND closed long enough ago to
+  # pass the grace period. Empty patterns are ignored.
+  local candidates
+  candidates=$(jq -c --arg id_re "$id_pattern" \
+                     --arg title_re "$title_pattern" \
+                     --argjson enabled "$enabled_epoch" \
+                     --argjson cutoff "$cutoff_close_epoch" '
+    .[] |
+    select(
+      ($id_re != "" and (.id | test($id_re))) or
+      ($title_re != "" and ((.title // "") | test($title_re)))
+    ) |
+    select(((.updated_at // "1970-01-01T00:00:00Z") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) >= $enabled) |
+    select(((.updated_at // "1970-01-01T00:00:00Z") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) <= $cutoff) |
+    {id, title, status, updated_at, metadata}
+  ' <<<"$closed_json")
+
+  while IFS= read -r bead_json; do
+    [[ -z "$bead_json" ]] && continue
+    local bead_id
+    bead_id=$(jq -r '.id' <<<"$bead_json")
+
+    local eval_out
+    eval_out=$(evaluate_bead "$bead_json" "$required_paths" "$require_paths" "$require_mol_formula" "$scope")
+
+    if [[ -z "$eval_out" ]]; then
+      # All required fields present — bead passes the gate.
+      continue
+    fi
+
+    if [[ "${eval_out:0:10}" == "__BYPASS__" ]]; then
+      local bypass_reason="${eval_out#__BYPASS__:}"
+      bypasses+=("$bead_id|$scope|$rule_id|$bypass_reason")
+      if ! already_logged_bypass "$rule_id" "$bead_id" "$bypass_reason"; then
+        log_event "bypass_respected" "$rule_id" "$bead_id" "$scope" \
+          "$(jq -cn --arg r "$bypass_reason" '{bypass_reason:$r}')"
+      fi
+      continue
+    fi
+
+    if [[ "${eval_out:0:16}" == "__OUT_OF_SCOPE__" ]]; then
+      # Rule preconditions not met — this close is intentionally outside
+      # the rule's scope (e.g. user-direct close with no formula marker).
+      # Don't log routine out-of-scope; it would flood the audit log.
+      continue
+    fi
+
+    local missing_paths
+    missing_paths=$(jq -Rsc 'split("\n") | map(select(length > 0))' <<<"$eval_out")
+    findings+=("$bead_id|$scope|$rule_id|$missing_paths")
+    log_event "evidence_missing" "$rule_id" "$bead_id" "$scope" \
+      "$(jq -cn --argjson m "$missing_paths" '{missing:$m}')"
+  done <<<"$candidates"
+}
+
+# Iterate rules.
+num_rules=$(jq '.rules | length' <<<"$CONFIG_JSON")
+for i in $(seq 0 $((num_rules - 1))); do
+  rule=$(jq -c ".rules[$i]" <<<"$CONFIG_JSON")
+  process_rule "$rule"
+done
+
+# Report.
+report=$(mktemp)
+trap 'rm -f "$report"' EXIT
+
+{
+  printf 'close-gate-reaper: %d offending close(s), %d bypass(es)\n' \
+    "${#findings[@]}" "${#bypasses[@]}"
+  if (( ${#findings[@]} > 0 )); then
+    echo
+    printf '%-22s %-22s %-28s %s\n' BEAD SCOPE RULE MISSING
+    printf '%-22s %-22s %-28s %s\n' ---- ----- ---- -------
+    for row in "${findings[@]}"; do
+      IFS='|' read -r id scope rule missing <<<"$row"
+      printf '%-22s %-22s %-28s %s\n' "$id" "$scope" "$rule" "$missing"
+    done
+  fi
+  if (( ${#bypasses[@]} > 0 )); then
+    echo
+    echo "Bypasses honored:"
+    for row in "${bypasses[@]}"; do
+      IFS='|' read -r id scope rule reason <<<"$row"
+      printf '  %-22s %-22s %-28s %s\n' "$id" "$scope" "$rule" "$reason"
+    done
+  fi
+  if (( ${#flagged[@]} > 0 )); then
+    echo
+    echo "Flagged (closed with unlanded branch — informational, not reopened;"
+    echo "the work-landing-reaper is the fixer, RCA §4b):"
+    printf '  %-22s %-18s %-32s %s\n' BEAD SCOPE BRANCH AHEAD
+    for row in "${flagged[@]}"; do
+      IFS='|' read -r id scope rule branch ahead <<<"$row"
+      printf '  %-22s %-18s %-32s %s\n' "$id" "$scope" "$branch" "$ahead"
+    done
+  fi
+  if (( ${#findings[@]} > 0 )); then
+    echo
+    if (( APPLY )); then
+      echo "Mode: APPLY (reopening offenders)"
+    else
+      echo "Mode: DRY-RUN (re-run with --apply to reopen)"
+    fi
+  fi
+} > "$report"
+
+cat "$report"
+
+reopened=0
+if (( APPLY )) && (( ${#findings[@]} > 0 )); then
+  for row in "${findings[@]}"; do
+    IFS='|' read -r id scope rule missing <<<"$row"
+    # Look up rule's reopen_reason
+    reason=$(jq -r --arg r "$rule" '.rules[] | select(.id == $r) | .reopen_reason' <<<"$CONFIG_JSON")
+    if [[ "$scope" == "city" ]]; then
+      if bd reopen "$id" --reason "$reason" >/dev/null 2>&1; then
+        reopened=$((reopened + 1))
+        log_event "reopened" "$rule" "$id" "$scope" '{}'
+      else
+        log_event "reopen_failed" "$rule" "$id" "$scope" '{}'
+      fi
+    else
+      if gc bd --rig "$scope" reopen "$id" --reason "$reason" >/dev/null 2>&1; then
+        reopened=$((reopened + 1))
+        log_event "reopened" "$rule" "$id" "$scope" '{}'
+      else
+        log_event "reopen_failed" "$rule" "$id" "$scope" '{}'
+      fi
+    fi
+  done
+  echo
+  echo "Reopened $reopened of ${#findings[@]} bead(s)."
+fi
+
+if (( NUDGE_MAYOR )) && (( ${#findings[@]} > 0 )); then
+  msg="close-gate-reaper report
+$(cat "$report")"
+  gc session nudge mayor "$msg" >/dev/null 2>&1 || true
+fi
+
+exit 0

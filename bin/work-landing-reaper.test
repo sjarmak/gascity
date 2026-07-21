@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# Standalone test for work-landing-reaper's landed_sha handling (dr-gkq4).
+#
+# Regression under test: a reviewed branch cherry-picked onto base with
+# conflict-adjusted content makes `git cherry` report '+' (not patch-
+# equivalent), so ancestry/patch-equivalence classified the bead as unlanded
+# and --apply could re-land already-shipped work. The reaper must honor a
+# recorded landed_sha that verifies as a commit reachable from base — and must
+# NOT trust the metadata alone: missing/non-commit/non-ancestor values continue
+# through artifact inspection and are reported as SUSPECT.
+#
+# Asserts (function level, via WORK_LANDING_REAPER_LIB=1 source):
+#   1. conflict-adjusted cherry-pick -> landing_status = unmerged:1 (the trap)
+#   2. recorded_landed_status: sha on base            -> verified
+#   3. recorded_landed_status: sha not on base        -> not_ancestor
+#   4. recorded_landed_status: unknown sha            -> missing_commit
+#   5. recorded_landed_status: garbage value          -> not_commit
+#
+# Asserts (end-to-end dry-run, `gc` stubbed on PATH):
+#   6. bead with verified landed_sha is NOT reported (neither would --apply it)
+#   7. bead with verified legacy gc.landed_sha is NOT reported
+#   8. truly unlanded bead IS still reported
+#   9. bead with non-ancestor landed_sha is reported as SUSPECT (and still
+#      goes through normal classification)
+#  10. audit log records skipped_recorded_landed_sha for the verified bead
+#
+# Run:  bash /home/ds/gas-city/bin/work-landing-reaper.test
+
+set -uo pipefail
+
+REAPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/work-landing-reaper"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+export WORK_LANDING_REAPER_LIB=1
+# shellcheck source=/dev/null
+source "$REAPER"
+set +e  # sourced script enables -e; tests manage their own failures
+
+fail=0
+check() {
+  local name=$1 expected=$2 actual=$3
+  if [[ "$actual" == "$expected" ]]; then
+    echo "PASS: $name (got '$actual')"
+  else
+    echo "FAIL: $name (expected '$expected', got '$actual')"
+    fail=1
+  fi
+}
+check_contains() {
+  local name=$1 needle=$2 haystack=$3
+  if grep -qF -- "$needle" <<<"$haystack"; then
+    echo "PASS: $name (found '$needle')"
+  else
+    echo "FAIL: $name ('$needle' not in output)"
+    fail=1
+  fi
+}
+check_not_contains() {
+  local name=$1 needle=$2 haystack=$3
+  if grep -qF -- "$needle" <<<"$haystack"; then
+    echo "FAIL: $name ('$needle' unexpectedly in output)"
+    fail=1
+  else
+    echo "PASS: $name ('$needle' absent)"
+  fi
+}
+
+# --- Fixture repo: base + a conflict-adjusted cherry-pick landing -------------
+REPO="$WORK/rig"
+git init -q -b main "$REPO"
+git -C "$REPO" config user.email t@t
+git -C "$REPO" config user.name t
+echo base > "$REPO/file.txt"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm base
+
+# Branch work/eb-landed: commit A.
+git -C "$REPO" checkout -qb work/eb-landed
+echo "landed change v1" > "$REPO/f.txt"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm "A: landed change"
+
+# Base: same change landed with conflict-adjusted content -> different patch-id,
+# so `git cherry` reports '+' for A even though the work shipped.
+git -C "$REPO" checkout -q main
+echo "landed change v1 (conflict-resolved wording)" > "$REPO/f.txt"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm "A': cherry-pick of A with conflict resolution"
+LANDED_SHA=$(git -C "$REPO" rev-parse HEAD)
+
+# Branch work/eb-legacy: same shape, stamped via legacy gc.landed_sha key.
+git -C "$REPO" checkout -qb work/eb-legacy main
+echo "legacy change" > "$REPO/l.txt"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm "L: legacy change"
+git -C "$REPO" checkout -q main
+echo "legacy change (adjusted)" > "$REPO/l.txt"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm "L': landed with adjustment"
+LEGACY_SHA=$(git -C "$REPO" rev-parse HEAD)
+
+# Branch work/eb-unlanded: genuinely unlanded, no landed_sha.
+git -C "$REPO" checkout -qb work/eb-unlanded main
+echo unlanded > "$REPO/g.txt"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm "B: unlanded change"
+
+# Branch work/eb-suspect: unlanded, stamped with a sha NOT reachable from main.
+git -C "$REPO" checkout -qb work/eb-suspect main
+echo suspect > "$REPO/h.txt"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm "C: suspect change"
+SUSPECT_SHA=$(git -C "$REPO" rev-parse HEAD)   # branch tip: not on main
+git -C "$REPO" checkout -q main
+
+# --- 1-5: function-level ------------------------------------------------------
+check "conflict-adjusted cherry-pick still reads unmerged" \
+  "unmerged:1" "$(landing_status "$REPO" work/eb-landed main)"
+check "landed_sha on base -> verified" \
+  "verified" "$(recorded_landed_status "$REPO" "$LANDED_SHA" main)"
+check "landed_sha not on base -> not_ancestor" \
+  "not_ancestor" "$(recorded_landed_status "$REPO" "$SUSPECT_SHA" main)"
+check "unknown sha -> missing_commit" \
+  "missing_commit" "$(recorded_landed_status "$REPO" "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" main)"
+check "garbage value -> not_commit" \
+  "not_commit" "$(recorded_landed_status "$REPO" "not-a-sha" main)"
+
+# --- 6-10: end-to-end dry-run with stubbed gc --------------------------------
+FIX="$WORK/fix"
+mkdir -p "$FIX/bin"
+
+jq -n --arg path "$REPO" '{rigs:[{name:"testrig", path:$path}]}' > "$FIX/rigs.json"
+jq -n --arg landed "$LANDED_SHA" --arg legacy "$LEGACY_SHA" --arg suspect "$SUSPECT_SHA" '[
+  {id:"eb-landed",   metadata:{review_verdict:"pass", landed_sha:$landed}},
+  {id:"eb-legacy",   metadata:{review_verdict:"pass", "gc.landed_sha":$legacy}},
+  {id:"eb-unlanded", metadata:{review_verdict:"pass"}},
+  {id:"eb-suspect",  metadata:{review_verdict:"pass", landed_sha:$suspect}}
+]' > "$FIX/beads.json"
+
+cat > "$FIX/bin/gc" <<STUB
+#!/usr/bin/env bash
+case "\$1" in
+  rig) cat "$FIX/rigs.json" ;;
+  bd)  cat "$FIX/beads.json" ;;
+  *)   exit 0 ;;
+esac
+STUB
+chmod +x "$FIX/bin/gc"
+
+cat > "$FIX/work-landing.yaml" <<'YAML'
+rigs:
+  - name: testrig
+    base_branch: main
+YAML
+
+OUT=$(PATH="$FIX/bin:$PATH" \
+      WORK_LANDING_REAPER_LIB=0 \
+      WORK_LANDING_CONFIG="$FIX/work-landing.yaml" \
+      WORK_LANDING_AUDIT_LOG="$FIX/audit.log" \
+      bash "$REAPER" 2>&1)
+rc=$?
+check "dry-run exits 0" "0" "$rc"
+
+check_not_contains "verified landed_sha bead not reported"        "eb-landed "  "$OUT"
+check_not_contains "verified legacy gc.landed_sha bead not reported" "eb-legacy" "$OUT"
+check_contains     "truly unlanded bead still reported"           "eb-unlanded" "$OUT"
+check_contains     "suspect bucket emitted"                       "SUSPECT landed_sha" "$OUT"
+check_contains     "non-ancestor stamp flagged with reason"       "not_ancestor:$SUSPECT_SHA" "$OUT"
+
+AUDIT=$(cat "$FIX/audit.log" 2>/dev/null)
+check_contains "audit: verified skip logged"  "skipped_recorded_landed_sha" "$AUDIT"
+check_contains "audit: suspect stamp logged"  "landed_sha_suspect"          "$AUDIT"
+
+echo
+if (( fail )); then echo "RESULT: FAIL"; exit 1; else echo "RESULT: PASS"; exit 0; fi

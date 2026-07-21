@@ -1,0 +1,6 @@
+Blinding map (de-blind only in the diff report):
+task-01: A=sonnet B=fable C=opus
+task-02: A=opus B=sonnet C=fable
+task-03: A=fable B=opus C=sonnet
+task-04: A=sonnet B=opus C=fable
+task-05: A=opus B=fable C=sonnet

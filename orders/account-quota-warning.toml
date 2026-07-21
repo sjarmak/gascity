@@ -1,0 +1,9 @@
+[order]
+description = "Every 30m: silently capacity-balance non-pinned Claude agents across healthy accounts and slack-ping gascity-maintenance only when an account's 7-day quota exceeds 75% (QUOTA_WARN_PCT). Balance = gc-capacity --rebalance auto --no-reset + gc reload, weighted by remaining 5h/7d quota and stable once converged; hot accounts receive no movable workers. Pinned agents are never auto-moved and are called out explicitly for hand relocation. Per-account alert dedupe follows the 7d reset window; routine balancing produces no Slack/mail noise."
+trigger = "cron"
+schedule = "*/30 * * * *"
+exec = "/home/ds/gas-city/bin/account-quota-warning"
+timeout = "180s"
+
+[order.env]
+QUOTA_AUTO_DRAIN = "1"

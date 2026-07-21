@@ -1,0 +1,16 @@
+# Widened daily (05:00 cron) -> hourly (cooldown) 2026-07-17 per Stephanie: a
+# stale-fleet audit found the gas-city index itself 33d stale (4 files
+# indexed vs 36 pending adds) despite this order existing, and daily left too
+# wide a drift window for Explore agents treating CodeGraph as authoritative.
+# `codegraph sync` is incremental/cheap so hourly is safe; the Sunday
+# full-`index` promotion in bin/codegraph-sync was narrowed to the 05:00
+# hour-of-day so it still fires once/week, not once/hour on Sundays. Undo:
+# revert to trigger=cron schedule="0 5 * * *" if hourly proves too chatty in
+# the log or scix-batch queue.
+[order]
+description = "Hourly refresh of the per-rig CodeGraph semantic indexes. Nothing else updates them, and Explore agents treat CodeGraph as their PRIMARY authoritative source — so a stale index silently makes them reason on old code. Runs incremental `codegraph sync` every hour; the script auto-promotes to a full `codegraph index` once weekly (Sunday 05:00 slot) to repair drift incremental sync can miss. Every codegraph call is wrapped in scix-batch (memory-capped transient cgroup) so a full re-index can't OOM-kill the mayor/supervisor."
+trigger = "cooldown"
+interval = "1h"
+exec = "/home/ds/gas-city/bin/codegraph-sync"
+timeout = "60m"
+idempotent = true

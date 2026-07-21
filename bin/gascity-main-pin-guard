@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# gascity-main-pin-guard — keep /home/ds/gascity-main pinned to `main`.
+#
+# Why this exists (2026-05-29):
+#
+#   gascity-main is the canonical tree gcsync pulls + builds the installed
+#   `gc` binary from. It MUST stay on `main`. But ship/test verification
+#   work routinely borrows it as scratch — e.g. on 2026-05-25 a mayor
+#   ship-verification subagent ran:
+#
+#       cd /home/ds/gascity-main && git checkout -q origin/main && \
+#         go test -run TestPolecatFormulaHaltsOnAutoPushFalse ./examples/gastown/...
+#
+#   …to test a file against origin/main, then moved back to its ship
+#   worktree WITHOUT restoring `main`. gascity-main sat detached for 4
+#   days. gcsync refuses when off-main — and it refuses SILENTLY (stderr
+#   to a log nobody reads), so the installed binary silently froze.
+#
+#   The fix has two halves:
+#     1. Self-heal: when the tree is off-main and STALE (HEAD hasn't moved
+#        in STALE_MIN minutes — i.e. abandoned, not an in-progress PR
+#        test), restore it to main. Any dirty tree is stashed first, never
+#        discarded.
+#     2. Never silent: every recovery nudges mayor, so a recurring leak in
+#        some ship/test workflow surfaces instead of rotting for days.
+#
+#   Fresh off-main state (HEAD moved < STALE_MIN ago) is left alone, so an
+#   active `gh pr checkout` test session in that tree is not yanked
+#   mid-flight.
+#
+#   A SECOND leak shape (2026-05-31): the tree stays ON main but is left
+#   DIRTY — a ship/test polecat edits files in place (e.g. a stale
+#   gastown_test.go leftover) without switching branch. gcsync's `git pull
+#   --ff-only` then aborts ("local changes would be overwritten"), freezing
+#   the binary the same way — but the off-main guard above never sees it.
+#   So we also stash a dirty-on-main tree once its newest edit is stale,
+#   gauging staleness by the newest dirty-file mtime (not HEAD mtime, which
+#   hasn't moved since the last pull) so an active in-tree test isn't yanked.
+#
+# Pairs with: orders/gcsync.toml (the 15m sync this unblocks).
+
+set -euo pipefail
+
+TREE=/home/ds/gascity-main
+STALE_MIN="${GASCITY_MAIN_PIN_STALE_MIN:-30}"
+LOG="${HOME}/.gc/gascity-main-pin-guard.log"
+
+mkdir -p "$(dirname "$LOG")"
+log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG"; }
+
+# Loud signal: nudge the active mayor so a recurring ship/test leak in the
+# build tree can't stay silent. Shared by the off-main and dirty-on-main paths.
+nudge_mayor() {
+    local body=$1 mayor
+    mayor=$(gc session list --json 2>/dev/null \
+        | jq -r '.sessions[] | select(.template == "mayor") | select(.state == "active") | .id' \
+        | head -1)
+    if [[ -n "$mayor" ]]; then
+        gc session nudge "$mayor" "$body" >/dev/null 2>&1 \
+            && log "nudged mayor ($mayor)" \
+            || log "nudge failed (mayor=$mayor)"
+    else
+        log "no active mayor session to nudge"
+    fi
+}
+
+cd "$TREE" 2>/dev/null || { log "skip: $TREE not accessible"; exit 0; }
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { log "skip: $TREE not a git work tree"; exit 0; }
+
+now=$(date +%s)
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+
+# On main: healthy unless dirty. A dirty-on-main tree blocks gcsync's ff-pull
+# (see header). Stash it once the newest edit is stale; leave a fresh edit
+# (active in-tree test) alone.
+if [[ "$branch" == "main" ]]; then
+    [[ -z "$(git status --porcelain 2>/dev/null | head -1)" ]] && exit 0   # clean → no-op
+
+    newest=0
+    while IFS= read -r path; do
+        [[ -e "$path" ]] || continue
+        m=$(stat -c %Y "$path" 2>/dev/null || echo 0)
+        (( m > newest )) && newest=$m
+    done < <(git status --porcelain 2>/dev/null | sed -E 's/^.{3}//; s/^.* -> //; s/^"//; s/"$//')
+    (( newest == 0 )) && newest=$now
+    dirty_age_min=$(( (now - newest) / 60 ))
+
+    if (( dirty_age_min < STALE_MIN )); then
+        log "on main but dirty (newest edit ${dirty_age_min}m old) — fresh (<${STALE_MIN}m), leaving for active use"
+        exit 0
+    fi
+
+    if git stash push -u -m "gascity-main-pin-guard auto-recover dirty-on-main $(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null 2>&1; then
+        log "recovered: on main but dirty (${dirty_age_min}m stale) — stashed leftovers (recover via 'git stash list' in $TREE)"
+        nudge_mayor "[gascity-main-pin-guard] gascity-main was dirty-on-main (${dirty_age_min}m stale leftovers) — stashed so gcsync's ff-pull can resume. A ship/test workflow is editing files in the build tree; it must use a DEDICATED 'git worktree add', never gascity-main. See bin/gascity-main-pin-guard header and memory feedback_mayor_ship_dedicated_worktree."
+    else
+        log "RECOVER FAILED: on main, dirty (${dirty_age_min}m stale), could not stash"
+    fi
+    exit 0
+fi
+
+# Off main. Gauge staleness via this worktree's HEAD file mtime (the
+# timestamp of the last branch switch / checkout).
+head_file=$(git rev-parse --git-path HEAD 2>/dev/null || echo "")
+head_mtime=$(stat -c %Y "$head_file" 2>/dev/null || echo "$now")
+age_min=$(( (now - head_mtime) / 60 ))
+
+if (( age_min < STALE_MIN )); then
+    log "off-main ('$branch', ${age_min}m old) but fresh (<${STALE_MIN}m) — leaving for active use"
+    exit 0
+fi
+
+# Stale → abandoned. Recover non-destructively.
+stash_note=""
+if [[ -n "$(git status --porcelain 2>/dev/null | head -1)" ]]; then
+    if git stash push -u -m "gascity-main-pin-guard auto-recover $(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null 2>&1; then
+        stash_note=" (dirty tree stashed — recover via 'git stash list' in $TREE)"
+    fi
+fi
+
+if ! git checkout main >/dev/null 2>&1; then
+    log "RECOVER FAILED: could not checkout main from '$branch'${stash_note}"
+    exit 1
+fi
+log "recovered: was '$branch' (${age_min}m stale)${stash_note} -> main"
+
+nudge_mayor "$(cat <<EOF
+[gascity-main-pin-guard] gascity-main was left on '$branch' (${age_min}m stale) — restored to main.${stash_note}
+
+gcsync had been blocked while off-main (it refuses + silently no-ops), so the installed gc binary was frozen the whole time.
+
+If a ship/test workflow left it detached: that workflow must run its checkout/test in a DEDICATED worktree (git worktree add ...), never in gascity-main. gascity-main is the gcsync build tree and must stay on main. See bin/gascity-main-pin-guard header and memory feedback_mayor_ship_dedicated_worktree.
+EOF
+)"
+
+exit 0

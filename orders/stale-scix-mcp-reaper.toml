@@ -1,0 +1,6 @@
+[order]
+description = "Hourly: reap stranded scix.mcp_server processes whose parent Claude session is no longer in a live ds-research tmux pane (orphaned / ad-hoc leftovers that hoard ~300-580M swap each; suspends do not free them). DRY-RUN until the rule is verified against a few real reaps, then add --apply --nudge-mayor. Fail-safe: aborts if the tmux socket lists zero panes."
+trigger = "cooldown"
+interval = "1h"
+exec = "/home/ds/gas-city/bin/stale-scix-mcp-reaper --apply --nudge-mayor"
+timeout = "60s"

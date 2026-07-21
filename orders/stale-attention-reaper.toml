@@ -1,0 +1,18 @@
+# Stale-attention reaper -> mayor. Stephanie 2026-06-30: "some back from may 12
+# showing up as 'need me' but I'm sure that work is stale; need an automated way
+# to handle that." The dashboard "need me" view surfaces open beads needing her;
+# the existing janitors only PRUNE CLOSED beads — nothing ages stale-but-OPEN
+# attention. This order is that missing path.
+#
+# Fires on AGE only (no movement past the TTL), complementing
+# decision-staleness-reaper (which fires on a resolved subject PR/bead). Both
+# are surface-only: the close/keep judgment stays with the mayor (ZFC) — see
+# bin/stale-attention-reaper header. Change-dedup'd, so an unchanged candidate
+# set is not re-mailed.
+# trigger=cooldown (no zero-lastRun bootstrap trap; mirrors decision-staleness-reaper).
+[order]
+description = "Daily: flag open needs/stephanie beads idle >21d to the mayor to re-confirm or close (surface-only, change-dedup'd)."
+trigger = "cooldown"
+interval = "24h"
+exec = "/home/ds/gas-city/bin/stale-attention-reaper"
+timeout = "3m"

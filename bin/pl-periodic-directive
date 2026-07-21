@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# pl-periodic-directive: deliver a standing directive trigger to PL sessions.
+#
+# The contract each directive expands to lives in the PL prompt templates
+# (## Standing periodic directives, canonical prompts/pl-periodic-directives.md).
+# This script is pure plumbing: pick the target PLs, submit a short trigger
+# message; all content/judgment is composed by the PL model (ZFC).
+#
+# Usage:
+#   pl-periodic-directive STATUS_UPDATE            # every live PL
+#   pl-periodic-directive DEEP_AUDIT --all         # every live PL (weekly)
+#   pl-periodic-directive DEEP_AUDIT --stalled     # only PLs of stalled rigs
+#
+# Stalled = rig has open actionable work, nothing in progress, no closes in
+# 24h (same definition as bin/flow-patrol).
+#
+# Audit log: .gc/pl-periodic-directive.log
+
+set -uo pipefail
+
+CITY=/home/ds/gas-city
+AUDIT_LOG="$CITY/.gc/pl-periodic-directive.log"
+DIRECTIVE="${1:-}"; shift || true
+SCOPE="--all"
+[[ "${1:-}" == "--stalled" || "${1:-}" == "--all" ]] && SCOPE="$1"
+
+case "$DIRECTIVE" in
+  STATUS_UPDATE|EXECUTIVE_STATUS|DEEP_AUDIT) ;;
+  *) echo "usage: pl-periodic-directive {STATUS_UPDATE|EXECUTIVE_STATUS|DEEP_AUDIT} [--all|--stalled]" >&2; exit 2 ;;
+esac
+
+ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+log() { echo "$(ts) $*" >> "$AUDIT_LOG"; }
+
+# PL agent -> rig work dir, from agents/*-pl/agent.toml.
+declare -A PL_DIR=()
+for f in "$CITY"/agents/*-pl/agent.toml; do
+  name=$(basename "$(dirname "$f")")
+  dir=$(sed -n 's/^work_dir = "\(.*\)"/\1/p; s/^dir = "\(.*\)"/\1/p' "$f" | head -1)
+  [[ -n "$dir" ]] && PL_DIR["$name"]="$dir"
+done
+
+# rig name -> path, for stalled-detection.
+declare -A RIG_PATH=()
+while IFS=$'\t' read -r rname rpath; do
+  [[ -n "$rname" && -n "$rpath" ]] && RIG_PATH["$rname"]="$rpath"
+done < <(gc rig list --json 2>/dev/null | jq -r '.rigs[] | select(.hq | not) | select(.suspended | not) | "\(.name)\t\(.path)"')
+
+# PL agent -> rig name (dir match, with the known worktree aliases).
+rig_for_pl() {
+  local pl="$1" dir="${PL_DIR[$1]:-}"
+  case "$pl" in
+    gascity-maintenance-pl) echo "gascity"; return ;;
+    gascity-packs-pl) echo "gascity-packs"; return ;;
+  esac
+  for rname in "${!RIG_PATH[@]}"; do
+    [[ "${RIG_PATH[$rname]}" == "$dir" ]] && { echo "$rname"; return; }
+  done
+  echo ""
+}
+
+if [[ "${PL_DIRECTIVE_DEBUG_MAP:-}" == "1" ]]; then
+  for pl in "${!PL_DIR[@]}"; do printf '%-26s -> %s\n' "$pl" "$(rig_for_pl "$pl")"; done
+  exit 0
+fi
+
+# Stalled check (flow-patrol definition).
+rig_stalled() {
+  local r="$1"
+  local open_n wip closed24 cut
+  cut=$(( $(date +%s) - 86400 ))
+  open_n=$(gc bd --rig "$r" list --status=open --json --limit=0 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
+  wip=$(gc bd --rig "$r" list --status=in_progress --json --limit=0 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
+  closed24=$(gc bd --rig "$r" list --status=closed --json --limit=300 2>/dev/null | jq -r --argjson cut "$cut" \
+    '[ .[] | (.updated_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $u | select($u >= $cut) ] | length' 2>/dev/null || echo 0)
+  (( open_n > 0 && wip == 0 && closed24 == 0 ))
+}
+
+trigger_text() {
+  local d="$1" extra="${2:-}"
+  case "$d" in
+    STATUS_UPDATE)
+      echo "DIRECTIVE: STATUS_UPDATE — post your twice-daily plain-language status update to your bound channel now (State / Blockers / Decisions needed; see '## Standing periodic directives' in your prompt). Proactive top-level post, Slack mrkdwn, <=15 lines." ;;
+    EXECUTIVE_STATUS)
+      echo "DIRECTIVE: EXECUTIVE_STATUS — update /home/ds/brain/Projects/Executive Status/Inputs/\$GC_AGENT.md now. Write one block fenced by '<!-- executive-status:start -->' and '<!-- executive-status:end -->' with exactly these one-line fields: project: plain project name; owner: \$GC_AGENT; updated: ISO-8601 with timezone; health: on-track|at-risk|blocked|parked; current: current outcome/focus; next: next planned outcome; risk: one material risk or none. Include frontmatter tag executive-status-input. Each content field <=240 characters. CEO-level plain language only: no bead IDs, session names, branches, paths, formula names, queue counts, or operational incident detail. Do not post routine project Slack; new human decisions still use the separate Tier-2 red-message path." ;;
+    DEEP_AUDIT)
+      echo "DIRECTIVE: DEEP_AUDIT${extra} — run the full project audit now per '## Standing periodic directives' in your prompt: (1) the single smartest / most radically innovative / accretive / useful / compelling addition, argued from actual project state; (2) best-practices audit vs ~/.claude/rules/common (erosion, test coverage, over-engineering), file:line findings. Write the full report to <rig-root>/.gc-reports/audit-$(date +%F).md (ensure .gc-reports/ is gitignored), post a condensed version (<=25 lines) to your channel. Include BLOCKED_CHECK: if mechanically blocked on human input/permissions, post a RED flag to your channel AND mail mayor with subject 'BLOCKED-ON-HUMAN: ...'." ;;
+  esac
+}
+
+# One supervisor snapshot per run. Calling `gc session list` once per PL made a
+# 23-lead status fan-out exceed the order's timeout before messages were sent.
+SESSION_LIST=$(gc session list 2>/dev/null || true)
+live_session() {
+  awk -v pl="$1" '$2 == pl && / active / {found=1} END{exit !found}' <<<"$SESSION_LIST"
+}
+
+sent=0 skipped=0
+RESULT_DIR=$(mktemp -d -t pl-periodic-directive.XXXXXX)
+trap 'rm -rf "$RESULT_DIR"' EXIT
+MAX_PARALLEL="${PL_DIRECTIVE_MAX_PARALLEL:-6}"
+running=0
+for pl in "${!PL_DIR[@]}"; do
+  if ! live_session "$pl"; then
+    log "skip $pl: no active session"; ((skipped++)); continue
+  fi
+  extra=""
+  if [[ "$SCOPE" == "--stalled" ]]; then
+    rig=$(rig_for_pl "$pl")
+    if [[ -z "$rig" ]]; then log "skip $pl: no rig mapping"; ((skipped++)); continue; fi
+    if ! rig_stalled "$rig"; then ((skipped++)); continue; fi
+    extra=" (triggered by stall: rig '$rig' has backlog with nothing moving for 24h — diagnose WHY in the report)"
+    log "stalled rig $rig -> $pl"
+  fi
+  message=$(trigger_text "$DIRECTIVE" "$extra")
+  (
+    if [[ "$DIRECTIVE" == "EXECUTIVE_STATUS" ]]; then
+      delivery=(gc mail send "$pl" -s "DIRECTIVE: EXECUTIVE_STATUS" -m "$message")
+    else
+      delivery=(gc session submit "$pl" "$message" --intent follow_up)
+    fi
+    if timeout 30s "${delivery[@]}" >/dev/null 2>&1; then
+      printf 'sent\n' > "$RESULT_DIR/$pl"
+    else
+      printf 'failed\n' > "$RESULT_DIR/$pl"
+    fi
+  ) &
+  ((running++))
+  if (( running >= MAX_PARALLEL )); then
+    wait -n || true
+    ((running--))
+  fi
+done
+wait
+
+for result in "$RESULT_DIR"/*; do
+  [[ -e "$result" ]] || continue
+  pl=$(basename "$result")
+  if [[ "$(cat "$result")" == "sent" ]]; then
+    log "sent $DIRECTIVE to $pl"
+    ((sent++))
+  else
+    log "ERROR submitting $DIRECTIVE to $pl"
+  fi
+done
+
+# The mayor owns portfolio-level work that does not belong to a project PL.
+# Ask the pinned mayor for one input on the same cadence; the exact schema is
+# carried in the message so this remains safe across prompt-version drift.
+if [[ "$DIRECTIVE" == "EXECUTIVE_STATUS" ]]; then
+  mayor_text='DIRECTIVE: EXECUTIVE_STATUS — update /home/ds/brain/Projects/Executive Status/Inputs/mayor.md with one fenced executive-status block. Required one-line fields: project: Mayor / Citywide; owner: mayor; updated: ISO-8601 with timezone; health: on-track|at-risk|blocked|parked; current: the highest-level citywide outcome/focus now; next: the next planned citywide outcome; risk: one material business-level risk or none. No bead IDs, session names, branches, paths, formula names, queue counts, or operational incident detail. Do not post routine Slack; the aggregator publishes one portfolio brief.'
+  if timeout 30s gc mail send mayor -s "DIRECTIVE: EXECUTIVE_STATUS" -m "$mayor_text" >/dev/null 2>&1; then
+    log "sent EXECUTIVE_STATUS to mayor"
+    ((sent++))
+  else
+    log "ERROR submitting EXECUTIVE_STATUS to mayor"
+  fi
+fi
+
+log "run done: directive=$DIRECTIVE scope=$SCOPE sent=$sent skipped=$skipped"
+echo "directive=$DIRECTIVE scope=$SCOPE sent=$sent skipped=$skipped"

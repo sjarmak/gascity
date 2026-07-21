@@ -1,0 +1,19 @@
+# PL nightly cycle — ask every project lead to write a handoff and restart
+# once a night so sessions stay context-fresh, prompt-current, and wedge-free.
+#
+# PL sessions are always-on and never auto-cycled; left for days they
+# accumulate context-window transcript until they wedge, and they never
+# re-read prompt-template edits. PLs also carry live conversations that may not
+# be durable yet, so each request is delivered at an idle boundary and tells
+# the PL to run `gc handoff`. Mayor uses the same context-preserving path.
+#
+# Greenlit by Stephanie 2026-05-16. 4:00 EDT — quiet hour, ahead of the
+# 6:30 overnight-digest and 7:00 morning-triage. gc cron evaluates in
+# the host's LOCAL tz (EDT).
+
+[order]
+description = "Nightly 4:00 EDT: ask every project lead and mayor to write a context-preserving self-handoff at an idle boundary. Keeps sessions context-fresh, prompt-current, and wedge-free without blind resets."
+trigger = "cron"
+schedule = "0 4 * * *"
+exec = "/home/ds/gas-city/bin/pl-nightly-cycle --apply"
+timeout = "5m"

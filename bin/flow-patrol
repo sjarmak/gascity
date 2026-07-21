@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# flow-patrol: per-rig pipeline FLOW digest to #all-agent-city.
+#
+# The positive-assurance complement to stall-watch. stall-watch fires only on
+# breakage (in-progress stalls, capacity, blocked sessions); it can't tell you
+# "work is flowing as expected across the rigs." This does: a steady per-rig
+# read of the pipeline (open -> in_progress -> closed) so the human gets
+# proactive confidence without asking. Cherry-picked from gastown's witness/
+# deacon flow model (Stephanie 2026-06-08) WITHOUT adopting the pack.
+#
+# Per rig it reports: open (actionable, excl. human-assigned) / in_progress /
+# closed-last-24h / blocked / oldest-open age. Flow status per rig:
+#   :white_check_mark: flowing  — work moving (wip>0 or closed in last 24h)
+#   :warning: STALLED          — backlog exists but nothing moving (open>0, wip=0, closed24h=0)
+#   :zzz: idle                 — no actionable open work
+#
+# Usage:
+#   flow-patrol            # dry-run: print the digest, no post
+#   flow-patrol --push     # post the digest to #all-agent-city
+# Env:
+#   FLOW_PATROL_CHANNEL    Slack conversation id (default C0B0TQMQF2B = all-agent-city)
+#   FLOW_PATROL_STALE_HRS  oldest-open age (h) to annotate on a stalled rig (default 24)
+
+set -uo pipefail
+
+CITY=/home/ds/gas-city
+CHANNEL="${FLOW_PATROL_CHANNEL:-C0B0TQMQF2B}"
+AUDIT_LOG="${FLOW_PATROL_AUDIT_LOG:-$CITY/.gc/flow-patrol.log}"
+HUMAN_ASSIGNEES_JSON="${HUMAN_ASSIGNEES:-[\"sjarmak\",\"sjarmak@users.noreply.github.com\"]}"
+STALE_HRS="${FLOW_PATROL_STALE_HRS:-24}"
+PUSH=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --push) PUSH=1; shift ;;
+    -h|--help) sed -n 's/^# \{0,1\}//p' "$0" | head -22; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+NOW=$(date +%s)
+CUT=$(( NOW - 86400 ))
+
+mapfile -t RIGS < <(gc rig list 2>/dev/null | awk '
+  /^  [a-zA-Z][a-zA-Z0-9_-]+/ {
+    suspended = 0
+    for (i = 1; i <= NF; i++) if ($i ~ /suspended/) suspended = 1
+    if (suspended) next
+    name = $1; sub(/:$/, "", name)
+    if (name != "ds-research") print name
+  }')
+
+# Per-rig counts. Returns TSV: open_n  oldest_open_epoch  wip  blocked  closed24h
+rig_counts() {
+  local r="$1" open_j wip blk closed_j
+  open_j=$(gc bd --rig "$r" list --status=open --json --limit=0 2>/dev/null || echo '[]')
+  wip=$(gc bd --rig "$r" list --status=in_progress --json --limit=0 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
+  blk=$(gc bd --rig "$r" list --status=blocked --json --limit=0 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
+  closed_j=$(gc bd --rig "$r" list --status=closed --json --limit=300 2>/dev/null || echo '[]')
+  local open_n oldest closed24
+  read -r open_n oldest < <(jq -r --argjson h "$HUMAN_ASSIGNEES_JSON" '
+    [ .[] | select(((.assignee // "") as $a | ($h | index($a)) | not)) ] as $o
+    | ($o | length) as $n
+    | ($o | map(.created_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) | min) as $m
+    | "\($n) \(if $m == null then 0 else $m end)"' <<<"$open_j" 2>/dev/null || echo "0 0")
+  closed24=$(jq -r --argjson cut "$CUT" '[ .[]
+    | (.updated_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $u
+    | select($u >= $cut) ] | length' <<<"$closed_j" 2>/dev/null || echo 0)
+  printf '%s\t%s\t%s\t%s\t%s\n' "${open_n:-0}" "${oldest:-0}" "${wip:-0}" "${blk:-0}" "${closed24:-0}"
+}
+
+declare -a FLOWING=() STALLED=() IDLE=()
+for r in "${RIGS[@]}"; do
+  IFS=$'\t' read -r open_n oldest wip blk closed24 < <(rig_counts "$r")
+  age_note=""
+  if [[ "${oldest:-0}" -gt 0 ]]; then
+    age_h=$(( (NOW - oldest) / 3600 ))
+    (( age_h >= STALE_HRS )) && age_note=" — oldest open ${age_h}h"
+  fi
+  line=$(printf '`%s` — open %s · wip %s · closed/24h %s%s' "$r" "$open_n" "$wip" "$closed24" \
+    "$([[ "$blk" -gt 0 ]] && echo " · blocked $blk")")
+  if (( open_n == 0 && wip == 0 )); then
+    IDLE+=("$r")
+  elif (( open_n > 0 && wip == 0 && closed24 == 0 )); then
+    STALLED+=(":warning: ${line}${age_note}")
+  else
+    FLOWING+=(":white_check_mark: ${line}")
+  fi
+done
+
+MSG=$(mktemp); trap 'rm -f "$MSG"' EXIT
+{
+  echo ":bar_chart: *Flow check* — $(date '+%Y-%m-%d %H:%M %Z')"
+  if (( ${#STALLED[@]} > 0 )); then
+    echo
+    echo "*Not moving (backlog, nothing in flight, no closes in 24h):*"
+    for l in "${STALLED[@]}"; do echo "$l"; done
+  fi
+  if (( ${#FLOWING[@]} > 0 )); then
+    echo
+    echo "*Flowing:*"
+    for l in "${FLOWING[@]}"; do echo "$l"; done
+  fi
+  if (( ${#IDLE[@]} > 0 )); then
+    echo
+    echo ":zzz: idle (no actionable work): $(IFS=', '; echo "${IDLE[*]}")"
+  fi
+} > "$MSG"
+
+ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+
+# `gc slack publish-to-channel` attributes the post to --session, defaulting to
+# $GC_SESSION_ID. The supervisor runs this order detached, where $GC_SESSION_ID
+# is unset, so the publish had no session to attribute and failed fast — the
+# morning flow digest silently rotted for a month. Resolve a stable mayor
+# session: prefer $GC_SESSION_ID (interactive), else the pinned mayor.
+resolve_publish_sid() {
+  if [[ -n "${GC_SESSION_ID:-}" ]]; then
+    printf '%s' "$GC_SESSION_ID"; return 0
+  fi
+  gc session list 2>/dev/null | awk '$2=="mayor" && /pin/{print $1; exit}'
+}
+PUBLISH_SID="$(resolve_publish_sid)"
+
+if (( ! PUSH )); then
+  echo "=== flow-patrol DRY-RUN (would post to $CHANNEL) ==="
+  cat "$MSG"
+  exit 0
+fi
+
+if gc slack publish-to-channel --conversation-id "$CHANNEL" --kind room \
+     ${PUBLISH_SID:+--session "$PUBLISH_SID"} --body-file "$MSG" >/dev/null 2>&1; then
+  echo "$(ts) posted flow digest (${#STALLED[@]} stalled / ${#FLOWING[@]} flowing / ${#IDLE[@]} idle) to $CHANNEL" >> "$AUDIT_LOG"
+else
+  echo "$(ts) ERROR: flow digest publish to $CHANNEL failed" >> "$AUDIT_LOG"
+  exit 1
+fi

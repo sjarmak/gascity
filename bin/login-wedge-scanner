@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""login-wedge-scanner — detect + (optionally) recycle agent sessions silently
+wedged at Claude Code's interactive LOGIN-METHOD selector.
+
+THE GAP THIS FILLS (2026-07-12, gc-453107 aoa/oversight-rig.project-lead):
+A gc-launched agent can come up onto Claude Code's interactive login screen:
+
+    Select login method:
+    ❯ 1. Claude account with subscription
+      2. Anthropic Console account
+
+A headless agent cannot answer this, so it hangs here forever while
+`gc session list` still reads `active` (the tmux runtime is alive). The idle
+clock keeps churning on the retry prompt, so idle-based liveness checks miss it
+(the AOA PL read "idle 6 days" but was actually wedged at this screen). The
+mayor only found it by peeking. It has bitten a PL/worker repeatedly.
+
+WHY THE EXISTING SCANNERS MISS THIS EXACT CLASS:
+  - polecat-ui-stuck-scanner's ui-modal pass is POOL-SCOPED (workers/polecats)
+    and SKIPS named sessions (PLs/mayor/dispatcher) — the AOA PL is named.
+  - polecat-ui-stuck-scanner's auth-wedge pass DOES scan every session, but its
+    markers ("Paste code here", "oauth/authorize", ...) target the later
+    paste-code OAuth screen, NOT this login-METHOD selector. It has fired 0x.
+  This scanner targets the login-method selector strings specifically, across
+  ALL active sessions (named + pool), and it is the ONLY scanner that recycles
+  this class.
+
+DETECTION (authoritative, single match suffices):
+  The login-method selector strings NEVER appear in a healthy running session,
+  so one match is authoritative. Two-scan confirmation still guards against a
+  transient seen during a legitimate restart.
+
+RECOVERY (staged, dry-run by default — this is a DESTRUCTIVE mechanism):
+  The fix that worked (AOA PL) was `gc session kill <id>` -> the reconciler
+  respawns the session, which re-reads its pinned account and comes up clean.
+  This is gated:
+    * DRY-RUN by default (LOGIN_WEDGE_EXECUTE unset): peek + report to mayor,
+      NEVER kills. This is the report a human reviews before promotion.
+    * --execute / LOGIN_WEDGE_EXECUTE=1 (human-promoted per the city's
+      dry-run->apply convention): recycle confirmed wedges, subject to the
+      safety guards + blast-radius caps below.
+
+  NUANCE captured in code (do not "simplify" away):
+    * If the account creds are genuinely bad, kill respawns onto the SAME
+      account and re-wedges. The per-session recycle-attempt cap detects that
+      loop and STOPS auto-recycling, escalating to an account-level fix
+      (/ds-cred <account> or re-pin) instead of hammering kill forever.
+    * The oversight-rig PL class (reset-pending/runtime-missing -> asleep,
+      dormant for days) is a DOWNSTREAM failure: those sessions are no longer
+      `active`, have no live runtime to peek, and kill does not respawn them.
+      This scanner cannot detect or heal that from a peek — it is called out in
+      the mayor report and tracked as a separate follow-up. Recycle alone is
+      NOT sufficient for that class.
+
+SAFETY GUARDS (must never recycle a legitimately-interactive human/guest):
+  1. Only sessions from `gc session list --json` are considered — a human
+     running `claude` by hand is not a gc session and never appears here.
+  2. `attached == true` (a human is attached to the tmux pane right now) -> SKIP.
+     This is the tmux cross-reference per CLAUDE.md's zombie-report guidance.
+  3. Protect-list (default: mayor) is never recycled — mayor recovery has its
+     own path (mayor-watchdog/failover); killing it is high blast-radius.
+  4. Two-scan confirmation (>= LOGIN_WEDGE_CONFIRM_SEC apart) before any recycle.
+  5. Blast-radius cap: at most LOGIN_WEDGE_MAX_RECYCLE_PER_TICK kills per pass.
+
+Every detection and action is logged (JSONL) and mailed to the mayor
+(surface-cooldown-deduped). Exit is always 0 — a sensor must not break the
+order loop.
+
+Env (all optional):
+  LOGIN_WEDGE_EXECUTE            "1" = recycle confirmed wedges. Unset = dry-run
+                                 (default). Promote in the ORDER FILE per the
+                                 dry-run->apply convention, with a flipped-by
+                                 annotation — do NOT flip it here.
+  LOGIN_WEDGE_PROTECT_CSV        never-recycle basenames (default "mayor")
+  LOGIN_WEDGE_MAX_RECYCLE_PER_TICK  kills per pass (default 2)
+  LOGIN_WEDGE_MAX_ATTEMPTS       recycles per session per window before
+                                 escalate-only (default 2)
+  LOGIN_WEDGE_ATTEMPT_WINDOW_SEC recycle-attempt window (default 3600)
+  LOGIN_WEDGE_RECYCLE_COOLDOWN_SEC  min gap between recycles of one session
+                                 (default 900)
+  LOGIN_WEDGE_CONFIRM_SEC        min age of first detection before confirm
+                                 (default 120)
+  LOGIN_WEDGE_SURFACE_COOLDOWN_SEC  per-session mail cooldown (default 14400)
+  LOGIN_WEDGE_MAX_PEEKS          peek fan-out cap per pass (default 40)
+  LOGIN_WEDGE_PEEK_WORKERS       peek concurrency (default 6)
+  LOGIN_WEDGE_LOG                JSONL log path
+  LOGIN_WEDGE_STATE             per-session state path
+  LOGIN_WEDGE_LOCK              whole-operation lock path
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+
+# --- Detection anchors -------------------------------------------------------
+# The login-METHOD selector. Any single one is authoritative: these strings do
+# not appear in a healthy running session. Kept robust to minor wording drift by
+# anchoring on the two most stable phrases plus the console-account line.
+LOGIN_SIGNATURE = [
+    "Select login method",
+    "Claude account with subscription",
+    "Anthropic Console account",
+]
+
+CITY = "/home/ds/gas-city"
+AGENTS_DIR = Path(CITY) / "agents"
+
+EXECUTE = bool(os.environ.get("LOGIN_WEDGE_EXECUTE", "").strip())
+PROTECT = {
+    p.strip()
+    for p in os.environ.get("LOGIN_WEDGE_PROTECT_CSV", "mayor").split(",")
+    if p.strip()
+}
+MAX_RECYCLE_PER_TICK = int(os.environ.get("LOGIN_WEDGE_MAX_RECYCLE_PER_TICK", "2"))
+MAX_ATTEMPTS = int(os.environ.get("LOGIN_WEDGE_MAX_ATTEMPTS", "2"))
+ATTEMPT_WINDOW_SEC = int(os.environ.get("LOGIN_WEDGE_ATTEMPT_WINDOW_SEC", "3600"))
+RECYCLE_COOLDOWN_SEC = int(os.environ.get("LOGIN_WEDGE_RECYCLE_COOLDOWN_SEC", "900"))
+CONFIRM_SEC = int(os.environ.get("LOGIN_WEDGE_CONFIRM_SEC", "120"))
+SURFACE_COOLDOWN_SEC = int(os.environ.get("LOGIN_WEDGE_SURFACE_COOLDOWN_SEC", "14400"))
+MAX_PEEKS = int(os.environ.get("LOGIN_WEDGE_MAX_PEEKS", "40"))
+PEEK_WORKERS = int(os.environ.get("LOGIN_WEDGE_PEEK_WORKERS", "6"))
+LOG_PATH = Path(os.environ.get("LOGIN_WEDGE_LOG", "/home/ds/.gc/login-wedge-scanner.log"))
+STATE_PATH = Path(
+    os.environ.get("LOGIN_WEDGE_STATE", "/home/ds/.gc/login-wedge-scanner-state.json")
+)
+LOCK_PATH = Path(
+    os.environ.get("LOGIN_WEDGE_LOCK", "/home/ds/.gc/login-wedge-scanner.lock")
+)
+
+
+def now() -> float:
+    return datetime.now(timezone.utc).timestamp()
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def log_line(payload: dict) -> None:
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_PATH.open("a") as f:
+            f.write(json.dumps({"ts": now_iso(), **payload}) + "\n")
+    except OSError:
+        pass
+
+
+def load_state() -> dict:
+    try:
+        with STATE_PATH.open() as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    try:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with STATE_PATH.open("w") as f:
+            json.dump(state, f)
+    except OSError:
+        pass
+
+
+def list_active_sessions() -> list[dict]:
+    try:
+        result = subprocess.run(
+            ["gc", "session", "list", "--json"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    if result.returncode != 0:
+        return []
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    raw = data.get("sessions") if isinstance(data, dict) else data
+    if not isinstance(raw, list):
+        return []
+    return [s for s in raw if s.get("state") == "active"]
+
+
+def peek_session(session_id: str, timeout: int = 10) -> str:
+    try:
+        result = subprocess.run(
+            ["gc", "session", "peek", session_id],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout or ""
+
+
+def detect_login(peek_output: str) -> list[str]:
+    return [m for m in LOGIN_SIGNATURE if m in peek_output]
+
+
+def session_basename(session: dict) -> str:
+    for k in ("alias", "name", "agent_name", "session_name", "template"):
+        v = session.get(k) or ""
+        if v:
+            return v.rsplit("/", 1)[-1]
+    return session.get("id") or ""
+
+
+def resolve_account(session: dict) -> str | None:
+    """Best-effort map a session to its pinned Claude account (claude-N)."""
+    prov = session.get("provider") or ""
+    m = re.match(r"claude-(\w+)$", prov)
+    if m:
+        return m.group(1)
+    for k in ("alias", "name", "agent_name", "template"):
+        v = session.get(k) or ""
+        if not v:
+            continue
+        toml = AGENTS_DIR / v.rsplit("/", 1)[-1] / "agent.toml"
+        try:
+            text = toml.read_text()
+        except OSError:
+            continue
+        mm = re.search(r'provider\s*=\s*"claude-(\w+)"', text)
+        if mm:
+            return mm.group(1)
+    return None
+
+
+def kill_session(session_id: str) -> tuple[bool, str]:
+    """Recycle: kill the runtime; the reconciler respawns the session fresh
+    (bead stays active, history preserved). The recovery that worked for the
+    AOA PL login-wedge."""
+    try:
+        result = subprocess.run(
+            ["gc", "session", "kill", session_id],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, str(e)
+    return result.returncode == 0, (result.stdout + result.stderr).strip()
+
+
+def mail_mayor(subject: str, body: str) -> None:
+    try:
+        subprocess.run(
+            ["gc", "mail", "send", "mayor/", "-s", subject, "-m", body],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def build_report(session: dict, acct: str | None, markers: list[str],
+                 action: str, extra: str = "") -> tuple[str, str]:
+    sid = session.get("id") or ""
+    target = session.get("alias") or session.get("name") or session.get("template") or sid
+    acct_str = f"account{acct}" if acct else "unknown-account (check the agent's provider pin)"
+    subject = f"login-wedge: {sid} ({session_basename(session)}) — {acct_str}"
+    body = (
+        "login-wedge-scanner: an agent session is hung at Claude Code's "
+        "interactive LOGIN-METHOD selector and cannot self-recover (a headless "
+        "agent can't answer 'Select login method').\n\n"
+        f"session:   {sid}\n"
+        f"target:    {target}\n"
+        f"account:   {acct_str}\n"
+        f"signature: {', '.join(markers)}\n"
+        f"execute:   {EXECUTE} ({'RECYCLE ENABLED' if EXECUTE else 'DRY-RUN — report only'})\n"
+        f"action:    {action}\n"
+    )
+    if extra:
+        body += f"\n{extra}\n"
+    body += (
+        "\nRecovery: `gc session kill " + sid + "` recycles it — the reconciler "
+        "respawns onto the pinned account and it comes up clean IF the creds are "
+        "healthy. If it re-wedges after a recycle, the account is bad: "
+        f"/ds-cred {acct_str} (stale/rotated refresh token) or re-pin the agent "
+        "(agents/<name>/agent.toml provider), THEN recycle.\n"
+        "\nNOTE: the oversight-rig PL dormancy class (reset-pending/"
+        "runtime-missing -> asleep for days) is a SEPARATE failure a recycle does "
+        "NOT fix — those sessions are not `active` and have no runtime to recycle; "
+        "they need a supervisor-level respawn or manual reset.\n"
+    )
+    return subject, body
+
+
+def _attempt_window_ok(rec: dict, ts: float) -> bool:
+    """True if the session has attempts left in the current rolling window.
+
+    Detects the kill->respawn->re-wedge loop (bad creds): after MAX_ATTEMPTS
+    recycles within ATTEMPT_WINDOW_SEC we stop auto-recycling and escalate.
+    """
+    win_start = rec.get("attempt_window_start", 0)
+    count = rec.get("recycle_count", 0)
+    if ts - win_start > ATTEMPT_WINDOW_SEC:
+        return True  # window rolled over -> attempts reset
+    return count < MAX_ATTEMPTS
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--execute", action="store_true",
+                    help="recycle confirmed wedges (overrides LOGIN_WEDGE_EXECUTE)")
+    ap.add_argument("--json", action="store_true", help="emit summary as JSON")
+    args = ap.parse_args()
+
+    execute = EXECUTE or args.execute
+
+    # F09 / dr-6qrb, 2026-07-20, mayor gc-520788: the order gate may fail
+    # open after its timeout, so serialize the complete scan->confirm->kill->
+    # state-write operation here. Lock failure is a logged skip, never a second
+    # live-kill writer. Remove only if the controller provides a proven
+    # fail-closed whole-operation lease.
+    try:
+        LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = LOCK_PATH.open("a")
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError) as e:
+        summary = {
+            "event": "scan-skipped-lock", "reason": str(e),
+            "scanned": 0, "wedged": 0, "recycled": 0,
+            "escalated": 0, "surfaced": 0, "execute": execute,
+        }
+        log_line(summary)
+        if args.json:
+            print(json.dumps(summary, indent=2))
+        else:
+            print("login-wedge-scanner: skipped — whole-operation lock busy/unavailable")
+        return 0
+
+    state = load_state()
+    ts = now()
+    sessions = list_active_sessions()
+
+    # Candidates: peek every active session (login-wedge hits named + pool).
+    candidates = sessions[:MAX_PEEKS]
+    peeks: dict[str, str] = {}
+    if candidates:
+        with ThreadPoolExecutor(max_workers=PEEK_WORKERS) as ex:
+            futs = {ex.submit(peek_session, s.get("id") or ""): s.get("id") or ""
+                    for s in candidates}
+            for fut, sid in futs.items():
+                try:
+                    peeks[sid] = fut.result()
+                except Exception:
+                    peeks[sid] = ""
+
+    wedged_ids: set[str] = set()
+    recycled = 0
+    surfaced = 0
+    escalated = 0
+    detail: list[dict] = []
+
+    for s in candidates:
+        sid = s.get("id") or ""
+        markers = detect_login(peeks.get(sid, ""))
+        if not markers:
+            # Not wedged now — clear any stale pending state for this sid.
+            if sid in state and state[sid].get("first_seen"):
+                state[sid].pop("first_seen", None)
+            continue
+        wedged_ids.add(sid)
+        rec = state.setdefault(sid, {})
+        acct = resolve_account(s)
+        basename = session_basename(s)
+        attached = bool(s.get("attached"))
+        protected = basename in PROTECT
+
+        # Two-scan confirmation: record first sighting, confirm on a later scan.
+        first_seen = rec.get("first_seen")
+        if not first_seen:
+            rec["first_seen"] = ts
+            log_line({"event": "login-wedge-pending-confirm", "session_id": sid,
+                      "target": basename, "account": acct, "markers": markers})
+            detail.append({"session_id": sid, "state": "pending-confirm"})
+            continue
+        confirmed = (ts - first_seen) >= CONFIRM_SEC
+        log_line({"event": "login-wedge-detected", "session_id": sid,
+                  "target": basename, "account": acct, "markers": markers,
+                  "attached": attached, "protected": protected,
+                  "confirmed": confirmed, "execute": execute})
+
+        # Decide the action label (drives both the report and the log).
+        if attached:
+            action = "SKIP — a human is attached to this tmux pane (guest/interactive guard)"
+        elif not confirmed:
+            action = "await 2nd-scan confirmation"
+        elif protected:
+            action = f"SKIP recycle — {basename} is protected; surface only"
+        elif not execute:
+            action = "DRY-RUN — would recycle (gc session kill); no action taken"
+        elif not _attempt_window_ok(rec, ts):
+            action = (f"ESCALATE — recycled {rec.get('recycle_count', 0)}x in window and "
+                      "still wedging: account-level fix needed, NOT another kill")
+        elif ts - rec.get("last_recycle", 0) < RECYCLE_COOLDOWN_SEC:
+            action = "recycle cooldown — prior kill still settling"
+        elif recycled >= MAX_RECYCLE_PER_TICK:
+            action = f"deferred — per-tick recycle cap ({MAX_RECYCLE_PER_TICK}) reached this pass"
+        else:
+            action = "RECYCLE — gc session kill (reconciler respawns fresh)"
+
+        # Execute the recycle only in the single "RECYCLE" branch above.
+        did_recycle = False
+        if action.startswith("RECYCLE"):
+            ok, msg = kill_session(sid)
+            did_recycle = ok
+            if ts - rec.get("attempt_window_start", 0) > ATTEMPT_WINDOW_SEC:
+                rec["attempt_window_start"] = ts
+                rec["recycle_count"] = 0
+            rec["recycle_count"] = rec.get("recycle_count", 0) + 1
+            rec["last_recycle"] = ts
+            recycled += 1 if ok else 0
+            log_line({"event": "recycle" if ok else "recycle-failed",
+                      "session_id": sid, "ok": ok, "msg": msg[:200],
+                      "recycle_count": rec["recycle_count"]})
+            action = (f"recycled ({'ok' if ok else 'FAILED'}) — attempt "
+                      f"{rec['recycle_count']}/{MAX_ATTEMPTS} in window")
+
+        if action.startswith("ESCALATE"):
+            escalated += 1
+
+        detail.append({"session_id": sid, "account": acct, "action": action,
+                       "recycled": did_recycle})
+
+        # Surface to mayor, deduped by per-session surface cooldown — unless we
+        # just recycled or escalated, which always warrant a fresh notice.
+        recently = (ts - rec.get("last_surfaced", 0)) < SURFACE_COOLDOWN_SEC
+        force = did_recycle or action.startswith("ESCALATE")
+        if not recently or force:
+            extra = ""
+            if attached:
+                extra = "Skipped: a human is attached to this session's tmux pane."
+            elif not execute:
+                extra = ("Scanner is in DRY-RUN. To promote: set LOGIN_WEDGE_EXECUTE=1 "
+                         "in orders/login-wedge-scanner.toml with a flipped-by "
+                         "annotation, after review of these dry-run reports.")
+            subject, body = build_report(s, acct, markers, action, extra)
+            mail_mayor(subject, body)
+            rec["last_surfaced"] = ts
+            surfaced += 1
+
+    # GC stale sids from state so it doesn't grow unbounded.
+    for sid in list(state.keys()):
+        if sid not in wedged_ids and not state[sid].get("recycle_count") \
+                and not state[sid].get("last_surfaced"):
+            state.pop(sid, None)
+
+    save_state(state)
+    summary = {
+        "event": "scan-summary", "scanned": len(candidates),
+        "wedged": len(wedged_ids), "recycled": recycled,
+        "escalated": escalated, "surfaced": surfaced, "execute": execute,
+    }
+    log_line(summary)
+    if args.json:
+        print(json.dumps({**summary, "detail": detail}, indent=2))
+    else:
+        print(f"login-wedge-scanner: scanned={len(candidates)} "
+              f"wedged={len(wedged_ids)} recycled={recycled} "
+              f"escalated={escalated} surfaced={surfaced} execute={execute}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

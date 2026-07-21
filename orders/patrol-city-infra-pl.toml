@@ -1,0 +1,13 @@
+# patrol-city-infra-pl — periodic triage/work tick for the city-infra mechanic PL.
+#
+# The pack's patrol-project-leads order only nudges sessions whose template is
+# "oversight-rig.project-lead"; the city-infra-pl is a city-scoped agent with a
+# different template, so it needs its own tick. Pure plumbing: the script just
+# nudges the active city-infra-pl session — all judgment stays with the PL.
+
+[order]
+description = "Every 15m: nudge the city-infra-pl to triage city-infra health and work ready in-place city-root beads."
+trigger = "cooldown"
+interval = "15m"
+exec = "/home/ds/gas-city/bin/nudge-city-infra-pl.sh"
+timeout = "2m"

@@ -1,0 +1,20 @@
+# Dispatch-patrol — keep work ROUTING across rigs (Stephanie 2026-06-08).
+#
+# Third of the monitoring trio:
+#   flow-patrol  (2x/day) — is work flowing (digest to #all-agent-city)
+#   stall-watch  (15m)    — breakage push (in-progress stalls / capacity / sessions)
+#   dispatch-patrol (30m) — ready backlog sitting UNDISPATCHED while pools idle
+#
+# Each run: per rig, count actionable-undispatched backlog (open, non-rollup/epic,
+# no assignee + no gc.routed_to). If a rig is over threshold and its PL is live,
+# auto-nudge the PL to route it (1h cooldown per rig). If the backlog persists
+# across cycles without shrinking, or a rig has backlog but no live PL, ESCALATE
+# to #all-agent-city — the human's "surface as needed" signal. Skips gascity
+# (gated PR work, never blind-drained); paces mem (epic sequence, not a drain).
+
+[order]
+description = "Every 30m: nudge rig PLs to route ready-but-undispatched backlog; escalate persistent/no-PL backlog to #all-agent-city. Skips gascity, paces mem."
+trigger = "cooldown"
+interval = "30m"
+exec = "/home/ds/gas-city/bin/dispatch-patrol --push"
+timeout = "5m"

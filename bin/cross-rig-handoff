@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""Persist and reconcile deterministic cross-rig handoffs.
+
+Added 2026-07-18 for dr-wjza. Remove when Gas City provides an equivalent
+native cross-store handoff primitive and the persisted records are migrated.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+ROOT = Path("/home/ds/gas-city")
+RECORD_DIR = Path(os.environ.get("CROSS_RIG_HANDOFF_DIR", ROOT / ".gc/cross-rig-handoffs"))
+AUDIT_LOG = Path(os.environ.get("CROSS_RIG_HANDOFF_AUDIT_LOG", ROOT / ".gc/cross-rig-handoff.log"))
+LOCK_FILE = Path(os.environ.get("CROSS_RIG_HANDOFF_LOCK", ROOT / ".gc/cross-rig-handoff.lock"))
+INVALID_NOTIFY_STATE = Path(
+    os.environ.get("CROSS_RIG_HANDOFF_INVALID_NOTIFY_STATE", ROOT / ".gc/cross-rig-handoff-invalid.notified")
+)
+QUALIFIED = re.compile(r"^(?:city:[^:]+|rig:[^:]+:[^:]+)$")
+REQUIRED_WORK = ("title", "description", "type", "priority", "labels")
+PROVENANCE = (
+    "cross_rig_handoff_id",
+    "cross_rig_handoff_source_ref",
+    "cross_rig_handoff_target_key",
+    "cross_rig_handoff_target_rig",
+    "cross_rig_handoff_target_store_ref",
+    "cross_rig_handoff_work_sha256",
+)
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical(value).encode()).hexdigest()
+
+
+@contextlib.contextmanager
+def locked():
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_FILE.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def atomic_write(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(value, out, sort_keys=True, indent=2)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def audit(event: str, record: dict[str, Any], **extra: Any) -> None:
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    row = {"ts": now(), "event": event, "handoff_id": record["handoff_id"], **extra}
+    with AUDIT_LOG.open("a") as out:
+        out.write(canonical(row) + "\n")
+
+
+def audit_invalid(path: Path, error: str) -> None:
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    row = {"ts": now(), "event": "record_invalid", "record_path": str(path), "error": error}
+    with AUDIT_LOG.open("a") as out:
+        out.write(canonical(row) + "\n")
+
+
+def transition(record: dict[str, Any], state: str, **extra: Any) -> None:
+    if record.get("state") == state:
+        return
+    record["state"] = state
+    record["updated_at"] = now()
+    record.setdefault("transitions", []).append({"state": state, "ts": record["updated_at"], **extra})
+    audit(state, record, **extra)
+
+
+def target_transition(
+    record: dict[str, Any],
+    target: dict[str, Any],
+    state: str,
+    error: str = "",
+    *,
+    emit: bool = True,
+) -> None:
+    previous = target.get("state")
+    previous_error = target.get("error", "")
+    target["state"] = state
+    if error:
+        target["error"] = error
+    else:
+        target.pop("error", None)
+    if emit and (previous != state or previous_error != error):
+        audit(
+            state,
+            record,
+            target_key=target["target_key"],
+            target_store_ref=target["store_ref"],
+            child_ref=(f"rig:{target['rig']}:{target['child_id']}" if target.get("child_id") else None),
+            previous_state=previous,
+            error=error or None,
+        )
+
+
+def validate(spec: Any) -> dict[str, Any]:
+    if not isinstance(spec, dict) or not isinstance(spec.get("handoff_id"), str) or not spec["handoff_id"].strip():
+        raise ValueError("handoff_id is required")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", spec["handoff_id"]):
+        raise ValueError("handoff_id contains unsafe characters")
+    if not isinstance(spec.get("source_ref"), str) or not QUALIFIED.fullmatch(spec["source_ref"]):
+        raise ValueError("source_ref must be city:<id> or rig:<rig>:<id>")
+    targets = spec.get("targets")
+    if not isinstance(targets, list) or not targets:
+        raise ValueError("targets must be a nonempty list")
+    keys, rigs = set(), set()
+    for target in targets:
+        if not isinstance(target, dict):
+            raise ValueError("each target must be an object")
+        key, rig = target.get("target_key"), target.get("rig")
+        if not isinstance(key, str) or not key or not isinstance(rig, str) or not rig or ":" in rig:
+            raise ValueError("target_key and rig are required")
+        if key in keys or rig in rigs:
+            raise ValueError("duplicate target_key or rig")
+        keys.add(key); rigs.add(rig)
+        if target.get("store_ref") != f"rig:{rig}":
+            raise ValueError(f"store_ref must be rig:{rig}")
+        if not isinstance(target.get("route_to"), str) or not target["route_to"].strip():
+            raise ValueError("route_to is required")
+        work = target.get("work")
+        if not isinstance(work, dict) or any(k not in work for k in REQUIRED_WORK):
+            raise ValueError(f"work requires {', '.join(REQUIRED_WORK)}")
+        if not all(isinstance(work[k], str) and work[k].strip() for k in ("title", "description", "type")):
+            raise ValueError("work title, description, and type must be nonempty strings")
+        if (
+            not isinstance(work["priority"], (str, int))
+            or not isinstance(work["labels"], list)
+            or not all(isinstance(label, str) and label for label in work["labels"])
+        ):
+            raise ValueError("work priority and labels are required")
+        if "acceptance_criteria" in work and not isinstance(work["acceptance_criteria"], str):
+            raise ValueError("acceptance_criteria must be a string")
+    return spec
+
+
+def rig_cmd(rig: str, *args: str) -> list[str]:
+    return ["gc", "bd", "--rig", rig, *args]
+
+
+def run_json(cmd: list[str]) -> tuple[bool, Any]:
+    proc = subprocess.run(cmd, text=True, capture_output=True)
+    if proc.returncode:
+        return False, proc.stderr.strip() or proc.stdout.strip()
+    try:
+        return True, json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return False, "malformed JSON response"
+
+
+def one(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, list):
+        return value[0] if len(value) == 1 and isinstance(value[0], dict) else None
+    return value if isinstance(value, dict) else None
+
+
+def expected_metadata(record: dict[str, Any], target: dict[str, Any]) -> dict[str, str]:
+    return dict(zip(PROVENANCE, (
+        record["handoff_id"], record["source_ref"], target["target_key"], target["rig"],
+        target["store_ref"], target["work_sha256"],
+    )))
+
+
+def query_matches(record: dict[str, Any], target: dict[str, Any]) -> tuple[bool, list[dict[str, Any]] | str]:
+    ok, data = run_json(rig_cmd(target["rig"], "list", "--all", "--limit=0", "--json",
+        "--metadata-field", f"cross_rig_handoff_id={record['handoff_id']}",
+        "--metadata-field", f"cross_rig_handoff_target_key={target['target_key']}"))
+    if not ok or not isinstance(data, list):
+        return False, str(data)
+    return True, [x for x in data if isinstance(x, dict)]
+
+
+def exact(child: dict[str, Any], expected: dict[str, str]) -> bool:
+    metadata = child.get("metadata") or {}
+    return isinstance(metadata, dict) and all(str(metadata.get(k, "")) == v for k, v in expected.items())
+
+
+def read_child(target: dict[str, Any]) -> tuple[bool, dict[str, Any] | str]:
+    ok, value = run_json(rig_cmd(target["rig"], "show", target["child_id"], "--json"))
+    child = one(value) if ok else None
+    return (True, child) if child else (False, str(value))
+
+
+def classify(record: dict[str, Any], target: dict[str, Any], child: dict[str, Any]) -> tuple[str, str]:
+    if not exact(child, expected_metadata(record, target)):
+        return "failed", "immutable child provenance mismatch"
+    status = child.get("status")
+    metadata = child.get("metadata") or {}
+    if status == "closed":
+        return "completed", ""
+    if status == "blocked" and (metadata.get("cross_rig_handoff_blocked_reason") or metadata.get("help_request")):
+        return "blocked", ""
+    # gc-sling may canonicalize a caller alias to an absolute template path.
+    # The owning-store child plus nonempty route is the machine proof; retain
+    # the observed canonical route in the record rather than comparing aliases.
+    if status == "in_progress" or (status == "open" and metadata.get("gc.routed_to")):
+        return "accepted", ""
+    return "failed", f"child is {status or 'unreadable'} and not routed as declared"
+
+
+def save(record: dict[str, Any]) -> None:
+    atomic_write(RECORD_DIR / f"{record['handoff_id']}.json", record)
+
+
+def create_child(record: dict[str, Any], target: dict[str, Any]) -> tuple[bool, str]:
+    work, metadata = target["work"], expected_metadata(record, target)
+    labels = list(dict.fromkeys([*work["labels"], "cross-rig-handoff", f"rig:{target['rig']}"]))
+    cmd = rig_cmd(target["rig"], "create", "--title", work["title"], "--description", work["description"],
+                  "--type", work["type"], "--priority", str(work["priority"]), "--labels", ",".join(labels),
+                  "--metadata", canonical(metadata), "--json")
+    if work.get("acceptance_criteria"):
+        cmd.extend(["--acceptance", work["acceptance_criteria"]])
+    ok, value = run_json(cmd)
+    child = one(value) if ok else None
+    if child and child.get("id"):
+        return True, str(child["id"])
+    # Commit-with-lost-response: only adopt after an exact metadata query.
+    qok, matches = query_matches(record, target)
+    if qok and isinstance(matches, list) and len(matches) == 1 and exact(matches[0], metadata):
+        return True, str(matches[0]["id"])
+    return False, str(value)
+
+
+def reconcile_target(record: dict[str, Any], target: dict[str, Any], apply: bool) -> bool:
+    expected = expected_metadata(record, target)
+    persisted_child = None
+    if target.get("child_id"):
+        readable, value = read_child(target)
+        if not readable:
+            target_transition(record, target, "failed", f"persisted child read failed: {value}", emit=apply)
+            return False
+        assert isinstance(value, dict)
+        if not exact(value, expected):
+            target_transition(record, target, "failed", "persisted child provenance mismatch", emit=apply)
+            return False
+        persisted_child = value
+
+    ok, matches = query_matches(record, target)
+    if not ok:
+        target_transition(record, target, "failed", f"query failed: {matches}", emit=apply)
+        return False
+    assert isinstance(matches, list)
+    if len(matches) > 1:
+        target_transition(record, target, "failed", "multiple children match provenance", emit=apply)
+        return False
+    child = matches[0] if matches else None
+    if persisted_child and (not child or child.get("id") != persisted_child.get("id")):
+        target_transition(record, target, "failed", "persisted child missing from provenance query", emit=apply)
+        return False
+    if child and not exact(child, expected):
+        target_transition(record, target, "failed", "immutable child provenance mismatch", emit=apply)
+        return False
+    if not child:
+        if not apply:
+            target_transition(record, target, "failed", "missing child", emit=False)
+            return False
+        target_transition(record, target, "materializing")
+        save(record)  # durable before child creation
+        created, result = create_child(record, target)
+        if not created:
+            target_transition(record, target, "failed", f"create failed: {result}")
+            return False
+        target["child_id"] = result
+        target["child_ref"] = f"rig:{target['rig']}:{result}"
+        ok, reread = read_child(target)
+        if not ok:
+            target_transition(record, target, "failed", f"created child read failed: {reread}")
+            return False
+        child = reread
+    target["child_id"] = str(child["id"])
+    target["child_ref"] = f"rig:{target['rig']}:{target['child_id']}"
+    target["observed_route"] = str((child.get("metadata") or {}).get("gc.routed_to") or "")
+    status, reason = classify(record, target, child)
+    metadata = child.get("metadata") or {}
+    if status == "failed" and child.get("status") == "open" and not metadata.get("gc.routed_to") and apply:
+        target_transition(record, target, "materializing")
+        save(record)  # durable before routing
+        proc = subprocess.run(["gc-sling", target["route_to"], target["child_id"], "--no-formula", "--no-convoy", "--nudge"],
+                              text=True, capture_output=True)
+        if proc.returncode:
+            target_transition(record, target, "failed", f"route failed: {proc.stderr.strip()}")
+            return False
+        ok, reread = read_child(target)
+        if not ok:
+            target_transition(record, target, "failed", f"post-route read failed: {reread}")
+            return False
+        target["observed_route"] = str((reread.get("metadata") or {}).get("gc.routed_to") or "")
+        status, reason = classify(record, target, reread)
+    target_transition(record, target, status, reason, emit=apply)
+    return status in {"accepted", "blocked", "completed"}
+
+
+def aggregate(record: dict[str, Any]) -> str:
+    states = {t.get("state") for t in record["targets"]}
+    if states == {"completed"}:
+        return "completed"
+    if states <= {"accepted", "blocked", "completed"}:
+        return "blocked" if "blocked" in states else "accepted"
+    return "failed"
+
+
+def materialize(record: dict[str, Any], apply: bool = True) -> bool:
+    successes = [reconcile_target(record, target, apply) for target in record["targets"]]
+    if apply:
+        transition(record, aggregate(record))
+        save(record)
+    return all(successes)
+
+
+def validate_record(record: Any, path: Path) -> dict[str, Any]:
+    if not isinstance(record, dict) or record.get("version") != 1:
+        raise ValueError(f"invalid record version in {path.name}")
+    handoff_id = record.get("handoff_id")
+    if (
+        not isinstance(handoff_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", handoff_id)
+        or not isinstance(record.get("source_ref"), str)
+        or not QUALIFIED.fullmatch(record["source_ref"])
+    ):
+        raise ValueError(f"invalid record identity in {path.name}")
+    targets = record.get("targets")
+    if not isinstance(targets, list) or not targets:
+        raise ValueError(f"record has no targets in {path.name}")
+    declaration = {"handoff_id": handoff_id, "source_ref": record["source_ref"], "targets": []}
+    valid_states = {"declared", "materializing", "accepted", "blocked", "failed", "completed"}
+    for target in targets:
+        if not isinstance(target, dict):
+            raise ValueError(f"invalid target in {path.name}")
+        required = ("target_key", "rig", "store_ref", "route_to", "work", "work_sha256", "state")
+        if any(key not in target for key in required):
+            raise ValueError(f"incomplete target in {path.name}")
+        declaration["targets"].append({key: target[key] for key in ("target_key", "rig", "store_ref", "route_to", "work")})
+        if not isinstance(target["work_sha256"], str) or target["work_sha256"] != digest(target["work"]):
+            raise ValueError(f"invalid work hash in {path.name}")
+        if target["state"] not in valid_states:
+            raise ValueError(f"invalid target state in {path.name}")
+        if "child_id" in target and (not isinstance(target["child_id"], str) or not target["child_id"]):
+            raise ValueError(f"invalid child identity in {path.name}")
+    validate(declaration)
+    if not isinstance(record.get("intent_sha256"), str) or record["intent_sha256"] != digest(declaration):
+        raise ValueError(f"immutable intent mismatch in {path.name}")
+    return record
+
+
+def load_record(handoff_id: str) -> dict[str, Any]:
+    path = RECORD_DIR / f"{handoff_id}.json"
+    if not path.exists():
+        raise ValueError(f"unknown handoff {handoff_id}")
+    return validate_record(json.loads(path.read_text()), path)
+
+
+def record_from_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    path = RECORD_DIR / f"{spec['handoff_id']}.json"
+    intent = digest(spec)
+    if path.exists():
+        record = validate_record(json.loads(path.read_text()), path)
+        if record.get("intent_sha256") != intent:
+            raise ValueError("handoff_id already exists with different immutable intent")
+        return record
+    readable, _ = source_closed(spec["source_ref"])
+    if not readable:
+        raise ValueError(f"source_ref is not readable: {spec['source_ref']}")
+    targets = []
+    for item in spec["targets"]:
+        target = json.loads(json.dumps(item))
+        target["work_sha256"] = digest(target["work"])
+        target["state"] = "declared"
+        targets.append(target)
+    record = {"version": 1, "handoff_id": spec["handoff_id"], "source_ref": spec["source_ref"],
+              "intent_sha256": intent, "created_at": now(), "targets": targets, "state": None, "transitions": []}
+    transition(record, "declared")
+    save(record)
+    return record
+
+
+def source_cmd(source_ref: str, action: str) -> list[str]:
+    parts = source_ref.split(":")
+    return ["bd", action, parts[1]] if parts[0] == "city" else rig_cmd(parts[1], action, parts[2])
+
+
+def source_closed(source_ref: str) -> tuple[bool, bool]:
+    ok, value = run_json([*source_cmd(source_ref, "show"), "--json"])
+    child = one(value) if ok else None
+    return (True, child.get("status") == "closed") if child else (False, False)
+
+
+def reopen_source_for_incomplete(record: dict[str, Any]) -> bool:
+    unresolved_targets = ",".join(
+        target["target_key"]
+        for target in record["targets"]
+        if target.get("state") not in {"accepted", "blocked", "completed"}
+    )
+    reopen_reason = (
+        f"incomplete cross-rig handoff {record['handoff_id']}; "
+        f"unresolved targets: {unresolved_targets or 'unknown'}"
+    )
+    audit("reopen_attempt", record, source_ref=record["source_ref"])
+    error = "source reopen verification failed"
+    for _ in range(2):
+        proc = subprocess.run(
+            [*source_cmd(record["source_ref"], "reopen"), "--reason", reopen_reason],
+            text=True,
+            capture_output=True,
+        )
+        verified, still_closed = source_closed(record["source_ref"])
+        if verified and not still_closed:
+            record.pop("reopen_error", None)
+            audit("source_reopened", record, source_ref=record["source_ref"])
+            save(record)
+            return True
+        error = proc.stderr.strip() or error
+    record["reopen_error"] = error
+    audit("reopen_failed", record, source_ref=record["source_ref"], error=error)
+    save(record)
+    return False
+
+
+def gate_records(source: str) -> list[dict[str, Any]]:
+    if not QUALIFIED.fullmatch(source):
+        raise ValueError("source must be city:<id> or rig:<rig>:<id>")
+    if not RECORD_DIR.exists():
+        return []
+    records = []
+    for path in RECORD_DIR.glob("*.json"):
+        raw = json.loads(path.read_text())
+        if not isinstance(raw, dict) or raw.get("source_ref") != source:
+            continue
+        records.append(validate_record(raw, path))
+    return records
+
+
+def complete_for_gate(record: dict[str, Any]) -> bool:
+    return bool(record["targets"]) and all(t.get("state") in {"accepted", "blocked", "completed"} for t in record["targets"])
+
+
+def nudge(records: list[dict[str, Any]], invalid_records: list[str]) -> None:
+    pending = [(r["handoff_id"], [(t["target_key"], t.get("state"), t.get("error", "")) for t in r["targets"] if t.get("state") not in {"accepted", "blocked", "completed"}]) for r in records]
+    fingerprint = digest({"pending": pending, "invalid": invalid_records})
+    todo = [r for r in records if r.get("last_nudge_fingerprint") != fingerprint]
+    invalid_seen = INVALID_NOTIFY_STATE.read_text().strip() if INVALID_NOTIFY_STATE.exists() else ""
+    if not todo and (not invalid_records or invalid_seen == fingerprint):
+        return
+    names = [r["handoff_id"] for r in records] + [f"invalid:{name}" for name in invalid_records]
+    message = "Cross-rig handoffs need attention: " + "; ".join(names)
+    proc = subprocess.run(["gc", "session", "nudge", "mayor", message], text=True, capture_output=True)
+    if proc.returncode == 0:
+        for record in todo:
+            record["last_nudge_fingerprint"] = fingerprint
+            save(record)
+        if invalid_records:
+            INVALID_NOTIFY_STATE.parent.mkdir(parents=True, exist_ok=True)
+            INVALID_NOTIFY_STATE.write_text(fingerprint + "\n")
+
+
+def scan(apply: bool, nudge_mayor: bool) -> bool:
+    records = []
+    invalid_records = []
+    if RECORD_DIR.exists():
+        for path in sorted(RECORD_DIR.glob("*.json")):
+            try:
+                records.append(validate_record(json.loads(path.read_text()), path))
+            except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
+                invalid_records.append(path.name)
+                if apply:
+                    audit_invalid(path, str(exc))
+    unresolved = []
+    for record in records:
+        try:
+            ok = materialize(record, apply=apply)
+            readable, closed = source_closed(record["source_ref"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            invalid_records.append(f"{record['handoff_id']}.json")
+            if apply:
+                audit_invalid(RECORD_DIR / f"{record['handoff_id']}.json", str(exc))
+            continue
+        if not readable:
+            record["source_error"] = "source is unreadable or missing"
+            if record not in unresolved:
+                unresolved.append(record)
+            if apply:
+                save(record)
+            continue
+        record.pop("source_error", None)
+        if not ok:
+            unresolved.append(record)
+            if apply and closed:
+                reopen_source_for_incomplete(record)
+    if apply and nudge_mayor and (unresolved or invalid_records):
+        nudge(unresolved, invalid_records)
+    print(canonical({
+        "records": len(records),
+        "unresolved": [r["handoff_id"] for r in unresolved],
+        "invalid_records": invalid_records,
+        "apply": apply,
+    }))
+    return not unresolved and not invalid_records
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    subs = parser.add_subparsers(dest="command", required=True)
+    mat = subs.add_parser("materialize"); group = mat.add_mutually_exclusive_group(required=True)
+    group.add_argument("--spec"); group.add_argument("--id")
+    gate = subs.add_parser("gate"); gate.add_argument("--source", required=True)
+    show = subs.add_parser("show"); show.add_argument("id")
+    scan_p = subs.add_parser("scan"); scan_p.add_argument("--apply", action="store_true"); scan_p.add_argument("--nudge-mayor", action="store_true")
+    args = parser.parse_args()
+    try:
+        with locked():
+            if args.command == "materialize":
+                if args.spec:
+                    text = sys.stdin.read() if args.spec == "-" else Path(args.spec).read_text()
+                    record = record_from_spec(validate(json.loads(text)))
+                else:
+                    record = load_record(args.id)
+                ok = materialize(record)
+                readable, closed = source_closed(record["source_ref"])
+                if not readable:
+                    record["source_error"] = "source is unreadable or missing"
+                    save(record)
+                    ok = False
+                elif not ok and closed:
+                    reopen_source_for_incomplete(record)
+                print(canonical(record))
+                return 0 if ok else 1
+            if args.command == "show":
+                print(json.dumps(load_record(args.id), sort_keys=True, indent=2)); return 0
+            if args.command == "gate":
+                records = gate_records(args.source)
+                for record in records:
+                    materialize(record, apply=False)
+                ok = bool(records) and all(complete_for_gate(r) for r in records)
+                print(canonical({"source_ref": args.source, "handoffs": [r["handoff_id"] for r in records], "satisfied": ok}))
+                return 0 if ok else 1
+            return 0 if scan(args.apply, args.nudge_mayor) else 1
+    except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        print(f"cross-rig-handoff: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

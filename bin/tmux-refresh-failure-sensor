@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# tmux-refresh-failure-sensor — early-warning sensor for host death by memory
+# exhaustion (dr-59p; RCA docs/rca-host-death-2026-07-15-memory-exhaustion.md).
+#
+# WHY: on 2026-07-15 the host hard-died 08:11 EDT (~85m city outage). No guard
+# fired — bin/resource-sweep gates on MemAvailable < 4G but MemAvailable never
+# fell below 9.9G while swap sat at 0MB free for hours. The one sharp, non-
+# chronic, ~zero-false-positive signal was the supervisor's own log line:
+#   tmux state cache: refresh failed in <duration>: tmux -u: context deadline exceeded
+# It appeared ~45 MINUTES before the death (07:26 at 3m14s, escalating to
+# 18m22s at 07:49). A multi-minute `tmux -u` is never steady-state, so a sensor
+# that watches supervisor.log for over-threshold refresh failures gives ~45min
+# of warning with essentially no false positives.
+#
+# DELIBERATELY NOT a memory-threshold sensor: the RCA shows swap_free ~0 and
+# Committed_AS > RAM were BOTH chronic all night and across the 14d boot, so a
+# static level test there fires every run (the alert fatigue resource-sweep's
+# author avoided). This sensor keys only on the sharp tmux-refresh signal.
+#
+# Read-only against the log. Mails mayor on any over-threshold refresh failure
+# inside the recent window, fingerprint-deduped so a persistent/escalating
+# condition mails once per distinct worst-event (escalations DO re-alert).
+# Always exits 0 — a guard that crashes is a guard that goes silent.
+
+set -u
+PATH=/home/ds/.local/bin:/usr/local/bin:/usr/bin:/bin
+export PATH
+
+CITY=/home/ds/gas-city
+GC_BIN="${TMUX_REFRESH_GC_BIN:-/home/ds/.local/bin/gc}"
+LOG="${TMUX_REFRESH_LOG:-/home/ds/.gc/supervisor.log}"
+STATE="${TMUX_REFRESH_STATE:-/home/ds/.gc/tmux-refresh-sensor-state.json}"
+# A multi-minute tmux -u is never steady-state; the first real alarm was 3m14s.
+# 60s sits well above any healthy refresh (sub-second to low-seconds) and below
+# the first pre-death signal.
+THRESH_SEC="${TMUX_REFRESH_ALERT_SEC:-60}"
+# Only consider failures seen in the recent window so old rotated-in entries do
+# not re-alert. The pre-death escalation spanned ~45m; 30m + a short order
+# cooldown keeps every event visible across a few runs (dedup handles repeats).
+WINDOW_MIN="${TMUX_REFRESH_WINDOW_MIN:-30}"
+# Safety cap on how much of the tail we scan (current log is ~30MB); the target
+# line is rare so a fixed-string grep over this is fast.
+SCAN_BYTES="${TMUX_REFRESH_SCAN_BYTES:-40M}"
+
+ts() { date "+%Y-%m-%d %H:%M:%S %Z"; }
+
+# Convert a Go time.Duration string (e.g. 3m14.6s, 18m22.9s, 1.5s, 800ms,
+# 1h2m3.4s) to whole+fractional seconds. Sub-second units (ms/us/ns) only ever
+# appear alone in Go's format (no h/m/s), so treating them as ~0 is correct for
+# a seconds-scale threshold.
+dur_to_sec() {
+  local d="$1" h m s d2
+  h=$(grep -oP '[0-9.]+(?=h)' <<<"$d" | head -1)
+  m=$(grep -oP '[0-9.]+(?=m(?!s))' <<<"$d" | head -1)
+  d2="${d//ms/_ms_}"                       # neutralise ms so 's' capture is real seconds
+  s=$(grep -oP '[0-9.]+(?=s)' <<<"$d2" | head -1)
+  awk "BEGIN{printf \"%.3f\", (${h:-0})*3600 + (${m:-0})*60 + (${s:-0})}"
+}
+
+if [[ ! -f "$LOG" ]]; then
+  echo "[$(ts)] LOG_MISSING $LOG — cannot watch tmux-refresh signal"
+  exit 0
+fi
+
+cutoff_epoch=$(date -d "-${WINDOW_MIN} min" +%s 2>/dev/null || echo 0)
+
+# Collect over-threshold refresh failures inside the window.
+worst_sec=0
+worst_line=""
+newest_epoch=0
+count=0
+
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  # Prefix format: "YYYY/MM/DD HH:MM:SS ..."  -> epoch for window filter.
+  lts="${line:0:19}"                         # "2026/07/15 07:26:24"
+  lepoch=$(date -d "${lts//\//-}" +%s 2>/dev/null || echo 0)
+  (( lepoch < cutoff_epoch )) && continue
+  dur=$(grep -oP 'refresh failed in \K[^:]+' <<<"$line" | head -1)
+  [[ -z "$dur" ]] && continue
+  dsec=$(dur_to_sec "$dur")
+  awk "BEGIN{exit !(${dsec:-0} >= ${THRESH_SEC})}" || continue
+  count=$((count + 1))
+  if awk "BEGIN{exit !(${dsec:-0} > ${worst_sec})}"; then
+    worst_sec="$dsec"; worst_line="$line"
+  fi
+  (( lepoch > newest_epoch )) && newest_epoch="$lepoch"
+done < <(tail -c "$SCAN_BYTES" "$LOG" 2>/dev/null | grep -aF 'tmux state cache: refresh failed in')
+
+if (( count == 0 )); then
+  echo "[$(ts)] clear — no tmux-refresh failure >= ${THRESH_SEC}s in last ${WINDOW_MIN}m"
+  exit 0
+fi
+
+worst_dur=$(grep -oP 'refresh failed in \K[^:]+' <<<"$worst_line" | head -1)
+worst_ts="${worst_line:0:19}"
+echo "[$(ts)] SENSOR TRIPPED: ${count} tmux-refresh failure(s) >= ${THRESH_SEC}s in last ${WINDOW_MIN}m; worst=${worst_dur} at ${worst_ts}"
+
+# Dedup on the worst event so a persistent condition mails once, but a NEW worst
+# (escalation 3m14s -> 18m22s) re-alerts — escalation is the signal we want.
+fp=$(printf '%s|%s' "$worst_ts" "$worst_dur" | sha256sum | cut -c1-16)
+last=$(jq -r '.last_fp // ""' "$STATE" 2>/dev/null || echo "")
+if [[ "$fp" == "$last" ]]; then
+  echo "[$(ts)] same worst event as last run — mail deduped"
+  exit 0
+fi
+
+body="tmux-refresh-failure-sensor tripped at $(ts)."$'\n\n'
+body+="Supervisor 'tmux state cache: refresh failed' over ${THRESH_SEC}s — the ~45min"$'\n'
+body+="early-warning signal for host death by memory exhaustion (RCA 2026-07-15)."$'\n\n'
+body+="- worst: ${worst_dur} at ${worst_ts}"$'\n'
+body+="- count over threshold in last ${WINDOW_MIN}m: ${count}"$'\n\n'
+body+="A multi-minute 'tmux -u' is never steady-state. Check host memory NOW:"$'\n'
+body+="  free -m ; grep -E 'Committed_AS|SwapFree|MemAvailable' /proc/meminfo"$'\n'
+body+="Root is the Stephanie-gated capacity item (box_oom_gate_scix_postgres);"$'\n'
+body+="last time this escalated (3m14s -> 18m22s) the host died ~45m later."$'\n\n'
+body+="Signal source: ${LOG}  |  RCA: docs/rca-host-death-2026-07-15-memory-exhaustion.md"
+
+if [[ -x "$GC_BIN" ]]; then
+  timeout 30 "$GC_BIN" --city "$CITY" mail send --to mayor \
+    -s "[tmux-refresh] host-death early warning: ${worst_dur} tmux refresh stall" \
+    -m "$body" >/dev/null 2>&1 \
+    && echo "[$(ts)] alert mailed to mayor" || echo "[$(ts)] alert mail FAILED"
+fi
+
+mkdir -p "$(dirname "$STATE")"
+printf '{"last_fp":"%s","last_ts":"%s","worst_dur":"%s","worst_event_ts":"%s"}\n' \
+  "$fp" "$(ts)" "$worst_dur" "$worst_ts" > "$STATE"
+
+exit 0

@@ -1,0 +1,23 @@
+# dispatch-feeder — mechanical pool-feeder (bead dr-b8y, Stephanie-approved
+# 2026-07-13 for a mem + gascity-dashboard pilot).
+#
+# SHIPPED DISABLED (`.disabled` suffix → the scheduler ignores this file).
+# This is deliberate: the ship state is "built, not running." See
+# .gc/dispatch-feeder.yaml for the full rollout.
+#
+# ENABLE THE DRY-RUN PILOT (mayor): rename to `dispatch-feeder.toml` (drop
+# `.disabled`). With both pilot rigs at mode: dry_run, the feeder then logs
+# would-sling decisions to .gc/dispatch-feeder.log every 30m and slings NOTHING.
+# After ~1 day, review the log, then flip mem + gascity-dashboard to mode: live
+# in .gc/dispatch-feeder.yaml. Fleet-wide expansion goes back to Stephanie.
+#
+# Every 30m, per rig with mode != disabled (and not held in
+# .gc/dispatch-holds.yaml): sling the top-K ready/unassigned/unrouted beads to
+# the rig's worker pool. --nudge-mayor mails a summary only when something is
+# actually slung or fails (dry_run stays silent — review the log instead).
+[order]
+description = "Every 30m: mechanically feed top-K ready/unassigned beads to each enabled rig's worker pool (dr-b8y). SHIPPED DISABLED; pilot rigs (mem, gascity-dashboard) are dry_run. EB is held. Enabling + going live is mayor/Stephanie-gated."
+trigger = "cooldown"
+interval = "30m"
+exec = "/home/ds/gas-city/bin/dispatch-feeder --nudge-mayor"
+timeout = "10m"

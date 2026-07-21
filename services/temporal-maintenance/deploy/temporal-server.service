@@ -1,0 +1,55 @@
+[Unit]
+Description=temporal-maintenance — self-hosted Temporal server (localhost, gRPC 7233 / UI 8233) for the maintenance Run provider
+Documentation=file://%h/gas-city/docs/design/temporal-maintenance-promotion-plan.md
+After=network-online.target
+Wants=network-online.target
+# Deliberately NOT ordered with, or a drop-in of, gascity-supervisor: this unit
+# must keep running (and be independently restartable) when the supervisor is
+# down. That failure-domain independence is a promotion invariant.
+
+[Service]
+Type=simple
+# Persistent single-node server. start-dev is a supported self-hosted mode; the
+# sqlite file is the durable store (operator owns backup/retention).
+Environment=PATH=%h/.local/bin:%h/go/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TEMPORAL_DB=%h/.local/share/temporal-maintenance/state.sqlite
+Environment=TEMPORAL_ADDRESS=127.0.0.1:7233
+ExecStartPre=/bin/sh -c 'mkdir -p %h/.local/share/temporal-maintenance'
+ExecStartPre=/bin/sh -c 'command -v temporal >/dev/null 2>&1 || { echo "temporal-server: no \"temporal\" on this unit PATH — install the CLI (see services/temporal-maintenance/README.md) or add its dir to Environment=PATH" >&2; exit 1; }'
+# Bind loopback only. --headless can be added to drop the UI; we keep it on 8233
+# for operator inspection during shadow.
+ExecStart=/usr/bin/env temporal server start-dev \
+  --ip 127.0.0.1 \
+  --port 7233 \
+  --ui-port 8233 \
+  --namespace maintenance \
+  --db-filename %h/.local/share/temporal-maintenance/state.sqlite \
+  --log-level warn
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Keep this off the systemd-oomd hit list: a bounded ceiling so the server can
+# never become the cgroup oomd picks inside user@1000 (which historically took
+# mayor/the supervisor as collateral).
+MemoryHigh=768M
+MemoryMax=1G
+
+# Hardening (same --user-safe subset the dashboard unit documents: no
+# PrivateDevices/ProtectKernelModules/MemoryDenyWriteExecute — those need caps an
+# unprivileged --user manager lacks, or break a Go runtime).
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=%h/.local/share/temporal-maintenance
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target

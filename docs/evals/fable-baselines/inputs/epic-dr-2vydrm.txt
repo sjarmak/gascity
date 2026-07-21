@@ -1,0 +1,159 @@
+○ dr-2vydrm [EPIC] · [epic] Three-benchmark QA framework — VERIFICATION_REPORT remediation across CSB / EB / codeprobe   [● P1 · OPEN]
+Owner: mayor · Type: epic
+Created: 2026-04-29 · Updated: 2026-06-21
+
+DESCRIPTION
+
+  Source: external CodeScaleBench Verification Report received 2026-04-24.    
+  Audit of 25 CSB tasks (18 SDLC + 7 Org) found 16% usable as-is, 88% usable  
+  after fixes, 12% broken. Defect classes generalize to EB and codeprobe.     
+                                                                              
+  ## Five defect classes (each with bright-line rule)                         
+                                                                              
+  A. Oracle-instruction coherence — every oracle path/symbol exists; lang/path
+  constraints match                                                           
+  B. Verifier mechanical correctness — set -euo pipefail, no grep|head,       
+  shellcheck clean                                                            
+  C. Calibration triad — null ≤0.1, golden ≥0.9, adversarial-keyword-dump ≤0.5
+  (highest-leverage check)                                                    
+  D. Scoring-method honesty — declared scoring_method tier; checklist +       
+  secondary judge required                                                    
+  E. Agent-agnostic fairness — no oracle paths in CLAUDE.md/AGENTS.md/READMEs 
+                                                                              
+  ## Architecture                                                             
+                                                                              
+  • benchmark_qa_core: shared Python lib (~300 lines, schema-agnostic). Pure  
+  functions: (instruction, oracle, repo_path, aux_files) → findings. Houses   
+  A/D/E logic.                                                                
+  • Per-rig adapters: thin wrappers feeding native task shape into the lib.   
+  • B/C stay per-benchmark (they touch the verifier runtime, not just static  
+  schema).                                                                    
+                                                                              
+  ## Already in flight (this session)                                         
+                                                                              
+  • codeprobe-zat9 (CLOSED): multi-backend oracle curator — covers class A for
+  symbol-reference-trace mining                                               
+  • codeprobe-voxa (in_progress): reward vs IR diagnostics separation — covers
+  class D for codeprobe                                                       
+  • EnterpriseBench-0rv.25 (CLOSED today): point-fix for 4 EB ground-truth    
+  bugs (not the structural framework)                                         
+                                                                              
+  ## Decision (sjarmak 2026-04-29)                                            
+                                                                              
+  **Do NOT pull broken tasks from public sourcegraph/CodeScaleBench.** Fix in 
+  private (sjarmak/CodeScaleBench) until verified by triad, then sjarmak      
+  pushes upstream to public when ready. Calibration-triad failures gate the   
+  **upstream push**, not the public corpus's existence.                       
+                                                                              
+  ## Repo flow per rig                                                        
+                                                                              
+  • CSB: work lands in private sjarmak/CodeScaleBench. Public                 
+  sourcegraph/CodeScaleBench is upstream — sjarmak handles the manual sync.   
+  • EB: private sjarmak/EnterpriseBench (no public counterpart at this time)  
+  • codeprobe: private sjarmak/codeprobe                                      
+                                                                              
+  Per feedback_no_remote_ops.md: workers do not push to public, do not open   
+  PRs. Workers commit to working branches in private worktrees only.          
+                                                                              
+  ## Children                                                                 
+                                                                              
+  • dr- benchmark_qa_core lib                                                 
+  • 3 per-rig adapter beads (CSB, EB, codeprobe)                              
+  • 3 per-rig calibration-triad beads (CSB, EB, codeprobe)                    
+  • 1 CSB verifier-lint bead                                                  
+                                                                              
+  ## Acceptance                                                               
+                                                                              
+  • benchmark_qa_core lib lands and is consumed by all 3 rig adapters         
+  • Calibration triad runs on all 3 rigs (results captured, NOT blocking      
+  public availability)                                                        
+  • Verifier-lint clean on CSB (42% of 781 test.sh files currently fail)      
+  • Each rig has run the new QA on its existing corpus and filed follow-up    
+  beads for failures                                                          
+  • Public response doc drafted (private repo, not yet published) summarizing 
+  remediation status                                                          
+                                                                              
+  ## Out of scope                                                             
+                                                                              
+  • Public PRs / pushes to sourcegraph/CodeScaleBench — sjarmak owns          
+  • Re-mining or re-authoring tasks discovered to be irrecoverable (file      
+  separately as needed)                                                       
+
+
+
+NOTES
+
+  EPIC ACCEPTANCE TIGHTENED 2026-04-30 (sjarmak feedback).                    
+                                                                              
+  The original acceptance ('benchmark_qa_core lib lands, calibration triad    
+  runs, verifier-lint clean') was static-schema-checks scope. After auditing  
+  codeprobe's voxa close (recall-only reward) against CSB's                   
+  docs/SCORING_SEMANTICS.md, the actual gap is broader: all 3 rigs need a     
+  unified ScoreResult contract that lets cross-rig comparison and tooling-    
+  decision plots be meaningful.                                               
+                                                                              
+  ## Unified contract (all 3 rigs emit this)                                  
+                                                                              
+    {                                                                         
+      "reward":          float,    // task completion quality, verifier-      
+  defined, [0..1]                                                             
+      "scorer_family":   string,   // rubric used — for interpretability      
+      "sub_scores":      {...},    // rubric breakdown                        
+      "diagnostics": {                                                        
+        "task_time_seconds": float,                                           
+        "token_cost_usd":    float,                                           
+        "ir_metrics":        { "precision": ..., "recall": ..., "f1": ... }   
+      }                                                                       
+    }                                                                         
+                                                                              
+  Drops CSB's pass_threshold/passed/scorable ceremony. Goal isn't policy      
+  compliance; goal is HIGH-SIGNAL REWARD for tooling-decision-making (does MCP
+  help? which agent? at what cost?).                                          
+                                                                              
+  ## Defect class coverage refreshed                                          
+                                                                              
+   Class                  | Current children        | Gap                     
+  ------------------------|-------------------------|-------------------------
+   A: oracle-instruction… | codeprobe-zat9 (closed… | EB has no upstream zat… 
+   B: verifier mechanica… | .8 (CSB shellcheck)     | EB no shell verifiers;… 
+   C: calibration triad   | .5/.6/.7 cover all 3 r… | unblocks once voxa lan… 
+   D: scoring honesty     | codeprobe-voxa (REOPEN… | needs scorer_family co… 
+   E: agent-agnostic fai… | none                    | new bead per rig (code… 
+                                                                              
+  ## Updated acceptance                                                       
+                                                                              
+  • A1. ScoreResult contract (above) emitted by all 3 rigs (codeprobe + EB +  
+  CSB)                                                                        
+  • A2. dr-2vydrm.1 lib defines schema constants for the contract; rigs import
+  from lib                                                                    
+  • A3. Calibration triad (.5/.6/.7) runs against the new contract;           
+  null/golden/adversarial-keyword-dump fixtures all return the contract shape 
+  • A4. Verifier-lint clean (.8 + new codeprobe analog .11)                   
+  • A5. Agent-agnostic fairness scan clean (new beads .10 / EB analog)        
+  • A6. Cross-rig dashboard / aggregate.json shows reward + scorer_family +   
+  sub_scores; mean-reward aggregates carry scorer_family caveats when mixed   
+  (per CSB reporting policy)                                                  
+                                                                              
+  ## Sequencing change                                                        
+                                                                              
+  Original: parallel by rig.                                                  
+  Revised: codeprobe-voxa (reopened) MUST land first since it's the reference 
+  scorer_family contract that .1/.4/.7 depend on. Then .1 (lib) absorbs the   
+  schema. Then adapters (.2/.3/.4) port. Then triad (.5/.6/.7) calibrates.    
+  Then lint + fairness in parallel.                                           
+                                                                              
+  ## Children added this update                                               
+                                                                              
+  • dr-2vydrm.9: cross-rig diagnostics plumbing (task_time_seconds +          
+  token_cost_usd surfaced per-trial)                                          
+  • dr-2vydrm.10: codeprobe agent-agnostic fairness scan (class E)            
+  • dr-2vydrm.11: codeprobe verifier-honesty lint (class B analog)            
+
+
+
+CHILDREN
+  ↳ ○ dr-2vydrm.3: [EB] Adapter: extend lib/eb_verify/schema_validator.py to call benchmark_qa_core (classes A/D/E) ● P1
+  ↳ ○ dr-2vydrm.9: [cross-rig] Diagnostics plumbing — task_time_seconds + token_cost_usd surfaced per-trial across codeprobe / EB / CSB ● P1
+  ↳ ○ dr-2vydrm.6: [EB] Calibration triad: eb_verify.calibrate subcommand (null/golden/adversarial gates) ● P1
+  ◐ 0/3 complete (0%)
+

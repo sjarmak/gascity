@@ -1,0 +1,6 @@
+[order]
+description = "When a bead owned by mayor closes (i.e., work mayor slung), nudge mayor with the close summary so it follows through without a human prompt. Enforcement for the 'mayor proactively polls slung work' rule that can't live in mayor's prompt or memory alone."
+trigger = "event"
+on = "bead.closed"
+exec = "/home/ds/gas-city/bin/wake-mayor-on-slung-close"
+timeout = "60s"

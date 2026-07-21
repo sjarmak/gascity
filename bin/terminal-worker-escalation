@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""Make terminal worker escalations durable and state-correct.
+
+Added 2026-07-18 for dr-80uo after gascity-dashboard-1rey/gc-512184.
+The source bead metadata is authoritative; JSON records support patrol and audit.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+ROOT = Path("/home/ds/gas-city")
+RECORD_DIR = Path(os.environ.get("TERMINAL_ESCALATION_DIR", ROOT / ".gc/terminal-escalations"))
+AUDIT_LOG = Path(os.environ.get("TERMINAL_ESCALATION_AUDIT_LOG", ROOT / ".gc/terminal-escalation.log"))
+LOCK_FILE = Path(os.environ.get("TERMINAL_ESCALATION_LOCK", ROOT / ".gc/terminal-escalation.lock"))
+NOTIFY_RETRY_SECONDS = int(os.environ.get("TERMINAL_ESCALATION_NOTIFY_RETRY_SECONDS", "600"))
+QUALIFIED = re.compile(r"^(?:city:[^:]+|rig:[^:]+:[^:]+)$")
+REASON_CLASS = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+TERMINAL_LABELS = ("terminal-escalated", "dispatch-blocked")
+CLEAR_METADATA = (
+    "gc.routed_to",
+    "gc.session_name",
+    "gc.session_id",
+    "gc.claimed_by",
+    "session_id",
+    "worker_session",
+)
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def one(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, list):
+        return value[0] if len(value) == 1 and isinstance(value[0], dict) else None
+    return value if isinstance(value, dict) else None
+
+
+def run_json(command: list[str]) -> tuple[bool, Any]:
+    proc = subprocess.run(command, text=True, capture_output=True)
+    if proc.returncode:
+        return False, proc.stderr.strip() or proc.stdout.strip()
+    try:
+        return True, json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return False, "malformed JSON response"
+
+
+@contextlib.contextmanager
+def locked():
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_FILE.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def atomic_write(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(value, out, sort_keys=True, indent=2)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def audit(event: str, record: dict[str, Any], **extra: Any) -> None:
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    row = {"ts": now(), "event": event, "escalation_id": record["escalation_id"], **extra}
+    with AUDIT_LOG.open("a") as out:
+        out.write(canonical(row) + "\n")
+
+
+def source_parts(source_ref: str) -> tuple[str, str | None, str]:
+    if not QUALIFIED.fullmatch(source_ref):
+        raise ValueError("source must be city:<id> or rig:<rig>:<id>")
+    parts = source_ref.split(":")
+    return ("city", None, parts[1]) if parts[0] == "city" else ("rig", parts[1], parts[2])
+
+
+def source_cmd(source_ref: str, action: str, *args: str) -> list[str]:
+    store, rig, bead = source_parts(source_ref)
+    prefix = ["bd", action, bead] if store == "city" else ["gc", "bd", "--rig", str(rig), action, bead]
+    return [*prefix, *args]
+
+
+def read_source(source_ref: str) -> tuple[bool, dict[str, Any] | str]:
+    ok, value = run_json(source_cmd(source_ref, "show", "--json"))
+    source = one(value) if ok else None
+    return (True, source) if source else (False, str(value))
+
+
+def update_source(source_ref: str, *args: str) -> tuple[bool, str]:
+    proc = subprocess.run(source_cmd(source_ref, "update", *args), text=True, capture_output=True)
+    return proc.returncode == 0, proc.stderr.strip() or proc.stdout.strip()
+
+
+def metadata_for(record: dict[str, Any]) -> dict[str, str]:
+    metadata = {
+        "help_request": f"terminal:{record['reason_class']} | {record['evidence']}",
+        "terminal_escalation_id": record["escalation_id"],
+        "terminal_escalation_source_ref": record["source_ref"],
+        "terminal_escalation_worker": record["worker"],
+        "terminal_escalation_owning_pl": record["owning_pl"],
+        "terminal_escalation_mayor": record["mayor"],
+        "terminal_escalation_reason_class": record["reason_class"],
+        "terminal_escalation_evidence": record["evidence"],
+        "terminal_escalation_created_at": record["created_at"],
+        "terminal_escalation_acknowledgement": record["acknowledgement"]["state"],
+        "terminal_escalation_disposition": record["disposition"]["state"],
+    }
+    acknowledgement = record["acknowledgement"]
+    if acknowledgement["state"] == "recorded":
+        metadata["terminal_escalation_acknowledged_by"] = acknowledgement["by"]
+        metadata["terminal_escalation_acknowledged_at"] = acknowledgement["at"]
+    disposition = record["disposition"]
+    if disposition["state"] == "recorded":
+        metadata["terminal_escalation_disposition_by"] = disposition["by"]
+        metadata["terminal_escalation_disposition_at"] = disposition["at"]
+        metadata["terminal_escalation_disposition_class"] = disposition["class"]
+        metadata["terminal_escalation_disposition_detail"] = disposition["detail"]
+    return metadata
+
+
+def source_transition_args(record: dict[str, Any]) -> list[str]:
+    args = ["--status", "blocked", "--assignee", ""]
+    for label in TERMINAL_LABELS:
+        args.extend(["--add-label", label])
+    for key, value in metadata_for(record).items():
+        args.extend(["--set-metadata", f"{key}={value}"])
+    for key in CLEAR_METADATA:
+        args.extend(["--unset-metadata", key])
+    return args
+
+
+def source_is_disarmed(source: dict[str, Any], record: dict[str, Any]) -> bool:
+    metadata = source.get("metadata") or {}
+    labels = set(source.get("labels") or [])
+    return (
+        source.get("status") == "blocked"
+        and not source.get("assignee")
+        and TERMINAL_LABELS[0] in labels
+        and TERMINAL_LABELS[1] in labels
+        and all(str(metadata.get(key, "")) == value for key, value in metadata_for(record).items())
+        and not any(metadata.get(key) for key in CLEAR_METADATA)
+    )
+
+
+def save(record: dict[str, Any]) -> None:
+    record["updated_at"] = now()
+    atomic_write(RECORD_DIR / f"{record['escalation_id']}.json", record)
+
+
+def validate_record(record: Any, path: Path) -> dict[str, Any]:
+    required = ("version", "escalation_id", "source_ref", "worker", "owning_pl", "mayor", "reason_class", "evidence", "created_at", "acknowledgement", "disposition", "notifications")
+    if not isinstance(record, dict) or record.get("version") != 1 or any(key not in record for key in required):
+        raise ValueError(f"invalid escalation record {path.name}")
+    source_parts(record["source_ref"])
+    if not all(isinstance(record[key], str) and record[key] for key in ("escalation_id", "worker", "owning_pl", "mayor", "evidence", "created_at")):
+        raise ValueError(f"invalid escalation identity {path.name}")
+    if not isinstance(record["reason_class"], str) or not REASON_CLASS.fullmatch(record["reason_class"]):
+        raise ValueError(f"invalid reason class {path.name}")
+    for field in ("acknowledgement", "disposition"):
+        if not isinstance(record[field], dict) or record[field].get("state") not in {"pending", "recorded"}:
+            raise ValueError(f"invalid {field} {path.name}")
+    if not isinstance(record["notifications"], dict):
+        raise ValueError(f"invalid notifications {path.name}")
+    return record
+
+
+def load(escalation_id: str) -> dict[str, Any]:
+    path = RECORD_DIR / f"{escalation_id}.json"
+    if not path.exists():
+        raise ValueError(f"unknown escalation {escalation_id}")
+    return validate_record(json.loads(path.read_text()), path)
+
+
+def load_for_source(source_ref: str) -> dict[str, Any]:
+    readable, value = read_source(source_ref)
+    if not readable:
+        raise ValueError(f"source is unreadable: {value}")
+    assert isinstance(value, dict)
+    escalation_id = str((value.get("metadata") or {}).get("terminal_escalation_id") or "")
+    if not escalation_id:
+        raise ValueError("source has no terminal escalation")
+    record = load(escalation_id)
+    if record["source_ref"] != source_ref:
+        raise ValueError("source escalation record mismatch")
+    return record
+
+
+def notification_due(entry: dict[str, Any] | None) -> bool:
+    if not entry or not entry.get("last_at"):
+        return True
+    try:
+        last = dt.datetime.fromisoformat(str(entry["last_at"]))
+    except ValueError:
+        return True
+    return (dt.datetime.now(dt.timezone.utc) - last).total_seconds() >= NOTIFY_RETRY_SECONDS
+
+
+def notify(record: dict[str, Any], force: bool = False) -> bool:
+    complete = record["acknowledgement"]["state"] == "recorded" and record["disposition"]["state"] == "recorded"
+    if complete:
+        return True
+    success = True
+    subject = f"TERMINAL ESCALATION: {record['source_ref']} [{record['reason_class']}]"
+    body = (
+        f"Escalation {record['escalation_id']} from worker {record['worker']}.\n"
+        f"Evidence: {record['evidence']}\n"
+        f"Acknowledge: {ROOT}/bin/terminal-worker-escalation ack --source {record['source_ref']} --coordinator <{record['owning_pl']}|{record['mayor']}>\n"
+        f"Then disposition: {ROOT}/bin/terminal-worker-escalation dispose --source {record['source_ref']} --coordinator <same> --class <class> --detail <detail>"
+    )
+    for recipient in dict.fromkeys((record["owning_pl"], record["mayor"])):
+        entry = record["notifications"].get(recipient)
+        if not force and not notification_due(entry):
+            continue
+        proc = subprocess.run(["gc", "mail", "send", recipient, "--notify", "--subject", subject, "--message", body], text=True, capture_output=True)
+        record["notifications"][recipient] = {
+            "attempts": int((entry or {}).get("attempts", 0)) + 1,
+            "last_at": now(),
+            "delivered": proc.returncode == 0,
+            "error": "" if proc.returncode == 0 else (proc.stderr.strip() or proc.stdout.strip()),
+        }
+        audit("notification_delivered" if proc.returncode == 0 else "notification_failed", record, recipient=recipient)
+        success = success and proc.returncode == 0
+    save(record)
+    return success
+
+
+def raise_escalation(args: argparse.Namespace) -> bool:
+    source_parts(args.source)
+    if not REASON_CLASS.fullmatch(args.reason_class):
+        raise ValueError("reason class must use lowercase letters, digits, dot, underscore, or dash")
+    readable, value = read_source(args.source)
+    if not readable:
+        raise ValueError(f"source is unreadable: {value}")
+    assert isinstance(value, dict)
+    existing = str((value.get("metadata") or {}).get("terminal_escalation_id") or "")
+    if existing:
+        record = load(existing)
+        return source_is_disarmed(value, record) and notify(record, force=True)
+    created = now()
+    suffix = hashlib.sha256(f"{args.source}\0{created}".encode()).hexdigest()[:12]
+    record = {
+        "version": 1,
+        "escalation_id": f"te-{suffix}",
+        "source_ref": args.source,
+        "worker": args.worker,
+        "owning_pl": args.owning_pl,
+        "mayor": "mayor",
+        "reason_class": args.reason_class,
+        "evidence": args.evidence,
+        "created_at": created,
+        "acknowledgement": {"state": "pending", "by": None, "at": None},
+        "disposition": {"state": "pending", "by": None, "at": None, "class": None, "detail": None},
+        "notifications": {},
+    }
+    ok, error = update_source(args.source, *source_transition_args(record))
+    if not ok:
+        raise ValueError(f"atomic source transition failed: {error}")
+    verified, source = read_source(args.source)
+    if not verified or not isinstance(source, dict) or not source_is_disarmed(source, record):
+        raise ValueError("source transition verification failed")
+    save(record)
+    audit("declared", record)
+    return notify(record, force=True)
+
+
+def acknowledge(source_ref: str, coordinator: str) -> bool:
+    record = load_for_source(source_ref)
+    readable, source = read_source(source_ref)
+    if not readable or not isinstance(source, dict):
+        raise ValueError(f"source is unreadable: {source}")
+    if merge_source_lifecycle(record, source):
+        save(record)
+        audit("record_recovered", record)
+    if coordinator not in {record["owning_pl"], record["mayor"]}:
+        raise ValueError("coordinator must be the owning PL or mayor")
+    ack = record["acknowledgement"]
+    if ack["state"] == "recorded":
+        if ack.get("by") != coordinator:
+            raise ValueError(f"escalation already acknowledged by {ack.get('by')}")
+        return True
+    ack.update({"state": "recorded", "by": coordinator, "at": now()})
+    ok, error = update_source(source_ref,
+        "--set-metadata", "terminal_escalation_acknowledgement=recorded",
+        "--set-metadata", f"terminal_escalation_acknowledged_by={coordinator}",
+        "--set-metadata", f"terminal_escalation_acknowledged_at={ack['at']}")
+    if not ok:
+        raise ValueError(f"acknowledgement source update failed: {error}")
+    save(record)
+    audit("acknowledged", record, coordinator=coordinator)
+    return True
+
+
+def dispose(source_ref: str, coordinator: str, disposition_class: str, detail: str) -> bool:
+    record = load_for_source(source_ref)
+    readable, source = read_source(source_ref)
+    if not readable or not isinstance(source, dict):
+        raise ValueError(f"source is unreadable: {source}")
+    if merge_source_lifecycle(record, source):
+        save(record)
+        audit("record_recovered", record)
+    ack = record["acknowledgement"]
+    if ack["state"] != "recorded" or ack.get("by") != coordinator:
+        raise ValueError("disposition must be recorded by the coordinator who acknowledged the escalation")
+    if not REASON_CLASS.fullmatch(disposition_class):
+        raise ValueError("disposition class is invalid")
+    disposition = record["disposition"]
+    if disposition["state"] == "recorded":
+        if (
+            disposition.get("by") == coordinator
+            and disposition.get("class") == disposition_class
+            and disposition.get("detail") == detail
+        ):
+            return True
+        raise ValueError("recorded disposition is immutable")
+    disposition.update({"state": "recorded", "by": coordinator, "at": now(), "class": disposition_class, "detail": detail})
+    ok, error = update_source(source_ref,
+        "--set-metadata", "terminal_escalation_disposition=recorded",
+        "--set-metadata", f"terminal_escalation_disposition_by={coordinator}",
+        "--set-metadata", f"terminal_escalation_disposition_at={disposition['at']}",
+        "--set-metadata", f"terminal_escalation_disposition_class={disposition_class}",
+        "--set-metadata", f"terminal_escalation_disposition_detail={detail}")
+    if not ok:
+        raise ValueError(f"disposition source update failed: {error}")
+    save(record)
+    audit("disposed", record, coordinator=coordinator, disposition_class=disposition_class)
+    return True
+
+
+def discover_sources() -> tuple[list[str], list[str]]:
+    configured = os.environ.get("TERMINAL_ESCALATION_STORES")
+    stores = configured.split(",") if configured else ["city"]
+    errors = []
+    if not configured:
+        proc = subprocess.run(["gc", "rig", "list"], text=True, capture_output=True)
+        if proc.returncode == 0:
+            stores.extend(re.findall(r"^  ([A-Za-z][A-Za-z0-9_-]*):", proc.stdout, re.MULTILINE))
+        else:
+            errors.append(f"rig discovery failed: {proc.stderr.strip() or proc.stdout.strip()}")
+    refs = []
+    for store in dict.fromkeys(stores):
+        command = ["bd", "list"] if store in {"city", "ds-research"} else ["gc", "bd", "--rig", store, "list"]
+        ok, value = run_json([*command, "--all", "--label", TERMINAL_LABELS[0], "--json"])
+        if not ok or not isinstance(value, list):
+            errors.append(f"store discovery failed for {store}: {value}")
+            continue
+        for source in value:
+            if not isinstance(source, dict) or not source.get("id"):
+                continue
+            refs.append(f"city:{source['id']}" if store in {"city", "ds-research"} else f"rig:{store}:{source['id']}")
+    return refs, errors
+
+
+def merge_source_lifecycle(record: dict[str, Any], source: dict[str, Any]) -> bool:
+    metadata = source.get("metadata") or {}
+    changed = False
+    source_ack = str(metadata.get("terminal_escalation_acknowledgement") or "pending")
+    if source_ack == "recorded":
+        incoming = {
+            "state": "recorded",
+            "by": metadata.get("terminal_escalation_acknowledged_by"),
+            "at": metadata.get("terminal_escalation_acknowledged_at"),
+        }
+        if not incoming["by"] or not incoming["at"]:
+            raise ValueError("source has incomplete recorded acknowledgement")
+        if record["acknowledgement"]["state"] == "pending":
+            record["acknowledgement"] = incoming
+            changed = True
+        elif record["acknowledgement"] != incoming:
+            raise ValueError("source and record acknowledgement differ")
+    elif record["acknowledgement"]["state"] == "recorded":
+        raise ValueError("source lost recorded acknowledgement")
+
+    source_disposition = str(metadata.get("terminal_escalation_disposition") or "pending")
+    if source_disposition == "recorded":
+        incoming = {
+            "state": "recorded",
+            "by": metadata.get("terminal_escalation_disposition_by"),
+            "at": metadata.get("terminal_escalation_disposition_at"),
+            "class": metadata.get("terminal_escalation_disposition_class"),
+            "detail": metadata.get("terminal_escalation_disposition_detail"),
+        }
+        if not all(incoming[key] for key in ("by", "at", "class", "detail")):
+            raise ValueError("source has incomplete recorded disposition")
+        if record["acknowledgement"]["state"] != "recorded" or incoming["by"] != record["acknowledgement"]["by"]:
+            raise ValueError("source disposition is not owned by acknowledging coordinator")
+        if record["disposition"]["state"] == "pending":
+            record["disposition"] = incoming
+            changed = True
+        elif record["disposition"] != incoming:
+            raise ValueError("source and record disposition differ")
+    elif record["disposition"]["state"] == "recorded":
+        raise ValueError("source lost recorded disposition")
+    return changed
+
+
+def reconstruct(source_ref: str, source: dict[str, Any]) -> dict[str, Any]:
+    metadata = source.get("metadata") or {}
+    escalation_id = str(metadata.get("terminal_escalation_id") or "")
+    record = {
+        "version": 1,
+        "escalation_id": escalation_id,
+        "source_ref": str(metadata.get("terminal_escalation_source_ref") or source_ref),
+        "worker": str(metadata.get("terminal_escalation_worker") or "unknown"),
+        "owning_pl": str(metadata.get("terminal_escalation_owning_pl") or ""),
+        "mayor": str(metadata.get("terminal_escalation_mayor") or "mayor"),
+        "reason_class": str(metadata.get("terminal_escalation_reason_class") or "unknown"),
+        "evidence": str(metadata.get("terminal_escalation_evidence") or metadata.get("help_request") or "missing evidence"),
+        "created_at": str(metadata.get("terminal_escalation_created_at") or now()),
+        "acknowledgement": {"state": str(metadata.get("terminal_escalation_acknowledgement") or "pending"), "by": metadata.get("terminal_escalation_acknowledged_by"), "at": metadata.get("terminal_escalation_acknowledged_at")},
+        "disposition": {"state": str(metadata.get("terminal_escalation_disposition") or "pending"), "by": metadata.get("terminal_escalation_disposition_by"), "at": metadata.get("terminal_escalation_disposition_at"), "class": metadata.get("terminal_escalation_disposition_class"), "detail": metadata.get("terminal_escalation_disposition_detail")},
+        "notifications": {},
+    }
+    return validate_record(record, Path(f"{escalation_id}.json"))
+
+
+def scan(apply: bool) -> bool:
+    records: dict[str, dict[str, Any]] = {}
+    invalid = []
+    if RECORD_DIR.exists():
+        for path in sorted(RECORD_DIR.glob("*.json")):
+            try:
+                record = validate_record(json.loads(path.read_text()), path)
+                records[record["source_ref"]] = record
+            except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
+                invalid.append(f"{path.name}: {exc}")
+    sources, discovery_errors = discover_sources()
+    invalid.extend(discovery_errors)
+    for source_ref in sources:
+        readable, source = read_source(source_ref)
+        if not readable or not isinstance(source, dict):
+            if source_ref not in records:
+                invalid.append(f"{source_ref}: source discovery read failed: {source}")
+            continue
+        if source_ref not in records:
+            try:
+                record = reconstruct(source_ref, source)
+                records[source_ref] = record
+                if apply:
+                    save(record)
+                    audit("record_reconstructed", record)
+            except (ValueError, KeyError, TypeError) as exc:
+                invalid.append(f"{source_ref}: {exc}")
+    pending = []
+    for source_ref, record in records.items():
+        readable, source = read_source(source_ref)
+        if not readable or not isinstance(source, dict):
+            pending.append(record["escalation_id"])
+            continue
+        try:
+            lifecycle_changed = merge_source_lifecycle(record, source)
+        except ValueError as exc:
+            invalid.append(f"{record['escalation_id']}: {exc}")
+            continue
+        if apply and lifecycle_changed:
+            save(record)
+            audit("record_recovered", record)
+        if not source_is_disarmed(source, record):
+            pending.append(record["escalation_id"])
+            if apply:
+                ok, error = update_source(source_ref, *source_transition_args(record))
+                audit("source_repaired" if ok else "source_repair_failed", record, error="" if ok else error)
+                if ok:
+                    verified, repaired = read_source(source_ref)
+                    if verified and isinstance(repaired, dict) and source_is_disarmed(repaired, record):
+                        pending.remove(record["escalation_id"])
+        incomplete = record["acknowledgement"]["state"] != "recorded" or record["disposition"]["state"] != "recorded"
+        if incomplete:
+            if record["escalation_id"] not in pending:
+                pending.append(record["escalation_id"])
+            if apply:
+                notify(record)
+    print(canonical({"apply": apply, "records": len(records), "pending": pending, "invalid": invalid}))
+    return not pending and not invalid
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    raised = sub.add_parser("raise")
+    raised.add_argument("--source", required=True)
+    raised.add_argument("--worker", required=True)
+    raised.add_argument("--owning-pl", required=True)
+    raised.add_argument("--reason-class", required=True)
+    raised.add_argument("--evidence", required=True)
+    ack = sub.add_parser("ack")
+    ack.add_argument("--source", required=True)
+    ack.add_argument("--coordinator", required=True)
+    disp = sub.add_parser("dispose")
+    disp.add_argument("--source", required=True)
+    disp.add_argument("--coordinator", required=True)
+    disp.add_argument("--class", dest="disposition_class", required=True)
+    disp.add_argument("--detail", required=True)
+    scan_parser = sub.add_parser("scan")
+    scan_parser.add_argument("--apply", action="store_true")
+    args = parser.parse_args()
+    try:
+        with locked():
+            if args.command == "raise":
+                ok = raise_escalation(args)
+            elif args.command == "ack":
+                ok = acknowledge(args.source, args.coordinator)
+            elif args.command == "dispose":
+                ok = dispose(args.source, args.coordinator, args.disposition_class, args.detail)
+            else:
+                ok = scan(args.apply)
+            return 0 if ok else 1
+    except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        print(f"terminal-worker-escalation: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

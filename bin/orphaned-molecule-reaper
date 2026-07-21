@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# orphaned-molecule-reaper: force-close workflow roots stranded in_progress by
+# the mol-do-work / graph.v2 finalize gap (bead dr-rz3).
+#
+# ROOT CAUSE (gc-binary, not fixable here): the workflow engine sometimes honors
+# an authored `drain` step's `gc runtime drain-ack` before running the
+# auto-injected workflow-finalize step, so the finalize never closes the
+# workflow root. The work bead (gc.var.issue) closes, but the root
+# (gc.kind=workflow) and its finalize step (gc.kind=workflow-finalize) stay
+# in_progress. The supervisor then orphan-drains the session, and the stranded
+# in_progress root orphans every subsequent single-slot spawn → churn loop
+# (seen on city-infra-polecat 2026-07-13; roots dr-201/dr-1zb/dr-a46).
+# This is the same lifecycle-semantics family as dr-7mb; per that RCA's lesson,
+# the durable fix is a controller-side reaper, not a prompt patch.
+#
+# WHAT IT REAPS — a workflow root is stranded when ALL hold:
+#   1. gc.kind == "workflow" and status == in_progress
+#   2. its work bead (gc.var.issue) exists and is CLOSED (the work finished)
+#   3. the root has been untouched for > grace (a healthy flow finalizes within
+#      seconds of the work bead closing; default grace 1200s = 20m)
+#   4. if gc.session_name is recorded, that exact session is NOT live (a live
+#      session could still be mid-finalize — leave it alone)
+# On reap: close the root + any workflow-finalize step (gc.root_bead_id == root)
+# still in_progress/open. Reversible (bd reopen) if ever wrong.
+#
+# Audit: /home/ds/gas-city/.gc/orphaned-molecule-reaper.log (JSONL)
+#
+# Usage:
+#   orphaned-molecule-reaper                    # dry-run (report only)
+#   orphaned-molecule-reaper --apply            # close stranded roots + finalize steps
+#   orphaned-molecule-reaper --store hq|<rig>   # limit to one store (default: all)
+#   orphaned-molecule-reaper --grace-seconds N  # override grace (default 1200)
+#   orphaned-molecule-reaper --nudge-mayor      # mail mayor if anything reaped
+#
+# Test seam: ORPHANED_MOL_FIXTURE=<file> supplies the HQ in_progress bead list
+# from a JSON file instead of querying the store (detection unit-testing only).
+
+set -euo pipefail
+
+AUDIT_LOG="${ORPHANED_MOL_AUDIT_LOG:-/home/ds/gas-city/.gc/orphaned-molecule-reaper.log}"
+APPLY=0
+NUDGE_MAYOR=0
+GRACE=1200
+STORE_FILTER=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)         APPLY=1; shift ;;
+    --nudge-mayor)   NUDGE_MAYOR=1; shift ;;
+    --grace-seconds) GRACE="$2"; shift 2 ;;
+    --store)         STORE_FILTER="$2"; shift 2 ;;
+    -h|--help)       sed -n 's/^# \{0,1\}//p' "$0" | head -34; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$(dirname "$AUDIT_LOG")"
+now_epoch=$(date +%s)
+
+log_event() {
+  # log_event <event> <store> <root> <extra-json>
+  local event=$1 store=$2 root=$3 extra=${4:-'{}'} ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  jq -cn --arg ts "$ts" --arg event "$event" --arg store "$store" --arg root "$root" \
+         --argjson extra "$extra" \
+    '{ts:$ts, event:$event, store:$store, root:$root} + $extra' >> "$AUDIT_LOG"
+}
+
+# Run bd against a store: "hq" => the city HQ dolt store; else a rig.
+store_bd() {
+  local store=$1; shift
+  if [[ "$store" == "hq" ]]; then
+    GC_BEADS=bd bd "$@"
+  else
+    gc bd --rig "$store" "$@"
+  fi
+}
+
+# in_progress bead list for a store (test seam overrides HQ only).
+list_in_progress() {
+  local store=$1
+  if [[ "$store" == "hq" && -n "${ORPHANED_MOL_FIXTURE:-}" ]]; then
+    cat "$ORPHANED_MOL_FIXTURE"; return
+  fi
+  store_bd "$store" list --status in_progress --json --limit 0 2>/dev/null || echo '[]'
+}
+
+# Active session identities (session_name / name / alias / agent_name).
+declare -A ACTIVE_SESSIONS
+while IFS= read -r s; do
+  [[ -n "$s" && "$s" != "null" ]] && ACTIVE_SESSIONS["$s"]=1
+done < <(gc session list --json 2>/dev/null | jq -r '.sessions[]? | .session_name, .name, .alias, .agent_name' 2>/dev/null | sort -u)
+
+# Stores to scan.
+stores=()
+if [[ -n "$STORE_FILTER" ]]; then
+  stores=("$STORE_FILTER")
+else
+  stores=("hq")
+  while IFS= read -r r; do [[ -n "$r" ]] && stores+=("$r"); done \
+    < <(gc rig list --json 2>/dev/null | jq -r '.rigs[]? | select(.hq != true) | .name')
+fi
+
+reaped_roots=()   # store|root|issue
+reaped_steps=()   # store|step|root
+skipped_live=()   # store|root
+
+close_bead() {
+  # close_bead <store> <id> <reason>. --force overrides the workflow root's
+  # "blocked by open [finalize step]" guard (its own child keeps it open).
+  local store=$1 id=$2 reason=$3
+  store_bd "$store" close "$id" --force --reason "$reason" >/dev/null 2>&1
+}
+
+process_store() {
+  local store=$1 ip op list
+  # Root detection uses the in_progress set (the churn signature; the test seam
+  # feeds this). Child/finalize steps may be `open`, so step lookup + the
+  # blocked-by check need the open set merged in too.
+  ip=$(list_in_progress "$store")
+  [[ -z "$ip" || "$ip" == "null" ]] && ip='[]'
+  jq -e 'type=="array"' <<<"$ip" >/dev/null 2>&1 || return 0
+  op=$(store_bd "$store" list --status open --json --limit 0 2>/dev/null || echo '[]')
+  jq -e 'type=="array"' <<<"$op" >/dev/null 2>&1 || op='[]'
+  list=$(printf '%s\n%s\n' "$ip" "$op" | jq -s 'add')
+
+  # Roots: gc.kind=workflow, in_progress only.
+  local roots
+  roots=$(jq -c '[.[] | select(.metadata."gc.kind"=="workflow")]' <<<"$ip")
+  local n; n=$(jq 'length' <<<"$roots")
+  (( n > 0 )) || return 0
+
+  local i
+  for (( i=0; i<n; i++ )); do
+    local root_json id issue session updated age issue_status
+    root_json=$(jq -c ".[$i]" <<<"$roots")
+    id=$(jq -r '.id' <<<"$root_json")
+    issue=$(jq -r '.metadata."gc.var.issue" // ""' <<<"$root_json")
+    session=$(jq -r '.metadata."gc.session_name" // ""' <<<"$root_json")
+    updated=$(jq -r '.updated_at // ""' <<<"$root_json")
+
+    [[ -n "$issue" && "$issue" != "null" ]] || continue
+
+    # Gate 2: work bead must be closed.
+    issue_status=$(store_bd "$store" show "$issue" --json 2>/dev/null \
+      | jq -r 'if type=="array" then .[0] else . end | .status // ""')
+    [[ "$issue_status" == "closed" ]] || continue
+
+    # Gate 3: root untouched for > grace.
+    local up_epoch=0
+    [[ -n "$updated" && "$updated" != "null" ]] && up_epoch=$(date -d "$updated" +%s 2>/dev/null || echo 0)
+    age=$(( now_epoch - up_epoch ))
+    (( age > GRACE )) || continue
+
+    # Gate 4: if the exact owning session is still live, leave it (may be mid-finalize).
+    if [[ -n "$session" && "$session" != "null" && -n "${ACTIVE_SESSIONS[$session]:-}" ]]; then
+      skipped_live+=("$store|$id")
+      log_event "skipped_live_session" "$store" "$id" \
+        "$(jq -cn --arg s "$session" '{session:$s}')"
+      continue
+    fi
+
+    # Stranded. Collect all still-open child steps pointing at this root
+    # (the workflow-finalize step and any other lingering step), so nothing is
+    # left to re-block the close or orphan a future spawn.
+    local steps
+    steps=$(jq -r --arg r "$id" '.[] | select(.metadata."gc.root_bead_id"==$r) | .id' <<<"$list")
+
+    if (( APPLY )); then
+      if close_bead "$store" "$id" "orphaned workflow: work bead $issue closed, root stranded in_progress ${age}s (mol-do-work finalize gap, dr-rz3)"; then
+        reaped_roots+=("$store|$id|$issue")
+        log_event "reaped_root" "$store" "$id" \
+          "$(jq -cn --arg is "$issue" --argjson a "$age" '{issue:$is, age_s:$a}')"
+      else
+        log_event "reap_failed" "$store" "$id" "$(jq -cn --arg is "$issue" '{issue:$is}')"
+        continue
+      fi
+      local st
+      while IFS= read -r st; do
+        [[ -z "$st" ]] && continue
+        if close_bead "$store" "$st" "finalize step of orphaned workflow root $id (dr-rz3)"; then
+          reaped_steps+=("$store|$st|$id")
+          log_event "reaped_finalize_step" "$store" "$st" "$(jq -cn --arg root "$id" '{root:$root}')"
+        fi
+      done <<<"$steps"
+    else
+      reaped_roots+=("$store|$id|$issue")
+      log_event "would_reap_root" "$store" "$id" \
+        "$(jq -cn --arg is "$issue" --argjson a "$age" '{issue:$is, age_s:$a}')"
+      local st
+      while IFS= read -r st; do
+        [[ -z "$st" ]] && continue
+        reaped_steps+=("$store|$st|$id")
+      done <<<"$steps"
+    fi
+  done
+}
+
+for store in "${stores[@]}"; do
+  process_store "$store"
+done
+
+# Report.
+build_report() {
+  if (( APPLY )); then
+    printf 'orphaned-molecule-reaper: reaped %d root(s) + %d finalize step(s); %d live-skipped\n' \
+      "${#reaped_roots[@]}" "${#reaped_steps[@]}" "${#skipped_live[@]}"
+  else
+    printf 'orphaned-molecule-reaper: DRY-RUN — %d stranded root(s) + %d finalize step(s); %d live-skipped\n' \
+      "${#reaped_roots[@]}" "${#reaped_steps[@]}" "${#skipped_live[@]}"
+  fi
+  if (( ${#reaped_roots[@]} > 0 )); then
+    echo; printf '  %-10s %-16s %s\n' STORE ROOT 'WORK-BEAD'
+    local row store root issue
+    for row in "${reaped_roots[@]}"; do IFS='|' read -r store root issue <<<"$row"
+      printf '  %-10s %-16s %s\n' "$store" "$root" "$issue"; done
+  fi
+  if (( ! APPLY )) && (( ${#reaped_roots[@]} > 0 )); then
+    echo; echo "Mode: DRY-RUN (re-run with --apply to close)"
+  fi
+  return 0
+}
+
+REPORT=$(build_report)
+printf '%s\n' "$REPORT"
+
+if (( NUDGE_MAYOR )) && (( ${#reaped_roots[@]} > 0 )); then
+  gc session nudge mayor "$REPORT" >/dev/null 2>&1 || true
+fi
+
+exit 0

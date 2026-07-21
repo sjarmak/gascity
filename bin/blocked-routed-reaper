@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# blocked-routed-reaper: clear gc.routed_to on beads that are NOT workable
+# (status=blocked or deferred) so the workflow-root / GC_TRIGGER_BEAD_ID spawn
+# path stops spawning no-op polecats for them (the gc-nby7oo class).
+#
+# WHY (RCA gc-453188): the canonical pool demand query
+# (`bd ready --metadata-field gc.routed_to`) correctly gates status — verified by
+# A/B repro, blocked+deferred are excluded. But the workflow-root dispatch path
+# reads listActiveWorkflowProjectionBeads (gascity internal/api/orders_feed.go:292
+# = a raw store.List(AllowScan:true) with NO status filter) and spawns roots by
+# gc.routed_to without re-checking status. A blocked workflow root that still
+# carries gc.routed_to therefore respawns workers that drain no-op and can poison
+# work_dirs. Root fix is gascity-source (status-gate that path); this reaper is
+# the in-floor MITIGATION until that lands: clearing routed_to removes the bead
+# from the spawn selection, and a blocked bead is re-routed when it reopens anyway.
+#
+# Default mode is DRY-RUN. Pass --apply to actually clear.
+#
+# Usage:
+#   blocked-routed-reaper                # dry-run report
+#   blocked-routed-reaper --apply        # clear routed_to on offenders
+#   blocked-routed-reaper --nudge-mayor  # nudge mayor for newly seen offenders
+
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${BLOCKED_ROUTED_AUDIT_LOG:-${CITY}/.gc/blocked-routed-reaper.log}"
+NOTIFY_STATE="${BLOCKED_ROUTED_NOTIFY_STATE:-${CITY}/.gc/blocked-routed-reaper.notified}"
+DOLT_PORT="${GC_DOLT_PORT:-29620}"
+
+APPLY=0
+NUDGE_MAYOR=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)       APPLY=1; shift ;;
+    --nudge-mayor) NUDGE_MAYOR=1; shift ;;
+    -h|--help)     sed -n 's/^# \{0,1\}//p' "$0" | head -30; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$(dirname "$AUDIT_LOG")"
+
+dolt_q() {
+  dolt --host 127.0.0.1 --port "$DOLT_PORT" --user root --no-tls --password '' \
+    sql --result-format csv -q "$1" 2>/dev/null
+}
+
+log_event() {
+  local event=$1 db=$2 bead=$3 extra=${4:-'{}'} ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  jq -cn --arg ts "$ts" --arg event "$event" --arg db "$db" --arg bead "$bead" \
+     --argjson extra "$extra" \
+    '{ts:$ts, event:$event, db:$db, bead:$bead} + $extra' >> "$AUDIT_LOG"
+}
+
+# db name -> rig name (aliases where they differ)
+db_to_rig() {
+  case "$1" in
+    code_intel_digest)  echo "code-intelligence-digest" ;;
+    migration_evals)    echo "migration-evals" ;;
+    scix_experiments)   echo "scix-experiments" ;;
+    EnterpriseBench)    echo "enterprisebench" ;;
+    CodeScaleBench)     echo "codescalebench" ;;
+    gascity_dashboard)  echo "gascity-dashboard" ;;
+    tom_swe)            echo "tom-swe" ;;
+    *)                  echo "$1" ;;
+  esac
+}
+
+dbs=$(dolt_q "SHOW DATABASES;" | grep -vE '^Database$|^information_schema$|^mysql$|^dolt$')
+
+offenders=()   # db|bead
+for db in $dbs; do
+  # only dbs with an issues table respond; others yield empty
+  while IFS= read -r bead; do
+    [[ -z "$bead" || "$bead" == "id" ]] && continue
+    offenders+=("$db|$bead")
+  done < <(dolt_q "SELECT id FROM \`$db\`.issues WHERE status IN ('blocked','deferred') AND JSON_UNQUOTE(JSON_EXTRACT(metadata,'\$.\"gc.routed_to\"')) <> '';" 2>/dev/null | tail -n +1)
+done
+
+count=${#offenders[@]}
+echo "blocked-routed-reaper: ${count} blocked/deferred bead(s) carrying live gc.routed_to"
+
+cleared=0
+cleared_offenders=()
+if (( count > 0 )); then
+  printf '%-22s %s\n' DB BEAD
+  printf '%-22s %s\n' -- ----
+  for row in "${offenders[@]}"; do
+    IFS='|' read -r db bead <<<"$row"
+    printf '%-22s %s\n' "$db" "$bead"
+    if (( APPLY )); then
+      # The city store (dolt_database "gc", dr- prefixed beads) is the default
+      # bd store — clear via plain `bd`. Rig stores go through `gc bd --rig`.
+      if [[ "$db" == "gc" ]]; then
+        rig="city"
+        ok=$(bd update "$bead" --unset-metadata "gc.routed_to" >/dev/null 2>&1 && echo 1 || echo 0)
+      else
+        rig=$(db_to_rig "$db")
+        ok=$(gc bd --rig "$rig" update "$bead" --unset-metadata "gc.routed_to" >/dev/null 2>&1 && echo 1 || echo 0)
+      fi
+      if [[ "$ok" == "1" ]]; then
+        cleared=$((cleared + 1))
+        cleared_offenders+=("$db|$bead")
+        log_event "cleared" "$db" "$bead" "$(jq -cn --arg r "$rig" '{rig:$r}')"
+      else
+        log_event "clear_failed" "$db" "$bead" "$(jq -cn --arg r "$rig" '{rig:$r}')"
+      fi
+    fi
+  done
+  echo
+  if (( APPLY )); then
+    echo "Mode: APPLY — cleared ${cleared}/${count}"
+  else
+    echo "Mode: DRY-RUN (re-run with --apply to clear)"
+  fi
+fi
+
+write_notify_state() {
+  local tmp
+  mkdir -p "$(dirname "$NOTIFY_STATE")"
+  tmp=$(mktemp "${NOTIFY_STATE}.tmp.XXXXXX")
+  printf '%s\n' "$@" | sed '/^$/d' | sort -u > "$tmp"
+  mv "$tmp" "$NOTIFY_STATE"
+}
+
+if (( NUDGE_MAYOR )) && (( cleared > 0 )); then
+  if [[ ! -e "$NOTIFY_STATE" ]]; then
+    # Upgrade baseline: these offenders caused the notification storm that
+    # prompted this guard, so record them without producing one final repeat.
+    write_notify_state "${cleared_offenders[@]}"
+    log_event "notification_baseline" "" "" "$(jq -cn --argjson count "$cleared" '{count:$count}')"
+  else
+    new_offenders=()
+    for row in "${cleared_offenders[@]}"; do
+      if ! grep -Fqx -- "$row" "$NOTIFY_STATE"; then
+        new_offenders+=("$row")
+      fi
+    done
+
+    new_count=${#new_offenders[@]}
+    if (( new_count > 0 )); then
+      mapfile -t known_offenders < "$NOTIFY_STATE"
+      write_notify_state "${known_offenders[@]}" "${new_offenders[@]}"
+      gc session nudge mayor "blocked-routed-reaper found ${new_count} newly seen blocked/deferred bead(s) carrying gc.routed_to (${cleared} cleared this run). The recurring known set remains audit-only; read-side status gating alone is insufficient, and writer-side root fix gc-4zb is in flight." 2>/dev/null \
+        || echo "warn: mayor nudge failed (asleep?); reaps are in the audit log" >&2
+    fi
+  fi
+fi
+
+exit 0

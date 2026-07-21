@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Standalone test for tmp-reaper's classify_entry decision function.
+#
+# Asserts the reaper reaps ONLY unambiguous-dead benchmark workspaces:
+#   1. old, allowlisted, no open handle        -> reap
+#   2. recent (within threshold)               -> keep:recent
+#   3. allowlisted but a live process holds it  -> keep:in-use
+#   4. system dir (.X11-unix-style)            -> keep:system
+#   5. not on the workspace allowlist          -> keep:pattern
+#   6. a git worktree (stale-worktree's job)    -> keep:worktree
+#   7. a plain file (not a dir)                 -> keep:not-dir
+#
+# Run:  bash /home/ds/gas-city/bin/tmp-reaper.test
+
+set -uo pipefail
+
+REAPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tmp-reaper"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# Source the reaper in library mode so only its functions load (no scan).
+export TMP_REAPER_LIB=1
+# shellcheck source=/dev/null
+source "$REAPER"
+
+NOW=$(date +%s)
+THRESH=3600                 # 1h threshold for the test
+OLD=$((NOW - 7200))         # 2h ago -> older than threshold
+
+fail=0
+check() {
+  local name=$1 expected=$2 actual=$3
+  if [[ "$actual" == "$expected" ]]; then
+    echo "PASS: $name (got '$actual')"
+  else
+    echo "FAIL: $name (expected '$expected', got '$actual')"
+    fail=1
+  fi
+}
+
+mk_old() { mkdir -p "$1"; touch -d "@$OLD" "$1"; }
+
+# --- Case 1: old, allowlisted, no handle -> reap ---
+C1="$WORK/tmp.deadrun"; mk_old "$C1"
+check "old-allowlisted-no-handle" "reap" "$(classify_entry "$C1" "$NOW" "$THRESH")"
+
+# --- Case 2: recent allowlisted -> keep:recent ---
+C2="$WORK/tmp.freshrun"; mkdir -p "$C2"   # mtime = now
+check "recent" "keep:recent" "$(classify_entry "$C2" "$NOW" "$THRESH")"
+
+# --- Case 3: old, allowlisted, BUT a live process holds a file under it ---
+C3="$WORK/tmp.heldrun"; mk_old "$C3"; echo x >"$C3/open.lock"
+exec 9<"$C3/open.lock"      # current shell now holds an open fd under C3
+touch -d "@$OLD" "$C3"      # keep dir mtime old (creating the file bumped it)
+_build_inuse_set            # capture the held fd into INUSE_SET (one /proc pass)
+check "in-use-held-by-live-proc" "keep:in-use" "$(classify_entry "$C3" "$NOW" "$THRESH")"
+exec 9<&-                   # release
+
+# --- Case 4: system dir -> keep:system (even if old + would-be-allowlisted shape) ---
+C4="$WORK/.X11-unix"; mk_old "$C4"
+check "system-dir" "keep:system" "$(classify_entry "$C4" "$NOW" "$THRESH")"
+
+# --- Case 5: old dir NOT on the allowlist -> keep:pattern ---
+C5="$WORK/important-user-data"; mk_old "$C5"
+check "not-allowlisted" "keep:pattern" "$(classify_entry "$C5" "$NOW" "$THRESH")"
+
+# --- Case 6: old, allowlisted, but a git worktree -> keep:worktree ---
+C6="$WORK/tmp.checkout"; mk_old "$C6"; printf 'gitdir: /somewhere\n' >"$C6/.git"
+check "git-worktree-deferred" "keep:worktree" "$(classify_entry "$C6" "$NOW" "$THRESH")"
+
+# --- Case 7: a plain file matching the pattern -> keep:not-dir ---
+C7="$WORK/tmp.afile"; touch -d "@$OLD" "$C7"
+check "plain-file-not-dir" "keep:not-dir" "$(classify_entry "$C7" "$NOW" "$THRESH")"
+
+echo
+if [[ $fail == 0 ]]; then echo "ALL PASS"; else echo "FAILURES"; fi
+exit $fail

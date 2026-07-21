@@ -1,0 +1,6 @@
+[order]
+description = "Every 10m: re-register Slack address-by-handle aliases (@dashboard -> gascity-dashboard-pl, @eb-pl -> enterprisebench-pl) to each PL's CURRENT live session. handle-alias binds to a session id, which changes on every PL respawn (pl-nightly-cycle 4:00 EDT, idle timeout, supervisor restart); without re-registration the handle silently routes to a dead session. The channel-binding reaper covers channel bindings, not handle-aliases. Idempotent + cheap. Implements the re-registration half of the Slack-usergroup PL wiring (project_slack_business_plus_usergroups)."
+trigger = "cooldown"
+interval = "10m"
+exec = "/home/ds/gas-city/bin/slack-handle-alias-reaper"
+timeout = "2m"

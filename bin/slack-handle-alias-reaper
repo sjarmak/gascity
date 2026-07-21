@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""slack-handle-alias-reaper — keep Slack address-by-handle aliases pointed at the
+LIVE session of each handle's PL agent.
+
+`gc slack handle-alias` binds a handle (`@dashboard`, `@eb-pl`) to a specific
+session id. PL sessions respawn — pl-nightly-cycle (4:00 EDT) resets them, idle
+timeout recycles them, the supervisor restart recreates them — and each respawn
+mints a NEW session id. Without re-registration, the handle keeps routing to a
+dead session and the cross-channel ping silently goes nowhere (the channel-binding
+reaper covers channel bindings, NOT handle-aliases).
+
+This reaper looks up the current active session for each configured agent and
+re-registers the alias. Idempotent and cheap — safe to run on a short cooldown.
+
+Usage:
+  slack-handle-alias-reaper [--dry-run]
+"""
+import json
+import subprocess
+import sys
+import os
+import datetime
+import urllib.request
+import urllib.error
+
+# handle (Slack user-group name, no leading @) -> PL agent name (agents/<name>/)
+HANDLE_AGENT = {
+    "dashboard": "gascity-dashboard-pl",
+    "eb-pl": "enterprisebench-pl",
+    "scix-pl": "scix-experiments-pl",
+    "migration": "migration-evals-pl",
+    "mem-pl": "mem-pl",
+    "gc-pl": "gascity-maintenance-pl",
+    "website": "website/oversight-rig.project-lead",
+}
+
+# PL agent -> the Slack channel it owns the upload binding for. `gc slack upload`
+# needs an active /extmsg/bind for the LIVE session id (binding_owner); that
+# binding is minted against a session id and goes stale on respawn, so we
+# re-POST it each cycle for the agent's current session. Keyed by agent name so
+# it tracks the live session, not a frozen id.
+BINDING_CHANNEL = {
+    "gascity-dashboard-pl": "C0B7C62HKFH",
+    "enterprisebench-pl": "C0B1NSHTSKT",
+    "scix-experiments-pl": "C0B17TXMT1C",
+    # generic rig PL: binding-owner also enables its `gc slack upload` (art posts)
+    "zeldascension/oversight-rig.project-lead": "C0B13JE7M35",
+    # mayor home channel — reply-current + upload directly (else only address-by-handle)
+    "mayor": "C0B0TQMQF2B",
+    "codeprobe-pl": "C0B1A0CKEH0",
+    "migration-evals-pl": "C0B8B1FD58W",
+    "mem-pl": "C0B8FKL9QKB",
+    "gascity-maintenance-pl": "C0B25SS12CD",
+}
+
+API_BASE = os.environ.get("GC_SUPERVISOR_API", "http://127.0.0.1:8372")
+CITY = os.environ.get("GC_CITY_NAME", "ds-research")
+SLACK_WORKSPACE = os.environ.get("SLACK_WORKSPACE_ID", "T0B17700WUW")
+
+# PL agent -> (Slack display name, avatar emoji). Identity is per-session and
+# resets on respawn (posts fall back to the bare app name "gc-oversight"
+# otherwise), so re-apply for the live session each cycle.
+IDENTITY = {
+    "gascity-dashboard-pl": ("Dashboard PL", "chart_with_upwards_trend"),
+    "enterprisebench-pl": ("EnterpriseBench PL", "test_tube"),
+    "scix-experiments-pl": ("SciX PL", "telescope"),
+    "zeldascension/oversight-rig.project-lead": ("Zeldascension PL", "crossed_swords"),
+    "codeprobe-pl": ("Codeprobe PL", "mag"),
+    "migration-evals-pl": ("Migration-Evals PL", "arrows_counterclockwise"),
+    "mem-pl": ("Memory Project Lead", "brain"),
+    "gascity-maintenance-pl": ("Gascity Maintenance PL", "wrench"),
+    "website/oversight-rig.project-lead": ("Website PL", "globe_with_meridians"),
+}
+
+LOG_PATH = os.path.expanduser("~/.gc/slack-handle-alias-reaper.log")
+# States in which a session can receive a dispatched message. Prefer 'active'.
+LIVE_STATES = ("active", "idle", "asleep", "start-pending")
+
+
+def _log(record: dict) -> None:
+    record["ts"] = datetime.datetime.now().astimezone().isoformat()
+    try:
+        with open(LOG_PATH, "a") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
+
+
+def _sessions() -> list:
+    out = subprocess.run(
+        ["gc", "session", "list", "--json"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(f"gc session list failed: {out.stderr.strip()[:200]}")
+    data = json.loads(out.stdout)
+    if isinstance(data, dict):
+        data = data.get("sessions") or data.get("items") or []
+    return data
+
+
+def _agent_basename(sess: dict) -> str:
+    # A session's identity surfaces in agent_name / alias / template. Yield both
+    # the full value (matches full-path keys like
+    # "zeldascension/oversight-rig.project-lead") AND the basename (matches short
+    # city-level agent keys like "gascity-dashboard-pl" from
+    # "/home/ds/gascity-dashboard/gascity-dashboard-pl").
+    for field in ("agent_name", "alias", "template", "session_name"):
+        val = (sess.get(field) or "").rstrip("/")
+        if not val:
+            continue
+        yield val
+        base = val.split("/")[-1]
+        if base and base != val:
+            yield base
+
+
+def _bind_owner(session_id: str, conversation_id: str) -> bool:
+    """Re-mint the /extmsg/bind record so `gc slack upload --session <id>` works.
+    The binding is keyed to a session id and goes stale on respawn; idempotent to
+    re-POST for the live session each cycle."""
+    body = json.dumps({
+        "session_id": session_id,
+        "conversation": {
+            "scope_id": CITY, "provider": "slack",
+            "account_id": SLACK_WORKSPACE,
+            "conversation_id": conversation_id, "kind": "room",
+        },
+    }).encode()
+    req = urllib.request.Request(
+        f"{API_BASE}/v0/city/{CITY}/extmsg/bind", data=body, method="POST",
+        headers={"X-GC-Request": "1", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status < 300
+    except (urllib.error.URLError, OSError) as exc:
+        _log({"event": "bind_error", "session": session_id,
+              "conversation": conversation_id, "error": str(exc)[:200]})
+        return False
+
+
+def _pick_session(sessions: list, agent: str) -> dict | None:
+    candidates = []
+    for s in sessions:
+        names = set(_agent_basename(s))
+        if agent in names:
+            candidates.append(s)
+    if not candidates:
+        return None
+    # Prefer the most-alive state, then the newest session.
+    def rank(s):
+        st = s.get("state", "")
+        state_rank = LIVE_STATES.index(st) if st in LIVE_STATES else len(LIVE_STATES)
+        return (state_rank, "-" + (s.get("created_at") or ""))
+    candidates.sort(key=rank)
+    return candidates[0]
+
+
+def main() -> int:
+    dry = "--dry-run" in sys.argv
+    try:
+        sessions = _sessions()
+    except Exception as exc:  # noqa: BLE001
+        _log({"event": "error", "error": str(exc)})
+        print(f"slack-handle-alias-reaper: {exc}", file=sys.stderr)
+        return 1
+
+    changed = 0
+    for handle, agent in HANDLE_AGENT.items():
+        sess = _pick_session(sessions, agent)
+        if sess is None:
+            _log({"event": "no_session", "handle": handle, "agent": agent})
+            print(f"  {handle}: no live session for agent '{agent}' — skip")
+            continue
+        sid = sess["id"]
+        if dry:
+            print(f"  {handle} -> {sid} ({agent}, {sess.get('state')}) [dry-run]")
+            continue
+        res = subprocess.run(
+            ["gc", "slack", "handle-alias", "--handle", handle, "--session", sid],
+            capture_output=True, text=True, timeout=60,
+        )
+        ok = res.returncode == 0
+        _log({"event": "register", "handle": handle, "agent": agent,
+              "session": sid, "state": sess.get("state"), "ok": ok,
+              "err": res.stderr.strip()[:200] if not ok else ""})
+        print(f"  {handle} -> {sid} ({agent}, {sess.get('state')}) "
+              f"{'ok' if ok else 'FAILED: ' + res.stderr.strip()[:120]}")
+        changed += 1 if ok else 0
+
+    # Refresh the upload binding (binding_owner) for each PL's CURRENT session so
+    # `gc slack upload` keeps working across respawns.
+    bound = 0
+    for agent, conv in BINDING_CHANNEL.items():
+        sess = _pick_session(sessions, agent)
+        if sess is None:
+            _log({"event": "no_session_bind", "agent": agent, "conversation": conv})
+            print(f"  bind {agent}: no live session — skip")
+            continue
+        sid = sess["id"]
+        if dry:
+            print(f"  bind {agent} -> {sid} @ {conv} [dry-run]")
+            continue
+        ok = _bind_owner(sid, conv)
+        _log({"event": "bind", "agent": agent, "session": sid,
+              "conversation": conv, "ok": ok})
+        print(f"  bind {agent} -> {sid} @ {conv} {'ok' if ok else 'FAILED'}")
+        bound += 1 if ok else 0
+
+    # Refresh per-session Slack identity (display name + emoji) for each PL.
+    identified = 0
+    for agent, (name, emoji) in IDENTITY.items():
+        sess = _pick_session(sessions, agent)
+        if sess is None:
+            continue
+        sid = sess["id"]
+        if dry:
+            print(f"  identity {agent} -> {sid} as '{name}' :{emoji}: [dry-run]")
+            continue
+        res = subprocess.run(
+            ["gc", "slack", "identity", "--session", sid, "--as", name,
+             "--avatar-emoji", emoji],
+            capture_output=True, text=True, timeout=60,
+        )
+        ok = res.returncode == 0
+        _log({"event": "identity", "agent": agent, "session": sid,
+              "name": name, "emoji": emoji, "ok": ok})
+        identified += 1 if ok else 0
+
+    _log({"event": "run", "registered": changed, "bound": bound,
+          "identified": identified, "dry_run": dry})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

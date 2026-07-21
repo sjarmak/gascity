@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""formula-version-sweep — flag in-flight molecules running STALE formula text.
+
+WHY THIS EXISTS (dr-9t3r, city-infra reliability sensor):
+  gc already stamps three keys onto every molecule step bead at instantiation:
+    gc.formula_name    e.g. "mol-focus-review"
+    gc.formula_hash    sha256 of the RAW formula file bytes at sling time
+    gc.formula_source  absolute path to the formula file
+  (verified 2026-07-17: gc.formula_hash == sha256(<source file>); the stamped
+  hash on gc-axp4/gc-0pgw matched formulas/mol-focus-review.formula.toml
+  .bak-2026-07-15-danglingworkdir exactly.)
+
+  What gc does NOT provide is the read-back: a formula edit does not heal
+  molecules already in flight, and nothing answers "which running molecules were
+  built from a now-superseded formula?" without archaeology (grepping bead text
+  for a marker string, bisecting *.bak files by mtime). That gap cost 4 days of a
+  100%-deadlocked EnterpriseBench pool and three stale cross-rig "it's still
+  broken" reports on 2026-07-15.
+
+WHAT THIS DOES:
+  For every in-flight (open|in_progress) bead across all rigs carrying the stamp,
+  recompute sha256(gc.formula_source) NOW and compare against gc.formula_hash.
+  A mismatch = the molecule is running formula text that has since been edited.
+  Read-only. Deterministic. No model calls (pure content-addressed comparison).
+
+USAGE:
+  formula-version-sweep                 # human summary, all rigs
+  formula-version-sweep --rig gascity   # one rig (fast)
+  formula-version-sweep --formula mol-focus-review
+  formula-version-sweep --json          # machine-readable
+  formula-version-sweep --exit-code     # exit 2 if any stale found (for orders/CI)
+
+EXIT CODES: 0 clean (or report-only), 1 tool error, 2 stale molecules found
+  (only with --exit-code).
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+GC = "gc"
+CALL_TIMEOUT = 25  # per gc call; a slow/throttled gc must not wedge the sweep
+
+
+def gc_json(args: list[str]) -> object | None:
+    """Run a gc subcommand and parse its JSON stdout. None on any failure."""
+    try:
+        p = subprocess.run(
+            [GC, *args],
+            capture_output=True,
+            text=True,
+            timeout=CALL_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if p.returncode != 0 or not p.stdout.strip():
+        return None
+    try:
+        return json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def as_list(payload: object, *keys: str) -> list:
+    """gc list endpoints return either a bare list or {"<key>": [...]}. Normalize."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for k in keys:
+            v = payload.get(k)
+            if isinstance(v, list):
+                return v
+    return []
+
+
+def rig_names() -> list[str]:
+    payload = gc_json(["rig", "list", "--json"])
+    return [r.get("name") for r in as_list(payload, "rigs") if r.get("name")]
+
+
+_sha_cache: dict[str, str | None] = {}
+
+
+def current_sha(path: str) -> str | None:
+    """sha256 of the raw file bytes, or None if the source no longer exists."""
+    if path in _sha_cache:
+        return _sha_cache[path]
+    try:
+        digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        digest = None
+    _sha_cache[path] = digest
+    return digest
+
+
+def scan_rig(rig: str, formula_filter: str | None) -> tuple[list[dict], bool]:
+    """Return (findings, reachable). findings = stale/missing-source beads."""
+    payload = gc_json(["bd", "--rig", rig, "list", "--json"])
+    if payload is None:
+        return [], False
+    findings: list[dict] = []
+    for b in as_list(payload, "issues"):
+        if b.get("status") not in ("open", "in_progress"):
+            continue
+        m = b.get("metadata") or {}
+        stamped = m.get("gc.formula_hash")
+        source = m.get("gc.formula_source")
+        if not stamped or not source:
+            continue
+        name = m.get("gc.formula_name") or "?"
+        if formula_filter and name != formula_filter:
+            continue
+        cur = current_sha(source)
+        if cur is None:
+            state = "source-missing"
+        elif cur != stamped:
+            state = "stale"
+        else:
+            continue  # up to date
+        findings.append(
+            {
+                "rig": rig,
+                "id": b.get("id"),
+                "status": b.get("status"),
+                "formula": name,
+                "source": source,
+                "stamped_hash": stamped,
+                "current_hash": cur,
+                "parent": b.get("parent"),
+                "state": state,
+            }
+        )
+    return findings, True
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Flag in-flight molecules on stale formula text.")
+    ap.add_argument("--rig", help="scan a single rig (default: all rigs)")
+    ap.add_argument("--formula", help="restrict to one formula name")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--exit-code", action="store_true", help="exit 2 if any stale found")
+    args = ap.parse_args()
+
+    rigs = [args.rig] if args.rig else rig_names()
+    if not rigs:
+        print("formula-version-sweep: no rigs resolved (gc rig list failed?)", file=sys.stderr)
+        return 1
+
+    findings: list[dict] = []
+    unreachable: list[str] = []
+    for rig in rigs:
+        f, ok = scan_rig(rig, args.formula)
+        if not ok:
+            unreachable.append(rig)
+        findings.extend(f)
+
+    findings.sort(key=lambda x: (x["formula"], x["rig"], x["id"] or ""))
+    stale = [f for f in findings if f["state"] == "stale"]
+
+    if args.json:
+        json.dump(
+            {
+                "rigs_scanned": len(rigs),
+                "rigs_unreachable": unreachable,
+                "stale_count": len(stale),
+                "findings": findings,
+            },
+            sys.stdout,
+            indent=2,
+        )
+        print()
+    else:
+        if not findings:
+            print(f"formula-version-sweep: clean — {len(rigs)} rig(s) scanned, "
+                  f"no in-flight molecule on stale formula text.")
+        else:
+            by_formula: dict[str, list[dict]] = {}
+            for f in findings:
+                by_formula.setdefault(f["formula"], []).append(f)
+            for name, group in sorted(by_formula.items()):
+                print(f"\n{name}:")
+                for f in group:
+                    tag = "STALE" if f["state"] == "stale" else "SOURCE-MISSING"
+                    root = f" root={f['parent']}" if f.get("parent") else ""
+                    cur = (f["current_hash"] or "-")[:12]
+                    print(f"  [{tag}] {f['rig']}/{f['id']} ({f['status']}) "
+                          f"stamped={f['stamped_hash'][:12]} current={cur}{root}")
+            print(f"\n{len(stale)} in-flight molecule bead(s) running stale formula text; "
+                  f"{len(findings) - len(stale)} with a missing source file.")
+        if unreachable:
+            print(f"(unreachable rigs, skipped: {', '.join(unreachable)})", file=sys.stderr)
+
+    if args.exit_code and stale:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

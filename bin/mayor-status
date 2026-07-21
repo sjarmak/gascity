@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# mayor-status: Single-command dashboard for deciding what to work on next.
+# Run this at session start and after each dispatch round.
+set -euo pipefail
+
+echo "=== AGENTS ==="
+tmux list-sessions 2>/dev/null | grep -v mayor || echo "  (none)"
+
+echo ""
+echo "=== RIGS ==="
+for rig in $(gc rig list 2>/dev/null | grep "Path:" | awk '{print $2}'); do
+  name=$(basename "$rig")
+  cd "$rig" 2>/dev/null || continue
+
+  # Counts by status (suppress dolt noise)
+  open=$(bd list --status=open 2>/dev/null | grep -c "^[○]" || true)
+  inprog=$(bd list --status=in_progress 2>/dev/null | grep -c "^[◐]" || true)
+
+  # Only show rigs with work
+  [ "$open" -eq 0 ] && [ "$inprog" -eq 0 ] && continue
+
+  # P0/P1 ready items (the ones that matter)
+  p1=$(bd ready 2>/dev/null | grep -E "● P[01] " | grep -v "sling-\|mol-focus\|order:\|pfx-test" | head -3)
+
+  echo "  $name: open=$open in_progress=$inprog"
+  if [ -n "$p1" ]; then
+    echo "$p1" | sed 's/^/    ★ /'
+  fi
+done
+
+echo ""
+echo "=== DECISION CHECKLIST ==="
+echo "  1. Any P0/P1 without an agent? → dispatch"
+echo "  2. Any in_progress with no tmux session? → orphaned, re-dispatch or close"
+echo "  3. Any agent exited? → check what it closed, dispatch next work"
+echo "  4. Blocked work? → check blockers, unblock if possible"

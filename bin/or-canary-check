@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""or-canary-check — is the oldest->hybrid claim-sort canary actually testable yet?
+
+The --sort hybrid override lives in exactly one code path: probe_pool_demand in
+agents/<pool>/agent.toml, which claims beads that were routed to the pool but left
+UNASSIGNED. Beads that a molecule pour stamps with an assignee at materialization
+never travel that path, so they say nothing about claim order.
+
+The first canary window (2026-07-13 -> 07-14) was void: the pool was wedged, and the
+probe queue sat in a single priority band. A priority sort is identical to FCFS when
+every ready bead shares a band, so "nothing broke" was vacuously true.
+
+This script measures the four roll-gate conditions on dr-94s. It is READ-ONLY.
+
+  bin/or-canary-check                     # EB pool, since the re-arm
+  bin/or-canary-check --since 2026-07-14  # explicit window
+  bin/or-canary-check --pool mem-worker
+"""
+
+import argparse
+import collections
+import json
+import sys
+from pathlib import Path
+
+EVENTS = Path("/home/ds/gas-city/.gc/events.jsonl")
+MIN_CLAIMS = 20
+MIN_BANDS = 2
+
+
+def load_transitions(since: str, pool: str):
+    """Replay bead.updated snapshots into per-bead assignee/priority histories."""
+    hist = collections.defaultdict(list)
+    if not EVENTS.exists():
+        sys.exit(f"no event log at {EVENTS}")
+    with EVENTS.open() as fh:
+        for line in fh:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("type") not in ("bead.created", "bead.updated"):
+                continue
+            ts = ev.get("ts", "")
+            payload = ev.get("payload") or ev.get("data") or {}
+            bead = payload.get("bead") or payload.get("issue") or payload
+            if not isinstance(bead, dict):
+                continue
+            bid = bead.get("id")
+            if not bid:
+                continue
+            hist[bid].append(
+                {
+                    "ts": ts,
+                    "assignee": str(bead.get("assignee") or ""),
+                    "priority": bead.get("priority"),
+                    "status": bead.get("status") or "",
+                    "created_at": bead.get("created_at") or "",
+                    "routed_to": str((bead.get("metadata") or {}).get("gc.routed_to") or ""),
+                }
+            )
+    return {b: sorted(h, key=lambda x: x["ts"]) for b, h in hist.items()}
+
+
+def probe_claims(hist, since: str, pool: str):
+    """A probe claim: bead sat routed+UNASSIGNED, then a worker took it.
+
+    Two things masquerade as claims and must be excluded, or the gate self-greens:
+
+    1. Pour-stamped beads, which carry an assignee from their first snapshot.
+    2. MOLECULE BINDINGS. When a mol-focus-review convoy binds to a worker, all
+       ~7 step beads (load-context, worktree, focus, simplify, review, run-tests,
+       finalize) get the SAME assignee at the SAME instant. That is one dispatch
+       decision, not seven claims, and the six downstream steps never travelled
+       probe_pool_demand at all. Counting them inflates claim volume ~7x and fakes
+       priority-band diversity, since every step inherits its root's priority.
+       So: collapse each (assignee, timestamp) group to a single claim.
+    """
+    raw = []
+    for bid, snaps in hist.items():
+        first = snaps[0]
+        if first["assignee"]:
+            continue
+        seen_unassigned_routed = False
+        for s in snaps:
+            routed = pool in s["routed_to"]
+            if routed and not s["assignee"]:
+                seen_unassigned_routed = True
+                continue
+            if seen_unassigned_routed and s["assignee"] and pool in s["assignee"]:
+                if s["ts"] >= since:
+                    raw.append(
+                        {
+                            "id": bid,
+                            "ts": s["ts"],
+                            "assignee": s["assignee"],
+                            "status": s["status"],
+                            "priority": s["priority"],
+                            "created_at": s["created_at"] or first["ts"],
+                        }
+                    )
+                break
+
+    # Collapse molecule bindings: one claim per (assignee, instant).
+    # Timestamps carry nanoseconds, so a whole-string key never matches; bind on
+    # the second (a molecule's steps are stamped within the same second).
+    groups = collections.defaultdict(list)
+    for c in raw:
+        groups[(c["assignee"], c["ts"][:19])].append(c)
+
+    claims = []
+    for (_assignee, _ts), members in groups.items():
+        # The entry step is the one that actually goes in_progress; fall back to
+        # the earliest-created member if no member is marked.
+        entry = next((m for m in members if m["status"] == "in_progress"), None)
+        if entry is None:
+            entry = min(members, key=lambda m: m["created_at"])
+        entry = dict(entry)
+        entry["collapsed_from"] = len(members)
+        claims.append(entry)
+
+    return sorted(claims, key=lambda c: c["ts"])
+
+
+def band_inversions(seq) -> int:
+    """Claims where a lower-priority bead was taken while a higher-priority one was
+    ALREADY ready. Hybrid predicts zero. FCFS, on priority-mixed traffic, predicts many."""
+    n = 0
+    for i, c in enumerate(seq):
+        if c["priority"] is None:
+            continue
+        for later in seq[i + 1:]:
+            if later["priority"] is None:
+                continue
+            if later["priority"] < c["priority"] and later["created_at"] <= c["ts"]:
+                n += 1
+                break
+    return n
+
+
+def discriminating(claims):
+    """Can this traffic tell hybrid apart from FCFS at all?
+
+    "Observed order != created_at order" is NOT a valid test: concurrent workers
+    reorder things by luck, so it greens on noise. The real question is the
+    counterfactual — replay the same claim slots in FCFS order and compare band
+    inversions. If FCFS would ALSO have produced zero inversions, then priority
+    order coincides with arrival order on this traffic and the two policies are
+    observationally identical here. A green is then vacuous, no matter how many
+    claims were collected.
+
+    Returns (is_discriminating, observed_inversions, fcfs_inversions).
+    """
+    if not claims:
+        return False, 0, 0
+    slots = [c["ts"] for c in claims]
+    fcfs = sorted(claims, key=lambda c: c["created_at"])
+    fcfs_sim = [dict(c, ts=slots[i]) for i, c in enumerate(fcfs)]
+    obs_inv = band_inversions(claims)
+    fcfs_inv = band_inversions(fcfs_sim)
+    return fcfs_inv > obs_inv, obs_inv, fcfs_inv
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--since", default="2026-07-14")
+    ap.add_argument("--pool", default="enterprisebench-worker")
+    args = ap.parse_args()
+
+    hist = load_transitions(args.since, args.pool)
+    claims = probe_claims(hist, args.since, args.pool)
+    bands = collections.Counter(c["priority"] for c in claims)
+
+    g1 = len(claims) >= MIN_CLAIMS
+    g2 = len(bands) >= MIN_BANDS
+    g3, obs_inv, fcfs_inv = discriminating(claims)
+
+    inflated = sum(c.get("collapsed_from", 1) for c in claims)
+    print(f"canary check — pool={args.pool} since={args.since}")
+    print(f"  raw assignee-transitions : {inflated:3d}   (molecule bindings, NOT claims)")
+    print(f"  probe_pool_demand claims : {len(claims):3d}   gate>= {MIN_CLAIMS}   {'PASS' if g1 else 'FAIL'}")
+    print(f"  distinct priority bands  : {len(bands):3d}   gate>= {MIN_BANDS}    {'PASS' if g2 else 'FAIL'}   {dict(bands)}")
+    print(f"  band inversions (live)   : {obs_inv:3d}   hybrid predicts 0")
+    print(f"  band inversions (if FCFS): {fcfs_inv:3d}   {'PASS' if g3 else 'FAIL'}  <- must exceed live, or the test is blind")
+
+    if not g2:
+        print("\n  NOTE: single-band traffic makes hybrid mathematically identical to FCFS.")
+    if not g3:
+        print("\n  VACUOUS: FCFS would produce the same band inversions on this traffic.")
+        print("  Priority order coincides with arrival order here, so hybrid and FCFS are")
+        print("  observationally identical. Passing gates 1 and 2 does not rescue this:")
+        print("  the traffic simply cannot tell the two policies apart. Do NOT roll on it.")
+
+    if claims:
+        print("\n  claim sequence: " + " ".join(f"P{c['priority']}" for c in claims))
+
+    verdict = "ROLL-ELIGIBLE" if (g1 and g2 and g3) else "HOLD — canary cannot discriminate hybrid from FCFS"
+    print(f"\n  verdict: {verdict}")
+    print("  (gate 4, zero strands, is judged from the EB PL's strand report, not here)")
+    return 0 if (g1 and g2 and g3) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

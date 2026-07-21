@@ -1,0 +1,6 @@
+[order]
+description = "Detect Slack bindings whose pool-spawned target session has closed and rebind to the live session in the same agent slot. Local fallback until upstream gascity stores stable identifiers on pool bindings."
+trigger = "cooldown"
+interval = "5m"
+exec = "/home/ds/gas-city/bin/slack-binding-reaper --apply --nudge-mayor"
+timeout = "1m"

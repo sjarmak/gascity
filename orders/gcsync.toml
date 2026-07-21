@@ -1,0 +1,6 @@
+[order]
+description = "Keep installed gc binary current with origin/main. gcsync is a no-op if already at HEAD, so frequent runs are cheap."
+trigger = "cooldown"
+interval = "15m"
+exec = "/home/ds/.local/bin/gcsync"
+timeout = "3m"

@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# stall-watch: eager, autonomous stall escalation to the human.
+#
+# Why this exists:
+#
+#   Detection of stalled work already exists (bin/mayor-health-surfacer), but
+#   it only ran 2x/day and nudged MAYOR with "surface anything human-relevant
+#   to stephanie at next interaction." That made mayor-noticing the trigger —
+#   a stall stayed invisible until Stephanie asked for status. This closes the
+#   last mile: runs every 15m as a gc order, dedups findings against per-channel
+#   state files, and pushes NEW / re-alerting stalls straight to Slack. Mayor is
+#   the responder, never the trigger.
+#
+#   Routing (Stephanie 2026-06-08):
+#     #gascity-maintenance (MAINT_CHANNEL) <- gascity-family stalls only
+#     #all-agent-city      (CITY_CHANNEL)  <- cross-rig + city-wide stalls
+#   A finding routes to exactly one channel, so each channel keeps its own
+#   dedup state and commits independently of the other's post result.
+#
+#   Calibration: only genuinely human-relevant signatures are pushed —
+#     WORK_STALLED  (in-progress beads stale > threshold, humans excluded)
+#     CAPACITY      (accounts DOWN or >= 80%) -> city-wide
+#     SESSIONS      (only blocked / degraded — asleep/suspended is normal)
+#   INFRA (transient watchdog recoveries) is detected but never pushed.
+#
+#   Dedup: each finding key is pushed once, then re-pushed only if still
+#   present after STALL_WATCH_REALERT_HOURS (default 6). Resolved findings
+#   are dropped from state silently. One post per channel per run, max.
+#
+# Usage:
+#   stall-watch              # dry-run: print what WOULD be pushed, no post
+#   stall-watch --push       # live: post new/re-alert findings to the channels
+#   stall-watch --stalled-hours N   # WORK_STALLED threshold (default 4)
+#
+# Env:
+#   STALL_WATCH_MAINT_CHANNEL  gascity-family channel (default C0B0TQMQF2B)
+#   STALL_WATCH_CITY_CHANNEL   cross-rig/city channel (default C0B0TQMQF2B)
+#   STALL_WATCH_REALERT_HOURS  re-alert window in hours (default 6)
+#   STALL_WATCH_STATE_DIR      dir holding the per-channel state files
+
+set -uo pipefail
+
+CITY=/home/ds/gas-city
+SURFACER="${STALL_WATCH_SURFACER:-$CITY/bin/mayor-health-surfacer}"
+STATE_DIR="${STALL_WATCH_STATE_DIR:-$CITY/.gc}"
+MAINT_STATE="$STATE_DIR/stall-watch-state.json"        # gascity-family (kept name for continuity)
+CITY_STATE="$STATE_DIR/stall-watch-city-state.json"    # cross-rig / city-wide
+AUDIT_LOG="${STALL_WATCH_AUDIT_LOG:-$CITY/.gc/stall-watch.log}"
+MAINT_CHANNEL="${STALL_WATCH_MAINT_CHANNEL:-C0B0TQMQF2B}"
+CITY_CHANNEL="${STALL_WATCH_CITY_CHANNEL:-C0B0TQMQF2B}"
+
+# `gc slack publish-to-channel` attributes the post to --session, defaulting to
+# $GC_SESSION_ID. Run detached by the supervisor, $GC_SESSION_ID is unset, so
+# the publish has no session to attribute and fails fast. Resolve a stable mayor
+# session: prefer $GC_SESSION_ID when present (interactive), else the pinned mayor.
+resolve_publish_sid() {
+  if [[ -n "${GC_SESSION_ID:-}" ]]; then
+    printf '%s' "$GC_SESSION_ID"; return 0
+  fi
+  gc session list 2>/dev/null | awk '$2=="mayor" && /pin/{print $1; exit}'
+}
+PUBLISH_SID="$(resolve_publish_sid)"
+REALERT_HOURS="${STALL_WATCH_REALERT_HOURS:-6}"
+STALLED_HOURS="${STALLED_HOURS:-4}"
+MAYOR_STALE_HOURS="${MAYOR_STALE_HOURS:-24}"
+# Severity-escalation threshold (hours): an already-alerted WORK_STALLED finding
+# re-posts only after it crosses this, instead of a flat time-based re-alert.
+ESCALATE_STALLED_HOURS="${STALL_WATCH_ESCALATE_HOURS:-24}"
+# Same idea for MAYOR_OWNED_STALE (added 2026-07-09): a mayor-owned bead first
+# alerts at MAYOR_STALE_HOURS (surfacer's detection floor), re-alerts only
+# after crossing this higher bar -- 3 days of continued silence, not a flat
+# re-nag on every tick.
+ESCALATE_MAYOR_STALE_HOURS="${STALL_WATCH_ESCALATE_MAYOR_HOURS:-72}"
+PUSH=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --push)          PUSH=1; shift ;;
+    --stalled-hours) STALLED_HOURS="$2"; shift 2 ;;
+    --mayor-stale-hours) MAYOR_STALE_HOURS="$2"; shift 2 ;;
+    -h|--help) sed -n 's/^# \{0,1\}//p' "$0" | head -40; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+NOW_EPOCH=$(date +%s)
+MAINT_MSG=$(mktemp); CITY_MSG=$(mktemp); FINDINGS_RAW=$(mktemp)
+MAINT_CAND="$MAINT_STATE.candidate"; CITY_CAND="$CITY_STATE.candidate"
+trap 'rm -f "$MAINT_MSG" "$CITY_MSG" "$FINDINGS_RAW" "$MAINT_CAND" "$CITY_CAND"' EXIT
+
+# Detect (reuse the proven surfacer). Findings travel via a file, NOT stdin:
+# the python program is fed on stdin via the heredoc, so piping findings to
+# stdin too would let the heredoc win and silently swallow them.
+STALLED_HOURS="$STALLED_HOURS" MAYOR_STALE_HOURS="$MAYOR_STALE_HOURS" \
+  timeout 240 "$SURFACER" --json > "$FINDINGS_RAW" 2>/dev/null || true
+
+FINDINGS_FILE="$FINDINGS_RAW" NOW_EPOCH="$NOW_EPOCH" REALERT_HOURS="$REALERT_HOURS" \
+  ESCALATE_STALLED_HOURS="$ESCALATE_STALLED_HOURS" \
+  ESCALATE_MAYOR_STALE_HOURS="$ESCALATE_MAYOR_STALE_HOURS" \
+  MAINT_STATE="$MAINT_STATE" CITY_STATE="$CITY_STATE" \
+  MAINT_CAND="$MAINT_CAND" CITY_CAND="$CITY_CAND" \
+  python3 - "$MAINT_MSG" "$CITY_MSG" 2>>"$AUDIT_LOG" <<'PYEOF'
+import json, os, sys
+
+maint_msg, city_msg = sys.argv[1], sys.argv[2]
+now = int(os.environ["NOW_EPOCH"])
+realert = int(os.environ["REALERT_HOURS"]) * 3600  # retained for back-compat; no longer drives re-alerts
+escalate_stalled_hours = int(os.environ.get("ESCALATE_STALLED_HOURS", "24"))
+escalate_mayor_stale_hours = int(os.environ.get("ESCALATE_MAYOR_STALE_HOURS", "72"))
+
+findings = []
+with open(os.environ["FINDINGS_FILE"]) as ff:
+    for line in ff:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            findings.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+def pushable(f):
+    cat = f.get("category")
+    if cat in ("WORK_STALLED", "MAYOR_OWNED_STALE", "CAPACITY"):
+        return True
+    if cat == "SESSIONS":
+        return f.get("state") in ("blocked", "degraded")
+    return False  # INFRA + anything else: detect but never push
+
+# Routing (Stephanie 2026-06-08): gascity-family -> #gascity-maintenance;
+# everything else (cross-rig + account-level CAPACITY) -> #all-agent-city.
+GASCITY_SCOPES = {"gascity", "gascity-packs", "gascity-dashboard", "city"}
+
+def is_gascity(f):
+    cat = f.get("category")
+    if cat in ("WORK_STALLED", "MAYOR_OWNED_STALE"):
+        return f.get("scope") in GASCITY_SCOPES
+    if cat == "SESSIONS":
+        return "gascity" in (f.get("template") or "")
+    return False  # CAPACITY + others are city-wide -> all-agent-city
+
+findings = [f for f in findings if pushable(f)]
+maint_bucket = [f for f in findings if is_gascity(f)]
+city_bucket = [f for f in findings if not is_gascity(f)]
+
+def hrs(f):
+    return int(f.get("hours", 0))
+
+def render(to_push):
+    stalled = sorted([f for f, _ in to_push if f["category"] == "WORK_STALLED"], key=hrs, reverse=True)
+    mayor_stale = sorted([f for f, _ in to_push if f["category"] == "MAYOR_OWNED_STALE"], key=hrs, reverse=True)
+    capacity = [f for f, _ in to_push if f["category"] == "CAPACITY"]
+    sessions = [f for f, _ in to_push if f["category"] == "SESSIONS"]
+    n_new = sum(1 for _, r in to_push if not r)
+    n_re = sum(1 for _, r in to_push if r)
+    lines = [f":rotating_light: *Stall watch* — {n_new} new" + (f" / {n_re} escalated" if n_re else "")]
+    if stalled:
+        lines.append("\n*Work stalled* (in-progress, no recent updates):")
+        for f in stalled:
+            lines.append(f"• `{f['id']}` ({f['scope']}) — {f['hours']}h — {f.get('title','')[:80]}")
+    if mayor_stale:
+        lines.append("\n*Mayor-owned, going quiet* (open/blocked, created by mayor, no recent update):")
+        for f in mayor_stale:
+            lines.append(f"• `{f['id']}` ({f['scope']}, {f.get('status','')}) — {f['hours']}h — {f.get('title','')[:80]}")
+    if capacity:
+        lines.append("\n*Capacity:*")
+        for f in capacity:
+            lines.append(f"• `{f['name']}` {f['status']} — 5h={f['five_h']}% 7d={f['seven_d']}%"
+                         + (f" — agents: {f['agents']}" if f.get('agents') else ""))
+    if sessions:
+        lines.append("\n*Sessions degraded/blocked:*")
+        for f in sessions:
+            lines.append(f"• `{f['id']}` {f['state']} — {f.get('template','')}")
+    return "\n".join(lines) + "\n"
+
+def sev_tier(f):
+    # Severity-escalation tier. An already-alerted finding re-posts only when its
+    # tier rises above what was last alerted — no flat time-based re-alerts of
+    # unchanged state (that was the "0 new / N ongoing" noise source).
+    cat = f.get("category")
+    if cat == "WORK_STALLED":
+        return 1 if int(f.get("hours", 0)) >= escalate_stalled_hours else 0
+    if cat == "MAYOR_OWNED_STALE":
+        return 1 if int(f.get("hours", 0)) >= escalate_mayor_stale_hours else 0
+    if cat == "CAPACITY":
+        return 1 if f.get("status") == "DOWN" else 0
+    return 0  # SESSIONS + others: alert once when first seen, never re-alert
+
+def process(bucket, state_path, cand_path, msg_path):
+    try:
+        with open(state_path) as fh:
+            old = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        old = {}
+    new_state, to_push = {}, []
+    for key, f in {f["key"]: f for f in bucket}.items():
+        tier = sev_tier(f)
+        prev = old.get(key)
+        if prev is None:
+            # genuinely new finding -> alert immediately
+            new_state[key] = {"first_seen": now, "tier": tier}
+            to_push.append((f, False))
+        else:
+            first_seen = prev.get("first_seen", now)
+            prev_tier = prev.get("tier", 0)
+            if tier > prev_tier:
+                # severity escalated since last alert -> re-post once at the new tier
+                new_state[key] = {"first_seen": first_seen, "tier": tier}
+                to_push.append((f, True))
+            else:
+                # unchanged or de-escalated -> hold state, do not re-post
+                new_state[key] = {"first_seen": first_seen, "tier": prev_tier}
+    # keys present before but gone now = resolved -> dropped from new_state
+    with open(cand_path, "w") as fh:
+        json.dump(new_state, fh, indent=2)
+    with open(msg_path, "w") as fh:
+        fh.write(render(to_push) if to_push else "")
+
+process(maint_bucket, os.environ["MAINT_STATE"], os.environ["MAINT_CAND"], maint_msg)
+process(city_bucket, os.environ["CITY_STATE"], os.environ["CITY_CAND"], city_msg)
+PYEOF
+
+ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+
+# Post one channel's message (if any) and commit its state independently.
+post_route() {
+  local label="$1" channel="$2" msg="$3" state="$4" cand="$5"
+  if [[ ! -s "$msg" ]]; then
+    [[ -f "$cand" ]] && mv -f "$cand" "$state"   # prune resolved keys
+    return 0
+  fi
+  if (( ! PUSH )); then
+    echo "=== stall-watch DRY-RUN ($label -> $channel) ==="
+    cat "$msg"
+    echo "=== state NOT modified (dry-run) ==="
+    return 0
+  fi
+  if gc slack publish-to-channel --conversation-id "$channel" --kind room \
+       ${PUBLISH_SID:+--session "$PUBLISH_SID"} \
+       --body-file "$msg" >/dev/null 2>&1; then
+    mv -f "$cand" "$state"
+    echo "$(ts) pushed $label $(wc -l < "$msg") line(s) to $channel" >> "$AUDIT_LOG"
+    gc session nudge mayor "stall-watch pushed to $label:
+$(cat "$msg")" >/dev/null 2>&1 || true
+  else
+    echo "$(ts) ERROR: publish $label -> $channel failed; state NOT advanced (will retry)" >> "$AUDIT_LOG"
+    return 1
+  fi
+}
+
+rc=0
+post_route "#gascity-maintenance" "$MAINT_CHANNEL" "$MAINT_MSG" "$MAINT_STATE" "$MAINT_CAND" || rc=1
+post_route "#all-agent-city"      "$CITY_CHANNEL"  "$CITY_MSG"  "$CITY_STATE"  "$CITY_CAND"  || rc=1
+
+if (( PUSH )) && [[ ! -s "$MAINT_MSG" && ! -s "$CITY_MSG" ]]; then
+  echo "$(ts) clean: no pushable stalls" >> "$AUDIT_LOG"
+fi
+exit $rc

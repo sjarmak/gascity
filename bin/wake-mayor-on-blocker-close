@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# wake-mayor-on-blocker-close — when a bead transitions to closed and it
+# blocks one or more open/deferred dependents, nudge mayor so the deferred
+# follow-up work can resume.
+#
+# Pattern: I orchestrate work by filing a blocker bead (e.g. a bug fix) and
+# a dependent bead (e.g. a validation rerun), linked via `bd dep <blocker>
+# --blocks <dependent>`. When the blocker closes, this script fires from
+# the bead.updated event order and pings me — so I follow through on the
+# continuation work I already committed to, without the human having to.
+#
+# This is "automation that keeps mayor informed", NOT "automation that
+# auto-dispatches work" — the human still controls all dispatch.
+#
+# Idempotent: state file tracks (blocker, dependent) pairs already nudged.
+
+set -euo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+STATE_FILE="${CITY}/.gc/wake-mayor-on-blocker-close-state.json"
+SINCE="${WAKE_MAYOR_ON_BLOCKER_CLOSE_SINCE:-5m}"
+
+mkdir -p "$(dirname "$STATE_FILE")"
+[[ -f "$STATE_FILE" ]] || echo '{}' > "$STATE_FILE"
+
+# Build prefix -> rig-name map for routing bd lookups to the right rig.
+declare -A PREFIX_TO_RIG
+while IFS=$'\t' read -r rig prefix; do
+    [[ -n "$prefix" ]] && PREFIX_TO_RIG["$prefix"]="$rig"
+done < <(gc rig list 2>/dev/null | awk '
+    /^  [a-zA-Z][a-zA-Z0-9_-]+:/ {
+        name = $1; sub(/:$/, "", name); current_rig = name
+    }
+    /^    Prefix:/ {
+        gsub(/^    Prefix:[ \t]+/, ""); print current_rig "\t" $0
+    }')
+
+rig_for_bead() {
+    local bead_id="$1" prefix
+    for prefix in "${!PREFIX_TO_RIG[@]}"; do
+        [[ "$bead_id" == "$prefix-"* ]] && echo "${PREFIX_TO_RIG[$prefix]}" && return
+    done
+    return 1
+}
+
+# bd_show <bead-id> -> JSON of the bead, or empty on failure.
+bd_show() {
+    local bead_id="$1" rig
+    if rig=$(rig_for_bead "$bead_id"); then
+        gc bd --rig "$rig" show "$bead_id" --json 2>/dev/null || true
+    else
+        gc bd show "$bead_id" --json 2>/dev/null || true
+    fi
+}
+
+# bd_dependents <bead-id> -> JSON array of beads that depend on this one
+# via `blocks` relationships.
+bd_dependents() {
+    local bead_id="$1" rig
+    if rig=$(rig_for_bead "$bead_id"); then
+        gc bd --rig "$rig" dep list "$bead_id" --direction=up --type blocks --json 2>/dev/null || echo '[]'
+    else
+        echo '[]'
+    fi
+}
+
+# Collect bead IDs from recent bead.updated events.
+mapfile -t bead_ids < <(
+    gc events --type bead.updated --since "$SINCE" 2>/dev/null \
+        | jq -r '.subject // empty' \
+        | awk 'NF' \
+        | sort -u
+)
+
+[[ ${#bead_ids[@]} -eq 0 ]] && exit 0
+
+state=$(cat "$STATE_FILE")
+mayor_nudges=()
+mayor_nudge_keys=()
+# Map[recipient-session]=batched-message (for owner-routed nudges)
+declare -A owner_nudges=()
+# Map[recipient-session]=newline-delimited dedup keys acknowledged by its nudge.
+declare -A owner_nudge_keys=()
+
+# Resolve the bead's `created_by` field to a `gc session nudge` target.
+# `created_by` comes in two shapes:
+#   - "<agent-basename>-gc-NNNNN" (e.g. "gascity-maintenance-pl-gc-156882")
+#     → nudge by extracted session id "gc-NNNNN"; the basename alone is not
+#       a valid nudge target (need either the full agent path or the session
+#       id, and the session id is the most stable across respawns).
+#   - "<rig>/<dotted.agent.path>" (e.g. "zeldascension/oversight-rig.project-lead")
+#     → nudge by the full path verbatim; gc accepts this form directly.
+resolve_nudge_target() {
+    local creator="$1"
+    if [[ "$creator" =~ -(gc-[a-zA-Z0-9]+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "$creator"
+    fi
+}
+
+# Determine if an owner string looks like a session-bound agent (PL, mayor,
+# polecat) vs an empty/legacy/human owner. We treat any non-empty owner that
+# isn't literally "human", "mayor", or empty as a candidate for ownership-
+# routed nudge — gc session nudge will refuse unknown targets, so this stays
+# safe.
+owner_is_session() {
+    local owner="$1"
+    [[ -z "$owner" ]] && return 1
+    [[ "$owner" == "human" ]] && return 1
+    [[ "$owner" == "mayor" ]] && return 1
+    return 0
+}
+
+for blocker_id in "${bead_ids[@]}"; do
+    blocker_json=$(bd_show "$blocker_id")
+    [[ -z "$blocker_json" ]] && continue
+
+    blocker_status=$(jq -r 'if type=="array" then .[0].status else .status end // empty' <<<"$blocker_json")
+    [[ "$blocker_status" != "closed" ]] && continue
+
+    # Skip formula-internal step beads. These have metadata.gc.step_ref
+    # set (e.g. mol-focus-review.focus, mol-do-work.commit) and represent
+    # wisp nodes inside a molecule, NOT real blockers with deferred
+    # follow-up work. Re-slinging them would create duplicate convoys.
+    step_ref=$(jq -r '
+        (if type=="array" then (.[0].metadata // {}) else (.metadata // {}) end)
+        | (."gc.step_ref" // empty)
+    ' <<<"$blocker_json")
+    [[ -n "$step_ref" ]] && continue
+
+    # Path 1: dep-blocks pattern (existing behavior — nudges mayor).
+    # Mayor orchestrates work via `bd dep <blocker> --blocks <dependent>`;
+    # when the blocker closes, mayor gets a nudge to act on the dependent.
+    dependents_json=$(bd_dependents "$blocker_id")
+    dependent_count=$(jq 'length' <<<"$dependents_json")
+    if [[ "$dependent_count" -gt 0 ]]; then
+        while IFS=$'\t' read -r dep_id dep_status dep_title; do
+            [[ -z "$dep_id" ]] && continue
+            case "$dep_status" in
+                open|in_progress|blocked|deferred) ;;
+                *) continue ;;
+            esac
+            pair_key="${blocker_id}::${dep_id}"
+            already=$(jq -r --arg k "$pair_key" '.[$k] // empty' <<<"$state")
+            [[ -n "$already" ]] && continue
+
+            mayor_nudges+=("blocker $blocker_id closed → $dep_id (status=$dep_status) ready: $dep_title")
+            mayor_nudge_keys+=("$pair_key")
+        done < <(jq -r '.[] | [.id, .status, .title] | @tsv' <<<"$dependents_json")
+    fi
+
+    # Path 2: creator-routed completion nudge (new 2026-05-09 for slack-bound
+    # PLs that sling work to polecats and need to surface results to humans).
+    # When a closed bead was created_by a non-mayor session (e.g. a PL that
+    # originated the work), nudge that creator so it can read the bead notes
+    # / artifact and post completion to its bound conversation.
+    #
+    # NOTE: bead.owner is the bd-side git-author email (e.g.
+    # gibsonsteph42@gmail.com), NOT the gc session that created the bead.
+    # The session identity lives in .created_by — that's what we route on.
+    blocker_creator=$(jq -r 'if type=="array" then .[0].created_by else .created_by end // empty' <<<"$blocker_json")
+    blocker_assignee=$(jq -r 'if type=="array" then .[0].assignee else .assignee end // empty' <<<"$blocker_json")
+    blocker_title=$(jq -r 'if type=="array" then .[0].title else .title end // empty' <<<"$blocker_json")
+
+    if owner_is_session "$blocker_creator"; then
+        creator_target=$(resolve_nudge_target "$blocker_creator")
+
+        # Skip if the creator IS the closer (typical when an agent closes its
+        # own bead — no point nudging itself).
+        if [[ "$blocker_creator" != "$blocker_assignee" ]]; then
+            creator_key="creator::${blocker_id}::${creator_target}"
+            already=$(jq -r --arg k "$creator_key" '.[$k] // empty' <<<"$state")
+            if [[ -z "$already" ]]; then
+                line="bead $blocker_id closed by ${blocker_assignee:-unknown}: $blocker_title"
+                if [[ -n "${owner_nudges[$creator_target]:-}" ]]; then
+                    owner_nudges[$creator_target]="${owner_nudges[$creator_target]}
+- ${line}"
+                else
+                    owner_nudges[$creator_target]="- ${line}"
+                fi
+                if [[ -n "${owner_nudge_keys[$creator_target]:-}" ]]; then
+                    owner_nudge_keys[$creator_target]+=$'\n'"${creator_key}"
+                else
+                    owner_nudge_keys[$creator_target]="$creator_key"
+                fi
+            fi
+        fi
+    fi
+done
+
+if [[ ${#mayor_nudges[@]} -eq 0 && ${#owner_nudges[@]} -eq 0 ]]; then
+    exit 0
+fi
+
+state_changed=false
+mark_delivered() {
+    local key="$1"
+    state=$(jq --arg k "$key" --arg ts "$(date -Is)" '.[$k] = $ts' <<<"$state")
+    state_changed=true
+}
+
+# Mayor nudge (existing dep-blocks behavior, unchanged contract).
+if [[ ${#mayor_nudges[@]} -gt 0 ]]; then
+    message="Blocker beads just closed; deferred follow-up work is now ready:"
+    for line in "${mayor_nudges[@]}"; do
+        message="${message}
+- ${line}"
+    done
+    message="${message}
+
+Take the next step on each (typically: undefer + clear assignee + clear gc.routed_to + re-sling)."
+
+    if gc session nudge mayor "$message" 2>/dev/null; then
+        for key in "${mayor_nudge_keys[@]}"; do
+            mark_delivered "$key"
+        done
+    else
+        echo "warn: gc session nudge mayor failed (mayor may be asleep); message logged here:" >&2
+        echo "$message" >&2
+    fi
+fi
+
+# Owner-routed nudges (new path — for slack-bound PLs and other non-mayor
+# session owners). Each owner gets one batched message with all the beads
+# they own that just closed.
+for owner_target in "${!owner_nudges[@]}"; do
+    body="${owner_nudges[$owner_target]}"
+    message="Bead(s) you own just closed:
+${body}
+
+Read the bead notes for the artifact path / outcome. If you're slack-bound and the close warrants an update to your channel, surface it as a proactive thread post (no eyes-react — that's for inbound replies only)."
+
+    if gc session nudge "$owner_target" "$message" 2>/dev/null; then
+        while IFS= read -r key; do
+            [[ -n "$key" ]] && mark_delivered "$key"
+        done <<<"${owner_nudge_keys[$owner_target]}"
+    else
+        echo "warn: gc session nudge ${owner_target} failed (target may be asleep or unknown); message logged here:" >&2
+        echo "$message" >&2
+    fi
+done
+
+if [[ "$state_changed" == true ]]; then
+    echo "$state" > "$STATE_FILE"
+fi

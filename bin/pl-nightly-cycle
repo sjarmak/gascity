@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# pl-nightly-cycle: request a context-preserving nightly PL handoff.
+#
+# Why: PL sessions are always-on and never auto-cycled. Left running for
+# days/weeks they (1) accumulate context-window transcript until they
+# wedge, (2) miss prompt-template edits — a stale session never re-reads
+# its template — and (3) carry weeks of transcript they don't need.
+#
+# PLs can carry live conversational state that has not reached beads yet.
+# Deliver a self-handoff request only after the current turn becomes idle;
+# the PL writes a durable summary and then asks the controller to restart it.
+# Mayor follows the same context-preserving path.
+#
+# Greenlit by Stephanie 2026-05-16.
+#
+# Default mode is DRY-RUN. Pass --apply to deliver the requests.
+#
+# Usage:
+#   pl-nightly-cycle              # dry-run: list handoff requests
+#   pl-nightly-cycle --apply      # request PL + mayor self-handoffs
+#   pl-nightly-cycle --apply --no-mayor   # request PL handoffs only
+set -uo pipefail
+
+CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
+AUDIT_LOG="${PL_CYCLE_AUDIT_LOG:-${CITY}/.gc/pl-nightly-cycle.log}"
+
+APPLY=0
+DO_MAYOR=1
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)     APPLY=1; shift ;;
+    --no-mayor)  DO_MAYOR=0; shift ;;
+    -h|--help)   sed -n 's/^# \{0,1\}//p' "$0" | head -26; exit 0 ;;
+    *) echo "pl-nightly-cycle: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$(dirname "$AUDIT_LOG")"
+
+log_event() {
+  # log_event <event> <target> <extra-json>
+  local event=$1 target=$2 extra=${3:-'{}'}
+  jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+         --arg event "$event" --arg target "$target" \
+         --argjson extra "$extra" \
+    '{ts:$ts, event:$event, target:$target} + $extra' >> "$AUDIT_LOG"
+}
+
+# Enumerate every materialized, non-closed project-lead session. Dedicated PLs
+# use *-pl names; imported legacy PLs use oversight-rig.project-lead names.
+if ! session_json=$(gc session list --json 2>/dev/null); then
+  echo "pl-nightly-cycle: gc session list failed" >&2
+  exit 1
+fi
+if ! pl_lines=$(jq -r '
+  if (.sessions | type) != "array" then
+    error("missing sessions array")
+  else
+    [
+      .sessions[]
+      | select(.closed != true)
+      | (.alias // .session_name // .name // "")
+      | select(test("(^|[/.])oversight-rig\\.project-lead$|(^|[/.])[a-z0-9_-]+-pl$"))
+    ]
+    | unique[]
+  end
+' <<<"$session_json"); then
+  echo "pl-nightly-cycle: could not parse gc session list JSON" >&2
+  exit 1
+fi
+pls=()
+while IFS= read -r name; do
+  [[ -n "$name" ]] && pls+=("$name")
+done <<<"$pl_lines"
+
+mode=$( [[ $APPLY -eq 1 ]] && echo "APPLY" || echo "DRY-RUN" )
+echo "pl-nightly-cycle [$mode]: ${#pls[@]} PL session(s) to hand off."
+
+requested=0
+failures=0
+for pl in "${pls[@]}"; do
+  if [[ $APPLY -eq 1 ]]; then
+    if gc session nudge "$pl" "Nightly context cycle: after finishing the current turn, run \`gc handoff\` with a concise summary of all in-flight work, unresolved questions, and the next action. Preserve any conversation that has not reached beads or mail; do not fresh-reset yourself. If handoff reports that restart was skipped because this is an on-demand named session, then run \`gc runtime request-restart\` after the handoff mail is durable." --delivery wait-idle >/dev/null 2>&1; then
+      requested=$((requested + 1))
+      if ! log_event "handoff-request-enqueued" "$pl" '{}'; then
+        failures=$((failures + 1))
+        echo "  audit FAILED: $pl" >&2
+      fi
+      echo "  requested self-handoff: $pl"
+    else
+      failures=$((failures + 1))
+      if ! log_event "handoff-request-failed" "$pl" '{}'; then
+        failures=$((failures + 1))
+        echo "  audit FAILED: $pl" >&2
+      fi
+      echo "  handoff request FAILED: $pl"
+    fi
+  else
+    echo "  would request self-handoff: $pl"
+  fi
+done
+
+# Mayor also writes a handoff before the controller restarts it.
+if [[ $DO_MAYOR -eq 1 ]]; then
+  if [[ $APPLY -eq 1 ]]; then
+    gc session nudge mayor "Nightly context cycle: run \`gc handoff\` now to refresh your context window — write a handoff summary of any in-flight work first so the next incarnation resumes cleanly." --delivery wait-idle >/dev/null 2>&1 \
+      && { log_event "mayor-handoff-request-enqueued" "mayor" '{}' || failures=$((failures + 1)); echo "  nudged mayor to self-handoff"; } \
+      || { failures=$((failures + 1)); log_event "mayor-handoff-request-failed" "mayor" '{}' || failures=$((failures + 1)); echo "  mayor nudge FAILED"; }
+  else
+    echo "  would nudge mayor to self-handoff (gc handoff)"
+  fi
+fi
+
+echo "pl-nightly-cycle [$mode]: ${requested} PL handoff request(s) delivered."
+if [[ $failures -gt 0 ]]; then
+  echo "pl-nightly-cycle [$mode]: $failures delivery/audit failure(s)." >&2
+  exit 1
+fi
+exit 0

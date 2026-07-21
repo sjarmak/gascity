@@ -1,0 +1,6 @@
+[order]
+description = "Detect newly-merged PRs Stephanie authored on gastownhall/gascity; post to slack #gascity-maintenance + mail mayor in real-time"
+trigger = "cooldown"
+interval = "5m"
+exec = "/home/ds/gas-city/bin/pr-merge-notifier"
+timeout = "60s"

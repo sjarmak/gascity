@@ -1,0 +1,6 @@
+[order]
+description = "Daily 09:00: report stale Claude Code processes (potential OOM precursors). Migrated from systemd timer."
+trigger = "cron"
+schedule = "0 9 * * *"
+exec = "/home/ds/gas-city/bin/claude-zombie-report --nudge-mayor"
+timeout = "5m"

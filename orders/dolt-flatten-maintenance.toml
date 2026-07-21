@@ -1,0 +1,47 @@
+# Weekly Dolt history flatten across all managed bead dbs above 5000 commits.
+#
+# WHY: every bead write auto-commits one Dolt commit, so per-db history depth
+# grows unbounded; past a few thousand commits workflow/convoy queries slow
+# enough to blow the 30s sling sub-timeout and kill dispatches (2026-06-17
+# gascity incident: convoy list 68s -> 11s after flatten). Neither the nightly
+# dolt-gc-maintenance (reachable history is not garbage) nor the Sunday
+# bead-prune-reaper (rows, not commits) touches depth — this order is the
+# missing third leg: prune (Sun 05:00) -> flatten (this, Sun 06:30) -> GC
+# (nightly 04:30) actually reclaims.
+#
+# AUTHORITY: mayor scope-add nudge gc-481831 on dr-84l ("ship it enabled");
+# the flatten operation class was Stephanie-authorized 2026-07-13 and executed
+# cleanly on mem/EnterpriseBench/gascity/gc that night (dr-84l, health gates
+# green). Installed enabled 2026-07-14 by city-infra-polecat gc-483558.
+#
+# SAFETY (bin/dolt-flatten-maintenance): per-db threshold gate, rig-dir
+# identity check (metadata.json project_id vs db _project_id), 30s quiescence
+# guard, bd dry-run cross-check, verified pre-flatten-* snapshot branch kept
+# per db, post-flatten depth + health gate, any failure aborts remaining dbs
+# and mails mayor. Never deletes a bead (bd gc runs --skip-decay). History is
+# the only loss — bd restore for pruned beads works only until the flatten.
+#
+# SCHEDULE: host-local tz (EDT). Sun 06:30 = 90m after the 05:00
+# bead-prune-reaper (15m timeout) so pruned rows fall out of history the same
+# morning; clear of the 04:30 nightly dolt-gc-maintenance window.
+# Zero-lastRun bootstrap: seeded by a supervised first fire on 2026-07-14
+# (`gc order run` / temporary wildcard per pl-status-update-am.toml header).
+#
+# UNDO: pause via [[orders.overrides]] in city.toml (or flip a wider
+# THRESHOLD in the script) if a flatten ever trips the abort mail twice in a
+# row; per-db recovery = the newest pre-flatten-* branch in that db.
+
+[order]
+description = "Weekly (Sun 06:30, after the 05:00 bead-prune-reaper): flatten Dolt commit history to 1 for every managed bead db above 5000 commits via bin/dolt-flatten-maintenance — threshold gate, quiescence guard, verified snapshot branch, health gates, abort-on-failure. Keeps sling latency off the 30s cliff that deep history causes (dr-84l follow-through, gc-481831)."
+trigger = "cron"
+schedule = "30 6 * * 0"
+exec = "/home/ds/gas-city/bin/dolt-flatten-maintenance"
+timeout = "45m"
+# Re-fire is a no-op re-evaluation: flattened dbs sit at depth 1, far below
+# the threshold gate, and the quiescence/identity guards skip anything unsafe.
+# The script also holds a nonblocking whole-operation flock across threshold,
+# quiescence, snapshot, flatten, and health checks; a concurrent fail-open run
+# records SKIP lock-busy and never crosses the mutation boundary (dr-6qrb /
+# mayor gc-520788, 2026-07-20).
+# Safe to fire even when starved (gastownhall/gascity#2893 fail-open).
+idempotent = true

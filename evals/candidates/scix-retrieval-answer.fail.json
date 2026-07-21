@@ -1,0 +1,2 @@
+{"tool_calls": 27, "build_green": true, "violations": 0, "baseline_violations": 0,
+ "output": "Returned 5 topical papers but none address the retraction-status question asked."}

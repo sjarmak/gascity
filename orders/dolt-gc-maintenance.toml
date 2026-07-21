@@ -1,0 +1,6 @@
+[order]
+description = "Nightly off-hours: reclaim uncollected dolt noms garbage via CALL DOLT_GC() across all managed bead databases. The managed dolt config sets dolt_auto_gc_enabled=OFF and assumes a 'compaction-driven scheduled GC' replaces it — that replacement was never wired up here, so the city store grew to 2.4GB of garbage and slowed every teardown past the systemd stop timeout (2026-05-25 SIGKILL incident). This order is that scheduled GC."
+trigger = "cron"
+schedule = "30 4 * * *"
+exec = "/home/ds/gas-city/bin/dolt-gc-maintenance"
+timeout = "30m"

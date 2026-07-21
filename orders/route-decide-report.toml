@@ -1,0 +1,16 @@
+# Weekly routing-decision distribution report.
+#
+# Aggregates routing.* metadata stamped by the Formula-Compile-Time
+# Router (FCTR) over the past 7 days. Phase 1 of the routing rollout
+# (see /tmp/routing-layer-rfc-v3.md §4.7) is measure-only — formulas
+# do not yet consume the stamped tier. This order shows what FCTR
+# would have routed if the consumer side were live.
+#
+# Exit criteria for Phase 2 ship gate: stamped Haiku share ≥ 25%.
+
+[order]
+description = "Weekly Monday 09:30 EDT: aggregate FCTR routing decisions (model_tier, grounded_review, human_gate) stamped on beads in the past 7 days across all rigs."
+trigger = "cron"
+schedule = "30 9 * * 1"
+exec = "/home/ds/gas-city/bin/route-decide-report --window 7d --output /home/ds/.gc/routing-report-$(date -u +%Y%m%d).json"
+timeout = "5m"

@@ -1,0 +1,11 @@
+# Weekly deep audit for EVERY rig regardless of flow: smartest-addition
+# question + best-practices audit (erosion, test coverage, over-engineering),
+# full report to <rig>/.gc-reports/ (gitignored), condensed version to the
+# project channel, BLOCKED-ON-HUMAN raised loudly. Stephanie 2026-06-12.
+# Seeding note: see pl-status-update-am.toml (zero-lastRun trap).
+[order]
+description = "Weekly Mon 10:00 EDT: every PL runs DEEP_AUDIT (smartest-addition + best-practices report) -> .gc-reports/ + project channel."
+trigger = "cron"
+schedule = "0 10 * * 1"
+exec = "/home/ds/gas-city/bin/pl-periodic-directive DEEP_AUDIT --all"
+timeout = "5m"

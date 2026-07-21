@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""Recover assigned work that remains in progress without explicit progress."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import enum
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Sequence
+
+
+UTC = timezone.utc
+CHECKPOINT_REQUESTED_AT = "gc.completion_checkpoint_requested_at"
+OBSERVED_UPDATED_AT = "gc.completion_observed_updated_at"
+RECOVERY_ATTEMPTS = "gc.completion_recovery_attempts"
+RECOVERED_AT = "gc.completion_recovered_at"
+RECOVERY_REASON = "gc.completion_recovery_reason"
+LAST_PROGRESS_ACK = "gc.completion_last_progress_at"
+PROGRESS_AT = "gc.progress_at"
+PROGRESS_EVIDENCE = "gc.progress_evidence"
+COMPLETION_EXEMPT = "gc.completion_exempt"
+DEFAULT_THRESHOLDS = {0: 3600, 1: 4 * 3600, 2: 12 * 3600, 3: 24 * 3600, 4: 48 * 3600}
+EXEMPT_LABELS = frozenset({"health-soak", "human-wip"})
+
+
+class Action(str, enum.Enum):
+    NONE = "none"
+    EXEMPT = "exempt"
+    REQUEST_CHECKPOINT = "request_checkpoint"
+    WAIT = "wait"
+    RESUMED = "resumed"
+    REQUEUE = "requeue"
+    BLOCK = "block"
+    INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class Config:
+    thresholds: dict[int, int]
+    checkpoint_grace: int
+    max_recoveries: int
+    human_assignees: frozenset[str]
+
+
+@dataclass(frozen=True)
+class Decision:
+    action: Action
+    stale_seconds: int = 0
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class Store:
+    name: str
+    rig: str | None
+
+    def command(self, *args: str) -> list[str]:
+        if self.rig is None:
+            return ["bd", *args]
+        return ["gc", "bd", "--rig", self.rig, *args]
+
+
+@dataclass
+class RunResult:
+    scanned: int = 0
+    requested: int = 0
+    resumed: int = 0
+    requeued: int = 0
+    blocked: int = 0
+    errors: int = 0
+
+
+def parse_duration(value: str) -> int:
+    match = re.fullmatch(r"([0-9]+)([smhd])", value)
+    if match is None:
+        raise ValueError(f"invalid duration {value!r}; use 30m, 4h, or 2d")
+    amount = int(match.group(1))
+    factors = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    return amount * factors[match.group(2)]
+
+
+def parse_instant(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def format_instant(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def metadata_of(issue: dict[str, Any]) -> dict[str, Any]:
+    metadata = issue.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def truthy(value: object) -> bool:
+    return str(value).lower() in {"1", "true", "yes"}
+
+
+def threshold_for(priority: object, config: Config) -> int:
+    try:
+        normalized = int(priority)
+    except (TypeError, ValueError):
+        normalized = 4
+    return config.thresholds.get(normalized, config.thresholds[4])
+
+
+def is_exempt(issue: dict[str, Any], config: Config) -> bool:
+    assignee = str(issue.get("assignee") or "")
+    labels = {str(label) for label in (issue.get("labels") or [])}
+    metadata = metadata_of(issue)
+    return (
+        not assignee
+        or assignee in config.human_assignees
+        or bool(labels & EXEMPT_LABELS)
+        or truthy(metadata.get("long_running"))
+        or truthy(metadata.get(COMPLETION_EXEMPT))
+        or bool(metadata.get("gc.hold_reason") or metadata.get("hold_reason"))
+    )
+
+
+def decide(issue: dict[str, Any], now: datetime, config: Config) -> Decision:
+    if issue.get("status") != "in_progress":
+        return Decision(Action.NONE)
+    if is_exempt(issue, config):
+        return Decision(Action.EXEMPT)
+
+    metadata = metadata_of(issue)
+    requested = parse_instant(metadata.get(CHECKPOINT_REQUESTED_AT))
+    baseline_key = OBSERVED_UPDATED_AT if requested else "updated_at"
+    baseline = parse_instant(metadata.get(baseline_key) if requested else issue.get(baseline_key))
+    if baseline is None:
+        return Decision(Action.INVALID, reason=f"missing or invalid {baseline_key}")
+
+    stale_seconds = max(0, int((now - baseline).total_seconds()))
+    if requested is None:
+        if stale_seconds < threshold_for(issue.get("priority"), config):
+            return Decision(Action.NONE, stale_seconds)
+        return Decision(Action.REQUEST_CHECKPOINT, stale_seconds)
+
+    progress = parse_instant(metadata.get(PROGRESS_AT))
+    evidence = str(metadata.get(PROGRESS_EVIDENCE) or "").strip()
+    if progress is not None and progress > requested and evidence:
+        return Decision(Action.RESUMED, stale_seconds, "explicit progress checkpoint")
+
+    request_age = max(0, int((now - requested).total_seconds()))
+    if request_age < config.checkpoint_grace:
+        return Decision(Action.WAIT, stale_seconds)
+
+    try:
+        attempts = int(metadata.get(RECOVERY_ATTEMPTS, 0))
+    except (TypeError, ValueError):
+        attempts = 0
+    if attempts >= config.max_recoveries:
+        return Decision(Action.BLOCK, stale_seconds, "recovery attempts exhausted")
+    return Decision(Action.REQUEUE, stale_seconds, "checkpoint grace expired")
+
+
+def run_command(argv: Sequence[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(argv),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+
+
+def load_json_command(argv: Sequence[str], timeout: int = 30) -> Any:
+    completed = run_command(argv, timeout)
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(f"{' '.join(argv)} failed ({completed.returncode}): {detail}")
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{' '.join(argv)} returned invalid JSON") from exc
+
+
+class Reconciler:
+    def __init__(
+        self,
+        config: Config,
+        now: datetime,
+        apply: bool,
+        nudge_mayor: bool,
+        audit_log: Path,
+    ) -> None:
+        self.config = config
+        self.now = now
+        self.apply = apply
+        self.nudge_mayor = nudge_mayor
+        self.audit_log = audit_log
+        self.result = RunResult()
+        self.mayor_messages: list[str] = []
+
+    def log(self, event: str, store: Store, issue_id: str, **extra: object) -> None:
+        self.audit_log.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "ts": format_instant(self.now),
+            "event": event,
+            "store": store.name,
+            "bead": issue_id,
+            **extra,
+        }
+        with self.audit_log.open("a") as handle:
+            handle.write(json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n")
+
+    def scan(self, store: Store) -> list[dict[str, Any]]:
+        payload = load_json_command(store.command("list", "--status=in_progress", "--json", "--limit=0"), 60)
+        if not isinstance(payload, list):
+            raise RuntimeError(f"{store.name} in-progress query returned {type(payload).__name__}, want list")
+        return [item for item in payload if isinstance(item, dict)]
+
+    def current(self, store: Store, issue_id: str) -> dict[str, Any]:
+        payload = load_json_command(store.command("show", issue_id, "--json"), 30)
+        if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
+            raise RuntimeError(f"{store.name}/{issue_id} show returned no issue")
+        return payload[0]
+
+    def update(self, store: Store, issue_id: str, *args: str) -> None:
+        completed = run_command(store.command("update", issue_id, *args), 45)
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise RuntimeError(f"update failed ({completed.returncode}): {detail}")
+
+    def mutation_is_current(self, store: Store, scanned: dict[str, Any], action: Action) -> bool:
+        current = self.current(store, str(scanned["id"]))
+        if current.get("status") != "in_progress" or current.get("assignee") != scanned.get("assignee"):
+            return False
+        if action == Action.REQUEST_CHECKPOINT:
+            return current.get("updated_at") == scanned.get("updated_at")
+        expected = metadata_of(scanned).get(CHECKPOINT_REQUESTED_AT)
+        return metadata_of(current).get(CHECKPOINT_REQUESTED_AT) == expected
+
+    def nudge(self, target: str, body: str) -> bool:
+        if not target:
+            return False
+        try:
+            completed = run_command(["gc", "session", "nudge", target, body], 20)
+        except subprocess.TimeoutExpired:
+            return False
+        return completed.returncode == 0
+
+    def request_checkpoint(self, store: Store, issue: dict[str, Any], decision: Decision) -> None:
+        issue_id = str(issue["id"])
+        requested_at = format_instant(self.now)
+        self.update(
+            store,
+            issue_id,
+            "--set-metadata",
+            f"{CHECKPOINT_REQUESTED_AT}={requested_at}",
+            "--set-metadata",
+            f"{OBSERVED_UPDATED_AT}={issue.get('updated_at', '')}",
+        )
+        command = (
+            f"bd update {issue_id}"
+            if store.rig is None
+            else f"gc bd --rig {store.rig} update {issue_id}"
+        )
+        message = (
+            f"[completion-lease] {issue_id} has no recorded progress for "
+            f"{decision.stale_seconds // 60}m. Within the checkpoint grace, either finish, "
+            f"mark it blocked with a concrete help_request, or record real progress:\n"
+            f"{command} --set-metadata {PROGRESS_AT}='$(date -u +%Y-%m-%dT%H:%M:%SZ)' "
+            f"--set-metadata {PROGRESS_EVIDENCE}='<artifact/test/checkpoint>'\n"
+            "A nudge or status heartbeat alone is not progress. Without a checkpoint the "
+            "claim will be reopened and requeued automatically."
+        )
+        delivered = self.nudge(str(issue.get("assignee") or ""), message)
+        self.result.requested += 1
+        self.log(
+            "checkpoint_requested",
+            store,
+            issue_id,
+            assignee=issue.get("assignee"),
+            stale_seconds=decision.stale_seconds,
+            delivered=delivered,
+        )
+        self.mayor_messages.append(f"checkpoint requested: {store.name}/{issue_id}")
+
+    def clear_resumed(self, store: Store, issue: dict[str, Any]) -> None:
+        issue_id = str(issue["id"])
+        progress_at = str(metadata_of(issue).get(PROGRESS_AT) or "")
+        self.update(
+            store,
+            issue_id,
+            "--unset-metadata",
+            CHECKPOINT_REQUESTED_AT,
+            "--unset-metadata",
+            OBSERVED_UPDATED_AT,
+            "--set-metadata",
+            f"{LAST_PROGRESS_ACK}={progress_at}",
+        )
+        self.result.resumed += 1
+        self.log("progress_resumed", store, issue_id, progress_at=progress_at)
+
+    def requeue(self, store: Store, issue: dict[str, Any], decision: Decision) -> None:
+        issue_id = str(issue["id"])
+        metadata = metadata_of(issue)
+        try:
+            attempts = int(metadata.get(RECOVERY_ATTEMPTS, 0)) + 1
+        except (TypeError, ValueError):
+            attempts = 1
+        recovered_at = format_instant(self.now)
+        self.update(
+            store,
+            issue_id,
+            "--status",
+            "open",
+            "--assignee",
+            "",
+            "--unset-metadata",
+            CHECKPOINT_REQUESTED_AT,
+            "--unset-metadata",
+            OBSERVED_UPDATED_AT,
+            "--set-metadata",
+            f"{RECOVERY_ATTEMPTS}={attempts}",
+            "--set-metadata",
+            f"{RECOVERED_AT}={recovered_at}",
+            "--set-metadata",
+            f"{RECOVERY_REASON}={decision.reason}",
+        )
+        self.result.requeued += 1
+        self.log("requeued", store, issue_id, attempts=attempts, stale_seconds=decision.stale_seconds)
+        self.mayor_messages.append(f"requeued after checkpoint timeout: {store.name}/{issue_id}")
+
+    def block(self, store: Store, issue: dict[str, Any], decision: Decision) -> None:
+        issue_id = str(issue["id"])
+        recovered_at = format_instant(self.now)
+        help_request = (
+            f"Completion reconciler exhausted {self.config.max_recoveries} automatic recoveries; "
+            "owner/plan requires diagnosis before another dispatch."
+        )
+        self.update(
+            store,
+            issue_id,
+            "--status",
+            "blocked",
+            "--assignee",
+            "",
+            "--unset-metadata",
+            CHECKPOINT_REQUESTED_AT,
+            "--unset-metadata",
+            OBSERVED_UPDATED_AT,
+            "--set-metadata",
+            f"{RECOVERED_AT}={recovered_at}",
+            "--set-metadata",
+            f"help_request={help_request}",
+            "--set-metadata",
+            f"{RECOVERY_REASON}={decision.reason}",
+        )
+        self.result.blocked += 1
+        self.log("blocked", store, issue_id, stale_seconds=decision.stale_seconds)
+        self.mayor_messages.append(f"blocked after repeated recovery failure: {store.name}/{issue_id}")
+
+    def apply_decision(self, store: Store, issue: dict[str, Any], decision: Decision) -> None:
+        if decision.action not in {
+            Action.REQUEST_CHECKPOINT,
+            Action.RESUMED,
+            Action.REQUEUE,
+            Action.BLOCK,
+        }:
+            if decision.action == Action.INVALID:
+                self.result.errors += 1
+                self.log("invalid_issue", store, str(issue.get("id", "")), reason=decision.reason)
+            return
+        if not self.apply:
+            print(f"would {decision.action.value}: {store.name}/{issue['id']}")
+            return
+        try:
+            if not self.mutation_is_current(store, issue, decision.action):
+                self.log("race_skipped", store, str(issue["id"]), action=decision.action.value)
+                return
+            if decision.action == Action.REQUEST_CHECKPOINT:
+                self.request_checkpoint(store, issue, decision)
+            elif decision.action == Action.RESUMED:
+                self.clear_resumed(store, issue)
+            elif decision.action == Action.REQUEUE:
+                self.requeue(store, issue, decision)
+            else:
+                self.block(store, issue, decision)
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            self.result.errors += 1
+            self.log(
+                "mutation_failed",
+                store,
+                str(issue.get("id", "")),
+                action=decision.action.value,
+                error=str(exc),
+            )
+
+    def run_store(self, store: Store) -> None:
+        try:
+            issues = self.scan(store)
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            self.result.errors += 1
+            self.log("scan_failed", store, "", error=str(exc))
+            return
+        self.result.scanned += len(issues)
+        for issue in issues:
+            self.apply_decision(store, issue, decide(issue, self.now, self.config))
+
+    def finish(self) -> None:
+        if not self.apply or not self.nudge_mayor or not self.mayor_messages:
+            return
+        body = "[completion-reconciler]\n" + "\n".join(f"- {line}" for line in self.mayor_messages)
+        if not self.nudge("mayor", body):
+            self.log("mayor_nudge_failed", Store("city", None), "", count=len(self.mayor_messages))
+
+
+def stores_for(scope: str) -> list[Store]:
+    city = Store("city", None)
+    if scope == "city":
+        return [city]
+    payload = load_json_command(["gc", "rig", "list", "--json"], 60)
+    rigs = payload.get("rigs") if isinstance(payload, dict) else None
+    if not isinstance(rigs, list):
+        raise RuntimeError("gc rig list returned no rigs array")
+    stores = [
+        Store(str(rig["name"]), str(rig["name"]))
+        for rig in rigs
+        if isinstance(rig, dict) and rig.get("name") not in {None, "ds-research"}
+    ]
+    if scope == "all":
+        return [city, *stores]
+    selected = [store for store in stores if store.name == scope]
+    if not selected:
+        raise RuntimeError(f"unknown scope {scope!r}")
+    return selected
+
+
+def config_from_env(args: argparse.Namespace) -> Config:
+    thresholds = {
+        priority: parse_duration(os.environ.get(f"COMPLETION_RECONCILER_P{priority}", default))
+        for priority, default in {0: "1h", 1: "4h", 2: "12h", 3: "24h", 4: "48h"}.items()
+    }
+    humans_raw = os.environ.get(
+        "COMPLETION_RECONCILER_HUMANS",
+        "sjarmak,sjarmak@users.noreply.github.com",
+    )
+    return Config(
+        thresholds=thresholds,
+        checkpoint_grace=parse_duration(args.checkpoint_grace),
+        max_recoveries=args.max_recoveries,
+        human_assignees=frozenset(value.strip() for value in humans_raw.split(",") if value.strip()),
+    )
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--apply", action="store_true", help="mutate stale beads; default is dry-run")
+    parser.add_argument("--nudge-mayor", action="store_true", help="nudge mayor after state changes")
+    parser.add_argument("--scope", default="all", help="all, city, or a rig name")
+    parser.add_argument("--checkpoint-grace", default="30m")
+    parser.add_argument("--max-recoveries", type=int, default=2)
+    parser.add_argument("--now", help="fixed UTC timestamp for tests")
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    now = parse_instant(args.now) if args.now else datetime.now(UTC)
+    if now is None:
+        print(f"completion-reconciler: invalid --now {args.now!r}", file=sys.stderr)
+        return 2
+    city = Path(os.environ.get("GC_STORE_ROOT", "/home/ds/gas-city"))
+    audit = Path(
+        os.environ.get("COMPLETION_RECONCILER_AUDIT_LOG", city / ".gc/completion-reconciler.log")
+    )
+    lock_path = Path(
+        os.environ.get("COMPLETION_RECONCILER_LOCK", city / ".gc/completion-reconciler.lock")
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        stores = stores_for(args.scope)
+        config = config_from_env(args)
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(f"completion-reconciler: {exc}", file=sys.stderr)
+        return 2
+
+    with lock_path.open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("completion-reconciler: another run is active; skipping")
+            return 0
+        runner = Reconciler(config, now, args.apply, args.nudge_mayor, audit)
+        for store in stores:
+            runner.run_store(store)
+        runner.finish()
+
+    mode = "APPLY" if args.apply else "DRY-RUN"
+    result = runner.result
+    print(
+        f"completion-reconciler: {mode} scanned={result.scanned} requested={result.requested} "
+        f"resumed={result.resumed} requeued={result.requeued} blocked={result.blocked} "
+        f"errors={result.errors}"
+    )
+    return 1 if result.errors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

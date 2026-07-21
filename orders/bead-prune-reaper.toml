@@ -1,0 +1,6 @@
+[order]
+description = "Weekly (Sun 05:00): prune closed non-ephemeral beads older than 30d across all rig stores via bin/bead-prune-reaper (wraps bd prune; skips pinned/open/ephemeral). Trims the live working set + shrinks JSONL exports + stages Dolt-history reclaim. Pruned beads stay recoverable via Dolt history (bd restore) until a SEPARATE, gated bd flatten — this order never flattens. Window 30d; first run 2026-06-03 pruned 17,010 (HQ gc db 15,629 -> 1,401 live). Motivated by gascity-dashboard-essq + the dashboard fetch-window warning, whose '247K store beads' was the supervisor total counting Dolt history, not the ~22K live rows."
+trigger = "cron"
+schedule = "0 5 * * 0"
+exec = "/home/ds/gas-city/bin/bead-prune-reaper --apply --nudge-mayor"
+timeout = "15m"

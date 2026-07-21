@@ -1,0 +1,10 @@
+# Adopted from gastownhall/gascity examples/gastown/packs/maintenance/orders/cross-rig-deps.toml (2026-05-25).
+# Converts satisfied cross-rig `blocks` deps → `related`. computeBlockedIDs
+# doesn't resolve across rig boundaries upstream, so dependent issues stay
+# blocked after the blocker closes in a different rig. Idempotent; 15-min
+# lookback window.
+[order]
+description = "Convert satisfied cross-rig blocks deps to related"
+trigger = "cooldown"
+interval = "5m"
+exec = "/home/ds/gas-city/scripts/gastown-maintenance/cross-rig-deps.sh"

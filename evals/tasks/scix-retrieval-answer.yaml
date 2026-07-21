@@ -1,0 +1,12 @@
+id: scix-retrieval-answer
+source: scix-retrieval
+description: A scix retrieval query returns papers that actually answer the question within 4 rounds.
+candidate: evals/candidates/scix-retrieval-answer.fail.json
+rule_judge:
+  max_tool_calls: 20
+  require_build_green: true
+  no_new_violations: true
+rubric_judge:
+  criteria: |
+    PASS only if the returned papers substantively answer the query, not merely
+    topical matches.

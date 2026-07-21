@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""resource-observability-sample — proactive resource early-warning sampler.
+
+Durable fix for the 2026-07-07 memory-saturation incident (spec
+docs/design/resource-observability-layer.md, gc-457861). Every 5m it captures one
+JSON line of box + fleet resource state to .gc/observability/resource-metrics.jsonl,
+then fires threshold alerts (cooldown-deduped) so creep is caught DAYS before
+saturation — the reactive reapers kill after it's bad; this warns before.
+
+The single most valuable new signal is per-MCP-server proc-count + summed RSS
+(the fan-out metric that caught code-intel-copilot regrowing to 5GB unnoticed).
+
+Alerts route to the mayor by mail (Slack is the mayor's to wire). De-dup: a
+standing breach alerts once per COOLDOWN_MIN, not every sample.
+
+Usage: resource-observability-sample [--nudge-mayor] [--json]
+Exit: 0 always (observability must never break the order loop).
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CITY = "/home/ds/gas-city"
+OBS_DIR = os.path.join(CITY, ".gc", "observability")
+METRICS = os.path.join(OBS_DIR, "resource-metrics.jsonl")
+STATE = os.path.join(OBS_DIR, "alert-state.json")
+INVESTIGATIONS = os.path.join(CITY, ".gc", "investigations")
+COOLDOWN_MIN = 60  # a standing breach re-alerts at most once per hour
+
+# Thresholds (from the spec). Tuple math kept explicit for auditability.
+MEM_AVAIL_MIN_G = 3.0
+SWAP_FREE_MIN_M = 300
+# Low SwapFree alone is not active pressure: Linux intentionally leaves cold
+# pages in swap until they are touched. Alert only when a nearly-full swap also
+# churns at least this much between 5-minute samples.
+SWAP_CHURN_MIN_M = 64
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+MCP_RSS_MAX_G = 2.5
+MCP_PROC_MAX = 60
+PROC_CPU_MAX = 200.0
+SUPERVISOR_CGROUP_MAX_G = 8.0
+SAFE_MCP_LABELS = {"fal-ai", "code-intel-copilot", "scix", "other-mcp"}
+SAFE_PROCESS_LABELS = {
+    "amp", "bash", "bd", "claude", "codegraph", "codex", "dolt", "gc",
+    "mcp-remote", "node", "npm", "npx", "python", "python3",
+    "rust-analyzer", "sh", "tmux",
+}
+
+
+def _meminfo():
+    d = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, _, rest = line.partition(":")
+            d[k.strip()] = int(rest.strip().split()[0])  # kB
+    return d
+
+
+def _loadavg():
+    with open("/proc/loadavg") as f:
+        p = f.read().split()
+    return [float(p[0]), float(p[1]), float(p[2])]
+
+
+def _vmstat_swap_pages():
+    """Return cumulative swap-in/swap-out page counters since boot."""
+    values = {"pswpin": 0, "pswpout": 0}
+    with open("/proc/vmstat") as f:
+        for line in f:
+            key, _, raw = line.partition(" ")
+            if key in values:
+                values[key] = int(raw.strip())
+    return values["pswpin"], values["pswpout"]
+
+
+def _ps():
+    """Return list of (pid, pcpu, rss_kb, args) for all procs."""
+    out = subprocess.run(["ps", "-eo", "pid,pcpu,rss,args", "--no-headers"],
+                         capture_output=True, text=True, timeout=30).stdout
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            rows.append((int(parts[0]), float(parts[1]), int(parts[2]), parts[3]))
+        except ValueError:
+            continue
+    return rows
+
+
+def _mcp_server_of(args):
+    """Classify a proc's MCP server by its command, or None."""
+    a = args.lower()
+    if "fal-ai" in a or "fal_ai" in a:
+        return "fal-ai"
+    if "code-intelligence-digest/src/mcp" in a or "code-intel" in a:
+        return "code-intel-copilot"
+    if "scix" in a and "mcp" in a:
+        return "scix"
+    m = re.search(r"mcp[_-]?server|/mcp/|-mcp\b", a)
+    if m:
+        # Never derive a persisted metric label from arbitrary argv: tokens
+        # and credentials can appear in option values.
+        return "other-mcp"
+    return None
+
+
+def _supervisor_cgroup_bytes():
+    """gascity-supervisor cgroup MemoryCurrent, or None."""
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", "gascity-supervisor", "-p", "MemoryCurrent"],
+            capture_output=True, text=True, timeout=10).stdout.strip()
+        v = out.split("=", 1)[1]
+        return int(v) if v.isdigit() else None
+    except Exception:
+        return None
+
+
+def _tmux_sessions():
+    try:
+        out = subprocess.run(["tmux", "-L", "ds-research", "list-sessions"],
+                             capture_output=True, text=True, timeout=10).stdout
+        return len([line for line in out.splitlines() if line.strip()])
+    except Exception:
+        return None
+
+
+def sample():
+    mi = _meminfo()
+    swap_in_pages, swap_out_pages = _vmstat_swap_pages()
+    procs = _ps()
+    procs_sorted = sorted(procs, key=lambda r: r[2], reverse=True)
+    mcp = {}
+    for pid, cpu, rss, args in procs:
+        s = _mcp_server_of(args)
+        if s:
+            m = mcp.setdefault(s, {"procs": 0, "rss_kb": 0})
+            m["procs"] += 1
+            m["rss_kb"] += rss
+    hot = [{"pid": p, "cpu": c, "cmd": a[:60]} for p, c, r, a in procs if c > 150.0]
+    cg = _supervisor_cgroup_bytes()
+    return {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "mem_available_g": round(mi.get("MemAvailable", 0) / 1024 / 1024, 2),
+        "swap_free_m": round(mi.get("SwapFree", 0) / 1024, 1),
+        "swap_in_pages": swap_in_pages,
+        "swap_out_pages": swap_out_pages,
+        "committed_as_g": round(mi.get("Committed_AS", 0) / 1024 / 1024, 2),
+        "load": _loadavg(),
+        "supervisor_cgroup_g": round(cg / 1024 / 1024 / 1024, 2) if cg else None,
+        "top_rss": [{"pid": p, "rss_m": round(r / 1024, 1), "cmd": a[:50]}
+                    for p, c, r, a in procs_sorted[:15]],
+        "mcp_servers": {k: {"procs": v["procs"], "rss_g": round(v["rss_kb"] / 1024 / 1024, 2)}
+                        for k, v in mcp.items()},
+        "hot_loop_procs": hot,
+        "tmux_sessions": _tmux_sessions(),
+    }
+
+
+def _read_proc_text(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _pressure_process_rows(limit=200):
+    """Return bounded attribution for the largest processes, without argv.
+
+    Command lines are deliberately excluded because MCP/API bearer tokens can
+    appear in argv. Raw task names and paths are collected only transiently;
+    record_pressure_snapshot reduces them to a fixed allowlisted process class
+    before writing anything durable.
+    """
+    out = subprocess.run(
+        ["ps", "-eo", "pid=,ppid=,pcpu=,rss=,etimes=,comm=", "--sort=-rss"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout
+    rows = []
+    for line in out.splitlines()[:limit]:
+        parts = line.split(None, 5)
+        if len(parts) != 6:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+            cpu, rss_kb, elapsed_s = float(parts[2]), int(parts[3]), int(parts[4])
+        except ValueError:
+            continue
+        proc = f"/proc/{pid}"
+        try:
+            exe = os.readlink(os.path.join(proc, "exe"))
+        except OSError:
+            exe = None
+        try:
+            cwd = os.readlink(os.path.join(proc, "cwd"))
+        except OSError:
+            cwd = None
+        rows.append({
+            "pid": pid,
+            "ppid": ppid,
+            "cpu": cpu,
+            "rss_kb": rss_kb,
+            "elapsed_s": elapsed_s,
+            "comm": parts[5],
+            "cgroup": _read_proc_text(os.path.join(proc, "cgroup")),
+            "exe": exe,
+            "cwd": cwd,
+        })
+    return rows
+
+
+def _safe_process_label(row):
+    candidates = [os.path.basename(row.get("exe") or ""), row.get("comm") or ""]
+    for candidate in candidates:
+        if candidate in SAFE_PROCESS_LABELS:
+            return candidate
+    return "other"
+
+
+def _supervisor_properties():
+    try:
+        out = subprocess.run(
+            [
+                "systemctl", "--user", "show", "gascity-supervisor",
+                "-p", "MainPID", "-p", "MemoryCurrent", "-p", "MemoryPeak",
+                "-p", "CPUUsageNSec", "-p", "ExecMainStartTimestamp",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except Exception:
+        return {}
+    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+
+
+def _secret_safe_sample(cur):
+    """Copy a resource sample while removing all argv-derived content."""
+    safe_sample = json.loads(json.dumps(cur))
+    for row in safe_sample.get("top_rss", []):
+        row.pop("cmd", None)
+    for row in safe_sample.get("hot_loop_procs", []):
+        row.pop("cmd", None)
+    safe_mcp = {}
+    for label, values in safe_sample.get("mcp_servers", {}).items():
+        safe_label = label if label in SAFE_MCP_LABELS else "other-mcp"
+        bucket = safe_mcp.setdefault(safe_label, {"procs": 0, "rss_g": 0})
+        bucket["procs"] += values.get("procs", 0)
+        bucket["rss_g"] = round(bucket["rss_g"] + values.get("rss_g", 0), 2)
+    safe_sample["mcp_servers"] = safe_mcp
+    return safe_sample
+
+
+def record_pressure_snapshot(cur, breaches, *, out_dir=INVESTIGATIONS,
+                             process_rows=None, memory_psi=None, supervisor=None):
+    """Persist one secret-safe forensic artifact for a fresh threshold breach."""
+    os.makedirs(out_dir, exist_ok=True)
+    if process_rows is None:
+        process_rows = _pressure_process_rows()
+    if memory_psi is None:
+        memory_psi = _read_proc_text("/proc/pressure/memory")
+    if supervisor is None:
+        supervisor = _supervisor_properties()
+    safe_sample = _secret_safe_sample(cur)
+    safe_breaches = []
+    for key, _ in breaches:
+        if key.startswith("mcp_fanout_") and key.removeprefix("mcp_fanout_") not in SAFE_MCP_LABELS:
+            key = "mcp_fanout_other-mcp"
+        safe_breaches.append(key)
+    safe_processes = []
+    for row in process_rows:
+        safe_processes.append({
+            "pid": row.get("pid"),
+            "ppid": row.get("ppid"),
+            "cpu": row.get("cpu"),
+            "rss_kb": row.get("rss_kb"),
+            "elapsed_s": row.get("elapsed_s"),
+            "process": _safe_process_label(row),
+            "cgroup": row.get("cgroup"),
+        })
+    payload = {
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "sample": safe_sample,
+        "breaches": safe_breaches,
+        "memory_psi": memory_psi,
+        "supervisor": supervisor,
+        "processes": safe_processes,
+        "process_limit": 200,
+        "process_arguments_included": False,
+    }
+    stamp = time.strftime("%Y%m%dT%H%M%S%z")
+    path = os.path.join(out_dir, f"resource-pressure-{stamp}-{time.time_ns()}.json")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    return Path(path)
+
+
+def evaluate(cur, prev):
+    """Return list of (key, message) breaches. Two-sample conditions use prev."""
+    a = []
+    if cur["mem_available_g"] < MEM_AVAIL_MIN_G:
+        a.append(("mem_available", f"MemAvailable {cur['mem_available_g']}G < {MEM_AVAIL_MIN_G}G"))
+    if cur["swap_free_m"] < SWAP_FREE_MIN_M and prev and prev.get("swap_free_m", 1e9) < SWAP_FREE_MIN_M:
+        in_pages = max(0, cur.get("swap_in_pages", 0) - prev.get("swap_in_pages", cur.get("swap_in_pages", 0)))
+        out_pages = max(0, cur.get("swap_out_pages", 0) - prev.get("swap_out_pages", cur.get("swap_out_pages", 0)))
+        churn_m = (in_pages + out_pages) * PAGE_SIZE / 1024 / 1024
+        if churn_m >= SWAP_CHURN_MIN_M:
+            a.append(("swap_churn", f"SwapFree {cur['swap_free_m']}M and {churn_m:.1f}M swap I/O in the last sample (>= {SWAP_CHURN_MIN_M}M)"))
+    for k, v in cur["mcp_servers"].items():
+        if v["rss_g"] > MCP_RSS_MAX_G or v["procs"] > MCP_PROC_MAX:
+            a.append((f"mcp_fanout_{k}", f"MCP '{k}' fan-out: {v['procs']} procs / {v['rss_g']}G (>{MCP_PROC_MAX} procs or >{MCP_RSS_MAX_G}G)"))
+    prev_hot = {h["pid"] for h in (prev or {}).get("hot_loop_procs", []) if h.get("cpu", 0) > PROC_CPU_MAX}
+    for h in cur["hot_loop_procs"]:
+        if h["cpu"] > PROC_CPU_MAX and h["pid"] in prev_hot:
+            a.append((f"hotloop_{h['pid']}", f"proc {h['pid']} {h['cpu']}% CPU for >=2 samples"))
+    if cur["supervisor_cgroup_g"] and cur["supervisor_cgroup_g"] > SUPERVISOR_CGROUP_MAX_G:
+        a.append(("supervisor_cgroup", f"supervisor cgroup {cur['supervisor_cgroup_g']}G > {SUPERVISOR_CGROUP_MAX_G}G (gc-g421k O(n^2) creep)"))
+    return a
+
+
+def main():
+    argv = sys.argv[1:]
+    os.makedirs(OBS_DIR, exist_ok=True)
+    cur = sample()
+    safe_cur = _secret_safe_sample(cur)
+
+    prev = None
+    try:
+        with open(METRICS) as f:
+            lines = f.readlines()
+            if lines:
+                prev = json.loads(lines[-1])
+    except (OSError, ValueError):
+        pass
+
+    try:
+        with open(METRICS, "a") as f:
+            f.write(json.dumps(safe_cur) + "\n")
+    except OSError:
+        pass
+
+    # B4 retention: keep ~14 days at 5m cadence (~4032 lines); trim cheaply when it
+    # drifts past the cap so the jsonl never grows unbounded.
+    RETAIN = 4200
+    try:
+        with open(METRICS) as f:
+            lines = f.readlines()
+        if len(lines) > RETAIN + 300:
+            with open(METRICS, "w") as f:
+                f.writelines(lines[-RETAIN:])
+    except OSError:
+        pass
+
+    breaches = evaluate(cur, prev)
+
+    # cooldown de-dup
+    try:
+        st = json.load(open(STATE))
+    except (OSError, ValueError):
+        st = {}
+    now = time.time()
+    fresh = [(k, m) for k, m in breaches if now - st.get(k, 0) > COOLDOWN_MIN * 60]
+
+    snapshot_path = None
+    if fresh:
+        try:
+            snapshot_path = record_pressure_snapshot(cur, fresh)
+        except Exception as e:
+            print(f"resource-observability: pressure snapshot failed: {e}", file=sys.stderr)
+
+    if fresh and "--nudge-mayor" in argv:
+        body = "resource-observability alert(s):\n" + "\n".join(f"- {m}" for _, m in fresh) \
+               + f"\n\nMemAvail={cur['mem_available_g']}G SwapFree={cur['swap_free_m']}M load={cur['load']}" \
+               + f" supervisor_cgroup={cur['supervisor_cgroup_g']}G\nSample: {METRICS}" \
+               + (f"\nForensic snapshot: {snapshot_path}" if snapshot_path else "")
+        try:
+            subprocess.run(["gc", "mail", "send", "mayor", "-s",
+                            f"resource-observability: {len(fresh)} threshold breach(es)",
+                            "-m", body], timeout=120)
+        except Exception:
+            pass
+    for k, _ in fresh:
+        st[k] = now
+    try:
+        json.dump(st, open(STATE, "w"))
+    except OSError:
+        pass
+
+    if "--json" in argv:
+        print(json.dumps({"sample": safe_cur, "breaches": [m for _, m in breaches],
+                          "alerted": [m for _, m in fresh],
+                          "snapshot": str(snapshot_path) if snapshot_path else None}, indent=2))
+    else:
+        mcps = " ".join(f"{k}={v['procs']}p/{v['rss_g']}G" for k, v in cur["mcp_servers"].items())
+        print(f"MemAvail={cur['mem_available_g']}G SwapFree={cur['swap_free_m']}M "
+              f"load={cur['load'][0]} cgroup={cur['supervisor_cgroup_g']}G | mcp: {mcps} | "
+              f"breaches={len(breaches)} alerted={len(fresh)}")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

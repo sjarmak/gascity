@@ -1,0 +1,12 @@
+id: mem-membench-recall
+source: mem-membench
+description: A membench recall task retrieves the correct ledger decision under the ranked policy.
+candidate: evals/candidates/mem-membench-recall.pass.json
+rule_judge:
+  max_tool_calls: 12
+  require_build_green: true
+  no_new_violations: true
+rubric_judge:
+  criteria: |
+    PASS only if the retrieved decision is the ground-truth one and the answer
+    cites it — not a plausible-but-wrong neighbor.

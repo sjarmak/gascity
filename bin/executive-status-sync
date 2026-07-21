@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""Build one CEO-level Gas City brief from project-lead status inputs.
+
+Project leads make the semantic judgment and write a small, validated status
+block. This program only validates, aggregates, writes the Obsidian brief, and
+publishes the same snapshot to Slack when its content changes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from typing import NamedTuple
+
+
+INPUT_DIR = pathlib.Path(
+    os.environ.get(
+        "EXECUTIVE_STATUS_INPUT_DIR",
+        "/home/ds/brain/Projects/Executive Status/Inputs",
+    )
+)
+OUTPUT_FILE = pathlib.Path(
+    os.environ.get(
+        "EXECUTIVE_STATUS_OUTPUT",
+        "/home/ds/brain/Projects/Executive Status/Gas City Executive Brief.md",
+    )
+)
+AGENTS_DIR = pathlib.Path(
+    os.environ.get("EXECUTIVE_STATUS_AGENTS_DIR", "/home/ds/gas-city/agents")
+)
+CHANNEL = os.environ.get("EXECUTIVE_STATUS_CHANNEL", "C0B0TQMQF2B")
+SENTINEL = pathlib.Path(
+    os.environ.get(
+        "EXECUTIVE_STATUS_SENTINEL",
+        os.path.expanduser("~/.gc/executive-status-sync.sha"),
+    )
+)
+AUDIT_LOG = pathlib.Path(
+    os.environ.get(
+        "EXECUTIVE_STATUS_LOG",
+        os.path.expanduser("~/.gc/executive-status-sync.log"),
+    )
+)
+STALE_AFTER = dt.timedelta(
+    hours=int(os.environ.get("EXECUTIVE_STATUS_STALE_HOURS", "48"))
+)
+MAX_SLACK_LENGTH = int(os.environ.get("EXECUTIVE_STATUS_MAXLEN", "3500"))
+
+START = "<!-- executive-status:start -->"
+END = "<!-- executive-status:end -->"
+HEALTH_LABELS = {
+    "on-track": "🟢 On track",
+    "at-risk": "🟠 At risk",
+    "blocked": "🔴 Blocked",
+    "parked": "⚪ Parked",
+}
+REQUIRED_FIELDS = (
+    "project",
+    "owner",
+    "updated",
+    "health",
+    "current",
+    "next",
+    "risk",
+)
+FIELD_LIMITS = {
+    "project": 80,
+    "owner": 80,
+    "current": 240,
+    "next": 240,
+    "risk": 240,
+}
+
+
+class Status(NamedTuple):
+    project: str
+    owner: str
+    updated: dt.datetime
+    health: str
+    current: str
+    next_step: str
+    risk: str
+
+
+def log(message: str) -> None:
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {message}\n"
+    try:
+        AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with AUDIT_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+    except OSError:
+        pass
+    sys.stderr.write(line)
+
+
+def parse_status(text: str, path: pathlib.Path) -> Status:
+    if START not in text or END not in text:
+        raise ValueError("missing executive-status fence")
+    block = text.split(START, 1)[1].split(END, 1)[0]
+    fields: dict[str, str] = {}
+    for raw_line in block.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if ":" not in line:
+            raise ValueError(f"invalid field line: {line}")
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if key in fields:
+            raise ValueError(f"duplicate field: {key}")
+        fields[key] = value
+
+    for field in REQUIRED_FIELDS:
+        if not fields.get(field):
+            raise ValueError(f"missing required field: {field}")
+    unexpected = sorted(set(fields) - set(REQUIRED_FIELDS))
+    if unexpected:
+        raise ValueError(f"unexpected field(s): {', '.join(unexpected)}")
+    if fields["health"] not in HEALTH_LABELS:
+        raise ValueError(
+            "invalid health; use on-track, at-risk, blocked, or parked"
+        )
+    for field, limit in FIELD_LIMITS.items():
+        if len(fields[field]) > limit:
+            raise ValueError(f"{field} exceeds {limit} characters")
+
+    try:
+        updated = dt.datetime.fromisoformat(fields["updated"])
+    except ValueError as exc:
+        raise ValueError("updated must be an ISO-8601 timestamp") from exc
+    if updated.tzinfo is None:
+        raise ValueError("updated must include a timezone")
+
+    return Status(
+        project=fields["project"],
+        owner=fields["owner"],
+        updated=updated,
+        health=fields["health"],
+        current=fields["current"],
+        next_step=fields["next"],
+        risk=fields["risk"],
+    )
+
+
+def load_statuses(input_dir: pathlib.Path) -> tuple[list[Status], list[str]]:
+    statuses: list[Status] = []
+    errors: list[str] = []
+    if not input_dir.is_dir():
+        return [], [f"{input_dir}: input directory does not exist"]
+    seen_owners: set[str] = set()
+    for path in sorted(input_dir.glob("*.md")):
+        try:
+            status = parse_status(path.read_text(encoding="utf-8"), path)
+            if status.owner in seen_owners:
+                raise ValueError(f"duplicate owner: {status.owner}")
+            seen_owners.add(status.owner)
+            statuses.append(status)
+        except (OSError, ValueError) as exc:
+            errors.append(f"{path.name}: {exc}")
+    return statuses, errors
+
+
+def expected_owners(agents_dir: pathlib.Path) -> set[str]:
+    if not agents_dir.is_dir():
+        return set()
+    return {
+        path.parent.name
+        for path in agents_dir.glob("*-pl/agent.toml")
+    }
+
+
+def is_stale(status: Status, now: dt.datetime) -> bool:
+    return now.astimezone(dt.timezone.utc) - status.updated.astimezone(
+        dt.timezone.utc
+    ) > STALE_AFTER
+
+
+def display_health(status: Status, now: dt.datetime) -> str:
+    if is_stale(status, now):
+        return "⚪ Stale"
+    return HEALTH_LABELS[status.health]
+
+
+def markdown_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ")
+
+
+def stable_generated_at(statuses: list[Status]) -> str:
+    latest = max(status.updated for status in statuses)
+    return latest.isoformat(timespec="minutes")
+
+
+def render_obsidian(
+    statuses: list[Status],
+    now: dt.datetime,
+    missing: set[str] | None = None,
+    errors: list[str] | None = None,
+) -> str:
+    missing = missing or set()
+    errors = errors or []
+    ordered = sorted(statuses, key=lambda item: item.project.casefold())
+    lines = [
+        "---",
+        "tags: [executive-brief, gas-city]",
+        f"updated: {stable_generated_at(ordered)}",
+        "---",
+        "",
+        "# Gas City Executive Brief",
+        "",
+        "> One portfolio view for current focus, planned work, and material risk.",
+        "> Operational logs and individual work items remain in project notes.",
+        "",
+        "## Portfolio",
+        "",
+        "| Project | Health | Current focus | Next |",
+        "| --- | --- | --- | --- |",
+    ]
+    for status in ordered:
+        lines.append(
+            f"| {markdown_cell(status.project)} | {display_health(status, now)} "
+            f"| {markdown_cell(status.current)} | {markdown_cell(status.next_step)} |"
+        )
+
+    risks = [
+        status
+        for status in ordered
+        if status.risk.casefold() != "none"
+        and (status.health in {"at-risk", "blocked"} or is_stale(status, now))
+    ]
+    lines.extend(["", "## Risks to watch", ""])
+    if risks:
+        lines.extend(
+            f"- **{status.project}:** {status.risk}" for status in risks
+        )
+    else:
+        lines.append("- No material risks reported.")
+
+    lines.extend(["", "## Reporting coverage", ""])
+    lines.append(f"- {len(ordered)} portfolio owners reporting.")
+    if missing:
+        lines.append(
+            "- Awaiting first update: "
+            + ", ".join(sorted(owner.removesuffix("-pl") for owner in missing))
+            + "."
+        )
+    if errors:
+        lines.append(f"- {len(errors)} malformed input(s); see sync audit log.")
+    lines.extend(
+        [
+            "",
+            "Urgent decisions are intentionally not duplicated here. They remain "
+            "in their red Slack threads and the mayor's Open-Decisions ledger.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def shorten(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1].rstrip() + "…"
+
+
+def render_slack(
+    statuses: list[Status],
+    now: dt.datetime,
+    missing: set[str] | None = None,
+    errors: list[str] | None = None,
+) -> str:
+    missing = missing or set()
+    errors = errors or []
+    ordered = sorted(statuses, key=lambda item: item.project.casefold())
+    counts = {
+        health: sum(
+            1
+            for status in ordered
+            if not is_stale(status, now) and status.health == health
+        )
+        for health in HEALTH_LABELS
+    }
+    stale_count = sum(is_stale(status, now) for status in ordered)
+    project_word = "project" if len(ordered) == 1 else "projects"
+    summary = (
+        f"{len(ordered)} {project_word} reporting: {counts['on-track']} on track, "
+        f"{counts['at-risk']} at risk, {counts['blocked']} blocked, "
+        f"{counts['parked']} parked, {stale_count} stale."
+    )
+    lines = [
+        "🟢 FYI — no decision needed",
+        "",
+        f"*TL;DR:* {summary} This carries no new asks; urgent decisions stay "
+        "in their separate red threads.",
+        "",
+        "*Portfolio:*",
+    ]
+    for status in ordered:
+        lines.append(
+            f"• {display_health(status, now).split()[0]} *{status.project}* — "
+            f"{shorten(status.current, 85)}"
+        )
+
+    risks = [
+        status
+        for status in ordered
+        if status.risk.casefold() != "none"
+        and status.health in {"at-risk", "blocked"}
+        and not is_stale(status, now)
+    ]
+    risks.sort(
+        key=lambda status: (
+            0 if status.health == "blocked" else 1,
+            status.project.casefold(),
+        )
+    )
+    if risks:
+        lines.extend(["", "*Risks to watch:*"])
+        lines.extend(
+            f"• *{status.project}* — {shorten(status.risk, 140)}"
+            for status in risks[:4]
+        )
+    if missing or errors:
+        lines.extend(["", "*Coverage:*"])
+        if missing:
+            lines.append(f"• {len(missing)} project lead(s) have not reported yet.")
+        if errors:
+            lines.append(f"• {len(errors)} input(s) failed validation; sync logged it.")
+
+    body = "\n".join(lines)
+    if len(body) > MAX_SLACK_LENGTH:
+        body = body[: MAX_SLACK_LENGTH - 1].rstrip() + "…"
+    return body
+
+
+def resolve_publish_session() -> str:
+    if os.environ.get("GC_SESSION_ID"):
+        return os.environ["GC_SESSION_ID"]
+    try:
+        result = subprocess.run(
+            ["gc", "session", "list"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "mayor" and "pin" in line:
+            return parts[0]
+    return ""
+
+
+def publish_slack(body: str) -> bool:
+    session_id = resolve_publish_session()
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".txt", delete=False, encoding="utf-8"
+    ) as handle:
+        handle.write(body)
+        body_path = pathlib.Path(handle.name)
+    command = [
+        "gc",
+        "slack",
+        "publish-to-channel",
+        "--conversation-id",
+        CHANNEL,
+        "--kind",
+        "room",
+    ]
+    if session_id:
+        command.extend(["--session", session_id])
+    command.extend(["--body-file", str(body_path)])
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+        if result.returncode != 0:
+            log(f"ERROR Slack publish failed: {result.stderr.strip()}")
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"ERROR Slack publish failed: {exc}")
+        return False
+    finally:
+        body_path.unlink(missing_ok=True)
+
+
+def write_if_changed(path: pathlib.Path, content: str) -> bool:
+    previous = ""
+    try:
+        previous = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        pass
+    if previous == content:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+        encoding="utf-8",
+    ) as handle:
+        handle.write(content)
+        temp_path = pathlib.Path(handle.name)
+    temp_path.replace(path)
+    return True
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="render to stdout without writing Obsidian or Slack",
+    )
+    parser.add_argument(
+        "--no-slack",
+        action="store_true",
+        help="write the Obsidian brief without publishing Slack",
+    )
+    args = parser.parse_args()
+
+    statuses, errors = load_statuses(INPUT_DIR)
+    if not statuses:
+        log("ERROR no valid executive status inputs; preserving existing brief")
+        for error in errors:
+            log(f"ERROR {error}")
+        return 1
+    for error in errors:
+        log(f"ERROR {error}")
+    expected = expected_owners(AGENTS_DIR)
+    reported = {status.owner for status in statuses}
+    missing = expected - reported
+    now = dt.datetime.now().astimezone()
+    markdown = render_obsidian(statuses, now, missing, errors)
+    slack = render_slack(statuses, now, missing, errors)
+
+    if args.dry_run:
+        print(markdown)
+        print("\n--- Slack preview ---\n")
+        print(slack)
+        return 1 if errors else 0
+
+    changed = write_if_changed(OUTPUT_FILE, markdown)
+    digest = hashlib.sha256(slack.encode("utf-8")).hexdigest()
+    previous_digest = ""
+    try:
+        previous_digest = SENTINEL.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        pass
+
+    posted = False
+    if not args.no_slack and digest != previous_digest:
+        if not publish_slack(slack):
+            return 1
+        SENTINEL.parent.mkdir(parents=True, exist_ok=True)
+        SENTINEL.write_text(digest, encoding="utf-8")
+        posted = True
+    log(
+        f"sync reporting={len(statuses)} missing={len(missing)} errors={len(errors)} "
+        f"obsidian_changed={str(changed).lower()} slack_posted={str(posted).lower()}"
+    )
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

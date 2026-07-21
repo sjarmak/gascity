@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+mkdir -p "$TMP/bin" "$TMP/city/.gc"
+cat > "$TMP/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+[{"number":4242,"title":"Make delivery durable","url":"https://example.invalid/pr/4242","mergedAt":"2026-07-20T00:00:00Z","headRefName":"fix/delivery","mergeCommit":{"oid":"1234567890abcdef"},"body":"Closes #12"}]
+JSON
+EOF
+
+cat > "$TMP/bin/gc" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1 $2" == "session list" ]]; then
+    printf '%s\n' 'gc-mayor mayor running pin'
+    exit 0
+fi
+if [[ "$1 $2" == "slack publish-to-channel" ]]; then
+    echo slack >> "${DELIVERY_LOG:?}"
+    [[ "${FAIL_SLACK:-0}" == 1 ]] && exit 1
+    exit 0
+fi
+if [[ "$1 $2" == "mail send" ]]; then
+    echo mail >> "${DELIVERY_LOG:?}"
+    [[ "${FAIL_MAIL:-0}" == 1 ]] && exit 1
+    exit 0
+fi
+echo "unexpected gc invocation: $*" >&2
+exit 2
+EOF
+chmod +x "$TMP/bin/gh" "$TMP/bin/gc"
+
+export PATH="$TMP/bin:$PATH"
+export GC_STORE_ROOT="$TMP/city"
+export DELIVERY_LOG="$TMP/deliveries.log"
+STATE="$TMP/city/.gc/pr-merge-notifier-state.json"
+
+count_delivery() {
+    local recipient="$1"
+    grep -c "^${recipient}$" "$DELIVERY_LOG" 2>/dev/null || true
+}
+
+reset_fixture() {
+    rm -f "$STATE" "$TMP/city/.gc/pr-merge-notifier.log"
+    : > "$DELIVERY_LOG"
+}
+
+run_notifier() {
+    FAIL_SLACK="$1" FAIL_MAIL="$2" "$ROOT/bin/pr-merge-notifier"
+}
+
+# Total delivery failure must not globally deduplicate the PR. Both required
+# recipients retry until each acknowledges delivery.
+reset_fixture
+run_notifier 1 1
+jq -e '(.notified_prs // []) | index(4242) == null' "$STATE" >/dev/null
+[[ $(count_delivery slack) -eq 1 ]]
+[[ $(count_delivery mail) -eq 1 ]]
+
+run_notifier 1 1
+jq -e '(.notified_prs // []) | index(4242) == null' "$STATE" >/dev/null
+[[ $(count_delivery slack) -eq 2 ]]
+[[ $(count_delivery mail) -eq 2 ]]
+
+run_notifier 0 0
+jq -e '(.notified_prs // []) | index(4242) != null' "$STATE" >/dev/null
+[[ $(count_delivery slack) -eq 3 ]]
+[[ $(count_delivery mail) -eq 3 ]]
+
+run_notifier 0 0
+[[ $(count_delivery slack) -eq 3 ]]
+[[ $(count_delivery mail) -eq 3 ]]
+echo "ok: total failure retries both required recipients; full acknowledgement becomes quiet"
+
+# Slack acknowledgement must remain quiet while failed mayor mail retries.
+reset_fixture
+run_notifier 0 1
+jq -e '((.slack_notified_prs // []) | index(4242) != null) and ((.mail_notified_prs // []) | index(4242) == null) and ((.notified_prs // []) | index(4242) == null)' "$STATE" >/dev/null
+[[ $(count_delivery slack) -eq 1 ]]
+[[ $(count_delivery mail) -eq 1 ]]
+
+run_notifier 0 0
+jq -e '(.notified_prs // []) | index(4242) != null' "$STATE" >/dev/null
+[[ $(count_delivery slack) -eq 1 ]]
+[[ $(count_delivery mail) -eq 2 ]]
+
+run_notifier 0 0
+[[ $(count_delivery slack) -eq 1 ]]
+[[ $(count_delivery mail) -eq 2 ]]
+echo "ok: acknowledged Slack stays quiet while failed mayor mail retries"
+
+# Mayor-mail acknowledgement must remain quiet while failed Slack retries.
+reset_fixture
+run_notifier 1 0
+jq -e '((.slack_notified_prs // []) | index(4242) == null) and ((.mail_notified_prs // []) | index(4242) != null) and ((.notified_prs // []) | index(4242) == null)' "$STATE" >/dev/null
+[[ $(count_delivery slack) -eq 1 ]]
+[[ $(count_delivery mail) -eq 1 ]]
+
+run_notifier 0 0
+jq -e '(.notified_prs // []) | index(4242) != null' "$STATE" >/dev/null
+[[ $(count_delivery slack) -eq 2 ]]
+[[ $(count_delivery mail) -eq 1 ]]
+
+run_notifier 0 0
+[[ $(count_delivery slack) -eq 2 ]]
+[[ $(count_delivery mail) -eq 1 ]]
+echo "ok: acknowledged mayor mail stays quiet while failed Slack retries"
+
+# Existing global state predates per-recipient fields and must remain quiet.
+reset_fixture
+printf '%s\n' '{"notified_prs":[4242]}' > "$STATE"
+run_notifier 0 0
+[[ $(count_delivery slack) -eq 0 ]]
+[[ $(count_delivery mail) -eq 0 ]]
+echo "ok: legacy globally-notified state remains compatible and quiet"
+echo "PASS: pr-merge-notifier per-recipient delivery contract fixtures"

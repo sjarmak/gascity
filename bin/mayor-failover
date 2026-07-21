@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Convenience alias: swap mayor to the coolest account.
+# Equivalent to: gc-capacity --rebalance mayor
+set -euo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$DIR/gc-capacity" --rebalance mayor "$@"

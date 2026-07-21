@@ -1,0 +1,6 @@
+[order]
+description = "Companion to pl-loop-close (event-driven on bead.closed). This is the cooldown-driven re-tick: fires every 1m to catch nudge-timeout fallbacks. The bead.closed event handles the initial nudge; this catches the case where the PL doesn't post within 5min and the handler needs to fall back to direct-post. Same script, idempotent via metadata.loop_close_posted_at."
+trigger = "cooldown"
+interval = "1m"
+exec = "/home/ds/gas-city/bin/pl-loop-close"
+timeout = "120s"

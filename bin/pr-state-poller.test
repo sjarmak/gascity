@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Standalone test for pr-state-poller's PER-REVIEW inline-comment gate.
+#
+# The bug under test (found 2026-07-16): `copilot_comment_count` was fetched from
+# /pulls/{pr}/comments — which returns EVERY copilot inline comment on the PR —
+# and then used to gate a decision about ONE review. On a PR where an earlier
+# review left inline comments, a later summary-only review inherited that count
+# and dispatched a spurious mol-pr-iterate against a review with no actionable
+# feedback. The code comment said "per copilot review"; the code counted PR-wide.
+#
+# Fixture: PR #9001 with two copilot reviews —
+#   review 111 → 4 inline comments   (actionable → MUST dispatch)
+#   review 222 → 0 inline comments   (summary-only → MUST skip)
+# PR-wide copilot comment count is therefore 4. Pre-fix, review 222 saw 4 and
+# dispatched. Post-fix it sees its own 0 and skips.
+#
+# Asserts:
+#   1. review 111 -> exactly ONE iterate_dispatched, with comments=4
+#      (comments=4 also pins the per-review count reaching dispatch_iterate:
+#       pre-fix this was the PR-wide total, which coincides here — so assertion 2
+#       is the one that actually catches the bug)
+#   2. review 222 -> ZERO iterate_dispatched, ONE skip_no_inline_comments
+#   3. total dispatches for the tick == 1
+#
+# Strategy: stub `gh` and `gc` on PATH. The `gh` stub serves the PR list, the
+# reviews array, and the comments array (each comment carrying its
+# pull_request_review_id). The `gc` stub records every `gc sling` to $SLING_LOG
+# and serves an empty convoy list so existing_iterate_bead() finds nothing.
+#
+# Run:  bash /home/ds/gas-city/bin/pr-state-poller.test
+
+set -uo pipefail
+
+POLLER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pr-state-poller"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+export GC_STORE_ROOT="$TMP/city"
+mkdir -p "$GC_STORE_ROOT/.gc"
+SLING_LOG="$TMP/slings.log"; : > "$SLING_LOG"
+AUDIT="$GC_STORE_ROOT/.gc/pr-state-poller.log"
+
+# --- stubs -----------------------------------------------------------------
+mkdir -p "$TMP/bin"
+
+cat > "$TMP/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+# gh stub: one PR (#9001) in gastownhall/gascity, none in gascity-packs.
+case "$*" in
+  *"pr list"*"gastownhall/gascity-packs"*) echo "" ;;
+  *"pr list"*)                             echo "9001" ;;
+  *"pulls/9001/reviews"*)
+      # two copilot reviews; 222 submitted later
+      echo '[{"id":111,"state":"COMMENTED","submitted_at":"2026-07-16T01:00:00Z"},{"id":222,"state":"COMMENTED","submitted_at":"2026-07-16T02:00:00Z"}]'
+      ;;
+  *"pulls/9001/comments"*)
+      # 4 inline comments, ALL belonging to review 111. Review 222 has none.
+      # Streaming --jq '.[] | ... | .pull_request_review_id' must yield 4x "111".
+      printf '111\n111\n111\n111\n'
+      ;;
+  *) echo "" ;;
+esac
+exit 0
+STUB
+chmod +x "$TMP/bin/gh"
+
+cat > "$TMP/bin/gc" <<STUB
+#!/usr/bin/env bash
+# gc stub: record slings; empty convoy list so the secondary guard finds nothing.
+case "\$1" in
+  sling)   printf '%s\n' "\$*" >> "$SLING_LOG"; cat >/dev/null; exit 0 ;;
+  convoy)  echo '{"convoys":[]}'; exit 0 ;;
+  bd)      echo '[]'; exit 0 ;;
+  *)       exit 0 ;;
+esac
+STUB
+chmod +x "$TMP/bin/gc"
+
+export PATH="$TMP/bin:$PATH"
+
+# --- run -------------------------------------------------------------------
+bash "$POLLER" --pr 9001 >/dev/null 2>&1
+
+# --- assert ----------------------------------------------------------------
+fail=0
+check() { # check <desc> <expected> <actual>
+  if [[ "$2" == "$3" ]]; then
+    echo "  ok: $1 ($3)"
+  else
+    echo "  FAIL: $1 — expected '$2', got '$3'"; fail=1
+  fi
+}
+
+dispatched_111=$(grep -c '"event":"iterate_dispatched".*"review_id":"111"' "$AUDIT" 2>/dev/null || true)
+dispatched_222=$(grep -c '"event":"iterate_dispatched".*"review_id":"222"' "$AUDIT" 2>/dev/null || true)
+skipped_222=$(grep -c '"event":"skip_no_inline_comments".*"review_id":"222"' "$AUDIT" 2>/dev/null || true)
+comments_111=$(grep '"event":"iterate_dispatched".*"review_id":"111"' "$AUDIT" 2>/dev/null | grep -o '"comments":[0-9]*' | head -1)
+total_slings=$(grep -c . "$SLING_LOG" 2>/dev/null || true)
+
+echo "pr-state-poller: per-review inline-comment gate"
+check "review 111 (4 comments) dispatched once"        "1"            "$dispatched_111"
+check "review 111 dispatched with its OWN count"       '"comments":4' "$comments_111"
+check "review 222 (0 comments) NOT dispatched"         "0"            "$dispatched_222"
+check "review 222 skipped as summary-only"             "1"            "$skipped_222"
+check "exactly one sling for the tick"                 "1"            "$total_slings"
+
+if (( fail )); then
+  echo "FAILED"; echo "--- audit log ---"; cat "$AUDIT" 2>/dev/null
+  echo "--- slings ---"; cat "$SLING_LOG" 2>/dev/null
+  exit 1
+fi
+echo "PASSED"

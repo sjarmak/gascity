@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# mayor-pattern-miner: weekly digest of infrastructure patterns from
+# watchdog + surfacer + janitor + close-gate-reaper logs. Surfaces recurring
+# failure modes that warrant upstream issues filed against gastownhall/gascity.
+#
+# Goal (from gc-autonomous-orchestration memory): every infrastructure
+# failure is data; this turns the data into action items.
+#
+# Usage:
+#   mayor-pattern-miner                      # produce digest, print to stdout
+#   mayor-pattern-miner --nudge-mayor        # also nudge mayor with digest
+#   mayor-pattern-miner --window-days N      # default 7
+
+set -uo pipefail
+
+CITY=/home/ds/gas-city
+WATCHDOG_LOG="$CITY/.gc/mayor-watchdog.log"
+CLOSE_GATE_LOG="$CITY/.gc/close-gate-reaper.log"
+SLING_INTERCEPT_LOG="$CITY/.gc/sling-intercept.log"
+EPIC_REVIEW_LOG="$CITY/.gc/epic-review-sweeper.log"
+WINDOW_DAYS="${WINDOW_DAYS:-7}"
+NUDGE_MAYOR=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --nudge-mayor)   NUDGE_MAYOR=1; shift ;;
+    --window-days)   WINDOW_DAYS="$2"; shift 2 ;;
+    -h|--help) sed -n 's/^# \{0,1\}//p' "$0" | head -12; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+NOW_EPOCH=$(date +%s)
+CUTOFF_EPOCH=$(( NOW_EPOCH - WINDOW_DAYS * 86400 ))
+SINCE="$WINDOW_DAYS days ago"
+
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
+
+{
+  echo "Mayor pattern-miner — $(date '+%Y-%m-%d') — last $WINDOW_DAYS days"
+  echo "================================================================"
+  echo
+
+  # ---- Watchdog recoveries ---------------------------------------------
+  echo "## mayor-watchdog events"
+  if [[ -f "$WATCHDOG_LOG" ]]; then
+    counts=$(jq -r --argjson cutoff "$CUTOFF_EPOCH" '
+      select((.ts | fromdateiso8601) >= $cutoff) |
+      .event
+    ' < "$WATCHDOG_LOG" 2>/dev/null | sort | uniq -c | sort -rn)
+    if [[ -n "$counts" ]]; then
+      echo "$counts"
+      total_problems=$(awk '{s+=$1} END{print s+0}' <<<"$counts")
+      echo
+      echo "Total events: $total_problems"
+      # Heuristic: 5+ recoveries in window = recurring pattern
+      if (( total_problems >= 5 )); then
+        echo "⚠ Recurring infra recovery pattern. Top reasons:"
+        jq -r --argjson cutoff "$CUTOFF_EPOCH" '
+          select((.ts | fromdateiso8601) >= $cutoff) |
+          select(.event == "problems_detected" or .event == "recovery") |
+          .detail
+        ' < "$WATCHDOG_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -5 | sed 's/^/  /'
+        echo "→ Candidate upstream issue: tmux/supervisor stability investigation"
+      fi
+    else
+      echo "  (no events — mayor stayed healthy)"
+    fi
+  else
+    echo "  (no watchdog log yet)"
+  fi
+  echo
+
+  # ---- Surfacer findings -----------------------------------------------
+  echo "## mayor-health-surfacer findings"
+  surfacer_lines=$(journalctl --user -u mayor-health-surfacer.service \
+    --since "$SINCE" --no-pager 2>/dev/null | grep "Findings:" | head -50)
+  if [[ -n "$surfacer_lines" ]]; then
+    runs=$(wc -l <<<"$surfacer_lines")
+    echo "  Runs with findings: $runs"
+    # Aggregate counts per category
+    awk '
+      match($0, /Findings: ([0-9]+) stalled \/ ([0-9]+) capacity \/ ([0-9]+) sessions \/ ([0-9]+) infra/, m) {
+        s += m[1]; c += m[2]; ss += m[3]; i += m[4]
+      }
+      END {
+        printf "  Aggregated: %d stalled-bead reports / %d capacity / %d session / %d infra\n", s, c, ss, i
+      }
+    ' <<<"$surfacer_lines"
+  else
+    echo "  (no surfacer findings — surveyed period was clean)"
+  fi
+  echo
+
+  # ---- Janitor findings ------------------------------------------------
+  echo "## bead-janitor findings"
+  janitor_lines=$(journalctl --user -u bead-janitor.service \
+    --since "$SINCE" --no-pager 2>/dev/null | grep -oE "[0-9]+ orphan formula scaffolding beads" | head -50)
+  if [[ -n "$janitor_lines" ]]; then
+    total=$(awk '{s+=$1} END{print s+0}' <<<"$janitor_lines")
+    runs=$(wc -l <<<"$janitor_lines")
+    avg=$(( runs > 0 ? total / runs : 0 ))
+    echo "  Runs: $runs   Total candidates surfaced: $total   Avg per run: $avg"
+    if (( avg >= 3 )); then
+      echo "  ⚠ Sustained orphan-bead production rate."
+      echo "  → Possible cause: formulas dispatched without phase=vapor, or worker drains mid-formula."
+      echo "  → Candidate upstream issue: formula step bead lifecycle / worker drain hooks"
+    fi
+  else
+    echo "  (janitor not yet run, or no findings)"
+  fi
+  echo
+
+  # ---- Close-gate reaper findings --------------------------------------
+  echo "## close-gate-reaper findings"
+  if [[ -f "$CLOSE_GATE_LOG" ]]; then
+    gate_events=$(jq -r --argjson cutoff "$CUTOFF_EPOCH" '
+      select((.ts | sub("\\.[0-9]+"; "") | fromdateiso8601) >= $cutoff) |
+      [.event, .rule, .bead] | @tsv
+    ' "$CLOSE_GATE_LOG" 2>/dev/null || true)
+    if [[ -n "$gate_events" ]]; then
+      missing_count=$(grep -c $'^evidence_missing\t' <<<"$gate_events")
+      reopened_count=$(grep -c $'^reopened\t' <<<"$gate_events")
+      bypass_count=$(grep -c $'^bypass_respected\t' <<<"$gate_events")
+      failed_count=$(grep -c $'^reopen_failed\t' <<<"$gate_events")
+      printf '  Evidence-missing closes: %s   Reopened: %s   Bypasses: %s   Reopen-failed: %s\n' \
+        "$missing_count" "$reopened_count" "$bypass_count" "$failed_count"
+      # Per-rule breakdown for recurring offenders
+      per_rule=$(awk -F'\t' '$1=="evidence_missing" {print $2}' <<<"$gate_events" | sort | uniq -c | sort -rn)
+      if [[ -n "$per_rule" ]]; then
+        echo "  By rule:"
+        while read -r count rule; do
+          [[ -z "$count" ]] && continue
+          printf '    %s× %s\n' "$count" "$rule"
+        done <<<"$per_rule"
+      fi
+      # Flag repeat-offender beads
+      repeat=$(awk -F'\t' '$1=="evidence_missing" {print $3}' <<<"$gate_events" | sort | uniq -c | sort -rn | awk '$1 >= 2' | head -5)
+      if [[ -n "$repeat" ]]; then
+        echo "  Repeat offenders (closed-missing-evidence ≥2 times):"
+        while read -r count bead; do
+          [[ -z "$count" ]] && continue
+          printf '    %s× %s\n' "$count" "$bead"
+        done <<<"$repeat"
+        echo "  ⚠ Repeat offenders suggest the worker/reviewer loop is not learning the evidence requirement."
+        echo "  → Candidate upstream issue: formula should require evidence metadata before close; or pre-close hook needs to block at source."
+      fi
+      if (( bypass_count >= 3 )); then
+        echo "  ⚠ Heavy bypass usage (${bypass_count} in window) — evidence requirement may be mis-calibrated or mis-understood."
+      fi
+    else
+      echo "  (no close-gate events in window)"
+    fi
+  else
+    echo "  (close-gate-reaper log not yet created)"
+  fi
+  echo
+
+  # ---- Sling intercept findings ----------------------------------------
+  echo "## gc-sling intercept findings"
+  if [[ -f "$SLING_INTERCEPT_LOG" ]]; then
+    sling_events=$(jq -r --argjson cutoff "$CUTOFF_EPOCH" '
+      select((.ts | sub("\\.[0-9]+"; "") | fromdateiso8601) >= $cutoff) |
+      [.event, .formula // "", .bead, .reason // ""] | @tsv
+    ' "$SLING_INTERCEPT_LOG" 2>/dev/null || true)
+    if [[ -n "$sling_events" ]]; then
+      injected=$(grep -c $'^formula_injected\t' <<<"$sling_events")
+      passthrough=$(grep -c $'^passthrough\t' <<<"$sling_events")
+      printf '  Formula-injected dispatches: %s   Logged passthroughs: %s\n' \
+        "$injected" "$passthrough"
+      # Breakdown by formula
+      by_formula=$(awk -F'\t' '$1=="formula_injected" {print $2}' <<<"$sling_events" | sort | uniq -c | sort -rn)
+      if [[ -n "$by_formula" ]]; then
+        echo "  Injections by formula:"
+        while read -r count formula; do
+          [[ -z "$count" ]] && continue
+          printf '    %s× %s\n' "$count" "$formula"
+        done <<<"$by_formula"
+      fi
+      # Sustained, high-volume wrapper usage would eventually be evidence the
+      # workaround has outlived its "temporary" window and the feature belongs
+      # upstream. Threshold is deliberately high — successful injections are
+      # not themselves evidence of a bug, just of the wrapper working.
+      if (( injected >= 50 )); then
+        echo "  ⚠ Heavy sustained injection volume (≥50 in window) — the"
+        echo "    wrapper has likely outgrown its workaround role."
+        echo "  → Candidate upstream issue: feat: per-prefix or per-metadata"
+        echo "     formula routing. Today only agent-level default_sling_formula"
+        echo "     exists. Reference: .gc/sling-intercept.log for concrete volume."
+      fi
+    else
+      echo "  (no sling-intercept events in window)"
+    fi
+  else
+    echo "  (gc-sling intercept log not yet created)"
+  fi
+  echo
+
+  # ---- Epic-review sweeper findings ------------------------------------
+  echo "## epic-review-sweeper findings"
+  if [[ -f "$EPIC_REVIEW_LOG" ]]; then
+    epic_events=$(jq -r --argjson cutoff "$CUTOFF_EPOCH" '
+      select((.ts | sub("\\.[0-9]+"; "") | fromdateiso8601) >= $cutoff) |
+      [.event, .rule, .epic, (.pass_count // 0 | tostring)] | @tsv
+    ' "$EPIC_REVIEW_LOG" 2>/dev/null || true)
+    if [[ -n "$epic_events" ]]; then
+      dispatched=$(grep -c $'^dispatched\t' <<<"$epic_events")
+      ready=$(grep -c $'^ready\t' <<<"$epic_events")
+      mailed=$(grep -c $'^mailed_human\t' <<<"$epic_events")
+      failed=$(grep -c $'^dispatch_failed\t' <<<"$epic_events")
+      printf '  Epic reviews dispatched: %s   Ready (no-op dry runs): %s   Stuck-mails to human: %s   Dispatch failed: %s\n' \
+        "$dispatched" "$ready" "$mailed" "$failed"
+      if (( mailed >= 1 )); then
+        echo "  ⚠ One or more epics hit max_passes and mailed the human."
+        echo "     Investigate: bd show the epic, decide whether to reset review_pass_count,"
+        echo "     close manually with evidence, or rescope."
+      fi
+      if (( failed >= 3 )); then
+        echo "  ⚠ Sustained dispatch failures — check that the reviewer agent session is healthy"
+        echo "     and gc sling is working in this workspace."
+      fi
+    else
+      echo "  (no sweeper events in window)"
+    fi
+  else
+    echo "  (epic-review-sweeper log not yet created)"
+  fi
+  echo
+
+  # ---- Stale orders ----------------------------------------------------
+  echo "## Stale orders (check for disable candidates)"
+  orders_dir="$CITY/orders"
+  stale_found=0
+  formula_pool_stale=0
+  if [[ -d "$orders_dir" ]]; then
+    for order_file in "$orders_dir"/*.toml; do
+      [[ -f "$order_file" ]] || continue
+      name=$(basename "$order_file" .toml)
+      # Skip the miner itself
+      [[ "$name" == "mayor-pattern-miner" ]] && continue
+
+      # Signal: hasn't fired within interval × 2
+      # (We deliberately do NOT flag `gate =` syntax — `beads-health` uses it
+      #  and fires every 30s reliably; gate/trigger are interchangeable for
+      #  exec-based orders.)
+      interval=$(grep -oE 'interval[[:space:]]*=[[:space:]]*"[^"]*"' "$order_file" 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+      if [[ -z "$interval" ]]; then
+        continue   # event-triggered or one-shot — no interval to check
+      fi
+
+      # Parse interval — supports 24h, 1h, 30m, 5m, 1d (basic units only)
+      unit="${interval: -1}"
+      value="${interval%?}"
+      case "$unit" in
+        s) interval_sec=$value ;;
+        m) interval_sec=$(( value * 60 )) ;;
+        h) interval_sec=$(( value * 3600 )) ;;
+        d) interval_sec=$(( value * 86400 )) ;;
+        *) continue ;;   # unknown unit — skip
+      esac
+      threshold_sec=$(( interval_sec * 2 ))
+
+      # Detect shape — formula+pool orders broke around 2026-04-19 (see
+      # upstream issue link in repository memory). Flag the shape so the
+      # mayor knows whether to disable vs investigate.
+      is_formula_pool=0
+      if grep -qE '^[[:space:]]*formula[[:space:]]*=' "$order_file" 2>/dev/null \
+         && grep -qE '^[[:space:]]*pool[[:space:]]*=' "$order_file" 2>/dev/null; then
+        is_formula_pool=1
+      fi
+
+      # Last firing — gc order history returns lines like:
+      # ORDER NAME    BEAD       EXECUTED
+      # We want the most recent EXECUTED timestamp
+      last_exec=$(gc order history "$name" 2>/dev/null | grep -oE '20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:+-]+' | head -1)
+      if [[ -z "$last_exec" ]]; then
+        # Never fired AND order has an interval — flag
+        echo "  ⚠ $name — interval=$interval but no firing history"
+        if (( is_formula_pool )); then
+          echo "    → formula+pool shape; possibly hit by the 2026-04 supervisor regression on formula-dispatched orders"
+          formula_pool_stale=$((formula_pool_stale + 1))
+        else
+          echo "    → either newly added (check) or never picked up by supervisor"
+        fi
+        stale_found=$((stale_found + 1))
+        continue
+      fi
+
+      last_epoch=$(date -d "$last_exec" +%s 2>/dev/null || echo 0)
+      age_sec=$(( NOW_EPOCH - last_epoch ))
+      if (( age_sec > threshold_sec )); then
+        age_days=$(( age_sec / 86400 ))
+        echo "  ⚠ $name — interval=$interval, last fired ${age_days}d ago (>2× interval)"
+        if (( is_formula_pool )); then
+          echo "    → formula+pool shape; matches the 2026-04 supervisor regression"
+          echo "    → either convert to exec-based, or disable until regression fixed upstream"
+          formula_pool_stale=$((formula_pool_stale + 1))
+        else
+          echo "    → target work may be complete; verify and disable if vestigial"
+        fi
+        stale_found=$((stale_found + 1))
+      fi
+    done
+
+    if (( stale_found == 0 )); then
+      echo "  (no stale orders detected)"
+    else
+      echo
+      echo "  Disable recipe: mv $orders_dir/<name>.toml $orders_dir/<name>.toml.disabled"
+      echo "  Preserves the file for resurrection; removes from active schedule."
+      if (( formula_pool_stale > 0 )); then
+        echo
+        echo "  ⚠ ${formula_pool_stale}× formula+pool-shaped stale order(s) detected — this is the"
+        echo "    silent-breakage class. Check the upstream issue tracking the supervisor regression"
+        echo "    before re-enabling; rewriting as exec-based is the safe interim."
+      fi
+    fi
+  else
+    echo "  (orders dir missing)"
+  fi
+  echo
+
+  # ---- Recurring stalled beads -----------------------------------------
+  echo "## Recurring stalled beads (appeared stalled across multiple sweeps)"
+  recurring=$(journalctl --user -u mayor-health-surfacer.service \
+    --since "$SINCE" --no-pager 2>/dev/null \
+    | grep -oE '[a-zA-Z][a-zA-Z0-9_-]+\s+[a-zA-Z_]+-[a-z0-9.]+\s+[0-9]+h' \
+    | awk '{print $2}' | sort | uniq -c | sort -rn | awk '$1 >= 2' | head -10)
+  if [[ -n "$recurring" ]]; then
+    echo "$recurring" | while read -r count id; do
+      printf '  %s× %s\n' "$count" "$id"
+    done
+    echo "  → Investigate root cause: are these awaiting human input, blocked, or genuinely abandoned?"
+  else
+    echo "  (none)"
+  fi
+  echo
+
+  echo "================================================================"
+  echo "Action prompt: review patterns marked ⚠ for potential upstream"
+  echo "issues. File against gastownhall/gascity using the sanitization"
+  echo "rules from feedback_sanitize_issues.md."
+} > "$out"
+
+cat "$out"
+
+if (( NUDGE_MAYOR )); then
+  msg="mayor-pattern-miner weekly digest
+
+$(cat "$out")
+
+Action: review ⚠ patterns and decide if any warrant an upstream issue.
+Surface a digest read to stephanie at next interaction (no need to wait
+on each item — just point her at this report)."
+  gc session nudge mayor "$msg" 2>/dev/null || \
+    echo "warn: nudge failed (mayor asleep); digest in journal" >&2
+fi
+
+exit 0

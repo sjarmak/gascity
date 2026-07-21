@@ -1,0 +1,15 @@
+# issue-merge-watcher — issue-hygiene piece 2 (mayor gc-429253). Reconciles the
+# human-verified covered-map (issue -> PR): when a mapped PR MERGES, its issue can
+# be closed (the repo's native auto-close misses fixes merged without a Closes
+# keyword — 17 such in the 2026-06 triage). Deterministic only: the sole signal is
+# "mapped PR merged"; never a heuristic or time-based close. Idempotent.
+#
+# LANDED IN DRY-RUN + nudge-mayor: reports merged-but-open candidates, does NOT
+# close. The go-live toggle is appending `--apply` to exec (the sanctioned
+# deterministic auto-close) — a maintainer call, not auto-enabled on first landing.
+[order]
+description = "Every 6h: FEED the covered-map from reviewer covers_issue judgments (issue-covered-map-feeder), then close any covered issue whose mapped PR has MERGED (issue-merge-watcher). The feeder ingests reviewer-emitted PR->issue coverage (ZFC: model judges, map acts); the watcher closes ONLY on the deterministic merge signal. Never time-closes. Audited."
+trigger = "cron"
+schedule = "0 */6 * * *"
+exec = "/bin/sh -c '/home/ds/gas-city/bin/issue-covered-map-feeder --apply && /home/ds/gas-city/bin/issue-merge-watcher --apply --nudge-mayor'"
+timeout = "5m"

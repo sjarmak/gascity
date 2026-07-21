@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# Standalone test for pool-liveness-sensor detection logic (dr-t4w0).
+#
+# The whole point of this bead: the sensor must tell a real corpse pool apart
+# from a busy-but-quiet worker, verified BY EXECUTION against both cases. A
+# sensor that pages on healthy work is worse than nothing. So this suite drives
+# the detection through fixtures (session list + per-rig claims + rig names +
+# per-tick peek output) and asserts mail is sent ONLY for a genuine deadlock.
+#
+# Liveness model under test: a worker with a FRESH cheap signal (last_active or
+# work_dir mtime) is ADVANCING with no peek. A worker with all cheap signals
+# stale is a SUSPECT and is judged by a PEEK-DIFF across ticks — output that
+# MOVES ⇒ alive; output FROZEN for MIN_STALE_PEEK_TICKS consecutive matches ⇒
+# STALLED. A pool flags iff ≥1 pinned worker, NO worker advancing, and EVERY
+# pinned worker confirmed STALLED. Assignee join is '{template_basename}-{id}'
+# (verified against live rig stores).
+#
+# Asserts:
+#   1. corpse pool (all pinned, cheap-stale, peek frozen) -> ONE deadlock mail
+#      (only after the peek debounce; first tick must NOT flag)
+#   2. same corpse re-scanned                     -> suppressed (persist, no mail)
+#   3. fresh last_active worker                    -> NO mail (cheap fast-path veto)
+#   4. fresh work_dir mtime, stale last_active     -> NO mail (OR-corroborator)
+#   5. busy-but-quiet worker, peek MOVING          -> NO mail (the brpa3 case)
+#   6. unpinned-STALE worker present               -> still flags (not an escape valve)
+#   7. unpinned-FRESH worker present               -> NO mail (can claim fresh work)
+#   8. no pinned workers (idle-stale warm pool)    -> NO mail (nudger's job, not a deadlock)
+#   9. recovered pool (peek moves again)           -> ONE resolved mail
+#  10. rig cannot be resolved                      -> skipped loudly, NO mail, no crash
+#  11. wrong assignee shape (bare id)              -> NOT pinned -> NO mail (join guard)
+#  16. stable Claude ready-input prompt             -> NO mail (responsive, not corpse)
+#
+# Run:  bash /home/ds/gas-city/bin/pool-liveness-sensor.test
+
+set -uo pipefail
+
+SENSOR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pool-liveness-sensor"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+STATE="$WORK/state.json"
+MAIL_LOG="$WORK/mail.log"
+SCAN_LOG="$WORK/scan.jsonl"
+RIGS="$WORK/rigs.json"; echo '["memtest"]' > "$RIGS"
+PEEKDIR="$WORK/peeks"; mkdir -p "$PEEKDIR"
+
+TMPL="/home/ds/projects/memtest/memtest-worker"   # basename memtest-worker
+FRESH_TS=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(seconds=60)).isoformat(timespec='seconds'))")
+STALE_TS=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(seconds=100000)).isoformat(timespec='seconds'))")
+
+FRESHDIR="$WORK/wd_fresh"; mkdir -p "$FRESHDIR"; : > "$FRESHDIR/f"; touch "$FRESHDIR/f"
+NODIR="$WORK/wd_missing"
+
+STUB="$WORK/stubbin"; mkdir -p "$STUB"
+cat > "$STUB/gc" <<'STUBEOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "mail send")
+    # Simulate a mail failure while $MAIL_FAIL points at an existing file.
+    if [ -n "${MAIL_FAIL:-}" ] && [ -f "$MAIL_FAIL" ]; then
+      echo "mailbox unreachable" >&2; exit 1
+    fi
+    printf '%s' "$*" | tr '\n' '~' >> "$MAIL_LOG"; printf '\n' >> "$MAIL_LOG" ;;
+  *) exit 0 ;;
+esac
+exit 0
+STUBEOF
+chmod +x "$STUB/gc"
+
+mk_sessions() { local out=$1; shift
+  { printf '{"sessions":['; local first=1
+    for w in "$@"; do [ $first -eq 1 ] && first=0 || printf ','; printf '%s' "$w"; done
+    printf ']}'; } > "$out"; }
+wk() {  # wk <id> <last_active> <work_dir>
+  printf '{"id":"%s","state":"active","alias":"%s","name":"%s","template":"%s","last_active":"%s","work_dir":"%s"}' \
+    "$1" "$1" "$1" "$TMPL" "$2" "$3"; }
+# claim handle = memtest-worker-<id>
+claims() {  # claims <file> <assignee>...
+  local out=$1; shift
+  { printf '{"memtest":['; local first=1
+    for a in "$@"; do [ $first -eq 1 ] && first=0 || printf ','
+      printf '{"id":"b-%s","assignee":"%s","status":"in_progress"}' "$a" "$a"; done
+    printf ']}'; } > "$out"; }
+setpeek() { printf '%s\n' "$2" > "$PEEKDIR/$1.peek"; }   # setpeek <id> <content>
+
+run() {  # run <sessions> <claims>  (MIN_STALE_PEEK_TICKS=1 unless MIN overridden)
+  PATH="$STUB:$PATH" MAIL_LOG="$MAIL_LOG" MAIL_FAIL="${MAIL_FAIL:-}" \
+  POOL_LIVENESS_SESSIONS_FIXTURE="$1" POOL_LIVENESS_CLAIMS_FIXTURE="$2" \
+  POOL_LIVENESS_RIGS_FIXTURE="${RIGS_OVERRIDE:-$RIGS}" POOL_LIVENESS_PEEK_DIR="$PEEKDIR" \
+  STATE_PATH="$STATE" LOG_PATH="$SCAN_LOG" MIN_STALE_PEEK_TICKS="${MIN:-1}" \
+  python3 "$SENSOR" >/dev/null 2>&1
+}
+mails() { [ -f "$MAIL_LOG" ] && wc -l < "$MAIL_LOG" || echo 0; }
+FAILED=0
+check() { if [ "$2" = "$3" ]; then echo "PASS: $1"; else echo "FAIL: $1 (exp=$2 act=$3)"; FAILED=1; fi; }
+reset() { rm -f "$STATE" "$MAIL_LOG"; rm -f "$PEEKDIR"/*.peek 2>/dev/null; }
+
+# --- 1. corpse pool: both pinned, cheap-stale, peek FROZEN -> flag after debounce
+reset
+S="$WORK/s1.json"; mk_sessions "$S" "$(wk w1 "$STALE_TS" "$NODIR")" "$(wk w2 "$STALE_TS" "$NODIR")"
+C="$WORK/c1.json"; claims "$C" memtest-worker-w1 memtest-worker-w2
+setpeek w1 "frozen-prompt-1"; setpeek w2 "frozen-prompt-2"
+run "$S" "$C"                       # tick1: baseline UNKNOWN -> must NOT flag
+check "corpse tick1 does not flag (peek baseline)" 0 "$(mails)"
+run "$S" "$C"                       # tick2: peek still frozen -> STALLED -> flag
+check "corpse tick2 flags (one mail)" 1 "$(mails)"
+grep -qi "DEADLOCK" "$MAIL_LOG" && echo "PASS: mail says DEADLOCK" || { echo "FAIL: not a deadlock mail"; FAILED=1; }
+
+# --- 2. persistent corpse suppressed -----------------------------------------
+run "$S" "$C"
+check "persistent corpse suppressed" 1 "$(mails)"
+
+# --- 3. fresh last_active -> cheap veto, NO mail -----------------------------
+reset
+S="$WORK/s3.json"; mk_sessions "$S" "$(wk w1 "$FRESH_TS" "$NODIR")" "$(wk w2 "$STALE_TS" "$NODIR")"
+C="$WORK/c3.json"; claims "$C" memtest-worker-w1 memtest-worker-w2
+setpeek w2 "frozen"
+run "$S" "$C"; run "$S" "$C"
+check "fresh last_active -> not flagged" 0 "$(mails)"
+
+# --- 4. fresh work_dir mtime, stale last_active -> NO mail --------------------
+reset
+S="$WORK/s4.json"; mk_sessions "$S" "$(wk w1 "$STALE_TS" "$FRESHDIR")" "$(wk w2 "$STALE_TS" "$NODIR")"
+C="$WORK/c4.json"; claims "$C" memtest-worker-w1 memtest-worker-w2
+setpeek w2 "frozen"
+run "$S" "$C"; run "$S" "$C"
+check "fresh work_dir mtime -> not flagged" 0 "$(mails)"
+
+# --- 5. busy-but-quiet worker: cheap-stale but peek MOVING -> NO mail (brpa3) -
+reset
+S="$WORK/s5.json"; mk_sessions "$S" "$(wk w1 "$STALE_TS" "$NODIR")" "$(wk w2 "$STALE_TS" "$NODIR")"
+C="$WORK/c5.json"; claims "$C" memtest-worker-w1 memtest-worker-w2
+setpeek w1 "batch-1-of-16"; setpeek w2 "frozen"
+run "$S" "$C"                       # baseline
+setpeek w1 "batch-7-of-16"          # w1 output MOVED
+run "$S" "$C"
+check "moving peek (16-subagent) -> not flagged" 0 "$(mails)"
+
+# --- 6. unpinned-STALE worker present -> still flags (not an escape valve) ----
+reset
+S="$WORK/s6.json"; mk_sessions "$S" "$(wk w1 "$STALE_TS" "$NODIR")" "$(wk w2 "$STALE_TS" "$NODIR")"
+C="$WORK/c6.json"; claims "$C" memtest-worker-w1     # only w1 pinned; w2 unpinned+stale
+setpeek w1 "frozen1"; setpeek w2 "frozen2"
+run "$S" "$C"; run "$S" "$C"
+check "unpinned-stale worker does not rescue -> flags" 1 "$(mails)"
+
+# --- 7. unpinned-FRESH worker present -> NO mail (can claim fresh) ------------
+reset
+S="$WORK/s7.json"; mk_sessions "$S" "$(wk w1 "$STALE_TS" "$NODIR")" "$(wk w2 "$FRESH_TS" "$NODIR")"
+C="$WORK/c7.json"; claims "$C" memtest-worker-w1     # w1 pinned-corpse; w2 free+fresh
+setpeek w1 "frozen"
+run "$S" "$C"; run "$S" "$C"
+check "unpinned-fresh worker vetoes -> not flagged" 0 "$(mails)"
+
+# --- 8. no pinned workers (idle-stale warm pool) -> NO mail -------------------
+reset
+S="$WORK/s8.json"; mk_sessions "$S" "$(wk w1 "$STALE_TS" "$NODIR")" "$(wk w2 "$STALE_TS" "$NODIR")"
+C="$WORK/c8.json"; claims "$C"     # no claims at all
+setpeek w1 "frozen"; setpeek w2 "frozen"
+run "$S" "$C"; run "$S" "$C"
+check "no pins (idle warm pool) -> not flagged" 0 "$(mails)"
+
+# --- 9. recovered pool: flagged, then peek MOVES -> one resolved mail ---------
+reset
+S="$WORK/s9.json"; mk_sessions "$S" "$(wk w1 "$STALE_TS" "$NODIR")" "$(wk w2 "$STALE_TS" "$NODIR")"
+C="$WORK/c9.json"; claims "$C" memtest-worker-w1 memtest-worker-w2
+setpeek w1 "frozen"; setpeek w2 "frozen"
+run "$S" "$C"; run "$S" "$C"        # flag it
+check "recovered: initial flag" 1 "$(mails)"
+setpeek w1 "now-moving-again"       # w1 comes alive
+run "$S" "$C"
+check "recovered: resolved mail" 2 "$(mails)"
+grep -qi "resolved" "$MAIL_LOG" && echo "PASS: resolution mail says resolved" || { echo "FAIL: no resolved mail"; FAILED=1; }
+
+# --- 10. rig unresolvable -> loud skip, no mail, no crash --------------------
+reset
+RIGS_OVERRIDE="$WORK/rigs_other.json"; echo '["some-other-rig"]' > "$RIGS_OVERRIDE"
+S="$WORK/s10.json"; mk_sessions "$S" "$(wk w1 "$STALE_TS" "$NODIR")" "$(wk w2 "$STALE_TS" "$NODIR")"
+C="$WORK/c10.json"; claims "$C" memtest-worker-w1 memtest-worker-w2
+setpeek w1 "frozen"; setpeek w2 "frozen"
+run "$S" "$C"; rc1=$?; run "$S" "$C"; rc2=$?
+check "unresolved rig exits 0" 0 "$rc2"
+check "unresolved rig -> no mail" 0 "$(mails)"
+grep -q "rig-unresolved" "$SCAN_LOG" && echo "PASS: rig-unresolved logged loud" || { echo "FAIL: rig-unresolved not logged"; FAILED=1; }
+unset RIGS_OVERRIDE
+
+# --- 11. wrong assignee shape (bare id) -> NOT pinned -> NO mail --------------
+reset
+S="$WORK/s11.json"; mk_sessions "$S" "$(wk w1 "$STALE_TS" "$NODIR")" "$(wk w2 "$STALE_TS" "$NODIR")"
+C="$WORK/c11.json"; claims "$C" w1 w2      # bare id, NOT memtest-worker-w1
+setpeek w1 "frozen"; setpeek w2 "frozen"
+run "$S" "$C"; run "$S" "$C"
+check "bare-id assignee does not pin -> not flagged" 0 "$(mails)"
+
+# --- 12. CamelCase pool dir vs lowercase rig name -> resolves and flags -------
+# The canonical case: /home/ds/projects/EnterpriseBench/enterprisebench-worker
+# against rig 'enterprisebench'. An exact (case-sensitive) match would silently
+# fail to resolve THE rig this sensor exists for.
+reset
+RIGS_OVERRIDE="$WORK/rigs_lc.json"; echo '["enterprisebench"]' > "$RIGS_OVERRIDE"
+CTMPL="/home/ds/projects/EnterpriseBench/enterprisebench-worker"
+S="$WORK/s12.json"
+mk_sessions "$S" \
+  "$(printf '{"id":"e1","state":"active","alias":"e1","name":"e1","template":"%s","last_active":"%s","work_dir":"%s"}' "$CTMPL" "$STALE_TS" "$NODIR")" \
+  "$(printf '{"id":"e2","state":"active","alias":"e2","name":"e2","template":"%s","last_active":"%s","work_dir":"%s"}' "$CTMPL" "$STALE_TS" "$NODIR")"
+# claim handle = enterprisebench-worker-<id>; claims live under rig key 'enterprisebench'
+C="$WORK/c12.json"
+printf '{"enterprisebench":[{"id":"b1","assignee":"enterprisebench-worker-e1","status":"in_progress"},{"id":"b2","assignee":"enterprisebench-worker-e2","status":"open"}]}' > "$C"
+setpeek e1 "frozen"; setpeek e2 "frozen"
+run "$S" "$C"; run "$S" "$C"
+check "CamelCase pool dir resolves lowercase rig -> flags" 1 "$(mails)"
+unset RIGS_OVERRIDE
+
+# --- 13. default MIN_STALE_PEEK_TICKS=2 debounce (baseline + 2 matches) -------
+# The shipped default is 2; the cases above force 1. Prove the extra tick.
+reset
+S="$WORK/s13.json"; mk_sessions "$S" "$(wk w1 "$STALE_TS" "$NODIR")" "$(wk w2 "$STALE_TS" "$NODIR")"
+C="$WORK/c13.json"; claims "$C" memtest-worker-w1 memtest-worker-w2
+setpeek w1 "frozen"; setpeek w2 "frozen"
+MIN=2 run "$S" "$C"; check "MIN=2 tick1 (baseline) no flag" 0 "$(mails)"
+MIN=2 run "$S" "$C"; check "MIN=2 tick2 (match#1) no flag" 0 "$(mails)"
+MIN=2 run "$S" "$C"; check "MIN=2 tick3 (match#2) flags" 1 "$(mails)"
+
+# --- 14. transient peek failure mid-flag -> carry, NO false 'resolved' (C2) ---
+reset
+S="$WORK/s14.json"; mk_sessions "$S" "$(wk w1 "$STALE_TS" "$NODIR")" "$(wk w2 "$STALE_TS" "$NODIR")"
+C="$WORK/c14.json"; claims "$C" memtest-worker-w1 memtest-worker-w2
+setpeek w1 "frozen"; setpeek w2 "frozen"
+run "$S" "$C"; run "$S" "$C"                 # flag it (MIN=1 default)
+check "C2: flagged" 1 "$(mails)"
+rm -f "$PEEKDIR"/w1.peek "$PEEKDIR"/w2.peek   # peek now fails (returns None -> UNKNOWN)
+run "$S" "$C"
+check "C2: peek-failure tick sends NO resolved mail" 1 "$(mails)"
+grep -qi "resolved" "$MAIL_LOG" && { echo "FAIL: false resolved on peek failure"; FAILED=1; } || echo "PASS: no false resolved on transient peek failure"
+setpeek w1 "moving-now"; setpeek w2 "frozen"  # w1 genuinely recovers
+run "$S" "$C"
+check "C2: genuine recovery resolves (one resolved mail)" 2 "$(mails)"
+
+# --- 15. failed alert mail is retried next tick, not lost forever (C1) --------
+reset
+FAILWD="$WORK/failflag"; : > "$FAILWD"      # mail fails while this file exists
+S="$WORK/s15.json"; mk_sessions "$S" "$(wk w1 "$STALE_TS" "$NODIR")" "$(wk w2 "$STALE_TS" "$NODIR")"
+C="$WORK/c15.json"; claims "$C" memtest-worker-w1 memtest-worker-w2
+setpeek w1 "frozen"; setpeek w2 "frozen"
+MAIL_FAIL="$FAILWD" run "$S" "$C"; MAIL_FAIL="$FAILWD" run "$S" "$C"   # deadlock, but mail fails
+check "C1: failed alert recorded nothing delivered" 0 "$(mails)"
+rm -f "$FAILWD"                              # mail works again
+run "$S" "$C"
+check "C1: alert retried and delivered next tick" 1 "$(mails)"
+
+# --- 16. stable Claude ready-input prompt is responsive, not a corpse --------
+# This is the codeprobe false-positive shape: completed/current-work prose plus
+# an unchanged input prompt and active TUI footer. Hash stability must not turn
+# a worker coherently waiting for its next instruction into a frozen corpse.
+reset
+S="$WORK/s16.json"; mk_sessions "$S" "$(wk w1 "$STALE_TS" "$NODIR")" "$(wk w2 "$STALE_TS" "$NODIR")"
+C="$WORK/c16.json"; claims "$C" memtest-worker-w1 memtest-worker-w2
+setpeek w1 $'Current work remains assigned and coherent.\n\n❯ go ahead\n  memtest:main | Opus | ctx: 7%\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents'
+setpeek w2 $'Landing checks passed; waiting at the landing gate.\n\n❯ land it on main with --ff-only\n  memtest:main | Opus | ctx: 8%\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents'
+run "$S" "$C"; run "$S" "$C"; run "$S" "$C"
+check "stable ready-input prompts -> not flagged" 0 "$(mails)"
+if grep -q '"verdict": "RESPONSIVE"' "$SCAN_LOG"; then
+  echo "PASS: ready-input workers classified RESPONSIVE"
+else
+  echo "FAIL: ready-input workers not classified RESPONSIVE"; FAILED=1
+fi
+
+if [ "$FAILED" -eq 0 ]; then echo "ALL PASS"; exit 0; fi
+echo "SUITE FAILED"; exit 1

@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# memory-audit-issues: detect stale external issue/PR refs in workspace memory.
+#
+# Scans CLAUDE.md and the mayor's memory directory for GitHub issue/PR refs
+# (format: owner/repo#NNN or github.com/owner/repo/{issues,pull}/NNN), queries
+# their current state via `gh`, and flags refs that are closed/merged when the
+# memory entry still treats them as active.
+#
+# State is tracked in ~/.gc/memory-audit-state.json so repeat runs only flag
+# changes since the last run (or newly-discovered stale refs).
+#
+# Usage:
+#   memory-audit-issues                 # print report, exit 0 (even if findings)
+#   memory-audit-issues --nudge-mayor   # send mail to mayor when findings
+#   memory-audit-issues --force         # re-flag even if state unchanged
+
+set -euo pipefail
+
+NUDGE_MAYOR=0
+FORCE=0
+SCAN_PATHS=(
+  "/home/ds/gas-city/CLAUDE.md"
+  "/home/ds/.claude-homes/account1/.claude/projects/-home-ds-gas-city/memory"
+)
+STATE_FILE="${HOME}/.gc/memory-audit-state.json"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --nudge-mayor) NUDGE_MAYOR=1; shift ;;
+    --force)       FORCE=1; shift ;;
+    -h|--help)
+      sed -n 's/^# \{0,1\}//p' "$0" | head -20
+      exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$(dirname "$STATE_FILE")"
+[[ -f "$STATE_FILE" ]] || echo '{"refs":{}}' > "$STATE_FILE"
+
+# --- extract refs: "owner/repo#N" -> "owner/repo N" one per line ------------
+extract_refs() {
+  local targets=()
+  for p in "${SCAN_PATHS[@]}"; do
+    [[ -e "$p" ]] && targets+=("$p")
+  done
+  [[ ${#targets[@]} -eq 0 ]] && return 0
+
+  # Short form: owner/repo#NNN. Owner/repo must look like a GH slug.
+  grep -rhoE '[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+#[0-9]+' \
+    "${targets[@]}" 2>/dev/null \
+    | sed -E 's|#| |' \
+    || true
+
+  # URL form: github.com/owner/repo/{issues,pull}/NNN
+  grep -rhoE 'github\.com/[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+/(issues|pull)/[0-9]+' \
+    "${targets[@]}" 2>/dev/null \
+    | sed -E 's|github\.com/([^/]+)/([^/]+)/(issues\|pull)/([0-9]+)|\1/\2 \4|' \
+    || true
+}
+
+# --- fetch state from gh; returns "<state>|<state_reason>|<kind>" ------------
+# kind is "pr" or "issue"; state_reason is "merged" for merged PRs.
+fetch_ref_state() {
+  local slug=$1 num=$2
+  # issues endpoint covers both issues and PRs.
+  local json
+  json=$(gh api "repos/${slug}/issues/${num}" --jq '{state: .state, state_reason: (.state_reason // ""), is_pr: (.pull_request != null)}' 2>/dev/null) || {
+    echo "unknown||unknown"
+    return 0
+  }
+  local state state_reason is_pr
+  state=$(echo "$json" | jq -r .state)
+  state_reason=$(echo "$json" | jq -r .state_reason)
+  is_pr=$(echo "$json" | jq -r .is_pr)
+
+  # Distinguish merged PRs.
+  if [[ "$is_pr" == "true" && "$state" == "closed" ]]; then
+    local merged
+    merged=$(gh api "repos/${slug}/pulls/${num}" --jq .merged 2>/dev/null || echo "false")
+    [[ "$merged" == "true" ]] && state_reason="merged"
+    echo "${state}|${state_reason}|pr"
+  else
+    local kind=issue
+    [[ "$is_pr" == "true" ]] && kind=pr
+    echo "${state}|${state_reason}|${kind}"
+  fi
+}
+
+# --- main loop ---------------------------------------------------------------
+tmp_state=$(mktemp)
+trap 'rm -f "$tmp_state"' EXIT
+echo '{"refs":{}}' > "$tmp_state"
+
+findings=()
+
+# Build a unique list of refs first
+declare -A seen=()
+while read -r slug num; do
+  [[ -z "${slug:-}" ]] && continue
+  key="${slug}#${num}"
+  [[ -n "${seen[$key]:-}" ]] && continue
+  seen[$key]=1
+
+  triple=$(fetch_ref_state "$slug" "$num")
+  state=${triple%%|*}; rest=${triple#*|}
+  reason=${rest%%|*}; kind=${rest#*|}
+
+  prev_state=$(jq -r --arg k "$key" '.refs[$k].state // ""' "$STATE_FILE")
+  prev_reason=$(jq -r --arg k "$key" '.refs[$k].state_reason // ""' "$STATE_FILE")
+
+  # Record new state
+  jq --arg k "$key" --arg s "$state" --arg r "$reason" --arg kd "$kind" \
+     --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     '.refs[$k] = {state:$s, state_reason:$r, kind:$kd, last_checked:$t}' \
+     "$tmp_state" > "$tmp_state.new" && mv "$tmp_state.new" "$tmp_state"
+
+  # Flag logic:
+  # - unknown state (network/auth): skip
+  # - open or in-progress states: skip
+  # - closed/merged and (first-seen OR state changed OR --force): flag
+  case "$state" in
+    unknown|open) continue ;;
+    closed)
+      if [[ "$FORCE" -eq 1 ]] || [[ "$prev_state" != "closed" ]] || [[ "$prev_reason" != "$reason" ]]; then
+        label="$state"
+        [[ -n "$reason" ]] && label="$state/$reason"
+        # Which file(s) mention this ref
+        files=$(grep -rlE "(${slug}#${num}|github\.com/${slug}/(issues|pull)/${num})" \
+          "${SCAN_PATHS[@]}" 2>/dev/null | sed "s|^|    - |" || true)
+        findings+=( "  - ${slug}#${num} [${kind}] → ${label}"$'\n'"${files}" )
+      fi
+      ;;
+  esac
+done < <(extract_refs)
+
+# Persist state (merge tmp into STATE_FILE; tmp has only scanned refs,
+# but we keep history for refs that disappeared from source — they may come back)
+jq -s '.[0].refs * .[1].refs | {refs: .}' "$STATE_FILE" "$tmp_state" > "${STATE_FILE}.new"
+mv "${STATE_FILE}.new" "$STATE_FILE"
+
+# --- output ------------------------------------------------------------------
+if [[ ${#findings[@]} -eq 0 ]]; then
+  echo "memory-audit-issues: no stale refs detected ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+  exit 0
+fi
+
+{
+  echo "memory-audit-issues: stale external refs detected in workspace memory"
+  echo ""
+  echo "These refs are closed/merged upstream. Memory entries that treat them as"
+  echo "active may be outdated. Review and prune."
+  echo ""
+  for f in "${findings[@]}"; do
+    echo "$f"
+  done
+} | tee /tmp/memory-audit-issues.last.txt
+
+if [[ "$NUDGE_MAYOR" -eq 1 ]]; then
+  body=$(cat /tmp/memory-audit-issues.last.txt)
+  gc mail send mayor -s "MEMORY AUDIT: stale refs in workspace memory" -m "$body" 2>&1 \
+    || echo "memory-audit-issues: mayor nudge failed (mayor asleep?) — report above" >&2
+fi
+
+exit 0

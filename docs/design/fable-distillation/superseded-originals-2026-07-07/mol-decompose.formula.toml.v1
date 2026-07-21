@@ -1,0 +1,203 @@
+description = """
+Decompose phase — read research and brainstorm findings from the convoy root
+bead, then create child work beads with acceptance criteria, review beads,
+and meta-review beads.
+
+This replaces the traditional PRD document. Each work unit becomes a bead
+with acceptance criteria in its description. Review and meta-review beads
+are created with dependency links so they auto-unblock in sequence:
+
+  work bead → (blocks) → review bead → (blocks) → meta-review bead
+
+Each work bead gets routing metadata:
+  - gc.routing=criteria-only → routed to Claude Opus (flexible implementation)
+  - gc.routing=prescriptive  → routed to Codex (exact implementation required)
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| issue    | caller | The convoy root bead (has research + brainstorm notes) |
+| rig      | caller | The rig name for creating child beads |
+"""
+formula = "mol-decompose"
+phase = "liquid"
+version = 1
+
+[vars]
+[vars.issue]
+description = "The convoy root bead ID (has research + brainstorm notes)"
+required = true
+
+[vars.rig]
+description = "The rig name (for bd prefix and routing)"
+required = true
+
+[[steps]]
+id = "decompose"
+title = "Create work beads with acceptance criteria and review chain"
+description = """
+You are decomposing a researched topic into implementable work units.
+
+**1. Read ALL accumulated context:**
+```bash
+bd show {{issue}}
+```
+
+The NOTES section contains:
+- Research findings (divergent perspectives, convergence decisions, premortem risks)
+- Brainstorm results (top candidates, selected direction)
+
+Read everything carefully. This is your ONLY input — there are no separate files.
+
+**2. Design the work breakdown:**
+
+Decompose the selected direction into 5-15 work units. For each unit, decide:
+
+a) **Acceptance criteria** — concrete, testable conditions. Each criterion must
+   be verifiable by running a command, checking an output, or observing a behavior.
+   "Works correctly" is NOT acceptable. "Running `pytest tests/` passes with 0
+   failures" IS acceptable.
+
+b) **Routing** — Is this task prescriptive (must be done exactly this way, specific
+   code to write, specific patterns to follow) or criteria-only (any implementation
+   that passes the acceptance criteria is fine)?
+   - Prescriptive → `gc.routing=prescriptive` (will be routed to Codex)
+   - Criteria-only → `gc.routing=criteria-only` (will be routed to Claude Opus)
+
+c) **Dependencies** — Which work units must complete before this one can start?
+
+d) **Scope** — Which files/modules will this unit touch?
+
+**3. Create the bead graph:**
+
+For EACH work unit, create three beads in this exact order:
+
+```bash
+# Create the work bead
+WORK_ID=$(bd create "<title>" \
+  --parent {{issue}} \
+  --description "<detailed description with context from research>" \
+  --acceptance "<criterion 1>
+<criterion 2>
+<criterion 3>" \
+  --metadata '{"gc.routing": "<prescriptive|criteria-only>", "gc.unit_type": "work", "gc.rig": "{{rig}}"}' \
+  --silent)
+
+echo "Created work bead: $WORK_ID"
+
+# Create the review bead (blocked by work bead)
+REVIEW_ID=$(bd create "Review: <title>" \
+  --parent {{issue}} \
+  --description "## Review of $WORK_ID
+
+Verify EVERY acceptance criterion on $WORK_ID is met. You did NOT write this code.
+
+**Procedure for each criterion:**
+1. READ: Find the code that implements it
+2. TEST: Run the verification command or check
+3. VERDICT: PASS or FAIL with evidence
+
+**Acceptance criteria to verify:**
+<copy exact criteria from work bead>
+
+**Also check:**
+- No extraneous changes outside the unit's scope
+- Code follows existing codebase conventions
+- No security issues (injection, auth, data exposure)
+
+Output a structured report:
+## Criterion Checklist
+- [criterion]: PASS/FAIL — evidence
+
+## Verdict
+PASS or FAIL with specific issues to fix" \
+  --metadata '{"gc.routing": "prescriptive", "gc.unit_type": "review", "gc.review_target": "'$WORK_ID'", "gc.rig": "{{rig}}"}' \
+  --deps "blocks:$WORK_ID" \
+  --silent)
+
+echo "Created review bead: $REVIEW_ID (blocked by $WORK_ID)"
+
+# Create the meta-review bead (blocked by review bead)
+META_ID=$(bd create "Meta-review: <title>" \
+  --parent {{issue}} \
+  --description "## Meta-review of $REVIEW_ID (reviewing $WORK_ID)
+
+You are reviewing THE REVIEW, not the code. Check:
+
+1. Did the reviewer actually test each criterion, or just read the code?
+2. Was evidence provided for each PASS verdict?
+3. Were any criteria skipped or hand-waved?
+4. Could a PASS verdict be a false positive?
+5. Is the review thorough enough to catch real issues?
+
+Read the review bead notes for the reviewer's report:
+```bash
+bd show $REVIEW_ID
+```
+
+Then check the actual code state yourself for at least 2 criteria.
+
+## Meta-Review Verdict
+PASS — review was thorough and accurate
+or
+FAIL — specific gaps in the review (reviewer must redo)" \
+  --metadata '{"gc.routing": "prescriptive", "gc.unit_type": "meta-review", "gc.review_target": "'$REVIEW_ID'", "gc.rig": "{{rig}}"}' \
+  --deps "blocks:$REVIEW_ID" \
+  --silent)
+
+echo "Created meta-review bead: $META_ID (blocked by $REVIEW_ID)"
+```
+
+**4. Handle dependencies between work units:**
+
+If work unit B depends on work unit A, add a dependency:
+```bash
+bd link $WORK_B_ID $WORK_A_ID  # A blocks B
+```
+
+**5. Record the decomposition summary:**
+
+```bash
+bd note {{issue}} --file /dev/stdin <<'NOTE'
+## Decomposition Complete
+
+### Work Units Created
+[List each work bead ID, title, routing, and dependency chain]
+
+### Dependency Graph
+[Show which units block which]
+
+### Routing Summary
+- Criteria-only (Claude Opus): [count] units
+- Prescriptive (Codex): [count] units
+- Reviews (Codex): [count] units
+- Meta-reviews (Codex): [count] units
+NOTE
+```
+
+**6. Update metadata and signal ready for dispatch:**
+```bash
+bd update {{issue}} --set-metadata phase=decompose_complete
+bd update {{issue}} --append-notes "Decomposition complete. $(date -Iseconds)"
+```
+
+**CRITICAL RULES:**
+- Every work bead MUST have testable acceptance criteria
+- Every work bead MUST have a review bead and meta-review bead
+- Review and meta-review beads are ALWAYS routed to Codex (prescriptive)
+- Do NOT close the root bead
+- Do NOT create beads without acceptance criteria"""
+
+[[steps]]
+id = "drain"
+title = "Signal completion"
+needs = ["decompose"]
+description = """
+Work is done. Signal the controller to reclaim this session:
+
+```bash
+gc runtime drain-ack
+```
+
+Run this command and nothing else."""

@@ -1,0 +1,98 @@
+description = """
+Research phase — run /research-project (diverge → converge → premortem) on a
+topic and capture all findings as bead notes rather than files.
+
+The output is a risk-annotated set of findings written directly to the convoy
+root bead. No separate PRD document is produced. The next phase (brainstorm
+or decompose) reads these notes as input.
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| issue    | caller | The convoy root bead — topic in title, context in description |
+| perspectives | caller | Number of divergent perspectives (default 3) |
+"""
+formula = "mol-research"
+phase = "liquid"
+version = 1
+
+[vars]
+[vars.issue]
+description = "The convoy root bead ID (topic in title, context in description)"
+required = true
+
+[vars.perspectives]
+description = "Number of divergent perspectives"
+default = "3"
+
+[[steps]]
+id = "research"
+title = "Run research-project pipeline"
+description = """
+You are conducting structured research on the topic described in bead {{issue}}.
+
+**1. Read the topic:**
+```bash
+bd show {{issue}}
+```
+
+The bead title is your research topic. The description has additional context.
+
+**2. Run the research-project pipeline:**
+
+Execute the full diverge → converge → premortem pipeline. Use {{perspectives}}
+perspectives for the diverge phase.
+
+/research-project
+
+When the skill asks for a topic, use the bead title and description.
+When it asks for number of perspectives, use {{perspectives}}.
+
+**3. Capture findings as bead notes:**
+
+After the pipeline completes, it will have produced research artifacts.
+Synthesize the key outputs into bead notes on {{issue}}:
+
+```bash
+bd note {{issue}} --file /dev/stdin <<'NOTE'
+## Research Findings
+
+### Divergent Perspectives
+[Summarize each perspective's key findings — keep the substance, not the format]
+
+### Convergence Decisions
+[List the decisions reached during structured debate]
+
+### Premortem Risks
+[List failure narratives with severity and likelihood]
+
+### Recommended Approach
+[The approach that survived convergence and premortem scrutiny]
+NOTE
+```
+
+Write ALL substantive findings to the bead. Future phases read ONLY the bead —
+files produced by the skill are ephemeral. If the research produced specific
+technical details, code patterns, or architecture decisions, include them.
+
+**4. Update bead metadata:**
+```bash
+bd update {{issue}} --set-metadata phase=research_complete
+bd update {{issue}} --append-notes "Research phase complete. $(date -Iseconds)"
+```
+
+Do NOT close the bead — it is the convoy root and will accumulate more notes."""
+
+[[steps]]
+id = "drain"
+title = "Signal completion"
+needs = ["research"]
+description = """
+Work is done. Signal the controller to reclaim this session:
+
+```bash
+gc runtime drain-ack
+```
+
+Run this command and nothing else."""
