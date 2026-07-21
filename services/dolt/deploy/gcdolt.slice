@@ -1,0 +1,58 @@
+[Unit]
+Description=Canonical Dolt sql-server (shared bead store) — isolated from the agent memcg
+Documentation=file://%h/gas-city/services/dolt/deploy/README.md
+
+# Added 2026-07-21 (bead gc-qaid). NOT YET INSTALLED — committed ahead of the
+# gc-side fix that places the server here; see "Undo / retire" below.
+#
+# Authority / evidence: four kernel memcg OOM kills of the canonical Dolt
+# server on 2026-07-21, at 09:28:56, 09:33:21, 09:42:00 and 09:49:05, each
+# logged by the kernel as
+#   oom-kill:constraint=CONSTRAINT_MEMCG,
+#   oom_memcg=/user.slice/user-1000.slice/user@1000.service/gascity.slice,
+#   task=dolt,... oom_score_adj:200
+# Counted directly from the kernel ring buffer, not from a summary:
+#   journalctl -k --since "2026-07-21 00:00" --until "2026-07-22 00:00" \
+#     | grep -cE 'Killed process .*\(dolt\)'   ->  4
+# Earlier prose about this incident circulated counts of 2, 3 and 5, and
+# referred to a 07:52 "global" dolt kill; the kernel log for that day records
+# no non-memcg dolt kill at all, so that one is not carried here. Each respawn
+# took a different port, desyncing the supervisor's hardcoded GC_DOLT_PORT pin
+# and opening the Dolt circuit breaker city-wide (51,155 breaker events in
+# ~/.gc/supervisor.log). Context: .gc-reports/city-audit-2026-07-21.md and
+# .gc-reports/reliability-evidence-2026-07-21.md (neither carries the per-kill
+# timestamps above; re-derive from the kernel log if they are ever disputed).
+#
+# Why a TOP-LEVEL slice and not "gascity-dolt.slice": systemd derives slice
+# nesting from the unit name, so "gascity-dolt.slice" would be a CHILD of
+# gascity.slice — the very cgroup whose 32G MemoryMax breach did the killing.
+# Nesting it there would not have prevented a single one of the kills above.
+# The kernel's memcg OOM killer only considers tasks inside the cgroup that hit
+# its limit, so the shared bead store for every rig has to sit outside it.
+#
+# Undo / retire: remove this unit and unset GC_DOLT_SLICE. Dolt then returns to
+# inheriting the cgroup of whichever process triggered auto-start, which is the
+# 2026-07-21 failure mode. Retire only if Dolt stops being a shared singleton.
+
+[Slice]
+# ~4x headroom over the measured working set: the four kills above caught the
+# server at 829,032-1,060,144 kB anon-rss (0.79-1.01 GiB), read from the same
+# kernel lines. A runaway Dolt dies alone here instead of
+# pushing user@1000 into pressure and taking the supervisor with it.
+MemoryMax=4G
+
+# Deliberately NO MemoryHigh. MemoryHigh throttles by reclaim rather than
+# killing, and this cgroup is anon-dominated with swap disabled — there is
+# nothing to reclaim, so the throttle spins. MemoryHigh=26G was set on
+# gascity.slice 2026-07-20 ~22:2x and reverted 2026-07-21 09:23 — the thrash
+# ran overnight, ~11h, not "the same morning": load 140-375 sustained,
+# pgscan_direct 1.88B, and load fell 375 -> 14 on the revert. See
+# reliability-evidence-2026-07-21.md section 0.1. Do not add it here.
+MemorySwapMax=0
+
+# Defense-in-depth ONLY, not the fix. ManagedOOMPreference steers systemd-oomd,
+# and oomd was not involved in any of the 2026-07-21 kills — `journalctl -u
+# systemd-oomd` for that day is empty; every kill was the kernel's memcg OOM
+# killer, which ignores this setting entirely. It is set so that if oomd ever
+# does start making decisions here, it prefers anything over the bead store.
+ManagedOOMPreference=avoid
