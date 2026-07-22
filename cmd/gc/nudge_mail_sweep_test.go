@@ -27,6 +27,14 @@ func nudgeSeed(id, nudgeID string, createdAt time.Time) beads.Bead {
 	}
 }
 
+// nudgeSeedWithExpiry is nudgeSeed with an explicit expires_at, for exercising
+// the queued-before-expiry retention guard (gastownhall/gascity#4299).
+func nudgeSeedWithExpiry(id, nudgeID string, createdAt, expiresAt time.Time) beads.Bead {
+	b := nudgeSeed(id, nudgeID, createdAt)
+	b.Metadata["expires_at"] = expiresAt.UTC().Format(time.RFC3339)
+	return b
+}
+
 // mailSeed builds a seed Bead for NewMemStoreFrom representing an open read mail bead.
 // id must be unique within the seed slice.
 func mailSeed(id string, createdAt time.Time) beads.Bead {
@@ -63,6 +71,46 @@ func TestSweepStaleNudgeMail_TTLBoundaries(t *testing.T) {
 	}
 	if result.MailClosed != 1 {
 		t.Errorf("MailClosed = %d, want 1", result.MailClosed)
+	}
+}
+
+func TestSweepStaleNudgeMail_QueuedNotSweptBeforeExpiry(t *testing.T) {
+	// #4299: a queued, undelivered nudge older than the short created_at retention
+	// TTL but well before its own 24h expires_at must NOT be swept — sweeping it
+	// destroys an undelivered human->agent notification. A queued nudge already
+	// past its own expiry is genuinely stale and still swept.
+	now := time.Date(2026, 7, 15, 6, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	seed := []beads.Bead{
+		// Past the TTL window, but expires 23h out -> must survive.
+		nudgeSeedWithExpiry("nudge-live", "nudge-live", now.Add(-nudgeTTL-time.Minute), now.Add(23*time.Hour)),
+		// Past the TTL window AND past its own expiry -> genuinely stale, sweep.
+		nudgeSeedWithExpiry("nudge-expired", "nudge-expired", now.Add(-25*time.Hour), now.Add(-time.Hour)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NudgeClosed != 1 {
+		t.Fatalf("NudgeClosed = %d, want 1 (only the expired nudge)", result.NudgeClosed)
+	}
+
+	liveBead, err := store.Get("nudge-live")
+	if err != nil {
+		t.Fatalf("get nudge-live: %v", err)
+	}
+	if liveBead.Status != "open" {
+		t.Errorf("nudge-live status = %q, want open (must not be swept before expiry)", liveBead.Status)
+	}
+	expiredBead, err := store.Get("nudge-expired")
+	if err != nil {
+		t.Fatalf("get nudge-expired: %v", err)
+	}
+	if expiredBead.Status != "closed" {
+		t.Errorf("nudge-expired status = %q, want closed (past its own expiry)", expiredBead.Status)
 	}
 }
 
@@ -348,8 +396,11 @@ func TestSweepStaleNudgeMail_NudgeTerminalMetadata(t *testing.T) {
 	if b.Metadata["terminal_at"] == "" {
 		t.Error("terminal_at should be set")
 	}
-	if b.Metadata["close_reason"] != nudgeMailSweepNudgeCloseReason {
-		t.Errorf("close_reason = %q, want %q", b.Metadata["close_reason"], nudgeMailSweepNudgeCloseReason)
+	if !strings.HasPrefix(b.Metadata["close_reason"], nudgeMailSweepNudgeCloseReason) {
+		t.Errorf("close_reason = %q, want prefix %q", b.Metadata["close_reason"], nudgeMailSweepNudgeCloseReason)
+	}
+	if !strings.Contains(b.Metadata["close_reason"], "age=") {
+		t.Errorf("close_reason = %q, want self-diagnosing age= detail (#4299)", b.Metadata["close_reason"])
 	}
 	if b.Status != "closed" {
 		t.Errorf("status = %q, want closed", b.Status)

@@ -62,7 +62,8 @@ func sweepStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 	// inside StaleShadowsBefore; the cross-phase close budget stays in this loop.
 	nudgeCutoff := now.Add(-nudgeTTL)
 	// nudge/mail beads are NoHistory (wisp-tier); StaleShadowsBefore reads both tiers.
-	nudgeShadows, err := nq.StaleShadowsBefore(nudgeCutoff, limit, liveIDs)
+	// `now` drives StaleShadowsBefore's queued-before-expiry exclusion (#4299).
+	nudgeShadows, err := nq.StaleShadowsBefore(nudgeCutoff, now, limit, liveIDs)
 	if err != nil {
 		return result, fmt.Errorf("nudge-mail-sweep: listing stale nudge beads: %w", err)
 	}
@@ -74,7 +75,7 @@ func sweepStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		if !shadow.Open {
 			continue
 		}
-		if err := nq.SweepStale(shadow.BeadID, nudgeMailSweepNudgeCloseReason, now); err != nil {
+		if err := nq.SweepStale(shadow.BeadID, nudgeSweepCloseReason(shadow, now, nudgeTTL), now); err != nil {
 			beadErrs = append(beadErrs, err)
 			continue
 		}
@@ -117,7 +118,7 @@ func countStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 
 	// Dry-run twin of the sweep: same typed read, same cross-phase budget, no writes.
 	nudgeCutoff := now.Add(-nudgeTTL)
-	nudgeShadows, err := nq.StaleShadowsBefore(nudgeCutoff, limit, liveIDs)
+	nudgeShadows, err := nq.StaleShadowsBefore(nudgeCutoff, now, limit, liveIDs)
 	if err != nil {
 		return result, fmt.Errorf("nudge-mail-sweep (dry-run): listing stale nudge beads: %w", err)
 	}
@@ -145,6 +146,25 @@ func countStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		result.MailClosed += mailCount
 	}
 	return result, nil
+}
+
+// nudgeSweepCloseReason builds the self-diagnosing close_reason stamped on a
+// swept nudge: the human retention-window sentence (nudgeMailSweepNudgeCloseReason,
+// which alone satisfies the >=20-char validation floor) followed by the computed
+// age and the threshold the sweep fired against. A queued nudge is swept only
+// once past its own expires_at, so its threshold is that expiry; every other
+// shadow is swept on the created_at retention TTL. Emitting both makes a future
+// misfire (gastownhall/gascity#4299) diagnosable from the bead alone.
+func nudgeSweepCloseReason(shadow nudgequeue.NudgeShadow, now time.Time, nudgeTTL time.Duration) string {
+	age := "unknown"
+	if !shadow.BeadCreatedAt.IsZero() {
+		age = now.Sub(shadow.BeadCreatedAt).Round(time.Second).String()
+	}
+	threshold := "ttl=" + nudgeTTL.String()
+	if shadow.State == "queued" && !shadow.ExpiresAt.IsZero() {
+		threshold = "expires_at=" + shadow.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	return fmt.Sprintf("%s (age=%s, %s)", nudgeMailSweepNudgeCloseReason, age, threshold)
 }
 
 // liveNudgeIDSet returns the set of nudge IDs currently in pending or in-flight state.

@@ -75,6 +75,11 @@ type NudgeShadow struct {
 	// DeliverAfter / ExpiresAt are the parsed scheduling timestamps if present.
 	DeliverAfter time.Time
 	ExpiresAt    time.Time
+	// BeadCreatedAt is the shadow bead's OWN creation time (bead.CreatedAt),
+	// bead-authoritative and distinct from the queue Item.CreatedAt (which lives
+	// in state.json and is deliberately absent above). The retention sweep reads
+	// it to compute a swept nudge's age for the self-diagnosing close_reason.
+	BeadCreatedAt time.Time
 }
 
 // Store is the nudge-class domain wrapper. It holds the strongly-typed
@@ -111,6 +116,7 @@ func decodeNudgeItem(b beads.Bead) NudgeShadow {
 		SessionID:      b.Metadata["session_id"],
 		Source:         b.Metadata["source"],
 		Message:        b.Metadata["message"],
+		BeadCreatedAt:  b.CreatedAt,
 	}
 	if raw := b.Metadata["reference_json"]; raw != "" {
 		var ref Reference
@@ -310,10 +316,19 @@ func (s *Store) SweepStale(beadID, closeReason string, now time.Time) error {
 // StaleShadowsBefore lists stale nudge shadows created before `before`, oldest
 // first, EXCLUDING any whose durable nudge id is in liveExcludeIDs — the live
 // flock-queue set (nudgequeue.State Pending/InFlight ids) a caller must never
-// sweep. It is the typed read behind the retention sweep and its dry-run twin:
-// callers iterate the returned NudgeShadow values, reading shadow.Open in place
-// of a raw b.Status crack and shadow.BeadID for the close target, instead of
-// holding raw beads and calling the deleted DecodeShadow.
+// sweep — and EXCLUDING any still-queued shadow that has not yet reached its own
+// expires_at. It is the typed read behind the retention sweep and its dry-run
+// twin: callers iterate the returned NudgeShadow values, reading shadow.Open in
+// place of a raw b.Status crack and shadow.BeadID for the close target, instead
+// of holding raw beads and calling the deleted DecodeShadow.
+//
+// `now` is the sweep clock used only for the queued-before-expiry exclusion; the
+// candidate query still cuts on `before` (now-nudgeTTL for the retention sweep).
+// A still-`queued` (undelivered) nudge rides its own 24h expires_at, not the
+// short created_at retention window, so sweeping it before expiry destroys an
+// undelivered human->agent notification (gastownhall/gascity#4299). A queued
+// shadow with no recorded expiry falls back to the created_at cutoff already
+// applied by the query, so legacy/malformed beads are never leaked.
 //
 // The query is byte-identical to the prior StaleCandidatesBefore (the gc:nudge
 // label, CreatedBefore cutoff, oldest-first sort, both storage tiers), so the
@@ -322,7 +337,7 @@ func (s *Store) SweepStale(beadID, closeReason string, now time.Time) error {
 // cross-phase close budget on top, so the live exclusion moving inside here does
 // not alter which beads the budget-limited loop closes. It is nil-receiver safe
 // and callable inside the withNudgeQueueState flock transaction.
-func (s *Store) StaleShadowsBefore(before time.Time, limit int, liveExcludeIDs map[string]bool) ([]NudgeShadow, error) {
+func (s *Store) StaleShadowsBefore(before, now time.Time, limit int, liveExcludeIDs map[string]bool) ([]NudgeShadow, error) {
 	if s == nil || s.store.Store == nil {
 		return nil, nil
 	}
@@ -345,9 +360,21 @@ func (s *Store) StaleShadowsBefore(before time.Time, limit int, liveExcludeIDs m
 		if id := strings.TrimSpace(shadow.ID); id != "" && liveExcludeIDs[id] {
 			continue
 		}
+		if shadowQueuedBeforeExpiry(shadow, now) {
+			continue
+		}
 		shadows = append(shadows, shadow)
 	}
 	return shadows, nil
+}
+
+// shadowQueuedBeforeExpiry reports whether a shadow is a still-queued nudge that
+// has not yet reached its own expires_at, and so must NOT be swept: an
+// undelivered nudge rides its 24h TTL, not the short created_at retention window
+// (gastownhall/gascity#4299). A shadow with no recorded expiry is not protected
+// here — it falls through to the created_at cutoff the query already applied.
+func shadowQueuedBeforeExpiry(shadow NudgeShadow, now time.Time) bool {
+	return shadow.State == "queued" && !shadow.ExpiresAt.IsZero() && now.Before(shadow.ExpiresAt)
 }
 
 // Find returns the OPEN (or terminal-but-decodable) nudge shadow for nudgeID as
