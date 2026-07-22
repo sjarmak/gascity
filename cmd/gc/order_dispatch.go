@@ -1416,6 +1416,63 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 	})
 }
 
+// orderFormulaSearchPaths returns the ordered formula search paths for an
+// order's scope, lowest→highest priority (matching FormulaLayers.SearchPaths).
+//
+// Dispatch used to resolve an order's formula against the single layer the
+// order file was scanned from, while `gc formula list`/`gc formula show`
+// resolve against the configured layer stack. A city order naming a formula
+// shipped by a city-imported pack therefore failed to dispatch with
+// `formula %q not found in search paths` even though the same build reported
+// the formula as resolvable (#4378). Searching the order's own scope stack
+// closes that divergence for both `gc order run` and controller/webhook
+// dispatch.
+//
+// The order's own layer is appended last so it stays highest priority: a
+// formula co-located with the order still shadows a pack-shipped one of the
+// same name. Scopes stay isolated — a city order sees city layers only, so it
+// cannot reach a rig-exclusive formula.
+func orderFormulaSearchPaths(cfg *config.City, a orders.Order) []string {
+	var stack []string
+	if cfg != nil {
+		stack = cfg.FormulaLayers.SearchPaths(strings.TrimSpace(a.Rig))
+	}
+
+	paths := make([]string, 0, len(stack)+1)
+	seen := make(map[string]struct{}, len(stack)+1)
+	add := func(p string) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return
+		}
+		if _, dup := seen[p]; dup {
+			return
+		}
+		seen[p] = struct{}{}
+		paths = append(paths, p)
+	}
+	for _, p := range stack {
+		add(p)
+	}
+	// Re-adding an already-present layer would leave it at its configured
+	// (lower) priority, so drop it from the stack first and re-append.
+	if layer := strings.TrimSpace(a.FormulaLayer); layer != "" {
+		if _, dup := seen[layer]; dup {
+			trimmed := paths[:0]
+			for _, p := range paths {
+				if p != layer {
+					trimmed = append(trimmed, p)
+				}
+			}
+			paths = trimmed
+		} else {
+			seen[layer] = struct{}{}
+		}
+		paths = append(paths, layer)
+	}
+	return paths
+}
+
 func prepareOrderWispRecipe(ctx context.Context, store beads.Store, a orders.Order, searchPaths []string, vars map[string]string) (*formula.Recipe, error) {
 	inv, err := graphv2.PrepareInvocation(ctx, store, a.Formula, searchPaths, "", vars)
 	if err != nil {
@@ -1535,11 +1592,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 		}
 	}
 
-	var searchPaths []string
-	if a.FormulaLayer != "" {
-		searchPaths = []string{a.FormulaLayer}
-	}
-	recipe, err := prepareOrderWispRecipe(ctx, store, a, searchPaths, vars)
+	recipe, err := prepareOrderWispRecipe(ctx, store, a, orderFormulaSearchPaths(m.cfg, a), vars)
 	if err != nil {
 		m.rec.Record(events.Event{
 			Type:    events.OrderFailed,
