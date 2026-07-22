@@ -1,0 +1,47 @@
+# temporal-observe — read-only observe-mode metrics collector (bead gc-4zf.7).
+# PROMOTED 2026-07-22 from the service-tree draft under change-control.
+# Authorization: Stephanie's 2026-07-22 decision to start gc-4zf.7 now
+# (observe-only, exempt from the gc-qaid memory gate); collection must run
+# until the gc-372 gate (~2026-07-23) so the moot-vs-forgotten question is
+# answered with a trend, not a point sample. Undo condition in the header
+# below (retire or promote at the gate).
+#
+# Why: the observe-mode bridge answers the signal-bridge moot-vs-forgotten
+# question (the 2026-07-21 audit's OPEN inconsistency) with data. Each run is
+# one READ-ONLY pass — temporal ListWorkflow + per-workflow state Query, plus
+# `gc bd ... list` — appending one JSONL line to
+# .gc/temporal-observe-metrics.jsonl. No mutation anywhere, test-gated
+# (TestObserveBridge_ReadOnly).
+#
+# Shape mirrors orders/temporal-soak-check.toml (cooldown trigger, env block,
+# explicit timeout math). 30m interval per the bead spec: fine-grained enough
+# to catch a waiting workflow inside one 120m cycle, cheap enough (~1s of
+# reads) to ignore.
+#
+# Fail-soft: the exec exits 0 when Temporal is unreachable or a read pass
+# fails (mirroring bin/temporal-maintenance-signal-bead-closed), so a down
+# server never wedges the order system. A CONFIG error (mode=execute, which is
+# gated behind bead gc-qaid) exits non-zero and should be loud.
+#
+# Timeout math: the binary's own --timeout default is 60s (ListWorkflow pages
+# + up to ~36 state Queries + 2 bd lists); the 120s order timeout gives 2x
+# headroom. Measured one-shot runtime against the live soak: ~1s.
+#
+# Undo (EXPECTED at the gc-372 gate, ~2026-07-23): when the soak closes and the
+# moot-vs-forgotten question is decided, either retire this order with the
+# outcome recorded in its header, or fold the observe metrics into Track B's
+# harness. Same rule as temporal-soak-check: a patrol nobody reads must not
+# outlive its question.
+
+[order]
+description = "Every 30m: read-only observe pass over the Temporal maintenance namespace and bead store; appends the 5 signal-bridge metrics + 2 expect-zero counts to .gc/temporal-observe-metrics.jsonl. Mutates nothing. Retire or promote at the gc-372 gate (~2026-07-23)."
+trigger = "cooldown"
+interval = "30m"
+exec = "/home/ds/gas-city/services/temporal-maintenance/bin/temporal-observe"
+timeout = "120s"
+idempotent = true
+
+[order.env]
+TEMPORAL_ADDRESS = "127.0.0.1:7233"
+TEMPORAL_NAMESPACE = "maintenance"
+TEMPORAL_MAINT_RIG = "gascity"
