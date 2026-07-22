@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Standalone test for agent-slice-audit (incident 2026-07-22, "crew unavailable").
+#
+# The whole point of this script: tell a CONTAINED agent pane apart from one
+# that escaped gascity-agents.slice into an unbounded tmux-spawn-*.scope. The
+# real incident had both shapes live at once, created in the same second by
+# the same supervisor, so the suite drives the exact observed cgroup strings
+# rather than synthetic ones.
+#
+# An audit that reports "all clear" when it could not actually enumerate panes
+# is the dangerous failure here -- it would have hidden this incident -- so
+# case 4 pins the inconclusive path to its own exit code, distinct from pass.
+#
+# Asserts:
+#   1. all panes in gascity-agents.slice        -> exit 0, no ESCAPED line
+#   2. mayor in app.slice/tmux-spawn-*          -> exit 1, names the session
+#   3. --fix clamps ONLY the escaped scope      -> correct unit + properties
+#   4. pane enumeration fails                   -> exit 2 (inconclusive != pass)
+#   5. gc-keepalive (infra, not an agent)       -> skipped, not flagged
+#   6. pane exits mid-audit (empty cgroup)      -> reported GONE, not ESCAPED
+#
+# Run:  bash /home/ds/gas-city/bin/agent-slice-audit.test
+
+set -uo pipefail
+
+AUDIT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agent-slice-audit"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+PASS=0
+FAIL=0
+
+ok()   { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
+bad()  { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; [ -n "${2:-}" ] && printf '       %s\n' "$2"; }
+
+CONTAINED="0::/user.slice/user-1000.slice/user@1000.service/gascity.slice/gascity-agents.slice/run-u45046.scope"
+ESCAPED="0::/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-75111452-c141-4aa7-abf7-090a915b3a9d.scope"
+
+# Fixture cgroup resolver: maps pid -> cgroup line via a table file.
+mk_cgroup_cmd() {
+  local table="$1"
+  cat > "$WORK/cgroup.sh" <<EOF
+#!/usr/bin/env bash
+grep -E "^\$1 " "$table" 2>/dev/null | head -1 | cut -d' ' -f2-
+EOF
+  chmod +x "$WORK/cgroup.sh"
+  echo "$WORK/cgroup.sh"
+}
+
+# --- case 1: everything contained -------------------------------------------
+cat > "$WORK/t1" <<EOF
+1163666 $CONTAINED
+1163670 $CONTAINED
+EOF
+out="$(AGENT_SLICE_AUDIT_PANES_CMD="printf 'city-infra-pl\t1163666\nmayor\t1163670\n'" \
+       AGENT_SLICE_AUDIT_CGROUP_CMD="$(mk_cgroup_cmd "$WORK/t1")" \
+       bash "$AUDIT" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && ! grep -q ESCAPED <<< "$out"; then
+  ok "1. all contained -> exit 0"
+else
+  bad "1. all contained -> exit 0" "rc=$rc out=$out"
+fi
+
+# --- case 2: the real incident shape ----------------------------------------
+cat > "$WORK/t2" <<EOF
+1163666 $CONTAINED
+1163670 $ESCAPED
+EOF
+out="$(AGENT_SLICE_AUDIT_PANES_CMD="printf 'city-infra-pl\t1163666\nmayor\t1163670\n'" \
+       AGENT_SLICE_AUDIT_CGROUP_CMD="$(mk_cgroup_cmd "$WORK/t2")" \
+       bash "$AUDIT" 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] \
+   && grep -q 'mayor.*ESCAPED' <<< "$out" \
+   && grep -q 'city-infra-pl.*ok' <<< "$out"; then
+  ok "2. escaped mayor -> exit 1, contained PL still ok"
+else
+  bad "2. escaped mayor -> exit 1" "rc=$rc out=$out"
+fi
+
+# --- case 3: --fix clamps only the escaped scope ----------------------------
+: > "$WORK/applied.log"
+cat > "$WORK/apply.sh" <<EOF
+#!/usr/bin/env bash
+echo "\$@" >> "$WORK/applied.log"
+EOF
+chmod +x "$WORK/apply.sh"
+out="$(AGENT_SLICE_AUDIT_PANES_CMD="printf 'city-infra-pl\t1163666\nmayor\t1163670\n'" \
+       AGENT_SLICE_AUDIT_CGROUP_CMD="$(mk_cgroup_cmd "$WORK/t2")" \
+       AGENT_SLICE_AUDIT_APPLY_CMD="$WORK/apply.sh" \
+       bash "$AUDIT" --fix 2>&1)"; rc=$?
+applied="$(cat "$WORK/applied.log")"
+if [ "$(wc -l < "$WORK/applied.log")" -eq 1 ] \
+   && grep -q 'tmux-spawn-75111452-c141-4aa7-abf7-090a915b3a9d.scope' <<< "$applied" \
+   && grep -q 'MemorySwapMax=0' <<< "$applied" \
+   && grep -q 'MemoryMax=16G' <<< "$applied"; then
+  ok "3. --fix clamps only the escaped scope, with swap block"
+else
+  bad "3. --fix clamps only the escaped scope" "applied=[$applied]"
+fi
+
+# --- case 4: enumeration failure is NOT a pass ------------------------------
+out="$(AGENT_SLICE_AUDIT_PANES_CMD="true" bash "$AUDIT" 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && grep -qi 'INCONCLUSIVE' <<< "$out"; then
+  ok "4. cannot enumerate -> exit 2 inconclusive, never a silent pass"
+else
+  bad "4. cannot enumerate -> exit 2" "rc=$rc out=$out"
+fi
+
+# --- case 5: infra session skipped ------------------------------------------
+cat > "$WORK/t5" <<EOF
+1497 0::/user.slice/user-1000.slice/user@1000.service/app.slice/gascity-tmux.service
+1163666 $CONTAINED
+EOF
+out="$(AGENT_SLICE_AUDIT_PANES_CMD="printf 'gc-keepalive\t1497\ncity-infra-pl\t1163666\n'" \
+       AGENT_SLICE_AUDIT_CGROUP_CMD="$(mk_cgroup_cmd "$WORK/t5")" \
+       bash "$AUDIT" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && ! grep -q 'gc-keepalive' <<< "$out"; then
+  ok "5. gc-keepalive skipped as infrastructure"
+else
+  bad "5. gc-keepalive skipped" "rc=$rc out=$out"
+fi
+
+# --- case 6: pane exits mid-audit -------------------------------------------
+cat > "$WORK/t6" <<EOF
+1163666 $CONTAINED
+EOF
+out="$(AGENT_SLICE_AUDIT_PANES_CMD="printf 'city-infra-pl\t1163666\nmayor\t999999\n'" \
+       AGENT_SLICE_AUDIT_CGROUP_CMD="$(mk_cgroup_cmd "$WORK/t6")" \
+       bash "$AUDIT" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'mayor.*GONE' <<< "$out"; then
+  ok "6. pane gone mid-audit -> GONE, not a false ESCAPED"
+else
+  bad "6. pane gone mid-audit -> GONE" "rc=$rc out=$out"
+fi
+
+echo
+echo "agent-slice-audit.test: ${PASS} passed, ${FAIL} failed"
+[ "$FAIL" -eq 0 ]

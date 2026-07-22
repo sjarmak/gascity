@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# agent-slice-audit — detect agent panes that escaped gascity-agents.slice.
+#
+# Why this exists (incident 2026-07-22, "crew unavailable"):
+# gc wraps every pane command in
+#   systemd-run --user --scope --slice=gascity-agents.slice -- sh -c '<cmd>'
+# so agents land in a slice carrying MemorySwapMax=0 + a memory ceiling.
+# Stock Ubuntu tmux ALSO creates its own transient tmux-spawn-*.scope under
+# app.slice for every pane. Those two race. On 2026-07-22 the mayor, the
+# city-infra-pl and the gascity-maintenance-pl panes were created in the SAME
+# SECOND from the same supervisor with byte-identical wrapped start commands;
+# the two PLs landed in gascity-agents.slice and the mayor landed in
+# app.slice/tmux-spawn-*.scope with every memory and swap limit set to
+# infinity. The mayor then filled all 8G of host swap with concurrent ~455M
+# `gc` invocations, drove load to 104 at 91% sys CPU, starved the dolt
+# sql-server until bead reads hit a 105s p95, and the supervisor API stopped
+# answering — which the dashboard renders as "crew unavailable" while every
+# agent is in fact alive.
+#
+# The placement is re-rolled on every respawn, so a pane that is contained
+# today can be uncontained after the next restart. Config alone cannot fix a
+# race; this is the detection half. Run it after any mayor/PL restart and on a
+# schedule.
+#
+# Exit codes:  0 = every agent pane contained,  1 = at least one escaped,
+#              2 = could not enumerate panes (audit inconclusive, NOT a pass)
+#
+# Usage:
+#   bin/agent-slice-audit             # report only
+#   bin/agent-slice-audit --fix       # also clamp escaped scopes in place
+#
+# --fix does NOT re-parent the pane (systemd cannot move a running process
+# between scopes). It applies MemorySwapMax=0 plus the ceilings directly to
+# the offending transient scope, which removes the host-swap blast radius
+# until the pane is restarted. Restarting the pane re-rolls the race; it does
+# not deterministically fix placement.
+#
+# Test seams (used by agent-slice-audit.test; unset in production):
+#   AGENT_SLICE_AUDIT_PANES_CMD   -> emits "session<TAB>pane_pid" per line
+#   AGENT_SLICE_AUDIT_CGROUP_CMD  -> given a pid, emits that pid's cgroup line
+#   AGENT_SLICE_AUDIT_APPLY_CMD   -> given a scope unit + properties, applies
+
+set -uo pipefail
+
+SOCKET="${AGENT_SLICE_AUDIT_SOCKET:-ds-research}"
+SLICE="${AGENT_SLICE_AUDIT_SLICE:-gascity-agents.slice}"
+SWAP_MAX="${AGENT_SLICE_AUDIT_SWAP_MAX:-0}"
+MEM_HIGH="${AGENT_SLICE_AUDIT_MEM_HIGH:-12G}"
+MEM_MAX="${AGENT_SLICE_AUDIT_MEM_MAX:-16G}"
+
+# Sessions that are infrastructure, not agents. The keepalive holds the tmux
+# server open (see gascity-tmux.service) and runs `sleep infinity`; clamping
+# it would be meaningless and flagging it would train operators to ignore
+# this audit.
+SKIP_SESSIONS="${AGENT_SLICE_AUDIT_SKIP:-gc-keepalive}"
+
+FIX=0
+for arg in "$@"; do
+  case "$arg" in
+    --fix) FIX=1 ;;
+    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    *) printf 'agent-slice-audit: unknown argument: %s\n' "$arg" >&2; exit 2 ;;
+  esac
+done
+
+list_panes() {
+  if [ -n "${AGENT_SLICE_AUDIT_PANES_CMD:-}" ]; then
+    eval "$AGENT_SLICE_AUDIT_PANES_CMD"
+    return
+  fi
+  local sessions session pid
+  sessions="$(timeout 30 tmux -L "$SOCKET" ls -F '#{session_name}' 2>/dev/null)" || return 1
+  [ -n "$sessions" ] || return 1
+  while IFS= read -r session; do
+    [ -n "$session" ] || continue
+    pid="$(timeout 15 tmux -L "$SOCKET" list-panes -t "$session" -F '#{pane_pid}' 2>/dev/null | head -1)"
+    [ -n "$pid" ] || continue
+    printf '%s\t%s\n' "$session" "$pid"
+  done <<< "$sessions"
+}
+
+pid_cgroup() {
+  local pid="$1"
+  if [ -n "${AGENT_SLICE_AUDIT_CGROUP_CMD:-}" ]; then
+    eval "$AGENT_SLICE_AUDIT_CGROUP_CMD" "$pid"
+    return
+  fi
+  cut -d: -f3 "/proc/$pid/cgroup" 2>/dev/null | head -1
+}
+
+apply_caps() {
+  local unit="$1"
+  if [ -n "${AGENT_SLICE_AUDIT_APPLY_CMD:-}" ]; then
+    eval "$AGENT_SLICE_AUDIT_APPLY_CMD" "$unit" \
+      "MemorySwapMax=$SWAP_MAX" "MemoryHigh=$MEM_HIGH" "MemoryMax=$MEM_MAX"
+    return
+  fi
+  systemctl --user set-property "$unit" \
+    "MemorySwapMax=$SWAP_MAX" "MemoryHigh=$MEM_HIGH" "MemoryMax=$MEM_MAX" 2>&1
+}
+
+is_skipped() {
+  local name="$1" skip
+  for skip in $SKIP_SESSIONS; do
+    [ "$name" = "$skip" ] && return 0
+  done
+  return 1
+}
+
+panes="$(list_panes)"
+if [ -z "$panes" ]; then
+  echo "agent-slice-audit: could not enumerate panes on socket '$SOCKET'" >&2
+  echo "agent-slice-audit: INCONCLUSIVE (not a pass)" >&2
+  exit 2
+fi
+
+escaped=0
+checked=0
+printf '%-34s %-9s %s\n' "SESSION" "PANE_PID" "PLACEMENT"
+
+while IFS=$'\t' read -r session pid; do
+  [ -n "$session" ] || continue
+  is_skipped "$session" && continue
+  cgroup="$(pid_cgroup "$pid")"
+  checked=$((checked + 1))
+
+  if [ -z "$cgroup" ]; then
+    printf '%-34s %-9s %s\n' "$session" "$pid" "GONE (pane exited mid-audit)"
+    continue
+  fi
+
+  case "$cgroup" in
+    */"$SLICE"/*)
+      printf '%-34s %-9s %s\n' "$session" "$pid" "ok  ${SLICE}"
+      ;;
+    *)
+      escaped=$((escaped + 1))
+      unit="${cgroup##*/}"
+      printf '%-34s %-9s %s\n' "$session" "$pid" "ESCAPED -> ${cgroup}"
+      if [ "$FIX" -eq 1 ]; then
+        if out="$(apply_caps "$unit")"; then
+          printf '%-34s %-9s %s\n' "" "" \
+            "clamped ${unit} swap=${SWAP_MAX} high=${MEM_HIGH} max=${MEM_MAX}"
+        else
+          printf '%-34s %-9s %s\n' "" "" "CLAMP FAILED ${unit}: ${out}" >&2
+        fi
+      fi
+      ;;
+  esac
+done <<< "$panes"
+
+echo
+if [ "$escaped" -gt 0 ]; then
+  echo "agent-slice-audit: ${escaped}/${checked} agent pane(s) OUTSIDE ${SLICE}"
+  [ "$FIX" -eq 0 ] && echo "agent-slice-audit: re-run with --fix to clamp them in place"
+  exit 1
+fi
+
+echo "agent-slice-audit: all ${checked} agent pane(s) contained in ${SLICE}"
+exit 0
