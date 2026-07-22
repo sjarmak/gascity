@@ -52,9 +52,28 @@ COMMERCIAL_MODULES="github.com/gastownhall/gascity-hosted"
 failed=0
 note() { echo "check-core-boundary: $*" >&2; }
 
-# Non-test core .go surface (whole module tree minus vendor/testdata/tests).
+# scan() enumerates TRACKED files (git ls-files), so a tree that is not a git
+# checkout cannot be evaluated. Per the fail-closed contract above, that is a
+# violation, not a pass: an empty file list must never masquerade as "clean".
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+	note "BLOCKED — not a git work tree; cannot enumerate tracked sources (fail-closed)."
+	exit 1
+fi
+
+# Non-test core .go surface: tracked source files only, minus vendor/testdata and
+# _test.go. Enumerating tracked files (git ls-files) instead of walking the whole
+# working tree keeps the guard immune to any in-tree Go cache or build-artifact
+# layout — e.g. a project-local GOMODCACHE under .cache/go-mod, the canonical
+# GitLab-CI layout — which would otherwise pull third-party sources into the scan
+# and manufacture false open-core violations (#4479). The vendor/testdata excludes
+# match a directory of that name at any depth, as --exclude-dir did. /dev/null keeps
+# grep in multi-file mode (filename-prefixed output) and stops it reading stdin when
+# the file list is empty.
 scan() {
-	grep -rn --include='*.go' --exclude-dir=vendor --exclude-dir=testdata "$1" . 2>/dev/null \
+	git ls-files -z -- '*.go' \
+		':(exclude)**/vendor/**' ':(exclude)vendor/**' \
+		':(exclude)**/testdata/**' ':(exclude)testdata/**' \
+		| xargs -0 grep -n "$1" /dev/null 2>/dev/null \
 		| grep -v '_test\.go:'
 }
 
