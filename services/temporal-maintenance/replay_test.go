@@ -1,6 +1,7 @@
 package temporalmaintenance
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,32 +10,109 @@ import (
 	"go.temporal.io/sdk/worker"
 )
 
-// historyFile is a completed-workflow history captured once from the local dev
-// server. Replaying it through the current workflow code proves the code change
-// is replay-safe (no non-determinism against a real recorded execution).
+// The replay-safety gate: recorded histories replayed through the current
+// workflow code prove a code change is replay-safe (no non-determinism against
+// a real execution). One fixture per production path. Operational discipline
+// for WHEN this gate must run and what a failure means lives in
+// docs/conventions/temporal-versioning.md.
 //
-// Capture it once (requires the temporal CLI):
+// Capturing a fixture is read-only against the deployed server:
 //
-//	temporal server start-dev
-//	go run ./worker            # in another terminal
-//	# drive one cycle to completion via the harness, then:
-//	temporal workflow show --workflow-id <id> --output json \
-//	  > testdata/maintenance_cycle_history.json
-const historyFile = "testdata/maintenance_cycle_history.json"
+//	temporal workflow show --namespace maintenance \
+//	  --workflow-id <completed-cycle-id> --output json > testdata/<name>.json
+//
+// (or from a local `temporal server start-dev` for paths production has not
+// exercised yet — see the README drive-through for the gated path.)
+var replayFixtures = []struct {
+	name string
+	file string
+	path string                         // which workflow path the history exercises
+	pin  func(t *testing.T, raw []byte) // content pin; nil = replay-only
+}{
+	{
+		name: "gated",
+		file: "testdata/maintenance_cycle_history.json",
+		path: "fanout + CI/review signals + human-gate Update + gated mutation",
+	},
+	{
+		name: "dispatch_only",
+		file: "testdata/dispatch_only_history.json",
+		// Captured 2026-07-22 from the production server (cycle
+		// maintenance-cycle-2026-07-22T02:00:00Z), recorded by the
+		// pre-gc-372.1 worker: replaying it against the post-fix code is the
+		// worked proof that an ActivityOptions-only change is replay-safe.
+		path: "dispatch-only (the armed 120m Schedule's production path)",
+		pin:  pinDispatchOnlyHistory,
+	},
+}
 
-// TestReplay_FromCapturedHistory replays a recorded history against the current
-// workflow code. It is the replay-safety gate for any workflow-code change. When
-// the captured history is not present (e.g. the temporal CLI is not installed on
-// this host yet), it skips with capture instructions rather than passing vacuously.
+// TestReplay_FromCapturedHistory replays each recorded history against the
+// current workflow code. It is the replay-safety gate for any workflow-code
+// change. Both fixtures are committed, so a missing or unreadable history is
+// a broken checkout — the gate FAILS rather than skipping, because a green
+// skip would silently disarm the only replay-safety proof this module has.
 func TestReplay_FromCapturedHistory(t *testing.T) {
-	path := filepath.Join(".", historyFile)
-	if _, err := os.Stat(path); err != nil {
-		t.Skipf("no captured history at %s — capture it from the dev server (see file header); "+
-			"replay-safety gate is inert until then", path)
+	for _, tc := range replayFixtures {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(".", tc.file)
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("captured history unreadable at %s (%v) — the %s replay gate must not pass vacuously; "+
+					"restore the committed fixture (see the file-header capture instructions)", path, err, tc.name)
+			}
+			if tc.pin != nil {
+				tc.pin(t, raw)
+			}
+			replayer := worker.NewWorkflowReplayer()
+			replayer.RegisterWorkflow(MaintenanceCycleWorkflow)
+			require.NoError(t, replayer.ReplayWorkflowHistoryFromJSONFile(nil, path),
+				"current workflow code must replay the captured %s history (%s) without non-determinism",
+				tc.name, tc.path)
+		})
 	}
+}
 
-	replayer := worker.NewWorkflowReplayer()
-	replayer.RegisterWorkflow(MaintenanceCycleWorkflow)
-	require.NoError(t, replayer.ReplayWorkflowHistoryFromJSONFile(nil, path),
-		"current workflow code must replay the captured history without non-determinism")
+// pinDispatchOnlyHistory asserts the dispatch_only fixture still IS the
+// production dispatch-only history: MaintenanceCycleWorkflow, exactly the two
+// DispatchSelection activities (review + author halves), ending at clean
+// completion. A silently swapped or truncated fixture fails here before the
+// replay could pass against the wrong history.
+func pinDispatchOnlyHistory(t *testing.T, raw []byte) {
+	t.Helper()
+	var hist struct {
+		Events []struct {
+			EventType string `json:"eventType"`
+			Started   *struct {
+				WorkflowType struct {
+					Name string `json:"name"`
+				} `json:"workflowType"`
+			} `json:"workflowExecutionStartedEventAttributes"`
+			ActivityScheduled *struct {
+				ActivityType struct {
+					Name string `json:"name"`
+				} `json:"activityType"`
+			} `json:"activityTaskScheduledEventAttributes"`
+		} `json:"events"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &hist), "fixture must be a temporal workflow show JSON history")
+	require.NotEmpty(t, hist.Events)
+
+	first := hist.Events[0]
+	require.Equal(t, "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED", first.EventType)
+	require.NotNil(t, first.Started)
+	require.Equal(t, "MaintenanceCycleWorkflow", first.Started.WorkflowType.Name)
+
+	dispatches := 0
+	for _, e := range hist.Events {
+		if e.ActivityScheduled == nil {
+			continue
+		}
+		require.Equal(t, "DispatchSelection", e.ActivityScheduled.ActivityType.Name,
+			"dispatch-only history schedules no activity besides DispatchSelection")
+		dispatches++
+	}
+	require.Equal(t, 2, dispatches, "dispatch-only history schedules exactly the two DispatchSelection activities")
+
+	require.Equal(t, "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED", hist.Events[len(hist.Events)-1].EventType,
+		"history must end at clean completion")
 }

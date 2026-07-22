@@ -27,6 +27,14 @@ This skill owns the change **process**; it does not own the config **content**
 | Supervisor/tmux restart sequence after a service-level change | `compass-tmux-supervisor`, `docs/conventions/tmux-supervisor.md`                        |
 | Ad-hoc guest-session conduct (may you edit at all?)           | `docs/conventions/guest-session-primer.md` + sibling `cityops-guest-session-discipline` |
 
+**Temporal workflow-definition changes carry their own deploy gate** (added
+2026-07-22, bead gc-4zf.9): any diff to
+`services/temporal-maintenance/workflow.go`, `state.go`, `idempotency.go`,
+activity names/registrations, or an SDK bump in its `go.mod` needs a replay
+test + versioning verdict per `docs/conventions/temporal-versioning.md`
+BEFORE the worker is rebuilt/restarted. Load that doc first; deploying an
+unversioned replay-hazardous change can break in-flight workflow histories.
+
 ## The ground rule: git is the change-control layer (since 2026-07-21)
 
 `/home/ds/gas-city` **became a git repository on 2026-07-21** (baseline
