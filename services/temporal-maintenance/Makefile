@@ -1,7 +1,7 @@
 # Build the Signal-bridge + worker binaries the systemd units and (disarmed)
 # orders reference. `make install` deploys the Phase-4 systemd --user units.
 BIN := bin
-CMDS := temporal-signal maintenance-reconcile
+CMDS := temporal-signal maintenance-reconcile temporal-observe
 
 .PHONY: build test clean install
 build:

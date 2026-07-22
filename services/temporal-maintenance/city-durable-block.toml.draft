@@ -1,0 +1,20 @@
+# DRAFT (gc-4zf.7) — proposed [durable] block for /home/ds/gas-city/city.toml.
+# NOT applied: city.toml edits go through change-control
+# (cityops-city-change-control); this file exists so the exact block is
+# reviewable before the flip.
+#
+# Semantics (parsed by services/temporal-maintenance/observe.go
+# LoadDurableConfig):
+#   enabled — gates the FUTURE durable execute bridge only. Observe runs are
+#             read-only and have nothing to gate; they run regardless and
+#             record the flag in each metrics line.
+#   mode    — "observe" is the only implemented mode. "execute" FAILS CLOSED
+#             at config load, naming the memory gate (bead gc-qaid): no
+#             Temporal execute-path expansion until that bead closes.
+#
+# While this block is absent from city.toml, LoadDurableConfig returns exactly
+# these defaults, so adding it changes nothing until a value is edited.
+
+[durable]
+enabled = false
+mode = "observe"

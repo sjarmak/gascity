@@ -8,6 +8,12 @@ the option-1 promotion of the `dr-2uh` shadow pilot. Standalone Go module;
 `docs/design/temporal-maintenance-promotion-plan.md`; pilot design:
 `docs/design/temporal-maintenance-run-pilot.md`.
 
+**Changing a deployed Workflow definition is gated**: any edit to
+`workflow.go` / `state.go` / `idempotency.go` (and activity names or
+registrations) must pass the replay gate (`go test -run TestReplay .`) and
+record a versioning verdict per
+`docs/conventions/temporal-versioning.md` (gc-4zf.9) before deploy.
+
 The bound default is still `DryRunAdapter`: every external mutation is
 **recorded, never executed**, so `gh pr create/review/merge`, `git push`, and
 Slack posts are captured as `ProposedMutation`s instead of run. `RealAdapter`
@@ -25,6 +31,8 @@ approval-gated execution before it can ever be bound.
 | `maintenance_runner.go` | `CommandRunner` + `ExecRunner` — real, allowlisted `gc`/`gc-sling`/`gh`/`git` execution; selection = create+sling |
 | `real_adapter.go` | `RealAdapter` — armed (persisted at-most-once) or unarmed (fail-closed `ErrRealAdapterUnarmed`) |
 | `activities.go` | `Activities` (`DispatchSelection`, `ProposeExternalAction`) |
+| `naming.go` | Forward-looking durable idempotency-key + Workflow-ID constructors (convention: `docs/design/durable-naming-convention.md`; legacy formats pinned by `TestLegacyFormatsUnchanged`) |
+| `observe.go` | `ObserveBridge` — read-only observe-mode metrics (gc-4zf.7); one-shot runner in `cmd/temporal-observe` |
 | `workflow.go` | `MaintenanceCycleWorkflow` + Signals, `state` Query, `humanDecision` Update |
 | `worker/main.go` | Worker entrypoint for the local dev server (binds `DryRunAdapter`) |
 | `*_test.go` | In-process + dev-server testsuite coverage |
