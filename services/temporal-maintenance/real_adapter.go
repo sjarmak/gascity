@@ -85,28 +85,45 @@ func (a *RealAdapter) Propose(ctx context.Context, m ProposedMutation) (Proposed
 		return ProposedMutation{}, false, ErrRealAdapterUnarmed
 	}
 
+	// Duplicate-delivery short-circuit: an existing record already holds the
+	// outcome, so answer from it without re-running the preflight read — a
+	// duplicate must stay answerable even while the backend behind the
+	// preflight is down.
+	if rec, ok, err := a.store.Load(m.IdempotencyKey); err != nil {
+		return ProposedMutation{}, false, err
+	} else if ok {
+		return a.settled(ctx, rec)
+	}
+
+	// Preflight runs BEFORE the claim. It is read-only, so an error here stamps
+	// nothing in the store and the Activity's RetryPolicy re-enters cleanly —
+	// a transient dolt outage on the selection in-flight read retries instead
+	// of terminally failing the cycle (gc-372.1). Fail-closed at-most-once is
+	// reserved for the mutation below.
+	if pf, ok := a.runner.(Preflighter); ok {
+		skip, err := pf.Preflight(ctx, m)
+		if err != nil {
+			var perm *PermanentPreflightError
+			if errors.As(err, &perm) {
+				// A validation/configuration defect: no retry can fix it, so
+				// record it terminally exactly like a failed run — never mask
+				// it behind a skip or burn the retry budget on it.
+				return a.recordPermanentPreflight(ctx, m, err)
+			}
+			return ProposedMutation{}, false, fmt.Errorf("RealAdapter: preflight for key %q: %w", m.IdempotencyKey, err)
+		}
+		if skip {
+			return a.recordSkip(ctx, m)
+		}
+	}
+
 	rec, claimedNow, err := a.store.Claim(m)
 	if err != nil {
 		return ProposedMutation{}, false, err
 	}
 	if !claimedNow {
-		// Someone already owns this key. Never re-run the side effect.
-		switch rec.Status {
-		case ExecDone:
-			done := rec.Mutation
-			done.Result = rec.ResultRef // surface the real outcome on a duplicate too
-			return done, false, nil
-		case ExecPending:
-			// A pending record on a non-claiming Propose means the claimer is
-			// gone: Temporal serializes attempts of one activity and cancels the
-			// prior attempt's ctx (killing its subprocess) at StartToClose, so a
-			// redelivery only reaches here after the original attempt ended. The
-			// claim is poison — unresolvable, and re-running would risk a double
-			// side effect — so quarantine it and escalate rather than fail silently.
-			return a.handlePoisonedPending(ctx, rec)
-		default: // failed — a genuine terminal outcome, surface it (no escalation).
-			return rec.Mutation, false, &TerminalExecError{Key: m.IdempotencyKey, Status: rec.Status, Msg: rec.Err}
-		}
+		// Someone claimed between our Load and Claim. Never re-run the side effect.
+		return a.settled(ctx, rec)
 	}
 
 	// resultRef may be non-empty even on error (e.g. runSelection created a bead
@@ -124,6 +141,66 @@ func (a *RealAdapter) Propose(ctx context.Context, m ProposedMutation) (Proposed
 	}
 	m.Result = resultRef // the real created bead id (or "skipped-inflight")
 	return m, true, nil
+}
+
+// settled answers a Propose whose key already has a record, never re-running
+// the side effect: done -> the recorded outcome, pending -> a poisoned claim
+// (the claimer is gone: Temporal serializes attempts of one activity and
+// cancels the prior attempt's ctx at StartToClose, so a redelivery only
+// reaches here after the original attempt ended — quarantine and escalate
+// rather than risk a double side effect), failed -> the terminal outcome.
+// The pre-claim preflight read lengthens Propose slightly, but the pending->
+// poison inference rests on that attempt serialization, not on Propose being
+// short: any redelivery arriving while a live attempt is mid-Run (up to the
+// full StartToClose) would observe the same pending record. Accepted risk,
+// unchanged in kind by the preflight.
+func (a *RealAdapter) settled(ctx context.Context, rec ExecRecord) (ProposedMutation, bool, error) {
+	switch rec.Status {
+	case ExecDone:
+		done := rec.Mutation
+		done.Result = rec.ResultRef // surface the real outcome on a duplicate too
+		return done, false, nil
+	case ExecPending:
+		return a.handlePoisonedPending(ctx, rec)
+	default: // failed — a genuine terminal outcome, surface it (no escalation).
+		return rec.Mutation, false, &TerminalExecError{Key: rec.Key, Status: rec.Status, Msg: rec.Err}
+	}
+}
+
+// recordSkip durably records a preflight skip as a completed "skipped-inflight"
+// key without executing anything, so a duplicate delivery reads the skip back
+// from the store instead of re-checking live state.
+func (a *RealAdapter) recordSkip(ctx context.Context, m ProposedMutation) (ProposedMutation, bool, error) {
+	rec, claimedNow, err := a.store.Claim(m)
+	if err != nil {
+		return ProposedMutation{}, false, err
+	}
+	if !claimedNow {
+		return a.settled(ctx, rec)
+	}
+	if err := a.store.Complete(m.IdempotencyKey, "skipped-inflight"); err != nil {
+		return ProposedMutation{}, false, err
+	}
+	m.Result = "skipped-inflight"
+	return m, true, nil
+}
+
+// recordPermanentPreflight stamps a permanent preflight failure as a terminal
+// failed key — the fail-closed behavior the old validate-inside-Run path had —
+// and surfaces the original error (the Activity's next retry, if any, then
+// short-circuits on the terminal record).
+func (a *RealAdapter) recordPermanentPreflight(ctx context.Context, m ProposedMutation, perr error) (ProposedMutation, bool, error) {
+	rec, claimedNow, err := a.store.Claim(m)
+	if err != nil {
+		return ProposedMutation{}, false, err
+	}
+	if !claimedNow {
+		return a.settled(ctx, rec)
+	}
+	if err := a.store.Fail(m.IdempotencyKey, "", perr.Error()); err != nil {
+		return ProposedMutation{}, false, fmt.Errorf("preflight failed permanently (%v) and recording failure failed: %w", perr, err)
+	}
+	return ProposedMutation{}, false, perr
 }
 
 // handlePoisonedPending quarantines a claim left pending by a crashed worker and

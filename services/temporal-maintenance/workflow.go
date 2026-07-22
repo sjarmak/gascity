@@ -158,7 +158,19 @@ func MaintenanceCycleWorkflow(ctx workflow.Context, in MaintenanceCycleInput) (M
 		// pending. Retries still bound transient (pre-claim) failures; a terminal
 		// post-claim outcome is surfaced non-retryably by the Activity.
 		StartToCloseTimeout: 5 * time.Minute,
-		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 3},
+		// Retries cover transient infra failures surfaced before the at-most-once
+		// claim — e.g. the selection in-flight read against a dolt whose circuit
+		// breaker is in cooldown, which terminally failed the 2026-07-21T10:00Z
+		// cycle under the old 3×1s window. The window must outlast a breaker
+		// cooldown (5s) and ride out a short memcg-kill storm: ~4m of coverage.
+		// Terminal post-claim outcomes short-circuit via the NonRetryable
+		// conversion in the Activity regardless of the attempt budget.
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval:    5 * time.Second,
+			BackoffCoefficient: 2,
+			MaximumInterval:    time.Minute,
+			MaximumAttempts:    8,
+		},
 	}
 	actx := workflow.WithActivityOptions(ctx, ao)
 	var acts *Activities // nil method value: used only to resolve the Activity name

@@ -19,6 +19,32 @@ type CommandRunner interface {
 	Run(ctx context.Context, m ProposedMutation) (resultRef string, err error)
 }
 
+// Preflighter is an optional CommandRunner refinement for checks that must run
+// BEFORE the at-most-once claim. A preflight is side-effect-free (reads only),
+// so RealAdapter treats its errors as retryable infrastructure failures: nothing
+// is stamped in the execstore and the Activity's RetryPolicy re-enters cleanly.
+// This placement is the retryable/terminal split: fail-closed at-most-once
+// belongs on the external mutation, never on a pre-mutation read (gc-372.1 — a
+// transient dolt circuit-breaker cooldown during the in-flight read must not
+// fail a cycle terminally).
+type Preflighter interface {
+	// Preflight reports whether the mutation should be skipped entirely
+	// (recorded as "skipped-inflight" without executing). A plain error means
+	// the check itself could not run; the caller retries the whole Propose. A
+	// *PermanentPreflightError means no retry can help; the caller records it
+	// terminally instead.
+	Preflight(ctx context.Context, m ProposedMutation) (skip bool, err error)
+}
+
+// PermanentPreflightError marks a preflight failure no retry can fix — a
+// configuration or validation defect in the mutation itself. RealAdapter
+// records it as a terminal failed key (fail-closed, like a failed run) so a
+// config error is never masked behind an in-flight skip or burned as retries.
+type PermanentPreflightError struct{ Err error }
+
+func (e *PermanentPreflightError) Error() string { return e.Err.Error() }
+func (e *PermanentPreflightError) Unwrap() error { return e.Err }
+
 // beadIDRe extracts the first gc-bead id from `gc bd create` output.
 var beadIDRe = regexp.MustCompile(`gc-[a-z0-9]+`)
 
@@ -72,6 +98,9 @@ type ExecRunner struct {
 	// tree — defence against a future caller pointing --body-file at a secret.
 	ScratchRoot string
 }
+
+// compile-time proof ExecRunner carries the pre-claim guard contract.
+var _ Preflighter = (*ExecRunner)(nil)
 
 // NewExecRunner returns a runner with the default allowlist and the gascity rig.
 func NewExecRunner(dir string) *ExecRunner {
@@ -127,36 +156,58 @@ func (r *ExecRunner) Run(ctx context.Context, m ProposedMutation) (string, error
 	return r.exec1(ctx, argv[0], argv[1:]...)
 }
 
-// runSelection mirrors bin/maintenance-cycle's create_and_sling: skip if a same-
-// half bead is already open (the in-flight guard that prevents pileup across
-// ticks), else create a tracking bead (body from the BodyFile path, with the
-// loop-close metadata) and sling it to the polecat with --no-formula --nudge.
-// Returns the created bead id, or "skipped-inflight" when the guard fires.
+// Preflight validates the selection's permanent inputs, then runs the
+// in-flight guard: skip when an open bead already carries the half label
+// (prevents pileup across ticks). Validation comes first, mirroring the old
+// runSelection order, so a configuration defect surfaces terminally (as a
+// *PermanentPreflightError) even when an in-flight bead would otherwise skip
+// this cycle — a config error must never be masked by a skip. The guard itself
+// executes no mutation — only the `gc bd list` read — so RealAdapter runs it
+// before claiming the idempotency key, and a transient dolt outage here
+// surfaces as a retryable error instead of a terminal execstore stamp
+// (gc-372.1). Actions other than selection have no preflight.
+func (r *ExecRunner) Preflight(ctx context.Context, m ProposedMutation) (bool, error) {
+	if m.Action != ActionSelection {
+		return false, nil
+	}
+	if _, err := r.validateSelection(m); err != nil {
+		return false, &PermanentPreflightError{Err: err}
+	}
+	half := m.Params["half_label"]
+	if half == "" {
+		return false, nil
+	}
+	return r.halfInflight(ctx, half)
+}
+
+// validateSelection checks the selection inputs no retry can repair — required
+// params and the BodyFile path — returning the validated body path. Shared by
+// Preflight (so a config error beats the skip) and runSelection (so Run stays
+// safe standalone).
+func (r *ExecRunner) validateSelection(m ProposedMutation) (string, error) {
+	if m.Params["polecat"] == "" || m.Params["title"] == "" {
+		return "", fmt.Errorf("ExecRunner selection: params polecat and title are required")
+	}
+	return r.validateBodyFile(m.BodyFile)
+}
+
+// runSelection mirrors bin/maintenance-cycle's create_and_sling: create a
+// tracking bead (body from the BodyFile path, with the loop-close metadata) and
+// sling it to the polecat with --no-formula --nudge. Returns the created bead
+// id. The same-half in-flight guard lives in Preflight, which RealAdapter runs
+// before the at-most-once claim — by the time Run executes, the guard has
+// passed.
 //
 // Required Params: "polecat", "title". Optional: "priority" (default "1"),
-// "labels", "half_label" (the in-flight guard label), "slack_channel"/"pl_agent"
-// (loop-close metadata). Required: BodyFile (the polecat prompt, worker-local,
-// never in history) — an absolute path, confined to ScratchRoot when one is set.
+// "labels", "slack_channel"/"pl_agent" (loop-close metadata). Required:
+// BodyFile (the polecat prompt, worker-local, never in history) — an absolute
+// path, confined to ScratchRoot when one is set.
 func (r *ExecRunner) runSelection(ctx context.Context, m ProposedMutation) (string, error) {
 	polecat := m.Params["polecat"]
 	title := m.Params["title"]
-	if polecat == "" || title == "" {
-		return "", fmt.Errorf("ExecRunner selection: params polecat and title are required")
-	}
-	body, err := r.validateBodyFile(m.BodyFile)
+	body, err := r.validateSelection(m)
 	if err != nil {
 		return "", err
-	}
-
-	// In-flight guard: don't stack a second same-half bead while one is open.
-	if half := m.Params["half_label"]; half != "" {
-		inflight, err := r.halfInflight(ctx, half)
-		if err != nil {
-			return "", err
-		}
-		if inflight {
-			return "skipped-inflight", nil
-		}
 	}
 
 	priority := m.Params["priority"]

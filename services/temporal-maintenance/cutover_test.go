@@ -1,6 +1,9 @@
 package temporalmaintenance
 
 import (
+	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -27,6 +30,51 @@ func TestDispatchOnly_CompletesAfterSelection(t *testing.T) {
 	require.Len(t, out.BeadIDs, 2, "both selection beads dispatched")
 	require.False(t, out.NeedsHuman, "dispatch-only never opens a gate")
 	require.Len(t, adapter.Recorded(), 2, "two selection proposals, no gated action")
+}
+
+// blipRunner fails its first failsLeft preflights the way a dolt
+// circuit-breaker cooldown does, then recovers; Run always succeeds.
+type blipRunner struct {
+	recordingRunner
+	failsLeft int64
+}
+
+func (b *blipRunner) Preflight(_ context.Context, _ ProposedMutation) (bool, error) {
+	if atomic.AddInt64(&b.failsLeft, -1) >= 0 {
+		return false, errors.New("dolt circuit breaker is open: server appears down (cooldown 5s)")
+	}
+	return false, nil
+}
+
+// The 2026-07-21T10:00Z failure shape, fixed: a transient dolt outage during
+// the selection in-flight read is retried by the Activity RetryPolicy and the
+// cycle Completes, instead of stamping a terminal execstore key and failing
+// the workflow (gc-372.1).
+func TestDispatchOnly_RecoversFromTransientSelectionBlip(t *testing.T) {
+	store, err := NewKeyStore(t.TempDir())
+	require.NoError(t, err)
+	br := &blipRunner{failsLeft: 2} // outage spans the first two attempts
+	adapter := NewArmedRealAdapter(store, br)
+	env := newEnv(t, adapter)
+
+	env.ExecuteWorkflow(MaintenanceCycleWorkflow, MaintenanceCycleInput{
+		Repo: "gastownhall-gascity", CycleKey: "blip", DispatchOnly: true,
+	})
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError(), "a transient pre-claim blip must not fail the cycle")
+
+	var out MaintenanceCycleState
+	require.NoError(t, env.GetWorkflowResult(&out))
+	require.Equal(t, PhaseDone, out.Phase)
+	require.Equal(t, 2, br.count(), "each branch's selection executed exactly once despite the retries")
+	// No terminal or pending debris: both keys are recorded done.
+	recs, err := store.All()
+	require.NoError(t, err)
+	require.Len(t, recs, 2)
+	for _, rec := range recs {
+		require.Equal(t, ExecDone, rec.Status, "key %s", rec.Key)
+	}
 }
 
 // With no CycleKey (a recurring Schedule's static input), the workflow derives a
