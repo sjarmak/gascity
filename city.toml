@@ -679,34 +679,42 @@ mouse_mode = "on"
 [[patches.agent]]
 dir = "/home/ds/gas-city"
 name = "city-infra-polecat"
+provider = "claude-4"
 suspended = true
 
 [[patches.agent]]
 dir = "/home/ds/gascity-dashboard"
 name = "gascity-dashboard-worker"
-provider = "claude-4"
+provider = "claude-2"
 suspended = true
 
 [[patches.agent]]
 dir = "/home/ds/gascity-packs"
 name = "gascity-packs-polecat"
+provider = "claude-5"
 suspended = true
 
+# Resumed 2026-07-22 by Stephanie's city-health instruction, delegated via
+# maintenance PL mail gc-540923: three verified stranded beads need a healthy
+# gascity polecat target before reassignment and one morning-triage run.
+# Re-suspend only on a new Stephanie/maintenance-PL instruction after that
+# bounded recovery, or if the target becomes unsafe; do not force-spawn here.
 [[patches.agent]]
 dir = "/home/ds/gascity"
 name = "polecat"
-provider = "claude-5"
-suspended = true
+provider = "claude-2"
+suspended = false
 
 [[patches.agent]]
 dir = "/home/ds/projects/CodeScaleBench"
 name = "codescalebench-worker"
-provider = "claude-2"
+provider = "claude-4"
 suspended = true
 
 [[patches.agent]]
 dir = "/home/ds/projects/EnterpriseBench"
 name = "enterprisebench-worker"
+provider = "claude-4"
 suspended = true
 
 [[patches.agent]]
@@ -717,49 +725,55 @@ suspended = true
 [[patches.agent]]
 dir = "/home/ds/projects/agent-diagnostics"
 name = "agent-diagnostics-worker"
+provider = "claude-4"
 suspended = true
 
 [[patches.agent]]
 dir = "/home/ds/projects/background-agents"
 name = "background-agents-worker"
+provider = "claude-4"
 suspended = true
 
 [[patches.agent]]
 dir = "/home/ds/projects/code-intelligence-digest"
 name = "code-intel-digest-worker"
+provider = "claude-5"
 suspended = true
 
 [[patches.agent]]
 dir = "/home/ds/projects/codeprobe"
 name = "codeprobe-worker"
+provider = "claude-5"
 suspended = true
 
 [[patches.agent]]
 dir = "/home/ds/projects/live_docs"
 name = "live_docs-worker"
-provider = "claude-4"
+provider = "claude-2"
 suspended = true
 
 [[patches.agent]]
 dir = "/home/ds/projects/mcp-ax"
 name = "mcp-ax-worker"
+provider = "claude-2"
 suspended = true
 
 [[patches.agent]]
 dir = "/home/ds/projects/mem"
 name = "mem-arm"
+provider = "claude-2"
 suspended = true
 
 [[patches.agent]]
 dir = "/home/ds/projects/mem"
 name = "mem-worker"
-provider = "claude-4"
+provider = "claude-2"
 suspended = true
 
 [[patches.agent]]
 dir = "/home/ds/projects/migration-evals"
 name = "migration-evals-worker"
-provider = "claude-3"
+provider = "claude-2"
 suspended = true
 
 [[patches.agent]]
@@ -770,18 +784,19 @@ suspended = true
 [[patches.agent]]
 dir = "/home/ds/projects/scix_experiments"
 name = "meta-reviewer"
-provider = "claude-3"
+provider = "claude-2"
 suspended = true
 
 [[patches.agent]]
 dir = "/home/ds/projects/scix_experiments"
 name = "scix-worker"
+provider = "claude-2"
 suspended = true
 
 [[patches.agent]]
 dir = "/home/ds/projects/zeldascension"
 name = "zeldascension-worker"
-provider = "claude-3"
+provider = "claude-4"
 suspended = true
 
 [beads]
