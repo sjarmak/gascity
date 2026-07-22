@@ -74,7 +74,10 @@ and is not wired for this command; use --format=json.`,
 }
 
 func newBeadsShowCmd(stdout, stderr io.Writer) *cobra.Command {
-	var format string
+	var (
+		format    string
+		execution bool
+	)
 	cmd := &cobra.Command{
 		Use:   "show <bead-id>",
 		Short: "Show a single bead (API-routed with bd fallback)",
@@ -85,9 +88,17 @@ otherwise.
 Supports --format. --format=json emits JSON (API-path JSON includes
 _cache_age_s; fallback-path JSON omits it). The bare --json flag is
 reserved by the CLI's JSON-contract layer and is not wired for this
-command; use --format=json.`,
+command; use --format=json.
+
+--execution renders a read-only execution projection instead of the plain
+bead: it correlates the bead with its active graph workflow(s), current
+step and assignee, matching live session, and target-worktree git state,
+with warnings when the underlying metadata is ambiguous. It reads live
+store state directly (local city only) and mutates nothing.`,
 		Example: `  gc beads show ga-abc
-  gc beads show ga-abc --format=json`,
+  gc beads show ga-abc --format=json
+  gc beads show ga-abc --execution
+  gc beads show ga-abc --execution --format=json`,
 		// MaximumNArgs(1), not ExactArgs(1): a missing id must reach the internal
 		// guard AFTER resolveReadTarget (so a resolve error still takes
 		// precedence), which the routeReadCmdWithHooks ordering in cmdBeadsShow
@@ -99,13 +110,18 @@ command; use --format=json.`,
 			if len(args) > 0 {
 				id = args[0]
 			}
-			if cmdBeadsShow(id, format, stdout, stderr) != 0 {
+			run := cmdBeadsShow
+			if execution {
+				run = cmdBeadsShowExecution
+			}
+			if run(id, format, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&format, "format", "text", "output format: text or json")
+	cmd.Flags().BoolVar(&execution, "execution", false, "render the read-only execution projection (workflow/step/session/worktree correlation)")
 	return cmd
 }
 

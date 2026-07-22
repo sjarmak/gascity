@@ -3,6 +3,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -285,6 +286,67 @@ func (g *Git) AheadBehindCtx(ctx context.Context) (ahead, behind int, err error)
 		return 0, 0, fmt.Errorf("parsing behind count: %w", err)
 	}
 	return ahead, behind, nil
+}
+
+// Head returns the full 40-char SHA of the current HEAD commit.
+func (g *Git) Head() (string, error) {
+	return g.HeadCtx(context.Background())
+}
+
+// HeadCtx is like Head but accepts a context.
+func (g *Git) HeadCtx(ctx context.Context) (string, error) {
+	out, err := g.runCtx(ctx, "rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// CommitsAhead returns the number of commits reachable from HEAD but not from
+// base (i.e. `git rev-list --count base..HEAD`). It errors if base cannot be
+// resolved.
+func (g *Git) CommitsAhead(base string) (int, error) {
+	return g.CommitsAheadCtx(context.Background(), base)
+}
+
+// CommitsAheadCtx is like CommitsAhead but accepts a context.
+func (g *Git) CommitsAheadCtx(ctx context.Context, base string) (int, error) {
+	out, err := g.runCtx(ctx, "rev-list", "--count", base+"..HEAD")
+	if err != nil {
+		return 0, err
+	}
+	var n int
+	trimmed := strings.TrimSpace(out)
+	if c, err := fmt.Sscanf(trimmed, "%d", &n); err != nil || c != 1 {
+		return 0, fmt.Errorf("parsing rev-list count %q: %w", trimmed, err)
+	}
+	return n, nil
+}
+
+// IsAncestor reports whether ancestor is an ancestor of (reachable from)
+// descendant. A clean "not an ancestor" result (git exit code 1) returns
+// (false, nil); any other failure (unresolvable ref, git error) returns an
+// error so callers do not mistake a broken probe for a negative answer.
+func (g *Git) IsAncestor(ancestor, descendant string) (bool, error) {
+	return g.IsAncestorCtx(context.Background(), ancestor, descendant)
+}
+
+// IsAncestorCtx is like IsAncestor but accepts a context.
+func (g *Git) IsAncestorCtx(ctx context.Context, ancestor, descendant string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "git", "merge-base", "--is-ancestor", ancestor, descendant)
+	cmd.Dir = g.workDir
+	cmd.Env = sanitizeGitEnv(os.Environ())
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+	// Exit code 1 is git's documented "not an ancestor" signal, not a fault.
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("git merge-base --is-ancestor %s %s: %s: %w",
+		ancestor, descendant, strings.TrimSpace(string(out)), err)
 }
 
 // gitEnvBlacklist lists git environment variables that must be stripped

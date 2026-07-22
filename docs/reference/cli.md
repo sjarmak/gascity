@@ -428,6 +428,12 @@ _cache_age_s; fallback-path JSON omits it). The bare --json flag is
 reserved by the CLI's JSON-contract layer and is not wired for this
 command; use --format=json.
 
+--execution renders a read-only execution projection instead of the plain
+bead: it correlates the bead with its active graph workflow(s), current
+step and assignee, matching live session, and target-worktree git state,
+with warnings when the underlying metadata is ambiguous. It reads live
+store state directly (local city only) and mutates nothing.
+
 ```
 gc beads show <bead-id> [flags]
 ```
@@ -437,10 +443,13 @@ gc beads show <bead-id> [flags]
 ```
 gc beads show ga-abc
 gc beads show ga-abc --format=json
+gc beads show ga-abc --execution
+gc beads show ga-abc --execution --format=json
 ```
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--execution` | bool |  | render the read-only execution projection (workflow/step/session/worktree correlation) |
 | `--format` | string | `text` | output format: text or json |
 
 ## gc build-image
