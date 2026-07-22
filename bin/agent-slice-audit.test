@@ -18,6 +18,8 @@
 #   4. pane enumeration fails                   -> exit 2 (inconclusive != pass)
 #   5. gc-keepalive (infra, not an agent)       -> skipped, not flagged
 #   6. pane exits mid-audit (empty cgroup)      -> reported GONE, not ESCAPED
+#   7. --fix clamps every escape                -> exit 0 (safe to schedule)
+#   8. --fix and a clamp FAILS                  -> exit 1 (still uncontained)
 #
 # Run:  bash /home/ds/gas-city/bin/agent-slice-audit.test
 
@@ -131,6 +133,30 @@ if [ "$rc" -eq 0 ] && grep -q 'mayor.*GONE' <<< "$out"; then
   ok "6. pane gone mid-audit -> GONE, not a false ESCAPED"
 else
   bad "6. pane gone mid-audit -> GONE" "rc=$rc out=$out"
+fi
+
+# --- case 7: --fix that contains everything is a PASS ------------------------
+# This is the contract that makes the order schedulable. Escapes are a race and
+# therefore routine; red must mean "could not contain", never "it happened".
+out="$(AGENT_SLICE_AUDIT_PANES_CMD="printf 'city-infra-pl\t1163666\nmayor\t1163670\n'" \
+       AGENT_SLICE_AUDIT_CGROUP_CMD="$(mk_cgroup_cmd "$WORK/t2")" \
+       AGENT_SLICE_AUDIT_APPLY_CMD="true" \
+       bash "$AUDIT" --fix 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'nothing left uncontained' <<< "$out"; then
+  ok "7. --fix clamped everything -> exit 0, schedulable without going red"
+else
+  bad "7. --fix clamped everything -> exit 0" "rc=$rc out=$out"
+fi
+
+# --- case 8: a FAILED clamp must still be red -------------------------------
+out="$(AGENT_SLICE_AUDIT_PANES_CMD="printf 'city-infra-pl\t1163666\nmayor\t1163670\n'" \
+       AGENT_SLICE_AUDIT_CGROUP_CMD="$(mk_cgroup_cmd "$WORK/t2")" \
+       AGENT_SLICE_AUDIT_APPLY_CMD="false" \
+       bash "$AUDIT" --fix 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && grep -q 'STILL UNCONTAINED' <<< "$out"; then
+  ok "8. --fix with a failing clamp -> exit 1, does not report success"
+else
+  bad "8. --fix with a failing clamp -> exit 1" "rc=$rc out=$out"
 fi
 
 echo

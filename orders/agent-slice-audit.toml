@@ -1,0 +1,42 @@
+# Agent-slice audit — contain panes that escape gascity-agents.slice.
+#
+# Incident 2026-07-22 ("crew unavailable"), approved by Stephanie in-session.
+#
+# gc wraps every agent pane in `systemd-run --scope --slice=gascity-agents.slice`
+# so agents inherit that slice's MemorySwapMax=0 and its memory ceiling. Stock
+# Ubuntu tmux also creates its own transient tmux-spawn-*.scope per pane under
+# app.slice, and the two race. Measured escape rate on this host: 1 in 3 (three
+# polecats spawned in the same second; two contained, one escaped). An escaped
+# pane has no ceiling of its own. On 2026-07-22 an escaped mayor pane filled all
+# 8G of host swap with concurrent ~455M `gc` invocations, drove load to 104 at
+# 91% sys CPU, starved the dolt sql-server to a 105s bead-read p95, and stopped
+# the supervisor API from answering — which reads as "crew unavailable" while
+# every agent is alive.
+#
+# Placement is re-rolled on EVERY respawn, so this cannot be fixed by config and
+# a pane that is contained now can be uncontained after the next restart. This
+# order bounds the exposure window to one interval. It is damage control; the
+# actual fix is deterministic placement at spawn time (bead gc-j7bm), and this
+# order should be retired when that lands.
+#
+# --fix clamps each escaped scope in place (MemorySwapMax=0 + ceilings). It
+# deliberately does NOT re-parent the pane: systemd has no operation to move a
+# running process between scopes, and restarting the pane just re-rolls the
+# race. The clamp dies with the pane, which is exactly why this must recur
+# rather than run once.
+#
+# Exit contract (see bin/agent-slice-audit.test cases 7 and 8): escapes are
+# routine, so "found and clamped" exits 0. Red means the audit could NOT
+# contain something, or could not enumerate panes at all — never merely that an
+# escape occurred. An order that went red on every escape would be red most of
+# the time and would train everyone to ignore it.
+#
+# cooldown, not cron: no zero-lastRun bootstrap trap, and it self-paces.
+
+[order]
+description = "Every 15m: find agent panes outside gascity-agents.slice and clamp them in place (MemorySwapMax=0 + ceilings). Silent when clean; red only when a pane could not be contained."
+trigger = "cooldown"
+interval = "15m"
+exec = "/home/ds/gas-city/bin/agent-slice-audit --fix"
+timeout = "3m"
+idempotent = true

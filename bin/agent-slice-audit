@@ -22,8 +22,17 @@
 # race; this is the detection half. Run it after any mayor/PL restart and on a
 # schedule.
 #
-# Exit codes:  0 = every agent pane contained,  1 = at least one escaped,
-#              2 = could not enumerate panes (audit inconclusive, NOT a pass)
+# Exit codes:
+#   0 = nothing left uncontained. Either every pane was already in the slice,
+#       or --fix clamped every escape it found.
+#   1 = something is uncontained RIGHT NOW: an escape was found and either
+#       --fix was not given, or a clamp failed.
+#   2 = could not enumerate panes. Inconclusive, and deliberately NOT a pass.
+#
+# The exit-0-after-clamp case is what makes this safe to schedule: escapes are
+# expected (they are a race, see below), so an order that went red on every
+# escape would be red most of the time and would train everyone to ignore it.
+# Red here means "I could not contain it", not "it happened".
 #
 # Usage:
 #   bin/agent-slice-audit             # report only
@@ -116,6 +125,7 @@ fi
 
 escaped=0
 checked=0
+clamped=0
 printf '%-34s %-9s %s\n' "SESSION" "PANE_PID" "PLACEMENT"
 
 while IFS=$'\t' read -r session pid; do
@@ -139,6 +149,7 @@ while IFS=$'\t' read -r session pid; do
       printf '%-34s %-9s %s\n' "$session" "$pid" "ESCAPED -> ${cgroup}"
       if [ "$FIX" -eq 1 ]; then
         if out="$(apply_caps "$unit")"; then
+          clamped=$((clamped + 1))
           printf '%-34s %-9s %s\n' "" "" \
             "clamped ${unit} swap=${SWAP_MAX} high=${MEM_HIGH} max=${MEM_MAX}"
         else
@@ -152,7 +163,15 @@ done <<< "$panes"
 echo
 if [ "$escaped" -gt 0 ]; then
   echo "agent-slice-audit: ${escaped}/${checked} agent pane(s) OUTSIDE ${SLICE}"
-  [ "$FIX" -eq 0 ] && echo "agent-slice-audit: re-run with --fix to clamp them in place"
+  if [ "$FIX" -eq 0 ]; then
+    echo "agent-slice-audit: re-run with --fix to clamp them in place"
+    exit 1
+  fi
+  if [ "$clamped" -eq "$escaped" ]; then
+    echo "agent-slice-audit: clamped ${clamped}/${escaped}; nothing left uncontained"
+    exit 0
+  fi
+  echo "agent-slice-audit: clamped ${clamped}/${escaped}; $((escaped - clamped)) STILL UNCONTAINED" >&2
   exit 1
 fi
 
