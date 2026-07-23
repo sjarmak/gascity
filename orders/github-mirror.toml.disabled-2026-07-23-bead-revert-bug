@@ -1,0 +1,61 @@
+# DISABLED 2026-07-23 (bead-revert-bug, dr-3f34): push was reopening closed
+# beads. Root cause fixed on this branch (e3dbe4e, then 5d683de hardened the
+# same reconcile path) but NOT YET RE-ENABLED here.
+#
+# RE-ENABLE CHECKLIST — read before restoring this file:
+# - ~45 issues on sjarmak/codeprobe-beads are open on GitHub against beads
+#   that were re-closed locally on 2026-07-23 (dr-3f34 cleanup). bin/github-
+#   mirror's mirror_set() only re-pushes a closed bead's close within
+#   MIRROR_CLOSED_DAYS (14) of that bead's updated_at — i.e. only if this
+#   order is re-enabled by ~2026-08-06. Miss that date and push will silently
+#   skip those beads forever; nothing else closes the issues for you.
+# - bin/github-mirror-reconcile's MIRROR-STALE-CLOSE finding (5d683de) DOES
+#   alert on this once the order (and therefore reconcile) is running again,
+#   even past the 2026-08-06 cutoff — but only reactively, and it does not
+#   auto-fix. If re-enabling after that date, either close the ~45 issues by
+#   hand first, or temporarily raise MIRROR_CLOSED_DAYS enough to pull them
+#   back inside the re-push window for one cycle, then restore it to 14.
+# - Reconcile does not run at all while this order stays disabled, so this
+#   deadline gets no live warning anywhere else — check it by hand.
+#
+# github-mirror — push-mirror real work beads to private per-rig mirror repos,
+# then sync the Projects v2 kanban (https://github.com/users/sjarmak/projects/2).
+# Installed 2026-07-19 per Stephanie session approval ("do it", 2026-07-18/19
+# session: beads↔GitHub mirror pilot). Design + evidence:
+# docs/design/github-mirror-pilot.md. Staged proposal copy:
+# docs/design/github-mirror/github-mirror.toml.
+# Mirror target decision (Stephanie 2026-07-19): PRIVATE sibling repos
+# (sjarmak/mem-beads, sjarmak/codeprobe-beads) — code repos are public and
+# bead bodies carry internal eval/infra detail (no-public-claims rule).
+# Requires patched bd 1.1.0 (56e6f65da, beads#4329 cherry-pick); stock 1.1.0
+# re-PATCHes the whole set every run (#4214). Undo: remove this file; then per
+# rig `bd config unset github.repository`.
+
+# Phase 3 added 2026-07-19 (Stephanie: "go ahead with phase 3"): exec switched
+# from bin/github-mirror to bin/github-mirror-cycle = reconcile THEN push+board.
+# Reconcile ingests human-filed mirror issues (triage-gated: deferred +
+# origin:github) and runs the loss/drift sweep (Slack #gascity-maintenance +
+# mayor nudge on fresh findings, 24h dedup, silent when clean). Reconcile MUST
+# run before push: it labels gh-closed-pending-triage beads so the push cannot
+# revert a human's GitHub-side close (e2e test showed push reopening a
+# human-closed issue when run first). Undo: restore exec from the
+# .bak-phase3-cycle-* snapshot.
+[order]
+description = "Beads mirror cycle: reconcile (intake + loss sweep) then push + kanban (mem, codeprobe)"
+trigger = "cooldown"
+interval = "45m"
+exec = "/home/ds/gas-city/bin/github-mirror-cycle"
+timeout = "900s"                 # steady-state runs are seconds; headroom for backlog catch-up
+idempotent = true                # re-fire safe: #4329 content-hash skips already-pushed beads without API calls
+
+[order.env]
+MIRROR_RIGS = "/home/ds/projects/mem /home/ds/projects/codeprobe"
+MIRROR_MODE = "--execute"        # flipped by Stephanie 2026-07-19 (session approval after dry-run review; supervised initial population: mem 144, codeprobe 26+1-removed, 0 errors)
+MIRROR_REPO_ALLOWLIST = "sjarmak/"   # hard guard: never mirror to gastownhall/* or other unowned upstreams
+MIRROR_MAX_CREATE = "300"        # abort a rig if new-issue creations would exceed this (blast-radius cap)
+MIRROR_CLOSED_DAYS = "14"        # closed-but-mirrored beads re-pushed within this window so closes propagate
+MIRROR_PROJECT_OWNER = "sjarmak"
+MIRROR_PROJECT_NUMBER = "2"      # "Gas City — beads kanban" (private user project, created 2026-07-19)
+RECONCILE_SLACK = "1"            # fresh findings -> #gascity-maintenance + mayor nudge; silent when clean
+RECONCILE_REALERT_HOURS = "24"
+RECONCILE_UNPUSHED_HOURS = "2"   # active real bead with no mirror issue after this = mirror-gap finding

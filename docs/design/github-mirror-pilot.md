@@ -143,11 +143,23 @@ cleaned up).
   bd subprocess (`rig_env()`). Applies to ANY rig-targeting order script.
 - **Loss/drift sweep**, per rig, findings reported not auto-fixed:
   ISSUE-MISSING (mirrored bead, issue deleted), UNPUSHED (active real bead
-  with no issue after 2h = mirror gap), GH-CLOSED (above), INTAKE/CONFIG
+  with no issue after 2h = mirror gap), GH-CLOSED (above), MIRROR-STALE-CLOSE
+  (issue still open on GitHub after its matching bead closed longer ago than
+  `MIRROR_CLOSED_DAYS` — `bin/github-mirror`'s push window has already
+  excluded it and nothing else will close it; added 5d683de after dr-3f34
+  review found the pair fell through both branches silently), INTAKE/CONFIG
   errors. Fresh findings (24h fingerprint dedup,
   `.gc/github-mirror-reconcile-state.json`) post to #gascity-maintenance +
   mayor nudge (stall-watch idiom); silent when clean. Audit:
   `.gc/github-mirror-reconcile.log`.
+- **Known gap while the order is disabled (2026-07-23 bead-revert-bug)**:
+  reconcile only runs as part of this same order, so MIRROR-STALE-CLOSE gets
+  no chance to fire until the order is re-enabled. ~45 issues on
+  sjarmak/codeprobe-beads are open against beads re-closed 2026-07-23; the
+  push re-close window for them expires ~2026-08-06 (`MIRROR_CLOSED_DAYS` =
+  14). Re-enable checklist and remedy live as a comment in
+  `orders/github-mirror.toml.disabled-2026-07-23-bead-revert-bug` — read it
+  before restoring the order past that date.
 
 ## Open questions
 
@@ -212,3 +224,100 @@ Promotion is intentionally staged:
 5. Install a central dry-run/execute order only after idempotence and cutover
    evidence are reviewed. The central repository never becomes an intake
    path.
+
+## Direction correction — issue-native planning (2026-07-21)
+
+Stephanie rejected the staged successor's renderer-only end state and directed
+the citywide system to follow `jarmak-personal/hvir#50`. The section above is
+retained as migration history, but its final sentence and continuous central
+rendering plan are superseded. **Do not promote `bin/github-central-mirror` as
+a recurring mirror or populate `gas-city-beads` from its current plan.** The
+mem/codeprobe pilot remains temporary containment while the issue-native
+replacement is built.
+
+The target is one repository-visible planning system:
+
+- `sjarmak/gas-city-beads` issues are the canonical durable planning records.
+- The canonical Project must reproduce the visible structure and lifecycle of
+  `jarmak-personal` Project #1 (`hvir Issue Tracker`). The existing private
+  `Gas City — beads kanban` Project #2 is an interim linked pilot, not the
+  parity target.
+- Exactly one `kind:*` label owns categorical kind. Zero or more `area:*`
+  labels remain multi-valued. A single `rig:*` label identifies execution
+  ownership. Project `Kind` is a one-way derivation from `kind:*`.
+- Project `Status` is planning state, not a duplicate bead status. Normal
+  movement is monotonic: Todo → In Progress; native issue closure owns Done.
+- Repository-owned event workflows handle issue/label/PR planning events.
+  Manual or infrequent reconciliation is a safety net, not the normal path.
+- Native closing references mean “this PR completes this issue.” An exact
+  `Contributes-to: #N` trailer means “this PR advances this issue without
+  completing it.” PRs are not duplicate planning cards.
+- Agents use one normalized repository-owned interface for issue + Project
+  reads and explicit `--apply` mutations; ProjectV2 node, field, and option IDs
+  remain implementation details.
+
+Reference parity is concrete, not stylistic shorthand:
+
+- `Status` has exactly `Todo`, `In Progress`, and `Done`.
+- `Kind` maps `kind:epic`, `kind:feature`, `kind:bug`, `kind:refactor`,
+  `kind:docs`, `kind:maintenance`, and `kind:enhancement` to the matching
+  title-case options.
+- The saved table views are `General` (`is:open`, grouped by Parent issue),
+  `Open Epics`, `Feature requests`, `Bugs`, and `Completed Work`, with the
+  reference filters and visible fields preserved.
+- PR lifecycle automation performs only the reference's monotonic
+  `Todo` → `In Progress` transition after current-state revalidation. Native
+  issue closure owns `Done`; no custom path demotes Status.
+- Repository-specific `rig:*`, priority, and area labels may extend filtering,
+  but they do not replace or distort the reference field/view contract.
+
+GitHub's Project-copy operation is the safe bootstrap because it preserves
+views, custom fields, configured workflows except auto-add, and insights while
+copying no source items, collaborators, or repository links. Destructively
+reshaping Project #2 would disturb its 196 pilot cards, and GitHub exposes no
+GraphQL mutation for recreating saved views. Copying, linking the copy, and
+unlinking Project #2 are therefore separate externally gated actions.
+
+Gas City still needs beads, but only as the execution plane. Field ownership is
+strict rather than bidirectional:
+
+| State | Owner |
+|---|---|
+| Issue identity, title/body, hierarchy, kind/area/rig/priority labels, open/closed | GitHub issue |
+| Project Kind | Derived from issue `kind:*` |
+| Project Status | GitHub Project + monotonic lifecycle automation |
+| Route, assignee, formula, session, attempt, evidence, execution dependency | Bead |
+| Issue ↔ execution binding | Immutable issue URL on the materialized bead, or a dedicated metadata key when `external_ref` is already occupied |
+
+The only supported cross-plane operations are bounded and idempotent:
+
+1. **One-time import:** turn selected persistent beads into canonical issues,
+   preserving provenance and hierarchy, then stop rendering those beads.
+2. **Materialize for dispatch:** an explicit ready-for-dispatch issue signal
+   creates or finds one bound bead. The bead is runtime state, not a second
+   editable planning record.
+3. **Report completion:** execution evidence may comment on and close the bound
+   issue; issue closure and Project Done remain GitHub-owned outcomes.
+
+Implementation order:
+
+1. Document the final taxonomy, field ownership, normalized record, and
+   issue/PR lifecycle contracts based on hvir's proven boundaries.
+2. Port the repository-owned Project client, pagination/retry layer, kind
+   policy, normalized-record CLI, PR relationship parser, workflows, security
+   tests, and agent issue-management skill into `gas-city-beads`.
+3. With separate external approvals, copy hvir Project #1 without items, link
+   the copy to the repo, update the repository defaults to its number, and only
+   then unlink the interim Project #2. Provision the reference label taxonomy
+   and create one canary issue in later gated actions.
+4. Demonstrate repeated/out-of-order event convergence and a complete
+   issue → materialized bead → execution evidence → closed issue loop.
+5. Run a fresh, reviewed one-time import plan in bounded batches. Pause and
+   drain the pilot before transfers; never run pilot writes and cutover writes
+   concurrently.
+6. Retire the per-rig polling mirror only after the issue-native loop and
+   import reconciliation are independently verified.
+
+External mutations remain individually gated: Project-to-repository linking,
+field/label creation, canary issue creation, transfers, bulk imports, workflow
+publication, secret/environment setup, and pilot-repository archival.
