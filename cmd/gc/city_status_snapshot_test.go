@@ -736,3 +736,89 @@ func TestCityStatusObservationsRunInParallel(t *testing.T) {
 		t.Fatalf("elapsed = %v, want < %v (likely serial); maxConcurrent = %d", elapsed, maxAllowed, maxConcurrent)
 	}
 }
+
+// TestRenderCityStatusTextPartialSummaryCountsUnknown covers #4579 defect 1:
+// during partial status the summary line must report unknown agents
+// separately instead of silently folding them into "not running".
+func TestRenderCityStatusTextPartialSummaryCountsUnknown(t *testing.T) {
+	snapshot := cityStatusSnapshot{
+		CityName: "city",
+		CityPath: "/home/user/city",
+		Partial:  true,
+		Agents: []cityStatusAgentRow{
+			{Agent: StatusAgentJSON{QualifiedName: "mayor", Running: true}, SessionName: "gt-mayor"},
+			{Agent: StatusAgentJSON{QualifiedName: "crew-1", Running: false}, SessionName: "gt-crew-1"},
+			{Agent: StatusAgentJSON{QualifiedName: "crew-2", Running: false, Suspended: true}, SessionName: "gt-crew-2"},
+		},
+		Summary: StatusSummaryJSON{TotalAgents: 3, RunningAgents: 1},
+	}
+
+	var stdout bytes.Buffer
+	renderCityStatusText(snapshot, newDrainOps(runtime.NewFake()), &stdout)
+	out := stdout.String()
+
+	if !strings.Contains(out, "1 running, 2 unknown of 3 agents") {
+		t.Errorf("partial summary missing '1 running, 2 unknown of 3 agents', got:\n%s", out)
+	}
+	if strings.Contains(out, "1/3 agents running") {
+		t.Errorf("partial summary still renders '1/3 agents running' (counts unknown as not-running), got:\n%s", out)
+	}
+}
+
+// TestRenderCityStatusTextNonPartialSummaryUnchanged pins the pre-#4579
+// summary format when the runtime probe answered fully.
+func TestRenderCityStatusTextNonPartialSummaryUnchanged(t *testing.T) {
+	snapshot := cityStatusSnapshot{
+		CityName: "city",
+		CityPath: "/home/user/city",
+		Agents: []cityStatusAgentRow{
+			{Agent: StatusAgentJSON{QualifiedName: "mayor", Running: true}, SessionName: "gt-mayor"},
+			{Agent: StatusAgentJSON{QualifiedName: "crew-1", Running: false}, SessionName: "gt-crew-1"},
+		},
+		Summary: StatusSummaryJSON{TotalAgents: 2, RunningAgents: 1},
+	}
+
+	var stdout bytes.Buffer
+	renderCityStatusText(snapshot, newDrainOps(runtime.NewFake()), &stdout)
+	out := stdout.String()
+
+	if !strings.Contains(out, "1/2 agents running") {
+		t.Errorf("non-partial summary missing '1/2 agents running', got:\n%s", out)
+	}
+	if strings.Contains(out, "unknown of") {
+		t.Errorf("non-partial summary must not mention unknown, got:\n%s", out)
+	}
+}
+
+// TestRenderCityStatusTextWideNamesKeepGutter covers #4579 defect 2: an
+// agent name wider than the pad width must never run into the status
+// column with no separator.
+func TestRenderCityStatusTextWideNamesKeepGutter(t *testing.T) {
+	const wide = "tar-valon/core.control-dispatcher" // 33 chars > 24 pad
+	snapshot := cityStatusSnapshot{
+		CityName: "city",
+		CityPath: "/home/user/city",
+		Partial:  true,
+		Agents: []cityStatusAgentRow{
+			{Agent: StatusAgentJSON{QualifiedName: "core.control-dispatcher", Running: false}, SessionName: "a"},
+			{Agent: StatusAgentJSON{QualifiedName: wide, Running: false}, SessionName: "b"},
+		},
+		Summary: StatusSummaryJSON{TotalAgents: 2, RunningAgents: 0},
+	}
+
+	var stdout bytes.Buffer
+	renderCityStatusText(snapshot, newDrainOps(runtime.NewFake()), &stdout)
+	out := stdout.String()
+
+	if strings.Contains(out, wide+"unknown") {
+		t.Errorf("wide agent name runs into status column with no gutter, got:\n%s", out)
+	}
+	if !strings.Contains(out, wide+"  unknown") {
+		t.Errorf("wide agent name missing two-space gutter before status, got:\n%s", out)
+	}
+	// 23-char name: one under the 24 pad width, where %-24s left only a
+	// single space — the boundary the minimum gutter widens.
+	if !strings.Contains(out, "core.control-dispatcher  unknown") {
+		t.Errorf("23-char agent name missing two-space gutter before status, got:\n%s", out)
+	}
+}

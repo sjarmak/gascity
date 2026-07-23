@@ -491,6 +491,17 @@ func diagnosticPtr(diagnostic beads.BeadsDiagnostic) *beads.BeadsDiagnostic {
 	return &diagnostic
 }
 
+// padStatusColumn left-aligns name to width for column layout while
+// guaranteeing a minimum two-space gutter, so names wider than the column
+// never run into the value that follows (#4579).
+func padStatusColumn(name string, width int) string {
+	pad := width - len(name)
+	if pad < 2 {
+		pad = 2
+	}
+	return name + strings.Repeat(" ", pad)
+}
+
 func renderCityStatusText(snapshot cityStatusSnapshot, dops drainOps, stdout io.Writer) {
 	fmt.Fprintf(stdout, "%s  %s\n", snapshot.CityName, snapshot.CityPath)                //nolint:errcheck // best-effort stdout
 	fmt.Fprintf(stdout, "  Controller: %s\n", controllerStatusLine(snapshot.Controller)) //nolint:errcheck // best-effort stdout
@@ -512,24 +523,32 @@ func renderCityStatusText(snapshot cityStatusSnapshot, dops drainOps, stdout io.
 		fmt.Fprintln(stdout, "Agents:")
 		for _, row := range snapshot.Agents {
 			if row.ScaleLabel != "" {
-				fmt.Fprintf(stdout, "  %-24s%s\n", row.GroupName, row.ScaleLabel) //nolint:errcheck // best-effort stdout
+				fmt.Fprintf(stdout, "  %s%s\n", padStatusColumn(row.GroupName, 24), row.ScaleLabel) //nolint:errcheck // best-effort stdout
 			}
 			status := agentStatusLineWithPartial(row.Agent.Running, dops, row.SessionName, row.Agent.Suspended, snapshot.Partial)
 			if row.Expanded {
-				fmt.Fprintf(stdout, "    %-22s%s\n", row.Agent.QualifiedName, status) //nolint:errcheck // best-effort stdout
+				fmt.Fprintf(stdout, "    %s%s\n", padStatusColumn(row.Agent.QualifiedName, 22), status) //nolint:errcheck // best-effort stdout
 			} else {
-				fmt.Fprintf(stdout, "  %-24s%s\n", row.Agent.QualifiedName, status) //nolint:errcheck // best-effort stdout
+				fmt.Fprintf(stdout, "  %s%s\n", padStatusColumn(row.Agent.QualifiedName, 24), status) //nolint:errcheck // best-effort stdout
 			}
 		}
-		fmt.Fprintln(stdout)                                                                                        //nolint:errcheck // best-effort stdout
-		fmt.Fprintf(stdout, "%d/%d agents running\n", snapshot.Summary.RunningAgents, snapshot.Summary.TotalAgents) //nolint:errcheck // best-effort stdout
+		fmt.Fprintln(stdout) //nolint:errcheck // best-effort stdout
+		if snapshot.Partial {
+			// The probe timed out, so non-running rows render as unknown
+			// above; the summary must not fold them into "not running"
+			// (#4579, residual of #4343).
+			unknown := snapshot.Summary.TotalAgents - snapshot.Summary.RunningAgents
+			fmt.Fprintf(stdout, "%d running, %d unknown of %d agents\n", snapshot.Summary.RunningAgents, unknown, snapshot.Summary.TotalAgents) //nolint:errcheck // best-effort stdout
+		} else {
+			fmt.Fprintf(stdout, "%d/%d agents running\n", snapshot.Summary.RunningAgents, snapshot.Summary.TotalAgents) //nolint:errcheck // best-effort stdout
+		}
 	}
 
 	if len(snapshot.NamedSessions) > 0 {
 		fmt.Fprintln(stdout) //nolint:errcheck // best-effort stdout
 		fmt.Fprintln(stdout, "Named sessions:")
 		for _, named := range snapshot.NamedSessions {
-			fmt.Fprintf(stdout, "  %-24s%s (%s)\n", named.Identity, named.Status, named.Mode) //nolint:errcheck // best-effort stdout
+			fmt.Fprintf(stdout, "  %s%s (%s)\n", padStatusColumn(named.Identity, 24), named.Status, named.Mode) //nolint:errcheck // best-effort stdout
 		}
 	}
 
@@ -541,7 +560,7 @@ func renderCityStatusText(snapshot cityStatusSnapshot, dops drainOps, stdout io.
 			if r.Suspended {
 				annotation = "  (suspended)"
 			}
-			fmt.Fprintf(stdout, "  %-24s%s%s\n", r.Name, r.Path, annotation) //nolint:errcheck // best-effort stdout
+			fmt.Fprintf(stdout, "  %s%s%s\n", padStatusColumn(r.Name, 24), r.Path, annotation) //nolint:errcheck // best-effort stdout
 		}
 	}
 
