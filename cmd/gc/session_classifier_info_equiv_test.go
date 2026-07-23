@@ -1440,7 +1440,12 @@ func TestSessionClassifierInfoEquivalence(t *testing.T) {
 	refCommandStale := func(prepared preparedStart, current beads.Bead) bool {
 		preparedCommand := strings.TrimSpace(prepared.candidate.tp.Command)
 		currentCommand := strings.TrimSpace(current.Metadata["command"])
-		return preparedCommand != "" && currentCommand != "" && preparedCommand != currentCommand
+		if preparedCommand == "" || currentCommand == "" || preparedCommand == currentCommand {
+			return false
+		}
+		// The enqueue-time twin has no raw bead sibling to read (WI-6 R4 deleted
+		// the pointer), so the oracle reads the same Info field production does.
+		return currentCommand != strings.TrimSpace(prepared.candidate.info.Command)
 	}
 	refIdentityMatches := func(prepared, current beads.Bead) bool {
 		preparedToken := strings.TrimSpace(prepared.Metadata["instance_token"])
@@ -1486,21 +1491,28 @@ func TestSessionClassifierInfoEquivalence(t *testing.T) {
 	}
 	//
 	// asyncStartPreparedCommandStale's prepared side is the resolved template command
-	// (tp.Command), shared by both forms; only the current side switches bead↔Info
-	// (Info.Command == metadata["command"]). The "closed" and "pool-managed-slot"
-	// (state=awake) / "pool-managed-flag-only" (state=active) fixtures exercise the
-	// Closed and awake/active branches the design calls out.
-	preparedWithCommand := func(cmd string) preparedStart {
-		return preparedStart{candidate: startCandidate{tp: TemplateParams{Command: cmd}}}
+	// (tp.Command) plus the enqueue-time twin's stored command, both shared by the
+	// two forms; only the current side switches bead↔Info (Info.Command ==
+	// metadata["command"]). The "closed" and "pool-managed-slot" (state=awake) /
+	// "pool-managed-flag-only" (state=active) fixtures exercise the Closed and
+	// awake/active branches the design calls out. Sweeping the enqueued dimension
+	// covers the changed-during-startup branch (#4144) on both forms.
+	preparedWithCommand := func(enqueued, cmd string) preparedStart {
+		return preparedStart{candidate: startCandidate{
+			info: session.Info{Command: enqueued},
+			tp:   TemplateParams{Command: cmd},
+		}}
 	}
 	for currentShape, currentBead := range beadsByShape {
 		currentBead := currentBead
 		currentInfo := sessiontest.SeedBead(t, currentBead)
 		t.Run("asyncCommandStale/"+currentShape, func(t *testing.T) {
-			for _, cmd := range []string{"", "claude --resume", "codex exec", "  claude --resume  "} {
-				pr := preparedWithCommand(cmd)
-				if got, want := asyncStartPreparedCommandStaleInfo(pr, currentInfo), refCommandStale(pr, currentBead); got != want {
-					t.Errorf("cmd=%q info=%v bead=%v", cmd, got, want)
+			for _, enqueued := range []string{"", "claude --resume", "codex exec", "  codex exec  "} {
+				for _, cmd := range []string{"", "claude --resume", "codex exec", "  claude --resume  "} {
+					pr := preparedWithCommand(enqueued, cmd)
+					if got, want := asyncStartPreparedCommandStaleInfo(pr, currentInfo), refCommandStale(pr, currentBead); got != want {
+						t.Errorf("enqueued=%q cmd=%q info=%v bead=%v", enqueued, cmd, got, want)
+					}
 				}
 			}
 		})

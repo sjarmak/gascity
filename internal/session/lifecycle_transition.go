@@ -329,6 +329,15 @@ type CommitStartedPatchInput struct {
 	// nothing stamps nothing. priming_attempted_at is never emitted here.
 	PrimedAt   time.Time
 	PromptHash string
+	// LaunchedCommand, when non-empty, records the resolved command this start
+	// actually spawned. The stored command is what `gc session attach` and the
+	// legacy respawn paths read, and what the async command-drift gate compares
+	// against, so a start that resolved a command different from the stored one
+	// must carry it onto the bead in this batch — otherwise the record keeps
+	// naming a command the session never ran (gastownhall/gascity#4144). Callers
+	// that re-confirm an already-running runtime rather than launching one leave
+	// it empty, so a recovery commit never claims a launch it did not perform.
+	LaunchedCommand string
 }
 
 // CommitStartedPatch records a successful runtime start atomically with the
@@ -379,6 +388,9 @@ func CommitStartedPatch(input CommitStartedPatchInput) MetadataPatch {
 	if !input.PrimedAt.IsZero() && input.PromptHash != "" {
 		patch[PrimedAtMetadataKey] = input.PrimedAt.UTC().Format(time.RFC3339)
 		patch[PromptHashMetadataKey] = input.PromptHash
+	}
+	if input.LaunchedCommand != "" {
+		patch["command"] = input.LaunchedCommand
 	}
 	return patch
 }

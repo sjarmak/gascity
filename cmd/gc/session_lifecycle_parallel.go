@@ -1707,14 +1707,30 @@ func refreshAsyncStartResult(result startResult, store beads.Store, stderr io.Wr
 	return result, true, false, false
 }
 
-// asyncStartPreparedCommandStaleInfo is the async-start command-drift gate: it
-// reads the current session's resolved command off Info.Command (the raw "command"
-// mirror, TrimSpace-equivalent). The prepared side is the resolved template command
-// (tp.Command). It is the sole form (the raw sibling was deleted in WI-6 R4).
+// asyncStartPreparedCommandStaleInfo is the async-start command-drift gate. It
+// answers one question: did the desired command move past the one this start
+// just launched? Three trimmed inputs — the resolved template command
+// (tp.Command, the value actually launched), the session's stored command at
+// enqueue time, and its stored command now (Info.Command, the raw "command"
+// mirror). It is the sole form (the raw sibling was deleted in WI-6 R4).
+//
+// Drift is real only when the stored command CHANGED during the spawn window.
+// tp.Command is resolved from live config at prepare time, so a stored command
+// that has not moved since enqueue records an EARLIER launch, not a newer
+// desire — the bead simply predates the config change. Reading that as drift
+// stopped the runtime this start had just spawned, and nothing on the discard
+// path advanced the stored command, so the next tick resolved the same pair and
+// killed the next spawn: an unbounded start→kill loop that made a provider
+// switch permanently brick its sessions (#4144). Config that moves AFTER a start
+// commits is caught by the started_config_hash / started_live_hash drift check
+// on the next tick, so no protection rests on this gate.
 func asyncStartPreparedCommandStaleInfo(prepared preparedStart, current sessionpkg.Info) bool {
 	preparedCommand := strings.TrimSpace(prepared.candidate.tp.Command)
 	currentCommand := strings.TrimSpace(current.Command)
-	return preparedCommand != "" && currentCommand != "" && preparedCommand != currentCommand
+	if preparedCommand == "" || currentCommand == "" || preparedCommand == currentCommand {
+		return false
+	}
+	return currentCommand != strings.TrimSpace(prepared.candidate.info.Command)
 }
 
 // clearPendingStartInFlightLease clears last_woke_at for the session handle so a
@@ -2060,6 +2076,15 @@ func commitStartResultTraced(
 		primedAt = clk.Now()
 		promptHash = result.prepared.promptHash
 	}
+	// This start launched tp.Command; when the stored command still names an
+	// earlier launch (the operator changed the agent's provider or args since
+	// the bead was created), fold the correction into the same batch so the
+	// bead records what actually ran. Diff-gated so an unchanged command costs
+	// no metadata write per spawn.
+	launchedCommand := ""
+	if resolved := strings.TrimSpace(tp.Command); resolved != "" && resolved != strings.TrimSpace(info.Command) {
+		launchedCommand = resolved
+	}
 	metadata := sessionpkg.CommitStartedPatch(sessionpkg.CommitStartedPatchInput{
 		CoreHash:                result.prepared.coreHash,
 		LiveHash:                result.prepared.liveHash,
@@ -2075,6 +2100,7 @@ func commitStartResultTraced(
 		Now:                 clk.Now(),
 		PrimedAt:            primedAt,
 		PromptHash:          promptHash,
+		LaunchedCommand:     launchedCommand,
 	})
 	storedMCPSnapshot, err := sessionpkg.EncodeMCPServersSnapshot(result.prepared.cfg.MCPServers)
 	if err != nil {

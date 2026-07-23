@@ -537,6 +537,25 @@ func TestCommitStartedPatchStampsFreshAwakeEpochOnlyForNewInterval(t *testing.T)
 	}
 }
 
+// TestCommitStartedPatchLaunchedCommand pins the stored-command correction that
+// keeps a session bead describing the command it actually ran. A start that
+// resolved a command the bead does not name folds the correction into this
+// batch; a caller that only re-confirms an already-running runtime leaves the
+// field empty and must not restamp the command (gastownhall/gascity#4144).
+func TestCommitStartedPatchLaunchedCommand(t *testing.T) {
+	now := time.Date(2026, 7, 11, 1, 51, 0, 0, time.UTC)
+
+	launched := CommitStartedPatch(CommitStartedPatchInput{CoreHash: "core", LaunchedCommand: "opencode", Now: now})
+	if launched["command"] != "opencode" {
+		t.Fatalf("command = %q, want the launched command recorded", launched["command"])
+	}
+
+	reconfirmed := CommitStartedPatch(CommitStartedPatchInput{CoreHash: "core", Now: now})
+	if v, ok := reconfirmed["command"]; ok {
+		t.Fatalf("command = %q, want no key when the commit launched nothing", v)
+	}
+}
+
 func TestCommitStartedPatchBuildsAtomicStartMetadata(t *testing.T) {
 	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
 	patch := CommitStartedPatch(CommitStartedPatchInput{
