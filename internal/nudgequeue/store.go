@@ -48,6 +48,10 @@ type NudgeShadow struct {
 	ID string
 	// BeadID is the shadow bead's own id.
 	BeadID string
+	// BeadCreatedAt is the shadow bead's own creation time (bead-authoritative,
+	// distinct from the queue Item.CreatedAt that lives only in state.json). The
+	// retention sweep reads it to stamp a computed age into its close_reason.
+	BeadCreatedAt time.Time
 	// Open reports whether the shadow bead is still open (bead Status == "open").
 	// It is bead-authoritative: the retention sweep reads it in place of cracking
 	// the raw bead Status.
@@ -101,6 +105,7 @@ func NewStore(store beads.NudgesStore) *Store {
 func decodeNudgeItem(b beads.Bead) NudgeShadow {
 	s := NudgeShadow{
 		BeadID:         b.ID,
+		BeadCreatedAt:  b.CreatedAt,
 		Open:           b.Status == "open",
 		ID:             b.Metadata["nudge_id"],
 		State:          b.Metadata["state"],
@@ -129,6 +134,22 @@ func decodeNudgeItem(b beads.Bead) NudgeShadow {
 		}
 	}
 	return s
+}
+
+// SweepEligible reports whether this shadow may be retention-swept at now.
+// A queued nudge before its own expires_at is never eligible (#4299): the
+// sweep's short TTL exists to reap leaked terminal shadows, not live queued
+// nudges. Absence from the flock-state live set is not proof of death — a
+// missing or desynced state.json would otherwise destroy an undelivered
+// nudge minutes after creation, ~24h before its own expiry. Both times are
+// RFC3339-UTC bead metadata compared as instants, so the guard is immune to
+// any host-local vs UTC clock mix. A queued shadow with no parseable
+// expires_at falls back to plain TTL staleness, matching prior behavior.
+func (s NudgeShadow) SweepEligible(now time.Time) bool {
+	if s.State == "queued" && !s.ExpiresAt.IsZero() && now.Before(s.ExpiresAt) {
+		return false
+	}
+	return true
 }
 
 // EnqueueRollbackCloseReason is the close_reason metadata value stamped on a

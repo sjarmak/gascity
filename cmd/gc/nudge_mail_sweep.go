@@ -28,6 +28,21 @@ const (
 	nudgeMailSweepMailCloseReason = beadmail.RetentionSweepCloseReason
 )
 
+// nudgeSweepCloseReason composes the close_reason for one swept nudge shadow:
+// the canonical prefix plus the computed age and the TTL threshold, so a sweep
+// misfire is self-diagnosing from the closed bead alone (#4299). A shadow with
+// no bead creation time falls back to the bare prefix.
+func nudgeSweepCloseReason(shadow nudgequeue.NudgeShadow, now time.Time, nudgeTTL time.Duration) string {
+	if shadow.BeadCreatedAt.IsZero() {
+		return nudgeMailSweepNudgeCloseReason
+	}
+	age := now.Sub(shadow.BeadCreatedAt).Round(time.Second)
+	if age < 0 {
+		age = 0
+	}
+	return fmt.Sprintf("%s (age %s > ttl %s)", nudgeMailSweepNudgeCloseReason, age, nudgeTTL)
+}
+
 // nudgeMailSweepResult holds per-category close counts from sweepStaleNudgeMail.
 type nudgeMailSweepResult struct {
 	NudgeClosed int
@@ -38,6 +53,9 @@ type nudgeMailSweepResult struct {
 //
 // Nudge candidates are open beads with label gc:nudge created before now-nudgeTTL
 // whose nudge_id is not present in nudgeState.Pending or nudgeState.InFlight.
+// A queued shadow before its own expires_at is additionally excluded via
+// NudgeShadow.SweepEligible (#4299), so a desynced or missing state file can
+// never destroy an undelivered nudge ahead of its declared expiry.
 // Terminal metadata is stamped via nudgequeue.Store.SweepStale before each close
 // so the bead audit trail is intact.
 //
@@ -71,10 +89,10 @@ func sweepStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		if limit > 0 && result.NudgeClosed+result.MailClosed >= limit {
 			break
 		}
-		if !shadow.Open {
+		if !shadow.Open || !shadow.SweepEligible(now) {
 			continue
 		}
-		if err := nq.SweepStale(shadow.BeadID, nudgeMailSweepNudgeCloseReason, now); err != nil {
+		if err := nq.SweepStale(shadow.BeadID, nudgeSweepCloseReason(shadow, now, nudgeTTL), now); err != nil {
 			beadErrs = append(beadErrs, err)
 			continue
 		}
@@ -125,7 +143,7 @@ func countStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		if limit > 0 && result.NudgeClosed+result.MailClosed >= limit {
 			break
 		}
-		if !shadow.Open {
+		if !shadow.Open || !shadow.SweepEligible(now) {
 			continue
 		}
 		result.NudgeClosed++

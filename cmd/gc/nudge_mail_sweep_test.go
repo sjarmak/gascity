@@ -348,8 +348,8 @@ func TestSweepStaleNudgeMail_NudgeTerminalMetadata(t *testing.T) {
 	if b.Metadata["terminal_at"] == "" {
 		t.Error("terminal_at should be set")
 	}
-	if b.Metadata["close_reason"] != nudgeMailSweepNudgeCloseReason {
-		t.Errorf("close_reason = %q, want %q", b.Metadata["close_reason"], nudgeMailSweepNudgeCloseReason)
+	if !strings.HasPrefix(b.Metadata["close_reason"], nudgeMailSweepNudgeCloseReason) {
+		t.Errorf("close_reason = %q, want prefix %q", b.Metadata["close_reason"], nudgeMailSweepNudgeCloseReason)
 	}
 	if b.Status != "closed" {
 		t.Errorf("status = %q, want closed", b.Status)
@@ -708,5 +708,105 @@ func TestCountStaleNudgeMail_MatchesSweepCounts(t *testing.T) {
 	}
 	if counts.MailClosed != 1 {
 		t.Errorf("count: MailClosed = %d, want 1", counts.MailClosed)
+	}
+}
+
+// nudgeSeedExpiring builds a queued nudge seed carrying its own expires_at,
+// mirroring what nudgequeue.Store.Save writes for every real enqueue.
+func nudgeSeedExpiring(id, nudgeID string, createdAt, expiresAt time.Time) beads.Bead {
+	b := nudgeSeed(id, nudgeID, createdAt)
+	b.Metadata["expires_at"] = expiresAt.UTC().Format(time.RFC3339)
+	return b
+}
+
+func TestSweepStaleNudgeMail_QueuedBeforeExpiryProtected(t *testing.T) {
+	// #4299: a queued, undelivered nudge whose id is NOT in the flock state
+	// (state desync / missing state file) must NOT be swept at the 10-minute
+	// TTL while its own expires_at is still in the future. Only after its
+	// expiry does the sweep reap it.
+	now := time.Date(2026, 7, 10, 6, 0, 58, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	seed := []beads.Bead{
+		// Created 11 minutes ago, expires ~23.8h from now — the reported shape.
+		nudgeSeedExpiring("bead-live", "nudge-live", now.Add(-11*time.Minute), now.Add(23*time.Hour+48*time.Minute)),
+		// Created 25h ago, expired 1h ago — sweepable.
+		nudgeSeedExpiring("bead-expired", "nudge-expired", now.Add(-25*time.Hour), now.Add(-time.Hour)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NudgeClosed != 1 {
+		t.Errorf("NudgeClosed = %d, want 1 (only the expired nudge)", result.NudgeClosed)
+	}
+
+	open, _ := store.ListOpen()
+	openIDs := make(map[string]bool)
+	for _, b := range open {
+		openIDs[b.ID] = true
+	}
+	if !openIDs["bead-live"] {
+		t.Errorf("queued nudge before its own expires_at was swept; it must remain open")
+	}
+	if openIDs["bead-expired"] {
+		t.Errorf("queued nudge past its expires_at should have been swept")
+	}
+}
+
+func TestCountStaleNudgeMail_QueuedBeforeExpiryProtected(t *testing.T) {
+	// Dry-run parity for the #4299 guard: the count must skip the same
+	// queued-before-expiry shadows the sweep skips.
+	now := time.Date(2026, 7, 10, 6, 0, 58, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	seed := []beads.Bead{
+		nudgeSeedExpiring("bead-live", "nudge-live", now.Add(-11*time.Minute), now.Add(23*time.Hour)),
+		nudgeSeedExpiring("bead-expired", "nudge-expired", now.Add(-25*time.Hour), now.Add(-time.Hour)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	counts, err := countStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if counts.NudgeClosed != 1 {
+		t.Errorf("count NudgeClosed = %d, want 1 (queued-before-expiry excluded)", counts.NudgeClosed)
+	}
+}
+
+func TestSweepStaleNudgeMail_CloseReasonSelfDiagnosing(t *testing.T) {
+	// #4299: the sweep's close_reason must carry the computed age and the TTL
+	// threshold so a future misfire is self-diagnosing from the bead alone.
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	const beadID = "nudge-aged"
+	seed := []beads.Bead{nudgeSeed(beadID, "nudge-aged", now.Add(-11*time.Minute))}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NudgeClosed != 1 {
+		t.Fatalf("NudgeClosed = %d, want 1", result.NudgeClosed)
+	}
+
+	b, err := store.Get(beadID)
+	if err != nil {
+		t.Fatalf("get bead: %v", err)
+	}
+	reason := b.Metadata["close_reason"]
+	if !strings.HasPrefix(reason, nudgeMailSweepNudgeCloseReason) {
+		t.Errorf("close_reason = %q, want prefix %q", reason, nudgeMailSweepNudgeCloseReason)
+	}
+	if !strings.Contains(reason, "age 11m0s") {
+		t.Errorf("close_reason = %q, want computed age \"age 11m0s\"", reason)
+	}
+	if !strings.Contains(reason, "ttl 10m0s") {
+		t.Errorf("close_reason = %q, want threshold \"ttl 10m0s\"", reason)
 	}
 }

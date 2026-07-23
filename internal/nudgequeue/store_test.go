@@ -599,3 +599,52 @@ func TestNilStoreIsNoOp(t *testing.T) {
 		t.Errorf("FindIncludingTerminal on nil store = (%+v,%v,%v), want (zero,false,nil)", shadow, ok, err)
 	}
 }
+
+// TestNudgeShadowSweepEligible pins the retention-sweep eligibility guard
+// (#4299): a queued nudge before its own expires_at must never be retention-
+// swept. The 10-minute sweep TTL exists to reap leaked terminal shadows, not
+// live queued nudges — absence from the flock state is not proof of death, so
+// the shadow's own queued+unexpired stamp is the last line of defense against
+// state-file desync destroying an undelivered nudge 23.8h before its expiry.
+func TestNudgeShadowSweepEligible(t *testing.T) {
+	now := time.Date(2026, 7, 10, 6, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name    string
+		state   string
+		expires time.Time
+		want    bool
+	}{
+		{"queued before expiry", "queued", now.Add(23 * time.Hour), false},
+		{"queued past expiry", "queued", now.Add(-time.Minute), true},
+		{"queued exactly at expiry", "queued", now, true},
+		{"queued without expiry metadata", "queued", time.Time{}, true},
+		{"terminal state before expiry", "injected", now.Add(23 * time.Hour), true},
+		{"failed state before expiry", "failed", now.Add(23 * time.Hour), true},
+		{"empty state before expiry", "", now.Add(23 * time.Hour), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			shadow := NudgeShadow{State: tc.state, ExpiresAt: tc.expires}
+			if got := shadow.SweepEligible(now); got != tc.want {
+				t.Errorf("SweepEligible(%s, expires=%v) = %v, want %v", tc.state, tc.expires, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDecodeNudgeItemBeadCreatedAt proves the decoder carries the shadow bead's
+// own created_at (bead-authoritative, distinct from the queue Item.CreatedAt
+// that lives only in state.json) so the retention sweep can stamp a computed
+// age into its close_reason.
+func TestDecodeNudgeItemBeadCreatedAt(t *testing.T) {
+	created := time.Date(2026, 7, 10, 5, 49, 54, 0, time.UTC)
+	shadow := decodeNudgeItem(beads.Bead{
+		ID:        "gc-1",
+		Status:    "open",
+		CreatedAt: created,
+		Metadata:  map[string]string{"nudge_id": "nudge-abc", "state": "queued"},
+	})
+	if !shadow.BeadCreatedAt.Equal(created) {
+		t.Errorf("BeadCreatedAt = %v, want %v", shadow.BeadCreatedAt, created)
+	}
+}
