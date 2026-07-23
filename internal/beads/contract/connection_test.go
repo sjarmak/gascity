@@ -174,6 +174,45 @@ func TestResolveDoltConnectionTargetTreatsSymlinkedCityAsCityScope(t *testing.T)
 	}
 }
 
+// The managed runtime publisher stamps data_dir symlink-resolved
+// (pathutil.NormalizePathForCompare), so a caller that reaches the city
+// through a symlinked spelling — e.g. macOS /tmp → /private/tmp — presents a
+// cityRoot whose Clean()ed data-dir expectation never string-matches the
+// stamped one. validManagedRuntimeState must compare symlink-aware or every
+// such caller gets ErrManagedRuntimeUnavailable while the server is healthy
+// (gastownhall/gascity#4586).
+func TestResolveDoltConnectionTargetAcceptsSymlinkedCityRootSpelling(t *testing.T) {
+	fs := fsys.OSFS{}
+	city := t.TempDir()
+	cityLink := filepath.Join(t.TempDir(), "city-link")
+	writeCanonicalConfig(t, fs, city, ConfigState{
+		IssuePrefix:    "gc",
+		EndpointOrigin: EndpointOriginManagedCity,
+		EndpointStatus: EndpointStatusVerified,
+	})
+	writeCanonicalMetadata(t, fs, city, "hq")
+	if err := os.MkdirAll(filepath.Join(city, ".beads", "dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// data_dir carries the real (resolved) spelling, as the publisher writes it.
+	port := writeReachableRuntimeState(t, fs, city)
+	if err := os.Symlink(city, cityLink); err != nil {
+		t.Fatal(err)
+	}
+
+	// The caller addresses the city exclusively through the symlink.
+	target, err := ResolveDoltConnectionTarget(fs, cityLink, cityLink)
+	if err != nil {
+		t.Fatalf("ResolveDoltConnectionTarget() error = %v, want managed target via symlinked cityRoot", err)
+	}
+	if target.External {
+		t.Fatal("symlinked cityRoot target should remain managed")
+	}
+	if target.Host != "127.0.0.1" || target.Port != port || target.Database != "hq" {
+		t.Fatalf("target = %+v", target)
+	}
+}
+
 func TestResolveAuthoritativeConfigStateDerivesLegacyManagedRigFromCityRuntime(t *testing.T) {
 	fs := fsys.OSFS{}
 	city := t.TempDir()

@@ -704,8 +704,12 @@ func validManagedRuntimeState(state managedRuntimeState, cityRoot string) bool {
 	if !state.Running || state.Port <= 0 || state.PID <= 0 {
 		return false
 	}
+	// The publisher stamps data_dir symlink-resolved, so the compare must be
+	// symlink-aware too: a caller spelling cityRoot through a symlink (macOS
+	// /tmp → /private/tmp, linked home dirs) is still the same city
+	// (gastownhall/gascity#4586).
 	expectedDataDir := filepath.Join(cityRoot, ".beads", "dolt")
-	if filepath.Clean(strings.TrimSpace(state.DataDir)) != filepath.Clean(expectedDataDir) {
+	if !sameScope(strings.TrimSpace(state.DataDir), expectedDataDir) {
 		return false
 	}
 	host := managedCityHost()

@@ -3351,6 +3351,11 @@ func buildStandaloneRigStores(cfg *config.City, cityPath string, stderr io.Write
 		store, err := openStoreAtForCity(rig.Path, cityPath)
 		if err != nil {
 			fmt.Fprintf(stderr, "gc supervisor: rig bead store %q: %v\n", rig.Name, err) //nolint:errcheck // best-effort stderr
+			// Keep the rig visible as an erroring store, matching
+			// api_state.buildStores: dropping it entirely makes the
+			// demand phase report rigStores=0 and silently stop
+			// counting the rig's routed work as demand (#4586).
+			stores[rig.Name] = unavailableStore{err: fmt.Errorf("open rig store %s: %w", rig.Path, err)}
 			continue
 		}
 		stores[rig.Name] = store
