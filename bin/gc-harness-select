@@ -340,11 +340,18 @@ def load_claude_telemetry(path: Path) -> dict[str, Telemetry]:
     result: dict[str, Telemetry] = {}
     for account in data.get("accounts", []):
         name = str(account.get("name", ""))
+        five = account.get("five_hour") or {}
         seven = account.get("seven_day") or {}
         error = account.get("error")
-        utilization = parse_utilization(seven.get("utilization"))
-        if not error and seven.get("utilization") is not None and utilization is None:
-            error = "invalid seven-day utilization"
+        five_utilization = parse_utilization(five.get("utilization"))
+        seven_utilization = parse_utilization(seven.get("utilization"))
+        if not error and (five_utilization is None or seven_utilization is None):
+            error = "invalid or unavailable five-hour/seven-day utilization"
+        utilization = (
+            max(five_utilization, seven_utilization)
+            if five_utilization is not None and seven_utilization is not None
+            else None
+        )
         result[name] = Telemetry(
             healthy=not error and utilization is not None,
             used_percent=utilization,

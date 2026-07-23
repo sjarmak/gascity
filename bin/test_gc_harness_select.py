@@ -271,7 +271,10 @@ def test_invalid_utilization_fails_closed(used: float) -> None:
 
 
 def test_verification_requires_implementation_family() -> None:
-    cfg = policy(candidate("claude-1", "anthropic", ("verification",)))
+    cfg = policy(
+        candidate("codex", "openai", ("implementation",)),
+        candidate("claude-1", "anthropic", ("verification",)),
+    )
 
     with pytest.raises(selector.HarnessSelectionError, match="implementation-family"):
         select(cfg, "verification", {"claude-1": telemetry(0)})
@@ -353,6 +356,33 @@ def test_invalid_codex_utilization_is_unhealthy(tmp_path: Path) -> None:
     assert reading.healthy is False
     assert reading.used_percent is None
     assert "invalid" in reading.detail
+
+
+def test_claude_telemetry_uses_the_most_exhausted_enforced_window(
+    tmp_path: Path,
+) -> None:
+    usage = tmp_path / "usage.json"
+    usage.write_text(
+        '{"accounts":[{"name":"account1","five_hour":{"utilization":80},'
+        '"seven_day":{"utilization":10},"fetched_at":"2026-07-23T01:59:00Z",'
+        '"error":null}]}'
+    )
+
+    reading = selector.load_claude_telemetry(usage)["account1"]
+
+    assert reading.healthy is True
+    assert reading.used_percent == 80
+    cfg = policy(
+        candidate("codex", "openai", ("implementation",)),
+        candidate("claude-1", "anthropic", ("verification",)),
+    )
+    with pytest.raises(selector.NoEligibleHarness, match="drain line"):
+        select(
+            cfg,
+            "verification",
+            {"claude-1": reading},
+            implementation_family="openai",
+        )
 
 
 def test_live_codex_rate_limit_query_refreshes_without_model_turn(

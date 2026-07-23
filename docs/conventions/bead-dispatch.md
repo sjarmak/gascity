@@ -75,6 +75,8 @@ The selector is `bin/gc-harness-select`; policy and ceilings live in
 over-drain, stale-telemetry, and over-concurrency candidates. A city-wide lock
 serializes selection through `gc sling` so concurrent callers cannot consume
 the same final slot. It refuses rather than guessing when no candidate is safe.
+Claude headroom uses the more exhausted of the current five-hour and seven-day
+windows, so temporary exhaustion cannot hide behind a cool weekly reading.
 Fresh Codex session telemetry is read locally; an idle account whose local
 reading has aged out is refreshed through Codex app-server's
 `account/rateLimits/read` endpoint, which does not run or charge a model turn.
