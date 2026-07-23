@@ -10,7 +10,9 @@ Two jobs, both read-heavy, run per mirror rig:
 2. LOSS/DRIFT SWEEP: mirrored bead whose issue vanished; issue closed on
    GitHub while the bead is active (human close = triage signal, never
    auto-applied); real active bead that has stayed unpushed past a threshold
-   (mirror gap). Findings are reported, not auto-fixed.
+   (mirror gap); issue still open on GitHub after its closed bead has aged
+   past the push's re-close window (stale close, push will never propagate).
+   Findings are reported, not auto-fixed.
 
 Reports: audit log always; Slack #gascity-maintenance + mayor nudge when
 findings are new (same idiom as bin/stall-watch), deduped by fingerprint for
@@ -139,12 +141,28 @@ def reconcile_rig(rig, env, now, findings, migrated_repositories):
                 f"{bead['id']} is {bead['status']} — labeled gh-closed-pending-triage "
                 "(push paused); triage: close bead or remove label to reopen"
             )
+        elif issue["state"].lower() == "open" and bead["status"] not in ACTIVE:
+            # bin/github-mirror's mirror_set() only re-pushes a closed bead's
+            # close within MIRROR_CLOSED_DAYS of the bead's updated_at. Past
+            # that window the issue stays open on GitHub forever with no
+            # other code path to close it or flag the drift — surface it here
+            # instead of silently falling through (dr-3f34 review finding 2).
+            closed_days = int(os.environ.get("MIRROR_CLOSED_DAYS", "14"))
+            if now - parse_ts(bead["updated_at"]) > timedelta(days=closed_days):
+                findings.append(
+                    f"[{rig}] MIRROR-STALE-CLOSE: issue #{issue['number']} still open but "
+                    f"{bead['id']} has been {bead['status']} for >{closed_days}d — the push "
+                    "window has closed and GitHub will not auto-close this issue; close it "
+                    "manually or touch the bead to re-open the push window"
+                )
 
 
 def find_bead_by_ref(rig, url):
     """Look up a local bead by external_ref across ALL statuses (including
     closed). Returns the bead dict, None if genuinely not found, or raises
-    RuntimeError if bd itself failed (caller must fail closed on that)."""
+    RuntimeError if bd itself failed OR returned non-JSON stdout on a 0 exit
+    (caller must fail closed on that — see reconcile_rig's own map-build
+    handler, which treats the same bd command's JSONDecodeError as a failure)."""
     lookup = run(
         ["bd", "list", "--all", "--limit", "0", "--json"],
         cwd=rig,
@@ -152,7 +170,11 @@ def find_bead_by_ref(rig, url):
     )
     if lookup.returncode != 0:
         raise RuntimeError(f"bd list --all failed: {lookup.stderr.strip()[:200]}")
-    return next((b for b in json.loads(lookup.stdout or "[]") if b.get("external_ref") == url), None)
+    try:
+        beads = json.loads(lookup.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"bd list --all returned non-JSON stdout: {exc}") from exc
+    return next((b for b in beads if b.get("external_ref") == url), None)
 
 
 def ingest(rig, repo, url, issue, env, findings):
