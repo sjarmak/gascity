@@ -93,8 +93,12 @@ def reconcile_rig(rig, env, now, findings, migrated_repositories):
 
     try:
         issue_list = list_repo_issues(repo)
+        # --all is required: the default `bd list` filter excludes closed
+        # beads, which made every closed bead with a still-open mirror issue
+        # look "unmatched" below and routed it into ingest() as if it were a
+        # human-filed issue — reverting the close (dr-3f34, 2026-07-23).
         bd = run(
-            ["bd", "list", "--limit", "0", "--json"],
+            ["bd", "list", "--all", "--limit", "0", "--json"],
             cwd=rig,
             env=rig_env(rig),
         )
@@ -137,7 +141,41 @@ def reconcile_rig(rig, env, now, findings, migrated_repositories):
             )
 
 
+def find_bead_by_ref(rig, url):
+    """Look up a local bead by external_ref across ALL statuses (including
+    closed). Returns the bead dict, None if genuinely not found, or raises
+    RuntimeError if bd itself failed (caller must fail closed on that)."""
+    lookup = run(
+        ["bd", "list", "--all", "--limit", "0", "--json"],
+        cwd=rig,
+        env=rig_env(rig),
+    )
+    if lookup.returncode != 0:
+        raise RuntimeError(f"bd list --all failed: {lookup.stderr.strip()[:200]}")
+    return next((b for b in json.loads(lookup.stdout or "[]") if b.get("external_ref") == url), None)
+
+
 def ingest(rig, repo, url, issue, env, findings):
+    # Defense-in-depth: never ingest/defer an issue whose ref already resolves
+    # to a local bead, whatever its status. reconcile_rig's own by_ref map
+    # should already have filtered this out, but ingest() must not trust that
+    # invariant blindly — this is exactly the check whose absence caused
+    # dr-3f34 (closed beads treated as human-filed issues and reverted).
+    try:
+        existing = find_bead_by_ref(rig, url)
+    except RuntimeError as exc:
+        # Fail closed: if we can't confirm there's no local bead, don't risk
+        # ingesting/deferring one that already exists.
+        findings.append(f"[{rig}] INTAKE-SKIPPED: issue #{issue['number']}: {exc}")
+        return
+    if existing is not None:
+        findings.append(
+            f"[{rig}] INTAKE-SKIPPED: issue #{issue['number']} \"{issue['title'][:60]}\" "
+            f"resolves to existing bead {existing['id']} ({existing['status']}) — "
+            "refusing to ingest/defer a known bead"
+        )
+        return
+
     # Selective pull takes a bare issue number; URL/github:N forms fail Atoi parsing.
     # Exit code is 0 even on a failed fetch, so success is verified by the
     # external_ref lookup below, not the return code.
@@ -149,12 +187,11 @@ def ingest(rig, repo, url, issue, env, findings):
     if pull.returncode != 0:
         findings.append(f"[{rig}] INTAKE-FAILED: pull #{issue['number']}: {pull.stderr.strip()[:200]}")
         return
-    lookup = run(
-        ["bd", "list", "--limit", "0", "--json"],
-        cwd=rig,
-        env=rig_env(rig),
-    )
-    bead = next((b for b in json.loads(lookup.stdout or "[]") if b.get("external_ref") == url), None)
+    try:
+        bead = find_bead_by_ref(rig, url)
+    except RuntimeError as exc:
+        findings.append(f"[{rig}] INTAKE-FAILED: pulled {url} but lookup failed: {exc}")
+        return
     if bead is None:
         findings.append(f"[{rig}] INTAKE-FAILED: pulled {url} but no bead carries that external_ref")
         return
