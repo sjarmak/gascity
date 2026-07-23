@@ -75,6 +75,21 @@ type NudgeShadow struct {
 	// DeliverAfter / ExpiresAt are the parsed scheduling timestamps if present.
 	DeliverAfter time.Time
 	ExpiresAt    time.Time
+	// BeadCreatedAt is the shadow bead row's own creation time — bead-
+	// authoritative, unlike the queue Item's CreatedAt, which lives exclusively
+	// in state.json and stays deliberately absent from this view. The retention
+	// sweep reads it to stamp a self-diagnosing age into its close_reason.
+	BeadCreatedAt time.Time
+}
+
+// SweepProtected reports whether the shadow must NOT be retention-swept at now:
+// a nudge whose own expires_at is known and still in the future is inside its
+// delivery window regardless of bead age (#4299 — the 10-minute retention TTL
+// must never shrink a queued nudge's 24h TTL to minutes). A past or unknown
+// expiry leaves the caller's retention cutoff as the fallback, so leaked shadow
+// beads without a parseable expires_at are still reclaimed.
+func (s NudgeShadow) SweepProtected(now time.Time) bool {
+	return !s.ExpiresAt.IsZero() && now.Before(s.ExpiresAt)
 }
 
 // Store is the nudge-class domain wrapper. It holds the strongly-typed
@@ -101,6 +116,7 @@ func NewStore(store beads.NudgesStore) *Store {
 func decodeNudgeItem(b beads.Bead) NudgeShadow {
 	s := NudgeShadow{
 		BeadID:         b.ID,
+		BeadCreatedAt:  b.CreatedAt,
 		Open:           b.Status == "open",
 		ID:             b.Metadata["nudge_id"],
 		State:          b.Metadata["state"],

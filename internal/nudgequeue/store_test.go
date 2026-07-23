@@ -546,6 +546,46 @@ func TestDecodeNudgeItemRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDecodeNudgeItemCarriesBeadCreatedAt proves the decoder carries the bead
+// row's own CreatedAt onto the shadow (bead-authoritative, distinct from the
+// queue Item's state.json-only CreatedAt), so the retention sweep can compute
+// a self-diagnosing age without touching queue state.
+func TestDecodeNudgeItemCarriesBeadCreatedAt(t *testing.T) {
+	created := time.Date(2026, 7, 10, 5, 49, 54, 0, time.UTC)
+	b := nudgeShadowBeadFromItem(Item{ID: "n", Agent: "a", Source: "s"}, "queued", "", "")
+	b.CreatedAt = created
+	got := decodeNudgeItem(b)
+	if !got.BeadCreatedAt.Equal(created) {
+		t.Errorf("BeadCreatedAt = %v, want %v", got.BeadCreatedAt, created)
+	}
+}
+
+// TestNudgeShadowSweepProtected pins the #4299 guard predicate: a shadow whose
+// own expires_at is known and still in the future must never be retention-swept,
+// regardless of bead age; a past or unknown expiry leaves the retention TTL as
+// the fallback.
+func TestNudgeShadowSweepProtected(t *testing.T) {
+	now := time.Date(2026, 7, 10, 6, 1, 0, 0, time.UTC)
+	cases := []struct {
+		name      string
+		expiresAt time.Time
+		want      bool
+	}{
+		{"future expiry protects", now.Add(23*time.Hour + 48*time.Minute), true},
+		{"past expiry does not protect", now.Add(-time.Minute), false},
+		{"expiry exactly now does not protect", now, false},
+		{"unknown expiry does not protect", time.Time{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NudgeShadow{ExpiresAt: tc.expiresAt}
+			if got := s.SweepProtected(now); got != tc.want {
+				t.Errorf("SweepProtected(%v) with expires_at=%v = %v, want %v", now, tc.expiresAt, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestDecodeNudgeItemNoReference proves a missing reference_json yields a nil
 // Reference (not a zero-value struct), matching the write codec which stores ""
 // for a nil reference.

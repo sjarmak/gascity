@@ -28,6 +28,20 @@ const (
 	nudgeMailSweepMailCloseReason = beadmail.RetentionSweepCloseReason
 )
 
+// nudgeSweepCloseReason builds the close_reason for one swept nudge bead: the
+// canonical constant plus the computed age and the retention threshold, so a
+// sweep misfire is self-diagnosing from the bead alone (#4299's ask — the
+// original incident needed wisp_events archeology to recover the timeline).
+// A zero BeadCreatedAt (legacy rows) falls back to the bare constant. The
+// terminal_reason metadata key stays the stable machine constant either way.
+func nudgeSweepCloseReason(shadow nudgequeue.NudgeShadow, now time.Time, nudgeTTL time.Duration) string {
+	if shadow.BeadCreatedAt.IsZero() {
+		return nudgeMailSweepNudgeCloseReason
+	}
+	age := now.Sub(shadow.BeadCreatedAt).Round(time.Second)
+	return fmt.Sprintf("%s (age %s > ttl %s)", nudgeMailSweepNudgeCloseReason, age, nudgeTTL)
+}
+
 // nudgeMailSweepResult holds per-category close counts from sweepStaleNudgeMail.
 type nudgeMailSweepResult struct {
 	NudgeClosed int
@@ -74,7 +88,12 @@ func sweepStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		if !shadow.Open {
 			continue
 		}
-		if err := nq.SweepStale(shadow.BeadID, nudgeMailSweepNudgeCloseReason, now); err != nil {
+		// #4299: a nudge inside its own expires_at window is still deliverable —
+		// the retention TTL must never shrink its delivery TTL to minutes.
+		if shadow.SweepProtected(now) {
+			continue
+		}
+		if err := nq.SweepStale(shadow.BeadID, nudgeSweepCloseReason(shadow, now, nudgeTTL), now); err != nil {
 			beadErrs = append(beadErrs, err)
 			continue
 		}
@@ -126,6 +145,10 @@ func countStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 			break
 		}
 		if !shadow.Open {
+			continue
+		}
+		// Mirror the sweep's #4299 guard so --dry-run reports what a sweep would do.
+		if shadow.SweepProtected(now) {
 			continue
 		}
 		result.NudgeClosed++

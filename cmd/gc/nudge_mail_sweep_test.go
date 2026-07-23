@@ -27,6 +27,14 @@ func nudgeSeed(id, nudgeID string, createdAt time.Time) beads.Bead {
 	}
 }
 
+// nudgeSeedWithExpiry is nudgeSeed plus the expires_at metadata a real enqueue
+// stamps (nudgequeue.Store.Save writes RFC3339 UTC).
+func nudgeSeedWithExpiry(id, nudgeID string, createdAt, expiresAt time.Time) beads.Bead {
+	b := nudgeSeed(id, nudgeID, createdAt)
+	b.Metadata["expires_at"] = expiresAt.UTC().Format(time.RFC3339)
+	return b
+}
+
 // mailSeed builds a seed Bead for NewMemStoreFrom representing an open read mail bead.
 // id must be unique within the seed slice.
 func mailSeed(id string, createdAt time.Time) beads.Bead {
@@ -348,11 +356,107 @@ func TestSweepStaleNudgeMail_NudgeTerminalMetadata(t *testing.T) {
 	if b.Metadata["terminal_at"] == "" {
 		t.Error("terminal_at should be set")
 	}
-	if b.Metadata["close_reason"] != nudgeMailSweepNudgeCloseReason {
-		t.Errorf("close_reason = %q, want %q", b.Metadata["close_reason"], nudgeMailSweepNudgeCloseReason)
+	if want := nudgeMailSweepNudgeCloseReason + " (age 10m1s > ttl 10m0s)"; b.Metadata["close_reason"] != want {
+		t.Errorf("close_reason = %q, want %q", b.Metadata["close_reason"], want)
 	}
 	if b.Status != "closed" {
 		t.Errorf("status = %q, want closed", b.Status)
+	}
+}
+
+// TestSweepStaleNudgeMail_QueuedUnexpiredNotSwept is the #4299 regression: a
+// queued, undelivered nudge older than the retention TTL but before its own
+// expires_at must survive the sweep even when the live-ID exclusion misses it
+// entirely (nil state — the worst case). Before the fix the sweep closed such a
+// nudge ~11 minutes after creation, ~23.8h before its own expiry, turning
+// at-most-once delivery into routine loss for busy sessions.
+func TestSweepStaleNudgeMail_QueuedUnexpiredNotSwept(t *testing.T) {
+	now := time.Date(2026, 7, 10, 6, 1, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	const beadID = "bead-live"
+	seed := []beads.Bead{
+		nudgeSeedWithExpiry(beadID, "nudge-live", now.Add(-11*time.Minute), now.Add(23*time.Hour+48*time.Minute)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NudgeClosed != 0 {
+		t.Errorf("NudgeClosed = %d, want 0 (queued nudge is before its own expires_at)", result.NudgeClosed)
+	}
+	b, err := store.Get(beadID)
+	if err != nil {
+		t.Fatalf("get bead: %v", err)
+	}
+	if b.Status != "open" {
+		t.Errorf("status = %q, want open (unexpired nudge must not be swept)", b.Status)
+	}
+
+	// The dry-run twin must agree, or --dry-run lies about what a sweep would do.
+	counts, err := countStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("countStaleNudgeMail: %v", err)
+	}
+	if counts.NudgeClosed != 0 {
+		t.Errorf("dry-run NudgeClosed = %d, want 0", counts.NudgeClosed)
+	}
+}
+
+// TestSweepStaleNudgeMail_ExpiredNudgeSwept guards the GC half of #4299: once a
+// nudge's own expires_at has passed, the retention sweep still reclaims the
+// shadow bead (the dispatcher should have terminalized it; the sweep is the
+// backstop for beads that missed terminalization).
+func TestSweepStaleNudgeMail_ExpiredNudgeSwept(t *testing.T) {
+	now := time.Date(2026, 7, 10, 6, 1, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	const beadID = "bead-expired"
+	seed := []beads.Bead{
+		nudgeSeedWithExpiry(beadID, "nudge-expired", now.Add(-25*time.Hour), now.Add(-time.Hour)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NudgeClosed != 1 {
+		t.Errorf("NudgeClosed = %d, want 1 (expired nudge is sweepable)", result.NudgeClosed)
+	}
+}
+
+// TestSweepStaleNudgeMail_CloseReasonDiagnostics proves the sweep's close_reason
+// carries the computed age and the retention threshold (#4299's third ask), so a
+// future sweep misfire is self-diagnosing instead of requiring wisp_events
+// archeology. terminal_reason stays the stable machine constant.
+func TestSweepStaleNudgeMail_CloseReasonDiagnostics(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	const beadID = "nudge-diag"
+	seed := []beads.Bead{nudgeSeed(beadID, "nudge-diag", now.Add(-11*time.Minute))}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NudgeClosed != 1 {
+		t.Fatalf("NudgeClosed = %d, want 1", result.NudgeClosed)
+	}
+	b, err := store.Get(beadID)
+	if err != nil {
+		t.Fatalf("get bead: %v", err)
+	}
+	wantReason := nudgeMailSweepNudgeCloseReason + " (age 11m0s > ttl 10m0s)"
+	if b.Metadata["close_reason"] != wantReason {
+		t.Errorf("close_reason = %q, want %q", b.Metadata["close_reason"], wantReason)
+	}
+	if b.Metadata["terminal_reason"] != "gc-swept-stale" {
+		t.Errorf("terminal_reason = %q, want gc-swept-stale (stable machine field)", b.Metadata["terminal_reason"])
 	}
 }
 
