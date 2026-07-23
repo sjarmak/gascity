@@ -19,6 +19,8 @@ set -euo pipefail
 
 CONFIG="${GC_SLING_INTERCEPT_CONFIG:-/home/ds/gas-city/.gc/sling-intercept.yaml}"
 LOG="${GC_SLING_INTERCEPT_LOG:-/home/ds/gas-city/.gc/sling-intercept.log}"
+HARNESS_SELECTOR="${GC_HARNESS_SELECTOR:-/home/ds/gas-city/bin/gc-harness-select}"
+HARNESS_LOCK="${GC_HARNESS_LOCK:-/home/ds/gas-city/.gc/harness-select.lock}"
 
 log_event() {
   # log_event <event> <bead> <target> <formula> <reason>
@@ -105,6 +107,9 @@ case "${1:-}" in
     echo "gc-sling: thin intercept wrapper. See $CONFIG for auto-injection rules."
     echo "         Pass-through in all cases except bead matches a rule AND no"
     echo "         formula flag is present."
+    echo "         Role routing: gc-sling auto <bead> --harness-role <role>"
+    echo "         Optional: --harness-provider <provider> and"
+    echo "                   --implementation-family <family>."
     exit 0 ;;
 esac
 
@@ -116,13 +121,23 @@ has_formula=0
 has_no_formula=0
 has_nudge=0
 has_no_nudge=0   # wrapper-only flag — opt out of default --nudge injection
+has_dry_run=0
 target=""
 bead=""
+harness_role=""
+harness_provider=""
+implementation_family=""
+rig_hint=""
+city_hint=""
+remote_city_hint=0
+target_index=-1
 prev=""
 
 # Flags that take a value after them (so the following token is NOT positional).
 value_taking_flags=("--on" "-t" "--title" "--var" "--scope-kind" "--scope-ref" \
-                    "--merge" "--city" "--rig")
+                    "--merge" "--city" "--rig" "--context" "--city-name" \
+                    "--city-url" "--harness-role" \
+                    "--harness-provider" "--implementation-family")
 
 is_value_for_prev() {
   local p=$1
@@ -132,20 +147,39 @@ is_value_for_prev() {
   return 1
 }
 
-for a in "${args[@]}"; do
+for i in "${!args[@]}"; do
+  a="${args[$i]}"
+  if is_value_for_prev "$prev"; then
+    case "$prev" in
+      --harness-role)          harness_role="$a" ;;
+      --harness-provider)      harness_provider="$a" ;;
+      --implementation-family) implementation_family="$a" ;;
+      --rig)                   rig_hint="$a" ;;
+      --city)                  city_hint="$a" ;;
+      --context|--city-name|--city-url) remote_city_hint=1 ;;
+    esac
+    prev="$a"
+    continue
+  fi
   case "$a" in
     --on|--on=*)                has_on=1 ;;
     -f|--formula|--formula=*)   has_formula=1 ;;
     --no-formula)               has_no_formula=1 ;;
     --nudge)                    has_nudge=1 ;;
     --no-nudge)                 has_no_nudge=1 ;;
+    -n|--dry-run)               has_dry_run=1 ;;
+    --harness-role=*)           harness_role="${a#*=}" ;;
+    --harness-provider=*)       harness_provider="${a#*=}" ;;
+    --implementation-family=*) implementation_family="${a#*=}" ;;
+    --rig=*)                    rig_hint="${a#*=}" ;;
+    --city=*)                   city_hint="${a#*=}" ;;
+    --context=*|--city-name=*|--city-url=*) remote_city_hint=1 ;;
     --)                         break ;;
     -*)                         : ;;
     *)
-      if is_value_for_prev "$prev"; then
-        :
-      elif [[ -z "$target" ]]; then
+      if [[ -z "$target" ]]; then
         target="$a"
+        target_index=$i
       elif [[ -z "$bead" ]]; then
         bead="$a"
       fi ;;
@@ -153,13 +187,134 @@ for a in "${args[@]}"; do
   prev="$a"
 done
 
+# Role-aware routing is opt-in through the literal target `auto`. An explicit
+# target remains authoritative and cannot be silently replaced by a policy
+# decision. The selector chooses among Gas City's existing implicit provider
+# agents and returns the evidence that must be persisted before dispatch.
+auto_selected=0
+if [[ "$target" == "auto" || -n "$harness_role$harness_provider$implementation_family" ]]; then
+  if [[ "$target" != "auto" ]]; then
+    echo "gc-sling: harness flags require target 'auto'; explicit target '$target' remains authoritative" >&2
+    exit 2
+  fi
+  if [[ -z "$harness_role" ]]; then
+    echo "gc-sling: target 'auto' requires --harness-role coordination|implementation|verification" >&2
+    exit 2
+  fi
+  if [[ "$harness_role" == "verification" && -z "$implementation_family" ]]; then
+    echo "gc-sling: verification routing requires --implementation-family <provider-or-family>" >&2
+    exit 2
+  fi
+  if (( remote_city_hint )) || [[ -n "$city_hint" ]]; then
+    echo "gc-sling: role-based auto routing is limited to the current local city" >&2
+    exit 2
+  fi
+  if [[ -z "$bead" || "$bead" != *-* ]]; then
+    echo "gc-sling: role-based auto routing requires an existing bead ID" >&2
+    exit 2
+  fi
+  # Serialize selection through dispatch so two simultaneous calls cannot both
+  # observe and consume the same final provider/role slot. The descriptor stays
+  # open across the final `exec gc sling` and is released when that command exits.
+  if (( has_dry_run == 0 )); then
+    if ! exec {harness_lock_fd}>"$HARNESS_LOCK"; then
+      echo "gc-sling: cannot open harness allocation lock $HARNESS_LOCK" >&2
+      exit 2
+    fi
+    if ! flock -w 30 "$harness_lock_fd"; then
+      echo "gc-sling: timed out waiting for harness allocation lock" >&2
+      exit 2
+    fi
+  fi
+  selector_args=("$harness_role" "--bead" "$bead")
+  [[ -n "$rig_hint" ]] && selector_args+=("--rig" "$rig_hint")
+  [[ -n "$harness_provider" ]] && selector_args+=("--provider" "$harness_provider")
+  [[ -n "$implementation_family" ]] \
+    && selector_args+=("--implementation-family" "$implementation_family")
+  selector_args+=("--json")
+  if ! selection_json=$(timeout 30 "$HARNESS_SELECTOR" "${selector_args[@]}"); then
+    echo "gc-sling: harness selection refused for $bead" >&2
+    [[ -n "${selection_json:-}" ]] && echo "$selection_json" >&2
+    exit 2
+  fi
+  if ! jq -e '.ok == true and (.target | type == "string") and (.provider | type == "string")' \
+      >/dev/null 2>&1 <<<"$selection_json"; then
+    echo "gc-sling: harness selector returned an invalid result: $selection_json" >&2
+    exit 2
+  fi
+
+  selected_target=$(jq -r '.target' <<<"$selection_json")
+  selected_provider=$(jq -r '.provider' <<<"$selection_json")
+  selected_family=$(jq -r '.family' <<<"$selection_json")
+  selected_rig=$(jq -r '.evidence.rig // ""' <<<"$selection_json")
+  selected_at=$(jq -r '.evidence.selected_at // ""' <<<"$selection_json")
+  selected_independent=$(jq -r \
+    'if .independent_review == null then "unknown" else (.independent_review | tostring) end' \
+    <<<"$selection_json")
+
+  # Record the decision before routing. If this write fails, dispatch must not
+  # proceed: a harness choice without durable provenance is not a valid choice.
+  # Core --dry-run is preview-only, so it deliberately skips all wrapper writes.
+  selection_json=$(jq -c '.' <<<"$selection_json")
+  metadata_args=(
+    --set-metadata "gc.harness_role=$harness_role"
+    --set-metadata "gc.harness_provider=$selected_provider"
+    --set-metadata "gc.harness_family=$selected_family"
+    --set-metadata "gc.harness_independent_review=$selected_independent"
+    --set-metadata "gc.harness_selected_at=$selected_at"
+    --set-metadata "gc.harness_selection=$selection_json"
+  )
+  if (( has_dry_run == 0 )); then
+    if [[ "$bead" == dr-* ]]; then
+      metadata_cmd=(env GC_BEADS=bd timeout 15 gc bd update "$bead")
+    else
+      metadata_cmd=(timeout 15 gc bd --rig "$selected_rig" update "$bead")
+    fi
+    if ! "${metadata_cmd[@]}" "${metadata_args[@]}" >/dev/null; then
+      echo "gc-sling: refusing to dispatch $bead because harness selection metadata could not be recorded" >&2
+      exit 2
+    fi
+  fi
+
+  # Strip wrapper-only flags and replace the first positional (`auto`) with the
+  # selected qualified target before any existing worktree/formula logic runs.
+  selected_args=()
+  skip_next=0
+  for i in "${!args[@]}"; do
+    a="${args[$i]}"
+    if (( skip_next )); then
+      skip_next=0
+      continue
+    fi
+    case "$a" in
+      --harness-role|--harness-provider|--implementation-family)
+        skip_next=1
+        continue ;;
+      --harness-role=*|--harness-provider=*|--implementation-family=*)
+        continue ;;
+    esac
+    if (( i == target_index )); then
+      selected_args+=("$selected_target")
+    else
+      selected_args+=("$a")
+    fi
+  done
+  set -- "${selected_args[@]}"
+  args=("$@")
+  target="$selected_target"
+  auto_selected=1
+  (( has_dry_run )) \
+    || log_event "harness-selected" "$bead" "$target" "" "provider=$selected_provider role=$harness_role"
+  echo "gc-sling: selected $target for $harness_role ($selected_provider)" >&2
+fi
+
 # Pre-flight dead-target guard. Routing to a target whose pool has zero live
 # sessions (a mistyped target, or a min=0 pool with no worker that won't spawn
 # — e.g. `gascity/codex`, which has no workers) silently strands the bead:
 # `gc sling` exits 0, the bead is stamped gc.routed_to, and nothing ever claims
 # it. This turns that silent strand into a loud warning at dispatch time.
 # gascity-rig code work belongs on target `polecat`, not `gascity/codex`.
-if [[ -n "$target" ]]; then
+if [[ -n "$target" && "$auto_selected" -eq 0 ]]; then
   # The sling target is an alias (e.g. `polecat`); sessions are stored under the
   # resolved template path (e.g. `/home/ds/gascity/polecat`), so an exact
   # --template match on the alias misses live sessions. Match on the target's
@@ -230,28 +385,47 @@ ensure_bead_worktree() {
   # existing-check never short-circuited (orphan worktrees) and the metadata writes
   # no-op'd while "worktree-recorded" logged success (gc-na2o). Fail-safe: fall back
   # to the raw prefix if the lookup is unavailable, so this is never worse than before.
-  local rig_name
-  rig_name=$(timeout 10 gc rig list --json 2>/dev/null \
+  local rig_name rig_json
+  rig_json=$(timeout 10 gc rig list --json 2>/dev/null || echo "")
+  rig_name=$(printf '%s' "$rig_json" \
     | jq -r --arg p "${bead%%-*}" '(.rigs // [])[] | select(.prefix==$p) | .name' 2>/dev/null | head -1)
   [[ -n "$rig_name" ]] || rig_name="${bead%%-*}"
 
   local tb repo
-  tb="${target##*/}"; tb="${tb%-[0-9]*}"
-  repo=$(timeout 10 gc session list --json 2>/dev/null | jq -r --arg t "$target" --arg tb "$tb" '
-    [ ((.sessions // .) // [])[]
-      | select(((.state // .State // "") | ascii_downcase) != "closed")
-      | select(
-          ((.template // .Template // "") == $t)
-          or (((.template // .Template // "") | split("/") | last | sub("-[0-9]+$";"")) == $tb)
-          or (((.work_dir // .WorkDir // "") | split("/") | last | sub("-[0-9]+$";"")) == $tb)
-        )
-      | (.work_dir // .WorkDir // "")
-    ] | map(select(. != "")) | first // ""' 2>/dev/null || echo "")
-  [[ -n "$repo" ]] || { log_event "worktree-skip" "$bead" "$target" "" "no live work_dir for target"; return 0; }
+  if (( auto_selected )); then
+    # Implicit provider agents are valid on-demand sling targets and commonly
+    # have no live session yet. Always resolve their repository from the bead's
+    # rig: the legacy basename matcher strips numeric suffixes, so codex-2 can
+    # otherwise collide with an unrelated codex session in another repository.
+    repo=$(printf '%s' "$rig_json" \
+      | jq -r --arg r "$rig_name" '(.rigs // [])[] | select(.name==$r) | (.path // "")' 2>/dev/null | head -1)
+  else
+    tb="${target##*/}"; tb="${tb%-[0-9]*}"
+    repo=$(timeout 10 gc session list --json 2>/dev/null | jq -r --arg t "$target" --arg tb "$tb" '
+      [ ((.sessions // .) // [])[]
+        | select(((.state // .State // "") | ascii_downcase) != "closed")
+        | select(
+            ((.template // .Template // "") == $t)
+            or (((.template // .Template // "") | split("/") | last | sub("-[0-9]+$";"")) == $tb)
+            or (((.work_dir // .WorkDir // "") | split("/") | last | sub("-[0-9]+$";"")) == $tb)
+          )
+        | (.work_dir // .WorkDir // "")
+      ] | map(select(. != "")) | first // ""' 2>/dev/null || echo "")
+  fi
+  if [[ -z "$repo" ]]; then
+    log_event "worktree-skip" "$bead" "$target" "" "no live work_dir or rig path for target"
+    (( auto_selected )) && return 4
+    return 0
+  fi
 
   git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
-    || { log_event "worktree-skip" "$bead" "$target" "" "$repo not a git repo"; return 0; }
-  local toplevel; toplevel=$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null) || return 0
+    || { log_event "worktree-skip" "$bead" "$target" "" "$repo not a git repo"; (( auto_selected )) && return 4; return 0; }
+  local toplevel
+  if ! toplevel=$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null); then
+    log_event "worktree-skip" "$bead" "$target" "" "cannot resolve git toplevel for $repo"
+    (( auto_selected )) && return 4
+    return 0
+  fi
   local wt_path="${toplevel}-${beadshort}"
 
   # dr-vn1i: authoritative per-rig base ref. Delegate base selection to the pure
@@ -272,6 +446,14 @@ ensure_bead_worktree() {
   existing=$(timeout 10 gc bd --rig "$rig_name" show "$bead" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | (.metadata."work_dir" // .metadata."gc.work_dir" // "")' 2>/dev/null || echo "")
   if [[ -n "$existing" ]]; then
+    if (( auto_selected )); then
+      if [[ "$existing" == "$toplevel" ]] \
+        || ! git -C "$toplevel" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $existing" \
+        || [[ "$existing" != *"$bead"* && "$existing" != *"-$beadshort" ]]; then
+        log_event "worktree-fail" "$bead" "$target" "" "recorded work_dir is not a dedicated worktree for $bead: $existing"
+        return 4
+      fi
+    fi
     log_event "worktree-exists" "$bead" "$target" "" "work_dir already set: $existing"
     return 0
   fi
@@ -285,30 +467,44 @@ ensure_bead_worktree() {
   if ! git -C "$toplevel" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $wt_path"; then
     if [[ -e "$wt_path" ]]; then
       log_event "worktree-skip" "$bead" "$target" "" "path exists, not a worktree: $wt_path"
+      (( auto_selected )) && return 4
     else
       if timeout 30 git -C "$toplevel" worktree add --detach "$wt_path" "$base_committish" >/dev/null 2>&1; then
         echo "gc-sling: created per-bead worktree $wt_path (base $base_ref${base_sha:+ @ $base_sha})" >&2
         log_event "worktree-created" "$bead" "$target" "" "$wt_path base=$base_ref sha=$base_sha"
       else
         log_event "worktree-fail" "$bead" "$target" "" "git worktree add failed for $wt_path"
+        (( auto_selected )) && return 4
         return 0
       fi
     fi
   fi
 
   if [[ -d "$wt_path" ]]; then
-    timeout 10 gc bd --rig "$rig_name" update "$bead" --set-metadata "work_dir=$wt_path" >/dev/null 2>&1 || true
-    timeout 10 gc bd --rig "$rig_name" update "$bead" --set-metadata "gc.work_dir=$wt_path" >/dev/null 2>&1 || true
+    metadata_ok=1
+    timeout 10 gc bd --rig "$rig_name" update "$bead" --set-metadata "work_dir=$wt_path" >/dev/null 2>&1 || metadata_ok=0
+    timeout 10 gc bd --rig "$rig_name" update "$bead" --set-metadata "gc.work_dir=$wt_path" >/dev/null 2>&1 || metadata_ok=0
     # dr-vn1i: record the authoritative base the worktree was cut from, so a
     # divergent base is auditable (and future finalize/land can verify against it).
-    timeout 10 gc bd --rig "$rig_name" update "$bead" --set-metadata "gc.base_ref=$base_ref" >/dev/null 2>&1 || true
-    [[ -n "$base_sha" ]] && timeout 10 gc bd --rig "$rig_name" update "$bead" --set-metadata "gc.base_sha=$base_sha" >/dev/null 2>&1 || true
+    timeout 10 gc bd --rig "$rig_name" update "$bead" --set-metadata "gc.base_ref=$base_ref" >/dev/null 2>&1 || metadata_ok=0
+    if [[ -n "$base_sha" ]]; then
+      timeout 10 gc bd --rig "$rig_name" update "$bead" --set-metadata "gc.base_sha=$base_sha" >/dev/null 2>&1 || metadata_ok=0
+    fi
+    if (( auto_selected && metadata_ok == 0 )); then
+      log_event "worktree-fail" "$bead" "$target" "" "failed to persist worktree metadata for $wt_path"
+      return 4
+    fi
     log_event "worktree-recorded" "$bead" "$target" "" "$wt_path base=$base_ref sha=$base_sha"
+  elif (( auto_selected )); then
+    log_event "worktree-fail" "$bead" "$target" "" "worktree path missing after creation: $wt_path"
+    return 4
   fi
 }
 
 _ebw_rc=0
-ensure_bead_worktree "$bead" "$target" || _ebw_rc=$?
+if (( has_dry_run == 0 )); then
+  ensure_bead_worktree "$bead" "$target" || _ebw_rc=$?
+fi
 if [[ "$_ebw_rc" == "3" ]]; then
   # dr-vn1i FAIL-CLOSED: an authoritative-base rig whose base couldn't be resolved
   # would otherwise dispatch onto a wrong/stale base and silently corrupt work
@@ -318,6 +514,11 @@ if [[ "$_ebw_rc" == "3" ]]; then
   echo "gc-sling: FAIL-CLOSED — refusing to dispatch $bead: its rig's authoritative base ref could not be resolved (fetch/access?), and a wrong-base per-bead worktree silently corrupts work (dr-vn1i)." >&2
   echo "gc-sling: fix the base-ref config (.gc/sling-base-refs.conf) or the remote fetch access, then re-sling." >&2
   log_event "sling-fail-closed" "$bead" "$target" "" "authoritative base unresolvable; dispatch aborted (dr-vn1i)"
+  exit 1
+fi
+if [[ "$_ebw_rc" == "4" ]]; then
+  echo "gc-sling: FAIL-CLOSED — refusing auto dispatch for $bead because its isolated worktree could not be verified and recorded." >&2
+  log_event "sling-fail-closed" "$bead" "$target" "" "auto-selected target lacks verified per-bead worktree"
   exit 1
 fi
 

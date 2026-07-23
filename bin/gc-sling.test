@@ -36,6 +36,8 @@ trap 'rm -rf "$WORK"' EXIT
 
 TARGET="city-infra-polecat"
 SLING_LOG="$WORK/sling.log"
+SELECT_LOG="$WORK/select.log"
+BD_LOG="$WORK/bd.log"
 
 # --- fixture intercept config: rules:[] exercises the REAL live code path ------
 # (empty ruleset => id/title match miss => the terminal `exec ... gc sling`,
@@ -52,6 +54,7 @@ cat > "$STUB/gc" <<EOF
 # authoritative store resolution, which is independent of ambient GC_BEADS.
 SLING_LOG="$SLING_LOG"
 TARGET="$TARGET"
+BD_LOG="$BD_LOG"
 EOF
 cat >> "$STUB/gc" <<'EOF'
 sub="${1:-}"; shift || true
@@ -63,13 +66,28 @@ case "$sub" in
     # STUB_SESSION_WORKDIR, to exercise the worktree guard (assertion 4).
     if [[ "${1:-}" == "list" ]]; then
       wd="${STUB_SESSION_WORKDIR:-/home/ds/gas-city/$TARGET}"
-      printf '{"sessions":[{"template":"/home/ds/gas-city/%s","work_dir":"%s","state":"idle"}]}\n' "$TARGET" "$wd"
+      template="${STUB_SESSION_TEMPLATE:-/home/ds/gas-city/$TARGET}"
+      printf '{"sessions":[{"template":"%s","work_dir":"%s","state":"idle"}]}\n' "$template" "$wd"
     fi
     ;;
   rig)
-    [[ "${1:-}" == "list" ]] && printf '{"rigs":[]}\n'
+    if [[ "${1:-}" == "list" ]]; then
+      if [[ -n "${STUB_RIG_PATH:-}" ]]; then
+        printf '{"rigs":[{"name":"gascity","prefix":"gc","path":"%s"}]}\n' "$STUB_RIG_PATH"
+      else
+        printf '{"rigs":[]}\n'
+      fi
+    fi
     ;;
   bd)
+    if [[ " $* " == *" update "* ]]; then
+      printf '%s\n' "$*" >> "$BD_LOG"
+      exit 0
+    fi
+    if [[ -n "${STUB_EXISTING_WORKDIR:-}" ]]; then
+      printf '[{"id":"stub","title":"stub bead","metadata":{"work_dir":"%s"}}]\n' "$STUB_EXISTING_WORKDIR"
+      exit 0
+    fi
     # Title-lookup path. Emit a bead so a title exists; rules:[] means it is
     # never matched, but the call must not error.
     printf '[{"id":"stub","title":"stub bead"}]\n'
@@ -77,23 +95,40 @@ case "$sub" in
   sling)
     # bead = the SECOND positional (first is the target, which itself contains
     # dashes — e.g. city-infra-polecat — so a "first token with a dash" scan would
-    # wrongly grab the target). The test never passes value-taking flags, so a
-    # plain positional counter over non-flag args is sufficient.
-    bead=""; pos=0
+    # wrongly grab the target). Skip values belonging to global flags so the
+    # fixture also exercises flags placed before the target.
+    bead=""; target=""; pos=0; skip=0
     for a in "$@"; do
+      if (( skip )); then skip=0; continue; fi
+      case "$a" in
+        --rig|--city) skip=1; continue ;;
+      esac
       [[ "$a" == -* ]] && continue
       pos=$((pos + 1))
+      [[ $pos -eq 1 ]] && target="$a"
       [[ $pos -eq 2 ]] && { bead="$a"; break; }
     done
     gcb="${GC_BEADS:-unset}"
     nudged="no"; for a in "$@"; do [[ "$a" == "--nudge" ]] && nudged="yes"; done
-    printf 'ROUTED bead=%s GC_BEADS=%s nudge=%s\n' "$bead" "$gcb" "$nudged" >> "$SLING_LOG"
+    printf 'ROUTED target=%s bead=%s GC_BEADS=%s nudge=%s args=%s\n' "$target" "$bead" "$gcb" "$nudged" "$*" >> "$SLING_LOG"
     exit 0
     ;;
 esac
 exit 0
 EOF
 chmod +x "$STUB/gc"
+
+# Fixed selector result for wrapper plumbing. Pure selection behavior is tested
+# in test_gc_harness_select.py; this fixture proves gc-sling consumes the JSON,
+# records it, strips wrapper-only flags, and routes to the selected target.
+cat > "$STUB/gc-harness-select" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$SELECT_LOG"
+cat <<'JSON'
+{"ok":true,"target":"gascity/codex-2","provider":"codex-2","family":"openai","role":"implementation","reason":"fixture","independent_review":false,"evidence":{"rig":"gascity","selected_at":"2026-07-23T02:00:00+00:00"}}
+JSON
+EOF
+chmod +x "$STUB/gc-harness-select"
 
 run_sling() { # run_sling <bead>
   PATH="$STUB:$PATH" \
@@ -113,6 +148,30 @@ run_sling_wt() {
   GC_SLING_INTERCEPT_CONFIG="$CFG" \
   GC_SLING_INTERCEPT_LOG="$WORK/intercept.log" \
     bash "$SLING" "$TARGET" "$1" >/dev/null 2>&1
+}
+
+run_auto_sling() {
+  PATH="$STUB:$PATH" \
+  GC_BEADS=file \
+  GC_HARNESS_SELECTOR="$STUB/gc-harness-select" \
+  GC_HARNESS_LOCK="$WORK/harness.lock" \
+  GC_SLING_NO_WORKTREE=1 \
+  GC_SLING_INTERCEPT_CONFIG="$CFG" \
+  GC_SLING_INTERCEPT_LOG="$WORK/intercept.log" \
+    bash "$SLING" auto "$1" --harness-role implementation \
+      --implementation-family codex >/dev/null 2>&1
+}
+
+run_auto_sling_wt() {
+  PATH="$STUB:$PATH" \
+  GC_BEADS=file \
+  GC_HARNESS_SELECTOR="$STUB/gc-harness-select" \
+  GC_HARNESS_LOCK="$WORK/harness.lock" \
+  STUB_RIG_PATH="$2" \
+  GC_SLING_BASE_REFS_CONF="$WORK/empty-base-refs.conf" \
+  GC_SLING_INTERCEPT_CONFIG="$CFG" \
+  GC_SLING_INTERCEPT_LOG="$WORK/intercept.log" \
+    bash "$SLING" auto "$1" --harness-role implementation >/dev/null 2>&1
 }
 
 fail() { echo "FAIL: $1" >&2; echo "  sling.log:"; sed 's/^/    /' "$SLING_LOG" 2>/dev/null >&2; exit 1; }
@@ -224,4 +283,147 @@ rc=$(rab otherrig "$SLOT1" main); rcc="${rc%%$'\t'*}"; outc="${rc#*$'\t'}"
 [[ "$(awk '{print $1}' <<<"$outc")" == "main" ]] \
   || fail "AC1c: unconfigured rig base is not the default branch (got '$outc')"
 
-echo "PASS: provider/nudge/no-stray-worktree contract holds, and resolve_authoritative_base pins two divergent slots to one upstream SHA, fails closed on an unresolvable ref, and falls through for unconfigured rigs"
+# --- assertion 6: role-based auto target selects, records, and routes --------
+: > "$SLING_LOG"; : > "$SELECT_LOG"; : > "$BD_LOG"
+run_auto_sling "gc-abc12"
+line=$(grep 'bead=gc-abc12' "$SLING_LOG" 2>/dev/null | head -1)
+[[ "$line" == *"target=gascity/codex-2"* ]] \
+  || fail "auto sling did not route to selector target: $line"
+[[ "$line" != *"--harness-role"* && "$line" != *"--implementation-family"* ]] \
+  || fail "wrapper-only harness flags leaked into gc sling: $line"
+grep -q '^implementation --bead gc-abc12 --implementation-family codex --json$' "$SELECT_LOG" \
+  || fail "selector did not receive role/bead/family: $(cat "$SELECT_LOG")"
+grep -q -- '--set-metadata gc.harness_provider=codex-2' "$BD_LOG" \
+  || fail "selection provider was not recorded on bead: $(cat "$BD_LOG")"
+grep -q -- '--set-metadata gc.harness_selection=' "$BD_LOG" \
+  || fail "selection evidence JSON was not recorded on bead: $(cat "$BD_LOG")"
+grep -q -- '--set-metadata gc.harness_independent_review=false' "$BD_LOG" \
+  || fail "false review-independence result was not preserved: $(cat "$BD_LOG")"
+
+# --- assertion 6b: flags before auto keep their positions --------------------
+: > "$SLING_LOG"
+PATH="$STUB:$PATH" \
+GC_BEADS=file \
+GC_HARNESS_SELECTOR="$STUB/gc-harness-select" \
+GC_HARNESS_LOCK="$WORK/harness.lock" \
+GC_SLING_NO_WORKTREE=1 \
+GC_SLING_INTERCEPT_CONFIG="$CFG" \
+GC_SLING_INTERCEPT_LOG="$WORK/intercept.log" \
+  bash "$SLING" --rig gascity auto gc-abc12 --harness-role implementation >/dev/null 2>&1
+line=$(grep 'bead=gc-abc12' "$SLING_LOG" 2>/dev/null | head -1)
+[[ "$line" == *"target=gascity/codex-2"*"args=--rig gascity gascity/codex-2 gc-abc12"* ]] \
+  || fail "flag before auto corrupted forwarded arguments: $line"
+
+# --- assertion 7: cold implicit auto target still gets an isolated worktree ---
+# The session fixture belongs to TARGET, not the selector's gascity/codex-2
+# target. Auto routing must therefore fall back to the bead rig's repository
+# instead of skipping isolation merely because the on-demand agent is cold.
+: > "$BD_LOG"
+: > "$WORK/empty-base-refs.conf"
+run_auto_sling_wt "gc-abc13" "$GITREPO"
+[[ -d "${GITREPO}-abc13" ]] \
+  || fail "cold implicit auto target did not get a per-bead worktree from its rig path"
+grep -q -- "--set-metadata work_dir=${GITREPO}-abc13" "$BD_LOG" \
+  || fail "cold implicit target worktree was not recorded on bead: $(cat "$BD_LOG")"
+
+# --- assertion 8: auto target fails closed when isolation cannot be resolved --
+: > "$SLING_LOG"
+if PATH="$STUB:$PATH" \
+   GC_BEADS=file \
+   GC_HARNESS_SELECTOR="$STUB/gc-harness-select" \
+   GC_HARNESS_LOCK="$WORK/harness.lock" \
+   GC_SLING_BASE_REFS_CONF="$WORK/empty-base-refs.conf" \
+   GC_SLING_INTERCEPT_CONFIG="$CFG" \
+   GC_SLING_INTERCEPT_LOG="$WORK/intercept.log" \
+     bash "$SLING" auto gc-abc14 --harness-role implementation >/dev/null 2>&1; then
+  fail "auto dispatch succeeded without a live work_dir or resolvable rig path"
+fi
+[[ -z "$(cat "$SLING_LOG")" ]] \
+  || fail "failed isolation still reached gc sling: $(cat "$SLING_LOG")"
+
+# --- assertion 9: shared checkout metadata does not count as isolation --------
+: > "$SLING_LOG"
+if PATH="$STUB:$PATH" \
+   GC_BEADS=file \
+   GC_HARNESS_SELECTOR="$STUB/gc-harness-select" \
+   GC_HARNESS_LOCK="$WORK/harness.lock" \
+   STUB_RIG_PATH="$GITREPO" \
+   STUB_EXISTING_WORKDIR="$GITREPO" \
+   GC_SLING_BASE_REFS_CONF="$WORK/empty-base-refs.conf" \
+   GC_SLING_INTERCEPT_CONFIG="$CFG" \
+   GC_SLING_INTERCEPT_LOG="$WORK/intercept.log" \
+     bash "$SLING" auto gc-abc16 --harness-role implementation >/dev/null 2>&1; then
+  fail "auto dispatch accepted the shared rig checkout as bead isolation"
+fi
+[[ -z "$(cat "$SLING_LOG")" ]] \
+  || fail "shared-checkout isolation failure still reached gc sling: $(cat "$SLING_LOG")"
+
+# --- assertion 10: cold explicit target preserves best-effort behavior --------
+: > "$SLING_LOG"
+PATH="$STUB:$PATH" \
+GC_BEADS=file \
+STUB_RIG_PATH="$GITREPO" \
+GC_SLING_BASE_REFS_CONF="$WORK/empty-base-refs.conf" \
+GC_SLING_INTERCEPT_CONFIG="$CFG" \
+GC_SLING_INTERCEPT_LOG="$WORK/intercept.log" \
+  bash "$SLING" cold-pool gc-abc17 >/dev/null 2>&1
+line=$(grep 'bead=gc-abc17' "$SLING_LOG" 2>/dev/null | head -1)
+[[ "$line" == *"target=cold-pool"* ]] \
+  || fail "cold explicit target no longer preserves pass-through behavior: $line"
+[[ ! -e "${GITREPO}-abc17" ]] \
+  || fail "cold explicit target unexpectedly used the auto-only rig fallback"
+
+# --- assertion 11: remote-city globals are parsed then explicitly refused -----
+: > "$SLING_LOG"
+remote_err="$WORK/remote.err"
+if PATH="$STUB:$PATH" \
+   GC_BEADS=file \
+   GC_HARNESS_SELECTOR="$STUB/gc-harness-select" \
+   GC_HARNESS_LOCK="$WORK/harness.lock" \
+     bash "$SLING" --context other-city auto gc-abc18 \
+       --harness-role implementation >/dev/null 2>"$remote_err"; then
+  fail "auto routing unexpectedly accepted a remote city context"
+fi
+grep -q 'limited to the current local city' "$remote_err" \
+  || fail "remote city refusal was misparsed as a positional target: $(cat "$remote_err")"
+[[ -z "$(cat "$SLING_LOG")" ]] \
+  || fail "remote-city refusal still reached gc sling: $(cat "$SLING_LOG")"
+
+# --- assertion 12: sibling provider sessions cannot redirect the auto repo ----
+OTHERREPO="$WORK/other-repo"
+git init -q -b main "$OTHERREPO"
+git -C "$OTHERREPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+: > "$SLING_LOG"; : > "$BD_LOG"
+PATH="$STUB:$PATH" \
+GC_BEADS=file \
+GC_HARNESS_SELECTOR="$STUB/gc-harness-select" \
+GC_HARNESS_LOCK="$WORK/harness.lock" \
+STUB_RIG_PATH="$GITREPO" \
+STUB_SESSION_TEMPLATE="codex" \
+STUB_SESSION_WORKDIR="$OTHERREPO" \
+GC_SLING_BASE_REFS_CONF="$WORK/empty-base-refs.conf" \
+GC_SLING_INTERCEPT_CONFIG="$CFG" \
+GC_SLING_INTERCEPT_LOG="$WORK/intercept.log" \
+  bash "$SLING" auto gc-abc19 --harness-role implementation >/dev/null 2>&1
+[[ -d "${GITREPO}-abc19" ]] \
+  || fail "auto target did not use the selected bead rig repository"
+[[ ! -e "${OTHERREPO}-abc19" ]] \
+  || fail "codex-2 auto target collided with a codex session repository"
+
+# --- assertion 13: core dry-run has no wrapper write/worktree side effects ----
+: > "$SLING_LOG"; : > "$BD_LOG"
+PATH="$STUB:$PATH" \
+GC_BEADS=file \
+GC_HARNESS_SELECTOR="$STUB/gc-harness-select" \
+GC_HARNESS_LOCK="$WORK/harness.lock" \
+STUB_RIG_PATH="$GITREPO" \
+GC_SLING_BASE_REFS_CONF="$WORK/empty-base-refs.conf" \
+GC_SLING_INTERCEPT_CONFIG="$CFG" \
+GC_SLING_INTERCEPT_LOG="$WORK/intercept.log" \
+  bash "$SLING" auto gc-abc20 --harness-role implementation --dry-run >/dev/null 2>&1
+line=$(grep 'bead=gc-abc20' "$SLING_LOG" 2>/dev/null | head -1)
+[[ "$line" == *"--dry-run"* ]] || fail "auto dry-run did not reach core dry-run: $line"
+[[ ! -s "$BD_LOG" ]] || fail "auto dry-run wrote bead metadata: $(cat "$BD_LOG")"
+[[ ! -e "${GITREPO}-abc20" ]] || fail "auto dry-run created a worktree"
+
+echo "PASS: provider/nudge/worktree contracts hold; authoritative bases are pinned; role-based auto routing selects under lock, preserves flags/evidence, dry-run, and explicit targets, isolates cold implicit targets to the bead rig, rejects shared checkouts/remote contexts, fails closed without isolation, and dispatches"

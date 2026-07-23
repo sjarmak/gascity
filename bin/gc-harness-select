@@ -1,0 +1,762 @@
+#!/usr/bin/env python3
+"""Select a dispatch target by role, verified headroom, and live concurrency.
+
+This is city policy, not Gas City SDK cognition. Gas City already materializes
+an on-demand agent for every configured provider at city and rig scope. This
+command chooses among those existing targets and explains the choice; it never
+edits agent provider pins or credentials.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import selectors
+import subprocess
+import sys
+import time
+import tomllib
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+
+CITY_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_POLICY = CITY_ROOT / "harness-policy.toml"
+DEFAULT_CITY_CONFIG = CITY_ROOT / "city.toml"
+DEFAULT_CLAUDE_USAGE = Path.home() / ".claude-usage" / "usage_cache.json"
+INACTIVE_STATES = {"asleep", "closed", "stopped", "suspended"}
+VALID_ROLES = {"coordination", "implementation", "verification"}
+
+
+class HarnessSelectionError(RuntimeError):
+    """Base class for loud, fail-closed selection errors."""
+
+
+class NoEligibleHarness(HarnessSelectionError):
+    """No configured candidate safely satisfies the requested role."""
+
+
+@dataclass(frozen=True)
+class Candidate:
+    provider: str
+    family: str
+    roles: tuple[str, ...]
+    telemetry: str
+    max_active: int
+    account: str = ""
+    telemetry_home: str = ""
+    retired: bool = False
+
+
+@dataclass(frozen=True)
+class Telemetry:
+    healthy: bool
+    used_percent: float | None
+    observed_at: datetime | None
+    source: str
+    bounded_fallback: bool = False
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class Policy:
+    drain_percent: float
+    telemetry_max_age_seconds: int
+    role_max_active: Mapping[str, int]
+    candidates: tuple[Candidate, ...]
+
+
+@dataclass(frozen=True)
+class Selection:
+    target: str
+    provider: str
+    family: str
+    role: str
+    reason: str
+    independent_review: bool | None
+    evidence: Mapping[str, Any]
+
+    def json_record(self) -> dict[str, Any]:
+        record = asdict(self)
+        record["ok"] = True
+        return record
+
+
+def parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def parse_utilization(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or not 0 <= parsed <= 100:
+        return None
+    return parsed
+
+
+def load_policy(path: Path) -> Policy:
+    try:
+        data = tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise HarnessSelectionError(
+            f"cannot load harness policy {path}: {exc}"
+        ) from exc
+    if data.get("version") != 1:
+        raise HarnessSelectionError(f"unsupported harness policy version in {path}")
+    roles = data.get("roles") or {}
+    role_max = {
+        name: int(spec["max_active"])
+        for name, spec in roles.items()
+        if isinstance(spec, dict) and "max_active" in spec
+    }
+    missing_roles = VALID_ROLES - set(role_max)
+    if missing_roles:
+        raise HarnessSelectionError(
+            f"policy {path} lacks role ceilings for: {', '.join(sorted(missing_roles))}"
+        )
+    candidates = tuple(
+        Candidate(
+            provider=str(raw["provider"]),
+            family=str(raw["family"]),
+            roles=tuple(str(role) for role in raw.get("roles", [])),
+            telemetry=str(raw["telemetry"]),
+            max_active=int(raw["max_active"]),
+            account=str(raw.get("account", "")),
+            telemetry_home=os.path.expanduser(str(raw.get("telemetry_home", ""))),
+            retired=bool(raw.get("retired", False)),
+        )
+        for raw in data.get("candidates", [])
+    )
+    return Policy(
+        drain_percent=float(data["drain_percent"]),
+        telemetry_max_age_seconds=int(data["telemetry_max_age_seconds"]),
+        role_max_active=role_max,
+        candidates=candidates,
+    )
+
+
+def _tail_lines(path: Path, maximum_bytes: int = 1_048_576) -> list[bytes]:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - maximum_bytes))
+            data = handle.read()
+    except OSError:
+        return []
+    if size > maximum_bytes:
+        data = data.split(b"\n", 1)[-1]
+    return data.splitlines()
+
+
+def load_codex_telemetry(home: Path) -> Telemetry:
+    sessions = home / "sessions"
+    try:
+        files = sorted(
+            sessions.rglob("*.jsonl"),
+            key=lambda path: (path.stat().st_mtime_ns, str(path)),
+            reverse=True,
+        )[:50]
+    except OSError as exc:
+        return Telemetry(False, None, None, f"codex:{home}", detail=str(exc))
+
+    latest: tuple[datetime, dict[str, Any]] | None = None
+    for path in files:
+        for raw in reversed(_tail_lines(path)):
+            try:
+                event = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            payload = event.get("payload") or {}
+            limits = payload.get("rate_limits") or {}
+            primary = limits.get("primary") or {}
+            if primary.get("used_percent") is None:
+                continue
+            observed = parse_timestamp(event.get("timestamp"))
+            if observed is not None and (latest is None or observed > latest[0]):
+                latest = (observed, limits)
+            break
+    if latest is not None:
+        observed, limits = latest
+        primary = limits.get("primary") or {}
+        reached = limits.get("rate_limit_reached_type")
+        spend_reached = limits.get("spend_control_reached")
+        healthy = not reached and not spend_reached
+        detail = ""
+        utilization = parse_utilization(primary.get("used_percent"))
+        if utilization is None:
+            healthy = False
+            detail = "invalid primary utilization"
+        elif reached:
+            detail = f"rate limit reached: {reached}"
+        elif spend_reached:
+            detail = "spend control reached"
+        return Telemetry(
+            healthy=healthy,
+            used_percent=utilization,
+            observed_at=observed,
+            source=f"codex:{home}",
+            detail=detail,
+        )
+    return Telemetry(
+        False,
+        None,
+        None,
+        f"codex:{home}",
+        detail="no rate-limit event found",
+    )
+
+
+def load_live_codex_telemetry(
+    home: Path,
+    command: Sequence[str] = ("codex", "app-server", "--stdio"),
+    timeout: float = 10,
+) -> Telemetry:
+    """Read account rate limits without spending a model turn.
+
+    The app-server protocol is line-delimited JSON. Initialize the connection,
+    then call account/rateLimits/read and keep stdin open until the response
+    arrives; closing it early lets the server exit before completing the call.
+    """
+    source = f"codex-app-server:{home}"
+    environment = os.environ.copy()
+    environment["CODEX_HOME"] = str(home)
+    try:
+        process = subprocess.Popen(
+            list(command),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            env=environment,
+        )
+    except OSError as exc:
+        return Telemetry(False, None, None, source, detail=str(exc))
+
+    poller = selectors.DefaultSelector()
+    try:
+        if process.stdin is None or process.stdout is None:
+            return Telemetry(
+                False, None, None, source, detail="app-server pipes unavailable"
+            )
+        poller.register(process.stdout, selectors.EVENT_READ)
+        initialize = {
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "gc-harness-select", "version": "1"},
+                "capabilities": {"experimentalApi": True},
+            },
+        }
+        process.stdin.write(json.dumps(initialize) + "\n")
+        process.stdin.flush()
+        deadline = time.monotonic() + timeout
+        requested_limits = False
+
+        while (remaining := deadline - time.monotonic()) > 0:
+            if not poller.select(remaining):
+                break
+            line = process.stdout.readline()
+            if not line:
+                break
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") == 1 and not requested_limits:
+                request = {
+                    "id": 2,
+                    "method": "account/rateLimits/read",
+                    "params": None,
+                }
+                process.stdin.write(json.dumps(request) + "\n")
+                process.stdin.flush()
+                requested_limits = True
+                continue
+            if message.get("id") != 2:
+                continue
+            if message.get("error"):
+                return Telemetry(
+                    False, None, None, source, detail=str(message["error"])
+                )
+            limits = (message.get("result") or {}).get("rateLimits") or {}
+            primary = limits.get("primary") or {}
+            utilization = parse_utilization(primary.get("usedPercent"))
+            reached = limits.get("rateLimitReachedType")
+            spend_reached = limits.get("spendControlReached")
+            healthy = utilization is not None and not reached and not spend_reached
+            detail = ""
+            if utilization is None:
+                detail = "invalid primary utilization"
+            elif reached:
+                detail = f"rate limit reached: {reached}"
+            elif spend_reached:
+                detail = "spend control reached"
+            return Telemetry(
+                healthy=healthy,
+                used_percent=utilization,
+                observed_at=datetime.now(timezone.utc),
+                source=source,
+                detail=detail,
+            )
+        return Telemetry(False, None, None, source, detail="app-server query timed out")
+    except (BrokenPipeError, OSError) as exc:
+        return Telemetry(False, None, None, source, detail=str(exc))
+    finally:
+        poller.close()
+        if process.stdin is not None:
+            process.stdin.close()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1)
+
+
+def load_claude_telemetry(path: Path) -> dict[str, Telemetry]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"*": Telemetry(False, None, None, f"claude:{path}", detail=str(exc))}
+    result: dict[str, Telemetry] = {}
+    for account in data.get("accounts", []):
+        name = str(account.get("name", ""))
+        seven = account.get("seven_day") or {}
+        error = account.get("error")
+        utilization = parse_utilization(seven.get("utilization"))
+        if not error and seven.get("utilization") is not None and utilization is None:
+            error = "invalid seven-day utilization"
+        result[name] = Telemetry(
+            healthy=not error and utilization is not None,
+            used_percent=utilization,
+            observed_at=parse_timestamp(
+                account.get("fetched_at") or data.get("fetched_at")
+            ),
+            source=f"claude:{path}:{name}",
+            detail=str(error or ""),
+        )
+    return result
+
+
+def collect_telemetry(
+    policy: Policy,
+    claude_usage_path: Path = DEFAULT_CLAUDE_USAGE,
+) -> dict[str, Telemetry]:
+    readings: dict[str, Telemetry] = {}
+    claude = load_claude_telemetry(claude_usage_path)
+    for candidate in policy.candidates:
+        if candidate.telemetry == "bounded":
+            readings[candidate.provider] = Telemetry(
+                healthy=True,
+                used_percent=None,
+                observed_at=None,
+                source="policy:bounded-concurrency",
+                bounded_fallback=True,
+                detail="no provider utilization feed; bounded by live ceilings",
+            )
+        elif candidate.telemetry == "codex":
+            home = Path(candidate.telemetry_home)
+            reading = load_codex_telemetry(home)
+            age = (
+                (datetime.now(timezone.utc) - reading.observed_at).total_seconds()
+                if reading.observed_at is not None
+                else float("inf")
+            )
+            if age < -60 or age > policy.telemetry_max_age_seconds:
+                reading = load_live_codex_telemetry(home)
+            readings[candidate.provider] = reading
+        elif candidate.telemetry == "claude":
+            readings[candidate.provider] = claude.get(
+                candidate.account,
+                claude.get(
+                    "*",
+                    Telemetry(
+                        False,
+                        None,
+                        None,
+                        f"claude:{claude_usage_path}:{candidate.account}",
+                        detail="account telemetry unavailable",
+                    ),
+                ),
+            )
+        else:
+            readings[candidate.provider] = Telemetry(
+                False,
+                None,
+                None,
+                f"policy:{candidate.telemetry}",
+                detail="unknown telemetry adapter",
+            )
+    return readings
+
+
+def qualify_target(rig: str, hq_name: str, provider: str) -> str:
+    return provider if rig == hq_name else f"{rig}/{provider}"
+
+
+def _candidate_rejection(
+    candidate: Candidate,
+    *,
+    role: str,
+    reading: Telemetry | None,
+    active: int,
+    configured_providers: set[str],
+    targets_by_provider: Mapping[str, str],
+    policy: Policy,
+    now: datetime,
+) -> str:
+    if candidate.retired:
+        return "retired"
+    if candidate.provider not in configured_providers:
+        return "not configured"
+    if candidate.provider not in targets_by_provider:
+        return "no matching provider target"
+    if candidate.max_active <= 0 or active >= candidate.max_active:
+        return f"provider ceiling {active}/{candidate.max_active}"
+    if role not in candidate.roles:
+        return f"role {role} not allowed"
+    if reading is None:
+        return "telemetry unavailable"
+    if not reading.healthy:
+        suffix = f": {reading.detail}" if reading.detail else ""
+        return f"down{suffix}"
+    if not reading.bounded_fallback:
+        if parse_utilization(reading.used_percent) is None:
+            return "invalid or unavailable utilization"
+        if reading.observed_at is None:
+            return "telemetry timestamp unavailable"
+        age = (now - reading.observed_at).total_seconds()
+        if age < -60 or age > policy.telemetry_max_age_seconds:
+            return f"stale telemetry ({int(age)}s old)"
+        if (
+            reading.used_percent is not None
+            and reading.used_percent >= policy.drain_percent
+        ):
+            return (
+                f"at/above drain line "
+                f"({reading.used_percent:.1f}% >= {policy.drain_percent:.1f}%)"
+            )
+    return ""
+
+
+def _normalize_family(value: str, candidates: Sequence[Candidate]) -> str:
+    value = value.strip().lower()
+    if not value:
+        return ""
+    aliases = {
+        "codex": "openai",
+        "openai": "openai",
+        "claude": "anthropic",
+        "anthropic": "anthropic",
+    }
+    if value in aliases:
+        return aliases[value]
+    for candidate in candidates:
+        if value == candidate.provider.lower():
+            return candidate.family
+    return value
+
+
+def select_harness(
+    *,
+    policy: Policy,
+    role: str,
+    rig: str,
+    telemetry_by_provider: Mapping[str, Telemetry],
+    active_by_provider: Mapping[str, int],
+    configured_providers: set[str],
+    targets_by_provider: Mapping[str, str],
+    implementation_family: str = "",
+    provider_pin: str = "",
+    now: datetime | None = None,
+) -> Selection:
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    role = role.strip().lower()
+    if role not in VALID_ROLES or role not in policy.role_max_active:
+        raise HarnessSelectionError(f"unknown harness role: {role!r}")
+    implementation_family = _normalize_family(implementation_family, policy.candidates)
+    if role == "verification" and not implementation_family:
+        raise HarnessSelectionError(
+            "verification role requires --implementation-family for review independence"
+        )
+    implementation_families = {
+        candidate.family
+        for candidate in policy.candidates
+        if not candidate.retired and "implementation" in candidate.roles
+    }
+    if role == "verification" and implementation_family not in implementation_families:
+        raise HarnessSelectionError(
+            f"unknown implementation family: {implementation_family!r}"
+        )
+
+    role_providers = {c.provider for c in policy.candidates if role in c.roles}
+    role_active = sum(
+        active_by_provider.get(provider, 0) for provider in role_providers
+    )
+    role_max = policy.role_max_active[role]
+    if role_active >= role_max:
+        raise NoEligibleHarness(
+            f"{role} role ceiling reached ({role_active}/{role_max})"
+        )
+
+    considered = list(policy.candidates)
+    if provider_pin:
+        considered = [c for c in considered if c.provider == provider_pin]
+        if not considered:
+            raise NoEligibleHarness(
+                f"pinned provider {provider_pin} is absent from policy"
+            )
+
+    eligible: list[tuple[Candidate, Telemetry]] = []
+    rejected: list[str] = []
+    for candidate in considered:
+        reading = telemetry_by_provider.get(candidate.provider)
+        rejection = _candidate_rejection(
+            candidate,
+            role=role,
+            reading=reading,
+            active=active_by_provider.get(candidate.provider, 0),
+            configured_providers=configured_providers,
+            targets_by_provider=targets_by_provider,
+            policy=policy,
+            now=now,
+        )
+        if rejection:
+            rejected.append(f"{candidate.provider}: {rejection}")
+        else:
+            eligible.append((candidate, reading))  # type: ignore[arg-type]
+
+    if not eligible:
+        prefix = f"pinned provider {provider_pin}: " if provider_pin else ""
+        raise NoEligibleHarness(prefix + "; ".join(rejected or ["no candidates"]))
+
+    independent: bool | None = None
+    same_family_fallback = False
+    if role == "verification" and implementation_family:
+        cross_family = [
+            item for item in eligible if item[0].family != implementation_family
+        ]
+        if cross_family:
+            eligible = cross_family
+            independent = True
+        else:
+            independent = False
+            same_family_fallback = True
+
+    def allocation_score(item: tuple[Candidate, Telemetry]) -> tuple[float, float, str]:
+        candidate, reading = item
+        used = reading.used_percent or 0.0
+        headroom = max(1.0, 100.0 - used)
+        active = active_by_provider.get(candidate.provider, 0)
+        return ((active + 1) / headroom, used, candidate.provider)
+
+    selected, reading = min(eligible, key=allocation_score)
+    active = active_by_provider.get(selected.provider, 0)
+    if provider_pin:
+        reason = f"explicit provider pin selected {selected.provider}"
+    elif same_family_fallback:
+        reason = (
+            f"no eligible cross-family reviewer; selected {selected.provider} "
+            "for capacity diversity only (not independent review)"
+        )
+    elif independent is True:
+        reason = (
+            f"selected {selected.provider} as an eligible cross-family reviewer "
+            f"for {implementation_family} implementation"
+        )
+    else:
+        reason = f"selected {selected.provider} by weighted live-load/headroom score"
+
+    observed = reading.observed_at.isoformat() if reading.observed_at else None
+    evidence = {
+        "selected_at": now.isoformat(),
+        "rig": rig,
+        "active_provider": active,
+        "provider_ceiling": selected.max_active,
+        "active_role": role_active,
+        "role_ceiling": role_max,
+        "used_percent": reading.used_percent,
+        "drain_percent": policy.drain_percent,
+        "telemetry_observed_at": observed,
+        "telemetry_source": reading.source,
+        "telemetry_bounded_fallback": reading.bounded_fallback,
+        "explicit_provider_pin": bool(provider_pin),
+        "implementation_family": implementation_family or None,
+    }
+    return Selection(
+        target=targets_by_provider[selected.provider],
+        provider=selected.provider,
+        family=selected.family,
+        role=role,
+        reason=reason,
+        independent_review=independent,
+        evidence=evidence,
+    )
+
+
+def _run_json(command: list[str], timeout: int = 15) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HarnessSelectionError(f"{' '.join(command)} failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise HarnessSelectionError(f"{' '.join(command)} failed: {detail}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise HarnessSelectionError(
+            f"{' '.join(command)} returned invalid JSON"
+        ) from exc
+
+
+def _load_city_providers(path: Path) -> set[str]:
+    try:
+        data = tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise HarnessSelectionError(f"cannot load city config {path}: {exc}") from exc
+    providers = set((data.get("providers") or {}).keys())
+    workspace_provider = (data.get("workspace") or {}).get("provider")
+    if workspace_provider:
+        providers.add(str(workspace_provider))
+    return providers
+
+
+def _runtime_inventory() -> tuple[
+    dict[str, int], dict[str, str], dict[str, dict[str, Any]], str
+]:
+    rig_data = _run_json(["gc", "rig", "list", "--json"])
+    agent_data = _run_json(["gc", "agent", "list", "--json"])
+    session_data = _run_json(["gc", "session", "list", "--json"])
+
+    rigs = {str(rig["name"]): rig for rig in rig_data.get("rigs", [])}
+    hq_name = next(
+        (name for name, rig in rigs.items() if rig.get("hq")),
+        str(rig_data.get("city_name") or ""),
+    )
+    targets: dict[str, str] = {}
+    # Filled by main once the rig is known. Preserve all target/provider pairs
+    # here under their qualified identity for exact matching.
+    for agent in agent_data.get("agents", []):
+        if agent.get("suspended"):
+            continue
+        provider = str(agent.get("provider") or "")
+        qualified = str(agent.get("qualified_name") or agent.get("name") or "")
+        if provider and qualified:
+            targets[qualified] = provider
+
+    active: dict[str, int] = {}
+    for session in session_data.get("sessions", []):
+        provider = str(session.get("provider") or "")
+        state = str(session.get("state") or "").lower()
+        if provider and state not in INACTIVE_STATES:
+            active[provider] = active.get(provider, 0) + 1
+    return active, targets, rigs, hq_name
+
+
+def _resolve_rig(
+    requested: str,
+    bead: str,
+    rigs: Mapping[str, Mapping[str, Any]],
+) -> str:
+    if requested:
+        for name, rig in rigs.items():
+            if requested in {name, str(rig.get("path") or "")}:
+                if rig.get("suspended"):
+                    raise HarnessSelectionError(f"rig {name} is suspended")
+                return name
+        raise HarnessSelectionError(f"unknown rig: {requested}")
+    matches = [
+        name
+        for name, rig in rigs.items()
+        if (prefix := str(rig.get("prefix") or ""))
+        and (bead == prefix or bead.startswith(prefix + "-"))
+    ]
+    if not matches:
+        raise HarnessSelectionError("cannot infer rig; pass --rig")
+    name = max(matches, key=lambda item: len(str(rigs[item].get("prefix") or "")))
+    if rigs[name].get("suspended"):
+        raise HarnessSelectionError(f"rig {name} is suspended")
+    return name
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("role", choices=sorted(VALID_ROLES))
+    parser.add_argument("--bead", default="", help="bead ID used to infer the rig")
+    parser.add_argument("--rig", default="", help="rig name or path")
+    parser.add_argument("--provider", default="", help="explicit provider pin")
+    parser.add_argument(
+        "--implementation-family",
+        default="",
+        help="provider or model family that produced the implementation",
+    )
+    parser.add_argument("--policy", type=Path, default=DEFAULT_POLICY)
+    parser.add_argument("--city-config", type=Path, default=DEFAULT_CITY_CONFIG)
+    parser.add_argument("--claude-usage", type=Path, default=DEFAULT_CLAUDE_USAGE)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    try:
+        policy = load_policy(args.policy)
+        active, qualified_targets, rigs, hq_name = _runtime_inventory()
+        rig = _resolve_rig(args.rig, args.bead, rigs)
+        configured = _load_city_providers(args.city_config)
+        targets = {
+            candidate.provider: qualify_target(rig, hq_name, candidate.provider)
+            for candidate in policy.candidates
+            if qualified_targets.get(qualify_target(rig, hq_name, candidate.provider))
+            == candidate.provider
+        }
+        selection = select_harness(
+            policy=policy,
+            role=args.role,
+            rig=rig,
+            telemetry_by_provider=collect_telemetry(policy, args.claude_usage),
+            active_by_provider=active,
+            configured_providers=configured,
+            targets_by_provider=targets,
+            implementation_family=args.implementation_family,
+            provider_pin=args.provider,
+        )
+    except HarnessSelectionError as exc:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
+        else:
+            print(f"gc-harness-select: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(selection.json_record(), sort_keys=True))
+    else:
+        print(selection.target)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

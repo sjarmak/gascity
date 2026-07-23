@@ -1,0 +1,89 @@
+version = 1
+drain_percent = 75
+telemetry_max_age_seconds = 1800
+
+[roles.coordination]
+max_active = 3
+
+[roles.implementation]
+max_active = 4
+
+[roles.verification]
+max_active = 4
+
+# Amp does not expose account utilization to this city. Its eligibility is the
+# explicit bounded fallback: provider health/configuration plus these live
+# concurrency ceilings. The current envelope is one high + two medium sessions.
+[[candidates]]
+provider = "amp"
+family = "amp"
+roles = ["coordination"]
+telemetry = "bounded"
+max_active = 1
+
+[[candidates]]
+provider = "amp-medium"
+family = "amp"
+roles = ["coordination"]
+telemetry = "bounded"
+max_active = 2
+
+[[candidates]]
+provider = "codex"
+family = "openai"
+roles = ["implementation", "verification"]
+telemetry = "codex"
+telemetry_home = "/home/ds/.codex"
+max_active = 2
+
+[[candidates]]
+provider = "codex-2"
+family = "openai"
+roles = ["implementation", "verification"]
+telemetry = "codex"
+telemetry_home = "/home/ds/.codex-homes/codex-2"
+max_active = 2
+
+[[candidates]]
+provider = "claude-1"
+family = "anthropic"
+roles = ["verification"]
+telemetry = "claude"
+account = "account1"
+max_active = 2
+
+# Keep the retirement explicit and auditable. The provider is also absent from
+# city.toml, but selection must reject it for the stronger reason even if a
+# stale config layer reintroduces the name.
+[[candidates]]
+provider = "claude-2"
+family = "anthropic"
+roles = ["verification"]
+telemetry = "claude"
+account = "account2"
+max_active = 0
+retired = true
+
+[[candidates]]
+provider = "claude-3"
+family = "anthropic"
+roles = ["verification"]
+telemetry = "claude"
+account = "account3"
+max_active = 2
+
+[[candidates]]
+provider = "claude-4"
+family = "anthropic"
+roles = ["verification"]
+telemetry = "claude"
+account = "account4"
+max_active = 2
+
+[[candidates]]
+provider = "claude-5"
+family = "anthropic"
+roles = ["verification"]
+telemetry = "claude"
+account = "account5"
+max_active = 2
