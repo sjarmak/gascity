@@ -136,6 +136,25 @@ def test_single_rebalance_refuses_pinned_agent(city):
         gc.plan_rebalance_single("pinned", agents, accounts, force=True)
 
 
+def test_rebalance_never_targets_retired_account2(city):
+    agents = [gc.AgentConfig(name="mover", provider="claude-1")]
+    accounts = _accounts(**{"claude-1": 90.0, "claude-2": 1.0, "claude-3": 20.0})
+
+    auto = gc.plan_rebalance_auto(
+        agents, accounts, avoid_providers=gc.DEFAULT_AVOID_PROVIDERS
+    )
+    assert auto.moves == [("mover", "claude-1", "claude-3")]
+
+    single = gc.plan_rebalance_single(
+        "mover",
+        agents,
+        accounts,
+        avoid_providers=gc.DEFAULT_AVOID_PROVIDERS,
+        force=True,
+    )
+    assert single.moves == [("mover", "claude-1", "claude-3")]
+
+
 # ── Provider writes target agent.toml ──────────────────────────────────────────
 
 def test_update_agent_provider_replaces_existing_line(city):

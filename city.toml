@@ -29,24 +29,10 @@ session_id_flag = "--session-id"
 fork_flag = "--fork-session"
 [providers.claude-1.env]
 DISABLE_INTERACTIVITY = "1"
-[providers.claude-2]
-base = "builtin:claude"
-display_name = "Claude (Account 2)"
-command = "/home/ds/gas-city/bin/claude-account"
-args = ["2"]
-option_defaults = { effort = "", model = "opus" }
-prompt_mode = "arg"
-ready_delay_ms = 1
-ready_prompt_prefix = "❯"
-process_names = ["claude"]
-supports_hooks = true
-instructions_file = "CLAUDE.md"
-resume_flag = "--resume"
-resume_style = "flag"
-session_id_flag = "--session-id"
-fork_flag = "--fork-session"
-[providers.claude-2.env]
-DISABLE_INTERACTIVITY = "1"
+# Claude account2 retired from the pool 2026-07-23 per Stephanie after its
+# identity became unverifiable. The claude-auto picker and gc-capacity also
+# exclude it. Restore this provider only after explicit approval and a fresh,
+# independently verified login; the credential directory remains untouched.
 [providers.claude-3]
 base = "builtin:claude"
 display_name = "Claude (Account 3)"
@@ -118,7 +104,9 @@ resume_style = "flag"
 session_id_flag = "--session-id"
 fork_flag = "--fork-session"
 [providers.claude-auto.env]
-CSU_PICK_EXCLUDE = ""
+# Defense in depth with bin/csu_pick.sh: account2 must remain unavailable even
+# when this provider is reloaded independently of the launcher script.
+CSU_PICK_EXCLUDE = "claude-2"
 DISABLE_INTERACTIVITY = "1"
 [providers.codex]
 base = "builtin:codex"
@@ -130,6 +118,16 @@ ready_delay_ms = 0
 ready_prompt_prefix = ">"
 process_names = ["codex"]
 resume_command = "/home/ds/.nvm/versions/node/v22.22.2/bin/codex resume {{.SessionKey}}"
+
+# Added 2026-07-23 per Stephanie: second ChatGPT Codex account, authenticated
+# independently as stephanie.jarmak@gmail.com. CODEX_HOME isolates auth,
+# sessions, logs, and mutable state; never copy auth.json between accounts.
+# Remove this provider if that isolated login is retired or becomes unverifiable.
+[providers.codex-2]
+base = "provider:codex"
+display_name = "Codex CLI (Account 2)"
+[providers.codex-2.env]
+CODEX_HOME = "/home/ds/.codex-homes/codex-2"
 
 [imports]
 [imports.cass]

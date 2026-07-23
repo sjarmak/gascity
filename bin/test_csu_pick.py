@@ -55,8 +55,8 @@ def _pick(tmp_path: Path, utilization: dict[int, float], exclude: str | None) ->
 
 
 @pytest.mark.parametrize("exclude", [None, ""])
-def test_no_implicit_account_exclusions(tmp_path: Path, exclude: str | None) -> None:
-    assert _pick(tmp_path, {1: 50, 2: 1, 3: 20, 4: 30, 5: 40}, exclude) == "2"
+def test_account2_is_excluded_by_default(tmp_path: Path, exclude: str | None) -> None:
+    assert _pick(tmp_path, {1: 50, 2: 1, 3: 20, 4: 30, 5: 40}, exclude) == "3"
 
 
 def test_explicit_account_exclusions_remain_available(tmp_path: Path) -> None:

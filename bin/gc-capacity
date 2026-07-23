@@ -44,6 +44,11 @@ PROVIDER_TO_ACCOUNT = {
 }
 ACCOUNT_TO_PROVIDER = {v: k for k, v in PROVIDER_TO_ACCOUNT.items()}
 
+# 2026-07-23 per Stephanie: account2 is retired from the work pool but remains
+# visible in the usage dashboard for diagnostics. The CLI always adds this set
+# to operator-supplied --avoid values. Remove only if she restores the account.
+DEFAULT_AVOID_PROVIDERS = {"claude-2"}
+
 # Thresholds for display coloring and recommendations
 THRESHOLD_HOT = 60.0    # 5h utilization above this = hot
 THRESHOLD_WARM = 30.0   # 5h utilization above this = warm
@@ -693,7 +698,7 @@ def main():
     accounts = load_usage()
     agents = parse_agents()
 
-    avoid_providers = {f"claude-{n}" for n in args.avoid}
+    avoid_providers = DEFAULT_AVOID_PROVIDERS | {f"claude-{n}" for n in args.avoid}
 
     if args.rebalance:
         if args.rebalance == "auto":

@@ -27,7 +27,7 @@
 #   CSU_PICK_CACHE      - path to cache (default ~/.claude-usage/usage_cache.json)
 #   CSU_PICK_MAX_AGE_MIN - refresh if oldest fetched_at > this many min (default 15)
 #   CSU_PICK_EXHAUSTED_PCT - 7d util threshold to skip (default 95)
-#   CSU_PICK_EXCLUDE    - comma-separated names/numbers to skip (default: none)
+#   CSU_PICK_EXCLUDE    - comma-separated names/numbers to skip (default: claude-2)
 #   CSU_PICK_FALLBACK   - account number returned on error (default "1")
 #   CSU_PICK_REFRESH_CMD - command to refresh cache (default "csu")
 #   CSU_PICK_TOP_K      - number of top candidates to randomize among (default 2)
@@ -41,7 +41,10 @@ set -euo pipefail
 CACHE="${CSU_PICK_CACHE:-$HOME/.claude-usage/usage_cache.json}"
 MAX_AGE_MIN="${CSU_PICK_MAX_AGE_MIN:-15}"
 EXHAUSTED_PCT="${CSU_PICK_EXHAUSTED_PCT:-95}"
-EXCLUDE="${CSU_PICK_EXCLUDE-}"
+# 2026-07-23 per Stephanie: account2 is retired from the Claude pool. Keep the
+# launcher-level default so an inherited or stale provider environment cannot
+# route work there. Remove only if Stephanie explicitly restores that account.
+EXCLUDE="${CSU_PICK_EXCLUDE:-claude-2}"
 FALLBACK="${CSU_PICK_FALLBACK:-1}"
 REFRESH_CMD="${CSU_PICK_REFRESH_CMD:-csu}"
 TOP_K="${CSU_PICK_TOP_K:-2}"
