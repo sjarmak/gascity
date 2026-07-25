@@ -12,24 +12,23 @@ This applies the SAME policy in a single read-filter-write pass:
             else one shared legacy bucket
   retain:   the 10 most recent per bucket (reference time = updated_at,
             falling back to created_at) regardless of age
-  delete:   the rest, only if reference time < now - 7d
+  delete:   the rest, only if reference time < now - 2d
 
-The SECOND pass (COMPACT_CLOSED_ANY_DAYS) is the one that actually holds the
-file down. Closed NON-order-tracking beads — gc's own session records, titled
-by working directory — are covered by NO reaper in the file store
-(bead-prune-reaper is Dolt-only; bead-janitor is .disabled), and they are 62%
-of the closed population. Set it to the same 7d TTL as the primary pass; a 30d
-window is effectively a no-op (2026-07-14: 30d deleted 828 of 55,272 beads =
-1.5%, while 7d deleted 26,621 = 48%), because the store re-bloats to stall size
-in about a day but a 30d window releases nothing for weeks.
+The SECOND pass (COMPACT_CLOSED_ANY_DAYS) bounds generic closed history.
+Closed NON-order-tracking beads — gc's own session records, titled by working
+directory — are covered by NO reaper in the file store
+(bead-prune-reaper is Dolt-only; bead-janitor is .disabled). The live order
+keeps those at 7d for audit/history while pruning transient order-tracking
+rows after 2d; this split was approved by Stephanie 2026-07-25 after dr-clh5.
 
 Locking mirrors bin/bead-janitor-file-store-helper.py: LOCK_EX on
 beads.json.lock, backup, atomic tempfile+rename. Safe against the live
 supervisor because FileStore writes reload from disk under the same lock.
-Dependency edges whose endpoints were compacted away are pruned in the same
-pass, and a non-closed bead in the delete set aborts the write.
+Dependency edges and out-of-band revision/fence entries whose beads were
+compacted away are pruned in the same pass, and a non-closed bead in the
+delete set aborts the write.
 
-Env: COMPACT_APPLY=1 to mutate (default dry-run), COMPACT_TTL_DAYS (7),
+Env: COMPACT_APPLY=1 to mutate (default dry-run), COMPACT_TTL_DAYS (2),
 COMPACT_RETAIN_LAST (10), COMPACT_CLOSED_ANY_DAYS (0 = off).
 """
 import datetime
@@ -45,7 +44,7 @@ from pathlib import Path
 BEADS = Path("/home/ds/gas-city/.gc/beads.json")
 LOCK = Path(str(BEADS) + ".lock")
 APPLY = os.environ.get("COMPACT_APPLY", "") == "1"
-TTL_DAYS = float(os.environ.get("COMPACT_TTL_DAYS", "7"))
+TTL_DAYS = float(os.environ.get("COMPACT_TTL_DAYS", "2"))
 RETAIN = int(os.environ.get("COMPACT_RETAIN_LAST", "10"))
 LEGACY = "\x00legacy-unscoped-order-tracking"
 
@@ -82,9 +81,10 @@ def main():
         key = "issues" if "issues" in raw else "beads"
         items = raw[key]
 
-        # Optional generic pass: apply the city's standing 30d prune policy
-        # (bin/bead-prune-reaper / `bd prune --older-than 30d`) to closed
-        # NON-order-tracking beads in the file store, which no reaper covers.
+        # Optional generic pass: apply the configured retention policy to
+        # closed NON-order-tracking beads in the file store, which no reaper
+        # covers. The live order intentionally keeps this longer than the
+        # transient order-tracking window to preserve ordinary audit history.
         generic_days = float(os.environ.get("COMPACT_CLOSED_ANY_DAYS", "0"))
         generic_cutoff = now - datetime.timedelta(days=generic_days) if generic_days > 0 else None
 
@@ -136,11 +136,35 @@ def main():
         ]
         dropped_deps = len(deps) - len(kept_deps)
 
+        # FileStore persists ConditionalWriter revisions and claim fences in
+        # maps keyed by bead ID. A normal FileStore save rebuilds these maps
+        # from surviving beads, but this one-pass compactor writes the raw JSON
+        # directly, so it must mirror that behavior rather than retain one
+        # stale map entry per deleted bead.
+        kept_id_maps = {}
+        dropped_id_maps = {}
+        for map_key in ("revisions", "fences"):
+            id_map = raw.get(map_key)
+            if not isinstance(id_map, dict):
+                continue
+            kept_id_maps[map_key] = {
+                bead_id: value
+                for bead_id, value in id_map.items()
+                if bead_id in surviving
+            }
+            dropped_id_maps[map_key] = len(id_map) - len(kept_id_maps[map_key])
+
         total_deleted = deleted + generic_deleted
         print(f"total={len(items)} order-tracking-closed={sum(len(v) for v in buckets.values())} "
               f"buckets={len(buckets)} delete={deleted} keep={len(keep)} apply={APPLY}")
         print(f"deps: total={len(deps)} keep={len(kept_deps)} dropped-dangling={dropped_deps}")
-        if not APPLY or total_deleted == 0:
+        for map_key in ("revisions", "fences"):
+            if map_key in kept_id_maps:
+                print(f"{map_key}: total={len(raw[map_key])} keep={len(kept_id_maps[map_key])} "
+                      f"dropped-stale={dropped_id_maps[map_key]}")
+
+        needs_write = total_deleted > 0 or dropped_deps > 0 or any(dropped_id_maps.values())
+        if not APPLY or not needs_write:
             return
 
         ts = now.strftime("%Y%m%dT%H%M%SZ")
@@ -148,6 +172,8 @@ def main():
         shutil.copy2(BEADS, backup)
         raw[key] = keep
         raw["deps"] = kept_deps
+        for map_key, id_map in kept_id_maps.items():
+            raw[map_key] = id_map
         with tempfile.NamedTemporaryFile("w", dir=BEADS.parent, delete=False) as tmp:
             json.dump(raw, tmp, separators=(",", ":"))
             tmp.flush()
