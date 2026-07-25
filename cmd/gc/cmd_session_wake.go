@@ -16,6 +16,7 @@ import (
 // newSessionWakeCmd creates the "gc session wake <id-or-alias>" command.
 func newSessionWakeCmd(stdout, stderr io.Writer) *cobra.Command {
 	var jsonOutput bool
+	var strict bool
 	cmd := &cobra.Command{
 		Use:   "wake <session-id-or-alias>",
 		Short: "Wake a session (request start and clear holds)",
@@ -25,19 +26,22 @@ After waking, the reconciler will start the session on its next tick
 if it has wake reasons (e.g., a matching config agent). If the session
 has no wake reasons, it remains asleep.
 
+The command reports which outcome occurred: "wake requested" when the
+wake was queued, or "no wake reasons, remaining asleep" when it was a
+no-op. Pass --strict to exit non-zero on the no-op case so scripts can
+branch on it.
+
 Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 		Example: `  gc session wake gc-42
   gc session wake mayor`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdSessionWake(args, stdout, stderr, jsonOutput) != 0 {
-				return errExit
-			}
-			return nil
+			return exitForCode(cmdSessionWake(args, stdout, stderr, jsonOutput, strict))
 		},
 		ValidArgsFunction: completeSessionIDs,
 	}
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "emit JSONL")
+	cmd.Flags().BoolVar(&strict, "strict", false, "exit non-zero when the wake is a no-op (no wake reasons)")
 	return cmd
 }
 
@@ -53,8 +57,7 @@ type sessionWakeDeps struct {
 }
 
 // cmdSessionWake is the CLI entry point for "gc session wake".
-func cmdSessionWake(args []string, stdout, stderr io.Writer, jsonOutput ...bool) int {
-	asJSON := sessionJSONRequested(jsonOutput)
+func cmdSessionWake(args []string, stdout, stderr io.Writer, asJSON, strict bool) int {
 	store, code := openCityStore(stderr, "gc session wake")
 	if store == nil {
 		return code
@@ -65,7 +68,7 @@ func cmdSessionWake(args []string, stdout, stderr io.Writer, jsonOutput ...bool)
 	if cityErr == nil {
 		cfg, _ = loadCityConfig(cityPath, stderr)
 	}
-	return doSessionWake(args[0], stdout, stderr, asJSON, sessionWakeDeps{
+	return doSessionWake(args[0], stdout, stderr, asJSON, strict, sessionWakeDeps{
 		store:                     store,
 		cfg:                       cfg,
 		cityPath:                  cityPath,
@@ -77,7 +80,7 @@ func cmdSessionWake(args []string, stdout, stderr io.Writer, jsonOutput ...bool)
 	})
 }
 
-func doSessionWake(target string, stdout, stderr io.Writer, asJSON bool, deps sessionWakeDeps) int {
+func doSessionWake(target string, stdout, stderr io.Writer, asJSON, strict bool, deps sessionWakeDeps) int {
 	sessStore := cliSessionStore(deps.store, deps.cfg, deps.cityPath)
 	id, err := resolveSessionIDMaterializingNamed(deps.cityPath, deps.cfg, sessStore, target)
 	if err != nil {
@@ -104,7 +107,12 @@ func doSessionWake(target string, stdout, stderr io.Writer, asJSON bool, deps se
 	}
 	nudgeIDs := res.NudgeIDs
 	hasRunnableTemplate := sessionWakeHasRunnableTemplateInfo(res.Info, deps.cfg)
-	if !hasRunnableTemplate && sessionWakeRequestedCreateInfo(res.Info) {
+	// remainedAsleep is the silent no-op the wake help text warns about: the
+	// session has no wake reason (no matching config agent) but requested a
+	// fresh create, so the reconciler will never start it and the metadata is
+	// reset back to asleep. Report it distinctly instead of claiming success.
+	remainedAsleep := !hasRunnableTemplate && sessionWakeRequestedCreateInfo(res.Info)
+	if remainedAsleep {
 		if err := sessFront.ApplyPatch(id, map[string]string{
 			"state":                     string(session.StateAsleep),
 			"state_reason":              "",
@@ -129,20 +137,40 @@ func doSessionWake(target string, stdout, stderr io.Writer, asJSON bool, deps se
 	}
 
 	if asJSON {
+		state := "wake_requested"
+		if remainedAsleep {
+			state = "no_wake_reasons"
+		}
 		if err := writeSessionActionJSON(stdout, sessionActionResult{
 			Action:              "wake",
 			SessionID:           id,
-			State:               "wake_requested",
+			State:               state,
 			WaitNudgesWithdrawn: len(nudgeIDs),
 		}); err != nil {
 			fmt.Fprintf(stderr, "gc session wake: %v\n", err) //nolint:errcheck
 			return 1
+		}
+		if remainedAsleep && strict {
+			return exitWakeNoOp
+		}
+		return 0
+	}
+	if remainedAsleep {
+		fmt.Fprintf(stdout, "Session %s: no wake reasons, remaining asleep.\n", id) //nolint:errcheck
+		if strict {
+			return exitWakeNoOp
 		}
 		return 0
 	}
 	fmt.Fprintf(stdout, "Session %s: wake requested.\n", id) //nolint:errcheck
 	return 0
 }
+
+// exitWakeNoOp is the exit code "gc session wake --strict" returns when the
+// wake was a no-op (the session had no wake reasons and remains asleep). It is
+// distinct from the generic error code (1) so a --strict caller can tell a
+// dropped wake apart from a hard failure.
+const exitWakeNoOp = 2
 
 func sessionWakeHasRunnableTemplateInfo(info session.Info, cfg *config.City) bool {
 	if cfg == nil {

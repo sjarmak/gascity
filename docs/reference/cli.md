@@ -4070,6 +4070,11 @@ After waking, the reconciler will start the session on its next tick
 if it has wake reasons (e.g., a matching config agent). If the session
 has no wake reasons, it remains asleep.
 
+The command reports which outcome occurred: "wake requested" when the
+wake was queued, or "no wake reasons, remaining asleep" when it was a
+no-op. Pass --strict to exit non-zero on the no-op case so scripts can
+branch on it.
+
 Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).
 
 ```
@@ -4086,6 +4091,7 @@ gc session wake mayor
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL |
+| `--strict` | bool |  | exit non-zero when the wake is a no-op (no wake reasons) |
 
 ## gc shell
 

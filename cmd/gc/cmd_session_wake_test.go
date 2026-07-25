@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/testutil"
 )
@@ -196,7 +197,7 @@ func TestDoSessionWake_PokesManagedControllerAfterStateChange(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := doSessionWake(sessionBead.ID, &stdout, &stderr, false, deps); code != 0 {
+	if code := doSessionWake(sessionBead.ID, &stdout, &stderr, false, false, deps); code != 0 {
 		t.Fatalf("doSessionWake() = %d, want 0; stderr=%s", code, stderr.String())
 	}
 	if got := strings.Join(calls, ","); got != "withdraw,managed,poke" {
@@ -255,7 +256,7 @@ func TestDoSessionWake_DoesNotPokeWithoutManagedController(t *testing.T) {
 		},
 	}
 
-	if code := doSessionWake(sessionBead.ID, &bytes.Buffer{}, &bytes.Buffer{}, false, deps); code != 0 {
+	if code := doSessionWake(sessionBead.ID, &bytes.Buffer{}, &bytes.Buffer{}, false, false, deps); code != 0 {
 		t.Fatalf("doSessionWake() = %d, want 0", code)
 	}
 	if poked {
@@ -296,7 +297,7 @@ func TestDoSessionWake_PokeFailureWarnsWithoutFailingWake(t *testing.T) {
 	}
 
 	var stderr bytes.Buffer
-	if code := doSessionWake(sessionBead.ID, &bytes.Buffer{}, &stderr, false, deps); code != 0 {
+	if code := doSessionWake(sessionBead.ID, &bytes.Buffer{}, &stderr, false, false, deps); code != 0 {
 		t.Fatalf("doSessionWake() = %d, want 0; stderr=%s", code, stderr.String())
 	}
 	if got := stderr.String(); !strings.Contains(got, "warning: poke failed: dial failed") {
@@ -309,6 +310,118 @@ func TestDoSessionWake_PokeFailureWarnsWithoutFailingWake(t *testing.T) {
 	if got := updated.Metadata["state"]; got != "asleep" {
 		t.Fatalf("state = %q, want asleep", got)
 	}
+}
+
+// newNoOpWakeSessionBead creates a suspended session bead with the given
+// template and returns its ID. A suspended session requests a fresh create on
+// wake, so whether the wake is effective turns entirely on whether the template
+// matches a configured agent.
+func newNoOpWakeSessionBead(t *testing.T, store beads.Store, template string) string {
+	t.Helper()
+	b, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"template":     template,
+			"state":        "suspended",
+			"sleep_reason": "user-hold",
+		},
+	})
+	if err != nil {
+		t.Fatalf("store.Create(session bead): %v", err)
+	}
+	return b.ID
+}
+
+func noOpWakeDeps(store beads.Store, cfg *config.City) sessionWakeDeps {
+	return sessionWakeDeps{
+		store:        store,
+		cfg:          cfg,
+		cityPath:     "/city",
+		cityResolved: true,
+		now: func() time.Time {
+			return time.Date(2026, 7, 16, 0, 0, 0, 0, time.UTC)
+		},
+		withdrawQueuedWaitNudges:  func(string, []string) error { return nil },
+		cityUsesManagedReconciler: func(string) bool { return false },
+		pokeController:            func(string) error { return nil },
+	}
+}
+
+// TestDoSessionWake_ReportsNoWakeReasonOutcome pins the #3975 fix: a wake with
+// no wake reason (no matching config agent) must be reported distinctly instead
+// of the misleading "wake requested", clear the pending wake back to asleep, and
+// exit non-zero under --strict so scripts can branch on the no-op.
+func TestDoSessionWake_ReportsNoWakeReasonOutcome(t *testing.T) {
+	// cfg has an agent "worker"; the session's template "orphan" matches none,
+	// so the wake is a no-op.
+	cfg := &config.City{Agents: []config.Agent{{Name: "worker"}}}
+
+	t.Run("plain no-op reports remaining asleep and clears the wake", func(t *testing.T) {
+		store := beads.NewMemStore()
+		id := newNoOpWakeSessionBead(t, store, "orphan")
+
+		var stdout, stderr bytes.Buffer
+		if code := doSessionWake(id, &stdout, &stderr, false, false, noOpWakeDeps(store, cfg)); code != 0 {
+			t.Fatalf("doSessionWake() = %d, want 0; stderr=%s", code, stderr.String())
+		}
+		if got := stdout.String(); !strings.Contains(got, "no wake reasons, remaining asleep") {
+			t.Fatalf("stdout = %q, want no-wake-reasons message", got)
+		}
+		if strings.Contains(stdout.String(), "wake requested") {
+			t.Fatalf("stdout = %q, must not claim wake requested", stdout.String())
+		}
+		updated, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("store.Get(%s): %v", id, err)
+		}
+		if got := updated.Metadata["state"]; got != "asleep" {
+			t.Fatalf("state = %q, want asleep", got)
+		}
+		if got := updated.Metadata["wake_request"]; got != "" {
+			t.Fatalf("wake_request = %q, want cleared", got)
+		}
+	})
+
+	t.Run("strict no-op exits with the no-op code", func(t *testing.T) {
+		store := beads.NewMemStore()
+		id := newNoOpWakeSessionBead(t, store, "orphan")
+
+		var stdout, stderr bytes.Buffer
+		if code := doSessionWake(id, &stdout, &stderr, false, true, noOpWakeDeps(store, cfg)); code != exitWakeNoOp {
+			t.Fatalf("doSessionWake(strict) = %d, want %d; stderr=%s", code, exitWakeNoOp, stderr.String())
+		}
+		if got := stdout.String(); !strings.Contains(got, "no wake reasons, remaining asleep") {
+			t.Fatalf("stdout = %q, want no-wake-reasons message", got)
+		}
+	})
+
+	t.Run("json no-op emits no_wake_reasons state", func(t *testing.T) {
+		store := beads.NewMemStore()
+		id := newNoOpWakeSessionBead(t, store, "orphan")
+
+		var stdout, stderr bytes.Buffer
+		if code := doSessionWake(id, &stdout, &stderr, true, false, noOpWakeDeps(store, cfg)); code != 0 {
+			t.Fatalf("doSessionWake(json) = %d, want 0; stderr=%s", code, stderr.String())
+		}
+		if got := stdout.String(); !strings.Contains(got, `"state":"no_wake_reasons"`) {
+			t.Fatalf("json stdout = %q, want no_wake_reasons state", got)
+		}
+	})
+
+	t.Run("strict is a no-op when the wake is effective", func(t *testing.T) {
+		store := beads.NewMemStore()
+		// Template "worker" matches the configured agent → effective wake.
+		id := newNoOpWakeSessionBead(t, store, "worker")
+
+		var stdout, stderr bytes.Buffer
+		if code := doSessionWake(id, &stdout, &stderr, false, true, noOpWakeDeps(store, cfg)); code != 0 {
+			t.Fatalf("doSessionWake(strict, effective) = %d, want 0; stderr=%s", code, stderr.String())
+		}
+		if got := stdout.String(); !strings.Contains(got, "wake requested") {
+			t.Fatalf("stdout = %q, want wake requested", got)
+		}
+	})
 }
 
 // This is the single real CLI/config/file-store/controller-socket composition
@@ -382,7 +495,7 @@ func TestCmdSessionWake_PokesManagedControllerAndRequestsSuspendedStart(t *testi
 	}()
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdSessionWake([]string{"mayor"}, &stdout, &stderr); code != 0 {
+	if code := cmdSessionWake([]string{"mayor"}, &stdout, &stderr, false, false); code != 0 {
 		t.Fatalf("cmdSessionWake() = %d, want 0; stderr=%s", code, stderr.String())
 	}
 
@@ -473,7 +586,7 @@ func TestCmdSessionWake_RejectsArchivedHistoricalSessionID(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdSessionWake([]string{sessionID}, &stdout, &stderr); code == 0 {
+	if code := cmdSessionWake([]string{sessionID}, &stdout, &stderr, false, false); code == 0 {
 		t.Fatalf("cmdSessionWake() = %d, want rejection; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 	// Pin the CLI wake-conflict artifact: the fused WakeSession returns a
@@ -520,7 +633,7 @@ func TestCmdSessionWake_RequestsStartForContinuityEligibleArchivedSessionID(t *t
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdSessionWake([]string{sessionID}, &stdout, &stderr); code != 0 {
+	if code := cmdSessionWake([]string{sessionID}, &stdout, &stderr, false, false); code != 0 {
 		t.Fatalf("cmdSessionWake() = %d, want success; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "wake requested") {

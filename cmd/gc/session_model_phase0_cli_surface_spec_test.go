@@ -33,7 +33,7 @@ func TestPhase0CLISessionTargetingSurfaces_RejectTemplateFactoryTargets(t *testi
 		{
 			name: "gc session wake",
 			run: func(stdout, stderr *bytes.Buffer) int {
-				return cmdSessionWake([]string{"template:worker"}, stdout, stderr)
+				return cmdSessionWake([]string{"template:worker"}, stdout, stderr, false, false)
 			},
 		},
 		{
@@ -119,7 +119,7 @@ func TestPhase0CLISessionTargetingSurfaces_BareConfigNameDoesNotMaterializeOrdin
 		{
 			name: "gc session wake",
 			run: func(stdout, stderr *bytes.Buffer) int {
-				return cmdSessionWake([]string{"worker"}, stdout, stderr)
+				return cmdSessionWake([]string{"worker"}, stdout, stderr, false, false)
 			},
 		},
 		{
