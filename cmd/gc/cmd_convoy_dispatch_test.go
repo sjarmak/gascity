@@ -4157,9 +4157,11 @@ func TestOpenControlStoreAtForCityPreservesFileAndExecProviderStores(t *testing.
 			}
 			t.Cleanup(func() { preflightDatabaseStateReaderFn = oldState })
 
+			var openedScopes []string
 			prevRunner := beadsExecCommandRunnerWithEnv
 			beadsExecCommandRunnerWithEnv = func(map[string]string) beads.CommandRunner {
-				return func(_ string, name string, args ...string) ([]byte, error) {
+				return func(dir string, name string, args ...string) ([]byte, error) {
+					openedScopes = append(openedScopes, dir)
 					if name != "bd" || !slices.Equal(args, []string{"context", "--json"}) {
 						t.Fatalf("unexpected command: %s %#v", name, args)
 					}
@@ -4174,6 +4176,100 @@ func TestOpenControlStoreAtForCityPreservesFileAndExecProviderStores(t *testing.
 					var hold *contract.SchemaCompatibilityHoldError
 					if !errors.As(err, &hold) {
 						t.Fatalf("openControlStoreAtForCity() error = %v, want SchemaCompatibilityHoldError", err)
+					}
+				})
+			}
+
+			t.Run("source workflow candidate selection is authoritative", func(t *testing.T) {
+				routingCity := t.TempDir()
+				routingRig := filepath.Join(routingCity, "rigs", "frontend")
+				if err := os.MkdirAll(filepath.Join(routingCity, ".beads"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(routingRig, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				metadata := `{"backend":"dolt","dolt_mode":"server","dolt_database":"gascity"}`
+				if err := os.WriteFile(filepath.Join(routingCity, ".beads", "metadata.json"), []byte(metadata), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				routingCfg := &config.City{Rigs: []config.Rig{{Name: "frontend", Path: routingRig}}}
+				var candidates []string
+				_, _, err := openSourceWorkflowStoresWith(routingCfg, routingCity, "gc-test", func(dir string) (beads.Store, error) {
+					candidates = append(candidates, dir)
+					return beads.NewMemStore(), nil
+				})
+				if err != nil {
+					t.Fatalf("openSourceWorkflowStoresWith() error = %v", err)
+				}
+				if !slices.Equal(candidates, []string{routingCity, routingRig}) {
+					t.Fatalf("openSourceWorkflowStoresWith() candidates = %v, want city and rig", candidates)
+				}
+			})
+
+			t.Run("source workflow candidate scan", func(t *testing.T) {
+				openedScopes = nil
+				_, _, err := openSourceWorkflowStores(holdCfg, holdCity, "gc-test")
+				var hold *contract.SchemaCompatibilityHoldError
+				if !errors.As(err, &hold) {
+					t.Fatalf("openSourceWorkflowStores() error = %v, want SchemaCompatibilityHoldError", err)
+				}
+				if !slices.Equal(openedScopes, []string{holdCity, holdRig}) {
+					t.Fatalf("openSourceWorkflowStores() opened scopes = %v, want city and rig", openedScopes)
+				}
+			})
+
+			t.Run("control source workflow stores lister", func(t *testing.T) {
+				openedScopes = nil
+				_, err := makeSourceWorkflowStoresLister(holdCity, holdCfg)()
+				var hold *contract.SchemaCompatibilityHoldError
+				if !errors.As(err, &hold) {
+					t.Fatalf("makeSourceWorkflowStoresLister() error = %v, want SchemaCompatibilityHoldError", err)
+				}
+				if !slices.Equal(openedScopes, []string{holdCity, holdRig}) {
+					t.Fatalf("makeSourceWorkflowStoresLister() opened scopes = %v, want city and rig", openedScopes)
+				}
+			})
+
+			for storeRef, wantScope := range map[string]string{
+				"city:test-city": holdCity,
+				"rig:frontend":   holdRig,
+			} {
+				t.Run("control store ref "+storeRef, func(t *testing.T) {
+					openedScopes = nil
+					_, err := makeStoreRefResolver(holdCity, holdCfg)(storeRef)
+					var hold *contract.SchemaCompatibilityHoldError
+					if !errors.As(err, &hold) {
+						t.Fatalf("makeStoreRefResolver(%q) error = %v, want SchemaCompatibilityHoldError", storeRef, err)
+					}
+					if !slices.Equal(openedScopes, []string{wantScope}) {
+						t.Fatalf("makeStoreRefResolver(%q) opened scopes = %v, want %s", storeRef, openedScopes, wantScope)
+					}
+				})
+
+				t.Run("source workflow selected "+storeRef, func(t *testing.T) {
+					openedScopes = nil
+					_, _, err := openSourceWorkflowStoreRef(holdCfg, holdCity, storeRef)
+					var hold *contract.SchemaCompatibilityHoldError
+					if !errors.As(err, &hold) {
+						t.Fatalf("openSourceWorkflowStoreRef(%q) error = %v, want SchemaCompatibilityHoldError", storeRef, err)
+					}
+					if !slices.Equal(openedScopes, []string{wantScope}) {
+						t.Fatalf("openSourceWorkflowStoreRef(%q) opened scopes = %v, want %s", storeRef, openedScopes, wantScope)
+					}
+				})
+			}
+
+			for _, storeRef := range []string{"", "city"} {
+				t.Run("source workflow default city "+storeRef, func(t *testing.T) {
+					openedScopes = nil
+					_, _, err := openSourceWorkflowStoreRef(holdCfg, holdCity, storeRef)
+					var hold *contract.SchemaCompatibilityHoldError
+					if !errors.As(err, &hold) {
+						t.Fatalf("openSourceWorkflowStoreRef(%q) error = %v, want SchemaCompatibilityHoldError", storeRef, err)
+					}
+					if !slices.Equal(openedScopes, []string{holdCity}) {
+						t.Fatalf("openSourceWorkflowStoreRef(%q) opened scopes = %v, want %s", storeRef, openedScopes, holdCity)
 					}
 				})
 			}

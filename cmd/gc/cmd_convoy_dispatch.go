@@ -351,7 +351,7 @@ func makeStoreRefResolver(cityPath string, cfg *config.City) func(string) (beads
 			if name != "" && cityName != "" && name != cityName {
 				return nil, fmt.Errorf("city ref %q does not match this city %q", ref, cityName)
 			}
-			return openStoreAtForCity(cityPath, cityPath)
+			return openControlStoreAtForCity(cityPath, cityPath, cfg)
 		case strings.HasPrefix(ref, "rig:"):
 			name := strings.TrimSpace(strings.TrimPrefix(ref, "rig:"))
 			if name == "" {
@@ -381,7 +381,7 @@ func makeSourceWorkflowLocker(ctx context.Context, cityPath string, cfg *config.
 
 func makeSourceWorkflowStoresLister(cityPath string, cfg *config.City) func() ([]dispatch.SourceWorkflowStore, error) {
 	return makeSourceWorkflowStoresListerWithOpenStore(cityPath, cfg, func(dir string) (beads.Store, error) {
-		return openStoreAtForCity(dir, cityPath)
+		return openControlStoreAtForCity(dir, cityPath, cfg)
 	})
 }
 
@@ -1094,7 +1094,7 @@ func openSourceWorkflowStoreRef(cfg *config.City, cityPath, storeRef string) (co
 	storeRef = strings.TrimSpace(storeRef)
 	switch {
 	case storeRef == "", storeRef == "city":
-		store, err := openStoreAtForCity(cityPath, cityPath)
+		store, err := openControlStoreAtForCity(cityPath, cityPath, cfg)
 		if err != nil {
 			return convoyStoreView{}, "", fmt.Errorf("opening city store: %w", err)
 		}
@@ -1104,7 +1104,7 @@ func openSourceWorkflowStoreRef(cfg *config.City, cityPath, storeRef string) (co
 		}
 		return convoyStoreView{path: cityPath, store: store}, "city:" + cityName, nil
 	case strings.HasPrefix(storeRef, "city:"):
-		store, err := openStoreAtForCity(cityPath, cityPath)
+		store, err := openControlStoreAtForCity(cityPath, cityPath, cfg)
 		if err != nil {
 			return convoyStoreView{}, "", fmt.Errorf("opening city store: %w", err)
 		}
@@ -1116,7 +1116,7 @@ func openSourceWorkflowStoreRef(cfg *config.City, cityPath, storeRef string) (co
 				continue
 			}
 			rigPath := resolveStoreScopeRoot(cityPath, rig.Path)
-			store, err := openStoreAtForCity(rigPath, cityPath)
+			store, err := openControlStoreAtForCity(rigPath, cityPath, cfg)
 			if err != nil {
 				return convoyStoreView{}, "", fmt.Errorf("opening rig store %s: %w", rigName, err)
 			}
@@ -1867,7 +1867,7 @@ func unscannedSourceWorkflowStoreSkips(cfg *config.City, cityPath, selectedStore
 // can see when singleton coverage degraded.
 func openSourceWorkflowStores(cfg *config.City, cityPath, beadID string) ([]convoyStoreView, []sourceWorkflowStoreSkip, error) {
 	return openSourceWorkflowStoresWith(cfg, cityPath, beadID, func(dir string) (beads.Store, error) {
-		return openStoreAtForCity(dir, cityPath)
+		return openControlStoreAtForCity(dir, cityPath, cfg)
 	})
 }
 
@@ -1876,7 +1876,7 @@ func openSourceWorkflowStores(cfg *config.City, cityPath, beadID string) ([]conv
 // rig stores without touching the filesystem.
 func openSourceWorkflowStoresWith(cfg *config.City, cityPath, beadID string, openStore func(string) (beads.Store, error)) ([]convoyStoreView, []sourceWorkflowStoreSkip, error) {
 	return openSourceWorkflowStoresWithProvider(cfg, cityPath, beadID, func(scopeRoot string) string {
-		return rawBeadsProviderForScope(scopeRoot, cityPath)
+		return authoritativeBeadsProviderForScope(scopeRoot, cityPath)
 	}, openStore)
 }
 
