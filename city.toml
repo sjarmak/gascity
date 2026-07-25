@@ -846,6 +846,67 @@ enabled = false
 name = "spawn-storm-detect"
 enabled = false
 
+# Emergency pause approved by Stephanie 2026-07-25 in Amp thread
+# T-019f8a15-7e09-7049-9ef2-438067d63866. These event handlers (including the
+# two cooldown rechecks) each launch a `gc events --since` history scan; with
+# the current 5M-event history, overlapping scans held the supervisor near
+# 400% CPU and exhausted swap (RCA: dr-clh5). Remove these overrides only after
+# the handlers consume a trigger-provided event/sequence cursor and a live
+# soak shows event-list requests no longer scan historical archives.
+[[orders.overrides]]
+name = "help-request-surface"
+enabled = false
+
+[[orders.overrides]]
+name = "mail-redirect-to-mayor"
+enabled = false
+
+[[orders.overrides]]
+name = "nudge-on-route"
+enabled = false
+
+[[orders.overrides]]
+name = "pl-human-gate-surface"
+enabled = false
+
+[[orders.overrides]]
+name = "pl-human-gate-surface-recheck"
+enabled = false
+
+[[orders.overrides]]
+name = "pl-loop-close"
+enabled = false
+
+[[orders.overrides]]
+name = "pl-loop-close-timeout"
+enabled = false
+
+[[orders.overrides]]
+name = "wake-mayor-on-blocker-close"
+enabled = false
+
+[[orders.overrides]]
+name = "wake-mayor-on-slung-close"
+enabled = false
+
+[[orders.overrides]]
+name = "cascade-nudge-on-blocker-close"
+enabled = false
+
+[[orders.overrides]]
+name = "notify-on-human-gate-creation"
+enabled = false
+
+# Temporarily paused 2026-07-25 under Stephanie's recovery authorization in
+# Amp thread T-019f8a15-7e09-7049-9ef2-438067d63866. gcsync advanced to
+# origin/main at 17:17 EDT and replaced the validated dr-clh5 recovery binary;
+# that build makes `gc status` exceed 30s again. Re-enable only after the
+# bounded status projection and FileStore decode fixes are both present on
+# main and a live `gc status` soak stays below 5s.
+[[orders.overrides]]
+name = "gcsync"
+enabled = false
+
 [api]
 port = 9443
 bind = "127.0.0.1"
