@@ -7,7 +7,16 @@
 set -euo pipefail
 
 readonly DEFAULT_SOCKET="projects"
-readonly -a STANDARD_WINDOWS=(shell codex claude amp)
+readonly -a AGENT_PROFILES=(
+  claude-1
+  claude-3
+  claude-4
+  claude-5
+  claude-auto
+  codex-1
+  codex-2
+  amp
+)
 
 SOCKET="${PMUX_SOCKET:-$DEFAULT_SOCKET}"
 TARGET_INPUT="."
@@ -15,40 +24,50 @@ TARGET_SET=0
 TARGET_DIR=""
 SESSION_NAME=""
 EXPLICIT_NAME=""
-REQUESTED_WINDOW=""
+AGENT_REQUEST=""
+AGENT_PROFILE=""
+AGENT_EXACT_WINDOW=""
+ACTIVE_WINDOW=""
+FORCE_NEW=0
 ATTACH=1
 PRINT_NAME=0
+ACTION="open"
 
 usage() {
   cat <<'EOF'
 Usage: pmux [PATH] [OPTIONS]
+       pmux PROFILE [PATH] [--new] [--no-attach]
+       pmux PROFILE-N [PATH]
+       pmux stop PROFILE-N [PATH]
        pmux list
 
-Create or reopen a four-window project cockpit on the dedicated "projects"
-tmux socket. PATH defaults to the current directory and resolves to the current
-Git worktree root when applicable.
+Create or reopen one tmux session for the current Hvir workspace. PATH defaults
+to the current directory and resolves to the current Git worktree root when
+applicable.
 
-Windows:
-  shell   General project shell
-  codex   Shell reserved for Codex
-  claude  Shell reserved for Claude Code
-  amp     Shell reserved for Amp
+Profiles:
+  claude-1, claude-3, claude-4, claude-5, claude-auto
+  codex-1, codex-2, amp
 
 Options:
   --name NAME       Use an explicit session name
-  --window NAME     Select shell, codex, claude, or amp
+  --new             Create another numbered window instead of reattaching
   --no-attach       Create or repair the session without attaching
   --print-name      Print the resolved session name without touching tmux
   -h, --help        Show this help
 
 Examples:
   pmux
-  pmux ~/projects/mem --window codex
-  pmux ~/projects/mem --name mem-main
+  pmux claude-auto
+  pmux codex-2 --new
+  pmux claude-1-2
+  pmux stop claude-1-2
+  pmux ~/projects/mem
   pmux list
 
-Detach from tmux with Ctrl-b d. Resume an exited agent in its window with
-"codex resume --last", "claude --continue", or "amp last".
+Running a profile reattaches its most recently active live window, or creates
+PROFILE-1 when none exists. Only --new adds another window. Agent windows close
+when their process exits, so completed sessions do not accumulate.
 EOF
 }
 
@@ -71,13 +90,8 @@ parse_args() {
         EXPLICIT_NAME="${1#*=}"
         shift
         ;;
-      --window)
-        (( $# >= 2 )) || die 2 "--window requires a value"
-        REQUESTED_WINDOW="$2"
-        shift 2
-        ;;
-      --window=*)
-        REQUESTED_WINDOW="${1#*=}"
+      --new)
+        FORCE_NEW=1
         shift
         ;;
       --no-attach)
@@ -97,9 +111,13 @@ parse_args() {
         die 2 "unknown option: $1"
         ;;
       *)
-        (( TARGET_SET == 0 )) || die 2 "only one project path may be provided"
-        TARGET_INPUT="$1"
-        TARGET_SET=1
+        if [[ -z "$AGENT_REQUEST" ]] && should_parse_as_agent "$1"; then
+          AGENT_REQUEST="$1"
+        else
+          (( TARGET_SET == 0 )) || die 2 "only one project path may be provided"
+          TARGET_INPUT="$1"
+          TARGET_SET=1
+        fi
         shift
         ;;
     esac
@@ -113,14 +131,62 @@ validate_socket() {
     || die 2 "ds-research is supervisor-owned; use the projects socket"
 }
 
-validate_window() {
-  [[ -z "$REQUESTED_WINDOW" ]] && return
+looks_like_agent_request() {
+  case "$1" in
+    claude-*|codex-*|amp|amp-*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
-  local window
-  for window in "${STANDARD_WINDOWS[@]}"; do
-    [[ "$REQUESTED_WINDOW" == "$window" ]] && return
+is_agent_profile() {
+  local candidate="$1" profile
+  for profile in "${AGENT_PROFILES[@]}"; do
+    [[ "$candidate" == "$profile" ]] && return
   done
-  die 2 "unknown window '$REQUESTED_WINDOW' (expected: shell, codex, claude, amp)"
+  return 1
+}
+
+label_belongs_to_profile() {
+  local label="$1" profile="$2" suffix
+  [[ "$label" == "$profile"-* ]] || return 1
+  suffix="${label#"$profile-"}"
+  [[ "$suffix" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_numbered_agent_label() {
+  local label="$1" profile
+  for profile in "${AGENT_PROFILES[@]}"; do
+    label_belongs_to_profile "$label" "$profile" && return
+  done
+  return 1
+}
+
+should_parse_as_agent() {
+  local candidate="$1"
+  is_agent_profile "$candidate" && return
+  is_numbered_agent_label "$candidate" && return
+  looks_like_agent_request "$candidate" && [[ ! -d "$candidate" ]]
+}
+
+resolve_agent_request() {
+  [[ -n "$AGENT_REQUEST" ]] || return 0
+
+  if is_agent_profile "$AGENT_REQUEST"; then
+    AGENT_PROFILE="$AGENT_REQUEST"
+    return
+  fi
+
+  local profile
+  for profile in "${AGENT_PROFILES[@]}"; do
+    if label_belongs_to_profile "$AGENT_REQUEST" "$profile"; then
+      (( FORCE_NEW == 0 )) \
+        || die 2 "--new accepts a profile, not an exact numbered window"
+      AGENT_PROFILE="$profile"
+      AGENT_EXACT_WINDOW="$AGENT_REQUEST"
+      return
+    fi
+  done
+  die 2 "unknown agent profile or numbered window: $AGENT_REQUEST"
 }
 
 resolve_target() {
@@ -230,7 +296,7 @@ ensure_window() {
 ensure_project_session() {
   command -v tmux >/dev/null 2>&1 || die 1 "tmux is not installed"
 
-  local created=0 window
+  local created=0
   if session_exists; then
     verify_session_path
   else
@@ -240,16 +306,141 @@ ensure_project_session() {
 
   tmux_run set-option -t "$SESSION_NAME" @pmux_managed "1"
   scrub_server_secrets
+  tmux_run set-environment -g PATH "$PATH"
+  tmux_run set-window-option -g automatic-rename off
+  tmux_run set-window-option -g allow-rename off
+  tmux_run set-window-option -g remain-on-exit off
 
-  for window in "${STANDARD_WINDOWS[@]}"; do
-    ensure_window "$window"
-  done
-
-  if [[ -n "$REQUESTED_WINDOW" ]]; then
-    tmux_run select-window -t "$SESSION_NAME:$REQUESTED_WINDOW"
-  elif (( created == 1 )); then
+  ensure_window shell
+  if (( created == 1 )); then
     tmux_run select-window -t "$SESSION_NAME:shell"
   fi
+}
+
+resolve_agent_executable() {
+  local launcher_dir="${PMUX_AGENT_LAUNCHER_DIR:-$HOME/.local/bin}"
+  local executable="${launcher_dir}/${AGENT_PROFILE}"
+  [[ "$launcher_dir" == /* && -x "$executable" ]] \
+    || die 1 "agent launcher is unavailable: $AGENT_PROFILE"
+  printf '%s\n' "$executable"
+}
+
+most_recent_agent_window() {
+  local profile="$1" activity index name
+  local best_activity=-1 best_index=-1 best_name=""
+
+  while IFS='|' read -r activity index name; do
+    label_belongs_to_profile "$name" "$profile" || continue
+    if (( activity > best_activity \
+      || (activity == best_activity && index > best_index) )); then
+      best_activity="$activity"
+      best_index="$index"
+      best_name="$name"
+    fi
+  done < <(tmux_run list-windows -t "$SESSION_NAME" \
+    -F '#{window_activity}|#{window_index}|#{window_name}')
+  printf '%s\n' "$best_name"
+}
+
+next_agent_window() {
+  local profile="$1" name suffix ordinal
+  local -A used=()
+
+  while IFS= read -r name; do
+    label_belongs_to_profile "$name" "$profile" || continue
+    suffix="${name#"$profile-"}"
+    used["$suffix"]=1
+  done < <(tmux_run list-windows -t "$SESSION_NAME" -F '#{window_name}')
+
+  for (( ordinal = 1; ordinal <= 999; ordinal++ )); do
+    if [[ -z "${used[$ordinal]:-}" ]]; then
+      printf '%s-%d\n' "$profile" "$ordinal"
+      return
+    fi
+  done
+  die 1 "no free numbered windows remain for $profile"
+}
+
+agent_lock() {
+  local runtime_dir="${XDG_RUNTIME_DIR:-$HOME/.cache}/pmux-locks"
+  mkdir -p "$runtime_dir"
+  chmod 0700 "$runtime_dir"
+  local lock_file="${runtime_dir}/${SESSION_NAME}.lock"
+  exec {PMUX_LOCK_FD}>"$lock_file"
+  flock "$PMUX_LOCK_FD" \
+    || die 1 "failed to lock workspace agent allocation"
+}
+
+release_agent_lock() {
+  flock -u "$PMUX_LOCK_FD"
+  exec {PMUX_LOCK_FD}>&-
+}
+
+activate_agent_window() {
+  agent_lock
+
+  if [[ -n "$AGENT_EXACT_WINDOW" ]]; then
+    window_exists "$AGENT_EXACT_WINDOW" \
+      || {
+        release_agent_lock
+        die 1 "$AGENT_EXACT_WINDOW is not running in this workspace"
+      }
+    ACTIVE_WINDOW="$AGENT_EXACT_WINDOW"
+  elif (( FORCE_NEW == 0 )); then
+    ACTIVE_WINDOW="$(most_recent_agent_window "$AGENT_PROFILE")"
+  fi
+
+  if [[ -z "$ACTIVE_WINDOW" ]]; then
+    local executable
+    executable="$(resolve_agent_executable)"
+    ACTIVE_WINDOW="$(next_agent_window "$AGENT_PROFILE")"
+    if ! tmux_run new-window -d -t "$SESSION_NAME" \
+      -n "$ACTIVE_WINDOW" -c "$TARGET_DIR" "$executable"; then
+      release_agent_lock
+      die 1 "failed to launch $ACTIVE_WINDOW"
+    fi
+  fi
+
+  if window_exists "$ACTIVE_WINDOW"; then
+    tmux_run select-window -t "$SESSION_NAME:$ACTIVE_WINDOW"
+    release_agent_lock
+    return
+  fi
+
+  release_agent_lock
+  die 1 "$ACTIVE_WINDOW exited before it could be attached"
+}
+
+stop_agent_window() {
+  [[ -n "$AGENT_EXACT_WINDOW" ]] \
+    || die 2 "stop requires an exact numbered agent window"
+  window_exists "$AGENT_EXACT_WINDOW" \
+    || die 1 "$AGENT_EXACT_WINDOW is not running in this workspace"
+  tmux_run kill-window -t "$SESSION_NAME:$AGENT_EXACT_WINDOW"
+  printf 'stopped\t%s\t%s\n' "$AGENT_EXACT_WINDOW" "$TARGET_DIR"
+}
+
+validate_exact_target() {
+  [[ -n "$AGENT_EXACT_WINDOW" ]] || return 0
+  session_exists \
+    || die 1 "$AGENT_EXACT_WINDOW is not running in this workspace"
+  verify_session_path
+  window_exists "$AGENT_EXACT_WINDOW" \
+    || die 1 "$AGENT_EXACT_WINDOW is not running in this workspace"
+}
+
+agent_windows_for_session() {
+  local session="$1" name result=""
+  while IFS= read -r name; do
+    is_numbered_agent_label "$name" || continue
+    if [[ -z "$result" ]]; then
+      result="$name"
+    else
+      result="${result},${name}"
+    fi
+  done < <(tmux_run list-windows -t "$session" -F '#{window_name}')
+  [[ -n "$result" ]] || result="-"
+  printf '%s\n' "$result"
 }
 
 list_sessions() {
@@ -261,18 +452,19 @@ list_sessions() {
     return
   fi
 
-  local name managed path metrics windows attached found=0
+  local name managed path metrics attached agents found=0
   while IFS= read -r name; do
     managed="$(tmux_run show-options -qv -t "$name" @pmux_managed)"
     [[ "$managed" == "1" ]] || continue
     path="$(tmux_run show-options -qv -t "$name" @pmux_path)"
     metrics="$(tmux_run display-message -p -t "$name" \
-      '#{session_windows}|#{session_attached}')"
-    IFS='|' read -r windows attached <<<"$metrics"
+      '#{session_attached}')"
+    attached="$metrics"
+    agents="$(agent_windows_for_session "$name")"
     if (( found == 0 )); then
-      printf 'SESSION\tWINDOWS\tATTACHED\tPATH\n'
+      printf 'SESSION\tATTACHED\tAGENTS\tPATH\n'
     fi
-    printf '%s\t%s\t%s\t%s\n' "$name" "$windows" "$attached" "$path"
+    printf '%s\t%s\t%s\t%s\n' "$name" "$attached" "$agents" "$path"
     found=1
   done <<<"$names"
 
@@ -295,30 +487,58 @@ attach_session() {
   exec tmux -L "$SOCKET" attach-session -t "$SESSION_NAME"
 }
 
-main() {
+parse_command() {
   if [[ "${1:-}" == "list" ]]; then
     shift
     (( $# == 0 )) || die 2 "'list' does not accept additional arguments"
     validate_socket
     list_sessions
-    return
+    exit 0
+  elif [[ "${1:-}" == "stop" ]]; then
+    ACTION="stop"
+    shift
+    (( $# > 0 )) || die 2 "stop requires an exact numbered agent window"
+    AGENT_REQUEST="$1"
+    shift
+    parse_args "$@"
   else
     parse_args "$@"
   fi
+}
+
+main() {
+  parse_command "$@"
   validate_socket
 
-  validate_window
   resolve_target
   derive_session_name
+  resolve_agent_request
+  if (( FORCE_NEW == 1 )) && [[ -z "$AGENT_PROFILE" ]]; then
+    die 2 "--new requires an agent profile"
+  fi
 
   if (( PRINT_NAME == 1 )); then
     printf '%s\n' "$SESSION_NAME"
     return
   fi
 
+  validate_exact_target
   ensure_project_session
+  if [[ "$ACTION" == "stop" ]]; then
+    stop_agent_window
+    return
+  fi
+
+  if [[ -n "$AGENT_PROFILE" ]]; then
+    activate_agent_window
+  fi
+
   if (( ATTACH == 0 )); then
-    printf '%s\t%s\n' "$SESSION_NAME" "$TARGET_DIR"
+    if [[ -n "$ACTIVE_WINDOW" ]]; then
+      printf '%s\t%s\n' "$ACTIVE_WINDOW" "$TARGET_DIR"
+    else
+      printf '%s\t%s\n' "$SESSION_NAME" "$TARGET_DIR"
+    fi
     return
   fi
   attach_session

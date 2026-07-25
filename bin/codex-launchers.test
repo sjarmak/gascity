@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# codex-launchers.test — account isolation and argument forwarding.
+
+set -uo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK="$(mktemp -d)"
+STUB_BIN="${WORK}/bin"
+TEST_HOME="${WORK}/home"
+LOG="${WORK}/codex.log"
+PASS=0
+FAIL=0
+
+cleanup() {
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+mkdir -p "$STUB_BIN" "${TEST_HOME}/.codex-homes/codex-2"
+cat >"${STUB_BIN}/codex" <<'EOF'
+#!/usr/bin/env bash
+printf 'home=%s\n' "${CODEX_HOME:-unset}" >>"$CODEX_TEST_LOG"
+printf 'arg=%s\n' "$@" >>"$CODEX_TEST_LOG"
+EOF
+chmod 0755 "${STUB_BIN}/codex"
+
+ok() {
+  PASS=$((PASS + 1))
+  printf '  ok   %s\n' "$1"
+}
+
+bad() {
+  FAIL=$((FAIL + 1))
+  printf '  FAIL %s\n' "$1"
+  [[ -z "${2:-}" ]] || printf '       %s\n' "$2"
+}
+
+run_launcher() {
+  local launcher="$1"
+  shift
+  HOME="$TEST_HOME" PATH="${STUB_BIN}:$PATH" CODEX_TEST_LOG="$LOG" \
+    CODEX_CLI_BIN="${STUB_BIN}/codex" \
+    CODEX_HOME="/tmp/wrong-codex-home" \
+    bash "${BIN_DIR}/${launcher}" "$@"
+}
+
+: >"$LOG"
+run_launcher codex-1 resume "session with spaces"
+out="$(cat "$LOG")"
+if grep -qx 'home=unset' <<<"$out" \
+  && [[ "$(grep -c '^arg=--yolo$' <<<"$out")" -eq 1 ]] \
+  && grep -qx 'arg=resume' <<<"$out" \
+  && grep -qx 'arg=session with spaces' <<<"$out"; then
+  ok "codex-1 uses the normal home, enables yolo, and preserves argv"
+else
+  bad "codex-1 uses the normal home, enables yolo, and preserves argv" \
+    "out=[$out]"
+fi
+
+: >"$LOG"
+run_launcher codex-2 --model gpt-test
+out="$(cat "$LOG")"
+if grep -qx "home=${TEST_HOME}/.codex-homes/codex-2" <<<"$out" \
+  && [[ "$(grep -c '^arg=--yolo$' <<<"$out")" -eq 1 ]] \
+  && grep -qx 'arg=--model' <<<"$out" \
+  && grep -qx 'arg=gpt-test' <<<"$out"; then
+  ok "codex-2 isolates its home, enables yolo, and preserves argv"
+else
+  bad "codex-2 isolates its home, enables yolo, and preserves argv" \
+    "out=[$out]"
+fi
+
+printf '\ncodex-launchers.test: %d passed, %d failed\n' "$PASS" "$FAIL"
+(( FAIL == 0 ))

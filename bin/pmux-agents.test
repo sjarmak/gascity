@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# pmux-agents.test — numbered workspace agent lifecycle.
+#
+# All agent commands and tmux state are isolated under a temporary directory.
+
+set -uo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PMUX="${BIN_DIR}/pmux"
+WORK="$(mktemp -d)"
+SOCKET="pmux-agents-test-$$"
+TMUX_DIR="${WORK}/tmux"
+RUNTIME_DIR="${WORK}/runtime"
+STUB_BIN="${WORK}/bin"
+PROJECT="${WORK}/workspace"
+PASS=0
+FAIL=0
+
+cleanup() {
+  TMUX_TMPDIR="$TMUX_DIR" tmux -L "$SOCKET" kill-server >/dev/null 2>&1 || true
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+mkdir -m 0700 "$TMUX_DIR"
+mkdir -m 0700 "$RUNTIME_DIR"
+mkdir -p "$STUB_BIN" "$PROJECT"
+git init -q -b main "$PROJECT"
+PROJECT="$(cd "$PROJECT" && pwd -P)"
+
+for profile in claude-1 claude-3 claude-4 claude-5 claude-auto codex-1 codex-2; do
+  cat >"${STUB_BIN}/${profile}" <<'EOF'
+#!/usr/bin/env bash
+exec sleep 300
+EOF
+  chmod 0755 "${STUB_BIN}/${profile}"
+done
+cat >"${STUB_BIN}/amp" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod 0755 "${STUB_BIN}/amp"
+
+ok() {
+  PASS=$((PASS + 1))
+  printf '  ok   %s\n' "$1"
+}
+
+bad() {
+  FAIL=$((FAIL + 1))
+  printf '  FAIL %s\n' "$1"
+  [[ -z "${2:-}" ]] || printf '       %s\n' "$2"
+}
+
+run_pmux() {
+  PATH="${STUB_BIN}:$PATH" PMUX_SOCKET="$SOCKET" TMUX_TMPDIR="$TMUX_DIR" \
+    XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    PMUX_AGENT_LAUNCHER_DIR="$STUB_BIN" \
+    bash "$PMUX" "$@"
+}
+
+tmux_test() {
+  TMUX_TMPDIR="$TMUX_DIR" tmux -L "$SOCKET" "$@"
+}
+
+SESSION="$(run_pmux --print-name "$PROJECT")"
+
+printf 'integration:\n'
+
+out="$(run_pmux claude-1 --no-attach "$PROJECT" 2>&1)"; rc=$?
+if (( rc == 0 )) \
+  && grep -q 'claude-1-1' <<<"$out" \
+  && tmux_test list-windows -t "$SESSION" -F '#{window_name}' \
+    | grep -qx claude-1-1; then
+  ok "a profile launch creates its first numbered agent window"
+else
+  bad "a profile launch creates its first numbered agent window" \
+    "rc=$rc out=$out"
+fi
+
+remain_on_exit="$(tmux_test show-window-options -gv remain-on-exit)"
+allow_rename="$(tmux_test show-window-options -gv allow-rename)"
+if [[ "$remain_on_exit" == "off" && "$allow_rename" == "off" ]]; then
+  ok "the workspace server enforces self-cleaning, stable agent windows"
+else
+  bad "the workspace server enforces self-cleaning, stable agent windows" \
+    "remain-on-exit=$remain_on_exit allow-rename=$allow_rename"
+fi
+
+out="$(run_pmux claude-1 --no-attach "$PROJECT" 2>&1)"; rc=$?
+count="$(tmux_test list-windows -t "$SESSION" -F '#{window_name}' \
+  | grep -c '^claude-1-' || true)"
+if (( rc == 0 )) && grep -q 'claude-1-1' <<<"$out" && [[ "$count" -eq 1 ]]; then
+  ok "a profile launch reattaches instead of accumulating windows"
+else
+  bad "a profile launch reattaches instead of accumulating windows" \
+    "rc=$rc count=$count out=$out"
+fi
+
+out="$(run_pmux claude-1 --new --no-attach "$PROJECT" 2>&1)"; rc=$?
+if (( rc == 0 )) \
+  && grep -q 'claude-1-2' <<<"$out" \
+  && tmux_test list-windows -t "$SESSION" -F '#{window_name}' \
+    | grep -qx claude-1-2; then
+  ok "--new deliberately creates the next numbered window"
+else
+  bad "--new deliberately creates the next numbered window" \
+    "rc=$rc out=$out"
+fi
+
+out="$(run_pmux claude-1-1 --no-attach "$PROJECT" 2>&1)"; rc=$?
+selected="$(tmux_test display-message -p -t "$SESSION" '#{window_name}')"
+if (( rc == 0 )) && [[ "$selected" == "claude-1-1" ]]; then
+  ok "an exact numbered label attaches to that workspace window"
+else
+  bad "an exact numbered label attaches to that workspace window" \
+    "rc=$rc selected=$selected out=$out"
+fi
+
+out="$(run_pmux stop claude-1-1 "$PROJECT" 2>&1)"; rc=$?
+if (( rc == 0 )) \
+  && ! tmux_test list-windows -t "$SESSION" -F '#{window_name}' \
+    | grep -qx claude-1-1; then
+  ok "stop removes one explicitly named agent window"
+else
+  bad "stop removes one explicitly named agent window" "rc=$rc out=$out"
+fi
+
+out="$(run_pmux claude-1 --new --no-attach "$PROJECT" 2>&1)"; rc=$?
+if (( rc == 0 )) && grep -q 'claude-1-1' <<<"$out"; then
+  ok "new launches recycle the lowest free ordinal"
+else
+  bad "new launches recycle the lowest free ordinal" "rc=$rc out=$out"
+fi
+
+run_pmux claude-3 --new --no-attach "$PROJECT" >"${WORK}/race-1.out" 2>&1 &
+race_pid_1=$!
+run_pmux claude-3 --new --no-attach "$PROJECT" >"${WORK}/race-2.out" 2>&1 &
+race_pid_2=$!
+wait "$race_pid_1"; race_rc_1=$?
+wait "$race_pid_2"; race_rc_2=$?
+race_windows="$(tmux_test list-windows -t "$SESSION" -F '#{window_name}' \
+  | grep '^claude-3-' | sort)"
+if (( race_rc_1 == 0 && race_rc_2 == 0 )) \
+  && [[ "$race_windows" == $'claude-3-1\nclaude-3-2' ]]; then
+  ok "concurrent launches allocate distinct numbered windows"
+else
+  bad "concurrent launches allocate distinct numbered windows" \
+    "rcs=$race_rc_1,$race_rc_2 windows=[$race_windows]"
+fi
+
+printf 'end-to-end:\n'
+
+out="$(run_pmux amp --no-attach "$PROJECT" 2>&1)"; rc=$?
+for attempt in 1 2 3 4 5; do
+  if ! tmux_test list-windows -t "$SESSION" -F '#{window_name}' \
+      | grep -q '^amp-'; then
+    break
+  fi
+  read -r -t 0.05 _ || true
+done
+if (( rc == 1 )) \
+  && grep -q 'exited before it could be attached' <<<"$out" \
+  && ! tmux_test list-windows -t "$SESSION" -F '#{window_name}' \
+    | grep -q '^amp-'; then
+  ok "an exited agent process removes its window and reports the failed launch"
+else
+  bad "an exited agent process removes its window and reports the failed launch" \
+    "rc=$rc out=$out"
+fi
+
+out="$(run_pmux list 2>&1)"; rc=$?
+if (( rc == 0 )) \
+  && grep -q 'claude-1-1' <<<"$out" \
+  && grep -q 'claude-1-2' <<<"$out"; then
+  ok "workspace listing exposes live numbered agent windows"
+else
+  bad "workspace listing exposes live numbered agent windows" \
+    "rc=$rc out=$out"
+fi
+
+out="$(run_pmux claude-2 --no-attach "$PROJECT" 2>&1)"; rc=$?
+if (( rc == 2 )) && grep -q 'unknown agent profile' <<<"$out"; then
+  ok "unapproved account profiles are rejected"
+else
+  bad "unapproved account profiles are rejected" "rc=$rc out=$out"
+fi
+
+out="$(run_pmux codex-2-9 --no-attach "$PROJECT" 2>&1)"; rc=$?
+if (( rc == 1 )) && grep -q 'not running in this workspace' <<<"$out"; then
+  ok "missing exact windows fail without silently creating a session"
+else
+  bad "missing exact windows fail without silently creating a session" \
+    "rc=$rc out=$out"
+fi
+
+while (( 10#$(date +%N) > 200000000 )); do
+  read -r -t 0.01 _ || true
+done
+run_pmux claude-4 --new --no-attach "$PROJECT" >/dev/null 2>&1
+run_pmux claude-4 --new --no-attach "$PROJECT" >/dev/null 2>&1
+out="$(run_pmux claude-4 --no-attach "$PROJECT" 2>&1)"; rc=$?
+if (( rc == 0 )) && grep -q 'claude-4-2' <<<"$out"; then
+  ok "same-second activity ties prefer the newest numbered window"
+else
+  bad "same-second activity ties prefer the newest numbered window" \
+    "rc=$rc out=$out"
+fi
+
+PROFILE_PATH="${WORK}/claude-project"
+mkdir -p "$PROFILE_PATH"
+out="$(cd "$WORK" && run_pmux --print-name claude-project 2>&1)"; rc=$?
+if (( rc == 0 )) && [[ "$out" == claude-project-* ]]; then
+  ok "profile-like existing relative paths remain project paths"
+else
+  bad "profile-like existing relative paths remain project paths" \
+    "rc=$rc out=$out"
+fi
+
+ABSENT_PROJECT="${WORK}/absent-workspace"
+mkdir -p "$ABSENT_PROJECT"
+ABSENT_SESSION="$(run_pmux --print-name "$ABSENT_PROJECT")"
+out="$(run_pmux codex-2-9 --no-attach "$ABSENT_PROJECT" 2>&1)"; rc=$?
+if (( rc == 1 )) \
+  && grep -q 'not running in this workspace' <<<"$out" \
+  && ! tmux_test has-session -t "$ABSENT_SESSION" 2>/dev/null; then
+  ok "an absent exact target does not create a workspace session"
+else
+  bad "an absent exact target does not create a workspace session" \
+    "rc=$rc out=$out"
+fi
+
+printf '\npmux-agents.test: %d passed, %d failed\n' "$PASS" "$FAIL"
+(( FAIL == 0 ))

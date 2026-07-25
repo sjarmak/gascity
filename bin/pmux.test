@@ -89,11 +89,11 @@ else
   bad "missing project directories fail clearly" "rc=$rc out=$out"
 fi
 
-out="$(run_pmux --window editor --no-attach "$PROJECT" 2>&1)"; rc=$?
-if (( rc == 2 )) && grep -q 'unknown window' <<<"$out"; then
-  ok "unknown standard windows are rejected"
+out="$(run_pmux --new --no-attach "$PROJECT" 2>&1)"; rc=$?
+if (( rc == 2 )) && grep -q -- '--new requires an agent profile' <<<"$out"; then
+  ok "--new without an agent profile is rejected"
 else
-  bad "unknown standard windows are rejected" "rc=$rc out=$out"
+  bad "--new without an agent profile is rejected" "rc=$rc out=$out"
 fi
 
 out="$(PMUX_SOCKET=ds-research TMUX_TMPDIR="$TMUX_DIR" bash "$PMUX" \
@@ -115,12 +115,11 @@ else
     "rc=$rc out=$out"
 fi
 
-windows="$(tmux_test list-windows -t "$EXPECTED_NAME" -F '#{window_name}' 2>&1 | sort)"
-expected_windows=$'amp\nclaude\ncodex\nshell'
-if [[ "$windows" == "$expected_windows" ]]; then
-  ok "the standard shell, Codex, Claude, and Amp windows exist"
+windows="$(tmux_test list-windows -t "$EXPECTED_NAME" -F '#{window_name}' 2>&1)"
+if [[ "$windows" == "shell" ]]; then
+  ok "a workspace starts with one shell and no idle agent windows"
 else
-  bad "the standard shell, Codex, Claude, and Amp windows exist" \
+  bad "a workspace starts with one shell and no idle agent windows" \
     "windows=[$windows]"
 fi
 
@@ -159,28 +158,28 @@ fi
 
 run_pmux --no-attach "$PROJECT" >/dev/null 2>&1
 window_count="$(tmux_test list-windows -t "$EXPECTED_NAME" -F '#{window_id}' | wc -l)"
-if [[ "$window_count" -eq 4 ]]; then
+if [[ "$window_count" -eq 1 ]]; then
   ok "reopening a project is idempotent"
 else
   bad "reopening a project is idempotent" "window_count=$window_count"
 fi
 
-tmux_test kill-window -t "${EXPECTED_NAME}:amp"
+tmux_test kill-window -t "${EXPECTED_NAME}:shell"
 run_pmux --no-attach "$PROJECT" >/dev/null 2>&1
-if tmux_test list-windows -t "$EXPECTED_NAME" -F '#{window_name}' | grep -qx amp; then
-  ok "reopening repairs a missing standard window"
+if tmux_test list-windows -t "$EXPECTED_NAME" -F '#{window_name}' | grep -qx shell; then
+  ok "reopening repairs a workspace whose shell session exited"
 else
-  bad "reopening repairs a missing standard window"
+  bad "reopening repairs a workspace whose shell session exited"
 fi
 
 printf 'end-to-end:\n'
 
-out="$(run_pmux --window claude --no-attach "$NESTED" 2>&1)"; rc=$?
+out="$(run_pmux --no-attach "$NESTED" 2>&1)"; rc=$?
 selected="$(tmux_test display-message -p -t "$EXPECTED_NAME" '#{session_windows}:#{window_name}')"
-if (( rc == 0 )) && [[ "$selected" == "4:claude" ]]; then
-  ok "a nested-directory launch reuses the session and selects the requested agent"
+if (( rc == 0 )) && [[ "$selected" == "1:shell" ]]; then
+  ok "a nested-directory launch reuses the workspace session"
 else
-  bad "a nested-directory launch reuses the session and selects the requested agent" \
+  bad "a nested-directory launch reuses the workspace session" \
     "rc=$rc selected=$selected out=$out"
 fi
 
