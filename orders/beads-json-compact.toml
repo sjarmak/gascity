@@ -11,12 +11,16 @@
 # in the 6h after it, ~3.7MB/h, and returns to stall size in about a day.
 #
 # WINDOWS: 6h for transient order-tracking beads, while generic closed history
-# stays at 7d. Approved by Stephanie 2026-07-25 in Amp thread
+# stays at 2d. Approved by Stephanie 2026-07-25 in Amp thread
 # T-019f8a15-7e09-7049-9ef2-438067d63866 after dr-clh5: even after the event
 # scanner storm was contained, the city created ~568 tracking rows/hour. A 2d
 # window still left 16K tracking rows and a 43MB file, costing ~9.8 CPU-seconds
 # per reload. Hourly compaction with a 6h window holds that transient class near
-# 3K rows while preserving ordinary closed history and the 10 newest runs/order.
+# 3K rows while preserving the 10 newest runs/order. The generic window was
+# reduced 7d->2d on 2026-07-25 after the unchanged-content decode fast path
+# left 66% average supervisor CPU: 6,853 closed session rows occupied 17.2 MiB,
+# and 5,235 were older than 2d. Restore 7d only after the city store moves off
+# the full-file backend or mutators stop rewriting the entire file.
 #
 # SAFETY: closed-only (a non-closed bead in the delete set aborts the write);
 # retains the 10 most recent order-tracking beads per order regardless of age;
@@ -45,6 +49,6 @@ idempotent = true
 
 [order.env]
 COMPACT_APPLY = "1"              # PROMOTED (Stephanie, 2026-07-14, via mayor) after reviewing the clean dry-run: 26,603 delete / 28,653 keep, deps 60->31, no non-closed beads in the delete set
-COMPACT_CLOSED_ANY_DAYS = "7"    # preserve the longer audit window for ordinary closed beads
+COMPACT_CLOSED_ANY_DAYS = "2"    # retain recent ordinary history; restore 7d after the full-file rewrite bottleneck is removed
 COMPACT_TTL_DAYS = "0.25"        # 6h transient window approved 2026-07-25 after post-fix profile + measured generation rate
 COMPACT_RETAIN_LAST = "10"       # keep the 10 newest tracking beads per order regardless of age

@@ -18,9 +18,13 @@ The SECOND pass (COMPACT_CLOSED_ANY_DAYS) bounds generic closed history.
 Closed NON-order-tracking beads — gc's own session records, titled by working
 directory — are covered by NO reaper in the file store
 (bead-prune-reaper is Dolt-only; bead-janitor is .disabled). The live order
-keeps those at 7d for audit/history while pruning transient order-tracking
-rows after 6h. At the measured ~568 tracking rows/hour, hourly compaction
-holds this class near 3K rows instead of the 16K retained by a 2d window.
+keeps those at 2d for recent audit/history while pruning transient
+order-tracking rows after 6h. At the measured ~568 tracking rows/hour,
+hourly compaction holds the tracking class near 3K rows instead of the 16K
+retained by a 2d tracking window. The shorter generic window is required
+because closed session rows alone occupied 17.2 MiB in the live file and
+full-file writes still consumed 66% average supervisor CPU after the
+unchanged-content decode fast path landed.
 
 Locking mirrors bin/bead-janitor-file-store-helper.py: LOCK_EX on
 beads.json.lock, backup, atomic tempfile+rename. Safe against the live
