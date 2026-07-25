@@ -12,14 +12,15 @@ This applies the SAME policy in a single read-filter-write pass:
             else one shared legacy bucket
   retain:   the 10 most recent per bucket (reference time = updated_at,
             falling back to created_at) regardless of age
-  delete:   the rest, only if reference time < now - 2d
+  delete:   the rest, only if reference time < now - 6h
 
 The SECOND pass (COMPACT_CLOSED_ANY_DAYS) bounds generic closed history.
 Closed NON-order-tracking beads — gc's own session records, titled by working
 directory — are covered by NO reaper in the file store
 (bead-prune-reaper is Dolt-only; bead-janitor is .disabled). The live order
 keeps those at 7d for audit/history while pruning transient order-tracking
-rows after 2d; this split was approved by Stephanie 2026-07-25 after dr-clh5.
+rows after 6h. At the measured ~568 tracking rows/hour, hourly compaction
+holds this class near 3K rows instead of the 16K retained by a 2d window.
 
 Locking mirrors bin/bead-janitor-file-store-helper.py: LOCK_EX on
 beads.json.lock, backup, atomic tempfile+rename. Safe against the live
@@ -28,7 +29,7 @@ Dependency edges and out-of-band revision/fence entries whose beads were
 compacted away are pruned in the same pass, and a non-closed bead in the
 delete set aborts the write.
 
-Env: COMPACT_APPLY=1 to mutate (default dry-run), COMPACT_TTL_DAYS (2),
+Env: COMPACT_APPLY=1 to mutate (default dry-run), COMPACT_TTL_DAYS (0.25),
 COMPACT_RETAIN_LAST (10), COMPACT_CLOSED_ANY_DAYS (0 = off).
 """
 import datetime
@@ -44,7 +45,7 @@ from pathlib import Path
 BEADS = Path("/home/ds/gas-city/.gc/beads.json")
 LOCK = Path(str(BEADS) + ".lock")
 APPLY = os.environ.get("COMPACT_APPLY", "") == "1"
-TTL_DAYS = float(os.environ.get("COMPACT_TTL_DAYS", "2"))
+TTL_DAYS = float(os.environ.get("COMPACT_TTL_DAYS", "0.25"))
 RETAIN = int(os.environ.get("COMPACT_RETAIN_LAST", "10"))
 LEGACY = "\x00legacy-unscoped-order-tracking"
 

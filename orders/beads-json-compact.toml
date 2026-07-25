@@ -10,12 +10,13 @@
 # compaction. The manual run is not a fix — the store regrew from 82MB to 105MB
 # in the 6h after it, ~3.7MB/h, and returns to stall size in about a day.
 #
-# WINDOWS: 2d for transient order-tracking beads, while generic closed history
-# stays at 7d. Approved by Stephanie 2026-07-25 after dr-clh5: at the new
-# 7-13K-bead/day generation rate, the prior 7d tracking window retained ~64K
-# beads and each FileStore refresh inflated ~534MB through json.Unmarshal.
-# The split policy removes ~36K old tracking rows while preserving the longer
-# audit window for ordinary closed beads and the 10 newest runs per order.
+# WINDOWS: 6h for transient order-tracking beads, while generic closed history
+# stays at 7d. Approved by Stephanie 2026-07-25 in Amp thread
+# T-019f8a15-7e09-7049-9ef2-438067d63866 after dr-clh5: even after the event
+# scanner storm was contained, the city created ~568 tracking rows/hour. A 2d
+# window still left 16K tracking rows and a 43MB file, costing ~9.8 CPU-seconds
+# per reload. Hourly compaction with a 6h window holds that transient class near
+# 3K rows while preserving ordinary closed history and the 10 newest runs/order.
 #
 # SAFETY: closed-only (a non-closed bead in the delete set aborts the write);
 # retains the 10 most recent order-tracking beads per order regardless of age;
@@ -34,7 +35,7 @@
 [order]
 description = "Janitor: compact closed beads out of the gc file store (.gc/beads.json) so order dispatch doesn't starve on reloadFromDisk (dry-run until enabled)"
 trigger = "cooldown"
-interval = "6h"
+interval = "1h"
 exec = "/home/ds/gas-city/bin/beads-json-compact-order-tracking.py"
 timeout = "300s"
 # Re-running is a no-op re-evaluation: a pass that finds nothing past the TTL
@@ -45,5 +46,5 @@ idempotent = true
 [order.env]
 COMPACT_APPLY = "1"              # PROMOTED (Stephanie, 2026-07-14, via mayor) after reviewing the clean dry-run: 26,603 delete / 28,653 keep, deps 60->31, no non-closed beads in the delete set
 COMPACT_CLOSED_ANY_DAYS = "7"    # preserve the longer audit window for ordinary closed beads
-COMPACT_TTL_DAYS = "2"           # tightened by Stephanie 2026-07-25 for transient order-tracking rows after dr-clh5
+COMPACT_TTL_DAYS = "0.25"        # 6h transient window approved 2026-07-25 after post-fix profile + measured generation rate
 COMPACT_RETAIN_LAST = "10"       # keep the 10 newest tracking beads per order regardless of age
