@@ -2,6 +2,7 @@ package beads
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -142,11 +143,13 @@ func applyBeadRevisionsSealed(fd *fileData) {
 // write. Fine for Tutorial 01 volumes.
 type FileStore struct {
 	*MemStore
-	fmu       sync.Mutex // guards mutate-then-save atomicity
-	fs        fsys.FS
-	path      string
-	locker    Locker // cross-process file lock; nopLocker when unset
-	freshness fileFreshness
+	fmu         sync.Mutex // guards mutate-then-save atomicity
+	fs          fsys.FS
+	path        string
+	locker      Locker // cross-process file lock; nopLocker when unset
+	freshness   fileFreshness
+	contentHash [sha256.Size]byte
+	hashKnown   bool
 }
 
 var _ ConditionalAssignmentReleaser = (*FileStore)(nil)
@@ -206,10 +209,12 @@ func OpenFileStore(fs fsys.FS, path string) (*FileStore, error) {
 	applyBeadRevisionsSealed(&fd)
 	applyBeadFences(fd.Beads, fd.Fences)
 	store := &FileStore{
-		MemStore: NewMemStoreFrom(fd.Seq, fd.Beads, fd.Deps),
-		fs:       fs,
-		path:     path,
-		locker:   locker,
+		MemStore:    NewMemStoreFrom(fd.Seq, fd.Beads, fd.Deps),
+		fs:          fs,
+		path:        path,
+		locker:      locker,
+		contentHash: sha256.Sum256(data),
+		hashKnown:   true,
 	}
 	// The JSON we just loaded and the file's current freshness can diverge if
 	// another handle rewrites the store between ReadFile and a follow-up Stat.
@@ -237,6 +242,10 @@ func (fs *FileStore) reloadFromDisk() error {
 		}
 		return fmt.Errorf("reloading file store: %w", err)
 	}
+	hash := sha256.Sum256(data)
+	if fs.hashKnown && hash == fs.contentHash {
+		return nil
+	}
 	var fd fileData
 	if err := json.Unmarshal(data, &fd); err != nil {
 		return fmt.Errorf("reloading file store: %w", err)
@@ -244,6 +253,8 @@ func (fs *FileStore) reloadFromDisk() error {
 	applyBeadRevisionsSealed(&fd)
 	applyBeadFences(fd.Beads, fd.Fences)
 	fs.restoreFrom(fd.Seq, fd.Beads, fd.Deps)
+	fs.contentHash = hash
+	fs.hashKnown = true
 	return nil
 }
 
@@ -292,6 +303,7 @@ func (fs *FileStore) refreshReadStateLocked() error {
 	}
 	if !current.exists {
 		fs.restoreFrom(0, nil, nil)
+		fs.hashKnown = false
 		fs.freshness = current
 		return nil
 	}
@@ -724,6 +736,8 @@ func (fs *FileStore) save() error {
 	if err := fs.fs.Rename(tmp, fs.path); err != nil {
 		return fmt.Errorf("saving file store: %w", err)
 	}
+	fs.contentHash = sha256.Sum256(data)
+	fs.hashKnown = true
 	fs.refreshFreshnessCache()
 	return nil
 }
