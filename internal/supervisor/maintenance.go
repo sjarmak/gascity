@@ -123,6 +123,7 @@ type StoreMaintenanceLoopDeps struct {
 	Store     beads.Store     // city Dolt store; future beads exercise it
 	CityPath  string          // absolute path for backup layout + logs
 	Recorder  events.Recorder // defaults to events.Discard when nil
+	FS        fsys.FS         // defaults to fsys.OSFS
 	Stderr    io.Writer       // defaults to io.Discard when nil
 	Clock     func() time.Time
 	Rand      func() float64 // returns [0,1); defaults to math/rand
@@ -171,6 +172,7 @@ type StoreMaintenanceLoop struct {
 	store             beads.Store
 	cityPath          string
 	recorder          events.Recorder
+	fs                fsys.FS
 	stderr            io.Writer
 	clock             func() time.Time
 	rand              func() float64
@@ -232,6 +234,9 @@ func NewStoreMaintenanceLoop(deps StoreMaintenanceLoopDeps) *StoreMaintenanceLoo
 	if deps.Recorder == nil {
 		deps.Recorder = events.Discard
 	}
+	if deps.FS == nil {
+		deps.FS = fsys.OSFS{}
+	}
 	if deps.Stderr == nil {
 		deps.Stderr = io.Discard
 	}
@@ -240,6 +245,7 @@ func NewStoreMaintenanceLoop(deps StoreMaintenanceLoopDeps) *StoreMaintenanceLoo
 		store:             deps.Store,
 		cityPath:          deps.CityPath,
 		recorder:          deps.Recorder,
+		fs:                deps.FS,
 		stderr:            deps.Stderr,
 		clock:             deps.Clock,
 		rand:              deps.Rand,
@@ -474,24 +480,20 @@ func (m *StoreMaintenanceLoop) emitRunEvent(run MaintenanceRun) {
 	if err != nil {
 		return
 	}
-	m.recorder.Record(events.Event{
+	event := events.Event{
 		Type:    eventType,
 		Actor:   maintenanceActor,
 		Subject: m.cityPath,
 		Ts:      run.FinishedAt,
 		Payload: raw,
-	})
-
-	// Append-time projection upkeep: persist this run's outcome into the
-	// latest-by-status sidecar so /status reads it in O(1) instead of
-	// re-scanning the archived event history. Best-effort — a
-	// failed sidecar write only means the next /status seed re-derives it
-	// from history, never a wrong value.
+	}
 	status := "success"
 	if run.Err != "" {
 		status = "failed"
 	}
-	if err := storehealth.RecordMaintenanceEvent(fsys.OSFS{}, m.cityPath, run.FinishedAt, status); err != nil {
+	if err := storehealth.RecordMaintenanceEvent(m.fs, m.cityPath, run.FinishedAt, status, func() {
+		m.recorder.Record(event)
+	}); err != nil {
 		fmt.Fprintf(m.stderr, "events: store-maintenance projection: %v\n", err) //nolint:errcheck // best-effort stderr
 	}
 

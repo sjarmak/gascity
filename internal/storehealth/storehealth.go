@@ -121,7 +121,11 @@ func LastMaintenance(fs fsys.FS, cityPath string, ep events.Provider) (time.Time
 		return p.Latest()
 	}
 	// Read-only fallback: derive the answer from history but do not write.
-	return scanMaintenanceProjection(ep).Latest()
+	scanned, err := scanMaintenanceProjection(ep)
+	if err != nil {
+		return time.Time{}, ""
+	}
+	return scanned.Latest()
 }
 
 // SeedMaintenanceProjection returns the latest maintenance timestamp/status
@@ -139,22 +143,29 @@ func LastMaintenance(fs fsys.FS, cityPath string, ep events.Provider) (time.Time
 // so the full scan runs at most once per city rather than on every
 // no-maintenance-events read — the failure mode that made request-time
 // scanning (and its archive-blind ListTail workaround) unacceptable.
-func SeedMaintenanceProjection(fs fsys.FS, cityPath string, ep events.Provider) (time.Time, string) {
+func SeedMaintenanceProjection(fs fsys.FS, cityPath string, ep events.Provider) (time.Time, string, error) {
 	if cityPath == "" {
-		return time.Time{}, ""
+		return time.Time{}, "", nil
 	}
 	if p, ok, err := LoadMaintenanceProjection(fs, cityPath); err == nil && ok {
-		return p.Latest()
+		ts, status := p.Latest()
+		return ts, status, nil
 	}
 
-	scanned := scanMaintenanceProjection(ep)
+	scanned, err := scanMaintenanceProjection(ep)
+	if err != nil {
+		return time.Time{}, "", err
+	}
 	projectionWriteMu.Lock()
 	defer projectionWriteMu.Unlock()
 	current, _, _ := LoadMaintenanceProjection(fs, cityPath)
 	current.LastDoneAt = maxTime(current.LastDoneAt, scanned.LastDoneAt)
 	current.LastFailedAt = maxTime(current.LastFailedAt, scanned.LastFailedAt)
-	_ = writeMaintenanceProjectionLocked(fs, cityPath, current) //nolint:errcheck // best-effort seed
-	return current.Latest()
+	if err := writeMaintenanceProjectionLocked(fs, cityPath, current); err != nil {
+		return time.Time{}, "", err
+	}
+	ts, status := current.Latest()
+	return ts, status, nil
 }
 
 const bytesPerMB = 1_000_000

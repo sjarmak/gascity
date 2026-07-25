@@ -123,7 +123,7 @@ func TestRunOnce_NoOpCycleUpdatesState(t *testing.T) {
 	now := time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC)
 	loop := NewStoreMaintenanceLoop(StoreMaintenanceLoopDeps{
 		Cfg:      cfg,
-		CityPath: "/tmp/city",
+		CityPath: t.TempDir(),
 		Clock:    func() time.Time { return now },
 		Rand:     func() float64 { return 0.5 },
 	})

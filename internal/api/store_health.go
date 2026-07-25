@@ -92,7 +92,10 @@ func (s *Server) computeStoreHealth(ctx context.Context) (*StatusStoreHealth, er
 	// supervisor is the single process permitted to persist the projection
 	// sidecar; the CLI fallback reads it without writing. This first-read seed
 	// keeps the supervisor's steady-state read O(1) after one bounded scan.
-	lastAt, lastStatus := storehealth.SeedMaintenanceProjection(fsys.OSFS{}, cityPath, s.state.EventProvider())
+	lastAt, lastStatus, err := storehealth.SeedMaintenanceProjection(fsys.OSFS{}, cityPath, s.state.EventProvider())
+	if err != nil {
+		return nil, fmt.Errorf("seed store-maintenance projection: %w", err)
+	}
 	h := storehealth.Compute(cityPath, size, rows, lastAt, lastStatus)
 	return statusStoreHealthFromDomain(h), nil
 }

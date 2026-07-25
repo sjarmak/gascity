@@ -70,7 +70,7 @@ func TestLoadMaintenanceProjectionCorrupt(t *testing.T) {
 func TestRecordMaintenanceEventCreatesAndPersists(t *testing.T) {
 	city := t.TempDir()
 	ts := time.Date(2026, 7, 1, 4, 0, 0, 0, time.UTC)
-	if err := RecordMaintenanceEvent(fsys.OSFS{}, city, ts, "success"); err != nil {
+	if err := RecordMaintenanceEvent(fsys.OSFS{}, city, ts, "success", nil); err != nil {
 		t.Fatalf("RecordMaintenanceEvent: %v", err)
 	}
 	p, ok, err := LoadMaintenanceProjection(fsys.OSFS{}, city)
@@ -90,10 +90,10 @@ func TestRecordMaintenanceEventCreatesAndPersists(t *testing.T) {
 
 func TestRecordMaintenanceEventIgnoresUnknownStatusAndZero(t *testing.T) {
 	city := t.TempDir()
-	if err := RecordMaintenanceEvent(fsys.OSFS{}, city, time.Now(), "bogus"); err != nil {
+	if err := RecordMaintenanceEvent(fsys.OSFS{}, city, time.Now(), "bogus", nil); err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
-	if err := RecordMaintenanceEvent(fsys.OSFS{}, city, time.Time{}, "success"); err != nil {
+	if err := RecordMaintenanceEvent(fsys.OSFS{}, city, time.Time{}, "success", nil); err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	if _, ok, _ := LoadMaintenanceProjection(fsys.OSFS{}, city); ok {
