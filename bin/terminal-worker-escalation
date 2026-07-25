@@ -28,6 +28,7 @@ NOTIFY_RETRY_SECONDS = int(os.environ.get("TERMINAL_ESCALATION_NOTIFY_RETRY_SECO
 QUALIFIED = re.compile(r"^(?:city:[^:]+|rig:[^:]+:[^:]+)$")
 REASON_CLASS = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 TERMINAL_LABELS = ("terminal-escalated", "dispatch-blocked")
+RELEASING_DISPOSITIONS = frozenset({"authorized-retry"})
 CLEAR_METADATA = (
     "gc.routed_to",
     "gc.session_name",
@@ -165,6 +166,11 @@ def source_is_disarmed(source: dict[str, Any], record: dict[str, Any]) -> bool:
         and all(str(metadata.get(key, "")) == value for key, value in metadata_for(record).items())
         and not any(metadata.get(key) for key in CLEAR_METADATA)
     )
+
+
+def disposition_releases_source(record: dict[str, Any]) -> bool:
+    disposition = record["disposition"]
+    return disposition["state"] == "recorded" and disposition.get("class") in RELEASING_DISPOSITIONS
 
 
 def save(record: dict[str, Any]) -> None:
@@ -479,7 +485,7 @@ def scan(apply: bool) -> bool:
         if apply and lifecycle_changed:
             save(record)
             audit("record_recovered", record)
-        if not source_is_disarmed(source, record):
+        if not disposition_releases_source(record) and not source_is_disarmed(source, record):
             pending.append(record["escalation_id"])
             if apply:
                 ok, error = update_source(source_ref, *source_transition_args(record))

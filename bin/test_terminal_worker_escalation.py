@@ -145,6 +145,47 @@ def test_patrol_repairs_redispatch_drift_and_retries_mail(env):
     assert [m["recipient"] for m in repaired["mail"]].count("gascity-dashboard-pl") >= 2
 
 
+@pytest.mark.parametrize("status", ["open", "in_progress", "closed"])
+def test_patrol_does_not_reblock_authorized_retry(env, status):
+    e, state, _ = env
+    assert raise_it(e).returncode == 0
+    assert run(e, "ack", "--source", SOURCE, "--coordinator", "mayor").returncode == 0
+    assert run(e, "dispose", "--source", SOURCE, "--coordinator", "mayor", "--class", "authorized-retry", "--detail", "retry approved").returncode == 0
+    live = json.loads(state.read_text())
+    source = live["rigs"]["gascity-dashboard"]["gascity-dashboard-1rey"]
+    source["status"] = status
+    source["assignee"] = None if status == "closed" else "worker-2"
+    source["metadata"]["gc.routed_to"] = "/worker-2"
+    state.write_text(json.dumps(live))
+    expected = json.loads(json.dumps(source))
+
+    result = run(e, "scan", "--apply")
+
+    assert result.returncode == 0, result.stdout
+    source = json.loads(state.read_text())["rigs"]["gascity-dashboard"]["gascity-dashboard-1rey"]
+    assert source == expected
+
+
+def test_patrol_reblocks_non_release_disposition(env):
+    e, state, _ = env
+    assert raise_it(e).returncode == 0
+    assert run(e, "ack", "--source", SOURCE, "--coordinator", "mayor").returncode == 0
+    assert run(e, "dispose", "--source", SOURCE, "--coordinator", "mayor", "--class", "upstream-gated", "--detail", "wait").returncode == 0
+    live = json.loads(state.read_text())
+    source = live["rigs"]["gascity-dashboard"]["gascity-dashboard-1rey"]
+    source["status"] = "in_progress"
+    source["assignee"] = "worker-2"
+    source["metadata"]["gc.routed_to"] = "/worker-2"
+    state.write_text(json.dumps(live))
+
+    result = run(e, "scan", "--apply")
+
+    assert result.returncode == 0, result.stdout
+    source = json.loads(state.read_text())["rigs"]["gascity-dashboard"]["gascity-dashboard-1rey"]
+    assert source["status"] == "blocked" and source["assignee"] is None
+    assert "gc.routed_to" not in source["metadata"]
+
+
 def test_patrol_reconstructs_record_from_authoritative_bead(env):
     e, _, tmp = env
     assert raise_it(e).returncode == 0
