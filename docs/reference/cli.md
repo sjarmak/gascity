@@ -4068,7 +4068,13 @@ Request wake for a session and release user hold or crash-loop quarantine metada
 
 After waking, the reconciler will start the session on its next tick
 if it has wake reasons (e.g., a matching config agent). If the session
-has no wake reasons, it remains asleep.
+has no wake reasons, it remains asleep and the command reports
+"no wake reasons, remaining asleep" (JSON state "no_wake_reasons")
+instead of "wake requested", so callers can tell a queued wake from a
+no-op.
+
+Pass --strict to exit non-zero when the wake is a no-op, so scripts can
+branch on the outcome without parsing output.
 
 Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).
 
@@ -4086,6 +4092,7 @@ gc session wake mayor
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL |
+| `--strict` | bool |  | exit non-zero when the wake is a no-op (session has no wake reasons) |
 
 ## gc shell
 
