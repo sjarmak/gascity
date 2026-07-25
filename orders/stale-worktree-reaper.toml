@@ -1,12 +1,13 @@
 # Expanded 2026-07-20 by Stephanie's direct request after ten unlocked,
 # clean+merged CodeScaleBench worktrees retained 194G while this order reported
-# zero candidates. The new cross-rig/unlocked scope is staged DRY-RUN first per
-# city change control. Promote by adding --apply only after reviewing its report;
-# the implementation still caps removals at 10, never uses --force, retains
-# branch refs, and fails closed on active bead-store references.
+# zero candidates. The new cross-rig/unlocked scope was staged DRY-RUN first per
+# city change control. Promoted 2026-07-25 after an autonomous AOA audit plus
+# Code Intelligence Digest and AOA canaries; the implementation caps removals
+# at 10, never uses --force, retains branch refs, and fails closed on drift,
+# process visibility gaps, live processes, and active bead-store references.
 [order]
-description = "Hourly dry-run: report registered worktrees across every rig that are clean, merged, inactive, unreferenced, and ≥3d stale; include size. Expanded beyond locked-only discovery after the 194G CodeScaleBench incident."
+description = "Hourly bounded pruning: remove up to 10 registered worktrees across every rig that are clean, merged, inactive, unreferenced, and ≥3d stale; retain exact branch refs and a pre-removal manifest."
 trigger = "cooldown"
 interval = "1h"
-exec = "/home/ds/gas-city/bin/stale-worktree-reaper --include-unlocked --threshold 3d --max-remove 10 --nudge-mayor"
+exec = "/home/ds/gas-city/bin/stale-worktree-reaper --apply --include-unlocked --threshold 3d --max-remove 10 --nudge-mayor"
 timeout = "20m"

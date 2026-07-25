@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
-# Standalone test for stale-worktree-reaper's worktree_emptiness decision.
+# Standalone tests for stale-worktree-reaper safety decisions.
 #
 # Asserts:
 #   1. A git worktree with uncommitted changes is NOT reapable      (-> dirty)
 #   2. An empty git worktree IS reapable                            (-> clean)
 #   3. jj fail-closed: an errored/ambiguous jj probe is NOT reapable (-> unknown)
+#   4. Suspended rigs remain visible while HQ is excluded
+#   5. Active bead workdir probes cache and fail closed
+#   6. Hidden-cwd command arguments still protect a worktree
+#   7. Incomplete process visibility refuses apply eligibility
+#   8. Exact tip/default identity drift fails final revalidation
+#   9. Early registration matches survive pipefail/SIGPIPE conditions
+#  10. A concurrent apply lock is refused
 #
 # jj is NOT installed on this machine, so case 3 stubs `jj` + `command` on PATH
 # to force the jj-aware branch and make the probe error, proving the decision
@@ -106,6 +113,99 @@ check "active workdir recognized" "active" "$ACTIVE_REF_STATE"
 active_workdir_state demo /tmp/repo /tmp/other
 check "active workdir query cached" "1" "$calls"
 check "unreferenced workdir clear" "clear" "$ACTIVE_REF_STATE"
+
+# --- Case 6: command arguments catch processes whose cwd is unreadable -------
+LIVE_PROCESS_PATHS=""
+LIVE_PROCESS_ARGS="node"$'\n'"--cwd=$WORK/hidden-cwd"$'\n'
+if path_has_live_process "$WORK/hidden-cwd"; then
+  hidden_state=live
+else
+  hidden_state=clear
+fi
+check "hidden cwd argument -> live" "live" "$hidden_state"
+
+# --- Case 7: incomplete process visibility fails closed ----------------------
+PROCESS_VISIBILITY_UNVERIFIED=1
+if process_snapshot_complete; then
+  visibility_state=complete
+else
+  visibility_state=incomplete
+fi
+check "incomplete process visibility -> not reapable" "incomplete" "$visibility_state"
+PROCESS_VISIBILITY_UNVERIFIED=0
+
+# --- Case 8: final identity check rejects tip drift --------------------------
+IDENTITY_REPO="$WORK/identity-repo"
+IDENTITY_WT="$WORK/identity-worktree"
+git init -q -b main "$IDENTITY_REPO"
+git -C "$IDENTITY_REPO" config user.email t@t
+git -C "$IDENTITY_REPO" config user.name t
+echo seed > "$IDENTITY_REPO/seed.txt"
+git -C "$IDENTITY_REPO" add seed.txt
+git -C "$IDENTITY_REPO" commit -qm seed
+git -C "$IDENTITY_REPO" branch work/test
+git -C "$IDENTITY_REPO" worktree add -q "$IDENTITY_WT" work/test
+identity_tip=$(git -C "$IDENTITY_WT" rev-parse HEAD)
+identity_default=$(git -C "$IDENTITY_REPO" rev-parse refs/heads/main)
+if candidate_identity_matches "$IDENTITY_REPO" "$IDENTITY_WT" work/test \
+     "$identity_tip" main "$identity_default"; then
+  identity_state=match
+else
+  identity_state=mismatch
+fi
+check "exact candidate identity -> match" "match" "$identity_state"
+git -C "$IDENTITY_WT" commit -q --allow-empty -m drift
+if candidate_identity_matches "$IDENTITY_REPO" "$IDENTITY_WT" work/test \
+     "$identity_tip" main "$identity_default"; then
+  identity_state=match
+else
+  identity_state=mismatch
+fi
+check "tip drift -> not reapable" "mismatch" "$identity_state"
+
+# --- Case 9: registration lookup consumes the full porcelain stream ----------
+(
+  git() {
+    if [[ "$*" == *"worktree list --porcelain"* ]]; then
+      python3 - <<PY
+print("worktree $WORK/early-match")
+for i in range(20000):
+    print(f"noise-{i}")
+PY
+    else
+      command git "$@"
+    fi
+  }
+  if worktree_is_registered /fake/repo "$WORK/early-match"; then
+    exit 0
+  fi
+  exit 1
+)
+if (( $? == 0 )); then
+  registration_state=match
+else
+  registration_state=mismatch
+fi
+check "early registration under pipefail -> match" "match" "$registration_state"
+
+# --- Case 10: only one apply owner can hold the run lock ---------------------
+LOCK_PATH="$WORK/reaper.lock"
+(
+  exec 9>"$LOCK_PATH"
+  flock -n 9
+  sleep 3
+) &
+lock_holder=$!
+sleep 0.1
+RUN_LOCK="$LOCK_PATH"
+if acquire_apply_lock; then
+  lock_state=acquired
+else
+  lock_state=blocked
+fi
+check "concurrent apply lock -> blocked" "blocked" "$lock_state"
+kill "$lock_holder" 2>/dev/null || true
+wait "$lock_holder" 2>/dev/null || true
 
 echo
 if (( fail )); then

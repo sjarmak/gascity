@@ -33,6 +33,9 @@ set -uo pipefail
 
 CITY="${GC_STORE_ROOT:-/home/ds/gas-city}"
 AUDIT_LOG="${STALE_WORKTREE_AUDIT_LOG:-${CITY}/.gc/stale-worktree-reaper.log}"
+MANIFEST_DIR="${STALE_WORKTREE_MANIFEST_DIR:-${CITY}/.gc/stale-worktree-manifests}"
+RUN_LOCK="${STALE_WORKTREE_RUN_LOCK:-${CITY}/.gc/stale-worktree-reaper.lock}"
+PROC_ROOT="${STALE_WORKTREE_PROC_ROOT:-/proc}"
 STALE_THRESHOLD="${STALE_WORKTREE_THRESHOLD:-24h}"
 # Shorter threshold for adopt-pr-*/ship-* worktrees (mayor gc-431319): their PR is
 # merged/closed (still gated by the merge-into-default check below), so they are
@@ -45,6 +48,9 @@ NUDGE_MAYOR=0
 ONLY_RIG=""
 INCLUDE_UNLOCKED=0
 MAX_REMOVE=25
+RUN_MANIFEST=""
+PROCESS_UNREADABLE_CWD=0
+PROCESS_VISIBILITY_UNVERIFIED=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -62,6 +68,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 mkdir -p "$(dirname "$AUDIT_LOG")"
+
+acquire_apply_lock() {
+  mkdir -p "$(dirname "$RUN_LOCK")"
+  exec {RUN_LOCK_FD}>"$RUN_LOCK"
+  flock -n "$RUN_LOCK_FD"
+}
 
 threshold_to_seconds() {
   local t="$1" num unit
@@ -172,6 +184,7 @@ log_event() {
 
 declare -A RIG_PATHS ACTIVE_WORKDIRS ACTIVE_WORKDIRS_OK
 LIVE_PROCESS_PATHS=""
+LIVE_PROCESS_ARGS=""
 ACTIVE_REF_STATE="unknown"
 
 load_rig_paths() {
@@ -186,10 +199,41 @@ load_rig_paths() {
 }
 
 load_live_process_paths() {
-  local proc fd path
+  local proc fd path proc_uid state arg saw_arg
+  local own_uid
   LIVE_PROCESS_PATHS=""
-  for proc in /proc/[0-9]*; do
+  LIVE_PROCESS_ARGS=""
+  PROCESS_UNREADABLE_CWD=0
+  PROCESS_VISIBILITY_UNVERIFIED=0
+  own_uid=$(id -u)
+
+  for proc in "$PROC_ROOT"/[0-9]*; do
+    [[ -d "$proc" ]] || continue
+    proc_uid=$(stat -c '%u' "$proc" 2>/dev/null) || continue
+    [[ "$proc_uid" == "$own_uid" ]] || continue
+    state=$(awk '/^State:/{print $2; exit}' "$proc/status" 2>/dev/null) || state=""
+    [[ "$state" == "Z" ]] && continue
+
+    saw_arg=0
+    if [[ -r "$proc/cmdline" ]]; then
+      while IFS= read -r -d '' arg; do
+        [[ -n "$arg" ]] || continue
+        LIVE_PROCESS_ARGS+="$arg"$'\n'
+        saw_arg=1
+      done < "$proc/cmdline"
+    fi
+
     path=$(readlink "$proc/cwd" 2>/dev/null) || path=""
+    if [[ -n "$path" ]]; then
+      LIVE_PROCESS_PATHS+="$path"$'\n'
+    elif [[ -d "$proc" ]]; then
+      PROCESS_UNREADABLE_CWD=$((PROCESS_UNREADABLE_CWD + 1))
+      if (( saw_arg == 0 )); then
+        PROCESS_VISIBILITY_UNVERIFIED=$((PROCESS_VISIBILITY_UNVERIFIED + 1))
+      fi
+    fi
+
+    path=$(readlink "$proc/exe" 2>/dev/null) || path=""
     [[ -n "$path" ]] && LIVE_PROCESS_PATHS+="$path"$'\n'
     for fd in "$proc"/fd/*; do
       path=$(readlink "$fd" 2>/dev/null) || continue
@@ -199,11 +243,20 @@ load_live_process_paths() {
 }
 
 path_has_live_process() {
-  local wt=$1 path
+  local wt=$1 path arg
   while IFS= read -r path; do
     [[ "$path" == "$wt" || "$path" == "$wt/"* ]] && return 0
   done <<<"$LIVE_PROCESS_PATHS"
+  # A non-dumpable same-user process may hide its cwd from /proc readlink.
+  # Command arguments still expose common --cwd/path launch contracts.
+  while IFS= read -r arg; do
+    [[ -n "$arg" && "$arg" == *"$wt"* ]] && return 0
+  done <<<"$LIVE_PROCESS_ARGS"
   return 1
+}
+
+process_snapshot_complete() {
+  (( PROCESS_VISIBILITY_UNVERIFIED == 0 ))
 }
 
 load_active_workdirs() {
@@ -258,7 +311,147 @@ default_branch() {
   echo "main"
 }
 
-reaped=()        # rig|worktree|branch|reason
+start_manifest() {
+  mkdir -p "$MANIFEST_DIR"
+  local stamp
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  RUN_MANIFEST="$MANIFEST_DIR/${stamp}-$$.jsonl"
+  : > "$RUN_MANIFEST"
+  chmod 600 "$RUN_MANIFEST"
+}
+
+# Return a bounded summary of ignored artifacts without enumerating every file
+# in large build caches. `git status --ignored=matching` collapses fully ignored
+# directories (for example target/) into a single entry.
+ignored_artifact_summary() {
+  local wt=$1 entry rel size_kib
+  local -a summaries=()
+  while IFS= read -r -d '' entry; do
+    [[ "$entry" == "!! "* ]] || continue
+    rel=${entry:3}
+    size_kib=$(du -sk -- "$wt/$rel" 2>/dev/null | awk '{print $1}' | head -1)
+    [[ "$size_kib" =~ ^[0-9]+$ ]] || size_kib=0
+    summaries+=("$rel:${size_kib}KiB")
+    (( ${#summaries[@]} >= 20 )) && break
+  done < <(git -C "$wt" status --porcelain=v1 -z --ignored=matching \
+            --untracked-files=normal 2>/dev/null)
+
+  local IFS=';'
+  printf '%s' "${summaries[*]:-none}"
+}
+
+manifest_eligibility() {
+  local rig=$1 wt=$2 branch=$3 tip=$4 default_br=$5 default_sha=$6 size_kib=$7
+  local ignored_summary
+  ignored_summary=$(ignored_artifact_summary "$wt")
+  jq -cn \
+    --arg event "eligible" \
+    --arg ts "$(date -Iseconds)" \
+    --arg rig "$rig" \
+    --arg path "$wt" \
+    --arg branch "$branch" \
+    --arg tip_sha "$tip" \
+    --arg default_branch "$default_br" \
+    --arg default_sha "$default_sha" \
+    --arg ignored_summary "$ignored_summary" \
+    --argjson size_kib "$size_kib" \
+    --argjson unreadable_process_cwds "$PROCESS_UNREADABLE_CWD" \
+    '{event:$event,eligibility_ts:$ts,rig:$rig,path:$path,branch:$branch,tip_sha:$tip_sha,
+      default_branch:$default_branch,default_sha:$default_sha,size_kib:$size_kib,
+      ignored_artifacts:$ignored_summary,unreadable_process_cwds:$unreadable_process_cwds}' \
+    >> "$RUN_MANIFEST"
+}
+
+manifest_result() {
+  local rig=$1 wt=$2 branch=$3 tip=$4 result=$5 detail=${6:-}
+  jq -cn \
+    --arg event "result" \
+    --arg ts "$(date -Iseconds)" \
+    --arg rig "$rig" \
+    --arg path "$wt" \
+    --arg branch "$branch" \
+    --arg tip_sha "$tip" \
+    --arg removal_result "$result" \
+    --arg detail "$detail" \
+    '{event:$event,ts:$ts,rig:$rig,path:$path,branch:$branch,tip_sha:$tip_sha,
+      removal_result:$removal_result,detail:$detail}' \
+    >> "$RUN_MANIFEST"
+}
+
+CANDIDATE_MISMATCH=""
+
+worktree_is_registered() {
+  local rig_path=$1 wt=$2
+  # Consume the full porcelain stream. `grep -q` can close the pipe after an
+  # early match, making git exit on SIGPIPE and turning a true match into a
+  # false negative under `set -o pipefail`.
+  git -C "$rig_path" worktree list --porcelain 2>/dev/null \
+    | awk -v wanted="worktree $wt" '$0 == wanted { found=1 } END { exit !found }'
+}
+
+# Re-check immutable candidate identity and reachability immediately before
+# deletion. Any drift from the scan snapshot is a skip, not a best-effort reap.
+candidate_identity_matches() {
+  local rig_path=$1 wt=$2 branch=$3 scanned_tip=$4 default_br=$5 scanned_default_sha=$6
+  local actual_branch actual_tip branch_tip actual_default emptiness
+  CANDIDATE_MISMATCH=""
+
+  if ! worktree_is_registered "$rig_path" "$wt"; then
+    CANDIDATE_MISMATCH="worktree is no longer registered"
+    return 1
+  fi
+  actual_branch=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null) || actual_branch=""
+  if [[ "$actual_branch" != "$branch" ]]; then
+    CANDIDATE_MISMATCH="branch changed from $branch to ${actual_branch:-detached}"
+    return 1
+  fi
+  actual_tip=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || actual_tip=""
+  branch_tip=$(git -C "$rig_path" rev-parse "refs/heads/$branch" 2>/dev/null) || branch_tip=""
+  if [[ "$actual_tip" != "$scanned_tip" || "$branch_tip" != "$scanned_tip" ]]; then
+    CANDIDATE_MISMATCH="tip changed from $scanned_tip"
+    return 1
+  fi
+  actual_default=$(git -C "$rig_path" rev-parse "refs/heads/$default_br" 2>/dev/null) || actual_default=""
+  if [[ "$actual_default" != "$scanned_default_sha" ]]; then
+    CANDIDATE_MISMATCH="default branch changed from $scanned_default_sha"
+    return 1
+  fi
+  if ! git -C "$rig_path" merge-base --is-ancestor "$scanned_tip" "$scanned_default_sha" 2>/dev/null; then
+    CANDIDATE_MISMATCH="tip is no longer reachable from scanned default"
+    return 1
+  fi
+  emptiness=$(worktree_emptiness "$wt")
+  if [[ "$emptiness" != "clean" ]]; then
+    CANDIDATE_MISMATCH="worktree is no longer clean ($emptiness)"
+    return 1
+  fi
+}
+
+final_revalidate() {
+  local rig=$1 rig_path=$2 wt=$3 branch=$4 tip=$5 default_br=$6 default_sha=$7
+  if ! candidate_identity_matches "$rig_path" "$wt" "$branch" "$tip" "$default_br" "$default_sha"; then
+    return 1
+  fi
+
+  load_live_process_paths
+  if ! process_snapshot_complete; then
+    CANDIDATE_MISMATCH="process visibility incomplete for $PROCESS_VISIBILITY_UNVERIFIED live process(es)"
+    return 1
+  fi
+  if path_has_live_process "$wt"; then
+    CANDIDATE_MISMATCH="live process references worktree"
+    return 1
+  fi
+
+  unset 'ACTIVE_WORKDIRS_OK[$rig]' 'ACTIVE_WORKDIRS[$rig]'
+  active_workdir_state "$rig" "$rig_path" "$wt"
+  if [[ "$ACTIVE_REF_STATE" != "clear" ]]; then
+    CANDIDATE_MISMATCH="active bead reference state is $ACTIVE_REF_STATE"
+    return 1
+  fi
+}
+
+reaped=()        # rig|worktree|branch|tip|default-branch|default-sha|size-kib
 skipped=()       # rig|worktree|reason
 candidates=0
 
@@ -268,8 +461,13 @@ scan_rig() {
   [[ -n "$rig_path" ]] || return 0
   [[ -d "$rig_path/.git" || -f "$rig_path/.git" ]] || return 0
 
-  local default_br
+  local default_br default_sha
   default_br=$(default_branch "$rig_path")
+  default_sha=$(git -C "$rig_path" rev-parse "refs/heads/$default_br" 2>/dev/null) || {
+    log_event "skipped_rig_default_unresolved" "$rig" "$rig_path" \
+      "$(jq -cn --arg b "$default_br" '{default_branch:$b}')"
+    return 0
+  }
 
   # Walk all worktrees registered in this rig (excluding the primary one).
   while IFS= read -r wt_path; do
@@ -350,9 +548,17 @@ scan_rig() {
       skipped+=("$rig|$wt_path|detached-head")
       continue
     fi
-    local tip
-    tip=$(git -C "$rig_path" rev-parse "$branch" 2>/dev/null) || continue
-    if ! git -C "$rig_path" merge-base --is-ancestor "$tip" "$default_br" 2>/dev/null; then
+    local tip head_tip
+    tip=$(git -C "$rig_path" rev-parse "refs/heads/$branch" 2>/dev/null) || continue
+    head_tip=$(git -C "$wt_path" rev-parse HEAD 2>/dev/null) || continue
+    if [[ "$tip" != "$head_tip" ]]; then
+      log_event "skipped_tip_mismatch" "$rig" "$wt_path" \
+        "$(jq -cn --arg b "$branch" --arg bt "$tip" --arg ht "$head_tip" \
+              '{branch:$b, branch_tip:$bt, head_tip:$ht}')"
+      skipped+=("$rig|$wt_path|tip-mismatch")
+      continue
+    fi
+    if ! git -C "$rig_path" merge-base --is-ancestor "$tip" "$default_sha" 2>/dev/null; then
       log_event "skipped_unmerged" "$rig" "$wt_path" \
         "$(jq -cn --arg b "$branch" --arg db "$default_br" \
               '{branch:$b, default_branch:$db}')"
@@ -363,11 +569,13 @@ scan_rig() {
     local size_kib
     size_kib=$(timeout 30 du -sk "$wt_path" 2>/dev/null | awk '{print $1}')
     [[ "$size_kib" =~ ^[0-9]+$ ]] || size_kib=0
-    reaped+=("$rig|$wt_path|$branch|$size_kib")
+    reaped+=("$rig|$wt_path|$branch|$tip|$default_br|$default_sha|$size_kib")
     log_event "stale_worktree_detected" "$rig" "$wt_path" \
-      "$(jq -cn --arg b "$branch" --arg db "$default_br" --arg t "$STALE_THRESHOLD" \
+      "$(jq -cn --arg b "$branch" --arg tip "$tip" --arg db "$default_br" \
+                  --arg ds "$default_sha" --arg t "$STALE_THRESHOLD" \
                   --argjson kib "$size_kib" \
-            '{branch:$b, default_branch:$db, threshold:$t, size_kib:$kib}')"
+            '{branch:$b, tip_sha:$tip, default_branch:$db, default_sha:$ds,
+              threshold:$t, size_kib:$kib}')"
   done < <(git -C "$rig_path" worktree list --porcelain 2>/dev/null \
            | sed -n 's/^worktree //p')
 }
@@ -382,8 +590,19 @@ fi
   echo "stale-worktree-reaper: --max-remove must be a positive integer" >&2
   exit 2
 }
+if (( APPLY )) && ! acquire_apply_lock; then
+  echo "stale-worktree-reaper: another apply run is active; exiting safely" >&2
+  log_event "apply_already_running" "city" "$RUN_LOCK" '{}'
+  exit 0
+fi
 load_rig_paths || exit 1
 load_live_process_paths
+if (( APPLY )) && ! process_snapshot_complete; then
+  echo "stale-worktree-reaper: process visibility incomplete for $PROCESS_VISIBILITY_UNVERIFIED live process(es); refusing apply" >&2
+  log_event "apply_process_visibility_incomplete" "city" "$PROC_ROOT" \
+    "$(jq -cn --argjson n "$PROCESS_VISIBILITY_UNVERIFIED" '{unverified_processes:$n}')"
+  exit 1
+fi
 
 if [[ -n "$ONLY_RIG" ]]; then
   scan_rig "$ONLY_RIG"
@@ -397,7 +616,7 @@ fi
 # newline-delimited and worktree paths containing newlines are unsupported by
 # git's own porcelain parser above; spaces remain intact.
 if (( ${#reaped[@]} > 1 )); then
-  mapfile -t reaped < <(printf '%s\n' "${reaped[@]}" | sort -t'|' -k4,4nr)
+  mapfile -t reaped < <(printf '%s\n' "${reaped[@]}" | sort -t'|' -k7,7nr)
 fi
 
 count=${#reaped[@]}
@@ -411,7 +630,7 @@ trap 'rm -f "$out"' EXIT
     printf '%-22s %-60s %-28s %10s\n' RIG WORKTREE BRANCH GiB
     printf '%-22s %-60s %-28s %10s\n' --- -------- ------ ---
     for row in "${reaped[@]}"; do
-      IFS='|' read -r rig wt branch size_kib <<<"$row"
+      IFS='|' read -r rig wt branch tip default_br default_sha size_kib <<<"$row"
       size_gib=$(awk -v kib="$size_kib" 'BEGIN {printf "%.1f", kib/1048576}')
       printf '%-22s %-60s %-28s %10s\n' "$rig" "$wt" "$branch" "$size_gib"
     done
@@ -428,49 +647,80 @@ cat "$out"
 
 reaped_ok=0
 if (( APPLY )) && (( count > 0 )); then
+  start_manifest
   for row in "${reaped[@]}"; do
     (( reaped_ok >= MAX_REMOVE )) && break
-    IFS='|' read -r rig wt branch size_kib <<<"$row"
+    IFS='|' read -r rig wt branch tip default_br default_sha size_kib <<<"$row"
     rig_path=${RIG_PATHS[$rig]}
-    # Eligibility may be minutes old after a fleet scan. Refresh both dynamic
-    # gates immediately before each removal and fail closed on store errors.
-    unset 'ACTIVE_WORKDIRS_OK[$rig]' 'ACTIVE_WORKDIRS[$rig]'
-    active_workdir_state "$rig" "$rig_path" "$wt"
-    if [[ "$ACTIVE_REF_STATE" != "clear" ]]; then
-      log_event "reap_skipped_final_active_reference" "$rig" "$wt" \
-        "$(jq -cn --arg state "$ACTIVE_REF_STATE" '{state:$state}')"
+
+    # Eligibility may be minutes old after a fleet scan. Revalidate the exact
+    # registered worktree, tip, default SHA, clean state, processes and beads.
+    if ! final_revalidate "$rig" "$rig_path" "$wt" "$branch" "$tip" "$default_br" "$default_sha"; then
+      log_event "reap_skipped_final_revalidation" "$rig" "$wt" \
+        "$(jq -cn --arg reason "$CANDIDATE_MISMATCH" --arg tip "$tip" \
+              '{reason:$reason, tip_sha:$tip}')"
+      manifest_eligibility "$rig" "$wt" "$branch" "$tip" "$default_br" "$default_sha" "$size_kib"
+      manifest_result "$rig" "$wt" "$branch" "$tip" "skipped" "$CANDIDATE_MISMATCH"
       continue
     fi
-    # Bead refresh can take up to 90s; snapshot process paths after it so a
-    # newly entered worktree cannot hide in that query window.
-    load_live_process_paths
-    if path_has_live_process "$wt"; then
-      log_event "reap_skipped_final_live_process" "$rig" "$wt" '{}'
+
+    # Persist the complete recovery record before the destructive operation.
+    manifest_eligibility "$rig" "$wt" "$branch" "$tip" "$default_br" "$default_sha" "$size_kib"
+
+    # Manifest collection can touch a large ignored cache. Close that window
+    # with one final exact revalidation immediately before removal.
+    if ! final_revalidate "$rig" "$rig_path" "$wt" "$branch" "$tip" "$default_br" "$default_sha"; then
+      log_event "reap_skipped_post_manifest_revalidation" "$rig" "$wt" \
+        "$(jq -cn --arg reason "$CANDIDATE_MISMATCH" --arg tip "$tip" \
+              '{reason:$reason, tip_sha:$tip}')"
+      manifest_result "$rig" "$wt" "$branch" "$tip" "skipped" "$CANDIDATE_MISMATCH"
       continue
     fi
+
+    local_porcelain=$(git -C "$rig_path" worktree list --porcelain 2>/dev/null \
+      | awk -v p="$wt" 'BEGIN{found=0} /^worktree / {found=(substr($0,10)==p)} found {print}')
+    was_locked=0
+    grep -q '^locked' <<<"$local_porcelain" && was_locked=1
     git -C "$rig_path" worktree unlock "$wt" 2>/dev/null || true
     # No --force: git performs a final clean-state check at deletion time.
     # Keep the branch ref as a cheap audit/recovery trail.
     if git -C "$rig_path" worktree remove "$wt" 2>/dev/null; then
       reaped_ok=$((reaped_ok + 1))
+      retained_tip=$(git -C "$rig_path" rev-parse "refs/heads/$branch" 2>/dev/null || true)
+      branch_retained_exact=false
+      [[ "$retained_tip" == "$tip" ]] && branch_retained_exact=true
       log_event "stale_worktree_reaped" "$rig" "$wt" \
-        "$(jq -cn --arg b "$branch" --argjson kib "$size_kib" \
-              '{branch:$b, size_kib:$kib, branch_retained:true}')"
+        "$(jq -cn --arg b "$branch" --arg tip "$tip" --arg retained "$retained_tip" \
+                    --argjson kib "$size_kib" --argjson exact "$branch_retained_exact" \
+              '{branch:$b, tip_sha:$tip, retained_tip_sha:$retained, size_kib:$kib,
+                branch_retained_exact:$exact}')"
+      manifest_result "$rig" "$wt" "$branch" "$tip" "removed" \
+        "branch_retained_exact=$branch_retained_exact retained_tip=$retained_tip"
     else
+      if (( was_locked )) && worktree_is_registered "$rig_path" "$wt"; then
+        git -C "$rig_path" worktree lock --reason "stale-worktree-reaper removal failed" "$wt" 2>/dev/null || true
+      fi
       log_event "reap_failed" "$rig" "$wt" \
-        "$(jq -cn --arg b "$branch" '{branch:$b}')"
+        "$(jq -cn --arg b "$branch" --arg tip "$tip" '{branch:$b, tip_sha:$tip}')"
+      manifest_result "$rig" "$wt" "$branch" "$tip" "failed" "git worktree remove refused"
     fi
   done
   echo
   echo "Reaped $reaped_ok of $count worktree(s); branch refs retained."
+  echo "Manifest: $RUN_MANIFEST"
 fi
 
 if (( NUDGE_MAYOR )) && (( count > 0 )); then
+  if (( APPLY )); then
+    action="Autonomous bounded pruning reaped $reaped_ok worktree(s). Manifest: $RUN_MANIFEST"
+  else
+    action="Dry-run only; use --apply after the autonomous safety audit."
+  fi
   msg="stale-worktree-reaper: $count stale worktree(s) detected
 $(cat "$out")
 
 Likely cause: orchestrator process died before reaching its worktree-teardown phase.
-Run 'stale-worktree-reaper --apply' to clean up.
+$action
 Tracking upstream as gascity gc-1b2 (worktree side currently out of scope)."
   gc session nudge mayor "$msg" 2>/dev/null \
     || echo "warn: gc session nudge mayor failed; report still in audit log" >&2

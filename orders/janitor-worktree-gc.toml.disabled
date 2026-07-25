@@ -1,3 +1,4 @@
+# Disabled 2026-07-25: stale-worktree-reaper is the sole cleanup owner.
 # Janitor patrol 1/2: worktree GC.
 # STAGED PROPOSAL - install by copying into <city>/orders/ (see README.md).
 # Order name comes from the file basename: janitor-worktree-gc.
