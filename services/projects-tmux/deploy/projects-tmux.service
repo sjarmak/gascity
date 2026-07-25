@@ -1,0 +1,13 @@
+[Unit]
+Description=Persistent tmux server for interactive project sessions
+ConditionFileIsExecutable=/usr/bin/tmux
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tmux -D -L projects
+Restart=on-failure
+RestartSec=2
+UnsetEnvironment=GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AMP_API_KEY SLACK_TOKEN SLACK_BOT_TOKEN
+
+[Install]
+WantedBy=default.target

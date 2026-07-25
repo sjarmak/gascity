@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# pmux — create or reopen a standard tmux cockpit for any working directory.
+#
+# Project sessions live on the dedicated "projects" socket. Gas City's
+# supervisor owns the "ds-research" socket and must never see these sessions.
+
+set -euo pipefail
+
+readonly DEFAULT_SOCKET="projects"
+readonly -a STANDARD_WINDOWS=(shell codex claude amp)
+
+SOCKET="${PMUX_SOCKET:-$DEFAULT_SOCKET}"
+TARGET_INPUT="."
+TARGET_SET=0
+TARGET_DIR=""
+SESSION_NAME=""
+EXPLICIT_NAME=""
+REQUESTED_WINDOW=""
+ATTACH=1
+PRINT_NAME=0
+
+usage() {
+  cat <<'EOF'
+Usage: pmux [PATH] [OPTIONS]
+       pmux list
+
+Create or reopen a four-window project cockpit on the dedicated "projects"
+tmux socket. PATH defaults to the current directory and resolves to the current
+Git worktree root when applicable.
+
+Windows:
+  shell   General project shell
+  codex   Shell reserved for Codex
+  claude  Shell reserved for Claude Code
+  amp     Shell reserved for Amp
+
+Options:
+  --name NAME       Use an explicit session name
+  --window NAME     Select shell, codex, claude, or amp
+  --no-attach       Create or repair the session without attaching
+  --print-name      Print the resolved session name without touching tmux
+  -h, --help        Show this help
+
+Examples:
+  pmux
+  pmux ~/projects/mem --window codex
+  pmux ~/projects/mem --name mem-main
+  pmux list
+
+Detach from tmux with Ctrl-b d. Resume an exited agent in its window with
+"codex resume --last", "claude --continue", or "amp last".
+EOF
+}
+
+die() {
+  local code="$1"
+  shift
+  printf 'pmux: %s\n' "$*" >&2
+  exit "$code"
+}
+
+parse_args() {
+  while (( $# > 0 )); do
+    case "$1" in
+      --name)
+        (( $# >= 2 )) || die 2 "--name requires a value"
+        EXPLICIT_NAME="$2"
+        shift 2
+        ;;
+      --name=*)
+        EXPLICIT_NAME="${1#*=}"
+        shift
+        ;;
+      --window)
+        (( $# >= 2 )) || die 2 "--window requires a value"
+        REQUESTED_WINDOW="$2"
+        shift 2
+        ;;
+      --window=*)
+        REQUESTED_WINDOW="${1#*=}"
+        shift
+        ;;
+      --no-attach)
+        ATTACH=0
+        shift
+        ;;
+      --print-name)
+        PRINT_NAME=1
+        ATTACH=0
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -*)
+        die 2 "unknown option: $1"
+        ;;
+      *)
+        (( TARGET_SET == 0 )) || die 2 "only one project path may be provided"
+        TARGET_INPUT="$1"
+        TARGET_SET=1
+        shift
+        ;;
+    esac
+  done
+}
+
+validate_socket() {
+  [[ "$SOCKET" =~ ^[A-Za-z0-9_-]+$ ]] \
+    || die 2 "invalid socket name: $SOCKET"
+  [[ "$SOCKET" != "ds-research" ]] \
+    || die 2 "ds-research is supervisor-owned; use the projects socket"
+}
+
+validate_window() {
+  [[ -z "$REQUESTED_WINDOW" ]] && return
+
+  local window
+  for window in "${STANDARD_WINDOWS[@]}"; do
+    [[ "$REQUESTED_WINDOW" == "$window" ]] && return
+  done
+  die 2 "unknown window '$REQUESTED_WINDOW' (expected: shell, codex, claude, amp)"
+}
+
+resolve_target() {
+  [[ -d "$TARGET_INPUT" ]] || die 2 "not a directory: $TARGET_INPUT"
+
+  local canonical git_root
+  canonical="$(cd "$TARGET_INPUT" && pwd -P)"
+  git_root="$(git -C "$canonical" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$git_root" ]]; then
+    canonical="$(cd "$git_root" && pwd -P)"
+  fi
+  TARGET_DIR="$canonical"
+}
+
+validate_explicit_name() {
+  [[ "$EXPLICIT_NAME" =~ ^[A-Za-z0-9_-]+$ ]] \
+    || die 2 "invalid session name '$EXPLICIT_NAME'; use letters, digits, _ or -"
+}
+
+derive_session_name() {
+  if [[ -n "$EXPLICIT_NAME" ]]; then
+    validate_explicit_name
+    SESSION_NAME="$EXPLICIT_NAME"
+    return
+  fi
+
+  command -v sha256sum >/dev/null 2>&1 \
+    || die 1 "sha256sum is required to derive stable session names"
+
+  local base safe path_hash
+  base="$(basename "$TARGET_DIR")"
+  safe="$(printf '%s' "$base" \
+    | sed 's/[^A-Za-z0-9_-]/-/g; s/-\{2,\}/-/g; s/^-//; s/-$//')"
+  [[ -n "$safe" ]] || safe="project"
+  path_hash="$(printf '%s' "$TARGET_DIR" | sha256sum)"
+  SESSION_NAME="${safe}-${path_hash:0:8}"
+}
+
+tmux_run() {
+  tmux -L "$SOCKET" "$@"
+}
+
+session_exists() {
+  tmux_run has-session -t "$SESSION_NAME" 2>/dev/null
+}
+
+window_exists() {
+  local wanted="$1"
+  tmux_run list-windows -t "$SESSION_NAME" -F '#{window_name}' \
+    | grep -Fxq "$wanted"
+}
+
+scrub_server_secrets() {
+  local variable
+  for variable in \
+    GITHUB_TOKEN GH_TOKEN \
+    OPENAI_API_KEY ANTHROPIC_API_KEY AMP_API_KEY \
+    SLACK_TOKEN SLACK_BOT_TOKEN; do
+    tmux_run set-environment -gu "$variable" \
+      || die 1 "failed to remove $variable from the tmux server environment"
+  done
+}
+
+create_session() {
+  local -a clean_environment=(
+    env
+    -u GITHUB_TOKEN
+    -u GH_TOKEN
+    -u OPENAI_API_KEY
+    -u ANTHROPIC_API_KEY
+    -u AMP_API_KEY
+    -u SLACK_TOKEN
+    -u SLACK_BOT_TOKEN
+  )
+
+  if ! "${clean_environment[@]}" tmux -L "$SOCKET" new-session \
+    -d -s "$SESSION_NAME" -n shell -c "$TARGET_DIR"; then
+    session_exists \
+      || die 1 "failed to create tmux session '$SESSION_NAME'"
+    verify_session_path
+    return
+  fi
+
+  tmux_run set-option -t "$SESSION_NAME" @pmux_path "$TARGET_DIR"
+  tmux_run set-window-option -t "$SESSION_NAME:shell" automatic-rename off
+}
+
+verify_session_path() {
+  local recorded
+  recorded="$(tmux_run show-options -qv -t "$SESSION_NAME" @pmux_path)"
+  [[ "$recorded" == "$TARGET_DIR" ]] || {
+    [[ -n "$recorded" ]] \
+      && die 1 "session '$SESSION_NAME' belongs to $recorded, not $TARGET_DIR"
+    die 1 "session '$SESSION_NAME' exists but is not managed by pmux"
+  }
+}
+
+ensure_window() {
+  local window="$1"
+  if ! window_exists "$window"; then
+    tmux_run new-window -d -t "$SESSION_NAME" -n "$window" -c "$TARGET_DIR"
+  fi
+  tmux_run set-window-option \
+    -t "$SESSION_NAME:$window" automatic-rename off
+}
+
+ensure_project_session() {
+  command -v tmux >/dev/null 2>&1 || die 1 "tmux is not installed"
+
+  local created=0 window
+  if session_exists; then
+    verify_session_path
+  else
+    create_session
+    created=1
+  fi
+
+  tmux_run set-option -t "$SESSION_NAME" @pmux_managed "1"
+  scrub_server_secrets
+
+  for window in "${STANDARD_WINDOWS[@]}"; do
+    ensure_window "$window"
+  done
+
+  if [[ -n "$REQUESTED_WINDOW" ]]; then
+    tmux_run select-window -t "$SESSION_NAME:$REQUESTED_WINDOW"
+  elif (( created == 1 )); then
+    tmux_run select-window -t "$SESSION_NAME:shell"
+  fi
+}
+
+list_sessions() {
+  command -v tmux >/dev/null 2>&1 || die 1 "tmux is not installed"
+
+  local names
+  if ! names="$(tmux_run list-sessions -F '#{session_name}' 2>/dev/null)"; then
+    printf 'No project sessions.\n'
+    return
+  fi
+
+  local name managed path metrics windows attached found=0
+  while IFS= read -r name; do
+    managed="$(tmux_run show-options -qv -t "$name" @pmux_managed)"
+    [[ "$managed" == "1" ]] || continue
+    path="$(tmux_run show-options -qv -t "$name" @pmux_path)"
+    metrics="$(tmux_run display-message -p -t "$name" \
+      '#{session_windows}|#{session_attached}')"
+    IFS='|' read -r windows attached <<<"$metrics"
+    if (( found == 0 )); then
+      printf 'SESSION\tWINDOWS\tATTACHED\tPATH\n'
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$name" "$windows" "$attached" "$path"
+    found=1
+  done <<<"$names"
+
+  (( found == 1 )) || printf 'No project sessions.\n'
+}
+
+attach_session() {
+  if [[ -n "${TMUX:-}" ]]; then
+    local current_socket target_socket
+    current_socket="${TMUX%%,*}"
+    target_socket="$(tmux_run display-message \
+      -p -t "$SESSION_NAME" '#{socket_path}')"
+    if [[ "$current_socket" == "$target_socket" ]]; then
+      tmux_run switch-client -t "$SESSION_NAME"
+      return
+    fi
+    die 1 "already inside tmux on another socket; detach first, then run: pmux '$TARGET_DIR'"
+  fi
+
+  exec tmux -L "$SOCKET" attach-session -t "$SESSION_NAME"
+}
+
+main() {
+  if [[ "${1:-}" == "list" ]]; then
+    shift
+    (( $# == 0 )) || die 2 "'list' does not accept additional arguments"
+    validate_socket
+    list_sessions
+    return
+  else
+    parse_args "$@"
+  fi
+  validate_socket
+
+  validate_window
+  resolve_target
+  derive_session_name
+
+  if (( PRINT_NAME == 1 )); then
+    printf '%s\n' "$SESSION_NAME"
+    return
+  fi
+
+  ensure_project_session
+  if (( ATTACH == 0 )); then
+    printf '%s\t%s\n' "$SESSION_NAME" "$TARGET_DIR"
+    return
+  fi
+  attach_session
+}
+
+main "$@"

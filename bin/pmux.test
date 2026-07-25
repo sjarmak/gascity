@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# pmux.test — unit, integration, and end-to-end coverage for project tmux.
+#
+# The suite uses a unique tmux socket under a temporary TMUX_TMPDIR. It never
+# connects to the default socket or Gas City's supervisor-owned ds-research
+# socket.
+
+set -uo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PMUX="${BIN_DIR}/pmux"
+UNIT="${BIN_DIR}/../services/projects-tmux/deploy/projects-tmux.service"
+WORK="$(mktemp -d)"
+SOCKET="pmux-test-$$"
+TMUX_DIR="${WORK}/tmux"
+PASS=0
+FAIL=0
+
+mkdir -m 0700 "$TMUX_DIR"
+
+cleanup() {
+  TMUX_TMPDIR="$TMUX_DIR" tmux -L "$SOCKET" kill-server >/dev/null 2>&1 || true
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+ok() {
+  PASS=$((PASS + 1))
+  printf '  ok   %s\n' "$1"
+}
+
+bad() {
+  FAIL=$((FAIL + 1))
+  printf '  FAIL %s\n' "$1"
+  [[ -z "${2:-}" ]] || printf '       %s\n' "$2"
+}
+
+run_pmux() {
+  PMUX_SOCKET="$SOCKET" TMUX_TMPDIR="$TMUX_DIR" bash "$PMUX" "$@"
+}
+
+tmux_test() {
+  TMUX_TMPDIR="$TMUX_DIR" tmux -L "$SOCKET" "$@"
+}
+
+PROJECT="${WORK}/Repo With Spaces"
+NESTED="${PROJECT}/src/deep"
+mkdir -p "$NESTED"
+git init -q -b main "$PROJECT"
+PROJECT="$(cd "$PROJECT" && pwd -P)"
+PATH_HASH="$(printf '%s' "$PROJECT" | sha256sum | cut -c1-8)"
+EXPECTED_NAME="Repo-With-Spaces-${PATH_HASH}"
+
+printf 'unit:\n'
+
+out="$(run_pmux --help 2>&1)"; rc=$?
+if (( rc == 0 )) && grep -q '^Usage: pmux' <<<"$out"; then
+  ok "help documents the launcher"
+else
+  bad "help documents the launcher" "rc=$rc out=$out"
+fi
+
+out="$(run_pmux --print-name "$NESTED" 2>&1)"; rc=$?
+if (( rc == 0 )) && [[ "$out" == "$EXPECTED_NAME" ]]; then
+  ok "nested paths resolve to a stable worktree-root session name"
+else
+  bad "nested paths resolve to a stable worktree-root session name" \
+    "rc=$rc expected=$EXPECTED_NAME out=$out"
+fi
+
+out="$(run_pmux --name research-main --print-name "$PROJECT" 2>&1)"; rc=$?
+if (( rc == 0 )) && [[ "$out" == "research-main" ]]; then
+  ok "an explicit valid session name wins"
+else
+  bad "an explicit valid session name wins" "rc=$rc out=$out"
+fi
+
+out="$(run_pmux --name 'bad:name' --print-name "$PROJECT" 2>&1)"; rc=$?
+if (( rc == 2 )) && grep -q 'invalid session name' <<<"$out"; then
+  ok "invalid explicit session names fail clearly"
+else
+  bad "invalid explicit session names fail clearly" "rc=$rc out=$out"
+fi
+
+out="$(run_pmux "${WORK}/missing" 2>&1)"; rc=$?
+if (( rc == 2 )) && grep -q 'not a directory' <<<"$out"; then
+  ok "missing project directories fail clearly"
+else
+  bad "missing project directories fail clearly" "rc=$rc out=$out"
+fi
+
+out="$(run_pmux --window editor --no-attach "$PROJECT" 2>&1)"; rc=$?
+if (( rc == 2 )) && grep -q 'unknown window' <<<"$out"; then
+  ok "unknown standard windows are rejected"
+else
+  bad "unknown standard windows are rejected" "rc=$rc out=$out"
+fi
+
+out="$(PMUX_SOCKET=ds-research TMUX_TMPDIR="$TMUX_DIR" bash "$PMUX" \
+  --no-attach "$PROJECT" 2>&1)"; rc=$?
+if (( rc == 2 )) && grep -q 'supervisor-owned' <<<"$out"; then
+  ok "the Gas City socket is rejected before any tmux mutation"
+else
+  bad "the Gas City socket is rejected before any tmux mutation" "rc=$rc out=$out"
+fi
+
+printf 'integration:\n'
+
+out="$(GITHUB_TOKEN=fixture-github-token AMP_API_KEY=fixture-amp-token \
+  run_pmux --no-attach "$PROJECT" 2>&1)"; rc=$?
+if (( rc == 0 )) && tmux_test has-session -t "$EXPECTED_NAME" 2>/dev/null; then
+  ok "a detached project session is created on the isolated socket"
+else
+  bad "a detached project session is created on the isolated socket" \
+    "rc=$rc out=$out"
+fi
+
+windows="$(tmux_test list-windows -t "$EXPECTED_NAME" -F '#{window_name}' 2>&1 | sort)"
+expected_windows=$'amp\nclaude\ncodex\nshell'
+if [[ "$windows" == "$expected_windows" ]]; then
+  ok "the standard shell, Codex, Claude, and Amp windows exist"
+else
+  bad "the standard shell, Codex, Claude, and Amp windows exist" \
+    "windows=[$windows]"
+fi
+
+paths="$(tmux_test list-panes -s -t "$EXPECTED_NAME" -F '#{pane_current_path}' | sort -u)"
+if [[ "$paths" == "$PROJECT" ]]; then
+  ok "every standard window starts at the worktree root"
+else
+  bad "every standard window starts at the worktree root" "paths=[$paths]"
+fi
+
+recorded_path="$(tmux_test show-options -qv -t "$EXPECTED_NAME" @pmux_path)"
+if [[ "$recorded_path" == "$PROJECT" ]]; then
+  ok "the session records its canonical project path"
+else
+  bad "the session records its canonical project path" "path=[$recorded_path]"
+fi
+
+if ! tmux_test show-environment -g GITHUB_TOKEN 2>/dev/null \
+    | grep -q '^GITHUB_TOKEN=' \
+  && ! tmux_test show-environment -g AMP_API_KEY 2>/dev/null \
+    | grep -q '^AMP_API_KEY='; then
+  ok "new long-lived servers do not retain launcher credentials"
+else
+  bad "new long-lived servers do not retain launcher credentials"
+fi
+
+OTHER_PROJECT="${WORK}/Other Project"
+mkdir -p "$OTHER_PROJECT"
+out="$(run_pmux --name "$EXPECTED_NAME" --no-attach "$OTHER_PROJECT" 2>&1)"; rc=$?
+if (( rc == 1 )) && grep -q "belongs to $PROJECT" <<<"$out"; then
+  ok "an explicit name cannot silently adopt another project's session"
+else
+  bad "an explicit name cannot silently adopt another project's session" \
+    "rc=$rc out=$out"
+fi
+
+run_pmux --no-attach "$PROJECT" >/dev/null 2>&1
+window_count="$(tmux_test list-windows -t "$EXPECTED_NAME" -F '#{window_id}' | wc -l)"
+if [[ "$window_count" -eq 4 ]]; then
+  ok "reopening a project is idempotent"
+else
+  bad "reopening a project is idempotent" "window_count=$window_count"
+fi
+
+tmux_test kill-window -t "${EXPECTED_NAME}:amp"
+run_pmux --no-attach "$PROJECT" >/dev/null 2>&1
+if tmux_test list-windows -t "$EXPECTED_NAME" -F '#{window_name}' | grep -qx amp; then
+  ok "reopening repairs a missing standard window"
+else
+  bad "reopening repairs a missing standard window"
+fi
+
+printf 'end-to-end:\n'
+
+out="$(run_pmux --window claude --no-attach "$NESTED" 2>&1)"; rc=$?
+selected="$(tmux_test display-message -p -t "$EXPECTED_NAME" '#{session_windows}:#{window_name}')"
+if (( rc == 0 )) && [[ "$selected" == "4:claude" ]]; then
+  ok "a nested-directory launch reuses the session and selects the requested agent"
+else
+  bad "a nested-directory launch reuses the session and selects the requested agent" \
+    "rc=$rc selected=$selected out=$out"
+fi
+
+tmux_test new-session -d -s unmanaged-infrastructure -n keepalive \
+  /usr/bin/sleep infinity
+out="$(run_pmux list 2>&1)"; rc=$?
+if (( rc == 0 )) \
+  && grep -q "$EXPECTED_NAME" <<<"$out" \
+  && grep -q "$PROJECT" <<<"$out" \
+  && ! grep -q 'unmanaged-infrastructure' <<<"$out"; then
+  ok "list shows project sessions with their paths and hides infrastructure"
+else
+  bad "list shows project sessions with their paths and hides infrastructure" \
+    "rc=$rc out=$out"
+fi
+
+unit_verify="$(systemd-analyze verify "$UNIT" 2>&1)"; rc=$?
+if [[ -f "$UNIT" ]] \
+  && grep -q '^Type=simple$' "$UNIT" \
+  && grep -q '^ExecStart=/usr/bin/tmux -D -L projects$' "$UNIT" \
+  && grep -q '^ConditionFileIsExecutable=/usr/bin/tmux$' "$UNIT" \
+  && ! grep -q 'ds-research' "$UNIT" \
+  && (( rc == 0 )) \
+  && [[ -z "$unit_verify" ]]; then
+  ok "the user service owns a valid foreground projects-socket server"
+else
+  bad "the user service owns a valid foreground projects-socket server" \
+    "rc=$rc verify=$unit_verify"
+fi
+
+printf '\npmux.test: %d passed, %d failed\n' "$PASS" "$FAIL"
+(( FAIL == 0 ))
