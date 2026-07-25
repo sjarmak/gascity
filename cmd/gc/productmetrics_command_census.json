@@ -2525,16 +2525,16 @@
       "path": "gc nudge drain",
       "aliases": [],
       "conditional_modes": [],
-      "hidden": true,
-      "effective_hidden": true,
+      "hidden": false,
+      "effective_hidden": false,
       "disable_flag_parsing": false,
       "shape": "runnable",
       "classification": "excluded",
       "notice_policy": "ineligible",
       "recording_policy": "excluded",
       "owner": "excluded",
-      "mode": "hidden-private",
-      "exclusion": "hidden-private"
+      "mode": "hook-protocol",
+      "exclusion": "hook-protocol"
     },
     {
       "path": "gc nudge poll",

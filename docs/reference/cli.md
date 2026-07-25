@@ -2574,7 +2574,35 @@ gc nudge
 
 | Subcommand | Description |
 |------------|-------------|
+| [gc nudge drain](#gc-nudge-drain) | Deliver queued nudges for a session and report what was delivered |
 | [gc nudge status](#gc-nudge-status) | Show queued and dead-letter nudges for a session |
+
+## gc nudge drain
+
+Deliver queued nudges for a session and report what was delivered.
+
+Deferred nudges accumulate while the target agent is asleep or is not yet at a
+safe interactive boundary. Draining is the supported way to flush that queue by
+hand; runtime hooks also call it automatically at each turn boundary.
+
+The session defaults to $GC_ALIAS or $GC_SESSION_ID when run inside a session;
+otherwise pass an alias or session id as the argument. On the plain (non
+--inject) path the command prints a delivery receipt to stderr and exits
+non-zero when no nudge was due, so scripts can tell an empty queue from a
+delivery.
+
+--inject emits &lt;system-reminder&gt; output for hook consumption instead of the
+plain runtime message and stays fail-open (exit 0) so a session is never wedged
+by a delivery hiccup.
+
+```
+gc nudge drain [session] [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--hook-format` | string |  | format hook output for a provider |
+| `--inject` | bool |  | emit &lt;system-reminder&gt; output for hook injection |
 
 ## gc nudge status
 

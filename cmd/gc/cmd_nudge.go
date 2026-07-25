@@ -275,11 +275,24 @@ func newNudgeDrainCmd(stdout, stderr io.Writer) *cobra.Command {
 	var inject bool
 	var hookFormat string
 	cmd := &cobra.Command{
-		Use:    "drain [session]",
-		Short:  "Deliver queued nudges for a session",
-		Long:   "Deliver queued nudges for a session. Used by runtime hooks.",
-		Args:   cobra.MaximumNArgs(1),
-		Hidden: true,
+		Use:   "drain [session]",
+		Short: "Deliver queued nudges for a session and report what was delivered",
+		Long: `Deliver queued nudges for a session and report what was delivered.
+
+Deferred nudges accumulate while the target agent is asleep or is not yet at a
+safe interactive boundary. Draining is the supported way to flush that queue by
+hand; runtime hooks also call it automatically at each turn boundary.
+
+The session defaults to $GC_ALIAS or $GC_SESSION_ID when run inside a session;
+otherwise pass an alias or session id as the argument. On the plain (non
+--inject) path the command prints a delivery receipt to stderr and exits
+non-zero when no nudge was due, so scripts can tell an empty queue from a
+delivery.
+
+--inject emits <system-reminder> output for hook consumption instead of the
+plain runtime message and stays fail-open (exit 0) so a session is never wedged
+by a delivery hiccup.`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if cmdNudgeDrainWithFormat(args, inject, hookFormat, stdout, stderr) != 0 {
 				return errExit
@@ -467,6 +480,7 @@ func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdo
 		if inject {
 			return 0
 		}
+		fmt.Fprintf(stderr, "gc nudge drain: no nudges due for %s\n", target.agentKey()) //nolint:errcheck
 		return 1
 	}
 	deliveryStore := openNudgeBeadStore(target.cityPath)
@@ -508,6 +522,7 @@ func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdo
 		if inject {
 			return 0
 		}
+		fmt.Fprintf(stderr, "gc nudge drain: no deliverable nudges for %s (queued entries were blocked or expired)\n", target.agentKey()) //nolint:errcheck
 		return 1
 	}
 
@@ -548,6 +563,7 @@ func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdo
 		return 1
 	}
 	stampLastNudgeDeliveredAt(deliverySessFront, target.sessionID, time.Now())
+	fmt.Fprintf(stderr, "gc nudge drain: delivered %d nudge(s) for %s\n", len(items), target.agentKey()) //nolint:errcheck
 	return 0
 }
 

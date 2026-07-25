@@ -3107,6 +3107,114 @@ func TestCmdNudgeDrainStampsLastNudgeDeliveredAt(t *testing.T) {
 	}
 }
 
+// TestNudgeDrainCommandIsDiscoverable pins the #4301 fix: `drain` is the only
+// hand-run flush path, so it must be visible in `gc nudge --help` and its help
+// must document session scoping and --inject. `poll` stays hidden (internal
+// fallback daemon).
+func TestNudgeDrainCommandIsDiscoverable(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	root := newNudgeCmd(&stdout, &stderr)
+
+	foundDrain, foundPoll, pollHidden := false, false, false
+	for _, sub := range root.Commands() {
+		switch sub.Name() {
+		case "drain":
+			foundDrain = true
+			if sub.Hidden {
+				t.Error("drain must be discoverable from `gc nudge --help`; it is the only hand-run flush path (#4301)")
+			}
+			if !strings.Contains(sub.Long, "$GC_ALIAS") || !strings.Contains(sub.Long, "--inject") {
+				t.Errorf("drain help must document session scoping and --inject; Long=%q", sub.Long)
+			}
+		case "poll":
+			foundPoll = true
+			pollHidden = sub.Hidden
+		}
+	}
+	if !foundDrain {
+		t.Fatal("nudge command is missing the drain subcommand")
+	}
+	if !foundPoll || !pollHidden {
+		t.Error("nudge poll should remain hidden (internal fallback daemon)")
+	}
+}
+
+// nudgeDrainTestCity builds a file-backed city with one active worker session
+// and returns the store plus the session bead id, ready for a drain call.
+func nudgeDrainTestCity(t *testing.T) (beads.Store, string) {
+	t.Helper()
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+
+	cityDir := t.TempDir()
+	writeNamedSessionCityTOML(t, cityDir)
+	t.Setenv("GC_CITY", cityDir)
+
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	created, err := store.Create(beads.Bead{
+		Title:  "Session: worker",
+		Type:   session.BeadType,
+		Status: "open",
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "worker-session",
+			"agent_name":   "worker",
+			"template":     "worker",
+			"state":        string(session.StateActive),
+		},
+	})
+	if err != nil {
+		t.Fatalf("store.Create session: %v", err)
+	}
+	return store, created.ID
+}
+
+// TestNudgeDrainPlainPathReportsOutcome pins the #4301 honesty fix: the plain
+// (non --inject) path prints a delivery receipt to stderr on success and an
+// explicit "no nudges due" line (plus a non-zero exit) when the queue is empty,
+// so a masked empty-queue can no longer masquerade as a silent success.
+func TestNudgeDrainPlainPathReportsOutcome(t *testing.T) {
+	t.Run("delivers_and_reports_count", func(t *testing.T) {
+		store, sessionID := nudgeDrainTestCity(t)
+		cityDir := os.Getenv("GC_CITY")
+		item := newQueuedNudgeWithOptions("worker", "check hook output", "session", time.Now().Add(-time.Minute), queuedNudgeOptions{
+			SessionID: sessionID,
+		})
+		if err := enqueueQueuedNudgeWithStore(cityDir, beads.NudgesStore{Store: store}, item); err != nil {
+			t.Fatalf("enqueueQueuedNudgeWithStore: %v", err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		code := cmdNudgeDrainWithFormat([]string{sessionID}, false, "", &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("cmdNudgeDrainWithFormat = %d, want 0; stderr=%s", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "check hook output") {
+			t.Fatalf("stdout = %q, want drained nudge text", stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "delivered 1") {
+			t.Fatalf("stderr = %q, want a delivery receipt reporting delivered 1", stderr.String())
+		}
+	})
+
+	t.Run("empty_queue_is_reported_not_silent", func(t *testing.T) {
+		_, sessionID := nudgeDrainTestCity(t)
+
+		var stdout, stderr bytes.Buffer
+		code := cmdNudgeDrainWithFormat([]string{sessionID}, false, "", &stdout, &stderr)
+		if code == 0 {
+			t.Fatalf("cmdNudgeDrainWithFormat = 0 on an empty queue, want non-zero so scripts can tell an empty queue from a delivery")
+		}
+		if !strings.Contains(stderr.String(), "no nudges due") {
+			t.Fatalf("stderr = %q, want an explicit 'no nudges due' report rather than a silent exit", stderr.String())
+		}
+	})
+}
+
 func TestDeliverSlingNudgeWaitIdleWrapsInSystemReminder(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)
