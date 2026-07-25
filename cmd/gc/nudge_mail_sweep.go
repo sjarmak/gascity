@@ -74,6 +74,9 @@ func sweepStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		if !shadow.Open {
 			continue
 		}
+		if nudgeShadowRidesTTL(shadow, now) {
+			continue
+		}
 		if err := nq.SweepStale(shadow.BeadID, nudgeMailSweepNudgeCloseReason, now); err != nil {
 			beadErrs = append(beadErrs, err)
 			continue
@@ -128,6 +131,9 @@ func countStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		if !shadow.Open {
 			continue
 		}
+		if nudgeShadowRidesTTL(shadow, now) {
+			continue
+		}
 		result.NudgeClosed++
 	}
 
@@ -145,6 +151,24 @@ func countStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		result.MailClosed += mailCount
 	}
 	return result, nil
+}
+
+// nudgeShadowRidesTTL reports whether an aged-past-cutoff nudge shadow must be
+// spared from the retention sweep because it is still a live, undelivered nudge
+// riding its own expires_at TTL. The retention window (nudgeTTL, ~10m) targets
+// delivered/terminal shadows; a still-queued (non-terminal) nudge whose expiry
+// is in the future has not been delivered and must survive until then. Sweeping
+// it destroys an undelivered human→agent notification (#4299). The flock live
+// set (nudgeState.Pending/InFlight) is the primary guard, but it is transient
+// runtime state that can drop a queued nudge; the bead's own expires_at is the
+// durable backstop. A shadow with no parsed expires_at (zero time) keeps the
+// prior age-only retention behavior, so genuinely expiryless shadows still age
+// out and nothing accumulates unbounded.
+func nudgeShadowRidesTTL(shadow nudgequeue.NudgeShadow, now time.Time) bool {
+	if nudgequeue.IsTerminalState(shadow.State) {
+		return false
+	}
+	return !shadow.ExpiresAt.IsZero() && now.Before(shadow.ExpiresAt)
 }
 
 // liveNudgeIDSet returns the set of nudge IDs currently in pending or in-flight state.

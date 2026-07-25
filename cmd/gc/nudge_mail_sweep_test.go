@@ -710,3 +710,97 @@ func TestCountStaleNudgeMail_MatchesSweepCounts(t *testing.T) {
 		t.Errorf("count: MailClosed = %d, want 1", counts.MailClosed)
 	}
 }
+
+// nudgeSeedWithExpiry builds a seed Bead for an open, still-queued nudge shadow
+// carrying an expires_at metadata stamp — the shape of a real undelivered nudge
+// riding its own TTL. id must be unique within the seed slice.
+func nudgeSeedWithExpiry(id, nudgeID string, createdAt, expiresAt time.Time) beads.Bead {
+	b := nudgeSeed(id, nudgeID, createdAt)
+	b.Metadata["expires_at"] = expiresAt.UTC().Format(time.RFC3339)
+	return b
+}
+
+// TestSweepStaleNudgeMail_QueuedUnexpiredSurvives is the #4299 regression: a
+// still-queued, undelivered nudge that is older than the retention TTL but whose
+// own expires_at is still in the future must NOT be swept. The 10-minute
+// retention window targets delivered/terminal shadows; a live queued nudge rides
+// its 24h TTL and swept-stale closure here destroys an undelivered notification.
+func TestSweepStaleNudgeMail_QueuedUnexpiredSurvives(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	const liveID = "nudge-queued-live"
+	seed := []beads.Bead{
+		// Created ~11 min ago (past the 10-min retention cutoff), but expires_at
+		// is 24h out — exactly the reported #4299 shape.
+		nudgeSeedWithExpiry("bead-live", liveID, now.Add(-11*time.Minute), now.Add(24*time.Hour)),
+		// A genuinely sweepable delivered/terminal-less nudge with no expiry stamp
+		// still gets swept, proving the guard is scoped to unexpired queued nudges.
+		nudgeSeed("bead-sweepable", "nudge-sweepable", now.Add(-nudgeTTL-time.Second)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	// nudgeState is nil: the nudge is NOT protected by the live flock set. Its own
+	// expires_at is the only thing that must keep it alive.
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NudgeClosed != 1 {
+		t.Errorf("NudgeClosed = %d, want 1 (only the expiryless sweepable nudge)", result.NudgeClosed)
+	}
+
+	open, _ := store.ListOpen()
+	found := false
+	for _, b := range open {
+		if b.Metadata["nudge_id"] == liveID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("queued, unexpired nudge %q was swept; it must survive until expires_at (#4299)", liveID)
+	}
+}
+
+// TestSweepStaleNudgeMail_QueuedExpiredIsSwept proves the guard does not disable
+// retention: a queued nudge whose expires_at has already passed is still swept,
+// so genuinely dead undelivered nudges do not accumulate.
+func TestSweepStaleNudgeMail_QueuedExpiredIsSwept(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	const expiredID = "nudge-queued-expired"
+	seed := []beads.Bead{
+		nudgeSeedWithExpiry("bead-expired", expiredID, now.Add(-25*time.Hour), now.Add(-time.Hour)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NudgeClosed != 1 {
+		t.Errorf("NudgeClosed = %d, want 1 (expired queued nudge is still swept)", result.NudgeClosed)
+	}
+}
+
+// TestCountStaleNudgeMail_QueuedUnexpiredExcluded pins the dry-run twin to the
+// same guard so `--dry-run` never reports a live queued nudge as would-close.
+func TestCountStaleNudgeMail_QueuedUnexpiredExcluded(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	seed := []beads.Bead{
+		nudgeSeedWithExpiry("bead-live", "nudge-queued-live", now.Add(-11*time.Minute), now.Add(24*time.Hour)),
+		nudgeSeed("bead-sweepable", "nudge-sweepable", now.Add(-nudgeTTL-time.Second)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	counts, err := countStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if counts.NudgeClosed != 1 {
+		t.Errorf("count: NudgeClosed = %d, want 1 (live queued nudge excluded from dry-run)", counts.NudgeClosed)
+	}
+}
