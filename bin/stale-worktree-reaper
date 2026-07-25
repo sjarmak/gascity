@@ -36,6 +36,8 @@ AUDIT_LOG="${STALE_WORKTREE_AUDIT_LOG:-${CITY}/.gc/stale-worktree-reaper.log}"
 MANIFEST_DIR="${STALE_WORKTREE_MANIFEST_DIR:-${CITY}/.gc/stale-worktree-manifests}"
 RUN_LOCK="${STALE_WORKTREE_RUN_LOCK:-${CITY}/.gc/stale-worktree-reaper.lock}"
 PROC_ROOT="${STALE_WORKTREE_PROC_ROOT:-/proc}"
+OPAQUE_CGROUP_ALLOW_RE="${STALE_WORKTREE_OPAQUE_CGROUP_ALLOW_RE:-}"
+OPAQUE_COMMAND_ALLOW_RE="${STALE_WORKTREE_OPAQUE_COMMAND_ALLOW_RE:-}"
 STALE_THRESHOLD="${STALE_WORKTREE_THRESHOLD:-24h}"
 # Shorter threshold for adopt-pr-*/ship-* worktrees (mayor gc-431319): their PR is
 # merged/closed (still gated by the merge-into-default check below), so they are
@@ -50,7 +52,9 @@ INCLUDE_UNLOCKED=0
 MAX_REMOVE=25
 RUN_MANIFEST=""
 PROCESS_UNREADABLE_CWD=0
+PROCESS_ALLOWED_OPAQUE=0
 PROCESS_VISIBILITY_UNVERIFIED=0
+PROCESS_UNVERIFIED_DETAILS=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -144,9 +148,10 @@ worktree_emptiness() {
   fi
 
   # Git-only path: identical to the original inline check.
-  local n
-  n=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l)
-  if (( n > 0 )); then
+  local status
+  if ! status=$(git -C "$wt" status --porcelain 2>/dev/null); then
+    echo unknown
+  elif [[ -n "$status" ]]; then
     echo dirty
   else
     echo clean
@@ -199,12 +204,14 @@ load_rig_paths() {
 }
 
 load_live_process_paths() {
-  local proc fd path proc_uid state arg saw_arg
+  local proc fd fd_name fd_names path proc_uid state arg arg0 cmdline cgroup opaque pid
   local own_uid
   LIVE_PROCESS_PATHS=""
   LIVE_PROCESS_ARGS=""
   PROCESS_UNREADABLE_CWD=0
+  PROCESS_ALLOWED_OPAQUE=0
   PROCESS_VISIBILITY_UNVERIFIED=0
+  PROCESS_UNVERIFIED_DETAILS=""
   own_uid=$(id -u)
 
   for proc in "$PROC_ROOT"/[0-9]*; do
@@ -214,31 +221,73 @@ load_live_process_paths() {
     state=$(awk '/^State:/{print $2; exit}' "$proc/status" 2>/dev/null) || state=""
     [[ "$state" == "Z" ]] && continue
 
-    saw_arg=0
+    arg0=""
+    cmdline=""
     if [[ -r "$proc/cmdline" ]]; then
       while IFS= read -r -d '' arg; do
         [[ -n "$arg" ]] || continue
         LIVE_PROCESS_ARGS+="$arg"$'\n'
-        saw_arg=1
+        [[ -n "$arg0" ]] || arg0=$arg
+        cmdline+="${cmdline:+ }$arg"
       done < "$proc/cmdline"
     fi
 
+    opaque=0
     path=$(readlink "$proc/cwd" 2>/dev/null) || path=""
     if [[ -n "$path" ]]; then
       LIVE_PROCESS_PATHS+="$path"$'\n'
     elif [[ -d "$proc" ]]; then
       PROCESS_UNREADABLE_CWD=$((PROCESS_UNREADABLE_CWD + 1))
-      if (( saw_arg == 0 )); then
-        PROCESS_VISIBILITY_UNVERIFIED=$((PROCESS_VISIBILITY_UNVERIFIED + 1))
-      fi
+      opaque=1
     fi
 
     path=$(readlink "$proc/exe" 2>/dev/null) || path=""
-    [[ -n "$path" ]] && LIVE_PROCESS_PATHS+="$path"$'\n'
-    for fd in "$proc"/fd/*; do
-      path=$(readlink "$fd" 2>/dev/null) || continue
-      [[ -n "$path" ]] && LIVE_PROCESS_PATHS+="$path"$'\n'
-    done
+    if [[ -n "$path" ]]; then
+      LIVE_PROCESS_PATHS+="$path"$'\n'
+    elif [[ -d "$proc" ]]; then
+      opaque=1
+    fi
+    # Enumerate through a checked operation. A bare glob cannot distinguish an
+    # empty directory from an unreadable directory whose pattern stayed literal.
+    if ! fd_names=$(find "$proc/fd" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null); then
+      opaque=1
+    else
+      while IFS= read -r fd_name; do
+        [[ -n "$fd_name" ]] || continue
+        fd="$proc/fd/$fd_name"
+        if ! path=$(readlink "$fd" 2>/dev/null); then
+          [[ -e "$fd" || -L "$fd" ]] && opaque=1
+          continue
+        fi
+        if [[ -n "$path" ]]; then
+          LIVE_PROCESS_PATHS+="$path"$'\n'
+        elif [[ -d "$proc" ]]; then
+          opaque=1
+        fi
+      done <<<"$fd_names"
+    fi
+
+    if (( opaque )) && [[ -d "$proc" ]]; then
+      state=$(awk '/^State:/{print $2; exit}' "$proc/status" 2>/dev/null) || state=""
+      if [[ -z "$state" ]]; then
+        if [[ -d "$proc" ]]; then
+          pid=${proc##*/}
+          PROCESS_VISIBILITY_UNVERIFIED=$((PROCESS_VISIBILITY_UNVERIFIED + 1))
+          PROCESS_UNVERIFIED_DETAILS+="pid=$pid arg0=${arg0:-unknown} status=unreadable"$'\n'
+        fi
+        continue
+      fi
+      [[ "$state" != "Z" ]] || continue
+      cgroup=$(cat "$proc/cgroup" 2>/dev/null) || cgroup=""
+      if [[ -n "$OPAQUE_CGROUP_ALLOW_RE" && -n "$OPAQUE_COMMAND_ALLOW_RE" &&
+            "$cgroup" =~ $OPAQUE_CGROUP_ALLOW_RE && "$cmdline" =~ $OPAQUE_COMMAND_ALLOW_RE ]]; then
+        PROCESS_ALLOWED_OPAQUE=$((PROCESS_ALLOWED_OPAQUE + 1))
+      else
+        PROCESS_VISIBILITY_UNVERIFIED=$((PROCESS_VISIBILITY_UNVERIFIED + 1))
+        pid=${proc##*/}
+        PROCESS_UNVERIFIED_DETAILS+="pid=$pid arg0=${arg0:-unknown} cgroup=${cgroup:-unknown}"$'\n'
+      fi
+    fi
   done
 }
 
@@ -259,26 +308,27 @@ process_snapshot_complete() {
   (( PROCESS_VISIBILITY_UNVERIFIED == 0 ))
 }
 
-load_active_workdirs() {
-  local rig=$1 rig_path=$2 status data paths="" paths_json
-  ACTIVE_WORKDIRS_OK["$rig"]=0
-  for status in open in_progress blocked; do
-    data=$(timeout 30 env BD_DISABLE_METRICS=1 BD_DISABLE_EVENT_FLUSH=1 \
-      bd -C "$rig_path" list --status "$status" --limit 0 --json 2>/dev/null) || {
-      ACTIVE_WORKDIRS_OK["$rig"]=0
-      return 1
-    }
-    # Both transport and schema must validate. Malformed JSON or a non-string
-    # work_dir is an unknown store state, never an empty active set.
-    paths_json=$(jq -ce '
-      if type != "array" then error("expected array")
-      else [.[] | (.metadata["gc.work_dir"] // .metadata["work_dir"] // null)
-                    | select(. != null)
-                    | if type == "string" then . else error("work_dir must be string") end]
-      end' <<<"$data") || return 1
-    paths+=$(jq -r '.[]' <<<"$paths_json")$'\n' || return 1
+candidate_fields_safe() {
+  local field
+  for field in "$@"; do
+    [[ "$field" != *'|'* && "$field" != *$'\n'* ]] || return 1
   done
-  ACTIVE_WORKDIRS["$rig"]="$paths"
+}
+
+load_active_workdirs() {
+  local rig=$1 rig_path=$2 data paths_json
+  ACTIVE_WORKDIRS_OK["$rig"]=0
+  data=$(timeout 30 env BD_DISABLE_METRICS=1 BD_DISABLE_EVENT_FLUSH=1 \
+    bd -C "$rig_path" list --status open,in_progress,blocked --limit 0 --json 2>/dev/null) || return 1
+  # Both transport and schema must validate. Malformed JSON or a non-string
+  # work_dir is an unknown store state, never an empty active set.
+  paths_json=$(jq -ce '
+    if type != "array" then error("expected array")
+    else [.[] | (.metadata["gc.work_dir"] // .metadata["work_dir"] // null)
+                  | select(. != null)
+                  | if type == "string" then . else error("work_dir must be string") end]
+    end' <<<"$data") || return 1
+  ACTIVE_WORKDIRS["$rig"]=$(jq -r '.[]' <<<"$paths_json")$'\n' || return 1
   ACTIVE_WORKDIRS_OK["$rig"]=1
 }
 
@@ -312,12 +362,13 @@ default_branch() {
 }
 
 start_manifest() {
-  mkdir -p "$MANIFEST_DIR"
+  mkdir -p "$MANIFEST_DIR" || return 1
   local stamp
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
   RUN_MANIFEST="$MANIFEST_DIR/${stamp}-$$.jsonl"
-  : > "$RUN_MANIFEST"
-  chmod 600 "$RUN_MANIFEST"
+  : > "$RUN_MANIFEST" || return 1
+  chmod 600 "$RUN_MANIFEST" || return 1
+  sync -f "$RUN_MANIFEST"
 }
 
 # Return a bounded summary of ignored artifacts without enumerating every file
@@ -354,12 +405,18 @@ manifest_eligibility() {
     --arg default_branch "$default_br" \
     --arg default_sha "$default_sha" \
     --arg ignored_summary "$ignored_summary" \
+    --arg unverified_process_details "$PROCESS_UNVERIFIED_DETAILS" \
     --argjson size_kib "$size_kib" \
     --argjson unreadable_process_cwds "$PROCESS_UNREADABLE_CWD" \
+    --argjson allowed_opaque_processes "$PROCESS_ALLOWED_OPAQUE" \
+    --argjson unverified_processes "$PROCESS_VISIBILITY_UNVERIFIED" \
     '{event:$event,eligibility_ts:$ts,rig:$rig,path:$path,branch:$branch,tip_sha:$tip_sha,
       default_branch:$default_branch,default_sha:$default_sha,size_kib:$size_kib,
-      ignored_artifacts:$ignored_summary,unreadable_process_cwds:$unreadable_process_cwds}' \
-    >> "$RUN_MANIFEST"
+      ignored_artifacts:$ignored_summary,unreadable_process_cwds:$unreadable_process_cwds,
+      allowed_opaque_processes:$allowed_opaque_processes,unverified_processes:$unverified_processes,
+      unverified_process_details:$unverified_process_details}' \
+    >> "$RUN_MANIFEST" || return 1
+  sync -f "$RUN_MANIFEST"
 }
 
 manifest_result() {
@@ -375,7 +432,8 @@ manifest_result() {
     --arg detail "$detail" \
     '{event:$event,ts:$ts,rig:$rig,path:$path,branch:$branch,tip_sha:$tip_sha,
       removal_result:$removal_result,detail:$detail}' \
-    >> "$RUN_MANIFEST"
+    >> "$RUN_MANIFEST" || return 1
+  sync -f "$RUN_MANIFEST"
 }
 
 CANDIDATE_MISMATCH=""
@@ -429,7 +487,12 @@ candidate_identity_matches() {
 
 final_revalidate() {
   local rig=$1 rig_path=$2 wt=$3 branch=$4 tip=$5 default_br=$6 default_sha=$7
-  if ! candidate_identity_matches "$rig_path" "$wt" "$branch" "$tip" "$default_br" "$default_sha"; then
+  # Query the potentially slow external bead store first, then close its race
+  # window with process and exact Git identity checks.
+  unset 'ACTIVE_WORKDIRS_OK[$rig]' 'ACTIVE_WORKDIRS[$rig]'
+  active_workdir_state "$rig" "$rig_path" "$wt"
+  if [[ "$ACTIVE_REF_STATE" != "clear" ]]; then
+    CANDIDATE_MISMATCH="active bead reference state is $ACTIVE_REF_STATE"
     return 1
   fi
 
@@ -443,10 +506,7 @@ final_revalidate() {
     return 1
   fi
 
-  unset 'ACTIVE_WORKDIRS_OK[$rig]' 'ACTIVE_WORKDIRS[$rig]'
-  active_workdir_state "$rig" "$rig_path" "$wt"
-  if [[ "$ACTIVE_REF_STATE" != "clear" ]]; then
-    CANDIDATE_MISMATCH="active bead reference state is $ACTIVE_REF_STATE"
+  if ! candidate_identity_matches "$rig_path" "$wt" "$branch" "$tip" "$default_br" "$default_sha"; then
     return 1
   fi
 }
@@ -565,6 +625,13 @@ scan_rig() {
       skipped+=("$rig|$wt_path|unmerged-into-$default_br")
       continue
     fi
+    if ! candidate_fields_safe "$rig" "$rig_path" "$wt_path" "$branch" "$default_br"; then
+      log_event "skipped_unsafe_record_field" "$rig" "$wt_path" \
+        "$(jq -cn --arg b "$branch" --arg db "$default_br" \
+              '{branch:$b, default_branch:$db, reason:"pipe-or-newline"}')"
+      skipped+=("$rig|$wt_path|unsafe-record-field")
+      continue
+    fi
 
     local size_kib
     size_kib=$(timeout 30 du -sk "$wt_path" 2>/dev/null | awk '{print $1}')
@@ -600,7 +667,9 @@ load_live_process_paths
 if (( APPLY )) && ! process_snapshot_complete; then
   echo "stale-worktree-reaper: process visibility incomplete for $PROCESS_VISIBILITY_UNVERIFIED live process(es); refusing apply" >&2
   log_event "apply_process_visibility_incomplete" "city" "$PROC_ROOT" \
-    "$(jq -cn --argjson n "$PROCESS_VISIBILITY_UNVERIFIED" '{unverified_processes:$n}')"
+    "$(jq -cn --arg details "$PROCESS_UNVERIFIED_DETAILS" \
+          --argjson n "$PROCESS_VISIBILITY_UNVERIFIED" \
+          '{unverified_processes:$n, details:$details}')"
   exit 1
 fi
 
@@ -647,7 +716,11 @@ cat "$out"
 
 reaped_ok=0
 if (( APPLY )) && (( count > 0 )); then
-  start_manifest
+  if ! start_manifest; then
+    echo "stale-worktree-reaper: cannot create durable pre-removal manifest; refusing apply" >&2
+    log_event "apply_manifest_unavailable" "city" "$MANIFEST_DIR" '{}'
+    exit 1
+  fi
   for row in "${reaped[@]}"; do
     (( reaped_ok >= MAX_REMOVE )) && break
     IFS='|' read -r rig wt branch tip default_br default_sha size_kib <<<"$row"
@@ -659,13 +732,21 @@ if (( APPLY )) && (( count > 0 )); then
       log_event "reap_skipped_final_revalidation" "$rig" "$wt" \
         "$(jq -cn --arg reason "$CANDIDATE_MISMATCH" --arg tip "$tip" \
               '{reason:$reason, tip_sha:$tip}')"
-      manifest_eligibility "$rig" "$wt" "$branch" "$tip" "$default_br" "$default_sha" "$size_kib"
-      manifest_result "$rig" "$wt" "$branch" "$tip" "skipped" "$CANDIDATE_MISMATCH"
+      manifest_eligibility "$rig" "$wt" "$branch" "$tip" "$default_br" "$default_sha" "$size_kib" \
+        && manifest_result "$rig" "$wt" "$branch" "$tip" "skipped" "$CANDIDATE_MISMATCH" || {
+          echo "stale-worktree-reaper: manifest write failed; aborting apply" >&2
+          exit 1
+        }
       continue
     fi
 
     # Persist the complete recovery record before the destructive operation.
-    manifest_eligibility "$rig" "$wt" "$branch" "$tip" "$default_br" "$default_sha" "$size_kib"
+    if ! manifest_eligibility "$rig" "$wt" "$branch" "$tip" "$default_br" "$default_sha" "$size_kib"; then
+      echo "stale-worktree-reaper: pre-removal manifest write failed; refusing deletion" >&2
+      log_event "reap_manifest_write_failed" "$rig" "$wt" \
+        "$(jq -cn --arg tip "$tip" '{tip_sha:$tip}')"
+      exit 1
+    fi
 
     # Manifest collection can touch a large ignored cache. Close that window
     # with one final exact revalidation immediately before removal.
@@ -673,7 +754,10 @@ if (( APPLY )) && (( count > 0 )); then
       log_event "reap_skipped_post_manifest_revalidation" "$rig" "$wt" \
         "$(jq -cn --arg reason "$CANDIDATE_MISMATCH" --arg tip "$tip" \
               '{reason:$reason, tip_sha:$tip}')"
-      manifest_result "$rig" "$wt" "$branch" "$tip" "skipped" "$CANDIDATE_MISMATCH"
+      if ! manifest_result "$rig" "$wt" "$branch" "$tip" "skipped" "$CANDIDATE_MISMATCH"; then
+        echo "stale-worktree-reaper: manifest result write failed; aborting apply" >&2
+        exit 1
+      fi
       continue
     fi
 
@@ -694,15 +778,23 @@ if (( APPLY )) && (( count > 0 )); then
                     --argjson kib "$size_kib" --argjson exact "$branch_retained_exact" \
               '{branch:$b, tip_sha:$tip, retained_tip_sha:$retained, size_kib:$kib,
                 branch_retained_exact:$exact}')"
-      manifest_result "$rig" "$wt" "$branch" "$tip" "removed" \
-        "branch_retained_exact=$branch_retained_exact retained_tip=$retained_tip"
+      if ! manifest_result "$rig" "$wt" "$branch" "$tip" "removed" \
+           "branch_retained_exact=$branch_retained_exact retained_tip=$retained_tip"; then
+        echo "stale-worktree-reaper: removal succeeded but manifest result write failed; stopping" >&2
+        log_event "reap_manifest_result_failed" "$rig" "$wt" \
+          "$(jq -cn --arg tip "$tip" '{tip_sha:$tip, removal_succeeded:true}')"
+        exit 1
+      fi
     else
       if (( was_locked )) && worktree_is_registered "$rig_path" "$wt"; then
         git -C "$rig_path" worktree lock --reason "stale-worktree-reaper removal failed" "$wt" 2>/dev/null || true
       fi
       log_event "reap_failed" "$rig" "$wt" \
         "$(jq -cn --arg b "$branch" --arg tip "$tip" '{branch:$b, tip_sha:$tip}')"
-      manifest_result "$rig" "$wt" "$branch" "$tip" "failed" "git worktree remove refused"
+      if ! manifest_result "$rig" "$wt" "$branch" "$tip" "failed" "git worktree remove refused"; then
+        echo "stale-worktree-reaper: manifest result write failed; stopping" >&2
+        exit 1
+      fi
     fi
   done
   echo

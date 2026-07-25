@@ -5,6 +5,7 @@
 #   1. A git worktree with uncommitted changes is NOT reapable      (-> dirty)
 #   2. An empty git worktree IS reapable                            (-> clean)
 #   3. jj fail-closed: an errored/ambiguous jj probe is NOT reapable (-> unknown)
+#      Git probe errors also fail closed                             (-> unknown)
 #   4. Suspended rigs remain visible while HQ is excluded
 #   5. Active bead workdir probes cache and fail closed
 #   6. Hidden-cwd command arguments still protect a worktree
@@ -12,6 +13,7 @@
 #   8. Exact tip/default identity drift fails final revalidation
 #   9. Early registration matches survive pipefail/SIGPIPE conditions
 #  10. A concurrent apply lock is refused
+#  11. Unsafe record delimiters, short cutoffs, and manifest failures fail closed
 #
 # jj is NOT installed on this machine, so case 3 stubs `jj` + `command` on PATH
 # to force the jj-aware branch and make the probe error, proving the decision
@@ -57,6 +59,15 @@ git -C "$GIT_CLEAN" config user.email t@t && git -C "$GIT_CLEAN" config user.nam
 echo seed > "$GIT_CLEAN/seed.txt"
 git -C "$GIT_CLEAN" add -A && git -C "$GIT_CLEAN" commit -qm seed
 check "git clean -> reapable" "clean" "$(worktree_emptiness "$GIT_CLEAN")"
+
+FAILED_GIT_STATUS=$(
+  git() {
+    if [[ "$*" == *"status --porcelain"* ]]; then return 128; fi
+    command git "$@"
+  }
+  worktree_emptiness "$GIT_CLEAN"
+)
+check "git status error -> unknown (fail closed)" "unknown" "$FAILED_GIT_STATUS"
 
 # --- Case 3: jj branch fails closed when the probe errors -> unknown ----------
 # Create a worktree that looks like a jj repo, and stub jj+command so the
@@ -125,14 +136,144 @@ fi
 check "hidden cwd argument -> live" "live" "$hidden_state"
 
 # --- Case 7: incomplete process visibility fails closed ----------------------
-PROCESS_VISIBILITY_UNVERIFIED=1
+FAKE_PROC="$WORK/proc"
+mkdir -p "$FAKE_PROC/123/fd"
+printf 'State:\tS (sleeping)\n' > "$FAKE_PROC/123/status"
+printf 'python3\0worker.py\0' > "$FAKE_PROC/123/cmdline"
+printf '0::/unreviewed.slice/job.scope\n' > "$FAKE_PROC/123/cgroup"
+touch "$FAKE_PROC/123/cwd" "$FAKE_PROC/123/exe" "$FAKE_PROC/123/fd/0"
+PROC_ROOT="$FAKE_PROC"
+OPAQUE_CGROUP_ALLOW_RE=""
+OPAQUE_COMMAND_ALLOW_RE=""
+load_live_process_paths
 if process_snapshot_complete; then
   visibility_state=complete
 else
   visibility_state=incomplete
 fi
 check "incomplete process visibility -> not reapable" "incomplete" "$visibility_state"
-PROCESS_VISIBILITY_UNVERIFIED=0
+check "opaque process counted as unverified" "1" "$PROCESS_VISIBILITY_UNVERIFIED"
+
+OPAQUE_CGROUP_ALLOW_RE='^0::/unreviewed\.slice/job\.scope$'
+OPAQUE_COMMAND_ALLOW_RE='^python3 worker\.py$'
+load_live_process_paths
+check "explicit opaque policy -> allowed" "1" "$PROCESS_ALLOWED_OPAQUE"
+if process_snapshot_complete; then
+  visibility_state=complete
+else
+  visibility_state=incomplete
+fi
+check "explicit opaque policy -> complete" "complete" "$visibility_state"
+
+FAKE_PROC_FD="$WORK/proc-fd-unreadable"
+mkdir -p "$FAKE_PROC_FD/124/fd"
+printf 'State:\tS (sleeping)\n' > "$FAKE_PROC_FD/124/status"
+printf 'python3\0worker.py\0' > "$FAKE_PROC_FD/124/cmdline"
+printf '0::/unreviewed.slice/job.scope\n' > "$FAKE_PROC_FD/124/cgroup"
+ln -s /tmp "$FAKE_PROC_FD/124/cwd"
+ln -s /bin/sh "$FAKE_PROC_FD/124/exe"
+chmod 000 "$FAKE_PROC_FD/124/fd"
+PROC_ROOT="$FAKE_PROC_FD"
+OPAQUE_CGROUP_ALLOW_RE=""
+OPAQUE_COMMAND_ALLOW_RE=""
+load_live_process_paths
+check "unreadable fd directory -> unverified" "1" "$PROCESS_VISIBILITY_UNVERIFIED"
+chmod 700 "$FAKE_PROC_FD/124/fd"
+
+FAKE_PROC_FD_RACE="$WORK/proc-fd-race"
+mkdir -p "$FAKE_PROC_FD_RACE/126/fd"
+printf 'State:\tS (sleeping)\n' > "$FAKE_PROC_FD_RACE/126/status"
+printf 'python3\0worker.py\0' > "$FAKE_PROC_FD_RACE/126/cmdline"
+printf '0::/unreviewed.slice/job.scope\n' > "$FAKE_PROC_FD_RACE/126/cgroup"
+ln -s /tmp "$FAKE_PROC_FD_RACE/126/cwd"
+ln -s /bin/sh "$FAKE_PROC_FD_RACE/126/exe"
+ln -s /tmp/held-by-process "$FAKE_PROC_FD_RACE/126/fd/9"
+fd_race_state=$(
+  find() {
+    chmod 000 "$1"
+    command find "$@"
+  }
+  PROC_ROOT="$FAKE_PROC_FD_RACE"
+  OPAQUE_CGROUP_ALLOW_RE=""
+  OPAQUE_COMMAND_ALLOW_RE=""
+  load_live_process_paths
+  printf '%s' "$PROCESS_VISIBILITY_UNVERIFIED"
+)
+check "fd enumeration race -> unverified" "1" "$fd_race_state"
+chmod 700 "$FAKE_PROC_FD_RACE/126/fd"
+
+FAKE_PROC_STATUS="$WORK/proc-status-unreadable"
+mkdir -p "$FAKE_PROC_STATUS/125/fd" "$FAKE_PROC_STATUS/125/status"
+printf 'python3\0worker.py\0' > "$FAKE_PROC_STATUS/125/cmdline"
+printf '0::/unreviewed.slice/job.scope\n' > "$FAKE_PROC_STATUS/125/cgroup"
+touch "$FAKE_PROC_STATUS/125/cwd"
+ln -s /bin/sh "$FAKE_PROC_STATUS/125/exe"
+PROC_ROOT="$FAKE_PROC_STATUS"
+load_live_process_paths
+check "unreadable live status -> unverified" "1" "$PROCESS_VISIBILITY_UNVERIFIED"
+
+STATUS_AWK_BIN="$WORK/status-awk-bin"
+mkdir -p "$STATUS_AWK_BIN"
+cat > "$STATUS_AWK_BIN/awk" <<'EOF'
+#!/usr/bin/env bash
+last=${!#}
+if [[ "$last" == "$AWK_STATUS_TARGET" ]]; then
+  n=$(cat "$AWK_COUNTER" 2>/dev/null || echo 0)
+  n=$((n + 1))
+  printf '%s\n' "$n" > "$AWK_COUNTER"
+  if (( n == 2 )); then
+    if [[ "${AWK_REMOVE_ON_SECOND:-0}" == "1" ]]; then
+      rm -rf "$(dirname "$AWK_STATUS_TARGET")"
+    fi
+    exit 1
+  fi
+fi
+exec /usr/bin/awk "$@"
+EOF
+chmod +x "$STATUS_AWK_BIN/awk"
+
+make_status_race_proc() {
+  local root=$1 pid=$2
+  mkdir -p "$root/$pid/fd"
+  printf 'State:\tS (sleeping)\n' > "$root/$pid/status"
+  printf 'python3\0worker.py\0' > "$root/$pid/cmdline"
+  printf '0::/reviewed.slice/job.scope\n' > "$root/$pid/cgroup"
+  touch "$root/$pid/cwd"
+  ln -s /bin/sh "$root/$pid/exe"
+}
+
+FAKE_STATUS_RACE="$WORK/proc-status-race"
+make_status_race_proc "$FAKE_STATUS_RACE" 127
+status_race_state=$(
+  export PATH="$STATUS_AWK_BIN:$PATH"
+  export AWK_COUNTER="$WORK/status-race-count"
+  export AWK_STATUS_TARGET="$FAKE_STATUS_RACE/127/status"
+  PROC_ROOT="$FAKE_STATUS_RACE"
+  OPAQUE_CGROUP_ALLOW_RE='^0::/reviewed\.slice/job\.scope$'
+  OPAQUE_COMMAND_ALLOW_RE='^python3 worker\.py$'
+  load_live_process_paths
+  printf '%s:%s' "$PROCESS_VISIBILITY_UNVERIFIED" "$PROCESS_ALLOWED_OPAQUE"
+)
+check "failed final status read -> unverified" "1:0" "$status_race_state"
+
+FAKE_STATUS_EXIT="$WORK/proc-status-exit"
+make_status_race_proc "$FAKE_STATUS_EXIT" 128
+status_exit_state=$(
+  export PATH="$STATUS_AWK_BIN:$PATH"
+  export AWK_COUNTER="$WORK/status-exit-count"
+  export AWK_STATUS_TARGET="$FAKE_STATUS_EXIT/128/status"
+  export AWK_REMOVE_ON_SECOND=1
+  PROC_ROOT="$FAKE_STATUS_EXIT"
+  OPAQUE_CGROUP_ALLOW_RE='^0::/reviewed\.slice/job\.scope$'
+  OPAQUE_COMMAND_ALLOW_RE='^python3 worker\.py$'
+  load_live_process_paths
+  printf '%s:%s' "$PROCESS_VISIBILITY_UNVERIFIED" "$PROCESS_ALLOWED_OPAQUE"
+)
+check "process disappearance during status read -> transient" "0:0" "$status_exit_state"
+
+PROC_ROOT=/proc
+OPAQUE_CGROUP_ALLOW_RE=""
+OPAQUE_COMMAND_ALLOW_RE=""
 
 # --- Case 8: final identity check rejects tip drift --------------------------
 IDENTITY_REPO="$WORK/identity-repo"
@@ -206,6 +347,48 @@ fi
 check "concurrent apply lock -> blocked" "blocked" "$lock_state"
 kill "$lock_holder" 2>/dev/null || true
 wait "$lock_holder" 2>/dev/null || true
+
+# --- Case 11: serialization, age policy and manifests fail closed ------------
+if candidate_fields_safe demo /tmp/plain work/demo main; then
+  field_state=safe
+else
+  field_state=unsafe
+fi
+check "plain candidate fields -> safe" "safe" "$field_state"
+if candidate_fields_safe demo '/tmp/injected|victim' work/demo main; then
+  field_state=safe
+else
+  field_state=unsafe
+fi
+check "pipe-delimited candidate field -> unsafe" "unsafe" "$field_state"
+
+uniform_cutoff=$(
+  STALE_WORKTREE_REAPER_LIB=1 \
+  STALE_WORKTREE_THRESHOLD=3d \
+  STALE_WORKTREE_SHORT_THRESHOLD=3d \
+  REAPER="$REAPER" \
+  bash -c 'source "$REAPER"; [[ "$(wt_cutoff_for /tmp/ship-123)" == "$CUTOFF_EPOCH" ]] && echo uniform || echo short'
+)
+check "ship/adopt cutoff under recurring policy -> 3d" "uniform" "$uniform_cutoff"
+
+MANIFEST_DIR=/proc/1/stale-worktree-reaper-test
+if start_manifest 2>/dev/null; then
+  manifest_state=available
+else
+  manifest_state=unavailable
+fi
+check "manifest creation failure -> unavailable" "unavailable" "$manifest_state"
+
+RUN_MANIFEST=/dev/full
+PROCESS_UNREADABLE_CWD=0
+PROCESS_ALLOWED_OPAQUE=0
+PROCESS_VISIBILITY_UNVERIFIED=0
+if manifest_eligibility demo "$GIT_CLEAN" main deadbeef main feedface 1 2>/dev/null; then
+  manifest_state=written
+else
+  manifest_state=failed
+fi
+check "manifest append failure -> failed" "failed" "$manifest_state"
 
 echo
 if (( fail )); then

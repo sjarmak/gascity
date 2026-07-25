@@ -11,3 +11,12 @@ trigger = "cooldown"
 interval = "1h"
 exec = "/home/ds/gas-city/bin/stale-worktree-reaper --apply --include-unlocked --threshold 3d --max-remove 10 --nudge-mayor"
 timeout = "20m"
+
+[order.env]
+# Keep the destructive policy uniformly at 3d, including ship/adopt leaves.
+STALE_WORKTREE_SHORT_THRESHOLD = "3d"
+# Same-user non-dumpable control-plane daemons hide /proc cwd/fd targets. Allow
+# only this audited cgroup+command intersection; any new opaque process blocks
+# the entire apply run and nudges the mayor rather than silently broadening it.
+STALE_WORKTREE_OPAQUE_CGROUP_ALLOW_RE = '/user\.slice/user-[0-9]+\.slice/(user@[0-9]+\.service/(init\.scope|app\.slice/(gascity-supervisor|gpg-agent)\.service)|session-[0-9]+\.scope)$'
+STALE_WORKTREE_OPAQUE_COMMAND_ALLOW_RE = '^(/usr/lib/systemd/systemd --user|\(sd-pam\)|sshd: |/usr/lib/openssh/sftp-server|/home/ds/\.local/bin/gc supervisor run|\./adapter/gc-slack-adapter|/home/ds/go/bin/gc __gc-managed-dolt-scope-watchdog|dolt sql-server|tmux .* -c /var/tmp/|/usr/bin/gpg-agent --supervised)'
