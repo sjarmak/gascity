@@ -80,16 +80,76 @@ title = "Work {i}"
 
 	// Without the var the required compile-time range var is unresolved and
 	// compilation fails — proving the var is what makes the recipe compile.
-	if _, err := prepareOrderWispRecipe(context.Background(), store, a, []string{dir}, nil); err == nil {
+	if _, _, err := prepareOrderWispRecipe(context.Background(), store, a, []string{dir}, nil); err == nil {
 		t.Fatal("prepareOrderWispRecipe with nil vars: expected failure for missing required range var n")
 	}
 
-	recipe, err := prepareOrderWispRecipe(context.Background(), store, a, []string{dir}, map[string]string{"n": "3"})
+	recipe, effectiveVars, err := prepareOrderWispRecipe(context.Background(), store, a, []string{dir}, map[string]string{"n": "3"})
 	if err != nil {
 		t.Fatalf("prepareOrderWispRecipe with vars: %v", err)
 	}
 	if len(recipe.Steps) != 4 {
 		t.Fatalf("len(recipe.Steps) = %d, want 4 (root + 3 loop iterations from n=3)", len(recipe.Steps))
+	}
+	// The resolved invocation vars must flow back to the caller so the wisp is
+	// instantiated with them (see #4668) — not discarded after compile.
+	if effectiveVars["n"] != "3" {
+		t.Fatalf("effectiveVars[n] = %q, want 3 (resolved vars returned for instantiation)", effectiveVars["n"])
+	}
+}
+
+// TestOrderRunSubstitutesCallerVarsInBeadText is the regression test for #4668:
+// a formula order dispatched with a caller var must substitute that value into
+// the instantiated bead text. The order-dispatch path discarded the resolved
+// invocation vars after compile and instantiated with molecule.Options{}, so a
+// {{var}} referencing a caller value rendered empty on the created bead. The
+// var lives only in the step description (the title-only unresolved-var guard
+// never catches it), reproducing the reporter's silent empty-text symptom.
+func TestOrderRunSubstitutesCallerVarsInBeadText(t *testing.T) {
+	dir := t.TempDir()
+	// subject is a declared-but-defaultless var: instantiation renders {{subject}}
+	// empty unless the caller value is threaded through to molecule.Instantiate.
+	formulaBody := `
+formula = "e1-var-text"
+version = 1
+
+[vars.subject]
+description = "Work subject"
+
+[[steps]]
+id = "work"
+title = "Work step"
+description = "Handle {{subject}} now."
+`
+	if err := os.WriteFile(filepath.Join(dir, "e1-var-text.toml"), []byte(strings.TrimSpace(formulaBody)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	aa := []orders.Order{{Name: "textorder", Formula: "e1-var-text", Trigger: "manual", FormulaLayer: dir}}
+	store := beads.NewMemStore()
+
+	var stdout, stderr bytes.Buffer
+	code := doOrderRunWithJSON(aa, "textorder", "", t.TempDir(), beads.OrdersStore{Store: store}, nil, false, map[string]string{"subject": "widgets"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doOrderRunWithJSON = %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	all, err := store.ListOpen()
+	if err != nil {
+		t.Fatalf("store.ListOpen(): %v", err)
+	}
+	var work *beads.Bead
+	for i := range all {
+		if all[i].Title == "Work step" {
+			work = &all[i]
+			break
+		}
+	}
+	if work == nil {
+		t.Fatalf("work step bead not created; beads=%#v", all)
+	}
+	if want := "Handle widgets now."; work.Description != want {
+		t.Errorf("step description = %q, want %q (caller var must substitute into bead text)", work.Description, want)
 	}
 }
 
