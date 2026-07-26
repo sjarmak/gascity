@@ -202,6 +202,27 @@ func (m cleanupTestingM) Run() int {
 	return code
 }
 
+// tmuxServerDrainingTestingM reaps any tmux server left listening on a socket
+// under the run's isolated socket root once all tests finish. It must wrap the
+// runner INSIDE cleanupTestingM so the drain happens before cleanupTestingM's
+// os.RemoveAll unlinks the socket root: removing the root out from under a live
+// server leaves an unreachable orphan that outlives the test binary (#4656).
+// Tests that drive the real tmux adapter (e.g. TestCmdNudgeStatusJSON, whose
+// named-session city resolves the socket "test-city") spawn such servers, and
+// the gctest-* orphan sweep does not match that socket name.
+type tmuxServerDrainingTestingM struct {
+	m          testscript.TestingM
+	socketRoot string
+}
+
+func (m tmuxServerDrainingTestingM) Run() int {
+	code := m.m.Run()
+	if killed := tmuxtest.KillServersUnderRoot(m.socketRoot); killed > 0 {
+		fmt.Fprintf(os.Stderr, "cmd/gc TestMain: reaped %d leaked tmux server(s) under %s before socket-root removal\n", killed, m.socketRoot) //nolint:errcheck
+	}
+	return code
+}
+
 func TestMain(m *testing.M) {
 	maybeRunProductMetricsDirectChildEnvSpy()
 
@@ -303,6 +324,7 @@ func TestMain(m *testing.M) {
 	configureFSPressureForTests()
 	configureSupervisorHooksForTests()
 	var testRunner testscript.TestingM = newDoltLeakGuardedTestingM(m, testTempRoot, testTempRoot, gcHome, runtimeDir, providerStubDir, sharedTestFixtureRoot)
+	testRunner = tmuxServerDrainingTestingM{m: testRunner, socketRoot: tmuxSocketRoot}
 	if tmuxSocketCleanupRoot != "" {
 		testRunner = cleanupTestingM{m: testRunner, paths: []string{tmuxSocketCleanupRoot}}
 	}

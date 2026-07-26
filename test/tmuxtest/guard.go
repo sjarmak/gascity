@@ -178,6 +178,41 @@ func killTestSocketPath(socketPath string) error {
 	return exec.CommandContext(ctx, "tmux", "-S", socketPath, "kill-server").Run()
 }
 
+// KillServersUnderRoot kills every live tmux server whose socket lives directly
+// under socketRoot's per-user socket dir (socketRoot/tmux-<uid>/*) and returns
+// the number killed. An isolated test binary owns a unique socketRoot (its
+// TMUX_TMPDIR), so every socket found there belongs to that run — including
+// non-gctest sockets such as the cmd/gc named-session tests' "test-city", which
+// KillAllTestSessions / listTestSocketPaths deliberately ignore (they match only
+// the "gctest-*" prefix). Each server is killed via `tmux -S <path> kill-server`,
+// so the scope is exactly the enumerated sockets and never the operator's own
+// default server.
+//
+// Call it from TestMain after the tests finish and BEFORE the socket root is
+// removed: os.RemoveAll on the root unlinks a still-running server's socket,
+// after which the server holds an fd on an unnamed inode forever and no client
+// (not even `tmux kill-server`) can reach it — an unreachable orphan that
+// survives until the PID is signaled directly or the host reboots
+// (gastownhall/gascity#4656).
+func KillServersUnderRoot(socketRoot string) int {
+	socketRoot = strings.TrimSpace(socketRoot)
+	if socketRoot == "" {
+		return 0
+	}
+	uid := strconv.Itoa(os.Getuid())
+	entries, err := filepath.Glob(filepath.Join(filepath.Clean(socketRoot), "tmux-"+uid, "*"))
+	if err != nil {
+		return 0
+	}
+	var killed int
+	for _, socketPath := range entries {
+		if err := killTestSocketPath(socketPath); err == nil {
+			killed++
+		}
+	}
+	return killed
+}
+
 // listTestSocketPaths returns tmux socket paths for orphaned gctest cities.
 func listTestSocketPaths() []string {
 	activeRoot := strings.TrimSpace(os.Getenv(tmuxTmpEnv))
