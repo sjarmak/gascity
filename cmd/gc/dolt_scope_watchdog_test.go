@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/config"
 )
 
 func TestManagedDoltScopeGone(t *testing.T) {
@@ -66,6 +69,142 @@ func TestManagedDoltScopeWatchdogEnabled_OffInTestBinary(t *testing.T) {
 	if managedDoltScopeWatchdogEnabled() {
 		t.Fatal("scope watchdog enabled inside the test binary; test scopes are owned by the test watchdog")
 	}
+}
+
+func TestManagedDoltScopeWatchdogIdleWindow(t *testing.T) {
+	cases := []struct {
+		env  string
+		want time.Duration
+	}{
+		{"", managedDoltScopeWatchdogDefaultIdleWindow},
+		{"250", 250 * time.Millisecond},
+		{"0", 0}, // explicit disable
+		{"-5", managedDoltScopeWatchdogDefaultIdleWindow},
+		{"nonsense", managedDoltScopeWatchdogDefaultIdleWindow},
+	}
+	for _, tc := range cases {
+		t.Run("env="+tc.env, func(t *testing.T) {
+			t.Setenv(managedDoltScopeWatchdogIdleEnv, tc.env)
+			if got := managedDoltScopeWatchdogIdleWindow(); got != tc.want {
+				t.Errorf("idle window for %q = %v, want %v", tc.env, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestManagedDoltScopeRootEphemeral(t *testing.T) {
+	tempDir := t.TempDir()
+	cases := []struct {
+		name      string
+		scopeRoot string
+		want      bool
+	}{
+		{"under temp", filepath.Join(tempDir, "city-a"), true},
+		{"equal to temp", tempDir, true},
+		{"outside temp", "/opt/cities/prod", false},
+		{"empty is non-ephemeral", "", false},
+		{"blank is non-ephemeral", "   ", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := managedDoltScopeRootEphemeral(tc.scopeRoot, tempDir); got != tc.want {
+				t.Errorf("managedDoltScopeRootEphemeral(%q, %q) = %v, want %v", tc.scopeRoot, tempDir, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestManagedDoltConfigListenerPort(t *testing.T) {
+	dir := t.TempDir()
+	// A realistic config produced by the production writer, so the parser is
+	// pinned to the actual on-disk shape rather than a hand-rolled sample.
+	realConfig := filepath.Join(dir, "real-dolt-config.yaml")
+	if err := writeManagedDoltConfigFile(realConfig, "127.0.0.1", "50127", filepath.Join(dir, "data"), "warning", config.DoltConfig{}); err != nil {
+		t.Fatalf("write managed config: %v", err)
+	}
+
+	write := func(name, content string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+	quotedPort := write("quoted.yaml", "listener:\n  port: \"3307\"\n  host: 0.0.0.0\n")
+	noListenerPort := write("noport.yaml", "log_level: warning\ndata_dir: \"/x\"\n")
+	// A stray indented `port:` outside the listener block must be ignored.
+	strayPort := write("stray.yaml", "other:\n  port: 9999\nlistener:\n  host: 127.0.0.1\n")
+
+	cases := []struct {
+		name       string
+		configFile string
+		wantPort   uint16
+		wantOK     bool
+	}{
+		{"production writer output", realConfig, 50127, true},
+		{"quoted port", quotedPort, 3307, true},
+		{"no listener port", noListenerPort, 0, false},
+		{"stray port outside listener block", strayPort, 0, false},
+		{"missing file", filepath.Join(dir, "absent.yaml"), 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			port, ok := managedDoltConfigListenerPort(tc.configFile)
+			if ok != tc.wantOK || port != tc.wantPort {
+				t.Errorf("managedDoltConfigListenerPort(%q) = (%d, %v), want (%d, %v)", tc.configFile, port, ok, tc.wantPort, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestManagedDoltIdleAbandonmentObserve(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+
+	t.Run("zero window disables the leg", func(t *testing.T) {
+		a := &managedDoltIdleAbandonment{window: 0}
+		if a.observe(0, true, base) || a.observe(0, true, base.Add(time.Hour)) {
+			t.Fatal("idle leg fired with a non-positive window")
+		}
+	})
+
+	t.Run("sustained zero connections fires after the window", func(t *testing.T) {
+		a := &managedDoltIdleAbandonment{window: time.Minute}
+		if a.observe(0, true, base) {
+			t.Fatal("fired on the first idle poll (window not yet elapsed)")
+		}
+		if a.observe(0, true, base.Add(30*time.Second)) {
+			t.Fatal("fired before the window elapsed")
+		}
+		if !a.observe(0, true, base.Add(time.Minute)) {
+			t.Fatal("did not fire once the idle window elapsed")
+		}
+	})
+
+	t.Run("an established connection resets the idle span", func(t *testing.T) {
+		a := &managedDoltIdleAbandonment{window: time.Minute}
+		a.observe(0, true, base)
+		if a.observe(2, true, base.Add(30*time.Second)) {
+			t.Fatal("fired despite an active connection")
+		}
+		// The span restarts from the reset; the old start no longer counts.
+		if a.observe(0, true, base.Add(90*time.Second)) {
+			t.Fatal("fired using the pre-reset idle start")
+		}
+		if !a.observe(0, true, base.Add(150*time.Second)) {
+			t.Fatal("did not fire a full window after the reset")
+		}
+	})
+
+	t.Run("an unreadable /proc poll resets and never reaps", func(t *testing.T) {
+		a := &managedDoltIdleAbandonment{window: time.Minute}
+		a.observe(0, true, base)
+		if a.observe(0, false, base.Add(30*time.Second)) {
+			t.Fatal("fired on an unreadable /proc poll")
+		}
+		if a.observe(0, false, base.Add(2*time.Minute)) {
+			t.Fatal("fired while /proc stayed unreadable")
+		}
+	})
 }
 
 func TestManagedDoltScopeWatchdogInterval(t *testing.T) {
@@ -181,6 +320,24 @@ func TestManagedDoltScopeWatchdogHelper(t *testing.T) {
 	if interval := strings.TrimSpace(os.Getenv("GC_TEST_MANAGED_DOLT_HELPER_SCOPE_WD_INTERVAL_MS")); interval != "" {
 		t.Setenv(managedDoltScopeWatchdogIntervalEnv, interval)
 	}
+	// TestMain scrubs non-GC_TEST_ GC_* keys, so the idle window rides a GC_TEST_
+	// control var and the helper re-exports it for the watchdog re-exec.
+	if idle := strings.TrimSpace(os.Getenv("GC_TEST_MANAGED_DOLT_HELPER_SCOPE_WD_IDLE_MS")); idle != "" {
+		t.Setenv(managedDoltScopeWatchdogIdleEnv, idle)
+	}
+	// The re-exec'd helper runs its own TestMain, which remaps TMPDIR to a
+	// per-process dir, so os.TempDir() here differs from the parent test's.
+	// When the parent asks for an ephemeral scope, create the scope root under
+	// THIS process's os.TempDir() so managedDoltScopeRootEphemeral (which the
+	// watchdog evaluates against the same os.TempDir()) sees it as temp-rooted.
+	cityPath := ""
+	if os.Getenv("GC_TEST_MANAGED_DOLT_HELPER_CITY_MODE") == "temp" {
+		root, err := os.MkdirTemp(os.TempDir(), "scope-idle-*")
+		if err != nil {
+			t.Fatalf("make temp scope root: %v", err)
+		}
+		cityPath = root
+	}
 	statePath := strings.TrimSpace(os.Getenv("GC_TEST_MANAGED_DOLT_HELPER_STATE"))
 	configPath := strings.TrimSpace(os.Getenv("GC_TEST_MANAGED_DOLT_HELPER_CONFIG"))
 	logPath := strings.TrimSpace(os.Getenv("GC_TEST_MANAGED_DOLT_HELPER_LOG"))
@@ -193,7 +350,7 @@ func TestManagedDoltScopeWatchdogHelper(t *testing.T) {
 	}
 	defer logFile.Close() //nolint:errcheck
 
-	started, err := startManagedDoltSQLServerWithScopeWatchdog("", configPath, logPath, logFile)
+	started, err := startManagedDoltSQLServerWithScopeWatchdog(cityPath, configPath, logPath, logFile)
 	if err != nil {
 		t.Fatalf("start managed dolt with scope watchdog: %v", err)
 	}
@@ -340,6 +497,140 @@ func TestManagedDoltScopeWatchdogServerSurvivesScopePresent(t *testing.T) {
 			t.Fatalf("watchdog pid %d still alive after its server exited", watchdogPID)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// freeLocalPort grabs a currently-unused TCP port. Nothing binds it after this
+// returns, so no process holds an established connection on it — the idle-leg
+// tests need a port whose established-connection count is provably zero.
+func freeLocalPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve free port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close reservation listener: %v", err)
+	}
+	return port
+}
+
+// writeIdleLegConfig writes a managed-shaped config carrying a listener port so
+// managedDoltConfigListenerPort resolves it and the idle-abandonment leg can arm.
+func writeIdleLegConfig(t *testing.T, path string, port int) {
+	t.Helper()
+	content := fmt.Sprintf("log_level: debug\n\nlistener:\n  port: %d\n  host: 127.0.0.1\n", port)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
+// TestManagedDoltScopeWatchdogReapsIdleTempRootedScope exercises the #4679
+// idle-abandonment leg end to end: a temp-rooted server with zero established
+// client connections must be reaped once the idle window elapses, even though
+// its scope directory (and --config anchor) still exist.
+func TestManagedDoltScopeWatchdogReapsIdleTempRootedScope(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("idle-abandonment leg counts connections via /proc/net/tcp (Linux only)")
+	}
+	dir := t.TempDir() // under os.TempDir(): an ephemeral scope root
+	fakeDoltDir := writeFakeDoltSQLServer(t)
+	statePath := filepath.Join(dir, "state")
+	configPath := filepath.Join(dir, "dolt-config.yaml")
+	logPath := filepath.Join(dir, "dolt.log")
+	writeIdleLegConfig(t, configPath, freeLocalPort(t))
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestManagedDoltScopeWatchdogHelper", "-test.v")
+	cmd.Env = sanitizedBaseEnv(
+		"GC_TEST_MANAGED_DOLT_HELPER=scope-watchdog",
+		"GC_TEST_MANAGED_DOLT_HELPER_STATE="+statePath,
+		"GC_TEST_MANAGED_DOLT_HELPER_CONFIG="+configPath,
+		"GC_TEST_MANAGED_DOLT_HELPER_LOG="+logPath,
+		"GC_TEST_MANAGED_DOLT_HELPER_FAKE_DOLT_DIR="+fakeDoltDir,
+		"GC_TEST_MANAGED_DOLT_HELPER_CITY_MODE=temp",
+		"GC_TEST_MANAGED_DOLT_HELPER_SCOPE_WD_INTERVAL_MS=50",
+		"GC_TEST_MANAGED_DOLT_HELPER_SCOPE_WD_IDLE_MS=100",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helper failed: %v\n%s", err, output)
+	}
+	doltPID, watchdogPID := readManagedDoltTestState(t, statePath)
+	t.Cleanup(func() {
+		cleanupManagedDoltTestPID(t, doltPID)
+		cleanupManagedDoltTestPID(t, watchdogPID)
+	})
+
+	deadline := time.Now().Add(10 * time.Second)
+	for pidAlive(doltPID) {
+		if time.Now().After(deadline) {
+			logData, _ := os.ReadFile(logPath)
+			t.Fatalf("idle temp-rooted dolt pid %d not reaped; watchdog log:\n%s", doltPID, logData)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for pidAlive(watchdogPID) {
+		if time.Now().After(deadline) {
+			t.Fatalf("watchdog pid %d still alive after reaping its idle server", watchdogPID)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	logData, _ := os.ReadFile(logPath)
+	if !strings.Contains(string(logData), "idle") {
+		t.Errorf("watchdog log missing the idle-abandonment termination decision; log:\n%s", logData)
+	}
+}
+
+// TestManagedDoltScopeWatchdogKeepsIdleNonTempScope pins the ephemeral gate: a
+// non-temp-rooted scope (empty scope root here) with zero connections must NOT
+// be reaped by the idle leg, even with the idle window shrunk to milliseconds.
+// Only the deleted-config anchor governs non-temp roots.
+func TestManagedDoltScopeWatchdogKeepsIdleNonTempScope(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("idle-abandonment leg counts connections via /proc/net/tcp (Linux only)")
+	}
+	dir := t.TempDir()
+	fakeDoltDir := writeFakeDoltSQLServer(t)
+	statePath := filepath.Join(dir, "state")
+	configPath := filepath.Join(dir, "dolt-config.yaml")
+	logPath := filepath.Join(dir, "dolt.log")
+	writeIdleLegConfig(t, configPath, freeLocalPort(t))
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestManagedDoltScopeWatchdogHelper", "-test.v")
+	cmd.Env = sanitizedBaseEnv(
+		"GC_TEST_MANAGED_DOLT_HELPER=scope-watchdog",
+		"GC_TEST_MANAGED_DOLT_HELPER_STATE="+statePath,
+		"GC_TEST_MANAGED_DOLT_HELPER_CONFIG="+configPath,
+		"GC_TEST_MANAGED_DOLT_HELPER_LOG="+logPath,
+		"GC_TEST_MANAGED_DOLT_HELPER_FAKE_DOLT_DIR="+fakeDoltDir,
+		// No GC_TEST_MANAGED_DOLT_HELPER_CITY: scope root is empty -> non-ephemeral.
+		"GC_TEST_MANAGED_DOLT_HELPER_SCOPE_WD_INTERVAL_MS=50",
+		"GC_TEST_MANAGED_DOLT_HELPER_SCOPE_WD_IDLE_MS=100",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helper failed: %v\n%s", err, output)
+	}
+	doltPID, watchdogPID := readManagedDoltTestState(t, statePath)
+	t.Cleanup(func() {
+		cleanupManagedDoltTestPID(t, doltPID)
+		cleanupManagedDoltTestPID(t, watchdogPID)
+	})
+
+	// Several idle windows must pass without a reap.
+	time.Sleep(500 * time.Millisecond)
+	if !pidAlive(doltPID) {
+		logData, _ := os.ReadFile(logPath)
+		t.Fatalf("non-temp-rooted dolt pid %d reaped by idle leg; ephemeral gate failed; log:\n%s", doltPID, logData)
+	}
+	if !pidAlive(watchdogPID) {
+		logData, _ := os.ReadFile(logPath)
+		t.Fatalf("watchdog pid %d died while non-temp scope idle; log:\n%s", watchdogPID, logData)
+	}
+	logData, _ := os.ReadFile(logPath)
+	if strings.Contains(string(logData), "idle-abandonment armed") {
+		t.Errorf("idle-abandonment armed for a non-temp-rooted scope; log:\n%s", logData)
 	}
 }
 

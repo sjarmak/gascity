@@ -27,6 +27,7 @@ package main
 // watchdog dies with its server.
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -67,6 +68,22 @@ const (
 	// one full interval apart distinguish "scope permanently deleted" from
 	// "scope momentarily absent" (crash-adoption window, transient rename).
 	managedDoltScopeGoneConfirmations = 2
+
+	// managedDoltScopeWatchdogIdleEnv overrides the idle-abandonment window in
+	// milliseconds for ephemeral (temp-rooted) scopes. "0" disables the leg
+	// entirely, leaving the deleted-config anchor as the only reap trigger.
+	// Tests set a few ms so the window fires deterministically.
+	managedDoltScopeWatchdogIdleEnv = "GC_DOLT_SCOPE_WATCHDOG_IDLE_MS"
+
+	// managedDoltScopeWatchdogDefaultIdleWindow is how long a temp-rooted
+	// managed server may hold zero established client connections before the
+	// watchdog reaps it as abandoned (#4679). Temp roots (agent scratchpads,
+	// throwaway cities) are never deleted by the lifecycle, so the deleted-config
+	// anchor never fires for them; this window bounds the leak. Hours, not
+	// minutes: managed bd/dolt clients open only short-lived per-operation
+	// connections, so the window must outlast the gaps between sporadic real use
+	// to avoid reaping a slowly-used temp scope. Non-temp roots are unaffected.
+	managedDoltScopeWatchdogDefaultIdleWindow = 2 * time.Hour
 )
 
 func init() {
@@ -107,6 +124,101 @@ func managedDoltScopeWatchdogInterval() time.Duration {
 		return managedDoltScopeWatchdogDefaultInterval
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+// managedDoltScopeWatchdogIdleWindow resolves the idle-abandonment window. An
+// empty env yields the production default; a valid non-negative millisecond
+// value overrides it (0 disables the leg); a malformed value falls back to the
+// default rather than silently disabling reaping.
+func managedDoltScopeWatchdogIdleWindow() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(managedDoltScopeWatchdogIdleEnv))
+	if raw == "" {
+		return managedDoltScopeWatchdogDefaultIdleWindow
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms < 0 {
+		return managedDoltScopeWatchdogDefaultIdleWindow
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// managedDoltScopeRootEphemeral reports whether a scope root lives under the OS
+// temp dir — the only class the idle-abandonment leg reaps (#4679). Non-temp
+// roots (real cities, operator worktrees) keep the deleted-config anchor as
+// their sole liveness signal, so an idle-but-wanted server there is never
+// stopped. An empty scope root is treated as non-ephemeral (never reaped).
+func managedDoltScopeRootEphemeral(scopeRoot, tempDir string) bool {
+	if strings.TrimSpace(scopeRoot) == "" {
+		return false
+	}
+	return pathWithinOrSame(scopeRoot, tempDir)
+}
+
+// managedDoltConfigListenerPort extracts the listener port from a managed dolt
+// config file (the gc-authored YAML written by writeManagedDoltConfigFile). The
+// idle-abandonment leg needs the port to count established client connections;
+// reading it from the config the watchdog already anchors on keeps the spawn
+// path's signature unchanged. Returns (0,false) when the file is unreadable or
+// carries no parseable listener port.
+func managedDoltConfigListenerPort(configFile string) (uint16, bool) {
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		return 0, false
+	}
+	inListener := false
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		// A top-level key carries no leading indentation; the port belongs to
+		// the listener block, so only read it while inside that block.
+		if line == strings.TrimLeft(line, " \t") {
+			inListener = trimmed == "listener:"
+			continue
+		}
+		if !inListener || !strings.HasPrefix(trimmed, "port:") {
+			continue
+		}
+		value := strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "port:")), `"'`)
+		port, err := strconv.ParseUint(value, 10, 16)
+		if err != nil || port == 0 {
+			return 0, false
+		}
+		return uint16(port), true
+	}
+	return 0, false
+}
+
+// managedDoltIdleAbandonment tracks how long an ephemeral-rooted managed server
+// has held zero established client connections and reports when that idle span
+// reaches the abandonment window (#4679). It is a pure state machine driven once
+// per watchdog poll, so the reap decision is unit-testable without a live server.
+type managedDoltIdleAbandonment struct {
+	window    time.Duration
+	idleSince time.Time
+}
+
+// observe folds one poll into the idle tracker and reports whether the server
+// should now be reaped as abandoned. Any established connection, or a poll that
+// could not read /proc (readable=false), resets the idle span — the leg only
+// fires on a sustained, provable run of zero connections. A non-positive window
+// disables the leg.
+func (a *managedDoltIdleAbandonment) observe(established int, readable bool, now time.Time) bool {
+	if a.window <= 0 {
+		return false
+	}
+	if !readable || established > 0 {
+		a.idleSince = time.Time{}
+		return false
+	}
+	if a.idleSince.IsZero() {
+		a.idleSince = now
+		return false
+	}
+	return now.Sub(a.idleSince) >= a.window
 }
 
 // managedDoltScopeGone reports whether the scope anchoring a managed dolt
@@ -237,6 +349,23 @@ func runManagedDoltScopeWatchdog(args []string, stdout, stderr *os.File) int {
 	fmt.Fprintf(logFile, "gc scope watchdog: supervising dolt sql-server pid %d (config %s, poll interval %s)\n", //nolint:errcheck
 		cmd.Process.Pid, configFile, interval)
 
+	// Idle-abandonment leg (#4679): temp-rooted scopes are never deleted by the
+	// lifecycle, so the deleted-config anchor never reaps them. Arm a second leg
+	// that reaps a temp-rooted server after a sustained run of zero established
+	// client connections. Non-temp roots and configs without a parseable
+	// listener port keep the deleted-config anchor as their only trigger.
+	idleWindow := managedDoltScopeWatchdogIdleWindow()
+	var idle *managedDoltIdleAbandonment
+	var idlePort uint16
+	if idleWindow > 0 && managedDoltScopeRootEphemeral(cityPath, os.TempDir()) {
+		if port, ok := managedDoltConfigListenerPort(configFile); ok {
+			idle = &managedDoltIdleAbandonment{window: idleWindow}
+			idlePort = port
+			fmt.Fprintf(logFile, "gc scope watchdog: idle-abandonment armed for temp-rooted scope %s (port %d, window %s)\n", //nolint:errcheck
+				cityPath, idlePort, idleWindow)
+		}
+	}
+
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
@@ -257,6 +386,16 @@ func runManagedDoltScopeWatchdog(args []string, stdout, stderr *os.File) int {
 		case <-ticker.C:
 			if !managedDoltScopeGone(configFile) {
 				goneStreak = 0
+				if idle != nil {
+					established, readable := establishedConnectionCountForPort(idlePort)
+					if idle.observe(established, readable, time.Now()) {
+						fmt.Fprintf(logFile, "gc scope watchdog: temp-rooted scope %s idle (0 established conns on port %d) for %s; terminating dolt sql-server pid %d\n", //nolint:errcheck
+							cityPath, idlePort, idleWindow, cmd.Process.Pid)
+						_ = terminateManagedDoltScopeWatchdogChild(cityPath, cmd.Process.Pid, startTicks, startIdentity)
+						<-done
+						return 0
+					}
+				}
 				continue
 			}
 			goneStreak++

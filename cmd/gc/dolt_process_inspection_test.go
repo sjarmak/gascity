@@ -11,6 +11,37 @@ import (
 	"time"
 )
 
+func TestCountEstablishedForPortInProcData(t *testing.T) {
+	// Trimmed /proc/net/tcp lines: header + rows in various states/ports. Field
+	// layout matches the kernel format (sl, local_address, rem_address, st, ...).
+	// Port 0x0CEA = 3306; 0x1F90 = 8080. States: 01 ESTABLISHED, 0A LISTEN.
+	data := strings.Join([]string{
+		"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+		"   0: 0100007F:0CEA 0100007F:B3A2 01 00000000:00000000 00:00000000 00000000  1000        0 100 1 0 0",
+		"   1: 0100007F:0CEA 0100007F:C4B1 01 00000000:00000000 00:00000000 00000000  1000        0 101 1 0 0",
+		"   2: 0100007F:0CEA 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 102 1 0 0", // LISTEN, excluded
+		"   3: 0100007F:1F90 0100007F:D5C2 01 00000000:00000000 00:00000000 00000000  1000        0 103 1 0 0", // other port
+		"short line",
+	}, "\n")
+
+	cases := []struct {
+		name string
+		port uint16
+		want int
+	}{
+		{"two established on 3306 (listen row on same port excluded)", 3306, 2},
+		{"one established on 8080", 8080, 1},
+		{"unused port", 9999, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := countEstablishedForPortInProcData(data, tc.port); got != tc.want {
+				t.Errorf("countEstablishedForPortInProcData(port=%d) = %d, want %d", tc.port, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestProcessArgsFromPSReturnsWhenPSHangs(t *testing.T) {
 	binDir := t.TempDir()
 	psPath := filepath.Join(binDir, "ps")

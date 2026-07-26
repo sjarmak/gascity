@@ -404,6 +404,52 @@ func listeningSocketInodesFromProc(port uint16) (map[string]struct{}, bool) {
 	return inodes, checked
 }
 
+// establishedConnectionCountForPort counts ESTABLISHED (/proc state 01) TCP
+// sockets whose local port equals port — the managed server's accepted client
+// connections. It mirrors listeningSocketInodesFromProc's source and parsing;
+// the bool reports whether at least one proc table was readable, so a caller can
+// distinguish "genuinely zero connections" from "could not tell" (a degraded
+// /proc must never be read as idle). Only established (01) sockets count: the
+// server's own listener (0A) and reaped per-call sockets are excluded.
+func establishedConnectionCountForPort(port uint16) (int, bool) {
+	count := 0
+	checked := false
+	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		checked = true
+		count += countEstablishedForPortInProcData(string(data), port)
+	}
+	return count, checked
+}
+
+// countEstablishedForPortInProcData counts ESTABLISHED sockets with the given
+// local port in one /proc/net/tcp{,6} table's contents. Split out from
+// establishedConnectionCountForPort so the line parsing is unit-testable without
+// a live /proc.
+func countEstablishedForPortInProcData(data string, port uint16) int {
+	count := 0
+	scanner := bufio.NewScanner(strings.NewReader(data))
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 4 || fields[3] != "01" {
+			continue
+		}
+		_, portHex, ok := strings.Cut(fields[1], ":")
+		if !ok {
+			continue
+		}
+		gotPort, err := strconv.ParseUint(portHex, 16, 16)
+		if err != nil || uint16(gotPort) != port {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
 func processWithSocketInodes(inodes map[string]struct{}) int {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
