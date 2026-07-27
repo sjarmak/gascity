@@ -19,14 +19,14 @@ ARG BASE_IMAGE=gc-agent-base:latest
 
 FROM golang:1.26.5-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS bd-builder
 
-ARG BD_VERSION=v1.1.0
-ARG BD_SOURCE_REF=8e4e59d39f3459a43cf21a3236a13eca4dd874f7
-ARG BD_SOURCE_SHA256=63597b6b368d7d26ba3fc570ae3b2fa4cd8a5155d4716cae13d178a560808d5a
-ARG BD_BUILD=8e4e59d39
+ARG BD_VERSION=v1.1.2
+ARG BD_SOURCE_REF=20e493e569c922d1253bdeff068c5e56c94957fb
+ARG BD_SOURCE_SHA256=89f479332c0381e0fdd3c7fd2c79f0d345c5ff4c70f5318ed0409501c2ed16ad
+ARG BD_BUILD=20e493e56
 ARG BD_BRANCH=HEAD
 ARG GRPC_VERSION=1.82.1
 
-# The published bd 1.1.0 binary embeds vulnerable grpc-go 1.80.0. Rebuild the
+# The published bd 1.1.2 binary embeds vulnerable grpc-go 1.80.0. Rebuild the
 # exact released source with its production CGO/pure-Go-regex configuration and
 # release identity, changing only the patched dependency version.
 RUN mkdir -p /src/bd /out \
