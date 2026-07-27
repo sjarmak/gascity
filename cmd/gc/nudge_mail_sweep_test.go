@@ -135,6 +135,44 @@ func TestSweepStaleNudgeMail_InFlightExclusion(t *testing.T) {
 	t.Errorf("in-flight nudge bead was swept; it should be skipped")
 }
 
+// TestSweepStaleNudgeMail_QueuedUnexpiredSurvives reproduces #4299: a queued,
+// undelivered nudge for a busy session (turn-start delivery skipped, so it is
+// absent from Pending/InFlight) must ride its own 24h expires_at, not the 10-minute
+// retention cutoff. The sweep must protect the still-unexpired nudge while still
+// closing a queued nudge that is genuinely past its expiry, so nothing leaks.
+func TestSweepStaleNudgeMail_QueuedUnexpiredSurvives(t *testing.T) {
+	now := time.Date(2026, 7, 10, 6, 0, 0, 0, time.UTC)
+	nudgeTTL := 10 * time.Minute
+
+	queuedWithExpiry := func(beadID, nudgeID string, expiresAt time.Time) beads.Bead {
+		b := nudgeSeed(beadID, nudgeID, now.Add(-nudgeTTL-time.Second))
+		b.Metadata["expires_at"] = expiresAt.UTC().Format(time.RFC3339)
+		return b
+	}
+	seed := []beads.Bead{
+		queuedWithExpiry("bead-unexpired", "nudge-unexpired", now.Add(23*time.Hour)),
+		queuedWithExpiry("bead-expired", "nudge-expired", now.Add(-time.Hour)),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeTTL, time.Hour, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NudgeClosed != 1 {
+		t.Errorf("NudgeClosed = %d, want 1 (only the expired queued nudge; the unexpired one is protected)", result.NudgeClosed)
+	}
+
+	// Confirm the unexpired queued nudge's bead is still open.
+	open, _ := store.ListOpen()
+	for _, b := range open {
+		if b.Metadata["nudge_id"] == "nudge-unexpired" {
+			return // survived — correct
+		}
+	}
+	t.Errorf("unexpired queued nudge was swept ~%s after creation, ~%s before its expiry; it must survive to expires_at (#4299)", nudgeTTL, 23*time.Hour)
+}
+
 func TestSweepStaleNudgeMail_OpenStatusFilter(t *testing.T) {
 	// AC2: already-closed mail beads do not produce a false failure.
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)

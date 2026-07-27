@@ -36,6 +36,12 @@ const nudgeBeadLabel = "gc:nudge"
 // nudgeBeadType is the bead type used for queued-nudge shadow beads.
 const nudgeBeadType = "chore"
 
+// nudgeStateQueued is the lifecycle "state" stamped on an enqueued-but-undelivered
+// nudge shadow bead (see Save). A queued nudge is live work awaiting delivery, not
+// a consumed nudge, so retention GC must not sweep it before its own expires_at
+// (see StaleShadowsBefore, #4299).
+const nudgeStateQueued = "queued"
+
 // NudgeShadow is the partial, read-only view decoded from a nudge shadow bead.
 // It carries ONLY the fields the bead is authoritative for: the controller-
 // stamped terminal fields (State / TerminalReason / CommitBoundary) plus
@@ -164,7 +170,7 @@ func (s *Store) Save(item Item) (beadID string, created bool, err error) {
 		"agent":              item.Agent,
 		"session_id":         item.SessionID,
 		"continuation_epoch": item.ContinuationEpoch,
-		"state":              "queued",
+		"state":              nudgeStateQueued,
 		"source":             item.Source,
 		"message":            item.Message,
 		"deliver_after":      item.DeliverAfter.UTC().Format(time.RFC3339),
@@ -308,21 +314,31 @@ func (s *Store) SweepStale(beadID, closeReason string, now time.Time) error {
 }
 
 // StaleShadowsBefore lists stale nudge shadows created before `before`, oldest
-// first, EXCLUDING any whose durable nudge id is in liveExcludeIDs — the live
+// first, EXCLUDING (1) any whose durable nudge id is in liveExcludeIDs — the live
 // flock-queue set (nudgequeue.State Pending/InFlight ids) a caller must never
-// sweep. It is the typed read behind the retention sweep and its dry-run twin:
-// callers iterate the returned NudgeShadow values, reading shadow.Open in place
-// of a raw b.Status crack and shadow.BeadID for the close target, instead of
-// holding raw beads and calling the deleted DecodeShadow.
+// sweep — and (2) any still-queued (undelivered) nudge whose own expires_at is
+// still in the future relative to `now`. It is the typed read behind the
+// retention sweep and its dry-run twin: callers iterate the returned NudgeShadow
+// values, reading shadow.Open in place of a raw b.Status crack and shadow.BeadID
+// for the close target.
 //
-// The query is byte-identical to the prior StaleCandidatesBefore (the gc:nudge
-// label, CreatedBefore cutoff, oldest-first sort, both storage tiers), so the
-// candidate set the sweep and dry-run see is unchanged. limit caps the number of
-// candidate beads FETCHED (0 or negative == unbounded); the caller keeps its own
-// cross-phase close budget on top, so the live exclusion moving inside here does
-// not alter which beads the budget-limited loop closes. It is nil-receiver safe
-// and callable inside the withNudgeQueueState flock transaction.
-func (s *Store) StaleShadowsBefore(before time.Time, limit int, liveExcludeIDs map[string]bool) ([]NudgeShadow, error) {
+// Exclusion (2) closes #4299: turn-start delivery is skipped for a busy session
+// by design, so a queued nudge that is absent from the live Pending/InFlight set
+// is NOT consumed. Sweeping it on the short created-before retention cutoff would
+// collapse its effective TTL from hours to the cutoff and destroy an undelivered
+// notification. A queued nudge past its expiry (and any consumed/terminal nudge)
+// is still returned, so nothing leaks. `now` and expires_at are absolute instants,
+// so the expiry compare is host-clock-offset invariant — the suspected
+// local-vs-UTC mix in the created-before cutoff cannot resurface here.
+//
+// The candidate query is byte-identical to the prior form (the gc:nudge label,
+// CreatedBefore cutoff, oldest-first sort, both storage tiers); the queued-expiry
+// guard only drops beads that were never safe to sweep, so the sweep and its
+// dry-run twin stay identical. limit caps the number of candidate beads FETCHED
+// (0 or negative == unbounded); the caller keeps its own cross-phase close budget
+// on top. It is nil-receiver safe and callable inside the withNudgeQueueState
+// flock transaction.
+func (s *Store) StaleShadowsBefore(before, now time.Time, limit int, liveExcludeIDs map[string]bool) ([]NudgeShadow, error) {
 	if s == nil || s.store.Store == nil {
 		return nil, nil
 	}
@@ -343,6 +359,13 @@ func (s *Store) StaleShadowsBefore(before time.Time, limit int, liveExcludeIDs m
 	for _, b := range candidates {
 		shadow := decodeNudgeItem(b)
 		if id := strings.TrimSpace(shadow.ID); id != "" && liveExcludeIDs[id] {
+			continue
+		}
+		// A queued nudge rides its own expires_at TTL; never sweep it before
+		// that expiry (#4299). A queued nudge with no recorded expiry, an
+		// expired queued nudge, and any consumed/terminal nudge remain sweep
+		// candidates, so existing retention behavior is unchanged.
+		if shadow.State == nudgeStateQueued && !shadow.ExpiresAt.IsZero() && now.Before(shadow.ExpiresAt) {
 			continue
 		}
 		shadows = append(shadows, shadow)
