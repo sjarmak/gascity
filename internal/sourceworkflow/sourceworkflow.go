@@ -425,10 +425,15 @@ func CloseWorkflowSubtreeAs(store beads.Store, rootID, outcome, reason string, r
 	if len(ordered) == 0 {
 		return 0, nil
 	}
-	base := map[string]string{
+	// Clear executable routes on every closed member so a cascade close (force
+	// replace, drain teardown, and the false-premise workflow wind-down of
+	// gpk-n29sn) removes gc.routed_to / gc.execution_routed_to through the same
+	// write, rather than leaving a routed-but-closed step for the reaper to sweep
+	// (gpk-3vmjj, gpk-0see3).
+	base := beadmeta.DisarmExecutableRoutes(map[string]string{
 		beadmeta.OutcomeMetadataKey: outcome,
 		"close_reason":              reason,
-	}
+	})
 	if len(rootExtra) == 0 {
 		return store.CloseAll(ordered, base)
 	}
@@ -452,10 +457,10 @@ func CloseWorkflowSubtreeAs(store beads.Store, rootID, outcome, reason string, r
 		total += n
 	}
 	if rootOpen {
-		rootMeta := map[string]string{
+		rootMeta := beadmeta.DisarmExecutableRoutes(map[string]string{
 			beadmeta.OutcomeMetadataKey: outcome,
 			"close_reason":              reason,
-		}
+		})
 		for k, v := range rootExtra {
 			rootMeta[k] = v
 		}

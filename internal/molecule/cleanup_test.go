@@ -375,3 +375,60 @@ func TestCloseSubtree_StampsCloseReason(t *testing.T) {
 		}
 	}
 }
+
+// TestCloseSubtreeDisarmsExecutableRoutes pins gc-mcewr item (3) for molecule
+// teardown: force-closing a molecule subtree must clear gc.routed_to and
+// gc.execution_routed_to on every closed member in the same write, so a
+// routed-but-closed step cannot be re-fed by the pool worker query or the
+// route-recovery restamper (gpk-3vmjj, gpk-0see3). gc.run_target is preserved.
+func TestCloseSubtreeDisarmsExecutableRoutes(t *testing.T) {
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title: "root",
+		Type:  "molecule",
+		Metadata: map[string]string{
+			"gc.routed_to":           "pool:reviewers",
+			"gc.execution_routed_to": "pool:reviewers",
+			"gc.run_target":          "pool:reviewers",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+	child, err := store.Create(beads.Bead{
+		Title:    "child",
+		ParentID: root.ID,
+		Metadata: map[string]string{
+			"gc.routed_to":           "polecat-4",
+			"gc.execution_routed_to": "control-dispatcher",
+			"gc.run_target":          "polecat-4",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+
+	closed, err := CloseSubtree(store, root.ID)
+	if err != nil {
+		t.Fatalf("CloseSubtree: %v", err)
+	}
+	if closed != 2 {
+		t.Fatalf("CloseSubtree closed %d beads, want 2", closed)
+	}
+
+	for _, id := range []string{root.ID, child.ID} {
+		bead, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got := bead.Metadata["gc.routed_to"]; got != "" {
+			t.Errorf("%s gc.routed_to = %q, want cleared", id, got)
+		}
+		if got := bead.Metadata["gc.execution_routed_to"]; got != "" {
+			t.Errorf("%s gc.execution_routed_to = %q, want cleared", id, got)
+		}
+		if got := bead.Metadata["gc.run_target"]; got == "" {
+			t.Errorf("%s gc.run_target was cleared, want preserved", id)
+		}
+	}
+}

@@ -9723,6 +9723,178 @@ func TestProcessControlClosesControlWhenWorkflowRootCanceled(t *testing.T) {
 	}
 }
 
+// TestProcessControlClosesControlWhenWorkflowRootTerminal pins gc-mcewr items
+// (1) and (3): a still-open control bead whose workflow root has reached a
+// terminal (closed) status by an ordinary close — not a cancel — must be closed
+// once as skipped, with its executable routes disarmed through the closure path,
+// so the dispatcher and route-recovery restamper cannot re-feed a descendant of
+// a terminal goal (the incoming review goals gpk-szkxh / gpk-bnmnf whose
+// dangling mol-pr-review descendants were dispatched again; gpk-3vmjj, gpk-0see3).
+func TestProcessControlClosesControlWhenWorkflowRootTerminal(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title:    "terminal review goal",
+		Type:     "molecule",
+		Status:   "open",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+	// Ordinary terminal close of the goal (no cancel marker, no cancel outcome).
+	if err := store.Close(root.ID); err != nil {
+		t.Fatalf("close root: %v", err)
+	}
+	control, err := store.Create(beads.Bead{
+		Title:  "dangling review descendant under terminal goal",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.kind":                "fanout",
+			"gc.root_bead_id":        root.ID,
+			"gc.root_store_ref":      "rig:gascity",
+			"gc.routed_to":           "polecat-4",
+			"gc.execution_routed_to": "control-dispatcher",
+			"gc.run_target":          "polecat-4",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create control: %v", err)
+	}
+
+	var traceBuf bytes.Buffer
+	opts := ProcessOptions{
+		Tracef: func(format string, args ...any) {
+			fmt.Fprintf(&traceBuf, format, args...)
+			traceBuf.WriteByte('\n')
+		},
+	}
+
+	result, err := ProcessControl(store, control, opts)
+	if err != nil {
+		t.Fatalf("ProcessControl: %v", err)
+	}
+	if !result.Processed || result.Action != "terminal-root" {
+		t.Fatalf("result = %+v, want processed terminal-root", result)
+	}
+	after := mustGetBead(t, store, control.ID)
+	if after.Status != "closed" {
+		t.Fatalf("status = %q, want closed", after.Status)
+	}
+	if after.Metadata["gc.outcome"] != "skipped" {
+		t.Fatalf("gc.outcome = %q, want skipped", after.Metadata["gc.outcome"])
+	}
+	// The route must be disarmed through the close write itself (item 3), not
+	// merely ignored by readers, so the reaper has nothing to sweep.
+	if got := after.Metadata["gc.routed_to"]; got != "" {
+		t.Fatalf("gc.routed_to = %q, want cleared through the closure path", got)
+	}
+	if got := after.Metadata["gc.execution_routed_to"]; got != "" {
+		t.Fatalf("gc.execution_routed_to = %q, want cleared through the closure path", got)
+	}
+	// A terminal-root release is not a failure.
+	if got := after.Metadata["gc.failure_reason"]; got != "" {
+		t.Fatalf("gc.failure_reason = %q, want empty", got)
+	}
+	traced := traceBuf.String()
+	if !strings.Contains(traced, "close reason=root_terminal") {
+		t.Fatalf("trace missing root_terminal close reason; got:\n%s", traced)
+	}
+}
+
+// TestCloseOrphanedControlLeavesLiveRootDescendantRouted pins gc-mcewr item (4):
+// a control bead under a LIVE (open) workflow root is left untouched by the
+// orphan/terminal gate — its route survives and it proceeds to normal dispatch.
+// This guards the valid outgoing self-review path against the terminal-root gate
+// firing on a healthy workflow.
+func TestCloseOrphanedControlLeavesLiveRootDescendantRouted(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title:    "live self-review goal",
+		Type:     "molecule",
+		Status:   "open",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+	control, err := store.Create(beads.Bead{
+		Title:  "routed descendant under live root",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.kind":                "fanout",
+			"gc.root_bead_id":        root.ID,
+			"gc.root_store_ref":      "rig:gascity",
+			"gc.routed_to":           "polecat-4",
+			"gc.execution_routed_to": "control-dispatcher",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create control: %v", err)
+	}
+
+	result, handled, err := closeOrphanedControl(store, control, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("closeOrphanedControl: %v", err)
+	}
+	if handled {
+		t.Fatalf("gate handled a control bead under a live root: %+v", result)
+	}
+	after := mustGetBead(t, store, control.ID)
+	if after.Status != "open" {
+		t.Fatalf("status = %q, want open (live root descendant must not be closed)", after.Status)
+	}
+	if got := after.Metadata["gc.routed_to"]; got != "polecat-4" {
+		t.Fatalf("gc.routed_to = %q, want preserved for a live-root descendant", got)
+	}
+	if got := after.Metadata["gc.execution_routed_to"]; got != "control-dispatcher" {
+		t.Fatalf("gc.execution_routed_to = %q, want preserved for a live-root descendant", got)
+	}
+}
+
+// TestSetOutcomeAndClosePreservesWorkflowRootDisplayRoute guards the fix for the
+// exact-head review finding: a workflow root's gc.routed_to doubles as the run's
+// display-projection target (workflowProjectionTarget / runFormulaTarget) and
+// graph.v2 deletes gc.run_target on the root, so a normal-completion close of
+// the root (processWorkflowFinalize -> setOutcomeAndClose) must NOT disarm it.
+// Only force-released dispatch-target control beads lose their routes on close.
+func TestSetOutcomeAndClosePreservesWorkflowRootDisplayRoute(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title:  "completed run root",
+		Type:   "molecule",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.kind":      "workflow",
+			"gc.routed_to": "pool:reviewers",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+
+	if err := setOutcomeAndClose(store, root.ID, "pass"); err != nil {
+		t.Fatalf("setOutcomeAndClose: %v", err)
+	}
+	after := mustGetBead(t, store, root.ID)
+	if after.Status != "closed" {
+		t.Fatalf("status = %q, want closed", after.Status)
+	}
+	if after.Metadata["gc.outcome"] != "pass" {
+		t.Fatalf("gc.outcome = %q, want pass", after.Metadata["gc.outcome"])
+	}
+	if got := after.Metadata["gc.routed_to"]; got != "pool:reviewers" {
+		t.Fatalf("gc.routed_to = %q, want preserved (root route is the run's display target)", got)
+	}
+}
+
 // TestProcessWorkflowFinalize_PurgesMoleculeArtifactDir verifies that
 // when a workflow finalizes, the molecule-scoped artifact directory is
 // removed so disk does not leak and a successor run with the same root

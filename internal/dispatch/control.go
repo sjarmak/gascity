@@ -1756,6 +1756,15 @@ func copyNonGCMetadata(dst, src map[string]string) {
 
 func updateMetadataAndClose(store beads.Store, beadID string, metadata map[string]string) error {
 	status := "closed"
+	// NOTE: route disarm is deliberately NOT applied here. This helper also
+	// closes the workflow ROOT (processWorkflowFinalize's setOutcomeAndClose on
+	// rootID), and a root's gc.routed_to doubles as the run's display-projection
+	// target (workflowProjectionTarget / runFormulaTarget) with no gc.run_target
+	// to fall back to (graphroute deletes it on the root). Route disarm on
+	// force-release is applied by the specific caller maps that close a routed
+	// dispatch-target control bead (closeCanceledControl, closeSupersededControl,
+	// the missing-root orphan close) so normal completion keeps the root's
+	// display target intact.
 	if err := store.Update(beadID, beads.UpdateOpts{
 		Status:   &status,
 		Metadata: metadata,

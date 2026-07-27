@@ -954,3 +954,70 @@ func TestSnapshotRestoreWorkflowBeadsRestoresMutableState(t *testing.T) {
 		t.Fatalf("child unrelated metadata = %q, want keep", got)
 	}
 }
+
+// TestCloseWorkflowSubtreeDisarmsExecutableRoutes pins gc-mcewr item (3): the
+// cascade close that winds down a false-premise workflow (gpk-n29sn) must clear
+// gc.routed_to and gc.execution_routed_to on every closed member in the same
+// write, so a routed-but-closed step is not left for the blocked-routed-reaper
+// to sweep after the fact (the gpk-3vmjj / gpk-0see3 re-route incidents). The
+// non-executable gc.run_target recovery pointer is preserved.
+func TestCloseWorkflowSubtreeDisarmsExecutableRoutes(t *testing.T) {
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title: "root",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":                "workflow",
+			"gc.routed_to":           "pool:reviewers",
+			"gc.execution_routed_to": "pool:reviewers",
+			"gc.run_target":          "pool:reviewers",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+	child, err := store.Create(beads.Bead{
+		Title:    "child",
+		Type:     "task",
+		ParentID: root.ID,
+		Metadata: map[string]string{
+			"gc.root_bead_id":        root.ID,
+			"gc.routed_to":           "polecat-4",
+			"gc.execution_routed_to": "control-dispatcher",
+			"gc.run_target":          "polecat-4",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(child): %v", err)
+	}
+	if err := store.DepAdd(child.ID, root.ID, "parent-child"); err != nil {
+		t.Fatalf("DepAdd(child): %v", err)
+	}
+
+	closed, err := CloseWorkflowSubtree(store, root.ID)
+	if err != nil {
+		t.Fatalf("CloseWorkflowSubtree: %v", err)
+	}
+	if closed != 2 {
+		t.Fatalf("CloseWorkflowSubtree closed %d beads, want 2", closed)
+	}
+
+	for _, id := range []string{root.ID, child.ID} {
+		bead, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if bead.Status != "closed" {
+			t.Fatalf("bead %s status = %q, want closed", id, bead.Status)
+		}
+		if got := bead.Metadata["gc.routed_to"]; got != "" {
+			t.Errorf("bead %s gc.routed_to = %q, want cleared", id, got)
+		}
+		if got := bead.Metadata["gc.execution_routed_to"]; got != "" {
+			t.Errorf("bead %s gc.execution_routed_to = %q, want cleared", id, got)
+		}
+		if got := bead.Metadata["gc.run_target"]; got == "" {
+			t.Errorf("bead %s gc.run_target was cleared, want preserved (non-executable recovery intent)", id)
+		}
+	}
+}

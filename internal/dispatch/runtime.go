@@ -217,6 +217,21 @@ func closeOrphanedControl(store beads.Store, bead beads.Bead, opts ProcessOption
 		if rootCanceled(root) {
 			return closeCanceledControl(store, bead, opts, rootID, rootStoreRef)
 		}
+		// A root that has reached a terminal (closed) status by an ordinary close
+		// — all-steps-done finalize, molecule autoclose, or an operator `bd close`
+		// of the goal — is also a durable stop. A still-open control bead under it
+		// can make no further progress, yet it keeps its gc.routed_to route, so the
+		// pool worker query and route-recovery restamper re-feed it (the terminal
+		// incoming-review goals gpk-szkxh / gpk-bnmnf whose dangling mol-pr-review
+		// descendants were dispatched again; gpk-3vmjj, gpk-0see3). Close it once
+		// as skipped so the route is disarmed through the closure path and the
+		// workflow is not re-dispatched. Normal completion closes descendants
+		// before the root (molecule autoclose runs child->root), so an open
+		// descendant under a closed root is always this anomaly, never the happy
+		// path.
+		if rootTerminal(root) {
+			return closeSupersededControl(store, bead, opts, rootID, rootStoreRef)
+		}
 		return ControlResult{}, false, nil
 	} else if !errors.Is(err, beads.ErrNotFound) {
 		return ControlResult{}, false, fmt.Errorf("%s: loading workflow root %s: %w", bead.ID, rootID, err)
@@ -224,13 +239,13 @@ func closeOrphanedControl(store beads.Store, bead beads.Bead, opts ProcessOption
 
 	opts.tracef("process-control bead=%s kind=%s close reason=missing_workflow_root root=%s store_ref=%s",
 		bead.ID, bead.Metadata[beadmeta.KindMetadataKey], rootID, rootStoreRef)
-	closeMetadata := map[string]string{
+	closeMetadata := beadmeta.DisarmExecutableRoutes(map[string]string{
 		beadmeta.OutcomeMetadataKey:           beadmeta.OutcomeFail,
 		beadmeta.FailureClassMetadataKey:      beadmeta.FailureClassHard,
 		beadmeta.FailureReasonMetadataKey:     "missing_workflow_root",
 		beadmeta.FinalDispositionMetadataKey:  beadmeta.DispositionOrphanedWorkflow,
 		beadmeta.MissingRootBeadIDMetadataKey: rootID,
-	}
+	})
 	clearControllerSpawnErrorMetadata(closeMetadata)
 	if err := updateMetadataAndClose(store, bead.ID, closeMetadata); err != nil {
 		return ControlResult{}, true, fmt.Errorf("%s: closing orphaned control: %w", bead.ID, err)
@@ -256,15 +271,57 @@ func rootCanceled(root beads.Bead) bool {
 func closeCanceledControl(store beads.Store, bead beads.Bead, opts ProcessOptions, rootID, rootStoreRef string) (ControlResult, bool, error) {
 	opts.tracef("process-control bead=%s kind=%s close reason=root_canceled root=%s store_ref=%s",
 		bead.ID, bead.Metadata[beadmeta.KindMetadataKey], rootID, rootStoreRef)
-	closeMetadata := map[string]string{
+	// Disarm the released control bead's executable routes in the same close
+	// write so the dispatcher / route-recovery restamper cannot re-feed it under
+	// the canceled run (gpk-3vmjj, gpk-0see3).
+	closeMetadata := beadmeta.DisarmExecutableRoutes(map[string]string{
 		beadmeta.OutcomeMetadataKey: beadmeta.OutcomeCanceled,
 		"close_reason":              controlRootCanceledCloseReason,
-	}
+	})
 	clearControllerSpawnErrorMetadata(closeMetadata)
 	if err := updateMetadataAndClose(store, bead.ID, closeMetadata); err != nil {
 		return ControlResult{}, true, fmt.Errorf("%s: closing canceled control: %w", bead.ID, err)
 	}
 	return ControlResult{Processed: true, Action: "canceled-workflow"}, true, nil
+}
+
+// rootTerminal reports whether a workflow root has reached a terminal (closed)
+// status by an ordinary close (an all-steps-done finalize, a molecule autoclose,
+// or an operator `bd close` of the goal). Bead.Status decodes only as
+// open/in_progress/closed (mapBdStatus collapses blocked/deferred to open), so a
+// merely non-runnable root is not treated as terminal here. rootCanceled is
+// checked before this, so a canceled root (also closed) keeps its distinct
+// gc.outcome=canceled disposition instead of falling through to skipped.
+func rootTerminal(root beads.Bead) bool {
+	return root.Status == "closed"
+}
+
+// controlRootTerminalCloseReason is stamped on a control bead closed because its
+// workflow root was already terminal, distinguishing this gate from the
+// cancellation and missing-root orphan closes above.
+const controlRootTerminalCloseReason = "control closed: workflow root already terminal"
+
+// closeSupersededControl closes a still-open control bead whose workflow root
+// has already reached a terminal (non-canceled) close, stamping
+// gc.outcome=skipped to match the CloseWorkflowSubtree wind-down. The close
+// routes through updateMetadataAndClose, which disarms gc.routed_to /
+// gc.execution_routed_to in the same write so the released descendant cannot be
+// re-fed by the dispatcher or route-recovery restamper.
+func closeSupersededControl(store beads.Store, bead beads.Bead, opts ProcessOptions, rootID, rootStoreRef string) (ControlResult, bool, error) {
+	opts.tracef("process-control bead=%s kind=%s close reason=root_terminal root=%s store_ref=%s",
+		bead.ID, bead.Metadata[beadmeta.KindMetadataKey], rootID, rootStoreRef)
+	// Disarm the released descendant's executable routes in the same close write
+	// so a still-open control bead under a terminal goal is not re-fed by the
+	// dispatcher or route-recovery restamper (gpk-3vmjj, gpk-0see3).
+	closeMetadata := beadmeta.DisarmExecutableRoutes(map[string]string{
+		beadmeta.OutcomeMetadataKey: beadmeta.OutcomeSkipped,
+		"close_reason":              controlRootTerminalCloseReason,
+	})
+	clearControllerSpawnErrorMetadata(closeMetadata)
+	if err := updateMetadataAndClose(store, bead.ID, closeMetadata); err != nil {
+		return ControlResult{}, true, fmt.Errorf("%s: closing superseded control: %w", bead.ID, err)
+	}
+	return ControlResult{Processed: true, Action: "terminal-root"}, true, nil
 }
 
 func (opts ProcessOptions) tracef(format string, args ...any) {

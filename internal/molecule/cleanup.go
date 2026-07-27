@@ -141,7 +141,11 @@ func CloseSubtree(store beads.Store, rootID string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return store.CloseAll(ordered, map[string]string{
+	// Clear executable routes on every closed member in the same write so a
+	// molecule teardown removes gc.routed_to / gc.execution_routed_to through the
+	// closure path, not after the fact via the blocked-routed-reaper (gpk-3vmjj,
+	// gpk-0see3).
+	return store.CloseAll(ordered, beadmeta.DisarmExecutableRoutes(map[string]string{
 		"close_reason": SubtreeClosedReason,
-	})
+	}))
 }
