@@ -273,7 +273,7 @@ jobs:
     runs-on: ${{ needs.runner-policy.outputs.runner_32vcpu }}
     env:
       DOLT_VERSION: "2.1.7"
-      BD_VERSION: "v1.1.0"
+      BD_VERSION: "v1.1.2"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: ./.github/actions/setup-gascity-ubuntu
@@ -302,7 +302,7 @@ jobs:
     runs-on: ${{ needs.runner-policy.outputs.runner_32vcpu }}
     env:
       DOLT_VERSION: "2.1.7"
-      BD_VERSION: "v1.1.0"
+      BD_VERSION: "v1.1.2"
     strategy:
       fail-fast: false
       matrix:
@@ -372,9 +372,10 @@ jobs:
   # Cross-version contract gate: the "current" cell of the bd matrix. The
   # "prev" cell is contract-acceptance-previous above (the min-supported
   # release). This cell builds bd from gastownhall/beads source at
-  # BD_CURRENT_REF (deps.env) — the bleeding-edge rc has no release tarball —
-  # and runs the same focused CLI contract, so a bd change that breaks gc's
-  # decoder/classifier surface against the newer bd is caught before merge.
+  # BD_CURRENT_REF (deps.env) and runs the same focused CLI contract, so a bd
+  # change that breaks gc's decoder/classifier surface against the newer bd is
+  # caught before merge. The source-build path remains distinct even when the
+  # current version equals the archive-installed default.
   # Path-gated on the beads filter; tolerated as a skip by the Check gate.
   contract-acceptance-current:
     name: Contract / acceptance A (bd current)
@@ -562,7 +563,7 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     env:
       DOLT_VERSION: "2.1.7"
-      BD_VERSION: "v1.1.0"
+      BD_VERSION: "v1.1.2"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: ./.github/actions/setup-gascity-ubuntu
@@ -716,7 +717,7 @@ jobs:
             command: ./scripts/test-integration-shard rest-smoke-2-of-2
     env:
       DOLT_VERSION: "2.1.7"
-      BD_VERSION: "v1.1.0"
+      BD_VERSION: "v1.1.2"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: ./.github/actions/setup-gascity-ubuntu
@@ -743,7 +744,7 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     env:
       DOLT_VERSION: "2.1.7"
-      BD_VERSION: "v1.1.0"
+      BD_VERSION: "v1.1.2"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: ./.github/actions/setup-gascity-ubuntu

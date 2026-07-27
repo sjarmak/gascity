@@ -8,18 +8,19 @@ import (
 	"strings"
 	"testing"
 
+	semver "github.com/Masterminds/semver/v3"
 	"github.com/gastownhall/gascity/internal/deps"
 )
 
 // TestBDVersionPins keeps every independently-edited bd version anchor in
 // lockstep, the same way TestDoltVersionPins does for Dolt. Before this test the
-// bd floors drifted apart: deps.env BD_VERSION, the init hard-dependency floor
-// bdMinVersion, the ready-projection feature floor bdReadyProjectionMinVersion,
-// the bd_compatibility config enum, and the install-bd-archive.sh SHA table were
-// all hand-edited with no cross-check, so a regression like #3135 (a 1.0.5 flag
-// emitted ahead of the pinned 1.0.4 floor) could merge green. This test makes
-// deps.env the single source of truth and fails loudly the moment an anchor
-// moves without the others.
+// bd floors drifted apart: deps.env BD_VERSION, the linked beads module, the
+// init hard-dependency floor bdMinVersion, the ready-projection feature floor
+// bdReadyProjectionMinVersion, the bd_compatibility config enum, and the
+// install-bd-archive.sh SHA table were all hand-edited with no cross-check, so
+// a regression like #3135 (a 1.0.5 flag emitted ahead of the pinned 1.0.4
+// floor) could merge green. This test makes deps.env the single source of truth
+// and fails loudly the moment an anchor moves without the others.
 func TestBDVersionPins(t *testing.T) {
 	root := repoRoot(t)
 	env := readDotenv(t, filepath.Join(root, "deps.env"))
@@ -37,6 +38,15 @@ func TestBDVersionPins(t *testing.T) {
 	}
 	if bdCurrent == "" {
 		t.Fatal("deps.env missing BD_CURRENT_VERSION (the bleeding-edge contract-matrix cell)")
+	}
+
+	goMod := readFile(t, root, "go.mod")
+	linkedVersion := regexp.MustCompile(`(?m)^\s*github\.com/steveyegge/beads\s+(v[^\s]+)`).FindStringSubmatch(goMod)
+	if linkedVersion == nil {
+		t.Fatal("go.mod missing github.com/steveyegge/beads module pin")
+	}
+	if linkedVersion[1] != bdVersion {
+		t.Fatalf("go.mod beads module = %q but deps.env BD_VERSION = %q; the native-store compatibility gate requires the linked library and installed bd CLI to match", linkedVersion[1], bdVersion)
 	}
 
 	// The current cell has no release tarball, so it is built from a pinned beads
@@ -67,6 +77,16 @@ func TestBDVersionPins(t *testing.T) {
 	if deps.CompareVersions(bdVersion, bdPrev) < 0 {
 		t.Fatalf("deps.env BD_VERSION = %q is older than BD_PREV_VERSION = %q; the installable default must be at least the minimum-supported version",
 			bdVersion, bdPrev)
+	}
+	// The source-built current cell is the forward-compatibility edge of the
+	// matrix. It may equal the installable default, but it must never trail it.
+	currentAtLeastDefault, err := pinVersionAtLeast(bdCurrent, bdVersion)
+	if err != nil {
+		t.Fatalf("compare deps.env BD_CURRENT_VERSION with BD_VERSION: %v", err)
+	}
+	if !currentAtLeastDefault {
+		t.Fatalf("deps.env BD_CURRENT_VERSION = %q is older than BD_VERSION = %q; the current contract cell must be at least the installable default",
+			bdCurrent, bdVersion)
 	}
 
 	// The ready-projection feature floor (#3135's regressing surface) must exist
@@ -142,6 +162,40 @@ jobs:
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("scanPinAssignments(BD_VERSION) = %+v, want %+v", got, want)
 	}
+}
+
+func TestPinVersionAtLeastHonorsPrereleaseOrdering(t *testing.T) {
+	tests := []struct {
+		candidate string
+		floor     string
+		want      bool
+	}{
+		{candidate: "v1.1.2", floor: "v1.1.2", want: true},
+		{candidate: "v1.2.0", floor: "v1.1.2", want: true},
+		{candidate: "v1.2.0-rc.1", floor: "v1.2.0", want: false},
+		{candidate: "v1.2.0", floor: "v1.2.0-rc.1", want: true},
+	}
+	for _, tt := range tests {
+		got, err := pinVersionAtLeast(tt.candidate, tt.floor)
+		if err != nil {
+			t.Fatalf("pinVersionAtLeast(%q, %q): %v", tt.candidate, tt.floor, err)
+		}
+		if got != tt.want {
+			t.Errorf("pinVersionAtLeast(%q, %q) = %v, want %v", tt.candidate, tt.floor, got, tt.want)
+		}
+	}
+}
+
+func pinVersionAtLeast(candidate, floor string) (bool, error) {
+	candidateVersion, err := semver.StrictNewVersion(strings.TrimPrefix(candidate, "v"))
+	if err != nil {
+		return false, err
+	}
+	floorVersion, err := semver.StrictNewVersion(strings.TrimPrefix(floor, "v"))
+	if err != nil {
+		return false, err
+	}
+	return !candidateVersion.LessThan(floorVersion), nil
 }
 
 // readDotenv parses simple KEY=VALUE lines, ignoring comments and blanks.

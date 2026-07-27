@@ -163,31 +163,26 @@ and the diff anchor only moves on a *real* wire change.
   | Cell | bd | gc | Runs in | Proves |
   |---|---|---|---|---|
   | 1 | **prev** (v1.0.4, Latest) | HEAD | gascity CI | new gc still supports min `bd` (the **#3135** direction) |
-  | 2 | **current** (v1.0.5) | HEAD | gascity CI | new gc works with current `bd` (exercises the 1.0.5 ready-projection path) |
+  | 2 | **current** (v1.1.2) | HEAD | gascity CI | new gc works with current `bd` (exercises the ready-projection path) |
   | 3 | HEAD | **prev gc release** | beads CI | new `bd` doesn't break shipped gc (the direction gascity CI structurally cannot cover) |
 
 - **Acquisition:** gascity downloads `bd` release tarballs via the existing
   SHA-pinned `install-bd-archive.sh` (API-SHA fallback **forbidden** on the
   required path). beads builds `bd` from source (HEAD) and downloads gascity
   release tarballs via a new SHA-pinned `install-gc-archive.sh`.
-- **v1.0.5 note:** currently a *Draft* with assets pinned — fetchable in CI with
-  the token. Promoting `deps.env BD_VERSION → v1.0.5` is the deliberate,
-  gate-guarded migration that PRE-1 stages once v1.0.5 publishes.
 - **Implementation note (current Phase-1 state).** The matrix above is the
-  *target* shape: the upper required cell is a published `BD_VERSION` release
-  installed via the `install-bd-archive.sh` tarball. Today's shipped `deps.env`
-  and `ci.yml` realize the bleeding-edge `current` cell with a third, distinct
-  anchor instead — `BD_CURRENT_VERSION` (`v1.1.0-rc.1`, a release-candidate with
-  **no** release tarball) built from beads source at the SHA-pinned
-  `BD_CURRENT_REF` by the `contract-acceptance-current` job, with
+  upper required cell uses a published `BD_VERSION` release installed via the
+  `install-bd-archive.sh` tarball. `deps.env` and `ci.yml` also retain a
+  separately pinned source-build path: `BD_CURRENT_VERSION` (`v1.1.2`) is built
+  from beads source at the SHA-pinned `BD_CURRENT_REF` by the
+  `contract-acceptance-current` job, with
   `contract-radar-bd-head` as the non-required radar. So the three `deps.env`
   bd anchors map onto the matrix as: `BD_PREV_VERSION` = the min-supported floor
   cell (tarball), `BD_VERSION` = the installable default the floor tracks
   (tarball), and `BD_CURRENT_VERSION`/`BD_CURRENT_REF` = the source-built `current`
-  cell. The doc's `BD_VERSION`-tarball upper cell stays the destination once
-  v1.0.5 publishes; until then the source-built `BD_CURRENT_*` path stands in for
-  it, and `bd_version_pin_test.go` keeps `BD_PREV_VERSION ≤ BD_VERSION` and the
-  init/ready floors anchored to those roles.
+  cell. The current cell may equal the installable default but cannot trail it;
+  `bd_version_pin_test.go` enforces `BD_PREV_VERSION ≤ BD_VERSION ≤
+  BD_CURRENT_VERSION` and keeps the init/ready floors anchored to those roles.
 
 ## Enumerated test catalog
 
