@@ -446,6 +446,89 @@ func TestResolveDefaultMailSenderForCommand_UsesDisplayAliasBeforeSessionName(t 
 	}
 }
 
+// TestResolveAuthorizedMailSender_RejectsIdentitySpoof verifies that an explicit
+// --from identity is authenticated against the calling session: a session may
+// send as a reserved identity (human/controller) or as its own mailbox, but not
+// as any other live session's mailbox (issue #4070).
+func TestResolveAuthorizedMailSender_RejectsIdentitySpoof(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	caller, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "polecat-2",
+			"session_name": "polecat-gc-596709",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create caller session: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "mayor",
+			"session_name": "mayor-gc-1",
+		},
+	}); err != nil {
+		t.Fatalf("Create victim session: %v", err)
+	}
+	cfg, _ := loadCityConfig(cityPath)
+
+	// The calling session is polecat-2.
+	t.Setenv("GC_SESSION_ID", caller.ID)
+	t.Setenv("GC_ALIAS", "polecat-2")
+	t.Setenv("GC_AGENT", "polecat-2")
+
+	cache := &mailIdentitySessionCache{}
+	self, err := resolveMailIdentityWithConfigCached(cityPath, cfg, store, "polecat-2", cache)
+	if err != nil {
+		t.Fatalf("resolve own identity: %v", err)
+	}
+
+	t.Run("spoof another live session is rejected", func(t *testing.T) {
+		got, err := resolveAuthorizedMailSender(cityPath, cfg, store, "mayor", cache)
+		if err == nil {
+			t.Fatalf("resolveAuthorizedMailSender(--from mayor) = %q, nil; want authorization error", got)
+		}
+		if !strings.Contains(err.Error(), "not authorized to send as") {
+			t.Errorf("err = %v, want 'not authorized to send as'", err)
+		}
+	})
+
+	t.Run("own identity is allowed", func(t *testing.T) {
+		got, err := resolveAuthorizedMailSender(cityPath, cfg, store, "polecat-2", cache)
+		if err != nil {
+			t.Fatalf("resolveAuthorizedMailSender(--from polecat-2) unexpected error: %v", err)
+		}
+		if got != self {
+			t.Errorf("got %q, want own mailbox %q", got, self)
+		}
+	})
+
+	t.Run("reserved controller identity is allowed", func(t *testing.T) {
+		got, err := resolveAuthorizedMailSender(cityPath, cfg, store, "controller", cache)
+		if err != nil {
+			t.Fatalf("resolveAuthorizedMailSender(--from controller) unexpected error: %v", err)
+		}
+		if got != controllerMailIdentity {
+			t.Errorf("got %q, want %q", got, controllerMailIdentity)
+		}
+	})
+}
+
 func TestResolveMailIdentityWithConfig_ExplicitAliasUsesDisplayAlias(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_MAIL", "")

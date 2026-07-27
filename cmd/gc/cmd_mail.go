@@ -1003,6 +1003,39 @@ func resolveMailIdentityWithConfigCached(cityPath string, cfg *config.City, stor
 	return resolveMailIdentityCached(store, identifier, cache)
 }
 
+// resolveAuthorizedMailSender resolves an explicit --from identity and enforces
+// that the calling session is authorized to send as it. A session may send as a
+// reserved city identity (human/controller) or as its own resolved mailbox;
+// sending as any other resolvable identity is rejected so that no session can
+// impersonate another identity's mailbox (issue #4070). Reserved identities are
+// shared city-wide roles rather than a private session mailbox, so their
+// existing open behavior is preserved.
+func resolveAuthorizedMailSender(cityPath string, cfg *config.City, store beads.Store, from string, cache *mailIdentitySessionCache) (string, error) {
+	resolved, err := resolveMailIdentityWithConfigCached(cityPath, cfg, store, from, cache)
+	if err != nil {
+		return "", fmt.Errorf("invalid sender %q: %w", from, err)
+	}
+	if _, ok := reservedMailSenderIdentity(from); ok {
+		return resolved, nil
+	}
+	if self, ok := callerMailIdentity(cityPath, cfg, store, cache); ok && self == resolved {
+		return resolved, nil
+	}
+	return "", fmt.Errorf("not authorized to send as %q: a session may only send as itself or a reserved identity", from)
+}
+
+// callerMailIdentity resolves the current session's own mailbox address from its
+// ambient identity (GC_SESSION_ID/GC_ALIAS/GC_AGENT), returning false when none
+// of the candidates resolves to a mailbox.
+func callerMailIdentity(cityPath string, cfg *config.City, store beads.Store, cache *mailIdentitySessionCache) (string, bool) {
+	for _, c := range defaultMailIdentityCandidates() {
+		if addr, err := resolveMailIdentityWithConfigCached(cityPath, cfg, store, c, cache); err == nil {
+			return addr, true
+		}
+	}
+	return "", false
+}
+
 func resolveMailRecipientIdentity(cityPath string, cfg *config.City, store beads.Store, identifier string) (string, error) {
 	return resolveMailRecipientIdentityCached(cityPath, cfg, store, identifier, nil)
 }
@@ -1738,9 +1771,9 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 			sender = defaultMailIdentity()
 		}
 	} else if sender != "human" && store != nil {
-		sender, err = resolveMailIdentityWithConfigCached(cityPath, cfg, store, sender, idCache)
+		sender, err = resolveAuthorizedMailSender(cityPath, cfg, store, from, idCache)
 		if err != nil {
-			fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", sender, err) //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
 	}
