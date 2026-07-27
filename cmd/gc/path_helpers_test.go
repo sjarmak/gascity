@@ -104,6 +104,15 @@ type doltLeakGuardedTestingM struct {
 	m            *testing.M
 	tempRoot     string
 	cleanupPaths []string
+	// beforeCleanup, when set, runs after the dolt leak scan and before any
+	// cleanupTemporaryPaths call removes tempRoot or the other cleanup paths.
+	// TestMain wires it to the tmux-server drain: when the isolated socket root
+	// falls back to a dir under tempRoot (cmdGCTmuxSocketRoot's fallback path),
+	// that root is removed by this guard's own cleanupTemporaryPaths, so the
+	// drain must run here — before every socket-root removal — or it re-leaks
+	// the orphan tmux server #4656 fixed. It runs before both cleanupTemporaryPaths
+	// call sites (normal teardown and the signal handler).
+	beforeCleanup func()
 }
 
 func newDoltLeakGuardedTestingM(m *testing.M, tempRoot string, cleanupPaths ...string) *doltLeakGuardedTestingM {
@@ -152,6 +161,7 @@ func (g *doltLeakGuardedTestingM) runWith(
 		}
 	}
 
+	g.runBeforeCleanup()
 	g.cleanupTemporaryPaths()
 	reapRegistered()
 
@@ -170,6 +180,7 @@ func (g *doltLeakGuardedTestingM) installSignalHandler() func() {
 		case sig := <-signals:
 			fmt.Fprintf(os.Stderr, "cmd/gc test dolt leak guard: received %s; sweeping test dolt processes before exit\n", sig) //nolint:errcheck
 			_ = g.reapDoltProcessesUnderRoot("signal")
+			g.runBeforeCleanup()
 			g.cleanupTemporaryPaths()
 			signal.Stop(signals)
 			if s, ok := sig.(syscall.Signal); ok {
@@ -182,6 +193,15 @@ func (g *doltLeakGuardedTestingM) installSignalHandler() func() {
 	return func() {
 		signal.Stop(signals)
 		close(done)
+	}
+}
+
+// runBeforeCleanup invokes the beforeCleanup hook (if any) at every point
+// where cleanupTemporaryPaths is about to remove tempRoot, so a hook that
+// drains resources living under tempRoot always runs while they still exist.
+func (g *doltLeakGuardedTestingM) runBeforeCleanup() {
+	if g.beforeCleanup != nil {
+		g.beforeCleanup()
 	}
 }
 

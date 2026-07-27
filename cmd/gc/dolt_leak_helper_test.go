@@ -632,3 +632,51 @@ func TestDoltLeakGuardedTestingMRunWithSweepsOrphanDirsAtStartup(t *testing.T) {
 		t.Fatalf("call order = %v, want [sweepStale sweepOrphanDirs runTests ...]", order)
 	}
 }
+
+// TestDoltLeakGuardedTestingMDrainsBeforePathRemoval pins the #4656
+// fallback-ordering invariant. When cmdGCTmuxSocketRoot cannot allocate a
+// socket parent under /tmp it falls back to a socket root nested under
+// tempRoot, which this guard's cleanupTemporaryPaths then removes. TestMain
+// wires the tmux-server drain as beforeCleanup, so the drain must run while
+// that root is still on disk — before cleanupTemporaryPaths unlinks tempRoot.
+// Draining after removal re-leaks the orphan tmux server #4656 fixed, which is
+// exactly what happened while the drain lived in an outer TestingM wrapper.
+func TestDoltLeakGuardedTestingMDrainsBeforePathRemoval(t *testing.T) {
+	tempRoot := filepath.Join(t.TempDir(), "gct-current")
+	// Mirror the fallback allocation: the socket root lives under tempRoot.
+	socketRoot := filepath.Join(tempRoot, "tmux")
+	if err := os.MkdirAll(socketRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeCleanupCalled := false
+	socketRootPresentAtDrain := false
+	g := newDoltLeakGuardedTestingM(nil, tempRoot, tempRoot)
+	g.beforeCleanup = func() {
+		beforeCleanupCalled = true
+		_, err := os.Stat(socketRoot)
+		socketRootPresentAtDrain = err == nil
+	}
+
+	code := g.runWith(
+		func() int { return 0 },
+		func() ([]DoltProcInfo, error) { return nil, nil },
+		func(string) bool { return false },
+		func() {},
+		func() {},
+		func([]DoltProcInfo) {},
+	)
+
+	if code != 0 {
+		t.Fatalf("guard returned code %d, want 0 for a clean run", code)
+	}
+	if !beforeCleanupCalled {
+		t.Fatal("beforeCleanup hook was never invoked; the tmux drain would never run before socket-root removal")
+	}
+	if !socketRootPresentAtDrain {
+		t.Fatal("beforeCleanup ran after the socket root under tempRoot was removed; #4656 fallback ordering regressed")
+	}
+	if _, err := os.Stat(tempRoot); !os.IsNotExist(err) {
+		t.Fatalf("tempRoot should be removed after runWith completes; stat err = %v", err)
+	}
+}
