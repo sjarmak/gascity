@@ -1003,6 +1003,39 @@ func resolveMailIdentityWithConfigCached(cityPath string, cfg *config.City, stor
 	return resolveMailIdentityCached(store, identifier, cache)
 }
 
+// authorizeMailSenderOverride rejects a --from sender override that resolves to
+// a live identity other than the caller's own. Claiming another identity in the
+// FROM field is spoofing (#4070): a fleet that trusts mail signed by a
+// coordinating role would accept forged authority. A session may therefore only
+// send as itself.
+//
+// resolved is the address --from already resolved to (via
+// resolveMailIdentityWithConfigCached). The caller's own candidate identities
+// are resolved through the SAME resolver and compared at the resolved-address
+// level, so the gate cannot diverge from the address the message will actually
+// carry — in particular a stale configured_named_identity that resolves to a
+// foreign live session is caught here even though it is not a directly
+// resolvable session name. Reserved identities ("human", "controller") are
+// exempt so scripts can still legitimately send alerts as controller.
+func authorizeMailSenderOverride(cityPath string, cfg *config.City, store beads.Store, requested, resolved string, cache *mailIdentitySessionCache) error {
+	if _, ok := reservedMailSenderIdentity(requested); ok {
+		return nil
+	}
+	for _, candidate := range defaultMailIdentityCandidates() {
+		ownAddr, err := resolveMailIdentityWithConfigCached(cityPath, cfg, store, candidate, cache)
+		if err != nil {
+			if errors.Is(err, session.ErrSessionNotFound) {
+				continue
+			}
+			return fmt.Errorf("resolving caller identity %q: %w", candidate, err)
+		}
+		if ownAddr == resolved {
+			return nil
+		}
+	}
+	return fmt.Errorf("not authorized to send as %q: --from may only name your own identity", requested)
+}
+
 func resolveMailRecipientIdentity(cityPath string, cfg *config.City, store beads.Store, identifier string) (string, error) {
 	return resolveMailRecipientIdentityCached(cityPath, cfg, store, identifier, nil)
 }
@@ -1738,11 +1771,16 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 			sender = defaultMailIdentity()
 		}
 	} else if sender != "human" && store != nil {
-		sender, err = resolveMailIdentityWithConfigCached(cityPath, cfg, store, sender, idCache)
-		if err != nil {
-			fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", sender, err) //nolint:errcheck // best-effort stderr
+		resolved, resolveErr := resolveMailIdentityWithConfigCached(cityPath, cfg, store, sender, idCache)
+		if resolveErr != nil {
+			fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", sender, resolveErr) //nolint:errcheck // best-effort stderr
 			return 1
 		}
+		if authErr := authorizeMailSenderOverride(cityPath, cfg, store, sender, resolved, idCache); authErr != nil {
+			fmt.Fprintf(stderr, "gc mail send: %v\n", authErr) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		sender = resolved
 	}
 
 	var nf nudgeFunc

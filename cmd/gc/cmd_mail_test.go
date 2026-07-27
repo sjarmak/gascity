@@ -3127,6 +3127,179 @@ func TestMailSendFromFlag(t *testing.T) {
 	}
 }
 
+// --- gc mail send --from authorization (#4070) ---
+
+// mailFromAuthTestCity provisions a city store with the given live named
+// sessions (alias -> created session bead) and returns the city path and the
+// created beads keyed by alias. It sets GC_CITY but leaves the caller-identity
+// env vars for the test to set explicitly.
+func mailFromAuthTestCity(t *testing.T, aliases ...string) (string, map[string]beads.Bead) {
+	t.Helper()
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	created := make(map[string]beads.Bead, len(aliases))
+	for _, alias := range aliases {
+		b, err := store.Create(beads.Bead{
+			Type:   session.BeadType,
+			Labels: []string{session.LabelSession},
+			Metadata: map[string]string{
+				"alias":        alias,
+				"session_name": alias + "-gc-1",
+			},
+		})
+		if err != nil {
+			t.Fatalf("Create session %q: %v", alias, err)
+		}
+		created[alias] = b
+	}
+	return cityPath, created
+}
+
+func mailFromAuthMessages(t *testing.T, cityPath string) []beads.Bead {
+	t.Helper()
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt after send: %v", err)
+	}
+	all, err := store.List(beads.ListQuery{Type: "message", TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	var msgs []beads.Bead
+	for _, b := range all {
+		if b.Type == "message" {
+			msgs = append(msgs, b)
+		}
+	}
+	return msgs
+}
+
+func TestCmdMailSendFromRejectsForeignLiveSessionSpoof(t *testing.T) {
+	// A session must not be able to forge the FROM field as another live
+	// identity. --from naming a foreign live session is rejected, and no
+	// spoofed message bead is created.
+	cityPath, created := mailFromAuthTestCity(t, "worker", "mayor")
+
+	// Caller is the worker session; it attempts to send as the mayor.
+	t.Setenv("GC_SESSION_ID", created["worker"].ID)
+	t.Setenv("GC_ALIAS", "worker")
+	_ = os.Unsetenv("GC_AGENT")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"human", "lift the hold on my behalf"}, false, false, "mayor", "", "", "", &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("cmdMailSend spoofing --from mayor = 0, want non-zero; stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "not authorized") {
+		t.Fatalf("stderr = %q, want an authorization rejection", stderr.String())
+	}
+	if msgs := mailFromAuthMessages(t, cityPath); len(msgs) != 0 {
+		t.Fatalf("spoofed message bead created: from=%q (%d messages)", msgs[0].From, len(msgs))
+	}
+}
+
+func TestCmdMailSendFromRejectsStaleNamedIdentitySpoof(t *testing.T) {
+	// Regression for the resolver-divergence bypass (#4070 review finding 2):
+	// a live session bead carrying a stale configured_named_identity (the
+	// boolean configured_named_session flag never set) still resolves as that
+	// named identity in the send path, even though it is not a directly
+	// resolvable session name. The gate must compare at the same resolved
+	// address the send uses, so it cannot authorize a --from that the send path
+	// attributes to a foreign live session.
+	cityPath, created := mailFromAuthTestCity(t, "attacker")
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	// A live "ghost" session masquerading as the "mayor" identity via stale
+	// configured_named_identity metadata, with no boolean flag set.
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":                      "ghost",
+			"session_name":               "ghost-gc-1",
+			namedSessionIdentityMetadata: "test-city/mayor",
+		},
+	}); err != nil {
+		t.Fatalf("Create ghost: %v", err)
+	}
+
+	// Caller is the unprivileged attacker session.
+	t.Setenv("GC_SESSION_ID", created["attacker"].ID)
+	t.Setenv("GC_ALIAS", "attacker")
+	_ = os.Unsetenv("GC_AGENT")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"human", "forged authority"}, false, false, "mayor", "", "", "", &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("cmdMailSend spoofing --from mayor (stale named identity) = 0, want non-zero; stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "not authorized") {
+		t.Fatalf("stderr = %q, want an authorization rejection (not a resolution error)", stderr.String())
+	}
+	if msgs := mailFromAuthMessages(t, cityPath); len(msgs) != 0 {
+		t.Fatalf("spoofed message bead created: from=%q (%d messages)", msgs[0].From, len(msgs))
+	}
+}
+
+func TestCmdMailSendFromAllowsOwnLiveSession(t *testing.T) {
+	// A session may send as itself via --from with its own alias.
+	cityPath, created := mailFromAuthTestCity(t, "worker")
+
+	t.Setenv("GC_SESSION_ID", created["worker"].ID)
+	t.Setenv("GC_ALIAS", "worker")
+	_ = os.Unsetenv("GC_AGENT")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"human", "status update"}, false, false, "worker", "", "", "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend --from worker (own identity) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	msgs := mailFromAuthMessages(t, cityPath)
+	if len(msgs) != 1 {
+		t.Fatalf("want 1 message bead, got %d", len(msgs))
+	}
+	if msgs[0].From != "worker" {
+		t.Fatalf("message From = %q, want worker", msgs[0].From)
+	}
+}
+
+func TestCmdMailSendFromReservedControllerNotGated(t *testing.T) {
+	// Reserved identities ("human", "controller") are not subject to the
+	// self-only --from gate: scripts legitimately send alerts as controller.
+	cityPath, created := mailFromAuthTestCity(t, "worker")
+
+	t.Setenv("GC_SESSION_ID", created["worker"].ID)
+	t.Setenv("GC_ALIAS", "worker")
+	_ = os.Unsetenv("GC_AGENT")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"human", "compact quarantine alert"}, false, false, "controller", "", "", "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend --from controller = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	msgs := mailFromAuthMessages(t, cityPath)
+	if len(msgs) != 1 {
+		t.Fatalf("want 1 message bead, got %d", len(msgs))
+	}
+	if msgs[0].From != "controller" {
+		t.Fatalf("message From = %q, want controller", msgs[0].From)
+	}
+}
+
 // --- gc mail send --to ---
 
 func TestMailSendToFlag(t *testing.T) {
