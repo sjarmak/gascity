@@ -74,6 +74,9 @@ func sweepStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		if !shadow.Open {
 			continue
 		}
+		if nudgeShadowRetainedBeforeExpiry(shadow, now) {
+			continue
+		}
 		if err := nq.SweepStale(shadow.BeadID, nudgeMailSweepNudgeCloseReason, now); err != nil {
 			beadErrs = append(beadErrs, err)
 			continue
@@ -128,6 +131,9 @@ func countStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		if !shadow.Open {
 			continue
 		}
+		if nudgeShadowRetainedBeforeExpiry(shadow, now) {
+			continue
+		}
 		result.NudgeClosed++
 	}
 
@@ -161,4 +167,15 @@ func liveNudgeIDSet(state *nudgequeue.State) map[string]bool {
 		live[item.ID] = true
 	}
 	return live
+}
+
+// nudgeShadowRetainedBeforeExpiry reports whether a still-queued (undelivered)
+// nudge must be retained because its own expires_at has not yet passed. The fixed
+// nudge TTL window is a retention floor for consumed/terminalized nudges; it must
+// not drop a fresh queued nudge before its scheduled expiry (#4299). The check
+// reads the durable, bead-authoritative state+expiry, so it protects a live queued
+// nudge even when state.json is missing or diverged and liveNudgeIDSet is empty.
+// The compare is instant-based, independent of now's clock domain.
+func nudgeShadowRetainedBeforeExpiry(shadow nudgequeue.NudgeShadow, now time.Time) bool {
+	return shadow.State == nudgequeue.StateQueued && !shadow.ExpiresAt.IsZero() && now.Before(shadow.ExpiresAt)
 }
