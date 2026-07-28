@@ -93,6 +93,10 @@ type Formula struct {
 	// Requires declares minimum host capabilities needed to compile this formula.
 	Requires *Requirements `json:"requires,omitempty" toml:"requires,omitempty"`
 
+	// Applicability declares structural constraints on which goals this formula
+	// may bind to (for example a direction axis). Absent means no constraint.
+	Applicability *Applicability `json:"applicability,omitempty" toml:"applicability,omitempty"`
+
 	// Type categorizes the formula: workflow, expansion, or aspect.
 	Type Type `json:"type"`
 
@@ -1103,6 +1107,7 @@ func (f *Formula) Validate() error {
 		errs = append(errs, fmt.Sprintf("contract: invalid value %q (must be graph.v2)", f.Contract))
 	}
 	errs = append(errs, validateRequirementDeclarations(f)...)
+	errs = append(errs, validateApplicabilityDeclarations(f)...)
 	if requiresExplicitGraphContract(f) {
 		errs = append(errs, explicitGraphRequirementError)
 	}

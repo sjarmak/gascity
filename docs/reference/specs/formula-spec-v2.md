@@ -179,6 +179,7 @@ declaration as an error.
 | `formula` | string | Required. Unique formula name used by `gc formula cook`, `gc sling --formula`, and `molecule.Cook`/`CookOn` |
 | `description` | string | Human-readable description; supports `{{var}}` substitution |
 | `requires` | table | Host capability requirements. `formula_compiler` (a semver comparator) is the only axis; unknown axes fail with `formula.requirement_unknown` (section 5) |
+| `applicability` | table | Structural goal-binding constraints. `direction` (`"incoming"` or `"outgoing"`) is the only axis; any other value fails with `formula.applicability_direction_invalid` and unknown axes fail with `formula.applicability_unknown` (section 5). Absent means no constraint; binding stays purely structural (no direction is ever inferred from names or descriptions) |
 | `contract` | string | Deprecated v2 opt-in. Only valid value: `"graph.v2"`; anything else fails validation. Prefer `[requires]` (section 5) |
 | `extends` | []string | Parent formulas to compose from (section 1.7) |
 | `vars` | table | Template variable declarations (section 1.4) |
@@ -192,8 +193,17 @@ declaration as an error.
 | `advice` | []table | Advanced before/after/around step transformations applied during cooking |
 | `pointcuts` | []table | Advanced target patterns for `type = "aspect"` formulas |
 
-Unknown top-level keys are silently ignored, with one exception: unknown
-keys inside `[requires]` are hard errors (section 5).
+Unknown top-level keys are silently ignored, with two exceptions: unknown
+keys inside `[requires]` and inside `[applicability]` are hard errors
+(section 5).
+
+A goal declares the matching side through `gc.applicability.direction` bead
+metadata. A formula and a goal bind when at least one side leaves direction
+undeclared, or when both declare the same direction; two different declared
+directions are incompatible. Explicit selection of an incompatible formula
+fails with `formula.applicability_incompatible`; default and fallback
+selection exclude incompatible formulas and fail with
+`formula.no_compatible_formula` when none remains.
 
 ### 1.3. Steps
 
@@ -978,6 +988,45 @@ and compiling a v2 formula with the host switch off fails as:
 ```text
 formula "<name>" requires formula compiler v2 but formula_v2 is disabled; enable [daemon] formula_v2 or lower the formula requirements
 ```
+
+### Applicability
+
+`[applicability]` is a structural goal-binding constraint, a sibling of
+`[requires]`. `direction` is the only axis; its value must be `"incoming"`
+or `"outgoing"`. An invalid value fails with:
+
+```text
+formula.applicability_direction_invalid: direction must be "incoming" or "outgoing", got "<value>"
+```
+
+and unknown axes fail with:
+
+```text
+formula.applicability_unknown: unknown formula applicability constraint "<key>"; supported constraints: direction
+```
+
+A goal declares its side through `gc.applicability.direction` bead
+metadata (written by the creating pack or caller, never inferred). A
+formula and a goal bind when at least one side leaves direction undeclared,
+or when both declare the same direction. Two different declared directions
+are incompatible. Explicit selection of an incompatible formula (`gc sling
+--on <formula>`) fails with:
+
+```text
+formula.applicability_incompatible: formula "<name>" declares direction "<dir>" but goal declares direction "<dir>"
+```
+
+Default and fallback selection excludes incompatible formulas and, when
+none remains, fails with:
+
+```text
+formula.no_compatible_formula: no formula is compatible with goal direction "<dir>" (excluded on direction: [<names>])
+```
+
+Matching is purely structural: no direction is inferred from a formula or
+goal name, description, label, or any keyword. `[applicability]` composes
+through `extends` like other formula fields — a child inherits the parent's
+declared direction unless it declares its own.
 
 ### Doctor and lint
 

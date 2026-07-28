@@ -58,6 +58,15 @@ func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, 
 		return SlingResult{}, err
 	}
 	a := opts.Target
+	// Gate the applicability direction axis before preflight. preflight's
+	// --reassign branch reopens the goal and clears its assignee (a store
+	// mutation), so a direction-incompatible sling must fail closed here,
+	// ahead of any side effect, to leave the goal untouched (gc-ebyq8). The
+	// batch path gates per child inside attachBatchFormula, already ahead of
+	// its own mutations.
+	if err := gateSlingDirection(opts, deps, querier); err != nil {
+		return SlingResult{}, err
+	}
 	result, preErr := preflight(opts, deps, querier)
 	if preErr != nil {
 		return result, preErr
@@ -389,6 +398,7 @@ func rootOnlyVaporPourHint(formulaName string, recipe *formula.Recipe) string {
 
 // slingOnFormula handles the --on formula attachment path.
 func slingOnFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID string, result SlingResult) (SlingResult, error) {
+	// Direction gate runs in DoSling before preflight (gateSlingDirection).
 	result, err := attachFormulaToBead(opts, deps, querier, beadID, opts.OnFormula, "on-formula", "formula", result)
 	if err == nil {
 		if hint := attachedBeadInstructionsDroppedHint(querier, beadID, opts.Vars); hint != "" {
@@ -427,6 +437,7 @@ func attachedBeadInstructionsDroppedHint(querier BeadQuerier, beadID string, use
 
 // slingDefaultFormula handles the default formula attachment path.
 func slingDefaultFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID string, result SlingResult) (SlingResult, error) {
+	// Direction gate runs in DoSling before preflight (gateSlingDirection).
 	result, err := attachFormulaToBead(opts, deps, querier, beadID, opts.Target.EffectiveDefaultSlingFormula(), "default-on-formula", "default formula", result)
 	if err == nil {
 		if hint := attachedBeadInstructionsDroppedHint(querier, beadID, opts.Vars); hint != "" {
@@ -1229,7 +1240,14 @@ func sourceWorkflowRootByIDInStore(store beads.Store, sourceBeadID, workflowID, 
 // pre-computed isGraph flag from the one-shot formula compile at the top of
 // DoSlingBatch so that compiling N times for N children becomes a single
 // compile per batch.
-func attachBatchFormula(ctx context.Context, opts SlingOpts, deps SlingDeps, child beads.Bead, a config.Agent, formulaName, formulaLabel, method string, isGraph bool) (SlingResult, error) {
+func attachBatchFormula(ctx context.Context, opts SlingOpts, deps SlingDeps, child beads.Bead, a config.Agent, formulaName, formulaLabel, method string, isGraph bool, formulaDir formula.Direction) (SlingResult, error) {
+	// Gate each child on the applicability direction axis, mirroring the
+	// single-bead paths: an explicit --on formula fails incompatible; the
+	// agent default fails no-compatible-formula. formulaDir was resolved once
+	// per batch; the child bead already carries its own goal-side metadata.
+	if err := checkGoalDirection(child.Metadata, formulaName, formulaDir, opts.OnFormula != ""); err != nil {
+		return SlingResult{}, fmt.Errorf("goal %s: %w", child.ID, err)
+	}
 	childVars := BuildSlingFormulaVars(formulaName, child.ID, opts.Vars, a, deps)
 	run := func() (SlingResult, error) {
 		mResult, err := InstantiateSlingFormula(ctx, formulaName, SlingFormulaSearchPaths(deps, a), molecule.Options{
@@ -1477,9 +1495,17 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 	// once here and again per child, turning an O(1) compile into O(N) disk
 	// reads + template expansions for an N-child batch.
 	var isGraph bool
+	// formulaDir is resolved once per batch (like isGraph) so the per-child
+	// applicability gate does not re-parse the formula N times. An unresolved
+	// direction is treated as unconstrained; the per-child attach still fails
+	// with the canonical error if the formula itself is broken.
+	var formulaDir formula.Direction
 	if useFormula != "" {
 		formulaVars := BuildSlingFormulaVars(useFormula, "", opts.Vars, a, deps)
 		searchPaths := SlingFormulaSearchPaths(deps, a)
+		if dir, dirErr := formula.LoadFormulaDirection(useFormula, searchPaths); dirErr == nil {
+			formulaDir = dir
+		}
 		var err error
 		isGraph, err = isGraphSlingFormula(context.Background(), useFormula, searchPaths, formulaVars)
 		if err != nil {
@@ -1492,7 +1518,13 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 		if isGraph && opts.Force {
 			checkAttachments = CheckBatchNoMoleculeChildrenAllowLiveWorkflow
 		}
-		if err := checkAttachments(querier, open, deps.Store, &batchResult); err != nil {
+		// Exclude direction-incompatible children from the attachment burn:
+		// checkBatchNoMoleculeChildren auto-closes an unassigned child's
+		// existing molecule, and a child the per-child direction gate will
+		// reject below must not be mutated first (fail-closed, no store
+		// mutation, gc-ebyq8). The gate in attachBatchFormula still rejects
+		// them in the loop.
+		if err := checkAttachments(querier, filterBurnableByDirection(open, formulaDir), deps.Store, &batchResult); err != nil {
 			return batchResult, fmt.Errorf("%w", err)
 		}
 	}
@@ -1547,7 +1579,7 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 			if opts.OnFormula == "" {
 				formulaLabel = "default formula"
 			}
-			formulaResult, err := attachBatchFormula(context.Background(), opts, deps, child, a, useFormula, formulaLabel, batchMethod, isGraph)
+			formulaResult, err := attachBatchFormula(context.Background(), opts, deps, child, a, useFormula, formulaLabel, batchMethod, isGraph, formulaDir)
 			if err != nil {
 				childResult.Failed = true
 				childResult.FailReason = err.Error()

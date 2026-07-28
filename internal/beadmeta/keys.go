@@ -39,6 +39,7 @@ const Namespace = "gc."
 // cmd/. Keep this block sorted by identifier; the Go compiler rejects duplicate
 // identifiers, giving us a free compile-time uniqueness guarantee.
 const (
+	ApplicabilityDirectionMetadataKey    = "gc.applicability.direction"
 	AttemptLogMetadataKey                = "gc.attempt_log"
 	AttemptMetadataKey                   = "gc.attempt"
 	BondMetadataKey                      = "gc.bond"
@@ -286,6 +287,7 @@ const OptionMetadataPrefix = "opt_"
 // declares. The guard test asserts every gc.* metadata literal used in non-test
 // Go resolves to a member of this slice (or a KnownMetadataPrefixes entry).
 var KnownMetadataKeys = []string{
+	ApplicabilityDirectionMetadataKey,
 	AttemptLogMetadataKey,
 	AttemptMetadataKey,
 	BondMetadataKey,

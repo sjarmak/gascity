@@ -270,20 +270,21 @@ func (p *Parser) Resolve(formula *Formula) (*Formula, error) {
 
 	// Build merged formula from parents
 	merged := &Formula{
-		Formula:     formula.Formula,
-		Description: formula.Description,
-		Catalog:     formula.Catalog,
-		Metadata:    cloneFormulaMetadata(formula.Metadata),
-		Contract:    formula.Contract,
-		Requires:    cloneRequirements(formula.Requires),
-		Type:        formula.Type,
-		Source:      formula.Source,
-		Phase:       formula.Phase,
-		Pour:        formula.Pour,
-		Vars:        make(map[string]*VarDef),
-		Steps:       nil,
-		Template:    nil,
-		Compose:     nil,
+		Formula:       formula.Formula,
+		Description:   formula.Description,
+		Catalog:       formula.Catalog,
+		Metadata:      cloneFormulaMetadata(formula.Metadata),
+		Contract:      formula.Contract,
+		Requires:      cloneRequirements(formula.Requires),
+		Applicability: cloneApplicability(formula.Applicability),
+		Type:          formula.Type,
+		Source:        formula.Source,
+		Phase:         formula.Phase,
+		Pour:          formula.Pour,
+		Vars:          make(map[string]*VarDef),
+		Steps:         nil,
+		Template:      nil,
+		Compose:       nil,
 	}
 
 	// Apply each parent in order
@@ -310,6 +311,9 @@ func (p *Parser) Resolve(formula *Formula) (*Formula, error) {
 		}
 		if merged.Requires == nil {
 			merged.Requires = cloneRequirements(parent.Requires)
+		}
+		if merged.Applicability == nil {
+			merged.Applicability = cloneApplicability(parent.Applicability)
 		}
 
 		// Phase cascades from the first parent that declares one; child
