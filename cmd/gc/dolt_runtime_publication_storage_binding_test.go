@@ -69,14 +69,17 @@ func TestManagedDoltRuntimePreflightSkipsCompleteStorageBinding(t *testing.T) {
 	healthCalls := 0
 	portCalls := 0
 
-	ensureManagedDoltPublishedForRuntime(
+	if err := ensureManagedDoltPublishedForRuntime(
 		cityPath,
 		&stderr,
 		"gc test",
 		func(string) error { healthCalls++; return nil },
 		managedDoltLifecycleOwned,
 		func(string) string { portCalls++; return "" },
-	)
+		nil,
+	); err != nil {
+		t.Fatalf("ensureManagedDoltPublishedForRuntime: %v", err)
+	}
 
 	if stderr.Len() != 0 {
 		t.Fatalf("runtime preflight stderr = %q, want empty", stderr.String())
