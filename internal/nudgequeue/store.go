@@ -131,6 +131,11 @@ func decodeNudgeItem(b beads.Bead) NudgeShadow {
 	return s
 }
 
+// StateQueued is the durable nudge shadow "state" metadata value for an enqueued,
+// not-yet-delivered nudge. It is bead-authoritative and independent of the flock'd
+// state.json, so a reader can trust it even when state.json is missing or diverged.
+const StateQueued = "queued"
+
 // EnqueueRollbackCloseReason is the close_reason metadata value stamped on a
 // partially-created nudge shadow bead when the enqueue transaction fails after
 // the bead was created. RollbackEnqueue stamps it before Close so BdStore.Close
@@ -164,7 +169,7 @@ func (s *Store) Save(item Item) (beadID string, created bool, err error) {
 		"agent":              item.Agent,
 		"session_id":         item.SessionID,
 		"continuation_epoch": item.ContinuationEpoch,
-		"state":              "queued",
+		"state":              StateQueued,
 		"source":             item.Source,
 		"message":            item.Message,
 		"deliver_after":      item.DeliverAfter.UTC().Format(time.RFC3339),
