@@ -204,6 +204,11 @@ func PreWakePatch(input PreWakePatchInput) MetadataPatch {
 		"generation":                 fmt.Sprintf("%d", input.Generation),
 		"wake_request":               "",
 		"wake_requested_at":          "",
+		// A wake starts a fresh lifecycle: clear any drain-ack provenance from the
+		// prior cycle so a later finalize (e.g. a reconciler-sourced drain that
+		// never re-captured) cannot read a stale "agent" and stamp a spurious
+		// cooldown.
+		DrainAckSourceMetadataKey: "",
 	}
 	if input.FreshWake {
 		patch["session_key"] = ""
@@ -395,6 +400,17 @@ func BeginDrainPatch(now time.Time, reason string) MetadataPatch {
 // DrainAckStopPendingReason marks a drain-acked runtime whose provider stop is
 // running asynchronously and waiting for controller finalization.
 const DrainAckStopPendingReason = "drain-ack-stop-pending"
+
+// DrainAckSourceMetadataKey is the durable bead field recording who initiated a
+// drain-ack. It is captured at the stop-pending transition (while the runtime is
+// still alive) so the finalizer can read the provenance after the runtime — and
+// the tmux env that held GC_DRAIN_ACK_SOURCE — is gone.
+const DrainAckSourceMetadataKey = "drain_ack_source"
+
+// DrainAckSourceAgent is the DrainAckSourceMetadataKey value for an
+// agent-initiated drain-ack (gc runtime drain-ack). It mirrors the runtime-side
+// GC_DRAIN_ACK_SOURCE=agent value so the durable and live representations agree.
+const DrainAckSourceAgent = "agent"
 
 // DrainAckStopPendingPatch records that a drain-acked session has moved into
 // durable stop-pending state. The provider stop itself is asynchronous; the

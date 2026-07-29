@@ -122,16 +122,28 @@ func isDrainAckStopPendingInfo(info sessionpkg.Info) bool {
 // the wakeTargets/startCandidates append, and the post-loop scans read only
 // orderedBeads[i].ID. On a persist error the input Info is returned unchanged with a
 // false ok, so the caller skips the fold (identical to the old bool-return).
-func markDrainAckStopPending(info sessionpkg.Info, sessFront *sessionpkg.Store, clk clock.Clock, stderr io.Writer) (sessionpkg.Info, bool) {
+func markDrainAckStopPending(info sessionpkg.Info, sessFront *sessionpkg.Store, sp runtime.Provider, clk clock.Clock, stderr io.Writer) (sessionpkg.Info, bool) {
 	if info.ID == "" || sessFront == nil {
 		return info, false
 	}
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	updated, err := sessFront.ApplyPatchInfo(info, sessionpkg.DrainAckStopPendingPatch(clk.Now().UTC()))
+	name := strings.TrimSpace(info.SessionNameMetadata)
+	// Capture drain-ack provenance durably NOW, while the runtime is still alive:
+	// GC_DRAIN_ACK_SOURCE lives in the tmux env, which dies with the session, but
+	// the finalizer runs after the stop and cannot read it. Persist it on the bead
+	// so finalize reads durable state. Overwrite on every stop-pending transition
+	// (not only the agent case) so a prior cycle's "agent" can never leak into a
+	// later reconciler-sourced drain.
+	source := ""
+	if isAgentSourcedDrainAck(sp, name) {
+		source = sessionpkg.DrainAckSourceAgent
+	}
+	patch := sessionpkg.DrainAckStopPendingPatch(clk.Now().UTC())
+	patch[sessionpkg.DrainAckSourceMetadataKey] = source
+	updated, err := sessFront.ApplyPatchInfo(info, patch)
 	if err != nil {
-		name := strings.TrimSpace(info.SessionNameMetadata)
 		if name == "" {
 			name = info.ID
 		}
@@ -495,7 +507,6 @@ func finalizeDrainAckStoppedSession(
 	template string,
 	closeIfUnassigned bool,
 	dops drainOps,
-	sp runtime.Provider,
 	dt *drainTracker,
 	clk clock.Clock,
 	rec events.Recorder,
@@ -598,7 +609,13 @@ func finalizeDrainAckStoppedSession(
 	if hasAssignedWork {
 		batch = sessionpkg.CompleteDrainPatch(clk.Now().UTC(), string(sessionpkg.SleepReasonIdle), info.WakeMode == "fresh")
 	}
-	if isAgentSourcedDrainAck(sp, name) &&
+	// Read the drain-ack provenance from the DURABLE bead field, never the runtime:
+	// finalize runs after the session has stopped, so the tmux env that held
+	// GC_DRAIN_ACK_SOURCE is already gone (GetMeta would fail session-gone and the
+	// cooldown would never stamp — #4824). markDrainAckStopPending captured it onto
+	// the bead while the session was still alive, when the provider could still tell
+	// a genuinely absent key from a gone session.
+	if strings.TrimSpace(info.DrainAckSource) == sessionpkg.DrainAckSourceAgent &&
 		!hasAssignedWork &&
 		sessionpkg.IsNamedSessionInfo(info) &&
 		sessionpkg.NamedSessionModeInfo(info) == "always" &&
@@ -675,7 +692,7 @@ func reconcileDrainAckStopPending(
 	return true, finalizeDrainAckStoppedSession(
 		cityPath, cfg, store, rigStores, info, tp.TemplateName,
 		!desired || isPoolManagedSessionInfo(info),
-		dops, sp, dt, clk, rec, stderr,
+		dops, dt, clk, rec, stderr,
 	)
 }
 
@@ -745,7 +762,7 @@ func finalizeDrainAckStopPendingSessions(
 			cityPath, cfg, store, rigStores, info,
 			normalizedSessionTemplateInfo(info, cfg),
 			isPoolManagedSessionInfo(info),
-			dops, sp, dt, clk, rec, stderr,
+			dops, dt, clk, rec, stderr,
 		)
 		finalized++
 	}
@@ -1963,7 +1980,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							if template == "" {
 								template = infoPostHeal.Template
 							}
-							if updated, ok := markDrainAckStopPending(infoByID[id], sessFront, clk, stderr); ok {
+							if updated, ok := markDrainAckStopPending(infoByID[id], sessFront, sp, clk, stderr); ok {
 								// markDrainAckStopPending persisted the stop-pending transition and
 								// returned the folded snapshot Info (write-returns-Info, Step 6d) —
 								// assign it directly. Cross-session isDrainAckStopPendingInfo reader.
@@ -2001,7 +2018,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						}
 						result := finalizeDrainAckStoppedSession(
 							cityPath, cfg, store, rigStores, infoByID[id], template,
-							true, dops, sp, dt, clk, rec, stderr,
+							true, dops, dt, clk, rec, stderr,
 						)
 						// finalizeDrainAckStoppedSession may close the bead in memory; fold
 						// that close onto the snapshot so the cross-session min-floor scan
@@ -2348,7 +2365,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						continue
 					}
 					if alive {
-						if updated, ok := markDrainAckStopPending(infoByID[id], sessFront, clk, stderr); ok {
+						if updated, ok := markDrainAckStopPending(infoByID[id], sessFront, sp, clk, stderr); ok {
 							// markDrainAckStopPending persisted + folded the stop-pending
 							// transition (write-returns-Info, Step 6d) — assign the returned Info,
 							// same as the orphan-arm site above (STEP6-PREPASS-AUDIT group 3).
@@ -2370,7 +2387,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					result := finalizeDrainAckStoppedSession(
 						cityPath, cfg, store, rigStores, infoByID[id], tp.TemplateName,
 						isPoolManagedSessionInfo(infoByID[id]),
-						dops, sp, finalizeDT,
+						dops, finalizeDT,
 						clk, rec, stderr,
 					)
 					// finalizeDrainAckStoppedSession may close the bead in memory; fold

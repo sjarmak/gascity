@@ -433,6 +433,13 @@ type Info struct {
 	// pending restart on the awake scan. Under raw-refresh coexistence the mirror
 	// reflects the in-memory value; Step 6 handles the Get-cutover intra-tick carrier.
 	RestartRequested string // restart_requested (raw)
+	// DrainAckSource is the RAW drain_ack_source metadata: the durable provenance
+	// of a drain-ack, captured on the bead while the runtime is still alive (at the
+	// stop-pending transition). The drain-ack finalizer reads it AFTER the runtime
+	// has stopped, when the tmux env that once held GC_DRAIN_ACK_SOURCE is gone, so
+	// the cooldown decision cannot depend on the provider. Trimmed == "agent" marks
+	// an agent-initiated drain-ack.
+	DrainAckSource string // drain_ack_source (raw)
 	// SessionIDFlag is the RAW session_id_flag metadata. freshRestartSessionKey
 	// (cmd/gc) reads it (trimmed != "") to decide whether the provider can inject a
 	// fresh session ID on a restart handoff. Additive mirror so that read can move off

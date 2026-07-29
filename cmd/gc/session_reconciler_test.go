@@ -763,15 +763,19 @@ func TestReconcileSessionBeads_DrainAckCooldownExclusions(t *testing.T) {
 			env := newReconcilerTestEnv()
 			env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 			session := env.createSessionBead("worker", "worker")
+			// Set the drain-ack source on the DURABLE bead field, the way
+			// markDrainAckStopPending captures it while the session is alive.
+			// finalize reads this (not the runtime), so the agent-sourced cases
+			// pass the first predicate and actually reach the exclusion under test
+			// (pool-managed / on-demand / assigned-work); reading it from tmux would
+			// have short-circuited earlier and never exercised those guards.
 			env.setSessionMetadata(&session, map[string]string{
-				namedSessionMetadataKey:      "true",
-				namedSessionIdentityMetadata: "worker",
-				namedSessionModeMetadata:     tt.namedMode,
-				poolManagedMetadataKey:       boolMetadata(tt.pool),
+				namedSessionMetadataKey:              "true",
+				namedSessionIdentityMetadata:         "worker",
+				namedSessionModeMetadata:             tt.namedMode,
+				poolManagedMetadataKey:               boolMetadata(tt.pool),
+				sessionpkg.DrainAckSourceMetadataKey: tt.ackSource,
 			})
-			if err := env.sp.SetMeta("worker", reconcilerDrainAckSourceKey, tt.ackSource); err != nil {
-				t.Fatalf("SetMeta(%s): %v", reconcilerDrainAckSourceKey, err)
-			}
 			if tt.assignWork {
 				if _, err := env.store.Create(beads.Bead{
 					Title:    "assigned work",
@@ -785,7 +789,7 @@ func TestReconcileSessionBeads_DrainAckCooldownExclusions(t *testing.T) {
 
 			finalizeDrainAckStoppedSession(
 				"", env.cfg, env.store, nil, env.sessionInfo(session.ID), "worker", tt.pool,
-				&providerDrainOps{sp: env.sp}, env.sp, env.dt, env.clk, env.rec, &env.stderr,
+				&providerDrainOps{sp: env.sp}, env.dt, env.clk, env.rec, &env.stderr,
 			)
 
 			got, err := env.store.Get(session.ID)
@@ -820,6 +824,60 @@ func TestReconcileSessionBeads_ExplicitWakeClearsAgentDrainAckCooldown(t *testin
 	}
 	if !env.sp.IsRunning(sessionName) {
 		t.Fatalf("always named session %q did not restart after explicit wake", sessionName)
+	}
+}
+
+// TestReconcileSessionBeads_AgentDrainAckPersistsDurableSource proves the
+// provenance is captured on the bead at the stop-pending transition — while the
+// runtime is still alive — so it outlives the runtime the finalizer never gets to
+// read. Without the durable capture the bead field is empty and the cooldown can
+// only ever come from the (soon-dead) tmux env.
+func TestReconcileSessionBeads_AgentDrainAckPersistsDurableSource(t *testing.T) {
+	_, drained, _ := agentDrainAckAlwaysNamedSession(t)
+	if got := drained.Metadata[sessionpkg.DrainAckSourceMetadataKey]; got != sessionpkg.DrainAckSourceAgent {
+		t.Fatalf("durable %s = %q, want %q", sessionpkg.DrainAckSourceMetadataKey, got, sessionpkg.DrainAckSourceAgent)
+	}
+}
+
+// TestFinalizeDrainAckStoppedSession_StampsCooldownFromDurableSourceAfterRuntimeGone
+// is the #4824 regression. GC_DRAIN_ACK_SOURCE lives in the tmux env, which dies
+// with the session, so by the time finalize runs the runtime metadata is GONE.
+// finalize must read the durable bead field captured at stop-pending, not the
+// runtime — otherwise a session-gone read is conflated with "not agent-sourced",
+// held_until never stamps, and the always-on respawn loop persists. Here the
+// runtime carries no source at all (tmux-death simulation) yet the cooldown still
+// stamps from durable state.
+func TestFinalizeDrainAckStoppedSession_StampsCooldownFromDurableSourceAfterRuntimeGone(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	session := env.createSessionBead("worker", "worker")
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:              "true",
+		namedSessionIdentityMetadata:         "worker",
+		namedSessionModeMetadata:             "always",
+		sessionpkg.DrainAckSourceMetadataKey: sessionpkg.DrainAckSourceAgent,
+	})
+	// Runtime-gone: nothing ever wrote GC_DRAIN_ACK_SOURCE to the provider, so a
+	// GetMeta-based check would see it absent and refuse the cooldown — the bug.
+	if got, _ := env.sp.GetMeta("worker", reconcilerDrainAckSourceKey); got != "" {
+		t.Fatalf("precondition: runtime drain-ack source = %q, want absent", got)
+	}
+
+	finalizeDrainAckStoppedSession(
+		"", env.cfg, env.store, nil, env.sessionInfo(session.ID), "worker", false,
+		&providerDrainOps{sp: env.sp}, env.dt, env.clk, env.rec, &env.stderr,
+	)
+
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", session.ID, err)
+	}
+	heldUntil, err := time.Parse(time.RFC3339, got.Metadata["held_until"])
+	if err != nil {
+		t.Fatalf("held_until = %q, want timestamp: %v", got.Metadata["held_until"], err)
+	}
+	if want := env.clk.Now().Add(agentDrainAckCooldown); !heldUntil.Equal(want) {
+		t.Fatalf("held_until = %s, want %s", heldUntil, want)
 	}
 }
 
@@ -3438,7 +3496,7 @@ func TestFinalizeDrainAckStoppedSessionDoesNotEmitEventsWhenFinalMetadataFails(t
 	failingStore := &failSetMetadataBatchStore{Store: env.store, err: errors.New("metadata write failed")}
 	finalizeDrainAckStoppedSession(
 		"", env.cfg, failingStore, nil, env.sessionInfo(session.ID), "worker", false,
-		newFakeDrainOps(), env.sp, env.dt, env.clk, env.rec, &env.stderr,
+		newFakeDrainOps(), env.dt, env.clk, env.rec, &env.stderr,
 	)
 
 	if len(fake.Events) != 0 {
@@ -3465,7 +3523,7 @@ func TestFinalizeDrainAckStoppedSessionFallsThroughWhenCloseGateRacesWithAssignm
 	racingStore := &assignOnListStore{Store: env.store, sessionID: session.ID}
 	finalizeDrainAckStoppedSession(
 		"", env.cfg, racingStore, nil, env.sessionInfo(session.ID), "worker", true,
-		newFakeDrainOps(), env.sp, env.dt, env.clk, env.rec, &env.stderr,
+		newFakeDrainOps(), env.dt, env.clk, env.rec, &env.stderr,
 	)
 
 	got, err := env.store.Get(session.ID)
