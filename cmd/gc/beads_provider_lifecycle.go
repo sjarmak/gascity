@@ -877,6 +877,23 @@ func initBeadsForDirWithExecutor(cityPath, dir, prefix, doltDatabase string, exe
 				}
 			}
 			env := overlayEnvEntries(baseEnv, overrides)
+			// Captured BEFORE the first init: a database that does not yet exist
+			// is being created by this invocation, so a later dirty-table recovery
+			// may commit its whole working set. A pre-existing one may hold live
+			// state, so recovery must decline to bulk-commit it. A probe failure
+			// leaves this false — the safe (decline) default — and is carried into
+			// recovery so it reports the probe failure rather than a bogus
+			// "pre-existed" reason.
+			databaseCreatedThisInvocation := false
+			var databaseCreationProbeErr error
+			if strings.TrimSpace(canonicalDoltDatabase) != "" {
+				existed, probeErr := managedDoltDatabaseExistsBeforeInit(cityPath, canonicalDoltDatabase)
+				if probeErr != nil {
+					databaseCreationProbeErr = probeErr
+				} else {
+					databaseCreatedThisInvocation = !existed
+				}
+			}
 			if err := execute(script, env, args...); err != nil {
 				if isBdAlreadyInitializedError(err) {
 					return finalizeCanonicalBdScopeInit(cityPath, dir, prefix, canonicalDoltDatabase)
@@ -896,11 +913,19 @@ func initBeadsForDirWithExecutor(cityPath, dir, prefix, doltDatabase string, exe
 					}
 				}
 				// beads refuses to migrate tables with an uncommitted working
-				// set and prescribes a remedy that hits the same refusal. We
-				// created this database, so clear it here instead of handing
-				// the operator that circular advice.
+				// set and prescribes a remedy that hits the same refusal. When
+				// this invocation created the database we clear it here instead
+				// of handing the operator that circular advice; on a pre-existing
+				// database recovery declines rather than bulk-commit live state.
 				if isBdInitDirtyTablesError(err) {
-					if recoverErr := recoverBdInitFromDirtyTables(cityPath, canonicalDoltDatabase, err, reinit); recoverErr != nil {
+					scope := dirtyTablesRecoveryScope{
+						cityPath:              cityPath,
+						scopeRoot:             dir,
+						database:              canonicalDoltDatabase,
+						createdThisInvocation: databaseCreatedThisInvocation,
+						creationProbeErr:      databaseCreationProbeErr,
+					}
+					if recoverErr := recoverBdInitFromDirtyTables(scope, err, reinit); recoverErr != nil {
 						return recoverErr
 					}
 					return finalizeCanonicalBdScopeInit(cityPath, dir, prefix, canonicalDoltDatabase)
