@@ -631,13 +631,6 @@ func classifyOrderFiring(order orders.Order, now time.Time, expected time.Durati
 		}
 		uptime := nonNegativeDuration(now.Sub(controllerStarted))
 		if uptime >= expected+expected/2 {
-			// Advisory only for cron: a cron order that has never fired since
-			// controller start may be the cron-scheduler bug (ga-97qngx), not
-			// a real outage. Cooldown never-fired/stale paths remain blocking
-			// because they indicate an execution gap.
-			if order.Trigger == "cron" {
-				return StatusError, SeverityAdvisory, fmt.Sprintf("%s: never fired since controller start %s ago", name, formatOrderFiringDuration(uptime))
-			}
 			return StatusError, SeverityBlocking, fmt.Sprintf("%s: never fired since controller start %s ago", name, formatOrderFiringDuration(uptime))
 		}
 		return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller running %s, within first cycle)", name, formatOrderFiringDuration(uptime))
