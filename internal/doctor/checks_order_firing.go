@@ -572,8 +572,14 @@ func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order 
 	if c.lastRun == nil {
 		return latest, nil
 	}
-	if !latest.IsZero() && now.Sub(latest) < expected+expected/2 {
-		return latest, nil
+	if !latest.IsZero() {
+		if order.Trigger == "cron" && len(strings.Fields(order.Schedule)) == 5 {
+			if !cronWindowOutstanding(order, now, latest) {
+				return latest, nil
+			}
+		} else if now.Sub(latest) < expected+expected/2 {
+			return latest, nil
+		}
 	}
 	runAt, err := c.lastRun(order)
 	if err != nil {
@@ -583,6 +589,21 @@ func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order 
 		return runAt, nil
 	}
 	return latest, nil
+}
+
+func cronWindowOutstanding(order orders.Order, now, lastFired time.Time) bool {
+	// The scheduler owns cron occurrence semantics, including time zones,
+	// catch-up, and DST. Evaluate through the end of the previous minute so
+	// doctor does not report a window while the scheduler can still fire it.
+	through := now.Truncate(time.Minute).Add(-time.Nanosecond)
+	result := orders.CheckTrigger(
+		order,
+		through,
+		func(string) (time.Time, error) { return lastFired, nil },
+		nil,
+		nil,
+	)
+	return result.Due
 }
 
 func latestOrderFiredAt(evts []events.Event, subject string) time.Time {
@@ -600,6 +621,10 @@ func latestOrderFiredAt(evts []events.Event, subject string) time.Time {
 
 func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time) (CheckStatus, CheckSeverity, string) {
 	name := orderDisplayName(order)
+	if order.Trigger == "cron" {
+		return classifyCronOrderFiring(order, now, expected, lastFired, controllerStarted)
+	}
+
 	if lastFired.IsZero() {
 		if controllerStarted.IsZero() {
 			return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name)
@@ -627,6 +652,34 @@ func classifyOrderFiring(order orders.Order, now time.Time, expected time.Durati
 	default:
 		return StatusOK, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected))
 	}
+}
+
+func classifyCronOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time) (CheckStatus, CheckSeverity, string) {
+	name := orderDisplayName(order)
+	baseline := lastFired
+	if baseline.IsZero() {
+		baseline = controllerStarted
+	}
+	if baseline.IsZero() {
+		return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name)
+	}
+	if !cronWindowOutstanding(order, now, baseline) {
+		if lastFired.IsZero() {
+			uptime := nonNegativeDuration(now.Sub(controllerStarted))
+			return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller running %s, within first cycle)", name, formatOrderFiringDuration(uptime))
+		}
+		age := nonNegativeDuration(now.Sub(lastFired))
+		return StatusOK, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected))
+	}
+	if lastFired.IsZero() {
+		uptime := nonNegativeDuration(now.Sub(controllerStarted))
+		return StatusError, SeverityAdvisory, fmt.Sprintf("%s: never fired since controller start %s ago", name, formatOrderFiringDuration(uptime))
+	}
+	age := nonNegativeDuration(now.Sub(lastFired))
+	if age >= expected*3 {
+		return StatusError, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (CRITICAL: stale)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected))
+	}
+	return StatusWarning, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, missed a cron window (overdue)", name, formatOrderFiringDuration(age))
 }
 
 func orderDisplayName(order orders.Order) string {
