@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -177,7 +176,16 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			blockingErrors++
 			continue
 		}
-		status, severity, detail := classifyOrderFiring(order, now, expected, lastFired, startedAt)
+		status, severity, detail, err := classifyOrderFiring(order, now, expected, lastFired, startedAt)
+		if err != nil {
+			worst = worseStatus(worst, StatusError)
+			result.Details = append(result.Details, fmt.Sprintf("%s: cannot evaluate cron occurrences: %v", orderDisplayName(order), err))
+			if firstNonOK == "" {
+				firstNonOK = orderHistoryHintTarget(order)
+			}
+			blockingErrors++
+			continue
+		}
 		worst = worseStatus(worst, status)
 		result.Details = append(result.Details, detail)
 		if status != StatusOK {
@@ -381,9 +389,9 @@ func expectedIntervalForOrder(order orders.Order, cronCache map[string]time.Dura
 }
 
 func computeExpectedIntervalForCronSchedule(schedule string) (time.Duration, error) {
-	fields := strings.Fields(schedule)
-	if len(fields) != 5 {
-		return 0, fmt.Errorf("invalid cron schedule: want 5 fields, got %d", len(fields))
+	parsed, err := orders.ParseCronSchedule(schedule)
+	if err != nil {
+		return 0, err
 	}
 
 	// Scan minute-by-minute from a fixed base so the result is deterministic
@@ -410,11 +418,7 @@ func computeExpectedIntervalForCronSchedule(schedule string) (time.Duration, err
 		matches := make([]time.Time, 0, 16)
 		for i := 0; i < windowMinutes; i++ {
 			ts := base.Add(time.Duration(i) * time.Minute)
-			matched, err := cronScheduleMatchesAt(fields, ts)
-			if err != nil {
-				return 0, err
-			}
-			if matched {
+			if parsed.Matches(ts) {
 				matches = append(matches, ts)
 			}
 		}
@@ -454,105 +458,6 @@ func computeExpectedIntervalForCronSchedule(schedule string) (time.Duration, err
 	return 0, fmt.Errorf("cron schedule %q has no firing minutes in a 366-day window", schedule)
 }
 
-func cronScheduleMatchesAt(fields []string, ts time.Time) (bool, error) {
-	specs := []struct {
-		name     string
-		field    string
-		value    int
-		min, max int
-	}{
-		{name: "minute", field: fields[0], value: ts.Minute(), min: 0, max: 59},
-		{name: "hour", field: fields[1], value: ts.Hour(), min: 0, max: 23},
-		{name: "day-of-month", field: fields[2], value: ts.Day(), min: 1, max: 31},
-		{name: "month", field: fields[3], value: int(ts.Month()), min: 1, max: 12},
-		{name: "day-of-week", field: fields[4], value: int(ts.Weekday()), min: 0, max: 6},
-	}
-	for _, spec := range specs {
-		matched, err := cronFieldMatchesForDoctor(spec.field, spec.value, spec.min, spec.max)
-		if err != nil {
-			return false, fmt.Errorf("invalid cron schedule: cannot parse %s field %q", spec.name, spec.field)
-		}
-		if !matched {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
-func cronFieldMatchesForDoctor(field string, value, lowerBound, upperBound int) (bool, error) {
-	if strings.TrimSpace(field) == "" {
-		return false, fmt.Errorf("empty field")
-	}
-	for _, rawPart := range strings.Split(field, ",") {
-		part := strings.TrimSpace(rawPart)
-		matched, err := cronPartMatchesForDoctor(part, value, lowerBound, upperBound)
-		if err != nil {
-			return false, err
-		}
-		if matched {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func cronPartMatchesForDoctor(part string, value, lowerBound, upperBound int) (bool, error) {
-	if part == "" {
-		return false, fmt.Errorf("empty part")
-	}
-	rangePart, stepPart, hasStep := strings.Cut(part, "/")
-	step := 1
-	if hasStep {
-		parsed, err := strconv.Atoi(strings.TrimSpace(stepPart))
-		if err != nil || parsed <= 0 {
-			return false, fmt.Errorf("invalid step")
-		}
-		step = parsed
-	}
-
-	lo, hi, err := cronRangeForDoctor(strings.TrimSpace(rangePart), lowerBound, upperBound)
-	if err != nil {
-		return false, err
-	}
-	if value < lo || value > hi {
-		return false, nil
-	}
-	return (value-lo)%step == 0, nil
-}
-
-func cronRangeForDoctor(rangePart string, lowerBound, upperBound int) (int, int, error) {
-	switch {
-	case rangePart == "*":
-		return lowerBound, upperBound, nil
-	case strings.Contains(rangePart, "-"):
-		start, end, ok := strings.Cut(rangePart, "-")
-		if !ok {
-			return 0, 0, fmt.Errorf("invalid range")
-		}
-		lo, err := strconv.Atoi(strings.TrimSpace(start))
-		if err != nil {
-			return 0, 0, err
-		}
-		hi, err := strconv.Atoi(strings.TrimSpace(end))
-		if err != nil {
-			return 0, 0, err
-		}
-		if lo < lowerBound || hi > upperBound || lo > hi {
-			return 0, 0, fmt.Errorf("range out of bounds")
-		}
-		return lo, hi, nil
-	default:
-		value, err := strconv.Atoi(rangePart)
-		if err != nil {
-			return 0, 0, err
-		}
-		if value < lowerBound || value > upperBound {
-			return 0, 0, fmt.Errorf("value out of bounds")
-		}
-		return value, value, nil
-	}
-}
-
 func latestControllerStartedAt(eventPath string) (time.Time, error) {
 	startEvents, err := events.ReadFiltered(eventPath, events.Filter{Type: events.ControllerStarted})
 	if err != nil {
@@ -573,8 +478,12 @@ func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order 
 		return latest, nil
 	}
 	if !latest.IsZero() {
-		if order.Trigger == "cron" && len(strings.Fields(order.Schedule)) == 5 {
-			if !cronWindowOutstanding(order, now, latest) {
+		if order.Trigger == "cron" {
+			outstanding, err := cronWindowOutstanding(order, now, latest)
+			if err != nil {
+				return time.Time{}, err
+			}
+			if !outstanding {
 				return latest, nil
 			}
 		} else if now.Sub(latest) < expected+expected/2 {
@@ -591,19 +500,8 @@ func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order 
 	return latest, nil
 }
 
-func cronWindowOutstanding(order orders.Order, now, lastFired time.Time) bool {
-	// The scheduler owns cron occurrence semantics, including time zones,
-	// catch-up, and DST. Evaluate through the end of the previous minute so
-	// doctor does not report a window while the scheduler can still fire it.
-	through := now.Truncate(time.Minute).Add(-time.Nanosecond)
-	result := orders.CheckTrigger(
-		order,
-		through,
-		func(string) (time.Time, error) { return lastFired, nil },
-		nil,
-		nil,
-	)
-	return result.Due
+func cronWindowOutstanding(order orders.Order, now, lastFired time.Time) (bool, error) {
+	return orders.HasCompletedCronOccurrence(order, lastFired, now)
 }
 
 func latestOrderFiredAt(evts []events.Event, subject string) time.Time {
@@ -619,7 +517,7 @@ func latestOrderFiredAt(evts []events.Event, subject string) time.Time {
 	return latest
 }
 
-func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time) (CheckStatus, CheckSeverity, string) {
+func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time) (CheckStatus, CheckSeverity, string, error) {
 	name := orderDisplayName(order)
 	if order.Trigger == "cron" {
 		return classifyCronOrderFiring(order, now, expected, lastFired, controllerStarted)
@@ -627,52 +525,56 @@ func classifyOrderFiring(order orders.Order, now time.Time, expected time.Durati
 
 	if lastFired.IsZero() {
 		if controllerStarted.IsZero() {
-			return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name)
+			return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name), nil
 		}
 		uptime := nonNegativeDuration(now.Sub(controllerStarted))
 		if uptime >= expected+expected/2 {
-			return StatusError, SeverityBlocking, fmt.Sprintf("%s: never fired since controller start %s ago", name, formatOrderFiringDuration(uptime))
+			return StatusError, SeverityBlocking, fmt.Sprintf("%s: never fired since controller start %s ago", name, formatOrderFiringDuration(uptime)), nil
 		}
-		return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller running %s, within first cycle)", name, formatOrderFiringDuration(uptime))
+		return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller running %s, within first cycle)", name, formatOrderFiringDuration(uptime)), nil
 	}
 
 	age := nonNegativeDuration(now.Sub(lastFired))
 	switch {
 	case age >= expected*3:
-		return StatusError, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (CRITICAL: stale)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected))
+		return StatusError, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (CRITICAL: stale)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected)), nil
 	case age >= expected+expected/2:
-		return StatusWarning, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (overdue)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected))
+		return StatusWarning, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (overdue)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected)), nil
 	default:
-		return StatusOK, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected))
+		return StatusOK, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected)), nil
 	}
 }
 
-func classifyCronOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time) (CheckStatus, CheckSeverity, string) {
+func classifyCronOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time) (CheckStatus, CheckSeverity, string, error) {
 	name := orderDisplayName(order)
 	baseline := lastFired
 	if baseline.IsZero() {
-		baseline = controllerStarted
+		if controllerStarted.IsZero() {
+			return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name), nil
+		}
+		baseline = controllerStarted.Add(-time.Minute)
 	}
-	if baseline.IsZero() {
-		return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name)
+	outstanding, err := cronWindowOutstanding(order, now, baseline)
+	if err != nil {
+		return StatusError, SeverityBlocking, "", err
 	}
-	if !cronWindowOutstanding(order, now, baseline) {
+	if !outstanding {
 		if lastFired.IsZero() {
 			uptime := nonNegativeDuration(now.Sub(controllerStarted))
-			return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller running %s, within first cycle)", name, formatOrderFiringDuration(uptime))
+			return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller running %s, within first cycle)", name, formatOrderFiringDuration(uptime)), nil
 		}
 		age := nonNegativeDuration(now.Sub(lastFired))
-		return StatusOK, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected))
+		return StatusOK, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected)), nil
 	}
 	if lastFired.IsZero() {
 		uptime := nonNegativeDuration(now.Sub(controllerStarted))
-		return StatusError, SeverityAdvisory, fmt.Sprintf("%s: never fired since controller start %s ago", name, formatOrderFiringDuration(uptime))
+		return StatusError, SeverityAdvisory, fmt.Sprintf("%s: never fired since controller start %s ago", name, formatOrderFiringDuration(uptime)), nil
 	}
 	age := nonNegativeDuration(now.Sub(lastFired))
 	if age >= expected*3 {
-		return StatusError, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (CRITICAL: stale)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected))
+		return StatusError, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (CRITICAL: stale)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected)), nil
 	}
-	return StatusWarning, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, missed a cron window (overdue)", name, formatOrderFiringDuration(age))
+	return StatusWarning, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, missed a cron window (overdue)", name, formatOrderFiringDuration(age)), nil
 }
 
 func orderDisplayName(order orders.Order) string {

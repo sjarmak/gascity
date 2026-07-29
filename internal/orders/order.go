@@ -304,6 +304,9 @@ func Validate(a Order) error {
 		if a.Schedule == "" {
 			return fmt.Errorf("order %q: cron trigger requires schedule", a.Name)
 		}
+		if _, err := ParseCronSchedule(a.Schedule); err != nil {
+			return fmt.Errorf("order %q: %w", a.Name, err)
+		}
 	case "condition":
 		if a.Check == "" {
 			return fmt.Errorf("order %q: condition trigger requires check command", a.Name)

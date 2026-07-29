@@ -161,3 +161,106 @@ tz = "America/New_York"
 		})
 	}
 }
+
+func TestOrderFiringCurrent_LeapDayMissBeyondDispatchCatchupIsStale(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringRawOrder(t, cityPath, "leap-day", `[order]
+exec = "true"
+trigger = "cron"
+schedule = "0 0 29 2 *"
+tz = "UTC"
+`)
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: time.Date(2020, 2, 28, 0, 0, 0, 0, time.UTC)},
+		events.Event{Type: events.OrderFired, Subject: "leap-day", Ts: time.Date(2020, 2, 29, 0, 0, 0, 0, time.UTC)},
+	)
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+
+	if result.Status != StatusError {
+		t.Fatalf("status = %v, want error after missed 2024 leap-day occurrence; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+}
+
+func TestOrderFiringCurrent_ControllerStartMinuteBecomesDueAfterGrace(t *testing.T) {
+	now := time.Date(2026, 7, 29, 10, 2, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringRawOrder(t, cityPath, "daily", `[order]
+exec = "true"
+trigger = "cron"
+schedule = "0 10 * * *"
+tz = "UTC"
+`)
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: time.Date(2026, 7, 29, 10, 0, 30, 0, time.UTC)},
+	)
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+
+	if result.Status != StatusError {
+		t.Fatalf("status = %v, want error after controller-start cron minute completed; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if result.Severity != SeverityAdvisory {
+		t.Fatalf("severity = %v, want advisory for never-fired order; details = %v", result.Severity, result.Details)
+	}
+}
+
+func TestOrderFiringCurrent_FallBackRepeatedMinuteRetainsGrace(t *testing.T) {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatalf("load America/New_York: %v", err)
+	}
+	// 06:30 UTC is the second 01:30 wall minute after the fall-back.
+	now := time.Date(2026, 11, 1, 6, 30, 30, 0, time.UTC).In(loc)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringRawOrder(t, cityPath, "fall-back", `[order]
+exec = "true"
+trigger = "cron"
+schedule = "30 1 * * *"
+tz = "America/New_York"
+`)
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-48 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "fall-back", Ts: time.Date(2026, 10, 31, 1, 30, 0, 0, loc)},
+	)
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+
+	if result.Status != StatusOK {
+		t.Fatalf("status = %v, want OK through the repeated 01:30 wall minute; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+}
+
+func TestOrderFiringCurrent_FallBackSlotRemainsFireableBeforeRepeat(t *testing.T) {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatalf("load America/New_York: %v", err)
+	}
+	// 05:45 UTC is 01:45 EDT, after the first 01:30 but before the clock
+	// repeats the hour and offers the same 01:30 wall slot again.
+	now := time.Date(2026, 11, 1, 5, 45, 0, 0, time.UTC).In(loc)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringRawOrder(t, cityPath, "fall-back", `[order]
+exec = "true"
+trigger = "cron"
+schedule = "30 1 * * *"
+tz = "America/New_York"
+`)
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-48 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "fall-back", Ts: time.Date(2026, 10, 31, 1, 30, 0, 0, loc)},
+	)
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+
+	if result.Status != StatusOK {
+		t.Fatalf("status = %v, want OK while the 01:30 slot can still repeat; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+}
+
+func TestComputeExpectedIntervalRejectsUnsupportedCronRange(t *testing.T) {
+	if _, err := computeExpectedIntervalForCronSchedule("0 9-17 * * *"); err == nil {
+		t.Fatal("range schedule accepted by doctor, but dispatcher does not support ranges")
+	}
+}

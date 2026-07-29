@@ -471,7 +471,6 @@ func TestComputeExpectedIntervalForCronSchedules(t *testing.T) {
 		{"every-4h", "0 */4 * * *", 4 * time.Hour},
 		{"every-15min", "*/15 * * * *", 15 * time.Minute},
 		{"daily-0300", "0 3 * * *", 24 * time.Hour},
-		{"hourly-business", "0 9-17 * * *", time.Hour},
 		// #2499: schedules coarser than daily must compute an honest interval
 		// instead of erroring on an empty 24h scan window. Weekly, biweekly,
 		// monthly, and yearly are the common shapes; the progressive-widen
@@ -672,7 +671,7 @@ func TestLatestOrderFiredAt_RecentEventSkipsLastRun(t *testing.T) {
 func TestLatestOrderFiredAt_StaleEventConsultsLastRun(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	expected := 4 * time.Hour
-	order := orders.Order{Name: "mol-dog-stale-db", Trigger: "cron"}
+	order := orders.Order{Name: "mol-dog-stale-db", Trigger: "cron", Schedule: "0 */4 * * *"}
 	// Event age (13h) exceeds expected*1.5 (6h), so the fast path must not apply.
 	staleEvent := now.Add(-13 * time.Hour)
 	freshRun := now.Add(-1 * time.Hour)
