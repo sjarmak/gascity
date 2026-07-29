@@ -1610,7 +1610,14 @@ func enqueuePreparedStartWaveForCity(
 				defer release()
 			}
 			result := runPreparedStartCandidate(ctx, item, cityPath, sp, store, cfg, startupTimeout, stabilityWaiter, sessionStaleKeyDetectionWaiter)
-			commitAsyncStartResultWithContext(ctx, result, sp, store, clk, rec, wave, stdout, stderr, trace)
+			// result.prepared is the enqueue-time snapshot; the commit refreshes a
+			// local copy. promptDelivered and the session ID are stable across that
+			// refresh, so the kickoff still fences to the right session. A trigger
+			// bead rebound mid-spawn could lag here, but poolClaimBackstop re-nudges
+			// such sessions on a later tick with fresh metadata (see idle_nudge.go).
+			if commitAsyncStartResultWithContext(ctx, result, sp, store, clk, rec, wave, stdout, stderr, trace) {
+				maybeEnqueueStepKickoffNudge(result.prepared, cityPath, store, clk.Now(), stderr)
+			}
 			if asyncFollowUp != nil {
 				asyncFollowUp()
 			}
@@ -1704,6 +1711,58 @@ func commitAsyncStartResultWithContext(
 		_ = clearReconcilerDrainAckMetadata(sp, refreshed.prepared.candidate.name())
 	}
 	return commitStartResultTraced(refreshed, sessFront, clk, rec, wave, stdout, stderr, trace)
+}
+
+// stepKickoffNudgeMessage is the first-prompt reminder queued for a born-unprimed
+// routed step session. It matches the nudge-on-route order's default message so a
+// step session that receives it runs its startup protocol (find and claim the bead
+// on its hook) exactly as an externally-primed session would.
+const stepKickoffNudgeMessage = "check for assigned work"
+
+// maybeEnqueueStepKickoffNudge queues a first-prompt nudge for a reconciler-spawned
+// step session that was born unprimed, closing the #4382 gap where such sessions
+// sit at a bare interactive prompt forever and their step never starts.
+//
+// A routed step bead has gc.routed_to stamped at bead.created, so its only
+// lifecycle event is bead.created; the nudge-on-route order fires on bead.updated
+// only and never primes it, and the reconciler spawn command carries no prompt
+// argument (promptDelivered == false). Nothing else owns delivering the first
+// prompt. This enqueues one; the session's own `gc nudge poll` sidecar (started by
+// `gc prime` at SessionStart) then delivers it out-of-band. The same idempotent
+// reminder also unsticks a relaunched step session whose kickoff was lost.
+//
+// The nudge is fenced to exactly the spawned session: both Agent and SessionID are
+// the session bead ID, which equals the poller target's GC_SESSION_ID, so no other
+// session can claim it. It is scoped to routed step sessions (a trigger bead is
+// present) and skips sessions already primed at spawn, so template-primed
+// pool/named sessions and idle capacity sessions are left untouched.
+//
+// Best-effort: a failed enqueue is logged, never fatal to the start that just
+// committed. Only committed starts reach here, so at most one kickoff is queued
+// per spawn.
+func maybeEnqueueStepKickoffNudge(prepared preparedStart, cityPath string, store beads.Store, now time.Time, stderr io.Writer) {
+	if store == nil {
+		return
+	}
+	// Skip sessions primed at spawn: an arg-mode template prompt already delivered
+	// the first turn, so a kickoff would be redundant.
+	if prepared.promptDelivered {
+		return
+	}
+	info := prepared.candidate.info
+	triggerBead := strings.TrimSpace(info.TriggerBeadID)
+	sessionID := strings.TrimSpace(info.ID)
+	// A trigger bead marks a routed step session; without one this is idle pool
+	// capacity that must not be nudged into claiming work that was never routed.
+	if triggerBead == "" || sessionID == "" {
+		return
+	}
+	item := newQueuedNudgeWithOptions(sessionID, stepKickoffNudgeMessage, "reconciler-step-kickoff", now, queuedNudgeOptions{
+		SessionID: sessionID,
+	})
+	if err := enqueueQueuedNudgeWithStore(cityPath, beads.NudgesStore{Store: store}, item); err != nil {
+		fmt.Fprintf(stderr, "session reconciler: enqueue kickoff nudge for step session %s (bead %s): %v\n", sessionID, triggerBead, err) //nolint:errcheck
+	}
 }
 
 // refreshAsyncStartResult re-reads the session bead just before commit so the async
@@ -2875,6 +2934,7 @@ func executePlannedStartsTraced(
 					_ = clearReconcilerDrainAckMetadata(sp, result.prepared.candidate.name())
 				}
 				if commitStartResultTraced(result, sessFront, clk, rec, wave, stdout, stderr, trace) {
+					maybeEnqueueStepKickoffNudge(result.prepared, cityPath, store, clk.Now(), stderr)
 					wakeCount++
 				}
 			}
