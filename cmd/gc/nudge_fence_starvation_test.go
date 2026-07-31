@@ -58,23 +58,25 @@ func TestWithNudgeTargetFence_PrefersCurrentSessionAmongDuplicates(t *testing.T)
 
 // TestWithNudgeTargetFence_KnownSessionIDFillsOwnEpoch guards the caller-knows-ID
 // path: when the target already carries a session ID, the epoch must be filled
-// from THAT exact session's bead, never from a newer same-name sibling. Filling
-// the wrong epoch would fence delivery on a fabricated identity.
+// from THAT exact session's bead, never from an older same-name sibling. The
+// known ID is the NEWER session while an obsolete twin was inserted first, so a
+// regression to the pre-fix oldest-first scan (which filled epoch from the first
+// same-name bead) would fill epoch "1" and fail this test.
 func TestWithNudgeTargetFence_KnownSessionIDFillsOwnEpoch(t *testing.T) {
 	store := beads.NudgesStore{Store: beads.NewMemStore()}
-	obsolete := openSessionBead(t, store, "1")
-	_ = openSessionBead(t, store, "2")
+	_ = openSessionBead(t, store, "1") // obsolete twin, inserted first (oldest-first scan would pick it)
+	current := openSessionBead(t, store, "2")
 
 	target := withNudgeTargetFence(store.Store, nudgeTarget{
 		sessionName: starvationSessionName,
-		sessionID:   obsolete,
+		sessionID:   current,
 	})
 
-	if target.sessionID != obsolete {
-		t.Fatalf("sessionID = %q, want unchanged %q", target.sessionID, obsolete)
+	if target.sessionID != current {
+		t.Fatalf("sessionID = %q, want unchanged %q", target.sessionID, current)
 	}
-	if target.continuationEpoch != "1" {
-		t.Fatalf("continuationEpoch = %q, want 1 (the known session's own epoch)", target.continuationEpoch)
+	if target.continuationEpoch != "2" {
+		t.Fatalf("continuationEpoch = %q, want 2 (the known session's own epoch, not the older sibling's)", target.continuationEpoch)
 	}
 }
 

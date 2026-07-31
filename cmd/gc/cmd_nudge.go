@@ -126,17 +126,12 @@ type nudgeTarget struct {
 }
 
 type nudgeStatusJSON struct {
-	SchemaVersion string `json:"schema_version"`
-	Command       string `json:"command"`
-	CityPath      string `json:"city_path"`
-	Agent         string `json:"agent"`
-	Session       string `json:"session"`
-	SessionID     string `json:"session_id,omitempty"`
-	// DeliveryState is the independently cross-checked delivery lifecycle of the
-	// routed work (route vs last-delivery vs live activity): unrouted, queued,
-	// awaiting_ack, acknowledged, or stalled. It exists so routed/assigned work is
-	// never read as active on routing metadata alone (gc-snrfp).
-	DeliveryState string            `json:"delivery_state"`
+	SchemaVersion string            `json:"schema_version"`
+	Command       string            `json:"command"`
+	CityPath      string            `json:"city_path"`
+	Agent         string            `json:"agent"`
+	Session       string            `json:"session"`
+	SessionID     string            `json:"session_id,omitempty"`
 	Counts        nudgeStatusCounts `json:"counts"`
 	Pending       []queuedNudge     `json:"pending"`
 	InFlight      []queuedNudge     `json:"in_flight"`
@@ -345,10 +340,6 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 		return 1
 	}
 
-	// Independently cross-check route vs delivery vs live activity so routed-only
-	// work is never reported as active on either the JSON or the human surface.
-	deliveryState := nudgeTargetDeliveryState(target, len(pending)+len(inFlight) > 0, time.Now())
-
 	if jsonOutput {
 		if err := writeCLIJSONLine(stdout, nudgeStatusJSON{
 			SchemaVersion: "1",
@@ -357,7 +348,6 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 			Agent:         target.agentKey(),
 			Session:       target.sessionName,
 			SessionID:     target.sessionID,
-			DeliveryState: string(deliveryState),
 			Counts: nudgeStatusCounts{
 				Pending:  len(pending),
 				InFlight: len(inFlight),
@@ -374,9 +364,9 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 	}
 
 	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(tw, "AGENT\tPENDING\tIN_FLIGHT\tDEAD\tDELIVERY\tSESSION\n") //nolint:errcheck
-	_, _ = fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%s\t%s\n",
-		target.agentKey(), len(pending), len(inFlight), len(dead), deliveryState, target.sessionName)
+	fmt.Fprintf(tw, "AGENT\tPENDING\tIN_FLIGHT\tDEAD\tSESSION\n") //nolint:errcheck
+	_, _ = fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%s\n",
+		target.agentKey(), len(pending), len(inFlight), len(dead), target.sessionName)
 	_ = tw.Flush()
 
 	if len(pending) > 0 {
@@ -1535,7 +1525,7 @@ func withNudgeTargetFence(store beads.Store, target nudgeTarget) nudgeTarget {
 // When the caller already knows the session ID, that exact session wins: the
 // epoch is filled from its own bead and never from a newer same-name sibling.
 // Otherwise the current session is the highest continuation epoch (the newest
-// conversation identity), tie-broken by most-recent activity then bead ID so the
+// conversation identity), tie-broken by most-recent creation then bead ID so the
 // choice is deterministic regardless of scan order. Returns false when no open
 // session matches the name (or, when a session ID is known, when no open bead
 // carries it).
@@ -1561,16 +1551,16 @@ func currentSessionInfoForName(open []session.Info, sessionName, knownSessionID 
 }
 
 // sessionInfoMoreCurrent reports whether a is a more-current conversation
-// identity than b: higher continuation epoch first, then more-recent activity,
-// then more-recent creation, then higher bead ID as a deterministic final
-// tiebreak. An unparseable epoch sorts as the lowest (0).
+// identity than b: higher continuation epoch first, then more-recent creation,
+// then higher bead ID as a deterministic final tiebreak. An unparseable epoch
+// sorts as the lowest (0). Activity recency is deliberately not a tiebreak here:
+// these infos come from the persisted projection (loadOpenSessionInfos), whose
+// LastActive is always zero — only the runtime-enriched read populates it — so a
+// LastActive comparison would be dead code masquerading as a signal.
 func sessionInfoMoreCurrent(a, b session.Info) bool {
 	ea, eb := parseContinuationEpoch(a.ContinuationEpoch), parseContinuationEpoch(b.ContinuationEpoch)
 	if ea != eb {
 		return ea > eb
-	}
-	if !a.LastActive.Equal(b.LastActive) {
-		return a.LastActive.After(b.LastActive)
 	}
 	if !a.CreatedAt.Equal(b.CreatedAt) {
 		return a.CreatedAt.After(b.CreatedAt)
