@@ -260,6 +260,50 @@ func TestNativeDoltStoreMapsUpstreamStatusesToGasCityContract(t *testing.T) {
 	}
 }
 
+func TestBeadFromNativeIssuePreservesBlockedStatusMarker(t *testing.T) {
+	// mapBdStatus folds StatusBlocked -> "open"; the self-blocked marker must
+	// survive the fold so the cache full-scan List() (which does not filter
+	// status) does not absorb this parked bead as claimable. Mirrors the
+	// BdStore behavior (TestBdIssueToBeadPreservesBlockedStatusAsIsBlockedMarker).
+	blocked, err := beadFromNativeIssue(&beadslib.Issue{
+		ID:        "gc-native-blocked",
+		Title:     "parked work",
+		Status:    beadslib.StatusBlocked,
+		IssueType: beadslib.TypeTask,
+		Priority:  1,
+	})
+	if err != nil {
+		t.Fatalf("beadFromNativeIssue blocked: %v", err)
+	}
+	if blocked.Status != "open" {
+		t.Fatalf("Status = %q, want folded open", blocked.Status)
+	}
+	if blocked.IsBlocked == nil || !*blocked.IsBlocked {
+		t.Fatalf("IsBlocked = %v, want true wire marker", blocked.IsBlocked)
+	}
+	if !IsSelfBlockedBead(blocked) {
+		t.Fatal("IsSelfBlockedBead = false, want true for a status-blocked native issue")
+	}
+
+	// A genuinely open issue is unaffected: no marker, claimable.
+	open, err := beadFromNativeIssue(&beadslib.Issue{
+		ID:        "gc-native-open",
+		Title:     "ready work",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.TypeTask,
+		Priority:  1,
+	})
+	if err != nil {
+		t.Fatalf("beadFromNativeIssue open: %v", err)
+	}
+	if open.IsBlocked != nil {
+		t.Fatalf("IsBlocked = %v, want nil for an open issue", *open.IsBlocked)
+	}
+	if IsSelfBlockedBead(open) {
+		t.Fatal("IsSelfBlockedBead = true, want false for an open native issue")
+	}
+}
+
 func TestNativeDoltStoreListStatusOpenMatchesOpenNormalizedUpstreamStatuses(t *testing.T) {
 	issues := []*beadslib.Issue{
 		{ID: "gc-open", Title: "open", Status: beadslib.StatusOpen, IssueType: beadslib.TypeTask, Priority: 2},
