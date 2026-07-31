@@ -1496,7 +1496,13 @@ func scanBead(rows interface{ Scan(...any) error }) (Bead, error) {
 		p := int(priority.Int64)
 		b.Priority = &p
 	}
+	rawStatus := b.Status
 	b.Status = mapBdStatus(b.Status)
+	// mapBdStatus folds a raw status="blocked" to "open"; preserve the
+	// self-blocked marker so a status-blocked row absorbed via the cache
+	// full-scan List() (which, unlike Ready(), does not filter status) is not
+	// treated as claimable. See Bead.IsBlocked.
+	applyStatusBlockedMarker(&b, rawStatus)
 	b.CreatedAt = parseDBTime(createdRaw).Truncate(time.Second)
 	b.UpdatedAt = parseDBTime(updatedRaw).Truncate(time.Second)
 	b.Metadata = parseMetadata(metadataRaw)

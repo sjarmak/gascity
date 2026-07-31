@@ -107,27 +107,35 @@ type Bead struct {
 	// nil or past means ready). Create paths preserve it; UpdateOpts does not
 	// mutate it.
 	DeferUntil *time.Time `json:"defer_until,omitempty"`
-	// IsBlocked carries bd's denormalized ready-work projection: "bd says this
-	// bead is not ready", which cachedBeadReady consumes as a short-circuit over
-	// dependency-derived readiness. Nil means the store did not provide the
-	// projection and cached ready falls back to dependencies for backward
-	// compatibility.
+	// IsBlocked carries a backend's "this bead is not ready" projection, which
+	// cachedBeadReady consumes as a short-circuit over dependency-derived
+	// readiness. Nil means the backend did not provide the projection and cached
+	// ready falls back to dependencies for backward compatibility.
 	//
-	// It carries BOTH of bd's not-ready dimensions, because bd populates them on
-	// different channels and Gas City must honor either: the dependency-derived
-	// is_blocked column, and the bd status value "blocked" (a worker parking work
-	// it cannot progress). mapBdStatus folds bd's status vocabulary onto Gas
-	// City's three statuses, so the second dimension would otherwise be erased at
-	// the projection boundary — see bdIssue.blockedFlag. This is the only
-	// not-claimable signal that survives every hop from bd's JSON through the
-	// cache and the HTTP/SSE wire to the controller's demand readers, which is
-	// what lets demand and `gc hook --claim` agree on one set.
+	// It carries BOTH not-ready dimensions the backends populate on different
+	// channels, and Gas City honors either: the dependency-derived is_blocked
+	// column, and the raw status value "blocked" (a worker parking work it cannot
+	// progress). This is the authoritative explanation of the status dimension;
+	// every conversion path (bdIssue.toBead, DoltliteReadStore.scanBead,
+	// NativeDoltStore.beadFromNativeIssue) and reader (IsSelfBlockedBead) refers
+	// here rather than re-deriving it.
+	//
+	// The status dimension needs its own carrier because mapBdStatus folds a
+	// backend's richer status vocabulary onto Gas City's three statuses, erasing
+	// "blocked" -> "open". applyStatusBlockedMarker reverses that loss at every
+	// conversion boundary by folding raw status="blocked" into IsBlocked=true
+	// (the exported, on-wire field) plus the store-internal blockedByStatus
+	// provenance bit. IsBlocked is the only self-blocked signal that survives the
+	// HTTP/SSE wire, so demand and `gc hook --claim` agree on one set.
 	IsBlocked *bool `json:"is_blocked,omitempty"`
-	// blockedByStatus records the provenance of an IsBlocked=true marker that
-	// bdIssue.toBead synthesized from bd's raw status=="blocked". Cache
-	// dependency invalidation may clear dependency-derived IsBlocked projections,
-	// but must not clear this independent status dimension. It is intentionally
-	// store-internal: IsBlocked remains the stable wire representation.
+	// blockedByStatus records that an IsBlocked=true marker came from a raw
+	// status=="blocked" fold rather than a dependency-derived projection. Cache
+	// dependency invalidation (clearReadyProjectionLocked) may clear the
+	// dependency-derived dimension but must not clear this status dimension. It is
+	// store-internal: IsBlocked is the stable wire representation, so a bead that
+	// crossed the wire arrives with blockedByStatus=false and IsBlocked=true; a
+	// backing refresh or reconcile restores the provenance bit from the raw
+	// status.
 	blockedByStatus bool
 	// Revision is the store-internal optimistic-concurrency token for
 	// ConditionalWriter. It is deliberately json:"-" so it stays off every HTTP
@@ -509,28 +517,45 @@ func IsReadyExcludedBead(b Bead) bool {
 }
 
 // IsSelfBlockedBead reports whether a bead carries its own blocked marker,
-// independent of the dependency graph checked by the per-store blocker
-// predicates. It is the STATUS dimension of Ready exclusion, exactly parallel
-// to IsReadyExcludedBead's TYPE dimension (the convoy/epic infrastructure
-// guard): a self-blocked bead is real work that simply is not claimable now.
+// independent of the dependency graph. It is the STATUS dimension of Ready
+// exclusion, parallel to IsReadyExcludedBead's TYPE dimension: a self-blocked
+// bead is real work that simply is not claimable now. It mirrors cmd/gc
+// isSelfBlockedHookCandidate so demand and `gc hook --claim` agree on one set;
+// see Bead.IsBlocked for why demand/claim disagreement is a respawn loop.
 //
-// This mirrors cmd/gc isSelfBlockedHookCandidate — the claim path's filter — so
-// demand and claim agree on one set instead of approximating each other. Demand
-// that counts what claim refuses to hand out IS a spawn loop: the controller
-// starts a worker, the worker's `gc hook --claim` finds nothing, it drain-acks,
-// and the unchanged demand immediately starts another one.
-//
-// bd's richer status vocabulary is folded onto Gas City's three statuses by
-// mapBdStatus, so a bd-side "blocked" arrives here as the is_blocked marker
-// preserved by bdIssue.blockedFlag rather than as a distinct Status. Both
-// spellings are accepted so native and bd-backed stores answer identically.
-// An absent marker means NOT blocked: bd's denormalized projection is not
-// always populated, and over-filtering here would strand ready work.
+// Accepts both spellings of the marker so every backend answers identically:
+// the IsBlocked field (set by applyStatusBlockedMarker where mapBdStatus already
+// folded status="blocked" away) and a raw, unfolded Status. An absent marker
+// means NOT blocked; over-filtering here would strand ready work.
 func IsSelfBlockedBead(b Bead) bool {
-	if b.blockedByStatus || (b.IsBlocked != nil && *b.IsBlocked) {
-		return true
+	return b.blockedByStatus ||
+		(b.IsBlocked != nil && *b.IsBlocked) ||
+		isBlockedStatusValue(b.Status)
+}
+
+// isBlockedStatusValue reports whether a raw (pre-mapBdStatus) status string is
+// the self-blocked "blocked" status, tolerant of case and surrounding
+// whitespace. It is the single spelling of the status->marker test shared by
+// every backend conversion path and the wire decoder, so the fold that erases
+// "blocked" is reversed identically everywhere.
+func isBlockedStatusValue(s string) bool {
+	return strings.EqualFold(strings.TrimSpace(s), "blocked")
+}
+
+// applyStatusBlockedMarker folds a backend's raw (pre-mapBdStatus) status into
+// the self-blocked markers on b. mapBdStatus collapses "blocked" -> "open", so
+// every conversion path calls this with the RAW status to preserve the signal:
+// blockedByStatus records the provenance (store-internal), and IsBlocked carries
+// it across the HTTP/SSE wire where blockedByStatus (unexported) cannot travel.
+// A status="blocked" row always wins, matching the claim path; a non-blocked
+// status leaves any dependency-derived IsBlocked untouched. See Bead.IsBlocked.
+func applyStatusBlockedMarker(b *Bead, rawStatus string) {
+	if !isBlockedStatusValue(rawStatus) {
+		return
 	}
-	return strings.EqualFold(strings.TrimSpace(b.Status), "blocked")
+	b.blockedByStatus = true
+	blocked := true
+	b.IsBlocked = &blocked
 }
 
 // HasReadyExcludedLabel reports whether a bead carries a label that marks it

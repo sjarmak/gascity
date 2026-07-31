@@ -233,6 +233,52 @@ func TestBdIssueToBeadPreservesBlockedStatusAsIsBlockedMarker(t *testing.T) {
 	}
 }
 
+func TestApplyStatusBlockedMarkerFoldsRawStatus(t *testing.T) {
+	// The shared fold every backend conversion path (BdStore, DoltLite,
+	// NativeDolt) delegates to. Case- and whitespace-tolerant; status "blocked"
+	// synthesizes IsBlocked=true and provenance; a non-blocked status leaves any
+	// dependency-derived IsBlocked untouched.
+	for _, spelling := range []string{"blocked", "BLOCKED", "  Blocked  "} {
+		b := Bead{ID: "gc-x", Status: "open"}
+		applyStatusBlockedMarker(&b, spelling)
+		if !b.blockedByStatus {
+			t.Fatalf("spelling %q: blockedByStatus = false, want true", spelling)
+		}
+		if b.IsBlocked == nil || !*b.IsBlocked {
+			t.Fatalf("spelling %q: IsBlocked = %v, want true", spelling, b.IsBlocked)
+		}
+		if !IsSelfBlockedBead(b) {
+			t.Fatalf("spelling %q: IsSelfBlockedBead = false, want true", spelling)
+		}
+	}
+
+	// Status "blocked" wins over an explicit dependency-derived false.
+	depFalse := false
+	overridden := Bead{ID: "gc-y", Status: "open", IsBlocked: &depFalse}
+	applyStatusBlockedMarker(&overridden, "blocked")
+	if overridden.IsBlocked == nil || !*overridden.IsBlocked {
+		t.Fatalf("IsBlocked = %v, want status-blocked to override dependency false", overridden.IsBlocked)
+	}
+
+	// A non-blocked raw status leaves an existing dependency-derived marker and
+	// provenance untouched.
+	preserved := Bead{ID: "gc-z", Status: "open", IsBlocked: &depFalse}
+	applyStatusBlockedMarker(&preserved, "in_progress")
+	if preserved.blockedByStatus {
+		t.Fatal("blockedByStatus = true for a non-blocked status")
+	}
+	if preserved.IsBlocked == nil || *preserved.IsBlocked {
+		t.Fatalf("IsBlocked = %v, want the dependency-derived false preserved", preserved.IsBlocked)
+	}
+	if IsSelfBlockedBead(preserved) {
+		t.Fatal("IsSelfBlockedBead = true for an unblocked bead")
+	}
+
+	if !isBlockedStatusValue(" Blocked ") || isBlockedStatusValue("open") {
+		t.Fatal("isBlockedStatusValue predicate does not match its spelling contract")
+	}
+}
+
 func TestTierWispsIncludesNoHistoryRows(t *testing.T) {
 	items := []Bead{
 		{ID: "issue", Title: "issue", Status: "open", Type: "task"},

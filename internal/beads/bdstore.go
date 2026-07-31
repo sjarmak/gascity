@@ -814,24 +814,13 @@ func (b *bdIssue) toBead() Bead {
 	}
 }
 
-// blockedFlag resolves the Bead.IsBlocked marker from bd's row. bd carries the
-// self-blocked signal on TWO channels and a given bd build may populate either:
-// the denormalized is_blocked column, and the status value "blocked" itself.
-// mapBdStatus deliberately folds bd's richer status vocabulary (blocked,
-// review, testing) onto Gas City's three-status model, so a row whose ONLY
-// self-blocked signal was status=="blocked" used to arrive here indistinguishable
-// from healthy open work — the projection erased the one field the claim path
-// keys on. Preserving it as is_blocked keeps the three-status model intact while
-// making the marker survive the projection, so demand-side readers can apply the
-// same non-claimable predicate the claim path applies (cmd/gc
-// isSelfBlockedHookCandidate, which tests is_blocked OR status=="blocked").
-//
-// The two channels are independent and combine with OR semantics, matching the
-// claim path: status "blocked" always wins, even when the dependency-derived
-// is_blocked column explicitly says false. For every other status, preserve the
-// optional is_blocked value exactly. In particular, an absent marker stays nil
-// ("bd did not say") rather than becoming a synthesized false, which would flip
-// cachedBeadReady from "consult dependencies" to "definitely ready".
+// blockedFlag resolves the Bead.IsBlocked marker from bd's row, ORing bd's two
+// independent not-ready channels: the dependency-derived is_blocked column and
+// the raw status "blocked". Status "blocked" wins even when the column says
+// false; otherwise the optional column value is preserved exactly (an absent
+// marker stays nil, so cachedBeadReady consults dependencies rather than
+// treating the bead as definitely ready). The status dimension is the same one
+// applyStatusBlockedMarker handles for the Dolt backends; see Bead.IsBlocked.
 func (b *bdIssue) blockedFlag() *bool {
 	if b.statusBlocked() {
 		blocked := true
@@ -841,7 +830,7 @@ func (b *bdIssue) blockedFlag() *bool {
 }
 
 func (b *bdIssue) statusBlocked() bool {
-	return strings.EqualFold(strings.TrimSpace(b.Status), "blocked")
+	return isBlockedStatusValue(b.Status)
 }
 
 func (b *bdIssue) normalizedDependencies() []Dep {

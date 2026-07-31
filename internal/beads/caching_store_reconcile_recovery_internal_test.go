@@ -109,6 +109,58 @@ func TestReconcileSkipsCloseWhenListDropsAliveBead(t *testing.T) {
 	}
 }
 
+// TestCachingStoreBackingMissFoldedStatusBlockedStaysOutOfReady covers the
+// off-wire blockedByStatus marker-loss race: a folded status-blocked event for
+// an uncached bead whose backing.Get fails (non-ErrNotFound) is installed from
+// the wire patch verbatim, carrying IsBlocked=true but no blockedByStatus
+// provenance. A later dep event -> clearReadyProjectionLocked would then clear
+// IsBlocked and re-admit the bead to Ready, resurrecting the respawn loop for
+// that bead in a cross-CachingStore relay topology. The install must instead
+// mark the row dirty so CachedReady declines until a reconcile restores the bit.
+func TestCachingStoreBackingMissFoldedStatusBlockedStaysOutOfReady(t *testing.T) {
+	t.Parallel()
+
+	mem := NewMemStore()
+	readyBead, err := mem.Create(Bead{Title: "ready work"})
+	if err != nil {
+		t.Fatalf("Create ready bead: %v", err)
+	}
+
+	const foldedID = "gc-folded-blocked"
+	backing := &droppingListStore{
+		Store:  mem,
+		getErr: map[string]error{foldedID: errors.New("backing transiently unavailable")},
+	}
+	cache := NewCachingStoreForTest(backing, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	// Baseline: the cache serves the genuinely-ready bead before the folded event.
+	ready, ok := cache.CachedReady()
+	if !ok || len(ready) != 1 || ready[0].ID != readyBead.ID {
+		t.Fatalf("CachedReady baseline = %+v ok=%v, want the ready bead served", ready, ok)
+	}
+
+	// Folded status-blocked event: wire status is "open", is_blocked is true, and
+	// blockedByStatus is off-wire (reconstructed false). backing.Get fails, so the
+	// row installs from the patch.
+	cache.ApplyEvent("bead.created", []byte(
+		`{"id":"`+foldedID+`","title":"parked","status":"open","issue_type":"task","is_blocked":true}`,
+	))
+	// The dep event that used to clear the wire-only IsBlocked and re-admit it.
+	cache.ApplyDepEvent(foldedID, nil)
+
+	ready, ok = cache.CachedReady()
+	if ok {
+		for _, b := range ready {
+			if b.ID == foldedID {
+				t.Fatalf("status-blocked bead %q served as ready after backing-miss install; respawn loop reintroduced", foldedID)
+			}
+		}
+	}
+}
+
 // TestReconcileEmitsCloseWhenBackingConfirmsNotFound verifies that a genuine
 // closure (List omits the bead AND backing.Get reports ErrNotFound) still
 // produces a bead.closed event.

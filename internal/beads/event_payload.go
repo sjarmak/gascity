@@ -1,9 +1,6 @@
 package beads
 
-import (
-	"encoding/json"
-	"strings"
-)
+import "encoding/json"
 
 // DecodeBeadEventPayload extracts a Bead from a bead.* event payload. It is the
 // single shared decoder for the bead-event wire shape; the API layer, the
@@ -49,7 +46,11 @@ func decodeRawBead(data json.RawMessage) (Bead, bool) {
 	if err := json.Unmarshal(data, &b); err != nil || b.ID == "" {
 		return Bead{}, false
 	}
-	b.blockedByStatus = strings.EqualFold(strings.TrimSpace(b.Status), "blocked")
+	// Reconstruct the status-blocked provenance only when the wire still spells
+	// status="blocked". Backends fold that to "open" before marshal, so a
+	// folded self-blocked bead arrives carrying IsBlocked=true and
+	// blockedByStatus=false; a backing refresh or reconcile restores the bit.
+	b.blockedByStatus = isBlockedStatusValue(b.Status)
 	if b.Type == "" {
 		var compat struct {
 			Type string `json:"type"`

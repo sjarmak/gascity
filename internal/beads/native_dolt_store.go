@@ -2113,6 +2113,11 @@ func beadFromNativeIssue(issue *beadslib.Issue) (Bead, error) {
 		NoHistory:   issue.NoHistory,
 		DeferUntil:  cloneTimePtr(issue.DeferUntil),
 	}
+	// mapBdStatus folds a raw status="blocked" to "open"; preserve the
+	// self-blocked marker so a status-blocked row absorbed via the cache
+	// full-scan List() (which, unlike Ready(), does not filter status) is not
+	// treated as claimable. See Bead.IsBlocked.
+	applyStatusBlockedMarker(&b, string(issue.Status))
 	for _, dep := range issue.Dependencies {
 		if dep == nil {
 			continue
