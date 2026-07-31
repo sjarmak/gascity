@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,6 +150,36 @@ func TestNudgeDeliveryObservationFromInfo_EndToEnd(t *testing.T) {
 	})
 	if got := classifyNudgeDelivery(dormantObs, now, nudgeAckDeadline); got.isActiveExecution() {
 		t.Fatalf("dormant session classified active (%q); must not over-report execution", got)
+	}
+}
+
+// TestCmdNudgeStatusTableShowsDeliveryState verifies the human-readable status
+// table carries the cross-checked delivery state, so an operator reading it sees
+// that routed work with no delivery is merely queued — never active.
+func TestCmdNudgeStatusTableShowsDeliveryState(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	cityDir := t.TempDir()
+	writeNamedSessionCityTOML(t, cityDir)
+	t.Setenv("GC_CITY", cityDir)
+
+	now := time.Now().Add(-time.Minute)
+	if err := enqueueQueuedNudge(cityDir, newQueuedNudge("mayor", "review queued work", now)); err != nil {
+		t.Fatalf("enqueueQueuedNudge: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdNudgeStatus([]string{"mayor"}, false, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdNudgeStatus table = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "DELIVERY") {
+		t.Fatalf("status table missing DELIVERY column:\n%s", out)
+	}
+	if !strings.Contains(out, string(nudgeDeliveryQueued)) {
+		t.Fatalf("status table delivery state != %q:\n%s", nudgeDeliveryQueued, out)
+	}
+	if strings.Contains(out, string(nudgeDeliveryAcknowledged)) {
+		t.Fatalf("routed-only work must not show as acknowledged/active:\n%s", out)
 	}
 }
 

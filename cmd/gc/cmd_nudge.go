@@ -345,6 +345,10 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 		return 1
 	}
 
+	// Independently cross-check route vs delivery vs live activity so routed-only
+	// work is never reported as active on either the JSON or the human surface.
+	deliveryState := nudgeTargetDeliveryState(target, len(pending)+len(inFlight) > 0, time.Now())
+
 	if jsonOutput {
 		if err := writeCLIJSONLine(stdout, nudgeStatusJSON{
 			SchemaVersion: "1",
@@ -353,7 +357,7 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 			Agent:         target.agentKey(),
 			Session:       target.sessionName,
 			SessionID:     target.sessionID,
-			DeliveryState: string(nudgeTargetDeliveryState(target, len(pending)+len(inFlight) > 0, time.Now())),
+			DeliveryState: string(deliveryState),
 			Counts: nudgeStatusCounts{
 				Pending:  len(pending),
 				InFlight: len(inFlight),
@@ -370,9 +374,9 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 	}
 
 	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(tw, "AGENT\tPENDING\tIN_FLIGHT\tDEAD\tSESSION\n") //nolint:errcheck
-	_, _ = fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%s\n",
-		target.agentKey(), len(pending), len(inFlight), len(dead), target.sessionName)
+	fmt.Fprintf(tw, "AGENT\tPENDING\tIN_FLIGHT\tDEAD\tDELIVERY\tSESSION\n") //nolint:errcheck
+	_, _ = fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%s\t%s\n",
+		target.agentKey(), len(pending), len(inFlight), len(dead), deliveryState, target.sessionName)
 	_ = tw.Flush()
 
 	if len(pending) > 0 {
