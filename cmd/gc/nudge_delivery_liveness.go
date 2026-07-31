@@ -5,6 +5,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/worker"
 )
 
 // nudgeAckDeadline bounds how long a delivered nudge may go unacknowledged — no
@@ -85,50 +86,64 @@ func (s nudgeDeliveryState) isStalledFault() bool {
 	return s == nudgeDeliveryStalled
 }
 
-// sessionStateIsLive reports whether a persisted session state is a live one
-// (the process is meant to be running). Only live states can carry the forward
-// activity that acknowledges a delivery; a dormant/terminal state never reads as
-// executing.
-func sessionStateIsLive(s session.State) bool {
-	return s == session.StateActive || s == session.StateAwake
-}
-
-// nudgeDeliveryObservationFromInfo assembles the independent evidence set from
-// the routed flag and the persisted session projection: the last-nudge-delivered
-// marker, the last observed activity, and whether the persisted state is live.
-// It reads only the persisted projection — no runtime provider is constructed —
-// so the status/health read stays side-effect free and errs toward never
-// over-reporting execution when liveness is unknown.
-func nudgeDeliveryObservationFromInfo(routed bool, info session.Info) nudgeDeliveryObservation {
-	return nudgeDeliveryObservation{
+// nudgeDeliveryObservationFromLive assembles the independent evidence set from
+// three distinct feeds: whether a nudge is routed (the queue), when it was last
+// delivered to the transport (the session's persisted last-nudge-delivered
+// marker), and the LIVE runtime observation (process liveness + last activity).
+// Live activity is deliberately not read from the persisted session projection:
+// Info.LastActive is populated only by the runtime-enriched read, so a
+// persisted-only read would report zero and falsely stall every past delivery.
+func nudgeDeliveryObservationFromLive(routed bool, deliveredAt time.Time, live worker.LiveObservation) nudgeDeliveryObservation {
+	obs := nudgeDeliveryObservation{
 		Routed:      routed,
-		DeliveredAt: info.LastNudgeDeliveredAt.UTC(),
-		LastActive:  info.LastActive.UTC(),
-		Running:     sessionStateIsLive(info.State),
+		DeliveredAt: deliveredAt.UTC(),
+		Running:     live.Running,
 	}
+	if live.LastActivity != nil {
+		obs.LastActive = live.LastActivity.UTC()
+	}
+	return obs
 }
 
 // nudgeTargetDeliveryState independently cross-checks a target's route, its last
-// transport delivery time, and its persisted session activity to report whether
+// transport delivery time, and its LIVE session activity to report whether
 // routed work is merely queued, awaiting acknowledgement, acknowledged
 // (executing), or stalled. Routed/assigned state alone is never reported as
-// active. The read is best-effort: a missing store or session projection
+// active. The gathers are best-effort: a missing store or runtime observation
 // degrades toward the safe direction — never over-reporting execution — rather
 // than failing the caller. now is injected for testability.
 func nudgeTargetDeliveryState(target nudgeTarget, routed bool, now time.Time) nudgeDeliveryState {
 	if !routed {
 		return nudgeDeliveryUnrouted
 	}
-	obs := nudgeDeliveryObservation{Routed: routed}
+	var deliveredAt time.Time
+	var live worker.LiveObservation
 	store := openNudgeBeadStore(target.cityPath)
 	if store.Store != nil {
 		defer closeBeadStoreHandle(store.Store) //nolint:errcheck // best-effort read
 		sessStore := cliSessionStore(store.Store, target.cfg, target.cityPath)
 		if info, ok := nudgeTargetSessionInfo(sessStore, target); ok {
-			obs = nudgeDeliveryObservationFromInfo(routed, info)
+			deliveredAt = info.LastNudgeDeliveredAt
 		}
+		live = nudgeTargetLiveObservation(target, sessStore)
 	}
-	return classifyNudgeDelivery(obs, now, nudgeAckDeadline)
+	return classifyNudgeDelivery(nudgeDeliveryObservationFromLive(routed, deliveredAt, live), now, nudgeAckDeadline)
+}
+
+// nudgeTargetLiveObservation best-effort gathers the live runtime observation
+// (process liveness + last activity) for a target. Any construction or
+// observation failure yields a zero observation so the caller degrades toward
+// never over-reporting execution rather than failing.
+func nudgeTargetLiveObservation(target nudgeTarget, sessStore beads.Store) worker.LiveObservation {
+	sp, err := newSessionProvider()
+	if err != nil {
+		return worker.LiveObservation{}
+	}
+	observed, obsErr := workerObserveNudgeTarget(target, sessStore, sp)
+	if obsErr != nil {
+		return worker.LiveObservation{}
+	}
+	return observed
 }
 
 // nudgeTargetSessionInfo resolves the open session bead a nudge target points

@@ -58,6 +58,7 @@ var canonicalProviderCalls = map[string]int{
 	"cmd_handoff.go:cmdHandoffRemote:newSessionProvider:bind-error":                                                                            1,
 	"cmd_nudge.go:cmdNudgePoll:newSessionProvider:bind-error":                                                                                  1,
 	"cmd_nudge.go:deliverSessionNudge:newSessionProvider:bind-error":                                                                           1,
+	"nudge_delivery_liveness.go:nudgeTargetLiveObservation:newSessionProvider:bind-error":                                                      1,
 	"cmd_nudge.go:sendMailNotify:newSessionProvider:bind-error":                                                                                1,
 	"cmd_restart.go:cmdRigRestart:newSessionProvider:bind-error":                                                                               1,
 	"cmd_rig.go:doRigList:rigListSessionProvider:bind-error":                                                                                   1,

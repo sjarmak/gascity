@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/worker"
 )
 
 func TestClassifyNudgeDelivery(t *testing.T) {
@@ -114,42 +114,39 @@ func TestNudgeDeliveryStateIsActiveExecution(t *testing.T) {
 	}
 }
 
-// TestNudgeDeliveryObservationFromInfo_EndToEnd exercises the pure-assembly path
-// a status/health surface uses: routed + delivered + forward activity on a live
-// session classifies as acknowledged, while routed + delivered on a live session
-// with stale activity past the deadline classifies as stalled — never active.
-func TestNudgeDeliveryObservationFromInfo_EndToEnd(t *testing.T) {
+// TestNudgeDeliveryObservationFromLive_EndToEnd exercises the pure-assembly path
+// the status/health surface uses: routed + delivered + live activity past
+// delivery classifies as acknowledged, while routed + delivered with stale
+// activity past the deadline classifies as stalled — never active. Live activity
+// comes from the runtime observation, not the persisted projection.
+func TestNudgeDeliveryObservationFromLive_EndToEnd(t *testing.T) {
 	now := time.Date(2026, 7, 31, 2, 0, 0, 0, time.UTC)
 	deliveredAt := now.Add(-30 * time.Second)
 
-	ackObs := nudgeDeliveryObservationFromInfo(true, session.Info{
-		State:                session.StateActive,
-		LastNudgeDeliveredAt: deliveredAt,
-		LastActive:           deliveredAt.Add(5 * time.Second),
+	activeSince := deliveredAt.Add(5 * time.Second)
+	ackObs := nudgeDeliveryObservationFromLive(true, deliveredAt, worker.LiveObservation{
+		Running:      true,
+		LastActivity: &activeSince,
 	})
 	if got := classifyNudgeDelivery(ackObs, now, nudgeAckDeadline); got != nudgeDeliveryAcknowledged {
 		t.Fatalf("acknowledged path = %q, want %q", got, nudgeDeliveryAcknowledged)
 	}
 
-	// Delivered long ago, live session but no forward activity → stalled.
+	// Delivered long ago, live process but no forward activity → stalled.
 	staleDelivered := now.Add(-5 * time.Minute)
-	stalledObs := nudgeDeliveryObservationFromInfo(true, session.Info{
-		State:                session.StateActive,
-		LastNudgeDeliveredAt: staleDelivered,
-		LastActive:           staleDelivered.Add(-time.Minute),
+	preDelivery := staleDelivered.Add(-time.Minute)
+	stalledObs := nudgeDeliveryObservationFromLive(true, staleDelivered, worker.LiveObservation{
+		Running:      true,
+		LastActivity: &preDelivery,
 	})
 	if got := classifyNudgeDelivery(stalledObs, now, nudgeAckDeadline); got != nudgeDeliveryStalled {
 		t.Fatalf("stalled path = %q, want %q", got, nudgeDeliveryStalled)
 	}
 
-	// Dormant session with forward activity: not live, so never acknowledged.
-	dormantObs := nudgeDeliveryObservationFromInfo(true, session.Info{
-		State:                session.StateAsleep,
-		LastNudgeDeliveredAt: deliveredAt,
-		LastActive:           deliveredAt.Add(5 * time.Second),
-	})
-	if got := classifyNudgeDelivery(dormantObs, now, nudgeAckDeadline); got.isActiveExecution() {
-		t.Fatalf("dormant session classified active (%q); must not over-report execution", got)
+	// No live observation at all (provider unavailable): never over-reports active.
+	blindObs := nudgeDeliveryObservationFromLive(true, deliveredAt, worker.LiveObservation{})
+	if got := classifyNudgeDelivery(blindObs, now, nudgeAckDeadline); got.isActiveExecution() {
+		t.Fatalf("blind observation classified active (%q); must not over-report execution", got)
 	}
 }
 
