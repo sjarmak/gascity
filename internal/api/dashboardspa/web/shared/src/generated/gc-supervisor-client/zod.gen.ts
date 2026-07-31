@@ -1055,6 +1055,7 @@ export const zAgentPatch = z.object({
     PreStartAppend: z.array(z.string()).nullable(),
     PromptTemplate: z.string().nullable(),
     Provider: z.string().nullable(),
+    Resident: z.boolean().nullable(),
     ResumeCommand: z.string().nullable(),
     ScaleCheck: z.string().nullable(),
     Scope: z.string().nullable(),
