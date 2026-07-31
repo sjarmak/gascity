@@ -141,6 +141,7 @@ func (c *CachingStore) ApplyEvent(eventType string, payload json.RawMessage) {
 
 	b := patch
 	refreshedFromBacking := false
+	backingRefreshFailed := false
 	if verifiedClosedFromBacking {
 		b = verifiedClosedFresh
 		refreshedFromBacking = true
@@ -154,7 +155,20 @@ func (c *CachingStore) ApplyEvent(eventType string, payload json.RawMessage) {
 			}
 		} else if !errors.Is(err, ErrNotFound) {
 			c.recordProblem(fmt.Sprintf("refresh %s event", eventType), err)
+			backingRefreshFailed = true
 		}
+	}
+	// Marker-loss guard: an uncached folded self-blocked event arrives with the
+	// on-wire IsBlocked=true but no blockedByStatus provenance (off-wire), so it
+	// reconstructs to false. When the backing refresh failed we install this
+	// patch verbatim, and a later ApplyDepEvent -> clearReadyProjectionLocked
+	// would then clear IsBlocked (provenance reads false) and re-admit the bead
+	// to Ready -> respawn loop. Conservatively restore the provenance bit so the
+	// status dimension survives the dep event. Over-retaining is fail-closed: the
+	// next reconcile reads the authoritative marker from the backing. See
+	// Bead.IsBlocked.
+	if backingRefreshFailed && !b.blockedByStatus && b.IsBlocked != nil && *b.IsBlocked {
+		b.blockedByStatus = true
 	}
 
 	if c.applyEventBeforeCommitForTest != nil {
@@ -420,20 +434,23 @@ func mergeCacheEventPatch(base, patch Bead, fields map[string]json.RawMessage) B
 	}
 	if hasCacheEventField(fields, "status") {
 		merged.Status = patch.Status
+		// Fold the patch's status into blockedByStatus provenance as a 3-way
+		// truth table (merged starts as a clone of base, so the default arm is a
+		// deliberate no-op that keeps base's bit):
 		switch {
 		case patch.blockedByStatus:
-			// Raw bd hook payloads preserve status=="blocked".
+			// Raw hook payload still spells status=="blocked": definitely blocked.
 			merged.blockedByStatus = true
 		case !hasCacheEventField(fields, "is_blocked") ||
 			patch.IsBlocked == nil || !*patch.IsBlocked:
-			// A definitely-unblocked non-blocked status clears provenance.
+			// Definitely-unblocked (non-blocked status, no true is_blocked): clear.
 			merged.blockedByStatus = false
-			// status=="open" plus IsBlocked=true is ambiguous: it can be a
-			// dependency-derived marker, or a folded status-blocked Bead emitted by
-			// another CachingStore (blockedByStatus is intentionally off-wire).
-			// Preserve existing provenance in that one case. A backing refresh or
-			// reconciliation has the authoritative store-internal bit and can clear
-			// it; conservatively retaining it cannot create false demand.
+		default:
+			// Ambiguous: status=="open" plus IsBlocked=true can be a
+			// dependency-derived marker or a folded status-blocked Bead relayed by
+			// another CachingStore (blockedByStatus is off-wire). Preserve base's
+			// provenance; a backing refresh or reconcile holds the authoritative
+			// bit, and conservatively retaining it cannot create false demand.
 		}
 	}
 	if hasCacheEventField(fields, "issue_type") || hasCacheEventField(fields, "type") {

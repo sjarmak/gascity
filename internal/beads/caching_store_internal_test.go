@@ -3169,6 +3169,47 @@ func TestCachingStoreRawOpenEventClearsStatusBlockedProvenance(t *testing.T) {
 	}
 }
 
+func TestReconcileFullScanKeepsStatusBlockedBeadOutOfReady(t *testing.T) {
+	t.Parallel()
+
+	// The cache full-scan List() (cacheFullScanQuery) does NOT filter status the
+	// way Ready() does, so a status-blocked row reaches the reconciler. With the
+	// conversion-path fix that row arrives already carrying the self-blocked
+	// marker; the reconcile absorb must preserve it, or demand counts work that
+	// gc hook --claim rejects on the DoltLite/NativeDolt backends this fork runs.
+	blockedTrue := true
+	backing := &completeEmbeddedDepsStore{}
+	cache := NewCachingStoreForTest(backing, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	backing.beads = []Bead{{
+		ID:              "gc-recon-blocked",
+		Title:           "parked work",
+		Status:          "open",
+		Type:            "task",
+		IsBlocked:       &blockedTrue,
+		blockedByStatus: true,
+	}}
+	cache.runReconciliation()
+
+	ready, ok := cache.CachedReady()
+	if !ok {
+		t.Fatal("CachedReady reported cache unavailable after reconcile")
+	}
+	if len(ready) != 0 {
+		t.Fatalf("CachedReady after full-scan reconcile = %+v, want status-blocked bead excluded", ready)
+	}
+	got, err := cache.Get("gc-recon-blocked")
+	if err != nil {
+		t.Fatalf("Get after reconcile: %v", err)
+	}
+	if !IsSelfBlockedBead(got) {
+		t.Fatalf("reconciled bead = %+v, want self-blocked marker preserved through the full-scan absorb", got)
+	}
+}
+
 func TestCachingStoreApplyEventMergesProjectedIsBlocked(t *testing.T) {
 	t.Parallel()
 
