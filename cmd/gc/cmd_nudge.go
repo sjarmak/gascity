@@ -126,12 +126,17 @@ type nudgeTarget struct {
 }
 
 type nudgeStatusJSON struct {
-	SchemaVersion string            `json:"schema_version"`
-	Command       string            `json:"command"`
-	CityPath      string            `json:"city_path"`
-	Agent         string            `json:"agent"`
-	Session       string            `json:"session"`
-	SessionID     string            `json:"session_id,omitempty"`
+	SchemaVersion string `json:"schema_version"`
+	Command       string `json:"command"`
+	CityPath      string `json:"city_path"`
+	Agent         string `json:"agent"`
+	Session       string `json:"session"`
+	SessionID     string `json:"session_id,omitempty"`
+	// DeliveryState is the independently cross-checked delivery lifecycle of the
+	// routed work (route vs last-delivery vs live activity): unrouted, queued,
+	// awaiting_ack, acknowledged, or stalled. It exists so routed/assigned work is
+	// never read as active on routing metadata alone (gc-snrfp).
+	DeliveryState string            `json:"delivery_state"`
 	Counts        nudgeStatusCounts `json:"counts"`
 	Pending       []queuedNudge     `json:"pending"`
 	InFlight      []queuedNudge     `json:"in_flight"`
@@ -348,6 +353,7 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 			Agent:         target.agentKey(),
 			Session:       target.sessionName,
 			SessionID:     target.sessionID,
+			DeliveryState: string(nudgeTargetDeliveryState(target, len(pending)+len(inFlight) > 0, time.Now())),
 			Counts: nudgeStatusCounts{
 				Pending:  len(pending),
 				InFlight: len(inFlight),
@@ -1503,19 +1509,79 @@ func withNudgeTargetFence(store beads.Store, target nudgeTarget) nudgeTarget {
 	if err != nil {
 		return target
 	}
-	for _, info := range open {
-		if info.SessionNameMetadata != target.sessionName {
-			continue
-		}
-		if target.sessionID == "" {
-			target.sessionID = info.ID
-		}
-		if target.continuationEpoch == "" {
-			target.continuationEpoch = info.ContinuationEpoch
-		}
+	info, ok := currentSessionInfoForName(open, target.sessionName, target.sessionID)
+	if !ok {
 		return target
 	}
+	if target.sessionID == "" {
+		target.sessionID = info.ID
+	}
+	if target.continuationEpoch == "" {
+		target.continuationEpoch = info.ContinuationEpoch
+	}
 	return target
+}
+
+// currentSessionInfoForName resolves which open session bead delivery should
+// fence on when several share one runtime session_name — the transient window
+// across a continuation-epoch bump or a pool recycle where an obsolete session
+// bead has not yet closed. Fencing on the wrong (obsolete) identity starves a
+// nudge that carries the current fence, so this selection is load-bearing.
+//
+// When the caller already knows the session ID, that exact session wins: the
+// epoch is filled from its own bead and never from a newer same-name sibling.
+// Otherwise the current session is the highest continuation epoch (the newest
+// conversation identity), tie-broken by most-recent activity then bead ID so the
+// choice is deterministic regardless of scan order. Returns false when no open
+// session matches the name (or, when a session ID is known, when no open bead
+// carries it).
+func currentSessionInfoForName(open []session.Info, sessionName, knownSessionID string) (session.Info, bool) {
+	var best session.Info
+	found := false
+	for _, info := range open {
+		if info.SessionNameMetadata != sessionName {
+			continue
+		}
+		if knownSessionID != "" {
+			if info.ID == knownSessionID {
+				return info, true
+			}
+			continue
+		}
+		if !found || sessionInfoMoreCurrent(info, best) {
+			best = info
+			found = true
+		}
+	}
+	return best, found
+}
+
+// sessionInfoMoreCurrent reports whether a is a more-current conversation
+// identity than b: higher continuation epoch first, then more-recent activity,
+// then more-recent creation, then higher bead ID as a deterministic final
+// tiebreak. An unparseable epoch sorts as the lowest (0).
+func sessionInfoMoreCurrent(a, b session.Info) bool {
+	ea, eb := parseContinuationEpoch(a.ContinuationEpoch), parseContinuationEpoch(b.ContinuationEpoch)
+	if ea != eb {
+		return ea > eb
+	}
+	if !a.LastActive.Equal(b.LastActive) {
+		return a.LastActive.After(b.LastActive)
+	}
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.After(b.CreatedAt)
+	}
+	return a.ID > b.ID
+}
+
+// parseContinuationEpoch parses the decimal continuation_epoch marker, returning
+// 0 for an empty or malformed value so it sorts below any real epoch.
+func parseContinuationEpoch(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 var startNudgePoller = ensureNudgePoller
