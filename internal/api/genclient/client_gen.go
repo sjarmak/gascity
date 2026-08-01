@@ -3549,6 +3549,16 @@ type SessionLifecyclePayload struct {
 	Template *string `json:"template,omitempty"`
 }
 
+// SessionLivenessStalePayload defines model for SessionLivenessStalePayload.
+type SessionLivenessStalePayload struct {
+	EpisodeId       string     `json:"episode_id"`
+	EscalateTo      *string    `json:"escalate_to,omitempty"`
+	FreshnessWindow string     `json:"freshness_window"`
+	LastActivity    *time.Time `json:"last_activity,omitempty"`
+	Session         string     `json:"session"`
+	StaleSince      time.Time  `json:"stale_since"`
+}
+
 // SessionMessageInputBody defines model for SessionMessageInputBody.
 type SessionMessageInputBody struct {
 	// Message Message text to send.
@@ -6087,6 +6097,21 @@ type TypedEventStreamEnvelopeSessionIdleKilled struct {
 	Workflow  *WorkflowEventProjection `json:"workflow,omitempty"`
 }
 
+// TypedEventStreamEnvelopeSessionLivenessStale defines model for TypedEventStreamEnvelopeSessionLivenessStale.
+type TypedEventStreamEnvelopeSessionLivenessStale struct {
+	Actor     string                      `json:"actor"`
+	Message   *string                     `json:"message,omitempty"`
+	Payload   SessionLivenessStalePayload `json:"payload"`
+	RunId     *string                     `json:"run_id,omitempty"`
+	Seq       int64                       `json:"seq"`
+	SessionId *string                     `json:"session_id,omitempty"`
+	StepId    *string                     `json:"step_id,omitempty"`
+	Subject   *string                     `json:"subject,omitempty"`
+	Ts        time.Time                   `json:"ts"`
+	Type      string                      `json:"type"`
+	Workflow  *WorkflowEventProjection    `json:"workflow,omitempty"`
+}
+
 // TypedEventStreamEnvelopeSessionMaxAgeKilled defines model for TypedEventStreamEnvelopeSessionMaxAgeKilled.
 type TypedEventStreamEnvelopeSessionMaxAgeKilled struct {
 	Actor     string                   `json:"actor"`
@@ -7320,6 +7345,22 @@ type TypedTaggedEventStreamEnvelopeSessionIdleKilled struct {
 	Ts        time.Time                `json:"ts"`
 	Type      string                   `json:"type"`
 	Workflow  *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
+// TypedTaggedEventStreamEnvelopeSessionLivenessStale defines model for TypedTaggedEventStreamEnvelopeSessionLivenessStale.
+type TypedTaggedEventStreamEnvelopeSessionLivenessStale struct {
+	Actor     string                      `json:"actor"`
+	City      string                      `json:"city"`
+	Message   *string                     `json:"message,omitempty"`
+	Payload   SessionLivenessStalePayload `json:"payload"`
+	RunId     *string                     `json:"run_id,omitempty"`
+	Seq       int64                       `json:"seq"`
+	SessionId *string                     `json:"session_id,omitempty"`
+	StepId    *string                     `json:"step_id,omitempty"`
+	Subject   *string                     `json:"subject,omitempty"`
+	Ts        time.Time                   `json:"ts"`
+	Type      string                      `json:"type"`
+	Workflow  *WorkflowEventProjection    `json:"workflow,omitempty"`
 }
 
 // TypedTaggedEventStreamEnvelopeSessionMaxAgeKilled defines model for TypedTaggedEventStreamEnvelopeSessionMaxAgeKilled.
@@ -9906,6 +9947,32 @@ func (t *EventPayload) FromSessionLifecyclePayload(v SessionLifecyclePayload) er
 
 // MergeSessionLifecyclePayload performs a merge with any union data inside the EventPayload, using the provided SessionLifecyclePayload
 func (t *EventPayload) MergeSessionLifecyclePayload(v SessionLifecyclePayload) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsSessionLivenessStalePayload returns the union data inside the EventPayload as a SessionLivenessStalePayload
+func (t EventPayload) AsSessionLivenessStalePayload() (SessionLivenessStalePayload, error) {
+	var body SessionLivenessStalePayload
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromSessionLivenessStalePayload overwrites any union data inside the EventPayload as the provided SessionLivenessStalePayload
+func (t *EventPayload) FromSessionLivenessStalePayload(v SessionLivenessStalePayload) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeSessionLivenessStalePayload performs a merge with any union data inside the EventPayload, using the provided SessionLivenessStalePayload
+func (t *EventPayload) MergeSessionLivenessStalePayload(v SessionLivenessStalePayload) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -13685,6 +13752,34 @@ func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeSessionIdleKille
 	return err
 }
 
+// AsTypedEventStreamEnvelopeSessionLivenessStale returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeSessionLivenessStale
+func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeSessionLivenessStale() (TypedEventStreamEnvelopeSessionLivenessStale, error) {
+	var body TypedEventStreamEnvelopeSessionLivenessStale
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedEventStreamEnvelopeSessionLivenessStale overwrites any union data inside the TypedEventStreamEnvelope as the provided TypedEventStreamEnvelopeSessionLivenessStale
+func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopeSessionLivenessStale(v TypedEventStreamEnvelopeSessionLivenessStale) error {
+	v.Type = "session.liveness_stale"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedEventStreamEnvelopeSessionLivenessStale performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopeSessionLivenessStale
+func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeSessionLivenessStale(v TypedEventStreamEnvelopeSessionLivenessStale) error {
+	v.Type = "session.liveness_stale"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedEventStreamEnvelopeSessionMaxAgeKilled returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeSessionMaxAgeKilled
 func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeSessionMaxAgeKilled() (TypedEventStreamEnvelopeSessionMaxAgeKilled, error) {
 	var body TypedEventStreamEnvelopeSessionMaxAgeKilled
@@ -14351,6 +14446,8 @@ func (t TypedEventStreamEnvelope) ValueByDiscriminator() (interface{}, error) {
 		return t.AsTypedEventStreamEnvelopeSessionDraining()
 	case "session.idle_killed":
 		return t.AsTypedEventStreamEnvelopeSessionIdleKilled()
+	case "session.liveness_stale":
+		return t.AsTypedEventStreamEnvelopeSessionLivenessStale()
 	case "session.max_age_killed":
 		return t.AsTypedEventStreamEnvelopeSessionMaxAgeKilled()
 	case "session.quarantined":
@@ -16054,6 +16151,34 @@ func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeSess
 	return err
 }
 
+// AsTypedTaggedEventStreamEnvelopeSessionLivenessStale returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeSessionLivenessStale
+func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeSessionLivenessStale() (TypedTaggedEventStreamEnvelopeSessionLivenessStale, error) {
+	var body TypedTaggedEventStreamEnvelopeSessionLivenessStale
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedTaggedEventStreamEnvelopeSessionLivenessStale overwrites any union data inside the TypedTaggedEventStreamEnvelope as the provided TypedTaggedEventStreamEnvelopeSessionLivenessStale
+func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopeSessionLivenessStale(v TypedTaggedEventStreamEnvelopeSessionLivenessStale) error {
+	v.Type = "session.liveness_stale"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedTaggedEventStreamEnvelopeSessionLivenessStale performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopeSessionLivenessStale
+func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeSessionLivenessStale(v TypedTaggedEventStreamEnvelopeSessionLivenessStale) error {
+	v.Type = "session.liveness_stale"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedTaggedEventStreamEnvelopeSessionMaxAgeKilled returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeSessionMaxAgeKilled
 func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeSessionMaxAgeKilled() (TypedTaggedEventStreamEnvelopeSessionMaxAgeKilled, error) {
 	var body TypedTaggedEventStreamEnvelopeSessionMaxAgeKilled
@@ -16720,6 +16845,8 @@ func (t TypedTaggedEventStreamEnvelope) ValueByDiscriminator() (interface{}, err
 		return t.AsTypedTaggedEventStreamEnvelopeSessionDraining()
 	case "session.idle_killed":
 		return t.AsTypedTaggedEventStreamEnvelopeSessionIdleKilled()
+	case "session.liveness_stale":
+		return t.AsTypedTaggedEventStreamEnvelopeSessionLivenessStale()
 	case "session.max_age_killed":
 		return t.AsTypedTaggedEventStreamEnvelopeSessionMaxAgeKilled()
 	case "session.quarantined":
