@@ -187,6 +187,63 @@ func TestConfiguredSessionTransportUsesT3RuntimeTransport(t *testing.T) {
 	}
 }
 
+// TestConfiguredSessionTransportCanonicalizesPerAgentT3BridgeOverride pins the
+// create-resolver fix: a per-agent `session = "t3bridge"` override must persist
+// as the "t3" carrier, not the runtime-selection name "t3bridge" (which no
+// classifier matches). The city-level session.provider path already resolved
+// correctly; only the per-agent override leaked.
+func TestConfiguredSessionTransportCanonicalizesPerAgentT3BridgeOverride(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:     "worker",
+			Dir:      "myrig",
+			Provider: "custom",
+			Session:  "t3bridge",
+		}},
+		Providers: map[string]config.ProviderSpec{
+			"custom": {
+				Command:   "/bin/echo",
+				PathCheck: "true",
+			},
+		},
+	}
+
+	if got := configuredSessionTransport(cfg, "myrig/worker", ""); got != "t3" {
+		t.Fatalf("configuredSessionTransport(per-agent session=t3bridge) = %q, want t3", got)
+	}
+}
+
+// TestConfiguredSessionTransportReturnsUnknownOnResolutionFailure pins finding 3:
+// a provider-resolution failure must yield the unknown sentinel ("") so a later
+// successful resolution can still correct the bead, rather than a confidently
+// guessed carrier (tmux) that persists as authoritative.
+func TestConfiguredSessionTransportReturnsUnknownOnResolutionFailure(t *testing.T) {
+	// Agent path: the template matches an agent whose provider is not in the
+	// catalog, so config.ResolveProvider errors.
+	agentPath := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:     "worker",
+			Dir:      "myrig",
+			Provider: "ghost-provider",
+		}},
+		Providers: map[string]config.ProviderSpec{},
+	}
+	if got := configuredSessionTransport(agentPath, "myrig/worker", ""); got != "" {
+		t.Fatalf("configuredSessionTransport(agent resolution failure) = %q, want \"\" (unknown sentinel, not a guessed carrier)", got)
+	}
+
+	// Provider path: no template match, and the provider name does not resolve.
+	providerPath := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Providers: map[string]config.ProviderSpec{},
+	}
+	if got := configuredSessionTransport(providerPath, "", "ghost-provider"); got != "" {
+		t.Fatalf("configuredSessionTransport(provider resolution failure) = %q, want \"\" (unknown sentinel)", got)
+	}
+}
+
 func TestBuildSessionResumeDoesNotInferProviderACPDefaultForStoppedLegacyTemplateSession(t *testing.T) {
 	fs := newSessionFakeState(t)
 	supportsACP := true

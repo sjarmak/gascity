@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"os/exec"
 	"strings"
 	"time"
@@ -51,10 +52,12 @@ func workerFactoryWithStaleKeyDetectionWaiter(
 					func(name string) (string, error) { return name, nil },
 				)
 				if err != nil {
-					return session.ResolveEffectiveTransport(
-						effectiveSessionProvider(agentCfg.Session, cfg.Session.Provider),
-						agentCfg.Session,
-					)
+					// Provider resolution failed: return the unknown sentinel so a
+					// later successful resolution can still correct the bead,
+					// rather than durably stamping a guessed carrier. Log so the
+					// broken config is attributable.
+					log.Printf("session transport unresolved: agent provider resolution failed (template=%q session=%q): %v", template, agentCfg.Session, err)
+					return ""
 				}
 				return session.ResolveEffectiveTransport(
 					effectiveSessionProvider(agentCfg.Session, cfg.Session.Provider),
@@ -75,7 +78,8 @@ func workerFactoryWithStaleKeyDetectionWaiter(
 				func(name string) (string, error) { return name, nil },
 			)
 			if err != nil {
-				return session.ResolveEffectiveTransport(cfg.Session.Provider, "")
+				log.Printf("session transport unresolved: provider resolution failed (provider=%q): %v", provider, err)
+				return ""
 			}
 			return session.ResolveEffectiveTransport(
 				cfg.Session.Provider,

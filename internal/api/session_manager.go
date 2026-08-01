@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log/slog"
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -40,10 +41,13 @@ func configuredSessionTransportResolution(cfg *config.City, template, provider s
 			func(name string) (string, error) { return name, nil },
 		)
 		if err != nil {
-			return session.ResolveEffectiveTransport(
-				effectiveSessionRuntimeName(agentCfg.Session, cfg.Session.Provider),
-				agentCfg.Session,
-			), false
+			// Provider resolution failed: return the unknown sentinel so a later
+			// successful resolution can still correct the bead, rather than
+			// durably stamping a guessed carrier. Log so the broken config is
+			// attributable.
+			slog.Warn("session transport unresolved: agent provider resolution failed",
+				"template", template, "session", agentCfg.Session, "error", err)
+			return "", false
 		}
 		return session.ResolveEffectiveTransport(
 			effectiveSessionRuntimeName(agentCfg.Session, cfg.Session.Provider),
@@ -64,7 +68,9 @@ func configuredSessionTransportResolution(cfg *config.City, template, provider s
 		func(name string) (string, error) { return name, nil },
 	)
 	if err != nil {
-		return session.ResolveEffectiveTransport(cfg.Session.Provider, ""), false
+		slog.Warn("session transport unresolved: provider resolution failed",
+			"provider", provider, "error", err)
+		return "", false
 	}
 	return session.ResolveEffectiveTransport(
 		cfg.Session.Provider,

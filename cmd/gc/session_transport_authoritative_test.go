@@ -178,6 +178,23 @@ func TestDesiredSessionTransportIsNeverEmpty(t *testing.T) {
 	}
 }
 
+// TestDesiredSessionTransportNeverPromotesNonACPRuntimeToACP pins the divergence
+// fix: IsACP already incorporates provider ACP-support, so a session that
+// resolved to non-ACP must not be re-stamped acp just because its effective
+// runtime name is the literal "acp" (a city Session.Provider="acp" over a
+// provider that does not support ACP). Mapping the raw runtime name would
+// durably mislabel the session and route it onto ACP — reintroducing the
+// wrong-routing class this work fixes.
+func TestDesiredSessionTransportNeverPromotesNonACPRuntimeToACP(t *testing.T) {
+	got := desiredSessionTransport(TemplateParams{
+		IsACP:                    false,
+		EffectiveSessionProvider: "acp",
+	})
+	if got != config.SessionTransportTmux {
+		t.Fatalf("desiredSessionTransport(IsACP=false, runtime=acp) = %q, want tmux; a non-ACP session must not be promoted to acp by the runtime-name mapping", got)
+	}
+}
+
 func sessionBeadWithMetadata(id string, meta map[string]string) beads.Bead {
 	return beads.Bead{
 		ID:       id,

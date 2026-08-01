@@ -232,6 +232,79 @@ func TestPersistedTransportHelper(t *testing.T) {
 	}
 }
 
+// TestResolveEffectiveTransportCanonicalizesRuntimeSelectionName pins that a
+// runtime-selection name reaching the resolvedTransport slot verbatim (a
+// per-agent `session = "t3bridge"` flows through
+// config.ResolveSessionCreateTransport's default branch) is mapped to its
+// carrier, not persisted as-is. Without this, "transport=t3bridge" is stamped
+// and no classifier — which match "t3" — recognizes the session.
+func TestResolveEffectiveTransportCanonicalizesRuntimeSelectionName(t *testing.T) {
+	cases := []struct{ runtimeName, resolvedTransport, want string }{
+		{"t3bridge", "t3bridge", "t3"},
+		{"", "exec:/opt/gc-session-t3", "t3"},
+		{"", "acp", "acp"},
+		{"", "tmux", "tmux"},
+		{"t3bridge", "", "t3"},
+		{"acp", "", "acp"},
+	}
+	for _, tc := range cases {
+		if got := ResolveEffectiveTransport(tc.runtimeName, tc.resolvedTransport); got != tc.want {
+			t.Errorf("ResolveEffectiveTransport(%q, %q) = %q, want %q", tc.runtimeName, tc.resolvedTransport, got, tc.want)
+		}
+	}
+}
+
+// TestPersistedTransportForCreateConsultsACPEvidence pins that a fresh create
+// with materialized MCP servers (only ACP produces them) but no config-resolved
+// transport is stamped acp, not defaulted to tmux — the misclassification that
+// otherwise sticks because reconcile never revisits an unconfigured session.
+func TestPersistedTransportForCreateConsultsACPEvidence(t *testing.T) {
+	if got := persistedTransportForCreate(transportTestTmuxProvider, "", true); got != "acp" {
+		t.Errorf("persistedTransportForCreate(acpEvidence=true) = %q, want acp", got)
+	}
+	if got := persistedTransportForCreate(transportTestTmuxProvider, "", false); got != "tmux" {
+		t.Errorf("persistedTransportForCreate(acpEvidence=false) = %q, want tmux", got)
+	}
+	// A resolved transport still wins over the ACP evidence heuristic.
+	if got := persistedTransportForCreate(transportTestTmuxProvider, "tmux", true); got != "tmux" {
+		t.Errorf("persistedTransportForCreate(transport=tmux, acpEvidence=true) = %q, want tmux", got)
+	}
+}
+
+// TestCreateSessionInfersACPFromMaterializedMCPEvidence exercises the create
+// path end to end: an ACP-shaped spec (materialized MCP servers) with a
+// provider that does not resolve a transport must persist transport=acp.
+func TestCreateSessionInfersACPFromMaterializedMCPEvidence(t *testing.T) {
+	for _, beadOnly := range []bool{false, true} {
+		store := beads.NewMemStore()
+		m := NewManagerWithOptions(store, runtime.NewFake())
+		info, err := m.CreateSession(context.Background(), CreateOptions{
+			BeadOnly: beadOnly,
+			Template: transportTestTemplate,
+			Title:    "worker",
+			Command:  transportTestCLICommand,
+			WorkDir:  t.TempDir(),
+			Provider: transportTestTmuxProvider,
+			Hints: runtime.Config{
+				MCPServers: []runtime.MCPServerConfig{{
+					Name:    "fixture",
+					Command: "/bin/fixture-mcp",
+				}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreateSession(beadOnly=%v): %v", beadOnly, err)
+		}
+		b, err := store.Get(info.ID)
+		if err != nil {
+			t.Fatalf("store.Get(%q): %v", info.ID, err)
+		}
+		if got := b.Metadata["transport"]; got != "acp" {
+			t.Fatalf("bead transport (beadOnly=%v) = %q, want acp; materialized MCP servers prove ACP before the tmux default", beadOnly, got)
+		}
+	}
+}
+
 func TestReconcileTransportMetadataPatchClearsACPArtifactsForT3(t *testing.T) {
 	existing := map[string]string{
 		TransportMetadataKey:          "acp",

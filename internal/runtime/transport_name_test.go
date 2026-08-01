@@ -22,3 +22,25 @@ func TestTransportForRuntimeName(t *testing.T) {
 		t.Errorf("TransportForRuntimeName() did not trim surrounding whitespace: got %q, want t3", got)
 	}
 }
+
+func TestCanonicalTransport(t *testing.T) {
+	tests := map[string]string{
+		// Already a transport carrier — returned unchanged.
+		"acp":  "acp",
+		"tmux": "tmux",
+		"t3":   "t3",
+		// A runtime-selection name that leaked into a transport slot — mapped.
+		"t3bridge":                "t3",
+		"exec:/opt/gc-session-t3": "t3",
+		// Anything else falls to the tmux carrier.
+		"k8s": "tmux",
+	}
+	for value, want := range tests {
+		if got := CanonicalTransport(value); got != want {
+			t.Errorf("CanonicalTransport(%q) = %q, want %q", value, got, want)
+		}
+	}
+	if got := CanonicalTransport("  t3bridge "); got != "t3" {
+		t.Errorf("CanonicalTransport() did not trim surrounding whitespace: got %q, want t3", got)
+	}
+}

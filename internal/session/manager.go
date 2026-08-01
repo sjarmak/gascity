@@ -621,6 +621,17 @@ func (m *Manager) transportToPersist(template, provider, transport string) strin
 	return persistedTransport(provider, transport)
 }
 
+// transportToPersistForCreate is transportToPersist for a fresh session create,
+// where ACP evidence on the spec disambiguates an otherwise-unknown transport
+// before the tmux default. acpEvidence is true when the create carries
+// materialized MCP servers, which only ACP transport produces.
+func (m *Manager) transportToPersistForCreate(template, provider, transport string, acpEvidence bool) string {
+	if strings.TrimSpace(transport) == "" {
+		transport = m.resolveConfiguredTransport(template, provider)
+	}
+	return persistedTransportForCreate(provider, transport, acpEvidence)
+}
+
 func (m *Manager) transportForBead(b beads.Bead, sessName string) (string, bool) {
 	transport := transportFromMetadata(b)
 	if transport != "" {
@@ -910,9 +921,10 @@ func (m *Manager) createStarted(ctx context.Context, spec CreateOptions) (Info, 
 			meta["alias"] = alias
 		}
 		// Stamp the resolved effective transport. When the caller supplies only
-		// a default-path transport, transportToPersist consults the configured
-		// runtime mapping before falling back to tmux.
-		meta[TransportMetadataKey] = m.transportToPersist(template, provider, transport)
+		// a default-path transport, transportToPersistForCreate consults the
+		// configured runtime mapping, then the create-path ACP evidence
+		// (materialized MCP servers), before falling back to tmux.
+		meta[TransportMetadataKey] = m.transportToPersistForCreate(template, provider, transport, len(spec.Hints.MCPServers) > 0)
 		if sessionKey != "" {
 			meta["session_key"] = sessionKey
 		}
@@ -1152,9 +1164,10 @@ func (m *Manager) createBeadOnly(spec CreateOptions) (Info, error) {
 			meta["alias"] = alias
 		}
 		// Stamp the resolved effective transport. When the caller supplies only
-		// a default-path transport, transportToPersist consults the configured
-		// runtime mapping before falling back to tmux.
-		meta[TransportMetadataKey] = m.transportToPersist(template, provider, transport)
+		// a default-path transport, transportToPersistForCreate consults the
+		// configured runtime mapping, then the create-path ACP evidence
+		// (materialized MCP servers), before falling back to tmux.
+		meta[TransportMetadataKey] = m.transportToPersistForCreate(template, provider, transport, len(spec.Hints.MCPServers) > 0)
 		if sessionKey != "" {
 			meta["session_key"] = sessionKey
 		}

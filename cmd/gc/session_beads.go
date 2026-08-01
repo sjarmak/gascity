@@ -259,7 +259,16 @@ func desiredSessionTransport(tp TemplateParams) string {
 	if tp.IsACP {
 		return config.SessionTransportACP
 	}
-	return session.ResolveEffectiveTransport(tp.EffectiveSessionProvider, "")
+	// Not ACP: IsACP already incorporated provider ACP-support, so the transport
+	// is the runtime's non-ACP carrier. A raw "acp" runtime name reaches here
+	// only when the resolved provider does not support ACP; it must fall to tmux
+	// rather than be re-promoted to acp by the runtime-name mapping, which would
+	// durably mislabel a non-ACP session and route it onto ACP.
+	transport := session.ResolveEffectiveTransport(tp.EffectiveSessionProvider, "")
+	if transport == config.SessionTransportACP {
+		return config.SessionTransportTmux
+	}
+	return transport
 }
 
 func canRebindConfiguredNamedSession(b beads.Bead, identity, sessionName, backingTemplate string) bool {

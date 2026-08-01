@@ -16,7 +16,12 @@ const TransportMetadataKey = "transport"
 // authoritative answer.
 func ResolveEffectiveTransport(runtimeName, resolvedTransport string) string {
 	if transport := strings.TrimSpace(resolvedTransport); transport != "" {
-		return transport
+		// A resolved transport may actually be a runtime-selection name — a
+		// per-agent `session = "t3bridge"` reaches here verbatim through
+		// config.ResolveSessionCreateTransport's default branch. Canonicalize it
+		// to its transport carrier so classifiers matching "t3"/"acp"/"tmux" are
+		// not defeated by "t3bridge" or an exec:.../gc-session-t3 alias.
+		return runtime.CanonicalTransport(transport)
 	}
 	return runtime.TransportForRuntimeName(runtimeName)
 }
@@ -29,6 +34,24 @@ func ResolveEffectiveTransport(runtimeName, resolvedTransport string) string {
 func persistedTransport(provider, transport string) string {
 	if normalized := normalizeTransport(provider, transport); normalized != "" {
 		return normalized
+	}
+	return config.SessionTransportTmux
+}
+
+// persistedTransportForCreate extends persistedTransport with the ACP evidence
+// available on a fresh-create path. MCP servers are materialized only for ACP
+// transport, so their presence proves the session is ACP even when neither the
+// explicit transport nor the template/provider resolved one. Without this, an
+// ACP session created without a config-resolvable template/provider (ad-hoc API
+// callers, createBeadOnly) would be stamped tmux by the unresolved default,
+// outranking the ACP-artifact fallback with no reconcile recovery — reconcile
+// never revisits an unconfigured session.
+func persistedTransportForCreate(provider, transport string, acpEvidence bool) string {
+	if normalized := normalizeTransport(provider, transport); normalized != "" {
+		return normalized
+	}
+	if acpEvidence {
+		return config.SessionTransportACP
 	}
 	return config.SessionTransportTmux
 }
