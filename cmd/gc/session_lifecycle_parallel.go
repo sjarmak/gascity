@@ -2006,9 +2006,23 @@ func providerCommandBaseName(rp *config.ResolvedProvider) string {
 // whose stored session_key references a transcript that no longer exists. Mirrors
 // the clears performed by recordWakeFailure (cmd/gc/session_reconcile.go) and
 // Manager.clearStaleResumeMetadata (internal/session/chat.go), so downstream
-// breaker / churn logic treats this as the same kind of recovery cycle. Returns the
-// patch it applied so the caller can fold the same batch onto the typed twin —
-// every key is in Info.ApplyPatch's switch.
+// breaker / churn logic treats this as the same kind of recovery cycle.
+//
+// Like those mirrors, it restamps reset_committed_at alongside the
+// continuation_reset_pending re-arm so the reset-stall timer measures from this
+// recovery, not a stale timestamp left by an earlier restart handoff
+// (gascity#4067): a start that aborts after this clear (relaunchAbortResidueFold)
+// parks the bead with the pending flag set, and an unstamped re-arm would inherit
+// the prior timestamp and fire a false session.reset_stalled. The store write
+// carries the fresh marker; it is kept OUT of the returned fold so the same tick's
+// awake scan does not force-wake the recovering session on the freshly committed
+// marker (#2345), mirroring the restart-handoff fold-strip. A wall clock is used
+// here because the recovery callers (buildPreparedStart, relaunchAbortResidueFold)
+// do not thread the reconciler clock and the timestamp is a stall-timer base that
+// no caller reads back off the returned fold.
+//
+// Returns the applied patch MINUS reset_committed_at so the caller can fold the
+// rest onto the typed twin — every returned key is in Info.ApplyPatch's switch.
 func clearStaleResumeKeyMetadata(handle string, sessFront *sessionpkg.Store) map[string]string {
 	patch := map[string]string{
 		"session_key":                "",
@@ -2021,10 +2035,15 @@ func clearStaleResumeKeyMetadata(handle string, sessFront *sessionpkg.Store) map
 		sessionpkg.PromptHashMetadataKey:         "",
 	}
 	if sessFront != nil && strings.TrimSpace(handle) != "" {
-		_ = sessFront.ApplyPatch(handle, patch)
+		stored := make(map[string]string, len(patch)+1)
+		for k, v := range patch {
+			stored[k] = v
+		}
+		stored[sessionpkg.ResetCommittedAtKey] = time.Now().UTC().Format(time.RFC3339)
+		_ = sessFront.ApplyPatch(handle, stored)
 		// S19 Stage 3 shadow: record the legacy priming-marker clears (no-op
 		// unless the shadow harness is enabled).
-		recordLegacyCompareWrites(handle, "clearStaleResumeKeyMetadata", patch)
+		recordLegacyCompareWrites(handle, "clearStaleResumeKeyMetadata", stored)
 	}
 	return patch
 }

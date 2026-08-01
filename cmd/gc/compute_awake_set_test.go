@@ -388,6 +388,69 @@ func TestNamedOnDemand_ResetPendingWaitsForRestartRequestToClear(t *testing.T) {
 	assertAsleep(t, result, sessionName)
 }
 
+// TestDrained_ResetPendingStaysAsleep is the gascity#4067 §A regression guard:
+// a drained session must never be force-woken by a pending continuation reset.
+// Before the drained-drain fix, AcknowledgeDrainPatch/CompleteDrainPatch(freshWake)
+// stamped reset_committed_at, which set ContinuationResetPending on the drained
+// bead and force-woke the session the reconciler had just parked — a
+// wake -> no-work -> drain-ack -> wake loop. The drain patches now clear
+// reset_committed_at, and the reset-pending wake path excludes Drained beads as
+// the defense-in-depth invariant this test pins: even if a drained bead somehow
+// carries ContinuationResetPending, "demand alone does not reselect it".
+func TestDrained_ResetPendingStaysAsleep(t *testing.T) {
+	template := "fixture/build-agent"
+	identity := "fixture/reset-target"
+	sessionName := "fixture--reset-target"
+
+	result := ComputeAwakeSet(AwakeInput{
+		Agents:        []AwakeAgent{{QualifiedName: template}},
+		NamedSessions: []AwakeNamedSession{{Identity: identity, Template: template, Mode: "on_demand"}},
+		SessionBeads: []AwakeSessionBead{{
+			ID:                       "mc-reset",
+			SessionName:              sessionName,
+			Template:                 template,
+			State:                    "drained",
+			NamedIdentity:            identity,
+			Drained:                  true,
+			ContinuationResetPending: true,
+		}},
+		ScaleCheckCounts: map[string]int{template: 0},
+		Now:              now,
+	})
+
+	assertAsleep(t, result, sessionName)
+}
+
+// TestDrained_ResetPendingWithAttachStillWakes confirms the §A exclusion is
+// scoped to the reset-pending force-wake only: a drained session with a pending
+// reset still wakes on real demand (an attached user), so the fix removes the
+// unwanted force-wake without stranding a session someone is actively using.
+func TestDrained_ResetPendingWithAttachStillWakes(t *testing.T) {
+	template := "fixture/build-agent"
+	identity := "fixture/reset-target"
+	sessionName := "fixture--reset-target"
+
+	result := ComputeAwakeSet(AwakeInput{
+		Agents:        []AwakeAgent{{QualifiedName: template}},
+		NamedSessions: []AwakeNamedSession{{Identity: identity, Template: template, Mode: "on_demand"}},
+		SessionBeads: []AwakeSessionBead{{
+			ID:                       "mc-reset",
+			SessionName:              sessionName,
+			Template:                 template,
+			State:                    "drained",
+			NamedIdentity:            identity,
+			Drained:                  true,
+			ContinuationResetPending: true,
+		}},
+		AttachedSessions: map[string]bool{sessionName: true},
+		ScaleCheckCounts: map[string]int{template: 0},
+		Now:              now,
+	})
+
+	assertAwake(t, result, sessionName)
+	assertReason(t, result, sessionName, "attached")
+}
+
 func TestNamedOnDemand_ExactNamedIdentityAssigneeWakes(t *testing.T) {
 	result := ComputeAwakeSet(AwakeInput{
 		Agents:        []AwakeAgent{{QualifiedName: "hello-world/refinery"}},

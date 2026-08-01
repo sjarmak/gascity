@@ -220,6 +220,7 @@ func ContinuationResetWakePatch(now time.Time) MetadataPatch {
 	patch["session_key"] = ""
 	applyFreshWakeConversationReset(patch)
 	patch["continuation_reset_pending"] = "true"
+	patch[ResetCommittedAtKey] = now.UTC().Format(time.RFC3339)
 	return patch
 }
 
@@ -424,6 +425,17 @@ func SleepPatch(now time.Time, reason string) MetadataPatch {
 // AcknowledgeDrainPatch records an agent-acknowledged drain. Drained is a
 // compatibility state distinct from ordinary asleep: demand alone does not
 // reselect it, but explicit attach or work can.
+//
+// A fresh-wake drain arms continuation_reset_pending so the eventual attach- or
+// work-driven wake starts a fresh conversation, but it CLEARS ResetCommittedAtKey
+// rather than stamping it (gascity#4067 §A). The committed timestamp is the sole
+// activator of both the reset-pending force-wake gate (compute_awake_bridge) and
+// the reset-stall timer (recordResetStallIfDue); leaving it set on a drained
+// session would force-wake the session the reconciler just parked (contradicting
+// "demand alone does not reselect it") and eventually fire a false reset-stall.
+// An empty committed timestamp closes both: resetPendingCommittedAtInfo reports
+// not-pending, so the drained session stays asleep and un-stalled while the
+// fresh-conversation intent survives on continuation_reset_pending.
 func AcknowledgeDrainPatch(freshWake bool) MetadataPatch {
 	patch := MetadataPatch{
 		"state":                     string(StateDrained),
@@ -436,11 +448,16 @@ func AcknowledgeDrainPatch(freshWake bool) MetadataPatch {
 		patch["session_key"] = ""
 		applyFreshWakeConversationReset(patch)
 		patch["continuation_reset_pending"] = "true"
+		patch[ResetCommittedAtKey] = ""
 	}
 	return patch
 }
 
 // CompleteDrainPatch records a completed controller drain as ordinary asleep.
+// Its fresh-wake arm clears ResetCommittedAtKey for the same reason as
+// AcknowledgeDrainPatch (gascity#4067 §A): a drained session must not carry the
+// committed timestamp that would force-wake it without demand or fire a false
+// reset-stall.
 func CompleteDrainPatch(now time.Time, reason string, freshWake bool) MetadataPatch {
 	patch := SleepPatch(now, reason)
 	patch["state_reason"] = ""
@@ -448,6 +465,7 @@ func CompleteDrainPatch(now time.Time, reason string, freshWake bool) MetadataPa
 		patch["session_key"] = ""
 		applyFreshWakeConversationReset(patch)
 		patch["continuation_reset_pending"] = "true"
+		patch[ResetCommittedAtKey] = ""
 	}
 	return patch
 }
@@ -491,6 +509,7 @@ func ConfigDriftResetPatch(nextState State, sessionKey string, now time.Time) Me
 		"last_woke_at":               "",
 		"restart_requested":          "",
 		"continuation_reset_pending": "true",
+		ResetCommittedAtKey:          now.UTC().Format(time.RFC3339),
 		"pending_create_claim":       "",
 		"pending_create_started_at":  "",
 	}

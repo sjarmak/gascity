@@ -657,7 +657,7 @@ func recordWakeFailure(info sessionpkg.Info, sessFront *sessionpkg.Store, clk cl
 	// left behind by older builds. The store write is best-effort (its error is
 	// intentionally ignored, as before) while the Info fold is unconditional.
 	if info.SessionKey != "" || info.StartedConfigHash != "" {
-		reset := sessionpkg.ConversationResetPatch(true)
+		reset := sessionpkg.ConversationResetPatch(true, clk.Now().UTC())
 		_ = sessFront.ApplyPatch(info.ID, reset)
 		info = info.ApplyPatch(reset)
 	}
@@ -752,7 +752,7 @@ func recordChurn(info sessionpkg.Info, sessFront *sessionpkg.Store, clk clock.Cl
 	// re-hitting the same wall. Best-effort store write (error ignored, as
 	// before) with an unconditional Info fold.
 	if info.SessionKey != "" {
-		reset := sessionpkg.ConversationResetPatch(false)
+		reset := sessionpkg.ConversationResetPatch(false, clk.Now().UTC())
 		_ = sessFront.ApplyPatch(info.ID, reset)
 		info = info.ApplyPatch(reset)
 	}
@@ -968,14 +968,31 @@ func healStateWithRollbackInfo(info sessionpkg.Info, alive bool, sessFront *sess
 	if len(batch) == 0 {
 		return nil, nil
 	}
-	if err := sessFront.ApplyPatch(info.ID, batch); err != nil {
+	// When this heal re-arms continuation_reset_pending, the store write also
+	// restamps reset_committed_at so the reset-stall timer measures from this heal
+	// rather than a stale marker left by an earlier restart handoff (gascity#4067):
+	// an unstamped re-arm inherits the prior timestamp and fires a false
+	// session.reset_stalled. The fresh marker is kept OUT of the returned fold so
+	// the same tick's awake scan does not force-wake the healed (possibly
+	// on-demand) session on the freshly committed marker — it self-heals onto the
+	// snapshot at the next tick's store reload, mirroring the restart-handoff
+	// fold-strip (#2345).
+	stored := batch
+	if batch["continuation_reset_pending"] == "true" {
+		stored = make(map[string]string, len(batch)+1)
+		for k, v := range batch {
+			stored[k] = v
+		}
+		stored[sessionpkg.ResetCommittedAtKey] = clk.Now().UTC().Format(time.RFC3339)
+	}
+	if err := sessFront.ApplyPatch(info.ID, stored); err != nil {
 		return nil, err
 	}
 	// S19 Stage 3 shadow: record the legacy compared-key writes this heal ACTUALLY
 	// applied (no-op unless the shadow harness is enabled). Colocated with the
 	// ApplyPatch so a pure builder (healStatePatchWithRollbackInfo) invoked only for
 	// inspection never records a write that never happened.
-	recordLegacyCompareWrites(info.ID, "healStateWithRollback", batch)
+	recordLegacyCompareWrites(info.ID, "healStateWithRollback", stored)
 	return batch, nil
 }
 

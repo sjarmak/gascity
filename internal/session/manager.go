@@ -1292,6 +1292,11 @@ func (m *Manager) RequestFreshRestart(id string) error {
 		return m.store.SetMetadataBatch(id, map[string]string{
 			"restart_requested":          "true",
 			"continuation_reset_pending": "true",
+			// Restamp the reset-stall timer alongside the pending flag in one
+			// batch so the pair commits together (gascity#4067): an unstamped
+			// re-arm inherits a stale reset_committed_at and fires a false
+			// session.reset_stalled.
+			ResetCommittedAtKey: m.now().UTC().Format(time.RFC3339),
 		})
 	})
 }

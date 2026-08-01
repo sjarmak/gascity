@@ -369,7 +369,16 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 	}
 
 	for _, bead := range input.SessionBeads {
-		if !bead.ContinuationResetPending || bead.RestartRequested || bead.WaitHold {
+		// Drained sessions are excluded from the reset-pending force-wake: a
+		// drain parks the session until explicit attach or work reselects it
+		// ("demand alone does not reselect it"), and a pending continuation
+		// reset is not demand. The drain patches already clear reset_committed_at
+		// so ContinuationResetPending is normally false here (gascity#4067 §A);
+		// this exclusion is the defense-in-depth invariant that a drained session
+		// is never force-woken by a pending reset even if some future arm site
+		// leaves the marker set. Attach / pending / work overrides below still
+		// wake a drained session on real demand.
+		if !bead.ContinuationResetPending || bead.RestartRequested || bead.WaitHold || bead.Drained {
 			continue
 		}
 		switch desired[bead.SessionName] {

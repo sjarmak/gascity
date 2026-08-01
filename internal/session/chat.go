@@ -136,30 +136,31 @@ func freshStartCommandFromMetadata(metadata map[string]string, fallback string) 
 }
 
 func (m *Manager) clearStaleResumeMetadata(id string, b *beads.Bead) error {
-	if err := m.store.SetMetadata(id, "session_key", ""); err != nil {
-		return fmt.Errorf("clearing stale resume metadata session_key: %w", err)
-	}
-	if err := m.store.SetMetadata(id, "started_config_hash", ""); err != nil {
-		return fmt.Errorf("clearing stale resume metadata started_config_hash: %w", err)
-	}
-	if err := m.store.SetMetadata(id, "continuation_reset_pending", "true"); err != nil {
-		return fmt.Errorf("clearing stale resume metadata continuation_reset_pending: %w", err)
+	patch := map[string]string{
+		"session_key":                "",
+		"started_config_hash":        "",
+		"continuation_reset_pending": "true",
+		// Re-arming continuation_reset_pending restamps the reset-stall timer so
+		// it measures from this stale-resume recovery, not a stale timestamp from
+		// an earlier restart handoff (gascity#4067). The pending flag and its
+		// timestamp are written in one batch so the pair commits together across
+		// every backend (gascity#4067 §D): a torn write would leave the awake gate
+		// and the stall timer reading a mismatched pair.
+		ResetCommittedAtKey: m.now().UTC().Format(time.RFC3339),
 	}
 	// Priming markers share started_config_hash's lifetime (S19 Stage 2): this
 	// stale-resume clear forces a fresh start, so the markers reset with it.
 	for _, k := range primingResetKeys {
-		if err := m.store.SetMetadata(id, k, ""); err != nil {
-			return fmt.Errorf("clearing stale resume metadata %s: %w", k, err)
-		}
+		patch[k] = ""
+	}
+	if err := m.store.SetMetadataBatch(id, patch); err != nil {
+		return fmt.Errorf("clearing stale resume metadata: %w", err)
 	}
 	if b.Metadata == nil {
 		b.Metadata = make(map[string]string)
 	}
-	b.Metadata["session_key"] = ""
-	b.Metadata["started_config_hash"] = ""
-	b.Metadata["continuation_reset_pending"] = "true"
-	for _, k := range primingResetKeys {
-		b.Metadata[k] = ""
+	for k, v := range patch {
+		b.Metadata[k] = v
 	}
 	return nil
 }

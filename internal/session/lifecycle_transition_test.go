@@ -123,6 +123,8 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 				"priming_attempted_at":       "",
 				"prompt_hash":                "",
 				"continuation_reset_pending": "true",
+				// Arm site: restamp the reset-stall timer (gascity#4067).
+				ResetCommittedAtKey: now.UTC().Format(time.RFC3339),
 			},
 		},
 		{
@@ -190,6 +192,10 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 				"priming_attempted_at":       "",
 				"prompt_hash":                "",
 				"continuation_reset_pending": "true",
+				// Drain clears the committed timestamp so a drained session is
+				// neither force-woken by the reset-pending gate nor false-stalled
+				// (gascity#4067 §A).
+				ResetCommittedAtKey: "",
 			},
 		},
 		{
@@ -213,6 +219,8 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 				"priming_attempted_at":       "",
 				"prompt_hash":                "",
 				"continuation_reset_pending": "true",
+				// Drain clears the committed timestamp (gascity#4067 §A).
+				ResetCommittedAtKey: "",
 			},
 		},
 		{
@@ -267,6 +275,7 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 				"last_woke_at":               "",
 				"restart_requested":          "",
 				"continuation_reset_pending": "true",
+				ResetCommittedAtKey:          now.UTC().Format(time.RFC3339),
 				"pending_create_claim":       "true",
 				"pending_create_started_at":  now.UTC().Format(time.RFC3339),
 				"session_key":                "new-session-key",
@@ -287,6 +296,7 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 				"last_woke_at":               "",
 				"restart_requested":          "",
 				"continuation_reset_pending": "true",
+				ResetCommittedAtKey:          now.UTC().Format(time.RFC3339),
 				"pending_create_claim":       "",
 				"pending_create_started_at":  "",
 				"session_key":                "new-session-key",
@@ -307,6 +317,7 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 				"last_woke_at":               "",
 				"restart_requested":          "",
 				"continuation_reset_pending": "true",
+				ResetCommittedAtKey:          now.UTC().Format(time.RFC3339),
 				"pending_create_claim":       "",
 				"pending_create_started_at":  "",
 			},
@@ -861,6 +872,76 @@ func TestAcknowledgeDrainPatchClearsStaleStateReasonOnApply(t *testing.T) {
 	})
 	if got := merged["state_reason"]; got != "" {
 		t.Fatalf("state_reason = %q, want cleared", got)
+	}
+}
+
+// TestContinuationResetArmRestampsResetCommittedAt is the gascity#4067 core:
+// re-arming continuation_reset_pending must restamp reset_committed_at so the
+// reset-stall timer measures from the re-arm, not a stale timestamp carried over
+// from an earlier restart handoff. Without the restamp, resetPendingCommittedAtInfo
+// pairs the fresh pending flag with the stale timestamp and recordResetStallIfDue
+// fires a false session.reset_stalled on a healthy session.
+func TestContinuationResetArmRestampsResetCommittedAt(t *testing.T) {
+	firstRestart := time.Date(2026, 5, 14, 10, 0, 0, 0, time.UTC)
+	reArm := firstRestart.Add(3 * time.Hour)
+
+	first := RestartRequestPatch("session-key-1", firstRestart)
+	if got, want := first[ResetCommittedAtKey], firstRestart.UTC().Format(time.RFC3339); got != want {
+		t.Fatalf("first cycle ResetCommittedAtKey = %q, want %q", got, want)
+	}
+
+	// A later continuation-reset re-arm (e.g. a churn/wake-failure reset) must
+	// carry the re-arm's timestamp, not inherit the first cycle's stale value.
+	second := ConversationResetPatch(false, reArm)
+	if got, want := second[ResetCommittedAtKey], reArm.UTC().Format(time.RFC3339); got != want {
+		t.Fatalf("re-arm ResetCommittedAtKey = %q, want fresh %q, not the stale first-cycle value", got, want)
+	}
+	if second["continuation_reset_pending"] != "true" {
+		t.Fatalf("re-arm continuation_reset_pending = %q, want %q", second["continuation_reset_pending"], "true")
+	}
+}
+
+// TestFreshWakeDrainClearsResetCommittedAt is the gascity#4067 §A regression
+// guard at the patch level: the fresh-wake drain patches clear reset_committed_at
+// rather than stamping it, so a drained session carries an empty committed
+// timestamp. resetPendingCommittedAtInfo then reports not-pending, which keeps the
+// drained session off both the reset-pending force-wake gate and the reset-stall
+// timer while continuation_reset_pending preserves the fresh-conversation intent
+// for the eventual attach- or work-driven wake.
+func TestFreshWakeDrainClearsResetCommittedAt(t *testing.T) {
+	now := time.Date(2026, 5, 14, 16, 0, 0, 0, time.UTC)
+
+	ack := AcknowledgeDrainPatch(true)
+	if got, ok := ack[ResetCommittedAtKey]; !ok || got != "" {
+		t.Fatalf("AcknowledgeDrainPatch(fresh) ResetCommittedAtKey = %q (present=%v), want cleared to \"\"", got, ok)
+	}
+	if ack["continuation_reset_pending"] != "true" {
+		t.Fatalf("AcknowledgeDrainPatch(fresh) continuation_reset_pending = %q, want %q", ack["continuation_reset_pending"], "true")
+	}
+
+	complete := CompleteDrainPatch(now, "idle", true)
+	if got, ok := complete[ResetCommittedAtKey]; !ok || got != "" {
+		t.Fatalf("CompleteDrainPatch(fresh) ResetCommittedAtKey = %q (present=%v), want cleared to \"\"", got, ok)
+	}
+	if complete["continuation_reset_pending"] != "true" {
+		t.Fatalf("CompleteDrainPatch(fresh) continuation_reset_pending = %q, want %q", complete["continuation_reset_pending"], "true")
+	}
+
+	// Applying the drain patch over a bead that still carries a stale committed
+	// timestamp clears it, so a session that requested a restart and then drained
+	// is not left with a dirty marker that would force-wake it.
+	merged := CompleteDrainPatch(now, "idle", true).Apply(map[string]string{
+		"continuation_reset_pending": "true",
+		ResetCommittedAtKey:          "2026-05-14T10:00:00Z",
+	})
+	if got := merged[ResetCommittedAtKey]; got != "" {
+		t.Fatalf("drain over stale marker: ResetCommittedAtKey = %q, want cleared", got)
+	}
+
+	// Resume-mode (non-fresh) drains do not touch the reset markers at all.
+	resume := AcknowledgeDrainPatch(false)
+	if _, ok := resume[ResetCommittedAtKey]; ok {
+		t.Fatalf("AcknowledgeDrainPatch(resume) must not write ResetCommittedAtKey")
 	}
 }
 
