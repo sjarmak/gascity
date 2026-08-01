@@ -3093,7 +3093,7 @@ func TestCmdNudgePollSleepsAfterSuccessfulDelivery(t *testing.T) {
 
 	deliverCalls := 0
 	origDeliver := deliverQueuedNudgesByPoller
-	deliverQueuedNudgesByPoller = func(nudgeTarget, beads.Store, runtime.Provider, time.Duration, worker.LiveObservation) (bool, error) {
+	deliverQueuedNudgesByPoller = func(nudgeTarget, beads.Store, beads.Store, runtime.Provider, time.Duration, worker.LiveObservation) (bool, error) {
 		deliverCalls++
 		return true, nil
 	}
@@ -3107,7 +3107,7 @@ func TestCmdNudgePollSleepsAfterSuccessfulDelivery(t *testing.T) {
 	defer func() { nudgePollSleep = origSleep }()
 
 	var stdout, stderr bytes.Buffer
-	code := cmdNudgePoll([]string{created.ID}, "worker-session", 5*time.Millisecond, 0, &stdout, &stderr)
+	code := cmdNudgePoll([]string{created.ID}, "worker-session", 5*time.Millisecond, 0, true, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("cmdNudgePoll = %d, want 0; stderr=%s", code, stderr.String())
 	}
