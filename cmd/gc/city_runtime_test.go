@@ -793,7 +793,7 @@ func TestCityRuntimeDemandSnapshotReusesStablePatrolDemand(t *testing.T) {
 		},
 		stderr: io.Discard,
 	}
-	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
+	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
 		buildCalls++
 		return DesiredStateResult{
 			State: map[string]TemplateParams{
@@ -1329,7 +1329,7 @@ func TestCityRuntimeDemandSnapshotRetainsOnlyPoolScaleCheckPartials(t *testing.T
 				},
 				stderr: io.Discard,
 			}
-			cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
+			cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
 				return tc.result
 			}
 
@@ -1487,7 +1487,7 @@ func TestCityRuntimeTickDispatchesOrdersBeforeDemandSnapshot(t *testing.T) {
 		stdout:              io.Discard,
 		stderr:              io.Discard,
 	}
-	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
+	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
 		if !od.called.Load() {
 			t.Fatal("order dispatch should happen before demand snapshot build")
 		}
@@ -1517,7 +1517,7 @@ func TestCityRuntimeTickReturnsBeforeDemandWhenCanceled(t *testing.T) {
 		stdout:              io.Discard,
 		stderr:              io.Discard,
 	}
-	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
+	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
 		t.Fatal("demand snapshot should not run after city context is canceled")
 		return DesiredStateResult{State: map[string]TemplateParams{}}
 	}
@@ -1553,7 +1553,7 @@ func TestCityRuntimeTickReturnsBeforeDemandWhenCanceledDuringOrderDispatch(t *te
 		stdout:              io.Discard,
 		stderr:              io.Discard,
 	}
-	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
+	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
 		t.Fatal("demand snapshot should not run after order dispatch cancels the city context")
 		return DesiredStateResult{State: map[string]TemplateParams{}}
 	}
@@ -2034,7 +2034,7 @@ func TestCityRuntimeDemandSnapshotCachesCustomDemandCommands(t *testing.T) {
 				},
 				stderr: io.Discard,
 			}
-			cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
+			cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
 				buildCalls++
 				return DesiredStateResult{State: map[string]TemplateParams{}}
 			}
@@ -2067,7 +2067,7 @@ func TestCityRuntimeDemandSnapshotThrottlesScaleCheckPatrolReeval(t *testing.T) 
 		},
 		stderr: io.Discard,
 	}
-	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
+	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
 		buildCalls++
 		return DesiredStateResult{State: map[string]TemplateParams{}}
 	}
@@ -2128,7 +2128,7 @@ func TestCityRuntimeDemandSnapshotDoesNotRunControllerWorkQuery(t *testing.T) {
 		},
 		stderr: io.Discard,
 	}
-	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
+	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
 		return DesiredStateResult{State: map[string]TemplateParams{}}
 	}
 
@@ -3782,11 +3782,12 @@ func TestCityRuntimeTick_RefreshesManualSessionOverlayAfterSync(t *testing.T) {
 		c *config.City,
 		currentSP runtime.Provider,
 		store beads.Store,
+		cityWorkStore beads.Store,
 		rigStores map[string]beads.Store,
 		sessionBeads *sessionBeadSnapshot,
 		trace *sessionReconcilerTraceCycle,
 	) DesiredStateResult {
-		result := buildDesiredStateWithSessionBeads("my-city", cityPath, time.Now(), c, currentSP, store, rigStores, sessionBeads, trace, &stderr)
+		result := buildDesiredStateWithSessionBeads("my-city", cityPath, time.Now(), c, currentSP, store, rigStores, sessionBeads, trace, &stderr, cityWorkStore)
 		if !mutated {
 			if err := store.SetMetadata(manual.ID, "session_name", sessionNameFromBeadID(manual.ID)); err != nil {
 				t.Fatalf("SetMetadata(session_name): %v", err)
@@ -3861,7 +3862,7 @@ func TestCityRuntimeTickRunsOnDeathWithCanonicalRigEnv(t *testing.T) {
 		rec:                 events.Discard,
 		stdout:              io.Discard,
 		stderr:              &stderr,
-		buildFnWithSessionBeads: func(_ *config.City, _ runtime.Provider, _ beads.Store, _ map[string]beads.Store, _ *sessionBeadSnapshot, _ *sessionReconcilerTraceCycle) DesiredStateResult {
+		buildFnWithSessionBeads: func(_ *config.City, _ runtime.Provider, _ beads.Store, _ beads.Store, _ map[string]beads.Store, _ *sessionBeadSnapshot, _ *sessionReconcilerTraceCycle) DesiredStateResult {
 			return DesiredStateResult{State: map[string]TemplateParams{}}
 		},
 	}
@@ -3905,7 +3906,7 @@ func TestCityRuntimeTickSkipsOnDeathWhenSessionListingIsPartial(t *testing.T) {
 		rec:    events.Discard,
 		stdout: io.Discard,
 		stderr: &stderr,
-		buildFnWithSessionBeads: func(_ *config.City, _ runtime.Provider, _ beads.Store, _ map[string]beads.Store, _ *sessionBeadSnapshot, _ *sessionReconcilerTraceCycle) DesiredStateResult {
+		buildFnWithSessionBeads: func(_ *config.City, _ runtime.Provider, _ beads.Store, _ beads.Store, _ map[string]beads.Store, _ *sessionBeadSnapshot, _ *sessionReconcilerTraceCycle) DesiredStateResult {
 			return DesiredStateResult{State: map[string]TemplateParams{}}
 		},
 	}
@@ -4142,7 +4143,7 @@ func TestCityRuntimeBuildDesiredState_StandaloneIncludesRigStores(t *testing.T) 
 		sp:                  runtime.NewFake(),
 		standaloneCityStore: cityStore,
 		standaloneRigStores: map[string]beads.Store{"gascity": rigStore},
-		buildFnWithSessionBeads: func(_ *config.City, _ runtime.Provider, store beads.Store, rigStores map[string]beads.Store, _ *sessionBeadSnapshot, _ *sessionReconcilerTraceCycle) DesiredStateResult {
+		buildFnWithSessionBeads: func(_ *config.City, _ runtime.Provider, store beads.Store, _ beads.Store, rigStores map[string]beads.Store, _ *sessionBeadSnapshot, _ *sessionReconcilerTraceCycle) DesiredStateResult {
 			if store != cityStore {
 				t.Fatalf("store = %v, want city store", store)
 			}
@@ -4158,6 +4159,38 @@ func TestCityRuntimeBuildDesiredState_StandaloneIncludesRigStores(t *testing.T) 
 	}
 	if gotRigStores["gascity"] != rigStore {
 		t.Fatalf("rigStores[gascity] = %v, want rig store", gotRigStores["gascity"])
+	}
+}
+
+func TestCityRuntimeBuildDesiredState_ControllerUsesDistinctCityWorkStore(t *testing.T) {
+	sessionStore := beads.NewMemStore()
+	cityWorkStore := beads.NewMemStore()
+	cs := &controllerState{
+		cityBeadStore:     sessionStore,
+		cityWorkBeadStore: cityWorkStore,
+	}
+	called := false
+	cr := &CityRuntime{
+		cityPath: t.TempDir(),
+		cityName: "demo",
+		cfg:      &config.City{},
+		sp:       runtime.NewFake(),
+		cs:       cs,
+		buildFnWithSessionBeads: func(_ *config.City, _ runtime.Provider, gotSessionStore, gotCityWorkStore beads.Store, _ map[string]beads.Store, _ *sessionBeadSnapshot, _ *sessionReconcilerTraceCycle) DesiredStateResult {
+			called = true
+			if gotSessionStore != sessionStore {
+				t.Fatalf("session store = %v, want %v", gotSessionStore, sessionStore)
+			}
+			if gotCityWorkStore != cityWorkStore {
+				t.Fatalf("city work store = %v, want %v", gotCityWorkStore, cityWorkStore)
+			}
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+	}
+
+	cr.buildDesiredState(nil, nil)
+	if !called {
+		t.Fatal("build function was not called")
 	}
 }
 
