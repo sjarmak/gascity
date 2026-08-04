@@ -12,6 +12,7 @@ import (
 	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/builtinpacks"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/doctor"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/hooks"
@@ -336,6 +337,17 @@ func doRigAddWithResult(fs fsys.FS, cityPath, rigPath string, includes []string,
 				}
 			}
 
+			// Prefer a canonical instructions pointer for the rig's default
+			// provider so the rig is born with one canonical instructions file
+			// (e.g. CLAUDE.md -> AGENTS.md) instead of a drift-prone whole-file
+			// copy. Best-effort: never overwrite hand-written content or an
+			// existing symlink, and never fail rig add.
+			if instr := resolveRigInstructionsFilename(pc.Cfg); instr != "" {
+				if _, _, perr := doctor.EnsureCanonicalInstructionsPointer(rigPath, instr); perr != nil {
+					fmt.Fprintf(stderr, "gc rig add: warning: canonical instructions pointer: %v\n", perr) //nolint:errcheck // best-effort stderr
+				}
+			}
+
 			reloadedCfg, prov, _ := config.LoadWithIncludes(fsys.OSFS{}, tomlPath)
 			emitLoadCityConfigWarnings(stderr, prov)
 			if reloadedCfg != nil {
@@ -384,6 +396,38 @@ func doRigAddWithResult(fs fsys.FS, cityPath, rigPath string, includes []string,
 		return config.Rig{}, 1
 	}
 	return r, 0
+}
+
+// resolveRigInstructionsFilename returns the instructions filename the rig's
+// default (workspace) provider expects, e.g. "CLAUDE.md" for a Claude
+// workspace. It resolves provider metadata without requiring the runtime
+// executable to be installed: scaffolding an instructions pointer is a file
+// operation, not a provider-readiness check. It tolerates a builtin workspace
+// provider that has no explicit [providers] catalog entry by augmenting the
+// catalog with the builtin alias. Returns "" when no provider can be resolved
+// (e.g. a providerless / start-command workspace), in which case the caller
+// creates no pointer.
+func resolveRigInstructionsFilename(cfg *config.City) string {
+	if cfg == nil {
+		return ""
+	}
+	providers := cfg.Providers
+	if name := strings.TrimSpace(cfg.Workspace.Provider); name != "" {
+		if _, ok := providers[name]; !ok {
+			augmented := make(map[string]config.ProviderSpec, len(providers)+1)
+			for k, v := range providers {
+				augmented[k] = v
+			}
+			augmented[name] = config.BuiltinProviderAlias(name)
+			providers = augmented
+		}
+	}
+	metadataOnlyLookPath := func(command string) (string, error) { return command, nil }
+	resolved, err := config.ResolveProvider(&config.Agent{}, &cfg.Workspace, providers, metadataOnlyLookPath)
+	if err != nil || resolved == nil {
+		return ""
+	}
+	return resolved.InstructionsFile
 }
 
 // The following one-line aliases keep cmd/gc test files compiling against the
