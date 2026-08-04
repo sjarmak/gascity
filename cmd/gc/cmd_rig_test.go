@@ -3384,3 +3384,89 @@ func TestRigAddRollbackRestoresThroughCityTomlSymlink(t *testing.T) {
 	}
 	assertCityTomlSymlinkRestored(t, link, target, symlinkedCityTomlOriginal)
 }
+
+// TestDoRigAdd_CreatesCanonicalInstructionsPointer verifies rig scaffolding
+// prefers a canonical instructions pointer: a rig that ships only AGENTS.md,
+// added under a Claude workspace (which expects CLAUDE.md), is born with
+// CLAUDE.md as a symlink to AGENTS.md rather than a drift-prone copy (gc-rk8yy).
+func TestDoRigAdd_CreatesCanonicalInstructionsPointer(t *testing.T) {
+	cityPath := t.TempDir()
+	writeSchema2RigCity(t, cityPath, "test-city", "[workspace]\nprovider = \"claude\"\n", "")
+
+	rigPath := filepath.Join(t.TempDir(), "my-frontend")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigPath, "AGENTS.md"), []byte("canonical instructions\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_BEADS", "bd")
+
+	var stdout, stderr bytes.Buffer
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "", "", false, false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doRigAdd returned %d, stderr: %s", code, stderr.String())
+	}
+
+	claudePath := filepath.Join(rigPath, "CLAUDE.md")
+	info, err := os.Lstat(claudePath)
+	if err != nil {
+		t.Fatalf("Lstat(CLAUDE.md): %v; stderr: %s", err, stderr.String())
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("CLAUDE.md is not a symlink (mode %v); scaffolding must prefer a canonical pointer", info.Mode())
+	}
+	target, err := os.Readlink(claudePath)
+	if err != nil {
+		t.Fatalf("Readlink(CLAUDE.md): %v", err)
+	}
+	if target != "AGENTS.md" {
+		t.Fatalf("CLAUDE.md -> %q, want AGENTS.md", target)
+	}
+}
+
+// TestDoRigAdd_PreservesHandWrittenClaudeMd verifies scaffolding never
+// overwrites a rig's existing hand-written provider instructions file.
+func TestDoRigAdd_PreservesHandWrittenClaudeMd(t *testing.T) {
+	cityPath := t.TempDir()
+	writeSchema2RigCity(t, cityPath, "test-city", "[workspace]\nprovider = \"claude\"\n", "")
+
+	rigPath := filepath.Join(t.TempDir(), "my-frontend")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigPath, "AGENTS.md"), []byte("canonical instructions\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	handWritten := "@AGENTS.md\n\n## Claude Code\nClaude-specific guidance.\n"
+	if err := os.WriteFile(filepath.Join(rigPath, "CLAUDE.md"), []byte(handWritten), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_BEADS", "bd")
+
+	var stdout, stderr bytes.Buffer
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "", "", false, false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doRigAdd returned %d, stderr: %s", code, stderr.String())
+	}
+
+	claudePath := filepath.Join(rigPath, "CLAUDE.md")
+	info, err := os.Lstat(claudePath)
+	if err != nil {
+		t.Fatalf("Lstat(CLAUDE.md): %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("hand-written CLAUDE.md was replaced by a symlink; content lost")
+	}
+	got, err := os.ReadFile(claudePath)
+	if err != nil {
+		t.Fatalf("ReadFile(CLAUDE.md): %v", err)
+	}
+	if string(got) != handWritten {
+		t.Fatalf("CLAUDE.md content = %q, want hand-written unchanged", string(got))
+	}
+}

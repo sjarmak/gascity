@@ -354,6 +354,55 @@ func instructionsFallbackUsable(dir, name string) bool {
 	return !info.IsDir()
 }
 
+// EnsureCanonicalInstructionsPointer makes a provider's expected instructions
+// file in dir a canonical pointer to an existing sibling instruction file,
+// rather than a drift-prone whole-file copy. It is the scaffold-time,
+// write-once counterpart to InstructionsFileCheck.Fix: rig scaffolding calls it
+// so a freshly provisioned rig is born with one canonical instructions file
+// (e.g. CLAUDE.md -> AGENTS.md) before any external managed-block writer has a
+// chance to materialize a separate copy that then drifts.
+//
+// Behavior, matching the "preserve hand-written content and existing
+// symlink-based rigs" contract:
+//   - If expected already exists in any form (regular file, symlink — even a
+//     dangling one — or directory), it is left untouched. The function never
+//     overwrites, so hand-written content and existing symlinks survive.
+//   - Otherwise, if a canonical sibling instruction file is present (AGENTS.md
+//     preferred, then CLAUDE.md, then INSTRUCTIONS.md), expected is created as a
+//     relative symlink to it. Content is never copied, so the two names cannot
+//     diverge.
+//   - If no canonical sibling is present, or expected is not a safe bare
+//     filename, it is a no-op.
+//
+// It returns linked=true only when a new symlink was created, the canonical
+// sibling's filename (empty when nothing was linkable), and any error from
+// creating the symlink. Symlink creation can fail on filesystems that do not
+// support symlinks ("where supported"); callers should treat that as a
+// best-effort warning rather than a hard failure, and must not fall back to
+// copying — copying is the drift source this function exists to prevent.
+func EnsureCanonicalInstructionsPointer(dir, expected string) (linked bool, canonical string, err error) {
+	expected, ok := safeInstructionsFilename(expected)
+	if !ok {
+		return false, "", nil
+	}
+	target := filepath.Join(dir, expected)
+	// Lstat, not Stat, so an existing symlink — even a dangling one — counts as
+	// user-owned state we must not clobber.
+	if _, statErr := os.Lstat(target); statErr == nil {
+		return false, "", nil
+	} else if !os.IsNotExist(statErr) {
+		return false, "", fmt.Errorf("inspecting %s: %w", target, statErr)
+	}
+	canonical = firstFallback(dir, expected)
+	if canonical == "" {
+		return false, "", nil
+	}
+	if linkErr := os.Symlink(canonical, target); linkErr != nil {
+		return false, canonical, fmt.Errorf("symlink %s -> %s: %w", expected, canonical, linkErr)
+	}
+	return true, canonical, nil
+}
+
 func safeInstructionsFilename(name string) (string, bool) {
 	name = strings.TrimSpace(name)
 	if name == "" || name == "." || name == ".." {
