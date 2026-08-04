@@ -381,3 +381,163 @@ func TestInstructionsFileCheck_MergesProvidersForSameGap(t *testing.T) {
 		t.Fatalf("Details[0] = %q, want sorted plural provider list", r.Details[0])
 	}
 }
+
+// readLink returns the symlink target of path, failing the test if path is not
+// a symlink.
+func readLink(t *testing.T, path string) string {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("Lstat(%q): %v", path, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%q is not a symlink (mode %v)", path, info.Mode())
+	}
+	target, err := os.Readlink(path)
+	if err != nil {
+		t.Fatalf("Readlink(%q): %v", path, err)
+	}
+	return target
+}
+
+func TestEnsureCanonicalInstructionsPointer_LinksMissingToCanonical(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "AGENTS.md"), "canonical instructions\n")
+
+	linked, canonical, err := EnsureCanonicalInstructionsPointer(dir, "CLAUDE.md")
+	if err != nil {
+		t.Fatalf("EnsureCanonicalInstructionsPointer: %v", err)
+	}
+	if !linked {
+		t.Fatalf("linked = false, want true")
+	}
+	if canonical != "AGENTS.md" {
+		t.Fatalf("canonical = %q, want AGENTS.md", canonical)
+	}
+	// The pointer must be a relative symlink to the canonical sibling, never a
+	// copy — so the two names can never diverge.
+	if got := readLink(t, filepath.Join(dir, "CLAUDE.md")); got != "AGENTS.md" {
+		t.Fatalf("symlink target = %q, want AGENTS.md", got)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "CLAUDE.md"))
+	if err != nil {
+		t.Fatalf("ReadFile through symlink: %v", err)
+	}
+	if string(got) != "canonical instructions\n" {
+		t.Fatalf("resolved content = %q, want canonical", string(got))
+	}
+
+	linked, canonical, err = EnsureCanonicalInstructionsPointer(dir, "CLAUDE.md")
+	if err != nil {
+		t.Fatalf("second EnsureCanonicalInstructionsPointer: %v", err)
+	}
+	if linked || canonical != "" {
+		t.Fatalf("second call linked=%v canonical=%q, want idempotent no-op", linked, canonical)
+	}
+	if got := readLink(t, filepath.Join(dir, "CLAUDE.md")); got != "AGENTS.md" {
+		t.Fatalf("symlink target after second call = %q, want AGENTS.md", got)
+	}
+}
+
+func TestEnsureCanonicalInstructionsPointer_PreservesHandWrittenFile(t *testing.T) {
+	// A rig whose CLAUDE.md carries hand-written content (e.g. an @AGENTS.md
+	// pointer stub plus a Claude-specific section) must be left untouched.
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "AGENTS.md"), "canonical instructions\n")
+	handWritten := "@AGENTS.md\n\n## Claude Code\nClaude-specific guidance.\n"
+	writeFile(t, filepath.Join(dir, "CLAUDE.md"), handWritten)
+
+	linked, _, err := EnsureCanonicalInstructionsPointer(dir, "CLAUDE.md")
+	if err != nil {
+		t.Fatalf("EnsureCanonicalInstructionsPointer: %v", err)
+	}
+	if linked {
+		t.Fatalf("linked = true, want false (must not overwrite)")
+	}
+	info, err := os.Lstat(filepath.Join(dir, "CLAUDE.md"))
+	if err != nil {
+		t.Fatalf("Lstat(CLAUDE.md): %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("CLAUDE.md was replaced by a symlink; hand-written content lost")
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "CLAUDE.md"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(got) != handWritten {
+		t.Fatalf("content = %q, want hand-written unchanged", string(got))
+	}
+}
+
+func TestEnsureCanonicalInstructionsPointer_PreservesExistingSymlink(t *testing.T) {
+	// An existing symlink-based rig is already canonical; leave it alone,
+	// including a symlink pointing somewhere unexpected.
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "AGENTS.md"), "canonical instructions\n")
+	writeFile(t, filepath.Join(dir, "INSTRUCTIONS.md"), "other\n")
+	if err := os.Symlink("INSTRUCTIONS.md", filepath.Join(dir, "CLAUDE.md")); err != nil {
+		t.Fatalf("seed symlink: %v", err)
+	}
+
+	linked, _, err := EnsureCanonicalInstructionsPointer(dir, "CLAUDE.md")
+	if err != nil {
+		t.Fatalf("EnsureCanonicalInstructionsPointer: %v", err)
+	}
+	if linked {
+		t.Fatalf("linked = true, want false (existing symlink preserved)")
+	}
+	if got := readLink(t, filepath.Join(dir, "CLAUDE.md")); got != "INSTRUCTIONS.md" {
+		t.Fatalf("symlink target changed to %q, want INSTRUCTIONS.md", got)
+	}
+}
+
+func TestEnsureCanonicalInstructionsPointer_NoCanonicalSiblingIsNoop(t *testing.T) {
+	// Nothing to point at: the rig ships only the expected name's absence and
+	// no sibling. Do not fabricate a target.
+	dir := t.TempDir()
+	linked, canonical, err := EnsureCanonicalInstructionsPointer(dir, "CLAUDE.md")
+	if err != nil {
+		t.Fatalf("EnsureCanonicalInstructionsPointer: %v", err)
+	}
+	if linked || canonical != "" {
+		t.Fatalf("linked=%v canonical=%q, want no-op", linked, canonical)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "CLAUDE.md")); !os.IsNotExist(err) {
+		t.Fatalf("CLAUDE.md was created with no canonical sibling")
+	}
+}
+
+func TestEnsureCanonicalInstructionsPointer_PrefersAgentsOverOtherSiblings(t *testing.T) {
+	// With both CLAUDE.md and INSTRUCTIONS.md present and AGENTS.md expected,
+	// AGENTS.md links to CLAUDE.md (the higher-priority fallback), not
+	// INSTRUCTIONS.md.
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "CLAUDE.md"), "claude\n")
+	writeFile(t, filepath.Join(dir, "INSTRUCTIONS.md"), "generic\n")
+
+	linked, canonical, err := EnsureCanonicalInstructionsPointer(dir, "AGENTS.md")
+	if err != nil {
+		t.Fatalf("EnsureCanonicalInstructionsPointer: %v", err)
+	}
+	if !linked || canonical != "CLAUDE.md" {
+		t.Fatalf("linked=%v canonical=%q, want linked to CLAUDE.md", linked, canonical)
+	}
+	if got := readLink(t, filepath.Join(dir, "AGENTS.md")); got != "CLAUDE.md" {
+		t.Fatalf("symlink target = %q, want CLAUDE.md", got)
+	}
+}
+
+func TestEnsureCanonicalInstructionsPointer_UnsafeFilenameIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "AGENTS.md"), "canonical\n")
+	for _, name := range []string{"", "../escape.md", "sub/dir.md", ".."} {
+		linked, _, err := EnsureCanonicalInstructionsPointer(dir, name)
+		if err != nil {
+			t.Fatalf("EnsureCanonicalInstructionsPointer(%q): %v", name, err)
+		}
+		if linked {
+			t.Fatalf("EnsureCanonicalInstructionsPointer(%q) linked, want no-op", name)
+		}
+	}
+}
