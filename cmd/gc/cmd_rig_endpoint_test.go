@@ -627,6 +627,100 @@ func TestDoRigSetEndpointSupportsExecGcBeadsBdProvider(t *testing.T) {
 	}
 }
 
+func TestDoRigSetEndpointStopsLastInheritedManagedDoltLifecycle(t *testing.T) {
+	t.Setenv("GC_BEADS", "")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+	t.Setenv("GC_HOME", t.TempDir())
+	cityDir := writeMixedProviderFileCity(t)
+	rigDir := filepath.Join(cityDir, "frontend")
+	builtinRuntimeReadyCache.Delete(normalizePathForCompare(cityDir))
+
+	originalRun := runRigEndpointManagedProviderOp
+	t.Cleanup(func() { runRigEndpointManagedProviderOp = originalRun })
+	var operations []string
+	runRigEndpointManagedProviderOp = func(_ string, _ []string, args ...string) error {
+		operations = append(operations, args...)
+		return nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doRigSetEndpoint(fsys.OSFS{}, cityDir, "frontend", rigEndpointOptions{
+		External:        true,
+		Host:            "db.example.test",
+		Port:            "4406",
+		AdoptUnverified: true,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doRigSetEndpoint() = %d, stderr = %s", code, stderr.String())
+	}
+	if len(operations) != 1 || operations[0] != "stop" {
+		t.Fatalf("managed lifecycle operations = %v, want [stop]", operations)
+	}
+	state := readRigEndpointConfigState(t, rigDir)
+	if state.EndpointOrigin != contract.EndpointOriginExplicit {
+		t.Fatalf("rig endpoint state = %+v, want explicit", state)
+	}
+}
+
+func TestDoRigSetEndpointKeepsManagedDoltForAnotherInheritedRig(t *testing.T) {
+	t.Setenv("GC_BEADS", "")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+	t.Setenv("GC_HOME", t.TempDir())
+	cityDir := writeMixedProviderFileCity(t)
+	frontendDir := filepath.Join(cityDir, "frontend")
+	backendDir := filepath.Join(cityDir, "backend")
+	if err := os.MkdirAll(filepath.Join(backendDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeRigEndpointMetadata(t, backendDir, "be")
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]
+name = "demo"
+
+[beads]
+provider = "file"
+
+[[rigs]]
+name = "frontend"
+path = "frontend"
+prefix = "fe"
+
+[[rigs]]
+name = "backend"
+path = "backend"
+prefix = "be"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.PersistRigSiteBindings(fsys.OSFS{}, cityDir, []config.Rig{
+		{Name: "frontend", Path: frontendDir},
+		{Name: "backend", Path: backendDir},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	originalRun := runRigEndpointManagedProviderOp
+	t.Cleanup(func() { runRigEndpointManagedProviderOp = originalRun })
+	var operations []string
+	runRigEndpointManagedProviderOp = func(_ string, _ []string, args ...string) error {
+		operations = append(operations, args...)
+		return nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doRigSetEndpoint(fsys.OSFS{}, cityDir, "frontend", rigEndpointOptions{
+		External:        true,
+		Host:            "db.example.test",
+		Port:            "4406",
+		AdoptUnverified: true,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doRigSetEndpoint() = %d, stderr = %s", code, stderr.String())
+	}
+	if len(operations) != 0 {
+		t.Fatalf("managed lifecycle operations = %v, want none while backend still inherits", operations)
+	}
+}
+
 func TestDoRigSetEndpointRejectsNonBDProvider(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 

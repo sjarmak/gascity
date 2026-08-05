@@ -35,7 +35,10 @@ type rigEndpointOptions struct {
 	DryRun          bool
 }
 
-var verifyRigExternalEndpoint = verifyExternalDoltEndpoint
+var (
+	verifyRigExternalEndpoint       = verifyExternalDoltEndpoint
+	runRigEndpointManagedProviderOp = runProviderOpWithEnv
+)
 
 func newRigSetEndpointCmd(stdout, stderr io.Writer) *cobra.Command {
 	var opts rigEndpointOptions
@@ -181,6 +184,12 @@ func doRigSetEndpoint(fs fsys.FS, cityPath, rigName string, opts rigEndpointOpti
 		fmt.Fprintf(stderr, "gc rig set-endpoint: WARN: rig %q now runs its own Dolt on 127.0.0.1:%s, independent of the city's managed Dolt; `gc start` will not supervise it.\n", rig.Name, targetState.DoltPort) //nolint:errcheck // best-effort stderr
 	}
 
+	retireManagedLifecycle, err := prepareRigEndpointManagedLifecycleRetirement(cityPath, cfg, rig, cityState, currentState, targetState, stderr)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc rig set-endpoint: prepare managed lifecycle retirement: %v\n", err) //nolint:errcheck
+		return 1
+	}
+
 	snapshots, err := snapshotRigEndpointFiles(fs, cityPath, rig.Path)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc rig set-endpoint: snapshot canonical files: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -202,9 +211,48 @@ func doRigSetEndpoint(fs fsys.FS, cityPath, rigName string, opts rigEndpointOpti
 		writeRigEndpointRollbackError(fs, stderr, snapshots, "syncing managed port artifact", err)
 		return 1
 	}
+	if retireManagedLifecycle != nil {
+		if err := retireManagedLifecycle(); err != nil {
+			writeRigEndpointRollbackError(fs, stderr, snapshots, "stopping retired managed provider", err)
+			return 1
+		}
+	}
 
 	printRigEndpointResult(stdout, rig, targetState)
 	return 0
+}
+
+func prepareRigEndpointManagedLifecycleRetirement(cityPath string, cfg *config.City, changingRig config.Rig, city, current, target contract.ConfigState, warningWriter io.Writer) (func() error, error) {
+	if current.EndpointOrigin != contract.EndpointOriginInheritedCity || target.EndpointOrigin == contract.EndpointOriginInheritedCity {
+		return nil, nil
+	}
+	for _, other := range cfg.Rigs {
+		if strings.EqualFold(other.Name, changingRig.Name) || !rigUsesManagedBdStoreContract(cityPath, other) {
+			continue
+		}
+		state, err := resolveOwnerRigConfigState(cityPath, other, city)
+		if err != nil {
+			return nil, err
+		}
+		if state.EndpointOrigin == contract.EndpointOriginInheritedCity {
+			return nil, nil
+		}
+	}
+	if err := EnsureBuiltinRuntimeAssets(cityPath, warningWriter); err != nil {
+		return nil, err
+	}
+	provider := "exec:" + gcBeadsBdScriptPath(cityPath)
+	environ, err := providerLifecycleProcessEnvWithError(cityPath, provider)
+	if err != nil {
+		return nil, err
+	}
+	script := strings.TrimPrefix(provider, "exec:")
+	return func() error {
+		if err := runRigEndpointManagedProviderOp(script, environ, "stop"); err != nil {
+			return err
+		}
+		return clearManagedDoltRuntimeStateUnlessPostgres(cityPath)
+	}, nil
 }
 
 func validateRigEndpointOptions(opts rigEndpointOptions) error {

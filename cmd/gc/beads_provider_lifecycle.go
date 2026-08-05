@@ -852,8 +852,10 @@ func ensureBeadsProvider(cityPath string) error {
 			}
 			return err
 		}
-		if err := publishManagedDoltRuntimeStateIfOwned(cityPath); err != nil {
-			return err
+		if providerUsesBdStoreContract(provider) {
+			if err := publishManagedDoltRuntimeStateIfOwned(cityPath); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -891,8 +893,10 @@ func shutdownBeadsProvider(cityPath string) error {
 		if err := runProviderOpWithEnv(script, providerEnv, "stop"); err != nil {
 			return err
 		}
-		if err := clearManagedDoltRuntimeStateIfOwned(cityPath); err != nil {
-			return err
+		if providerUsesBdStoreContract(provider) {
+			if err := clearManagedDoltRuntimeStateIfOwned(cityPath); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1250,8 +1254,10 @@ func healthBeadsProviderContext(ctx context.Context, cityPath string, waitForSco
 			if recErr := runProviderOpWithEnvContext(ctx, script, providerEnv, "recover"); recErr != nil {
 				return fmt.Errorf("unhealthy (%w) and recovery failed: %w", err, recErr)
 			}
-			if pubErr := publishManagedDoltRuntimeStateIfOwned(cityPath); pubErr != nil {
-				return fmt.Errorf("recovered but failed to publish managed dolt runtime state: %w", pubErr)
+			if providerUsesBdStoreContract(provider) {
+				if pubErr := publishManagedDoltRuntimeStateIfOwned(cityPath); pubErr != nil {
+					return fmt.Errorf("recovered but failed to publish managed dolt runtime state: %w", pubErr)
+				}
 			}
 			if waitForScopes {
 				if waitErr := waitForAllBeadsScopesReadyAfterRecovery(cityPath, 10*time.Second); waitErr != nil {
