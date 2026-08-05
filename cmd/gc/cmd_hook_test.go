@@ -2954,3 +2954,58 @@ func TestFilterUnreadyHookCandidatesExcludesClosedBeadsFromReworkDrift(t *testin
 		t.Fatalf("filterUnreadyHookCandidates returned %d items for closed bead, want 0; got %q", len(items), got)
 	}
 }
+
+// TestCmdHookLegacyRigPathTemplateEnvResolvesAcrossMigration verifies the
+// dec-a5ar transition: a pool seat spawned BEFORE the Dir normalization runs
+// with GC_AGENT/GC_ALIAS/GC_TEMPLATE stamped in the legacy absolute-rig-path
+// form. After the config load normalizes the agent to its rig-name identity,
+// "gc hook $GC_AGENT" from that seat must still resolve the backing config
+// through the legacy GC_TEMPLATE spelling and return work.
+func TestCmdHookLegacyRigPathTemplateEnvResolvesAcrossMigration(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+
+	cityDir := t.TempDir()
+	rigDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The agent declares the ABSOLUTE rig path as dir (the pre-migration
+	// config shape); load-time normalization rewrites it to "decisions".
+	cityToml := `[workspace]
+name = "test-city"
+
+[[rigs]]
+name = "decisions"
+path = "` + rigDir + `"
+
+[[agent]]
+name = "decisions-worker"
+dir = "` + rigDir + `"
+max_active_sessions = 3
+work_query = "printf '[{\"id\":\"ga-legacy1\",\"status\":\"open\",\"title\":\"work item\"}]'"
+`
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GC_CITY", cityDir)
+	// Legacy seat env: identity strings minted before the normalization.
+	t.Setenv("GC_AGENT", rigDir+"/decisions-worker-1")
+	t.Setenv("GC_ALIAS", rigDir+"/decisions-worker-1")
+	t.Setenv("GC_TEMPLATE", rigDir+"/decisions-worker")
+	t.Setenv("GC_SESSION_NAME", "decisions-worker-mc-abc")
+	t.Setenv("GC_SESSION_ID", "mc-abc456")
+
+	var stdout, stderr bytes.Buffer
+	// Simulate "gc hook $GC_AGENT" — positional arg is the legacy instance name.
+	code := cmdHookWithFormat([]string{rigDir + "/decisions-worker-1"}, false, "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdHookWithFormat(legacy rig-path env) = %d, want 0; stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "ga-legacy1") {
+		t.Errorf("stdout = %q, want to contain work item ga-legacy1", stdout.String())
+	}
+}

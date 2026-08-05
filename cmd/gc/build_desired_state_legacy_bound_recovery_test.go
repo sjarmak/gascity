@@ -471,3 +471,105 @@ func TestRetainScaleCheckPartialPoolDesired_InFlightCreatingBeadRetained(t *test
 		t.Fatalf("stale creating bead incorrectly retained: retained[worker]=%d, want 0", staleGot[template])
 	}
 }
+
+// legacyRigPathRecoveryConfig builds the dec-a5ar migration shape: rig
+// "decisions" bound to a real absolute path, pool agent "decisions-worker"
+// carrying the canonical rig-name Dir. Beads persisted before the Dir
+// normalization still spell identities as "<abs rig path>/decisions-worker".
+func legacyRigPathRecoveryConfig(t *testing.T) (*config.City, string) {
+	t.Helper()
+	rigRoot := t.TempDir()
+	return &config.City{
+		Rigs:   []config.Rig{{Name: "decisions", Path: rigRoot}},
+		Agents: []config.Agent{poolAgent("decisions-worker", "decisions", intPtr(3), 0)},
+	}, rigRoot
+}
+
+// TestCanonicalizeLegacyRigPathAssignedWorkRehomesToCanonical proves the
+// assigned half of the dec-a5ar migration: work assigned/routed to the legacy
+// absolute-rig-path identity is re-homed to the canonical rig-name identity,
+// mirroring the bound->unbound recovery above.
+func TestCanonicalizeLegacyRigPathAssignedWorkRehomesToCanonical(t *testing.T) {
+	cfg, rigRoot := legacyRigPathRecoveryConfig(t)
+	legacy := rigRoot + "/decisions-worker"
+	const canonical = "decisions/decisions-worker"
+
+	wb := workBead("wb-rp1", legacy, legacy, "in_progress", 5)
+	mem := beads.NewMemStoreFrom(0, []beads.Bead{wb}, nil)
+	store := &updateCountingStore{Store: mem}
+
+	canonicalizeLegacyBoundAssignedWork(cfg, []beads.Bead{wb}, []beads.Store{store}, newSessionBeadSnapshot(nil), io.Discard)
+
+	got, err := mem.Get("wb-rp1")
+	if err != nil {
+		t.Fatalf("Get(wb-rp1): %v", err)
+	}
+	if got.Assignee != canonical {
+		t.Errorf("assignee = %q, want %q (re-homed to canonical)", got.Assignee, canonical)
+	}
+	if routed := got.Metadata["gc.routed_to"]; routed != canonical {
+		t.Errorf("gc.routed_to = %q, want %q (re-homed to canonical)", routed, canonical)
+	}
+
+	// Idempotent: a second pass over the now-canonical bead writes nothing.
+	rehomed, _ := mem.Get("wb-rp1")
+	store.updates = 0
+	canonicalizeLegacyBoundAssignedWork(cfg, []beads.Bead{rehomed}, []beads.Store{store}, newSessionBeadSnapshot(nil), io.Discard)
+	if store.updates != 0 {
+		t.Errorf("second pass wrote %d times, want 0 (re-home must be idempotent)", store.updates)
+	}
+}
+
+// TestCanonicalizeLegacyRigPathUnassignedRoutedWorkRehomesRoute proves the
+// demand/claim half of the dec-a5ar migration: open, unassigned work still
+// routed to "<abs rig path>/decisions-worker" has its gc.routed_to rewritten
+// to the canonical rig-name identity, so the canonical pool-demand probe,
+// worker work_query, and claim predicate — all raw-string matches — can see
+// and claim it.
+func TestCanonicalizeLegacyRigPathUnassignedRoutedWorkRehomesRoute(t *testing.T) {
+	cfg, rigRoot := legacyRigPathRecoveryConfig(t)
+	legacy := rigRoot + "/decisions-worker"
+	const canonical = "decisions/decisions-worker"
+
+	wb := workBead("wb-rp2", legacy, "", "open", 5)
+	mem := beads.NewMemStoreFrom(0, []beads.Bead{wb}, nil)
+	store := &updateCountingStore{Store: mem}
+
+	canonicalizeLegacyBoundUnassignedRoutedWork(cfg, []beads.Bead{wb}, []beads.Store{store}, io.Discard)
+
+	got, err := mem.Get("wb-rp2")
+	if err != nil {
+		t.Fatalf("Get(wb-rp2): %v", err)
+	}
+	if routed := got.Metadata["gc.routed_to"]; routed != canonical {
+		t.Errorf("gc.routed_to = %q, want %q (re-homed to canonical)", routed, canonical)
+	}
+	if !hookClaimMatchesRoute(got, []string{canonical}) {
+		t.Error("re-homed bead must match the canonical claim route")
+	}
+
+	// Idempotent: a second pass over the now-canonical bead writes nothing.
+	rehomed, _ := mem.Get("wb-rp2")
+	store.updates = 0
+	canonicalizeLegacyBoundUnassignedRoutedWork(cfg, []beads.Bead{rehomed}, []beads.Store{store}, io.Discard)
+	if store.updates != 0 {
+		t.Errorf("second pass wrote %d times, want 0 (re-home must be idempotent)", store.updates)
+	}
+}
+
+// TestCanonicalizeLegacyRigPathUnassignedSkipsNonRigAbsRoute pins the
+// no-false-rewrite edge on the migration pass: an absolute route whose dir
+// segment matches no configured rig is left untouched.
+func TestCanonicalizeLegacyRigPathUnassignedSkipsNonRigAbsRoute(t *testing.T) {
+	cfg, _ := legacyRigPathRecoveryConfig(t)
+	other := t.TempDir()
+
+	wb := workBead("wb-rp3", other+"/decisions-worker", "", "open", 5)
+	mem := beads.NewMemStoreFrom(0, []beads.Bead{wb}, nil)
+	store := &updateCountingStore{Store: mem}
+
+	canonicalizeLegacyBoundUnassignedRoutedWork(cfg, []beads.Bead{wb}, []beads.Store{store}, io.Discard)
+	if store.updates != 0 {
+		t.Errorf("expected no re-home for a non-rig absolute route, got %d writes", store.updates)
+	}
+}

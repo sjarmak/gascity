@@ -667,6 +667,14 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	}
 	prov.Warnings = append(prov.Warnings, siteBindingWarnings...)
 
+	// Rewrite absolute rig-path agent dirs to the rig NAME so every derived
+	// identity (alias, agent_name, GC_AGENT/GC_ALIAS/GC_TEMPLATE, beacon,
+	// gc.routed_to) is rig-qualified instead of path-shaped (dec-a5ar,
+	// dr-2x9x). Runs after ApplySiteBindings (rig paths authoritative) and
+	// after ApplyPatches ([[patches.agent]] selectors may key on the
+	// absolute dir form).
+	NormalizeAgentRigDirs(root, cityRoot)
+
 	// Inline scope="rig" named sessions are generic declarations until the
 	// city's rig set is finalized. Stamp them after site bindings so the
 	// controller sees one concrete identity per rig.

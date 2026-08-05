@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ import (
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/telemetry"
@@ -358,7 +360,10 @@ func computeWorkSet(cfg *config.City, runner ScaleCheckRunner, cityName, cityDir
 // config.AgentMatchesIdentity) win over all fallbacks; when nothing matches
 // exactly, a legacy bound form ("dir/binding.name") resolves to the unbound
 // agent "dir/name" so sessions and work persisted before a bound→unbound
-// migration stay attributed. Callers that need strict exact-match lookup
+// migration stay attributed, and a legacy rig-path form
+// ("<abs rig path>/name", minted before NormalizeAgentRigDirs) resolves to
+// the agent under its rig-name Dir so beads persisted before the dec-a5ar
+// normalization stay attributed. Callers that need strict exact-match lookup
 // (e.g. uniqueness validation) must not use this resolver.
 // Returns nil if not found.
 func findAgentByTemplate(cfg *config.City, template string) *config.Agent {
@@ -376,7 +381,49 @@ func findAgentByTemplate(cfg *config.City, template string) *config.Agent {
 			return &cfg.Agents[i]
 		}
 	}
+	if rewritten := legacyRigPathTemplateIdentity(cfg, template); rewritten != "" {
+		for i := range cfg.Agents {
+			if config.AgentMatchesIdentity(&cfg.Agents[i], rewritten) {
+				return &cfg.Agents[i]
+			}
+		}
+		for i := range cfg.Agents {
+			if legacyBoundTemplateMatchesUnboundAgent(&cfg.Agents[i], rewritten) {
+				return &cfg.Agents[i]
+			}
+		}
+	}
 	return nil
+}
+
+// legacyRigPathTemplateIdentity maps a persisted identity whose dir segment
+// is the ABSOLUTE path of a configured rig ("/home/ds/projects/decisions/
+// decisions-worker") onto the rig-name form ("decisions/decisions-worker").
+// Identities in this shape were minted before NormalizeAgentRigDirs rewrote
+// absolute rig-path agent dirs at config finalize; they persist in
+// gc.routed_to, assignees, and session-bead agent_name/alias. SamePath
+// comparison absorbs trailing slashes and symlinked spellings. Returns ""
+// when the dir segment is not absolute or matches no configured rig — a dir
+// equal to a rig SUBpath never matches, so non-rig absolute identities are
+// never re-attributed. Rigs whose configured path is not absolute are
+// skipped: without the city path they cannot be resolved for comparison
+// (every reconciler entry point runs resolveRigPaths first).
+func legacyRigPathTemplateIdentity(cfg *config.City, template string) string {
+	dir, local := config.ParseQualifiedName(template)
+	if local == "" || !filepath.IsAbs(strings.TrimSpace(dir)) {
+		return ""
+	}
+	for _, rig := range cfg.Rigs {
+		name := strings.TrimSpace(rig.Name)
+		path := strings.TrimSpace(rig.Path)
+		if name == "" || path == "" || !filepath.IsAbs(path) {
+			continue
+		}
+		if pathutil.SamePath(dir, path) {
+			return name + "/" + local
+		}
+	}
+	return ""
 }
 
 func legacyBoundTemplateMatchesUnboundAgent(agent *config.Agent, template string) bool {

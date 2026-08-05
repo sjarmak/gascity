@@ -328,13 +328,25 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 			agentName == strings.TrimSpace(os.Getenv("GC_AGENT")) ||
 			agentName == strings.TrimSpace(os.Getenv("GC_SESSION_NAME"))
 		if tpl := strings.TrimSpace(os.Getenv("GC_TEMPLATE")); tpl != "" && tpl != agentName && isRuntimeIdentity {
-			if ta, tok := resolveAgentIdentity(cfg, tpl, currentRigContext(cfg)); tok {
+			candidates := []string{tpl}
+			// A seat spawned before NormalizeAgentRigDirs carries the legacy
+			// absolute-rig-path template in its env; accept it on read so the
+			// seat keeps resolving its config across the migration (dec-a5ar).
+			if rewritten := legacyRigPathTemplateIdentity(cfg, tpl); rewritten != "" {
+				candidates = append(candidates, rewritten)
+			}
+			for _, candidate := range candidates {
+				ta, tok := resolveAgentIdentity(cfg, candidate, currentRigContext(cfg))
+				if !tok {
+					continue
+				}
 				a, ok = ta, true
-				agentName = tpl
+				agentName = candidate
 				if !sessionTemplateContext {
 					sessionTemplateContext = strings.TrimSpace(os.Getenv("GC_SESSION_NAME")) != "" ||
 						strings.TrimSpace(os.Getenv("GC_SESSION_ID")) != ""
 				}
+				break
 			}
 		}
 	}

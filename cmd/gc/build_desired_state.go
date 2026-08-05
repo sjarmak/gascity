@@ -4543,8 +4543,10 @@ func canonicalizeLegacyBoundAssignedWork(cfg *config.City, workBeads []beads.Bea
 }
 
 // canonicalizeLegacyBoundUnassignedRoutedWork rewrites the gc.routed_to of open,
-// unassigned pool work that is still routed to the legacy bound form of a
-// now-unbound pool agent ("dir/binding.name") onto the agent's current canonical
+// unassigned pool work that is still routed to a legacy form of a configured
+// pool agent — the bound form of a now-unbound agent ("dir/binding.name") or
+// the rig-path form minted before NormalizeAgentRigDirs
+// ("<abs rig path>/name", dec-a5ar) — onto the agent's current canonical
 // identity ("dir/name").
 //
 // This closes the demand/claim half of the bound→unbound migration that the
@@ -4584,12 +4586,13 @@ func canonicalizeLegacyBoundUnassignedRoutedWork(cfg *config.City, workBeads []b
 		if routedTo == "" {
 			continue
 		}
-		// Cheap pre-filter: a legacy bound form is "dir/binding.name", so only a
-		// route whose local segment carries the binding-separator dot can be one.
-		// Canonical unbound routes ("dir/name") skip the per-bead agent scan in
-		// normalizeAgentTemplateIdentity, keeping the steady-state cost off the
-		// full open-routed backlog.
-		if _, local := config.ParseQualifiedName(routedTo); !strings.Contains(local, ".") {
+		// Cheap pre-filter: a legacy bound form is "dir/binding.name" (local
+		// segment carries the binding-separator dot) and a legacy rig-path form
+		// is "<abs rig path>/name" (dir segment is absolute, minted before
+		// NormalizeAgentRigDirs — dec-a5ar). Canonical routes ("dir/name")
+		// skip the per-bead agent scan in normalizeAgentTemplateIdentity,
+		// keeping the steady-state cost off the full open-routed backlog.
+		if dir, local := config.ParseQualifiedName(routedTo); !strings.Contains(local, ".") && !filepath.IsAbs(dir) {
 			continue
 		}
 		canonicalRouted := normalizeAgentTemplateIdentity(cfg, routedTo)
