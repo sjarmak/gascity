@@ -30,10 +30,27 @@ SESSION_TMP=$(mktemp) || {
 }
 trap 'rm -f "$TMP" "$SESSION_TMP"' EXIT
 
-RIG_NAMES=""
-RIG_LIST=$(gc rig list --json 2>/dev/null) || RIG_LIST=""
-if [ -n "$RIG_LIST" ]; then
-    RIG_NAMES=$(echo "$RIG_LIST" | jq -r '.rigs[] | select(.hq == false) | .name' 2>/dev/null) || RIG_NAMES=""
+if ! RIG_LIST=$(gc rig list --json 2>/dev/null); then
+    echo "orphan-sweep: unable to discover rigs; skipping cycle" >&2
+    exit 0
+fi
+if ! RIG_NAMES=$(printf '%s\n' "$RIG_LIST" | jq -er '
+    if (
+        type == "object"
+        and (.rigs | type == "array")
+        and all(.rigs[];
+            type == "object"
+            and (.name | type == "string" and length > 0)
+            and (.hq | type == "boolean")
+        )
+    ) then
+        [.rigs[] | select(.hq == false) | .name] | join("\n")
+    else
+        error("invalid rig list envelope")
+    end
+' 2>/dev/null); then
+    echo "orphan-sweep: unable to discover rigs; skipping cycle" >&2
+    exit 0
 fi
 
 append_session_list() {
@@ -42,14 +59,22 @@ append_session_list() {
     if "$@" >"$session_fetch_tmp" 2>/dev/null \
         && jq -e '
             type == "object"
-            and .schema_version == "1"
             and (.sessions | type == "array")
-            and (.summary | type == "object")
-            and (.filters | type == "object")
+            and (
+                (
+                    .schema_version == "1"
+                    and (.summary | type == "object")
+                    and (.filters | type == "object")
+                )
+                or (._cache_age_s | type == "number")
+            )
             and all(.sessions[];
                 type == "object"
                 and ((.id // .ID // "") | type == "string" and length > 0)
-                and ((if has("closed") then .closed elif has("Closed") then .Closed else null end) | type == "boolean")
+                and (
+                    ((if has("closed") then .closed elif has("Closed") then .Closed else null end) | type == "boolean")
+                    or ((.state // .State // null) | type == "string")
+                )
             )
         ' "$session_fetch_tmp" >/dev/null 2>&1; then
         cat "$session_fetch_tmp" >>"$SESSION_TMP"
@@ -211,7 +236,7 @@ session_bead_candidates() {
         printf 'mc-%s\n' "${assignee##*-mc-}"
     fi
 
-    if [[ "$assignee" =~ -gc-([0-9]+)$ ]]; then
+    if [[ "$assignee" =~ -gc-([[:alnum:]]+)$ ]]; then
         printf 'gc-%s\n' "${BASH_REMATCH[1]}"
     fi
 

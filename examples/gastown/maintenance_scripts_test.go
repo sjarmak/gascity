@@ -332,7 +332,7 @@ exit 1
 	}
 }
 
-func TestOrphanSweepPreservesPoolAssignmentsWhenSessionListIsPartial(t *testing.T) {
+func TestOrphanSweepPreservesAlphanumericPoolAssignmentsWhenSessionListIsPartial(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
 	gcLog := filepath.Join(t.TempDir(), "gc.log")
@@ -362,18 +362,18 @@ case "$1" in
     if [ "$2" = "list" ]; then
       cat <<'EOF'
 [
-  {"id":"gc-review-root","status":"in_progress","assignee":"polecat-gc-625720"},
-  {"id":"gc-review-step","status":"in_progress","assignee":"polecat-gc-625720"}
+  {"id":"gc-review-root","status":"in_progress","assignee":"polecat-gc-q9j0om"},
+  {"id":"gc-review-step","status":"in_progress","assignee":"polecat-gc-q9j0om"}
 ]
 EOF
       exit 0
     fi
     if [ "$2" = "show" ] && { [ "$3" = "gc-review-root" ] || [ "$3" = "gc-review-step" ]; }; then
-      printf '[{"id":"%s","status":"in_progress","assignee":"polecat-gc-625720"}]\n' "$3"
+      printf '[{"id":"%s","status":"in_progress","assignee":"polecat-gc-q9j0om"}]\n' "$3"
       exit 0
     fi
-    if [ "$2" = "show" ] && [ "$3" = "gc-625720" ] && [ "$4" = "--json" ]; then
-      printf '[{"id":"gc-625720","status":"open","issue_type":"session","metadata":{"state":"active","session_name":"polecat-gc-625720"}}]\n'
+    if [ "$2" = "show" ] && [ "$3" = "gc-q9j0om" ] && [ "$4" = "--json" ]; then
+      printf '[{"id":"gc-q9j0om","status":"open","issue_type":"session","metadata":{"state":"active","session_name":"polecat-gc-q9j0om"}}]\n'
       exit 0
     fi
     if [ "$2" = "release-if-current" ]; then
@@ -403,7 +403,7 @@ exit 1
 	if strings.Contains(string(logData), "bd release-if-current ") {
 		t.Fatalf("partial session liveness released live root or step:\n%s", logData)
 	}
-	if got := strings.Count(string(logData), "bd show gc-625720 --json"); got != 2 {
+	if got := strings.Count(string(logData), "bd show gc-q9j0om --json"); got != 2 {
 		t.Fatalf("live session bead probe count = %d, want 2:\n%s", got, logData)
 	}
 
@@ -424,7 +424,7 @@ exit 1
 	}
 }
 
-func TestOrphanSweepReleasesDeadPoolAssignmentAfterCompleteLivenessRead(t *testing.T) {
+func TestOrphanSweepReleasesDeadPoolAssignmentWithAPISessionEnvelope(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
 	gcLog := filepath.Join(t.TempDir(), "gc.log")
@@ -446,7 +446,7 @@ case "$1" in
     ;;
   session)
     if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
-      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+      printf '{"_cache_age_s":0,"sessions":[]}\n'
       exit 0
     fi
     ;;
@@ -494,6 +494,72 @@ exit 1
 		if !strings.Contains(log, want) {
 			t.Fatalf("missing required gc call %q:\n%s", want, log)
 		}
+	}
+}
+
+func TestOrphanSweepReleasesNothingWhenRigDiscoveryFails(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      printf 'Agent: project/worker\n  source: pack\n'
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      exit 1
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "list" ]; then
+      printf '[{"id":"ga-hq-orphan","status":"in_progress","assignee":"missing-hq-session"}]\n'
+      exit 0
+    fi
+    if [ "$2" = "show" ] && [ "$3" = "ga-hq-orphan" ] && [ "$4" = "--json" ]; then
+      printf '[{"id":"ga-hq-orphan","status":"in_progress","assignee":"missing-hq-session"}]\n'
+      exit 0
+    fi
+    if [ "$2" = "release-if-current" ]; then
+      printf 'released\n'
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+
+	env := map[string]string{
+		"GC_CITY":      cityDir,
+		"GC_CITY_PATH": cityDir,
+		"GC_CALL_LOG":  gcLog,
+		"PATH":         binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+	out, err := runScriptResult(t, coreScriptPath("orphan-sweep.sh"), env)
+	if err != nil {
+		t.Fatalf("orphan-sweep failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "orphan-sweep: unable to discover rigs; skipping cycle") {
+		t.Fatalf("unexpected orphan-sweep output:\n%s", out)
+	}
+
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if strings.Contains(string(logData), "bd release-if-current ") {
+		t.Fatalf("failed rig discovery released work:\n%s", logData)
 	}
 }
 
@@ -1659,6 +1725,10 @@ EOF
 EOF
 	      exit 0
 	    fi
+	    if [ "$2" = "show" ] && [ "$3" = "gc-closed" ] && [ "$4" = "--json" ]; then
+	      printf '[{"id":"gc-closed","status":"closed","issue_type":"session","metadata":{"state":"closed"}}]\n'
+	      exit 0
+	    fi
 	    if [ "$2" = "release-if-current" ]; then
 	      printf 'released\n'
 	      exit 0
@@ -2163,6 +2233,14 @@ if [ "$*" = "bd show $ORPHAN_SWEEP_ORPHAN_ID --json" ]; then
 fi
 if [ "$*" = "bd show $ORPHAN_SWEEP_ORPHAN_ASSIGNEE --json" ]; then
   exit 1
+fi
+case "$ORPHAN_SWEEP_ORPHAN_ASSIGNEE" in
+  *-gc-*) orphan_session_id="gc-${ORPHAN_SWEEP_ORPHAN_ASSIGNEE##*-gc-}" ;;
+  *) orphan_session_id="" ;;
+esac
+if [ -n "$orphan_session_id" ] && [ "$*" = "bd show $orphan_session_id --json" ]; then
+  printf '[{"id":"%s","status":"closed","issue_type":"session","metadata":{"state":"closed"}}]\n' "$orphan_session_id"
+  exit 0
 fi
 printf 'UNEXPECTED: %s\n' "$*" >> "$GC_CALL_LOG"
 printf 'UNEXPECTED: %s\n' "$*" >&2
