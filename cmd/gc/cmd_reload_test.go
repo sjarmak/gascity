@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/api"
@@ -466,39 +467,37 @@ func TestHandleReloadSocketCmdBusyOnAcceptTimeout(t *testing.T) {
 }
 
 func TestHandleReloadSocketCmdWaitsForAcceptedAfterHandoff(t *testing.T) {
-	oldAccept := controllerReloadAcceptTimeout
-	controllerReloadAcceptTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { controllerReloadAcceptTimeout = oldAccept })
+	synctest.Test(t, func(t *testing.T) {
+		oldAccept := controllerReloadAcceptTimeout
+		controllerReloadAcceptTimeout = 200 * time.Millisecond
+		t.Cleanup(func() { controllerReloadAcceptTimeout = oldAccept })
 
-	server, client := net.Pipe()
-	defer client.Close() //nolint:errcheck
+		server, client := net.Pipe()
+		defer client.Close() //nolint:errcheck
 
-	reloadReqCh := make(chan reloadRequest)
-	done := make(chan struct{})
-	go func() {
-		handleReloadSocketCmd(server, `{"wait":false}`, reloadReqCh)
-		close(done)
-	}()
+		reloadReqCh := make(chan reloadRequest)
+		done := make(chan struct{})
+		go func() {
+			handleReloadSocketCmd(server, `{"wait":false}`, reloadReqCh)
+			close(done)
+		}()
 
-	time.Sleep(180 * time.Millisecond)
-	req := <-reloadReqCh
-	time.Sleep(50 * time.Millisecond)
-	req.acceptedCh <- reloadControlReply{
-		Outcome: reloadOutcomeAccepted,
-		Message: "Reload requested.",
-	}
+		time.Sleep(180 * time.Millisecond)
+		req := <-reloadReqCh
+		time.Sleep(50 * time.Millisecond)
+		req.acceptedCh <- reloadControlReply{
+			Outcome: reloadOutcomeAccepted,
+			Message: "Reload requested.",
+		}
 
-	reply := readReloadSocketReply(t, client)
-	if reply.Outcome != reloadOutcomeAccepted {
-		t.Fatalf("reply.Outcome = %q, want %q", reply.Outcome, reloadOutcomeAccepted)
-	}
+		reply := readReloadSocketReply(t, client)
+		if reply.Outcome != reloadOutcomeAccepted {
+			t.Fatalf("reply.Outcome = %q, want %q", reply.Outcome, reloadOutcomeAccepted)
+		}
 
-	client.Close() //nolint:errcheck
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("reload socket handler did not exit")
-	}
+		client.Close() //nolint:errcheck
+		<-done
+	})
 }
 
 func TestControllerReloadAcceptTimeoutDefault(t *testing.T) {
