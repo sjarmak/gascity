@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -24,7 +23,7 @@ func (h peekOnlyHandle) Peek(context.Context, int) (string, error) {
 func TestStreamSessionPeekAcceptsPeekCapability(t *testing.T) {
 	srv := New(newSessionFakeState(t))
 	info := session.Info{ID: "sess-1", Template: "probe", Provider: "claude"}
-	rec := httptest.NewRecorder()
+	rec := newSyncResponseRecorder()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -35,21 +34,21 @@ func TestStreamSessionPeekAcceptsPeekCapability(t *testing.T) {
 
 	deadline := time.Now().Add(250 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		if strings.Contains(rec.Body.String(), "hello from peek") {
-			if !strings.Contains(rec.Body.String(), `"provider":"claude"`) {
-				cancel()
-				<-done
-				t.Fatalf("stream body missing provider envelope: %s", rec.Body.String())
-			}
+		if strings.Contains(rec.BodyString(), "hello from peek") {
 			cancel()
 			<-done
+
+			body := rec.BodyString()
+			if !strings.Contains(body, `"provider":"claude"`) {
+				t.Fatalf("stream body missing provider envelope: %s", body)
+			}
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	cancel()
 	<-done
-	t.Fatalf("stream body missing peek output: %s", rec.Body.String())
+	t.Fatalf("stream body missing peek output: %s", rec.BodyString())
 }
 
 type peekPendingHandle struct {
