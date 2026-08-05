@@ -70,8 +70,12 @@ func (c *sessionModelDoctorCheck) Run(_ *doctor.CheckContext) *doctor.CheckResul
 		if session.IsSessionBeadOrRepairable(b) || b.Status == "closed" {
 			continue
 		}
+		// A message's assignee is its historical recipient, not a live work
+		// owner. Mail remains useful after the recipient session retires, and
+		// rewriting that recipient would corrupt delivery history. Route checks
+		// still apply independently if a message carries gc.routed_to.
 		assignee := strings.TrimSpace(b.Assignee)
-		if assignee != "" {
+		if b.Type != "message" && assignee != "" {
 			if owner, ok := sessionByID[assignee]; ok {
 				if owner.Status == "closed" {
 					findings = append(findings, fmt.Sprintf("closed-bead-owner: %s is assigned to closed session bead %s", b.ID, assignee))

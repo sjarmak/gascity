@@ -90,7 +90,9 @@ gc-only "heartbeat <issue-id>" subcommand, which rewrites to
 "update <issue-id> --set-metadata gc.last_heartbeat_at=<RFC3339 UTC now>"
 so long-running workers can signal liveness to the dashboard, and
 "release-if-current <issue-id> <assignee>", which conditionally resets an
-in-progress assignment only when the bead still has that assignee.
+in-progress assignment only when the bead still has that assignee, and
+"migrate-record" performs one compare-before-write file-provider migration
+with an append-only audit record.
 
 gc bd forces BD_EXPORT_AUTO=false to prevent bd's git auto-export hook
 from wedging the wrapper after printing command output. If you need
@@ -101,7 +103,9 @@ auto-export behavior, invoke bd directly.`,
   gc bd list --rig my-project -s open
   gc bd --city /path/to/city list    # pins the city (HQ) store, no rig auto-detect
   gc bd heartbeat my-project-abc     # stamp gc.last_heartbeat_at=now
-  gc bd release-if-current my-project-abc worker-1`,
+  gc bd release-if-current my-project-abc worker-1
+  gc bd migrate-record gc-abc --actor operator --reason "approved" \
+    --expect-assignee old --assignee new`,
 		DisableFlagParsing: true,
 		RunE: func(_ *cobra.Command, args []string) error {
 			// Plumb doBd's numeric exit code through exitForCode so the
@@ -241,6 +245,13 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		return doBdReleaseIfCurrent(cityPath, cfg, target, id, expectedAssignee, stdout, stderr)
+	}
+	if req, ok, err := parseBdMigrateRecordArgs(bdArgs); ok || err != nil {
+		if err != nil {
+			fmt.Fprintf(stderr, "gc bd migrate-record: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		return doBdMigrateRecord(cityPath, target, req, stdout, stderr)
 	}
 	if provider := rawBeadsProviderForScope(target.ScopeRoot, cityPath); !providerUsesBdStoreContract(provider) {
 		fmt.Fprintf(stderr, "gc bd: only supported for bd-backed beads providers (resolved %q for %s)\n", provider, target.ScopeRoot) //nolint:errcheck // best-effort stderr
