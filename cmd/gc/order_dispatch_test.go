@@ -1847,6 +1847,77 @@ func TestOrderDispatchCadenceDisablesDedicatedLoopWithoutCooldownDemand(t *testi
 	}
 }
 
+func TestOrderDispatchScanOrderBoundsFrequentCooldownGapUnderBurst(t *testing.T) {
+	const (
+		frequentOrders = 2
+		burstOrders    = 64
+	)
+	aa := make([]orders.Order, 0, frequentOrders+burstOrders)
+	for i := 0; i < frequentOrders; i++ {
+		aa = append(aa, orders.Order{
+			Name:     fmt.Sprintf("health-%d", i),
+			Trigger:  "cooldown",
+			Interval: "30s",
+		})
+	}
+	for i := 0; i < burstOrders; i++ {
+		aa = append(aa, orders.Order{
+			Name:     fmt.Sprintf("maintenance-%d", i),
+			Trigger:  "cooldown",
+			Interval: "5m",
+		})
+	}
+
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	m := &memoryOrderDispatcher{
+		aa:                   aa,
+		maxDispatchesPerTick: 5,
+		nextDispatchStart:    frequentOrders,
+		schedulerLastRun:     make(map[string]time.Time, len(aa)),
+	}
+	for _, a := range aa {
+		m.schedulerLastRun[a.ScopedName()] = base
+	}
+
+	lastFrequent := map[string]time.Time{
+		aa[0].ScopedName(): base,
+		aa[1].ScopedName(): base,
+	}
+	launchedMaintenance := make(map[string]bool)
+	for tick := 1; tick <= 48; tick++ {
+		now := base.Add(time.Duration(tick) * minOrderDispatchInterval)
+		launched := 0
+		for _, idx := range m.dispatchScanOrder(now) {
+			a := aa[idx]
+			interval, err := time.ParseDuration(a.Interval)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if now.Sub(m.schedulerLastRun[a.ScopedName()]) < interval {
+				continue
+			}
+			if a.Interval == "30s" {
+				if gap := now.Sub(lastFrequent[a.ScopedName()]); gap > 2*interval {
+					t.Fatalf("%s gap = %s, want <= %s under burst", a.ScopedName(), gap, 2*interval)
+				}
+				lastFrequent[a.ScopedName()] = now
+			} else {
+				launchedMaintenance[a.ScopedName()] = true
+			}
+			m.schedulerLastRun[a.ScopedName()] = now
+			m.nextDispatchStart = (idx + 1) % len(aa)
+			launched++
+			if launched == m.maxDispatchesPerTick {
+				break
+			}
+		}
+	}
+
+	if got := len(launchedMaintenance); got != burstOrders {
+		t.Fatalf("maintenance orders launched = %d, want %d (frequent priority must retain burst fairness)", got, burstOrders)
+	}
+}
+
 func TestOrderDispatchBudgetRotatesAcrossAlwaysDueOrders(t *testing.T) {
 	store := beads.NewMemStore()
 	var aa []orders.Order
@@ -10351,6 +10422,12 @@ func TestCarryLastRunCacheFrom(t *testing.T) {
 	}
 	if got := next.lastRunCache[orderHistoryCacheKey("order-b", keys)]; !got.Equal(older) {
 		t.Errorf("order-b = %v, want %v", got, older)
+	}
+	if got := next.schedulerLastRun["order-a"]; !got.Equal(newer) {
+		t.Errorf("scheduler order-a = %v, want newer %v (reload must preserve burst priority)", got, newer)
+	}
+	if got := next.schedulerLastRun["order-b"]; !got.Equal(older) {
+		t.Errorf("scheduler order-b = %v, want %v", got, older)
 	}
 
 	next.carryLastRunCacheFrom(&memoryOrderDispatcher{}) // empty source

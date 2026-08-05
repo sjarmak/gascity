@@ -389,6 +389,7 @@ type memoryOrderDispatcher struct {
 	cityPath             string
 	cacheMu              sync.Mutex
 	lastRunCache         map[string]time.Time
+	schedulerLastRun     map[string]time.Time
 	gateBackoffUntil     map[string]time.Time
 
 	dispatchCtx    context.Context
@@ -582,10 +583,6 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	if total == 0 {
 		return
 	}
-	start := 0
-	if m.maxDispatchesPerTick > 0 {
-		start = m.nextDispatchStart % total
-	}
 	spendDispatchBudget := func(idx int) bool {
 		budgetSpent++
 		if m.maxDispatchesPerTick > 0 {
@@ -594,8 +591,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		return m.maxDispatchesPerTick > 0 && budgetSpent >= m.maxDispatchesPerTick
 	}
 
-	for offset := 0; offset < total; offset++ {
-		idx := (start + offset) % total
+	for _, idx := range m.dispatchScanOrder(now) {
 		a := m.aa[idx]
 		// Skip orders targeting suspended rigs.
 		if m.orderRigSuspended(a) {
@@ -779,6 +775,62 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			return
 		}
 	}
+}
+
+// dispatchScanOrder ranks periodic cooldown work by how many configured
+// intervals have elapsed since its observed last run. This keeps a burst of
+// long-interval orders from carrying the rotating cursor past short-interval
+// health work for an entire order-set traversal. Orders with equal urgency,
+// including never-observed and non-cooldown orders, retain the existing
+// rotating order so the bounded launch budget remains fair.
+func (m *memoryOrderDispatcher) dispatchScanOrder(now time.Time) []int {
+	total := len(m.aa)
+	if total == 0 {
+		return nil
+	}
+	start := 0
+	if m.maxDispatchesPerTick > 0 {
+		start = m.nextDispatchStart % total
+	}
+
+	type rankedOrder struct {
+		idx     int
+		urgency float64
+		rank    int
+	}
+	ranked := make([]rankedOrder, 0, total)
+	m.cacheMu.Lock()
+	for idx, a := range m.aa {
+		urgency := 1.0
+		if a.Trigger == "cooldown" {
+			interval, err := time.ParseDuration(a.Interval)
+			last, observed := m.schedulerLastRun[a.ScopedName()]
+			if err == nil && interval > 0 && observed && !last.IsZero() {
+				urgency = float64(now.Sub(last)) / float64(interval)
+				if urgency < 0 {
+					urgency = 0
+				}
+			}
+		}
+		ranked = append(ranked, rankedOrder{
+			idx:     idx,
+			urgency: urgency,
+			rank:    (idx - start + total) % total,
+		})
+	}
+	m.cacheMu.Unlock()
+
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].urgency != ranked[j].urgency {
+			return ranked[i].urgency > ranked[j].urgency
+		}
+		return ranked[i].rank < ranked[j].rank
+	})
+	indexes := make([]int, len(ranked))
+	for i := range ranked {
+		indexes[i] = ranked[i].idx
+	}
+	return indexes
 }
 
 // launchDispatchOne spawns dispatchOne with a context that cancels when
@@ -1146,6 +1198,14 @@ func (m *memoryOrderDispatcher) rememberLastRun(orderName string, storeKeys []st
 	if existing, ok := m.lastRunCache[key]; !ok || existing.IsZero() || last.After(existing) {
 		m.lastRunCache[key] = last
 	}
+	if !last.IsZero() {
+		if m.schedulerLastRun == nil {
+			m.schedulerLastRun = make(map[string]time.Time)
+		}
+		if existing, ok := m.schedulerLastRun[orderName]; !ok || existing.IsZero() || last.After(existing) {
+			m.schedulerLastRun[orderName] = last
+		}
+	}
 }
 
 // carryLastRunCacheFrom copies warm last-run entries from a previous
@@ -1171,6 +1231,16 @@ func (m *memoryOrderDispatcher) carryLastRunCacheFrom(prev *memoryOrderDispatche
 	for key, last := range prev.lastRunCache {
 		if existing, ok := m.lastRunCache[key]; !ok || last.After(existing) {
 			m.lastRunCache[key] = last
+		}
+	}
+	if len(prev.schedulerLastRun) > 0 {
+		if m.schedulerLastRun == nil {
+			m.schedulerLastRun = make(map[string]time.Time, len(prev.schedulerLastRun))
+		}
+		for orderName, last := range prev.schedulerLastRun {
+			if existing, ok := m.schedulerLastRun[orderName]; !ok || last.After(existing) {
+				m.schedulerLastRun[orderName] = last
+			}
 		}
 	}
 }
