@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
@@ -295,6 +296,82 @@ func TestResolveActiveWispStep_AttachedMoleculeIDBridge(t *testing.T) {
 	}
 }
 
+func TestResolveActiveWispStep_AttachedMoleculeIDBridgeHonorsReadiness(t *testing.T) {
+	createdAt := time.Date(2026, time.August, 3, 16, 7, 27, 0, time.UTC)
+	const (
+		rootID       = "gc-root"
+		sourceID     = "gc-source"
+		intakeID     = "gc-z-intake"
+		downstreamID = "gc-a-downstream"
+	)
+	store := beads.NewMemStoreFrom(4, []beads.Bead{
+		{
+			ID:        rootID,
+			Title:     "Formula: mol-attached-work",
+			Type:      "molecule",
+			Status:    "in_progress",
+			CreatedAt: createdAt,
+			UpdatedAt: createdAt,
+		},
+		{
+			ID:          sourceID,
+			Title:       "Source work bead",
+			Description: "Do the attached work",
+			Type:        "task",
+			Status:      "in_progress",
+			Assignee:    "alice",
+			CreatedAt:   createdAt,
+			UpdatedAt:   createdAt,
+			Metadata: map[string]string{
+				beadmeta.MoleculeIDMetadataKey: rootID,
+			},
+		},
+		{
+			ID:          intakeID,
+			Title:       "Step 1: intake",
+			Description: "Read the work request",
+			Type:        "step",
+			Status:      "open",
+			ParentID:    rootID,
+			CreatedAt:   createdAt,
+			UpdatedAt:   createdAt,
+		},
+		{
+			ID:          downstreamID,
+			Title:       "Step 2: review",
+			Description: "Review the implementation",
+			Type:        "step",
+			Status:      "open",
+			ParentID:    rootID,
+			CreatedAt:   createdAt,
+			UpdatedAt:   createdAt,
+		},
+	}, []beads.Dep{{
+		IssueID:     downstreamID,
+		DependsOnID: intakeID,
+		Type:        "blocks",
+	}})
+
+	got, err := resolveActiveWispStep(store, []string{"alice"})
+	if err != nil {
+		t.Fatalf("resolve before intake closes: %v", err)
+	}
+	if got == nil || got.ID != intakeID {
+		t.Fatalf("resolve before intake closes = %+v, want ready intake %s", got, intakeID)
+	}
+
+	if err := store.Close(intakeID); err != nil {
+		t.Fatalf("Close(%s): %v", intakeID, err)
+	}
+	got, err = resolveActiveWispStep(store, []string{"alice"})
+	if err != nil {
+		t.Fatalf("resolve after intake closes: %v", err)
+	}
+	if got == nil || got.ID != downstreamID {
+		t.Fatalf("resolve after intake closes = %+v, want newly ready downstream %s", got, downstreamID)
+	}
+}
+
 func TestFormatWispStepReminder_ContainsKeyContent(t *testing.T) {
 	b := &beads.Bead{
 		ID:          "gcy-abc",
@@ -310,6 +387,20 @@ func TestFormatWispStepReminder_ContainsKeyContent(t *testing.T) {
 		if !contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestFormatWispStepReminder_IdentifiesMoleculeRoot(t *testing.T) {
+	b := &beads.Bead{
+		ID:          "gc-step",
+		Title:       "Intake",
+		Description: "Inspect the molecule",
+		ParentID:    "gc-root",
+	}
+
+	out := formatWispStepReminder(b)
+	if !contains(out, "bd mol current gc-root") {
+		t.Fatalf("output does not explain how to inspect the bridged molecule root:\n%s", out)
 	}
 }
 
