@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
@@ -270,6 +271,84 @@ func TestPhase0DoctorReportsHistoricalAliasOwner(t *testing.T) {
 	out := stdout.String() + stderr.String()
 	if !strings.Contains(out, "historical-alias-owner") {
 		t.Fatalf("doctor output missing historical-alias-owner finding:\n%s", out)
+	}
+}
+
+func TestPhase0DoctorDoesNotTreatHistoricalMessageRecipientsAsWorkOwners(t *testing.T) {
+	cityPath, store := newPhase0DoctorCityWithConfig(t, `[workspace]
+name = "test-city"
+
+[beads]
+provider = "file"
+
+[[agent]]
+name = "worker"
+start_command = "true"
+`)
+
+	closed, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "s-gc-closed",
+			"template":     "worker",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+	if err := store.Close(closed.ID); err != nil {
+		t.Fatalf("Close(%s): %v", closed.ID, err)
+	}
+
+	for _, assignee := range []string{closed.ID, "gc-missing-session", "worker"} {
+		if _, err := store.Create(beads.Bead{
+			Type:     "message",
+			Status:   "open",
+			Title:    "historical mail",
+			Assignee: assignee,
+		}); err != nil {
+			t.Fatalf("create historical message for %q: %v", assignee, err)
+		}
+	}
+
+	check := &sessionModelDoctorCheck{
+		cfg: &config.City{
+			Workspace: config.Workspace{Name: "test-city"},
+			Agents:    []config.Agent{{Name: "worker"}},
+		},
+		cityPath: cityPath,
+		newStore: func(string) (beads.Store, error) { return store, nil },
+	}
+	result := check.Run(&doctor.CheckContext{Verbose: true})
+	if result.Status != doctor.StatusOK {
+		t.Fatalf("session-model result = %#v, want historical message recipients ignored", result)
+	}
+}
+
+func TestPhase0DoctorStillChecksRoutesOnHistoricalMessages(t *testing.T) {
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Type:     "message",
+		Status:   "open",
+		Title:    "historical mail",
+		Assignee: "gc-missing-session",
+		Metadata: map[string]string{beadmeta.RoutedToMetadataKey: "missing-route"},
+	}); err != nil {
+		t.Fatalf("create historical message: %v", err)
+	}
+	check := &sessionModelDoctorCheck{
+		cfg:      &config.City{Workspace: config.Workspace{Name: "test-city"}},
+		cityPath: "/city",
+		newStore: func(string) (beads.Store, error) { return store, nil },
+	}
+	result := check.Run(&doctor.CheckContext{Verbose: true})
+	details := strings.Join(result.Details, "\n")
+	if result.Status != doctor.StatusWarning || !strings.Contains(details, "stale-routed-config") {
+		t.Fatalf("session-model result = %#v, want stale route warning", result)
+	}
+	if strings.Contains(details, "missing-bead-owner") {
+		t.Fatalf("session-model result = %#v, message recipient was treated as work owner", result)
 	}
 }
 

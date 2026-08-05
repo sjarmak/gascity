@@ -276,7 +276,9 @@ gc-only "heartbeat &lt;issue-id&gt;" subcommand, which rewrites to
 "update &lt;issue-id&gt; --set-metadata gc.last_heartbeat_at=&lt;RFC3339 UTC now&gt;"
 so long-running workers can signal liveness to the dashboard, and
 "release-if-current &lt;issue-id&gt; &lt;assignee&gt;", which conditionally resets an
-in-progress assignment only when the bead still has that assignee.
+in-progress assignment only when the bead still has that assignee, and
+"migrate-record" performs one compare-before-write file-provider migration
+with an append-only audit record.
 
 gc bd forces BD_EXPORT_AUTO=false to prevent bd's git auto-export hook
 from wedging the wrapper after printing command output. If you need
@@ -296,6 +298,8 @@ gc bd list --rig my-project -s open
 gc bd --city /path/to/city list    # pins the city (HQ) store, no rig auto-detect
 gc bd heartbeat my-project-abc     # stamp gc.last_heartbeat_at=now
 gc bd release-if-current my-project-abc worker-1
+gc bd migrate-record gc-abc --actor operator --reason "approved" \
+  --expect-assignee old --assignee new
 ```
 
 ## gc beads
