@@ -744,6 +744,19 @@ func TestEnsureBuiltinRuntimeAssetsSkipsShimForNonBdCity(t *testing.T) {
 	}
 }
 
+func TestEnsureBuiltinRuntimeAssetsWritesShimForFileCityWithInheritedBdRig(t *testing.T) {
+	city := writeMixedProviderFileCity(t)
+	t.Setenv("GC_HOME", t.TempDir())
+	builtinRuntimeReadyCache.Delete(normalizePathForCompare(city))
+
+	if err := EnsureBuiltinRuntimeAssets(city, io.Discard); err != nil {
+		t.Fatalf("EnsureBuiltinRuntimeAssets: %v", err)
+	}
+	if _, err := os.Stat(gcBeadsBdScriptPath(city)); err != nil {
+		t.Fatalf("stat mixed-provider gc-beads-bd shim: %v", err)
+	}
+}
+
 func TestEnsureBuiltinRuntimeAssetsPrunesRetiredSystemPacks(t *testing.T) {
 	city := t.TempDir()
 

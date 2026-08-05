@@ -159,7 +159,7 @@ func requiredBuiltinSources(cityPath string) map[string]string {
 func requiredBuiltinPackNames(cityPath string) []string {
 	required := []string{"core"}
 
-	if cityUsesBdStoreContract(cityPath) {
+	if cityUsesBdStoreContract(cityPath) || fileCityNeedsManagedBdAssets(cityPath) {
 		required = append(required, "bd")
 	}
 	provider := strings.TrimSpace(configuredBeadsProviderValue(cityPath))
@@ -288,7 +288,7 @@ func bundledGcBeadsBdScriptTarget() (string, error) {
 // boundary rewrites its target whenever the binary (and therefore the
 // cache location) changes. Cities on non-bd providers skip it.
 func ensureGcBeadsBdShim(cityPath string) error {
-	if !cityUsesBdStoreContract(cityPath) {
+	if !cityUsesBdStoreContract(cityPath) && !fileCityNeedsManagedBdAssets(cityPath) {
 		return nil
 	}
 	target, err := bundledGcBeadsBdScriptTarget()
@@ -305,6 +305,17 @@ exec %q "$@"
 		return err
 	}
 	return fsys.WriteFileIfContentOrModeChangedAtomic(fsys.OSFS{}, path, []byte(shim), 0o755)
+}
+
+func fileCityNeedsManagedBdAssets(cityPath string) bool {
+	if rawBeadsProvider(cityPath) != "file" {
+		return false
+	}
+	hasEvidence, err := fileCityHasManagedDoltLifecycleEvidence(cityPath)
+	// Asset readiness is the safe side of an ambiguous cheap probe. The full
+	// config/lifecycle boundary will surface the underlying error; do not also
+	// risk leaving a required managed-provider shim absent.
+	return err != nil || hasEvidence
 }
 
 // pruneRetiredSystemPacks removes the retired .gc/system/packs tree.
