@@ -243,18 +243,11 @@ func resolveInProgressStepChild(store beads.Store, moleculeID string) (*beads.Be
 	return &best, nil
 }
 
-// resolveEntryStepChild returns the first open type=step child of moleculeID.
+// resolveEntryStepChild returns the first ready type=step child of moleculeID.
 // This is the deterministic fallback when no step is in-progress: the formula's
-// entry position — where execution should (re)start.
+// next dependency-ready execution position.
 func resolveEntryStepChild(store beads.Store, moleculeID string) (*beads.Bead, error) {
-	results, err := store.List(beads.ListQuery{
-		Status:   "open",
-		Type:     "step",
-		ParentID: moleculeID,
-		TierMode: beads.TierBoth,
-		Limit:    1,
-		Sort:     beads.SortCreatedAsc,
-	})
+	results, err := beads.ReadyDirectChildren(store, moleculeID, "step", beads.TierBoth)
 	if err != nil {
 		return nil, fmt.Errorf("resolving entry step for molecule %s: %w", moleculeID, err)
 	}
@@ -292,8 +285,15 @@ func resolveBeadWithDescription(store beads.Store, assignees []string) (*beads.B
 func formatWispStepReminder(b *beads.Bead) string {
 	title := extmsg.SanitizeForSystemReminder(strings.TrimSpace(b.Title))
 	desc := extmsg.SanitizeForSystemReminder(strings.TrimSpace(b.Description))
+	rootHint := ""
+	if rootID := extmsg.SanitizeForSystemReminder(strings.TrimSpace(b.ParentID)); rootID != "" {
+		rootHint = fmt.Sprintf(
+			"\nFormula root: %s\nIf `bd mol current` cannot infer this attached formula, run `bd mol current %s`.\n",
+			rootID, rootID,
+		)
+	}
 	return fmt.Sprintf(
-		"<system-reminder>\nYour current active work assignment:\n\n## %s (%s)\n\n%s\n</system-reminder>\n",
-		title, b.ID, desc,
+		"<system-reminder>\nYour current active work assignment:\n\n## %s (%s)\n%s\n%s\n</system-reminder>\n",
+		title, b.ID, rootHint, desc,
 	)
 }
