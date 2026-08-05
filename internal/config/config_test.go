@@ -2547,6 +2547,42 @@ esac
 	}
 }
 
+func TestRoutedPoolQueriesAllowManagedSessionWithManualOrigin(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	bdScript := `#!/bin/sh
+set -eu
+case "$*" in
+  *"--metadata-field gc.routed_to=hello-world/worker"*)
+    printf '[{"id":"routed-root","issue_type":"task"}]'
+    ;;
+  *) printf '[]' ;;
+esac
+`
+	queries := map[string]string{
+		"full":        a.EffectiveWorkQuery(),
+		"routed-only": a.EffectiveRoutedPoolQuery(),
+	}
+	for name, query := range queries {
+		t.Run(name+"/managed", func(t *testing.T) {
+			out := runShellWithFakeBd(t, query, map[string]string{
+				"GC_SESSION_ORIGIN": "manual",
+				"GC_POOL_MANAGED":   "true",
+			}, bdScript)
+			if !strings.Contains(out, "routed-root") {
+				t.Fatalf("query output = %q, want routed work for managed pool session", out)
+			}
+		})
+		t.Run(name+"/interactive-manual", func(t *testing.T) {
+			out := runShellWithFakeBd(t, query, map[string]string{
+				"GC_SESSION_ORIGIN": "manual",
+			}, bdScript)
+			if strings.Contains(out, "routed-root") {
+				t.Fatalf("query output = %q, genuine manual session must not consume routed pool work", out)
+			}
+		})
+	}
+}
+
 func TestEffectiveWorkQueryClaimsRunTargetOnlyRootDuringMigration(t *testing.T) {
 	if _, err := exec.LookPath("jq"); err != nil {
 		t.Skip("jq not available; migration fallback filters routed_to with jq")

@@ -3241,6 +3241,12 @@ func resolveTemplateForSessionBeadInfo(
 	if err != nil {
 		return tp, err
 	}
+	if info.PoolManaged && !info.ManualSession {
+		if tp.Env == nil {
+			tp.Env = make(map[string]string)
+		}
+		tp.Env["GC_POOL_MANAGED"] = boolMetadata(true)
+	}
 	if triggerID := strings.TrimSpace(info.TriggerBeadID); triggerID != "" {
 		if tp.Env == nil {
 			tp.Env = make(map[string]string)

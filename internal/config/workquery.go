@@ -326,7 +326,7 @@ func ephemeralAssignedReadyProbeScript(shellVar string, includeEphemeralReady bo
 func poolDemandOriginGateScript() string {
 	return `case "$GC_SESSION_ORIGIN" in ` +
 		`ephemeral|"") ;; ` +
-		`*) exit 0 ;; ` +
+		`*) [ "$GC_POOL_MANAGED" = "true" ] || exit 0 ;; ` +
 		`esac; `
 }
 

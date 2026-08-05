@@ -9,6 +9,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 // Phase 0 spec coverage from engdocs/design/session-model-unification.md:
@@ -43,8 +44,59 @@ func TestPhase0RuntimeEnv_TemplateResolutionSetsOriginAndPublicHandle(t *testing
 	if got := tp.Env["GC_SESSION_ORIGIN"]; got == "" {
 		t.Fatal("GC_SESSION_ORIGIN = empty, want explicit origin")
 	}
+	if got := tp.Env["GC_POOL_MANAGED"]; got != "" {
+		t.Fatalf("GC_POOL_MANAGED = %q, want explicit empty default", got)
+	}
 	if got := tp.Env["GC_AGENT"]; got != tp.Env["GC_SESSION_NAME"] {
 		t.Fatalf("GC_AGENT = %q, want public-handle compatibility value %q", got, tp.Env["GC_SESSION_NAME"])
+	}
+}
+
+func TestPhase0RuntimeEnv_SessionRecordProjectsManagedPoolIdentity(t *testing.T) {
+	params := &agentBuildParams{
+		cityName:   "phase0-city",
+		cityPath:   t.TempDir(),
+		workspace:  &config.Workspace{Provider: "test-agent"},
+		providers:  map[string]config.ProviderSpec{"test-agent": {DisplayName: "Test Agent", Command: "true"}},
+		lookPath:   func(string) (string, error) { return filepath.Join("/usr/bin", "true"), nil },
+		fs:         fsys.OSFS{},
+		beaconTime: time.Unix(0, 0),
+		beadNames:  make(map[string]string),
+		stderr:     io.Discard,
+	}
+	agentCfg := &config.Agent{Name: "worker", Provider: "test-agent"}
+
+	for _, tc := range []struct {
+		name          string
+		info          session.Info
+		wantProjected bool
+	}{
+		{
+			name: "controller-managed pool session",
+			info: session.Info{
+				SessionNameMetadata: "worker-adhoc-managed",
+				PoolManaged:         true,
+			},
+			wantProjected: true,
+		},
+		{
+			name: "legacy interactive manual pool session",
+			info: session.Info{
+				SessionNameMetadata: "worker-adhoc-manual",
+				PoolManaged:         true,
+				ManualSession:       true,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tp, err := resolveTemplateForSessionBeadInfo(params, agentCfg, agentCfg.QualifiedName(), nil, tc.info)
+			if err != nil {
+				t.Fatalf("resolveTemplateForSessionBeadInfo: %v", err)
+			}
+			if got := tp.Env["GC_POOL_MANAGED"] == "true"; got != tc.wantProjected {
+				t.Fatalf("GC_POOL_MANAGED projected = %v, want %v (value %q)", got, tc.wantProjected, tp.Env["GC_POOL_MANAGED"])
+			}
+		})
 	}
 }
 

@@ -279,6 +279,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		"GC_SESSION_ID":       sessionBeadID,
 		"GC_TEMPLATE":         templateNameFor(cfgAgent, qualifiedName),
 		"GC_SESSION_ORIGIN":   "ephemeral",
+		"GC_POOL_MANAGED":     "",
 		"GC_AGENT":            sessName,
 		"GC_ALIAS":            qualifiedName,
 		"GC_DIR":              workDir,
