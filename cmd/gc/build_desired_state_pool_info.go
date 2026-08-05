@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/session"
 )
@@ -191,6 +192,16 @@ func reusablePoolSessionInfo(bp *agentBuildParams, cfgAgent *config.Agent, templ
 	}
 	if info.MetadataState == "asleep" {
 		return false
+	}
+	if info.PendingCreateClaim {
+		clk := &clock.Fake{Time: bp.beaconTime}
+		var startupTimeout time.Duration
+		if bp.city != nil {
+			startupTimeout = bp.city.Session.StartupTimeoutDuration()
+		}
+		if !pendingCreateLeaseActiveInfo(info, clk, startupTimeout) {
+			return false
+		}
 	}
 	if isManualSessionInfoForAgent(info, cfgAgent) {
 		return false

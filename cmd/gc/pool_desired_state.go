@@ -3,10 +3,12 @@ package main
 import (
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/agentutil"
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
@@ -114,6 +116,23 @@ func computePoolDesiredStates(
 	scaleCheckDemand map[string]scaleCheckDemand,
 	trace *sessionReconcilerTraceCycle,
 ) []PoolDesiredState {
+	return computePoolDesiredStatesAt(cfg, assignedWorkBeads, sessionInfos, scaleCheckCounts, scaleCheckDemand, trace, time.Now())
+}
+
+func computePoolDesiredStatesAt(
+	cfg *config.City,
+	assignedWorkBeads []beads.Bead,
+	sessionInfos []sessionpkg.Info,
+	scaleCheckCounts map[string]int,
+	scaleCheckDemand map[string]scaleCheckDemand,
+	trace *sessionReconcilerTraceCycle,
+	now time.Time,
+) []PoolDesiredState {
+	leaseClock := &clock.Fake{Time: now}
+	var startupTimeout time.Duration
+	if cfg != nil {
+		startupTimeout = cfg.Session.StartupTimeoutDuration()
+	}
 	// Build reverse lookup: any identifier → session bead ID.
 	// Assignee on work beads may be a bead ID, session name, alias, or
 	// a prior alias preserved in alias_history. Resume-tier dispatch
@@ -258,7 +277,7 @@ func computePoolDesiredStates(
 			resumeSessionBeadIDs[req.SessionBeadID] = struct{}{}
 		}
 	}
-	inFlightNewRequests := poolInFlightNewRequests(cfg, sessionInfos, resumeSessionBeadIDs)
+	inFlightNewRequests := poolInFlightNewRequests(cfg, sessionInfos, resumeSessionBeadIDs, leaseClock, startupTimeout)
 
 	// Merge scale_check demand. In bead-backed reconciliation, scale_check is
 	// the authoritative signal for new unassigned demand only; resume requests
@@ -383,7 +402,13 @@ func canonicalSingletonAliasHeldTemplates(cfg *config.City, sessionInfos []sessi
 	return held
 }
 
-func poolInFlightNewRequests(cfg *config.City, sessionInfos []sessionpkg.Info, resumeSessionBeadIDs map[string]struct{}) map[string][]SessionRequest {
+func poolInFlightNewRequests(
+	cfg *config.City,
+	sessionInfos []sessionpkg.Info,
+	resumeSessionBeadIDs map[string]struct{},
+	leaseClock clock.Clock,
+	startupTimeout time.Duration,
+) map[string][]SessionRequest {
 	requests := make(map[string][]SessionRequest)
 	sortedSessionInfos := append([]sessionpkg.Info(nil), sessionInfos...)
 	sort.SliceStable(sortedSessionInfos, func(i, j int) bool {
@@ -414,7 +439,7 @@ func poolInFlightNewRequests(cfg *config.City, sessionInfos []sessionpkg.Info, r
 			if normalizedSessionTemplateInfo(sb, cfg) != template {
 				continue
 			}
-			if !poolSessionConsumesNewDemandInfo(sb) {
+			if !poolSessionConsumesNewDemandInfo(sb, leaseClock, startupTimeout) {
 				continue
 			}
 			requests[template] = append(requests[template], SessionRequest{
@@ -431,14 +456,13 @@ func poolInFlightNewRequests(cfg *config.City, sessionInfos []sessionpkg.Info, r
 }
 
 // poolSessionConsumesNewDemandInfo reports whether a pool session already
-// represents spent "new" demand: it holds an active pending_create_claim, or
-// its raw state is creating/start-pending. It reads PendingCreateClaim and the
-// raw MetadataState. This pure desired-state pass has no reconciler clock:
-// creating sessions still represent already-spent new demand; lifecycle code
-// owns stale-creating recovery with its clock-aware predicate.
-func poolSessionConsumesNewDemandInfo(info sessionpkg.Info) bool {
+// represents spent "new" demand: it holds a live pending_create_claim lease,
+// or its raw state is creating/start-pending without a claim. The caller
+// supplies the desired-state pass timestamp so lease decisions are deterministic
+// and agree with reconciliation.
+func poolSessionConsumesNewDemandInfo(info sessionpkg.Info, clk clock.Clock, startupTimeout time.Duration) bool {
 	if info.PendingCreateClaim {
-		return true
+		return pendingCreateLeaseActiveInfo(info, clk, startupTimeout)
 	}
 	state := strings.TrimSpace(info.MetadataState)
 	return state == "creating" || state == string(sessionpkg.StateStartPending)

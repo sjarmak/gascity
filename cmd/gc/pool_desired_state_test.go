@@ -11,6 +11,8 @@ import (
 
 func intPtr(n int) *int { return &n }
 
+var poolDesiredStateTestNow = time.Date(2026, 5, 4, 12, 10, 0, 0, time.UTC)
+
 // TestNestedCapUsageRejectionTyped verifies that the retyped rejection producer
 // returns the typed site/reason constants for each cap kind, and that the
 // underlying string values are byte-identical to the pre-S26b literals.
@@ -98,11 +100,11 @@ func sessionBead(id, status string) beads.Bead {
 }
 
 func pendingPoolSessionBead(id string) beads.Bead {
-	return poolSessionBeadWithState(id, "creating", boolMetadata(true))
+	return pendingPoolSessionBeadAt(id, poolDesiredStateTestNow.Add(-time.Minute))
 }
 
 func pendingPoolSessionBeadAt(id string, createdAt time.Time) beads.Bead {
-	session := pendingPoolSessionBead(id)
+	session := poolSessionBeadWithState(id, "creating", boolMetadata(true))
 	session.CreatedAt = createdAt
 	return session
 }
@@ -110,10 +112,11 @@ func pendingPoolSessionBeadAt(id string, createdAt time.Time) beads.Bead {
 func poolSessionBeadWithState(id, state, pendingCreateClaim string) beads.Bead {
 	const template = "claude"
 	return beads.Bead{
-		ID:     id,
-		Status: "open",
-		Type:   sessionBeadType,
-		Labels: []string{sessionBeadLabel, "template:" + template},
+		ID:        id,
+		Status:    "open",
+		Type:      sessionBeadType,
+		Labels:    []string{sessionBeadLabel, "template:" + template},
+		CreatedAt: poolDesiredStateTestNow.Add(-time.Minute),
 		Metadata: map[string]string{
 			"template":             template,
 			"session_name":         PoolSessionName(template, id),
@@ -1218,7 +1221,7 @@ func TestComputePoolDesiredStates_InFlightNewSessionsConsumeScaleDemand(t *testi
 	}
 	scaleCheck := map[string]int{"claude": 3}
 
-	result := ComputePoolDesiredStates(cfg, nil, sessionInfosFromBeads(sessions), scaleCheck)
+	result := computePoolDesiredStatesAt(cfg, nil, sessionInfosFromBeads(sessions), scaleCheck, nil, nil, poolDesiredStateTestNow)
 
 	counts := PoolDesiredCounts(result)
 	if counts["claude"] != 3 {
@@ -1250,7 +1253,7 @@ func TestComputePoolDesiredStates_InFlightNewSessionsDoNotCreateZeroDemand(t *te
 	}
 	scaleCheck := map[string]int{"claude": 0}
 
-	result := ComputePoolDesiredStates(cfg, nil, sessionInfosFromBeads(sessions), scaleCheck)
+	result := computePoolDesiredStatesAt(cfg, nil, sessionInfosFromBeads(sessions), scaleCheck, nil, nil, poolDesiredStateTestNow)
 
 	counts := PoolDesiredCounts(result)
 	if counts["claude"] != 0 {
@@ -1268,7 +1271,7 @@ func TestComputePoolDesiredStates_InFlightNewSessionsOnlySubtractCoveredDemand(t
 	}
 	scaleCheck := map[string]int{"claude": 5}
 
-	result := ComputePoolDesiredStates(cfg, nil, sessionInfosFromBeads(sessions), scaleCheck)
+	result := computePoolDesiredStatesAt(cfg, nil, sessionInfosFromBeads(sessions), scaleCheck, nil, nil, poolDesiredStateTestNow)
 
 	if len(result) != 1 {
 		t.Fatalf("len(result) = %d, want 1", len(result))
@@ -1299,6 +1302,48 @@ func TestComputePoolDesiredStates_InFlightNewSessionsOnlySubtractCoveredDemand(t
 	}
 }
 
+func TestComputePoolDesiredStates_PendingCreateLeaseHonorsTimeoutAndFloor(t *testing.T) {
+	now := poolDesiredStateTestNow
+	cfg := &config.City{
+		Agents:  []config.Agent{poolAgent("claude", "", intPtr(4), 2)},
+		Session: config.SessionConfig{StartupTimeout: "5m"},
+	}
+	expired := pendingPoolSessionBeadAt("expired", now.Add(-11*time.Minute))
+	expired.Metadata["pending_create_started_at"] = expired.CreatedAt.Format(time.RFC3339)
+	live := pendingPoolSessionBeadAt("live", now.Add(-11*time.Minute))
+	live.Metadata["pending_create_started_at"] = live.CreatedAt.Format(time.RFC3339)
+	live.Metadata["last_woke_at"] = now.Add(-90 * time.Second).Format(time.RFC3339)
+
+	for _, tc := range []struct {
+		name        string
+		session     beads.Bead
+		wantID      string
+		forbiddenID string
+	}{{"expired claim gets replacement", expired, "", expired.ID}, {"live long startup is retained", live, live.ID, ""}} {
+		t.Run(tc.name, func(t *testing.T) {
+			infos := sessionInfosFromBeads([]beads.Bead{tc.session})
+			if tc.forbiddenID != "" && reusablePoolSessionInfo(&agentBuildParams{city: cfg, beaconTime: now}, &cfg.Agents[0], "claude", infos[0], nil) {
+				t.Fatal("expired pending create was eligible for reuse")
+			}
+			result := computePoolDesiredStatesAt(cfg, nil, infos, map[string]int{"claude": 2}, nil, nil, now)
+			if len(result) != 1 || len(result[0].Requests) != 2 {
+				t.Fatalf("result = %#v, want exactly two floor requests", result)
+			}
+			for _, req := range result[0].Requests {
+				if req.SessionBeadID == tc.forbiddenID {
+					t.Fatalf("expired session retained: %#v", result[0].Requests)
+				}
+				if tc.wantID != "" && req.SessionBeadID == tc.wantID {
+					return
+				}
+			}
+			if tc.wantID != "" {
+				t.Fatalf("live session missing: %#v", result[0].Requests)
+			}
+		})
+	}
+}
+
 func TestComputePoolDesiredStates_InFlightResumeBeadsDoNotConsumeNewDemand(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{poolAgent("claude", "", intPtr(10), 0)},
@@ -1312,7 +1357,7 @@ func TestComputePoolDesiredStates_InFlightResumeBeadsDoNotConsumeNewDemand(t *te
 	}
 	scaleCheck := map[string]int{"claude": 3}
 
-	result := ComputePoolDesiredStates(cfg, work, sessionInfosFromBeads(sessions), scaleCheck)
+	result := computePoolDesiredStatesAt(cfg, work, sessionInfosFromBeads(sessions), scaleCheck, nil, nil, poolDesiredStateTestNow)
 
 	if len(result) != 1 {
 		t.Fatalf("len(result) = %d, want 1", len(result))
@@ -1429,7 +1474,7 @@ func TestComputePoolDesiredStates_InFlightPredicateBranches(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := ComputePoolDesiredStates(cfg, nil, sessionInfosFromBeads([]beads.Bead{tt.session}), map[string]int{"claude": 1})
+			result := computePoolDesiredStatesAt(cfg, nil, sessionInfosFromBeads([]beads.Bead{tt.session}), map[string]int{"claude": 1}, nil, nil, poolDesiredStateTestNow)
 
 			if len(result) != 1 || len(result[0].Requests) != 1 {
 				t.Fatalf("result = %#v, want one in-flight request", result)
@@ -1470,7 +1515,7 @@ func TestComputePoolDesiredStates_InFlightSelectionRespectsCapsInStableOrder(t *
 		pendingPoolSessionBeadAt("sess-tie-a", base.Add(2*time.Minute)),
 	}
 
-	result := ComputePoolDesiredStates(cfg, nil, sessionInfosFromBeads(sessions), map[string]int{"claude": 10})
+	result := computePoolDesiredStatesAt(cfg, nil, sessionInfosFromBeads(sessions), map[string]int{"claude": 10}, nil, nil, poolDesiredStateTestNow)
 
 	if len(result) != 1 {
 		t.Fatalf("len(result) = %d, want 1", len(result))
@@ -1497,7 +1542,7 @@ func TestComputePoolDesiredStates_InFlightDemandRecordsTrace(t *testing.T) {
 	}
 	trace := newPoolDesiredStateTestTrace("claude")
 
-	result := computePoolDesiredStates(cfg, nil, sessionInfosFromBeads(sessions), map[string]int{"claude": 5}, nil, trace)
+	result := computePoolDesiredStatesAt(cfg, nil, sessionInfosFromBeads(sessions), map[string]int{"claude": 5}, nil, trace, poolDesiredStateTestNow)
 
 	if len(result) != 1 || len(result[0].Requests) != 5 {
 		t.Fatalf("result = %#v, want five desired requests", result)
@@ -1530,7 +1575,7 @@ func TestComputePoolDesiredStates_InFlightDemandRecordsTraceWhenCapsSuppressReus
 	}
 	trace := newPoolDesiredStateTestTrace("claude")
 
-	result := computePoolDesiredStates(cfg, nil, sessionInfosFromBeads(sessions), map[string]int{"claude": 5}, nil, trace)
+	result := computePoolDesiredStatesAt(cfg, nil, sessionInfosFromBeads(sessions), map[string]int{"claude": 5}, nil, trace, poolDesiredStateTestNow)
 
 	if len(result) != 0 {
 		t.Fatalf("result = %#v, want no desired requests when workspace cap is exhausted", result)

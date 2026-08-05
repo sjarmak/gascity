@@ -16,6 +16,7 @@ import (
 	"github.com/gastownhall/gascity/internal/agentutil"
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/hooks"
@@ -843,7 +844,7 @@ func buildDesiredStateWithSessionBeads(
 		bp.assignedWorkBeads = poolWorkBeads
 		bp.poolScaleCheckPartialTemplates = poolScaleCheckPartialTemplates
 		bp.providerHealthSnapshot = loadProviderHealthSnapshot(cityPath)
-		poolDesiredStates := ComputePoolDesiredStatesWithDemandTraced(cfg, poolWorkBeads, sessionBeads.OpenInfos(), scaleCheckCounts, scaleCheckDemandByTemplate, trace)
+		poolDesiredStates := computePoolDesiredStatesAt(cfg, poolWorkBeads, sessionBeads.OpenInfos(), scaleCheckCounts, scaleCheckDemandByTemplate, trace, beaconTime)
 		bp.configurePoolSessionCreateFairShare(poolDesiredStates)
 		for _, poolState := range poolDesiredStates {
 			cfgAgent := findAgentByTemplate(cfg, poolState.Template)
@@ -1898,17 +1899,26 @@ func sortedBoolMapKeys(values map[string]bool) []string {
 }
 
 func retainScaleCheckPartialPoolDesired(cfg *config.City, counts map[string]int, sessionBeads *sessionBeadSnapshot, partialTemplates map[string]bool) map[string]int {
+	return retainScaleCheckPartialPoolDesiredAt(cfg, counts, sessionBeads, partialTemplates, time.Now())
+}
+
+func retainScaleCheckPartialPoolDesiredAt(cfg *config.City, counts map[string]int, sessionBeads *sessionBeadSnapshot, partialTemplates map[string]bool, now time.Time) map[string]int {
 	if len(partialTemplates) == 0 || sessionBeads == nil {
 		return counts
 	}
 	retained := make(map[string]int)
+	leaseClock := &clock.Fake{Time: now}
+	var startupTimeout time.Duration
+	if cfg != nil {
+		startupTimeout = cfg.Session.StartupTimeoutDuration()
+	}
 	for _, info := range sessionBeads.OpenInfos() {
 		// Adopted session beads can persist a legacy bound template identity;
 		// normalize to the current canonical name before the membership check,
 		// because partialTemplates is keyed canonically. Without this a transient
 		// scale_check partial failure would drop legacy-bound pool sessions.
 		template := normalizeAgentTemplateIdentity(cfg, strings.TrimSpace(info.Template))
-		if !partialTemplates[template] || !isPoolManagedSessionInfo(info) || !scaleCheckPartialSessionRetainableInfo(info) {
+		if !partialTemplates[template] || !isPoolManagedSessionInfo(info) || !scaleCheckPartialSessionRetainableInfo(info, leaseClock, startupTimeout) {
 			continue
 		}
 		retained[template]++
@@ -1934,12 +1944,12 @@ func retainScaleCheckPartialPoolDesired(cfg *config.City, counts map[string]int,
 // interrupt an in-progress drain lifecycle. It reads the raw state metadata
 // (Info.MetadataState) and delegates the in-flight-create default case to
 // isPendingPoolCreateInfo.
-func scaleCheckPartialSessionPreservableInfo(i session.Info) bool {
+func scaleCheckPartialSessionPreservableInfo(i session.Info, clk clock.Clock, startupTimeout time.Duration) bool {
 	switch strings.TrimSpace(i.MetadataState) {
 	case "", "active", "awake", "start-pending", "creating", "asleep", "stopped", "suspended", "quarantined":
 		return true
 	default:
-		return isPendingPoolCreateInfo(i)
+		return isPendingPoolCreateInfo(i, clk, startupTimeout)
 	}
 }
 
@@ -1950,12 +1960,12 @@ func scaleCheckPartialSessionPreservableInfo(i session.Info) bool {
 // they stop inflating the desired count. It reads the raw state metadata
 // (Info.MetadataState) and delegates the in-flight-create case to
 // isPendingPoolCreateInfo.
-func scaleCheckPartialSessionRetainableInfo(i session.Info) bool {
+func scaleCheckPartialSessionRetainableInfo(i session.Info, clk clock.Clock, startupTimeout time.Duration) bool {
 	switch strings.TrimSpace(i.MetadataState) {
 	case "active", "awake":
 		return true
 	default:
-		return isPendingPoolCreateInfo(i)
+		return isPendingPoolCreateInfo(i, clk, startupTimeout)
 	}
 }
 
@@ -2450,6 +2460,8 @@ func discoverSessionBeadsWithRoots(
 	if sessionBeads == nil {
 		return nil
 	}
+	leaseClock := &clock.Fake{Time: bp.beaconTime}
+	startupTimeout := cfg.Session.StartupTimeoutDuration()
 	roots := make(map[string]bool)
 	for _, info := range sessionBeads.OpenInfos() {
 		if info.Closed {
@@ -2476,7 +2488,7 @@ func discoverSessionBeadsWithRoots(
 		}
 		poolScaleCheckPartial := poolScaleCheckPartialTemplates[template]
 		namedScaleCheckPartial := namedScaleCheckPartialTemplates[template] && isNamedSessionInfo(info)
-		scaleCheckPartial := scaleCheckPartialSessionPreservableInfo(info) && (poolScaleCheckPartial || namedScaleCheckPartial)
+		scaleCheckPartial := scaleCheckPartialSessionPreservableInfo(info, leaseClock, startupTimeout) && (poolScaleCheckPartial || namedScaleCheckPartial)
 		// Find the config agent for this template.
 		cfgAgent := findAgentByTemplate(cfg, template)
 		if cfgAgent == nil {
@@ -2505,7 +2517,7 @@ func discoverSessionBeadsWithRoots(
 		if isEphemeralSessionInfoForAgent(info, cfgAgent) {
 			manualSession := isManualSessionInfoForAgent(info, cfgAgent)
 			creating := info.MetadataState == "creating" || info.MetadataState == string(session.StateStartPending)
-			pendingCreate := isPendingPoolCreateInfo(info)
+			pendingCreate := isPendingPoolCreateInfo(info, leaseClock, startupTimeout)
 			templateDesired := desiredHasTemplate(desired, template)
 			// Pool-managed beads are controller-created capacity. A pending
 			// or creating bead that the pool pass did not select is stale
@@ -2526,12 +2538,20 @@ func discoverSessionBeadsWithRoots(
 			// roll back even during a partial tick. For all other states (active, awake,
 			// asleep, stopped, …) the broad preservable rule applies unchanged.
 			poolPartialAlive := (poolScaleCheckPartial || namedScaleCheckPartial) &&
-				(isPendingPoolCreateInfo(info) || (!creating && scaleCheckPartialSessionPreservableInfo(info)))
+				(isPendingPoolCreateInfo(info, leaseClock, startupTimeout) || (!creating && scaleCheckPartialSessionPreservableInfo(info, leaseClock, startupTimeout)))
 			if controllerManagedPool && !manualSession && !isNamedSessionInfo(info) &&
 				!sessionAlreadyDesired && !templateDesired && !poolPartialAlive {
 				continue
 			}
-			if !manualSession && (!creating || isStaleCreatingInfo(info)) && !templateDesired && !pendingCreate && !scaleCheckPartial {
+			// Only an expired pending-create claim is removed independently of
+			// template demand. A stale creating session that never held a claim
+			// keeps the pre-existing templateDesired behavior until lifecycle
+			// recovery closes it.
+			if controllerManagedPool && !manualSession && !isNamedSessionInfo(info) &&
+				!sessionAlreadyDesired && creating && info.PendingCreateClaim && !pendingCreate && !scaleCheckPartial {
+				continue
+			}
+			if !manualSession && (!creating || isStaleCreatingInfo(info)) && !templateDesired && !info.PendingCreateClaim && !scaleCheckPartial {
 				continue
 			}
 		}
@@ -2610,8 +2630,9 @@ func discoverSessionBeadsWithRoots(
 
 // isPendingPoolCreateInfo reports whether a pool-managed session is an in-flight
 // create still holding an active pending_create_claim lease.
-func isPendingPoolCreateInfo(i session.Info) bool {
-	return isPoolManagedSessionInfo(i) && i.PendingCreateClaim
+func isPendingPoolCreateInfo(i session.Info, clk clock.Clock, startupTimeout time.Duration) bool {
+	return isPoolManagedSessionInfo(i) && i.PendingCreateClaim &&
+		pendingCreateLeaseActiveInfo(i, clk, startupTimeout)
 }
 
 func realizeDependencyFloors(

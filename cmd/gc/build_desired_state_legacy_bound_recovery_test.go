@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
@@ -426,6 +427,7 @@ func TestRetainScaleCheckPartialPoolDesiredNormalizesLegacyBoundTemplate(t *test
 // that removes "start-pending" and "creating" from the explicit case list,
 // in-flight creates with an active lease still count as retained capacity.
 func TestRetainScaleCheckPartialPoolDesired_InFlightCreatingBeadRetained(t *testing.T) {
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
 		Agents: []config.Agent{{
@@ -440,7 +442,7 @@ func TestRetainScaleCheckPartialPoolDesired_InFlightCreatingBeadRetained(t *test
 
 	// In-flight create: pending_create_claim=true (active lease) → must be retained.
 	inFlightBead := beads.Bead{
-		ID: "creating-inflight", Type: sessionBeadType, Status: "open",
+		ID: "creating-inflight", Type: sessionBeadType, Status: "open", CreatedAt: now.Add(-time.Minute),
 		Metadata: map[string]string{
 			"template":             template,
 			"session_name":         "worker-1",
@@ -450,7 +452,7 @@ func TestRetainScaleCheckPartialPoolDesired_InFlightCreatingBeadRetained(t *test
 		},
 	}
 	snapshot := newSessionBeadSnapshot([]beads.Bead{inFlightBead})
-	got := retainScaleCheckPartialPoolDesired(cfg, nil, snapshot, partial)
+	got := retainScaleCheckPartialPoolDesiredAt(cfg, nil, snapshot, partial, now)
 	if got[template] < 1 {
 		t.Fatalf("in-flight creating bead not retained: retained[worker]=%d, want >= 1", got[template])
 	}
@@ -466,7 +468,7 @@ func TestRetainScaleCheckPartialPoolDesired_InFlightCreatingBeadRetained(t *test
 		},
 	}
 	staleSnapshot := newSessionBeadSnapshot([]beads.Bead{staleBead})
-	staleGot := retainScaleCheckPartialPoolDesired(cfg, nil, staleSnapshot, partial)
+	staleGot := retainScaleCheckPartialPoolDesiredAt(cfg, nil, staleSnapshot, partial, now)
 	if staleGot[template] != 0 {
 		t.Fatalf("stale creating bead incorrectly retained: retained[worker]=%d, want 0", staleGot[template])
 	}
