@@ -176,6 +176,7 @@ func TestManagedDoltOpsCheckDiscoversRigMetadataOnConfigError(t *testing.T) {
 
 func TestDoDoctorRunsCityDoltCheckForInheritedBdRigUnderFileBackedCity(t *testing.T) {
 	cityDir := t.TempDir()
+	cleanupManagedDoltTestCity(t, cityDir)
 	rigDir := filepath.Join(cityDir, "frontend")
 	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
@@ -416,6 +417,7 @@ prefix = "ma"
 
 func TestDoDoctorRunsDoltTopologyForBdRigUnderFileBackedCity(t *testing.T) {
 	cityDir := t.TempDir()
+	cleanupManagedDoltTestCity(t, cityDir)
 	rigDir := filepath.Join(cityDir, "frontend")
 	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
 		t.Fatal(err)

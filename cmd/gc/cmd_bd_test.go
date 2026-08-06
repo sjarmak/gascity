@@ -1118,6 +1118,7 @@ func TestGcBdAllowsRigPassthroughForBdBackedRigUnderFileCity(t *testing.T) {
 	rigFlag = ""
 
 	cityDir := t.TempDir()
+	cleanupManagedDoltTestCity(t, cityDir)
 	rigDir := filepath.Join(cityDir, "frontend")
 	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o700); err != nil {
 		t.Fatal(err)
@@ -2410,6 +2411,7 @@ func TestDoBdReleaseIfCurrentWorksForBdStoreFallback(t *testing.T) {
 	rigFlag = ""
 
 	cityDir := t.TempDir()
+	cleanupManagedDoltTestCity(t, cityDir)
 	rigDir := filepath.Join(cityDir, "frontend")
 	if err := os.MkdirAll(rigDir, 0o755); err != nil {
 		t.Fatalf("mkdir rig: %v", err)
