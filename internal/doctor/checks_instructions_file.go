@@ -374,33 +374,31 @@ func instructionsFallbackUsable(dir, name string) bool {
 //   - If no canonical sibling is present, or expected is not a safe bare
 //     filename, it is a no-op.
 //
-// It returns linked=true only when a new symlink was created, the canonical
-// sibling's filename (empty when nothing was linkable), and any error from
-// creating the symlink. Symlink creation can fail on filesystems that do not
-// support symlinks ("where supported"); callers should treat that as a
-// best-effort warning rather than a hard failure, and must not fall back to
-// copying — copying is the drift source this function exists to prevent.
-func EnsureCanonicalInstructionsPointer(dir, expected string) (linked bool, canonical string, err error) {
+// Symlink creation can fail on filesystems that do not support symlinks
+// ("where supported"); callers should treat that as a best-effort warning
+// rather than a hard failure, and must not fall back to copying — copying is
+// the drift source this function exists to prevent.
+func EnsureCanonicalInstructionsPointer(dir, expected string) error {
 	expected, ok := safeInstructionsFilename(expected)
 	if !ok {
-		return false, "", nil
+		return nil
 	}
 	target := filepath.Join(dir, expected)
 	// Lstat, not Stat, so an existing symlink — even a dangling one — counts as
 	// user-owned state we must not clobber.
 	if _, statErr := os.Lstat(target); statErr == nil {
-		return false, "", nil
+		return nil
 	} else if !os.IsNotExist(statErr) {
-		return false, "", fmt.Errorf("inspecting %s: %w", target, statErr)
+		return fmt.Errorf("inspecting %s: %w", target, statErr)
 	}
-	canonical = firstFallback(dir, expected)
+	canonical := firstFallback(dir, expected)
 	if canonical == "" {
-		return false, "", nil
+		return nil
 	}
 	if linkErr := os.Symlink(canonical, target); linkErr != nil {
-		return false, canonical, fmt.Errorf("symlink %s -> %s: %w", expected, canonical, linkErr)
+		return fmt.Errorf("symlink %s -> %s: %w", expected, canonical, linkErr)
 	}
-	return true, canonical, nil
+	return nil
 }
 
 func safeInstructionsFilename(name string) (string, bool) {

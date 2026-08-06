@@ -343,7 +343,7 @@ func doRigAddWithResult(fs fsys.FS, cityPath, rigPath string, includes []string,
 			// copy. Best-effort: never overwrite hand-written content or an
 			// existing symlink, and never fail rig add.
 			if instr := resolveRigInstructionsFilename(pc.Cfg); instr != "" {
-				if _, _, perr := doctor.EnsureCanonicalInstructionsPointer(rigPath, instr); perr != nil {
+				if perr := doctor.EnsureCanonicalInstructionsPointer(rigPath, instr); perr != nil {
 					fmt.Fprintf(stderr, "gc rig add: warning: canonical instructions pointer: %v\n", perr) //nolint:errcheck // best-effort stderr
 				}
 			}
