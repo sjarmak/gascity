@@ -21,6 +21,7 @@ var readRotationDir = os.ReadDir
 // Filter specifies predicates for ReadFiltered. Zero values are ignored.
 type Filter struct {
 	Type     string    // match events with this Type
+	OrType   string    // also match this Type when Type is set
 	Actor    string    // match events with this Actor
 	Subject  string    // match events with this Subject
 	Since    time.Time // match events at or after this time
@@ -43,7 +44,7 @@ func matchesFilter(e Event, f Filter) bool {
 	if f.BeforeSeq > 0 && e.Seq >= f.BeforeSeq {
 		return false
 	}
-	if f.Type != "" && e.Type != f.Type {
+	if f.Type != "" && e.Type != f.Type && e.Type != f.OrType {
 		return false
 	}
 	if f.Actor != "" && e.Actor != f.Actor {
@@ -101,6 +102,41 @@ func ReadFiltered(path string, filter Filter) ([]Event, error) {
 	return result, err
 }
 
+// ReadFilteredActive reads matching events from only the active JSONL file.
+// It deliberately excludes rotated archives for callers whose durable fallback
+// already covers history and whose hot path needs only recent events.
+func ReadFilteredActive(path string, filter Filter) ([]Event, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading events: %w", err)
+	}
+	defer f.Close() //nolint:errcheck // read-only file
+
+	var result []Event
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // handle lines up to 1MB
+	for scanner.Scan() {
+		var event Event
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+			continue // skip malformed lines
+		}
+		if !matchesFilter(event, filter) {
+			continue
+		}
+		result = append(result, event)
+		if limitReached(len(result), filter) {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return result, fmt.Errorf("scanning events: %w", err)
+	}
+	return result, nil
+}
+
 type eventSeqWindow struct {
 	first uint64
 	last  uint64
@@ -145,35 +181,14 @@ func readFilteredTracked(path string, filter Filter) ([]Event, map[eventSeqWindo
 		}
 	}
 
-	f, err := os.Open(path)
+	activeFilter := filter
+	if filter.Limit > 0 {
+		activeFilter.Limit = filter.Limit - len(result)
+	}
+	active, err := ReadFilteredActive(path, activeFilter)
+	result = append(result, active...)
 	if err != nil {
-		if os.IsNotExist(err) {
-			if len(result) == 0 {
-				return nil, listed, nil
-			}
-			return result, listed, nil
-		}
-		return result, listed, fmt.Errorf("reading events: %w", err)
-	}
-	defer f.Close() //nolint:errcheck // read-only file
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // handle lines up to 1MB
-	for scanner.Scan() {
-		var e Event
-		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
-			continue // skip malformed lines
-		}
-		if !matchesFilter(e, filter) {
-			continue
-		}
-		result = append(result, e)
-		if limitReached(len(result), filter) {
-			break
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return result, listed, fmt.Errorf("scanning events: %w", err)
+		return result, listed, err
 	}
 	return result, listed, nil
 }

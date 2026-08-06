@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
@@ -291,6 +292,26 @@ func TestOrderFiringCurrent_UsesEffectiveRigSuspension(t *testing.T) {
 				t.Fatalf("status = %v, want stale error for explicitly resumed rig; details = %v", result.Status, result.Details)
 			}
 		})
+	}
+}
+
+func TestOrderFiringCurrent_ReportsUnreadableSuspensionState(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	statePath := citylayout.SuspensionStateFile(cityPath)
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+		t.Fatalf("creating suspension state dir: %v", err)
+	}
+	if err := os.WriteFile(statePath, []byte("not-json"), 0o644); err != nil {
+		t.Fatalf("writing malformed suspension state: %v", err)
+	}
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	if result.Status != StatusError {
+		t.Fatalf("status = %v, want error; msg = %s", result.Status, result.Message)
+	}
+	if !strings.Contains(result.Message, "load suspension state") {
+		t.Fatalf("message = %q, want suspension-state load diagnostic", result.Message)
 	}
 }
 
