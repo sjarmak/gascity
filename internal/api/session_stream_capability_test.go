@@ -32,23 +32,17 @@ func TestStreamSessionPeekAcceptsPeekCapability(t *testing.T) {
 		close(done)
 	}()
 
-	deadline := time.Now().Add(250 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if strings.Contains(rec.BodyString(), "hello from peek") {
-			cancel()
-			<-done
-
-			body := rec.BodyString()
-			if !strings.Contains(body, `"provider":"claude"`) {
-				t.Fatalf("stream body missing provider envelope: %s", body)
-			}
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitForRecorderSubstring(t, rec, "hello from peek", 250*time.Millisecond)
 	cancel()
 	<-done
-	t.Fatalf("stream body missing peek output: %s", rec.BodyString())
+
+	body := rec.BodyString()
+	if !strings.Contains(body, "hello from peek") {
+		t.Fatalf("stream body missing peek output: %s", body)
+	}
+	if !strings.Contains(body, `"provider":"claude"`) {
+		t.Fatalf("stream body missing provider envelope: %s", body)
+	}
 }
 
 type peekPendingHandle struct {
