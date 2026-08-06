@@ -3711,6 +3711,39 @@ func TestStorageTryUploaderLockDistinguishesFreeAndContended(t *testing.T) {
 	}
 }
 
+func TestStorageTryStateLockDistinguishesFreeAndContended(t *testing.T) {
+	inspection := inspectStorageTestHome(t, true)
+	firstRoot, err := openStorageRootMutable(inspection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = firstRoot.Close() }()
+	secondRoot, err := openStorageRootMutable(inspection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = secondRoot.Close() }()
+
+	first, acquired, err := firstRoot.tryAcquireLock(stateLockName)
+	if err != nil || !acquired {
+		t.Fatalf("first tryAcquireLock = (%v, %v), want acquired", acquired, err)
+	}
+	second, acquired, err := secondRoot.tryAcquireLock(stateLockName)
+	if err != nil || acquired || second != nil {
+		t.Fatalf("contended tryAcquireLock = (%v, %v, %v), want no lock and no error", second, acquired, err)
+	}
+	if err := first.Release(); err != nil {
+		t.Fatal(err)
+	}
+	second, acquired, err = secondRoot.tryAcquireLock(stateLockName)
+	if err != nil || !acquired {
+		t.Fatalf("tryAcquireLock after release = (%v, %v), want acquired", acquired, err)
+	}
+	if err := second.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestStorageCloseRacesOperationsWithTypedClosedResult(t *testing.T) {
 	inspection := inspectStorageTestHome(t, true)
 	seed, err := openStorageRootMutable(inspection)
