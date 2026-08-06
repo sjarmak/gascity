@@ -874,10 +874,17 @@ func (directory *storageDir) acquireLock(ctx context.Context, name string) (*adv
 }
 
 func (directory *storageDir) tryAcquireUploaderLock() (*advisoryLock, bool, error) {
+	return directory.tryAcquireLock(uploaderLockName)
+}
+
+func (directory *storageDir) tryAcquireLock(name string) (*advisoryLock, bool, error) {
 	if directory == nil || directory.backend == nil {
 		return nil, false, errStorageClosed
 	}
-	backend, acquired, err := directory.backend.tryAcquireLock(uploaderLockName)
+	if !isStorageLockName(name) {
+		return nil, false, fmt.Errorf("productmetrics: unrecognized lock name %q", name)
+	}
+	backend, acquired, err := directory.backend.tryAcquireLock(name)
 	if err != nil || !acquired {
 		return nil, false, err
 	}

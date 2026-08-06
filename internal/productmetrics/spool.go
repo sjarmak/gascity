@@ -208,15 +208,21 @@ func (service *Service) RecordOnce(permit RecordingPermit, commandID CommandID) 
 		return RecordDropped
 	}
 	defer func() { _ = root.Close() }()
-	remaining, ok := window.remaining()
-	if !ok {
-		return RecordDropped
-	}
-	lockContext, cancel := context.WithTimeout(context.Background(), remaining)
-	defer cancel()
-	lock, err := root.acquireLock(lockContext, stateLockName)
+	lock, acquired, err := root.tryAcquireLock(stateLockName)
 	if err != nil {
 		return RecordDropped
+	}
+	if !acquired {
+		remaining, ok := window.remaining()
+		if !ok {
+			return RecordDropped
+		}
+		lockContext, cancel := context.WithTimeout(context.Background(), remaining)
+		defer cancel()
+		lock, err = root.acquireLock(lockContext, stateLockName)
+		if err != nil {
+			return RecordDropped
+		}
 	}
 	defer func() { _ = lock.Release() }()
 	if _, ok := window.remaining(); !ok {
