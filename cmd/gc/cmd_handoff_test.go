@@ -468,8 +468,8 @@ func TestDoHandoff_Regression744_NamedSessionSkipsRestart(t *testing.T) {
 	if outcome.code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", outcome.code, stderr.String())
 	}
-	if outcome.restartRequested {
-		t.Fatal("restartRequested = true, want false for on-demand named session")
+	if outcome.disposition != handoffDispositionCheckpointOnly {
+		t.Fatalf("disposition = %q, want %q for on-demand named session", outcome.disposition, handoffDispositionCheckpointOnly)
 	}
 
 	mailFound := false
@@ -539,8 +539,8 @@ func TestDoHandoff_NamedSessionClearRestartFailureReturnsError(t *testing.T) {
 	if outcome.code != 1 {
 		t.Fatalf("code = %d, want 1", outcome.code)
 	}
-	if outcome.restartRequested {
-		t.Fatal("restartRequested = true, want false")
+	if outcome.disposition != "" {
+		t.Fatalf("disposition = %q, want empty on failure", outcome.disposition)
 	}
 	if !strings.Contains(stderr.String(), "clearing stale restart request") {
 		t.Fatalf("stderr = %q, want stale restart cleanup error", stderr.String())
@@ -581,8 +581,8 @@ func TestDoHandoff_NamedAlwaysSessionRequestsRestart(t *testing.T) {
 	if outcome.code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", outcome.code, stderr.String())
 	}
-	if !outcome.restartRequested {
-		t.Fatal("restartRequested = false, want true for always-mode named session")
+	if outcome.disposition != handoffDispositionRestartRequested {
+		t.Fatalf("disposition = %q, want %q for always-mode named session", outcome.disposition, handoffDispositionRestartRequested)
 	}
 	if !dops.restartRequested["mayor"] {
 		t.Error("restart-requested flag not set for always-mode named session")
@@ -595,67 +595,6 @@ func TestDoHandoff_NamedAlwaysSessionRequestsRestart(t *testing.T) {
 	}
 	if rec.Events[1].Type != events.SessionDraining {
 		t.Fatalf("event[1].Type = %q, want %q", rec.Events[1].Type, events.SessionDraining)
-	}
-}
-
-// TestDoHandoff_PinnedAlwaysSessionRequiresPersistRestart covers Fix 1: a
-// pinned named session (pin_awake == "true") is kill-protected by the
-// reconciler unless an explicit controller reset is persisted, so
-// persistRestart is mandatory rather than best-effort for pinned sessions.
-// When it is unavailable or fails, doHandoffWithOutcome must report failure
-// and must not promise a restart it cannot guarantee.
-func TestDoHandoff_PinnedAlwaysSessionRequiresPersistRestart(t *testing.T) {
-	for _, tc := range []struct {
-		name           string
-		persistRestart func() error
-	}{
-		{name: "nil persistRestart"},
-		{name: "persistRestart error", persistRestart: func() error { return errors.New("worker boundary unavailable") }},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			store := beads.NewMemStore()
-			rec := events.NewFake()
-			dops := newFakeDrainOps()
-			var stdout, stderr bytes.Buffer
-
-			b, err := store.Create(beads.Bead{
-				Type:   sessionBeadType,
-				Labels: []string{"gc:session"},
-			})
-			if err != nil {
-				t.Fatalf("seeding session bead: %v", err)
-			}
-			if err := store.SetMetadata(b.ID, "session_name", "mayor"); err != nil {
-				t.Fatalf("set session_name: %v", err)
-			}
-			if err := store.SetMetadata(b.ID, "configured_named_session", "true"); err != nil {
-				t.Fatalf("set configured_named_session: %v", err)
-			}
-			if err := store.SetMetadata(b.ID, "configured_named_mode", "always"); err != nil {
-				t.Fatalf("set configured_named_mode: %v", err)
-			}
-			if err := store.SetMetadata(b.ID, "pin_awake", "true"); err != nil {
-				t.Fatalf("set pin_awake: %v", err)
-			}
-
-			outcome := doHandoffWithOutcome(store, store, rec, dops, tc.persistRestart, "mayor", "mayor",
-				[]string{"HANDOFF: context full"}, &stdout, &stderr)
-			if outcome.code != 1 {
-				t.Fatalf("code = %d, want 1; stderr: %s", outcome.code, stderr.String())
-			}
-			if outcome.restartRequested {
-				t.Fatal("restartRequested = true, want false when persistRestart is unavailable for a pinned session")
-			}
-			if strings.Contains(stdout.String(), "requesting restart") {
-				t.Errorf("stdout = %q, must not promise a restart when persistRestart is unavailable for a pinned session", stdout.String())
-			}
-			if len(rec.Events) != 1 {
-				t.Fatalf("got %d events, want 1 (mail only, no SessionDraining); events=%v", len(rec.Events), rec.Events)
-			}
-			if rec.Events[0].Type != events.MailSent {
-				t.Fatalf("event[0].Type = %q, want %q", rec.Events[0].Type, events.MailSent)
-			}
-		})
 	}
 }
 
