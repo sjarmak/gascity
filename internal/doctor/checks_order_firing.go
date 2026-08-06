@@ -115,7 +115,14 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 		return result
 	}
 
-	allOrders, err := scanOrderFiringCurrentOrders(cityPath, c.cfg)
+	suspendedRigs, err := orderFiringCurrentSuspendedRigs(cityPath, c.cfg)
+	if err != nil {
+		result.Status = StatusError
+		result.Message = fmt.Sprintf("load suspension state: %v", err)
+		return result
+	}
+
+	allOrders, err := scanOrderFiringCurrentOrders(cityPath, c.cfg, suspendedRigs)
 	if err != nil {
 		result.Status = StatusError
 		result.Message = fmt.Sprintf("scan orders: %v", err)
@@ -123,17 +130,33 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 	}
 
 	eventPath := filepath.Join(cityPath, citylayout.RuntimeRoot, "events.jsonl")
-	firedEvents, err := events.ReadFiltered(eventPath, events.Filter{Type: events.OrderFired})
+	historyEvents, err := events.ReadFilteredActive(eventPath, events.Filter{
+		Type:   events.OrderFired,
+		OrType: events.ControllerStarted,
+	})
 	if err != nil {
 		result.Status = StatusError
-		result.Message = fmt.Sprintf("read order firing events: %v", err)
+		result.Message = fmt.Sprintf("read order firing history: %v", err)
 		return result
 	}
-	startedAt, err := latestControllerStartedAt(eventPath)
-	if err != nil {
-		result.Status = StatusError
-		result.Message = fmt.Sprintf("read controller start events: %v", err)
-		return result
+	firedEvents, startedAt := splitOrderFiringHistory(historyEvents)
+	if c.lastRun == nil || startedAt.IsZero() {
+		archivedHistory, err := events.ReadFiltered(eventPath, events.Filter{
+			Type:   events.OrderFired,
+			OrType: events.ControllerStarted,
+		})
+		if err != nil {
+			result.Status = StatusError
+			result.Message = fmt.Sprintf("read archived order firing history: %v", err)
+			return result
+		}
+		archivedFired, archivedStartedAt := splitOrderFiringHistory(archivedHistory)
+		if c.lastRun == nil {
+			firedEvents = archivedFired
+		}
+		if startedAt.IsZero() {
+			startedAt = archivedStartedAt
+		}
 	}
 
 	now := c.clock()
@@ -147,8 +170,6 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 	// Track severity contributions across error-level entries. Warnings should
 	// stay visible without converting an advisory error into a blocking gate.
 	var blockingErrors, advisoryErrors int
-	suspendedRigs := orderFiringCurrentSuspendedRigs(cityPath, c.cfg)
-
 	for _, order := range allOrders {
 		if order.Trigger != "cron" && order.Trigger != "cooldown" {
 			continue
@@ -218,9 +239,9 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 	return result
 }
 
-func scanOrderFiringCurrentOrders(cityPath string, cfg *config.City) ([]orders.Order, error) {
-	scanCfg := orderFiringCurrentScanConfig(cityPath, cfg)
-	scanCfg = orderFiringCurrentPruneSuspendedOnlyWildcardOverrides(cityPath, cfg, scanCfg)
+func scanOrderFiringCurrentOrders(cityPath string, cfg *config.City, suspendedRigs map[string]bool) ([]orders.Order, error) {
+	scanCfg := orderFiringCurrentScanConfig(cfg, suspendedRigs)
+	scanCfg = orderFiringCurrentPruneSuspendedOnlyWildcardOverrides(cityPath, cfg, scanCfg, suspendedRigs)
 	allOrders, err := orderdiscovery.ScanAll(cityPath, scanCfg, orderFiringCurrentScanOptions(cityPath))
 	if err != nil {
 		return nil, err
@@ -238,11 +259,10 @@ func orderFiringCurrentScanOptions(cityPath string) orderdiscovery.ScanOptions {
 	}
 }
 
-func orderFiringCurrentScanConfig(cityPath string, cfg *config.City) *config.City {
+func orderFiringCurrentScanConfig(cfg *config.City, suspended map[string]bool) *config.City {
 	if cfg == nil {
 		return nil
 	}
-	suspended := orderFiringCurrentSuspendedRigs(cityPath, cfg)
 	if len(suspended) == 0 {
 		return cfg
 	}
@@ -277,11 +297,14 @@ func orderFiringCurrentScanConfig(cityPath string, cfg *config.City) *config.Cit
 	return &clone
 }
 
-func orderFiringCurrentPruneSuspendedOnlyWildcardOverrides(cityPath string, originalCfg, scanCfg *config.City) *config.City {
+func orderFiringCurrentPruneSuspendedOnlyWildcardOverrides(
+	cityPath string,
+	originalCfg, scanCfg *config.City,
+	suspended map[string]bool,
+) *config.City {
 	if originalCfg == nil || scanCfg == nil || len(scanCfg.Orders.Overrides) == 0 {
 		return scanCfg
 	}
-	suspended := orderFiringCurrentSuspendedRigs(cityPath, originalCfg)
 	if len(suspended) == 0 {
 		return scanCfg
 	}
@@ -327,19 +350,22 @@ func orderFiringCurrentScanWithoutOverrides(cityPath string, cfg *config.City) (
 	return orderdiscovery.ScanAll(cityPath, &clone, orderFiringCurrentScanOptions(cityPath))
 }
 
-func orderFiringCurrentSuspendedRigs(cityPath string, cfg *config.City) map[string]bool {
+func orderFiringCurrentSuspendedRigs(cityPath string, cfg *config.City) (map[string]bool, error) {
 	out := make(map[string]bool)
 	if cfg == nil {
-		return out
+		return out, nil
 	}
-	st, _ := suspensionstate.Load(fsys.OSFS{}, cityPath)
+	st, err := suspensionstate.Load(fsys.OSFS{}, cityPath)
+	if err != nil {
+		return nil, err
+	}
 	for _, rig := range cfg.Rigs {
 		if suspensionstate.EffectiveRigSuspended(st, rig.Name, rig.EffectiveSuspendedOnStart()) &&
 			strings.TrimSpace(rig.Name) != "" {
 			out[rig.Name] = true
 		}
 	}
-	return out
+	return out, nil
 }
 
 func orderFiringCurrentOrderSuspended(suspended map[string]bool, order orders.Order) bool {
@@ -553,18 +579,18 @@ func cronRangeForDoctor(rangePart string, lowerBound, upperBound int) (int, int,
 	}
 }
 
-func latestControllerStartedAt(eventPath string) (time.Time, error) {
-	startEvents, err := events.ReadFiltered(eventPath, events.Filter{Type: events.ControllerStarted})
-	if err != nil {
-		return time.Time{}, err
-	}
+func splitOrderFiringHistory(historyEvents []events.Event) ([]events.Event, time.Time) {
+	firedEvents := make([]events.Event, 0, len(historyEvents))
 	var latest time.Time
-	for _, event := range startEvents {
-		if event.Ts.After(latest) {
+	for _, event := range historyEvents {
+		if event.Type == events.OrderFired {
+			firedEvents = append(firedEvents, event)
+		}
+		if event.Type == events.ControllerStarted && event.Ts.After(latest) {
 			latest = event.Ts
 		}
 	}
-	return latest, nil
+	return firedEvents, latest
 }
 
 func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order orders.Order, expected time.Duration, now time.Time) (time.Time, error) {

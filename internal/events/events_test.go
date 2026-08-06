@@ -487,6 +487,21 @@ func TestReadFiltered(t *testing.T) {
 		}
 	})
 
+	t.Run("by_alternative_type", func(t *testing.T) {
+		got, err := ReadFiltered(path, Filter{Type: BeadCreated, OrType: SessionWoke})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("got %d, want 2", len(got))
+		}
+		for _, event := range got {
+			if event.Type != BeadCreated && event.Type != SessionWoke {
+				t.Fatalf("unexpected event type %q", event.Type)
+			}
+		}
+	})
+
 	t.Run("by_actor", func(t *testing.T) {
 		got, err := ReadFiltered(path, Filter{Actor: "gc"})
 		if err != nil {
