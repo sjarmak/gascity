@@ -325,7 +325,7 @@ func TestRecordOnceDecisionWindowGatesNoReplaceConflictReplay(t *testing.T) {
 				// Model the no-replace syscall observing the racing destination.
 				// From that attempted mutation onward, replay classification,
 				// parent sync, and staging cleanup are a clock-free durability tail.
-				current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+				current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 				return unix.EEXIST
 			}
 		}
@@ -469,12 +469,12 @@ func TestRecordOnceChecksDecisionBudgetBeforeUncancellableStorage(t *testing.T) 
 	deps.newUUID = uuidSequence(t, testEventIDOne)
 	start := testRecordHour
 	var mu sync.Mutex
-	times := []time.Time{start, start.Add(defaultRecordDecisionBudget + time.Nanosecond)}
+	times := []time.Time{start, start.Add(testRecordDecisionBudget + time.Nanosecond)}
 	deps.now = func() time.Time {
 		mu.Lock()
 		defer mu.Unlock()
 		if len(times) == 0 {
-			return start.Add(defaultRecordDecisionBudget + time.Second)
+			return start.Add(testRecordDecisionBudget + time.Second)
 		}
 		value := times[0]
 		times = times[1:]
@@ -507,7 +507,7 @@ func TestRecordOnceRechecksDecisionBudgetAfterStateLockBeforeConfigRead(t *testi
 	deps.storageHooks.beforeStep = func(step storageStep) error {
 		if step == storageStepLock {
 			mu.Lock()
-			current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+			current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 			mu.Unlock()
 		}
 		return nil
@@ -543,7 +543,7 @@ func TestRecordOnceSpentBudgetAfterReservationLeavesOnlySafeOvercount(t *testing
 	deps.now = func() time.Time { return current }
 	deps.beforeRecordOperation = func(operation recordOperation) {
 		if operation == recordOperationQueueOpen {
-			current = start.Add(defaultRecordDecisionBudget + time.Nanosecond)
+			current = start.Add(testRecordDecisionBudget + time.Nanosecond)
 		}
 	}
 	service := mustOpenTestService(t, deps)
@@ -597,7 +597,7 @@ func TestRecordOnceDecisionWindowGatesEveryForegroundQuotaBoundary(t *testing.T)
 		service.deps.now = func() time.Time { return current }
 		service.deps.beforeRecordOperation = func(operation recordOperation) {
 			if operation == recordOperationQuotaRead {
-				current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+				current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 			}
 		}
 		quotaOpens := 0
@@ -625,7 +625,7 @@ func TestRecordOnceDecisionWindowGatesEveryForegroundQuotaBoundary(t *testing.T)
 		service.deps.now = func() time.Time { return current }
 		service.deps.beforeRecordOperation = func(operation recordOperation) {
 			if operation == recordLookupOperation(spoolControlDirectoryName) {
-				current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+				current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 			}
 		}
 		quotaOpens := 0
@@ -657,7 +657,7 @@ func TestRecordOnceDecisionWindowGatesEveryForegroundQuotaBoundary(t *testing.T)
 			service.deps.now = func() time.Time { return current }
 			service.deps.beforeRecordOperation = func(operation recordOperation) {
 				if operation == recordLookupOperation(expireName) {
-					current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+					current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 				}
 			}
 			lookups := 0
@@ -699,7 +699,7 @@ func TestRecordOnceDecisionWindowGatesEveryForegroundQuotaBoundary(t *testing.T)
 			service.deps.now = func() time.Time { return current }
 			service.deps.beforeRecordOperation = func(operation recordOperation) {
 				if operation == test.operation {
-					current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+					current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 				}
 			}
 			quotaWrites := 0
@@ -6616,7 +6616,7 @@ func TestRecordOnceDecisionExpiryStopsTempCollisionRetries(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+		current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 	}
 
 	result := service.RecordOnce(permit, CommandHelp)
@@ -7573,7 +7573,7 @@ func TestRecordOnceDecisionExpiryStopsQuotaStageTempCollisionRetries(t *testing.
 			}
 			collisions[collisionPath] = info
 		}
-		current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+		current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 	}
 
 	result := service.RecordOnce(permit, CommandHelp)
@@ -7605,7 +7605,7 @@ func TestRecordOnceDecisionGatesStorageSafeBoundaries(t *testing.T) {
 		service.deps.now = func() time.Time {
 			nowCalls++
 			if nowCalls > 2 {
-				return testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+				return testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 			}
 			return testRecordHour
 		}
@@ -7631,7 +7631,7 @@ func TestRecordOnceDecisionGatesStorageSafeBoundaries(t *testing.T) {
 		service.deps.storageHooks.afterFileOpen = func(path string) {
 			if filepath.Base(path) == configFileName {
 				configOpened = true
-				current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+				current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 			}
 		}
 		service.deps.storageHooks.metadata = func(path string, metadata storageMetadata) storageMetadata {
@@ -7661,7 +7661,7 @@ func TestRecordOnceDecisionGatesStorageSafeBoundaries(t *testing.T) {
 		}
 		service.deps.storageHooks.afterDirectoryAttempt = func(path string, err error) {
 			if path == filepath.Join(home.Root(), queueDirectoryName) && errors.Is(err, fs.ErrNotExist) {
-				current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+				current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 			}
 		}
 		if got := service.RecordOnce(permit, CommandHelp); got != RecordDropped {
@@ -7690,7 +7690,7 @@ func TestRecordOnceDecisionGatesStorageSafeBoundaries(t *testing.T) {
 			}
 			componentOpens++
 			if componentOpens == 1 {
-				current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+				current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 			}
 		}
 		if got := service.RecordOnce(permit, CommandHelp); got != RecordDropped {
@@ -7713,7 +7713,7 @@ func TestRecordOnceDecisionGatesStorageSafeBoundaries(t *testing.T) {
 		service.deps.storageHooks.beforeRead = func(path string) {
 			if filepath.Base(path) == configFileName {
 				beforeRead++
-				current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+				current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 			}
 		}
 		service.deps.storageHooks.afterRead = func(path string, _, _ int, _ error) {
@@ -7806,7 +7806,7 @@ func TestRecordOnceDecisionExpiryStopsUnchangedNoReplaceRetry(t *testing.T) {
 		if armed && step == storageStepRename {
 			renameAttempts++
 			if renameAttempts == 1 {
-				current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+				current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 				return unix.EINTR
 			}
 		}
@@ -7846,7 +7846,7 @@ func TestRecordOnceDecisionExpiryDuringNoReplacePrestatePreventsInstall(t *testi
 		if step == storageStepRename && eventTempPath != "" && !expired {
 			renameSteps++
 			expired = true
-			current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+			current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 		}
 		return nil
 	}
@@ -10625,7 +10625,7 @@ func TestDirectoryOpenExpiryStopsSafeValidationAndRecoverySync(t *testing.T) {
 		service.deps.storageHooks.afterDirectoryOpen = func(path string) {
 			if path == home.Root() && !expired {
 				expired = true
-				current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+				current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 			}
 		}
 		service.deps.storageHooks.metadata = func(_ string, metadata storageMetadata) storageMetadata {
@@ -10668,7 +10668,7 @@ func TestDirectoryOpenExpiryStopsSafeValidationAndRecoverySync(t *testing.T) {
 		service.deps.storageHooks.afterDirectoryOpen = func(path string) {
 			if path == target && !expired {
 				expired = true
-				current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+				current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 			}
 		}
 		service.deps.storageHooks.metadata = func(_ string, metadata storageMetadata) storageMetadata {
@@ -10708,7 +10708,7 @@ func TestDirectoryOpenExpiryStopsSafeValidationAndRecoverySync(t *testing.T) {
 		service.deps.storageHooks.afterDirectoryOpen = func(path string) {
 			if path == target && !expired {
 				expired = true
-				current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+				current = testRecordHour.Add(testRecordDecisionBudget + time.Nanosecond)
 			}
 		}
 		service.deps.storageHooks.metadata = func(_ string, metadata storageMetadata) storageMetadata {
