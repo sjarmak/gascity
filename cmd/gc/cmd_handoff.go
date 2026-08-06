@@ -279,23 +279,18 @@ func doHandoffWithOutcome(store, sessStore beads.Store, rec events.Recorder, dop
 			return handoffOutcome{code: 1}
 		}
 		fmt.Fprintf(stdout, "Handoff: sent mail %s (named session; restart skipped).\n", b.ID) //nolint:errcheck // best-effort stdout
-		return handoffOutcome{code: 0, disposition: handoffDispositionCheckpointOnly}
+		return handoffOutcome{disposition: handoffDispositionCheckpointOnly}
 	}
 
-	// Pinned named sessions are an operator-owned conversation. The reconciler
-	// deliberately refuses an abrupt restart unless several independently
-	// persisted markers line up, and a production incident showed that even a
-	// successfully persisted reset can leave the live session pinned while the
-	// caller waits. Treat handoff as a durable checkpoint for this policy shape:
-	// save the self-mail above, disarm any abandoned restart state, and return a
-	// truthful typed result without asking the controller to stop the session.
+	// The reconciler protects pinned named sessions from abrupt restart. Treat
+	// handoff as a checkpoint and disarm any abandoned restart state.
 	if pinned {
 		if err := clearRestartRequest(sessStore, dops, sessionName); err != nil {
 			fmt.Fprintf(stderr, "gc handoff: clearing stale restart request for pinned session %q: %v\n", sessionName, err) //nolint:errcheck // best-effort stderr
 			return handoffOutcome{code: 1}
 		}
 		fmt.Fprintf(stdout, "Handoff: sent mail %s (checkpoint only; pinned named session remains running).\n", b.ID) //nolint:errcheck // best-effort stdout
-		return handoffOutcome{code: 0, disposition: handoffDispositionCheckpointOnly}
+		return handoffOutcome{disposition: handoffDispositionCheckpointOnly}
 	}
 
 	if err := dops.setRestartRequested(sessionName); err != nil {
@@ -315,7 +310,7 @@ func doHandoffWithOutcome(store, sessStore beads.Store, rec events.Recorder, dop
 	})
 
 	fmt.Fprintf(stdout, "Handoff: sent mail %s, requesting restart...\n", b.ID) //nolint:errcheck // best-effort stdout
-	return handoffOutcome{code: 0, disposition: handoffDispositionRestartRequested}
+	return handoffOutcome{disposition: handoffDispositionRestartRequested}
 }
 
 // doHandoffAuto sends handoff mail to self without requesting restart.
