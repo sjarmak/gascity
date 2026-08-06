@@ -796,16 +796,17 @@ func (m *memoryOrderDispatcher) dispatchScanOrder(now time.Time) []int {
 	type rankedOrder struct {
 		idx     int
 		urgency float64
-		rank    int
 	}
 	ranked := make([]rankedOrder, 0, total)
 	m.cacheMu.Lock()
-	for idx, a := range m.aa {
+	for offset := 0; offset < total; offset++ {
+		idx := (start + offset) % total
+		a := m.aa[idx]
 		urgency := 1.0
 		if a.Trigger == "cooldown" {
 			interval, err := time.ParseDuration(a.Interval)
-			last, observed := m.schedulerLastRun[a.ScopedName()]
-			if err == nil && interval > 0 && observed && !last.IsZero() {
+			last := m.schedulerLastRun[a.ScopedName()]
+			if err == nil && interval > 0 && !last.IsZero() {
 				urgency = float64(now.Sub(last)) / float64(interval)
 				if urgency < 0 {
 					urgency = 0
@@ -815,16 +816,12 @@ func (m *memoryOrderDispatcher) dispatchScanOrder(now time.Time) []int {
 		ranked = append(ranked, rankedOrder{
 			idx:     idx,
 			urgency: urgency,
-			rank:    (idx - start + total) % total,
 		})
 	}
 	m.cacheMu.Unlock()
 
 	sort.SliceStable(ranked, func(i, j int) bool {
-		if ranked[i].urgency != ranked[j].urgency {
-			return ranked[i].urgency > ranked[j].urgency
-		}
-		return ranked[i].rank < ranked[j].rank
+		return ranked[i].urgency > ranked[j].urgency
 	})
 	indexes := make([]int, len(ranked))
 	for i := range ranked {
