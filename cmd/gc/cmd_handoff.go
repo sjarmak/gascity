@@ -411,30 +411,31 @@ func clearRestartRequest(sessStore beads.Store, dops drainOps, sessionName strin
 	if sessionName == "" {
 		return nil
 	}
-	var errs []error
+	if sessStore != nil {
+		id, err := resolveSessionID(sessStore, sessionName)
+		if err != nil && !errors.Is(err, session.ErrSessionNotFound) {
+			return fmt.Errorf("resolving session %q: %w", sessionName, err)
+		}
+		if err == nil {
+			sessFront := sessionFrontDoor(sessStore)
+			info, getErr := sessFront.Get(id)
+			if getErr != nil {
+				return fmt.Errorf("loading session %q: %w", id, getErr)
+			}
+			if _, updateErr := sessFront.UpdateMetadataInfo(info, map[string]string{
+				"restart_requested":          "",
+				"continuation_reset_pending": "",
+			}); updateErr != nil {
+				return fmt.Errorf("clearing bead restart flag: %w", updateErr)
+			}
+		}
+	}
 	if dops != nil {
 		if err := dops.clearRestartRequested(sessionName); err != nil {
-			errs = append(errs, fmt.Errorf("clearing runtime restart flag: %w", err))
+			return fmt.Errorf("clearing runtime restart flag: %w", err)
 		}
 	}
-	if sessStore == nil {
-		return errors.Join(errs...)
-	}
-	id, err := resolveSessionID(sessStore, sessionName)
-	if err != nil {
-		if errors.Is(err, session.ErrSessionNotFound) {
-			return errors.Join(errs...)
-		}
-		errs = append(errs, fmt.Errorf("resolving session %q: %w", sessionName, err))
-		return errors.Join(errs...)
-	}
-	if err := sessionFrontDoor(sessStore).ApplyPatch(id, map[string]string{
-		"restart_requested":          "",
-		"continuation_reset_pending": "",
-	}); err != nil {
-		errs = append(errs, fmt.Errorf("clearing bead restart flag: %w", err))
-	}
-	return errors.Join(errs...)
+	return nil
 }
 
 // doHandoffRemote sends handoff mail to a remote session and kills its runtime.
