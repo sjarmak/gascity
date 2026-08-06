@@ -90,7 +90,7 @@ func cmdServiceList(jsonOutput bool, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "gc service list: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	return doServiceList(cityPath, cfg, serviceReadClient(cityPath, cfg), jsonOutput, stdout, stderr)
+	return doServiceList(cityPath, cfg, serviceClient(cityPath, cfg), jsonOutput, stdout, stderr)
 }
 
 func cmdServiceDoctor(name string, jsonOutput bool, stdout, stderr io.Writer) int {
@@ -104,7 +104,7 @@ func cmdServiceDoctor(name string, jsonOutput bool, stdout, stderr io.Writer) in
 		fmt.Fprintf(stderr, "gc service doctor: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	return doServiceDoctor(cityPath, cfg, serviceReadClient(cityPath, cfg), name, jsonOutput, stdout, stderr)
+	return doServiceDoctor(cityPath, cfg, serviceClient(cityPath, cfg), name, jsonOutput, stdout, stderr)
 }
 
 func newServiceRestartCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -149,7 +149,7 @@ func cmdServiceRestart(name string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "gc service restart: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	client := serviceRestartClient(cityPath, cfg)
+	client := serviceClient(cityPath, cfg)
 	if client == nil {
 		fmt.Fprintln(stderr, "gc service restart: controller is not running") //nolint:errcheck // best-effort stderr
 		return 1
@@ -162,7 +162,7 @@ func cmdServiceRestart(name string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func serviceRestartClient(cityPath string, cfg *config.City) *api.Client {
+func serviceClient(cityPath string, cfg *config.City) *api.Client {
 	if client := serviceSupervisorClientHook(cityPath); client != nil {
 		return client
 	}
@@ -325,24 +325,6 @@ func lookupService(cfg *config.City, name string) (config.Service, bool) {
 		}
 	}
 	return config.Service{}, false
-}
-
-func serviceReadClient(cityPath string, cfg *config.City) serviceStatusReader {
-	if client := serviceSupervisorClientHook(cityPath); client != nil {
-		return client
-	}
-	if serviceControllerAliveHook(cityPath) != 0 && cfg.API.Port > 0 {
-		bind := cfg.API.BindOrDefault()
-		switch bind {
-		case "0.0.0.0":
-			bind = "127.0.0.1"
-		case "::", "[::]":
-			bind = "::1"
-		}
-		baseURL := fmt.Sprintf("http://%s", net.JoinHostPort(bind, strconv.Itoa(cfg.API.Port)))
-		return api.NewCityScopedClient(baseURL, standaloneControllerCityName(cfg, cityPath))
-	}
-	return nil
 }
 
 func publicationState(status workspacesvc.Status) string {

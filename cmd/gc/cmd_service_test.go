@@ -52,21 +52,14 @@ func TestServiceClientsPreferSupervisorForManagedCity(t *testing.T) {
 		Services:  []config.Service{{Name: "healthz"}},
 	}
 
-	readClient := serviceReadClient("/city", cfg)
-	if readClient != supervisorClient {
-		t.Fatalf("serviceReadClient = %p, want supervisor client %p", readClient, supervisorClient)
-	}
-	restartClient := serviceRestartClient("/city", cfg)
-	if restartClient != supervisorClient {
-		t.Fatalf("serviceRestartClient = %p, want supervisor client %p", restartClient, supervisorClient)
+	client := serviceClient("/city", cfg)
+	if client != supervisorClient {
+		t.Fatalf("serviceClient = %p, want supervisor client %p", client, supervisorClient)
 	}
 
 	serviceSupervisorClientHook = func(string) *api.Client { return nil }
-	if readClient := serviceReadClient("/city", cfg); readClient == nil || readClient == supervisorClient {
-		t.Fatalf("serviceReadClient without supervisor = %p, want standalone client", readClient)
-	}
-	if restartClient := serviceRestartClient("/city", cfg); restartClient == nil || restartClient == supervisorClient {
-		t.Fatalf("serviceRestartClient without supervisor = %p, want standalone client", restartClient)
+	if client := serviceClient("/city", cfg); client == nil || client == supervisorClient {
+		t.Fatalf("serviceClient without supervisor = %p, want standalone client", client)
 	}
 }
 
