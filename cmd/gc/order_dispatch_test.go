@@ -1918,6 +1918,57 @@ func TestOrderDispatchScanOrderBoundsFrequentCooldownGapUnderBurst(t *testing.T)
 	}
 }
 
+func TestOrderDispatchBudgetDoesNotStarveConditionBehindOverdueCooldownBurst(t *testing.T) {
+	const cooldownOrders = 10
+	aa := make([]orders.Order, 0, cooldownOrders+1)
+	for i := 0; i < cooldownOrders; i++ {
+		aa = append(aa, orders.Order{
+			Name:     fmt.Sprintf("maintenance-%d", i),
+			Trigger:  "cooldown",
+			Interval: "5m",
+			Exec:     "true",
+		})
+	}
+	aa = append(aa, orders.Order{
+		Name:    "condition",
+		Trigger: "condition",
+		Check:   "true",
+		Exec:    "true",
+	})
+
+	store := beads.NewMemStore()
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, successfulExec, nil)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	m := ad.(*memoryOrderDispatcher)
+	m.maxDispatchesPerTick = 5
+
+	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	m.schedulerLastRun = make(map[string]time.Time, cooldownOrders)
+	for _, a := range aa[:cooldownOrders] {
+		m.schedulerLastRun[a.ScopedName()] = now.Add(-2 * time.Hour)
+	}
+
+	ad.dispatch(context.Background(), t.TempDir(), now)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if !ad.drain(ctx) {
+		t.Fatal("drain timed out waiting for mixed-trigger dispatches")
+	}
+
+	if got := len(trackingBeads(t, store, "order-run:condition")); got != 1 {
+		t.Fatalf("condition launches = %d, want 1 on the first saturated cooldown tick", got)
+	}
+	cooldownLaunches := 0
+	for _, a := range aa[:cooldownOrders] {
+		cooldownLaunches += len(trackingBeads(t, store, "order-run:"+a.ScopedName()))
+	}
+	if cooldownLaunches != m.maxDispatchesPerTick-1 {
+		t.Fatalf("cooldown launches = %d, want %d alongside the reserved condition slot", cooldownLaunches, m.maxDispatchesPerTick-1)
+	}
+}
+
 func TestOrderDispatchBudgetRotatesAcrossAlwaysDueOrders(t *testing.T) {
 	store := beads.NewMemStore()
 	var aa []orders.Order

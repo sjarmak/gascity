@@ -780,9 +780,10 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 // dispatchScanOrder ranks periodic cooldown work by how many configured
 // intervals have elapsed since its observed last run. This keeps a burst of
 // long-interval orders from carrying the rotating cursor past short-interval
-// health work for an entire order-set traversal. Orders with equal urgency,
-// including never-observed and non-cooldown orders, retain the existing
-// rotating order so the bounded launch budget remains fair.
+// health work for an entire order-set traversal. A saturated tick reserves
+// one launch slot for non-cooldown work so persistent cooldown demand cannot
+// starve event and condition triggers. Both groups retain rotating order for
+// equal urgency.
 func (m *memoryOrderDispatcher) dispatchScanOrder(now time.Time) []int {
 	total := len(m.aa)
 	if total == 0 {
@@ -793,39 +794,53 @@ func (m *memoryOrderDispatcher) dispatchScanOrder(now time.Time) []int {
 		start = m.nextDispatchStart % total
 	}
 
-	type rankedOrder struct {
+	type rankedCooldown struct {
 		idx     int
 		urgency float64
 	}
-	ranked := make([]rankedOrder, 0, total)
+	cooldowns := make([]rankedCooldown, 0, total)
+	other := make([]int, 0, total)
 	m.cacheMu.Lock()
 	for offset := 0; offset < total; offset++ {
 		idx := (start + offset) % total
 		a := m.aa[idx]
+		if a.Trigger != "cooldown" {
+			other = append(other, idx)
+			continue
+		}
 		urgency := 1.0
-		if a.Trigger == "cooldown" {
-			interval, err := time.ParseDuration(a.Interval)
-			last := m.schedulerLastRun[a.ScopedName()]
-			if err == nil && interval > 0 && !last.IsZero() {
-				urgency = float64(now.Sub(last)) / float64(interval)
-				if urgency < 0 {
-					urgency = 0
-				}
+		interval, err := time.ParseDuration(a.Interval)
+		last := m.schedulerLastRun[a.ScopedName()]
+		if err == nil && interval > 0 && !last.IsZero() {
+			urgency = float64(now.Sub(last)) / float64(interval)
+			if urgency < 0 {
+				urgency = 0
 			}
 		}
-		ranked = append(ranked, rankedOrder{
+		cooldowns = append(cooldowns, rankedCooldown{
 			idx:     idx,
 			urgency: urgency,
 		})
 	}
 	m.cacheMu.Unlock()
 
-	sort.SliceStable(ranked, func(i, j int) bool {
-		return ranked[i].urgency > ranked[j].urgency
+	sort.SliceStable(cooldowns, func(i, j int) bool {
+		return cooldowns[i].urgency > cooldowns[j].urgency
 	})
-	indexes := make([]int, len(ranked))
-	for i := range ranked {
-		indexes[i] = ranked[i].idx
+	cooldownPrefix := len(cooldowns)
+	if m.maxDispatchesPerTick > 1 && len(other) > 0 {
+		cooldownPrefix = min(cooldownPrefix, m.maxDispatchesPerTick-1)
+	} else if m.maxDispatchesPerTick == 1 && len(other) > 0 && m.aa[start].Trigger != "cooldown" {
+		cooldownPrefix = 0
+	}
+
+	indexes := make([]int, 0, total)
+	for _, ranked := range cooldowns[:cooldownPrefix] {
+		indexes = append(indexes, ranked.idx)
+	}
+	indexes = append(indexes, other...)
+	for _, ranked := range cooldowns[cooldownPrefix:] {
+		indexes = append(indexes, ranked.idx)
 	}
 	return indexes
 }
