@@ -226,7 +226,7 @@ func TestRecordOnceKeepsStoredEventWhenSpawnWindowExpires(t *testing.T) {
 	deps.now = func() time.Time { return current }
 	deps.beforeRecordOperation = func(operation recordOperation) {
 		if operation == recordOperationSpawnThrottleRead {
-			current = testRecordHour.Add(defaultRecordDecisionBudget)
+			current = testRecordHour.Add(testRecordDecisionBudget)
 		}
 	}
 	starts := 0

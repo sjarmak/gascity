@@ -17,11 +17,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/gchome"
 )
 
-const testNotice = "TEST-ONLY product metrics notice\n"
+const (
+	testNotice               = "TEST-ONLY product metrics notice\n"
+	testRecordDecisionBudget = 5 * time.Second
+)
 
 func TestEnvironmentDisableTruthSets(t *testing.T) {
 	for _, value := range []string{"1", "true", "yes", "on", "TRUE", " Yes ", "\ton\n"} {
@@ -1086,7 +1090,8 @@ func defaultTestServiceDependencies(home gchome.ProductUsageHome, epoch uint64) 
 		newUUID: func() (string, error) {
 			return randomUUIDv4(rand.Reader)
 		},
-		verifyTTY: func(io.Writer) bool { return true },
+		recordDecisionBudget: testRecordDecisionBudget,
+		verifyTTY:            func(io.Writer) bool { return true },
 	}
 }
 

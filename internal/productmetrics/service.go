@@ -187,6 +187,7 @@ type serviceDependencies struct {
 	getenv                      func(string) string
 	newUUID                     func() (string, error)
 	now                         func() time.Time
+	recordDecisionBudget        time.Duration
 	beforeRecordOperation       func(recordOperation)
 	verifyTTY                   func(io.Writer) bool
 	storageHooks                storageTestHooks
@@ -398,6 +399,9 @@ func openWithDependencies(deps serviceDependencies) (*Service, error) {
 	}
 	if deps.now == nil {
 		deps.now = time.Now
+	}
+	if deps.recordDecisionBudget <= 0 {
+		deps.recordDecisionBudget = defaultRecordDecisionBudget
 	}
 	if deps.verifyTTY == nil {
 		return nil, errors.New("productmetrics: TTY verifier dependency is nil")

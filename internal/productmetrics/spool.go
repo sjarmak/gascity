@@ -172,7 +172,7 @@ func (service *Service) RecordOnce(permit RecordingPermit, commandID CommandID) 
 	if !eventWithinRetention(occurred, started) {
 		return RecordDropped
 	}
-	window := recordDecisionWindow{started: started, now: service.deps.now, limit: defaultRecordDecisionBudget}
+	window := recordDecisionWindow{started: started, now: service.deps.now, limit: service.deps.recordDecisionBudget}
 	eventID, err := service.deps.newUUID()
 	if err != nil || !validCanonicalUUIDv4(eventID) {
 		return RecordDropped
