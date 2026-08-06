@@ -158,6 +158,9 @@ func cmdServiceRestart(name string, stdout, stderr io.Writer) int {
 }
 
 func serviceRestartClient(cityPath string, cfg *config.City) *api.Client {
+	if client := supervisorCityAPIClient(cityPath); client != nil {
+		return client
+	}
 	if controllerAlive(cityPath) != 0 && cfg.API.Port > 0 {
 		bind := cfg.API.BindOrDefault()
 		switch bind {
@@ -168,9 +171,6 @@ func serviceRestartClient(cityPath string, cfg *config.City) *api.Client {
 		}
 		baseURL := fmt.Sprintf("http://%s", net.JoinHostPort(bind, strconv.Itoa(cfg.API.Port)))
 		return api.NewCityScopedClient(baseURL, standaloneControllerCityName(cfg, cityPath))
-	}
-	if client := supervisorCityAPIClient(cityPath); client != nil {
-		return client
 	}
 	return nil
 }
@@ -323,6 +323,9 @@ func lookupService(cfg *config.City, name string) (config.Service, bool) {
 }
 
 func serviceReadClient(cityPath string, cfg *config.City) serviceStatusReader {
+	if client := supervisorCityAPIClient(cityPath); client != nil {
+		return client
+	}
 	if controllerAlive(cityPath) != 0 && cfg.API.Port > 0 {
 		bind := cfg.API.BindOrDefault()
 		switch bind {
@@ -333,9 +336,6 @@ func serviceReadClient(cityPath string, cfg *config.City) serviceStatusReader {
 		}
 		baseURL := fmt.Sprintf("http://%s", net.JoinHostPort(bind, strconv.Itoa(cfg.API.Port)))
 		return api.NewCityScopedClient(baseURL, standaloneControllerCityName(cfg, cityPath))
-	}
-	if client := supervisorCityAPIClient(cityPath); client != nil {
-		return client
 	}
 	return nil
 }

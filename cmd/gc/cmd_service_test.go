@@ -4,10 +4,17 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/supervisor"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
 )
 
@@ -33,6 +40,116 @@ func (f fakeServiceReader) GetService(name string) (workspacesvc.Status, error) 
 		return workspacesvc.Status{}, fmt.Errorf("missing service %s", name)
 	}
 	return status, nil
+}
+
+func TestServiceClientsPreferSupervisorForManagedCity(t *testing.T) {
+	t.Setenv("GC_HOME", t.TempDir())
+	cityPath := shortSocketTempDir(t, "gc-service-route-")
+
+	listener, err := startControllerSocket(
+		cityPath,
+		controllerHostingSupervisor,
+		func() {},
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("start supervisor compatibility controller socket: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	if pid := controllerAlive(cityPath); pid == 0 {
+		t.Fatal("controllerAlive = 0, want live supervisor compatibility socket")
+	}
+
+	status := workspacesvc.Status{
+		ServiceName:      "healthz",
+		Kind:             "workflow",
+		State:            "ready",
+		LocalState:       "ready",
+		PublicationState: "private",
+	}
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "GET /v0/city/bright-lights/services":
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []workspacesvc.Status{status}, "total": 1})
+		case "GET /v0/city/bright-lights/service/healthz":
+			_ = json.NewEncoder(w).Encode(status)
+		case "POST /v0/city/bright-lights/service/healthz/restart":
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	host, portText, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split supervisor test address: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse supervisor test port: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(supervisor.ConfigPath()), 0o755); err != nil {
+		t.Fatalf("create supervisor config directory: %v", err)
+	}
+	if err := os.WriteFile(supervisor.ConfigPath(), []byte(fmt.Sprintf("[supervisor]\nbind = %q\nport = %d\n", host, port)), 0o644); err != nil {
+		t.Fatalf("write supervisor config: %v", err)
+	}
+	registry := supervisor.NewRegistry(supervisor.RegistryPath())
+	if err := registry.Register(cityPath, "bright-lights"); err != nil {
+		t.Fatalf("register managed city: %v", err)
+	}
+
+	oldAlive, oldRunning := supervisorAliveHook, supervisorCityRunningHook
+	supervisorAliveHook = os.Getpid
+	supervisorCityRunningHook = func(string) (bool, string, bool) { return true, "ready", true }
+	t.Cleanup(func() {
+		supervisorAliveHook = oldAlive
+		supervisorCityRunningHook = oldRunning
+	})
+
+	deadPort, err := strconv.Atoi(freeLoopbackPort(t))
+	if err != nil {
+		t.Fatalf("parse dead standalone API port: %v", err)
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "bright-lights"},
+		API:       config.APIConfig{Bind: "127.0.0.1", Port: deadPort},
+		Services:  []config.Service{{Name: "healthz"}},
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := doServiceList(cityPath, cfg, serviceReadClient(cityPath, cfg), false, &stdout, &stderr); code != 0 {
+		t.Fatalf("service list code = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := doServiceDoctor(cityPath, cfg, serviceReadClient(cityPath, cfg), "healthz", false, &stdout, &stderr); code != 0 {
+		t.Fatalf("service doctor code = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	client := serviceRestartClient(cityPath, cfg)
+	if client == nil {
+		t.Fatal("serviceRestartClient = nil, want supervisor client")
+	}
+	if err := client.RestartService("healthz"); err != nil {
+		t.Fatalf("restart service through selected client: %v", err)
+	}
+
+	wantRequests := []string{
+		"GET /v0/city/bright-lights/services",
+		"GET /v0/city/bright-lights/service/healthz",
+		"POST /v0/city/bright-lights/service/healthz/restart",
+	}
+	if fmt.Sprint(requests) != fmt.Sprint(wantRequests) {
+		t.Fatalf("supervisor requests = %v, want %v", requests, wantRequests)
+	}
 }
 
 func TestDoServiceListUsesLiveStatuses(t *testing.T) {
