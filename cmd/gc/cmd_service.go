@@ -19,6 +19,11 @@ type serviceStatusReader interface {
 	GetService(name string) (workspacesvc.Status, error)
 }
 
+var (
+	serviceControllerAliveHook  = controllerAlive
+	serviceSupervisorClientHook = supervisorCityAPIClient
+)
+
 func newServiceCmd(stdout, stderr io.Writer) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "service",
@@ -158,10 +163,10 @@ func cmdServiceRestart(name string, stdout, stderr io.Writer) int {
 }
 
 func serviceRestartClient(cityPath string, cfg *config.City) *api.Client {
-	if client := supervisorCityAPIClient(cityPath); client != nil {
+	if client := serviceSupervisorClientHook(cityPath); client != nil {
 		return client
 	}
-	if controllerAlive(cityPath) != 0 && cfg.API.Port > 0 {
+	if serviceControllerAliveHook(cityPath) != 0 && cfg.API.Port > 0 {
 		bind := cfg.API.BindOrDefault()
 		switch bind {
 		case "0.0.0.0":
@@ -323,10 +328,10 @@ func lookupService(cfg *config.City, name string) (config.Service, bool) {
 }
 
 func serviceReadClient(cityPath string, cfg *config.City) serviceStatusReader {
-	if client := supervisorCityAPIClient(cityPath); client != nil {
+	if client := serviceSupervisorClientHook(cityPath); client != nil {
 		return client
 	}
-	if controllerAlive(cityPath) != 0 && cfg.API.Port > 0 {
+	if serviceControllerAliveHook(cityPath) != 0 && cfg.API.Port > 0 {
 		bind := cfg.API.BindOrDefault()
 		switch bind {
 		case "0.0.0.0":
