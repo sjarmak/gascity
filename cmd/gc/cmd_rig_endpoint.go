@@ -241,12 +241,12 @@ func prepareRigEndpointManagedLifecycleRetirement(cityPath string, cfg *config.C
 	if err := EnsureBuiltinRuntimeAssets(cityPath, warningWriter); err != nil {
 		return nil, err
 	}
-	provider := "exec:" + gcBeadsBdScriptPath(cityPath)
+	script := gcBeadsBdScriptPath(cityPath)
+	provider := "exec:" + script
 	environ, err := providerLifecycleProcessEnvWithError(cityPath, provider)
 	if err != nil {
 		return nil, err
 	}
-	script := strings.TrimPrefix(provider, "exec:")
 	return func() error {
 		if err := runRigEndpointManagedProviderOp(script, environ, "stop"); err != nil {
 			return err
