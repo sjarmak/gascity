@@ -37,7 +37,9 @@ controller-restartable, requests a restart and blocks until the controller
 stops the session. For on-demand configured named sessions, sends mail and
 returns without requesting restart: handoff intentionally leaves the
 user-attended session running instead of restarting it out from under the
-user. The controller can restart such a session via
+user. Pinned named sessions follow the same checkpoint-only contract because
+the controller deliberately protects them from abrupt restart. The controller
+can restart such a session via
 gc runtime request-restart; handoff deliberately does not.
 
 For controller-restartable sessions, equivalent to:
@@ -178,7 +180,7 @@ func cmdHandoff(args []string, target string, auto bool, hookFormat string, stdo
 	if outcome.code != 0 {
 		return outcome.code
 	}
-	if !outcome.restartRequested {
+	if outcome.disposition != handoffDispositionRestartRequested {
 		return 0
 	}
 
@@ -239,9 +241,16 @@ func sessionRestartPersister(cityPath string, sessStore beads.Store, sp runtime.
 }
 
 type handoffOutcome struct {
-	code             int
-	restartRequested bool
+	code        int
+	disposition handoffDisposition
 }
+
+type handoffDisposition string
+
+const (
+	handoffDispositionCheckpointOnly   handoffDisposition = "checkpoint_only"
+	handoffDispositionRestartRequested handoffDisposition = "restart_requested"
+)
 
 // doHandoff sends a handoff mail to self and requests restart when the
 // controller can restart the current session. Testable: does not block.
@@ -270,30 +279,30 @@ func doHandoffWithOutcome(store, sessStore beads.Store, rec events.Recorder, dop
 			return handoffOutcome{code: 1}
 		}
 		fmt.Fprintf(stdout, "Handoff: sent mail %s (named session; restart skipped).\n", b.ID) //nolint:errcheck // best-effort stdout
-		return handoffOutcome{code: 0}
+		return handoffOutcome{code: 0, disposition: handoffDispositionCheckpointOnly}
+	}
+
+	// Pinned named sessions are an operator-owned conversation. The reconciler
+	// deliberately refuses an abrupt restart unless several independently
+	// persisted markers line up, and a production incident showed that even a
+	// successfully persisted reset can leave the live session pinned while the
+	// caller waits. Treat handoff as a durable checkpoint for this policy shape:
+	// save the self-mail above, disarm any abandoned restart state, and return a
+	// truthful typed result without asking the controller to stop the session.
+	if pinned {
+		if err := clearRestartRequest(sessStore, dops, sessionName); err != nil {
+			fmt.Fprintf(stderr, "gc handoff: clearing stale restart request for pinned session %q: %v\n", sessionName, err) //nolint:errcheck // best-effort stderr
+			return handoffOutcome{code: 1}
+		}
+		fmt.Fprintf(stdout, "Handoff: sent mail %s (checkpoint only; pinned named session remains running).\n", b.ID) //nolint:errcheck // best-effort stdout
+		return handoffOutcome{code: 0, disposition: handoffDispositionCheckpointOnly}
 	}
 
 	if err := dops.setRestartRequested(sessionName); err != nil {
 		fmt.Fprintf(stderr, "gc handoff: setting restart flag: %v\n", err) //nolint:errcheck // best-effort stderr
 		return handoffOutcome{code: 1}
 	}
-	// Pinned named sessions are kill-protected by the reconciler unless an
-	// explicit controller reset (continuation_reset_pending) is persisted
-	// through the worker boundary: without it, the reconciler's collateral-skip
-	// clears the runtime flag set above and leaves the session running
-	// indefinitely. Persisting is therefore mandatory for pinned sessions; for
-	// everything else the runtime flag is primary and the bead write stays
-	// best-effort backup.
-	if pinned {
-		if persistRestart == nil {
-			fmt.Fprintf(stderr, "gc handoff: pinned session %q has no restart persistence available; not requesting restart\n", sessionName) //nolint:errcheck // best-effort stderr
-			return handoffOutcome{code: 1}
-		}
-		if err := persistRestart(); err != nil {
-			fmt.Fprintf(stderr, "gc handoff: could not persist restart marker for pinned session %q; not requesting restart: %v\n", sessionName, err) //nolint:errcheck // best-effort stderr
-			return handoffOutcome{code: 1}
-		}
-	} else if persistRestart != nil {
+	if persistRestart != nil {
 		if err := persistRestart(); err != nil {
 			fmt.Fprintf(stderr, "gc handoff: setting bead restart flag: %v\n", err) //nolint:errcheck // best-effort stderr
 		}
@@ -306,7 +315,7 @@ func doHandoffWithOutcome(store, sessStore beads.Store, rec events.Recorder, dop
 	})
 
 	fmt.Fprintf(stdout, "Handoff: sent mail %s, requesting restart...\n", b.ID) //nolint:errcheck // best-effort stdout
-	return handoffOutcome{code: 0, restartRequested: true}
+	return handoffOutcome{code: 0, disposition: handoffDispositionRestartRequested}
 }
 
 // doHandoffAuto sends handoff mail to self without requesting restart.
