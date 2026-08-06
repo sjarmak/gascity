@@ -165,7 +165,8 @@ func TestDisableAndPurgeBoundsInitialAndPostUploaderStateLocks(t *testing.T) {
 
 	t.Run("post-uploader state lock", func(t *testing.T) {
 		home, service, _ := newRecordServiceFixture(t, testEventIDThree)
-		service.deps.disableStateWait = 100 * time.Millisecond
+		service.deps.disableStateWait = testutil.GoroutineRaceTimeout / 2
+		service.deps.disableFinalStateWait = 100 * time.Millisecond
 		atUploader := make(chan struct{})
 		releaseUploaderAttempt := make(chan struct{})
 		service.deps.beforeDisableUploaderLock = func() {
