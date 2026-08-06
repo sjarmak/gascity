@@ -2387,6 +2387,12 @@ dir = "myrig"
 
 func TestCmdNudgeStatusJSON(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
+	// Fake session runtime: resolving the mayor alias materializes the named
+	// session, and with the real provider that starts an actual tmux server on
+	// the shared "test-city" socket that outlives the test (99 accumulated on
+	// one host, the oldest 21 days). This test asserts on nudge-queue JSON,
+	// not session runtime behavior.
+	t.Setenv("GC_SESSION", "fake")
 	cityDir := t.TempDir()
 	writeNamedSessionCityTOML(t, cityDir)
 	t.Setenv("GC_CITY", cityDir)
