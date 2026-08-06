@@ -4694,12 +4694,12 @@ func TestStopManagedCityDoesNotUseStartupOrDriftTimeouts(t *testing.T) {
 		},
 	}
 
-	var stderr bytes.Buffer
-	start := time.Now()
-	err := stopManagedCity(mc, cityPath, &stderr)
-	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-		t.Fatalf("stopManagedCity took %s, want shutdown-timeout bound", elapsed)
+	if got := managedCityStopTimeout(mc); got != 20*time.Millisecond {
+		t.Fatalf("managedCityStopTimeout = %s, want shutdown timeout", got)
 	}
+
+	var stderr bytes.Buffer
+	err := stopManagedCity(mc, cityPath, &stderr)
 	if err == nil {
 		t.Fatal("stopManagedCity err = nil, want non-nil because city never exited")
 	}
