@@ -205,6 +205,24 @@ func buildAwakeInputFromReconciler(
 	return input
 }
 
+// applyConvoyHolds marks the seats that unfinishedConvoyHolds found to be
+// mid-run on a convoy that has not finished.
+//
+// It is a separate step rather than another buildAwakeInputFromReconciler
+// parameter because that function is pure over data the reconciler has already
+// collected — it performs no store I/O — and the convoy verdict is resolved by
+// reading beads. Keeping the read on this side preserves that split.
+func applyConvoyHolds(input *AwakeInput, holds map[string]bool) {
+	if input == nil || len(holds) == 0 {
+		return
+	}
+	for i := range input.SessionBeads {
+		if holds[input.SessionBeads[i].ID] {
+			input.SessionBeads[i].HoldsUnfinishedConvoy = true
+		}
+	}
+}
+
 func shouldProbeAttachmentForAwakeInput(info session.Info, alive bool, cfg *config.City, poolDesired map[string]int) bool {
 	if !alive {
 		return false

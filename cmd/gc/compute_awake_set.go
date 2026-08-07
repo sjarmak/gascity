@@ -77,6 +77,18 @@ type AwakeSessionBead struct {
 	RestartRequested          bool      // restart_requested metadata is still active
 	ContinuationResetPending  bool      // continuation_reset_pending metadata is set
 	CurrentlyProcessingBeadID string    // work bead the session is currently processing
+	// HoldsUnfinishedConvoy is true when the convoy anchored by this session's
+	// currently_processing_bead_id has not finished. It is deliberately
+	// independent of whether any step is claimed right now: between two steps
+	// the previous one is closed and the next is open and unassigned, so the
+	// seat presents no assigned demand at all even though it is mid-run.
+	//
+	// Without this fact the seat looks idle for that window, and a drain
+	// verdict computed inside it churns the run — the convoy's remaining work
+	// is requeued and re-picked by a different seat, which repeats the
+	// worktree setup the original seat had already done. The fix is to close
+	// the window, not to order the drain against the claim.
+	HoldsUnfinishedConvoy bool
 }
 
 // AwakeWorkBead represents a work bead with an assignee.
@@ -290,6 +302,26 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 		}
 	}
 
+	// Seats holding an unfinished convoy. A seat between two steps of a run it
+	// still owns has no claimed work to point at, so none of the demand passes
+	// above see it; this pass is what keeps it out of the drain set for that
+	// window. It never displaces an existing reason — a seat already explained
+	// by manual, scaled, or named demand keeps that reason for observability,
+	// and the idle exemption below keys off the hold itself rather than the
+	// reason string, so the protection applies either way.
+	for _, bead := range input.SessionBeads {
+		if !bead.HoldsUnfinishedConvoy || bead.State == "closed" || bead.Drained {
+			continue
+		}
+		if _, already := desired[bead.SessionName]; already {
+			continue
+		}
+		if agent, ok := lookupAgent(bead.Template); !ok || agent.Suspended {
+			continue
+		}
+		desired[bead.SessionName] = "convoy-hold"
+	}
+
 	// Sessions with assigned work — a session that has in_progress work or
 	// ready open work assigned to it must stay awake. Open work must carry
 	// Ready=true so a blocked routed assignment cannot become wake demand if
@@ -479,7 +511,14 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 		// because it has no idle reference. The "work done, no demand" drain
 		// still fires via the "on-demand:running" reason, which is NOT exempt.
 		// See #3413.
+		//
+		// A seat holding an unfinished convoy is exempt on the fact, not on its
+		// reason string: at a step boundary the seat may still be carrying an
+		// unrelated reason (scaled:demand, manual) that is itself idle-eligible,
+		// and canceling the wake there would re-open exactly the window the
+		// hold exists to close.
 		if decision.ShouldWake && !input.AttachedSessions[name] && !input.PendingSessions[name] && !bead.Pinned && !bead.IdleSince.IsZero() &&
+			!bead.HoldsUnfinishedConvoy &&
 			!isAlwaysNamedSession(input.NamedSessions, bead) &&
 			desired[name] != "assigned-work" && desired[name] != "min-active" &&
 			desired[name] != "reset-pending" &&

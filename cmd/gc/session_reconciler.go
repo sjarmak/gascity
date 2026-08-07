@@ -3384,6 +3384,11 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		cfg, cityPath, sessionInfos, poolDesired, namedSessionDemand, namedRoutedDemand, workSet, readyWaitSet,
 		assignedWorkBeads, reconcileOpts.readyAssignedFlags, wakeTargets, sp, clk.Now(),
 	)
+	// A seat between two steps of a run it still owns has no claimed work, so
+	// none of the demand signals above see it. Resolve that hold from the store
+	// and fold it in before the decision, so the seat is never in the drain set
+	// at a step boundary.
+	applyConvoyHolds(&awakeInput, unfinishedConvoyHolds(cityPath, cfg, store, rigStores, sessionInfos, stderr))
 	awakeDecisions := ComputeAwakeSet(awakeInput)
 	wakeEvals := awakeSetToWakeEvals(awakeDecisions, awakeInput.SessionBeads)
 
