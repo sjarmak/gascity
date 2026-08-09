@@ -84,6 +84,7 @@ func workerFactoryWithStaleKeyDetectionWaiter(
 		UsageSink:               usageSinkForCity(cfg, cityPath),
 		ResolveTransport:        resolveTransport,
 		ResolveSessionRuntime:   workerSessionRuntimeResolverWithConfig(cityPath, cfg),
+		ResolveStartupPrompt:    workerStartupPromptResolverWithConfig(cityPath, store, sp, cfg),
 		StaleKeyDetectionWaiter: waiter,
 		Pricing:                 cfg.PricingRegistry(),
 	})

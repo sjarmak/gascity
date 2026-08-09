@@ -1078,10 +1078,12 @@ func buildPreparedStartWithWorkDirResolver(
 	hasResumeKey := strings.TrimSpace(candidate.info.SessionKey) != ""
 	// S19 priming confirmation (write-only in Stage 2): a marker is stamped only
 	// when the pure delivery decision holds AND this incarnation is a fresh
-	// launch — the exact complement of the resume override below, which swaps in
+	// launch — the exact complement of the resume override, which swaps in
 	// restartPromptNudge and delivers nothing. Reading the env marker instead
 	// would mis-stamp every resume (it is re-set to "1" for hook consumption).
-	promptDelivered := delivery.Delivered && (firstStart || forceFresh || !hasResumeKey)
+	// Both halves live in applyStartupPromptDelivery, the single copy of the
+	// rule shared with the worker handle's runtime resolver (dr-5fek).
+	promptDelivered := applyStartupPromptDelivery(&agentCfg, tp.Prompt, tp.Hints.Nudge, delivery, firstStart, forceFresh, hasResumeKey)
 	// prompt_hash is the sha256 of the rendered startup TEMPLATE prompt (tp.Prompt)
 	// only, computed here BEFORE the one-shot initial_message is appended to the
 	// delivered payload below. The hash exists so a template/config change re-primes
@@ -1089,42 +1091,13 @@ func buildPreparedStartWithWorkDirResolver(
 	// replays the transient initial_message, so hashing the delivered bytes would
 	// make the stored hash never match the re-derivation and re-prime forever.
 	promptHash := sessionpkg.PromptHash(tp.Prompt)
-	if !firstStart && !forceFresh && hasResumeKey {
-		agentCfg.PromptSuffix = ""
-		agentCfg.PromptFlag = ""
-		agentCfg.Nudge = restartPromptNudge(tp.Prompt, tp.Hints.Nudge)
-		if agentCfg.Env != nil {
-			delete(agentCfg.Env, startupPromptDeliveredEnv)
-		}
-		if strings.TrimSpace(tp.Prompt) != "" {
-			if agentCfg.Env == nil {
-				agentCfg.Env = map[string]string{}
-			}
-			agentCfg.Env[startupPromptDeliveredEnv] = "1"
-		}
-	}
 	// Initial message: append to prompt on first start only, reusing the
 	// overrides parsed once by parseSessionTemplateOverridesForLaunch above.
 	// Schema overrides were already applied in the block above (before coreHash).
 	// resolveSessionCommand only adds --resume/--session-id which are not schema
 	// flags, so the overrides don't need to be re-applied.
 	if msg, ok := sessionOverrides["initial_message"]; ok && msg != "" && (firstStart || forceFresh) {
-		if tp.ResolvedProvider != nil && tp.ResolvedProvider.PromptMode == "none" {
-			agentCfg.Nudge = appendInitialMessageToStartupNudge(agentCfg.Nudge, msg)
-		} else {
-			existing := ""
-			if agentCfg.PromptSuffix != "" {
-				parts := shellquote.Split(agentCfg.PromptSuffix)
-				if len(parts) > 0 {
-					existing = parts[0]
-				}
-			}
-			if existing != "" {
-				agentCfg.PromptSuffix = shellquote.Quote(existing + "\n\n---\n\nUser message:\n" + msg)
-			} else {
-				agentCfg.PromptSuffix = shellquote.Quote(msg)
-			}
-		}
+		applyInitialMessage(&agentCfg, msg, tp.ResolvedProvider != nil && tp.ResolvedProvider.PromptMode == "none")
 	}
 	generation, _ := strconv.Atoi(candidate.info.Generation)
 	if generation <= 0 {

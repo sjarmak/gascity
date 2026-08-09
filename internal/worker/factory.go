@@ -35,6 +35,9 @@ type FactoryConfig struct {
 	// Pricing estimates per-invocation cost for telemetry. Nil falls back
 	// to the registry built from shipped defaults.
 	Pricing *pricing.Registry
+	// ResolveStartupPrompt renders the startup prompt at start time. See
+	// SessionHandleConfig.ResolveStartupPrompt.
+	ResolveStartupPrompt StartupPromptResolver
 }
 
 // Factory centralizes worker-boundary object construction for callers such as
@@ -47,6 +50,7 @@ type Factory struct {
 	recorder              events.Recorder
 	usageSink             usage.Sink
 	resolveSessionRuntime SessionRuntimeResolver
+	resolveStartupPrompt  StartupPromptResolver
 	pricing               *pricing.Registry
 }
 
@@ -64,7 +68,12 @@ func NewFactory(cfg FactoryConfig) (*Factory, error) {
 		opts = append(opts, sessionpkg.WithStaleKeyDetectionWaiter(cfg.StaleKeyDetectionWaiter))
 	}
 	manager := sessionpkg.NewManagerWithOptions(cfg.Store, cfg.Provider, opts...)
-	return newFactory(manager, cfg.Store, cfg.Provider, cfg.SearchPaths, cfg.Recorder, cfg.UsageSink, cfg.ResolveSessionRuntime, cfg.Pricing)
+	f, err := newFactory(manager, cfg.Store, cfg.Provider, cfg.SearchPaths, cfg.Recorder, cfg.UsageSink, cfg.ResolveSessionRuntime, cfg.Pricing)
+	if err != nil {
+		return nil, err
+	}
+	f.resolveStartupPrompt = cfg.ResolveStartupPrompt
+	return f, nil
 }
 
 // NewFactoryFromManager wraps an already-constructed session manager behind the
@@ -111,12 +120,13 @@ func (f *Factory) UsageSink() usage.Sink {
 // session manager and transcript search paths.
 func (f *Factory) Session(spec SessionSpec) (*SessionHandle, error) {
 	return NewSessionHandle(SessionHandleConfig{
-		Manager:     f.manager,
-		SearchPaths: append([]string(nil), f.searchPaths...),
-		Recorder:    f.recorder,
-		UsageSink:   f.usageSink,
-		Session:     spec,
-		Pricing:     f.pricing,
+		Manager:              f.manager,
+		SearchPaths:          append([]string(nil), f.searchPaths...),
+		Recorder:             f.recorder,
+		UsageSink:            f.usageSink,
+		Session:              spec,
+		Pricing:              f.pricing,
+		ResolveStartupPrompt: f.resolveStartupPrompt,
 	})
 }
 

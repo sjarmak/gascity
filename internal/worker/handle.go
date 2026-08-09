@@ -256,6 +256,26 @@ type SessionHandleConfig struct {
 	// Pricing estimates per-invocation cost for telemetry. Nil falls back
 	// to the registry built from shipped defaults.
 	Pricing *pricing.Registry
+	// ResolveStartupPrompt renders the agent's startup prompt for this session
+	// at START time. It is deliberately NOT applied when the handle is built:
+	// rendering a template stages provider overlays and writes settings and
+	// skill snapshots, which must not happen for read-only operations like
+	// peek, state, or kill. Nil leaves the spec's own hints untouched (dr-5fek).
+	ResolveStartupPrompt StartupPromptResolver
+}
+
+// StartupPromptResolver renders the startup prompt for an existing session.
+// It is invoked only on paths that actually bring a runtime up.
+type StartupPromptResolver func(info sessionpkg.Info, metadata map[string]string) (StartupPrompt, error)
+
+// StartupPrompt is the prompt-bearing subset of runtime.Config. Keeping it
+// narrow means a startup-prompt resolver cannot quietly redirect the command,
+// work dir, or environment of a session it was only asked to prime.
+type StartupPrompt struct {
+	PromptSuffix string
+	PromptFlag   string
+	Nudge        string
+	Env          map[string]string
 }
 
 // SessionHandle is the production worker handle backed by session.Manager.
@@ -271,6 +291,7 @@ type SessionHandle struct {
 	history        *HistorySnapshot
 	historyRaw     historyGeneration
 	pricing        *pricing.Registry
+	resolvePrompt  StartupPromptResolver
 	invTelemetryMu sync.Mutex
 	// sidecarDoneID is the session id whose transcript-session sidecar has been
 	// confirmed written, guarded by sidecarMu. The keyed transcript path is stable

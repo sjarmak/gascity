@@ -1130,6 +1130,67 @@ func TestPrepareStartCandidate_ResumeCapableWithoutSessionKeyKeepsStartupPrompt(
 	}
 }
 
+// The complement of the test above, and the branch that had NO coverage: when
+// there IS a session_key to resume onto, the startup prompt must NOT be replayed
+// as a fresh first turn. It comes off the command line entirely and re-primes
+// through the nudge instead.
+//
+// Written for dr-5fek. The delivery rule was extracted into
+// applyStartupPromptDelivery so the reconciler and the worker handle share one
+// copy; disabling that override left every pre-existing reconciler test green,
+// which means this branch was resting on nothing.
+func TestPrepareStartCandidate_ResumeWithSessionKeyRePrimesInsteadOfReplaying(t *testing.T) {
+	store := beads.NewMemStore()
+	session, err := store.Create(beads.Bead{
+		Title:  "codex-worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "agent:codex-worker"},
+		Metadata: map[string]string{
+			"template":            "codex-worker",
+			"session_name":        "codex-worker",
+			"started_config_hash": "previous-start",
+			"session_key":         "existing-provider-session",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, err := prepareStartCandidate(startCandidate{
+		info: sessiontest.SeedBead(t, session),
+		tp: TemplateParams{
+			TemplateName: "codex-worker",
+			SessionName:  "codex-worker",
+			Command:      "aimux run codex -- --dangerously-bypass-approvals-and-sandbox",
+			Prompt:       "You are a routed workflow lane. Run gc hook first.",
+			ResolvedProvider: &config.ResolvedProvider{
+				Name:          "codex",
+				PromptMode:    "arg",
+				ResumeFlag:    "resume",
+				ResumeStyle:   "subcommand",
+				ResumeCommand: "aimux run codex -- resume {{.SessionKey}}",
+			},
+		},
+		order: 0,
+	}, &config.City{}, store, &clock.Fake{Time: time.Date(2026, 5, 5, 4, 20, 0, 0, time.UTC)})
+	if err != nil {
+		t.Fatalf("prepareStartCandidate: %v", err)
+	}
+
+	if prepared.cfg.PromptSuffix != "" {
+		t.Fatalf("PromptSuffix = %q, want empty: resuming onto a live session must not replay the startup prompt as argv", prepared.cfg.PromptSuffix)
+	}
+	if prepared.cfg.PromptFlag != "" {
+		t.Fatalf("PromptFlag = %q, want empty on resume", prepared.cfg.PromptFlag)
+	}
+	if !strings.Contains(prepared.cfg.Nudge, "Run gc hook first") {
+		t.Fatalf("Nudge = %q, want the startup prompt re-primed through the nudge", prepared.cfg.Nudge)
+	}
+	if got := prepared.cfg.Env[startupPromptDeliveredEnv]; got != "1" {
+		t.Fatalf("Env[%s] = %q, want \"1\" so hooks can tell primed from never-primed", startupPromptDeliveredEnv, got)
+	}
+}
+
 func TestPrepareStartCandidate_DoesNotAppendCLIResumeFlagForACP(t *testing.T) {
 	store := beads.NewMemStore()
 	session, err := store.Create(beads.Bead{

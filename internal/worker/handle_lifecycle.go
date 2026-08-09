@@ -22,8 +22,65 @@ func (h *SessionHandle) Start(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	err = h.manager.Start(ctx, id, startCommand, h.runtimeHints())
+	startHints, err := h.startHints(id)
+	if err != nil {
+		return err
+	}
+	err = h.manager.Start(ctx, id, startCommand, startHints)
 	return err
+}
+
+// startHints builds the runtime hints for a start that is actually happening.
+//
+// The startup prompt is rendered HERE and not when the handle is constructed.
+// Rendering a template is not a read: it stages provider overlays, installs
+// hook-backed files, and writes settings and skill snapshots. Doing that at
+// handle-construction time would make read-only operations -- peek, state,
+// kill, stop, observe -- mutate the city on disk. So it is paid for only by the
+// paths that actually bring a runtime up from an EXISTING session record:
+// Start, Attach, and StartResolved's empty-hints fallback.
+//
+// Create(CreateModeStarted) also starts a runtime and is deliberately NOT
+// covered here. dr-5fek is scoped to priming EXISTING session records
+// (attach / restart / recycle); creating one is a separate repair.
+//
+// The distinguishing factor is ownership metadata -- session kind, agent_name,
+// configured_named_session, pool markers -- NOT "existing record vs ad-hoc
+// create": this mode also starts configured sessions. Resolving unconditionally
+// here regressed two real tests (gc session new surfaced a city.toml rig-path
+// validation error this path had never executed, and a configured named
+// session failed to start), because the create call site does not yet apply
+// that ownership test the way startupPromptAgentForSession does for existing
+// records.
+//
+// A resolver error is returned, not swallowed. A configured agent whose
+// template will not resolve must fail loudly here rather than silently start
+// the session live-but-unprimed, which is the exact defect this fixes.
+func (h *SessionHandle) startHints(id string) (runtime.Config, error) {
+	cfg := h.runtimeHints()
+	if h.resolvePrompt == nil {
+		return cfg, nil
+	}
+	info, pr, err := sessionRecordViaManager(h.manager, id)
+	if err != nil {
+		return runtime.Config{}, err
+	}
+	prompt, err := h.resolvePrompt(info, pr.Metadata)
+	if err != nil {
+		return runtime.Config{}, err
+	}
+	return applyStartupPromptToConfig(cfg, prompt), nil
+}
+
+// applyStartupPromptToConfig lays the resolved prompt onto runtime hints. The
+// resolver owns only the prompt-bearing fields; it can never redirect the
+// command, work dir, or provider of a session it was asked to prime.
+func applyStartupPromptToConfig(cfg runtime.Config, prompt StartupPrompt) runtime.Config {
+	cfg.PromptSuffix = prompt.PromptSuffix
+	cfg.PromptFlag = prompt.PromptFlag
+	cfg.Nudge = prompt.Nudge
+	cfg.Env = mergeStringMaps(cfg.Env, prompt.Env)
+	return cfg
 }
 
 // StartResolved starts or resumes the worker using a caller-supplied runtime
@@ -47,7 +104,10 @@ func (h *SessionHandle) StartResolved(ctx context.Context, startCommand string, 
 	}
 	startHints := hints
 	if strings.TrimSpace(startHints.Command) == "" {
-		startHints = h.runtimeHints()
+		startHints, err = h.startHints(id)
+		if err != nil {
+			return err
+		}
 	}
 	err = h.manager.StartRuntimeOnly(ctx, id, command, startHints)
 	return err
@@ -67,7 +127,11 @@ func (h *SessionHandle) Attach(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	err = h.manager.Attach(ctx, id, resumeCommand, h.runtimeHints())
+	startHints, err := h.startHints(id)
+	if err != nil {
+		return err
+	}
+	err = h.manager.Attach(ctx, id, resumeCommand, startHints)
 	return err
 }
 
@@ -470,6 +534,15 @@ func (h *SessionHandle) startCommand(id string) (string, error) {
 		resumeInfo.ResumeCommand = resumeCommand
 	}
 	return sessionpkg.BuildResumeCommand(resumeInfo), nil
+}
+
+// FirstProviderSessionStart reports whether this incarnation is the first
+// launch of the underlying provider session, as opposed to a resume onto one
+// that already exists. Exported so the cmd/gc runtime resolver can apply the
+// startup-prompt delivery rule from the same predicate the handle's own start
+// builder uses, instead of keeping a second copy that can drift (dr-5fek).
+func FirstProviderSessionStart(state sessionpkg.State, metadata map[string]string) bool {
+	return firstProviderSessionStart(state, metadata)
 }
 
 func firstProviderSessionStart(state sessionpkg.State, metadata map[string]string) bool {
