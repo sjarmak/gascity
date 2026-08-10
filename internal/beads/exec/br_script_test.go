@@ -21,6 +21,53 @@ func TestGcBeadsBrReadyIncludeEphemeralFailsLoudlyUntilSupported(t *testing.T) {
 	}
 }
 
+func TestGcBeadsBrFenceAndRemovalUseRevisionGuardedMetadataLabels(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "br.log")
+	binDir := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const oldLabel = "metahex:647261696e5f61636b5f746f6b656e:6f6c64"
+	fake := filepath.Join(binDir, "br")
+	script := `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$BR_TEST_LOG"
+case "$1" in
+  show) printf '[{"id":"gc-session","status":"open","labels":["keep","` + oldLabel + `"]}]\n' ;;
+  update) printf '{"ok":true}\n' ;;
+  *) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BR_TEST_LOG", logPath)
+	t.Setenv("BR_DIR", tmp)
+
+	store := NewStore(findGcBeadsBrScript(t))
+	if won, err := store.FenceMetadataKey("gc-session", "drain_ack_token", "old", "new"); err != nil || !won {
+		t.Fatalf("FenceMetadataKey = (%v, %v), want (true, nil)", won, err)
+	}
+	if err := store.Update("gc-session", beads.UpdateOpts{RemoveMetadata: []string{"drain_ack_token"}}); err != nil {
+		t.Fatalf("Update RemoveMetadata: %v", err)
+	}
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(logBytes)
+	for _, want := range []string{
+		"update --json gc-session --set-labels keep,metahex:647261696e5f61636b5f746f6b656e:6e6577",
+		"update --json gc-session --set-labels keep",
+	} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("br calls missing %q:\n%s", want, log)
+		}
+	}
+}
+
 func findGcBeadsBrScript(t *testing.T) string {
 	t.Helper()
 

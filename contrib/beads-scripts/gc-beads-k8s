@@ -188,6 +188,18 @@ join_labels() {
   echo "$*"
 }
 
+sql_string_literal() {
+  local value="${1//\\/\\\\}"
+  value="${value//\'/\'\'}"
+  printf "'%s'" "$value"
+}
+
+metadata_json_path() {
+  local key="${1//\\/\\\\}"
+  key="${key//\"/\\\"}"
+  printf '$."%s"' "$key"
+}
+
 # --- Operations ---
 
 case "$op" in
@@ -371,14 +383,45 @@ case "$op" in
     parent_id=$(echo "$input" | jq -r '.parent_id // empty')
     [ -n "$parent_id" ] && cmd_args+=(--add-label "parent:$parent_id")
 
-    # Handle metadata via --metadata (avoids CSV quoting issues with --add-label).
-    # bd --metadata uses merge semantics: new keys are added, existing keys are
-    # overwritten, and keys not in the payload are preserved. Verified against
-    # bd 0.62+ (see TestUpdate_metadataRoundTripsViaConformance).
-    metadata_json=$(echo "$input" | jq -c '.metadata // empty')
-    [ -n "$metadata_json" ] && cmd_args+=(--metadata "$metadata_json")
+    # Incremental flags can be combined with --unset-metadata in one atomic bd
+    # update; the full --metadata flag cannot.
+    while IFS= read -r entry; do
+      [ -z "$entry" ] && continue
+      meta_key=$(printf '%s' "$entry" | jq -r '.key')
+      meta_value=$(printf '%s' "$entry" | jq -r '.value')
+      cmd_args+=(--set-metadata "$meta_key=$meta_value")
+    done < <(echo "$input" | jq -c '.metadata // {} | to_entries[]')
+
+    while IFS= read -r meta_key; do
+      [ -n "$meta_key" ] && cmd_args+=(--unset-metadata "$meta_key")
+    done < <(echo "$input" | jq -r '.remove_metadata // [] | .[]')
 
     run_bd "${cmd_args[@]}" > /dev/null
+    ;;
+
+  fence-metadata-key)
+    id="${1:?fence-metadata-key: missing id}"
+    key="${2:?fence-metadata-key: missing key}"
+    expected="${3-}"
+    next=$(cat)
+	row=$(run_bd show --json "$id" | jq '.[0]')
+	table="issues"
+	if [ "$(printf '%s' "$row" | jq -r '(.no_history // false) or (.ephemeral // false)')" = "true" ]; then
+		table="wisps"
+	fi
+    path=$(metadata_json_path "$key")
+    metadata="COALESCE(NULLIF(metadata, ''), '{}')"
+	row_lock_hex=$(od -An -N8 -tx8 /dev/urandom | tr -d ' \n')
+	row_lock=$((16#${row_lock_hex:0:15}))
+	[ "$row_lock" -ne 0 ] || row_lock=1
+	query="UPDATE $table SET metadata = JSON_SET($metadata, $(sql_string_literal "$path"), $(sql_string_literal "$next")), row_lock = CASE WHEN row_lock = $row_lock THEN $((row_lock + 1)) ELSE $row_lock END, updated_at = CURRENT_TIMESTAMP WHERE id = $(sql_string_literal "$id") AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT($metadata, $(sql_string_literal "$path"))), '') = $(sql_string_literal "$expected")"
+    result=$(run_bd sql --json "$query")
+    rows=$(printf '%s' "$result" | jq -r '.rows_affected // 0')
+    if [ "$rows" -gt 0 ] 2>/dev/null; then
+      printf '{"swapped":true}\n'
+    else
+      printf '{"swapped":false}\n'
+    fi
     ;;
 
   close)

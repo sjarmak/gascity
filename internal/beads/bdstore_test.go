@@ -3318,6 +3318,88 @@ func TestBdStoreReleaseIfCurrentUsesGuardedSQL(t *testing.T) {
 	}
 }
 
+func TestBdStoreFenceMetadataKeyUsesGuardedSQL(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		if args[0] == "show" {
+			return []byte(`[{"id":"bd-'42","title":"session","status":"open","issue_type":"session","no_history":true}]`), nil
+		}
+		gotArgs = append([]string(nil), args...)
+		return []byte(`{"rows_affected":1,"schema_version":1}`), nil
+	}
+	store := beads.NewBdStore("/city", runner)
+
+	swapped, err := store.FenceMetadataKey("bd-'42", `drain_ack."fence`, "old", "new")
+	if err != nil || !swapped {
+		t.Fatalf("FenceMetadataKey = (%v, %v), want (true, nil)", swapped, err)
+	}
+	if len(gotArgs) != 3 || gotArgs[0] != "sql" || gotArgs[1] != "--json" {
+		t.Fatalf("args = %q, want bd sql --json <query>", gotArgs)
+	}
+	for _, want := range []string{
+		"UPDATE wisps SET metadata = JSON_SET",
+		"row_lock = ",
+		"WHERE id = 'bd-''42'",
+		"= 'old'",
+	} {
+		if !strings.Contains(gotArgs[2], want) {
+			t.Fatalf("SQL query missing %q: %s", want, gotArgs[2])
+		}
+	}
+	if strings.Contains(gotArgs[2], "revision =") {
+		t.Fatalf("SQL query references the nonexistent revision column: %s", gotArgs[2])
+	}
+	if !strings.Contains(gotArgs[2], `drain_ack`) || !strings.Contains(gotArgs[2], `fence`) {
+		t.Fatalf("SQL query missing escaped metadata path: %s", gotArgs[2])
+	}
+}
+
+func TestBdStoreFenceMetadataKeySkipsValueMismatch(t *testing.T) {
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		if args[0] == "show" {
+			return []byte(`[{"id":"bd-42","title":"session","status":"open","issue_type":"session"}]`), nil
+		}
+		return []byte(`{"rows_affected":0,"schema_version":1}`), nil
+	}
+	store := beads.NewBdStore("/city", runner)
+	if swapped, err := store.FenceMetadataKey("bd-42", "fence", "old", "new"); err != nil || swapped {
+		t.Fatalf("FenceMetadataKey = (%v, %v), want (false, nil)", swapped, err)
+	}
+}
+
+func TestBdStoreFenceMetadataKeyFallsBackToEmbeddedDoltSQL(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"demo"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	runner := func(callDir, name string, args ...string) ([]byte, error) {
+		calls = append(calls, callDir+": "+name+" "+strings.Join(args, " "))
+		switch name {
+		case "bd":
+			if args[0] == "show" {
+				return []byte(`[{"id":"bd-42","title":"session","status":"open","issue_type":"session"}]`), nil
+			}
+			return nil, errors.New("'bd sql' is not yet supported in embedded mode")
+		case "dolt":
+			return []byte(`{"rows":[{"rows_affected":1}]}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected command %s", name)
+		}
+	}
+	store := beads.NewBdStore(dir, runner)
+	if swapped, err := store.FenceMetadataKey("bd-42", "fence", "", "claimed"); err != nil || !swapped {
+		t.Fatalf("FenceMetadataKey = (%v, %v), want (true, nil)", swapped, err)
+	}
+	if len(calls) != 3 || !strings.Contains(calls[2], "dolt sql -r json -q UPDATE issues SET metadata = JSON_SET") ||
+		!strings.Contains(calls[2], "SELECT ROW_COUNT() AS rows_affected") {
+		t.Fatalf("calls = %#v, want bd SQL followed by guarded embedded Dolt SQL", calls)
+	}
+}
+
 func TestBdStoreReleaseIfCurrentSQLLiteralEscapesBackslash(t *testing.T) {
 	var gotArgs []string
 	runner := func(_, _ string, args ...string) ([]byte, error) {

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -35,12 +34,6 @@ type DoltliteReadStore struct {
 }
 
 func (s *DoltliteReadStore) NeedsSessionTypeFallback() bool { return true }
-
-type doltliteMetadata struct {
-	Backend      string `json:"backend"`
-	Database     string `json:"database"`
-	DoltDatabase string `json:"dolt_database"`
-}
 
 type doltliteTableSet struct {
 	issues string
@@ -127,18 +120,7 @@ func doltliteIssueTypeNotInPredicate(alias string) (string, []any) {
 // .beads/metadata.json (dolt_database, then database), falling back to the "hq"
 // default bd uses when neither pins a concrete name.
 func doltliteDBPath(dir string) (string, error) {
-	meta, err := readDoltliteMetadata(dir)
-	if err != nil {
-		return "", err
-	}
-	dbName := strings.TrimSpace(meta.DoltDatabase)
-	if dbName == "" || dbName == "doltlite" {
-		dbName = strings.TrimSpace(meta.Database)
-	}
-	if dbName == "" || dbName == "doltlite" {
-		dbName = "hq"
-	}
-	return filepath.Join(dir, ".beads", "doltlite", dbName+".db"), nil
+	return doltliteFenceDBPath(dir)
 }
 
 func NewDoltliteReadStore(dir string, backing *BdStore) (*DoltliteReadStore, error) {
@@ -192,21 +174,6 @@ func ReindexDoltliteStore(dir string) error {
 		return fmt.Errorf("closing doltlite store %q after reindex: %w", dbPath, err)
 	}
 	return nil
-}
-
-func readDoltliteMetadata(dir string) (doltliteMetadata, error) {
-	var meta doltliteMetadata
-	data, err := os.ReadFile(filepath.Join(dir, ".beads", "metadata.json"))
-	if err != nil {
-		return meta, err
-	}
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return meta, err
-	}
-	if !isDoltliteMetadata(meta.Backend, meta.Database) {
-		return meta, fmt.Errorf("not a doltlite beads store")
-	}
-	return meta, nil
 }
 
 func (s *DoltliteReadStore) CloseStore() error {
@@ -699,6 +666,17 @@ func (s *DoltliteReadStore) DeleteIfMatch(_ string, _ int64) error {
 // UpdateIfMatch).
 func (s *DoltliteReadStore) CompareAndSetMetadataKey(_, _, _, _ string) (bool, error) {
 	return false, ErrConditionalWriteUnsupported
+}
+
+// FenceMetadataKey delegates the self-contained bd value-CAS path. Unlike the
+// revision-based ConditionalWriter methods, this operation performs its own bd
+// read and does not consume the direct-SQL projection's unavailable revision.
+func (s *DoltliteReadStore) FenceMetadataKey(id, key, expected, next string) (bool, error) {
+	ok, err := s.BdStore.FenceMetadataKey(id, key, expected, next)
+	if err == nil && ok {
+		s.resetOrderRunCache()
+	}
+	return ok, err
 }
 
 // The stamp carrier promotes from the embedded *BdStore; the capability prober

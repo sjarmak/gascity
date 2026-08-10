@@ -29,6 +29,16 @@ func TestCurrentSessionRuntimeTargetUsesAlias(t *testing.T) {
 	if got.sessionName != "s-gc-42" {
 		t.Fatalf("sessionName = %q, want s-gc-42", got.sessionName)
 	}
+	if got.sessionID != "gc-42" {
+		t.Fatalf("sessionID = %q, want gc-42", got.sessionID)
+	}
+}
+
+func TestSessionRuntimeTargetDurableIdentityPrefersSessionID(t *testing.T) {
+	target := sessionRuntimeTarget{sessionID: "gc-42", sessionName: "agent"}
+	if got := target.durableIdentity(); got != "gc-42" {
+		t.Fatalf("durableIdentity() = %q, want gc-42", got)
+	}
 }
 
 func TestCurrentSessionRuntimeTargetFallsBackToCityPathEnv(t *testing.T) {

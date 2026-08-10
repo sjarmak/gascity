@@ -280,7 +280,7 @@ func TestFinalizeDrainAckStoppedSession_RecordsAgentStopMetric(t *testing.T) {
 		// metric label cannot silently fall back to the session-name space.
 		session := env.createSessionBead(sessionName, identity)
 		env.setSessionMetadata(&session, map[string]string{"agent_name": identity})
-		patch := sessionpkg.DrainAckStopPendingPatch(env.clk.Now().UTC())
+		patch := drainAckStopPendingPatchForTest(env.clk.Now().UTC())
 		if err := env.store.SetMetadataBatch(session.ID, patch); err != nil {
 			t.Fatalf("SetMetadataBatch(stop-pending): %v", err)
 		}
@@ -863,7 +863,7 @@ func TestFinalizeDrainAckStoppedSession_WitnessBranchDoesNotRecordMetric(t *test
 
 	session := env.createSessionBead(sessionName, identity)
 	env.setSessionMetadata(&session, map[string]string{"agent_name": identity})
-	patch := sessionpkg.DrainAckStopPendingPatch(env.clk.Now().UTC())
+	patch := drainAckStopPendingPatchForTest(env.clk.Now().UTC())
 	if err := env.store.SetMetadataBatch(session.ID, patch); err != nil {
 		t.Fatalf("SetMetadataBatch(stop-pending): %v", err)
 	}

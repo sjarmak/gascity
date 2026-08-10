@@ -107,6 +107,16 @@ func (dt *drainTracker) forgetDurableAckClear(id string) {
 	delete(dt.durableAckClears, id)
 }
 
+func (dt *drainTracker) durableAckClearPending(id string) bool {
+	if dt == nil {
+		return false
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	_, pending := dt.durableAckClears[id]
+	return pending
+}
+
 func (dt *drainTracker) durableAckClearSnapshot() map[string]string {
 	out := make(map[string]string)
 	if dt == nil {

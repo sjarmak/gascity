@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -474,7 +475,7 @@ func TestHookClaimSessionEligibility(t *testing.T) {
 // exits 0 so a startup wrapper treats the refusal as a completed drain.
 func TestWriteHookClaimDrainStaleSessionWithDrainAck(t *testing.T) {
 	acked := false
-	fakeAck := func(io.Writer) error { acked = true; return nil }
+	fakeAck := func(context.Context, io.Writer) error { acked = true; return nil }
 
 	var stdout, stderr bytes.Buffer
 	code := writeHookClaimDrain(hookClaimReasonStaleSession, true, true, fakeAck, &stdout, &stderr)
@@ -498,7 +499,7 @@ func TestWriteHookClaimDrainStaleSessionWithDrainAck(t *testing.T) {
 // runs drain-ack unless --drain-ack was requested, and returns the historical
 // exit 1 for an unacknowledged drain.
 func TestWriteHookClaimDrainDoesNotAckWhenNotRequested(t *testing.T) {
-	fakeAck := func(io.Writer) error {
+	fakeAck := func(context.Context, io.Writer) error {
 		t.Fatalf("drain-ack must not run without --drain-ack")
 		return nil
 	}

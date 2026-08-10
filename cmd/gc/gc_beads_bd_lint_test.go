@@ -359,3 +359,14 @@ func repoRootForLint(t *testing.T) string {
 		dir = parent
 	}
 }
+
+func TestGCBeadsBDScriptRoutesMetadataFence(t *testing.T) {
+	root := repoRootForLint(t)
+	data, err := os.ReadFile(filepath.Join(root, "examples", "bd", "assets", "scripts", "gc-beads-bd.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "|fence-metadata-key|") {
+		t.Fatal("gc-beads-bd.sh must route fence-metadata-key to bd-store-bridge")
+	}
+}

@@ -97,11 +97,21 @@ func (fs *FileStore) DeleteIfMatch(id string, expectedRevision int64) error {
 // flushes to disk. A genuine value mismatch returns (false, nil) without a save;
 // a swap persists and returns (true, nil).
 func (fs *FileStore) CompareAndSetMetadataKey(id, key, expected, next string) (bool, error) {
-	fs.fmu.Lock()
-	defer fs.fmu.Unlock()
 	if fs.DisableConditionalWrites {
 		return false, ErrConditionalWriteUnsupported
 	}
+	return fs.fenceMetadataKey(id, key, expected, next)
+}
+
+// FenceMetadataKey performs the always-on cross-process metadata CAS used by
+// lifecycle safety fences, independently of conditional-writes rollout mode.
+func (fs *FileStore) FenceMetadataKey(id, key, expected, next string) (bool, error) {
+	return fs.fenceMetadataKey(id, key, expected, next)
+}
+
+func (fs *FileStore) fenceMetadataKey(id, key, expected, next string) (bool, error) {
+	fs.fmu.Lock()
+	defer fs.fmu.Unlock()
 	if err := fs.locker.Lock(); err != nil {
 		return false, err
 	}
@@ -110,7 +120,7 @@ func (fs *FileStore) CompareAndSetMetadataKey(id, key, expected, next string) (b
 		return false, err
 	}
 	snap := fs.snapshotLocked()
-	ok, err := fs.MemStore.CompareAndSetMetadataKey(id, key, expected, next)
+	ok, err := fs.MemStore.FenceMetadataKey(id, key, expected, next)
 	if err != nil || !ok {
 		return ok, err // error, or (false, nil) genuine mismatch: nothing to persist
 	}

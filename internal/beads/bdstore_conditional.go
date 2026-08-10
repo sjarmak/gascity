@@ -543,6 +543,10 @@ func (s *BdStore) CompareAndSetMetadataKey(id, key, expected, next string) (bool
 	if capable, _ := s.conditionalWritesCapable(); !capable {
 		return false, ErrConditionalWriteUnsupported
 	}
+	return s.fenceMetadataKeyViaRevisionCAS(id, key, expected, next)
+}
+
+func (s *BdStore) fenceMetadataKeyViaRevisionCAS(id, key, expected, next string) (bool, error) {
 	for attempt := 1; ; attempt++ {
 		b, err := s.Get(id)
 		if err != nil {
@@ -588,4 +592,90 @@ func (s *BdStore) CompareAndSetMetadataKey(id, key, expected, next string) (bool
 			return false, err
 		}
 	}
+}
+
+// FenceMetadataKey performs the lifecycle value-CAS as one guarded SQL update.
+// Stable bd releases expose raw SQL before they expose revision-CAS, and the
+// WHERE predicate makes an ambiguous replay unnecessary: callers surface an
+// uncertain write and re-read on the next level-triggered pass.
+func (s *BdStore) FenceMetadataKey(id, key, expected, next string) (bool, error) {
+	if s.isDoltliteBackend() {
+		return fenceMetadataKeyViaDoltliteSQLite(s.ctx, s.dir, id, key, expected, next)
+	}
+	current, err := s.Get(id)
+	if err != nil {
+		return false, fmt.Errorf("bd fence-metadata-key: locating storage table: %w", err)
+	}
+	table := "issues"
+	if current.NoHistory || current.Ephemeral {
+		table = "wisps"
+	}
+	rowLock := freshMetadataFenceRowLock()
+	query := fenceMetadataKeySQLQuery(table, id, key, expected, next, rowLock)
+	if s.isPostgresBackend() {
+		query = fenceMetadataKeyPostgresSQLQuery(table, id, key, expected, next, rowLock)
+	}
+	args := s.bdTransientWriteArgs([]string{"sql", "--json", query})
+	out, err := s.runner(s.dir, "bd", args...)
+	if err != nil {
+		if isBdSQLUnsupportedInEmbeddedMode(err) {
+			return s.fenceMetadataKeyViaEmbeddedDoltSQL(query)
+		}
+		return false, fmt.Errorf("bd fence-metadata-key: %w", err)
+	}
+	var result struct {
+		RowsAffected int `json:"rows_affected"`
+	}
+	if err := json.Unmarshal(extractJSON(out), &result); err != nil {
+		return false, fmt.Errorf("bd fence-metadata-key: parsing SQL result: %w", err)
+	}
+	return result.RowsAffected > 0, nil
+}
+
+func fenceMetadataKeySQLQuery(table, id, key, expected, next string, rowLock int64) string {
+	path := metadataJSONPath(key)
+	metadata := "COALESCE(NULLIF(metadata, ''), '{}')"
+	return "UPDATE " + table + " SET metadata = JSON_SET(" + metadata + ", " + bdSQLStringLiteral(path) + ", " + bdSQLStringLiteral(next) + "), row_lock = " + metadataFenceRowLockSQL(rowLock) + ", updated_at = CURRENT_TIMESTAMP" +
+		" WHERE id = " + bdSQLStringLiteral(id) +
+		" AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(" + metadata + ", " + bdSQLStringLiteral(path) + ")), '') = " + bdSQLStringLiteral(expected)
+}
+
+func fenceMetadataKeyPostgresSQLQuery(table, id, key, expected, next string, rowLock int64) string {
+	keyLiteral := bdSQLStringLiteral(key)
+	metadata := "COALESCE(metadata, '{}'::jsonb)"
+	return "UPDATE " + table + " SET metadata = jsonb_set(" + metadata + ", ARRAY[" + keyLiteral + "], to_jsonb(" + bdSQLStringLiteral(next) + "::text), true), row_lock = " + metadataFenceRowLockSQL(rowLock) + ", updated_at = CURRENT_TIMESTAMP" +
+		" WHERE id = " + bdSQLStringLiteral(id) +
+		" AND COALESCE(" + metadata + " ->> " + keyLiteral + ", '') = " + bdSQLStringLiteral(expected)
+}
+
+func freshMetadataFenceRowLock() int64 {
+	return rand.Int63n(1<<63-2) + 1 //nolint:gosec // opaque concurrency token, not a secret
+}
+
+func metadataFenceRowLockSQL(token int64) string {
+	raw := strconv.FormatInt(token, 10)
+	return "CASE WHEN row_lock = " + raw + " THEN " + strconv.FormatInt(token+1, 10) + " ELSE " + raw + " END"
+}
+
+func metadataJSONPath(key string) string {
+	return `$."` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(key) + `"`
+}
+
+func (s *BdStore) fenceMetadataKeyViaEmbeddedDoltSQL(query string) (bool, error) {
+	doltDir, ok, err := s.embeddedDoltDir()
+	if err != nil {
+		return false, fmt.Errorf("bd fence-metadata-key embedded fallback: %w", err)
+	}
+	if !ok {
+		return false, fmt.Errorf("bd fence-metadata-key embedded fallback: %w", ErrConditionalWriteUnsupported)
+	}
+	out, err := s.runner(doltDir, "dolt", "sql", "-r", "json", "-q", query+"; SELECT ROW_COUNT() AS rows_affected")
+	if err != nil {
+		return false, fmt.Errorf("bd fence-metadata-key embedded fallback: dolt sql: %w", err)
+	}
+	rowsAffected, err := parseDoltRowsAffected(out)
+	if err != nil {
+		return false, fmt.Errorf("bd fence-metadata-key embedded fallback: parsing SQL result: %w", err)
+	}
+	return rowsAffected > 0, nil
 }

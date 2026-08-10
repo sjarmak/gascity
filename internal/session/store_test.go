@@ -3,6 +3,7 @@ package session
 import (
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,7 +19,20 @@ func recordingStore(t *testing.T, b beads.Bead) (*Store, *beadstest.RecordingSto
 	t.Helper()
 	mem := beads.NewMemStoreFrom(1, []beads.Bead{b}, nil)
 	rec := beadstest.NewRecordingStore(mem)
-	return NewStore(beads.SessionStore{Store: rec}), rec
+	return NewStore(beads.SessionStore{Store: &recordingFencedStore{RecordingStore: rec, fencer: mem}}), rec
+}
+
+type recordingFencedStore struct {
+	*beadstest.RecordingStore
+	fencer beads.MetadataKeyFencer
+}
+
+func (s *recordingFencedStore) FenceMetadataKey(id, key, expected, next string) (bool, error) {
+	return s.fencer.FenceMetadataKey(id, key, expected, next)
+}
+
+func (s *recordingFencedStore) MetadataKeyFencerHandle() (beads.MetadataKeyFencer, bool) {
+	return s, true
 }
 
 // TestApplyPatchByteIdenticalToSetMetaBatch proves ApplyPatch emits exactly one
@@ -86,6 +100,365 @@ func TestApplyPatchInfoPersistsAndFoldsEqualsReprojection(t *testing.T) {
 	// ...which is byte-identical to a full reprojection of the patched bead.
 	if want := infoFromPersistedBead(reprojectBead(b, patch)); !reflect.DeepEqual(got, want) {
 		t.Errorf("ApplyPatchInfo fold diverged from full reprojection\n got=%+v\nwant=%+v", got, want)
+	}
+}
+
+func TestApplyPatchClearingDrainAcknowledgementUsesLiveCancellationMarkers(t *testing.T) {
+	backing := beads.NewMemStoreFrom(1, []beads.Bead{sessionBeadFixture("s-1", "open", map[string]string{
+		DrainAckTokenMetadataKey:  "token-current",
+		DrainAckSourceMetadataKey: DrainAckSourceAgent,
+	})}, nil)
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	front := NewStore(beads.SessionStore{Store: cache})
+
+	stale, err := front.Get("s-1")
+	if err != nil {
+		t.Fatalf("Get stale snapshot: %v", err)
+	}
+	marker := DrainAckCancellationMetadataKey("token-obsolete")
+	if err := backing.SetMetadata("s-1", marker, "true"); err != nil {
+		t.Fatalf("seed live cancellation marker: %v", err)
+	}
+
+	if _, err := front.ApplyPatchClearingDrainAcknowledgementInfo(stale, AcknowledgeDrainPatch(false)); err != nil {
+		t.Fatalf("ApplyPatchClearingDrainAcknowledgementInfo: %v", err)
+	}
+	got, err := backing.Get("s-1")
+	if err != nil {
+		t.Fatalf("Get backing: %v", err)
+	}
+	if _, present := got.Metadata[marker]; present {
+		t.Fatalf("live cancellation marker remained after acknowledgement finalization: %v", got.Metadata)
+	}
+}
+
+func TestApplyPatchClearingDrainAcknowledgementUsesSingleUpdateWithoutMarkers(t *testing.T) {
+	front, rec := recordingStore(t, sessionBeadFixture("s-1", "open", map[string]string{
+		DrainAckTokenMetadataKey:  "token-current",
+		DrainAckSourceMetadataKey: DrainAckSourceAgent,
+	}))
+	info, err := front.Get("s-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch := AcknowledgeDrainPatch(false)
+	if _, err := front.ApplyPatchClearingDrainAcknowledgementInfo(info, patch); err != nil {
+		t.Fatalf("ApplyPatchClearingDrainAcknowledgementInfo: %v", err)
+	}
+	if calls := rec.CallsForOp("Update"); len(calls) != 1 {
+		t.Fatalf("Update calls = %d, want one atomic update", len(calls))
+	} else if !reflect.DeepEqual(calls[0].Opts.Metadata, map[string]string(patch)) {
+		t.Fatalf("atomic update metadata = %#v, want %#v", calls[0].Opts.Metadata, map[string]string(patch))
+	}
+	if calls := rec.CallsForOp("SetMetadataBatch"); len(calls) != 0 {
+		t.Fatalf("SetMetadataBatch calls = %d, want none", len(calls))
+	}
+}
+
+func TestBeginDrainAckStopPendingRejectsCanceledToken(t *testing.T) {
+	store := beads.NewMemStoreFrom(1, []beads.Bead{sessionBeadFixture("s-1", "open", map[string]string{
+		"state":                                    "active",
+		DrainAckTokenMetadataKey:                   "token-1",
+		DrainAckSourceMetadataKey:                  DrainAckSourceAgent,
+		DrainAckCancelTokenMetadataKey:             "token-1",
+		DrainAckCancellationMetadataKey("token-1"): "true",
+	})}, nil)
+	front := NewStore(beads.SessionStore{Store: store})
+	stale := infoFromPersistedBead(sessionBeadFixture("s-1", "open", map[string]string{
+		"state":                   "active",
+		DrainAckTokenMetadataKey:  "token-1",
+		DrainAckSourceMetadataKey: DrainAckSourceAgent,
+	}))
+
+	if _, err := front.BeginDrainAckStopPendingInfo(stale, time.Now()); !errors.Is(err, ErrDrainAcknowledgementCanceled) {
+		t.Fatalf("BeginDrainAckStopPendingInfo error = %v, want ErrDrainAcknowledgementCanceled", err)
+	}
+	got, err := front.GetLive("s-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State == StateDraining {
+		t.Fatalf("canceled acknowledgement entered stop-pending: %+v", got)
+	}
+}
+
+func TestBeginDrainAckStopPendingRejectsConsumedStaleToken(t *testing.T) {
+	store := beads.NewMemStoreFrom(1, []beads.Bead{sessionBeadFixture("s-1", "open", map[string]string{
+		"state": "active",
+	})}, nil)
+	front := NewStore(beads.SessionStore{Store: store})
+	stale := infoFromPersistedBead(sessionBeadFixture("s-1", "open", map[string]string{
+		"state":                   "active",
+		DrainAckTokenMetadataKey:  "token-1",
+		DrainAckSourceMetadataKey: DrainAckSourceAgent,
+	}))
+
+	if _, err := front.BeginDrainAckStopPendingInfo(stale, time.Now()); !errors.Is(err, ErrDrainAcknowledgementSuperseded) {
+		t.Fatalf("BeginDrainAckStopPendingInfo error = %v, want ErrDrainAcknowledgementSuperseded", err)
+	}
+	got, err := front.GetLive("s-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State == StateDraining {
+		t.Fatalf("consumed stale acknowledgement entered stop-pending: %+v", got)
+	}
+}
+
+func TestBeginDrainAckStopPendingAllowsReconcilerOwnedTokenlessAck(t *testing.T) {
+	store := beads.NewMemStoreFrom(1, []beads.Bead{sessionBeadFixture("s-1", "open", map[string]string{
+		"state": "active",
+	})}, nil)
+	front := NewStore(beads.SessionStore{Store: store})
+	info, err := front.GetLive("s-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := front.BeginDrainAckStopPendingInfo(info, time.Now())
+	if err != nil {
+		t.Fatalf("BeginDrainAckStopPendingInfo: %v", err)
+	}
+	if got.State != StateDraining {
+		t.Fatalf("tokenless reconciler acknowledgement state = %q, want %q", got.State, StateDraining)
+	}
+}
+
+func TestBeginDrainAckStopPendingRejectsPendingLegacyClear(t *testing.T) {
+	store := beads.NewMemStoreFrom(1, []beads.Bead{sessionBeadFixture("s-1", "open", map[string]string{
+		"state":                   "active",
+		DrainAckSourceMetadataKey: DrainAckSourceAgent,
+		DrainAckTokenMetadataKey:  drainAckLegacyClearFenceValue,
+	})}, nil)
+	front := NewStore(beads.SessionStore{Store: store})
+	info, err := front.GetLive("s-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := front.BeginDrainAckStopPendingInfo(info, time.Now()); !errors.Is(err, ErrDrainAcknowledgementCanceled) {
+		t.Fatalf("BeginDrainAckStopPendingInfo error = %v, want ErrDrainAcknowledgementCanceled", err)
+	}
+	got, err := front.GetLive("s-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State == StateDraining {
+		t.Fatalf("pending legacy clear entered stop-pending: %+v", got)
+	}
+}
+
+func TestDrainAckStopPendingFenceWinsConcurrentCancellation(t *testing.T) {
+	store := beads.NewMemStoreFrom(1, []beads.Bead{sessionBeadFixture("s-1", "open", map[string]string{
+		"state":                   "active",
+		DrainAckTokenMetadataKey:  "token-1",
+		DrainAckSourceMetadataKey: DrainAckSourceAgent,
+	})}, nil)
+	front := NewStore(beads.SessionStore{Store: store})
+	info, err := front.GetLive("s-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := front.BeginDrainAckStopPendingInfo(info, time.Now()); err != nil {
+		t.Fatalf("BeginDrainAckStopPendingInfo: %v", err)
+	}
+	canceled, err := front.CancelDrainAcknowledgement("s-1", "token-1")
+	if !errors.Is(err, ErrDrainAcknowledgementStopCommitted) {
+		t.Fatalf("CancelDrainAcknowledgement error = %v, want ErrDrainAcknowledgementStopCommitted", err)
+	}
+	if canceled {
+		t.Fatal("cancellation won after stop-pending fence was acquired")
+	}
+	if _, err := front.FinalizeDrainAcknowledgementInfo(info, AcknowledgeDrainPatch(false)); err != nil {
+		t.Fatalf("FinalizeDrainAcknowledgementInfo: %v", err)
+	}
+}
+
+type cancelBeforeStopFenceStore struct {
+	beads.Store
+	token string
+	once  sync.Once
+}
+
+func (s *cancelBeforeStopFenceStore) FenceMetadataKey(id, key, expected, next string) (bool, error) {
+	if key == DrainAckTokenMetadataKey && next == drainAckStopFenceValue(s.token) {
+		s.once.Do(func() {
+			front := NewStore(beads.SessionStore{Store: s.Store})
+			if _, err := front.CancelDrainAcknowledgement(id, s.token); err != nil {
+				panic(err)
+			}
+		})
+	}
+	fencer, ok := beads.MetadataKeyFencerFor(s.Store)
+	if !ok {
+		return false, beads.ErrConditionalWriteUnsupported
+	}
+	return fencer.FenceMetadataKey(id, key, expected, next)
+}
+
+type acknowledgeBeforeLegacyClearFenceStore struct {
+	beads.Store
+	once sync.Once
+}
+
+func (s *acknowledgeBeforeLegacyClearFenceStore) FenceMetadataKey(id, key, expected, next string) (bool, error) {
+	if key == DrainAckTokenMetadataKey && expected == "" && next == drainAckLegacyClearFenceValue {
+		s.once.Do(func() {
+			_ = s.Update(id, beads.UpdateOpts{Metadata: map[string]string{
+				DrainAckSourceMetadataKey: DrainAckSourceAgent,
+			}})
+			fencer, _ := beads.MetadataKeyFencerFor(s.Store)
+			_, _ = fencer.FenceMetadataKey(id, key, "", "new-token")
+		})
+	}
+	fencer, ok := beads.MetadataKeyFencerFor(s.Store)
+	if !ok {
+		return false, beads.ErrConditionalWriteUnsupported
+	}
+	return fencer.FenceMetadataKey(id, key, expected, next)
+}
+
+func (s *acknowledgeBeforeLegacyClearFenceStore) MetadataKeyFencerHandle() (beads.MetadataKeyFencer, bool) {
+	return s, true
+}
+
+func TestClearLegacyDrainAcknowledgementDoesNotEraseConcurrentAcknowledgement(t *testing.T) {
+	mem := beads.NewMemStoreFrom(1, []beads.Bead{sessionBeadFixture("s-1", "open", map[string]string{
+		DrainAckSourceMetadataKey: DrainAckSourceAgent,
+	})}, nil)
+	store := &acknowledgeBeforeLegacyClearFenceStore{Store: mem}
+	front := NewStore(beads.SessionStore{Store: store})
+
+	cleared, err := front.ClearLegacyDrainAcknowledgement("s-1")
+	if err != nil {
+		t.Fatalf("ClearLegacyDrainAcknowledgement: %v", err)
+	}
+	if cleared {
+		t.Fatal("legacy acknowledgement reported cleared after a newer acknowledgement won")
+	}
+	got, err := front.GetLive("s-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DrainAckToken != "new-token" || got.DrainAckSource != DrainAckSourceAgent {
+		t.Fatalf("new acknowledgement was erased: source=%q token=%q", got.DrainAckSource, got.DrainAckToken)
+	}
+}
+
+func TestApplyPatchClearingDrainAcknowledgementDoesNotEraseConcurrentAcknowledgement(t *testing.T) {
+	mem := beads.NewMemStoreFrom(1, []beads.Bead{sessionBeadFixture("s-1", "open", map[string]string{
+		"state": "active",
+	})}, nil)
+	store := &acknowledgeBeforeLegacyClearFenceStore{Store: mem}
+	front := NewStore(beads.SessionStore{Store: store})
+	stale, err := front.GetLive("s-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = front.ApplyPatchClearingDrainAcknowledgementInfo(stale, AcknowledgeDrainPatch(false))
+	if !errors.Is(err, ErrDrainAcknowledgementSuperseded) {
+		t.Fatalf("ApplyPatchClearingDrainAcknowledgementInfo error = %v, want ErrDrainAcknowledgementSuperseded", err)
+	}
+	got, err := front.GetLive("s-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DrainAckToken != "new-token" || got.DrainAckSource != DrainAckSourceAgent {
+		t.Fatalf("new acknowledgement was erased: source=%q token=%q", got.DrainAckSource, got.DrainAckToken)
+	}
+}
+
+func TestClearLegacyDrainAcknowledgementResumesPendingClear(t *testing.T) {
+	mem := beads.NewMemStoreFrom(1, []beads.Bead{sessionBeadFixture("s-1", "open", map[string]string{
+		DrainAckSourceMetadataKey: DrainAckSourceAgent,
+		DrainAckTokenMetadataKey:  drainAckLegacyClearFenceValue,
+	})}, nil)
+	front := NewStore(beads.SessionStore{Store: mem})
+
+	cleared, err := front.ClearLegacyDrainAcknowledgement("s-1")
+	if err != nil || !cleared {
+		t.Fatalf("ClearLegacyDrainAcknowledgement = (%v, %v), want (true, nil)", cleared, err)
+	}
+	got, err := front.GetLive("s-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DrainAckSource != "" || got.DrainAckToken != "" {
+		t.Fatalf("pending legacy clear was not completed: source=%q token=%q", got.DrainAckSource, got.DrainAckToken)
+	}
+}
+
+func TestClearLegacyDrainAcknowledgementUsesSingleUpdate(t *testing.T) {
+	front, rec := recordingStore(t, sessionBeadFixture("s-1", "open", map[string]string{
+		DrainAckSourceMetadataKey: DrainAckSourceAgent,
+	}))
+
+	cleared, err := front.ClearLegacyDrainAcknowledgement("s-1")
+	if err != nil || !cleared {
+		t.Fatalf("ClearLegacyDrainAcknowledgement = (%v, %v), want (true, nil)", cleared, err)
+	}
+	updates := rec.CallsForOp("Update")
+	if len(updates) != 1 {
+		t.Fatalf("Update calls = %d, want 1 (all ops: %v)", len(updates), opsOf(rec.Calls()))
+	}
+	if calls := rec.CallsForOp("SetMetadataBatch"); len(calls) != 0 {
+		t.Fatalf("SetMetadataBatch calls = %d, want 0", len(calls))
+	}
+	want := map[string]string{
+		DrainAckSourceMetadataKey:      "",
+		DrainAckTokenMetadataKey:       "",
+		DrainAckCancelTokenMetadataKey: "",
+	}
+	if !reflect.DeepEqual(updates[0].Opts.Metadata, want) {
+		t.Fatalf("Update metadata = %#v, want %#v", updates[0].Opts.Metadata, want)
+	}
+}
+
+func TestDrainAckCancellationWinsBeforeConcurrentStopFence(t *testing.T) {
+	base := beads.NewMemStoreFrom(1, []beads.Bead{sessionBeadFixture("s-1", "open", map[string]string{
+		"state":                   "active",
+		DrainAckTokenMetadataKey:  "token-1",
+		DrainAckSourceMetadataKey: DrainAckSourceAgent,
+	})}, nil)
+	racing := &cancelBeforeStopFenceStore{Store: base, token: "token-1"}
+	front := NewStore(beads.SessionStore{Store: racing})
+	info, err := front.GetLive("s-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := front.BeginDrainAckStopPendingInfo(info, time.Now()); !errors.Is(err, ErrDrainAcknowledgementCanceled) {
+		t.Fatalf("BeginDrainAckStopPendingInfo error = %v, want ErrDrainAcknowledgementCanceled", err)
+	}
+	got, err := NewStore(beads.SessionStore{Store: base}).GetLive("s-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsDrainAcknowledgementCanceled(got) {
+		t.Fatalf("cancellation did not remain authoritative: %+v", got)
+	}
+}
+
+func TestFinalizeDrainAcknowledgementPreservesConcurrentCancellation(t *testing.T) {
+	base := beads.NewMemStoreFrom(1, []beads.Bead{sessionBeadFixture("s-1", "open", map[string]string{
+		"state":                   "active",
+		DrainAckTokenMetadataKey:  "token-1",
+		DrainAckSourceMetadataKey: DrainAckSourceAgent,
+	})}, nil)
+	racing := &cancelBeforeStopFenceStore{Store: base, token: "token-1"}
+	front := NewStore(beads.SessionStore{Store: racing})
+	info, err := front.GetLive("s-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := front.FinalizeDrainAcknowledgementInfo(info, AcknowledgeDrainPatch(false)); !errors.Is(err, ErrDrainAcknowledgementCanceled) {
+		t.Fatalf("FinalizeDrainAcknowledgementInfo error = %v, want ErrDrainAcknowledgementCanceled", err)
+	}
+	got, err := NewStore(beads.SessionStore{Store: base}).GetLive("s-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsDrainAcknowledgementCanceled(got) || got.MetadataState != "active" {
+		t.Fatalf("cancellation was consumed by terminal patch: %+v", got)
 	}
 }
 
@@ -237,9 +610,8 @@ func TestSetWaitHoldClearWritesEmptyStrings(t *testing.T) {
 }
 
 // TestCloseEmitsClosePatchThenClose proves Close stamps ClosePatch metadata and
-// then closes the bead — the byte-identical replacement for closeBead's
-// SetMetadataBatch(ClosePatch)+Close, WITHOUT any work-reassignment side effect
-// (that is Phase 6).
+// then closes the bead using one atomic Update for the terminal provenance
+// cluster, without any work-reassignment side effect (that is Phase 6).
 func TestCloseEmitsClosePatchThenClose(t *testing.T) {
 	b := sessionBeadFixture("s-1", "open", map[string]string{"state": "active"})
 	is, rec := recordingStore(t, b)
@@ -254,13 +626,13 @@ func TestCloseEmitsClosePatchThenClose(t *testing.T) {
 	}
 
 	gotOps := opsOf(rec.Calls())
-	wantOps := []string{"SetMetadataBatch", "Close"}
+	wantOps := []string{"Update", "Close"}
 	if !reflect.DeepEqual(gotOps, wantOps) {
 		t.Fatalf("Close ops = %v, want %v", gotOps, wantOps)
 	}
 	want := map[string]string(ClosePatch(now, "gc_swept"))
-	if !reflect.DeepEqual(rec.CallsForOp("SetMetadataBatch")[0].Metadata, want) {
-		t.Errorf("close patch = %#v, want %#v", rec.CallsForOp("SetMetadataBatch")[0].Metadata, want)
+	if !reflect.DeepEqual(rec.CallsForOp("Update")[0].Opts.Metadata, want) {
+		t.Errorf("close patch = %#v, want %#v", rec.CallsForOp("Update")[0].Opts.Metadata, want)
 	}
 }
 

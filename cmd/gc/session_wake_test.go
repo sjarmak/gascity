@@ -18,36 +18,92 @@ import (
 	"github.com/gastownhall/gascity/internal/session/sessiontest"
 )
 
-type failOnceConditionalStore struct {
+type failOnceUpdateStore struct {
 	beads.Store
-	writer   beads.ConditionalWriter
 	failNext bool
 }
 
-func (s *failOnceConditionalStore) UpdateIfMatch(id string, revision int64, opts beads.UpdateOpts) error {
+type failOnceFenceStore struct {
+	beads.Store
+	failNext bool
+}
+
+type drainWorkScanCountingStore struct {
+	beads.Store
+	lists int
+}
+
+func (s *drainWorkScanCountingStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	s.lists++
+	return s.Store.List(query)
+}
+
+func (s *drainWorkScanCountingStore) MetadataKeyFencerHandle() (beads.MetadataKeyFencer, bool) {
+	return beads.MetadataKeyFencerFor(s.Store)
+}
+
+func (s *failOnceFenceStore) MetadataKeyFencerHandle() (beads.MetadataKeyFencer, bool) {
+	return s, true
+}
+
+func (s *failOnceFenceStore) FenceMetadataKey(id, key, expected, next string) (bool, error) {
 	if s.failNext {
 		s.failNext = false
-		return errors.New("transient conditional write failure")
+		return false, errors.New("transient fence failure")
 	}
-	return s.writer.UpdateIfMatch(id, revision, opts)
+	fencer, ok := beads.MetadataKeyFencerFor(s.Store)
+	if !ok {
+		return false, beads.ErrConditionalWriteUnsupported
+	}
+	return fencer.FenceMetadataKey(id, key, expected, next)
 }
 
-func (s *failOnceConditionalStore) CloseIfMatch(id string, revision int64) error {
-	return s.writer.CloseIfMatch(id, revision)
+func (s *failOnceUpdateStore) MetadataKeyFencerHandle() (beads.MetadataKeyFencer, bool) {
+	return beads.MetadataKeyFencerFor(s.Store)
 }
 
-func (s *failOnceConditionalStore) DeleteIfMatch(id string, revision int64) error {
-	return s.writer.DeleteIfMatch(id, revision)
+type toggleDrainAckSetFailProvider struct {
+	runtime.Provider
+	fail bool
 }
 
-func (s *failOnceConditionalStore) CompareAndSetMetadataKey(id, key, expected, next string) (bool, error) {
-	return s.writer.CompareAndSetMetadataKey(id, key, expected, next)
+type replaceMarkerOnRemoveProvider struct {
+	runtime.Provider
+	sessionName string
+	triggerKey  string
+	nextKey     string
+	nextToken   string
+}
+
+func (p *replaceMarkerOnRemoveProvider) RemoveMeta(name, key string) error {
+	if name == p.sessionName && key == p.triggerKey {
+		if err := p.SetMeta(name, p.nextKey, p.nextToken); err != nil {
+			return err
+		}
+	}
+	return p.Provider.RemoveMeta(name, key)
+}
+
+func (p *toggleDrainAckSetFailProvider) SetMeta(name, key, value string) error {
+	if p.fail && key == "GC_DRAIN_ACK" {
+		return errors.New("injected drain acknowledgement publish failure")
+	}
+	return p.Provider.SetMeta(name, key, value)
+}
+
+func (s *failOnceUpdateStore) Update(id string, opts beads.UpdateOpts) error {
+	if s.failNext {
+		s.failNext = false
+		return errors.New("transient update failure")
+	}
+	return s.Store.Update(id, opts)
 }
 
 type countingWakeMetadataStore struct {
 	*beads.MemStore
 	singleCalls int
 	batchCalls  int
+	updateCalls int
 }
 
 type failingWakeMetadataStore struct {
@@ -69,17 +125,10 @@ func makeWakeBead(id string, meta map[string]string) beads.Bead {
 	return beads.Bead{ID: id, Type: sessionBeadType, Labels: []string{sessionBeadLabel}, Metadata: cloned}
 }
 
-// wakeInfo projects a store-created fixture bead through the session front door
-// (sessiontest.SeedBead runs the production codec at the store edge) instead of
-// cracking it raw. These fixtures come from store.Create, which stamps
-// Type="task"; the front door narrows on session shape, so the seed copy is
-// retyped to a session bead. That retype is the ONLY projection delta —
-// Info.Type becomes "session" instead of "task" — and no wake/drain consumer
-// (preWakeCommit, completeDrain) reads Info.Type, so the returned Info is
-// identical for every field they read (id, session_name, generation, wake_mode,
-// continuation/identity metadata, created_at, closed) to the former raw
-// InfoFromPersistedBead crack. b is taken by value, so the retype does
-// not disturb the caller's bead or the store the consumer writes back to.
+// wakeInfo projects a persisted session-shaped fixture through the production
+// session codec instead of cracking the bead directly. Callers that pass the
+// result to a front door backed by their own store must persist the same session
+// type and label there, because lifecycle writes reload and validate that row.
 func wakeInfo(t *testing.T, b beads.Bead) sessionpkg.Info {
 	t.Helper()
 	return seedSessionInfo(b)
@@ -95,7 +144,12 @@ func (s *countingWakeMetadataStore) SetMetadataBatch(id string, kvs map[string]s
 	return s.MemStore.SetMetadataBatch(id, kvs)
 }
 
-func (s *failingWakeMetadataStore) SetMetadataBatch(_ string, _ map[string]string) error {
+func (s *countingWakeMetadataStore) Update(id string, opts beads.UpdateOpts) error {
+	s.updateCalls++
+	return s.MemStore.Update(id, opts)
+}
+
+func (s *failingWakeMetadataStore) Update(_ string, _ beads.UpdateOpts) error {
 	return s.err
 }
 
@@ -106,6 +160,7 @@ func TestPreWakeCommit(t *testing.T) {
 
 	b, err := store.Create(beads.Bead{
 		Title: "test-session",
+		Type:  sessionBeadType, Labels: []string{sessionBeadLabel},
 		Metadata: map[string]string{
 			"session_name": "test-worker",
 			"template":     "worker",
@@ -147,13 +202,43 @@ func TestPreWakeCommit(t *testing.T) {
 	}
 }
 
-func TestPreWakeCommitUsesSingleBatchMetadataWrite(t *testing.T) {
+func TestPreWakeCommitCompactsDrainCancellationMarkers(t *testing.T) {
+	now := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+	store := beads.NewMemStore()
+	token := "obsolete-token"
+	b, err := store.Create(beads.Bead{
+		Title: "test-session",
+		Type:  sessionBeadType, Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "test-worker",
+			"template":     "worker",
+			"generation":   "2",
+			sessionpkg.DrainAckCancellationMetadataKey(token): "true",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := preWakeCommit(wakeInfo(t, b), sessionFrontDoor(store), &clock.Fake{Time: now}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := got.Metadata[sessionpkg.DrainAckCancellationMetadataKey(token)]; present {
+		t.Fatalf("obsolete cancellation marker remained after wake: %v", got.Metadata)
+	}
+}
+
+func TestPreWakeCommitUsesSingleMetadataUpdate(t *testing.T) {
 	now := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
 	clk := &clock.Fake{Time: now}
 	store := &countingWakeMetadataStore{MemStore: beads.NewMemStore()}
 
 	b, err := store.Create(beads.Bead{
 		Title: "test-session",
+		Type:  sessionBeadType, Labels: []string{sessionBeadLabel},
 		Metadata: map[string]string{
 			"session_name": "test-worker",
 			"template":     "worker",
@@ -167,11 +252,11 @@ func TestPreWakeCommitUsesSingleBatchMetadataWrite(t *testing.T) {
 	if _, _, _, err := preWakeCommit(wakeInfo(t, b), sessionFrontDoor(store), clk); err != nil {
 		t.Fatalf("preWakeCommit: %v", err)
 	}
-	if store.batchCalls != 1 {
-		t.Fatalf("batchCalls = %d, want 1", store.batchCalls)
+	if store.updateCalls != 1 {
+		t.Fatalf("updateCalls = %d, want 1", store.updateCalls)
 	}
-	if store.singleCalls != 0 {
-		t.Fatalf("singleCalls = %d, want 0", store.singleCalls)
+	if store.singleCalls != 0 || store.batchCalls != 0 {
+		t.Fatalf("decomposed metadata calls = (%d single, %d batch), want none", store.singleCalls, store.batchCalls)
 	}
 }
 
@@ -181,6 +266,7 @@ func TestPreWakeCommit_InvalidName(t *testing.T) {
 
 	b, _ := store.Create(beads.Bead{
 		Title: "bad-session",
+		Type:  sessionBeadType, Labels: []string{sessionBeadLabel},
 		Metadata: map[string]string{
 			"session_name": "../bad",
 			"template":     "worker",
@@ -200,6 +286,7 @@ func TestPreWakeCommit_BumpsContinuationEpochForFreshWake(t *testing.T) {
 
 	b, err := store.Create(beads.Bead{
 		Title: "fresh-session",
+		Type:  sessionBeadType, Labels: []string{sessionBeadLabel},
 		Metadata: map[string]string{
 			"session_name":       "fresh-worker",
 			"template":           "worker",
@@ -229,6 +316,7 @@ func TestPreWakeCommit_FreshModeClearsPreviousConversationMetadata(t *testing.T)
 
 	b, err := store.Create(beads.Bead{
 		Title: "fresh-session",
+		Type:  sessionBeadType, Labels: []string{sessionBeadLabel},
 		Metadata: map[string]string{
 			"session_name":               "fresh-worker",
 			"template":                   "worker",
@@ -284,6 +372,7 @@ func TestPreWakeCommit_ResumeModePreservesPreviousConversationMetadata(t *testin
 
 	b, err := store.Create(beads.Bead{
 		Title: "resume-session",
+		Type:  sessionBeadType, Labels: []string{sessionBeadLabel},
 		Metadata: map[string]string{
 			"session_name":            "resume-worker",
 			"template":                "worker",
@@ -342,6 +431,7 @@ func TestPreWakeCommit_FreshModeTraceLogsClearedProviderMetadata(t *testing.T) {
 
 	b, err := store.Create(beads.Bead{
 		Title: "fresh-session",
+		Type:  sessionBeadType, Labels: []string{sessionBeadLabel},
 		Metadata: map[string]string{
 			"session_name":            "fresh-worker",
 			"template":                "worker",
@@ -397,6 +487,7 @@ func TestPreWakeCommit_FreshModeTraceSilentWhenTraceDisabled(t *testing.T) {
 	store := beads.NewMemStore()
 	b, err := store.Create(beads.Bead{
 		Title: "fresh-session",
+		Type:  sessionBeadType, Labels: []string{sessionBeadLabel},
 		Metadata: map[string]string{
 			"session_name":            "fresh-worker",
 			"template":                "worker",
@@ -441,6 +532,7 @@ func TestPreWakeCommit_FreshModeTraceSilentWhenNothingCleared(t *testing.T) {
 	t.Setenv("GC_TMUX_TRACE", "1")
 	b, err := store.Create(beads.Bead{
 		Title: "fresh-session",
+		Type:  sessionBeadType, Labels: []string{sessionBeadLabel},
 		Metadata: map[string]string{
 			"session_name": "fresh-worker",
 			"template":     "worker",
@@ -480,6 +572,7 @@ func TestPreWakeCommit_ResumeModeTraceSilent(t *testing.T) {
 	t.Setenv("GC_TMUX_TRACE", "1")
 	b, err := store.Create(beads.Bead{
 		Title: "resume-session",
+		Type:  sessionBeadType, Labels: []string{sessionBeadLabel},
 		Metadata: map[string]string{
 			"session_name":            "resume-worker",
 			"template":                "worker",
@@ -527,6 +620,7 @@ func TestPreWakeCommit_FreshModeTraceSilentOnStoreFailure(t *testing.T) {
 	t.Setenv("GC_TMUX_TRACE", "1")
 	b, err := store.Create(beads.Bead{
 		Title: "fresh-session",
+		Type:  sessionBeadType, Labels: []string{sessionBeadLabel},
 		Metadata: map[string]string{
 			"session_name":            "fresh-worker",
 			"template":                "worker",
@@ -571,6 +665,7 @@ func TestPreWakeCommit_BumpsContinuationEpochForPendingReset(t *testing.T) {
 
 	b, err := store.Create(beads.Bead{
 		Title: "reset-session",
+		Type:  sessionBeadType, Labels: []string{sessionBeadLabel},
 		Metadata: map[string]string{
 			"session_name":               "reset-worker",
 			"template":                   "worker",
@@ -885,14 +980,19 @@ func TestAdvanceSessionDrains_ProcessExited(t *testing.T) {
 	dt := newDrainTracker()
 
 	// No session running (process exited).
+	token := "canceled-drain-token"
 	b, _ := store.Create(beads.Bead{
 		Title: "test",
 		Metadata: map[string]string{
-			"session_name": "test-session",
-			"template":     "worker",
-			"generation":   "3",
-			"state":        "active",
-			"pool_slot":    "1",
+			"session_name":                       "test-session",
+			"template":                           "worker",
+			"generation":                         "3",
+			"state":                              "active",
+			"pool_slot":                          "1",
+			sessionpkg.DrainAckSourceMetadataKey: sessionpkg.DrainAckSourceAgent,
+			sessionpkg.DrainAckTokenMetadataKey:  token,
+			sessionpkg.DrainAckCancelTokenMetadataKey:         token,
+			sessionpkg.DrainAckCancellationMetadataKey(token): "true",
 		},
 	})
 
@@ -922,6 +1022,9 @@ func TestAdvanceSessionDrains_ProcessExited(t *testing.T) {
 	}
 	if got.Metadata["sleep_reason"] != "idle" {
 		t.Errorf("sleep_reason = %q, want idle", got.Metadata["sleep_reason"])
+	}
+	if _, present := got.Metadata[sessionpkg.DrainAckCancellationMetadataKey(token)]; present {
+		t.Fatalf("obsolete cancellation marker remained: %v", got.Metadata)
 	}
 }
 
@@ -1447,6 +1550,160 @@ func TestCompleteDrain_ClearsLastWokeAt(t *testing.T) {
 	}
 }
 
+func TestAdvanceSessionDrainsOrdinaryCompletionSkipsAssignedWorkScan(t *testing.T) {
+	now := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	sp := runtime.NewFake()
+	backing := beads.NewMemStore()
+	store := &drainWorkScanCountingStore{Store: backing}
+	b, err := backing.Create(beads.Bead{
+		Title: "worker", Type: sessionpkg.BeadType, Status: "open",
+		Labels: []string{sessionpkg.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "worker", "template": "worker", "state": "active", "generation": "1",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dt := newDrainTracker()
+	dt.set(b.ID, &drainState{reason: "idle", generation: 1, deadline: now.Add(time.Minute)})
+	advanceSessionDrainsWithSessionsTraced(dt, sp, store, infoLookupFromBeadLookup(func(id string) *beads.Bead {
+		got, _ := backing.Get(id)
+		return &got
+	}), map[string]wakeEvaluation{}, &config.City{}, clk, nil)
+	if store.lists != 0 {
+		t.Fatalf("ordinary drain completion issued %d assigned-work List calls, want 0", store.lists)
+	}
+}
+
+func TestAdvanceSessionDrains_RuntimeDiesAfterDurableAgentAckAppliesCooldown(t *testing.T) {
+	now := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	sp := runtime.NewFake()
+	store := beads.NewMemStore()
+	dt := newDrainTracker()
+	b, err := store.Create(beads.Bead{
+		Title: "worker", Type: sessionpkg.BeadType, Status: "open",
+		Labels: []string{sessionpkg.LabelSession},
+		Metadata: map[string]string{
+			"session_name":              "worker",
+			"template":                  "worker",
+			"state":                     "active",
+			"generation":                "1",
+			"configured_named_session":  "true",
+			"configured_named_identity": "worker",
+			"configured_named_mode":     "always",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessionpkg.NewManagerWithOptions(store, sp).AcknowledgeDrain(b.ID); err != nil {
+		t.Fatal(err)
+	}
+	dt.set(b.ID, &drainState{reason: "idle", generation: 1, deadline: now.Add(time.Minute)})
+	advanceSessionDrainsWithSessionsTraced(dt, sp, store, infoLookupFromBeadLookup(func(id string) *beads.Bead {
+		got, _ := store.Get(id)
+		return &got
+	}), map[string]wakeEvaluation{}, &config.City{}, clk, nil)
+	got, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := now.Add(agentDrainAckCooldown).Format(time.RFC3339)
+	if got.Metadata["held_until"] != want {
+		t.Fatalf("held_until = %q, want %q", got.Metadata["held_until"], want)
+	}
+}
+
+func TestAdvanceSessionDrains_RuntimeDiesAfterAgentAckWithAssignedWorkSkipsCooldown(t *testing.T) {
+	now := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	sp := runtime.NewFake()
+	store := beads.NewMemStore()
+	dt := newDrainTracker()
+	b, err := store.Create(beads.Bead{
+		Title: "worker", Type: sessionpkg.BeadType, Status: "open",
+		Labels: []string{sessionpkg.LabelSession},
+		Metadata: map[string]string{
+			"session_name":              "worker",
+			"template":                  "worker",
+			"state":                     "active",
+			"generation":                "1",
+			"configured_named_session":  "true",
+			"configured_named_identity": "worker",
+			"configured_named_mode":     "always",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessionpkg.NewManagerWithOptions(store, sp).AcknowledgeDrain(b.ID); err != nil {
+		t.Fatal(err)
+	}
+	dt.set(b.ID, &drainState{reason: "idle", generation: 1, deadline: now.Add(time.Minute)})
+	advanceSessionDrainsWithSessionsTraced(dt, sp, store, infoLookupFromBeadLookup(func(id string) *beads.Bead {
+		got, _ := store.Get(id)
+		return &got
+	}), map[string]wakeEvaluation{b.ID: {Reason: "assigned-work", Reasons: []WakeReason{WakeWork}}}, &config.City{}, clk, nil)
+	got, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata["held_until"] != "" {
+		t.Fatalf("held_until = %q, want empty with assigned work", got.Metadata["held_until"])
+	}
+}
+
+func TestAdvanceSessionDrains_RuntimeDiesAfterAgentAckRechecksReachableAssignedWork(t *testing.T) {
+	now := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	sp := runtime.NewFake()
+	store := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+	dt := newDrainTracker()
+	b, err := store.Create(beads.Bead{
+		Title: "worker", Type: sessionpkg.BeadType, Status: "open",
+		Labels: []string{sessionpkg.LabelSession},
+		Metadata: map[string]string{
+			"session_name":              "worker",
+			"template":                  "worker",
+			"state":                     "active",
+			"generation":                "1",
+			"configured_named_session":  "true",
+			"configured_named_identity": "worker",
+			"configured_named_mode":     "always",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessionpkg.NewManagerWithOptions(store, sp).AcknowledgeDrain(b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rigStore.Create(beads.Bead{
+		Title: "late work", Type: "task", Status: "in_progress", Assignee: "worker",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dt.set(b.ID, &drainState{reason: "idle", generation: 1, deadline: now.Add(time.Minute)})
+	advanceSessionDrainsWithSessionsTraced(dt, sp, store, infoLookupFromBeadLookup(func(id string) *beads.Bead {
+		got, _ := store.Get(id)
+		return &got
+	}), map[string]wakeEvaluation{}, &config.City{}, clk, nil, drainCompletionWorkScope{
+		cityPath:  t.TempDir(),
+		rigStores: map[string]beads.Store{"rig": rigStore},
+	})
+	got, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata["held_until"] != "" {
+		t.Fatalf("held_until = %q, want empty after authoritative assigned-work recheck", got.Metadata["held_until"])
+	}
+}
+
 func TestCompleteDrain_FreshModeClearsIdentity(t *testing.T) {
 	now := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
 	clk := &clock.Fake{Time: now}
@@ -1655,11 +1912,7 @@ func TestDrainTracker_FinishIdleProbeIgnoresStaleProbe(t *testing.T) {
 // drain path clears it elsewhere).
 func TestDurableDrainAcknowledgementClearRetriesAfterTransientFailure(t *testing.T) {
 	backing := beads.NewMemStore()
-	writer, ok := beads.ConditionalWriterFor(backing)
-	if !ok {
-		t.Fatal("MemStore lacks conditional writer")
-	}
-	wrapped := &failOnceConditionalStore{Store: backing, writer: writer, failNext: true}
+	wrapped := &failOnceUpdateStore{Store: backing}
 	mgr := sessionpkg.NewManagerWithOptions(wrapped, runtime.NewFake())
 	info, err := mgr.CreateSession(context.Background(), sessionpkg.CreateOptions{
 		Template: "worker", Title: "worker", Command: "echo", WorkDir: t.TempDir(), Provider: "stub",
@@ -1671,26 +1924,433 @@ func TestDurableDrainAcknowledgementClearRetriesAfterTransientFailure(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	wrapped.failNext = true
 	info.DrainAckSource = sessionpkg.DrainAckSourceAgent
 	info.DrainAckToken = token
 	dt := newDrainTracker()
 	front := sessionFrontDoor(wrapped)
-	if clearDurableDrainAcknowledgement(info, front, dt) {
+	if clearDurableDrainAcknowledgement(info, front, dt, nil) {
 		t.Fatal("first clear unexpectedly succeeded")
 	}
 	if got := dt.durableAckClearSnapshot()[info.ID]; got != token {
 		t.Fatalf("retry token = %q, want %q", got, token)
 	}
-	retryDurableDrainAcknowledgementClears(front, dt)
+	retryDurableDrainAcknowledgementClears(front, dt, nil)
 	got, err := backing.Get(info.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Metadata[sessionpkg.DrainAckSourceMetadataKey] != "" || got.Metadata[sessionpkg.DrainAckTokenMetadataKey] != "" {
-		t.Fatalf("durable acknowledgement not cleared on retry: metadata=%v", got.Metadata)
+	if got.Metadata[sessionpkg.DrainAckCancelTokenMetadataKey] != token {
+		t.Fatalf("durable acknowledgement not canceled on retry: metadata=%v", got.Metadata)
 	}
 	if _, pending := dt.durableAckClearSnapshot()[info.ID]; pending {
 		t.Fatal("successful retry remained queued")
+	}
+}
+
+func TestDurableDrainAcknowledgementFenceFailureQueuesProviderBackedRetry(t *testing.T) {
+	backing := beads.NewMemStore()
+	wrapped := &failOnceFenceStore{Store: backing}
+	sp := runtime.NewFake()
+	mgr := sessionpkg.NewManagerWithOptions(wrapped, sp)
+	info, err := mgr.CreateSession(context.Background(), sessionpkg.CreateOptions{
+		Template: "worker", Title: "worker", Command: "echo", WorkDir: t.TempDir(), Provider: "stub",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err = sessionFrontDoor(wrapped).GetLive(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapped.failNext = true
+	if clearDurableDrainAcknowledgement(info, sessionFrontDoor(wrapped), newDrainTracker(), sp) {
+		t.Fatal("clear unexpectedly succeeded")
+	}
+	retryKey := drainAckCancelPendingKey(token)
+	if got, err := sp.GetMeta(info.SessionNameMetadata, retryKey); err != nil || got != token {
+		t.Fatalf("provider retry marker = %q, %v; want %q", got, err, token)
+	}
+
+	// A fresh tracker models a controller restart. The provider marker alone
+	// must recover the cancellation before stop reconciliation can claim it.
+	latest, ok := retryRuntimeDrainAckCancellation(info, sessionFrontDoor(wrapped), sp, newDrainTracker())
+	if !ok || !sessionpkg.IsDrainAcknowledgementCanceled(latest) {
+		t.Fatalf("restart recovery = (%+v, %v), want durable cancellation", latest, ok)
+	}
+}
+
+func TestDurableDrainAcknowledgementClearDoesNotRetryAfterStopFenceWins(t *testing.T) {
+	store := beads.NewMemStore()
+	mgr := sessionpkg.NewManagerWithOptions(store, runtime.NewFake())
+	info, err := mgr.CreateSession(context.Background(), sessionpkg.CreateOptions{
+		Template: "worker", Title: "worker", Command: "echo", WorkDir: t.TempDir(), Provider: "stub",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	front := sessionFrontDoor(store)
+	info, err = front.GetLive(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := front.BeginDrainAckStopPendingInfo(info, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	dt := newDrainTracker()
+	if clearDurableDrainAcknowledgement(info, front, dt, nil) {
+		t.Fatal("clear unexpectedly won after stop fence")
+	}
+	if _, pending := dt.durableAckClearSnapshot()[info.ID]; pending {
+		t.Fatal("definitively lost cancellation was queued for retry")
+	}
+	got, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got.Metadata[sessionpkg.DrainAckCancellationMetadataKey(token)]; ok {
+		t.Fatalf("stop-fenced acknowledgement gained cancellation marker: metadata=%v", got.Metadata)
+	}
+}
+
+func TestDurableDrainAcknowledgementClearRestoresNewerRuntimeAck(t *testing.T) {
+	backing := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := sessionpkg.NewManagerWithOptions(backing, sp)
+	info, err := mgr.CreateSession(context.Background(), sessionpkg.CreateOptions{
+		Template: "worker", Title: "worker", Command: "echo", WorkDir: t.TempDir(), Provider: "stub",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldToken, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newToken, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err = sessionFrontDoor(backing).GetLive(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.DrainAckToken = oldToken
+	dt := newDrainTracker()
+	if clearDurableDrainAcknowledgement(info, sessionFrontDoor(backing), dt, sp) {
+		t.Fatal("stale clear unexpectedly canceled the newer acknowledgement")
+	}
+	if _, pending := dt.durableAckClearSnapshot()[info.ID]; pending {
+		t.Fatal("superseded clear remained queued for retry")
+	}
+	if ack, err := sp.GetMeta(info.SessionNameMetadata, "GC_DRAIN_ACK"); err != nil || ack != "1" {
+		t.Fatalf("runtime drain ack = %q, %v; want restored", ack, err)
+	}
+	got, err := backing.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata[sessionpkg.DrainAckTokenMetadataKey] != newToken || got.Metadata[sessionpkg.DrainAckCancelTokenMetadataKey] != oldToken {
+		t.Fatalf("durable acknowledgement fencing metadata = %v", got.Metadata)
+	}
+}
+
+func TestDurableDrainAcknowledgementClearDoesNotRestoreNewerCanceledAck(t *testing.T) {
+	backing := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := sessionpkg.NewManagerWithOptions(backing, sp)
+	info, err := mgr.CreateSession(context.Background(), sessionpkg.CreateOptions{
+		Template: "worker", Title: "worker", Command: "echo", WorkDir: t.TempDir(), Provider: "stub",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldToken, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newToken, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CancelDrainAcknowledgement(info.ID, newToken); err != nil {
+		t.Fatal(err)
+	}
+	info, err = sessionFrontDoor(backing).GetLive(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.DrainAckToken = oldToken
+	if clearDurableDrainAcknowledgement(info, sessionFrontDoor(backing), newDrainTracker(), sp) {
+		t.Fatal("stale clear unexpectedly canceled the newer acknowledgement")
+	}
+	if ack, err := sp.GetMeta(info.SessionNameMetadata, "GC_DRAIN_ACK"); err != nil || ack != "" {
+		t.Fatalf("runtime drain ack = %q, %v; want absent for canceled newer ack", ack, err)
+	}
+}
+
+func TestRuntimeQueuedDrainAckCancellationRetries(t *testing.T) {
+	backing := beads.NewMemStore()
+	wrapped := &failOnceUpdateStore{Store: backing}
+	sp := runtime.NewFake()
+	mgr := sessionpkg.NewManagerWithOptions(wrapped, sp)
+	info, err := mgr.CreateSession(context.Background(), sessionpkg.CreateOptions{
+		Template: "worker", Title: "worker", Command: "echo", WorkDir: t.TempDir(), Provider: "stub",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err = sessionFrontDoor(wrapped).GetLive(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.SetMeta(info.SessionNameMetadata, drainAckCancelPendingKey(token), token); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&providerDrainOps{sp: sp}).setDrain(info.SessionNameMetadata); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&providerDrainOps{sp: sp}).setDrainAck(info.SessionNameMetadata); err != nil {
+		t.Fatal(err)
+	}
+	dt := newDrainTracker()
+	wrapped.failNext = true
+	if _, ok := retryRuntimeDrainAckCancellation(info, sessionFrontDoor(wrapped), sp, dt); ok {
+		t.Fatal("transient cancellation unexpectedly succeeded")
+	}
+	if got := dt.durableAckClearSnapshot()[info.ID]; got != token {
+		t.Fatalf("queued retry token = %q, want %q", got, token)
+	}
+	latest, ok := retryRuntimeDrainAckCancellation(info, sessionFrontDoor(wrapped), sp, dt)
+	if !ok || latest.DrainAckCancelToken != token {
+		t.Fatalf("retry result = (%+v, %v), want canceled token", latest, ok)
+	}
+	if pending, err := sp.GetMeta(info.SessionNameMetadata, drainAckCancelPendingKey(token)); err != nil || pending != "" {
+		t.Fatalf("runtime pending cancellation = %q, %v; want cleared", pending, err)
+	}
+	for _, key := range []string{"GC_DRAIN", "GC_DRAIN_ACK"} {
+		if got, err := sp.GetMeta(info.SessionNameMetadata, key); err != nil || got != "" {
+			t.Fatalf("runtime %s = %q, %v; want cleared", key, got, err)
+		}
+	}
+}
+
+func TestRuntimeQueuedDrainAckCancellationStopsRetryingAfterStopFenceWins(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := sessionpkg.NewManagerWithOptions(store, sp)
+	info, err := mgr.CreateSession(context.Background(), sessionpkg.CreateOptions{
+		Template: "worker", Title: "worker", Command: "echo", WorkDir: t.TempDir(), Provider: "stub",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	front := sessionFrontDoor(store)
+	info, err = front.GetLive(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := front.BeginDrainAckStopPendingInfo(info, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.SetMeta(info.SessionNameMetadata, drainAckCancelPendingKey(token), token); err != nil {
+		t.Fatal(err)
+	}
+	dt := newDrainTracker()
+	if _, ok := retryRuntimeDrainAckCancellation(info, front, sp, dt); !ok {
+		t.Fatal("stop-fence loss was not consumed")
+	}
+	if pending, err := sp.GetMeta(info.SessionNameMetadata, drainAckCancelPendingKey(token)); err != nil || pending != "" {
+		t.Fatalf("provider retry marker = %q, %v; want cleared", pending, err)
+	}
+	if _, pending := dt.durableAckClearSnapshot()[info.ID]; pending {
+		t.Fatal("stop-fence loss remained queued in drain tracker")
+	}
+}
+
+func TestRuntimeQueuedDrainAckCancellationRetainsCanceledInfoWhenProviderCleanupFails(t *testing.T) {
+	backing := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := sessionpkg.NewManagerWithOptions(backing, sp)
+	info, err := mgr.CreateSession(context.Background(), sessionpkg.CreateOptions{
+		Template: "worker", Title: "worker", Command: "echo", WorkDir: t.TempDir(), Provider: "stub",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err = sessionFrontDoor(backing).GetLive(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.SetMeta(info.SessionNameMetadata, drainAckCancelPendingKey(token), token); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&providerDrainOps{sp: sp}).setDrain(info.SessionNameMetadata); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&providerDrainOps{sp: sp}).setDrainAck(info.SessionNameMetadata); err != nil {
+		t.Fatal(err)
+	}
+	sp.RemoveMetaErrors[info.SessionNameMetadata] = map[string]error{"GC_DRAIN_ACK": errors.New("injected cleanup failure")}
+
+	latest, ok := retryRuntimeDrainAckCancellation(info, sessionFrontDoor(backing), sp, newDrainTracker())
+	if !ok {
+		t.Fatal("durably canceled acknowledgement was discarded after provider cleanup failure")
+	}
+	if latest.DrainAckCancelToken != token {
+		t.Fatalf("cancel token = %q, want %q", latest.DrainAckCancelToken, token)
+	}
+	if sessionpkg.DrainAcknowledgementToken(latest) != token {
+		t.Fatalf("active token = %q, want canceled token retained for retry fencing", latest.DrainAckToken)
+	}
+}
+
+func TestDurableDrainAcknowledgementClearRetriesNewerAckRestoration(t *testing.T) {
+	store := beads.NewMemStore()
+	baseProvider := runtime.NewFake()
+	sp := &toggleDrainAckSetFailProvider{Provider: baseProvider, fail: true}
+	mgr := sessionpkg.NewManagerWithOptions(store, sp)
+	info, err := mgr.CreateSession(context.Background(), sessionpkg.CreateOptions{
+		Template: "worker", Title: "worker", Command: "echo", WorkDir: t.TempDir(), Provider: "stub",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldToken, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.AcknowledgeDrain(info.ID); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := sessionFrontDoor(store).GetLive(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := latest
+	stale.DrainAckToken = oldToken
+	dt := newDrainTracker()
+	if clearDurableDrainAcknowledgement(stale, sessionFrontDoor(store), dt, sp) {
+		t.Fatal("stale token unexpectedly canceled newer acknowledgement")
+	}
+	if got := dt.durableAckClearSnapshot()[info.ID]; got != oldToken {
+		t.Fatalf("restoration retry token = %q, want %q", got, oldToken)
+	}
+
+	sp.fail = false
+	retryDurableDrainAcknowledgementClears(sessionFrontDoor(store), dt, sp)
+	if _, pending := dt.durableAckClearSnapshot()[info.ID]; pending {
+		t.Fatal("successful acknowledgement restoration remained queued")
+	}
+	if acked, err := (&providerDrainOps{sp: sp}).isDrainAcked(latest.SessionNameMetadata); err != nil || !acked {
+		t.Fatalf("restored runtime acknowledgement = %v, %v; want true", acked, err)
+	}
+}
+
+func TestRuntimeQueuedDrainAckCancellationRetriesNewerAckRestoration(t *testing.T) {
+	store := beads.NewMemStore()
+	baseProvider := runtime.NewFake()
+	sp := &toggleDrainAckSetFailProvider{Provider: baseProvider, fail: true}
+	mgr := sessionpkg.NewManagerWithOptions(store, sp)
+	info, err := mgr.CreateSession(context.Background(), sessionpkg.CreateOptions{
+		Template: "worker", Title: "worker", Command: "echo", WorkDir: t.TempDir(), Provider: "stub",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldToken, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.AcknowledgeDrain(info.ID); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := sessionFrontDoor(store).GetLive(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.SetMeta(latest.SessionNameMetadata, drainAckCancelPendingKey(oldToken), oldToken); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.SetMeta(latest.SessionNameMetadata, drainAckCancelPendingLegacyKey, oldToken); err != nil {
+		t.Fatal(err)
+	}
+	dt := newDrainTracker()
+	if _, ok := retryRuntimeDrainAckCancellation(latest, sessionFrontDoor(store), sp, dt); !ok {
+		t.Fatal("durable state was not folded after failed restoration")
+	}
+	if marker, err := sp.GetMeta(latest.SessionNameMetadata, drainAckCancelPendingKey(oldToken)); err != nil || marker != oldToken {
+		t.Fatalf("pending restoration marker = %q, %v; want %q", marker, err, oldToken)
+	}
+
+	sp.fail = false
+	if _, ok := retryRuntimeDrainAckCancellation(latest, sessionFrontDoor(store), sp, dt); !ok {
+		t.Fatal("restoration retry did not complete")
+	}
+	if marker, err := sp.GetMeta(latest.SessionNameMetadata, drainAckCancelPendingKey(oldToken)); err != nil || marker != "" {
+		t.Fatalf("pending restoration marker = %q, %v; want cleared", marker, err)
+	}
+	if acked, err := (&providerDrainOps{sp: sp}).isDrainAcked(latest.SessionNameMetadata); err != nil || !acked {
+		t.Fatalf("restored runtime acknowledgement = %v, %v; want true", acked, err)
+	}
+}
+
+func TestRuntimeQueuedDrainAckCancellationDoesNotRemoveNewerTokenMarker(t *testing.T) {
+	store := beads.NewMemStore()
+	baseProvider := runtime.NewFake()
+	mgr := sessionpkg.NewManagerWithOptions(store, baseProvider)
+	info, err := mgr.CreateSession(context.Background(), sessionpkg.CreateOptions{
+		Template: "worker", Title: "worker", Command: "echo", WorkDir: t.TempDir(), Provider: "stub",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldToken, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err := sessionFrontDoor(store).GetLive(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newToken, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldKey := drainAckCancelPendingKey(oldToken)
+	newKey := drainAckCancelPendingKey(newToken)
+	if err := baseProvider.SetMeta(info.SessionNameMetadata, oldKey, oldToken); err != nil {
+		t.Fatal(err)
+	}
+	sp := &replaceMarkerOnRemoveProvider{
+		Provider: baseProvider, sessionName: info.SessionNameMetadata,
+		triggerKey: oldKey, nextKey: newKey, nextToken: newToken,
+	}
+	if _, ok := retryRuntimeDrainAckCancellation(stale, sessionFrontDoor(store), sp, newDrainTracker()); !ok {
+		t.Fatal("old-token cancellation did not complete")
+	}
+	if marker, err := baseProvider.GetMeta(info.SessionNameMetadata, newKey); err != nil || marker != newToken {
+		t.Fatalf("new-token retry marker = %q, %v; want %q", marker, err, newToken)
 	}
 }
 

@@ -5,7 +5,7 @@
 #   export GC_BEADS=exec:/path/to/contrib/beads-scripts/gc-beads-br
 #   gc start my-city
 #
-# Dependencies: br (beads_rust), jq, bash
+# Dependencies: br (beads_rust), jq, bash, flock
 #
 # Label conventions:
 #   parent:<id>  — tracks parent-child relationships
@@ -28,6 +28,14 @@ shift
 if [ -n "${BR_DIR:-}" ]; then
   cd "$BR_DIR"
 fi
+
+# Serialize every wrapper operation so fence-metadata-key can compare and
+# replace the label set as one provider transaction. Direct br invocations are
+# outside the exec-provider contract and must not mutate the same store while
+# Gas City owns it.
+mkdir -p .beads
+exec 9>.beads/gc-exec-provider.lock
+flock 9
 
 # join_labels joins an array of labels with commas for br --labels flag.
 join_labels() {
@@ -57,6 +65,12 @@ meta_label() {
   key_hex=$(printf '%s' "$key" | hex_encode)
   value_hex=$(printf '%s' "$value" | hex_encode)
   printf 'metahex:%s:%s\n' "$key_hex" "$value_hex"
+}
+
+meta_label_prefix() {
+  local key_hex
+  key_hex=$(printf '%s' "$1" | hex_encode)
+  printf 'metahex:%s:' "$key_hex"
 }
 
 # json_string_array renders argv as a JSON string array.
@@ -244,6 +258,8 @@ case "$op" in
     id="$1"
     input=$(cat)
     cmd_args=(br update --json "$id")
+    current=$(br show --json "$id" | jq '.[0]')
+    mapfile -t desired_labels < <(printf '%s' "$current" | jq -r '.labels // [] | .[]')
 
     description=$(echo "$input" | jq -r '.description // empty')
     [ -n "$description" ] && cmd_args+=(--description "$description")
@@ -251,21 +267,70 @@ case "$op" in
     assignee=$(echo "$input" | jq -r '.assignee // empty')
     [ -n "$assignee" ] && cmd_args+=(--assignee "$assignee")
 
-    # Append labels via --add-label (one per flag).
+    # Fold label and metadata mutations into one replacement so provenance
+    # clusters carried by a single exec Update cannot split across commands.
     while IFS= read -r label; do
-      [ -n "$label" ] && cmd_args+=(--add-label "$label")
+      [ -n "$label" ] && desired_labels+=("$label")
     done < <(echo "$input" | jq -r '.labels // [] | .[]')
+    while IFS= read -r remove_label; do
+      [ -z "$remove_label" ] && continue
+      kept=()
+      for label in "${desired_labels[@]}"; do
+        [ "$label" = "$remove_label" ] || kept+=("$label")
+      done
+      desired_labels=("${kept[@]}")
+    done < <(echo "$input" | jq -r '.remove_labels // [] | .[]')
 
     # Handle parent_id change.
     parent_id=$(echo "$input" | jq -r '.parent_id // empty')
-    [ -n "$parent_id" ] && cmd_args+=(--add-label "parent:$parent_id")
+    [ -n "$parent_id" ] && desired_labels+=("parent:$parent_id")
 
     # Convert metadata entries to br-safe labels.
     while IFS=$'\t' read -r meta_key meta_value; do
-      [ -n "$meta_key" ] && cmd_args+=(--add-label "$(meta_label "$meta_key" "$meta_value")")
+      [ -z "$meta_key" ] && continue
+      prefix=$(meta_label_prefix "$meta_key")
+      kept=()
+      for label in "${desired_labels[@]}"; do
+        [[ "$label" == "$prefix"* ]] || kept+=("$label")
+      done
+      desired_labels=("${kept[@]}")
+      desired_labels+=("$(meta_label "$meta_key" "$meta_value")")
     done < <(echo "$input" | jq -r '.metadata // {} | to_entries[] | [.key, (.value|tostring)] | @tsv')
 
+    while IFS= read -r meta_key; do
+      [ -z "$meta_key" ] && continue
+      prefix=$(meta_label_prefix "$meta_key")
+      kept=()
+      for label in "${desired_labels[@]}"; do
+        [[ "$label" == "$prefix"* ]] || kept+=("$label")
+      done
+      desired_labels=("${kept[@]}")
+    done < <(echo "$input" | jq -r '.remove_metadata // [] | .[]')
+
+    cmd_args+=(--set-labels "$(join_labels "${desired_labels[@]}")")
     "${cmd_args[@]}" > /dev/null
+    ;;
+
+  fence-metadata-key)
+    id="${1:?fence-metadata-key: missing id}"
+    key="${2:?fence-metadata-key: missing key}"
+    expected="${3-}"
+    next=$(cat)
+    prefix=$(meta_label_prefix "$key")
+    current=$(br show --json "$id" | jq '.[0]')
+    current_label=$(printf '%s' "$current" | jq -r --arg prefix "$prefix" '[.labels // [] | .[] | select(startswith($prefix))] | last // ""')
+    current_value=""
+    if [ -n "$current_label" ]; then
+      current_value=$(hex_decode "${current_label#"$prefix"}")
+    fi
+    if [ "$current_value" != "$expected" ]; then
+      printf '{"swapped":false}\n'
+      exit 0
+    fi
+    mapfile -t desired_labels < <(printf '%s' "$current" | jq -r --arg prefix "$prefix" '.labels // [] | .[] | select(startswith($prefix) | not)')
+    desired_labels+=("$(meta_label "$key" "$next")")
+    br update --json "$id" --set-labels "$(join_labels "${desired_labels[@]}")" > /dev/null
+    printf '{"swapped":true}\n'
     ;;
 
   close)

@@ -7,11 +7,14 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -39,6 +42,8 @@ type drainOps interface {
 type providerDrainOps struct {
 	sp runtime.Provider
 }
+
+var errDrainAcknowledgementSuperseded = errors.New("drain acknowledgement superseded")
 
 type runtimeDrainCheckJSON struct {
 	SchemaVersion string `json:"schema_version"`
@@ -302,7 +307,7 @@ func cmdRuntimeUndrain(args []string, jsonOutput bool, stdout, stderr io.Writer)
 	}
 	dops := newDrainOps(sp)
 	rec := openCityRecorder(stderr)
-	_, cancelAck, err := runtimeDrainAckPersistence(target, sp)
+	_, cancelAck, err := runtimeDrainAckPersistence(context.Background(), target, sp)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc runtime undrain: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -323,13 +328,44 @@ func doRuntimeUndrain(dops drainOps, sp runtime.Provider, cancelAck func() error
 		fmt.Fprintf(stderr, "gc runtime undrain: session %q is not running\n", targetName) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	if err := dops.clearDrain(sn); err != nil {
-		fmt.Fprintf(stderr, "gc runtime undrain: %v\n", err) //nolint:errcheck // best-effort stderr
-		return 1
-	}
+	cancelToken := ""
 	if cancelAck != nil {
 		if err := cancelAck(); err != nil {
 			fmt.Fprintf(stderr, "gc runtime undrain: clearing durable provenance: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		cancelToken, err = sp.GetMeta(sn, drainAckCancelPendingLegacyKey)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc runtime undrain: reading cancellation retry token: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+	}
+	clearErr := dops.clearDrain(sn)
+	// Re-check the same durable token fence after clearing provider metadata.
+	// A newer acknowledgement that landed between the first check and the clear
+	// must keep a runtime signal, so republish it before reporting the lost race.
+	if cancelAck != nil {
+		if err := cancelAck(); err != nil {
+			if errors.Is(err, errDrainAcknowledgementSuperseded) {
+				restoreErr := ensureRuntimeDrainAcknowledgement(dops, sn)
+				if clearErr == nil && restoreErr == nil {
+					restoreErr = clearDrainAckCancellationRetryMarkers(sp, sn, cancelToken)
+				}
+				err = errors.Join(err, clearErr, restoreErr)
+			} else {
+				err = errors.Join(clearErr, err)
+			}
+			fmt.Fprintf(stderr, "gc runtime undrain: verifying durable provenance after runtime clear: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+	}
+	if clearErr != nil {
+		fmt.Fprintf(stderr, "gc runtime undrain: %v\n", clearErr) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if cancelAck != nil {
+		if err := clearDrainAckCancellationRetryMarkers(sp, sn, cancelToken); err != nil {
+			fmt.Fprintf(stderr, "gc runtime undrain: clearing cancellation retry marker: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
 	}
@@ -355,6 +391,18 @@ func doRuntimeUndrain(dops drainOps, sp runtime.Provider, cancelAck func() error
 	}
 	fmt.Fprintf(stdout, "Undrained session '%s'\n", targetName) //nolint:errcheck // best-effort stdout
 	return 0
+}
+
+func clearDrainAckCancellationRetryMarkers(sp runtime.Provider, sessionName, token string) error {
+	if strings.TrimSpace(token) == "" {
+		return nil
+	}
+	markerErr := sp.RemoveMeta(sessionName, drainAckCancelPendingKey(token))
+	indexedToken, indexErr := sp.GetMeta(sessionName, drainAckCancelPendingLegacyKey)
+	if indexErr != nil || indexedToken != token {
+		return errors.Join(markerErr, indexErr)
+	}
+	return errors.Join(markerErr, sp.RemoveMeta(sessionName, drainAckCancelPendingLegacyKey))
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +527,10 @@ current work in response to a drain signal.`,
 }
 
 func cmdRuntimeDrainAck(args []string, jsonOutput bool, stdout, stderr io.Writer) int {
+	return cmdRuntimeDrainAckContext(context.Background(), args, jsonOutput, stdout, stderr)
+}
+
+func cmdRuntimeDrainAckContext(ctx context.Context, args []string, jsonOutput bool, stdout, stderr io.Writer) int {
 	var target sessionRuntimeTarget
 	var err error
 	if len(args) > 0 {
@@ -499,7 +551,7 @@ func cmdRuntimeDrainAck(args []string, jsonOutput bool, stdout, stderr io.Writer
 		fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	persistAck, rollbackAck, err := runtimeDrainAckPersistence(target, sp)
+	persistAck, rollbackAck, err := runtimeDrainAckPersistence(ctx, target, sp)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -508,38 +560,199 @@ func cmdRuntimeDrainAck(args []string, jsonOutput bool, stdout, stderr io.Writer
 	return doRuntimeDrainAck(dops, persistAck, rollbackAck, target.cityPath, target.display, target.sessionName, jsonOutput, stdout, stderr)
 }
 
-func runtimeDrainAckPersistence(target sessionRuntimeTarget, sp runtime.Provider) (func() error, func() error, error) {
-	store, err := openCityStoreAt(target.cityPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("opening store: %w", err)
-	}
+func runtimeDrainAckPersistence(ctx context.Context, target sessionRuntimeTarget, sp runtime.Provider) (func() error, func() error, error) {
 	cfg, cfgErr := loadCityConfigWithoutBuiltinPackRefresh(target.cityPath, io.Discard)
 	if cfgErr != nil && !errors.Is(cfgErr, os.ErrNotExist) {
+		if runtimeDrainAckTargetIsProviderOnly(target, sp) {
+			return nil, nil, nil
+		}
 		return nil, nil, fmt.Errorf("loading config: %w", cfgErr)
 	}
+	store, err := openDrainAckStore(ctx, target.cityPath, cfg)
+	if err != nil {
+		if runtimeDrainAckTargetIsProviderOnly(target, sp) {
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("opening store: %w", err)
+	}
 	sessStore := cliSessionStore(store, cfg, target.cityPath)
-	handle, err := workerHandleForSessionTargetWithConfig(target.cityPath, sessStore, sp, cfg, target.sessionName)
+	durableIdentity := target.durableIdentity()
+	id, err := session.ResolveSessionID(sessStore, durableIdentity)
+	if err != nil {
+		if errors.Is(err, session.ErrSessionNotFound) {
+			return nil, nil, nil
+		}
+		if runtimeDrainAckTargetIsProviderOnly(target, sp) {
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("resolving durable session: %w", err)
+	}
+	handle, err := workerHandleForSessionWithConfig(target.cityPath, sessStore, sp, cfg, id)
 	if err != nil {
 		return nil, nil, fmt.Errorf("resolving session: %w", err)
-	}
-	id, err := session.ResolveSessionID(sessStore, target.sessionName)
-	if err != nil {
-		return nil, nil, fmt.Errorf("resolving durable session: %w", err)
 	}
 	info, err := sessionFrontDoor(sessStore).GetLive(id)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading durable drain acknowledgement: %w", err)
 	}
-	ackToken := info.DrainAckToken
+	ackToken := session.DrainAcknowledgementToken(info)
 	return func() error {
-			token, err := handle.AcknowledgeDrain(context.Background())
+			token, err := handle.AcknowledgeDrain(ctx)
 			if err == nil {
 				ackToken = token
 			}
 			return err
 		}, func() error {
-			return handle.CancelDrainAcknowledgement(context.Background(), ackToken)
+			rollbackCtx := ctx
+			if _, bounded := rollbackCtx.Deadline(); !bounded {
+				var cancel context.CancelFunc
+				rollbackCtx, cancel = context.WithTimeout(rollbackCtx, time.Second)
+				defer cancel()
+			}
+			var rollbackSessionStore beads.Store
+			openRollbackStore := func() error {
+				rollbackStore, err := openDrainAckStore(rollbackCtx, target.cityPath, cfg)
+				if err != nil {
+					return fmt.Errorf("opening store for durable cancellation: %w", err)
+				}
+				rollbackSessionStore = cliSessionStore(rollbackStore, cfg, target.cityPath)
+				return nil
+			}
+			if strings.TrimSpace(ackToken) == "" {
+				if err := openRollbackStore(); err != nil {
+					return err
+				}
+				latest, err := sessionFrontDoor(rollbackSessionStore).GetLive(id)
+				if err != nil {
+					return fmt.Errorf("rechecking durable drain acknowledgement: %w", err)
+				}
+				ackToken = session.DrainAcknowledgementToken(latest)
+				if strings.TrimSpace(ackToken) == "" {
+					return sp.RemoveMeta(target.sessionName, drainAckCancelPendingLegacyKey)
+				}
+			}
+			markerKey := drainAckCancelPendingKey(ackToken)
+			markerErr := errors.Join(
+				sp.SetMeta(target.sessionName, markerKey, ackToken),
+				sp.SetMeta(target.sessionName, drainAckCancelPendingLegacyKey, ackToken),
+			)
+			if rollbackSessionStore == nil {
+				if err := openRollbackStore(); err != nil {
+					return errors.Join(markerErr, err)
+				}
+			}
+			rollbackHandle, err := workerHandleForSessionWithConfig(target.cityPath, rollbackSessionStore, sp, cfg, id)
+			if err != nil {
+				return errors.Join(markerErr, fmt.Errorf("resolving session for durable cancellation: %w", err))
+			}
+			cancelErr := retryDrainAckCancellation(rollbackCtx, func(retryCtx context.Context) error {
+				return rollbackHandle.CancelDrainAcknowledgement(retryCtx, ackToken)
+			})
+			if markerErr != nil || cancelErr != nil {
+				if markerErr != nil {
+					markerErr = fmt.Errorf("queueing durable cancellation retry: %w", markerErr)
+				}
+				return errors.Join(markerErr, cancelErr)
+			}
+			latest, err := sessionFrontDoor(rollbackSessionStore).GetLive(id)
+			if err != nil {
+				return fmt.Errorf("verifying durable drain acknowledgement cancellation: %w", err)
+			}
+			if latest.DrainAckToken != "" &&
+				session.DrainAcknowledgementToken(latest) != ackToken &&
+				!session.IsDrainAcknowledgementCanceled(latest) {
+				return errors.Join(
+					errDrainAcknowledgementSuperseded,
+					clearDrainAckCancellationRetryMarkers(sp, target.sessionName, ackToken),
+				)
+			}
+			return nil
 		}, nil
+}
+
+func openDrainAckStore(ctx context.Context, cityPath string, cfg *config.City) (beads.Store, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	provider := rawBeadsProvider(cityPath)
+	var (
+		store beads.Store
+		err   error
+	)
+	switch {
+	case provider == "file":
+		var fileStore *beads.FileStore
+		fileStore, err = openCompatibleFileStoreContext(ctx, cityPath)
+		if err == nil {
+			fileStore.SetLocker(beads.NewContextFileFlock(ctx, filepath.Join(cityPath, ".gc", "beads.json.lock")))
+			store = fileStore
+		}
+	case strings.HasPrefix(provider, "exec:"):
+		store, err = openExecStoreAtForCityContext(ctx, provider, cityPath, cityPath)
+	case provider == "doltlite" || contract.ProviderUsesBDContract(provider):
+		store, err = scopedBdStoreForCity(ctx, cityPath)
+	default:
+		err = fmt.Errorf("unsupported beads provider %q", provider)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return wrapStoreWithBeadPolicies(store, cfg), nil
+}
+
+func openCompatibleFileStoreContext(ctx context.Context, cityPath string) (*beads.FileStore, error) {
+	type result struct {
+		store *beads.FileStore
+		err   error
+	}
+	ready := make(chan result, 1)
+	go func() {
+		store, err := openCompatibleFileStore(cityPath, cityPath)
+		ready <- result{store: store, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case opened := <-ready:
+		return opened.store, opened.err
+	}
+}
+
+func runtimeDrainAckTargetIsProviderOnly(target sessionRuntimeTarget, sp runtime.Provider) bool {
+	if strings.TrimSpace(target.sessionID) != "" || sp == nil {
+		return false
+	}
+	id, err := sp.GetMeta(target.sessionName, "GC_SESSION_ID")
+	return err == nil && strings.TrimSpace(id) == ""
+}
+
+func retryDrainAckCancellation(ctx context.Context, cancel func(context.Context) error) error {
+	if cancel == nil {
+		return nil
+	}
+	retryCtx := ctx
+	if _, bounded := retryCtx.Deadline(); !bounded {
+		var stop context.CancelFunc
+		retryCtx, stop = context.WithTimeout(retryCtx, time.Second)
+		defer stop()
+	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := retryCtx.Err(); err != nil {
+			return errors.Join(lastErr, err)
+		}
+		err := cancel(retryCtx)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		select {
+		case <-retryCtx.Done():
+			return errors.Join(lastErr, retryCtx.Err())
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	return lastErr
 }
 
 // ---------------------------------------------------------------------------

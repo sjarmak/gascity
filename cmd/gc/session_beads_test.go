@@ -3101,6 +3101,32 @@ func TestCloseBeadUsesSingleTransactionForMetadataAndClose(t *testing.T) {
 	}
 }
 
+func TestCloseBeadRemovesDrainAcknowledgementCancellationMarkers(t *testing.T) {
+	store := beads.NewMemStore()
+	token := "obsolete-token"
+	b, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			session.DrainAckCancellationMetadataKey(token): "true",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !closeBead(store, b.ID, string(session.StateAwake), time.Now().UTC(), ioDiscard{}) {
+		t.Fatal("closeBead returned false, want true")
+	}
+	closed, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := closed.Metadata[session.DrainAckCancellationMetadataKey(token)]; ok {
+		t.Fatalf("closed session retained cancellation marker: metadata=%v", closed.Metadata)
+	}
+}
+
 // TestCloseFailedCreateBeadUsesSingleTransactionForMetadataAndClose pins
 // ga-igcny0.1.1 for the failed-create close path specifically: the claim
 // clears and the terminal Close must be one atomic unit, not two direct

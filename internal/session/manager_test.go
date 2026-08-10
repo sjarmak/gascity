@@ -404,11 +404,14 @@ func TestAcknowledgeDrainPersistsAgentProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get(%s) after cancel: %v", info.ID, err)
 	}
-	if source := got.Metadata[DrainAckSourceMetadataKey]; source != "" {
-		t.Fatalf("%s after cancel = %q, want empty", DrainAckSourceMetadataKey, source)
+	if source := got.Metadata[DrainAckSourceMetadataKey]; source != DrainAckSourceAgent {
+		t.Fatalf("%s after cancel = %q, want %q", DrainAckSourceMetadataKey, source, DrainAckSourceAgent)
 	}
-	if gotToken := got.Metadata[DrainAckTokenMetadataKey]; gotToken != "" {
-		t.Fatalf("%s after cancel = %q, want empty", DrainAckTokenMetadataKey, gotToken)
+	if gotToken := got.Metadata[DrainAckTokenMetadataKey]; gotToken != drainAckCanceledFenceValue(token) {
+		t.Fatalf("%s after cancel = %q, want canceled fence for %q", DrainAckTokenMetadataKey, gotToken, token)
+	}
+	if cancelToken := got.Metadata[DrainAckCancelTokenMetadataKey]; cancelToken != token {
+		t.Fatalf("%s after cancel = %q, want %q", DrainAckCancelTokenMetadataKey, cancelToken, token)
 	}
 }
 
@@ -437,6 +440,230 @@ func TestCancelDrainAcknowledgementDoesNotClearNewerToken(t *testing.T) {
 	if got.Metadata[DrainAckTokenMetadataKey] != newToken || got.Metadata[DrainAckSourceMetadataKey] != DrainAckSourceAgent {
 		t.Fatalf("new acknowledgement was cleared: metadata=%v", got.Metadata)
 	}
+	if got.Metadata[DrainAckCancelTokenMetadataKey] != oldToken {
+		t.Fatalf("cancellation tombstone = %q, want old token %q", got.Metadata[DrainAckCancelTokenMetadataKey], oldToken)
+	}
+}
+
+func TestAcknowledgeDrainRejectsCommittedStopFence(t *testing.T) {
+	store := beads.NewMemStore()
+	mgr := NewManagerWithOptions(store, runtime.NewFake())
+	created, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "chat", Command: "claude", WorkDir: t.TempDir(), Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.AcknowledgeDrain(created.ID); err != nil {
+		t.Fatal(err)
+	}
+	front := NewStore(beads.SessionStore{Store: store})
+	live, err := front.GetLive(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := front.BeginDrainAckStopPendingInfo(live, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.AcknowledgeDrain(created.ID); !errors.Is(err, ErrDrainAcknowledgementStopCommitted) {
+		t.Fatalf("AcknowledgeDrain error = %v, want ErrDrainAcknowledgementStopCommitted", err)
+	}
+}
+
+type stopFenceBeforeAcknowledgementWriteStore struct {
+	beads.Store
+	oldToken string
+	once     sync.Once
+}
+
+func (s *stopFenceBeforeAcknowledgementWriteStore) commitStopFence(id string) {
+	s.once.Do(func() {
+		front := NewStore(beads.SessionStore{Store: s.Store})
+		live, err := front.GetLive(id)
+		if err != nil {
+			panic(err)
+		}
+		if _, err := front.BeginDrainAckStopPendingInfo(live, time.Now()); err != nil {
+			panic(err)
+		}
+	})
+}
+
+func (s *stopFenceBeforeAcknowledgementWriteStore) Update(id string, opts beads.UpdateOpts) error {
+	if next := opts.Metadata[DrainAckTokenMetadataKey]; next != "" && next != s.oldToken {
+		s.commitStopFence(id)
+	}
+	return s.Store.Update(id, opts)
+}
+
+func (s *stopFenceBeforeAcknowledgementWriteStore) FenceMetadataKey(id, key, expected, next string) (bool, error) {
+	if key == DrainAckTokenMetadataKey && expected == s.oldToken && next != expected {
+		s.commitStopFence(id)
+	}
+	fencer, ok := beads.MetadataKeyFencerFor(s.Store)
+	if !ok {
+		return false, beads.ErrConditionalWriteUnsupported
+	}
+	return fencer.FenceMetadataKey(id, key, expected, next)
+}
+
+func TestAcknowledgeDrainCannotOverwriteConcurrentStopFence(t *testing.T) {
+	base := beads.NewMemStore()
+	baseManager := NewManagerWithOptions(base, runtime.NewFake())
+	created, err := baseManager.CreateSession(context.Background(), CreateOptions{
+		Template: "helper", Title: "chat", Command: "claude", WorkDir: t.TempDir(), Provider: "claude",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldToken, err := baseManager.AcknowledgeDrain(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracing := &stopFenceBeforeAcknowledgementWriteStore{Store: base, oldToken: oldToken}
+	manager := NewManagerWithOptions(tracing, runtime.NewFake())
+
+	if _, err := manager.AcknowledgeDrain(created.ID); !errors.Is(err, ErrDrainAcknowledgementStopCommitted) {
+		t.Fatalf("AcknowledgeDrain error = %v, want ErrDrainAcknowledgementStopCommitted", err)
+	}
+	got, err := NewStore(beads.SessionStore{Store: base}).GetLive(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DrainAckToken != drainAckStopFenceValue(oldToken) {
+		t.Fatalf("drain acknowledgement token = %q, want committed fence for %q", got.DrainAckToken, oldToken)
+	}
+}
+
+func TestDelayedOldCancellationCannotUncancelNewerToken(t *testing.T) {
+	store := beads.NewMemStore()
+	mgr := NewManagerWithOptions(store, runtime.NewFake())
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "chat", Command: "claude", WorkDir: t.TempDir(), Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldToken, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newToken, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CancelDrainAcknowledgement(info.ID, newToken); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CancelDrainAcknowledgement(info.ID, oldToken); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := NewStore(beads.SessionStore{Store: store}).GetLive(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DrainAckToken != drainAckCanceledFenceValue(newToken) || got.DrainAckCancelToken != newToken {
+		t.Fatalf("newer cancellation lost after delayed old cancellation: %+v", got)
+	}
+}
+
+func TestAcknowledgeDrainCompactsPreviousCancellationMarker(t *testing.T) {
+	store := beads.NewMemStore()
+	mgr := NewManagerWithOptions(store, runtime.NewFake())
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "chat", Command: "claude", WorkDir: t.TempDir(), Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldToken, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CancelDrainAcknowledgement(info.ID, oldToken); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.AcknowledgeDrain(info.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := got.Metadata[DrainAckCancellationMetadataKey(oldToken)]; present {
+		t.Fatalf("obsolete cancellation marker remained: %v", got.Metadata)
+	}
+}
+
+func TestAcknowledgeDrainCompactsEveryObsoleteCancellationMarker(t *testing.T) {
+	store := beads.NewMemStore()
+	mgr := NewManagerWithOptions(store, runtime.NewFake())
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "chat", Command: "claude", WorkDir: t.TempDir(), Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CancelDrainAcknowledgement(info.ID, second); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CancelDrainAcknowledgement(info.ID, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.AcknowledgeDrain(info.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range []string{first, second} {
+		if _, present := got.Metadata[DrainAckCancellationMetadataKey(token)]; present {
+			t.Fatalf("obsolete cancellation marker for %q remained: %v", token, got.Metadata)
+		}
+	}
+}
+
+func TestFinalizeDrainAcknowledgementCompactsEveryCancellationMarker(t *testing.T) {
+	store := beads.NewMemStore()
+	mgr := NewManagerWithOptions(store, runtime.NewFake())
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "chat", Command: "claude", WorkDir: t.TempDir(), Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CancelDrainAcknowledgement(info.ID, first); err != nil {
+		t.Fatal(err)
+	}
+	const obsolete = "obsolete-token"
+	if err := store.SetMetadata(info.ID, DrainAckCancellationMetadataKey(obsolete), "true"); err != nil {
+		t.Fatal(err)
+	}
+	front := NewStore(beads.SessionStore{Store: store})
+	live, err := front.GetLive(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := front.FinalizeDrainAcknowledgementInfo(live, AcknowledgeDrainPatch(false)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range []string{first, obsolete} {
+		if _, present := got.Metadata[DrainAckCancellationMetadataKey(token)]; present {
+			t.Fatalf("obsolete cancellation marker for %q remained: %v", token, got.Metadata)
+		}
+	}
 }
 
 func TestCancelDrainAcknowledgementResolvesTypedStoreWrappers(t *testing.T) {
@@ -458,8 +685,32 @@ func TestCancelDrainAcknowledgementResolvesTypedStoreWrappers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Metadata[DrainAckSourceMetadataKey] != "" || got.Metadata[DrainAckTokenMetadataKey] != "" {
-		t.Fatalf("durable acknowledgement was not cleared: metadata=%v", got.Metadata)
+	if got.Metadata[DrainAckCancelTokenMetadataKey] != token {
+		t.Fatalf("durable acknowledgement was not canceled: metadata=%v", got.Metadata)
+	}
+}
+
+func TestCancelDrainAcknowledgementDoesNotRequireConditionalWrites(t *testing.T) {
+	backing := beads.NewMemStore()
+	mgr := NewManagerWithOptions(beads.SessionStore{Store: backing}, runtime.NewFake())
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "chat", Command: "claude", WorkDir: t.TempDir(), Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backing.DisableConditionalWrites = true
+	if err := mgr.CancelDrainAcknowledgement(info.ID, token); err != nil {
+		t.Fatalf("CancelDrainAcknowledgement without conditional writes: %v", err)
+	}
+	got, err := backing.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata[DrainAckCancelTokenMetadataKey] != token {
+		t.Fatalf("durable acknowledgement was not canceled: metadata=%v", got.Metadata)
 	}
 }
 
@@ -5341,6 +5592,38 @@ func TestCloseDetailed_StopSuccessClosesBead(t *testing.T) {
 	}
 	if b.Status != "closed" {
 		t.Errorf("bead Status = %q, want closed", b.Status)
+	}
+}
+
+func TestCloseDetailedClearsDrainAcknowledgementProvenance(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{
+		Template: "helper", Command: "claude", WorkDir: "/tmp", Provider: "claude",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CancelDrainAcknowledgement(info.ID, token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.CloseDetailed(info.ID); err != nil {
+		t.Fatalf("CloseDetailed: %v", err)
+	}
+	got, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata[DrainAckSourceMetadataKey] != "" || got.Metadata[DrainAckTokenMetadataKey] != "" || got.Metadata[DrainAckCancelTokenMetadataKey] != "" {
+		t.Fatalf("fixed drain acknowledgement provenance survived close: %v", got.Metadata)
+	}
+	if _, ok := got.Metadata[DrainAckCancellationMetadataKey(token)]; ok {
+		t.Fatalf("per-token cancellation marker survived close: %v", got.Metadata)
 	}
 }
 

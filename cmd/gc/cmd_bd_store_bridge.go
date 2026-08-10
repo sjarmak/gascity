@@ -29,16 +29,17 @@ type bdStoreBridgeCreateRequest struct {
 }
 
 type bdStoreBridgeUpdateRequest struct {
-	Title        *string           `json:"title,omitempty"`
-	Status       *string           `json:"status,omitempty"`
-	Type         *string           `json:"type,omitempty"`
-	Priority     *int              `json:"priority,omitempty"`
-	Description  *string           `json:"description,omitempty"`
-	ParentID     *string           `json:"parent_id,omitempty"`
-	Assignee     *string           `json:"assignee,omitempty"`
-	Labels       []string          `json:"labels,omitempty"`
-	RemoveLabels []string          `json:"remove_labels,omitempty"`
-	Metadata     map[string]string `json:"metadata,omitempty"`
+	Title          *string           `json:"title,omitempty"`
+	Status         *string           `json:"status,omitempty"`
+	Type           *string           `json:"type,omitempty"`
+	Priority       *int              `json:"priority,omitempty"`
+	Description    *string           `json:"description,omitempty"`
+	ParentID       *string           `json:"parent_id,omitempty"`
+	Assignee       *string           `json:"assignee,omitempty"`
+	Labels         []string          `json:"labels,omitempty"`
+	RemoveLabels   []string          `json:"remove_labels,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
+	RemoveMetadata []string          `json:"remove_metadata,omitempty"`
 }
 
 type bdStoreBridgeBead struct {
@@ -181,16 +182,17 @@ func runBdStoreBridge(op string, args []string, dir, host, port, user string, st
 			return err
 		}
 		return store.Update(args[0], beads.UpdateOpts{
-			Title:        req.Title,
-			Status:       req.Status,
-			Type:         req.Type,
-			Priority:     req.Priority,
-			Description:  req.Description,
-			ParentID:     req.ParentID,
-			Assignee:     req.Assignee,
-			Labels:       req.Labels,
-			RemoveLabels: req.RemoveLabels,
-			Metadata:     req.Metadata,
+			Title:          req.Title,
+			Status:         req.Status,
+			Type:           req.Type,
+			Priority:       req.Priority,
+			Description:    req.Description,
+			ParentID:       req.ParentID,
+			Assignee:       req.Assignee,
+			Labels:         req.Labels,
+			RemoveLabels:   req.RemoveLabels,
+			Metadata:       req.Metadata,
+			RemoveMetadata: req.RemoveMetadata,
 		})
 	case "close":
 		if len(args) < 1 {
@@ -266,6 +268,25 @@ func runBdStoreBridge(op string, args []string, dir, host, port, user string, st
 			return fmt.Errorf("read stdin: %w", err)
 		}
 		return store.SetMetadata(args[0], args[1], string(value))
+	case "fence-metadata-key":
+		if len(args) < 3 {
+			return fmt.Errorf("usage: fence-metadata-key <id> <key> <expected>")
+		}
+		next, err := io.ReadAll(stdin)
+		if err != nil {
+			return fmt.Errorf("read stdin: %w", err)
+		}
+		fencer, ok := beads.MetadataKeyFencerFor(store)
+		if !ok {
+			return beads.ErrConditionalWriteUnsupported
+		}
+		swapped, err := fencer.FenceMetadataKey(args[0], args[1], args[2], string(next))
+		if err != nil {
+			return err
+		}
+		return writeJSON(stdout, struct {
+			Swapped bool `json:"swapped"`
+		}{Swapped: swapped})
 	case "delete":
 		if len(args) < 1 {
 			return fmt.Errorf("usage: delete <id>")

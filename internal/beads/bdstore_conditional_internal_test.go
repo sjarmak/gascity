@@ -640,6 +640,41 @@ func TestUpdateIfMatchSuccessAppliesFence(t *testing.T) {
 	}
 }
 
+func TestFenceMetadataKeyPostgresUsesGuardedPostgresSQL(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "metadata.json"), []byte(`{"backend":"postgres"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		if args[0] == "show" {
+			return []byte(`[{"id":"gc-session","status":"open","metadata":{"fence":"old"}}]`), nil
+		}
+		gotArgs = append([]string(nil), args...)
+		return []byte(`{"rows_affected":1}`), nil
+	}
+	store := NewBdStore(dir, runner)
+	won, err := store.FenceMetadataKey("gc-session", "fence", "old", "new")
+	if err != nil || !won {
+		t.Fatalf("FenceMetadataKey = (%v, %v), want (true, nil)", won, err)
+	}
+	if len(gotArgs) != 3 || gotArgs[0] != "sql" || gotArgs[1] != "--json" {
+		t.Fatalf("PostgreSQL fence argv = %v, want bd sql --json <query>", gotArgs)
+	}
+	query := gotArgs[2]
+	for _, want := range []string{"UPDATE issues SET metadata = jsonb_set", "row_lock = ", "->> 'fence'", "WHERE id = 'gc-session'"} {
+		if !strings.Contains(query, want) {
+			t.Fatalf("PostgreSQL fence query missing %q: %s", want, query)
+		}
+	}
+	if strings.Contains(query, "revision =") || strings.Contains(query, "JSON_SET") {
+		t.Fatalf("PostgreSQL fence used an unsupported schema column or MySQL function: %s", query)
+	}
+}
+
 func TestUpdateIfMatchEmptyOptsIsTypedErrorNoWrite(t *testing.T) {
 	// Pinned cross-store contract: an empty fenced update is invalid input
 	// (ErrEmptyConditionalUpdate) — never a silent nil, never a fence write.

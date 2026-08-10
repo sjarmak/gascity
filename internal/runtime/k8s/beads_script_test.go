@@ -191,6 +191,54 @@ func TestBeadsScriptCloseForcesCrossActorClose(t *testing.T) {
 	assertCallContains(t, result.callLog, "close --force --json ga-orphan")
 }
 
+func TestBeadsScriptUpdateForwardsMetadataRemovals(t *testing.T) {
+	result := runBeadsScript(t, beadsScriptOptions{
+		Op:    "update",
+		Args:  []string{"gc-session"},
+		Input: `{"metadata":{"state":"closed"},"remove_metadata":["drain_ack_canceled_deadbeef"]}`,
+	})
+	if result.err != nil {
+		t.Fatalf("gc-beads-k8s update error = %v\noutput:\n%s", result.err, result.output)
+	}
+	assertCallContains(t, result.callLog, "update --json gc-session --set-metadata state=closed --unset-metadata drain_ack_canceled_deadbeef")
+	if strings.Contains(result.callLog, " --metadata ") {
+		t.Fatalf("update combined incompatible full-metadata and unset flags: %s", result.callLog)
+	}
+}
+
+func TestBeadsScriptFenceMetadataKeyUsesSchemaCompatibleGuardedSQL(t *testing.T) {
+	result := runBeadsScript(t, beadsScriptOptions{
+		Op:    "fence-metadata-key",
+		Args:  []string{"gc-session", "drain_ack_token", "old"},
+		Input: "new",
+	})
+	if result.err != nil {
+		t.Fatalf("gc-beads-k8s fence error = %v\noutput:\n%s", result.err, result.output)
+	}
+	if strings.TrimSpace(result.output) != `{"swapped":true}` {
+		t.Fatalf("fence output = %q, want swapped true", result.output)
+	}
+	for _, want := range []string{"sql --json UPDATE issues", "row_lock = ", "drain_ack_token", "gc-session"} {
+		assertCallContains(t, result.callLog, want)
+	}
+	if strings.Contains(result.callLog, "revision =") {
+		t.Fatalf("fence SQL references the nonexistent revision column: %s", result.callLog)
+	}
+}
+
+func TestBeadsScriptFenceMetadataKeySelectsWispsForNoHistoryRows(t *testing.T) {
+	result := runBeadsScript(t, beadsScriptOptions{
+		Op:         "fence-metadata-key",
+		Args:       []string{"gc-session", "drain_ack_token", "old"},
+		Input:      "new",
+		ShowOutput: `[{"id":"gc-session","no_history":true}]`,
+	})
+	if result.err != nil {
+		t.Fatalf("gc-beads-k8s wisp fence error = %v\noutput:\n%s", result.err, result.output)
+	}
+	assertCallContains(t, result.callLog, "sql --json UPDATE wisps")
+}
+
 func TestBeadsScriptListDoesNotRewriteIssuePrefixPerCommand(t *testing.T) {
 	result := runBeadsScript(t, beadsScriptOptions{
 		Op: "list",
@@ -270,10 +318,12 @@ func TestBeadsScriptConfigSetKeepsBEADSDIRScoped(t *testing.T) {
 type beadsScriptOptions struct {
 	Op          string
 	Args        []string
+	Input       string
 	Env         map[string]string
 	PodPhase    string
 	ListOutput  string
 	ReadyOutput string
+	ShowOutput  string
 }
 
 type beadsScriptResult struct {
@@ -291,6 +341,9 @@ func runBeadsScript(t *testing.T, opts beadsScriptOptions) beadsScriptResult {
 	if opts.ReadyOutput == "" {
 		opts.ReadyOutput = "[]"
 	}
+	if opts.ShowOutput == "" {
+		opts.ShowOutput = `[{"id":"gc-session"}]`
+	}
 
 	tmpDir := t.TempDir()
 	manifestPath := filepath.Join(tmpDir, "manifest.json")
@@ -307,6 +360,7 @@ manifest_out=%q
 call_log=%q
 list_output=%q
 ready_output=%q
+show_output=%q
 printf '%%s\n' "$*" >> "$call_log"
 joined=" $* "
 if [[ "$joined" == *" get pod gc-beads-runner -o jsonpath={.status.phase} "* ]]; then
@@ -328,6 +382,18 @@ if [[ "$joined" == *" wait --for=condition=Ready pod/gc-beads-runner "* ]]; then
   exit 0
 fi
 if [[ "$joined" == *" exec gc-beads-runner -- sh -c "* ]]; then
+  if [[ "$*" == *" sql --json UPDATE issues"* ]]; then
+    printf '{"rows_affected":1}'
+    exit 0
+  fi
+	if [[ "$*" == *" sql --json UPDATE wisps"* ]]; then
+		printf '{"rows_affected":1}'
+		exit 0
+	fi
+	if [[ "$*" == *" show --json "* ]]; then
+		printf '%%s' "$show_output"
+		exit 0
+	fi
   if [[ "$*" == *"bd list --json --limit 0 --all"* ]]; then
     printf '%%s' "$list_output"
     exit 0
@@ -344,13 +410,14 @@ if [[ "$joined" == *" exec gc-beads-runner -- sh -c "* ]]; then
 fi
 printf 'unexpected kubectl call: %%s\n' "$*" >&2
 exit 1
-`, manifestPath, callLogPath, opts.ListOutput, opts.ReadyOutput, opts.PodPhase)
+`, manifestPath, callLogPath, opts.ListOutput, opts.ReadyOutput, opts.ShowOutput, opts.PodPhase)
 	if err := os.WriteFile(fakeKubectl, []byte(kubectlScript), 0o755); err != nil {
 		t.Fatalf("write fake kubectl: %v", err)
 	}
 
 	args := append([]string{opts.Op}, opts.Args...)
 	cmd := exec.Command(beadsScriptPath(t), args...)
+	cmd.Stdin = strings.NewReader(opts.Input)
 	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	for key, value := range opts.Env {
 		cmd.Env = append(cmd.Env, key+"="+value)

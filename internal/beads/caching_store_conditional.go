@@ -206,7 +206,21 @@ func (c *CachingStore) CompareAndSetMetadataKey(id, key, expected, next string) 
 	if !ok {
 		return false, ErrConditionalWriteUnsupported
 	}
-	swapped, err := writer.CompareAndSetMetadataKey(id, key, expected, next)
+	return c.fenceMetadataKey(id, key, expected, next, writer.CompareAndSetMetadataKey)
+}
+
+// FenceMetadataKey forwards the always-on lifecycle metadata fence and keeps
+// the cache coherent with the winning backing-store value.
+func (c *CachingStore) FenceMetadataKey(id, key, expected, next string) (bool, error) {
+	fencer, ok := MetadataKeyFencerFor(c.conditionalBacking())
+	if !ok {
+		return false, ErrConditionalWriteUnsupported
+	}
+	return c.fenceMetadataKey(id, key, expected, next, fencer.FenceMetadataKey)
+}
+
+func (c *CachingStore) fenceMetadataKey(id, key, expected, next string, swap func(string, string, string, string) (bool, error)) (bool, error) {
+	swapped, err := swap(id, key, expected, next)
 	if err != nil {
 		c.applyConditionalWriteFailure(id, err)
 		return swapped, err

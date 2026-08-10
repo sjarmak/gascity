@@ -442,6 +442,8 @@ type Info struct {
 	DrainAckSource string // drain_ack_source (raw)
 	// DrainAckToken is the per-acknowledgement fence paired with DrainAckSource.
 	DrainAckToken string // drain_ack_token (raw)
+	// DrainAckCancelToken is the cancellation tombstone for DrainAckToken.
+	DrainAckCancelToken string // drain_ack_cancel_token (raw)
 	// SessionIDFlag is the RAW session_id_flag metadata. freshRestartSessionKey
 	// (cmd/gc) reads it (trimmed != "") to decide whether the provider can inject a
 	// fresh session ID on a restart handoff. Additive mirror so that read can move off
@@ -1302,16 +1304,40 @@ func (m *Manager) RequestFreshRestart(id string) error {
 func (m *Manager) AcknowledgeDrain(id string) (string, error) {
 	token := NewInstanceToken()
 	err := withSessionMutationLock(id, func() error {
-		if _, _, err := m.sessionBead(id); err != nil {
-			return err
+		fencer, ok := beads.MetadataKeyFencerFor(m.store)
+		if !ok {
+			return beads.ErrConditionalWriteUnsupported
 		}
-		if err := m.store.Update(id, beads.UpdateOpts{Metadata: map[string]string{
-			DrainAckSourceMetadataKey: DrainAckSourceAgent,
-			DrainAckTokenMetadataKey:  token,
-		}}); err != nil {
-			return fmt.Errorf("recording drain-ack provenance for session %s: %w", id, err)
+		for attempt := 0; attempt < 5; attempt++ {
+			current, _, err := m.sessionBead(id)
+			if err != nil {
+				return err
+			}
+			currentToken := current.Metadata[DrainAckTokenMetadataKey]
+			if currentToken == drainAckLegacyClearFenceValue {
+				continue
+			}
+			if isDrainAckStopFenceToken(currentToken) ||
+				(currentToken != "" && current.Metadata[DrainAckCancelTokenMetadataKey] == drainAckStopFenceValue(currentToken)) {
+				return ErrDrainAcknowledgementStopCommitted
+			}
+			// Source and obsolete per-token tombstones are not the serialization
+			// point. Commit them before the token CAS so a concurrent stop can only
+			// win or lose on the shared token key; no later write can erase its fence.
+			opts := beads.UpdateOpts{Metadata: map[string]string{DrainAckSourceMetadataKey: DrainAckSourceAgent}}
+			opts.RemoveMetadata = DrainAckCancellationMetadataKeys(current.Metadata)
+			if err := m.store.Update(id, opts); err != nil {
+				return fmt.Errorf("recording drain-ack provenance for session %s: %w", id, err)
+			}
+			swapped, err := fencer.FenceMetadataKey(id, DrainAckTokenMetadataKey, currentToken, token)
+			if err != nil {
+				return fmt.Errorf("recording drain-ack token for session %s: %w", id, err)
+			}
+			if swapped {
+				return nil
+			}
 		}
-		return nil
+		return fmt.Errorf("recording drain acknowledgement for session %s: concurrent metadata updates", id)
 	})
 	if err != nil {
 		return "", err
@@ -1319,8 +1345,8 @@ func (m *Manager) AcknowledgeDrain(id string) (string, error) {
 	return token, nil
 }
 
-// CancelDrainAcknowledgement clears durable drain provenance after publishing
-// the runtime ack flag fails.
+// CancelDrainAcknowledgement records cancellation of the specified durable
+// acknowledgement after publishing the runtime ack flag fails.
 func (m *Manager) CancelDrainAcknowledgement(id, token string) error {
 	return withSessionMutationLock(id, func() error {
 		if _, _, err := m.sessionBead(id); err != nil {
@@ -1383,6 +1409,14 @@ func (m *Manager) CloseDetailed(id string) (CloseResult, error) {
 		}
 		if err := m.retireConfiguredNamedSessionIdentifiers(id, b); err != nil {
 			return err
+		}
+		front := NewStore(beads.SessionStore{Store: m.store})
+		if _, err := front.ApplyPatchClearingDrainAcknowledgementInfo(infoFromPersistedBead(b), MetadataPatch{
+			DrainAckSourceMetadataKey:      "",
+			DrainAckTokenMetadataKey:       "",
+			DrainAckCancelTokenMetadataKey: "",
+		}); err != nil {
+			return fmt.Errorf("clearing drain acknowledgement before closing session %s: %w", id, err)
 		}
 
 		if err := m.store.Close(id); err != nil {

@@ -1,11 +1,31 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+)
+
+// ErrDrainAcknowledgementCanceled reports that cancellation won the durable
+// acknowledgement fence before the controller could commit stop-pending.
+var ErrDrainAcknowledgementCanceled = errors.New("drain acknowledgement canceled")
+
+// ErrDrainAcknowledgementStopCommitted reports that the controller won the
+// durable fence and cancellation can no longer revoke the pending stop.
+var ErrDrainAcknowledgementStopCommitted = errors.New("drain acknowledgement stop committed")
+
+// ErrDrainAcknowledgementSuperseded reports that the acknowledgement observed
+// by a caller was consumed or replaced before it could claim stop-pending.
+var ErrDrainAcknowledgementSuperseded = errors.New("drain acknowledgement superseded")
+
+const (
+	drainAckStopFencePrefix       = "stop-pending:"
+	drainAckCanceledFencePrefix   = "canceled:"
+	drainAckLegacyClearFenceValue = "legacy-clear-pending"
 )
 
 // This file extends the session-class domain wrapper (Store) with the
@@ -135,52 +155,259 @@ func (s *Store) BeginDrainAckStopPending(id string, now time.Time) error {
 // drain-ack provenance is preserved because it was committed by the agent's
 // acknowledge command before runtime metadata could disappear.
 func (s *Store) BeginDrainAckStopPendingInfo(info Info, now time.Time) (Info, error) {
-	return s.ApplyPatchInfo(info, DrainAckStopPendingPatch(now))
+	claimed, err := s.claimDrainAcknowledgementStop(info, false)
+	if err != nil {
+		return info, err
+	}
+	return s.ApplyPatchInfo(claimed, DrainAckStopPendingPatch(now))
 }
 
-// CancelDrainAcknowledgement clears durable agent provenance when a drain ack
-// is canceled before finalization.
+// CancelDrainAcknowledgement records a token-specific cancellation tombstone
+// and reports whether it canceled the currently durable acknowledgement.
 func (s *Store) CancelDrainAcknowledgement(id, token string) (bool, error) {
-	for attempts := 0; attempts < 4; attempts++ {
-		current, err := beads.HandlesFor(s.store).Live.Get(id)
+	writer, ok := beads.MetadataKeyFencerFor(s.store.Store)
+	if !ok {
+		return false, beads.ErrConditionalWriteUnsupported
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		current, err := s.GetLive(id)
 		if err != nil {
 			return false, err
 		}
-		if current.Metadata[DrainAckTokenMetadataKey] != token {
+		if isDrainAckStopFenceToken(current.DrainAckToken) {
+			return false, ErrDrainAcknowledgementStopCommitted
+		}
+		if canceledToken, canceled := drainAckCanceledFenceToken(current.DrainAckToken); canceled {
+			if canceledToken != token {
+				return false, nil
+			}
+			if err := s.store.Update(id, beads.UpdateOpts{Metadata: map[string]string{
+				DrainAckCancelTokenMetadataKey:         token,
+				DrainAckCancellationMetadataKey(token): "true",
+			}}); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+		if current.DrainAckCancelToken == drainAckStopFenceValue(current.DrainAckToken) {
+			return false, ErrDrainAcknowledgementStopCommitted
+		}
+		if current.DrainAckToken != token {
+			if err := s.store.Update(id, beads.UpdateOpts{Metadata: map[string]string{
+				DrainAckCancelTokenMetadataKey:         token,
+				DrainAckCancellationMetadataKey(token): "true",
+			}}); err != nil {
+				return false, err
+			}
 			return false, nil
 		}
-		writer, ok := resolvedConditionalWriter(s.store.Store)
-		if !ok {
-			return false, beads.ErrConditionalWriteUnsupported
+		swapped, err := writer.FenceMetadataKey(id, DrainAckTokenMetadataKey, token, drainAckCanceledFenceValue(token))
+		if err != nil {
+			return false, err
 		}
-		err = writer.UpdateIfMatch(id, current.Revision, beads.UpdateOpts{Metadata: map[string]string{
-			DrainAckSourceMetadataKey: "",
-			DrainAckTokenMetadataKey:  "",
-		}})
-		if beads.IsPreconditionFailed(err) {
+		if !swapped {
 			continue
 		}
-		return err == nil, err
+		if err := s.store.Update(id, beads.UpdateOpts{Metadata: map[string]string{
+			DrainAckCancelTokenMetadataKey:         token,
+			DrainAckCancellationMetadataKey(token): "true",
+		}}); err != nil {
+			return false, err
+		}
+		latest, err := s.GetLive(id)
+		if err != nil {
+			return false, err
+		}
+		return IsDrainAcknowledgementCanceled(latest), nil
 	}
-	return false, fmt.Errorf("canceling drain acknowledgement for %s: concurrent updates did not settle", id)
+	return false, fmt.Errorf("canceling drain acknowledgement for session %s: concurrent metadata updates", id)
 }
 
-func resolvedConditionalWriter(store beads.Store) (beads.ConditionalWriter, bool) {
-	const maxWrapperDepth = 8
-	for range maxWrapperDepth {
-		if writer, ok := beads.ConditionalWriterFor(store); ok {
-			return writer, true
+// ClearLegacyDrainAcknowledgement clears pre-token acknowledgement provenance
+// without racing a new token-bearing acknowledgement. The token key remains
+// the serialization point; a fixed pending value makes an interrupted clear
+// resumable by a later reconciliation pass.
+func (s *Store) ClearLegacyDrainAcknowledgement(id string) (bool, error) {
+	writer, ok := beads.MetadataKeyFencerFor(s.store.Store)
+	if !ok {
+		return false, beads.ErrConditionalWriteUnsupported
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		current, err := s.GetLive(id)
+		if err != nil {
+			return false, err
 		}
-		targeter, ok := store.(beads.ConditionalWritesResolveTargeter)
-		if !ok {
-			return nil, false
+		if current.DrainAckToken == drainAckLegacyClearFenceValue {
+			if err := s.store.Update(id, beads.UpdateOpts{Metadata: map[string]string{
+				DrainAckSourceMetadataKey:      "",
+				DrainAckTokenMetadataKey:       "",
+				DrainAckCancelTokenMetadataKey: "",
+			}}); err != nil {
+				return false, err
+			}
+			return true, nil
 		}
-		store = targeter.ConditionalWritesResolveTarget()
-		if store == nil {
-			return nil, false
+		if current.DrainAckToken != "" || current.DrainAckSource == "" {
+			return false, nil
+		}
+		swapped, err := writer.FenceMetadataKey(id, DrainAckTokenMetadataKey, "", drainAckLegacyClearFenceValue)
+		if err != nil {
+			return false, err
+		}
+		if !swapped {
+			continue
+		}
+		if err := s.store.Update(id, beads.UpdateOpts{Metadata: map[string]string{
+			DrainAckSourceMetadataKey:      "",
+			DrainAckTokenMetadataKey:       "",
+			DrainAckCancelTokenMetadataKey: "",
+		}}); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, fmt.Errorf("clearing legacy drain acknowledgement for session %s: concurrent metadata updates", id)
+}
+
+// RefreshDrainAcknowledgementInfo reloads the durable projection for an
+// already-identified session while bypassing eventual-consistency caches.
+func (s *Store) RefreshDrainAcknowledgementInfo(info Info) (Info, error) {
+	if s == nil || s.store.Store == nil || strings.TrimSpace(info.ID) == "" {
+		return info, fmt.Errorf("loading session %q: %w", info.ID, beads.ErrNotFound)
+	}
+	current, err := beads.HandlesFor(s.store.Store).Live.Get(info.ID)
+	if err != nil {
+		return info, fmt.Errorf("loading session %q: %w", info.ID, err)
+	}
+	return infoFromPersistedBead(current), nil
+}
+
+// FinalizeDrainAcknowledgementInfo persists the terminal drain patch and
+// removes the active token's cancellation marker in the same store update.
+func (s *Store) FinalizeDrainAcknowledgementInfo(info Info, patch MetadataPatch) (Info, error) {
+	claimed, err := s.claimDrainAcknowledgementStop(info, false)
+	if err != nil {
+		return info, err
+	}
+	return s.applyPatchAfterDrainAcknowledgementClaim(info, claimed, patch)
+}
+
+func drainAckStopFenceValue(token string) string { return drainAckStopFencePrefix + token }
+
+func drainAckCanceledFenceValue(token string) string { return drainAckCanceledFencePrefix + token }
+
+func isDrainAckStopFenceToken(value string) bool {
+	token, ok := strings.CutPrefix(value, drainAckStopFencePrefix)
+	return ok && token != ""
+}
+
+func drainAckCanceledFenceToken(value string) (string, bool) {
+	token, ok := strings.CutPrefix(value, drainAckCanceledFencePrefix)
+	return token, ok && token != ""
+}
+
+// DrainAcknowledgementToken returns the command-issued token without its
+// durable stop/cancel state prefix.
+func DrainAcknowledgementToken(info Info) string {
+	if info.DrainAckToken == drainAckLegacyClearFenceValue {
+		return ""
+	}
+	if token, stopped := strings.CutPrefix(info.DrainAckToken, drainAckStopFencePrefix); stopped {
+		return token
+	}
+	if token, canceled := drainAckCanceledFenceToken(info.DrainAckToken); canceled {
+		return token
+	}
+	return info.DrainAckToken
+}
+
+// IsDrainAcknowledgementCanceled reports whether the durable token state or
+// its legacy cancel-token projection records cancellation of the active ack.
+func IsDrainAcknowledgementCanceled(info Info) bool {
+	if _, canceled := drainAckCanceledFenceToken(info.DrainAckToken); canceled {
+		return true
+	}
+	return strings.TrimSpace(info.DrainAckToken) != "" && info.DrainAckCancelToken == info.DrainAckToken
+}
+
+func (s *Store) claimDrainAcknowledgementStop(info Info, terminalClear bool) (Info, error) {
+	writer, ok := beads.MetadataKeyFencerFor(s.store.Store)
+	if !ok {
+		return info, beads.ErrConditionalWriteUnsupported
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		current, err := s.GetLive(info.ID)
+		if err != nil {
+			return info, err
+		}
+		requestedToken := DrainAcknowledgementToken(info)
+		currentToken := DrainAcknowledgementToken(current)
+		if info.DrainAckToken == "" && current.DrainAckToken != "" && current.DrainAckToken != drainAckLegacyClearFenceValue {
+			return info, ErrDrainAcknowledgementSuperseded
+		}
+		if requestedToken != "" && (currentToken != requestedToken || current.DrainAckSource != DrainAckSourceAgent) {
+			return info, ErrDrainAcknowledgementSuperseded
+		}
+		if current.DrainAckToken == drainAckLegacyClearFenceValue {
+			if !terminalClear {
+				return info, ErrDrainAcknowledgementCanceled
+			}
+			return current, nil
+		}
+		if isDrainAckStopFenceToken(current.DrainAckToken) {
+			return current, nil
+		}
+		if current.DrainAckToken == "" {
+			swapped, err := writer.FenceMetadataKey(info.ID, DrainAckTokenMetadataKey, "", drainAckLegacyClearFenceValue)
+			if err != nil {
+				return info, err
+			}
+			if swapped {
+				current.DrainAckToken = drainAckLegacyClearFenceValue
+				return current, nil
+			}
+			continue
+		}
+		if IsDrainAcknowledgementCanceled(current) && !terminalClear {
+			return info, ErrDrainAcknowledgementCanceled
+		}
+		fence := drainAckStopFenceValue(currentToken)
+		if current.DrainAckCancelToken == fence {
+			return current, nil
+		}
+		swapped, err := writer.FenceMetadataKey(info.ID, DrainAckTokenMetadataKey, current.DrainAckToken, fence)
+		if err != nil {
+			return info, err
+		}
+		if swapped {
+			current.DrainAckToken = fence
+			return current, nil
 		}
 	}
-	return beads.ConditionalWriterFor(store)
+	return info, fmt.Errorf("claiming drain acknowledgement for session %s: concurrent metadata updates", info.ID)
+}
+
+// ApplyPatchClearingDrainAcknowledgementInfo persists a lifecycle patch while
+// removing every obsolete per-token cancellation marker in the same update.
+func (s *Store) ApplyPatchClearingDrainAcknowledgementInfo(info Info, patch MetadataPatch) (Info, error) {
+	claimed, err := s.claimDrainAcknowledgementStop(info, true)
+	if err != nil {
+		return info, err
+	}
+	return s.applyPatchAfterDrainAcknowledgementClaim(info, claimed, patch)
+}
+
+func (s *Store) applyPatchAfterDrainAcknowledgementClaim(info, claimed Info, patch MetadataPatch) (Info, error) {
+	current, err := beads.HandlesFor(s.store.Store).Live.Get(info.ID)
+	if err != nil {
+		return info, err
+	}
+	removeMetadata := DrainAckCancellationMetadataKeys(current.Metadata)
+	opts := beads.UpdateOpts{Metadata: map[string]string(patch), RemoveMetadata: removeMetadata}
+	if err := s.store.Update(info.ID, opts); err != nil {
+		return info, err
+	}
+	return claimed.ApplyPatch(patch), nil
 }
 
 // RequestRestart records a controller handoff to a fresh provider conversation
@@ -344,7 +571,7 @@ func (s *Store) Close(id, stateCode string, now time.Time) (bool, error) {
 	if info.Closed {
 		return false, nil
 	}
-	if err := s.ApplyPatch(id, ClosePatch(now, stateCode)); err != nil {
+	if _, err := s.ApplyPatchClearingDrainAcknowledgementInfo(info, ClosePatch(now, stateCode)); err != nil {
 		return false, err
 	}
 	if err := s.store.Close(id); err != nil {

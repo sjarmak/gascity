@@ -26,11 +26,20 @@ type Store struct {
 	script  string
 	timeout time.Duration
 	env     map[string]string
+	ctx     context.Context
 }
+
+var _ beads.MetadataKeyFencer = (*Store)(nil)
 
 // SetEnv sets environment variables passed to the script process.
 func (s *Store) SetEnv(env map[string]string) {
 	s.env = env
+}
+
+// SetContext binds future script invocations to ctx in addition to the store's
+// own timeout. It is intended for short-lived command-scoped stores.
+func (s *Store) SetContext(ctx context.Context) {
+	s.ctx = ctx
 }
 
 // NewStore returns a Store that delegates to the given script.
@@ -74,14 +83,20 @@ func stripExecEnvKey(key string) bool {
 // run executes the script with the given args, optionally piping stdinData
 // to its stdin. Returns the trimmed stdout on success.
 //
-// Exit code 2 is treated as success for unknown operation names. When ready is
-// called with contract flags, exit code 2 means the invocation was rejected and
-// must surface as an error instead of silently returning empty data.
+// Exit code 2 is treated as success for optional unknown operation names. For
+// correctness-critical operations, exit 2 means the provider lacks a required
+// capability and must surface as an error.
 func (s *Store) run(stdinData []byte, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	parent := s.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, s.timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, s.script, args...)
+	prepareCommandForTimeout(cmd)
+	cmd.Cancel = func() error { return killCommandTree(cmd) }
 	// WaitDelay ensures Go forcibly closes I/O pipes after the context
 	// expires, even if grandchild processes still hold them open.
 	cmd.WaitDelay = 2 * time.Second
@@ -101,7 +116,7 @@ func (s *Store) run(stdinData []byte, args ...string) (string, error) {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			if exitErr.ExitCode() == 2 {
-				if readyExit2IsRejectedInvocation(args) {
+				if exit2IsRejectedInvocation(args) {
 					errMsg := strings.TrimSpace(stderr.String())
 					if errMsg == "" {
 						errMsg = err.Error()
@@ -121,8 +136,8 @@ func (s *Store) run(stdinData []byte, args ...string) (string, error) {
 	return strings.TrimRight(stdout.String(), "\n"), nil
 }
 
-func readyExit2IsRejectedInvocation(args []string) bool {
-	return len(args) > 1 && args[0] == "ready"
+func exit2IsRejectedInvocation(args []string) bool {
+	return len(args) > 0 && (args[0] == "fence-metadata-key" || len(args) > 1 && args[0] == "ready")
 }
 
 // isNotFoundError reports whether an error from the script indicates a
@@ -466,6 +481,23 @@ func (s *Store) SetMetadataBatch(id string, kvs map[string]string) error {
 		}
 	}
 	return nil
+}
+
+// FenceMetadataKey delegates the atomic lifecycle fence to the provider. The
+// provider must compare and update in one backend transaction; unlike optional
+// operations, an unknown-operation exit cannot degrade to an unsafe success.
+func (s *Store) FenceMetadataKey(id, key, expected, next string) (bool, error) {
+	out, err := s.run([]byte(next), "fence-metadata-key", id, key, expected)
+	if err != nil {
+		return false, err
+	}
+	var result struct {
+		Swapped bool `json:"swapped"`
+	}
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		return false, fmt.Errorf("parsing fence-metadata-key result: %w", err)
+	}
+	return result.Swapped, nil
 }
 
 // Tx executes fn sequentially against the exec store.

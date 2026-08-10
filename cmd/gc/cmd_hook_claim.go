@@ -72,7 +72,7 @@ type (
 	hookClaimFunc                 func(context.Context, string, []string, string, string) (beads.Bead, bool, error)
 	hookListContinuationFunc      func(context.Context, string, []string, string, string) ([]beads.Bead, error)
 	hookAssignContinuationFunc    func(context.Context, string, []string, string, string) error
-	hookDrainAckFunc              func(io.Writer) error
+	hookDrainAckFunc              func(context.Context, io.Writer) error
 	hookEmitClaimRejectedFunc     func(beadID, existingClaimant, attemptedClaimant string)
 	hookResolveWorkBranchFunc     func(dir string) string
 	hookStampWorkMetaFunc         func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
@@ -418,7 +418,9 @@ func writeHookClaimDrain(reason string, jsonOut, drainAck bool, drainAckFn hookD
 		Reason:        reason,
 	}
 	if drainAck {
-		if err := drainAckFn(stderr); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
+		defer cancel()
+		if err := drainAckFn(ctx, stderr); err != nil {
 			fmt.Fprintf(stderr, "gc hook --claim: drain-ack failed: %v\n", err) //nolint:errcheck
 			return 1
 		}
@@ -1206,8 +1208,8 @@ func hookAssignContinuationWithBdStore(_ context.Context, dir string, env []stri
 	return store.Update(beadID, beads.UpdateOpts{Assignee: &assignee})
 }
 
-func hookRuntimeDrainAck(stderr io.Writer) error {
-	if code := cmdRuntimeDrainAck(nil, false, io.Discard, stderr); code != 0 {
+func hookRuntimeDrainAck(ctx context.Context, stderr io.Writer) error {
+	if code := cmdRuntimeDrainAckContext(ctx, nil, false, io.Discard, stderr); code != 0 {
 		return errors.New("runtime drain-ack returned non-zero")
 	}
 	return nil

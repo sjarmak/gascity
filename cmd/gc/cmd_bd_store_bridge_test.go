@@ -77,8 +77,15 @@ JSON
 [{"id":"BD-1","title":"captured","status":"open","issue_type":"message","assignee":"mayor","created_at":"2026-02-27T10:00:00Z"}]
 JSON
     ;;
-  update)
+  update|close|assign|delete)
+    if [ "${2:-}" = "--help" ]; then
+      printf '%s\n' '      --if-revision int   require matching revision'
+      exit 0
+    fi
     exit 0
+    ;;
+  sql)
+    printf '%s\n' '{"rows_affected":1,"schema_version":1}'
     ;;
   dep)
     if [ "${2:-}" = "list" ]; then
@@ -176,6 +183,30 @@ func TestBdStoreBridgeCreateCmdProjectsCanonicalEnvAndClearsAmbientAuthority(t *
 	for _, want := range []string{"create", "--json", "captured", "-t", "task", "--labels", "triage"} {
 		if !strings.Contains(string(argsText), want) {
 			t.Fatalf("bd args missing %q: %s", want, string(argsText))
+		}
+	}
+
+	stdout.Reset()
+	if err := runBdStoreBridge("fence-metadata-key", []string{"BD-1", "lifecycle", ""}, scopeDir,
+		"db.example.internal", "3317", "root", strings.NewReader("claimed"), &stdout); err != nil {
+		t.Fatalf("fence-metadata-key: %v", err)
+	}
+	var fenceResult struct {
+		Swapped bool `json:"swapped"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &fenceResult); err != nil {
+		t.Fatalf("fence stdout JSON: %v\n%s", err, stdout.String())
+	}
+	if !fenceResult.Swapped {
+		t.Fatal("fence swapped = false, want true")
+	}
+	argsText, err = os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"sql", "--json", "UPDATE issues", "BD-1", "lifecycle", "claimed"} {
+		if !strings.Contains(string(argsText), want) {
+			t.Fatalf("fence bd args missing %q: %s", want, argsText)
 		}
 	}
 }

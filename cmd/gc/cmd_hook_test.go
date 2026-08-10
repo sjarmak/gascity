@@ -671,11 +671,14 @@ func TestDoHookClaimCommandErrorKeepsProtocolStdoutEmpty(t *testing.T) {
 
 func TestDoHookClaimDrainAckOnNoWork(t *testing.T) {
 	drained := false
+	bounded := false
 	runner := func(string, string) (string, error) { return "[]", nil }
 	ops := hookClaimOps{
 		Runner: runner,
-		DrainAck: func(io.Writer) error {
+		DrainAck: func(ctx context.Context, _ io.Writer) error {
 			drained = true
+			deadline, ok := ctx.Deadline()
+			bounded = ok && time.Until(deadline) > 0 && time.Until(deadline) <= hookClaimMutationTimeout
 			return nil
 		},
 	}
@@ -694,6 +697,9 @@ func TestDoHookClaimDrainAckOnNoWork(t *testing.T) {
 	}
 	if !drained {
 		t.Fatal("drain ack was not called")
+	}
+	if !bounded {
+		t.Fatal("drain acknowledgement did not receive the hook mutation deadline")
 	}
 	var result hookClaimJSONResult
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
@@ -799,7 +805,7 @@ func TestClaimHookWorkDrainsWhenPrimaryLosesRaceThenFederatedStoreErrors(t *test
 		},
 		EmitClaimRejected: func(string, string, string) {},
 		ResolveWorkBranch: func(string) string { return "" },
-		DrainAck:          func(io.Writer) error { return nil },
+		DrainAck:          func(context.Context, io.Writer) error { return nil },
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -2568,7 +2574,7 @@ func TestDoHookClaimDrainsClaimsErroredWhenEveryCandidateErrors(t *testing.T) {
 			attempts = append(attempts, beadID)
 			return beads.Bead{}, false, fmt.Errorf("claiming %s: store write timeout", beadID)
 		},
-		DrainAck: func(io.Writer) error {
+		DrainAck: func(context.Context, io.Writer) error {
 			drained = true
 			return nil
 		},
@@ -2621,7 +2627,7 @@ func TestClaimHookWorkDrainsClaimsErroredWhenEveryCandidateErrors(t *testing.T) 
 		},
 		EmitClaimRejected: func(string, string, string) {},
 		ResolveWorkBranch: func(string) string { return "" },
-		DrainAck:          func(io.Writer) error { return nil },
+		DrainAck:          func(context.Context, io.Writer) error { return nil },
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",

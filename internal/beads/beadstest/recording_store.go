@@ -141,6 +141,7 @@ func cloneBead(b beads.Bead) beads.Bead {
 func cloneOpts(o beads.UpdateOpts) beads.UpdateOpts {
 	o.Labels = cloneStrings(o.Labels)
 	o.RemoveLabels = cloneStrings(o.RemoveLabels)
+	o.RemoveMetadata = cloneStrings(o.RemoveMetadata)
 	o.Metadata = cloneMeta(o.Metadata)
 	return o
 }

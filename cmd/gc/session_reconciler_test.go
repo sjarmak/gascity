@@ -89,6 +89,26 @@ type transientPeekErrorProvider struct {
 	calls int
 }
 
+type toggleFenceFailureStore struct {
+	beads.Store
+	fail bool
+}
+
+func (s *toggleFenceFailureStore) MetadataKeyFencerHandle() (beads.MetadataKeyFencer, bool) {
+	return s, true
+}
+
+func (s *toggleFenceFailureStore) FenceMetadataKey(id, key, expected, next string) (bool, error) {
+	if s.fail {
+		return false, errors.New("transient fence failure")
+	}
+	fencer, ok := beads.MetadataKeyFencerFor(s.Store)
+	if !ok {
+		return false, beads.ErrConditionalWriteUnsupported
+	}
+	return fencer.FenceMetadataKey(id, key, expected, next)
+}
+
 func (p *transientPeekErrorProvider) Peek(name string, lines int) (string, error) {
 	p.calls++
 	if p.calls == 1 {
@@ -183,6 +203,19 @@ type failRateLimitHoldStore struct {
 	*beads.MemStore
 	failRateLimitHold  bool
 	rateLimitHoldCalls int
+}
+
+type failNextGetStore struct {
+	beads.Store
+	remaining int
+}
+
+func (s *failNextGetStore) Get(id string) (beads.Bead, error) {
+	if s.remaining > 0 {
+		s.remaining--
+		return beads.Bead{}, errors.New("authoritative session read failed")
+	}
+	return s.Store.Get(id)
 }
 
 func (s *failRateLimitHoldStore) SetMetadataBatch(id string, kvs map[string]string) error {
@@ -754,6 +787,196 @@ func TestReconcileSessionBeads_AgentDrainAckAlwaysNamedSessionGetsBoundedCooldow
 	}
 }
 
+func TestReconcileSessionBeads_DurableAgentAckSurvivesRuntimeAndProviderMetadataDeath(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "worker", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "always"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
+	env.desiredState[sessionName] = TemplateParams{Command: "true", SessionName: sessionName, TemplateName: "worker", ConfiguredNamedIdentity: "worker", ConfiguredNamedMode: "always"}
+	if err := env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "true"}); err != nil {
+		t.Fatal(err)
+	}
+	session := env.createSessionBead(sessionName, "worker")
+	env.markSessionActive(&session)
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey: "true", namedSessionIdentityMetadata: "worker", namedSessionModeMetadata: "always",
+	})
+	if _, err := sessionpkg.NewManagerWithOptions(env.store, env.sp).AcknowledgeDrain(session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.sp.Stop(sessionName); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&providerDrainOps{sp: env.sp}).clearDrain(sessionName); err != nil {
+		t.Fatal(err)
+	}
+
+	if woken := env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{session}, nil, &providerDrainOps{sp: env.sp}); woken != 0 {
+		t.Fatalf("woken = %d, want 0", woken)
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata["held_until"] == "" {
+		t.Fatal("durable acknowledgement completed without named-session cooldown")
+	}
+}
+
+func TestReconcileSessionBeads_DefersDeadRuntimeWhenDurableAckRefreshFails(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "worker", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "always"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
+	env.desiredState[sessionName] = TemplateParams{
+		Command: "true", SessionName: sessionName, TemplateName: "worker",
+		ConfiguredNamedIdentity: "worker", ConfiguredNamedMode: "always",
+	}
+	if err := env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "true"}); err != nil {
+		t.Fatal(err)
+	}
+	session := env.createSessionBead(sessionName, "worker")
+	env.markSessionCreating(&session)
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey: "true", namedSessionIdentityMetadata: "worker", namedSessionModeMetadata: "always",
+	})
+	baseStore := env.store
+	if _, err := sessionpkg.NewManagerWithOptions(baseStore, env.sp).AcknowledgeDrain(session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.sp.Stop(sessionName); err != nil {
+		t.Fatal(err)
+	}
+	env.store = &failNextGetStore{Store: baseStore, remaining: 1}
+
+	if woken := env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{session}, nil, &providerDrainOps{sp: env.sp}); woken != 0 {
+		t.Fatalf("woken after authoritative acknowledgement read failure = %d, want 0", woken)
+	}
+	if env.sp.IsRunning(sessionName) {
+		t.Fatalf("session %q restarted after authoritative acknowledgement read failure", sessionName)
+	}
+	got, err := baseStore.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata[sessionpkg.DrainAckTokenMetadataKey] == "" {
+		t.Fatalf("durable acknowledgement cleared after failed refresh: metadata=%v", got.Metadata)
+	}
+}
+
+func TestReconcileSessionBeads_DurableAgentAckOverridesStaleReconcilerSource(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "worker", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "always"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
+	env.desiredState[sessionName] = TemplateParams{Command: "true", SessionName: sessionName, TemplateName: "worker", ConfiguredNamedIdentity: "worker", ConfiguredNamedMode: "always"}
+	if err := env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "true"}); err != nil {
+		t.Fatal(err)
+	}
+	session := env.createSessionBead(sessionName, "worker")
+	env.markSessionActive(&session)
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey: "true", namedSessionIdentityMetadata: "worker", namedSessionModeMetadata: "always",
+	})
+	if _, err := sessionpkg.NewManagerWithOptions(env.store, env.sp).AcknowledgeDrain(session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := setReconcilerDrainAckMetadata(env.sp, sessionName, &drainState{reason: "idle", generation: 999}); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.sp.Stop(sessionName); err != nil {
+		t.Fatal(err)
+	}
+
+	if woken := env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{session}, nil, &providerDrainOps{sp: env.sp}); woken != 0 {
+		t.Fatalf("woken = %d, want 0", woken)
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata["held_until"] == "" {
+		t.Fatalf("durable agent acknowledgement was discarded as stale: metadata=%v", got.Metadata)
+	}
+}
+
+func TestReconcileSessionBeads_CanceledDurableAgentAckDoesNotStopRuntime(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker", StartCommand: "true"}}}
+	env.desiredState["worker"] = TemplateParams{Command: "true", SessionName: "worker", TemplateName: "worker"}
+	if err := env.sp.Start(context.Background(), "worker", runtime.Config{Command: "true"}); err != nil {
+		t.Fatal(err)
+	}
+	session := env.createSessionBead("worker", "worker")
+	env.markSessionActive(&session)
+	mgr := sessionpkg.NewManagerWithOptions(env.store, env.sp)
+	token, err := mgr.AcknowledgeDrain(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CancelDrainAcknowledgement(session.ID, token); err != nil {
+		t.Fatal(err)
+	}
+	dops := &providerDrainOps{sp: env.sp}
+	if err := dops.setDrainAck("worker"); err != nil {
+		t.Fatal(err)
+	}
+	env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{session}, nil, dops)
+	if !env.sp.IsRunning("worker") {
+		t.Fatal("runtime stopped after its durable acknowledgement was canceled")
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isDrainAckStopPendingInfo(wakeInfo(t, got)) {
+		t.Fatal("canceled acknowledgement moved session to stop-pending")
+	}
+}
+
+func TestReconcileSessionBeads_PendingDrainAckCancellationDoesNotStopRuntime(t *testing.T) {
+	env := newReconcilerTestEnv()
+	failingStore := &toggleFenceFailureStore{Store: env.store}
+	env.store = failingStore
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker", StartCommand: "true"}}}
+	env.desiredState["worker"] = TemplateParams{Command: "true", SessionName: "worker", TemplateName: "worker"}
+	if err := env.sp.Start(context.Background(), "worker", runtime.Config{Command: "true"}); err != nil {
+		t.Fatal(err)
+	}
+	session := env.createSessionBead("worker", "worker")
+	env.markSessionActive(&session)
+	token, err := sessionpkg.NewManagerWithOptions(env.store, env.sp).AcknowledgeDrain(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failingStore.fail = true
+	env.dt.rememberDurableAckClear(session.ID, token)
+	dops := &providerDrainOps{sp: env.sp}
+	if err := dops.setDrainAck("worker"); err != nil {
+		t.Fatal(err)
+	}
+	env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{session}, nil, dops)
+	if !env.sp.IsRunning("worker") {
+		t.Fatal("runtime stopped while durable acknowledgement cancellation was pending")
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isDrainAckStopPendingInfo(wakeInfo(t, got)) {
+		t.Fatal("pending cancellation was converted into drain-ack stop-pending")
+	}
+}
+
 func TestReconcileSessionBeads_DrainAckCooldownExclusions(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -785,6 +1008,7 @@ func TestReconcileSessionBeads_DrainAckCooldownExclusions(t *testing.T) {
 				namedSessionModeMetadata:             tt.namedMode,
 				poolManagedMetadataKey:               boolMetadata(tt.pool),
 				sessionpkg.DrainAckSourceMetadataKey: tt.ackSource,
+				sessionpkg.DrainAckTokenMetadataKey:  "ack-token",
 			})
 			if tt.assignWork {
 				if _, err := env.store.Create(beads.Bead{
@@ -841,8 +1065,41 @@ func TestReconcileSessionBeads_ExplicitWakeClearsAgentDrainAckCooldown(t *testin
 // finalization does not leave agent provenance available to a later drain.
 func TestReconcileSessionBeads_AgentDrainAckConsumesDurableSource(t *testing.T) {
 	_, drained, _ := agentDrainAckAlwaysNamedSession(t)
-	if got := drained.Metadata[sessionpkg.DrainAckSourceMetadataKey]; got != "" {
-		t.Fatalf("durable %s = %q, want consumed", sessionpkg.DrainAckSourceMetadataKey, got)
+	for _, key := range []string{
+		sessionpkg.DrainAckSourceMetadataKey,
+		sessionpkg.DrainAckTokenMetadataKey,
+		sessionpkg.DrainAckCancelTokenMetadataKey,
+	} {
+		if got := drained.Metadata[key]; got != "" {
+			t.Fatalf("durable %s = %q, want consumed", key, got)
+		}
+	}
+}
+
+func TestFinalizeDrainAckStoppedSessionCanceledAgentAckSkipsCooldown(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	session := env.createSessionBead("worker", "worker")
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:                   "true",
+		namedSessionIdentityMetadata:              "worker",
+		namedSessionModeMetadata:                  "always",
+		sessionpkg.DrainAckSourceMetadataKey:      sessionpkg.DrainAckSourceAgent,
+		sessionpkg.DrainAckTokenMetadataKey:       "ack-token",
+		sessionpkg.DrainAckCancelTokenMetadataKey: "ack-token",
+	})
+
+	finalizeDrainAckStoppedSession(
+		"", env.cfg, env.store, nil, env.sessionInfo(session.ID), "worker", false,
+		&providerDrainOps{sp: env.sp}, env.dt, env.clk, env.rec, &env.stderr,
+	)
+
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if heldUntil := got.Metadata["held_until"]; heldUntil != "" {
+		t.Fatalf("held_until = %q, want empty for canceled acknowledgement", heldUntil)
 	}
 }
 
@@ -859,6 +1116,9 @@ func TestFinalizeDrainAckStoppedSessionRefreshesDurableSource(t *testing.T) {
 	if _, err := sessionpkg.NewManagerWithOptions(env.store, env.sp).AcknowledgeDrain(session.ID); err != nil {
 		t.Fatalf("AcknowledgeDrain(%s): %v", session.ID, err)
 	}
+	if err := sessionpkg.NewManagerWithOptions(env.store, env.sp).RequestFreshRestart(session.ID); err != nil {
+		t.Fatalf("RequestFreshRestart(%s): %v", session.ID, err)
+	}
 
 	finalizeDrainAckStoppedSession(
 		"", env.cfg, env.store, nil, stale, "worker", false,
@@ -871,6 +1131,9 @@ func TestFinalizeDrainAckStoppedSessionRefreshesDurableSource(t *testing.T) {
 	}
 	if heldUntil := got.Metadata["held_until"]; heldUntil == "" {
 		t.Fatal("held_until is empty; finalizer used stale drain-ack provenance")
+	}
+	if restartRequested := got.Metadata["restart_requested"]; restartRequested != "" {
+		t.Fatalf("restart_requested = %q, want consumed from authoritative refresh", restartRequested)
 	}
 }
 
@@ -1705,7 +1968,7 @@ func TestFinalizeDrainAckStopPendingSessionsClosesStoppedPoolBeforeAllocation(t 
 		Agents: []config.Agent{{Name: "worker"}},
 	}
 	session := env.createSessionBead("worker", "worker")
-	patch := sessionpkg.DrainAckStopPendingPatch(env.clk.Now().UTC())
+	patch := drainAckStopPendingPatchForTest(env.clk.Now().UTC())
 	patch[poolManagedMetadataKey] = boolMetadata(true)
 	if err := env.store.SetMetadataBatch(session.ID, patch); err != nil {
 		t.Fatalf("SetMetadataBatch(stop-pending): %v", err)
@@ -1794,7 +2057,7 @@ func TestFinalizeDrainAckStopPendingSessionsConfirmsProcessNameSurvivor(t *testi
 	sp := &reparentSurvivorProvider{Fake: env.sp}
 
 	session := env.createSessionBead("worker", "worker")
-	patch := sessionpkg.DrainAckStopPendingPatch(env.clk.Now().UTC())
+	patch := drainAckStopPendingPatchForTest(env.clk.Now().UTC())
 	patch[poolManagedMetadataKey] = boolMetadata(true)
 	if err := env.store.SetMetadataBatch(session.ID, patch); err != nil {
 		t.Fatalf("SetMetadataBatch(stop-pending): %v", err)
@@ -3458,14 +3721,22 @@ func TestReconcileSessionBeads_Phase0HealVisibleOnSnapshot(t *testing.T) {
 // List. Used by the drain-ack fail-closed regression test below.
 type listErrStore struct {
 	beads.Store
-	err error
+	err                 error
+	allowSessionCatalog bool
 }
 
 func (s *listErrStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+	if s.allowSessionCatalog && (q.Type == sessionBeadType || q.Label == sessionpkg.LabelSession) {
+		return s.Store.List(q)
+	}
 	if s.err != nil {
 		return nil, s.err
 	}
 	return s.Store.List(q)
+}
+
+func (s *listErrStore) MetadataKeyFencerHandle() (beads.MetadataKeyFencer, bool) {
+	return beads.MetadataKeyFencerFor(s.Store)
 }
 
 type assignOnListStore struct {
@@ -3491,9 +3762,48 @@ func (s *assignOnListStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 	return s.Store.List(q)
 }
 
+func (s *assignOnListStore) MetadataKeyFencerHandle() (beads.MetadataKeyFencer, bool) {
+	return beads.MetadataKeyFencerFor(s.Store)
+}
+
 type failSetMetadataBatchStore struct {
 	beads.Store
 	err error
+}
+
+type cancelBeforeFinalizerCloseStore struct {
+	beads.Store
+	token string
+	once  sync.Once
+}
+
+func (s *cancelBeforeFinalizerCloseStore) FenceMetadataKey(id, key, expected, next string) (bool, error) {
+	if key == sessionpkg.DrainAckTokenMetadataKey && strings.HasPrefix(next, "stop-pending:") {
+		s.once.Do(func() {
+			front := sessionpkg.NewStore(beads.SessionStore{Store: s.Store})
+			if _, err := front.CancelDrainAcknowledgement(id, s.token); err != nil {
+				panic(err)
+			}
+		})
+	}
+	fencer, ok := beads.MetadataKeyFencerFor(s.Store)
+	if !ok {
+		return false, beads.ErrConditionalWriteUnsupported
+	}
+	return fencer.FenceMetadataKey(id, key, expected, next)
+}
+
+func (s *failSetMetadataBatchStore) MetadataKeyFencerHandle() (beads.MetadataKeyFencer, bool) {
+	return beads.MetadataKeyFencerFor(s.Store)
+}
+
+func drainAckStopPendingPatchForTest(now time.Time) sessionpkg.MetadataPatch {
+	const token = "test-drain-ack-token"
+	patch := sessionpkg.DrainAckStopPendingPatch(now)
+	patch[sessionpkg.DrainAckSourceMetadataKey] = sessionpkg.DrainAckSourceAgent
+	patch[sessionpkg.DrainAckTokenMetadataKey] = token
+	patch[sessionpkg.DrainAckCancelTokenMetadataKey] = "stop-pending:" + token
+	return patch
 }
 
 func (s *failSetMetadataBatchStore) SetMetadataBatch(string, map[string]string) error {
@@ -3503,6 +3813,13 @@ func (s *failSetMetadataBatchStore) SetMetadataBatch(string, map[string]string) 
 	return nil
 }
 
+func (s *failSetMetadataBatchStore) Update(id string, opts beads.UpdateOpts) error {
+	if s.err != nil {
+		return s.err
+	}
+	return s.Store.Update(id, opts)
+}
+
 func TestFinalizeDrainAckStoppedSessionDoesNotEmitEventsWhenFinalMetadataFails(t *testing.T) {
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
@@ -3510,7 +3827,7 @@ func TestFinalizeDrainAckStoppedSessionDoesNotEmitEventsWhenFinalMetadataFails(t
 	env.rec = fake
 
 	session := env.createSessionBead("worker", "worker")
-	patch := sessionpkg.DrainAckStopPendingPatch(env.clk.Now().UTC())
+	patch := drainAckStopPendingPatchForTest(env.clk.Now().UTC())
 	if err := env.store.SetMetadataBatch(session.ID, patch); err != nil {
 		t.Fatalf("SetMetadataBatch(stop-pending): %v", err)
 	}
@@ -3537,7 +3854,7 @@ func TestFinalizeDrainAckStoppedSessionFallsThroughWhenCloseGateRacesWithAssignm
 	env.rec = fake
 
 	session := env.createSessionBead("worker", "worker")
-	patch := sessionpkg.DrainAckStopPendingPatch(env.clk.Now().UTC())
+	patch := drainAckStopPendingPatchForTest(env.clk.Now().UTC())
 	if err := env.store.SetMetadataBatch(session.ID, patch); err != nil {
 		t.Fatalf("SetMetadataBatch(stop-pending): %v", err)
 	}
@@ -3572,6 +3889,62 @@ func TestFinalizeDrainAckStoppedSessionFallsThroughWhenCloseGateRacesWithAssignm
 	}
 }
 
+func TestFinalizeDrainAckStoppedSessionDoesNotCloseAfterCancellationWins(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	session := env.createSessionBead("worker", "worker")
+	const token = "cancel-before-close"
+	env.setSessionMetadata(&session, map[string]string{
+		sessionpkg.DrainAckSourceMetadataKey: sessionpkg.DrainAckSourceAgent,
+		sessionpkg.DrainAckTokenMetadataKey:  token,
+	})
+	racing := &cancelBeforeFinalizerCloseStore{Store: env.store, token: token}
+
+	finalizeDrainAckStoppedSession(
+		"", env.cfg, racing, nil, env.sessionInfo(session.ID), "worker", true,
+		newFakeDrainOps(), env.dt, env.clk, env.rec, &env.stderr,
+	)
+
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status == "closed" {
+		t.Fatalf("session closed after cancellation won: metadata=%v", got.Metadata)
+	}
+	latest, err := sessionpkg.NewStore(beads.SessionStore{Store: env.store}).GetLive(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sessionpkg.IsDrainAcknowledgementCanceled(latest) {
+		t.Fatalf("cancellation lost before close: %+v", latest)
+	}
+}
+
+func TestFinalizeDrainAckStoppedSessionDoesNotCloseAlreadyCanceledAcknowledgement(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	session := env.createSessionBead("worker", "worker")
+	env.setSessionMetadata(&session, map[string]string{
+		sessionpkg.DrainAckSourceMetadataKey:      sessionpkg.DrainAckSourceAgent,
+		sessionpkg.DrainAckTokenMetadataKey:       "canceled:token-before-refresh",
+		sessionpkg.DrainAckCancelTokenMetadataKey: "token-before-refresh",
+	})
+
+	finalizeDrainAckStoppedSession(
+		"", env.cfg, env.store, nil, env.sessionInfo(session.ID), "worker", true,
+		newFakeDrainOps(), env.dt, env.clk, env.rec, &env.stderr,
+	)
+
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status == "closed" {
+		t.Fatalf("session closed after canceled acknowledgement refresh: metadata=%v", got.Metadata)
+	}
+}
+
 // TestReconcileSessionBeads_DrainAckLiveStoreErrorFailsClosed guards the
 // drain-ack live-query error path. When sessionHasOpenAssignedWork returns
 // an error, drain-ack treats hasAssignedWork as true (fail-closed) so the
@@ -3588,7 +3961,7 @@ func TestReconcileSessionBeads_DrainAckLiveStoreErrorFailsClosed(t *testing.T) {
 	env.markSessionActive(&session)
 
 	// Wrap the store so List returns an error for the live-query check.
-	erroring := &listErrStore{Store: env.store, err: fmt.Errorf("store is unavailable")}
+	erroring := &listErrStore{Store: env.store, err: fmt.Errorf("store is unavailable"), allowSessionCatalog: true}
 
 	dops := newFakeDrainOps()
 	if err := dops.setDrainAck("worker"); err != nil {
@@ -4268,6 +4641,10 @@ func TestReconcileSessionBeads_DrainAckStopFailurePreservesMetadata(t *testing.T
 
 type failStopPendingStore struct {
 	beads.Store
+}
+
+func (s *failStopPendingStore) MetadataKeyFencerHandle() (beads.MetadataKeyFencer, bool) {
+	return beads.MetadataKeyFencerFor(s.Store)
 }
 
 func (s *failStopPendingStore) SetMetadataBatch(id string, kvs map[string]string) error {
@@ -6611,9 +6988,11 @@ func TestReconcileSessionBeads_FailedCreateNotDesiredClosed(t *testing.T) {
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "polecat", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(5)}}}
 	session := env.createSessionBead("polecat", "polecat-ga-mg0")
-	session.Metadata["state"] = "failed-create"
-	session.Metadata["pool_managed"] = "true"
-	session.Metadata["pool_slot"] = "1"
+	env.setSessionMetadata(&session, map[string]string{
+		"state":        "failed-create",
+		"pool_managed": "true",
+		"pool_slot":    "1",
+	})
 
 	env.reconcile([]beads.Bead{session})
 
@@ -9035,7 +9414,7 @@ func TestReconcileSessionBeads_ConfigDriftDrainAckAttachmentErrorDefersStop(t *t
 		t.Fatalf("attachment observation error should not mark drain-ack stop pending; metadata=%v", after.Metadata)
 	}
 	if !env.sp.IsRunning("worker") {
-		t.Fatal("attachment observation error should keep config-drift drain-ack session running")
+		t.Fatalf("attachment observation error should keep config-drift drain-ack session running; stderr=%q", env.stderr.String())
 	}
 	if !strings.Contains(env.stderr.String(), "observing config-drift attachment") {
 		t.Fatalf("stderr = %q, want attachment observation diagnostic", env.stderr.String())

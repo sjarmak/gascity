@@ -112,6 +112,13 @@ func isDrainAckStopPendingInfo(info sessionpkg.Info) bool {
 		strings.TrimSpace(info.StateReason) == sessionpkg.DrainAckStopPendingReason
 }
 
+func durableDrainAckRefreshCandidate(info sessionpkg.Info) bool {
+	return strings.TrimSpace(info.DrainAckSource) != "" ||
+		strings.TrimSpace(info.DrainAckToken) != "" ||
+		strings.TrimSpace(info.DrainAckCancelToken) != "" ||
+		isDrainAckStopPendingInfo(info)
+}
+
 // markDrainAckStopPending persists the drain-ack stop-pending transition through
 // the session front door and returns the refreshed Info as a LOCAL fold
 // (write-returns-Info, Step 6d): ApplyPatchInfo emits DrainAckStopPendingPatch and
@@ -461,6 +468,77 @@ type drainAckFinalizeResult struct {
 	witnessInfo *sessionpkg.Info
 }
 
+func activeDurableAgentDrainAcknowledgement(info sessionpkg.Info) bool {
+	return strings.TrimSpace(info.DrainAckSource) == sessionpkg.DrainAckSourceAgent &&
+		strings.TrimSpace(sessionpkg.DrainAcknowledgementToken(info)) != "" &&
+		!sessionpkg.IsDrainAcknowledgementCanceled(info)
+}
+
+func terminalDrainAcknowledgementPatch(info sessionpkg.Info, clk clock.Clock, hasAssignedWork bool) sessionpkg.MetadataPatch {
+	batch := sessionpkg.AcknowledgeDrainPatch(info.WakeMode == "fresh")
+	if hasAssignedWork {
+		batch = sessionpkg.CompleteDrainPatch(clk.Now().UTC(), string(sessionpkg.SleepReasonIdle), info.WakeMode == "fresh")
+	}
+	if !hasAssignedWork && activeDurableAgentDrainAcknowledgement(info) &&
+		sessionpkg.IsNamedSessionInfo(info) &&
+		sessionpkg.NamedSessionModeInfo(info) == "always" &&
+		!isPoolManagedSessionInfo(info) {
+		batch["held_until"] = clk.Now().UTC().Add(agentDrainAckCooldown).Format(time.RFC3339)
+	}
+	if info.RestartRequested == "true" {
+		batch["restart_requested"] = ""
+	}
+	return batch
+}
+
+type durableDrainAckSnapshot struct {
+	front  *sessionpkg.Store
+	loaded bool
+	byID   map[string]sessionpkg.Info
+	err    error
+}
+
+func newDurableDrainAckSnapshot(front *sessionpkg.Store) *durableDrainAckSnapshot {
+	return &durableDrainAckSnapshot{front: front}
+}
+
+func (s *durableDrainAckSnapshot) refresh(info sessionpkg.Info) (sessionpkg.Info, bool, bool, error) {
+	if s == nil || s.front == nil {
+		return info, false, false, nil
+	}
+	if !s.loaded {
+		s.loaded = true
+		rows, err := s.front.ListAll(sessionpkg.ListAllOptions{Live: true})
+		if err != nil {
+			s.err = err
+		} else {
+			s.byID = make(map[string]sessionpkg.Info, len(rows))
+			for _, row := range rows {
+				s.byID[row.ID] = row
+			}
+		}
+	}
+	if s.err != nil {
+		return info, false, false, s.err
+	}
+	latest, ok := s.byID[info.ID]
+	if !ok {
+		return info, false, false, fmt.Errorf("loading session %q from authoritative drain acknowledgement snapshot: %w", info.ID, beads.ErrNotFound)
+	}
+	refreshed := info
+	refreshed.DrainAckSource = latest.DrainAckSource
+	refreshed.DrainAckToken = latest.DrainAckToken
+	refreshed.DrainAckCancelToken = latest.DrainAckCancelToken
+	canceled := sessionpkg.IsDrainAcknowledgementCanceled(latest)
+	return refreshed, activeDurableAgentDrainAcknowledgement(refreshed), canceled, nil
+}
+
+func (s *durableDrainAckSnapshot) set(info sessionpkg.Info) {
+	if s != nil && s.loaded && s.err == nil && s.byID != nil {
+		s.byID[info.ID] = info
+	}
+}
+
 // applyTo folds the finalize result onto the coherent pre-call snapshot Info,
 // byte-identically to re-projecting the mutated bead (the raw refreshSessionInfo
 // path): the witness reprojection wins outright; the non-close folded Info
@@ -512,6 +590,12 @@ func finalizeDrainAckStoppedSession(
 		return drainAckFinalizeResult{}
 	}
 	info.DrainAckSource = latest.DrainAckSource
+	info.DrainAckToken = latest.DrainAckToken
+	info.DrainAckCancelToken = latest.DrainAckCancelToken
+	info.RestartRequested = latest.RestartRequested
+	if sessionpkg.IsDrainAcknowledgementCanceled(info) {
+		return drainAckFinalizeResult{}
+	}
 	// Every decision read comes off the typed Info; the whole-bead raw-by-design
 	// helpers (sessionHasOpenAssignedWorkForReachableStore,
 	// closeSessionBeadIfReachableStoreUnassigned, recordDrainAckAssignedWorkEvent)
@@ -553,6 +637,16 @@ func finalizeDrainAckStoppedSession(
 		hasAssignedWork = true
 	}
 	if closeIfUnassigned && !hasAssignedWork {
+		if activeDurableAgentDrainAcknowledgement(info) {
+			claimed, claimErr := sessionFrontDoor(store).BeginDrainAckStopPendingInfo(info, clk.Now().UTC())
+			if claimErr != nil {
+				if !errors.Is(claimErr, sessionpkg.ErrDrainAcknowledgementCanceled) {
+					fmt.Fprintf(stderr, "session reconciler: claiming drain acknowledgement before close for %s: %v\n", name, claimErr) //nolint:errcheck
+				}
+				return drainAckFinalizeResult{}
+			}
+			info = claimed
+		}
 		if closeSessionBeadIfReachableStoreUnassigned(cityPath, cfg, store, rigStores, info, "drained", clk.Now().UTC(), stderr) {
 			closePatch := sessionpkg.ClosePatch(clk.Now().UTC(), "drained")
 			if dops != nil {
@@ -602,22 +696,12 @@ func finalizeDrainAckStoppedSession(
 			hasAssignedWork = true
 		}
 	}
-	batch := sessionpkg.AcknowledgeDrainPatch(info.WakeMode == "fresh")
-	if hasAssignedWork {
-		batch = sessionpkg.CompleteDrainPatch(clk.Now().UTC(), string(sessionpkg.SleepReasonIdle), info.WakeMode == "fresh")
-	}
+	batch := terminalDrainAcknowledgementPatch(info, clk, hasAssignedWork)
 	// Read the drain-ack provenance from the DURABLE bead field, never the runtime:
 	// finalize can run after the session has stopped, so the tmux env that held
 	// GC_DRAIN_ACK_SOURCE may already be gone. The agent command persisted this
 	// field before publishing the runtime ack flag, so a dead-first observation
 	// cannot erase the provenance needed for the cooldown (#4824).
-	if strings.TrimSpace(info.DrainAckSource) == sessionpkg.DrainAckSourceAgent &&
-		!hasAssignedWork &&
-		sessionpkg.IsNamedSessionInfo(info) &&
-		sessionpkg.NamedSessionModeInfo(info) == "always" &&
-		!isPoolManagedSessionInfo(info) {
-		batch["held_until"] = clk.Now().UTC().Add(agentDrainAckCooldown).Format(time.RFC3339)
-	}
 	// A drain-ack that completes a restart-request cycle (gc session reset →
 	// agent drain-ack) must also consume restart_requested. The drain-ack
 	// branch handles the stop and continues before the restart-requested
@@ -625,10 +709,12 @@ func finalizeDrainAckStoppedSession(
 	// store, a later cache-reconcile re-emission resurrects it and the
 	// controller honors it as a fresh restart request — a phantom second
 	// restart that rotates session_key and destroys resume continuity (#2574).
-	if info.RestartRequested == "true" {
-		batch["restart_requested"] = ""
+	var foldedInfo sessionpkg.Info
+	if activeDurableAgentDrainAcknowledgement(info) {
+		foldedInfo, err = sessionFrontDoor(store).FinalizeDrainAcknowledgementInfo(info, batch)
+	} else {
+		foldedInfo, err = sessionFrontDoor(store).ApplyPatchClearingDrainAcknowledgementInfo(info, batch)
 	}
-	foldedInfo, err := sessionFrontDoor(store).ApplyPatchInfo(info, batch)
 	if err != nil {
 		fmt.Fprintf(stderr, "session reconciler: finalizing drain-ack stopped %s: %v\n", name, err) //nolint:errcheck
 		// Store write failed, so nothing changed — the snapshot must stay unchanged
@@ -1445,6 +1531,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	tick := newReconcileTick(orderedInfos)
 	infoByID := tick.infoByID
 	orderedIDs := tick.orderedIDs
+	drainAckSnapshot := newDurableDrainAckSnapshot(sessFront)
 
 	phaseStart = time.Now()
 	cbNow := clk.Now().UTC()
@@ -1571,6 +1658,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		}
 		return rollbackPendingCreate(info, sessFront, clk.Now().UTC(), stderr)
 	}
+	retryDurableDrainAcknowledgementClears(sessFront, dt, sp)
 	phaseStart = time.Now()
 	for i := range orderedRows {
 		if ctx != nil && ctx.Err() != nil {
@@ -1583,6 +1671,16 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		id := orderedRows[i].Info.ID
 		info := infoByID[id]
 		name := strings.TrimSpace(info.SessionNameMetadata)
+		if updated, ok := retryRuntimeDrainAckCancellation(info, sessFront, sp, dt); ok {
+			tick.set(id, updated)
+			drainAckSnapshot.set(updated)
+			info = updated
+		}
+		// A failed cancellation remains authoritative over the older active
+		// acknowledgement. Suppress only drain-ack handling until the retry
+		// commits or definitively loses its token fence; unrelated reconciliation
+		// for the row still proceeds.
+		drainAckCancellationPending := dt.durableAckClearPending(id)
 		tp, desired := desiredState[name]
 		if shadowTick != nil {
 			// 3a: durable facts from the already-observed coherent typed Info (the
@@ -1668,6 +1766,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			providerAlive, livenessErr := workerSessionTargetRunningWithConfig(cityPath, store, sp, cfg, id)
 			if livenessErr != nil {
 				providerAlive = false
+			}
+			if !providerAlive && durableDrainAckRefreshCandidate(info) {
+				if latest, _, _, refreshErr := drainAckSnapshot.refresh(info); refreshErr == nil {
+					info = latest
+					tick.set(id, latest)
+				}
 			}
 			if shadowTick != nil {
 				// 3a: capture the !desired path's OWN probe result (presence only,
@@ -1926,8 +2030,20 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				}
 				continue
 			default:
-				if dops != nil {
-					if acked, _ := dops.isDrainAcked(name); acked {
+				if !drainAckCancellationPending && dops != nil {
+					acked, _ := dops.isDrainAcked(name)
+					if acked || activeDurableAgentDrainAcknowledgement(infoPostHeal) {
+						latest, _, canceled, refreshErr := drainAckSnapshot.refresh(infoPostHeal)
+						if refreshErr != nil {
+							fmt.Fprintf(stderr, "session reconciler: refreshing durable drain acknowledgement for %s: %v\n", name, refreshErr) //nolint:errcheck
+							continue
+						}
+						infoPostHeal = latest
+						tick.set(id, latest)
+						if canceled {
+							_ = dops.clearDrain(name)
+							continue
+						}
 						// gc-hz0nu: every drain-acked decision below depends on the
 						// store-derived desired-state / assigned-work view. During a
 						// partial store query (transient Dolt failure) that view is
@@ -1960,7 +2076,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							if cancelSessionDrainForAssignedWorkInfo(infoPostHeal, sp, dt) ||
 								cancelRecoveredDrainForAssignedWorkInfo(infoPostHeal, sp, name) {
 								_ = dops.clearDrain(name)
-								clearDurableDrainAcknowledgement(infoPostHeal, sessFront, dt)
+								clearDurableDrainAcknowledgement(infoPostHeal, sessFront, dt, sp)
 								template := normalizedSessionTemplateInfo(infoPostHeal, cfg)
 								if template == "" {
 									template = infoPostHeal.Template
@@ -2159,6 +2275,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// The desired-session fast path only needs running/alive; attachment
 		// and activity are probed by the narrower branches that use them.
 		running, alive := observeRuntimeProviderLiveness(sp, name, tp.Hints.ProcessNames)
+		if !running && !alive {
+			latest, _, _, refreshErr := drainAckSnapshot.refresh(infoByID[id])
+			if refreshErr != nil {
+				fmt.Fprintf(stderr, "session reconciler: deferring dead session '%s': refreshing durable drain acknowledgement: %v\n", name, refreshErr) //nolint:errcheck
+				continue
+			}
+			tick.set(id, latest)
+		}
 		if shadowTick != nil {
 			// 3a: capture the desired fast path's OWN two-bit probe (present +
 			// alive) by name, enabling zombie (present && !alive) expression.
@@ -2256,21 +2380,45 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// Honor the ack even if the agent exited before this tick; otherwise
 		// the session falls through to orphan handling and can block the next
 		// worker wave until the stale awake bead ages out.
-		if dops != nil {
-			if acked, _ := dops.isDrainAcked(name); acked {
-				if !alive && staleOrLegacyDrainAckBeforeStartInfo(infoByID[id], sp, name) {
+		if !drainAckCancellationPending && dops != nil {
+			acked, _ := dops.isDrainAcked(name)
+			if acked || activeDurableAgentDrainAcknowledgement(infoByID[id]) {
+				latest, durableAgentAck, canceled, refreshErr := drainAckSnapshot.refresh(infoByID[id])
+				if refreshErr != nil {
+					if ds := dt.get(id); ds != nil && ds.reason == "config-drift" {
+						fmt.Fprintf(stderr, "session reconciler: observing config-drift attachment for %s: %v\n", name, refreshErr) //nolint:errcheck
+						drainCancelled := cancelSessionConfigDriftDrainInfo(infoByID[id], sp, dt)
+						if !drainCancelled {
+							_ = clearReconcilerDrainAckMetadata(sp, name)
+						}
+						clearDurableDrainAcknowledgement(infoByID[id], sessFront, dt, sp)
+					} else {
+						fmt.Fprintf(stderr, "session reconciler: refreshing durable drain acknowledgement for %s: %v\n", name, refreshErr) //nolint:errcheck
+					}
+					continue
+				}
+				tick.set(id, latest)
+				if canceled {
+					_ = dops.clearDrain(name)
+					continue
+				}
+				if !durableAgentAck && !alive && staleOrLegacyDrainAckBeforeStartInfo(infoByID[id], sp, name) {
 					_ = clearReconcilerDrainAckMetadata(sp, name)
-					clearDurableDrainAcknowledgement(infoByID[id], sessFront, dt)
+					clearDurableDrainAcknowledgement(infoByID[id], sessFront, dt, sp)
 				} else {
-					if staleReconcilerDrainAckInfo(infoByID[id], sp, name) {
+					if !durableAgentAck && staleReconcilerDrainAckInfo(infoByID[id], sp, name) {
 						_ = clearReconcilerDrainAckMetadata(sp, name)
-						clearDurableDrainAcknowledgement(infoByID[id], sessFront, dt)
+						clearDurableDrainAcknowledgement(infoByID[id], sessFront, dt, sp)
 						if trace != nil {
 							trace.RecordDecision(TraceSiteReconcilerDrainAck, TraceReasonStaleGeneration, TraceOutcomeClear, tp.TemplateName, name, nil)
 						}
 						continue
 					}
 					ackReason, reconcilerOwnedAck := reconcilerDrainAckMatchesSessionInfo(infoByID[id], sp, name)
+					if durableAgentAck {
+						ackReason = ""
+						reconcilerOwnedAck = false
+					}
 					// gc-kkgak: a reconciler-owned drain ack is minted from the
 					// desired-state / assigned-work view. During a partial store
 					// query that view is unreliable, so defer the reconciler-owned
@@ -2297,7 +2445,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						if alive && hasAssignedWork &&
 							(cancelSessionDrainForAssignedWorkInfo(infoByID[id], sp, dt) || cancelRecoveredDrainForAssignedWorkInfo(infoByID[id], sp, name)) {
 							_ = dops.clearDrain(name)
-							clearDurableDrainAcknowledgement(infoByID[id], sessFront, dt)
+							clearDurableDrainAcknowledgement(infoByID[id], sessFront, dt, sp)
 							if trace != nil {
 								trace.RecordDecision(TraceSiteDrainCancel, TraceReasonCode(ackReason), TraceOutcomeCancelAssignedWork, tp.TemplateName, name, nil)
 							}
@@ -2319,7 +2467,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							if !drainCancelled {
 								_ = clearReconcilerDrainAckMetadata(sp, name)
 							}
-							clearDurableDrainAcknowledgement(infoByID[id], sessFront, dt)
+							clearDurableDrainAcknowledgement(infoByID[id], sessFront, dt, sp)
 							if trace != nil {
 								trace.RecordDecision(TraceSiteReconcilerDrainAck, TraceReasonConfigDriftAttachmentError, TraceOutcomeCancelReconcilerAck, tp.TemplateName, name, traceRecordPayload{
 									"drain_canceled": drainCancelled,
@@ -2338,7 +2486,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							if !drainCancelled {
 								_ = clearReconcilerDrainAckMetadata(sp, name)
 							}
-							clearDurableDrainAcknowledgement(infoByID[id], sessFront, dt)
+							clearDurableDrainAcknowledgement(infoByID[id], sessFront, dt, sp)
 							if trace != nil {
 								trace.RecordDecision(TraceSiteReconcilerDrainAck, TraceReasonConfigDriftAttached, TraceOutcomeCancelReconcilerAck, tp.TemplateName, name, traceRecordPayload{
 									"drain_canceled": drainCancelled,
@@ -2351,7 +2499,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							if !drainCancelled {
 								_ = clearReconcilerDrainAckMetadata(sp, name)
 							}
-							clearDurableDrainAcknowledgement(infoByID[id], sessFront, dt)
+							clearDurableDrainAcknowledgement(infoByID[id], sessFront, dt, sp)
 							if trace != nil {
 								trace.RecordDecision(TraceSiteReconcilerDrainAck, TraceReasonConfigDriftRecentlyAttached, TraceOutcomeCancelReconcilerAck, tp.TemplateName, name, traceRecordPayload{
 									"drain_canceled": drainCancelled,
@@ -2362,7 +2510,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					}
 					if pendingInteractionKeepsAwakeInfo(infoByID[id], sp, name, clk) &&
 						(cancelReconcilerAckedDrainInfo(infoByID[id], sp, dt) || cancelRecoveredReconcilerAckedDrainInfo(infoByID[id], sp, name)) {
-						clearDurableDrainAcknowledgement(infoByID[id], sessFront, dt)
+						clearDurableDrainAcknowledgement(infoByID[id], sessFront, dt, sp)
 						if trace != nil {
 							trace.RecordDecision(TraceSiteReconcilerDrainAck, TraceReasonPending, TraceOutcomeCancelReconcilerAck, tp.TemplateName, name, nil)
 						}
@@ -3766,7 +3914,10 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		info, ok := infoByID[id]
 		return info, ok
 	}
-	advanceSessionDrainsWithSessionsTraced(dt, sp, store, infoLookup, wakeEvals, cfg, clk, trace)
+	advanceSessionDrainsWithSessionsTraced(
+		dt, sp, store, infoLookup, wakeEvals, cfg, clk, trace,
+		drainCompletionWorkScope{cityPath: cityPath, rigStores: rigStores},
+	)
 	clearMissingIdleProbes(dt, infoByID)
 	recordPhase(TraceSiteSessionReconcileDrainAdvance, "session_reconcile.advance_drains", phaseStart, map[string]any{
 		"ordered_session_count": len(orderedRows),

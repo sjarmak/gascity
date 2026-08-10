@@ -1,6 +1,7 @@
 package exec //nolint:revive // internal package, always imported with alias
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -11,7 +12,158 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/beadstest"
+	"github.com/gastownhall/gascity/internal/processgroup/processgrouptest"
 )
+
+func TestStoreContextBoundsScriptInvocation(t *testing.T) {
+	script := writeScript(t, t.TempDir(), `exec sleep 60`)
+	store := NewStore(script)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	store.SetContext(ctx)
+	started := time.Now()
+	if _, err := store.Get("gc-1"); err == nil {
+		t.Fatal("Get error = nil, want context deadline")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("context-bound exec took %v, want under 1s", elapsed)
+	}
+}
+
+func TestStoreContextCancellationKillsScriptProcessGroup(t *testing.T) {
+	processgrouptest.RequireRealProcessSignals(t)
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "child.pid")
+	script := writeScript(t, dir, `
+sleep 30 &
+echo "$!" > "`+pidFile+`"
+wait
+`)
+	store := NewStore(script)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	store.SetContext(ctx)
+	_, _ = store.Get("gc-1")
+	childPIDBytes, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("read child pid: %v", err)
+	}
+	childPID := strings.TrimSpace(string(childPIDBytes))
+	t.Cleanup(func() { _ = exec.Command("kill", "-KILL", childPID).Run() })
+	for range 50 {
+		if err := exec.Command("kill", "-0", childPID).Run(); err != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("child process %s survived exec-provider cancellation", childPID)
+}
+
+func TestFenceMetadataKeyUsesAtomicProviderOperation(t *testing.T) {
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "args")
+	stdinFile := filepath.Join(dir, "stdin")
+	script := writeScript(t, dir, `
+printf '%s\n' "$@" > "`+argsFile+`"
+cat > "`+stdinFile+`"
+printf '{"swapped":true}\n'
+`)
+	store := NewStore(script)
+	swapped, err := store.FenceMetadataKey("gc-1", "lifecycle_fence", "old", "new")
+	if err != nil || !swapped {
+		t.Fatalf("FenceMetadataKey = (%v, %v), want (true, nil)", swapped, err)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(args), "fence-metadata-key\ngc-1\nlifecycle_fence\nold\n"; got != want {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+	next, err := os.ReadFile(stdinFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(next), "new"; got != want {
+		t.Fatalf("stdin = %q, want %q", got, want)
+	}
+}
+
+func TestFenceMetadataKeyRejectsMissingProviderOperation(t *testing.T) {
+	script := writeScript(t, t.TempDir(), `exit 2`)
+	if _, err := NewStore(script).FenceMetadataKey("gc-1", "key", "", "next"); err == nil {
+		t.Fatal("FenceMetadataKey error = nil, want unsupported provider operation")
+	}
+}
+
+func TestConformanceFenceMetadataKeyHasSingleWinner(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available")
+	}
+	if _, err := exec.LookPath("flock"); err != nil {
+		t.Skip("flock not available")
+	}
+	scriptPath, err := filepath.Abs(filepath.Join("testdata", "conformance.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(scriptPath)
+	store.SetEnv(storeTargetEnv(t.TempDir()))
+	created, err := store.Create(beads.Bead{Title: "target"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan bool, 2)
+	errs := make(chan error, 2)
+	for _, next := range []string{"first", "second"} {
+		go func() {
+			swapped, err := store.FenceMetadataKey(created.ID, "lifecycle_fence", "", next)
+			results <- swapped
+			errs <- err
+		}()
+	}
+	winners := 0
+	for range 2 {
+		if <-results {
+			winners++
+		}
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("fence winners = %d, want 1", winners)
+	}
+}
+
+func TestConformanceUpdateRemovesMetadata(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available")
+	}
+	scriptPath, err := filepath.Abs(filepath.Join("testdata", "conformance.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(scriptPath)
+	store.SetEnv(storeTargetEnv(t.TempDir()))
+	created, err := store.Create(beads.Bead{Title: "target", Metadata: map[string]string{"obsolete": "true", "keep": "yes"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(created.ID, beads.UpdateOpts{RemoveMetadata: []string{"obsolete"}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got.Metadata["obsolete"]; ok {
+		t.Fatalf("removed metadata retained: %v", got.Metadata)
+	}
+	if got.Metadata["keep"] != "yes" {
+		t.Fatalf("unrelated metadata changed: %v", got.Metadata)
+	}
+}
 
 // writeScript creates an executable shell script in dir and returns its path.
 func writeScript(t *testing.T, dir, content string) string {

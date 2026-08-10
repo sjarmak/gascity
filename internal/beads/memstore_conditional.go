@@ -107,6 +107,18 @@ func (m *MemStore) CompareAndSetMetadataKey(id, key, expected, next string) (boo
 	if m.DisableConditionalWrites {
 		return false, ErrConditionalWriteUnsupported
 	}
+	return m.fenceMetadataKeyLocked(id, key, expected, next)
+}
+
+// FenceMetadataKey performs the always-on metadata CAS used by lifecycle
+// safety fences, independently of the optional conditional-writes mode.
+func (m *MemStore) FenceMetadataKey(id, key, expected, next string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.fenceMetadataKeyLocked(id, key, expected, next)
+}
+
+func (m *MemStore) fenceMetadataKeyLocked(id, key, expected, next string) (bool, error) {
 	i := m.indexOfLocked(id)
 	if i < 0 {
 		return false, fmt.Errorf("compare-and-set metadata on %q: %w", id, ErrNotFound)

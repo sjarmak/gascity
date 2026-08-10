@@ -56,11 +56,25 @@ type failNthMetadataBatchStore struct {
 }
 
 func (s *failNthMetadataBatchStore) SetMetadataBatch(id string, kvs map[string]string) error {
+	if err := s.failNextWrite(); err != nil {
+		return err
+	}
+	return s.MemStore.SetMetadataBatch(id, kvs)
+}
+
+func (s *failNthMetadataBatchStore) Update(id string, opts beads.UpdateOpts) error {
+	if err := s.failNextWrite(); err != nil {
+		return err
+	}
+	return s.MemStore.Update(id, opts)
+}
+
+func (s *failNthMetadataBatchStore) failNextWrite() error {
 	s.calls++
 	if s.calls == s.failOn {
 		return errors.New("batch failed")
 	}
-	return s.MemStore.SetMetadataBatch(id, kvs)
+	return nil
 }
 
 // failPostCloseSessionNameStore models a non-atomic Store.Tx backend

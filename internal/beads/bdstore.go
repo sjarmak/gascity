@@ -294,6 +294,7 @@ type PurgeResult struct {
 type BdStore struct {
 	dir         string          // city root directory (where .beads/ lives)
 	runner      CommandRunner   // injectable for testing
+	ctx         context.Context // bounds in-process backend fallbacks; defaults to Background
 	purgeRunner PurgeRunnerFunc // injectable for testing; nil uses exec default
 	idPrefix    string          // bead ID prefix owned by this store, without trailing "-"
 
@@ -332,6 +333,17 @@ var _ ConditionalAssignmentReleaser = (*BdStore)(nil)
 // BdStoreOption configures optional bd CLI behavior for a BdStore.
 type BdStoreOption func(*BdStore)
 
+// WithBdStoreContext binds in-process backend fallbacks to ctx. The command
+// runner must be bound separately; scoped callers use this beside
+// ExecCommandRunnerWithEnvContext.
+func WithBdStoreContext(ctx context.Context) BdStoreOption {
+	return func(s *BdStore) {
+		if ctx != nil {
+			s.ctx = ctx
+		}
+	}
+}
+
 // WithBdStoreListSkipLabels controls whether List may pass --skip-labels to bd.
 // Keep disabled unless the caller has opted into bd 1.0.5-compatible CLI
 // semantics; bd 1.0.4 rejects the flag.
@@ -348,7 +360,7 @@ func NewBdStore(dir string, runner CommandRunner, opts ...BdStoreOption) *BdStor
 
 // NewBdStoreWithPrefix creates a BdStore with an explicit owned bead ID prefix.
 func NewBdStoreWithPrefix(dir string, runner CommandRunner, idPrefix string, opts ...BdStoreOption) *BdStore {
-	s := &BdStore{dir: dir, runner: runner, idPrefix: normalizeIDPrefix(idPrefix)}
+	s := &BdStore{dir: dir, runner: runner, ctx: context.Background(), idPrefix: normalizeIDPrefix(idPrefix)}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(s)
@@ -1125,6 +1137,11 @@ func bdUpdateArgs(id string, opts UpdateOpts) []string {
 			args = append(args, "--set-metadata", k+"="+opts.Metadata[k])
 		}
 	}
+	removeMetadata := append([]string(nil), opts.RemoveMetadata...)
+	sort.Strings(removeMetadata)
+	for _, key := range removeMetadata {
+		args = append(args, "--unset-metadata", key)
+	}
 	for _, l := range opts.Labels {
 		args = append(args, "--add-label", l)
 	}
@@ -1422,6 +1439,11 @@ func (s *BdStore) UpdateAll(ids []string, opts UpdateOpts) (int, error) {
 		for _, k := range keys {
 			args = append(args, "--set-metadata", k+"="+opts.Metadata[k])
 		}
+	}
+	removeMetadata := append([]string(nil), opts.RemoveMetadata...)
+	sort.Strings(removeMetadata)
+	for _, key := range removeMetadata {
+		args = append(args, "--unset-metadata", key)
 	}
 	for _, l := range opts.Labels {
 		args = append(args, "--add-label", l)
@@ -1754,6 +1776,11 @@ func updateProjectionMatches(current Bead, opts UpdateOpts) bool {
 			return false
 		}
 	}
+	for _, key := range opts.RemoveMetadata {
+		if _, present := current.Metadata[key]; present {
+			return false
+		}
+	}
 	for _, label := range opts.Labels {
 		if !bdStoreStringSliceContains(current.Labels, label) {
 			return false
@@ -1803,6 +1830,11 @@ func (item *bdStoreTxItem) preservedUpdateOpts(includeStatus bool) UpdateOpts {
 	if len(current.Metadata) > 0 {
 		opts.Metadata = maps.Clone(current.Metadata)
 	}
+	for key := range item.original.Metadata {
+		if _, present := current.Metadata[key]; !present {
+			opts.RemoveMetadata = append(opts.RemoveMetadata, key)
+		}
+	}
 	// bd update can clobber unspecified fields in dolt-server mode, so labels
 	// are re-emitted as a full post-mutation set for staged Tx applies.
 	opts.Labels = append([]string(nil), current.Labels...)
@@ -1834,7 +1866,7 @@ func hasUpdateOpts(opts UpdateOpts) bool {
 		opts.Description != nil ||
 		opts.ParentID != nil ||
 		opts.Assignee != nil ||
-		len(opts.Metadata) > 0 ||
+		len(opts.Metadata) > 0 || len(opts.RemoveMetadata) > 0 ||
 		len(opts.Labels) > 0 ||
 		len(opts.RemoveLabels) > 0
 }
@@ -1927,6 +1959,20 @@ func (s *BdStore) isDoltliteBackend() bool {
 		return false
 	}
 	return ok
+}
+
+func (s *BdStore) isPostgresBackend() bool {
+	data, err := os.ReadFile(filepath.Join(s.dir, ".beads", "metadata.json"))
+	if err != nil {
+		return false
+	}
+	var meta struct {
+		Backend string `json:"backend"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(meta.Backend), "postgres")
 }
 
 func metadataDeclaresDoltlite(data []byte) (bool, error) {

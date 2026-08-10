@@ -189,6 +189,9 @@ func (m *MemStore) applyUpdateLocked(i int, opts UpdateOpts) {
 			m.beads[i].Metadata[k] = v
 		}
 	}
+	for _, key := range opts.RemoveMetadata {
+		delete(m.beads[i].Metadata, key)
+	}
 	if len(opts.Labels) > 0 {
 		m.beads[i].Labels = append(m.beads[i].Labels, opts.Labels...)
 	}

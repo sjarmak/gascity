@@ -50,6 +50,18 @@ var (
 // *beadPolicyStore.
 func (s *beadPolicyStore) ConditionalWritesResolveTarget() beads.Store { return s.Store }
 
+// ConditionalWriterHandle preserves atomic lifecycle fences through the policy
+// wrapper while ordinary writes continue through the policy surface.
+func (s *beadPolicyStore) ConditionalWriterHandle() (beads.ConditionalWriter, bool) {
+	return beads.ConditionalWriterFor(s.Store)
+}
+
+// MetadataKeyFencerHandle preserves always-on lifecycle fences through the
+// policy wrapper.
+func (s *beadPolicyStore) MetadataKeyFencerHandle() (beads.MetadataKeyFencer, bool) {
+	return beads.MetadataKeyFencerFor(s.Store)
+}
+
 var (
 	_ beads.BatchDeleter = (*beadPolicyStore)(nil)
 	_ beads.BatchDeleter = (*beadPolicyGraphStore)(nil)

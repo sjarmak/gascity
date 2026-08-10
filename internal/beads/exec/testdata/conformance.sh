@@ -189,6 +189,13 @@ update)
         .labels = ([.labels[] | select(. as $l | $mk | any(. as $prefix | $l | startswith($prefix)) | not)] + $ml)')
 	fi
 
+	# Remove requested metadata keys from their reserved labels.
+	remove_meta_prefixes=$(echo "$input" | jq -c '[.remove_metadata // [] | .[] | "meta:\(.)="]')
+	if [ "$remove_meta_prefixes" != "[]" ]; then
+		current=$(echo "$current" | jq --argjson prefixes "$remove_meta_prefixes" '
+        .labels = [.labels[] | select(. as $l | $prefixes | any(. as $prefix | $l | startswith($prefix)) | not)]')
+	fi
+
 	# Append labels if present.
 	new_labels=$(echo "$input" | jq -c '.labels // []')
 	if [ "$new_labels" != "[]" ]; then
@@ -271,6 +278,31 @@ set-metadata)
 	jq --arg ml "$meta_label" --arg mp "$meta_prefix" '
       .labels = ([.labels // [] | .[] | select(startswith($mp) | not)] + [$ml])
     ' "$bead_file" >"$bead_file.tmp" && mv "$bead_file.tmp" "$bead_file"
+	;;
+
+fence-metadata-key)
+	id="$1"
+	key="$2"
+	expected="$3"
+	next=$(cat)
+	bead_file="$STATE_ROOT/$id.json"
+	if [ ! -f "$bead_file" ]; then
+		echo "bead $id not found" >&2
+		exit 1
+	fi
+	exec 9>"$STATE_ROOT/.fence.lock"
+	flock 9
+	meta_prefix="meta:${key}="
+	current=$(jq -r --arg mp "$meta_prefix" '[.labels // [] | .[] | select(startswith($mp))][0] // "" | ltrimstr($mp)' "$bead_file")
+	if [ "$current" != "$expected" ]; then
+		printf '{"swapped":false}\n'
+		exit 0
+	fi
+	meta_label="meta:${key}=${next}"
+	jq --arg ml "$meta_label" --arg mp "$meta_prefix" '
+      .labels = ([.labels // [] | .[] | select(startswith($mp) | not)] + [$ml])
+    ' "$bead_file" >"$bead_file.tmp" && mv "$bead_file.tmp" "$bead_file"
+	printf '{"swapped":true}\n'
 	;;
 
 mol-cook)

@@ -134,16 +134,17 @@ type Bead struct {
 
 // UpdateOpts specifies which fields to change. Nil pointers are skipped.
 type UpdateOpts struct {
-	Title        *string // set title (nil = no change)
-	Status       *string // set status (nil = no change)
-	Type         *string // set issue type (nil = no change)
-	Priority     *int    // set priority (nil = no change)
-	Description  *string
-	ParentID     *string
-	Assignee     *string  // set assignee (nil = no change)
-	Labels       []string // append these labels (nil = no change)
-	RemoveLabels []string // remove these labels (nil = no change)
-	Metadata     map[string]string
+	Title          *string // set title (nil = no change)
+	Status         *string // set status (nil = no change)
+	Type           *string // set issue type (nil = no change)
+	Priority       *int    // set priority (nil = no change)
+	Description    *string
+	ParentID       *string
+	Assignee       *string  // set assignee (nil = no change)
+	Labels         []string // append these labels (nil = no change)
+	RemoveLabels   []string // remove these labels (nil = no change)
+	Metadata       map[string]string
+	RemoveMetadata []string // remove metadata keys (nil = no change)
 }
 
 // ConditionalAssignmentReleaser is implemented by stores that can release an
@@ -205,6 +206,49 @@ type ConditionalWriter interface {
 	CompareAndSetMetadataKey(id, key, expected, next string) (bool, error)
 }
 
+// MetadataKeyFencer provides the always-on, single-key compare-and-set used by
+// lifecycle protocols whose correctness cannot depend on the optional
+// conditional-writes rollout mode.
+type MetadataKeyFencer interface {
+	FenceMetadataKey(id, key, expected, next string) (bool, error)
+}
+
+// MetadataKeyFencerHandleProvider lets wrappers preserve an underlying
+// always-on metadata fence without claiming unrelated optional capabilities.
+type MetadataKeyFencerHandleProvider interface {
+	MetadataKeyFencerHandle() (MetadataKeyFencer, bool)
+}
+
+// MetadataKeyFencerFor resolves the always-on metadata fence through typed
+// class wrappers and explicit wrapper handles.
+func MetadataKeyFencerFor(store Store) (MetadataKeyFencer, bool) {
+	if store == nil {
+		return nil, false
+	}
+	if fencer, ok := store.(MetadataKeyFencer); ok {
+		return fencer, true
+	}
+	if provider, ok := store.(MetadataKeyFencerHandleProvider); ok {
+		return provider.MetadataKeyFencerHandle()
+	}
+	switch typed := store.(type) {
+	case SessionStore:
+		return MetadataKeyFencerFor(typed.Store)
+	case WorkStore:
+		return MetadataKeyFencerFor(typed.Store)
+	case GraphStore:
+		return MetadataKeyFencerFor(typed.Store)
+	case MailStore:
+		return MetadataKeyFencerFor(typed.Store)
+	case OrdersStore:
+		return MetadataKeyFencerFor(typed.Store)
+	case NudgesStore:
+		return MetadataKeyFencerFor(typed.Store)
+	default:
+		return nil, false
+	}
+}
+
 // ErrEmptyConditionalUpdate reports an UpdateIfMatch with no fields to apply.
 // The three in-tree implementations diverged here (bd cannot express an empty
 // fenced update; the native stores validated-and-bumped), so the contract is
@@ -216,7 +260,7 @@ var ErrEmptyConditionalUpdate = errors.New("conditional update: empty UpdateOpts
 func isEmptyUpdateOpts(o UpdateOpts) bool {
 	return o.Title == nil && o.Status == nil && o.Type == nil && o.Priority == nil &&
 		o.Description == nil && o.ParentID == nil && o.Assignee == nil &&
-		len(o.Labels) == 0 && len(o.RemoveLabels) == 0 && len(o.Metadata) == 0
+		len(o.Labels) == 0 && len(o.RemoveLabels) == 0 && len(o.Metadata) == 0 && len(o.RemoveMetadata) == 0
 }
 
 // ConditionalWriterHandleProvider exposes a conditional-write handle for stores

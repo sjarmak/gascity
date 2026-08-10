@@ -68,11 +68,12 @@ Exit code 2 is the forward-compatibility mechanism: when Gas City adds an
 operation, an older script returns exit 2 and the provider treats it as a
 no-op success, so scripts only implement the operations they care about.
 
-The one exception is `ready` invoked with contract arguments (such as
+The exceptions are `ready` invoked with contract arguments (such as
 `--include-ephemeral`): there, exit 2 is surfaced as an error rather than a
 silent success, so runnable ephemeral beads are never quietly hidden from the
-orchestrator. A script that cannot serve those ready queries should exit 1 with
-a stderr message instead.
+orchestrator; and `fence-metadata-key`, whose atomicity is required for session
+lifecycle safety. A script that cannot serve either operation should exit 1
+with a stderr message instead.
 
 ## Operations
 
@@ -92,6 +93,7 @@ These are the subcommands a backend implements. Bead reads return a JSON array
 | `list-by-label` | `script list-by-label <label> 0` | — | bead JSON array |
 | `ready` | `script ready [--include-ephemeral]` | — | bead JSON array |
 | `set-metadata` | `script set-metadata <id> <key>` | value (raw bytes) | — |
+| `fence-metadata-key` | `script fence-metadata-key <id> <key> <expected>` | next value (raw bytes) | `{ "swapped": true\|false }` |
 | `dep-add` | `script dep-add <id> <depends-on-id> <type>` | — | — |
 | `dep-remove` | `script dep-remove <id> <depends-on-id>` | — | — |
 | `dep-list` | `script dep-list <id> <down\|up>` | — | dependency JSON array |
@@ -107,6 +109,11 @@ extra work:
 - `Tx` runs its callback sequentially against the same store; writes are not
   grouped into a single transaction.
 - `Ping` runs `list` to confirm the script is reachable.
+
+`fence-metadata-key` is deliberately not composed from `get` plus
+`set-metadata`: the provider script must compare the current value and apply the
+next value in one backend transaction or lock. An empty expected value matches
+both an absent key and a key whose value is empty.
 
 ### `ready` and ephemeral tiers
 
@@ -156,14 +163,15 @@ The **create request** is a subset (`title`, `type`, `priority`, `labels`,
 `ephemeral`, `no_history`, `defer_until`). The **update request** carries only
 the fields being changed (`title`, `status`, `type`, `priority`, `description`,
 `parent_id`, `assignee`, plus `labels`/`remove_labels` and a `metadata`
-overlay); omitted fields are left unchanged, and `labels` appends rather than
-replaces. `dep-list` returns objects of `{ "issue_id", "depends_on_id", "type" }`.
+overlay plus `remove_metadata` keys); omitted fields are left unchanged, and
+`labels` appends rather than replaces. `dep-list` returns objects of
+`{ "issue_id", "depends_on_id", "type" }`.
 
 ### Conventions
 
 - **JSON on stdin for mutations** avoids shell-quoting issues with titles,
-  descriptions, and labels; `set-metadata` passes its value as raw stdin bytes
-  so it can hold newlines, quotes, or JSON.
+  descriptions, and labels; `set-metadata` and `fence-metadata-key` pass their
+  values as raw stdin bytes so they can hold newlines, quotes, or JSON.
 - **Not found → exit 1** with `not found` (or `no issue found`) on stderr;
   `get`, `close`, and `reopen` map that to the platform's not-found error.
 - **Idempotent writes** — `close` on an already-closed bead should still exit 0;

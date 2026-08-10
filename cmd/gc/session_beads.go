@@ -2982,7 +2982,11 @@ func closeBead(store beads.Store, id, reason string, now time.Time, stderr io.Wr
 	// while the Close fails; the helper then reports failure and the reconciler
 	// re-runs the close next tick, so no bead is durably left half-closed.
 	txErr := store.Tx("gc: close session "+id, func(tx beads.Tx) error {
-		if err := tx.SetMetadataBatch(id, session.ClosePatch(now, reason)); err != nil {
+		opts := beads.UpdateOpts{Metadata: session.ClosePatch(now, reason)}
+		if snapshotErr == nil {
+			opts.RemoveMetadata = session.DrainAckCancellationMetadataKeys(snapshot.Metadata)
+		}
+		if err := tx.Update(id, opts); err != nil {
 			return err
 		}
 		return tx.Close(id)

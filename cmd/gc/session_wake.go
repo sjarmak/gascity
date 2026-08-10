@@ -70,7 +70,7 @@ func preWakeCommit(
 		SleepReason:       sleepReason,
 		FreshWake:         freshWake,
 	})
-	if writeErr := sessFront.ApplyPatch(info.ID, batch); writeErr != nil {
+	if _, writeErr := sessFront.ApplyPatchClearingDrainAcknowledgementInfo(info, batch); writeErr != nil {
 		return 0, "", nil, fmt.Errorf("pre-wake metadata commit: %w", writeErr)
 	}
 	traceFreshWakeMetadataReset(name, freshWakeResetPriorValues(info), batch, freshWake)
@@ -218,7 +218,104 @@ const (
 	drainAckSourceAgentValue        = sessions.DrainAckSourceAgent
 	reconcilerDrainAckReasonKey     = "GC_DRAIN_REASON"
 	reconcilerDrainAckGenerationKey = "GC_DRAIN_GENERATION"
+	drainAckCancelPendingLegacyKey  = "GC_DRAIN_ACK_CANCEL_TOKEN"
 )
+
+func drainAckCancelPendingKey(token string) string {
+	return "GC_" + strings.ToUpper(sessions.DrainAckCancellationMetadataKey(token))
+}
+
+func retryRuntimeDrainAckCancellation(info sessions.Info, sessFront *sessions.Store, sp runtime.Provider, dt *drainTracker) (sessions.Info, bool) {
+	if sessFront == nil || sp == nil || strings.TrimSpace(info.ID) == "" || strings.TrimSpace(info.SessionNameMetadata) == "" {
+		return info, false
+	}
+	retryKey := drainAckCancelPendingKey(sessions.DrainAcknowledgementToken(info))
+	token, err := sp.GetMeta(info.SessionNameMetadata, retryKey)
+	legacyIndex := false
+	if err == nil && strings.TrimSpace(token) == "" {
+		token, err = sp.GetMeta(info.SessionNameMetadata, drainAckCancelPendingLegacyKey)
+		if strings.TrimSpace(token) != "" {
+			retryKey = drainAckCancelPendingKey(token)
+			legacyIndex = true
+		}
+	}
+	if err != nil || strings.TrimSpace(token) == "" {
+		return info, false
+	}
+	canceled, err := sessFront.CancelDrainAcknowledgement(info.ID, token)
+	if err != nil {
+		if errors.Is(err, sessions.ErrDrainAcknowledgementStopCommitted) {
+			if dt != nil {
+				dt.forgetDurableAckClear(info.ID)
+			}
+			latest, latestErr := sessFront.GetLive(info.ID)
+			if latestErr != nil {
+				return info, false
+			}
+			removeErr := sp.RemoveMeta(info.SessionNameMetadata, retryKey)
+			if legacyIndex {
+				removeErr = errors.Join(removeErr, sp.RemoveMeta(info.SessionNameMetadata, drainAckCancelPendingLegacyKey))
+			}
+			if removeErr != nil {
+				return latest, false
+			}
+			return latest, true
+		}
+		if dt != nil {
+			dt.rememberDurableAckClear(info.ID, token)
+		}
+		return info, false
+	}
+	latest, err := sessFront.GetLive(info.ID)
+	if err != nil {
+		return info, false
+	}
+	if canceled {
+		if err := (&providerDrainOps{sp: sp}).clearDrain(info.SessionNameMetadata); err != nil {
+			return latest, true
+		}
+		verified, verifyErr := sessFront.GetLive(info.ID)
+		if verifyErr != nil {
+			_ = (&providerDrainOps{sp: sp}).setDrainAck(info.SessionNameMetadata)
+			return latest, false
+		}
+		latest = verified
+	}
+	if sessions.DrainAcknowledgementToken(latest) != token && activeDurableAgentDrainAcknowledgement(latest) {
+		if err := ensureRuntimeDrainAcknowledgement(&providerDrainOps{sp: sp}, info.SessionNameMetadata); err != nil {
+			if dt != nil {
+				dt.rememberDurableAckClear(info.ID, token)
+			}
+			return latest, true
+		}
+	}
+	removeErr := sp.RemoveMeta(info.SessionNameMetadata, retryKey)
+	if legacyIndex {
+		removeErr = errors.Join(removeErr, sp.RemoveMeta(info.SessionNameMetadata, drainAckCancelPendingLegacyKey))
+	}
+	if removeErr != nil {
+		return latest, true
+	}
+	if dt != nil {
+		dt.forgetDurableAckClear(info.ID)
+	}
+	return latest, true
+}
+
+func ensureRuntimeDrainAcknowledgement(dops drainOps, name string) error {
+	if dops == nil {
+		return fmt.Errorf("drain operations unavailable")
+	}
+	setErr := dops.setDrainAck(name)
+	if setErr == nil {
+		return nil
+	}
+	acked, readErr := dops.isDrainAcked(name)
+	if readErr == nil && acked {
+		return nil
+	}
+	return errors.Join(setErr, readErr)
+}
 
 func setReconcilerDrainAckMetadata(sp runtime.Provider, name string, ds *drainState) error {
 	if ds == nil {
@@ -256,26 +353,85 @@ func clearReconcilerDrainAckMetadata(sp runtime.Provider, name string) error {
 	return errors.Join(errs...)
 }
 
-func clearDurableDrainAcknowledgement(info sessions.Info, sessFront *sessions.Store, dt *drainTracker) bool {
+func clearDurableDrainAcknowledgement(info sessions.Info, sessFront *sessions.Store, dt *drainTracker, sp runtime.Provider) bool {
 	if sessFront == nil || strings.TrimSpace(info.ID) == "" {
 		return false
 	}
-	_, err := sessFront.CancelDrainAcknowledgement(info.ID, info.DrainAckToken)
+	// Pre-token session beads can still carry the original durable source field.
+	// Claim the shared token key before clearing it so a newer acknowledgement
+	// either wins first or observes a resumable legacy-clear fence.
+	if strings.TrimSpace(sessions.DrainAcknowledgementToken(info)) == "" {
+		if strings.TrimSpace(info.DrainAckSource) == "" {
+			return false
+		}
+		cleared, err := sessFront.ClearLegacyDrainAcknowledgement(info.ID)
+		if err != nil {
+			log.Printf("session wake: clearing legacy durable drain acknowledgement for %s: %v", info.ID, err)
+			return false
+		}
+		return cleared
+	}
+	cleared, err := sessFront.CancelDrainAcknowledgement(info.ID, info.DrainAckToken)
 	if err != nil {
+		if errors.Is(err, sessions.ErrDrainAcknowledgementStopCommitted) {
+			dt.forgetDurableAckClear(info.ID)
+			return false
+		}
 		log.Printf("session wake: clearing durable drain acknowledgement for %s: %v", info.ID, err)
 		dt.rememberDurableAckClear(info.ID, info.DrainAckToken)
+		queueDurableDrainAcknowledgementClear(info, sp)
+		return false
+	}
+	if !cleared {
+		// A superseding acknowledgement needs its runtime flag restored only while
+		// it is still active. Terminal finalization can consume the token, and a
+		// separate cancellation can already have tombstoned the newer token.
+		latest, latestErr := sessFront.GetLive(info.ID)
+		if latestErr != nil {
+			dt.rememberDurableAckClear(info.ID, info.DrainAckToken)
+			queueDurableDrainAcknowledgementClear(info, sp)
+			return false
+		}
+		if activeDurableAgentDrainAcknowledgement(latest) && sp != nil && strings.TrimSpace(latest.SessionNameMetadata) != "" {
+			if err := ensureRuntimeDrainAcknowledgement(&providerDrainOps{sp: sp}, latest.SessionNameMetadata); err != nil {
+				log.Printf("session wake: restoring newer runtime drain acknowledgement for %s: %v", info.ID, err)
+				dt.rememberDurableAckClear(info.ID, info.DrainAckToken)
+				queueDurableDrainAcknowledgementClear(info, sp)
+				return false
+			}
+		}
+		dt.forgetDurableAckClear(info.ID)
 		return false
 	}
 	dt.forgetDurableAckClear(info.ID)
 	return true
 }
 
-func retryDurableDrainAcknowledgementClears(sessFront *sessions.Store, dt *drainTracker) {
+func queueDurableDrainAcknowledgementClear(info sessions.Info, sp runtime.Provider) {
+	token := sessions.DrainAcknowledgementToken(info)
+	name := strings.TrimSpace(info.SessionNameMetadata)
+	if sp == nil || name == "" || token == "" {
+		return
+	}
+	if err := errors.Join(
+		sp.SetMeta(name, drainAckCancelPendingKey(token), token),
+		sp.SetMeta(name, drainAckCancelPendingLegacyKey, token),
+	); err != nil {
+		log.Printf("session wake: queueing provider-backed drain acknowledgement cancellation for %s: %v", info.ID, err)
+	}
+}
+
+func retryDurableDrainAcknowledgementClears(sessFront *sessions.Store, dt *drainTracker, sp runtime.Provider) {
 	if sessFront == nil || dt == nil {
 		return
 	}
 	for id, token := range dt.durableAckClearSnapshot() {
-		clearDurableDrainAcknowledgement(sessions.Info{ID: id, DrainAckToken: token}, sessFront, dt)
+		info, err := sessFront.GetLive(id)
+		if err != nil {
+			continue
+		}
+		info.DrainAckToken = token
+		clearDurableDrainAcknowledgement(info, sessFront, dt, sp)
 	}
 }
 
@@ -522,6 +678,7 @@ func advanceSessionDrainsWithSessionsTraced(
 	cfg *config.City,
 	clk clock.Clock,
 	trace *sessionReconcilerTraceCycle,
+	completionScopes ...drainCompletionWorkScope,
 ) {
 	// wakeEvals is required. The reconciler builds it from the coherent infoByID
 	// snapshot via ComputeAwakeSet -> awakeSetToWakeEvals; tests supply explicit
@@ -530,10 +687,13 @@ func advanceSessionDrainsWithSessionsTraced(
 	// readyWaitSet inputs from this prod core — the scan runs entirely off infoLookup.
 	// Session front door constructed once from the same store; nil when store is
 	// nil so completeDrain keeps its store==nil short-circuit.
-	sessFront := sessionFrontDoor(store)
-	retryDurableDrainAcknowledgementClears(sessFront, dt)
-	if store == nil {
-		sessFront = nil
+	var sessFront *sessions.Store
+	completionScope := drainCompletionWorkScope{}
+	if len(completionScopes) > 0 {
+		completionScope = completionScopes[0]
+	}
+	if store != nil {
+		sessFront = sessionFrontDoor(store)
 	}
 	for id, ds := range dt.all() {
 		info, ok := infoLookup(id)
@@ -556,7 +716,7 @@ func advanceSessionDrainsWithSessionsTraced(
 				_ = clearReconcilerDrainAckMetadata(sp, name)
 			}
 			dt.remove(id)
-			clearDurableDrainAcknowledgement(info, sessFront, dt)
+			clearDurableDrainAcknowledgement(info, sessFront, dt, sp)
 			if trace != nil {
 				trace.RecordDecision(TraceSiteDrainStale, TraceReasonStaleGeneration, TraceOutcomeCancel, normalizedSessionTemplateInfo(info, cfg), name, traceRecordPayload{
 					"drain_reason":       ds.reason,
@@ -574,7 +734,10 @@ func advanceSessionDrainsWithSessionsTraced(
 		}
 		if !running {
 			// Process exited — drain complete.
-			completeDrain(info, sessFront, ds, clk)
+			if !completeStoppedDrain(info, sessFront, ds, completionScope, cfg, store,
+				containsWakeReason(wakeEvals[id].Reasons, WakeWork), clk) {
+				continue
+			}
 			dt.clearIdleProbe(id)
 			dt.remove(id)
 			telemetry.RecordDrainTransition(context.Background(), name, ds.reason, "complete")
@@ -590,7 +753,7 @@ func advanceSessionDrainsWithSessionsTraced(
 			containsWakeReason(eval.Reasons, WakePending) &&
 			pendingDrainReasonCancelable(ds.reason) {
 			if cancelSessionDrainForPendingInfo(info, sp, dt) {
-				clearDurableDrainAcknowledgement(info, sessFront, dt)
+				clearDurableDrainAcknowledgement(info, sessFront, dt, sp)
 				if trace != nil {
 					trace.RecordDecision(TraceSiteDrainCancel, TraceReasonCode(ds.reason), TraceOutcomeCancelPending, normalizedSessionTemplateInfo(info, cfg), name, nil)
 				}
@@ -603,7 +766,7 @@ func advanceSessionDrainsWithSessionsTraced(
 			containsWakeReason(eval.Reasons, WakeWork) &&
 			assignedWorkDrainReasonCancelable(ds.reason) {
 			if cancelSessionDrainForAssignedWorkInfo(info, sp, dt) {
-				clearDurableDrainAcknowledgement(info, sessFront, dt)
+				clearDurableDrainAcknowledgement(info, sessFront, dt, sp)
 				if trace != nil {
 					trace.RecordDecision(TraceSiteDrainCancel, TraceReasonCode(ds.reason), TraceOutcomeCancelAssignedWork, normalizedSessionTemplateInfo(info, cfg), name, nil)
 				}
@@ -623,7 +786,7 @@ func advanceSessionDrainsWithSessionsTraced(
 					_ = clearReconcilerDrainAckMetadata(sp, name)
 				}
 				dt.remove(id)
-				clearDurableDrainAcknowledgement(info, sessFront, dt)
+				clearDurableDrainAcknowledgement(info, sessFront, dt, sp)
 				if trace != nil {
 					trace.RecordDecision(TraceSiteDrainCancel, TraceReasonCode(ds.reason), TraceOutcomeCancel, normalizedSessionTemplateInfo(info, cfg), name, nil)
 				}
@@ -695,7 +858,10 @@ func advanceSessionDrainsWithSessionsTraced(
 				running = false
 			}
 			if !running {
-				completeDrain(info, sessFront, ds, clk)
+				if !completeStoppedDrain(info, sessFront, ds, completionScope, cfg, store,
+					containsWakeReason(wakeEvals[id].Reasons, WakeWork), clk) {
+					continue
+				}
 				dt.clearIdleProbe(id)
 				dt.remove(id)
 				telemetry.RecordDrainTransition(context.Background(), name, ds.reason, "timeout")
@@ -709,6 +875,20 @@ func advanceSessionDrainsWithSessionsTraced(
 	}
 }
 
+type drainCompletionWorkScope struct {
+	cityPath  string
+	rigStores map[string]beads.Store
+}
+
+func drainCompletionHasAssignedWork(scope drainCompletionWorkScope, cfg *config.City, store beads.Store, info sessions.Info, snapshotHasWork bool) bool {
+	hasAssignedWork, err := sessionHasOpenAssignedWorkForReachableStore(scope.cityPath, cfg, store, scope.rigStores, info)
+	if err != nil {
+		log.Printf("session wake: checking assigned work before completing drain for %s: %v", info.ID, err)
+		return true
+	}
+	return snapshotHasWork || hasAssignedWork
+}
+
 // completeDrain writes drain-complete metadata to the store for the drained
 // session. It reads only the typed Info (id + raw wake_mode); the raw-bead
 // mirror the reconciler used to keep is dropped. Nothing reads a drained
@@ -720,8 +900,41 @@ func completeDrain(info sessions.Info, sessFront *sessions.Store, ds *drainState
 	if sessFront == nil {
 		return
 	}
+	latest, err := sessFront.RefreshDrainAcknowledgementInfo(info)
+	if err != nil {
+		return
+	}
+	completeDrainRefreshed(latest, sessFront, ds, false, clk)
+}
+
+// completeStoppedDrain refreshes durable acknowledgement provenance before
+// deciding whether drain completion needs the expensive cross-store work scan.
+func completeStoppedDrain(info sessions.Info, sessFront *sessions.Store, ds *drainState, scope drainCompletionWorkScope, cfg *config.City, store beads.Store, snapshotHasWork bool, clk clock.Clock) bool {
+	if sessFront == nil {
+		return true
+	}
+	latest, err := sessFront.RefreshDrainAcknowledgementInfo(info)
+	if err != nil {
+		return false
+	}
+	hasAssignedWork := false
+	if activeDurableAgentDrainAcknowledgement(latest) {
+		hasAssignedWork = drainCompletionHasAssignedWork(scope, cfg, store, latest, snapshotHasWork)
+	}
+	return completeDrainRefreshed(latest, sessFront, ds, hasAssignedWork, clk)
+}
+
+func completeDrainRefreshed(info sessions.Info, sessFront *sessions.Store, ds *drainState, hasAssignedWork bool, clk clock.Clock) bool {
 	batch := sessions.CompleteDrainPatch(clk.Now(), ds.reason, info.WakeMode == "fresh")
-	_ = sessFront.ApplyPatch(info.ID, batch)
+	if activeDurableAgentDrainAcknowledgement(info) {
+		batch = terminalDrainAcknowledgementPatch(info, clk, hasAssignedWork)
+	}
+	if activeDurableAgentDrainAcknowledgement(info) {
+		_, err := sessFront.FinalizeDrainAcknowledgementInfo(info, batch)
+		return err == nil
+	}
+	_, err := sessFront.ApplyPatchClearingDrainAcknowledgementInfo(info, batch)
+	return err == nil
 }
 
 // verifiedStop stops a session after verifying the instance_token matches.

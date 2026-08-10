@@ -255,6 +255,11 @@ func restoreNativeDoltOpenEnv(previous map[string]*string) {
 type NativeDoltStore struct {
 	mu      sync.RWMutex
 	storage beadslib.Storage
+	// metadataKeyFencer is the guarded-SQL bridge used by production stores for
+	// one-statement, cross-process lifecycle fences.
+	metadataKeyFencer MetadataKeyFencer
+	// fenceMu serializes the transaction fallback used by direct test stores.
+	fenceMu sync.Mutex
 	// generation increments on every successful reconnect. A read that fails
 	// with a transient connection error records the generation it observed and
 	// asks reconnect to swap the dead handle only if no other reader already did.
@@ -311,8 +316,15 @@ func WithNativeReopen(reopen NativeReopenFunc) NativeDoltStoreOption {
 	return func(s *NativeDoltStore) { s.reopen = reopen }
 }
 
+// WithNativeMetadataKeyFencer supplies the cross-process guarded-SQL bridge
+// used for correctness-critical lifecycle fences.
+func WithNativeMetadataKeyFencer(fencer MetadataKeyFencer) NativeDoltStoreOption {
+	return func(s *NativeDoltStore) { s.metadataKeyFencer = fencer }
+}
+
 var (
 	_ Store                         = (*NativeDoltStore)(nil)
+	_ MetadataKeyFencer             = (*NativeDoltStore)(nil)
 	_ ConditionalAssignmentReleaser = (*NativeDoltStore)(nil)
 	_ AtomicTxStore                 = (*NativeDoltStore)(nil)
 	_ GraphApplyStore               = (*NativeDoltStore)(nil)
@@ -1420,6 +1432,59 @@ func (s *NativeDoltStore) SetMetadataBatch(id string, kvs map[string]string) err
 	return nativeStoreError(id, storage.UpdateIssue(ctx, id, map[string]interface{}{"metadata": raw}, s.actor))
 }
 
+// FenceMetadataKey atomically updates one metadata key when its persisted
+// value matches expected. The read, comparison, and write share one native
+// Dolt transaction, so competing controller and agent processes cannot both
+// win the lifecycle fence.
+func (s *NativeDoltStore) FenceMetadataKey(id, key, expected, next string) (bool, error) {
+	if s.metadataKeyFencer != nil {
+		return s.metadataKeyFencer.FenceMetadataKey(id, key, expected, next)
+	}
+	s.fenceMu.Lock()
+	defer s.fenceMu.Unlock()
+	storage, release, err := s.acquireStorage()
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	ctx, cancel := nativeDoltOperationContext(context.TODO())
+	defer cancel()
+	swapped := false
+	err = storage.RunInTransaction(ctx, fmt.Sprintf("gc: fence metadata %s on %s", key, id), func(tx beadslib.Transaction) error {
+		issue, err := tx.GetIssue(ctx, id)
+		if err != nil {
+			return nativeStoreError(id, err)
+		}
+		if issue == nil {
+			return fmt.Errorf("bead %q: %w", id, ErrNotFound)
+		}
+		metadata, err := metadataMapFromNative(issue.Metadata)
+		if err != nil {
+			return fmt.Errorf("parsing metadata for bead %q: %w", id, err)
+		}
+		if metadata[key] != expected {
+			return nil
+		}
+		if metadata == nil {
+			metadata = make(map[string]string, 1)
+		}
+		metadata[key] = next
+		raw, err := metadataRawFromMap(metadata)
+		if err != nil {
+			return err
+		}
+		if err := tx.UpdateIssue(ctx, id, map[string]interface{}{"metadata": raw}, s.actor); err != nil {
+			return nativeStoreError(id, err)
+		}
+		swapped = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return swapped, nil
+}
+
 // Tx executes fn inside a single native Dolt transaction so every write in the
 // callback shares one DOLT_COMMIT. This is the coalescing path that lets a
 // caller (e.g. an extmsg bind) issue several bead writes at the cost of one
@@ -1600,7 +1665,7 @@ func (s *NativeDoltStore) nativeUpdates(ctx context.Context, storage nativeIssue
 	if opts.Assignee != nil {
 		updates["assignee"] = *opts.Assignee
 	}
-	if len(opts.Metadata) > 0 {
+	if len(opts.Metadata) > 0 || len(opts.RemoveMetadata) > 0 {
 		issue, err := storage.GetIssue(ctx, id)
 		if err != nil {
 			return nil, nativeStoreError(id, err)
@@ -1617,6 +1682,9 @@ func (s *NativeDoltStore) nativeUpdates(ctx context.Context, storage nativeIssue
 		}
 		for k, v := range opts.Metadata {
 			metadata[k] = v
+		}
+		for _, key := range opts.RemoveMetadata {
+			delete(metadata, key)
 		}
 		raw, err := metadataRawFromMap(metadata)
 		if err != nil {
