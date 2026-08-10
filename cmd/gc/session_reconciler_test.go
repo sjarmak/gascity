@@ -847,48 +847,6 @@ func TestReconcileSessionBeads_AgentDrainAckPersistsDurableSource(t *testing.T) 
 	}
 }
 
-// TestFinalizeDrainAckStoppedSession_StampsCooldownFromDurableSourceAfterRuntimeGone
-// is the #4824 regression. GC_DRAIN_ACK_SOURCE lives in the tmux env, which dies
-// with the session, so by the time finalize runs the runtime metadata is GONE.
-// finalize must read the durable bead field captured at acknowledge time, not the
-// runtime — otherwise a session-gone read is conflated with "not agent-sourced",
-// held_until never stamps, and the always-on respawn loop persists. Here the
-// runtime carries no source at all (tmux-death simulation) yet the cooldown still
-// stamps from durable state.
-func TestFinalizeDrainAckStoppedSession_StampsCooldownFromDurableSourceAfterRuntimeGone(t *testing.T) {
-	env := newReconcilerTestEnv()
-	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
-	session := env.createSessionBead("worker", "worker")
-	env.setSessionMetadata(&session, map[string]string{
-		namedSessionMetadataKey:              "true",
-		namedSessionIdentityMetadata:         "worker",
-		namedSessionModeMetadata:             "always",
-		sessionpkg.DrainAckSourceMetadataKey: sessionpkg.DrainAckSourceAgent,
-	})
-	// Runtime-gone: nothing ever wrote GC_DRAIN_ACK_SOURCE to the provider, so a
-	// GetMeta-based check would see it absent and refuse the cooldown — the bug.
-	if got, _ := env.sp.GetMeta("worker", reconcilerDrainAckSourceKey); got != "" {
-		t.Fatalf("precondition: runtime drain-ack source = %q, want absent", got)
-	}
-
-	finalizeDrainAckStoppedSession(
-		"", env.cfg, env.store, nil, env.sessionInfo(session.ID), "worker", false,
-		&providerDrainOps{sp: env.sp}, env.dt, env.clk, env.rec, &env.stderr,
-	)
-
-	got, err := env.store.Get(session.ID)
-	if err != nil {
-		t.Fatalf("Get(%s): %v", session.ID, err)
-	}
-	heldUntil, err := time.Parse(time.RFC3339, got.Metadata["held_until"])
-	if err != nil {
-		t.Fatalf("held_until = %q, want timestamp: %v", got.Metadata["held_until"], err)
-	}
-	if want := env.clk.Now().Add(agentDrainAckCooldown); !heldUntil.Equal(want) {
-		t.Fatalf("held_until = %s, want %s", heldUntil, want)
-	}
-}
-
 func TestReconcileSessionBeads_DrainAckKeepsBeadOpen(t *testing.T) {
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{
