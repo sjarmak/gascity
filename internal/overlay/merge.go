@@ -215,7 +215,7 @@ func mergeHookArray(category string, base, over []any) []any {
 	for _, entry := range base {
 		if m, ok := entry.(map[string]any); ok {
 			if key, hasKey := hookEntryKey(category, m); hasKey {
-				if idx, found := baseIdx[key]; found {
+				if idx, found := baseIdx[key]; found && isManagedSessionStartEntry(category, m, key) {
 					result[idx] = entry
 					continue
 				}
@@ -293,8 +293,10 @@ func hookEntryKey(category string, entry map[string]any) (string, bool) {
 }
 
 func managedSessionStartHookKey(entry map[string]any) (string, bool) {
-	if command, ok := entry["command"].(string); ok && isManagedSessionStartPrimeCommand(command) {
-		return "managed-session-start-prime", true
+	if command, ok := entry["command"].(string); ok {
+		if city, managed := managedSessionStartPrimeCommandCity(command); managed {
+			return managedSessionStartKey(city), true
+		}
 	}
 	inner, ok := entry["hooks"].([]any)
 	if !ok {
@@ -306,51 +308,87 @@ func managedSessionStartHookKey(entry map[string]any) (string, bool) {
 			continue
 		}
 		command, ok := m["command"].(string)
-		if ok && isManagedSessionStartPrimeCommand(command) {
-			return "managed-session-start-prime", true
+		if ok {
+			if city, managed := managedSessionStartPrimeCommandCity(command); managed {
+				return managedSessionStartKey(city), true
+			}
 		}
 	}
 	return "", false
 }
 
-func isManagedSessionStartPrimeCommand(command string) bool {
-	// Managed commands carry a shell prefix:
-	//   export PATH="..." && GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart <gc ...>
-	// Take everything after the last "&&" so the quoted PATH and the "&&"
-	// operator never reach the word splitter.
-	if idx := strings.LastIndex(command, "&&"); idx >= 0 {
-		command = command[idx+2:]
-	}
-	tokens := shellquote.Split(command)
-	i := 0
-	for i < len(tokens) && strings.Contains(tokens[i], "=") && !strings.HasPrefix(tokens[i], "=") {
-		i++ // skip leading env assignments (GC_MANAGED_SESSION_HOOK=1, …)
-	}
-	if i >= len(tokens) || tokens[i] != "gc" {
+const (
+	managedSessionStartKeyPrefix = "managed-session-start-prime:"
+	canonicalGCPathPrefix        = `export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH" && `
+)
+
+func managedSessionStartKey(city string) string {
+	return managedSessionStartKeyPrefix + city
+}
+
+func isManagedSessionStartEntry(category string, entry map[string]any, key string) bool {
+	if category != "SessionStart" {
 		return false
 	}
+	managedKey, ok := managedSessionStartHookKey(entry)
+	return ok && key == managedKey
+}
+
+func managedSessionStartPrimeCommandCity(command string) (string, bool) {
+	command = strings.TrimPrefix(command, canonicalGCPathPrefix)
+	tokens := shellquote.Split(command)
+	env := make(map[string]string)
+	i := 0
+	for i < len(tokens) && strings.Contains(tokens[i], "=") && !strings.HasPrefix(tokens[i], "=") {
+		key, value, ok := strings.Cut(tokens[i], "=")
+		if !ok || key != "GC_MANAGED_SESSION_HOOK" && key != "GC_HOOK_EVENT_NAME" {
+			return "", false
+		}
+		env[key] = value
+		i++
+	}
+	if i >= len(tokens) || tokens[i] != "gc" {
+		return "", false
+	}
 	args := tokens[i+1:]
-	// strip optional --city <dir> / --city=<dir>
-	if len(args) >= 2 && args[0] == "--city" {
+	city := ""
+	if len(args) >= 1 && args[0] == "--city" {
+		if len(args) < 2 || args[1] == "" {
+			return "", false
+		}
+		city = args[1]
 		args = args[2:]
 	} else if len(args) >= 1 && strings.HasPrefix(args[0], "--city=") {
+		city = strings.TrimPrefix(args[0], "--city=")
+		if city == "" {
+			return "", false
+		}
 		args = args[1:]
 	}
-	// direct: prime --hook --hook-format codex
-	if len(args) >= 4 && args[0] == "prime" && args[1] == "--hook" &&
-		args[2] == "--hook-format" && args[3] == "codex" {
-		return true
+	if env["GC_MANAGED_SESSION_HOOK"] == "1" && env["GC_HOOK_EVENT_NAME"] == "SessionStart" && len(env) == 2 &&
+		(isPrimeHookArgs(args) || isCodexPrimeHookArgs(args)) {
+		return city, true
 	}
-	// wrapper: hook run … -- prime --hook --hook-format codex
-	if len(args) >= 2 && args[0] == "hook" && args[1] == "run" {
-		for j := 2; j+4 < len(args); j++ {
-			if args[j] == "--" && args[j+1] == "prime" && args[j+2] == "--hook" &&
-				args[j+3] == "--hook-format" && args[j+4] == "codex" {
-				return true
-			}
-		}
+	if len(env) == 0 && isLegacyCodexPrimeHookRunArgs(args) {
+		return city, true
 	}
-	return false
+	return "", false
+}
+
+func isPrimeHookArgs(args []string) bool {
+	return len(args) == 2 && args[0] == "prime" && args[1] == "--hook"
+}
+
+func isCodexPrimeHookArgs(args []string) bool {
+	return len(args) == 4 && isPrimeHookArgs(args[:2]) && args[2] == "--hook-format" && args[3] == "codex"
+}
+
+func isLegacyCodexPrimeHookRunArgs(args []string) bool {
+	if len(args) < 7 || args[0] != "hook" || args[1] != "run" || args[2] != "--timeout" ||
+		args[3] != "15s" || args[4] != "--timeout-exit-code" || args[5] != "0" || args[6] != "--" {
+		return false
+	}
+	return isPrimeHookArgs(args[7:]) || isCodexPrimeHookArgs(args[7:])
 }
 
 // innerHooksKey derives a stable identity from the inner "hooks" array of a

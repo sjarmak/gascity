@@ -197,6 +197,100 @@ func TestMergeSettingsJSON_DedupesCityBoundManagedCodexSessionStartVariants(t *t
 	}
 }
 
+func TestMergeSettingsJSON_ManagedSessionStartIdentityBoundaries(t *testing.T) {
+	const pathPrefix = `export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH" && `
+	current := func(city string) string {
+		return pathPrefix + `GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc --city '` + city + `' prime --hook --hook-format codex`
+	}
+	tests := []struct {
+		name        string
+		baseCommand string
+		overCommand string
+		wantEntries int
+	}{
+		{
+			name:        "rejects user chained prefix",
+			baseCommand: `echo user-owned && GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc --city '/city' prime --hook --hook-format codex`,
+			overCommand: current("/city"),
+			wantEntries: 2,
+		},
+		{
+			name:        "keeps different city bindings",
+			baseCommand: current("/one"),
+			overCommand: current("/two"),
+			wantEntries: 2,
+		},
+		{
+			name:        "recognizes previous managed direct form",
+			baseCommand: pathPrefix + `GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc --city '/city' prime --hook`,
+			overCommand: current("/city"),
+			wantEntries: 1,
+		},
+		{
+			name:        "recognizes exact legacy hook run wrapper",
+			baseCommand: pathPrefix + `gc --city '/city' hook run --timeout 15s --timeout-exit-code 0 -- prime --hook`,
+			overCommand: current("/city"),
+			wantEntries: 1,
+		},
+		{
+			name:        "rejects trailing arguments",
+			baseCommand: current("/city") + ` --user-owned`,
+			overCommand: current("/city"),
+			wantEntries: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := sessionStartSettingsJSON(t, "startup", tt.baseCommand)
+			over := sessionStartSettingsJSON(t, "", tt.overCommand)
+			result, err := MergeSettingsJSON(base, over)
+			if err != nil {
+				t.Fatalf("MergeSettingsJSON: %v", err)
+			}
+			var doc map[string]any
+			if err := json.Unmarshal(result, &doc); err != nil {
+				t.Fatalf("unmarshal result: %v", err)
+			}
+			entries := doc["hooks"].(map[string]any)["SessionStart"].([]any)
+			if len(entries) != tt.wantEntries {
+				t.Fatalf("SessionStart entries = %d, want %d:\n%s", len(entries), tt.wantEntries, result)
+			}
+		})
+	}
+}
+
+func TestMergeSettingsJSON_PreservesDuplicateUserBaseEntries(t *testing.T) {
+	base := []byte(`{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"echo first"}]},{"matcher":"startup","hooks":[{"type":"command","command":"echo second"}]}]}}`)
+	over := []byte(`{"hooks":{"SessionStart":[]}}`)
+
+	result, err := MergeSettingsJSON(base, over)
+	if err != nil {
+		t.Fatalf("MergeSettingsJSON: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(result, &doc); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	entries := doc["hooks"].(map[string]any)["SessionStart"].([]any)
+	if len(entries) != 2 {
+		t.Fatalf("SessionStart entries = %d, want 2 user entries preserved:\n%s", len(entries), result)
+	}
+}
+
+func sessionStartSettingsJSON(t *testing.T, matcher, command string) []byte {
+	t.Helper()
+	doc := map[string]any{"hooks": map[string]any{"SessionStart": []any{map[string]any{
+		"matcher": matcher,
+		"hooks":   []any{map[string]any{"type": "command", "command": command}},
+	}}}}
+	data, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+	return data
+}
+
 func TestMergeSettingsJSON_DoesNotDedupeSameCommandAcrossNonSessionStartMatchers(t *testing.T) {
 	base := `{
 		"hooks": {
