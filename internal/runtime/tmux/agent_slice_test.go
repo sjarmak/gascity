@@ -133,6 +133,67 @@ func testAgentSliceRetriesEscapedNewSessionUntilPlaced(t *testing.T) {
 	}
 }
 
+func TestVerifyAgentSlicePlacementWaitsForStableFinalPlacement(t *testing.T) {
+	tm := NewTmux()
+	observations := []error{
+		errors.New("tmux returned an empty pane pid"),
+		nil,
+		errors.New("pane moved into app.slice"),
+	}
+	observations = append(observations, make([]error, agentSlicePlacementStableChecks)...)
+	checks := 0
+	tm.agentSlicePlacementSample = func(target, slice string) error {
+		if target != "gc-test-stabilize" {
+			t.Fatalf("sample target = %q", target)
+		}
+		if slice != "gascity-agents.slice" {
+			t.Fatalf("sample slice = %q", slice)
+		}
+		if checks >= len(observations) {
+			t.Fatalf("unexpected placement sample %d", checks+1)
+		}
+		err := observations[checks]
+		checks++
+		return err
+	}
+	waits := 0
+	tm.agentSlicePlacementWait = func(time.Duration) { waits++ }
+
+	if err := tm.verifyAgentSlicePlacement("gc-test-stabilize", "gascity-agents.slice"); err != nil {
+		t.Fatalf("verifyAgentSlicePlacement: %v", err)
+	}
+	if checks != len(observations) {
+		t.Fatalf("placement samples = %d, want %d", checks, len(observations))
+	}
+	if waits != checks-1 {
+		t.Fatalf("placement waits = %d, want %d", waits, checks-1)
+	}
+}
+
+func TestVerifyAgentSlicePlacementRejectsTransientInitialSuccess(t *testing.T) {
+	tm := NewTmux()
+	checks := 0
+	tm.agentSlicePlacementSample = func(string, string) error {
+		checks++
+		if checks == 1 {
+			return nil
+		}
+		return errors.New("pane settled in app.slice")
+	}
+	tm.agentSlicePlacementWait = func(time.Duration) {}
+
+	err := tm.verifyAgentSlicePlacement("gc-test-escape", "gascity-agents.slice")
+	if err == nil {
+		t.Fatal("verifyAgentSlicePlacement returned nil after transient initial placement")
+	}
+	if !strings.Contains(err.Error(), "pane settled in app.slice") {
+		t.Fatalf("error = %v, want last observed placement", err)
+	}
+	if checks != agentSlicePlacementChecks {
+		t.Fatalf("placement samples = %d, want bounded %d", checks, agentSlicePlacementChecks)
+	}
+}
+
 func testAgentSliceAbortsNewSessionWhenPlacementKeepsEscaping(t *testing.T) {
 	t.Setenv(AgentSliceEnv, "gascity-agents.slice")
 	tm, exec := newSliceTestTmux(t)

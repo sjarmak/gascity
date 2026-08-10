@@ -252,6 +252,10 @@ type Tmux struct {
 	// agentSlicePlacement is a test seam for post-spawn cgroup verification.
 	// Nil selects verifyAgentSlicePlacement.
 	agentSlicePlacement func(target, slice string) error
+	// agentSlicePlacementSample and agentSlicePlacementWait are test seams for
+	// the production verifier's bounded stabilization loop.
+	agentSlicePlacementSample func(target, slice string) error
+	agentSlicePlacementWait   func(time.Duration)
 
 	// serverSocketObserver observes a named socket only after tmux reports
 	// ErrNoServer during the new-session preflight. Nil selects the production
