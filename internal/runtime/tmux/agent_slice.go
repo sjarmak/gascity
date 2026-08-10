@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -27,6 +28,10 @@ import (
 // slice where resource weights can be applied. Default-off: when unset, pane
 // commands run unwrapped exactly as before.
 const AgentSliceEnv = "GC_AGENT_SLICE"
+
+// agentSlicePlacementAttempts bounds retries when tmux's own transient scope
+// wins the race with systemd-run. A pane that still escapes is terminated.
+const agentSlicePlacementAttempts = 3
 
 // agentSliceProbeTimeout bounds the one-time systemd-run availability probe.
 // Test-overridable.
@@ -128,4 +133,83 @@ func (w *agentSliceWrapper) wrap(slice, command string) string {
 // non-empty slice value decides whether wrapping is active for this Tmux.
 func (t *Tmux) wrapPaneCommand(command string) string {
 	return t.agentSlice.wrap(os.Getenv(AgentSliceEnv), command)
+}
+
+// ensureAgentSlicePlacement verifies that a wrapped pane actually landed in
+// GC_AGENT_SLICE. systemd-enabled tmux moves the pane into its own scope after
+// fork, racing the systemd-run wrapper. Retry the spawn when tmux wins; if all
+// attempts fail, terminate the pane so an unbounded agent never runs outside
+// the configured resource slice.
+func (t *Tmux) ensureAgentSlicePlacement(target, workDir, command, wrapped string, newSession bool) error {
+	slice := os.Getenv(AgentSliceEnv)
+	if slice == "" || command == "" || wrapped == command || !t.agentSlice.ok {
+		return nil
+	}
+	verify := t.agentSlicePlacement
+	if verify == nil {
+		verify = t.verifyAgentSlicePlacement
+	}
+	var placementErr error
+	for attempt := 1; attempt <= agentSlicePlacementAttempts; attempt++ {
+		placementErr = verify(target, slice)
+		if placementErr == nil {
+			return nil
+		}
+		if attempt == agentSlicePlacementAttempts {
+			break
+		}
+		args := []string{"respawn-pane", "-k", "-t", target}
+		if workDir != "" {
+			args = append(args, "-c", workDir)
+		}
+		args = append(args, wrapped)
+		if _, err := t.run(args...); err != nil {
+			placementErr = fmt.Errorf("retrying pane in agent slice: %w", err)
+			break
+		}
+	}
+
+	abortCommand := "kill-pane"
+	if newSession {
+		abortCommand = "kill-session"
+	}
+	if _, err := t.run(abortCommand, "-t", target); err != nil {
+		return fmt.Errorf("agent pane placement failed after %d attempts (%w); aborting escaped pane: %w",
+			agentSlicePlacementAttempts, placementErr, err)
+	}
+	return fmt.Errorf("agent pane placement failed after %d attempts: %w",
+		agentSlicePlacementAttempts, placementErr)
+}
+
+func (t *Tmux) verifyAgentSlicePlacement(target, slice string) error {
+	pid, err := t.run("display-message", "-p", "-t", target, "#{pane_pid}")
+	if err != nil {
+		return fmt.Errorf("reading pane pid: %w", err)
+	}
+	if pid == "" {
+		return errors.New("tmux returned an empty pane pid")
+	}
+	data, err := os.ReadFile("/proc/" + pid + "/cgroup")
+	if err != nil {
+		return fmt.Errorf("reading pane %s cgroup: %w", pid, err)
+	}
+	if cgroupContainsSlice(data, slice) {
+		return nil
+	}
+	return fmt.Errorf("pane %s cgroup is outside %s: %s", pid, slice, strings.TrimSpace(string(data)))
+}
+
+func cgroupContainsSlice(data []byte, slice string) bool {
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		for _, component := range strings.Split(parts[2], "/") {
+			if component == slice {
+				return true
+			}
+		}
+	}
+	return false
 }

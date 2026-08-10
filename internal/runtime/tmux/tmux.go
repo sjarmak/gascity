@@ -249,6 +249,9 @@ type Tmux struct {
 	// agentSlice wraps pane commands in a transient systemd user scope when
 	// GC_AGENT_SLICE is set (see AgentSliceEnv in agent_slice.go).
 	agentSlice agentSliceWrapper
+	// agentSlicePlacement is a test seam for post-spawn cgroup verification.
+	// Nil selects verifyAgentSlicePlacement.
+	agentSlicePlacement func(target, slice string) error
 
 	// serverSocketObserver observes a named socket only after tmux reports
 	// ErrNoServer during the new-session preflight. Nil selects the production
@@ -456,9 +459,13 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 		args = append(args, "-c", workDir)
 	}
 	// Add the command as the last argument - tmux runs it as the pane's initial process
-	args = append(args, t.wrapPaneCommand(command))
+	wrapped := t.wrapPaneCommand(command)
+	args = append(args, wrapped)
 	_, err := t.run(args...)
 	if err != nil {
+		return err
+	}
+	if err := t.ensureAgentSlicePlacement(name, workDir, command, wrapped, true); err != nil {
 		return err
 	}
 	_ = t.ConfigureServer()
@@ -516,9 +523,13 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 		command = "env" + prefix + " " + command
 	}
 	// Add the command as the last argument
-	args = append(args, t.wrapPaneCommand(command))
+	wrapped := t.wrapPaneCommand(command)
+	args = append(args, wrapped)
 	_, err := t.run(args...)
 	if err != nil {
+		return err
+	}
+	if err := t.ensureAgentSlicePlacement(name, workDir, command, wrapped, true); err != nil {
 		return err
 	}
 	_ = t.ConfigureServer()
@@ -3550,8 +3561,11 @@ func (t *Tmux) SetMailClickBinding(_ string) error {
 // This is used for "hot reload" of agent sessions - instantly restart in place.
 // The pane parameter should be a pane ID (e.g., "%0") or session:window.pane format.
 func (t *Tmux) RespawnPane(pane, command string) error {
-	_, err := t.run("respawn-pane", "-k", "-t", pane, t.wrapPaneCommand(command))
-	return err
+	wrapped := t.wrapPaneCommand(command)
+	if _, err := t.run("respawn-pane", "-k", "-t", pane, wrapped); err != nil {
+		return err
+	}
+	return t.ensureAgentSlicePlacement(pane, "", command, wrapped, false)
 }
 
 // RespawnPaneWithWorkDir kills all processes in a pane and starts a new command
@@ -3562,9 +3576,12 @@ func (t *Tmux) RespawnPaneWithWorkDir(pane, workDir, command string) error {
 	if workDir != "" {
 		args = append(args, "-c", workDir)
 	}
-	args = append(args, t.wrapPaneCommand(command))
-	_, err := t.run(args...)
-	return err
+	wrapped := t.wrapPaneCommand(command)
+	args = append(args, wrapped)
+	if _, err := t.run(args...); err != nil {
+		return err
+	}
+	return t.ensureAgentSlicePlacement(pane, workDir, command, wrapped, false)
 }
 
 // ClearHistory clears the scrollback history buffer for a pane.
