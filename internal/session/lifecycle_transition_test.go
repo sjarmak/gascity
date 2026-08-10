@@ -349,10 +349,12 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 			name:  "close",
 			patch: ClosePatch(now, "orphaned"),
 			want: MetadataPatch{
-				"state":        "orphaned",
-				"close_reason": "session orphaned: configured agent removed",
-				"closed_at":    now.Format(time.RFC3339),
-				"synced_at":    now.Format(time.RFC3339),
+				"state":                   "orphaned",
+				"close_reason":            "session orphaned: configured agent removed",
+				"closed_at":               now.Format(time.RFC3339),
+				"synced_at":               now.Format(time.RFC3339),
+				DrainAckSourceMetadataKey: "",
+				DrainAckTokenMetadataKey:  "",
 			},
 		},
 		{
@@ -924,5 +926,10 @@ func TestClosePatchKeepsShortStateCode(t *testing.T) {
 	if trimmed := strings.TrimSpace(patch["close_reason"]); len(trimmed) < 20 {
 		t.Errorf("close_reason = %q (%d trimmed chars); want >=20 to satisfy validator",
 			patch["close_reason"], len(trimmed))
+	}
+	_, hasSourceClear := patch[DrainAckSourceMetadataKey]
+	_, hasTokenClear := patch[DrainAckTokenMetadataKey]
+	if !hasSourceClear || !hasTokenClear || patch[DrainAckSourceMetadataKey] != "" || patch[DrainAckTokenMetadataKey] != "" {
+		t.Fatalf("ClosePatch must consume drain acknowledgement provenance: %#v", patch)
 	}
 }

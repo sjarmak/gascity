@@ -557,10 +557,12 @@ func ArchivePatch(now time.Time, reason string, continuityEligible bool) Metadat
 func ClosePatch(now time.Time, stateCode string) MetadataPatch {
 	ts := now.UTC().Format(time.RFC3339)
 	return MetadataPatch{
-		"state":        stateCode,
-		"close_reason": CanonicalCloseReason(stateCode),
-		"closed_at":    ts,
-		"synced_at":    ts,
+		"state":                   stateCode,
+		"close_reason":            CanonicalCloseReason(stateCode),
+		"closed_at":               ts,
+		"synced_at":               ts,
+		DrainAckSourceMetadataKey: "",
+		DrainAckTokenMetadataKey:  "",
 	}
 }
 

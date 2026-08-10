@@ -149,7 +149,7 @@ func (s *Store) CancelDrainAcknowledgement(id, token string) (bool, error) {
 		if current.Metadata[DrainAckTokenMetadataKey] != token {
 			return false, nil
 		}
-		writer, ok := beads.ConditionalWriterFor(s.store.Store)
+		writer, ok := resolvedConditionalWriter(s.store.Store)
 		if !ok {
 			return false, beads.ErrConditionalWriteUnsupported
 		}
@@ -163,6 +163,24 @@ func (s *Store) CancelDrainAcknowledgement(id, token string) (bool, error) {
 		return err == nil, err
 	}
 	return false, fmt.Errorf("canceling drain acknowledgement for %s: concurrent updates did not settle", id)
+}
+
+func resolvedConditionalWriter(store beads.Store) (beads.ConditionalWriter, bool) {
+	const maxWrapperDepth = 8
+	for range maxWrapperDepth {
+		if writer, ok := beads.ConditionalWriterFor(store); ok {
+			return writer, true
+		}
+		targeter, ok := store.(beads.ConditionalWritesResolveTargeter)
+		if !ok {
+			return nil, false
+		}
+		store = targeter.ConditionalWritesResolveTarget()
+		if store == nil {
+			return nil, false
+		}
+	}
+	return beads.ConditionalWriterFor(store)
 }
 
 // RequestRestart records a controller handoff to a fresh provider conversation

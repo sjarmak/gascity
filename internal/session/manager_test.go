@@ -439,6 +439,30 @@ func TestCancelDrainAcknowledgementDoesNotClearNewerToken(t *testing.T) {
 	}
 }
 
+func TestCancelDrainAcknowledgementResolvesTypedStoreWrappers(t *testing.T) {
+	backing := beads.NewMemStore()
+	store := beads.SessionStore{Store: backing}
+	mgr := NewManagerWithOptions(store, runtime.NewFake())
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "chat", Command: "claude", WorkDir: t.TempDir(), Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CancelDrainAcknowledgement(info.ID, token); err != nil {
+		t.Fatalf("CancelDrainAcknowledgement through typed wrapper: %v", err)
+	}
+	got, err := backing.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata[DrainAckSourceMetadataKey] != "" || got.Metadata[DrainAckTokenMetadataKey] != "" {
+		t.Fatalf("durable acknowledgement was not cleared: metadata=%v", got.Metadata)
+	}
+}
+
 // TestRetireConfiguredNamedSessionIdentifiersFreesCanonicalIdentity pins that the
 // Manager.Close named-session retirement path frees the durable canonical-identity
 // record (canonical_instance_name / canonical_pool_slot) alongside the legacy
