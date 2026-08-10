@@ -455,6 +455,27 @@ func TestEnsureCanonicalInstructionsPointer_PreservesHandWrittenFile(t *testing.
 	}
 }
 
+func TestEnsureCanonicalInstructionsPointer_MigratesDuplicateRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	const instructions = "shared instructions\n"
+	writeFile(t, filepath.Join(dir, "AGENTS.md"), instructions)
+	writeFile(t, filepath.Join(dir, "CLAUDE.md"), instructions)
+
+	if err := EnsureCanonicalInstructionsPointer(dir, "CLAUDE.md"); err != nil {
+		t.Fatalf("EnsureCanonicalInstructionsPointer: %v", err)
+	}
+	if got := readLink(t, filepath.Join(dir, "CLAUDE.md")); got != "AGENTS.md" {
+		t.Fatalf("symlink target = %q, want AGENTS.md", got)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "CLAUDE.md"))
+	if err != nil {
+		t.Fatalf("ReadFile through migrated symlink: %v", err)
+	}
+	if string(got) != instructions {
+		t.Fatalf("resolved content = %q, want %q", got, instructions)
+	}
+}
+
 func TestEnsureCanonicalInstructionsPointer_PreservesExistingSymlink(t *testing.T) {
 	// An existing symlink-based rig is already canonical; leave it alone,
 	// including a symlink pointing somewhere unexpected.
