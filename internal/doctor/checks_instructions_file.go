@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -364,9 +365,11 @@ func instructionsFallbackUsable(dir, name string) bool {
 //
 // Behavior, matching the "preserve hand-written content and existing
 // symlink-based rigs" contract:
-//   - If expected already exists in any form (regular file, symlink — even a
-//     dangling one — or directory), it is left untouched. The function never
-//     overwrites, so hand-written content and existing symlinks survive.
+//   - If expected is a regular file whose content exactly matches the
+//     canonical sibling, it is atomically replaced by a relative symlink. This
+//     migrates drift-prone whole-file copies without changing their content.
+//   - Other existing files, symlinks — even dangling ones — and directories
+//     are left untouched, so hand-written content and existing links survive.
 //   - Otherwise, if a canonical sibling instruction file is present (AGENTS.md
 //     preferred, then CLAUDE.md, then INSTRUCTIONS.md), expected is created as a
 //     relative symlink to it. Content is never copied, so the two names cannot
@@ -386,17 +389,50 @@ func EnsureCanonicalInstructionsPointer(dir, expected string) error {
 	target := filepath.Join(dir, expected)
 	// Lstat, not Stat, so an existing symlink — even a dangling one — counts as
 	// user-owned state we must not clobber.
-	if _, statErr := os.Lstat(target); statErr == nil {
-		return nil
-	} else if !os.IsNotExist(statErr) {
+	info, statErr := os.Lstat(target)
+	if statErr != nil && !os.IsNotExist(statErr) {
 		return fmt.Errorf("inspecting %s: %w", target, statErr)
 	}
 	canonical := firstFallback(dir, expected)
 	if canonical == "" {
 		return nil
 	}
+	if statErr == nil {
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		canonicalContent, readErr := os.ReadFile(filepath.Join(dir, canonical))
+		if readErr != nil {
+			return fmt.Errorf("reading canonical instructions %s: %w", canonical, readErr)
+		}
+		targetContent, readErr := os.ReadFile(target)
+		if readErr != nil {
+			return fmt.Errorf("reading provider instructions %s: %w", expected, readErr)
+		}
+		if !bytes.Equal(targetContent, canonicalContent) {
+			return nil
+		}
+		return replaceWithInstructionsSymlink(dir, target, canonical)
+	}
 	if linkErr := os.Symlink(canonical, target); linkErr != nil {
 		return fmt.Errorf("symlink %s -> %s: %w", expected, canonical, linkErr)
+	}
+	return nil
+}
+
+func replaceWithInstructionsSymlink(dir, target, canonical string) error {
+	stagingDir, err := os.MkdirTemp(dir, ".gc-instructions-pointer-")
+	if err != nil {
+		return fmt.Errorf("creating instructions pointer staging directory: %w", err)
+	}
+	defer os.RemoveAll(stagingDir) //nolint:errcheck // best-effort cleanup after rename
+
+	staged := filepath.Join(stagingDir, filepath.Base(target))
+	if err := os.Symlink(canonical, staged); err != nil {
+		return fmt.Errorf("staging symlink %s -> %s: %w", filepath.Base(target), canonical, err)
+	}
+	if err := os.Rename(staged, target); err != nil {
+		return fmt.Errorf("replacing %s with symlink to %s: %w", filepath.Base(target), canonical, err)
 	}
 	return nil
 }
