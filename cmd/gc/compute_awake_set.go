@@ -42,6 +42,7 @@ type AwakeAgent struct {
 	QualifiedName     string   // e.g. "hello-world/polecat"
 	DependsOn         []string // template names this agent depends on
 	Suspended         bool
+	WakeMode          string
 	SleepAfterIdle    time.Duration // 0 = disabled
 	MinActiveSessions int           // effective min_active_sessions; 0 = no always-warm guarantee
 }
@@ -296,8 +297,11 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 		if bead.State == "closed" {
 			continue
 		}
-		if agent, ok := lookupAgent(bead.Template); ok && agent.Suspended {
-			continue
+		if agent, ok := lookupAgent(bead.Template); ok {
+			if agent.Suspended || (agent.WakeMode == "fresh" && bead.State == "asleep" &&
+				bead.SleepReason == string(sessionpkg.SleepReasonCityStop)) {
+				continue
+			}
 		}
 		var (
 			fallback   string
@@ -345,7 +349,7 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 	// on the pool min path. Scoped to sleep_reason=city-stop so idle_timeout
 	// and wake_mode semantics are unchanged. See #2739.
 	for _, agent := range input.Agents {
-		if agent.Suspended || agent.MinActiveSessions <= 0 {
+		if agent.Suspended || agent.WakeMode == "fresh" || agent.MinActiveSessions <= 0 {
 			continue
 		}
 		template := agent.QualifiedName

@@ -16,6 +16,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/api"
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
@@ -10317,6 +10318,72 @@ func TestReconcileSessionBeads_ZombieCapturesScrollback(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected SessionCrashed event with scrollback capture")
+	}
+}
+
+func TestReconcileSessionBeads_FreshCityStopOwnerGetsBoundReplacement(t *testing.T) {
+	for _, minActive := range []*int{intPtr(1), nil} {
+		name := "elastic"
+		if minActive != nil {
+			name = "bounded"
+		}
+		t.Run(name, func(t *testing.T) {
+			cityPath := t.TempDir()
+			store := beads.NewMemStore()
+			sp := runtime.NewFake()
+			clk := &clock.Fake{Time: time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)}
+			maxActive := 2
+			cfg := &config.City{
+				Workspace: config.Workspace{Name: "test-city"},
+				Agents: []config.Agent{{
+					Name: "claude", StartCommand: "true", WakeMode: "fresh",
+					MaxActiveSessions: &maxActive, MinActiveSessions: minActive,
+				}},
+			}
+
+			stale := poolSessionBeadWithState("s-stale", "asleep", "")
+			stale.Metadata["sleep_reason"] = "city-stop"
+			stale.Metadata["pool_slot"] = "1"
+			stale.Metadata["generation"] = "1"
+			stale.Metadata["instance_token"] = "stale-token"
+			stale, err := store.Create(stale)
+			if err != nil {
+				t.Fatalf("Create(stale session): %v", err)
+			}
+			work, err := store.Create(workBead("w1", "claude", stale.ID, "in_progress", 1))
+			if err != nil {
+				t.Fatalf("Create(work): %v", err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			ds := buildDesiredState(cfg.EffectiveCityName(), cityPath, clk.Now(), cfg, sp, store, &stderr)
+			sessions, err := loadSessionBeads(store)
+			if err != nil {
+				t.Fatalf("loadSessionBeads: %v", err)
+			}
+			poolDesired := PoolDesiredCounts(ComputePoolDesiredStates(cfg, ds.AssignedWorkBeads, sessionInfosFromBeads(sessions), ds.ScaleCheckCounts))
+			woken := reconcileSessionBeads(
+				context.Background(), sessions, ds.State, configuredSessionNames(cfg, cfg.EffectiveCityName(), store),
+				cfg, sp, store, nil, ds.AssignedWorkBeads, nil, newDrainTracker(), poolDesired,
+				ds.StoreQueryPartial, nil, cfg.EffectiveCityName(), nil, clk, events.Discard, 0, 0, &stdout, &stderr,
+			)
+			if woken != 1 {
+				t.Fatalf("woken = %d, want 1; stdout=%q stderr=%q", woken, stdout.String(), stderr.String())
+			}
+			if sp.IsRunning(stale.Metadata["session_name"]) {
+				t.Fatalf("stale city-stop session %q was resumed", stale.Metadata["session_name"])
+			}
+			post, err := loadSessionBeads(store)
+			if err != nil {
+				t.Fatalf("loadSessionBeads(post): %v", err)
+			}
+			for _, sessionBead := range post {
+				if sessionBead.ID != stale.ID && sessionBead.Metadata[beadmeta.TriggerBeadIDMetadataKey] == work.ID {
+					return
+				}
+			}
+			t.Fatalf("no fresh session retained trigger work %s; sessions=%#v", work.ID, post)
+		})
 	}
 }
 

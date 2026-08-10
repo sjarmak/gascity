@@ -2396,6 +2396,10 @@ func discoverSessionBeadsWithRoots(
 		// no work.
 		if isEphemeralSessionInfoForAgent(info, cfgAgent) {
 			manualSession := isManualSessionInfoForAgent(info, cfgAgent)
+			if !manualSession && cfgAgent.EffectiveWakeMode() == "fresh" &&
+				info.State == session.StateAsleep && info.SleepReason == string(session.SleepReasonCityStop) {
+				continue
+			}
 			creating := info.MetadataState == "creating" || info.MetadataState == string(session.StateStartPending)
 			pendingCreate := isPendingPoolCreateInfo(info)
 			templateDesired := desiredHasTemplate(desired, template)

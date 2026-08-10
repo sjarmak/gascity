@@ -53,6 +53,7 @@ func buildAwakeInputFromReconciler(
 		agent := AwakeAgent{
 			QualifiedName:     a.QualifiedName(),
 			Suspended:         isAgentEffectivelySuspendedWith(cfg, a, suspState),
+			WakeMode:          a.EffectiveWakeMode(),
 			SleepAfterIdle:    parseSleepDuration(a.SleepAfterIdle),
 			MinActiveSessions: a.EffectiveMinActiveSessions(),
 		}

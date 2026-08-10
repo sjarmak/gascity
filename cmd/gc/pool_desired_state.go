@@ -123,11 +123,7 @@ func computePoolDesiredStates(
 	assigneeToSessionBeadID := make(map[string]string)
 	sessionBeadTemplate := make(map[string]string)
 	namedSessionBeadIDs := make(map[string]bool)
-	// asleepSessionBeadIDs marks non-closed sessions whose runtime state is
-	// asleep (normalizeInfoState also folds "drained" into StateAsleep). A
-	// wake_mode="fresh" agent must not resume one of these stale rows — see the
-	// resume-tier guard below.
-	asleepSessionBeadIDs := make(map[string]bool)
+	sessionInfoByID := make(map[string]sessionpkg.Info)
 	for _, sb := range sessionInfos {
 		if sb.Closed {
 			continue
@@ -145,15 +141,14 @@ func computePoolDesiredStates(
 		if isNamedSessionInfo(sb) {
 			namedSessionBeadIDs[sb.ID] = true
 		}
-		if sb.State == sessionpkg.StateAsleep {
-			asleepSessionBeadIDs[sb.ID] = true
-		}
+		sessionInfoByID[sb.ID] = sb
 	}
 
 	aliasHeldTemplates := canonicalSingletonAliasHeldTemplates(cfg, sessionInfos)
 
 	var resumeRequests []SessionRequest
 	wakeRequestedTemplates := make(map[string]struct{})
+	freshReplacementWorkBeads := make(map[string]struct{})
 
 	for i := range cfg.Agents {
 		agent := &cfg.Agents[i]
@@ -203,16 +198,23 @@ func computePoolDesiredStates(
 				if namedSessionBeadIDs[sessionBeadID] {
 					continue
 				}
-				// A wake_mode="fresh" pool agent must not resume a stale
-				// *asleep* session left over from before a restart: resuming
-				// runs the dead session's pre_start hook, which hangs and is
-				// killed on the resume deadline, so the pool never materializes
-				// a live member (every reconcile re-attempts the same doomed
-				// resume). Skip the resume and let the scale_check / min-fill
-				// path start a clean session. A live (non-asleep) session still
-				// resumes; agents with unset or wake_mode="resume" are
-				// unaffected. (gastownhall/gascity#4849)
-				if agent.EffectiveWakeMode() == "fresh" && asleepSessionBeadIDs[sessionBeadID] {
+				info := sessionInfoByID[sessionBeadID]
+				if agent.EffectiveWakeMode() == "fresh" && info.State == sessionpkg.StateAsleep &&
+					info.SleepReason == string(sessionpkg.SleepReasonCityStop) {
+					if _, exists := freshReplacementWorkBeads[wb.ID]; exists {
+						continue
+					}
+					freshReplacementWorkBeads[wb.ID] = struct{}{}
+					resumeRequests = append(resumeRequests, SessionRequest{
+						Template:       template,
+						BeadPriority:   beadPriority(wb),
+						Tier:           "new",
+						WorkBeadID:     wb.ID,
+						WorkBeadTitle:  strings.TrimSpace(wb.Title),
+						WorkPack:       strings.TrimSpace(wb.Metadata[beadmeta.PackMetadataKey]),
+						WorkWorkspace:  strings.TrimSpace(wb.Metadata[beadmeta.PackWorkspaceMetadataKey]),
+						BrainParentSID: strings.TrimSpace(wb.Metadata[beadmeta.BrainParentSIDMetadataKey]),
+					})
 					continue
 				}
 				resumeRequests = append(resumeRequests, SessionRequest{

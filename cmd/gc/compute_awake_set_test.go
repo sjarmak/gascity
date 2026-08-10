@@ -2314,3 +2314,31 @@ func TestAssignedWork_NoRecordedCurrent_FirstMatchAnchors(t *testing.T) {
 		t.Fatal("RequiresFreshCycle = true, want false — no recorded current means no divergence")
 	}
 }
+
+func TestComputeAwakeSet_FreshWakeLeavesOnlyCityStopOwnerAsleep(t *testing.T) {
+	tests := []struct {
+		name        string
+		wakeMode    string
+		sleepReason string
+		wantWake    bool
+	}{
+		{name: "fresh city-stop", wakeMode: "fresh", sleepReason: "city-stop", wantWake: false},
+		{name: "fresh idle-timeout", wakeMode: "fresh", sleepReason: "idle-timeout", wantWake: true},
+		{name: "resume city-stop", wakeMode: "resume", sleepReason: "city-stop", wantWake: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ComputeAwakeSet(AwakeInput{
+				Agents: []AwakeAgent{{QualifiedName: "worker", WakeMode: tt.wakeMode}},
+				SessionBeads: []AwakeSessionBead{{
+					ID: "s1", SessionName: "worker-1", Template: "worker",
+					State: "asleep", SleepReason: tt.sleepReason,
+				}},
+				WorkBeads: []AwakeWorkBead{{ID: "w1", Assignee: "s1", Status: "in_progress"}},
+			})
+			if got := result["worker-1"].ShouldWake; got != tt.wantWake {
+				t.Fatalf("ShouldWake = %v, want %v; decision=%+v", got, tt.wantWake, result["worker-1"])
+			}
+		})
+	}
+}
