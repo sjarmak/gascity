@@ -21,6 +21,7 @@ func newSliceTestTmux(t *testing.T) (*Tmux, *fakeExecutor) {
 	tm.exec = exec
 	tm.agentSlice.probe = func(string) error { return nil }
 	tm.agentSlice.warn = &strings.Builder{}
+	tm.agentSlicePlacement = func(string, string) error { return nil }
 	return tm, exec
 }
 
@@ -88,6 +89,105 @@ func TestAgentSliceWrapsRespawnPane(t *testing.T) {
 	args = exec.calls[1]
 	if got := args[len(args)-1]; got != want {
 		t.Fatalf("respawn-with-workdir command = %q, want %q", got, want)
+	}
+}
+
+func TestAgentSliceRetriesEscapedNewSessionUntilPlaced(t *testing.T) {
+	t.Setenv(AgentSliceEnv, "gascity-agents.slice")
+	tm, exec := newSliceTestTmux(t)
+	checks := 0
+	tm.agentSlicePlacement = func(target, slice string) error {
+		checks++
+		if target != "gc-test-slice-retry" {
+			t.Fatalf("placement target = %q, want session name", target)
+		}
+		if slice != "gascity-agents.slice" {
+			t.Fatalf("placement slice = %q", slice)
+		}
+		if checks == 1 {
+			return errors.New("pane escaped into app.slice")
+		}
+		return nil
+	}
+
+	if err := tm.NewSessionWithCommand("gc-test-slice-retry", "/work", "claude"); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	if checks != 2 {
+		t.Fatalf("placement checks = %d, want 2", checks)
+	}
+	respawns := 0
+	for _, call := range exec.calls {
+		if slices.Contains(call, "respawn-pane") {
+			respawns++
+		}
+	}
+	if respawns != 1 {
+		t.Fatalf("respawn calls = %d, want 1: %v", respawns, exec.calls)
+	}
+}
+
+func TestAgentSliceAbortsNewSessionWhenPlacementKeepsEscaping(t *testing.T) {
+	t.Setenv(AgentSliceEnv, "gascity-agents.slice")
+	tm, exec := newSliceTestTmux(t)
+	tm.agentSlicePlacement = func(string, string) error {
+		return errors.New("pane escaped into app.slice")
+	}
+
+	err := tm.NewSessionWithCommand("gc-test-slice-abort", "/work", "claude")
+	if err == nil {
+		t.Fatal("NewSessionWithCommand returned nil for persistently escaped pane")
+	}
+	if !strings.Contains(err.Error(), "pane escaped into app.slice") {
+		t.Fatalf("error = %v, want placement failure", err)
+	}
+	if len(exec.calls) < 2 || !slices.Contains(exec.calls[len(exec.calls)-1], "kill-session") {
+		t.Fatalf("last call = %v, want fail-closed kill-session", exec.calls[len(exec.calls)-1])
+	}
+}
+
+func TestAgentSliceAbortsRespawnedPaneWhenPlacementKeepsEscaping(t *testing.T) {
+	t.Setenv(AgentSliceEnv, "gascity-agents.slice")
+	tm, exec := newSliceTestTmux(t)
+	tm.agentSlicePlacement = func(string, string) error {
+		return errors.New("pane escaped into app.slice")
+	}
+
+	err := tm.RespawnPane("%7", "claude")
+	if err == nil {
+		t.Fatal("RespawnPane returned nil for persistently escaped pane")
+	}
+	if len(exec.calls) < 2 || !slices.Contains(exec.calls[len(exec.calls)-1], "kill-pane") {
+		t.Fatalf("last call = %v, want fail-closed kill-pane", exec.calls[len(exec.calls)-1])
+	}
+}
+
+func TestCgroupContainsSlice(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want bool
+	}{
+		{
+			name: "tmux scope nested under target",
+			data: "0::/user.slice/user-1000.slice/user@1000.service/gascity.slice/gascity-agents.slice/tmux-spawn-123.scope\n",
+			want: true,
+		},
+		{
+			name: "escaped app scope",
+			data: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-123.scope\n",
+		},
+		{
+			name: "substring is not a component match",
+			data: "0::/user.slice/not-gascity-agents.slice-child/run.scope\n",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := cgroupContainsSlice([]byte(tc.data), "gascity-agents.slice"); got != tc.want {
+				t.Fatalf("cgroupContainsSlice() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
