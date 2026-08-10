@@ -172,6 +172,7 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 				"last_woke_at":              "",
 				"pending_create_claim":      "",
 				"pending_create_started_at": "",
+				"drain_ack_source":          "",
 			},
 		},
 		{
@@ -183,6 +184,7 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 				"last_woke_at":               "",
 				"pending_create_claim":       "",
 				"pending_create_started_at":  "",
+				"drain_ack_source":           "",
 				"session_key":                "",
 				"started_config_hash":        "",
 				"started_live_hash":          "",
@@ -204,6 +206,7 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 				"last_woke_at":               "",
 				"pending_create_claim":       "",
 				"pending_create_started_at":  "",
+				"drain_ack_source":           "",
 				"sleep_intent":               "",
 				"slept_at":                   now.Format(time.RFC3339),
 				"session_key":                "",

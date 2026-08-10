@@ -445,6 +445,7 @@ func AcknowledgeDrainPatch(freshWake bool) MetadataPatch {
 		"last_woke_at":              "",
 		"pending_create_claim":      "",
 		"pending_create_started_at": "",
+		DrainAckSourceMetadataKey:   "",
 	}
 	if freshWake {
 		patch["session_key"] = ""
@@ -458,6 +459,7 @@ func AcknowledgeDrainPatch(freshWake bool) MetadataPatch {
 func CompleteDrainPatch(now time.Time, reason string, freshWake bool) MetadataPatch {
 	patch := SleepPatch(now, reason)
 	patch["state_reason"] = ""
+	patch[DrainAckSourceMetadataKey] = ""
 	if freshWake {
 		patch["session_key"] = ""
 		applyFreshWakeConversationReset(patch)

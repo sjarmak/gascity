@@ -138,6 +138,12 @@ func (s *Store) BeginDrainAckStopPendingInfo(info Info, now time.Time) (Info, er
 	return s.ApplyPatchInfo(info, DrainAckStopPendingPatch(now))
 }
 
+// CancelDrainAcknowledgement clears durable agent provenance when a drain ack
+// is canceled before finalization.
+func (s *Store) CancelDrainAcknowledgement(id string) error {
+	return s.ApplyPatch(id, MetadataPatch{DrainAckSourceMetadataKey: ""})
+}
+
 // RequestRestart records a controller handoff to a fresh provider conversation
 // via RestartRequestPatch. Replaces the restart-request write in session_reconciler.go.
 func (s *Store) RequestRestart(id, sessionKey string, now time.Time) error {

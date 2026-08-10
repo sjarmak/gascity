@@ -1316,7 +1316,7 @@ func (m *Manager) CancelDrainAcknowledgement(id string) error {
 		if _, _, err := m.sessionBead(id); err != nil {
 			return err
 		}
-		if err := m.store.SetMetadata(id, DrainAckSourceMetadataKey, ""); err != nil {
+		if err := NewStore(beads.SessionStore{Store: m.store}).CancelDrainAcknowledgement(id); err != nil {
 			return fmt.Errorf("clearing drain-ack provenance for session %s: %w", id, err)
 		}
 		return nil

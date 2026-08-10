@@ -1085,12 +1085,13 @@ func TestAdvanceSessionDrains_OrphanedDrainCanceledForAssignedWork(t *testing.T)
 		Type:   sessionBeadType,
 		Labels: []string{sessionBeadLabel},
 		Metadata: map[string]string{
-			"session_name": "test-session",
-			"template":     "worker",
-			"provider":     "claude",
-			"work_dir":     t.TempDir(),
-			"generation":   "3",
-			"state":        "active",
+			"session_name":                       "test-session",
+			"template":                           "worker",
+			"provider":                           "claude",
+			"work_dir":                           t.TempDir(),
+			"generation":                         "3",
+			"state":                              "active",
+			sessionpkg.DrainAckSourceMetadataKey: sessionpkg.DrainAckSourceAgent,
 		},
 	})
 	if err != nil {
@@ -1128,6 +1129,13 @@ func TestAdvanceSessionDrains_OrphanedDrainCanceledForAssignedWork(t *testing.T)
 	}
 	if ack, _ := sp.GetMeta("test-session", "GC_DRAIN_ACK"); ack != "" {
 		t.Fatalf("GC_DRAIN_ACK = %q, want cleared after assigned-work cancellation", ack)
+	}
+	updated, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", b.ID, err)
+	}
+	if source := updated.Metadata[sessionpkg.DrainAckSourceMetadataKey]; source != "" {
+		t.Fatalf("durable drain-ack source = %q, want cleared after cancellation", source)
 	}
 	if !sp.IsRunning("test-session") {
 		t.Fatal("session should stay running after assigned-work cancellation")

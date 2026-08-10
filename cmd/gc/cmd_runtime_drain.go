@@ -301,11 +301,16 @@ func cmdRuntimeUndrain(args []string, jsonOutput bool, stdout, stderr io.Writer)
 	}
 	dops := newDrainOps(sp)
 	rec := openCityRecorder(stderr)
-	return doRuntimeUndrain(dops, sp, rec, target.display, target.sessionName, jsonOutput, stdout, stderr)
+	_, cancelAck, err := runtimeDrainAckPersistence(target, sp)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc runtime undrain: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	return doRuntimeUndrain(dops, sp, cancelAck, rec, target.display, target.sessionName, jsonOutput, stdout, stderr)
 }
 
 // doRuntimeUndrain clears the drain signal on a session.
-func doRuntimeUndrain(dops drainOps, sp runtime.Provider, rec events.Recorder,
+func doRuntimeUndrain(dops drainOps, sp runtime.Provider, cancelAck func() error, rec events.Recorder,
 	targetName, sn string, jsonOutput bool, stdout, stderr io.Writer,
 ) int {
 	running, err := workerSessionTargetRunningWithConfig("", nil, sp, nil, sn)
@@ -320,6 +325,12 @@ func doRuntimeUndrain(dops drainOps, sp runtime.Provider, rec events.Recorder,
 	if err := dops.clearDrain(sn); err != nil {
 		fmt.Fprintf(stderr, "gc runtime undrain: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+	if cancelAck != nil {
+		if err := cancelAck(); err != nil {
+			fmt.Fprintf(stderr, "gc runtime undrain: clearing durable provenance: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
 	}
 	rec.Record(events.Event{
 		Type:    events.SessionUndrained,
@@ -695,7 +706,11 @@ func doRuntimeDrainAck(dops drainOps, persistAck, rollbackAck func() error, city
 		}
 	}
 	if err := dops.setDrainAck(sn); err != nil {
-		if rollbackAck != nil {
+		// setDrainAck can return a cleanup error after it has successfully
+		// published GC_DRAIN_ACK. Preserve durable provenance unless a read
+		// authoritatively proves that publication did not happen.
+		acked, readErr := dops.isDrainAcked(sn)
+		if !acked && readErr == nil && rollbackAck != nil {
 			if rollbackErr := rollbackAck(); rollbackErr != nil {
 				err = errors.Join(err, fmt.Errorf("rolling back durable provenance: %w", rollbackErr))
 			}

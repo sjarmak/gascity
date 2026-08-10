@@ -773,8 +773,8 @@ func TestReconcileSessionBeads_DrainAckCooldownExclusions(t *testing.T) {
 			env := newReconcilerTestEnv()
 			env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 			session := env.createSessionBead("worker", "worker")
-			// Set the drain-ack source on the DURABLE bead field, the way
-			// markDrainAckStopPending captures it while the session is alive.
+			// Set the drain-ack source on the durable bead field, as the agent's
+			// acknowledgement command does before publishing the runtime flag.
 			// finalize reads this (not the runtime), so the agent-sourced cases
 			// pass the first predicate and actually reach the exclusion under test
 			// (pool-managed / on-demand / assigned-work); reading it from tmux would
@@ -837,13 +837,40 @@ func TestReconcileSessionBeads_ExplicitWakeClearsAgentDrainAckCooldown(t *testin
 	}
 }
 
-// TestReconcileSessionBeads_AgentDrainAckPersistsDurableSource proves the
-// provenance is captured by the acknowledge command before runtime metadata can
-// disappear, and remains intact through the stop-pending transition.
-func TestReconcileSessionBeads_AgentDrainAckPersistsDurableSource(t *testing.T) {
+// TestReconcileSessionBeads_AgentDrainAckConsumesDurableSource proves terminal
+// finalization does not leave agent provenance available to a later drain.
+func TestReconcileSessionBeads_AgentDrainAckConsumesDurableSource(t *testing.T) {
 	_, drained, _ := agentDrainAckAlwaysNamedSession(t)
-	if got := drained.Metadata[sessionpkg.DrainAckSourceMetadataKey]; got != sessionpkg.DrainAckSourceAgent {
-		t.Fatalf("durable %s = %q, want %q", sessionpkg.DrainAckSourceMetadataKey, got, sessionpkg.DrainAckSourceAgent)
+	if got := drained.Metadata[sessionpkg.DrainAckSourceMetadataKey]; got != "" {
+		t.Fatalf("durable %s = %q, want consumed", sessionpkg.DrainAckSourceMetadataKey, got)
+	}
+}
+
+func TestFinalizeDrainAckStoppedSessionRefreshesDurableSource(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	session := env.createSessionBead("worker", "worker")
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "worker",
+		namedSessionModeMetadata:     "always",
+	})
+	stale := env.sessionInfo(session.ID)
+	if err := sessionpkg.NewManagerWithOptions(env.store, env.sp).AcknowledgeDrain(session.ID); err != nil {
+		t.Fatalf("AcknowledgeDrain(%s): %v", session.ID, err)
+	}
+
+	finalizeDrainAckStoppedSession(
+		"", env.cfg, env.store, nil, stale, "worker", false,
+		&providerDrainOps{sp: env.sp}, env.dt, env.clk, env.rec, &env.stderr,
+	)
+
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", session.ID, err)
+	}
+	if heldUntil := got.Metadata["held_until"]; heldUntil == "" {
+		t.Fatal("held_until is empty; finalizer used stale drain-ack provenance")
 	}
 }
 

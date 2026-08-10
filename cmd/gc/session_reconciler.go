@@ -503,6 +503,15 @@ func finalizeDrainAckStoppedSession(
 	if store == nil || info.ID == "" {
 		return drainAckFinalizeResult{}
 	}
+	// The controller snapshot may predate the command that durably recorded the
+	// ack. Refresh the typed provenance immediately before the terminal decision;
+	// if it cannot be read authoritatively, defer finalization to the next tick.
+	latest, err := sessionFrontDoor(store).Get(info.ID)
+	if err != nil {
+		fmt.Fprintf(stderr, "session reconciler: refreshing drain-ack provenance for %s: %v\n", info.ID, err) //nolint:errcheck
+		return drainAckFinalizeResult{}
+	}
+	info.DrainAckSource = latest.DrainAckSource
 	// Every decision read comes off the typed Info; the whole-bead raw-by-design
 	// helpers (sessionHasOpenAssignedWorkForReachableStore,
 	// closeSessionBeadIfReachableStoreUnassigned, recordDrainAckAssignedWorkEvent)
@@ -1951,6 +1960,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							if cancelSessionDrainForAssignedWorkInfo(infoPostHeal, sp, dt) ||
 								cancelRecoveredDrainForAssignedWorkInfo(infoPostHeal, sp, name) {
 								_ = dops.clearDrain(name)
+								clearDurableDrainAcknowledgement(infoPostHeal, sessFront)
 								template := normalizedSessionTemplateInfo(infoPostHeal, cfg)
 								if template == "" {
 									template = infoPostHeal.Template
@@ -2250,9 +2260,11 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			if acked, _ := dops.isDrainAcked(name); acked {
 				if !alive && staleOrLegacyDrainAckBeforeStartInfo(infoByID[id], sp, name) {
 					_ = clearReconcilerDrainAckMetadata(sp, name)
+					clearDurableDrainAcknowledgement(infoByID[id], sessFront)
 				} else {
 					if staleReconcilerDrainAckInfo(infoByID[id], sp, name) {
 						_ = clearReconcilerDrainAckMetadata(sp, name)
+						clearDurableDrainAcknowledgement(infoByID[id], sessFront)
 						if trace != nil {
 							trace.RecordDecision(TraceSiteReconcilerDrainAck, TraceReasonStaleGeneration, TraceOutcomeClear, tp.TemplateName, name, nil)
 						}
@@ -2285,6 +2297,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						if alive && hasAssignedWork &&
 							(cancelSessionDrainForAssignedWorkInfo(infoByID[id], sp, dt) || cancelRecoveredDrainForAssignedWorkInfo(infoByID[id], sp, name)) {
 							_ = dops.clearDrain(name)
+							clearDurableDrainAcknowledgement(infoByID[id], sessFront)
 							if trace != nil {
 								trace.RecordDecision(TraceSiteDrainCancel, TraceReasonCode(ackReason), TraceOutcomeCancelAssignedWork, tp.TemplateName, name, nil)
 							}
@@ -2306,6 +2319,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							if !drainCancelled {
 								_ = clearReconcilerDrainAckMetadata(sp, name)
 							}
+							clearDurableDrainAcknowledgement(infoByID[id], sessFront)
 							if trace != nil {
 								trace.RecordDecision(TraceSiteReconcilerDrainAck, TraceReasonConfigDriftAttachmentError, TraceOutcomeCancelReconcilerAck, tp.TemplateName, name, traceRecordPayload{
 									"drain_canceled": drainCancelled,
@@ -2324,6 +2338,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							if !drainCancelled {
 								_ = clearReconcilerDrainAckMetadata(sp, name)
 							}
+							clearDurableDrainAcknowledgement(infoByID[id], sessFront)
 							if trace != nil {
 								trace.RecordDecision(TraceSiteReconcilerDrainAck, TraceReasonConfigDriftAttached, TraceOutcomeCancelReconcilerAck, tp.TemplateName, name, traceRecordPayload{
 									"drain_canceled": drainCancelled,
@@ -2336,6 +2351,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							if !drainCancelled {
 								_ = clearReconcilerDrainAckMetadata(sp, name)
 							}
+							clearDurableDrainAcknowledgement(infoByID[id], sessFront)
 							if trace != nil {
 								trace.RecordDecision(TraceSiteReconcilerDrainAck, TraceReasonConfigDriftRecentlyAttached, TraceOutcomeCancelReconcilerAck, tp.TemplateName, name, traceRecordPayload{
 									"drain_canceled": drainCancelled,
@@ -2346,6 +2362,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					}
 					if pendingInteractionKeepsAwakeInfo(infoByID[id], sp, name, clk) &&
 						(cancelReconcilerAckedDrainInfo(infoByID[id], sp, dt) || cancelRecoveredReconcilerAckedDrainInfo(infoByID[id], sp, name)) {
+						clearDurableDrainAcknowledgement(infoByID[id], sessFront)
 						if trace != nil {
 							trace.RecordDecision(TraceSiteReconcilerDrainAck, TraceReasonPending, TraceOutcomeCancelReconcilerAck, tp.TemplateName, name, nil)
 						}

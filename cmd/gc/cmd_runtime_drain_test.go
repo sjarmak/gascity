@@ -18,6 +18,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
@@ -524,12 +525,16 @@ func TestDoRuntimeUndrain(t *testing.T) {
 
 	rec := events.NewFake()
 	var stdout, stderr bytes.Buffer
-	code := doRuntimeUndrain(dops, sp, rec, "worker", "worker", false, &stdout, &stderr)
+	canceled := false
+	code := doRuntimeUndrain(dops, sp, func() error { canceled = true; return nil }, rec, "worker", "worker", false, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
 	if dops.draining["worker"] {
 		t.Error("drain flag still set after undrain")
+	}
+	if !canceled {
+		t.Error("durable drain acknowledgement was not canceled")
 	}
 	if got := stdout.String(); got != "Undrained session 'worker'\n" {
 		t.Errorf("stdout = %q, want %q", got, "Undrained session 'worker'\n")
@@ -544,7 +549,7 @@ func TestDoRuntimeUndrainNotRunning(t *testing.T) {
 	sp := runtime.NewFake()
 
 	var stdout, stderr bytes.Buffer
-	code := doRuntimeUndrain(dops, sp, events.Discard, "worker", "worker", false, &stdout, &stderr)
+	code := doRuntimeUndrain(dops, sp, nil, events.Discard, "worker", "worker", false, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("code = %d, want 1", code)
 	}
@@ -562,7 +567,7 @@ func TestDoRuntimeUndrainJSON(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doRuntimeUndrain(dops, sp, events.Discard, "worker", "worker", true, &stdout, &stderr)
+	code := doRuntimeUndrain(dops, sp, nil, events.Discard, "worker", "worker", true, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -855,7 +860,7 @@ func TestDoRuntimeDrainAckDurableFailureDoesNotSetRuntimeFlagOrPoke(t *testing.T
 
 func TestDoRuntimeDrainAckRuntimeFailureRollsBackDurableProvenance(t *testing.T) {
 	dops := newFakeDrainOps()
-	dops.err = errors.New("runtime metadata failed")
+	dops.onSetDrainAck = func() error { return errors.New("runtime metadata failed") }
 	persisted := false
 	rolledBack := false
 	var stdout, stderr bytes.Buffer
@@ -870,6 +875,32 @@ func TestDoRuntimeDrainAckRuntimeFailureRollsBackDurableProvenance(t *testing.T)
 	}
 	if !persisted || !rolledBack {
 		t.Fatalf("persisted=%v rolledBack=%v, want both true", persisted, rolledBack)
+	}
+}
+
+func TestDoRuntimeDrainAckPartialRuntimePublicationPreservesDurableProvenance(t *testing.T) {
+	sp := &recordingMetaProvider{
+		Fake:      runtime.NewFake(),
+		removeErr: errors.New("stale metadata cleanup failed"),
+	}
+	dops := newDrainOps(sp)
+	rolledBack := false
+	var stdout, stderr bytes.Buffer
+	code := doRuntimeDrainAck(
+		dops,
+		func() error { return nil },
+		func() error { rolledBack = true; return nil },
+		"/city/path", "worker", "worker", false, &stdout, &stderr,
+	)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	acked, err := dops.isDrainAcked("worker")
+	if err != nil || !acked {
+		t.Fatalf("runtime ack = %v, err=%v; want published ack", acked, err)
+	}
+	if rolledBack {
+		t.Fatal("durable provenance rolled back after runtime ack was published")
 	}
 }
 
@@ -1428,7 +1459,6 @@ func TestDrainAckNoArgsFallsBackToCityPathEnv(t *testing.T) {
 
 	cityDir := t.TempDir()
 	t.Setenv("GC_BEADS", "file")
-	t.Setenv("GC_DOLT", "skip")
 	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1436,11 +1466,12 @@ func TestDrainAckNoArgsFallsBackToCityPathEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openCityStoreAt: %v", err)
 	}
-	if _, err := store.Create(beads.Bead{
-		ID: "gc-42", Title: "mayor", Type: sessionpkg.BeadType, Status: "open",
+	session, err := store.Create(beads.Bead{
+		Title: "mayor", Type: sessionpkg.BeadType, Status: "open",
 		Labels:   []string{sessionpkg.LabelSession},
 		Metadata: map[string]string{"session_name": "s-gc-42", "state": "active"},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("Create(session): %v", err)
 	}
 
@@ -1448,7 +1479,6 @@ func TestDrainAckNoArgsFallsBackToCityPathEnv(t *testing.T) {
 	cmd := newRuntimeDrainAckCmd(&stdout, &stderr)
 	cmd.SilenceErrors = true
 	cmd.SilenceUsage = true
-	t.Setenv("GC_SESSION", "fake")
 	t.Setenv("GC_ALIAS", "mayor")
 	t.Setenv("GC_SESSION_ID", "gc-42")
 	t.Setenv("GC_SESSION_NAME", "s-gc-42")
@@ -1463,9 +1493,13 @@ func TestDrainAckNoArgsFallsBackToCityPathEnv(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Drain acknowledged") {
 		t.Fatalf("stdout = %q, want drain acknowledgement", stdout.String())
 	}
-	got, err := store.Get("gc-42")
+	verifiedStore, err := beads.OpenFileStore(fsys.OSFS{}, filepath.Join(cityDir, ".gc", "beads.json"))
 	if err != nil {
-		t.Fatalf("Get(gc-42): %v", err)
+		t.Fatalf("reopen city store: %v", err)
+	}
+	got, err := verifiedStore.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", session.ID, err)
 	}
 	if source := got.Metadata["drain_ack_source"]; source != "agent" {
 		t.Fatalf("drain_ack_source = %q, want agent", source)
