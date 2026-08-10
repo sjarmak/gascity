@@ -41,6 +41,10 @@ func TestAgentSliceWrapsNewSessionWithCommand(t *testing.T) {
 	if got != want {
 		t.Fatalf("pane command = %q, want %q", got, want)
 	}
+
+	t.Run("retries escaped placement", testAgentSliceRetriesEscapedNewSessionUntilPlaced)
+	t.Run("aborts persistent escape", testAgentSliceAbortsNewSessionWhenPlacementKeepsEscaping)
+	t.Run("parses cgroup paths", testCgroupContainsSlice)
 }
 
 func TestAgentSliceWrapsNewSessionWithCommandAndEnv(t *testing.T) {
@@ -90,9 +94,11 @@ func TestAgentSliceWrapsRespawnPane(t *testing.T) {
 	if got := args[len(args)-1]; got != want {
 		t.Fatalf("respawn-with-workdir command = %q, want %q", got, want)
 	}
+
+	t.Run("aborts persistent escape", testAgentSliceAbortsRespawnedPaneWhenPlacementKeepsEscaping)
 }
 
-func TestAgentSliceRetriesEscapedNewSessionUntilPlaced(t *testing.T) {
+func testAgentSliceRetriesEscapedNewSessionUntilPlaced(t *testing.T) {
 	t.Setenv(AgentSliceEnv, "gascity-agents.slice")
 	tm, exec := newSliceTestTmux(t)
 	checks := 0
@@ -127,7 +133,7 @@ func TestAgentSliceRetriesEscapedNewSessionUntilPlaced(t *testing.T) {
 	}
 }
 
-func TestAgentSliceAbortsNewSessionWhenPlacementKeepsEscaping(t *testing.T) {
+func testAgentSliceAbortsNewSessionWhenPlacementKeepsEscaping(t *testing.T) {
 	t.Setenv(AgentSliceEnv, "gascity-agents.slice")
 	tm, exec := newSliceTestTmux(t)
 	tm.agentSlicePlacement = func(string, string) error {
@@ -146,7 +152,7 @@ func TestAgentSliceAbortsNewSessionWhenPlacementKeepsEscaping(t *testing.T) {
 	}
 }
 
-func TestAgentSliceAbortsRespawnedPaneWhenPlacementKeepsEscaping(t *testing.T) {
+func testAgentSliceAbortsRespawnedPaneWhenPlacementKeepsEscaping(t *testing.T) {
 	t.Setenv(AgentSliceEnv, "gascity-agents.slice")
 	tm, exec := newSliceTestTmux(t)
 	tm.agentSlicePlacement = func(string, string) error {
@@ -162,7 +168,7 @@ func TestAgentSliceAbortsRespawnedPaneWhenPlacementKeepsEscaping(t *testing.T) {
 	}
 }
 
-func TestCgroupContainsSlice(t *testing.T) {
+func testCgroupContainsSlice(t *testing.T) {
 	tests := []struct {
 		name string
 		data string
