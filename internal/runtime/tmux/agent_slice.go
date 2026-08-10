@@ -29,9 +29,18 @@ import (
 // commands run unwrapped exactly as before.
 const AgentSliceEnv = "GC_AGENT_SLICE"
 
-// agentSlicePlacementAttempts bounds retries when tmux's own transient scope
-// wins the race with systemd-run. A pane that still escapes is terminated.
-const agentSlicePlacementAttempts = 3
+const (
+	// agentSlicePlacementAttempts bounds respawns when tmux's own transient
+	// scope wins the race with systemd-run. A pane that still escapes is
+	// terminated.
+	agentSlicePlacementAttempts = 3
+	// Placement must remain correct for 11 samples (500ms between the first
+	// and last) before it is accepted. The full 41-sample window gives PID
+	// startup and both asynchronous cgroup movers up to two seconds to settle.
+	agentSlicePlacementChecks       = 41
+	agentSlicePlacementStableChecks = 11
+	agentSlicePlacementInterval     = 50 * time.Millisecond
+)
 
 // agentSliceProbeTimeout bounds the one-time systemd-run availability probe.
 // Test-overridable.
@@ -182,6 +191,39 @@ func (t *Tmux) ensureAgentSlicePlacement(target, workDir, command, wrapped strin
 }
 
 func (t *Tmux) verifyAgentSlicePlacement(target, slice string) error {
+	sample := t.agentSlicePlacementSample
+	if sample == nil {
+		sample = t.sampleAgentSlicePlacement
+	}
+	wait := t.agentSlicePlacementWait
+	if wait == nil {
+		wait = time.Sleep
+	}
+
+	stableChecks := 0
+	var lastErr error
+	for check := 1; check <= agentSlicePlacementChecks; check++ {
+		if err := sample(target, slice); err != nil {
+			stableChecks = 0
+			lastErr = err
+		} else {
+			stableChecks++
+			if stableChecks == agentSlicePlacementStableChecks {
+				return nil
+			}
+		}
+		if check < agentSlicePlacementChecks {
+			wait(agentSlicePlacementInterval)
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("placement did not remain stable for the required observation window")
+	}
+	return fmt.Errorf("pane placement did not stabilize after %d checks: %w",
+		agentSlicePlacementChecks, lastErr)
+}
+
+func (t *Tmux) sampleAgentSlicePlacement(target, slice string) error {
 	pid, err := t.run("display-message", "-p", "-t", target, "#{pane_pid}")
 	if err != nil {
 		return fmt.Errorf("reading pane pid: %w", err)
