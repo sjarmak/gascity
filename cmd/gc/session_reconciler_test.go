@@ -702,8 +702,18 @@ func agentDrainAckAlwaysNamedSession(t *testing.T) (*reconcilerTestEnv, beads.Be
 	})
 
 	dops := &providerDrainOps{sp: env.sp}
+	mgr := sessionpkg.NewManagerWithOptions(env.store, env.sp)
+	if err := mgr.AcknowledgeDrain(session.ID); err != nil {
+		t.Fatalf("AcknowledgeDrain(%s): %v", session.ID, err)
+	}
 	if err := dops.setDrainAck(sessionName); err != nil {
 		t.Fatalf("setDrainAck(%s): %v", sessionName, err)
+	}
+	// Tmux-like metadata loss: the runtime provenance disappears before the
+	// reconciler observes the live session, while the durable session command
+	// above remains authoritative.
+	if err := env.sp.RemoveMeta(sessionName, reconcilerDrainAckSourceKey); err != nil {
+		t.Fatalf("RemoveMeta(%s): %v", reconcilerDrainAckSourceKey, err)
 	}
 	if woken := env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{session}, nil, dops); woken != 0 {
 		t.Fatalf("woken while beginning drain-ack stop = %d, want 0", woken)
@@ -828,10 +838,8 @@ func TestReconcileSessionBeads_ExplicitWakeClearsAgentDrainAckCooldown(t *testin
 }
 
 // TestReconcileSessionBeads_AgentDrainAckPersistsDurableSource proves the
-// provenance is captured on the bead at the stop-pending transition — while the
-// runtime is still alive — so it outlives the runtime the finalizer never gets to
-// read. Without the durable capture the bead field is empty and the cooldown can
-// only ever come from the (soon-dead) tmux env.
+// provenance is captured by the acknowledge command before runtime metadata can
+// disappear, and remains intact through the stop-pending transition.
 func TestReconcileSessionBeads_AgentDrainAckPersistsDurableSource(t *testing.T) {
 	_, drained, _ := agentDrainAckAlwaysNamedSession(t)
 	if got := drained.Metadata[sessionpkg.DrainAckSourceMetadataKey]; got != sessionpkg.DrainAckSourceAgent {
@@ -842,7 +850,7 @@ func TestReconcileSessionBeads_AgentDrainAckPersistsDurableSource(t *testing.T) 
 // TestFinalizeDrainAckStoppedSession_StampsCooldownFromDurableSourceAfterRuntimeGone
 // is the #4824 regression. GC_DRAIN_ACK_SOURCE lives in the tmux env, which dies
 // with the session, so by the time finalize runs the runtime metadata is GONE.
-// finalize must read the durable bead field captured at stop-pending, not the
+// finalize must read the durable bead field captured at acknowledge time, not the
 // runtime — otherwise a session-gone read is conflated with "not agent-sourced",
 // held_until never stamps, and the always-on respawn loop persists. Here the
 // runtime carries no source at all (tmux-death simulation) yet the cooldown still

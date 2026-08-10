@@ -130,6 +130,14 @@ func (s *Store) BeginDrainAckStopPending(id string, now time.Time) error {
 	return s.ApplyPatch(id, DrainAckStopPendingPatch(now))
 }
 
+// BeginDrainAckStopPendingInfo moves a drain-acked session into durable
+// stop-pending state and returns the locally folded projection. Existing
+// drain-ack provenance is preserved because it was committed by the agent's
+// acknowledge command before runtime metadata could disappear.
+func (s *Store) BeginDrainAckStopPendingInfo(info Info, now time.Time) (Info, error) {
+	return s.ApplyPatchInfo(info, DrainAckStopPendingPatch(now))
+}
+
 // RequestRestart records a controller handoff to a fresh provider conversation
 // via RestartRequestPatch. Replaces the restart-request write in session_reconciler.go.
 func (s *Store) RequestRestart(id, sessionKey string, now time.Time) error {

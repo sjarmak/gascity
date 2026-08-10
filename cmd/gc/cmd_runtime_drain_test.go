@@ -19,6 +19,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 // drainOpsWithCountdown wraps fakeDrainOps and returns false for isRestartRequested
@@ -59,6 +60,7 @@ type fakeDrainOps struct {
 	restartRequested map[string]bool
 	driftRestart     map[string]bool
 	err              error // injected error for all ops
+	onSetDrainAck    func() error
 	restartReadErr   error
 	setDrainCalls    []string
 	clearDrainCalls  []string
@@ -339,6 +341,11 @@ func (f *fakeDrainOps) drainStartTime(sessionName string) (time.Time, error) {
 func (f *fakeDrainOps) setDrainAck(sessionName string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.onSetDrainAck != nil {
+		if err := f.onSetDrainAck(); err != nil {
+			return err
+		}
+	}
 	if f.err != nil {
 		return f.err
 	}
@@ -666,7 +673,7 @@ func TestDoRuntimeDrainAck(t *testing.T) {
 
 	dops := newFakeDrainOps()
 	var stdout, stderr bytes.Buffer
-	code := doRuntimeDrainAck(dops, "", "worker", "worker", false, &stdout, &stderr)
+	code := doRuntimeDrainAck(dops, nil, nil, "", "worker", "worker", false, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -682,7 +689,7 @@ func TestDoRuntimeDrainAckError(t *testing.T) {
 	dops := newFakeDrainOps()
 	dops.err = errors.New("tmux borked")
 	var stdout, stderr bytes.Buffer
-	code := doRuntimeDrainAck(dops, "", "worker", "worker", false, &stdout, &stderr)
+	code := doRuntimeDrainAck(dops, nil, nil, "", "worker", "worker", false, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("code = %d, want 1", code)
 	}
@@ -708,7 +715,7 @@ func TestDoRuntimeDrainAckJSON(t *testing.T) {
 
 	dops := newFakeDrainOps()
 	var stdout, stderr bytes.Buffer
-	code := doRuntimeDrainAck(dops, "", "worker", "worker", true, &stdout, &stderr)
+	code := doRuntimeDrainAck(dops, nil, nil, "", "worker", "worker", true, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -739,7 +746,7 @@ func TestDoRuntimeDrainAckPokesController(t *testing.T) {
 	// of the three adjacent string params in the new signature.
 	dops := newFakeDrainOps()
 	var stdout, stderr bytes.Buffer
-	code := doRuntimeDrainAck(dops, "/city/path", "display-name", "session-name", false, &stdout, &stderr)
+	code := doRuntimeDrainAck(dops, nil, nil, "/city/path", "display-name", "session-name", false, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -766,7 +773,7 @@ func TestDoRuntimeDrainAckErrorDoesNotPoke(t *testing.T) {
 	dops := newFakeDrainOps()
 	dops.err = errors.New("tmux borked")
 	var stdout, stderr bytes.Buffer
-	code := doRuntimeDrainAck(dops, "/city/path", "worker", "worker", false, &stdout, &stderr)
+	code := doRuntimeDrainAck(dops, nil, nil, "/city/path", "worker", "worker", false, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("code = %d, want 1", code)
 	}
@@ -782,7 +789,7 @@ func TestDoRuntimeDrainAckPokeFailureWarns(t *testing.T) {
 
 	dops := newFakeDrainOps()
 	var stdout, stderr bytes.Buffer
-	code := doRuntimeDrainAck(dops, "/city/path", "worker", "worker", false, &stdout, &stderr)
+	code := doRuntimeDrainAck(dops, nil, nil, "/city/path", "worker", "worker", false, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0 (poke failure is best-effort)", code)
 	}
@@ -791,6 +798,78 @@ func TestDoRuntimeDrainAckPokeFailureWarns(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "Drain acknowledged.") {
 		t.Errorf("stdout = %q, want it to contain %q", stdout.String(), "Drain acknowledged.")
+	}
+}
+
+func TestDoRuntimeDrainAckPersistsBeforeRuntimeFlag(t *testing.T) {
+	old := drainAckPokeController
+	drainAckPokeController = func(string) error { return nil }
+	t.Cleanup(func() { drainAckPokeController = old })
+
+	persisted := false
+	dops := newFakeDrainOps()
+	dops.onSetDrainAck = func() error {
+		if !persisted {
+			return errors.New("runtime ack set before durable provenance")
+		}
+		return nil
+	}
+	var stdout, stderr bytes.Buffer
+	code := doRuntimeDrainAck(dops, func() error {
+		persisted = true
+		return nil
+	}, nil, "/city/path", "worker", "worker", false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !dops.acked["worker"] {
+		t.Fatal("runtime drain-ack flag was not set")
+	}
+}
+
+func TestDoRuntimeDrainAckDurableFailureDoesNotSetRuntimeFlagOrPoke(t *testing.T) {
+	calls := 0
+	old := drainAckPokeController
+	drainAckPokeController = func(string) error {
+		calls++
+		return nil
+	}
+	t.Cleanup(func() { drainAckPokeController = old })
+
+	dops := newFakeDrainOps()
+	var stdout, stderr bytes.Buffer
+	code := doRuntimeDrainAck(dops, func() error { return errors.New("store unavailable") }, nil, "/city/path", "worker", "worker", false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	if dops.acked["worker"] {
+		t.Fatal("runtime drain-ack flag set after durable provenance failed")
+	}
+	if calls != 0 {
+		t.Fatalf("poke called %d times, want 0", calls)
+	}
+	if got := stderr.String(); got != "gc runtime drain-ack: recording durable provenance: store unavailable\n" {
+		t.Fatalf("stderr = %q", got)
+	}
+}
+
+func TestDoRuntimeDrainAckRuntimeFailureRollsBackDurableProvenance(t *testing.T) {
+	dops := newFakeDrainOps()
+	dops.err = errors.New("runtime metadata failed")
+	persisted := false
+	rolledBack := false
+	var stdout, stderr bytes.Buffer
+	code := doRuntimeDrainAck(
+		dops,
+		func() error { persisted = true; return nil },
+		func() error { rolledBack = true; return nil },
+		"/city/path", "worker", "worker", false, &stdout, &stderr,
+	)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	if !persisted || !rolledBack {
+		t.Fatalf("persisted=%v rolledBack=%v, want both true", persisted, rolledBack)
 	}
 }
 
@@ -1348,8 +1427,21 @@ func TestDrainAckNoArgsFallsBackToCityPathEnv(t *testing.T) {
 	t.Cleanup(func() { drainAckPokeController = old })
 
 	cityDir := t.TempDir()
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_DOLT", "skip")
 	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
+	}
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		ID: "gc-42", Title: "mayor", Type: sessionpkg.BeadType, Status: "open",
+		Labels:   []string{sessionpkg.LabelSession},
+		Metadata: map[string]string{"session_name": "s-gc-42", "state": "active"},
+	}); err != nil {
+		t.Fatalf("Create(session): %v", err)
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -1364,12 +1456,19 @@ func TestDrainAckNoArgsFallsBackToCityPathEnv(t *testing.T) {
 	t.Setenv("GC_CITY_PATH", cityDir)
 
 	cmd.SetArgs([]string{})
-	err := cmd.Execute()
+	err = cmd.Execute()
 	if err != nil {
 		t.Fatalf("drain-ack should succeed with GC_CITY_PATH fallback: %v; stderr=%q", err, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "Drain acknowledged") {
 		t.Fatalf("stdout = %q, want drain acknowledgement", stdout.String())
+	}
+	got, err := store.Get("gc-42")
+	if err != nil {
+		t.Fatalf("Get(gc-42): %v", err)
+	}
+	if source := got.Metadata["drain_ack_source"]; source != "agent" {
+		t.Fatalf("drain_ack_source = %q, want agent", source)
 	}
 }
 

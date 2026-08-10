@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
@@ -466,33 +467,54 @@ current work in response to a drain signal.`,
 }
 
 func cmdRuntimeDrainAck(args []string, jsonOutput bool, stdout, stderr io.Writer) int {
+	var target sessionRuntimeTarget
+	var err error
 	if len(args) > 0 {
-		target, err := resolveSessionRuntimeTarget(args[0], stderr)
+		target, err = resolveSessionRuntimeTarget(args[0], stderr)
 		if err != nil {
 			fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		sp, err := newSessionProvider()
+	} else {
+		target, err = currentSessionRuntimeTarget()
 		if err != nil {
 			fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		dops := newDrainOps(sp)
-		return doRuntimeDrainAck(dops, target.cityPath, target.display, target.sessionName, jsonOutput, stdout, stderr)
-	}
-
-	current, err := currentSessionRuntimeTarget()
-	if err != nil {
-		fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
-		return 1
 	}
 	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	persistAck, rollbackAck, err := runtimeDrainAckPersistence(target, sp)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	dops := newDrainOps(sp)
-	return doRuntimeDrainAck(dops, current.cityPath, current.display, current.sessionName, jsonOutput, stdout, stderr)
+	return doRuntimeDrainAck(dops, persistAck, rollbackAck, target.cityPath, target.display, target.sessionName, jsonOutput, stdout, stderr)
+}
+
+func runtimeDrainAckPersistence(target sessionRuntimeTarget, sp runtime.Provider) (func() error, func() error, error) {
+	store, err := openCityStoreAt(target.cityPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening store: %w", err)
+	}
+	cfg, cfgErr := loadCityConfigWithoutBuiltinPackRefresh(target.cityPath, io.Discard)
+	if cfgErr != nil && !errors.Is(cfgErr, os.ErrNotExist) {
+		return nil, nil, fmt.Errorf("loading config: %w", cfgErr)
+	}
+	sessStore := cliSessionStore(store, cfg, target.cityPath)
+	handle, err := workerHandleForSessionTargetWithConfig(target.cityPath, sessStore, sp, cfg, target.sessionName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolving session: %w", err)
+	}
+	return func() error {
+			return handle.AcknowledgeDrain(context.Background())
+		}, func() error {
+			return handle.CancelDrainAcknowledgement(context.Background())
+		}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -665,8 +687,19 @@ var drainAckPokeController = pokeController
 // doRuntimeDrainAck sets the drain-ack flag on the session, then pokes the
 // controller so the reconciler observes the drained state immediately instead
 // of waiting for its next patrol tick.
-func doRuntimeDrainAck(dops drainOps, cityPath, targetName, sn string, jsonOutput bool, stdout, stderr io.Writer) int {
+func doRuntimeDrainAck(dops drainOps, persistAck, rollbackAck func() error, cityPath, targetName, sn string, jsonOutput bool, stdout, stderr io.Writer) int {
+	if persistAck != nil {
+		if err := persistAck(); err != nil {
+			fmt.Fprintf(stderr, "gc runtime drain-ack: recording durable provenance: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+	}
 	if err := dops.setDrainAck(sn); err != nil {
+		if rollbackAck != nil {
+			if rollbackErr := rollbackAck(); rollbackErr != nil {
+				err = errors.Join(err, fmt.Errorf("rolling back durable provenance: %w", rollbackErr))
+			}
+		}
 		fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}

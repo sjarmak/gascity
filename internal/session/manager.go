@@ -434,8 +434,8 @@ type Info struct {
 	// reflects the in-memory value; Step 6 handles the Get-cutover intra-tick carrier.
 	RestartRequested string // restart_requested (raw)
 	// DrainAckSource is the RAW drain_ack_source metadata: the durable provenance
-	// of a drain-ack, captured on the bead while the runtime is still alive (at the
-	// stop-pending transition). The drain-ack finalizer reads it AFTER the runtime
+	// of a drain-ack, captured by the acknowledge command before it publishes the
+	// runtime flag. The drain-ack finalizer reads it AFTER the runtime
 	// has stopped, when the tmux env that once held GC_DRAIN_ACK_SOURCE is gone, so
 	// the cooldown decision cannot depend on the provider. Trimmed == "agent" marks
 	// an agent-initiated drain-ack.
@@ -1291,6 +1291,35 @@ func (m *Manager) RequestFreshRestart(id string) error {
 			"restart_requested":          "true",
 			"continuation_reset_pending": "true",
 		})
+	})
+}
+
+// AcknowledgeDrain records agent-initiated drain provenance before the runtime
+// publishes its drain-ack flag. The durable marker survives runtime teardown so
+// the reconciler can apply the named-session cooldown after confirming death.
+func (m *Manager) AcknowledgeDrain(id string) error {
+	return withSessionMutationLock(id, func() error {
+		if _, _, err := m.sessionBead(id); err != nil {
+			return err
+		}
+		if err := m.store.SetMetadata(id, DrainAckSourceMetadataKey, DrainAckSourceAgent); err != nil {
+			return fmt.Errorf("recording drain-ack provenance for session %s: %w", id, err)
+		}
+		return nil
+	})
+}
+
+// CancelDrainAcknowledgement clears durable drain provenance after publishing
+// the runtime ack flag fails.
+func (m *Manager) CancelDrainAcknowledgement(id string) error {
+	return withSessionMutationLock(id, func() error {
+		if _, _, err := m.sessionBead(id); err != nil {
+			return err
+		}
+		if err := m.store.SetMetadata(id, DrainAckSourceMetadataKey, ""); err != nil {
+			return fmt.Errorf("clearing drain-ack provenance for session %s: %w", id, err)
+		}
+		return nil
 	})
 }
 

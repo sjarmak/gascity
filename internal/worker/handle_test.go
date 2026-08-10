@@ -104,6 +104,27 @@ func TestSessionHandleStartStopState(t *testing.T) {
 	}
 }
 
+func TestSessionHandleAcknowledgeDrainUsesSessionCommand(t *testing.T) {
+	handle, store, _, _ := newTestSessionHandle(t, SessionSpec{
+		Profile: ProfileClaudeTmuxCLI, Template: "probe", Title: "Probe", Command: "claude",
+		WorkDir: t.TempDir(), Provider: "claude",
+	})
+	if err := handle.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := handle.AcknowledgeDrain(context.Background()); err != nil {
+		t.Fatalf("AcknowledgeDrain: %v", err)
+	}
+
+	got, err := store.Get(handle.sessionID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", handle.sessionID, err)
+	}
+	if source := got.Metadata[sessionpkg.DrainAckSourceMetadataKey]; source != sessionpkg.DrainAckSourceAgent {
+		t.Fatalf("%s = %q, want %q", sessionpkg.DrainAckSourceMetadataKey, source, sessionpkg.DrainAckSourceAgent)
+	}
+}
+
 func TestSessionHandleStateBusyDoesNotPrimeHistoryCache(t *testing.T) {
 	searchBase := t.TempDir()
 	workDir := t.TempDir()

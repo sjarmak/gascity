@@ -402,14 +402,12 @@ func BeginDrainPatch(now time.Time, reason string) MetadataPatch {
 const DrainAckStopPendingReason = "drain-ack-stop-pending"
 
 // DrainAckSourceMetadataKey is the durable bead field recording who initiated a
-// drain-ack. It is captured at the stop-pending transition (while the runtime is
-// still alive) so the finalizer can read the provenance after the runtime — and
-// the tmux env that held GC_DRAIN_ACK_SOURCE — is gone.
+// drain-ack. The acknowledge command writes it before publishing the runtime
+// flag so the finalizer can read the provenance after the runtime is gone.
 const DrainAckSourceMetadataKey = "drain_ack_source"
 
 // DrainAckSourceAgent is the DrainAckSourceMetadataKey value for an
-// agent-initiated drain-ack (gc runtime drain-ack). It mirrors the runtime-side
-// GC_DRAIN_ACK_SOURCE=agent value so the durable and live representations agree.
+// agent-initiated drain-ack (gc runtime drain-ack).
 const DrainAckSourceAgent = "agent"
 
 // DrainAckStopPendingPatch records that a drain-acked session has moved into

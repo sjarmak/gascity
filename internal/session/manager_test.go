@@ -371,6 +371,40 @@ func TestCreate(t *testing.T) {
 	}
 }
 
+func TestAcknowledgeDrainPersistsAgentProvenance(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{
+		Template: "helper", Title: "my chat", Command: "claude", WorkDir: t.TempDir(), Provider: "claude",
+	})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := mgr.AcknowledgeDrain(info.ID); err != nil {
+		t.Fatalf("AcknowledgeDrain: %v", err)
+	}
+
+	got, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", info.ID, err)
+	}
+	if source := got.Metadata[DrainAckSourceMetadataKey]; source != DrainAckSourceAgent {
+		t.Fatalf("%s = %q, want %q", DrainAckSourceMetadataKey, source, DrainAckSourceAgent)
+	}
+	if err := mgr.CancelDrainAcknowledgement(info.ID); err != nil {
+		t.Fatalf("CancelDrainAcknowledgement: %v", err)
+	}
+	got, err = store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get(%s) after cancel: %v", info.ID, err)
+	}
+	if source := got.Metadata[DrainAckSourceMetadataKey]; source != "" {
+		t.Fatalf("%s after cancel = %q, want empty", DrainAckSourceMetadataKey, source)
+	}
+}
+
 // TestRetireConfiguredNamedSessionIdentifiersFreesCanonicalIdentity pins that the
 // Manager.Close named-session retirement path frees the durable canonical-identity
 // record (canonical_instance_name / canonical_pool_slot) alongside the legacy

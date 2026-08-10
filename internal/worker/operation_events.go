@@ -23,6 +23,7 @@ const (
 	workerOperationAttach        workerOperation = "attach"
 	workerOperationCreate        workerOperation = "create"
 	workerOperationReset         workerOperation = "reset"
+	workerOperationDrainAck      workerOperation = "drain_ack"
 	workerOperationStop          workerOperation = "stop"
 	workerOperationKill          workerOperation = "kill"
 	workerOperationClose         workerOperation = "close"
