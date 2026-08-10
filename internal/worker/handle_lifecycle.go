@@ -113,22 +113,21 @@ func (h *SessionHandle) Reset(ctx context.Context) (err error) {
 }
 
 // AcknowledgeDrain persists agent-initiated drain provenance for the worker.
-func (h *SessionHandle) AcknowledgeDrain(ctx context.Context) (err error) {
+func (h *SessionHandle) AcknowledgeDrain(ctx context.Context) (token string, err error) {
 	event := h.beginOperationEvent(ctx, workerOperationDrainAck)
 	defer func() { event.finish(err) }()
 
 	id := h.currentSessionID()
 	if id == "" {
 		err = fmt.Errorf("%w: drain acknowledgement requires a bead-backed session", ErrOperationUnsupported)
-		return err
+		return "", err
 	}
-	err = h.manager.AcknowledgeDrain(id)
-	return err
+	return h.manager.AcknowledgeDrain(id)
 }
 
 // CancelDrainAcknowledgement clears provenance when the runtime ack publish
 // fails after the durable command commits.
-func (h *SessionHandle) CancelDrainAcknowledgement(ctx context.Context) (err error) {
+func (h *SessionHandle) CancelDrainAcknowledgement(ctx context.Context, token string) (err error) {
 	event := h.beginOperationEvent(ctx, workerOperationDrainAck)
 	defer func() { event.finish(err) }()
 
@@ -137,7 +136,7 @@ func (h *SessionHandle) CancelDrainAcknowledgement(ctx context.Context) (err err
 		err = fmt.Errorf("%w: drain acknowledgement requires a bead-backed session", ErrOperationUnsupported)
 		return err
 	}
-	err = h.manager.CancelDrainAcknowledgement(id)
+	err = h.manager.CancelDrainAcknowledgement(id, token)
 	return err
 }
 

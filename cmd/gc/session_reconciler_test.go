@@ -703,7 +703,7 @@ func agentDrainAckAlwaysNamedSession(t *testing.T) (*reconcilerTestEnv, beads.Be
 
 	dops := &providerDrainOps{sp: env.sp}
 	mgr := sessionpkg.NewManagerWithOptions(env.store, env.sp)
-	if err := mgr.AcknowledgeDrain(session.ID); err != nil {
+	if _, err := mgr.AcknowledgeDrain(session.ID); err != nil {
 		t.Fatalf("AcknowledgeDrain(%s): %v", session.ID, err)
 	}
 	if err := dops.setDrainAck(sessionName); err != nil {
@@ -856,7 +856,7 @@ func TestFinalizeDrainAckStoppedSessionRefreshesDurableSource(t *testing.T) {
 		namedSessionModeMetadata:     "always",
 	})
 	stale := env.sessionInfo(session.ID)
-	if err := sessionpkg.NewManagerWithOptions(env.store, env.sp).AcknowledgeDrain(session.ID); err != nil {
+	if _, err := sessionpkg.NewManagerWithOptions(env.store, env.sp).AcknowledgeDrain(session.ID); err != nil {
 		t.Fatalf("AcknowledgeDrain(%s): %v", session.ID, err)
 	}
 
@@ -871,6 +871,36 @@ func TestFinalizeDrainAckStoppedSessionRefreshesDurableSource(t *testing.T) {
 	}
 	if heldUntil := got.Metadata["held_until"]; heldUntil == "" {
 		t.Fatal("held_until is empty; finalizer used stale drain-ack provenance")
+	}
+}
+
+func TestFinalizeDrainAckStoppedSessionBypassesStaleControllerCache(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	b := env.createSessionBead("worker", "worker")
+	env.setSessionMetadata(&b, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "worker",
+		namedSessionModeMetadata:     "always",
+	})
+	cache := beads.NewCachingStoreForTest(env.store, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := sessionFrontDoor(cache).Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessionpkg.NewManagerWithOptions(env.store, env.sp).AcknowledgeDrain(b.ID); err != nil {
+		t.Fatal(err)
+	}
+	finalizeDrainAckStoppedSession("", env.cfg, cache, nil, stale, "worker", false, newFakeDrainOps(), env.dt, env.clk, env.rec, &env.stderr)
+	got, err := env.store.Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata["held_until"] == "" {
+		t.Fatalf("held_until missing; finalizer read stale cache: metadata=%v", got.Metadata)
 	}
 }
 

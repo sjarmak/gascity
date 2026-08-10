@@ -189,6 +189,7 @@ var infoKeyCodec = []infoKeySpec{
 	{"wake_request", func(i *Info, v string) { i.WakeRequest = v }},
 	{"restart_requested", func(i *Info, v string) { i.RestartRequested = v }},
 	{DrainAckSourceMetadataKey, func(i *Info, v string) { i.DrainAckSource = v }},
+	{DrainAckTokenMetadataKey, func(i *Info, v string) { i.DrainAckToken = v }},
 	{"session_id_flag", func(i *Info, v string) { i.SessionIDFlag = v }},
 	{"template_overrides", func(i *Info, v string) { i.TemplateOverrides = v }},
 	{"provider_kind", func(i *Info, v string) { i.ProviderKind = v }},

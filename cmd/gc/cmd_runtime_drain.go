@@ -15,6 +15,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/spf13/cobra"
 )
 
@@ -521,10 +522,23 @@ func runtimeDrainAckPersistence(target sessionRuntimeTarget, sp runtime.Provider
 	if err != nil {
 		return nil, nil, fmt.Errorf("resolving session: %w", err)
 	}
+	id, err := session.ResolveSessionID(sessStore, target.sessionName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolving durable session: %w", err)
+	}
+	info, err := sessionFrontDoor(sessStore).GetLive(id)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading durable drain acknowledgement: %w", err)
+	}
+	ackToken := info.DrainAckToken
 	return func() error {
-			return handle.AcknowledgeDrain(context.Background())
+			token, err := handle.AcknowledgeDrain(context.Background())
+			if err == nil {
+				ackToken = token
+			}
+			return err
 		}, func() error {
-			return handle.CancelDrainAcknowledgement(context.Background())
+			return handle.CancelDrainAcknowledgement(context.Background(), ackToken)
 		}, nil
 }
 
@@ -698,6 +712,7 @@ var drainAckPokeController = pokeController
 // doRuntimeDrainAck sets the drain-ack flag on the session, then pokes the
 // controller so the reconciler observes the drained state immediately instead
 // of waiting for its next patrol tick.
+
 func doRuntimeDrainAck(dops drainOps, persistAck, rollbackAck func() error, cityPath, targetName, sn string, jsonOutput bool, stdout, stderr io.Writer) int {
 	if persistAck != nil {
 		if err := persistAck(); err != nil {

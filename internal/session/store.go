@@ -140,8 +140,29 @@ func (s *Store) BeginDrainAckStopPendingInfo(info Info, now time.Time) (Info, er
 
 // CancelDrainAcknowledgement clears durable agent provenance when a drain ack
 // is canceled before finalization.
-func (s *Store) CancelDrainAcknowledgement(id string) error {
-	return s.ApplyPatch(id, MetadataPatch{DrainAckSourceMetadataKey: ""})
+func (s *Store) CancelDrainAcknowledgement(id, token string) (bool, error) {
+	for attempts := 0; attempts < 4; attempts++ {
+		current, err := beads.HandlesFor(s.store).Live.Get(id)
+		if err != nil {
+			return false, err
+		}
+		if current.Metadata[DrainAckTokenMetadataKey] != token {
+			return false, nil
+		}
+		writer, ok := beads.ConditionalWriterFor(s.store.Store)
+		if !ok {
+			return false, beads.ErrConditionalWriteUnsupported
+		}
+		err = writer.UpdateIfMatch(id, current.Revision, beads.UpdateOpts{Metadata: map[string]string{
+			DrainAckSourceMetadataKey: "",
+			DrainAckTokenMetadataKey:  "",
+		}})
+		if beads.IsPreconditionFailed(err) {
+			continue
+		}
+		return err == nil, err
+	}
+	return false, fmt.Errorf("canceling drain acknowledgement for %s: concurrent updates did not settle", id)
 }
 
 // RequestRestart records a controller handoff to a fresh provider conversation

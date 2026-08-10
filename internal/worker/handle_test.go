@@ -112,7 +112,8 @@ func TestSessionHandleAcknowledgeDrainUsesSessionCommand(t *testing.T) {
 	if err := handle.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if err := handle.AcknowledgeDrain(context.Background()); err != nil {
+	token, err := handle.AcknowledgeDrain(context.Background())
+	if err != nil {
 		t.Fatalf("AcknowledgeDrain: %v", err)
 	}
 
@@ -122,6 +123,9 @@ func TestSessionHandleAcknowledgeDrainUsesSessionCommand(t *testing.T) {
 	}
 	if source := got.Metadata[sessionpkg.DrainAckSourceMetadataKey]; source != sessionpkg.DrainAckSourceAgent {
 		t.Fatalf("%s = %q, want %q", sessionpkg.DrainAckSourceMetadataKey, source, sessionpkg.DrainAckSourceAgent)
+	}
+	if token == "" || got.Metadata[sessionpkg.DrainAckTokenMetadataKey] != token {
+		t.Fatalf("drain ack token = %q, returned %q", got.Metadata[sessionpkg.DrainAckTokenMetadataKey], token)
 	}
 }
 

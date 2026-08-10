@@ -256,12 +256,26 @@ func clearReconcilerDrainAckMetadata(sp runtime.Provider, name string) error {
 	return errors.Join(errs...)
 }
 
-func clearDurableDrainAcknowledgement(info sessions.Info, sessFront *sessions.Store) {
+func clearDurableDrainAcknowledgement(info sessions.Info, sessFront *sessions.Store, dt *drainTracker) bool {
 	if sessFront == nil || strings.TrimSpace(info.ID) == "" {
+		return false
+	}
+	_, err := sessFront.CancelDrainAcknowledgement(info.ID, info.DrainAckToken)
+	if err != nil {
+		log.Printf("session wake: clearing durable drain acknowledgement for %s: %v", info.ID, err)
+		dt.rememberDurableAckClear(info.ID, info.DrainAckToken)
+		return false
+	}
+	dt.forgetDurableAckClear(info.ID)
+	return true
+}
+
+func retryDurableDrainAcknowledgementClears(sessFront *sessions.Store, dt *drainTracker) {
+	if sessFront == nil || dt == nil {
 		return
 	}
-	if err := sessFront.CancelDrainAcknowledgement(info.ID); err != nil {
-		log.Printf("session wake: clearing durable drain acknowledgement for %s: %v", info.ID, err)
+	for id, token := range dt.durableAckClearSnapshot() {
+		clearDurableDrainAcknowledgement(sessions.Info{ID: id, DrainAckToken: token}, sessFront, dt)
 	}
 }
 
@@ -517,6 +531,7 @@ func advanceSessionDrainsWithSessionsTraced(
 	// Session front door constructed once from the same store; nil when store is
 	// nil so completeDrain keeps its store==nil short-circuit.
 	sessFront := sessionFrontDoor(store)
+	retryDurableDrainAcknowledgementClears(sessFront, dt)
 	if store == nil {
 		sessFront = nil
 	}
@@ -541,7 +556,7 @@ func advanceSessionDrainsWithSessionsTraced(
 				_ = clearReconcilerDrainAckMetadata(sp, name)
 			}
 			dt.remove(id)
-			clearDurableDrainAcknowledgement(info, sessFront)
+			clearDurableDrainAcknowledgement(info, sessFront, dt)
 			if trace != nil {
 				trace.RecordDecision(TraceSiteDrainStale, TraceReasonStaleGeneration, TraceOutcomeCancel, normalizedSessionTemplateInfo(info, cfg), name, traceRecordPayload{
 					"drain_reason":       ds.reason,
@@ -575,7 +590,7 @@ func advanceSessionDrainsWithSessionsTraced(
 			containsWakeReason(eval.Reasons, WakePending) &&
 			pendingDrainReasonCancelable(ds.reason) {
 			if cancelSessionDrainForPendingInfo(info, sp, dt) {
-				clearDurableDrainAcknowledgement(info, sessFront)
+				clearDurableDrainAcknowledgement(info, sessFront, dt)
 				if trace != nil {
 					trace.RecordDecision(TraceSiteDrainCancel, TraceReasonCode(ds.reason), TraceOutcomeCancelPending, normalizedSessionTemplateInfo(info, cfg), name, nil)
 				}
@@ -588,7 +603,7 @@ func advanceSessionDrainsWithSessionsTraced(
 			containsWakeReason(eval.Reasons, WakeWork) &&
 			assignedWorkDrainReasonCancelable(ds.reason) {
 			if cancelSessionDrainForAssignedWorkInfo(info, sp, dt) {
-				clearDurableDrainAcknowledgement(info, sessFront)
+				clearDurableDrainAcknowledgement(info, sessFront, dt)
 				if trace != nil {
 					trace.RecordDecision(TraceSiteDrainCancel, TraceReasonCode(ds.reason), TraceOutcomeCancelAssignedWork, normalizedSessionTemplateInfo(info, cfg), name, nil)
 				}
@@ -608,7 +623,7 @@ func advanceSessionDrainsWithSessionsTraced(
 					_ = clearReconcilerDrainAckMetadata(sp, name)
 				}
 				dt.remove(id)
-				clearDurableDrainAcknowledgement(info, sessFront)
+				clearDurableDrainAcknowledgement(info, sessFront, dt)
 				if trace != nil {
 					trace.RecordDecision(TraceSiteDrainCancel, TraceReasonCode(ds.reason), TraceOutcomeCancel, normalizedSessionTemplateInfo(info, cfg), name, nil)
 				}

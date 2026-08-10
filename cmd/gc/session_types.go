@@ -75,6 +75,7 @@ type drainTracker struct {
 	idleProbes       map[string]*idleProbeState // session bead ID -> async idle probe
 	resetStalls      map[string]bool            // session bead ID -> reset stall event emitted
 	suspendDeferrals map[string]int             // session bead ID -> consecutive ticks a named session has been suspend-drain-eligible with its spec absent (#3630)
+	durableAckClears map[string]string          // session bead ID -> acknowledgement token whose failed clear must retry
 	idleProbeCursor  int
 }
 
@@ -84,7 +85,39 @@ func newDrainTracker() *drainTracker {
 		idleProbes:       make(map[string]*idleProbeState),
 		resetStalls:      make(map[string]bool),
 		suspendDeferrals: make(map[string]int),
+		durableAckClears: make(map[string]string),
 	}
+}
+
+func (dt *drainTracker) rememberDurableAckClear(id, token string) {
+	if dt == nil || strings.TrimSpace(id) == "" {
+		return
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	dt.durableAckClears[id] = token
+}
+
+func (dt *drainTracker) forgetDurableAckClear(id string) {
+	if dt == nil {
+		return
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	delete(dt.durableAckClears, id)
+}
+
+func (dt *drainTracker) durableAckClearSnapshot() map[string]string {
+	out := make(map[string]string)
+	if dt == nil {
+		return out
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	for id, token := range dt.durableAckClears {
+		out[id] = token
+	}
+	return out
 }
 
 func (dt *drainTracker) get(beadID string) *drainState {

@@ -440,6 +440,8 @@ type Info struct {
 	// the cooldown decision cannot depend on the provider. Trimmed == "agent" marks
 	// an agent-initiated drain-ack.
 	DrainAckSource string // drain_ack_source (raw)
+	// DrainAckToken is the per-acknowledgement fence paired with DrainAckSource.
+	DrainAckToken string // drain_ack_token (raw)
 	// SessionIDFlag is the RAW session_id_flag metadata. freshRestartSessionKey
 	// (cmd/gc) reads it (trimmed != "") to decide whether the provider can inject a
 	// fresh session ID on a restart handoff. Additive mirror so that read can move off
@@ -1297,26 +1299,34 @@ func (m *Manager) RequestFreshRestart(id string) error {
 // AcknowledgeDrain records agent-initiated drain provenance before the runtime
 // publishes its drain-ack flag. The durable marker survives runtime teardown so
 // the reconciler can apply the named-session cooldown after confirming death.
-func (m *Manager) AcknowledgeDrain(id string) error {
-	return withSessionMutationLock(id, func() error {
+func (m *Manager) AcknowledgeDrain(id string) (string, error) {
+	token := NewInstanceToken()
+	err := withSessionMutationLock(id, func() error {
 		if _, _, err := m.sessionBead(id); err != nil {
 			return err
 		}
-		if err := m.store.SetMetadata(id, DrainAckSourceMetadataKey, DrainAckSourceAgent); err != nil {
+		if err := m.store.Update(id, beads.UpdateOpts{Metadata: map[string]string{
+			DrainAckSourceMetadataKey: DrainAckSourceAgent,
+			DrainAckTokenMetadataKey:  token,
+		}}); err != nil {
 			return fmt.Errorf("recording drain-ack provenance for session %s: %w", id, err)
 		}
 		return nil
 	})
+	if err != nil {
+		return "", err
+	}
+	return token, nil
 }
 
 // CancelDrainAcknowledgement clears durable drain provenance after publishing
 // the runtime ack flag fails.
-func (m *Manager) CancelDrainAcknowledgement(id string) error {
+func (m *Manager) CancelDrainAcknowledgement(id, token string) error {
 	return withSessionMutationLock(id, func() error {
 		if _, _, err := m.sessionBead(id); err != nil {
 			return err
 		}
-		if err := NewStore(beads.SessionStore{Store: m.store}).CancelDrainAcknowledgement(id); err != nil {
+		if _, err := NewStore(beads.SessionStore{Store: m.store}).CancelDrainAcknowledgement(id, token); err != nil {
 			return fmt.Errorf("clearing drain-ack provenance for session %s: %w", id, err)
 		}
 		return nil

@@ -129,17 +129,17 @@ func (h *RuntimeHandle) Reset(ctx context.Context) (err error) {
 
 // AcknowledgeDrain reports unsupported because runtime-only handles have no
 // durable session record for drain provenance.
-func (h *RuntimeHandle) AcknowledgeDrain(ctx context.Context) (err error) {
+func (h *RuntimeHandle) AcknowledgeDrain(ctx context.Context) (token string, err error) {
 	event := h.beginOperationEvent(ctx, workerOperationDrainAck)
 	defer func() { event.finish(err) }()
 
 	err = fmt.Errorf("%w: drain acknowledgement requires a bead-backed session", ErrOperationUnsupported)
-	return err
+	return "", err
 }
 
 // CancelDrainAcknowledgement reports unsupported because runtime-only handles
 // have no durable session record.
-func (h *RuntimeHandle) CancelDrainAcknowledgement(ctx context.Context) (err error) {
+func (h *RuntimeHandle) CancelDrainAcknowledgement(ctx context.Context, _ string) (err error) {
 	event := h.beginOperationEvent(ctx, workerOperationDrainAck)
 	defer func() { event.finish(err) }()
 

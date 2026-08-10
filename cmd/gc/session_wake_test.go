@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log"
 	"os"
 	"strings"
@@ -16,6 +17,32 @@ import (
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/session/sessiontest"
 )
+
+type failOnceConditionalStore struct {
+	beads.Store
+	writer   beads.ConditionalWriter
+	failNext bool
+}
+
+func (s *failOnceConditionalStore) UpdateIfMatch(id string, revision int64, opts beads.UpdateOpts) error {
+	if s.failNext {
+		s.failNext = false
+		return errors.New("transient conditional write failure")
+	}
+	return s.writer.UpdateIfMatch(id, revision, opts)
+}
+
+func (s *failOnceConditionalStore) CloseIfMatch(id string, revision int64) error {
+	return s.writer.CloseIfMatch(id, revision)
+}
+
+func (s *failOnceConditionalStore) DeleteIfMatch(id string, revision int64) error {
+	return s.writer.DeleteIfMatch(id, revision)
+}
+
+func (s *failOnceConditionalStore) CompareAndSetMetadataKey(id, key, expected, next string) (bool, error) {
+	return s.writer.CompareAndSetMetadataKey(id, key, expected, next)
+}
 
 type countingWakeMetadataStore struct {
 	*beads.MemStore
@@ -1626,6 +1653,48 @@ func TestDrainTracker_FinishIdleProbeIgnoresStaleProbe(t *testing.T) {
 // has left the working set is cleared. Info values are irrelevant — only key
 // presence matters (a closed-but-present session keeps its probe here; the
 // drain path clears it elsewhere).
+func TestDurableDrainAcknowledgementClearRetriesAfterTransientFailure(t *testing.T) {
+	backing := beads.NewMemStore()
+	writer, ok := beads.ConditionalWriterFor(backing)
+	if !ok {
+		t.Fatal("MemStore lacks conditional writer")
+	}
+	wrapped := &failOnceConditionalStore{Store: backing, writer: writer, failNext: true}
+	mgr := sessionpkg.NewManagerWithOptions(wrapped, runtime.NewFake())
+	info, err := mgr.CreateSession(context.Background(), sessionpkg.CreateOptions{
+		Template: "worker", Title: "worker", Command: "echo", WorkDir: t.TempDir(), Provider: "stub",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.DrainAckSource = sessionpkg.DrainAckSourceAgent
+	info.DrainAckToken = token
+	dt := newDrainTracker()
+	front := sessionFrontDoor(wrapped)
+	if clearDurableDrainAcknowledgement(info, front, dt) {
+		t.Fatal("first clear unexpectedly succeeded")
+	}
+	if got := dt.durableAckClearSnapshot()[info.ID]; got != token {
+		t.Fatalf("retry token = %q, want %q", got, token)
+	}
+	retryDurableDrainAcknowledgementClears(front, dt)
+	got, err := backing.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata[sessionpkg.DrainAckSourceMetadataKey] != "" || got.Metadata[sessionpkg.DrainAckTokenMetadataKey] != "" {
+		t.Fatalf("durable acknowledgement not cleared on retry: metadata=%v", got.Metadata)
+	}
+	if _, pending := dt.durableAckClearSnapshot()[info.ID]; pending {
+		t.Fatal("successful retry remained queued")
+	}
+}
+
+// TestClearMissingIdleProbes verifies probes for missing sessions are removed.
 func TestClearMissingIdleProbes(t *testing.T) {
 	dt := newDrainTracker()
 	for _, id := range []string{"present", "also-present", "missing"} {

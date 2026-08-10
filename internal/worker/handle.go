@@ -34,8 +34,8 @@ type LifecycleHandle interface {
 	Attach(context.Context) error
 	Create(context.Context, CreateMode) (sessionpkg.Info, error)
 	Reset(context.Context) error
-	AcknowledgeDrain(context.Context) error
-	CancelDrainAcknowledgement(context.Context) error
+	AcknowledgeDrain(context.Context) (string, error)
+	CancelDrainAcknowledgement(context.Context, string) error
 	Stop(context.Context) error
 	Kill(context.Context) error
 	Close(context.Context) error

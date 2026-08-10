@@ -382,7 +382,8 @@ func TestAcknowledgeDrainPersistsAgentProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := mgr.AcknowledgeDrain(info.ID); err != nil {
+	token, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
 		t.Fatalf("AcknowledgeDrain: %v", err)
 	}
 
@@ -393,7 +394,10 @@ func TestAcknowledgeDrainPersistsAgentProvenance(t *testing.T) {
 	if source := got.Metadata[DrainAckSourceMetadataKey]; source != DrainAckSourceAgent {
 		t.Fatalf("%s = %q, want %q", DrainAckSourceMetadataKey, source, DrainAckSourceAgent)
 	}
-	if err := mgr.CancelDrainAcknowledgement(info.ID); err != nil {
+	if gotToken := got.Metadata[DrainAckTokenMetadataKey]; gotToken != token || token == "" {
+		t.Fatalf("%s = %q, want non-empty returned token %q", DrainAckTokenMetadataKey, gotToken, token)
+	}
+	if err := mgr.CancelDrainAcknowledgement(info.ID, token); err != nil {
 		t.Fatalf("CancelDrainAcknowledgement: %v", err)
 	}
 	got, err = store.Get(info.ID)
@@ -402,6 +406,36 @@ func TestAcknowledgeDrainPersistsAgentProvenance(t *testing.T) {
 	}
 	if source := got.Metadata[DrainAckSourceMetadataKey]; source != "" {
 		t.Fatalf("%s after cancel = %q, want empty", DrainAckSourceMetadataKey, source)
+	}
+	if gotToken := got.Metadata[DrainAckTokenMetadataKey]; gotToken != "" {
+		t.Fatalf("%s after cancel = %q, want empty", DrainAckTokenMetadataKey, gotToken)
+	}
+}
+
+func TestCancelDrainAcknowledgementDoesNotClearNewerToken(t *testing.T) {
+	store := beads.NewMemStore()
+	mgr := NewManagerWithOptions(store, runtime.NewFake())
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "chat", Command: "claude", WorkDir: t.TempDir(), Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldToken, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newToken, err := mgr.AcknowledgeDrain(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CancelDrainAcknowledgement(info.ID, oldToken); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata[DrainAckTokenMetadataKey] != newToken || got.Metadata[DrainAckSourceMetadataKey] != DrainAckSourceAgent {
+		t.Fatalf("new acknowledgement was cleared: metadata=%v", got.Metadata)
 	}
 }
 

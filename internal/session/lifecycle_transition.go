@@ -209,6 +209,7 @@ func PreWakePatch(input PreWakePatchInput) MetadataPatch {
 		// never re-captured) cannot read a stale "agent" and stamp a spurious
 		// cooldown.
 		DrainAckSourceMetadataKey: "",
+		DrainAckTokenMetadataKey:  "",
 	}
 	if input.FreshWake {
 		patch["session_key"] = ""
@@ -406,6 +407,10 @@ const DrainAckStopPendingReason = "drain-ack-stop-pending"
 // flag so the finalizer can read the provenance after the runtime is gone.
 const DrainAckSourceMetadataKey = "drain_ack_source"
 
+// DrainAckTokenMetadataKey fences cancellation of one agent acknowledgement
+// from a later acknowledgement in the same session incarnation.
+const DrainAckTokenMetadataKey = "drain_ack_token"
+
 // DrainAckSourceAgent is the DrainAckSourceMetadataKey value for an
 // agent-initiated drain-ack (gc runtime drain-ack).
 const DrainAckSourceAgent = "agent"
@@ -446,6 +451,7 @@ func AcknowledgeDrainPatch(freshWake bool) MetadataPatch {
 		"pending_create_claim":      "",
 		"pending_create_started_at": "",
 		DrainAckSourceMetadataKey:   "",
+		DrainAckTokenMetadataKey:    "",
 	}
 	if freshWake {
 		patch["session_key"] = ""
@@ -460,6 +466,7 @@ func CompleteDrainPatch(now time.Time, reason string, freshWake bool) MetadataPa
 	patch := SleepPatch(now, reason)
 	patch["state_reason"] = ""
 	patch[DrainAckSourceMetadataKey] = ""
+	patch[DrainAckTokenMetadataKey] = ""
 	if freshWake {
 		patch["session_key"] = ""
 		applyFreshWakeConversationReset(patch)
