@@ -2059,6 +2059,7 @@ func reconcileCities(
 		controlDispatcherCh := make(chan struct{}, 1)
 
 		var cityRuntime *CityRuntime
+		var startupReady atomic.Bool
 		if err := runPostPrepareStep("building_city_runtime", func() error {
 			cityRuntime = newCityRuntime(CityRuntimeParams{
 				CityPath:                path,
@@ -2082,6 +2083,7 @@ func reconcileCities(
 				PokeCh:                  pokeCh,
 				ControlDispatcherCh:     controlDispatcherCh,
 				OnStarted: func() {
+					startupReady.Store(true)
 					cr.UpdateCallback(path, func(m *managedCity) {
 						m.started = true
 					})
@@ -2385,13 +2387,25 @@ func reconcileCities(
 			}()
 			defer l.Close() //nolint:errcheck // close listener (after socket removal)
 			defer telemetry.RecordControllerLifecycle(context.Background(), "stopped")
-			cityRuntime.run(cityCtx)
+			exitedBeforeCancel := false
+			runManagedCityAttempt(cityCancel, func() {
+				cityRuntime.run(cityCtx)
+				exitedBeforeCancel = cityCtx.Err() == nil
+			})
+			if exitedBeforeCancel && !startupReady.Load() {
+				fmt.Fprintf(stderr, "gc supervisor: city '%s': runtime exited before startup readiness; canceled controller state and cache reconcilers; retrying on the next patrol\n", n) //nolint:errcheck
+			}
 		}(cityName, path, fr, lis, sockPath, sockInfo, lock)
 
 		rec.Record(events.Event{Type: events.ControllerStarted, Actor: "gc"})
 		telemetry.RecordControllerLifecycle(context.Background(), "started")
 		fmt.Fprintf(stdout, "Launching city '%s' (%s)\n", cityName, path) //nolint:errcheck
 	}
+}
+
+func runManagedCityAttempt(cancel context.CancelFunc, run func()) {
+	defer cancel()
+	run()
 }
 
 func emitPendingCityCreateResult(cr *cityRegistry, path, cityName string, stderr io.Writer) {

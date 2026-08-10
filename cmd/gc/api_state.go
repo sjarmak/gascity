@@ -297,7 +297,17 @@ func primeThenStartReconciler(ctx context.Context, cs *beads.CachingStore, agent
 	if ctx.Err() != nil {
 		return
 	}
-	cs.StartReconciler(ctx, beads.WithStaggerAuto(), agentID)
+	cs.StartReconciler(ctx, beads.WithStaggerAuto(), cacheReconcilerIdentity(agentID, cs.IDPrefix()))
+}
+
+func cacheReconcilerIdentity(agentID, storePrefix string) string {
+	if storePrefix == "" {
+		storePrefix = "city"
+	}
+	if agentID == "" {
+		return "store:" + storePrefix
+	}
+	return agentID + "/store:" + storePrefix
 }
 
 // buildStores creates bead stores for each rig in cfg.
