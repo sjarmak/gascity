@@ -1125,6 +1125,11 @@ func bdUpdateArgs(id string, opts UpdateOpts) []string {
 			args = append(args, "--set-metadata", k+"="+opts.Metadata[k])
 		}
 	}
+	removeMetadata := append([]string(nil), opts.RemoveMetadata...)
+	sort.Strings(removeMetadata)
+	for _, key := range removeMetadata {
+		args = append(args, "--unset-metadata", key)
+	}
 	for _, l := range opts.Labels {
 		args = append(args, "--add-label", l)
 	}
@@ -1422,6 +1427,11 @@ func (s *BdStore) UpdateAll(ids []string, opts UpdateOpts) (int, error) {
 		for _, k := range keys {
 			args = append(args, "--set-metadata", k+"="+opts.Metadata[k])
 		}
+	}
+	removeMetadata := append([]string(nil), opts.RemoveMetadata...)
+	sort.Strings(removeMetadata)
+	for _, key := range removeMetadata {
+		args = append(args, "--unset-metadata", key)
 	}
 	for _, l := range opts.Labels {
 		args = append(args, "--add-label", l)
@@ -1754,6 +1764,11 @@ func updateProjectionMatches(current Bead, opts UpdateOpts) bool {
 			return false
 		}
 	}
+	for _, key := range opts.RemoveMetadata {
+		if _, present := current.Metadata[key]; present {
+			return false
+		}
+	}
 	for _, label := range opts.Labels {
 		if !bdStoreStringSliceContains(current.Labels, label) {
 			return false
@@ -1803,6 +1818,11 @@ func (item *bdStoreTxItem) preservedUpdateOpts(includeStatus bool) UpdateOpts {
 	if len(current.Metadata) > 0 {
 		opts.Metadata = maps.Clone(current.Metadata)
 	}
+	for key := range item.original.Metadata {
+		if _, present := current.Metadata[key]; !present {
+			opts.RemoveMetadata = append(opts.RemoveMetadata, key)
+		}
+	}
 	// bd update can clobber unspecified fields in dolt-server mode, so labels
 	// are re-emitted as a full post-mutation set for staged Tx applies.
 	opts.Labels = append([]string(nil), current.Labels...)
@@ -1834,7 +1854,7 @@ func hasUpdateOpts(opts UpdateOpts) bool {
 		opts.Description != nil ||
 		opts.ParentID != nil ||
 		opts.Assignee != nil ||
-		len(opts.Metadata) > 0 ||
+		len(opts.Metadata) > 0 || len(opts.RemoveMetadata) > 0 ||
 		len(opts.Labels) > 0 ||
 		len(opts.RemoveLabels) > 0
 }

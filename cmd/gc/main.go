@@ -1436,6 +1436,10 @@ func openStoreResultAtForCityWithAuthority(storePath, cityPath string, modeOverr
 }
 
 func openExecStoreAtForCity(provider, scopeRoot, runtimeCityPath string) (beads.Store, error) {
+	return openExecStoreAtForCityContext(context.Background(), provider, scopeRoot, runtimeCityPath)
+}
+
+func openExecStoreAtForCityContext(ctx context.Context, provider, scopeRoot, runtimeCityPath string) (beads.Store, error) {
 	target, err := resolveConfiguredExecStoreTarget(runtimeCityPath, scopeRoot)
 	if err != nil {
 		return nil, err
@@ -1447,13 +1451,13 @@ func openExecStoreAtForCity(provider, scopeRoot, runtimeCityPath string) (beads.
 			if err != nil {
 				return nil, err
 			}
-			projected, err := bdRuntimeEnvForRigWithError(runtimeCityPath, cfg, target.ScopeRoot)
+			projected, err := bdRuntimeEnvForRigWithErrorRecoveryContext(ctx, runtimeCityPath, cfg, target.ScopeRoot, true)
 			if err != nil {
 				return nil, err
 			}
 			copyExecProjectedBackendEnv(env, projected)
 		} else {
-			projected, err := bdRuntimeEnvWithError(runtimeCityPath)
+			projected, err := bdRuntimeEnvWithErrorRecoveryContext(ctx, runtimeCityPath, true)
 			if err != nil {
 				return nil, err
 			}
@@ -1462,6 +1466,7 @@ func openExecStoreAtForCity(provider, scopeRoot, runtimeCityPath string) (beads.
 	}
 	store := beadsexec.NewStore(strings.TrimPrefix(provider, "exec:"))
 	store.SetEnv(env)
+	store.SetContext(ctx)
 	return store, nil
 }
 

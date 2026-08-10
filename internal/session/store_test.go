@@ -89,6 +89,35 @@ func TestApplyPatchInfoPersistsAndFoldsEqualsReprojection(t *testing.T) {
 	}
 }
 
+func TestApplyPatchClearingDrainAcknowledgementUsesLiveCancellationMarkers(t *testing.T) {
+	backing := beads.NewMemStoreFrom(1, []beads.Bead{sessionBeadFixture("s-1", "open", map[string]string{
+		DrainAckTokenMetadataKey:  "token-current",
+		DrainAckSourceMetadataKey: DrainAckSourceAgent,
+	})}, nil)
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	front := NewStore(beads.SessionStore{Store: cache})
+
+	stale, err := front.Get("s-1")
+	if err != nil {
+		t.Fatalf("Get stale snapshot: %v", err)
+	}
+	marker := DrainAckCancellationMetadataKey("token-obsolete")
+	if err := backing.SetMetadata("s-1", marker, "true"); err != nil {
+		t.Fatalf("seed live cancellation marker: %v", err)
+	}
+
+	if _, err := front.ApplyPatchClearingDrainAcknowledgementInfo(stale, AcknowledgeDrainPatch(false)); err != nil {
+		t.Fatalf("ApplyPatchClearingDrainAcknowledgementInfo: %v", err)
+	}
+	got, err := backing.Get("s-1")
+	if err != nil {
+		t.Fatalf("Get backing: %v", err)
+	}
+	if _, present := got.Metadata[marker]; present {
+		t.Fatalf("live cancellation marker remained after acknowledgement finalization: %v", got.Metadata)
+	}
+}
+
 // TestApplyPatchInfoEmptyIsNoOp proves an empty patch persists nothing and
 // returns the input Info unchanged (matching ApplyPatch's len==0 short-circuit).
 func TestApplyPatchInfoEmptyIsNoOp(t *testing.T) {

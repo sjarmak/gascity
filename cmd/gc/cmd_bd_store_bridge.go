@@ -29,16 +29,17 @@ type bdStoreBridgeCreateRequest struct {
 }
 
 type bdStoreBridgeUpdateRequest struct {
-	Title        *string           `json:"title,omitempty"`
-	Status       *string           `json:"status,omitempty"`
-	Type         *string           `json:"type,omitempty"`
-	Priority     *int              `json:"priority,omitempty"`
-	Description  *string           `json:"description,omitempty"`
-	ParentID     *string           `json:"parent_id,omitempty"`
-	Assignee     *string           `json:"assignee,omitempty"`
-	Labels       []string          `json:"labels,omitempty"`
-	RemoveLabels []string          `json:"remove_labels,omitempty"`
-	Metadata     map[string]string `json:"metadata,omitempty"`
+	Title          *string           `json:"title,omitempty"`
+	Status         *string           `json:"status,omitempty"`
+	Type           *string           `json:"type,omitempty"`
+	Priority       *int              `json:"priority,omitempty"`
+	Description    *string           `json:"description,omitempty"`
+	ParentID       *string           `json:"parent_id,omitempty"`
+	Assignee       *string           `json:"assignee,omitempty"`
+	Labels         []string          `json:"labels,omitempty"`
+	RemoveLabels   []string          `json:"remove_labels,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
+	RemoveMetadata []string          `json:"remove_metadata,omitempty"`
 }
 
 type bdStoreBridgeBead struct {
@@ -181,16 +182,17 @@ func runBdStoreBridge(op string, args []string, dir, host, port, user string, st
 			return err
 		}
 		return store.Update(args[0], beads.UpdateOpts{
-			Title:        req.Title,
-			Status:       req.Status,
-			Type:         req.Type,
-			Priority:     req.Priority,
-			Description:  req.Description,
-			ParentID:     req.ParentID,
-			Assignee:     req.Assignee,
-			Labels:       req.Labels,
-			RemoveLabels: req.RemoveLabels,
-			Metadata:     req.Metadata,
+			Title:          req.Title,
+			Status:         req.Status,
+			Type:           req.Type,
+			Priority:       req.Priority,
+			Description:    req.Description,
+			ParentID:       req.ParentID,
+			Assignee:       req.Assignee,
+			Labels:         req.Labels,
+			RemoveLabels:   req.RemoveLabels,
+			Metadata:       req.Metadata,
+			RemoveMetadata: req.RemoveMetadata,
 		})
 	case "close":
 		if len(args) < 1 {

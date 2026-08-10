@@ -442,6 +442,8 @@ type Info struct {
 	DrainAckSource string // drain_ack_source (raw)
 	// DrainAckToken is the per-acknowledgement fence paired with DrainAckSource.
 	DrainAckToken string // drain_ack_token (raw)
+	// DrainAckCancelToken is the cancellation tombstone for DrainAckToken.
+	DrainAckCancelToken string // drain_ack_cancel_token (raw)
 	// SessionIDFlag is the RAW session_id_flag metadata. freshRestartSessionKey
 	// (cmd/gc) reads it (trimmed != "") to decide whether the provider can inject a
 	// fresh session ID on a restart handoff. Additive mirror so that read can move off
@@ -1302,13 +1304,17 @@ func (m *Manager) RequestFreshRestart(id string) error {
 func (m *Manager) AcknowledgeDrain(id string) (string, error) {
 	token := NewInstanceToken()
 	err := withSessionMutationLock(id, func() error {
-		if _, _, err := m.sessionBead(id); err != nil {
+		current, _, err := m.sessionBead(id)
+		if err != nil {
 			return err
 		}
-		if err := m.store.Update(id, beads.UpdateOpts{Metadata: map[string]string{
-			DrainAckSourceMetadataKey: DrainAckSourceAgent,
-			DrainAckTokenMetadataKey:  token,
-		}}); err != nil {
+		opts := beads.UpdateOpts{Metadata: map[string]string{
+			DrainAckSourceMetadataKey:      DrainAckSourceAgent,
+			DrainAckTokenMetadataKey:       token,
+			DrainAckCancelTokenMetadataKey: "",
+		}}
+		opts.RemoveMetadata = drainAckCancellationMetadataKeys(current.Metadata)
+		if err := m.store.Update(id, opts); err != nil {
 			return fmt.Errorf("recording drain-ack provenance for session %s: %w", id, err)
 		}
 		return nil
@@ -1319,8 +1325,8 @@ func (m *Manager) AcknowledgeDrain(id string) (string, error) {
 	return token, nil
 }
 
-// CancelDrainAcknowledgement clears durable drain provenance after publishing
-// the runtime ack flag fails.
+// CancelDrainAcknowledgement records cancellation of the specified durable
+// acknowledgement after publishing the runtime ack flag fails.
 func (m *Manager) CancelDrainAcknowledgement(id, token string) error {
 	return withSessionMutationLock(id, func() error {
 		if _, _, err := m.sessionBead(id); err != nil {

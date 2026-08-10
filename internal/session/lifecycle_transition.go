@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -208,8 +210,9 @@ func PreWakePatch(input PreWakePatchInput) MetadataPatch {
 		// prior cycle so a later finalize (e.g. a reconciler-sourced drain that
 		// never re-captured) cannot read a stale "agent" and stamp a spurious
 		// cooldown.
-		DrainAckSourceMetadataKey: "",
-		DrainAckTokenMetadataKey:  "",
+		DrainAckSourceMetadataKey:      "",
+		DrainAckTokenMetadataKey:       "",
+		DrainAckCancelTokenMetadataKey: "",
 	}
 	if input.FreshWake {
 		patch["session_key"] = ""
@@ -411,6 +414,32 @@ const DrainAckSourceMetadataKey = "drain_ack_source"
 // from a later acknowledgement in the same session incarnation.
 const DrainAckTokenMetadataKey = "drain_ack_token"
 
+// DrainAckCancelTokenMetadataKey is a durable cancellation tombstone. A drain
+// acknowledgement is canceled only when this value equals its token; a later
+// acknowledgement has a different token and therefore cannot be erased by a
+// delayed cancellation write.
+const DrainAckCancelTokenMetadataKey = "drain_ack_cancel_token"
+
+const drainAckCancellationMetadataPrefix = "drain_ack_canceled_"
+
+// DrainAckCancellationMetadataKey returns the per-token cancellation marker.
+// Hashing keeps arbitrary persisted token text out of metadata key names.
+func DrainAckCancellationMetadataKey(token string) string {
+	digest := sha256.Sum256([]byte(token))
+	return drainAckCancellationMetadataPrefix + hex.EncodeToString(digest[:])
+}
+
+func drainAckCancellationMetadataKeys(metadata map[string]string) []string {
+	keys := make([]string, 0)
+	for key := range metadata {
+		if strings.HasPrefix(key, drainAckCancellationMetadataPrefix) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // DrainAckSourceAgent is the DrainAckSourceMetadataKey value for an
 // agent-initiated drain-ack (gc runtime drain-ack).
 const DrainAckSourceAgent = "agent"
@@ -445,13 +474,14 @@ func SleepPatch(now time.Time, reason string) MetadataPatch {
 // reselect it, but explicit attach or work can.
 func AcknowledgeDrainPatch(freshWake bool) MetadataPatch {
 	patch := MetadataPatch{
-		"state":                     string(StateDrained),
-		"state_reason":              "",
-		"last_woke_at":              "",
-		"pending_create_claim":      "",
-		"pending_create_started_at": "",
-		DrainAckSourceMetadataKey:   "",
-		DrainAckTokenMetadataKey:    "",
+		"state":                        string(StateDrained),
+		"state_reason":                 "",
+		"last_woke_at":                 "",
+		"pending_create_claim":         "",
+		"pending_create_started_at":    "",
+		DrainAckSourceMetadataKey:      "",
+		DrainAckTokenMetadataKey:       "",
+		DrainAckCancelTokenMetadataKey: "",
 	}
 	if freshWake {
 		patch["session_key"] = ""
@@ -467,6 +497,7 @@ func CompleteDrainPatch(now time.Time, reason string, freshWake bool) MetadataPa
 	patch["state_reason"] = ""
 	patch[DrainAckSourceMetadataKey] = ""
 	patch[DrainAckTokenMetadataKey] = ""
+	patch[DrainAckCancelTokenMetadataKey] = ""
 	if freshWake {
 		patch["session_key"] = ""
 		applyFreshWakeConversationReset(patch)
@@ -557,12 +588,13 @@ func ArchivePatch(now time.Time, reason string, continuityEligible bool) Metadat
 func ClosePatch(now time.Time, stateCode string) MetadataPatch {
 	ts := now.UTC().Format(time.RFC3339)
 	return MetadataPatch{
-		"state":                   stateCode,
-		"close_reason":            CanonicalCloseReason(stateCode),
-		"closed_at":               ts,
-		"synced_at":               ts,
-		DrainAckSourceMetadataKey: "",
-		DrainAckTokenMetadataKey:  "",
+		"state":                        stateCode,
+		"close_reason":                 CanonicalCloseReason(stateCode),
+		"closed_at":                    ts,
+		"synced_at":                    ts,
+		DrainAckSourceMetadataKey:      "",
+		DrainAckTokenMetadataKey:       "",
+		DrainAckCancelTokenMetadataKey: "",
 	}
 }
 

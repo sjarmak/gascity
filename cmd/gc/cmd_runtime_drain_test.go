@@ -62,6 +62,7 @@ type fakeDrainOps struct {
 	driftRestart     map[string]bool
 	err              error // injected error for all ops
 	onSetDrainAck    func() error
+	onClearDrain     func(*fakeDrainOps, string) error
 	restartReadErr   error
 	setDrainCalls    []string
 	clearDrainCalls  []string
@@ -309,6 +310,9 @@ func (f *fakeDrainOps) clearDrain(sessionName string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.clearDrainCalls = append(f.clearDrainCalls, sessionName)
+	if f.onClearDrain != nil {
+		return f.onClearDrain(f, sessionName)
+	}
 	if f.err != nil {
 		return f.err
 	}
@@ -541,6 +545,66 @@ func TestDoRuntimeUndrain(t *testing.T) {
 	}
 	if len(rec.Events) != 1 || rec.Events[0].Type != events.SessionUndrained {
 		t.Errorf("events = %v, want one SessionUndrained event", rec.Events)
+	}
+}
+
+func TestDoRuntimeUndrainPreservesRuntimeAckWhenDurableTokenAdvanced(t *testing.T) {
+	dops := newFakeDrainOps()
+	dops.draining["worker"] = true
+	if err := dops.setDrainAck("worker"); err != nil {
+		t.Fatal(err)
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "worker", runtime.Config{Command: "echo"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doRuntimeUndrain(dops, sp, func() error { return errDrainAcknowledgementSuperseded }, events.Discard, "worker", "worker", false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	if !dops.draining["worker"] {
+		t.Fatal("drain flag was cleared after the durable acknowledgement advanced")
+	}
+	acked, err := dops.isDrainAcked("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !acked {
+		t.Fatal("runtime acknowledgement was cleared after the durable token advanced")
+	}
+}
+
+func TestDoRuntimeUndrainRepublishesAckThatAdvancesDuringRuntimeClear(t *testing.T) {
+	dops := newFakeDrainOps()
+	dops.draining["worker"] = true
+	if err := dops.setDrainAck("worker"); err != nil {
+		t.Fatal(err)
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "worker", runtime.Config{Command: "echo"}); err != nil {
+		t.Fatal(err)
+	}
+
+	checks := 0
+	var stdout, stderr bytes.Buffer
+	code := doRuntimeUndrain(dops, sp, func() error {
+		checks++
+		if checks == 1 {
+			return nil
+		}
+		return errDrainAcknowledgementSuperseded
+	}, events.Discard, "worker", "worker", false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	acked, err := dops.isDrainAcked("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !acked {
+		t.Fatal("newer acknowledgement was not republished after runtime clear")
 	}
 }
 
@@ -901,6 +965,261 @@ func TestDoRuntimeDrainAckPartialRuntimePublicationPreservesDurableProvenance(t 
 	}
 	if rolledBack {
 		t.Fatal("durable provenance rolled back after runtime ack was published")
+	}
+}
+
+func TestRuntimeDrainAckPersistenceAllowsRuntimeOnlySession(t *testing.T) {
+	cityDir := t.TempDir()
+	t.Setenv("GC_BEADS", "file")
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	persist, rollback, err := runtimeDrainAckPersistence(context.Background(), sessionRuntimeTarget{
+		cityPath: cityDir, sessionID: "gc-missing", sessionName: "agent",
+	}, runtime.NewFake())
+	if err != nil {
+		t.Fatalf("runtimeDrainAckPersistence: %v", err)
+	}
+	if persist != nil || rollback != nil {
+		t.Fatalf("runtime-only persistence = (%v, %v), want nil callbacks", persist != nil, rollback != nil)
+	}
+}
+
+func TestRuntimeDrainAckPersistenceAllowsProviderOnlySessionWhenStoreFails(t *testing.T) {
+	cityDir := t.TempDir()
+	script := filepath.Join(t.TempDir(), "broken-store")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GC_BEADS", "exec:"+script)
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "worker", runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	persist, rollback, err := runtimeDrainAckPersistence(context.Background(), sessionRuntimeTarget{
+		cityPath: cityDir, sessionName: "worker",
+	}, sp)
+	if err != nil {
+		t.Fatalf("runtimeDrainAckPersistence: %v", err)
+	}
+	if persist != nil || rollback != nil {
+		t.Fatalf("provider-only persistence callbacks = (%v, %v), want nil", persist != nil, rollback != nil)
+	}
+}
+
+func TestRetryDrainAckCancellationRetriesTransientFailure(t *testing.T) {
+	attempts := 0
+	err := retryDrainAckCancellation(context.Background(), func() error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("transient write")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+}
+
+func TestRuntimeDrainAckPersistenceDeadlinePreservesFileBackend(t *testing.T) {
+	cityDir := t.TempDir()
+	t.Setenv("GC_BEADS", "file")
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.Create(beads.Bead{
+		Title: "worker", Type: sessionpkg.BeadType, Status: "open",
+		Labels:   []string{sessionpkg.LabelSession},
+		Metadata: map[string]string{"session_name": "worker", "state": "active"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	persist, rollback, err := runtimeDrainAckPersistence(ctx, sessionRuntimeTarget{
+		cityPath: cityDir, sessionID: created.ID, sessionName: "worker",
+	}, runtime.NewFake())
+	if err != nil {
+		t.Fatalf("runtimeDrainAckPersistence: %v", err)
+	}
+	if persist == nil || rollback == nil {
+		t.Fatalf("file-backed persistence callbacks = (%v, %v), want both non-nil", persist != nil, rollback != nil)
+	}
+}
+
+func TestOpenDrainAckStoreAcceptsDoltLiteCompatibilityProvider(t *testing.T) {
+	cityDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[beads]\nprovider = \"doltlite\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := openDrainAckStore(context.Background(), cityDir, nil)
+	if err != nil {
+		t.Fatalf("openDrainAckStore: %v", err)
+	}
+	if store == nil {
+		t.Fatal("openDrainAckStore returned nil store")
+	}
+}
+
+func TestRuntimeDrainAckCancellationKeepsRetryMarkerUntilRuntimeClear(t *testing.T) {
+	cityDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[beads]\nprovider = \"file\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.Create(beads.Bead{
+		Title: "worker", Type: sessionpkg.BeadType, Status: "open",
+		Labels:   []string{sessionpkg.LabelSession},
+		Metadata: map[string]string{"session_name": "worker", "state": "active"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "worker", runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	persist, rollback, err := runtimeDrainAckPersistence(context.Background(), sessionRuntimeTarget{
+		cityPath: cityDir, sessionID: created.ID, sessionName: "worker",
+	}, sp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := persist(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rollback(); err != nil {
+		t.Fatal(err)
+	}
+	marker, err := sp.GetMeta("worker", drainAckCancelPendingKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marker == "" {
+		t.Fatal("cancellation retry marker cleared before runtime metadata")
+	}
+}
+
+func TestRuntimeDrainAckCancellationIgnoresNewerCanceledToken(t *testing.T) {
+	cityDir := t.TempDir()
+	t.Setenv("GC_BEADS", "file")
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.Create(beads.Bead{
+		Title: "worker", Type: sessionpkg.BeadType, Status: "open",
+		Labels:   []string{sessionpkg.LabelSession},
+		Metadata: map[string]string{"session_name": "worker", "state": "active"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp := runtime.NewFake()
+	persist, rollback, err := runtimeDrainAckPersistence(context.Background(), sessionRuntimeTarget{
+		cityPath: cityDir, sessionID: created.ID, sessionName: "worker",
+	}, sp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := persist(); err != nil {
+		t.Fatal(err)
+	}
+	mgr := sessionpkg.NewManagerWithOptions(store, sp)
+	newToken, err := mgr.AcknowledgeDrain(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CancelDrainAcknowledgement(created.ID, newToken); err != nil {
+		t.Fatal(err)
+	}
+	if err := rollback(); err != nil {
+		t.Fatalf("rollback with newer canceled token: %v", err)
+	}
+}
+
+func TestDoRuntimeUndrainRestoresNewerAckAfterPartialClearFailure(t *testing.T) {
+	dops := newFakeDrainOps()
+	dops.acked["worker"] = true
+	dops.onClearDrain = func(f *fakeDrainOps, sessionName string) error {
+		delete(f.acked, sessionName)
+		return errors.New("partial runtime clear")
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "worker", runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	checks := 0
+	cancelAck := func() error {
+		checks++
+		if checks == 1 {
+			return nil
+		}
+		return errDrainAcknowledgementSuperseded
+	}
+	var stdout, stderr bytes.Buffer
+	code := doRuntimeUndrain(dops, sp, cancelAck, events.Discard, "worker", "worker", false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1; stderr=%q", code, stderr.String())
+	}
+	if checks != 2 {
+		t.Fatalf("durable fence checks = %d, want 2", checks)
+	}
+	if !dops.acked["worker"] {
+		t.Fatal("newer runtime acknowledgement was not restored after partial clear")
+	}
+}
+
+func TestDoRuntimeUndrainKeepsRetryMarkerWhenNewerAckRestorationFails(t *testing.T) {
+	dops := newFakeDrainOps()
+	dops.acked["worker"] = true
+	dops.onClearDrain = func(f *fakeDrainOps, sessionName string) error {
+		delete(f.acked, sessionName)
+		return nil
+	}
+	dops.onSetDrainAck = func() error { return errors.New("injected restoration failure") }
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "worker", runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.SetMeta("worker", drainAckCancelPendingKey, "old-token"); err != nil {
+		t.Fatal(err)
+	}
+	checks := 0
+	cancelAck := func() error {
+		checks++
+		if checks == 1 {
+			return nil
+		}
+		return errDrainAcknowledgementSuperseded
+	}
+	var stdout, stderr bytes.Buffer
+	code := doRuntimeUndrain(dops, sp, cancelAck, events.Discard, "worker", "worker", false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1; stderr=%q", code, stderr.String())
+	}
+	if marker, err := sp.GetMeta("worker", drainAckCancelPendingKey); err != nil || marker != "old-token" {
+		t.Fatalf("pending restoration marker = %q, %v; want retained", marker, err)
 	}
 }
 
@@ -1467,7 +1786,7 @@ func TestDrainAckNoArgsFallsBackToCityPathEnv(t *testing.T) {
 		t.Fatalf("openCityStoreAt: %v", err)
 	}
 	session, err := store.Create(beads.Bead{
-		Title: "mayor", Type: sessionpkg.BeadType, Status: "open",
+		Title: "worker", Type: sessionpkg.BeadType, Status: "open",
 		Labels:   []string{sessionpkg.LabelSession},
 		Metadata: map[string]string{"session_name": "s-gc-42", "state": "active"},
 	})
@@ -1479,8 +1798,8 @@ func TestDrainAckNoArgsFallsBackToCityPathEnv(t *testing.T) {
 	cmd := newRuntimeDrainAckCmd(&stdout, &stderr)
 	cmd.SilenceErrors = true
 	cmd.SilenceUsage = true
-	t.Setenv("GC_ALIAS", "mayor")
-	t.Setenv("GC_SESSION_ID", "gc-42")
+	t.Setenv("GC_ALIAS", "worker")
+	t.Setenv("GC_SESSION_ID", session.ID)
 	t.Setenv("GC_SESSION_NAME", "s-gc-42")
 	t.Setenv("GC_CITY", "")
 	t.Setenv("GC_CITY_PATH", cityDir)

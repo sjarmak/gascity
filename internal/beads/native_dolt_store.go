@@ -1600,7 +1600,7 @@ func (s *NativeDoltStore) nativeUpdates(ctx context.Context, storage nativeIssue
 	if opts.Assignee != nil {
 		updates["assignee"] = *opts.Assignee
 	}
-	if len(opts.Metadata) > 0 {
+	if len(opts.Metadata) > 0 || len(opts.RemoveMetadata) > 0 {
 		issue, err := storage.GetIssue(ctx, id)
 		if err != nil {
 			return nil, nativeStoreError(id, err)
@@ -1617,6 +1617,9 @@ func (s *NativeDoltStore) nativeUpdates(ctx context.Context, storage nativeIssue
 		}
 		for k, v := range opts.Metadata {
 			metadata[k] = v
+		}
+		for _, key := range opts.RemoveMetadata {
+			delete(metadata, key)
 		}
 		raw, err := metadataRawFromMap(metadata)
 		if err != nil {

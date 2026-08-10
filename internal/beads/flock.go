@@ -1,9 +1,12 @@
 package beads
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
+	"time"
 )
 
 // Locker abstracts file-level locking for cross-process synchronization.
@@ -20,11 +23,18 @@ type Locker interface {
 type FileFlock struct {
 	path string
 	f    *os.File
+	ctx  context.Context
 }
 
 // NewFileFlock returns a new FileFlock that locks the given path.
 func NewFileFlock(path string) *FileFlock {
 	return &FileFlock{path: path}
+}
+
+// NewContextFileFlock returns a file lock whose acquisition stops when ctx is
+// canceled. The acquired lock still remains held until Unlock.
+func NewContextFileFlock(ctx context.Context, path string) *FileFlock {
+	return &FileFlock{path: path, ctx: ctx}
 }
 
 // Lock acquires an exclusive flock, creating the lock file if needed.
@@ -33,12 +43,35 @@ func (fl *FileFlock) Lock() error {
 	if err != nil {
 		return fmt.Errorf("flock open: %w", err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("flock lock: %w", err)
+	if fl.ctx == nil {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("flock lock: %w", err)
+		}
+		fl.f = f
+		return nil
 	}
-	fl.f = f
-	return nil
+	for {
+		if err := fl.ctx.Err(); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("flock lock: %w", err)
+		}
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			fl.f = f
+			return nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			_ = f.Close()
+			return fmt.Errorf("flock lock: %w", err)
+		}
+		select {
+		case <-fl.ctx.Done():
+			_ = f.Close()
+			return fmt.Errorf("flock lock: %w", fl.ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 // Unlock releases the flock and closes the lock file.

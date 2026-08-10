@@ -144,6 +144,7 @@ func infoFromPersistedBeadFrozen(b beads.Bead) Info {
 		RestartRequested:               b.Metadata["restart_requested"],
 		DrainAckSource:                 b.Metadata[DrainAckSourceMetadataKey],
 		DrainAckToken:                  b.Metadata[DrainAckTokenMetadataKey],
+		DrainAckCancelToken:            b.Metadata[DrainAckCancelTokenMetadataKey],
 		SessionIDFlag:                  b.Metadata["session_id_flag"],
 		TemplateOverrides:              b.Metadata["template_overrides"],
 		WakeAttemptsMetadata:           b.Metadata["wake_attempts"],

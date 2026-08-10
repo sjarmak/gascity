@@ -732,6 +732,11 @@ func (c *CachingStore) updateMatchesCached(id string, opts UpdateOpts) bool {
 			return false
 		}
 	}
+	for _, key := range opts.RemoveMetadata {
+		if _, present := b.Metadata[key]; present {
+			return false
+		}
+	}
 	if len(opts.Labels) > 0 || len(opts.RemoveLabels) > 0 {
 		// Set-equality check: opts.Labels ⊆ existing AND
 		// (opts.RemoveLabels ∩ existing) = ∅ implies the final label set
@@ -1161,6 +1166,9 @@ func applyUpdateOptsToBead(bead Bead, opts UpdateOpts) Bead {
 		for key, value := range opts.Metadata {
 			bead.Metadata[key] = value
 		}
+	}
+	for _, key := range opts.RemoveMetadata {
+		delete(bead.Metadata, key)
 	}
 	if len(opts.Labels) > 0 || len(opts.RemoveLabels) > 0 {
 		remove := make(map[string]struct{}, len(opts.RemoveLabels))

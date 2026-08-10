@@ -67,6 +67,7 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 				"wake_requested_at":          "",
 				"drain_ack_source":           "",
 				"drain_ack_token":            "",
+				"drain_ack_cancel_token":     "",
 			},
 		},
 		{
@@ -93,6 +94,7 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 				"wake_requested_at":          "",
 				"drain_ack_source":           "",
 				"drain_ack_token":            "",
+				"drain_ack_cancel_token":     "",
 				"session_key":                "",
 				"started_config_hash":        "",
 				"started_live_hash":          "",
@@ -176,6 +178,7 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 				"pending_create_started_at": "",
 				"drain_ack_source":          "",
 				"drain_ack_token":           "",
+				"drain_ack_cancel_token":    "",
 			},
 		},
 		{
@@ -189,6 +192,7 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 				"pending_create_started_at":  "",
 				"drain_ack_source":           "",
 				"drain_ack_token":            "",
+				"drain_ack_cancel_token":     "",
 				"session_key":                "",
 				"started_config_hash":        "",
 				"started_live_hash":          "",
@@ -212,6 +216,7 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 				"pending_create_started_at":  "",
 				"drain_ack_source":           "",
 				"drain_ack_token":            "",
+				"drain_ack_cancel_token":     "",
 				"sleep_intent":               "",
 				"slept_at":                   now.Format(time.RFC3339),
 				"session_key":                "",
@@ -349,12 +354,13 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 			name:  "close",
 			patch: ClosePatch(now, "orphaned"),
 			want: MetadataPatch{
-				"state":                   "orphaned",
-				"close_reason":            "session orphaned: configured agent removed",
-				"closed_at":               now.Format(time.RFC3339),
-				"synced_at":               now.Format(time.RFC3339),
-				DrainAckSourceMetadataKey: "",
-				DrainAckTokenMetadataKey:  "",
+				"state":                        "orphaned",
+				"close_reason":                 "session orphaned: configured agent removed",
+				"closed_at":                    now.Format(time.RFC3339),
+				"synced_at":                    now.Format(time.RFC3339),
+				DrainAckSourceMetadataKey:      "",
+				DrainAckTokenMetadataKey:       "",
+				DrainAckCancelTokenMetadataKey: "",
 			},
 		},
 		{
@@ -929,7 +935,8 @@ func TestClosePatchKeepsShortStateCode(t *testing.T) {
 	}
 	_, hasSourceClear := patch[DrainAckSourceMetadataKey]
 	_, hasTokenClear := patch[DrainAckTokenMetadataKey]
-	if !hasSourceClear || !hasTokenClear || patch[DrainAckSourceMetadataKey] != "" || patch[DrainAckTokenMetadataKey] != "" {
+	_, hasCancelTokenClear := patch[DrainAckCancelTokenMetadataKey]
+	if !hasSourceClear || !hasTokenClear || !hasCancelTokenClear || patch[DrainAckSourceMetadataKey] != "" || patch[DrainAckTokenMetadataKey] != "" || patch[DrainAckCancelTokenMetadataKey] != "" {
 		t.Fatalf("ClosePatch must consume drain acknowledgement provenance: %#v", patch)
 	}
 }

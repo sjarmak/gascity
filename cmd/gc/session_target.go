@@ -12,7 +12,15 @@ import (
 type sessionRuntimeTarget struct {
 	cityPath    string
 	display     string
+	sessionID   string
 	sessionName string
+}
+
+func (t sessionRuntimeTarget) durableIdentity() string {
+	if id := strings.TrimSpace(t.sessionID); id != "" {
+		return id
+	}
+	return strings.TrimSpace(t.sessionName)
 }
 
 func defaultSessionDisplayIdentity() string {
@@ -48,6 +56,7 @@ func currentSessionRuntimeTarget() (sessionRuntimeTarget, error) {
 	return sessionRuntimeTarget{
 		cityPath:    cityPath,
 		display:     display,
+		sessionID:   strings.TrimSpace(os.Getenv("GC_SESSION_ID")),
 		sessionName: sessionName,
 	}, nil
 }
@@ -64,6 +73,7 @@ func resolveSessionRuntimeTarget(identifier string, warningWriter ...io.Writer) 
 	return sessionRuntimeTarget{
 		cityPath:    target.cityPath,
 		display:     display,
+		sessionID:   target.sessionID,
 		sessionName: target.sessionName,
 	}, nil
 }

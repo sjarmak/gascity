@@ -3,6 +3,7 @@ package session
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -138,49 +139,57 @@ func (s *Store) BeginDrainAckStopPendingInfo(info Info, now time.Time) (Info, er
 	return s.ApplyPatchInfo(info, DrainAckStopPendingPatch(now))
 }
 
-// CancelDrainAcknowledgement clears durable agent provenance when a drain ack
-// is canceled before finalization.
+// CancelDrainAcknowledgement records a token-specific cancellation tombstone
+// and reports whether it canceled the currently durable acknowledgement.
 func (s *Store) CancelDrainAcknowledgement(id, token string) (bool, error) {
-	for attempts := 0; attempts < 4; attempts++ {
-		current, err := beads.HandlesFor(s.store).Live.Get(id)
-		if err != nil {
-			return false, err
-		}
-		if current.Metadata[DrainAckTokenMetadataKey] != token {
-			return false, nil
-		}
-		writer, ok := resolvedConditionalWriter(s.store.Store)
-		if !ok {
-			return false, beads.ErrConditionalWriteUnsupported
-		}
-		err = writer.UpdateIfMatch(id, current.Revision, beads.UpdateOpts{Metadata: map[string]string{
-			DrainAckSourceMetadataKey: "",
-			DrainAckTokenMetadataKey:  "",
-		}})
-		if beads.IsPreconditionFailed(err) {
-			continue
-		}
-		return err == nil, err
+	if err := s.store.Update(id, beads.UpdateOpts{Metadata: map[string]string{
+		DrainAckCancelTokenMetadataKey:         token,
+		DrainAckCancellationMetadataKey(token): "true",
+	}}); err != nil {
+		return false, err
 	}
-	return false, fmt.Errorf("canceling drain acknowledgement for %s: concurrent updates did not settle", id)
+	current, err := s.GetLive(id)
+	if err != nil {
+		return false, err
+	}
+	return current.DrainAckToken == token && current.DrainAckCancelToken == token, nil
 }
 
-func resolvedConditionalWriter(store beads.Store) (beads.ConditionalWriter, bool) {
-	const maxWrapperDepth = 8
-	for range maxWrapperDepth {
-		if writer, ok := beads.ConditionalWriterFor(store); ok {
-			return writer, true
-		}
-		targeter, ok := store.(beads.ConditionalWritesResolveTargeter)
-		if !ok {
-			return nil, false
-		}
-		store = targeter.ConditionalWritesResolveTarget()
-		if store == nil {
-			return nil, false
-		}
+// RefreshDrainAcknowledgementInfo reloads the durable projection for an
+// already-identified session while bypassing eventual-consistency caches.
+func (s *Store) RefreshDrainAcknowledgementInfo(info Info) (Info, error) {
+	if s == nil || s.store.Store == nil || strings.TrimSpace(info.ID) == "" {
+		return info, fmt.Errorf("loading session %q: %w", info.ID, beads.ErrNotFound)
 	}
-	return beads.ConditionalWriterFor(store)
+	current, err := beads.HandlesFor(s.store.Store).Live.Get(info.ID)
+	if err != nil {
+		return info, fmt.Errorf("loading session %q: %w", info.ID, err)
+	}
+	return infoFromPersistedBead(current), nil
+}
+
+// FinalizeDrainAcknowledgementInfo persists the terminal drain patch and
+// removes the active token's cancellation marker in the same store update.
+func (s *Store) FinalizeDrainAcknowledgementInfo(info Info, patch MetadataPatch) (Info, error) {
+	return s.ApplyPatchClearingDrainAcknowledgementInfo(info, patch)
+}
+
+// ApplyPatchClearingDrainAcknowledgementInfo persists a lifecycle patch while
+// removing every obsolete per-token cancellation marker in the same update.
+func (s *Store) ApplyPatchClearingDrainAcknowledgementInfo(info Info, patch MetadataPatch) (Info, error) {
+	current, err := s.store.Get(info.ID)
+	if err != nil {
+		return info, err
+	}
+	removeMetadata := drainAckCancellationMetadataKeys(current.Metadata)
+	if len(removeMetadata) == 0 {
+		return s.ApplyPatchInfo(info, patch)
+	}
+	opts := beads.UpdateOpts{Metadata: map[string]string(patch), RemoveMetadata: removeMetadata}
+	if err := s.store.Update(info.ID, opts); err != nil {
+		return info, err
+	}
+	return info.ApplyPatch(patch), nil
 }
 
 // RequestRestart records a controller handoff to a fresh provider conversation
@@ -344,7 +353,7 @@ func (s *Store) Close(id, stateCode string, now time.Time) (bool, error) {
 	if info.Closed {
 		return false, nil
 	}
-	if err := s.ApplyPatch(id, ClosePatch(now, stateCode)); err != nil {
+	if _, err := s.ApplyPatchClearingDrainAcknowledgementInfo(info, ClosePatch(now, stateCode)); err != nil {
 		return false, err
 	}
 	if err := s.store.Close(id); err != nil {

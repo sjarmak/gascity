@@ -39,6 +39,12 @@ func infoFromPersistedBead(b beads.Bead) Info {
 		spec := &infoKeyCodec[i]
 		spec.set(&info, b.Metadata[spec.key])
 	}
+	// The fixed field is retained for compatibility and diagnostics, while the
+	// per-token marker makes cancellation monotonic: a delayed cancellation of
+	// an older acknowledgement cannot overwrite evidence for the active token.
+	if info.DrainAckToken != "" && b.Metadata[DrainAckCancellationMetadataKey(info.DrainAckToken)] != "" {
+		info.DrainAckCancelToken = info.DrainAckToken
+	}
 	return info
 }
 

@@ -43,6 +43,39 @@ func underlyingPolicyStoreForTest(store beads.Store) beads.Store {
 	return base
 }
 
+func TestBeadPolicyStorePreservesAuthoritativeSessionReadHandle(t *testing.T) {
+	backing := beads.NewMemStore()
+	created, err := backing.Create(beads.Bead{
+		Title:  "worker",
+		Type:   session.BeadType,
+		Status: "open",
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "worker",
+			"state":        "active",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatal(err)
+	}
+	wrapped := wrapStoreWithBeadPolicies(cache, &config.City{})
+	if err := backing.SetMetadata(created.ID, session.DrainAckTokenMetadataKey, "durable-token"); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := sessionFrontDoor(wrapped).GetLive(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.DrainAckToken != "durable-token" {
+		t.Fatalf("GetLive drain token = %q, want authoritative backing value", info.DrainAckToken)
+	}
+}
+
 func TestBeadPolicyStorePreservesConditionalAssignmentReleaser(t *testing.T) {
 	backing := beads.NewMemStore()
 	wrapped := wrapStoreWithBeadPolicies(backing, nil)

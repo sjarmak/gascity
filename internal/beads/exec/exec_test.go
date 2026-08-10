@@ -1,6 +1,7 @@
 package exec //nolint:revive // internal package, always imported with alias
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -12,6 +13,21 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/beadstest"
 )
+
+func TestStoreContextBoundsScriptInvocation(t *testing.T) {
+	script := writeScript(t, t.TempDir(), `exec sleep 60`)
+	store := NewStore(script)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	store.SetContext(ctx)
+	started := time.Now()
+	if _, err := store.Get("gc-1"); err == nil {
+		t.Fatal("Get error = nil, want context deadline")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("context-bound exec took %v, want under 1s", elapsed)
+	}
+}
 
 // writeScript creates an executable shell script in dir and returns its path.
 func writeScript(t *testing.T, dir, content string) string {

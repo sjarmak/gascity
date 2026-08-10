@@ -168,7 +168,7 @@ func TestDoHookClaimStopsAfterCommittedClaimReadbackFailure(t *testing.T) {
 			attempts = append(attempts, beadID)
 			return beads.Bead{ID: beadID, Assignee: assignee}, true, errors.New("canonical read failed")
 		},
-		DrainAck: func(io.Writer) error {
+		DrainAck: func(context.Context, io.Writer) error {
 			drained = true
 			return nil
 		},
@@ -244,7 +244,7 @@ func TestDoHookClaimUsesSelectedStoreContextForMutationAndContinuation(t *testin
 			}
 			return nil
 		},
-		DrainAck: func(io.Writer) error { return nil },
+		DrainAck: func(context.Context, io.Writer) error { return nil },
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -302,7 +302,7 @@ func TestDoHookClaimSkipsBlockedRoutedHeadAndClaimsReadyBehindIt(t *testing.T) {
 			claimedBead = beadID
 			return beads.Bead{ID: beadID, Assignee: assignee, Status: "in_progress"}, true, nil
 		},
-		DrainAck: func(io.Writer) error { return nil },
+		DrainAck: func(context.Context, io.Writer) error { return nil },
 	}
 
 	var stdout, stderr bytes.Buffer

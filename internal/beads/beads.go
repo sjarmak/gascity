@@ -134,16 +134,17 @@ type Bead struct {
 
 // UpdateOpts specifies which fields to change. Nil pointers are skipped.
 type UpdateOpts struct {
-	Title        *string // set title (nil = no change)
-	Status       *string // set status (nil = no change)
-	Type         *string // set issue type (nil = no change)
-	Priority     *int    // set priority (nil = no change)
-	Description  *string
-	ParentID     *string
-	Assignee     *string  // set assignee (nil = no change)
-	Labels       []string // append these labels (nil = no change)
-	RemoveLabels []string // remove these labels (nil = no change)
-	Metadata     map[string]string
+	Title          *string // set title (nil = no change)
+	Status         *string // set status (nil = no change)
+	Type           *string // set issue type (nil = no change)
+	Priority       *int    // set priority (nil = no change)
+	Description    *string
+	ParentID       *string
+	Assignee       *string  // set assignee (nil = no change)
+	Labels         []string // append these labels (nil = no change)
+	RemoveLabels   []string // remove these labels (nil = no change)
+	Metadata       map[string]string
+	RemoveMetadata []string // remove metadata keys (nil = no change)
 }
 
 // ConditionalAssignmentReleaser is implemented by stores that can release an
@@ -216,7 +217,7 @@ var ErrEmptyConditionalUpdate = errors.New("conditional update: empty UpdateOpts
 func isEmptyUpdateOpts(o UpdateOpts) bool {
 	return o.Title == nil && o.Status == nil && o.Type == nil && o.Priority == nil &&
 		o.Description == nil && o.ParentID == nil && o.Assignee == nil &&
-		len(o.Labels) == 0 && len(o.RemoveLabels) == 0 && len(o.Metadata) == 0
+		len(o.Labels) == 0 && len(o.RemoveLabels) == 0 && len(o.Metadata) == 0 && len(o.RemoveMetadata) == 0
 }
 
 // ConditionalWriterHandleProvider exposes a conditional-write handle for stores

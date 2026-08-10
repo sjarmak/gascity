@@ -26,11 +26,18 @@ type Store struct {
 	script  string
 	timeout time.Duration
 	env     map[string]string
+	ctx     context.Context
 }
 
 // SetEnv sets environment variables passed to the script process.
 func (s *Store) SetEnv(env map[string]string) {
 	s.env = env
+}
+
+// SetContext binds future script invocations to ctx in addition to the store's
+// own timeout. It is intended for short-lived command-scoped stores.
+func (s *Store) SetContext(ctx context.Context) {
+	s.ctx = ctx
 }
 
 // NewStore returns a Store that delegates to the given script.
@@ -78,7 +85,11 @@ func stripExecEnvKey(key string) bool {
 // called with contract flags, exit code 2 means the invocation was rejected and
 // must surface as an error instead of silently returning empty data.
 func (s *Store) run(stdinData []byte, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	parent := s.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, s.timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, s.script, args...)
