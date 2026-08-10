@@ -45,6 +45,8 @@ func TestAgentSliceWrapsNewSessionWithCommand(t *testing.T) {
 	t.Run("retries escaped placement", testAgentSliceRetriesEscapedNewSessionUntilPlaced)
 	t.Run("aborts persistent escape", testAgentSliceAbortsNewSessionWhenPlacementKeepsEscaping)
 	t.Run("parses cgroup paths", testCgroupContainsSlice)
+	t.Run("waits for stable final placement", testVerifyAgentSlicePlacementWaitsForStableFinalPlacement)
+	t.Run("rejects transient initial success", testVerifyAgentSlicePlacementRejectsTransientInitialSuccess)
 }
 
 func TestAgentSliceWrapsNewSessionWithCommandAndEnv(t *testing.T) {
@@ -133,8 +135,7 @@ func testAgentSliceRetriesEscapedNewSessionUntilPlaced(t *testing.T) {
 	}
 }
 
-func TestVerifyAgentSlicePlacementWaitsForStableFinalPlacement(t *testing.T) {
-	tm := NewTmux()
+func testVerifyAgentSlicePlacementWaitsForStableFinalPlacement(t *testing.T) {
 	observations := []error{
 		errors.New("tmux returned an empty pane pid"),
 		nil,
@@ -142,7 +143,7 @@ func TestVerifyAgentSlicePlacementWaitsForStableFinalPlacement(t *testing.T) {
 	}
 	observations = append(observations, make([]error, agentSlicePlacementStableChecks)...)
 	checks := 0
-	tm.agentSlicePlacementSample = func(target, slice string) error {
+	sample := func(target, slice string) error {
 		if target != "gc-test-stabilize" {
 			t.Fatalf("sample target = %q", target)
 		}
@@ -157,10 +158,10 @@ func TestVerifyAgentSlicePlacementWaitsForStableFinalPlacement(t *testing.T) {
 		return err
 	}
 	waits := 0
-	tm.agentSlicePlacementWait = func(time.Duration) { waits++ }
+	wait := func(time.Duration) { waits++ }
 
-	if err := tm.verifyAgentSlicePlacement("gc-test-stabilize", "gascity-agents.slice"); err != nil {
-		t.Fatalf("verifyAgentSlicePlacement: %v", err)
+	if err := verifyAgentSlicePlacementWith("gc-test-stabilize", "gascity-agents.slice", sample, wait); err != nil {
+		t.Fatalf("verifyAgentSlicePlacementWith: %v", err)
 	}
 	if checks != len(observations) {
 		t.Fatalf("placement samples = %d, want %d", checks, len(observations))
@@ -170,19 +171,17 @@ func TestVerifyAgentSlicePlacementWaitsForStableFinalPlacement(t *testing.T) {
 	}
 }
 
-func TestVerifyAgentSlicePlacementRejectsTransientInitialSuccess(t *testing.T) {
-	tm := NewTmux()
+func testVerifyAgentSlicePlacementRejectsTransientInitialSuccess(t *testing.T) {
 	checks := 0
-	tm.agentSlicePlacementSample = func(string, string) error {
+	sample := func(string, string) error {
 		checks++
 		if checks == 1 {
 			return nil
 		}
 		return errors.New("pane settled in app.slice")
 	}
-	tm.agentSlicePlacementWait = func(time.Duration) {}
 
-	err := tm.verifyAgentSlicePlacement("gc-test-escape", "gascity-agents.slice")
+	err := verifyAgentSlicePlacementWith("gc-test-escape", "gascity-agents.slice", sample, func(time.Duration) {})
 	if err == nil {
 		t.Fatal("verifyAgentSlicePlacement returned nil after transient initial placement")
 	}

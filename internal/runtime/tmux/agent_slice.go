@@ -191,15 +191,14 @@ func (t *Tmux) ensureAgentSlicePlacement(target, workDir, command, wrapped strin
 }
 
 func (t *Tmux) verifyAgentSlicePlacement(target, slice string) error {
-	sample := t.agentSlicePlacementSample
-	if sample == nil {
-		sample = t.sampleAgentSlicePlacement
-	}
-	wait := t.agentSlicePlacementWait
-	if wait == nil {
-		wait = time.Sleep
-	}
+	return verifyAgentSlicePlacementWith(target, slice, t.sampleAgentSlicePlacement, time.Sleep)
+}
 
+func verifyAgentSlicePlacementWith(
+	target, slice string,
+	sample func(target, slice string) error,
+	wait func(time.Duration),
+) error {
 	stableChecks := 0
 	var lastErr error
 	for check := 1; check <= agentSlicePlacementChecks; check++ {
