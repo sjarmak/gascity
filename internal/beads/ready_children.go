@@ -6,6 +6,12 @@ import (
 	"time"
 )
 
+// ReadyDirectChildrenReader lets a store preserve backend-specific dependency
+// target identity while selecting ready formula children.
+type ReadyDirectChildrenReader interface {
+	ReadyDirectChildren(parentID, beadType string, tier TierMode) ([]Bead, error)
+}
+
 // ReadyDirectChildren returns open, dependency-ready direct children of the
 // requested type in deterministic creation order. Unlike Store.Ready, the
 // caller explicitly selects an infrastructure type such as "step", so this
@@ -13,6 +19,9 @@ import (
 func ReadyDirectChildren(store Store, parentID, beadType string, tier TierMode) ([]Bead, error) {
 	if store == nil {
 		return nil, errors.New("listing ready direct children: nil store")
+	}
+	if reader, ok := store.(ReadyDirectChildrenReader); ok {
+		return reader.ReadyDirectChildren(parentID, beadType, tier)
 	}
 	children, err := store.List(ListQuery{
 		Status:   "open",

@@ -53,8 +53,10 @@ var (
 func (s *beadPolicyStore) ConditionalWritesResolveTarget() beads.Store { return s.Store }
 
 var (
-	_ beads.BatchDeleter = (*beadPolicyStore)(nil)
-	_ beads.BatchDeleter = (*beadPolicyGraphStore)(nil)
+	_ beads.BatchDeleter              = (*beadPolicyStore)(nil)
+	_ beads.BatchDeleter              = (*beadPolicyGraphStore)(nil)
+	_ beads.ReadyDirectChildrenReader = (*beadPolicyStore)(nil)
+	_ beads.ReadyDirectChildrenReader = (*beadPolicyGraphStore)(nil)
 )
 
 func wrapStoreWithBeadPolicies(store beads.Store, cfg *config.City) beads.Store {
@@ -97,6 +99,12 @@ func (s *beadPolicyStore) List(query beads.ListQuery) ([]beads.Bead, error) {
 
 func (s *beadPolicyStore) Ready(query ...beads.ReadyQuery) ([]beads.Bead, error) {
 	return s.Store.Ready(expandPolicyReadyQuery(query...))
+}
+
+// ReadyDirectChildren forwards formula-child readiness to the underlying
+// store so backend-specific dependency target identity is preserved.
+func (s *beadPolicyStore) ReadyDirectChildren(parentID, beadType string, tier beads.TierMode) ([]beads.Bead, error) {
+	return beads.ReadyDirectChildren(s.Store, parentID, beadType, tier)
 }
 
 // ReadyContext preserves the policy-expanded read tier for deadline-sensitive

@@ -76,12 +76,18 @@ func (s *DoltliteReadStore) doltliteReadyIssueWhere(tables doltliteTableSet) (st
 
 func doltliteReadyIssueWhere(tables doltliteTableSet, includeWispTargets bool) (string, []any) {
 	typePredicate, args := doltliteIssueTypeNotInPredicate("i")
+	dependencyPredicate, dependencyArgs := doltliteDependencyReadyWhere(tables, includeWispTargets)
+	return typePredicate + " AND " + dependencyPredicate, append(args, dependencyArgs...)
+}
+
+func doltliteDependencyReadyWhere(tables doltliteTableSet, includeWispTargets bool) (string, []any) {
 	blockingTypes := make([]string, 0, len(readyBlockingDependencyTypes))
 	for typ := range readyBlockingDependencyTypes {
 		blockingTypes = append(blockingTypes, typ)
 	}
 	sort.Strings(blockingTypes)
 	blockingPlaceholders := strings.TrimRight(strings.Repeat("?,", len(blockingTypes)), ",")
+	args := make([]any, 0, len(blockingTypes))
 	for _, typ := range blockingTypes {
 		args = append(args, typ)
 	}
@@ -89,21 +95,18 @@ func doltliteReadyIssueWhere(tables doltliteTableSet, includeWispTargets bool) (
 	issueTarget := "COALESCE(NULLIF(d.depends_on_issue_id, ''), NULLIF(d.depends_on_id, ''), NULLIF(d.depends_on_external, ''), '')"
 	wispTarget := "NULLIF(d.depends_on_wisp_id, '')"
 	depType := "COALESCE(NULLIF(d.type, ''), 'blocks')"
-	blockerJoins := "LEFT JOIN " + tables.issues + " blocker_issue ON blocker_issue.id = " + issueTarget
+	blockerJoins := "LEFT JOIN " + doltliteIssueTables.issues + " blocker_issue ON blocker_issue.id = " + issueTarget
 	blockerStatus := "COALESCE(blocker_issue.status, '')"
 	if includeWispTargets {
 		blockerJoins += "\n\t\t\tLEFT JOIN " + doltliteWispTables.issues + " blocker_wisp ON blocker_wisp.id = " + wispTarget
 		blockerStatus = "CASE WHEN " + wispTarget + " IS NOT NULL THEN COALESCE(blocker_wisp.status, '') ELSE COALESCE(blocker_issue.status, '') END"
 	}
 
-	return strings.Join([]string{
-		typePredicate,
-		`NOT EXISTS (
+	return `NOT EXISTS (
 				SELECT 1 FROM ` + tables.deps + ` d
 				` + blockerJoins + `
 				WHERE d.issue_id = i.id AND ` + depType + ` IN (` + blockingPlaceholders + `) AND ` + blockerStatus + ` != 'closed'
-			)`,
-	}, " AND "), args
+			)`, args
 }
 
 func doltliteIssueTypeNotInPredicate(alias string) (string, []any) {
@@ -386,6 +389,37 @@ func (s *DoltliteReadStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 	}
 	s.readyMu.Unlock()
 	return out, nil
+}
+
+// ReadyDirectChildren returns dependency-ready direct children without the
+// actionable-type exclusions used by Ready. Its SQL predicate retains typed
+// issue-versus-wisp dependency targets, including when both tiers share an ID.
+func (s *DoltliteReadStore) ReadyDirectChildren(parentID, beadType string, tier TierMode) ([]Bead, error) {
+	query := ListQuery{
+		Status:   "open",
+		Type:     beadType,
+		ParentID: parentID,
+		TierMode: tier,
+		Sort:     SortCreatedAsc,
+	}
+	sets := doltliteTableSetsForMode(tier)
+	merged := make([]Bead, 0)
+	seen := make(map[string]struct{})
+	for _, tables := range sets {
+		where, args := doltliteDependencyReadyWhere(tables, s.tableExists(doltliteWispTables.issues))
+		rows, err := s.queryIssueTable(query, tables, where, args, 0, "")
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			if _, ok := seen[row.ID]; ok {
+				continue
+			}
+			seen[row.ID] = struct{}{}
+			merged = append(merged, row)
+		}
+	}
+	return ApplyListQuery(merged, query), nil
 }
 
 func (s *DoltliteReadStore) LastOrderRun(name string) (time.Time, error) {

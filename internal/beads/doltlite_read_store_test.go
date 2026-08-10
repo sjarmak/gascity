@@ -292,6 +292,134 @@ func TestDoltliteReadStoreReadyUsesTypedWispTargetWhenIDsCollide(t *testing.T) {
 	}
 }
 
+func TestDoltliteReadyDirectChildrenUsesTypedWispTargetWhenIDsCollide(t *testing.T) {
+	store, closeStore := newTestDoltliteReadStore(t)
+	defer closeStore()
+	writer := openTestDoltliteWriter(t, store.db)
+	defer writer.Close() //nolint:errcheck // test cleanup
+
+	createdAt := time.Date(2026, time.August, 3, 16, 7, 27, 0, time.UTC)
+	insertTestDoltliteIssue(t, writer, "issues", "labels", "dependencies", testDoltliteIssue{
+		ID:        "gc-entry-root",
+		Title:     "attached formula root",
+		Status:    "in_progress",
+		IssueType: "molecule",
+		CreatedAt: createdAt,
+	})
+	insertTestDoltliteIssue(t, writer, "issues", "labels", "dependencies", testDoltliteIssue{
+		ID:        "gc-collision-blocker",
+		Title:     "closed issue sharing blocker id",
+		Status:    "closed",
+		IssueType: "task",
+		CreatedAt: createdAt,
+	})
+	insertTestDoltliteIssue(t, writer, "wisps", "wisp_labels", "wisp_dependencies", testDoltliteIssue{
+		ID:        "gc-collision-blocker",
+		Title:     "open wisp sharing blocker id",
+		Status:    "open",
+		IssueType: "task",
+		CreatedAt: createdAt,
+		Ephemeral: true,
+	})
+	insertTestDoltliteIssue(t, writer, "issues", "labels", "dependencies", testDoltliteIssue{
+		ID:        "gc-z-intake",
+		Title:     "ready intake",
+		Status:    "open",
+		IssueType: "step",
+		CreatedAt: createdAt,
+		Dependencies: []testDoltliteDependency{{
+			DependsOnIssueID: "gc-entry-root",
+			Type:             "parent-child",
+		}},
+	})
+	insertTestDoltliteIssue(t, writer, "issues", "labels", "dependencies", testDoltliteIssue{
+		ID:        "gc-a-downstream",
+		Title:     "blocked downstream",
+		Status:    "open",
+		IssueType: "step",
+		CreatedAt: createdAt,
+		Dependencies: []testDoltliteDependency{
+			{
+				DependsOnIssueID: "gc-entry-root",
+				Type:             "parent-child",
+			},
+			{
+				DependsOnWispID: "gc-collision-blocker",
+				Type:            "blocks",
+			},
+		},
+	})
+
+	ready, err := ReadyDirectChildren(store, "gc-entry-root", "step", TierBoth)
+	if err != nil {
+		t.Fatalf("ReadyDirectChildren before blocker closes: %v", err)
+	}
+	if got := testBeadIDs(ready); !slices.Equal(got, []string{"gc-z-intake"}) {
+		t.Fatalf("ready children before blocker closes = %v, want [gc-z-intake]", got)
+	}
+
+	if _, err := writer.Exec(`UPDATE wisps SET status = 'closed' WHERE id = ?`, "gc-collision-blocker"); err != nil {
+		t.Fatalf("close typed wisp blocker: %v", err)
+	}
+	ready, err = ReadyDirectChildren(store, "gc-entry-root", "step", TierBoth)
+	if err != nil {
+		t.Fatalf("ReadyDirectChildren after blocker closes: %v", err)
+	}
+	if got := testBeadIDs(ready); !slices.Equal(got, []string{"gc-a-downstream", "gc-z-intake"}) {
+		t.Fatalf("ready children after blocker closes = %v, want [gc-a-downstream gc-z-intake]", got)
+	}
+}
+
+func TestDoltliteReadyDirectChildrenWispChildUsesTypedIssueTarget(t *testing.T) {
+	store, closeStore := newTestDoltliteReadStore(t)
+	defer closeStore()
+	writer := openTestDoltliteWriter(t, store.db)
+	defer writer.Close() //nolint:errcheck // test cleanup
+
+	createdAt := time.Date(2026, time.August, 3, 16, 7, 27, 0, time.UTC)
+	insertTestDoltliteIssue(t, writer, "issues", "labels", "dependencies", testDoltliteIssue{
+		ID:        "gc-closed-issue-blocker",
+		Title:     "closed issue blocker",
+		Status:    "closed",
+		IssueType: "task",
+		CreatedAt: createdAt,
+	})
+	insertTestDoltliteIssue(t, writer, "wisps", "wisp_labels", "wisp_dependencies", testDoltliteIssue{
+		ID:        "gc-wisp-root",
+		Title:     "wisp formula root",
+		Status:    "in_progress",
+		IssueType: "molecule",
+		CreatedAt: createdAt,
+		Ephemeral: true,
+	})
+	insertTestDoltliteIssue(t, writer, "wisps", "wisp_labels", "wisp_dependencies", testDoltliteIssue{
+		ID:        "gc-wisp-step",
+		Title:     "wisp step",
+		Status:    "open",
+		IssueType: "step",
+		CreatedAt: createdAt,
+		Ephemeral: true,
+		Dependencies: []testDoltliteDependency{
+			{
+				DependsOnWispID: "gc-wisp-root",
+				Type:            "parent-child",
+			},
+			{
+				DependsOnIssueID: "gc-closed-issue-blocker",
+				Type:             "blocks",
+			},
+		},
+	})
+
+	ready, err := ReadyDirectChildren(store, "gc-wisp-root", "step", TierBoth)
+	if err != nil {
+		t.Fatalf("ReadyDirectChildren: %v", err)
+	}
+	if got := testBeadIDs(ready); !slices.Equal(got, []string{"gc-wisp-step"}) {
+		t.Fatalf("ready wisp children = %v, want [gc-wisp-step]", got)
+	}
+}
+
 func TestDoltliteReadStoreReadyHonorsLimit(t *testing.T) {
 	store, closeStore := newTestDoltliteReadStore(t)
 	defer closeStore()
