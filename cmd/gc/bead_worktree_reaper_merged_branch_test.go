@@ -26,9 +26,10 @@ func addMergedBranchWorktree(t *testing.T, rigRoot, cityPath, agentHome, beadID 
 	mustGit(t, rigRoot, "worktree", "add", "-b", branch, wtPath)
 	mustGit(t, wtPath, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "work ("+beadID+")")
 	mustGit(t, wtPath, "push", "origin", branch)
+	mustGit(t, rigRoot, "merge", "--ff-only", branch)
 	mustGit(t, rigRoot, "push", "origin", "--delete", branch)
 	mustGit(t, rigRoot, "fetch", "--prune", "origin")
-	backdateWorktreeGitFile(t, wtPath, 24*time.Hour)
+	backdateWorktreeGitFile(t, wtPath, 4*24*time.Hour)
 	return wtPath
 }
 
@@ -61,11 +62,11 @@ func TestReapClosedBeadWorktrees_ReapsWorktreeWhoseMergedBranchWasDeleted(t *tes
 	}
 }
 
-// TestReapClosedBeadWorktrees_ProtectsDetachedHEADWithOrphanCommits pins the
-// safety half of the same gate. A detached HEAD carrying a commit that no
-// branch, tag, or remote reaches WOULD be orphaned by removing the worktree, so
-// the reaper must still protect it and say why.
-func TestReapClosedBeadWorktrees_ProtectsDetachedHEADWithOrphanCommits(t *testing.T) {
+// TestReapClosedBeadWorktrees_ProtectsUnlandedHEADWithOnlyRescueRef pins the
+// contract that rescue refs preserve commits but never prove landing. The
+// mutation this catches is replacing the default-branch landing probe with an
+// any-ref reachability probe, which would make this tree pass wrongly.
+func TestReapClosedBeadWorktrees_ProtectsUnlandedHEADWithOnlyRescueRef(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	wt := filepath.Join(cityPath, ".gc", "worktrees", reapTestRigName, "builder", "ga-orphan1")
 	if err := os.MkdirAll(filepath.Dir(wt), 0o755); err != nil {
@@ -73,7 +74,8 @@ func TestReapClosedBeadWorktrees_ProtectsDetachedHEADWithOrphanCommits(t *testin
 	}
 	mustGit(t, rigRoot, "worktree", "add", "--detach", wt)
 	mustGit(t, wt, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "orphan work")
-	backdateWorktreeGitFile(t, wt, 24*time.Hour)
+	mustGit(t, wt, "branch", "rescue/ga-orphan1")
+	backdateWorktreeGitFile(t, wt, 4*24*time.Hour)
 
 	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-orphan1", Status: "closed"}}, nil)
 	cfg := reapTestConfig(rigRoot)
@@ -88,8 +90,8 @@ func TestReapClosedBeadWorktrees_ProtectsDetachedHEADWithOrphanCommits(t *testin
 	if len(report.Protected) != 1 {
 		t.Fatalf("Protected = %+v, want exactly 1 entry", report.Protected)
 	}
-	if !strings.Contains(report.Protected[0].Reason, "unreachable=true") {
-		t.Errorf("Reason = %q, want it to report unreachable=true", report.Protected[0].Reason)
+	if !strings.Contains(report.Protected[0].Reason, "landed=false") {
+		t.Errorf("Reason = %q, want it to report landed=false", report.Protected[0].Reason)
 	}
 	if _, err := os.Stat(wt); err != nil {
 		t.Errorf("protected worktree %s was removed: %v", wt, err)
@@ -108,7 +110,7 @@ func TestReapClosedBeadWorktrees_ReapsWorktreeNestedUnderBeadNamedParent(t *test
 		t.Fatalf("mkdir worktree parent: %v", err)
 	}
 	mustGit(t, rigRoot, "worktree", "add", "-b", "polecat/ga-nested1", wt)
-	backdateWorktreeGitFile(t, wt, 24*time.Hour)
+	backdateWorktreeGitFile(t, wt, 4*24*time.Hour)
 
 	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-nested1", Status: "closed"}}, nil)
 	cfg := reapTestConfig(rigRoot)
@@ -140,7 +142,7 @@ func TestReapClosedBeadWorktrees_IgnoresWorktreeWithNoResolvableBead(t *testing.
 		t.Fatalf("mkdir worktree parent: %v", err)
 	}
 	mustGit(t, rigRoot, "worktree", "add", "-b", "scratch", wt)
-	backdateWorktreeGitFile(t, wt, 24*time.Hour)
+	backdateWorktreeGitFile(t, wt, 4*24*time.Hour)
 
 	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-nested1", Status: "closed"}}, nil)
 	cfg := reapTestConfig(rigRoot)
@@ -172,7 +174,7 @@ func TestReapClosedBeadWorktrees_ProtectsOnGitProbeError(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: /nonexistent/gc-reaper-probe-test\n"), 0o644); err != nil {
 		t.Fatalf("corrupt worktree .git pointer: %v", err)
 	}
-	backdateWorktreeGitFile(t, wt, 24*time.Hour)
+	backdateWorktreeGitFile(t, wt, 4*24*time.Hour)
 
 	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-broken1", Status: "closed"}}, nil)
 	cfg := reapTestConfig(rigRoot)
