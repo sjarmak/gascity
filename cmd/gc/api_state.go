@@ -209,7 +209,7 @@ func newControllerState(
 		fmt.Fprintf(os.Stderr, "api: city bead store: %v (session/mail endpoints disabled)\n", err)
 	} else {
 		store := opened.Store
-		cs.cityBeadStore = wrapWithCachingStore(ctx, store, ep, true)
+		cs.cityBeadStore = wrapWithCachingStore(ctx, store, ep, true, "city:"+cityName)
 		cs.cityBeadsDiagnostic = diagnosticPtr(opened.Diagnostic)
 		cs.cityMailProv = newCityMailProvider(cs.cityBeadStore, cfg, cityPath, ep)
 		svc := extmsg.NewServices(cs.cityBeadStore)
@@ -228,7 +228,7 @@ func newControllerState(
 // Suspended rigs pass false: they spawn no agents, so nothing writes locally and
 // a continuously refreshed cache buys nothing; reconciling every suspended rig
 // every cycle is what pegs the supervisor (gastownhall/gascity #1978 follow-up).
-func wrapWithCachingStore(ctx context.Context, store beads.Store, ep events.Provider, backgroundRefresh bool) beads.Store {
+func wrapWithCachingStore(ctx context.Context, store beads.Store, ep events.Provider, backgroundRefresh bool, storeScope string) beads.Store {
 	baseStore, policyStore, policyWrapped := unwrapBeadPolicyStore(store)
 	if baseStore == nil {
 		return nil
@@ -272,7 +272,7 @@ func wrapWithCachingStore(ctx context.Context, store beads.Store, ep events.Prov
 	}
 	// Full prime runs async — backfills remaining beads for List()
 	// callers (convergence reconcile, sweep, API handlers).
-	go primeThenStartReconciler(ctx, cs, os.Getenv("GC_AGENT"))
+	go primeThenStartReconciler(ctx, cs, os.Getenv("GC_AGENT"), storeScope)
 	if policyWrapped {
 		return wrapStoreWithBeadPolicies(cs, policyStore.cfg)
 	}
@@ -289,7 +289,7 @@ func wrapWithCachingStore(ctx context.Context, store beads.Store, ep events.Prov
 // storage-level state created before a restart (e.g. routed pool work
 // feeding scale-check demand) stayed invisible until something else
 // touched the bead. Only shutdown (ctx canceled) skips the reconciler.
-func primeThenStartReconciler(ctx context.Context, cs *beads.CachingStore, agentID string) {
+func primeThenStartReconciler(ctx context.Context, cs *beads.CachingStore, agentID, storeScope string) {
 	log.Printf("caching-store: priming ...")
 	if err := cs.Prime(ctx); err != nil {
 		log.Printf("caching-store: prime FAILED: %v (reads use bd subprocess until the reconciler converges)", err)
@@ -297,17 +297,17 @@ func primeThenStartReconciler(ctx context.Context, cs *beads.CachingStore, agent
 	if ctx.Err() != nil {
 		return
 	}
-	cs.StartReconciler(ctx, beads.WithStaggerAuto(), cacheReconcilerIdentity(agentID, cs.IDPrefix()))
+	cs.StartReconciler(ctx, beads.WithStaggerAuto(), cacheReconcilerIdentity(agentID, storeScope))
 }
 
-func cacheReconcilerIdentity(agentID, storePrefix string) string {
-	if storePrefix == "" {
-		storePrefix = "city"
+func cacheReconcilerIdentity(agentID, storeScope string) string {
+	if storeScope == "" {
+		storeScope = "unknown"
 	}
 	if agentID == "" {
-		return "store:" + storePrefix
+		return "store:" + storeScope
 	}
-	return agentID + "/store:" + storePrefix
+	return agentID + "/store:" + storeScope
 }
 
 // buildStores creates bead stores for each rig in cfg.
@@ -358,13 +358,13 @@ func (cs *controllerState) buildStores(cfg *config.City) map[string]beads.Store 
 			// Legacy file mode aliases every rig to the same backing store, so
 			// the cache handle must be shared too for immediate cross-rig reads.
 			if sharedLegacyCachedStore == nil {
-				sharedLegacyCachedStore = wrapWithCachingStore(cs.cacheCtx, sharedLegacyFileStore, cs.eventProv, true)
+				sharedLegacyCachedStore = wrapWithCachingStore(cs.cacheCtx, sharedLegacyFileStore, cs.eventProv, true, "city:"+cs.cityName)
 			}
 			stores[rig.Name] = sharedLegacyCachedStore
 			continue
 		}
 		store = cs.openRigStore(scopeProvider, rig.Name, scopeRoot, rig.EffectivePrefix(), cfg)
-		stores[rig.Name] = wrapWithCachingStore(cs.cacheCtx, store, cs.eventProv, rigStoreBackgroundRefresh(suspState, rig))
+		stores[rig.Name] = wrapWithCachingStore(cs.cacheCtx, store, cs.eventProv, rigStoreBackgroundRefresh(suspState, rig), "rig:"+rig.Name)
 	}
 	return stores
 }
@@ -738,7 +738,7 @@ func (cs *controllerState) update(cfg *config.City, sp runtime.Provider) {
 	var cityMailProv mail.Provider
 	var extSvc *extmsg.Services
 	if cityStore != nil {
-		cityStore = wrapWithCachingStore(cs.cacheCtx, cityStore, cs.eventProv, true)
+		cityStore = wrapWithCachingStore(cs.cacheCtx, cityStore, cs.eventProv, true, "city:"+cs.cityName)
 		cityMailProv = newCityMailProvider(cityStore, cfg, cs.cityPath, cs.eventProv)
 		svc := extmsg.NewServices(cityStore)
 		extSvc = &svc

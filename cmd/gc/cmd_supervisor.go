@@ -2387,14 +2387,9 @@ func reconcileCities(
 			}()
 			defer l.Close() //nolint:errcheck // close listener (after socket removal)
 			defer telemetry.RecordControllerLifecycle(context.Background(), "stopped")
-			exitedBeforeCancel := false
-			runManagedCityAttempt(cityCancel, func() {
+			runManagedCityAttempt(cityCtx, cityCancel, startupReady.Load, stderr, n, func() {
 				cityRuntime.run(cityCtx)
-				exitedBeforeCancel = cityCtx.Err() == nil
 			})
-			if exitedBeforeCancel && !startupReady.Load() {
-				fmt.Fprintf(stderr, "gc supervisor: city '%s': runtime exited before startup readiness; canceled controller state and cache reconcilers; retrying on the next patrol\n", n) //nolint:errcheck
-			}
 		}(cityName, path, fr, lis, sockPath, sockInfo, lock)
 
 		rec.Record(events.Event{Type: events.ControllerStarted, Actor: "gc"})
@@ -2403,9 +2398,14 @@ func reconcileCities(
 	}
 }
 
-func runManagedCityAttempt(cancel context.CancelFunc, run func()) {
+func runManagedCityAttempt(ctx context.Context, cancel context.CancelFunc, startupReady func() bool, stderr io.Writer, cityName string, run func()) {
 	defer cancel()
 	run()
+	exitedBeforeCancel := ctx.Err() == nil
+	cancel()
+	if exitedBeforeCancel && !startupReady() {
+		fmt.Fprintf(stderr, "gc supervisor: city '%s': runtime exited before startup readiness; canceled controller state and cache reconcilers; retrying on the next patrol\n", cityName) //nolint:errcheck
+	}
 }
 
 func emitPendingCityCreateResult(cr *cityRegistry, path, cityName string, stderr io.Writer) {

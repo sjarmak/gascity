@@ -2060,7 +2060,7 @@ func TestWrapWithCachingStoreCachesNonBdStore(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	store := wrapWithCachingStore(context.Background(), backing, nil, true)
+	store := wrapWithCachingStore(context.Background(), backing, nil, true, "rig:test")
 	cached, ok := store.(*beads.CachingStore)
 	if !ok {
 		t.Fatalf("store type = %T, want *beads.CachingStore", store)
@@ -2079,7 +2079,7 @@ func TestWrapWithCachingStoreCachesNonBdStore(t *testing.T) {
 }
 
 func TestWrapWithCachingStoreReturnsNilStore(t *testing.T) {
-	if got := wrapWithCachingStore(context.Background(), nil, nil, true); got != nil {
+	if got := wrapWithCachingStore(context.Background(), nil, nil, true, "rig:test"); got != nil {
 		t.Fatalf("wrapWithCachingStore(nil) = %#v, want nil", got)
 	}
 }
@@ -2099,7 +2099,7 @@ func TestWrapWithCachingStoreNoBackgroundRefresh(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := wrapWithCachingStore(ctx, backing, nil, false)
+	store := wrapWithCachingStore(ctx, backing, nil, false, "rig:test")
 	cached, ok := store.(*beads.CachingStore)
 	if !ok {
 		t.Fatalf("store type = %T, want *beads.CachingStore", store)
@@ -4028,7 +4028,7 @@ func TestPrimeThenStartReconcilerArmsReconcilerOnPrimeFailure(t *testing.T) {
 
 	// "armed" is the FNV stagger for this agent ID; a non-zero value can
 	// only have been written by StartReconciler.
-	primeThenStartReconciler(ctx, cs, "armed")
+	primeThenStartReconciler(ctx, cs, "armed", "rig:test")
 
 	if got := cs.Stats().StaggerOffsetMs; got <= 0 {
 		t.Fatalf("StaggerOffsetMs = %d, want > 0 (reconciler must arm after failed prime)", got)
@@ -4045,7 +4045,7 @@ func TestPrimeThenStartReconcilerSkipsReconcilerOnShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	primeThenStartReconciler(ctx, cs, "armed")
+	primeThenStartReconciler(ctx, cs, "armed", "rig:test")
 
 	if got := cs.Stats().StaggerOffsetMs; got != 0 {
 		t.Fatalf("StaggerOffsetMs = %d, want 0 (reconciler must not arm after shutdown)", got)
