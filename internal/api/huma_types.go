@@ -218,7 +218,7 @@ type StatusWorkCounts struct {
 	DependencyReady int `json:"dependency_ready" doc:"Number of beads with all dependencies satisfied. Equal to ready; may include epics, gated, assigned/routed, or branch-ready beads that are not currently assignable."`
 	// SchedulerDispatchable is the subset of DependencyReady that could be
 	// handed to an agent right now: see beads.IsSchedulerDispatchable.
-	SchedulerDispatchable int `json:"scheduler_dispatchable" doc:"Subset of dependency_ready excluding already-assigned/routed beads, structural epic/rollup/convoy/molecule beads (by type or label), beads with an unresolved gate: label or an explicit dispatch-gate label (e.g. needs-decision, deferred, icebox, parked), and beads halted at branch-ready. This is the executable queue depth."`
+	SchedulerDispatchable int `json:"scheduler_dispatchable" doc:"Subset of dependency_ready excluding already-assigned/routed beads, structural epic/rollup/convoy/molecule beads (by type or label), beads with an unresolved gate: label or a canonical dispatch hold, and beads halted at branch-ready. User-defined labels do not become SDK dispatch policy. This is the executable queue depth."`
 	Open                  int `json:"open" doc:"Number of open work items."`
 }
 
