@@ -65,6 +65,15 @@ type MaintenanceRun struct {
 	SnapshotPath string
 }
 
+type pendingMaintenanceAlert struct {
+	provider mail.Provider
+	stderr   io.Writer
+	to       string
+	subject  string
+	body     string
+	logLabel string
+}
+
 // DoltOps is the minimal SQL surface the maintenance loop needs to run
 // CALL DOLT_GC() and the post-gc smoke test. Production wraps *sql.DB
 // via NewSQLDoltOps; tests supply fakes. Close must release the
@@ -357,11 +366,15 @@ func (m *StoreMaintenanceLoop) runOnce(ctx context.Context) {
 	if !m.mu.TryLock() {
 		return
 	}
-	defer m.mu.Unlock()
-	if ctx.Err() != nil {
-		return
-	}
-	m.executeCycleLocked(ctx)
+	alert := func() *pendingMaintenanceAlert {
+		defer m.mu.Unlock()
+		if ctx.Err() != nil {
+			return nil
+		}
+		_, alert := m.executeCycleLocked(ctx)
+		return alert
+	}()
+	deliverMaintenanceAlert(alert)
 }
 
 // TriggerNow runs one maintenance cycle synchronously, returning the
@@ -381,11 +394,19 @@ func (m *StoreMaintenanceLoop) TriggerNow(ctx context.Context) (MaintenanceRun, 
 		}
 		return MaintenanceRun{}, &MaintenanceInProgressError{StartedAt: started}
 	}
-	defer m.mu.Unlock()
-	if err := ctx.Err(); err != nil {
+	run, alert, err := func() (MaintenanceRun, *pendingMaintenanceAlert, error) {
+		defer m.mu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return MaintenanceRun{}, nil, err
+		}
+		run, alert := m.executeCycleLocked(ctx)
+		return run, alert, nil
+	}()
+	if err != nil {
 		return MaintenanceRun{}, err
 	}
-	return m.executeCycleLocked(ctx), nil
+	deliverMaintenanceAlert(alert)
+	return run, nil
 }
 
 // InFlightStart reports the start time of the currently-in-flight
@@ -404,7 +425,7 @@ func (m *StoreMaintenanceLoop) InFlightStart() (time.Time, bool) {
 // held. Callers are responsible for acquiring/releasing the lease and for
 // the context-cancellation pre-check; this method focuses on the cycle
 // body so runOnce and TriggerNow share exactly one code path.
-func (m *StoreMaintenanceLoop) executeCycleLocked(ctx context.Context) MaintenanceRun {
+func (m *StoreMaintenanceLoop) executeCycleLocked(ctx context.Context) (MaintenanceRun, *pendingMaintenanceAlert) {
 	started := m.clock()
 	m.runStartedAt.Store(&started)
 	defer m.runStartedAt.Store(nil)
@@ -425,7 +446,7 @@ func (m *StoreMaintenanceLoop) executeCycleLocked(ctx context.Context) Maintenan
 	return m.finishCycleLocked(started, snapshotPath, nil)
 }
 
-func (m *StoreMaintenanceLoop) finishCycleLocked(started time.Time, snapshotPath string, err error) MaintenanceRun {
+func (m *StoreMaintenanceLoop) finishCycleLocked(started time.Time, snapshotPath string, err error) (MaintenanceRun, *pendingMaintenanceAlert) {
 	run := MaintenanceRun{
 		StartedAt:    started,
 		FinishedAt:   m.clock(),
@@ -443,22 +464,16 @@ func (m *StoreMaintenanceLoop) finishCycleLocked(started time.Time, snapshotPath
 	}
 	m.lastRunAt = started
 	m.appendHistoryLocked(run)
+	alert := m.prepareAlertLocked(run)
 	m.emitRunEvent(run)
-	return run
+	return run, alert
 }
 
-// emitRunEvent is the single run-completion side-effect point: it drives
-// the operator-alert state machine and records the typed
-// gc.store.maintenance.done or gc.store.maintenance.failed event. The
-// failed variant fires when run.Err is non-empty; the done variant
-// otherwise. Emission failures are swallowed (the recorder itself is
-// best-effort). emitRunEvent does not lock: the alert-dedup state it
-// mutates is guarded by m.mu, which production callers already hold —
-// m.mu doubles as the cycle lease, held for the whole maintenance run
-// (finishCycleLocked), so the alert mail send under it adds negligible
-// hold time to a lease that already spans the multi-minute cycle.
+// emitRunEvent records the typed gc.store.maintenance.done or
+// gc.store.maintenance.failed event for a completed run. The failed variant
+// fires when run.Err is non-empty; the done variant otherwise. Emission
+// failures are swallowed (the recorder itself is best-effort).
 func (m *StoreMaintenanceLoop) emitRunEvent(run MaintenanceRun) {
-	m.maybeSendAlertLocked(run)
 	if m.recorder == nil {
 		return
 	}
@@ -500,12 +515,10 @@ func (m *StoreMaintenanceLoop) emitRunEvent(run MaintenanceRun) {
 	})
 }
 
-// maybeSendAlertLocked drives the operator-alert state machine after each
-// run. Mail fires on failure-fingerprint CHANGE only: entering a failure
-// state (or the failure changing shape) sends one alert; identical repeats
-// are counted but suppressed; the first success after an alerted failure
-// sends one recovery notice. Caller must hold m.mu.
-func (m *StoreMaintenanceLoop) maybeSendAlertLocked(run MaintenanceRun) {
+// prepareAlertLocked advances the operator-alert state machine and snapshots
+// any message that should be delivered after the maintenance lease is
+// released. Caller must hold m.mu.
+func (m *StoreMaintenanceLoop) prepareAlertLocked(run MaintenanceRun) *pendingMaintenanceAlert {
 	fingerprint := ""
 	if run.Err != "" {
 		fingerprint = run.Stage + "\x00" + run.Err
@@ -518,17 +531,20 @@ func (m *StoreMaintenanceLoop) maybeSendAlertLocked(run MaintenanceRun) {
 		}
 	case "":
 		// Failure→success: recovery notice, back to the healthy state.
-		m.sendRecoveryNotice(run)
+		alert := m.prepareRecoveryNoticeLocked(run)
 		m.alertFingerprint = ""
 		m.alertSince = time.Time{}
 		m.alertSuppressed = 0
+		return alert
 	default:
 		// New failure, or the failure changed shape mid-streak.
-		m.sendFailureAlert(run)
+		alert := m.prepareFailureAlert(run)
 		m.alertFingerprint = fingerprint
 		m.alertSince = run.StartedAt
 		m.alertSuppressed = 0
+		return alert
 	}
+	return nil
 }
 
 // checkDiskPreflight checks free space in cityPath's filesystem before a
@@ -599,15 +615,11 @@ func (m *StoreMaintenanceLoop) emitDiskEvent(eventType string, free int64) {
 	})
 }
 
-// sendFailureAlert posts one best-effort operator alert mail for a
-// failed maintenance run. Callers gate it on fingerprint change (see
-// maybeSendAlertLocked) so it fires once per distinct failure, not per
-// interval. It is a no-op when Mail is unset or AlertTo is empty; Send
-// errors are logged to stderr but never propagate. The subject and body
-// shape is stable and documented in the runbook (ga-d5y / ga-sec).
-func (m *StoreMaintenanceLoop) sendFailureAlert(run MaintenanceRun) {
+// prepareFailureAlert renders one operator alert for delivery after the
+// maintenance lease is released.
+func (m *StoreMaintenanceLoop) prepareFailureAlert(run MaintenanceRun) *pendingMaintenanceAlert {
 	if m.mail == nil || m.cfg.AlertTo == "" {
-		return
+		return nil
 	}
 	duration := run.FinishedAt.Sub(run.StartedAt).Seconds()
 	if duration < 0 {
@@ -627,21 +639,21 @@ func (m *StoreMaintenanceLoop) sendFailureAlert(run MaintenanceRun) {
 	fmt.Fprintf(&body, "City:          %s\n", m.cityPath)
 	fmt.Fprintf(&body, "Next retry:    %s (approximate; actual time subject to jitter)\n", nextRetry)
 
-	if _, err := m.mail.Send(maintenanceActor, m.cfg.AlertTo, subject, body.String()); err != nil {
-		fmt.Fprintf(m.stderr, "store-maintenance: alert mail send failed: %v\n", err) //nolint:errcheck // best-effort stderr
+	return &pendingMaintenanceAlert{
+		provider: m.mail,
+		stderr:   m.stderr,
+		to:       m.cfg.AlertTo,
+		subject:  subject,
+		body:     body.String(),
+		logLabel: "alert",
 	}
 }
 
-// sendRecoveryNotice posts one best-effort operator mail when a run
-// succeeds after an alerted failure streak, closing the loop opened by
-// sendFailureAlert. Caller must hold m.mu (it reads the alert dedup
-// state). No-op when Mail is unset, AlertTo is empty, or no failure
-// alert was attempted for the streak (alertFingerprint is empty).
-// Send success is not tracked: if the failure alert's Send errored,
-// the recovery notice is still attempted — both are best-effort.
-func (m *StoreMaintenanceLoop) sendRecoveryNotice(run MaintenanceRun) {
+// prepareRecoveryNoticeLocked renders one recovery notice while the failure
+// streak state is stable. Caller must hold m.mu.
+func (m *StoreMaintenanceLoop) prepareRecoveryNoticeLocked(run MaintenanceRun) *pendingMaintenanceAlert {
 	if m.mail == nil || m.cfg.AlertTo == "" || m.alertFingerprint == "" {
-		return
+		return nil
 	}
 	stage, errMsg, _ := strings.Cut(m.alertFingerprint, "\x00")
 
@@ -657,8 +669,22 @@ func (m *StoreMaintenanceLoop) sendRecoveryNotice(run MaintenanceRun) {
 	fmt.Fprintf(&body, "Recovered at:  %s\n", run.FinishedAt.UTC().Format(time.RFC3339))
 	fmt.Fprintf(&body, "City:          %s\n", m.cityPath)
 
-	if _, err := m.mail.Send(maintenanceActor, m.cfg.AlertTo, subject, body.String()); err != nil {
-		fmt.Fprintf(m.stderr, "store-maintenance: recovery mail send failed: %v\n", err) //nolint:errcheck // best-effort stderr
+	return &pendingMaintenanceAlert{
+		provider: m.mail,
+		stderr:   m.stderr,
+		to:       m.cfg.AlertTo,
+		subject:  subject,
+		body:     body.String(),
+		logLabel: "recovery",
+	}
+}
+
+func deliverMaintenanceAlert(alert *pendingMaintenanceAlert) {
+	if alert == nil {
+		return
+	}
+	if _, err := alert.provider.Send(maintenanceActor, alert.to, alert.subject, alert.body); err != nil {
+		fmt.Fprintf(alert.stderr, "store-maintenance: %s mail send failed: %v\n", alert.logLabel, err) //nolint:errcheck // best-effort stderr
 	}
 }
 

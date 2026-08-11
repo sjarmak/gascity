@@ -2,6 +2,8 @@ package supervisor
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,50 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/mail"
 )
+
+type reentrantMailProvider struct {
+	mail.Provider
+	onSend func()
+}
+
+func (p *reentrantMailProvider) Send(from, to, subject, body string) (mail.Message, error) {
+	p.onSend()
+	return p.Provider.Send(from, to, subject, body)
+}
+
+func TestAlert_SendRunsAfterMaintenanceLeaseRelease(t *testing.T) {
+	mailProvider := &reentrantMailProvider{Provider: mail.NewFake()}
+	loop := NewStoreMaintenanceLoop(StoreMaintenanceLoopDeps{
+		Cfg: config.DoltMaintenance{
+			Enabled: true,
+			AlertTo: "gascity/mayor",
+		},
+		CityPath: "/tmp/city",
+		Recorder: events.NewFake(),
+		Mail:     mailProvider,
+		OpenDoltBackup: func(context.Context) (DoltBackupRunner, error) {
+			return nil, errors.New("backup unavailable")
+		},
+	})
+	mailProvider.onSend = func() {
+		_ = loop.History()
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := loop.TriggerNow(context.Background())
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("TriggerNow: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("TriggerNow deadlocked when alert mail re-entered History")
+	}
+}
 
 // TestAlert_SentOnFailureWithAlertTo covers the primary happy path for
 // alert mail: a failing MaintenanceRun with AlertTo configured must
@@ -326,11 +372,12 @@ func TestAlert_NilMailProviderSkips(t *testing.T) {
 	})
 }
 
-// emitRunEventLocked calls emitRunEvent under loop.mu, matching the
-// production contract (callers hold the lease mutex; the alert-dedup
-// state emitRunEvent mutates is mu-guarded).
+// emitRunEventLocked mirrors production completion: update alert state and
+// record the event under the lease, then deliver mail after releasing it.
 func emitRunEventLocked(loop *StoreMaintenanceLoop, run MaintenanceRun) {
 	loop.mu.Lock()
-	defer loop.mu.Unlock()
+	alert := loop.prepareAlertLocked(run)
 	loop.emitRunEvent(run)
+	loop.mu.Unlock()
+	deliverMaintenanceAlert(alert)
 }
