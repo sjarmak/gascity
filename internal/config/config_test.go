@@ -3713,8 +3713,8 @@ func TestDaemonAutoReapClosedBeadWorktreesExplicitFalse(t *testing.T) {
 
 func TestDaemonAutoReapClosedBeadWorktreesDryRunDefault(t *testing.T) {
 	d := DaemonConfig{}
-	if d.AutoReapClosedBeadWorktreesDryRunEnabled() {
-		t.Errorf("AutoReapClosedBeadWorktreesDryRunEnabled() = true, want false (default)")
+	if !d.AutoReapClosedBeadWorktreesDryRunEnabled() {
+		t.Errorf("AutoReapClosedBeadWorktreesDryRunEnabled() = false, want true (safe default)")
 	}
 }
 
@@ -3758,6 +3758,13 @@ func TestDaemonAutoReapClosedBeadWorktreesMinAgeMinutesExplicitZeroDisables(t *t
 	got := d.AutoReapClosedBeadWorktreesMinAge()
 	if got != 0 {
 		t.Errorf("AutoReapClosedBeadWorktreesMinAge() = %v, want 0 (quarantine disabled)", got)
+	}
+}
+
+func TestDaemonAutoReapClosedBeadWorktreesMaxRemoveDefault(t *testing.T) {
+	d := DaemonConfig{}
+	if got := d.AutoReapClosedBeadWorktreesMaxRemovePerRun(); got != 10 {
+		t.Fatalf("max remove=%d, want 10", got)
 	}
 }
 

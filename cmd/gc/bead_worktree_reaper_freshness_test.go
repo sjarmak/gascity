@@ -46,7 +46,7 @@ func TestReapClosedBeadWorktrees_ProtectsFreshWorktreeUnderDefaultQuarantine(t *
 // other gate passes).
 func TestReapClosedBeadWorktrees_ReapsWorktreeOlderThanDefaultMinAge(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
-	wt := addClosedWorktree(t, rigRoot, cityPath, "builder", "ga-old0001") // backdated 24h by the shared helper
+	wt := addClosedWorktree(t, rigRoot, cityPath, "builder", "ga-old0001") // backdated past the 3d default by the shared helper
 	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-old0001", Status: "closed"}}, nil)
 	cfg := reapTestConfig(rigRoot)
 	injectLiveness(t, liveWorktreeState{scanned: true})

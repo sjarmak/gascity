@@ -3,6 +3,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -245,6 +246,49 @@ func (g *Git) HasUnreachableCommitsResult() (bool, error) {
 		return false, fmt.Errorf("checking unreachable commits: %w", err)
 	}
 	return strings.TrimSpace(out) != "", nil
+}
+
+// HeadLandedOnDefaultResult reports whether HEAD is either an ancestor of the
+// repository's default branch or every HEAD-only commit is patch-equivalent to
+// that branch. Reachability from other refs (including rescue refs) is
+// deliberately irrelevant: such refs preserve work but do not prove landing.
+func (g *Git) HeadLandedOnDefaultResult() (bool, error) {
+	branch, err := g.DefaultBranch()
+	if err != nil {
+		return false, fmt.Errorf("resolving default branch: %w", err)
+	}
+	var defaultRef string
+	for _, candidate := range []string{"refs/heads/" + branch, "refs/remotes/origin/" + branch} {
+		if _, probeErr := g.run("rev-parse", "--verify", candidate+"^{commit}"); probeErr == nil {
+			defaultRef = candidate
+			break
+		}
+	}
+	if defaultRef == "" {
+		return false, fmt.Errorf("default branch %q has no resolvable local or origin ref", branch)
+	}
+
+	if _, ancestorErr := g.run("merge-base", "--is-ancestor", "HEAD", defaultRef); ancestorErr == nil {
+		return true, nil
+	} else if !gitExitCode(ancestorErr, 1) {
+		return false, fmt.Errorf("testing HEAD ancestry against %s: %w", defaultRef, ancestorErr)
+	}
+
+	out, err := g.run("cherry", defaultRef, "HEAD")
+	if err != nil {
+		return false, fmt.Errorf("testing patch equivalence against %s: %w", defaultRef, err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "+") {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func gitExitCode(err error, code int) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == code
 }
 
 // HasStashes reports whether the repository has stashed work.

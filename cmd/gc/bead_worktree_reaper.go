@@ -71,15 +71,10 @@ type reapReport struct {
 //     sit at or beneath the worktree. If the liveness scan is indeterminate
 //     (no /proc), NOTHING is reaped this pass — the reaper cannot prove any
 //     tree is idle (root cause B: closed-bead != end-of-use).
-//  6. Git state: no uncommitted changes, no stashes, and no commits that
-//     removing the worktree would orphan — commits reachable from no branch,
-//     tag, or remote-tracking ref (git.HasUnreachableCommitsResult). The test
-//     is deliberately reachability, not push state: `git worktree remove`
-//     deletes the checkout, not refs/heads. Gating on push state instead made
-//     the reaper a no-op for exactly the worktrees it exists to collect,
-//     because a merge queue that deletes the merged branch from origin leaves
-//     every merged bead's HEAD permanently unreached by any remote ref
-//     (gastownhall/gascity ga-uh1m). A failed probe protects the tree.
+//  6. Git state: no uncommitted changes or stashes, and HEAD is landed on the
+//     default branch either by ancestry or patch equivalence. Reachability
+//     from any other ref, especially a rescue ref, is preservation evidence
+//     only and never proves landing. A failed probe protects the tree.
 //
 // When dryRun is true the reaper performs all discovery and classification and
 // emits bead.worktree.reap_skipped events describing what it would reap and
@@ -102,6 +97,7 @@ func reapClosedBeadWorktrees(
 	stderr io.Writer,
 ) reapReport {
 	report := reapReport{DryRun: dryRun}
+	successfulRemovals := 0
 	if stderr == nil {
 		stderr = io.Discard
 	}
@@ -206,6 +202,29 @@ func reapClosedBeadWorktrees(
 				continue
 			}
 
+			if reason := cleanupDispositionProtectReason(bead, rigRoot, wt); reason != "" {
+				if skips.shouldSurface(worktreePath, reason) {
+					fmt.Fprintf(stderr, "reapClosedBeadWorktrees: protecting %s (bead %s closed but %s)\n", worktreePath, beadID, reason) //nolint:errcheck
+					recordReapSkipped(rec, beadID, worktreePath, rigName, reason)
+				}
+				report.Protected = append(report.Protected, reapDecision{
+					BeadID: beadID, Path: worktreePath, Rig: rigName, Branch: wt.Branch, Reason: reason,
+				})
+				continue
+			}
+
+			if registeredChild := registeredChildWorktree(worktreePath, worktrees); registeredChild != "" {
+				reason := fmt.Sprintf("topology unsafe: registered child worktree %s", registeredChild)
+				if skips.shouldSurface(worktreePath, reason) {
+					fmt.Fprintf(stderr, "reapClosedBeadWorktrees: protecting %s (bead %s closed but %s)\n", worktreePath, beadID, reason) //nolint:errcheck
+					recordReapSkipped(rec, beadID, worktreePath, rigName, reason)
+				}
+				report.Protected = append(report.Protected, reapDecision{
+					BeadID: beadID, Path: worktreePath, Rig: rigName, Branch: wt.Branch, Reason: reason,
+				})
+				continue
+			}
+
 			// Freshness quarantine (FR-5): a worktree younger than the
 			// configured minimum age is exempt from reaping, protecting
 			// against the race between worktree creation and its owning
@@ -235,7 +254,7 @@ func reapClosedBeadWorktrees(
 				continue
 			}
 
-			candidates = append(candidates, reapCandidate{beadID: beadID, worktreePath: worktreePath})
+			candidates = append(candidates, reapCandidate{beadID: beadID, worktreePath: worktreePath, head: wt.Head})
 		}
 
 		if len(candidates) == 0 {
@@ -300,15 +319,15 @@ func reapClosedBeadWorktrees(
 			if reason == "" {
 				wg := git.New(worktreePath)
 				hasUncommitted := wg.HasUncommittedWork()
-				hasUnreachable, unreachableErr := wg.HasUnreachableCommitsResult()
+				landed, landedErr := wg.HeadLandedOnDefaultResult()
 				hasStashes, stashErr := wg.HasStashesResult()
 				switch {
-				case unreachableErr != nil:
-					reason = fmt.Sprintf("git probe failed (failing closed): %v", unreachableErr)
+				case landedErr != nil:
+					reason = fmt.Sprintf("git probe failed (failing closed): %v", landedErr)
 				case stashErr != nil:
 					reason = fmt.Sprintf("git probe failed (failing closed): %v", stashErr)
-				case hasUncommitted || hasUnreachable || hasStashes:
-					reason = fmt.Sprintf("unsafe git state: uncommitted=%v unreachable=%v stashes=%v", hasUncommitted, hasUnreachable, hasStashes)
+				case hasUncommitted || !landed || hasStashes:
+					reason = fmt.Sprintf("unsafe git state: uncommitted=%v landed=%v stashes=%v", hasUncommitted, landed, hasStashes)
 				}
 			}
 
@@ -343,6 +362,32 @@ func reapClosedBeadWorktrees(
 				continue
 			}
 
+			if successfulRemovals >= cfg.Daemon.AutoReapClosedBeadWorktreesMaxRemovePerRun() {
+				reason = fmt.Sprintf("per-run removal limit reached: max_remove=%d", cfg.Daemon.AutoReapClosedBeadWorktreesMaxRemovePerRun())
+				if skips.shouldSurface(worktreePath, reason) {
+					fmt.Fprintf(stderr, "reapClosedBeadWorktrees: protecting %s (bead %s closed but %s)\n", worktreePath, beadID, reason) //nolint:errcheck
+					recordReapSkipped(rec, beadID, worktreePath, rigName, reason)
+				}
+				report.Protected = append(report.Protected, reapDecision{
+					BeadID: beadID, Path: worktreePath, Rig: rigName, Branch: branch, Reason: reason,
+				})
+				continue
+			}
+
+			bead, err := store.Get(beadID)
+			if err != nil {
+				reason = fmt.Sprintf("reloading bead before cleanup manifest (failing closed): %v", err)
+				report.Protected = append(report.Protected, reapDecision{BeadID: beadID, Path: worktreePath, Rig: rigName, Branch: branch, Reason: reason})
+				continue
+			}
+			manifestWT := git.Worktree{Path: worktreePath, Branch: branch, Head: c.head}
+			if err := manifestWorktreeCleanup(store, bead, rigRoot, manifestWT); err != nil {
+				reason = fmt.Sprintf("recording pre-removal cleanup manifest (failing closed): %v", err)
+				fmt.Fprintf(stderr, "reapClosedBeadWorktrees: protecting %s (bead %s closed but %s)\n", worktreePath, beadID, reason) //nolint:errcheck
+				report.Protected = append(report.Protected, reapDecision{BeadID: beadID, Path: worktreePath, Rig: rigName, Branch: branch, Reason: reason})
+				continue
+			}
+
 			// Remove the worktree from the OWNING rig repository. git worktree
 			// remove must be run from the main repo root, not from within the
 			// worktree being removed.
@@ -370,6 +415,7 @@ func reapClosedBeadWorktrees(
 			report.Reaped = append(report.Reaped, reapDecision{
 				BeadID: beadID, Path: worktreePath, Rig: rigName, Branch: branch,
 			})
+			successfulRemovals++
 		}
 	}
 	return report
@@ -381,6 +427,16 @@ func reapClosedBeadWorktrees(
 type reapCandidate struct {
 	beadID       string
 	worktreePath string
+	head         string
+}
+
+func registeredChildWorktree(parent string, worktrees []git.Worktree) string {
+	for _, wt := range worktrees {
+		if isStrictlyUnderDir(parent, wt.Path) {
+			return wt.Path
+		}
+	}
+	return ""
 }
 
 // reapSkipTracker makes the reaper's skip reporting edge-triggered, so a

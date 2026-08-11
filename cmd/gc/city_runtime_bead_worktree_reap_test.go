@@ -55,7 +55,10 @@ func TestCityRuntimeTick_SkipsClosedBeadWorktreeReapWhenDisabled(t *testing.T) {
 
 	cfg := reapTestConfig(rigRoot)
 	disabled := false
-	cfg.Daemon = config.DaemonConfig{AutoReapClosedBeadWorktrees: &disabled}
+	cfg.Daemon = config.DaemonConfig{
+		AutoReapClosedBeadWorktrees:       &disabled,
+		AutoReapClosedBeadWorktreesDryRun: &disabled,
+	}
 
 	var stderr bytes.Buffer
 	runReapTick(t, newReapTickRuntime(cityPath, cfg, store, &stderr))

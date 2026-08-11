@@ -2612,21 +2612,21 @@ type DaemonConfig struct {
 	AutoRestartOnDrift *bool `toml:"auto_restart_on_drift,omitempty" jsonschema:"default=true"`
 	// AutoReapClosedBeadWorktrees controls whether the reconciler patrol
 	// automatically removes per-bead git worktrees once their associated
-	// work bead reaches closed status. Only worktrees with a clean working
-	// tree, no stashes, and no commits that removal would orphan — commits
-	// reachable from no branch, tag, or remote-tracking ref — are removed;
-	// push state is deliberately not the test, since `git worktree remove`
-	// deletes the checkout and not refs/heads. Unsafe worktrees are logged
-	// as warnings and left in place for operator review. Session
-	// home directories (agent template directories) are never touched.
+	// work bead reaches closed status. Removal requires the durable terminal
+	// disposition plus every fail-closed safety gate: registered topology,
+	// staleness, no active bead/session/process reference, a clean tree, and
+	// HEAD landed on the default branch by ancestry or patch equivalence.
+	// Rescue refs preserve work but never prove landing. A pre-removal manifest
+	// is written before non-forced worktree removal; branch refs remain intact.
+	// Unsafe worktrees are reported and retained for operator review.
 	// Defaults to false. Set to true to enable automated worktree cleanup.
 	AutoReapClosedBeadWorktrees *bool `toml:"auto_reap_closed_bead_worktrees,omitempty" jsonschema:"default=false"`
 	// AutoReapClosedBeadWorktreesDryRun makes the reconciler patrol run the
 	// full worktree-reap classification each tick — discovery, closed-bead
 	// match, liveness gate, and git-safety probes — but emit
 	// bead.worktree.reap_skipped events describing what it WOULD reap and
-	// what it protected, without removing anything. This is the safe
-	// staged-rollout surface: an operator enables dry-run first, confirms via
+	// what it protected, without removing anything. This is the default safe
+	// staged-rollout surface: an operator confirms via
 	// `gc events` that no live worktree appears in the would-reap set, then
 	// enables AutoReapClosedBeadWorktrees for real removal. Those events are
 	// edge-triggered: each worktree is reported when the patrol first
@@ -2634,8 +2634,9 @@ type DaemonConfig struct {
 	// tick, so the would-reap set is complete right after dry-run is enabled
 	// rather than reprinted every sweep. Dry-run has no effect when
 	// AutoReapClosedBeadWorktrees is already true (real removal supersedes
-	// it). Defaults to false.
-	AutoReapClosedBeadWorktreesDryRun *bool `toml:"auto_reap_closed_bead_worktrees_dry_run,omitempty" jsonschema:"default=false"`
+	// it). Defaults to true so the shipped mode classifies and reports without
+	// deleting; real removal remains separately opt-in.
+	AutoReapClosedBeadWorktreesDryRun *bool `toml:"auto_reap_closed_bead_worktrees_dry_run,omitempty" jsonschema:"default=true"`
 	// AutoReapClosedBeadWorktreesMinAgeMinutes is the minimum worktree age,
 	// in minutes, before a closed-bead worktree becomes eligible for reap
 	// classification at all (borrow-veto scan and beyond). This quarantines
@@ -2647,7 +2648,11 @@ type DaemonConfig struct {
 	// DefaultAutoReapClosedBeadWorktreesMinAgeMinutes. Zero disables the
 	// quarantine entirely (every closed-bead worktree is immediately
 	// eligible for the rest of the gate chain, regardless of age).
-	AutoReapClosedBeadWorktreesMinAgeMinutes *int `toml:"auto_reap_closed_bead_worktrees_min_age_minutes,omitempty" jsonschema:"default=10"`
+	AutoReapClosedBeadWorktreesMinAgeMinutes *int `toml:"auto_reap_closed_bead_worktrees_min_age_minutes,omitempty" jsonschema:"default=4320"`
+	// AutoReapClosedBeadWorktreesMaxRemove bounds successful removals in one
+	// patrol pass. Nil defaults to 10; zero disables removal while retaining
+	// classification. The bound limits the blast radius of a bad classifier.
+	AutoReapClosedBeadWorktreesMaxRemove *int `toml:"auto_reap_closed_bead_worktrees_max_remove,omitempty" jsonschema:"default=10"`
 	// StartReadyTimeout is how long `gc start` and `gc register` wait for
 	// the supervisor to report the city as Running. Cities with many
 	// registered or adopted sessions take longer to start because the
@@ -2703,20 +2708,20 @@ func (d *DaemonConfig) AutoReapClosedBeadWorktreesEnabled() bool {
 
 // AutoReapClosedBeadWorktreesDryRunEnabled reports whether the patrol should
 // run the worktree-reap classification and emit would-reap/protected events
-// without removing anything. Defaults to false when the field is unset (nil).
+// without removing anything. Defaults to true when the field is unset (nil).
 // Real removal (AutoReapClosedBeadWorktreesEnabled) supersedes dry-run: when
 // both are set, the reaper deletes for real, so callers should treat dry-run
 // as active only when this is true AND real reaping is off.
 func (d *DaemonConfig) AutoReapClosedBeadWorktreesDryRunEnabled() bool {
 	if d.AutoReapClosedBeadWorktreesDryRun == nil {
-		return false
+		return true
 	}
 	return *d.AutoReapClosedBeadWorktreesDryRun
 }
 
 // DefaultAutoReapClosedBeadWorktreesMinAgeMinutes is the quarantine window
 // applied when AutoReapClosedBeadWorktreesMinAgeMinutes is unset.
-const DefaultAutoReapClosedBeadWorktreesMinAgeMinutes = 10
+const DefaultAutoReapClosedBeadWorktreesMinAgeMinutes = 3 * 24 * 60
 
 // AutoReapClosedBeadWorktreesMinAge returns the minimum worktree age before a
 // closed-bead worktree is eligible for reap classification. Defaults to
@@ -2727,6 +2732,15 @@ func (d *DaemonConfig) AutoReapClosedBeadWorktreesMinAge() time.Duration {
 		return time.Duration(DefaultAutoReapClosedBeadWorktreesMinAgeMinutes) * time.Minute
 	}
 	return time.Duration(*d.AutoReapClosedBeadWorktreesMinAgeMinutes) * time.Minute
+}
+
+// AutoReapClosedBeadWorktreesMaxRemovePerRun returns the successful-removal
+// cap for one patrol pass. Negative configured values fail closed to zero.
+func (d *DaemonConfig) AutoReapClosedBeadWorktreesMaxRemovePerRun() int {
+	if d.AutoReapClosedBeadWorktreesMaxRemove == nil {
+		return 10
+	}
+	return max(0, *d.AutoReapClosedBeadWorktreesMaxRemove)
 }
 
 // AutoPruneWorkerDirEnabled reports whether the reconciler should remove a
