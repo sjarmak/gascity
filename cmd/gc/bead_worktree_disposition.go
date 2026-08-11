@@ -5,6 +5,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	gitcore "github.com/gastownhall/gascity/internal/git"
@@ -12,15 +13,15 @@ import (
 )
 
 const (
-	worktreeCleanupPendingKey = "gc.worktree_cleanup_pending"
-	worktreeCleanupPathKey    = "gc.worktree_cleanup_path"
-	worktreeCleanupRepoKey    = "gc.worktree_cleanup_repo"
-	worktreeCleanupBranchKey  = "gc.worktree_cleanup_branch"
-	worktreeCleanupHeadKey    = "gc.worktree_cleanup_head"
-	worktreeCleanupReasonKey  = "gc.worktree_cleanup_reason"
+	worktreeCleanupPendingKey = beadmeta.WorktreeCleanupPendingMetadataKey
+	worktreeCleanupPathKey    = beadmeta.WorktreeCleanupPathMetadataKey
+	worktreeCleanupRepoKey    = beadmeta.WorktreeCleanupRepoMetadataKey
+	worktreeCleanupBranchKey  = beadmeta.WorktreeCleanupBranchMetadataKey
+	worktreeCleanupHeadKey    = beadmeta.WorktreeCleanupHeadMetadataKey
+	worktreeCleanupReasonKey  = beadmeta.WorktreeCleanupReasonMetadataKey
 
-	worktreeCleanupManifestVersionKey  = "gc.worktree_cleanup_manifest_version"
-	worktreeCleanupManifestCriteriaKey = "gc.worktree_cleanup_manifest_criteria"
+	worktreeCleanupManifestVersionKey  = beadmeta.WorktreeCleanupManifestVersionMetadataKey
+	worktreeCleanupManifestCriteriaKey = beadmeta.WorktreeCleanupManifestCriteriaMetadataKey
 )
 
 const worktreeCleanupCriteriaV1 = "registered,repo-branch-no-drift,clean,landed,process-visible-idle,no-live-session,no-active-bead-reference,topology-safe,stale,rescue-ref-not-landing"
@@ -101,7 +102,7 @@ func recordClosedWorktreeCleanupDispositions(cfg *config.City, rigStores map[str
 }
 
 func terminalWorktreePath(work beads.Bead) (string, bool) {
-	canonical := strings.TrimSpace(work.Metadata["gc.work_dir"])
+	canonical := strings.TrimSpace(work.Metadata[beadmeta.WorkDirMetadataKey])
 	legacy := strings.TrimSpace(work.Metadata["work_dir"])
 	if canonical != "" && legacy != "" && !pathutil.SamePath(canonical, legacy) {
 		return "", false
