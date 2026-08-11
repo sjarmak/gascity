@@ -116,6 +116,15 @@ func parseHolder(raw string) (Holder, error) {
 
 // Record is a decoded lease. It is comparable, so two records are equal only
 // when every field matches, including the holder's instance token.
+//
+// Comparing with == is only meaningful between canonical records. time.Time
+// compares its wall clock, monotonic reading and location, so a record built
+// from time.Now() or from a non-UTC zone is != the record it decodes back to,
+// even though both encode to the identical wire string. Decode always yields
+// canonical records; a caller-built record does not until it passes through
+// Canonical. Comparing a caller-built record against a decoded one with ==
+// silently reports "the lease changed" when nothing changed, which is the
+// wrong answer for a fence check.
 type Record struct {
 	// Epoch is the fencing counter. Zero is a legal epoch: absence of the
 	// record, not a zero epoch, is the unleased condition. Negative values
@@ -132,6 +141,18 @@ type Record struct {
 	// Zero is legal and means no attempt has been retried. Negative values
 	// are not representable on the wire.
 	Attempts int64
+}
+
+// Canonical returns the record with its expiry in the form Decode produces:
+// UTC, with any monotonic reading stripped. It is the fixed point that makes
+// == meaningful, so a caller comparing a record it built against one it
+// decoded should canonicalize the built one first. The zero expiry carried by
+// StateParked and StateDead is already canonical and is left alone.
+func (r Record) Canonical() Record {
+	if !r.ExpiresAt.IsZero() {
+		r.ExpiresAt = r.ExpiresAt.UTC().Round(0)
+	}
+	return r
 }
 
 // Validate reports whether the record can be encoded: a known state, a
@@ -334,12 +355,27 @@ func Unleased() Lease {
 	return Lease{}
 }
 
+// opaque is the fail-closed lease returned alongside every error. It is
+// present, so IsUnleased reports false, and it carries the zero Record, whose
+// holder can never equal a real holder because NewHolder rejects empty parts.
+//
+// The direction matters more than the value. A caller that ignores or defers
+// the error must not be able to read an error result as "nothing owns this":
+// that turns one malformed byte in the store into two workers claiming one
+// bead, which is the failure this package exists to prevent. Reading it as
+// "held by someone I am not" costs a stalled claim and a loud downstream
+// mismatch instead, and both are recoverable.
+func opaque() Lease {
+	return Lease{present: true}
+}
+
 // Present wraps a record as a present lease. It validates the record and
-// returns the unleased lease with an error when the record is not encodable,
-// so an invalid record cannot masquerade as ownership.
+// returns the fail-closed lease with an error when the record is not
+// encodable, so an invalid record cannot masquerade as ownership OR as
+// absence.
 func Present(r Record) (Lease, error) {
 	if err := r.Validate(); err != nil {
-		return Lease{}, fmt.Errorf("building lease: %w", err)
+		return opaque(), fmt.Errorf("building lease: %w", err)
 	}
 	return Lease{present: true, record: r}, nil
 }
@@ -367,13 +403,16 @@ func (l Lease) Record() (Record, bool) {
 //
 // An absent value is the unleased condition; a present value is decoded, and a
 // present empty string is malformed rather than absent.
+//
+// A decode failure returns the fail-closed lease, never the unleased one. Only
+// a genuinely absent key decodes to unleased.
 func DecodeLease(raw string, present bool) (Lease, error) {
 	if !present {
 		return Unleased(), nil
 	}
 	rec, err := Decode(raw)
 	if err != nil {
-		return Unleased(), err
+		return opaque(), err
 	}
 	return Lease{present: true, record: rec}, nil
 }

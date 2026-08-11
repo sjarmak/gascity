@@ -376,9 +376,19 @@ func TestNewHolderRejectsMalformedParts(t *testing.T) {
 		{"empty agent", "", "seat-1", "inst-01"},
 		{"empty session", "worker-a", "", "inst-01"},
 		{"empty token", "worker-a", "seat-1", ""},
+		// The full part-by-separator matrix, not just the diagonal. Every
+		// part must reject every separator: the guard is one shared
+		// ContainsAny today, and a refactor that gave each part its own set
+		// would leave a hole the diagonal cannot see.
 		{"agent carries the field separator", "work|er", "seat-1", "inst-01"},
-		{"session carries the holder separator", "worker-a", "seat@1", "inst-01"},
-		{"token carries the holder separator", "worker-a", "seat-1", "inst#01"},
+		{"agent carries the session separator", "work@er", "seat-1", "inst-01"},
+		{"agent carries the instance separator", "work#er", "seat-1", "inst-01"},
+		{"session carries the field separator", "worker-a", "seat|1", "inst-01"},
+		{"session carries the session separator", "worker-a", "seat@1", "inst-01"},
+		{"session carries the instance separator", "worker-a", "seat#1", "inst-01"},
+		{"token carries the field separator", "worker-a", "seat-1", "inst|01"},
+		{"token carries the session separator", "worker-a", "seat-1", "inst@01"},
+		{"token carries the instance separator", "worker-a", "seat-1", "inst#01"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h, err := NewHolder(tc.agent, tc.session, tc.token)
@@ -491,8 +501,11 @@ func TestLookupDistinguishesAbsentFromEmpty(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Lookup on an empty value = %+v, want an error", empty)
 	}
-	if !empty.IsUnleased() {
-		t.Fatal("a failed Lookup must not report a lease")
+	// Fail closed, not open. A caller that ignores this error must not read
+	// the result as unowned and claim a bead another worker holds; an
+	// undecodable value is "held by someone I cannot identify".
+	if empty.IsUnleased() {
+		t.Fatal("a failed Lookup reported the unleased condition, which lets an ignored error become a double claim")
 	}
 
 	nilMap, err := Lookup(nil, key)
@@ -513,6 +526,88 @@ func TestLookupDistinguishesAbsentFromEmpty(t *testing.T) {
 	}
 	if rec.State != StateHeld {
 		t.Fatalf("State = %q, want %q", rec.State, StateHeld)
+	}
+}
+
+// TestLookupCarriesEveryFieldThrough pins every field of the record across
+// Lookup, not just State. It exists because a mutation that dropped all fields
+// except State (returning Record{State: rec.State} from DecodeLease) passed the
+// entire suite: nothing else asserted that epoch, expiry, or the holder
+// survived the decode. The instance token is the load-bearing one. It is the
+// incarnation discriminator, the single field that makes a restarted seat a
+// different holder, so a decode that silently drops it makes a stale worker
+// indistinguishable from the live one.
+func TestLookupCarriesEveryFieldThrough(t *testing.T) {
+	const key = "lease"
+	raw := "v1|7|worker-a@seat-1#inst-01|2026-08-11T04:05:06.5Z|held|3"
+
+	l, err := Lookup(map[string]string{key: raw}, key)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	rec, ok := l.Record()
+	if !ok {
+		t.Fatal("a well-formed value did not yield a record")
+	}
+
+	if rec.Epoch != 7 {
+		t.Errorf("Epoch = %d, want 7", rec.Epoch)
+	}
+	if rec.Attempts != 3 {
+		t.Errorf("Attempts = %d, want 3", rec.Attempts)
+	}
+	if rec.State != StateHeld {
+		t.Errorf("State = %q, want %q", rec.State, StateHeld)
+	}
+	want := mustHolder(t, "worker-a", "seat-1", "inst-01")
+	if rec.Holder != want {
+		t.Errorf("Holder = %+v, want %+v", rec.Holder, want)
+	}
+	if rec.Holder.InstanceToken != "inst-01" {
+		t.Errorf("InstanceToken = %q, want %q", rec.Holder.InstanceToken, "inst-01")
+	}
+	wantExpiry := time.Date(2026, 8, 11, 4, 5, 6, 500000000, time.UTC)
+	if !rec.ExpiresAt.Equal(wantExpiry) {
+		t.Errorf("ExpiresAt = %v, want %v", rec.ExpiresAt, wantExpiry)
+	}
+
+	// Re-encoding is the backstop: any field silently dropped above would
+	// change the wire form even if an assertion for it were removed later.
+	got, err := Encode(rec)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if got != raw {
+		t.Errorf("Encode() = %q, want %q", got, raw)
+	}
+}
+
+// TestFailedDecodeIsNotUnleased covers every constructor that returns a Lease
+// alongside an error. The dangerous direction is a caller ignoring the error
+// and reading the result as unowned.
+func TestFailedDecodeIsNotUnleased(t *testing.T) {
+	bad, err := DecodeLease("v1|nope|worker-a@seat-1#inst-01|-|parked|0", true)
+	if err == nil {
+		t.Fatal("DecodeLease on a malformed record returned no error")
+	}
+	if bad.IsUnleased() {
+		t.Error("DecodeLease error result reported unleased")
+	}
+
+	invalid, err := Present(Record{State: StateHeld})
+	if err == nil {
+		t.Fatal("Present on an invalid record returned no error")
+	}
+	if invalid.IsUnleased() {
+		t.Error("Present error result reported unleased")
+	}
+
+	// The fail-closed lease must not be mistakable for a real owner either:
+	// its zero holder can never equal a holder NewHolder would build, because
+	// NewHolder rejects empty parts.
+	rec, ok := invalid.Record()
+	if ok && rec.Holder == mustHolder(t, "worker-a", "seat-1", "inst-01") {
+		t.Error("the fail-closed lease compared equal to a real holder")
 	}
 }
 
@@ -538,6 +633,72 @@ func TestStateStringsAreStable(t *testing.T) {
 	} {
 		if string(state) != want {
 			t.Fatalf("state %v renders as %q, want %q", state, string(state), want)
+		}
+	}
+}
+
+// TestCanonicalMakesRoundTripComparable pins the trap that == on a Record is
+// only meaningful between canonical records. A record built from a non-UTC
+// zone or from time.Now() encodes to exactly the same wire string as the
+// record it decodes back to, yet != reports them as different, because
+// time.Time compares its location and monotonic reading and not just the
+// instant. A fence check written as `built == decoded` would read that as "the
+// lease changed" when nothing changed.
+func TestCanonicalMakesRoundTripComparable(t *testing.T) {
+	h := mustHolder(t, "worker-a", "seat-1", "inst-01")
+
+	for _, tc := range []struct {
+		name    string
+		expires time.Time
+	}{
+		{"non-UTC zone", time.Date(2026, 8, 11, 6, 5, 6, 0, time.FixedZone("plus2", 2*3600))},
+		{"monotonic reading", time.Now().Add(time.Hour)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			built := Record{Epoch: 1, Holder: h, ExpiresAt: tc.expires, State: StateHeld}
+
+			wire, err := Encode(built)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			decoded, err := Decode(wire)
+			if err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+
+			// The wire form is correct and identical either way.
+			reWire, err := Encode(decoded)
+			if err != nil {
+				t.Fatalf("Encode(decoded): %v", err)
+			}
+			if reWire != wire {
+				t.Fatalf("re-encode = %q, want %q", reWire, wire)
+			}
+
+			// Canonical is the fixed point that makes == usable.
+			if got := built.Canonical(); got != decoded {
+				t.Errorf("built.Canonical() = %+v, want %+v", got, decoded)
+			}
+			if got := decoded.Canonical(); got != decoded {
+				t.Errorf("Canonical is not idempotent on a decoded record: %+v", got)
+			}
+		})
+	}
+}
+
+// TestCanonicalLeavesZeroExpiryAlone guards the states that carry no deadline:
+// canonicalizing must not turn the zero time into a real one, or Validate
+// would start rejecting parked and dead records.
+func TestCanonicalLeavesZeroExpiryAlone(t *testing.T) {
+	h := mustHolder(t, "worker-a", "seat-1", "inst-01")
+	for _, state := range []State{StateParked, StateDead} {
+		rec := Record{Epoch: 1, Holder: h, State: state}
+		got := rec.Canonical()
+		if !got.ExpiresAt.IsZero() {
+			t.Errorf("state %q: Canonical set an expiry %v", state, got.ExpiresAt)
+		}
+		if err := got.Validate(); err != nil {
+			t.Errorf("state %q: canonical record no longer validates: %v", state, err)
 		}
 	}
 }
