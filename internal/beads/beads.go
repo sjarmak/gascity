@@ -521,19 +521,10 @@ func isSchedulerDispatchableExcludedType(t string) bool {
 	return t == "epic" || t == "rollup" || IsContainerType(t) || IsMoleculeType(t)
 }
 
-// dispatchStructuralLabels enumerates labels that mark a bead as structural
-// rollup/grouping work rather than an actionable unit, mirroring the label
-// leg of dispatch_structural in bin/dispatchability.jq. A bead can carry
-// these labels regardless of its issue_type, so this check is independent of
-// isSchedulerDispatchableExcludedType.
-var dispatchStructuralLabels = map[string]bool{
-	"rollup": true,
-	"epic":   true,
-}
-
+// Structural labels exclude grouping beads whose stored type is less precise.
 func hasDispatchStructuralLabel(b Bead) bool {
 	for _, label := range b.Labels {
-		if dispatchStructuralLabels[label] {
+		if label == "rollup" || label == "epic" {
 			return true
 		}
 	}
