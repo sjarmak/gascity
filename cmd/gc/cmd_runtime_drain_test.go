@@ -825,6 +825,63 @@ type drainAckOwnerRaceStore struct {
 	traced    bool
 }
 
+type drainAckWriteOnlyTx struct {
+	beads.Tx
+}
+
+type drainAckAtomicWriteOnlyStore struct {
+	beads.Store
+	triggerID string
+	newOwner  string
+}
+
+func (s *drainAckAtomicWriteOnlyStore) AtomicTx() bool { return true }
+
+func (s *drainAckAtomicWriteOnlyStore) Tx(commitMsg string, fn func(beads.Tx) error) error {
+	status := "in_progress"
+	if err := s.Update(s.triggerID, beads.UpdateOpts{
+		Status:   &status,
+		Assignee: &s.newOwner,
+	}); err != nil {
+		return err
+	}
+	return s.Store.Tx(commitMsg, func(tx beads.Tx) error {
+		return fn(drainAckWriteOnlyTx{Tx: tx})
+	})
+}
+
+func TestCompleteRuntimeDrainAckTriggerFailsClosedWithoutAtomicRereadOrFence(t *testing.T) {
+	mem := beads.NewMemStore()
+	trigger, err := mem.Create(beads.Bead{
+		Title:    "current session work",
+		Status:   "in_progress",
+		Assignee: "current-session",
+	})
+	if err != nil {
+		t.Fatalf("Create(trigger): %v", err)
+	}
+	store := &drainAckAtomicWriteOnlyStore{
+		Store:     mem,
+		triggerID: trigger.ID,
+		newOwner:  "replacement-session",
+	}
+
+	err = completeRuntimeDrainAckTrigger(store, trigger.ID, []string{"current-session"})
+	if !errors.Is(err, beads.ErrTxReadUnsupported) {
+		t.Fatalf("completeRuntimeDrainAckTrigger error = %v, want ErrTxReadUnsupported", err)
+	}
+	got, err := mem.Get(trigger.ID)
+	if err != nil {
+		t.Fatalf("Get(trigger): %v", err)
+	}
+	if got.Status != "in_progress" || got.Assignee != "replacement-session" {
+		t.Fatalf("reassigned trigger = status %q assignee %q, want in_progress/replacement-session", got.Status, got.Assignee)
+	}
+	if got.Metadata[beadmeta.OutcomeMetadataKey] != "" {
+		t.Fatalf("reassigned trigger outcome = %q, want unset", got.Metadata[beadmeta.OutcomeMetadataKey])
+	}
+}
+
 func (s *drainAckOwnerRaceStore) AtomicTx() bool { return true }
 
 func (s *drainAckOwnerRaceStore) raceOwnership() error {
