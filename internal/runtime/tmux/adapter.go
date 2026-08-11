@@ -1142,7 +1142,7 @@ func doStartSession(ctx context.Context, ops startOps, name string, cfg runtime.
 
 	// Step 0: Run pre-start commands (directory/worktree preparation).
 	if err := runPreStart(ctx, ops, name, cfg, setupTimeout); err != nil {
-		return fmt.Errorf("running pre_start: %w", err)
+		return fmt.Errorf("running pre_start: %w", runtime.NewPreStartError(err))
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1220,7 +1220,7 @@ func doRelaunchSession(ctx context.Context, ops startOps, name string, cfg runti
 	// unprepared workDir can point agents at the wrong repo — the same
 	// rationale that makes pre_start failures fatal in doStartSession.
 	if err := runPreStart(ctx, ops, name, cfg, setupTimeout); err != nil {
-		return fmt.Errorf("relaunch: running pre_start: %w", err)
+		return fmt.Errorf("relaunch: running pre_start: %w", runtime.NewPreStartError(err))
 	}
 	if err := ctx.Err(); err != nil {
 		return err

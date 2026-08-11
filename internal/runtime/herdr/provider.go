@@ -90,7 +90,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 	// workDir. Runs only once we know we're actually creating the agent (the
 	// ErrSessionExists check above), so an existing session never re-runs prep.
 	if err := p.runPreStart(ctx, cfg); err != nil {
-		return fmt.Errorf("herdr: running pre_start: %w", err)
+		return fmt.Errorf("herdr: running pre_start: %w", runtime.NewPreStartError(err))
 	}
 	// Place the agent in its own tab under a per-rig (per-town) workspace, so
 	// agents are separate switchable spaces rather than tiled panes. The

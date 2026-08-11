@@ -243,6 +243,15 @@ type startResult struct {
 	phases startPhaseTimings
 }
 
+const (
+	preStartBreakerStateMetadataKey  = "pre_start_breaker"
+	preStartFailureReasonMetadataKey = "pre_start_failure_reason"
+	preStartFailureAtMetadataKey     = "pre_start_failure_at"
+	preStartBreakerOpen              = "open"
+	preStartBreakerHeldUntil         = "9999-12-31T23:59:59Z"
+	preStartFailureSleepReason       = "pre-start-failure"
+)
+
 // startPhaseTimings breaks down a start operation into the discrete
 // sub-phases visible from runPreparedStartCandidate +
 // commitAsyncStartResultWithContext. Each duration is wall-clock; zero
@@ -2197,6 +2206,13 @@ func commitStartFailure(result startResult, sessFront *sessionpkg.Store, clk clo
 	name := result.prepared.candidate.name()
 	tp := result.prepared.candidate.tp
 	fmt.Fprintf(stderr, "session reconciler: starting %s: %s\n", name, formatLifecycleError(result.err)) //nolint:errcheck
+	if reason, preStartFailure := runtime.PreStartFailureReason(result.err); preStartFailure && result.rollbackPending {
+		if err := parkPendingCreatePreStartFailure(info, sessFront, clk.Now().UTC(), reason); err != nil {
+			fmt.Fprintf(stderr, "session reconciler: parking pre_start failure for %s: %v\n", name, err) //nolint:errcheck
+		}
+		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, "pre_start_parked", result.started, result.finished, result.err, result.phases)
+		return
+	}
 	if reason := runtime.ProviderTerminalErrorReason(result.err.Error()); reason != "" {
 		// This runs on the async start goroutine, and this failure arm is terminal
 		// (logs + returns), so the write-returns-Info fold is discarded — never assign
@@ -2283,6 +2299,23 @@ func commitStartFailure(result startResult, sessFront *sessionpkg.Store, clk clo
 		})
 	}
 	logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, string(result.outcome), result.started, result.finished, result.err, result.phases)
+}
+
+func parkPendingCreatePreStartFailure(info sessionpkg.Info, sessFront *sessionpkg.Store, now time.Time, reason string) error {
+	if sessFront == nil || strings.TrimSpace(info.ID) == "" {
+		return errors.New("session store and id are required")
+	}
+	return sessFront.ApplyPatch(info.ID, sessionpkg.MetadataPatch{
+		"state":                          string(sessionpkg.StateAsleep),
+		"sleep_reason":                   preStartFailureSleepReason,
+		"held_until":                     preStartBreakerHeldUntil,
+		"last_woke_at":                   "",
+		"pending_create_claim":           "",
+		"pending_create_started_at":      "",
+		preStartBreakerStateMetadataKey:  preStartBreakerOpen,
+		preStartFailureReasonMetadataKey: strings.TrimSpace(reason),
+		preStartFailureAtMetadataKey:     now.Format(time.RFC3339),
+	})
 }
 
 // recoverRunningPendingCreate heals an already-active bead whose

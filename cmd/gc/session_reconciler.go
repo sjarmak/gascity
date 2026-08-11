@@ -2022,6 +2022,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					}
 				}
 				if providerAlive {
+					// Suspending a configured pool fences future starts; it does not
+					// retire a runtime that is already healthy. This matches the CLI
+					// contract and leaves ordinary scale-down/orphan handling below
+					// unchanged.
+					if agent := findAgentByTemplate(cfg, normalizedSessionTemplateInfo(infoPostHeal, cfg)); agent != nil && agent.Suspended {
+						cancelSessionDrainInfo(infoPostHeal, sp, dt)
+						continue
+					}
 					// When a store query failed (partial results),
 					// skip drain — the session may have work that we
 					// couldn't see due to the transient failure.

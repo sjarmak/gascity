@@ -380,6 +380,39 @@ func computePoolDesiredStates(
 		}
 	}
 
+	// A deterministic pre_start failure parks the concrete pool slot on its
+	// existing session bead. Retain that bead as a resume-shaped request so
+	// min floors and elastic demand count the parked slot instead of minting a
+	// replacement every reconciliation tick. The durable hold suppresses the
+	// actual wake until an operator resets the session.
+	parked := append([]sessionpkg.Info(nil), sessionInfos...)
+	sortSessionInfosByCreatedAtThenID(parked)
+	retained := make(map[string]struct{}, len(resumeRequests))
+	for _, req := range resumeRequests {
+		if req.SessionBeadID != "" {
+			retained[req.SessionBeadID] = struct{}{}
+		}
+	}
+	for _, info := range parked {
+		if info.ID == "" || info.Closed || !isPoolManagedSessionInfo(info) || isNamedSessionInfo(info) || info.SleepReason != preStartFailureSleepReason {
+			continue
+		}
+		if _, ok := retained[info.ID]; ok {
+			continue
+		}
+		template := normalizedSessionTemplateInfo(info, cfg)
+		agent := findAgentByTemplate(cfg, template)
+		if agent == nil || agent.Suspended || !agent.SupportsGenericEphemeralSessions() {
+			continue
+		}
+		resumeRequests = append(resumeRequests, SessionRequest{
+			Template:      template,
+			Tier:          "resume",
+			SessionBeadID: info.ID,
+		})
+		retained[info.ID] = struct{}{}
+	}
+
 	// Residency reuse/wake: for each min-floored canonical singleton with a live
 	// owner (active/awake/asleep/in-flight), resume the SAME bead so the floor is
 	// satisfied in place — no colliding fresh generation (gc-0ychy). Iterate

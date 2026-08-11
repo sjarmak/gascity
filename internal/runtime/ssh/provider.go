@@ -126,7 +126,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 			return fmt.Errorf("ssh start %q: pre_start: %w", name, err)
 		}
 		if code != 0 {
-			return fmt.Errorf("ssh start %q: pre_start %q exited %d: %s", name, cmd, code, strings.TrimSpace(string(out)))
+			return fmt.Errorf("ssh start %q: pre_start: %w", name, runtime.NewPreStartError(fmt.Errorf("command %q exited %d: %s", cmd, code, strings.TrimSpace(string(out)))))
 		}
 	}
 

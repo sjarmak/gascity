@@ -36,6 +36,58 @@ var ErrInteractionUnsupported = errors.New("session interaction is unsupported")
 // process, but it exited before startup completed successfully.
 var ErrSessionDiedDuringStartup = errors.New("session died during startup")
 
+// PreStartError reports that a configured pre_start command failed before the
+// runtime session was launched. Reconciliation uses this typed boundary to
+// park a deterministic provisioning failure without guessing from provider
+// error text.
+type PreStartError struct {
+	err error
+}
+
+// NewPreStartError wraps err as a pre_start failure.
+func NewPreStartError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var existing *PreStartError
+	if errors.As(err, &existing) {
+		return err
+	}
+	return &PreStartError{err: err}
+}
+
+// Error implements error.
+func (e *PreStartError) Error() string {
+	if e == nil || e.err == nil {
+		return "pre_start failed"
+	}
+	return "pre_start failed: " + e.err.Error()
+}
+
+// Unwrap returns the underlying command failure.
+func (e *PreStartError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+// PreStartFailureReason returns the underlying command failure text and true
+// when err contains a PreStartError.
+func PreStartFailureReason(err error) (string, bool) {
+	var target *PreStartError
+	if !errors.As(err, &target) {
+		return "", false
+	}
+	if target == nil || target.err == nil {
+		return "pre_start failed", true
+	}
+	if errors.Is(target.err, context.Canceled) || errors.Is(target.err, context.DeadlineExceeded) {
+		return "", false
+	}
+	return target.err.Error(), true
+}
+
 // ErrSessionNotFound reports that an operation targeted a session the
 // runtime does not know about. Benign for Stop() — the session was
 // already gone — but fatal for Attach/Send. Providers wrap their own

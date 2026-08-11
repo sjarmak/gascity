@@ -1,6 +1,11 @@
 package runtime
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+)
 
 func TestSyncWorkDirEnvSetsGCDir(t *testing.T) {
 	cfg := SyncWorkDirEnv(Config{WorkDir: "/tmp/work"})
@@ -55,4 +60,22 @@ func TestHasManagedStartupHints(t *testing.T) {
 
 func boolPtr(v bool) *bool {
 	return &v
+}
+
+func TestPreStartFailureReason(t *testing.T) {
+	t.Run("command failure is deterministic", func(t *testing.T) {
+		err := fmt.Errorf("provider: %w", NewPreStartError(errors.New("slot branch mismatch")))
+		reason, ok := PreStartFailureReason(err)
+		if !ok || reason != "slot branch mismatch" {
+			t.Fatalf("PreStartFailureReason() = %q, %v", reason, ok)
+		}
+	})
+
+	for _, transient := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(transient.Error(), func(t *testing.T) {
+			if reason, ok := PreStartFailureReason(NewPreStartError(transient)); ok {
+				t.Fatalf("PreStartFailureReason() = %q, true; transient cancellation must retry", reason)
+			}
+		})
+	}
 }

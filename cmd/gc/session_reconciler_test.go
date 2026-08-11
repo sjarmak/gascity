@@ -8458,6 +8458,128 @@ func TestReconcileSessionBeads_RollsBackPendingCreateOnProviderError(t *testing.
 	}
 }
 
+func TestReconcileSessionBeads_PreStartFailureParksPendingCreate(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	sp.StartErrors = map[string]error{"sky": runtime.NewPreStartError(errors.New("slot branch mismatch"))}
+	clk := &clock.Fake{Time: time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)}
+	one := 1
+	cfg := &config.City{Agents: []config.Agent{{Name: "helper", MinActiveSessions: &one, MaxActiveSessions: &one}}}
+	desired := map[string]TemplateParams{
+		"sky": {
+			Command:      "test-cmd",
+			SessionName:  "sky",
+			TemplateName: "helper",
+		},
+	}
+
+	bead, err := store.Create(beads.Bead{
+		Title:  "helper",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "template:helper"},
+		Metadata: map[string]string{
+			"session_name":          "sky",
+			"session_name_explicit": "true",
+			"pool_managed":          "true",
+			"pending_create_claim":  "true",
+			"template":              "helper",
+			"state":                 "creating",
+			"generation":            "1",
+			"continuation_epoch":    "1",
+			"instance_token":        "test-token",
+			"pool_slot":             "2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(bead): %v", err)
+	}
+
+	cfgNames := configuredSessionNames(cfg, "", store)
+	woken := reconcileSessionBeads(
+		context.Background(), []beads.Bead{bead}, desired, cfgNames,
+		cfg, sp, store, nil, nil, nil, newDrainTracker(), map[string]int{"helper": 1}, false, nil, "",
+		nil, clk, events.Discard, 0, 0, io.Discard, io.Discard,
+	)
+	if woken != 0 {
+		t.Fatalf("woken = %d, want 0", woken)
+	}
+
+	got, err := store.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get(bead): %v", err)
+	}
+	if got.Status != "open" {
+		t.Fatalf("status = %q, want open so the slot keeps one durable bead", got.Status)
+	}
+	if got.Metadata["session_name"] != "sky" || got.Metadata["pool_slot"] != "2" {
+		t.Fatalf("slot identity changed: session_name=%q pool_slot=%q", got.Metadata["session_name"], got.Metadata["pool_slot"])
+	}
+	if got.Metadata["state"] != "asleep" {
+		t.Fatalf("state = %q, want asleep", got.Metadata["state"])
+	}
+	if got.Metadata["pending_create_claim"] != "" {
+		t.Fatalf("pending_create_claim = %q, want cleared", got.Metadata["pending_create_claim"])
+	}
+	if got.Metadata[preStartBreakerStateMetadataKey] != preStartBreakerOpen {
+		t.Fatalf("pre-start breaker = %q, want %q", got.Metadata[preStartBreakerStateMetadataKey], preStartBreakerOpen)
+	}
+	if got.Metadata[preStartFailureReasonMetadataKey] != "slot branch mismatch" {
+		t.Fatalf("pre-start failure reason = %q", got.Metadata[preStartFailureReasonMetadataKey])
+	}
+	if got.Metadata["held_until"] != preStartBreakerHeldUntil {
+		t.Fatalf("held_until = %q, want durable park %q", got.Metadata["held_until"], preStartBreakerHeldUntil)
+	}
+
+	parked, err := sessionFrontDoor(store).Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get parked session info: %v", err)
+	}
+	poolStates := ComputePoolDesiredStates(cfg, nil, []sessionpkg.Info{parked}, nil)
+	if len(poolStates) != 1 || len(poolStates[0].Requests) != 1 {
+		t.Fatalf("pool desired after park = %+v, want one retained slot request", poolStates)
+	}
+	if gotID := poolStates[0].Requests[0].SessionBeadID; gotID != bead.ID {
+		t.Fatalf("retained session bead = %q, want same parked bead %q", gotID, bead.ID)
+	}
+	if starts := sp.CountCalls("Start", "sky"); starts != 1 {
+		t.Fatalf("start calls after first failure = %d, want 1", starts)
+	}
+	reconcileSessionBeads(
+		context.Background(), []beads.Bead{got}, desired, cfgNames,
+		cfg, sp, store, nil, nil, nil, newDrainTracker(), map[string]int{"helper": 1}, false, nil, "",
+		nil, clk, events.Discard, 0, 0, io.Discard, io.Discard,
+	)
+	if starts := sp.CountCalls("Start", "sky"); starts != 1 {
+		t.Fatalf("start calls after parked retry tick = %d, want 1", starts)
+	}
+}
+
+func TestReconcileSessionBeads_SuspendedPoolKeepsLiveSessionRunning(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker", Suspended: true}}}
+	if err := env.sp.Start(context.Background(), "worker-1", runtime.Config{}); err != nil {
+		t.Fatalf("Start(worker-1): %v", err)
+	}
+	session := env.createSessionBead("worker-1", "worker")
+	env.markSessionActive(&session)
+
+	env.reconcile([]beads.Bead{session})
+
+	if !env.sp.IsRunning("worker-1") {
+		t.Fatal("suspending a pool stopped its existing live session")
+	}
+	if drain := env.dt.get(session.ID); drain != nil {
+		t.Fatalf("suspending a pool initiated drain %+v, want existing session untouched", drain)
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get(session): %v", err)
+	}
+	if got.Status != "open" {
+		t.Fatalf("status = %q, want open", got.Status)
+	}
+}
+
 func TestReconcileSessionBeads_PoolScaleDownOrphansExcess(t *testing.T) {
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{
