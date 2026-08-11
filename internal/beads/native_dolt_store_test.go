@@ -1191,6 +1191,7 @@ func TestNativeDoltStoreTxAppliesCallbackWrites(t *testing.T) {
 	store := newNativeDoltStoreForTest(newNativeDoltMemStorage())
 	created, err := store.Create(Bead{
 		Title:    "native tx",
+		Assignee: "current-session",
 		Metadata: map[string]string{"initial": "true"},
 	})
 	if err != nil {
@@ -1199,6 +1200,17 @@ func TestNativeDoltStoreTxAppliesCallbackWrites(t *testing.T) {
 	title := "native tx updated"
 
 	if err := store.Tx("native tx test", func(tx Tx) error {
+		readTx, ok := tx.(ReadTx)
+		if !ok {
+			return errors.New("native transaction does not provide atomic reads")
+		}
+		current, err := readTx.Get(created.ID)
+		if err != nil {
+			return err
+		}
+		if current.Assignee != "current-session" {
+			return fmt.Errorf("transactional assignee = %q, want current-session", current.Assignee)
+		}
 		if err := tx.Update(created.ID, UpdateOpts{
 			Title:    &title,
 			Metadata: map[string]string{"phase": "updated"},

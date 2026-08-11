@@ -565,6 +565,40 @@ func completeRuntimeDrainAckTrigger(store beads.Store, triggerID string, session
 			beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass,
 		},
 	}
+	if beads.StoreSupportsAtomicTx(store) {
+		readTransaction := false
+		err := store.Tx("gc: complete runtime drain trigger "+triggerID, func(tx beads.Tx) error {
+			readTx, ok := tx.(beads.ReadTx)
+			if !ok {
+				return nil
+			}
+			current, err := readTx.Get(triggerID)
+			if err != nil {
+				if errors.Is(err, beads.ErrNotFound) {
+					return nil
+				}
+				return err
+			}
+			readTransaction = true
+			if strings.EqualFold(strings.TrimSpace(current.Status), "closed") {
+				return nil
+			}
+			currentKind := strings.TrimSpace(current.Metadata[beadmeta.KindMetadataKey])
+			if beadmeta.IsControlKind(currentKind) || slices.Contains(beadmeta.WorkflowTopologyKinds, currentKind) {
+				return fmt.Errorf("trigger bead %s has non-worker kind %q", triggerID, currentKind)
+			}
+			if !hookClaimHasIdentity(current.Assignee, sessionIdentities) {
+				return nil
+			}
+			return tx.Update(triggerID, opts)
+		})
+		if err != nil && !errors.Is(err, beads.ErrTxReadUnsupported) {
+			return fmt.Errorf("closing trigger bead %s: %w", triggerID, err)
+		}
+		if readTransaction {
+			return nil
+		}
+	}
 	if writer, ok := beads.ConditionalWriterFor(store); ok {
 		if err := writer.UpdateIfMatch(triggerID, bead.Revision, opts); err != nil {
 			if beads.IsPreconditionFailed(err) {

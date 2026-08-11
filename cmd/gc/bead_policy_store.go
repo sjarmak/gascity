@@ -38,6 +38,7 @@ type beadPolicyGraphStore struct {
 var (
 	_ beads.ConditionalAssignmentReleaser    = (*beadPolicyStore)(nil)
 	_ beads.ConditionalWritesResolveTargeter = (*beadPolicyStore)(nil)
+	_ beads.AtomicTxStore                    = (*beadPolicyStore)(nil)
 	_ beads.AtomicClaimer                    = (*beadPolicyStore)(nil)
 	_ beads.AtomicClaimer                    = (*beadPolicyGraphStore)(nil)
 )
@@ -51,6 +52,11 @@ var (
 // wrapper. beadPolicyGraphStore inherits this via its embedded
 // *beadPolicyStore.
 func (s *beadPolicyStore) ConditionalWritesResolveTarget() beads.Store { return s.Store }
+
+// AtomicTx reports whether the wrapped store provides all-or-nothing Tx
+// semantics. The policy layer forwards Tx unchanged, so it inherits the
+// backing store's guarantee.
+func (s *beadPolicyStore) AtomicTx() bool { return beads.StoreSupportsAtomicTx(s.Store) }
 
 var (
 	_ beads.BatchDeleter              = (*beadPolicyStore)(nil)
