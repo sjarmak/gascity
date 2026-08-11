@@ -572,14 +572,18 @@ func completeRuntimeDrainAckTrigger(store beads.Store, triggerID string, session
 			if !ok {
 				return nil
 			}
+			readTransaction = true
 			current, err := readTx.Get(triggerID)
 			if err != nil {
+				if errors.Is(err, beads.ErrTxReadUnsupported) {
+					readTransaction = false
+					return err
+				}
 				if errors.Is(err, beads.ErrNotFound) {
 					return nil
 				}
 				return err
 			}
-			readTransaction = true
 			if strings.EqualFold(strings.TrimSpace(current.Status), "closed") {
 				return nil
 			}
