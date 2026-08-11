@@ -387,17 +387,17 @@ func computePoolDesiredStates(
 	// actual wake until an operator resets the session.
 	parked := append([]sessionpkg.Info(nil), sessionInfos...)
 	sortSessionInfosByCreatedAtThenID(parked)
-	retained := make(map[string]struct{}, len(resumeRequests))
+	resumeSessionBeadIDs := make(map[string]struct{}, len(resumeRequests))
 	for _, req := range resumeRequests {
 		if req.SessionBeadID != "" {
-			retained[req.SessionBeadID] = struct{}{}
+			resumeSessionBeadIDs[req.SessionBeadID] = struct{}{}
 		}
 	}
 	for _, info := range parked {
 		if info.ID == "" || info.Closed || !isPoolManagedSessionInfo(info) || isNamedSessionInfo(info) || info.SleepReason != preStartFailureSleepReason {
 			continue
 		}
-		if _, ok := retained[info.ID]; ok {
+		if _, ok := resumeSessionBeadIDs[info.ID]; ok {
 			continue
 		}
 		template := normalizedSessionTemplateInfo(info, cfg)
@@ -410,7 +410,7 @@ func computePoolDesiredStates(
 			Tier:          "resume",
 			SessionBeadID: info.ID,
 		})
-		retained[info.ID] = struct{}{}
+		resumeSessionBeadIDs[info.ID] = struct{}{}
 	}
 
 	// Residency reuse/wake: for each min-floored canonical singleton with a live
@@ -444,12 +444,6 @@ func computePoolDesiredStates(
 	limits := newNestedCapLimits(cfg)
 	usage := acceptedNestedCapUsage(limits, resumeRequests)
 	allRequests := append([]SessionRequest(nil), resumeRequests...)
-	resumeSessionBeadIDs := make(map[string]struct{}, len(resumeRequests))
-	for _, req := range resumeRequests {
-		if req.SessionBeadID != "" {
-			resumeSessionBeadIDs[req.SessionBeadID] = struct{}{}
-		}
-	}
 	inFlightNewRequests := poolInFlightNewRequests(cfg, sessionInfos, resumeSessionBeadIDs)
 
 	// Merge scale_check demand. In bead-backed reconciliation, scale_check is
