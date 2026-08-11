@@ -2037,7 +2037,7 @@ func clearStaleResumeKeyMetadata(handle string, sessFront *sessionpkg.Store) map
 			stored[k] = v
 		}
 		stored[sessionpkg.ResetCommittedAtKey] = time.Now().UTC().Format(time.RFC3339)
-		_ = sessFront.ApplyPatch(handle, stored)
+		_ = sessFront.UpdateMetadata(handle, stored)
 		// S19 Stage 3 shadow: record the legacy priming-marker clears (no-op
 		// unless the shadow harness is enabled).
 		recordLegacyCompareWrites(handle, "clearStaleResumeKeyMetadata", stored)

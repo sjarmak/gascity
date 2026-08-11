@@ -102,7 +102,7 @@ func cycleAliveSessionForFreshReassign(
 		batch["session_key"] = ""
 	}
 	batch[sessionpkg.CurrentBeadIDKey] = newBeadID
-	if err := sessionFrontDoor(store).ApplyPatch(info.ID, batch); err != nil {
+	if err := sessionFrontDoor(store).UpdateMetadata(info.ID, batch); err != nil {
 		if stderr != nil {
 			fmt.Fprintf(stderr, "session reconciler: recording fresh-cycle handoff for %s: %v\n", name, err) //nolint:errcheck
 		}

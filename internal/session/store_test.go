@@ -643,3 +643,58 @@ func TestUpdateMetadataInfoFailedWritePersistsNothingAndReturnsInputUnchanged(t 
 		}
 	}
 }
+
+// TestUpdateMetadataEmitsSingleUpdateWithResetCluster pins the handle-only
+// counterpart used by reset arming and drain transitions: pending and its
+// committed timestamp travel in one backend Update, never a decomposable
+// SetMetadataBatch.
+func TestUpdateMetadataEmitsSingleUpdateWithResetCluster(t *testing.T) {
+	b := sessionBeadFixture("s-1", "open", map[string]string{"state": "active"})
+	is, rec := recordingStore(t, b)
+	patch := MetadataPatch{
+		"continuation_reset_pending": "true",
+		ResetCommittedAtKey:          "2026-08-11T09:00:00Z",
+	}
+
+	if err := is.UpdateMetadata("s-1", patch); err != nil {
+		t.Fatalf("UpdateMetadata: %v", err)
+	}
+
+	updates := rec.CallsForOp("Update")
+	if len(updates) != 1 {
+		t.Fatalf("Update ops = %d, want 1 (all ops: %v)", len(updates), opsOf(rec.Calls()))
+	}
+	if !reflect.DeepEqual(updates[0].Opts.Metadata, map[string]string(patch)) {
+		t.Errorf("Update metadata = %#v, want full reset cluster %#v", updates[0].Opts.Metadata, map[string]string(patch))
+	}
+	if n := len(rec.CallsForOp("SetMetadataBatch")); n != 0 {
+		t.Errorf("SetMetadataBatch ops = %d, want 0", n)
+	}
+}
+
+func TestUpdateMetadataFailedWritePersistsNoResetCluster(t *testing.T) {
+	b := sessionBeadFixture("s-1", "open", map[string]string{
+		"continuation_reset_pending": "",
+		ResetCommittedAtKey:          "old",
+	})
+	mem := beads.NewMemStoreFrom(1, []beads.Bead{b}, nil)
+	is := NewStore(beads.SessionStore{Store: updateFailStore{Store: mem, err: errors.New("update rejected")}})
+	patch := MetadataPatch{
+		"continuation_reset_pending": "true",
+		ResetCommittedAtKey:          "new",
+	}
+
+	if err := is.UpdateMetadata("s-1", patch); err == nil {
+		t.Fatal("UpdateMetadata: want error on failed Update")
+	}
+	after, err := mem.Get("s-1")
+	if err != nil {
+		t.Fatalf("Get after failed update: %v", err)
+	}
+	if got := after.Metadata["continuation_reset_pending"]; got != "" {
+		t.Errorf("continuation_reset_pending = %q, want unchanged", got)
+	}
+	if got := after.Metadata[ResetCommittedAtKey]; got != "old" {
+		t.Errorf("reset_committed_at = %q, want old", got)
+	}
+}

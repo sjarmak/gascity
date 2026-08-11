@@ -707,7 +707,7 @@ func recordWakeFailure(info sessionpkg.Info, sessFront *sessionpkg.Store, clk cl
 	// intentionally ignored, as before) while the Info fold is unconditional.
 	if info.SessionKey != "" || info.StartedConfigHash != "" {
 		reset := sessionpkg.ConversationResetPatch(true, clk.Now().UTC())
-		_ = sessFront.ApplyPatch(info.ID, reset)
+		_ = sessFront.UpdateMetadata(info.ID, reset)
 		info = info.ApplyPatch(reset)
 	}
 	accrual := sessionpkg.WakeFailureAccrualPatch(attempts, defaultMaxWakeAttempts, clk.Now().Add(defaultQuarantineDuration))
@@ -802,7 +802,7 @@ func recordChurn(info sessionpkg.Info, sessFront *sessionpkg.Store, clk clock.Cl
 	// before) with an unconditional Info fold.
 	if info.SessionKey != "" {
 		reset := sessionpkg.ConversationResetPatch(false, clk.Now().UTC())
-		_ = sessFront.ApplyPatch(info.ID, reset)
+		_ = sessFront.UpdateMetadata(info.ID, reset)
 		info = info.ApplyPatch(reset)
 	}
 
@@ -1034,7 +1034,7 @@ func healStateWithRollbackInfo(info sessionpkg.Info, alive bool, sessFront *sess
 		}
 		stored[sessionpkg.ResetCommittedAtKey] = clk.Now().UTC().Format(time.RFC3339)
 	}
-	if err := sessFront.ApplyPatch(info.ID, stored); err != nil {
+	if err := sessFront.UpdateMetadata(info.ID, stored); err != nil {
 		return nil, err
 	}
 	// S19 Stage 3 shadow: record the legacy compared-key writes this heal ACTUALLY

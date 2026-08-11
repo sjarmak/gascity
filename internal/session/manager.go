@@ -1293,7 +1293,7 @@ func (m *Manager) RequestFreshRestart(id string) error {
 		if _, _, err := m.sessionBead(id); err != nil {
 			return err
 		}
-		return m.store.SetMetadataBatch(id, map[string]string{
+		return m.store.Update(id, beads.UpdateOpts{Metadata: map[string]string{
 			"restart_requested":          "true",
 			"continuation_reset_pending": "true",
 			// Restamp the reset-stall timer alongside the pending flag in one
@@ -1301,7 +1301,7 @@ func (m *Manager) RequestFreshRestart(id string) error {
 			// re-arm inherits a stale reset_committed_at and fires a false
 			// session.reset_stalled.
 			ResetCommittedAtKey: m.now().UTC().Format(time.RFC3339),
-		})
+		}})
 	})
 }
 

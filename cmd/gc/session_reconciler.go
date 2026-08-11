@@ -611,7 +611,7 @@ func finalizeDrainAckStoppedSession(
 	if info.RestartRequested == "true" {
 		batch["restart_requested"] = ""
 	}
-	foldedInfo, err := sessionFrontDoor(store).ApplyPatchInfo(info, batch)
+	foldedInfo, err := sessionFrontDoor(store).UpdateMetadataInfo(info, batch)
 	if err != nil {
 		fmt.Fprintf(stderr, "session reconciler: finalizing drain-ack stopped %s: %v\n", name, err) //nolint:errcheck
 		// Store write failed, so nothing changed — the snapshot must stay unchanged
@@ -2561,7 +2561,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				if hasCapability && newSessionKey == "" {
 					batch["session_key"] = ""
 				}
-				if err := sessionFrontDoor(store).ApplyPatch(id, batch); err != nil {
+				if err := sessionFrontDoor(store).UpdateMetadata(id, batch); err != nil {
 					fmt.Fprintf(stderr, "session reconciler: recording restart handoff for %s: %v\n", name, err) //nolint:errcheck
 					continue
 				}
@@ -5314,7 +5314,7 @@ func resetConfiguredNamedSessionForConfigDriftInfo(
 	batch[namedSessionConfigDriftDeferredKeyMetadata] = ""
 	batch[sessionAttachedConfigDriftDeferredAtMetadata] = ""
 	batch[sessionAttachedConfigDriftDeferredKeyMetadata] = ""
-	if err := sessionFrontDoor(store).ApplyPatch(info.ID, batch); err != nil {
+	if err := sessionFrontDoor(store).UpdateMetadata(info.ID, batch); err != nil {
 		fmt.Fprintf(stderr, "session reconciler: recording config-drift repair for %s: %v\n", sessionName, err) //nolint:errcheck
 		return nil
 	}

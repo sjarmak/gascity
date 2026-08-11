@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/beads/beadstest"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
@@ -277,6 +278,13 @@ func (s failMetadataKeyStore) SetMetadataBatch(id string, patch map[string]strin
 		return errors.New("set metadata failed")
 	}
 	return s.MemStore.SetMetadataBatch(id, patch)
+}
+
+func (s failMetadataKeyStore) Update(id string, opts beads.UpdateOpts) error {
+	if _, ok := opts.Metadata[s.key]; ok {
+		return errors.New("set metadata failed")
+	}
+	return s.MemStore.Update(id, opts)
 }
 
 func (s waitFailStore) List(query beads.ListQuery) ([]beads.Bead, error) {
@@ -5274,6 +5282,59 @@ func TestEnsureRunning_StartupDeathClearMetadataFailurePropagates(t *testing.T) 
 	}
 	if b.Metadata["session_key"] == "" {
 		t.Fatal("session_key should remain set after failed metadata clear")
+	}
+}
+
+func TestRequestFreshRestartWritesResetClusterWithOneUpdate(t *testing.T) {
+	mem := beads.NewMemStoreFrom(1, []beads.Bead{
+		sessionBeadFixture("s-1", "open", map[string]string{"state": "active"}),
+	}, nil)
+	rec := beadstest.NewRecordingStore(mem)
+	mgr := NewManagerWithOptions(rec, runtime.NewFake(), WithClock(&clock.Fake{Time: time.Date(2026, 8, 11, 9, 0, 0, 0, time.UTC)}))
+
+	if err := mgr.RequestFreshRestart("s-1"); err != nil {
+		t.Fatalf("RequestFreshRestart: %v", err)
+	}
+
+	updates := rec.CallsForOp("Update")
+	if len(updates) != 1 {
+		t.Fatalf("Update ops = %d, want 1", len(updates))
+	}
+	patch := updates[0].Opts.Metadata
+	if patch["continuation_reset_pending"] != "true" || patch[ResetCommittedAtKey] != "2026-08-11T09:00:00Z" {
+		t.Fatalf("reset cluster = %#v, want pending=true with fresh timestamp", patch)
+	}
+	if n := len(rec.CallsForOp("SetMetadataBatch")); n != 0 {
+		t.Fatalf("SetMetadataBatch ops = %d, want 0", n)
+	}
+}
+
+func TestClearStaleResumeMetadataWritesResetClusterWithOneUpdate(t *testing.T) {
+	b := sessionBeadFixture("s-1", "open", map[string]string{
+		"session_key":         "stale",
+		"started_config_hash": "old",
+	})
+	mem := beads.NewMemStoreFrom(1, []beads.Bead{b}, nil)
+	rec := beadstest.NewRecordingStore(mem)
+	mgr := NewManagerWithOptions(rec, runtime.NewFake(), WithClock(&clock.Fake{Time: time.Date(2026, 8, 11, 9, 0, 0, 0, time.UTC)}))
+
+	if err := mgr.clearStaleResumeMetadata("s-1", &b); err != nil {
+		t.Fatalf("clearStaleResumeMetadata: %v", err)
+	}
+
+	updates := rec.CallsForOp("Update")
+	if len(updates) != 1 {
+		t.Fatalf("Update ops = %d, want 1", len(updates))
+	}
+	patch := updates[0].Opts.Metadata
+	if patch["continuation_reset_pending"] != "true" || patch[ResetCommittedAtKey] != "2026-08-11T09:00:00Z" {
+		t.Fatalf("reset cluster = %#v, want pending=true with fresh timestamp", patch)
+	}
+	if patch["session_key"] != "" || patch["started_config_hash"] != "" {
+		t.Fatalf("stale resume fields = %#v, want cleared", patch)
+	}
+	if n := len(rec.CallsForOp("SetMetadataBatch")); n != 0 {
+		t.Fatalf("SetMetadataBatch ops = %d, want 0", n)
 	}
 }
 

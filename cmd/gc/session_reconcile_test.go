@@ -36,6 +36,8 @@ type testStore struct {
 	metadataBatchCalls   int
 	metadataBatchPatches []map[string]string
 	metadataBatchErr     error
+	updateCalls          int
+	updatePatches        []map[string]string
 }
 
 func newTestStore() *testStore {
@@ -64,6 +66,25 @@ func (s *testStore) SetMetadataBatch(id string, kvs map[string]string) error {
 		if err := s.SetMetadata(id, k, v); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (s *testStore) Update(id string, opts beads.UpdateOpts) error {
+	s.updateCalls++
+	patch := make(map[string]string, len(opts.Metadata))
+	for k, v := range opts.Metadata {
+		patch[k] = v
+	}
+	s.updatePatches = append(s.updatePatches, patch)
+	if s.metadataBatchErr != nil {
+		return s.metadataBatchErr
+	}
+	if s.metadata[id] == nil {
+		s.metadata[id] = make(map[string]string)
+	}
+	for k, v := range opts.Metadata {
+		s.metadata[id][k] = v
 	}
 	return nil
 }
@@ -1510,6 +1531,16 @@ func TestRecordWakeFailure_ClearsStartedConfigHash(t *testing.T) {
 	}
 	if session.Metadata["started_config_hash"] != "" {
 		t.Errorf("started_config_hash = %q, want empty (so next wake uses --session-id, not --resume)", session.Metadata["started_config_hash"])
+	}
+	if store.updateCalls != 1 {
+		t.Fatalf("Update calls = %d, want 1 for the atomic reset cluster", store.updateCalls)
+	}
+	reset := store.updatePatches[0]
+	if reset["continuation_reset_pending"] != "true" || reset[sessionpkg.ResetCommittedAtKey] != now.Format(time.RFC3339) {
+		t.Fatalf("atomic reset cluster = %#v, want pending=true with fresh timestamp", reset)
+	}
+	if store.metadataBatchCalls != 0 {
+		t.Fatalf("SetMetadataBatch calls = %d, want 0 for the atomic reset path", store.metadataBatchCalls)
 	}
 }
 

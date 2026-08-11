@@ -202,6 +202,14 @@ func (s *failSessionHealStore) SetMetadataBatch(id string, kvs map[string]string
 	return s.Store.SetMetadataBatch(id, kvs)
 }
 
+func (s *failSessionHealStore) Update(id string, opts beads.UpdateOpts) error {
+	if id == s.sessionID && opts.Metadata["state"] == string(sessionpkg.StateAsleep) {
+		s.attempts++
+		return s.err
+	}
+	return s.Store.Update(id, opts)
+}
+
 func (s *failRateLimitHoldStore) SetMetadataBatch(id string, kvs map[string]string) error {
 	if kvs["sleep_reason"] == "rate_limit" {
 		s.rateLimitHoldCalls++
@@ -3533,6 +3541,10 @@ func (s *assignOnListStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 type failSetMetadataBatchStore struct {
 	beads.Store
 	err error
+}
+
+func (s *failSetMetadataBatchStore) Update(string, beads.UpdateOpts) error {
+	return s.err
 }
 
 func (s *failSetMetadataBatchStore) SetMetadataBatch(string, map[string]string) error {

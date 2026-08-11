@@ -153,7 +153,7 @@ func (m *Manager) clearStaleResumeMetadata(id string, b *beads.Bead) error {
 	for _, k := range primingResetKeys {
 		patch[k] = ""
 	}
-	if err := m.store.SetMetadataBatch(id, patch); err != nil {
+	if err := m.store.Update(id, beads.UpdateOpts{Metadata: patch}); err != nil {
 		return fmt.Errorf("clearing stale resume metadata: %w", err)
 	}
 	if b.Metadata == nil {

@@ -45,6 +45,17 @@ func (s *Store) ApplyPatch(id string, patch MetadataPatch) error {
 	return s.store.SetMetadataBatch(id, map[string]string(patch))
 }
 
+// UpdateMetadata persists a metadata patch with one Store.Update operation.
+// Use it for key clusters that must commit together on every backend, including
+// continuation_reset_pending and reset_committed_at. Unlike ApplyPatch, it
+// never routes through a backend's potentially decomposed SetMetadataBatch.
+func (s *Store) UpdateMetadata(id string, patch MetadataPatch) error {
+	if len(patch) == 0 {
+		return nil
+	}
+	return s.store.Update(id, beads.UpdateOpts{Metadata: map[string]string(patch)})
+}
+
 // ApplyPatchInfo persists patch for info.ID (via ApplyPatch) and returns the
 // refreshed Info as a LOCAL fold — info.ApplyPatch(patch) — never a re-Get. It
 // is the write-returns-Info chokepoint the reconciler routes its direct
@@ -102,7 +113,7 @@ func (s *Store) UpdateMetadataInfo(info Info, patch MetadataPatch) (Info, error)
 	if len(patch) == 0 {
 		return info, nil
 	}
-	if err := s.store.Update(info.ID, beads.UpdateOpts{Metadata: map[string]string(patch)}); err != nil {
+	if err := s.UpdateMetadata(info.ID, patch); err != nil {
 		return info, err
 	}
 	return info.ApplyPatch(patch), nil
@@ -133,14 +144,14 @@ func (s *Store) BeginDrainAckStopPending(id string, now time.Time) error {
 // RequestRestart records a controller handoff to a fresh provider conversation
 // via RestartRequestPatch. Replaces the restart-request write in session_reconciler.go.
 func (s *Store) RequestRestart(id, sessionKey string, now time.Time) error {
-	return s.ApplyPatch(id, RestartRequestPatch(sessionKey, now))
+	return s.UpdateMetadata(id, RestartRequestPatch(sessionKey, now))
 }
 
 // ResetConfigDrift records an in-place named-session repair after core config
 // drift via ConfigDriftResetPatch. Replaces the config-drift reset writes in
 // session_reconciler.go and soft_reload.go.
 func (s *Store) ResetConfigDrift(id string, next State, sessionKey string, now time.Time) error {
-	return s.ApplyPatch(id, ConfigDriftResetPatch(next, sessionKey, now))
+	return s.UpdateMetadata(id, ConfigDriftResetPatch(next, sessionKey, now))
 }
 
 // SetWaitHold sets or clears the wait-hold + sleep-intent markers. Replaces the
