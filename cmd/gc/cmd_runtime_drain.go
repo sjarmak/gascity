@@ -532,7 +532,75 @@ func completeCurrentRuntimeDrainAckTrigger(current sessionRuntimeTarget) error {
 		os.Getenv("GC_ALIAS"),
 		os.Getenv("GC_AGENT"),
 	)
-	return completeRuntimeDrainAckTrigger(store, triggerID, identities)
+	return completeRuntimeDrainAckCurrentWork(
+		store,
+		triggerID,
+		identities,
+		os.Getenv("GC_SESSION_ID"),
+		current.sessionName,
+	)
+}
+
+func completeRuntimeDrainAckCurrentWork(store beads.Store, triggerID string, sessionIdentities []string, sessionID, sessionName string) error {
+	claimedID, err := runtimeDrainAckClaimedWorkID(store, sessionIdentities, sessionID, sessionName)
+	if err != nil {
+		return err
+	}
+	if claimedID != "" {
+		triggerID = claimedID
+	}
+	return completeRuntimeDrainAckTrigger(store, triggerID, sessionIdentities)
+}
+
+func runtimeDrainAckClaimedWorkID(store beads.Store, sessionIdentities []string, sessionID, sessionName string) (string, error) {
+	if store == nil {
+		return "", nil
+	}
+	items, err := store.List(beads.ListQuery{
+		Status:    "in_progress",
+		Assignees: sessionIdentities,
+		TierMode:  beads.TierBoth,
+		Live:      true,
+	})
+	if err != nil {
+		return "", fmt.Errorf("finding current claimed work: %w", err)
+	}
+
+	candidates := make([]beads.Bead, 0, len(items))
+	stamped := make([]beads.Bead, 0, 1)
+	sessionID = strings.TrimSpace(sessionID)
+	sessionName = strings.TrimSpace(sessionName)
+	for _, item := range items {
+		if !strings.EqualFold(strings.TrimSpace(item.Status), "in_progress") ||
+			!hookClaimHasIdentity(item.Assignee, sessionIdentities) ||
+			hookClaimCandidateIsMessage(item) {
+			continue
+		}
+		kind := strings.TrimSpace(item.Metadata[beadmeta.KindMetadataKey])
+		if beadmeta.IsControlKind(kind) || slices.Contains(beadmeta.WorkflowTopologyKinds, kind) {
+			continue
+		}
+		candidates = append(candidates, item)
+		if sessionID != "" && strings.TrimSpace(item.Metadata[beadmeta.SessionIDMetadataKey]) == sessionID ||
+			sessionName != "" && strings.TrimSpace(item.Metadata[beadmeta.SessionNameMetadataKey]) == sessionName {
+			stamped = append(stamped, item)
+		}
+	}
+
+	switch len(stamped) {
+	case 1:
+		return stamped[0].ID, nil
+	case 0:
+		if len(candidates) == 1 {
+			return candidates[0].ID, nil
+		}
+		if len(candidates) == 0 {
+			return "", nil
+		}
+	default:
+		return "", fmt.Errorf("finding current claimed work: session stamp matches %d in-progress beads", len(stamped))
+	}
+	return "", fmt.Errorf("finding current claimed work: session identities match %d in-progress beads without a unique session stamp", len(candidates))
 }
 
 func completeRuntimeDrainAckTrigger(store beads.Store, triggerID string, sessionIdentities []string) error {

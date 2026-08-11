@@ -818,6 +818,111 @@ func TestCompleteRuntimeDrainAckTriggerIgnoresStaleUnownedTrigger(t *testing.T) 
 	}
 }
 
+func TestCompleteRuntimeDrainAckCurrentWorkPrefersClaimedBeadOverEnvironmentTrigger(t *testing.T) {
+	store := beads.NewMemStore()
+	environmentTrigger, err := store.Create(beads.Bead{
+		Title:  "queued work that launched the seat",
+		Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("Create(environment trigger): %v", err)
+	}
+	claimed, err := store.Create(beads.Bead{
+		Title:    "stale drain step returned by gc hook --claim",
+		Status:   "in_progress",
+		Assignee: "pool-slot",
+		Metadata: map[string]string{
+			beadmeta.SessionIDMetadataKey:   "gc-session",
+			beadmeta.SessionNameMetadataKey: "slot-session",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(claimed bead): %v", err)
+	}
+	inProgress := "in_progress"
+	if err := store.Update(claimed.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("mark claimed bead in progress: %v", err)
+	}
+
+	err = completeRuntimeDrainAckCurrentWork(
+		store,
+		environmentTrigger.ID,
+		[]string{"pool-slot", "slot-session", "gc-session"},
+		"gc-session",
+		"slot-session",
+	)
+	if err != nil {
+		t.Fatalf("completeRuntimeDrainAckCurrentWork: %v", err)
+	}
+
+	gotClaimed, err := store.Get(claimed.ID)
+	if err != nil {
+		t.Fatalf("Get(claimed): %v", err)
+	}
+	if gotClaimed.Status != "closed" || gotClaimed.Metadata[beadmeta.OutcomeMetadataKey] != beadmeta.OutcomePass {
+		t.Fatalf("claimed bead = status %q outcome %q, want closed/pass", gotClaimed.Status, gotClaimed.Metadata[beadmeta.OutcomeMetadataKey])
+	}
+	gotTrigger, err := store.Get(environmentTrigger.ID)
+	if err != nil {
+		t.Fatalf("Get(environment trigger): %v", err)
+	}
+	if gotTrigger.Status != "open" {
+		t.Fatalf("environment trigger status = %q, want open", gotTrigger.Status)
+	}
+}
+
+func TestCompleteRuntimeDrainAckCurrentWorkFallsBackToOwnedEnvironmentTrigger(t *testing.T) {
+	store := beads.NewMemStore()
+	trigger, err := store.Create(beads.Bead{
+		Title:    "drain step from the environment",
+		Assignee: "pool-slot",
+	})
+	if err != nil {
+		t.Fatalf("Create(trigger): %v", err)
+	}
+
+	if err := completeRuntimeDrainAckCurrentWork(store, trigger.ID, []string{"pool-slot"}, "gc-session", "slot-session"); err != nil {
+		t.Fatalf("completeRuntimeDrainAckCurrentWork: %v", err)
+	}
+	got, err := store.Get(trigger.ID)
+	if err != nil {
+		t.Fatalf("Get(trigger): %v", err)
+	}
+	if got.Status != "closed" || got.Metadata[beadmeta.OutcomeMetadataKey] != beadmeta.OutcomePass {
+		t.Fatalf("trigger = status %q outcome %q, want closed/pass", got.Status, got.Metadata[beadmeta.OutcomeMetadataKey])
+	}
+}
+
+func TestCompleteRuntimeDrainAckCurrentWorkFailsClosedOnAmbiguousClaims(t *testing.T) {
+	store := beads.NewMemStore()
+	var claimedIDs []string
+	for _, title := range []string{"first claim", "second claim"} {
+		claimed, err := store.Create(beads.Bead{Title: title, Assignee: "pool-slot"})
+		if err != nil {
+			t.Fatalf("Create(%s): %v", title, err)
+		}
+		inProgress := "in_progress"
+		if err := store.Update(claimed.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+			t.Fatalf("mark %s in progress: %v", title, err)
+		}
+		claimedIDs = append(claimedIDs, claimed.ID)
+	}
+
+	err := completeRuntimeDrainAckCurrentWork(store, "unrelated-trigger", []string{"pool-slot"}, "gc-session", "slot-session")
+	if err == nil || !strings.Contains(err.Error(), "match 2 in-progress beads") {
+		t.Fatalf("completeRuntimeDrainAckCurrentWork error = %v, want ambiguous-claims diagnostic", err)
+	}
+	for _, id := range claimedIDs {
+		got, getErr := store.Get(id)
+		if getErr != nil {
+			t.Fatalf("Get(%s): %v", id, getErr)
+		}
+		if got.Status != "in_progress" {
+			t.Fatalf("ambiguous claim %s status = %q, want in_progress", id, got.Status)
+		}
+	}
+}
+
 type drainAckOwnerRaceStore struct {
 	beads.Store
 	triggerID string
