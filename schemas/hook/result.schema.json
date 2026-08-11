@@ -34,7 +34,10 @@
         "ready_assignment",
         "no_work",
         "claims_errored",
-        "stale_session"
+        "stale_session",
+        "city_suspended",
+        "agent_suspended",
+        "rig_suspended"
       ]
     },
     "bead_id": {
@@ -98,7 +101,10 @@
             "enum": [
               "no_work",
               "claims_errored",
-              "stale_session"
+              "stale_session",
+              "city_suspended",
+              "agent_suspended",
+              "rig_suspended"
             ]
           }
         }

@@ -22,12 +22,14 @@ const hookClaimCommandName = "hook"
 
 // Drain-action reasons for the gc hook --claim result contract
 // (schemas/hook/result.schema.json). Every value here is a valid reason when
-// action is "drain": an idle store, an operational claim-write failure, or a
-// refused stale session.
+// action is "drain".
 const (
-	hookClaimReasonNoWork        = "no_work"
-	hookClaimReasonClaimsErrored = "claims_errored"
-	hookClaimReasonStaleSession  = "stale_session"
+	hookClaimReasonNoWork         = "no_work"
+	hookClaimReasonClaimsErrored  = "claims_errored"
+	hookClaimReasonStaleSession   = "stale_session"
+	hookClaimReasonCitySuspended  = "city_suspended"
+	hookClaimReasonAgentSuspended = "agent_suspended"
+	hookClaimReasonRigSuspended   = "rig_suspended"
 )
 
 var hookClaimMutationTimeout = 10 * time.Second
@@ -469,9 +471,16 @@ func writeHookClaimStaleSessionDrain(opts hookCommandOptions, stdout, stderr io.
 	return writeHookClaimDrain(hookClaimReasonStaleSession, opts.JSON, opts.DrainAck, hookRuntimeDrainAck, stdout, stderr)
 }
 
+func writeHookClaimSuspensionDrain(reason string, opts hookCommandOptions, stdout, stderr io.Writer) int {
+	drainAckFn := opts.DrainAckFn
+	if drainAckFn == nil {
+		drainAckFn = hookRuntimeDrainAck
+	}
+	return writeHookClaimDrain(reason, opts.JSON, opts.DrainAck, drainAckFn, stdout, stderr)
+}
+
 // writeHookClaimDrain writes the single structured drain result shared by every
-// terminal no-claim outcome: an idle no-work store, a claims-errored store, and a
-// refused stale session. For a --json caller it emits the schema-backed drain
+// terminal no-claim outcome. For a --json caller it emits the schema-backed drain
 // line; when drainAck is set it first runs drainAckFn and marks the result
 // acknowledged. The exit code mirrors the historical contract — 0 once drain is
 // acknowledged, else 1 — so a non-drain-ack caller still reports action=drain
