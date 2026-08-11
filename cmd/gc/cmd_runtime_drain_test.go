@@ -884,6 +884,40 @@ func TestCompleteRuntimeDrainAckTriggerDoesNotCloseReassignedAtomicStoreBead(t *
 	}
 }
 
+type drainAckDeleteRaceStore struct {
+	beads.Store
+	triggerID string
+}
+
+func (s *drainAckDeleteRaceStore) AtomicTx() bool { return true }
+
+func (s *drainAckDeleteRaceStore) Tx(commitMsg string, fn func(beads.Tx) error) error {
+	if err := s.Delete(s.triggerID); err != nil {
+		return err
+	}
+	return s.Store.Tx(commitMsg, fn)
+}
+
+func TestCompleteRuntimeDrainAckTriggerTreatsAtomicDeleteRaceAsComplete(t *testing.T) {
+	mem := beads.NewMemStore()
+	trigger, err := mem.Create(beads.Bead{
+		Title:    "current session work",
+		Status:   "in_progress",
+		Assignee: "current-session",
+	})
+	if err != nil {
+		t.Fatalf("Create(trigger): %v", err)
+	}
+	store := &drainAckDeleteRaceStore{Store: mem, triggerID: trigger.ID}
+
+	if err := completeRuntimeDrainAckTrigger(store, trigger.ID, []string{"current-session"}); err != nil {
+		t.Fatalf("completeRuntimeDrainAckTrigger: %v", err)
+	}
+	if _, err := mem.Get(trigger.ID); !errors.Is(err, beads.ErrNotFound) {
+		t.Fatalf("Get(trigger) error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestJoinDrainAckMutationErrorsMissingSessionBeadIsIdempotent(t *testing.T) {
 	err := joinDrainAckMutationErrors(
 		fmt.Errorf("setting metadata on %q: %w", "gc-missing", beads.ErrNotFound),
