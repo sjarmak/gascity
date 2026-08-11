@@ -53,7 +53,7 @@ func initReapRig(t *testing.T) (cityPath, rigRoot string) {
 // itself use addClosedWorktreeWithAge directly.
 func addClosedWorktree(t *testing.T, rigRoot, cityPath, agentHome, beadID string) string {
 	t.Helper()
-	return addClosedWorktreeWithAge(t, rigRoot, cityPath, agentHome, beadID, 24*time.Hour)
+	return addClosedWorktreeWithAge(t, rigRoot, cityPath, agentHome, beadID, 4*24*time.Hour)
 }
 
 // addClosedWorktreeWithAge is addClosedWorktree with an explicit backdated
