@@ -3099,9 +3099,10 @@ func TestCityRuntimeBeadReconcileTick_IdleClaimNudgeRunsForReportActivityRuntime
 		State:            map[string]TemplateParams{},
 		ScaleCheckCounts: map[string]int{"worker": 0},
 		AssignedWorkBeads: []beads.Bead{
-			// Open + unassigned == unclaimed: the slot's trigger bead the warm pool
-			// worker never began. workBead sets gc.routed_to but leaves the assignee empty.
-			workBead("w-idle", "worker", "", "open", 5),
+			// Open + assigned is still unclaimed: assignment records the intended
+			// seat, while only in_progress proves that seat began execution. This
+			// is the routed/assigned-but-idle state from gc-snrfp.
+			workBead("w-idle", "worker", "worker-bd-idle", "open", 5),
 		},
 	}
 	cr.beadReconcileTick(context.Background(), result, cr.loadSessionBeadSnapshot(), nil, false)
@@ -3114,7 +3115,7 @@ func TestCityRuntimeBeadReconcileTick_IdleClaimNudgeRunsForReportActivityRuntime
 		t.Fatalf("tick unexpectedly closed the idle pool session: %+v", got)
 	}
 	if c := got.Metadata[idleClaimNudgeCountKey]; c != "1" {
-		t.Fatalf("idle-claim nudge did not fire for a report-activity runtime: attempt count = %q, want 1", c)
+		t.Fatalf("idle-claim nudge did not fire for open assigned work: attempt count = %q, want 1", c)
 	}
 }
 

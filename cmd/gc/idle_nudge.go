@@ -385,13 +385,13 @@ func (p poolClaimBackstop) governs(s beads.Bead) bool {
 // The engine's ID-keyed map is ignored: resolution goes through the
 // store-scoped snapshot so a slot bound to a rig bead is matched against that
 // rig's copy, not a same-ID bead in another store.
-func (p poolClaimBackstop) resolve(s beads.Bead, _ map[string]beads.Bead, sessName string) (backstopTarget, backstopResolution) {
+func (p poolClaimBackstop) resolve(s beads.Bead, _ map[string]beads.Bead, _ string) (backstopTarget, backstopResolution) {
 	triggerID := strings.TrimSpace(s.Metadata[beadmeta.TriggerBeadIDMetadataKey])
 	if triggerID == "" {
 		return backstopTarget{}, backstopResolutionClear
 	}
 	w, ok := p.work.lookup(triggerID, s.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey])
-	if !ok || !isUnclaimedTrigger(w, sessName) {
+	if !ok || !isUnclaimedTrigger(w) {
 		return backstopTarget{}, backstopResolutionClear
 	}
 	return backstopTarget{ID: triggerID}, backstopResolutionOutstanding
@@ -487,14 +487,13 @@ func normalizeIdleClaimStoreRef(storeRef string) string {
 }
 
 // isUnclaimedTrigger reports whether the pool slot's trigger bead is still
-// waiting to be claimed: status open and not already assigned to this slot
-// (a non-empty assignee equal to the session means the claim is mid-flight).
-func isUnclaimedTrigger(w beads.Bead, sessName string) bool {
+// waiting to be claimed. Assignment records where the bead should run; only an
+// in_progress status proves that a worker claimed it. Treating open+assigned as
+// execution suppresses the backstop when the delivery that was meant to start
+// the claim is stranded in the target's composer (gc-snrfp).
+func isUnclaimedTrigger(w beads.Bead) bool {
 	if !strings.EqualFold(strings.TrimSpace(w.Status), "open") {
 		return false // in_progress / closed / blocked → not ours to nudge
-	}
-	if assignee := strings.TrimSpace(w.Assignee); assignee != "" && assignee == sessName {
-		return false
 	}
 	return true
 }
