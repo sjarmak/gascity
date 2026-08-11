@@ -818,6 +818,72 @@ func TestCompleteRuntimeDrainAckTriggerIgnoresStaleUnownedTrigger(t *testing.T) 
 	}
 }
 
+type drainAckOwnerRaceStore struct {
+	beads.Store
+	triggerID string
+	newOwner  string
+	traced    bool
+}
+
+func (s *drainAckOwnerRaceStore) AtomicTx() bool { return true }
+
+func (s *drainAckOwnerRaceStore) raceOwnership() error {
+	if s.traced {
+		return nil
+	}
+	s.traced = true
+	status := "in_progress"
+	return s.Store.Update(s.triggerID, beads.UpdateOpts{
+		Status:   &status,
+		Assignee: &s.newOwner,
+	})
+}
+
+func (s *drainAckOwnerRaceStore) Update(id string, opts beads.UpdateOpts) error {
+	if err := s.raceOwnership(); err != nil {
+		return err
+	}
+	return s.Store.Update(id, opts)
+}
+
+func (s *drainAckOwnerRaceStore) Tx(commitMsg string, fn func(beads.Tx) error) error {
+	if err := s.raceOwnership(); err != nil {
+		return err
+	}
+	return s.Store.Tx(commitMsg, fn)
+}
+
+func TestCompleteRuntimeDrainAckTriggerDoesNotCloseReassignedAtomicStoreBead(t *testing.T) {
+	mem := beads.NewMemStore()
+	trigger, err := mem.Create(beads.Bead{
+		Title:    "current session work",
+		Status:   "in_progress",
+		Assignee: "current-session",
+	})
+	if err != nil {
+		t.Fatalf("Create(trigger): %v", err)
+	}
+	store := &drainAckOwnerRaceStore{
+		Store:     mem,
+		triggerID: trigger.ID,
+		newOwner:  "replacement-session",
+	}
+
+	if err := completeRuntimeDrainAckTrigger(store, trigger.ID, []string{"current-session"}); err != nil {
+		t.Fatalf("completeRuntimeDrainAckTrigger: %v", err)
+	}
+	got, err := mem.Get(trigger.ID)
+	if err != nil {
+		t.Fatalf("Get(trigger): %v", err)
+	}
+	if got.Status != "in_progress" || got.Assignee != "replacement-session" {
+		t.Fatalf("reassigned trigger = status %q assignee %q, want in_progress/replacement-session", got.Status, got.Assignee)
+	}
+	if got.Metadata[beadmeta.OutcomeMetadataKey] != "" {
+		t.Fatalf("reassigned trigger outcome = %q, want unset", got.Metadata[beadmeta.OutcomeMetadataKey])
+	}
+}
+
 func TestJoinDrainAckMutationErrorsMissingSessionBeadIsIdempotent(t *testing.T) {
 	err := joinDrainAckMutationErrors(
 		fmt.Errorf("setting metadata on %q: %w", "gc-missing", beads.ErrNotFound),

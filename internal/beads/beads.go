@@ -51,6 +51,10 @@ var ErrConditionalReleaseUnsupported = errors.New("conditional assignment releas
 // callers treat it as a reason to fall back, never as "another actor won".
 var ErrAtomicClaimUnsupported = errors.New("atomic claim unsupported")
 
+// ErrTxReadUnsupported reports that a Store.Tx callback provides only the
+// write surface and cannot reread state inside the transaction.
+var ErrTxReadUnsupported = errors.New("transactional read unsupported")
+
 // ErrConditionalWriteUnsupported reports that this store (or the bd behind it)
 // cannot perform conditional writes. Latching it per store instance is the
 // capability veto: no code path in internal/beads converts it into an
@@ -361,6 +365,13 @@ type Tx interface {
 	Update(id string, opts UpdateOpts) error
 	SetMetadataBatch(id string, kvs map[string]string) error
 	Close(id string) error
+}
+
+// ReadTx is the optional read-capable transaction surface. Stores implement it
+// when reads and writes in the callback share the same atomic transaction.
+type ReadTx interface {
+	Tx
+	Get(id string) (Bead, error)
 }
 
 func runSequentialTx(tx Tx, fn func(Tx) error) error {
