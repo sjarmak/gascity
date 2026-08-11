@@ -1302,7 +1302,7 @@ func (cr *CityRuntime) tick(
 		recordPhase(TraceSiteSessionSnapshot, "load_session_snapshot.after_reap", phaseStart, traceSessionSnapshotFields(sessionBeads))
 	}
 	phaseStart = time.Now()
-	dispositionsRecorded := recordClosedWorktreeCleanupDispositions(cr.cfg, cr.rigBeadStores(), cr.stderr)
+	dispositionsRecorded := recordClosedWorktreeCleanupDispositions(cr.cfg, cr.rigBeadStores(), cr.stderr) // residency:allow — constructor input to recordClosedWorktreeCleanupDispositions, not a residency answer
 	recordPhase(TraceSiteControllerTickPhase, "record_closed_worktree_cleanup_dispositions", phaseStart, map[string]any{"recorded": dispositionsRecorded})
 	reapEnabled := cr.cfg.Daemon.AutoReapClosedBeadWorktreesEnabled()
 	reapDryRun := cr.cfg.Daemon.AutoReapClosedBeadWorktreesDryRunEnabled()

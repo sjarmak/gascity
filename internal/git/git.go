@@ -257,17 +257,32 @@ func (g *Git) HeadLandedOnDefaultResult() (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("resolving default branch: %w", err)
 	}
-	var defaultRef string
-	for _, candidate := range []string{"refs/heads/" + branch, "refs/remotes/origin/" + branch} {
-		if _, probeErr := g.run("rev-parse", "--verify", candidate+"^{commit}"); probeErr == nil {
-			defaultRef = candidate
-			break
-		}
-	}
-	if defaultRef == "" {
-		return false, fmt.Errorf("default branch %q has no resolvable local or origin ref", branch)
+
+	remoteOut, remoteErr := g.run("remote")
+	hasRemote := remoteErr == nil && strings.TrimSpace(remoteOut) != ""
+
+	// Landing must be judged against the published branch, not a local ref an
+	// operator can move at will and that routinely sits ahead of what is
+	// actually shipped. Prefer refs/remotes/origin/<branch> whenever a remote
+	// is configured; fall back to the local ref only for the standalone
+	// (no-remote) case. When a remote exists but its ref for this branch will
+	// not resolve, that is unevaluable, not "assume local" — fail closed by
+	// returning an error rather than silently trusting the local ref.
+	remoteRef := "refs/remotes/origin/" + branch
+	if _, probeErr := g.run("rev-parse", "--verify", remoteRef+"^{commit}"); probeErr == nil {
+		return g.headLandedOnRef(remoteRef)
+	} else if hasRemote {
+		return false, fmt.Errorf("default branch %q has no resolvable origin ref: %w", branch, probeErr)
 	}
 
+	localRef := "refs/heads/" + branch
+	if _, probeErr := g.run("rev-parse", "--verify", localRef+"^{commit}"); probeErr != nil {
+		return false, fmt.Errorf("default branch %q has no resolvable local or origin ref", branch)
+	}
+	return g.headLandedOnRef(localRef)
+}
+
+func (g *Git) headLandedOnRef(defaultRef string) (bool, error) {
 	if _, ancestorErr := g.run("merge-base", "--is-ancestor", "HEAD", defaultRef); ancestorErr == nil {
 		return true, nil
 	} else if !gitExitCode(ancestorErr, 1) {
