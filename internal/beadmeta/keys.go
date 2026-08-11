@@ -202,15 +202,23 @@ const (
 	// copied into a binding with the name of the binding it came from, so a
 	// resumed attempt can tell a row it wrote from content the destination
 	// already owned.
-	InfraMigratedFromMetadataKey   = "gc.infra_migrated_from"
-	TriggerBeadStoreRefMetadataKey = "gc.trigger_bead_store_ref"
-	TruncatedMetadataKey           = "gc.truncated"
-	WorkBranchMetadataKey          = "gc.work_branch"
-	WorkCommitMetadataKey          = "gc.work_commit"
-	WorkDirMetadataKey             = "gc.work_dir"
-	WorkOutcomeMetadataKey         = "gc.work_outcome"
-	WorkVerificationMetadataKey    = "gc.work_verification"
-	WorkflowIDMetadataKey          = "gc.workflow_id"
+	InfraMigratedFromMetadataKey               = "gc.infra_migrated_from"
+	TriggerBeadStoreRefMetadataKey             = "gc.trigger_bead_store_ref"
+	TruncatedMetadataKey                       = "gc.truncated"
+	WorkBranchMetadataKey                      = "gc.work_branch"
+	WorkCommitMetadataKey                      = "gc.work_commit"
+	WorkDirMetadataKey                         = "gc.work_dir"
+	WorkOutcomeMetadataKey                     = "gc.work_outcome"
+	WorkVerificationMetadataKey                = "gc.work_verification"
+	WorktreeCleanupBranchMetadataKey           = "gc.worktree_cleanup_branch"
+	WorktreeCleanupHeadMetadataKey             = "gc.worktree_cleanup_head"
+	WorktreeCleanupManifestCriteriaMetadataKey = "gc.worktree_cleanup_manifest_criteria"
+	WorktreeCleanupManifestVersionMetadataKey  = "gc.worktree_cleanup_manifest_version"
+	WorktreeCleanupPathMetadataKey             = "gc.worktree_cleanup_path"
+	WorktreeCleanupPendingMetadataKey          = "gc.worktree_cleanup_pending"
+	WorktreeCleanupReasonMetadataKey           = "gc.worktree_cleanup_reason"
+	WorktreeCleanupRepoMetadataKey             = "gc.worktree_cleanup_repo"
+	WorkflowIDMetadataKey                      = "gc.workflow_id"
 )
 
 // Work-record metadata keys (ADR-0009). These bind a work bead to its claim
@@ -451,6 +459,14 @@ var KnownMetadataKeys = []string{
 	WorkDirMetadataKey,
 	WorkOutcomeMetadataKey,
 	WorkVerificationMetadataKey,
+	WorktreeCleanupBranchMetadataKey,
+	WorktreeCleanupHeadMetadataKey,
+	WorktreeCleanupManifestCriteriaMetadataKey,
+	WorktreeCleanupManifestVersionMetadataKey,
+	WorktreeCleanupPathMetadataKey,
+	WorktreeCleanupPendingMetadataKey,
+	WorktreeCleanupReasonMetadataKey,
+	WorktreeCleanupRepoMetadataKey,
 	WorkflowIDMetadataKey,
 }
 
