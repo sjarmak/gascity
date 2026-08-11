@@ -211,7 +211,10 @@
               "storage-migrate",
               "storage-status",
               "ready",
-              "storage-recover-stranded"
+              "storage-recover-stranded",
+              "worktree-cleanup",
+              "worktree-ensure",
+              "worktree-verify"
             ]
           },
           "event_id": {
