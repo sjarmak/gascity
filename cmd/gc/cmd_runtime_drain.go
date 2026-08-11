@@ -551,7 +551,13 @@ func completeRuntimeDrainAckTrigger(store beads.Store, triggerID string, session
 	if err != nil || !eligible {
 		return err
 	}
-	opts := runtimeDrainAckTriggerCompletionOpts()
+	status := "closed"
+	opts := beads.UpdateOpts{
+		Status: &status,
+		Metadata: map[string]string{
+			beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass,
+		},
+	}
 	writer, hasWriter := beads.ConditionalWriterFor(store)
 	if beads.StoreSupportsAtomicTx(store) {
 		err := completeRuntimeDrainAckTriggerTx(store, triggerID, sessionIdentities, opts)
@@ -577,16 +583,6 @@ func runtimeDrainAckTriggerEligible(triggerID string, bead beads.Bead, sessionId
 		return false, fmt.Errorf("trigger bead %s has non-worker kind %q", triggerID, kind)
 	}
 	return hookClaimHasIdentity(bead.Assignee, sessionIdentities), nil
-}
-
-func runtimeDrainAckTriggerCompletionOpts() beads.UpdateOpts {
-	status := "closed"
-	return beads.UpdateOpts{
-		Status: &status,
-		Metadata: map[string]string{
-			beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass,
-		},
-	}
 }
 
 func completeRuntimeDrainAckTriggerTx(store beads.Store, triggerID string, sessionIdentities []string, opts beads.UpdateOpts) error {
