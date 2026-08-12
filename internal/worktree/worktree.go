@@ -641,6 +641,14 @@ func publishAndVerifyProvenance(spec Spec, resolvedBase string) (Report, error) 
 // report. It fences against stale/cross-owner reports using the durable
 // attempt ID and refuses to remove a worktree that acquired WIP.
 func RollbackAttempt(spec Spec, report Report) error {
+	// Validate before touching anything. Taking the lock first would resolve
+	// the lock file through an unvalidated RepoDir, and git resolves an empty
+	// dir against the calling process's own working directory: an incomplete
+	// spec then writes into whatever repository the caller happens to be
+	// standing in, and reports only the validation error.
+	if err := spec.validate(); err != nil {
+		return fmt.Errorf("rollback refused: %w", err)
+	}
 	if !report.Created {
 		return errors.New("rollback refused: report does not describe an attempt-created worktree")
 	}
