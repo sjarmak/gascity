@@ -3,8 +3,10 @@ package worktree
 import (
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -40,6 +42,30 @@ func managedSpec(repo, root, path, branch, base string) Spec {
 		Generation: "1",
 		Lifecycle:  LifecycleActive,
 	}
+}
+
+// snapshotTree returns every path under dir, relative and sorted. Unlike
+// snapshotDir it recurses, so it catches a write anywhere in the tree rather
+// than only a new top-level entry.
+func snapshotTree(t *testing.T, dir string) []string {
+	t.Helper()
+	var found []string
+	err := filepath.WalkDir(dir, func(path string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			return relErr
+		}
+		found = append(found, rel)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking %q: %v", dir, err)
+	}
+	sort.Strings(found)
+	return found
 }
 
 func publishRemoteRef(t *testing.T, repo, branch, commit string) {
@@ -621,6 +647,8 @@ func TestManagedDryRunDoesNotPublishProvenance(t *testing.T) {
 	spec := managedSpec(repo, root, wt, "work/gc-test", base)
 	spec.DryRun = true
 	before := snapshotDir(t, root)
+	commonDir := runGit(t, repo, "rev-parse", "--absolute-git-dir")
+	beforeCommon := snapshotTree(t, commonDir)
 
 	rep, err := Ensure(spec)
 	if err != nil {
@@ -633,15 +661,12 @@ func TestManagedDryRunDoesNotPublishProvenance(t *testing.T) {
 		t.Fatalf("dry-run mutated root: before=%v after=%v", before, after)
 	}
 	// The workspace root is not the only place a plan could write. The
-	// serialization lock lives under the repository's common git dir, so
-	// snapshotting only the root would let a lock acquired ahead of the
-	// dry-run return pass as pure.
-	lockFile, err := lockFilePath(repo, wt)
-	if err != nil {
-		t.Fatalf("lockFilePath: %v", err)
-	}
-	if _, statErr := os.Stat(filepath.Dir(lockFile)); !os.IsNotExist(statErr) {
-		t.Fatalf("dry-run created the lock dir %q: %v", filepath.Dir(lockFile), statErr)
+	// serialization lock lives under the repository's common git dir, so a
+	// snapshot of the root alone would let a lock acquired ahead of the dry-run
+	// return pass as pure. Snapshotting the whole common dir rather than just
+	// the lock path also covers anything else a future plan might leave there.
+	if after := snapshotTree(t, commonDir); strings.Join(after, "\x00") != strings.Join(beforeCommon, "\x00") {
+		t.Fatalf("dry-run mutated the repository:\n  before=%v\n  after=%v", beforeCommon, after)
 	}
 }
 
