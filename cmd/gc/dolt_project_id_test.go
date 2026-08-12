@@ -259,11 +259,13 @@ func TestProjectIdentityL3AdapterContractAndManagedComposition(t *testing.T) {
 	defer cleanup()
 	portString := fmt.Sprintf("%d", port)
 
+	// The handle is pooled and owned by internal/doltpool, so it must not be
+	// closed here. doltpool caches by key and never evicts, so a Close would
+	// leave a dead entry that any later caller on the same key would be served.
 	db, err := managedDoltOpenDatabase("127.0.0.1", portString, "root", "hq")
 	if err != nil {
 		t.Fatalf("managedDoltOpenDatabase: %v", err)
 	}
-	defer func() { _ = db.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
