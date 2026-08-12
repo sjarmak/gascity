@@ -3,6 +3,7 @@ package worktree
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -179,5 +180,41 @@ func TestConcurrentEnsureNeverDestroysTheWinnersWorkspace(t *testing.T) {
 	}
 	if _, err := Verify(spec); err != nil {
 		t.Fatalf("workspace does not verify after contended Ensure: %v", err)
+	}
+}
+
+// TestRollbackAttemptValidatesBeforeTouchingAnything covers the boundary an
+// operation crosses when it acquires a resource before checking its inputs.
+//
+// git resolves an empty working directory against the calling process's own
+// cwd, so an incomplete spec does not fail inertly: it walks up to whatever
+// repository the caller happens to be standing in, writes there, and reports
+// only the validation error. The test stands the process in a repository of
+// its own so the damage is observable instead of landing in the developer's
+// checkout.
+func TestRollbackAttemptValidatesBeforeTouchingAnything(t *testing.T) {
+	repo, base := initTestRepo(t)
+	root := t.TempDir()
+	wt := filepath.Join(root, "gc-unvalidated")
+	spec := managedSpec(repo, root, wt, "work/gc-unvalidated", base)
+
+	rep, err := Ensure(spec)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	ambient, _ := initTestRepo(t)
+	t.Chdir(ambient)
+	ambientGitDir := runGit(t, ambient, "rev-parse", "--absolute-git-dir")
+	before := snapshotTree(t, ambientGitDir)
+
+	incomplete := spec
+	incomplete.RepoDir = ""
+	if err := RollbackAttempt(incomplete, rep); err == nil {
+		t.Fatal("RollbackAttempt accepted a spec with no repo dir")
+	}
+
+	if after := snapshotTree(t, ambientGitDir); strings.Join(after, "\x00") != strings.Join(before, "\x00") {
+		t.Fatalf("rollback with an invalid spec wrote into the ambient repository:\n  before=%v\n  after=%v", before, after)
 	}
 }
