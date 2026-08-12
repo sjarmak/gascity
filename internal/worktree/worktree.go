@@ -48,6 +48,14 @@ const (
 	CleanupErrorAmbiguous = "ambiguous_path"
 	// CleanupErrorOwnership reports durable provenance that does not match the caller.
 	CleanupErrorOwnership = "ownership_mismatch"
+	// CleanupErrorStaleAttempt reports a worktree owned by the caller but
+	// created by a different provisioning attempt than the one the request
+	// names. It is distinct from CleanupErrorOwnership because the two demand
+	// opposite responses: a stale attempt is the caller's own out-of-date
+	// handle, recoverable by re-reading the current attempt id with verify,
+	// while an ownership mismatch means the workspace belongs to somebody else
+	// and retrying is exactly the wrong move.
+	CleanupErrorStaleAttempt = "stale_attempt"
 	// CleanupErrorDirty reports staged, unstaged, or untracked work.
 	CleanupErrorDirty = "dirty_worktree"
 	// CleanupErrorUnreachable reports commits that removing the worktree would
@@ -333,6 +341,26 @@ func Ensure(spec Spec) (Report, error) {
 	if err := spec.validate(); err != nil {
 		return Report{}, err
 	}
+	// Serialize against a concurrent Ensure, Cleanup, or rollback on this path,
+	// from the FIRST observation through the last write. Ensure decides whether
+	// to create from state it observed -- does the path exist, does the branch
+	// exist -- so a lock taken only around the write is too late: a rival Ensure
+	// creates the workspace in between, this call's `git worktree add` fails
+	// against a path it still believes is free, and the rollback for that
+	// failure removes the winner's workspace.
+	//
+	// A dry run observes and plans but mutates nothing, so it neither takes the
+	// lock nor creates the lock file. Its purity is the contract, and a plan
+	// that blocks on another caller's write would be a worse answer than a
+	// plan that reports the state it saw.
+	if !spec.DryRun {
+		lock, lockErr := lockPath(spec.RepoDir, spec.Path)
+		if lockErr != nil {
+			return Report{}, lockErr
+		}
+		defer lock.unlock()
+	}
+
 	rep, verifyErr := Verify(spec)
 	if verifyErr == nil {
 		return rep, nil
@@ -348,15 +376,6 @@ func Ensure(spec Spec) (Report, error) {
 	if spec.DryRun {
 		return planDryRun(spec, rep, branchExists, resolvedBase)
 	}
-
-	// Serialize creation against a concurrent Ensure or Cleanup on this path.
-	// Acquired after the dry-run return above so dry-run creates no lock file
-	// and stays observationally pure.
-	lock, lockErr := lockPath(spec.RepoDir, spec.Path)
-	if lockErr != nil {
-		return rep, lockErr
-	}
-	defer lock.unlock()
 
 	if err := createWorktree(repoGit, spec, branchExists); err != nil {
 		return rep, rollbackResult(err, rollbackAfterFailedCreate(repoGit, spec.Path, spec.Branch, !branchExists))
@@ -443,7 +462,7 @@ func Cleanup(spec Spec) (CleanupReport, error) {
 	// path, so they identify the SLOT rather than the occupant; only the
 	// attempt id distinguishes this worktree from its replacement.
 	if verified.Provenance == nil || verified.Provenance.AttemptID != spec.AttemptID {
-		return cleanupFailure(report, CleanupErrorOwnership,
+		return cleanupFailure(report, CleanupErrorStaleAttempt,
 			fmt.Sprintf("worktree attempt %q does not match the requested attempt %q; refusing to remove a workspace this request did not create",
 				provenanceAttempt(verified.Provenance), spec.AttemptID))
 	}
@@ -628,6 +647,16 @@ func RollbackAttempt(spec Spec, report Report) error {
 	if report.Provenance == nil || report.Provenance.AttemptID == "" {
 		return errors.New("rollback refused: report has no provenance attempt id")
 	}
+
+	// Rollback verifies and then removes, so it needs the same lock Ensure and
+	// Cleanup hold: without it the attempt this call verified can be cleaned up
+	// and replaced before the removal lands, and rollback deletes the successor.
+	lock, lockErr := lockPath(spec.RepoDir, spec.Path)
+	if lockErr != nil {
+		return fmt.Errorf("rollback refused: %w", lockErr)
+	}
+	defer lock.unlock()
+
 	verified, err := Verify(spec)
 	if err != nil {
 		return fmt.Errorf("rollback refused: %w", err)

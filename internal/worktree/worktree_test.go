@@ -632,6 +632,17 @@ func TestManagedDryRunDoesNotPublishProvenance(t *testing.T) {
 	if after := snapshotDir(t, root); strings.Join(after, "\x00") != strings.Join(before, "\x00") {
 		t.Fatalf("dry-run mutated root: before=%v after=%v", before, after)
 	}
+	// The workspace root is not the only place a plan could write. The
+	// serialization lock lives under the repository's common git dir, so
+	// snapshotting only the root would let a lock acquired ahead of the
+	// dry-run return pass as pure.
+	lockFile, err := lockFilePath(repo, wt)
+	if err != nil {
+		t.Fatalf("lockFilePath: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Dir(lockFile)); !os.IsNotExist(statErr) {
+		t.Fatalf("dry-run created the lock dir %q: %v", filepath.Dir(lockFile), statErr)
+	}
 }
 
 func TestCleanupRemovesOnlyVerifiedMergedPushedWorktreeAndIsIdempotent(t *testing.T) {

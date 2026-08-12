@@ -45,8 +45,8 @@ func TestCleanupRefusesStaleAttemptAgainstReprovisionedWorktree(t *testing.T) {
 	if cleanupErr == nil {
 		t.Fatal("Cleanup with a finished attempt id removed a re-provisioned workspace, want refusal")
 	}
-	if !report.CleanupPending || report.Error == nil || report.Error.Code != CleanupErrorOwnership {
-		t.Fatalf("Cleanup report = %+v, want structured ownership refusal", report)
+	if !report.CleanupPending || report.Error == nil || report.Error.Code != CleanupErrorStaleAttempt {
+		t.Fatalf("Cleanup report = %+v, want structured stale-attempt refusal", report)
 	}
 	if _, statErr := os.Stat(wt); statErr != nil {
 		t.Fatalf("Cleanup removed the re-provisioned worktree: %v", statErr)
@@ -61,49 +61,28 @@ func TestCleanupRefusesStaleAttemptAgainstReprovisionedWorktree(t *testing.T) {
 	}
 }
 
-// TestPathLockSerializesWorkspaceOperations proves the lock is mutually
-// exclusive, which is what closes the window between Cleanup's checks and its
-// removal.
-//
-// The assertion is ordering, not timing: while the lock is held, a second
-// acquisition must not have completed; once released, it must complete. A
-// second acquirer that has not yet been scheduled also reads as "not
-// completed", so the test cannot fail spuriously.
-func TestPathLockSerializesWorkspaceOperations(t *testing.T) {
+// TestPathLockKeyFollowsSymlinkedAncestors covers two specs that name one
+// workspace through different paths. A lock keyed on the literal path hands
+// each caller its own lock file, which excludes nothing.
+func TestPathLockKeyFollowsSymlinkedAncestors(t *testing.T) {
 	repo, _ := initTestRepo(t)
-	path := filepath.Join(t.TempDir(), "gc-locked")
+	realRoot := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(realRoot, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
 
-	held, err := lockPath(repo, path)
+	viaReal, err := lockFilePath(repo, filepath.Join(realRoot, "wt"))
 	if err != nil {
-		t.Fatalf("lockPath: %v", err)
+		t.Fatalf("lockFilePath(real): %v", err)
 	}
-
-	acquired := make(chan *pathLock, 1)
-	go func() {
-		second, lockErr := lockPath(repo, path)
-		if lockErr != nil {
-			close(acquired)
-			return
-		}
-		acquired <- second
-	}()
-
-	select {
-	case second := <-acquired:
-		if second != nil {
-			second.unlock()
-		}
-		t.Fatal("a second lockPath succeeded while the first was held")
-	default:
+	viaAlias, err := lockFilePath(repo, filepath.Join(alias, "wt"))
+	if err != nil {
+		t.Fatalf("lockFilePath(alias): %v", err)
 	}
-
-	held.unlock()
-
-	second, ok := <-acquired
-	if !ok {
-		t.Fatal("second lockPath failed after the first was released")
+	if viaReal != viaAlias {
+		t.Fatalf("same workspace locked two files:\n  via real  = %s\n  via alias = %s", viaReal, viaAlias)
 	}
-	second.unlock()
 }
 
 // TestCleanupDoesNotLeaveALockFileBehind keeps the serialization lock out of
@@ -132,5 +111,66 @@ func TestCleanupDoesNotLeaveALockFileBehind(t *testing.T) {
 	}
 	for _, entry := range entries {
 		t.Errorf("root retains %q after ensure+cleanup, want an empty root", entry.Name())
+	}
+}
+
+// TestConcurrentEnsureNeverDestroysTheWinnersWorkspace is the regression test
+// for a lock that covered the write but not the observation the write was
+// decided from.
+//
+// Ensure chooses whether to create from state it read before locking: is the
+// path absent, does the branch exist. Serializing only the create makes the
+// loser's `git worktree add` run strictly AFTER the winner's has succeeded,
+// against a path the loser still believes is free. The add fails, and the
+// rollback for that failure removes whatever worktree is registered at the
+// path, which is now the winner's. The winner has already been told it holds a
+// valid workspace.
+//
+// The assertion does not depend on which caller wins: exactly one must report
+// Created, the other must report an already-ensured success, and the workspace
+// must exist at the end.
+func TestConcurrentEnsureNeverDestroysTheWinnersWorkspace(t *testing.T) {
+	repo, base := initTestRepo(t)
+	root := t.TempDir()
+	wt := filepath.Join(root, "gc-contended")
+	spec := managedSpec(repo, root, wt, "work/gc-contended", base)
+
+	type outcome struct {
+		report Report
+		err    error
+	}
+	results := make(chan outcome, 2)
+	start := make(chan struct{})
+	for range 2 {
+		go func() {
+			<-start
+			rep, err := Ensure(spec)
+			results <- outcome{rep, err}
+		}()
+	}
+	close(start)
+
+	created := 0
+	for range 2 {
+		got := <-results
+		if got.err != nil {
+			t.Errorf("Ensure under contention failed: %v", got.err)
+			continue
+		}
+		if got.report.Created {
+			created++
+		}
+	}
+	if t.Failed() {
+		return
+	}
+	if created != 1 {
+		t.Fatalf("Created reported by %d of 2 concurrent Ensures, want exactly 1", created)
+	}
+	if _, err := os.Stat(wt); err != nil {
+		t.Fatalf("workspace missing after contended Ensure: %v", err)
+	}
+	if _, err := Verify(spec); err != nil {
+		t.Fatalf("workspace does not verify after contended Ensure: %v", err)
 	}
 }
