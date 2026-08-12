@@ -5025,8 +5025,10 @@ gc worktree
 Remove an owned worktree after all safety gates pass.
 
 Cleanup verifies the canonical repository, path, branch, and durable ownership
-provenance before acting. It refuses dirty worktrees, commits not reachable
-from a remote-tracking ref, and commits not merged into --base. There is no
+provenance before acting. It refuses dirty worktrees, commits reachable from no
+branch, tag, or remote-tracking ref, and commits not merged into --base.
+--attempt-id binds the removal to one exact provisioning attempt, so a stale
+request cannot remove a workspace re-created at the same path. There is no
 force mode and no recursive-filesystem fallback. An already-absent,
 unregistered path is an idempotent success. With --json, safety refusals return
 a structured cleanup_pending result for formula automation.
@@ -5037,6 +5039,7 @@ gc worktree cleanup [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--attempt-id` | string |  | attempt id returned by the ensure that created this worktree (required) |
 | `--base` | string |  | exact base ref used for this worktree (required) |
 | `--base-sha` | string |  | recorded base SHA to verify when reusing a worktree |
 | `--bead` | string |  | work bead bound to this worktree (required) |

@@ -430,6 +430,7 @@ func TestEnsureManagedWorktreePersistsAndVerifiesProvenance(t *testing.T) {
 		rep.Provenance.Owner != spec.Owner ||
 		rep.Provenance.Generation != spec.Generation ||
 		rep.Provenance.Lifecycle != LifecycleActive ||
+		rep.Provenance.CreatedAt == nil ||
 		rep.Provenance.CreatedAt.IsZero() ||
 		rep.Provenance.AttemptID == "" {
 		t.Fatalf("provenance = %+v, want complete durable identity", rep.Provenance)
@@ -447,7 +448,9 @@ func TestEnsureManagedWorktreePersistsAndVerifiesProvenance(t *testing.T) {
 	if err := json.Unmarshal(data, &stored); err != nil {
 		t.Fatalf("Unmarshal provenance: %v", err)
 	}
-	if stored != *rep.Provenance {
+	// Compare by value: CreatedAt is a pointer, so struct equality would
+	// compare addresses rather than the timestamps it records.
+	if !provenanceEqual(stored, *rep.Provenance) {
 		t.Fatalf("stored provenance = %+v, report = %+v", stored, *rep.Provenance)
 	}
 
@@ -623,7 +626,7 @@ func TestManagedDryRunDoesNotPublishProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Ensure dry-run: %v", err)
 	}
-	if rep.Provenance == nil || rep.Provenance.CreatedAt.IsZero() == false || rep.Provenance.AttemptID != "" {
+	if rep.Provenance == nil || rep.Provenance.CreatedAt != nil || rep.Provenance.AttemptID != "" {
 		t.Fatalf("dry-run provenance = %+v, want planned identity without creation facts", rep.Provenance)
 	}
 	if after := snapshotDir(t, root); strings.Join(after, "\x00") != strings.Join(before, "\x00") {
@@ -641,6 +644,7 @@ func TestCleanupRemovesOnlyVerifiedMergedPushedWorktreeAndIsIdempotent(t *testin
 		t.Fatalf("Ensure: %v", err)
 	}
 	publishRemoteRef(t, repo, base, rep.Head)
+	spec.AttemptID = rep.Provenance.AttemptID
 
 	cleaned, err := Cleanup(spec)
 	if err != nil {
@@ -675,6 +679,7 @@ func TestCleanupRefusesDirtyWorktreeWithoutRemovingWIP(t *testing.T) {
 		t.Fatalf("Ensure: %v", err)
 	}
 	publishRemoteRef(t, repo, base, rep.Head)
+	spec.AttemptID = rep.Provenance.AttemptID
 	marker := filepath.Join(wt, "uncommitted.txt")
 	if err := os.WriteFile(marker, []byte("keep"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -697,14 +702,16 @@ func TestCleanupRefusesUnpushedCommits(t *testing.T) {
 	root := t.TempDir()
 	wt := filepath.Join(root, "gc-test")
 	spec := managedSpec(repo, root, wt, "work/gc-test", base)
-	if _, err := Ensure(spec); err != nil {
+	rep, err := Ensure(spec)
+	if err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
+	spec.AttemptID = rep.Provenance.AttemptID
 	publishRemoteRef(t, repo, base, runGit(t, repo, "rev-parse", base))
 	runGit(t, wt, "commit", "--allow-empty", "-m", "local-only")
 
-	report, err := Cleanup(spec)
-	if err == nil {
+	report, cleanupErr := Cleanup(spec)
+	if cleanupErr == nil {
 		t.Fatal("Cleanup unpushed worktree succeeded, want refusal")
 	}
 	// The commit is local-only but still reachable from the worktree's own
@@ -725,15 +732,17 @@ func TestCleanupRefusesPushedButUnmergedCommits(t *testing.T) {
 	root := t.TempDir()
 	wt := filepath.Join(root, "gc-test")
 	spec := managedSpec(repo, root, wt, "work/gc-test", base)
-	if _, err := Ensure(spec); err != nil {
+	rep, err := Ensure(spec)
+	if err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
+	spec.AttemptID = rep.Provenance.AttemptID
 	runGit(t, wt, "commit", "--allow-empty", "-m", "pushed-not-merged")
 	tip := runGit(t, wt, "rev-parse", "HEAD")
 	publishRemoteRef(t, repo, spec.Branch, tip)
 
-	report, err := Cleanup(spec)
-	if err == nil {
+	report, cleanupErr := Cleanup(spec)
+	if cleanupErr == nil {
 		t.Fatal("Cleanup unmerged worktree succeeded, want refusal")
 	}
 	if !report.CleanupPending || report.Error == nil || report.Error.Code != CleanupErrorUnmerged {
@@ -754,6 +763,7 @@ func TestCleanupRefusesAmbiguousOrMismatchedOwnership(t *testing.T) {
 			t.Fatalf("Mkdir: %v", err)
 		}
 		spec := managedSpec(repo, root, path, "work/plain", base)
+		spec.AttemptID = "attempt-that-never-existed"
 		report, err := Cleanup(spec)
 		if err == nil {
 			t.Fatal("Cleanup ambiguous plain path succeeded, want refusal")
@@ -769,13 +779,15 @@ func TestCleanupRefusesAmbiguousOrMismatchedOwnership(t *testing.T) {
 	t.Run("provenance owner does not match", func(t *testing.T) {
 		path := filepath.Join(root, "owned")
 		spec := managedSpec(repo, root, path, "work/owned", base)
-		if _, err := Ensure(spec); err != nil {
+		rep, err := Ensure(spec)
+		if err != nil {
 			t.Fatalf("Ensure: %v", err)
 		}
 		conflict := spec
+		conflict.AttemptID = rep.Provenance.AttemptID
 		conflict.Owner = "other-owner"
-		report, err := Cleanup(conflict)
-		if err == nil {
+		report, cleanupErr := Cleanup(conflict)
+		if cleanupErr == nil {
 			t.Fatal("Cleanup mismatched provenance succeeded, want refusal")
 		}
 		if !report.CleanupPending || report.Error == nil || report.Error.Code != CleanupErrorOwnership {
@@ -809,16 +821,18 @@ func TestCleanupRequiresManagedSpecAndRefusesMissingRegisteredPath(t *testing.T)
 		root := t.TempDir()
 		path := filepath.Join(root, "owned")
 		spec := managedSpec(repo, root, path, "work/disappeared", base)
-		if _, err := Ensure(spec); err != nil {
+		rep, err := Ensure(spec)
+		if err != nil {
 			t.Fatalf("Ensure: %v", err)
 		}
+		spec.AttemptID = rep.Provenance.AttemptID
 		moved := filepath.Join(root, "moved-aside")
 		if err := os.Rename(path, moved); err != nil {
 			t.Fatalf("Rename worktree aside: %v", err)
 		}
 
-		report, err := Cleanup(spec)
-		if err == nil {
+		report, cleanupErr := Cleanup(spec)
+		if cleanupErr == nil {
 			t.Fatal("Cleanup missing registered path succeeded, want refusal")
 		}
 		if !report.CleanupPending || report.Error == nil || report.Error.Code != CleanupErrorAmbiguous {

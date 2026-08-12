@@ -24,6 +24,7 @@ type worktreeCmdOpts struct {
 	Owner      string
 	Generation string
 	Lifecycle  string
+	AttemptID  string
 	DryRun     bool
 	JSON       bool
 }
@@ -117,8 +118,10 @@ func newWorktreeCleanupCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Remove an owned worktree after all safety gates pass.
 
 Cleanup verifies the canonical repository, path, branch, and durable ownership
-provenance before acting. It refuses dirty worktrees, commits not reachable
-from a remote-tracking ref, and commits not merged into --base. There is no
+provenance before acting. It refuses dirty worktrees, commits reachable from no
+branch, tag, or remote-tracking ref, and commits not merged into --base.
+--attempt-id binds the removal to one exact provisioning attempt, so a stale
+request cannot remove a workspace re-created at the same path. There is no
 force mode and no recursive-filesystem fallback. An already-absent,
 unregistered path is an idempotent success. With --json, safety refusals return
 a structured cleanup_pending result for formula automation.`,
@@ -131,6 +134,9 @@ a structured cleanup_pending result for formula automation.`,
 		},
 	}
 	worktreeFlagSet(cmd, &opts)
+	cmd.Flags().StringVar(&opts.AttemptID, "attempt-id", "",
+		"attempt id returned by the ensure that created this worktree (required)")
+	_ = cmd.MarkFlagRequired("attempt-id")
 	return cmd
 }
 
@@ -160,6 +166,7 @@ func (o worktreeCmdOpts) spec() (worktree.Spec, error) {
 		Owner:      o.Owner,
 		Generation: o.Generation,
 		Lifecycle:  o.Lifecycle,
+		AttemptID:  o.AttemptID,
 		DryRun:     o.DryRun,
 	}, nil
 }

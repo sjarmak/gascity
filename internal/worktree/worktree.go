@@ -100,6 +100,19 @@ type Spec struct {
 	Generation string
 	// Lifecycle is the durable lifecycle state, initially "active".
 	Lifecycle string
+	// AttemptID names the exact provisioning attempt a Cleanup is authorized to
+	// remove, as returned by the Ensure that created it. Cleanup requires it and
+	// removes nothing unless the worktree's durable provenance carries the same
+	// id.
+	//
+	// Without it, ownership is only bound to bead, owner, and generation, which
+	// a re-provisioned workspace at the same path reproduces exactly. A cleanup
+	// holding one attempt's arguments would then verify successfully against a
+	// LATER attempt's worktree and delete live work. Every attempt mints a fresh
+	// random id, so requiring an exact match makes stale cleanups fail closed.
+	//
+	// Ensure ignores this field; it mints its own.
+	AttemptID string
 	// DryRun plans without mutating anything.
 	DryRun bool
 }
@@ -107,20 +120,25 @@ type Spec struct {
 // Provenance is the durable, worktree-specific ownership record. It lives in
 // the worktree's private git directory, never in the checked-out files.
 type Provenance struct {
-	SchemaVersion int       `json:"schema_version"`
-	BeadID        string    `json:"bead_id"`
-	StoreRef      string    `json:"store_ref"`
-	RepoIdentity  string    `json:"repo_identity"`
-	Path          string    `json:"path"`
-	Branch        string    `json:"branch"`
-	BaseRef       string    `json:"base_ref"`
-	BaseSHA       string    `json:"base_sha"`
-	Creator       string    `json:"creator"`
-	Owner         string    `json:"owner"`
-	Generation    string    `json:"generation"`
-	CreatedAt     time.Time `json:"created_at"`
-	Lifecycle     string    `json:"lifecycle"`
-	AttemptID     string    `json:"attempt_id"`
+	SchemaVersion int    `json:"schema_version"`
+	BeadID        string `json:"bead_id"`
+	StoreRef      string `json:"store_ref"`
+	RepoIdentity  string `json:"repo_identity"`
+	Path          string `json:"path"`
+	Branch        string `json:"branch"`
+	BaseRef       string `json:"base_ref"`
+	BaseSHA       string `json:"base_sha"`
+	Creator       string `json:"creator"`
+	Owner         string `json:"owner"`
+	Generation    string `json:"generation"`
+	// CreatedAt and AttemptID exist only once a worktree has actually been
+	// created. They are pointers/omitempty so planned provenance omits them
+	// instead of emitting a zero time and an empty id, which a consumer
+	// publishing this evidence onto a bead would otherwise store as though
+	// they were real.
+	CreatedAt *time.Time `json:"created_at,omitempty"`
+	Lifecycle string     `json:"lifecycle"`
+	AttemptID string     `json:"attempt_id,omitempty"`
 }
 
 // Report describes the observed or planned workspace state.
@@ -331,6 +349,15 @@ func Ensure(spec Spec) (Report, error) {
 		return planDryRun(spec, rep, branchExists, resolvedBase)
 	}
 
+	// Serialize creation against a concurrent Ensure or Cleanup on this path.
+	// Acquired after the dry-run return above so dry-run creates no lock file
+	// and stays observationally pure.
+	lock, lockErr := lockPath(spec.RepoDir, spec.Path)
+	if lockErr != nil {
+		return rep, lockErr
+	}
+	defer lock.unlock()
+
 	if err := createWorktree(repoGit, spec, branchExists); err != nil {
 		return rep, rollbackResult(err, rollbackAfterFailedCreate(repoGit, spec.Path, spec.Branch, !branchExists))
 	}
@@ -367,6 +394,19 @@ func Cleanup(spec Spec) (CleanupReport, error) {
 	if err := spec.validate(); err != nil {
 		return cleanupFailure(report, CleanupErrorInvalidSpec, err.Error())
 	}
+	if strings.TrimSpace(spec.AttemptID) == "" {
+		return cleanupFailure(report, CleanupErrorInvalidSpec,
+			"cleanup requires the attempt id returned by the Ensure that created this worktree")
+	}
+
+	// Hold the path lock across verification AND removal. Every check below is
+	// worthless if the workspace can be replaced between the check and the
+	// remove.
+	lock, err := lockPath(spec.RepoDir, spec.Path)
+	if err != nil {
+		return cleanupFailure(report, CleanupErrorAmbiguous, err.Error())
+	}
+	defer lock.unlock()
 
 	repoGit := git.New(spec.RepoDir)
 	registered, err := matchingRegisteredWorktrees(repoGit, spec.Path)
@@ -397,6 +437,16 @@ func Cleanup(spec Spec) (CleanupReport, error) {
 	}
 	report.Head = verified.Head
 	report.Provenance = verified.Provenance
+
+	// Bind removal to one exact provisioning attempt. Bead, owner, and
+	// generation are all reproduced by a re-provisioned workspace at the same
+	// path, so they identify the SLOT rather than the occupant; only the
+	// attempt id distinguishes this worktree from its replacement.
+	if verified.Provenance == nil || verified.Provenance.AttemptID != spec.AttemptID {
+		return cleanupFailure(report, CleanupErrorOwnership,
+			fmt.Sprintf("worktree attempt %q does not match the requested attempt %q; refusing to remove a workspace this request did not create",
+				provenanceAttempt(verified.Provenance), spec.AttemptID))
+	}
 
 	worktreeGit := git.New(spec.Path)
 	status, err := worktreeGit.StatusPorcelain()
@@ -550,7 +600,8 @@ func publishAndVerifyProvenance(spec Spec, resolvedBase string) (Report, error) 
 	if err != nil {
 		return Report{}, fmt.Errorf("worktree %q provenance preparation failed: %w", spec.Path, err)
 	}
-	provenance.CreatedAt = time.Now().UTC()
+	createdAt := time.Now().UTC()
+	provenance.CreatedAt = &createdAt
 	provenance.AttemptID, err = newAttemptID()
 	if err != nil {
 		return Report{}, fmt.Errorf("worktree %q provenance attempt id failed: %w", spec.Path, err)
@@ -817,7 +868,7 @@ func verifyProvenance(spec Spec, got Provenance) error {
 	if got.BaseSHA == "" {
 		return errors.New("base SHA is empty")
 	}
-	if got.CreatedAt.IsZero() {
+	if got.CreatedAt == nil || got.CreatedAt.IsZero() {
 		return errors.New("creation time is empty")
 	}
 	if got.AttemptID == "" {
