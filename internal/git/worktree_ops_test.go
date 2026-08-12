@@ -115,11 +115,11 @@ func TestBranchDelete(t *testing.T) {
 	if !g.BranchExists("doomed") {
 		t.Fatal("setup: branch doomed missing")
 	}
-	if err := g.BranchDelete("doomed"); err != nil {
-		t.Fatalf("BranchDelete: %v", err)
+	if err := g.BranchDeleteIfMerged("doomed"); err != nil {
+		t.Fatalf("BranchDeleteIfMerged: %v", err)
 	}
 	if g.BranchExists("doomed") {
-		t.Error("branch doomed still exists after BranchDelete")
+		t.Error("branch doomed still exists after BranchDeleteIfMerged")
 	}
 }
 

@@ -102,12 +102,20 @@ func (g *Git) WorktreeAddExistingBranch(path, branch string) error {
 	return nil
 }
 
-// BranchDelete force-deletes a local branch.
-func (g *Git) BranchDelete(branch string) error {
+// BranchDeleteIfMerged deletes a local branch only when git can prove the
+// deletion loses nothing, and returns an error when it cannot.
+//
+// It uses `git branch -d` rather than `-D` deliberately. Rollback paths reach
+// here holding a branch an agent may have committed to, and a worktree with
+// commits still has a clean status, so a working-tree check cannot see them.
+// `-D` would delete the only ref reaching those commits and orphan them; `-d`
+// refuses instead, which is the correct outcome for a rollback that would
+// otherwise destroy work it did not create.
+func (g *Git) BranchDeleteIfMerged(branch string) error {
 	if err := validateRefArg("branch", branch); err != nil {
 		return err
 	}
-	if _, err := g.run("branch", "-D", branch); err != nil {
+	if _, err := g.run("branch", "-d", branch); err != nil {
 		return fmt.Errorf("deleting branch %q: %w", branch, err)
 	}
 	return nil
