@@ -50,8 +50,17 @@ const (
 	CleanupErrorOwnership = "ownership_mismatch"
 	// CleanupErrorDirty reports staged, unstaged, or untracked work.
 	CleanupErrorDirty = "dirty_worktree"
-	// CleanupErrorUnpushed reports commits absent from every remote-tracking ref.
-	CleanupErrorUnpushed = "unpushed_commits"
+	// CleanupErrorUnreachable reports commits that removing the worktree would
+	// orphan: commits reachable from no branch, tag, or remote-tracking ref.
+	//
+	// The test is reachability rather than push state on purpose. `git worktree
+	// remove` deletes the checkout, not refs/heads, so commits some local ref
+	// still reaches survive removal. Gating on push state instead makes cleanup
+	// a permanent no-op for exactly the worktrees it exists to collect: once a
+	// branch is squash-merged and deleted from the remote, no remote-tracking
+	// ref reaches that HEAD ever again, so the gate latches on forever and the
+	// leak becomes monotonic (#4816).
+	CleanupErrorUnreachable = "unreachable_commits"
 	// CleanupErrorUnmerged reports a HEAD not contained in the requested base.
 	CleanupErrorUnmerged = "unmerged_commits"
 	// CleanupErrorRemove reports a safe git worktree remove failure.
@@ -323,11 +332,11 @@ func Ensure(spec Spec) (Report, error) {
 	}
 
 	if err := createWorktree(repoGit, spec, branchExists); err != nil {
-		return rep, err
+		return rep, rollbackResult(err, rollbackAfterFailedCreate(repoGit, spec.Path, spec.Branch, !branchExists))
 	}
 	created, err := verifyCreatedWorktree(repoGit, spec, branchExists, resolvedBase)
 	if err != nil {
-		return rep, err
+		return rep, rollbackResult(err, rollbackCreated(repoGit, spec.Path, spec.Branch, !branchExists))
 	}
 	if spec.managed() {
 		created, err = publishAndVerifyProvenance(spec, resolvedBase)
@@ -397,12 +406,12 @@ func Cleanup(spec Spec) (CleanupReport, error) {
 	if strings.TrimSpace(status) != "" {
 		return cleanupFailure(report, CleanupErrorDirty, "worktree contains staged, unstaged, or untracked changes")
 	}
-	hasUnpushed, err := worktreeGit.HasUnpushedCommitsResult()
+	hasUnreachable, err := worktreeGit.HasUnreachableCommitsResult()
 	if err != nil {
-		return cleanupFailure(report, CleanupErrorUnpushed, err.Error())
+		return cleanupFailure(report, CleanupErrorUnreachable, err.Error())
 	}
-	if hasUnpushed {
-		return cleanupFailure(report, CleanupErrorUnpushed, "worktree HEAD contains commits not reachable from any remote-tracking ref")
+	if hasUnreachable {
+		return cleanupFailure(report, CleanupErrorUnreachable, "worktree HEAD contains commits reachable from no branch, tag, or remote-tracking ref")
 	}
 	baseSHA, err := repoGit.RevParseVerifyCommit(spec.Base)
 	if err != nil {
@@ -591,11 +600,48 @@ func RollbackAttempt(spec Spec, report Report) error {
 		return fmt.Errorf("pruning rolled-back worktree: %w", err)
 	}
 	if report.BranchCreated {
-		if err := repoGit.BranchDelete(spec.Branch); err != nil {
+		if err := repoGit.BranchDeleteIfMerged(spec.Branch); err != nil {
 			return fmt.Errorf("deleting attempt-created branch %q: %w", spec.Branch, err)
 		}
 	}
 	return nil
+}
+
+// rollbackAfterFailedCreate undoes whatever a failed creation actually left
+// behind.
+//
+// `git worktree add` is not atomic. It registers the worktree and creates the
+// branch before running post-checkout work, so a hook, an LFS smudge, or a
+// disk error can fail the command after those artifacts exist. Returning the
+// error without reconciling leaks a registered worktree and a branch, and the
+// caller cannot tell from the error that anything was created.
+//
+// Rollback therefore inspects current state rather than assuming the add
+// either fully succeeded or did nothing: it removes the registration only if
+// one is present, and deletes the branch only if this call was the one that
+// would have created it and it now exists. Removal is never forced, so a
+// partial checkout that left real content is retained and reported rather than
+// deleted.
+func rollbackAfterFailedCreate(repoGit *git.Git, path, branch string, branchCreated bool) error {
+	var errs []error
+	matches, err := matchingRegisteredWorktrees(repoGit, path)
+	switch {
+	case err != nil:
+		errs = append(errs, fmt.Errorf("listing worktrees for rollback: %w", err))
+	case len(matches) > 0:
+		if err := repoGit.WorktreeRemove(path, false); err != nil {
+			errs = append(errs, err)
+		}
+		if err := repoGit.WorktreePrune(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if branchCreated && repoGit.BranchExists(branch) {
+		if err := repoGit.BranchDeleteIfMerged(branch); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // rollbackCreated undoes only artifacts created by the current Ensure call.
@@ -610,7 +656,7 @@ func rollbackCreated(repoGit *git.Git, path, branch string, branchCreated bool) 
 		errs = append(errs, err)
 	}
 	if branchCreated {
-		if err := repoGit.BranchDelete(branch); err != nil {
+		if err := repoGit.BranchDeleteIfMerged(branch); err != nil {
 			errs = append(errs, err)
 		}
 	}

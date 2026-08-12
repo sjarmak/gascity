@@ -707,8 +707,13 @@ func TestCleanupRefusesUnpushedCommits(t *testing.T) {
 	if err == nil {
 		t.Fatal("Cleanup unpushed worktree succeeded, want refusal")
 	}
-	if !report.CleanupPending || report.Error == nil || report.Error.Code != CleanupErrorUnpushed {
-		t.Fatalf("Cleanup report = %+v, want structured unpushed cleanup_pending refusal", report)
+	// The commit is local-only but still reachable from the worktree's own
+	// branch, and `git worktree remove` deletes the checkout rather than
+	// refs/heads, so removal would not orphan it. The reachability gate
+	// therefore passes and the merge gate is what refuses: the commit is not
+	// contained in the base. Cleanup still declines, which is the point.
+	if !report.CleanupPending || report.Error == nil || report.Error.Code != CleanupErrorUnmerged {
+		t.Fatalf("Cleanup report = %+v, want structured unmerged cleanup_pending refusal", report)
 	}
 	if _, statErr := os.Stat(wt); statErr != nil {
 		t.Fatalf("Cleanup removed unpushed worktree: %v", statErr)
