@@ -70,16 +70,18 @@ func lockFilePath(repoDir, path string) (string, error) {
 //
 // Two specs can name one workspace through different symlinked ancestors, and a
 // lock keyed on the literal path would hand each of them a different lock file,
-// which excludes nothing. The leaf is resolved separately from its parent
-// because the workspace itself usually does not exist yet at lock time, while
-// its parent does. When the parent cannot be resolved either, the cleaned path
-// is the best key available, and using it is strictly better than failing to
-// lock.
+// which excludes nothing. This uses the same resolver the rest of the package
+// uses to establish path identity, so the lock and the ownership checks cannot
+// disagree about which workspace is which. It resolves as much of the path as
+// exists, which matters because the workspace and even its parent usually do
+// not exist yet at lock time.
+//
+// When nothing resolves, the cleaned path is the best key available, and using
+// it is strictly better than failing to lock.
 func canonicalLockKey(abs string) string {
-	dir, base := filepath.Split(filepath.Clean(abs))
-	resolved, err := filepath.EvalSymlinks(filepath.Clean(dir))
+	canonical, err := canonicalPathAllowMissing(abs)
 	if err != nil {
 		return filepath.Clean(abs)
 	}
-	return filepath.Join(resolved, base)
+	return canonical
 }

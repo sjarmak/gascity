@@ -72,16 +72,23 @@ func TestPathLockKeyFollowsSymlinkedAncestors(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	viaReal, err := lockFilePath(repo, filepath.Join(realRoot, "wt"))
-	if err != nil {
-		t.Fatalf("lockFilePath(real): %v", err)
-	}
-	viaAlias, err := lockFilePath(repo, filepath.Join(alias, "wt"))
-	if err != nil {
-		t.Fatalf("lockFilePath(alias): %v", err)
-	}
-	if viaReal != viaAlias {
-		t.Fatalf("same workspace locked two files:\n  via real  = %s\n  via alias = %s", viaReal, viaAlias)
+	// Both leaves are checked: one whose parent exists, and one several levels
+	// below a parent that does not exist yet. The second is the ordinary case
+	// on first use, since creation makes the intermediate directories, and a
+	// resolver that gives up when the parent is missing would key those two
+	// callers to different lock files.
+	for _, leaf := range []string{"wt", filepath.Join("not", "yet", "wt")} {
+		viaReal, err := lockFilePath(repo, filepath.Join(realRoot, leaf))
+		if err != nil {
+			t.Fatalf("lockFilePath(real, %q): %v", leaf, err)
+		}
+		viaAlias, err := lockFilePath(repo, filepath.Join(alias, leaf))
+		if err != nil {
+			t.Fatalf("lockFilePath(alias, %q): %v", leaf, err)
+		}
+		if viaReal != viaAlias {
+			t.Errorf("workspace %q locked two files:\n  via real  = %s\n  via alias = %s", leaf, viaReal, viaAlias)
+		}
 	}
 }
 
