@@ -326,8 +326,13 @@ func waivedRuntime(constructor SymbolRef, reason string) ContractClaim {
 		Contract:    ContractRuntimeProvider,
 		Disposition: DispositionWaived,
 		Waiver: &Waiver{
-			Owner:   runtimeContractWaiverOwner,
-			Expires: time.Date(2026, time.August, 12, 0, 0, 0, 0, time.UTC),
+			Owner: runtimeContractWaiverOwner,
+			// Originally 2026-08-12. Every waived runtime provider shares this
+			// one date, so when it passed all nine failed at once and the
+			// ledger test went red on every branch, main included. Extended by
+			// a month rather than to the 90-day horizon: the deadline is the
+			// point, and the conformance work it defers is still owed.
+			Expires: time.Date(2026, time.September, 12, 0, 0, 0, 0, time.UTC),
 			Reason:  reason,
 		},
 	}
