@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 
 	"github.com/gastownhall/gascity/internal/git"
 )
 
 // pathLock serializes provisioning operations on one workspace path across
-// processes.
+// processes. Acquire it with lockPath and release it with unlock; the
+// acquisition itself is platform-specific and lives in lock_unix.go and
+// lock_windows.go.
 //
 // Cleanup's safety is a check-then-act sequence: it verifies registration,
 // ownership, cleanliness, reachability, and merge state, and only then removes.
@@ -20,10 +21,8 @@ import (
 // one at the same path in between, and the removal then lands on a workspace
 // none of the checks ever examined. Ensure has the mirror-image race, where two
 // callers both observe a missing path and one loses the creation.
-type pathLock struct{ f *os.File }
 
-// lockPath acquires an exclusive advisory lock for the given workspace path
-// within the given repository. The returned lock must be released with unlock.
+// openLockFile creates and opens the lock file for a workspace path.
 //
 // The lock file lives under the repository's common git dir rather than beside
 // the workspace, for two reasons. It must outlive the removal it guards, so it
@@ -31,7 +30,11 @@ type pathLock struct{ f *os.File }
 // which callers list and expect to hold only workspaces. The common dir is also
 // the correct scope: every worktree of one repository shares it, so two
 // processes contending for the same path always agree on the same lock file.
-func lockPath(repoDir, path string) (*pathLock, error) {
+//
+// The file is never unlinked. An unlink would let one process delete the file a
+// second process is already blocked on, after which a third could create a
+// fresh one and hold "the same" lock simultaneously.
+func openLockFile(repoDir, path string) (*os.File, error) {
 	lockFile, err := lockFilePath(repoDir, path)
 	if err != nil {
 		return nil, err
@@ -43,15 +46,11 @@ func lockPath(repoDir, path string) (*pathLock, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening worktree lock for %q: %w", path, err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("locking worktree %q: %w", path, err)
-	}
-	return &pathLock{f: f}, nil
+	return f, nil
 }
 
 // lockFilePath derives the lock file for a workspace path. The name is a digest
-// of the absolute path rather than the path itself, so that no workspace name
+// of the canonical path rather than the path itself, so that no workspace name
 // can produce an invalid or colliding file name.
 func lockFilePath(repoDir, path string) (string, error) {
 	common, err := git.New(repoDir).CommonDir()
@@ -62,17 +61,25 @@ func lockFilePath(repoDir, path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolving worktree path %q for locking: %w", path, err)
 	}
-	sum := sha256.Sum256([]byte(filepath.Clean(abs)))
+	sum := sha256.Sum256([]byte(canonicalLockKey(abs)))
 	return filepath.Join(common, "gc-worktree-locks", hex.EncodeToString(sum[:])+".lock"), nil
 }
 
-// unlock releases the lock. It is safe to call on a nil lock so callers can
-// defer it unconditionally.
-func (l *pathLock) unlock() {
-	if l == nil || l.f == nil {
-		return
+// canonicalLockKey reduces an absolute workspace path to the string two callers
+// naming the same workspace will agree on.
+//
+// Two specs can name one workspace through different symlinked ancestors, and a
+// lock keyed on the literal path would hand each of them a different lock file,
+// which excludes nothing. The leaf is resolved separately from its parent
+// because the workspace itself usually does not exist yet at lock time, while
+// its parent does. When the parent cannot be resolved either, the cleaned path
+// is the best key available, and using it is strictly better than failing to
+// lock.
+func canonicalLockKey(abs string) string {
+	dir, base := filepath.Split(filepath.Clean(abs))
+	resolved, err := filepath.EvalSymlinks(filepath.Clean(dir))
+	if err != nil {
+		return filepath.Clean(abs)
 	}
-	_ = syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
-	_ = l.f.Close()
-	l.f = nil
+	return filepath.Join(resolved, base)
 }
