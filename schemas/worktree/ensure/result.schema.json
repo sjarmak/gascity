@@ -43,9 +43,7 @@
         "creator",
         "owner",
         "generation",
-        "created_at",
-        "lifecycle",
-        "attempt_id"
+        "lifecycle"
       ],
       "properties": {
         "schema_version": { "const": 1 },

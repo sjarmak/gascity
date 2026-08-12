@@ -21,9 +21,11 @@ func TestCleanupRemovesSquashMergedWorktreeAfterRemoteBranchDeleted(t *testing.T
 	root := t.TempDir()
 	wt := filepath.Join(root, "gc-merged")
 	spec := managedSpec(repo, root, wt, "work/gc-merged", base)
-	if _, err := Ensure(spec); err != nil {
+	rep, err := Ensure(spec)
+	if err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
+	spec.AttemptID = rep.Provenance.AttemptID
 
 	// The end state after a squash-merge with the remote branch deleted: the
 	// worktree HEAD is contained in the base, and NO remote-tracking ref
@@ -36,9 +38,9 @@ func TestCleanupRemovesSquashMergedWorktreeAfterRemoteBranchDeleted(t *testing.T
 	// A push-state gate refuses here forever, because nothing on a remote
 	// reaches HEAD. A reachability gate allows it, because the local base
 	// branch still reaches HEAD and removing the checkout orphans nothing.
-	report, err := Cleanup(spec)
-	if err != nil {
-		t.Fatalf("Cleanup refused a merged worktree whose remote branch was deleted: %+v (%v)", report, err)
+	report, cleanupErr := Cleanup(spec)
+	if cleanupErr != nil {
+		t.Fatalf("Cleanup refused a merged worktree whose remote branch was deleted: %+v (%v)", report, cleanupErr)
 	}
 	if !report.Removed || report.CleanupPending {
 		t.Fatalf("Cleanup report = %+v, want removed with no pending action", report)
@@ -78,4 +80,18 @@ func TestRollbackAttemptRefusesToOrphanCommittedWork(t *testing.T) {
 	if got := runGit(t, repo, "rev-parse", "work/gc-committed"); got != committed {
 		t.Fatalf("branch tip = %q, want the committed work %q to survive rollback", got, committed)
 	}
+}
+
+// provenanceEqual compares two provenance records by value. CreatedAt is a
+// pointer so that planned provenance can omit it, which means struct equality
+// would compare addresses instead of the recorded timestamps.
+func provenanceEqual(a, b Provenance) bool {
+	switch {
+	case (a.CreatedAt == nil) != (b.CreatedAt == nil):
+		return false
+	case a.CreatedAt != nil && !a.CreatedAt.Equal(*b.CreatedAt):
+		return false
+	}
+	a.CreatedAt, b.CreatedAt = nil, nil
+	return a == b
 }
