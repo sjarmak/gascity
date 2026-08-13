@@ -1250,8 +1250,7 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 	}
 	var out []Bead
 	err := s.withReadRetry(func(ctx context.Context, storage beadslib.Storage) error {
-		filter := nativeIssueFilterFromListQuery(query)
-		issues, err := storage.SearchIssues(ctx, "", filter)
+		issues, err := nativeIssuesForListQuery(ctx, storage, query)
 		if err != nil {
 			return err
 		}
@@ -1998,10 +1997,15 @@ func nativeIssueFromBead(b Bead) (*beadslib.Issue, error) {
 		Assignee:    b.Assignee,
 		Sender:      b.From,
 		CreatedAt:   b.CreatedAt,
+		UpdatedAt:   b.UpdatedAt,
 		Labels:      append([]string(nil), b.Labels...),
 		Ephemeral:   b.Ephemeral,
 		NoHistory:   b.NoHistory,
 		DeferUntil:  cloneTimePtr(b.DeferUntil),
+	}
+	if b.Ref != "" {
+		externalRef := b.Ref
+		issue.ExternalRef = &externalRef
 	}
 	if b.Priority != nil {
 		issue.Priority = *b.Priority
@@ -2058,6 +2062,7 @@ func beadFromNativeIssue(issue *beadslib.Issue) (Bead, error) {
 		Type:        string(issue.IssueType),
 		Priority:    nativePriorityFromIssue(issue),
 		CreatedAt:   issue.CreatedAt,
+		UpdatedAt:   issue.UpdatedAt,
 		Assignee:    issue.Assignee,
 		From:        issue.Sender,
 		Description: issue.Description,
@@ -2066,6 +2071,9 @@ func beadFromNativeIssue(issue *beadslib.Issue) (Bead, error) {
 		Ephemeral:   issue.Ephemeral,
 		NoHistory:   issue.NoHistory,
 		DeferUntil:  cloneTimePtr(issue.DeferUntil),
+	}
+	if issue.ExternalRef != nil {
+		b.Ref = *issue.ExternalRef
 	}
 	for _, dep := range issue.Dependencies {
 		if dep == nil {
@@ -2081,6 +2089,19 @@ func beadFromNativeIssue(issue *beadslib.Issue) (Bead, error) {
 			b.ParentID = dep.DependsOnID
 		}
 	}
+	legacyParent := b.Metadata[workMigrationLegacyParentMetadataKey]
+	if legacyParent != "" {
+		if !validWorkMigrationWitness(b.Metadata[workMigrationSourceWitnessMetadataKey]) {
+			return Bead{}, fmt.Errorf("%w: row %q has an unbound legacy parent representation", ErrUnsupportedWorkMigrationShape, b.ID)
+		}
+		if b.ParentID != "" && b.ParentID != legacyParent {
+			return Bead{}, fmt.Errorf("%w: row %q has conflicting real and legacy parents %q and %q", ErrUnsupportedWorkMigrationShape, b.ID, b.ParentID, legacyParent)
+		}
+		if b.ParentID == "" {
+			b.ParentID = legacyParent
+		}
+	}
+	delete(b.Metadata, workMigrationLegacyParentMetadataKey)
 	return b, nil
 }
 
@@ -2124,7 +2145,7 @@ func nativeCreatedLimitPushdown(query ListQuery) int {
 	// runs and silently drop page rows. Fetch the full candidate set for those
 	// shapes, mirroring the sibling gates (doltliteCanSelectBoundedTopN,
 	// exec.go, bdstore canApplyWispsServerLimit).
-	if query.SeekAfter != nil || !query.UpdatedBefore.IsZero() || len(query.Assignees) > 0 {
+	if query.SeekAfter != nil || !query.UpdatedBefore.IsZero() || len(query.Assignees) > 0 || query.ParentID != "" {
 		return 0
 	}
 	switch query.Sort {
@@ -2155,6 +2176,40 @@ func nativeCreatedLimitPushdown(query ListQuery) int {
 		// client-side in ApplyListQuery.
 		return 0
 	}
+}
+
+func nativeIssuesForListQuery(ctx context.Context, storage beadslib.Storage, query ListQuery) ([]*beadslib.Issue, error) {
+	filter := nativeIssueFilterFromListQuery(query)
+	issues, err := storage.SearchIssues(ctx, "", filter)
+	if err != nil || query.ParentID == "" {
+		return issues, err
+	}
+
+	legacyFilter := filter
+	legacyFilter.ParentID = nil
+	legacyFilter.Limit = 0
+	legacyFilter.MetadataFields = make(map[string]string, len(filter.MetadataFields)+1)
+	for key, value := range filter.MetadataFields {
+		legacyFilter.MetadataFields[key] = value
+	}
+	legacyFilter.MetadataFields[workMigrationLegacyParentMetadataKey] = query.ParentID
+	legacyIssues, err := storage.SearchIssues(ctx, "", legacyFilter)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(issues)+len(legacyIssues))
+	merged := make([]*beadslib.Issue, 0, len(issues)+len(legacyIssues))
+	for _, issue := range append(issues, legacyIssues...) {
+		if issue == nil {
+			continue
+		}
+		if _, duplicate := seen[issue.ID]; duplicate {
+			continue
+		}
+		seen[issue.ID] = struct{}{}
+		merged = append(merged, issue)
+	}
+	return merged, nil
 }
 
 func nativeIssueFilterFromListQuery(query ListQuery) beadslib.IssueFilter {
