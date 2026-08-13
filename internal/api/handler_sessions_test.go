@@ -22,6 +22,7 @@ import (
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/nudgequeue"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
 	"github.com/gastownhall/gascity/internal/session"
@@ -457,14 +458,19 @@ type blockingNudgeProvider struct {
 	*runtime.Fake
 	started chan struct{}
 	unblock chan struct{}
+	once    sync.Once
 }
 
 func (p *blockingNudgeProvider) Nudge(name string, content []runtime.ContentBlock) error {
-	if p.started != nil {
-		close(p.started)
-	}
+	p.once.Do(func() { close(p.started) })
 	<-p.unblock
 	return p.Fake.Nudge(name, content)
+}
+
+func (p *blockingNudgeProvider) NudgeNow(name string, content []runtime.ContentBlock) error {
+	p.once.Do(func() { close(p.started) })
+	<-p.unblock
+	return p.Fake.NudgeNow(name, content)
 }
 
 type pendingSessionMissingProvider struct {
@@ -3227,8 +3233,12 @@ args = ["{{.AgentName}}", "{{.WorkDir}}", "{{.TemplateName}}"]
 	}
 }
 
-func TestHandleProviderSessionCreateWithMessageUsesProviderDefaultNudge(t *testing.T) {
+func TestHandleProviderSessionCreateWithMessageUsesDurableFollowUp(t *testing.T) {
 	fs := newSessionFakeState(t)
+	base := "builtin:claude"
+	providerSpec := fs.cfg.Providers["test-agent"]
+	providerSpec.Base = &base
+	fs.cfg.Providers["test-agent"] = providerSpec
 	srv := New(fs)
 	h := newTestCityHandlerWith(t, fs, srv)
 
@@ -3245,6 +3255,18 @@ func TestHandleProviderSessionCreateWithMessageUsesProviderDefaultNudge(t *testi
 	success, failure := waitForSessionCreateResult(t, fs.eventProv, accepted.RequestID)
 	if success == nil {
 		t.Fatalf("session create failed: %s: %s", failure.ErrorCode, failure.ErrorMessage)
+	}
+	state, err := nudgequeue.LoadState(fs.cityPath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(state.Pending) != 1 || state.Pending[0].Message != "hello" {
+		t.Fatalf("pending = %+v, want one durable initial-message follow-up", state.Pending)
+	}
+	for _, call := range fs.sp.Calls {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
+			t.Fatalf("runtime call = %#v, want durable follow-up instead of provider nudge", call)
+		}
 	}
 }
 
@@ -3531,7 +3553,7 @@ func TestHumaCreateProviderSessionRejectsACPProviderWithoutACPRouting(t *testing
 	}
 }
 
-func TestHandleProviderSessionCreateWithMessageRollsBackOnDeliveryFailure(t *testing.T) {
+func TestHandleProviderSessionCreateWithMessageDoesNotUseDefaultNudge(t *testing.T) {
 	fs := newSessionFakeState(t)
 	provider := &failNudgeProvider{Fake: runtime.NewFake(), err: errors.New("nudge failed")}
 	wrappedState := &stateWithSessionProvider{fakeState: fs, provider: provider}
@@ -3549,22 +3571,20 @@ func TestHandleProviderSessionCreateWithMessageRollsBackOnDeliveryFailure(t *tes
 
 	accepted := decodeAsyncAccepted(t, rec.Body)
 	success, failure := waitForSessionCreateResult(t, fs.eventProv, accepted.RequestID)
-	if success != nil {
-		t.Fatalf("session create succeeded unexpectedly: %+v", success)
+	if success == nil {
+		t.Fatalf("session create failed: %+v", failure)
 	}
-	if failure == nil {
-		t.Fatal("expected session create failure event")
-	}
-	if failure.ErrorCode != "message_delivery_failed" {
-		t.Fatalf("failure error_code = %q, want message_delivery_failed; message=%s", failure.ErrorCode, failure.ErrorMessage)
-	}
-	mgr := session.NewManagerWithOptions(fs.cityBeadStore, provider)
-	sessions, err := mgr.List("", "")
+	state, err := nudgequeue.LoadState(fs.cityPath)
 	if err != nil {
-		t.Fatalf("list sessions after rollback: %v", err)
+		t.Fatalf("LoadState: %v", err)
 	}
-	if len(sessions) != 0 {
-		t.Fatalf("got %d sessions after rollback, want 0: %+v", len(sessions), sessions)
+	if len(state.Pending) != 1 || state.Pending[0].Message != "hello" {
+		t.Fatalf("pending = %+v, want one durable initial-message follow-up", state.Pending)
+	}
+	for _, call := range provider.Calls {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
+			t.Fatalf("runtime call = %#v, want no provider-default nudge", call)
+		}
 	}
 }
 
@@ -3935,6 +3955,10 @@ func TestHandleSessionCreatePersistsExplicitOptionsInTemplateOverrides(t *testin
 
 func TestHandleSessionCreatePreservesInitialMessageWithOptions(t *testing.T) {
 	fs := newSessionFakeStateWithOptions(t)
+	base := "builtin:claude"
+	providerSpec := fs.cfg.Providers["test-agent"]
+	providerSpec.Base = &base
+	fs.cfg.Providers["test-agent"] = providerSpec
 	srv := New(fs)
 	h := newTestCityHandlerWith(t, fs, srv)
 	_ = h
@@ -3942,7 +3966,7 @@ func TestHandleSessionCreatePreservesInitialMessageWithOptions(t *testing.T) {
 	// Create session with BOTH options AND a message.
 	// Regression: the old code overwrote template_overrides with just the
 	// options, clobbering the initial_message that was set at creation time.
-	body := `{"kind":"agent","name":"myrig/worker","message":"Hello from Discord!","options":{"effort":"high"}}`
+	body := `{"kind":"provider","name":"test-agent","message":"Hello from Discord!","options":{"effort":"high"}}`
 	req := newPostRequest(cityURL(fs, "/sessions"), strings.NewReader(body))
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
@@ -3974,6 +3998,18 @@ func TestHandleSessionCreatePreservesInitialMessageWithOptions(t *testing.T) {
 	}
 	if parsed["effort"] != "high" {
 		t.Errorf("effort = %q, want %q", parsed["effort"], "high")
+	}
+	for _, call := range fs.sp.Calls {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
+			t.Fatalf("runtime call = %#v, want durable follow-up instead of provider nudge", call)
+		}
+	}
+	state, err := nudgequeue.LoadState(fs.cityPath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(state.Pending) != 1 || state.Pending[0].Message != "Hello from Discord!" {
+		t.Fatalf("pending = %+v, want one durable initial-message follow-up", state.Pending)
 	}
 }
 
@@ -4282,9 +4318,13 @@ func TestHandleSessionPermissionModePreservesProviderCreateOptions(t *testing.T)
 
 func TestLegacyHandleProviderSessionCreatePersistsOptionsInTemplateOverrides(t *testing.T) {
 	fs := newSessionFakeStateWithOptions(t)
+	base := "builtin:claude"
+	providerSpec := fs.cfg.Providers["test-agent"]
+	providerSpec.Base = &base
+	fs.cfg.Providers["test-agent"] = providerSpec
 	srv := New(fs)
 
-	req := newPostRequest("/v0/sessions", strings.NewReader(`{"kind":"provider","name":"test-agent","options":{"permission_mode":"plan","effort":"high"}}`))
+	req := newPostRequest("/v0/sessions", strings.NewReader(`{"kind":"provider","name":"test-agent","message":"start safely","options":{"permission_mode":"plan","effort":"high"}}`))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -4307,6 +4347,21 @@ func TestLegacyHandleProviderSessionCreatePersistsOptionsInTemplateOverrides(t *
 	}
 	if got := overrides["effort"]; got != "high" {
 		t.Fatalf("template_overrides.effort = %q, want high", got)
+	}
+	if got := overrides["initial_message"]; got != "start safely" {
+		t.Fatalf("template_overrides.initial_message = %q, want start safely", got)
+	}
+	for _, call := range fs.sp.Calls {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
+			t.Fatalf("runtime call = %#v, want durable follow-up instead of provider nudge", call)
+		}
+	}
+	state, err := nudgequeue.LoadState(fs.cityPath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(state.Pending) != 1 || state.Pending[0].Message != "start safely" {
+		t.Fatalf("pending = %+v, want one durable initial-message follow-up", state.Pending)
 	}
 }
 
@@ -4793,6 +4848,43 @@ func TestHandleSessionMessageQueuesSuspendedSessionMessage(t *testing.T) {
 	}
 }
 
+func TestHandleSessionMessageQueuesRunningSessionAsDurableFollowUp(t *testing.T) {
+	fs := newSessionFakeState(t)
+	srv := New(fs)
+	h := newTestCityHandlerWith(t, fs, srv)
+	info := createTestSession(t, fs.cityBeadStore, fs.sp, "Running Message")
+	callsBefore := len(fs.sp.Calls)
+
+	req := newPostRequest(cityURL(fs, "/session/")+info.ID+"/messages", strings.NewReader(`{"message":"follow up safely"}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("message status = %d, want %d; body: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	accepted := decodeAsyncAccepted(t, rec.Body)
+	success, failure := waitForSessionMessageResult(t, fs.eventProv, accepted.RequestID)
+	if success == nil {
+		t.Fatalf("session message failed: %s: %s", failure.ErrorCode, failure.ErrorMessage)
+	}
+
+	state, err := nudgequeue.LoadState(fs.cityPath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(state.Pending) != 1 {
+		t.Fatalf("pending messages = %d, want 1 durable follow-up", len(state.Pending))
+	}
+	if got := state.Pending[0]; got.SessionID != info.ID || got.Message != "follow up safely" {
+		t.Fatalf("pending message = %+v, want session %q message %q", got, info.ID, "follow up safely")
+	}
+	for _, call := range fs.sp.Calls[callsBefore:] {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
+			t.Fatalf("runtime call = %#v, want durable queue instead of immediate default delivery", call)
+		}
+	}
+}
+
 func TestHandleSessionMessageMaterializesNamedSessionAsync(t *testing.T) {
 	fs := newSessionFakeState(t)
 	srv := New(fs)
@@ -4845,6 +4937,10 @@ func TestHandleSessionMessageEmitsFailureWhenProviderNudgeHangs(t *testing.T) {
 	h := newTestCityHandlerWith(t, fs, srv)
 
 	info := createTestSession(t, fs.cityBeadStore, fs.sp, "blocked-message")
+	mgr := session.NewManagerWithOptions(fs.cityBeadStore, fs.sp)
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
 	req := newPostRequest(cityURL(fs, "/session/")+info.ID+"/messages", strings.NewReader(`{"message":"hello"}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -4904,6 +5000,10 @@ func TestHandleSessionMessageLogsLateProviderResultAfterTimeout(t *testing.T) {
 	h := newTestCityHandlerWith(t, fs, srv)
 
 	info := createTestSession(t, fs.cityBeadStore, fs.sp, "late-message")
+	mgr := session.NewManagerWithOptions(fs.cityBeadStore, fs.sp)
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
 	req := newPostRequest(cityURL(fs, "/session/")+info.ID+"/messages", strings.NewReader(`{"message":"hello"}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -8398,12 +8498,18 @@ func TestSessionMessageAndSubmitRejectNonexistentTargetSynchronously(t *testing.
 	srv := New(fs)
 	h := newTestCityHandlerWith(t, fs, srv)
 
-	for _, path := range []string{"/session/no-such-session-xyz/messages", "/session/no-such-session-xyz/submit"} {
+	for _, tc := range []struct {
+		path string
+		body string
+	}{
+		{path: "/session/no-such-session-xyz/messages", body: `{"message":"hello"}`},
+		{path: "/session/no-such-session-xyz/submit", body: `{"message":"hello","intent":"interrupt_now"}`},
+	} {
 		rec := httptest.NewRecorder()
-		req := newPostRequest(cityURL(fs, path), strings.NewReader(`{"message":"hello"}`))
+		req := newPostRequest(cityURL(fs, tc.path), strings.NewReader(tc.body))
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusNotFound {
-			t.Fatalf("%s status = %d, want 404; body=%s", path, rec.Code, rec.Body.String())
+			t.Fatalf("%s status = %d, want 404; body=%s", tc.path, rec.Code, rec.Body.String())
 		}
 	}
 
@@ -8438,12 +8544,18 @@ func TestSessionMessageAndSubmitRejectAmbiguousTargetWith409(t *testing.T) {
 		}, "")
 	}
 
-	for _, path := range []string{"/session/dup-target/messages", "/session/dup-target/submit"} {
+	for _, tc := range []struct {
+		path string
+		body string
+	}{
+		{path: "/session/dup-target/messages", body: `{"message":"hello"}`},
+		{path: "/session/dup-target/submit", body: `{"message":"hello","intent":"interrupt_now"}`},
+	} {
 		rec := httptest.NewRecorder()
-		req := newPostRequest(cityURL(fs, path), strings.NewReader(`{"message":"hello"}`))
+		req := newPostRequest(cityURL(fs, tc.path), strings.NewReader(tc.body))
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusConflict {
-			t.Fatalf("%s status = %d, want %d (409 for ambiguous target); body=%s", path, rec.Code, http.StatusConflict, rec.Body.String())
+			t.Fatalf("%s status = %d, want %d (409 for ambiguous target); body=%s", tc.path, rec.Code, http.StatusConflict, rec.Body.String())
 		}
 	}
 }
