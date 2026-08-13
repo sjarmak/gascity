@@ -108,6 +108,14 @@ var displayTypes = map[string]bool{
 	"result":    true,
 }
 
+func isSubmittedHookAttachment(e *Entry) bool {
+	return e != nil &&
+		e.Type == "attachment" &&
+		e.Attachment != nil &&
+		e.Attachment.HookEvent == "UserPromptSubmit" &&
+		e.Attachment.Text() != ""
+}
+
 // ReadFile reads a Claude JSONL session file and resolves it into a
 // Session. The file is parsed, DAG-resolved, and filtered to display
 // entries. Returns the most recent tailCompactions worth of messages
@@ -123,7 +131,7 @@ func ReadFile(path string, tailCompactions int) (*Session, error) {
 	// Filter to display types.
 	var messages []*Entry
 	for _, e := range dag.ActiveBranch {
-		if displayTypes[e.Type] {
+		if displayTypes[e.Type] || isSubmittedHookAttachment(e) {
 			messages = append(messages, e)
 		}
 	}
@@ -287,7 +295,7 @@ func ReadFileOlder(path string, tailCompactions int, beforeMessageID string) (*S
 
 	var messages []*Entry
 	for _, e := range dag.ActiveBranch {
-		if displayTypes[e.Type] {
+		if displayTypes[e.Type] || isSubmittedHookAttachment(e) {
 			messages = append(messages, e)
 		}
 	}
@@ -348,7 +356,7 @@ func ReadFileNewer(path string, tailCompactions int, afterMessageID string) (*Se
 
 	var messages []*Entry
 	for _, e := range dag.ActiveBranch {
-		if displayTypes[e.Type] {
+		if displayTypes[e.Type] || isSubmittedHookAttachment(e) {
 			messages = append(messages, e)
 		}
 	}

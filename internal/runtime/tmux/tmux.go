@@ -1949,9 +1949,11 @@ const (
 // submitEnterAndConfirm sends the provider's submit key sequence (see
 // nudgeSubmitKeySequences — a single Enter for every family this fork has
 // verified so far) and confirms the message submitted by observing the
-// agent transition to its busy/processing state. It re-sends the sequence
-// only while the pane remains idle (submission not yet observed), so a turn
-// that already started can never receive a second submit.
+// agent transition from idle to its busy/processing state. It refuses to send
+// when the pane is already busy because another turn's busy indicator cannot
+// acknowledge this message. It re-sends the sequence only while the pane
+// remains idle (submission not yet observed), so a turn that already started
+// can never receive a second submit.
 //
 // Returns:
 //   - (true, nil)  — the agent went busy: the message submitted.
@@ -1964,6 +1966,14 @@ const (
 // All side effects are injected so the decision logic is unit-testable without
 // a live tmux server.
 func submitEnterAndConfirm(sendSubmit func() error, wake func(), busy func() (bool, error), sleep func(time.Duration)) (bool, error) {
+	initialBusy, err := busy()
+	if err != nil {
+		return false, fmt.Errorf("observing pane before submit: %w", err)
+	}
+	if initialBusy {
+		return false, nil
+	}
+
 	var lastErr error
 	for send := 0; send < submitEnterMaxSends; send++ {
 		if send > 0 {
@@ -2081,6 +2091,20 @@ func (t *Tmux) NudgeSession(session, message string) error {
 		target = agentPane
 	}
 
+	// Refuse a verified-submit nudge before pasting when another turn is
+	// already active. The queued caller will retain the item for retry, and
+	// the active pane's draft cannot accumulate duplicate payloads.
+	verifySubmit := t.submitVerifyEligible(target)
+	if verifySubmit {
+		isBusy, err := t.paneBusy(target)
+		if err != nil {
+			return fmt.Errorf("observing pane before nudge: %w", err)
+		}
+		if isBusy {
+			return fmt.Errorf("%w: session %q already busy", ErrNudgeSubmitUnconfirmed, session)
+		}
+	}
+
 	// Snapshot genuine activity BEFORE the first keystroke, and stamp the poke
 	// only once delivery is actually confirmed (see delivered below). This
 	// mirrors recordPoke/GetSessionActivity (see discountPokeActivity) so gc's
@@ -2140,7 +2164,7 @@ func (t *Tmux) NudgeSession(session, message string) error {
 	submitKeys := t.nudgeSubmitKeySequence(target)
 	sendSubmit := func() error { return t.sendNudgeSubmitSequence(target, submitKeys) }
 	wake := func() { t.WakePaneIfDetached(session) }
-	if t.submitVerifyEligible(target) {
+	if verifySubmit {
 		confirmed, err := submitEnterAndConfirm(sendSubmit, wake, func() (bool, error) { return t.paneBusy(target) }, time.Sleep)
 		if err != nil {
 			return fmt.Errorf("failed to send submit sequence: %w", err)
