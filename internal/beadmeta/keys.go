@@ -202,15 +202,17 @@ const (
 	// copied into a binding with the name of the binding it came from, so a
 	// resumed attempt can tell a row it wrote from content the destination
 	// already owned.
-	InfraMigratedFromMetadataKey   = "gc.infra_migrated_from"
-	TriggerBeadStoreRefMetadataKey = "gc.trigger_bead_store_ref"
-	TruncatedMetadataKey           = "gc.truncated"
-	WorkBranchMetadataKey          = "gc.work_branch"
-	WorkCommitMetadataKey          = "gc.work_commit"
-	WorkDirMetadataKey             = "gc.work_dir"
-	WorkOutcomeMetadataKey         = "gc.work_outcome"
-	WorkVerificationMetadataKey    = "gc.work_verification"
-	WorkflowIDMetadataKey          = "gc.workflow_id"
+	InfraMigratedFromMetadataKey          = "gc.infra_migrated_from"
+	TriggerBeadStoreRefMetadataKey        = "gc.trigger_bead_store_ref"
+	TruncatedMetadataKey                  = "gc.truncated"
+	WorkBranchMetadataKey                 = "gc.work_branch"
+	WorkCommitMetadataKey                 = "gc.work_commit"
+	WorkDirMetadataKey                    = "gc.work_dir"
+	WorkMigrationLegacyParentMetadataKey  = "gc.work_migration_legacy_parent"
+	WorkMigrationSourceWitnessMetadataKey = "gc.work_migration_source_witness"
+	WorkOutcomeMetadataKey                = "gc.work_outcome"
+	WorkVerificationMetadataKey           = "gc.work_verification"
+	WorkflowIDMetadataKey                 = "gc.workflow_id"
 )
 
 // Work-record metadata keys (ADR-0009). These bind a work bead to its claim
@@ -449,6 +451,8 @@ var KnownMetadataKeys = []string{
 	WorkBranchMetadataKey,
 	WorkCommitMetadataKey,
 	WorkDirMetadataKey,
+	WorkMigrationLegacyParentMetadataKey,
+	WorkMigrationSourceWitnessMetadataKey,
 	WorkOutcomeMetadataKey,
 	WorkVerificationMetadataKey,
 	WorkflowIDMetadataKey,
