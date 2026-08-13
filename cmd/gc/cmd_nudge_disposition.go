@@ -30,10 +30,9 @@ func newNudgeDismissCmd(stdout, stderr io.Writer) *cobra.Command {
 	var reason string
 	var jsonOutput bool
 	cmd := &cobra.Command{
-		Use:     "dismiss <nudge-id>",
-		Aliases: []string{"cancel"},
-		Short:   "Dismiss one adjudicated dead-letter nudge",
-		Args:    cobra.ExactArgs(1),
+		Use:   "dismiss <nudge-id>",
+		Short: "Dismiss one adjudicated dead-letter nudge",
+		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if cmdNudgeDismiss(args, reason, jsonOutput, stdout, stderr) != 0 {
 				return errExit
@@ -342,8 +341,11 @@ func existingNudgeDisposition(front *nudgequeue.Store, nudgeID, want, reason, ac
 	if shadow.OperatorReason != reason || shadow.OperatorActor != actor || shadow.RetryTarget != retryTarget {
 		return nudgeDispositionResult{}, fmt.Errorf("nudge %q already dispositioned as %q with different audit inputs", nudgeID, want)
 	}
-	command := "nudge " + strings.TrimSuffix(want, "ed")
-	if want == "retried" {
+	command := "nudge dismiss"
+	switch want {
+	case "canceled":
+		command = "nudge cancel"
+	case "retried":
 		command = "nudge retry"
 	}
 	return dispositionResult(command, shadow), nil

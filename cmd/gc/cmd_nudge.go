@@ -252,6 +252,7 @@ was asleep or was not at a safe interactive boundary yet.`,
 	}
 	cmd.AddCommand(
 		newNudgeStatusCmd(stdout, stderr),
+		newNudgeCancelCmd(stdout, stderr),
 		newNudgeDismissCmd(stdout, stderr),
 		newNudgeRetryCmd(stdout, stderr),
 		newNudgeDrainCmd(stdout, stderr),
