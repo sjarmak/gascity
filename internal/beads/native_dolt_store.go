@@ -2041,7 +2041,18 @@ func beadFromNativeIssue(issue *beadslib.Issue) (Bead, error) {
 			b.ParentID = legacyParent
 		}
 	}
+	legacyTitle, hasLegacyTitle := b.Metadata[workMigrationLegacyTitleMetadataKey]
+	if hasLegacyTitle {
+		if !validWorkMigrationWitness(b.Metadata[workMigrationSourceWitnessMetadataKey]) {
+			return Bead{}, fmt.Errorf("%w: row %q has an unbound legacy title representation", ErrUnsupportedWorkMigrationShape, b.ID)
+		}
+		if b.Title != nativeWorkStoredTitle(b.ID, legacyTitle) {
+			return Bead{}, fmt.Errorf("%w: row %q has a conflicting legacy title representation", ErrUnsupportedWorkMigrationShape, b.ID)
+		}
+		b.Title = legacyTitle
+	}
 	delete(b.Metadata, workMigrationLegacyParentMetadataKey)
+	delete(b.Metadata, workMigrationLegacyTitleMetadataKey)
 	return b, nil
 }
 
