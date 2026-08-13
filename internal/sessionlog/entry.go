@@ -36,6 +36,7 @@ type Entry struct {
 	// Content
 	Message     json.RawMessage `json:"message"` // {role, content} for user/assistant
 	SystemEvent *SystemEvent    `json:"systemEvent,omitempty"`
+	Attachment  *Attachment     `json:"attachment,omitempty"`
 
 	// Tool pairing
 	ToolUseID string `json:"toolUseID,omitempty"` // tool_use block ID (for tool_result pairing)
@@ -52,6 +53,31 @@ type Entry struct {
 	// Raw preserves the full JSON line for pass-through to API consumers.
 	Raw         json.RawMessage `json:"-"`
 	RawRecordID string          `json:"-"`
+}
+
+// Attachment is provider-recorded context attached to a submitted turn.
+// Claude writes UserPromptSubmit hook output this way after the prompt has
+// crossed the submit boundary; exposing it keeps delivery verification on the
+// same authoritative transcript parser as ordinary user turns.
+type Attachment struct {
+	Type      string          `json:"type,omitempty"`
+	HookName  string          `json:"hookName,omitempty"`
+	HookEvent string          `json:"hookEvent,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+}
+
+// Text returns attachment content only when the provider encoded it as a
+// string. Other attachment kinds use arrays, objects, or null; those shapes
+// must remain parseable without becoming displayable message text.
+func (a *Attachment) Text() string {
+	if a == nil || len(a.Content) == 0 {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(a.Content, &text); err != nil {
+		return ""
+	}
+	return text
 }
 
 // SystemEvent carries provider-neutral system event metadata extracted from a

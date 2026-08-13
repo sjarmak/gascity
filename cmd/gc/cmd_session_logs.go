@@ -326,6 +326,12 @@ func sessionLogEntryToJSON(e *worker.TranscriptEntry) sessionLogEntryJSON {
 	if len(e.Message) > 0 {
 		entry.Message = e.Message
 	}
+	if e.Type == "attachment" && e.Attachment != nil {
+		entry.Role = "system"
+		entry.Subtype = e.Attachment.HookEvent
+		entry.Text = e.Attachment.Text()
+		return entry
+	}
 	mc := resolveMessage(e.Message)
 	if mc == nil {
 		return entry
@@ -482,6 +488,10 @@ func printLogEntry(w io.Writer, e *worker.TranscriptEntry) {
 
 	// Type badge.
 	typeStr := strings.ToUpper(e.Type)
+	if e.Type == "attachment" && e.Attachment != nil {
+		fmt.Fprintf(w, "%s[%s:%s] %s\n", ts, typeStr, e.Attachment.HookEvent, e.Attachment.Text()) //nolint:errcheck
+		return
+	}
 
 	mc := resolveMessage(e.Message)
 	if mc == nil {
