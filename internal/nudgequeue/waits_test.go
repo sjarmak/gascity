@@ -60,14 +60,24 @@ func (s nudgeExactLimitStore) List(query beads.ListQuery) ([]beads.Bead, error) 
 
 func nudgeItems(query beads.ListQuery, count int) []beads.Bead {
 	items := make([]beads.Bead, count)
+	nudgeID := strings.TrimPrefix(query.Label, "nudge:")
 	for i := range items {
 		items[i] = beads.Bead{
-			ID:     "nudge",
-			Status: "open",
-			Labels: []string{query.Label},
+			ID:       "nudge",
+			Status:   "open",
+			Labels:   []string{query.Label},
+			Metadata: map[string]string{"nudge_id": nudgeID},
 		}
 	}
 	return items
+}
+
+func testWaitNudgeShadow(title, nudgeID string) beads.Bead {
+	return beads.Bead{
+		Title:    title,
+		Labels:   []string{"nudge:" + nudgeID},
+		Metadata: map[string]string{"nudge_id": nudgeID},
+	}
 }
 
 func (s nudgeMarkFailStore) SetMetadataBatch(string, map[string]string) error {
@@ -84,10 +94,7 @@ func (s nudgeSelectiveMarkFailStore) SetMetadataBatch(id string, kvs map[string]
 func (s *nudgeReenqueueStore) SetMetadataBatch(id string, kvs map[string]string) error {
 	if !s.injected {
 		s.injected = true
-		created, err := s.Create(beads.Bead{
-			Title:  "replacement nudge",
-			Labels: []string{"nudge:" + s.nudgeID},
-		})
+		created, err := s.Create(testWaitNudgeShadow("replacement nudge", s.nudgeID))
 		if err != nil {
 			return err
 		}
@@ -131,10 +138,7 @@ func (s *nudgeReenqueueBeforeTerminalStore) injectReplacement() error {
 		return nil
 	}
 	s.injected = true
-	created, err := s.Create(beads.Bead{
-		Title:  "replacement nudge",
-		Labels: []string{"nudge:" + s.nudgeID},
-	})
+	created, err := s.Create(testWaitNudgeShadow("replacement nudge", s.nudgeID))
 	if err != nil {
 		return err
 	}
@@ -190,10 +194,7 @@ func (s queueLockDetectStore) requireQueueLockAvailable() error {
 
 func TestMarkTerminalUsesBoundedNudgeLookup(t *testing.T) {
 	mem := beads.NewMemStore()
-	nudge, err := mem.Create(beads.Bead{
-		Title:  "nudge",
-		Labels: []string{"nudge:nudge-123"},
-	})
+	nudge, err := mem.Create(testWaitNudgeShadow("nudge", "nudge-123"))
 	if err != nil {
 		t.Fatalf("create nudge bead: %v", err)
 	}
@@ -221,6 +222,152 @@ func TestMarkTerminalUsesBoundedNudgeLookup(t *testing.T) {
 	}
 }
 
+func TestMarkTerminalRejectsLabelMetadataIdentityMismatch(t *testing.T) {
+	mem := beads.NewMemStore()
+	wrong, err := mem.Create(beads.Bead{
+		Title:  "mislabeled nudge",
+		Labels: []string{"nudge:nudge-target"},
+		Metadata: map[string]string{
+			"nudge_id": "nudge-other",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create mismatched nudge bead: %v", err)
+	}
+
+	if err := markTerminal(mem, "nudge-target", time.Now().UTC().Format(time.RFC3339)); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("markTerminal error = %v, want identity mismatch", err)
+	}
+	updated, err := mem.Get(wrong.ID)
+	if err != nil {
+		t.Fatalf("Get(mismatched): %v", err)
+	}
+	if updated.Status != "open" {
+		t.Fatalf("mismatched nudge status = %q, want open", updated.Status)
+	}
+}
+
+func TestWithdrawWaitNudgesRejectsLegacyLabelMetadataIdentityMismatch(t *testing.T) {
+	cityPath := t.TempDir()
+	mem := beads.NewMemStore()
+	wrong, err := mem.Create(beads.Bead{
+		Title:  "mislabeled nudge",
+		Labels: []string{"nudge:nudge-target"},
+		Metadata: map[string]string{
+			"nudge_id": "nudge-other",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create mismatched nudge bead: %v", err)
+	}
+	item := Item{
+		ID:        "nudge-target",
+		Agent:     "worker",
+		Source:    "wait",
+		Message:   "ready",
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: time.Now().Add(time.Hour).UTC(),
+	}
+	if err := WithState(cityPath, func(state *State) error {
+		state.Pending = append(state.Pending, item)
+		return nil
+	}); err != nil {
+		t.Fatalf("seed queue state: %v", err)
+	}
+
+	err = WithdrawWaitNudges(mem, cityPath, []string{item.ID})
+	if err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("WithdrawWaitNudges error = %v, want identity mismatch", err)
+	}
+	state, loadErr := LoadState(cityPath)
+	if loadErr != nil || len(state.Pending) != 1 || state.Pending[0].ID != item.ID {
+		t.Fatalf("pending/load error = %#v/%v, want direction retained", state.Pending, loadErr)
+	}
+	updated, getErr := mem.Get(wrong.ID)
+	if getErr != nil || updated.Status != "open" {
+		t.Fatalf("mismatched bead status/error = %q/%v, want open", updated.Status, getErr)
+	}
+}
+
+func TestWithdrawWaitNudgesRejectsBeadIDMetadataIdentityMismatch(t *testing.T) {
+	cityPath := t.TempDir()
+	mem := beads.NewMemStore()
+	wrong, err := mem.Create(beads.Bead{
+		Title:  "wrong nudge",
+		Labels: []string{"nudge:nudge-other"},
+		Metadata: map[string]string{
+			"nudge_id": "nudge-other",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create wrong nudge bead: %v", err)
+	}
+	item := Item{
+		ID:        "nudge-target",
+		BeadID:    wrong.ID,
+		Agent:     "worker",
+		Source:    "wait",
+		Message:   "ready",
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: time.Now().Add(time.Hour).UTC(),
+	}
+	if err := WithState(cityPath, func(state *State) error {
+		state.Pending = append(state.Pending, item)
+		return nil
+	}); err != nil {
+		t.Fatalf("seed queue state: %v", err)
+	}
+
+	err = WithdrawWaitNudges(mem, cityPath, []string{item.ID})
+	if err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("WithdrawWaitNudges error = %v, want identity mismatch", err)
+	}
+	state, loadErr := LoadState(cityPath)
+	if loadErr != nil || len(state.Pending) != 1 || state.Pending[0].ID != item.ID {
+		t.Fatalf("pending/load error = %#v/%v, want direction retained", state.Pending, loadErr)
+	}
+	updated, getErr := mem.Get(wrong.ID)
+	if getErr != nil || updated.Status != "open" {
+		t.Fatalf("mismatched bead status/error = %q/%v, want open", updated.Status, getErr)
+	}
+}
+
+func TestWithdrawWaitNudgesRejectsClosedBeadIDMetadataIdentityMismatch(t *testing.T) {
+	cityPath := t.TempDir()
+	mem := beads.NewMemStore()
+	wrong, err := mem.Create(testWaitNudgeShadow("wrong nudge", "nudge-other"))
+	if err != nil {
+		t.Fatalf("create wrong nudge bead: %v", err)
+	}
+	if err := mem.Close(wrong.ID); err != nil {
+		t.Fatalf("close wrong nudge bead: %v", err)
+	}
+	item := Item{
+		ID:        "nudge-target",
+		BeadID:    wrong.ID,
+		Agent:     "worker",
+		Source:    "wait",
+		Message:   "ready",
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: time.Now().Add(time.Hour).UTC(),
+	}
+	if err := WithState(cityPath, func(state *State) error {
+		state.Pending = append(state.Pending, item)
+		return nil
+	}); err != nil {
+		t.Fatalf("seed queue state: %v", err)
+	}
+
+	err = WithdrawWaitNudges(mem, cityPath, []string{item.ID})
+	if err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("WithdrawWaitNudges error = %v, want identity mismatch", err)
+	}
+	state, loadErr := LoadState(cityPath)
+	if loadErr != nil || len(state.Pending) != 1 || state.Pending[0].ID != item.ID {
+		t.Fatalf("pending/load error = %#v/%v, want direction retained", state.Pending, loadErr)
+	}
+}
+
 func TestTerminalNudgeBeads_AllowsExactLookupLimit(t *testing.T) {
 	items, err := terminalNudgeBeads(nudgeExactLimitStore{Store: beads.NewMemStore()}, "nudge-123")
 	if err != nil {
@@ -235,10 +382,7 @@ func TestMarkTerminalTerminalizesVisibleOpenNudgeWhenLookupCaps(t *testing.T) {
 	mem := beads.NewMemStore()
 	var visible []beads.Bead
 	for i := 0; i < NudgeLookupLimit+1; i++ {
-		item, err := mem.Create(beads.Bead{
-			Title:  "open nudge",
-			Labels: []string{"nudge:nudge-123"},
-		})
+		item, err := mem.Create(testWaitNudgeShadow("open nudge", "nudge-123"))
 		if err != nil {
 			t.Fatalf("create open nudge %d: %v", i, err)
 		}
@@ -280,10 +424,7 @@ func TestWithdrawWaitNudges_TerminalizesOutsideQueueLock(t *testing.T) {
 		t.Fatalf("seed queue state: %v", err)
 	}
 	mem := beads.NewMemStore()
-	nudge, err := mem.Create(beads.Bead{
-		Title:  "nudge",
-		Labels: []string{"nudge:" + item.ID},
-	})
+	nudge, err := mem.Create(testWaitNudgeShadow("nudge", item.ID))
 	if err != nil {
 		t.Fatalf("create nudge bead: %v", err)
 	}
@@ -325,10 +466,7 @@ func TestWithdrawWaitNudges_LeavesQueueIntactOnMarkTerminalFailure(t *testing.T)
 		t.Fatalf("seed queue state: %v", err)
 	}
 	mem := beads.NewMemStore()
-	if _, err := mem.Create(beads.Bead{
-		Title:  "nudge",
-		Labels: []string{"nudge:" + item.ID},
-	}); err != nil {
+	if _, err := mem.Create(testWaitNudgeShadow("nudge", item.ID)); err != nil {
 		t.Fatalf("create nudge bead: %v", err)
 	}
 
@@ -366,17 +504,11 @@ func TestWithdrawWaitNudges_RemovesTerminalizedSiblingsOnLaterFailure(t *testing
 		ExpiresAt: now.Add(time.Hour),
 	}
 	mem := beads.NewMemStore()
-	goodNudge, err := mem.Create(beads.Bead{
-		Title:  "good nudge",
-		Labels: []string{"nudge:" + goodItem.ID},
-	})
+	goodNudge, err := mem.Create(testWaitNudgeShadow("good nudge", goodItem.ID))
 	if err != nil {
 		t.Fatalf("create good nudge bead: %v", err)
 	}
-	badNudge, err := mem.Create(beads.Bead{
-		Title:  "bad nudge",
-		Labels: []string{"nudge:" + badItem.ID},
-	})
+	badNudge, err := mem.Create(testWaitNudgeShadow("bad nudge", badItem.ID))
 	if err != nil {
 		t.Fatalf("create bad nudge bead: %v", err)
 	}
@@ -422,10 +554,7 @@ func TestWithdrawWaitNudges_KeepsReenqueuedSameIDItem(t *testing.T) {
 		ExpiresAt: now.Add(time.Hour),
 	}
 	mem := beads.NewMemStore()
-	nudge, err := mem.Create(beads.Bead{
-		Title:  "nudge",
-		Labels: []string{"nudge:" + item.ID},
-	})
+	nudge, err := mem.Create(testWaitNudgeShadow("nudge", item.ID))
 	if err != nil {
 		t.Fatalf("create nudge bead: %v", err)
 	}
@@ -473,10 +602,7 @@ func TestWithdrawWaitNudges_KeepsSameIDReenqueueBeforeTerminalLookup(t *testing.
 		ExpiresAt: now.Add(time.Hour),
 	}
 	mem := beads.NewMemStore()
-	nudge, err := mem.Create(beads.Bead{
-		Title:  "nudge",
-		Labels: []string{"nudge:" + item.ID},
-	})
+	nudge, err := mem.Create(testWaitNudgeShadow("nudge", item.ID))
 	if err != nil {
 		t.Fatalf("create nudge bead: %v", err)
 	}
