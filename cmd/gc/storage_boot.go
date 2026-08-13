@@ -694,10 +694,7 @@ func resolveCityStoragePlan(cityPath string, cfg *config.City) (*storebinding.St
 // a description must not be able to trip the drift refusal that exists to
 // protect recorded pins.
 func cityStorageWorkPins(cityPath string, cfg *config.City) storebinding.WorkPinInputs {
-	hqPrefix := ""
-	if cfg != nil {
-		hqPrefix = cfg.ResolvedWorkspacePrefix
-	}
+	hqPrefix := config.EffectiveHQPrefix(cfg)
 	pins := storebinding.WorkPinInputs{
 		ConfigContext: storageWorkConfigContext(cityPath, cfg),
 		HQ: storebinding.WorkScopePin{
@@ -737,7 +734,7 @@ func storageWorkConfigContext(cityPath string, cfg *config.City) storebinding.Co
 	sum := sha256.New()
 	fmt.Fprintln(sum, cityPath) //nolint:errcheck // hashing a writer that cannot fail
 	if cfg != nil {
-		fmt.Fprintln(sum, cfg.ResolvedWorkspacePrefix) //nolint:errcheck // hashing a writer that cannot fail
+		fmt.Fprintln(sum, config.EffectiveHQPrefix(cfg)) //nolint:errcheck // hashing a writer that cannot fail
 		for _, rig := range cfg.Rigs {
 			fmt.Fprintf(sum, "%s\x00%s\x00%s\x00%t\n", rig.Name, rig.EffectivePrefix(), rig.Path, rig.Suspended) //nolint:errcheck // hashing a writer that cannot fail
 		}
