@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gc://schemas/nudge/retry/result.schema.json",
+  "title": "gc nudge retry result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ok",
+    "command",
+    "nudge_id",
+    "disposition",
+    "reason",
+    "actor",
+    "operator_at",
+    "terminal_bead_id",
+    "retry_nudge_id",
+    "retry_target"
+  ],
+  "properties": {
+    "schema_version": { "const": "1" },
+    "ok": { "const": true },
+    "command": { "const": "nudge retry" },
+    "nudge_id": { "type": "string", "minLength": 1 },
+    "disposition": { "const": "retried" },
+    "reason": { "type": "string", "minLength": 1 },
+    "actor": { "type": "string", "minLength": 1 },
+    "operator_at": { "type": "string", "format": "date-time" },
+    "terminal_bead_id": { "type": "string", "minLength": 1 },
+    "retry_nudge_id": { "type": "string", "minLength": 1 },
+    "retry_target": { "type": "string", "minLength": 1 }
+  }
+}

@@ -79,6 +79,16 @@ type NudgeShadow struct {
 	CreatedAt time.Time
 	// TerminalAt is the controller terminalization clock, when present.
 	TerminalAt time.Time
+	// OperatorDisposition records an explicit human/model adjudication of a
+	// dead letter. It is separate from State and TerminalReason: those preserve
+	// the delivery failure, while these fields explain what the operator did
+	// after that failure.
+	OperatorDisposition string
+	OperatorReason      string
+	OperatorActor       string
+	OperatorAt          time.Time
+	RetryNudgeID        string
+	RetryTarget         string
 }
 
 // Store is the nudge-class domain wrapper. It holds the strongly-typed
@@ -104,18 +114,23 @@ func NewStore(store beads.NudgesStore) *Store {
 // only bead fields), matching the projection-invariance invariant.
 func decodeNudgeItem(b beads.Bead) NudgeShadow {
 	s := NudgeShadow{
-		BeadID:         b.ID,
-		CreatedAt:      b.CreatedAt,
-		Open:           b.Status == "open",
-		ID:             b.Metadata["nudge_id"],
-		State:          b.Metadata["state"],
-		TerminalReason: b.Metadata["terminal_reason"],
-		CommitBoundary: b.Metadata["commit_boundary"],
-		CloseReason:    b.Metadata["close_reason"],
-		Agent:          b.Metadata["agent"],
-		SessionID:      b.Metadata["session_id"],
-		Source:         b.Metadata["source"],
-		Message:        b.Metadata["message"],
+		BeadID:              b.ID,
+		CreatedAt:           b.CreatedAt,
+		Open:                b.Status == "open",
+		ID:                  b.Metadata["nudge_id"],
+		State:               b.Metadata["state"],
+		TerminalReason:      b.Metadata["terminal_reason"],
+		CommitBoundary:      b.Metadata["commit_boundary"],
+		CloseReason:         b.Metadata["close_reason"],
+		Agent:               b.Metadata["agent"],
+		SessionID:           b.Metadata["session_id"],
+		Source:              b.Metadata["source"],
+		Message:             b.Metadata["message"],
+		OperatorDisposition: b.Metadata["operator_disposition"],
+		OperatorReason:      b.Metadata["operator_reason"],
+		OperatorActor:       b.Metadata["operator_actor"],
+		RetryNudgeID:        b.Metadata["retry_nudge_id"],
+		RetryTarget:         b.Metadata["retry_target"],
 	}
 	if raw := b.Metadata["reference_json"]; raw != "" {
 		var ref Reference
@@ -136,6 +151,11 @@ func decodeNudgeItem(b beads.Bead) NudgeShadow {
 	if raw := b.Metadata["terminal_at"]; raw != "" {
 		if ts, err := time.Parse(time.RFC3339, raw); err == nil {
 			s.TerminalAt = ts
+		}
+	}
+	if raw := b.Metadata["operator_at"]; raw != "" {
+		if ts, err := time.Parse(time.RFC3339, raw); err == nil {
+			s.OperatorAt = ts
 		}
 	}
 	return s
