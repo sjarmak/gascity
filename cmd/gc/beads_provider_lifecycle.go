@@ -147,10 +147,21 @@ var (
 )
 
 var (
-	initDirIfReadyEnsureBeadsProvider = ensureBeadsProvider
-	initDirIfReadyInitAndHookDir      = initAndHookDir
-	initDirIfReadyWaitForManagedDolt  = waitForManagedDoltInitReady
-	initAndHookDirWaitForScopeReady   = waitForBeadsScopeReadyAfterRecovery
+	initDirIfReadyEnsureBeadsProvider           = ensureBeadsProvider
+	initDirIfReadyInitAndHookDir                = initAndHookDir
+	initDirIfReadyWaitForManagedDolt            = waitForManagedDoltInitReady
+	initAndHookDirWaitForScopeReady             = waitForBeadsScopeReadyAfterRecovery
+	startBeadsLifecycleEnsureProvider           = ensureBeadsProvider
+	startBeadsLifecycleInitAndHookDir           = initAndHookDir
+	startBeadsLifecycleVerifyRetainedWorkAtBoot = verifyRetainedWorkMigrationAtBoot
+	startBeadsLifecycleVerifyRetainedWork       = func(cityPath string, cfg *config.City) error {
+		ctx, cancel := providerLifecycleContext(context.Background(), providerProbeTimeout)
+		defer cancel()
+		return startBeadsLifecycleVerifyRetainedWorkAtBoot(
+			ctx, cityPath, rawBeadsProvider(cityPath),
+			config.EffectiveHQPrefix(cfg), defaultWorkMigrationBootRuntime(),
+		)
+	}
 )
 
 func isRetryableManagedDoltLifecycleError(err error) bool {
@@ -225,16 +236,23 @@ func startBeadsLifecycle(cityPath, _ string, cfg *config.City, stderr io.Writer)
 		skipLocalDolt = true
 	}
 	if !skipLocalDolt {
-		if err := ensureBeadsProvider(cityPath); err != nil {
+		if err := startBeadsLifecycleEnsureProvider(cityPath); err != nil {
 			return fmt.Errorf("bead store: %w", err)
 		}
+	}
+	return initializeBeadsAfterProvider(cityPath, cfg, stderr)
+}
+
+func initializeBeadsAfterProvider(cityPath string, cfg *config.City, stderr io.Writer) error {
+	if err := startBeadsLifecycleVerifyRetainedWork(cityPath, cfg); err != nil {
+		return fmt.Errorf("verify retained Work migration: %w", err)
 	}
 	beadsPrefix := config.EffectiveHQPrefix(cfg)
 	// Leave doltDatabase empty unless the caller knows a canonical server DB
 	// identity that differs from the bead prefix. New managed bd stores still
 	// default to prefix-named databases, but older/imported metadata may carry
 	// a different dolt_database that gc-beads-bd should preserve.
-	if err := initAndHookDir(cityPath, cityPath, beadsPrefix); err != nil {
+	if err := startBeadsLifecycleInitAndHookDir(cityPath, cityPath, beadsPrefix); err != nil {
 		return fmt.Errorf("init city beads: %w", err)
 	}
 	for i := range cfg.Rigs {
@@ -242,7 +260,7 @@ func startBeadsLifecycle(cityPath, _ string, cfg *config.City, stderr io.Writer)
 			continue
 		}
 		prefix := cfg.Rigs[i].EffectivePrefix()
-		if err := initAndHookDir(cityPath, cfg.Rigs[i].Path, prefix); err != nil {
+		if err := startBeadsLifecycleInitAndHookDir(cityPath, cfg.Rigs[i].Path, prefix); err != nil {
 			return fmt.Errorf("init rig %q beads: %w", cfg.Rigs[i].Name, err)
 		}
 	}
