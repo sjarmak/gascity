@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,7 +35,8 @@ func TestRunWorkMigrationRealNativeDestination(t *testing.T) {
 	if err := native.Close(); err != nil {
 		t.Fatalf("close native initializer: %v", err)
 	}
-	createdAt := time.Date(2026, 8, 12, 10, 11, 12, 0, time.UTC)
+	createdAt := time.Date(2026, 8, 12, 10, 11, 12, 856235045, time.UTC)
+	longTitle := strings.Repeat("legacy work direction ", 30)
 	fixture := struct {
 		Seq   int          `json:"seq"`
 		Beads []beads.Bead `json:"beads"`
@@ -42,7 +44,7 @@ func TestRunWorkMigrationRealNativeDestination(t *testing.T) {
 	}{
 		Seq: 2,
 		Beads: []beads.Bead{
-			{ID: "gc-a", Title: "a", Status: "open", Type: "task", CreatedAt: createdAt, ParentID: "gc-missing"},
+			{ID: "gc-a", Title: longTitle, Status: "open", Type: "task", CreatedAt: createdAt, ParentID: "gc-missing"},
 			{ID: "gc-b", Title: "b", Status: "closed", Type: "bug", CreatedAt: createdAt},
 		},
 		Deps: []beads.Dep{{IssueID: "gc-a", DependsOnID: "gc-b", Type: "blocks"}},
@@ -88,5 +90,20 @@ func TestRunWorkMigrationRealNativeDestination(t *testing.T) {
 	}
 	if info, err := os.Stat(workMigrationProofPath(destinationPath)); err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("proof mode = %v, %v", info, err)
+	}
+	reader, err := beads.OpenNativeDoltStoreAtWithoutAmbientEnv(context.Background(), destinationPath)
+	if err != nil {
+		t.Fatalf("reopen native destination: %v", err)
+	}
+	migrated, err := reader.Get("gc-a")
+	closeErr := reader.CloseStore()
+	if err != nil || closeErr != nil {
+		t.Fatalf("read migrated long title: %v; close: %v", err, closeErr)
+	}
+	if migrated.Title != longTitle {
+		t.Fatalf("migrated title length = %d, want exact %d", len(migrated.Title), len(longTitle))
+	}
+	if _, leaked := migrated.Metadata["gc.work_migration_legacy_title"]; leaked {
+		t.Fatalf("legacy title representation leaked through metadata: %+v", migrated.Metadata)
 	}
 }
