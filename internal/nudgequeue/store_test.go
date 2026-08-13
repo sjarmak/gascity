@@ -187,6 +187,31 @@ func TestTerminalizeMissingBeadIsNoOp(t *testing.T) {
 	}
 }
 
+func TestFindRejectsLabelMetadataIdentityMismatch(t *testing.T) {
+	base := beads.NewMemStore()
+	store := NewStore(beads.NudgesStore{Store: base})
+	const targetID = "nudge-target"
+	if _, err := base.Create(beads.Bead{
+		Title:  "corrupt nudge shadow",
+		Type:   nudgeBeadType,
+		Labels: []string{nudgeBeadLabel, "nudge:" + targetID},
+		Metadata: map[string]string{
+			"nudge_id": "nudge-other",
+			"state":    "queued",
+		},
+	}); err != nil {
+		t.Fatalf("seed mismatched shadow: %v", err)
+	}
+
+	shadow, ok, err := store.FindIncludingTerminal(targetID)
+	if err != nil {
+		t.Fatalf("FindIncludingTerminal: %v", err)
+	}
+	if ok {
+		t.Fatalf("FindIncludingTerminal = %+v, true; want mismatched identity rejected", shadow)
+	}
+}
+
 // TestRollbackEnqueueEmitsByteIdenticalWrites proves RollbackEnqueue stamps the
 // canonical rollback close_reason then closes — the byte-identical contract for
 // the prior inline rollback in enqueueQueuedNudgeWithStore.

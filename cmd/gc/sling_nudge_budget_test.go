@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -36,16 +37,19 @@ func (s *advancingNudgeStore) operations() int64 {
 	return atomic.LoadInt64(&s.ops)
 }
 
-func (s *advancingNudgeStore) List(beads.ListQuery) ([]beads.Bead, error) {
+func (s *advancingNudgeStore) List(query beads.ListQuery) ([]beads.Bead, error) {
 	if err := s.tick(); err != nil {
 		return nil, err
 	}
 	return []beads.Bead{{
-		ID:       "shadow-open",
-		Type:     nudgeBeadType,
-		Status:   "open",
-		Labels:   []string{nudgeBeadLabel},
-		Metadata: map[string]string{"state": "queued"},
+		ID:     "shadow-open",
+		Type:   nudgeBeadType,
+		Status: "open",
+		Labels: []string{nudgeBeadLabel},
+		Metadata: map[string]string{
+			"nudge_id": strings.TrimPrefix(query.Label, "nudge:"),
+			"state":    "queued",
+		},
 	}}, nil
 }
 
