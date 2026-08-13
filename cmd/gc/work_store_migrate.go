@@ -226,6 +226,8 @@ func newStorageMigrateWorkCmdWithRuntime(runtime workMigrationRuntime, stdout, s
 				fmt.Fprintln(stderr, "gc storage migrate-work: --destination-workspace must name an absolute workspace") //nolint:errcheck // best-effort stderr
 				return errExit
 			}
+			request.FromFile = filepath.Clean(request.FromFile)
+			request.DestinationWorkspace = filepath.Clean(request.DestinationWorkspace)
 			result, err := runWorkMigration(cmd.Context(), request, runtime)
 			if err != nil {
 				fmt.Fprintf(stderr, "gc storage migrate-work: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -364,6 +366,15 @@ func workMigrationIDs(rows []beads.Bead) []string {
 func sha256String(data []byte) string {
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func validSHA256String(value string) bool {
+	encoded, ok := strings.CutPrefix(value, "sha256:")
+	if !ok || len(encoded) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(encoded)
+	return err == nil
 }
 
 func workMigrationRedirectKeys() []string {

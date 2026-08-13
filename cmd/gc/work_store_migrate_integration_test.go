@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,8 +17,8 @@ import (
 
 func TestRunWorkMigrationRealNativeDestination(t *testing.T) {
 	root := t.TempDir()
-	sourcePath := filepath.Join(root, "source", "beads.json")
 	destinationPath := filepath.Join(root, "destination")
+	sourcePath := filepath.Join(destinationPath, ".gc", "beads.json")
 	if err := os.MkdirAll(filepath.Dir(sourcePath), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -105,5 +106,48 @@ func TestRunWorkMigrationRealNativeDestination(t *testing.T) {
 	}
 	if _, leaked := migrated.Metadata["gc.work_migration_legacy_title"]; leaked {
 		t.Fatalf("legacy title representation leaked through metadata: %+v", migrated.Metadata)
+	}
+	if err := verifyRetainedWorkMigrationAtBoot(
+		context.Background(), destinationPath, "bd", "dr", defaultWorkMigrationBootRuntime(),
+	); err != nil {
+		t.Fatalf("boot verification of proven copy: %v", err)
+	}
+	if err := os.WriteFile(sourcePath, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyRetainedWorkMigrationAtBoot(
+		context.Background(), destinationPath, "bd", "dr", defaultWorkMigrationBootRuntime(),
+	); err != nil {
+		t.Fatalf("boot verification after non-semantic source churn: %v", err)
+	}
+	fixture.Beads[0].Title = "changed retained work"
+	changedData, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourcePath, changedData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyRetainedWorkMigrationAtBoot(
+		context.Background(), destinationPath, "bd", "dr", defaultWorkMigrationBootRuntime(),
+	); !errors.Is(err, errWorkMigrationProofInvalid) {
+		t.Fatalf("boot verification after Work mutation = %v, want proof invalid", err)
+	}
+	if err := os.WriteFile(sourcePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mutator, err := beads.OpenNativeDoltStoreAtWithoutAmbientEnv(context.Background(), destinationPath)
+	if err != nil {
+		t.Fatalf("open native mutator: %v", err)
+	}
+	deleteErr := mutator.Delete("gc-b")
+	closeErr = mutator.CloseStore()
+	if deleteErr != nil || closeErr != nil {
+		t.Fatalf("delete native row: %v; close: %v", deleteErr, closeErr)
+	}
+	if err := verifyRetainedWorkMigrationAtBoot(
+		context.Background(), destinationPath, "bd", "dr", defaultWorkMigrationBootRuntime(),
+	); !errors.Is(err, errWorkCopyUnconfirmed) {
+		t.Fatalf("boot verification after native deletion = %v, want copy unconfirmed", err)
 	}
 }
