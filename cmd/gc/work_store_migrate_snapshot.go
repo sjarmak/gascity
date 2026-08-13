@@ -115,6 +115,12 @@ func expectedWorkMigrationRows(snapshot beads.ExactWorkSnapshot) []beads.Bead {
 		if row.UpdatedAt.IsZero() {
 			row.UpdatedAt = row.CreatedAt
 		}
+		row.CreatedAt = beads.CanonicalWorkMigrationTime(row.CreatedAt)
+		row.UpdatedAt = beads.CanonicalWorkMigrationTime(row.UpdatedAt)
+		if row.DeferUntil != nil {
+			canonical := beads.CanonicalWorkMigrationTime(*row.DeferUntil)
+			row.DeferUntil = &canonical
+		}
 		if row.Status == "" {
 			row.Status = "open"
 		}
@@ -129,8 +135,11 @@ func expectedWorkMigrationRows(snapshot beads.ExactWorkSnapshot) []beads.Bead {
 			row.Metadata[beadmeta.WorkMigrationSourceWitnessMetadataKey] = snapshot.SourceWitness
 		}
 		row.Labels = slices.Clone(source.Labels)
+		sort.Strings(row.Labels)
+		row.Labels = slices.Compact(row.Labels)
 		row.Needs = slices.Clone(source.Needs)
 		row.Dependencies = slices.Clone(source.Dependencies)
+		sortWorkMigrationDependencies(row.Dependencies)
 		row.IsBlocked = nil
 		row.Revision = 0
 		row.ClaimFence = 0

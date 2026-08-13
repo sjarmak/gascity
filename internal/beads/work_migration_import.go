@@ -7,6 +7,8 @@ import (
 	"maps"
 	"sort"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	beadslib "github.com/steveyegge/beads"
@@ -23,7 +25,9 @@ var (
 
 const (
 	workMigrationLegacyParentMetadataKey  = beadmeta.WorkMigrationLegacyParentMetadataKey
+	workMigrationLegacyTitleMetadataKey   = beadmeta.WorkMigrationLegacyTitleMetadataKey
 	workMigrationSourceWitnessMetadataKey = beadmeta.WorkMigrationSourceWitnessMetadataKey
+	nativeWorkTitleMaxBytes               = 500
 )
 
 // ExactWorkSnapshot is one validated file-ledger Work slice and its canonical
@@ -121,13 +125,23 @@ func normalizeExactWorkRow(row *Bead, witness string, priorIDs map[string]struct
 	if row.Metadata == nil {
 		row.Metadata = make(StringMap)
 	}
-	for _, key := range []string{workMigrationLegacyParentMetadataKey, workMigrationSourceWitnessMetadataKey} {
+	for _, key := range []string{workMigrationLegacyParentMetadataKey, workMigrationLegacyTitleMetadataKey, workMigrationSourceWitnessMetadataKey} {
 		if _, exists := row.Metadata[key]; exists {
 			return fmt.Errorf("%w: row %q already carries reserved key %q", ErrUnsupportedWorkMigrationShape, row.ID, key)
 		}
 	}
+	if row.Title == "" || len(row.Title) > nativeWorkTitleMaxBytes {
+		row.Metadata[workMigrationLegacyTitleMetadataKey] = row.Title
+		row.Title = nativeWorkStoredTitle(row.ID, row.Title)
+	}
 	if row.UpdatedAt.IsZero() {
 		row.UpdatedAt = row.CreatedAt
+	}
+	row.CreatedAt = CanonicalWorkMigrationTime(row.CreatedAt)
+	row.UpdatedAt = CanonicalWorkMigrationTime(row.UpdatedAt)
+	if row.DeferUntil != nil {
+		canonical := CanonicalWorkMigrationTime(*row.DeferUntil)
+		row.DeferUntil = &canonical
 	}
 	if row.Status == "" {
 		row.Status = "open"
@@ -137,6 +151,33 @@ func normalizeExactWorkRow(row *Bead, witness string, priorIDs map[string]struct
 	}
 	row.Metadata[workMigrationSourceWitnessMetadataKey] = witness
 	return nil
+}
+
+// CanonicalWorkMigrationTime matches the nearest-second precision of the
+// native Beads issues table. The proof retains the exact source-file hash.
+func CanonicalWorkMigrationTime(value time.Time) time.Time {
+	if value.IsZero() {
+		return value
+	}
+	return value.UTC().Round(time.Second)
+}
+
+func nativeWorkTitlePrefix(title string) string {
+	if len(title) <= nativeWorkTitleMaxBytes {
+		return title
+	}
+	prefix := title[:nativeWorkTitleMaxBytes]
+	for len(prefix) > 0 && !utf8.ValidString(prefix) {
+		prefix = prefix[:len(prefix)-1]
+	}
+	return prefix
+}
+
+func nativeWorkStoredTitle(id, title string) string {
+	if title == "" {
+		return id
+	}
+	return nativeWorkTitlePrefix(title)
 }
 
 func exactWorkDependencies(rows []Bead, ids map[string]struct{}) ([]*beadslib.Dependency, error) {

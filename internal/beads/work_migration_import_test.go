@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	beadslib "github.com/steveyegge/beads"
 )
@@ -100,6 +101,101 @@ func TestNativeDoltStoreImportExactWorkSnapshotPreservesRowsAndDependencies(t *t
 	}
 	if p2.Priority != nil {
 		t.Fatalf("explicit P2 did not normalize to native default: %v", p2.Priority)
+	}
+}
+
+func TestPrepareExactWorkSnapshotEncodesOversizeTitleLosslessly(t *testing.T) {
+	createdAt := time.Date(2026, 8, 12, 10, 11, 12, 0, time.UTC)
+	fullTitle := strings.Repeat("界", 167) + "ab"
+	witness := "sha256:" + strings.Repeat("a", 64)
+
+	rows, _, err := prepareExactWorkSnapshot(ExactWorkSnapshot{
+		SourceWitness: witness,
+		Rows:          []Bead{{ID: "gc-long-title", Title: fullTitle, CreatedAt: createdAt}},
+	})
+	if err != nil {
+		t.Fatalf("prepareExactWorkSnapshot: %v", err)
+	}
+	if len(rows[0].Title) > 500 || !utf8.ValidString(rows[0].Title) {
+		t.Fatalf("native title prefix is %d bytes, valid UTF-8=%v", len(rows[0].Title), utf8.ValidString(rows[0].Title))
+	}
+	if got := rows[0].Metadata["gc.work_migration_legacy_title"]; got != fullTitle {
+		t.Fatalf("encoded legacy title = %q, want %q", got, fullTitle)
+	}
+
+	issue, err := nativeIssueFromBead(rows[0])
+	if err != nil {
+		t.Fatalf("nativeIssueFromBead: %v", err)
+	}
+	got, err := beadFromNativeIssue(issue)
+	if err != nil {
+		t.Fatalf("beadFromNativeIssue: %v", err)
+	}
+	if got.Title != fullTitle {
+		t.Fatalf("reconstructed title = %q, want %q", got.Title, fullTitle)
+	}
+	if _, leaked := got.Metadata["gc.work_migration_legacy_title"]; leaked {
+		t.Fatalf("legacy title representation leaked through metadata: %+v", got.Metadata)
+	}
+}
+
+func TestPrepareExactWorkSnapshotEncodesEmptyTitleLosslessly(t *testing.T) {
+	createdAt := time.Date(2026, 8, 12, 10, 11, 12, 0, time.UTC)
+	witness := "sha256:" + strings.Repeat("b", 64)
+
+	rows, _, err := prepareExactWorkSnapshot(ExactWorkSnapshot{
+		SourceWitness: witness,
+		Rows:          []Bead{{ID: "gc-empty-title", CreatedAt: createdAt}},
+	})
+	if err != nil {
+		t.Fatalf("prepareExactWorkSnapshot: %v", err)
+	}
+	if rows[0].Title != "gc-empty-title" {
+		t.Fatalf("native title placeholder = %q, want row ID", rows[0].Title)
+	}
+	if encoded, ok := rows[0].Metadata["gc.work_migration_legacy_title"]; !ok || encoded != "" {
+		t.Fatalf("encoded empty title = %q, present=%v", encoded, ok)
+	}
+
+	issue, err := nativeIssueFromBead(rows[0])
+	if err != nil {
+		t.Fatalf("nativeIssueFromBead: %v", err)
+	}
+	got, err := beadFromNativeIssue(issue)
+	if err != nil {
+		t.Fatalf("beadFromNativeIssue: %v", err)
+	}
+	if got.Title != "" {
+		t.Fatalf("reconstructed title = %q, want empty", got.Title)
+	}
+	if _, leaked := got.Metadata["gc.work_migration_legacy_title"]; leaked {
+		t.Fatalf("legacy title representation leaked through metadata: %+v", got.Metadata)
+	}
+}
+
+func TestPrepareExactWorkSnapshotCanonicalizesSubsecondTimes(t *testing.T) {
+	createdAt := time.Date(2026, 8, 12, 10, 11, 12, 856235045, time.UTC)
+	updatedAt := time.Date(2026, 8, 12, 11, 12, 13, 123456789, time.UTC)
+	deferUntil := time.Date(2026, 8, 13, 12, 13, 14, 999999999, time.UTC)
+
+	rows, _, err := prepareExactWorkSnapshot(ExactWorkSnapshot{
+		SourceWitness: "sha256:" + strings.Repeat("c", 64),
+		Rows: []Bead{{
+			ID: "gc-subsecond", Title: "subsecond", CreatedAt: createdAt,
+			UpdatedAt: updatedAt, DeferUntil: &deferUntil,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("prepareExactWorkSnapshot: %v", err)
+	}
+	if !rows[0].CreatedAt.Equal(createdAt.Round(time.Second)) {
+		t.Fatalf("created_at = %s, want %s", rows[0].CreatedAt, createdAt.Round(time.Second))
+	}
+	if !rows[0].UpdatedAt.Equal(updatedAt.Round(time.Second)) {
+		t.Fatalf("updated_at = %s, want %s", rows[0].UpdatedAt, updatedAt.Round(time.Second))
+	}
+	if rows[0].DeferUntil == nil || !rows[0].DeferUntil.Equal(deferUntil.Round(time.Second)) {
+		t.Fatalf("defer_until = %v, want %s", rows[0].DeferUntil, deferUntil.Round(time.Second))
 	}
 }
 
@@ -203,6 +299,12 @@ func TestBeadFromNativeIssueRejectsInvalidLegacyParentRepresentation(t *testing.
 			name: "missing source witness",
 			issue: &beadslib.Issue{
 				ID: "gc-child", Metadata: json.RawMessage(`{"gc.work_migration_legacy_parent":"gc-legacy"}`),
+			},
+		},
+		{
+			name: "legacy title missing source witness",
+			issue: &beadslib.Issue{
+				ID: "gc-child", Metadata: json.RawMessage(`{"gc.work_migration_legacy_title":"full legacy title"}`),
 			},
 		},
 		{
