@@ -1,6 +1,9 @@
 package doctor
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,15 +32,28 @@ func spyEventReader(calls *[]eventReadCall) orderFiringEventReadFunc {
 	}
 }
 
+// spyNewestEventReader is spyEventReader for the newest-first seam, recording
+// into the same call log so one assertion loop covers every read the check makes.
+func spyNewestEventReader(calls *[]eventReadCall) orderFiringEventReadFunc {
+	return func(path string, filter events.Filter, limit int) ([]events.Event, error) {
+		*calls = append(*calls, eventReadCall{filter: filter, limit: limit})
+		return events.ReadFilteredNewestFirst(path, filter, limit)
+	}
+}
+
 // TestOrderFiringCurrent_EventReadsAreBounded is the regression guard for
 // ga-klv: the check must never issue an unbounded read against the city event
 // log. On a busy city that log reaches hundreds of megabytes, and a full scan
 // (36s per read, measured on a 161MB/253k-line log) blows the 15s check budget
 // and turns this check permanently red for a reason unrelated to order firing.
 //
-// The check needs only the newest firing per order, so every read it issues up
-// front must carry a positive limit. The one sanctioned unbounded read is the
-// controller-start fallback, and only after the bounded read came back empty.
+// The check needs only the newest firing per order, so every read it issues
+// must carry a positive limit — with no exceptions. The controller-start read
+// used to be a sanctioned unbounded fallback, on the theory that it fired only
+// on a log with no controller start in its active file. That case turned out to
+// be the normal one, not the exception, and the unbounded read it reached for
+// gunzipped every archive on the city (dr-6ew80). It now reaches the archives
+// newest-first under a limit instead.
 func TestOrderFiringCurrent_EventReadsAreBounded(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	cityPath, cfg := orderFiringTestCity(t)
@@ -51,6 +67,7 @@ func TestOrderFiringCurrent_EventReadsAreBounded(t *testing.T) {
 	check := NewOrderFiringCurrentCheck(cfg, cityPath)
 	check.clock = func() time.Time { return now }
 	check.readEvents = spyEventReader(&calls)
+	check.readEventsNewest = spyNewestEventReader(&calls)
 
 	result := check.Run(&CheckContext{CityPath: cityPath})
 	if result.Status != StatusOK {
@@ -69,11 +86,8 @@ func TestOrderFiringCurrent_EventReadsAreBounded(t *testing.T) {
 				t.Fatalf("call %d: order.fired read is unbounded (limit=%d); a full event-log scan blows the check budget", i, call.limit)
 			}
 		case events.ControllerStarted:
-			// The first controller.started read must be bounded. A later
-			// unbounded read is the sanctioned fallback for a log whose
-			// active file holds no controller start at all.
-			if !sawStarted && call.limit <= 0 {
-				t.Fatalf("call %d: first controller.started read is unbounded (limit=%d)", i, call.limit)
+			if call.limit <= 0 {
+				t.Fatalf("call %d: controller.started read is unbounded (limit=%d); it walks every archive on the city", i, call.limit)
 			}
 			sawStarted = true
 		default:
@@ -377,5 +391,89 @@ func TestOrderFiringCurrent_ReadsCityEventLogPath(t *testing.T) {
 		if got != want {
 			t.Fatalf("read path = %q, want %q", got, want)
 		}
+	}
+}
+
+// writeOrderFiringArchive gzips one JSONL event into a canonical events archive
+// beside the city's active log.
+func writeOrderFiringArchive(t *testing.T, cityPath, basename string, evt events.Event) {
+	t.Helper()
+	line, err := json.Marshal(evt)
+	if err != nil {
+		t.Fatalf("marshal archived event: %v", err)
+	}
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	if _, err := gw.Write(append(line, '\n')); err != nil {
+		t.Fatalf("gzip archived event: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("closing gzip writer: %v", err)
+	}
+	path := filepath.Join(cityPath, ".gc", basename)
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatalf("write archive %s: %v", basename, err)
+	}
+}
+
+// TestOrderFiringCurrent_ControllerStartReadStopsAtNewestArchive is the
+// end-to-end half of the dr-6ew80 guard, against a real archive layout rather
+// than a call-shape spy. It is deliberately two-sided.
+//
+// The city's active log holds no controller.started — the measured steady state,
+// since the active file covers minutes and a controller start is emitted only on
+// controller/supervisor start. The newest archive holds one; the older archive is
+// unreadable.
+//
+// The order has NEVER fired, so classifyOrderFiring's verdict depends entirely
+// on the controller start: with it, "never fired since controller start 24h ago"
+// (StatusError); without it, "controller start unknown" (StatusOK). That makes
+// the assertion catch a regression in either direction —
+//
+//   - reading too much: the unbounded ReadFiltered walks archives oldest-first
+//     and dies on the unreadable one, which on the real city meant gunzipping
+//     all 37 archives (2.16 GB) on every run;
+//   - reading too little: an active-file-only read never sees the archived
+//     start and silently downgrades a real never-fired outage to OK.
+//
+// A test with a freshly-fired order would assert neither: classifyOrderFiring
+// takes the lastFired branch and never consults the controller start at all.
+func TestOrderFiringCurrent_ControllerStartReadStopsAtNewestArchive(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "cleanup-cooldown", "cooldown", "1h")
+	// Unrelated traffic only: cleanup-cooldown itself has never fired.
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.OrderFired, Subject: "some-other-order", Ts: now.Add(-10 * time.Minute)},
+	)
+
+	// Older archive: a canonical basename over non-gzip bytes. Opening it fails.
+	if err := os.WriteFile(
+		filepath.Join(cityPath, ".gc", "events.jsonl.archive-20260517T090000Z-seq-1-2.gz"),
+		[]byte("not gzip; opening this archive is the regression\n"), 0o644,
+	); err != nil {
+		t.Fatalf("write unreadable archive: %v", err)
+	}
+	// Newer archive: the controller start the check is looking for.
+	writeOrderFiringArchive(t, cityPath, "events.jsonl.archive-20260517T110000Z-seq-3-4.gz",
+		events.Event{Seq: 3, Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)})
+
+	check := NewOrderFiringCurrentCheck(cfg, cityPath)
+	check.clock = func() time.Time { return now }
+
+	result := check.Run(&CheckContext{CityPath: cityPath})
+
+	if result.Status == StatusError && strings.Contains(result.Message, "timed out") {
+		t.Fatalf("check timed out: %s", result.Message)
+	}
+	details := strings.Join(result.Details, " | ")
+	if strings.Contains(details, "controller start unknown") {
+		t.Fatalf("the archived controller start was not read; the lookup is bounded to the active file. details = %s", details)
+	}
+	if !strings.Contains(details, "never fired since controller start") {
+		t.Fatalf("details = %s; want the never-fired-since-start verdict, which only the archived controller start can produce", details)
+	}
+	if result.Status != StatusError {
+		t.Fatalf("status = %v, want error (cooldown order never fired in 24h of uptime); details = %s", result.Status, details)
 	}
 }

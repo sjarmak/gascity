@@ -73,6 +73,13 @@ type OrderFiringCurrentCheck struct {
 	lastRun        OrderFiringCurrentLastRunFunc
 	historyTimeout time.Duration
 	readEvents     orderFiringEventReadFunc
+	// readEventsNewest searches the archives too, newest-first. It is a
+	// separate seam from readEvents because the two reads want opposite
+	// behavior when the active file comes up short: the order.fired read stays
+	// inside the active file and falls through to the bounded order-run
+	// history, while the controller-start read must reach back into the
+	// archives, since a controller start is rare enough to have rotated out.
+	readEventsNewest orderFiringEventReadFunc
 }
 
 // NewOrderFiringCurrentCheck creates a check for cron and cooldown order freshness.
@@ -83,6 +90,8 @@ func NewOrderFiringCurrentCheck(cfg *config.City, cityPath string, opts ...Order
 		clock:          time.Now,
 		historyTimeout: orderFiringHistoryTimeout,
 		readEvents:     events.ReadFilteredTail,
+
+		readEventsNewest: events.ReadFilteredNewestFirst,
 	}
 	for _, opt := range opts {
 		opt(check)
@@ -597,22 +606,33 @@ func (c *OrderFiringCurrentCheck) readEventTail(path string, filter events.Filte
 	return read(path, filter, limit)
 }
 
-// latestControllerStartedAt reports the newest controller start. The tail read
-// finds it within a few lines on any city whose controller has started since
-// the log last rotated. Only when the active log holds no controller start at
-// all does it pay for the full read (which also covers archives) — the same
-// cost this always paid, now confined to the case that actually needs it.
+// readEventNewest reads the newest matching events across the active log and
+// its archives through the check's newest-first reader, defaulting to the real
+// one when none was injected.
+func (c *OrderFiringCurrentCheck) readEventNewest(path string, filter events.Filter, limit int) ([]events.Event, error) {
+	read := c.readEventsNewest
+	if read == nil {
+		read = events.ReadFilteredNewestFirst
+	}
+	return read(path, filter, limit)
+}
+
+// latestControllerStartedAt reports the newest controller start, reading the
+// active log's tail and then archives newest-first until it finds one.
+//
+// The read has to reach the archives: a controller start is emitted only when
+// the controller or supervisor starts, while the active log covers minutes on a
+// busy city (measured on ds-research: ~7 minutes, zero controller starts), so
+// the answer is almost always in an archive. What it must NOT do is get there
+// via an unbounded read. events.ReadFiltered walks archives oldest-first and
+// cannot express "the newest", so asking it for one controller start gunzipped
+// every archive on the city — 37 files / 2.16 GB / 2.9M lines as measured on
+// ds-research, where gzip decompression alone costs twice this check's timeout.
 func (c *OrderFiringCurrentCheck) latestControllerStartedAt(eventPath string) (time.Time, error) {
 	filter := events.Filter{Type: events.ControllerStarted}
-	startEvents, err := c.readEventTail(eventPath, filter, 1)
+	startEvents, err := c.readEventNewest(eventPath, filter, 1)
 	if err != nil {
 		return time.Time{}, err
-	}
-	if len(startEvents) == 0 {
-		startEvents, err = c.readEventTail(eventPath, filter, 0)
-		if err != nil {
-			return time.Time{}, err
-		}
 	}
 	var latest time.Time
 	for _, event := range startEvents {
