@@ -30,9 +30,10 @@ func newNudgeDismissCmd(stdout, stderr io.Writer) *cobra.Command {
 	var reason string
 	var jsonOutput bool
 	cmd := &cobra.Command{
-		Use:   "dismiss <nudge-id>",
-		Short: "Dismiss one adjudicated dead-letter nudge",
-		Args:  cobra.ExactArgs(1),
+		Use:     "dismiss <nudge-id>",
+		Aliases: []string{"cancel"},
+		Short:   "Dismiss one adjudicated dead-letter nudge",
+		Args:    cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if cmdNudgeDismiss(args, reason, jsonOutput, stdout, stderr) != 0 {
 				return errExit

@@ -2555,7 +2555,9 @@
     },
     {
       "path": "gc nudge dismiss",
-      "aliases": [],
+      "aliases": [
+        "cancel"
+      ],
       "conditional_modes": [],
       "hidden": false,
       "effective_hidden": false,
