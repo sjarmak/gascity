@@ -1035,6 +1035,12 @@ func doOrderRunExecResult(a orders.Order, cityPath string, cfg *config.City, var
 
 // --- gc order check ---
 
+// orderCheckEventTailLimit bounds the optional order.fired fast path. The
+// authoritative last-run store remains the fallback when a firing is outside
+// this window. Calling Provider.List here would scan and materialize every
+// retained event archive before order check can emit a single row.
+const orderCheckEventTailLimit = 2000
+
 func cmdOrderCheck(jsonOutput bool, stdout, stderr io.Writer) int {
 	cityPath, cfg, aa, code := loadOrdersWithCity(stderr, "gc order check")
 	if code != 0 {
@@ -1190,8 +1196,8 @@ func doOrderCheckWithStoresResolverScopedJSON(cityPath string, cfg *config.City,
 	}
 
 	var firedEvents []events.Event
-	if ep != nil {
-		firedEvents, _ = ep.List(events.Filter{Type: events.OrderFired})
+	if tail, ok := ep.(events.TailProvider); ok {
+		firedEvents, _ = tail.ListTail(events.Filter{Type: events.OrderFired}, orderCheckEventTailLimit)
 	}
 	latestFired := make(map[string]time.Time)
 	for _, event := range firedEvents {
