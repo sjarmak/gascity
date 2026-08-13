@@ -770,6 +770,11 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		fmt.Fprintf(stderr, "gc start: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	// Refuse split-ledger startup before lifecycle mutations begin.
+	if err := assertBeadsProviderResolutionsAgree(cityPath); err != nil {
+		fmt.Fprintf(stderr, "gc start: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 
 	ensureInitArtifacts(cityPath, stderr, "gc start")
 
