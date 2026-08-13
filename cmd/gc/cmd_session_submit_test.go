@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -45,8 +46,6 @@ func TestParseSessionSubmitIntentAcceptsLegacySpellings(t *testing.T) {
 		raw  string
 		want session.SubmitIntent
 	}{
-		{raw: "", want: session.SubmitIntentDefault},
-		{raw: "default", want: session.SubmitIntentDefault},
 		{raw: "follow_up", want: session.SubmitIntentFollowUp},
 		{raw: "follow-up", want: session.SubmitIntentFollowUp},
 		{raw: "interrupt_now", want: session.SubmitIntentInterruptNow},
@@ -65,7 +64,36 @@ func TestParseSessionSubmitIntentAcceptsLegacySpellings(t *testing.T) {
 		})
 	}
 
+	for _, raw := range []string{"", "default"} {
+		if _, err := parseSessionSubmitIntent(raw); err == nil {
+			t.Fatalf("parseSessionSubmitIntent(%q) unexpectedly succeeded", raw)
+		}
+	}
 	if _, err := parseSessionSubmitIntent("later"); err == nil {
 		t.Fatal("parseSessionSubmitIntent(later) unexpectedly succeeded")
+	}
+}
+
+func TestSessionSubmitRequiresExplicitSafeIntentBeforeTargetResolution(t *testing.T) {
+	for _, args := range [][]string{
+		{"not-a-real-session", "work direction"},
+		{"not-a-real-session", "work direction", "--intent", "default"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			cmd := newSessionSubmitCmd(&stdout, &stderr)
+			cmd.SetArgs(args)
+
+			err := cmd.Execute()
+			if !errors.Is(err, errExit) {
+				t.Fatalf("Execute() error = %v, want errExit", err)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			if got := stderr.String(); !strings.Contains(got, "explicit --intent is required") {
+				t.Fatalf("stderr = %q, want explicit intent error", got)
+			}
+		})
 	}
 }

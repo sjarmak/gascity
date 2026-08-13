@@ -667,9 +667,10 @@ func (s *Server) sendBackgroundMessageToSession(ctx context.Context, store beads
 }
 
 // sendUserMessageToSession keeps POST /messages as a compatibility alias for
-// the semantic default submit path.
+// the durable follow-up submit path. The provider-specific default can report
+// success without submitting a turn while a session is busy or draining.
 func (s *Server) sendUserMessageToSession(ctx context.Context, store beads.Store, id, message string) error {
-	_, err := s.submitMessageToSession(ctx, store, id, message, session.SubmitIntentDefault)
+	_, err := s.submitMessageToSession(ctx, store, id, message, session.SubmitIntentFollowUp)
 	return err
 }
 
