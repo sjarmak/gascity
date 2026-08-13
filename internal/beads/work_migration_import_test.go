@@ -400,6 +400,7 @@ func TestPrepareExactWorkSnapshotRejectsMalformedInputs(t *testing.T) {
 		{name: "missing id", snapshot: ExactWorkSnapshot{SourceWitness: witness, Rows: []Bead{{CreatedAt: createdAt}}}},
 		{name: "missing created at", snapshot: ExactWorkSnapshot{SourceWitness: witness, Rows: []Bead{{ID: "gc-a"}}}},
 		{name: "duplicate id", snapshot: ExactWorkSnapshot{SourceWitness: witness, Rows: []Bead{{ID: "gc-a", CreatedAt: createdAt}, {ID: "gc-a", CreatedAt: createdAt}}}},
+		{name: "unsupported status", snapshot: ExactWorkSnapshot{SourceWitness: witness, Rows: []Bead{{ID: "gc-a", Status: "deferred", CreatedAt: createdAt}}}},
 		{name: "legacy needs", snapshot: ExactWorkSnapshot{SourceWitness: witness, Rows: []Bead{{ID: "gc-a", CreatedAt: createdAt, Needs: []string{"gc-b"}}}}},
 		{name: "reserved witness", snapshot: ExactWorkSnapshot{SourceWitness: witness, Rows: []Bead{{ID: "gc-a", CreatedAt: createdAt, Metadata: StringMap{workMigrationSourceWitnessMetadataKey: "foreign"}}}}},
 		{name: "reserved legacy parent", snapshot: ExactWorkSnapshot{SourceWitness: witness, Rows: []Bead{{ID: "gc-a", CreatedAt: createdAt, Metadata: StringMap{workMigrationLegacyParentMetadataKey: "foreign"}}}}},

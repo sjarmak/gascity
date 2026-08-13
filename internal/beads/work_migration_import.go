@@ -143,8 +143,12 @@ func normalizeExactWorkRow(row *Bead, witness string, priorIDs map[string]struct
 		canonical := CanonicalWorkMigrationTime(*row.DeferUntil)
 		row.DeferUntil = &canonical
 	}
-	if row.Status == "" {
+	switch beadslib.Status(row.Status) {
+	case "":
 		row.Status = "open"
+	case beadslib.StatusOpen, beadslib.StatusInProgress, beadslib.StatusClosed:
+	default:
+		return fmt.Errorf("%w: row %q has status %q, which the native read contract cannot preserve", ErrUnsupportedWorkMigrationShape, row.ID, row.Status)
 	}
 	if row.Type == "" {
 		row.Type = "task"
