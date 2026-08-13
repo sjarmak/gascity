@@ -2,6 +2,7 @@ package nudgequeue
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -161,7 +162,14 @@ func terminalNudgeBeads(store beads.Store, nudgeID string) ([]beads.Bead, error)
 	if len(items) > NudgeLookupLimit {
 		log.Printf("nudgequeue: nudge %q lookup capped at %d; terminalizing visible candidates", nudgeID, NudgeLookupLimit)
 	}
-	return items, nil
+	matching := items[:0]
+	for _, item := range items {
+		if item.Metadata["nudge_id"] != nudgeID {
+			return nil, fmt.Errorf("nudge %q shadow %q identity mismatch: metadata nudge_id=%q", nudgeID, item.ID, item.Metadata["nudge_id"])
+		}
+		matching = append(matching, item)
+	}
+	return matching, nil
 }
 
 func markTerminalCandidates(store beads.Store, nudgeID string, candidates []withdrawCandidate, now string) error {
@@ -176,7 +184,7 @@ func markTerminalCandidates(store beads.Store, nudgeID string, candidates []with
 			continue
 		}
 		seen[candidate.BeadID] = true
-		if err := markTerminalBeadByID(store, candidate.BeadID, now); err != nil {
+		if err := markTerminalBeadByID(store, nudgeID, candidate.BeadID, now); err != nil {
 			return err
 		}
 	}
@@ -208,7 +216,7 @@ func markTerminal(store beads.Store, nudgeID, now string) error {
 	return nil
 }
 
-func markTerminalBeadByID(store beads.Store, beadID, now string) error {
+func markTerminalBeadByID(store beads.Store, nudgeID, beadID, now string) error {
 	if beadID == "" {
 		return nil
 	}
@@ -218,6 +226,9 @@ func markTerminalBeadByID(store beads.Store, beadID, now string) error {
 	}
 	if err != nil {
 		return err
+	}
+	if item.Metadata["nudge_id"] != nudgeID {
+		return fmt.Errorf("nudge %q shadow %q identity mismatch: metadata nudge_id=%q", nudgeID, beadID, item.Metadata["nudge_id"])
 	}
 	if item.Status == "closed" {
 		return nil
