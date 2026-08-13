@@ -843,6 +843,38 @@ func TestStorageWorkPinsDescribeEveryBoundScope(t *testing.T) {
 	}
 }
 
+func TestStorageWorkPinsUseEffectiveHQPrefix(t *testing.T) {
+	root := t.TempDir()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "ds-research"},
+		Rigs: []config.Rig{
+			{Name: "gascity", Prefix: "gc", Path: filepath.Join(root, "gascity")},
+		},
+	}
+
+	pins := cityStorageWorkPins(root, cfg)
+	if pins.HQ.Prefix != "dr" {
+		t.Fatalf("HQ prefix = %q, want effective city prefix dr", pins.HQ.Prefix)
+	}
+	if len(pins.Rigs) != 1 || pins.Rigs[0].Prefix != "gc" {
+		t.Fatalf("rig pins = %+v, want one gascity pin with prefix gc", pins.Rigs)
+	}
+
+	registry := storebinding.NewProviderRegistry()
+	if err := registry.Freeze(); err != nil {
+		t.Fatalf("freezing an empty registry: %v", err)
+	}
+	if _, err := storebinding.ResolveStoragePlan(registry, cfg.EffectiveStorage(), pins, root); err != nil {
+		t.Fatalf("resolving distinct derived HQ and rig prefixes: %v", err)
+	}
+
+	other := *cfg
+	other.Workspace = config.Workspace{Name: "gastown"}
+	if got := cityStorageWorkPins(root, &other).ConfigContext; got == pins.ConfigContext {
+		t.Fatalf("config context did not change with effective HQ prefix: %q", got)
+	}
+}
+
 // TestStorageGateChecksTheRollbackSpelling pins what the runbook tells an
 // operator to type when rolling a split back, because a rollback that refuses
 // to boot is worse than no rollback at all.
