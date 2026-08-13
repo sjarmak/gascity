@@ -2957,14 +2957,10 @@ export const zSessionCreateSucceededPayload = z.object({
 /**
  * Semantic delivery choice for a user message on a session submit request.
  */
-export const zSubmitIntent = z.enum([
-    'default',
-    'follow_up',
-    'interrupt_now'
-]);
+export const zSubmitIntent = z.enum(['follow_up', 'interrupt_now']);
 
 export const zSessionSubmitInputBody = z.object({
-    intent: zSubmitIntent.optional(),
+    intent: zSubmitIntent,
     message: z.string().min(1).regex(/\S/)
 });
 

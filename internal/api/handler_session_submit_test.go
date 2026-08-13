@@ -14,75 +14,28 @@ import (
 	"github.com/gastownhall/gascity/internal/session"
 )
 
-func TestHandleSessionSubmitDefaultsToProviderDefaultBehavior(t *testing.T) {
-	fs := newSessionFakeState(t)
-	h := newTestCityHandler(t, fs)
+func TestHandleSessionSubmitRefusesUnsafeDefaultIntent(t *testing.T) {
+	for _, body := range []string{
+		`{"message":"hello"}`,
+		`{"message":"hello","intent":"default"}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			fs := newSessionFakeState(t)
+			h := newTestCityHandler(t, fs)
+			info := createTestSession(t, fs.cityBeadStore, fs.sp, "Submit Me")
+			callsBefore := len(fs.sp.Calls)
 
-	info := createTestSession(t, fs.cityBeadStore, fs.sp, "Submit Me")
-	mgr := session.NewManagerWithOptions(fs.cityBeadStore, fs.sp)
-	if err := mgr.Suspend(info.ID); err != nil {
-		t.Fatalf("Suspend: %v", err)
-	}
+			req := newPostRequest(cityURL(fs, "/session/")+info.ID+"/submit", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
 
-	req := newPostRequest(cityURL(fs, "/session/")+info.ID+"/submit", strings.NewReader(`{"message":"hello"}`))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("submit status = %d, want %d; body: %s", rec.Code, http.StatusAccepted, rec.Body.String())
-	}
-	var accepted asyncAcceptedBody
-	if err := json.NewDecoder(rec.Body).Decode(&accepted); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if accepted.RequestID == "" {
-		t.Fatal("missing request_id")
-	}
-
-	success, failure := waitForSessionSubmitResult(t, fs.eventProv, accepted.RequestID)
-	if success == nil {
-		t.Fatalf("session submit failed: %s: %s", failure.ErrorCode, failure.ErrorMessage)
-	}
-	// Default intent on a suspended session resumes immediately (not queued).
-	if success.Queued {
-		t.Fatalf("queued = true, want false (default intent resumes)")
-	}
-	if success.Intent != string(session.SubmitIntentDefault) {
-		t.Fatalf("intent = %q, want %q", success.Intent, session.SubmitIntentDefault)
-	}
-}
-
-func TestHandleSessionSubmitUsesImmediateDefaultForCodex(t *testing.T) {
-	fs := newSessionFakeState(t)
-	h := newTestCityHandler(t, fs)
-
-	mgr := session.NewManagerWithOptions(fs.cityBeadStore, fs.sp)
-	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "helper", Title: "Codex Submit", Command: "codex", WorkDir: t.TempDir(), Provider: "codex", Env: nil, Resume: session.ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	if err := mgr.Suspend(info.ID); err != nil {
-		t.Fatalf("Suspend: %v", err)
-	}
-
-	req := newPostRequest(cityURL(fs, "/session/")+info.ID+"/submit", strings.NewReader(`{"message":"hello"}`))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("submit status = %d, want %d; body: %s", rec.Code, http.StatusAccepted, rec.Body.String())
-	}
-	var accepted asyncAcceptedBody
-	if err := json.NewDecoder(rec.Body).Decode(&accepted); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if accepted.RequestID == "" {
-		t.Fatal("missing request_id")
-	}
-
-	success, failure := waitForSessionSubmitResult(t, fs.eventProv, accepted.RequestID)
-	if success == nil {
-		t.Fatalf("session submit failed: %s: %s", failure.ErrorCode, failure.ErrorMessage)
+			if rec.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("submit status = %d, want %d; body: %s", rec.Code, http.StatusUnprocessableEntity, rec.Body.String())
+			}
+			if got := len(fs.sp.Calls); got != callsBefore {
+				t.Fatalf("runtime calls = %d, want unchanged %d", got, callsBefore)
+			}
+		})
 	}
 }
 

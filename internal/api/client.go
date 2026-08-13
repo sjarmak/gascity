@@ -1471,10 +1471,14 @@ func (c *Client) SubmitSession(id, message string, intent session.SubmitIntent) 
 	if err := c.requireCityScope(); err != nil {
 		return SessionSubmitResponse{}, err
 	}
-	body := genclient.SubmitSessionJSONRequestBody{Message: message}
-	if intent != "" {
-		i := genclient.SubmitIntent(intent)
-		body.Intent = &i
+	switch intent {
+	case session.SubmitIntentFollowUp, session.SubmitIntentInterruptNow:
+	default:
+		return SessionSubmitResponse{}, fmt.Errorf("explicit submit intent is required (want follow_up or interrupt_now; default delivery is unsafe)")
+	}
+	body := genclient.SubmitSessionJSONRequestBody{
+		Intent:  genclient.SubmitIntent(intent),
+		Message: message,
 	}
 	resp, err := c.cw.SubmitSessionWithResponse(context.Background(), c.cityName, id, nil, body)
 	if err != nil {
