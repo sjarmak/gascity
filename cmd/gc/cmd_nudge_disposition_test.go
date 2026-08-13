@@ -290,6 +290,11 @@ func TestRetryDeadQueuedNudgeDoesNotDuplicateExistingPendingRetry(t *testing.T) 
 
 func TestNudgeDispositionCommandsRejectMissingOperatorInputs(t *testing.T) {
 	var stdout, stderr bytes.Buffer
+	if code := cmdNudgeCancel([]string{"nudge-pending"}, "", false, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "--reason") {
+		t.Fatalf("cancel code/stderr = %d/%q, want required reason", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
 	if code := cmdNudgeDismiss([]string{"nudge-dead"}, "", false, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "--reason") {
 		t.Fatalf("dismiss code/stderr = %d/%q, want required reason", code, stderr.String())
 	}
@@ -300,14 +305,14 @@ func TestNudgeDispositionCommandsRejectMissingOperatorInputs(t *testing.T) {
 	}
 }
 
-func TestNudgeCancelResolvesToAuditedDismissal(t *testing.T) {
+func TestNudgeCancelIsDistinctFromDeadLetterDismissal(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	command, _, err := newNudgeCmd(&stdout, &stderr).Find([]string{"cancel"})
 	if err != nil {
 		t.Fatalf("find cancel command: %v", err)
 	}
-	if command.Name() != "dismiss" {
-		t.Fatalf("cancel resolved to %q, want audited dismiss command", command.Name())
+	if command.Name() != "cancel" {
+		t.Fatalf("cancel resolved to %q, want distinct pending-cancel command", command.Name())
 	}
 }
 
@@ -339,7 +344,7 @@ func TestWriteNudgeDispositionResultHasStableJSONReceipt(t *testing.T) {
 }
 
 func TestNudgeDispositionCommandsDeclareJSONContracts(t *testing.T) {
-	for _, command := range []string{"dismiss", "retry"} {
+	for _, command := range []string{"cancel", "dismiss", "retry"} {
 		t.Run(command, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := run([]string{"nudge", command, "--json-schema"}, &stdout, &stderr)
