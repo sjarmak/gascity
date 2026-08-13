@@ -300,6 +300,17 @@ func TestNudgeDispositionCommandsRejectMissingOperatorInputs(t *testing.T) {
 	}
 }
 
+func TestNudgeCancelResolvesToAuditedDismissal(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	command, _, err := newNudgeCmd(&stdout, &stderr).Find([]string{"cancel"})
+	if err != nil {
+		t.Fatalf("find cancel command: %v", err)
+	}
+	if command.Name() != "dismiss" {
+		t.Fatalf("cancel resolved to %q, want audited dismiss command", command.Name())
+	}
+}
+
 func TestWriteNudgeDispositionResultHasStableJSONReceipt(t *testing.T) {
 	result := nudgeDispositionResult{
 		SchemaVersion:  "1",
