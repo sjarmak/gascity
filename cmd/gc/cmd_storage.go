@@ -174,6 +174,7 @@ operator arranges rather than something a program can observe.`,
 	}
 	cmd.AddCommand(
 		newStorageMigrateCmd(surface, stdout, stderr),
+		newStorageMigrateWorkCmd(stdout, stderr),
 		newStorageStatusCmd(surface, stdout, stderr),
 		newStorageRecoverCmd(repair, stdout, stderr),
 	)

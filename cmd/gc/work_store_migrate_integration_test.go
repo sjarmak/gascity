@@ -1,0 +1,92 @@
+//go:build integration
+
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/gastownhall/gascity/internal/beads"
+)
+
+func TestRunWorkMigrationRealNativeDestination(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "source", "beads.json")
+	destinationPath := filepath.Join(root, "destination")
+	if err := os.MkdirAll(filepath.Dir(sourcePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(destinationPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	native, err := beads.OpenNativeStorage(context.Background(), destinationPath, nil)
+	if err != nil {
+		t.Fatalf("initialize native destination: %v", err)
+	}
+	if err := native.SetConfig(context.Background(), "issue_prefix", "dr"); err != nil {
+		_ = native.Close()
+		t.Fatalf("set native destination prefix: %v", err)
+	}
+	if err := native.Close(); err != nil {
+		t.Fatalf("close native initializer: %v", err)
+	}
+	createdAt := time.Date(2026, 8, 12, 10, 11, 12, 0, time.UTC)
+	fixture := struct {
+		Seq   int          `json:"seq"`
+		Beads []beads.Bead `json:"beads"`
+		Deps  []beads.Dep  `json:"deps"`
+	}{
+		Seq: 2,
+		Beads: []beads.Bead{
+			{ID: "gc-a", Title: "a", Status: "open", Type: "task", CreatedAt: createdAt, ParentID: "gc-missing"},
+			{ID: "gc-b", Title: "b", Status: "closed", Type: "bug", CreatedAt: createdAt},
+		},
+		Deps: []beads.Dep{{IssueID: "gc-a", DependsOnID: "gc-b", Type: "blocks"}},
+	}
+	data, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourcePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	request := workMigrationRequest{FromFile: sourcePath, DestinationWorkspace: destinationPath, FleetStopped: true}
+	first, err := runWorkMigration(context.Background(), request, defaultWorkMigrationRuntime())
+	if err != nil {
+		t.Fatalf("first migration: %v", err)
+	}
+	second, err := runWorkMigration(context.Background(), request, defaultWorkMigrationRuntime())
+	if err != nil {
+		t.Fatalf("second migration: %v", err)
+	}
+	if first.Disposition != "imported" || second.Disposition != "already_proven" {
+		t.Fatalf("dispositions = %q/%q", first.Disposition, second.Disposition)
+	}
+	proofData, err := os.ReadFile(workMigrationProofPath(destinationPath))
+	if err != nil {
+		t.Fatalf("read proof: %v", err)
+	}
+	var proof workMigrationProof
+	if err := json.Unmarshal(proofData, &proof); err != nil {
+		t.Fatalf("decode proof: %v", err)
+	}
+	if proof.Version != workMigrationProofVersion ||
+		len(proof.WorkIDs) != 2 ||
+		proof.SourceWitness != first.SourceWitness ||
+		proof.NativeReadbackWitness != first.SourceWitness ||
+		proof.DependencyWitness != first.DependencyWitness ||
+		proof.DestinationPrefix != "dr" ||
+		proof.CommandVersion == "" ||
+		proof.Disposition != "already_proven" ||
+		len(proof.ImportedIDs) != 0 {
+		t.Fatalf("proof = %+v", proof)
+	}
+	if info, err := os.Stat(workMigrationProofPath(destinationPath)); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("proof mode = %v, %v", info, err)
+	}
+}

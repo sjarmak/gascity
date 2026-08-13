@@ -216,7 +216,8 @@
               "nudge-dismiss",
               "nudge-retry",
               "beads-close-exact",
-              "nudge-cancel"
+              "nudge-cancel",
+              "storage-migrate-work"
             ]
           },
           "event_id": {
