@@ -39,6 +39,31 @@ func TestReadWorkMigrationSnapshotSelectsExactWorkClosure(t *testing.T) {
 	}
 }
 
+func TestWorkMigrationRowsWitnessCanonicalizesDependencyOrder(t *testing.T) {
+	createdAt := time.Date(2026, 8, 12, 10, 11, 12, 0, time.UTC)
+	first := beads.Dep{IssueID: "gc-a", DependsOnID: "gc-b", Type: "blocks"}
+	second := beads.Dep{IssueID: "gc-a", DependsOnID: "gc-c", Type: "tracks"}
+	rows := []beads.Bead{{
+		ID: "gc-a", Title: "a", Status: "open", Type: "task", CreatedAt: createdAt,
+		Labels: []string{"z", "a", "z"}, Dependencies: []beads.Dep{first, second},
+	}}
+	reordered := append([]beads.Bead(nil), rows...)
+	reordered[0].Dependencies = []beads.Dep{second, first}
+	reordered[0].Labels = []string{"a", "z"}
+
+	want, err := workMigrationRowsWitness(rows)
+	if err != nil {
+		t.Fatalf("first witness: %v", err)
+	}
+	got, err := workMigrationRowsWitness(reordered)
+	if err != nil {
+		t.Fatalf("reordered witness: %v", err)
+	}
+	if got != want {
+		t.Fatalf("reordered witness = %s, want %s", got, want)
+	}
+}
+
 func TestReadWorkMigrationSnapshotRefusesRoutingAndClosureViolations(t *testing.T) {
 	createdAt := time.Date(2026, 8, 12, 10, 11, 12, 0, time.UTC)
 	tests := []struct {
