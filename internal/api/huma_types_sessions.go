@@ -155,7 +155,7 @@ type SessionSubmitInput struct {
 	ID   string `path:"id" doc:"Session ID, alias, or runtime session_name."`
 	Body struct {
 		Message string               `json:"message" minLength:"1" pattern:"\\S" doc:"Message text to submit."`
-		Intent  session.SubmitIntent `json:"intent,omitempty" enum:"default,follow_up,interrupt_now" doc:"Submit intent; empty defaults to \"default\"."`
+		Intent  session.SubmitIntent `json:"intent" enum:"follow_up,interrupt_now" doc:"Required submit intent. Provider-default delivery is unsafe and refused."`
 	}
 }
 
