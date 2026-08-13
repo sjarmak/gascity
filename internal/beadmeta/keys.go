@@ -211,6 +211,7 @@ const (
 	WorkCommitMetadataKey                 = "gc.work_commit"
 	WorkDirMetadataKey                    = "gc.work_dir"
 	WorkMigrationLegacyParentMetadataKey  = "gc.work_migration_legacy_parent"
+	WorkMigrationLegacyTitleMetadataKey   = "gc.work_migration_legacy_title"
 	WorkMigrationSourceWitnessMetadataKey = "gc.work_migration_source_witness"
 	WorkOutcomeMetadataKey                = "gc.work_outcome"
 	WorkVerificationMetadataKey           = "gc.work_verification"
@@ -456,6 +457,7 @@ var KnownMetadataKeys = []string{
 	WorkCommitMetadataKey,
 	WorkDirMetadataKey,
 	WorkMigrationLegacyParentMetadataKey,
+	WorkMigrationLegacyTitleMetadataKey,
 	WorkMigrationSourceWitnessMetadataKey,
 	WorkOutcomeMetadataKey,
 	WorkVerificationMetadataKey,
