@@ -2733,9 +2733,23 @@ gc nudge
 
 | Subcommand | Description |
 |------------|-------------|
+| [gc nudge cancel](#gc-nudge-cancel) | Cancel one pending nudge before delivery |
 | [gc nudge dismiss](#gc-nudge-dismiss) | Dismiss one adjudicated dead-letter nudge |
 | [gc nudge retry](#gc-nudge-retry) | Retry one dead-letter nudge against an explicit current session |
 | [gc nudge status](#gc-nudge-status) | Show queued and dead-letter nudges for a session |
+
+## gc nudge cancel
+
+Cancel one pending nudge before delivery
+
+```
+gc nudge cancel <nudge-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | bool |  | Output as JSON |
+| `--reason` | string |  | required audit reason for canceling the pending nudge |
 
 ## gc nudge dismiss
 

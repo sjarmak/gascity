@@ -4502,6 +4502,7 @@ func TestMarkQueuedNudgeTerminalStampsCloseReason(t *testing.T) {
 		{name: "failed_fence_mismatch", state: "failed", reason: "queued nudge session fence mismatch"},
 		{name: "expired", state: "expired", reason: "expired"},
 		{name: "superseded", state: "superseded", reason: "superseded"},
+		{name: "canceled", state: "canceled", reason: "operator canceled"},
 		{name: "injected", state: "injected", reason: "", commitBoundary: "provider-nudge-return"},
 		{name: "accepted_for_injection", state: "accepted_for_injection", reason: "", commitBoundary: "hook-transport-accepted"},
 	}
@@ -4565,6 +4566,7 @@ func TestNudgeCanonicalCloseReasonMeetsValidatorThreshold(t *testing.T) {
 		"failed",
 		"expired",
 		"superseded",
+		"canceled",
 		"injected",
 		"accepted_for_injection",
 	}

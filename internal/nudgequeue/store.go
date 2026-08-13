@@ -451,6 +451,9 @@ func (s *Store) find(nudgeID string, includeClosed bool) (beads.Bead, bool, erro
 	var fallback beads.Bead
 	hasFallback := false
 	for _, item := range items {
+		if item.Metadata["nudge_id"] != nudgeID {
+			continue
+		}
 		if item.Status != "closed" {
 			return item, true, nil
 		}
@@ -498,7 +501,7 @@ func CanonicalCloseReason(stateCode string) string { return canonicalCloseReason
 
 func isTerminalNudgeState(state string) bool {
 	switch state {
-	case "accepted_for_injection", "injected", "expired", "failed", "superseded":
+	case "accepted_for_injection", "injected", "expired", "failed", "superseded", "canceled":
 		return true
 	default:
 		return false
@@ -520,6 +523,8 @@ func canonicalCloseReason(stateCode string) string {
 		return "nudge expired past deliver-by deadline"
 	case "superseded":
 		return "nudge superseded by newer queued entry"
+	case "canceled":
+		return "nudge canceled by operator before delivery"
 	case "injected":
 		return "nudge delivered via provider injection"
 	case "accepted_for_injection":
