@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 )
@@ -166,6 +167,74 @@ func TestVerifyRetainedWorkMigrationAtBootRechecksNativeCopyAndMovingSource(t *t
 			t.Fatalf("error/opens = %v/%d, want unconfirmed/1", err, opens)
 		}
 	})
+
+	t.Run("native authority may evolve after cutover", func(t *testing.T) {
+		cityPath, snapshot, proof := newWorkMigrationBootFixture(t)
+		writeWorkMigrationBootProof(t, cityPath, proof)
+		rows := expectedWorkMigrationRows(snapshot.Exact)
+		rows[0].Title = "changed by the live authority"
+		rows[0].UpdatedAt = rows[0].UpdatedAt.Add(time.Hour)
+		rows[0].Metadata = beads.StringMap{
+			beadmeta.WorkMigrationSourceWitnessMetadataKey: proof.SourceWitness,
+			"runtime.after_cutover":                        "changed",
+		}
+		runtime := workMigrationBootRuntimeForRows(rows, nil, nil)
+		if err := verifyRetainedWorkMigrationAtBoot(context.Background(), cityPath, "bd", "dr", runtime); err != nil {
+			t.Fatalf("verifyRetainedWorkMigrationAtBoot: %v", err)
+		}
+	})
+
+	t.Run("new unstamped native work is allowed", func(t *testing.T) {
+		cityPath, snapshot, proof := newWorkMigrationBootFixture(t)
+		writeWorkMigrationBootProof(t, cityPath, proof)
+		rows := append(expectedWorkMigrationRows(snapshot.Exact), beads.Bead{
+			ID: "dr-new", Title: "native work", Status: "open", Type: "task", CreatedAt: workMigrationBootTime(),
+		})
+		runtime := workMigrationBootRuntimeForRows(rows, nil, nil)
+		if err := verifyRetainedWorkMigrationAtBoot(context.Background(), cityPath, "bd", "dr", runtime); err != nil {
+			t.Fatalf("verifyRetainedWorkMigrationAtBoot: %v", err)
+		}
+	})
+
+	for _, test := range []struct {
+		name   string
+		mutate func([]beads.Bead, workMigrationProof) []beads.Bead
+	}{
+		{
+			name: "expected row loses witness stamp",
+			mutate: func(rows []beads.Bead, _ workMigrationProof) []beads.Bead {
+				delete(rows[0].Metadata, beadmeta.WorkMigrationSourceWitnessMetadataKey)
+				return rows
+			},
+		},
+		{
+			name: "expected row changes witness stamp",
+			mutate: func(rows []beads.Bead, _ workMigrationProof) []beads.Bead {
+				rows[0].Metadata[beadmeta.WorkMigrationSourceWitnessMetadataKey] = "sha256:" + strings.Repeat("f", 64)
+				return rows
+			},
+		},
+		{
+			name: "extra row claims frozen witness",
+			mutate: func(rows []beads.Bead, proof workMigrationProof) []beads.Bead {
+				return append(rows, beads.Bead{
+					ID: "dr-extra", Title: "extra", Status: "open", Type: "task", CreatedAt: workMigrationBootTime(),
+					Metadata: beads.StringMap{beadmeta.WorkMigrationSourceWitnessMetadataKey: proof.SourceWitness},
+				})
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cityPath, snapshot, proof := newWorkMigrationBootFixture(t)
+			writeWorkMigrationBootProof(t, cityPath, proof)
+			rows := test.mutate(expectedWorkMigrationRows(snapshot.Exact), proof)
+			runtime := workMigrationBootRuntimeForRows(rows, nil, nil)
+			err := verifyRetainedWorkMigrationAtBoot(context.Background(), cityPath, "bd", "dr", runtime)
+			if !errors.Is(err, errWorkCopyUnconfirmed) {
+				t.Fatalf("error = %v, want errWorkCopyUnconfirmed", err)
+			}
+		})
+	}
 
 	t.Run("source changes during check", func(t *testing.T) {
 		cityPath, snapshot, proof := newWorkMigrationBootFixture(t)
@@ -385,13 +454,19 @@ func newWorkMigrationBootFixture(t *testing.T) (string, workMigrationSnapshot, w
 }
 
 func workMigrationBootRuntimeForSnapshot(snapshot workMigrationSnapshot, opens *int) workMigrationBootRuntime {
+	rows := expectedWorkMigrationRows(snapshot.Exact)
+	return workMigrationBootRuntimeForRows(rows, rows[0].Dependencies, opens)
+}
+
+func workMigrationBootRuntimeForRows(rows []beads.Bead, deps []beads.Dep, opens *int) workMigrationBootRuntime {
 	return workMigrationBootRuntime{
 		readSource: openWorkMigrationFileSource,
 		readProof:  os.ReadFile,
 		openDestination: func(context.Context, string) (workMigrationDestination, error) {
-			*opens++
-			rows := expectedWorkMigrationRows(snapshot.Exact)
-			return newFakeWorkMigrationDestination(rows, rows[0].Dependencies), nil
+			if opens != nil {
+				*opens++
+			}
+			return newFakeWorkMigrationDestination(rows, deps), nil
 		},
 	}
 }
