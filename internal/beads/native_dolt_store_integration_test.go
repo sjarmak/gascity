@@ -11,7 +11,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -314,5 +316,93 @@ func TestNativeDoltStoreRealBackendRoundTrip(t *testing.T) {
 	}
 	if _, err := store.Get("gc-missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Get missing error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestNativeDoltStoreExactWorkSnapshotRealBackendRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "workspace")
+	restore, err := withWithheldBeadsEnv()
+	if err != nil {
+		t.Fatalf("withhold ambient Beads environment: %v", err)
+	}
+	storage, err := beadslib.OpenBestAvailable(ctx, filepath.Join(root, ".beads"))
+	restore()
+	if err != nil {
+		t.Skipf("upstream native beads storage unavailable: %v", err)
+	}
+	if err := storage.SetConfig(ctx, "issue_prefix", "dr"); err != nil {
+		_ = storage.Close()
+		t.Fatalf("set destination issue prefix: %v", err)
+	}
+	store := newNativeDoltStoreWithStorageAndPrefix(storage, "work-migration-integration", "dr")
+	createdAt := time.Date(2026, 8, 12, 10, 11, 12, 0, time.UTC)
+	updatedAt := createdAt.Add(time.Hour)
+	priority := 1
+	witness := "sha256:" + strings.Repeat("e", 64)
+	_, err = store.ImportExactWorkSnapshot(ExactWorkSnapshot{
+		SourceWitness: witness,
+		Rows: []Bead{
+			{ID: "gc-parent", Title: "foreign parent", Status: "open", Type: "task", CreatedAt: createdAt},
+			{
+				ID: "gc-child", Title: "foreign child", Status: "in_progress", Type: "bug",
+				Priority: &priority, CreatedAt: createdAt, UpdatedAt: updatedAt,
+				Assignee: "worker", From: "sender", Ref: "source-ref", Description: "preserved",
+				Labels: []string{"migration", "work"}, Metadata: StringMap{"gc.routed_to": "worker"},
+				ParentID:     "gc-parent",
+				Dependencies: []Dep{{IssueID: "gc-child", DependsOnID: "gc-parent", Type: "parent-child"}},
+			},
+			{ID: "gc-dangling", Title: "legacy parent", Status: "closed", Type: "task", CreatedAt: createdAt, ParentID: "gc-missing"},
+		},
+	})
+	if err != nil {
+		_ = store.CloseStore()
+		t.Fatalf("ImportExactWorkSnapshot: %v", err)
+	}
+	if err := store.CloseStore(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	reader, err := OpenNativeDoltStoreAtWithoutAmbientEnv(ctx, root)
+	if err != nil {
+		t.Fatalf("reopen independent native reader: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reader.CloseStore(); err != nil {
+			t.Fatalf("close reader: %v", err)
+		}
+	})
+	if reader.IDPrefix() != "dr" {
+		t.Fatalf("destination prefix = %q, want dr", reader.IDPrefix())
+	}
+	child, err := reader.Get("gc-child")
+	if err != nil {
+		t.Fatalf("Get foreign child after reopen: %v", err)
+	}
+	if child.Status != "in_progress" || child.Type != "bug" || child.Assignee != "worker" || child.From != "sender" || child.Ref != "source-ref" {
+		t.Fatalf("child core fields = %+v", child)
+	}
+	if child.Priority == nil || *child.Priority != priority || !child.CreatedAt.Equal(createdAt) || !child.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("child priority/timestamps = %v %s/%s", child.Priority, child.CreatedAt, child.UpdatedAt)
+	}
+	if !slices.Equal(child.Labels, []string{"migration", "work"}) || child.Metadata["gc.routed_to"] != "worker" || child.Metadata[workMigrationSourceWitnessMetadataKey] != witness {
+		t.Fatalf("child labels/metadata = %v/%v", child.Labels, child.Metadata)
+	}
+	if len(child.Dependencies) != 1 || child.ParentID != "gc-parent" {
+		t.Fatalf("child dependency/parent = %+v/%q", child.Dependencies, child.ParentID)
+	}
+	dangling, err := reader.Get("gc-dangling")
+	if err != nil {
+		t.Fatalf("Get dangling child after reopen: %v", err)
+	}
+	if dangling.Status != "closed" || dangling.ParentID != "gc-missing" {
+		t.Fatalf("dangling closed row = %+v", dangling)
+	}
+	children, err := reader.List(ListQuery{ParentID: "gc-missing", IncludeClosed: true})
+	if err != nil {
+		t.Fatalf("List dangling parent after reopen: %v", err)
+	}
+	if len(children) != 1 || children[0].ID != "gc-dangling" {
+		t.Fatalf("dangling parent query = %+v", children)
 	}
 }
