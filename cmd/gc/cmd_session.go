@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -82,10 +83,10 @@ func newSessionSubmitCmd(stdout, stderr io.Writer) *cobra.Command {
 		Short: "Submit a message with semantic delivery intent",
 		Long: `Submit a user message to a session without choosing provider transport details.
 
-The runtime decides whether to wake, inject immediately, or queue the message
-according to the selected semantic intent.`,
-		Example: `  gc session submit mayor "status update"
-  gc session submit mayor "after this run, handle docs" --intent follow_up
+The caller must choose whether this work follows the current run or interrupts
+it. Ambiguous provider-default delivery is refused because some runtimes can
+accept it without submitting a receiver turn.`,
+		Example: `  gc session submit mayor "after this run, handle docs" --intent follow_up
   gc session submit mayor "stop and do this instead" --intent interrupt_now`,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(_ *cobra.Command, args []string) error {
@@ -101,7 +102,7 @@ according to the selected semantic intent.`,
 		},
 		ValidArgsFunction: completeSessionIDs,
 	}
-	cmd.Flags().StringVar(&intent, "intent", string(session.SubmitIntentDefault), "submit intent: default, follow_up, or interrupt_now")
+	cmd.Flags().StringVar(&intent, "intent", "", "required submit intent: follow_up or interrupt_now")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "JSON output")
 	return cmd
 }
@@ -2544,13 +2545,13 @@ joined automatically.`,
 func parseSessionSubmitIntent(raw string) (session.SubmitIntent, error) {
 	switch strings.TrimSpace(raw) {
 	case "", string(session.SubmitIntentDefault):
-		return session.SubmitIntentDefault, nil
+		return "", errors.New("explicit --intent is required (want follow_up or interrupt_now; default delivery is unsafe)")
 	case "follow-up", string(session.SubmitIntentFollowUp):
 		return session.SubmitIntentFollowUp, nil
 	case "interrupt-now", string(session.SubmitIntentInterruptNow):
 		return session.SubmitIntentInterruptNow, nil
 	default:
-		return "", fmt.Errorf("unknown submit intent %q (want default, follow_up, or interrupt_now)", raw)
+		return "", fmt.Errorf("unknown submit intent %q (want follow_up or interrupt_now)", raw)
 	}
 }
 

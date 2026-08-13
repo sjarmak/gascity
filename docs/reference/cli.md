@@ -4225,8 +4225,9 @@ gc session reset <session-id-or-alias> [flags]
 
 Submit a user message to a session without choosing provider transport details.
 
-The runtime decides whether to wake, inject immediately, or queue the message
-according to the selected semantic intent.
+The caller must choose whether this work follows the current run or interrupts
+it. Ambiguous provider-default delivery is refused because some runtimes can
+accept it without submitting a receiver turn.
 
 ```
 gc session submit <id-or-alias> <message...> [flags]
@@ -4235,14 +4236,13 @@ gc session submit <id-or-alias> <message...> [flags]
 **Example:**
 
 ```
-gc session submit mayor "status update"
 gc session submit mayor "after this run, handle docs" --intent follow_up
 gc session submit mayor "stop and do this instead" --intent interrupt_now
 ```
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--intent` | string | `default` | submit intent: default, follow_up, or interrupt_now |
+| `--intent` | string |  | required submit intent: follow_up or interrupt_now |
 | `--json` | bool |  | JSON output |
 
 ## gc session suspend
