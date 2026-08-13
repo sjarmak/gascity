@@ -2688,7 +2688,36 @@ gc nudge
 
 | Subcommand | Description |
 |------------|-------------|
+| [gc nudge dismiss](#gc-nudge-dismiss) | Dismiss one adjudicated dead-letter nudge |
+| [gc nudge retry](#gc-nudge-retry) | Retry one dead-letter nudge against an explicit current session |
 | [gc nudge status](#gc-nudge-status) | Show queued and dead-letter nudges for a session |
+
+## gc nudge dismiss
+
+Dismiss one adjudicated dead-letter nudge
+
+```
+gc nudge dismiss <nudge-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | bool |  | Output as JSON |
+| `--reason` | string |  | required audit reason for dismissing the dead letter |
+
+## gc nudge retry
+
+Retry one dead-letter nudge against an explicit current session
+
+```
+gc nudge retry <nudge-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | bool |  | Output as JSON |
+| `--reason` | string |  | required audit reason for retrying the dead letter |
+| `--to` | string |  | required current session alias or id |
 
 ## gc nudge status
 
