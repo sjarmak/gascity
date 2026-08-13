@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/coordclass"
 )
@@ -69,7 +70,7 @@ func verifyRetainedWorkMigrationAtBoot(
 	if err != nil {
 		return err
 	}
-	if err := verifyBootWorkMigrationDestination(ctx, cityPath, proof, snapshot, runtime); err != nil {
+	if err := verifyBootWorkMigrationDestination(ctx, cityPath, proof, runtime); err != nil {
 		return err
 	}
 	currentSource, _, err := runtime.readSource(sourcePath)
@@ -205,7 +206,6 @@ func verifyBootWorkMigrationDestination(
 	ctx context.Context,
 	cityPath string,
 	proof workMigrationProof,
-	snapshot workMigrationSnapshot,
 	runtime workMigrationBootRuntime,
 ) error {
 	destination, err := runtime.openDestination(ctx, cityPath)
@@ -218,13 +218,39 @@ func verifyBootWorkMigrationDestination(
 			destination.IDPrefix(), proof.DestinationPrefix,
 		)
 	} else {
-		_, err = verifyWorkMigrationSnapshot(destination, snapshot.Exact)
+		err = verifyBootWorkMigrationContinuity(destination, proof)
 	}
 	closeErr := destination.CloseStore()
 	if closeErr != nil {
 		closeErr = fmt.Errorf("%w: closing boot verifier: %w", errWorkVerificationUnavailable, closeErr)
 	}
 	return errors.Join(err, closeErr)
+}
+
+func verifyBootWorkMigrationContinuity(destination beads.Store, proof workMigrationProof) error {
+	stamped, err := destination.List(beads.ListQuery{
+		IncludeClosed: true,
+		TierMode:      beads.TierBoth,
+		AllowScan:     true,
+		Metadata: map[string]string{
+			beadmeta.WorkMigrationSourceWitnessMetadataKey: proof.SourceWitness,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("%w: listing native Work continuity: %w", errWorkVerificationUnavailable, err)
+	}
+	ids := make([]string, 0, len(stamped))
+	for _, row := range stamped {
+		if row.Metadata[beadmeta.WorkMigrationSourceWitnessMetadataKey] != proof.SourceWitness {
+			return fmt.Errorf("%w: destination row %q does not carry the proven source witness", errWorkCopyUnconfirmed, row.ID)
+		}
+		ids = append(ids, row.ID)
+	}
+	sort.Strings(ids)
+	if !slices.Equal(ids, proof.WorkIDs) {
+		return fmt.Errorf("%w: destination witness ids %v, want %v", errWorkCopyUnconfirmed, ids, proof.WorkIDs)
+	}
+	return nil
 }
 
 func invalidWorkMigrationProof(path, format string, args ...any) error {

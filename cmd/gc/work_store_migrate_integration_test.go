@@ -112,6 +112,24 @@ func TestRunWorkMigrationRealNativeDestination(t *testing.T) {
 	); err != nil {
 		t.Fatalf("boot verification of proven copy: %v", err)
 	}
+	mutator, err := beads.OpenNativeDoltStoreAtWithoutAmbientEnv(context.Background(), destinationPath)
+	if err != nil {
+		t.Fatalf("open native mutator: %v", err)
+	}
+	metadataErr := mutator.SetMetadata("gc-a", "runtime.after_cutover", "changed")
+	newWork, createErr := mutator.Create(beads.Bead{Title: "new native work", Type: "task"})
+	closeErr = mutator.CloseStore()
+	if metadataErr != nil || createErr != nil || closeErr != nil {
+		t.Fatalf("evolve native Work authority: metadata: %v; create: %v; close: %v", metadataErr, createErr, closeErr)
+	}
+	if !strings.HasPrefix(newWork.ID, "dr-") {
+		t.Fatalf("new native Work id = %q, want destination prefix dr-", newWork.ID)
+	}
+	if err := verifyRetainedWorkMigrationAtBoot(
+		context.Background(), destinationPath, "bd", "dr", defaultWorkMigrationBootRuntime(),
+	); err != nil {
+		t.Fatalf("boot verification after legitimate native Work mutation: %v", err)
+	}
 	if err := os.WriteFile(sourcePath, append(data, '\n'), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +154,7 @@ func TestRunWorkMigrationRealNativeDestination(t *testing.T) {
 	if err := os.WriteFile(sourcePath, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	mutator, err := beads.OpenNativeDoltStoreAtWithoutAmbientEnv(context.Background(), destinationPath)
+	mutator, err = beads.OpenNativeDoltStoreAtWithoutAmbientEnv(context.Background(), destinationPath)
 	if err != nil {
 		t.Fatalf("open native mutator: %v", err)
 	}
