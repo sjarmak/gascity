@@ -50,6 +50,45 @@ func TestSubmitEnterAndConfirmStopsWhenBusy(t *testing.T) {
 	}
 }
 
+// TestSubmitEnterAndConfirmRejectsPreexistingBusyState proves that another
+// in-flight turn cannot satisfy this nudge's submit acknowledgement. A busy
+// pane before Enter means there is no idle-to-busy transition to correlate
+// with this message, so the caller must retain the nudge for retry.
+func TestSubmitEnterAndConfirmRejectsPreexistingBusyState(t *testing.T) {
+	var enters int
+	busy := func() (bool, error) { return true, nil }
+	sendEnter := func() error { enters++; return nil }
+
+	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, noSleep)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if confirmed {
+		t.Fatal("confirmed = true, want false for a pane busy before this nudge's Enter")
+	}
+	if enters != 0 {
+		t.Fatalf("enters = %d, want 0 (must not submit into another active turn)", enters)
+	}
+}
+
+func TestSubmitEnterAndConfirmSurfacesInitialObservationFailure(t *testing.T) {
+	observeErr := errors.New("capture pane unavailable")
+	var enters int
+	busy := func() (bool, error) { return false, observeErr }
+	sendEnter := func() error { enters++; return nil }
+
+	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, noSleep)
+	if confirmed {
+		t.Fatal("confirmed = true, want false")
+	}
+	if !errors.Is(err, observeErr) {
+		t.Fatalf("err = %v, want observation error chain", err)
+	}
+	if enters != 0 {
+		t.Fatalf("enters = %d, want 0 when acknowledgement path is broken", enters)
+	}
+}
+
 // TestSubmitEnterAndConfirmNoDoubleSubmitOnFastTurn proves the safety property:
 // if a turn goes busy after the first send's polls but before a re-send, the
 // pre-re-send busy check catches it and no second Enter is issued.
@@ -59,7 +98,7 @@ func TestSubmitEnterAndConfirmNoDoubleSubmitOnFastTurn(t *testing.T) {
 	busy := func() (bool, error) {
 		busyCalls++
 		// Idle for the first send's polls; busy at the pre-re-send check.
-		return busyCalls > submitConfirmPollsPerSend, nil
+		return busyCalls > submitConfirmPollsPerSend+1, nil
 	}
 	sendEnter := func() error { enters++; return nil }
 
