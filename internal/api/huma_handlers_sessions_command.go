@@ -349,7 +349,7 @@ func (s *Server) humaCreateProviderSession(_ context.Context, store beads.Sessio
 			return
 		}
 		if msg := strings.TrimSpace(body.Message); msg != "" {
-			if _, sendErr := s.submitMessageToSession(context.Background(), store.Store, info.ID, msg, session.SubmitIntentDefault); sendErr != nil {
+			if _, sendErr := s.submitMessageToSession(context.Background(), store.Store, info.ID, msg, session.SubmitIntentFollowUp); sendErr != nil {
 				if rollbackErr := s.rollbackCreatedSession(store, info.ID); rollbackErr != nil {
 					s.emitSessionCreateFailed(reqID, "message_delivery_failed",
 						fmt.Sprintf("initial message delivery failed: %v (rollback failed: %v)", sendErr, rollbackErr))
@@ -699,8 +699,8 @@ func (s *Server) humaHandleSessionSubmit(ctx context.Context, input *SessionSubm
 	}
 
 	intent := input.Body.Intent
-	if intent == "" {
-		intent = session.SubmitIntentDefault
+	if intent == "" || intent == session.SubmitIntentDefault {
+		return nil, apierr.InvalidRequest.Msg("explicit intent is required (want follow_up or interrupt_now; default delivery is unsafe)")
 	}
 
 	reqID, reqIDErr := newRequestID()

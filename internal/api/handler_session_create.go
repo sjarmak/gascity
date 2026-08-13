@@ -405,9 +405,11 @@ func (s *Server) createProviderSession(w http.ResponseWriter, r *http.Request, s
 		fmt.Fprintf(os.Stderr, "session %s: "+format+"\n", append([]any{info.ID}, args...)...)
 	})
 
-	// Deliver initial message if provided.
+	// Provider sessions start immediately, so their initial message must use a
+	// durable follow-up instead of provider-default delivery. A delivery error
+	// is loud at the create boundary and rolls the new session back.
 	if msg := strings.TrimSpace(body.Message); msg != "" {
-		if _, sendErr := s.submitMessageToSession(r.Context(), store.Store, info.ID, msg, session.SubmitIntentDefault); sendErr != nil {
+		if _, sendErr := s.submitMessageToSession(r.Context(), store.Store, info.ID, msg, session.SubmitIntentFollowUp); sendErr != nil {
 			log.Printf("session %s: initial message delivery failed: %v", info.ID, sendErr)
 			rollbackErr := s.rollbackCreatedSession(store, info.ID)
 			s.idem.unreserve(idemKey)

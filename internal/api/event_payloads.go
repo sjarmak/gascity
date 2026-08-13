@@ -100,7 +100,7 @@ type SessionSubmitSucceededPayload struct {
 	RequestID string `json:"request_id" doc:"Correlation ID from the 202 response."`
 	SessionID string `json:"session_id" doc:"Session ID that received the submission."`
 	Queued    bool   `json:"queued" doc:"Whether the message was queued for later delivery."`
-	Intent    string `json:"intent" doc:"Resolved submit intent (default, follow_up, interrupt_now)."`
+	Intent    string `json:"intent" doc:"Resolved submit intent (follow_up or interrupt_now)."`
 }
 
 // IsEventPayload marks SessionSubmitSucceededPayload as an events.Payload variant.

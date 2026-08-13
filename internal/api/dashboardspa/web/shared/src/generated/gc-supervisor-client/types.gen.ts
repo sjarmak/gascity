@@ -4300,9 +4300,9 @@ export type SessionStructuredUserPrompt = {
 
 export type SessionSubmitInputBody = {
     /**
-     * Submit intent; empty defaults to "default".
+     * Required submit intent. Provider-default delivery is unsafe and refused.
      */
-    intent?: SubmitIntent;
+    intent: SubmitIntent;
     /**
      * Message text to submit.
      */
@@ -4311,7 +4311,7 @@ export type SessionSubmitInputBody = {
 
 export type SessionSubmitSucceededPayload = {
     /**
-     * Resolved submit intent (default, follow_up, interrupt_now).
+     * Resolved submit intent (follow_up or interrupt_now).
      */
     intent: string;
     /**
@@ -4927,7 +4927,7 @@ export type SubmissionCapabilities = {
 /**
  * Semantic delivery choice for a user message on a session submit request.
  */
-export type SubmitIntent = 'default' | 'follow_up' | 'interrupt_now';
+export type SubmitIntent = 'follow_up' | 'interrupt_now';
 
 export type SupervisorCitiesOutputBody = {
     /**

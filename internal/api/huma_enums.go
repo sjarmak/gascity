@@ -30,7 +30,6 @@ type submitIntentSchema struct{}
 func (submitIntentSchema) Schema(r huma.Registry) *huma.Schema {
 	return registerNamedEnum(r, "SubmitIntent",
 		"Semantic delivery choice for a user message on a session submit request.",
-		string(session.SubmitIntentDefault),
 		string(session.SubmitIntentFollowUp),
 		string(session.SubmitIntentInterruptNow),
 	)

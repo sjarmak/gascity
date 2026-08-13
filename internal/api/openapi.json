@@ -10431,9 +10431,8 @@
         "properties": {
           "intent": {
             "$ref": "#/components/schemas/SubmitIntent",
-            "description": "Submit intent; empty defaults to \"default\".",
+            "description": "Required submit intent. Provider-default delivery is unsafe and refused.",
             "enum": [
-              "default",
               "follow_up",
               "interrupt_now"
             ]
@@ -10446,7 +10445,8 @@
           }
         },
         "required": [
-          "message"
+          "message",
+          "intent"
         ],
         "type": "object"
       },
@@ -10454,7 +10454,7 @@
         "additionalProperties": false,
         "properties": {
           "intent": {
-            "description": "Resolved submit intent (default, follow_up, interrupt_now).",
+            "description": "Resolved submit intent (follow_up or interrupt_now).",
             "type": "string"
           },
           "queued": {
@@ -11551,7 +11551,6 @@
       "SubmitIntent": {
         "description": "Semantic delivery choice for a user message on a session submit request.",
         "enum": [
-          "default",
           "follow_up",
           "interrupt_now"
         ],

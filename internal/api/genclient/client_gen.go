@@ -599,7 +599,6 @@ func (e StatusConditionalWritesOrigin) Valid() bool {
 
 // Defines values for SubmitIntent.
 const (
-	Default      SubmitIntent = "default"
 	FollowUp     SubmitIntent = "follow_up"
 	InterruptNow SubmitIntent = "interrupt_now"
 )
@@ -607,8 +606,6 @@ const (
 // Valid indicates whether the value is a known member of the SubmitIntent enum.
 func (e SubmitIntent) Valid() bool {
 	switch e {
-	case Default:
-		return true
 	case FollowUp:
 		return true
 	case InterruptNow:
@@ -4550,7 +4547,7 @@ type SessionStructuredUserPrompt struct {
 // SessionSubmitInputBody defines model for SessionSubmitInputBody.
 type SessionSubmitInputBody struct {
 	// Intent Semantic delivery choice for a user message on a session submit request.
-	Intent *SubmitIntent `json:"intent,omitempty"`
+	Intent SubmitIntent `json:"intent"`
 
 	// Message Message text to submit.
 	Message string `json:"message"`
@@ -4558,7 +4555,7 @@ type SessionSubmitInputBody struct {
 
 // SessionSubmitSucceededPayload defines model for SessionSubmitSucceededPayload.
 type SessionSubmitSucceededPayload struct {
-	// Intent Resolved submit intent (default, follow_up, interrupt_now).
+	// Intent Resolved submit intent (follow_up or interrupt_now).
 	Intent string `json:"intent"`
 
 	// Queued Whether the message was queued for later delivery.

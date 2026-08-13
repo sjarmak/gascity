@@ -934,6 +934,24 @@ func TestClientSubmitSessionWaitsForResultEvent(t *testing.T) {
 	}
 }
 
+func TestClientSubmitSessionRejectsUnsafeDefaultBeforeRequest(t *testing.T) {
+	requests := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests++
+	}))
+	defer ts.Close()
+
+	c := NewCityScopedClient(ts.URL, "alpha")
+	for _, intent := range []session.SubmitIntent{"", session.SubmitIntentDefault} {
+		if _, err := c.SubmitSession("sess-123", "take this now", intent); err == nil {
+			t.Fatalf("SubmitSession(intent=%q) unexpectedly succeeded", intent)
+		}
+	}
+	if requests != 0 {
+		t.Fatalf("requests = %d, want 0", requests)
+	}
+}
+
 func TestClientSubmitSessionReportsAsyncFailure(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
