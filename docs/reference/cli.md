@@ -323,7 +323,7 @@ gc bd release-if-current my-project-abc worker-1
 Manage the beads provider (backing store for issue tracking).
 
 Subcommands for topology operations, health checking, diagnostics, exact-store
-metadata compare-and-set, and read-only list/show routed through the supervisor
+conditional writes, and read-only list/show routed through the supervisor
 API with transparent fallback to direct bd reads.
 
 ```
@@ -333,6 +333,7 @@ gc beads
 | Subcommand | Description |
 |------------|-------------|
 | [gc beads city](#gc-beads-city) | Manage canonical city endpoint topology |
+| [gc beads close-exact](#gc-beads-close-exact) | Revision-fence an identity-checked close in one exact local store |
 | [gc beads health](#gc-beads-health) | Check beads provider health |
 | [gc beads list](#gc-beads-list) | List beads (API-routed with bd fallback) |
 | [gc beads metadata-cas](#gc-beads-metadata-cas) | Atomically compare and set one metadata key in an exact local store |
@@ -381,6 +382,50 @@ gc beads city use-managed [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--dry-run` | bool |  | show the canonical changes without writing files |
+
+## gc beads close-exact
+
+Close one bead in one explicitly selected local file store after checking
+its title, status, and one metadata value. Both the scope and the file-provider
+surface are explicit. The close is revision-fenced, so a
+concurrent mutation is a hard failure rather than closing changed work. The
+result is read back from the same store before success is reported.
+
+The command never scans other stores, follows a cross-store fallback, or
+operates on a remote city. A retry against an already-closed bead succeeds only
+when the title and metadata identity still match.
+
+Use --json for the canonical machine-output contract. --format=json remains
+accepted for compatibility. Combining --json with an explicit --format=text is
+a usage error.
+
+```
+gc beads close-exact <bead-id> [flags]
+```
+
+**Example:**
+
+```
+gc beads close-exact gc-123 \
+  --store-ref=city:demo \
+  --surface=file \
+  --expected-title=dr-wisp-abc \
+  --expected-status=open \
+  --expected-metadata-key=gc.routed_to \
+  --expected-metadata-value=demo/receiver \
+  --json
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--expected-metadata-key` | string |  | required metadata identity key |
+| `--expected-metadata-value` | string |  | required metadata identity value (explicit empty is allowed) |
+| `--expected-status` | string |  | required pre-close status: open or in_progress |
+| `--expected-title` | string |  | required exact title precondition |
+| `--format` | string | `text` | output format: text or json |
+| `--json` | bool |  | emit the canonical JSON result |
+| `--store-ref` | string |  | exact local store: city:&lt;name&gt; or rig:&lt;name&gt; |
+| `--surface` | string |  | exact provider surface (file) |
 
 ## gc beads health
 
