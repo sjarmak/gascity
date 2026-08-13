@@ -238,6 +238,42 @@ func TestStorageMigrateWorkCommandReportsStructuredDryRun(t *testing.T) {
 	}
 }
 
+func TestStorageMigrateWorkCommandCanonicalizesProofEndpoints(t *testing.T) {
+	runtime, _ := newWorkMigrationRuntimeForTest(t)
+	var sourcePath, destinationPath string
+	runtime.readSource = func(path string) (beads.Store, []byte, error) {
+		sourcePath = path
+		return workMigrationSourceForTest(t), []byte("stable source"), nil
+	}
+	runtime.foreignControllerPID = func(path string) int {
+		destinationPath = path
+		return 0
+	}
+	var proof workMigrationProof
+	runtime.writeProof = func(path string, got workMigrationProof) error {
+		destinationPath = path
+		proof = got
+		return nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := newStorageMigrateWorkCmdWithRuntime(runtime, &stdout, &stderr)
+	cmd.SetArgs([]string{
+		"--from-file", "/source/../source/beads.json",
+		"--destination-workspace", "/destination/",
+		"--fleet-stopped",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v; stderr=%s", err, stderr.String())
+	}
+	if sourcePath != "/source/beads.json" || proof.SourceFile != sourcePath {
+		t.Fatalf("source path/proof = %q/%q, want canonical source", sourcePath, proof.SourceFile)
+	}
+	if destinationPath != "/destination" || proof.DestinationWorkspace != destinationPath {
+		t.Fatalf("destination path/proof = %q/%q, want canonical destination", destinationPath, proof.DestinationWorkspace)
+	}
+}
+
 func TestStorageRootCarriesMigrateWorkVerb(t *testing.T) {
 	root := newStorageCmd(&bytes.Buffer{}, &bytes.Buffer{})
 	command, _, err := root.Find([]string{storageWorkMigrationVerb})
