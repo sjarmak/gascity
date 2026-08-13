@@ -44,6 +44,25 @@ type partialListStore struct {
 	err  error
 }
 
+type boundedOrderCheckEvents struct {
+	*events.Fake
+	tailCalls int
+	listCalls int
+}
+
+func (p *boundedOrderCheckEvents) List(_ events.Filter) ([]events.Event, error) {
+	p.listCalls++
+	return nil, errors.New("unbounded event list must not be used by order check")
+}
+
+func (p *boundedOrderCheckEvents) ListTail(filter events.Filter, limit int) ([]events.Event, error) {
+	p.tailCalls++
+	if limit <= 0 {
+		return nil, fmt.Errorf("tail limit = %d, want positive", limit)
+	}
+	return p.Fake.ListTail(filter, limit)
+}
+
 func (s *partialListStore) List(_ beads.ListQuery) ([]beads.Bead, error) {
 	return s.rows, s.err
 }
@@ -3989,6 +4008,42 @@ func TestOrderCheckCooldownFastPathBypassesLastRunStore(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "cooldown") {
 		t.Fatalf("stdout missing not-due cooldown row:\n%s", stdout.String())
+	}
+}
+
+func TestOrderCheckCooldownFastPathNeverScansUnboundedEventHistory(t *testing.T) {
+	now := time.Date(2026, 8, 13, 2, 0, 0, 0, time.UTC)
+	aa := []orders.Order{{
+		Name:     "digest",
+		Trigger:  "cooldown",
+		Interval: "24h",
+		Formula:  "mol-digest",
+	}}
+	failStore := labelFailListStore{
+		Store:     beads.NewMemStore(),
+		failLabel: "order-run:digest",
+	}
+	resolver := func(orders.Order) ([]beads.OrdersStore, error) { //nolint:unparam // resolver contract includes errors; this bounded fast-path test uses one store.
+		return []beads.OrdersStore{{Store: failStore}}, nil
+	}
+
+	ep := &boundedOrderCheckEvents{Fake: events.NewFake()}
+	ep.Record(events.Event{Type: events.OrderFired, Subject: "digest", Ts: now.Add(-time.Hour)})
+
+	for _, jsonOutput := range []bool{false, true} {
+		t.Run(fmt.Sprintf("json=%t", jsonOutput), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := doOrderCheckWithStoresResolverScopedJSON(t.TempDir(), &config.City{}, aa, now, ep, resolver, jsonOutput, &stdout, &stderr)
+			if code != 1 {
+				t.Fatalf("exit = %d, want 1 (cooldown active); stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+			}
+			if ep.listCalls != 0 {
+				t.Fatalf("unbounded List called %d times", ep.listCalls)
+			}
+		})
+	}
+	if ep.tailCalls != 2 {
+		t.Fatalf("bounded ListTail calls = %d, want 2", ep.tailCalls)
 	}
 }
 
