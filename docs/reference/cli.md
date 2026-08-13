@@ -4595,6 +4595,7 @@ gc storage
 | Subcommand | Description |
 |------------|-------------|
 | [gc storage migrate](#gc-storage-migrate) | Migrate this city's infrastructure classes onto their configured binding |
+| [gc storage migrate-work](#gc-storage-migrate-work) | Copy the explicit file-ledger Work slice into a native Dolt workspace |
 | [gc storage recover-stranded](#gc-storage-recover-stranded) | Copy stranded infrastructure beads from the retained work store into the converged binding |
 | [gc storage status](#gc-storage-status) | Report this city's storage-class layout (read-only) |
 
@@ -4621,6 +4622,21 @@ gc storage migrate [flags]
 |------|------|---------|-------------|
 | `--fleet-stopped` | bool |  | attest that every writer that can reach this city's work store is stopped — not just its controller, which this command proves on its own |
 | `--from-work` | bool |  | migrate the infrastructure classes out of this city's work store |
+
+## gc storage migrate-work
+
+Copy the explicit file-ledger Work slice into a native Dolt workspace
+
+```
+gc storage migrate-work [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--destination-workspace` | string |  | absolute path to the existing native Dolt workspace |
+| `--dry-run` | bool |  | validate and witness the source without opening or writing the destination |
+| `--fleet-stopped` | bool |  | attest that every writer that can reach this city's work store is stopped — not just its controller, which this command proves on its own |
+| `--from-file` | string |  | absolute path to the retained file-provider beads.json |
 
 ## gc storage recover-stranded
 
