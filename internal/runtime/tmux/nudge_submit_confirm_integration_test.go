@@ -26,6 +26,7 @@ import ("bufio";"fmt";"os";"strconv")
 func main(){
 	busyAfter:=1
 	if v:=os.Getenv("GC_TEST_BUSY_AFTER"); v!=""{ if n,err:=strconv.Atoi(v); err==nil && n>0 { busyAfter=n } }
+	if os.Getenv("GC_TEST_START_BUSY")=="1" { fmt.Print("esc to interrupt\n") }
 	enters:=0
 	r:=bufio.NewReader(os.Stdin)
 	for{
@@ -50,6 +51,47 @@ func main(){
 		t.Fatalf("go build %s: %v\n%s", name, err, string(out))
 	}
 	return bin
+}
+
+// TestNudgeSessionDoesNotAckAnotherTurnBusy proves the receiver-side failure
+// from dr-zisw against real tmux: a pre-existing Claude busy indicator cannot
+// confirm this nudge, and no submit Enter is sent into the active turn.
+func TestNudgeSessionDoesNotAckAnotherTurnBusy(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	tm := testTmux()
+	dir := t.TempDir()
+	fake := buildBusyOnEnterBinary(t, dir, "fakeclaude-already-busy")
+	sessionName := fmt.Sprintf("gt-test-nudge-already-busy-%d", time.Now().UnixNano()%100000)
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommandAndEnv(sessionName, dir, fake, map[string]string{
+		"GC_PROVIDER":        "claude",
+		"GC_TEST_START_BUSY": "1",
+	}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	const message = "hello-already-busy"
+	for attempt := 1; attempt <= 3; attempt++ {
+		err := tm.NudgeSession(sessionName, message)
+		if !errors.Is(err, ErrNudgeSubmitUnconfirmed) {
+			t.Fatalf("NudgeSession attempt %d err = %v, want ErrNudgeSubmitUnconfirmed", attempt, err)
+		}
+	}
+	out, captureErr := tm.CapturePaneAll(sessionName)
+	if captureErr != nil {
+		t.Fatalf("CapturePaneAll: %v", captureErr)
+	}
+	if strings.Contains(out, "ENTER#1") {
+		t.Fatalf("sent Enter into another active turn:\n%s", out)
+	}
+	if strings.Contains(out, message) {
+		t.Fatalf("pasted nudge into another active turn:\n%s", out)
+	}
 }
 
 // TestNudgeSessionConfirmsSubmitForClaude proves the verified-submit path
