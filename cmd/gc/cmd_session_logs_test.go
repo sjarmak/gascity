@@ -858,6 +858,90 @@ observe_paths = [%q]
 	validateJSONAgainstResultSchema(t, []string{"session", "logs"}, stdout.Bytes())
 }
 
+func TestCmdSessionLogsJSONIncludesSubmittedHookAttachment(t *testing.T) {
+	clearGCEnv(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+
+	cityDir := t.TempDir()
+	searchBase := t.TempDir()
+	workDir := t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(fmt.Sprintf(`[workspace]
+
+[daemon]
+observe_paths = [%q]
+`, searchBase)), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.gc): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, ".gc", "site.toml"), []byte("workspace_name = \"test\"\n"), 0o644); err != nil {
+		t.Fatalf("write site.toml: %v", err)
+	}
+	writeBuiltinImportsFixture(t, cityDir, "core")
+
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("openCityStoreAt(%q): %v", cityDir, err)
+	}
+	b, err := store.Create(beads.Bead{
+		Title:  "hook attachment logs session",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "runtime-session",
+			"session_key":  "known-session",
+			"provider":     "claude",
+			"template":     "worker",
+			"state":        "asleep",
+			"work_dir":     workDir,
+		},
+	})
+	if err != nil {
+		t.Fatalf("store.Create(session): %v", err)
+	}
+	writeNamedTestSession(t, searchBase, workDir, "known-session.jsonl",
+		`{"uuid":"1","parentUuid":"","type":"user","message":{"role":"user","content":"submitted prompt"},"timestamp":"2025-01-01T00:00:00Z"}`,
+		`{"uuid":"2","parentUuid":"1","type":"attachment","attachment":{"type":"hook_success","hookName":"UserPromptSubmit:nudge drain --inject","hookEvent":"UserPromptSubmit","content":"deferred marker NUDGE-1"},"timestamp":"2025-01-01T00:00:01Z"}`,
+		`{"uuid":"3","parentUuid":"2","type":"attachment","attachment":{"type":"hook_success","hookName":"UserPromptSubmit:empty","hookEvent":"UserPromptSubmit","content":""},"timestamp":"2025-01-01T00:00:02Z"}`,
+		`{"uuid":"4","parentUuid":"3","type":"attachment","attachment":{"type":"hook_additional_context","hookEvent":"PostToolUse","content":[{"type":"text","text":"not submitted-turn evidence"}]},"timestamp":"2025-01-01T00:00:03Z"}`,
+		`{"uuid":"5","parentUuid":"4","type":"attachment","attachment":{"type":"hook_success","hookEvent":"PostToolUse","content":"not a submitted hook"},"timestamp":"2025-01-01T00:00:04Z"}`,
+		`{"uuid":"6","parentUuid":"5","type":"assistant","message":{"role":"assistant","content":"continued after polymorphic attachment"},"timestamp":"2025-01-01T00:00:05Z"}`,
+	)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionLogs([]string{b.ID}, false, 0, true, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionLogs(--json) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	var got sessionLogsJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not parseable JSON: %v\n%s", err, stdout.String())
+	}
+	if len(got.Entries) != 3 {
+		t.Fatalf("logs JSON entries = %+v, want user turn, submitted hook attachment, and assistant turn", got.Entries)
+	}
+	attachment := got.Entries[1]
+	if attachment.Type != "attachment" || attachment.Subtype != "UserPromptSubmit" || attachment.Role != "system" || attachment.Text != "deferred marker NUDGE-1" {
+		t.Fatalf("attachment = %+v, want submitted UserPromptSubmit evidence", attachment)
+	}
+	validateJSONAgainstResultSchema(t, []string{"session", "logs"}, stdout.Bytes())
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := cmdSessionLogs([]string{b.ID}, false, 0, false, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionLogs = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "[ATTACHMENT:UserPromptSubmit] deferred marker NUDGE-1") {
+		t.Fatalf("human logs omit submitted hook attachment:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "not submitted-turn evidence") {
+		t.Fatalf("human logs exposed unrelated hook attachment:\n%s", stdout.String())
+	}
+}
+
 func TestCmdSessionLogsJSONBlocksValidateDeclaredSchema(t *testing.T) {
 	clearGCEnv(t)
 	clearInheritedCityRoutingEnv(t)
