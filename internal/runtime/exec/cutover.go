@@ -44,6 +44,10 @@ func (s *seamBackedProvider) NudgeStable(ctx context.Context, name, effectID str
 	return s.raw.NudgeStable(ctx, name, effectID, content)
 }
 
+func (s *seamBackedProvider) LookupStableNudge(ctx context.Context, name, effectID string, content []runtime.ContentBlock) (runtime.StableNudgeLookup, error) {
+	return s.raw.LookupStableNudge(ctx, name, effectID, content)
+}
+
 // DismissKnownDialogs implements [runtime.DialogProvider] (non-seam passthrough).
 func (s *seamBackedProvider) DismissKnownDialogs(ctx context.Context, name string, timeout time.Duration) error {
 	return s.raw.DismissKnownDialogs(ctx, name, timeout)
