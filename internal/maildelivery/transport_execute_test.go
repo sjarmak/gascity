@@ -3,6 +3,7 @@ package maildelivery
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -67,6 +68,79 @@ func TestExecuteTransportInvocationErrorBecomesUnknownWithoutRedelivery(t *testi
 		time.Date(2026, 8, 13, 23, 20, 0, 0, time.UTC), nil, invoke)
 	if replayErr != nil || replay.State != TransportUnknownExternalState || physicalEffects != 1 {
 		t.Fatalf("fault replay = %#v, %v, effects=%d", replay, replayErr, physicalEffects)
+	}
+}
+
+func TestExecuteTransportRetrySafeResponseLossRetriesThenCommits(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		deduplicate bool
+		wantEffects int
+	}{
+		{name: "protected", deduplicate: true, wantEffects: 1},
+		{name: "naive", deduplicate: false, wantEffects: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, _ := newDeliveryStore()
+			delivery := createWaitingDelivery(t, store)
+			fence := validFence()
+			request := TransportAttemptRequest{
+				DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+				ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+				CreatedAt: time.Date(2026, 8, 13, 23, 18, 0, 0, time.UTC),
+			}
+			effects := make(map[string]int)
+			calls := 0
+			invoke := func(_ context.Context, attempt TransportAttempt) (TransportReceipt, error) {
+				calls++
+				if !tc.deduplicate || effects[attempt.NudgeID] == 0 {
+					effects[attempt.NudgeID]++
+				}
+				if calls == 1 {
+					return TransportReceipt{}, fmt.Errorf("%w: destination committed before response loss", ErrTransportRetrySafe)
+				}
+				return TransportReceipt{
+					Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
+					State: EffectCommitted, CommitBoundary: TransportCommitBoundaryDestinationAtomic,
+					ReceiptRef: "destination:test", ReceiptSHA256: strings.Repeat("a", 64),
+					RecordedAt: request.CreatedAt.Add(time.Minute),
+				}, nil
+			}
+
+			first, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence}, request.CreatedAt.Add(time.Second), nil, invoke)
+			if !errors.Is(err, ErrTransportRetrySafe) || first.State != TransportRequested {
+				t.Fatalf("first = %#v, %v, want requested retry-safe", first, err)
+			}
+			second, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence}, request.CreatedAt.Add(2*time.Second), nil, invoke)
+			if err != nil || second.State != TransportCommitted {
+				t.Fatalf("second = %#v, %v, want committed", second, err)
+			}
+			if got := effects[second.NudgeID]; got != tc.wantEffects {
+				t.Fatalf("physical effects = %d, want %d", got, tc.wantEffects)
+			}
+		})
+	}
+}
+
+func TestExecuteTransportRetrySafeResponseLossIsBoundedAndAuditable(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	request := TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 20, 0, 0, time.UTC),
+	}
+	invoke := func(context.Context, TransportAttempt) (TransportReceipt, error) {
+		return TransportReceipt{}, fmt.Errorf("%w: response lost", ErrTransportRetrySafe)
+	}
+	first, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence}, request.CreatedAt, nil, invoke)
+	if !errors.Is(err, ErrTransportRetrySafe) || first.State != TransportRequested || first.InvocationCount != 1 || first.InvocationStartedAt.IsZero() {
+		t.Fatalf("first = %#v, %v", first, err)
+	}
+	second, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence}, request.CreatedAt.Add(time.Second), nil, invoke)
+	if !errors.Is(err, ErrTransportRetrySafe) || second.State != TransportUnknownExternalState || second.InvocationCount != 2 {
+		t.Fatalf("second = %#v, %v", second, err)
 	}
 }
 

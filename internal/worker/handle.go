@@ -91,6 +91,20 @@ type Handle interface {
 	LiveObservationHandle
 }
 
+// HasExactSessionReceipt reports whether handle is backed by the canonical
+// session front door and can therefore bind a nudge receipt to a session bead.
+// Runtime-only handles cannot provide that identity.
+func HasExactSessionReceipt(handle Handle) bool {
+	sessionHandle, ok := handle.(*SessionHandle)
+	return ok && sessionHandle != nil
+}
+
+// SupportsDestinationAtomicNudge reports exact-session destination receipt support.
+func SupportsDestinationAtomicNudge(handle Handle) bool {
+	supported, ok := handle.(interface{ SupportsStableNudge() bool })
+	return ok && supported.SupportsStableNudge()
+}
+
 // Phase captures the worker-level lifecycle state surfaced by [Handle.State].
 type Phase string
 
@@ -179,7 +193,8 @@ type NudgeRequest struct {
 	Wake     NudgeWakePolicy `json:"wake,omitempty"`
 	// EffectID is a caller-owned stable identity carried into the provider
 	// acceptance receipt. It is not message content or an idempotency claim.
-	EffectID string `json:"effect_id,omitempty"`
+	EffectID       string `json:"effect_id,omitempty"`
+	CommitBoundary string `json:"commit_boundary,omitempty"`
 }
 
 // NudgeResult reports whether the requested live delivery actually happened.
@@ -199,18 +214,24 @@ type NudgeResult struct {
 // idempotency.
 const NudgeCommitBoundaryProviderReturn = "provider-nudge-return"
 
+// NudgeCommitBoundaryDestinationAtomic proves atomic destination effect+receipt persistence.
+const NudgeCommitBoundaryDestinationAtomic = "destination-atomic-effect-receipt"
+
 // NudgeAcceptanceReceipt binds provider success to one stable effect and exact
 // runtime target without including nudge text.
 type NudgeAcceptanceReceipt struct {
-	Version           int       `json:"version"`
-	EffectID          string    `json:"effect_id"`
-	TargetSessionRef  string    `json:"target_session_ref,omitempty"`
-	TargetRuntimeName string    `json:"target_runtime_name"`
-	Provider          string    `json:"provider"`
-	Transport         string    `json:"transport"`
-	CommitBoundary    string    `json:"commit_boundary"`
-	AcceptedAt        time.Time `json:"accepted_at"`
-	ReceiptSHA256     string    `json:"receipt_sha256"`
+	Version                  int       `json:"version"`
+	EffectID                 string    `json:"effect_id"`
+	TargetSessionRef         string    `json:"target_session_ref,omitempty"`
+	TargetRuntimeName        string    `json:"target_runtime_name"`
+	Provider                 string    `json:"provider"`
+	Transport                string    `json:"transport"`
+	CommitBoundary           string    `json:"commit_boundary"`
+	AcceptedAt               time.Time `json:"accepted_at"`
+	ReceiptSHA256            string    `json:"receipt_sha256"`
+	ContentSHA256            string    `json:"content_sha256,omitempty"`
+	DestinationRef           string    `json:"destination_ref,omitempty"`
+	DestinationReceiptSHA256 string    `json:"destination_receipt_sha256,omitempty"`
 }
 
 // NudgeUndeliveredReason is the closed set of reasons a live nudge did not

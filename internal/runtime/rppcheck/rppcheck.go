@@ -14,6 +14,8 @@ package rppcheck
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -193,6 +195,7 @@ func (c *checker) runOpTimeout(ctx context.Context, timeout time.Duration, stdin
 var knownCapabilities = map[string]string{
 	runtime.ProtocolCapabilityReportAttachment: "is-attached",
 	runtime.ProtocolCapabilityReportActivity:   "get-last-activity",
+	runtime.ProtocolCapabilityStableNudge:      "nudge-stable",
 }
 
 const handshakeCheck = "protocol handshake"
@@ -340,6 +343,9 @@ func (c *checker) remainingCheckNames() []string {
 			names = append(names, "optional: "+knownCapabilities[capability])
 		}
 	}
+	if c.result.Protocol.Has(runtime.ProtocolCapabilityStableNudge) {
+		names = append(names, "capability effect.nudge-idempotent: nudge-stable")
+	}
 	return append(names,
 		"optional: process-alive",
 		"optional: nudge",
@@ -367,12 +373,57 @@ func (c *checker) skipRemainingChecks(detail string) {
 func (c *checker) checkSessionOps(ctx context.Context, name string) {
 	c.checkCapabilityOp(ctx, runtime.ProtocolCapabilityReportAttachment, name, c.validateIsAttached)
 	c.checkCapabilityOp(ctx, runtime.ProtocolCapabilityReportActivity, name, c.validateLastActivity)
+	c.checkStableNudge(ctx, name)
 
 	c.checkProcessAlive(ctx, name)
 	c.checkOptional(ctx, "optional: nudge", []byte("gc runtime check probe"), "nudge", name)
 	c.checkMetadataRoundTrip(ctx, name)
 	c.checkOptional(ctx, "optional: peek", nil, "peek", name, "10")
 	c.checkListRunning(ctx, name)
+}
+
+func (c *checker) checkStableNudge(ctx context.Context, name string) {
+	if !c.result.Protocol.Has(runtime.ProtocolCapabilityStableNudge) {
+		return
+	}
+	effectSum := sha256.Sum256([]byte("gc-rpp-stable-nudge-v1\x00" + name))
+	effectID := "mail-nudge-" + hex.EncodeToString(effectSum[:])
+	content := runtime.TextContent("gc runtime check stable nudge probe")
+	payload, err := json.Marshal(runtime.StableNudgeRequest{Version: 1, EffectID: effectID, Content: content})
+	if err != nil {
+		c.record("capability effect.nudge-idempotent: nudge-stable", StatusFail, err.Error())
+		return
+	}
+	res := c.runOp(ctx, payload, "nudge-stable", name, effectID)
+	check := "capability effect.nudge-idempotent: nudge-stable"
+	if res.unsupported || res.err != nil {
+		detail := "declared capability operation is unsupported"
+		if res.err != nil {
+			detail = res.err.Error()
+		}
+		c.record(check, StatusFail, detail)
+		return
+	}
+	var receipt runtime.StableNudgeReceipt
+	if err := json.Unmarshal([]byte(res.stdout), &receipt); err != nil {
+		c.record(check, StatusFail, "invalid stable nudge receipt: "+err.Error())
+		return
+	}
+	hash, hashErr := runtime.StableNudgeContentSHA256(content)
+	if hashErr != nil {
+		c.record(check, StatusFail, hashErr.Error())
+		return
+	}
+	if err := receipt.Validate(); err != nil || receipt.EffectID != effectID || receipt.TargetRuntimeName != name || receipt.ContentSHA256 != hash {
+		c.record(check, StatusFail, "stable nudge receipt does not bind the exact request")
+		return
+	}
+	replay := c.runOp(ctx, payload, "nudge-stable", name, effectID)
+	if replay.err != nil || replay.unsupported || replay.stdout != res.stdout {
+		c.record(check, StatusFail, "stable nudge replay did not return the byte-identical receipt")
+		return
+	}
+	c.record(check, StatusPass, "destination-atomic receipt validated")
 }
 
 // checkCapabilityOp runs the op a capability promises. Declared: exit 2
