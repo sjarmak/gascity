@@ -3192,6 +3192,321 @@
         ],
         "type": "object"
       },
+      "FencedExecutionArtifact": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "uri": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "uri",
+          "sha256"
+        ],
+        "type": "object"
+      },
+      "FencedExecutionCancelInput": {
+        "additionalProperties": false,
+        "properties": {
+          "bead_id": {
+            "type": "string"
+          },
+          "city_id": {
+            "type": "string"
+          },
+          "claim_token": {
+            "type": "string"
+          },
+          "execution_id": {
+            "type": "string"
+          },
+          "formula_rig": {
+            "type": "string"
+          },
+          "generation": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "target_session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city_id",
+          "formula_rig",
+          "bead_id",
+          "generation",
+          "claim_token",
+          "target_session_id",
+          "execution_id"
+        ],
+        "type": "object"
+      },
+      "FencedExecutionCancelOutputBody": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/FencedExecutionError"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/FencedExecutionStopReceipt"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
+      },
+      "FencedExecutionError": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "type": "object"
+      },
+      "FencedExecutionExecuteOutputBody": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/FencedExecutionError"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "result": {
+            "$ref": "#/components/schemas/FencedExecutionResult"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
+      },
+      "FencedExecutionInput": {
+        "additionalProperties": false,
+        "properties": {
+          "bead_id": {
+            "type": "string"
+          },
+          "city_id": {
+            "type": "string"
+          },
+          "claim_token": {
+            "type": "string"
+          },
+          "formula_hash": {
+            "type": "string"
+          },
+          "formula_name": {
+            "type": "string"
+          },
+          "formula_rig": {
+            "type": "string"
+          },
+          "formula_root_id": {
+            "type": "string"
+          },
+          "formula_step_key": {
+            "type": "string"
+          },
+          "formula_version": {
+            "type": "string"
+          },
+          "generation": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "target_session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city_id",
+          "run_id",
+          "bead_id",
+          "generation",
+          "formula_name",
+          "formula_hash",
+          "formula_version",
+          "formula_root_id",
+          "formula_step_key",
+          "formula_rig",
+          "claim_token",
+          "target_session_id"
+        ],
+        "type": "object"
+      },
+      "FencedExecutionReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "attached": {
+            "type": "boolean"
+          },
+          "execution_id": {
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "process": {
+            "$ref": "#/components/schemas/FencedProcessIdentity"
+          },
+          "request_hash": {
+            "type": "string"
+          },
+          "target": {
+            "$ref": "#/components/schemas/FencedExecutionTarget"
+          }
+        },
+        "required": [
+          "execution_id",
+          "operation_id",
+          "request_hash",
+          "target",
+          "process",
+          "attached"
+        ],
+        "type": "object"
+      },
+      "FencedExecutionResolveOutputBody": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/FencedExecutionError"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/FencedExecutionReceipt"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
+      },
+      "FencedExecutionResult": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_refs": {
+            "items": {
+              "$ref": "#/components/schemas/FencedExecutionArtifact"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/FencedExecutionReceipt"
+          }
+        },
+        "required": [
+          "receipt",
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "FencedExecutionStopReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "receipt": {
+            "$ref": "#/components/schemas/FencedExecutionReceipt"
+          },
+          "revoked": {
+            "type": "boolean"
+          },
+          "stopped": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "receipt",
+          "revoked",
+          "stopped"
+        ],
+        "type": "object"
+      },
+      "FencedExecutionTarget": {
+        "additionalProperties": false,
+        "properties": {
+          "configured_identity": {
+            "type": "string"
+          },
+          "continuation_epoch": {
+            "type": "string"
+          },
+          "generation": {
+            "type": "string"
+          },
+          "instance_token": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "session_name": {
+            "type": "string"
+          },
+          "started_config_hash": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "session_name",
+          "configured_identity",
+          "generation",
+          "continuation_epoch",
+          "instance_token",
+          "started_config_hash"
+        ],
+        "type": "object"
+      },
+      "FencedProcessIdentity": {
+        "additionalProperties": false,
+        "properties": {
+          "pid": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "process_group_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "start_identity": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pid",
+          "process_group_id",
+          "start_identity"
+        ],
+        "type": "object"
+      },
       "FormulaDetailResponse": {
         "additionalProperties": false,
         "properties": {
@@ -47006,6 +47321,360 @@
           }
         },
         "summary": "Get v0 city by city name status"
+      }
+    },
+    "/v0/city/{cityName}/temporal/fenced-executions/cancel": {
+      "post": {
+        "operationId": "post-v0-city-by-city-name-temporal-fenced-executions-cancel",
+        "parameters": [
+          {
+            "description": "Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.",
+            "in": "header",
+            "name": "X-GC-Request",
+            "required": true,
+            "schema": {
+              "description": "Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "City name.",
+            "in": "path",
+            "name": "cityName",
+            "required": true,
+            "schema": {
+              "description": "City name.",
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FencedExecutionCancelInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FencedExecutionCancelOutputBody"
+                }
+              }
+            },
+            "description": "OK",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Unprocessable Entity",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          }
+        },
+        "summary": "Post v0 city by city name temporal fenced executions cancel"
+      }
+    },
+    "/v0/city/{cityName}/temporal/fenced-executions/execute": {
+      "post": {
+        "operationId": "post-v0-city-by-city-name-temporal-fenced-executions-execute",
+        "parameters": [
+          {
+            "description": "Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.",
+            "in": "header",
+            "name": "X-GC-Request",
+            "required": true,
+            "schema": {
+              "description": "Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "City name.",
+            "in": "path",
+            "name": "cityName",
+            "required": true,
+            "schema": {
+              "description": "City name.",
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FencedExecutionInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FencedExecutionExecuteOutputBody"
+                }
+              }
+            },
+            "description": "OK",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Unprocessable Entity",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          }
+        },
+        "summary": "Post v0 city by city name temporal fenced executions execute"
+      }
+    },
+    "/v0/city/{cityName}/temporal/fenced-executions/resolve": {
+      "post": {
+        "operationId": "post-v0-city-by-city-name-temporal-fenced-executions-resolve",
+        "parameters": [
+          {
+            "description": "Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.",
+            "in": "header",
+            "name": "X-GC-Request",
+            "required": true,
+            "schema": {
+              "description": "Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "City name.",
+            "in": "path",
+            "name": "cityName",
+            "required": true,
+            "schema": {
+              "description": "City name.",
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FencedExecutionInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FencedExecutionResolveOutputBody"
+                }
+              }
+            },
+            "description": "OK",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Unprocessable Entity",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "headers": {
+              "X-GC-Request-Id": {
+                "$ref": "#/components/headers/X-GC-Request-Id"
+              }
+            }
+          }
+        },
+        "summary": "Post v0 city by city name temporal fenced executions resolve"
       }
     },
     "/v0/city/{cityName}/unregister": {

@@ -107,6 +107,17 @@ func (f *Factory) UsageSink() usage.Sink {
 	return f.usageSink
 }
 
+// FencedExecutionCoordinator returns the controller-owned formula execution
+// service over this factory's canonical session store/provider wiring.
+func (f *Factory) FencedExecutionCoordinator(workStore beads.Store) (*FencedExecutionCoordinator, error) {
+	return NewFencedExecutionCoordinator(FencedExecutionCoordinatorConfig{
+		WorkStore:             workStore,
+		SessionStore:          f.store,
+		Provider:              f.provider,
+		ResolveSessionRuntime: f.resolveSessionRuntime,
+	})
+}
+
 // Session returns a worker-owned session handle backed by the factory's
 // session manager and transcript search paths.
 func (f *Factory) Session(spec SessionSpec) (*SessionHandle, error) {

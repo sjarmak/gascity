@@ -245,6 +245,10 @@ func (sm *SupervisorMux) registerCityRoutes() {
 	}, (*Server).humaHandleMailReply)
 	cityDelete(sm, "/mail/{id}", (*Server).humaHandleMailDelete, errorStatuses(http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound))
 
+	cityPost(sm, "/temporal/fenced-executions/resolve", (*Server).humaHandleFencedExecutionResolve, errorStatuses(http.StatusUnauthorized, http.StatusForbidden))
+	cityPost(sm, "/temporal/fenced-executions/execute", (*Server).humaHandleFencedExecutionExecute, errorStatuses(http.StatusUnauthorized, http.StatusForbidden))
+	cityPost(sm, "/temporal/fenced-executions/cancel", (*Server).humaHandleFencedExecutionCancel, errorStatuses(http.StatusUnauthorized, http.StatusForbidden))
+
 	// Convoys.
 	// 400: invalid pagination cursor (invalid-cursor problem type).
 	cityGet(sm, "/convoys", (*Server).humaHandleConvoyList, errorStatuses(http.StatusBadRequest, http.StatusNotFound, http.StatusServiceUnavailable), listOrder("(created_at DESC, id DESC) — newest convoys first"))

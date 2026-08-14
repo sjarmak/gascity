@@ -116,6 +116,26 @@ that window return `404` with the typed not-found problem detail. The
 city list and lifecycle events are the readiness boundary for clients
 that need to issue per-city requests.
 
+Formula-agent execution is an effectful controller-owned mutation. The typed
+`/temporal/fenced-executions/{resolve,execute,cancel}` routes validate the
+canonical work claim and exact session authority before using the optional
+`runtime.FencedExecutionProvider` capability. A provider receipt binds the
+stable operation and request hash, configured session identity, generation,
+continuation epoch, instance token, config digest, and exact process
+PID/group/start identity. Cancellation durably records revocation before an
+exact process-group stop. Providers without this optional capability return a
+typed unsupported error; the controller does not compose legacy wake/kill
+operations or select a different provider.
+
+The raw work claim capability is accepted only on the authenticated loopback
+request so it can be compared with canonical Beads state. Durable bindings,
+API errors, and event/result records contain only its SHA-256 digest (through
+the stable request hash), never the raw capability. The local subprocess
+provider is the production-capable implementation because it owns the exact
+child process. Other session providers remain valid for ordinary sessions but
+cannot be activated for fenced formula execution unless they implement the
+same closed capability.
+
 ### The generated Go client
 
 `internal/api/genclient/` has three in-tree consumer categories,

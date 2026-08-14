@@ -1208,6 +1208,96 @@ export type FanoutPolicy = {
     MaxTotalPeerDeliveries: number;
 };
 
+export type FencedExecutionArtifact = {
+    kind: string;
+    sha256: string;
+    uri: string;
+};
+
+export type FencedExecutionCancelInput = {
+    bead_id: string;
+    city_id: string;
+    claim_token: string;
+    execution_id: string;
+    formula_rig: string;
+    generation: number;
+    target_session_id: string;
+};
+
+export type FencedExecutionCancelOutputBody = {
+    error?: FencedExecutionError;
+    ok: boolean;
+    receipt?: FencedExecutionStopReceipt;
+};
+
+export type FencedExecutionError = {
+    code: string;
+};
+
+export type FencedExecutionExecuteOutputBody = {
+    error?: FencedExecutionError;
+    ok: boolean;
+    result?: FencedExecutionResult;
+};
+
+export type FencedExecutionInput = {
+    bead_id: string;
+    city_id: string;
+    claim_token: string;
+    formula_hash: string;
+    formula_name: string;
+    formula_rig: string;
+    formula_root_id: string;
+    formula_step_key: string;
+    formula_version: string;
+    generation: number;
+    run_id: string;
+    target_session_id: string;
+};
+
+export type FencedExecutionReceipt = {
+    attached: boolean;
+    execution_id: string;
+    operation_id: string;
+    process: FencedProcessIdentity;
+    request_hash: string;
+    target: FencedExecutionTarget;
+};
+
+export type FencedExecutionResolveOutputBody = {
+    error?: FencedExecutionError;
+    ok: boolean;
+    receipt?: FencedExecutionReceipt;
+};
+
+export type FencedExecutionResult = {
+    artifact_refs?: Array<FencedExecutionArtifact> | null;
+    outcome: string;
+    receipt: FencedExecutionReceipt;
+};
+
+export type FencedExecutionStopReceipt = {
+    receipt: FencedExecutionReceipt;
+    revoked: boolean;
+    stopped: boolean;
+};
+
+export type FencedExecutionTarget = {
+    configured_identity: string;
+    continuation_epoch: string;
+    generation: string;
+    instance_token: string;
+    session_id: string;
+    session_name: string;
+    started_config_hash: string;
+};
+
+export type FencedProcessIdentity = {
+    pid: number;
+    process_group_id: number;
+    start_identity: string;
+};
+
 export type FormulaDetailResponse = {
     deps: Array<FormulaPreviewEdgeResponse> | null;
     description: string;
@@ -18140,6 +18230,150 @@ export type GetV0CityByCityNameStatusResponses = {
 };
 
 export type GetV0CityByCityNameStatusResponse = GetV0CityByCityNameStatusResponses[keyof GetV0CityByCityNameStatusResponses];
+
+export type PostV0CityByCityNameTemporalFencedExecutionsCancelData = {
+    body: FencedExecutionCancelInput;
+    headers: {
+        /**
+         * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+         */
+        'X-GC-Request': string;
+    };
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/temporal/fenced-executions/cancel';
+};
+
+export type PostV0CityByCityNameTemporalFencedExecutionsCancelErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ErrorModel;
+    /**
+     * Forbidden
+     */
+    403: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+};
+
+export type PostV0CityByCityNameTemporalFencedExecutionsCancelError = PostV0CityByCityNameTemporalFencedExecutionsCancelErrors[keyof PostV0CityByCityNameTemporalFencedExecutionsCancelErrors];
+
+export type PostV0CityByCityNameTemporalFencedExecutionsCancelResponses = {
+    /**
+     * OK
+     */
+    200: FencedExecutionCancelOutputBody;
+};
+
+export type PostV0CityByCityNameTemporalFencedExecutionsCancelResponse = PostV0CityByCityNameTemporalFencedExecutionsCancelResponses[keyof PostV0CityByCityNameTemporalFencedExecutionsCancelResponses];
+
+export type PostV0CityByCityNameTemporalFencedExecutionsExecuteData = {
+    body: FencedExecutionInput;
+    headers: {
+        /**
+         * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+         */
+        'X-GC-Request': string;
+    };
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/temporal/fenced-executions/execute';
+};
+
+export type PostV0CityByCityNameTemporalFencedExecutionsExecuteErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ErrorModel;
+    /**
+     * Forbidden
+     */
+    403: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+};
+
+export type PostV0CityByCityNameTemporalFencedExecutionsExecuteError = PostV0CityByCityNameTemporalFencedExecutionsExecuteErrors[keyof PostV0CityByCityNameTemporalFencedExecutionsExecuteErrors];
+
+export type PostV0CityByCityNameTemporalFencedExecutionsExecuteResponses = {
+    /**
+     * OK
+     */
+    200: FencedExecutionExecuteOutputBody;
+};
+
+export type PostV0CityByCityNameTemporalFencedExecutionsExecuteResponse = PostV0CityByCityNameTemporalFencedExecutionsExecuteResponses[keyof PostV0CityByCityNameTemporalFencedExecutionsExecuteResponses];
+
+export type PostV0CityByCityNameTemporalFencedExecutionsResolveData = {
+    body: FencedExecutionInput;
+    headers: {
+        /**
+         * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+         */
+        'X-GC-Request': string;
+    };
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/temporal/fenced-executions/resolve';
+};
+
+export type PostV0CityByCityNameTemporalFencedExecutionsResolveErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ErrorModel;
+    /**
+     * Forbidden
+     */
+    403: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+};
+
+export type PostV0CityByCityNameTemporalFencedExecutionsResolveError = PostV0CityByCityNameTemporalFencedExecutionsResolveErrors[keyof PostV0CityByCityNameTemporalFencedExecutionsResolveErrors];
+
+export type PostV0CityByCityNameTemporalFencedExecutionsResolveResponses = {
+    /**
+     * OK
+     */
+    200: FencedExecutionResolveOutputBody;
+};
+
+export type PostV0CityByCityNameTemporalFencedExecutionsResolveResponse = PostV0CityByCityNameTemporalFencedExecutionsResolveResponses[keyof PostV0CityByCityNameTemporalFencedExecutionsResolveResponses];
 
 export type PostV0CityByCityNameUnregisterData = {
     body?: never;

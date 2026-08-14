@@ -42,7 +42,8 @@ type Provider struct {
 	mu       sync.Mutex
 	dir      string                  // socket/meta file directory
 	procs    map[string]*sessionConn // in-process tracking
-	workDirs map[string]string       // session name → workDir (for CopyTo)
+	fenced   map[string]*fencedExecution
+	workDirs map[string]string // session name → workDir (for CopyTo)
 	ops      providerOps
 }
 

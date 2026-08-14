@@ -579,6 +579,96 @@ export const zConversationGroupRecord = z.object({
     SchemaVersion: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' })
 });
 
+export const zFencedExecutionArtifact = z.object({
+    kind: z.string(),
+    sha256: z.string(),
+    uri: z.string()
+});
+
+export const zFencedExecutionCancelInput = z.object({
+    bead_id: z.string(),
+    city_id: z.string(),
+    claim_token: z.string(),
+    execution_id: z.string(),
+    formula_rig: z.string(),
+    generation: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    target_session_id: z.string()
+});
+
+export const zFencedExecutionError = z.object({
+    code: z.string()
+});
+
+export const zFencedExecutionInput = z.object({
+    bead_id: z.string(),
+    city_id: z.string(),
+    claim_token: z.string(),
+    formula_hash: z.string(),
+    formula_name: z.string(),
+    formula_rig: z.string(),
+    formula_root_id: z.string(),
+    formula_step_key: z.string(),
+    formula_version: z.string(),
+    generation: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    run_id: z.string(),
+    target_session_id: z.string()
+});
+
+export const zFencedExecutionTarget = z.object({
+    configured_identity: z.string(),
+    continuation_epoch: z.string(),
+    generation: z.string(),
+    instance_token: z.string(),
+    session_id: z.string(),
+    session_name: z.string(),
+    started_config_hash: z.string()
+});
+
+export const zFencedProcessIdentity = z.object({
+    pid: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    process_group_id: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    start_identity: z.string()
+});
+
+export const zFencedExecutionReceipt = z.object({
+    attached: z.boolean(),
+    execution_id: z.string(),
+    operation_id: z.string(),
+    process: zFencedProcessIdentity,
+    request_hash: z.string(),
+    target: zFencedExecutionTarget
+});
+
+export const zFencedExecutionResolveOutputBody = z.object({
+    error: zFencedExecutionError.optional(),
+    ok: z.boolean(),
+    receipt: zFencedExecutionReceipt.optional()
+});
+
+export const zFencedExecutionResult = z.object({
+    artifact_refs: z.array(zFencedExecutionArtifact).nullish(),
+    outcome: z.string(),
+    receipt: zFencedExecutionReceipt
+});
+
+export const zFencedExecutionExecuteOutputBody = z.object({
+    error: zFencedExecutionError.optional(),
+    ok: z.boolean(),
+    result: zFencedExecutionResult.optional()
+});
+
+export const zFencedExecutionStopReceipt = z.object({
+    receipt: zFencedExecutionReceipt,
+    revoked: z.boolean(),
+    stopped: z.boolean()
+});
+
+export const zFencedExecutionCancelOutputBody = z.object({
+    error: zFencedExecutionError.optional(),
+    ok: z.boolean(),
+    receipt: zFencedExecutionStopReceipt.optional()
+});
+
 export const zFormulaPreviewBody = z.object({
     scope_kind: z.string().optional(),
     scope_ref: z.string().optional(),
@@ -9186,6 +9276,51 @@ export const zGetV0CityByCityNameStatusQuery = z.object({
  * OK
  */
 export const zGetV0CityByCityNameStatusResponse = zStatusBody;
+
+export const zPostV0CityByCityNameTemporalFencedExecutionsCancelBody = zFencedExecutionCancelInput;
+
+export const zPostV0CityByCityNameTemporalFencedExecutionsCancelHeaders = z.object({
+    'X-GC-Request': z.string().min(1)
+});
+
+export const zPostV0CityByCityNameTemporalFencedExecutionsCancelPath = z.object({
+    cityName: z.string().min(1).regex(/\S/)
+});
+
+/**
+ * OK
+ */
+export const zPostV0CityByCityNameTemporalFencedExecutionsCancelResponse = zFencedExecutionCancelOutputBody;
+
+export const zPostV0CityByCityNameTemporalFencedExecutionsExecuteBody = zFencedExecutionInput;
+
+export const zPostV0CityByCityNameTemporalFencedExecutionsExecuteHeaders = z.object({
+    'X-GC-Request': z.string().min(1)
+});
+
+export const zPostV0CityByCityNameTemporalFencedExecutionsExecutePath = z.object({
+    cityName: z.string().min(1).regex(/\S/)
+});
+
+/**
+ * OK
+ */
+export const zPostV0CityByCityNameTemporalFencedExecutionsExecuteResponse = zFencedExecutionExecuteOutputBody;
+
+export const zPostV0CityByCityNameTemporalFencedExecutionsResolveBody = zFencedExecutionInput;
+
+export const zPostV0CityByCityNameTemporalFencedExecutionsResolveHeaders = z.object({
+    'X-GC-Request': z.string().min(1)
+});
+
+export const zPostV0CityByCityNameTemporalFencedExecutionsResolvePath = z.object({
+    cityName: z.string().min(1).regex(/\S/)
+});
+
+/**
+ * OK
+ */
+export const zPostV0CityByCityNameTemporalFencedExecutionsResolveResponse = zFencedExecutionResolveOutputBody;
 
 export const zPostV0CityByCityNameUnregisterHeaders = z.object({
     'X-GC-Request': z.string().min(1)

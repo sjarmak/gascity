@@ -1963,6 +1963,108 @@ type FanoutPolicy struct {
 	MaxTotalPeerDeliveries     int64 `json:"MaxTotalPeerDeliveries"`
 }
 
+// FencedExecutionArtifact defines model for FencedExecutionArtifact.
+type FencedExecutionArtifact struct {
+	Kind   string `json:"kind"`
+	Sha256 string `json:"sha256"`
+	Uri    string `json:"uri"`
+}
+
+// FencedExecutionCancelInput defines model for FencedExecutionCancelInput.
+type FencedExecutionCancelInput struct {
+	BeadId          string `json:"bead_id"`
+	CityId          string `json:"city_id"`
+	ClaimToken      string `json:"claim_token"`
+	ExecutionId     string `json:"execution_id"`
+	FormulaRig      string `json:"formula_rig"`
+	Generation      int64  `json:"generation"`
+	TargetSessionId string `json:"target_session_id"`
+}
+
+// FencedExecutionCancelOutputBody defines model for FencedExecutionCancelOutputBody.
+type FencedExecutionCancelOutputBody struct {
+	Error   *FencedExecutionError       `json:"error,omitempty"`
+	Ok      bool                        `json:"ok"`
+	Receipt *FencedExecutionStopReceipt `json:"receipt,omitempty"`
+}
+
+// FencedExecutionError defines model for FencedExecutionError.
+type FencedExecutionError struct {
+	Code string `json:"code"`
+}
+
+// FencedExecutionExecuteOutputBody defines model for FencedExecutionExecuteOutputBody.
+type FencedExecutionExecuteOutputBody struct {
+	Error  *FencedExecutionError  `json:"error,omitempty"`
+	Ok     bool                   `json:"ok"`
+	Result *FencedExecutionResult `json:"result,omitempty"`
+}
+
+// FencedExecutionInput defines model for FencedExecutionInput.
+type FencedExecutionInput struct {
+	BeadId          string `json:"bead_id"`
+	CityId          string `json:"city_id"`
+	ClaimToken      string `json:"claim_token"`
+	FormulaHash     string `json:"formula_hash"`
+	FormulaName     string `json:"formula_name"`
+	FormulaRig      string `json:"formula_rig"`
+	FormulaRootId   string `json:"formula_root_id"`
+	FormulaStepKey  string `json:"formula_step_key"`
+	FormulaVersion  string `json:"formula_version"`
+	Generation      int64  `json:"generation"`
+	RunId           string `json:"run_id"`
+	TargetSessionId string `json:"target_session_id"`
+}
+
+// FencedExecutionReceipt defines model for FencedExecutionReceipt.
+type FencedExecutionReceipt struct {
+	Attached    bool                  `json:"attached"`
+	ExecutionId string                `json:"execution_id"`
+	OperationId string                `json:"operation_id"`
+	Process     FencedProcessIdentity `json:"process"`
+	RequestHash string                `json:"request_hash"`
+	Target      FencedExecutionTarget `json:"target"`
+}
+
+// FencedExecutionResolveOutputBody defines model for FencedExecutionResolveOutputBody.
+type FencedExecutionResolveOutputBody struct {
+	Error   *FencedExecutionError   `json:"error,omitempty"`
+	Ok      bool                    `json:"ok"`
+	Receipt *FencedExecutionReceipt `json:"receipt,omitempty"`
+}
+
+// FencedExecutionResult defines model for FencedExecutionResult.
+type FencedExecutionResult struct {
+	ArtifactRefs *[]FencedExecutionArtifact `json:"artifact_refs,omitempty"`
+	Outcome      string                     `json:"outcome"`
+	Receipt      FencedExecutionReceipt     `json:"receipt"`
+}
+
+// FencedExecutionStopReceipt defines model for FencedExecutionStopReceipt.
+type FencedExecutionStopReceipt struct {
+	Receipt FencedExecutionReceipt `json:"receipt"`
+	Revoked bool                   `json:"revoked"`
+	Stopped bool                   `json:"stopped"`
+}
+
+// FencedExecutionTarget defines model for FencedExecutionTarget.
+type FencedExecutionTarget struct {
+	ConfiguredIdentity string `json:"configured_identity"`
+	ContinuationEpoch  string `json:"continuation_epoch"`
+	Generation         string `json:"generation"`
+	InstanceToken      string `json:"instance_token"`
+	SessionId          string `json:"session_id"`
+	SessionName        string `json:"session_name"`
+	StartedConfigHash  string `json:"started_config_hash"`
+}
+
+// FencedProcessIdentity defines model for FencedProcessIdentity.
+type FencedProcessIdentity struct {
+	Pid            int64  `json:"pid"`
+	ProcessGroupId int64  `json:"process_group_id"`
+	StartIdentity  string `json:"start_identity"`
+}
+
 // FormulaDetailResponse defines model for FormulaDetailResponse.
 type FormulaDetailResponse struct {
 	Deps        *[]FormulaPreviewEdgeResponse `json:"deps"`
@@ -9591,6 +9693,24 @@ type GetV0CityByCityNameStatusParams struct {
 	Lite *bool `form:"lite,omitempty" json:"lite,omitempty"`
 }
 
+// PostV0CityByCityNameTemporalFencedExecutionsCancelParams defines parameters for PostV0CityByCityNameTemporalFencedExecutionsCancel.
+type PostV0CityByCityNameTemporalFencedExecutionsCancelParams struct {
+	// XGCRequest Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+	XGCRequest string `json:"X-GC-Request"`
+}
+
+// PostV0CityByCityNameTemporalFencedExecutionsExecuteParams defines parameters for PostV0CityByCityNameTemporalFencedExecutionsExecute.
+type PostV0CityByCityNameTemporalFencedExecutionsExecuteParams struct {
+	// XGCRequest Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+	XGCRequest string `json:"X-GC-Request"`
+}
+
+// PostV0CityByCityNameTemporalFencedExecutionsResolveParams defines parameters for PostV0CityByCityNameTemporalFencedExecutionsResolve.
+type PostV0CityByCityNameTemporalFencedExecutionsResolveParams struct {
+	// XGCRequest Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+	XGCRequest string `json:"X-GC-Request"`
+}
+
 // PostV0CityByCityNameUnregisterParams defines parameters for PostV0CityByCityNameUnregister.
 type PostV0CityByCityNameUnregisterParams struct {
 	// XGCRequest Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
@@ -9806,6 +9926,15 @@ type CreateSessionJSONRequestBody = SessionCreateBody
 
 // PostV0CityByCityNameSlingJSONRequestBody defines body for PostV0CityByCityNameSling for application/json ContentType.
 type PostV0CityByCityNameSlingJSONRequestBody = SlingInputBody
+
+// PostV0CityByCityNameTemporalFencedExecutionsCancelJSONRequestBody defines body for PostV0CityByCityNameTemporalFencedExecutionsCancel for application/json ContentType.
+type PostV0CityByCityNameTemporalFencedExecutionsCancelJSONRequestBody = FencedExecutionCancelInput
+
+// PostV0CityByCityNameTemporalFencedExecutionsExecuteJSONRequestBody defines body for PostV0CityByCityNameTemporalFencedExecutionsExecute for application/json ContentType.
+type PostV0CityByCityNameTemporalFencedExecutionsExecuteJSONRequestBody = FencedExecutionInput
+
+// PostV0CityByCityNameTemporalFencedExecutionsResolveJSONRequestBody defines body for PostV0CityByCityNameTemporalFencedExecutionsResolve for application/json ContentType.
+type PostV0CityByCityNameTemporalFencedExecutionsResolveJSONRequestBody = FencedExecutionInput
 
 // AsAdapterEventPayload returns the union data inside the EventPayload as a AdapterEventPayload
 func (t EventPayload) AsAdapterEventPayload() (AdapterEventPayload, error) {
@@ -18861,6 +18990,21 @@ type ClientInterface interface {
 	// GetV0CityByCityNameStatus request
 	GetV0CityByCityNameStatus(ctx context.Context, cityName string, params *GetV0CityByCityNameStatusParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// PostV0CityByCityNameTemporalFencedExecutionsCancelWithBody request with any body
+	PostV0CityByCityNameTemporalFencedExecutionsCancelWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsCancelParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	PostV0CityByCityNameTemporalFencedExecutionsCancel(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsCancelParams, body PostV0CityByCityNameTemporalFencedExecutionsCancelJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// PostV0CityByCityNameTemporalFencedExecutionsExecuteWithBody request with any body
+	PostV0CityByCityNameTemporalFencedExecutionsExecuteWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsExecuteParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	PostV0CityByCityNameTemporalFencedExecutionsExecute(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsExecuteParams, body PostV0CityByCityNameTemporalFencedExecutionsExecuteJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// PostV0CityByCityNameTemporalFencedExecutionsResolveWithBody request with any body
+	PostV0CityByCityNameTemporalFencedExecutionsResolveWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsResolveParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	PostV0CityByCityNameTemporalFencedExecutionsResolve(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsResolveParams, body PostV0CityByCityNameTemporalFencedExecutionsResolveJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// PostV0CityByCityNameUnregister request
 	PostV0CityByCityNameUnregister(ctx context.Context, cityName string, params *PostV0CityByCityNameUnregisterParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -21246,6 +21390,78 @@ func (c *Client) PostV0CityByCityNameSling(ctx context.Context, cityName string,
 
 func (c *Client) GetV0CityByCityNameStatus(ctx context.Context, cityName string, params *GetV0CityByCityNameStatusParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewGetV0CityByCityNameStatusRequest(c.Server, cityName, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PostV0CityByCityNameTemporalFencedExecutionsCancelWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsCancelParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV0CityByCityNameTemporalFencedExecutionsCancelRequestWithBody(c.Server, cityName, params, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PostV0CityByCityNameTemporalFencedExecutionsCancel(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsCancelParams, body PostV0CityByCityNameTemporalFencedExecutionsCancelJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV0CityByCityNameTemporalFencedExecutionsCancelRequest(c.Server, cityName, params, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PostV0CityByCityNameTemporalFencedExecutionsExecuteWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsExecuteParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV0CityByCityNameTemporalFencedExecutionsExecuteRequestWithBody(c.Server, cityName, params, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PostV0CityByCityNameTemporalFencedExecutionsExecute(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsExecuteParams, body PostV0CityByCityNameTemporalFencedExecutionsExecuteJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV0CityByCityNameTemporalFencedExecutionsExecuteRequest(c.Server, cityName, params, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PostV0CityByCityNameTemporalFencedExecutionsResolveWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsResolveParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV0CityByCityNameTemporalFencedExecutionsResolveRequestWithBody(c.Server, cityName, params, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PostV0CityByCityNameTemporalFencedExecutionsResolve(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsResolveParams, body PostV0CityByCityNameTemporalFencedExecutionsResolveJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV0CityByCityNameTemporalFencedExecutionsResolveRequest(c.Server, cityName, params, body)
 	if err != nil {
 		return nil, err
 	}
@@ -31110,6 +31326,186 @@ func NewGetV0CityByCityNameStatusRequest(server string, cityName string, params 
 	return req, nil
 }
 
+// NewPostV0CityByCityNameTemporalFencedExecutionsCancelRequest calls the generic PostV0CityByCityNameTemporalFencedExecutionsCancel builder with application/json body
+func NewPostV0CityByCityNameTemporalFencedExecutionsCancelRequest(server string, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsCancelParams, body PostV0CityByCityNameTemporalFencedExecutionsCancelJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewPostV0CityByCityNameTemporalFencedExecutionsCancelRequestWithBody(server, cityName, params, "application/json", bodyReader)
+}
+
+// NewPostV0CityByCityNameTemporalFencedExecutionsCancelRequestWithBody generates requests for PostV0CityByCityNameTemporalFencedExecutionsCancel with any type of body
+func NewPostV0CityByCityNameTemporalFencedExecutionsCancelRequestWithBody(server string, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsCancelParams, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cityName", cityName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v0/city/%s/temporal/fenced-executions/cancel", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	if params != nil {
+
+		var headerParam0 string
+
+		headerParam0, err = runtime.StyleParamWithOptions("simple", false, "X-GC-Request", params.XGCRequest, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("X-GC-Request", headerParam0)
+
+	}
+
+	return req, nil
+}
+
+// NewPostV0CityByCityNameTemporalFencedExecutionsExecuteRequest calls the generic PostV0CityByCityNameTemporalFencedExecutionsExecute builder with application/json body
+func NewPostV0CityByCityNameTemporalFencedExecutionsExecuteRequest(server string, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsExecuteParams, body PostV0CityByCityNameTemporalFencedExecutionsExecuteJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewPostV0CityByCityNameTemporalFencedExecutionsExecuteRequestWithBody(server, cityName, params, "application/json", bodyReader)
+}
+
+// NewPostV0CityByCityNameTemporalFencedExecutionsExecuteRequestWithBody generates requests for PostV0CityByCityNameTemporalFencedExecutionsExecute with any type of body
+func NewPostV0CityByCityNameTemporalFencedExecutionsExecuteRequestWithBody(server string, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsExecuteParams, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cityName", cityName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v0/city/%s/temporal/fenced-executions/execute", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	if params != nil {
+
+		var headerParam0 string
+
+		headerParam0, err = runtime.StyleParamWithOptions("simple", false, "X-GC-Request", params.XGCRequest, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("X-GC-Request", headerParam0)
+
+	}
+
+	return req, nil
+}
+
+// NewPostV0CityByCityNameTemporalFencedExecutionsResolveRequest calls the generic PostV0CityByCityNameTemporalFencedExecutionsResolve builder with application/json body
+func NewPostV0CityByCityNameTemporalFencedExecutionsResolveRequest(server string, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsResolveParams, body PostV0CityByCityNameTemporalFencedExecutionsResolveJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewPostV0CityByCityNameTemporalFencedExecutionsResolveRequestWithBody(server, cityName, params, "application/json", bodyReader)
+}
+
+// NewPostV0CityByCityNameTemporalFencedExecutionsResolveRequestWithBody generates requests for PostV0CityByCityNameTemporalFencedExecutionsResolve with any type of body
+func NewPostV0CityByCityNameTemporalFencedExecutionsResolveRequestWithBody(server string, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsResolveParams, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cityName", cityName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v0/city/%s/temporal/fenced-executions/resolve", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	if params != nil {
+
+		var headerParam0 string
+
+		headerParam0, err = runtime.StyleParamWithOptions("simple", false, "X-GC-Request", params.XGCRequest, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("X-GC-Request", headerParam0)
+
+	}
+
+	return req, nil
+}
+
 // NewPostV0CityByCityNameUnregisterRequest generates requests for PostV0CityByCityNameUnregister
 func NewPostV0CityByCityNameUnregisterRequest(server string, cityName string, params *PostV0CityByCityNameUnregisterParams) (*http.Request, error) {
 	var err error
@@ -32394,6 +32790,21 @@ type ClientWithResponsesInterface interface {
 
 	// GetV0CityByCityNameStatusWithResponse request
 	GetV0CityByCityNameStatusWithResponse(ctx context.Context, cityName string, params *GetV0CityByCityNameStatusParams, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameStatusResponse, error)
+
+	// PostV0CityByCityNameTemporalFencedExecutionsCancelWithBodyWithResponse request with any body
+	PostV0CityByCityNameTemporalFencedExecutionsCancelWithBodyWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsCancelParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameTemporalFencedExecutionsCancelResponse, error)
+
+	PostV0CityByCityNameTemporalFencedExecutionsCancelWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsCancelParams, body PostV0CityByCityNameTemporalFencedExecutionsCancelJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameTemporalFencedExecutionsCancelResponse, error)
+
+	// PostV0CityByCityNameTemporalFencedExecutionsExecuteWithBodyWithResponse request with any body
+	PostV0CityByCityNameTemporalFencedExecutionsExecuteWithBodyWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsExecuteParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameTemporalFencedExecutionsExecuteResponse, error)
+
+	PostV0CityByCityNameTemporalFencedExecutionsExecuteWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsExecuteParams, body PostV0CityByCityNameTemporalFencedExecutionsExecuteJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameTemporalFencedExecutionsExecuteResponse, error)
+
+	// PostV0CityByCityNameTemporalFencedExecutionsResolveWithBodyWithResponse request with any body
+	PostV0CityByCityNameTemporalFencedExecutionsResolveWithBodyWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsResolveParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameTemporalFencedExecutionsResolveResponse, error)
+
+	PostV0CityByCityNameTemporalFencedExecutionsResolveWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsResolveParams, body PostV0CityByCityNameTemporalFencedExecutionsResolveJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameTemporalFencedExecutionsResolveResponse, error)
 
 	// PostV0CityByCityNameUnregisterWithResponse request
 	PostV0CityByCityNameUnregisterWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameUnregisterParams, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameUnregisterResponse, error)
@@ -36616,6 +37027,84 @@ func (r GetV0CityByCityNameStatusResponse) StatusCode() int {
 	return 0
 }
 
+type PostV0CityByCityNameTemporalFencedExecutionsCancelResponse struct {
+	Body                      []byte
+	HTTPResponse              *http.Response
+	JSON200                   *FencedExecutionCancelOutputBody
+	ApplicationproblemJSON401 *ErrorModel
+	ApplicationproblemJSON403 *ErrorModel
+	ApplicationproblemJSON422 *ErrorModel
+	ApplicationproblemJSON500 *ErrorModel
+}
+
+// Status returns HTTPResponse.Status
+func (r PostV0CityByCityNameTemporalFencedExecutionsCancelResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PostV0CityByCityNameTemporalFencedExecutionsCancelResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type PostV0CityByCityNameTemporalFencedExecutionsExecuteResponse struct {
+	Body                      []byte
+	HTTPResponse              *http.Response
+	JSON200                   *FencedExecutionExecuteOutputBody
+	ApplicationproblemJSON401 *ErrorModel
+	ApplicationproblemJSON403 *ErrorModel
+	ApplicationproblemJSON422 *ErrorModel
+	ApplicationproblemJSON500 *ErrorModel
+}
+
+// Status returns HTTPResponse.Status
+func (r PostV0CityByCityNameTemporalFencedExecutionsExecuteResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PostV0CityByCityNameTemporalFencedExecutionsExecuteResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type PostV0CityByCityNameTemporalFencedExecutionsResolveResponse struct {
+	Body                      []byte
+	HTTPResponse              *http.Response
+	JSON200                   *FencedExecutionResolveOutputBody
+	ApplicationproblemJSON401 *ErrorModel
+	ApplicationproblemJSON403 *ErrorModel
+	ApplicationproblemJSON422 *ErrorModel
+	ApplicationproblemJSON500 *ErrorModel
+}
+
+// Status returns HTTPResponse.Status
+func (r PostV0CityByCityNameTemporalFencedExecutionsResolveResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PostV0CityByCityNameTemporalFencedExecutionsResolveResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
 type PostV0CityByCityNameUnregisterResponse struct {
 	Body                          []byte
 	HTTPResponse                  *http.Response
@@ -38590,6 +39079,57 @@ func (c *ClientWithResponses) GetV0CityByCityNameStatusWithResponse(ctx context.
 		return nil, err
 	}
 	return ParseGetV0CityByCityNameStatusResponse(rsp)
+}
+
+// PostV0CityByCityNameTemporalFencedExecutionsCancelWithBodyWithResponse request with arbitrary body returning *PostV0CityByCityNameTemporalFencedExecutionsCancelResponse
+func (c *ClientWithResponses) PostV0CityByCityNameTemporalFencedExecutionsCancelWithBodyWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsCancelParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameTemporalFencedExecutionsCancelResponse, error) {
+	rsp, err := c.PostV0CityByCityNameTemporalFencedExecutionsCancelWithBody(ctx, cityName, params, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV0CityByCityNameTemporalFencedExecutionsCancelResponse(rsp)
+}
+
+func (c *ClientWithResponses) PostV0CityByCityNameTemporalFencedExecutionsCancelWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsCancelParams, body PostV0CityByCityNameTemporalFencedExecutionsCancelJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameTemporalFencedExecutionsCancelResponse, error) {
+	rsp, err := c.PostV0CityByCityNameTemporalFencedExecutionsCancel(ctx, cityName, params, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV0CityByCityNameTemporalFencedExecutionsCancelResponse(rsp)
+}
+
+// PostV0CityByCityNameTemporalFencedExecutionsExecuteWithBodyWithResponse request with arbitrary body returning *PostV0CityByCityNameTemporalFencedExecutionsExecuteResponse
+func (c *ClientWithResponses) PostV0CityByCityNameTemporalFencedExecutionsExecuteWithBodyWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsExecuteParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameTemporalFencedExecutionsExecuteResponse, error) {
+	rsp, err := c.PostV0CityByCityNameTemporalFencedExecutionsExecuteWithBody(ctx, cityName, params, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV0CityByCityNameTemporalFencedExecutionsExecuteResponse(rsp)
+}
+
+func (c *ClientWithResponses) PostV0CityByCityNameTemporalFencedExecutionsExecuteWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsExecuteParams, body PostV0CityByCityNameTemporalFencedExecutionsExecuteJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameTemporalFencedExecutionsExecuteResponse, error) {
+	rsp, err := c.PostV0CityByCityNameTemporalFencedExecutionsExecute(ctx, cityName, params, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV0CityByCityNameTemporalFencedExecutionsExecuteResponse(rsp)
+}
+
+// PostV0CityByCityNameTemporalFencedExecutionsResolveWithBodyWithResponse request with arbitrary body returning *PostV0CityByCityNameTemporalFencedExecutionsResolveResponse
+func (c *ClientWithResponses) PostV0CityByCityNameTemporalFencedExecutionsResolveWithBodyWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsResolveParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameTemporalFencedExecutionsResolveResponse, error) {
+	rsp, err := c.PostV0CityByCityNameTemporalFencedExecutionsResolveWithBody(ctx, cityName, params, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV0CityByCityNameTemporalFencedExecutionsResolveResponse(rsp)
+}
+
+func (c *ClientWithResponses) PostV0CityByCityNameTemporalFencedExecutionsResolveWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameTemporalFencedExecutionsResolveParams, body PostV0CityByCityNameTemporalFencedExecutionsResolveJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameTemporalFencedExecutionsResolveResponse, error) {
+	rsp, err := c.PostV0CityByCityNameTemporalFencedExecutionsResolve(ctx, cityName, params, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV0CityByCityNameTemporalFencedExecutionsResolveResponse(rsp)
 }
 
 // PostV0CityByCityNameUnregisterWithResponse request returning *PostV0CityByCityNameUnregisterResponse
@@ -48294,6 +48834,168 @@ func ParseGetV0CityByCityNameStatusResponse(rsp *http.Response) (*GetV0CityByCit
 			return nil, err
 		}
 		response.ApplicationproblemJSON503 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParsePostV0CityByCityNameTemporalFencedExecutionsCancelResponse parses an HTTP response from a PostV0CityByCityNameTemporalFencedExecutionsCancelWithResponse call
+func ParsePostV0CityByCityNameTemporalFencedExecutionsCancelResponse(rsp *http.Response) (*PostV0CityByCityNameTemporalFencedExecutionsCancelResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PostV0CityByCityNameTemporalFencedExecutionsCancelResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest FencedExecutionCancelOutputBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON500 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParsePostV0CityByCityNameTemporalFencedExecutionsExecuteResponse parses an HTTP response from a PostV0CityByCityNameTemporalFencedExecutionsExecuteWithResponse call
+func ParsePostV0CityByCityNameTemporalFencedExecutionsExecuteResponse(rsp *http.Response) (*PostV0CityByCityNameTemporalFencedExecutionsExecuteResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PostV0CityByCityNameTemporalFencedExecutionsExecuteResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest FencedExecutionExecuteOutputBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON500 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParsePostV0CityByCityNameTemporalFencedExecutionsResolveResponse parses an HTTP response from a PostV0CityByCityNameTemporalFencedExecutionsResolveWithResponse call
+func ParsePostV0CityByCityNameTemporalFencedExecutionsResolveResponse(rsp *http.Response) (*PostV0CityByCityNameTemporalFencedExecutionsResolveResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PostV0CityByCityNameTemporalFencedExecutionsResolveResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest FencedExecutionResolveOutputBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON500 = &dest
 
 	}
 

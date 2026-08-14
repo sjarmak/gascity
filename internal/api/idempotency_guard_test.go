@@ -87,9 +87,15 @@ var exemptFromIdempotency = map[string]bool{
 	"post-v0-city-by-city-name-session-by-id-suspend":          true,
 	"post-v0-city-by-city-name-session-by-id-wake":             true,
 	"post-v0-city-by-city-name-sling":                          true,
-	"post-v0-city-by-city-name-unregister":                     true,
-	"rotate-events":                                            true,
-	"trigger-maintenance-dolt-gc":                              true,
+	// Fenced execution is intrinsically keyed by its controller-persisted
+	// operation/request hash and exact process receipt. Resolve and execute
+	// attach to that binding; cancel replays its durable revocation state.
+	"post-v0-city-by-city-name-temporal-fenced-executions-resolve": true,
+	"post-v0-city-by-city-name-temporal-fenced-executions-execute": true,
+	"post-v0-city-by-city-name-temporal-fenced-executions-cancel":  true,
+	"post-v0-city-by-city-name-unregister":                         true,
+	"rotate-events":                                                true,
+	"trigger-maintenance-dolt-gc":                                  true,
 }
 
 type idemSpecDoc struct {
