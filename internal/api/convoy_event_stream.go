@@ -12,6 +12,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 )
 
@@ -443,7 +444,7 @@ func workflowEventBeadFromSubject(state State, subjectID string) (beads.Bead, bo
 	}
 
 	matches := make([]beads.Bead, 0, 2)
-	for _, info := range workflowStores(state) {
+	for _, info := range workflowStoresForBeadID(state, subjectID) {
 		if info.store == nil {
 			continue
 		}
@@ -456,6 +457,101 @@ func workflowEventBeadFromSubject(state State, subjectID string) (beads.Bead, bo
 		return matches[0], true
 	}
 	return beads.Bead{}, false
+}
+
+// workflowStoresForBeadID narrows the workflow store scan to the scope whose
+// CONFIGURED bead-ID prefix owns id, falling back to the full scan when no
+// configured prefix does.
+//
+// This is the hot path for the whole city, not a micro-optimization. Every
+// bead.created/updated/closed event whose payload does not already carry
+// workflow metadata reaches workflowEventBeadFromSubject, and the unscoped scan
+// asked EVERY store for the id — one `bd show` subprocess per store, per event,
+// per connected SSE subscriber, of which at most one could ever answer. A rig
+// store cannot hold another rig's bead, so the other probes were guaranteed
+// misses; on a 22-store city they were 21/22 of the work.
+//
+// Narrowing does not weaken the caller's cross-store-uniqueness gate. A
+// configured prefix has exactly one owning scope, so a scoped scan yields at
+// most one match and len(matches)==1 still means "resolved unambiguously". The
+// one behavior this DOES change is a bead whose id sits in scope A's namespace
+// while the row physically lives in scope B's store: that is no longer found.
+// This deliberately matches the contract the controller's own event router
+// already enforces (beadEventConfiguredStoreLocked in cmd/gc/api_state.go) —
+// a configured prefix owns its namespace even when the owning store is absent,
+// and an owned id never falls back to the all-stores scan.
+//
+// It fails OPEN in every case where ownership is not established: no config, an
+// id in no configured namespace (relocated-class ids such as the graph store's
+// reserved prefix land here), or an owning scope with no store in the scan. The
+// first two return the full scan; the third returns an empty scan, which is the
+// same answer the full scan gave — the owning store is not present, so nobody
+// can hold the bead.
+func workflowStoresForBeadID(state State, id string) []workflowStoreInfo {
+	all := workflowStores(state)
+	owner, ok := configuredScopeRefForBeadID(state, id)
+	if !ok {
+		return all
+	}
+	scoped := make([]workflowStoreInfo, 0, 2)
+	for _, info := range all {
+		// Match on scopeRef, not ref: the relocated graph store carries the
+		// city's scopeRef under a distinct ref, and a city-owned id must still
+		// reach it.
+		if info.scopeRef == owner {
+			scoped = append(scoped, info)
+		}
+	}
+	return scoped
+}
+
+// configuredScopeRefForBeadID resolves the scope ref (city name or rig name)
+// whose configured bead-ID prefix owns id, by longest namespace match. Returns
+// ok=false when no configured prefix owns it, or when two scopes claim the SAME
+// prefix — an ambiguous claim is not ownership, and the caller must fall back to
+// the full scan rather than pick one.
+//
+// The collision is reachable, not theoretical: a rig prefix defaults to
+// config.DeriveBeadsPrefix(rig.Name) and the city's to the same function over
+// the city name, so a city named "gas-city" and a rig named "gascity" both
+// derive "gc". Silently preferring one would make every bead in the other's
+// namespace unresolvable, which is a worse failure than the fan-out this
+// function exists to remove.
+func configuredScopeRefForBeadID(state State, id string) (string, bool) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", false
+	}
+	cfg := state.Config()
+	if cfg == nil {
+		return "", false
+	}
+	matchedRef := ""
+	matchedLen := -1
+	ambiguous := false
+	// Longest-prefix wins so a rig prefix that extends another (e.g. "mem" and
+	// "mem-eval") routes to the more specific owner.
+	match := func(prefix, ref string) {
+		if prefix == "" || ref == "" || !strings.HasPrefix(id, prefix+"-") {
+			return
+		}
+		switch {
+		case len(prefix) > matchedLen:
+			matchedLen = len(prefix)
+			matchedRef = ref
+			ambiguous = false
+		case len(prefix) == matchedLen && ref != matchedRef:
+			ambiguous = true
+		}
+	}
+	match(config.EffectiveHQPrefix(cfg), workflowCityScopeRef(state.CityName()))
+	for i := range cfg.Rigs {
+		match(cfg.Rigs[i].EffectivePrefix(), cfg.Rigs[i].Name)
+	}
+	if ambiguous {
+		return "", false
+	}
+	return matchedRef, matchedLen >= 0
 }
 
 func workflowEventRoot(state State, bead beads.Bead) (workflowStoreInfo, beads.Bead, bool) {
@@ -474,8 +570,11 @@ func workflowEventRoot(state State, bead beads.Bead) (workflowStoreInfo, beads.B
 		}
 	}
 
+	// Same narrowing as the subject scan, and for the same reason: this
+	// fallback runs whenever gc.root_store_ref is missing or stale, and the
+	// root id names one scope's namespace.
 	matches := make([]workflowRootMatch, 0, 2)
-	for _, info := range workflowStores(state) {
+	for _, info := range workflowStoresForBeadID(state, rootID) {
 		if info.store == nil {
 			continue
 		}

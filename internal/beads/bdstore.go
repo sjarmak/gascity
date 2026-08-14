@@ -1195,7 +1195,16 @@ func (s *BdStore) Get(id string) (Bead, error) {
 		// that look like bead IDs are eligible: callers also pass through
 		// non-bead names (e.g. slash-qualified session recipients), which
 		// must not leak into a supplemental wisp query.
-		if isWispQueryableID(id) {
+		//
+		// mayOwnID additionally suppresses the fallback for an id outside this
+		// store's own ID namespace. Every cross-store lookup (the API's
+		// workflow-event store scan, `gc beads show`, convoy dispatch's
+		// find-across-stores) probes stores that cannot own the id, and each
+		// such probe paid for TWO bd subprocesses — a `bd show` miss and then a
+		// supplemental `bd query` miss — where one was already conclusive. The
+		// wisps table lives in the same store as the issues table, so a store
+		// that cannot mint the id holds it in neither tier.
+		if isWispQueryableID(id) && s.mayOwnID(id) {
 			wisps, queryErr := s.getEphemeralByID(id)
 			if queryErr == nil {
 				for _, b := range wisps {
@@ -2672,6 +2681,24 @@ func isWispQueryableID(id string) bool {
 		}
 	}
 	return true
+}
+
+// mayOwnID reports whether id can name a bead this store mints. A store that
+// declares an ID prefix owns exactly the "<prefix>-" namespace, so an id
+// outside it cannot live here in either the issues or the wisps tier.
+//
+// It FAILS OPEN: a store with no declared prefix (the plain NewBdStore path,
+// and any store whose scope config could not be read) owns everything, so the
+// caller's behavior is unchanged there. The namespace test matches the one
+// relocated classes use for the same question — see idNamespace matching in
+// bdsql_relocation.go — so a store that owns a prefix answers identically
+// whichever surface asks.
+func (s *BdStore) mayOwnID(id string) bool {
+	prefix := s.IDPrefix()
+	if prefix == "" {
+		return true
+	}
+	return id == prefix || strings.HasPrefix(id, prefix+"-")
 }
 
 func (s *BdStore) getEphemeralByID(id string) ([]Bead, error) {
