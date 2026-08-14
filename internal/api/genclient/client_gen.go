@@ -1608,6 +1608,22 @@ type ConvoyRemoveInputBody struct {
 	Items *[]string `json:"items,omitempty"`
 }
 
+// Delivery defines model for Delivery.
+type Delivery struct {
+	Attention          string     `json:"attention"`
+	CreatedAt          time.Time  `json:"created_at"`
+	ExpiresAt          *time.Time `json:"expires_at,omitempty"`
+	Id                 string     `json:"id"`
+	MessageId          string     `json:"message_id"`
+	MessageRevision    int64      `json:"message_revision"`
+	Phase              string     `json:"phase"`
+	Policy             string     `json:"policy"`
+	PolicySourceSha256 *string    `json:"policy_source_sha256,omitempty"`
+	SeatRef            string     `json:"seat_ref"`
+	StoreRef           string     `json:"store_ref"`
+	Version            int64      `json:"version"`
+}
+
 // DeliveryContextRecord defines model for DeliveryContextRecord.
 type DeliveryContextRecord struct {
 	BindingGeneration int64             `json:"BindingGeneration"`
@@ -1621,11 +1637,24 @@ type DeliveryContextRecord struct {
 	SourceSessionID   string            `json:"SourceSessionID"`
 }
 
+// DeliveryKey defines model for DeliveryKey.
+type DeliveryKey struct {
+	CreatedAt  time.Time `json:"created_at"`
+	DeliveryId string    `json:"delivery_id"`
+}
+
 // Dep defines model for Dep.
 type Dep struct {
 	DependsOnId string `json:"depends_on_id"`
 	IssueId     string `json:"issue_id"`
 	Type        string `json:"type"`
+}
+
+// DurableSendResult defines model for DurableSendResult.
+type DurableSendResult struct {
+	Delivery Delivery `json:"delivery"`
+	Message  Message  `json:"message"`
+	Outcome  string   `json:"outcome"`
 }
 
 // ErrorDetail defines model for ErrorDetail.
@@ -2428,6 +2457,43 @@ type MailCountOutputBody struct {
 	Unread int64 `json:"unread"`
 }
 
+// MailDeliveryAttemptBody defines model for MailDeliveryAttemptBody.
+type MailDeliveryAttemptBody struct {
+	Attempt     TransportAttempt `json:"attempt"`
+	FailureCode *string          `json:"failure_code,omitempty"`
+	Ok          bool             `json:"ok"`
+}
+
+// MailDeliveryReconcileBody defines model for MailDeliveryReconcileBody.
+type MailDeliveryReconcileBody struct {
+	FailureCode *string         `json:"failure_code,omitempty"`
+	Ok          bool            `json:"ok"`
+	Report      ReconcileReport `json:"report"`
+}
+
+// MailDeliveryReconcileInputBody defines model for MailDeliveryReconcileInputBody.
+type MailDeliveryReconcileInputBody struct {
+	ExpectedDeliveryId *string `json:"expected_delivery_id,omitempty"`
+	Limit              int64   `json:"limit"`
+	SeatRef            string  `json:"seat_ref"`
+}
+
+// MailDurableSendBody defines model for MailDurableSendBody.
+type MailDurableSendBody struct {
+	FailureCode *string           `json:"failure_code,omitempty"`
+	Ok          bool              `json:"ok"`
+	Result      DurableSendResult `json:"result"`
+}
+
+// MailDurableSendInputBody defines model for MailDurableSendInputBody.
+type MailDurableSendInputBody struct {
+	Message          string    `json:"message"`
+	Recipient        string    `json:"recipient"`
+	SenderCandidates *[]string `json:"sender_candidates"`
+	StableKey        string    `json:"stable_key"`
+	Subject          *string   `json:"subject,omitempty"`
+}
+
 // MailEventPayload defines model for MailEventPayload.
 type MailEventPayload struct {
 	Message *Message `json:"message,omitempty"`
@@ -3126,6 +3192,28 @@ type ReadinessItem struct {
 // ReadinessResponse defines model for ReadinessResponse.
 type ReadinessResponse struct {
 	Items map[string]ReadinessItem `json:"items"`
+}
+
+// ReconcileItem defines model for ReconcileItem.
+type ReconcileItem struct {
+	Attempt    *TransportAttempt `json:"attempt,omitempty"`
+	DeliveryId string            `json:"delivery_id"`
+	Outcome    string            `json:"outcome"`
+	Phase      string            `json:"phase"`
+}
+
+// ReconcileReport defines model for ReconcileReport.
+type ReconcileReport struct {
+	ActionRequired        bool             `json:"action_required"`
+	Checkpoint            SweepCheckpoint  `json:"checkpoint"`
+	Deliveries            *[]ReconcileItem `json:"deliveries"`
+	ExpectedDeliveryId    *string          `json:"expected_delivery_id,omitempty"`
+	ExpectedDeliveryPhase *string          `json:"expected_delivery_phase,omitempty"`
+	ObservedAt            time.Time        `json:"observed_at"`
+	PageCommitted         bool             `json:"page_committed"`
+	Plan                  SweepPlan        `json:"plan"`
+	SchemaVersion         string           `json:"schema_version"`
+	SeatRef               string           `json:"seat_ref"`
 }
 
 // Record defines model for Record.
@@ -5226,6 +5314,22 @@ type SupervisorStartup struct {
 	Ready bool `json:"ready"`
 }
 
+// SweepCheckpoint defines model for SweepCheckpoint.
+type SweepCheckpoint struct {
+	After         DeliveryKey `json:"after"`
+	Generation    int64       `json:"generation"`
+	HighWatermark DeliveryKey `json:"high_watermark"`
+	SeatRef       string      `json:"seat_ref"`
+	Version       int64       `json:"version"`
+}
+
+// SweepPlan defines model for SweepPlan.
+type SweepPlan struct {
+	HighWatermark DeliveryKey    `json:"high_watermark"`
+	Page          *[]DeliveryKey `json:"page"`
+	Wrap          bool           `json:"wrap"`
+}
+
 // TaggedEventStreamEnvelope defines model for TaggedEventStreamEnvelope.
 type TaggedEventStreamEnvelope struct {
 	Actor            string                   `json:"actor"`
@@ -5248,6 +5352,42 @@ type TranscriptMessageKind string
 
 // TranscriptProvenance Provenance of a transcript entry (freshly observed vs. replayed from persisted history).
 type TranscriptProvenance string
+
+// TransportAttempt defines model for TransportAttempt.
+type TransportAttempt struct {
+	AttemptId                 string           `json:"attempt_id"`
+	AuthorityGeneration       int64            `json:"authority_generation"`
+	AuthorityIntentSha256     string           `json:"authority_intent_sha256"`
+	AuthorityKind             string           `json:"authority_kind"`
+	AuthorityRef              string           `json:"authority_ref"`
+	ContinuationEpoch         int64            `json:"continuation_epoch"`
+	CoveredDeliveryIds        *[]string        `json:"covered_delivery_ids"`
+	CreatedAt                 time.Time        `json:"created_at"`
+	DeliveryId                string           `json:"delivery_id"`
+	ExpectedDeliveryRevision  int64            `json:"expected_delivery_revision"`
+	InstanceTokenSha256       string           `json:"instance_token_sha256"`
+	InvocationCount           int64            `json:"invocation_count"`
+	InvocationLeaseUntil      *time.Time       `json:"invocation_lease_until,omitempty"`
+	InvocationStartedAt       *time.Time       `json:"invocation_started_at,omitempty"`
+	NudgeId                   string           `json:"nudge_id"`
+	Receipt                   TransportReceipt `json:"receipt"`
+	ReceiptLookupFailureCount int64            `json:"receipt_lookup_failure_count"`
+	SessionRef                string           `json:"session_ref"`
+	State                     string           `json:"state"`
+	Version                   int64            `json:"version"`
+}
+
+// TransportReceipt defines model for TransportReceipt.
+type TransportReceipt struct {
+	AttemptId      string    `json:"attempt_id"`
+	CommitBoundary *string   `json:"commit_boundary,omitempty"`
+	NudgeId        string    `json:"nudge_id"`
+	ReceiptRef     *string   `json:"receipt_ref,omitempty"`
+	ReceiptSha256  *string   `json:"receipt_sha256,omitempty"`
+	RecordedAt     time.Time `json:"recorded_at"`
+	State          string    `json:"state"`
+	Version        int64     `json:"version"`
+}
 
 // TypedEventStreamEnvelope Discriminated union of city event stream envelopes. Each variant constrains the envelope type and payload schema together.
 type TypedEventStreamEnvelope struct {
@@ -9147,6 +9287,24 @@ type GetV0CityByCityNameMailCountParams struct {
 	Rig *string `form:"rig,omitempty" json:"rig,omitempty"`
 }
 
+// PostV0CityByCityNameMailDeliveryReconcileSeatParams defines parameters for PostV0CityByCityNameMailDeliveryReconcileSeat.
+type PostV0CityByCityNameMailDeliveryReconcileSeatParams struct {
+	// XGCRequest Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+	XGCRequest string `json:"X-GC-Request"`
+}
+
+// PostV0CityByCityNameMailDeliveryByAttemptIdInvokeParams defines parameters for PostV0CityByCityNameMailDeliveryByAttemptIdInvoke.
+type PostV0CityByCityNameMailDeliveryByAttemptIdInvokeParams struct {
+	// XGCRequest Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+	XGCRequest string `json:"X-GC-Request"`
+}
+
+// PostV0CityByCityNameMailDurableParams defines parameters for PostV0CityByCityNameMailDurable.
+type PostV0CityByCityNameMailDurableParams struct {
+	// XGCRequest Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+	XGCRequest string `json:"X-GC-Request"`
+}
+
 // GetV0CityByCityNameMailThreadByIdParams defines parameters for GetV0CityByCityNameMailThreadById.
 type GetV0CityByCityNameMailThreadByIdParams struct {
 	// Rig Filter by rig.
@@ -9752,6 +9910,12 @@ type PostV0CityByCityNameFormulasByNamePreviewJSONRequestBody = FormulaPreviewBo
 
 // SendMailJSONRequestBody defines body for SendMail for application/json ContentType.
 type SendMailJSONRequestBody = MailSendInputBody
+
+// PostV0CityByCityNameMailDeliveryReconcileSeatJSONRequestBody defines body for PostV0CityByCityNameMailDeliveryReconcileSeat for application/json ContentType.
+type PostV0CityByCityNameMailDeliveryReconcileSeatJSONRequestBody = MailDeliveryReconcileInputBody
+
+// PostV0CityByCityNameMailDurableJSONRequestBody defines body for PostV0CityByCityNameMailDurable for application/json ContentType.
+type PostV0CityByCityNameMailDurableJSONRequestBody = MailDurableSendInputBody
 
 // ReplyMailJSONRequestBody defines body for ReplyMail for application/json ContentType.
 type ReplyMailJSONRequestBody = MailReplyInputBody
@@ -18588,6 +18752,22 @@ type ClientInterface interface {
 	// GetV0CityByCityNameMailCount request
 	GetV0CityByCityNameMailCount(ctx context.Context, cityName string, params *GetV0CityByCityNameMailCountParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// PostV0CityByCityNameMailDeliveryReconcileSeatWithBody request with any body
+	PostV0CityByCityNameMailDeliveryReconcileSeatWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDeliveryReconcileSeatParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	PostV0CityByCityNameMailDeliveryReconcileSeat(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDeliveryReconcileSeatParams, body PostV0CityByCityNameMailDeliveryReconcileSeatJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetV0CityByCityNameMailDeliveryByAttemptId request
+	GetV0CityByCityNameMailDeliveryByAttemptId(ctx context.Context, cityName string, attemptID string, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// PostV0CityByCityNameMailDeliveryByAttemptIdInvoke request
+	PostV0CityByCityNameMailDeliveryByAttemptIdInvoke(ctx context.Context, cityName string, attemptID string, params *PostV0CityByCityNameMailDeliveryByAttemptIdInvokeParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// PostV0CityByCityNameMailDurableWithBody request with any body
+	PostV0CityByCityNameMailDurableWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDurableParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	PostV0CityByCityNameMailDurable(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDurableParams, body PostV0CityByCityNameMailDurableJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// GetV0CityByCityNameMailThreadById request
 	GetV0CityByCityNameMailThreadById(ctx context.Context, cityName string, id string, params *GetV0CityByCityNameMailThreadByIdParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -20082,6 +20262,78 @@ func (c *Client) SendMail(ctx context.Context, cityName string, params *SendMail
 
 func (c *Client) GetV0CityByCityNameMailCount(ctx context.Context, cityName string, params *GetV0CityByCityNameMailCountParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewGetV0CityByCityNameMailCountRequest(c.Server, cityName, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PostV0CityByCityNameMailDeliveryReconcileSeatWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDeliveryReconcileSeatParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV0CityByCityNameMailDeliveryReconcileSeatRequestWithBody(c.Server, cityName, params, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PostV0CityByCityNameMailDeliveryReconcileSeat(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDeliveryReconcileSeatParams, body PostV0CityByCityNameMailDeliveryReconcileSeatJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV0CityByCityNameMailDeliveryReconcileSeatRequest(c.Server, cityName, params, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) GetV0CityByCityNameMailDeliveryByAttemptId(ctx context.Context, cityName string, attemptID string, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetV0CityByCityNameMailDeliveryByAttemptIdRequest(c.Server, cityName, attemptID)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PostV0CityByCityNameMailDeliveryByAttemptIdInvoke(ctx context.Context, cityName string, attemptID string, params *PostV0CityByCityNameMailDeliveryByAttemptIdInvokeParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV0CityByCityNameMailDeliveryByAttemptIdInvokeRequest(c.Server, cityName, attemptID, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PostV0CityByCityNameMailDurableWithBody(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDurableParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV0CityByCityNameMailDurableRequestWithBody(c.Server, cityName, params, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) PostV0CityByCityNameMailDurable(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDurableParams, body PostV0CityByCityNameMailDurableJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV0CityByCityNameMailDurableRequest(c.Server, cityName, params, body)
 	if err != nil {
 		return nil, err
 	}
@@ -26395,6 +26647,221 @@ func NewGetV0CityByCityNameMailCountRequest(server string, cityName string, para
 	return req, nil
 }
 
+// NewPostV0CityByCityNameMailDeliveryReconcileSeatRequest calls the generic PostV0CityByCityNameMailDeliveryReconcileSeat builder with application/json body
+func NewPostV0CityByCityNameMailDeliveryReconcileSeatRequest(server string, cityName string, params *PostV0CityByCityNameMailDeliveryReconcileSeatParams, body PostV0CityByCityNameMailDeliveryReconcileSeatJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewPostV0CityByCityNameMailDeliveryReconcileSeatRequestWithBody(server, cityName, params, "application/json", bodyReader)
+}
+
+// NewPostV0CityByCityNameMailDeliveryReconcileSeatRequestWithBody generates requests for PostV0CityByCityNameMailDeliveryReconcileSeat with any type of body
+func NewPostV0CityByCityNameMailDeliveryReconcileSeatRequestWithBody(server string, cityName string, params *PostV0CityByCityNameMailDeliveryReconcileSeatParams, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cityName", cityName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v0/city/%s/mail/delivery/reconcile-seat", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	if params != nil {
+
+		var headerParam0 string
+
+		headerParam0, err = runtime.StyleParamWithOptions("simple", false, "X-GC-Request", params.XGCRequest, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("X-GC-Request", headerParam0)
+
+	}
+
+	return req, nil
+}
+
+// NewGetV0CityByCityNameMailDeliveryByAttemptIdRequest generates requests for GetV0CityByCityNameMailDeliveryByAttemptId
+func NewGetV0CityByCityNameMailDeliveryByAttemptIdRequest(server string, cityName string, attemptID string) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cityName", cityName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "attemptID", attemptID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v0/city/%s/mail/delivery/%s", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("GET", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewPostV0CityByCityNameMailDeliveryByAttemptIdInvokeRequest generates requests for PostV0CityByCityNameMailDeliveryByAttemptIdInvoke
+func NewPostV0CityByCityNameMailDeliveryByAttemptIdInvokeRequest(server string, cityName string, attemptID string, params *PostV0CityByCityNameMailDeliveryByAttemptIdInvokeParams) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cityName", cityName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "attemptID", attemptID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v0/city/%s/mail/delivery/%s/invoke", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+
+		var headerParam0 string
+
+		headerParam0, err = runtime.StyleParamWithOptions("simple", false, "X-GC-Request", params.XGCRequest, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("X-GC-Request", headerParam0)
+
+	}
+
+	return req, nil
+}
+
+// NewPostV0CityByCityNameMailDurableRequest calls the generic PostV0CityByCityNameMailDurable builder with application/json body
+func NewPostV0CityByCityNameMailDurableRequest(server string, cityName string, params *PostV0CityByCityNameMailDurableParams, body PostV0CityByCityNameMailDurableJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewPostV0CityByCityNameMailDurableRequestWithBody(server, cityName, params, "application/json", bodyReader)
+}
+
+// NewPostV0CityByCityNameMailDurableRequestWithBody generates requests for PostV0CityByCityNameMailDurable with any type of body
+func NewPostV0CityByCityNameMailDurableRequestWithBody(server string, cityName string, params *PostV0CityByCityNameMailDurableParams, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cityName", cityName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v0/city/%s/mail/durable", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	if params != nil {
+
+		var headerParam0 string
+
+		headerParam0, err = runtime.StyleParamWithOptions("simple", false, "X-GC-Request", params.XGCRequest, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("X-GC-Request", headerParam0)
+
+	}
+
+	return req, nil
+}
+
 // NewGetV0CityByCityNameMailThreadByIdRequest generates requests for GetV0CityByCityNameMailThreadById
 func NewGetV0CityByCityNameMailThreadByIdRequest(server string, cityName string, id string, params *GetV0CityByCityNameMailThreadByIdParams) (*http.Request, error) {
 	var err error
@@ -32122,6 +32589,22 @@ type ClientWithResponsesInterface interface {
 	// GetV0CityByCityNameMailCountWithResponse request
 	GetV0CityByCityNameMailCountWithResponse(ctx context.Context, cityName string, params *GetV0CityByCityNameMailCountParams, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameMailCountResponse, error)
 
+	// PostV0CityByCityNameMailDeliveryReconcileSeatWithBodyWithResponse request with any body
+	PostV0CityByCityNameMailDeliveryReconcileSeatWithBodyWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDeliveryReconcileSeatParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameMailDeliveryReconcileSeatResponse, error)
+
+	PostV0CityByCityNameMailDeliveryReconcileSeatWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDeliveryReconcileSeatParams, body PostV0CityByCityNameMailDeliveryReconcileSeatJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameMailDeliveryReconcileSeatResponse, error)
+
+	// GetV0CityByCityNameMailDeliveryByAttemptIdWithResponse request
+	GetV0CityByCityNameMailDeliveryByAttemptIdWithResponse(ctx context.Context, cityName string, attemptID string, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameMailDeliveryByAttemptIdResponse, error)
+
+	// PostV0CityByCityNameMailDeliveryByAttemptIdInvokeWithResponse request
+	PostV0CityByCityNameMailDeliveryByAttemptIdInvokeWithResponse(ctx context.Context, cityName string, attemptID string, params *PostV0CityByCityNameMailDeliveryByAttemptIdInvokeParams, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponse, error)
+
+	// PostV0CityByCityNameMailDurableWithBodyWithResponse request with any body
+	PostV0CityByCityNameMailDurableWithBodyWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDurableParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameMailDurableResponse, error)
+
+	PostV0CityByCityNameMailDurableWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDurableParams, body PostV0CityByCityNameMailDurableJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameMailDurableResponse, error)
+
 	// GetV0CityByCityNameMailThreadByIdWithResponse request
 	GetV0CityByCityNameMailThreadByIdWithResponse(ctx context.Context, cityName string, id string, params *GetV0CityByCityNameMailThreadByIdParams, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameMailThreadByIdResponse, error)
 
@@ -34457,6 +34940,120 @@ func (r GetV0CityByCityNameMailCountResponse) Status() string {
 
 // StatusCode returns HTTPResponse.StatusCode
 func (r GetV0CityByCityNameMailCountResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type PostV0CityByCityNameMailDeliveryReconcileSeatResponse struct {
+	Body                      []byte
+	HTTPResponse              *http.Response
+	JSON200                   *MailDeliveryReconcileBody
+	ApplicationproblemJSON400 *ErrorModel
+	ApplicationproblemJSON401 *ErrorModel
+	ApplicationproblemJSON403 *ErrorModel
+	ApplicationproblemJSON409 *ErrorModel
+	ApplicationproblemJSON422 *ErrorModel
+	ApplicationproblemJSON500 *ErrorModel
+	ApplicationproblemJSON503 *ErrorModel
+}
+
+// Status returns HTTPResponse.Status
+func (r PostV0CityByCityNameMailDeliveryReconcileSeatResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PostV0CityByCityNameMailDeliveryReconcileSeatResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type GetV0CityByCityNameMailDeliveryByAttemptIdResponse struct {
+	Body                      []byte
+	HTTPResponse              *http.Response
+	JSON200                   *MailDeliveryAttemptBody
+	ApplicationproblemJSON400 *ErrorModel
+	ApplicationproblemJSON404 *ErrorModel
+	ApplicationproblemJSON422 *ErrorModel
+	ApplicationproblemJSON500 *ErrorModel
+	ApplicationproblemJSON503 *ErrorModel
+}
+
+// Status returns HTTPResponse.Status
+func (r GetV0CityByCityNameMailDeliveryByAttemptIdResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetV0CityByCityNameMailDeliveryByAttemptIdResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type PostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponse struct {
+	Body                      []byte
+	HTTPResponse              *http.Response
+	JSON200                   *MailDeliveryAttemptBody
+	ApplicationproblemJSON400 *ErrorModel
+	ApplicationproblemJSON401 *ErrorModel
+	ApplicationproblemJSON403 *ErrorModel
+	ApplicationproblemJSON409 *ErrorModel
+	ApplicationproblemJSON422 *ErrorModel
+	ApplicationproblemJSON500 *ErrorModel
+	ApplicationproblemJSON503 *ErrorModel
+}
+
+// Status returns HTTPResponse.Status
+func (r PostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type PostV0CityByCityNameMailDurableResponse struct {
+	Body                      []byte
+	HTTPResponse              *http.Response
+	JSON200                   *MailDurableSendBody
+	ApplicationproblemJSON400 *ErrorModel
+	ApplicationproblemJSON401 *ErrorModel
+	ApplicationproblemJSON403 *ErrorModel
+	ApplicationproblemJSON409 *ErrorModel
+	ApplicationproblemJSON422 *ErrorModel
+	ApplicationproblemJSON500 *ErrorModel
+	ApplicationproblemJSON503 *ErrorModel
+}
+
+// Status returns HTTPResponse.Status
+func (r PostV0CityByCityNameMailDurableResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PostV0CityByCityNameMailDurableResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -37735,6 +38332,58 @@ func (c *ClientWithResponses) GetV0CityByCityNameMailCountWithResponse(ctx conte
 		return nil, err
 	}
 	return ParseGetV0CityByCityNameMailCountResponse(rsp)
+}
+
+// PostV0CityByCityNameMailDeliveryReconcileSeatWithBodyWithResponse request with arbitrary body returning *PostV0CityByCityNameMailDeliveryReconcileSeatResponse
+func (c *ClientWithResponses) PostV0CityByCityNameMailDeliveryReconcileSeatWithBodyWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDeliveryReconcileSeatParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameMailDeliveryReconcileSeatResponse, error) {
+	rsp, err := c.PostV0CityByCityNameMailDeliveryReconcileSeatWithBody(ctx, cityName, params, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV0CityByCityNameMailDeliveryReconcileSeatResponse(rsp)
+}
+
+func (c *ClientWithResponses) PostV0CityByCityNameMailDeliveryReconcileSeatWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDeliveryReconcileSeatParams, body PostV0CityByCityNameMailDeliveryReconcileSeatJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameMailDeliveryReconcileSeatResponse, error) {
+	rsp, err := c.PostV0CityByCityNameMailDeliveryReconcileSeat(ctx, cityName, params, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV0CityByCityNameMailDeliveryReconcileSeatResponse(rsp)
+}
+
+// GetV0CityByCityNameMailDeliveryByAttemptIdWithResponse request returning *GetV0CityByCityNameMailDeliveryByAttemptIdResponse
+func (c *ClientWithResponses) GetV0CityByCityNameMailDeliveryByAttemptIdWithResponse(ctx context.Context, cityName string, attemptID string, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameMailDeliveryByAttemptIdResponse, error) {
+	rsp, err := c.GetV0CityByCityNameMailDeliveryByAttemptId(ctx, cityName, attemptID, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetV0CityByCityNameMailDeliveryByAttemptIdResponse(rsp)
+}
+
+// PostV0CityByCityNameMailDeliveryByAttemptIdInvokeWithResponse request returning *PostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponse
+func (c *ClientWithResponses) PostV0CityByCityNameMailDeliveryByAttemptIdInvokeWithResponse(ctx context.Context, cityName string, attemptID string, params *PostV0CityByCityNameMailDeliveryByAttemptIdInvokeParams, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponse, error) {
+	rsp, err := c.PostV0CityByCityNameMailDeliveryByAttemptIdInvoke(ctx, cityName, attemptID, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponse(rsp)
+}
+
+// PostV0CityByCityNameMailDurableWithBodyWithResponse request with arbitrary body returning *PostV0CityByCityNameMailDurableResponse
+func (c *ClientWithResponses) PostV0CityByCityNameMailDurableWithBodyWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDurableParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameMailDurableResponse, error) {
+	rsp, err := c.PostV0CityByCityNameMailDurableWithBody(ctx, cityName, params, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV0CityByCityNameMailDurableResponse(rsp)
+}
+
+func (c *ClientWithResponses) PostV0CityByCityNameMailDurableWithResponse(ctx context.Context, cityName string, params *PostV0CityByCityNameMailDurableParams, body PostV0CityByCityNameMailDurableJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameMailDurableResponse, error) {
+	rsp, err := c.PostV0CityByCityNameMailDurable(ctx, cityName, params, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV0CityByCityNameMailDurableResponse(rsp)
 }
 
 // GetV0CityByCityNameMailThreadByIdWithResponse request returning *GetV0CityByCityNameMailThreadByIdResponse
@@ -43314,6 +43963,292 @@ func ParseGetV0CityByCityNameMailCountResponse(rsp *http.Response) (*GetV0CityBy
 			return nil, err
 		}
 		response.ApplicationproblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON503 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParsePostV0CityByCityNameMailDeliveryReconcileSeatResponse parses an HTTP response from a PostV0CityByCityNameMailDeliveryReconcileSeatWithResponse call
+func ParsePostV0CityByCityNameMailDeliveryReconcileSeatResponse(rsp *http.Response) (*PostV0CityByCityNameMailDeliveryReconcileSeatResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PostV0CityByCityNameMailDeliveryReconcileSeatResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest MailDeliveryReconcileBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON503 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetV0CityByCityNameMailDeliveryByAttemptIdResponse parses an HTTP response from a GetV0CityByCityNameMailDeliveryByAttemptIdWithResponse call
+func ParseGetV0CityByCityNameMailDeliveryByAttemptIdResponse(rsp *http.Response) (*GetV0CityByCityNameMailDeliveryByAttemptIdResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetV0CityByCityNameMailDeliveryByAttemptIdResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest MailDeliveryAttemptBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON503 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParsePostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponse parses an HTTP response from a PostV0CityByCityNameMailDeliveryByAttemptIdInvokeWithResponse call
+func ParsePostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponse(rsp *http.Response) (*PostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest MailDeliveryAttemptBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON503 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParsePostV0CityByCityNameMailDurableResponse parses an HTTP response from a PostV0CityByCityNameMailDurableWithResponse call
+func ParsePostV0CityByCityNameMailDurableResponse(rsp *http.Response) (*PostV0CityByCityNameMailDurableResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PostV0CityByCityNameMailDurableResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest MailDurableSendBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON409 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
 		var dest ErrorModel

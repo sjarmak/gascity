@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/maildelivery"
@@ -22,6 +25,19 @@ import (
 
 type fixedMailDeliveryFenceResolver struct {
 	fence maildelivery.ActivationFence
+}
+
+type authorityDriftAfterStableNudgeProvider struct {
+	*runtime.Fake
+	afterStableNudge func()
+}
+
+func (p *authorityDriftAfterStableNudgeProvider) NudgeStable(ctx context.Context, name, effectID string, content []runtime.ContentBlock) (runtime.StableNudgeReceipt, error) {
+	receipt, err := p.Fake.NudgeStable(ctx, name, effectID, content)
+	if err == nil && p.afterStableNudge != nil {
+		p.afterStableNudge()
+	}
+	return receipt, err
 }
 
 func (r fixedMailDeliveryFenceResolver) ResolveMailActivationFence(context.Context, string) (maildelivery.ActivationFence, error) {
@@ -91,6 +107,74 @@ func TestMailDeliveryCommandsAreRegistered(t *testing.T) {
 	}
 }
 
+// TestMailDeliveryInvokeAPIPreservesResultAndNeverFallsBackOnResponses is the
+// checked Medium HTTP owner for the CLI mutation-routing/no-second-effect proof.
+func TestMailDeliveryInvokeAPIPreservesResultAndNeverFallsBackOnResponses(t *testing.T) {
+	attempt := maildelivery.TransportAttempt{
+		Version: 1, AttemptID: "mail-attempt-result", DeliveryID: "mail-delivery-result",
+		State: maildelivery.TransportRequested, InvocationCount: 2,
+		CreatedAt: time.Date(2026, 8, 14, 12, 30, 0, 0, time.UTC),
+	}
+	calls := make(map[string]int)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v0/city/test-city/mail/delivery/"), "/invoke")
+		calls[attemptID]++
+		w.Header().Set("Content-Type", "application/json")
+		switch attemptID {
+		case attempt.AttemptID:
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+				"ok": false, "failure_code": "retry_safe", "attempt": attempt,
+			})
+		case "mail-attempt-app-500":
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+				"title": "Internal Server Error", "status": http.StatusInternalServerError,
+				"detail": "provider failed after admission",
+			})
+		default:
+			_, _ = w.Write([]byte(`{"ok":true,"attempt":`))
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+	t.Setenv("GC_NO_API", "")
+	originalAlive, originalSupervisor := apiRouteControllerAliveHook, apiRouteSupervisorClientHook
+	t.Cleanup(func() {
+		apiRouteControllerAliveHook = originalAlive
+		apiRouteSupervisorClientHook = originalSupervisor
+	})
+	apiRouteControllerAliveHook = func(string) int { return 0 }
+	client := api.NewCityScopedClient(server.URL, "test-city")
+	apiRouteSupervisorClientHook = func(string) *api.Client { return client }
+
+	for _, tc := range []struct {
+		attemptID  string
+		wantStdout string
+		wantStderr string
+	}{
+		{attempt.AttemptID, attempt.AttemptID, "retry_safe"},
+		{"mail-attempt-app-500", "", "provider failed after admission"},
+		{"mail-attempt-malformed", "", "decoding mail delivery invoke response"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := cmdMailDeliveryInvoke(context.Background(), tc.attemptID, &stdout, &stderr); code != 1 {
+			t.Fatalf("invoke %q code=%d stdout=%q stderr=%q", tc.attemptID, code, stdout.String(), stderr.String())
+		}
+		if !strings.Contains(stdout.String(), tc.wantStdout) || !strings.Contains(stderr.String(), tc.wantStderr) {
+			t.Fatalf("invoke %q stdout=%q stderr=%q", tc.attemptID, stdout.String(), stderr.String())
+		}
+		if strings.Contains(stderr.String(), "open city store") || calls[tc.attemptID] != 1 {
+			t.Fatalf("invoke %q fell back or reinvoked: calls=%d stderr=%q", tc.attemptID, calls[tc.attemptID], stderr.String())
+		}
+	}
+}
+
 func TestMailDeliveryReconcileCommandRejectsWideExactCanaryBeforeOpeningStore(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := cmdMailDeliveryReconcileSeat(context.Background(), "seat:test-city/reviewer", 2,
@@ -130,7 +214,7 @@ func TestReconcileMailDeliverySeatAuthorityWaitIsDurableAndDoesNotStarvePage(t *
 	second := createMailDeliveryForReconcile(t, store, "b", time.Date(2026, 8, 14, 3, 10, 1, 0, time.UTC))
 	resolver := failingMailDeliveryFenceResolver{err: fmt.Errorf("%w: no active named session", maildelivery.ErrAuthorityUnavailable)}
 
-	report, err := reconcileMailDeliverySeat(context.Background(), store, first.SeatRef, 2,
+	report, err := maildelivery.ReconcileSeat(context.Background(), store, first.SeatRef, 2,
 		time.Date(2026, 8, 14, 3, 11, 0, 0, time.UTC), resolver, nil)
 	if err != nil {
 		t.Fatalf("reconcileMailDeliverySeat: %v", err)
@@ -160,7 +244,7 @@ func TestReconcileExpectedMailDeliverySeatRejectsDifferentPageBeforeDeliveryEffe
 	first := createMailDeliveryForReconcile(t, store, "canary-a", time.Date(2026, 8, 14, 3, 9, 0, 0, time.UTC))
 	second := createMailDeliveryForReconcile(t, store, "canary-b", time.Date(2026, 8, 14, 3, 9, 1, 0, time.UTC))
 	effects := 0
-	report, err := reconcileExpectedMailDeliverySeat(context.Background(), store, first.SeatRef, 1, second.ID,
+	report, err := maildelivery.ReconcileExpectedSeat(context.Background(), store, first.SeatRef, 1, second.ID,
 		time.Date(2026, 8, 14, 3, 9, 30, 0, time.UTC), fixedMailDeliveryFenceResolver{fence: testMailDeliveryFence()},
 		func(context.Context, maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
 			effects++
@@ -207,7 +291,7 @@ func TestReconcileExpectedMailDeliverySeatReportsExactTerminalCanaryWithoutFailu
 	}
 
 	effects := 0
-	report, err := reconcileExpectedMailDeliverySeat(context.Background(), store, current.SeatRef, 1, current.ID,
+	report, err := maildelivery.ReconcileExpectedSeat(context.Background(), store, current.SeatRef, 1, current.ID,
 		attempt.CreatedAt.Add(4*time.Second), resolver, func(context.Context, maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
 			effects++
 			return maildelivery.TransportAttempt{}, nil
@@ -233,7 +317,7 @@ func TestReconcileMailDeliverySeatUnknownCommitsPageAndReportsAction(t *testing.
 		return attempt, errors.New("provider response lost")
 	}
 
-	report, err := reconcileMailDeliverySeat(context.Background(), store, delivery.SeatRef, 1,
+	report, err := maildelivery.ReconcileSeat(context.Background(), store, delivery.SeatRef, 1,
 		time.Date(2026, 8, 14, 3, 12, 30, 0, time.UTC), resolver, execute)
 	if err != nil {
 		t.Fatalf("reconcileMailDeliverySeat: %v", err)
@@ -259,7 +343,7 @@ func TestReconcileMailDeliverySeatInfrastructureFailureReplaysUnchangedPage(t *t
 		return attempt, wantErr
 	}
 
-	report, err := reconcileMailDeliverySeat(context.Background(), store, delivery.SeatRef, 1,
+	report, err := maildelivery.ReconcileSeat(context.Background(), store, delivery.SeatRef, 1,
 		time.Date(2026, 8, 14, 3, 15, 0, 0, time.UTC), resolver, execute)
 	if !errors.Is(err, wantErr) || report.PageCommitted {
 		t.Fatalf("report = %#v, err = %v", report, err)
@@ -298,7 +382,7 @@ func TestReconcileMailDeliverySeatCoalescesPageIntoOneDurableEffect(t *testing.T
 				}, nil
 			})
 	}
-	report, err := reconcileMailDeliverySeat(context.Background(), store, first.SeatRef, 2,
+	report, err := maildelivery.ReconcileSeat(context.Background(), store, first.SeatRef, 2,
 		time.Date(2026, 8, 14, 3, 30, 30, 0, time.UTC), resolver, execute)
 	if err != nil || effects != 1 || !report.PageCommitted || len(report.Deliveries) != 2 {
 		t.Fatalf("report=%#v effects=%d err=%v", report, effects, err)
@@ -332,7 +416,7 @@ func TestReconcileMailDeliverySeatRefencesRequestedGroupWithoutStarvation(t *tes
 				return maildelivery.TransportReceipt{}, fmt.Errorf("%w: destination refused before effect", maildelivery.ErrTransportRetrySafe)
 			})
 	}
-	firstReport, err := reconcileMailDeliverySeat(context.Background(), store, first.SeatRef, 2,
+	firstReport, err := maildelivery.ReconcileSeat(context.Background(), store, first.SeatRef, 2,
 		time.Date(2026, 8, 14, 3, 32, 30, 0, time.UTC), firstResolver, retrySafe)
 	if err != nil || !firstReport.PageCommitted || firstReport.Deliveries[0].Outcome != mailDeliveryReconcileRetryable {
 		t.Fatalf("first report=%#v err=%v", firstReport, err)
@@ -356,7 +440,7 @@ func TestReconcileMailDeliverySeatRefencesRequestedGroupWithoutStarvation(t *tes
 				}, nil
 			})
 	}
-	secondReport, err := reconcileMailDeliverySeat(context.Background(), store, second.SeatRef, 2,
+	secondReport, err := maildelivery.ReconcileSeat(context.Background(), store, second.SeatRef, 2,
 		time.Date(2026, 8, 14, 3, 33, 30, 0, time.UTC), secondResolver, commit)
 	if err != nil || !secondReport.PageCommitted || effects != 1 || len(secondReport.Deliveries) != 2 {
 		t.Fatalf("second report=%#v effects=%d err=%v", secondReport, effects, err)
@@ -376,14 +460,79 @@ func TestReconcileMailDeliverySeatEscalatedRetryRemainsRetryableAndActionable(t 
 	store := maildelivery.NewStore(backing)
 	delivery := createMailDeliveryForReconcile(t, store, "retry-escalated", time.Date(2026, 8, 14, 3, 34, 0, 0, time.UTC))
 	resolver := fixedMailDeliveryFenceResolver{fence: testMailDeliveryFence()}
-	report, err := reconcileMailDeliverySeat(context.Background(), store, delivery.SeatRef, 1,
+	report, err := maildelivery.ReconcileSeat(context.Background(), store, delivery.SeatRef, 1,
 		time.Date(2026, 8, 14, 3, 34, 30, 0, time.UTC), resolver,
 		func(_ context.Context, attempt maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
-			return attempt, fmt.Errorf("%w: %w", maildelivery.ErrTransportRetryEscalated, maildelivery.ErrTransportRetrySafe)
+			attempt.ReceiptLookupFailureCount = maildelivery.TransportReceiptLookupEscalationThreshold
+			return attempt, errors.Join(maildelivery.ErrTransportRetryEscalated, maildelivery.ErrTransportReceiptLookupRetryLater)
 		})
 	if err != nil || !report.PageCommitted || !report.ActionRequired || len(report.Deliveries) != 1 ||
-		report.Deliveries[0].Outcome != mailDeliveryReconcileRetryable {
+		report.Deliveries[0].Outcome != mailDeliveryReconcileRetryable || report.Deliveries[0].Attempt == nil ||
+		report.Deliveries[0].Attempt.ReceiptLookupFailureCount != maildelivery.TransportReceiptLookupEscalationThreshold {
 		t.Fatalf("report=%#v err=%v", report, err)
+	}
+}
+
+func TestMailDeliveryWorkerInvokerRetainsCommittedReceiptAcrossPostEffectAuthorityDrift(t *testing.T) {
+	ctx := context.Background()
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".gc", "settings.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	sessBacking := beads.NewMemStore()
+	provider := &authorityDriftAfterStableNudgeProvider{Fake: runtime.NewFake()}
+	mgr := newSessionManagerWithConfig(cityPath, sessBacking, provider, cfg)
+	info, err := mgr.CreateSession(ctx, session.CreateOptions{
+		Alias: "reviewer", ExplicitName: "mail-reviewer", Template: "reviewer", Title: "Reviewer",
+		Command: "claude", WorkDir: t.TempDir(), Provider: "exec", Transport: "exec",
+		ExtraMeta: map[string]string{session.NamedSessionIdentityMetadata: "reviewer"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := &mailDeliveryFenceResolver{store: sessionFrontDoor(sessBacking), sessionRef: info.ID, options: session.MailActivationFenceOptions{
+		CityRef: "city:test-city", SeatRef: "seat:test-city/reviewer", ConfigSHA256: strings.Repeat("a", 64),
+		IssuedByRef: "controller:test-city/mail-delivery-cli",
+	}}
+	fence, err := resolver.ResolveMailActivationFence(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backing := beads.NewMemStore()
+	backing.HonorExplicitIDs = true
+	store := maildelivery.NewStore(backing)
+	delivery, err := maildelivery.NewDelivery("city:test-city/messaging", "msg-authority-drift", 1, fence.SeatRef,
+		maildelivery.PolicyNotifyOnly, maildelivery.AttentionImmediate, time.Date(2026, 8, 14, 15, 5, 0, 0, time.UTC), nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err = store.Create(delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err = store.Advance(delivery.ID, delivery.Revision, maildelivery.PhaseWaitingForActivation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := store.CreateTransportAttempt(ctx, maildelivery.TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision, ExpectedFenceID: fence.FenceID,
+		CoveredDeliveryIDs: []string{delivery.ID}, CreatedAt: time.Date(2026, 8, 14, 15, 6, 0, 0, time.UTC),
+	}, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.afterStableNudge = func() {
+		if setErr := sessBacking.SetMetadata(info.ID, "instance_token", "replacement-after-provider-acceptance"); setErr != nil {
+			t.Errorf("replace authority: %v", setErr)
+		}
+	}
+	receipt, err := mailDeliveryWorkerInvoker(cityPath, cfg, sessBacking, provider, resolver)(ctx, attempt)
+	if err != nil || receipt.State != maildelivery.EffectCommitted || receipt.ReceiptRef == "" || provider.StableNudgeEffectCount(attempt.NudgeID) != 1 {
+		t.Fatalf("invoke receipt=%#v err=%v effects=%d", receipt, err, provider.StableNudgeEffectCount(attempt.NudgeID))
 	}
 }
 
@@ -400,14 +549,14 @@ func TestReconcileMailDeliverySeatExistingAttemptWaitsWhenAuthorityUnavailable(t
 				return maildelivery.TransportReceipt{}, fmt.Errorf("%w: offline before effect", maildelivery.ErrTransportRetrySafe)
 			})
 	}
-	first, err := reconcileMailDeliverySeat(context.Background(), store, delivery.SeatRef, 1,
+	first, err := maildelivery.ReconcileSeat(context.Background(), store, delivery.SeatRef, 1,
 		time.Date(2026, 8, 14, 3, 35, 10, 0, time.UTC), resolver, retrySafe)
 	if err != nil || first.Deliveries[0].Outcome != mailDeliveryReconcileRetryable {
 		t.Fatalf("first=%#v err=%v", first, err)
 	}
 	offline := failingMailDeliveryFenceResolver{err: fmt.Errorf("%w: no active named session", maildelivery.ErrAuthorityUnavailable)}
 	called := false
-	second, err := reconcileMailDeliverySeat(context.Background(), store, delivery.SeatRef, 1,
+	second, err := maildelivery.ReconcileSeat(context.Background(), store, delivery.SeatRef, 1,
 		time.Date(2026, 8, 14, 3, 36, 0, 0, time.UTC), offline,
 		func(context.Context, maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
 			called = true
@@ -432,7 +581,7 @@ func TestReconcileMailDeliverySeatUnknownRemainsActionRequiredAcrossRefence(t *t
 				return maildelivery.TransportReceipt{}, errors.New("provider response lost after possible effect")
 			})
 	}
-	first, err := reconcileMailDeliverySeat(context.Background(), store, delivery.SeatRef, 1,
+	first, err := maildelivery.ReconcileSeat(context.Background(), store, delivery.SeatRef, 1,
 		time.Date(2026, 8, 14, 3, 37, 10, 0, time.UTC), resolver, unknown)
 	if err != nil || !first.ActionRequired || first.Deliveries[0].Outcome != mailDeliveryReconcileUnknownExternalState {
 		t.Fatalf("first=%#v err=%v", first, err)
@@ -442,7 +591,7 @@ func TestReconcileMailDeliverySeatUnknownRemainsActionRequiredAcrossRefence(t *t
 	refenced.AuthorityIntentSHA256 = strings.Repeat("9", 64)
 	refenced.FenceID = "mail-activation-" + refenced.AuthorityIntentSHA256
 	called := false
-	second, err := reconcileMailDeliverySeat(context.Background(), store, delivery.SeatRef, 1,
+	second, err := maildelivery.ReconcileSeat(context.Background(), store, delivery.SeatRef, 1,
 		time.Date(2026, 8, 14, 3, 38, 0, 0, time.UTC), fixedMailDeliveryFenceResolver{fence: refenced},
 		func(context.Context, maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
 			called = true
@@ -456,7 +605,7 @@ func TestReconcileMailDeliverySeatUnknownRemainsActionRequiredAcrossRefence(t *t
 }
 
 func TestClassifyMailDeliveryExecutionDoesNotHideIdentityConflict(t *testing.T) {
-	_, err := classifyMailDeliveryExecution(maildelivery.TransportAttempt{}, fmt.Errorf("%w: identity differs", maildelivery.ErrConflict))
+	_, err := maildelivery.ClassifyExecution(maildelivery.TransportAttempt{}, fmt.Errorf("%w: identity differs", maildelivery.ErrConflict))
 	if !errors.Is(err, maildelivery.ErrConflict) {
 		t.Fatalf("identity conflict classified as retryable: %v", err)
 	}
@@ -467,7 +616,7 @@ func TestReconcileMailDeliverySeatRejectsInvalidObservationBeforeStoreMutation(t
 	backing.HonorExplicitIDs = true
 	store := maildelivery.NewStore(backing)
 	observedAt := time.Date(2026, 8, 14, 3, 15, 0, 0, time.FixedZone("offset", 3600))
-	if _, err := reconcileMailDeliverySeat(context.Background(), store, "seat:test-city/reviewer", 1,
+	if _, err := maildelivery.ReconcileSeat(context.Background(), store, "seat:test-city/reviewer", 1,
 		observedAt, fixedMailDeliveryFenceResolver{fence: testMailDeliveryFence()}, nil); err == nil {
 		t.Fatal("non-UTC observation accepted")
 	}

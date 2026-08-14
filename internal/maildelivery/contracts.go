@@ -81,11 +81,21 @@ func DeliveryID(storeRef, messageID, seatRef string) (string, error) {
 	return "mail-delivery-" + digest("mail-delivery-v1", storeRef, messageID, seatRef), nil
 }
 
+// ValidateDeliveryID rejects caller-shaped or noncanonical durable delivery
+// identities. CLI and API adapters use this domain validator rather than
+// maintaining their own wire parser.
+func ValidateDeliveryID(value string) error {
+	if !validPrefixedHash(value, "mail-delivery-") {
+		return fmt.Errorf("delivery ID is invalid")
+	}
+	return nil
+}
+
 // AttemptID returns the stable identity for one delivery under logical authority.
 // Issuance-only fence metadata is deliberately excluded.
 func AttemptID(deliveryID string, fence ActivationFence) (string, error) {
-	if !validPrefixedHash(deliveryID, "mail-delivery-") {
-		return "", fmt.Errorf("delivery ID is invalid")
+	if err := ValidateDeliveryID(deliveryID); err != nil {
+		return "", err
 	}
 	if err := fence.Validate(); err != nil {
 		return "", err

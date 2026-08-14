@@ -34,24 +34,24 @@ func TestSendDurableStableDerivesDomainBoundIdentityAndReplaysExactly(t *testing
 	provider := New(backing)
 	intent := stableDurableIntent()
 
-	firstMessage, firstDelivery, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
+	first, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
 	if err != nil {
 		t.Fatalf("first SendDurableStable: %v", err)
 	}
-	secondMessage, secondDelivery, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
+	second, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
 	if err != nil {
 		t.Fatalf("replayed SendDurableStable: %v", err)
 	}
-	if firstMessage.ID == "" || !strings.HasPrefix(firstMessage.ID, "gc-mail-") {
-		t.Fatalf("stable message id = %q", firstMessage.ID)
+	if first.Message.ID == "" || !strings.HasPrefix(first.Message.ID, "gc-mail-") || first.Outcome != DurableSendCreated {
+		t.Fatalf("first stable result = %#v", first)
 	}
-	if !reflect.DeepEqual(secondMessage, firstMessage) || !reflect.DeepEqual(secondDelivery, firstDelivery) {
-		t.Fatalf("replay = %#v / %#v, want %#v / %#v", secondMessage, secondDelivery, firstMessage, firstDelivery)
+	if second.Outcome != DurableSendExactReplay || !reflect.DeepEqual(second.Message, first.Message) || !reflect.DeepEqual(second.Delivery, first.Delivery) {
+		t.Fatalf("replay = %#v, want exact replay of %#v", second, first)
 	}
-	if _, _, err := provider.SendDurableStable("sender", "reviewer", "subject", "changed body", intent); !errors.Is(err, maildelivery.ErrConflict) {
+	if _, err := provider.SendDurableStable("sender", "reviewer", "subject", "changed body", intent); !errors.Is(err, maildelivery.ErrConflict) {
 		t.Fatalf("changed-content replay error = %v, want ErrConflict", err)
 	}
-	if _, _, err := provider.SendDurableStable("sender", "other", "subject", "body", intent); !errors.Is(err, maildelivery.ErrConflict) {
+	if _, err := provider.SendDurableStable("sender", "other", "subject", "body", intent); !errors.Is(err, maildelivery.ErrConflict) {
 		t.Fatalf("changed-recipient replay error = %v, want ErrConflict", err)
 	}
 
@@ -59,8 +59,8 @@ func TestSendDurableStableDerivesDomainBoundIdentityAndReplaysExactly(t *testing
 	if err != nil {
 		t.Fatalf("durableStableMessageID: %v", err)
 	}
-	if firstMessage.ID != wantID {
-		t.Fatalf("message id = %q, want %q", firstMessage.ID, wantID)
+	if first.Message.ID != wantID {
+		t.Fatalf("message id = %q, want %q", first.Message.ID, wantID)
 	}
 	for name, mutate := range map[string]func(*StableDurableSendIntent){
 		"city": func(i *StableDurableSendIntent) {
@@ -89,20 +89,20 @@ func TestSendDurableStableReplayReturnsAdvancedDeliveryPhase(t *testing.T) {
 	provider := New(backing)
 	intent := stableDurableIntent()
 
-	message, created, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
+	first, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
 	if err != nil {
 		t.Fatalf("first SendDurableStable: %v", err)
 	}
-	advanced, err := maildelivery.NewStore(backing).Advance(created.ID, created.Revision, maildelivery.PhaseWaitingForActivation)
+	advanced, err := maildelivery.NewStore(backing).Advance(first.Delivery.ID, first.Delivery.Revision, maildelivery.PhaseWaitingForActivation)
 	if err != nil {
 		t.Fatalf("Advance: %v", err)
 	}
-	replayedMessage, replayedDelivery, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
+	replayed, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
 	if err != nil {
 		t.Fatalf("replay after phase advance: %v", err)
 	}
-	if replayedMessage.ID != message.ID || !reflect.DeepEqual(replayedDelivery, advanced) {
-		t.Fatalf("advanced replay = %#v / %#v, want message %q and %#v", replayedMessage, replayedDelivery, message.ID, advanced)
+	if replayed.Outcome != DurableSendExactReplay || replayed.Message.ID != first.Message.ID || !reflect.DeepEqual(replayed.Delivery, advanced) {
+		t.Fatalf("advanced replay = %#v, want message %q and %#v", replayed, first.Message.ID, advanced)
 	}
 }
 
@@ -112,22 +112,42 @@ func TestSendDurableStableReplaySurvivesMessageReadAndArchiveDrift(t *testing.T)
 	provider := New(backing)
 	intent := stableDurableIntent()
 
-	message, delivery, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
+	first, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
 	if err != nil {
 		t.Fatalf("first SendDurableStable: %v", err)
 	}
-	if err := provider.MarkRead(message.ID); err != nil {
+	if err := provider.MarkRead(first.Message.ID); err != nil {
 		t.Fatalf("MarkRead: %v", err)
 	}
-	if err := provider.Archive(message.ID); err != nil {
+	if err := provider.Archive(first.Message.ID); err != nil {
 		t.Fatalf("Archive: %v", err)
 	}
-	replayedMessage, replayedDelivery, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
+	replayed, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
 	if err != nil {
 		t.Fatalf("replay after message drift: %v", err)
 	}
-	if replayedMessage.ID != message.ID || !reflect.DeepEqual(replayedDelivery, delivery) {
-		t.Fatalf("replay = %#v / %#v, want message %q and %#v", replayedMessage, replayedDelivery, message.ID, delivery)
+	if replayed.Outcome != DurableSendExactReplay || replayed.Message.ID != first.Message.ID || !reflect.DeepEqual(replayed.Delivery, first.Delivery) {
+		t.Fatalf("replay = %#v, want %#v", replayed, first)
+	}
+}
+
+func TestSendDurableStableReportsMessageOnlyRepairThenExactReplay(t *testing.T) {
+	backing := &failNthCreateStore{MemStore: beads.NewMemStore(), failAt: 2}
+	backing.HonorExplicitIDs = true
+	provider := New(backing)
+	intent := stableDurableIntent()
+	messageOnly, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
+	if err == nil || messageOnly.Message.ID == "" || messageOnly.Delivery.ID != "" {
+		t.Fatalf("message-only result = %#v, %v", messageOnly, err)
+	}
+	backing.failAt = 0
+	repaired, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
+	if err != nil || repaired.Outcome != DurableSendMessageOnlyRepaired || repaired.Message.ID != messageOnly.Message.ID || repaired.Delivery.ID == "" {
+		t.Fatalf("repair result = %#v, %v", repaired, err)
+	}
+	replay, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
+	if err != nil || replay.Outcome != DurableSendExactReplay || !reflect.DeepEqual(replay.Message, repaired.Message) || !reflect.DeepEqual(replay.Delivery, repaired.Delivery) {
+		t.Fatalf("exact replay = %#v, %v; want %#v", replay, err, repaired)
 	}
 }
 
@@ -145,7 +165,7 @@ func TestSendDurableStableRejectsUnboundedOrCrossCityIdentityBeforeWrite(t *test
 			backing.HonorExplicitIDs = true
 			intent := stableDurableIntent()
 			mutate(&intent)
-			if _, _, err := New(backing).SendDurableStable("sender", "reviewer", "subject", "body", intent); err == nil {
+			if _, err := New(backing).SendDurableStable("sender", "reviewer", "subject", "body", intent); err == nil {
 				t.Fatal("SendDurableStable succeeded")
 			}
 			rows, err := backing.List(beads.ListQuery{AllowScan: true, IncludeClosed: true, TierMode: beads.TierBoth})

@@ -59,8 +59,21 @@ func executeTransport(ctx context.Context, store *Store, request TransportAttemp
 		}
 		receipt, lookupErr := lookup(ctx, attempt)
 		if lookupErr != nil {
-			unknown, markErr := store.RecordUnknownTransportState(attempt.AttemptID, attempt.Revision, uncertainAt)
-			return unknown, errors.Join(fmt.Errorf("mail delivery destination receipt lookup failed: %w", lookupErr), markErr)
+			counted, countErr := store.RecordTransportReceiptLookupFailure(attempt.AttemptID, attempt.Revision)
+			if countErr != nil {
+				if current, loadErr := store.TransportAttempt(attempt.AttemptID); loadErr == nil {
+					counted = current
+				} else {
+					counted = attempt
+				}
+			}
+			lookupFailure := errors.Join(ErrTransportReceiptLookupRetryLater, lookupErr, countErr)
+			if counted.ReceiptLookupFailureCount >= TransportReceiptLookupEscalationThreshold {
+				return counted, fmt.Errorf("receipt lookup failure count %d reached threshold %d: %w",
+					counted.ReceiptLookupFailureCount, TransportReceiptLookupEscalationThreshold,
+					errors.Join(ErrTransportRetryEscalated, lookupFailure))
+			}
+			return counted, lookupFailure
 		}
 		switch receipt.State {
 		case EffectCommitted:

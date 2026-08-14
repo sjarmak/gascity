@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -48,8 +49,22 @@ type messageOnlyDurableMailProvider struct {
 	delivery maildelivery.Delivery
 }
 
-func (p messageOnlyDurableMailProvider) SendDurableStable(_, _, _, _ string, _ beadmail.StableDurableSendIntent) (mail.Message, maildelivery.Delivery, error) {
-	return mail.Message{ID: "gc-mail-message-only", From: "sender", To: "reviewer"}, p.delivery, errors.New("injected delivery write failure")
+type durableSendEventRecorder struct {
+	mu     sync.Mutex
+	events []events.Event
+}
+
+func (r *durableSendEventRecorder) Record(event events.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, event)
+}
+
+func (p messageOnlyDurableMailProvider) SendDurableStable(_, _, _, _ string, _ beadmail.StableDurableSendIntent) (beadmail.DurableSendResult, error) {
+	return beadmail.DurableSendResult{
+		Message:  mail.Message{ID: "gc-mail-message-only", From: "sender", To: "reviewer"},
+		Delivery: p.delivery, Outcome: beadmail.DurableSendCreated,
+	}, errors.New("injected delivery write failure")
 }
 
 func (countOnlyMailProvider) Send(string, string, string, string) (mail.Message, error) {
@@ -3241,6 +3256,81 @@ func TestDoMailSendDurableJSONReportsIntentWithoutRuntimeNotification(t *testing
 	rows, err := store.List(beads.ListQuery{AllowScan: true, IncludeClosed: true, TierMode: beads.TierBoth})
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("durable rows = %#v, %v", rows, err)
+	}
+}
+
+func TestDoMailSendDurableExactConcurrentReplayHasOneCreationTelemetryOwner(t *testing.T) {
+	store := beads.NewMemStore()
+	store.HonorExplicitIDs = true
+	provider := beadmail.New(store)
+	request := durableMailSendRequest{
+		StableKey: "concurrent-canary", Notify: true, Recipient: "reviewer", Sender: "sender",
+		Subject: "subject", Body: "body", CityRef: "city:test-city",
+		MessagingStoreRef: "city:test-city/messaging", SeatRef: "seat:test-city/reviewer",
+	}
+	recorder := &durableSendEventRecorder{}
+	var telemetryMu sync.Mutex
+	var telemetryOps []string
+	previousRecorder := recordDurableMailOp
+	recordDurableMailOp = func(_ context.Context, operation string, _ error) {
+		telemetryMu.Lock()
+		defer telemetryMu.Unlock()
+		telemetryOps = append(telemetryOps, operation)
+	}
+	defer func() { recordDurableMailOp = previousRecorder }()
+
+	results := make(chan durableMailSendResult, 3)
+	errs := make(chan string, 3)
+	run := func() {
+		var stdout, stderr bytes.Buffer
+		if code := doMailSendDurableJSON(provider, recorder, request, true, &stdout, &stderr); code != 0 {
+			errs <- stderr.String()
+			return
+		}
+		var result durableMailSendResult
+		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+			errs <- err.Error()
+			return
+		}
+		results <- result
+	}
+	var group sync.WaitGroup
+	for range 2 {
+		group.Add(1)
+		go func() { defer group.Done(); run() }()
+	}
+	group.Wait()
+	run() // a settled exact replay must also remain observability-silent
+	close(results)
+	close(errs)
+	for errText := range errs {
+		t.Fatalf("durable send failed: %s", errText)
+	}
+	created := 0
+	for result := range results {
+		if result.Outcome == string(beadmail.DurableSendCreated) {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("created outcomes = %d, want one", created)
+	}
+	recorder.mu.Lock()
+	eventCount := len(recorder.events)
+	recorder.mu.Unlock()
+	if eventCount != 1 {
+		t.Fatalf("mail.sent events = %d, want one", eventCount)
+	}
+	telemetryMu.Lock()
+	defer telemetryMu.Unlock()
+	sendCount := 0
+	for _, operation := range telemetryOps {
+		if operation == "send" {
+			sendCount++
+		}
+	}
+	if sendCount != 1 {
+		t.Fatalf("send telemetry = %v, want one creation owner", telemetryOps)
 	}
 }
 

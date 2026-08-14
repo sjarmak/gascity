@@ -123,6 +123,54 @@ func TestStoreTransportReceiptCommitsOnceAndConflictingRepeatFails(t *testing.T)
 	}
 }
 
+func TestStoreRecordTransportReceiptLookupFailureUsesCASAndPreservesAttempt(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	attempt, err := store.CreateTransportAttempt(context.Background(), TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 14, 15, 0, 0, 0, time.UTC),
+	}, fixedFenceResolver{fence: fence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invoking, err := store.BeginTransportInvocation(attempt.AttemptID, attempt.Revision, attempt.CreatedAt.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	counted, err := store.RecordTransportReceiptLookupFailure(invoking.AttemptID, invoking.Revision)
+	if err != nil || counted.ReceiptLookupFailureCount != 1 || counted.State != TransportInvoking || counted.Receipt != (TransportReceipt{}) {
+		t.Fatalf("first lookup failure = %#v, %v", counted, err)
+	}
+	if _, err := store.RecordTransportReceiptLookupFailure(invoking.AttemptID, invoking.Revision); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale replay = %v, want ErrConflict", err)
+	}
+	persisted, err := store.TransportAttempt(invoking.AttemptID)
+	if err != nil || !reflect.DeepEqual(persisted, counted) {
+		t.Fatalf("persisted = %#v, %v; want %#v", persisted, err, counted)
+	}
+	originalWriter := store.writer
+	store.writer = lookupFailurePreconditionWriter{ConditionalWriter: originalWriter}
+	if _, err := store.RecordTransportReceiptLookupFailure(counted.AttemptID, counted.Revision); !errors.Is(err, ErrConflict) {
+		t.Fatalf("CAS loser = %v, want ErrConflict", err)
+	}
+	store.writer = nil
+	if _, err := store.RecordTransportReceiptLookupFailure(counted.AttemptID, counted.Revision); err == nil {
+		t.Fatal("missing conditional writer accepted lookup failure")
+	}
+	store.writer = originalWriter
+	if _, err := store.RecordTransportReceiptLookupFailure("mail-attempt-missing", 1); err == nil {
+		t.Fatal("missing attempt accepted lookup failure")
+	}
+}
+
+type lookupFailurePreconditionWriter struct{ beads.ConditionalWriter }
+
+func (lookupFailurePreconditionWriter) UpdateIfMatch(id string, expected int64, _ beads.UpdateOpts) error {
+	return &beads.PreconditionFailedError{ID: id, Expected: expected, Current: expected + 1}
+}
+
 type failTransportFinalizeStore struct {
 	*beads.MemStore
 	deliveryID string

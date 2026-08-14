@@ -106,11 +106,14 @@ type durableMailSendResult struct {
 	RuntimeNotified       bool   `json:"runtime_notified"`
 	Notified              bool   `json:"notified"`
 	ActionRequired        bool   `json:"action_required"`
+	Outcome               string `json:"outcome,omitempty"`
 }
 
 type stableDurableMailSender interface {
-	SendDurableStable(string, string, string, string, beadmail.StableDurableSendIntent) (mail.Message, maildelivery.Delivery, error)
+	SendDurableStable(string, string, string, string, beadmail.StableDurableSendIntent) (beadmail.DurableSendResult, error)
 }
+
+var recordDurableMailOp = telemetry.RecordMailOp
 
 type mailMessageSummary struct {
 	ID       string `json:"id"`
@@ -1602,6 +1605,21 @@ func cmdMailSendDurable(args []string, notify, all bool, from, to, subject, mess
 		fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	if cityPath, resolveErr := resolveCity(); resolveErr == nil {
+		if client := apiClient(cityPath); client != nil {
+			senderCandidates := []string{from}
+			if from == "" {
+				senderCandidates = defaultMailIdentityCandidates()
+			}
+			domainResult, apiErr := client.SendDurableMail(api.DurableMailCommand{
+				StableKey: stableKey, Recipient: request.Recipient, SenderCandidates: senderCandidates,
+				Subject: request.Subject, Body: request.Body,
+			})
+			if apiErr == nil || !api.ShouldFallback(client, apiErr) {
+				return renderDurableMailSendResult(domainResult, apiErr, request, jsonOut, stdout, stderr)
+			}
+		}
+	}
 
 	mp, code := openCityMailProvider(stderr, "gc mail send")
 	if mp == nil {
@@ -1657,17 +1675,29 @@ func doMailSendDurableJSON(mp mail.Provider, rec events.Recorder, request durabl
 		fmt.Fprintf(stderr, "gc mail send: configured mail provider %T does not support durable notifications\n", mp) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	message, delivery, err := sender.SendDurableStable(request.Sender, request.Recipient, request.Subject, request.Body, beadmail.StableDurableSendIntent{
+	domainResult, err := sender.SendDurableStable(request.Sender, request.Recipient, request.Subject, request.Body, beadmail.StableDurableSendIntent{
 		CityRef: request.CityRef, MessagingStoreRef: request.MessagingStoreRef, SeatRef: request.SeatRef,
 		StableKey: request.StableKey, Policy: maildelivery.PolicyNotifyOnly, Attention: maildelivery.AttentionImmediate,
 	})
-	telemetry.RecordMailOp(context.Background(), "send", err)
-	if message.ID != "" {
+	message := domainResult.Message
+	switch domainResult.Outcome {
+	case beadmail.DurableSendCreated:
+		recordDurableMailOp(context.Background(), "send", err)
+	case beadmail.DurableSendMessageOnlyRepaired:
+		recordDurableMailOp(context.Background(), "send_repair", err)
+	}
+	if domainResult.Outcome == beadmail.DurableSendCreated && message.ID != "" {
 		rec.Record(events.Event{Type: events.MailSent, Actor: message.From, Subject: message.ID, Message: request.Recipient, Payload: mailEventPayload(&message)})
 	}
+	return renderDurableMailSendResult(domainResult, err, request, jsonOut, stdout, stderr)
+}
+
+func renderDurableMailSendResult(domainResult beadmail.DurableSendResult, err error, request durableMailSendRequest, jsonOut bool, stdout, stderr io.Writer) int {
+	message, delivery := domainResult.Message, domainResult.Delivery
 	result := durableMailSendResult{
 		SchemaVersion: "mail-durable-send/v1", OK: err == nil, Command: "mail.send", Action: "durable-notify",
 		MessageID: message.ID, DeliveryID: delivery.ID, NotificationRequested: true, RuntimeNotified: false, Notified: false,
+		Outcome: string(domainResult.Outcome),
 	}
 	if delivery.ID != "" {
 		result.Phase = string(delivery.Phase)
