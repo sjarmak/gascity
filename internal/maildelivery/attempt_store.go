@@ -27,6 +27,10 @@ const (
 // is owned by another caller and canonical state was left unchanged.
 var ErrTransportInvocationInProgress = errors.New("mail delivery transport invocation is in progress")
 
+// ErrTransportInvocationRace identifies a benign competing claimant. It also
+// wraps ErrConflict for callers that need the broader compatibility class.
+var ErrTransportInvocationRace = errors.New("mail delivery transport invocation race")
+
 // ErrTransportRetrySafe permits only an identical stable-effect retry.
 var ErrTransportRetrySafe = errors.New("mail delivery transport invocation is safe to retry with the same effect ID")
 
@@ -211,7 +215,17 @@ func (s *Store) transportAttemptForExpected(deliveryID string, expectedRevision 
 	if err != nil {
 		return TransportAttempt{}, false, err
 	}
-	if revision != expectedRevision || attemptID != proposed.AttemptID {
+	if revision != expectedRevision {
+		delivery, decodeErr := decodeDelivery(raw)
+		if decodeErr == nil && delivery.Phase == PhaseWaitingForActivation && delivery.Revision == expectedRevision {
+			previous, loadErr := s.TransportAttempt(attemptID)
+			if loadErr == nil && previous.State == TransportRequested {
+				return TransportAttempt{}, false, nil
+			}
+		}
+		return TransportAttempt{}, false, fmt.Errorf("%w: canonical transport attempt link differs from request", ErrConflict)
+	}
+	if attemptID != proposed.AttemptID {
 		return TransportAttempt{}, false, fmt.Errorf("%w: canonical transport attempt link differs from request", ErrConflict)
 	}
 	existing, err := s.TransportAttempt(attemptID)
@@ -237,7 +251,7 @@ func (s *Store) committedTransportAttemptForDelivery(deliveryID string) (Transpo
 	if err != nil {
 		return TransportAttempt{}, err
 	}
-	if attempt.DeliveryID != deliveryID || attempt.State != TransportCommitted || attempt.Receipt.State != EffectCommitted {
+	if !slices.Contains(attempt.CoveredDeliveryIDs, deliveryID) || attempt.State != TransportCommitted || attempt.Receipt.State != EffectCommitted {
 		return TransportAttempt{}, fmt.Errorf("%w: delivery has no committed canonical transport receipt", ErrConflict)
 	}
 	return attempt, nil
@@ -300,7 +314,7 @@ func (s *Store) BeginTransportInvocation(attemptID string, expectedRevision uint
 	}
 	if err := s.writer.UpdateIfMatch(attemptID, int64(expectedRevision), beads.UpdateOpts{Metadata: map[string]string{transportAttemptDataKey: payload}}); err != nil {
 		if beads.IsPreconditionFailed(err) {
-			return TransportAttempt{}, fmt.Errorf("%w: transport invocation already claimed", ErrConflict)
+			return TransportAttempt{}, fmt.Errorf("%w: %w: transport invocation already claimed", ErrTransportInvocationRace, ErrConflict)
 		}
 		return TransportAttempt{}, fmt.Errorf("beginning mail delivery transport invocation: %w", err)
 	}
@@ -404,7 +418,16 @@ func (s *Store) finishTransportAttempt(attemptID string, expectedRevision uint64
 }
 
 func (s *Store) finalizeCommittedTransport(attempt TransportAttempt) error {
-	delivery, err := s.Get(attempt.DeliveryID)
+	for _, deliveryID := range attempt.CoveredDeliveryIDs {
+		if err := s.finalizeCoveredTransport(deliveryID, attempt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) finalizeCoveredTransport(deliveryID string, attempt TransportAttempt) error {
+	delivery, err := s.Get(deliveryID)
 	if err != nil {
 		return err
 	}
@@ -441,6 +464,67 @@ func (s *Store) finalizeCommittedTransport(attempt TransportAttempt) error {
 			return fmt.Errorf("%w: delivery revision moved before runtime-notified commit", ErrConflict)
 		}
 		return fmt.Errorf("committing mail delivery runtime-notified phase: %w", err)
+	}
+	return nil
+}
+
+// LinkCoveredTransportAttempt repairs the crash gap between creation of one
+// coalesced attempt and linking every covered delivery. It never changes the
+// attempt identity or invokes the external effect.
+func (s *Store) LinkCoveredTransportAttempt(attempt TransportAttempt) error {
+	if err := attempt.validate(); err != nil {
+		return err
+	}
+	for _, deliveryID := range attempt.CoveredDeliveryIDs {
+		delivery, err := s.Get(deliveryID)
+		if err != nil {
+			return err
+		}
+		if delivery.Phase == PhaseNotificationRequested || delivery.Phase == PhaseRuntimeNotified {
+			linked, err := s.linkedTransportAttempt(delivery.ID)
+			if err != nil || linked.AttemptID != attempt.AttemptID {
+				return fmt.Errorf("%w: covered delivery %q has a different transport attempt", ErrConflict, delivery.ID)
+			}
+			continue
+		}
+		if delivery.Phase != PhaseWaitingForActivation {
+			return fmt.Errorf("%w: covered delivery %q is in phase %q", ErrConflict, delivery.ID, delivery.Phase)
+		}
+		if err := s.linkCoveredTransportAttempt(delivery, attempt); err != nil {
+			return err
+		}
+	}
+	if attempt.State == TransportCommitted {
+		return s.finalizeCommittedTransport(attempt)
+	}
+	return nil
+}
+
+func (s *Store) linkCoveredTransportAttempt(delivery Delivery, attempt TransportAttempt) error {
+	if !slices.Contains(attempt.CoveredDeliveryIDs, delivery.ID) {
+		return fmt.Errorf("%w: transport attempt does not cover delivery %q", ErrConflict, delivery.ID)
+	}
+	delivery.Phase = PhaseNotificationRequested
+	payload, err := encodeDelivery(delivery)
+	if err != nil {
+		return err
+	}
+	if s.writer == nil {
+		return fmt.Errorf("mail delivery conditional writes unavailable")
+	}
+	err = s.writer.UpdateIfMatch(delivery.ID, int64(delivery.Revision), beads.UpdateOpts{Metadata: map[string]string{
+		deliveryDataKey: payload, deliveryPhaseKey: string(PhaseNotificationRequested),
+		transportAttemptLinkKey: receiptLink(delivery.Revision, attempt.AttemptID),
+	}})
+	if err != nil {
+		if beads.IsPreconditionFailed(err) {
+			linked, loadErr := s.linkedTransportAttempt(delivery.ID)
+			if loadErr == nil && linked.AttemptID == attempt.AttemptID {
+				return nil
+			}
+			return fmt.Errorf("%w: delivery revision moved before coalesced transport link", ErrConflict)
+		}
+		return fmt.Errorf("linking coalesced mail delivery transport attempt: %w", err)
 	}
 	return nil
 }

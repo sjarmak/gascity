@@ -182,6 +182,163 @@ func TestStoreTransportReceiptRepairsCommitBeforeDeliveryFinalize(t *testing.T) 
 	}
 }
 
+func TestStoreCoalescedTransportReceiptFinalizesEveryCoveredDelivery(t *testing.T) {
+	store, _ := newDeliveryStore()
+	primary := createWaitingDelivery(t, store)
+	secondaryInput, err := NewDelivery(primary.StoreRef, "msg-2", primary.MessageRevision, primary.SeatRef,
+		primary.Policy, primary.Attention, primary.CreatedAt.Add(time.Second), nil, "")
+	if err != nil {
+		t.Fatalf("NewDelivery secondary: %v", err)
+	}
+	secondary, err := store.Create(secondaryInput)
+	if err != nil {
+		t.Fatalf("Create secondary: %v", err)
+	}
+	secondary, err = store.Advance(secondary.ID, secondary.Revision, PhaseWaitingForActivation)
+	if err != nil {
+		t.Fatalf("Advance secondary: %v", err)
+	}
+
+	fence := validFence()
+	attempt, err := store.CreateTransportAttempt(context.Background(), TransportAttemptRequest{
+		DeliveryID: primary.ID, ExpectedDeliveryRevision: primary.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{secondary.ID, primary.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 3, 50, 0, time.UTC),
+	}, fixedFenceResolver{fence: fence})
+	if err != nil {
+		t.Fatalf("CreateTransportAttempt: %v", err)
+	}
+	invoking, err := store.BeginTransportInvocation(attempt.AttemptID, attempt.Revision, attempt.CreatedAt.Add(time.Second))
+	if err != nil {
+		t.Fatalf("BeginTransportInvocation: %v", err)
+	}
+	receipt := TransportReceipt{
+		Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
+		State: EffectCommitted, CommitBoundary: TransportCommitBoundaryDestinationAtomic,
+		ReceiptRef:    "nudge-receipt:test-city/coalesced",
+		ReceiptSHA256: strings.Repeat("d", 64),
+		RecordedAt:    time.Date(2026, 8, 13, 23, 3, 55, 0, time.UTC),
+	}
+	committed, err := store.RecordTransportReceipt(attempt.AttemptID, invoking.Revision, receipt)
+	if err == nil || committed.State != TransportCommitted {
+		t.Fatalf("RecordTransportReceipt before secondary link = %#v, %v; want durable commit plus repair error", committed, err)
+	}
+	primaryAfterCommit, getErr := store.Get(primary.ID)
+	if getErr != nil || primaryAfterCommit.Phase != PhaseRuntimeNotified {
+		t.Fatalf("primary after partial finalize = %#v, %v", primaryAfterCommit, getErr)
+	}
+	secondaryBeforeRepair, getErr := store.Get(secondary.ID)
+	if getErr != nil || secondaryBeforeRepair.Phase != PhaseWaitingForActivation {
+		t.Fatalf("secondary before repair = %#v, %v", secondaryBeforeRepair, getErr)
+	}
+	if err := store.LinkCoveredTransportAttempt(committed); err != nil {
+		t.Fatalf("LinkCoveredTransportAttempt repair: %v", err)
+	}
+	if err := store.LinkCoveredTransportAttempt(committed); err != nil {
+		t.Fatalf("idempotent LinkCoveredTransportAttempt: %v", err)
+	}
+	for _, deliveryID := range []string{primary.ID, secondary.ID} {
+		delivery, getErr := store.Get(deliveryID)
+		if getErr != nil || delivery.Phase != PhaseRuntimeNotified {
+			t.Fatalf("delivery %s = %#v, %v", deliveryID, delivery, getErr)
+		}
+		linked, linkErr := store.committedTransportAttemptForDelivery(deliveryID)
+		if linkErr != nil || !reflect.DeepEqual(linked, committed) {
+			t.Fatalf("committed attempt for %s = %#v, %v; want %#v", deliveryID, linked, linkErr, committed)
+		}
+	}
+}
+
+func TestStoreCommittedTransportCannotBeReplacedAfterDeliveryReturnsToWaiting(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	attempt, err := store.CreateTransportAttempt(context.Background(), TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 3, 56, 0, time.UTC),
+	}, fixedFenceResolver{fence: fence})
+	if err != nil {
+		t.Fatalf("CreateTransportAttempt: %v", err)
+	}
+	invoking, err := store.BeginTransportInvocation(attempt.AttemptID, attempt.Revision, attempt.CreatedAt.Add(time.Second))
+	if err != nil {
+		t.Fatalf("BeginTransportInvocation: %v", err)
+	}
+	_, err = store.RecordTransportReceipt(attempt.AttemptID, invoking.Revision, TransportReceipt{
+		Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
+		State: EffectCommitted, CommitBoundary: TransportCommitBoundaryDestinationAtomic,
+		ReceiptRef:    "nudge-receipt:test-city/committed",
+		ReceiptSHA256: strings.Repeat("e", 64),
+		RecordedAt:    time.Date(2026, 8, 13, 23, 3, 58, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("RecordTransportReceipt: %v", err)
+	}
+	delivery, err = store.Get(delivery.ID)
+	if err != nil {
+		t.Fatalf("Get committed delivery: %v", err)
+	}
+	delivery, err = store.Advance(delivery.ID, delivery.Revision, PhaseWaitingForActivation)
+	if err != nil {
+		t.Fatalf("Advance back to waiting: %v", err)
+	}
+	changedFence := fence
+	changedFence.AuthorityGeneration++
+	changedFence.AuthorityIntentSHA256 = strings.Repeat("f", 64)
+	changedFence.FenceID = "mail-activation-" + changedFence.AuthorityIntentSHA256
+	_, err = store.CreateTransportAttempt(context.Background(), TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: changedFence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 4, 0, 0, time.UTC),
+	}, fixedFenceResolver{fence: changedFence})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("replacement after committed transport = %v, want ErrConflict", err)
+	}
+	linked, linkErr := store.committedTransportAttemptForDelivery(delivery.ID)
+	if linkErr != nil || linked.AttemptID != attempt.AttemptID {
+		t.Fatalf("canonical committed attempt = %#v, %v; want %s", linked, linkErr, attempt.AttemptID)
+	}
+}
+
+func TestStoreCoalescedTransportRejectsCompetingCoveredDeliveryLink(t *testing.T) {
+	store, _ := newDeliveryStore()
+	primary := createWaitingDelivery(t, store)
+	secondaryInput, err := NewDelivery(primary.StoreRef, "msg-competing", primary.MessageRevision, primary.SeatRef,
+		primary.Policy, primary.Attention, primary.CreatedAt.Add(time.Second), nil, "")
+	if err != nil {
+		t.Fatalf("NewDelivery secondary: %v", err)
+	}
+	secondary, err := store.Create(secondaryInput)
+	if err != nil {
+		t.Fatalf("Create secondary: %v", err)
+	}
+	secondary, err = store.Advance(secondary.ID, secondary.Revision, PhaseWaitingForActivation)
+	if err != nil {
+		t.Fatalf("Advance secondary: %v", err)
+	}
+	fence := validFence()
+	coalesced, err := store.CreateTransportAttempt(context.Background(), TransportAttemptRequest{
+		DeliveryID: primary.ID, ExpectedDeliveryRevision: primary.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{primary.ID, secondary.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 4, 1, 0, time.UTC),
+	}, fixedFenceResolver{fence: fence})
+	if err != nil {
+		t.Fatalf("Create coalesced attempt: %v", err)
+	}
+	competing, err := store.CreateTransportAttempt(context.Background(), TransportAttemptRequest{
+		DeliveryID: secondary.ID, ExpectedDeliveryRevision: secondary.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{secondary.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 4, 2, 0, time.UTC),
+	}, fixedFenceResolver{fence: fence})
+	if err != nil {
+		t.Fatalf("Create competing attempt: %v", err)
+	}
+	if err := store.LinkCoveredTransportAttempt(coalesced); !errors.Is(err, ErrConflict) {
+		t.Fatalf("LinkCoveredTransportAttempt with competing %s = %v, want ErrConflict", competing.AttemptID, err)
+	}
+}
+
 func TestStoreUnreceiptedAttemptBecomesUnknownAndCannotRedeliver(t *testing.T) {
 	store, _ := newDeliveryStore()
 	delivery := createWaitingDelivery(t, store)
@@ -219,6 +376,42 @@ func TestStoreUnreceiptedAttemptBecomesUnknownAndCannotRedeliver(t *testing.T) {
 	loaded, err := store.TransportAttempt(attempt.AttemptID)
 	if err != nil || !reflect.DeepEqual(loaded, unknown) {
 		t.Fatalf("TransportAttempt = %#v, %v; want %#v", loaded, err, unknown)
+	}
+}
+
+func TestStoreRetrySafeReleasePreservesStableEffectIdentity(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	attempt, err := store.CreateTransportAttempt(context.Background(), TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 6, 10, 0, time.UTC),
+	}, fixedFenceResolver{fence: fence})
+	if err != nil {
+		t.Fatalf("CreateTransportAttempt: %v", err)
+	}
+	first, err := store.BeginTransportInvocation(attempt.AttemptID, attempt.Revision, attempt.CreatedAt.Add(time.Second))
+	if err != nil {
+		t.Fatalf("BeginTransportInvocation: %v", err)
+	}
+	if _, err := store.ReleaseTransportInvocation(attempt.AttemptID, first.Revision+1); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale release = %v, want ErrConflict", err)
+	}
+	released, err := store.ReleaseTransportInvocation(attempt.AttemptID, first.Revision)
+	if err != nil {
+		t.Fatalf("ReleaseTransportInvocation: %v", err)
+	}
+	if released.State != TransportRequested || released.AttemptID != attempt.AttemptID || released.NudgeID != attempt.NudgeID ||
+		released.InvocationCount != 1 || !released.InvocationLeaseUntil.IsZero() {
+		t.Fatalf("released attempt = %#v", released)
+	}
+	second, err := store.BeginTransportInvocation(released.AttemptID, released.Revision, attempt.CreatedAt.Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("second BeginTransportInvocation: %v", err)
+	}
+	if second.AttemptID != attempt.AttemptID || second.NudgeID != attempt.NudgeID || second.InvocationCount != 2 {
+		t.Fatalf("retried attempt changed stable identity: %#v", second)
 	}
 }
 
@@ -304,6 +497,9 @@ func TestStoreTransportAttemptRejectsMissingAuthorityRevisionAndPhase(t *testing
 
 func TestStoreTransportAttemptRejectsInvalidIntentAndTerminalMutation(t *testing.T) {
 	store, backing := newDeliveryStore()
+	if err := store.LinkCoveredTransportAttempt(TransportAttempt{}); err == nil {
+		t.Fatal("invalid coalesced transport attempt linked")
+	}
 	delivery := createWaitingDelivery(t, store)
 	fence := validFence()
 	request := TransportAttemptRequest{

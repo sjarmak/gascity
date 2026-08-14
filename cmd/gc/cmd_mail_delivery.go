@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -24,7 +25,41 @@ type mailDeliveryAttemptResult struct {
 	Attempt       maildelivery.TransportAttempt `json:"attempt"`
 }
 
-const mailDeliveryNudgeText = "1 actionable mail delivery; run gc mail inbox"
+type mailDeliveryReconcileOutcome string
+
+const (
+	mailDeliveryReconcileWaitingForAuthority  mailDeliveryReconcileOutcome = "waiting_for_authority"
+	mailDeliveryReconcileCommitted            mailDeliveryReconcileOutcome = "committed"
+	mailDeliveryReconcileUnknownExternalState mailDeliveryReconcileOutcome = "unknown_external_state"
+	mailDeliveryReconcileRetryable            mailDeliveryReconcileOutcome = "retryable"
+)
+
+type mailDeliveryReconcileItem struct {
+	DeliveryID string                         `json:"delivery_id"`
+	Phase      maildelivery.Phase             `json:"phase"`
+	Outcome    mailDeliveryReconcileOutcome   `json:"outcome"`
+	Attempt    *maildelivery.TransportAttempt `json:"attempt,omitempty"`
+}
+
+type mailDeliveryReconcileReport struct {
+	SchemaVersion  string                       `json:"schema_version"`
+	SeatRef        string                       `json:"seat_ref"`
+	ObservedAt     time.Time                    `json:"observed_at"`
+	PageCommitted  bool                         `json:"page_committed"`
+	ActionRequired bool                         `json:"action_required"`
+	Checkpoint     maildelivery.SweepCheckpoint `json:"checkpoint"`
+	Plan           maildelivery.SweepPlan       `json:"plan"`
+	Deliveries     []mailDeliveryReconcileItem  `json:"deliveries"`
+}
+
+type mailDeliveryAttemptExecutor func(context.Context, maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error)
+
+func mailDeliveryNudgeText(count int) string {
+	if count == 1 {
+		return "1 actionable mail delivery; run gc mail inbox"
+	}
+	return fmt.Sprintf("%d actionable mail deliveries; run gc mail inbox", count)
+}
 
 func newMailDeliveryCmd(stdout, stderr io.Writer) *cobra.Command {
 	cmd := &cobra.Command{Use: "delivery", Short: "Operate durable mail delivery attempts"}
@@ -46,7 +81,269 @@ func newMailDeliveryCmd(stdout, stderr io.Writer) *cobra.Command {
 			return nil
 		},
 	})
+	var reconcileLimit int
+	reconcile := &cobra.Command{
+		Use: "reconcile-seat <seat-ref>", Short: "Reconcile one bounded body-free seat delivery page", Args: cobra.ExactArgs(1),
+		RunE: func(c *cobra.Command, args []string) error {
+			if cmdMailDeliveryReconcileSeat(c.Context(), args[0], reconcileLimit, stdout, stderr) != 0 {
+				return errExit
+			}
+			return nil
+		},
+	}
+	reconcile.Flags().IntVar(&reconcileLimit, "limit", 50, "maximum deliveries to process (1-100)")
+	cmd.AddCommand(reconcile)
 	return cmd
+}
+
+func cmdMailDeliveryReconcileSeat(ctx context.Context, seatRef string, limit int, stdout, stderr io.Writer) int {
+	if limit <= 0 || limit > 100 {
+		fmt.Fprintln(stderr, "gc mail delivery reconcile-seat: --limit must be between 1 and 100") //nolint:errcheck
+		return 1
+	}
+	workStore, cityPath, code := openCityStoreWithPath(stderr, "gc mail delivery reconcile-seat")
+	if workStore == nil {
+		return code
+	}
+	defer closeBeadStoreHandle(workStore) //nolint:errcheck
+	cfg, prov, err := config.LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
+	if err != nil {
+		fmt.Fprintf(stderr, "gc mail delivery reconcile-seat: load city config: %v\n", err) //nolint:errcheck
+		return 1
+	}
+	cityName := loadedCityName(cfg, cityPath)
+	sessStore := cliSessionStore(workStore, cfg, cityPath)
+	resolver, err := mailDeliveryFenceResolverForSeat(sessionFrontDoor(sessStore), cfg, cityName, seatRef,
+		config.Revision(fsys.OSFS{}, prov, cfg, cityPath))
+	if err != nil {
+		fmt.Fprintf(stderr, "gc mail delivery reconcile-seat: %v\n", err) //nolint:errcheck
+		return 1
+	}
+	deliveryStore := maildelivery.NewStore(resolveMailMessagesStore(cliStorageRoutes(cityPath), workStore, cfg, cityPath, nil))
+	var execute mailDeliveryAttemptExecutor
+	if resolver.sessionRef != "" {
+		provider, providerErr := newSessionProviderForCity(cfg, cityPath)
+		if providerErr != nil {
+			fmt.Fprintf(stderr, "gc mail delivery reconcile-seat: provider: %v\n", providerErr) //nolint:errcheck
+			return 1
+		}
+		execute = func(callCtx context.Context, attempt maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
+			return executeMailDeliveryAttemptWithLookup(callCtx, deliveryStore, attempt, resolver, time.Now().UTC(),
+				mailDeliveryWorkerPreflight(cityPath, cfg, sessStore, provider, resolver),
+				mailDeliveryWorkerReceiptLookup(cityPath, cfg, sessStore, provider, resolver),
+				mailDeliveryWorkerInvoker(cityPath, cfg, sessStore, provider, resolver))
+		}
+	}
+	report, reconcileErr := reconcileMailDeliverySeat(ctx, deliveryStore, seatRef, limit, time.Now().UTC(), resolver, execute)
+	writeCode := writeMailDeliveryReconcileReport(stdout, stderr, report)
+	if reconcileErr != nil {
+		fmt.Fprintf(stderr, "gc mail delivery reconcile-seat: %v\n", reconcileErr) //nolint:errcheck
+		return 1
+	}
+	if writeCode != 0 || report.ActionRequired {
+		if report.ActionRequired {
+			fmt.Fprintln(stderr, "gc mail delivery reconcile-seat: durable delivery state requires operator attention") //nolint:errcheck
+		}
+		return 1
+	}
+	return 0
+}
+
+func reconcileMailDeliverySeat(ctx context.Context, store *maildelivery.Store, seatRef string, limit int, observedAt time.Time,
+	resolver maildelivery.FenceResolver, execute mailDeliveryAttemptExecutor,
+) (mailDeliveryReconcileReport, error) {
+	report := mailDeliveryReconcileReport{
+		SchemaVersion: "mail-delivery-reconcile/v1", SeatRef: seatRef, ObservedAt: observedAt,
+		Deliveries: make([]mailDeliveryReconcileItem, 0, limit),
+	}
+	if store == nil || observedAt.IsZero() || observedAt.Location() != time.UTC {
+		return report, fmt.Errorf("mail delivery reconcile inputs are invalid")
+	}
+	checkpoint, plan, err := store.PlanSweepPage(seatRef, limit)
+	report.Checkpoint = checkpoint
+	report.Plan = plan
+	if err != nil {
+		return report, err
+	}
+	if checkpoint.HighWatermark.IsZero() {
+		return report, nil
+	}
+	pageIDs := make([]string, 0, len(plan.Page))
+	pageSet := make(map[string]struct{}, len(plan.Page))
+	for _, key := range plan.Page {
+		pageIDs = append(pageIDs, key.DeliveryID)
+		pageSet[key.DeliveryID] = struct{}{}
+	}
+	attempts := make(map[string]maildelivery.TransportAttempt)
+	attemptOrder := make([]string, 0, len(pageIDs))
+	handled := make(map[string]struct{}, len(pageIDs))
+	waiting := make([]string, 0, len(pageIDs))
+
+	// Recover existing groups first, including a crash after the primary link
+	// but before every covered delivery link became durable.
+	for _, deliveryID := range pageIDs {
+		delivery, loadErr := store.Get(deliveryID)
+		if loadErr != nil {
+			return report, loadErr
+		}
+		if delivery.Phase == maildelivery.PhaseStored || delivery.Phase == maildelivery.PhaseWaitingForActivation {
+			continue
+		}
+		attempt, prepareErr := store.PrepareTransportAttempt(ctx, deliveryID, observedAt, resolver)
+		if errors.Is(prepareErr, maildelivery.ErrTransportAuthorityChanged) {
+			continue
+		}
+		if prepareErr != nil {
+			if errors.Is(prepareErr, maildelivery.ErrAuthorityUnavailable) {
+				coveredIDs := []string{deliveryID}
+				if attempt.AttemptID != "" {
+					coveredIDs = attempt.CoveredDeliveryIDs
+				}
+				for _, covered := range coveredIDs {
+					if _, inPage := pageSet[covered]; !inPage {
+						continue
+					}
+					current, currentErr := store.Get(covered)
+					if currentErr != nil {
+						return report, currentErr
+					}
+					report.Deliveries = append(report.Deliveries, mailDeliveryReconcileItem{
+						DeliveryID: covered, Phase: current.Phase, Outcome: mailDeliveryReconcileWaitingForAuthority,
+					})
+					handled[covered] = struct{}{}
+				}
+				continue
+			}
+			if errors.Is(prepareErr, maildelivery.ErrTransportInvocationInProgress) {
+				if _, exists := attempts[attempt.AttemptID]; !exists {
+					attemptOrder = append(attemptOrder, attempt.AttemptID)
+				}
+				attempts[attempt.AttemptID] = attempt
+				for _, covered := range attempt.CoveredDeliveryIDs {
+					if _, inPage := pageSet[covered]; inPage {
+						handled[covered] = struct{}{}
+					}
+				}
+				continue
+			}
+			return report, prepareErr
+		}
+		if err := store.LinkCoveredTransportAttempt(attempt); err != nil {
+			return report, err
+		}
+		if _, exists := attempts[attempt.AttemptID]; !exists {
+			attemptOrder = append(attemptOrder, attempt.AttemptID)
+		}
+		attempts[attempt.AttemptID] = attempt
+		for _, covered := range attempt.CoveredDeliveryIDs {
+			if _, inPage := pageSet[covered]; inPage {
+				handled[covered] = struct{}{}
+			}
+		}
+	}
+	for _, deliveryID := range pageIDs {
+		if _, alreadyHandled := handled[deliveryID]; !alreadyHandled {
+			waiting = append(waiting, deliveryID)
+		}
+	}
+	if len(waiting) > 0 {
+		attempt, prepareErr := store.PrepareTransportBatch(ctx, waiting, observedAt, resolver)
+		if prepareErr != nil {
+			if !errors.Is(prepareErr, maildelivery.ErrAuthorityUnavailable) {
+				return report, prepareErr
+			}
+			for _, deliveryID := range waiting {
+				delivery, loadErr := store.Get(deliveryID)
+				if loadErr != nil {
+					return report, loadErr
+				}
+				if delivery.Phase == maildelivery.PhaseStored {
+					delivery, loadErr = store.Advance(delivery.ID, delivery.Revision, maildelivery.PhaseWaitingForActivation)
+					if loadErr != nil {
+						return report, loadErr
+					}
+				}
+				report.Deliveries = append(report.Deliveries, mailDeliveryReconcileItem{
+					DeliveryID: delivery.ID, Phase: delivery.Phase, Outcome: mailDeliveryReconcileWaitingForAuthority,
+				})
+			}
+		} else {
+			attemptOrder = append(attemptOrder, attempt.AttemptID)
+			attempts[attempt.AttemptID] = attempt
+		}
+	}
+	items := make(map[string]mailDeliveryReconcileItem, len(pageIDs))
+	for _, item := range report.Deliveries {
+		items[item.DeliveryID] = item
+	}
+	for _, attemptID := range attemptOrder {
+		attempt := attempts[attemptID]
+		result := attempt
+		var executeErr error
+		var outcome mailDeliveryReconcileOutcome
+		switch attempt.State {
+		case maildelivery.TransportCommitted:
+			outcome = mailDeliveryReconcileCommitted
+		case maildelivery.TransportUnknownExternalState:
+			outcome = mailDeliveryReconcileUnknownExternalState
+		default:
+			if execute == nil {
+				return report, fmt.Errorf("mail delivery transport executor is unavailable")
+			}
+			result, executeErr = execute(ctx, attempt)
+		}
+		var classifyErr error
+		if outcome == "" {
+			outcome, classifyErr = classifyMailDeliveryExecution(result, executeErr)
+		}
+		if classifyErr != nil {
+			return report, classifyErr
+		}
+		report.ActionRequired = report.ActionRequired || outcome == mailDeliveryReconcileUnknownExternalState
+		for _, deliveryID := range attempt.CoveredDeliveryIDs {
+			if _, inPage := pageSet[deliveryID]; !inPage {
+				continue
+			}
+			delivery, loadErr := store.Get(deliveryID)
+			if loadErr != nil {
+				return report, loadErr
+			}
+			resultCopy := result
+			items[deliveryID] = mailDeliveryReconcileItem{DeliveryID: deliveryID, Phase: delivery.Phase, Outcome: outcome, Attempt: &resultCopy}
+		}
+	}
+	report.Deliveries = report.Deliveries[:0]
+	for _, deliveryID := range pageIDs {
+		item, ok := items[deliveryID]
+		if !ok {
+			return report, fmt.Errorf("mail delivery %q has no durable page result", deliveryID)
+		}
+		report.Deliveries = append(report.Deliveries, item)
+	}
+	committed, err := store.CommitSweepPage(checkpoint, plan)
+	if err != nil {
+		return report, err
+	}
+	report.Checkpoint = committed
+	report.PageCommitted = true
+	return report, nil
+}
+
+func classifyMailDeliveryExecution(result maildelivery.TransportAttempt, err error) (mailDeliveryReconcileOutcome, error) {
+	if result.State == maildelivery.TransportUnknownExternalState {
+		return mailDeliveryReconcileUnknownExternalState, nil
+	}
+	if err != nil && (errors.Is(err, maildelivery.ErrTransportRetrySafe) ||
+		errors.Is(err, maildelivery.ErrTransportInvocationInProgress) || errors.Is(err, maildelivery.ErrTransportInvocationRace)) {
+		return mailDeliveryReconcileRetryable, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if result.State == maildelivery.TransportCommitted {
+		return mailDeliveryReconcileCommitted, nil
+	}
+	return "", fmt.Errorf("mail delivery returned nonterminal transport state %q", result.State)
 }
 
 func cmdMailDeliveryStatus(attemptID string, stdout, stderr io.Writer) int {
@@ -119,8 +416,8 @@ func cmdMailDeliveryInvoke(ctx context.Context, attemptID string, stdout, stderr
 	return writeMailDeliveryAttempt(stdout, stderr, "invoke", result)
 }
 
-func executeMailDeliveryAttempt(ctx context.Context, store *maildelivery.Store, attempt maildelivery.TransportAttempt, resolver maildelivery.FenceResolver, uncertainAt time.Time, preflight maildelivery.TransportPreflight, invoke maildelivery.TransportInvoker) (maildelivery.TransportAttempt, error) {
-	return executeMailDeliveryAttemptWithLookup(ctx, store, attempt, resolver, uncertainAt, preflight, nil, invoke)
+func executeMailDeliveryAttempt(ctx context.Context, store *maildelivery.Store, attempt maildelivery.TransportAttempt, resolver maildelivery.FenceResolver, uncertainAt time.Time, invoke maildelivery.TransportInvoker) (maildelivery.TransportAttempt, error) {
+	return executeMailDeliveryAttemptWithLookup(ctx, store, attempt, resolver, uncertainAt, nil, nil, invoke)
 }
 
 func executeMailDeliveryAttemptWithLookup(ctx context.Context, store *maildelivery.Store, attempt maildelivery.TransportAttempt, resolver maildelivery.FenceResolver, uncertainAt time.Time, preflight maildelivery.TransportPreflight, lookup maildelivery.TransportReceiptLookup, invoke maildelivery.TransportInvoker) (maildelivery.TransportAttempt, error) {
@@ -137,14 +434,54 @@ func executeMailDeliveryAttemptWithLookup(ctx context.Context, store *maildelive
 }
 
 type mailDeliveryFenceResolver struct {
-	store      *session.Store
-	sessionRef string
-	options    session.MailActivationFenceOptions
-	lastInfo   session.Info
+	store        *session.Store
+	sessionRef   string
+	options      session.MailActivationFenceOptions
+	authorityErr error
+	lastInfo     session.Info
+}
+
+func mailDeliveryFenceResolverForSeat(store *session.Store, cfg *config.City, cityName, seatRef, configSHA256 string) (*mailDeliveryFenceResolver, error) {
+	prefix := "seat:" + cityName + "/"
+	if cityName == "" || !strings.HasPrefix(seatRef, prefix) {
+		return nil, fmt.Errorf("mail delivery seat %q is not in city %q", seatRef, cityName)
+	}
+	identity := strings.TrimPrefix(seatRef, prefix)
+	if identity == "" || strings.TrimSpace(identity) != identity {
+		return nil, fmt.Errorf("mail delivery seat %q has no exact configured identity", seatRef)
+	}
+	spec, ok := session.FindNamedSessionSpec(cfg, cityName, identity)
+	if !ok {
+		return nil, fmt.Errorf("mail delivery seat %q is not a configured named session", seatRef)
+	}
+	resolver := &mailDeliveryFenceResolver{
+		store: store,
+		options: session.MailActivationFenceOptions{
+			CityRef: "city:" + cityName, SeatRef: seatRef, ConfigSHA256: configSHA256,
+			IssuedByRef: "controller:" + cityName + "/mail-delivery-cli",
+		},
+	}
+	match, err := store.LookupConfiguredNamed(spec)
+	if err != nil {
+		resolver.authorityErr = fmt.Errorf("%w: configured session lookup: %w", maildelivery.ErrAuthorityUnavailable, err)
+		return resolver, nil
+	}
+	switch {
+	case match.HasConflict:
+		resolver.authorityErr = fmt.Errorf("%w: configured session %q conflicts with %q", maildelivery.ErrAuthorityUnavailable, identity, match.Conflict)
+	case !match.HasCanonical:
+		resolver.authorityErr = fmt.Errorf("%w: configured session %q has no canonical active projection", maildelivery.ErrAuthorityUnavailable, identity)
+	default:
+		resolver.sessionRef = match.Canonical
+	}
+	return resolver, nil
 }
 
 func (r *mailDeliveryFenceResolver) ResolveMailActivationFence(_ context.Context, seatRef string) (maildelivery.ActivationFence, error) {
-	if r == nil || r.store == nil || r.sessionRef == "" {
+	if r != nil && r.authorityErr != nil {
+		return maildelivery.ActivationFence{}, r.authorityErr
+	}
+	if r == nil || r.store == nil || r.sessionRef == "" || !strings.HasPrefix(r.options.CityRef, "city:") {
 		return maildelivery.ActivationFence{}, maildelivery.ErrAuthorityUnavailable
 	}
 	info, err := r.store.Get(r.sessionRef)
@@ -197,7 +534,7 @@ func mailDeliveryWorkerInvoker(cityPath string, cfg *config.City, sessStore bead
 			return maildelivery.TransportReceipt{}, err
 		}
 		result, err := handle.Nudge(ctx, worker.NudgeRequest{
-			Text: mailDeliveryNudgeText, Delivery: worker.NudgeDeliveryImmediate,
+			Text: mailDeliveryNudgeText(len(attempt.CoveredDeliveryIDs)), Delivery: worker.NudgeDeliveryImmediate,
 			Source: "mail-delivery", Wake: worker.NudgeWakeLiveOnly, EffectID: attempt.NudgeID,
 			CommitBoundary: worker.NudgeCommitBoundaryDestinationAtomic,
 		})
@@ -244,7 +581,7 @@ func mailDeliveryWorkerReceiptLookup(cityPath string, cfg *config.City, sessStor
 		if err := requireExactMailDeliveryReceiptHandle(handle); err != nil {
 			return maildelivery.TransportReceipt{}, err
 		}
-		lookup, err := worker.LookupDestinationAtomicNudge(ctx, handle, attempt.NudgeID, mailDeliveryNudgeText)
+		lookup, err := worker.LookupDestinationAtomicNudge(ctx, handle, attempt.NudgeID, mailDeliveryNudgeText(len(attempt.CoveredDeliveryIDs)))
 		if err != nil {
 			return maildelivery.TransportReceipt{}, err
 		}
@@ -305,6 +642,19 @@ func writeMailDeliveryAttempt(stdout, stderr io.Writer, operation string, attemp
 	payload, err := json.Marshal(mailDeliveryAttemptResult{SchemaVersion: "mail-delivery-attempt/v1", Attempt: attempt})
 	if err != nil {
 		fmt.Fprintf(stderr, "gc mail delivery %s: encode result: %v\n", operation, err) //nolint:errcheck
+		return 1
+	}
+	fmt.Fprintln(stdout, string(payload)) //nolint:errcheck
+	return 0
+}
+
+func writeMailDeliveryReconcileReport(stdout, stderr io.Writer, report mailDeliveryReconcileReport) int {
+	if report.SchemaVersion != "mail-delivery-reconcile/v1" || report.SeatRef == "" || report.ObservedAt.IsZero() {
+		return 1
+	}
+	payload, err := json.Marshal(report)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc mail delivery reconcile-seat: encode result: %v\n", err) //nolint:errcheck
 		return 1
 	}
 	fmt.Fprintln(stdout, string(payload)) //nolint:errcheck
