@@ -24,9 +24,26 @@ func TestRecordOnceAuthorizedDropUpdatesBoundedDiagnostics(t *testing.T) {
 	if err := root.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// Keep the state lock past the production decision deadline. Test fixtures
+	// freeze the decision clock, so scheduler delay must not choose the drop path.
+	lockRoot := mustOpenMutableRoot(t, home)
+	heldLock, err := lockRoot.acquireLock(context.Background(), stateLockName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseContext, cancelRelease := context.WithTimeout(context.Background(), 2*defaultRecordDecisionBudget)
+	defer cancelRelease()
+	released := make(chan error, 1)
+	go func() {
+		<-releaseContext.Done()
+		released <- errors.Join(heldLock.Release(), lockRoot.Close())
+	}()
 
 	if result := service.RecordOnce(permit, CommandHelp); result != RecordDropped {
 		t.Fatalf("RecordOnce() = %v, want dropped", result)
+	}
+	if err := <-released; err != nil {
+		t.Fatalf("release contended state lock: %v", err)
 	}
 	status := readDiagnosticStatusFixture(t, home)
 	if status.droppedEvents != 1 || status.lastErrorClass != DiagnosticErrorDiskFull {
