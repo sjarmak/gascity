@@ -418,6 +418,7 @@ func TestSendControllerCommandWithTimeoutsTimesOutOnRead(t *testing.T) {
 			return
 		}
 		// Input the test feeds a fake server to define the scenario, not a hang detector (ga-57b2dk exclusion).
+		// ga-57b2dk-exempt: fake-server-scenario-input
 		<-time.After(200 * time.Millisecond)
 	}()
 
@@ -874,6 +875,7 @@ func TestWatchConfigDirs_CityRootDoesNotWatchUnrelatedNestedSubdir(t *testing.T)
 	select {
 	case <-pokeCh:
 		t.Fatalf("unexpected watcher poke after unrelated nested city-root file changed; stderr=%q", stderr.String())
+	// ga-57b2dk-exempt: unrelated-nested-file-negative-window
 	case <-time.After(250 * time.Millisecond):
 	}
 	if dirty.Load() {
@@ -924,6 +926,7 @@ func TestWatchConfigDirs_CityRootIgnoresRuntimeTraceWrites(t *testing.T) {
 		select {
 		case <-pokeCh:
 			t.Fatalf("unexpected watcher poke after runtime trace write #%d; stderr=%q", i+1, stderr.String())
+		// ga-57b2dk-exempt: runtime-trace-negative-window
 		case <-time.After(250 * time.Millisecond):
 		}
 		if dirty.Load() {
@@ -1453,6 +1456,7 @@ func TestResetSessionCircuitBreakerStateClearsRacingOpenPersist(t *testing.T) {
 	// Bounded best-effort probe with no assertion on either branch (ga-57b2dk exclusion).
 	select {
 	case <-store.cleared:
+	// ga-57b2dk-exempt: circuit-reset-best-effort-probe
 	case <-time.After(50 * time.Millisecond):
 	}
 
