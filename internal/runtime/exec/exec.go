@@ -667,6 +667,41 @@ func (p *Provider) NudgeStable(ctx context.Context, name, effectID string, conte
 	return receipt, nil
 }
 
+// LookupStableNudge reads destination evidence without invoking the effect.
+func (p *Provider) LookupStableNudge(ctx context.Context, name, effectID string, content []runtime.ContentBlock) (runtime.StableNudgeLookup, error) {
+	if err := runtime.ValidateStableNudgeEffectID(effectID); err != nil {
+		return runtime.StableNudgeLookup{}, err
+	}
+	if !p.SupportsStableNudge() {
+		return runtime.StableNudgeLookup{}, runtime.ErrStableNudgeUnsupported
+	}
+	contentHash, err := runtime.StableNudgeContentSHA256(content)
+	if err != nil {
+		return runtime.StableNudgeLookup{}, err
+	}
+	data, err := json.Marshal(runtime.StableNudgeLookupRequest{Version: 1, EffectID: effectID, ContentSHA256: contentHash})
+	if err != nil {
+		return runtime.StableNudgeLookup{}, err
+	}
+	out, err := p.runWithContext(ctx, p.timeout, data, "nudge-stable-status", name, effectID)
+	if err != nil {
+		return runtime.StableNudgeLookup{}, fmt.Errorf("reading stable nudge receipt: %w", err)
+	}
+	decoder := json.NewDecoder(strings.NewReader(out))
+	decoder.DisallowUnknownFields()
+	var lookup runtime.StableNudgeLookup
+	if err := decoder.Decode(&lookup); err != nil {
+		return runtime.StableNudgeLookup{}, fmt.Errorf("decoding stable nudge lookup: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return runtime.StableNudgeLookup{}, fmt.Errorf("decoding stable nudge lookup: trailing JSON")
+	}
+	if err := lookup.Validate(effectID, name, contentHash); err != nil {
+		return runtime.StableNudgeLookup{}, fmt.Errorf("%w: %w", runtime.ErrStableNudgeConflict, err)
+	}
+	return lookup, nil
+}
+
 // SetMeta stores a key-value pair: script set-meta <name> <key>
 // The value is sent on stdin.
 func (p *Provider) SetMeta(name, key, value string) error {

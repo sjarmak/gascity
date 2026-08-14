@@ -2,12 +2,17 @@ package rppcheck
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/runtime"
 )
 
 // writeScript creates an executable shell script in dir and returns its path.
@@ -54,6 +59,37 @@ case "$op" in
   *) exit 2 ;;
 esac
 `, stateDir)
+}
+
+func stableNudgeScript(t *testing.T, stateDir, sessionName string, malformedLookup bool) string {
+	t.Helper()
+	effectSum := sha256.Sum256([]byte("gc-rpp-stable-nudge-v1\x00" + sessionName))
+	effectID := "mail-nudge-" + hex.EncodeToString(effectSum[:])
+	content := runtime.TextContent("gc runtime check stable nudge probe")
+	receipt, err := runtime.NewStableNudgeReceipt(effectID, sessionName, content, "rppcheck-destination:"+effectID, time.Date(2026, 8, 14, 2, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptJSON, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookupJSON, err := json.Marshal(runtime.StableNudgeLookup{
+		Version: 1, State: runtime.StableNudgeLookupCommitted, Receipt: receipt,
+		ObservedAt: time.Date(2026, 8, 14, 2, 0, 1, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if malformedLookup {
+		lookupJSON = []byte(`{"version":1,"state":"committed"}`)
+	}
+	body := strings.Replace(conformantScript(stateDir),
+		`["report-attachment","report-activity"]`,
+		`["report-attachment","report-activity","effect.nudge-idempotent"]`, 1)
+	return strings.Replace(body,
+		`  nudge)             cat > /dev/null ;;`,
+		fmt.Sprintf("  nudge-stable)        cat > /dev/null; printf '%%s' '%s' ;;\n  nudge-stable-status) cat > /dev/null; printf '%%s' '%s' ;;\n  nudge)             cat > /dev/null ;;", receiptJSON, lookupJSON), 1)
 }
 
 // minimalScript returns a script body implementing only the required
@@ -133,6 +169,24 @@ func TestRun_ConformantExecutablePasses(t *testing.T) {
 		if c := findCheck(t, res, name); c.Status != StatusPass {
 			t.Errorf("check %q = %s (%s), want PASS", name, c.Status, c.Detail)
 		}
+	}
+}
+
+func TestRun_StableNudgeCapabilityChecksCommittedLookup(t *testing.T) {
+	const sessionName = "gc-rpp-check-stable"
+	state := t.TempDir()
+	res := runScript(t, stableNudgeScript(t, state, sessionName, false), Options{SessionName: sessionName})
+	if c := findCheck(t, res, "capability effect.nudge-idempotent: nudge-stable"); c.Status != StatusPass {
+		t.Fatalf("stable nudge check = %s (%s), want PASS", c.Status, c.Detail)
+	}
+}
+
+func TestRun_StableNudgeCapabilityRejectsMalformedLookup(t *testing.T) {
+	const sessionName = "gc-rpp-check-stable-malformed"
+	state := t.TempDir()
+	res := runScript(t, stableNudgeScript(t, state, sessionName, true), Options{SessionName: sessionName})
+	if c := findCheck(t, res, "capability effect.nudge-idempotent: nudge-stable"); c.Status != StatusFail {
+		t.Fatalf("stable nudge check = %s (%s), want FAIL", c.Status, c.Detail)
 	}
 }
 

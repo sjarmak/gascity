@@ -89,6 +89,7 @@ care about.
 | `process-alive` | `script process-alive <name>` | process names (1/line) | `true` or `false` |
 | `nudge` | `script nudge <name>` | message text | — |
 | `nudge-stable` | `script nudge-stable <name> <effect-id>` | `StableNudgeRequest` JSON | `StableNudgeReceipt` JSON |
+| `nudge-stable-status` | `script nudge-stable-status <name> <effect-id>` | `StableNudgeLookupRequest` JSON | `StableNudgeLookup` JSON |
 | `set-meta` | `script set-meta <name> <key>` | value on stdin | — |
 | `get-meta` | `script get-meta <name> <key>` | — | value (empty = not set) |
 | `remove-meta` | `script remove-meta <name> <key>` | — | — |
@@ -168,6 +169,17 @@ attempt retains its invocation count and terminalizes as unknown after the
 second lost response. Unsupported operations and malformed receipts are never
 classified retry-safe. The conformance checker uses a per-run effect ID and
 requires two calls to return byte-identical receipt JSON.
+`nudge-stable-status` is read-only and mandatory with the capability. It returns
+either the exact committed receipt or the closed `unknown_external_state`
+outcome with a UTC observation time; it never creates or redelivers an effect.
+Expired MailDelivery invocation leases use one point-in-time lookup before they
+are conservatively terminalized, without another physical notification. This is
+the read primitive required by `confirm-disarm`; it is not the rollback
+controller, bounded wait, poller-drain integration, or late-effect observation
+window. Ledger absence remains `unknown_external_state` because retention is not
+part of this protocol, and a rotated activation fence cannot advance the old
+attempt's canonical state. Operators must treat that terminal state as a failed
+delivery outcome, not as successful notification.
 
 The handshake runs once per provider instance and is cached.
 

@@ -861,6 +861,23 @@ func (m *Manager) SendStableLiveOnly(ctx context.Context, id, effectID, message 
 	return receipt, delivered, err
 }
 
+// LookupStableNudge reads the exact session destination ledger without waking it.
+func (m *Manager) LookupStableNudge(ctx context.Context, id, effectID, message string) (lookup runtime.StableNudgeLookup, err error) {
+	err = withSessionMutationLock(id, func() error {
+		_, sessName, loadErr := m.sessionBead(id)
+		if loadErr != nil {
+			return loadErr
+		}
+		stable, ok := m.sp.(runtime.StableNudgeProvider)
+		if !ok || !stable.SupportsStableNudge() {
+			return runtime.ErrStableNudgeUnsupported
+		}
+		lookup, loadErr = stable.LookupStableNudge(ctx, sessName, effectID, runtime.TextContent(message))
+		return loadErr
+	})
+	return lookup, err
+}
+
 // TryWaitIdleNudge delivers a best-effort session nudge at a provider-defined
 // safe boundary. It resumes supported runtimes if needed, then reports whether
 // live delivery actually happened. Unsupported providers return (false, nil)

@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/maildelivery"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
@@ -151,5 +155,82 @@ func TestExecuteMailDeliveryAttemptCommitsTypedProviderAcceptanceOnce(t *testing
 		if bytes.Contains(stdout.Bytes(), []byte(forbidden)) {
 			t.Fatalf("status output contains forbidden content marker %q: %s", forbidden, stdout.String())
 		}
+	}
+}
+
+func TestMailDeliveryWorkerReceiptLookupMapsExactDestinationEvidence(t *testing.T) {
+	ctx := context.Background()
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".gc", "settings.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	sessBacking := beads.NewMemStore()
+	provider := runtime.NewFake()
+	mgr := newSessionManagerWithConfig(cityPath, sessBacking, provider, cfg)
+	info, err := mgr.CreateSession(ctx, session.CreateOptions{
+		Alias: "reviewer", ExplicitName: "mail-reviewer", Template: "reviewer", Title: "Reviewer",
+		Command: "claude", WorkDir: t.TempDir(), Provider: "exec", Transport: "exec",
+		ExtraMeta: map[string]string{session.NamedSessionIdentityMetadata: "reviewer"},
+	})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	resolver := &mailDeliveryFenceResolver{
+		store: sessionFrontDoor(sessBacking), sessionRef: info.ID,
+		options: session.MailActivationFenceOptions{
+			CityRef: "city:test-city", SeatRef: "seat:test-city/reviewer",
+			ConfigSHA256: strings.Repeat("a", 64), IssuedByRef: "controller:test-city/mail-delivery-cli",
+		},
+	}
+	fence, err := resolver.ResolveMailActivationFence(ctx, "")
+	if err != nil {
+		t.Fatalf("ResolveMailActivationFence: %v", err)
+	}
+	deliveryBacking := beads.NewMemStore()
+	deliveryBacking.HonorExplicitIDs = true
+	deliveryStore := maildelivery.NewStore(deliveryBacking)
+	delivery, err := maildelivery.NewDelivery(
+		"city:test-city/messaging", "msg-lookup", 1, fence.SeatRef,
+		maildelivery.PolicyNotifyOnly, maildelivery.AttentionImmediate,
+		time.Date(2026, 8, 14, 2, 10, 0, 0, time.UTC), nil, "",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err = deliveryStore.Create(delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err = deliveryStore.Advance(delivery.ID, delivery.Revision, maildelivery.PhaseWaitingForActivation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := deliveryStore.CreateTransportAttempt(ctx, maildelivery.TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 14, 2, 11, 0, 0, time.UTC),
+	}, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup := mailDeliveryWorkerReceiptLookup(cityPath, cfg, sessBacking, provider, resolver)
+	unknown, err := lookup(ctx, attempt)
+	if err != nil || unknown.State != maildelivery.EffectUnknownExternalState || unknown.RecordedAt.IsZero() {
+		t.Fatalf("unknown lookup = %#v, %v", unknown, err)
+	}
+	want, err := provider.NudgeStable(ctx, info.SessionName, attempt.NudgeID, runtime.TextContent(mailDeliveryNudgeText))
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := lookup(ctx, attempt)
+	if err != nil || committed.State != maildelivery.EffectCommitted ||
+		committed.CommitBoundary != maildelivery.TransportCommitBoundaryDestinationAtomic ||
+		committed.ReceiptRef != "destination:"+want.DestinationRef ||
+		committed.ReceiptSHA256 != want.ReceiptSHA256 || !committed.RecordedAt.Equal(want.AcceptedAt) {
+		t.Fatalf("committed lookup = %#v, %v; want %#v", committed, err, want)
 	}
 }
