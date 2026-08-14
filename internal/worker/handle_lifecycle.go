@@ -344,7 +344,14 @@ func (h *SessionHandle) Nudge(ctx context.Context, req NudgeRequest) (result Nud
 		if req.Delivery != NudgeDeliveryImmediate || normalizeNudgeWakePolicy(req.Wake) != NudgeWakeLiveOnly {
 			return NudgeResult{}, fmt.Errorf("destination-atomic nudge requires immediate live-only delivery")
 		}
-		source, delivered, stableErr := h.manager.SendStableLiveOnly(ctx, id, req.EffectID, req.Text)
+		if req.ExpectedAuthority == nil {
+			return NudgeResult{}, ErrNudgeAuthorityRequired
+		}
+		expected := *req.ExpectedAuthority
+		validate := func(info sessionpkg.Info) error {
+			return validateNudgeSessionAuthority(info, expected)
+		}
+		source, delivered, stableErr := h.manager.SendStableLiveOnlyValidated(ctx, id, req.EffectID, req.Text, validate)
 		if stableErr != nil {
 			return NudgeResult{}, stableErr
 		}
@@ -403,6 +410,22 @@ func (h *SessionHandle) Nudge(ctx context.Context, req NudgeRequest) (result Nud
 		err = fmt.Errorf("unknown nudge delivery %q", req.Delivery)
 		return NudgeResult{}, err
 	}
+}
+
+func validateNudgeSessionAuthority(info sessionpkg.Info, expected NudgeSessionAuthority) error {
+	if info.ID != expected.SessionRef || info.ConfiguredNamedIdentity != expected.ConfiguredSeatIdentity {
+		return ErrNudgeAuthorityChanged
+	}
+	fence, err := sessionpkg.IssueMailActivationFence(info, sessionpkg.MailActivationFenceOptions{
+		CityRef: expected.CityRef, SeatRef: expected.SeatRef, ConfigSHA256: expected.ConfigSHA256,
+		IssuedByRef: expected.IssuedByRef, IssuedAt: time.Now().UTC(),
+	})
+	if err != nil || fence.SessionRef != expected.SessionRef ||
+		fence.AuthorityGeneration != expected.AuthorityGeneration || fence.ContinuationEpoch != expected.ContinuationEpoch ||
+		fence.InstanceTokenSHA256 != expected.InstanceTokenSHA256 || fence.AuthorityIntentSHA256 != expected.AuthorityIntentSHA256 {
+		return ErrNudgeAuthorityChanged
+	}
+	return nil
 }
 
 // SupportsStableNudge reports the session manager's destination capability.

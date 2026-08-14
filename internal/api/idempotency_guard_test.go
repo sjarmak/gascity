@@ -73,23 +73,31 @@ var exemptFromIdempotency = map[string]bool{
 	"post-v0-city-by-city-name-mail-by-id-archive":             true,
 	"post-v0-city-by-city-name-mail-by-id-mark-unread":         true,
 	"post-v0-city-by-city-name-mail-by-id-read":                true,
-	"post-v0-city-by-city-name-order-by-name-disable":          true,
-	"post-v0-city-by-city-name-order-by-name-enable":           true,
-	"post-v0-city-by-city-name-order-by-name-run":              true,
-	"post-v0-city-by-city-name-rig-by-name-by-action":          true,
-	"post-v0-city-by-city-name-runs-by-run-id-cancel":          true,
-	"post-v0-city-by-city-name-service-by-name-restart":        true,
-	"post-v0-city-by-city-name-session-by-id-close":            true,
-	"post-v0-city-by-city-name-session-by-id-kill":             true,
-	"post-v0-city-by-city-name-session-by-id-permission-mode":  true,
-	"post-v0-city-by-city-name-session-by-id-rename":           true,
-	"post-v0-city-by-city-name-session-by-id-stop":             true,
-	"post-v0-city-by-city-name-session-by-id-suspend":          true,
-	"post-v0-city-by-city-name-session-by-id-wake":             true,
-	"post-v0-city-by-city-name-sling":                          true,
-	"post-v0-city-by-city-name-unregister":                     true,
-	"rotate-events":                                            true,
-	"trigger-maintenance-dolt-gc":                              true,
+	// Durable send requires its domain stable_key and derives deterministic
+	// message/delivery identities from it. A second generic key would create
+	// competing idempotency authorities instead of adding safety.
+	"post-v0-city-by-city-name-mail-durable": true,
+	// Reconcile and invoke replay canonical delivery/attempt state machines;
+	// they never mint caller-selected resources or replacement effect IDs.
+	"post-v0-city-by-city-name-mail-delivery-by-attempt-id-invoke": true,
+	"post-v0-city-by-city-name-mail-delivery-reconcile-seat":       true,
+	"post-v0-city-by-city-name-order-by-name-disable":              true,
+	"post-v0-city-by-city-name-order-by-name-enable":               true,
+	"post-v0-city-by-city-name-order-by-name-run":                  true,
+	"post-v0-city-by-city-name-rig-by-name-by-action":              true,
+	"post-v0-city-by-city-name-runs-by-run-id-cancel":              true,
+	"post-v0-city-by-city-name-service-by-name-restart":            true,
+	"post-v0-city-by-city-name-session-by-id-close":                true,
+	"post-v0-city-by-city-name-session-by-id-kill":                 true,
+	"post-v0-city-by-city-name-session-by-id-permission-mode":      true,
+	"post-v0-city-by-city-name-session-by-id-rename":               true,
+	"post-v0-city-by-city-name-session-by-id-stop":                 true,
+	"post-v0-city-by-city-name-session-by-id-suspend":              true,
+	"post-v0-city-by-city-name-session-by-id-wake":                 true,
+	"post-v0-city-by-city-name-sling":                              true,
+	"post-v0-city-by-city-name-unregister":                         true,
+	"rotate-events":                                                true,
+	"trigger-maintenance-dolt-gc":                                  true,
 }
 
 type idemSpecDoc struct {

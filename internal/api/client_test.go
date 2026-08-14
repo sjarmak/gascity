@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -571,6 +573,165 @@ func TestClientBusinessErrorNoFallback(t *testing.T) {
 	}
 	if ShouldFallback(nil, err) {
 		t.Errorf("ShouldFallback = true for business error: %v", err)
+	}
+}
+
+func TestMailDeliveryMutationClientMalformedAndBusinessResponsesDoNotFallback(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/mail/durable"):
+			body, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(body), `"stable_key":"error"`) {
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"title":"failed","status":500,"detail":"durable failed"}`))
+				return
+			}
+			if strings.Contains(string(body), `"stable_key":"nonjson"`) {
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("accepted without body"))
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"result":null}`))
+		case strings.HasSuffix(r.URL.Path, "/mail/delivery/reconcile-seat"):
+			body, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(body), `"expected_delivery_id":"error"`) {
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"title":"failed","status":500,"detail":"reconcile failed"}`))
+				return
+			}
+			if strings.Contains(string(body), `"expected_delivery_id":"nonjson"`) {
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("accepted without body"))
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"report":null}`))
+		case strings.Contains(r.URL.Path, "nonjson-200"):
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("accepted without body"))
+		case r.Method == http.MethodGet:
+			if strings.Contains(r.URL.Path, "status-500") {
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"title":"failed","status":500,"detail":"status failed"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"attempt":{"attempt_id":"other"}}`))
+		case strings.Contains(r.URL.Path, "app-500"):
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+				"title": "Internal Server Error", "status": http.StatusInternalServerError,
+				"detail": "mail delivery provider failed after admission",
+			})
+		case strings.Contains(r.URL.Path, "business-409"):
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+				"title": "Conflict", "status": http.StatusConflict, "detail": "stable nudge conflict",
+			})
+		default:
+			shape := "null"
+			for suffix, value := range map[string]string{
+				"malformed-object": `{}`, "malformed-string": `"wrong"`, "malformed-number": `7`, "malformed-null": `null`,
+			} {
+				if strings.Contains(r.URL.Path, suffix) {
+					shape = value
+				}
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"attempt":%s}`, shape)
+		}
+	}))
+	defer ts.Close()
+
+	c := NewCityScopedClient(ts.URL, "alpha")
+	for _, attemptID := range []string{
+		"app-500", "business-409", "malformed-object", "malformed-string", "malformed-number", "malformed-null",
+	} {
+		_, err := c.InvokeMailDelivery(attemptID)
+		if err == nil {
+			t.Fatalf("InvokeMailDelivery(%q): expected error", attemptID)
+		}
+		if ShouldFallback(c, err) {
+			t.Fatalf("InvokeMailDelivery(%q): malformed/business response became fallbackable: %v", attemptID, err)
+		}
+	}
+	for operation, err := range map[string]error{
+		"durable": func() error {
+			_, err := c.SendDurableMail(DurableMailCommand{StableKey: "key", Recipient: "worker", SenderCandidates: []string{"human"}, Body: "body"})
+			return err
+		}(),
+		"reconcile": func() error {
+			_, err := c.ReconcileMailDeliverySeat("seat:alpha/worker", 1, "")
+			return err
+		}(),
+		"status": func() error {
+			_, err := c.MailDeliveryStatus("mismatch")
+			return err
+		}(),
+	} {
+		if err == nil || ShouldFallback(c, err) {
+			t.Fatalf("%s malformed/mismatched response err=%v fallback=%v", operation, err, ShouldFallback(c, err))
+		}
+	}
+	for operation, err := range map[string]error{
+		"durable-500": func() error {
+			_, err := c.SendDurableMail(DurableMailCommand{StableKey: "error", Recipient: "worker", SenderCandidates: []string{"human"}, Body: "body"})
+			return err
+		}(),
+		"durable-no-body": func() error {
+			_, err := c.SendDurableMail(DurableMailCommand{StableKey: "nonjson", Recipient: "worker", SenderCandidates: []string{"human"}, Body: "body"})
+			return err
+		}(),
+		"reconcile-500": func() error {
+			_, err := c.ReconcileMailDeliverySeat("seat:alpha/worker", 1, "error")
+			return err
+		}(),
+		"reconcile-no-body": func() error {
+			_, err := c.ReconcileMailDeliverySeat("seat:alpha/worker", 1, "nonjson")
+			return err
+		}(),
+		"invoke-no-body": func() error {
+			_, err := c.InvokeMailDelivery("nonjson-200")
+			return err
+		}(),
+		"status-500": func() error {
+			_, err := c.MailDeliveryStatus("status-500")
+			return err
+		}(),
+		"status-no-body": func() error {
+			_, err := c.MailDeliveryStatus("nonjson-200")
+			return err
+		}(),
+	} {
+		if err == nil || ShouldFallback(c, err) {
+			t.Fatalf("%s response err=%v fallback=%v", operation, err, ShouldFallback(c, err))
+		}
+	}
+	unavailable := NewCityScopedClient("http://127.0.0.1:0", "alpha")
+	for operation, err := range map[string]error{
+		"durable-transport": func() error {
+			_, err := unavailable.SendDurableMail(DurableMailCommand{StableKey: "transport", Recipient: "worker", SenderCandidates: []string{"human"}, Body: "body"})
+			return err
+		}(),
+		"reconcile-transport": func() error {
+			_, err := unavailable.ReconcileMailDeliverySeat("seat:alpha/worker", 1, "")
+			return err
+		}(),
+		"invoke-transport": func() error {
+			_, err := unavailable.InvokeMailDelivery("transport")
+			return err
+		}(),
+		"status-transport": func() error {
+			_, err := unavailable.MailDeliveryStatus("transport")
+			return err
+		}(),
+	} {
+		if err == nil || !ShouldFallback(unavailable, err) {
+			t.Fatalf("%s err=%v fallback=%v", operation, err, ShouldFallback(unavailable, err))
+		}
 	}
 }
 

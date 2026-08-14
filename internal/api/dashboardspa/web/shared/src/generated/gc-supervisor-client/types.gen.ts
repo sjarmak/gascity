@@ -773,6 +773,21 @@ export type ConvoyRemoveInputBody = {
     items?: Array<string> | null;
 };
 
+export type Delivery = {
+    attention: string;
+    created_at: string;
+    expires_at?: string;
+    id: string;
+    message_id: string;
+    message_revision: number;
+    phase: string;
+    policy: string;
+    policy_source_sha256?: string;
+    seat_ref: string;
+    store_ref: string;
+    version: number;
+};
+
 export type DeliveryContextRecord = {
     BindingGeneration: number;
     Conversation: ConversationRef;
@@ -787,10 +802,21 @@ export type DeliveryContextRecord = {
     SourceSessionID: string;
 };
 
+export type DeliveryKey = {
+    created_at: string;
+    delivery_id: string;
+};
+
 export type Dep = {
     depends_on_id: string;
     issue_id: string;
     type: string;
+};
+
+export type DurableSendResult = {
+    delivery: Delivery;
+    message: Message;
+    outcome: string;
 };
 
 export type ErrorDetail = {
@@ -1753,6 +1779,38 @@ export type MailCountOutputBody = {
     unread: number;
 };
 
+export type MailDeliveryAttemptBody = {
+    attempt: TransportAttempt;
+    failure_code?: string;
+    ok: boolean;
+};
+
+export type MailDeliveryReconcileBody = {
+    failure_code?: string;
+    ok: boolean;
+    report: ReconcileReport;
+};
+
+export type MailDeliveryReconcileInputBody = {
+    expected_delivery_id?: string;
+    limit: number;
+    seat_ref: string;
+};
+
+export type MailDurableSendBody = {
+    failure_code?: string;
+    ok: boolean;
+    result: DurableSendResult;
+};
+
+export type MailDurableSendInputBody = {
+    message: string;
+    recipient: string;
+    sender_candidates: Array<string> | null;
+    stable_key: string;
+    subject?: string;
+};
+
 export type MailEventPayload = {
     message?: Message;
     rig: string;
@@ -2569,6 +2627,26 @@ export type ReadinessResponse = {
     items: {
         [key: string]: ReadinessItem;
     };
+};
+
+export type ReconcileItem = {
+    attempt?: TransportAttempt;
+    delivery_id: string;
+    outcome: string;
+    phase: string;
+};
+
+export type ReconcileReport = {
+    action_required: boolean;
+    checkpoint: SweepCheckpoint;
+    deliveries: Array<ReconcileItem> | null;
+    expected_delivery_id?: string;
+    expected_delivery_phase?: string;
+    observed_at: string;
+    page_committed: boolean;
+    plan: SweepPlan;
+    schema_version: string;
+    seat_ref: string;
 };
 
 export type Record = {
@@ -5119,6 +5197,20 @@ export type SupervisorStartup = {
     ready: boolean;
 };
 
+export type SweepCheckpoint = {
+    after: DeliveryKey;
+    generation: number;
+    high_watermark: DeliveryKey;
+    seat_ref: string;
+    version: number;
+};
+
+export type SweepPlan = {
+    high_watermark: DeliveryKey;
+    page: Array<DeliveryKey> | null;
+    wrap: boolean;
+};
+
 export type TaggedEventStreamEnvelope = {
     actor: string;
     city: string;
@@ -5144,6 +5236,40 @@ export type TranscriptMessageKind = 'inbound' | 'outbound';
  * Provenance of a transcript entry (freshly observed vs. replayed from persisted history).
  */
 export type TranscriptProvenance = 'live' | 'hydrated';
+
+export type TransportAttempt = {
+    attempt_id: string;
+    authority_generation: number;
+    authority_intent_sha256: string;
+    authority_kind: string;
+    authority_ref: string;
+    continuation_epoch: number;
+    covered_delivery_ids: Array<string> | null;
+    created_at: string;
+    delivery_id: string;
+    expected_delivery_revision: number;
+    instance_token_sha256: string;
+    invocation_count: number;
+    invocation_lease_until?: string;
+    invocation_started_at?: string;
+    nudge_id: string;
+    receipt: TransportReceipt;
+    receipt_lookup_failure_count: number;
+    session_ref: string;
+    state: string;
+    version: number;
+};
+
+export type TransportReceipt = {
+    attempt_id: string;
+    commit_boundary?: string;
+    nudge_id: string;
+    receipt_ref?: string;
+    receipt_sha256?: string;
+    recorded_at: string;
+    state: string;
+    version: number;
+};
 
 /**
  * Typed city event stream envelope
@@ -13645,6 +13771,234 @@ export type GetV0CityByCityNameMailCountResponses = {
 };
 
 export type GetV0CityByCityNameMailCountResponse = GetV0CityByCityNameMailCountResponses[keyof GetV0CityByCityNameMailCountResponses];
+
+export type PostV0CityByCityNameMailDeliveryReconcileSeatData = {
+    body: MailDeliveryReconcileInputBody;
+    headers: {
+        /**
+         * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+         */
+        'X-GC-Request': string;
+    };
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/mail/delivery/reconcile-seat';
+};
+
+export type PostV0CityByCityNameMailDeliveryReconcileSeatErrors = {
+    /**
+     * Bad Request
+     */
+    400: ErrorModel;
+    /**
+     * Unauthorized
+     */
+    401: ErrorModel;
+    /**
+     * Forbidden
+     */
+    403: ErrorModel;
+    /**
+     * Conflict
+     */
+    409: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type PostV0CityByCityNameMailDeliveryReconcileSeatError = PostV0CityByCityNameMailDeliveryReconcileSeatErrors[keyof PostV0CityByCityNameMailDeliveryReconcileSeatErrors];
+
+export type PostV0CityByCityNameMailDeliveryReconcileSeatResponses = {
+    /**
+     * OK
+     */
+    200: MailDeliveryReconcileBody;
+};
+
+export type PostV0CityByCityNameMailDeliveryReconcileSeatResponse = PostV0CityByCityNameMailDeliveryReconcileSeatResponses[keyof PostV0CityByCityNameMailDeliveryReconcileSeatResponses];
+
+export type GetV0CityByCityNameMailDeliveryByAttemptIdData = {
+    body?: never;
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+        attemptID: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/mail/delivery/{attemptID}';
+};
+
+export type GetV0CityByCityNameMailDeliveryByAttemptIdErrors = {
+    /**
+     * Bad Request
+     */
+    400: ErrorModel;
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type GetV0CityByCityNameMailDeliveryByAttemptIdError = GetV0CityByCityNameMailDeliveryByAttemptIdErrors[keyof GetV0CityByCityNameMailDeliveryByAttemptIdErrors];
+
+export type GetV0CityByCityNameMailDeliveryByAttemptIdResponses = {
+    /**
+     * OK
+     */
+    200: MailDeliveryAttemptBody;
+};
+
+export type GetV0CityByCityNameMailDeliveryByAttemptIdResponse = GetV0CityByCityNameMailDeliveryByAttemptIdResponses[keyof GetV0CityByCityNameMailDeliveryByAttemptIdResponses];
+
+export type PostV0CityByCityNameMailDeliveryByAttemptIdInvokeData = {
+    body?: never;
+    headers: {
+        /**
+         * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+         */
+        'X-GC-Request': string;
+    };
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+        attemptID: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/mail/delivery/{attemptID}/invoke';
+};
+
+export type PostV0CityByCityNameMailDeliveryByAttemptIdInvokeErrors = {
+    /**
+     * Bad Request
+     */
+    400: ErrorModel;
+    /**
+     * Unauthorized
+     */
+    401: ErrorModel;
+    /**
+     * Forbidden
+     */
+    403: ErrorModel;
+    /**
+     * Conflict
+     */
+    409: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type PostV0CityByCityNameMailDeliveryByAttemptIdInvokeError = PostV0CityByCityNameMailDeliveryByAttemptIdInvokeErrors[keyof PostV0CityByCityNameMailDeliveryByAttemptIdInvokeErrors];
+
+export type PostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponses = {
+    /**
+     * OK
+     */
+    200: MailDeliveryAttemptBody;
+};
+
+export type PostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponse = PostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponses[keyof PostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponses];
+
+export type PostV0CityByCityNameMailDurableData = {
+    body: MailDurableSendInputBody;
+    headers: {
+        /**
+         * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+         */
+        'X-GC-Request': string;
+    };
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/mail/durable';
+};
+
+export type PostV0CityByCityNameMailDurableErrors = {
+    /**
+     * Bad Request
+     */
+    400: ErrorModel;
+    /**
+     * Unauthorized
+     */
+    401: ErrorModel;
+    /**
+     * Forbidden
+     */
+    403: ErrorModel;
+    /**
+     * Conflict
+     */
+    409: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type PostV0CityByCityNameMailDurableError = PostV0CityByCityNameMailDurableErrors[keyof PostV0CityByCityNameMailDurableErrors];
+
+export type PostV0CityByCityNameMailDurableResponses = {
+    /**
+     * OK
+     */
+    200: MailDurableSendBody;
+};
+
+export type PostV0CityByCityNameMailDurableResponse = PostV0CityByCityNameMailDurableResponses[keyof PostV0CityByCityNameMailDurableResponses];
 
 export type GetV0CityByCityNameMailThreadByIdData = {
     body?: never;

@@ -10,8 +10,8 @@ version = 2
 [[audit_baseline]]
 scope = "all"
 resource = "subprocess"
-baseline_calls = 612
-baseline_files = 175
+baseline_calls = 613
+baseline_files = 176
 reported_calls = 495
 reported_files = 135
 owner_bead = "ga-80po0c.2"
@@ -116,8 +116,8 @@ expires = "2026-10-01"
 [[debt]]
 scope = "untagged"
 resource = "http_test_server"
-baseline_calls = 317
-baseline_files = 66
+baseline_calls = 320
+baseline_files = 68
 reported_calls = 255
 reported_files = 56
 owner_bead = "ga-80po0c.2.2"
@@ -228,6 +228,50 @@ owner_bead = "ga-80po0c.2.1"
 invariant = "cmd/gc TestMain is the checked package-level Medium owner for process environment and tmux namespace setup"
 resource_owner = "only declared environment and tmux calls lexically inside TestMain leave Small debt"
 migration_target = "P0.4b/P0.4c-tmux"
+expires = "2026-10-01"
+
+[[medium]]
+package_dir = "cmd/gc"
+package_name = "main"
+owner = "TestMailDeliveryInvokeAPIPreservesResultAndNeverFallsBackOnResponses"
+resources = ["http_test_server"]
+owner_bead = "gc-dyfe8.1"
+invariant = "the CLI API mutation routing proof is a checked Medium loopback-server owner"
+resource_owner = "the loopback server is confined to one result-bearing, business-error, and malformed-response no-fallback matrix and is closed by test cleanup"
+migration_target = "gc-dyfe8.1"
+expires = "2026-10-01"
+
+[[medium]]
+package_dir = "internal/api"
+package_name = "api"
+owner = "TestMailDeliveryMutationClientMalformedAndBusinessResponsesDoNotFallback"
+resources = ["http_test_server"]
+owner_bead = "gc-dyfe8.1"
+invariant = "the mail-delivery generated-client malformed/business response matrix is a checked Medium loopback-server owner"
+resource_owner = "the loopback server is confined to one object, string, number, null, 4xx, and 5xx non-fallback matrix and is closed by test cleanup"
+migration_target = "gc-dyfe8.1"
+expires = "2026-10-01"
+
+[[medium]]
+package_dir = "internal/api"
+package_name = "api"
+owner = "TestMailDeliveryControlPlaneRoundTrip"
+resources = ["http_test_server"]
+owner_bead = "gc-dyfe8.1"
+invariant = "the running-supervisor mail-delivery generated-client roundtrip is a checked Medium loopback-server owner"
+resource_owner = "the loopback server is confined to the generated client and typed result-bearing supervisor route proof and is closed by test cleanup"
+migration_target = "gc-dyfe8.1"
+expires = "2026-10-01"
+
+[[medium]]
+package_dir = "cmd/gc"
+package_name = "main"
+owner = "TestMailDeliveryExactBinaryRecoversCommittedEffectAcrossCWD"
+resources = ["subprocess"]
+owner_bead = "gc-snrfp.3"
+invariant = "the exact built-binary mail-delivery crash-recovery proof is a checked Medium subprocess owner"
+resource_owner = "the built gc subprocesses are confined to TestMailDeliveryExactBinaryRecoversCommittedEffectAcrossCWD, which proves the production CLI recovers one committed destination effect across process and working-directory boundaries"
+migration_target = "gc-snrfp.3"
 expires = "2026-10-01"
 
 [[medium]]

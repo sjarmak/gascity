@@ -341,6 +341,21 @@ export const zConvoyRemoveInputBody = z.object({
     items: z.array(z.string()).nullish()
 });
 
+export const zDelivery = z.object({
+    attention: z.string(),
+    created_at: z.iso.datetime(),
+    expires_at: z.iso.datetime().optional(),
+    id: z.string(),
+    message_id: z.string(),
+    message_revision: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    phase: z.string(),
+    policy: z.string(),
+    policy_source_sha256: z.string().optional(),
+    seat_ref: z.string(),
+    store_ref: z.string(),
+    version: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' })
+});
+
 export const zDeliveryContextRecord = z.object({
     BindingGeneration: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
     Conversation: zConversationRef,
@@ -351,6 +366,11 @@ export const zDeliveryContextRecord = z.object({
     SchemaVersion: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
     SessionID: z.string(),
     SourceSessionID: z.string()
+});
+
+export const zDeliveryKey = z.object({
+    created_at: z.iso.datetime(),
+    delivery_id: z.string()
 });
 
 export const zDep = z.object({
@@ -745,6 +765,20 @@ export const zMailCountOutputBody = z.object({
     unread: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' })
 });
 
+export const zMailDeliveryReconcileInputBody = z.object({
+    expected_delivery_id: z.string().optional(),
+    limit: z.coerce.bigint().gte(BigInt(1)).lte(BigInt(100)),
+    seat_ref: z.string().min(1)
+});
+
+export const zMailDurableSendInputBody = z.object({
+    message: z.string().min(1),
+    recipient: z.string().min(1),
+    sender_candidates: z.array(z.string()).min(1).nullable(),
+    stable_key: z.string().min(1),
+    subject: z.string().optional()
+});
+
 export const zMailReplyInputBody = z.object({
     body: z.string().optional(),
     from: z.string().optional(),
@@ -799,6 +833,18 @@ export const zMessage = z.object({
     subject: z.string(),
     thread_id: z.string().optional(),
     to: z.string()
+});
+
+export const zDurableSendResult = z.object({
+    delivery: zDelivery,
+    message: zMessage,
+    outcome: z.string()
+});
+
+export const zMailDurableSendBody = z.object({
+    failure_code: z.string().optional(),
+    ok: z.boolean(),
+    result: zDurableSendResult
 });
 
 export const zMailEventPayload = z.object({
@@ -3063,6 +3109,20 @@ export const zSupervisorHealthOutputBody = z.object({
     version: z.string()
 });
 
+export const zSweepCheckpoint = z.object({
+    after: zDeliveryKey,
+    generation: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    high_watermark: zDeliveryKey,
+    seat_ref: z.string(),
+    version: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' })
+});
+
+export const zSweepPlan = z.object({
+    high_watermark: zDeliveryKey,
+    page: z.array(zDeliveryKey).nullable(),
+    wrap: z.boolean()
+});
+
 /**
  * Direction of a transcript entry.
  */
@@ -3112,6 +3172,72 @@ export const zOutboundResult = z.object({
     DeliveryContext: zDeliveryContextRecord,
     Receipt: zPublishReceipt,
     TranscriptEntry: zConversationTranscriptRecord
+});
+
+export const zTransportReceipt = z.object({
+    attempt_id: z.string(),
+    commit_boundary: z.string().optional(),
+    nudge_id: z.string(),
+    receipt_ref: z.string().optional(),
+    receipt_sha256: z.string().optional(),
+    recorded_at: z.iso.datetime(),
+    state: z.string(),
+    version: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' })
+});
+
+export const zTransportAttempt = z.object({
+    attempt_id: z.string(),
+    authority_generation: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    authority_intent_sha256: z.string(),
+    authority_kind: z.string(),
+    authority_ref: z.string(),
+    continuation_epoch: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    covered_delivery_ids: z.array(z.string()).nullable(),
+    created_at: z.iso.datetime(),
+    delivery_id: z.string(),
+    expected_delivery_revision: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    instance_token_sha256: z.string(),
+    invocation_count: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    invocation_lease_until: z.iso.datetime().optional(),
+    invocation_started_at: z.iso.datetime().optional(),
+    nudge_id: z.string(),
+    receipt: zTransportReceipt,
+    receipt_lookup_failure_count: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    session_ref: z.string(),
+    state: z.string(),
+    version: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' })
+});
+
+export const zMailDeliveryAttemptBody = z.object({
+    attempt: zTransportAttempt,
+    failure_code: z.string().optional(),
+    ok: z.boolean()
+});
+
+export const zReconcileItem = z.object({
+    attempt: zTransportAttempt.optional(),
+    delivery_id: z.string(),
+    outcome: z.string(),
+    phase: z.string()
+});
+
+export const zReconcileReport = z.object({
+    action_required: z.boolean(),
+    checkpoint: zSweepCheckpoint,
+    deliveries: z.array(zReconcileItem).nullable(),
+    expected_delivery_id: z.string().optional(),
+    expected_delivery_phase: z.string().optional(),
+    observed_at: z.iso.datetime(),
+    page_committed: z.boolean(),
+    plan: zSweepPlan,
+    schema_version: z.string(),
+    seat_ref: z.string()
+});
+
+export const zMailDeliveryReconcileBody = z.object({
+    failure_code: z.string().optional(),
+    ok: z.boolean(),
+    report: zReconcileReport
 });
 
 export const zUnboundEventPayload = z.object({
@@ -8047,6 +8173,60 @@ export const zGetV0CityByCityNameMailCountQuery = z.object({
  * OK
  */
 export const zGetV0CityByCityNameMailCountResponse = zMailCountOutputBody;
+
+export const zPostV0CityByCityNameMailDeliveryReconcileSeatBody = zMailDeliveryReconcileInputBody;
+
+export const zPostV0CityByCityNameMailDeliveryReconcileSeatHeaders = z.object({
+    'X-GC-Request': z.string().min(1)
+});
+
+export const zPostV0CityByCityNameMailDeliveryReconcileSeatPath = z.object({
+    cityName: z.string().min(1).regex(/\S/)
+});
+
+/**
+ * OK
+ */
+export const zPostV0CityByCityNameMailDeliveryReconcileSeatResponse = zMailDeliveryReconcileBody;
+
+export const zGetV0CityByCityNameMailDeliveryByAttemptIdPath = z.object({
+    cityName: z.string().min(1).regex(/\S/),
+    attemptID: z.string().min(1)
+});
+
+/**
+ * OK
+ */
+export const zGetV0CityByCityNameMailDeliveryByAttemptIdResponse = zMailDeliveryAttemptBody;
+
+export const zPostV0CityByCityNameMailDeliveryByAttemptIdInvokeHeaders = z.object({
+    'X-GC-Request': z.string().min(1)
+});
+
+export const zPostV0CityByCityNameMailDeliveryByAttemptIdInvokePath = z.object({
+    cityName: z.string().min(1).regex(/\S/),
+    attemptID: z.string().min(1)
+});
+
+/**
+ * OK
+ */
+export const zPostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponse = zMailDeliveryAttemptBody;
+
+export const zPostV0CityByCityNameMailDurableBody = zMailDurableSendInputBody;
+
+export const zPostV0CityByCityNameMailDurableHeaders = z.object({
+    'X-GC-Request': z.string().min(1)
+});
+
+export const zPostV0CityByCityNameMailDurablePath = z.object({
+    cityName: z.string().min(1).regex(/\S/)
+});
+
+/**
+ * OK
+ */
+export const zPostV0CityByCityNameMailDurableResponse = zMailDurableSendBody;
 
 export const zGetV0CityByCityNameMailThreadByIdPath = z.object({
     cityName: z.string().min(1).regex(/\S/),

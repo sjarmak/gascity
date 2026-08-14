@@ -24,6 +24,9 @@ const (
 	// TransportRetryEscalationThreshold raises an operator-visible signal
 	// without changing a retry-safe attempt's requested state.
 	TransportRetryEscalationThreshold uint64 = 3
+	// TransportReceiptLookupEscalationThreshold bounds consecutive failures
+	// to read destination evidence without changing the recoverable invocation.
+	TransportReceiptLookupEscalationThreshold uint64 = 3
 )
 
 // ErrTransportInvocationInProgress reports that an unexpired invocation lease
@@ -40,6 +43,12 @@ var ErrTransportRetrySafe = errors.New("mail delivery transport invocation is sa
 // ErrTransportRetryEscalated reports repeated retry-safe failures that remain
 // safe to invoke again but now require operator visibility.
 var ErrTransportRetryEscalated = errors.New("mail delivery transport retry requires operator attention")
+
+// ErrTransportReceiptLookupRetryLater reports that destination evidence could
+// not be read after an invocation lease expired. The durable invoking attempt
+// is intentionally left unchanged: neither a committed effect nor its absence
+// has been proven, so callers may retry only the read-only lookup.
+var ErrTransportReceiptLookupRetryLater = errors.New("mail delivery destination receipt lookup requires retry")
 
 // TransportState is the closed state of one stable external-effect attempt.
 type TransportState string
@@ -71,26 +80,27 @@ type TransportAttemptRequest struct {
 
 // TransportAttempt is the canonical lifecycle and receipt for one stable nudge.
 type TransportAttempt struct {
-	Version                  int              `json:"version"`
-	AttemptID                string           `json:"attempt_id"`
-	NudgeID                  string           `json:"nudge_id"`
-	DeliveryID               string           `json:"delivery_id"`
-	ExpectedDeliveryRevision uint64           `json:"expected_delivery_revision"`
-	CoveredDeliveryIDs       []string         `json:"covered_delivery_ids"`
-	AuthorityKind            AuthorityKind    `json:"authority_kind"`
-	AuthorityRef             string           `json:"authority_ref"`
-	AuthorityGeneration      uint64           `json:"authority_generation"`
-	AuthorityIntentSHA256    string           `json:"authority_intent_sha256"`
-	SessionRef               string           `json:"session_ref"`
-	ContinuationEpoch        uint64           `json:"continuation_epoch"`
-	InstanceTokenSHA256      string           `json:"instance_token_sha256"`
-	State                    TransportState   `json:"state"`
-	InvocationStartedAt      time.Time        `json:"invocation_started_at,omitempty"`
-	InvocationLeaseUntil     time.Time        `json:"invocation_lease_until,omitempty"`
-	InvocationCount          uint64           `json:"invocation_count"`
-	Receipt                  TransportReceipt `json:"receipt"`
-	CreatedAt                time.Time        `json:"created_at"`
-	Revision                 uint64           `json:"-"`
+	Version                   int              `json:"version"`
+	AttemptID                 string           `json:"attempt_id"`
+	NudgeID                   string           `json:"nudge_id"`
+	DeliveryID                string           `json:"delivery_id"`
+	ExpectedDeliveryRevision  uint64           `json:"expected_delivery_revision"`
+	CoveredDeliveryIDs        []string         `json:"covered_delivery_ids"`
+	AuthorityKind             AuthorityKind    `json:"authority_kind"`
+	AuthorityRef              string           `json:"authority_ref"`
+	AuthorityGeneration       uint64           `json:"authority_generation"`
+	AuthorityIntentSHA256     string           `json:"authority_intent_sha256"`
+	SessionRef                string           `json:"session_ref"`
+	ContinuationEpoch         uint64           `json:"continuation_epoch"`
+	InstanceTokenSHA256       string           `json:"instance_token_sha256"`
+	State                     TransportState   `json:"state"`
+	InvocationStartedAt       time.Time        `json:"invocation_started_at,omitempty"`
+	InvocationLeaseUntil      time.Time        `json:"invocation_lease_until,omitempty"`
+	InvocationCount           uint64           `json:"invocation_count"`
+	ReceiptLookupFailureCount uint64           `json:"receipt_lookup_failure_count"`
+	Receipt                   TransportReceipt `json:"receipt"`
+	CreatedAt                 time.Time        `json:"created_at"`
+	Revision                  uint64           `json:"-"`
 }
 
 // ValidateAuthority checks a persisted attempt against freshly controller-
@@ -310,6 +320,7 @@ func (s *Store) BeginTransportInvocation(attemptID string, expectedRevision uint
 	}
 	current.State = TransportInvoking
 	current.InvocationCount++
+	current.ReceiptLookupFailureCount = 0
 	current.InvocationStartedAt = startedAt
 	current.InvocationLeaseUntil = startedAt.Add(TransportInvocationLeaseDuration)
 	payload, err := encodeTransportAttempt(current)
@@ -324,6 +335,33 @@ func (s *Store) BeginTransportInvocation(attemptID string, expectedRevision uint
 			return TransportAttempt{}, fmt.Errorf("%w: %w: transport invocation already claimed", ErrTransportInvocationRace, ErrConflict)
 		}
 		return TransportAttempt{}, fmt.Errorf("beginning mail delivery transport invocation: %w", err)
+	}
+	return s.TransportAttempt(attemptID)
+}
+
+// RecordTransportReceiptLookupFailure durably counts one failed read of
+// destination evidence while preserving the invoking attempt for recovery.
+func (s *Store) RecordTransportReceiptLookupFailure(attemptID string, expectedRevision uint64) (TransportAttempt, error) {
+	current, err := s.TransportAttempt(attemptID)
+	if err != nil {
+		return TransportAttempt{}, err
+	}
+	if current.State != TransportInvoking || current.Revision != expectedRevision {
+		return TransportAttempt{}, fmt.Errorf("%w: transport attempt %q cannot record receipt lookup failure from %s/%d", ErrConflict, attemptID, current.State, current.Revision)
+	}
+	current.ReceiptLookupFailureCount++
+	payload, err := encodeTransportAttempt(current)
+	if err != nil {
+		return TransportAttempt{}, err
+	}
+	if s.writer == nil {
+		return TransportAttempt{}, s.conditionalWriterError()
+	}
+	if err := s.writer.UpdateIfMatch(attemptID, int64(expectedRevision), beads.UpdateOpts{Metadata: map[string]string{transportAttemptDataKey: payload}}); err != nil {
+		if beads.IsPreconditionFailed(err) {
+			return TransportAttempt{}, fmt.Errorf("%w: transport receipt lookup failure lost CAS", ErrConflict)
+		}
+		return TransportAttempt{}, fmt.Errorf("recording mail delivery transport receipt lookup failure: %w", err)
 	}
 	return s.TransportAttempt(attemptID)
 }
@@ -403,6 +441,7 @@ func (s *Store) finishTransportAttempt(attemptID string, expectedRevision uint64
 		return TransportAttempt{}, fmt.Errorf("mail delivery transport state and receipt differ")
 	}
 	current.State = state
+	current.ReceiptLookupFailureCount = 0
 	current.Receipt = receipt
 	payload, err := encodeTransportAttempt(current)
 	if err != nil {
@@ -567,7 +606,7 @@ func (a TransportAttempt) validate() error {
 	}
 	switch a.State {
 	case TransportRequested:
-		if a.Receipt != (TransportReceipt{}) {
+		if a.Receipt != (TransportReceipt{}) || a.ReceiptLookupFailureCount != 0 {
 			return fmt.Errorf("requested transport attempt carries a receipt")
 		}
 		if !a.InvocationLeaseUntil.IsZero() || (a.InvocationCount == 0) != a.InvocationStartedAt.IsZero() ||
@@ -581,7 +620,7 @@ func (a TransportAttempt) validate() error {
 			return fmt.Errorf("invoking transport attempt lease is invalid")
 		}
 	case TransportCommitted, TransportUnknownExternalState:
-		if a.InvocationCount == 0 || a.InvocationStartedAt.IsZero() || a.InvocationStartedAt.Location() != time.UTC ||
+		if a.InvocationCount == 0 || a.ReceiptLookupFailureCount != 0 || a.InvocationStartedAt.IsZero() || a.InvocationStartedAt.Location() != time.UTC ||
 			a.InvocationLeaseUntil.IsZero() || a.InvocationLeaseUntil.Location() != time.UTC {
 			return fmt.Errorf("terminal transport attempt lacks invocation identity")
 		}
@@ -610,6 +649,7 @@ func sameTransportIntent(existing, proposed TransportAttempt) bool {
 	existing.InvocationStartedAt = proposed.InvocationStartedAt
 	existing.InvocationLeaseUntil = proposed.InvocationLeaseUntil
 	existing.InvocationCount = proposed.InvocationCount
+	existing.ReceiptLookupFailureCount = proposed.ReceiptLookupFailureCount
 	existing.Revision = 0
 	proposed.Revision = 0
 	return transportAttemptEqual(existing, proposed)
