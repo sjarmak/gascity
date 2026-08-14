@@ -91,6 +91,15 @@ func TestMailDeliveryCommandsAreRegistered(t *testing.T) {
 	}
 }
 
+func TestMailDeliveryReconcileCommandRejectsWideExactCanaryBeforeOpeningStore(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := cmdMailDeliveryReconcileSeat(context.Background(), "seat:test-city/reviewer", 2,
+		"mail-delivery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &stdout, &stderr)
+	if code != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "--limit 1") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
 type failingMailDeliveryFenceResolver struct{ err error }
 
 func (r failingMailDeliveryFenceResolver) ResolveMailActivationFence(context.Context, string) (maildelivery.ActivationFence, error) {
@@ -141,6 +150,71 @@ func TestReconcileMailDeliverySeatAuthorityWaitIsDurableAndDoesNotStarvePage(t *
 	checkpoint, err := store.GetSweepCheckpoint(first.SeatRef)
 	if err != nil || checkpoint.Generation != 2 || !checkpoint.After.IsZero() || !checkpoint.HighWatermark.IsZero() {
 		t.Fatalf("checkpoint = %#v, %v", checkpoint, err)
+	}
+}
+
+func TestReconcileExpectedMailDeliverySeatRejectsDifferentPageBeforeDeliveryEffect(t *testing.T) {
+	backing := beads.NewMemStore()
+	backing.HonorExplicitIDs = true
+	store := maildelivery.NewStore(backing)
+	first := createMailDeliveryForReconcile(t, store, "canary-a", time.Date(2026, 8, 14, 3, 9, 0, 0, time.UTC))
+	second := createMailDeliveryForReconcile(t, store, "canary-b", time.Date(2026, 8, 14, 3, 9, 1, 0, time.UTC))
+	effects := 0
+	report, err := reconcileExpectedMailDeliverySeat(context.Background(), store, first.SeatRef, 1, second.ID,
+		time.Date(2026, 8, 14, 3, 9, 30, 0, time.UTC), fixedMailDeliveryFenceResolver{fence: testMailDeliveryFence()},
+		func(context.Context, maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
+			effects++
+			return maildelivery.TransportAttempt{}, nil
+		})
+	if err == nil || !strings.Contains(err.Error(), "differs from expected") || effects != 0 || report.PageCommitted || len(report.Deliveries) != 0 {
+		t.Fatalf("report=%#v effects=%d err=%v", report, effects, err)
+	}
+	current, getErr := store.Get(first.ID)
+	if getErr != nil || current.Phase != maildelivery.PhaseStored {
+		t.Fatalf("first delivery changed before exact canary gate: %#v, %v", current, getErr)
+	}
+	checkpoint, checkpointErr := store.GetSweepCheckpoint(first.SeatRef)
+	if checkpointErr != nil || checkpoint.Generation != 1 || checkpoint.HighWatermark.IsZero() {
+		t.Fatalf("refused canary must retain its checkpoint-only observation: %#v, %v", checkpoint, checkpointErr)
+	}
+}
+
+func TestReconcileExpectedMailDeliverySeatReportsExactTerminalCanaryWithoutFailure(t *testing.T) {
+	store, attempt, resolver := testMailDeliveryAttempt(t)
+	invoking, err := store.BeginTransportInvocation(attempt.AttemptID, attempt.Revision, attempt.CreatedAt.Add(time.Second))
+	if err != nil {
+		t.Fatalf("BeginTransportInvocation: %v", err)
+	}
+	_, err = store.RecordTransportReceipt(attempt.AttemptID, invoking.Revision, maildelivery.TransportReceipt{
+		Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
+		State: maildelivery.EffectCommitted, CommitBoundary: maildelivery.TransportCommitBoundaryDestinationAtomic,
+		ReceiptRef: "nudge-receipt:test-city/terminal", ReceiptSHA256: strings.Repeat("c", 64),
+		RecordedAt: attempt.CreatedAt.Add(2 * time.Second),
+	})
+	if err != nil {
+		t.Fatalf("RecordTransportReceipt: %v", err)
+	}
+	current, err := store.Get(attempt.DeliveryID)
+	if err != nil {
+		t.Fatalf("Get notified delivery: %v", err)
+	}
+	_, err = store.RecordDisposition(context.Background(), maildelivery.DispositionRequest{
+		DeliveryID: current.ID, ExpectedDeliveryRevision: current.Revision,
+		Reason: maildelivery.DispositionPolicySatisfiedNotified, RecordedAt: attempt.CreatedAt.Add(3 * time.Second),
+	}, resolver)
+	if err != nil {
+		t.Fatalf("RecordDisposition: %v", err)
+	}
+
+	effects := 0
+	report, err := reconcileExpectedMailDeliverySeat(context.Background(), store, current.SeatRef, 1, current.ID,
+		attempt.CreatedAt.Add(4*time.Second), resolver, func(context.Context, maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
+			effects++
+			return maildelivery.TransportAttempt{}, nil
+		})
+	if err != nil || effects != 0 || report.ExpectedDeliveryID != current.ID || report.ExpectedDeliveryPhase != maildelivery.PhaseDispositioned ||
+		report.PageCommitted || len(report.Deliveries) != 0 {
+		t.Fatalf("terminal report=%#v effects=%d err=%v", report, effects, err)
 	}
 }
 

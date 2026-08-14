@@ -2440,6 +2440,7 @@ gc mail delivery reconcile-seat <seat-ref> [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--expect-delivery-id` | string |  | require exactly this delivery; a mismatch may retain a body-free sweep checkpoint |
 | `--limit` | int | `50` | maximum deliveries to process (1-100) |
 
 ## gc mail delivery status
