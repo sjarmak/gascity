@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,14 +43,16 @@ type mailDeliveryReconcileItem struct {
 }
 
 type mailDeliveryReconcileReport struct {
-	SchemaVersion  string                       `json:"schema_version"`
-	SeatRef        string                       `json:"seat_ref"`
-	ObservedAt     time.Time                    `json:"observed_at"`
-	PageCommitted  bool                         `json:"page_committed"`
-	ActionRequired bool                         `json:"action_required"`
-	Checkpoint     maildelivery.SweepCheckpoint `json:"checkpoint"`
-	Plan           maildelivery.SweepPlan       `json:"plan"`
-	Deliveries     []mailDeliveryReconcileItem  `json:"deliveries"`
+	SchemaVersion         string                       `json:"schema_version"`
+	SeatRef               string                       `json:"seat_ref"`
+	ObservedAt            time.Time                    `json:"observed_at"`
+	ExpectedDeliveryID    string                       `json:"expected_delivery_id,omitempty"`
+	ExpectedDeliveryPhase maildelivery.Phase           `json:"expected_delivery_phase,omitempty"`
+	PageCommitted         bool                         `json:"page_committed"`
+	ActionRequired        bool                         `json:"action_required"`
+	Checkpoint            maildelivery.SweepCheckpoint `json:"checkpoint"`
+	Plan                  maildelivery.SweepPlan       `json:"plan"`
+	Deliveries            []mailDeliveryReconcileItem  `json:"deliveries"`
 }
 
 type mailDeliveryAttemptExecutor func(context.Context, maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error)
@@ -82,23 +85,29 @@ func newMailDeliveryCmd(stdout, stderr io.Writer) *cobra.Command {
 		},
 	})
 	var reconcileLimit int
+	var expectedDeliveryID string
 	reconcile := &cobra.Command{
 		Use: "reconcile-seat <seat-ref>", Short: "Reconcile one bounded body-free seat delivery page", Args: cobra.ExactArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
-			if cmdMailDeliveryReconcileSeat(c.Context(), args[0], reconcileLimit, stdout, stderr) != 0 {
+			if cmdMailDeliveryReconcileSeat(c.Context(), args[0], reconcileLimit, expectedDeliveryID, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
 	reconcile.Flags().IntVar(&reconcileLimit, "limit", 50, "maximum deliveries to process (1-100)")
+	reconcile.Flags().StringVar(&expectedDeliveryID, "expect-delivery-id", "", "require exactly this delivery; a mismatch may retain a body-free sweep checkpoint")
 	cmd.AddCommand(reconcile)
 	return cmd
 }
 
-func cmdMailDeliveryReconcileSeat(ctx context.Context, seatRef string, limit int, stdout, stderr io.Writer) int {
+func cmdMailDeliveryReconcileSeat(ctx context.Context, seatRef string, limit int, expectedDeliveryID string, stdout, stderr io.Writer) int {
 	if limit <= 0 || limit > 100 {
 		fmt.Fprintln(stderr, "gc mail delivery reconcile-seat: --limit must be between 1 and 100") //nolint:errcheck
+		return 1
+	}
+	if expectedDeliveryID != "" && (!validMailDeliveryCLIIdentity(expectedDeliveryID) || limit != 1) {
+		fmt.Fprintln(stderr, "gc mail delivery reconcile-seat: --expect-delivery-id requires one valid delivery ID and --limit 1") //nolint:errcheck
 		return 1
 	}
 	workStore, cityPath, code := openCityStoreWithPath(stderr, "gc mail delivery reconcile-seat")
@@ -134,7 +143,7 @@ func cmdMailDeliveryReconcileSeat(ctx context.Context, seatRef string, limit int
 				mailDeliveryWorkerInvoker(cityPath, cfg, sessStore, provider, resolver))
 		}
 	}
-	report, reconcileErr := reconcileMailDeliverySeat(ctx, deliveryStore, seatRef, limit, time.Now().UTC(), resolver, execute)
+	report, reconcileErr := reconcileExpectedMailDeliverySeat(ctx, deliveryStore, seatRef, limit, expectedDeliveryID, time.Now().UTC(), resolver, execute)
 	writeCode := writeMailDeliveryReconcileReport(stdout, stderr, report)
 	if reconcileErr != nil {
 		fmt.Fprintf(stderr, "gc mail delivery reconcile-seat: %v\n", reconcileErr) //nolint:errcheck
@@ -152,6 +161,12 @@ func cmdMailDeliveryReconcileSeat(ctx context.Context, seatRef string, limit int
 func reconcileMailDeliverySeat(ctx context.Context, store *maildelivery.Store, seatRef string, limit int, observedAt time.Time,
 	resolver maildelivery.FenceResolver, execute mailDeliveryAttemptExecutor,
 ) (mailDeliveryReconcileReport, error) {
+	return reconcileExpectedMailDeliverySeat(ctx, store, seatRef, limit, "", observedAt, resolver, execute)
+}
+
+func reconcileExpectedMailDeliverySeat(ctx context.Context, store *maildelivery.Store, seatRef string, limit int, expectedDeliveryID string,
+	observedAt time.Time, resolver maildelivery.FenceResolver, execute mailDeliveryAttemptExecutor,
+) (mailDeliveryReconcileReport, error) {
 	report := mailDeliveryReconcileReport{
 		SchemaVersion: "mail-delivery-reconcile/v1", SeatRef: seatRef, ObservedAt: observedAt,
 		Deliveries: make([]mailDeliveryReconcileItem, 0, limit),
@@ -159,11 +174,33 @@ func reconcileMailDeliverySeat(ctx context.Context, store *maildelivery.Store, s
 	if store == nil || observedAt.IsZero() || observedAt.Location() != time.UTC {
 		return report, fmt.Errorf("mail delivery reconcile inputs are invalid")
 	}
+	if expectedDeliveryID != "" {
+		if !validMailDeliveryCLIIdentity(expectedDeliveryID) || limit != 1 {
+			return report, fmt.Errorf("mail delivery exact canary inputs are invalid")
+		}
+		expected, err := store.Get(expectedDeliveryID)
+		if err != nil {
+			return report, err
+		}
+		if expected.SeatRef != seatRef {
+			return report, fmt.Errorf("mail delivery canary seat differs from expected delivery")
+		}
+		if expected.Phase == maildelivery.PhaseDispositioned {
+			report.ExpectedDeliveryID = expected.ID
+			report.ExpectedDeliveryPhase = expected.Phase
+			return report, nil
+		}
+	}
 	checkpoint, plan, err := store.PlanSweepPage(seatRef, limit)
 	report.Checkpoint = checkpoint
 	report.Plan = plan
 	if err != nil {
 		return report, err
+	}
+	if expectedDeliveryID != "" {
+		if !validMailDeliveryCLIIdentity(expectedDeliveryID) || limit != 1 || len(plan.Page) != 1 || plan.Page[0].DeliveryID != expectedDeliveryID {
+			return report, fmt.Errorf("mail delivery canary page differs from expected delivery %q", expectedDeliveryID)
+		}
 	}
 	if checkpoint.HighWatermark.IsZero() {
 		return report, nil
@@ -327,6 +364,17 @@ func reconcileMailDeliverySeat(ctx context.Context, store *maildelivery.Store, s
 	report.Checkpoint = committed
 	report.PageCommitted = true
 	return report, nil
+}
+
+func validMailDeliveryCLIIdentity(value string) bool {
+	// Keep this wire identity in lockstep with temporalbeads.validateMailDeliveryID
+	// in the gas-city Temporal service; the repositories intentionally do not share a module.
+	const prefix = "mail-delivery-"
+	if !strings.HasPrefix(value, prefix) || len(value) != len(prefix)+64 {
+		return false
+	}
+	decoded, err := hex.DecodeString(strings.TrimPrefix(value, prefix))
+	return err == nil && len(decoded) == 32 && value == strings.ToLower(value)
 }
 
 func classifyMailDeliveryExecution(result maildelivery.TransportAttempt, err error) (mailDeliveryReconcileOutcome, error) {
