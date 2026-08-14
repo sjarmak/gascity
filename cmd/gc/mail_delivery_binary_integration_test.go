@@ -16,7 +16,6 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
-	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/maildelivery"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
@@ -30,7 +29,7 @@ func TestMailDeliveryExactBinaryRecoversCommittedEffectAcrossCWD(t *testing.T) {
 	const (
 		cityName    = "mail-binary-test"
 		identity    = "reviewer"
-		messageID   = "gc-mail-aaaaaaaaaaaaaaaaaaaaaaaa"
+		stableKey   = "goal-5-exact-binary-canary"
 		subjectMark = "private-subject-mail-binary-marker"
 		bodyMark    = "private-body-mail-binary-marker"
 	)
@@ -82,14 +81,45 @@ func TestMailDeliveryExactBinaryRecoversCommittedEffectAcrossCWD(t *testing.T) {
 		t.Fatalf("create isolated named session: %v", err)
 	}
 	seatRef := "seat:" + cityName + "/" + identity
-	mailProvider := beadmail.New(store)
-	_, delivery, err := mailProvider.SendDurable("fixture-sender", identity, subjectMark, bodyMark, beadmail.DurableSendIntent{
-		MessageID: messageID, StoreRef: "city:" + cityName + "/messaging", SeatRef: seatRef,
-		Policy: maildelivery.PolicyNotifyOnly, Attention: maildelivery.AttentionImmediate,
-		ObservedAt: time.Now().UTC(),
-	})
+	if err := closeBeadStoreHandle(store); err != nil {
+		t.Fatalf("close isolated session store: %v", err)
+	}
+
+	outsideCWD := t.TempDir()
+	sendArgs := []string{
+		"--city", cityPath, "mail", "send", "--notify", "--durable-notify-key", stableKey,
+		identity, "-s", subjectMark, "-m", bodyMark, "--json",
+	}
+	sendOut, sendErr := runMailDeliveryExactBinary(ctx, gcBinary, outsideCWD, cityPath, adapterPath, sendArgs)
+	if sendErr != nil {
+		t.Fatalf("exact gc durable send failed: %v\n%s", sendErr, sendOut)
+	}
+	var sendResult durableMailSendResult
+	if err := json.Unmarshal(firstJSONLineForMailDeliveryBinaryTest(sendOut), &sendResult); err != nil {
+		t.Fatalf("decode durable send result: %v\n%s", err, sendOut)
+	}
+	if !sendResult.OK || sendResult.ActionRequired || sendResult.MessageID == "" || sendResult.DeliveryID == "" ||
+		sendResult.Phase != string(maildelivery.PhaseStored) || !sendResult.NotificationRequested || sendResult.RuntimeNotified || sendResult.Notified {
+		t.Fatalf("durable send result = %#v", sendResult)
+	}
+
+	store, err = openCityStoreAt(cityPath)
 	if err != nil {
-		t.Fatalf("seed durable mail: %v", err)
+		t.Fatalf("reopen isolated durable-send store: %v", err)
+	}
+	delivery, err := maildelivery.NewStore(store).Get(sendResult.DeliveryID)
+	if err != nil {
+		t.Fatalf("read CLI-created durable delivery: %v", err)
+	}
+	messageRow, err := store.Get(sendResult.MessageID)
+	if err != nil {
+		t.Fatalf("read CLI-created durable message: %v", err)
+	}
+	if messageRow.Title != subjectMark || messageRow.Description != bodyMark || messageRow.Assignee != identity {
+		t.Fatalf("CLI-created message = %#v", messageRow)
+	}
+	if messageCount, deliveryCount := countMailDeliveryBinaryRows(t, store); messageCount != 1 || deliveryCount != 1 {
+		t.Fatalf("CLI-created rows = %d messages / %d deliveries, want 1 / 1", messageCount, deliveryCount)
 	}
 	resolver, err := mailDeliveryFenceResolverForSeat(sessionFrontDoor(store), cfg, cityName, seatRef,
 		config.Revision(fsys.OSFS{}, provenance, cfg, cityPath))
@@ -123,8 +153,6 @@ func TestMailDeliveryExactBinaryRecoversCommittedEffectAcrossCWD(t *testing.T) {
 	if err := closeBeadStoreHandle(store); err != nil {
 		t.Fatalf("close isolated seed store: %v", err)
 	}
-
-	outsideCWD := t.TempDir()
 	args := []string{
 		"--city", cityPath, "mail", "delivery", "reconcile-seat", seatRef,
 		"--limit", "1", "--expect-delivery-id", delivery.ID,
@@ -193,7 +221,7 @@ func TestMailDeliveryExactBinaryRecoversCommittedEffectAcrossCWD(t *testing.T) {
 		report.Deliveries[0].Attempt.NudgeID != nudgeID || report.Deliveries[0].Attempt.State != string(maildelivery.TransportCommitted) {
 		t.Fatalf("second exact gc report = %#v", report)
 	}
-	for _, forbidden := range []string{subjectMark, bodyMark, messageID} {
+	for _, forbidden := range []string{subjectMark, bodyMark, sendResult.MessageID} {
 		if strings.Contains(secondOut, forbidden) {
 			t.Fatalf("exact gc report leaked %q: %s", forbidden, secondOut)
 		}
@@ -207,7 +235,7 @@ func TestMailDeliveryExactBinaryRecoversCommittedEffectAcrossCWD(t *testing.T) {
 	if !strings.Contains(string(request), nudgeID) {
 		t.Fatalf("stable-nudge request lacks exact nudge ID: %s", request)
 	}
-	for _, forbidden := range []string{subjectMark, bodyMark, messageID, delivery.ID} {
+	for _, forbidden := range []string{subjectMark, bodyMark, sendResult.MessageID, delivery.ID} {
 		if strings.Contains(string(request), forbidden) {
 			t.Fatalf("stable-nudge request leaked %q: %s", forbidden, request)
 		}
@@ -226,6 +254,27 @@ func TestMailDeliveryExactBinaryRecoversCommittedEffectAcrossCWD(t *testing.T) {
 	if err != nil || finalDelivery.Phase != maildelivery.PhaseRuntimeNotified {
 		t.Fatalf("final exact delivery = %#v, %v", finalDelivery, err)
 	}
+	if messageCount, deliveryCount := countMailDeliveryBinaryRows(t, store); messageCount != 1 || deliveryCount != 1 {
+		t.Fatalf("final rows = %d messages / %d deliveries, want 1 / 1", messageCount, deliveryCount)
+	}
+}
+
+func countMailDeliveryBinaryRows(t *testing.T, store beads.Store) (int, int) {
+	t.Helper()
+	rows, err := store.List(beads.ListQuery{AllowScan: true, IncludeClosed: true, TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("list exact-binary rows: %v", err)
+	}
+	messages, deliveries := 0, 0
+	for _, row := range rows {
+		switch row.Type {
+		case "message":
+			messages++
+		case "mail-delivery":
+			deliveries++
+		}
+	}
+	return messages, deliveries
 }
 
 func writeMailDeliveryBinaryCity(t *testing.T, cityPath, cityName, identity, adapterPath string) {
