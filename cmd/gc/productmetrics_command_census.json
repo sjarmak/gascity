@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "next_id": 203,
+  "next_id": 205,
   "permanent_ids": [
     {
       "name": "help",
@@ -2232,6 +2232,52 @@
       "classification": "mail-delete",
       "owner": "immediate",
       "id": 79
+    },
+    {
+      "path": "gc mail delivery",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "structural",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "help",
+      "canonical_target": "@help",
+      "owner": "structural",
+      "id": 1
+    },
+    {
+      "path": "gc mail delivery invoke",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "mail-delivery-invoke",
+      "owner": "immediate",
+      "id": 203
+    },
+    {
+      "path": "gc mail delivery status",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "mail-delivery-status",
+      "owner": "immediate",
+      "id": 204
     },
     {
       "path": "gc mail inbox",

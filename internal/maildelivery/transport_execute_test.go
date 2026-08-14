@@ -1,0 +1,278 @@
+package maildelivery
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gastownhall/gascity/internal/beads"
+)
+
+func TestExecuteTransportInvokesOnceAndReturnsCanonicalCommit(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	request := TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 14, 0, 0, time.UTC),
+	}
+	invocations := 0
+	invoke := func(_ context.Context, attempt TransportAttempt) (TransportReceipt, error) {
+		invocations++
+		return TransportReceipt{
+			Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
+			CommitBoundary: TransportCommitBoundaryDestinationAtomic,
+			State:          EffectCommitted, ReceiptRef: "nudge-receipt:test-city/exact",
+			ReceiptSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			RecordedAt:    time.Date(2026, 8, 13, 23, 15, 0, 0, time.UTC),
+		}, nil
+	}
+	first, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence},
+		time.Date(2026, 8, 13, 23, 16, 0, 0, time.UTC), nil, invoke)
+	if err != nil || first.State != TransportCommitted || invocations != 1 {
+		t.Fatalf("first execution = %#v, %v, invocations=%d", first, err, invocations)
+	}
+	replay, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence},
+		time.Date(2026, 8, 13, 23, 17, 0, 0, time.UTC), nil, invoke)
+	if err != nil || replay.AttemptID != first.AttemptID || replay.State != TransportCommitted || invocations != 1 {
+		t.Fatalf("replay = %#v, %v, invocations=%d", replay, err, invocations)
+	}
+}
+
+func TestExecuteTransportInvocationErrorBecomesUnknownWithoutRedelivery(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	request := TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 18, 0, 0, time.UTC),
+	}
+	physicalEffects := 0
+	invoke := func(context.Context, TransportAttempt) (TransportReceipt, error) {
+		physicalEffects++ // destination committed, response was lost
+		return TransportReceipt{}, errors.New("response lost after destination commit")
+	}
+	unknown, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence},
+		time.Date(2026, 8, 13, 23, 19, 0, 0, time.UTC), nil, invoke)
+	if err == nil || unknown.State != TransportUnknownExternalState || physicalEffects != 1 {
+		t.Fatalf("faulted execution = %#v, %v, effects=%d", unknown, err, physicalEffects)
+	}
+	replay, replayErr := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence},
+		time.Date(2026, 8, 13, 23, 20, 0, 0, time.UTC), nil, invoke)
+	if replayErr != nil || replay.State != TransportUnknownExternalState || physicalEffects != 1 {
+		t.Fatalf("fault replay = %#v, %v, effects=%d", replay, replayErr, physicalEffects)
+	}
+}
+
+func TestExecuteTransportRecoversExpiredInvokingLeaseAsUnknownWithoutCallingProvider(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	request := TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 21, 0, 0, time.UTC),
+	}
+	attempt, err := store.CreateTransportAttempt(context.Background(), request, fixedFenceResolver{fence: fence})
+	if err != nil {
+		t.Fatalf("CreateTransportAttempt: %v", err)
+	}
+	startedAt := time.Date(2026, 8, 13, 23, 21, 0, 0, time.UTC)
+	if _, err := store.BeginTransportInvocation(attempt.AttemptID, attempt.Revision, startedAt); err != nil {
+		t.Fatalf("BeginTransportInvocation: %v", err)
+	}
+	called := false
+	got, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence},
+		startedAt.Add(TransportInvocationLeaseDuration+time.Second), nil, func(context.Context, TransportAttempt) (TransportReceipt, error) {
+			called = true
+			return TransportReceipt{}, nil
+		})
+	if err != nil || got.State != TransportUnknownExternalState || called {
+		t.Fatalf("invoking recovery = %#v, %v, called=%t", got, err, called)
+	}
+}
+
+func TestExecuteTransportConcurrentCallerLeavesLiveInvocationIntact(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	startedAt := time.Date(2026, 8, 13, 23, 22, 0, 0, time.UTC)
+	request := TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID}, CreatedAt: startedAt,
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	firstDone := make(chan struct{})
+	var first TransportAttempt
+	var firstErr error
+	go func() {
+		defer close(firstDone)
+		first, firstErr = ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence}, startedAt, nil,
+			func(_ context.Context, attempt TransportAttempt) (TransportReceipt, error) {
+				once.Do(func() { close(entered) })
+				<-release
+				return TransportReceipt{
+					Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
+					State: EffectCommitted, CommitBoundary: TransportCommitBoundaryDestinationAtomic,
+					ReceiptRef: "nudge-receipt:test-city/concurrent", ReceiptSHA256: strings.Repeat("a", 64),
+					RecordedAt: startedAt.Add(time.Second),
+				}, nil
+			})
+	}()
+	<-entered
+	second, secondErr := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence}, startedAt.Add(time.Second), nil,
+		func(context.Context, TransportAttempt) (TransportReceipt, error) {
+			t.Fatal("concurrent caller invoked provider")
+			return TransportReceipt{}, nil
+		})
+	if !errors.Is(secondErr, ErrTransportInvocationInProgress) || second.State != TransportInvoking {
+		t.Fatalf("concurrent caller = %#v, %v", second, secondErr)
+	}
+	close(release)
+	<-firstDone
+	if firstErr != nil || first.State != TransportCommitted {
+		t.Fatalf("first caller = %#v, %v", first, firstErr)
+	}
+}
+
+func TestExecuteTransportPreflightFailureStaysRequested(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	request := TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 24, 0, 0, time.UTC),
+	}
+	called := false
+	got, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence},
+		time.Date(2026, 8, 13, 23, 25, 0, 0, time.UTC),
+		func(context.Context, TransportAttempt) error { return errors.New("target inactive") },
+		func(context.Context, TransportAttempt) (TransportReceipt, error) {
+			called = true
+			return TransportReceipt{}, nil
+		})
+	if err == nil || got.State != TransportRequested || called {
+		t.Fatalf("preflight failure = %#v, %v, called=%t", got, err, called)
+	}
+	loaded, loadErr := store.TransportAttempt(got.AttemptID)
+	if loadErr != nil || loaded.State != TransportRequested {
+		t.Fatalf("persisted preflight state = %#v, %v", loaded, loadErr)
+	}
+}
+
+func TestExecuteTransportRejectsUnavailableOrNonUTCBoundary(t *testing.T) {
+	invoke := func(context.Context, TransportAttempt) (TransportReceipt, error) { return TransportReceipt{}, nil }
+	if _, err := ExecuteTransport(context.Background(), nil, TransportAttemptRequest{}, nil, time.Now().UTC(), nil, invoke); err == nil {
+		t.Fatal("nil store succeeded")
+	}
+	store, _ := newDeliveryStore()
+	if _, err := ExecuteTransport(context.Background(), store, TransportAttemptRequest{}, nil, time.Now().UTC(), nil, nil); err == nil {
+		t.Fatal("nil invoker succeeded")
+	}
+	if _, err := ExecuteTransport(context.Background(), store, TransportAttemptRequest{}, nil, time.Now(), nil, invoke); err == nil {
+		t.Fatal("non-UTC uncertainty time succeeded")
+	}
+}
+
+func TestExecuteTransportAcceptsTypedUnknownWithoutRedelivery(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	request := TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 33, 0, 0, time.UTC),
+	}
+	calls := 0
+	got, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence},
+		time.Date(2026, 8, 13, 23, 34, 0, 0, time.UTC), nil,
+		func(_ context.Context, attempt TransportAttempt) (TransportReceipt, error) {
+			calls++
+			return TransportReceipt{
+				Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
+				State:      EffectUnknownExternalState,
+				RecordedAt: time.Date(2026, 8, 13, 23, 35, 0, 0, time.UTC),
+			}, nil
+		})
+	if err != nil || got.State != TransportUnknownExternalState || calls != 1 {
+		t.Fatalf("typed unknown = %#v, %v, calls=%d", got, err, calls)
+	}
+	replay, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence},
+		time.Date(2026, 8, 13, 23, 36, 0, 0, time.UTC), nil,
+		func(context.Context, TransportAttempt) (TransportReceipt, error) {
+			calls++
+			return TransportReceipt{}, nil
+		})
+	if err != nil || replay.State != TransportUnknownExternalState || calls != 1 {
+		t.Fatalf("typed unknown replay = %#v, %v, calls=%d", replay, err, calls)
+	}
+}
+
+func TestExecuteTransportUntypedProviderOutcomeBecomesUnknown(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	request := TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 37, 0, 0, time.UTC),
+	}
+	got, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence},
+		time.Date(2026, 8, 13, 23, 38, 0, 0, time.UTC), nil,
+		func(context.Context, TransportAttempt) (TransportReceipt, error) { return TransportReceipt{}, nil })
+	if err == nil || got.State != TransportUnknownExternalState {
+		t.Fatalf("untyped outcome = %#v, %v", got, err)
+	}
+}
+
+func TestExecuteTransportRepairsCommittedAttemptBeforeReturningTerminal(t *testing.T) {
+	backing := &failTransportFinalizeStore{MemStore: beads.NewMemStore()}
+	backing.HonorExplicitIDs = true
+	store := NewStore(backing)
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	request := TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 46, 0, 0, time.UTC),
+	}
+	calls := 0
+	invoke := func(_ context.Context, attempt TransportAttempt) (TransportReceipt, error) {
+		calls++
+		return TransportReceipt{
+			Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
+			CommitBoundary: TransportCommitBoundaryDestinationAtomic,
+			State:          EffectCommitted, ReceiptRef: "provider-acceptance:test-city/replay-repair",
+			ReceiptSHA256: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+			RecordedAt:    time.Date(2026, 8, 13, 23, 47, 0, 0, time.UTC),
+		}, nil
+	}
+	backing.deliveryID, backing.failNext = delivery.ID, true
+	committed, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence},
+		time.Date(2026, 8, 13, 23, 48, 0, 0, time.UTC), nil, invoke)
+	if err == nil || committed.State != TransportCommitted || calls != 1 {
+		t.Fatalf("first execution = %#v, %v, calls=%d", committed, err, calls)
+	}
+	parked, getErr := store.Get(delivery.ID)
+	if getErr != nil || parked.Phase != PhaseNotificationRequested {
+		t.Fatalf("parked delivery = %#v, %v", parked, getErr)
+	}
+
+	repaired, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence},
+		time.Date(2026, 8, 13, 23, 49, 0, 0, time.UTC), nil, invoke)
+	if err != nil || !reflect.DeepEqual(repaired, committed) || calls != 1 {
+		t.Fatalf("repair execution = %#v, %v, calls=%d; want %#v", repaired, err, calls, committed)
+	}
+	notified, getErr := store.Get(delivery.ID)
+	if getErr != nil || notified.Phase != PhaseRuntimeNotified {
+		t.Fatalf("repaired delivery = %#v, %v", notified, getErr)
+	}
+}

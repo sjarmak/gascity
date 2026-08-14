@@ -177,17 +177,40 @@ type NudgeRequest struct {
 	Delivery NudgeDelivery   `json:"delivery,omitempty"`
 	Source   string          `json:"source,omitempty"`
 	Wake     NudgeWakePolicy `json:"wake,omitempty"`
+	// EffectID is a caller-owned stable identity carried into the provider
+	// acceptance receipt. It is not message content or an idempotency claim.
+	EffectID string `json:"effect_id,omitempty"`
 }
 
 // NudgeResult reports whether the requested live delivery actually happened.
 type NudgeResult struct {
-	Delivered bool `json:"delivered"`
+	Delivered bool                    `json:"delivered"`
+	Receipt   *NudgeAcceptanceReceipt `json:"receipt,omitempty"`
 	// Undelivered names WHY a live delivery did not happen, for the callers
 	// that downgrade to the queue and have to tell a human what they did.
 	// Empty when Delivered is true, and empty for a downgrade this type does
 	// not (yet) distinguish — a caller must treat it as a hint, never as a
 	// second copy of Delivered.
 	Undelivered NudgeUndeliveredReason `json:"undelivered,omitempty"`
+}
+
+// NudgeCommitBoundaryProviderReturn means the provider returned success. It
+// proves acceptance at this boundary, not agent consumption or provider-native
+// idempotency.
+const NudgeCommitBoundaryProviderReturn = "provider-nudge-return"
+
+// NudgeAcceptanceReceipt binds provider success to one stable effect and exact
+// runtime target without including nudge text.
+type NudgeAcceptanceReceipt struct {
+	Version           int       `json:"version"`
+	EffectID          string    `json:"effect_id"`
+	TargetSessionRef  string    `json:"target_session_ref,omitempty"`
+	TargetRuntimeName string    `json:"target_runtime_name"`
+	Provider          string    `json:"provider"`
+	Transport         string    `json:"transport"`
+	CommitBoundary    string    `json:"commit_boundary"`
+	AcceptedAt        time.Time `json:"accepted_at"`
+	ReceiptSHA256     string    `json:"receipt_sha256"`
 }
 
 // NudgeUndeliveredReason is the closed set of reasons a live nudge did not
