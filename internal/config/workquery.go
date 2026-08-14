@@ -190,13 +190,39 @@ func bdQueryEphemeralStatusQuietShell(status string) string {
 	return bdQueryEphemeralStatusShell(status) + ` 2>/dev/null`
 }
 
-func legacyEphemeralReadyFilterJQ(selector string, limit int, excludeHoldLabels bool) string {
-	body := selector +
-		` | select(((.issue_type // .type // "") != "epic"))` +
-		` | select(([ (.dependencies // [])[]` +
+// readyFilterTier names which work-query tier a generated ephemeral ready
+// filter serves. Two exclusions are scoped to the unassigned pool tier and must
+// never reach an assignee-scoped one:
+//
+//   - epics, because an unassigned parent epic has no executable spec (gc-udx).
+//     A bead ALREADY ASSIGNED to this agent is its work whatever its type, and
+//     the patrol-loop pattern self-assigns an epic wisp it must resume after a
+//     restart. Excluding epics there strands the wisp (dr-ssajj).
+//   - dispatch-hold labels, per excludeHoldLabelsShellArgs: assignee-scoped
+//     tiers are hold-transparent by design.
+//
+// The two travel together because both answer the same question — is this the
+// unassigned pool tier? — so one parameter carries them and they cannot be set
+// inconsistently. The `bd ready` tiers scope the same pair by pairing
+// --exclude-type=epic with --unassigned; this is the jq form of that pairing.
+type readyFilterTier int
+
+const (
+	// assignedReadyTier reads beads already assigned to one identity.
+	assignedReadyTier readyFilterTier = iota
+	// unassignedPoolReadyTier reads claimable, unassigned, routed demand.
+	unassignedPoolReadyTier
+)
+
+func legacyEphemeralReadyFilterJQ(selector string, limit int, tier readyFilterTier) string {
+	body := selector
+	if tier == unassignedPoolReadyTier {
+		body += ` | select(((.issue_type // .type // "") != "epic"))`
+	}
+	body += ` | select(([ (.dependencies // [])[]` +
 		` | select((.type // .dep_type // "") as $t | ($t == "blocks" or $t == "waits-for" or $t == "conditional-blocks"))` +
 		` | select((.status // .depends_on_status // "") != "closed") ] | length) == 0)`
-	if excludeHoldLabels {
+	if tier == unassignedPoolReadyTier {
 		body += excludeHoldLabelsJQClause()
 	}
 	filter := `[.[] | ` + body + `]` + ` | sort_by(.created_at // "")`
@@ -214,7 +240,7 @@ func legacyEphemeralPoolDemandShell(limit int, topo QueryTopology, quiet bool) s
 		`select((.assignee // "") == "")`+
 			` | select((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == $target) or ((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == "") and (`+jqMeta(beadmeta.RunTargetMetadataKey)+` == $target) and (`+jqMeta(beadmeta.KindMetadataKey)+` == "`+beadmeta.KindWorkflow+`")))`,
 		limit,
-		true,
+		unassignedPoolReadyTier,
 	)
 	query := bdQueryEphemeralStatusShell("open")
 	if quiet {
@@ -441,11 +467,17 @@ func ephemeralAssignedInProgressProbeScript(shellVar string, topo QueryTopology)
 // (see splitEnv.mintWispWith). The ephemeral tier only exists where the policy
 // front door put the wisp somewhere a plain read cannot see it, which is the
 // single-store city.
+//
+// It is an ASSIGNED tier, so it filters on assignedReadyTier terms only. The
+// `bd ready` assigned tier beside it (assignedReadyTierCommand) carries no
+// --exclude-type=epic; this one carried the jq equivalent until dr-ssajj, which
+// meant an agent's own open epic wisp was dropped at every bd_compatibility
+// value EXCEPT bd-1.0.5, where this tier is not generated at all.
 func ephemeralAssignedReadyProbeScript(shellVar string, topo QueryTopology) string {
 	if topo.includeEphemeralReady() {
 		return ""
 	}
-	filter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1, false)
+	filter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1, assignedReadyTier)
 	return `r=$(` + bdQueryEphemeralStatusQuietShell("open") + ` | ` +
 		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
@@ -538,18 +570,30 @@ func (a *Agent) effectiveQuery(kind queryKind, topo QueryTopology) string {
 // configured bd compatibility mode. Molecule containers are not routable
 // demand.
 //
-// Parent epics are excluded from the routed (pool) tier only
-// (--exclude-type=epic). An unassigned parent epic has no executable spec —
-// its semantic is "all children done" — so a pool worker claiming one does
-// undefined work (gc-udx; the repro is a routed parent epic, see
-// TestEffectiveWorkQuerySkipsEpicLeafScenario). The assigned tiers do NOT
-// exclude epics: work already assigned to this agent is owned, and the
+// Parent epics are excluded from the routed (pool) tier only. An unassigned
+// parent epic has no executable spec — its semantic is "all children done" — so
+// a pool worker claiming one does undefined work (gc-udx). The assigned tiers
+// do NOT exclude epics: work already assigned to this agent is owned, and the
 // patrol-loop pattern (gastown witness/refinery/deacon) can self-assign an
 // epic wisp that the agent must resume after a session restart. Excluding
 // epics there silently stranded those wisps (gc hook exited 1 with empty
 // output). Roles that need different behavior still opt in via an explicit
 // work_query in their agent config; that custom query is returned unchanged
 // above.
+//
+// The exclusion has TWO forms and the scoping has to hold in both: the
+// `--exclude-type=epic` flag on the `bd ready` tiers, always paired with
+// --unassigned; and the jq clause on the bd-1.0.4 ephemeral tiers, scoped by
+// readyFilterTier. Only the first was tier-scoped until dr-ssajj, so at every
+// bd_compatibility value except bd-1.0.5 — which does not generate the jq tier
+// at all, and is therefore the one level a pinned test cannot observe the bug
+// from — an agent's own open epic wisp was dropped.
+//
+// Guarded by TestEffectiveWorkQueryAssignedTierSurfacesEpicWisp (parameterised
+// across compat levels) and TestEffectiveWorkQueryPoolTierStillHidesUnassignedEpicWisp.
+// TestEffectiveWorkQuerySkipsEpicLeafScenario is NOT a guard on the scoping: it
+// asserts only that the routed tier hides an epic, which an unscoped exclusion
+// also satisfies.
 //
 // When the reconciler runs the query for demand detection (no session
 // context), all identity vars are empty → assignee tiers skip → only

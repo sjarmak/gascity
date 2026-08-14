@@ -2472,38 +2472,129 @@ func TestEffectiveWorkQueryExcludesEpicsControlDispatcher(t *testing.T) {
 	}
 }
 
-// TestEffectiveWorkQueryAssignedTierSurfacesEpicWisp verifies that a
-// self-assigned ephemeral epic (a "wisp" — the patrol-loop pattern used
-// by the gastown witness/refinery/deacon) is surfaced by the default
-// work query's assigned tiers. The fake bd here mimics real bd's
-// --exclude-type=epic behavior: it returns the epic wisp for a
-// `ready --assignee` query ONLY when --exclude-type=epic is absent.
-// Before the fix the assigned tier carried --exclude-type=epic and the
-// agent's own open wisp was dropped (gc hook exited 1 with no output);
-// the gc-udx parent-epic guard lives on the routed (Tier 3) query, which
-// still excludes epics — see TestEffectiveWorkQuerySkipsEpicLeafScenario.
-func TestEffectiveWorkQueryAssignedTierSurfacesEpicWisp(t *testing.T) {
-	a := Agent{Name: "witness", Dir: "hello-world"}
-	out := runEffectiveWorkQueryForBeads(t, a, BeadsConfig{BDCompatibility: BeadsBDCompatibility105}, map[string]string{
-		"GC_SESSION_ID":     "witness-sess",
-		"GC_SESSION_ORIGIN": "ephemeral",
-	}, `#!/bin/sh
+// assignedEpicWispFakeBd is a fake bd that holds ONE bead: an open ephemeral
+// epic assigned to witness-sess. It answers both routes the assigned-ready tier
+// can take, so the same state is observable at every bd_compatibility value:
+//
+//   - bd-1.0.5 reads wisps through `bd ready --include-ephemeral`, and mimics
+//     real bd by dropping the epic-typed row when --exclude-type=epic is on the
+//     wire.
+//   - unset / bd-1.0.4 has no ephemeral ready surface, so the wisp is only
+//     reachable through `bd query ephemeral=true AND status=open` and the jq
+//     filter the generated script applies to it.
+const assignedEpicWispFakeBd = `#!/bin/sh
 set -eu
+wisp='[{"id":"patrol-wisp","issue_type":"epic","ephemeral":true,"status":"open","assignee":"witness-sess","created_at":"2026-05-01T00:00:00Z"}]'
 case "$1" in
   ready)
     case "$*" in
-      *"--assignee=witness-sess"*"--exclude-type=epic"*)
+      *"--exclude-type=epic"*)
         # real bd drops the epic-typed wisp when epics are excluded
         printf '[]' ;;
-      *"ready --include-ephemeral"*"--assignee=witness-sess"*)
-        printf '[{"id":"patrol-wisp","issue_type":"epic","ephemeral":true}]' ;;
+      *"--include-ephemeral"*"--assignee=witness-sess"*)
+        printf '%s' "$wisp" ;;
+      *) printf '[]' ;;
+    esac ;;
+  query)
+    case "$*" in
+      *"ephemeral=true AND status=open"*) printf '%s' "$wisp" ;;
       *) printf '[]' ;;
     esac ;;
   *) printf '[]' ;;
 esac
-`)
-	if !strings.Contains(out, "patrol-wisp") {
-		t.Fatalf("EffectiveWorkQuery() did not surface the self-assigned epic wisp (assigned tier still excludes epics?): %q", out)
+`
+
+// TestEffectiveWorkQueryAssignedTierSurfacesEpicWisp verifies that a
+// self-assigned ephemeral epic (a "wisp" — the patrol-loop pattern used
+// by the gastown witness/refinery/deacon) is surfaced by the default
+// work query's assigned tiers at EVERY bd_compatibility value.
+//
+// The compat axis is the point (dr-ssajj). The earlier form of this guard
+// pinned bd-1.0.5, which is the one level where the ephemeral jq tier is not
+// generated at all, so it could not observe the default path this city runs:
+// at unset / bd-1.0.4 the assigned ephemeral probe carried an unqualified
+// `select(((.issue_type // .type // "") != "epic"))` and dropped the agent's
+// own wisp (gc hook exited 1 with no output).
+//
+// Do NOT read TestEffectiveWorkQuerySkipsEpicLeafScenario as covering this: it
+// asserts the routed tier HIDES an epic, so a globally applied exclusion keeps
+// it green either way.
+func TestEffectiveWorkQueryAssignedTierSurfacesEpicWisp(t *testing.T) {
+	for _, compat := range []string{"", BeadsBDCompatibility104, BeadsBDCompatibility105} {
+		t.Run("compat="+compat, func(t *testing.T) {
+			a := Agent{Name: "witness", Dir: "hello-world"}
+			out := runEffectiveWorkQueryForBeads(t, a, BeadsConfig{BDCompatibility: compat}, map[string]string{
+				"GC_SESSION_ID":     "witness-sess",
+				"GC_SESSION_ORIGIN": "ephemeral",
+			}, assignedEpicWispFakeBd)
+			if !strings.Contains(out, "patrol-wisp") {
+				t.Fatalf("EffectiveWorkQueryFor(bd_compatibility=%q) did not surface the self-assigned epic wisp (assigned tier still excludes epics?): %q", compat, out)
+			}
+		})
+	}
+}
+
+// TestEffectiveWorkQueryPoolTierStillHidesUnassignedEpicWisp is the other half
+// of dr-ssajj: lifting the epic exclusion off the ASSIGNED tier must not lift
+// it off the unassigned pool tier, where it is the gc-udx guard. An unassigned
+// parent epic has no executable spec, so a pool worker claiming one does
+// undefined work.
+//
+// The fake bd answers `bd ready` with nothing, so the only route to the epic is
+// the legacy ephemeral pool-demand jq filter — the same helper the assigned
+// probe uses. Both the work query (worker claim path) and the count-form
+// (reconciler spawn path) are asserted, because they share that predicate.
+func TestEffectiveWorkQueryPoolTierStillHidesUnassignedEpicWisp(t *testing.T) {
+	const fakeBd = `#!/bin/sh
+set -eu
+case "$1" in
+  query)
+    case "$*" in
+      *"ephemeral=true AND status=open"*)
+        printf '[{"id":"parent-epic","issue_type":"epic","ephemeral":true,"status":"open","assignee":"","created_at":"2026-05-01T00:00:00Z","metadata":{"gc.routed_to":"hello-world/worker"}}]' ;;
+      *) printf '[]' ;;
+    esac ;;
+  *) printf '[]' ;;
+esac
+`
+	for _, compat := range []string{"", BeadsBDCompatibility104} {
+		t.Run("compat="+compat, func(t *testing.T) {
+			a := Agent{Name: "worker", Dir: "hello-world"}
+			beads := BeadsConfig{BDCompatibility: compat}
+			out := runEffectiveWorkQueryForBeads(t, a, beads, map[string]string{
+				"GC_SESSION_ORIGIN": "ephemeral",
+			}, fakeBd)
+			if strings.Contains(out, "parent-epic") {
+				t.Fatalf("EffectiveWorkQueryFor(bd_compatibility=%q) served an UNASSIGNED epic to a pool worker (gc-udx): %q", compat, out)
+			}
+			demand := strings.TrimSpace(runShellWithFakeBd(t, a.EffectivePoolDemandQueryFor(QueryTopology{Beads: beads}), nil, fakeBd))
+			if demand != "0" {
+				t.Fatalf("EffectivePoolDemandQueryFor(bd_compatibility=%q) = %q, want 0: an unassigned epic is not spawnable demand", compat, demand)
+			}
+		})
+	}
+}
+
+// TestLegacyEphemeralReadyFilterIsTierScoped pins the shape of the two jq
+// filters the bd-1.0.4 ephemeral tiers generate, so the scoping survives a
+// refactor of the helper that builds them. The assigned filter goes straight
+// from the assignee selector into the dependency-blocking clause; the pool
+// filter keeps the epic exclusion between them.
+func TestLegacyEphemeralReadyFilterIsTierScoped(t *testing.T) {
+	const epicClause = ` | select(((.issue_type // .type // "") != "epic"))`
+	assigned := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1, assignedReadyTier)
+	if strings.Contains(assigned, epicClause) {
+		t.Errorf("assigned-tier ephemeral filter excludes epics, stranding self-assigned wisps (dr-ssajj): %s", assigned)
+	}
+	pool := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == "")`, 1, unassignedPoolReadyTier)
+	if !strings.Contains(pool, epicClause) {
+		t.Errorf("unassigned pool-tier ephemeral filter dropped the epic exclusion (gc-udx): %s", pool)
+	}
+	if !strings.Contains(pool, `"hold:mayor"`) {
+		t.Errorf("unassigned pool-tier ephemeral filter dropped the dispatch-hold exclusion: %s", pool)
+	}
+	if strings.Contains(assigned, `"hold:mayor"`) {
+		t.Errorf("assigned-tier ephemeral filter must stay hold-transparent: %s", assigned)
 	}
 }
 
