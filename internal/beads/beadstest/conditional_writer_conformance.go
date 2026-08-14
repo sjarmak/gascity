@@ -87,15 +87,20 @@ func RunConditionalWriterConformanceWithOptions(t *testing.T, name string, open 
 		id := b.ID
 
 		prev := revOf(t, s, id)
+		seen := map[int64]bool{prev: true}
 		bump := func(label string, mutate func() error) {
 			t.Helper()
 			if err := mutate(); err != nil {
 				t.Fatalf("%s: %v", label, err)
 			}
 			cur := revOf(t, s, id)
-			if cur <= prev {
-				t.Fatalf("%s did not bump revision: %d -> %d (want strictly greater)", label, prev, cur)
+			if cur == prev {
+				t.Fatalf("%s did not change revision: %d -> %d", label, prev, cur)
 			}
+			if seen[cur] {
+				t.Fatalf("%s reused revision %d", label, cur)
+			}
+			seen[cur] = true
 			prev = cur
 		}
 
@@ -106,7 +111,7 @@ func RunConditionalWriterConformanceWithOptions(t *testing.T, name string, open 
 		bump("Update(labels)", func() error { return s.Update(id, beads.UpdateOpts{Labels: []string{"alpha"}}) })
 		bump("Update(status)", func() error { return s.Update(id, beads.UpdateOpts{Status: strPtr("in_progress")}) })
 		bump("Update(description)", func() error { return s.Update(id, beads.UpdateOpts{Description: strPtr("desc")}) })
-		bump("Update(priority)", func() error { p := 2; return s.Update(id, beads.UpdateOpts{Priority: &p}) })
+		bump("Update(priority)", func() error { p := 1; return s.Update(id, beads.UpdateOpts{Priority: &p}) })
 		bump("Update(metadata-opt)", func() error { return s.Update(id, beads.UpdateOpts{Metadata: map[string]string{"mo": "1"}}) })
 		bump("Update(removeLabels)", func() error { return s.Update(id, beads.UpdateOpts{RemoveLabels: []string{"alpha"}}) })
 		bump("SetMetadata", func() error { return s.SetMetadata(id, "k", "v") })
@@ -119,9 +124,13 @@ func RunConditionalWriterConformanceWithOptions(t *testing.T, name string, open 
 			t.Fatalf("Close: %v", err)
 		}
 		if closed, err := s.Get(id); err == nil {
-			if closed.Revision <= prev {
-				t.Fatalf("Close did not bump revision: %d -> %d", prev, closed.Revision)
+			if closed.Revision == prev {
+				t.Fatalf("Close did not change revision: %d -> %d", prev, closed.Revision)
 			}
+			if seen[closed.Revision] {
+				t.Fatalf("Close reused revision %d", closed.Revision)
+			}
+			seen[closed.Revision] = true
 			prev = closed.Revision
 		}
 		bump("Reopen", func() error { return s.Reopen(id) })
@@ -168,7 +177,7 @@ func RunConditionalWriterConformanceWithOptions(t *testing.T, name string, open 
 		}
 	})
 
-	t.Run(name+"/revision_monotonic_never_reused", func(t *testing.T) {
+	t.Run(name+"/revision_changes_and_is_never_reused", func(t *testing.T) {
 		s := open(t)
 		b, err := s.Create(beads.Bead{Title: "mono"})
 		if err != nil {
@@ -184,8 +193,8 @@ func RunConditionalWriterConformanceWithOptions(t *testing.T, name string, open 
 				t.Fatal(err)
 			}
 			cur := revOf(t, s, id)
-			if cur <= last {
-				t.Fatalf("revision not monotonic at step %d: %d -> %d", i, last, cur)
+			if cur == last {
+				t.Fatalf("revision unchanged at step %d: %d", i, cur)
 			}
 			if seen[cur] {
 				t.Fatalf("revision %d reused at step %d", cur, i)
@@ -260,8 +269,8 @@ func RunConditionalWriterConformanceWithOptions(t *testing.T, name string, open 
 		if got.Title != "applied" {
 			t.Fatalf("UpdateIfMatch did not apply opts: title = %q, want %q", got.Title, "applied")
 		}
-		if got.Revision <= aRev {
-			t.Fatalf("UpdateIfMatch did not bump revision: %d -> %d", aRev, got.Revision)
+		if got.Revision == aRev {
+			t.Fatalf("UpdateIfMatch did not change revision: %d", aRev)
 		}
 
 		// CloseIfMatch at the current revision succeeds.

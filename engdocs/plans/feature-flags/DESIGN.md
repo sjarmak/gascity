@@ -1324,8 +1324,8 @@ This section defines the capability axis in `internal/beads`: the optional store
 //   - EVERY mutation of the issue row bumps the revision: field updates,
 //     label add/remove, metadata writes (any key), assign, close, reopen,
 //     delete. Reads never bump. Cross-bead writes never bump this bead.
-//   - A bead's revision is monotonically increasing for the lifetime of the
-//     bead and is never reused.
+//   - A bead's revision changes to a fresh value for every covered mutation
+//     and is never reused. Numeric ordering is undefined.
 //
 // GRANULARITY CONTRACT: consumers may assume NEITHER value-level nor
 // revision-level conflict semantics. Backends differ: sqlite and the native
@@ -1530,7 +1530,7 @@ func RunConditionalWriterConformance(t *testing.T, name string, open func(t *tes
 	t.Run(name+"/every_mutation_bumps_revision", ...)      // update, labels, metadata,
 	                                                       // assign, close, reopen — full verb matrix
 	t.Run(name+"/reads_never_bump", ...)
-	t.Run(name+"/revision_monotonic_never_reused", ...)
+	t.Run(name+"/revision_changes_and_is_never_reused", ...)
 	t.Run(name+"/stale_revision_is_precondition_failed", ...) // typed, Expected/Current populated
 	                                                          // where the backend can supply them
 	t.Run(name+"/cas_empty_expected_claims_absent_or_empty_only", ...)
@@ -2640,7 +2640,7 @@ _Rationale: CC-4 (verified: no sqlite ConditionalWriter exists in-tree; the depl
 
 ### Test seams (all typed, all per-instance)
 
-**Decision:** (1) rollout.ForTest takes TYPED With* option funcs (rollout.WithBeadsConditionalWrites(rollout.Require)) generated alongside each Flags accessor — deleting a flag breaks tests at COMPILE time; the string-keyed unknown-key path does not exist. (2) Resolve takes injected LookupEnv (map-backed fake; no t.Setenv; GC_BEADS_CONDITIONAL_WRITES registered in LeakVectorVars, enforced by a registry test). (3) Capability-absent is an INSTANCE TOGGLE (mem.DisableConditionalWrites=true → methods return ErrConditionalWriteUnsupported, interface set intact) — the withoutConditionalWrites wrapper is deleted because it silently strips all five optional store interfaces (the class_store.go:15 lesson). (4) A store-agnostic ConditionalWriter CONFORMANCE SUITE (which operations bump revision, exit-9 equivalence, empty-expected semantics, monotonicity — documented as the interface's doc-comment contract) runs over MemStore, FileStore, CachingStore-over-MemStore, and sqlite in unit CI, and over BdStore against real bd under //go:build integration; it slots into the existing contract-test system (PR #3714). New internal/rollout test package ships its generated testenv_import_test.go.
+**Decision:** (1) rollout.ForTest takes TYPED With* option funcs (rollout.WithBeadsConditionalWrites(rollout.Require)) generated alongside each Flags accessor — deleting a flag breaks tests at COMPILE time; the string-keyed unknown-key path does not exist. (2) Resolve takes injected LookupEnv (map-backed fake; no t.Setenv; GC_BEADS_CONDITIONAL_WRITES registered in LeakVectorVars, enforced by a registry test). (3) Capability-absent is an INSTANCE TOGGLE (mem.DisableConditionalWrites=true → methods return ErrConditionalWriteUnsupported, interface set intact) — the withoutConditionalWrites wrapper is deleted because it silently strips all five optional store interfaces (the class_store.go:15 lesson). (4) A store-agnostic ConditionalWriter CONFORMANCE SUITE (which operations change revision, exit-9 equivalence, empty-expected semantics, fresh-token non-reuse — documented as the interface's doc-comment contract) runs over MemStore, FileStore, CachingStore-over-MemStore, and sqlite in unit CI, and over BdStore against real bd under //go:build integration; it slots into the existing contract-test system (PR #3714). New internal/rollout test package ships its generated testenv_import_test.go.
 
 
 _Rationale: T-9 (stringly ForTest), T-5 (wrapper erases sibling capabilities — already bitten in-tree), T-4 (fake revision-discipline divergence makes green CI predict nothing about production bd)._

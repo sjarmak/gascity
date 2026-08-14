@@ -440,7 +440,7 @@ func (s *BdStore) DeleteIfMatch(id string, expectedRevision int64) error {
 //     would misreport a landed write as a precondition.
 //   - SERIALIZATION-class transient (transient AND not ambiguous: the txn rolled
 //     back) → re-read the revision; if it moved, the fence is permanently stale
-//     (revisions are monotonic and never reused) so return a precondition
+//     (revisions are fresh and never reused) so return a precondition
 //     immediately rather than replaying a doomed fence; otherwise back off and
 //     retry the SAME argv with the SAME expectedRevision. Re-fencing with a
 //     freshly-read revision would silently downgrade CAS to last-writer-wins.

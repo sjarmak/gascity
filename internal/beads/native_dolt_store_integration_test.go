@@ -151,6 +151,50 @@ func TestNativeDoltStoreRegularUpdateEventRecording(t *testing.T) {
 	}
 }
 
+func TestNativeDoltStoreConditionalWriteRejectsTokenStaleFromLabelMutation(t *testing.T) {
+	ctx := context.Background()
+	storage, err := beadslib.OpenBestAvailable(ctx, filepath.Join(t.TempDir(), ".beads"))
+	if err != nil {
+		t.Skipf("upstream native beads storage unavailable: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := storage.Close(); err != nil {
+			t.Fatalf("close upstream storage: %v", err)
+		}
+	})
+	if err := storage.SetConfig(ctx, "issue_prefix", "gc"); err != nil {
+		t.Fatalf("set issue prefix: %v", err)
+	}
+	store := newNativeDoltStoreWithStorageAndPrefix(storage, "conditional-label-regression", "gc")
+
+	created, err := store.Create(Bead{Title: "conditional label regression"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if created.Revision == 0 {
+		t.Fatal("Create returned zero revision")
+	}
+	if err := storage.AddLabel(ctx, created.ID, "outside-writer", "external"); err != nil {
+		t.Fatalf("external AddLabel: %v", err)
+	}
+	current, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get after AddLabel: %v", err)
+	}
+	if current.Revision == 0 || current.Revision == created.Revision {
+		t.Fatalf("label mutation left revision at %d, want a fresh non-zero token", current.Revision)
+	}
+
+	title := "must not land through stale token"
+	writer := ConditionalWriter(store)
+	if err := writer.UpdateIfMatch(created.ID, created.Revision, UpdateOpts{Title: &title}); !IsPreconditionFailed(err) {
+		t.Fatalf("UpdateIfMatch with pre-label revision: got %v, want PreconditionFailed", err)
+	}
+	if err := writer.UpdateIfMatch(created.ID, current.Revision, UpdateOpts{Title: &title}); err != nil {
+		t.Fatalf("UpdateIfMatch with current revision: %v", err)
+	}
+}
+
 // TestNativeDoltStoreEphemeralMailSend verifies that creating an ephemeral message
 // bead (the gc mail send code path) succeeds through the upstream beads library.
 //

@@ -48,8 +48,7 @@ func RunMetadataCASConformance(t *testing.T, name string, open func(t *testing.T
 // full ConditionalWriter — the two suites can be diffed against each other.
 // The revision legs are deliberately absent rather than skipped: a narrow
 // store makes no revision claim at all, so there is nothing to assert (see
-// the MetadataCASWriter doc comment for why no sound revision token exists at
-// beads v1.1.0).
+// the MetadataCASWriter doc comment).
 //
 // Both contract traps that the in-tree implementations historically diverged
 // on ride this suite: empty-expected matching absent OR present-and-empty,
