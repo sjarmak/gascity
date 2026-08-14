@@ -88,6 +88,7 @@ care about.
 | `attach` | `script attach <name>` | tty passthrough | tty passthrough |
 | `process-alive` | `script process-alive <name>` | process names (1/line) | `true` or `false` |
 | `nudge` | `script nudge <name>` | message text | — |
+| `nudge-stable` | `script nudge-stable <name> <effect-id>` | `StableNudgeRequest` JSON | `StableNudgeReceipt` JSON |
 | `set-meta` | `script set-meta <name> <key>` | value on stdin | — |
 | `get-meta` | `script get-meta <name> <key>` | — | value (empty = not set) |
 | `remove-meta` | `script remove-meta <name> <key>` | — | — |
@@ -153,6 +154,20 @@ Capabilities:
 | `proc.provision` | The script implements the box-without-agent `provision` op (see Operations), so the controller provisions the box, then launches the agent over `exec` (the un-weld). Without it, `start` provisions and launches in one op. |
 | `proc.stream` | Reserved (connection-plane family, parallel to `env.*`): declares the persistent bidirectional `stream` connection op (ACP over a stream, tmux pipe-pane). Sets `CanStream`. The `stream` op and its capability-gated conformance entry land with the connection rewrite. |
 | `tty.attach` | Reserved: declares an interactive PTY `attach` connection op. Sets `CanAttachTTY`. |
+| `effect.nudge-idempotent` | The destination atomically persists the physical nudge effect and its receipt under the supplied stable effect ID. `nudge-stable` retries with byte-identical target/content return the same receipt without another effect; conflicts fail. A lost response is safe to retry with the same ID. This proves destination acceptance, not agent consumption. |
+
+`nudge-stable` is stricter than the best-effort `nudge` operation. Its stdin is
+body-free orchestration JSON containing `version`, `effect_id`, and structured
+`content`. The returned schema-1 receipt binds the effect ID, runtime name,
+content SHA-256, destination reference, UTC acceptance time, the exact
+`destination-atomic-effect-receipt` boundary, and a SHA-256 over the receipt.
+Declaring the capability without implementing those atomic replay semantics is
+a protocol violation; callers otherwise fail closed before invoking it.
+Transport-level response loss permits one identical retry; the canonical mail
+attempt retains its invocation count and terminalizes as unknown after the
+second lost response. Unsupported operations and malformed receipts are never
+classified retry-safe. The conformance checker uses a per-run effect ID and
+requires two calls to return byte-identical receipt JSON.
 
 The handshake runs once per provider instance and is cached.
 

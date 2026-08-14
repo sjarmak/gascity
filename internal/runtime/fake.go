@@ -52,12 +52,16 @@ type Fake struct {
 	ExecResults map[string]FakeExecResult
 	// RelaunchErrors configures Fake.Relaunch errors per session name; an absent
 	// entry relaunches successfully (records the call, updates the live config).
-	RelaunchErrors map[string]error
+	RelaunchErrors          map[string]error
+	stableNudgeReceipts     map[string]StableNudgeReceipt
+	stableNudgeEffects      map[string]int
+	stableNudgeResponseLoss map[string]bool
 }
 
 var (
 	_ ProcessTableScanner = (*Fake)(nil)
 	_ RelaunchProvider    = (*Fake)(nil)
+	_ StableNudgeProvider = (*Fake)(nil)
 )
 
 // Call records a single method invocation on [Fake].
@@ -73,6 +77,7 @@ type Call struct {
 	Dst       string         // only set for CopyTo calls
 	RequestID string         // only set for Respond calls
 	Action    string         // only set for Respond calls
+	EffectID  string         // only set for stable effect calls
 }
 
 // FakeExecResult configures one [Fake.Exec] outcome.
@@ -131,6 +136,9 @@ func NewFake() *Fake {
 		WaitForIdleGates:        make(map[string]chan struct{}),
 		WaitForIdleStarted:      make(map[string]chan struct{}),
 		RelaunchErrors:          make(map[string]error),
+		stableNudgeReceipts:     make(map[string]StableNudgeReceipt),
+		stableNudgeEffects:      make(map[string]int),
+		stableNudgeResponseLoss: make(map[string]bool),
 	}
 }
 
@@ -159,6 +167,9 @@ func NewFailFake() *Fake {
 		WaitForIdleGates:        make(map[string]chan struct{}),
 		WaitForIdleStarted:      make(map[string]chan struct{}),
 		RelaunchErrors:          make(map[string]error),
+		stableNudgeReceipts:     make(map[string]StableNudgeReceipt),
+		stableNudgeEffects:      make(map[string]int),
+		stableNudgeResponseLoss: make(map[string]bool),
 		broken:                  true,
 	}
 }
@@ -386,6 +397,64 @@ func (f *Fake) Nudge(name string, content []ContentBlock) error {
 		return fmt.Errorf("session unavailable")
 	}
 	return nil
+}
+
+// SupportsStableNudge reports the fake's destination-atomic capability.
+func (f *Fake) SupportsStableNudge() bool { return true }
+
+// LoseStableNudgeResponseOnce makes the next newly committed stable effect
+// return a retry-safe response-loss error after the destination receipt exists.
+func (f *Fake) LoseStableNudgeResponseOnce(effectID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stableNudgeResponseLoss[effectID] = true
+}
+
+// StableNudgeEffectCount reports physical commits for an effect ID.
+func (f *Fake) StableNudgeEffectCount(effectID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stableNudgeEffects[effectID]
+}
+
+// NudgeStable atomically records one fake effect and receipt per stable ID.
+func (f *Fake) NudgeStable(ctx context.Context, name, effectID string, content []ContentBlock) (StableNudgeReceipt, error) {
+	if err := ctx.Err(); err != nil {
+		return StableNudgeReceipt{}, err
+	}
+	if err := ValidateStableNudgeEffectID(effectID); err != nil {
+		return StableNudgeReceipt{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, Call{Method: "NudgeStable", Name: name, EffectID: effectID, Content: append([]ContentBlock(nil), content...), Message: FlattenText(content)})
+	if f.broken {
+		return StableNudgeReceipt{}, fmt.Errorf("session unavailable")
+	}
+	if _, ok := f.sessions[name]; !ok {
+		return StableNudgeReceipt{}, fmt.Errorf("%w: %q", ErrSessionNotFound, name)
+	}
+	contentHash, err := stableNudgeContentSHA256(content)
+	if err != nil {
+		return StableNudgeReceipt{}, err
+	}
+	if existing, ok := f.stableNudgeReceipts[effectID]; ok {
+		if existing.TargetRuntimeName != name || existing.ContentSHA256 != contentHash {
+			return StableNudgeReceipt{}, fmt.Errorf("%w: effect %q", ErrStableNudgeConflict, effectID)
+		}
+		return existing, nil
+	}
+	receipt, err := NewStableNudgeReceipt(effectID, name, content, "fake-destination:"+effectID, time.Now().UTC())
+	if err != nil {
+		return StableNudgeReceipt{}, err
+	}
+	f.stableNudgeReceipts[effectID] = receipt
+	f.stableNudgeEffects[effectID]++
+	if f.stableNudgeResponseLoss[effectID] {
+		delete(f.stableNudgeResponseLoss, effectID)
+		return StableNudgeReceipt{}, fmt.Errorf("%w: effect committed", ErrStableNudgeRetrySafe)
+	}
+	return receipt, nil
 }
 
 // NudgeNow records the call and returns nil (or an error if broken).
