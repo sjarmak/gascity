@@ -18,6 +18,21 @@ import (
 
 const durableDeliveryRepairKey = "mail.delivery.repair.v1"
 
+const stableDurableSendKeyMaxBytes = 128
+
+// StableDurableSendIntent names a bounded, replay-stable durable notification.
+// The logical city, messaging authority, and seat are explicit so message
+// identity cannot confuse the messaging and sessions coordination classes.
+type StableDurableSendIntent struct {
+	CityRef           string
+	MessagingStoreRef string
+	SeatRef           string
+	StableKey         string
+	Policy            maildelivery.Policy
+	Attention         maildelivery.Attention
+	ObservedAt        time.Time
+}
+
 // DurableSendIntent is the content-free, preallocated identity and policy for
 // a recoverable message-first send.
 type DurableSendIntent struct {
@@ -43,6 +58,58 @@ type durableDeliveryRepair struct {
 	Attention          maildelivery.Attention `json:"attention"`
 	ExpiresAt          *time.Time             `json:"expires_at,omitempty"`
 	PolicySourceSHA256 string                 `json:"policy_source_sha256,omitempty"`
+}
+
+// SendDurableStable derives the explicit message identity inside the beadmail
+// boundary and delegates to the message-first durable write protocol.
+func (p *Provider) SendDurableStable(from, to, subject, body string, intent StableDurableSendIntent) (mail.Message, maildelivery.Delivery, error) {
+	messageID, err := durableStableMessageID(intent)
+	if err != nil {
+		return mail.Message{}, maildelivery.Delivery{}, fmt.Errorf("beadmail stable durable send: %w", err)
+	}
+	city := strings.TrimPrefix(intent.CityRef, "city:")
+	seatOwner := strings.TrimPrefix(intent.SeatRef, "seat:"+city+"/")
+	if to != seatOwner {
+		return mail.Message{}, maildelivery.Delivery{}, fmt.Errorf("beadmail stable durable send: %w: recipient %q does not match stable seat %q", maildelivery.ErrConflict, to, intent.SeatRef)
+	}
+	return p.SendDurable(from, to, subject, body, DurableSendIntent{
+		MessageID: messageID, StoreRef: intent.MessagingStoreRef, SeatRef: intent.SeatRef,
+		Policy: intent.Policy, Attention: intent.Attention, ObservedAt: intent.ObservedAt,
+	})
+}
+
+func durableStableMessageID(intent StableDurableSendIntent) (string, error) {
+	if !validStableDurableSendKey(intent.StableKey) {
+		return "", fmt.Errorf("stable key must be 1-%d ASCII identifier bytes", stableDurableSendKeyMaxBytes)
+	}
+	city := strings.TrimPrefix(intent.CityRef, "city:")
+	if city == "" || intent.CityRef != "city:"+city || strings.ContainsAny(city, "/\x00\r\n") {
+		return "", fmt.Errorf("city ref %q is invalid", intent.CityRef)
+	}
+	if intent.MessagingStoreRef != intent.CityRef+"/messaging" {
+		return "", fmt.Errorf("messaging store ref %q does not belong to %q", intent.MessagingStoreRef, intent.CityRef)
+	}
+	seatPrefix := "seat:" + city + "/"
+	seatOwner := strings.TrimPrefix(intent.SeatRef, seatPrefix)
+	if seatOwner == "" || intent.SeatRef != seatPrefix+seatOwner || strings.ContainsAny(seatOwner, "\x00\r\n") {
+		return "", fmt.Errorf("seat ref %q does not belong to %q", intent.SeatRef, intent.CityRef)
+	}
+	sum := sha256.Sum256([]byte("gascity-mail-durable-notify-v1\x00" + intent.CityRef + "\x00" + intent.MessagingStoreRef + "\x00" + intent.SeatRef + "\x00" + intent.StableKey))
+	return fmt.Sprintf("gc-mail-%x", sum[:16]), nil
+}
+
+func validStableDurableSendKey(key string) bool {
+	if len(key) == 0 || len(key) > stableDurableSendKeyMaxBytes {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '/' || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // SendDurable persists a message carrying complete content-free repair intent,
@@ -99,7 +166,7 @@ func (p *Provider) SendDurable(from, to, subject, body string, intent DurableSen
 		if deliveryErr != nil {
 			return message, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: %w", deliveryErr)
 		}
-		created, createErr := maildelivery.NewStore(p.store).Create(delivery)
+		created, createErr := ensureDurableDelivery(maildelivery.NewStore(p.store), delivery)
 		if createErr != nil {
 			return message, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: creating delivery: %w", createErr)
 		}
@@ -130,11 +197,14 @@ func (p *Provider) SendDurable(from, to, subject, body string, intent DurableSen
 		row = existing
 	}
 	message := beadToMessage(row)
+	if row.ID != intent.MessageID {
+		return message, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: store changed deterministic message ID %q to %q", intent.MessageID, row.ID)
+	}
 	delivery, err := deliveryFromMessageRow(row, repair)
 	if err != nil {
 		return message, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: %w", err)
 	}
-	created, err := maildelivery.NewStore(p.store).Create(delivery)
+	created, err := ensureDurableDelivery(maildelivery.NewStore(p.store), delivery)
 	if err != nil {
 		return message, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: creating delivery: %w", err)
 	}
@@ -157,6 +227,9 @@ func sameDurableMessage(existing, wanted beads.Bead) bool {
 // RepairDurableDelivery reconstructs the deterministic delivery only from the
 // exact message row and its immutable repair metadata.
 func (p *Provider) RepairDurableDelivery(messageID string) (maildelivery.Delivery, error) {
+	if p == nil || p.store == nil {
+		return maildelivery.Delivery{}, fmt.Errorf("beadmail repair delivery: store unavailable")
+	}
 	row, err := p.store.Get(messageID)
 	if err != nil {
 		return maildelivery.Delivery{}, fmt.Errorf("beadmail repair delivery: getting message: %w", err)
@@ -172,7 +245,7 @@ func (p *Provider) RepairDurableDelivery(messageID string) (maildelivery.Deliver
 	if err != nil {
 		return maildelivery.Delivery{}, fmt.Errorf("beadmail repair delivery: %w", err)
 	}
-	return maildelivery.NewStore(p.store).Create(delivery)
+	return ensureDurableDelivery(maildelivery.NewStore(p.store), delivery)
 }
 
 func deliveryFromMessageRow(row beads.Bead, repair durableDeliveryRepair) (maildelivery.Delivery, error) {
@@ -182,7 +255,42 @@ func deliveryFromMessageRow(row beads.Bead, repair durableDeliveryRepair) (maild
 	if row.Revision <= 0 {
 		return maildelivery.Delivery{}, fmt.Errorf("message revision is invalid")
 	}
+	cityRef := strings.TrimSuffix(repair.StoreRef, "/messaging")
+	city := strings.TrimPrefix(cityRef, "city:")
+	if city == "" || cityRef != "city:"+city || repair.StoreRef != cityRef+"/messaging" {
+		return maildelivery.Delivery{}, fmt.Errorf("repair messaging store identity is invalid")
+	}
+	wantSeatRef := "seat:" + city + "/" + row.Assignee
+	if row.Assignee == "" || repair.SeatRef != wantSeatRef {
+		return maildelivery.Delivery{}, fmt.Errorf("repair seat %q does not match message assignee %q in city %q", repair.SeatRef, row.Assignee, city)
+	}
 	return maildelivery.NewDelivery(repair.StoreRef, row.ID, uint64(row.Revision), repair.SeatRef, repair.Policy, repair.Attention, row.CreatedAt.UTC(), repair.ExpiresAt, repair.PolicySourceSHA256)
+}
+
+func ensureDurableDelivery(store *maildelivery.Store, wanted maildelivery.Delivery) (maildelivery.Delivery, error) {
+	created, err := store.Create(wanted)
+	if err == nil {
+		return created, nil
+	}
+	current, getErr := store.Get(wanted.ID)
+	if getErr == nil && sameDurableDeliveryIntent(current, wanted) {
+		return current, nil
+	}
+	return maildelivery.Delivery{}, err
+}
+
+func sameDurableDeliveryIntent(current, wanted maildelivery.Delivery) bool {
+	if (current.ExpiresAt == nil) != (wanted.ExpiresAt == nil) {
+		return false
+	}
+	if current.ExpiresAt != nil && !current.ExpiresAt.Equal(*wanted.ExpiresAt) {
+		return false
+	}
+	current.ExpiresAt = nil
+	wanted.ExpiresAt = nil
+	current.Phase, wanted.Phase = "", ""
+	current.Revision, wanted.Revision = 0, 0
+	return current == wanted
 }
 
 func decodeDurableRepair(data string) (durableDeliveryRepair, error) {

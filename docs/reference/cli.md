@@ -2573,6 +2573,7 @@ gc mail send --all "Status update: tests passing"
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--all` | bool |  | broadcast to all live sessions (excludes sender and human) |
+| `--durable-notify-key` | string |  | stable key for one durable notify-only delivery |
 | `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human") |
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | message body text |
