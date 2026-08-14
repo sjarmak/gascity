@@ -17,8 +17,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/gchome"
+	"github.com/gastownhall/gascity/internal/testutil"
 )
 
 const testNotice = "TEST-ONLY product metrics notice\n"
@@ -1085,6 +1087,9 @@ func defaultTestServiceDependencies(home gchome.ProductUsageHome, epoch uint64) 
 		getenv: func(string) string { return "" },
 		newUUID: func() (string, error) {
 			return randomUUIDv4(rand.Reader)
+		},
+		recordLockContext: func(time.Duration) (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), testutil.GoroutineRaceTimeout)
 		},
 		verifyTTY: func(io.Writer) bool { return true },
 	}
