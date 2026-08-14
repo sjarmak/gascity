@@ -17,6 +17,7 @@ var (
 	CityNotFound        = Register(ProblemType{Code: "city-not-found", Status: http.StatusNotFound, Title: "City Not Found"})
 	BeadNotFound        = Register(ProblemType{Code: "bead-not-found", Status: http.StatusNotFound, Title: "Bead Not Found"})
 	MailNotFound        = Register(ProblemType{Code: "mail-not-found", Status: http.StatusNotFound, Title: "Mail Message Not Found"})
+	MailDeliveryMissing = Register(ProblemType{Code: "mail-delivery-not-found", Status: http.StatusNotFound, Title: "Mail Delivery Not Found"})
 	RigNotFound         = Register(ProblemType{Code: "rig-not-found", Status: http.StatusNotFound, Title: "Rig Not Found"})
 	SessionNotFound     = Register(ProblemType{Code: "session-not-found", Status: http.StatusNotFound, Title: "Session Not Found"})
 	WaitNotFound        = Register(ProblemType{Code: "wait-not-found", Status: http.StatusNotFound, Title: "Wait Not Found"})

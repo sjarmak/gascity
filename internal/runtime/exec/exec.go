@@ -131,9 +131,11 @@ func (p *Provider) cancellationError(ctxErr error, stderr string, args []string)
 }
 
 // runError maps an ordinary (non-cancellation) cmd.Run failure onto the
-// provider's contract: exit code 2 is an unknown operation treated as success
-// (forward compatible, nil error), a "start ... already exists" collision maps
-// to [runtime.ErrSessionExists], and everything else wraps the adapter's stderr.
+// provider's contract: exit code 2 is normally an unknown operation treated as
+// success (forward compatible, nil error), but stable-nudge operations fail
+// closed with [runtime.ErrStableNudgeUnsupported]. A "start ... already exists"
+// collision maps to [runtime.ErrSessionExists], and everything else wraps the
+// adapter's stderr.
 func (p *Provider) runError(runErr error, stderr string, args []string) error {
 	var exitErr *exec.ExitError
 	if errors.As(runErr, &exitErr) && exitErr.ExitCode() == 2 {

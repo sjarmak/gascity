@@ -15,10 +15,18 @@ func mailDeliveryAPIError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, maildelivery.ErrConflict) {
-		return apierr.ConflictWrongState.Msg(err.Error())
+	switch {
+	case errors.Is(err, ErrMailDeliveryInvalid):
+		return apierr.InvalidRequest.Msg("mail delivery request is invalid")
+	case errors.Is(err, ErrMailDeliveryNotFound):
+		return apierr.MailDeliveryMissing.Msg("mail delivery resource was not found")
+	case errors.Is(err, ErrMailDeliveryUnavailable):
+		return apierr.ServiceUnavailable.Msg("mail delivery service is unavailable")
+	case errors.Is(err, maildelivery.ErrConflict):
+		return apierr.ConflictWrongState.Msg("mail delivery state conflicts with the request")
+	default:
+		return apierr.Internal.Msg("mail delivery operation failed")
 	}
-	return apierr.Internal.Msg(err.Error())
 }
 
 func mailDeliveryFailureCode(err error) string {
@@ -34,6 +42,12 @@ func mailDeliveryFailureCode(err error) string {
 		return "retry_safe"
 	case errors.Is(err, maildelivery.ErrTransportInvocationInProgress), errors.Is(err, maildelivery.ErrTransportInvocationRace):
 		return "invocation_in_progress"
+	case errors.Is(err, ErrMailDeliveryInvalid):
+		return "invalid"
+	case errors.Is(err, ErrMailDeliveryNotFound):
+		return "not_found"
+	case errors.Is(err, ErrMailDeliveryUnavailable):
+		return "unavailable"
 	default:
 		return "operation_failed"
 	}

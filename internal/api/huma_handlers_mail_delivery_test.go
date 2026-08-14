@@ -2,13 +2,16 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/api/apierr"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/mail/beadmail"
@@ -113,6 +116,11 @@ func TestMailDeliveryControlPlaneRoundTrip(t *testing.T) {
 	if !strings.Contains(err.Error(), "retry_safe") {
 		t.Fatalf("invoke error = %v, want closed retry_safe code", err)
 	}
+	coordinator.invokeErr = errors.Join(ErrMailDeliveryNotFound, errors.New("canonical delivery missing"))
+	gotAttempt, err = client.InvokeMailDelivery(attempt.AttemptID)
+	if !reflect.DeepEqual(gotAttempt, attempt) || err == nil || !strings.Contains(err.Error(), "not_found") || ShouldFallback(client, err) {
+		t.Fatalf("result-bearing not-found attempt=%#v err=%v fallback=%v", gotAttempt, err, ShouldFallback(client, err))
+	}
 	gotStatus, err := client.MailDeliveryStatus(attempt.AttemptID)
 	if err != nil || !reflect.DeepEqual(gotStatus, attempt) {
 		t.Fatalf("status attempt=%#v err=%v", gotStatus, err)
@@ -165,6 +173,9 @@ func TestMailDeliveryHandlersFailClosedBeforeResultAndClassifyFailures(t *testin
 		{maildelivery.ErrTransportReceiptLookupRetryLater, "receipt_lookup_retry_later"},
 		{maildelivery.ErrTransportRetrySafe, "retry_safe"},
 		{maildelivery.ErrTransportInvocationInProgress, "invocation_in_progress"},
+		{ErrMailDeliveryInvalid, "invalid"},
+		{ErrMailDeliveryNotFound, "not_found"},
+		{ErrMailDeliveryUnavailable, "unavailable"},
 		{baseErr, "operation_failed"},
 	} {
 		if got := mailDeliveryFailureCode(tc.err); got != tc.code {
@@ -173,5 +184,45 @@ func TestMailDeliveryHandlersFailClosedBeforeResultAndClassifyFailures(t *testin
 	}
 	if mailDeliveryFailureCode(nil) != "" || mailDeliveryAPIError(maildelivery.ErrConflict) == nil || mailDeliveryAPIError(baseErr) == nil {
 		t.Fatal("closed error classification failed")
+	}
+}
+
+func TestMailDeliveryHTTPProblemsMapTypedCoordinatorErrorsWithoutDetailLeakage(t *testing.T) {
+	const secret = "/private/operator/city.toml dsn=db.internal/city?sslmode=verify-full"
+	coordinator := &mailDeliveryCoordinatorFake{}
+	state := &mailDeliveryCoordinatorFakeState{fakeState: newFakeState(t), coordinator: coordinator}
+	handler := newTestCityHandler(t, state)
+
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+		wantDetail string
+	}{
+		{"invalid", errors.Join(ErrMailDeliveryInvalid, errors.New(secret)), http.StatusBadRequest, "invalid-request", "mail delivery request is invalid"},
+		{"not found", errors.Join(ErrMailDeliveryNotFound, errors.New(secret)), http.StatusNotFound, "mail-delivery-not-found", "mail delivery resource was not found"},
+		{"unavailable", errors.Join(ErrMailDeliveryUnavailable, errors.New(secret)), http.StatusServiceUnavailable, "service-unavailable", "mail delivery service is unavailable"},
+		{"internal", errors.New("unexpected failure: " + secret), http.StatusInternalServerError, "internal", "mail delivery operation failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coordinator.statusErr = tc.err
+			req := httptest.NewRequest(http.MethodGet, cityURL(state, "/mail/delivery/mail-attempt-test"), nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			var problem apierr.ErrorModel
+			if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+				t.Fatalf("decode problem: %v; body=%s", err, rec.Body.String())
+			}
+			if problem.Code != tc.wantCode || problem.Detail != tc.wantDetail {
+				t.Fatalf("problem=%#v", problem)
+			}
+			if strings.Contains(rec.Body.String(), secret) || strings.Contains(rec.Body.String(), "db.internal/city") {
+				t.Fatalf("problem leaked coordinator detail: %s", rec.Body.String())
+			}
+		})
 	}
 }

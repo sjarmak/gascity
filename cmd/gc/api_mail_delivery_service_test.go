@@ -114,20 +114,20 @@ func TestControllerMailDeliveryDurableSendAndAuthorityWaitUseCanonicalService(t 
 	if err != nil || !report.PageCommitted || len(report.Deliveries) != 1 || report.Deliveries[0].Outcome != maildelivery.ReconcileWaitingForAuthority {
 		t.Fatalf("report=%#v err=%v", report, err)
 	}
-	if _, err := coordinator.ReconcileMailDeliverySeat(context.Background(), "seat:test-city/reviewer", 0, ""); err == nil {
-		t.Fatal("reconcile accepted invalid limit")
+	if _, err := coordinator.ReconcileMailDeliverySeat(context.Background(), "seat:test-city/reviewer", 0, ""); !errors.Is(err, api.ErrMailDeliveryInvalid) {
+		t.Fatalf("reconcile invalid limit error=%v", err)
 	}
 	if _, err := coordinator.SendDurableMail(context.Background(), api.DurableMailCommand{
 		StableKey: "bad-recipient", Recipient: "missing", SenderCandidates: []string{"human"}, Body: "body",
-	}); err == nil {
-		t.Fatal("durable send accepted an unconfigured recipient")
+	}); !errors.Is(err, api.ErrMailDeliveryInvalid) {
+		t.Fatalf("unconfigured recipient error=%v", err)
 	}
 	if _, err := coordinator.SendDurableMail(context.Background(), api.DurableMailCommand{
 		StableKey: "bad-sender", Recipient: "reviewer", SenderCandidates: []string{"missing"}, Body: "body",
-	}); err == nil {
-		t.Fatal("durable send accepted an unresolved sender")
+	}); !errors.Is(err, api.ErrMailDeliveryInvalid) {
+		t.Fatalf("unresolved sender error=%v", err)
 	}
-	if _, err := coordinator.InvokeMailDelivery(context.Background(), "mail-attempt-missing"); !errors.Is(err, beads.ErrNotFound) {
+	if _, err := coordinator.InvokeMailDelivery(context.Background(), "mail-attempt-missing"); !errors.Is(err, beads.ErrNotFound) || !errors.Is(err, api.ErrMailDeliveryNotFound) {
 		t.Fatalf("missing attempt error=%v", err)
 	}
 	snapshot, err := coordinator.snapshot()
@@ -136,8 +136,8 @@ func TestControllerMailDeliveryDurableSendAndAuthorityWaitUseCanonicalService(t 
 	}
 	state.sp = nil
 	snapshot.provider = nil
-	if _, _, _, err := coordinator.deliveryRuntime(snapshot, "seat:test-city/reviewer", "session-missing"); err == nil {
-		t.Fatal("delivery runtime accepted missing provider")
+	if _, _, _, err := coordinator.deliveryRuntime(snapshot, "seat:test-city/reviewer", "session-missing"); !errors.Is(err, api.ErrMailDeliveryUnavailable) {
+		t.Fatalf("missing provider error=%v", err)
 	}
 	state.sp = runtime.NewFake()
 	snapshot.provider = state.sp
@@ -145,15 +145,15 @@ func TestControllerMailDeliveryDurableSendAndAuthorityWaitUseCanonicalService(t 
 		t.Fatalf("delivery runtime execute=%v err=%v", execute != nil, err)
 	}
 	state.cityMailProv = nil
-	if _, err := coordinator.SendDurableMail(context.Background(), command); err == nil {
-		t.Fatal("durable send accepted provider without stable support")
+	if _, err := coordinator.SendDurableMail(context.Background(), command); !errors.Is(err, api.ErrMailDeliveryUnavailable) {
+		t.Fatalf("provider without stable support error=%v", err)
 	}
 
 	var nilState *controllerState
 	if nilState.MailDeliveryCoordinator() != nil {
 		t.Fatal("nil controller state returned a coordinator")
 	}
-	if _, err := (&controllerMailDeliveryCoordinator{}).snapshot(); err == nil {
-		t.Fatal("nil coordinator state produced a snapshot")
+	if _, err := (&controllerMailDeliveryCoordinator{}).snapshot(); !errors.Is(err, api.ErrMailDeliveryUnavailable) {
+		t.Fatalf("nil coordinator snapshot error=%v", err)
 	}
 }

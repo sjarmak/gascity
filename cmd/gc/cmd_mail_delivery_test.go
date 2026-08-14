@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,25 +26,53 @@ import (
 )
 
 type fakeMailDeliveryMutationClient struct {
-	attempts map[string]maildelivery.TransportAttempt
-	errors   map[string]error
-	calls    map[string]int
+	durableResult  beadmail.DurableSendResult
+	durableErr     error
+	report         maildelivery.ReconcileReport
+	reconcileErr   error
+	attempts       map[string]maildelivery.TransportAttempt
+	errors         map[string]error
+	sendCalls      int
+	reconcileCalls int
+	calls          map[string]int
+}
+
+type trackingMailDeliveryMutationClient struct {
+	*api.Client
+	sendCalls      int
+	reconcileCalls int
+	invokeCalls    int
+}
+
+func (c *trackingMailDeliveryMutationClient) SendDurableMail(command api.DurableMailCommand) (beadmail.DurableSendResult, error) {
+	c.sendCalls++
+	return c.Client.SendDurableMail(command)
+}
+
+func (c *trackingMailDeliveryMutationClient) ReconcileMailDeliverySeat(seatRef string, limit int, expectedDeliveryID string) (maildelivery.ReconcileReport, error) {
+	c.reconcileCalls++
+	return c.Client.ReconcileMailDeliverySeat(seatRef, limit, expectedDeliveryID)
+}
+
+func (c *trackingMailDeliveryMutationClient) InvokeMailDelivery(attemptID string) (maildelivery.TransportAttempt, error) {
+	c.invokeCalls++
+	return c.Client.InvokeMailDelivery(attemptID)
 }
 
 func (f *fakeMailDeliveryMutationClient) SendDurableMail(api.DurableMailCommand) (beadmail.DurableSendResult, error) {
-	panic("unexpected durable send")
+	f.sendCalls++
+	return f.durableResult, f.durableErr
 }
 
 func (f *fakeMailDeliveryMutationClient) ReconcileMailDeliverySeat(string, int, string) (maildelivery.ReconcileReport, error) {
-	panic("unexpected reconcile")
+	f.reconcileCalls++
+	return f.report, f.reconcileErr
 }
 
 func (f *fakeMailDeliveryMutationClient) InvokeMailDelivery(id string) (maildelivery.TransportAttempt, error) {
 	f.calls[id]++
 	return f.attempts[id], f.errors[id]
 }
-
-func (*fakeMailDeliveryMutationClient) ShouldFallback(error) bool { return false }
 
 type fixedMailDeliveryFenceResolver struct {
 	fence maildelivery.ActivationFence
@@ -50,6 +81,49 @@ type fixedMailDeliveryFenceResolver struct {
 type authorityDriftAfterStableNudgeProvider struct {
 	*runtime.Fake
 	afterStableNudge func()
+}
+
+type maxDestinationRefProvider struct {
+	*runtime.Fake
+	mu      sync.Mutex
+	receipt runtime.StableNudgeReceipt
+}
+
+func (p *maxDestinationRefProvider) NudgeStable(ctx context.Context, name, effectID string, content []runtime.ContentBlock) (runtime.StableNudgeReceipt, error) {
+	base, err := p.Fake.NudgeStable(ctx, name, effectID, content)
+	if err != nil {
+		return runtime.StableNudgeReceipt{}, err
+	}
+	receipt, err := runtime.NewStableNudgeReceipt(effectID, name, content, strings.Repeat("d", 256), base.AcceptedAt)
+	if err != nil {
+		return runtime.StableNudgeReceipt{}, err
+	}
+	p.mu.Lock()
+	p.receipt = receipt
+	p.mu.Unlock()
+	return receipt, nil
+}
+
+func (p *maxDestinationRefProvider) LookupStableNudge(ctx context.Context, name, effectID string, content []runtime.ContentBlock) (runtime.StableNudgeLookup, error) {
+	if err := ctx.Err(); err != nil {
+		return runtime.StableNudgeLookup{}, err
+	}
+	p.mu.Lock()
+	receipt := p.receipt
+	p.mu.Unlock()
+	if receipt == (runtime.StableNudgeReceipt{}) {
+		return runtime.StableNudgeLookup{Version: 1, State: runtime.StableNudgeLookupUnknownExternalState, ObservedAt: time.Now().UTC()}, nil
+	}
+	contentSHA256, err := runtime.StableNudgeContentSHA256(content)
+	if err != nil {
+		return runtime.StableNudgeLookup{}, err
+	}
+	if receipt.EffectID != effectID || receipt.TargetRuntimeName != name || receipt.ContentSHA256 != contentSHA256 {
+		return runtime.StableNudgeLookup{}, runtime.ErrStableNudgeConflict
+	}
+	return runtime.StableNudgeLookup{
+		Version: 1, State: runtime.StableNudgeLookupCommitted, Receipt: receipt, ObservedAt: time.Now().UTC(),
+	}, nil
 }
 
 func (p *authorityDriftAfterStableNudgeProvider) NudgeStable(ctx context.Context, name, effectID string, content []runtime.ContentBlock) (runtime.StableNudgeReceipt, error) {
@@ -174,6 +248,60 @@ func TestMailDeliveryInvokeAPIPreservesResultAndNeverFallsBackOnResponses(t *tes
 		if strings.Contains(stderr.String(), "open city store") || fake.calls[tc.attemptID] != 1 {
 			t.Fatalf("invoke %q fell back or reinvoked: calls=%d stderr=%q", tc.attemptID, fake.calls[tc.attemptID], stderr.String())
 		}
+	}
+}
+
+func TestMailDeliveryMutationAPIConnectionFailuresNeverFallBackToLocalStores(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+	t.Setenv("GC_NO_API", "")
+	for _, key := range []string{"BEADS_DOLT_SERVER_PORT", "BEADS_DIR", "BEADS_ACTOR", "BEADS_HOLDER_TOKEN"} {
+		t.Setenv(key, "")
+	}
+	closedServer := httptest.NewServer(nil)
+	closedServer.Close()
+	client := &trackingMailDeliveryMutationClient{Client: api.NewCityScopedClient(closedServer.URL, "test-city")}
+	originalResolver := resolveMailDeliveryMutationClient
+	t.Cleanup(func() { resolveMailDeliveryMutationClient = originalResolver })
+	resolveMailDeliveryMutationClient = func(string) mailDeliveryMutationClient { return client }
+	if _, err := resolveCity(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadDir(cityPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("durable send", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := cmdMailSendDurable([]string{"reviewer", "body"}, true, false, "human", "", "", "", "api-connection", true, &stdout, &stderr)
+		if code != 1 || client.sendCalls != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "request failed") {
+			t.Fatalf("code=%d calls=%d stdout=%q stderr=%q", code, client.sendCalls, stdout.String(), stderr.String())
+		}
+	})
+	t.Run("reconcile", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := cmdMailDeliveryReconcileSeat(context.Background(), "seat:test-city/reviewer", 1, "", &stdout, &stderr)
+		if code != 1 || client.reconcileCalls != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "request failed") {
+			t.Fatalf("code=%d calls=%d stdout=%q stderr=%q", code, client.reconcileCalls, stdout.String(), stderr.String())
+		}
+	})
+	t.Run("invoke", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := cmdMailDeliveryInvoke(context.Background(), "mail-attempt-api-connection-result", &stdout, &stderr)
+		if code != 1 || client.invokeCalls != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "request failed") {
+			t.Fatalf("code=%d calls=%d stdout=%q stderr=%q", code, client.invokeCalls, stdout.String(), stderr.String())
+		}
+	})
+	after, err := os.ReadDir(cityPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("API connection errors mutated the local city: before=%v after=%v", before, after)
 	}
 }
 
@@ -849,8 +977,93 @@ func TestMailDeliveryWorkerReceiptLookupMapsExactDestinationEvidence(t *testing.
 	committed, err := lookup(ctx, attempt)
 	if err != nil || committed.State != maildelivery.EffectCommitted ||
 		committed.CommitBoundary != maildelivery.TransportCommitBoundaryDestinationAtomic ||
-		committed.ReceiptRef != "destination:"+want.DestinationRef ||
+		committed.ReceiptRef != want.DestinationRef ||
 		committed.ReceiptSHA256 != want.ReceiptSHA256 || !committed.RecordedAt.Equal(want.AcceptedAt) {
 		t.Fatalf("committed lookup = %#v, %v; want %#v", committed, err, want)
+	}
+}
+
+func TestMailDeliveryMaxDestinationRefCommitsCanonicalReceiptAndReplaysWithoutEffect(t *testing.T) {
+	ctx := context.Background()
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".gc", "settings.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	sessionBacking := beads.NewMemStore()
+	provider := &maxDestinationRefProvider{Fake: runtime.NewFake()}
+	mgr := newSessionManagerWithConfig(cityPath, sessionBacking, provider, cfg)
+	info, err := mgr.CreateSession(ctx, session.CreateOptions{
+		Alias: "reviewer", ExplicitName: "mail-reviewer", Template: "reviewer", Title: "Reviewer",
+		Command: "claude", WorkDir: t.TempDir(), Provider: "exec", Transport: "exec",
+		ExtraMeta: map[string]string{session.NamedSessionIdentityMetadata: "reviewer"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := &mailDeliveryFenceResolver{
+		store: sessionFrontDoor(sessionBacking), sessionRef: info.ID,
+		options: session.MailActivationFenceOptions{
+			CityRef: "city:test-city", SeatRef: "seat:test-city/reviewer",
+			ConfigSHA256: strings.Repeat("a", 64), IssuedByRef: mailDeliveryIssuerRef("test-city"),
+		},
+	}
+	fence, err := resolver.ResolveMailActivationFence(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryBacking := beads.NewMemStore()
+	deliveryBacking.HonorExplicitIDs = true
+	store := maildelivery.NewStore(deliveryBacking)
+	delivery, err := maildelivery.NewDelivery(
+		"city:test-city/messaging", "msg-max-destination-ref", 1, fence.SeatRef,
+		maildelivery.PolicyNotifyOnly, maildelivery.AttentionImmediate,
+		time.Date(2026, 8, 14, 16, 10, 0, 0, time.UTC), nil, "",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err = store.Create(delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err = store.Advance(delivery.ID, delivery.Revision, maildelivery.PhaseWaitingForActivation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := store.CreateTransportAttempt(ctx, maildelivery.TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 14, 16, 11, 0, 0, time.UTC),
+	}, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preflight := mailDeliveryWorkerPreflight(cityPath, cfg, sessionBacking, provider, resolver)
+	lookup := mailDeliveryWorkerReceiptLookup(cityPath, cfg, sessionBacking, provider, resolver)
+	invoke := mailDeliveryWorkerInvoker(cityPath, cfg, sessionBacking, provider, resolver)
+
+	committed, err := executeMailDeliveryAttemptWithLookup(ctx, store, attempt, resolver,
+		time.Date(2026, 8, 14, 16, 12, 0, 0, time.UTC), preflight, lookup, invoke)
+	if err != nil || committed.State != maildelivery.TransportCommitted || provider.StableNudgeEffectCount(attempt.NudgeID) != 1 {
+		t.Fatalf("first execute = %#v, err=%v effects=%d", committed, err, provider.StableNudgeEffectCount(attempt.NudgeID))
+	}
+	if committed.Receipt.ReceiptRef != strings.Repeat("d", 256) || len(committed.Receipt.ReceiptRef) > 256 {
+		t.Fatalf("canonical receipt ref = %q sha=%q", committed.Receipt.ReceiptRef, committed.Receipt.ReceiptSHA256)
+	}
+	if err := committed.Receipt.Validate(committed.AttemptID, committed.NudgeID); err != nil {
+		t.Fatalf("committed receipt invalid: %v", err)
+	}
+	recoveredReceipt, err := lookup(ctx, committed)
+	if err != nil || !reflect.DeepEqual(recoveredReceipt, committed.Receipt) {
+		t.Fatalf("lookup receipt = %#v, err=%v; committed=%#v", recoveredReceipt, err, committed.Receipt)
+	}
+	replay, err := executeMailDeliveryAttemptWithLookup(ctx, store, attempt, resolver,
+		time.Date(2026, 8, 14, 16, 13, 0, 0, time.UTC), preflight, lookup, invoke)
+	if err != nil || replay.State != maildelivery.TransportCommitted || provider.StableNudgeEffectCount(attempt.NudgeID) != 1 {
+		t.Fatalf("replay = %#v, err=%v effects=%d", replay, err, provider.StableNudgeEffectCount(attempt.NudgeID))
 	}
 }

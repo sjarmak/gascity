@@ -2,9 +2,19 @@ package api
 
 import (
 	"context"
+	"errors"
 
 	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/maildelivery"
+)
+
+var (
+	// ErrMailDeliveryInvalid identifies coordinator input rejected before mutation.
+	ErrMailDeliveryInvalid = errors.New("mail delivery request is invalid")
+	// ErrMailDeliveryNotFound identifies a missing canonical delivery resource.
+	ErrMailDeliveryNotFound = errors.New("mail delivery resource was not found")
+	// ErrMailDeliveryUnavailable identifies a coordinator dependency unavailable before mutation.
+	ErrMailDeliveryUnavailable = errors.New("mail delivery coordinator is unavailable")
 )
 
 // DurableMailCommand contains caller intent only. The service resolves city,

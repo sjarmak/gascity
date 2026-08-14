@@ -1615,9 +1615,7 @@ func cmdMailSendDurable(args []string, notify, all bool, from, to, subject, mess
 				StableKey: stableKey, Recipient: request.Recipient, SenderCandidates: senderCandidates,
 				Subject: request.Subject, Body: request.Body,
 			})
-			if apiErr == nil || !client.ShouldFallback(apiErr) {
-				return renderDurableMailSendResult(domainResult, apiErr, request, jsonOut, stdout, stderr)
-			}
+			return renderDurableMailSendResult(domainResult, apiErr, request, jsonOut, stdout, stderr)
 		}
 	}
 

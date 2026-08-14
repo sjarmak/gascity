@@ -70,12 +70,16 @@ No shell invocation — the script is exec'd directly.
 |------|---------|
 | 0 | Success |
 | 1 | Failure (stderr contains error message) |
-| 2 | Unknown operation (treated as success — forward compatible) |
+| 2 | Unknown operation (normally a no-op success; declared stable-nudge operations return `ErrStableNudgeUnsupported`) |
 
 Exit code 2 is the forward-compatibility mechanism. When Gas City adds new
 operations in the future, old scripts return exit 2 and the provider treats
-it as a no-op success. Scripts only need to implement the operations they
-care about.
+it as a no-op success for ordinary operations. The exception is
+`nudge-stable` and `nudge-stable-status`: after a provider declares
+`effect.nudge-idempotent`, exit 2 maps to `ErrStableNudgeUnsupported` so durable
+delivery fails closed instead of reporting a successful effect. Scripts only
+need to implement the ordinary operations they care about, but must implement
+both stable-nudge operations when they declare that capability.
 
 ## Operations
 
@@ -290,7 +294,9 @@ responsibility. Session setup commands are the *script's* responsibility
 
 1. Start with `contrib/session-scripts/gc-session-screen` as a template.
 2. Implement the operations your backend supports.
-3. Return exit 2 for operations you don't support.
+3. Return exit 2 for ordinary operations you don't support. If the `protocol`
+   handshake declares `effect.nudge-idempotent`, implement both stable-nudge
+   operations; exit 2 for either is `ErrStableNudgeUnsupported`, not success.
 4. Validate with `gc runtime check ./your-script` — it runs the protocol
    handshake, the required lifecycle round-trip (start, is-running, stop,
    idempotent stop), exercises every capability the handshake declares,

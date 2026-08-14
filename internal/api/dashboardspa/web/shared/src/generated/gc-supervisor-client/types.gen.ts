@@ -13912,6 +13912,10 @@ export type PostV0CityByCityNameMailDeliveryByAttemptIdInvokeErrors = {
      */
     403: ErrorModel;
     /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
      * Conflict
      */
     409: ErrorModel;

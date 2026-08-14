@@ -246,7 +246,7 @@ func (sm *SupervisorMux) registerCityRoutes() {
 	cityDelete(sm, "/mail/{id}", (*Server).humaHandleMailDelete, errorStatuses(http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound))
 	cityPost(sm, "/mail/durable", (*Server).humaHandleMailDurableSend, errorStatuses(http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusConflict, http.StatusServiceUnavailable))
 	cityPost(sm, "/mail/delivery/reconcile-seat", (*Server).humaHandleMailDeliveryReconcile, errorStatuses(http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusConflict, http.StatusServiceUnavailable))
-	cityPost(sm, "/mail/delivery/{attemptID}/invoke", (*Server).humaHandleMailDeliveryInvoke, errorStatuses(http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusConflict, http.StatusServiceUnavailable))
+	cityPost(sm, "/mail/delivery/{attemptID}/invoke", (*Server).humaHandleMailDeliveryInvoke, errorStatuses(http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusConflict, http.StatusServiceUnavailable))
 	cityGet(sm, "/mail/delivery/{attemptID}", (*Server).humaHandleMailDeliveryStatus, errorStatuses(http.StatusBadRequest, http.StatusNotFound, http.StatusServiceUnavailable))
 
 	// Convoys.

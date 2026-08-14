@@ -40,7 +40,7 @@ type controllerMailDeliverySnapshot struct {
 
 func (c *controllerMailDeliveryCoordinator) snapshot() (controllerMailDeliverySnapshot, error) {
 	if c == nil || c.state == nil {
-		return controllerMailDeliverySnapshot{}, fmt.Errorf("mail delivery coordinator unavailable")
+		return controllerMailDeliverySnapshot{}, api.ErrMailDeliveryUnavailable
 	}
 	c.state.mu.RLock()
 	snapshot := controllerMailDeliverySnapshot{
@@ -52,11 +52,11 @@ func (c *controllerMailDeliveryCoordinator) snapshot() (controllerMailDeliverySn
 	}
 	c.state.mu.RUnlock()
 	if snapshot.cfg == nil || snapshot.workStore == nil || snapshot.cityPath == "" || snapshot.cityName == "" {
-		return controllerMailDeliverySnapshot{}, fmt.Errorf("mail delivery coordinator state is incomplete")
+		return controllerMailDeliverySnapshot{}, fmt.Errorf("%w: coordinator state is incomplete", api.ErrMailDeliveryUnavailable)
 	}
 	_, provenance, err := config.LoadWithIncludes(fsys.OSFS{}, snapshot.cityPath+"/city.toml")
 	if err != nil {
-		return controllerMailDeliverySnapshot{}, fmt.Errorf("loading mail delivery config provenance: %w", err)
+		return controllerMailDeliverySnapshot{}, fmt.Errorf("%w: loading config provenance: %w", api.ErrMailDeliveryUnavailable, err)
 	}
 	snapshot.configHash = config.Revision(fsys.OSFS{}, provenance, snapshot.cfg, snapshot.cityPath)
 	return snapshot, nil
@@ -70,12 +70,12 @@ func (c *controllerMailDeliveryCoordinator) SendDurableMail(_ context.Context, c
 		return beadmail.DurableSendResult{}, err
 	}
 	if snapshot.mailSender == nil {
-		return beadmail.DurableSendResult{}, fmt.Errorf("configured mail provider does not support durable notifications")
+		return beadmail.DurableSendResult{}, fmt.Errorf("%w: configured mail provider does not support durable notifications", api.ErrMailDeliveryUnavailable)
 	}
 	sessionStore := cliSessionStore(snapshot.workStore, snapshot.cfg, snapshot.cityPath)
 	seatRef, recipient, err := resolveDurableMailSeat(snapshot.cfg, snapshot.cityName, sessionFrontDoor(sessionStore), command.Recipient)
 	if err != nil {
-		return beadmail.DurableSendResult{}, err
+		return beadmail.DurableSendResult{}, fmt.Errorf("%w: %w", api.ErrMailDeliveryInvalid, err)
 	}
 	sender := ""
 	for _, candidate := range command.SenderCandidates {
@@ -84,17 +84,21 @@ func (c *controllerMailDeliveryCoordinator) SendDurableMail(_ context.Context, c
 			break
 		}
 		if !errors.Is(err, session.ErrSessionNotFound) {
-			return beadmail.DurableSendResult{}, fmt.Errorf("invalid sender %q: %w", candidate, err)
+			return beadmail.DurableSendResult{}, fmt.Errorf("%w: invalid sender %q: %w", api.ErrMailDeliveryInvalid, candidate, err)
 		}
 	}
 	if sender == "" {
-		return beadmail.DurableSendResult{}, fmt.Errorf("no sender identity resolved")
+		return beadmail.DurableSendResult{}, fmt.Errorf("%w: no sender identity resolved", api.ErrMailDeliveryInvalid)
 	}
 	cityRef := "city:" + snapshot.cityName
-	return snapshot.mailSender.SendDurableStable(sender, recipient, command.Subject, command.Body, beadmail.StableDurableSendIntent{
+	result, err := snapshot.mailSender.SendDurableStable(sender, recipient, command.Subject, command.Body, beadmail.StableDurableSendIntent{
 		CityRef: cityRef, MessagingStoreRef: cityRef + "/messaging", SeatRef: seatRef,
 		StableKey: command.StableKey, Policy: maildelivery.PolicyNotifyOnly, Attention: maildelivery.AttentionImmediate,
 	})
+	if err != nil && result.Message.ID == "" {
+		return result, fmt.Errorf("%w: durable provider failed: %w", api.ErrMailDeliveryUnavailable, err)
+	}
+	return result, err
 }
 
 func (c *controllerMailDeliveryCoordinator) deliveryRuntime(snapshot controllerMailDeliverySnapshot, seatRef, sessionRef string) (*maildelivery.Store, *mailDeliveryFenceResolver, maildelivery.AttemptExecutor, error) {
@@ -113,14 +117,14 @@ func (c *controllerMailDeliveryCoordinator) deliveryRuntime(snapshot controllerM
 		}
 	}
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, fmt.Errorf("%w: %w", api.ErrMailDeliveryInvalid, err)
 	}
 	store := maildelivery.NewStore(resolveMailMessagesStore(snapshot.routes, snapshot.workStore, snapshot.cfg, snapshot.cityPath, nil))
 	if resolver.sessionRef == "" {
 		return store, resolver, nil, nil
 	}
 	if snapshot.provider == nil {
-		return nil, nil, nil, fmt.Errorf("mail delivery session provider unavailable")
+		return nil, nil, nil, fmt.Errorf("%w: session provider unavailable", api.ErrMailDeliveryUnavailable)
 	}
 	execute := func(ctx context.Context, attempt maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
 		return executeMailDeliveryAttemptWithLookup(ctx, store, attempt, resolver, time.Now().UTC(),
@@ -135,7 +139,7 @@ func (c *controllerMailDeliveryCoordinator) ReconcileMailDeliverySeat(ctx contex
 	c.state.mailDeliveryMu.Lock()
 	defer c.state.mailDeliveryMu.Unlock()
 	if limit <= 0 || limit > 100 || (expectedDeliveryID != "" && (maildelivery.ValidateDeliveryID(expectedDeliveryID) != nil || limit != 1)) {
-		return maildelivery.ReconcileReport{}, fmt.Errorf("mail delivery reconcile inputs are invalid")
+		return maildelivery.ReconcileReport{}, api.ErrMailDeliveryInvalid
 	}
 	snapshot, err := c.snapshot()
 	if err != nil {
@@ -158,11 +162,17 @@ func (c *controllerMailDeliveryCoordinator) InvokeMailDelivery(ctx context.Conte
 	store := maildelivery.NewStore(resolveMailMessagesStore(snapshot.routes, snapshot.workStore, snapshot.cfg, snapshot.cityPath, nil))
 	attempt, err := store.TransportAttempt(attemptID)
 	if err != nil {
-		return maildelivery.TransportAttempt{}, err
+		if errors.Is(err, beads.ErrNotFound) {
+			return maildelivery.TransportAttempt{}, fmt.Errorf("%w: %w", api.ErrMailDeliveryNotFound, err)
+		}
+		return maildelivery.TransportAttempt{}, fmt.Errorf("%w: loading transport attempt: %w", api.ErrMailDeliveryUnavailable, err)
 	}
 	delivery, err := store.Get(attempt.DeliveryID)
 	if err != nil {
-		return attempt, fmt.Errorf("loading canonical delivery for invocation: %w", err)
+		if errors.Is(err, beads.ErrNotFound) {
+			return attempt, fmt.Errorf("%w: loading canonical delivery: %w", api.ErrMailDeliveryNotFound, err)
+		}
+		return attempt, fmt.Errorf("%w: loading canonical delivery: %w", api.ErrMailDeliveryUnavailable, err)
 	}
 	seatRef := delivery.SeatRef
 	_, _, execute, err := c.deliveryRuntime(snapshot, seatRef, attempt.SessionRef)
@@ -170,7 +180,7 @@ func (c *controllerMailDeliveryCoordinator) InvokeMailDelivery(ctx context.Conte
 		return maildelivery.TransportAttempt{}, err
 	}
 	if execute == nil {
-		return attempt, fmt.Errorf("mail delivery transport executor unavailable")
+		return attempt, fmt.Errorf("%w: transport executor unavailable", api.ErrMailDeliveryUnavailable)
 	}
 	return execute(ctx, attempt)
 }
@@ -181,7 +191,14 @@ func (c *controllerMailDeliveryCoordinator) MailDeliveryStatus(_ context.Context
 		return maildelivery.TransportAttempt{}, err
 	}
 	store := maildelivery.NewStore(resolveMailMessagesStore(snapshot.routes, snapshot.workStore, snapshot.cfg, snapshot.cityPath, nil))
-	return store.TransportAttempt(attemptID)
+	attempt, err := store.TransportAttempt(attemptID)
+	if errors.Is(err, beads.ErrNotFound) {
+		return maildelivery.TransportAttempt{}, fmt.Errorf("%w: %w", api.ErrMailDeliveryNotFound, err)
+	}
+	if err != nil {
+		return maildelivery.TransportAttempt{}, fmt.Errorf("%w: loading transport attempt: %w", api.ErrMailDeliveryUnavailable, err)
+	}
+	return attempt, nil
 }
 
 var _ api.MailDeliveryCoordinator = (*controllerMailDeliveryCoordinator)(nil)

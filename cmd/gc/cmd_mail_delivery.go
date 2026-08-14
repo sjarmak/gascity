@@ -43,13 +43,6 @@ type mailDeliveryMutationClient interface {
 	SendDurableMail(api.DurableMailCommand) (beadmail.DurableSendResult, error)
 	ReconcileMailDeliverySeat(string, int, string) (maildelivery.ReconcileReport, error)
 	InvokeMailDelivery(string) (maildelivery.TransportAttempt, error)
-	ShouldFallback(error) bool
-}
-
-type supervisorMailDeliveryClient struct{ *api.Client }
-
-func (c supervisorMailDeliveryClient) ShouldFallback(err error) bool {
-	return api.ShouldFallback(c.Client, err)
 }
 
 var resolveMailDeliveryMutationClient = func(cityPath string) mailDeliveryMutationClient {
@@ -57,7 +50,7 @@ var resolveMailDeliveryMutationClient = func(cityPath string) mailDeliveryMutati
 	if client == nil {
 		return nil
 	}
-	return supervisorMailDeliveryClient{Client: client}
+	return client
 }
 
 func mailDeliveryIssuerRef(cityName string) string {
@@ -120,9 +113,7 @@ func cmdMailDeliveryReconcileSeat(ctx context.Context, seatRef string, limit int
 	if cityPath, resolveErr := resolveCity(); resolveErr == nil {
 		if client := resolveMailDeliveryMutationClient(cityPath); client != nil {
 			report, apiErr := client.ReconcileMailDeliverySeat(seatRef, limit, expectedDeliveryID)
-			if apiErr == nil || !client.ShouldFallback(apiErr) {
-				return renderMailDeliveryReconcile(report, apiErr, stdout, stderr)
-			}
+			return renderMailDeliveryReconcile(report, apiErr, stdout, stderr)
 		}
 	}
 	workStore, cityPath, code := openCityStoreWithPath(stderr, "gc mail delivery reconcile-seat")
@@ -216,9 +207,7 @@ func cmdMailDeliveryInvoke(ctx context.Context, attemptID string, stdout, stderr
 	if cityPath, resolveErr := resolveCity(); resolveErr == nil {
 		if client := resolveMailDeliveryMutationClient(cityPath); client != nil {
 			attempt, apiErr := client.InvokeMailDelivery(attemptID)
-			if apiErr == nil || !client.ShouldFallback(apiErr) {
-				return renderMailDeliveryInvoke(attempt, apiErr, stdout, stderr)
-			}
+			return renderMailDeliveryInvoke(attempt, apiErr, stdout, stderr)
 		}
 	}
 	workStore, cityPath, code := openCityStoreWithPath(stderr, "gc mail delivery invoke")
@@ -417,16 +406,10 @@ func mailDeliveryWorkerInvoker(cityPath string, cfg *config.City, sessStore bead
 			result.Receipt.CommitBoundary != worker.NudgeCommitBoundaryDestinationAtomic {
 			return maildelivery.TransportReceipt{}, fmt.Errorf("provider acceptance receipt does not match exact mail delivery target")
 		}
-		receipt := maildelivery.TransportReceipt{
-			Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
-			State: maildelivery.EffectCommitted, CommitBoundary: maildelivery.TransportCommitBoundaryDestinationAtomic,
-			ReceiptRef: "destination:" + result.Receipt.DestinationRef, ReceiptSHA256: result.Receipt.DestinationReceiptSHA256,
-			RecordedAt: result.Receipt.AcceptedAt,
-		}
 		// The worker validated exact authority under the session mutation lock
 		// immediately before the provider effect. Once the exact destination
 		// receipt exists, later projection drift cannot revoke that evidence.
-		return receipt, nil
+		return canonicalMailDeliveryTransportReceipt(attempt, result.Receipt)
 	}
 }
 
@@ -460,13 +443,24 @@ func mailDeliveryWorkerReceiptLookup(cityPath string, cfg *config.City, sessStor
 		if lookup.Receipt == nil || lookup.Receipt.CommitBoundary != worker.NudgeCommitBoundaryDestinationAtomic {
 			return maildelivery.TransportReceipt{}, fmt.Errorf("destination lookup returned no exact stable receipt")
 		}
-		return maildelivery.TransportReceipt{
-			Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
-			State: maildelivery.EffectCommitted, CommitBoundary: maildelivery.TransportCommitBoundaryDestinationAtomic,
-			ReceiptRef:    "destination:" + lookup.Receipt.DestinationRef,
-			ReceiptSHA256: lookup.Receipt.DestinationReceiptSHA256, RecordedAt: lookup.Receipt.AcceptedAt,
-		}, nil
+		return canonicalMailDeliveryTransportReceipt(attempt, lookup.Receipt)
 	}
+}
+
+func canonicalMailDeliveryTransportReceipt(attempt maildelivery.TransportAttempt, source *worker.NudgeAcceptanceReceipt) (maildelivery.TransportReceipt, error) {
+	if source == nil {
+		return maildelivery.TransportReceipt{}, fmt.Errorf("destination returned no exact stable receipt")
+	}
+	receipt := maildelivery.TransportReceipt{
+		Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
+		State: maildelivery.EffectCommitted, CommitBoundary: maildelivery.TransportCommitBoundaryDestinationAtomic,
+		ReceiptRef: source.DestinationRef, ReceiptSHA256: source.DestinationReceiptSHA256,
+		RecordedAt: source.AcceptedAt,
+	}
+	if err := receipt.Validate(attempt.AttemptID, attempt.NudgeID); err != nil {
+		return maildelivery.TransportReceipt{}, fmt.Errorf("constructing canonical mail delivery receipt: %w", err)
+	}
+	return receipt, nil
 }
 
 func mailDeliveryWorkerPreflight(cityPath string, cfg *config.City, sessStore beads.Store, provider runtime.Provider, resolver *mailDeliveryFenceResolver) maildelivery.TransportPreflight {

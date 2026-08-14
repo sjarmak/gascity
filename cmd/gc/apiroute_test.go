@@ -168,8 +168,8 @@ func TestMailDeliveryMutationClientUsesManagedSupervisorWhenControllerIsPortless
 	dir := writeCityTOMLForRoute(t, t.TempDir(), "name = \"t\"\n")
 
 	got := resolveMailDeliveryMutationClient(dir)
-	client, ok := got.(supervisorMailDeliveryClient)
-	if !ok || client.Client != sentinel {
+	client, ok := got.(*api.Client)
+	if !ok || client != sentinel {
 		t.Fatalf("mail delivery mutation client = %#v, want managed supervisor", got)
 	}
 	if gotIssuer := mailDeliveryIssuerRef("t"); gotIssuer != "controller:t/mail-delivery" {
