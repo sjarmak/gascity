@@ -18,6 +18,7 @@ func TestStableNudgeWireCommitBeforeResponseLossRetriesSameEffect(t *testing.T) 
 	dir := t.TempDir()
 	effectFile := filepath.Join(dir, "effects")
 	receiptFile := filepath.Join(dir, "receipt")
+	lookupFile := filepath.Join(dir, "lookup")
 	requestFile := filepath.Join(dir, "request")
 	effectID := "mail-nudge-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	content := runtime.TextContent("1 actionable mail delivery; run gc mail inbox")
@@ -29,6 +30,13 @@ func TestStableNudgeWireCommitBeforeResponseLossRetriesSameEffect(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
+	lookupWire, err := json.Marshal(runtime.StableNudgeLookup{
+		Version: 1, State: runtime.StableNudgeLookupCommitted,
+		Receipt: want, ObservedAt: time.Date(2026, 8, 14, 1, 5, 1, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("Marshal lookup: %v", err)
+	}
 	script := writeScript(t, dir, fmt.Sprintf(`
 case "$1" in
   protocol) printf '%%s' '{"version":0,"capabilities":["effect.nudge-idempotent"]}' ;;
@@ -37,13 +45,15 @@ case "$1" in
     if test ! -f %q; then
       printf '%%s\n' "$3" >> %q
       printf '%%s' %q > %q
+      printf '%%s' %q > %q
       exit 1
     fi
     cat %q
     ;;
+  nudge-stable-status) cat %q ;;
   *) exit 2 ;;
 esac
-`, requestFile, receiptFile, effectFile, string(wire), receiptFile, receiptFile))
+`, requestFile, receiptFile, effectFile, string(wire), receiptFile, string(lookupWire), lookupFile, receiptFile, lookupFile))
 	p := NewSeamBacked(script)
 	stable, ok := p.(runtime.StableNudgeProvider)
 	if !ok {
@@ -52,6 +62,10 @@ esac
 
 	if _, err := stable.NudgeStable(context.Background(), "session-a", effectID, content); !errors.Is(err, runtime.ErrStableNudgeRetrySafe) {
 		t.Fatalf("first NudgeStable error = %v, want ErrStableNudgeRetrySafe", err)
+	}
+	lookup, err := stable.LookupStableNudge(context.Background(), "session-a", effectID, content)
+	if err != nil || lookup.State != runtime.StableNudgeLookupCommitted || lookup.Receipt != want {
+		t.Fatalf("LookupStableNudge = %#v, %v", lookup, err)
 	}
 	got, err := stable.NudgeStable(context.Background(), "session-a", effectID, content)
 	if err != nil {
@@ -73,6 +87,23 @@ esac
 	}
 	if !strings.Contains(string(request), effectID) || strings.Contains(string(request), "subject") || strings.Contains(string(request), "body") {
 		t.Fatalf("request = %s", request)
+	}
+}
+
+func TestStableNudgeWireLookupReturnsExplicitUnknown(t *testing.T) {
+	dir := t.TempDir()
+	script := writeScript(t, dir, `
+case "$1" in
+ protocol) printf '%s' '{"version":0,"capabilities":["effect.nudge-idempotent"]}' ;;
+ nudge-stable-status) printf '%s' '{"version":1,"state":"unknown_external_state","observed_at":"2026-08-14T01:07:00Z"}' ;;
+ *) exit 2 ;;
+esac
+`)
+	p := NewProvider(script)
+	lookup, err := p.LookupStableNudge(context.Background(), "session-a",
+		"mail-nudge-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", runtime.TextContent("notice"))
+	if err != nil || lookup.State != runtime.StableNudgeLookupUnknownExternalState || lookup.Receipt != (runtime.StableNudgeReceipt{}) {
+		t.Fatalf("LookupStableNudge = %#v, %v", lookup, err)
 	}
 }
 

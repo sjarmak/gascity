@@ -457,6 +457,31 @@ func (f *Fake) NudgeStable(ctx context.Context, name, effectID string, content [
 	return receipt, nil
 }
 
+// LookupStableNudge reads destination evidence without producing an effect.
+func (f *Fake) LookupStableNudge(ctx context.Context, name, effectID string, content []ContentBlock) (StableNudgeLookup, error) {
+	if err := ctx.Err(); err != nil {
+		return StableNudgeLookup{}, err
+	}
+	if err := ValidateStableNudgeEffectID(effectID); err != nil {
+		return StableNudgeLookup{}, err
+	}
+	contentHash, err := stableNudgeContentSHA256(content)
+	if err != nil {
+		return StableNudgeLookup{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, Call{Method: "LookupStableNudge", Name: name, EffectID: effectID})
+	if receipt, ok := f.stableNudgeReceipts[effectID]; ok {
+		lookup := StableNudgeLookup{Version: 1, State: StableNudgeLookupCommitted, Receipt: receipt, ObservedAt: time.Now().UTC()}
+		if err := lookup.Validate(effectID, name, contentHash); err != nil {
+			return StableNudgeLookup{}, fmt.Errorf("%w: %w", ErrStableNudgeConflict, err)
+		}
+		return lookup, nil
+	}
+	return StableNudgeLookup{Version: 1, State: StableNudgeLookupUnknownExternalState, ObservedAt: time.Now().UTC()}, nil
+}
+
 // NudgeNow records the call and returns nil (or an error if broken).
 func (f *Fake) NudgeNow(name string, content []ContentBlock) error {
 	f.mu.Lock()

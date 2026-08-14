@@ -160,13 +160,14 @@ func (f *Factory) SessionByRecord(info sessionpkg.Info, pr sessionpkg.PersistedR
 
 func (f *Factory) sessionFromRecord(info sessionpkg.Info, pr sessionpkg.PersistedResponse) (Handle, error) {
 	spec := SessionSpec{
-		ID:       info.ID,
-		Template: info.Template,
-		Title:    info.Title,
-		Alias:    info.Alias,
-		Command:  info.Command,
-		Provider: info.Provider,
-		WorkDir:  info.WorkDir,
+		ID:        info.ID,
+		Template:  info.Template,
+		Title:     info.Title,
+		Alias:     info.Alias,
+		Command:   info.Command,
+		Provider:  info.Provider,
+		Transport: info.Transport,
+		WorkDir:   info.WorkDir,
 		Resume: sessionpkg.ProviderResume{
 			ResumeFlag:    info.ResumeFlag,
 			ResumeStyle:   info.ResumeStyle,

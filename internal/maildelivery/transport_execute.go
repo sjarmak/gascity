@@ -16,9 +16,22 @@ type TransportInvoker func(context.Context, TransportAttempt) (TransportReceipt,
 // invoking CAS. A failure leaves the durable intent requested and retryable.
 type TransportPreflight func(context.Context, TransportAttempt) error
 
+// TransportReceiptLookup reads destination evidence without invoking an effect.
+type TransportReceiptLookup func(context.Context, TransportAttempt) (TransportReceipt, error)
+
 // ExecuteTransport applies the requested->invoking->committed|unknown protocol.
 // Replays never invoke a terminal or already-invoking attempt.
 func ExecuteTransport(ctx context.Context, store *Store, request TransportAttemptRequest, resolver FenceResolver, uncertainAt time.Time, preflight TransportPreflight, invoke TransportInvoker) (TransportAttempt, error) {
+	return executeTransport(ctx, store, request, resolver, uncertainAt, preflight, nil, invoke)
+}
+
+// ExecuteTransportWithReceiptLookup reconciles expired invocations from
+// read-only destination evidence before conservatively declaring uncertainty.
+func ExecuteTransportWithReceiptLookup(ctx context.Context, store *Store, request TransportAttemptRequest, resolver FenceResolver, uncertainAt time.Time, preflight TransportPreflight, lookup TransportReceiptLookup, invoke TransportInvoker) (TransportAttempt, error) {
+	return executeTransport(ctx, store, request, resolver, uncertainAt, preflight, lookup, invoke)
+}
+
+func executeTransport(ctx context.Context, store *Store, request TransportAttemptRequest, resolver FenceResolver, uncertainAt time.Time, preflight TransportPreflight, lookup TransportReceiptLookup, invoke TransportInvoker) (TransportAttempt, error) {
 	if store == nil || invoke == nil {
 		return TransportAttempt{}, fmt.Errorf("mail delivery transport execution is unavailable")
 	}
@@ -41,7 +54,23 @@ func ExecuteTransport(ctx context.Context, store *Store, request TransportAttemp
 		if uncertainAt.Before(attempt.InvocationLeaseUntil) {
 			return attempt, fmt.Errorf("%w until %s", ErrTransportInvocationInProgress, attempt.InvocationLeaseUntil.Format(time.RFC3339Nano))
 		}
-		return store.RecordUnknownTransportState(attempt.AttemptID, attempt.Revision, uncertainAt)
+		if lookup == nil {
+			return store.RecordUnknownTransportState(attempt.AttemptID, attempt.Revision, uncertainAt)
+		}
+		receipt, lookupErr := lookup(ctx, attempt)
+		if lookupErr != nil {
+			unknown, markErr := store.RecordUnknownTransportState(attempt.AttemptID, attempt.Revision, uncertainAt)
+			return unknown, errors.Join(fmt.Errorf("mail delivery destination receipt lookup failed: %w", lookupErr), markErr)
+		}
+		switch receipt.State {
+		case EffectCommitted:
+			return store.RecordTransportReceipt(attempt.AttemptID, attempt.Revision, receipt)
+		case EffectUnknownExternalState:
+			return store.RecordUnknownTransportState(attempt.AttemptID, attempt.Revision, uncertainAt)
+		default:
+			unknown, markErr := store.RecordUnknownTransportState(attempt.AttemptID, attempt.Revision, uncertainAt)
+			return unknown, errors.Join(fmt.Errorf("mail delivery destination receipt lookup returned no typed outcome"), markErr)
+		}
 	case TransportRequested:
 		// Continue below; this caller still needs to win the invocation CAS.
 	default:

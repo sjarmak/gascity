@@ -105,6 +105,27 @@ func SupportsDestinationAtomicNudge(handle Handle) bool {
 	return ok && supported.SupportsStableNudge()
 }
 
+// DestinationNudgeLookup is exact destination evidence or explicit uncertainty.
+type DestinationNudgeLookup struct {
+	Receipt    *NudgeAcceptanceReceipt
+	Unknown    bool
+	ObservedAt time.Time
+}
+
+// StableNudgeLookupHandle exposes read-only destination receipt lookup.
+type StableNudgeLookupHandle interface {
+	LookupStableNudge(context.Context, string, string) (DestinationNudgeLookup, error)
+}
+
+// LookupDestinationAtomicNudge reads exact destination evidence through a session handle.
+func LookupDestinationAtomicNudge(ctx context.Context, handle Handle, effectID, text string) (DestinationNudgeLookup, error) {
+	reader, ok := handle.(StableNudgeLookupHandle)
+	if !ok {
+		return DestinationNudgeLookup{}, runtime.ErrStableNudgeUnsupported
+	}
+	return reader.LookupStableNudge(ctx, effectID, text)
+}
+
 // Phase captures the worker-level lifecycle state surfaced by [Handle.State].
 type Phase string
 

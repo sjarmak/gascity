@@ -172,6 +172,70 @@ func TestExecuteTransportRecoversExpiredInvokingLeaseAsUnknownWithoutCallingProv
 	}
 }
 
+func TestExecuteTransportExpiredInvocationCommitsReadOnlyDestinationReceipt(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	startedAt := time.Date(2026, 8, 13, 23, 21, 0, 0, time.UTC)
+	request := TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID}, CreatedAt: startedAt,
+	}
+	attempt, err := store.CreateTransportAttempt(context.Background(), request, fixedFenceResolver{fence: fence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invoking, err := store.BeginTransportInvocation(attempt.AttemptID, attempt.Revision, startedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookupCalls, invokeCalls := 0, 0
+	lookup := func(_ context.Context, current TransportAttempt) (TransportReceipt, error) {
+		lookupCalls++
+		return TransportReceipt{
+			Version: 1, AttemptID: current.AttemptID, NudgeID: current.NudgeID,
+			State: EffectCommitted, CommitBoundary: TransportCommitBoundaryDestinationAtomic,
+			ReceiptRef: "destination:recovered", ReceiptSHA256: strings.Repeat("a", 64), RecordedAt: startedAt.Add(time.Second),
+		}, nil
+	}
+	got, err := ExecuteTransportWithReceiptLookup(context.Background(), store, request, fixedFenceResolver{fence: fence},
+		invoking.InvocationLeaseUntil.Add(time.Second), nil, lookup, func(context.Context, TransportAttempt) (TransportReceipt, error) {
+			invokeCalls++
+			return TransportReceipt{}, nil
+		})
+	if err != nil || got.State != TransportCommitted || lookupCalls != 1 || invokeCalls != 0 {
+		t.Fatalf("recovery = %#v, %v, lookups=%d invokes=%d", got, err, lookupCalls, invokeCalls)
+	}
+}
+
+func TestExecuteTransportExpiredInvocationRecordsLookupUnknown(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	startedAt := time.Date(2026, 8, 13, 23, 22, 0, 0, time.UTC)
+	request := TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID}, CreatedAt: startedAt,
+	}
+	attempt, _ := store.CreateTransportAttempt(context.Background(), request, fixedFenceResolver{fence: fence})
+	invoking, _ := store.BeginTransportInvocation(attempt.AttemptID, attempt.Revision, startedAt)
+	uncertainAt := invoking.InvocationLeaseUntil.Add(time.Second)
+	got, err := ExecuteTransportWithReceiptLookup(context.Background(), store, request, fixedFenceResolver{fence: fence},
+		uncertainAt, nil,
+		func(_ context.Context, current TransportAttempt) (TransportReceipt, error) {
+			return TransportReceipt{
+				Version: 1, AttemptID: current.AttemptID, NudgeID: current.NudgeID,
+				State: EffectUnknownExternalState, RecordedAt: startedAt.Add(-24 * time.Hour),
+			}, nil
+		}, func(context.Context, TransportAttempt) (TransportReceipt, error) {
+			t.Fatal("provider invoked")
+			return TransportReceipt{}, nil
+		})
+	if err != nil || got.State != TransportUnknownExternalState || !got.Receipt.RecordedAt.Equal(uncertainAt) {
+		t.Fatalf("recovery = %#v, %v", got, err)
+	}
+}
+
 func TestExecuteTransportConcurrentCallerLeavesLiveInvocationIntact(t *testing.T) {
 	store, _ := newDeliveryStore()
 	delivery := createWaitingDelivery(t, store)
