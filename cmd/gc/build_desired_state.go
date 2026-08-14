@@ -17,6 +17,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/coordclass"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/hooks"
 	"github.com/gastownhall/gascity/internal/poolplan"
@@ -159,10 +160,12 @@ type poolEvalWork struct {
 }
 
 type defaultScaleCheckTarget struct {
-	template string
-	storeKey string
-	store    beads.Store
-	err      error
+	template     string
+	storeKey     string
+	candidateRef string
+	store        beads.Store
+	role         classStoreRole
+	err          error
 }
 
 type scaleCheckDemand struct {
@@ -389,12 +392,40 @@ func buildDesiredStateWithSessionBeads(
 	trace *sessionReconcilerTraceCycle,
 	stderr io.Writer,
 ) DesiredStateResult {
+	return buildDesiredStateWithClassStores(
+		cityName, cityPath, beaconTime, cfg, sp,
+		store, store, rigStores, sessionBeads, trace, stderr,
+	)
+}
+
+type desiredStateBuildWithClassStoresFn func(
+	*config.City,
+	runtime.Provider,
+	beads.Store,
+	beads.Store,
+	map[string]beads.Store,
+	*sessionBeadSnapshot,
+	*sessionReconcilerTraceCycle,
+) DesiredStateResult
+
+func buildDesiredStateWithClassStores(
+	cityName, cityPath string,
+	beaconTime time.Time,
+	cfg *config.City,
+	sp runtime.Provider,
+	sessionStore beads.Store,
+	workStore beads.Store,
+	rigWorkStores map[string]beads.Store,
+	sessionBeads *sessionBeadSnapshot,
+	trace *sessionReconcilerTraceCycle,
+	stderr io.Writer,
+) DesiredStateResult {
 	citySt, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
 	if effectiveCitySuspended(cfg, citySt) {
 		return DesiredStateResult{}
 	}
 
-	bp := newAgentBuildParams(cityName, cityPath, cfg, sp, beaconTime, store, stderr)
+	bp := newAgentBuildParams(cityName, cityPath, cfg, sp, beaconTime, sessionStore, stderr)
 	bp.sessionBeads = sessionBeads
 
 	// Pre-compute suspended rig paths (config + runtime state).
@@ -405,7 +436,7 @@ func buildDesiredStateWithSessionBeads(
 	// not swallowed: undercounting running sessions can misclassify a pool as
 	// cold and trigger a spurious scale-from-zero probe.
 	subPhaseStart := time.Now()
-	allOpenSessionInfos, openSessionBeadsErr := collectAllOpenSessionInfos(cfg, store, rigStores, suspendedRigPaths)
+	allOpenSessionInfos, openSessionBeadsErr := collectAllOpenSessionInfos(cfg, sessionStore, rigWorkStores, suspendedRigPaths)
 	recordDemandSubPhase(trace, "demand_snapshot.collect_open_session_beads", subPhaseStart, map[string]any{
 		"beads":   len(allOpenSessionInfos),
 		"partial": openSessionBeadsErr != nil,
@@ -435,15 +466,46 @@ func buildDesiredStateWithSessionBeads(
 	type activeStore struct {
 		store beads.Store
 		ref   string
+		role  classStoreRole
 	}
-	activeStores := []activeStore{{store: store, ref: "city"}}
+	workRole := classStoreRoleAll
+	infraRole := classStoreRoleAll
+	if sessionStore != nil && sessionStore != workStore {
+		workRole = classStoreRoleWork
+		infraRole = classStoreRoleInfrastructure
+	}
+	activeStores := []activeStore{{store: workStore, ref: "city", role: workRole}}
+	if sessionStore != nil && sessionStore != workStore {
+		activeStores = append(activeStores, activeStore{store: sessionStore, ref: "city", role: infraRole})
+	}
 	for _, rig := range cfg.Rigs {
 		if suspendedRigPaths[filepath.Clean(rig.Path)] {
 			continue
 		}
-		if s, ok := rigStores[rig.Name]; ok {
-			activeStores = append(activeStores, activeStore{store: s, ref: rig.Name})
+		if s, ok := rigWorkStores[rig.Name]; ok {
+			activeStores = append(activeStores, activeStore{store: s, ref: rig.Name, role: workRole})
 		}
+	}
+	additionalCityTarget := func(template string, ownStore beads.Store) (defaultScaleCheckTarget, bool) {
+		if sessionStore == nil || sessionStore == workStore || sessionStore == ownStore {
+			return defaultScaleCheckTarget{}, false
+		}
+		return defaultScaleCheckTarget{
+			template:     template,
+			store:        sessionStore,
+			storeKey:     "class",
+			candidateRef: "city",
+			role:         infraRole,
+		}, true
+	}
+	decorateOwnTarget := func(target defaultScaleCheckTarget, storeScopedControlDispatcher bool) defaultScaleCheckTarget {
+		target.candidateRef = target.storeKey
+		target.role = workRole
+		if storeScopedControlDispatcher && infraRole == classStoreRoleInfrastructure && target.store == sessionStore {
+			target.candidateRef = "city"
+			target.role = infraRole
+		}
+		return target
 	}
 
 	for i := range cfg.Agents {
@@ -485,6 +547,10 @@ func buildDesiredStateWithSessionBeads(
 		hasCustomScaleCheck := strings.TrimSpace(cfg.Agents[i].ScaleCheck) != ""
 		template := cfg.Agents[i].QualifiedName()
 		storeScopedControlDispatcher := cfg.Agents[i].Name == config.ControlDispatcherAgentName
+		defaultCityStore := workStore
+		if storeScopedControlDispatcher && sessionStore != nil {
+			defaultCityStore = sessionStore
+		}
 		runningSessions := 0
 		for _, si := range allOpenSessionInfos {
 			if isPoolManagedSessionInfo(si) && poolSessionIsLiveInfo(si) {
@@ -527,8 +593,8 @@ func buildDesiredStateWithSessionBeads(
 			// work below; defaultNamedScaleTargets only preserves partial-query
 			// retention for configured named-session beads.
 			poolDir := agentCommandDir(cityPath, &cfg.Agents[i], cfg.Rigs)
-			if store != nil && !hasCustomScaleCheck {
-				ownTarget := defaultScaleCheckTargetForAgent(cityPath, cfg, &cfg.Agents[i], store, rigStores)
+			if workStore != nil && !hasCustomScaleCheck {
+				ownTarget := decorateOwnTarget(defaultScaleCheckTargetForAgent(cityPath, cfg, &cfg.Agents[i], defaultCityStore, rigWorkStores), storeScopedControlDispatcher)
 				// mode='always': named session is unconditionally desired by the named
 				// pass; pool demand is redundant and creates {name}-N phantoms when N
 				// routed beads arrive. mode='on_demand': pool demand wakes the sleeping
@@ -553,18 +619,24 @@ func buildDesiredStateWithSessionBeads(
 				// Same guard conditions apply: healthy own rig store, not
 				// city-aliased, not city-scoped. The named-session target list
 				// mirrors these probes only for partial-query retention bookkeeping.
-				if !storeScopedControlDispatcher && ownTarget.storeKey != "city" && ownTarget.store != nil && ownTarget.err == nil && ownTarget.store != store {
-					cityTarget := defaultScaleCheckTarget{template: template, store: store, storeKey: "city"}
+				if !storeScopedControlDispatcher && ownTarget.storeKey != "city" && ownTarget.store != nil && ownTarget.err == nil && ownTarget.store != workStore {
+					cityTarget := defaultScaleCheckTarget{template: template, store: workStore, storeKey: "city", candidateRef: "city", role: workRole}
 					if namedSessionMode != "always" {
 						defaultScaleTargets = append(defaultScaleTargets, cityTarget)
 					}
 					defaultNamedScaleTargets = append(defaultNamedScaleTargets, cityTarget)
 				}
+				if classTarget, ok := additionalCityTarget(template, ownTarget.store); ok {
+					if namedSessionMode != "always" {
+						defaultScaleTargets = append(defaultScaleTargets, classTarget)
+					}
+					defaultNamedScaleTargets = append(defaultNamedScaleTargets, classTarget)
+				}
 				continue
 			}
-			if store != nil && isCold && !storeScopedControlDispatcher {
+			if workStore != nil && isCold && !storeScopedControlDispatcher {
 				for _, source := range activeStores {
-					target := defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref}
+					target := defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref, candidateRef: source.ref, role: source.role}
 					// Mirror the generic-pool cold-wake probe below (vp-s37 /
 					// #3078): a custom scale_check that is cold and asleep
 					// cannot see routed demand, so probe every active store
@@ -591,7 +663,7 @@ func buildDesiredStateWithSessionBeads(
 					coldWakeTemplates[template] = true
 				}
 			}
-			pendingPools = append(pendingPools, poolEvalWork{agentIdx: i, sp: sp, poolDir: poolDir, newDemand: store != nil})
+			pendingPools = append(pendingPools, poolEvalWork{agentIdx: i, sp: sp, poolDir: poolDir, newDemand: workStore != nil})
 			continue
 		}
 
@@ -603,8 +675,8 @@ func buildDesiredStateWithSessionBeads(
 		// them as desired counts; bead-backed mode uses them as authoritative
 		// new unassigned demand while assigned work drives resume requests.
 		poolDir := agentCommandDir(cityPath, &cfg.Agents[i], cfg.Rigs)
-		if store != nil && !hasCustomScaleCheck {
-			ownTarget := defaultScaleCheckTargetForAgent(cityPath, cfg, &cfg.Agents[i], store, rigStores)
+		if workStore != nil && !hasCustomScaleCheck {
+			ownTarget := decorateOwnTarget(defaultScaleCheckTargetForAgent(cityPath, cfg, &cfg.Agents[i], defaultCityStore, rigWorkStores), storeScopedControlDispatcher)
 			defaultScaleTargets = append(defaultScaleTargets, ownTarget)
 			// Cross-store demand (FR-S0.1 / vp-s37): a rig pool's routed demand
 			// may live in the city store (vp-kvp cross-store delivery), which
@@ -643,7 +715,7 @@ func buildDesiredStateWithSessionBeads(
 			// unreachable, and the partial flag must keep suppressing drain
 			// decisions rather than be overridden by a spurious city-store wake.
 			//
-			// ownTarget.store != store is a same-pointer optimization: it skips
+			// ownTarget.store != workStore is a same-pointer optimization: it skips
 			// appending a "city" probe when the rig store IS the identical Store
 			// object as the city store (which would re-probe one store, not form
 			// a real cross-store union). It is NOT the alias-safety guard — a rig
@@ -657,8 +729,11 @@ func buildDesiredStateWithSessionBeads(
 			// Control dispatchers are deliberately store-scoped: a rig copy cannot
 			// claim a route from the city store. Keep their cold-wake probe on the
 			// owning store instead of applying generic cross-store pool delivery.
-			if !storeScopedControlDispatcher && ownTarget.storeKey != "city" && ownTarget.store != nil && ownTarget.err == nil && ownTarget.store != store {
-				defaultScaleTargets = append(defaultScaleTargets, defaultScaleCheckTarget{template: template, store: store, storeKey: "city"})
+			if !storeScopedControlDispatcher && ownTarget.storeKey != "city" && ownTarget.store != nil && ownTarget.err == nil && ownTarget.store != workStore {
+				defaultScaleTargets = append(defaultScaleTargets, defaultScaleCheckTarget{template: template, store: workStore, storeKey: "city", candidateRef: "city", role: workRole})
+			}
+			if classTarget, ok := additionalCityTarget(template, ownTarget.store); ok {
+				defaultScaleTargets = append(defaultScaleTargets, classTarget)
 			}
 			continue
 		}
@@ -669,9 +744,9 @@ func buildDesiredStateWithSessionBeads(
 		// only wake a sleeping pool, never override the custom count. A custom
 		// scale_check that should scale on cross-store routed demand must count
 		// it itself, or the pool will churn at the warm/cold boundary.
-		if store != nil && isCold && !storeScopedControlDispatcher {
+		if workStore != nil && isCold && !storeScopedControlDispatcher {
 			for _, source := range activeStores {
-				defaultScaleTargets = append(defaultScaleTargets, defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref})
+				defaultScaleTargets = append(defaultScaleTargets, defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref, candidateRef: source.ref, role: source.role})
 			}
 			coldWakeTemplates[template] = true
 		}
@@ -680,7 +755,7 @@ func buildDesiredStateWithSessionBeads(
 			fmt.Fprintf(stderr, "scaleCheck: building env for %s: %v\n", cfg.Agents[i].QualifiedName(), err) //nolint:errcheck
 			continue
 		}
-		pendingPools = append(pendingPools, poolEvalWork{agentIdx: i, sp: sp, poolDir: poolDir, env: env, newDemand: store != nil})
+		pendingPools = append(pendingPools, poolEvalWork{agentIdx: i, sp: sp, poolDir: poolDir, env: env, newDemand: workStore != nil})
 	}
 
 	// Collect work beads with assignees — used for both pool demand and
@@ -711,9 +786,9 @@ func buildDesiredStateWithSessionBeads(
 	// scale-check and named-session probes read after those writes and share a
 	// second cache created below. See readyDemandCache.
 	assignedReadyCache := newReadyDemandCache()
-	if store != nil {
+	if workStore != nil {
 		subPhaseStart = time.Now()
-		assignedWorkBeads, assignedWorkStores, assignedWorkStoreRefs, readyAssigned, storePartial = collectAssignedWorkBeadsWithStores(cfg, store, rigStores, suspendedRigPaths, sessionBeads, assignedReadyCache)
+		assignedWorkBeads, assignedWorkStores, assignedWorkStoreRefs, readyAssigned, storePartial = collectAssignedWorkBeadsWithClassStores(cfg, workStore, rigWorkStores, suspendedRigPaths, sessionBeads, sessionStore, assignedReadyCache)
 		recordDemandSubPhase(trace, "demand_snapshot.collect_assigned_work", subPhaseStart, map[string]any{
 			"beads":   len(assignedWorkBeads),
 			"partial": storePartial,
@@ -727,7 +802,7 @@ func buildDesiredStateWithSessionBeads(
 				fmt.Fprintf(stderr, "  %s assignee=%s routed=%s status=%s\n", wb.ID, wb.Assignee, wb.Metadata[beadmeta.RoutedToMetadataKey], wb.Status) //nolint:errcheck
 			}
 		} else {
-			fmt.Fprintf(stderr, "assignedWorkBeads: 0 beads (rigStores=%d)\n", len(rigStores)) //nolint:errcheck
+			fmt.Fprintf(stderr, "assignedWorkBeads: 0 beads (rigStores=%d)\n", len(rigWorkStores)) //nolint:errcheck
 		}
 		// Durably record which session is executing each in-progress work
 		// bead. The Assignee link is transient (cleared on close), so without
@@ -751,7 +826,7 @@ func buildDesiredStateWithSessionBeads(
 		// the cold pool never wakes for it.
 		subPhaseStart = time.Now()
 		var unassignedRoutedPartial bool
-		unassignedRoutedBeads, unassignedRoutedStores, unassignedRoutedStoreRefs, unassignedRoutedPartial = collectOpenUnassignedRoutedWork(cfg, store, rigStores, suspendedRigPaths, stderr)
+		unassignedRoutedBeads, unassignedRoutedStores, unassignedRoutedStoreRefs, unassignedRoutedPartial = collectOpenUnassignedRoutedWorkWithClassStores(cfg, workStore, rigWorkStores, suspendedRigPaths, sessionStore, stderr)
 		canonicalizeLegacyBoundUnassignedRoutedWork(cfg, unassignedRoutedBeads, unassignedRoutedStores, stderr)
 		repairControlDispatcherRoutesForStoreScope(cityPath, cfg, unassignedRoutedBeads, unassignedRoutedStores, unassignedRoutedStoreRefs, stderr)
 		// canonicalizeLegacyBound* above rewrote gc.routed_to on open ready
@@ -1238,6 +1313,8 @@ func collectAssignedWorkBeads(
 // gate and must not, by status alone, hold a session awake. It is keyed by
 // store ref + bead ID so a ready bead in one store cannot mark a blocked open
 // bead with the same ID in another store as ready (storeScopedBeadKey).
+//
+//nolint:unparam // compatibility wrapper keeps suspended-rig scope explicit for existing callers.
 func collectAssignedWorkBeadsWithStores(
 	cfg *config.City,
 	cityStore beads.Store,
@@ -1246,22 +1323,36 @@ func collectAssignedWorkBeadsWithStores(
 	sessionBeads *sessionBeadSnapshot,
 	caches ...*readyDemandCache,
 ) ([]beads.Bead, []beads.Store, []string, map[storeScopedBeadKey]bool, bool) {
+	return collectAssignedWorkBeadsWithClassStores(
+		cfg, cityStore, rigStores, suspendedRigPaths, sessionBeads, nil, caches...,
+	)
+}
+
+func collectAssignedWorkBeadsWithClassStores(
+	cfg *config.City,
+	cityWorkStore beads.Store,
+	rigWorkStores map[string]beads.Store,
+	suspendedRigPaths map[string]bool,
+	sessionBeads *sessionBeadSnapshot,
+	additionalCityStore beads.Store,
+	caches ...*readyDemandCache,
+) ([]beads.Bead, []beads.Store, []string, map[storeScopedBeadKey]bool, bool) {
 	cache := optionalReadyDemandCache(caches)
-	// Work arm of the reconciler frame: iterate the work-class candidate fan-out
-	// (city + non-suspended rigs). The city store carries the empty store-ref so
-	// the index-aligned workBeads/workStores slices stay per-bead aligned for the
-	// canonicalize/stamp writers. CachingStore-wrapped stores are used; creating
+	// Work arm of the reconciler frame: iterate the city Work store, the optional
+	// shared infrastructure store, and non-suspended rig Work stores. Each row's
+	// logical scope is resolved independently from its physical store so the
+	// index-aligned workBeads/workStores/storeRefs slices stay per-bead aligned for
+	// the canonicalize/stamp writers. CachingStore-wrapped stores are used; creating
 	// raw bdStoreForCity per rig spawns bd subprocesses on every tick, saturating
 	// dolt. On a single-store city this is the same store the sessions arm
 	// iterates (identity).
-	stores := coordClassStoreCandidates(cfg, cityStore, rigStores, suspendedRigPaths, "")
+	stores := coordClassStoreCandidates(cfg, cityWorkStore, rigWorkStores, suspendedRigPaths, "", additionalCityStore)
 
 	type storeAssignedWorkResult struct {
-		ref       string // store ref these beads came from (empty = city store)
 		beads     []beads.Bead
 		stores    []beads.Store
 		storeRefs []string
-		readyIDs  map[string]bool
+		readyIDs  map[storeScopedBeadKey]bool
 		errs      []error
 	}
 	results := make([]storeAssignedWorkResult, len(stores))
@@ -1275,18 +1366,18 @@ func collectAssignedWorkBeadsWithStores(
 			var resultStores []beads.Store
 			var resultStoreRefs []string
 			var errs []error
-			readyIDs := make(map[string]bool)
+			readyIDs := make(map[storeScopedBeadKey]bool)
 			seen := make(map[string]struct{})
 			// In-progress beads with an assignee (active work), plus stranded
 			// unassigned pool work that needs to be reopened. This pass runs
 			// across every store before any ready handoff probes, so already
 			// active work never waits behind unrelated ready scans.
 			if inProgress, err := listBothTiersForControllerDemand(source.store, beads.ListQuery{Status: "in_progress"}); err == nil {
-				appendInProgressWorkUnique(cfg, &result, &resultStores, &resultStoreRefs, readyIDs, inProgress, seen, source.store, source.ref)
+				appendInProgressWorkUnique(cfg, &result, &resultStores, &resultStoreRefs, readyIDs, inProgress, seen, source)
 			} else {
 				errs = append(errs, fmt.Errorf("List(in_progress): %w", err))
 				if beads.IsPartialResult(err) && len(inProgress) > 0 {
-					appendInProgressWorkUnique(cfg, &result, &resultStores, &resultStoreRefs, readyIDs, inProgress, seen, source.store, source.ref)
+					appendInProgressWorkUnique(cfg, &result, &resultStores, &resultStoreRefs, readyIDs, inProgress, seen, source)
 				}
 			}
 			// Open assigned molecule roots that count as wake demand. Whether an
@@ -1298,11 +1389,11 @@ func collectAssignedWorkBeadsWithStores(
 			// the backing store's raw --status=open filter, which excludes it —
 			// see listOpenForControllerDemandLive.
 			if openDemand, err := listOpenForControllerDemandLive(source.store); err == nil {
-				appendOpenAssignedMoleculeWorkUnique(&result, &resultStores, &resultStoreRefs, readyIDs, openDemand, seen, source.store, source.ref)
+				appendOpenAssignedMoleculeWorkUnique(cfg, &result, &resultStores, &resultStoreRefs, readyIDs, openDemand, seen, source)
 			} else {
 				errs = append(errs, fmt.Errorf("List(open, live demand): %w", err))
 				if beads.IsPartialResult(err) && len(openDemand) > 0 {
-					appendOpenAssignedMoleculeWorkUnique(&result, &resultStores, &resultStoreRefs, readyIDs, openDemand, seen, source.store, source.ref)
+					appendOpenAssignedMoleculeWorkUnique(cfg, &result, &resultStores, &resultStoreRefs, readyIDs, openDemand, seen, source)
 				}
 			}
 			// Open pool-routed beads that still carry an assignee. These are
@@ -1327,14 +1418,14 @@ func collectAssignedWorkBeadsWithStores(
 			// skipReadyAssignees note below), and releaseOrphanedPoolAssignments'
 			// own live re-read (liveWorkAssignmentStillReleasable) skips it.
 			if openRouted, err := listBothTiersForControllerDemand(source.store, beads.ListQuery{Status: "open"}); err == nil {
-				appendOpenRoutedWorkUnique(&result, &resultStores, &resultStoreRefs, openRouted, seen, source.store, source.ref)
+				appendOpenRoutedWorkUnique(cfg, &result, &resultStores, &resultStoreRefs, openRouted, seen, source)
 			} else {
 				errs = append(errs, fmt.Errorf("List(open): %w", err))
 				if beads.IsPartialResult(err) && len(openRouted) > 0 {
-					appendOpenRoutedWorkUnique(&result, &resultStores, &resultStoreRefs, openRouted, seen, source.store, source.ref)
+					appendOpenRoutedWorkUnique(cfg, &result, &resultStores, &resultStoreRefs, openRouted, seen, source)
 				}
 			}
-			results[idx] = storeAssignedWorkResult{ref: source.ref, beads: result, stores: resultStores, storeRefs: resultStoreRefs, readyIDs: readyIDs, errs: errs}
+			results[idx] = storeAssignedWorkResult{beads: result, stores: resultStores, storeRefs: resultStoreRefs, readyIDs: readyIDs, errs: errs}
 		}()
 	}
 	wg.Wait()
@@ -1347,14 +1438,28 @@ func collectAssignedWorkBeadsWithStores(
 	// rig bead for a ready city bead with the same ID. It is keyed by store ref
 	// + bead ID (storeScopedBeadKey).
 	readyAssigned := make(map[storeScopedBeadKey]bool)
+	authorityStores := make(map[storeScopedBeadKey]beads.Store)
+	appendAuthoritative := func(r storeAssignedWorkResult) {
+		for i, bead := range r.beads {
+			key := storeScopedBeadKey{StoreRef: r.storeRefs[i], ID: bead.ID}
+			if authority, exists := authorityStores[key]; exists {
+				if authority == r.stores[i] && r.readyIDs[key] {
+					readyAssigned[key] = true
+				}
+				continue
+			}
+			authorityStores[key] = r.stores[i]
+			result = append(result, bead)
+			resultStores = append(resultStores, r.stores[i])
+			resultStoreRefs = append(resultStoreRefs, r.storeRefs[i])
+			if r.readyIDs[key] {
+				readyAssigned[key] = true
+			}
+		}
+	}
 	var partial bool
 	for _, r := range results {
-		result = append(result, r.beads...)
-		resultStores = append(resultStores, r.stores...)
-		resultStoreRefs = append(resultStoreRefs, r.storeRefs...)
-		for id := range r.readyIDs {
-			readyAssigned[storeScopedBeadKey{StoreRef: r.ref, ID: id}] = true
-		}
+		appendAuthoritative(r)
 		for _, err := range r.errs {
 			log.Printf("collectAssignedWorkBeads: %v", err)
 			partial = true
@@ -1401,20 +1506,15 @@ func collectAssignedWorkBeadsWithStores(
 			var readyBeads []beads.Bead
 			var readyStores []beads.Store
 			var readyStoreRefs []string
-			readyIDs := make(map[string]bool)
+			readyIDs := make(map[storeScopedBeadKey]bool)
 			seen := make(map[string]struct{})
-			appendAssignedUnique(&readyBeads, &readyStores, &readyStoreRefs, readyIDs, ready, seen, source.store, source.ref)
-			readyResults[idx] = storeAssignedWorkResult{ref: source.ref, beads: readyBeads, stores: readyStores, storeRefs: readyStoreRefs, readyIDs: readyIDs, errs: errs}
+			appendAssignedUnique(cfg, &readyBeads, &readyStores, &readyStoreRefs, readyIDs, ready, seen, source)
+			readyResults[idx] = storeAssignedWorkResult{beads: readyBeads, stores: readyStores, storeRefs: readyStoreRefs, readyIDs: readyIDs, errs: errs}
 		}()
 	}
 	wg.Wait()
 	for _, r := range readyResults {
-		result = append(result, r.beads...)
-		resultStores = append(resultStores, r.stores...)
-		resultStoreRefs = append(resultStoreRefs, r.storeRefs...)
-		for id := range r.readyIDs {
-			readyAssigned[storeScopedBeadKey{StoreRef: r.ref, ID: id}] = true
-		}
+		appendAuthoritative(r)
 		for _, err := range r.errs {
 			log.Printf("collectAssignedWorkBeads: %v", err)
 			partial = true
@@ -1575,11 +1675,11 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 	}
 
 	type scaleStoreGroup struct {
-		store     beads.Store
+		candidate classStoreCandidate
 		storeKey  string
 		templates map[string]struct{}
 	}
-	groups := make(map[string]*scaleStoreGroup)
+	var groups []*scaleStoreGroup
 	var errs []error
 	var partialTemplates map[string]bool
 	for _, target := range targets {
@@ -1603,10 +1703,24 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 		if key == "" {
 			key = fmt.Sprintf("%p", target.store)
 		}
-		group := groups[key]
+		candidateRef := strings.TrimSpace(target.candidateRef)
+		if candidateRef == "" {
+			candidateRef = key
+		}
+		var group *scaleStoreGroup
+		for _, existing := range groups {
+			if existing.candidate.store == target.store && existing.candidate.ref == candidateRef && existing.candidate.role == target.role && existing.storeKey == key {
+				group = existing
+				break
+			}
+		}
 		if group == nil {
-			group = &scaleStoreGroup{store: target.store, storeKey: key, templates: make(map[string]struct{})}
-			groups[key] = group
+			group = &scaleStoreGroup{
+				candidate: classStoreCandidate{store: target.store, ref: candidateRef, role: target.role},
+				storeKey:  key,
+				templates: make(map[string]struct{}),
+			}
+			groups = append(groups, group)
 		}
 		group.templates[template] = struct{}{}
 	}
@@ -1621,21 +1735,29 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 	// probe no longer cold-gated, that double-count would be a persistent
 	// warm condition rather than a one-tick wake overshoot, so dedup by ID.
 	countedBeads := make(map[string]map[string]struct{})
-	for key, group := range groups {
+	for _, group := range groups {
 		// Ready()/CachedReady() iteration surfaces actionable work
 		// matched against gc.routed_to/gc.run_target. Formula orders that
 		// should wake pools must create an actionable root, such as a
 		// vapor/root-only wisp. Molecule containers and formula step
 		// beads remain hidden by readyExcludeTypes.
-		ready, readyErr := cache.controllerDemandReady(group.store)
+		ready, readyErr := cache.controllerDemandReady(group.candidate.store)
 		if readyErr != nil {
-			errs = append(errs, fmt.Errorf("default scale_check %s templates=%s: Ready(): %w", key, strings.Join(sortedStringSet(group.templates), ","), readyErr))
+			errs = append(errs, fmt.Errorf("default scale_check %s templates=%s: Ready(): %w", group.storeKey, strings.Join(sortedStringSet(group.templates), ","), readyErr))
 			partialTemplates = markScaleCheckPartialSet(partialTemplates, group.templates)
 			if !beads.IsPartialResult(readyErr) {
 				ready = nil
 			}
 		}
 		for _, b := range ready {
+			logicalStoreRef := group.storeKey
+			if group.candidate.role != classStoreRoleAll {
+				canonicalRef, accepted := canonicalStoreRefForCandidate(cfg, b, group.candidate)
+				if !accepted {
+					continue
+				}
+				logicalStoreRef = canonicalRef
+			}
 			if strings.TrimSpace(b.Assignee) != "" {
 				continue
 			}
@@ -1675,7 +1797,7 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 			if entry.StoreRefs == nil {
 				entry.StoreRefs = make(map[string]string)
 			}
-			entry.StoreRefs[b.ID] = group.storeKey
+			entry.StoreRefs[b.ID] = logicalStoreRef
 			if parentSID := strings.TrimSpace(b.Metadata[beadmeta.BrainParentSIDMetadataKey]); parentSID != "" {
 				if entry.ParentSIDs == nil {
 					entry.ParentSIDs = make(map[string]string)
@@ -2308,24 +2430,32 @@ func mergeNamedSessionDemand(poolDesired map[string]int, namedDemand map[string]
 	}
 }
 
-func appendInProgressWorkUnique(cfg *config.City, dst *[]beads.Bead, stores *[]beads.Store, storeRefs *[]string, readyIDs map[string]bool, beadList []beads.Bead, seen map[string]struct{}, store beads.Store, storeRef string) {
+func appendInProgressWorkUnique(cfg *config.City, dst *[]beads.Bead, stores *[]beads.Store, storeRefs *[]string, readyIDs map[storeScopedBeadKey]bool, beadList []beads.Bead, seen map[string]struct{}, candidate classStoreCandidate) {
 	for _, b := range beadList {
 		if strings.TrimSpace(b.Assignee) == "" && !isRecoverableUnassignedInProgressPoolWork(cfg, b) {
 			continue
 		}
-		if appendWorkUnique(dst, stores, storeRefs, b, seen, store, storeRef) {
-			markReadyAssigned(readyIDs, b)
+		storeRef, ok := assignedStoreRefForCandidate(cfg, b, candidate)
+		if !ok {
+			continue
+		}
+		if appendWorkUnique(dst, stores, storeRefs, b, seen, candidate.store, storeRef) {
+			markReadyAssigned(readyIDs, b, storeRef)
 		}
 	}
 }
 
-func appendAssignedUnique(dst *[]beads.Bead, stores *[]beads.Store, storeRefs *[]string, readyIDs map[string]bool, beadList []beads.Bead, seen map[string]struct{}, store beads.Store, storeRef string) {
+func appendAssignedUnique(cfg *config.City, dst *[]beads.Bead, stores *[]beads.Store, storeRefs *[]string, readyIDs map[storeScopedBeadKey]bool, beadList []beads.Bead, seen map[string]struct{}, candidate classStoreCandidate) {
 	for _, b := range beadList {
 		if strings.TrimSpace(b.Assignee) == "" {
 			continue
 		}
-		if appendWorkUnique(dst, stores, storeRefs, b, seen, store, storeRef) {
-			markReadyAssigned(readyIDs, b)
+		storeRef, ok := assignedStoreRefForCandidate(cfg, b, candidate)
+		if !ok {
+			continue
+		}
+		if appendWorkUnique(dst, stores, storeRefs, b, seen, candidate.store, storeRef) {
+			markReadyAssigned(readyIDs, b, storeRef)
 		}
 	}
 }
@@ -2336,13 +2466,17 @@ func appendAssignedUnique(dst *[]beads.Bead, stores *[]beads.Store, storeRefs *[
 // for on-demand named sessions such as the Gas Town refinery patrol — so these
 // beads contribute to readyIDs (their assigned turn is genuinely actionable),
 // unlike the open-routed orphan-release pass.
-func appendOpenAssignedMoleculeWorkUnique(dst *[]beads.Bead, stores *[]beads.Store, storeRefs *[]string, readyIDs map[string]bool, beadList []beads.Bead, seen map[string]struct{}, store beads.Store, storeRef string) {
+func appendOpenAssignedMoleculeWorkUnique(cfg *config.City, dst *[]beads.Bead, stores *[]beads.Store, storeRefs *[]string, readyIDs map[storeScopedBeadKey]bool, beadList []beads.Bead, seen map[string]struct{}, candidate classStoreCandidate) {
 	for _, b := range beadList {
 		if !isOpenAssignedMoleculeWork(b) {
 			continue
 		}
-		if appendWorkUnique(dst, stores, storeRefs, b, seen, store, storeRef) {
-			markReadyAssigned(readyIDs, b)
+		storeRef, ok := assignedStoreRefForCandidate(cfg, b, candidate)
+		if !ok {
+			continue
+		}
+		if appendWorkUnique(dst, stores, storeRefs, b, seen, candidate.store, storeRef) {
+			markReadyAssigned(readyIDs, b, storeRef)
 		}
 	}
 }
@@ -2351,11 +2485,11 @@ func appendOpenAssignedMoleculeWorkUnique(dst *[]beads.Bead, stores *[]beads.Sto
 // by the assigned-work passes that establish real readiness (in-progress,
 // store-Ready()/deps, and assigned molecule roots) — never by the open-routed
 // orphan-release pass, whose beads have not passed any readiness gate.
-func markReadyAssigned(readyIDs map[string]bool, b beads.Bead) {
+func markReadyAssigned(readyIDs map[storeScopedBeadKey]bool, b beads.Bead, storeRef string) {
 	if readyIDs == nil {
 		return
 	}
-	readyIDs[b.ID] = true
+	readyIDs[storeScopedBeadKey{StoreRef: storeRef, ID: b.ID}] = true
 }
 
 func isOpenAssignedMoleculeWork(b beads.Bead) bool {
@@ -2374,7 +2508,7 @@ func isOpenAssignedMoleculeWork(b beads.Bead) bool {
 // dead session (graph.v2 wisps where the root depends on the finalize
 // step, so the root never enters ready and the step assignee remains a
 // long-form dead-session identity invisible to readyAssignedWorkAssignees).
-func appendOpenRoutedWorkUnique(dst *[]beads.Bead, stores *[]beads.Store, storeRefs *[]string, beadList []beads.Bead, seen map[string]struct{}, store beads.Store, storeRef string) {
+func appendOpenRoutedWorkUnique(cfg *config.City, dst *[]beads.Bead, stores *[]beads.Store, storeRefs *[]string, beadList []beads.Bead, seen map[string]struct{}, candidate classStoreCandidate) {
 	for _, b := range beadList {
 		if strings.TrimSpace(b.Assignee) == "" {
 			continue
@@ -2382,7 +2516,11 @@ func appendOpenRoutedWorkUnique(dst *[]beads.Bead, stores *[]beads.Store, storeR
 		if routedToOrLegacyWorkflowTarget(b) == "" {
 			continue
 		}
-		appendWorkUnique(dst, stores, storeRefs, b, seen, store, storeRef)
+		storeRef, ok := assignedStoreRefForCandidate(cfg, b, candidate)
+		if !ok {
+			continue
+		}
+		appendWorkUnique(dst, stores, storeRefs, b, seen, candidate.store, storeRef)
 	}
 }
 
@@ -4466,32 +4604,34 @@ func canonicalizeLegacyBoundUnassignedRoutedWork(cfg *config.City, workBeads []b
 // read per store per tick so the raw-status filter runs, which costs a
 // backing-store round trip the cached read did not — the accepted tradeoff for
 // not counting blocked work as demand.
+//
+//nolint:unparam // compatibility wrapper keeps suspended-rig scope explicit for existing callers.
 func collectOpenUnassignedRoutedWork(cfg *config.City, store beads.Store, rigStores map[string]beads.Store, suspendedRigPaths map[string]bool, stderr io.Writer) ([]beads.Bead, []beads.Store, []string, bool) {
+	return collectOpenUnassignedRoutedWorkWithClassStores(
+		cfg, store, rigStores, suspendedRigPaths, nil, stderr,
+	)
+}
+
+func collectOpenUnassignedRoutedWorkWithClassStores(cfg *config.City, store beads.Store, rigStores map[string]beads.Store, suspendedRigPaths map[string]bool, additionalCityStore beads.Store, stderr io.Writer) ([]beads.Bead, []beads.Store, []string, bool) {
 	if cfg == nil {
 		return nil, nil, nil, false
 	}
-	// Work arm (unassigned-routed re-home scan): iterate the work-class
-	// candidate fan-out, labeling the city store "city" for the diagnostic
-	// ref. Identity on a single-store city.
-	stores := coordClassStoreCandidates(cfg, store, rigStores, suspendedRigPaths, "city")
+	// Work arm (unassigned-routed re-home scan): iterate city Work, the optional
+	// shared infrastructure store, and rig Work stores. Physical candidates are
+	// kept separate from each row's canonical city/rig scope. Identity on a
+	// single-store city.
+	stores := coordClassStoreCandidates(cfg, store, rigStores, suspendedRigPaths, "city", additionalCityStore)
 
 	var workBeads []beads.Bead
 	var workStores []beads.Store
 	var workStoreRefs []string
 	var partial bool
 	seen := make(map[storeScopedBeadKey]struct{})
-	for sourceIndex, source := range stores {
+	for _, source := range stores {
 		if source.store == nil {
 			continue
 		}
-		storeRef := "rig:" + strings.TrimSpace(source.ref)
-		if sourceIndex == 0 {
-			cityName := strings.TrimSpace(cfg.Workspace.Name)
-			if cityName == "" {
-				cityName = "city"
-			}
-			storeRef = "city:" + cityName
-		}
+		diagnosticRef, _ := physicalCandidateStoreRef(cfg, source.ref)
 		// Live so the backing store's raw --status=open filter excludes blocked/
 		// deferred work: this unassigned-routed set feeds openControlDispatcherDemand
 		// and the route-repair passes, and mapBdStatus would otherwise collapse a
@@ -4513,7 +4653,7 @@ func collectOpenUnassignedRoutedWork(cfg *config.City, store beads.Store, rigSto
 			// so skip only this store's population.
 			partial = true
 			if !beads.IsPartialResult(err) {
-				fmt.Fprintf(stderr, "collectOpenUnassignedRoutedWork: %s: List(open): %v\n", storeRef, err) //nolint:errcheck
+				fmt.Fprintf(stderr, "collectOpenUnassignedRoutedWork: %s: List(open): %v\n", diagnosticRef, err) //nolint:errcheck
 				continue
 			}
 		}
@@ -4524,7 +4664,8 @@ func collectOpenUnassignedRoutedWork(cfg *config.City, store beads.Store, rigSto
 			if strings.TrimSpace(b.Metadata[beadmeta.RoutedToMetadataKey]) == "" {
 				continue
 			}
-			if !rootStoreRefMatchesCandidate(b.Metadata[beadmeta.RootStoreRefMetadataKey], storeRef) {
+			storeRef, accepted := canonicalStoreRefForCandidate(cfg, b, source)
+			if !accepted {
 				continue
 			}
 			key := storeScopedBeadKey{StoreRef: storeRef, ID: b.ID}
@@ -4617,6 +4758,88 @@ func normalizeDemandStoreRef(storeRef string) string {
 	default:
 		return storeRef
 	}
+}
+
+func classStoreCandidateAccepts(candidate classStoreCandidate, bead beads.Bead) bool {
+	class := coordclass.Classify(bead)
+	switch candidate.role {
+	case classStoreRoleWork:
+		return class == coordclass.ClassWork
+	case classStoreRoleInfrastructure:
+		return class != coordclass.ClassWork
+	default:
+		return true
+	}
+}
+
+// canonicalStoreRefForCandidate separates a physical store handle from the
+// logical workflow scope of the row it returned. A split infrastructure
+// binding contains city- and rig-owned graph rows together, so its row scope
+// must come from gc.root_store_ref; a Work or legacy all-class candidate keeps
+// the physical city/rig scope and rejects a contradictory canonical row.
+func canonicalStoreRefForCandidate(cfg *config.City, bead beads.Bead, candidate classStoreCandidate) (string, bool) {
+	if !classStoreCandidateAccepts(candidate, bead) {
+		return "", false
+	}
+	rootRef := strings.TrimSpace(bead.Metadata[beadmeta.RootStoreRefMetadataKey])
+	if candidate.role == classStoreRoleInfrastructure && rootRef != "" {
+		return validateCanonicalCandidateStoreRef(cfg, rootRef)
+	}
+	fallback, ok := physicalCandidateStoreRef(cfg, candidate.ref)
+	if !ok {
+		return "", false
+	}
+	if rootRef != "" && !rootStoreRefMatchesCandidate(rootRef, fallback) {
+		return "", false
+	}
+	return fallback, true
+}
+
+func physicalCandidateStoreRef(cfg *config.City, storeRef string) (string, bool) {
+	storeRef = strings.TrimSpace(storeRef)
+	cityName := ""
+	if cfg != nil {
+		cityName = strings.TrimSpace(cfg.Workspace.Name)
+	}
+	switch storeRef {
+	case "", "city":
+		if cityName == "" {
+			return "city", true
+		}
+		return "city:" + cityName, true
+	default:
+		if canonical, ok := validateCanonicalCandidateStoreRef(cfg, storeRef); ok {
+			return canonical, true
+		}
+		if strings.Contains(storeRef, ":") {
+			return "", false
+		}
+		return "rig:" + storeRef, true
+	}
+}
+
+func validateCanonicalCandidateStoreRef(cfg *config.City, storeRef string) (string, bool) {
+	storeRef = strings.TrimSpace(storeRef)
+	if cfg != nil && strings.TrimSpace(cfg.Workspace.Name) != "" {
+		return canonicalContinuationClaimStoreRef(cfg.Workspace.Name, storeRef)
+	}
+	if _, ok := storeref.ScopeRigContext(storeRef); !ok {
+		return "", false
+	}
+	return storeRef, true
+}
+
+func assignedStoreRefForCandidate(cfg *config.City, bead beads.Bead, candidate classStoreCandidate) (string, bool) {
+	canonical, ok := canonicalStoreRefForCandidate(cfg, bead, candidate)
+	if !ok {
+		return "", false
+	}
+	rigContext, scoped := storeref.ScopeRigContext(canonical)
+	if !scoped {
+		// The only accepted noncanonical fallback is the legacy city shorthand.
+		return "", canonical == "city"
+	}
+	return rigContext, true
 }
 
 // rootStoreRefMatchesCandidate filters duplicate views of one physical graph

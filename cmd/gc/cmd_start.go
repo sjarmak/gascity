@@ -54,6 +54,27 @@ func standaloneBuildAgentsFnWithSessionBeads(
 	}
 }
 
+func standaloneBuildAgentsFnWithClassStores(
+	cityName, cityPath string,
+	beaconTime time.Time,
+	stderr io.Writer,
+) desiredStateBuildWithClassStoresFn {
+	return func(
+		c *config.City,
+		currentSP runtime.Provider,
+		sessionStore beads.Store,
+		workStore beads.Store,
+		rigWorkStores map[string]beads.Store,
+		sessionBeads *sessionBeadSnapshot,
+		trace *sessionReconcilerTraceCycle,
+	) DesiredStateResult {
+		return buildDesiredStateWithClassStores(
+			cityName, cityPath, beaconTime, c, currentSP,
+			sessionStore, workStore, rigWorkStores, sessionBeads, trace, stderr,
+		)
+	}
+}
+
 // computeSuspendedNames builds a set of session names for agents marked
 // suspended in the config or runtime state, or belonging to suspended
 // rigs. Also includes all agents when the city itself is suspended.
@@ -909,6 +930,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		return buildDesiredState(cityName, cityPath, beaconTime, c, currentSP, store, stderr)
 	}
 	buildAgentsWithSessionBeads := standaloneBuildAgentsFnWithSessionBeads(cityName, cityPath, beaconTime, stderr)
+	buildAgentsWithClassStores := standaloneBuildAgentsFnWithClassStores(cityName, cityPath, beaconTime, stderr)
 
 	recorder := events.Discard
 	var eventProv events.Provider // nil when events disabled or FileRecorder fails
@@ -937,7 +959,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		poolDeathHandlers := computePoolDeathHandlers(cfg, cityName, cityPath, sp, stderr)
 		watchTargets := config.WatchTargets(prov, cfg, cityPath)
 		configRev := config.Revision(fsys.OSFS{}, prov, cfg, cityPath)
-		return runController(cityPath, tomlPath, cfg, configRev, buildAgents, buildAgentsWithSessionBeads, sp,
+		return runController(cityPath, tomlPath, cfg, configRev, buildAgents, buildAgentsWithSessionBeads, buildAgentsWithClassStores, sp,
 			newDrainOps(sp), poolSessions, poolDeathHandlers, watchTargets, recorder, eventProv, stdout, stderr)
 	}
 
@@ -972,20 +994,10 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	}
 	rigStores := buildStandaloneRigStores(cfg, cityPath, stderr)
 
-	// Route the reconcile cascade's SESSION arm through the session coordination-class
-	// store so a [beads.classes.sessions] relocation reaches standalone start the same
-	// way it reaches the running controller — "same code path as the daemon"
-	// (CityRuntime.buildDesiredState / controlDispatcherTick, city_runtime.go), which
-	// passes sessionsBeadStore().Store as the LEADING store of
-	// buildDesiredStateWithSessionBeads and to loadSessionBeadSnapshot /
-	// syncSessionBeadsWithSnapshotAndRigStores / reconcileSessionBeadsAtPathWithNamedDemand,
-	// with rigStores as the per-rig WORK tail. That leading store is
-	// agentBuildParams.beadStore (creates/updates session beads) and the
-	// collectAllOpenSessionInfos "city" arm; it also still carries the city-work "city"
-	// arm (collectAssignedWorkBeadsWithStores / cold-wake scale-check probes) — a dual
-	// role the daemon routes to the session store today too, tracked as a shared E2
-	// two-store split. Identity to oneShotStore at the single-store backend, so
-	// byte-identical today. releaseOrphanedPoolAssignmentsWhenSnapshotsComplete keeps
+	// Route the reconcile cascade's session arm through the session-class store,
+	// while desired-state demand reads use oneShotStore as the city Work ledger and
+	// rigStores as the rig Work tail. Identity at the single-store backend preserves
+	// legacy behavior. releaseOrphanedPoolAssignmentsWhenSnapshotsComplete keeps
 	// the plain oneShotStore, matching the daemon's cityBeadStore() there (its lone
 	// liveOpenSessionAssignmentExists session read is a shared work-release-boundary
 	// follow-up).
@@ -999,7 +1011,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		sessionBeads = nil
 		sessionQueryPartial = true
 	}
-	dsResult := buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, sessStore, rigStores, sessionBeads, nil, stderr)
+	dsResult := buildDesiredStateWithClassStores(cityName, cityPath, beaconTime, cfg, sp, sessStore, oneShotStore, rigStores, sessionBeads, nil, stderr)
 	dsResult.SessionQueryPartial = dsResult.SessionQueryPartial || sessionQueryPartial
 	ds := dsResult.State
 	cfgNames := configuredSessionNamesWithSnapshot(cfg, cityName, sessionBeads)
@@ -1014,7 +1026,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		// Standalone start has no follow-up patrol tick, so after reopening
 		// orphaned pool work we must immediately rebuild demand and sync once
 		// more so replacement session beads can be materialized in this run.
-		dsResult = buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, sessStore, rigStores, sessionBeads, nil, stderr)
+		dsResult = buildDesiredStateWithClassStores(cityName, cityPath, beaconTime, cfg, sp, sessStore, oneShotStore, rigStores, sessionBeads, nil, stderr)
 		ds = dsResult.State
 		cfgNames = configuredSessionNamesWithSnapshot(cfg, cityName, sessionBeads)
 		_, sessionBeads = syncSessionBeadsWithSnapshotAndRigStores(
@@ -1055,7 +1067,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		fmt.Fprintf(stderr, "gc start: loading session beads: %v\n", err) //nolint:errcheck
 		sessionBeads = nil
 	}
-	dsResult = buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, sessStore, rigStores, sessionBeads, nil, stderr)
+	dsResult = buildDesiredStateWithClassStores(cityName, cityPath, beaconTime, cfg, sp, sessStore, oneShotStore, rigStores, sessionBeads, nil, stderr)
 	ds = dsResult.State
 	cfgNames = configuredSessionNamesWithSnapshot(cfg, cityName, sessionBeads)
 	syncSessionBeadsWithSnapshotAndRigStores(

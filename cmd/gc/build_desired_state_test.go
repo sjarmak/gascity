@@ -897,6 +897,42 @@ func TestDefaultScaleCheckDemandCarriesTriggerBeadID(t *testing.T) {
 	}
 }
 
+func TestDefaultScaleCheckDemandRoleAllPreservesLegacyCrossStoreWake(t *testing.T) {
+	const template = "rig-A/planner"
+	store := beads.NewMemStore()
+	work, err := store.Create(beads.Bead{
+		Title:  "legacy cross-store routed work",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.RoutedToMetadataKey:     template,
+			beadmeta.RootStoreRefMetadataKey: "rig:rig-A",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create routed bead: %v", err)
+	}
+
+	counts, demand, partialTemplates, errs := defaultScaleCheckCountsAndDemand(
+		&config.City{Workspace: config.Workspace{Name: "test-city"}},
+		[]defaultScaleCheckTarget{{
+			template: template,
+			storeKey: "city",
+			store:    store,
+			role:     classStoreRoleAll,
+		}},
+	)
+	if len(errs) != 0 || len(partialTemplates) != 0 {
+		t.Fatalf("legacy role-all demand errors/partial = %v / %v", errs, partialTemplates)
+	}
+	if got := counts[template]; got != 1 {
+		t.Fatalf("role-all cross-store count = %d, want 1", got)
+	}
+	if got := demand[template].StoreRefs[work.ID]; got != "city" {
+		t.Fatalf("role-all store ref = %q, want legacy label city", got)
+	}
+}
+
 // TestDefaultScaleCheckCountsAndDemandNormalizesInstanceSuffixedRouteTarget
 // reproduces a writer that stamps gc.routed_to with an instance-suffixed pool
 // identity directly (e.g. `bd update --set-metadata gc.routed_to=hello-world/polecat-1`),

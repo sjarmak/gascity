@@ -963,20 +963,36 @@ func compactSessionAssignmentIdentifiers(raw []string) []string {
 type classStoreCandidate struct {
 	store beads.Store
 	ref   string
+	role  classStoreRole
 }
 
-// coordClassStoreCandidates builds the index-aligned per-class candidate
-// fan-out the controller reconciler iterates each tick: the city store first
-// (labeled with cityRef), then every non-suspended configured rig store in
-// cfg.Rigs order. It is the single source of truth for the "city + rigs"
-// candidate list that the session-iteration arm and the work-collection arms
-// each build; both arms feed the same store today (identity), but expressing
-// them through one named builder keeps the work-vs-session split structurally
-// explicit and the workBeads/workStores slices per-bead aligned. cityRef
-// distinguishes the assigned-work arm (which records the city store under the
-// empty ref) from the session and unassigned arms (which label it "city").
-func coordClassStoreCandidates(cfg *config.City, cityStore beads.Store, rigStores map[string]beads.Store, suspendedRigPaths map[string]bool, cityRef string) []classStoreCandidate {
-	candidates := []classStoreCandidate{{store: cityStore, ref: cityRef}}
+type classStoreRole uint8
+
+const (
+	classStoreRoleAll classStoreRole = iota
+	classStoreRoleWork
+	classStoreRoleInfrastructure
+)
+
+// coordClassStoreCandidates builds the physical candidate fan-out used by the
+// work collectors: an optional authoritative shared infrastructure binding,
+// city Work, then non-suspended rig Work stores in config order. Roles keep
+// physical grouping separate from each row's logical city/rig scope. The
+// infrastructure binding leads so a drifted retained Work copy cannot win a
+// same-ID collision. Duplicate handles are removed so a single-store topology
+// remains byte-identical. cityRef is the legacy physical city label used when
+// all classes still share one store.
+func coordClassStoreCandidates(cfg *config.City, cityStore beads.Store, rigStores map[string]beads.Store, suspendedRigPaths map[string]bool, cityRef string, additionalCityStores ...beads.Store) []classStoreCandidate {
+	additionalCityStore := firstDistinctClassStore(cityStore, additionalCityStores)
+	workRole := classStoreRoleAll
+	if additionalCityStore != nil {
+		workRole = classStoreRoleWork
+	}
+	var candidates []classStoreCandidate
+	if additionalCityStore != nil {
+		candidates = append(candidates, classStoreCandidate{store: additionalCityStore, ref: cityRef, role: classStoreRoleInfrastructure})
+	}
+	candidates = append(candidates, classStoreCandidate{store: cityStore, ref: cityRef, role: workRole})
 	if cfg == nil {
 		return candidates
 	}
@@ -985,10 +1001,19 @@ func coordClassStoreCandidates(cfg *config.City, cityStore beads.Store, rigStore
 			continue
 		}
 		if s, ok := rigStores[rig.Name]; ok {
-			candidates = append(candidates, classStoreCandidate{store: s, ref: rig.Name})
+			candidates = append(candidates, classStoreCandidate{store: s, ref: "rig:" + rig.Name, role: workRole})
 		}
 	}
 	return candidates
+}
+
+func firstDistinctClassStore(cityStore beads.Store, stores []beads.Store) beads.Store {
+	for _, store := range stores {
+		if store != nil && store != cityStore {
+			return store
+		}
+	}
+	return nil
 }
 
 // workAssignmentStores is the work-class candidate builder for the
