@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -186,14 +187,19 @@ func mailDeliveryWorkerInvoker(cityPath string, cfg *config.City, sessStore bead
 		result, err := handle.Nudge(ctx, worker.NudgeRequest{
 			Text: "1 actionable mail delivery; run gc mail inbox", Delivery: worker.NudgeDeliveryImmediate,
 			Source: "mail-delivery", Wake: worker.NudgeWakeLiveOnly, EffectID: attempt.NudgeID,
+			CommitBoundary: worker.NudgeCommitBoundaryDestinationAtomic,
 		})
 		if err != nil {
+			if errors.Is(err, runtime.ErrStableNudgeRetrySafe) {
+				return maildelivery.TransportReceipt{}, fmt.Errorf("%w: %w", maildelivery.ErrTransportRetrySafe, err)
+			}
 			return maildelivery.TransportReceipt{}, err
 		}
 		if !result.Delivered || result.Receipt == nil {
 			return maildelivery.TransportReceipt{}, fmt.Errorf("provider returned no typed acceptance receipt")
 		}
-		if err := result.Receipt.Validate(); err != nil || result.Receipt.EffectID != attempt.NudgeID || result.Receipt.TargetSessionRef != info.ID {
+		if err := result.Receipt.Validate(); err != nil || result.Receipt.EffectID != attempt.NudgeID || result.Receipt.TargetSessionRef != info.ID ||
+			result.Receipt.CommitBoundary != worker.NudgeCommitBoundaryDestinationAtomic {
 			return maildelivery.TransportReceipt{}, fmt.Errorf("provider acceptance receipt does not match exact mail delivery target")
 		}
 		freshFence, err := resolver.ResolveMailActivationFence(ctx, "")
@@ -202,8 +208,8 @@ func mailDeliveryWorkerInvoker(cityPath string, cfg *config.City, sessStore bead
 		}
 		return maildelivery.TransportReceipt{
 			Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
-			State: maildelivery.EffectCommitted, CommitBoundary: maildelivery.TransportCommitBoundaryProviderReturn,
-			ReceiptRef: "provider-acceptance:" + result.Receipt.ReceiptSHA256, ReceiptSHA256: result.Receipt.ReceiptSHA256,
+			State: maildelivery.EffectCommitted, CommitBoundary: maildelivery.TransportCommitBoundaryDestinationAtomic,
+			ReceiptRef: "destination:" + result.Receipt.DestinationRef, ReceiptSHA256: result.Receipt.DestinationReceiptSHA256,
 			RecordedAt: result.Receipt.AcceptedAt,
 		}, nil
 	}
@@ -235,9 +241,8 @@ func mailDeliveryWorkerPreflight(cityPath string, cfg *config.City, sessStore be
 }
 
 func requireExactMailDeliveryReceiptHandle(handle worker.Handle) error {
-	sessionHandle, ok := handle.(*worker.SessionHandle)
-	if !ok || sessionHandle == nil {
-		return fmt.Errorf("mail delivery requires a bead-backed session handle with an exact session acceptance receipt")
+	if !worker.HasExactSessionReceipt(handle) || !worker.SupportsDestinationAtomicNudge(handle) {
+		return fmt.Errorf("mail delivery requires a bead-backed session handle with destination-atomic stable-nudge support")
 	}
 	return nil
 }

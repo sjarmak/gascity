@@ -242,6 +242,9 @@ func (h *RuntimeHandle) Interrupt(ctx context.Context, _ InterruptRequest) (err 
 // Like Message, it is permanently excluded from invocation telemetry;
 // see SessionHandle.recordInvocationTelemetry.
 func (h *RuntimeHandle) Nudge(ctx context.Context, req NudgeRequest) (result NudgeResult, err error) {
+	if req.CommitBoundary == NudgeCommitBoundaryDestinationAtomic {
+		return NudgeResult{}, runtime.ErrStableNudgeUnsupported
+	}
 	event := h.beginOperationEvent(ctx, workerOperationNudge)
 	defer func() {
 		// Receipt construction happens after provider success. A construction
@@ -292,6 +295,9 @@ func (h *RuntimeHandle) Nudge(ctx context.Context, req NudgeRequest) (result Nud
 		return NudgeResult{}, err
 	}
 }
+
+// SupportsStableNudge is false because runtime-only handles lack exact session identity.
+func (h *RuntimeHandle) SupportsStableNudge() bool { return false }
 
 // Transcript reports unavailable because runtime-only handles have no transcript adapter.
 func (h *RuntimeHandle) Transcript(context.Context, TranscriptRequest) (*TranscriptResult, error) {

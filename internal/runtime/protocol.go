@@ -53,6 +53,9 @@ const (
 	// requires proc.exec); without it, the controller uses the welded `start` op
 	// (compat). It gates TransportCapabilities.SeparableLaunch.
 	ProtocolCapabilityProvision = "proc.provision"
+	// ProtocolCapabilityStableNudge declares destination-atomic effect and
+	// receipt persistence keyed by the caller's stable nudge ID.
+	ProtocolCapabilityStableNudge = "effect.nudge-idempotent"
 )
 
 // ProtocolInfo is the parsed `protocol` handshake response. The zero
