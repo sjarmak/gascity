@@ -790,7 +790,14 @@ func sortMailByPriority(messages []mail.Message) []mail.Message {
 // (renderMailCheckFromAPI and doMailCheckTargetWithFormat) surface higher-
 // priority unread first.
 func formatInjectOutput(messages []mail.Message) string {
-	messages = sortMailByPriority(messages)
+	return formatOrderedInjectOutput(sortMailByPriority(messages))
+}
+
+// formatOrderedInjectOutput formats messages in caller-supplied order. The
+// ordinary mail-check path passes priority/arrival order through
+// formatInjectOutput; SessionStart passes priority/newest order so its clamped
+// preview cannot be pinned forever by an old unread backlog.
+func formatOrderedInjectOutput(messages []mail.Message) string {
 	var sb strings.Builder
 	sb.WriteString("<system-reminder>\n")
 	fmt.Fprintf(&sb, "You have %d unread message(s).\n\n", len(messages))
