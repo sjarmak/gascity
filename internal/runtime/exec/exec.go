@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -623,6 +624,47 @@ func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
 		return err
 	}
 	return p.nudgeOp(name, content)
+}
+
+// SupportsStableNudge reports the adapter's declared stable-effect capability.
+func (p *Provider) SupportsStableNudge() bool {
+	return p.handshakeCapability(runtime.ProtocolCapabilityStableNudge)
+}
+
+// NudgeStable invokes the capability-gated destination-atomic operation.
+func (p *Provider) NudgeStable(ctx context.Context, name, effectID string, content []runtime.ContentBlock) (runtime.StableNudgeReceipt, error) {
+	if err := runtime.ValidateStableNudgeEffectID(effectID); err != nil {
+		return runtime.StableNudgeReceipt{}, err
+	}
+	if !p.SupportsStableNudge() {
+		return runtime.StableNudgeReceipt{}, runtime.ErrStableNudgeUnsupported
+	}
+	request := runtime.StableNudgeRequest{Version: 1, EffectID: effectID, Content: content}
+	data, err := json.Marshal(request)
+	if err != nil {
+		return runtime.StableNudgeReceipt{}, err
+	}
+	out, err := p.runWithContext(ctx, p.timeout, data, "nudge-stable", name, effectID)
+	if err != nil {
+		return runtime.StableNudgeReceipt{}, fmt.Errorf("%w: %w", runtime.ErrStableNudgeRetrySafe, err)
+	}
+	decoder := json.NewDecoder(strings.NewReader(out))
+	decoder.DisallowUnknownFields()
+	var receipt runtime.StableNudgeReceipt
+	if err := decoder.Decode(&receipt); err != nil {
+		return runtime.StableNudgeReceipt{}, fmt.Errorf("malformed stable nudge response: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return runtime.StableNudgeReceipt{}, fmt.Errorf("malformed stable nudge response: trailing JSON")
+	}
+	contentHash, hashErr := runtime.StableNudgeContentSHA256(content)
+	if hashErr != nil {
+		return runtime.StableNudgeReceipt{}, hashErr
+	}
+	if validateErr := receipt.Validate(); validateErr != nil || receipt.EffectID != effectID || receipt.TargetRuntimeName != name || receipt.ContentSHA256 != contentHash {
+		return runtime.StableNudgeReceipt{}, fmt.Errorf("%w: destination receipt differs from request", runtime.ErrStableNudgeConflict)
+	}
+	return receipt, nil
 }
 
 // SetMeta stores a key-value pair: script set-meta <name> <key>

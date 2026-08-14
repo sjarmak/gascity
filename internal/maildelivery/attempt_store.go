@@ -27,6 +27,9 @@ const (
 // is owned by another caller and canonical state was left unchanged.
 var ErrTransportInvocationInProgress = errors.New("mail delivery transport invocation is in progress")
 
+// ErrTransportRetrySafe permits only an identical stable-effect retry.
+var ErrTransportRetrySafe = errors.New("mail delivery transport invocation is safe to retry with the same effect ID")
+
 // TransportState is the closed state of one stable external-effect attempt.
 type TransportState string
 
@@ -73,6 +76,7 @@ type TransportAttempt struct {
 	State                    TransportState   `json:"state"`
 	InvocationStartedAt      time.Time        `json:"invocation_started_at,omitempty"`
 	InvocationLeaseUntil     time.Time        `json:"invocation_lease_until,omitempty"`
+	InvocationCount          uint64           `json:"invocation_count"`
 	Receipt                  TransportReceipt `json:"receipt"`
 	CreatedAt                time.Time        `json:"created_at"`
 	Revision                 uint64           `json:"-"`
@@ -284,6 +288,7 @@ func (s *Store) BeginTransportInvocation(attemptID string, expectedRevision uint
 		return TransportAttempt{}, fmt.Errorf("%w: transport attempt %q cannot begin at revision %d from %s/%d", ErrConflict, attemptID, expectedRevision, current.State, current.Revision)
 	}
 	current.State = TransportInvoking
+	current.InvocationCount++
 	current.InvocationStartedAt = startedAt
 	current.InvocationLeaseUntil = startedAt.Add(TransportInvocationLeaseDuration)
 	payload, err := encodeTransportAttempt(current)
@@ -298,6 +303,34 @@ func (s *Store) BeginTransportInvocation(attemptID string, expectedRevision uint
 			return TransportAttempt{}, fmt.Errorf("%w: transport invocation already claimed", ErrConflict)
 		}
 		return TransportAttempt{}, fmt.Errorf("beginning mail delivery transport invocation: %w", err)
+	}
+	return s.TransportAttempt(attemptID)
+}
+
+// ReleaseTransportInvocation returns a claimed attempt to requested only when
+// the destination contract guarantees an identical effect-ID retry is safe.
+func (s *Store) ReleaseTransportInvocation(attemptID string, expectedRevision uint64) (TransportAttempt, error) {
+	current, err := s.TransportAttempt(attemptID)
+	if err != nil {
+		return TransportAttempt{}, err
+	}
+	if current.State != TransportInvoking || current.Revision != expectedRevision {
+		return TransportAttempt{}, fmt.Errorf("%w: transport attempt %q cannot release from %s/%d", ErrConflict, attemptID, current.State, current.Revision)
+	}
+	current.State = TransportRequested
+	current.InvocationLeaseUntil = time.Time{}
+	payload, err := encodeTransportAttempt(current)
+	if err != nil {
+		return TransportAttempt{}, err
+	}
+	if s.writer == nil {
+		return TransportAttempt{}, fmt.Errorf("mail delivery conditional writes unavailable")
+	}
+	if err := s.writer.UpdateIfMatch(attemptID, int64(expectedRevision), beads.UpdateOpts{Metadata: map[string]string{transportAttemptDataKey: payload}}); err != nil {
+		if beads.IsPreconditionFailed(err) {
+			return TransportAttempt{}, fmt.Errorf("%w: transport invocation release lost CAS", ErrConflict)
+		}
+		return TransportAttempt{}, fmt.Errorf("releasing mail delivery transport invocation: %w", err)
 	}
 	return s.TransportAttempt(attemptID)
 }
@@ -443,17 +476,18 @@ func (a TransportAttempt) validate() error {
 		if a.Receipt != (TransportReceipt{}) {
 			return fmt.Errorf("requested transport attempt carries a receipt")
 		}
-		if !a.InvocationStartedAt.IsZero() || !a.InvocationLeaseUntil.IsZero() {
+		if !a.InvocationLeaseUntil.IsZero() || (a.InvocationCount == 0) != a.InvocationStartedAt.IsZero() ||
+			(!a.InvocationStartedAt.IsZero() && a.InvocationStartedAt.Location() != time.UTC) {
 			return fmt.Errorf("requested transport attempt carries invocation lease")
 		}
 	case TransportInvoking:
-		if a.Receipt != (TransportReceipt{}) || a.InvocationStartedAt.IsZero() || a.InvocationStartedAt.Location() != time.UTC ||
+		if a.InvocationCount == 0 || a.Receipt != (TransportReceipt{}) || a.InvocationStartedAt.IsZero() || a.InvocationStartedAt.Location() != time.UTC ||
 			a.InvocationLeaseUntil.IsZero() || a.InvocationLeaseUntil.Location() != time.UTC ||
 			!a.InvocationLeaseUntil.Equal(a.InvocationStartedAt.Add(TransportInvocationLeaseDuration)) {
 			return fmt.Errorf("invoking transport attempt lease is invalid")
 		}
 	case TransportCommitted, TransportUnknownExternalState:
-		if a.InvocationStartedAt.IsZero() || a.InvocationStartedAt.Location() != time.UTC ||
+		if a.InvocationCount == 0 || a.InvocationStartedAt.IsZero() || a.InvocationStartedAt.Location() != time.UTC ||
 			a.InvocationLeaseUntil.IsZero() || a.InvocationLeaseUntil.Location() != time.UTC {
 			return fmt.Errorf("terminal transport attempt lacks invocation identity")
 		}
@@ -481,6 +515,7 @@ func sameTransportIntent(existing, proposed TransportAttempt) bool {
 	existing.Receipt = proposed.Receipt
 	existing.InvocationStartedAt = proposed.InvocationStartedAt
 	existing.InvocationLeaseUntil = proposed.InvocationLeaseUntil
+	existing.InvocationCount = proposed.InvocationCount
 	existing.Revision = 0
 	proposed.Revision = 0
 	return transportAttemptEqual(existing, proposed)

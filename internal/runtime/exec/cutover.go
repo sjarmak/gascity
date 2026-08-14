@@ -27,6 +27,7 @@ var (
 	_ runtime.DialogProvider          = (*seamBackedProvider)(nil)
 	_ runtime.SleepCapabilityProvider = (*seamBackedProvider)(nil)
 	_ runtime.RelaunchProvider        = (*seamBackedProvider)(nil)
+	_ runtime.StableNudgeProvider     = (*seamBackedProvider)(nil)
 )
 
 // NewSeamBacked wraps an exec provider for the given script so it is served
@@ -35,6 +36,12 @@ func NewSeamBacked(script string) runtime.Provider {
 	raw := NewProvider(script)
 	rt, tp := raw.Seams()
 	return &seamBackedProvider{Provider: runtime.NewProviderFromSeams(rt, tp), raw: raw}
+}
+
+func (s *seamBackedProvider) SupportsStableNudge() bool { return s.raw.SupportsStableNudge() }
+
+func (s *seamBackedProvider) NudgeStable(ctx context.Context, name, effectID string, content []runtime.ContentBlock) (runtime.StableNudgeReceipt, error) {
+	return s.raw.NudgeStable(ctx, name, effectID, content)
 }
 
 // DismissKnownDialogs implements [runtime.DialogProvider] (non-seam passthrough).
