@@ -24,6 +24,8 @@ type mailDeliveryAttemptResult struct {
 	Attempt       maildelivery.TransportAttempt `json:"attempt"`
 }
 
+const mailDeliveryNudgeText = "1 actionable mail delivery; run gc mail inbox"
+
 func newMailDeliveryCmd(stdout, stderr io.Writer) *cobra.Command {
 	cmd := &cobra.Command{Use: "delivery", Short: "Operate durable mail delivery attempts"}
 	cmd.AddCommand(&cobra.Command{
@@ -98,8 +100,9 @@ func cmdMailDeliveryInvoke(ctx context.Context, attemptID string, stdout, stderr
 		fmt.Fprintf(stderr, "gc mail delivery invoke: provider: %v\n", err) //nolint:errcheck
 		return 1
 	}
-	result, err := executeMailDeliveryAttempt(ctx, deliveryStore, attempt, resolver, time.Now().UTC(),
+	result, err := executeMailDeliveryAttemptWithLookup(ctx, deliveryStore, attempt, resolver, time.Now().UTC(),
 		mailDeliveryWorkerPreflight(cityPath, cfg, sessStore, provider, resolver),
+		mailDeliveryWorkerReceiptLookup(cityPath, cfg, sessStore, provider, resolver),
 		mailDeliveryWorkerInvoker(cityPath, cfg, sessStore, provider, resolver))
 	if err != nil {
 		// The typed result is still emitted when the provider outcome is
@@ -108,10 +111,19 @@ func cmdMailDeliveryInvoke(ctx context.Context, attemptID string, stdout, stderr
 		fmt.Fprintf(stderr, "gc mail delivery invoke: %v\n", err) //nolint:errcheck
 		return 1
 	}
+	if result.State == maildelivery.TransportUnknownExternalState {
+		_ = writeMailDeliveryAttempt(stdout, stderr, "invoke", result)
+		fmt.Fprintln(stderr, "gc mail delivery invoke: transport outcome is unknown_external_state") //nolint:errcheck
+		return 1
+	}
 	return writeMailDeliveryAttempt(stdout, stderr, "invoke", result)
 }
 
 func executeMailDeliveryAttempt(ctx context.Context, store *maildelivery.Store, attempt maildelivery.TransportAttempt, resolver maildelivery.FenceResolver, uncertainAt time.Time, preflight maildelivery.TransportPreflight, invoke maildelivery.TransportInvoker) (maildelivery.TransportAttempt, error) {
+	return executeMailDeliveryAttemptWithLookup(ctx, store, attempt, resolver, uncertainAt, preflight, nil, invoke)
+}
+
+func executeMailDeliveryAttemptWithLookup(ctx context.Context, store *maildelivery.Store, attempt maildelivery.TransportAttempt, resolver maildelivery.FenceResolver, uncertainAt time.Time, preflight maildelivery.TransportPreflight, lookup maildelivery.TransportReceiptLookup, invoke maildelivery.TransportInvoker) (maildelivery.TransportAttempt, error) {
 	fence, err := resolver.ResolveMailActivationFence(ctx, "")
 	if err != nil {
 		return maildelivery.TransportAttempt{}, err
@@ -121,7 +133,7 @@ func executeMailDeliveryAttempt(ctx context.Context, store *maildelivery.Store, 
 		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: append([]string(nil), attempt.CoveredDeliveryIDs...),
 		CreatedAt: attempt.CreatedAt,
 	}
-	return maildelivery.ExecuteTransport(ctx, store, request, resolver, uncertainAt, preflight, invoke)
+	return maildelivery.ExecuteTransportWithReceiptLookup(ctx, store, request, resolver, uncertainAt, preflight, lookup, invoke)
 }
 
 type mailDeliveryFenceResolver struct {
@@ -185,7 +197,7 @@ func mailDeliveryWorkerInvoker(cityPath string, cfg *config.City, sessStore bead
 			return maildelivery.TransportReceipt{}, err
 		}
 		result, err := handle.Nudge(ctx, worker.NudgeRequest{
-			Text: "1 actionable mail delivery; run gc mail inbox", Delivery: worker.NudgeDeliveryImmediate,
+			Text: mailDeliveryNudgeText, Delivery: worker.NudgeDeliveryImmediate,
 			Source: "mail-delivery", Wake: worker.NudgeWakeLiveOnly, EffectID: attempt.NudgeID,
 			CommitBoundary: worker.NudgeCommitBoundaryDestinationAtomic,
 		})
@@ -211,6 +223,45 @@ func mailDeliveryWorkerInvoker(cityPath string, cfg *config.City, sessStore bead
 			State: maildelivery.EffectCommitted, CommitBoundary: maildelivery.TransportCommitBoundaryDestinationAtomic,
 			ReceiptRef: "destination:" + result.Receipt.DestinationRef, ReceiptSHA256: result.Receipt.DestinationReceiptSHA256,
 			RecordedAt: result.Receipt.AcceptedAt,
+		}, nil
+	}
+}
+
+func mailDeliveryWorkerReceiptLookup(cityPath string, cfg *config.City, sessStore beads.Store, provider runtime.Provider, resolver *mailDeliveryFenceResolver) maildelivery.TransportReceiptLookup {
+	return func(ctx context.Context, attempt maildelivery.TransportAttempt) (maildelivery.TransportReceipt, error) {
+		fence, err := resolver.ResolveMailActivationFence(ctx, "")
+		if err != nil {
+			return maildelivery.TransportReceipt{}, err
+		}
+		if err := attempt.ValidateAuthority(fence); err != nil {
+			return maildelivery.TransportReceipt{}, err
+		}
+		info := resolver.lastInfo
+		handle, err := workerHandleForSessionWithConfig(cityPath, sessStore, provider, cfg, info.ID)
+		if err != nil {
+			return maildelivery.TransportReceipt{}, err
+		}
+		if err := requireExactMailDeliveryReceiptHandle(handle); err != nil {
+			return maildelivery.TransportReceipt{}, err
+		}
+		lookup, err := worker.LookupDestinationAtomicNudge(ctx, handle, attempt.NudgeID, mailDeliveryNudgeText)
+		if err != nil {
+			return maildelivery.TransportReceipt{}, err
+		}
+		if lookup.Unknown {
+			return maildelivery.TransportReceipt{
+				Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
+				State: maildelivery.EffectUnknownExternalState, RecordedAt: lookup.ObservedAt,
+			}, nil
+		}
+		if lookup.Receipt == nil || lookup.Receipt.CommitBoundary != worker.NudgeCommitBoundaryDestinationAtomic {
+			return maildelivery.TransportReceipt{}, fmt.Errorf("destination lookup returned no exact stable receipt")
+		}
+		return maildelivery.TransportReceipt{
+			Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
+			State: maildelivery.EffectCommitted, CommitBoundary: maildelivery.TransportCommitBoundaryDestinationAtomic,
+			ReceiptRef:    "destination:" + lookup.Receipt.DestinationRef,
+			ReceiptSHA256: lookup.Receipt.DestinationReceiptSHA256, RecordedAt: lookup.Receipt.AcceptedAt,
 		}, nil
 	}
 }

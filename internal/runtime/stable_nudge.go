@@ -27,6 +27,7 @@ const StableNudgeCommitBoundaryDestinationAtomic = "destination-atomic-effect-re
 type StableNudgeProvider interface {
 	SupportsStableNudge() bool
 	NudgeStable(context.Context, string, string, []ContentBlock) (StableNudgeReceipt, error)
+	LookupStableNudge(context.Context, string, string, []ContentBlock) (StableNudgeLookup, error)
 }
 
 // StableNudgeRequest is the body-free exec-provider wire request.
@@ -34,6 +35,52 @@ type StableNudgeRequest struct {
 	Version  int            `json:"version"`
 	EffectID string         `json:"effect_id"`
 	Content  []ContentBlock `json:"content"`
+}
+
+// StableNudgeLookupState is the closed read-only destination outcome.
+type StableNudgeLookupState string
+
+const (
+	// StableNudgeLookupCommitted carries the canonical destination receipt.
+	StableNudgeLookupCommitted StableNudgeLookupState = "committed"
+	// StableNudgeLookupUnknownExternalState proves the destination cannot decide.
+	StableNudgeLookupUnknownExternalState StableNudgeLookupState = "unknown_external_state"
+)
+
+// StableNudgeLookupRequest binds a read-only query to exact effect content.
+type StableNudgeLookupRequest struct {
+	Version       int    `json:"version"`
+	EffectID      string `json:"effect_id"`
+	ContentSHA256 string `json:"content_sha256"`
+}
+
+// StableNudgeLookup is either one committed receipt or explicit uncertainty.
+type StableNudgeLookup struct {
+	Version    int                    `json:"version"`
+	State      StableNudgeLookupState `json:"state"`
+	Receipt    StableNudgeReceipt     `json:"receipt,omitempty"`
+	ObservedAt time.Time              `json:"observed_at"`
+}
+
+// Validate checks lookup shape and exact request identity.
+func (l StableNudgeLookup) Validate(effectID, target, contentSHA256 string) error {
+	if l.Version != 1 || l.ObservedAt.IsZero() || l.ObservedAt.Location() != time.UTC {
+		return fmt.Errorf("stable nudge lookup version is invalid")
+	}
+	switch l.State {
+	case StableNudgeLookupCommitted:
+		if err := l.Receipt.Validate(); err != nil || l.Receipt.EffectID != effectID ||
+			l.Receipt.TargetRuntimeName != target || l.Receipt.ContentSHA256 != contentSHA256 {
+			return fmt.Errorf("stable nudge lookup receipt differs from request")
+		}
+	case StableNudgeLookupUnknownExternalState:
+		if l.Receipt != (StableNudgeReceipt{}) {
+			return fmt.Errorf("unknown stable nudge lookup carries a receipt")
+		}
+	default:
+		return fmt.Errorf("stable nudge lookup state is invalid")
+	}
+	return nil
 }
 
 // StableNudgeReceipt is destination evidence for one stable physical effect.

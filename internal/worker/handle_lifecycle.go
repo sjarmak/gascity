@@ -410,6 +410,31 @@ func (h *SessionHandle) SupportsStableNudge() bool {
 	return h != nil && h.manager != nil && h.manager.SupportsStableNudge()
 }
 
+// LookupStableNudge reads destination evidence without delivering another nudge.
+func (h *SessionHandle) LookupStableNudge(ctx context.Context, effectID, text string) (DestinationNudgeLookup, error) {
+	if h == nil || h.manager == nil {
+		return DestinationNudgeLookup{}, runtime.ErrStableNudgeUnsupported
+	}
+	if err := runtime.ValidateStableNudgeEffectID(effectID); err != nil {
+		return DestinationNudgeLookup{}, err
+	}
+	id, err := h.ensureSessionID()
+	if err != nil {
+		return DestinationNudgeLookup{}, err
+	}
+	lookup, err := h.manager.LookupStableNudge(ctx, id, effectID, text)
+	if err != nil {
+		return DestinationNudgeLookup{}, err
+	}
+	if lookup.State == runtime.StableNudgeLookupUnknownExternalState {
+		return DestinationNudgeLookup{Unknown: true, ObservedAt: lookup.ObservedAt}, nil
+	}
+	receipt, err := newDestinationAtomicNudgeReceipt(effectID, id, h.session.Provider, h.session.Transport, lookup.Receipt)
+	return DestinationNudgeLookup{Receipt: receipt, ObservedAt: lookup.ObservedAt}, err
+}
+
+var _ StableNudgeLookupHandle = (*SessionHandle)(nil)
+
 func (h *SessionHandle) ensureSessionID() (string, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
