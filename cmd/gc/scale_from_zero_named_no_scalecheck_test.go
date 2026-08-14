@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 )
@@ -44,6 +45,373 @@ func newNoScaleCheckNamedBackingCity(t *testing.T) (cfg *config.City, cityStore 
 	cityStore = beads.NewMemStore()
 	rigStores = map[string]beads.Store{"rig-A": beads.NewMemStore()}
 	return cfg, cityStore, rigStores, "rig-A/planner"
+}
+
+func newSplitDesiredStateRuntime(t *testing.T, cfg *config.City, workStore, sessionStore beads.Store, rigStores map[string]beads.Store) *CityRuntime {
+	t.Helper()
+	cityPath := t.TempDir()
+	return &CityRuntime{
+		storageRoutes:          messagingSplitRoutes(sessionStore),
+		cityPath:               cityPath,
+		cityName:               "test-city",
+		cfg:                    cfg,
+		sp:                     &localMockProvider{},
+		stderr:                 os.Stderr,
+		standaloneCityStore:    workStore,
+		standaloneRigStores:    rigStores,
+		buildFnWithClassStores: supervisorBuildAgentsFnWithClassStores(cityPath, "test-city", os.Stderr),
+	}
+}
+
+func TestCityRuntimeBuildDesiredStateUsesWorkLedgerForNamedDemandWhenSessionsAreSplit(t *testing.T) {
+	cfg, workStore, rigStores, identity := newNoScaleCheckNamedBackingCity(t)
+	workStore.(*beads.MemStore).IDPrefix = "work"
+	if _, err := workStore.Create(beads.Bead{
+		ID:       "work-routed-1",
+		Status:   "open",
+		Type:     "task",
+		Metadata: map[string]string{"gc.routed_to": identity},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionStore := beads.NewMemStore()
+	sessionStore.IDPrefix = "session"
+	cr := newSplitDesiredStateRuntime(t, cfg, workStore, sessionStore, rigStores)
+
+	sessionBeads := newSessionBeadSnapshot(nil)
+	result := cr.buildDesiredState(sessionBeads, nil)
+
+	if got := result.ScaleCheckCounts[identity]; got != 1 {
+		t.Fatalf("ScaleCheckCounts[%q] = %d, want 1 for routed demand in the Work ledger", identity, got)
+	}
+	infos := sessionBeads.OpenInfos()
+	if len(infos) != 1 {
+		t.Fatalf("session snapshot has %d open rows, want 1 materialized in the session ledger", len(infos))
+	}
+	if _, err := sessionStore.Get(infos[0].ID); err != nil {
+		t.Fatalf("session %q not found in session ledger: %v", infos[0].ID, err)
+	}
+	if _, err := workStore.Get(infos[0].ID); err == nil {
+		t.Fatalf("session %q leaked into Work ledger", infos[0].ID)
+	}
+}
+
+func TestCityRuntimeBuildDesiredStateRetainsGraphLedgerDemandWhenWorkIsSplit(t *testing.T) {
+	cfg, workStore, rigStores, identity := newNoScaleCheckNamedBackingCity(t)
+	sessionStore := beads.NewMemStore()
+	if _, err := sessionStore.Create(beads.Bead{
+		Status: "open",
+		Type:   "task",
+		Metadata: map[string]string{
+			"gc.kind":                        "workflow",
+			"gc.routed_to":                   identity,
+			beadmeta.RootStoreRefMetadataKey: "city:test-city",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cr := newSplitDesiredStateRuntime(t, cfg, workStore, sessionStore, rigStores)
+
+	result := cr.buildDesiredState(newSessionBeadSnapshot(nil), nil)
+
+	if got := result.ScaleCheckCounts[identity]; got != 1 {
+		t.Fatalf("ScaleCheckCounts[%q] = %d, want 1 for routed graph demand in the class ledger", identity, got)
+	}
+	if len(result.State) != 1 {
+		t.Fatalf("desired sessions = %d, want 1 for routed graph demand", len(result.State))
+	}
+	if len(result.ReadyUnassignedRoutedWorkBeads) != 1 {
+		t.Fatalf("ready routed graph work = %d, want 1 for the idle-claim backstop", len(result.ReadyUnassignedRoutedWorkBeads))
+	}
+	if got := result.ReadyUnassignedRoutedWorkStoreRefs; len(got) != 1 || got[0] != "city:test-city" {
+		t.Fatalf("ready routed graph refs = %v, want [city:test-city]", got)
+	}
+}
+
+func TestCityRuntimeBuildDesiredStateUnionsWorkAndGraphDemand(t *testing.T) {
+	cfg, workStore, rigStores, identity := newNoScaleCheckNamedBackingCity(t)
+	cfg.NamedSessions = nil
+	workStore.(*beads.MemStore).IDPrefix = "work"
+	if _, err := workStore.Create(beads.Bead{
+		Status:   "open",
+		Type:     "task",
+		Metadata: map[string]string{"gc.routed_to": identity},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sessionStore := beads.NewMemStore()
+	sessionStore.IDPrefix = "graph"
+	if _, err := sessionStore.Create(beads.Bead{
+		Status: "open",
+		Type:   "task",
+		Metadata: map[string]string{
+			"gc.kind":                        "workflow",
+			"gc.routed_to":                   identity,
+			beadmeta.RootStoreRefMetadataKey: "rig:rig-A",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result := newSplitDesiredStateRuntime(t, cfg, workStore, sessionStore, rigStores).
+		buildDesiredState(newSessionBeadSnapshot(nil), nil)
+
+	if got := result.ScaleCheckCounts[identity]; got != 2 {
+		t.Fatalf("ScaleCheckCounts[%q] = %d, want the union of one Work and one graph direction", identity, got)
+	}
+	if len(result.ReadyUnassignedRoutedWorkBeads) != 2 {
+		t.Fatalf("ready routed union = %d, want both Work and graph directions", len(result.ReadyUnassignedRoutedWorkBeads))
+	}
+	foundRigGraph := false
+	for i, bead := range result.ReadyUnassignedRoutedWorkBeads {
+		if bead.Metadata[beadmeta.RootStoreRefMetadataKey] != "rig:rig-A" {
+			continue
+		}
+		foundRigGraph = i < len(result.ReadyUnassignedRoutedWorkStoreRefs) && result.ReadyUnassignedRoutedWorkStoreRefs[i] == "rig:rig-A"
+	}
+	if !foundRigGraph {
+		t.Fatalf("ready routed refs = %v, want the graph direction under rig:rig-A", result.ReadyUnassignedRoutedWorkStoreRefs)
+	}
+}
+
+func TestCollectOpenUnassignedRoutedWorkSplitUsesLiveClassCopy(t *testing.T) {
+	const sharedID = "shared-graph-direction"
+	staleWork := beads.NewMemStoreFrom(1, []beads.Bead{{
+		ID: sharedID, Status: "open", Type: "task", Metadata: map[string]string{
+			beadmeta.RoutedToMetadataKey:     "rig-A/planner",
+			beadmeta.RootStoreRefMetadataKey: "city:test-city",
+		},
+	}}, nil)
+	liveClass := beads.NewMemStoreFrom(1, []beads.Bead{{
+		ID: sharedID, Status: "open", Type: "task", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:         beadmeta.KindWorkflow,
+			beadmeta.RoutedToMetadataKey:     "rig-A/planner",
+			beadmeta.RootStoreRefMetadataKey: "city:test-city",
+		},
+	}}, nil)
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+
+	work, stores, refs, partial := collectOpenUnassignedRoutedWorkWithClassStores(
+		cfg, staleWork, nil, nil, liveClass, os.Stderr,
+	)
+
+	if partial {
+		t.Fatal("split routed-work collection reported partial on healthy stores")
+	}
+	if len(work) != 1 || len(stores) != 1 || stores[0] != liveClass {
+		t.Fatalf("collected stores = %v for work %v, want only the authoritative class binding", stores, work)
+	}
+	if len(refs) != 1 || refs[0] != "city:test-city" {
+		t.Fatalf("collected refs = %v, want [city:test-city]", refs)
+	}
+}
+
+func TestCollectAssignedWorkSplitUsesLiveClassCopyWhenRetainedClassDrifts(t *testing.T) {
+	const sharedID = "shared-assigned-graph-direction"
+	staleWork := beads.NewMemStoreFrom(1, []beads.Bead{{
+		ID: sharedID, Status: "in_progress", Type: "task", Assignee: "rig-A/planner-1", Metadata: map[string]string{
+			beadmeta.RoutedToMetadataKey:     "rig-A/planner",
+			beadmeta.RootStoreRefMetadataKey: "rig:rig-A",
+		},
+	}}, nil)
+	liveClass := beads.NewMemStoreFrom(1, []beads.Bead{{
+		ID: sharedID, Status: "in_progress", Type: "task", Assignee: "rig-A/planner-1", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:         beadmeta.KindWorkflow,
+			beadmeta.RoutedToMetadataKey:     "rig-A/planner",
+			beadmeta.RootStoreRefMetadataKey: "rig:rig-A",
+		},
+	}}, nil)
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "rig-A", Path: t.TempDir()}},
+		Agents:    []config.Agent{{Name: "planner", Dir: "rig-A"}},
+	}
+
+	work, stores, refs, ready, partial := collectAssignedWorkBeadsWithClassStores(
+		cfg, beads.NewMemStore(), map[string]beads.Store{"rig-A": staleWork}, nil, nil, liveClass,
+	)
+
+	if partial {
+		t.Fatal("split assigned-work collection reported partial on healthy stores")
+	}
+	if len(work) != 1 || work[0].ID != sharedID || len(stores) != 1 || stores[0] != liveClass {
+		t.Fatalf("assigned work/stores = %v / %v, want only the authoritative class row", work, stores)
+	}
+	if len(refs) != 1 || refs[0] != "rig-A" {
+		t.Fatalf("assigned refs = %v, want [rig-A]", refs)
+	}
+	if !ready[storeScopedBeadKey{StoreRef: "rig-A", ID: sharedID}] {
+		t.Fatalf("ready assigned keys = %v, want authoritative rig-scoped key", ready)
+	}
+}
+
+func TestCollectAssignedWorkSplitUsesLogicalRigScopeFromClassRow(t *testing.T) {
+	workStore := beads.NewMemStore()
+	classStore := beads.NewMemStore()
+	assigned, err := classStore.Create(beads.Bead{
+		Status:   "in_progress",
+		Type:     "task",
+		Assignee: "rig-A/planner-1",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:         beadmeta.KindWorkflow,
+			beadmeta.RootStoreRefMetadataKey: "rig:rig-A",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "rig-A", Path: t.TempDir()}},
+		Agents:    []config.Agent{{Name: "planner", Dir: "rig-A"}},
+	}
+
+	work, stores, refs, ready, partial := collectAssignedWorkBeadsWithClassStores(
+		cfg, workStore, nil, nil, nil, classStore,
+	)
+
+	if partial {
+		t.Fatal("split assigned-work collection reported partial on healthy stores")
+	}
+	if len(work) != 1 || work[0].ID != assigned.ID || len(stores) != 1 || stores[0] != classStore {
+		t.Fatalf("assigned work/stores = %v / %v, want the class-store row", work, stores)
+	}
+	if len(refs) != 1 || refs[0] != "rig-A" {
+		t.Fatalf("assigned refs = %v, want bare rig ref [rig-A]", refs)
+	}
+	if !ready[storeScopedBeadKey{StoreRef: "rig-A", ID: assigned.ID}] {
+		t.Fatalf("ready assigned keys = %v, want rig-scoped key for %s", ready, assigned.ID)
+	}
+	if !assignedWorkIndexReachableFromAgent(t.TempDir(), cfg, &cfg.Agents[0], refs, 0) {
+		t.Fatal("rig-A session cannot reach its assigned graph row after logical scope projection")
+	}
+}
+
+func TestClassStoreCandidateLogicalRefs(t *testing.T) {
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	work := beads.Bead{Type: "task"}
+	graph := beads.Bead{Type: "task", Metadata: map[string]string{
+		beadmeta.KindMetadataKey:         beadmeta.KindWorkflow,
+		beadmeta.RootStoreRefMetadataKey: "rig:rig-A",
+	}}
+	cityGraph := graph
+	cityGraph.Metadata = map[string]string{
+		beadmeta.KindMetadataKey:         beadmeta.KindWorkflow,
+		beadmeta.RootStoreRefMetadataKey: "city:test-city",
+	}
+
+	for _, tc := range []struct {
+		name      string
+		bead      beads.Bead
+		candidate classStoreCandidate
+		canonical string
+		assigned  string
+		ok        bool
+	}{
+		{name: "city work", bead: work, candidate: classStoreCandidate{ref: "city", role: classStoreRoleWork}, canonical: "city:test-city", ok: true},
+		{name: "rig work", bead: work, candidate: classStoreCandidate{ref: "rig:rig-A", role: classStoreRoleWork}, canonical: "rig:rig-A", assigned: "rig-A", ok: true},
+		{name: "rig infrastructure", bead: graph, candidate: classStoreCandidate{ref: "city", role: classStoreRoleInfrastructure}, canonical: "rig:rig-A", assigned: "rig-A", ok: true},
+		{name: "city infrastructure", bead: cityGraph, candidate: classStoreCandidate{ref: "city", role: classStoreRoleInfrastructure}, canonical: "city:test-city", ok: true},
+		{name: "retained graph rejected by Work", bead: graph, candidate: classStoreCandidate{ref: "rig:rig-A", role: classStoreRoleWork}},
+		{name: "work rejected by infrastructure", bead: work, candidate: classStoreCandidate{ref: "city", role: classStoreRoleInfrastructure}},
+		{name: "wrong city rejected", bead: beads.Bead{Type: "task", Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow, beadmeta.RootStoreRefMetadataKey: "city:other"}}, candidate: classStoreCandidate{ref: "city", role: classStoreRoleInfrastructure}},
+		{name: "malformed ref rejected", bead: beads.Bead{Type: "task", Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow, beadmeta.RootStoreRefMetadataKey: "rig:"}}, candidate: classStoreCandidate{ref: "city", role: classStoreRoleInfrastructure}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			canonical, ok := canonicalStoreRefForCandidate(cfg, tc.bead, tc.candidate)
+			if canonical != tc.canonical || ok != tc.ok {
+				t.Fatalf("canonical ref = (%q, %v), want (%q, %v)", canonical, ok, tc.canonical, tc.ok)
+			}
+			assigned, assignedOK := assignedStoreRefForCandidate(cfg, tc.bead, tc.candidate)
+			if assigned != tc.assigned || assignedOK != tc.ok {
+				t.Fatalf("assigned ref = (%q, %v), want (%q, %v)", assigned, assignedOK, tc.assigned, tc.ok)
+			}
+		})
+	}
+
+	if got, ok := physicalCandidateStoreRef(nil, "city"); got != "city" || !ok {
+		t.Fatalf("legacy city fallback = (%q, %v), want (city, true)", got, ok)
+	}
+	if got, ok := physicalCandidateStoreRef(cfg, "unknown:scope"); got != "" || ok {
+		t.Fatalf("malformed physical ref = (%q, %v), want rejected", got, ok)
+	}
+}
+
+func TestBuildDesiredStateSplitWakesRigControlDispatcherFromClassBinding(t *testing.T) {
+	maxActive := 1
+	minActive := 0
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "rig-A", Path: t.TempDir()}},
+		Agents: []config.Agent{{
+			Name:              config.ControlDispatcherAgentName,
+			BindingName:       "core",
+			Dir:               "rig-A",
+			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+			MaxActiveSessions: &maxActive,
+			MinActiveSessions: &minActive,
+		}},
+	}
+	classStore := beads.NewMemStore()
+	control, err := classStore.Create(beads.Bead{
+		Status: "open",
+		Type:   "task",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:         beadmeta.KindWorkflowFinalize,
+			beadmeta.RoutedToMetadataKey:     "core.control-dispatcher",
+			beadmeta.RootBeadIDMetadataKey:   "graph-root-1",
+			beadmeta.RootStoreRefMetadataKey: "rig:rig-A",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workStore := beads.NewMemStore()
+	retainedRigWork := beads.NewMemStoreFrom(1, []beads.Bead{{
+		ID:     control.ID,
+		Status: "open",
+		Type:   "task",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:         beadmeta.KindWorkflowFinalize,
+			beadmeta.RoutedToMetadataKey:     "core.control-dispatcher",
+			beadmeta.RootBeadIDMetadataKey:   "graph-root-1",
+			beadmeta.RootStoreRefMetadataKey: "rig:rig-A",
+		},
+	}}, nil)
+
+	result := newSplitDesiredStateRuntime(t, cfg, workStore, classStore, map[string]beads.Store{"rig-A": retainedRigWork}).
+		buildDesiredState(newSessionBeadSnapshot(nil), nil)
+
+	const route = "rig-A/core.control-dispatcher"
+	stored, err := classStore.Get(control.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stored.Metadata[beadmeta.RoutedToMetadataKey]; got != route {
+		t.Fatalf("live class route = %q, want repaired route %q", got, route)
+	}
+	stale, err := retainedRigWork.Get(control.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stale.Metadata[beadmeta.RoutedToMetadataKey]; got != "core.control-dispatcher" {
+		t.Fatalf("retained Work copy route = %q, want unchanged stale source", got)
+	}
+	if got := result.ScaleCheckCounts[route]; got != 1 {
+		t.Fatalf("ScaleCheckCounts[%q] = %d, want 1 from rig-scoped graph control", route, got)
+	}
+	foundDesired := false
+	for _, desired := range result.State {
+		foundDesired = foundDesired || desired.TemplateName == route
+	}
+	if !foundDesired {
+		t.Fatalf("desired state = %v, want a live %q dispatcher", result.State, route)
+	}
+	if len(result.ReadyUnassignedRoutedWorkBeads) != 1 || len(result.ReadyUnassignedRoutedWorkStoreRefs) != 1 || result.ReadyUnassignedRoutedWorkStoreRefs[0] != "rig:rig-A" {
+		t.Fatalf("ready control work/refs = %v / %v, want one rig:rig-A direction", result.ReadyUnassignedRoutedWorkBeads, result.ReadyUnassignedRoutedWorkStoreRefs)
+	}
 }
 
 // TestBuildDesiredState_ScaleFromZero_NoScaleCheck_CrossStore_NamedPath is the
