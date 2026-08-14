@@ -755,6 +755,28 @@ func TestSessionHandleNudgeReturnsDestinationAtomicReceipt(t *testing.T) {
 	if got := sp.StableNudgeEffectCount(effectID); got != 1 {
 		t.Fatalf("physical effect count = %d, want 1", got)
 	}
+	lookup, err := LookupDestinationAtomicNudge(context.Background(), handle, effectID, "1 actionable mail delivery; run gc mail inbox")
+	if err != nil || lookup.Unknown || lookup.Receipt == nil || lookup.Receipt.DestinationReceiptSHA256 != receipt.DestinationReceiptSHA256 {
+		t.Fatalf("LookupDestinationAtomicNudge = %#v, %v", lookup, err)
+	}
+	if got := sp.StableNudgeEffectCount(effectID); got != 1 {
+		t.Fatalf("lookup changed physical effect count to %d", got)
+	}
+}
+
+func TestSessionHandleLookupDestinationAtomicNudgeReturnsExplicitUnknownWithoutEffect(t *testing.T) {
+	handle, _, sp, _ := newTestSessionHandle(t, SessionSpec{
+		Profile: ProfileClaudeTmuxCLI, Template: "probe", Title: "Probe",
+		Command: "claude", WorkDir: t.TempDir(), Provider: "exec", Transport: "exec",
+	})
+	effectID := "mail-nudge-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	lookup, err := LookupDestinationAtomicNudge(context.Background(), handle, effectID, "1 actionable mail delivery; run gc mail inbox")
+	if err != nil || !lookup.Unknown || lookup.Receipt != nil || lookup.ObservedAt.IsZero() {
+		t.Fatalf("LookupDestinationAtomicNudge = %#v, %v", lookup, err)
+	}
+	if got := sp.StableNudgeEffectCount(effectID); got != 0 {
+		t.Fatalf("lookup created %d physical effects", got)
+	}
 }
 
 func TestSessionHandleNudgeWaitIdleUsesWorkerBoundary(t *testing.T) {

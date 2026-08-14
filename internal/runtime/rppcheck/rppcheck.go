@@ -423,6 +423,37 @@ func (c *checker) checkStableNudge(ctx context.Context, name string) {
 		c.record(check, StatusFail, "stable nudge replay did not return the byte-identical receipt")
 		return
 	}
+	lookupPayload, err := json.Marshal(runtime.StableNudgeLookupRequest{Version: 1, EffectID: effectID, ContentSHA256: hash})
+	if err != nil {
+		c.record(check, StatusFail, err.Error())
+		return
+	}
+	lookupResult := c.runOp(ctx, lookupPayload, "nudge-stable-status", name, effectID)
+	if lookupResult.err != nil {
+		c.record(check, StatusFail, "stable nudge read-only lookup failed: "+lookupResult.err.Error())
+		return
+	}
+	if lookupResult.unsupported {
+		c.record(check, StatusFail, "stable nudge read-only lookup is unsupported")
+		return
+	}
+	var lookup runtime.StableNudgeLookup
+	if err := json.Unmarshal([]byte(lookupResult.stdout), &lookup); err != nil {
+		c.record(check, StatusFail, "invalid stable nudge read-only lookup: "+err.Error())
+		return
+	}
+	if err := lookup.Validate(effectID, name, hash); err != nil {
+		c.record(check, StatusFail, "invalid stable nudge read-only lookup: "+err.Error())
+		return
+	}
+	if lookup.State != runtime.StableNudgeLookupCommitted {
+		c.record(check, StatusFail, "stable nudge read-only lookup did not report committed")
+		return
+	}
+	if lookup.Receipt != receipt {
+		c.record(check, StatusFail, "stable nudge read-only lookup receipt differs from nudge receipt")
+		return
+	}
 	c.record(check, StatusPass, "destination-atomic receipt validated")
 }
 
