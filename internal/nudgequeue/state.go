@@ -64,6 +64,24 @@ type State struct {
 	DispatchSkips map[string]int64 `json:"dispatch_skips,omitempty"`
 }
 
+// NextDeadline returns the earliest non-zero delivery deadline among live
+// pending and in-flight items. Dead letters are terminal and deliberately do
+// not rearm the runtime deadline timer.
+func NextDeadline(state State) (time.Time, bool) {
+	var earliest time.Time
+	for _, bucket := range [][]Item{state.Pending, state.InFlight} {
+		for _, item := range bucket {
+			if item.ExpiresAt.IsZero() {
+				continue
+			}
+			if earliest.IsZero() || item.ExpiresAt.Before(earliest) {
+				earliest = item.ExpiresAt
+			}
+		}
+	}
+	return earliest, !earliest.IsZero()
+}
+
 // SortState orders items deterministically inside each queue bucket.
 func SortState(state *State) {
 	sort.SliceStable(state.Pending, func(i, j int) bool {
@@ -162,8 +180,8 @@ func LockPath(cityPath string) string {
 
 // WakeSocketPath returns the path to the supervisor nudge-dispatcher wake
 // socket. Producers connect to this path after enqueue to trigger immediate
-// dispatch; the supervisor listens on it when daemon.nudge_dispatcher is
-// "supervisor".
+// deadline rearming in every daemon mode and delivery dispatch when
+// daemon.nudge_dispatcher is "supervisor".
 //
 // Preserves the legacy `<city>/.gc/runtime/nudges/wake.sock` location for
 // short city paths but falls back to a deterministic short temp-path
