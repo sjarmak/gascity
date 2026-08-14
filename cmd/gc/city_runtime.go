@@ -116,6 +116,7 @@ type CityRuntime struct {
 	publication             supervisor.PublicationConfig
 	buildFn                 func(*config.City, runtime.Provider, beads.Store) DesiredStateResult
 	buildFnWithSessionBeads func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult
+	buildFnWithClassStores  desiredStateBuildWithClassStoresFn
 
 	dops                    drainOps
 	ct                      crashTracker
@@ -255,6 +256,7 @@ type CityRuntimeParams struct {
 	Publication             supervisor.PublicationConfig
 	BuildFn                 func(*config.City, runtime.Provider, beads.Store) DesiredStateResult
 	BuildFnWithSessionBeads func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult
+	BuildFnWithClassStores  desiredStateBuildWithClassStoresFn
 	Dops                    drainOps
 
 	Rec events.Recorder
@@ -387,6 +389,7 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 		publication:             p.Publication,
 		buildFn:                 p.BuildFn,
 		buildFnWithSessionBeads: p.BuildFnWithSessionBeads,
+		buildFnWithClassStores:  p.BuildFnWithClassStores,
 		dops:                    p.Dops,
 		ct:                      ct,
 		it:                      it,
@@ -3193,14 +3196,8 @@ func (cr *CityRuntime) nudgeDispatchTick(_ context.Context) {
 }
 
 func (cr *CityRuntime) controlDispatcherTick(ctx context.Context) {
-	// The control-dispatcher tick threads one city store as two roles at once:
-	// the session-bead store the desired-state build creates and updates session
-	// beads through (sessions — the build-fn's leading store param flows into
-	// agentBuildParams.beadStore and the collectAllOpenSessionInfos "city" arm)
-	// and the per-rig work tail (work). The session-sync and reconcile arms below
-	// take the same sessions store. Split into the class accessors so a future
-	// per-class backend routes each role independently; both collapse to the same
-	// store today, so the tick is byte-identical.
+	// Session creation stays on the session-class ledger while dispatcher demand
+	// is read from the city and rig Work ledgers.
 	sessionsStore := cr.sessionsBeadStore()
 	if sessionsStore.Store == nil || cr.sessionDrains == nil {
 		return
@@ -3214,13 +3211,14 @@ func (cr *CityRuntime) controlDispatcherTick(ctx context.Context) {
 	cr.ensureManagedDoltPublishedForTick()
 
 	sessionBeads := cr.loadSessionBeadSnapshot()
-	wfcResult := buildDesiredStateWithSessionBeads(
+	wfcResult := buildDesiredStateWithClassStores(
 		cr.cityName,
 		cr.cityPath,
 		time.Now(),
 		filteredCfg,
 		cr.sp,
 		sessionsStore.Store,
+		cr.cityWorkStore().Store,
 		unwrapWorkStores(cr.workBeadStores()),
 		sessionBeads,
 		nil,
@@ -3445,13 +3443,20 @@ func filterReconcileRowsByName(snapshot *sessionBeadSnapshot, names map[string]b
 }
 
 func (cr *CityRuntime) buildDesiredState(sessionBeads *sessionBeadSnapshot, trace *sessionReconcilerTraceCycle) DesiredStateResult {
-	// The desired-state build threads two store roles: the session-bead store the
-	// build-fn's leading store param flows into (sessions — it becomes
-	// agentBuildParams.beadStore, which creates and updates session beads, and the
-	// collectAllOpenSessionInfos "city" arm) and the per-rig work tail. Split the
-	// single city store into the class accessors so a future per-class backend
-	// routes each role independently; both collapse to the same store today.
+	// Session creation and reads stay on the session-class ledger while worker
+	// demand is read independently from the city and rig Work ledgers.
 	sessionsStore := cr.sessionsBeadStore()
+	if cr.buildFnWithClassStores != nil {
+		return cr.buildFnWithClassStores(
+			cr.cfg,
+			cr.sp,
+			sessionsStore.Store,
+			cr.cityWorkStore().Store,
+			unwrapWorkStores(cr.workBeadStores()),
+			sessionBeads,
+			trace,
+		)
+	}
 	if cr.buildFnWithSessionBeads != nil {
 		return cr.buildFnWithSessionBeads(cr.cfg, cr.sp, sessionsStore.Store, unwrapWorkStores(cr.workBeadStores()), sessionBeads, trace)
 	}

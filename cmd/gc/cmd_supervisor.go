@@ -2106,6 +2106,7 @@ func reconcileCities(
 				Publication:             publication,
 				BuildFn:                 supervisorBuildAgentsFn(path, cityName, stderr),
 				BuildFnWithSessionBeads: supervisorBuildAgentsFnWithSessionBeads(path, cityName, stderr),
+				BuildFnWithClassStores:  supervisorBuildAgentsFnWithClassStores(path, cityName, stderr),
 				Dops:                    dops,
 				Rec:                     rec,
 				PoolSessions:            poolSessions,
@@ -2729,6 +2730,16 @@ func supervisorBuildAgentsFnWithSessionBeads(cityPath, cityName string, stderr i
 	beaconTime := time.Now()
 	return func(c *config.City, sp runtime.Provider, store beads.Store, rigStores map[string]beads.Store, sessionBeads *sessionBeadSnapshot, trace *sessionReconcilerTraceCycle) DesiredStateResult {
 		return buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, c, sp, store, rigStores, sessionBeads, trace, stderr)
+	}
+}
+
+func supervisorBuildAgentsFnWithClassStores(cityPath, cityName string, stderr io.Writer) desiredStateBuildWithClassStoresFn {
+	beaconTime := time.Now()
+	return func(c *config.City, sp runtime.Provider, sessionStore, workStore beads.Store, rigWorkStores map[string]beads.Store, sessionBeads *sessionBeadSnapshot, trace *sessionReconcilerTraceCycle) DesiredStateResult {
+		return buildDesiredStateWithClassStores(
+			cityName, cityPath, beaconTime, c, sp,
+			sessionStore, workStore, rigWorkStores, sessionBeads, trace, stderr,
+		)
 	}
 }
 
