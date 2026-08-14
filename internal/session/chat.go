@@ -830,6 +830,37 @@ func (m *Manager) SendImmediateLiveOnly(ctx context.Context, id, message string)
 	return m.sendLiveOnly(ctx, id, message, true)
 }
 
+// SupportsStableNudge reports whether the selected runtime declares the contract.
+func (m *Manager) SupportsStableNudge() bool {
+	stable, ok := m.sp.(runtime.StableNudgeProvider)
+	return ok && stable.SupportsStableNudge()
+}
+
+// SendStableLiveOnly invokes a destination-idempotent nudge for an already
+// running exact session. The provider owns atomic effect+receipt persistence.
+func (m *Manager) SendStableLiveOnly(ctx context.Context, id, effectID, message string) (receipt runtime.StableNudgeReceipt, delivered bool, err error) {
+	err = withSessionMutationLock(id, func() error {
+		_, sessName, loadErr := m.sessionBead(id)
+		if loadErr != nil {
+			return loadErr
+		}
+		stable, ok := m.sp.(runtime.StableNudgeProvider)
+		if !ok || !stable.SupportsStableNudge() {
+			return runtime.ErrStableNudgeUnsupported
+		}
+		if !m.sp.IsRunning(sessName) {
+			return nil
+		}
+		receipt, loadErr = stable.NudgeStable(ctx, sessName, effectID, runtime.TextContent(message))
+		if loadErr != nil {
+			return loadErr
+		}
+		delivered = true
+		return nil
+	})
+	return receipt, delivered, err
+}
+
 // TryWaitIdleNudge delivers a best-effort session nudge at a provider-defined
 // safe boundary. It resumes supported runtimes if needed, then reports whether
 // live delivery actually happened. Unsupported providers return (false, nil)

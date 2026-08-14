@@ -304,7 +304,7 @@ func (h *SessionHandle) Nudge(ctx context.Context, req NudgeRequest) (result Nud
 		// Receipt construction happens after provider success. A construction
 		// failure is therefore an indeterminate external outcome, not permission
 		// for a caller to retry the physical nudge.
-		if err == nil && result.Delivered && req.EffectID != "" && result.Receipt == nil {
+		if err == nil && result.Delivered && req.EffectID != "" && result.Receipt == nil && req.CommitBoundary != NudgeCommitBoundaryDestinationAtomic {
 			result.Receipt, err = newNudgeAcceptanceReceipt(req.EffectID, targetSessionRef, targetRuntimeName, h.session.Provider, h.session.Transport, time.Now())
 		}
 		event.payload.Delivered = boolPointer(result.Delivered)
@@ -322,6 +322,9 @@ func (h *SessionHandle) Nudge(ctx context.Context, req NudgeRequest) (result Nud
 		err = fmt.Errorf("nudge effect ID is invalid")
 		return NudgeResult{}, err
 	}
+	if req.CommitBoundary != "" && req.CommitBoundary != NudgeCommitBoundaryProviderReturn && req.CommitBoundary != NudgeCommitBoundaryDestinationAtomic {
+		return NudgeResult{}, fmt.Errorf("nudge commit boundary is invalid")
+	}
 	id, err := h.ensureSessionID()
 	if err != nil {
 		return NudgeResult{}, err
@@ -336,6 +339,21 @@ func (h *SessionHandle) Nudge(ctx context.Context, req NudgeRequest) (result Nud
 	resumeCommand, err := h.startCommand(id)
 	if err != nil {
 		return NudgeResult{}, err
+	}
+	if req.CommitBoundary == NudgeCommitBoundaryDestinationAtomic {
+		if req.Delivery != NudgeDeliveryImmediate || normalizeNudgeWakePolicy(req.Wake) != NudgeWakeLiveOnly {
+			return NudgeResult{}, fmt.Errorf("destination-atomic nudge requires immediate live-only delivery")
+		}
+		source, delivered, stableErr := h.manager.SendStableLiveOnly(ctx, id, req.EffectID, req.Text)
+		if stableErr != nil {
+			return NudgeResult{}, stableErr
+		}
+		if !delivered {
+			return NudgeResult{Delivered: false}, nil
+		}
+		result = NudgeResult{Delivered: true}
+		result.Receipt, err = newDestinationAtomicNudgeReceipt(req.EffectID, id, h.session.Provider, h.session.Transport, source)
+		return result, err
 	}
 	switch req.Delivery {
 	case "", NudgeDeliveryDefault:
@@ -385,6 +403,11 @@ func (h *SessionHandle) Nudge(ctx context.Context, req NudgeRequest) (result Nud
 		err = fmt.Errorf("unknown nudge delivery %q", req.Delivery)
 		return NudgeResult{}, err
 	}
+}
+
+// SupportsStableNudge reports the session manager's destination capability.
+func (h *SessionHandle) SupportsStableNudge() bool {
+	return h != nil && h.manager != nil && h.manager.SupportsStableNudge()
 }
 
 func (h *SessionHandle) ensureSessionID() (string, error) {

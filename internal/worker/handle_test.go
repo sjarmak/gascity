@@ -720,6 +720,43 @@ func TestSessionHandleNudgeReturnsEffectBoundProviderAcceptance(t *testing.T) {
 	}
 }
 
+func TestSessionHandleNudgeReturnsDestinationAtomicReceipt(t *testing.T) {
+	handle, _, sp, mgr := newTestSessionHandle(t, SessionSpec{
+		Profile: ProfileClaudeTmuxCLI, Template: "probe", Title: "Probe",
+		Command: "claude", WorkDir: t.TempDir(), Provider: "exec", Transport: "exec",
+	})
+	if err := handle.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	info, err := mgr.Get(handle.sessionID)
+	if err != nil {
+		t.Fatalf("manager.Get: %v", err)
+	}
+	effectID := "mail-nudge-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	result, err := handle.Nudge(context.Background(), NudgeRequest{
+		Text: "1 actionable mail delivery; run gc mail inbox", Delivery: NudgeDeliveryImmediate,
+		Source: "mail-delivery", Wake: NudgeWakeLiveOnly, EffectID: effectID,
+		CommitBoundary: NudgeCommitBoundaryDestinationAtomic,
+	})
+	if err != nil {
+		t.Fatalf("Nudge: %v", err)
+	}
+	if !result.Delivered || result.Receipt == nil {
+		t.Fatalf("result = %#v", result)
+	}
+	receipt := *result.Receipt
+	if receipt.CommitBoundary != NudgeCommitBoundaryDestinationAtomic || receipt.TargetSessionRef != handle.sessionID ||
+		receipt.TargetRuntimeName != info.SessionName || receipt.DestinationRef == "" || receipt.DestinationReceiptSHA256 == "" {
+		t.Fatalf("receipt = %#v", receipt)
+	}
+	if err := receipt.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got := sp.StableNudgeEffectCount(effectID); got != 1 {
+		t.Fatalf("physical effect count = %d, want 1", got)
+	}
+}
+
 func TestSessionHandleNudgeWaitIdleUsesWorkerBoundary(t *testing.T) {
 	handle, _, sp, mgr := newTestSessionHandle(t, SessionSpec{
 		Profile:  ProfileClaudeTmuxCLI,

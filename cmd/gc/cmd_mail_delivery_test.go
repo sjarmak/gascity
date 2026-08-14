@@ -9,6 +9,8 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/maildelivery"
+	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/worker"
 )
 
@@ -92,8 +94,17 @@ func TestMailDeliveryReceiptHandleRejectsRuntimeOnlyBeforeInvocation(t *testing.
 		t.Fatal("nil handle accepted")
 	}
 	var exact worker.Handle = &worker.SessionHandle{}
-	if err := requireExactMailDeliveryReceiptHandle(exact); err != nil {
-		t.Fatalf("session handle rejected: %v", err)
+	if err := requireExactMailDeliveryReceiptHandle(exact); err == nil {
+		t.Fatal("receipt-incapable session handle accepted")
+	}
+	stableProvider := runtime.NewFake()
+	mgr := session.NewManagerWithOptions(beads.NewMemStore(), stableProvider)
+	capable, err := worker.NewSessionHandle(worker.SessionHandleConfig{Manager: mgr, Session: worker.SessionSpec{ID: "gc-session-test", Provider: "exec", Transport: "exec"}})
+	if err != nil {
+		t.Fatalf("NewSessionHandle: %v", err)
+	}
+	if err := requireExactMailDeliveryReceiptHandle(capable); err != nil {
+		t.Fatalf("stable-nudge-capable session rejected: %v", err)
 	}
 }
 
