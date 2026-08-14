@@ -2419,6 +2419,7 @@ gc mail delivery
 | Subcommand | Description |
 |------------|-------------|
 | [gc mail delivery invoke](#gc-mail-delivery-invoke) | Invoke one requested mail delivery attempt |
+| [gc mail delivery reconcile-seat](#gc-mail-delivery-reconcile-seat) | Reconcile one bounded body-free seat delivery page |
 | [gc mail delivery status](#gc-mail-delivery-status) | Read one durable mail delivery attempt |
 
 ## gc mail delivery invoke
@@ -2428,6 +2429,18 @@ Invoke one requested mail delivery attempt
 ```
 gc mail delivery invoke <attempt-id>
 ```
+
+## gc mail delivery reconcile-seat
+
+Reconcile one bounded body-free seat delivery page
+
+```
+gc mail delivery reconcile-seat <seat-ref> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--limit` | int | `50` | maximum deliveries to process (1-100) |
 
 ## gc mail delivery status
 
