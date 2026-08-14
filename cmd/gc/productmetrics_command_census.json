@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "next_id": 205,
+  "next_id": 206,
   "permanent_ids": [
     {
       "name": "help",
@@ -2263,6 +2263,21 @@
       "classification": "mail-delivery-invoke",
       "owner": "immediate",
       "id": 203
+    },
+    {
+      "path": "gc mail delivery reconcile-seat",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "mail-delivery-reconcile-seat",
+      "owner": "immediate",
+      "id": 205
     },
     {
       "path": "gc mail delivery status",
