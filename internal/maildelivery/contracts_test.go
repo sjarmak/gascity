@@ -9,7 +9,7 @@ import (
 func validFence() ActivationFence {
 	return ActivationFence{
 		Version:               1,
-		FenceID:               "mail-activation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		FenceID:               "mail-activation-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		CityRef:               "city:test-city",
 		SeatRef:               "seat:test-city/reviewer",
 		AuthorityKind:         AuthorityNamedSessionControllerV1,
@@ -49,7 +49,6 @@ func TestAttemptIDIgnoresIssuanceMetadata(t *testing.T) {
 	}
 
 	reissued := fence
-	reissued.FenceID = "mail-activation-" + strings.Repeat("e", 64)
 	reissued.IssuedByRef = "controller:test-city/restarted-reconciler"
 	reissued.IssuedAt = reissued.IssuedAt.Add(time.Hour)
 	second, err := AttemptID("mail-delivery-"+strings.Repeat("d", 64), reissued)
@@ -94,6 +93,7 @@ func TestActivationFenceValidationFailsClosed(t *testing.T) {
 		"unknown authority":   func(f *ActivationFence) { f.AuthorityKind = "caller" },
 		"missing intent hash": func(f *ActivationFence) { f.AuthorityIntentSHA256 = "" },
 		"bad token hash":      func(f *ActivationFence) { f.InstanceTokenSHA256 = "not-a-hash" },
+		"mismatched fence ID": func(f *ActivationFence) { f.FenceID = "mail-activation-" + strings.Repeat("e", 64) },
 		"zero generation":     func(f *ActivationFence) { f.AuthorityGeneration = 0 },
 		"zero epoch":          func(f *ActivationFence) { f.ContinuationEpoch = 0 },
 		"non UTC issue time": func(f *ActivationFence) {
