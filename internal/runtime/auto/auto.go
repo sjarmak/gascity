@@ -33,6 +33,8 @@ var (
 	_ runtime.TransportCapabilityProvider   = (*Provider)(nil)
 	_ runtime.RelaunchProvider              = (*Provider)(nil)
 	_ runtime.LivenessObserver              = (*Provider)(nil)
+	_ runtime.StableNudgeProvider           = (*Provider)(nil)
+	_ runtime.TargetStableNudgeProvider     = (*Provider)(nil)
 )
 
 // New creates a composite provider. defaultSP handles sessions not
@@ -43,6 +45,38 @@ func New(defaultSP, acpSP runtime.Provider) *Provider {
 		acpSP:     acpSP,
 		routes:    make(map[string]bool),
 	}
+}
+
+// SupportsStableNudge reports whether every possible route supports stable nudges.
+func (p *Provider) SupportsStableNudge() bool {
+	defaultStable, defaultOK := p.defaultSP.(runtime.StableNudgeProvider)
+	acpStable, acpOK := p.acpSP.(runtime.StableNudgeProvider)
+	return defaultOK && acpOK && defaultStable.SupportsStableNudge() && acpStable.SupportsStableNudge()
+}
+
+// SupportsStableNudgeTarget reports capability for the backend routed to name.
+func (p *Provider) SupportsStableNudgeTarget(name string) bool {
+	return runtime.SupportsStableNudgeTarget(p.route(name), name)
+}
+
+// NudgeStable forwards a destination-idempotent nudge to the routed backend.
+func (p *Provider) NudgeStable(ctx context.Context, name, effectID string, content []runtime.ContentBlock) (runtime.StableNudgeReceipt, error) {
+	target := p.route(name)
+	stable, ok := target.(runtime.StableNudgeProvider)
+	if !ok || !runtime.SupportsStableNudgeTarget(target, name) {
+		return runtime.StableNudgeReceipt{}, runtime.ErrStableNudgeUnsupported
+	}
+	return stable.NudgeStable(ctx, name, effectID, content)
+}
+
+// LookupStableNudge reads stable-nudge evidence from the routed backend.
+func (p *Provider) LookupStableNudge(ctx context.Context, name, effectID string, content []runtime.ContentBlock) (runtime.StableNudgeLookup, error) {
+	target := p.route(name)
+	stable, ok := target.(runtime.StableNudgeProvider)
+	if !ok || !runtime.SupportsStableNudgeTarget(target, name) {
+		return runtime.StableNudgeLookup{}, runtime.ErrStableNudgeUnsupported
+	}
+	return stable.LookupStableNudge(ctx, name, effectID, content)
 }
 
 // RouteACP registers a session name to use the ACP backend.

@@ -3125,8 +3125,9 @@ func TestResolveDurableMailSeatUsesConfiguredNamedSessionFrontDoorOnly(t *testin
 		}
 	}
 	emptyFront := session.NewStore(beads.SessionStore{Store: beads.NewMemStore()})
-	if _, _, err := resolveDurableMailSeat(cfg, "test-city", emptyFront, "reviewer"); err == nil || !strings.Contains(err.Error(), "no live configured named session") {
-		t.Fatalf("configured but absent target error = %v", err)
+	seat, recipient, err = resolveDurableMailSeat(cfg, "test-city", emptyFront, "reviewer")
+	if err != nil || seat != "seat:test-city/reviewer" || recipient != "reviewer" {
+		t.Fatalf("configured seat without live canonical = %q, %q, %v", seat, recipient, err)
 	}
 }
 
@@ -3140,7 +3141,6 @@ func TestCmdMailSendDurableWiresConfiguredSeatToMessagingStore(t *testing.T) {
 	t.Setenv("GC_DOLT", "skip")
 	t.Setenv("GC_CITY", cityPath)
 	t.Setenv("GC_SESSION", "exec:"+adapterPath)
-	t.Setenv(testFileStoreHonorExplicitIDsEnv, "1")
 
 	cfg, err := config.Load(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
 	if err != nil {

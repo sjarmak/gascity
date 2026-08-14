@@ -216,7 +216,7 @@ func TestMailDeliveryExactBinaryRecoversCommittedEffectAcrossCWD(t *testing.T) {
 		t.Fatalf("decode second exact gc report: %v\n%s", err, secondOut)
 	}
 	if report.SchemaVersion != "mail-delivery-reconcile/v1" || report.SeatRef != seatRef || len(report.Deliveries) != 1 ||
-		report.Deliveries[0].DeliveryID != delivery.ID || report.Deliveries[0].Phase != string(maildelivery.PhaseRuntimeNotified) ||
+		report.Deliveries[0].DeliveryID != delivery.ID || report.Deliveries[0].Phase != string(maildelivery.PhaseDispositioned) ||
 		report.Deliveries[0].Outcome != "committed" || report.Deliveries[0].Attempt.AttemptID != attemptID ||
 		report.Deliveries[0].Attempt.NudgeID != nudgeID || report.Deliveries[0].Attempt.State != string(maildelivery.TransportCommitted) {
 		t.Fatalf("second exact gc report = %#v", report)
@@ -251,7 +251,7 @@ func TestMailDeliveryExactBinaryRecoversCommittedEffectAcrossCWD(t *testing.T) {
 		t.Fatalf("final exact attempt = %#v, %v", finalAttempt, err)
 	}
 	finalDelivery, err := maildelivery.NewStore(store).Get(delivery.ID)
-	if err != nil || finalDelivery.Phase != maildelivery.PhaseRuntimeNotified {
+	if err != nil || finalDelivery.Phase != maildelivery.PhaseDispositioned {
 		t.Fatalf("final exact delivery = %#v, %v", finalDelivery, err)
 	}
 	if messageCount, deliveryCount := countMailDeliveryBinaryRows(t, store); messageCount != 1 || deliveryCount != 1 {
@@ -361,7 +361,6 @@ func runMailDeliveryExactBinary(ctx context.Context, binary, cwd, cityPath, adap
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"), "HOME=" + filepath.Join(cityPath, ".home"), "GC_HOME=" + filepath.Join(cityPath, ".gc-home"),
 		"GC_CITY=" + cityPath, "GC_BEADS=file", "GC_BEADS_SCOPE_ROOT=", "GC_DOLT=skip", "GC_SESSION=exec:" + adapterPath,
-		testFileStoreHonorExplicitIDsEnv + "=1",
 	}
 	output, err := cmd.CombinedOutput()
 	return string(output), err

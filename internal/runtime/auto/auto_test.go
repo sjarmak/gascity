@@ -93,6 +93,36 @@ func TestRouteDefaultAndACP(t *testing.T) {
 	}
 }
 
+func TestStableNudgeCapabilityAndCallsFollowExactRoute(t *testing.T) {
+	if !New(runtime.NewFake(), runtime.NewFake()).SupportsStableNudge() {
+		t.Fatal("all-capable composite lost global capability")
+	}
+	defaultSP := runtime.NewFake()
+	acpSP := &runtimeNoInteractionProvider{Provider: runtime.NewFake()}
+	p := New(defaultSP, acpSP)
+	p.RouteACP("acp-agent")
+	if err := defaultSP.Start(context.Background(), "plain-agent", runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	if !p.SupportsStableNudgeTarget("plain-agent") || p.SupportsStableNudgeTarget("acp-agent") || p.SupportsStableNudge() {
+		t.Fatalf("capability global=%t plain=%t acp=%t", p.SupportsStableNudge(), p.SupportsStableNudgeTarget("plain-agent"), p.SupportsStableNudgeTarget("acp-agent"))
+	}
+	effectID := "mail-nudge-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	content := runtime.TextContent("notice")
+	if _, err := p.NudgeStable(context.Background(), "plain-agent", effectID, content); err != nil {
+		t.Fatalf("plain NudgeStable: %v", err)
+	}
+	if lookup, err := p.LookupStableNudge(context.Background(), "plain-agent", effectID, content); err != nil || lookup.State != runtime.StableNudgeLookupCommitted {
+		t.Fatalf("plain LookupStableNudge = %#v, %v", lookup, err)
+	}
+	if _, err := p.NudgeStable(context.Background(), "acp-agent", effectID, content); !errors.Is(err, runtime.ErrStableNudgeUnsupported) {
+		t.Fatalf("acp NudgeStable = %v, want unsupported", err)
+	}
+	if _, err := p.LookupStableNudge(context.Background(), "acp-agent", effectID, content); !errors.Is(err, runtime.ErrStableNudgeUnsupported) {
+		t.Fatalf("acp LookupStableNudge = %v, want unsupported", err)
+	}
+}
+
 func TestUnroute(t *testing.T) {
 	defaultSP := runtime.NewFake()
 	acpSP := runtime.NewFake()

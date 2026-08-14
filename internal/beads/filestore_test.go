@@ -94,6 +94,20 @@ func TestFileStore(t *testing.T) {
 	beadstest.RunFenceConformance(t, factory)
 }
 
+func TestFileStoreHonorsExplicitIDsByDefault(t *testing.T) {
+	store, err := beads.OpenFileStore(fsys.OSFS{}, filepath.Join(t.TempDir(), "beads.json"))
+	if err != nil {
+		t.Fatalf("OpenFileStore: %v", err)
+	}
+	created, err := store.Create(beads.Bead{ID: "stable-id", Title: "stable"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if created.ID != "stable-id" {
+		t.Fatalf("created ID = %q, want stable-id", created.ID)
+	}
+}
+
 func TestFileStoreConditionalWriterConformance(t *testing.T) {
 	open := func(st *testing.T) beads.Store {
 		path := filepath.Join(st.TempDir(), "beads.json")

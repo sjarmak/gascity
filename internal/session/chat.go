@@ -836,6 +836,13 @@ func (m *Manager) SupportsStableNudge() bool {
 	return ok && stable.SupportsStableNudge()
 }
 
+// SupportsStableNudgeForSession reports capability for the exact configured
+// runtime route behind a session bead.
+func (m *Manager) SupportsStableNudgeForSession(id string) bool {
+	_, sessName, err := m.sessionBead(id)
+	return err == nil && runtime.SupportsStableNudgeTarget(m.sp, sessName)
+}
+
 // SendStableLiveOnly invokes a destination-idempotent nudge for an already
 // running exact session. The provider owns atomic effect+receipt persistence.
 func (m *Manager) SendStableLiveOnly(ctx context.Context, id, effectID, message string) (receipt runtime.StableNudgeReceipt, delivered bool, err error) {
@@ -845,7 +852,7 @@ func (m *Manager) SendStableLiveOnly(ctx context.Context, id, effectID, message 
 			return loadErr
 		}
 		stable, ok := m.sp.(runtime.StableNudgeProvider)
-		if !ok || !stable.SupportsStableNudge() {
+		if !ok || !runtime.SupportsStableNudgeTarget(m.sp, sessName) {
 			return runtime.ErrStableNudgeUnsupported
 		}
 		if !m.sp.IsRunning(sessName) {
@@ -869,7 +876,7 @@ func (m *Manager) LookupStableNudge(ctx context.Context, id, effectID, message s
 			return loadErr
 		}
 		stable, ok := m.sp.(runtime.StableNudgeProvider)
-		if !ok || !stable.SupportsStableNudge() {
+		if !ok || !runtime.SupportsStableNudgeTarget(m.sp, sessName) {
 			return runtime.ErrStableNudgeUnsupported
 		}
 		lookup, loadErr = stable.LookupStableNudge(ctx, sessName, effectID, runtime.TextContent(message))

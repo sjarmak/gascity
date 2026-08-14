@@ -2,6 +2,7 @@ package maildelivery
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +13,21 @@ func newDeliveryStore() (*Store, *beads.MemStore) {
 	backing := beads.NewMemStore()
 	backing.HonorExplicitIDs = true
 	return NewStore(backing), backing
+}
+
+func TestStoreCreateFailsBeforeWriteAndRetainsConditionalWriterDiagnostic(t *testing.T) {
+	backing := beads.NewMemStore()
+	store := &Store{beads: backing, writerErr: errors.New("native CAS probe failed")}
+	if _, err := store.Create(validDelivery(t)); err == nil || !strings.Contains(err.Error(), "native CAS probe failed") {
+		t.Fatalf("Create error = %v, want retained diagnostic", err)
+	}
+	rows, err := backing.List(beads.ListQuery{AllowScan: true, IncludeClosed: true, TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("failed Create wrote rows: %#v", rows)
+	}
 }
 
 func TestStoreListActionableKeysIsSeatScopedBoundedAndKeysetPaged(t *testing.T) {

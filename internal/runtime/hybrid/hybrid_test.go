@@ -69,6 +69,35 @@ func TestStart_RoutesToRemote(t *testing.T) {
 	}
 }
 
+func TestStableNudgeCapabilityAndCallsFollowExactRoute(t *testing.T) {
+	if !New(runtime.NewFake(), runtime.NewFake(), isRemote).SupportsStableNudge() {
+		t.Fatal("all-capable composite lost global capability")
+	}
+	local := runtime.NewFake()
+	remote := &runtimeNoInteractionProvider{Provider: runtime.NewFake()}
+	h := New(local, remote, isRemote)
+	if err := local.Start(context.Background(), "local-agent", runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	if !h.SupportsStableNudgeTarget("local-agent") || h.SupportsStableNudgeTarget("remote-agent-1") || h.SupportsStableNudge() {
+		t.Fatalf("capability global=%t local=%t remote=%t", h.SupportsStableNudge(), h.SupportsStableNudgeTarget("local-agent"), h.SupportsStableNudgeTarget("remote-agent-1"))
+	}
+	effectID := "mail-nudge-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	content := runtime.TextContent("notice")
+	if _, err := h.NudgeStable(context.Background(), "local-agent", effectID, content); err != nil {
+		t.Fatalf("local NudgeStable: %v", err)
+	}
+	if lookup, err := h.LookupStableNudge(context.Background(), "local-agent", effectID, content); err != nil || lookup.State != runtime.StableNudgeLookupCommitted {
+		t.Fatalf("local LookupStableNudge = %#v, %v", lookup, err)
+	}
+	if _, err := h.NudgeStable(context.Background(), "remote-agent-1", effectID, content); !errors.Is(err, runtime.ErrStableNudgeUnsupported) {
+		t.Fatalf("remote NudgeStable = %v, want unsupported", err)
+	}
+	if _, err := h.LookupStableNudge(context.Background(), "remote-agent-1", effectID, content); !errors.Is(err, runtime.ErrStableNudgeUnsupported) {
+		t.Fatalf("remote LookupStableNudge = %v, want unsupported", err)
+	}
+}
+
 func TestListRunning_MergesBothBackends(t *testing.T) {
 	local, remote := runtime.NewFake(), runtime.NewFake()
 	h := New(local, remote, isRemote)
