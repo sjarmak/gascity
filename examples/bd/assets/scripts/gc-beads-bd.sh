@@ -2480,6 +2480,31 @@ run_bd_pinned() {
     )
 }
 
+record_bd_local_version_after_init() {
+    local dir="$1"
+    local version tmp
+    version=$(bd --version 2>/dev/null | awk 'NR == 1 && $1 == "bd" && $2 == "version" { print $3 }')
+    if [ -z "$version" ] && [ "${GC_MANAGED_DOLT_TEST_MODE:-}" = "1" ]; then
+        # Unit fixtures use deliberately minimal bd stubs. Production binaries
+        # strip this test-only mode before spawning the provider lifecycle.
+        version="1.0.0"
+    fi
+    if ! printf '%s\n' "$version" | awk -F. '
+        NF != 3 { exit 1 }
+        {
+            for (i = 1; i <= 3; i++) {
+                if ($i !~ /^[0-9]+$/) { exit 1 }
+            }
+        }
+    '; then
+        die "bd init succeeded but bd --version did not return a semantic version; refusing to leave an unversioned workspace"
+    fi
+    tmp="$dir/.beads/.local_version.tmp.$$"
+    (umask 077; printf '%s\n' "$version" > "$tmp") || die "failed to record bd workspace version after init"
+    chmod 600 "$tmp" || die "failed to secure bd workspace version after init"
+    mv "$tmp" "$dir/.beads/.local_version" || die "failed to publish bd workspace version after init"
+}
+
 run_bd_init_pinned() {
     local dir="$1"
     local prefix="$2"
@@ -2487,13 +2512,15 @@ run_bd_init_pinned() {
     local host="$4"
     local force_init="${5:-false}"
     if [ "$force_init" = "true" ]; then
-        run_bd_pinned "$dir" init --force --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
+        BEADS_DOLT_SHARED_SERVER=1 run_bd_pinned "$dir" init --force --quiet --server --external -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
             --server-host "$host" --server-port "$DOLT_PORT" "$dir" || die "bd init failed for $dir"
+        record_bd_local_version_after_init "$dir"
         return 0
     fi
 
-    run_bd_pinned "$dir" init --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
+    BEADS_DOLT_SHARED_SERVER=1 run_bd_pinned "$dir" init --quiet --server --external -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
         --server-host "$host" --server-port "$DOLT_PORT" "$dir" || die "bd init failed for $dir"
+    record_bd_local_version_after_init "$dir"
 }
 
 run_bd_doltlite() {
@@ -2876,8 +2903,6 @@ op_init() {
     # compatibility state for raw bd operations, not a second GC authority.
     ensure_bd_runtime_issue_prefix "$dolt_database" "$prefix"
 
-    ensure_project_identity "$dir"
-
     # Drop orphan database created by bd init (upstream gt-sv1h) only after
     # the pinned database schema is visible. Some bd builds appear to stage
     # schema work before the pinned catalog entry is fully adopted; deleting
@@ -2888,6 +2913,7 @@ op_init() {
     fi
 
     normalize_scope_after_init "$dir" "$prefix" "$dolt_database"
+    ensure_project_identity "$dir"
 }
 
 

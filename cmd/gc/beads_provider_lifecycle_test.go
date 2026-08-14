@@ -5432,6 +5432,7 @@ func TestInitAndHookDirExecGcBeadsBdCanonicalizesScopeFilesInGo(t *testing.T) {
 	writeExecStoreCityConfig(t, cityPath, "demo", "gc", nil)
 
 	captureFile := filepath.Join(t.TempDir(), "canonical-files-owned")
+	preInitMetadataFile := filepath.Join(t.TempDir(), "pre-init-metadata")
 	scriptDir := t.TempDir()
 	script := filepath.Join(scriptDir, "gc-beads-bd")
 	scriptBody := fmt.Sprintf(`#!/bin/sh
@@ -5440,9 +5441,14 @@ op="$1"
 shift
 case "$op" in
   init)
-    printf '%%s
+	printf '%%s
 ' "${GC_CANONICAL_FILES_OWNED:-}" > %q
-    dir="$1"
+	dir="$1"
+	if [ -e "$dir/.beads/metadata.json" ]; then
+		printf 'present\n' > %q
+	else
+		printf 'absent\n' > %q
+	fi
     mkdir -p "$dir/.beads"
     cat > "$dir/.beads/config.yaml" <<'YAML'
 issue-prefix: stale
@@ -5457,7 +5463,7 @@ JSON
     exit 2
     ;;
 esac
-`, captureFile)
+`, captureFile, preInitMetadataFile, preInitMetadataFile)
 	if err := os.WriteFile(script, []byte(scriptBody), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -5472,6 +5478,11 @@ esac
 		t.Fatalf("read capture file: %v", err)
 	} else if got := strings.TrimSpace(string(data)); got != "" {
 		t.Fatalf("GC_CANONICAL_FILES_OWNED = %q, want empty", got)
+	}
+	if data, err := os.ReadFile(preInitMetadataFile); err != nil {
+		t.Fatalf("read pre-init metadata observation: %v", err)
+	} else if got := strings.TrimSpace(string(data)); got != "absent" {
+		t.Fatalf("metadata before provider init = %q, want absent so bd can establish its current-version witness", got)
 	}
 
 	cfgState, ok, err := contract.ReadConfigState(fsys.OSFS{}, filepath.Join(cityPath, ".beads", "config.yaml"))
@@ -6105,9 +6116,14 @@ capture_dir="` + captureDir + `"
 cmd="${1:-}"
 record() {
   name="$1"
-  printf '%s|%s|%s|%s|%s\n' "${GC_DOLT_HOST:-}" "${GC_DOLT_PORT:-}" "${BEADS_DOLT_SERVER_HOST:-}" "${BEADS_DOLT_SERVER_PORT:-}" "${BEADS_DIR:-}" > "$capture_dir/$name"
+	  printf '%s|%s|%s|%s|%s|%s\n' "${GC_DOLT_HOST:-}" "${GC_DOLT_PORT:-}" "${BEADS_DOLT_SERVER_HOST:-}" "${BEADS_DOLT_SERVER_PORT:-}" "${BEADS_DOLT_SHARED_SERVER:-}" "${BEADS_DIR:-}" > "$capture_dir/$name"
 }
+
 case "$cmd" in
+	--version)
+		echo 'bd version 1.1.1 (test)'
+		exit 0
+		;;
   init)
     last=""
     for arg in "$@"; do
@@ -6164,6 +6180,7 @@ esac
 		"3307",
 		"rig-db.example.com",
 		"3307",
+		"1",
 		filepath.Join(rigDir, ".beads"),
 	}, "|")
 	data, err := os.ReadFile(filepath.Join(captureDir, "init.env"))
@@ -6181,14 +6198,67 @@ esac
 		t.Fatalf("read list.env: %v", err)
 	}
 	parts := strings.Split(strings.TrimSpace(string(listData)), "|")
-	if len(parts) != 5 {
-		t.Fatalf("list.env = %q, want 5 fields", strings.TrimSpace(string(listData)))
+	if len(parts) != 6 {
+		t.Fatalf("list.env = %q, want 6 fields", strings.TrimSpace(string(listData)))
 	}
 	if parts[0] != "rig-db.example.com" || parts[1] != "3307" {
 		t.Fatalf("list.env host/port = %q|%q, want rig-db.example.com|3307", parts[0], parts[1])
 	}
-	if parts[4] != filepath.Join(rigDir, ".beads") {
-		t.Fatalf("list.env BEADS_DIR = %q, want %q", parts[4], filepath.Join(rigDir, ".beads"))
+	if parts[4] != "" {
+		t.Fatalf("list.env BEADS_DOLT_SHARED_SERVER = %q, want empty outside the init subprocess", parts[4])
+	}
+	if parts[5] != filepath.Join(rigDir, ".beads") {
+		t.Fatalf("list.env BEADS_DIR = %q, want %q", parts[5], filepath.Join(rigDir, ".beads"))
+	}
+	versionData, err := os.ReadFile(filepath.Join(rigDir, ".beads", ".local_version"))
+	if err != nil {
+		t.Fatalf("read .local_version: %v", err)
+	}
+	if got := strings.TrimSpace(string(versionData)); got != "1.1.1" {
+		t.Fatalf(".local_version = %q, want pinned bd semantic version 1.1.1", got)
+	}
+}
+
+func TestRecordBdLocalVersionAfterInitPreservesCallerUmask(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available; skipping shell-function test")
+	}
+
+	root := repoRootForLint(t)
+	scriptBytes, err := os.ReadFile(filepath.Join(root, "examples", "bd", "assets", "scripts", "gc-beads-bd.sh"))
+	if err != nil {
+		t.Fatalf("read gc-beads-bd.sh: %v", err)
+	}
+	fnSrc := extractShellFunction(t, string(scriptBytes), "record_bd_local_version_after_init")
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	probe := `set -e
+die() { printf '%s\n' "$*" >&2; return 1; }
+bd() { printf '%s\n' 'bd version 1.1.1 (test)'; }
+` + fnSrc + `
+umask 027
+before=$(umask)
+record_bd_local_version_after_init "$1"
+after=$(umask)
+printf '%s|%s\n' "$before" "$after"
+`
+	cmd := exec.Command("bash", "-c", probe, "bash", dir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("record local version probe: %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "0027|0027" {
+		t.Fatalf("umask before|after = %q, want 0027|0027", got)
+	}
+	version, err := os.ReadFile(filepath.Join(dir, ".beads", ".local_version"))
+	if err != nil {
+		t.Fatalf("read .local_version: %v", err)
+	}
+	if got := strings.TrimSpace(string(version)); got != "1.1.1" {
+		t.Fatalf(".local_version = %q, want 1.1.1", got)
 	}
 }
 
@@ -7578,7 +7648,7 @@ esac
 		t.Fatalf("read init args: %v", err)
 	}
 	gotArgs := string(argsData)
-	for _, want := range []string{"init --quiet --server -p gc --database hq"} {
+	for _, want := range []string{"init --quiet --server --external -p gc --database hq"} {
 		if !strings.Contains(gotArgs, want) {
 			t.Fatalf("bd init retry args missing %q:\n%s", want, gotArgs)
 		}
@@ -7708,8 +7778,8 @@ esac
 	}
 	gotState := string(stateData)
 	for _, want := range []string{
-		"metadata=yes args=init --force --quiet --server -p gc --database hq",
-		"metadata=no args=init --quiet --server -p gc --database hq",
+		"metadata=yes args=init --force --quiet --server --external -p gc --database hq",
+		"metadata=no args=init --quiet --server --external -p gc --database hq",
 	} {
 		if !strings.Contains(gotState, want) {
 			t.Fatalf("init state missing %q:\n%s", want, gotState)

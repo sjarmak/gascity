@@ -5459,6 +5459,15 @@ func TestCityRuntimeSoftReloadAcceptsDriftForAppliedAndNoChange(t *testing.T) {
 			}
 
 			store := beads.NewMemStore()
+			// Applied reloads reopen the controller state's authoritative city
+			// store. Keep that seam on this fixture's store so the test observes
+			// one durable session corpus even when the pinned native provider can
+			// successfully open the otherwise-empty temporary city.
+			previousOpenCityStore := newControllerStateOpenCityStore
+			newControllerStateOpenCityStore = func(string, gate.Mode) (beads.StoreOpenResult, error) {
+				return beads.StoreOpenResult{Store: store}, nil
+			}
+			t.Cleanup(func() { newControllerStateOpenCityStore = previousOpenCityStore })
 			oldHash := runtime.CoreFingerprint(runtime.Config{Command: tc.storedCommand})
 			sessionBead, err := store.Create(beads.Bead{
 				Title:  "worker",
@@ -5518,8 +5527,11 @@ func TestCityRuntimeSoftReloadAcceptsDriftForAppliedAndNoChange(t *testing.T) {
 				if reply.Outcome != tc.wantOutcome {
 					t.Fatalf("reply.Outcome = %q, want %q; stderr=%s stdout=%s", reply.Outcome, tc.wantOutcome, stderr.String(), stdout.String())
 				}
-				if reply.AcceptedDriftCount == nil || *reply.AcceptedDriftCount != tc.wantAccepted {
-					t.Fatalf("AcceptedDriftCount = %v, want %d", reply.AcceptedDriftCount, tc.wantAccepted)
+				if reply.AcceptedDriftCount == nil {
+					t.Fatalf("AcceptedDriftCount = nil, want %d", tc.wantAccepted)
+				}
+				if *reply.AcceptedDriftCount != tc.wantAccepted {
+					t.Fatalf("AcceptedDriftCount = %d, want %d; stderr=%s stdout=%s", *reply.AcceptedDriftCount, tc.wantAccepted, stderr.String(), stdout.String())
 				}
 			default:
 				t.Fatal("manual soft reload did not reply")

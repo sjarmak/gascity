@@ -501,7 +501,7 @@ func canonicalScopeDoltDatabase(cityPath, dir, prefix string) string {
 	return readDeferredManagedDoltDatabase(filepath.Join(dir, ".beads", "metadata.json"), defaultScopeDoltDatabase(cityPath, dir, prefix))
 }
 
-func normalizeCanonicalBdScopeFilesForInit(cityPath, dir, prefix, doltDatabase string) error {
+func normalizeCanonicalBdScopeConfigForInit(cityPath, dir, prefix string) error {
 	if !cityUsesBdStoreContract(cityPath) {
 		return nil
 	}
@@ -516,6 +516,18 @@ func normalizeCanonicalBdScopeFilesForInit(cityPath, dir, prefix, doltDatabase s
 		if err := ensureCanonicalScopeConfigState(fsys.OSFS{}, dir, state); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func normalizeCanonicalBdScopeFilesForInit(cityPath, dir, prefix, doltDatabase string) error {
+	if err := normalizeCanonicalBdScopeConfigForInit(cityPath, dir, prefix); err != nil {
+		return err
+	}
+	if skipsManagedDolt, err := scopeSkipsManagedDoltForInit(cityPath, dir); err != nil {
+		return err
+	} else if skipsManagedDolt {
+		return nil
 	}
 	if strings.TrimSpace(doltDatabase) == "" {
 		doltDatabase = canonicalScopeDoltDatabase(cityPath, dir, prefix)
@@ -544,7 +556,10 @@ func initAndHookDir(cityPath, dir, prefix string) error {
 		return nil
 	}
 	doltDatabase := canonicalScopeDoltDatabase(cityPath, dir, prefix)
-	if err := normalizeCanonicalBdScopeFilesForInit(cityPath, dir, prefix, doltDatabase); err != nil {
+	// Before bd init, gc owns only config.yaml. Let bd create metadata.json and
+	// its current-version witness together; pre-seeding metadata makes a fresh
+	// shared-server workspace indistinguishable from a legacy workspace to bd.
+	if err := normalizeCanonicalBdScopeConfigForInit(cityPath, dir, prefix); err != nil {
 		return err
 	}
 	if err := initBeadsForDir(cityPath, dir, prefix, doltDatabase); err != nil {
