@@ -110,10 +110,10 @@ func (a TransportAttempt) ValidateAuthority(fence ActivationFence) error {
 		return err
 	}
 	want := attemptIDFromAuthority(a.DeliveryID, fence.AuthorityKind, fence.AuthorityRef,
-		fence.AuthorityGeneration, fence.AuthorityIntentSHA256, fence.SessionRef,
+		fence.AuthorityGeneration, fence.SessionRef,
 		fence.ContinuationEpoch, fence.InstanceTokenSHA256)
 	if a.AttemptID != want || a.AuthorityKind != fence.AuthorityKind || a.AuthorityRef != fence.AuthorityRef ||
-		a.AuthorityGeneration != fence.AuthorityGeneration || a.AuthorityIntentSHA256 != fence.AuthorityIntentSHA256 ||
+		a.AuthorityGeneration != fence.AuthorityGeneration ||
 		a.SessionRef != fence.SessionRef || a.ContinuationEpoch != fence.ContinuationEpoch ||
 		a.InstanceTokenSHA256 != fence.InstanceTokenSHA256 {
 		return fmt.Errorf("%w: transport attempt authority is stale", ErrConflict)
@@ -596,7 +596,7 @@ func (a TransportAttempt) validate() error {
 		return fmt.Errorf("mail delivery transport attempt does not cover its primary delivery")
 	}
 	wantAttemptID := attemptIDFromAuthority(a.DeliveryID, a.AuthorityKind, a.AuthorityRef,
-		a.AuthorityGeneration, a.AuthorityIntentSHA256, a.SessionRef, a.ContinuationEpoch, a.InstanceTokenSHA256)
+		a.AuthorityGeneration, a.SessionRef, a.ContinuationEpoch, a.InstanceTokenSHA256)
 	if a.AttemptID != wantAttemptID {
 		return fmt.Errorf("mail delivery transport attempt ID differs from stable authority")
 	}
@@ -644,6 +644,10 @@ func encodeTransportAttempt(attempt TransportAttempt) (string, error) {
 
 func sameTransportIntent(existing, proposed TransportAttempt) bool {
 	existing.CreatedAt = proposed.CreatedAt
+	// The intent digest records config/issuer provenance at admission, but it
+	// does not identify the destination effect. A retry after config drift must
+	// reuse the persisted audit value and the same stable attempt/nudge IDs.
+	existing.AuthorityIntentSHA256 = proposed.AuthorityIntentSHA256
 	existing.State = proposed.State
 	existing.Receipt = proposed.Receipt
 	existing.InvocationStartedAt = proposed.InvocationStartedAt

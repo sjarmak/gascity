@@ -101,14 +101,14 @@ func AttemptID(deliveryID string, fence ActivationFence) (string, error) {
 		return "", err
 	}
 	return attemptIDFromAuthority(deliveryID, fence.AuthorityKind, fence.AuthorityRef,
-		fence.AuthorityGeneration, fence.AuthorityIntentSHA256, fence.SessionRef,
+		fence.AuthorityGeneration, fence.SessionRef,
 		fence.ContinuationEpoch, fence.InstanceTokenSHA256), nil
 }
 
-func attemptIDFromAuthority(deliveryID string, kind AuthorityKind, authorityRef string, generation uint64, intentSHA256, sessionRef string, epoch uint64, tokenSHA256 string) string {
+func attemptIDFromAuthority(deliveryID string, kind AuthorityKind, authorityRef string, generation uint64, sessionRef string, epoch uint64, tokenSHA256 string) string {
 	return "mail-attempt-" + digest(
 		"mail-attempt-v1", deliveryID, string(kind), authorityRef, fmt.Sprint(generation),
-		intentSHA256, sessionRef, fmt.Sprint(epoch), tokenSHA256,
+		sessionRef, fmt.Sprint(epoch), tokenSHA256,
 	)
 }
 

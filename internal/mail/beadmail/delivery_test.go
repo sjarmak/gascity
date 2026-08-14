@@ -83,6 +83,33 @@ func TestSendDurableStableDerivesDomainBoundIdentityAndReplaysExactly(t *testing
 	}
 }
 
+func TestSameDurableMessageIgnoresOnlyVolatileSenderSessionIdentity(t *testing.T) {
+	wanted := beads.Bead{
+		ID: "gc-mail-stable", Title: "subject", Description: "body", Type: messageBeadType,
+		Assignee: "reviewer", From: "sender", NoHistory: true,
+		Labels: []string{"thread:" + durableThreadID("gc-mail-stable")},
+		Metadata: map[string]string{
+			fromSessionIDMetadataKey: "session-new",
+			fromDisplayMetadataKey:   "sender",
+			durableDeliveryRepairKey: "repair-proof",
+		},
+	}
+	existing := wanted
+	existing.Metadata = map[string]string{
+		fromSessionIDMetadataKey: "session-old",
+		fromDisplayMetadataKey:   "sender",
+		durableDeliveryRepairKey: "repair-proof",
+	}
+	if !sameDurableMessage(existing, wanted) {
+		t.Fatal("replacement sender session changed the logical durable message")
+	}
+
+	existing.Metadata[fromDisplayMetadataKey] = "other-sender"
+	if sameDurableMessage(existing, wanted) {
+		t.Fatal("changed logical sender was ignored with volatile session metadata")
+	}
+}
+
 func TestSendDurableStableReplayReturnsAdvancedDeliveryPhase(t *testing.T) {
 	backing := beads.NewMemStore()
 	backing.HonorExplicitIDs = true

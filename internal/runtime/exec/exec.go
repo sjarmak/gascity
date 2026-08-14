@@ -673,7 +673,10 @@ func (p *Provider) NudgeStable(ctx context.Context, name, effectID string, conte
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return runtime.StableNudgeReceipt{}, fmt.Errorf("malformed stable nudge response: trailing JSON")
 	}
-	if validateErr := receipt.Validate(); validateErr != nil || receipt.EffectID != effectID || receipt.TargetRuntimeName != name || receipt.ContentSHA256 != contentHash {
+	if validateErr := receipt.Validate(); validateErr != nil {
+		return runtime.StableNudgeReceipt{}, fmt.Errorf("malformed stable nudge receipt: %w", validateErr)
+	}
+	if receipt.EffectID != effectID || receipt.TargetRuntimeName != name || receipt.ContentSHA256 != contentHash {
 		return runtime.StableNudgeReceipt{}, fmt.Errorf("%w: destination receipt differs from request", runtime.ErrStableNudgeConflict)
 	}
 	return receipt, nil
@@ -726,6 +729,9 @@ func (p *Provider) LookupStableNudge(ctx context.Context, name, effectID string,
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return runtime.StableNudgeLookup{}, fmt.Errorf("decoding stable nudge lookup: trailing JSON")
+	}
+	if err := lookup.ValidateShape(); err != nil {
+		return runtime.StableNudgeLookup{}, fmt.Errorf("malformed stable nudge lookup: %w", err)
 	}
 	if err := lookup.Validate(effectID, name, contentHash); err != nil {
 		return runtime.StableNudgeLookup{}, fmt.Errorf("%w: %w", runtime.ErrStableNudgeConflict, err)

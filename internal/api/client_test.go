@@ -14,6 +14,8 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
 )
@@ -577,7 +579,7 @@ func TestClientBusinessErrorNoFallback(t *testing.T) {
 }
 
 func TestMailDeliveryMutationClientMalformedAndBusinessResponsesDoNotFallback(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/mail/durable"):
@@ -643,10 +645,9 @@ func TestMailDeliveryMutationClientMalformedAndBusinessResponsesDoNotFallback(t 
 			}
 			_, _ = fmt.Fprintf(w, `{"ok":true,"attempt":%s}`, shape)
 		}
-	}))
-	defer ts.Close()
+	})
 
-	c := NewCityScopedClient(ts.URL, "alpha")
+	c := newClientWithHTTPClient("http://localhost", "alpha", &http.Client{Transport: loopbackTransport{h: handler}})
 	for _, attemptID := range []string{
 		"app-500", "business-409", "malformed-object", "malformed-string", "malformed-number", "malformed-null",
 	} {
@@ -732,6 +733,24 @@ func TestMailDeliveryMutationClientMalformedAndBusinessResponsesDoNotFallback(t 
 		if err == nil || !ShouldFallback(unavailable, err) {
 			t.Fatalf("%s err=%v fallback=%v", operation, err, ShouldFallback(unavailable, err))
 		}
+	}
+}
+
+func TestValidateDurableMailResultPreservesMessageOnlyFailure(t *testing.T) {
+	result := beadmail.DurableSendResult{
+		Message: mail.Message{ID: "gc-message-only"},
+		Outcome: beadmail.DurableSendCreated,
+	}
+	if err := validateDurableMailResult(result, true); err != nil {
+		t.Fatalf("message-only durable result rejected: %v", err)
+	}
+	if err := validateDurableMailResult(result, false); err == nil {
+		t.Fatal("successful response without delivery identity was accepted")
+	}
+
+	result.Message.ID = ""
+	if err := validateDurableMailResult(result, true); err == nil {
+		t.Fatal("delivery-free result without canonical message identity was accepted")
 	}
 }
 

@@ -108,7 +108,7 @@ func (c *controllerMailDeliveryCoordinator) deliveryRuntime(snapshot controllerM
 			store: sessionFrontDoor(sessionStore), sessionRef: sessionRef,
 			options: session.MailActivationFenceOptions{
 				CityRef: "city:" + snapshot.cityName, SeatRef: seatRef, ConfigSHA256: snapshot.configHash,
-				IssuedByRef: "controller:" + snapshot.cityName + "/mail-delivery-api",
+				IssuedByRef: mailDeliveryIssuerRef(snapshot.cityName),
 			},
 		}
 	}

@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,11 +15,33 @@ import (
 	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/maildelivery"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/worker"
 )
+
+type fakeMailDeliveryMutationClient struct {
+	attempts map[string]maildelivery.TransportAttempt
+	errors   map[string]error
+	calls    map[string]int
+}
+
+func (f *fakeMailDeliveryMutationClient) SendDurableMail(api.DurableMailCommand) (beadmail.DurableSendResult, error) {
+	panic("unexpected durable send")
+}
+
+func (f *fakeMailDeliveryMutationClient) ReconcileMailDeliverySeat(string, int, string) (maildelivery.ReconcileReport, error) {
+	panic("unexpected reconcile")
+}
+
+func (f *fakeMailDeliveryMutationClient) InvokeMailDelivery(id string) (maildelivery.TransportAttempt, error) {
+	f.calls[id]++
+	return f.attempts[id], f.errors[id]
+}
+
+func (*fakeMailDeliveryMutationClient) ShouldFallback(error) bool { return false }
 
 type fixedMailDeliveryFenceResolver struct {
 	fence maildelivery.ActivationFence
@@ -53,7 +73,7 @@ func testMailDeliveryFence() maildelivery.ActivationFence {
 		AuthorityIntentSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		SessionRef:            "gc-session-test", ContinuationEpoch: 3,
 		InstanceTokenSHA256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		IssuedByRef:         "controller:test-city/mail-delivery-cli",
+		IssuedByRef:         mailDeliveryIssuerRef("test-city"),
 		IssuedAt:            time.Date(2026, 8, 13, 23, 40, 0, 0, time.UTC),
 	}
 }
@@ -107,36 +127,23 @@ func TestMailDeliveryCommandsAreRegistered(t *testing.T) {
 	}
 }
 
-// TestMailDeliveryInvokeAPIPreservesResultAndNeverFallsBackOnResponses is the
-// checked Medium HTTP owner for the CLI mutation-routing/no-second-effect proof.
+// TestMailDeliveryInvokeAPIPreservesResultAndNeverFallsBackOnResponses covers
+// CLI mutation routing through an owned in-process adapter without a listener.
 func TestMailDeliveryInvokeAPIPreservesResultAndNeverFallsBackOnResponses(t *testing.T) {
 	attempt := maildelivery.TransportAttempt{
 		Version: 1, AttemptID: "mail-attempt-result", DeliveryID: "mail-delivery-result",
 		State: maildelivery.TransportRequested, InvocationCount: 2,
 		CreatedAt: time.Date(2026, 8, 14, 12, 30, 0, 0, time.UTC),
 	}
-	calls := make(map[string]int)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attemptID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v0/city/test-city/mail/delivery/"), "/invoke")
-		calls[attemptID]++
-		w.Header().Set("Content-Type", "application/json")
-		switch attemptID {
-		case attempt.AttemptID:
-			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-				"ok": false, "failure_code": "retry_safe", "attempt": attempt,
-			})
-		case "mail-attempt-app-500":
-			w.Header().Set("Content-Type", "application/problem+json")
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-				"title": "Internal Server Error", "status": http.StatusInternalServerError,
-				"detail": "provider failed after admission",
-			})
-		default:
-			_, _ = w.Write([]byte(`{"ok":true,"attempt":`))
-		}
-	}))
-	t.Cleanup(server.Close)
+	fake := &fakeMailDeliveryMutationClient{
+		attempts: map[string]maildelivery.TransportAttempt{attempt.AttemptID: attempt},
+		errors: map[string]error{
+			attempt.AttemptID:        &api.MailDeliveryOperationError{Code: "retry_safe"},
+			"mail-attempt-app-500":   errors.New("provider failed after admission"),
+			"mail-attempt-malformed": errors.New("decoding mail delivery invoke response"),
+		},
+		calls: make(map[string]int),
+	}
 
 	cityPath := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o600); err != nil {
@@ -144,14 +151,9 @@ func TestMailDeliveryInvokeAPIPreservesResultAndNeverFallsBackOnResponses(t *tes
 	}
 	t.Setenv("GC_CITY", cityPath)
 	t.Setenv("GC_NO_API", "")
-	originalAlive, originalSupervisor := apiRouteControllerAliveHook, apiRouteSupervisorClientHook
-	t.Cleanup(func() {
-		apiRouteControllerAliveHook = originalAlive
-		apiRouteSupervisorClientHook = originalSupervisor
-	})
-	apiRouteControllerAliveHook = func(string) int { return 0 }
-	client := api.NewCityScopedClient(server.URL, "test-city")
-	apiRouteSupervisorClientHook = func(string) *api.Client { return client }
+	originalResolver := resolveMailDeliveryMutationClient
+	t.Cleanup(func() { resolveMailDeliveryMutationClient = originalResolver })
+	resolveMailDeliveryMutationClient = func(string) mailDeliveryMutationClient { return fake }
 
 	for _, tc := range []struct {
 		attemptID  string
@@ -169,8 +171,8 @@ func TestMailDeliveryInvokeAPIPreservesResultAndNeverFallsBackOnResponses(t *tes
 		if !strings.Contains(stdout.String(), tc.wantStdout) || !strings.Contains(stderr.String(), tc.wantStderr) {
 			t.Fatalf("invoke %q stdout=%q stderr=%q", tc.attemptID, stdout.String(), stderr.String())
 		}
-		if strings.Contains(stderr.String(), "open city store") || calls[tc.attemptID] != 1 {
-			t.Fatalf("invoke %q fell back or reinvoked: calls=%d stderr=%q", tc.attemptID, calls[tc.attemptID], stderr.String())
+		if strings.Contains(stderr.String(), "open city store") || fake.calls[tc.attemptID] != 1 {
+			t.Fatalf("invoke %q fell back or reinvoked: calls=%d stderr=%q", tc.attemptID, fake.calls[tc.attemptID], stderr.String())
 		}
 	}
 }
@@ -496,7 +498,7 @@ func TestMailDeliveryWorkerInvokerRetainsCommittedReceiptAcrossPostEffectAuthori
 	}
 	resolver := &mailDeliveryFenceResolver{store: sessionFrontDoor(sessBacking), sessionRef: info.ID, options: session.MailActivationFenceOptions{
 		CityRef: "city:test-city", SeatRef: "seat:test-city/reviewer", ConfigSHA256: strings.Repeat("a", 64),
-		IssuedByRef: "controller:test-city/mail-delivery-cli",
+		IssuedByRef: mailDeliveryIssuerRef("test-city"),
 	}}
 	fence, err := resolver.ResolveMailActivationFence(ctx, "")
 	if err != nil {
@@ -801,7 +803,7 @@ func TestMailDeliveryWorkerReceiptLookupMapsExactDestinationEvidence(t *testing.
 		store: sessionFrontDoor(sessBacking), sessionRef: info.ID,
 		options: session.MailActivationFenceOptions{
 			CityRef: "city:test-city", SeatRef: "seat:test-city/reviewer",
-			ConfigSHA256: strings.Repeat("a", 64), IssuedByRef: "controller:test-city/mail-delivery-cli",
+			ConfigSHA256: strings.Repeat("a", 64), IssuedByRef: mailDeliveryIssuerRef("test-city"),
 		},
 	}
 	fence, err := resolver.ResolveMailActivationFence(ctx, "")

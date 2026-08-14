@@ -109,14 +109,26 @@ type StableNudgeLookup struct {
 
 // Validate checks lookup shape and exact request identity.
 func (l StableNudgeLookup) Validate(effectID, target, contentSHA256 string) error {
+	if err := l.ValidateShape(); err != nil {
+		return err
+	}
+	if l.State == StableNudgeLookupCommitted && (l.Receipt.EffectID != effectID ||
+		l.Receipt.TargetRuntimeName != target || l.Receipt.ContentSHA256 != contentSHA256) {
+		return fmt.Errorf("stable nudge lookup receipt differs from request")
+	}
+	return nil
+}
+
+// ValidateShape checks that a lookup is structurally valid without comparing
+// it to one caller's requested identity.
+func (l StableNudgeLookup) ValidateShape() error {
 	if l.Version != 1 || l.ObservedAt.IsZero() || l.ObservedAt.Location() != time.UTC {
 		return fmt.Errorf("stable nudge lookup version is invalid")
 	}
 	switch l.State {
 	case StableNudgeLookupCommitted:
-		if err := l.Receipt.Validate(); err != nil || l.Receipt.EffectID != effectID ||
-			l.Receipt.TargetRuntimeName != target || l.Receipt.ContentSHA256 != contentSHA256 {
-			return fmt.Errorf("stable nudge lookup receipt differs from request")
+		if err := l.Receipt.Validate(); err != nil {
+			return fmt.Errorf("stable nudge lookup receipt is invalid: %w", err)
 		}
 	case StableNudgeLookupUnknownExternalState:
 		if l.Receipt != (StableNudgeReceipt{}) {
@@ -219,5 +231,5 @@ func validLowerHexSHA256(v string) bool {
 }
 
 func validStableNudgeRef(v string) bool {
-	return v != "" && strings.TrimSpace(v) == v && !strings.ContainsAny(v, "\x00\r\n\t")
+	return v != "" && len(v) <= 256 && strings.ToLower(v) == v && strings.TrimSpace(v) == v && !strings.ContainsAny(v, "\x00\r\n\t")
 }

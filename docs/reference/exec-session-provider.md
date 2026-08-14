@@ -162,6 +162,9 @@ body-free orchestration JSON containing `version`, `effect_id`, and structured
 `content`. The returned schema-1 receipt binds the effect ID, runtime name,
 content SHA-256, destination reference, UTC acceptance time, the exact
 `destination-atomic-effect-receipt` boundary, and a SHA-256 over the receipt.
+Runtime names and destination references use the MailDelivery reference
+contract: non-empty, lower-case, whitespace-exact, control-free, and at most
+256 bytes.
 Declaring the capability without implementing those atomic replay semantics is
 a protocol violation; callers otherwise fail closed before invoking it.
 Transport-level response loss permits unlimited identical retries. The
@@ -171,9 +174,10 @@ state or losing the original retry-safe classification. A destination content
 conflict is returned as schema-1 `StableNudgeConflict` JSON binding the effect
 ID, requested content SHA-256, and different existing content SHA-256; it maps
 to `ErrStableNudgeConflict`, never retry-safe. Unsupported operations and
-malformed receipts/conflicts are also never classified retry-safe. The
-conformance checker uses a per-run effect ID and requires two calls to return
-byte-identical receipt JSON.
+malformed receipts/conflicts are also never classified retry-safe; malformed
+receipt structure fails closed without being mislabeled as an identity
+conflict. The conformance checker uses a per-run effect ID and requires two
+calls to return byte-identical receipt JSON.
 `nudge-stable-status` is read-only and mandatory with the capability. It returns
 either the exact committed receipt or the closed `unknown_external_state`
 outcome with a UTC observation time; it never creates or redelivers an effect.

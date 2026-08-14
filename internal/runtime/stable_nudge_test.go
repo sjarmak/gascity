@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -108,5 +109,62 @@ func TestStableNudgeReceiptRejectsDigestAndIdentityDrift(t *testing.T) {
 				t.Fatalf("Validate accepted mutated receipt %#v", changed)
 			}
 		})
+	}
+}
+
+func TestStableNudgeReceiptRefsMatchMailDeliveryContract(t *testing.T) {
+	effectID := "mail-nudge-" + strings.Repeat("a", 64)
+	for _, invalid := range []string{"Session-A", strings.Repeat("a", 257)} {
+		if _, err := NewStableNudgeReceipt(effectID, invalid, TextContent("notice"), "receipt:one", time.Now().UTC()); err == nil {
+			t.Fatalf("NewStableNudgeReceipt accepted invalid target ref %q", invalid)
+		}
+		if _, err := NewStableNudgeReceipt(effectID, "session-a", TextContent("notice"), invalid, time.Now().UTC()); err == nil {
+			t.Fatalf("NewStableNudgeReceipt accepted invalid destination ref %q", invalid)
+		}
+	}
+}
+
+func TestStableNudgeLookupSeparatesMalformedShapeFromIdentityConflict(t *testing.T) {
+	effectID := "mail-nudge-" + strings.Repeat("b", 64)
+	content := TextContent("notice")
+	contentHash, err := StableNudgeContentSHA256(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := NewStableNudgeReceipt(effectID, "session-a", content, "receipt:one", time.Date(2026, 8, 14, 1, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed := StableNudgeLookup{
+		Version: 1, State: StableNudgeLookupCommitted, Receipt: receipt,
+		ObservedAt: time.Date(2026, 8, 14, 1, 1, 0, 0, time.UTC),
+	}
+	if err := committed.ValidateShape(); err != nil {
+		t.Fatalf("valid committed shape: %v", err)
+	}
+	if err := committed.Validate(effectID, "session-a", contentHash); err != nil {
+		t.Fatalf("valid committed identity: %v", err)
+	}
+	if err := committed.Validate(effectID, "session-b", contentHash); err == nil {
+		t.Fatal("valid receipt with different request identity was accepted")
+	}
+
+	unknown := StableNudgeLookup{Version: 1, State: StableNudgeLookupUnknownExternalState, ObservedAt: committed.ObservedAt}
+	if err := unknown.Validate(effectID, "session-a", contentHash); err != nil {
+		t.Fatalf("valid unknown lookup: %v", err)
+	}
+	unknown.Receipt = receipt
+	if err := unknown.ValidateShape(); err == nil {
+		t.Fatal("unknown lookup carrying a receipt was structurally accepted")
+	}
+	malformed := committed
+	malformed.Receipt.TargetRuntimeName = "Session-A"
+	if err := malformed.ValidateShape(); err == nil {
+		t.Fatal("malformed receipt was structurally accepted")
+	}
+	malformed = committed
+	malformed.State = "other"
+	if err := malformed.ValidateShape(); err == nil {
+		t.Fatal("unknown lookup state was accepted")
 	}
 }

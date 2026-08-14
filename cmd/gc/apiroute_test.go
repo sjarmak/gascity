@@ -154,3 +154,25 @@ func TestMaintenanceAPIClientRoutesToSupervisor(t *testing.T) {
 		}
 	})
 }
+
+func TestMailDeliveryMutationClientUsesManagedSupervisorWhenControllerIsPortless(t *testing.T) {
+	sentinel := api.NewClient("http://supervisor.sentinel:1")
+	origAlive, origSup := apiRouteControllerAliveHook, apiRouteSupervisorClientHook
+	t.Cleanup(func() {
+		apiRouteControllerAliveHook = origAlive
+		apiRouteSupervisorClientHook = origSup
+	})
+	t.Setenv("GC_NO_API", "")
+	apiRouteControllerAliveHook = func(string) int { return 4242 }
+	apiRouteSupervisorClientHook = func(string) *api.Client { return sentinel }
+	dir := writeCityTOMLForRoute(t, t.TempDir(), "name = \"t\"\n")
+
+	got := resolveMailDeliveryMutationClient(dir)
+	client, ok := got.(supervisorMailDeliveryClient)
+	if !ok || client.Client != sentinel {
+		t.Fatalf("mail delivery mutation client = %#v, want managed supervisor", got)
+	}
+	if gotIssuer := mailDeliveryIssuerRef("t"); gotIssuer != "controller:t/mail-delivery" {
+		t.Fatalf("mail delivery issuer = %q", gotIssuer)
+	}
+}

@@ -3,7 +3,7 @@ package api
 import (
 	"context"
 	"errors"
-	"net/http/httptest"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -56,8 +56,8 @@ func (f *mailDeliveryCoordinatorFake) MailDeliveryStatus(context.Context, string
 	return f.attempt, f.statusErr
 }
 
-// TestMailDeliveryControlPlaneRoundTrip is the checked Medium HTTP owner for
-// the running-supervisor/generated-client mutation roundtrip.
+// TestMailDeliveryControlPlaneRoundTrip exercises the generated client and
+// supervisor handler through the owned in-process transport.
 func TestMailDeliveryControlPlaneRoundTrip(t *testing.T) {
 	observedAt := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
 	attempt := maildelivery.TransportAttempt{
@@ -78,15 +78,25 @@ func TestMailDeliveryControlPlaneRoundTrip(t *testing.T) {
 		attempt: attempt, invokeErr: errors.Join(maildelivery.ErrTransportRetrySafe, errors.New("receipt read failed")),
 	}
 	state := &mailDeliveryCoordinatorFakeState{fakeState: newFakeState(t), coordinator: coordinator}
-	server := httptest.NewServer(newTestCityHandler(t, state))
-	t.Cleanup(server.Close)
-	client := NewCityScopedClient(server.URL, state.CityName())
+	handler := newTestCityHandler(t, state)
+	client := newClientWithHTTPClient("http://localhost", state.CityName(), &http.Client{Transport: loopbackTransport{h: handler}})
 
 	durable, err := client.SendDurableMail(DurableMailCommand{
 		StableKey: "roundtrip", Recipient: "worker", SenderCandidates: []string{"human"}, Subject: "subject", Body: "notify",
 	})
 	if err != nil || durable.Outcome != beadmail.DurableSendExactReplay || coordinator.durableCalls != 1 {
 		t.Fatalf("durable = %#v, err=%v, calls=%d", durable, err, coordinator.durableCalls)
+	}
+	coordinator.durableResult = beadmail.DurableSendResult{
+		Message: mail.Message{ID: "gc-message-only", From: "human", To: "worker"},
+		Outcome: beadmail.DurableSendCreated,
+	}
+	coordinator.durableErr = errors.New("delivery create failed after message commit")
+	messageOnly, err := client.SendDurableMail(DurableMailCommand{
+		StableKey: "message-only", Recipient: "worker", SenderCandidates: []string{"human"}, Body: "notify",
+	})
+	if messageOnly.Message.ID != "gc-message-only" || messageOnly.Delivery.ID != "" || err == nil || ShouldFallback(client, err) {
+		t.Fatalf("message-only durable = %#v, err=%v fallback=%v", messageOnly, err, ShouldFallback(client, err))
 	}
 
 	gotReport, err := client.ReconcileMailDeliverySeat(report.SeatRef, 1, "mail-delivery-roundtrip")

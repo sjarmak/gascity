@@ -60,19 +60,59 @@ func TestAttemptIDIgnoresIssuanceMetadata(t *testing.T) {
 	}
 }
 
+func TestAttemptIDIgnoresConfigDerivedIntentButFencesStableAuthority(t *testing.T) {
+	fence := validFence()
+	first, err := AttemptID("mail-delivery-"+strings.Repeat("d", 64), fence)
+	if err != nil {
+		t.Fatalf("AttemptID: %v", err)
+	}
+
+	reconfigured := fence
+	reconfigured.AuthorityIntentSHA256 = strings.Repeat("e", 64)
+	reconfigured.FenceID = "mail-activation-" + reconfigured.AuthorityIntentSHA256
+	second, err := AttemptID("mail-delivery-"+strings.Repeat("d", 64), reconfigured)
+	if err != nil {
+		t.Fatalf("AttemptID after config drift: %v", err)
+	}
+	if second != first {
+		t.Fatalf("config-only drift minted a new effect identity: %q != %q", second, first)
+	}
+
+	reconfigured.AuthorityGeneration++
+	third, err := AttemptID("mail-delivery-"+strings.Repeat("d", 64), reconfigured)
+	if err != nil {
+		t.Fatalf("AttemptID after authority drift: %v", err)
+	}
+	if third == first {
+		t.Fatal("authority generation drift reused the effect identity")
+	}
+}
+
 func TestAttemptIDChangesWithStableAuthority(t *testing.T) {
 	fence := validFence()
 	first, err := AttemptID("mail-delivery-"+strings.Repeat("d", 64), fence)
 	if err != nil {
 		t.Fatalf("AttemptID: %v", err)
 	}
-	fence.ContinuationEpoch++
-	second, err := AttemptID("mail-delivery-"+strings.Repeat("d", 64), fence)
-	if err != nil {
-		t.Fatalf("AttemptID changed authority: %v", err)
-	}
-	if second == first {
-		t.Fatal("continuation epoch change reused attempt ID")
+	for name, mutate := range map[string]func(*ActivationFence){
+		"authority kind":       func(f *ActivationFence) { f.AuthorityKind = AuthorityActivationContractV0Alpha1 },
+		"authority ref":        func(f *ActivationFence) { f.AuthorityRef = "mail-session-fence:test-city/session-2@4" },
+		"authority generation": func(f *ActivationFence) { f.AuthorityGeneration++ },
+		"session":              func(f *ActivationFence) { f.SessionRef = "session-2" },
+		"continuation epoch":   func(f *ActivationFence) { f.ContinuationEpoch++ },
+		"instance token":       func(f *ActivationFence) { f.InstanceTokenSHA256 = strings.Repeat("d", 64) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := fence
+			mutate(&changed)
+			second, err := AttemptID("mail-delivery-"+strings.Repeat("d", 64), changed)
+			if err != nil {
+				t.Fatalf("AttemptID changed authority: %v", err)
+			}
+			if second == first {
+				t.Fatal("stable authority change reused attempt ID")
+			}
+		})
 	}
 }
 
