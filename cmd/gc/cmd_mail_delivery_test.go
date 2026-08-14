@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,17 +77,388 @@ func testMailDeliveryAttempt(t *testing.T) (*maildelivery.Store, maildelivery.Tr
 
 func TestMailDeliveryCommandsAreRegistered(t *testing.T) {
 	cmd := newMailCmd(&bytes.Buffer{}, &bytes.Buffer{})
-	for _, args := range [][]string{{"delivery"}, {"delivery", "status"}, {"delivery", "invoke"}} {
+	for _, args := range [][]string{{"delivery"}, {"delivery", "status"}, {"delivery", "invoke"}, {"delivery", "reconcile-seat"}} {
 		found, _, err := cmd.Find(args)
 		if err != nil || found == nil {
 			t.Fatalf("Find(%v) = %#v, %v", args, found, err)
 		}
 	}
-	for _, name := range []string{"status", "invoke"} {
+	for _, name := range []string{"status", "invoke", "reconcile-seat"} {
 		child, _, err := cmd.Find([]string{"delivery", name})
 		if err != nil || child.Short == "" {
 			t.Fatalf("%s Short = %q, %v", name, child.Short, err)
 		}
+	}
+}
+
+type failingMailDeliveryFenceResolver struct{ err error }
+
+func (r failingMailDeliveryFenceResolver) ResolveMailActivationFence(context.Context, string) (maildelivery.ActivationFence, error) {
+	return maildelivery.ActivationFence{}, r.err
+}
+
+func createMailDeliveryForReconcile(t *testing.T, store *maildelivery.Store, suffix string, createdAt time.Time) maildelivery.Delivery {
+	t.Helper()
+	delivery, err := maildelivery.NewDelivery(
+		"city:test-city/messaging", "msg-reconcile-"+suffix, 1, "seat:test-city/reviewer",
+		maildelivery.PolicyNotifyOnly, maildelivery.AttentionImmediate, createdAt, nil, "",
+	)
+	if err != nil {
+		t.Fatalf("NewDelivery: %v", err)
+	}
+	delivery, err = store.Create(delivery)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	return delivery
+}
+
+func TestReconcileMailDeliverySeatAuthorityWaitIsDurableAndDoesNotStarvePage(t *testing.T) {
+	backing := beads.NewMemStore()
+	backing.HonorExplicitIDs = true
+	store := maildelivery.NewStore(backing)
+	first := createMailDeliveryForReconcile(t, store, "a", time.Date(2026, 8, 14, 3, 10, 0, 0, time.UTC))
+	second := createMailDeliveryForReconcile(t, store, "b", time.Date(2026, 8, 14, 3, 10, 1, 0, time.UTC))
+	resolver := failingMailDeliveryFenceResolver{err: fmt.Errorf("%w: no active named session", maildelivery.ErrAuthorityUnavailable)}
+
+	report, err := reconcileMailDeliverySeat(context.Background(), store, first.SeatRef, 2,
+		time.Date(2026, 8, 14, 3, 11, 0, 0, time.UTC), resolver, nil)
+	if err != nil {
+		t.Fatalf("reconcileMailDeliverySeat: %v", err)
+	}
+	if !report.PageCommitted || report.ActionRequired || len(report.Deliveries) != 2 {
+		t.Fatalf("report = %#v", report)
+	}
+	gotIDs := map[string]bool{report.Deliveries[0].DeliveryID: true, report.Deliveries[1].DeliveryID: true}
+	if !gotIDs[first.ID] || !gotIDs[second.ID] {
+		t.Fatalf("report IDs = %#v", gotIDs)
+	}
+	for _, item := range report.Deliveries {
+		if item.Outcome != mailDeliveryReconcileWaitingForAuthority || item.Phase != maildelivery.PhaseWaitingForActivation || item.Attempt != nil {
+			t.Fatalf("item = %#v", item)
+		}
+	}
+	checkpoint, err := store.GetSweepCheckpoint(first.SeatRef)
+	if err != nil || checkpoint.Generation != 2 || !checkpoint.After.IsZero() || !checkpoint.HighWatermark.IsZero() {
+		t.Fatalf("checkpoint = %#v, %v", checkpoint, err)
+	}
+}
+
+func TestReconcileMailDeliverySeatUnknownCommitsPageAndReportsAction(t *testing.T) {
+	backing := beads.NewMemStore()
+	backing.HonorExplicitIDs = true
+	store := maildelivery.NewStore(backing)
+	delivery := createMailDeliveryForReconcile(t, store, "unknown", time.Date(2026, 8, 14, 3, 12, 0, 0, time.UTC))
+	resolver := fixedMailDeliveryFenceResolver{fence: testMailDeliveryFence()}
+	execute := func(_ context.Context, attempt maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
+		attempt.State = maildelivery.TransportUnknownExternalState
+		attempt.Receipt = maildelivery.TransportReceipt{
+			Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
+			State: maildelivery.EffectUnknownExternalState, RecordedAt: time.Date(2026, 8, 14, 3, 13, 0, 0, time.UTC),
+		}
+		return attempt, errors.New("provider response lost")
+	}
+
+	report, err := reconcileMailDeliverySeat(context.Background(), store, delivery.SeatRef, 1,
+		time.Date(2026, 8, 14, 3, 12, 30, 0, time.UTC), resolver, execute)
+	if err != nil {
+		t.Fatalf("reconcileMailDeliverySeat: %v", err)
+	}
+	if !report.PageCommitted || !report.ActionRequired || len(report.Deliveries) != 1 ||
+		report.Deliveries[0].Outcome != mailDeliveryReconcileUnknownExternalState || report.Deliveries[0].Attempt == nil {
+		t.Fatalf("report = %#v", report)
+	}
+	checkpoint, err := store.GetSweepCheckpoint(delivery.SeatRef)
+	if err != nil || checkpoint.Generation != 2 || !checkpoint.After.IsZero() {
+		t.Fatalf("checkpoint = %#v, %v", checkpoint, err)
+	}
+}
+
+func TestReconcileMailDeliverySeatInfrastructureFailureReplaysUnchangedPage(t *testing.T) {
+	backing := beads.NewMemStore()
+	backing.HonorExplicitIDs = true
+	store := maildelivery.NewStore(backing)
+	delivery := createMailDeliveryForReconcile(t, store, "infra", time.Date(2026, 8, 14, 3, 14, 0, 0, time.UTC))
+	resolver := fixedMailDeliveryFenceResolver{fence: testMailDeliveryFence()}
+	wantErr := errors.New("provider unavailable")
+	execute := func(_ context.Context, attempt maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
+		return attempt, wantErr
+	}
+
+	report, err := reconcileMailDeliverySeat(context.Background(), store, delivery.SeatRef, 1,
+		time.Date(2026, 8, 14, 3, 15, 0, 0, time.UTC), resolver, execute)
+	if !errors.Is(err, wantErr) || report.PageCommitted {
+		t.Fatalf("report = %#v, err = %v", report, err)
+	}
+	checkpoint, getErr := store.GetSweepCheckpoint(delivery.SeatRef)
+	if getErr != nil || !checkpoint.After.IsZero() || checkpoint.Generation != 1 {
+		t.Fatalf("checkpoint = %#v, %v", checkpoint, getErr)
+	}
+	_, replay, planErr := store.PlanSweepPage(delivery.SeatRef, 1)
+	if planErr != nil || len(replay.Page) != 1 || replay.Page[0].DeliveryID != delivery.ID {
+		t.Fatalf("replay = %#v, %v", replay, planErr)
+	}
+}
+
+func TestReconcileMailDeliverySeatCoalescesPageIntoOneDurableEffect(t *testing.T) {
+	backing := beads.NewMemStore()
+	backing.HonorExplicitIDs = true
+	store := maildelivery.NewStore(backing)
+	first := createMailDeliveryForReconcile(t, store, "coalesce-a", time.Date(2026, 8, 14, 3, 30, 0, 0, time.UTC))
+	second := createMailDeliveryForReconcile(t, store, "coalesce-b", time.Date(2026, 8, 14, 3, 30, 1, 0, time.UTC))
+	resolver := fixedMailDeliveryFenceResolver{fence: testMailDeliveryFence()}
+	effects := 0
+	execute := func(ctx context.Context, attempt maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
+		effects++
+		if len(attempt.CoveredDeliveryIDs) != 2 || mailDeliveryNudgeText(len(attempt.CoveredDeliveryIDs)) != "2 actionable mail deliveries; run gc mail inbox" {
+			t.Fatalf("attempt coverage/text = %#v / %q", attempt.CoveredDeliveryIDs, mailDeliveryNudgeText(len(attempt.CoveredDeliveryIDs)))
+		}
+		return executeMailDeliveryAttempt(ctx, store, attempt, resolver,
+			time.Date(2026, 8, 14, 3, 31, 0, 0, time.UTC),
+			func(_ context.Context, invoking maildelivery.TransportAttempt) (maildelivery.TransportReceipt, error) {
+				return maildelivery.TransportReceipt{
+					Version: 1, AttemptID: invoking.AttemptID, NudgeID: invoking.NudgeID,
+					State: maildelivery.EffectCommitted, CommitBoundary: maildelivery.TransportCommitBoundaryDestinationAtomic,
+					ReceiptRef: "destination:coalesced", ReceiptSHA256: strings.Repeat("d", 64),
+					RecordedAt: time.Date(2026, 8, 14, 3, 31, 1, 0, time.UTC),
+				}, nil
+			})
+	}
+	report, err := reconcileMailDeliverySeat(context.Background(), store, first.SeatRef, 2,
+		time.Date(2026, 8, 14, 3, 30, 30, 0, time.UTC), resolver, execute)
+	if err != nil || effects != 1 || !report.PageCommitted || len(report.Deliveries) != 2 {
+		t.Fatalf("report=%#v effects=%d err=%v", report, effects, err)
+	}
+	if report.Deliveries[0].Attempt == nil || report.Deliveries[1].Attempt == nil ||
+		report.Deliveries[0].Attempt.AttemptID != report.Deliveries[1].Attempt.AttemptID ||
+		report.Deliveries[0].Attempt.NudgeID != report.Deliveries[1].Attempt.NudgeID {
+		t.Fatalf("coalesced items = %#v", report.Deliveries)
+	}
+	for _, delivery := range []maildelivery.Delivery{first, second} {
+		current, loadErr := store.Get(delivery.ID)
+		if loadErr != nil || current.Phase != maildelivery.PhaseRuntimeNotified {
+			t.Fatalf("delivery %s = %#v, %v", delivery.ID, current, loadErr)
+		}
+	}
+}
+
+func TestReconcileMailDeliverySeatRefencesRequestedGroupWithoutStarvation(t *testing.T) {
+	backing := beads.NewMemStore()
+	backing.HonorExplicitIDs = true
+	store := maildelivery.NewStore(backing)
+	first := createMailDeliveryForReconcile(t, store, "refence-a", time.Date(2026, 8, 14, 3, 32, 0, 0, time.UTC))
+	second := createMailDeliveryForReconcile(t, store, "refence-b", time.Date(2026, 8, 14, 3, 32, 1, 0, time.UTC))
+	firstResolver := fixedMailDeliveryFenceResolver{fence: testMailDeliveryFence()}
+	firstAttemptID := ""
+	retrySafe := func(ctx context.Context, attempt maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
+		firstAttemptID = attempt.AttemptID
+		return executeMailDeliveryAttempt(ctx, store, attempt, firstResolver,
+			time.Date(2026, 8, 14, 3, 33, 0, 0, time.UTC),
+			func(context.Context, maildelivery.TransportAttempt) (maildelivery.TransportReceipt, error) {
+				return maildelivery.TransportReceipt{}, fmt.Errorf("%w: destination refused before effect", maildelivery.ErrTransportRetrySafe)
+			})
+	}
+	firstReport, err := reconcileMailDeliverySeat(context.Background(), store, first.SeatRef, 2,
+		time.Date(2026, 8, 14, 3, 32, 30, 0, time.UTC), firstResolver, retrySafe)
+	if err != nil || !firstReport.PageCommitted || firstReport.Deliveries[0].Outcome != mailDeliveryReconcileRetryable {
+		t.Fatalf("first report=%#v err=%v", firstReport, err)
+	}
+	refenced := testMailDeliveryFence()
+	refenced.AuthorityGeneration++
+	refenced.AuthorityIntentSHA256 = strings.Repeat("e", 64)
+	refenced.FenceID = "mail-activation-" + refenced.AuthorityIntentSHA256
+	secondResolver := fixedMailDeliveryFenceResolver{fence: refenced}
+	effects := 0
+	commit := func(ctx context.Context, attempt maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
+		effects++
+		return executeMailDeliveryAttempt(ctx, store, attempt, secondResolver,
+			time.Date(2026, 8, 14, 3, 34, 0, 0, time.UTC),
+			func(_ context.Context, invoking maildelivery.TransportAttempt) (maildelivery.TransportReceipt, error) {
+				return maildelivery.TransportReceipt{
+					Version: 1, AttemptID: invoking.AttemptID, NudgeID: invoking.NudgeID,
+					State: maildelivery.EffectCommitted, CommitBoundary: maildelivery.TransportCommitBoundaryDestinationAtomic,
+					ReceiptRef: "destination:refenced", ReceiptSHA256: strings.Repeat("f", 64),
+					RecordedAt: time.Date(2026, 8, 14, 3, 34, 1, 0, time.UTC),
+				}, nil
+			})
+	}
+	secondReport, err := reconcileMailDeliverySeat(context.Background(), store, second.SeatRef, 2,
+		time.Date(2026, 8, 14, 3, 33, 30, 0, time.UTC), secondResolver, commit)
+	if err != nil || !secondReport.PageCommitted || effects != 1 || len(secondReport.Deliveries) != 2 {
+		t.Fatalf("second report=%#v effects=%d err=%v", secondReport, effects, err)
+	}
+	if secondReport.Deliveries[0].Attempt == nil || secondReport.Deliveries[0].Attempt.AttemptID == firstAttemptID {
+		t.Fatalf("refence did not replace stable attempt: %#v", secondReport.Deliveries)
+	}
+	checkpoint, loadErr := store.GetSweepCheckpoint(first.SeatRef)
+	if loadErr != nil || checkpoint.Generation != 3 || !checkpoint.After.IsZero() {
+		t.Fatalf("checkpoint=%#v err=%v", checkpoint, loadErr)
+	}
+}
+
+func TestReconcileMailDeliverySeatExistingAttemptWaitsWhenAuthorityUnavailable(t *testing.T) {
+	backing := beads.NewMemStore()
+	backing.HonorExplicitIDs = true
+	store := maildelivery.NewStore(backing)
+	delivery := createMailDeliveryForReconcile(t, store, "authority-offline", time.Date(2026, 8, 14, 3, 35, 0, 0, time.UTC))
+	resolver := fixedMailDeliveryFenceResolver{fence: testMailDeliveryFence()}
+	retrySafe := func(ctx context.Context, attempt maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
+		return executeMailDeliveryAttempt(ctx, store, attempt, resolver,
+			time.Date(2026, 8, 14, 3, 35, 30, 0, time.UTC),
+			func(context.Context, maildelivery.TransportAttempt) (maildelivery.TransportReceipt, error) {
+				return maildelivery.TransportReceipt{}, fmt.Errorf("%w: offline before effect", maildelivery.ErrTransportRetrySafe)
+			})
+	}
+	first, err := reconcileMailDeliverySeat(context.Background(), store, delivery.SeatRef, 1,
+		time.Date(2026, 8, 14, 3, 35, 10, 0, time.UTC), resolver, retrySafe)
+	if err != nil || first.Deliveries[0].Outcome != mailDeliveryReconcileRetryable {
+		t.Fatalf("first=%#v err=%v", first, err)
+	}
+	offline := failingMailDeliveryFenceResolver{err: fmt.Errorf("%w: no active named session", maildelivery.ErrAuthorityUnavailable)}
+	called := false
+	second, err := reconcileMailDeliverySeat(context.Background(), store, delivery.SeatRef, 1,
+		time.Date(2026, 8, 14, 3, 36, 0, 0, time.UTC), offline,
+		func(context.Context, maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
+			called = true
+			return maildelivery.TransportAttempt{}, nil
+		})
+	if err != nil || called || !second.PageCommitted || second.ActionRequired || len(second.Deliveries) != 1 ||
+		second.Deliveries[0].Outcome != mailDeliveryReconcileWaitingForAuthority {
+		t.Fatalf("second=%#v called=%v err=%v", second, called, err)
+	}
+}
+
+func TestReconcileMailDeliverySeatUnknownRemainsActionRequiredAcrossRefence(t *testing.T) {
+	backing := beads.NewMemStore()
+	backing.HonorExplicitIDs = true
+	store := maildelivery.NewStore(backing)
+	delivery := createMailDeliveryForReconcile(t, store, "unknown-refence", time.Date(2026, 8, 14, 3, 37, 0, 0, time.UTC))
+	resolver := fixedMailDeliveryFenceResolver{fence: testMailDeliveryFence()}
+	unknown := func(ctx context.Context, attempt maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
+		return executeMailDeliveryAttempt(ctx, store, attempt, resolver,
+			time.Date(2026, 8, 14, 3, 37, 30, 0, time.UTC),
+			func(context.Context, maildelivery.TransportAttempt) (maildelivery.TransportReceipt, error) {
+				return maildelivery.TransportReceipt{}, errors.New("provider response lost after possible effect")
+			})
+	}
+	first, err := reconcileMailDeliverySeat(context.Background(), store, delivery.SeatRef, 1,
+		time.Date(2026, 8, 14, 3, 37, 10, 0, time.UTC), resolver, unknown)
+	if err != nil || !first.ActionRequired || first.Deliveries[0].Outcome != mailDeliveryReconcileUnknownExternalState {
+		t.Fatalf("first=%#v err=%v", first, err)
+	}
+	refenced := testMailDeliveryFence()
+	refenced.AuthorityGeneration++
+	refenced.AuthorityIntentSHA256 = strings.Repeat("9", 64)
+	refenced.FenceID = "mail-activation-" + refenced.AuthorityIntentSHA256
+	called := false
+	second, err := reconcileMailDeliverySeat(context.Background(), store, delivery.SeatRef, 1,
+		time.Date(2026, 8, 14, 3, 38, 0, 0, time.UTC), fixedMailDeliveryFenceResolver{fence: refenced},
+		func(context.Context, maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
+			called = true
+			return maildelivery.TransportAttempt{}, nil
+		})
+	if err != nil || called || !second.PageCommitted || !second.ActionRequired ||
+		second.Deliveries[0].Outcome != mailDeliveryReconcileUnknownExternalState || second.Deliveries[0].Attempt == nil ||
+		second.Deliveries[0].Attempt.State != maildelivery.TransportUnknownExternalState {
+		t.Fatalf("second=%#v called=%v err=%v", second, called, err)
+	}
+}
+
+func TestClassifyMailDeliveryExecutionDoesNotHideIdentityConflict(t *testing.T) {
+	_, err := classifyMailDeliveryExecution(maildelivery.TransportAttempt{}, fmt.Errorf("%w: identity differs", maildelivery.ErrConflict))
+	if !errors.Is(err, maildelivery.ErrConflict) {
+		t.Fatalf("identity conflict classified as retryable: %v", err)
+	}
+}
+
+func TestReconcileMailDeliverySeatRejectsInvalidObservationBeforeStoreMutation(t *testing.T) {
+	backing := beads.NewMemStore()
+	backing.HonorExplicitIDs = true
+	store := maildelivery.NewStore(backing)
+	observedAt := time.Date(2026, 8, 14, 3, 15, 0, 0, time.FixedZone("offset", 3600))
+	if _, err := reconcileMailDeliverySeat(context.Background(), store, "seat:test-city/reviewer", 1,
+		observedAt, fixedMailDeliveryFenceResolver{fence: testMailDeliveryFence()}, nil); err == nil {
+		t.Fatal("non-UTC observation accepted")
+	}
+	if _, err := store.GetSweepCheckpoint("seat:test-city/reviewer"); !errors.Is(err, beads.ErrNotFound) {
+		t.Fatalf("invalid input mutated checkpoint: %v", err)
+	}
+}
+
+func TestWriteMailDeliveryReconcileReportIsTypedAndContentFree(t *testing.T) {
+	report := mailDeliveryReconcileReport{
+		SchemaVersion: "mail-delivery-reconcile/v1", SeatRef: "seat:test-city/reviewer",
+		ObservedAt: time.Date(2026, 8, 14, 3, 16, 0, 0, time.UTC), PageCommitted: true,
+		Deliveries: []mailDeliveryReconcileItem{{DeliveryID: "mail-delivery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Phase: maildelivery.PhaseRuntimeNotified, Outcome: mailDeliveryReconcileCommitted}},
+	}
+	var stdout, stderr bytes.Buffer
+	if code := writeMailDeliveryReconcileReport(&stdout, &stderr, report); code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+	var decoded mailDeliveryReconcileReport
+	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil || decoded.SchemaVersion != report.SchemaVersion || len(decoded.Deliveries) != 1 {
+		t.Fatalf("decoded=%#v err=%v", decoded, err)
+	}
+	for _, forbidden := range []string{"subject", "body", "thread", "message_text"} {
+		if bytes.Contains(stdout.Bytes(), []byte(forbidden)) {
+			t.Fatalf("output contains %q: %s", forbidden, stdout.String())
+		}
+	}
+}
+
+func TestMailDeliveryFenceResolverForSeatUsesExactConfiguredNamedSession(t *testing.T) {
+	ctx := context.Background()
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".gc", "settings.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "reviewer"}},
+		NamedSessions: []config.NamedSession{{Name: "reviewer", Template: "reviewer", Scope: "city"}},
+	}
+	backing := beads.NewMemStore()
+	provider := runtime.NewFake()
+	mgr := newSessionManagerWithConfig(cityPath, backing, provider, cfg)
+	info, err := mgr.CreateSession(ctx, session.CreateOptions{
+		Alias: "reviewer", ExplicitName: config.NamedSessionRuntimeName("test-city", cfg.Workspace, "reviewer"),
+		Template: "reviewer", Title: "Reviewer", Command: "claude", WorkDir: t.TempDir(), Provider: "exec", Transport: "exec",
+		ExtraMeta: map[string]string{session.NamedSessionIdentityMetadata: "reviewer"},
+	})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	resolver, err := mailDeliveryFenceResolverForSeat(sessionFrontDoor(backing), cfg, "test-city",
+		"seat:test-city/reviewer", strings.Repeat("a", 64))
+	if err != nil || resolver.sessionRef != info.ID || resolver.authorityErr != nil {
+		t.Fatalf("resolver=%#v err=%v; session=%#v", resolver, err, info)
+	}
+	fence, err := resolver.ResolveMailActivationFence(ctx, "seat:test-city/reviewer")
+	if err != nil || fence.SessionRef != info.ID || fence.SeatRef != "seat:test-city/reviewer" || fence.CityRef != "city:test-city" {
+		t.Fatalf("fence=%#v err=%v", fence, err)
+	}
+}
+
+func TestMailDeliveryFenceResolverForSeatKeepsAbsentProjectionTypedUnavailable(t *testing.T) {
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "reviewer"}},
+		NamedSessions: []config.NamedSession{{Name: "reviewer", Template: "reviewer", Scope: "city"}},
+	}
+	resolver, err := mailDeliveryFenceResolverForSeat(sessionFrontDoor(beads.NewMemStore()), cfg, "test-city",
+		"seat:test-city/reviewer", strings.Repeat("a", 64))
+	if err != nil || resolver.sessionRef != "" || !errors.Is(resolver.authorityErr, maildelivery.ErrAuthorityUnavailable) {
+		t.Fatalf("resolver=%#v err=%v", resolver, err)
+	}
+	if _, resolveErr := resolver.ResolveMailActivationFence(context.Background(), "seat:test-city/reviewer"); !errors.Is(resolveErr, maildelivery.ErrAuthorityUnavailable) {
+		t.Fatalf("ResolveMailActivationFence = %v", resolveErr)
+	}
+	if _, err := mailDeliveryFenceResolverForSeat(sessionFrontDoor(beads.NewMemStore()), cfg, "test-city",
+		"seat:other-city/reviewer", strings.Repeat("a", 64)); err == nil {
+		t.Fatal("cross-city seat accepted")
 	}
 }
 
@@ -127,12 +500,12 @@ func TestExecuteMailDeliveryAttemptCommitsTypedProviderAcceptanceOnce(t *testing
 		}, nil
 	}
 	first, err := executeMailDeliveryAttempt(context.Background(), store, attempt, resolver,
-		time.Date(2026, 8, 13, 23, 43, 0, 0, time.UTC), nil, invoke)
+		time.Date(2026, 8, 13, 23, 43, 0, 0, time.UTC), invoke)
 	if err != nil || first.State != maildelivery.TransportCommitted || calls != 1 {
 		t.Fatalf("first execution = %#v, %v, calls=%d", first, err, calls)
 	}
 	replay, err := executeMailDeliveryAttempt(context.Background(), store, attempt, resolver,
-		time.Date(2026, 8, 13, 23, 44, 0, 0, time.UTC), nil, invoke)
+		time.Date(2026, 8, 13, 23, 44, 0, 0, time.UTC), invoke)
 	if err != nil || replay.AttemptID != first.AttemptID || calls != 1 {
 		t.Fatalf("replay = %#v, %v, calls=%d", replay, err, calls)
 	}
@@ -222,7 +595,7 @@ func TestMailDeliveryWorkerReceiptLookupMapsExactDestinationEvidence(t *testing.
 	if err != nil || unknown.State != maildelivery.EffectUnknownExternalState || unknown.RecordedAt.IsZero() {
 		t.Fatalf("unknown lookup = %#v, %v", unknown, err)
 	}
-	want, err := provider.NudgeStable(ctx, info.SessionName, attempt.NudgeID, runtime.TextContent(mailDeliveryNudgeText))
+	want, err := provider.NudgeStable(ctx, info.SessionName, attempt.NudgeID, runtime.TextContent(mailDeliveryNudgeText(1)))
 	if err != nil {
 		t.Fatal(err)
 	}
