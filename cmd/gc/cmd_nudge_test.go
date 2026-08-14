@@ -4267,9 +4267,10 @@ func TestPruneDeadQueuedNudges_RemovesOldDeadItems(t *testing.T) {
 			t.Fatalf("enqueueQueuedNudge(%s): %v", item.ID, err)
 		}
 	}
-	// Dead-letter both at different times: old at -2h, recent at -30m.
+	// Dead-letter both at different times: old beyond the 48h audit window,
+	// recent inside it.
 	for i := 0; i < defaultQueuedNudgeMaxAttempts; i++ {
-		if err := recordQueuedNudgeFailure(dir, []string{"n-old"}, context.DeadlineExceeded, now.Add(-2*time.Hour+time.Duration(i)*time.Second)); err != nil {
+		if err := recordQueuedNudgeFailure(dir, []string{"n-old"}, context.DeadlineExceeded, now.Add(-49*time.Hour+time.Duration(i)*time.Second)); err != nil {
 			t.Fatalf("recordQueuedNudgeFailure(n-old, %d): %v", i, err)
 		}
 	}
@@ -4279,7 +4280,8 @@ func TestPruneDeadQueuedNudges_RemovesOldDeadItems(t *testing.T) {
 		}
 	}
 
-	// With defaultQueuedNudgeDeadRetention (1h), old should be pruned (has terminal bead), recent kept.
+	// The old item is beyond defaultQueuedNudgeDeadRetention and has a terminal
+	// bead, while the recent item must remain visible to the standing alarm.
 	store := openNudgeBeadStore(dir)
 	err := withNudgeQueueState(dir, func(state *nudgeQueueState) error {
 		return pruneDeadQueuedNudges(state, nudgeFrontDoor(store), now, noMaintenanceDeadline())

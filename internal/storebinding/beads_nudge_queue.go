@@ -68,7 +68,7 @@ const (
 	nudgeQueueMaxAttempts = 5
 	// nudgeQueueDeadRetention is how long a dead letter stays in the dead
 	// bucket before it ages into the invisible terminal record.
-	nudgeQueueDeadRetention = time.Hour
+	nudgeQueueDeadRetention = 48 * time.Hour
 	// nudgeQueueTerminalRetention is how long a terminal record survives
 	// before the sweep deletes it. It is the ttl the deployed queue's
 	// retention sweeper runs with (cmd/gc's defaultQueuedNudgeTTL, also a
