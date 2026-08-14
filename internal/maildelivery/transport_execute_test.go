@@ -122,7 +122,7 @@ func TestExecuteTransportRetrySafeResponseLossRetriesThenCommits(t *testing.T) {
 	}
 }
 
-func TestExecuteTransportRetrySafeResponseLossIsBoundedAndAuditable(t *testing.T) {
+func TestExecuteTransportRetrySafeResponseLossRemainsRetryable(t *testing.T) {
 	store, _ := newDeliveryStore()
 	delivery := createWaitingDelivery(t, store)
 	fence := validFence()
@@ -135,12 +135,25 @@ func TestExecuteTransportRetrySafeResponseLossIsBoundedAndAuditable(t *testing.T
 		return TransportReceipt{}, fmt.Errorf("%w: response lost", ErrTransportRetrySafe)
 	}
 	first, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence}, request.CreatedAt, nil, invoke)
-	if !errors.Is(err, ErrTransportRetrySafe) || first.State != TransportRequested || first.InvocationCount != 1 || first.InvocationStartedAt.IsZero() {
+	if !errors.Is(err, ErrTransportRetrySafe) || errors.Is(err, ErrTransportRetryEscalated) || first.State != TransportRequested || first.InvocationCount != 1 || first.InvocationStartedAt.IsZero() {
 		t.Fatalf("first = %#v, %v", first, err)
 	}
 	second, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence}, request.CreatedAt.Add(time.Second), nil, invoke)
-	if !errors.Is(err, ErrTransportRetrySafe) || second.State != TransportUnknownExternalState || second.InvocationCount != 2 {
-		t.Fatalf("second = %#v, %v", second, err)
+	if !errors.Is(err, ErrTransportRetrySafe) || errors.Is(err, ErrTransportRetryEscalated) || second.State != TransportRequested || second.InvocationCount != 2 {
+		t.Fatalf("second = %#v, %v, want requested retry-safe", second, err)
+	}
+	third, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence}, request.CreatedAt.Add(2*time.Second), nil, invoke)
+	if !errors.Is(err, ErrTransportRetrySafe) || !errors.Is(err, ErrTransportRetryEscalated) || third.State != TransportRequested || third.InvocationCount != TransportRetryEscalationThreshold ||
+		!strings.Contains(err.Error(), "count 3") || !strings.Contains(err.Error(), "threshold 3") {
+		t.Fatalf("third = %#v, %v, want requested escalated retry-safe", third, err)
+	}
+	fourth, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence}, request.CreatedAt.Add(3*time.Second), nil, invoke)
+	if !errors.Is(err, ErrTransportRetrySafe) || !errors.Is(err, ErrTransportRetryEscalated) || fourth.State != TransportRequested || fourth.InvocationCount != 4 {
+		t.Fatalf("fourth = %#v, %v, want later requested escalated retry-safe", fourth, err)
+	}
+	persisted, loadErr := store.TransportAttempt(fourth.AttemptID)
+	if loadErr != nil || persisted.State != TransportRequested || persisted.InvocationCount != 4 || persisted.Receipt != (TransportReceipt{}) {
+		t.Fatalf("persisted = %#v, %v", persisted, loadErr)
 	}
 }
 

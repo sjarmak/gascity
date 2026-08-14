@@ -106,6 +106,31 @@ func TestSendDurableStableReplayReturnsAdvancedDeliveryPhase(t *testing.T) {
 	}
 }
 
+func TestSendDurableStableReplaySurvivesMessageReadAndArchiveDrift(t *testing.T) {
+	backing := beads.NewMemStore()
+	backing.HonorExplicitIDs = true
+	provider := New(backing)
+	intent := stableDurableIntent()
+
+	message, delivery, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
+	if err != nil {
+		t.Fatalf("first SendDurableStable: %v", err)
+	}
+	if err := provider.MarkRead(message.ID); err != nil {
+		t.Fatalf("MarkRead: %v", err)
+	}
+	if err := provider.Archive(message.ID); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	replayedMessage, replayedDelivery, err := provider.SendDurableStable("sender", "reviewer", "subject", "body", intent)
+	if err != nil {
+		t.Fatalf("replay after message drift: %v", err)
+	}
+	if replayedMessage.ID != message.ID || !reflect.DeepEqual(replayedDelivery, delivery) {
+		t.Fatalf("replay = %#v / %#v, want message %q and %#v", replayedMessage, replayedDelivery, message.ID, delivery)
+	}
+}
+
 func TestSendDurableStableRejectsUnboundedOrCrossCityIdentityBeforeWrite(t *testing.T) {
 	for name, mutate := range map[string]func(*StableDurableSendIntent){
 		"empty key":        func(i *StableDurableSendIntent) { i.StableKey = "" },

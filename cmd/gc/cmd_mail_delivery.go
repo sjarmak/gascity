@@ -336,7 +336,7 @@ func reconcileExpectedMailDeliverySeat(ctx context.Context, store *maildelivery.
 		if classifyErr != nil {
 			return report, classifyErr
 		}
-		report.ActionRequired = report.ActionRequired || outcome == mailDeliveryReconcileUnknownExternalState
+		report.ActionRequired = report.ActionRequired || outcome == mailDeliveryReconcileUnknownExternalState || errors.Is(executeErr, maildelivery.ErrTransportRetryEscalated)
 		for _, deliveryID := range attempt.CoveredDeliveryIDs {
 			if _, inPage := pageSet[deliveryID]; !inPage {
 				continue
@@ -344,6 +344,18 @@ func reconcileExpectedMailDeliverySeat(ctx context.Context, store *maildelivery.
 			delivery, loadErr := store.Get(deliveryID)
 			if loadErr != nil {
 				return report, loadErr
+			}
+			if outcome == mailDeliveryReconcileCommitted && delivery.Policy == maildelivery.PolicyNotifyOnly && delivery.Phase == maildelivery.PhaseRuntimeNotified {
+				if _, dispositionErr := store.RecordDisposition(ctx, maildelivery.DispositionRequest{
+					DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+					Reason: maildelivery.DispositionPolicySatisfiedNotified, RecordedAt: result.Receipt.RecordedAt,
+				}, resolver); dispositionErr != nil {
+					return report, dispositionErr
+				}
+				delivery, loadErr = store.Get(deliveryID)
+				if loadErr != nil {
+					return report, loadErr
+				}
 			}
 			resultCopy := result
 			items[deliveryID] = mailDeliveryReconcileItem{DeliveryID: deliveryID, Phase: delivery.Phase, Outcome: outcome, Attempt: &resultCopy}
@@ -560,10 +572,10 @@ func mailDeliveryWorkerInvoker(cityPath string, cfg *config.City, sessStore bead
 	return func(ctx context.Context, attempt maildelivery.TransportAttempt) (maildelivery.TransportReceipt, error) {
 		fence, err := resolver.ResolveMailActivationFence(ctx, "")
 		if err != nil {
-			return maildelivery.TransportReceipt{}, err
+			return maildelivery.TransportReceipt{}, fmt.Errorf("%w: %w", maildelivery.ErrTransportRetrySafe, err)
 		}
 		if err := attempt.ValidateAuthority(fence); err != nil {
-			return maildelivery.TransportReceipt{}, err
+			return maildelivery.TransportReceipt{}, fmt.Errorf("%w: %w", maildelivery.ErrTransportRetrySafe, err)
 		}
 		info := resolver.lastInfo
 		target := resolveNudgeTargetFromSessionInfo(cityPath, cfg, info)
@@ -572,14 +584,14 @@ func mailDeliveryWorkerInvoker(cityPath string, cfg *config.City, sessStore bead
 			if err == nil {
 				err = fmt.Errorf("exact mail delivery target is not running")
 			}
-			return maildelivery.TransportReceipt{}, err
+			return maildelivery.TransportReceipt{}, fmt.Errorf("%w: %w", maildelivery.ErrTransportRetrySafe, err)
 		}
 		handle, err := workerHandleForSessionWithConfig(cityPath, sessStore, provider, cfg, info.ID)
 		if err != nil {
-			return maildelivery.TransportReceipt{}, err
+			return maildelivery.TransportReceipt{}, fmt.Errorf("%w: %w", maildelivery.ErrTransportRetrySafe, err)
 		}
 		if err := requireExactMailDeliveryReceiptHandle(handle); err != nil {
-			return maildelivery.TransportReceipt{}, err
+			return maildelivery.TransportReceipt{}, fmt.Errorf("%w: %w", maildelivery.ErrTransportRetrySafe, err)
 		}
 		result, err := handle.Nudge(ctx, worker.NudgeRequest{
 			Text: mailDeliveryNudgeText(len(attempt.CoveredDeliveryIDs)), Delivery: worker.NudgeDeliveryImmediate,
@@ -587,28 +599,32 @@ func mailDeliveryWorkerInvoker(cityPath string, cfg *config.City, sessStore bead
 			CommitBoundary: worker.NudgeCommitBoundaryDestinationAtomic,
 		})
 		if err != nil {
-			if errors.Is(err, runtime.ErrStableNudgeRetrySafe) {
+			if errors.Is(err, runtime.ErrStableNudgeRetrySafe) || errors.Is(err, runtime.ErrStableNudgeUnsupported) {
 				return maildelivery.TransportReceipt{}, fmt.Errorf("%w: %w", maildelivery.ErrTransportRetrySafe, err)
 			}
 			return maildelivery.TransportReceipt{}, err
 		}
 		if !result.Delivered || result.Receipt == nil {
-			return maildelivery.TransportReceipt{}, fmt.Errorf("provider returned no typed acceptance receipt")
+			return maildelivery.TransportReceipt{}, fmt.Errorf("%w: provider returned no typed acceptance receipt", maildelivery.ErrTransportRetrySafe)
 		}
 		if err := result.Receipt.Validate(); err != nil || result.Receipt.EffectID != attempt.NudgeID || result.Receipt.TargetSessionRef != info.ID ||
 			result.Receipt.CommitBoundary != worker.NudgeCommitBoundaryDestinationAtomic {
 			return maildelivery.TransportReceipt{}, fmt.Errorf("provider acceptance receipt does not match exact mail delivery target")
 		}
-		freshFence, err := resolver.ResolveMailActivationFence(ctx, "")
-		if err != nil || attempt.ValidateAuthority(freshFence) != nil || resolver.lastInfo.ID != info.ID {
-			return maildelivery.TransportReceipt{}, fmt.Errorf("provider acceptance raced exact mail delivery authority")
-		}
-		return maildelivery.TransportReceipt{
+		receipt := maildelivery.TransportReceipt{
 			Version: 1, AttemptID: attempt.AttemptID, NudgeID: attempt.NudgeID,
 			State: maildelivery.EffectCommitted, CommitBoundary: maildelivery.TransportCommitBoundaryDestinationAtomic,
 			ReceiptRef: "destination:" + result.Receipt.DestinationRef, ReceiptSHA256: result.Receipt.DestinationReceiptSHA256,
 			RecordedAt: result.Receipt.AcceptedAt,
-		}, nil
+		}
+		freshFence, err := resolver.ResolveMailActivationFence(ctx, "")
+		if err != nil {
+			return receipt, nil
+		}
+		if attempt.ValidateAuthority(freshFence) != nil || resolver.lastInfo.ID != info.ID {
+			return maildelivery.TransportReceipt{}, fmt.Errorf("provider acceptance raced exact mail delivery authority")
+		}
+		return receipt, nil
 	}
 }
 

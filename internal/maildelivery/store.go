@@ -22,8 +22,9 @@ var ErrConflict = errors.New("mail delivery conflict")
 
 // Store persists typed MailDelivery resources on the canonical Beads substrate.
 type Store struct {
-	beads  beads.Store
-	writer beads.ConditionalWriter
+	beads     beads.Store
+	writer    beads.ConditionalWriter
+	writerErr error
 }
 
 // NewStore returns a typed store. Mutations fail closed when revision-CAS is absent.
@@ -35,13 +36,29 @@ func NewStore(store beads.Store) *Store {
 		// legacy result; a diagnostic or refusal never falls back.
 		writer, _ = beads.ConditionalWriterFor(store)
 	}
-	return &Store{beads: store, writer: writer}
+	var writerErr error
+	if resolveErr != nil {
+		writerErr = resolveErr
+	} else if diagnostic != nil {
+		writerErr = fmt.Errorf("store=%s gate=%s reason=%s", diagnostic.Store, diagnostic.PreflightGate, diagnostic.PreflightReason)
+	}
+	return &Store{beads: store, writer: writer, writerErr: writerErr}
+}
+
+func (s *Store) conditionalWriterError() error {
+	if s != nil && s.writerErr != nil {
+		return fmt.Errorf("mail delivery conditional writes unavailable: %w", s.writerErr)
+	}
+	return fmt.Errorf("mail delivery conditional writes unavailable")
 }
 
 // Create persists one deterministic delivery or returns the byte-equivalent row.
 func (s *Store) Create(delivery Delivery) (Delivery, error) {
 	if s == nil || s.beads == nil {
 		return Delivery{}, fmt.Errorf("mail delivery store is unavailable")
+	}
+	if s.writer == nil {
+		return Delivery{}, s.conditionalWriterError()
 	}
 	if err := delivery.Validate(); err != nil {
 		return Delivery{}, err
@@ -120,7 +137,7 @@ func (s *Store) Get(id string) (Delivery, error) {
 // Advance applies one legal phase edge under the exact Beads revision.
 func (s *Store) Advance(id string, expectedRevision uint64, next Phase) (Delivery, error) {
 	if s == nil || s.writer == nil {
-		return Delivery{}, fmt.Errorf("mail delivery conditional writes unavailable")
+		return Delivery{}, s.conditionalWriterError()
 	}
 	current, err := s.Get(id)
 	if err != nil {

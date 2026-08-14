@@ -21,6 +21,9 @@ const (
 	// TransportInvocationLeaseDuration bounds how long another caller must
 	// treat an invoking attempt as live before crash recovery may mark it unknown.
 	TransportInvocationLeaseDuration = 2 * time.Minute
+	// TransportRetryEscalationThreshold raises an operator-visible signal
+	// without changing a retry-safe attempt's requested state.
+	TransportRetryEscalationThreshold uint64 = 3
 )
 
 // ErrTransportInvocationInProgress reports that an unexpired invocation lease
@@ -33,6 +36,10 @@ var ErrTransportInvocationRace = errors.New("mail delivery transport invocation 
 
 // ErrTransportRetrySafe permits only an identical stable-effect retry.
 var ErrTransportRetrySafe = errors.New("mail delivery transport invocation is safe to retry with the same effect ID")
+
+// ErrTransportRetryEscalated reports repeated retry-safe failures that remain
+// safe to invoke again but now require operator visibility.
+var ErrTransportRetryEscalated = errors.New("mail delivery transport retry requires operator attention")
 
 // TransportState is the closed state of one stable external-effect attempt.
 type TransportState string
@@ -184,7 +191,7 @@ func (s *Store) CreateTransportAttempt(ctx context.Context, request TransportAtt
 		return TransportAttempt{}, err
 	}
 	if s.writer == nil {
-		return TransportAttempt{}, fmt.Errorf("mail delivery conditional writes unavailable")
+		return TransportAttempt{}, s.conditionalWriterError()
 	}
 	err = s.writer.UpdateIfMatch(delivery.ID, int64(request.ExpectedDeliveryRevision), beads.UpdateOpts{Metadata: map[string]string{
 		deliveryDataKey: deliveryPayload, deliveryPhaseKey: string(PhaseNotificationRequested),
@@ -310,7 +317,7 @@ func (s *Store) BeginTransportInvocation(attemptID string, expectedRevision uint
 		return TransportAttempt{}, err
 	}
 	if s.writer == nil {
-		return TransportAttempt{}, fmt.Errorf("mail delivery conditional writes unavailable")
+		return TransportAttempt{}, s.conditionalWriterError()
 	}
 	if err := s.writer.UpdateIfMatch(attemptID, int64(expectedRevision), beads.UpdateOpts{Metadata: map[string]string{transportAttemptDataKey: payload}}); err != nil {
 		if beads.IsPreconditionFailed(err) {
@@ -338,7 +345,7 @@ func (s *Store) ReleaseTransportInvocation(attemptID string, expectedRevision ui
 		return TransportAttempt{}, err
 	}
 	if s.writer == nil {
-		return TransportAttempt{}, fmt.Errorf("mail delivery conditional writes unavailable")
+		return TransportAttempt{}, s.conditionalWriterError()
 	}
 	if err := s.writer.UpdateIfMatch(attemptID, int64(expectedRevision), beads.UpdateOpts{Metadata: map[string]string{transportAttemptDataKey: payload}}); err != nil {
 		if beads.IsPreconditionFailed(err) {
@@ -402,7 +409,7 @@ func (s *Store) finishTransportAttempt(attemptID string, expectedRevision uint64
 		return TransportAttempt{}, err
 	}
 	if s.writer == nil {
-		return TransportAttempt{}, fmt.Errorf("mail delivery conditional writes unavailable")
+		return TransportAttempt{}, s.conditionalWriterError()
 	}
 	if err := s.writer.UpdateIfMatch(attemptID, int64(expectedRevision), beads.UpdateOpts{Metadata: map[string]string{transportAttemptDataKey: payload}}); err != nil {
 		if beads.IsPreconditionFailed(err) {
@@ -431,7 +438,7 @@ func (s *Store) finalizeCoveredTransport(deliveryID string, attempt TransportAtt
 	if err != nil {
 		return err
 	}
-	if delivery.Phase == PhaseRuntimeNotified {
+	if delivery.Phase == PhaseRuntimeNotified || delivery.Phase == PhaseRead || delivery.Phase == PhaseDispositioned {
 		return nil
 	}
 	if delivery.Phase != PhaseNotificationRequested {
@@ -451,7 +458,7 @@ func (s *Store) finalizeCoveredTransport(deliveryID string, attempt TransportAtt
 		return err
 	}
 	if s.writer == nil {
-		return fmt.Errorf("mail delivery conditional writes unavailable")
+		return s.conditionalWriterError()
 	}
 	if err := s.writer.UpdateIfMatch(delivery.ID, int64(delivery.Revision), beads.UpdateOpts{Metadata: map[string]string{
 		deliveryDataKey: payload, deliveryPhaseKey: string(PhaseRuntimeNotified),
@@ -487,6 +494,9 @@ func (s *Store) LinkCoveredTransportAttempt(attempt TransportAttempt) error {
 			}
 			continue
 		}
+		if delivery.Phase == PhaseRead || delivery.Phase == PhaseDispositioned {
+			continue
+		}
 		if delivery.Phase != PhaseWaitingForActivation {
 			return fmt.Errorf("%w: covered delivery %q is in phase %q", ErrConflict, delivery.ID, delivery.Phase)
 		}
@@ -510,7 +520,7 @@ func (s *Store) linkCoveredTransportAttempt(delivery Delivery, attempt Transport
 		return err
 	}
 	if s.writer == nil {
-		return fmt.Errorf("mail delivery conditional writes unavailable")
+		return s.conditionalWriterError()
 	}
 	err = s.writer.UpdateIfMatch(delivery.ID, int64(delivery.Revision), beads.UpdateOpts{Metadata: map[string]string{
 		deliveryDataKey: payload, deliveryPhaseKey: string(PhaseNotificationRequested),

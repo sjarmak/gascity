@@ -82,7 +82,7 @@ func (s *Store) RecordDisposition(ctx context.Context, request DispositionReques
 		return Disposition{}, err
 	}
 	if s == nil || s.writer == nil {
-		return Disposition{}, fmt.Errorf("mail delivery conditional writes unavailable")
+		return Disposition{}, s.conditionalWriterError()
 	}
 	err = s.writer.UpdateIfMatch(delivery.ID, int64(request.ExpectedDeliveryRevision), beads.UpdateOpts{
 		Metadata: map[string]string{

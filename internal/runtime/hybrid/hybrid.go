@@ -25,12 +25,46 @@ var (
 	_ runtime.InterruptedTurnResetProvider  = (*Provider)(nil)
 	_ runtime.RelaunchProvider              = (*Provider)(nil)
 	_ runtime.LivenessObserver              = (*Provider)(nil)
+	_ runtime.StableNudgeProvider           = (*Provider)(nil)
+	_ runtime.TargetStableNudgeProvider     = (*Provider)(nil)
 )
 
 // New creates a hybrid provider. isRemote returns true for sessions
 // that should be managed by the remote provider.
 func New(local, remote runtime.Provider, isRemote func(string) bool) *Provider {
 	return &Provider{local: local, remote: remote, isRemote: isRemote}
+}
+
+// SupportsStableNudge reports whether every possible route supports stable nudges.
+func (p *Provider) SupportsStableNudge() bool {
+	localStable, localOK := p.local.(runtime.StableNudgeProvider)
+	remoteStable, remoteOK := p.remote.(runtime.StableNudgeProvider)
+	return localOK && remoteOK && localStable.SupportsStableNudge() && remoteStable.SupportsStableNudge()
+}
+
+// SupportsStableNudgeTarget reports capability for the backend routed to name.
+func (p *Provider) SupportsStableNudgeTarget(name string) bool {
+	return runtime.SupportsStableNudgeTarget(p.route(name), name)
+}
+
+// NudgeStable forwards a destination-idempotent nudge to the routed backend.
+func (p *Provider) NudgeStable(ctx context.Context, name, effectID string, content []runtime.ContentBlock) (runtime.StableNudgeReceipt, error) {
+	target := p.route(name)
+	stable, ok := target.(runtime.StableNudgeProvider)
+	if !ok || !runtime.SupportsStableNudgeTarget(target, name) {
+		return runtime.StableNudgeReceipt{}, runtime.ErrStableNudgeUnsupported
+	}
+	return stable.NudgeStable(ctx, name, effectID, content)
+}
+
+// LookupStableNudge reads stable-nudge evidence from the routed backend.
+func (p *Provider) LookupStableNudge(ctx context.Context, name, effectID string, content []runtime.ContentBlock) (runtime.StableNudgeLookup, error) {
+	target := p.route(name)
+	stable, ok := target.(runtime.StableNudgeProvider)
+	if !ok || !runtime.SupportsStableNudgeTarget(target, name) {
+		return runtime.StableNudgeLookup{}, runtime.ErrStableNudgeUnsupported
+	}
+	return stable.LookupStableNudge(ctx, name, effectID, content)
 }
 
 func (p *Provider) route(name string) runtime.Provider {
