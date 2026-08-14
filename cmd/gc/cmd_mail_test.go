@@ -25,6 +25,7 @@ import (
 	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	mailexec "github.com/gastownhall/gascity/internal/mail/exec"
+	"github.com/gastownhall/gascity/internal/maildelivery"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/spf13/cobra"
@@ -40,6 +41,15 @@ type failingListByLabelStore struct {
 type threadOnlyMailProvider struct {
 	countOnlyMailProvider
 	messages []mail.Message
+}
+
+type messageOnlyDurableMailProvider struct {
+	*mail.Fake
+	delivery maildelivery.Delivery
+}
+
+func (p messageOnlyDurableMailProvider) SendDurableStable(_, _, _, _ string, _ beadmail.StableDurableSendIntent) (mail.Message, maildelivery.Delivery, error) {
+	return mail.Message{ID: "gc-mail-message-only", From: "sender", To: "reviewer"}, p.delivery, errors.New("injected delivery write failure")
 }
 
 func (countOnlyMailProvider) Send(string, string, string, string) (mail.Message, error) {
@@ -3052,6 +3062,233 @@ func TestMailNotifyHelpDocumentsManagedWake(t *testing.T) {
 				t.Fatalf("Long help = %q, want unread-mail wake boundary", cmd.Long)
 			}
 		})
+	}
+}
+
+func TestMailSendDurableNotifyFlagIsExplicit(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	cmd := newMailSendCmd(&stdout, &stderr)
+	flag := cmd.Flags().Lookup("durable-notify-key")
+	if flag == nil {
+		t.Fatal("--durable-notify-key flag is missing")
+	}
+	if !strings.Contains(flag.Usage, "stable") {
+		t.Fatalf("flag usage = %q, want stable-key boundary", flag.Usage)
+	}
+}
+
+func TestValidateDurableMailSendRequestBoundsFirstSlice(t *testing.T) {
+	for name, request := range map[string]durableMailSendRequest{
+		"missing notify": {StableKey: "canary", Notify: false},
+		"broadcast":      {StableKey: "canary", Notify: true, All: true},
+		"human":          {StableKey: "canary", Notify: true, Recipient: "human"},
+		"empty key":      {StableKey: "", Notify: true, Recipient: "reviewer"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateDurableMailSendRequest(request); err == nil {
+				t.Fatal("validation succeeded")
+			}
+		})
+	}
+	if err := validateDurableMailSendRequest(durableMailSendRequest{StableKey: "canary", Notify: true, Recipient: "reviewer"}); err != nil {
+		t.Fatalf("valid request: %v", err)
+	}
+}
+
+func TestResolveDurableMailSeatUsesConfiguredNamedSessionFrontDoorOnly(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city", SessionTemplate: "{{.City}}--{{.Name}}"},
+		Agents:        []config.Agent{{Name: "reviewer", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Name: "reviewer", Template: "reviewer", Scope: "city", Mode: "always"}},
+	}
+	spec, ok := session.FindNamedSessionSpec(cfg, "test-city", "reviewer")
+	if !ok {
+		t.Fatal("configured named session missing")
+	}
+	row, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: map[string]string{
+		"alias": "friendly-alias", "session_name": spec.SessionName,
+		session.NamedSessionMetadataKey: "true", session.NamedSessionIdentityMetadata: spec.Identity,
+		session.NamedSessionModeMetadata: "always",
+	}})
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	front := session.NewStore(beads.SessionStore{Store: store})
+	seat, recipient, err := resolveDurableMailSeat(cfg, "test-city", front, "reviewer")
+	if err != nil || seat != "seat:test-city/reviewer" || recipient != "reviewer" {
+		t.Fatalf("configured target = seat:%q recipient:%q err:%v", seat, recipient, err)
+	}
+	for _, rejected := range []string{"human", row.ID, spec.SessionName, "friendly-alias", "missing", "seat:other/reviewer"} {
+		if _, _, err := resolveDurableMailSeat(cfg, "test-city", front, rejected); err == nil {
+			t.Errorf("target %q resolved", rejected)
+		}
+	}
+	emptyFront := session.NewStore(beads.SessionStore{Store: beads.NewMemStore()})
+	if _, _, err := resolveDurableMailSeat(cfg, "test-city", emptyFront, "reviewer"); err == nil || !strings.Contains(err.Error(), "no live configured named session") {
+		t.Fatalf("configured but absent target error = %v", err)
+	}
+}
+
+func TestCmdMailSendDurableWiresConfiguredSeatToMessagingStore(t *testing.T) {
+	const cityName = "mail-durable-command-test"
+	cityPath := t.TempDir()
+	adapterPath := filepath.Join(t.TempDir(), "unused-adapter")
+	writeMailDeliveryBinaryCity(t, cityPath, cityName, "reviewer", adapterPath)
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_CITY", cityPath)
+	t.Setenv("GC_SESSION", "exec:"+adapterPath)
+	t.Setenv(testFileStoreHonorExplicitIDsEnv, "1")
+
+	cfg, err := config.Load(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
+	if err != nil {
+		t.Fatalf("load city config: %v", err)
+	}
+	spec, ok := session.FindNamedSessionSpec(cfg, cityName, "reviewer")
+	if !ok {
+		t.Fatal("named session is not configured")
+	}
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("open fixture store: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: map[string]string{
+		"alias": "reviewer", "session_name": spec.SessionName,
+		session.NamedSessionMetadataKey: "true", session.NamedSessionIdentityMetadata: spec.Identity,
+		session.NamedSessionModeMetadata: "always",
+	}}); err != nil {
+		t.Fatalf("create configured session: %v", err)
+	}
+	if err := closeBeadStoreHandle(store); err != nil {
+		t.Fatalf("close fixture store: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := newMailSendCmd(&stdout, &stderr)
+	cmd.SetArgs([]string{"--notify", "--durable-notify-key", "in-process-canary", "--to", "reviewer", "--subject", "subject", "--message", "body", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("durable send command: %v; stderr=%s", err, stderr.String())
+	}
+	var result durableMailSendResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || !result.OK || result.MessageID == "" || result.DeliveryID == "" || result.Phase != string(maildelivery.PhaseStored) {
+		t.Fatalf("command result = %#v, %v; stdout=%s", result, err, stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := cmdMailSendDurable([]string{"reviewer", "second body"}, true, false, "reviewer", "", "", "", "in-process-canary-2", true, &stdout, &stderr); code != 0 {
+		t.Fatalf("explicit configured sender = %d; stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	const invalidSender = "not-a-configured-sender"
+	if code := cmdMailSendDurable([]string{"reviewer", "third body"}, true, false, invalidSender, "", "", "", "in-process-canary-3", true, &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), fmt.Sprintf("invalid sender %q", invalidSender)) {
+		t.Fatalf("invalid sender = %d; stderr=%s", code, stderr.String())
+	}
+}
+
+func TestCmdMailSendDurableRejectsInvalidShapesBeforeOpeningStores(t *testing.T) {
+	for name, run := range map[string]func(io.Writer) int{
+		"missing args": func(stderr io.Writer) int {
+			return cmdMailSendDurable(nil, true, false, "human", "", "", "", "key", true, io.Discard, stderr)
+		},
+		"subject missing recipient": func(stderr io.Writer) int {
+			return cmdMailSendDurable(nil, true, false, "human", "", "subject", "body", "key", true, io.Discard, stderr)
+		},
+		"missing notify": func(stderr io.Writer) int {
+			return cmdMailSendDurable([]string{"reviewer", "body"}, false, false, "human", "", "", "", "key", true, io.Discard, stderr)
+		},
+		"broadcast": func(stderr io.Writer) int {
+			return cmdMailSendDurable([]string{"reviewer", "body"}, true, true, "human", "", "", "", "key", true, io.Discard, stderr)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			if code := run(&stderr); code == 0 || stderr.Len() == 0 {
+				t.Fatalf("invalid shape = code %d stderr %q", code, stderr.String())
+			}
+		})
+	}
+	var stderr bytes.Buffer
+	if code := cmdMailSendDurable([]string{"body"}, true, true, "human", "", "", "", "key", true, io.Discard, &stderr); code == 0 || !strings.Contains(stderr.String(), "cannot be combined with --all") {
+		t.Fatalf("broadcast validation = code %d stderr %q", code, stderr.String())
+	}
+}
+
+func TestDoMailSendDurableJSONReportsIntentWithoutRuntimeNotification(t *testing.T) {
+	store := beads.NewMemStore()
+	store.HonorExplicitIDs = true
+	provider := beadmail.New(store)
+	request := durableMailSendRequest{
+		StableKey: "canary", Notify: true, Recipient: "reviewer", Sender: "sender",
+		Subject: "private subject", Body: "private body", CityRef: "city:test-city",
+		MessagingStoreRef: "city:test-city/messaging", SeatRef: "seat:test-city/reviewer",
+	}
+	var stdout, stderr bytes.Buffer
+	code := doMailSendDurableJSON(provider, events.Discard, request, true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doMailSendDurableJSON = %d; stderr=%s", code, stderr.String())
+	}
+	var result durableMailSendResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode result: %v; stdout=%s", err, stdout.String())
+	}
+	if !result.OK || result.ActionRequired || result.MessageID == "" || result.DeliveryID == "" ||
+		result.Phase != string(maildelivery.PhaseStored) || !result.NotificationRequested || result.RuntimeNotified || result.Notified {
+		t.Fatalf("result = %#v", result)
+	}
+	rows, err := store.List(beads.ListQuery{AllowScan: true, IncludeClosed: true, TierMode: beads.TierBoth})
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("durable rows = %#v, %v", rows, err)
+	}
+}
+
+func TestDoMailSendDurableRejectsProviderWithoutCapability(t *testing.T) {
+	mp := mail.NewFake()
+	request := durableMailSendRequest{StableKey: "canary", Notify: true, Recipient: "reviewer", Sender: "sender", Body: "body", CityRef: "city:test-city", MessagingStoreRef: "city:test-city/messaging", SeatRef: "seat:test-city/reviewer"}
+	var stdout, stderr bytes.Buffer
+	if code := doMailSendDurableJSON(mp, events.Discard, request, true, &stdout, &stderr); code == 0 {
+		t.Fatalf("unsupported provider succeeded: stdout=%s", stdout.String())
+	}
+	if got, err := mp.Inbox("reviewer"); err != nil || len(got) != 0 {
+		t.Fatalf("unsupported provider fell back to ordinary send: %#v, %v", got, err)
+	}
+}
+
+func TestDoMailSendDurableJSONReportsMessageOnlyGapAsActionRequired(t *testing.T) {
+	provider := messageOnlyDurableMailProvider{Fake: mail.NewFake()}
+	request := durableMailSendRequest{StableKey: "canary", Notify: true, Recipient: "reviewer", Sender: "sender", Body: "body", CityRef: "city:test-city", MessagingStoreRef: "city:test-city/messaging", SeatRef: "seat:test-city/reviewer"}
+	var stdout, stderr bytes.Buffer
+	if code := doMailSendDurableJSON(provider, events.Discard, request, true, &stdout, &stderr); code == 0 {
+		t.Fatalf("message-only gap returned success: stdout=%s", stdout.String())
+	}
+	var result durableMailSendResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode message-only result: %v; stdout=%s", err, stdout.String())
+	}
+	if result.OK || !result.ActionRequired || result.MessageID != "gc-mail-message-only" || result.DeliveryID != "" || result.Phase != "message-only" || result.RuntimeNotified || result.Notified {
+		t.Fatalf("message-only result = %#v", result)
+	}
+	if !strings.Contains(stderr.String(), "requires action") {
+		t.Fatalf("stderr = %q, want action-required diagnostic", stderr.String())
+	}
+}
+
+func TestDoMailSendDurableJSONReportsReturnedDeliveryPhaseOnFailure(t *testing.T) {
+	delivery := maildelivery.Delivery{ID: "gc-delivery-current", Phase: maildelivery.PhaseWaitingForActivation}
+	provider := messageOnlyDurableMailProvider{Fake: mail.NewFake(), delivery: delivery}
+	request := durableMailSendRequest{StableKey: "canary", Notify: true, Recipient: "reviewer", Sender: "sender", Body: "body", CityRef: "city:test-city", MessagingStoreRef: "city:test-city/messaging", SeatRef: "seat:test-city/reviewer"}
+	var stdout, stderr bytes.Buffer
+	if code := doMailSendDurableJSON(provider, events.Discard, request, true, &stdout, &stderr); code == 0 {
+		t.Fatalf("failed durable send returned success: stdout=%s", stdout.String())
+	}
+	var result durableMailSendResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode result: %v; stdout=%s", err, stdout.String())
+	}
+	if result.DeliveryID != delivery.ID || result.Phase != string(delivery.Phase) || !result.ActionRequired {
+		t.Fatalf("returned durable state = %#v, want delivery %#v", result, delivery)
 	}
 }
 

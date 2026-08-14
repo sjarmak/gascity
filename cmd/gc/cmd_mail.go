@@ -21,6 +21,7 @@ import (
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/mail/beadmail"
+	"github.com/gastownhall/gascity/internal/maildelivery"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/telemetry"
 	"github.com/spf13/cobra"
@@ -78,6 +79,37 @@ type mailActionResult struct {
 	AlreadyDone   bool                 `json:"already_done,omitempty"`
 	Notified      bool                 `json:"notified,omitempty"`
 	DryRun        bool                 `json:"dry_run,omitempty"`
+}
+
+type durableMailSendRequest struct {
+	StableKey         string
+	Notify            bool
+	All               bool
+	Recipient         string
+	Sender            string
+	Subject           string
+	Body              string
+	CityRef           string
+	MessagingStoreRef string
+	SeatRef           string
+}
+
+type durableMailSendResult struct {
+	SchemaVersion         string `json:"schema_version"`
+	OK                    bool   `json:"ok"`
+	Command               string `json:"command"`
+	Action                string `json:"action"`
+	MessageID             string `json:"message_id"`
+	DeliveryID            string `json:"delivery_id"`
+	Phase                 string `json:"phase"`
+	NotificationRequested bool   `json:"notification_requested"`
+	RuntimeNotified       bool   `json:"runtime_notified"`
+	Notified              bool   `json:"notified"`
+	ActionRequired        bool   `json:"action_required"`
+}
+
+type stableDurableMailSender interface {
+	SendDurableStable(string, string, string, string, beadmail.StableDurableSendIntent) (mail.Message, maildelivery.Delivery, error)
 }
 
 type mailMessageSummary struct {
@@ -1439,6 +1471,7 @@ func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
 	var subject string
 	var message string
 	var jsonOut bool
+	var durableNotifyKey string
 	cmd := &cobra.Command{
 		Use:   "send [<to>] [<body>]",
 		Short: "Send a message to a session alias or human",
@@ -1460,11 +1493,14 @@ Use --all to broadcast to all live sessions (excluding sender and "human").`,
   gc mail send polecat "Priority task" --notify
   gc mail send --all "Status update: tests passing"`,
 		Args: cobra.ArbitraryArgs,
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			code := 0
-			if jsonOut {
+			switch {
+			case cmd.Flags().Changed("durable-notify-key"):
+				code = cmdMailSendDurable(args, notify, all, from, to, subject, message, durableNotifyKey, jsonOut, stdout, stderr)
+			case jsonOut:
 				code = cmdMailSendJSON(args, notify, all, from, to, subject, message, true, stdout, stderr)
-			} else {
+			default:
 				code = cmdMailSend(args, notify, all, from, to, subject, message, stdout, stderr)
 			}
 			if code != 0 {
@@ -1482,8 +1518,177 @@ Use --all to broadcast to all live sessions (excluding sender and "human").`,
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "message subject line")
 	cmd.Flags().StringVarP(&message, "message", "m", "", "message body text")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSONL result")
+	cmd.Flags().StringVar(&durableNotifyKey, "durable-notify-key", "", "stable key for one durable notify-only delivery")
 	cmd.MarkFlagsMutuallyExclusive("to", "all")
 	return cmd
+}
+
+func validateDurableMailSendRequest(request durableMailSendRequest) error {
+	if request.StableKey == "" {
+		return fmt.Errorf("--durable-notify-key requires a non-empty stable key")
+	}
+	if request.All {
+		return fmt.Errorf("--durable-notify-key cannot be combined with --all")
+	}
+	if !request.Notify {
+		return fmt.Errorf("--durable-notify-key requires --notify")
+	}
+	if normalizeNamedSessionTarget(request.Recipient) == "human" {
+		return fmt.Errorf("--durable-notify-key does not support recipient human")
+	}
+	return nil
+}
+
+func resolveDurableMailSeat(cfg *config.City, cityName string, sessions *session.Store, target string) (string, string, error) {
+	normalized := session.NormalizeNamedSessionTarget(target)
+	if normalized == "" || normalized == "human" || cfg == nil || sessions == nil {
+		return "", "", fmt.Errorf("durable mail recipient %q is not a configured named session", target)
+	}
+	spec, ok, err := session.ResolveNamedSessionSpecForConfigTarget(cfg, cityName, normalized, "")
+	if err != nil {
+		return "", "", fmt.Errorf("resolving durable mail recipient %q: %w", target, err)
+	}
+	if !ok || spec.Named == nil {
+		return "", "", fmt.Errorf("durable mail recipient %q is not a configured named session", target)
+	}
+	publicLeaf := spec.Named.Name
+	if publicLeaf == "" {
+		publicLeaf = spec.Named.Template
+	}
+	if normalized != spec.Identity && normalized != publicLeaf {
+		return "", "", fmt.Errorf("durable mail recipient %q must name the configured identity, not an alias or runtime session", target)
+	}
+	lookup, err := sessions.LookupConfiguredNamed(spec)
+	if err != nil {
+		return "", "", fmt.Errorf("resolving durable mail recipient authority: %w", err)
+	}
+	if !lookup.HasCanonical {
+		if lookup.HasConflict {
+			return "", "", fmt.Errorf("durable mail recipient %q conflicts with live session %s", target, lookup.Conflict)
+		}
+		return "", "", fmt.Errorf("durable mail recipient %q has no live configured named session", target)
+	}
+	return "seat:" + cityName + "/" + spec.Identity, spec.Identity, nil
+}
+
+func cmdMailSendDurable(args []string, notify, all bool, from, to, subject, message, stableKey string, jsonOut bool, stdout, stderr io.Writer) int {
+	if err := validateDurableMailSendRequest(durableMailSendRequest{StableKey: stableKey, Notify: notify, All: all}); err != nil {
+		fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if to != "" && !all {
+		args = append([]string{to}, args...)
+	}
+	if subject != "" || message != "" {
+		if len(args) < 1 {
+			fmt.Fprintln(stderr, "gc mail send: missing recipient") //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		body := message
+		if body == "" && len(args) > 1 {
+			body = strings.Join(args[1:], " ")
+		}
+		args = []string{args[0], subject, body}
+	}
+	if len(args) < 2 {
+		fmt.Fprintln(stderr, "gc mail send: --durable-notify-key requires one recipient and message body") //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	var parsedSubject, body string
+	if len(args) >= 3 {
+		parsedSubject, body = args[1], args[2]
+	} else {
+		body = strings.Join(args[1:], " ")
+	}
+	request := durableMailSendRequest{StableKey: stableKey, Notify: notify, All: all, Recipient: args[0], Subject: parsedSubject, Body: body}
+	if err := validateDurableMailSendRequest(request); err != nil {
+		fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+
+	mp, code := openCityMailProvider(stderr, "gc mail send")
+	if mp == nil {
+		return code
+	}
+	workStore, cityPath, code := openCityStoreWithPath(stderr, "gc mail send")
+	if workStore == nil {
+		return code
+	}
+	cfg, err := loadCityConfigWithoutBuiltinPackRefresh(cityPath, stderr)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc mail send: loading city config: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	cityName := loadedCityName(cfg, cityPath)
+	sessionsStore := cliSessionStore(workStore, cfg, cityPath)
+	seatRef, recipient, err := resolveDurableMailSeat(cfg, cityName, cliSessionFrontDoor(workStore, cfg, cityPath), request.Recipient)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	sender := from
+	if sender == "" {
+		var ok bool
+		sender, ok = resolveDefaultMailSenderForCommand(cityPath, cfg, sessionsStore, stderr, "gc mail send")
+		if !ok {
+			return 1
+		}
+	} else if sender != "human" {
+		requestedSender := sender
+		sender, err = resolveMailIdentityWithConfig(cityPath, cfg, sessionsStore, requestedSender)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", requestedSender, err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+	}
+	request.Sender = sender
+	request.Recipient = recipient
+	request.CityRef = "city:" + cityName
+	request.MessagingStoreRef = request.CityRef + "/messaging"
+	request.SeatRef = seatRef
+	return doMailSendDurableJSON(mp, openCityRecorder(stderr), request, jsonOut, stdout, stderr)
+}
+
+func doMailSendDurableJSON(mp mail.Provider, rec events.Recorder, request durableMailSendRequest, jsonOut bool, stdout, stderr io.Writer) int {
+	if err := validateDurableMailSendRequest(request); err != nil {
+		fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	sender, ok := mp.(stableDurableMailSender)
+	if !ok {
+		fmt.Fprintf(stderr, "gc mail send: configured mail provider %T does not support durable notifications\n", mp) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	message, delivery, err := sender.SendDurableStable(request.Sender, request.Recipient, request.Subject, request.Body, beadmail.StableDurableSendIntent{
+		CityRef: request.CityRef, MessagingStoreRef: request.MessagingStoreRef, SeatRef: request.SeatRef,
+		StableKey: request.StableKey, Policy: maildelivery.PolicyNotifyOnly, Attention: maildelivery.AttentionImmediate,
+	})
+	telemetry.RecordMailOp(context.Background(), "send", err)
+	if message.ID != "" {
+		rec.Record(events.Event{Type: events.MailSent, Actor: message.From, Subject: message.ID, Message: request.Recipient, Payload: mailEventPayload(&message)})
+	}
+	result := durableMailSendResult{
+		SchemaVersion: "mail-durable-send/v1", OK: err == nil, Command: "mail.send", Action: "durable-notify",
+		MessageID: message.ID, DeliveryID: delivery.ID, NotificationRequested: true, RuntimeNotified: false, Notified: false,
+	}
+	if delivery.ID != "" {
+		result.Phase = string(delivery.Phase)
+	} else if message.ID != "" {
+		result.Phase = "message-only"
+	}
+	result.ActionRequired = err != nil
+	if jsonOut && (err == nil || message.ID != "") {
+		if writeCLIJSONLineOrExit(stdout, stderr, "gc mail send", result) != 0 {
+			return 1
+		}
+	} else if err == nil {
+		fmt.Fprintf(stdout, "Created durable delivery %s for message %s to %s\n", delivery.ID, message.ID, request.Recipient) //nolint:errcheck // best-effort stdout
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "gc mail send: durable notification requires action: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	return 0
 }
 
 func newMailInboxCmd(stdout, stderr io.Writer) *cobra.Command {
