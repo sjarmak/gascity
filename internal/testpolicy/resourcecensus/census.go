@@ -758,7 +758,7 @@ var listenerHelperPackageIdentities = []listenerHelperPackageIdentity{
 			"runController",
 			"runSupervisor",
 			"startControllerSocket",
-			"startNudgeWakeListener",
+			"startNudgeWakeListenerForChannels",
 		},
 	},
 	{

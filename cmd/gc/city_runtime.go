@@ -209,6 +209,7 @@ type CityRuntime struct {
 	pokeCh              chan struct{}                // non-blocking signal to trigger immediate reconciler tick
 	controlDispatcherCh chan struct{}                // non-blocking signal for control-dispatcher-only reconcile
 	nudgeWakeCh         chan struct{}                // signal to dispatch queued nudges; fed by wake socket listener
+	nudgeDeadlineWakeCh chan struct{}                // signal to rearm the independent nudge deadline monitor
 	reloadMu            sync.Mutex                   // guards activeReload
 	activeReload        *reloadRequest
 	onStarted           func()
@@ -441,15 +442,16 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 			}
 			return make(chan struct{}, 1)
 		}(),
-		nudgeWakeCh:       make(chan struct{}, 1),
-		onStarted:         p.OnStarted,
-		onStatus:          p.OnStatus,
-		managedDoltHealth: managedDoltHealth,
-		managedDoltOwned:  managedDoltOwned,
-		managedDoltPort:   managedDoltPort,
-		logPrefix:         logPrefix,
-		stdout:            p.Stdout,
-		stderr:            p.Stderr,
+		nudgeWakeCh:         make(chan struct{}, 1),
+		nudgeDeadlineWakeCh: make(chan struct{}, 1),
+		onStarted:           p.OnStarted,
+		onStatus:            p.OnStatus,
+		managedDoltHealth:   managedDoltHealth,
+		managedDoltOwned:    managedDoltOwned,
+		managedDoltPort:     managedDoltPort,
+		logPrefix:           logPrefix,
+		stdout:              p.Stdout,
+		stderr:              p.Stderr,
 	}
 	cr.svc = workspacesvc.NewManager(&serviceRuntime{cr: cr})
 	if err := cr.svc.Reload(); err != nil {
@@ -520,6 +522,28 @@ func (cr *CityRuntime) run(ctx context.Context) {
 			cr.standaloneCityStore = store
 		}
 		cr.standaloneRigStores = buildStandaloneRigStores(cr.cfg, cr.cityPath, cr.stderr)
+	}
+
+	// Deadline enforcement is independent of reconciliation startup and ticks:
+	// either can block on a provider or a slow session operation, but neither is
+	// allowed to postpone a queued direction's deliver-by failure. Start only
+	// after the runtime's class-routed stores exist; the loop must use that
+	// boot-accepted nudge authority rather than opening a second CLI store.
+	if cr.cityPath != "" {
+		deadlineCtx, stopDeadline := context.WithCancel(ctx)
+		if _, err := startNudgeWakeListenerForChannels(deadlineCtx, cr.cityPath,
+			[]chan<- struct{}{cr.nudgeWakeCh, cr.nudgeDeadlineWakeCh}, cr.stderr, cr.logPrefix); err != nil {
+			fmt.Fprintf(cr.stderr, "%s: nudge deadline instrument failure: %v (using bounded durable-state rescans)\n", cr.logPrefix, err) //nolint:errcheck
+		}
+		deadlineDone := make(chan struct{})
+		go func() {
+			defer close(deadlineDone)
+			cr.runNudgeDeadlineLoop(deadlineCtx)
+		}()
+		defer func() {
+			stopDeadline()
+			<-deadlineDone
+		}()
 	}
 
 	// Record bead store health metric.
@@ -791,18 +815,6 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	interval := cr.cfg.Daemon.PatrolIntervalDuration()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
-	// Start the supervisor nudge dispatcher when configured. The wake-socket
-	// listener feeds nudgeWakeCh on every producer enqueue, giving sub-second
-	// dispatch latency. Patrol-tick fallback inside cr.tick() guarantees
-	// eventual delivery if the wake is missed (socket race, listener
-	// restart). Legacy mode skips the listener entirely; per-session
-	// pollers continue to own delivery.
-	if nudgeDispatcherIsSupervisor(cr.cfg) && cr.cityPath != "" {
-		if _, err := startNudgeWakeListener(ctx, cr.cityPath, cr.nudgeWakeCh, cr.stderr, cr.logPrefix); err != nil {
-			fmt.Fprintf(cr.stderr, "%s: nudge dispatcher: %v (falling back to patrol-only delivery)\n", cr.logPrefix, err) //nolint:errcheck // best-effort stderr
-		}
-	}
 
 	// Reload acceptance runs on its own goroutine so that a slow tick
 	// body (e.g., a session-start wave that waits for startup_timeout)
@@ -2245,7 +2257,9 @@ func (cr *CityRuntime) reloadConfigTraced(
 				appendWarning(fmt.Sprintf("city bead store reload: %v", err))
 			}
 		} else {
+			cr.serviceStateMu.Lock()
 			cr.standaloneCityStore = s
+			cr.serviceStateMu.Unlock()
 		}
 		cr.standaloneRigStores = buildStandaloneRigStores(nextCfg, cr.cityPath, cr.stderr)
 	}

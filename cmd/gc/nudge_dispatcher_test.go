@@ -43,7 +43,7 @@ func TestStartNudgeWakeListenerSignalsOnConnect(t *testing.T) {
 	dir := t.TempDir()
 	wakeCh := make(chan struct{}, 1)
 
-	lis, err := startNudgeWakeListener(ctx, dir, wakeCh, nil, "test")
+	lis, err := startNudgeWakeListenerForChannels(ctx, dir, []chan<- struct{}{wakeCh}, nil, "test")
 	if err != nil {
 		t.Fatalf("startNudgeWakeListener: %v", err)
 	}
@@ -57,13 +57,36 @@ func TestStartNudgeWakeListenerSignalsOnConnect(t *testing.T) {
 	}
 }
 
+func TestStartNudgeWakeListenerFansOutDeadlineAndDispatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dir := t.TempDir()
+	dispatchWake := make(chan struct{}, 1)
+	deadlineWake := make(chan struct{}, 1)
+
+	lis, err := startNudgeWakeListenerForChannels(ctx, dir, []chan<- struct{}{dispatchWake, deadlineWake}, nil, "test")
+	if err != nil {
+		t.Fatalf("startNudgeWakeListenerForChannels: %v", err)
+	}
+	defer lis.Close() //nolint:errcheck
+
+	pingNudgeWakeSocket(dir)
+	for name, wake := range map[string]<-chan struct{}{"dispatch": dispatchWake, "deadline": deadlineWake} {
+		select {
+		case <-wake:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s wake not signaled within 2s of producer ping", name)
+		}
+	}
+}
+
 func TestStartNudgeWakeListenerCoalescesBurst(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	dir := t.TempDir()
 	wakeCh := make(chan struct{}, 1)
 
-	lis, err := startNudgeWakeListener(ctx, dir, wakeCh, nil, "test")
+	lis, err := startNudgeWakeListenerForChannels(ctx, dir, []chan<- struct{}{wakeCh}, nil, "test")
 	if err != nil {
 		t.Fatalf("startNudgeWakeListener: %v", err)
 	}
@@ -94,7 +117,7 @@ func TestStartNudgeWakeListenerStopsOnContextCancel(t *testing.T) {
 	dir := t.TempDir()
 	wakeCh := make(chan struct{}, 1)
 
-	lis, err := startNudgeWakeListener(ctx, dir, wakeCh, nil, "test")
+	lis, err := startNudgeWakeListenerForChannels(ctx, dir, []chan<- struct{}{wakeCh}, nil, "test")
 	if err != nil {
 		t.Fatalf("startNudgeWakeListener: %v", err)
 	}
@@ -594,7 +617,7 @@ func TestEnqueuePingsWakeSocket(t *testing.T) {
 	defer cancel()
 	dir := t.TempDir()
 	wakeCh := make(chan struct{}, 1)
-	lis, err := startNudgeWakeListener(ctx, dir, wakeCh, nil, "test")
+	lis, err := startNudgeWakeListenerForChannels(ctx, dir, []chan<- struct{}{wakeCh}, nil, "test")
 	if err != nil {
 		t.Fatalf("startNudgeWakeListener: %v", err)
 	}

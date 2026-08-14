@@ -23,12 +23,11 @@ import (
 const pingNudgeWakeSocketDialTimeout = 200 * time.Millisecond
 
 // pingNudgeWakeSocket sends a best-effort wake signal to the supervisor's
-// nudge dispatcher. Callers invoke this after enqueueing a queued nudge so
-// the supervisor delivers within sub-second latency instead of waiting for
-// the next patrol tick. Failures (no listener, dial timeout, write error)
-// are intentionally silent: the patrol-tick fallback in supervisor mode
-// and the per-session poller in legacy mode each guarantee eventual
-// delivery without the wake.
+// nudge dispatcher and deadline timer. Callers invoke this after enqueueing a
+// queued nudge so the supervisor can deliver promptly and rearm when the new
+// item has an earlier expires_at. Failures (no listener, dial timeout, write
+// error) are intentionally silent at the producer: the deadline loop and
+// delivery patrol independently rescan durable queue state.
 func pingNudgeWakeSocket(cityPath string) {
 	if cityPath == "" {
 		return
@@ -43,12 +42,10 @@ func pingNudgeWakeSocket(cityPath string) {
 	_, _ = conn.Write([]byte{1})
 }
 
-// startNudgeWakeListener opens the supervisor wake socket and spawns an
-// accept loop that signals wakeCh on every connection. The returned
-// listener is closed when ctx is canceled. Returns nil, nil when the
-// socket cannot be opened (e.g. permission, path-too-long); callers fall
-// back to patrol-interval dispatching.
-func startNudgeWakeListener(ctx context.Context, cityPath string, wakeCh chan<- struct{}, stderr io.Writer, logPrefix string) (net.Listener, error) {
+// startNudgeWakeListenerForChannels fans one durable enqueue signal out to
+// independent consumers. A shared receive channel would make dispatch and
+// deadline rearming race, silently starving whichever consumer lost the read.
+func startNudgeWakeListenerForChannels(ctx context.Context, cityPath string, wakeChans []chan<- struct{}, stderr io.Writer, logPrefix string) (net.Listener, error) {
 	path := nudgequeue.WakeSocketPath(cityPath)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("creating nudge wake dir: %w", err)
@@ -95,10 +92,15 @@ func startNudgeWakeListener(ctx context.Context, cityPath string, wakeCh chan<- 
 			var buf [16]byte
 			_, _ = conn.Read(buf[:])
 			_ = conn.Close()
-			select {
-			case wakeCh <- struct{}{}:
-			default:
-				// Already-pending wake covers this enqueue; coalesced.
+			for _, wakeCh := range wakeChans {
+				if wakeCh == nil {
+					continue
+				}
+				select {
+				case wakeCh <- struct{}{}:
+				default:
+					// Already-pending wake covers this enqueue; coalesced.
+				}
 			}
 		}
 	}()
