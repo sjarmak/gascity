@@ -1,11 +1,20 @@
 package dashboardspa
 
 import (
+	"fmt"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"path"
+	"regexp"
 	"strings"
 	"testing"
+	"testing/fstest"
+)
+
+var (
+	dashboardAssetReferenceRE = regexp.MustCompile(`/assets/[^"']+`)
+	dashboardConflictMarkerRE = regexp.MustCompile(`(?m)^(<<<<<<< |\|{7} |=======\s*$|>>>>>>> )`)
 )
 
 func newHandler(t *testing.T) http.Handler {
@@ -75,6 +84,96 @@ func TestHashedAssetIsImmutablyCached(t *testing.T) {
 	if cc := rec.Header().Get("Cache-Control"); !strings.Contains(cc, "immutable") {
 		t.Errorf("asset %s: Cache-Control = %q, want immutable", asset, cc)
 	}
+}
+
+func TestEmbeddedDashboardBundleIntegrity(t *testing.T) {
+	if err := validateEmbeddedDashboardBundle(distFS); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateEmbeddedDashboardBundleRejectsBrokenArtifacts(t *testing.T) {
+	t.Run("non-canonical asset reference", func(t *testing.T) {
+		bundle := fstest.MapFS{
+			"dist/index.html": {Data: []byte(`<script src="/assets/../index.html"></script>`)},
+		}
+		if err := validateEmbeddedDashboardBundle(bundle); err == nil || !strings.Contains(err.Error(), "non-canonical") {
+			t.Fatalf("validateEmbeddedDashboardBundle() error = %v, want non-canonical asset reference", err)
+		}
+	})
+
+	t.Run("asset reference is a directory", func(t *testing.T) {
+		bundle := fstest.MapFS{
+			"dist/index.html":    {Data: []byte(`<script src="/assets/chunks"></script>`)},
+			"dist/assets/chunks": {Mode: fs.ModeDir},
+		}
+		if err := validateEmbeddedDashboardBundle(bundle); err == nil || !strings.Contains(err.Error(), "regular file") {
+			t.Fatalf("validateEmbeddedDashboardBundle() error = %v, want regular-file asset", err)
+		}
+	})
+
+	t.Run("missing referenced asset", func(t *testing.T) {
+		bundle := fstest.MapFS{
+			"dist/index.html": {Data: []byte(`<script src="/assets/missing.js"></script>`)},
+		}
+		if err := validateEmbeddedDashboardBundle(bundle); err == nil || !strings.Contains(err.Error(), "missing.js") {
+			t.Fatalf("validateEmbeddedDashboardBundle() error = %v, want missing asset", err)
+		}
+	})
+
+	t.Run("conflict marker", func(t *testing.T) {
+		bundle := fstest.MapFS{
+			"dist/index.html":    {Data: []byte(`<script src="/assets/app.js"></script>`)},
+			"dist/assets/app.js": {Data: []byte("<<<<<<< HEAD\nconst version = 1\n=======\nconst version = 2\n>>>>>>> branch\n")},
+		}
+		if err := validateEmbeddedDashboardBundle(bundle); err == nil || !strings.Contains(err.Error(), "conflict marker") {
+			t.Fatalf("validateEmbeddedDashboardBundle() error = %v, want conflict marker", err)
+		}
+	})
+}
+
+func validateEmbeddedDashboardBundle(bundle fs.FS) error {
+	const indexPath = "dist/index.html"
+	index, err := fs.ReadFile(bundle, indexPath)
+	if err != nil {
+		return fmt.Errorf("read embedded dashboard index: %w", err)
+	}
+
+	references := dashboardAssetReferenceRE.FindAllString(string(index), -1)
+	if len(references) == 0 {
+		return fmt.Errorf("embedded dashboard index has no asset references")
+	}
+	for _, reference := range references {
+		cleanReference := path.Clean(reference)
+		if cleanReference != reference || !strings.HasPrefix(cleanReference, "/assets/") {
+			return fmt.Errorf("embedded dashboard asset reference %q is non-canonical", reference)
+		}
+		assetPath := path.Join("dist", strings.TrimPrefix(cleanReference, "/"))
+		info, err := fs.Stat(bundle, assetPath)
+		if err != nil {
+			return fmt.Errorf("embedded dashboard references %s: %w", reference, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("embedded dashboard reference %s is not a regular file", reference)
+		}
+	}
+
+	return fs.WalkDir(bundle, "dist", func(filePath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		contents, err := fs.ReadFile(bundle, filePath)
+		if err != nil {
+			return fmt.Errorf("read embedded dashboard file %s: %w", filePath, err)
+		}
+		if dashboardConflictMarkerRE.Match(contents) {
+			return fmt.Errorf("embedded dashboard file %s contains a conflict marker", filePath)
+		}
+		return nil
+	})
 }
 
 func TestCSPPinsInlineScriptHash(t *testing.T) {
