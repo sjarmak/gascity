@@ -3,18 +3,141 @@ package beads
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	beadslib "github.com/steveyegge/beads"
+	"github.com/steveyegge/beads/issueops"
 )
 
-// NativeDoltStore offers the narrow metadata value-CAS and deliberately NOT
-// the full ConditionalWriter. The revision-CAS trio needs a backend fence
-// token that beads v1.1.0 cannot supply, and declaring the interface to get
-// this one method would make ResolveConditionalWriter resolve under require
-// mode — converting a loud typed refusal into a silent wrong-fenced write.
-// internal/beads/metadata_cas.go carries the full reasoning.
-var _ MetadataCASWriter = (*NativeDoltStore)(nil)
+var (
+	_ ConditionalWriter = (*NativeDoltStore)(nil)
+	_ MetadataCASWriter = (*NativeDoltStore)(nil)
+)
+
+// UpdateIfMatch applies opts when the issue still carries expectedRevision.
+func (s *NativeDoltStore) UpdateIfMatch(id string, expectedRevision int64, opts UpdateOpts) error {
+	if isEmptyUpdateOpts(opts) {
+		return ErrEmptyConditionalUpdate
+	}
+	storage, release, err := s.acquireStorage()
+	if err != nil {
+		return err
+	}
+	defer release()
+	ctx, cancel := nativeDoltOperationContext(context.TODO())
+	defer cancel()
+	lifecycle, err := storage.IssueLifecycle()
+	if err != nil {
+		return err
+	}
+	patch, err := nativeConditionalIssuePatch(opts)
+	if err != nil {
+		return err
+	}
+	_, err = lifecycle.Update(ctx, issueops.UpdateRequest{
+		Actor:           s.actor,
+		IssueID:         id,
+		Patch:           patch,
+		ExpectedVersion: &expectedRevision,
+	})
+	return s.nativeConditionalError(ctx, storage, id, expectedRevision, err)
+}
+
+// CloseIfMatch closes the issue when it still carries expectedRevision.
+func (s *NativeDoltStore) CloseIfMatch(id string, expectedRevision int64) error {
+	storage, release, err := s.acquireStorage()
+	if err != nil {
+		return err
+	}
+	defer release()
+	ctx, cancel := nativeDoltOperationContext(context.TODO())
+	defer cancel()
+	_, err = storage.CloseIssueChecked(ctx, id, s.actor, beadslib.CloseIssueOptions{
+		Force: true, ExpectedVersion: &expectedRevision,
+	})
+	return s.nativeConditionalError(ctx, storage, id, expectedRevision, err)
+}
+
+// DeleteIfMatch uses the upstream guarded deletion role so the version check,
+// dependent handling, reference rewrites, and deletion share one transaction.
+func (s *NativeDoltStore) DeleteIfMatch(id string, expectedRevision int64) error {
+	storage, release, err := s.acquireStorage()
+	if err != nil {
+		return err
+	}
+	defer release()
+	ctx, cancel := nativeDoltOperationContext(context.TODO())
+	defer cancel()
+	deleter, err := storage.Deleter()
+	if err != nil {
+		return nativeStoreError(id, err)
+	}
+	_, err = deleter.Delete(ctx, issueops.DeleteRequest{
+		Actor:           s.actor,
+		IDs:             []string{id},
+		Force:           true,
+		ExpectedVersion: &expectedRevision,
+	})
+	if err := s.nativeConditionalError(ctx, storage, id, expectedRevision, err); err != nil {
+		return err
+	}
+	if err := s.localStrings.DeleteBead(id); err != nil {
+		return fmt.Errorf("deleting bead %q: cleaning up local strings: %w", id, err)
+	}
+	return nil
+}
+
+func nativeConditionalIssuePatch(opts UpdateOpts) (issueops.IssuePatch, error) {
+	patch := issueops.IssuePatch{Labels: issueops.LabelPatch{Add: opts.Labels, Remove: opts.RemoveLabels}}
+	if opts.Title != nil {
+		patch.Title = issueops.Field[string]{Set: true, Value: *opts.Title}
+	}
+	if opts.Status != nil {
+		patch.Status = issueops.Field[issueops.Status]{Set: true, Value: issueops.Status(*opts.Status)}
+	}
+	if opts.Type != nil {
+		patch.IssueType = issueops.Field[issueops.IssueType]{Set: true, Value: issueops.IssueType(*opts.Type)}
+	}
+	if opts.Priority != nil {
+		patch.Priority = issueops.Field[int]{Set: true, Value: *opts.Priority}
+	}
+	if opts.Description != nil {
+		patch.Description = issueops.Field[string]{Set: true, Value: *opts.Description}
+	}
+	if opts.ParentID != nil {
+		patch.ParentID = issueops.Field[string]{Set: true, Value: *opts.ParentID}
+	}
+	if opts.Assignee != nil {
+		patch.Assignee = issueops.Field[string]{Set: true, Value: *opts.Assignee}
+	}
+	if len(opts.Metadata) > 0 {
+		patch.Metadata.Set = make(map[string]json.RawMessage, len(opts.Metadata))
+		for key, value := range opts.Metadata {
+			raw, err := json.Marshal(value)
+			if err != nil {
+				return issueops.IssuePatch{}, fmt.Errorf("marshaling metadata value %q: %w", key, err)
+			}
+			patch.Metadata.Set[key] = raw
+		}
+	}
+	return patch, nil
+}
+
+func (s *NativeDoltStore) nativeConditionalError(ctx context.Context, storage beadslib.Storage, id string, expectedRevision int64, err error) error {
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, beadslib.ErrVersionMismatch) {
+		return nativeStoreError(id, err)
+	}
+	current := int64(0)
+	issue, readErr := storage.GetIssue(ctx, id)
+	if readErr == nil && issue != nil {
+		current = issue.RowVersion
+	}
+	return &PreconditionFailedError{ID: id, Expected: expectedRevision, Current: current, Raw: err.Error()}
+}
 
 // CompareAndSetMetadataKey atomically sets metadata[key] = next when the key's
 // current value equals expected.

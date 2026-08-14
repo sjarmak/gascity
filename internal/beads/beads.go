@@ -175,8 +175,9 @@ type ConditionalAssignmentReleaser interface {
 //     bumps the revision is backend-dependent and callers must not rely on
 //     either answer. This is why every consumer treats PreconditionFailedError
 //     as a re-read trigger, never as a conclusion about what changed.
-//   - A bead's revision is monotonically increasing for the lifetime of the bead
-//     and is never reused.
+//   - A bead's revision changes to a fresh value for every covered mutation and
+//     is never reused for the lifetime of the bead. Numeric ordering is
+//     undefined, as required by the equality-only rule above.
 //
 // GRANULARITY CONTRACT: consumers may assume NEITHER value-level nor
 // revision-level conflict semantics. Backends differ — sqlite and the native

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	beadslib "github.com/steveyegge/beads"
+	"github.com/steveyegge/beads/issueops"
 )
 
 func TestNativeDoltStoreCreateDelegatesToUpstreamStorage(t *testing.T) {
@@ -2039,6 +2040,7 @@ type nativeDoltTransactionTestStorage interface {
 	GetIssue(context.Context, string) (*beadslib.Issue, error)
 	UpdateIssue(context.Context, string, map[string]interface{}, string) error
 	CloseIssue(context.Context, string, string, string, string) error
+	DeleteIssue(context.Context, string) error
 	AddLabel(context.Context, string, string, string) error
 	RemoveLabel(context.Context, string, string, string) error
 	AddDependency(context.Context, *beadslib.Dependency, string) error
@@ -2061,6 +2063,10 @@ func (tx nativeDoltTransactionForTest) CreateIssues(ctx context.Context, issues 
 
 func (tx nativeDoltTransactionForTest) CloseIssue(ctx context.Context, id, reason, actor, session string) error {
 	return tx.storage.CloseIssue(ctx, id, reason, actor, session)
+}
+
+func (tx nativeDoltTransactionForTest) DeleteIssue(ctx context.Context, id string) error {
+	return tx.storage.DeleteIssue(ctx, id)
 }
 
 func (tx nativeDoltTransactionForTest) GetIssue(ctx context.Context, id string) (*beadslib.Issue, error) {
@@ -2281,6 +2287,18 @@ func (s *nativeDoltMemStorage) RunInTransaction(_ context.Context, _ string, fn 
 	return runNativeDoltMemStorageTransactionForTest(s, func() error {
 		return fn(nativeDoltTransactionForTest{storage: s})
 	})
+}
+
+func (s *nativeDoltMemStorage) IssueLifecycle() (issueops.Lifecycle, error) {
+	return nil, errors.New("native Dolt memory fixture does not model the upstream lifecycle role")
+}
+
+func (s *nativeDoltMemStorage) CloseIssueChecked(context.Context, string, string, beadslib.CloseIssueOptions) (beadslib.CloseIssueResult, error) {
+	return beadslib.CloseIssueResult{}, errors.New("native Dolt memory fixture does not model guarded close")
+}
+
+func (s *nativeDoltMemStorage) Deleter() (issueops.Deleter, error) {
+	return nil, errors.New("native Dolt memory fixture does not model guarded deletion")
 }
 
 func runNativeDoltMemStorageTransactionForTest(storage *nativeDoltMemStorage, fn func() error) error {

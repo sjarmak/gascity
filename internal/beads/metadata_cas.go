@@ -2,16 +2,11 @@
 //
 // ConditionalWriter (beads.go) bundles four methods: the revision-CAS trio
 // (UpdateIfMatch/CloseIfMatch/DeleteIfMatch) plus CompareAndSetMetadataKey.
-// The trio needs a backend fence token — a revision that advances on every
-// mutation and is never reused. The beads v1.1.0 schema cannot supply one:
-// types.Issue carries no revision field (Get().Revision is 0 and never
-// advances), the issues DDL has no version column, and updated_at is
-// second-granularity — so two same-second writes yield an EQUAL token and a
-// stale fence SILENTLY SUCCEEDS, which is the lost update a fence exists to
-// prevent. Label mutations never touch updated_at at all. A store-maintained
-// counter is not a fence either: the Dolt database is multi-writer (the bd
-// CLI, other gascity processes, graph-apply), and a counter only the fencer
-// maintains fences nothing.
+// The trio needs a backend fence token — an equality-only revision that changes
+// on every covered mutation and is never reused. Some backends cannot supply
+// one. A store-maintained counter is not sufficient for a multi-writer backend:
+// writers that bypass the store would also bypass the counter and leave a stale
+// fence looking current.
 //
 // CompareAndSetMetadataKey needs no such token — it guards on the key's own
 // current value — so it is soundly implementable today on stores where the
@@ -23,10 +18,6 @@
 // exactly the silent legacy write under require that the seam exists to make
 // inexpressible. See the condWritesStamp comment in native_dolt_store.go.
 //
-// Upstream beads #4697 (claim_fence) is the missing backend primitive. When it
-// lands, a store can implement the trio soundly and declare ConditionalWriter;
-// until then a narrow-only store declares MetadataCASWriter and nothing more.
-//
 // Resolution is deliberately SEPARATE from ResolveConditionalWriter: this is a
 // capability lookup, not the operator-policy seam. It carries no
 // conditional_writes mode, because its consumers (target_scope member
@@ -35,7 +26,7 @@
 // implementation, so gating it on a rollout flag would leave them with nothing
 // under the default off. Nothing here can raise enforcement on the trio: a
 // narrow writer never satisfies ConditionalWriter, so the trio's callers stay
-// exactly as refused as they are today.
+// refused for that backing.
 
 package beads
 
