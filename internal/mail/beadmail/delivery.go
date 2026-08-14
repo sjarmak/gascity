@@ -267,6 +267,11 @@ func sameDurableMessage(existing, wanted beads.Bead) bool {
 		return false
 	}
 	for key, value := range wanted.Metadata {
+		if key == fromSessionIDMetadataKey {
+			// The session bead is volatile routing metadata. The display sender is
+			// the logical identity and remains part of replay comparison.
+			continue
+		}
 		if existing.Metadata[key] != value {
 			return false
 		}

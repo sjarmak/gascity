@@ -1606,7 +1606,7 @@ func cmdMailSendDurable(args []string, notify, all bool, from, to, subject, mess
 		return 1
 	}
 	if cityPath, resolveErr := resolveCity(); resolveErr == nil {
-		if client := apiClient(cityPath); client != nil {
+		if client := resolveMailDeliveryMutationClient(cityPath); client != nil {
 			senderCandidates := []string{from}
 			if from == "" {
 				senderCandidates = defaultMailIdentityCandidates()
@@ -1615,7 +1615,7 @@ func cmdMailSendDurable(args []string, notify, all bool, from, to, subject, mess
 				StableKey: stableKey, Recipient: request.Recipient, SenderCandidates: senderCandidates,
 				Subject: request.Subject, Body: request.Body,
 			})
-			if apiErr == nil || !api.ShouldFallback(client, apiErr) {
+			if apiErr == nil || !client.ShouldFallback(apiErr) {
 				return renderDurableMailSendResult(domainResult, apiErr, request, jsonOut, stdout, stderr)
 			}
 		}

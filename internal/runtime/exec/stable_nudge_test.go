@@ -226,6 +226,92 @@ esac
 	}
 }
 
+func TestStableNudgeWireClassifiesMalformedReceiptApartFromIdentityConflict(t *testing.T) {
+	dir := t.TempDir()
+	effectID := "mail-nudge-" + strings.Repeat("7", 64)
+	script := writeScript(t, dir, `
+case "$1" in
+ protocol) printf '%s' '{"version":0,"capabilities":["effect.nudge-idempotent"]}' ;;
+ nudge-stable) cat >/dev/null; printf '%s' '{"version":1,"effect_id":"bad","target_runtime_name":"Session-A"}' ;;
+ *) exit 2 ;;
+esac
+`)
+	p := NewProvider(script)
+	if _, err := p.NudgeStable(context.Background(), "session-a", effectID, runtime.TextContent("notice")); err == nil || errors.Is(err, runtime.ErrStableNudgeConflict) || errors.Is(err, runtime.ErrStableNudgeRetrySafe) {
+		t.Fatalf("malformed receipt error = %v, want fail-closed non-conflict", err)
+	}
+}
+
+func TestStableNudgeLookupClassifiesMalformedShapeApartFromValidConflict(t *testing.T) {
+	effectID := "mail-nudge-" + strings.Repeat("6", 64)
+	content := runtime.TextContent("notice")
+	acceptedAt := time.Date(2026, 8, 14, 1, 0, 0, 0, time.UTC)
+	receipt, err := runtime.NewStableNudgeReceipt(effectID, "session-b", content, "receipt:one", acceptedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name         string
+		lookup       runtime.StableNudgeLookup
+		wantConflict bool
+	}{
+		{
+			name: "valid identity mismatch", wantConflict: true,
+			lookup: runtime.StableNudgeLookup{Version: 1, State: runtime.StableNudgeLookupCommitted, Receipt: receipt, ObservedAt: acceptedAt.Add(time.Minute)},
+		},
+		{
+			name: "malformed receipt",
+			lookup: func() runtime.StableNudgeLookup {
+				bad := receipt
+				bad.TargetRuntimeName = "Session-B"
+				return runtime.StableNudgeLookup{Version: 1, State: runtime.StableNudgeLookupCommitted, Receipt: bad, ObservedAt: acceptedAt.Add(time.Minute)}
+			}(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			wire, err := json.Marshal(tc.lookup)
+			if err != nil {
+				t.Fatal(err)
+			}
+			script := writeScript(t, dir, fmt.Sprintf(`
+case "$1" in
+ protocol) printf '%%s' '{"version":0,"capabilities":["effect.nudge-idempotent"]}' ;;
+ nudge-stable-status) cat >/dev/null; printf '%%s' '%s' ;;
+ *) exit 2 ;;
+esac
+`, wire))
+			_, gotErr := NewProvider(script).LookupStableNudge(context.Background(), "session-a", effectID, content)
+			if gotErr == nil || errors.Is(gotErr, runtime.ErrStableNudgeConflict) != tc.wantConflict || errors.Is(gotErr, runtime.ErrStableNudgeRetrySafe) {
+				t.Fatalf("lookup error = %v, want conflict=%v and never retry-safe", gotErr, tc.wantConflict)
+			}
+		})
+	}
+}
+
+func TestStableNudgeLookupRejectsMalformedJSONAndTrailingData(t *testing.T) {
+	effectID := "mail-nudge-" + strings.Repeat("5", 64)
+	for name, wire := range map[string]string{
+		"malformed": `{"version":`,
+		"trailing":  `{"version":1,"state":"unknown_external_state","observed_at":"2026-08-14T01:00:00Z"}{}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			script := writeScript(t, dir, fmt.Sprintf(`
+case "$1" in
+ protocol) printf '%%s' '{"version":0,"capabilities":["effect.nudge-idempotent"]}' ;;
+ nudge-stable-status) cat >/dev/null; printf '%%s' '%s' ;;
+ *) exit 2 ;;
+esac
+`, wire))
+			if _, err := NewProvider(script).LookupStableNudge(context.Background(), "session-a", effectID, runtime.TextContent("notice")); err == nil || errors.Is(err, runtime.ErrStableNudgeConflict) || errors.Is(err, runtime.ErrStableNudgeRetrySafe) {
+				t.Fatalf("malformed lookup error = %v", err)
+			}
+		})
+	}
+}
+
 func TestStableNudgeWireRejectsMalformedEffectIDBeforeOperation(t *testing.T) {
 	dir := t.TempDir()
 	called := filepath.Join(dir, "called")

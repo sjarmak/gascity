@@ -211,7 +211,7 @@ func (s *Store) PrepareTransportBatch(ctx context.Context, deliveryIDs []string,
 func sameStableActivationFence(a, b ActivationFence) bool {
 	return a.CityRef == b.CityRef && a.SeatRef == b.SeatRef && a.AuthorityKind == b.AuthorityKind &&
 		a.AuthorityRef == b.AuthorityRef && a.AuthorityGeneration == b.AuthorityGeneration &&
-		a.AuthorityIntentSHA256 == b.AuthorityIntentSHA256 && a.SessionRef == b.SessionRef &&
+		a.SessionRef == b.SessionRef &&
 		a.ContinuationEpoch == b.ContinuationEpoch && a.InstanceTokenSHA256 == b.InstanceTokenSHA256
 }
 

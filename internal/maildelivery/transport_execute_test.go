@@ -111,9 +111,18 @@ func TestExecuteTransportRetrySafeResponseLossRetriesThenCommits(t *testing.T) {
 			if !errors.Is(err, ErrTransportRetrySafe) || first.State != TransportRequested {
 				t.Fatalf("first = %#v, %v, want requested retry-safe", first, err)
 			}
-			second, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence}, request.CreatedAt.Add(2*time.Second), nil, invoke)
+			reconfigured := fence
+			reconfigured.AuthorityIntentSHA256 = strings.Repeat("e", 64)
+			reconfigured.FenceID = "mail-activation-" + reconfigured.AuthorityIntentSHA256
+			reconfigured.IssuedByRef = "controller:test-city/mail-delivery"
+			retryRequest := request
+			retryRequest.ExpectedFenceID = reconfigured.FenceID
+			second, err := ExecuteTransport(context.Background(), store, retryRequest, fixedFenceResolver{fence: reconfigured}, request.CreatedAt.Add(2*time.Second), nil, invoke)
 			if err != nil || second.State != TransportCommitted {
 				t.Fatalf("second = %#v, %v, want committed", second, err)
+			}
+			if second.AttemptID != first.AttemptID || second.NudgeID != first.NudgeID {
+				t.Fatalf("config/issuer drift changed effect identity: first=%s/%s second=%s/%s", first.AttemptID, first.NudgeID, second.AttemptID, second.NudgeID)
 			}
 			if got := effects[second.NudgeID]; got != tc.wantEffects {
 				t.Fatalf("physical effects = %d, want %d", got, tc.wantEffects)

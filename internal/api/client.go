@@ -219,12 +219,18 @@ func convertGeneratedMailDelivery[T any](value any) (T, error) {
 	return result, nil
 }
 
-func validateDurableMailResult(result beadmail.DurableSendResult) error {
-	if result.Message.ID == "" || result.Delivery.ID == "" {
-		return fmt.Errorf("durable mail response has no exact message and delivery identity")
+func validateDurableMailResult(result beadmail.DurableSendResult, allowMessageOnly bool) error {
+	if result.Message.ID == "" {
+		return fmt.Errorf("durable mail response has no exact message identity")
+	}
+	if result.Delivery.ID == "" && !allowMessageOnly {
+		return fmt.Errorf("successful durable mail response has no exact delivery identity")
 	}
 	switch result.Outcome {
 	case beadmail.DurableSendCreated, beadmail.DurableSendMessageOnlyRepaired, beadmail.DurableSendExactReplay:
+		// Delivery creation is a second durable write. A result-bearing failure
+		// may therefore carry the exact canonical message with no delivery yet;
+		// preserving that identity is what makes repair honest and idempotent.
 		return nil
 	default:
 		return fmt.Errorf("durable mail response has invalid outcome %q", result.Outcome)
@@ -693,7 +699,10 @@ func NewCityScopedClient(baseURL, cityName string) *Client {
 }
 
 func newClient(baseURL, cityName string) *Client {
-	httpClient := &http.Client{Timeout: defaultClientTimeout}
+	return newClientWithHTTPClient(baseURL, cityName, &http.Client{Timeout: defaultClientTimeout})
+}
+
+func newClientWithHTTPClient(baseURL, cityName string, httpClient *http.Client) *Client {
 	cw, err := genclient.NewClientWithResponses(
 		baseURL,
 		genclient.WithHTTPClient(httpClient),
@@ -1425,7 +1434,7 @@ func (c *Client) SendDurableMail(command DurableMailCommand) (beadmail.DurableSe
 	if err != nil {
 		return beadmail.DurableSendResult{}, err
 	}
-	if err := validateDurableMailResult(result); err != nil {
+	if err := validateDurableMailResult(result, !resp.JSON200.Ok); err != nil {
 		return beadmail.DurableSendResult{}, err
 	}
 	return result, mailDeliveryResultError(resp.JSON200.Ok, resp.JSON200.FailureCode)

@@ -14,6 +14,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/maildelivery"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
@@ -37,6 +38,31 @@ type (
 	mailDeliveryReconcileItem   = maildelivery.ReconcileItem
 	mailDeliveryReconcileReport = maildelivery.ReconcileReport
 )
+
+type mailDeliveryMutationClient interface {
+	SendDurableMail(api.DurableMailCommand) (beadmail.DurableSendResult, error)
+	ReconcileMailDeliverySeat(string, int, string) (maildelivery.ReconcileReport, error)
+	InvokeMailDelivery(string) (maildelivery.TransportAttempt, error)
+	ShouldFallback(error) bool
+}
+
+type supervisorMailDeliveryClient struct{ *api.Client }
+
+func (c supervisorMailDeliveryClient) ShouldFallback(err error) bool {
+	return api.ShouldFallback(c.Client, err)
+}
+
+var resolveMailDeliveryMutationClient = func(cityPath string) mailDeliveryMutationClient {
+	client, _ := maintenanceAPIClient(cityPath)
+	if client == nil {
+		return nil
+	}
+	return supervisorMailDeliveryClient{Client: client}
+}
+
+func mailDeliveryIssuerRef(cityName string) string {
+	return "controller:" + cityName + "/mail-delivery"
+}
 
 func mailDeliveryNudgeText(count int) string {
 	if count == 1 {
@@ -92,9 +118,9 @@ func cmdMailDeliveryReconcileSeat(ctx context.Context, seatRef string, limit int
 		return 1
 	}
 	if cityPath, resolveErr := resolveCity(); resolveErr == nil {
-		if client := apiClient(cityPath); client != nil {
+		if client := resolveMailDeliveryMutationClient(cityPath); client != nil {
 			report, apiErr := client.ReconcileMailDeliverySeat(seatRef, limit, expectedDeliveryID)
-			if apiErr == nil || !api.ShouldFallback(client, apiErr) {
+			if apiErr == nil || !client.ShouldFallback(apiErr) {
 				return renderMailDeliveryReconcile(report, apiErr, stdout, stderr)
 			}
 		}
@@ -188,9 +214,9 @@ func cmdMailDeliveryStatus(attemptID string, stdout, stderr io.Writer) int {
 
 func cmdMailDeliveryInvoke(ctx context.Context, attemptID string, stdout, stderr io.Writer) int {
 	if cityPath, resolveErr := resolveCity(); resolveErr == nil {
-		if client := apiClient(cityPath); client != nil {
+		if client := resolveMailDeliveryMutationClient(cityPath); client != nil {
 			attempt, apiErr := client.InvokeMailDelivery(attemptID)
-			if apiErr == nil || !api.ShouldFallback(client, apiErr) {
+			if apiErr == nil || !client.ShouldFallback(apiErr) {
 				return renderMailDeliveryInvoke(attempt, apiErr, stdout, stderr)
 			}
 		}
@@ -217,7 +243,7 @@ func cmdMailDeliveryInvoke(ctx context.Context, attemptID string, stdout, stderr
 		store: sessionFrontDoor(sessStore), sessionRef: attempt.SessionRef,
 		options: session.MailActivationFenceOptions{
 			CityRef: "city:" + loadedCityName(cfg, cityPath), ConfigSHA256: config.Revision(fsys.OSFS{}, prov, cfg, cityPath),
-			IssuedByRef: "controller:" + loadedCityName(cfg, cityPath) + "/mail-delivery-cli",
+			IssuedByRef: mailDeliveryIssuerRef(loadedCityName(cfg, cityPath)),
 		},
 	}
 	provider, err := newSessionProviderForCity(cfg, cityPath)
@@ -291,7 +317,7 @@ func mailDeliveryFenceResolverForSeat(store *session.Store, cfg *config.City, ci
 		store: store,
 		options: session.MailActivationFenceOptions{
 			CityRef: "city:" + cityName, SeatRef: seatRef, ConfigSHA256: configSHA256,
-			IssuedByRef: "controller:" + cityName + "/mail-delivery-cli",
+			IssuedByRef: mailDeliveryIssuerRef(cityName),
 		},
 	}
 	match, err := store.LookupConfiguredNamed(spec)
