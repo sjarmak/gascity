@@ -20,5 +20,34 @@ func OpenNativeDoltStoreForConditionalConformance(ctx context.Context, beadsDir,
 		_ = storage.Close()
 		return nil, fmt.Errorf("set issue prefix: %w", err)
 	}
+	metadata, ok := storage.(interface {
+		SetMetadata(context.Context, string, string) error
+	})
+	if !ok {
+		_ = storage.Close()
+		return nil, fmt.Errorf("native test storage does not implement SetMetadata")
+	}
+	if err := metadata.SetMetadata(ctx, "_project_id", "conditional-writer-conformance-project"); err != nil {
+		_ = storage.Close()
+		return nil, fmt.Errorf("set project identity: %w", err)
+	}
 	return newNativeDoltStoreWithStorageAndPrefix(storage, actor, "gc"), nil
+}
+
+// CommitNativeDoltStoreForConditionalConformance settles pending graph writes
+// before tests exercise the production full-recompute cleanliness guard.
+func CommitNativeDoltStoreForConditionalConformance(ctx context.Context, store *NativeDoltStore, actor string) error {
+	storage, release, err := store.acquireStorage()
+	if err != nil {
+		return err
+	}
+	defer release()
+	committer, ok := storage.(interface {
+		CommitPending(context.Context, string) (bool, error)
+	})
+	if !ok {
+		return fmt.Errorf("native test storage does not implement CommitPending")
+	}
+	_, err = committer.CommitPending(ctx, actor)
+	return err
 }

@@ -336,6 +336,7 @@ gc beads
 | [gc beads health](#gc-beads-health) | Check beads provider health |
 | [gc beads list](#gc-beads-list) | List beads (API-routed with bd fallback) |
 | [gc beads metadata-cas](#gc-beads-metadata-cas) | Atomically compare and set one metadata key in an exact local store |
+| [gc beads reconcile-blocked-status](#gc-beads-reconcile-blocked-status) | Reconcile stored blocked status to canonical dependency readiness |
 | [gc beads show](#gc-beads-show) | Show a single bead (API-routed with bd fallback) |
 
 ## gc beads city
@@ -480,6 +481,32 @@ gc beads metadata-cas tr-123 \
 | `--key` | string |  | metadata key to compare and set |
 | `--next` | string |  | replacement value (explicit empty is allowed) |
 | `--store-ref` | string |  | exact local store: city:&lt;name&gt; or rig:&lt;name&gt; |
+
+## gc beads reconcile-blocked-status
+
+Reconcile the raw stored lifecycle status to the canonical is_blocked
+projection in one exact local city store. The command performs a bounded full
+nonclosed snapshot, refuses truncation or unclassified legacy rows before any
+write, and fences each patch on revision, raw status, and an in-transaction
+canonical is_blocked refresh.
+
+Pass --migration-ledger for the audited preimages of legacy blocked rows. The
+ledger is optional after every legacy row has either been restored or carries
+the projection marker. --dry-run still requires the authoritative native read
+and guarded-write capabilities, and it may refresh the derived is_blocked cache
+before planning; it never applies a lifecycle or metadata patch.
+
+```
+gc beads reconcile-blocked-status [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--dry-run` | bool |  | plan without applying lifecycle or metadata patches |
+| `--json` | bool |  | emit one canonical JSON result |
+| `--limit` | int | `1000` | maximum nonclosed rows in one complete pass |
+| `--migration-ledger` | string |  | complete audited legacy-preimage ledger JSON |
+| `--store-ref` | string |  | exact local city store: city:&lt;name&gt; |
 
 ## gc beads show
 

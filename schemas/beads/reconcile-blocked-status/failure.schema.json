@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gc://schemas/beads/reconcile-blocked-status/failure.schema.json",
+  "title": "gc beads reconcile-blocked-status failure",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "ok", "error"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "ok": {"const": false},
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "exit_code"],
+      "properties": {
+        "code": {"type": "string", "minLength": 1},
+        "message": {"type": "string", "minLength": 1},
+        "exit_code": {"type": "integer", "minimum": 1}
+      }
+    },
+    "store_ref": {
+      "type": "string",
+      "pattern": "^city:[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 260
+    },
+    "dry_run": {"type": "boolean"},
+    "scanned": {"type": "integer", "minimum": 0},
+    "planned": {"type": "integer", "minimum": 0},
+    "applied": {"type": "integer", "minimum": 0},
+    "unsafe": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "reason"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "reason": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "error": {
+            "properties": {"code": {"const": "unsafe_corpus"}},
+            "required": ["code"]
+          }
+        }
+      },
+      "then": {
+        "required": ["store_ref", "dry_run", "scanned", "planned", "applied", "unsafe"],
+        "properties": {
+          "error": {
+            "properties": {
+              "code": {"const": "unsafe_corpus"},
+              "exit_code": {"const": 1}
+            }
+          },
+          "applied": {"const": 0},
+          "unsafe": {"minItems": 1}
+        }
+      }
+    }
+  ]
+}

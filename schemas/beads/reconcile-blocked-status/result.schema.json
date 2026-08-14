@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gc://schemas/beads/reconcile-blocked-status/result.schema.json",
+  "title": "gc beads reconcile-blocked-status result",
+  "description": "Result of one bounded blocked-status reconciliation pass.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "ok", "store_ref", "dry_run", "scanned", "planned", "applied", "unsafe"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "ok": {"const": true},
+    "store_ref": {
+      "type": "string",
+      "pattern": "^city:[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 260
+    },
+    "dry_run": {"type": "boolean"},
+    "scanned": {"type": "integer", "minimum": 0},
+    "planned": {"type": "integer", "minimum": 0},
+    "applied": {"type": "integer", "minimum": 0},
+    "unsafe": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "reason"],
+        "properties": {
+          "id": {"type": "string"},
+          "reason": {"type": "string"}
+        }
+      }
+    }
+  }
+}
