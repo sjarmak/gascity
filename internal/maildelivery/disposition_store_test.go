@@ -3,6 +3,7 @@ package maildelivery
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -212,8 +213,8 @@ func TestStoreDispositionFailsClosedOnInvalidOrUnavailableAuthority(t *testing.T
 		Reason:     DispositionPolicySatisfiedNotified,
 		RecordedAt: time.Date(2026, 8, 13, 20, 14, 0, 0, time.UTC),
 	}
-	if _, err := store.RecordDisposition(context.Background(), base, fixedFenceResolver{fence: validFence()}); !errors.Is(err, ErrAuthorityUnavailable) {
-		t.Fatalf("unsupported canonical proof = %v, want ErrAuthorityUnavailable", err)
+	if _, err := store.RecordDisposition(context.Background(), base, fixedFenceResolver{fence: validFence()}); err == nil || errors.Is(err, ErrAuthorityUnavailable) {
+		t.Fatalf("missing canonical transport proof = %v", err)
 	}
 	base.Reason = DispositionReason("invented")
 	if _, err := store.RecordDisposition(context.Background(), base, fixedFenceResolver{fence: validFence()}); err == nil {
@@ -228,5 +229,77 @@ func TestStoreDispositionFailsClosedOnInvalidOrUnavailableAuthority(t *testing.T
 	cancel()
 	if _, err := store.RecordDisposition(canceled, base, fixedFenceResolver{fence: validFence()}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled disposition = %v, want context.Canceled", err)
+	}
+}
+
+func TestStoreDispositionDerivesNotifyProofFromAtomicDestinationTransport(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	request := TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 26, 0, 0, time.UTC),
+	}
+	attempt, err := ExecuteTransport(context.Background(), store, request, fixedFenceResolver{fence: fence},
+		time.Date(2026, 8, 13, 23, 27, 0, 0, time.UTC), nil,
+		func(_ context.Context, invoking TransportAttempt) (TransportReceipt, error) {
+			return TransportReceipt{
+				Version: 1, AttemptID: invoking.AttemptID, NudgeID: invoking.NudgeID,
+				State: EffectCommitted, CommitBoundary: TransportCommitBoundaryDestinationAtomic,
+				ReceiptRef:    "destination-atomic:test-city/notify",
+				ReceiptSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				RecordedAt:    time.Date(2026, 8, 13, 23, 28, 0, 0, time.UTC),
+			}, nil
+		})
+	if err != nil {
+		t.Fatalf("ExecuteTransport: %v", err)
+	}
+	notified, err := store.Get(delivery.ID)
+	if err != nil {
+		t.Fatalf("Get notified: %v", err)
+	}
+	disposition, err := store.RecordDisposition(context.Background(), DispositionRequest{
+		DeliveryID: notified.ID, ExpectedDeliveryRevision: notified.Revision,
+		Reason: DispositionPolicySatisfiedNotified, RecordedAt: time.Date(2026, 8, 13, 23, 32, 0, 0, time.UTC),
+	}, fixedFenceResolver{fence: fence})
+	if err != nil {
+		t.Fatalf("RecordDisposition: %v", err)
+	}
+	if disposition.ProofReceiptID != attempt.AttemptID {
+		t.Fatalf("proof = %q, want %q", disposition.ProofReceiptID, attempt.AttemptID)
+	}
+}
+
+func TestStoreDispositionRejectsProviderReturnAsNotifyProof(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	attempt, err := ExecuteTransport(context.Background(), store, TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID},
+		CreatedAt: time.Date(2026, 8, 13, 23, 33, 0, 0, time.UTC),
+	}, fixedFenceResolver{fence: fence}, time.Date(2026, 8, 13, 23, 34, 0, 0, time.UTC), nil,
+		func(_ context.Context, invoking TransportAttempt) (TransportReceipt, error) {
+			return TransportReceipt{
+				Version: 1, AttemptID: invoking.AttemptID, NudgeID: invoking.NudgeID,
+				State: EffectCommitted, CommitBoundary: TransportCommitBoundaryProviderReturn,
+				ReceiptRef: "provider-acceptance:test-city/notify", ReceiptSHA256: strings.Repeat("a", 64),
+				RecordedAt: time.Date(2026, 8, 13, 23, 35, 0, 0, time.UTC),
+			}, nil
+		})
+	if err != nil || attempt.State != TransportCommitted {
+		t.Fatalf("ExecuteTransport = %#v, %v", attempt, err)
+	}
+	notified, err := store.Get(delivery.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	_, err = store.RecordDisposition(context.Background(), DispositionRequest{
+		DeliveryID: notified.ID, ExpectedDeliveryRevision: notified.Revision,
+		Reason: DispositionPolicySatisfiedNotified, RecordedAt: time.Date(2026, 8, 13, 23, 36, 0, 0, time.UTC),
+	}, fixedFenceResolver{fence: fence})
+	if !errors.Is(err, ErrAuthorityUnavailable) {
+		t.Fatalf("provider-return disposition = %v, want ErrAuthorityUnavailable", err)
 	}
 }
