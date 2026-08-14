@@ -40,7 +40,7 @@ const (
 	defaultQueuedNudgeClaimTTL      = 2 * time.Minute
 	defaultQueuedNudgeRetryDelay    = 15 * time.Second
 	defaultQueuedNudgeMaxAttempts   = 5
-	defaultQueuedNudgeDeadRetention = 1 * time.Hour
+	defaultQueuedNudgeDeadRetention = 48 * time.Hour
 
 	// nudgeEnqueueMaintenanceBudget bounds the wall-clock time the foreground
 	// `gc sling --nudge` enqueue path spends on best-effort nudge-queue
