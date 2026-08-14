@@ -654,6 +654,16 @@ func (p *Provider) NudgeStable(ctx context.Context, name, effectID string, conte
 		}
 		return runtime.StableNudgeReceipt{}, fmt.Errorf("%w: %w", runtime.ErrStableNudgeRetrySafe, err)
 	}
+	contentHash, hashErr := runtime.StableNudgeContentSHA256(content)
+	if hashErr != nil {
+		return runtime.StableNudgeReceipt{}, hashErr
+	}
+	if conflict, recognized, conflictErr := decodeStableNudgeConflict(out, effectID, contentHash); recognized {
+		if conflictErr != nil {
+			return runtime.StableNudgeReceipt{}, fmt.Errorf("malformed stable nudge conflict: %w", conflictErr)
+		}
+		return runtime.StableNudgeReceipt{}, fmt.Errorf("%w: effect %s already binds content %s", runtime.ErrStableNudgeConflict, conflict.EffectID, conflict.ExistingContentSHA256)
+	}
 	decoder := json.NewDecoder(strings.NewReader(out))
 	decoder.DisallowUnknownFields()
 	var receipt runtime.StableNudgeReceipt
@@ -663,14 +673,29 @@ func (p *Provider) NudgeStable(ctx context.Context, name, effectID string, conte
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return runtime.StableNudgeReceipt{}, fmt.Errorf("malformed stable nudge response: trailing JSON")
 	}
-	contentHash, hashErr := runtime.StableNudgeContentSHA256(content)
-	if hashErr != nil {
-		return runtime.StableNudgeReceipt{}, hashErr
-	}
 	if validateErr := receipt.Validate(); validateErr != nil || receipt.EffectID != effectID || receipt.TargetRuntimeName != name || receipt.ContentSHA256 != contentHash {
 		return runtime.StableNudgeReceipt{}, fmt.Errorf("%w: destination receipt differs from request", runtime.ErrStableNudgeConflict)
 	}
 	return receipt, nil
+}
+
+func decodeStableNudgeConflict(out, effectID, contentSHA256 string) (runtime.StableNudgeConflict, bool, error) {
+	var probe struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal([]byte(out), &probe); err != nil || probe.State != runtime.StableNudgeConflictState {
+		return runtime.StableNudgeConflict{}, false, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(out))
+	decoder.DisallowUnknownFields()
+	var conflict runtime.StableNudgeConflict
+	if err := decoder.Decode(&conflict); err != nil {
+		return conflict, true, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return conflict, true, fmt.Errorf("trailing JSON")
+	}
+	return conflict, true, conflict.Validate(effectID, contentSHA256)
 }
 
 // LookupStableNudge reads destination evidence without invoking the effect.

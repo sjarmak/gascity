@@ -88,7 +88,7 @@ care about.
 | `attach` | `script attach <name>` | tty passthrough | tty passthrough |
 | `process-alive` | `script process-alive <name>` | process names (1/line) | `true` or `false` |
 | `nudge` | `script nudge <name>` | message text | — |
-| `nudge-stable` | `script nudge-stable <name> <effect-id>` | `StableNudgeRequest` JSON | `StableNudgeReceipt` JSON |
+| `nudge-stable` | `script nudge-stable <name> <effect-id>` | `StableNudgeRequest` JSON | `StableNudgeReceipt` or typed `StableNudgeConflict` JSON |
 | `nudge-stable-status` | `script nudge-stable-status <name> <effect-id>` | `StableNudgeLookupRequest` JSON | `StableNudgeLookup` JSON |
 | `set-meta` | `script set-meta <name> <key>` | value on stdin | — |
 | `get-meta` | `script get-meta <name> <key>` | — | value (empty = not set) |
@@ -164,16 +164,29 @@ content SHA-256, destination reference, UTC acceptance time, the exact
 `destination-atomic-effect-receipt` boundary, and a SHA-256 over the receipt.
 Declaring the capability without implementing those atomic replay semantics is
 a protocol violation; callers otherwise fail closed before invoking it.
-Transport-level response loss permits one identical retry; the canonical mail
-attempt retains its invocation count and terminalizes as unknown after the
-second lost response. Unsupported operations and malformed receipts are never
-classified retry-safe. The conformance checker uses a per-run effect ID and
-requires two calls to return byte-identical receipt JSON.
+Transport-level response loss permits unlimited identical retries. The
+canonical mail attempt returns to `requested`, retains its invocation count,
+and raises the typed operator-escalation signal at count 3 without changing
+state or losing the original retry-safe classification. A destination content
+conflict is returned as schema-1 `StableNudgeConflict` JSON binding the effect
+ID, requested content SHA-256, and different existing content SHA-256; it maps
+to `ErrStableNudgeConflict`, never retry-safe. Unsupported operations and
+malformed receipts/conflicts are also never classified retry-safe. The
+conformance checker uses a per-run effect ID and requires two calls to return
+byte-identical receipt JSON.
 `nudge-stable-status` is read-only and mandatory with the capability. It returns
 either the exact committed receipt or the closed `unknown_external_state`
 outcome with a UTC observation time; it never creates or redelivers an effect.
-Expired MailDelivery invocation leases use one point-in-time lookup before they
-are conservatively terminalized, without another physical notification. This is
+Expired MailDelivery invocation leases use read-only destination lookup without
+another physical notification. A transient lookup failure preserves the exact
+`invoking` attempt and durably increments its consecutive lookup-failure count.
+Count 3 raises the typed operator-escalation signal without reinvoking or
+terminalizing; later failures remain recoverable and a later exact receipt
+still commits. An explicit typed destination `unknown_external_state`
+terminalizes it. Destination-atomic invocation validates the exact session
+authority under the session mutation lock immediately before the effect; once
+that authorized effect returns an exact receipt, later projection drift cannot
+invalidate the receipt. This is
 the read primitive required by `confirm-disarm`; it is not the rollback
 controller, bounded wait, poller-drain integration, or late-effect observation
 window. Ledger absence remains `unknown_external_state` because retention is not

@@ -181,6 +181,51 @@ esac
 	}
 }
 
+func TestStableNudgeWireMapsTypedDestinationConflictWithoutRetry(t *testing.T) {
+	dir := t.TempDir()
+	effectID := "mail-nudge-9999999999999999999999999999999999999999999999999999999999999999"
+	content := runtime.TextContent("current content")
+	contentHash, err := runtime.StableNudgeContentSHA256(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflictWire, err := json.Marshal(runtime.StableNudgeConflict{
+		Version: 1, State: runtime.StableNudgeConflictState,
+		EffectID: effectID, RequestedContentSHA256: contentHash,
+		ExistingContentSHA256: strings.Repeat("a", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := writeScript(t, dir, fmt.Sprintf(`
+case "$1" in
+ protocol) printf '%%s' '{"version":0,"capabilities":["effect.nudge-idempotent"]}' ;;
+ nudge-stable) cat >/dev/null; printf '%%s' '%s' ;;
+ *) exit 2 ;;
+esac
+`, string(conflictWire)))
+	p := NewProvider(script)
+	if _, err := p.NudgeStable(context.Background(), "session-a", effectID, content); !errors.Is(err, runtime.ErrStableNudgeConflict) || errors.Is(err, runtime.ErrStableNudgeRetrySafe) {
+		t.Fatalf("NudgeStable error = %v, want conflict only", err)
+	}
+}
+
+func TestStableNudgeWireRejectsMalformedTypedConflictFailClosed(t *testing.T) {
+	dir := t.TempDir()
+	effectID := "mail-nudge-8888888888888888888888888888888888888888888888888888888888888888"
+	script := writeScript(t, dir, `
+case "$1" in
+ protocol) printf '%s' '{"version":0,"capabilities":["effect.nudge-idempotent"]}' ;;
+ nudge-stable) cat >/dev/null; printf '%s' '{"version":1,"state":"conflict","effect_id":"wrong","requested_content_sha256":"bad","existing_content_sha256":"bad"}' ;;
+ *) exit 2 ;;
+esac
+`)
+	p := NewProvider(script)
+	if _, err := p.NudgeStable(context.Background(), "session-a", effectID, runtime.TextContent("notice")); err == nil || errors.Is(err, runtime.ErrStableNudgeRetrySafe) || errors.Is(err, runtime.ErrStableNudgeConflict) {
+		t.Fatalf("NudgeStable error = %v, want fail-closed malformed output", err)
+	}
+}
+
 func TestStableNudgeWireRejectsMalformedEffectIDBeforeOperation(t *testing.T) {
 	dir := t.TempDir()
 	called := filepath.Join(dir, "called")

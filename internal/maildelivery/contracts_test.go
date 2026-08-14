@@ -87,6 +87,22 @@ func TestAttemptIDRejectsInvalidDeliveryAndAuthority(t *testing.T) {
 	}
 }
 
+func TestValidateDeliveryIDUsesCanonicalDomainIdentity(t *testing.T) {
+	valid := "mail-delivery-" + strings.Repeat("a", 64)
+	if err := ValidateDeliveryID(valid); err != nil {
+		t.Fatalf("ValidateDeliveryID(valid): %v", err)
+	}
+	for _, invalid := range []string{
+		"", "mail-delivery-" + strings.Repeat("a", 63),
+		"mail-delivery-" + strings.Repeat("A", 64),
+		"mail-delivery-" + strings.Repeat("z", 64),
+	} {
+		if err := ValidateDeliveryID(invalid); err == nil {
+			t.Fatalf("ValidateDeliveryID(%q) succeeded", invalid)
+		}
+	}
+}
+
 func TestActivationFenceValidationFailsClosed(t *testing.T) {
 	tests := map[string]func(*ActivationFence){
 		"zero version":        func(f *ActivationFence) { f.Version = 0 },

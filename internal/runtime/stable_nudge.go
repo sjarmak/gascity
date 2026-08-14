@@ -56,6 +56,32 @@ type StableNudgeRequest struct {
 	Content  []ContentBlock `json:"content"`
 }
 
+// StableNudgeConflictState is the closed exec-wire outcome for an effect ID
+// that the destination already bound to different content.
+const StableNudgeConflictState = "conflict"
+
+// StableNudgeConflict is a typed, content-free destination refusal. It binds
+// the requested identity and both content digests so adapters never confuse a
+// real idempotency conflict with response loss or an arbitrary subprocess exit.
+type StableNudgeConflict struct {
+	Version                int    `json:"version"`
+	State                  string `json:"state"`
+	EffectID               string `json:"effect_id"`
+	RequestedContentSHA256 string `json:"requested_content_sha256"`
+	ExistingContentSHA256  string `json:"existing_content_sha256"`
+}
+
+// Validate checks that the typed conflict belongs to this exact request and
+// proves a real content mismatch.
+func (c StableNudgeConflict) Validate(effectID, contentSHA256 string) error {
+	if c.Version != 1 || c.State != StableNudgeConflictState || c.EffectID != effectID ||
+		c.RequestedContentSHA256 != contentSHA256 || !validLowerHexSHA256(c.ExistingContentSHA256) ||
+		c.ExistingContentSHA256 == contentSHA256 {
+		return fmt.Errorf("stable nudge conflict differs from request")
+	}
+	return nil
+}
+
 // StableNudgeLookupState is the closed read-only destination outcome.
 type StableNudgeLookupState string
 

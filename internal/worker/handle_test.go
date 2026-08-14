@@ -721,22 +721,42 @@ func TestSessionHandleNudgeReturnsEffectBoundProviderAcceptance(t *testing.T) {
 }
 
 func TestSessionHandleNudgeReturnsDestinationAtomicReceipt(t *testing.T) {
-	handle, _, sp, mgr := newTestSessionHandle(t, SessionSpec{
+	handle, store, sp, mgr := newTestSessionHandle(t, SessionSpec{
 		Profile: ProfileClaudeTmuxCLI, Template: "probe", Title: "Probe",
 		Command: "claude", WorkDir: t.TempDir(), Provider: "exec", Transport: "exec",
 	})
 	if err := handle.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	if err := store.SetMetadataBatch(handle.sessionID, map[string]string{
+		"configured_named_identity": "probe", "configured_named_session": "true",
+		"continuation_epoch": "1", "generation": "1", "instance_token": "destination-authority-token",
+	}); err != nil {
+		t.Fatalf("seed authority: %v", err)
+	}
 	info, err := mgr.Get(handle.sessionID)
 	if err != nil {
 		t.Fatalf("manager.Get: %v", err)
+	}
+	options := sessionpkg.MailActivationFenceOptions{
+		CityRef: "city:test-city", SeatRef: "seat:test-city/probe", ConfigSHA256: strings.Repeat("a", 64),
+		IssuedByRef: "controller:test-city/mail-delivery", IssuedAt: time.Date(2026, 8, 14, 1, 0, 0, 0, time.UTC),
+	}
+	fence, err := sessionpkg.IssueMailActivationFence(info, options)
+	if err != nil {
+		t.Fatalf("IssueMailActivationFence: %v", err)
+	}
+	expected := &NudgeSessionAuthority{
+		SessionRef: info.ID, ConfiguredSeatIdentity: info.ConfiguredNamedIdentity,
+		CityRef: options.CityRef, SeatRef: options.SeatRef, ConfigSHA256: options.ConfigSHA256, IssuedByRef: options.IssuedByRef,
+		AuthorityGeneration: fence.AuthorityGeneration, ContinuationEpoch: fence.ContinuationEpoch,
+		InstanceTokenSHA256: fence.InstanceTokenSHA256, AuthorityIntentSHA256: fence.AuthorityIntentSHA256,
 	}
 	effectID := "mail-nudge-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 	result, err := handle.Nudge(context.Background(), NudgeRequest{
 		Text: "1 actionable mail delivery; run gc mail inbox", Delivery: NudgeDeliveryImmediate,
 		Source: "mail-delivery", Wake: NudgeWakeLiveOnly, EffectID: effectID,
-		CommitBoundary: NudgeCommitBoundaryDestinationAtomic,
+		CommitBoundary: NudgeCommitBoundaryDestinationAtomic, ExpectedAuthority: expected,
 	})
 	if err != nil {
 		t.Fatalf("Nudge: %v", err)
@@ -761,6 +781,85 @@ func TestSessionHandleNudgeReturnsDestinationAtomicReceipt(t *testing.T) {
 	}
 	if got := sp.StableNudgeEffectCount(effectID); got != 1 {
 		t.Fatalf("lookup changed physical effect count to %d", got)
+	}
+}
+
+func TestSessionHandleDestinationAtomicNudgeRejectsReplacedAuthorityBeforeProvider(t *testing.T) {
+	handle, store, sp, mgr := newTestSessionHandle(t, SessionSpec{
+		Profile: ProfileClaudeTmuxCLI, Template: "reviewer", Title: "Reviewer",
+		Command: "claude", WorkDir: t.TempDir(), Provider: "exec", Transport: "exec",
+	})
+	if err := handle.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := store.SetMetadataBatch(handle.sessionID, map[string]string{
+		"configured_named_identity": "reviewer",
+		"configured_named_session":  "true",
+		"continuation_epoch":        "7",
+		"generation":                "4",
+		"instance_token":            "authority-token-before-replacement",
+	}); err != nil {
+		t.Fatalf("seed authority: %v", err)
+	}
+	info, err := mgr.Get(handle.sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := sessionpkg.MailActivationFenceOptions{
+		CityRef: "city:test-city", SeatRef: "seat:test-city/reviewer",
+		ConfigSHA256: strings.Repeat("a", 64), IssuedByRef: "controller:test-city/mail-delivery",
+		IssuedAt: time.Date(2026, 8, 14, 1, 0, 0, 0, time.UTC),
+	}
+	fence, err := sessionpkg.IssueMailActivationFence(info, options)
+	if err != nil {
+		t.Fatalf("IssueMailActivationFence: %v", err)
+	}
+	expected := &NudgeSessionAuthority{
+		SessionRef: info.ID, ConfiguredSeatIdentity: info.ConfiguredNamedIdentity,
+		CityRef: options.CityRef, SeatRef: options.SeatRef, ConfigSHA256: options.ConfigSHA256, IssuedByRef: options.IssuedByRef,
+		AuthorityGeneration: fence.AuthorityGeneration, ContinuationEpoch: fence.ContinuationEpoch,
+		InstanceTokenSHA256: fence.InstanceTokenSHA256, AuthorityIntentSHA256: fence.AuthorityIntentSHA256,
+	}
+	// This is the former preflight race: the caller already issued its fence,
+	// then the canonical session authority changed before Nudge acquired the
+	// session mutation lock.
+	if err := store.SetMetadata(handle.sessionID, "instance_token", "replacement-authority-token"); err != nil {
+		t.Fatalf("replace authority: %v", err)
+	}
+	effectID := "mail-nudge-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	startCalls := len(sp.Calls)
+	result, err := handle.Nudge(context.Background(), NudgeRequest{
+		Text: "1 actionable mail delivery; run gc mail inbox", Delivery: NudgeDeliveryImmediate,
+		Source: "mail-delivery", Wake: NudgeWakeLiveOnly, EffectID: effectID,
+		CommitBoundary: NudgeCommitBoundaryDestinationAtomic, ExpectedAuthority: expected,
+	})
+	if !errors.Is(err, ErrNudgeAuthorityChanged) || result.Delivered {
+		t.Fatalf("Nudge = %#v, %v; want authority-changed before effect", result, err)
+	}
+	if got := sp.StableNudgeEffectCount(effectID); got != 0 {
+		t.Fatalf("physical effect count = %d, want 0", got)
+	}
+	if call := firstCall(sp.Calls[startCalls:], "NudgeStable"); call != nil {
+		t.Fatalf("provider called after stale fence: %#v", call)
+	}
+}
+
+func TestSessionHandleDestinationAtomicNudgeRequiresExpectedAuthority(t *testing.T) {
+	handle, _, sp, _ := newTestSessionHandle(t, SessionSpec{
+		Profile: ProfileClaudeTmuxCLI, Template: "probe", Title: "Probe",
+		Command: "claude", WorkDir: t.TempDir(), Provider: "exec", Transport: "exec",
+	})
+	effectID := "mail-nudge-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	result, err := handle.Nudge(context.Background(), NudgeRequest{
+		Text: "1 actionable mail delivery; run gc mail inbox", Delivery: NudgeDeliveryImmediate,
+		Source: "mail-delivery", Wake: NudgeWakeLiveOnly, EffectID: effectID,
+		CommitBoundary: NudgeCommitBoundaryDestinationAtomic,
+	})
+	if !errors.Is(err, ErrNudgeAuthorityRequired) || result.Delivered {
+		t.Fatalf("Nudge = %#v, %v; want authority-required before effect", result, err)
+	}
+	if got := sp.StableNudgeEffectCount(effectID); got != 0 {
+		t.Fatalf("physical effect count = %d, want 0", got)
 	}
 }
 

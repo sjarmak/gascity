@@ -846,10 +846,23 @@ func (m *Manager) SupportsStableNudgeForSession(id string) bool {
 // SendStableLiveOnly invokes a destination-idempotent nudge for an already
 // running exact session. The provider owns atomic effect+receipt persistence.
 func (m *Manager) SendStableLiveOnly(ctx context.Context, id, effectID, message string) (receipt runtime.StableNudgeReceipt, delivered bool, err error) {
+	return m.SendStableLiveOnlyValidated(ctx, id, effectID, message, nil)
+}
+
+// SendStableLiveOnlyValidated invokes a destination-idempotent nudge only
+// after validate accepts the freshly loaded canonical session projection.
+// Loading, validation, runtime liveness, and the provider call share the same
+// session mutation lock, closing the preflight-to-effect replacement race.
+func (m *Manager) SendStableLiveOnlyValidated(ctx context.Context, id, effectID, message string, validate func(Info) error) (receipt runtime.StableNudgeReceipt, delivered bool, err error) {
 	err = withSessionMutationLock(id, func() error {
-		_, sessName, loadErr := m.sessionBead(id)
+		bead, sessName, loadErr := m.sessionBead(id)
 		if loadErr != nil {
 			return loadErr
+		}
+		if validate != nil {
+			if validateErr := validate(m.infoFromBead(bead)); validateErr != nil {
+				return validateErr
+			}
 		}
 		stable, ok := m.sp.(runtime.StableNudgeProvider)
 		if !ok || !runtime.SupportsStableNudgeTarget(m.sp, sessName) {

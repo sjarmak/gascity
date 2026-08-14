@@ -249,6 +249,67 @@ func TestExecuteTransportExpiredInvocationRecordsLookupUnknown(t *testing.T) {
 	}
 }
 
+func TestExecuteTransportExpiredInvocationLookupFailuresEscalateAndRecoverWithoutReinvocation(t *testing.T) {
+	store, _ := newDeliveryStore()
+	delivery := createWaitingDelivery(t, store)
+	fence := validFence()
+	startedAt := time.Date(2026, 8, 13, 23, 22, 0, 0, time.UTC)
+	request := TransportAttemptRequest{
+		DeliveryID: delivery.ID, ExpectedDeliveryRevision: delivery.Revision,
+		ExpectedFenceID: fence.FenceID, CoveredDeliveryIDs: []string{delivery.ID}, CreatedAt: startedAt,
+	}
+	attempt, err := store.CreateTransportAttempt(context.Background(), request, fixedFenceResolver{fence: fence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invoking, err := store.BeginTransportInvocation(attempt.AttemptID, attempt.Revision, startedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invokeCalls := 0
+	lookupCalls := 0
+	transientErr := errors.New("destination ledger temporarily unavailable")
+	lookup := func(_ context.Context, current TransportAttempt) (TransportReceipt, error) {
+		lookupCalls++
+		if lookupCalls <= 4 {
+			return TransportReceipt{}, transientErr
+		}
+		return TransportReceipt{
+			Version: 1, AttemptID: current.AttemptID, NudgeID: current.NudgeID,
+			State: EffectCommitted, CommitBoundary: TransportCommitBoundaryDestinationAtomic,
+			ReceiptRef: "destination:recovered-after-transient", ReceiptSHA256: strings.Repeat("b", 64),
+			RecordedAt: startedAt.Add(time.Second),
+		}, nil
+	}
+	var current TransportAttempt
+	for wantCount := uint64(1); wantCount <= 4; wantCount++ {
+		current, err = ExecuteTransportWithReceiptLookup(context.Background(), store, request, fixedFenceResolver{fence: fence},
+			invoking.InvocationLeaseUntil.Add(time.Duration(wantCount)*time.Second), nil, lookup, func(context.Context, TransportAttempt) (TransportReceipt, error) {
+				invokeCalls++
+				return TransportReceipt{}, nil
+			})
+		if !errors.Is(err, ErrTransportReceiptLookupRetryLater) || !errors.Is(err, transientErr) || current.ReceiptLookupFailureCount != wantCount ||
+			current.State != TransportInvoking || current.Receipt != (TransportReceipt{}) || invokeCalls != 0 {
+			t.Fatalf("lookup failure %d = %#v, %v, invokes=%d", wantCount, current, err, invokeCalls)
+		}
+		if gotEscalated := errors.Is(err, ErrTransportRetryEscalated); gotEscalated != (wantCount >= TransportReceiptLookupEscalationThreshold) {
+			t.Fatalf("lookup failure %d escalated=%v, err=%v", wantCount, gotEscalated, err)
+		}
+		persisted, loadErr := store.TransportAttempt(invoking.AttemptID)
+		if loadErr != nil || !reflect.DeepEqual(persisted, current) {
+			t.Fatalf("persisted lookup failure %d = %#v, %v; want %#v", wantCount, persisted, loadErr, current)
+		}
+	}
+	recovered, err := ExecuteTransportWithReceiptLookup(context.Background(), store, request, fixedFenceResolver{fence: fence},
+		invoking.InvocationLeaseUntil.Add(5*time.Second), nil, lookup, func(context.Context, TransportAttempt) (TransportReceipt, error) {
+			invokeCalls++
+			return TransportReceipt{}, nil
+		})
+	if err != nil || recovered.State != TransportCommitted || recovered.Receipt.ReceiptRef != "destination:recovered-after-transient" || invokeCalls != 0 {
+		t.Fatalf("later recovery = %#v, %v, invokes=%d", recovered, err, invokeCalls)
+	}
+}
+
 func TestExecuteTransportConcurrentCallerLeavesLiveInvocationIntact(t *testing.T) {
 	store, _ := newDeliveryStore()
 	delivery := createWaitingDelivery(t, store)

@@ -31,6 +31,28 @@ type StableDurableSendIntent struct {
 	ObservedAt        time.Time
 }
 
+// DurableSendOutcome identifies which canonical write, if any, this call owns.
+// DurableSendOutcome is advisory under a concurrent replay. The canonical
+// store's message-created result and the corresponding MailSent event owner
+// are authoritative.
+type DurableSendOutcome string
+
+const (
+	// DurableSendCreated means this invocation created the canonical message and delivery.
+	DurableSendCreated DurableSendOutcome = "created"
+	// DurableSendMessageOnlyRepaired means this invocation repaired a missing delivery for an existing message.
+	DurableSendMessageOnlyRepaired DurableSendOutcome = "message_only_repaired"
+	// DurableSendExactReplay means the exact message and delivery already existed.
+	DurableSendExactReplay DurableSendOutcome = "exact_replay"
+)
+
+// DurableSendResult is the truthful canonical result of a stable durable send.
+type DurableSendResult struct {
+	Message  mail.Message          `json:"message"`
+	Delivery maildelivery.Delivery `json:"delivery"`
+	Outcome  DurableSendOutcome    `json:"outcome"`
+}
+
 // DurableSendIntent is the content-free, preallocated identity and policy for
 // a recoverable message-first send.
 type DurableSendIntent struct {
@@ -60,17 +82,17 @@ type durableDeliveryRepair struct {
 
 // SendDurableStable derives the explicit message identity inside the beadmail
 // boundary and delegates to the message-first durable write protocol.
-func (p *Provider) SendDurableStable(from, to, subject, body string, intent StableDurableSendIntent) (mail.Message, maildelivery.Delivery, error) {
+func (p *Provider) SendDurableStable(from, to, subject, body string, intent StableDurableSendIntent) (DurableSendResult, error) {
 	messageID, err := durableStableMessageID(intent)
 	if err != nil {
-		return mail.Message{}, maildelivery.Delivery{}, fmt.Errorf("beadmail stable durable send: %w", err)
+		return DurableSendResult{}, fmt.Errorf("beadmail stable durable send: %w", err)
 	}
 	city := strings.TrimPrefix(intent.CityRef, "city:")
 	seatOwner := strings.TrimPrefix(intent.SeatRef, "seat:"+city+"/")
 	if to != seatOwner {
-		return mail.Message{}, maildelivery.Delivery{}, fmt.Errorf("beadmail stable durable send: %w: recipient %q does not match stable seat %q", maildelivery.ErrConflict, to, intent.SeatRef)
+		return DurableSendResult{}, fmt.Errorf("beadmail stable durable send: %w: recipient %q does not match stable seat %q", maildelivery.ErrConflict, to, intent.SeatRef)
 	}
-	return p.SendDurable(from, to, subject, body, DurableSendIntent{
+	return p.sendDurableResult(from, to, subject, body, DurableSendIntent{
 		MessageID: messageID, StoreRef: intent.MessagingStoreRef, SeatRef: intent.SeatRef,
 		Policy: intent.Policy, Attention: intent.Attention, ObservedAt: intent.ObservedAt,
 	})
@@ -114,11 +136,16 @@ func validStableDurableSendKey(key string) bool {
 // then creates its canonical delivery. A second-write failure returns the
 // durable message so callers can report the honest message-only state.
 func (p *Provider) SendDurable(from, to, subject, body string, intent DurableSendIntent) (mail.Message, maildelivery.Delivery, error) {
+	result, err := p.sendDurableResult(from, to, subject, body, intent)
+	return result.Message, result.Delivery, err
+}
+
+func (p *Provider) sendDurableResult(from, to, subject, body string, intent DurableSendIntent) (DurableSendResult, error) {
 	if p == nil || p.store == nil {
-		return mail.Message{}, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: store unavailable")
+		return DurableSendResult{}, fmt.Errorf("beadmail durable send: store unavailable")
 	}
 	if to == "" {
-		return mail.Message{}, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: recipient is required")
+		return DurableSendResult{}, fmt.Errorf("beadmail durable send: recipient is required")
 	}
 	repair := durableDeliveryRepair{
 		Version: 1, MessageID: intent.MessageID, StoreRef: intent.StoreRef,
@@ -127,11 +154,11 @@ func (p *Provider) SendDurable(from, to, subject, body string, intent DurableSen
 	}
 	repairJSON, err := json.Marshal(repair)
 	if err != nil {
-		return mail.Message{}, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: encoding repair intent: %w", err)
+		return DurableSendResult{}, fmt.Errorf("beadmail durable send: encoding repair intent: %w", err)
 	}
 	from, metadata, err := p.resolveSenderRoute(from)
 	if err != nil {
-		return mail.Message{}, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: %w", err)
+		return DurableSendResult{}, fmt.Errorf("beadmail durable send: %w", err)
 	}
 	if metadata == nil {
 		metadata = make(map[string]string)
@@ -157,21 +184,27 @@ func (p *Provider) SendDurable(from, to, subject, body string, intent DurableSen
 	existing, getErr := p.store.Get(intent.MessageID)
 	if getErr == nil {
 		if !sameDurableMessage(existing, wanted) {
-			return mail.Message{}, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: %w: message %q already exists with different bytes", maildelivery.ErrConflict, intent.MessageID)
+			return DurableSendResult{}, fmt.Errorf("beadmail durable send: %w: message %q already exists with different bytes", maildelivery.ErrConflict, intent.MessageID)
 		}
 		message := beadToMessage(existing)
 		delivery, deliveryErr := deliveryFromMessageRow(existing, repair)
 		if deliveryErr != nil {
-			return message, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: %w", deliveryErr)
+			return DurableSendResult{Message: message}, fmt.Errorf("beadmail durable send: %w", deliveryErr)
+		}
+		outcome := DurableSendExactReplay
+		if _, deliveryErr := maildelivery.NewStore(p.store).Get(delivery.ID); errors.Is(deliveryErr, beads.ErrNotFound) {
+			outcome = DurableSendMessageOnlyRepaired
+		} else if deliveryErr != nil {
+			return DurableSendResult{Message: message}, fmt.Errorf("beadmail durable send: checking delivery replay: %w", deliveryErr)
 		}
 		created, createErr := ensureDurableDelivery(maildelivery.NewStore(p.store), delivery)
 		if createErr != nil {
-			return message, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: creating delivery: %w", createErr)
+			return DurableSendResult{Message: message, Outcome: outcome}, fmt.Errorf("beadmail durable send: creating delivery: %w", createErr)
 		}
-		return message, created, nil
+		return DurableSendResult{Message: message, Delivery: created, Outcome: outcome}, nil
 	}
 	if !errors.Is(getErr, beads.ErrNotFound) {
-		return mail.Message{}, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: checking message replay: %w", getErr)
+		return DurableSendResult{}, fmt.Errorf("beadmail durable send: checking message replay: %w", getErr)
 	}
 
 	// Validate every caller-controlled scalar, including expiry against the
@@ -181,32 +214,42 @@ func (p *Provider) SendDurable(from, to, subject, body string, intent DurableSen
 		validationTime = time.Now().UTC()
 	}
 	if _, err := maildelivery.NewDelivery(intent.StoreRef, intent.MessageID, 1, intent.SeatRef, intent.Policy, intent.Attention, validationTime, intent.ExpiresAt, intent.PolicySourceSHA256); err != nil {
-		return mail.Message{}, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: %w", err)
+		return DurableSendResult{}, fmt.Errorf("beadmail durable send: %w", err)
 	}
 	row, err := p.store.Create(wanted)
+	messageCreated := err == nil
 	if err != nil {
 		existing, getErr := p.store.Get(intent.MessageID)
 		if getErr != nil {
-			return mail.Message{}, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: creating message: %w", err)
+			return DurableSendResult{}, fmt.Errorf("beadmail durable send: creating message: %w", err)
 		}
 		if !sameDurableMessage(existing, wanted) {
-			return mail.Message{}, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: %w: message %q already exists with different bytes", maildelivery.ErrConflict, intent.MessageID)
+			return DurableSendResult{}, fmt.Errorf("beadmail durable send: %w: message %q already exists with different bytes", maildelivery.ErrConflict, intent.MessageID)
 		}
 		row = existing
 	}
 	message := beadToMessage(row)
 	if row.ID != intent.MessageID {
-		return message, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: store changed deterministic message ID %q to %q", intent.MessageID, row.ID)
+		return DurableSendResult{Message: message}, fmt.Errorf("beadmail durable send: store changed deterministic message ID %q to %q", intent.MessageID, row.ID)
 	}
 	delivery, err := deliveryFromMessageRow(row, repair)
 	if err != nil {
-		return message, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: %w", err)
+		return DurableSendResult{Message: message}, fmt.Errorf("beadmail durable send: %w", err)
+	}
+	outcome := DurableSendCreated
+	if !messageCreated {
+		outcome = DurableSendExactReplay
+		if _, deliveryErr := maildelivery.NewStore(p.store).Get(delivery.ID); errors.Is(deliveryErr, beads.ErrNotFound) {
+			outcome = DurableSendMessageOnlyRepaired
+		} else if deliveryErr != nil {
+			return DurableSendResult{Message: message}, fmt.Errorf("beadmail durable send: checking delivery replay: %w", deliveryErr)
+		}
 	}
 	created, err := ensureDurableDelivery(maildelivery.NewStore(p.store), delivery)
 	if err != nil {
-		return message, maildelivery.Delivery{}, fmt.Errorf("beadmail durable send: creating delivery: %w", err)
+		return DurableSendResult{Message: message, Outcome: outcome}, fmt.Errorf("beadmail durable send: creating delivery: %w", err)
 	}
-	return message, created, nil
+	return DurableSendResult{Message: message, Delivery: created, Outcome: outcome}, nil
 }
 
 func durableThreadID(messageID string) string {

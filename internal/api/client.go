@@ -30,6 +30,8 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
+	"github.com/gastownhall/gascity/internal/maildelivery"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
 )
@@ -173,6 +175,74 @@ func IsMaintenanceDisabled(err error) bool {
 type serverError struct {
 	status int
 	msg    string
+}
+
+// MailDeliveryOperationError is a result-bearing domain failure returned over
+// a successful HTTP response. The corresponding method still returns the
+// exact durable result/report/attempt; callers must not fall back or reinvoke.
+type MailDeliveryOperationError struct {
+	Code string
+}
+
+func (e *MailDeliveryOperationError) Error() string {
+	if e == nil || e.Code == "" {
+		return "mail delivery operation failed"
+	}
+	return "mail delivery operation failed: " + e.Code
+}
+
+func mailDeliveryResultError(ok bool, code *string) error {
+	if ok {
+		return nil
+	}
+	value := "operation_failed"
+	if code != nil && *code != "" {
+		value = *code
+	}
+	return &MailDeliveryOperationError{Code: value}
+}
+
+func convertGeneratedMailDelivery[T any](value any) (T, error) {
+	var result T
+	data, err := json.Marshal(value)
+	if err != nil {
+		return result, fmt.Errorf("encoding generated mail delivery response: %w", err)
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	// These mutation envelopes require a same-revision CLI and supervisor.
+	// Unknown fields fail closed so a caller never retries an effect after
+	// silently misreading a newer result-bearing contract.
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil {
+		return result, fmt.Errorf("decoding generated mail delivery response: %w", err)
+	}
+	return result, nil
+}
+
+func validateDurableMailResult(result beadmail.DurableSendResult) error {
+	if result.Message.ID == "" || result.Delivery.ID == "" {
+		return fmt.Errorf("durable mail response has no exact message and delivery identity")
+	}
+	switch result.Outcome {
+	case beadmail.DurableSendCreated, beadmail.DurableSendMessageOnlyRepaired, beadmail.DurableSendExactReplay:
+		return nil
+	default:
+		return fmt.Errorf("durable mail response has invalid outcome %q", result.Outcome)
+	}
+}
+
+func validateMailDeliveryReport(report maildelivery.ReconcileReport, seatRef string) error {
+	if report.SchemaVersion != "mail-delivery-reconcile/v1" || report.SeatRef != seatRef {
+		return fmt.Errorf("mail delivery reconcile response identity does not match seat %q", seatRef)
+	}
+	return nil
+}
+
+func validateMailDeliveryAttempt(attempt maildelivery.TransportAttempt, attemptID string) error {
+	if attempt.AttemptID == "" || attempt.AttemptID != attemptID {
+		return fmt.Errorf("mail delivery response identity does not match attempt %q", attemptID)
+	}
+	return nil
 }
 
 func (e *serverError) Error() string {
@@ -1318,6 +1388,147 @@ func (c *Client) CountMail(agent, rig string) (CachedRead[MailCountView], error)
 		Body:       mailCountFromGen(resp.JSON200),
 		AgeSeconds: cacheAgeFromResponse(resp.HTTPResponse),
 	}, nil
+}
+
+// SendDurableMail routes one stable notify-only send through the supervisor.
+// A result-bearing application failure returns both the durable result and a
+// MailDeliveryOperationError; it is never a fallback signal.
+func (c *Client) SendDurableMail(command DurableMailCommand) (beadmail.DurableSendResult, error) {
+	if err := c.requireCityScope(); err != nil {
+		return beadmail.DurableSendResult{}, err
+	}
+	request := genclient.PostV0CityByCityNameMailDurableJSONRequestBody{
+		StableKey: command.StableKey, Recipient: command.Recipient, Message: command.Body,
+		SenderCandidates: &command.SenderCandidates,
+	}
+	if command.Subject != "" {
+		request.Subject = &command.Subject
+	}
+	httpResp, err := c.cw.PostV0CityByCityNameMailDurable(context.Background(), c.cityName, nil, request)
+	if err != nil {
+		return beadmail.DurableSendResult{}, &connError{err: fmt.Errorf("request failed: %w", err)}
+	}
+	if httpResp == nil {
+		return beadmail.DurableSendResult{}, &connError{err: fmt.Errorf("nil response")}
+	}
+	resp, err := genclient.ParsePostV0CityByCityNameMailDurableResponse(httpResp)
+	if err != nil {
+		return beadmail.DurableSendResult{}, fmt.Errorf("decoding durable mail response: %w", err)
+	}
+	if err := apiErrorFromResponse(resp.StatusCode(), pdOf(resp)); err != nil {
+		return beadmail.DurableSendResult{}, err
+	}
+	if resp.JSON200 == nil {
+		return beadmail.DurableSendResult{}, fmt.Errorf("API returned %d with no durable mail body", resp.StatusCode())
+	}
+	result, err := convertGeneratedMailDelivery[beadmail.DurableSendResult](resp.JSON200.Result)
+	if err != nil {
+		return beadmail.DurableSendResult{}, err
+	}
+	if err := validateDurableMailResult(result); err != nil {
+		return beadmail.DurableSendResult{}, err
+	}
+	return result, mailDeliveryResultError(resp.JSON200.Ok, resp.JSON200.FailureCode)
+}
+
+// ReconcileMailDeliverySeat routes one bounded seat sweep through the supervisor.
+func (c *Client) ReconcileMailDeliverySeat(seatRef string, limit int, expectedDeliveryID string) (maildelivery.ReconcileReport, error) {
+	if err := c.requireCityScope(); err != nil {
+		return maildelivery.ReconcileReport{}, err
+	}
+	request := genclient.PostV0CityByCityNameMailDeliveryReconcileSeatJSONRequestBody{SeatRef: seatRef, Limit: int64(limit)}
+	if expectedDeliveryID != "" {
+		request.ExpectedDeliveryId = &expectedDeliveryID
+	}
+	httpResp, err := c.cw.PostV0CityByCityNameMailDeliveryReconcileSeat(context.Background(), c.cityName, nil, request)
+	if err != nil {
+		return maildelivery.ReconcileReport{}, &connError{err: fmt.Errorf("request failed: %w", err)}
+	}
+	if httpResp == nil {
+		return maildelivery.ReconcileReport{}, &connError{err: fmt.Errorf("nil response")}
+	}
+	resp, err := genclient.ParsePostV0CityByCityNameMailDeliveryReconcileSeatResponse(httpResp)
+	if err != nil {
+		return maildelivery.ReconcileReport{}, fmt.Errorf("decoding mail delivery reconcile response: %w", err)
+	}
+	if err := apiErrorFromResponse(resp.StatusCode(), pdOf(resp)); err != nil {
+		return maildelivery.ReconcileReport{}, err
+	}
+	if resp.JSON200 == nil {
+		return maildelivery.ReconcileReport{}, fmt.Errorf("API returned %d with no mail delivery reconcile body", resp.StatusCode())
+	}
+	report, err := convertGeneratedMailDelivery[maildelivery.ReconcileReport](resp.JSON200.Report)
+	if err != nil {
+		return maildelivery.ReconcileReport{}, err
+	}
+	if err := validateMailDeliveryReport(report, seatRef); err != nil {
+		return maildelivery.ReconcileReport{}, err
+	}
+	return report, mailDeliveryResultError(resp.JSON200.Ok, resp.JSON200.FailureCode)
+}
+
+// InvokeMailDelivery routes one prepared transport attempt through the supervisor.
+func (c *Client) InvokeMailDelivery(attemptID string) (maildelivery.TransportAttempt, error) {
+	if err := c.requireCityScope(); err != nil {
+		return maildelivery.TransportAttempt{}, err
+	}
+	httpResp, err := c.cw.PostV0CityByCityNameMailDeliveryByAttemptIdInvoke(context.Background(), c.cityName, attemptID, nil)
+	if err != nil {
+		return maildelivery.TransportAttempt{}, &connError{err: fmt.Errorf("request failed: %w", err)}
+	}
+	if httpResp == nil {
+		return maildelivery.TransportAttempt{}, &connError{err: fmt.Errorf("nil response")}
+	}
+	resp, err := genclient.ParsePostV0CityByCityNameMailDeliveryByAttemptIdInvokeResponse(httpResp)
+	if err != nil {
+		return maildelivery.TransportAttempt{}, fmt.Errorf("decoding mail delivery invoke response: %w", err)
+	}
+	if err := apiErrorFromResponse(resp.StatusCode(), pdOf(resp)); err != nil {
+		return maildelivery.TransportAttempt{}, err
+	}
+	if resp.JSON200 == nil {
+		return maildelivery.TransportAttempt{}, fmt.Errorf("API returned %d with no mail delivery attempt body", resp.StatusCode())
+	}
+	attempt, err := convertGeneratedMailDelivery[maildelivery.TransportAttempt](resp.JSON200.Attempt)
+	if err != nil {
+		return maildelivery.TransportAttempt{}, err
+	}
+	if err := validateMailDeliveryAttempt(attempt, attemptID); err != nil {
+		return maildelivery.TransportAttempt{}, err
+	}
+	return attempt, mailDeliveryResultError(resp.JSON200.Ok, resp.JSON200.FailureCode)
+}
+
+// MailDeliveryStatus reads one canonical transport attempt through the supervisor.
+func (c *Client) MailDeliveryStatus(attemptID string) (maildelivery.TransportAttempt, error) {
+	if err := c.requireCityScope(); err != nil {
+		return maildelivery.TransportAttempt{}, err
+	}
+	httpResp, err := c.cw.GetV0CityByCityNameMailDeliveryByAttemptId(context.Background(), c.cityName, attemptID)
+	if err != nil {
+		return maildelivery.TransportAttempt{}, &connError{err: fmt.Errorf("request failed: %w", err)}
+	}
+	if httpResp == nil {
+		return maildelivery.TransportAttempt{}, &connError{err: fmt.Errorf("nil response")}
+	}
+	resp, err := genclient.ParseGetV0CityByCityNameMailDeliveryByAttemptIdResponse(httpResp)
+	if err != nil {
+		return maildelivery.TransportAttempt{}, fmt.Errorf("decoding mail delivery status response: %w", err)
+	}
+	if err := apiErrorFromResponse(resp.StatusCode(), pdOf(resp)); err != nil {
+		return maildelivery.TransportAttempt{}, err
+	}
+	if resp.JSON200 == nil {
+		return maildelivery.TransportAttempt{}, fmt.Errorf("API returned %d with no mail delivery status body", resp.StatusCode())
+	}
+	attempt, err := convertGeneratedMailDelivery[maildelivery.TransportAttempt](resp.JSON200.Attempt)
+	if err != nil {
+		return maildelivery.TransportAttempt{}, err
+	}
+	if err := validateMailDeliveryAttempt(attempt, attemptID); err != nil {
+		return maildelivery.TransportAttempt{}, err
+	}
+	return attempt, nil
 }
 
 // GetService fetches one current workspace service status.

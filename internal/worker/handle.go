@@ -21,6 +21,12 @@ var (
 	// ErrHistoryUnavailable reports that the worker has no discoverable
 	// transcript yet.
 	ErrHistoryUnavailable = errors.New("worker history is unavailable")
+	// ErrNudgeAuthorityChanged reports that canonical session authority no
+	// longer matches the exact tuple carried by a destination-atomic request.
+	ErrNudgeAuthorityChanged = errors.New("worker nudge session authority changed")
+	// ErrNudgeAuthorityRequired reports a destination-atomic request that did
+	// not carry the exact authority tuple required before its provider effect.
+	ErrNudgeAuthorityRequired = errors.New("worker nudge session authority is required")
 )
 
 // StateHandle exposes worker lifecycle state queries.
@@ -216,6 +222,26 @@ type NudgeRequest struct {
 	// acceptance receipt. It is not message content or an idempotency claim.
 	EffectID       string `json:"effect_id,omitempty"`
 	CommitBoundary string `json:"commit_boundary,omitempty"`
+	// ExpectedAuthority is a closed worker-owned copy of the exact session
+	// controller authority that authorized a destination-atomic effect.
+	ExpectedAuthority *NudgeSessionAuthority `json:"expected_authority,omitempty"`
+}
+
+// NudgeSessionAuthority binds a destination-atomic nudge to the exact
+// canonical session projection and controller/config intent that issued it.
+// It intentionally lives at the worker boundary so worker does not depend on
+// the higher-level mail-delivery package.
+type NudgeSessionAuthority struct {
+	SessionRef             string `json:"session_ref"`
+	ConfiguredSeatIdentity string `json:"configured_seat_identity"`
+	CityRef                string `json:"city_ref"`
+	SeatRef                string `json:"seat_ref"`
+	ConfigSHA256           string `json:"config_sha256"`
+	IssuedByRef            string `json:"issued_by_ref"`
+	AuthorityGeneration    uint64 `json:"authority_generation"`
+	ContinuationEpoch      uint64 `json:"continuation_epoch"`
+	InstanceTokenSHA256    string `json:"instance_token_sha256"`
+	AuthorityIntentSHA256  string `json:"authority_intent_sha256"`
 }
 
 // NudgeResult reports whether the requested live delivery actually happened.
