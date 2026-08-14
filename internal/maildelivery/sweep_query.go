@@ -17,7 +17,7 @@ func (s *Store) CaptureSweepHighWatermark(current SweepCheckpoint) (SweepCheckpo
 		return current, nil
 	}
 	if s == nil || s.writer == nil {
-		return SweepCheckpoint{}, fmt.Errorf("mail delivery conditional writes unavailable")
+		return SweepCheckpoint{}, s.conditionalWriterError()
 	}
 
 	high, found, err := s.maxActionableKey(current.SeatRef)

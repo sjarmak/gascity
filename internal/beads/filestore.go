@@ -188,8 +188,10 @@ func OpenFileStore(fs fsys.FS, path string) (*FileStore, error) {
 	data, err := fs.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			mem := NewMemStore()
+			mem.HonorExplicitIDs = true
 			return &FileStore{
-				MemStore:  NewMemStore(),
+				MemStore:  mem,
 				fs:        fs,
 				path:      path,
 				locker:    locker,
@@ -205,8 +207,10 @@ func OpenFileStore(fs fsys.FS, path string) (*FileStore, error) {
 	}
 	applyBeadRevisionsSealed(&fd)
 	applyBeadFences(fd.Beads, fd.Fences)
+	mem := NewMemStoreFrom(fd.Seq, fd.Beads, fd.Deps)
+	mem.HonorExplicitIDs = true
 	store := &FileStore{
-		MemStore: NewMemStoreFrom(fd.Seq, fd.Beads, fd.Deps),
+		MemStore: mem,
 		fs:       fs,
 		path:     path,
 		locker:   locker,

@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
-	"slices"
 	"strings"
 	"time"
 
@@ -217,11 +215,26 @@ func durableThreadID(messageID string) string {
 }
 
 func sameDurableMessage(existing, wanted beads.Bead) bool {
-	return existing.ID == wanted.ID && existing.Title == wanted.Title &&
-		existing.Description == wanted.Description && existing.Type == wanted.Type &&
-		existing.Assignee == wanted.Assignee && existing.From == wanted.From &&
-		existing.NoHistory && !existing.Ephemeral &&
-		slices.Equal(existing.Labels, wanted.Labels) && maps.Equal(existing.Metadata, wanted.Metadata)
+	if existing.ID != wanted.ID || existing.Title != wanted.Title ||
+		existing.Description != wanted.Description || existing.Type != wanted.Type ||
+		existing.Assignee != wanted.Assignee || existing.From != wanted.From {
+		return false
+	}
+	if !existing.NoHistory || existing.Ephemeral {
+		return false
+	}
+	for key, value := range wanted.Metadata {
+		if existing.Metadata[key] != value {
+			return false
+		}
+	}
+	wantThread := durableThreadID(wanted.ID)
+	for _, label := range existing.Labels {
+		if label == "thread:"+wantThread {
+			return true
+		}
+	}
+	return false
 }
 
 // RepairDurableDelivery reconstructs the deterministic delivery only from the
@@ -290,6 +303,7 @@ func sameDurableDeliveryIntent(current, wanted maildelivery.Delivery) bool {
 	wanted.ExpiresAt = nil
 	current.Phase, wanted.Phase = "", ""
 	current.Revision, wanted.Revision = 0, 0
+	current.MessageRevision, wanted.MessageRevision = 0, 0
 	return current == wanted
 }
 

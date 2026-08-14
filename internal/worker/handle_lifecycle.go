@@ -407,7 +407,11 @@ func (h *SessionHandle) Nudge(ctx context.Context, req NudgeRequest) (result Nud
 
 // SupportsStableNudge reports the session manager's destination capability.
 func (h *SessionHandle) SupportsStableNudge() bool {
-	return h != nil && h.manager != nil && h.manager.SupportsStableNudge()
+	if h == nil || h.manager == nil {
+		return false
+	}
+	id := h.currentSessionID()
+	return id != "" && h.manager.SupportsStableNudgeForSession(id)
 }
 
 // LookupStableNudge reads destination evidence without delivering another nudge.

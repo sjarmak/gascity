@@ -310,7 +310,7 @@ func TestReconcileMailDeliverySeatCoalescesPageIntoOneDurableEffect(t *testing.T
 	}
 	for _, delivery := range []maildelivery.Delivery{first, second} {
 		current, loadErr := store.Get(delivery.ID)
-		if loadErr != nil || current.Phase != maildelivery.PhaseRuntimeNotified {
+		if loadErr != nil || current.Phase != maildelivery.PhaseDispositioned {
 			t.Fatalf("delivery %s = %#v, %v", delivery.ID, current, loadErr)
 		}
 	}
@@ -367,6 +367,23 @@ func TestReconcileMailDeliverySeatRefencesRequestedGroupWithoutStarvation(t *tes
 	checkpoint, loadErr := store.GetSweepCheckpoint(first.SeatRef)
 	if loadErr != nil || checkpoint.Generation != 3 || !checkpoint.After.IsZero() {
 		t.Fatalf("checkpoint=%#v err=%v", checkpoint, loadErr)
+	}
+}
+
+func TestReconcileMailDeliverySeatEscalatedRetryRemainsRetryableAndActionable(t *testing.T) {
+	backing := beads.NewMemStore()
+	backing.HonorExplicitIDs = true
+	store := maildelivery.NewStore(backing)
+	delivery := createMailDeliveryForReconcile(t, store, "retry-escalated", time.Date(2026, 8, 14, 3, 34, 0, 0, time.UTC))
+	resolver := fixedMailDeliveryFenceResolver{fence: testMailDeliveryFence()}
+	report, err := reconcileMailDeliverySeat(context.Background(), store, delivery.SeatRef, 1,
+		time.Date(2026, 8, 14, 3, 34, 30, 0, time.UTC), resolver,
+		func(_ context.Context, attempt maildelivery.TransportAttempt) (maildelivery.TransportAttempt, error) {
+			return attempt, fmt.Errorf("%w: %w", maildelivery.ErrTransportRetryEscalated, maildelivery.ErrTransportRetrySafe)
+		})
+	if err != nil || !report.PageCommitted || !report.ActionRequired || len(report.Deliveries) != 1 ||
+		report.Deliveries[0].Outcome != mailDeliveryReconcileRetryable {
+		t.Fatalf("report=%#v err=%v", report, err)
 	}
 }
 
@@ -549,8 +566,13 @@ func TestMailDeliveryReceiptHandleRejectsRuntimeOnlyBeforeInvocation(t *testing.
 		t.Fatal("receipt-incapable session handle accepted")
 	}
 	stableProvider := runtime.NewFake()
-	mgr := session.NewManagerWithOptions(beads.NewMemStore(), stableProvider)
-	capable, err := worker.NewSessionHandle(worker.SessionHandleConfig{Manager: mgr, Session: worker.SessionSpec{ID: "gc-session-test", Provider: "exec", Transport: "exec"}})
+	sessionStore := beads.NewMemStore()
+	mgr := session.NewManagerWithOptions(sessionStore, stableProvider)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{BeadOnly: true, Template: "reviewer", Title: "Reviewer", Command: "true", WorkDir: t.TempDir(), Provider: "exec", Transport: "exec"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	capable, err := worker.NewSessionHandle(worker.SessionHandleConfig{Manager: mgr, Session: worker.SessionSpec{ID: info.ID, Provider: "exec", Transport: "exec"}})
 	if err != nil {
 		t.Fatalf("NewSessionHandle: %v", err)
 	}

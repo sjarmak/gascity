@@ -7,6 +7,27 @@ import (
 	"time"
 )
 
+type providerWithoutStableNudge struct{ Provider }
+
+type targetAwareStableFake struct{ *Fake }
+
+func (f targetAwareStableFake) SupportsStableNudgeTarget(target string) bool {
+	return target == "supported"
+}
+
+func TestSupportsStableNudgeTargetUsesExactCapabilitySurface(t *testing.T) {
+	if SupportsStableNudgeTarget(providerWithoutStableNudge{Provider: NewFake()}, "supported") {
+		t.Fatal("provider without stable interface reported support")
+	}
+	if !SupportsStableNudgeTarget(NewFake(), "supported") {
+		t.Fatal("global stable provider lost support")
+	}
+	targeted := targetAwareStableFake{Fake: NewFake()}
+	if !SupportsStableNudgeTarget(targeted, "supported") || SupportsStableNudgeTarget(targeted, "unsupported") {
+		t.Fatal("target-aware capability ignored exact target")
+	}
+}
+
 func TestFakeStableNudgeCommitBeforeResponseLossReplaysOneEffect(t *testing.T) {
 	fake := NewFake()
 	if err := fake.Start(context.Background(), "session-a", Config{}); err != nil {

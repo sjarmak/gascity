@@ -247,6 +247,26 @@ func TestStoreCoalescedTransportReceiptFinalizesEveryCoveredDelivery(t *testing.
 			t.Fatalf("committed attempt for %s = %#v, %v; want %#v", deliveryID, linked, linkErr, committed)
 		}
 	}
+	secondary, err = store.Get(secondary.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.RecordDisposition(context.Background(), DispositionRequest{
+		DeliveryID: secondary.ID, ExpectedDeliveryRevision: secondary.Revision,
+		Reason: DispositionPolicySatisfiedNotified, RecordedAt: receipt.RecordedAt.Add(time.Second),
+	}, fixedFenceResolver{fence: fence}); err != nil {
+		t.Fatalf("RecordDisposition: %v", err)
+	}
+	primary, err = store.Get(primary.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Advance(primary.ID, primary.Revision, PhaseRead); err != nil {
+		t.Fatalf("Advance read: %v", err)
+	}
+	if err := store.LinkCoveredTransportAttempt(committed); err != nil {
+		t.Fatalf("LinkCoveredTransportAttempt with read covered row: %v", err)
+	}
 }
 
 func TestStoreCommittedTransportCannotBeReplacedAfterDeliveryReturnsToWaiting(t *testing.T) {

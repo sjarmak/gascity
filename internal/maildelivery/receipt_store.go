@@ -276,7 +276,7 @@ func (s *Store) responseReceiptForExpected(ctx context.Context, request Response
 
 func (s *Store) reserveReceiptLink(deliveryID string, expectedRevision uint64, key, receiptID string) error {
 	if s == nil || s.writer == nil {
-		return fmt.Errorf("mail delivery conditional writes unavailable")
+		return s.conditionalWriterError()
 	}
 	link := receiptLink(expectedRevision, receiptID)
 	if err := s.writer.UpdateIfMatch(deliveryID, int64(expectedRevision), beads.UpdateOpts{Metadata: map[string]string{key: link}}); err != nil {
