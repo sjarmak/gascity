@@ -1562,11 +1562,8 @@ func resolveDurableMailSeat(cfg *config.City, cityName string, sessions *session
 	if err != nil {
 		return "", "", fmt.Errorf("resolving durable mail recipient authority: %w", err)
 	}
-	if !lookup.HasCanonical {
-		if lookup.HasConflict {
-			return "", "", fmt.Errorf("durable mail recipient %q conflicts with live session %s", target, lookup.Conflict)
-		}
-		return "", "", fmt.Errorf("durable mail recipient %q has no live configured named session", target)
+	if lookup.HasConflict {
+		return "", "", fmt.Errorf("durable mail recipient %q conflicts with live session %s", target, lookup.Conflict)
 	}
 	return "seat:" + cityName + "/" + spec.Identity, spec.Identity, nil
 }
@@ -1614,6 +1611,7 @@ func cmdMailSendDurable(args []string, notify, all bool, from, to, subject, mess
 	if workStore == nil {
 		return code
 	}
+	defer closeBeadStoreHandle(workStore) //nolint:errcheck // command-scoped store handle
 	cfg, err := loadCityConfigWithoutBuiltinPackRefresh(cityPath, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc mail send: loading city config: %v\n", err) //nolint:errcheck // best-effort stderr

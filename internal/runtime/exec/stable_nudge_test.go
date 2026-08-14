@@ -163,6 +163,24 @@ esac
 	}
 }
 
+func TestStableNudgeWireClassifiesDeclaredButUnsupportedOperation(t *testing.T) {
+	dir := t.TempDir()
+	script := writeScript(t, dir, `
+case "$1" in
+ protocol) printf '%s' '{"version":0,"capabilities":["effect.nudge-idempotent"]}' ;;
+ *) exit 2 ;;
+esac
+`)
+	p := NewProvider(script)
+	effectID := "mail-nudge-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	if _, err := p.NudgeStable(context.Background(), "session-a", effectID, runtime.TextContent("notice")); !errors.Is(err, runtime.ErrStableNudgeUnsupported) || errors.Is(err, runtime.ErrStableNudgeRetrySafe) {
+		t.Fatalf("NudgeStable error = %v, want unsupported only", err)
+	}
+	if _, err := p.LookupStableNudge(context.Background(), "session-a", effectID, runtime.TextContent("notice")); !errors.Is(err, runtime.ErrStableNudgeUnsupported) {
+		t.Fatalf("LookupStableNudge error = %v, want unsupported", err)
+	}
+}
+
 func TestStableNudgeWireRejectsMalformedEffectIDBeforeOperation(t *testing.T) {
 	dir := t.TempDir()
 	called := filepath.Join(dir, "called")

@@ -61,7 +61,7 @@ func (s *Store) GetSweepCheckpoint(seatRef string) (SweepCheckpoint, error) {
 // AdvanceSweepCheckpoint persists one planned page under the exact revision.
 func (s *Store) AdvanceSweepCheckpoint(current SweepCheckpoint, plan SweepPlan) (SweepCheckpoint, error) {
 	if s == nil || s.writer == nil {
-		return SweepCheckpoint{}, fmt.Errorf("mail delivery conditional writes unavailable")
+		return SweepCheckpoint{}, s.conditionalWriterError()
 	}
 	next, err := AdvanceSweep(current, plan)
 	if err != nil {

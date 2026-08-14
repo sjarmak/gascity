@@ -88,15 +88,15 @@ func executeTransport(ctx context.Context, store *Store, request TransportAttemp
 	receipt, invokeErr := invoke(ctx, invoking)
 	if invokeErr != nil {
 		if errors.Is(invokeErr, ErrTransportRetrySafe) {
-			if invoking.InvocationCount >= 2 {
-				unknown, markErr := store.RecordUnknownTransportState(invoking.AttemptID, invoking.Revision, uncertainAt)
-				return unknown, errors.Join(fmt.Errorf("mail delivery stable transport retry bound reached: %w", invokeErr), markErr)
-			}
 			released, releaseErr := store.ReleaseTransportInvocation(invoking.AttemptID, invoking.Revision)
 			if releaseErr != nil {
 				if current, loadErr := store.TransportAttempt(invoking.AttemptID); loadErr == nil {
 					released = current
 				}
+			}
+			if invoking.InvocationCount >= TransportRetryEscalationThreshold {
+				return released, fmt.Errorf("%w: retry-safe invocation count %d reached threshold %d: %w",
+					ErrTransportRetryEscalated, invoking.InvocationCount, TransportRetryEscalationThreshold, errors.Join(invokeErr, releaseErr))
 			}
 			return released, errors.Join(invokeErr, releaseErr)
 		}

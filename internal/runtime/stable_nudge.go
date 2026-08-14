@@ -30,6 +30,25 @@ type StableNudgeProvider interface {
 	LookupStableNudge(context.Context, string, string, []ContentBlock) (StableNudgeLookup, error)
 }
 
+// TargetStableNudgeProvider refines composite capability for one routed target.
+type TargetStableNudgeProvider interface {
+	SupportsStableNudgeTarget(string) bool
+}
+
+// SupportsStableNudgeTarget reports the honest capability of the provider route
+// selected for target. Providers without target-aware routing use their global
+// declaration.
+func SupportsStableNudgeTarget(provider Provider, target string) bool {
+	stable, ok := provider.(StableNudgeProvider)
+	if !ok {
+		return false
+	}
+	if targeted, ok := provider.(TargetStableNudgeProvider); ok {
+		return targeted.SupportsStableNudgeTarget(target)
+	}
+	return stable.SupportsStableNudge()
+}
+
 // StableNudgeRequest is the body-free exec-provider wire request.
 type StableNudgeRequest struct {
 	Version  int            `json:"version"`

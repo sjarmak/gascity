@@ -137,6 +137,9 @@ func (p *Provider) cancellationError(ctxErr error, stderr string, args []string)
 func (p *Provider) runError(runErr error, stderr string, args []string) error {
 	var exitErr *exec.ExitError
 	if errors.As(runErr, &exitErr) && exitErr.ExitCode() == 2 {
+		if len(args) > 0 && (args[0] == "nudge-stable" || args[0] == "nudge-stable-status") {
+			return fmt.Errorf("exec provider declared stable nudge but operation %q is unsupported: %w", args[0], runtime.ErrStableNudgeUnsupported)
+		}
 		return nil
 	}
 	errMsg := strings.TrimSpace(stderr)
@@ -646,6 +649,9 @@ func (p *Provider) NudgeStable(ctx context.Context, name, effectID string, conte
 	}
 	out, err := p.runWithContext(ctx, p.timeout, data, "nudge-stable", name, effectID)
 	if err != nil {
+		if errors.Is(err, runtime.ErrStableNudgeUnsupported) {
+			return runtime.StableNudgeReceipt{}, err
+		}
 		return runtime.StableNudgeReceipt{}, fmt.Errorf("%w: %w", runtime.ErrStableNudgeRetrySafe, err)
 	}
 	decoder := json.NewDecoder(strings.NewReader(out))
