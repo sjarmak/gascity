@@ -2316,6 +2316,7 @@ gc mail
 | [gc mail check](#gc-mail-check) | Check for unread mail (use --inject for hook output) |
 | [gc mail count](#gc-mail-count) | Show total/unread message count |
 | [gc mail delete](#gc-mail-delete) | Delete one or more messages (closes the beads) |
+| [gc mail delivery](#gc-mail-delivery) | Operate durable mail delivery attempts |
 | [gc mail inbox](#gc-mail-inbox) | List unread messages (defaults to your inbox) |
 | [gc mail mark-read](#gc-mail-mark-read) | Mark a message as read |
 | [gc mail mark-unread](#gc-mail-mark-unread) | Mark a message as unread |
@@ -2406,6 +2407,35 @@ gc mail delete <id>... [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL result |
+
+## gc mail delivery
+
+Operate durable mail delivery attempts
+
+```
+gc mail delivery
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| [gc mail delivery invoke](#gc-mail-delivery-invoke) | Invoke one requested mail delivery attempt |
+| [gc mail delivery status](#gc-mail-delivery-status) | Read one durable mail delivery attempt |
+
+## gc mail delivery invoke
+
+Invoke one requested mail delivery attempt
+
+```
+gc mail delivery invoke <attempt-id>
+```
+
+## gc mail delivery status
+
+Read one durable mail delivery attempt
+
+```
+gc mail delivery status <attempt-id>
+```
 
 ## gc mail inbox
 

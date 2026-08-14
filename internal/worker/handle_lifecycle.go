@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
@@ -297,8 +298,15 @@ func (h *SessionHandle) Interrupt(ctx context.Context, _ InterruptRequest) (err 
 
 // Nudge sends a best-effort redirect message to the worker.
 func (h *SessionHandle) Nudge(ctx context.Context, req NudgeRequest) (result NudgeResult, err error) {
+	var targetSessionRef, targetRuntimeName string
 	event := h.beginOperationEvent(ctx, workerOperationNudge)
 	defer func() {
+		// Receipt construction happens after provider success. A construction
+		// failure is therefore an indeterminate external outcome, not permission
+		// for a caller to retry the physical nudge.
+		if err == nil && result.Delivered && req.EffectID != "" && result.Receipt == nil {
+			result.Receipt, err = newNudgeAcceptanceReceipt(req.EffectID, targetSessionRef, targetRuntimeName, h.session.Provider, h.session.Transport, time.Now())
+		}
 		event.payload.Delivered = boolPointer(result.Delivered)
 		event.finish(err)
 		if err == nil {
@@ -310,9 +318,20 @@ func (h *SessionHandle) Nudge(ctx context.Context, req NudgeRequest) (result Nud
 		err = fmt.Errorf("nudge text is required")
 		return NudgeResult{}, err
 	}
+	if req.EffectID != "" && !validNudgeEffectID(req.EffectID) {
+		err = fmt.Errorf("nudge effect ID is invalid")
+		return NudgeResult{}, err
+	}
 	id, err := h.ensureSessionID()
 	if err != nil {
 		return NudgeResult{}, err
+	}
+	if req.EffectID != "" {
+		info, infoErr := h.manager.Get(id)
+		if infoErr != nil {
+			return NudgeResult{}, infoErr
+		}
+		targetSessionRef, targetRuntimeName = id, info.SessionName
 	}
 	resumeCommand, err := h.startCommand(id)
 	if err != nil {

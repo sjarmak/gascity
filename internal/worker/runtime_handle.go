@@ -244,12 +244,22 @@ func (h *RuntimeHandle) Interrupt(ctx context.Context, _ InterruptRequest) (err 
 func (h *RuntimeHandle) Nudge(ctx context.Context, req NudgeRequest) (result NudgeResult, err error) {
 	event := h.beginOperationEvent(ctx, workerOperationNudge)
 	defer func() {
+		// Receipt construction happens after provider success. A construction
+		// failure is therefore an indeterminate external outcome, not permission
+		// for a caller to retry the physical nudge.
+		if err == nil && result.Delivered && req.EffectID != "" && result.Receipt == nil {
+			result.Receipt, err = newNudgeAcceptanceReceipt(req.EffectID, "", h.sessionName, h.providerName, h.transport, time.Now())
+		}
 		event.payload.Delivered = boolPointer(result.Delivered)
 		event.finish(err)
 	}()
 
 	if strings.TrimSpace(req.Text) == "" {
 		err = fmt.Errorf("nudge text is required")
+		return NudgeResult{}, err
+	}
+	if req.EffectID != "" && !validNudgeEffectID(req.EffectID) {
+		err = fmt.Errorf("nudge effect ID is invalid")
 		return NudgeResult{}, err
 	}
 	if !h.provider.IsRunning(h.sessionName) {

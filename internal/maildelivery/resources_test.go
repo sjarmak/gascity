@@ -134,7 +134,8 @@ func TestTransportReceiptDistinguishesCommittedFromUnknown(t *testing.T) {
 
 	committed := TransportReceipt{
 		Version: 1, AttemptID: attemptID, NudgeID: nudgeID, State: EffectCommitted,
-		ReceiptRef: "nudge-receipt:test-city/1", ReceiptSHA256: strings.Repeat("e", 64),
+		CommitBoundary: TransportCommitBoundaryDestinationAtomic,
+		ReceiptRef:     "nudge-receipt:test-city/1", ReceiptSHA256: strings.Repeat("e", 64),
 		RecordedAt: time.Date(2026, 8, 13, 20, 2, 0, 0, time.UTC),
 	}
 	if err := committed.Validate(attemptID, nudgeID); err != nil {
@@ -143,6 +144,7 @@ func TestTransportReceiptDistinguishesCommittedFromUnknown(t *testing.T) {
 
 	unknown := committed
 	unknown.State = EffectUnknownExternalState
+	unknown.CommitBoundary = ""
 	unknown.ReceiptRef = ""
 	unknown.ReceiptSHA256 = ""
 	if err := unknown.Validate(attemptID, nudgeID); err != nil {
@@ -153,6 +155,7 @@ func TestTransportReceiptDistinguishesCommittedFromUnknown(t *testing.T) {
 		"committed without receipt":       func(r *TransportReceipt) { r.ReceiptRef = "" },
 		"unknown with flattering receipt": func(r *TransportReceipt) { r.State = EffectUnknownExternalState },
 		"wrong nudge":                     func(r *TransportReceipt) { r.NudgeID = "mail-nudge-" + strings.Repeat("0", 64) },
+		"unknown commit boundary":         func(r *TransportReceipt) { r.CommitBoundary = "invented" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			candidate := committed

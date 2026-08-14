@@ -152,6 +152,18 @@ func (s *Store) Disposition(ctx context.Context, deliveryID string, resolver Fen
 
 func (s *Store) deriveDispositionProof(ctx context.Context, delivery Delivery, reason DispositionReason, resolver FenceResolver) (string, error) {
 	switch reason {
+	case DispositionPolicySatisfiedNotified:
+		if delivery.Policy != PolicyNotifyOnly {
+			return "", fmt.Errorf("mail delivery disposition %q does not match policy", reason)
+		}
+		attempt, err := s.committedTransportAttemptForDelivery(delivery.ID)
+		if err != nil {
+			return "", fmt.Errorf("deriving disposition transport proof: %w", err)
+		}
+		if attempt.Receipt.CommitBoundary != TransportCommitBoundaryDestinationAtomic {
+			return "", fmt.Errorf("%w: notify disposition requires destination-atomic transport proof", ErrAuthorityUnavailable)
+		}
+		return attempt.AttemptID, nil
 	case DispositionPolicySatisfiedRead:
 		if delivery.Policy != PolicyReadRequired {
 			return "", fmt.Errorf("mail delivery disposition %q does not match policy", reason)
@@ -170,8 +182,7 @@ func (s *Store) deriveDispositionProof(ctx context.Context, delivery Delivery, r
 			return "", fmt.Errorf("deriving disposition response proof: %w", err)
 		}
 		return receipt.ReceiptID, nil
-	case DispositionPolicySatisfiedNotified, DispositionRecipientDeclined,
-		DispositionSenderCanceled, DispositionSuperseded, DispositionExpired,
+	case DispositionRecipientDeclined, DispositionSenderCanceled, DispositionSuperseded, DispositionExpired,
 		DispositionRecipientSeatRetired:
 		return "", fmt.Errorf("%w: canonical proof reader for disposition %q", ErrAuthorityUnavailable, reason)
 	default:

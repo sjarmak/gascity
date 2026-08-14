@@ -151,15 +151,28 @@ const (
 	EffectUnknownExternalState EffectState = "unknown_external_state"
 )
 
+// TransportCommitBoundary names what a committed receipt actually proves.
+type TransportCommitBoundary string
+
+const (
+	// TransportCommitBoundaryProviderReturn proves only that the provider call
+	// returned success. It is not destination idempotency or agent consumption.
+	TransportCommitBoundaryProviderReturn TransportCommitBoundary = "provider-nudge-return"
+	// TransportCommitBoundaryDestinationAtomic proves the destination atomically
+	// bound the stable nudge ID to the accepted effect and durable receipt.
+	TransportCommitBoundaryDestinationAtomic TransportCommitBoundary = "destination-atomic-effect-receipt"
+)
+
 // TransportReceipt binds one stable nudge effect to destination evidence.
 type TransportReceipt struct {
-	Version       int         `json:"version"`
-	AttemptID     string      `json:"attempt_id"`
-	NudgeID       string      `json:"nudge_id"`
-	State         EffectState `json:"state"`
-	ReceiptRef    string      `json:"receipt_ref,omitempty"`
-	ReceiptSHA256 string      `json:"receipt_sha256,omitempty"`
-	RecordedAt    time.Time   `json:"recorded_at"`
+	Version        int                     `json:"version"`
+	AttemptID      string                  `json:"attempt_id"`
+	NudgeID        string                  `json:"nudge_id"`
+	State          EffectState             `json:"state"`
+	CommitBoundary TransportCommitBoundary `json:"commit_boundary,omitempty"`
+	ReceiptRef     string                  `json:"receipt_ref,omitempty"`
+	ReceiptSHA256  string                  `json:"receipt_sha256,omitempty"`
+	RecordedAt     time.Time               `json:"recorded_at"`
 }
 
 // Validate rejects flattering or identity-mismatched transport evidence.
@@ -170,11 +183,12 @@ func (r TransportReceipt) Validate(attemptID, nudgeID string) error {
 	}
 	switch r.State {
 	case EffectCommitted:
-		if !validRef(r.ReceiptRef) || !validHash(r.ReceiptSHA256) {
+		if (r.CommitBoundary != TransportCommitBoundaryProviderReturn && r.CommitBoundary != TransportCommitBoundaryDestinationAtomic) ||
+			!validRef(r.ReceiptRef) || !validHash(r.ReceiptSHA256) {
 			return fmt.Errorf("committed transport receipt lacks destination evidence")
 		}
 	case EffectUnknownExternalState:
-		if r.ReceiptRef != "" || r.ReceiptSHA256 != "" {
+		if r.CommitBoundary != "" || r.ReceiptRef != "" || r.ReceiptSHA256 != "" {
 			return fmt.Errorf("unknown transport state carries flattering evidence")
 		}
 	default:

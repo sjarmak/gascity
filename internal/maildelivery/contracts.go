@@ -45,6 +45,9 @@ func (f ActivationFence) Validate() error {
 	if !validPrefixedHash(f.FenceID, "mail-activation-") {
 		return fmt.Errorf("activation fence ID is invalid")
 	}
+	if strings.TrimPrefix(f.FenceID, "mail-activation-") != f.AuthorityIntentSHA256 {
+		return fmt.Errorf("activation fence ID does not match authority intent")
+	}
 	for name, value := range map[string]string{
 		"city_ref": f.CityRef, "seat_ref": f.SeatRef, "authority_ref": f.AuthorityRef,
 		"session_ref": f.SessionRef, "issued_by_ref": f.IssuedByRef,
@@ -87,11 +90,16 @@ func AttemptID(deliveryID string, fence ActivationFence) (string, error) {
 	if err := fence.Validate(); err != nil {
 		return "", err
 	}
+	return attemptIDFromAuthority(deliveryID, fence.AuthorityKind, fence.AuthorityRef,
+		fence.AuthorityGeneration, fence.AuthorityIntentSHA256, fence.SessionRef,
+		fence.ContinuationEpoch, fence.InstanceTokenSHA256), nil
+}
+
+func attemptIDFromAuthority(deliveryID string, kind AuthorityKind, authorityRef string, generation uint64, intentSHA256, sessionRef string, epoch uint64, tokenSHA256 string) string {
 	return "mail-attempt-" + digest(
-		"mail-attempt-v1", deliveryID, string(fence.AuthorityKind), fence.AuthorityRef,
-		fmt.Sprint(fence.AuthorityGeneration), fence.AuthorityIntentSHA256, fence.SessionRef,
-		fmt.Sprint(fence.ContinuationEpoch), fence.InstanceTokenSHA256,
-	), nil
+		"mail-attempt-v1", deliveryID, string(kind), authorityRef, fmt.Sprint(generation),
+		intentSHA256, sessionRef, fmt.Sprint(epoch), tokenSHA256,
+	)
 }
 
 // Phase is the closed durable delivery phase vocabulary.
