@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/mail"
@@ -79,7 +80,7 @@ func primeUnreadMailInjection(skip map[string]bool) string {
 	if len(messages) == 0 {
 		return ""
 	}
-	return formatInjectOutput(messages)
+	return formatOrderedInjectOutput(sortSessionStartUnreadMail(messages))
 }
 
 // primeUnreadMailMessages returns the current agent's unread ordinary mail via
@@ -98,6 +99,23 @@ func primeUnreadMailMessages() []mail.Message {
 		return nil
 	}
 	return messages
+}
+
+// sortSessionStartUnreadMail returns a copy ordered by descending priority,
+// then newest-first within a priority. SessionStart shows only a small preview,
+// so preserving provider arrival order for equal-priority mail would let an old
+// backlog hide every newly arrived direction forever. Equal timestamps remain
+// stable because no stronger arrival fact exists.
+func sortSessionStartUnreadMail(messages []mail.Message) []mail.Message {
+	sorted := make([]mail.Message, len(messages))
+	copy(sorted, messages)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].Priority != sorted[j].Priority {
+			return sorted[i].Priority > sorted[j].Priority
+		}
+		return sorted[i].CreatedAt.After(sorted[j].CreatedAt)
+	})
+	return sorted
 }
 
 // sessionStartAutoHandoffInjection returns only durable auto-handoff mail for
