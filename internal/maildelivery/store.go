@@ -28,7 +28,13 @@ type Store struct {
 
 // NewStore returns a typed store. Mutations fail closed when revision-CAS is absent.
 func NewStore(store beads.Store) *Store {
-	writer, _ := beads.ConditionalWriterFor(store)
+	writer, diagnostic, resolveErr := beads.ResolveConditionalWriter(store)
+	if writer == nil && diagnostic == nil && resolveErr == nil {
+		// Directly injected stores historically used CAS whenever the interface
+		// was present. Preserve that behavior only for the resolver's ordinary
+		// legacy result; a diagnostic or refusal never falls back.
+		writer, _ = beads.ConditionalWriterFor(store)
+	}
 	return &Store{beads: store, writer: writer}
 }
 

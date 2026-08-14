@@ -1344,15 +1344,27 @@ func openExistingScopeLocalFileStore(scopeRoot string) (*beads.FileStore, error)
 	return openScopeLocalFileStore(scopeRoot)
 }
 
+const testFileStoreHonorExplicitIDsEnv = "GC_TEST_FILESTORE_HONOR_EXPLICIT_IDS"
+
 func openCompatibleFileStore(scopeRoot, cityPath string) (*beads.FileStore, error) {
 	scopeRoot = resolveStoreScopeRoot(cityPath, scopeRoot)
-	if !samePath(scopeRoot, cityPath) && scopeUsesFileStoreContract(scopeRoot) {
-		return openExistingScopeLocalFileStore(scopeRoot)
+	var store *beads.FileStore
+	var err error
+	switch {
+	case !samePath(scopeRoot, cityPath) && scopeUsesFileStoreContract(scopeRoot):
+		store, err = openExistingScopeLocalFileStore(scopeRoot)
+	case fileStoreUsesScopedRoots(cityPath):
+		store, err = openExistingScopeLocalFileStore(scopeRoot)
+	default:
+		store, err = openScopeLocalFileStore(cityPath)
 	}
-	if fileStoreUsesScopedRoots(cityPath) {
-		return openExistingScopeLocalFileStore(scopeRoot)
+	if err != nil {
+		return nil, err
 	}
-	return openScopeLocalFileStore(cityPath)
+	if managedDoltTestModeEnabled() && os.Getenv(testFileStoreHonorExplicitIDsEnv) == "1" {
+		store.HonorExplicitIDs = true
+	}
+	return store, nil
 }
 
 func openStoreAtForCity(storePath, cityPath string) (beads.Store, error) {
