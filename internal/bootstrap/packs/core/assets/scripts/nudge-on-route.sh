@@ -61,15 +61,24 @@ duration_to_seconds() {
 # pool's active members by template and nudge each; a target with no members
 # (a single-session agent, or an explicit slot name) is nudged directly.
 # Returns 0 if at least one nudge succeeded, non-zero otherwise.
+#
+# _key (the "<bead_id>|<routed_to>" pair computed by the caller) is threaded
+# through as --idempotency-key so the durable nudge record carries the same
+# caller-supplied identity this script's own dedup state already keys on
+# (EFFECT-003): a retried delivery for the same routing pair is recognized
+# as the same durable nudge instead of minting an unaccountable new one. A
+# pool fan-out nudges each member under its own per-member key so members
+# remain individually retriable.
 nudge_routed_target() {
     _target="$1"
+    _key="$2"
     _members="$(gc session list --json --state active --template "$_target" 2>/dev/null \
         | jq -r '(.sessions // [])[] | .name // .id' 2>/dev/null)" || _members=""
     if [ -n "$_members" ]; then
         _any=1
         while IFS= read -r _m; do
             [ -n "$_m" ] || continue
-            if gc session nudge "$_m" "$NUDGE_MESSAGE" >/dev/null 2>&1; then
+            if gc session nudge "$_m" "$NUDGE_MESSAGE" --idempotency-key "$_key|$_m" >/dev/null 2>&1; then
                 _any=0
             fi
         done <<MEMBERS
@@ -77,7 +86,7 @@ $_members
 MEMBERS
         return "$_any"
     fi
-    gc session nudge "$_target" "$NUDGE_MESSAGE" >/dev/null 2>&1
+    gc session nudge "$_target" "$NUDGE_MESSAGE" --idempotency-key "$_key" >/dev/null 2>&1
 }
 
 # Pull recent bead.updated events. Best-effort: a read failure (API down)
@@ -115,7 +124,7 @@ while IFS="$(printf '\t')" read -r bead_id routed_to; do
         STATE="$(echo "$STATE" | jq --arg k "$key" --arg now "$NOW" '.[$k] = $now')"
         continue
     fi
-    if nudge_routed_target "$routed_to"; then
+    if nudge_routed_target "$routed_to" "$key"; then
         STATE="$(echo "$STATE" | jq --arg k "$key" --arg now "$NOW" '.[$k] = $now')"
         NUDGED=$((NUDGED + 1))
     fi

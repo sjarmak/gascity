@@ -2512,6 +2512,7 @@ func sessionKillRuntimeAlreadyInactive(info session.Info, sp runtime.Provider) b
 func newSessionNudgeCmd(stdout, stderr io.Writer) *cobra.Command {
 	var delivery string
 	var jsonOutput bool
+	var idempotencyKey string
 	cmd := &cobra.Command{
 		Use:   "nudge <id-or-alias> <message...>",
 		Short: "Send a text message to a running session",
@@ -2521,7 +2522,13 @@ The message is delivered as text content to the session's input. This is
 equivalent to typing the message into the session's terminal.
 
 Accepts a session ID or session alias. Multi-word messages are
-joined automatically.`,
+joined automatically.
+
+--idempotency-key names the caller-supplied identity for this nudge's durable
+record. Reusing the same key across retries (or repeated invocations for the
+same underlying event) dedups against the durable nudge record instead of
+enqueueing an unidentifiable duplicate. Omitting it preserves the default
+behavior of a freshly generated, unlinked identity per call.`,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(_ *cobra.Command, args []string) error {
 			mode, err := parseNudgeDeliveryMode(delivery)
@@ -2529,7 +2536,7 @@ joined automatically.`,
 				fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck // best-effort stderr
 				return errExit
 			}
-			if cmdSessionNudge(args, mode, jsonOutput, stdout, stderr) != 0 {
+			if cmdSessionNudge(args, mode, jsonOutput, idempotencyKey, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
@@ -2538,6 +2545,7 @@ joined automatically.`,
 	}
 	cmd.Flags().StringVar(&delivery, "delivery", string(nudgeDeliveryWaitIdle), "delivery mode: immediate, wait-idle, or queue")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "JSON output")
+	cmd.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "caller-supplied identity for this nudge's durable record; reused across retries to dedup instead of duplicating")
 	return cmd
 }
 
@@ -2667,7 +2675,10 @@ type sessionNudgeJSON struct {
 }
 
 // cmdSessionNudge is the CLI entry point for "gc session nudge".
-func cmdSessionNudge(args []string, delivery nudgeDeliveryMode, jsonOutput bool, stdout, stderr io.Writer) int {
+// cmdSessionNudge runs "gc session nudge". idempotencyKey is the
+// caller-supplied durable-record identity from --idempotency-key
+// (EFFECT-003); see newSessionNudgeCmd.
+func cmdSessionNudge(args []string, delivery nudgeDeliveryMode, jsonOutput bool, idempotencyKey string, stdout, stderr io.Writer) int {
 	target := args[0]
 	message := strings.Join(args[1:], " ")
 
@@ -2676,7 +2687,7 @@ func cmdSessionNudge(args []string, delivery nudgeDeliveryMode, jsonOutput bool,
 		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	return deliverSessionNudge(targetInfo, message, delivery, jsonOutput, stdout, stderr)
+	return deliverSessionNudge(targetInfo, message, delivery, jsonOutput, idempotencyKey, stdout, stderr)
 }
 
 // resolveWorkDir determines the working directory for a session based on the

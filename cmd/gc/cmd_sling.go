@@ -959,7 +959,7 @@ func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, stderr
 		return dryRunSingle(opts, deps, querier, stdout, stderr)
 	}
 	if result.NudgeAgent != nil {
-		doSlingNudge(result.NudgeAgent, deps.CityName, deps.CityPath, deps.Cfg, deps.SP, deps.Store, stdout, stderr)
+		doSlingNudge(result.NudgeAgent, deps.CityName, deps.CityPath, deps.Cfg, deps.SP, deps.Store, result.BeadID, stdout, stderr)
 	}
 	return 0
 }
@@ -1065,7 +1065,7 @@ func doSlingBatchWithJSON(opts slingOpts, deps slingDeps, querier BeadChildQueri
 		return dryRunSingle(opts, deps, querier, humanStdout, stderr)
 	}
 	if result.NudgeAgent != nil {
-		doSlingNudge(result.NudgeAgent, deps.CityName, deps.CityPath, deps.Cfg, deps.SP, deps.Store, humanStdout, stderr)
+		doSlingNudge(result.NudgeAgent, deps.CityName, deps.CityPath, deps.Cfg, deps.SP, deps.Store, result.BeadID, humanStdout, stderr)
 	}
 	// Success only (never dry-run or error): surface a dashboard deep link
 	// when one resolves. Resolution failure degrades silently to no link.
@@ -1501,8 +1501,12 @@ func checkBeadState(q BeadQuerier, beadID string, a config.Agent) beadCheckResul
 // For multi-session configs, nudges the first running instance. If the target is not
 // running, pokes the controller to trigger an immediate reconciler tick
 // so WakeWork can wake the session without waiting for the next patrol.
+// beadID is the routed bead's id (sling.SlingResult.BeadID); it becomes part of
+// the caller-supplied durable-record identity for any queued nudge this
+// produces (EFFECT-003), so a re-sling of the same bead dedups instead of
+// enqueueing an unidentifiable duplicate.
 func doSlingNudge(a *config.Agent, cityName, cityPath string, cfg *config.City,
-	sp runtime.Provider, store beads.Store, stdout, stderr io.Writer,
+	sp runtime.Provider, store beads.Store, beadID string, stdout, stderr io.Writer,
 ) {
 	st := cfg.Workspace.SessionTemplate
 
@@ -1528,7 +1532,7 @@ func doSlingNudge(a *config.Agent, cityName, cityPath string, cfg *config.City,
 				}
 				member := resolvePoolNudgeMember(cfg, a, ref.qualifiedInstance)
 				target := buildSlingNudgeTarget(member, cityName, cityPath, cfg, sessStore, ref.sessionName)
-				deliverSlingNudge(target, sp, rawStore, cityPath, stdout, stderr)
+				deliverSlingNudge(target, sp, rawStore, cityPath, beadID, stdout, stderr)
 				return true
 			}
 			return false
@@ -1558,7 +1562,7 @@ func doSlingNudge(a *config.Agent, cityName, cityPath string, cfg *config.City,
 	sessStore := cliSessionStore(store, cfg, cityPath)
 	sn := lookupSessionNameOrLegacy(sessStore, cityName, a.QualifiedName(), st)
 	target := buildSlingNudgeTarget(*a, cityName, cityPath, cfg, sessStore, sn)
-	deliverSlingNudge(target, sp, store, cityPath, stdout, stderr)
+	deliverSlingNudge(target, sp, store, cityPath, beadID, stdout, stderr)
 }
 
 // resolvePoolNudgeMember resolves the config identity to nudge for a live pool
@@ -1637,7 +1641,10 @@ func buildSlingNudgeTarget(agent config.Agent, cityName, cityPath string, cfg *c
 	})
 }
 
-func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Store, cityPath string, stdout, stderr io.Writer) {
+// deliverSlingNudge nudges (or queues a nudge for) target after a sling
+// routing. beadID is the routed bead's id; see doSlingNudge for its role as
+// part of the caller-supplied durable-record identity (EFFECT-003).
+func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Store, cityPath, beadID string, stdout, stderr io.Writer) {
 	const msg = "Work slung. Check your hook."
 	// Session observation/handle and the last-nudge-delivered stamp route to the
 	// session coordination-class store (derived from the target's cfg+cityPath); the
@@ -1670,7 +1677,11 @@ func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Stor
 		}
 	}
 
-	if err := enqueueQueuedNudgeWithStore(target.cityPath, beads.NudgesStore{Store: store}, newQueuedNudgeWithOptions(target.agent.QualifiedName(), msg, "sling", now, queuedNudgeOptionsFromTarget(target))); err != nil {
+	slingKey := ""
+	if beadID != "" {
+		slingKey = "sling:" + beadID + ":" + target.agent.QualifiedName()
+	}
+	if err := enqueueQueuedNudgeWithStore(target.cityPath, beads.NudgesStore{Store: store}, newQueuedNudgeWithOptions(target.agent.QualifiedName(), msg, "sling", now, queuedNudgeOptionsFromTarget(target, slingKey))); err != nil {
 		telemetry.RecordNudge(context.Background(), target.agent.QualifiedName(), err)
 		fmt.Fprintf(stderr, "warning: bead routed but nudge failed: %v\n", err) //nolint:errcheck // best-effort
 		return

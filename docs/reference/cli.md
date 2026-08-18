@@ -4097,6 +4097,12 @@ equivalent to typing the message into the session's terminal.
 Accepts a session ID or session alias. Multi-word messages are
 joined automatically.
 
+--idempotency-key names the caller-supplied identity for this nudge's durable
+record. Reusing the same key across retries (or repeated invocations for the
+same underlying event) dedups against the durable nudge record instead of
+enqueueing an unidentifiable duplicate. Omitting it preserves the default
+behavior of a freshly generated, unlinked identity per call.
+
 ```
 gc session nudge <id-or-alias> <message...> [flags]
 ```
@@ -4104,6 +4110,7 @@ gc session nudge <id-or-alias> <message...> [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--delivery` | string | `wait-idle` | delivery mode: immediate, wait-idle, or queue |
+| `--idempotency-key` | string |  | caller-supplied identity for this nudge's durable record; reused across retries to dedup instead of duplicating |
 | `--json` | bool |  | JSON output |
 
 ## gc session peek

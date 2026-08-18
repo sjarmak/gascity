@@ -528,7 +528,7 @@ func TestDeliverSessionNudgeWithWorkerImmediateResumesSuspendedSession(t *testin
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryImmediate, false, &stdout, &stderr)
+	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryImmediate, false, "", &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("deliverSessionNudgeWithWorker = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -581,7 +581,7 @@ func TestDeliverSessionNudgeWithWorkerWaitIdleResumesClaudeSession(t *testing.T)
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryWaitIdle, false, &stdout, &stderr)
+	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryWaitIdle, false, "", &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("deliverSessionNudgeWithWorker = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -657,7 +657,7 @@ func TestDeliverSessionNudgeWithWorkerManagedNonRunningQueuesWakeForController(t
 	beforeCalls := len(fake.Calls)
 
 	var stdout, stderr bytes.Buffer
-	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryImmediate, false, &stdout, &stderr)
+	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryImmediate, false, "", &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("deliverSessionNudgeWithWorker = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -695,6 +695,102 @@ func TestDeliverSessionNudgeWithWorkerManagedNonRunningQueuesWakeForController(t
 		case "Start", "Nudge", "NudgeNow":
 			t.Fatalf("managed non-running nudge must not start or deliver from caller env; saw call %+v", call)
 		}
+	}
+}
+
+// TestDeliverSessionNudgeWithWorkerCallerIdentitySurvivesToDurableRecord is the
+// EFFECT-003 regression test (dr-3msk6.1): the nudge-delivery effect must carry
+// a caller-supplied identity end-to-end into the DURABLE nudge record, not just
+// accept an identity string and drop it on the floor. Before this change,
+// deliverSessionNudgeWithWorker has no caller-identity parameter at all, so a
+// caller can never ask "did nudge X actually land" — every call mints a fresh
+// random ID (newQueuedNudgeID), and a caller-visible key never reaches the
+// durable record checked here: the shadow bead behind nudgeFrontDoor(store) and
+// the flock'd queue state read back via listQueuedNudgesForTarget.
+//
+// A caller-supplied identity that never reaches the durable record is
+// indistinguishable from one that does until a second call with the same key
+// either dedups (correct) or silently double-enqueues / overwrites (the
+// EFFECT-003 failure mode reappearing). This test asserts both halves: the
+// first call's key is readable back from the durable record, and a second call
+// reusing that key is recognized as the same durable nudge rather than treated
+// as a brand new, unidentified one.
+func TestDeliverSessionNudgeWithWorkerCallerIdentitySurvivesToDurableRecord(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	fake := runtime.NewFake()
+	mgr := newSessionManagerWithConfig(dir, store, fake, nil)
+
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "worker", Title: "Worker", Command: "claude", WorkDir: dir, Provider: "claude", Env: nil, Resume: session.ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	prevManaged := nudgeCityUsesManagedReconciler
+	prevPoke := nudgePokeController
+	nudgeCityUsesManagedReconciler = func(cityPath string) bool { return cityPath == dir }
+	nudgePokeController = func(string) error { return nil }
+	t.Cleanup(func() {
+		nudgeCityUsesManagedReconciler = prevManaged
+		nudgePokeController = prevPoke
+	})
+
+	target := nudgeTarget{
+		cityPath:    dir,
+		cfg:         &config.City{Agents: []config.Agent{{Name: "worker", Provider: "claude"}}},
+		sessionID:   info.ID,
+		sessionName: info.SessionName,
+		identity:    "worker",
+		agent:       config.Agent{Name: "worker", Provider: "claude"},
+	}
+
+	const key = "caller-supplied-identity-1"
+	var stdout, stderr bytes.Buffer
+	if code := deliverSessionNudgeWithWorker(target, store, fake, "first message", nudgeDeliveryImmediate, false, key, &stdout, &stderr); code != 0 {
+		t.Fatalf("deliverSessionNudgeWithWorker (first call) = %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	// The durable shadow-bead record (the observability projection behind
+	// beads.NudgesStore) must carry the caller-supplied key as its nudge ID.
+	if _, ok, err := nudgeFrontDoor(store).Find(key); err != nil {
+		t.Fatalf("Find(%q): %v", key, err)
+	} else if !ok {
+		t.Fatalf("durable nudge record for caller-supplied key %q not found; caller identity did not survive to the durable record", key)
+	}
+
+	// The canonical durable authority (the flock'd queue state.json) must also
+	// carry it: exactly one pending item, keyed by the caller-supplied ID.
+	pending, inFlight, dead, err := listQueuedNudgesForTarget(dir, target, time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudgesForTarget: %v", err)
+	}
+	if len(pending) != 1 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead = %d/%d/%d, want 1/0/0", len(pending), len(inFlight), len(dead))
+	}
+	if pending[0].ID != key {
+		t.Fatalf("pending[0].ID = %q, want caller-supplied key %q", pending[0].ID, key)
+	}
+
+	// A second call reusing the SAME caller-supplied key (with a DIFFERENT
+	// message, simulating a retried or re-slung nudge) must be recognized as
+	// the same durable nudge: no second pending item, and the original
+	// durable record is not silently overwritten.
+	if code := deliverSessionNudgeWithWorker(target, store, fake, "second message", nudgeDeliveryImmediate, false, key, &stdout, &stderr); code != 0 {
+		t.Fatalf("deliverSessionNudgeWithWorker (second call, same key) = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	pending, inFlight, dead, err = listQueuedNudgesForTarget(dir, target, time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudgesForTarget (after second call): %v", err)
+	}
+	if len(pending) != 1 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead after duplicate-key call = %d/%d/%d, want 1/0/0 (dedup by caller-supplied identity)", len(pending), len(inFlight), len(dead))
+	}
+	if pending[0].Message != "first message" {
+		t.Fatalf("pending[0].Message after duplicate-key call = %q, want %q (dedup must not silently overwrite the durable record)", pending[0].Message, "first message")
 	}
 }
 
@@ -738,7 +834,7 @@ func TestDeliverSessionNudgeWithWorkerManagedQueueFailureDoesNotWake(t *testing.
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryImmediate, false, &stdout, &stderr)
+	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryImmediate, false, "", &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("deliverSessionNudgeWithWorker = %d, want 1", code)
 	}
@@ -820,7 +916,7 @@ func TestDeliverSessionNudgeWithWorkerManagedWakeFailureRollsBackQueuedNudge(t *
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryImmediate, false, &stdout, &stderr)
+	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryImmediate, false, "", &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("deliverSessionNudgeWithWorker = %d, want 1", code)
 	}
@@ -918,7 +1014,7 @@ func TestDeliverSessionNudgeWithWorkerManagedWaitNudgeWithdrawFailureKeepsQueued
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryImmediate, false, &stdout, &stderr)
+	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryImmediate, false, "", &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("deliverSessionNudgeWithWorker = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1013,7 +1109,7 @@ func TestDeliverSessionNudgeWithWorkerManagedObserveErrorDoesNotResumeFromCaller
 	beforeCalls := len(fake.Calls)
 
 	var stdout, stderr bytes.Buffer
-	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryImmediate, false, &stdout, &stderr)
+	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryImmediate, false, "", &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("deliverSessionNudgeWithWorker = %d, want 1", code)
 	}
@@ -1074,7 +1170,7 @@ func TestDeliverSessionNudgeWithWorkerWaitIdleQueuesUnsupportedProviderAfterResu
 	t.Cleanup(func() { startNudgePoller = prev })
 
 	var stdout, stderr bytes.Buffer
-	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryWaitIdle, false, &stdout, &stderr)
+	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryWaitIdle, false, "", &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("deliverSessionNudgeWithWorker = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1565,7 +1661,7 @@ func TestSendMailNotifyWithWorkerManagedNonRunningQueuesWakeForController(t *tes
 	}
 	beforeCalls := len(fake.Calls)
 
-	if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+	if err := sendMailNotifyWithWorker(target, store, fake, "human", ""); err != nil {
 		t.Fatalf("sendMailNotifyWithWorker: %v", err)
 	}
 	if pokes != 1 {
@@ -1644,7 +1740,7 @@ func TestSendMailNotifyWithWorkerManagedQueueFailureDoesNotWake(t *testing.T) {
 		agent:       config.Agent{Name: "worker", Provider: "claude"},
 	}
 
-	err = sendMailNotifyWithWorker(target, store, fake, "human")
+	err = sendMailNotifyWithWorker(target, store, fake, "human", "")
 	if err == nil {
 		t.Fatal("sendMailNotifyWithWorker: expected queue error")
 	}
@@ -1718,7 +1814,7 @@ func TestSendMailNotifyQueuesIndependentRemindersForEachMail(t *testing.T) {
 	// Two mails arrive back to back; the first reminder is still pending
 	// (unread) when the second arrives.
 	for i := 0; i < 2; i++ {
-		if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+		if err := sendMailNotifyWithWorker(target, store, fake, "human", ""); err != nil {
 			t.Fatalf("sendMailNotifyWithWorker(call %d): %v", i+1, err)
 		}
 	}
@@ -1777,7 +1873,7 @@ func TestSendMailNotifyWithWorkerManagedWakeFailureRollsBackQueuedNudge(t *testi
 		agent:       config.Agent{Name: "worker", Provider: "claude"},
 	}
 
-	err = sendMailNotifyWithWorker(target, store, fake, "human")
+	err = sendMailNotifyWithWorker(target, store, fake, "human", "")
 	if err == nil {
 		t.Fatal("sendMailNotifyWithWorker: expected wake conflict")
 	}
@@ -1871,7 +1967,7 @@ func TestSendMailNotifyWithWorkerManagedWaitNudgeWithdrawFailureKeepsQueuedNudge
 		agent:       config.Agent{Name: "worker", Provider: "claude"},
 	}
 
-	if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+	if err := sendMailNotifyWithWorker(target, store, fake, "human", ""); err != nil {
 		t.Fatalf("sendMailNotifyWithWorker: %v", err)
 	}
 	if withdraws != 1 {
@@ -1963,7 +2059,7 @@ func TestSendMailNotifyWithWorkerManagedWakePokeFailureIsNonFatal(t *testing.T) 
 	}
 	beforeCalls := len(fake.Calls)
 
-	if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+	if err := sendMailNotifyWithWorker(target, store, fake, "human", ""); err != nil {
 		t.Fatalf("sendMailNotifyWithWorker: %v", err)
 	}
 	if pokes != 1 {
@@ -2109,7 +2205,7 @@ func TestSendMailNotifyWithWorkerStartsPollerBySessionIDForAliasedTarget(t *test
 	}
 	t.Cleanup(func() { startNudgePoller = prev })
 
-	if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+	if err := sendMailNotifyWithWorker(target, store, fake, "human", ""); err != nil {
 		t.Fatalf("sendMailNotifyWithWorker: %v", err)
 	}
 	if !called {
@@ -2208,7 +2304,7 @@ func TestSendMailNotifyWithWorkerWaitIdlePreservesMailSource(t *testing.T) {
 		sessionName: info.SessionName,
 	}
 
-	if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+	if err := sendMailNotifyWithWorker(target, store, fake, "human", ""); err != nil {
 		t.Fatalf("sendMailNotifyWithWorker: %v", err)
 	}
 
@@ -2254,7 +2350,7 @@ func TestSendMailNotifyWithWorkerQueuesWhenRuntimeIsGone(t *testing.T) {
 	}
 
 	startCalls := len(fake.Calls)
-	if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+	if err := sendMailNotifyWithWorker(target, store, fake, "human", ""); err != nil {
 		t.Fatalf("sendMailNotifyWithWorker: %v", err)
 	}
 	for _, call := range fake.Calls[startCalls:] {
@@ -2303,7 +2399,7 @@ func TestSendMailNotifyWithWorkerQueuesWhenDirectProviderMisses(t *testing.T) {
 		sessionName: info.SessionName,
 	}
 
-	if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+	if err := sendMailNotifyWithWorker(target, store, fake, "human", ""); err != nil {
 		t.Fatalf("sendMailNotifyWithWorker: %v", err)
 	}
 
@@ -3174,7 +3270,7 @@ func TestDeliverSlingNudgeWaitIdleWrapsInSystemReminder(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	deliverSlingNudge(target, fake, store, dir, &stdout, &stderr)
+	deliverSlingNudge(target, fake, store, dir, "", &stdout, &stderr)
 
 	var nudgeNowCalls int
 	var delivered string
@@ -3225,7 +3321,7 @@ func TestDeliverSlingNudgeQueuesFencedReminderAndStartsPollerForAsleepSession(t 
 	t.Cleanup(func() { startNudgePoller = prev })
 
 	var stdout, stderr bytes.Buffer
-	deliverSlingNudge(target, fake, store, dir, &stdout, &stderr)
+	deliverSlingNudge(target, fake, store, dir, "", &stdout, &stderr)
 
 	pending, inFlight, dead, err := listQueuedNudges(dir, target.agent.QualifiedName(), time.Now())
 	if err != nil {
@@ -4226,7 +4322,7 @@ start_command = "echo"
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := cmdSessionNudge([]string{"sess-worker", "check", "deploy"}, nudgeDeliveryQueue, true, &stdout, &stderr)
+	code := cmdSessionNudge([]string{"sess-worker", "check", "deploy"}, nudgeDeliveryQueue, true, "", &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("cmdSessionNudge = %d, want 0; stderr: %s", code, stderr.String())
 	}

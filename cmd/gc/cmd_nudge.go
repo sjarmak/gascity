@@ -587,8 +587,13 @@ func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdo
 	return 0
 }
 
-func queuedNudgeOptionsFromTarget(target nudgeTarget) queuedNudgeOptions {
+// queuedNudgeOptionsFromTarget builds the queuedNudgeOptions for a target. id
+// is the caller-supplied durable-record identity (see queuedNudgeOptions.ID):
+// empty means "no caller identity supplied", preserving the existing
+// random-ID fallback in newQueuedNudgeWithOptions.
+func queuedNudgeOptionsFromTarget(target nudgeTarget, id string) queuedNudgeOptions {
 	return queuedNudgeOptions{
+		ID:                id,
 		SessionID:         target.sessionID,
 		ContinuationEpoch: target.continuationEpoch,
 	}
@@ -780,7 +785,12 @@ func shouldKeepNudgePollerAlive(target nudgeTarget, missingSince, now time.Time)
 	return now.Sub(missingSince) < defaultNudgePollStartGrace
 }
 
-func deliverSessionNudge(target nudgeTarget, message string, mode nudgeDeliveryMode, jsonOutput bool, stdout, stderr io.Writer) int {
+// deliverSessionNudge delivers (or queues) a nudge for the CLI entry point.
+// idempotencyKey is the caller-supplied durable-record identity (EFFECT-003):
+// when non-empty, the same key reused across calls dedups against the durable
+// nudge record instead of minting a new, unidentifiable one; empty preserves
+// the pre-existing random-ID behavior.
+func deliverSessionNudge(target nudgeTarget, message string, mode nudgeDeliveryMode, jsonOutput bool, idempotencyKey string, stdout, stderr io.Writer) int {
 	store, err := openNudgeBeadStoreErr(target.cityPath)
 	if err != nil || store.Store == nil {
 		fmt.Fprintf(stderr, "gc session nudge: opening the nudge store for %q: %v\n", target.agentKey(), err) //nolint:errcheck
@@ -791,12 +801,15 @@ func deliverSessionNudge(target nudgeTarget, message string, mode nudgeDeliveryM
 		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck
 		return 1
 	}
-	return deliverSessionNudgeWithWorker(target, store.Store, sp, message, mode, jsonOutput, stdout, stderr)
+	return deliverSessionNudgeWithWorker(target, store.Store, sp, message, mode, jsonOutput, idempotencyKey, stdout, stderr)
 }
 
-func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp runtime.Provider, message string, mode nudgeDeliveryMode, jsonOutput bool, stdout, stderr io.Writer) int {
+// deliverSessionNudgeWithWorker is deliverSessionNudge with an injectable
+// store/provider. idempotencyKey carries the caller-supplied durable-record
+// identity (EFFECT-003) into every queuing path below; see deliverSessionNudge.
+func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp runtime.Provider, message string, mode nudgeDeliveryMode, jsonOutput bool, idempotencyKey string, stdout, stderr io.Writer) int {
 	if mode == nudgeDeliveryQueue {
-		return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, "", stdout, stderr)
+		return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, "", idempotencyKey, stdout, stderr)
 	}
 	// Two-store split: the raw store keeps threading the nudge-enqueue currency,
 	// while the session-class observe/handle reads below route through sessStore.
@@ -809,7 +822,7 @@ func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp run
 		return 1
 	}
 	if queueManagedWake {
-		return queueManagedSessionNudgeWake(target, store, message, mode, jsonOutput, stdout, stderr)
+		return queueManagedSessionNudgeWake(target, store, message, mode, jsonOutput, idempotencyKey, stdout, stderr)
 	}
 	// A wait-idle nudge to a RUNNING-but-busy target must not block the caller in
 	// the worker's synchronous WaitForIdle (runtimeHandleWaitIdleTimeout, 30s):
@@ -830,7 +843,7 @@ func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp run
 	// those would needlessly downgrade live delivery to queued. (gco-90ui)
 	if mode == nudgeDeliveryWaitIdle && target.sessionTransport() != "acp" && target.providerName() == "claude" {
 		if obs, obsErr := nudgeObserveTarget(target, sessStore, sp); obsErr == nil && obs.Running && nudgeObservationBusy(obs) {
-			return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, worker.NudgeUndeliveredNoIdleBoundary, stdout, stderr)
+			return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, worker.NudgeUndeliveredNoIdleBoundary, idempotencyKey, stdout, stderr)
 		}
 	}
 	delivery, ok := workerNudgeDeliveryForMode(mode)
@@ -851,7 +864,7 @@ func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp run
 	if err != nil {
 		if errors.Is(err, runtime.ErrSessionNotFound) && target.sessionTransport() == "acp" {
 			if mode == nudgeDeliveryWaitIdle {
-				return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, "", stdout, stderr)
+				return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, "", idempotencyKey, stdout, stderr)
 			}
 			if mode == nudgeDeliveryImmediate {
 				fmt.Fprintf(stderr, "gc session nudge: live ACP delivery failed for %s because this process does not own the ACP connection; retry with --delivery=wait-idle or --delivery=queue so the queued dispatcher can deliver it\n", target.agentKey()) //nolint:errcheck
@@ -862,7 +875,7 @@ func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp run
 		return 1
 	}
 	if mode == nudgeDeliveryWaitIdle && !result.Delivered {
-		return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, result.Undelivered, stdout, stderr)
+		return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, result.Undelivered, idempotencyKey, stdout, stderr)
 	}
 	if jsonOutput {
 		return writeCLIJSONLineOrExit(stdout, stderr, "gc session nudge", sessionNudgeJSON{
@@ -919,8 +932,11 @@ func canRequestManagedNudgeWake(target nudgeTarget, store beads.Store) bool {
 		nudgeCityUsesManagedReconciler(target.cityPath)
 }
 
-func queueManagedSessionNudgeWake(target nudgeTarget, store beads.Store, message string, mode nudgeDeliveryMode, jsonOutput bool, stdout, stderr io.Writer) int {
-	item := newQueuedNudgeWithOptions(target.agentKey(), message, "session", time.Now(), queuedNudgeOptionsFromTarget(target))
+// queueManagedSessionNudgeWake queues a nudge for a managed-reconciler session
+// that must be woken rather than nudged live. idempotencyKey is the
+// caller-supplied durable-record identity (EFFECT-003); see deliverSessionNudge.
+func queueManagedSessionNudgeWake(target nudgeTarget, store beads.Store, message string, mode nudgeDeliveryMode, jsonOutput bool, idempotencyKey string, stdout, stderr io.Writer) int {
+	item := newQueuedNudgeWithOptions(target.agentKey(), message, "session", time.Now(), queuedNudgeOptionsFromTarget(target, idempotencyKey))
 	if err := enqueueManagedNudgeThenWake(target, store, item); err != nil {
 		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck
 		return 1
@@ -1113,15 +1129,16 @@ func nudgeTargetLiveGenerationMatches(target nudgeTarget, obs worker.LiveObserva
 }
 
 func deliverSessionNudgeWithProvider(target nudgeTarget, sp runtime.Provider, mode nudgeDeliveryMode, stdout, stderr io.Writer) int {
-	return deliverSessionNudgeWithWorker(target, nil, sp, "check deploy status", mode, false, stdout, stderr)
+	return deliverSessionNudgeWithWorker(target, nil, sp, "check deploy status", mode, false, "", stdout, stderr)
 }
 
 // queueSessionNudgeWithWorker enqueues a nudge the live leg could not (or must
 // not) deliver. undelivered names why live delivery was skipped so the operator
 // line can say it; it is empty for a caller that queued by request rather than
-// by downgrade.
-func queueSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp runtime.Provider, message string, mode nudgeDeliveryMode, jsonOutput bool, undelivered worker.NudgeUndeliveredReason, stdout, stderr io.Writer) int {
-	if err := enqueueQueuedNudge(target.cityPath, newQueuedNudgeWithOptions(target.agentKey(), message, "session", time.Now(), queuedNudgeOptionsFromTarget(target))); err != nil {
+// by downgrade. idempotencyKey is the caller-supplied durable-record identity
+// (EFFECT-003); see deliverSessionNudge.
+func queueSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp runtime.Provider, message string, mode nudgeDeliveryMode, jsonOutput bool, undelivered worker.NudgeUndeliveredReason, idempotencyKey string, stdout, stderr io.Writer) int {
+	if err := enqueueQueuedNudge(target.cityPath, newQueuedNudgeWithOptions(target.agentKey(), message, "session", time.Now(), queuedNudgeOptionsFromTarget(target, idempotencyKey))); err != nil {
 		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck
 		return 1
 	}
@@ -1175,7 +1192,14 @@ func queuedNudgeDowngradeNote(target nudgeTarget, undelivered worker.NudgeUndeli
 	}
 }
 
-func sendMailNotify(target nudgeTarget, sender string) error {
+// sendMailNotify nudges target that mail has arrived from sender. messageID is
+// the id of the mail message that triggered the notification; it becomes the
+// caller-supplied durable-record identity (EFFECT-003) for any queued nudge
+// this produces (via the "mail:"+messageID key), so a retried or duplicate
+// notification for the same message dedups instead of minting an
+// unidentifiable duplicate. Empty preserves the pre-existing random-ID
+// behavior.
+func sendMailNotify(target nudgeTarget, sender, messageID string) error {
 	store, err := openNudgeBeadStoreErr(target.cityPath)
 	if err != nil {
 		return err
@@ -1187,15 +1211,22 @@ func sendMailNotify(target nudgeTarget, sender string) error {
 	if err != nil {
 		return err
 	}
-	return sendMailNotifyWithWorker(target, store.Store, sp, sender)
+	return sendMailNotifyWithWorker(target, store.Store, sp, sender, messageID)
 }
 
 func sendMailNotifyWithProvider(target nudgeTarget, sp runtime.Provider) error {
-	return sendMailNotifyWithWorker(target, nil, sp, "human")
+	return sendMailNotifyWithWorker(target, nil, sp, "human", "")
 }
 
-func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.Provider, sender string) error {
+// sendMailNotifyWithWorker is sendMailNotify with an injectable store/provider.
+// See sendMailNotify for messageID's role as the caller-supplied durable-record
+// identity.
+func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.Provider, sender, messageID string) error {
 	msg := fmt.Sprintf("You have mail from %s", sender)
+	mailKey := ""
+	if messageID != "" {
+		mailKey = "mail:" + messageID
+	}
 	now := time.Now()
 	// Session-class store for the observe/handle reads and the last-nudge stamp
 	// below; the raw store keeps flowing to canRequestManagedNudgeWake,
@@ -1227,7 +1258,7 @@ func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.
 		}
 	}
 	if !obs.Running && canRequestManagedNudgeWake(target, store) {
-		item := newQueuedNudgeWithOptions(target.agentKey(), msg, "mail", now, queuedNudgeOptionsFromTarget(target))
+		item := newQueuedNudgeWithOptions(target.agentKey(), msg, "mail", now, queuedNudgeOptionsFromTarget(target, mailKey))
 		if err := enqueueManagedNudgeThenWake(target, store, item); err != nil {
 			return err
 		}
@@ -1238,7 +1269,7 @@ func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.
 		}
 		return nil
 	}
-	if err := enqueueQueuedNudge(target.cityPath, newQueuedNudgeWithOptions(target.agentKey(), msg, "mail", now, queuedNudgeOptionsFromTarget(target))); err != nil {
+	if err := enqueueQueuedNudge(target.cityPath, newQueuedNudgeWithOptions(target.agentKey(), msg, "mail", now, queuedNudgeOptionsFromTarget(target, mailKey))); err != nil {
 		return err
 	}
 	if obs.Running {

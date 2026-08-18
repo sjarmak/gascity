@@ -127,7 +127,11 @@ while IFS= read -r blocker; do
         fi
         set_rig_args "$dep_id"
         msg="blocker $blocker closed — your dependent $dep_id may be unblocked"
-        if gc session nudge ${RIG_ARG1:+"$RIG_ARG1" "$RIG_ARG2"} "$assignee" "$msg" >/dev/null 2>&1; then
+        # --idempotency-key threads this script's own (blocker, dependent) dedup
+        # key into the durable nudge record (EFFECT-003): a retried delivery for
+        # the same pair is recognized as the same durable nudge rather than
+        # minting an unaccountable new one.
+        if gc session nudge ${RIG_ARG1:+"$RIG_ARG1" "$RIG_ARG2"} "$assignee" "$msg" --idempotency-key "$key" >/dev/null 2>&1; then
             STATE="$(echo "$STATE" | jq --arg k "$key" --arg now "$NOW" '.[$k] = $now')"
             NUDGED=$((NUDGED + 1))
         fi

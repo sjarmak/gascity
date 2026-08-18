@@ -414,12 +414,21 @@ func githubPRRepairWorkflowVars(bead beads.Bead, result githubmonitor.Result) ma
 // defaultNudgeGitHubPRRepairWorker best-effort notifies an assigned worker that
 // a PR's failures changed. It shells out to `gc session nudge`; failures are
 // ignored because the durable bead update is the source of truth.
+//
+// This fires on every monitor tick that finds an already-open repair bead, so
+// bead.ID alone is not a safe idempotency key: the same bead can legitimately
+// need a fresh nudge when result.FailureKind changes between ticks. Including
+// FailureKind in the key (EFFECT-003) means a repeat tick with unchanged
+// failures dedups against the durable nudge record, while a genuinely new
+// failure kind still gets its own durable nudge instead of being silently
+// dropped by an over-broad key.
 func defaultNudgeGitHubPRRepairWorker(cityPath, assignee string, bead beads.Bead, result githubmonitor.Result) {
 	msg := fmt.Sprintf("GitHub PR %s/%s#%d still needs repair (%s); refreshed failures on %s.",
 		result.Owner, result.Repo, result.Number, result.FailureKind, bead.ID)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "gc", "--city", cityPath, "session", "nudge", assignee, msg)
+	idempotencyKey := "github-pr-repair-nudge:" + bead.ID + ":" + result.FailureKind
+	cmd := exec.CommandContext(ctx, "gc", "--city", cityPath, "session", "nudge", assignee, msg, "--idempotency-key", idempotencyKey)
 	disableProductMetricsForChild(cmd)
 	_ = cmd.Run() //nolint:errcheck // best-effort; the bead update is the durable record
 }
