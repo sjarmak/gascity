@@ -2142,8 +2142,9 @@ func reconcileCities(
 		// Wire API state.
 		var cs *controllerState
 		if err := runPostPrepareStep("opening_controller_state", func() error {
-			cs = newControllerStateWithRoutes(cityCtx, cityRuntime.storageRoutes, cfg, sp, eventProv, cityName, path)
-			return nil
+			var stateErr error
+			cs, stateErr = newControllerStateWithRoutes(cityCtx, cityRuntime.storageRoutes, cfg, sp, eventProv, cityName, path)
+			return stateErr
 		}); err != nil {
 			// The runtime is already built, and it holds this city's storage
 			// binding, its trace file and its workspace services. Abandoning it
