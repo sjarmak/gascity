@@ -3520,14 +3520,7 @@ func ensureManagedDoltPublishedForRuntime(
 		// Adopt path: the managed Dolt is already live (e.g. it survived a
 		// supervisor restart). Reparent and verify the exact owned process tree
 		// before publishing the endpoint to any controller work.
-		if placementFn != nil {
-			if err := placementFn(cityPath, port); err != nil {
-				fmt.Fprintf(stderr, "%s: managed dolt placement preflight: %v\n", logPrefix, err) //nolint:errcheck
-				return fmt.Errorf("managed dolt placement preflight: %w", err)
-			}
-		}
-		exportSupervisorAmbientDoltPortEnv(port)
-		return nil
+		return publishManagedDoltPort(cityPath, port, placementFn, stderr, logPrefix)
 	}
 	if err := healthFn(cityPath); err != nil {
 		// Nothing to re-resolve: the port lookup below is expensive (ownership
@@ -3541,18 +3534,32 @@ func ensureManagedDoltPublishedForRuntime(
 	// re-resolve so the fresh port lands in the ambient env on this tick
 	// rather than the next one.
 	if port := portFn(cityPath); port != "" {
-		if placementFn != nil {
-			if err := placementFn(cityPath, port); err != nil {
-				fmt.Fprintf(stderr, "%s: managed dolt placement preflight: %v\n", logPrefix, err) //nolint:errcheck
-				return fmt.Errorf("managed dolt placement preflight: %w", err)
-			}
-		}
-		exportSupervisorAmbientDoltPortEnv(port)
-		return nil
+		return publishManagedDoltPort(cityPath, port, placementFn, stderr, logPrefix)
 	}
 	err = fmt.Errorf("managed dolt health succeeded but no live port resolved")
 	fmt.Fprintf(stderr, "%s: managed dolt publication preflight: %v\n", logPrefix, err) //nolint:errcheck
 	return err
+}
+
+// publishManagedDoltPort places the already-live managed Dolt (if placementFn
+// is installed) and exports its port to the ambient environment. Shared by
+// both call sites in ensureManagedDoltPublishedForRuntime: the fast path
+// where portFn already resolved a port, and the path after a health preflight
+// just started or recovered the server.
+func publishManagedDoltPort(
+	cityPath, port string,
+	placementFn func(string, string) error,
+	stderr io.Writer,
+	logPrefix string,
+) error {
+	if placementFn != nil {
+		if err := placementFn(cityPath, port); err != nil {
+			fmt.Fprintf(stderr, "%s: managed dolt placement preflight: %v\n", logPrefix, err) //nolint:errcheck
+			return fmt.Errorf("managed dolt placement preflight: %w", err)
+		}
+	}
+	exportSupervisorAmbientDoltPortEnv(port)
+	return nil
 }
 
 // syncBeadsAndUpdateIndex runs syncSessionBeads.

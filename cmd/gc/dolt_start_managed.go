@@ -451,16 +451,16 @@ func startManagedDoltSQLServer(cityPath, configFile, logFilePath string, logFile
 	cmd.SysProcAttr = managedDoltSQLServerSysProcAttr()
 	cmd.Env = doltServerEnv(cityPath, os.Environ())
 	// Attempt to hand the server a lower oom_score_adj across the fork, then
-	// put our own back. The watchdog path can simply keep the lowered value because it is a
-	// process dedicated to this one server; the caller here is a
-	// general-purpose gc invocation whose badness must not be permanently
+	// put our own back. The watchdog path can simply keep the lowered value
+	// because it is a process dedicated to this one server; the caller here is
+	// a general-purpose gc invocation whose badness must not be permanently
 	// rewritten as a side effect of starting dolt. Restoring immediately after
 	// Start keeps the window to the fork itself — a concurrent fork elsewhere
 	// in this process during that window would also inherit the lowered value,
 	// which is harmless (it only makes a process less attractive to the OOM
-	// killer, never more).
-	// Held across the fork so a concurrent spawn in this process cannot observe
-	// or restore the lowered value mid-sequence.
+	// killer, never more). The mutex is held across that whole window so a
+	// concurrent spawn in this process cannot observe or restore the lowered
+	// value mid-sequence.
 	managedDoltOOMScoreAdjMu.Lock()
 	previousOOMScoreAdj, loweredOOMScoreAdj, err := applyManagedDoltOOMScoreAdj()
 	switch {
