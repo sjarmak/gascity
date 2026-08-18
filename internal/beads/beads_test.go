@@ -34,6 +34,25 @@ func TestIsContainerType(t *testing.T) {
 	}
 }
 
+func TestIsEpicOrContainerType(t *testing.T) {
+	tests := []struct {
+		typ  string
+		want bool
+	}{
+		{"epic", true},
+		{"convoy", true},
+		{"task", false},
+		{"message", false},
+		{"", false},
+		{"EPIC", false}, // case-sensitive
+	}
+	for _, tt := range tests {
+		if got := IsEpicOrContainerType(tt.typ); got != tt.want {
+			t.Errorf("IsEpicOrContainerType(%q) = %v, want %v", tt.typ, got, tt.want)
+		}
+	}
+}
+
 func TestIsMoleculeType(t *testing.T) {
 	tests := []struct {
 		typ  string

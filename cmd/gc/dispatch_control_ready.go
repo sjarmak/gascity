@@ -13,6 +13,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/dispatchexclusion"
 	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
@@ -45,7 +46,11 @@ import (
 const controlReadyQueryMarkerPrefix = "BD_EXPORT_AUTO=false GC_CONTROL_TARGET="
 
 // controlReadyExcludeType mirrors the shell script's --exclude-type=epic.
-const controlReadyExcludeType = "epic"
+// Sourced from beadmeta.EpicType so the literal has one definition shared
+// with internal/config/workquery.go's generated shell/jq strings and
+// internal/dispatchexclusion's routed-tier predicate; the value is
+// unchanged ("epic").
+const controlReadyExcludeType = beadmeta.EpicType
 
 // controlReadyFallbackLimit bounds the single batched bd ready call issued
 // when the cache can't answer. It must be generous enough that per-candidate/
@@ -184,13 +189,18 @@ func controlReadyRoutes(parsed parsedControlReadyQuery) []string {
 	return routes
 }
 
-// filterReadyByAssignee mirrors `bd ready --assignee=$cand --exclude-type=epic --limit=N`.
+// filterReadyByAssignee mirrors `bd ready --assignee=$cand --limit=N`, minus
+// mail (dispatchexclusion.Excluded at TierAssigned). Note this tier does NOT
+// exclude epic/container-typed beads: work already assigned to this agent is
+// owned work regardless of type (ADR-0019, dr-89vak.4) -- unlike the old
+// literal --exclude-type=epic shell mirror, an assigned epic wisp is
+// surfaced here, not dropped (gc-udx).
 // ready is expected to already be in canonical ready order (CachedReady/
 // SortBeadsReadyOrder), matching bd's own default (no --sort) ready order.
 func filterReadyByAssignee(ready []beads.Bead, assignee string, limit int) []beads.Bead {
 	var out []beads.Bead
 	for _, b := range ready {
-		if b.Assignee != assignee || b.Type == controlReadyExcludeType {
+		if b.Assignee != assignee || dispatchexclusion.Excluded(b, dispatchexclusion.TierAssigned) {
 			continue
 		}
 		out = append(out, b)
@@ -205,11 +215,13 @@ func filterReadyByAssignee(ready []beads.Bead, assignee string, limit int) []bea
 // This is a route-scoped, unassigned tier (Tier 3 pool-demand/control-dispatcher
 // routing), so held beads must be excluded (ga-5736js): filterReadyByAssignee
 // (Tier 1/2, assignee-scoped) stays hold-transparent by design and must not
-// gain this filter.
+// gain this filter. Unassigned epic/container-typed beads are excluded here
+// (dispatchexclusion.Excluded at TierRouted): they group child beads rather
+// than being directly actionable pool work.
 func filterReadyByRoute(ready []beads.Bead, metadataKey, route string) []beads.Bead {
 	var matched []beads.Bead
 	for _, b := range ready {
-		if b.Assignee != "" || b.Type == controlReadyExcludeType {
+		if b.Assignee != "" || dispatchexclusion.Excluded(b, dispatchexclusion.TierRouted) {
 			continue
 		}
 		if b.Metadata[metadataKey] != route {

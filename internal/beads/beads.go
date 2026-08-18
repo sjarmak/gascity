@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/beadmeta"
 )
 
 // ErrNotFound is returned when a bead ID does not exist in the store.
@@ -398,6 +400,15 @@ var containerTypes = map[string]bool{
 // that should be expanded during dispatch.
 func IsContainerType(t string) bool {
 	return containerTypes[t]
+}
+
+// IsEpicOrContainerType reports whether t is the epic type or a container
+// type (see IsContainerType). This is the single spelling for the "epic or
+// container" arm of the routed-tier dispatch exclusion predicate
+// (internal/dispatchexclusion), matching the pre-existing check in
+// internal/sling/sling_core.go.
+func IsEpicOrContainerType(t string) bool {
+	return t == beadmeta.EpicType || IsContainerType(t)
 }
 
 // moleculeTypes enumerates bead types that represent attached or

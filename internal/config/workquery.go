@@ -200,7 +200,7 @@ type PoolDemandServeRules struct {
 func PoolDemandServeRulesForQuery() PoolDemandServeRules {
 	return PoolDemandServeRules{
 		RequireUnassigned: true,
-		ExcludeTypes:      []string{"epic"},
+		ExcludeTypes:      []string{beadmeta.EpicType},
 		ExcludeLabels:     append([]string(nil), beadmeta.DispatchHoldLabels...),
 	}
 }
@@ -257,7 +257,7 @@ func bdQueryEphemeralStatusQuietShell(status string) string {
 
 func legacyEphemeralReadyFilterJQ(selector string, limit int, excludeHoldLabels bool) string {
 	body := selector +
-		` | select(((.issue_type // .type // "") != "epic"))` +
+		` | select(((.issue_type // .type // "") != "` + beadmeta.EpicType + `"))` +
 		` | select(([ (.dependencies // [])[]` +
 		` | select((.type // .dep_type // "") as $t | ($t == "blocks" or $t == "waits-for" or $t == "conditional-blocks"))` +
 		` | select((.status // .depends_on_status // "") != "closed") ] | length) == 0)`

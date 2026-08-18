@@ -1506,7 +1506,7 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 			return DoSling(singleOpts, deps, querier)
 		}
 	}
-	if b.Type == "epic" || beads.IsContainerType(b.Type) {
+	if beads.IsEpicOrContainerType(b.Type) {
 		if shouldValidateExistingBead(opts) {
 			if err := validateExistingBeadInQuerier(opts.BeadOrFormula, deps.StoreRef, containerQuerier); err != nil {
 				return SlingResult{Target: a.QualifiedName()}, err
@@ -1771,7 +1771,7 @@ func selectedStoreContainer(opts SlingOpts, deps SlingDeps) (beads.Bead, bool) {
 	if err != nil {
 		return beads.Bead{}, false
 	}
-	return b, b.Type == "epic" || beads.IsContainerType(b.Type)
+	return b, beads.IsEpicOrContainerType(b.Type)
 }
 
 // reopenForReassign makes a bead claimable by a target pool before routing:
