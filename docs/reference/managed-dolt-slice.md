@@ -4,6 +4,11 @@
 processes are placed in. Unlike [`GC_AGENT_SLICE`](/reference/tmux-agent-slice),
 which is opt-in, this placement is **on by default** and fail-closed.
 
+This entire page applies to **Linux only** — the mechanism is a systemd user
+manager plus cgroup v2. On other hosts (e.g. macOS), gc spawns and adopts the
+managed Dolt server unwrapped, with no placement and no fail-closed
+enforcement, exactly as it did before this feature existed.
+
 ## Why placement is default-on
 
 gc auto-starts the managed server from whichever process first needs it — the

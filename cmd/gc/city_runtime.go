@@ -389,7 +389,12 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 	}
 	managedDoltPlacement := p.ManagedDoltPlacement
 	_, managedDoltSliceExplicit := os.LookupEnv(managedDoltSliceEnv)
-	if managedDoltPlacement == nil && (!managedDoltTestModeEnabled() || managedDoltSliceExplicit) {
+	if managedDoltPlacement == nil && supervisorRuntimeGOOS == "linux" && (!managedDoltTestModeEnabled() || managedDoltSliceExplicit) {
+		// adoptManagedDoltPlacement's non-Linux build always fails closed (no
+		// systemd user manager to reparent into); leaving placement nil here
+		// lets publishManagedDoltPort's existing nil-placementFn skip take over,
+		// so non-Linux hosts publish the ambient port unplaced instead of
+		// blocking city startup on the tick barrier below.
 		managedDoltPlacement = adoptManagedDoltPlacement
 	}
 

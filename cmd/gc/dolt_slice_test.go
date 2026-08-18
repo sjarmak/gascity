@@ -179,6 +179,26 @@ func TestWrapManagedDoltArgvFailsClosedWhenPlacementCannotBePrepared(t *testing.
 	}
 }
 
+func TestWrapManagedDoltArgvSkipsPlacementOnNonLinux(t *testing.T) {
+	oldGOOS := supervisorRuntimeGOOS
+	supervisorRuntimeGOOS = "darwin"
+	t.Cleanup(func() { supervisorRuntimeGOOS = oldGOOS })
+
+	// Even an explicit setting can't be honored: the adopt side has no
+	// non-Linux implementation to keep it consistent with, so the top-level
+	// entry point skips placement outright rather than half-enforcing it.
+	t.Setenv(managedDoltSliceEnv, "required.slice")
+
+	argv := []string{"dolt", "sql-server", "--config", "x"}
+	got, err := wrapManagedDoltArgv(argv)
+	if err != nil {
+		t.Fatalf("wrapManagedDoltArgv error = %v, want nil on non-Linux", err)
+	}
+	if !reflect.DeepEqual(got, argv) {
+		t.Fatalf("wrapManagedDoltArgv = %q, want unwrapped %q", got, argv)
+	}
+}
+
 func TestWrapManagedDoltArgvRejectsExplicitEmptySlice(t *testing.T) {
 	got, err := wrapManagedDoltArgvFor([]string{"dolt", "sql-server"}, "", true)
 	if err == nil {

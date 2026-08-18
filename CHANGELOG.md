@@ -211,18 +211,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   off for the life of the process. Update any log-scraping that matched the old
   string.
 
-- **Managed Dolt servers are now placed in their own systemd user slice.**
-  Previously the managed `dolt sql-server` inherited the cgroup of whichever
-  process happened to trigger auto-start, so resource limits applied to a
-  shared, long-lived bead store by accident. gc now spawns it into
-  `gcdolt.slice` by default via a transient systemd scope, and the scope
+- **Managed Dolt servers are now placed in their own systemd user slice (Linux
+  only).** Previously the managed `dolt sql-server` inherited the cgroup of
+  whichever process happened to trigger auto-start, so resource limits applied
+  to a shared, long-lived bead store by accident. On Linux, gc now spawns it
+  into `gcdolt.slice` by default via a transient systemd scope, and the scope
   watchdog clears the `oom_score_adj` the server inherits from systemd's user
-  manager. On hosts without `systemd-run` or a reachable user bus, gc warns once
-  and spawns unwrapped exactly as before, so this cannot prevent the server from
-  starting. Set `GC_DOLT_SLICE=""` to disable placement, or point it at a
+  manager. This placement is fail-closed: if `systemd-run` or the user bus
+  isn't reachable, gc refuses to spawn or adopt the server rather than run it
+  unbounded. Set `GC_DOLT_SLICE=""` to disable placement, or point it at a
   different slice. Note that systemd nests `a-b.slice` under `a.slice`: a dolt
   slice named as a child of your agent slice stays subject to that cgroup's
-  limits and defeats the purpose. See `docs/reference/managed-dolt-slice.md`.
+  limits and defeats the purpose. Non-Linux hosts (e.g. macOS) have no
+  equivalent mechanism yet; gc spawns and adopts the managed server unwrapped
+  there, exactly as before this change. See
+  `docs/reference/managed-dolt-slice.md`.
 
 ### Fixed
 

@@ -90,6 +90,10 @@ descendant process across fork.
 - Placing any other `gc`-managed process. The tmux server has a similar latent
   inherited-cgroup problem, but one instance does not justify generalizing the
   mechanism further than the shared helper already does.
+- Non-Linux placement. The mechanism is systemd user-manager + cgroup v2,
+  which only exists on Linux. On other hosts (e.g. macOS) gc spawns and adopts
+  the managed server unwrapped, exactly as it did before this design — no
+  fail-closed enforcement, because there is nothing to enforce against.
 
 ## Proposed Design
 

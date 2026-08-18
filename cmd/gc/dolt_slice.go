@@ -153,6 +153,13 @@ func validateManagedDoltSliceName(slice string) error {
 // own PID, and the start-identity snapshot, termination guards and reaping all
 // continue to address the right process.
 func wrapManagedDoltArgv(argv []string) ([]string, error) {
+	if supervisorRuntimeGOOS != "linux" {
+		// The slice/scope/cgroup mechanism this package builds on is Linux-only
+		// (systemd user manager + cgroup v2). Non-Linux hosts get the same
+		// unwrapped spawn they had before this placement feature existed; see
+		// the design doc's Non-goals.
+		return argv, nil
+	}
 	slice := managedDoltSlice()
 	_, explicitlyConfigured := os.LookupEnv(managedDoltSliceEnv)
 	return wrapManagedDoltArgvFor(argv, slice, explicitlyConfigured)

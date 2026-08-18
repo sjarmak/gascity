@@ -1519,6 +1519,65 @@ func TestNewCityRuntimePreflightsManagedDoltPublicationBeforeStartupStoreWork(t 
 	}
 }
 
+func TestNewCityRuntimeGatesDefaultManagedDoltPlacementOnLinux(t *testing.T) {
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "bd")
+	// managedDoltTestModeEnabled() is always true in a test binary, so the
+	// default-wiring branch also requires an explicit GC_DOLT_SLICE to engage
+	// on Linux; see the comment on the wiring itself.
+	t.Setenv(managedDoltSliceEnv, "gcdolt-test.slice")
+	stubManagedDoltStoreOpeners(t)
+
+	newRuntimeWithPlacement := func(t *testing.T) *CityRuntime {
+		t.Helper()
+		cityPath := t.TempDir()
+		cleanupManagedDoltTestCity(t, cityPath)
+		sp := runtime.NewFake()
+		cr, err := newCityRuntime(CityRuntimeParams{
+			CityPath:          cityPath,
+			CityName:          "test-city",
+			Cfg:               &config.City{},
+			SP:                sp,
+			ManagedDoltHealth: func(string) error { return nil },
+			ManagedDoltOwned:  func(string) (bool, error) { return true, nil },
+			ManagedDoltPort:   func(string) string { return "" },
+			BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+				return DesiredStateResult{State: map[string]TemplateParams{}}
+			},
+			Dops:   newDrainOps(sp),
+			Rec:    events.Discard,
+			Stdout: io.Discard,
+			Stderr: io.Discard,
+		})
+		if err != nil {
+			t.Fatalf("building the city runtime: %v", err)
+		}
+		return cr
+	}
+
+	t.Run("linux wires the real adopter", func(t *testing.T) {
+		oldGOOS := supervisorRuntimeGOOS
+		supervisorRuntimeGOOS = "linux"
+		t.Cleanup(func() { supervisorRuntimeGOOS = oldGOOS })
+
+		cr := newRuntimeWithPlacement(t)
+		if cr.managedDoltPlacement == nil {
+			t.Fatal("managedDoltPlacement = nil on linux, want the default adopter wired")
+		}
+	})
+
+	t.Run("non-linux leaves placement nil", func(t *testing.T) {
+		oldGOOS := supervisorRuntimeGOOS
+		supervisorRuntimeGOOS = "darwin"
+		t.Cleanup(func() { supervisorRuntimeGOOS = oldGOOS })
+
+		cr := newRuntimeWithPlacement(t)
+		if cr.managedDoltPlacement != nil {
+			t.Fatal("managedDoltPlacement != nil on darwin, want nil (no non-Linux adopter exists)")
+		}
+	})
+}
+
 func TestNewCityRuntimePreflightUsesResolvableProviderStateByDefault(t *testing.T) {
 	t.Setenv("GC_BEADS", "bd")
 	stubManagedDoltStoreOpeners(t)
