@@ -1073,6 +1073,84 @@ func TestDoSlingNudgeNoSession(t *testing.T) {
 	}
 }
 
+// TestDoSlingNudgeSurvivesToDurableRecordAndDedups is the sling-path
+// counterpart to TestDeliverSessionNudgeWithWorkerCallerIdentitySurvivesToDurableRecord
+// (cmd_nudge_test.go), covering EFFECT-003 for cmd_sling.go's nudge path:
+// deliverSlingNudge derives the durable nudge ID as
+// "sling:"+beadID+":"+agent.QualifiedName(), and a retried sling for the same
+// bead must dedup against that durable record instead of enqueueing an
+// unidentified duplicate. Going through the full doSling entry point (rather
+// than calling doSlingNudge directly) also exercises the previously-untested
+// wiring from internal/sling's SlingResult.BeadID into doSlingNudge's beadID
+// parameter.
+func TestDoSlingNudgeSurvivesToDurableRecordAndDedups(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	// Don't start the session — mirrors TestDoSlingNudgeNoSession so the
+	// nudge deterministically takes the queue path instead of racing live
+	// delivery.
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	deps.CityPath = t.TempDir() // isolated path so poke doesn't hit a real socket
+	opts := testOpts(a, "BL-1")
+	opts.Nudge = true
+
+	// querier=nil makes CheckBeadStateWithOptions return a zero result on
+	// every call (idempotency pre-check never short-circuits), so a repeat
+	// doSling call below re-exercises the same nudge routing deterministically
+	// instead of skipping it on a stale idempotency verdict.
+	code := doSling(opts, deps, nil, stdout, stderr)
+	if code != 0 {
+		t.Fatalf("doSling (first call) returned %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	const wantKey = "sling:BL-1:mayor"
+
+	// The durable shadow-bead record must carry the sling key. This also
+	// confirms doSling threads result.BeadID ("BL-1", from opts.BeadOrFormula
+	// via internal/sling's finalize) into doSlingNudge -- not asserted by any
+	// existing test.
+	if _, ok, err := nudgeFrontDoor(beads.NudgesStore{Store: deps.Store}).Find(wantKey); err != nil {
+		t.Fatalf("Find(%q): %v", wantKey, err)
+	} else if !ok {
+		t.Fatalf("durable nudge record for sling key %q not found; bead ID did not survive to the durable record", wantKey)
+	}
+
+	pending, inFlight, dead, err := listQueuedNudges(deps.CityPath, "mayor", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 1 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead = %d/%d/%d, want 1/0/0", len(pending), len(inFlight), len(dead))
+	}
+	if pending[0].ID != wantKey {
+		t.Fatalf("pending[0].ID = %q, want %q", pending[0].ID, wantKey)
+	}
+	firstMessage := pending[0].Message
+
+	// A retried sling for the SAME bead (e.g. a re-slung or retried dispatch)
+	// must dedup against the durable record instead of enqueueing a second,
+	// unidentified nudge or silently overwriting the first.
+	stdout.Reset()
+	stderr.Reset()
+	code = doSling(opts, deps, nil, stdout, stderr)
+	if code != 0 {
+		t.Fatalf("doSling (second call, same bead) returned %d, want 0; stderr: %s", code, stderr.String())
+	}
+	pending, inFlight, dead, err = listQueuedNudges(deps.CityPath, "mayor", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges (after second call): %v", err)
+	}
+	if len(pending) != 1 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead after duplicate-bead call = %d/%d/%d, want 1/0/0 (dedup by sling key)", len(pending), len(inFlight), len(dead))
+	}
+	if pending[0].Message != firstMessage {
+		t.Fatalf("pending[0].Message after duplicate-bead call = %q, want %q (dedup must not silently overwrite the durable record)", pending[0].Message, firstMessage)
+	}
+}
+
 func TestDoSlingNudgeSuspended(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()

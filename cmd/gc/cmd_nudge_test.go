@@ -1828,6 +1828,92 @@ func TestSendMailNotifyQueuesIndependentRemindersForEachMail(t *testing.T) {
 	}
 }
 
+// TestSendMailNotifyWithWorkerMessageIDSurvivesToDurableRecordAndDedups is the
+// mail-path counterpart to
+// TestDeliverSessionNudgeWithWorkerCallerIdentitySurvivesToDurableRecord,
+// covering EFFECT-003 for cmd_mail.go's notify path: sendMailNotifyWithWorker
+// derives the durable nudge ID as "mail:"+messageID (see the mailKey
+// construction just above this test), and a retried notify for the same
+// message must dedup against that durable record instead of enqueueing an
+// unidentified duplicate. TestSendMailNotifyQueuesIndependentRemindersForEachMail
+// above covers the contrasting case: an empty messageID mints a fresh random
+// ID every call, so repeats never dedup.
+func TestSendMailNotifyWithWorkerMessageIDSurvivesToDurableRecordAndDedups(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	fake := runtime.NewFake()
+	mgr := newSessionManagerWithConfig(dir, store, fake, nil)
+
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "mayor", Title: "Mayor", Command: "claude", WorkDir: dir, Provider: "claude", Env: nil, Resume: session.ProviderResume{}, Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Recipient is not live, so notify falls back to a queued reminder.
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	// City is not managed, so the wake path is skipped and notify takes the
+	// plain queued-reminder fallback that threads mailKey into
+	// queuedNudgeOptionsFromTarget.
+	prevManaged := nudgeCityUsesManagedReconciler
+	nudgeCityUsesManagedReconciler = func(string) bool { return false }
+	t.Cleanup(func() { nudgeCityUsesManagedReconciler = prevManaged })
+
+	target := nudgeTarget{
+		cityPath:    dir,
+		cfg:         &config.City{Agents: []config.Agent{{Name: "mayor", Provider: "claude"}}},
+		sessionID:   info.ID,
+		sessionName: info.SessionName,
+		identity:    "mayor",
+		agent:       config.Agent{Name: "mayor", Provider: "claude"},
+	}
+
+	const messageID = "msg-caller-supplied-1"
+	const wantKey = "mail:" + messageID
+	if err := sendMailNotifyWithWorker(target, store, fake, "human", messageID); err != nil {
+		t.Fatalf("sendMailNotifyWithWorker (first call): %v", err)
+	}
+
+	// The durable shadow-bead record must carry the derived mail key.
+	if _, ok, err := nudgeFrontDoor(store).Find(wantKey); err != nil {
+		t.Fatalf("Find(%q): %v", wantKey, err)
+	} else if !ok {
+		t.Fatalf("durable nudge record for mail key %q not found; messageID did not survive to the durable record", wantKey)
+	}
+
+	// The canonical durable authority (the flock'd queue state.json) must also
+	// carry it: exactly one pending item, keyed by "mail:"+messageID.
+	pending, inFlight, dead, err := listQueuedNudgesForTarget(dir, target, time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudgesForTarget: %v", err)
+	}
+	if len(pending) != 1 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead = %d/%d/%d, want 1/0/0", len(pending), len(inFlight), len(dead))
+	}
+	if pending[0].ID != wantKey {
+		t.Fatalf("pending[0].ID = %q, want %q", pending[0].ID, wantKey)
+	}
+
+	// A retried notify for the SAME message (different sender, simulating a
+	// re-delivered mail event) must dedup against the durable record instead
+	// of enqueueing a second, unidentified reminder or overwriting the first.
+	if err := sendMailNotifyWithWorker(target, store, fake, "human-retry", messageID); err != nil {
+		t.Fatalf("sendMailNotifyWithWorker (second call, same messageID): %v", err)
+	}
+	pending, inFlight, dead, err = listQueuedNudgesForTarget(dir, target, time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudgesForTarget (after second call): %v", err)
+	}
+	if len(pending) != 1 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead after duplicate-messageID call = %d/%d/%d, want 1/0/0 (dedup by mail messageID)", len(pending), len(inFlight), len(dead))
+	}
+	if pending[0].Message != "You have mail from human" {
+		t.Fatalf("pending[0].Message after duplicate-messageID call = %q, want %q (dedup must not silently overwrite the durable record)", pending[0].Message, "You have mail from human")
+	}
+}
+
 func TestSendMailNotifyWithWorkerManagedWakeFailureRollsBackQueuedNudge(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	dir := t.TempDir()

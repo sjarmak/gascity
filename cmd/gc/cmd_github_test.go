@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
@@ -417,5 +418,99 @@ func TestGitHubPRBackfillCommandPropagatesRepairStoreError(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "store unavailable") {
 		t.Fatalf("stderr = %q, want store error", stderr.String())
+	}
+}
+
+// TestDefaultNudgeGitHubPRRepairWorkerSurvivesToDurableRecordAndDedups is the
+// github-pr-repair-nudge counterpart to
+// TestDeliverSessionNudgeWithWorkerCallerIdentitySurvivesToDurableRecord
+// (cmd_nudge_test.go), covering EFFECT-003 for defaultNudgeGitHubPRRepairWorker:
+// it shells out to a real `gc session nudge ... --idempotency-key
+// github-pr-repair-nudge:<bead.ID>:<FailureKind>` subprocess, and this is the
+// only test that proves that key survives through the real CLI dispatch
+// (cmdSessionNudge, deliberately NOT unit-tested on its own -- see the note
+// in cmd_session_test.go) into the durable nudge record, and that a repeat
+// tick with an unchanged FailureKind dedups against it per the EFFECT-003
+// doc comment on defaultNudgeGitHubPRRepairWorker.
+//
+// The subprocess is the current test binary re-executed as "gc" (the same
+// installProductMetricsDirectChildSpyCommand PATH-symlink trick
+// TestProductMetricsDirectChildEnvGitHubNudge uses), but WITHOUT setting the
+// env-spy path: with that var unset, TestMain's isTestscriptCommandInvocation
+// check dispatches os.Args[0]=="gc" straight into the real CLI
+// (mainExitCode), exactly as testscript.Main does for txtar fixtures.
+func TestDefaultNudgeGitHubPRRepairWorkerSurvivesToDurableRecordAndDedups(t *testing.T) {
+	installProductMetricsDirectChildSpyCommand(t, "gc")
+	t.Setenv("GC_SESSION", "fake")
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_BOOTSTRAP", "skip")
+
+	cityPath := t.TempDir()
+	writeCityToml(t, cityPath, "[workspace]\nname = \"demo\"\n\n[providers.claude]\nbase = \"builtin:claude\"\n\n[[agent]]\nname = \"worker\"\nprovider = \"claude\"\n\n[[named_session]]\ntemplate = \"worker\"\nmode = \"on_demand\"\n")
+
+	bead := beads.Bead{ID: "gc-test-1"}
+	result := githubmonitor.Result{Owner: "owner", Repo: "repo", Number: 1, FailureKind: "checks_failed"}
+
+	defaultNudgeGitHubPRRepairWorker(cityPath, "worker", bead, result)
+
+	wantKey := "github-pr-repair-nudge:" + bead.ID + ":" + result.FailureKind
+
+	store, err := openNudgeBeadStoreErr(cityPath)
+	if err != nil {
+		t.Fatalf("openNudgeBeadStoreErr: %v", err)
+	}
+	if _, ok, err := nudgeFrontDoor(store).Find(wantKey); err != nil {
+		t.Fatalf("Find(%q): %v", wantKey, err)
+	} else if !ok {
+		t.Fatalf("durable nudge record for github-pr-repair key %q not found; the subprocess's --idempotency-key did not survive to the durable record", wantKey)
+	}
+
+	pending, inFlight, dead, err := listQueuedNudges(cityPath, "worker", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 1 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead = %d/%d/%d, want 1/0/0; stdout/stderr from the subprocess are not captured here, see cityPath %s for on-disk state", len(pending), len(inFlight), len(dead), cityPath)
+	}
+	if pending[0].ID != wantKey {
+		t.Fatalf("pending[0].ID = %q, want %q", pending[0].ID, wantKey)
+	}
+	firstMessage := pending[0].Message
+
+	// A repeat tick that finds the same repair bead with an UNCHANGED
+	// FailureKind (the common case: the monitor polls every tick) must dedup
+	// against the durable record instead of enqueueing a second, unidentified
+	// nudge.
+	defaultNudgeGitHubPRRepairWorker(cityPath, "worker", bead, result)
+	pending, inFlight, dead, err = listQueuedNudges(cityPath, "worker", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges (after repeat tick, same FailureKind): %v", err)
+	}
+	if len(pending) != 1 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead after repeat tick = %d/%d/%d, want 1/0/0 (dedup by github-pr-repair-nudge key)", len(pending), len(inFlight), len(dead))
+	}
+	if pending[0].Message != firstMessage {
+		t.Fatalf("pending[0].Message after repeat tick = %q, want %q (dedup must not silently overwrite the durable record)", pending[0].Message, firstMessage)
+	}
+
+	// A tick where FailureKind CHANGES (per the EFFECT-003 doc comment on
+	// defaultNudgeGitHubPRRepairWorker) must get its own durable nudge instead
+	// of being dropped by an over-broad key.
+	changedResult := result
+	changedResult.FailureKind = "merge_conflict"
+	defaultNudgeGitHubPRRepairWorker(cityPath, "worker", bead, changedResult)
+	pending, inFlight, dead, err = listQueuedNudges(cityPath, "worker", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges (after FailureKind change): %v", err)
+	}
+	if len(pending) != 2 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead after FailureKind change = %d/%d/%d, want 2/0/0 (a new FailureKind must not dedup against the old one)", len(pending), len(inFlight), len(dead))
+	}
+	changedKey := "github-pr-repair-nudge:" + bead.ID + ":" + changedResult.FailureKind
+	if _, ok, err := nudgeFrontDoor(store).Find(changedKey); err != nil {
+		t.Fatalf("Find(%q): %v", changedKey, err)
+	} else if !ok {
+		t.Fatalf("durable nudge record for changed-FailureKind key %q not found", changedKey)
 	}
 }
