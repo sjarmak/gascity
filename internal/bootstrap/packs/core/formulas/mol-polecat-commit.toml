@@ -13,15 +13,21 @@ unnecessary.
 3. Commit to base_branch, push, close bead, exit
 4. You are GONE — no refinery step needed
 
-**No feature branch.** Work is committed directly to base_branch.
-Push conflicts are handled by fetch + rebase + retry (up to 3 times).
+**No feature branch.** Work is committed directly to base_branch. The push
+itself goes through `gc git-push-fenced`, which reads the remote ref back
+before AND after pushing so a dropped connection after a successful push is
+never mistaken for a rejection. Its exit code distinguishes three states, not
+two: 0 = confirmed landed, 1 = definitively did not land (fetch + rebase +
+retry, up to 3 times), 2 = could not be determined — stop immediately, never
+retry blind on a 2.
 
 ## Failure Modes
 
 | Situation | Action |
 |-----------|--------|
 | Tests fail | Fix them. Do not proceed with failures. |
-| Push conflict (3 retries exhausted) | Mail Witness, mark yourself stuck |
+| Push conflict (3 retries exhausted, rc=1 each time) | Mail Witness, mark yourself stuck |
+| Push state unknown (`gc git-push-fenced` rc=2) | STOP immediately — mail Witness, do not rebase or retry |
 | Blocked on external | Mail Witness, mark yourself stuck |
 | Context filling | `gc runtime request-restart` (blocks until controller kills you) |
 | Unsure what to do | Mail Witness, don't guess |"""
@@ -111,22 +117,46 @@ If ANY output (untracked files, uncommitted changes):
 git add -A && git commit -m "chore: capture remaining work ($WORK_BEAD_ID)"
 ```
 
-**2. Push to base_branch with conflict retry (up to 3 attempts):**
+**2. Push to base_branch via `gc git-push-fenced`, with conflict retry (up to 3 attempts):**
+
+Do NOT push with a bare `git push`. Its exit code cannot tell "the remote
+rejected this" apart from "the remote accepted this and the connection
+dropped before you saw it" — retrying blind on the latter can push the same
+commit twice, or rebase onto a base_branch that already has it.
+`gc git-push-fenced` reads the remote ref back both before and after the
+push and reports one of three states:
+
+- **rc 0** — the commit IS on {{base_branch}} (pushed now, or already there).
+  Treat as success; continue to step 3.
+- **rc 1** — definitively NOT on {{base_branch}}. Safe to retry: fetch,
+  rebase, push again.
+- **rc 2** — could not be determined. STOP. Do not rebase. Do not retry. Do
+  not consume a retry attempt. This is a block-and-escalate condition, not a
+  failure to loop past.
 
 ```bash
 for attempt in 1 2 3; do
-    if git push origin HEAD:{{base_branch}}; then
-        echo "Push succeeded on attempt $attempt"
+    gc git-push-fenced --remote origin --branch {{base_branch}} --remote-branch {{base_branch}}
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "Push confirmed on {{base_branch}} (attempt $attempt)"
         break
     fi
+    if [ "$rc" -eq 2 ]; then
+        echo "Push state UNKNOWN (rc=2) — stopping without retrying"
+        gc mail send <rig>/witness -s "URGENT: Push state UNKNOWN for {{base_branch}}" \
+          -m "Issue: $WORK_BEAD_ID. gc git-push-fenced could not determine whether the commit landed on {{base_branch}} (rc=2, attempt $attempt). Do NOT assume it failed or retry — a human must check {{base_branch}} by hand before this bead is touched again."
+        gc runtime drain-ack
+        exit 2
+    fi
     if [ "$attempt" -eq 3 ]; then
-        echo "Push failed after 3 attempts"
+        echo "Push failed after 3 attempts (rc=1 each time)"
         gc mail send <rig>/witness -s "HELP: Push conflict after 3 retries" \
           -m "Issue: $WORK_BEAD_ID. Cannot push to {{base_branch}}."
         gc runtime drain-ack
         exit 1
     fi
-    echo "Push failed (attempt $attempt), rebasing..."
+    echo "Push failed (attempt $attempt, rc=1), rebasing..."
     git fetch origin {{base_branch}}
     git rebase origin/{{base_branch}}
     # If rebase conflicts: resolve them, then git rebase --continue
