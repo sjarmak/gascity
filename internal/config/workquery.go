@@ -200,7 +200,7 @@ type PoolDemandServeRules struct {
 func PoolDemandServeRulesForQuery() PoolDemandServeRules {
 	return PoolDemandServeRules{
 		RequireUnassigned: true,
-		ExcludeTypes:      []string{"epic"},
+		ExcludeTypes:      []string{beadmeta.EpicType},
 		ExcludeLabels:     append([]string(nil), beadmeta.DispatchHoldLabels...),
 	}
 }
@@ -294,7 +294,7 @@ func ephemeralStatusSnapshotShell(shellVar, status string) string {
 // `dependencies` array — which is precise enough to prove "definitely no
 // dependencies" but not to resolve whether a nonzero count is still open.
 func ephemeralReadyBaseSelectorJQ(selector string, excludeHoldLabels bool) string {
-	body := selector + ` | select(((.issue_type // .type // "") != "epic"))`
+	body := selector + ` | select(((.issue_type // .type // "") != "` + beadmeta.EpicType + `"))`
 	if excludeHoldLabels {
 		body += excludeHoldLabelsJQClause()
 	}

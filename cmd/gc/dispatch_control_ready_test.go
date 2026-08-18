@@ -107,15 +107,23 @@ func TestControlReadyRoutesFiltersEmptyAliases(t *testing.T) {
 	}
 }
 
-func TestFilterReadyByAssigneeExcludesEpicAndOtherAssignees(t *testing.T) {
+// TestFilterReadyByAssigneeIncludesAssignedEpicExcludesMailAndOtherAssignees
+// covers the corrected ADR-0019 (dr-89vak.4) contract for the assigned tier:
+// an epic already assigned to the candidate is legitimate owned work and
+// must be surfaced (not silently dropped, gc-udx), a mail message bead is
+// excluded regardless of assignment, and beads assigned to someone else are
+// excluded.
+func TestFilterReadyByAssigneeIncludesAssignedEpicExcludesMailAndOtherAssignees(t *testing.T) {
 	ready := []beads.Bead{
-		{ID: "ga-epic-leak", Assignee: "cand", Type: "epic"},
+		{ID: "ga-epic-owned", Assignee: "cand", Type: "epic"},
+		{ID: "ga-mail", Assignee: "cand", Type: "message"},
 		{ID: "ga-ready", Assignee: "cand", Type: "task"},
 		{ID: "ga-other", Assignee: "someone-else", Type: "task"},
 	}
 	got := filterReadyByAssignee(ready, "cand", workflowServeScanLimit)
-	if len(got) != 1 || got[0].ID != "ga-ready" {
-		t.Fatalf("filterReadyByAssignee = %#v, want only ga-ready", got)
+	want := []string{"ga-epic-owned", "ga-ready"}
+	if !stringSlicesEqual(beadIDs(got), want) {
+		t.Fatalf("filterReadyByAssignee = %#v, want %#v", beadIDs(got), want)
 	}
 }
 
@@ -235,7 +243,14 @@ func TestEvaluateControlReadyMatchesShellQueryPriority(t *testing.T) {
 	}
 }
 
-func TestEvaluateControlReadyExcludesEpicAndInstantiating(t *testing.T) {
+// TestEvaluateControlReadyIncludesAssignedEpicExcludesRoutedEpicAndInstantiating
+// covers both tiers of the corrected ADR-0019 (dr-89vak.4) contract in one
+// end-to-end evaluateControlReady pass: an epic already assigned to the
+// control-dispatcher itself is owned work and must be surfaced (ga-epic-owned,
+// gc-udx), while an unassigned epic offered through the route tier is still
+// excluded (ga-epic-routed) because it groups child beads rather than being
+// directly actionable pool work.
+func TestEvaluateControlReadyIncludesAssignedEpicExcludesRoutedEpicAndInstantiating(t *testing.T) {
 	query := workflowServeControlReadyQuery(config.Agent{Name: config.ControlDispatcherAgentName, Dir: "gascity"})
 	parsed, ok := parseControlReadyQuery(query)
 	if !ok {
@@ -246,14 +261,15 @@ func TestEvaluateControlReadyExcludesEpicAndInstantiating(t *testing.T) {
 		"GC_ALIAS=gascity/control-dispatcher",
 	}
 	ready := []beads.Bead{
-		{ID: "ga-epic-leak", Assignee: "gascity--control-dispatcher", Type: "epic"},
+		{ID: "ga-epic-owned", Assignee: "gascity--control-dispatcher", Type: "epic"},
 		{ID: "ga-ready", Assignee: "gascity--control-dispatcher", Type: "task"},
+		{ID: "ga-epic-routed", Type: "epic", Metadata: map[string]string{beadmeta.RunTargetMetadataKey: "gascity/control-dispatcher"}},
 		{ID: "ga-instantiating-routed", Metadata: map[string]string{beadmeta.RunTargetMetadataKey: "gascity/control-dispatcher", beadmeta.InstantiatingMetadataKey: "true"}},
 		{ID: "ga-routed", Metadata: map[string]string{beadmeta.RunTargetMetadataKey: "gascity/control-dispatcher", "gc.kind": "scope-check"}},
 	}
 
 	got := evaluateControlReady(ready, parsed, envList)
-	wantIDs := []string{"ga-ready", "ga-routed"}
+	wantIDs := []string{"ga-epic-owned", "ga-ready", "ga-routed"}
 	if !stringSlicesEqual(beadIDs(got), wantIDs) {
 		t.Fatalf("evaluateControlReady ids = %#v, want %#v", beadIDs(got), wantIDs)
 	}
@@ -324,6 +340,10 @@ func TestTryControlReadyFromCacheOrFallbackAnswersFromCacheWithZeroSubprocessCal
 	if err != nil {
 		t.Fatalf("create ready bead: %v", err)
 	}
+	// epic is assigned to target: per the corrected ADR-0019 (dr-89vak.4)
+	// contract, a bead already assigned to the requesting agent is never
+	// excluded on type, so this assigned epic must be surfaced (gc-udx), not
+	// dropped.
 	epic, err := store.Create(beads.Bead{Assignee: target, Type: "epic"})
 	if err != nil {
 		t.Fatalf("create epic bead: %v", err)
@@ -348,9 +368,9 @@ func TestTryControlReadyFromCacheOrFallbackAnswersFromCacheWithZeroSubprocessCal
 	for _, b := range queue {
 		gotIDs = append(gotIDs, b.ID)
 	}
-	wantIDs := []string{ready.ID, routed.ID}
+	wantIDs := []string{ready.ID, epic.ID, routed.ID}
 	if !stringSlicesEqual(gotIDs, wantIDs) {
-		t.Fatalf("queue ids = %#v, want %#v (epic bead %s must be excluded)", gotIDs, wantIDs, epic.ID)
+		t.Fatalf("queue ids = %#v, want %#v (assigned epic bead %s must be surfaced, not excluded)", gotIDs, wantIDs, epic.ID)
 	}
 }
 

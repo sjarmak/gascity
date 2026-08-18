@@ -20,6 +20,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/executionevent"
 	"github.com/gastownhall/gascity/internal/git"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 )
 
 const hookClaimCommandName = "hook"
@@ -689,8 +690,15 @@ func claimFirstReadyHookAssignment(candidates []beads.Bead, opts hookClaimOption
 	claimsErrored := false
 	now := ops.nowOrWallClock()
 	for _, candidate := range candidates {
+		// Mail is read, not claimed as work: a message bead addressed to this
+		// session's identity has the same assignee-matches-identity shape as a
+		// real existing/ready assignment, so without this check it was
+		// returned by the existing/ready-assignment paths as work ahead of
+		// any real routed work waiting in the same batch (#4419) -- not by
+		// race, by construction, since this loop runs before
+		// claimFirstEligibleHookCandidate ever sees the routed candidates.
 		if strings.TrimSpace(candidate.ID) == "" ||
-			hookClaimCandidateIsMessage(candidate) ||
+			beadmail.IsMessageBead(candidate) ||
 			!strings.EqualFold(strings.TrimSpace(candidate.Status), "open") ||
 			!hookClaimHasIdentity(candidate.Assignee, opts.IdentityCandidates) ||
 			hookCandidateBudgetDeferred(candidate, now) {
@@ -1154,7 +1162,9 @@ func adoptAfterFailedRestamp(beadID, current, target string, verdict hookAdoptio
 
 func hookClaimExistingAssignment(candidates []beads.Bead, opts hookClaimOptions) (hookClaimJSONResult, beads.Bead, bool) {
 	for _, candidate := range candidates {
-		if hookClaimCandidateIsMessage(candidate) {
+		// See the matching comment in claimFirstReadyHookAssignment (#4419):
+		// mail is read, not claimed as an existing assignment.
+		if beadmail.IsMessageBead(candidate) {
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(candidate.Status), "in_progress") &&
@@ -1173,18 +1183,6 @@ func hookClaimExistingAssignment(candidates []beads.Bead, opts hookClaimOptions)
 		}
 	}
 	return hookClaimJSONResult{}, beads.Bead{}, false
-}
-
-// hookClaimCandidateIsMessage reports whether candidate is a mail message
-// bead (issue_type="message"). Mail is read, not claimed as work: a message
-// bead addressed to this session's identity has the same
-// assignee-matches-identity shape as a real existing/ready assignment, so
-// without this check it was returned by the existing/ready-assignment paths as work
-// ahead of any real routed work waiting in the same batch (#4419) -- not by
-// race, by construction, since this function runs before
-// claimFirstEligibleHookCandidate ever sees the routed candidates.
-func hookClaimCandidateIsMessage(candidate beads.Bead) bool {
-	return strings.EqualFold(strings.TrimSpace(candidate.Type), "message")
 }
 
 // writeHookClaimWorkResultForBead stamps, correlates and reports one claimed or
