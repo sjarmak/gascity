@@ -411,7 +411,7 @@ func supervisorProcessEnvMap(data []byte) map[string]string {
 			continue
 		}
 		key, value, ok := bytes.Cut(item, []byte("="))
-		if !ok {
+		if !ok || len(key) == 0 {
 			continue
 		}
 		env[string(key)] = string(value)
