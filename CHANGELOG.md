@@ -219,10 +219,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   watchdog clears the `oom_score_adj` the server inherits from systemd's user
   manager. This placement is fail-closed: if `systemd-run` or the user bus
   isn't reachable, gc refuses to spawn or adopt the server rather than run it
-  unbounded. Set `GC_DOLT_SLICE=""` to disable placement, or point it at a
-  different slice. Note that systemd nests `a-b.slice` under `a.slice`: a dolt
-  slice named as a child of your agent slice stays subject to that cgroup's
-  limits and defeats the purpose. Non-Linux hosts (e.g. macOS) have no
+  unbounded. Set `GC_DOLT_SLICE` to point it at a different slice; there is no
+  supported way to disable placement on Linux — an explicit empty value is
+  rejected the same as an unreachable systemd, so it can't silently
+  reintroduce the unbounded cgroup this fixes. Note that systemd nests
+  `a-b.slice` under `a.slice`: a dolt slice named as a child of your agent
+  slice stays subject to that cgroup's limits and defeats the purpose.
+  Non-Linux hosts (e.g. macOS) have no
   equivalent mechanism yet; gc spawns and adopts the managed server unwrapped
   there, exactly as before this change. See
   `docs/reference/managed-dolt-slice.md`.

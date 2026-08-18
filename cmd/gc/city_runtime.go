@@ -388,8 +388,7 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 		managedDoltPort = currentResolvableManagedDoltPort
 	}
 	managedDoltPlacement := p.ManagedDoltPlacement
-	_, managedDoltSliceExplicit := os.LookupEnv(managedDoltSliceEnv)
-	if managedDoltPlacement == nil && supervisorRuntimeGOOS == "linux" && (!managedDoltTestModeEnabled() || managedDoltSliceExplicit) {
+	if managedDoltPlacement == nil && managedDoltPlacementActive() {
 		// adoptManagedDoltPlacement's non-Linux build always fails closed (no
 		// systemd user manager to reparent into); leaving placement nil here
 		// lets publishManagedDoltPort's existing nil-placementFn skip take over,

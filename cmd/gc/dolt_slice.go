@@ -115,6 +115,19 @@ func managedDoltSliceFor(testMode bool, envValue string, envSet bool) string {
 	return managedDoltDefaultSlice
 }
 
+// managedDoltPlacementActive reports whether the Linux adopt path should be
+// wired as the default placement function. This is the same GOOS/test-mode/
+// explicit-empty matrix wrapManagedDoltArgv enforces at spawn time; callers
+// (newCityRuntime) use it instead of re-deriving the condition by hand, since
+// the two would otherwise need to be kept in sync manually.
+func managedDoltPlacementActive() bool {
+	if supervisorRuntimeGOOS != "linux" {
+		return false
+	}
+	_, explicit := os.LookupEnv(managedDoltSliceEnv)
+	return !managedDoltTestModeEnabled() || explicit
+}
+
 // prepareManagedDoltPlacement applies and verifies the bounded resource policy
 // before a managed-Dolt spawn or adoption can be considered safe.
 func prepareManagedDoltPlacement(ctx context.Context, slice string) error {

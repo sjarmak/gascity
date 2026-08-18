@@ -355,13 +355,20 @@ func readProcStartIdentity(pid int) string {
 	return strings.TrimSpace(string(out))
 }
 
-func parseProcStartTimeTicks(data []byte) uint64 {
+// procStatFieldsAfterComm splits the /proc/<pid>/stat fields that follow the
+// parenthesized comm field, which may itself contain spaces or parens. Field
+// index N here is `man 5 proc`'s 1-based stat field N+2 (comm is field 2).
+func procStatFieldsAfterComm(data []byte) []string {
 	text := string(data)
 	closeParen := strings.LastIndex(text, ")")
 	if closeParen < 0 {
-		return 0
+		return nil
 	}
-	fields := strings.Fields(text[closeParen+1:])
+	return strings.Fields(text[closeParen+1:])
+}
+
+func parseProcStartTimeTicks(data []byte) uint64 {
+	fields := procStatFieldsAfterComm(data)
 	if len(fields) <= 19 {
 		return 0
 	}

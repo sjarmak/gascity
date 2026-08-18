@@ -501,16 +501,16 @@ func readManagedDoltAdoptState(cityPath string, port int) (doltRuntimeState, err
 	return doltRuntimeState{}, fmt.Errorf("%s", strings.Join(failures, "; "))
 }
 
+// The five readers below all go through readWithTimeout (dolt_cleanup_discovery.go)
+// rather than a bare os.ReadFile: a stuck /proc entry during adoption must not
+// hang the tick that calls it.
+
 func readManagedDoltProcessPPID(pid int) (int, error) {
-	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	data, err := readWithTimeout(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
 	if err != nil {
 		return 0, err
 	}
-	closeParen := strings.LastIndex(string(data), ")")
-	if closeParen < 0 {
-		return 0, fmt.Errorf("malformed /proc stat")
-	}
-	fields := strings.Fields(string(data)[closeParen+1:])
+	fields := procStatFieldsAfterComm(data)
 	if len(fields) < 2 {
 		return 0, fmt.Errorf("short /proc stat")
 	}
@@ -518,7 +518,7 @@ func readManagedDoltProcessPPID(pid int) (int, error) {
 }
 
 func readManagedDoltProcessCmdline(pid int) ([]string, error) {
-	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
+	data, err := readWithTimeout(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
 	if err != nil {
 		return nil, err
 	}
@@ -526,21 +526,15 @@ func readManagedDoltProcessCmdline(pid int) ([]string, error) {
 }
 
 func readManagedDoltProcessEnviron(pid int) (map[string]string, error) {
-	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "environ"))
+	data, err := readWithTimeout(filepath.Join("/proc", strconv.Itoa(pid), "environ"))
 	if err != nil {
 		return nil, err
 	}
-	environ := make(map[string]string)
-	for _, entry := range strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00") {
-		if key, value, ok := strings.Cut(entry, "="); ok && key != "" {
-			environ[key] = value
-		}
-	}
-	return environ, nil
+	return supervisorProcessEnvMap(data), nil
 }
 
 func readManagedDoltProcessChildren(pid int) ([]int, error) {
-	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "task", strconv.Itoa(pid), "children"))
+	data, err := readWithTimeout(filepath.Join("/proc", strconv.Itoa(pid), "task", strconv.Itoa(pid), "children"))
 	if err != nil {
 		return nil, err
 	}
@@ -557,7 +551,7 @@ func readManagedDoltProcessChildren(pid int) ([]int, error) {
 }
 
 func readManagedDoltProcessCgroup(pid int) (string, error) {
-	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cgroup"))
+	data, err := readWithTimeout(filepath.Join("/proc", strconv.Itoa(pid), "cgroup"))
 	if err != nil {
 		return "", err
 	}
