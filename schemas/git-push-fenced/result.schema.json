@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ok", "outcome", "exit_code", "note", "remote", "ref", "push_attempted"],
+  "properties": {
+    "ok": {
+      "const": true
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "already_landed",
+        "pushed",
+        "landed_despite_nonzero",
+        "dry_run",
+        "create_only_exists",
+        "not_ancestor",
+        "rejected",
+        "pre_push_read_failed",
+        "verify_read_failed",
+        "ancestry_unknown",
+        "ancestry_unreadable_locally",
+        "invalid_invocation"
+      ]
+    },
+    "exit_code": {
+      "type": "integer",
+      "enum": [0, 1, 2]
+    },
+    "note": {
+      "type": "string"
+    },
+    "remote": {
+      "type": "string"
+    },
+    "ref": {
+      "type": "string"
+    },
+    "intended": {
+      "type": "string"
+    },
+    "observed_before": {
+      "type": "string"
+    },
+    "observed_after": {
+      "type": "string"
+    },
+    "push_attempted": {
+      "type": "boolean"
+    },
+    "push_exit_code": {
+      "type": "integer"
+    },
+    "push_stderr": {
+      "type": "string"
+    }
+  }
+}
