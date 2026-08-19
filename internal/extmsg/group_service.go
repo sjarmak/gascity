@@ -117,7 +117,7 @@ func (s *groupService) EnsureGroup(ctx context.Context, caller Caller, input Ens
 		created, err := s.store.Create(beads.Bead{
 			Title:    title,
 			Type:     "task",
-			Labels:   []string{"gc:extmsg-group", labelGroupBase, groupRootLabel(ref)},
+			Labels:   []string{labelGroupBase, groupRootLabel(ref)},
 			Metadata: fields,
 		})
 		if err != nil {

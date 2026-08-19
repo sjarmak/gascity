@@ -181,7 +181,7 @@ func (s *bindingService) createBindingLocked(caller Caller, ref ConversationRef,
 	// or a concrete session. Agent bindings get only the agent label; session
 	// bindings get the volatile session-id label plus the stable session-name
 	// label (which survives respawn) when a name is known.
-	labels := []string{"gc:extmsg-binding", labelBindingBase, bindingConversationLabel(ref)}
+	labels := []string{labelBindingBase, bindingConversationLabel(ref)}
 	if target.agentName != "" {
 		labels = append(labels, bindingAgentLabel(target.agentName))
 	} else {

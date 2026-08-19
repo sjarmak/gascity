@@ -106,7 +106,6 @@ func (s *transcriptService) Append(ctx context.Context, input AppendTranscriptIn
 			"attachments_json":       attachmentsJSON,
 		})
 		labels := []string{
-			labelTranscriptBase,
 			transcriptConversationLabel(ref),
 			transcriptBucketLabel(ref, transcriptBucket(sequence)),
 		}
@@ -117,7 +116,7 @@ func (s *transcriptService) Append(ctx context.Context, input AppendTranscriptIn
 			Title:       fmt.Sprintf("%s#%d", conversationTitle(ref), sequence),
 			Type:        "task",
 			Description: text,
-			Labels:      append([]string{"gc:extmsg-transcript"}, labels...),
+			Labels:      append([]string{labelTranscriptBase}, labels...),
 			Metadata:    fields,
 		})
 		if err != nil {
@@ -390,7 +389,7 @@ func (s *transcriptService) ensureMembershipLockedWriter(w membershipWriter, inp
 	created, err := w.Create(beads.Bead{
 		Title:    sessionID + " -> " + conversationTitle(ref),
 		Type:     "task",
-		Labels:   []string{"gc:extmsg-membership", labelMembershipBase, membershipConversationLabel(ref), membershipExactLabel(ref, sessionID), membershipSessionLabel(sessionID)},
+		Labels:   []string{labelMembershipBase, membershipConversationLabel(ref), membershipExactLabel(ref, sessionID), membershipSessionLabel(sessionID)},
 		Metadata: fields,
 	})
 	if err != nil {
@@ -759,7 +758,7 @@ func (s *transcriptService) ensureStateLockedWriter(w membershipWriter, ref Conv
 	created, err := w.Create(beads.Bead{
 		Title:    conversationTitle(ref) + "/state",
 		Type:     "task",
-		Labels:   []string{"gc:extmsg-transcript-state", labelTranscriptStateBase, transcriptStateLabel(ref)},
+		Labels:   []string{labelTranscriptStateBase, transcriptStateLabel(ref)},
 		Metadata: fields,
 	})
 	if err != nil {

@@ -96,7 +96,7 @@ func (s *deliveryContextService) Record(ctx context.Context, caller Caller, inpu
 			_, err = s.store.Create(beads.Bead{
 				Title:    title,
 				Type:     "task",
-				Labels:   []string{"gc:extmsg-delivery", labelDeliveryBase, label, deliverySessionLabel(sessionID)},
+				Labels:   []string{labelDeliveryBase, label, deliverySessionLabel(sessionID)},
 				Metadata: fields,
 			})
 			if err != nil {

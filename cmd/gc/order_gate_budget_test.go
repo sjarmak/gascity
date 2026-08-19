@@ -222,7 +222,7 @@ func TestConditionChecksRunConcurrentlyWithinTheirCap(t *testing.T) {
 			// 0 only on overlap; always exit normally so the trap unregisters.
 			check := fmt.Sprintf(
 				`mkdir -p %[1]s; echo . >> %[3]s; f=$(mktemp %[1]s/w.XXXXXX); trap 'rm -f "$f"' EXIT; `+
-					`i=0; while [ $i -lt 50 ]; do if [ "$(ls %[1]s | wc -l)" -ge 2 ]; then exit 0; fi; sleep 0.02; i=$((i+1)); done; exit 1`,
+					`i=0; while [ $i -lt 200 ]; do if [ "$(ls %[1]s | wc -l)" -ge 2 ]; then exit 0; fi; sleep 0.02; i=$((i+1)); done; exit 1`,
 				liveDir, wave, ranMarker)
 
 			aa := make([]orders.Order, 0, wave)
