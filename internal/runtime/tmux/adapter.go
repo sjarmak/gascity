@@ -908,9 +908,6 @@ func (o *tmuxStartOps) capturePane(name string, lines int) (string, error) {
 // disabled capture (empty runtimeDir) or any I/O error returns "" without
 // affecting startup. Returns the artifact path when written.
 func (o *tmuxStartOps) recordStartCrash(name, paneContent string) string {
-	if o.runtimeDir == "" {
-		return ""
-	}
 	status, signal := o.tm.PaneDeadInfo(name)
 
 	var b strings.Builder
@@ -921,21 +918,9 @@ func (o *tmuxStartOps) recordStartCrash(name, paneContent string) string {
 	if signal != "" {
 		fmt.Fprintf(&b, "signal: %s\n", signal)
 	}
-	b.WriteString("--- last pane output ---\n")
-	b.WriteString(paneContent)
-	if paneContent != "" && !strings.HasSuffix(paneContent, "\n") {
-		b.WriteByte('\n')
-	}
+	writeDiagnosticTextBlock(&b, "--- last pane output ---\n", paneContent)
 
-	dir := filepath.Join(o.runtimeDir, "sessions", name)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return ""
-	}
-	path := filepath.Join(dir, "start-stderr.log")
-	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
-		return ""
-	}
-	return path
+	return writeSessionDiagnosticFile(o.runtimeDir, name, "start-stderr.log", b.String())
 }
 
 // recordUnconfirmedNudge persists a durable diagnostic artifact when the
@@ -948,24 +933,39 @@ func (o *tmuxStartOps) recordStartCrash(name, paneContent string) string {
 // semantics): a disabled capture (empty runtimeDir) or any I/O error returns
 // "" without affecting startup. Returns the artifact path when written.
 func (o *tmuxStartOps) recordUnconfirmedNudge(name, message string, cause error) string {
-	if o.runtimeDir == "" {
-		return ""
-	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "session: %s\n", name)
 	fmt.Fprintf(&b, "cause: %v\n", cause)
-	b.WriteString("--- startup nudge text ---\n")
-	b.WriteString(message)
-	if message != "" && !strings.HasSuffix(message, "\n") {
+	writeDiagnosticTextBlock(&b, "--- startup nudge text ---\n", message)
+
+	return writeSessionDiagnosticFile(o.runtimeDir, name, "startup-nudge-unconfirmed.log", b.String())
+}
+
+// writeDiagnosticTextBlock appends a labeled text block to a diagnostic
+// builder, normalizing a missing trailing newline. Shared by
+// recordStartCrash, recordUnconfirmedNudge, and Tmux.recordUnconfirmedSubmit.
+func writeDiagnosticTextBlock(b *strings.Builder, label, text string) {
+	b.WriteString(label)
+	b.WriteString(text)
+	if text != "" && !strings.HasSuffix(text, "\n") {
 		b.WriteByte('\n')
 	}
+}
 
-	dir := filepath.Join(o.runtimeDir, "sessions", name)
+// writeSessionDiagnosticFile best-effort writes a per-session diagnostic
+// artifact under runtimeDir/sessions/<name>/<filename>. A disabled capture
+// (empty runtimeDir) or any I/O error returns "" without surfacing an error,
+// matching the best-effort contract of the diagnostic writers that call it.
+func writeSessionDiagnosticFile(runtimeDir, name, filename, content string) string {
+	if runtimeDir == "" {
+		return ""
+	}
+	dir := filepath.Join(runtimeDir, "sessions", name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return ""
 	}
-	path := filepath.Join(dir, "startup-nudge-unconfirmed.log")
-	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+	path := filepath.Join(dir, filename)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return ""
 	}
 	return path
