@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -209,11 +210,11 @@ func TestModelUsageFact(t *testing.T) {
 		CacheReadTokens:     10,
 		CacheCreationTokens: 5,
 	}
-	// modelUsageFact resolves RunID from the run chain; StepID is intentionally
-	// left unset — model usage is attributed at run level, not per formula step.
+	// modelUsageFact resolves RunID from the run chain. With no step context,
+	// StepID remains empty.
 	bead := beads.Bead{ID: "b1", Metadata: map[string]string{"molecule_id": "mol-7"}}
 
-	priced := modelUsageFact(u, bead.Metadata, bead.ID, "session-1", "myrig/polecat-1", "claude", 0.02, true, now)
+	priced := modelUsageFact(u, bead.Metadata, "", bead.ID, "session-1", "myrig/polecat-1", "claude", 0.02, true, now)
 	if priced.Kind != usage.KindModel {
 		t.Fatalf("kind = %q", priced.Kind)
 	}
@@ -226,8 +227,8 @@ func TestModelUsageFact(t *testing.T) {
 	if priced.SessionID != "session-1" {
 		t.Fatalf("SessionID = %q, want the session bead id session-1", priced.SessionID)
 	}
-	// StepID is intentionally unset: model usage is attributed at run level, not per
-	// formula step (the gc.active_work_bead session pointer was retired).
+	// StepID is intentionally unset in this path because the test does not
+	// populate currently_processing_bead_id.
 	if priced.StepID != "" {
 		t.Fatalf("StepID = %q, want empty (run-level attribution)", priced.StepID)
 	}
@@ -253,9 +254,34 @@ func TestModelUsageFact(t *testing.T) {
 	}
 
 	// Unpriced collapses cost to zero regardless of the cost argument.
-	unp := modelUsageFact(u, bead.Metadata, bead.ID, "session-1", "w", "claude", 0.02, false, now)
+	unp := modelUsageFact(u, bead.Metadata, "", bead.ID, "session-1", "w", "claude", 0.02, false, now)
 	if !unp.Unpriced || unp.CostUSDEstimate != 0 {
 		t.Fatalf("unpriced fact must zero the cost and set the flag: %+v", unp)
+	}
+}
+
+func TestModelUsageFactUsesStepID(t *testing.T) {
+	now := time.Unix(2, 0).UTC()
+	u := sessionlog.TailUsage{
+		EntryUUID:           "entry-2",
+		MessageID:           "",
+		Model:               "claude-opus-4-7",
+		InputTokens:         7,
+		OutputTokens:        3,
+		CacheReadTokens:     1,
+		CacheCreationTokens: 2,
+	}
+	bead := beads.Bead{
+		ID: "b2",
+		Metadata: map[string]string{
+			sessionpkg.CurrentBeadIDKey: "step-77",
+			"molecule_id":               "mol-8",
+		},
+	}
+
+	fact := modelUsageFact(u, bead.Metadata, strings.TrimSpace(bead.Metadata[sessionpkg.CurrentBeadIDKey]), bead.ID, "session-2", "myrig/polecat-1", "claude", 0.01, true, now)
+	if fact.StepID != "step-77" {
+		t.Fatalf("StepID = %q, want step-77", fact.StepID)
 	}
 }
 
