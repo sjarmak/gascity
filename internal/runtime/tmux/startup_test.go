@@ -68,6 +68,7 @@ type fakeStartOps struct {
 	capturePaneText            string
 	capturePaneErr             error
 	recordStartCrashPath       string
+	recordUnconfirmedNudgePath string
 }
 
 type errReader struct{}
@@ -195,6 +196,11 @@ func (f *fakeStartOps) capturePane(name string, _ int) (string, error) {
 func (f *fakeStartOps) recordStartCrash(name, _ string) string {
 	f.calls = append(f.calls, startCall{method: "recordStartCrash", name: name})
 	return f.recordStartCrashPath
+}
+
+func (f *fakeStartOps) recordUnconfirmedNudge(name, _ string, _ error) string {
+	f.calls = append(f.calls, startCall{method: "recordUnconfirmedNudge", name: name})
+	return f.recordUnconfirmedNudgePath
 }
 
 func (f *fakeStartOps) runSetupCommand(_ context.Context, cmd string, env map[string]string, timeout time.Duration) error {
@@ -944,10 +950,11 @@ func TestDoStartSessionReturnsNudgeDeliveryError(t *testing.T) {
 	// The startup nudge has no retry-capable caller, so an unconfirmed submit
 	// must not fail the start: the keystrokes reached tmux and the session is
 	// already verified alive. Only genuine delivery errors are fatal (above).
-	t.Run("unconfirmed submit is not fatal", func(t *testing.T) {
+	t.Run("unconfirmed submit is not fatal but is durably recorded", func(t *testing.T) {
 		ops := &fakeStartOps{
-			hasSessionResult: true,
-			sendKeysErr:      fmt.Errorf("%w: session %q", ErrNudgeSubmitUnconfirmed, "test"),
+			hasSessionResult:           true,
+			sendKeysErr:                fmt.Errorf("%w: session %q", ErrNudgeSubmitUnconfirmed, "test"),
+			recordUnconfirmedNudgePath: "/city/.gc/runtime/sessions/test/startup-nudge-unconfirmed.log",
 		}
 
 		cfg := runtime.Config{
@@ -959,7 +966,11 @@ func TestDoStartSessionReturnsNudgeDeliveryError(t *testing.T) {
 			t.Fatalf("doStartSession = %v, want nil for an unconfirmed startup nudge", err)
 		}
 
-		assertCallSequence(t, ops, wantCalls)
+		// dr-6siig: an unconfirmed startup nudge has no retry-capable caller
+		// (Start returns nil, so nothing requeues it), so it must leave a
+		// durable artifact for a later observer instead of only a stderr
+		// line that vanishes with the process.
+		assertCallSequence(t, ops, append(append([]string(nil), wantCalls...), "recordUnconfirmedNudge"))
 	})
 }
 
