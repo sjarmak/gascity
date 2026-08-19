@@ -99,11 +99,12 @@ func TestEmitComputeFactForBead(t *testing.T) {
 	b, err := store.Create(beads.Bead{
 		Title: "session",
 		Metadata: map[string]string{
-			"state":            "asleep",
-			"session_name":     "s-x",
-			"awake_started_at": start.Format(time.RFC3339),
-			"slept_at":         slept.Format(time.RFC3339),
-			"molecule_id":      "mol-7",
+			"state":                  "asleep",
+			"session_name":           "s-x",
+			"awake_started_at":       start.Format(time.RFC3339),
+			"slept_at":               slept.Format(time.RFC3339),
+			"molecule_id":            "mol-7",
+			session.CurrentBeadIDKey: "build",
 		},
 	})
 	if err != nil {
@@ -136,6 +137,9 @@ func TestEmitComputeFactForBead(t *testing.T) {
 	if f.Runtime != "fake" || f.City != "demo" || f.Worker != "s-x" {
 		t.Fatalf("unexpected fact fields: %+v", f)
 	}
+	if f.StepID != "build" {
+		t.Fatalf("StepID = %q, want build", f.StepID)
+	}
 	if f.IdempotencyKey == "" {
 		t.Fatal("missing idempotency key")
 	}
@@ -164,11 +168,12 @@ func TestEmitComputeFactForBeadMultiInterval(t *testing.T) {
 	b, err := store.Create(beads.Bead{
 		Title: "session",
 		Metadata: map[string]string{
-			"state":            "asleep",
-			"session_name":     "pool-1",
-			"awake_started_at": t1.Format(time.RFC3339Nano),
-			"slept_at":         s1.Format(time.RFC3339Nano),
-			"molecule_id":      "run-A",
+			"state":                  "asleep",
+			"session_name":           "pool-1",
+			"awake_started_at":       t1.Format(time.RFC3339Nano),
+			"slept_at":               s1.Format(time.RFC3339Nano),
+			"molecule_id":            "run-A",
+			session.CurrentBeadIDKey: "first-step",
 		},
 	})
 	if err != nil {
@@ -178,6 +183,9 @@ func TestEmitComputeFactForBeadMultiInterval(t *testing.T) {
 
 	if !emitComputeFactForBead(context.Background(), sink, store, b, "fake", "demo", s1.Add(time.Second), nil, true) {
 		t.Fatal("interval 1 should emit")
+	}
+	if got := sink.facts[0].StepID; got != "first-step" {
+		t.Fatalf("interval 1 StepID = %q, want first-step", got)
 	}
 
 	// Second awake interval: the controller stamps a fresh epoch on wake.
@@ -189,12 +197,18 @@ func TestEmitComputeFactForBeadMultiInterval(t *testing.T) {
 	if err := store.SetMetadata(b.ID, "slept_at", s2.Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.SetMetadata(b.ID, session.CurrentBeadIDKey, "second-step"); err != nil {
+		t.Fatal(err)
+	}
 	refreshed, err := store.Get(b.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !emitComputeFactForBead(context.Background(), sink, store, refreshed, "fake", "demo", s2.Add(time.Second), nil, true) {
 		t.Fatal("interval 2 should emit a second compute fact")
+	}
+	if got := sink.facts[1].StepID; got != "second-step" {
+		t.Fatalf("interval 2 StepID = %q, want second-step", got)
 	}
 	if len(sink.facts) != 2 {
 		t.Fatalf("want 2 compute facts across two awake intervals, got %d", len(sink.facts))

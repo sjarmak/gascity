@@ -195,7 +195,7 @@ func (h *SessionHandle) recordInvocationTelemetry(ctx context.Context) {
 			telemetry.RecordInvocationCostEstimate(ctx, labels, cost)
 		}
 		if emitFacts {
-			h.recordModelUsageFact(modelUsageFact(u, pr.Metadata, id, id, info.SessionName, providerFamily, cost, priced, now))
+			h.recordModelUsageFact(modelUsageFact(u, pr.Metadata, strings.TrimSpace(pr.Metadata[sessionpkg.CurrentBeadIDKey]), id, id, info.SessionName, providerFamily, cost, priced, now))
 		}
 	}
 	// Best-effort: a failed cursor write means the next prompt op may
@@ -213,34 +213,30 @@ func (h *SessionHandle) recordInvocationTelemetry(ctx context.Context) {
 // run's model and compute facts carry the same RunID and group together in
 // gc costs. The session bead id is carried verbatim as SessionID (the join key to
 // the manifold spend plane's EIA session_id and to recall transcripts), distinct
-// from the resolved RunID and from Worker (the session name). StepID is left
-// unset: model usage is attributed at run level, not per formula step (see the
-// StepID note in the body). The dedup identity is the invocation's provider message id (or the
-// transcript entry uuid when none), so the best-effort cursor races noted on
+// from the resolved RunID and from Worker (the session name). StepID is populated
+// from session.CurrentBeadIDKey when present, allowing model usage to be
+// attributed to the active work bead alongside compute facts. The dedup identity
+// is the invocation's provider message id (or the transcript entry uuid when
+// none), so the best-effort cursor races noted on
 // recordInvocationTelemetry collapse a re-recorded invocation to one fact at the
 // sink via IdempotencyKey. Unpriced is true exactly when the pricing registry
 // had no entry for the (family, model) pair; cost is then left zero and must be
 // read as "not measured", never as a free invocation.
-func modelUsageFact(u sessionlog.TailUsage, meta map[string]string, beadID, sessionID, worker, providerFamily string, cost float64, priced bool, now time.Time) usage.Fact {
+func modelUsageFact(u sessionlog.TailUsage, meta map[string]string, stepID, beadID, sessionID, worker, providerFamily string, cost float64, priced bool, now time.Time) usage.Fact {
 	// beadID and sessionID are the session bead id and the run-id fallback — the
 	// same fields the retired ResolveRunID(bead.Metadata, bead.ID, sessionID) read
 	// from the raw bead. At the sole production call site they are equal (the
 	// handle's currentSessionID == the session bead id); the params stay distinct
 	// so the run-chain precedence contract is preserved verbatim.
 	runID := beadmeta.ResolveRunID(meta, beadID, sessionID)
-	// Model usage is attributed at run level: StepID stays unset. Per-step
-	// attribution was retired along with the gc.active_work_bead session pointer —
-	// the claim hook no longer stamps it (that was an unsafe fuzzy session-bead
-	// write), so no production source names the current step. Compute facts are
-	// already run-level, so both usage Kinds now roll up per run, matching events.
 	reqID := usageIdentity(u)
 	if !priced {
 		cost = 0
 	}
 	return usage.Fact{
-		RunID:     runID,
-		SessionID: strings.TrimSpace(sessionID),
-		// StepID intentionally unset — run-level attribution (see body note).
+		RunID:               runID,
+		SessionID:           strings.TrimSpace(sessionID),
+		StepID:              strings.TrimSpace(stepID),
 		Worker:              strings.TrimSpace(worker),
 		Kind:                usage.KindModel,
 		Model:               strings.TrimSpace(u.Model),
@@ -625,7 +621,7 @@ func (f *Factory) sweepResolvedTranscript(ctx context.Context, family, id string
 		if priced {
 			telemetry.RecordInvocationCostEstimate(ctx, labels, cost)
 		}
-		fact := modelUsageFact(u, meta, id, id, workerName, family, cost, priced, now)
+		fact := modelUsageFact(u, meta, strings.TrimSpace(meta[sessionpkg.CurrentBeadIDKey]), id, id, workerName, family, cost, priced, now)
 		if recErr := sink.Record(ctx, fact); recErr != nil {
 			// Stop at the first failure and advance the cursor only through the last
 			// success, so the next sweep resumes here instead of skipping the gap.
