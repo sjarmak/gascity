@@ -92,9 +92,9 @@ func isLiveModelSweepState(state string) bool {
 // graceful-sleep end), else to now (best-effort for other terminal transitions).
 //
 // RunID is resolved from the session bead's own run chain (workflow_id ||
-// molecule_id || gc.root_bead_id-or-self || bead id). Per-work-bead attribution
-// is deferred until a dispatch/claim writer exists, so pooled sessions roll up
-// per-session for now (see engdocs/design/usage-facts-v0.md).
+// molecule_id || gc.root_bead_id-or-self || bead id). The acting work bead id is
+// read from the session's currently_processing_bead_id metadata when present and
+// written as StepID, enabling paired cost rollups across model and compute.
 func emitComputeFactForBead(ctx context.Context, sink usage.Sink, store beads.Store, bead beads.Bead, runtimeKind, city string, now time.Time, logf func(string, ...any), commit bool) bool {
 	if sink == nil || sink == usage.Discard || store == nil {
 		return false
@@ -137,6 +137,7 @@ func emitComputeFactForBead(ctx context.Context, sink usage.Sink, store beads.St
 		// union both Kinds; an unset SessionID here would silently drop compute/wall
 		// cost from the join).
 		SessionID:      strings.TrimSpace(bead.ID),
+		StepID:         strings.TrimSpace(meta[session.CurrentBeadIDKey]),
 		Worker:         strings.TrimSpace(meta["session_name"]),
 		City:           city,
 		Kind:           usage.KindCompute,

@@ -16,7 +16,8 @@ func TestLocalSinkAppendAndReadDedup(t *testing.T) {
 
 	f1 := Fact{Kind: KindModel, RunID: "r1", IdempotencyKey: "k1", InputTokens: 1}
 	f2 := Fact{Kind: KindModel, RunID: "r1", IdempotencyKey: "k2", InputTokens: 2}
-	for _, f := range []Fact{f1, f2, f1 /* replay of k1 */} {
+	f1Replay := Fact{Kind: KindModel, RunID: "r1", IdempotencyKey: "k1", InputTokens: 3}
+	for _, f := range []Fact{f1, f2, f1Replay /* replay of k1 */} {
 		if err := s.Record(ctx, f); err != nil {
 			t.Fatalf("Record: %v", err)
 		}
@@ -32,9 +33,12 @@ func TestLocalSinkAppendAndReadDedup(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("expected 2 facts after dedup, got %d", len(got))
 	}
-	// First-occurrence order preserved.
-	if got[0].IdempotencyKey != "k1" || got[1].IdempotencyKey != "k2" {
+	// Last-write wins; order follows final-seen line positions.
+	if got[0].IdempotencyKey != "k2" || got[1].IdempotencyKey != "k1" {
 		t.Fatalf("order/dedup wrong: %q, %q", got[0].IdempotencyKey, got[1].IdempotencyKey)
+	}
+	if got[1].InputTokens != 3 {
+		t.Fatalf("last-write for k1 must win, got InputTokens=%d", got[1].InputTokens)
 	}
 }
 
