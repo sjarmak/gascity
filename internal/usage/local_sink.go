@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -104,8 +105,9 @@ func terminateTornTail(file *os.File) error {
 }
 
 // ReadFacts reads all facts from a LocalSink file, collapsing duplicates by
-// IdempotencyKey (first occurrence wins; input order is preserved). Facts with
-// an empty IdempotencyKey cannot be deduplicated and are all kept.
+// IdempotencyKey (last occurrence wins; input order follows the last kept event
+// position). Facts with an empty IdempotencyKey cannot be deduplicated and are
+// all kept.
 //
 // A malformed line — a torn mid-append, or a record a torn predecessor merged
 // into — is skipped rather than aborting the whole read, and reported in the
@@ -124,7 +126,11 @@ func ReadFacts(path string) (facts []Fact, warnings []string, err error) {
 	}
 	defer file.Close() //nolint:errcheck // read-only handle
 
-	seen := make(map[string]struct{})
+	type retainedFact struct {
+		index int
+		fact  Fact
+	}
+	kept := map[string]retainedFact{}
 	// bufio.Reader.ReadString grows to fit arbitrarily long lines instead of
 	// failing on an over-budget token, and preserves the terminator so a trailing
 	// empty chunk at EOF is distinguishable from a real record.
@@ -146,13 +152,24 @@ func ReadFacts(path string) (facts []Fact, warnings []string, err error) {
 				warnings = append(warnings, fmt.Sprintf("usage: skipped malformed fact at %s:%d: %v", path, lineNo, jsonErr))
 			} else if f.IdempotencyKey == "" {
 				facts = append(facts, f)
-			} else if _, dup := seen[f.IdempotencyKey]; !dup {
-				seen[f.IdempotencyKey] = struct{}{}
-				facts = append(facts, f)
+			} else {
+				kept[f.IdempotencyKey] = retainedFact{index: lineNo, fact: f}
 			}
 		}
 		if atEOF {
 			break
+		}
+	}
+	if len(kept) > 0 {
+		keys := make([]string, 0, len(kept))
+		for key := range kept {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			return kept[keys[i]].index < kept[keys[j]].index
+		})
+		for _, key := range keys {
+			facts = append(facts, kept[key].fact)
 		}
 	}
 	return facts, warnings, nil
