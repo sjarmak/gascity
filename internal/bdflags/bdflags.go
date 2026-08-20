@@ -2,24 +2,29 @@
 // subcommand. It backs both the write-mutation ID guard in cmd/gc/cmd_bd.go
 // and the gc lint check that validates bd invocations embedded in prompt
 // templates, so the two call sites cannot drift apart from each other.
-//
-// Sourced from bd <sub> --help output (2026-07-13, bd v1.1.0).
 package bdflags
 
-import "sort"
+import (
+	"os/exec"
+	"sort"
+	"strings"
+	"sync"
+	"unicode"
+)
 
 // globalValueFlags are accepted by every bd subcommand and consume the next
 // argument as their value.
 var globalValueFlags = map[string]bool{
-	"--actor": true, "--db": true, "-C": true, "--directory": true,
-	"--dolt-auto-commit": true,
+	"--actor": true, "--database": true, "--db": true, "-C": true,
+	"--directory": true, "--dolt-auto-commit": true, "--mem-profile": true,
 }
 
 // globalBoolFlags are accepted by every bd subcommand and take no value.
 var globalBoolFlags = map[string]bool{
-	"--global": true, "--ignore-schema-skew": true, "--json": true,
-	"--profile": true, "-q": true, "--quiet": true, "--readonly": true,
-	"--sandbox": true, "-v": true, "--verbose": true, "-h": true, "--help": true,
+	"--cpu-profile": true, "--global": true, "--ignore-schema-skew": true,
+	"--json": true, "--no-color": true, "--profile": true, "-q": true,
+	"--quiet": true, "--readonly": true, "--sandbox": true, "-v": true,
+	"--verbose": true, "-h": true, "--help": true,
 }
 
 // valueFlagsBySub holds each subcommand's value-consuming flags (beyond the
@@ -45,7 +50,8 @@ var valueFlagsBySub = map[string]map[string]bool{
 		"-a": true, "--assignee": true, "--await-id": true, "--body-file": true,
 		"--defer": true, "-d": true, "--description": true, "--design": true,
 		"--design-file": true, "--due": true, "-e": true, "--estimate": true,
-		"--external-ref": true, "--metadata": true, "--notes": true,
+		"--external-ref": true, "--if-assignee": true, "--if-status": true,
+		"--metadata": true, "--notes": true,
 		"--parent": true, "-p": true, "--priority": true, "--remove-label": true,
 		"--session": true, "--set-labels": true, "--set-metadata": true,
 		"-s": true, "--status": true, "-t": true, "--type": true,
@@ -119,6 +125,7 @@ var boolFlagsBySub = map[string]map[string]bool{
 	},
 	"update": {
 		"--allow-empty-description": true, "--claim": true, "--ephemeral": true,
+		"--force":   true,
 		"--history": true, "--no-history": true, "--persistent": true, "--stdin": true,
 	},
 	"close": {
@@ -202,7 +209,9 @@ func ValueFlags(sub string) map[string]bool {
 	if !ok {
 		return nil
 	}
-	return mergeFlagSets(globalValueFlags, subFlags)
+	base := mergeFlagSets(globalValueFlags, subFlags)
+	discovered := parseDiscoveredFlags(sub)
+	return mergeFlagSets(base, discovered.value)
 }
 
 // BoolFlags returns the set of boolean flag names for sub, merged with the
@@ -213,7 +222,191 @@ func BoolFlags(sub string) map[string]bool {
 	if !ok {
 		return nil
 	}
-	return mergeFlagSets(globalBoolFlags, subFlags)
+	base := mergeFlagSets(globalBoolFlags, subFlags)
+	discovered := parseDiscoveredFlags(sub)
+	return mergeFlagSets(base, discovered.bool)
+}
+
+type discoveredFlags struct {
+	value map[string]bool
+	bool  map[string]bool
+}
+
+var (
+	parseDiscoveredOnce sync.Map
+
+	runBdHelpForSubcommand = func(sub string) ([]byte, error) {
+		parts := strings.Split(sub, " ")
+		args := append(parts, "--help")
+		cmd := exec.Command("bd", args...)
+		return cmd.CombinedOutput()
+	}
+)
+
+func parseDiscoveredFlags(sub string) discoveredFlags {
+	if cached, ok := parseDiscoveredOnce.Load(sub); ok {
+		if parsed, ok := cached.(discoveredFlags); ok {
+			return parsed
+		}
+	}
+
+	parsed := discoveredFlags{
+		value: make(map[string]bool),
+		bool:  make(map[string]bool),
+	}
+
+	if out, err := runBdHelpForSubcommand(sub); err == nil {
+		parseHelpFlagsToSets(string(out), parsed)
+	}
+
+	parseDiscoveredOnce.Store(sub, parsed)
+	return parsed
+}
+
+// parseHelpFlagsToSets reads cobra-style help output and classifies flags as
+// value-consuming vs. boolean across both local and global flag sections.
+//
+// cobra/pflag never prints a type name for a boolean flag: a value flag's
+// usage line looks like "--status string   New status" (single space before
+// the type, then column padding before the description); a boolean flag's
+// looks like "--help   help for update" (padding starts immediately, no type
+// token at all). That single-vs-multiple-space gap after the flag name(s) is
+// the only reliable signal for whether a type token is present; collapsing
+// it with strings.Fields (as an earlier version of this parser did) makes an
+// unrecognized type token indistinguishable from the first word of a
+// boolean flag's description (dr-n959f).
+func parseHelpFlagsToSets(helpText string, dst discoveredFlags) {
+	inFlags := false
+	for _, rawLine := range strings.Split(helpText, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+
+		switch {
+		case strings.HasPrefix(line, "Flags:"):
+			inFlags = true
+			continue
+		case strings.HasPrefix(line, "Global Flags:"):
+			inFlags = true
+			continue
+		case !strings.HasPrefix(line, "-"):
+			inFlags = false
+			continue
+		}
+
+		if !inFlags {
+			continue
+		}
+
+		flags, rest := scanFlagTokens(line)
+		if len(flags) == 0 {
+			continue
+		}
+
+		isValue := hasTypeTokenColumn(rest)
+
+		for _, flag := range flags {
+			if isValue {
+				dst.value[flag] = true
+			} else {
+				dst.bool[flag] = true
+			}
+		}
+	}
+}
+
+// scanFlagTokens consumes the leading comma-separated flag aliases from a
+// trimmed help line (e.g. "-a, --assignee string   Assignee") and returns
+// them along with the untouched remainder, spacing intact.
+func scanFlagTokens(line string) (flags []string, rest string) {
+	rest = line
+	for {
+		trimmed := strings.TrimLeft(rest, " ")
+		if !strings.HasPrefix(trimmed, "-") {
+			rest = trimmed
+			return flags, rest
+		}
+
+		end := strings.IndexAny(trimmed, " ,")
+		var tok string
+		if end == -1 {
+			tok, trimmed = trimmed, ""
+		} else {
+			tok, trimmed = trimmed[:end], trimmed[end:]
+		}
+		if tok != "-" && tok != "--" {
+			flags = append(flags, tok)
+		}
+
+		if strings.HasPrefix(trimmed, ",") {
+			rest = trimmed[1:]
+			continue
+		}
+		rest = trimmed
+		return flags, rest
+	}
+}
+
+// hasTypeTokenColumn reports whether rest (the text following a help line's
+// flag aliases, spacing intact) carries a type-annotation token rather than
+// jumping straight to the description. A single leading space marks a type
+// column; two or more spaces mean the flag is boolean and rest is already
+// the description.
+func hasTypeTokenColumn(rest string) bool {
+	if !strings.HasPrefix(rest, " ") || strings.HasPrefix(rest, "  ") {
+		return false
+	}
+	token := strings.Fields(rest)
+	if len(token) == 0 {
+		return false
+	}
+	return isValueToken(token[0])
+}
+
+func isValueToken(token string) bool {
+	t := strings.Trim(token, "[]")
+	t = strings.TrimSuffix(strings.TrimPrefix(t, "<"), ">")
+	if t == "" {
+		return false
+	}
+
+	if strings.ContainsAny(t, "\\") {
+		return false
+	}
+
+	// Type annotations that are not boolean.
+	base := strings.TrimSuffix(t, "s")
+	switch t {
+	case "string", "stringArray", "stringSlice", "duration", "int", "int64", "uint", "uint64", "float64", "float32", "time.Duration", "path", "file", "type", "id", "ids", "args", "name", "keys", "value":
+		return true
+	case "bool", "boolean":
+		return false
+	}
+
+	if strings.Contains(t, "[") || strings.Contains(t, "]") {
+		return true
+	}
+
+	if strings.ContainsRune(token, '<') && strings.ContainsRune(token, '>') {
+		return true
+	}
+
+	if base != t {
+		return isValueToken(base)
+	}
+
+	for _, r := range t {
+		if unicode.IsUpper(r) {
+			return false
+		}
+	}
+
+	// Unknown lowercase type token: fail closed and treat it as value-taking.
+	// Misclassifying a value flag as boolean lets the argv scanner read the
+	// flag's value as the next positional, which bdMutationWriteIDs can then
+	// mistake for a bead ID (dr-n959f).
+	return true
 }
 
 func mergeFlagSets(sets ...map[string]bool) map[string]bool {

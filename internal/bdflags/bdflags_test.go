@@ -56,12 +56,21 @@ func TestGlobalFlagsPresentOnEverySubcommand(t *testing.T) {
 		if !boolFlags["-v"] || !boolFlags["--verbose"] {
 			t.Errorf("BoolFlags(%q) missing global -v/--verbose", sub)
 		}
+		if !boolFlags["--cpu-profile"] {
+			t.Errorf("BoolFlags(%q) missing global --cpu-profile", sub)
+		}
+		if !boolFlags["--no-color"] {
+			t.Errorf("BoolFlags(%q) missing global --no-color", sub)
+		}
 		valueFlags := ValueFlags(sub)
 		if !valueFlags["--actor"] {
 			t.Errorf("ValueFlags(%q) missing global --actor", sub)
 		}
 		if !valueFlags["-C"] || !valueFlags["--directory"] {
 			t.Errorf("ValueFlags(%q) missing global -C/--directory", sub)
+		}
+		if !valueFlags["--database"] || !valueFlags["--mem-profile"] {
+			t.Errorf("ValueFlags(%q) missing global --database/--mem-profile", sub)
 		}
 	}
 }
@@ -77,13 +86,13 @@ func TestCreateStatusFlagsConsumeValues(t *testing.T) {
 
 func TestUpdateFlagSets(t *testing.T) {
 	value := ValueFlags("update")
-	for _, f := range []string{"--assignee", "-a", "--status", "-s", "--priority", "-p", "--set-metadata", "--unset-metadata", "--parent", "--type", "-t"} {
+	for _, f := range []string{"--assignee", "-a", "--status", "-s", "--priority", "-p", "--set-metadata", "--unset-metadata", "--parent", "--type", "-t", "--if-assignee", "--if-status"} {
 		if !value[f] {
 			t.Errorf("ValueFlags(update)[%q] = false, want true", f)
 		}
 	}
 	boolFlags := BoolFlags("update")
-	for _, f := range []string{"--claim", "--ephemeral", "--persistent", "--stdin"} {
+	for _, f := range []string{"--claim", "--ephemeral", "--persistent", "--stdin", "--force"} {
 		if !boolFlags[f] {
 			t.Errorf("BoolFlags(update)[%q] = false, want true", f)
 		}
@@ -245,5 +254,73 @@ func TestScanUnknownFlagsBareBdWithoutGcPrefix(t *testing.T) {
 	findings := ScanUnknownFlags([]byte("bd update <id> --asignee bob"))
 	if len(findings) != 1 {
 		t.Fatalf("ScanUnknownFlags() = %v, want exactly 1 finding", findings)
+	}
+}
+
+func TestParseHelpFlagsToSets(t *testing.T) {
+	helpText := "Flags:\n  -a, --assignee string   Assignee\n  --claim   Claim the bead\n"
+
+	parsed := discoveredFlags{value: map[string]bool{}, bool: map[string]bool{}}
+	parseHelpFlagsToSets(helpText, parsed)
+
+	if !parsed.value["--assignee"] || !parsed.value["-a"] {
+		t.Errorf("parseHelpFlagsToSets() value = %v, want --assignee/-a", parsed.value)
+	}
+	if !parsed.bool["--claim"] {
+		t.Errorf("parseHelpFlagsToSets() bool = %v, want --claim", parsed.bool)
+	}
+}
+
+// TestParseHelpFlagsToSetsUnknownLowercaseTokenFailsClosed drives runtime
+// help discovery (dr-n959f) with a flag whose type token the parser does not
+// recognize. isValueToken must fail closed and classify it as value-taking,
+// not boolean, so bdMutationWriteIDs cannot read the value as a positional.
+func TestParseHelpFlagsToSetsUnknownLowercaseTokenFailsClosed(t *testing.T) {
+	helpText := "Flags:\n  --frobnicate widget   frobnicate the widget\n"
+
+	dst := discoveredFlags{value: map[string]bool{}, bool: map[string]bool{}}
+	parseHelpFlagsToSets(helpText, dst)
+
+	if dst.bool["--frobnicate"] {
+		t.Fatalf("parseHelpFlagsToSets() classified --frobnicate as boolean; want value-taking (unknown lowercase token %q must fail closed)", "widget")
+	}
+	if !dst.value["--frobnicate"] {
+		t.Fatalf("parseHelpFlagsToSets() did not classify --frobnicate as value-taking; got value=%v bool=%v", dst.value, dst.bool)
+	}
+}
+
+func TestValueFlagsIncorporatesDiscovered(t *testing.T) {
+	restore := runBdHelpForSubcommand
+	runBdHelpForSubcommand = func(_ string) ([]byte, error) {
+		return []byte("Flags:\n  --json   Output JSON\n  --frobnicate widget   frobnicate the widget\n"), nil
+	}
+	defer func() { runBdHelpForSubcommand = restore }()
+	parseDiscoveredOnce.Delete("close")
+	defer parseDiscoveredOnce.Delete("close")
+
+	flags := ValueFlags("close")
+	if !flags["--frobnicate"] {
+		t.Errorf("ValueFlags(close)[--frobnicate] = false, want true (discovered)")
+	}
+	// --json has no type token in the fixture (multiple spaces before the
+	// description, no single-space type column) so it must classify boolean,
+	// not value-taking.
+	if flags["--json"] {
+		t.Fatalf("ValueFlags(close)[--json] = true, want false (no type token in fixture)")
+	}
+}
+
+func TestBoolFlagsIncorporatesDiscovered(t *testing.T) {
+	restore := runBdHelpForSubcommand
+	runBdHelpForSubcommand = func(_ string) ([]byte, error) {
+		return []byte("Flags:\n  --frobnicate   toggle the widget\n"), nil
+	}
+	defer func() { runBdHelpForSubcommand = restore }()
+	parseDiscoveredOnce.Delete("reopen")
+	defer parseDiscoveredOnce.Delete("reopen")
+
+	flags := BoolFlags("reopen")
+	if !flags["--frobnicate"] {
+		t.Errorf("BoolFlags(reopen)[--frobnicate] = false, want true (discovered)")
 	}
 }
