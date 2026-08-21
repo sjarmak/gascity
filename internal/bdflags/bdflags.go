@@ -5,11 +5,12 @@
 package bdflags
 
 import (
-	"os/exec"
 	"sort"
 	"strings"
 	"sync"
 	"unicode"
+
+	"github.com/gastownhall/gascity/internal/beads"
 )
 
 // globalValueFlags are accepted by every bd subcommand and consume the next
@@ -236,10 +237,8 @@ var (
 	parseDiscoveredOnce sync.Map
 
 	runBdHelpForSubcommand = func(sub string) ([]byte, error) {
-		parts := strings.Split(sub, " ")
-		args := append(parts, "--help")
-		cmd := exec.Command("bd", args...)
-		return cmd.CombinedOutput()
+		args := append(strings.Split(sub, " "), "--help")
+		return beads.ExecCommandRunner()("", "bd", args...)
 	}
 )
 
