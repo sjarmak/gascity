@@ -217,7 +217,8 @@ func (c *CachingStore) ApplyEvent(eventType string, payload json.RawMessage) {
 	mutated := false
 	switch eventType {
 	case "bead.created":
-		if _, exists := c.beads[b.ID]; !exists {
+		_, alreadyCached := c.beads[b.ID]
+		if !alreadyCached {
 			c.noteMutationLocked(b.ID)
 			// OC-3: absorb installs the row before updateEventDepsLocked, whose
 			// clearReadyProjectionLocked must observe the newly absorbed row.
@@ -230,13 +231,20 @@ func (c *CachingStore) ApplyEvent(eventType string, payload json.RawMessage) {
 		}
 		c.updateStatsLocked()
 		mutated = true
-		if c.clearDependentReadyProjectionsLocked(b.ID) {
+		// Only a row that this event actually installed can invalidate a
+		// dependent's cached is_blocked. Re-announcing a bead the cache already
+		// holds tells the dependents nothing (dr-l09kl).
+		if !alreadyCached && c.clearDependentReadyProjectionsLocked(b.ID) {
 			mutated = true
 		}
 	case "bead.updated":
 		existing, cached := c.beads[b.ID]
 		// Read before absorb: dependents' readiness turns on this row's status,
-		// so only a real transition may invalidate their projection.
+		// so only a real transition may invalidate their projection. Gating on
+		// the field's PRESENCE re-entered the reconcile loop: the emitter always
+		// carries status, and clearing on every full-snapshot event wiped
+		// is_blocked from every cached row — the amplifier behind the
+		// reconcile-echo flood in dr-l09kl (ga-fnmb5).
 		statusChanged := !cached || existing.Status != b.Status
 		if !cached || beadChanged(existing, b, false) {
 			c.noteMutationLocked(b.ID)
@@ -251,8 +259,6 @@ func (c *CachingStore) ApplyEvent(eventType string, payload json.RawMessage) {
 			c.noteMutationLocked(b.ID)
 			mutated = true
 		}
-		// Gating on the field's PRESENCE re-entered the reconcile loop: the
-		// emitter always carries status, and clearing nils is_blocked (ga-fnmb5).
 		if statusChanged && hasCacheEventField(fields, "status") &&
 			c.clearDependentReadyProjectionsLocked(b.ID) {
 			mutated = true
@@ -305,12 +311,21 @@ func (c *CachingStore) updateEventDepsLocked(eventType string, b Bead, fields ma
 		// field changes, and the hook payload omits dependencies after removals.
 		// Treat the bead's dependency coverage as unknown until the backing
 		// store or reconciliation supplies an explicit dependency snapshot.
+		//
+		// Dropping the deps row and clearing depsComplete is what makes the
+		// unknown safe: CachedReady declines outright for a ready candidate whose
+		// deps it cannot account for, so readiness goes live until the next
+		// reconcile restores the snapshot. The bead's OWN is_blocked is not part
+		// of that guarantee and is deliberately left alone. It is bd's verdict
+		// about this bead, the reconcile pass had just installed it, and clearing
+		// it here closed a feedback loop: the reconciler's notifications are fed
+		// straight back into this same cache by the controller, is_blocked went
+		// nil on every one, and the next pass saw nil-vs-verdict as a change and
+		// re-emitted a byte-identical snapshot for every active bead, forever —
+		// ~145MB of event log per 13 minutes (dr-l09kl).
 		mutated := false
 		if _, ok := c.deps[b.ID]; ok {
 			delete(c.deps, b.ID)
-			mutated = true
-		}
-		if c.clearReadyProjectionLocked(b.ID) {
 			mutated = true
 		}
 		if c.depsComplete {

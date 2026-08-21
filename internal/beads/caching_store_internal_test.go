@@ -3116,6 +3116,225 @@ func TestCachingStoreApplyEventMergesProjectedIsBlocked(t *testing.T) {
 	}
 }
 
+func TestCachingStoreApplyEventInvalidatesDependentReadyProjectionOnlyOnNews(t *testing.T) {
+	t.Parallel()
+
+	createdAt := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name                  string
+		eventType             string
+		targetAlreadyCached   bool
+		eventStatus           string
+		wantProjectionPresent bool
+	}{
+		{
+			name:                  "cached bead.created carries no news",
+			eventType:             "bead.created",
+			targetAlreadyCached:   true,
+			eventStatus:           "open",
+			wantProjectionPresent: true,
+		},
+		{
+			name:                  "same-status bead.updated carries no news",
+			eventType:             "bead.updated",
+			targetAlreadyCached:   true,
+			eventStatus:           "open",
+			wantProjectionPresent: true,
+		},
+		{
+			name:                "new bead.created invalidates",
+			eventType:           "bead.created",
+			eventStatus:         "open",
+			targetAlreadyCached: false,
+		},
+		{
+			name:                "changed-status bead.updated invalidates",
+			eventType:           "bead.updated",
+			targetAlreadyCached: true,
+			eventStatus:         "closed",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			const targetID = "bd-target"
+			const dependentID = "bd-dependent"
+			blocked := true
+			target := Bead{
+				ID:        targetID,
+				Title:     "target",
+				Status:    "open",
+				Type:      "task",
+				CreatedAt: createdAt,
+			}
+			dependent := Bead{
+				ID:        dependentID,
+				Title:     "dependent",
+				Status:    "open",
+				Type:      "task",
+				CreatedAt: createdAt,
+				Needs:     []string{targetID},
+				IsBlocked: &blocked,
+			}
+			cachedBeads := []Bead{dependent}
+			if tc.targetAlreadyCached {
+				cachedBeads = append(cachedBeads, target)
+			}
+			backing := &completeEmbeddedDepsStore{
+				Store: NewMemStore(),
+				beads: cachedBeads,
+			}
+			cache := NewCachingStoreForTest(backing, nil)
+			if err := cache.Prime(context.Background()); err != nil {
+				t.Fatalf("Prime: %v", err)
+			}
+			if projection := cachedIsBlockedForTest(cache, dependentID); projection == nil || !*projection {
+				t.Fatalf("precondition: dependent IsBlocked = %v, want present true projection", projection)
+			}
+
+			eventBead := target
+			eventBead.Status = tc.eventStatus
+			payload, err := json.Marshal(eventBead)
+			if err != nil {
+				t.Fatalf("marshal %s event: %v", tc.eventType, err)
+			}
+			cache.ApplyEvent(tc.eventType, payload)
+
+			projection := cachedIsBlockedForTest(cache, dependentID)
+			if tc.wantProjectionPresent {
+				if projection == nil || !*projection {
+					t.Fatalf("dependent IsBlocked after %s = %v, want preserved true projection", tc.eventType, projection)
+				}
+				return
+			}
+			if projection != nil {
+				t.Fatalf("dependent IsBlocked after %s = %v, want invalidated nil projection", tc.eventType, *projection)
+			}
+		})
+	}
+}
+
+func TestCachingStoreConcurrentUpdatedEventsGateReadyProjectionInvalidation(t *testing.T) {
+	t.Parallel()
+
+	createdAt := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	t.Run("dependency removal invalidates coverage without erasing verdict", func(t *testing.T) {
+		testConcurrentDependencyRemovalInvalidation(t, createdAt)
+	})
+	t.Run("repeated no-op status snapshots neither invalidate nor refire", func(t *testing.T) {
+		testConcurrentNoOpUpdatedEvents(t, createdAt)
+	})
+}
+
+func testConcurrentDependencyRemovalInvalidation(t *testing.T, createdAt time.Time) {
+	t.Helper()
+
+	cache := newConcurrentProjectionCache(t, createdAt, nil)
+	payload, err := json.Marshal(Bead{
+		ID:        "bd-dependent",
+		Title:     "dependent",
+		Status:    "open",
+		Type:      "task",
+		CreatedAt: createdAt,
+	})
+	if err != nil {
+		t.Fatalf("marshal dependency-removal event: %v", err)
+	}
+	applyUpdatedEventConcurrently(cache, payload)
+
+	cache.mu.RLock()
+	depsComplete := cache.depsComplete
+	_, depsCached := cache.deps["bd-dependent"]
+	projection := cloneBoolPtr(cache.beads["bd-dependent"].IsBlocked)
+	cache.mu.RUnlock()
+	if depsComplete || depsCached {
+		t.Errorf("dependency projection after removal: complete=%v cached=%v, want false false", depsComplete, depsCached)
+	}
+	if projection == nil || !*projection {
+		t.Errorf("dependent IsBlocked after dependency removal = %v, want retained true verdict", projection)
+	}
+	if ready, ok := cache.CachedReady(); ok {
+		t.Errorf("CachedReady after dependency removal = %+v, ok=true; want dependency projection invalidated", ready)
+	}
+}
+
+func testConcurrentNoOpUpdatedEvents(t *testing.T, createdAt time.Time) {
+	t.Helper()
+
+	var refires atomic.Int64
+	cache := newConcurrentProjectionCache(t, createdAt, func(eventType, beadID string, _ json.RawMessage) {
+		if eventType == "bead.updated" && beadID == "bd-dependent" {
+			refires.Add(1)
+		}
+	})
+	refires.Store(0)
+	payload := json.RawMessage(`{
+		"id":"bd-blocker",
+		"title":"blocker",
+		"status":"open",
+		"issue_type":"task",
+		"created_at":"2026-01-01T00:00:00Z",
+		"dependencies":[]
+	}`)
+	applyUpdatedEventConcurrently(cache, payload)
+
+	if projection := cachedIsBlockedForTest(cache, "bd-dependent"); projection == nil || !*projection {
+		t.Errorf("dependent IsBlocked after repeated no-op events = %v, want preserved true projection", projection)
+	}
+	cache.runReconciliation()
+	if got := refires.Load(); got != 0 {
+		t.Errorf("bead.updated refires after repeated no-op events = %d, want 0", got)
+	}
+}
+
+func applyUpdatedEventConcurrently(cache *CachingStore, payload json.RawMessage) {
+	const workerCount = 16
+
+	start := make(chan struct{})
+	var ready sync.WaitGroup
+	var done sync.WaitGroup
+	ready.Add(workerCount)
+	done.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer done.Done()
+			ready.Done()
+			<-start
+			cache.ApplyEvent("bead.updated", payload)
+		}()
+	}
+	ready.Wait()
+	close(start)
+	done.Wait()
+}
+
+func newConcurrentProjectionCache(
+	t *testing.T,
+	createdAt time.Time,
+	onChange func(eventType, beadID string, payload json.RawMessage),
+) *CachingStore {
+	t.Helper()
+
+	blocked := true
+	backing := &completeEmbeddedDepsStore{
+		Store: NewMemStore(),
+		beads: []Bead{
+			{
+				ID: "bd-blocker", Title: "blocker", Status: "open", Type: "task", CreatedAt: createdAt,
+			},
+			{
+				ID: "bd-dependent", Title: "dependent", Status: "open", Type: "task", CreatedAt: createdAt,
+				Needs: []string{"bd-blocker"}, IsBlocked: &blocked,
+			},
+		},
+	}
+	cache := NewCachingStoreForTest(backing, onChange)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+	return cache
+}
+
 func TestCachingStoreApplyCloseEventClearsDependentProjectedIsBlocked(t *testing.T) {
 	t.Parallel()
 
