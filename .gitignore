@@ -45,6 +45,7 @@ internal/api/dashboardspa/web/frontend/.playwright/
 # sync-project-agents writes local migration backups here; don't commit them.
 .agents/migration/
 .gc/
+.gc-reports/
 
 # Dolt database files (added by bd init)
 .dolt/

@@ -525,6 +525,20 @@ func TestFileStoreOpenCorruptedJSON(t *testing.T) {
 When to use: corrupted data, concurrent writes, specific error types,
 double-claim conflicts, rollback behavior, boundary conditions.
 
+**Minimal `city.toml` shape for a real CLI subprocess dispatch.** A test that
+shells out to a real `gc <subcommand>` subprocess (the re-exec-self-as-"gc"
+PATH-symlink trick — see `installProductMetricsDirectChildSpyCommand` and its
+callers in `cmd/gc`) needs a `city.toml` that resolves a session end to end,
+not just parses. The minimal shape that satisfies CLI-level session
+resolution: a `[[named_session]]` entry with a `template` naming an
+`[[agent]]`, a `[providers.<name>]` block with `base = "builtin:claude"` (or
+whichever built-in the agent's `provider` names), and the agent's `provider`
+field set to that same name. Missing any one of the three fails resolution
+with an error that does not obviously point back at `city.toml` — this was
+found by trial and error via a throwaway debug test (dr-3msk6.1's
+github-pr-repair postcondition test, `cbf4bbd2b`), so start from this shape
+rather than rediscovering it.
+
 `make test` and `make test-cover` now follow this boundary strictly: they
 run the fast unit loop only, with `GC_FAST_UNIT=1` gating slow `cmd/gc`
 process scenarios. Slow process-backed cases
@@ -603,6 +617,20 @@ GC_FAST_UNIT=0 ./scripts/test-integration-shard packages-cmd-gc-3-of-6
 Raw `go test` is still appropriate for a focused package or a single failing
 test. Do not use it as the default for full local sweeps when a sharded target
 exists.
+
+**When a long `go test` run is launched in the background (`nohup ... &`, an
+agent harness's background-task tool, CI polling), the launcher's own exit
+code is not the test result.** A backgrounding wrapper reports success the
+moment it has detached the child process, not when `go test` itself finishes;
+a harness task-notification can likewise report "completed (exit code 0)" for
+the wrapper shell while the detached `go test` process is still running or
+already failed. Confirm the real result from the test binary's own output:
+grep the captured log for `--- FAIL:` (per-test) and the trailing `ok`/`FAIL
+<package> <duration>` summary line, not the launcher's reported status. If the
+capture shows a bare `FAIL` with no `--- FAIL:` line above it, the per-test
+detail was truncated before capture (e.g. a `| tail -N` in the launch command)
+and needs a direct re-run with output written straight to a file to see which
+test actually failed.
 
 The `productmetrics_testhook` profile is a required, path-gated CI lane with
 six named owners, including the real CLI re-exec process contract. Its tagged

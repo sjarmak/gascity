@@ -400,6 +400,56 @@ becoming more useful as models improve — it becomes LESS useful instead.
   into `applyRigPatch` so layered configs (fragments, patches) can
   override it. No field-sync test exists for Rig today; the patch path
   must be checked manually.
+- **Resolving conflicts in the command-census files:** `go run
+  ./cmd/gen-command-census` touches four files, but they are NOT
+  interchangeable "generated artifacts." `cmd/gc/productmetrics_command_census.json`
+  is the hand-maintained MANIFEST (`cmd/gen-command-census/main.go:48`
+  reads it as the generator's input); `cmd/gc/metrics_census_gen.go`,
+  `internal/productmetrics/command_ids_gen.go`, and
+  `schemas/metrics/example/result.schema.json` are the DERIVED output.
+  On a rebase/merge conflict, taking either side wholesale for the
+  manifest and then regenerating is unsafe: two branches that each add
+  new commands independently both consume `next_id` from their own base,
+  so their generated IDs collide once merged (e.g. one side assigns ID
+  202 to a new command, the other independently assigns 202 to a
+  different new command). Taking `--ours`/`--theirs` blindly either
+  silently drops one side's new commands or leaves colliding IDs that
+  the regenerator won't itself catch. Resolve it by hand: diff each
+  side's `commands` array against their common merge-base to find the
+  actual new entries, keep both sets, renumber the later side's new
+  entries starting from the CURRENT (post-merge) `next_id`, keep the
+  array sorted by `path` (`validateSortedRows` in
+  `internal/commandcensus/manifest.go` enforces this), bump `next_id`
+  past the highest ID used, then run `go run ./cmd/gen-command-census`
+  (no `--check`) to regenerate the three derived files from the
+  corrected manifest and `go run ./cmd/gen-command-census --check` to
+  confirm no drift. Any test asserting a literal generated-catalog count
+  (e.g. `internal/productmetrics/event_test.go`) must have its literal
+  updated to match the real post-regeneration count — get that count by
+  running the test once and reading its failure message, not by hand
+  arithmetic. (Landed 2026-08-18 after this exact mistake nearly shipped
+  during PR #5193's rebase — a first pass took `--ours` for the manifest
+  and silently dropped that PR's own new `gc worktree` commands.)
+
+- **Resolving conflicts in the resource-census ledger files**: a second,
+  unrelated generated-artifact family with the same failure mode.
+  `internal/testpolicy/resourcecensus/census.go`'s `bootstrapPolicy` Go
+  literal is the source of truth for test-resource-debt baselines
+  (subprocess/fixed_sleep/environment call-site counts); `test/test-resources.toml`
+  must mirror it exactly; `TESTING.md`'s "CHECKED TEST RESOURCE LEDGER" table is
+  *generated* from `test-resources.toml` (`go test
+  ./internal/testpolicy/resourcecensus -run
+  TestRepositoryLedgerMatchesCensusAndDocumentation -update`). On a rebase
+  conflict in any of these three, do not hand-merge the numbers from either
+  side: take the current/HEAD baseline as a starting point, then run `go test
+  ./internal/testpolicy/resourcecensus/... -count=1` to get the census
+  self-check's live diagnostic of exactly which counters the rebased branch's
+  own new code requires bumping, apply only those deltas to both `census.go`
+  and `test-resources.toml` in lockstep, then regenerate `TESTING.md` via the
+  `-update` flag above and re-run the check clean. (Landed 2026-08-18 while
+  rebasing `fix/supervisor-adopt-dolt-port` 518 commits onto `origin/main`;
+  an initial take-HEAD resolution was one increment stale because it didn't
+  yet account for the branch's own rebased-in test files.)
 
 - `TESTING.md` — testing philosophy, tier boundaries, and sharded local
   runners. Read before writing any test. For broad local sweeps, prefer the
