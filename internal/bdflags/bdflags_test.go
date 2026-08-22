@@ -35,6 +35,24 @@ func TestParseHelpFlagsToSets(t *testing.T) {
 	}
 }
 
+func TestParseHelpFlagsToSetsUnknownLowercaseTypeFailsClosed(t *testing.T) {
+	helpText := `Flags:
+      --output template   Render output with the selected template`
+
+	parsed := discoveredFlags{
+		value: map[string]bool{},
+		bool:  map[string]bool{},
+	}
+	parseHelpFlagsToSets(helpText, &parsed)
+
+	if parsed.bool["--output"] {
+		t.Fatal("--output classified as boolean for unknown lowercase type token; want value-consuming")
+	}
+	if !parsed.value["--output"] {
+		t.Fatal("--output not classified as value-consuming for unknown lowercase type token")
+	}
+}
+
 func TestValueFlagsIncorporatesDiscovered(t *testing.T) {
 	orig := runBdHelpForSubcommand
 	runBdHelpForSubcommand = func(sub string) ([]byte, error) {

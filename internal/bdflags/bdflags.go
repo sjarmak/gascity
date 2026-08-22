@@ -385,7 +385,7 @@ func isValueToken(token string) bool {
 	switch t {
 	case "string", "stringArray", "stringSlice", "duration", "int", "int64", "uint", "uint64", "float64", "float32", "time.Duration", "path", "file", "type", "id", "ids", "args", "name", "keys", "value":
 		return true
-	case "bool", "boolean":
+	case "bool", "boolean", "help":
 		return false
 	}
 
@@ -403,7 +403,10 @@ func isValueToken(token string) bool {
 		}
 	}
 
-	return false
+	// Unknown lowercase tokens in cobra's type position are ambiguous. Fail
+	// closed by treating them as value-consuming so a following argv token can
+	// never be mistaken for a bead ID.
+	return true
 }
 
 func mergeFlagSets(sets ...map[string]bool) map[string]bool {
