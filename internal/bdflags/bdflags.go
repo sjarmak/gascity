@@ -387,6 +387,13 @@ func isValueToken(token string) bool {
 		return true
 	case "bool", "boolean":
 		return false
+	case "help":
+		// Not a real type annotation. strings.Fields collapses the
+		// help-column padding after a no-value flag like --help, so the
+		// first word of ITS OWN description ("help for update") lands in
+		// the type-token position. Treat it as boolean rather than folding
+		// it into the unknown-lowercase-token fail-closed default below.
+		return false
 	}
 
 	if strings.Contains(t, "[") || strings.Contains(t, "]") {
@@ -403,7 +410,11 @@ func isValueToken(token string) bool {
 		}
 	}
 
-	return false
+	// Unknown lowercase type token: fail closed and treat it as value-taking.
+	// Misclassifying a value flag as boolean lets the argv scanner read the
+	// flag's value as the next positional, which bdMutationWriteIDs can then
+	// mistake for a bead ID (dr-n959f).
+	return true
 }
 
 func mergeFlagSets(sets ...map[string]bool) map[string]bool {

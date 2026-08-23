@@ -35,6 +35,27 @@ func TestParseHelpFlagsToSets(t *testing.T) {
 	}
 }
 
+// TestParseHelpFlagsToSetsUnknownLowercaseTokenFailsClosed drives runtime
+// help discovery (dr-n959f) with a flag whose type token the parser does not
+// recognize. isValueToken must fail closed and classify it as value-taking,
+// not boolean, so bdMutationWriteIDs cannot read the value as a positional.
+func TestParseHelpFlagsToSetsUnknownLowercaseTokenFailsClosed(t *testing.T) {
+	helpText := `Flags:
+      --frobnicate widget   frobnicate the widget`
+
+	parsed := discoveredFlags{
+		value: map[string]bool{},
+		bool:  map[string]bool{},
+	}
+	parseHelpFlagsToSets(helpText, &parsed)
+	if parsed.bool["--frobnicate"] {
+		t.Fatalf("--frobnicate classified as boolean; want value-taking (unknown lowercase type token %q must fail closed)", "widget")
+	}
+	if !parsed.value["--frobnicate"] {
+		t.Fatalf("--frobnicate not classified as value-taking; got value=%v bool=%v", parsed.value, parsed.bool)
+	}
+}
+
 func TestValueFlagsIncorporatesDiscovered(t *testing.T) {
 	orig := runBdHelpForSubcommand
 	runBdHelpForSubcommand = func(sub string) ([]byte, error) {
