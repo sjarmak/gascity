@@ -72,10 +72,7 @@ func TestSessionEventsLive(t *testing.T) {
 	})
 
 	// Forced status change on evt-a's pane must arrive attributed.
-	a, ok, err := p.c.getAgent(ctx, "evt-a")
-	if err != nil || !ok {
-		t.Fatalf("getAgent evt-a: ok=%v err=%v", ok, err)
-	}
+	a := observedSession(t, p, "evt-a")
 	report := func(pane, state string) {
 		t.Helper()
 		out, err := exec.Command("herdr", "--session", session, "pane", "report-agent", pane,
@@ -99,10 +96,7 @@ func TestSessionEventsLive(t *testing.T) {
 		t.Fatalf("Start evt-b: %v", err)
 	}
 	t.Cleanup(func() { _ = p.Stop("evt-b") })
-	b, ok, err := p.c.getAgent(ctx, "evt-b")
-	if err != nil || !ok {
-		t.Fatalf("getAgent evt-b: ok=%v err=%v", ok, err)
-	}
+	b := observedSession(t, p, "evt-b")
 	// The resubscribe cycle emits a fresh resync; wait for it so the report
 	// below races nothing.
 	waitForEvent(t, ch, 15*time.Second, func(ev runtime.SessionEvent) bool {

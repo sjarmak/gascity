@@ -168,15 +168,15 @@ func (p *Provider) clearPaneBinding(name string) {
 	_ = p.RemoveMeta(name, metaBoundAt)
 }
 
-// boundSessionNames enumerates the session names with a live-looking sidecar
-// binding (a stored name and pane id), for ListRunning to merge with herdr's
-// registry — which never sees raw shell sessions.
-func (p *Provider) boundSessionNames() []string {
+// eachBinding calls fn for every sidecar that carries a live-looking binding
+// (both a stored session name and a stored pane id). Unreadable or partial
+// sidecars are skipped: a binding half-written by an in-flight Start is not
+// yet a placement.
+func (p *Provider) eachBinding(fn func(name, pane string)) {
 	entries, err := os.ReadDir(p.metaDir)
 	if err != nil {
-		return nil
+		return
 	}
-	var names []string
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -185,12 +185,33 @@ func (p *Provider) boundSessionNames() []string {
 		if err != nil || name == "" {
 			continue
 		}
-		if pane, err := readMetaFile(filepath.Join(p.metaDir, e.Name(), sanitize(metaBoundPane))); err != nil || pane == "" {
+		pane, err := readMetaFile(filepath.Join(p.metaDir, e.Name(), sanitize(metaBoundPane)))
+		if err != nil || pane == "" {
 			continue
 		}
-		names = append(names, name)
+		fn(name, pane)
 	}
+}
+
+// boundSessionNames enumerates the session names with a live-looking sidecar
+// binding (a stored name and pane id), for ListRunning to merge with herdr's
+// registry — which never sees raw shell sessions.
+func (p *Provider) boundSessionNames() []string {
+	var names []string
+	p.eachBinding(func(name, _ string) { names = append(names, name) })
 	return names
+}
+
+// boundPaneIndex maps herdr pane id → gc session name for every live-looking
+// binding. This is the raw-shell half of the picture: herdr names a pane in
+// its agent registry only when gc launched it as a detected agent KIND, so
+// anything consuming agent.list alone (activity stamping, session-event
+// attribution) is blind to raw and bare-shell sessions. The sidecar is the
+// only place their gc name exists.
+func (p *Provider) boundPaneIndex() map[string]string {
+	idx := make(map[string]string)
+	p.eachBinding(func(name, pane string) { idx[pane] = name })
+	return idx
 }
 
 // readMetaFile reads one sidecar value ("" when absent).

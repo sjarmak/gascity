@@ -114,8 +114,15 @@ func (c *client) runWithSecrets(ctx context.Context, declared []string, args ...
 	return env.Result, nil
 }
 
-// agentInfo mirrors herdr's agent object.
+// agentInfo mirrors herdr's agent object. It also decodes a pane.list entry,
+// which carries the same fields minus the registry name (see observed.go).
 type agentInfo struct {
+	// Name is the REGISTRY name gc assigned via `agent start <name> --kind`.
+	// Do not confuse it with herdr's sibling "agent" key, which holds the
+	// detected KIND ("claude", "codex"): a payload can carry one, both, or
+	// neither. `pane report-agent` sets the kind and leaves the name unset,
+	// so an entry that looks named on the wire can still decode to Name ""
+	// — and only a name-bearing entry is addressable by `agent get <name>`.
 	Name        string `json:"name"`
 	PaneID      string `json:"pane_id"`
 	WorkspaceID string `json:"workspace_id"`

@@ -51,10 +51,7 @@ func TestActivityLive(t *testing.T) {
 	}
 	t.Logf("seeded: %v (age %v)", first, time.Since(first))
 
-	a, ok, err := p.c.getAgent(ctx, "act-a")
-	if err != nil || !ok {
-		t.Fatalf("getAgent act-a: ok=%v err=%v", ok, err)
-	}
+	a := observedSession(t, p, "act-a")
 	t.Logf("natural agent_status of an undetected pane: %q (revision %d)", a.AgentStatus, a.Revision)
 
 	report := func(state string) {
@@ -68,8 +65,14 @@ func TestActivityLive(t *testing.T) {
 
 	// working → continuously active: successive reads advance and stay ~now.
 	report("working")
+	// Gate on the stamp moving PAST the cold seed, not merely on it being
+	// fresh: the seed is itself moments old here, so a freshness-only
+	// predicate is satisfied before the tracker has polled the reported
+	// status even once, and the advance check below then reads a frozen
+	// stamp twice. Under a loaded full-package run that first poll is late
+	// often enough to fail.
 	waitActivity(t, p, "act-a", 5*time.Second, func(got time.Time) bool {
-		return !got.IsZero() && time.Since(got) < 100*time.Millisecond
+		return got.After(first) && time.Since(got) < 100*time.Millisecond
 	})
 	w1 := lastActivity(t, p, "act-a")
 	time.Sleep(30 * time.Millisecond)
@@ -112,19 +115,13 @@ func TestActivityLive(t *testing.T) {
 		if got := lastActivity(t, p, "act-b"); !got.Equal(aged) {
 			t.Fatalf("quiet unknown-status pane must age, not re-stamp: %v then %v", aged, got)
 		}
-		b, ok, err := p.c.getAgent(ctx, "act-b")
-		if err != nil || !ok {
-			t.Fatalf("getAgent act-b: ok=%v err=%v", ok, err)
-		}
+		b := observedSession(t, p, "act-b")
 		out, err := exec.Command("herdr", "--session", session, "pane", "run", b.PaneID, "revision-poke").CombinedOutput()
 		if err != nil {
 			t.Fatalf("pane run: %v: %s", err, out)
 		}
 		time.Sleep(500 * time.Millisecond) // several shrunk poll intervals
-		after, ok, err := p.c.getAgent(ctx, "act-b")
-		if err != nil || !ok {
-			t.Fatalf("getAgent act-b after poke: ok=%v err=%v", ok, err)
-		}
+		after := observedSession(t, p, "act-b")
 		if after.Revision != b.Revision {
 			bumped := waitActivity(t, p, "act-b", 5*time.Second, func(got time.Time) bool {
 				return got.After(aged)
@@ -147,6 +144,24 @@ func TestActivityLive(t *testing.T) {
 	waitActivity(t, p, "act-a", 10*time.Second, func(got time.Time) bool {
 		return got.IsZero()
 	})
+}
+
+// observedSession is the live-test lookup for one session's herdr-side view.
+// It goes through observedSessions rather than the agent registry on purpose:
+// these sessions run raw commands, and herdr names a pane in agent.list only
+// when gc launched it as a detected agent kind, so a registry lookup answers
+// not-found for every one of them.
+func observedSession(t *testing.T, p *Provider, name string) agentInfo {
+	t.Helper()
+	observed, err := p.observedSessions(context.Background())
+	if err != nil {
+		t.Fatalf("observedSessions: %v", err)
+	}
+	a, ok := observed[name]
+	if !ok {
+		t.Fatalf("session %q not observed (have %d entries)", name, len(observed))
+	}
+	return a
 }
 
 // liveActivityCfg is the live-test agent config: cat idles forever with no

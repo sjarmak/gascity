@@ -9,8 +9,9 @@ import (
 
 // This file implements GetLastActivity for herdr. herdr exposes no activity
 // timestamp anywhere in its API, so the provider maintains one: a lazily
-// started tracker polls agent.list and stamps a per-session last-activity
-// time from what the polls OBSERVE. The design constraints, in order:
+// started tracker polls the merged session view (observed.go: agent.list plus
+// the bound panes it cannot see) and stamps a per-session last-activity time
+// from what the polls OBSERVE. The design constraints, in order:
 //
 //   - Level-triggered only. herdr replays a backlog of recent events to every
 //     new subscription (see events.go), so event content is never a stamp
@@ -23,7 +24,7 @@ import (
 //     live agent — the churn class that got the #312 idle nudger reverted
 //     (#468). While the last polled status is working, GetLastActivity
 //     returns now.
-//   - Status outranks the revision counter. agent.list carries a per-pane
+//   - Status outranks the revision counter. Every listing carries a per-pane
 //     output revision, but a DETECTED agent's idle TUI may still redraw
 //     (spinners, status lines), and stamping those ticks would make idle
 //     sessions read as permanently active. The revision stamps activity only
@@ -104,7 +105,7 @@ func (a *activityTracker) start(p *Provider) {
 		a.cancel = cancel
 		a.done = done
 		a.mu.Unlock()
-		a.poll(ctx, p.c)
+		a.poll(ctx, p)
 		go func() {
 			defer close(done)
 			a.run(ctx, p)
@@ -175,19 +176,22 @@ func (a *activityTracker) run(ctx context.Context, p *Provider) {
 			}
 		case <-debounce.C:
 			armed = false
-			a.poll(ctx, p.c)
+			a.poll(ctx, p)
 		case <-ticker.C:
-			a.poll(ctx, p.c)
+			a.poll(ctx, p)
 		}
 	}
 }
 
-// poll reconciles the map against one agent.list snapshot. Stamps: first
-// observation, any status change, and — only for status "unknown" — a moved
-// output revision. A failed poll keeps the previous state untouched.
-func (a *activityTracker) poll(ctx context.Context, c *client) {
+// poll reconciles the map against one observedSessions snapshot — the agent
+// registry merged with bound raw panes, so bare shells are tracked too (see
+// observed.go; the "unknown" revision leg below is unreachable without it).
+// Stamps: first observation, any status change, and — only for status
+// "unknown" — a moved output revision. A failed poll keeps the previous state
+// untouched.
+func (a *activityTracker) poll(ctx context.Context, p *Provider) {
 	cctx, cancel := context.WithTimeout(ctx, activityPollTimeout)
-	agents, err := c.sockAgentList(cctx)
+	observed, err := p.observedSessions(cctx)
 	cancel()
 	if err != nil {
 		return
@@ -195,13 +199,10 @@ func (a *activityTracker) poll(ctx context.Context, c *client) {
 	now := a.now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	next := make(map[string]activityEntry, len(agents))
-	for _, ag := range agents {
-		if ag.Name == "" {
-			continue
-		}
+	next := make(map[string]activityEntry, len(observed))
+	for name, ag := range observed {
 		status := strings.ToLower(strings.TrimSpace(ag.AgentStatus))
-		prev, seen := a.entries[ag.Name]
+		prev, seen := a.entries[name]
 		e := activityEntry{status: status, revision: ag.Revision, stamp: prev.stamp}
 		switch {
 		case !seen:
@@ -211,7 +212,7 @@ func (a *activityTracker) poll(ctx context.Context, c *client) {
 		case status == agentStatusUnknown && ag.Revision != prev.revision:
 			e.stamp = now
 		}
-		next[ag.Name] = e
+		next[name] = e
 	}
 	a.entries = next
 }

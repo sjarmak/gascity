@@ -108,7 +108,7 @@ func (p *Provider) SubscribeSessionEvents(ctx context.Context) (<-chan runtime.S
 // backoff. Failures are logged once per streak, not per retry.
 func (p *Provider) runSessionEventStream(ctx context.Context, ch chan runtime.SessionEvent) {
 	defer close(ch)
-	s := &sessionEventStream{c: p.c, ch: ch}
+	s := &sessionEventStream{p: p, c: p.c, ch: ch}
 	backoff := sessionEventMinBackoff
 	for {
 		if ctx.Err() != nil {
@@ -145,6 +145,10 @@ func (p *Provider) runSessionEventStream(ctx context.Context, ch chan runtime.Se
 
 // sessionEventStream is one subscriber's translation state.
 type sessionEventStream struct {
+	// p supplies the merged session view (observed.go). Attribution cannot
+	// come from the agent registry alone: raw and bare-shell panes never
+	// enter it, so their frames would arrive with an empty session name.
+	p  *Provider
 	c  *client
 	ch chan runtime.SessionEvent
 
@@ -167,23 +171,23 @@ type sessionEventStream struct {
 // filter set, emit the leading resync, then translate frames until the
 // transport fails (err), the filter set must grow (resubscribe), or ctx ends.
 func (s *sessionEventStream) runCycle(ctx context.Context) (resubscribe bool, err error) {
-	agents, err := s.c.sockAgentList(ctx)
+	observed, err := s.p.observedSessions(ctx)
 	if err != nil {
 		return false, err
 	}
-	s.paneNames = make(map[string]string, len(agents))
-	s.subscribed = make(map[string]bool, len(agents))
+	s.paneNames = make(map[string]string, len(observed))
+	s.subscribed = make(map[string]bool, len(observed))
 	subs := []subscribeSub{
 		{Type: "pane.created"},
 		{Type: "pane.closed"},
 		{Type: "pane.exited"},
 		{Type: "pane.agent_detected"},
 	}
-	for _, a := range agents {
-		if a.PaneID == "" || a.Name == "" {
+	for name, a := range observed {
+		if a.PaneID == "" {
 			continue
 		}
-		s.paneNames[a.PaneID] = a.Name
+		s.paneNames[a.PaneID] = name
 		if !s.subscribed[a.PaneID] {
 			s.subscribed[a.PaneID] = true
 			subs = append(subs, subscribeSub{Type: "pane.agent_status_changed", PaneID: a.PaneID})
@@ -261,15 +265,15 @@ func (s *sessionEventStream) runCycle(ctx context.Context) (resubscribe bool, er
 		case <-relist.C:
 			relistArmed = false
 			s.tryPendingResync() // piggyback: a drained consumer gets its owed resync even in a quiet stream
-			agents, err := s.c.sockAgentList(ctx)
+			observed, err := s.p.observedSessions(ctx)
 			if err != nil {
 				return false, err
 			}
-			for _, a := range agents {
-				if a.PaneID == "" || a.Name == "" {
+			for name, a := range observed {
+				if a.PaneID == "" {
 					continue
 				}
-				s.paneNames[a.PaneID] = a.Name
+				s.paneNames[a.PaneID] = name
 				if !s.subscribed[a.PaneID] {
 					resubscribe = true
 				}
@@ -301,7 +305,7 @@ func (s *sessionEventStream) handleFrame(line []byte) (relistHint bool) {
 		return false
 	}
 	ev := runtime.SessionEvent{
-		Session: s.paneNames[f.Data.PaneID],
+		Session: s.sessionFor(f.Data.PaneID),
 		Ref:     f.Data.PaneID,
 		Time:    time.Now(),
 	}
@@ -328,6 +332,27 @@ func (s *sessionEventStream) handleFrame(line []byte) (relistHint bool) {
 	}
 	s.emit(ev)
 	return relistHint
+}
+
+// sessionFor attributes a pane to its gc session name. The cycle's map answers
+// almost every frame; a miss falls back to the sidecar bindings, which Start
+// persists before the pane can emit anything. The fallback is what makes
+// attribution race-free: the pane_created hint only ARMS a debounced re-list,
+// so a session that exits inside that debounce (a short command) would
+// otherwise report its own exit under an empty name. Hits are merged into the
+// map, so the lookup costs one directory read per newly seen pane.
+func (s *sessionEventStream) sessionFor(paneID string) string {
+	if paneID == "" {
+		return ""
+	}
+	if name := s.paneNames[paneID]; name != "" {
+		return name
+	}
+	name := s.p.boundPaneIndex()[paneID]
+	if name != "" {
+		s.paneNames[paneID] = name
+	}
+	return name
 }
 
 // emit delivers ev without ever blocking the read loop: an owed resync is
@@ -424,4 +449,32 @@ func (c *client) sockAgentList(ctx context.Context) ([]agentInfo, error) {
 		return nil, fmt.Errorf("herdr agent.list (socket): decode: %w", err)
 	}
 	return wrap.Agents, nil
+}
+
+// sockPaneList is pane.list over a dedicated short-lived connection. A pane
+// object carries the same pane_id / agent_status / revision fields agentInfo
+// reads, minus the registry name — which is exactly why it is needed: raw and
+// bare-shell panes never enter agent.list, so this is the only view that sees
+// them at all. Their gc name comes from the sidecar binding, not from herdr.
+func (c *client) sockPaneList(ctx context.Context) ([]agentInfo, error) {
+	conn, err := c.dialSocket(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(sessionEventOpTimeout))
+	if err := sockSend(conn, "pane.list", struct{}{}); err != nil {
+		return nil, fmt.Errorf("herdr pane.list (socket): %w", err)
+	}
+	res, err := readSockResponse(bufio.NewReader(conn))
+	if err != nil {
+		return nil, fmt.Errorf("herdr pane.list (socket): %w", err)
+	}
+	var wrap struct {
+		Panes []agentInfo `json:"panes"`
+	}
+	if err := json.Unmarshal(res, &wrap); err != nil {
+		return nil, fmt.Errorf("herdr pane.list (socket): decode: %w", err)
+	}
+	return wrap.Panes, nil
 }
