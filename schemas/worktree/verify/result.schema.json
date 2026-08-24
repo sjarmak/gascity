@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "gc worktree verify --json result",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "ok",
+    "command",
+    "action",
+    "path",
+    "branch",
+    "head",
+    "created",
+    "branch_created"
+  ],
+  "properties": {
+    "schema_version": { "const": "1" },
+    "ok": { "const": true },
+    "command": { "const": "worktree verify" },
+    "action": { "const": "verify" },
+    "path": { "type": "string" },
+    "branch": { "type": "string" },
+    "head": { "type": "string" },
+    "created": { "const": false },
+    "branch_created": { "const": false },
+    "planned": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "additionalProperties": true
+}

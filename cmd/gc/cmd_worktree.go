@@ -117,7 +117,7 @@ func runWorktreeEnsure(opts worktreeCmdOpts, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "gc worktree ensure: %v\n", err) //nolint:errcheck
 		return 1
 	}
-	return writeWorktreeReport(rep, opts, stdout, stderr)
+	return writeWorktreeReport("ensure", rep, opts, stdout, stderr)
 }
 
 func runWorktreeVerify(opts worktreeCmdOpts, stdout, stderr io.Writer) int {
@@ -131,12 +131,27 @@ func runWorktreeVerify(opts worktreeCmdOpts, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "gc worktree verify: %v\n", err) //nolint:errcheck
 		return 1
 	}
-	return writeWorktreeReport(rep, opts, stdout, stderr)
+	return writeWorktreeReport("verify", rep, opts, stdout, stderr)
 }
 
-func writeWorktreeReport(rep worktree.Report, opts worktreeCmdOpts, stdout, stderr io.Writer) int {
+type worktreeJSONResult struct {
+	SchemaVersion string `json:"schema_version"`
+	OK            bool   `json:"ok"`
+	Command       string `json:"command"`
+	Action        string `json:"action"`
+	worktree.Report
+}
+
+func writeWorktreeReport(action string, rep worktree.Report, opts worktreeCmdOpts, stdout, stderr io.Writer) int {
 	if opts.JSON {
-		if err := json.NewEncoder(stdout).Encode(rep); err != nil {
+		result := worktreeJSONResult{
+			SchemaVersion: "1",
+			OK:            true,
+			Command:       "worktree " + action,
+			Action:        action,
+			Report:        rep,
+		}
+		if err := json.NewEncoder(stdout).Encode(result); err != nil {
 			fmt.Fprintf(stderr, "gc worktree: encoding report: %v\n", err) //nolint:errcheck
 			return 1
 		}

@@ -118,3 +118,79 @@ func TestCmdWorktreeRegistered(t *testing.T) {
 	}
 	t.Fatal("gc worktree command is not registered on the root command")
 }
+
+func TestCmdWorktreeEnsureStrictJSONContract(t *testing.T) {
+	t.Setenv("GC_JSON_CONTRACT_STRICT", "1")
+	repo, base := worktreeTestRepo(t)
+	wt := filepath.Join(t.TempDir(), "wt")
+	args := []string{
+		"worktree", "ensure", "--json",
+		"--repo", repo,
+		"--path", wt,
+		"--branch", "work/gc-test",
+		"--base", base,
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run(args, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(%v) failed: code=%d stdout=%q stderr=%q", args, code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "json_unsupported") {
+		t.Fatalf("gc worktree ensure still lacks declared JSON support: %s", stdout.String())
+	}
+	var result struct {
+		SchemaVersion string `json:"schema_version"`
+		OK            bool   `json:"ok"`
+		Command       string `json:"command"`
+		Action        string `json:"action"`
+		Path          string `json:"path"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal JSON output %q: %v", stdout.String(), err)
+	}
+	if result.SchemaVersion != "1" || !result.OK || result.Command != "worktree ensure" ||
+		result.Action != "ensure" || result.Path != wt {
+		t.Fatalf("JSON result = %+v, want declared structured ensure output", result)
+	}
+	validateJSONAgainstResultSchema(t, []string{"worktree", "ensure"}, stdout.Bytes())
+}
+
+func TestCmdWorktreeVerifyStrictJSONContract(t *testing.T) {
+	t.Setenv("GC_JSON_CONTRACT_STRICT", "1")
+	repo, base := worktreeTestRepo(t)
+	wt := filepath.Join(t.TempDir(), "wt")
+	var setupStdout, setupStderr bytes.Buffer
+	if code := runWorktreeEnsure(worktreeCmdOpts{
+		Repo: repo, Path: wt, Branch: "work/gc-test", Base: base,
+	}, &setupStdout, &setupStderr); code != 0 {
+		t.Fatalf("ensure setup exit = %d, stderr: %s", code, setupStderr.String())
+	}
+
+	args := []string{
+		"worktree", "verify", "--json",
+		"--repo", repo,
+		"--path", wt,
+		"--branch", "work/gc-test",
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run(args, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(%v) failed: code=%d stdout=%q stderr=%q", args, code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "json_unsupported") {
+		t.Fatalf("gc worktree verify still lacks declared JSON support: %s", stdout.String())
+	}
+	var result struct {
+		SchemaVersion string `json:"schema_version"`
+		OK            bool   `json:"ok"`
+		Command       string `json:"command"`
+		Action        string `json:"action"`
+		Path          string `json:"path"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal JSON output %q: %v", stdout.String(), err)
+	}
+	if result.SchemaVersion != "1" || !result.OK || result.Command != "worktree verify" ||
+		result.Action != "verify" || result.Path != wt {
+		t.Fatalf("JSON result = %+v, want declared structured verify output", result)
+	}
+	validateJSONAgainstResultSchema(t, []string{"worktree", "verify"}, stdout.Bytes())
+}
