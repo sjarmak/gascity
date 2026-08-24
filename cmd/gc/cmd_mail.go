@@ -745,14 +745,12 @@ func doMailCheckTargetWithFormat(mp mail.Provider, target resolvedMailTarget, in
 				fmt.Fprintf(stderr, "gc mail check: writing hook output: %v\n", err) //nolint:errcheck // best-effort stderr
 				return 0
 			}
-			// Archive the SAME messages that were injected: priority-sort
-			// before the clamp so the archived set matches formatInjectOutput's
-			// displayed set (a priority:1 handoff that floats into the window is
+			// Archive the SAME messages that were injected: selectInjectMessages
+			// is the single authority for this window, so the archived set
+			// always matches formatInjectOutput's displayed set (a priority:1
+			// handoff, or the newest three, that floats into the window is
 			// injected AND archived, never injected-but-not-archived).
-			injectedMessages := sortMailByPriority(messages)
-			if len(injectedMessages) > mailInjectMaxMessages {
-				injectedMessages = injectedMessages[:mailInjectMaxMessages]
-			}
+			injectedMessages := selectInjectMessages(messages)
 			archiveInjectedAutoHandoffMessages(mp, injectedMessages, stderr)
 		}
 		return 0 // --inject always exits 0
@@ -784,45 +782,51 @@ func archiveInjectedAutoHandoffMessages(mp mail.Provider, messages []mail.Messag
 	}
 }
 
-// sortMailByPriority returns a copy of messages ordered by descending Priority
-// (higher first), stable so ties keep arrival (oldest-first) order. This runs
-// BEFORE the mailInjectMaxMessages clamp so a higher-priority unread message
-// (e.g. a restart handoff tagged priority:1) surfaces within the injection
-// window instead of being dropped by arrival order. It returns a copy so the
-// caller's (possibly cached, e.g. api.CachedRead) backing slice is never
-// reordered as a side effect.
-//
-// Safety: mail.Message.Priority has no writer for ordinary mail today —
-// extractPriority parses a numeric `priority:N` label and every normal message
-// is priority 0 — so on existing all-priority-0 mail SliceStable is a provable
-// no-op that preserves oldest-first order. Only newly priority-tagged mail
-// floats. See STAGED-mail-priority (gastownhall/gascity Phase-4
-// priority-stratified inbox check).
-func sortMailByPriority(messages []mail.Message) []mail.Message {
+// selectInjectMessages is the single authority for which messages appear in
+// the mail-inject banner (and, by extension, which get auto-archived
+// alongside it — see doMailCheckTargetWithFormat and
+// sessionStartAutoHandoffInjection, which both call this instead of
+// re-deriving the selection). It orders by Priority DESC (a priority-tagged
+// handoff, e.g. priority:1, always outranks recency), then CreatedAt DESC
+// (newest first) so a seat with a backlog still sees new mail instead of the
+// oldest three, then ID as a deterministic final tiebreak so tests never
+// flake on equal timestamps. It returns a copy — the caller's (possibly
+// cached) backing slice is never reordered as a side effect — clamped to at
+// most mailInjectMaxMessages.
+func selectInjectMessages(messages []mail.Message) []mail.Message {
 	sorted := make([]mail.Message, len(messages))
 	copy(sorted, messages)
 	sort.SliceStable(sorted, func(i, j int) bool {
-		return sorted[i].Priority > sorted[j].Priority // higher priority first; ties keep arrival order
+		if sorted[i].Priority != sorted[j].Priority {
+			return sorted[i].Priority > sorted[j].Priority
+		}
+		if !sorted[i].CreatedAt.Equal(sorted[j].CreatedAt) {
+			return sorted[i].CreatedAt.After(sorted[j].CreatedAt)
+		}
+		return sorted[i].ID > sorted[j].ID
 	})
+	if len(sorted) > mailInjectMaxMessages {
+		sorted = sorted[:mailInjectMaxMessages]
+	}
 	return sorted
 }
 
 // formatInjectOutput formats messages as a <system-reminder> block for
-// injection into an agent's prompt via a UserPromptSubmit hook. It priority-
-// sorts before the display clamp so both inject render paths
-// (renderMailCheckFromAPI and doMailCheckTargetWithFormat) surface higher-
-// priority unread first.
+// injection into an agent's prompt via a UserPromptSubmit hook. It selects
+// the display window via selectInjectMessages so both inject render paths
+// (renderMailCheckFromAPI and doMailCheckTargetWithFormat) surface the same
+// priority-then-recency window.
 func formatInjectOutput(messages []mail.Message) string {
-	messages = sortMailByPriority(messages)
+	total := len(messages)
+	shown := selectInjectMessages(messages)
 	var sb strings.Builder
 	sb.WriteString("<system-reminder>\n")
-	fmt.Fprintf(&sb, "You have %d unread message(s).\n\n", len(messages))
-	limit := len(messages)
-	if limit > mailInjectMaxMessages {
-		limit = mailInjectMaxMessages
-		fmt.Fprintf(&sb, "Showing the first %d message(s) here; run 'gc mail inbox' for the full list.\n\n", limit)
+	fmt.Fprintf(&sb, "You have %d unread message(s).\n\n", total)
+	if total > len(shown) {
+		older := total - len(shown)
+		fmt.Fprintf(&sb, "Showing the %d most recent; %d older unread not shown; run 'gc mail inbox' for the full list.\n\n", len(shown), older)
 	}
-	for _, m := range messages[:limit] {
+	for _, m := range shown {
 		// Sanitize attacker-controllable fields (sender identity, subject,
 		// body) before interpolating into the <system-reminder> block.
 		// Without this, a sender can inject </system-reminder> sequences

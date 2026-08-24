@@ -3583,13 +3583,13 @@ func TestMailCheckInjectLimitsMessageCount(t *testing.T) {
 	}
 
 	out := stdout.String()
-	for _, want := range []string{"4 unread message(s)", "gc-1 from sender-a", "gc-2 from sender-b", "gc-3 from sender-c", "Showing the first 3 message(s)"} {
+	for _, want := range []string{"4 unread message(s)", "gc-2 from sender-b", "gc-3 from sender-c", "gc-4 from sender-d", "Showing the 3 most recent; 1 older unread not shown"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stdout missing %q:\n%s", want, out)
 		}
 	}
-	if strings.Contains(out, "gc-4") || strings.Contains(out, "fourth") {
-		t.Errorf("stdout should not include the fourth message:\n%s", out)
+	if strings.Contains(out, "gc-1") || strings.Contains(out, "first") {
+		t.Errorf("stdout should not include the oldest message:\n%s", out)
 	}
 }
 
@@ -3819,8 +3819,8 @@ func TestMailCheckInjectArchivesEphemeralAutoHandoffMessages(t *testing.T) {
 // That test pinned the bug: a priority-tagged restart handoff arriving BEHIND a
 // full window of ordinary mail was clamped out of the injection preview (never
 // surfaced, never archived). With the priority-sort-before-clamp patch (handoff
-// mail tagged priority:1 at the cmd_handoff send sites + sortMailByPriority run
-// before both the display and archive clamps), a priority:1 handoff now floats
+// mail tagged priority:1 at the cmd_handoff send sites + selectInjectMessages
+// run before both the display and archive clamps), a priority:1 handoff now floats
 // into the window: it is injected AND archived, while a lower-priority ordinary
 // message is the one clamped out and left open. mail.Message.Priority is
 // otherwise unwritten, so ordinary all-priority-0 mail keeps arrival order.
@@ -3867,6 +3867,161 @@ func TestMailCheckInjectFloatsPriorityAutoHandoffIntoWindow(t *testing.T) {
 	}
 	if b.Status != "open" {
 		t.Fatalf("clamped-out ordinary mail status = %q, want open", b.Status)
+	}
+}
+
+// TestMailCheckInjectShowsNewestOfBacklog is the regression test for
+// gc-gdljl: a seat with more than mailInjectMaxMessages unread messages must
+// see the newest ones in the banner, not the oldest three by arrival order.
+func TestMailCheckInjectShowsNewestOfBacklog(t *testing.T) {
+	store := beads.NewMemStore()
+	mp := beadmail.New(store)
+	const total = 13
+	ids := make([]string, 0, total)
+	for i := 0; i < total; i++ {
+		m, err := mp.Send("human", "mayor", "", fmt.Sprintf("body-%d", i))
+		if err != nil {
+			t.Fatalf("Send %d: %v", i, err)
+		}
+		ids = append(ids, m.ID)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doMailCheck(mp, "mayor", true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doMailCheck = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+
+	newest := ids[total-mailInjectMaxMessages:]
+	oldest := ids[:total-mailInjectMaxMessages]
+	for _, id := range newest {
+		if !strings.Contains(out, id+" from") {
+			t.Errorf("banner missing newest message %s:\n%s", id, out)
+		}
+	}
+	for _, id := range oldest {
+		if strings.Contains(out, id+" from") {
+			t.Errorf("banner should not include older message %s:\n%s", id, out)
+		}
+	}
+	wantHeader := fmt.Sprintf("Showing the %d most recent; %d older unread not shown", mailInjectMaxMessages, total-mailInjectMaxMessages)
+	if !strings.Contains(out, wantHeader) {
+		t.Errorf("banner header = %q missing, got:\n%s", wantHeader, out)
+	}
+}
+
+// TestMailCheckInjectArchivesExactlyTheNewestBacklogWindow verifies the
+// archived set matches the injected set when a backlog of auto-handoff mail
+// is thinned to the newest mailInjectMaxMessages: this is the regression the
+// old duplicated sort+clamp (formatInjectOutput vs doMailCheckTargetWithFormat)
+// would reintroduce if the newest-first fix were applied to only one of them.
+func TestMailCheckInjectArchivesExactlyTheNewestBacklogWindow(t *testing.T) {
+	store := beads.NewMemStore()
+	mp := beadmail.New(store)
+	const total = 5
+	ids := make([]string, 0, total)
+	for i := 0; i < total; i++ {
+		b, err := store.Create(beads.Bead{
+			Title:    fmt.Sprintf("context cycle %d", i),
+			Type:     "message",
+			Assignee: "mayor",
+			From:     "mayor",
+			Labels:   []string{mail.AutoHandoffLabel, mail.ArchiveAfterInjectLabel},
+		})
+		if err != nil {
+			t.Fatalf("Create auto handoff %d: %v", i, err)
+		}
+		ids = append(ids, b.ID)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doMailCheck(mp, "mayor", true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doMailCheck = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+
+	newest := ids[total-mailInjectMaxMessages:]
+	oldest := ids[:total-mailInjectMaxMessages]
+	for _, id := range newest {
+		if !strings.Contains(out, id) {
+			t.Errorf("banner missing newest auto handoff %s:\n%s", id, out)
+		}
+		assertAutoHandoffRetainedAddressable(t, store, id) // injected => archived
+	}
+	for _, id := range oldest {
+		if strings.Contains(out, id) {
+			t.Errorf("banner should not include older auto handoff %s:\n%s", id, out)
+		}
+		b, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("older auto handoff should remain: %v", err)
+		}
+		if b.Status != "open" {
+			t.Fatalf("un-injected auto handoff %s status = %q, want open (not archived)", id, b.Status)
+		}
+	}
+}
+
+// TestMailCheckInjectPriorityBeatsRecencyEvenWhenOldest proves priority still
+// outranks recency under the new CreatedAt-based ordering: a priority:1
+// message that is ALSO the oldest message in the mailbox must still float
+// into the injection (and archive) window.
+func TestMailCheckInjectPriorityBeatsRecencyEvenWhenOldest(t *testing.T) {
+	store := beads.NewMemStore()
+	mp := beadmail.New(store)
+	oldestPriority, err := store.Create(beads.Bead{
+		Title:    "oldest but priority:1",
+		Type:     "message",
+		Assignee: "mayor",
+		From:     "mayor",
+		Labels:   []string{mail.AutoHandoffLabel, mail.ArchiveAfterInjectLabel, "priority:1"},
+	})
+	if err != nil {
+		t.Fatalf("Create priority auto handoff: %v", err)
+	}
+	// Newer, ordinary-priority auto handoffs sent after the priority message,
+	// filling the injection window.
+	newerIDs := make([]string, 0, mailInjectMaxMessages)
+	for i := 0; i < mailInjectMaxMessages; i++ {
+		b, err := store.Create(beads.Bead{
+			Title:    fmt.Sprintf("newer %d", i),
+			Type:     "message",
+			Assignee: "mayor",
+			From:     "mayor",
+			Labels:   []string{mail.AutoHandoffLabel, mail.ArchiveAfterInjectLabel},
+		})
+		if err != nil {
+			t.Fatalf("Create newer auto handoff %d: %v", i, err)
+		}
+		newerIDs = append(newerIDs, b.ID)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doMailCheck(mp, "mayor", true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doMailCheck = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+
+	if !strings.Contains(out, oldestPriority.ID) {
+		t.Fatalf("oldest priority:1 message %s should float into the window:\n%s", oldestPriority.ID, out)
+	}
+	assertAutoHandoffRetainedAddressable(t, store, oldestPriority.ID) // injected => archived
+
+	// The oldest of the newer (non-priority) messages is the one clamped out,
+	// since the priority message displaced it from the window; it stays open.
+	clampedOut := newerIDs[0]
+	if strings.Contains(out, clampedOut) {
+		t.Fatalf("clamped-out message %s should not appear in banner:\n%s", clampedOut, out)
+	}
+	b, err := store.Get(clampedOut)
+	if err != nil {
+		t.Fatalf("clamped-out message should remain: %v", err)
+	}
+	if b.Status != "open" {
+		t.Fatalf("clamped-out message %s status = %q, want open (not archived)", clampedOut, b.Status)
 	}
 }
 
