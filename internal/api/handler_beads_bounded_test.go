@@ -189,6 +189,27 @@ func TestBeadListAllTrueFallsBackWithoutCounter(t *testing.T) {
 	}
 }
 
+// TestResolveBeadListFullScanDetachesReturnedPage pins the ownership boundary
+// between the O(history) fallback scan and its O(limit) response. The response
+// cache retains the returned page for a short TTL; if that page shares the
+// full scan's backing array, caching ten rows retains every hydrated bead.
+func TestResolveBeadListFullScanDetachesReturnedPage(t *testing.T) {
+	all := make([]beads.Bead, 100)
+	for i := range all {
+		all[i].ID = fmt.Sprintf("gc-%03d", i)
+	}
+
+	page, total, hasMore := resolveBeadListPage(all, nil, 10, false, nil, false)
+	if len(page) != 10 || total != len(all) || !hasMore {
+		t.Fatalf("page = %d items / total %d / hasMore %v, want 10 / 100 / true", len(page), total, hasMore)
+	}
+
+	all[0].ID = "mutated-full-scan-backing-array"
+	if page[0].ID == all[0].ID {
+		t.Fatal("returned page still aliases the full-scan backing array")
+	}
+}
+
 // countOKListFailStore is a Store + Counter fake whose Count succeeds — so the
 // bounded all=true path bakes its rows into the upfront Total — but whose List
 // fails with a non-partial error, so those rows never reach the merged page.

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/api/apierr"
@@ -329,7 +330,10 @@ func resolveBeadListPage(all []beads.Bead, seek *beads.SeekBoundary, limit int, 
 	if end > len(all) {
 		end = len(all)
 	}
-	return all[start:end], total, end < len(all)
+	// The response cache retains page after this full-history scan returns.
+	// Detach it so an O(limit) response cannot keep the O(history) backing
+	// array (and every hydrated bead in it) alive for the cache TTL.
+	return slices.Clone(all[start:end]), total, end < len(all)
 }
 
 // mintNextCursor returns the keyset continuation cursor for a truncated page:
