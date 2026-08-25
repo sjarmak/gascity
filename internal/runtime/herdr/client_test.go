@@ -20,23 +20,23 @@ import (
 // $HOME elsewhere (this fleet's agent sandboxes do exactly that) made the
 // old code compute a path no herdr process ever binds.
 //
-// Both tests below skip on windows, darwin, and plan9: os.UserConfigDir()
-// only follows XDG_CONFIG_HOME on its Unix default branch, and on darwin
+// Both tests below skip on windows, darwin, ios, and plan9: os.UserConfigDir()
+// only follows XDG_CONFIG_HOME on its Unix default branch, and on darwin/ios
 // it ignores the env var entirely, always resolving under
 // "$HOME/Library/Application Support" (see the Go stdlib implementation
 // and its own os_test.go, which skips the identical platform set for the
-// same reason). Asserting an XDG- or ".config"-rooted path is only valid
-// on the platforms os.UserConfigDir() treats as XDG-following. Whether
-// herdr's own binary uses pure-XDG resolution on every one of those
-// platforms is unverified here — the empirical check above was run on
-// Linux only — so the tests skip on the platforms os.UserConfigDir()
-// itself does not follow XDG, rather than assert an unconfirmed
-// cross-platform contract.
+// same reason — darwin and ios share that branch). Asserting an XDG- or
+// ".config"-rooted path is only valid on the platforms os.UserConfigDir()
+// treats as XDG-following. Whether herdr's own binary uses pure-XDG
+// resolution on every one of those platforms is unverified here — the
+// empirical check above was run on Linux only — so the tests skip on the
+// platforms os.UserConfigDir() itself does not follow XDG, rather than
+// assert an unconfirmed cross-platform contract.
 
 func skipUnlessXDGPlatform(t *testing.T) {
 	t.Helper()
 	switch runtime.GOOS {
-	case "windows", "darwin", "plan9":
+	case "windows", "darwin", "ios", "plan9":
 		t.Skipf("os.UserConfigDir() does not follow XDG_CONFIG_HOME on %s; herdr's own resolution on this platform is unverified (see ga-nqlb8q)", runtime.GOOS)
 	}
 }
