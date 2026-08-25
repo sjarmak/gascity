@@ -861,3 +861,206 @@ func TestIsValidCityName(t *testing.T) {
 		}
 	}
 }
+
+// TestRegistryRegisterAssignsMonotonicGeneration proves each genuinely new
+// registration is stamped with a strictly increasing generation, and that
+// re-registering an existing path (a no-op rename) does not consume a new
+// generation (ga-nqlb8q).
+func TestRegistryRegisterAssignsMonotonicGeneration(t *testing.T) {
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "cities.toml"))
+
+	path1 := filepath.Join(dir, "city-a")
+	path2 := filepath.Join(dir, "city-b")
+	for _, p := range []string{path1, path2} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := r.Register(path1, "city-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register(path2, "city-b"); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := r.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gens := map[string]int64{}
+	for _, e := range entries {
+		gens[e.Path] = e.Generation
+	}
+	if gens[path1] == 0 || gens[path2] == 0 {
+		t.Fatalf("expected non-zero generations, got %+v", gens)
+	}
+	if gens[path1] == gens[path2] {
+		t.Fatalf("expected distinct generations, both got %d", gens[path1])
+	}
+
+	// Re-registering the same path with the same name is a no-op and must
+	// not change its generation.
+	if err := r.Register(path1, "city-a"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = r.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Path == path1 && e.Generation != gens[path1] {
+			t.Fatalf("generation changed on no-op re-register: got %d, want %d", e.Generation, gens[path1])
+		}
+	}
+}
+
+// TestRegistryUnregisterRecordsAuthorizationForExactGeneration proves that an
+// explicit Unregister durably records an authorization tied to the exact
+// generation that was removed, and that ConsumeUnregisterAuthorization
+// consumes it exactly once (ga-nqlb8q).
+func TestRegistryUnregisterRecordsAuthorizationForExactGeneration(t *testing.T) {
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "cities.toml"))
+
+	cityPath := filepath.Join(dir, "bright-lights")
+	if err := os.MkdirAll(cityPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register(cityPath, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := r.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	gen := entries[0].Generation
+	if gen == 0 {
+		t.Fatal("expected non-zero generation after Register")
+	}
+
+	if err := r.Unregister(cityPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Authorized: the exact generation that was unregistered is consumable.
+	ok, err := r.ConsumeUnregisterAuthorization(cityPath, gen)
+	if err != nil {
+		t.Fatalf("ConsumeUnregisterAuthorization: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected authorization to be present for the unregistered generation")
+	}
+
+	// One-shot: consuming it again must fail.
+	ok, err = r.ConsumeUnregisterAuthorization(cityPath, gen)
+	if err != nil {
+		t.Fatalf("ConsumeUnregisterAuthorization (second call): %v", err)
+	}
+	if ok {
+		t.Fatal("expected authorization to be consumed exactly once, but it was consumable twice")
+	}
+}
+
+// TestRegistryConsumeUnregisterAuthorizationRejectsStaleGeneration proves
+// that an authorization recorded for one generation does not authorize
+// stopping a city running under a different (e.g. re-registered) generation
+// — a stale-generation disappearance must not be treated as authorized
+// (ga-nqlb8q).
+func TestRegistryConsumeUnregisterAuthorizationRejectsStaleGeneration(t *testing.T) {
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "cities.toml"))
+
+	cityPath := filepath.Join(dir, "bright-lights")
+	if err := os.MkdirAll(cityPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register(cityPath, ""); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := r.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleGen := entries[0].Generation
+
+	if err := r.Unregister(cityPath); err != nil {
+		t.Fatal(err)
+	}
+	// Re-register the same path: this mints a NEW generation.
+	if err := r.Register(cityPath, ""); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = r.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newGen := entries[0].Generation
+	if newGen == staleGen {
+		t.Fatalf("expected re-registration to mint a new generation, got same %d", newGen)
+	}
+
+	// A running city on the OLD (stale) generation must not be authorized
+	// to stop just because an unregister-authorization record exists for
+	// that path in general.
+	ok, err := r.ConsumeUnregisterAuthorization(cityPath, staleGen)
+	if err != nil {
+		t.Fatalf("ConsumeUnregisterAuthorization: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected the authorization recorded for the stale generation to still be consumable by its exact generation")
+	}
+
+	// But the NEW generation has no authorization recorded against it.
+	ok, err = r.ConsumeUnregisterAuthorization(cityPath, newGen)
+	if err != nil {
+		t.Fatalf("ConsumeUnregisterAuthorization (new generation): %v", err)
+	}
+	if ok {
+		t.Fatal("expected no authorization for the new generation, but one was consumed")
+	}
+}
+
+// TestRegistryConsumeUnregisterAuthorizationMissingReturnsFalse proves that
+// a registry disappearance with NO recorded unregister authorization (e.g. an
+// empty or unaudited registry read) returns (false, nil), not an error and
+// not true — the caller must treat this as "hold the city running"
+// (ga-nqlb8q).
+func TestRegistryConsumeUnregisterAuthorizationMissingReturnsFalse(t *testing.T) {
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "cities.toml"))
+
+	ok, err := r.ConsumeUnregisterAuthorization(filepath.Join(dir, "never-registered"), 1)
+	if err != nil {
+		t.Fatalf("ConsumeUnregisterAuthorization on empty registry: %v", err)
+	}
+	if ok {
+		t.Fatal("expected false for a city with no recorded authorization")
+	}
+}
+
+// TestRegistryConsumeUnregisterAuthorizationOnCorruptFileFailsSafe proves
+// that a corrupt registry file causes ConsumeUnregisterAuthorization to
+// return an error rather than (true, nil) — a corrupt read must never look
+// like authorization to stop a running city (ga-nqlb8q).
+func TestRegistryConsumeUnregisterAuthorizationOnCorruptFileFailsSafe(t *testing.T) {
+	dir := t.TempDir()
+	regPath := filepath.Join(dir, "cities.toml")
+	if err := os.WriteFile(regPath, []byte("this is not valid toml [[["), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := NewRegistry(regPath)
+
+	ok, err := r.ConsumeUnregisterAuthorization(filepath.Join(dir, "some-city"), 1)
+	if err == nil {
+		t.Fatal("expected error for corrupt registry file")
+	}
+	if ok {
+		t.Fatal("expected corrupt registry read to never report authorization as present")
+	}
+}

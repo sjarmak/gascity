@@ -1074,14 +1074,15 @@ func reloadSupervisorJSON(stdout, stderr io.Writer, jsonOut bool) int {
 
 // managedCity tracks a running CityRuntime inside the supervisor.
 type managedCity struct {
-	cr         *CityRuntime
-	name       string // city name at launch — used for name-drift detection
-	started    bool
-	status     string
-	cancel     context.CancelFunc
-	done       chan struct{} // closed when the city goroutine exits
-	closer     io.Closer     // FileRecorder (or nil); closed on city stop
-	tombstoned atomic.Bool   // set before Remove() in shutdown paths for teardown safety
+	cr            *CityRuntime
+	name          string // city name at launch — used for name-drift detection
+	started       bool
+	status        string
+	cancel        context.CancelFunc
+	done          chan struct{} // closed when the city goroutine exits
+	closer        io.Closer     // FileRecorder (or nil); closed on city stop
+	tombstoned    atomic.Bool   // set before Remove() in shutdown paths for teardown safety
+	regGeneration int64         // registry generation this city was started under (ga-nqlb8q)
 }
 
 // deleteManagedCityIfCurrent prevents a stale city goroutine from removing
@@ -1691,11 +1692,19 @@ func reconcileCities(
 		desired[e.Path] = e
 	}
 
-	// Stop cities no longer in registry. Collect under lock, stop outside
-	// to avoid blocking API requests during graceful shutdown.
-	var toStop []*managedCity
-	var toStopPaths []string
-	cr.BatchUpdate(func(
+	// Cities missing from the registry read are candidates for stopping —
+	// but a registry disappearance is not itself authorization to stop a
+	// running city (ga-nqlb8q): an empty, corrupt, or racy registry read
+	// looks identical to a genuine explicit gc unregister. Collect
+	// candidates under lock without mutating state yet, then require each
+	// one to consume a matching durable UnregisterAuthorization (exact
+	// path + exact registration generation) before it is allowed to stop.
+	type stopCandidate struct {
+		mc   *managedCity
+		path string
+	}
+	var candidates []stopCandidate
+	cr.ReadCallback(func(
 		cities map[string]*managedCity,
 		_ map[string]cityInitProgress,
 		_ map[string]*initFailRecord,
@@ -1703,11 +1712,41 @@ func reconcileCities(
 	) {
 		for path, mc := range cities {
 			if _, ok := desired[path]; !ok {
-				mc.tombstoned.Store(true)
-				toStop = append(toStop, mc)
-				toStopPaths = append(toStopPaths, path)
-				delete(cities, path)
+				candidates = append(candidates, stopCandidate{mc: mc, path: path})
 			}
+		}
+	})
+
+	var toStop []*managedCity
+	var toStopPaths []string
+	for _, c := range candidates {
+		authorized, err := reg.ConsumeUnregisterAuthorization(c.path, c.mc.regGeneration)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc supervisor: ALERT: registry disappearance for city %q (%s) — unregister-authorization check failed (%v); holding city running, NOT stopping\n", c.mc.name, c.path, err) //nolint:errcheck
+			continue
+		}
+		if !authorized {
+			fmt.Fprintf(stderr, "gc supervisor: ALERT: city %q (%s) disappeared from the registry with no matching unregister authorization for generation %d — holding city running, NOT stopping (unaudited or stale registry disappearance; see ga-nqlb8q)\n", c.mc.name, c.path, c.mc.regGeneration) //nolint:errcheck
+			continue
+		}
+		toStop = append(toStop, c.mc)
+		toStopPaths = append(toStopPaths, c.path)
+	}
+
+	cr.BatchUpdate(func(
+		cities map[string]*managedCity,
+		_ map[string]cityInitProgress,
+		_ map[string]*initFailRecord,
+		_ map[string]*panicRecord,
+	) {
+		for i, mc := range toStop {
+			// Re-verify identity: the authorization check above ran
+			// outside cr's lock, so guard against a concurrent reconcile
+			// pass having already replaced or removed this city.
+			if !deleteManagedCityIfCurrent(cities, toStopPaths[i], mc) {
+				continue
+			}
+			mc.tombstoned.Store(true)
 		}
 	})
 
@@ -2086,7 +2125,7 @@ func reconcileCities(
 		reloadReqCh := make(chan reloadRequest)
 		cityCtx, cityCancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
-		mc := &managedCity{name: cityName, cancel: cityCancel, done: done, closer: fr}
+		mc := &managedCity{name: cityName, cancel: cityCancel, done: done, closer: fr, regGeneration: entry.Generation}
 
 		convergenceReqCh := make(chan convergenceRequest, 16)
 		controlDispatcherCh := make(chan struct{}, 1)

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/gastownhall/gascity/internal/pathutil"
@@ -29,8 +30,22 @@ var ErrPendingCityRequestExists = errors.New("pending city request already exist
 
 // CityEntry is one registered city in the supervisor registry.
 type CityEntry struct {
-	Path string `toml:"path"`           // absolute path to city root directory
-	Name string `toml:"name,omitempty"` // effective city name (workspace.name or basename)
+	Path       string `toml:"path"`                 // absolute path to city root directory
+	Name       string `toml:"name,omitempty"`       // effective city name (workspace.name or basename)
+	Generation int64  `toml:"generation,omitempty"` // monotonic registration generation, assigned on first Register (ga-nqlb8q)
+}
+
+// UnregisterAuthorization is a durable record that an explicit gc unregister
+// removed a specific registration generation of a city. reconcileCities may
+// stop a running city for a registry disappearance only when it can consume
+// a matching authorization for that city's exact current generation — an
+// empty, corrupt, or stale-generation registry read must never be treated as
+// authorization to stop a live city (ga-nqlb8q).
+type UnregisterAuthorization struct {
+	Path       string `toml:"path"`
+	Generation int64  `toml:"generation"`
+	Actor      string `toml:"actor"`
+	Timestamp  string `toml:"timestamp"` // RFC3339
 }
 
 // EffectiveName returns the city's effective name.
@@ -55,9 +70,11 @@ type PendingCityRequestEntry struct {
 
 // registryFile is the TOML structure of ~/.gc/cities.toml.
 type registryFile struct {
-	Cities              []CityEntry               `toml:"cities"`
-	Rigs                []RigEntry                `toml:"rigs,omitempty"`
-	PendingCityRequests []PendingCityRequestEntry `toml:"pending_city_requests,omitempty"`
+	Cities                   []CityEntry               `toml:"cities"`
+	Rigs                     []RigEntry                `toml:"rigs,omitempty"`
+	PendingCityRequests      []PendingCityRequestEntry `toml:"pending_city_requests,omitempty"`
+	NextGeneration           int64                     `toml:"next_generation,omitempty"`
+	UnregisterAuthorizations []UnregisterAuthorization `toml:"unregister_authorizations,omitempty"`
 }
 
 // Registry manages the set of registered cities. Thread-safe.
@@ -122,10 +139,11 @@ func (r *Registry) Register(cityPath, effectiveName string) error {
 	}
 	defer unlock()
 
-	entries, err := r.loadLocked()
+	rf, err := r.loadAllLocked()
 	if err != nil {
 		return err
 	}
+	entries := rf.Cities
 
 	for i, e := range entries {
 		if sameRegistryPath(e.Path, abs) {
@@ -139,15 +157,18 @@ func (r *Registry) Register(cityPath, effectiveName string) error {
 				}
 			}
 			entries[i].Name = effectiveName
-			return r.saveLocked(entries)
+			rf.Cities = entries
+			return r.saveAllLocked(rf)
 		}
 		if e.EffectiveName() == effectiveName {
 			return fmt.Errorf("city name %q already registered at %s (choose a unique registration name, for example with gc register --name)", effectiveName, e.Path)
 		}
 	}
 
-	entries = append(entries, CityEntry{Path: abs, Name: effectiveName})
-	return r.saveLocked(entries)
+	rf.NextGeneration++
+	entries = append(entries, CityEntry{Path: abs, Name: effectiveName, Generation: rf.NextGeneration})
+	rf.Cities = entries
+	return r.saveAllLocked(rf)
 }
 
 // Unregister removes a city from the registry by path. Returns an
@@ -170,16 +191,19 @@ func (r *Registry) Unregister(cityPath string) error {
 	}
 	defer unlock()
 
-	entries, err := r.loadLocked()
+	rf, err := r.loadAllLocked()
 	if err != nil {
 		return err
 	}
+	entries := rf.Cities
 
+	var removed CityEntry
 	found := false
 	filtered := entries[:0]
 	for _, e := range entries {
 		if sameRegistryPath(e.Path, abs) {
 			found = true
+			removed = e
 			continue
 		}
 		filtered = append(filtered, e)
@@ -187,7 +211,60 @@ func (r *Registry) Unregister(cityPath string) error {
 	if !found {
 		return fmt.Errorf("city at %s is not registered", abs)
 	}
-	return r.saveLocked(filtered)
+	rf.Cities = filtered
+	rf.UnregisterAuthorizations = append(rf.UnregisterAuthorizations, UnregisterAuthorization{
+		Path:       abs,
+		Generation: removed.Generation,
+		Actor:      "gc unregister",
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+	})
+	return r.saveAllLocked(rf)
+}
+
+// ConsumeUnregisterAuthorization reports whether a durable, explicit
+// unregister authorization exists for cityPath at exactly generation, and if
+// so removes it (one-shot consumption) and returns true. It returns false
+// without error for a missing, empty, or generation-mismatched record — the
+// caller (reconcileCities) must treat false as "hold the city running", never
+// as permission to stop it. This is the only path that may authorize
+// stopping a running city for a registry disappearance (ga-nqlb8q).
+func (r *Registry) ConsumeUnregisterAuthorization(cityPath string, generation int64) (bool, error) {
+	r.refuseHostRegistryDuringTests()
+
+	abs, err := resolveAbsPath(cityPath)
+	if err != nil {
+		return false, err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	unlock, err := r.fileLock()
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+
+	rf, err := r.loadAllLocked()
+	if err != nil {
+		return false, err
+	}
+
+	idx := -1
+	for i, a := range rf.UnregisterAuthorizations {
+		if sameRegistryPath(a.Path, abs) && a.Generation == generation {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return false, nil
+	}
+	rf.UnregisterAuthorizations = append(rf.UnregisterAuthorizations[:idx], rf.UnregisterAuthorizations[idx+1:]...)
+	if err := r.saveAllLocked(rf); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // LookupCityByName finds a registered city by its effective name. Returns the
@@ -389,18 +466,6 @@ func (r *Registry) saveAllLocked(rf registryFile) error {
 		return fmt.Errorf("renaming registry file: %w", err)
 	}
 	return nil
-}
-
-// saveLocked writes the city entries, preserving existing rig entries.
-// Caller must hold r.mu.Lock and fileLock.
-func (r *Registry) saveLocked(entries []CityEntry) error {
-	rf, err := r.loadAllLocked()
-	if err != nil {
-		// If we can't load, start fresh with just cities.
-		rf = registryFile{}
-	}
-	rf.Cities = entries
-	return r.saveAllLocked(rf)
 }
 
 // ListRigs returns all registered rigs. Returns an empty slice (not nil)

@@ -1513,14 +1513,32 @@ func TestReconcileCitiesUnregisterEventUsesManagedCityName(t *testing.T) {
 	if err := registry.StorePendingRequestID(cityPath, "req-test-unregister"); err != nil {
 		t.Fatal(err)
 	}
+
+	// A real explicit gc unregister must be recorded before reconcile will
+	// stop a managed city (ga-nqlb8q) — register first to mint a
+	// generation, then unregister to create the matching durable
+	// authorization the managedCity carries.
+	reg := supervisor.NewRegistry(supervisor.RegistryPath())
+	if err := reg.Register(cityPath, "effective-city"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := reg.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen := entries[0].Generation
+	if err := reg.Unregister(cityPath); err != nil {
+		t.Fatal(err)
+	}
+
 	registry.Add(cityPath, &managedCity{
-		name:    "effective-city",
-		started: true,
-		cancel:  func() {},
-		done:    done,
+		name:          "effective-city",
+		started:       true,
+		cancel:        func() {},
+		done:          done,
+		regGeneration: gen,
 	})
 
-	reg := supervisor.NewRegistry(supervisor.RegistryPath())
 	var stdout, stderr bytes.Buffer
 	reconcileCities(reg, registry, supervisor.PublicationConfig{}, &stdout, &stderr)
 
