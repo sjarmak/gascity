@@ -411,9 +411,13 @@ func isValueToken(token string) bool {
 	}
 
 	// Unknown lowercase type token: fail closed and treat it as value-taking.
-	// Misclassifying a value flag as boolean lets the argv scanner read the
-	// flag's value as the next positional, which bdMutationWriteIDs can then
-	// mistake for a bead ID (dr-n959f).
+	// This feeds ValueFlagsWithDiscovery/BoolFlagsWithDiscovery, consumed by
+	// the lint-time argv scanner in scan.go. Misclassifying a value flag as
+	// boolean there advances the scanner by one token instead of two,
+	// shifting every subsequent token left and producing false positives or
+	// false negatives in the lint check (dr-n959f). This does not affect the
+	// runtime write-mutation guard (bdMutationWriteIDs in cmd/gc/cmd_bd.go),
+	// which reads its own pinned static tables and never calls discovery.
 	return true
 }
 

@@ -35,10 +35,13 @@ func TestParseHelpFlagsToSets(t *testing.T) {
 	}
 }
 
-// TestParseHelpFlagsToSetsUnknownLowercaseTokenFailsClosed drives runtime
-// help discovery (dr-n959f) with a flag whose type token the parser does not
+// TestParseHelpFlagsToSetsUnknownLowercaseTokenFailsClosed drives help-text
+// discovery (dr-n959f) with a flag whose type token the parser does not
 // recognize. isValueToken must fail closed and classify it as value-taking,
-// not boolean, so bdMutationWriteIDs cannot read the value as a positional.
+// not boolean, so the discovered flag set feeds ValueFlagsWithDiscovery
+// rather than BoolFlagsWithDiscovery — see
+// TestScanUnknownFlagsUnknownTokenFailsClosed in scan_test.go for the
+// argv-shift consequence this prevents in the lint-time scanner.
 func TestParseHelpFlagsToSetsUnknownLowercaseTokenFailsClosed(t *testing.T) {
 	helpText := `Flags:
       --frobnicate widget   frobnicate the widget`
