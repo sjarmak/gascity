@@ -1752,3 +1752,33 @@ func TestCanonicalSingletonAliasHeldTemplates_ExcludesFailedCreateHolder(t *test
 		t.Fatalf("drained holder released its alias and must NOT mark mayor held; got held")
 	}
 }
+
+// TestComputePoolDesiredStates_SuspendedAgentAssignedWorkNoDemand pins the
+// destination-side guarantee for gc-ugmpl: assigned work naming a suspended
+// pool agent must not materialize pool demand, while the same work against a
+// live agent still does.
+func TestComputePoolDesiredStates_SuspendedAgentAssignedWorkNoDemand(t *testing.T) {
+	suspended := poolAgent("codex", "gascity", intPtr(3), 0)
+	suspended.Suspended = true
+	cfg := &config.City{Agents: []config.Agent{suspended}}
+	work := []beads.Bead{
+		workBead("w1", "gascity/codex", "gascity/codex", "in_progress", 5),
+	}
+	result := ComputePoolDesiredStates(cfg, work, nil, map[string]int{"gascity/codex": 2})
+	for _, st := range result {
+		if len(st.Requests) != 0 {
+			t.Fatalf("suspended agent produced %d pool requests, want 0", len(st.Requests))
+		}
+	}
+
+	live := poolAgent("codex", "gascity", intPtr(3), 0)
+	liveCfg := &config.City{Agents: []config.Agent{live}}
+	liveResult := ComputePoolDesiredStates(liveCfg, work, nil, map[string]int{"gascity/codex": 2})
+	total := 0
+	for _, st := range liveResult {
+		total += len(st.Requests)
+	}
+	if total == 0 {
+		t.Fatal("non-suspended agent produced no pool requests, want > 0")
+	}
+}
