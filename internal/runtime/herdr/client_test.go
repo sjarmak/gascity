@@ -1,7 +1,10 @@
 package herdr
 
 import (
+	"context"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -43,5 +46,60 @@ func TestSocketPathFallsBackToHomeConfigWhenXDGUnset(t *testing.T) {
 	c := newClient("hometest", "")
 	if got, want := c.socketPath(), filepath.Join(home, ".config", "herdr", "sessions", "hometest", "herdr.sock"); got != want {
 		t.Errorf("socketPath() = %q; want %q", got, want)
+	}
+}
+
+// TestRunPreservesErrorCodeFromStderrEnvelope pins the structured-code path
+// for a herdr invocation that exits nonzero and writes its error envelope to
+// stderr. Every code-driven recovery in this package — the agent_pane_busy
+// retry loop in Start, resolveAgentNameTaken's adoption — gates on
+// herdrErrorCode, so a stderr envelope flattened into an opaque string
+// silently disables all of them: the caller sees an unrecognized failure and
+// gives up on the first attempt. That is what made
+// TestProviderLiveClaudeKindPath fail in 0.53s under load (gc-mlkgy), far
+// short of the retry loop's own backoff budget.
+func TestRunPreservesErrorCodeFromStderrEnvelope(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "herdr")
+	script := "#!/bin/sh\n" +
+		`printf '%s' '{"error":{"code":"agent_pane_busy","message":"agent target pane w1:p1 is not an available shell"},"id":"cli:agent:start"}' >&2` + "\n" +
+		"exit 1\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &client{bin: bin, session: "gctest"}
+	_, err := c.run(context.Background(), "agent", "start", "kindsmoke")
+	if err == nil {
+		t.Fatal("run returned nil error for a nonzero herdr exit")
+	}
+	if got := herdrErrorCode(err); got != "agent_pane_busy" {
+		t.Fatalf("herdrErrorCode = %q, want %q (error was %v)", got, "agent_pane_busy", err)
+	}
+	if !strings.Contains(err.Error(), "not an available shell") {
+		t.Fatalf("error = %v, want herdr's own message preserved", err)
+	}
+}
+
+// TestRunKeepsOpaqueStderrWhenNotAnEnvelope keeps the non-JSON stderr path
+// intact: a herdr crash or a shell-level failure has no envelope to decode
+// and must still surface its text.
+func TestRunKeepsOpaqueStderrWhenNotAnEnvelope(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "herdr")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho 'panic: boom' >&2\nexit 2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &client{bin: bin, session: "gctest"}
+	_, err := c.run(context.Background(), "agent", "list")
+	if err == nil {
+		t.Fatal("run returned nil error for a nonzero herdr exit")
+	}
+	if got := herdrErrorCode(err); got != "" {
+		t.Fatalf("herdrErrorCode = %q, want empty for non-envelope stderr", got)
+	}
+	if !strings.Contains(err.Error(), "panic: boom") {
+		t.Fatalf("error = %v, want the raw stderr preserved", err)
 	}
 }

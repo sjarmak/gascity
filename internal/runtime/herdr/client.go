@@ -89,6 +89,18 @@ func (c *client) runWithSecrets(ctx context.Context, declared []string, args ...
 		safe, secrets := redactedArgv(args, declared)
 		var ee *exec.ExitError
 		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
+			// herdr reports a rejected command as its normal error envelope on
+			// stderr with a nonzero exit. Decode it so the structured code
+			// survives: every recovery path in this package gates on
+			// herdrErrorCode, so flattening the envelope into an opaque string
+			// disables the agent_pane_busy retry and agent_name_taken adoption
+			// alike, and the caller gives up on an error it knows how to
+			// handle. Non-envelope stderr (a crash, a shell-level failure) has
+			// nothing to decode and keeps its raw text.
+			var env envelope
+			if jerr := json.Unmarshal(ee.Stderr, &env); jerr == nil && env.Error != nil {
+				return nil, fmt.Errorf("herdr %v: %w", safe, env.Error.redacted(secrets))
+			}
 			return nil, fmt.Errorf("herdr %v: %s", safe, redactText(string(ee.Stderr), secrets))
 		}
 		// err here is exec's own (*exec.Error, *exec.ExitError): it carries the
