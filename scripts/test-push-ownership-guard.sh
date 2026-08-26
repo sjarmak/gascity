@@ -584,6 +584,135 @@ test_bead_id_fallback_used_when_branch_no_match() {
 }
 
 # ---------------------------------------------------------------------------
+# Store-agnostic branch-id extraction (gc-b8r7x).
+#
+# The extraction pattern used to hardcode the `ga-` prefix and a 6-character
+# suffix, so in a store whose ids look like `gc-nrhaz` (3-5 characters) NO
+# branch ever resolved and every push fell through to the assignee fallback.
+# A long-lived seat accumulates held beads, so that fallback turned each one
+# into a veto over every unrelated push from that seat.
+# ---------------------------------------------------------------------------
+
+test_bead_id_branch_wins_for_non_ga_store_prefix() {
+    local repo fbd out rc
+    repo="$(new_repo_with_branch "rebase/gc-nrhaz-4973")"
+    fbd="$(mktemp -d "${TMPDIR:-/tmp}/gc-pog-fakebd.XXXXXX")"
+    cat > "$fbd/bd" <<'FAKE'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  show)
+    echo "$2" >> "$(dirname "$0")/show-ids.log"
+    case "$2" in
+      gc-nrhaz) printf '[{"id":"gc-nrhaz","status":"in_progress","assignee":"agent-x","metadata":{"gc.routed_to":"tmpl-x"},"labels":[]}]' ;;
+      *) printf '{"error":"no issues found matching the provided IDs","schema_version":1}' ;;
+    esac
+    ;;
+  list)
+    printf '[{"id":"gc-xhkr0"}]'
+    ;;
+  *) exit 1 ;;
+esac
+FAKE
+    chmod +x "$fbd/bd"
+    out="$(run_guard "$repo" "$fbd" "agent-x" "tmpl-x" 2>&1)"; rc=$?
+    if [[ $rc -eq 0 ]] && grep -qx "gc-nrhaz" "$fbd/show-ids.log" 2>/dev/null; then
+        record_pass "resolve/branch-id-extraction-is-store-agnostic (rc=0, gc-nrhaz resolved from branch, held gc-xhkr0 not consulted)"
+    else
+        record_fail "resolve/branch-id-extraction-is-store-agnostic" "expected rc=0 with gc-nrhaz checked, got rc=$rc ids=[$(cat "$fbd/show-ids.log" 2>/dev/null)], output: $out"
+    fi
+    rm -rf "$repo" "$fbd"
+}
+
+# The held bead assigned to this session must not veto a push whose branch
+# names a different, unheld bead — acceptance criterion 3 of gc-b8r7x, and
+# the exact shape of the reported false positive.
+test_bead_id_held_assignee_does_not_veto_unrelated_branch() {
+    local repo fbd out rc
+    repo="$(new_repo_with_branch "rebase/gc-nrhaz-4973")"
+    fbd="$(mktemp -d "${TMPDIR:-/tmp}/gc-pog-fakebd.XXXXXX")"
+    cat > "$fbd/bd" <<'FAKE'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  show)
+    case "$2" in
+      gc-nrhaz) printf '[{"id":"gc-nrhaz","status":"in_progress","assignee":"agent-x","metadata":{"gc.routed_to":"tmpl-x"},"labels":[]}]' ;;
+      gc-xhkr0) printf '[{"id":"gc-xhkr0","status":"in_progress","assignee":"agent-x","metadata":{"gc.routed_to":"tmpl-x"},"labels":["hold:mayor"]}]' ;;
+      *) printf '{"error":"no issues found matching the provided IDs","schema_version":1}' ;;
+    esac
+    ;;
+  list) printf '[{"id":"gc-xhkr0"}]' ;;
+  *) exit 1 ;;
+esac
+FAKE
+    chmod +x "$fbd/bd"
+    out="$(run_guard "$repo" "$fbd" "agent-x" "tmpl-x" 2>&1)"; rc=$?
+    if [[ $rc -eq 0 ]]; then
+        record_pass "resolve/held-assignee-does-not-veto-unrelated-branch (rc=0, hold:mayor on gc-xhkr0 is irrelevant to this branch)"
+    else
+        record_fail "resolve/held-assignee-does-not-veto-unrelated-branch" "expected rc=0, got rc=$rc, output: $out"
+    fi
+    rm -rf "$repo" "$fbd"
+}
+
+# The anchored pattern can still match an ordinary slug (branch
+# pl-shared-checkout yields the candidate "pl-shared").
+# Such a candidate must resolve to a definitive not-found and hand the
+# decision back to the assignee fallback, NOT block the push. Pre-validating
+# candidates with an extra `bd show` probe is what this avoids: a probe
+# cannot tell not-found from bd-unreachable, which breaks every fail-closed
+# path in this file.
+test_bead_id_slug_false_positive_falls_back_to_assignee() {
+    local repo fbd out rc
+    repo="$(new_repo_with_branch "pl-shared-checkout")"
+    fbd="$(mktemp -d "${TMPDIR:-/tmp}/gc-pog-fakebd.XXXXXX")"
+    cat > "$fbd/bd" <<'FAKE'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  show)
+    echo "$2" >> "$(dirname "$0")/show-ids.log"
+    case "$2" in
+      gc-realwk) printf '[{"id":"gc-realwk","status":"in_progress","assignee":"agent-x","metadata":{"gc.routed_to":"tmpl-x"},"labels":[]}]' ;;
+      *) printf '{"error":"no issues found matching the provided IDs","schema_version":1}' ;;
+    esac
+    ;;
+  list) printf '[{"id":"gc-realwk"}]' ;;
+  *) exit 1 ;;
+esac
+FAKE
+    chmod +x "$fbd/bd"
+    out="$(run_guard "$repo" "$fbd" "agent-x" "tmpl-x" 2>&1)"; rc=$?
+    if [[ $rc -eq 0 ]] && grep -qx "gc-realwk" "$fbd/show-ids.log" 2>/dev/null; then
+        record_pass "resolve/slug-false-positive-falls-back-to-assignee (rc=0, unresolvable branch candidate deferred to gc-realwk)"
+    else
+        record_fail "resolve/slug-false-positive-falls-back-to-assignee" "expected rc=0 with gc-realwk checked, got rc=$rc ids=[$(cat "$fbd/show-ids.log" 2>/dev/null)], output: $out"
+    fi
+    rm -rf "$repo" "$fbd"
+}
+
+# Acceptance criterion 2: when only the assignee fallback resolves an id, a
+# refusal must say WHY it thinks that bead is related to this push, so an
+# operator can tell a real ownership violation from a false positive without
+# reading the script.
+test_bead_id_assignee_fallback_refusal_explains_provenance() {
+    local repo fbd out rc
+    repo="$(new_repo_with_branch "chore/unrelated-cleanup")"
+    fbd="$(mktemp -d "${TMPDIR:-/tmp}/gc-pog-fakebd.XXXXXX")"
+    write_fake_bd "$fbd"
+    printf '[{"id":"gc-heldbd"}]' > "$fbd/fake-bd-state/list-json"
+    write_show_json "$fbd" "gc-heldbd" "in_progress" "agent-x" "tmpl-x" '["hold:mayor"]'
+    out="$(run_guard "$repo" "$fbd" "agent-x" "tmpl-x" 2>&1)"; rc=$?
+    if [[ $rc -ne 0 ]] && grep -q "branch name .* names no known bead" <<<"$out" && grep -q "in-progress assignment" <<<"$out"; then
+        record_pass "resolve/assignee-fallback-refusal-explains-provenance (rc=$rc, refusal states the id came from the session's assignment, not the branch)"
+    else
+        record_fail "resolve/assignee-fallback-refusal-explains-provenance" "expected non-zero rc with a provenance explanation, got rc=$rc, output: $out"
+    fi
+    rm -rf "$repo" "$fbd"
+}
+
+# ---------------------------------------------------------------------------
 # Branch reuse (ga-bf39j8): the same branch name can be reused across a
 # sequence of beads over time -- e.g. a build bead closes, and a review bead
 # continues work on the IDENTICAL branch. The branch-derived id then names a
@@ -1076,6 +1205,10 @@ run_all() {
     test_bead_id_branch_wins_and_warns_on_disagreement
     test_bead_id_branch_resolves_multi_level_subbead_id
     test_bead_id_fallback_used_when_branch_no_match
+    test_bead_id_branch_wins_for_non_ga_store_prefix
+    test_bead_id_held_assignee_does_not_veto_unrelated_branch
+    test_bead_id_slug_false_positive_falls_back_to_assignee
+    test_bead_id_assignee_fallback_refusal_explains_provenance
     test_bead_id_branch_reused_prefers_open_successor_when_branch_bead_closed
     test_bead_id_branch_reused_successor_match_via_branch_metadata_alone
     test_bead_id_branch_reused_successor_match_via_build_bead_metadata_alone

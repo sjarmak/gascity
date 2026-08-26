@@ -73,6 +73,16 @@ POG_READ_ATTEMPTS="${POG_READ_ATTEMPTS:-3}"
 # "no such assignment". Not a valid bead id by construction.
 POG_AMBIGUOUS_SENTINEL="__pog_unresolved_ambiguous__"
 
+# Provenance of the id assert_bead_still_claimed is checking, set by
+# _pog_resolve_bead_id: "branch" (the id was read off the branch name) or
+# "assignee" (no branch id, so this session's in-progress assignment stood
+# in). Refusals name it so an operator can tell a real ownership violation
+# from an unrelated held bead the fallback happened to pick up.
+POG_ID_SOURCE=""
+POG_ID_BRANCH=""
+POG_FALLBACK_ID=""
+POG_RESOLVED_ID=""
+
 # _pog_timeout <seconds> <cmd...>: run <cmd...> bounded by <seconds>,
 # mirroring the timeout/gtimeout fallback shim in
 # test/agents/graph-dispatch.sh (the only bounded-exec precedent in this
@@ -196,9 +206,34 @@ _pog_resolve_bead_id() {
     local branch=""
     branch="$(git symbolic-ref --short HEAD 2>/dev/null || git branch --show-current 2>/dev/null || true)"
 
+    POG_ID_BRANCH="$branch"
+    POG_ID_SOURCE=""
+    POG_FALLBACK_ID=""
+
+    # Bead-id extraction is store-agnostic: the prefix and suffix length both
+    # vary by store (this fork's ids are gc- with a 3-5 character suffix; the
+    # upstream store's are ga- with 6), and a pattern pinned to one store
+    # matches nothing in the other, so every push falls through to the
+    # assignee fallback and every held bead a long-lived seat is assigned to
+    # becomes a veto over unrelated pushes (gc-b8r7x).
+    #
+    # The match is ANCHORED to the start of the branch or to the token right
+    # after a '/', and the prefix is limited to the 2-3 letter shape every
+    # store uses (ga, gc, dr, vp), which is where every real branch shape puts the id
+    # (rebase/gc-nrhaz-4973, fix/gc-dn3mx-..., builder/ga-abc123.1-slug,
+    # deploy/ga-g5ihlp-gate) — so it yields at most one candidate instead of
+    # scanning the whole slug. It can still match an ordinary hyphenated word
+    # (fix/supervisor-adopt-dolt-port -> "supervisor-adopt"); that candidate
+    # is resolved OPTIMISTICALLY and the ordinary `bd show` in
+    # assert_bead_still_claimed decides reality. Pre-validating candidates
+    # with an extra probe is deliberately not done: `bd show` exits 0 and
+    # prints an error object for a missing id, so a probe cannot distinguish
+    # not-found from bd-unreachable, and treating an unconfirmable candidate
+    # as "nothing to check" turns six fail-closed paths in this guard into
+    # silent allows (measured: 29 pass / 6 fail against this file's suite).
     local branch_id=""
     if [[ -n "$branch" ]]; then
-        branch_id="$(grep -oE 'ga-[0-9a-z]{6}(\.[0-9]+)*' <<<"$branch" | head -1 || true)"
+        branch_id="$(grep -oE '(^|/)[a-z]{2,3}-[0-9a-z]{3,8}(\.[0-9]+)*' <<<"$branch" | head -1 | sed 's|^/||' || true)"
     fi
 
     # assignee_read_failed distinguishes "the read failed" (ambiguity) from
@@ -234,10 +269,10 @@ _pog_resolve_bead_id() {
         # signal left for this branch shape, so a failed read is ambiguity, not
         # "nothing to check" — hand the caller the sentinel so it fails closed.
         if [[ -z "$assignee_id" && $assignee_read_failed -eq 1 ]]; then
-            printf '%s' "$POG_AMBIGUOUS_SENTINEL"
+            POG_RESOLVED_ID="$POG_AMBIGUOUS_SENTINEL"
             return
         fi
-        printf '%s' "$assignee_id"
+        POG_RESOLVED_ID="$assignee_id"
         return
     fi
 
@@ -255,7 +290,7 @@ _pog_resolve_bead_id() {
     fi
     if [[ -n "$successor_id" && "$successor_id" != "$branch_id" ]] && _pog_branch_id_bead_inactive "$branch_id"; then
         echo "push-ownership-guard: NOTE branch $branch was reused after $branch_id closed; this session's in-progress $successor_id declares itself that bead's continuation (metadata.branch/build_bead), using $successor_id instead" >&2
-        printf '%s' "$successor_id"
+        POG_RESOLVED_ID="$successor_id"
         return
     fi
 
@@ -264,9 +299,16 @@ _pog_resolve_bead_id() {
     fi
 
     if [[ -n "$branch_id" ]]; then
-        printf '%s' "$branch_id"
+        # Keep the assignee id as the fallback for the one case the branch
+        # candidate can be wrong in: it names no bead at all (a slug word that
+        # happens to look like an id). assert_bead_still_claimed switches to
+        # it only on a DEFINITIVE not-found, never on a failed read.
+        POG_ID_SOURCE="branch"
+        POG_FALLBACK_ID="$assignee_id"
+        POG_RESOLVED_ID="$branch_id"
     else
-        printf '%s' "$assignee_id"
+        [[ -n "$assignee_id" ]] && POG_ID_SOURCE="assignee"
+        POG_RESOLVED_ID="$assignee_id"
     fi
 }
 
@@ -277,8 +319,13 @@ assert_bead_still_claimed() {
         return 0
     fi
 
+    # Called in the CURRENT shell, not a command substitution: the resolver
+    # also records where the id came from (POG_ID_SOURCE / POG_FALLBACK_ID)
+    # and a subshell would discard that.
     local id
-    id="$(_pog_resolve_bead_id)"
+    POG_RESOLVED_ID=""
+    _pog_resolve_bead_id
+    id="$POG_RESOLVED_ID"
     if [[ "$id" == "$POG_AMBIGUOUS_SENTINEL" ]]; then
         echo "push-ownership-guard: BLOCKED — deploy-gate branch: could not read this session's in-progress assignment (bd unreachable or not on PATH), so ownership cannot be verified; re-run the push first — if it keeps failing, bd/Dolt needs attention. Last resort: git push --no-verify" >&2
         return 1
@@ -292,14 +339,40 @@ assert_bead_still_claimed() {
         return 1
     fi
 
+    # The read loop runs at most twice: once for the id the resolver chose,
+    # and once more if that id was read off the branch name and turns out to
+    # name no bead at all. `bd show` answers a missing id with a JSON object
+    # carrying .error (exit 0), which is a DEFINITIVE not-found and the only
+    # signal treated as "that candidate was a slug word, not an id". An
+    # unreachable or unparseable read is ambiguity and still fails closed.
     local json
-    if ! json="$(_pog_read_with_retry bd show "$id" --json)" || [[ -z "$json" ]]; then
-        echo "push-ownership-guard: BLOCKED — bd show $id unreachable after $POG_READ_ATTEMPTS attempts; re-run the push first — if it keeps failing, bd/Dolt needs attention. Last resort: git push --no-verify" >&2
-        return 1
-    fi
-    if ! jq -e '.' <<<"$json" >/dev/null 2>&1; then
-        echo "push-ownership-guard: BLOCKED — bd show $id --json returned unparseable output; re-run the push first — if it keeps failing, bd/Dolt needs attention. Last resort: git push --no-verify" >&2
-        return 1
+    while :; do
+        if ! json="$(_pog_read_with_retry bd show "$id" --json)" || [[ -z "$json" ]]; then
+            echo "push-ownership-guard: BLOCKED — bd show $id unreachable after $POG_READ_ATTEMPTS attempts; re-run the push first — if it keeps failing, bd/Dolt needs attention. Last resort: git push --no-verify" >&2
+            return 1
+        fi
+        if ! jq -e '.' <<<"$json" >/dev/null 2>&1; then
+            echo "push-ownership-guard: BLOCKED — bd show $id --json returned unparseable output; re-run the push first — if it keeps failing, bd/Dolt needs attention. Last resort: git push --no-verify" >&2
+            return 1
+        fi
+        if ! jq -e 'type == "object" and has("error")' <<<"$json" >/dev/null 2>&1; then
+            break
+        fi
+        if [[ "$POG_ID_SOURCE" == "branch" && -n "$POG_FALLBACK_ID" && "$POG_FALLBACK_ID" != "$id" ]]; then
+            echo "push-ownership-guard: NOTE branch $POG_ID_BRANCH looked like it named bead $id, but no such bead exists; checking this session's in-progress assignment $POG_FALLBACK_ID instead" >&2
+            id="$POG_FALLBACK_ID"
+            POG_ID_SOURCE="assignee"
+            continue
+        fi
+        return 0  # no such bead and nothing else to check
+    done
+
+    # Acceptance criterion 2 of gc-b8r7x: when the id came from the assignee
+    # fallback rather than the branch, every refusal below says so, because
+    # that is the path that picks up beads unrelated to the push.
+    local why=""
+    if [[ "$POG_ID_SOURCE" == "assignee" ]]; then
+        why=" — NOTE: branch name '$POG_ID_BRANCH' names no known bead, so this id came from this session's in-progress assignment, not from this push; if $id is unrelated to this branch, this refusal is a false positive"
     fi
 
     # NOTE: never name this local 'status' — it is a zsh special parameter
@@ -313,7 +386,7 @@ assert_bead_still_claimed() {
     labels="$(jq -r '.[0].labels[]? // empty' <<<"$json")"
 
     if [[ "$bead_status" != "in_progress" && "$bead_status" != "open" ]]; then
-        echo "push-ownership-guard: BLOCKED — $id status is '$bead_status', not in_progress/open; the claim behind this push is stale. Bypass with: git push --no-verify" >&2
+        echo "push-ownership-guard: BLOCKED — $id status is '$bead_status', not in_progress/open; the claim behind this push is stale.$why Bypass with: git push --no-verify" >&2
         return 1
     fi
 
@@ -347,22 +420,22 @@ assert_bead_still_claimed() {
             if [[ -n "$assignee" && "$assignee" == "$_pog_ident" ]]; then _pog_owned=1; break; fi
         done
         if [[ $_pog_owned -eq 0 ]]; then
-            echo "push-ownership-guard: BLOCKED — $id assignee is '$assignee', not any current-session identity (${_pog_identities[*]}); it was reassigned since this push began. Bypass with: git push --no-verify" >&2
+            echo "push-ownership-guard: BLOCKED — $id assignee is '$assignee', not any current-session identity (${_pog_identities[*]}); it was reassigned since this push began.$why Bypass with: git push --no-verify" >&2
             return 1
         fi
     fi
 
     if [[ -n "${GC_TEMPLATE:-}" && -n "$routed_to" && "$routed_to" != "$GC_TEMPLATE" ]]; then
-        echo "push-ownership-guard: BLOCKED — $id gc.routed_to is '$routed_to', not this session's config identity ($GC_TEMPLATE); it was rerouted since this push began. Bypass with: git push --no-verify" >&2
+        echo "push-ownership-guard: BLOCKED — $id gc.routed_to is '$routed_to', not this session's config identity ($GC_TEMPLATE); it was rerouted since this push began.$why Bypass with: git push --no-verify" >&2
         return 1
     fi
 
     if grep -qx 'hold:mayor' <<<"$labels"; then
-        echo "push-ownership-guard: BLOCKED — $id is held (hold:mayor); a mayor ruling is pending. Bypass with: git push --no-verify" >&2
+        echo "push-ownership-guard: BLOCKED — $id is held (hold:mayor); a mayor ruling is pending.$why Bypass with: git push --no-verify" >&2
         return 1
     fi
     if grep -qx 'hold:external' <<<"$labels"; then
-        echo "push-ownership-guard: BLOCKED — $id is held (hold:external). Bypass with: git push --no-verify" >&2
+        echo "push-ownership-guard: BLOCKED — $id is held (hold:external).$why Bypass with: git push --no-verify" >&2
         return 1
     fi
 
