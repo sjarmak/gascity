@@ -553,7 +553,13 @@ func TestPrintSummary_AdvisoryRenderedSeparately(t *testing.T) {
 // wedged check must not stall the run — it reports as a timed-out advisory
 // error and every check registered after it still executes.
 func TestRunCheckTimeoutAbandonsWedgedCheck(t *testing.T) {
-	d := &Doctor{CheckTimeout: 25 * time.Millisecond}
+	// The budget bounds BOTH checks, not just the wedge: "after" also runs
+	// under boundedRun, so a scheduling stall longer than CheckTimeout on its
+	// goroutine reports it as timed out and fails the "ran normally"
+	// assertion below. Under `make test-fast-parallel` a 25ms budget was not
+	// enough headroom for that (gc-q68wq). The wedge still costs exactly one
+	// budget of wall clock, so keep this the smallest value with real margin.
+	d := &Doctor{CheckTimeout: 500 * time.Millisecond}
 	wedged := &mockCheck{name: "wedged", status: StatusOK, block: make(chan struct{})}
 	t.Cleanup(func() { close(wedged.block) }) // abandon the wedge once the run has returned
 	after := &mockCheck{name: "after", status: StatusOK, msg: "ran"}
@@ -563,7 +569,7 @@ func TestRunCheckTimeoutAbandonsWedgedCheck(t *testing.T) {
 	var buf bytes.Buffer
 	start := time.Now()
 	report := d.Run(&CheckContext{}, &buf, false)
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("run took %s; the wedged check was not abandoned", elapsed)
 	}
 
