@@ -363,6 +363,20 @@ func withMaxSessionAgeTracker(tr maxSessionAgeTracker) startExecutionOption {
 	}
 }
 
+// trackerStartExecutionOptions returns the reconcile-pass options that install
+// cityRuntime's lifecycle trackers. The two live together in one method so a
+// single guard test covers both halves of the wiring: that newCityRuntime
+// built the trackers, and that they are handed to startExecution. The
+// assigned-work defer backstop was silently dropped from both halves once
+// already (#4630 wiring lost in a branch split); every behavior test stayed
+// green because they drive withAssignedWorkDeferTracker directly.
+func (cr *CityRuntime) trackerStartExecutionOptions() []startExecutionOption {
+	return []startExecutionOption{
+		withMaxSessionAgeTracker(cr.mat),
+		withAssignedWorkDeferTracker(cr.adt),
+	}
+}
+
 // withAssignedWorkDeferTracker installs the consecutive same-bead
 // assigned-work defer backstop for this reconcile pass. Nil leaves the
 // backstop disabled (DecideIdleTimeout's AssignedWorkHas defer applies with
