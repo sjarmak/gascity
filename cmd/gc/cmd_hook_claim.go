@@ -158,6 +158,12 @@ type hookClaimOps struct {
 	// detached HEAD) marks that candidate unusable; the session back-reference is
 	// still stamped.
 	ResolveWorkBranch hookResolveWorkBranchFunc
+	// ResolveSessionWorkDir returns the checkout the CLAIMING session is running
+	// in, used only as the fallback when the bead records no checkout of its own
+	// (gc-2n4c: a pool-routed bead cannot record one, because no slot is chosen
+	// until this claim). Empty result means nothing is knowable and nothing is
+	// stamped.
+	ResolveSessionWorkDir hookResolveSessionWorkDirFunc
 	// StampWorkMeta writes the claim-time execution-identity metadata patch
 	// (gc.work_branch and/or the durable session back-reference gc.session_id /
 	// gc.session_name) onto the claimed bead in ONE update. Best-effort.
@@ -202,16 +208,17 @@ type hookClaimOps struct {
 }
 
 type (
-	hookClaimFunc              func(context.Context, string, []string, string, string) (beads.Bead, bool, error)
-	hookListContinuationFunc   func(context.Context, string, []string, string, string) ([]beads.Bead, error)
-	hookAssignContinuationFunc func(context.Context, string, []string, string, string) error
-	hookDrainAckFunc           func(io.Writer) error
-	hookEmitClaimRejectedFunc  func(beadID, existingClaimant, attemptedClaimant string)
-	hookResolveWorkBranchFunc  func(workerDir string) string
-	hookStampWorkMetaFunc      func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
-	hookStampSessionClaimFunc  func(sessionID, beadID string) error
-	hookPublishRunMapFunc      func(runID, beadID string, sessionKeys ...string) error
-	hookClaimReleaseFunc       func(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error)
+	hookClaimFunc                 func(context.Context, string, []string, string, string) (beads.Bead, bool, error)
+	hookListContinuationFunc      func(context.Context, string, []string, string, string) ([]beads.Bead, error)
+	hookAssignContinuationFunc    func(context.Context, string, []string, string, string) error
+	hookDrainAckFunc              func(io.Writer) error
+	hookEmitClaimRejectedFunc     func(beadID, existingClaimant, attemptedClaimant string)
+	hookResolveWorkBranchFunc     func(workerDir string) string
+	hookResolveSessionWorkDirFunc func(sessionID string) string
+	hookStampWorkMetaFunc         func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
+	hookStampSessionClaimFunc     func(sessionID, beadID string) error
+	hookPublishRunMapFunc         func(runID, beadID string, sessionKeys ...string) error
+	hookClaimReleaseFunc          func(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error)
 )
 
 type hookClaimJSONResult struct {
@@ -356,6 +363,9 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.ResolveWorkBranch == nil {
 		ops.ResolveWorkBranch = hookResolveWorkBranch
+	}
+	if ops.ResolveSessionWorkDir == nil {
+		ops.ResolveSessionWorkDir = hookResolveSessionWorkDir
 	}
 	if ops.StampWorkMeta == nil {
 		ops.StampWorkMeta = hookStampWorkMetaWithBdStore
@@ -1088,9 +1098,10 @@ func hookClaimWorkerDirs(bead beads.Bead) []string {
 	return dirs
 }
 
-// hookClaimWorkerBranch returns the branch of the first checkout bead records
-// that resolves to one, or "" when it records no usable checkout at all. resolve
-// is the validating step: it yields "" for a path that is missing, is not a
+// hookClaimWorkerBranch returns the branch of the first of dirs that resolves to
+// one, or "" when none does. dirs is the caller's ordered candidate list: what
+// the bead records (hookClaimWorkerDirs), or the claiming session's own checkout
+// when the bead records nothing. resolve is the validating step: it yields "" for a path that is missing, is not a
 // repo, or has a detached HEAD, so an unusable candidate falls through to the
 // next rather than being stamped.
 //
@@ -1098,8 +1109,8 @@ func hookClaimWorkerDirs(bead beads.Bead) []string {
 // claimed before its worktree exists, and no branch is knowable then; the close
 // gate fails loudly on a shipped bead that lacks one, which is strictly better
 // than validating its commit against a branch the work never touched.
-func hookClaimWorkerBranch(bead beads.Bead, resolve hookResolveWorkBranchFunc) string {
-	for _, dir := range hookClaimWorkerDirs(bead) {
+func hookClaimWorkerBranch(dirs []string, resolve hookResolveWorkBranchFunc) string {
+	for _, dir := range dirs {
 		if branch := strings.TrimSpace(resolve(dir)); branch != "" {
 			return branch
 		}
@@ -1198,16 +1209,40 @@ func hookClaimLifecycleCandidate(bead beads.Bead, opts hookClaimOptions) bool {
 // IsControlKind, GC_SESSION_ID, or a resolvable worktree branch the way the other
 // three keys are.
 //
+// gc.work_dir is a fifth entry, and the only one this function can ADD rather
+// than merely reflect. It is stamped only when the bead records no checkout of
+// its own, from the claiming session's, and it feeds the same patch's
+// gc.work_branch resolution so both land on the first claim instead of waiting
+// for a reconcile tick to notice (gc-2n4c). It observes the control-bead
+// boundary the session back-reference keys observe, and it is never a rewrite:
+// a bead that records a checkout keeps it.
+//
 // An empty result means every key is already current, so the caller issues no
 // write.
 func hookClaimIdentityPatch(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps) map[string]string {
 	patch := map[string]string{}
-	if branch := hookClaimWorkerBranch(bead, ops.ResolveWorkBranch); branch != "" &&
+	sessionID := hookClaimSessionID(opts.Env)
+	isControl := beadmeta.IsControlKind(strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey]))
+
+	dirs := hookClaimWorkerDirs(bead)
+	// A pool-routed bead records no checkout at all, so fall back to the
+	// claiming session's own (gc-2n4c). Only as a fallback: a recorded value is
+	// the bead's own declared intent and the tree the close gate resolves from,
+	// while the session's dir is at best the same tree reached another way. The
+	// seam is nil when a test constructs hookClaimOps directly instead of going
+	// through applyDefaults; like every other identity source here, an
+	// unavailable one stamps nothing rather than guessing a path.
+	if len(dirs) == 0 && sessionID != "" && !isControl && ops.ResolveSessionWorkDir != nil {
+		if sessionDir := strings.TrimSpace(ops.ResolveSessionWorkDir(sessionID)); sessionDir != "" {
+			patch[beadmeta.WorkDirMetadataKey] = sessionDir
+			dirs = []string{sessionDir}
+		}
+	}
+	if branch := hookClaimWorkerBranch(dirs, ops.ResolveWorkBranch); branch != "" &&
 		strings.TrimSpace(bead.Metadata[beadmeta.WorkBranchMetadataKey]) != branch {
 		patch[beadmeta.WorkBranchMetadataKey] = branch
 	}
-	if sessionID := hookClaimSessionID(opts.Env); sessionID != "" &&
-		!beadmeta.IsControlKind(strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey])) {
+	if sessionID != "" && !isControl {
 		if strings.TrimSpace(bead.Metadata[beadmeta.SessionIDMetadataKey]) != sessionID {
 			patch[beadmeta.SessionIDMetadataKey] = sessionID
 		}
