@@ -3,6 +3,7 @@ package overlay
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -784,4 +785,72 @@ func TestMergeSettingsJSON_NoWrap_LeavesBareEntries(t *testing.T) {
 	if _, wrapped := arr[0].(map[string]any)["hooks"]; wrapped {
 		t.Errorf("bare entry was wrapped without WithWrapBareHooks: %v", arr[0])
 	}
+}
+
+// TestMergeSettingsJSON_MatcheredPreToolUse_IdempotentAcrossReprojections pins
+// the shape reported in gastownhall/gascity#3862: a PreToolUse hook carrying a
+// top-level matcher, re-projected on every reconcile tick. The matcher is the
+// entry's identity, so the overlay must replace the base entry in place rather
+// than append beside it. The matcherless-wrapper tests above cover the shape
+// #3081 fixed; this covers the matcher'd shape #3862 reported, which had no
+// regression test of its own.
+func TestMergeSettingsJSON_MatcheredPreToolUse_IdempotentAcrossReprojections(t *testing.T) {
+	base := []byte(`{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"ubs hook"}]}]}}`)
+
+	// Each tick merges the embedded base into the file written by the last
+	// tick, exactly as the settings projector does.
+	cur := base
+	for i := 0; i < 25; i++ {
+		merged, err := MergeSettingsJSON(base, cur, WithWrapBareHooks())
+		if err != nil {
+			t.Fatalf("reprojection %d: %v", i, err)
+		}
+		cur = merged
+	}
+	if got := preToolUseEntryCount(t, cur); got != 1 {
+		t.Fatalf("PreToolUse entries after 25 reprojections = %d, want 1: %s", got, cur)
+	}
+}
+
+// TestMergeSettingsJSON_MatcheredPreToolUse_CollapsesExistingBloat covers
+// recovery rather than prevention: a settings file that already accumulated
+// duplicates under an older binary must collapse back to one entry on the next
+// projection, without an operator editing the file by hand.
+func TestMergeSettingsJSON_MatcheredPreToolUse_CollapsesExistingBloat(t *testing.T) {
+	const entry = `{"matcher":"Bash","hooks":[{"type":"command","command":"ubs hook"}]}`
+	base := []byte(`{"hooks":{"PreToolUse":[` + entry + `]}}`)
+
+	dupes := make([]string, 500)
+	for i := range dupes {
+		dupes[i] = entry
+	}
+	bloated := []byte(`{"hooks":{"PreToolUse":[` + strings.Join(dupes, ",") + `]}}`)
+
+	merged, err := MergeSettingsJSON(base, bloated, WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("merging bloated settings: %v", err)
+	}
+	if got := preToolUseEntryCount(t, merged); got != 1 {
+		t.Fatalf("PreToolUse entries after collapsing %d duplicates = %d, want 1", len(dupes), got)
+	}
+}
+
+// preToolUseEntryCount reports how many entries a merged settings document
+// carries under hooks.PreToolUse, failing the test if the document does not
+// have that shape.
+func preToolUseEntryCount(t *testing.T, doc []byte) int {
+	t.Helper()
+	var parsed map[string]any
+	if err := json.Unmarshal(doc, &parsed); err != nil {
+		t.Fatalf("unmarshaling merged settings: %v", err)
+	}
+	hooks, ok := parsed["hooks"].(map[string]any)
+	if !ok {
+		t.Fatalf("merged settings has no hooks object: %s", doc)
+	}
+	entries, ok := hooks["PreToolUse"].([]any)
+	if !ok {
+		t.Fatalf("merged settings has no PreToolUse array: %s", doc)
+	}
+	return len(entries)
 }
