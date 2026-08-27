@@ -147,7 +147,13 @@ type hookClaimOps struct {
 	Claim              hookClaimFunc
 	ListContinuation   hookListContinuationFunc
 	AssignContinuation hookAssignContinuationFunc
-	DrainAck           hookDrainAckFunc
+	// ResolveContinuationOwner returns the session name a workflow root is
+	// currently bound to, or "" when the root is not in progress or carries no
+	// binding. It is what lets the claim path tell a genuinely unclaimed
+	// affinity=require step from one a live session is already executing
+	// without having stamped a pin on it (gc-9tql).
+	ResolveContinuationOwner hookResolveContinuationOwnerFunc
+	DrainAck                 hookDrainAckFunc
 	// EmitClaimRejected publishes a bead.claim_rejected event when a claim is
 	// lost to a different live claimant (ADR-0009). Best-effort.
 	EmitClaimRejected hookEmitClaimRejectedFunc
@@ -200,16 +206,17 @@ type hookClaimOps struct {
 }
 
 type (
-	hookClaimFunc              func(context.Context, string, []string, string, string) (beads.Bead, bool, error)
-	hookListContinuationFunc   func(context.Context, string, []string, string, string) ([]beads.Bead, error)
-	hookAssignContinuationFunc func(context.Context, string, []string, string, string) error
-	hookDrainAckFunc           func(io.Writer) error
-	hookEmitClaimRejectedFunc  func(beadID, existingClaimant, attemptedClaimant string)
-	hookResolveWorkBranchFunc  func(dir string) string
-	hookStampWorkMetaFunc      func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
-	hookStampSessionClaimFunc  func(sessionID, beadID string) error
-	hookPublishRunMapFunc      func(runID, beadID string, sessionKeys ...string) error
-	hookClaimReleaseFunc       func(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error)
+	hookClaimFunc                    func(context.Context, string, []string, string, string) (beads.Bead, bool, error)
+	hookListContinuationFunc         func(context.Context, string, []string, string, string) ([]beads.Bead, error)
+	hookAssignContinuationFunc       func(context.Context, string, []string, string, string) error
+	hookResolveContinuationOwnerFunc func(ctx context.Context, dir string, env []string, rootID string) (string, error)
+	hookDrainAckFunc                 func(io.Writer) error
+	hookEmitClaimRejectedFunc        func(beadID, existingClaimant, attemptedClaimant string)
+	hookResolveWorkBranchFunc        func(dir string) string
+	hookStampWorkMetaFunc            func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
+	hookStampSessionClaimFunc        func(sessionID, beadID string) error
+	hookPublishRunMapFunc            func(runID, beadID string, sessionKeys ...string) error
+	hookClaimReleaseFunc             func(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error)
 )
 
 type hookClaimJSONResult struct {
@@ -345,6 +352,9 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.AssignContinuation == nil {
 		ops.AssignContinuation = hookAssignContinuationWithBdStore
+	}
+	if ops.ResolveContinuationOwner == nil {
+		ops.ResolveContinuationOwner = hookResolveContinuationOwnerWithBdStore
 	}
 	if ops.DrainAck == nil {
 		ops.DrainAck = hookRuntimeDrainAck
@@ -618,6 +628,9 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 		if !hookCandidateClaimable(candidate, opts.RouteTargets) {
 			continue
 		}
+		if hookCandidateGroupOwnedElsewhere(ctx, candidate, opts, ops, dir) {
+			continue
+		}
 		// F-B. The fresh-claim CAS is the mutation that mints a new obligation,
 		// so it is the one the turn-binding window most directly guards.
 		if ops.claimWindowSpent() {
@@ -697,6 +710,40 @@ func hookCandidateClaimable(candidate beads.Bead, routeTargets []string) bool {
 	return strings.TrimSpace(candidate.ID) != "" &&
 		strings.TrimSpace(candidate.Assignee) == "" &&
 		hookClaimMatchesRoute(candidate, routeTargets)
+}
+
+// hookCandidateGroupOwnedElsewhere reports whether a pool-routed
+// affinity=require step belongs to a continuation group a DIFFERENT session is
+// already executing.
+//
+// graphroute.ApplyGraphRouteBinding deliberately leaves a MetadataOnly (pool)
+// step with no assignee and no session pin so fresh pool work stays claimable by
+// anybody, and preassignHookContinuationGroup only sweeps the group once, at the
+// first claim. A step that becomes ready later therefore sits open, unassigned
+// and unpinned while the slot that owns the group is mid-run, and nothing in the
+// candidate itself distinguishes it from unclaimed work. The workflow root does
+// carry the binding, so that is what this reads.
+//
+// A dead owner cannot block the group permanently: the reconciler sweep recovers
+// a root bound to a dead session (gc-zf4), which clears the binding this reads.
+// Any resolution failure is treated as "not owned" so a store hiccup degrades to
+// the pre-existing behavior rather than stalling the hook.
+func hookCandidateGroupOwnedElsewhere(ctx context.Context, candidate beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string) bool {
+	if strings.TrimSpace(candidate.Metadata[beadmeta.SessionAffinityMetadataKey]) != "require" {
+		return false
+	}
+	rootID := strings.TrimSpace(candidate.Metadata[beadmeta.RootBeadIDMetadataKey])
+	if rootID == "" || strings.TrimSpace(candidate.Metadata[beadmeta.ContinuationGroupMetadataKey]) == "" {
+		return false
+	}
+	if ops.ResolveContinuationOwner == nil || ctx.Err() != nil {
+		return false
+	}
+	owner, err := ops.ResolveContinuationOwner(ctx, dir, opts.Env, rootID)
+	if err != nil || strings.TrimSpace(owner) == "" {
+		return false
+	}
+	return !hookClaimHasIdentity(owner, opts.IdentityCandidates)
 }
 
 // reportHookClaimRejected publishes a bead.claim_rejected event (ADR-0009) when a
@@ -1858,6 +1905,21 @@ func hookListContinuationWithBdStore(_ context.Context, dir string, env []string
 		},
 		TierMode: beads.TierBoth,
 	})
+}
+
+// hookResolveContinuationOwnerWithBdStore reads the workflow root's durable
+// session back-reference (#2843). Only an in-progress root binds its group; a
+// root in any other state leaves the group free.
+func hookResolveContinuationOwnerWithBdStore(ctx context.Context, dir string, env []string, rootID string) (string, error) {
+	store := hookClaimBdStoreContext(ctx, dir, env, "")
+	root, err := store.Get(rootID)
+	if err != nil {
+		return "", err
+	}
+	if !strings.EqualFold(strings.TrimSpace(root.Status), "in_progress") {
+		return "", nil
+	}
+	return strings.TrimSpace(root.Metadata[beadmeta.SessionNameMetadataKey]), nil
 }
 
 func hookAssignContinuationWithBdStore(_ context.Context, dir string, env []string, beadID, assignee string) error {
