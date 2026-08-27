@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/gchome"
 )
@@ -1087,6 +1088,15 @@ func defaultTestServiceDependencies(home gchome.ProductUsageHome, epoch uint64) 
 			return randomUUIDv4(rand.Reader)
 		},
 		verifyTTY: func(io.Writer) bool { return true },
+		// The foreground record budget is measured on deps.now, which these
+		// tests freeze or drive by hand. The production default bounds the
+		// advisory-lock wait with that budget in REAL time, so a fsync slower
+		// than 50ms under a parallel test load aborts a record whose injected
+		// clock has not moved (gc-tblk). Tests keep cancellation and drop only
+		// the real-clock deadline; production keeps context.WithTimeout.
+		newRecordLockContext: func(parent context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+			return context.WithCancel(parent)
+		},
 	}
 }
 

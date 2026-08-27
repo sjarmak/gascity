@@ -179,14 +179,20 @@ type serviceRelease struct {
 // serviceDependencies is package-private by design. Unit tests can exercise a
 // marked synthetic release; normal binaries can only call OpenProduction.
 type serviceDependencies struct {
-	home                        gchome.ProductUsageHome
-	homeErr                     error
-	homeReason                  StateReason
-	release                     serviceRelease
-	notice                      noticeDefinition
-	getenv                      func(string) string
-	newUUID                     func() (string, error)
-	now                         func() time.Time
+	home       gchome.ProductUsageHome
+	homeErr    error
+	homeReason StateReason
+	release    serviceRelease
+	notice     noticeDefinition
+	getenv     func(string) string
+	newUUID    func() (string, error)
+	now        func() time.Time
+	// newRecordLockContext bounds the foreground record path's advisory-lock
+	// wait. It defaults to context.WithTimeout, which measures REAL time. The
+	// remaining record budget it receives is measured on `now`, so a test that
+	// freezes `now` must override this too; otherwise a slow fsync on a loaded
+	// machine truncates a window the test declared open (gc-tblk).
+	newRecordLockContext        func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 	beforeRecordOperation       func(recordOperation)
 	verifyTTY                   func(io.Writer) bool
 	storageHooks                storageTestHooks
@@ -398,6 +404,9 @@ func openWithDependencies(deps serviceDependencies) (*Service, error) {
 	}
 	if deps.now == nil {
 		deps.now = time.Now
+	}
+	if deps.newRecordLockContext == nil {
+		deps.newRecordLockContext = context.WithTimeout
 	}
 	if deps.verifyTTY == nil {
 		return nil, errors.New("productmetrics: TTY verifier dependency is nil")

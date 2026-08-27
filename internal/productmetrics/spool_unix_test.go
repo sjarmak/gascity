@@ -11283,3 +11283,49 @@ func assertNoQueuedEvents(t *testing.T, home gchome.ProductUsageHome) {
 		t.Fatalf("queue contains entries: %v", entries)
 	}
 }
+
+// TestRecordOnceDecisionWindowIgnoresRealClockDuringLockWait pins the boundary
+// between the injected decision clock and the real one. The record budget is
+// defined entirely on service.deps.now, so a caller that freezes that clock has
+// declared the window open; a slow advisory-lock acquisition on a loaded
+// machine must not close it. Before the fix the remaining budget was handed to
+// context.WithTimeout, which measures real time, so a single fsync slower than
+// the 50ms budget aborted the record before it reached the boundary the test
+// had staged (gc-tblk).
+func TestRecordOnceDecisionWindowIgnoresRealClockDuringLockWait(t *testing.T) {
+	home, service, permit := newRecordServiceFixture(t, testEventIDOne)
+	current := testRecordHour
+	service.deps.now = func() time.Time { return current }
+	service.deps.beforeRecordOperation = func(operation recordOperation) {
+		if operation == recordOperationEventWrite {
+			current = testRecordHour.Add(defaultRecordDecisionBudget + time.Nanosecond)
+		}
+	}
+	quotaWrites := 0
+	stalled := false
+	service.deps.storageHooks.beforeStep = func(step storageStep) error {
+		if step == storageStepWrite {
+			quotaWrites++
+		}
+		// Stall the very first durability sync, which the lock path performs
+		// while creating its advisory-lock file, for longer than the record
+		// budget in REAL time. The injected clock does not move.
+		if step == storageStepFileSync && !stalled {
+			stalled = true
+			time.Sleep(defaultRecordDecisionBudget + 20*time.Millisecond)
+		}
+		return nil
+	}
+	if got := service.RecordOnce(permit, CommandHelp); got != RecordDropped {
+		t.Fatalf("RecordOnce = %v, want dropped at the staged event-write boundary", got)
+	}
+	if !stalled {
+		t.Fatal("advisory-lock durability sync never ran; the stall never exercised the lock wait")
+	}
+	if quotaWrites != 1 {
+		t.Fatalf("a real-clock stall during the lock wait truncated the frozen window: %d quota writes, want 1", quotaWrites)
+	}
+	if _, err := os.Lstat(filepath.Join(home.Root(), quotaFileName)); err != nil {
+		t.Fatalf("stalled lock wait lost the conservative quota: %v", err)
+	}
+}
