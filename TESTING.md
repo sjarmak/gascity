@@ -172,6 +172,41 @@ the last observed state, and have one named boundary owner. Busy loops and a
 fixed sleep before the helper are forbidden. The deadline rule below supplies
 safety timeouts; those deadlines must not determine the normal test duration.
 
+## A faked clock is only as good as its narrowest escape hatch
+
+Injecting a clock does not make a test deterministic on its own. Production code
+routinely converts a duration it measured on the injected clock into a REAL
+deadline, most often by handing it to `context.WithTimeout` or
+`context.WithDeadline`. A test that freezes the injected clock has declared its
+window open, but that one real deadline still expires on a loaded machine, and
+the code under test takes an abort path the test never staged.
+
+The failure is invisible in isolation and looks like flakiness in a parallel
+sweep: focused reruns always pass, and a different subtest fails each time,
+because which step the real deadline lands on depends on machine load rather
+than anything in the test.
+
+So when a test fakes a clock, account for every real-time dependency on the path
+it drives, not just the arithmetic the fake feeds:
+
+```bash
+grep -rn 'context.WithTimeout\|context.WithDeadline\|time.After\|NewTicker\|NewTimer' <pkg>
+```
+
+Any hit reachable from the faked path is an escape hatch. Make its source
+injectable (this package already does exactly that for other deadlines) and
+default it in the package's shared test-dependency helper, so the whole class is
+closed rather than the one test that happened to fail. Production keeps the real
+deadline: bounding blocking IO in real time is usually the correct behavior, and
+the defect is the test's inheritance of it, not the bound itself.
+
+(Precedent 2026-08-27, gc-tblk: the foreground record path in
+`internal/productmetrics` budgeted itself on `service.deps.now`, then bounded its
+advisory-lock wait with `context.WithTimeout`. One fsync slower than the 50ms
+budget aborted the record before its first `flock`, and
+`TestRecordOnceDecisionWindowGatesEveryForegroundQuotaBoundary` reported zero
+quota writes where the staged boundary expected one.)
+
 ## Test doubles and conformance are one contract
 
 A fast substitute is trustworthy only when it is held to the same observable
