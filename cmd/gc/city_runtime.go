@@ -122,6 +122,7 @@ type CityRuntime struct {
 	ct                      crashTracker
 	it                      idleTracker
 	mat                     maxSessionAgeTracker
+	adt                     assignedWorkDeferTracker
 	wg                      wispGC
 	od                      orderDispatcher
 	retiredOrderDispatchers []orderDispatcher
@@ -368,6 +369,7 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 
 	it := buildIdleTracker(p.Cfg, p.CityName, p.CityPath, p.SP)
 	mat := buildMaxSessionAgeTracker(p.Cfg, p.CityName, p.SP)
+	adt := buildAssignedWorkDeferTracker(p.Cfg, p.CityName, p.SP)
 
 	wg := newWispGCForConfig(p.Cfg)
 
@@ -429,6 +431,7 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 		ct:                      ct,
 		it:                      it,
 		mat:                     mat,
+		adt:                     adt,
 		wg:                      wg,
 		od:                      od,
 		orderSet:                orderSnapshot.Orders,
@@ -2287,6 +2290,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 
 	cr.it = buildIdleTracker(nextCfg, cr.cityName, cr.cityPath, nextSp)
 	cr.mat = buildMaxSessionAgeTracker(nextCfg, cr.cityName, nextSp)
+	cr.adt = buildAssignedWorkDeferTracker(nextCfg, cr.cityName, nextSp)
 
 	cr.wg = newWispGCForConfig(nextCfg)
 
@@ -2769,7 +2773,6 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		withAsyncStartLimiter(cr.ensureAsyncStartLimiter()),
 		withAsyncStartTracker(&cr.asyncStarts),
 		withAsyncDrainAckStopTracker(&cr.asyncStops),
-		withMaxSessionAgeTracker(cr.mat),
 		withReadyAssignedFlags(readyAssignedFlagsForBeads(result.ReadyAssigned, awakeAssignedWorkBeads, awakeAssignedStoreRefs)),
 		// The legs this tick read the surviving assigned work through. The
 		// orphan-close tie-break releases a held claim through its own leg
@@ -2789,6 +2792,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		// unclaimed-trigger gate.
 		withWarmClaimProbe(buildWarmClaimTriggerProbe(cr.newWarmClaimTriggerResolver(rigStores), cr.stderr)),
 	}
+	reconcileStartOptions = append(reconcileStartOptions, cr.trackerStartExecutionOptions()...)
 	if bootReconcile {
 		// #3288: skip the per-session orphan/failed-create session-bead closes on
 		// the boot tick so readiness does not wait on their wisp-tier work-probe

@@ -7556,3 +7556,53 @@ func TestWarnIfClosedOrderTrackingBacklogLarge_CountsStoresTogether(t *testing.T
 		t.Fatalf("warning = %q, want one advisory line for the city", got)
 	}
 }
+
+// TestNewCityRuntimeWiresAssignedWorkDeferTracker pins the assigned-work defer
+// tracker into the runtime's construction, not merely into the option that
+// consumes it. The tracker is the same-bead backstop the idle-kill ladder
+// consults (#4630); its three behavior tests drive
+// withAssignedWorkDeferTracker directly, so dropping cr.adt from
+// newCityRuntime leaves every one of them green and the backstop dead in
+// production. Only the unused-symbol linter noticed, and only because the
+// builder happened to lose its last caller.
+func TestNewCityRuntimeWiresAssignedWorkDeferTracker(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath,
+		CityName: "test-city",
+		TomlPath: tomlPath,
+		Cfg:      cfg,
+		SP:       sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+
+	if cr.adt == nil {
+		t.Fatal("newCityRuntime left adt nil: the idle-kill same-bead defer backstop is not wired")
+	}
+
+	// Construction alone is not the whole wiring: the tracker also has to reach
+	// startExecution. Apply the reconcile-pass tracker options and assert both
+	// land, so deleting either the builder call or the option line fails here.
+	var opts startExecutionOptions
+	for _, apply := range cr.trackerStartExecutionOptions() {
+		apply(&opts)
+	}
+	if opts.assignedWorkDeferTr == nil {
+		t.Fatal("trackerStartExecutionOptions did not install the assigned-work defer tracker")
+	}
+}
