@@ -87,6 +87,23 @@ git branch -a --list '*<slug>*'
 git cat-file -t <sha>   # loose objects often survive a deleted branch
 ```
 
+A close reason naming a SHA (`"landed on main at <sha>"`) needs the stronger
+check, because there is no branch left to look for and the sentence already
+asserts the thing you are testing:
+
+```bash
+git merge-base --is-ancestor <sha> origin/main && echo IN || echo NOT_IN
+git grep <symbol> origin/main -- <path>   # a rebase would have changed the SHA
+```
+
+Run both. Ancestry alone can be a false negative if the work was rebased or
+squashed on the way in, so confirm the absence by grepping `origin/main` for a
+SYMBOL the fix introduced (a new file, a new constant) rather than trusting the
+SHA. On 2026-08-27 a 5-commit stack from 2026-07-17 failed both checks: gc-ewk4
+(P1, closed "landed on main at e3ce4b7af") and gc-nuhl (P1) had run live on main
+for six weeks, and two further beads (gc-5xyt, gc-175t) had premises written
+against that unlanded code.
+
 A missing branch with surviving commit objects is a salvage, not a re-author:
 cherry-pick onto current `origin/main` and resolve conflicts by keeping main's
 structure and porting the semantics into it. Beware that `git cherry-pick
