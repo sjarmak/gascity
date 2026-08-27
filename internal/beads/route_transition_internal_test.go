@@ -197,3 +197,38 @@ func TestApplyUpdateOptsToBeadDisarmsRouteOnNonRunnableTransition(t *testing.T) 
 		t.Errorf("gc.routed_to = %q, want cleared", v)
 	}
 }
+
+// TestApplySQLiteUpdateOptsDisarmsRouteOnNonRunnableTransition covers the
+// SQLite backend, which did not exist when gc-nuhl's gate was written.
+// applySQLiteUpdateOpts is its single shared inner helper: SQLiteStore.Update,
+// sqliteStoreTx.Update, and the conditional (CAS) write in
+// sqlite_store_conditional.go all funnel through it, so gating there is what
+// makes the doc comment's "regardless of backend" claim true rather than an
+// overclaim.
+func TestApplySQLiteUpdateOptsDisarmsRouteOnNonRunnableTransition(t *testing.T) {
+	for _, status := range []string{"blocked", "deferred"} {
+		bead := Bead{
+			ID:     "gc-1",
+			Status: "in_progress",
+			Metadata: map[string]string{
+				beadmeta.RoutedToMetadataKey:          "/home/ds/gascity/polecat",
+				beadmeta.ExecutionRoutedToMetadataKey: "gascity/control-dispatcher",
+				beadmeta.RunTargetMetadataKey:         "/home/ds/gascity/polecat",
+			},
+		}
+		got := applySQLiteUpdateOpts(bead, UpdateOpts{Status: strptr(status)})
+		if got.Status != status {
+			t.Errorf("Status = %q, want %s", got.Status, status)
+		}
+		if v := got.Metadata[beadmeta.RoutedToMetadataKey]; v != "" {
+			t.Errorf("%s: gc.routed_to = %q, want cleared", status, v)
+		}
+		if v := got.Metadata[beadmeta.ExecutionRoutedToMetadataKey]; v != "" {
+			t.Errorf("%s: gc.execution_routed_to = %q, want cleared", status, v)
+		}
+		// gc.run_target is non-executable recovery intent and must survive.
+		if v := got.Metadata[beadmeta.RunTargetMetadataKey]; v == "" {
+			t.Errorf("%s: gc.run_target was cleared, want preserved", status)
+		}
+	}
+}

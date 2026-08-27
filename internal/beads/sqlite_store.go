@@ -1039,7 +1039,14 @@ func scanSQLiteBead(row sqliteScanner) (Bead, error) {
 // field semantics (nil pointers skipped, Labels appended, RemoveLabels
 // filtered, Metadata merged). Update and UpdateIfMatch share it so the fenced
 // and unfenced paths cannot drift.
+//
+// It is also this backend's single call site for
+// disarmRouteOnNonRunnableTransition (gc-nuhl): SQLiteStore.Update,
+// sqliteStoreTx.Update and the conditional write all funnel through here, so
+// no SQLite write path can leave an executable route on a bead it moves to
+// blocked or deferred.
 func applySQLiteUpdateOpts(b Bead, opts UpdateOpts) Bead {
+	opts = disarmRouteOnNonRunnableTransition(opts)
 	if opts.Title != nil {
 		b.Title = *opts.Title
 	}
