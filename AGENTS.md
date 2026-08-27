@@ -118,6 +118,27 @@ closed 2026-07-17 on a deleted branch, ran live for six weeks and left 506 of 63
 `gc.work_branch` values naming the shared rig checkout; two downstream beads had
 premises written against its unlanded code.)
 
+**An OPEN bead is not proof the bug is live.** The mirror of the false close, and
+it costs the same wasted authoring pass. A bead names a mechanism at file:line,
+those line numbers no longer resolve, and the fix turns out to have landed under
+a commit whose subject says nothing about it. Before implementing any bead's fix
+candidate, grep `origin/main` for a SYMBOL the fix would introduce, exactly as
+you would to disprove a SHA-claiming close:
+
+```bash
+git grep -c <symbol> origin/main -- <path>
+git log origin/main --oneline -S'<symbol>' -- <path>   # names the commit that landed it
+```
+
+When it already landed, the bead's remaining scope is whatever the guard does NOT
+cover, and its measured exposure figure is stale by construction: re-measure it
+before quoting it. (Precedent 2026-08-27: gc-j0cfh (P1) proposed guarding
+`stampRunSessionIdentity` against pool slot-label work_dirs; the guard
+(`workDirStampHasOwnershipEvidence`) had been on main since `e938a1906` under the
+subject "close terminal workflow residue (#5026)", and the bead's "77 open"
+exposure had fallen to 18. The real remaining defect was a NEW mint path added
+minutes earlier in the same session's own claim-time commit.)
+
 ## Development approach
 
 **TDD.** Write the test first, watch it fail, make it pass. Every package
