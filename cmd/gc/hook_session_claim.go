@@ -66,6 +66,13 @@ func hookStampSessionCurrentClaim(sessionID, beadID string) error {
 // session is the first actor that knows the concrete tree, and its own bead is
 // the only place that records it: GC_WORK_DIR is not in a pool session's env.
 //
+// A POOL-MANAGED session is refused outright. Its WorkDir is the slot label
+// (polecat-slots/polecat-N), a SHARED directory rather than an isolated
+// worktree, so stamping it would turn a slot label into worktree-ownership
+// evidence on the bead — the gc-j0cfh defect, which the reconciler side already
+// refuses via workDirStampHasOwnershipEvidence. A pool claim therefore stamps
+// nothing here and waits for the provisioner to record a real per-bead tree.
+//
 // The id is resolved EXACTLY, for the same reason SetCurrentClaim does: bd's
 // fuzzy resolver would otherwise let a prefix collision hand back a different
 // session's checkout, and this value is stamped onto the work bead as durable
@@ -85,6 +92,24 @@ func hookResolveSessionWorkDir(sessionID string) string {
 	}
 	info, err := sessFront.Get(resolved)
 	if err != nil {
+		return ""
+	}
+	return sessionStampableWorkDir(info)
+}
+
+// sessionStampableWorkDir returns the checkout of info that may be stamped onto
+// a work bead as gc.work_dir, or "" when info has none that qualifies. It is the
+// decidable half of hookResolveSessionWorkDir, split out so the pool refusal is
+// testable without a live city.
+//
+// A POOL-MANAGED session is refused outright: its WorkDir is the slot label
+// (polecat-slots/polecat-N), a SHARED directory rather than an isolated
+// worktree, so stamping it would turn a slot label into worktree-ownership
+// evidence on the bead (gc-j0cfh). The reconciler side refuses the same value
+// for the same reason (workDirStampHasOwnershipEvidence), and this keeps the
+// claim path from becoming a second way to mint it.
+func sessionStampableWorkDir(info session.Info) string {
+	if info.PoolManaged {
 		return ""
 	}
 	return strings.TrimSpace(info.WorkDir)
