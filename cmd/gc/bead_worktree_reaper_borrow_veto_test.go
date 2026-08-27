@@ -266,3 +266,64 @@ func TestReapClosedBeadWorktrees_BorrowVetoScanIsBatchedPerRig(t *testing.T) {
 		t.Errorf("IncludeClosed = true, want false: closed beads are discarded by IsTerminalStatus anyway, so pulling each rig's full closed history every tick is pure cost")
 	}
 }
+
+// TestReapClosedBeadWorktrees_BorrowVetoMarksUnownedReference pins that the
+// veto reason distinguishes a reference held by a bead someone is actually
+// working from one held by a bead with no assignee.
+//
+// An unassigned non-terminal bead that still carries gc.work_dir vetoes
+// forever: nothing clears the key when a claim is dropped or a worker dies, so
+// the tree it names is protected by a reference no one owns. On the live
+// gascity store 275 of the 322 non-terminal beads carrying a work_dir have no
+// assignee, and the veto reason gave no way to tell those apart from real
+// borrows. Protection is unchanged — failing closed is still correct, because
+// the bead may be re-claimed — but the reason now says which kind of reference
+// it is, so the leak is measurable from the reap_skipped stream instead of
+// requiring a store query to discover.
+func TestReapClosedBeadWorktrees_BorrowVetoMarksUnownedReference(t *testing.T) {
+	cityPath, rigRoot := initReapRig(t)
+	wt := addClosedWorktree(t, rigRoot, cityPath, "builder", "ga-owner01")
+	store := beads.NewMemStoreFrom(1, []beads.Bead{
+		{ID: "ga-owner01", Status: "closed"},
+		{ID: "ga-orphan03", Status: "open", Metadata: map[string]string{beadmeta.WorkDirMetadataKey: wt}},
+	}, nil)
+	cfg := reapTestConfig(rigRoot)
+	injectLiveness(t, liveWorktreeState{scanned: true})
+
+	var stderr bytes.Buffer
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{"mrig": store}, nil, false, events.Discard, nil, &stderr)
+
+	if len(report.Reaped) != 0 {
+		t.Fatalf("Reaped = %+v, want 0: an unowned reference must still fail closed", report.Reaped)
+	}
+	if len(report.Protected) != 1 {
+		t.Fatalf("Protected = %+v, want exactly 1 borrow-veto entry", report.Protected)
+	}
+	if !strings.Contains(report.Protected[0].Reason, "ga-orphan03 (unowned)") {
+		t.Errorf("Reason = %q, want it to mark ga-orphan03 as an unowned reference", report.Protected[0].Reason)
+	}
+}
+
+// TestReapClosedBeadWorktrees_BorrowVetoLeavesOwnedReferenceUnmarked is the
+// negative half: a reference held by an assigned bead is a real borrow and
+// must not be reported as unowned.
+func TestReapClosedBeadWorktrees_BorrowVetoLeavesOwnedReferenceUnmarked(t *testing.T) {
+	cityPath, rigRoot := initReapRig(t)
+	wt := addClosedWorktree(t, rigRoot, cityPath, "builder", "ga-owner01")
+	store := beads.NewMemStoreFrom(1, []beads.Bead{
+		{ID: "ga-owner01", Status: "closed"},
+		{ID: "ga-held04", Status: "in_progress", Assignee: "worker-1", Metadata: map[string]string{beadmeta.WorkDirMetadataKey: wt}},
+	}, nil)
+	cfg := reapTestConfig(rigRoot)
+	injectLiveness(t, liveWorktreeState{scanned: true})
+
+	var stderr bytes.Buffer
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{"mrig": store}, nil, false, events.Discard, nil, &stderr)
+
+	if len(report.Protected) != 1 {
+		t.Fatalf("Protected = %+v, want exactly 1 borrow-veto entry", report.Protected)
+	}
+	if strings.Contains(report.Protected[0].Reason, "unowned") {
+		t.Errorf("Reason = %q, want no unowned marker on a reference held by an assigned bead", report.Protected[0].Reason)
+	}
+}

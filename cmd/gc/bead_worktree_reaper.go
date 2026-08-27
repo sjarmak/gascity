@@ -507,12 +507,29 @@ func scanBorrowVetoReferences(store beads.Store, candidates []reapCandidate) (ma
 				continue
 			}
 			if raw, hit := byNorm[pathutil.NormalizePathForCompare(p)]; hit {
-				refs[raw] = append(refs[raw], b.ID)
+				refs[raw] = append(refs[raw], borrowVetoReferenceLabel(b))
 				break
 			}
 		}
 	}
 	return refs, nil
+}
+
+// borrowVetoReferenceLabel names a bead in a borrow-veto reason, marking it
+// "(unowned)" when nothing holds it.
+//
+// A non-terminal bead with no assignee still vetoes — it can be re-claimed, so
+// failing closed stays correct — but it is a different thing from a tree
+// someone is working in. Nothing clears gc.work_dir when a claim is dropped or
+// a worker dies, so such a reference protects its tree indefinitely; on the
+// live gascity store 275 of 322 non-terminal beads carrying a work_dir have no
+// assignee. Without this marker the two cases render identically and the
+// backlog is invisible in the reap_skipped stream.
+func borrowVetoReferenceLabel(b beads.Bead) string {
+	if strings.TrimSpace(b.Assignee) == "" {
+		return b.ID + " (unowned)"
+	}
+	return b.ID
 }
 
 // recordReapSkipped emits a bead.worktree.reap_skipped event carrying the
