@@ -390,6 +390,16 @@ func standardAssignedWorkQueryScript(topo QueryTopology) string {
 		standardAssignedReadyWorkQueryScript(topo)
 }
 
+// assignedTierWidenLimit is the row count the four assigned work_query tiers
+// read. Each tier prints its reader's output and exits as soon as it is
+// non-empty, before the hook layer's readiness filter runs, so a single-row
+// read lets an unready head bead (a self-blocked step, or one carrying
+// gc.disarmed) hide every other bead assigned to the same identity. Reading
+// past one row gives filterUnreadyHookCandidates something to fall through to;
+// it and claimFirstEligibleHookCandidate already iterate the full candidate
+// array generically. Mirrors routedReadyTierCommand's existing precedent.
+const assignedTierWidenLimit = "20"
+
 // assignedInProgressTierCommand is the crash-recovery read for one identity.
 //
 // This tier WAS the one read the federation swap left on single-store `bd list`,
@@ -420,7 +430,7 @@ func assignedInProgressTierCommand(shellVar string, topo QueryTopology) string {
 	if fed {
 		reader = gcReadyCommand + ` --status in_progress`
 	}
-	return `r=$(` + reader + ` --assignee="$` + shellVar + `" --json --limit=1` +
+	return `r=$(` + reader + ` --assignee="$` + shellVar + `" --json --limit=` + assignedTierWidenLimit +
 		readyReaderStderrSink(fed) + `)` + readyReaderFailurePropagation(fed) + `; `
 }
 
@@ -558,7 +568,7 @@ func inProgressBlockedByEnrichmentScript(federated bool, checkHold bool) string 
 func assignedReadyTierCommand(shellVar string, topo QueryTopology) string {
 	fed := topo.FederatedReady
 	return `r=$(` + readyReaderCommand(fed) + bdReadyIncludeEphemeralArg(topo.includeEphemeralReady()) +
-		` --assignee="$` + shellVar + `" --json --limit=1` + readyReaderStderrSink(fed) + `)` +
+		` --assignee="$` + shellVar + `" --json --limit=` + assignedTierWidenLimit + readyReaderStderrSink(fed) + `)` +
 		readyReaderFailurePropagation(fed) + `; `
 }
 
