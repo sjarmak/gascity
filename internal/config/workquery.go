@@ -390,7 +390,8 @@ func standardAssignedWorkQueryScript(topo QueryTopology) string {
 		standardAssignedReadyWorkQueryScript(topo)
 }
 
-// assignedTierWidenLimit is the row count the four assigned work_query tiers
+// assignedTierWidenLimit is the row count the assigned work_query tiers and
+// their bd-1.0.4-compat ephemeral probes read.  Previously: the four tiers
 // read. Each tier prints its reader's output and exits as soon as it is
 // non-empty, before the hook layer's readiness filter runs, so a single-row
 // read lets an unready head bead (a self-blocked step, or one carrying
@@ -398,7 +399,7 @@ func standardAssignedWorkQueryScript(topo QueryTopology) string {
 // past one row gives filterUnreadyHookCandidates something to fall through to;
 // it and claimFirstEligibleHookCandidate already iterate the full candidate
 // array generically. Mirrors routedReadyTierCommand's existing precedent.
-const assignedTierWidenLimit = "20"
+const assignedTierWidenLimit = 20
 
 // assignedInProgressTierCommand is the crash-recovery read for one identity.
 //
@@ -430,7 +431,7 @@ func assignedInProgressTierCommand(shellVar string, topo QueryTopology) string {
 	if fed {
 		reader = gcReadyCommand + ` --status in_progress`
 	}
-	return `r=$(` + reader + ` --assignee="$` + shellVar + `" --json --limit=` + assignedTierWidenLimit +
+	return `r=$(` + reader + ` --assignee="$` + shellVar + `" --json --limit=` + strconv.Itoa(assignedTierWidenLimit) +
 		readyReaderStderrSink(fed) + `)` + readyReaderFailurePropagation(fed) + `; `
 }
 
@@ -568,7 +569,7 @@ func inProgressBlockedByEnrichmentScript(federated bool, checkHold bool) string 
 func assignedReadyTierCommand(shellVar string, topo QueryTopology) string {
 	fed := topo.FederatedReady
 	return `r=$(` + readyReaderCommand(fed) + bdReadyIncludeEphemeralArg(topo.includeEphemeralReady()) +
-		` --assignee="$` + shellVar + `" --json --limit=` + assignedTierWidenLimit + readyReaderStderrSink(fed) + `)` +
+		` --assignee="$` + shellVar + `" --json --limit=` + strconv.Itoa(assignedTierWidenLimit) + readyReaderStderrSink(fed) + `)` +
 		readyReaderFailurePropagation(fed) + `; `
 }
 
@@ -622,7 +623,7 @@ func legacyControlAssignedReadyWorkQueryScript(topo QueryTopology) string {
 // without it a held ephemeral bead exited the script as the sole candidate, the
 // Go-side filter then stripped it, and the hook reported no_work while ready
 // work sat unqueried below — the same starvation, wearing a drain label.
-// Filtering before the `.[:1]` truncation also lets a second, unheld
+// Filtering before the row-slice truncation also lets a second, unheld
 // in_progress candidate be served instead of being shadowed by a held first.
 //
 // Failure mode differs from the bd-list tier's fail-open serve, deliberately:
@@ -636,11 +637,11 @@ func legacyControlAssignedReadyWorkQueryScript(topo QueryTopology) string {
 // re-served on every hook tick (ga-qjozkw).
 func ephemeralAssignedInProgressProbeScript(shellVar string, topo QueryTopology) string {
 	_ = topo
-	filter := `[.[] | select((.assignee // "") == $id)` + excludeHoldLabelsJQClause() + `] | .[:1]`
+	filter := `[.[] | select((.assignee // "") == $id)` + excludeHoldLabelsJQClause() + `] | .[:` + strconv.Itoa(assignedTierWidenLimit) + `]`
 	// federated=false: this row comes from `bd query`, which never carries a
 	// resolved blocked_by, so the carried-lookup branch would only ever fall
 	// through to bd show — skip straight to it. checkHold=false: the filter
-	// above already excludes held candidates before the `.[:1]` truncation, so
+	// above already excludes held candidates before the row-slice truncation, so
 	// the post-truncation nheld check here would always read zero.
 	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
 		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
@@ -668,8 +669,8 @@ func ephemeralAssignedReadyProbeScript(shellVar string, topo QueryTopology) stri
 	if topo.includeEphemeralReady() {
 		return ""
 	}
-	fastFilter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1, false)
-	slowFilter := ephemeralReadyDependencyCandidateFilterJQ(`select((.assignee // "") == $id)`, 1, false)
+	fastFilter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, assignedTierWidenLimit, false)
+	slowFilter := ephemeralReadyDependencyCandidateFilterJQ(`select((.assignee // "") == $id)`, assignedTierWidenLimit, false)
 	return `open_ephemeral=$(` + bdQueryEphemeralStatusQuietShell("open") + `); ` +
 		`r=$(printf "%s" "$open_ephemeral" | jq --arg id "$` + shellVar + `" ` + shellquote.Quote(fastFilter) + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
