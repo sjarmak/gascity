@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/beadmeta"
 )
 
 // countingBackingStore wraps a Store and counts SetMetadata /
@@ -1286,5 +1288,54 @@ func TestCachingStoreCloseKeepsCachedSynthesisWhenRefreshFails(t *testing.T) {
 	}
 	if got.Status != "closed" {
 		t.Fatalf("cached status after Close with failed refresh = %q, want %q (synthesis fallback)", got.Status, "closed")
+	}
+}
+
+// TestCachingStoreUpdateDisarmsRouteBeforeIdempotenceCheck covers gc-175t.
+// CachingStore.Update short-circuits to a no-op when every non-nil field in
+// opts already matches the cached bead. That comparison ran against the
+// caller's raw opts, before disarmRouteOnNonRunnableTransition, so a
+// reconciliation loop idempotently re-asserting "still blocked" on a bead that
+// carries a stale executable route could never clear it: opts.Status matched
+// the cached status, opts.Metadata was empty, and the gate never ran.
+//
+// Under a bd-family backing this is unreachable today only because mapBdStatus
+// collapses "blocked" to "open" on decode, so opts.Status never matches the
+// cached value. That is accidental protection from an unrelated decode
+// detail, not the invariant. A backing that stores raw status (MemStore here,
+// SQLiteStore in the same package) reaches it directly.
+func TestCachingStoreUpdateDisarmsRouteBeforeIdempotenceCheck(t *testing.T) {
+	t.Parallel()
+
+	backing := NewMemStore()
+	bead, err := backing.Create(Bead{Title: "stale route"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Seed the exact state route_transition.go's doc comment names as
+	// reachable through the SetMetadata / external-bd-CLI gaps: already
+	// blocked, still carrying an executable route.
+	if err := backing.Update(bead.ID, UpdateOpts{Status: strptr("blocked")}); err != nil {
+		t.Fatalf("seed status: %v", err)
+	}
+	if err := backing.SetMetadata(bead.ID, beadmeta.RoutedToMetadataKey, "/home/ds/gascity/polecat"); err != nil {
+		t.Fatalf("seed route: %v", err)
+	}
+
+	cache := NewCachingStoreForTest(backing, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	if err := cache.Update(bead.ID, UpdateOpts{Status: strptr("blocked")}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	got, err := backing.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if v := got.Metadata[beadmeta.RoutedToMetadataKey]; v != "" {
+		t.Errorf("gc.routed_to = %q, want cleared; the idempotence short-circuit bypassed the route-disarm gate", v)
 	}
 }

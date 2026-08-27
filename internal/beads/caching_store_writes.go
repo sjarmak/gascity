@@ -54,6 +54,15 @@ func (c *CachingStore) createWith(create func() (Bead, error)) (Bead, error) {
 
 // Update passes through to the backing store and refreshes the cache.
 func (c *CachingStore) Update(id string, opts UpdateOpts) error {
+	// Disarm executable routes BEFORE the idempotence comparison, not only
+	// inside applyUpdateOptsToBead on the backing pass (gc-175t). An
+	// idempotent "still blocked" write from a reconciliation or health-patrol
+	// loop otherwise matches the cached bead field-for-field, short-circuits
+	// here, and leaves a stale gc.routed_to that the loop can never self-heal.
+	// Gating here makes the route-clearing keys part of what the comparison
+	// sees, so such a write is no longer mistaken for a no-op.
+	opts = disarmRouteOnNonRunnableTransition(opts)
+
 	// Idempotence: if every non-nil field in opts already matches the
 	// cached bead AND the cache is primed, the backing call is a no-op.
 	// Skipping it avoids the bd subprocess invocation, the on_update

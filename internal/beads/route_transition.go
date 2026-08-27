@@ -37,8 +37,10 @@ var routeDisarmMetadataKeys = []string{
 //
 // Every concrete Store write path that can change status calls this at its
 // single shared inner helper (bdUpdateArgs, applyUpdateLocked, nativeUpdates,
-// applyUpdateOptsToBead, applySQLiteUpdateOpts) before applying opts, so the
-// invariant holds
+// applyUpdateOptsToBead, applySQLiteUpdateOpts) before applying opts.
+// CachingStore.Update additionally calls this at its own entry point, ahead of
+// its idempotence short-circuit, so a no-op-looking write cannot skip the gate
+// (gc-175t). Together the invariant holds
 // regardless of backend and regardless of whether the caller used Update or
 // the UpdateIfMatch (CAS) path -- both route through the same inner helper
 // per backend.
