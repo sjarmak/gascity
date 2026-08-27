@@ -182,3 +182,36 @@ func TestAssignedWorkDeferTracker_IndependentSessionsDoNotShareState(t *testing.
 		t.Fatalf("worker-1 second defer did not exceed its own limit 1 (state bled from worker-2?)")
 	}
 }
+
+// TestAssignedWorkDeferTracker_EmptyAnchorNeverExhausts proves the backstop
+// holds its streak when the session reports no anchor bead. The backstop's
+// premise is "wedged re-deferring on the SAME bead"; an empty
+// currently_processing_bead_id is the absence of that evidence, not evidence
+// of a stable anchor. Counting it would force-stop a session on nothing more
+// than repeated unknowns (gc-tiav2).
+func TestAssignedWorkDeferTracker_EmptyAnchorNeverExhausts(t *testing.T) {
+	tr := newAssignedWorkDeferTracker()
+	tr.setLimit("s", 1)
+	for i := 0; i < 5; i++ {
+		if tr.recordDefer("s", "", "") {
+			t.Fatalf("defer %d with an empty anchor reported exhausted; empty anchor is absent evidence, not a stable anchor", i+1)
+		}
+	}
+}
+
+// TestAssignedWorkDeferTracker_EmptyAnchorDoesNotAdvanceRealStreak proves the
+// held empty-anchor defers above do not silently accumulate: once a real
+// anchor appears, the streak starts from that anchor's own first defer.
+func TestAssignedWorkDeferTracker_EmptyAnchorDoesNotAdvanceRealStreak(t *testing.T) {
+	tr := newAssignedWorkDeferTracker()
+	tr.setLimit("s", 1)
+	for i := 0; i < 3; i++ {
+		tr.recordDefer("s", "", "")
+	}
+	if tr.recordDefer("s", "", "ga-anchor") {
+		t.Fatal("first defer on a real anchor reported exhausted; the empty-anchor defers leaked into its count")
+	}
+	if !tr.recordDefer("s", "", "ga-anchor") {
+		t.Fatal("second defer on the same real anchor did not exceed limit 1; the backstop is not live")
+	}
+}

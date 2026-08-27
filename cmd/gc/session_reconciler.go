@@ -3322,6 +3322,10 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				facts.Blocker = lifecycleTimerBlockerInfo(infoByID[id], clk.Now())
 			}
 			dec := sessionpkg.DecideIdleTimeout(facts)
+			// Whether the AssignedWorkHas below came from a real positive
+			// reading or from the fail-closed error branch. The defer backstop
+			// must not count a defer it has no evidence for (gc-tiav2).
+			assignedWorkProbeErrored := false
 			for dec.Action == sessionpkg.TimerActionGatherPending ||
 				dec.Action == sessionpkg.TimerActionGatherAssignedWork ||
 				dec.Action == sessionpkg.TimerActionGatherMinFloor {
@@ -3339,6 +3343,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						// hold in-flight work. Mirrors the max-age gather above.
 						fmt.Fprintf(stderr, "session reconciler: checking assigned work for idle-timeout %s: %v\n", name, assignedErr) //nolint:errcheck // best-effort stderr
 						hasWork = true
+						assignedWorkProbeErrored = true
 					}
 					facts.AssignedWork = sessionpkg.AssignedWorkNone
 					if hasWork {
@@ -3369,7 +3374,15 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			// outcome (blocker/pending defer, ordinary idle stop, or no
 			// trigger) resets the streak so it never bleeds into an unrelated
 			// later defer run.
-			if assignedWorkDeferTr != nil {
+			//
+			// A defer produced by the fail-closed probe-error branch is held
+			// rather than counted: it reports "has work" precisely BECAUSE the
+			// store could not be read, so it is absent evidence, not a wedge.
+			// Counting it turns a run of store blips into a forced stop of the
+			// healthy session the fail-closed branch exists to protect
+			// (gc-tiav2). Holding advances nothing and clears nothing, so a
+			// real streak established before the blip survives it.
+			if assignedWorkDeferTr != nil && !assignedWorkProbeErrored {
 				if dec.Action == sessionpkg.TimerActionDefer && dec.TraceReason == string(TraceReasonAssignedWork) {
 					anchorBeadID := strings.TrimSpace(infoByID[id].CurrentlyProcessingBeadID)
 					if assignedWorkDeferTr.recordDefer(name, tp.TemplateName, anchorBeadID) {

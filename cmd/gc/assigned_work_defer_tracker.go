@@ -39,6 +39,11 @@ type assignedWorkDeferTracker interface {
 	// session's previously recorded anchor — including first sight — the
 	// count resets to zero before this defer is counted, so a fresh anchor
 	// bead always starts at one.
+	//
+	// An EMPTY anchorBeadID is absent evidence rather than a stable
+	// anchor: it is held, advancing nothing and clearing nothing, and
+	// always reports false. Counting unknowns would force-stop a session
+	// on repeated absence of a reading (gc-tiav2).
 	recordDefer(sessionName, template, anchorBeadID string) (exhausted bool)
 
 	// reset clears sessionName's consecutive-defer count and remembered
@@ -140,6 +145,14 @@ func (m *memoryAssignedWorkDeferTracker) limitFor(sessionName, template string) 
 }
 
 func (m *memoryAssignedWorkDeferTracker) recordDefer(sessionName, template, anchorBeadID string) bool {
+	if anchorBeadID == "" {
+		// Absent evidence, not a stable anchor. A session reporting no
+		// currently_processing_bead_id gives no basis for "wedged
+		// re-deferring on the SAME bead", so this defer neither advances
+		// the streak nor clears it: the count keeps whatever a real
+		// anchor established and waits for the next observation.
+		return false
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	st := m.state[sessionName]

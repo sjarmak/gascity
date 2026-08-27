@@ -10349,11 +10349,13 @@ func TestReconcileSessionBeads_MaxAgeBusyDeferFallsThroughToIdleTimeout(t *testi
 // (RecordDecision only appends when detailSource finds template as a key in
 // tracer.detail, and ensureAutoArm needs an armStore this literal has none
 // of) — mirrors the literal already proven in
-// TestReconcileSessionBeads_MaxAgeBusyDeferFallsThroughToIdleTimeout.
-func idleTimeoutBackstopTrace(templateName string) *sessionReconcilerTraceCycle {
+// TestReconcileSessionBeads_MaxAgeBusyDeferFallsThroughToIdleTimeout. Every
+// test in this group drives the single "witness" template, so the template
+// name is fixed here rather than threaded through each caller.
+func idleTimeoutBackstopTrace() *sessionReconcilerTraceCycle {
 	return &sessionReconcilerTraceCycle{
 		tracer: &SessionReconcilerTracer{
-			detail: map[string]TraceSource{templateName: TraceSourceManual},
+			detail: map[string]TraceSource{"witness": TraceSourceManual},
 		},
 		dropReasons:       map[string]int{},
 		pendingDetail:     map[string][]SessionReconcilerTraceRecord{},
@@ -10434,7 +10436,7 @@ func TestReconcileSessionBeads_AssignedWorkDeferBackstopForcesStopAfterLimit(t *
 
 	runTick := func() (*sessionReconcilerTraceCycle, *events.Fake) {
 		rec := events.NewFake()
-		trace := idleTimeoutBackstopTrace("witness")
+		trace := idleTimeoutBackstopTrace()
 		reconcileSessionBeadsTraced(
 			context.Background(), "", []beads.Bead{session}, env.desiredState, cfgNames, env.cfg, env.sp,
 			env.store, nil, nil, nil, nil, env.dt, poolDesired, false, nil, "",
@@ -10515,7 +10517,7 @@ func TestReconcileSessionBeads_AssignedWorkDeferBackstopResetsOnAnchorChange(t *
 			"currently_processing_bead_id": anchorBeadID,
 		})
 		rec := events.NewFake()
-		trace := idleTimeoutBackstopTrace("witness")
+		trace := idleTimeoutBackstopTrace()
 		reconcileSessionBeadsTraced(
 			context.Background(), "", []beads.Bead{session}, env.desiredState, cfgNames, env.cfg, env.sp,
 			env.store, nil, nil, nil, nil, env.dt, poolDesired, false, nil, "",
@@ -10581,7 +10583,7 @@ func TestReconcileSessionBeads_AssignedWorkDeferBackstopResetsOnOtherOutcome(t *
 
 	runTick := func() *events.Fake {
 		rec := events.NewFake()
-		trace := idleTimeoutBackstopTrace("witness")
+		trace := idleTimeoutBackstopTrace()
 		reconcileSessionBeadsTraced(
 			context.Background(), "", []beads.Bead{session}, env.desiredState, cfgNames, env.cfg, env.sp,
 			env.store, nil, nil, nil, nil, env.dt, poolDesired, false, nil, "",
@@ -12135,3 +12137,75 @@ func TestReconcileSessionBeads_ClosesOrphanedFailedCreateAndFreesSlot(t *testing
 // Regression: poolDesired derived from desiredState counts ALL session beads
 // (including discovered ones), inflating the desired count. This test verifies
 // that derivePoolDesired only counts pool sessions, not all discovered beads.
+
+// assigneeListErrStore fails the assigned-work probe for exactly one assignee
+// and passes every other read through, so a test can simulate a store blip
+// scoped to the idle-timeout assigned-work gather without disturbing the rest
+// of the reconcile pass.
+type assigneeListErrStore struct {
+	beads.Store
+	assignee string
+	err      error
+}
+
+func (s assigneeListErrStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+	if q.Assignee == s.assignee {
+		return nil, s.err
+	}
+	return s.Store.List(q)
+}
+
+// TestReconcileSessionBeads_AssignedWorkDeferBackstopHoldsOnProbeError proves
+// the defer backstop does not count defers it has no evidence for. The
+// idle-timeout assigned-work gather fails CLOSED: when the store probe errors
+// it reports AssignedWorkHas so a transient blip cannot idle-kill a session
+// that may still hold in-flight work. That deferral says nothing about whether
+// the session is wedged, so feeding it to the streak counter turns a run of
+// store errors into a forced stop of a healthy session — the exact outcome the
+// fail-closed branch exists to prevent (gc-tiav2).
+func TestReconcileSessionBeads_AssignedWorkDeferBackstopHoldsOnProbeError(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "witness"}}}
+	env.addDesired("witness", "witness", true)
+	session := env.createSessionBead("witness", "witness")
+	env.markSessionActive(&session)
+	env.setSessionMetadata(&session, map[string]string{
+		"currently_processing_bead_id": "ga-anchor1",
+	})
+	if err := env.sp.SetMeta("witness", "GC_SESSION_ID", session.ID); err != nil {
+		t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+	}
+
+	probeStore := assigneeListErrStore{
+		Store:    env.store,
+		assignee: session.ID,
+		err:      errors.New("store blip"),
+	}
+
+	tr := newAssignedWorkDeferTracker()
+	tr.setLimit("witness", 1)
+	it := newFakeIdleTracker()
+	it.idle["witness"] = true
+
+	poolDesired := make(map[string]int)
+	for _, tp := range env.desiredState {
+		if tp.TemplateName != "" {
+			poolDesired[tp.TemplateName]++
+		}
+	}
+	cfgNames := configuredSessionNames(env.cfg, "", env.store)
+
+	for i := 0; i < 4; i++ {
+		rec := events.NewFake()
+		trace := idleTimeoutBackstopTrace()
+		reconcileSessionBeadsTraced(
+			context.Background(), "", []beads.Bead{session}, env.desiredState, cfgNames, env.cfg, env.sp,
+			probeStore, nil, nil, nil, nil, env.dt, poolDesired, false, nil, "",
+			it, env.clk, rec, 0, 0, &env.stdout, &env.stderr, trace,
+			withAssignedWorkDeferTracker(tr),
+		)
+		if idleTimeoutBackstopKilled(rec) {
+			t.Fatalf("tick %d: session force-stopped after an ERRORED assigned-work probe; an unreadable store is absent evidence, not a wedge", i+1)
+		}
+	}
+}
