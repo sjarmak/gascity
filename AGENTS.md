@@ -77,6 +77,30 @@ Useful search targets:
 If history contains working code, prefer porting the smallest proven slice
 instead of inventing a parallel mechanism.
 
+**A CLOSED bead is not proof the fix landed.** This fork routinely closes work
+"branch-ready, not pushed", naming a branch in the close reason. Those branches
+get reaped, and the bead still reads CLOSED while the bug runs live on main.
+Before trusting any bead that cites a fix, verify the branch still exists:
+
+```bash
+git branch -a --list '*<slug>*'
+git cat-file -t <sha>   # loose objects often survive a deleted branch
+```
+
+A missing branch with surviving commit objects is a salvage, not a re-author:
+cherry-pick onto current `origin/main` and resolve conflicts by keeping main's
+structure and porting the semantics into it. Beware that `git cherry-pick
+--abort` rolls back commits already completed earlier in the same multi-commit
+pick; recover with `git reset --hard <sha>` on the still-reachable object, or
+apply the remaining commits one at a time.
+
+The same caution applies to any bead whose description was written against an
+unlanded fix: it describes code that is not in the tree. Confirm against
+`origin/main` by SHA before acting on such a premise. (Precedent: gc-j4sr, a P0
+closed 2026-07-17 on a deleted branch, ran live for six weeks and left 506 of 636
+`gc.work_branch` values naming the shared rig checkout; two downstream beads had
+premises written against its unlanded code.)
+
 ## Development approach
 
 **TDD.** Write the test first, watch it fail, make it pass. Every package
