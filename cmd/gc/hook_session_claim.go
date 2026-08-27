@@ -2,6 +2,7 @@ package main
 
 import (
 	"io"
+	"strings"
 
 	"github.com/gastownhall/gascity/internal/session"
 )
@@ -51,4 +52,40 @@ func hookStampSessionCurrentClaim(sessionID, beadID string) error {
 	}
 	_, err = sessFront.SetCurrentClaim(sessionID, beadID)
 	return err
+}
+
+// hookResolveSessionWorkDir returns the checkout the session identified by
+// sessionID is running in, or "" when that is not knowable. It is the
+// production implementation of the hookClaimOps.ResolveSessionWorkDir seam.
+//
+// A bead routed to a POOL records no checkout of its own: cliBeadRouter.Route
+// normalizes a pool target through agentutil.NormalizePoolRouteTarget, so
+// gc.routed_to names a pool identity and no slot exists to name a worktree until
+// a claim happens (gc-2n4c). Stamping a work_dir at route time would therefore
+// bind a pool-label path to the bead, which is the gc-j0cfh defect. The claiming
+// session is the first actor that knows the concrete tree, and its own bead is
+// the only place that records it: GC_WORK_DIR is not in a pool session's env.
+//
+// The id is resolved EXACTLY, for the same reason SetCurrentClaim does: bd's
+// fuzzy resolver would otherwise let a prefix collision hand back a different
+// session's checkout, and this value is stamped onto the work bead as durable
+// execution identity. Every failure yields "" — an unset gc.work_dir is the
+// honest outcome, and the caller stamps nothing rather than guessing a path.
+func hookResolveSessionWorkDir(sessionID string) string {
+	if strings.TrimSpace(sessionID) == "" {
+		return ""
+	}
+	sessFront, err := sessionCurrentClaimFrontDoor()
+	if err != nil {
+		return ""
+	}
+	resolved, err := sessFront.ResolveIDByExactID(strings.TrimSpace(sessionID))
+	if err != nil {
+		return ""
+	}
+	info, err := sessFront.Get(resolved)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(info.WorkDir)
 }
