@@ -273,6 +273,11 @@ func (cr *CityRuntime) logRouteRecovery(report routeRecoveryReport) {
 		// spawns nothing for them. The remedy is a migration, not a wider tick.
 		fmt.Fprintf(cr.stderr, "%s: route recovery (%s): %d open routed bead(s) sit on a work leg the runtime plane does not read, so no pool seat is spawned for them; run `gc storage migrate` to move them to the infra binding\n", cr.logPrefix, report.lane, report.offPlaneRouted) //nolint:errcheck // best-effort stderr
 	}
+	if report.unfenced > 0 {
+		// Loud: each one is a molecule instantiation that died mid-fence and
+		// left a control bead the dispatcher had been dropping every pass.
+		fmt.Fprintf(cr.stderr, "%s: route recovery (%s): cleared a stale instantiation fence on %d bead(s) whose instantiation never finished; they were invisible to control dispatch until now\n", cr.logPrefix, report.lane, report.unfenced) //nolint:errcheck // best-effort stderr
+	}
 	if report.quarantined > 0 {
 		fmt.Fprintf(cr.stderr, "%s: route recovery (%s): quarantined %d bead(s) for operator review (`gc doctor` route-recovery-quarantine)\n", cr.logPrefix, report.lane, report.quarantined) //nolint:errcheck // best-effort stderr
 	}

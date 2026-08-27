@@ -82,6 +82,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/storeref"
 )
 
@@ -110,6 +111,14 @@ const (
 	// one failure is the ordinary race the re-check exists to catch: a claim
 	// landing between the scan and the write.
 	routeRecoveryQuarantinePasses = 2
+
+	// routeRecoveryUnfencePasses is how many CONSECUTIVE backstop passes must
+	// see the SAME bead still carrying gc.instantiating before this lane clears
+	// the fence. Two, for the same reason quarantine waits: one sighting is
+	// indistinguishable from a workflow that is legitimately mid-instantiation
+	// while the pass runs, and unfencing that one would publish a half-wired
+	// graph. Two passes an hour apart is not a race with anything.
+	routeRecoveryUnfencePasses = 2
 
 	// routeRecoveryFlapLimit bounds how many times this lane will restore the
 	// SAME bead's route. A route that has to be restored again and again is not
@@ -161,6 +170,10 @@ type routeRecoveryReport struct {
 	// legReads counts store round trips this pass issued. It is the unit the
 	// tick's latency is actually measured in, and the budget test asserts on it.
 	legReads int
+	// unfenced counts beads this pass found stranded mid-instantiation and
+	// activated. A non-zero count means a molecule instantiation died between
+	// its fence write and its activation write; see unfenceStaleInstantiating.
+	unfenced int
 	// legs counts the plan legs this pass was allowed to read. A pass reporting
 	// zero legs converged nothing, which must not read as "nothing to converge".
 	legs int
@@ -266,6 +279,10 @@ type routeRecoveryLane struct {
 	consecutiveRecheckFailures map[string]int
 	restores                   map[string]int
 
+	// consecutiveFenceSightings counts backstop passes that found a bead still
+	// fenced mid-instantiation. See routeRecoveryUnfencePasses.
+	consecutiveFenceSightings map[string]int
+
 	interval time.Duration
 	retry    time.Duration
 	poll     time.Duration
@@ -276,6 +293,7 @@ func newRouteRecoveryLane() *routeRecoveryLane {
 		pending:                    map[string]struct{}{},
 		consecutiveRecheckFailures: map[string]int{},
 		restores:                   map[string]int{},
+		consecutiveFenceSightings:  map[string]int{},
 		interval:                   routeRecoveryBackstopInterval,
 		retry:                      routeRecoveryBackstopRetryInterval,
 		poll:                       backstopPollInterval,
@@ -658,6 +676,7 @@ func (l *routeRecoveryLane) backstopPassOnPlane(plan storeref.ResolvedPlan, reas
 		report.candidates += legReport.candidates
 		report.restored += legReport.restored
 		report.quarantined += legReport.quarantined
+		report.unfenced += legReport.unfenced
 		report.legReads += legReport.legReads
 		report.offPlaneRouted += legReport.offPlaneRouted
 		report.flapping = append(report.flapping, legReport.flapping...)
@@ -705,7 +724,11 @@ func (l *routeRecoveryLane) backstopLeg(leg planeLeg) routeRecoveryReport {
 		return report
 	}
 	var ids []string
+	var fenced []string
 	for _, b := range items {
+		if strings.TrimSpace(b.Metadata[beadmeta.InstantiatingMetadataKey]) != "" {
+			fenced = append(fenced, b.ID)
+		}
 		if !leg.binding && b.Status == "open" && strings.TrimSpace(b.Assignee) == "" &&
 			strings.TrimSpace(b.Metadata[beadmeta.RoutedToMetadataKey]) != "" {
 			// Already routed, on a leg the tick's demand read refuses: nothing
@@ -720,20 +743,24 @@ func (l *routeRecoveryLane) backstopLeg(leg planeLeg) routeRecoveryReport {
 		}
 		ids = append(ids, b.ID)
 	}
+	unfenced, unfenceReads, unfenceErr := l.unfenceStaleInstantiating(store, fenced)
+	report.unfenced = unfenced
+	report.legReads += unfenceReads
 	report.candidates = len(ids)
 	if len(ids) == 0 {
+		report.err = unfenceErr
 		return report
 	}
 	rows, reads, err := liveOpenCandidates(store, ids)
 	report.legReads += reads
 	if err != nil {
-		report.err = fmt.Errorf("re-reading %d route candidate(s): %w", len(ids), err)
+		report.err = errors.Join(unfenceErr, fmt.Errorf("re-reading %d route candidate(s): %w", len(ids), err))
 		return report
 	}
 	// The re-verify answers for the ids it returned; the ones it dropped are the
 	// candidates whose live row no longer agrees with the scan, and a
 	// disagreement that survives two passes is what quarantine surfaces.
-	var errs []error
+	errs := []error{unfenceErr}
 	returned := make(map[string]struct{}, len(rows))
 	for _, row := range rows {
 		returned[row.ID] = struct{}{}
@@ -904,6 +931,83 @@ func (l *routeRecoveryLane) noteRecheckFailure(store beads.Store, id string) (bo
 		return false, nil
 	}
 	return l.quarantine(store, beads.Bead{ID: id}, routeRecoveryQuarantineRecheckFailed)
+}
+
+// unfenceStaleInstantiating clears instantiation fences that no live process is
+// going to clear itself.
+//
+// molecule fences a graph workflow's steps by setting gc.instantiating and
+// moving the assignee, type and routing aside into their gc.deferred_*
+// companions, then clears the fence in a second pass once the whole graph is
+// wired. Those are separate store writes. Every ORDINARY failure between them
+// already clears the fence (markFailed / markFailedReporting), but a hard crash
+// or a kill does not, and a fenced bead is dropped by the control dispatcher's
+// readiness scan on every pass forever: it is not blocked, not held, and not
+// closed, so nothing else reports it either.
+//
+// The repair is the activation the dead process owed, replayed verbatim through
+// molecule.ActivateFencedGraphWorkflowBead rather than reconstructed here, so
+// there is exactly one definition of what "activated" means. Beads whose fence
+// clears on their own drop out of the streak, which is what keeps this from
+// racing a live instantiation.
+//
+// It returns the repairs made and the store round trips it spent.
+func (l *routeRecoveryLane) unfenceStaleInstantiating(store beads.Store, fenced []string) (int, int, error) {
+	if store == nil {
+		return 0, 0, nil
+	}
+	still := make(map[string]struct{}, len(fenced))
+	for _, id := range fenced {
+		still[id] = struct{}{}
+	}
+	var due []string
+	l.mu.Lock()
+	for id := range l.consecutiveFenceSightings {
+		if _, ok := still[id]; !ok {
+			delete(l.consecutiveFenceSightings, id)
+		}
+	}
+	for _, id := range fenced {
+		l.consecutiveFenceSightings[id]++
+		if l.consecutiveFenceSightings[id] >= routeRecoveryUnfencePasses {
+			due = append(due, id)
+		}
+	}
+	l.mu.Unlock()
+	if len(due) == 0 {
+		return 0, 0, nil
+	}
+	sort.Strings(due)
+	live := beads.HandlesFor(store).Live
+	var errs []error
+	unfenced, reads := 0, 0
+	for _, id := range due {
+		b, err := live.Get(id)
+		reads++
+		if err != nil {
+			errs = append(errs, fmt.Errorf("bead %s: re-reading stale instantiation fence: %w", id, err))
+			continue
+		}
+		// The live row is the authority: a fence the owning process cleared
+		// between the scan and here yields a zero update and no write.
+		update := molecule.DeferredRoutingActivationUpdate(b)
+		if update.Assignee == nil && update.Type == nil && len(update.Metadata) == 0 {
+			l.mu.Lock()
+			delete(l.consecutiveFenceSightings, id)
+			l.mu.Unlock()
+			continue
+		}
+		if err := store.Update(id, update); err != nil {
+			errs = append(errs, fmt.Errorf("bead %s: clearing stale instantiation fence: %w", id, err))
+			continue
+		}
+		reads++
+		unfenced++
+		l.mu.Lock()
+		delete(l.consecutiveFenceSightings, id)
+		l.mu.Unlock()
+	}
+	return unfenced, reads, errors.Join(errs...)
 }
 
 // quarantine marks a bead for the doctor advisory. Quarantine is a LABEL, never

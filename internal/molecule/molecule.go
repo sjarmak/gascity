@@ -1043,7 +1043,7 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 			if beadID == "" {
 				continue
 			}
-			if err := activateFencedGraphWorkflowBead(store, beadID); err != nil {
+			if _, err := ActivateFencedGraphWorkflowBead(store, beadID); err != nil {
 				markFailed(store, createdIDs)
 				return nil, fmt.Errorf("activating graph step %q: %w", step.ID, err)
 			}
@@ -1411,19 +1411,39 @@ func fenceGraphWorkflowBead(b *beads.Bead) {
 	deferBeadRouting(b)
 }
 
-func activateFencedGraphWorkflowBead(store beads.Store, id string) error {
+// ActivateFencedGraphWorkflowBead clears the instantiation fence on one bead,
+// restoring the assignee, type and routing that fenceGraphWorkflowBead moved
+// aside. It reports whether the bead needed activating, so a caller sweeping for
+// fences left behind by a crashed instantiation can count only real repairs.
+//
+// It is exported for the route-recovery backstop (gc-og1z): the fence and the
+// activation are separate store writes, so a process killed between them leaves
+// a permanently fenced bead that the control dispatcher's readiness scan drops
+// forever. Nothing else re-runs this, so the convergence lane must.
+func ActivateFencedGraphWorkflowBead(store beads.Store, id string) (bool, error) {
 	b, err := store.Get(id)
 	if err != nil {
-		return err
+		return false, err
 	}
-	update := deferredRoutingActivationUpdate(b)
+	update := DeferredRoutingActivationUpdate(b)
 	if update.Assignee == nil && update.Type == nil && len(update.Metadata) == 0 {
-		return nil
+		return false, nil
 	}
-	return store.Update(id, update)
+	if err := store.Update(id, update); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-func deferredRoutingActivationUpdate(b beads.Bead) beads.UpdateOpts {
+// DeferredRoutingActivationUpdate builds the update that lifts one bead's
+// instantiation fence: assignee, type and routing restored from their
+// gc.deferred_* companions, and gc.instantiating cleared. A bead that carries no
+// fence yields a zero update, which makes the activation idempotent.
+//
+// Exported alongside ActivateFencedGraphWorkflowBead so a caller that must read
+// the bead through its own handle (the route-recovery backstop reads live) still
+// gets exactly this definition of "activated" rather than a second copy of it.
+func DeferredRoutingActivationUpdate(b beads.Bead) beads.UpdateOpts {
 	update := beads.UpdateOpts{}
 	metadata := map[string]string{}
 	if assignee := b.Metadata[DeferredAssigneeMetadataKey]; assignee != "" {
@@ -1637,7 +1657,7 @@ func activateAttachCandidate(store beads.Store, rootID string, idMapping map[str
 	}
 	sort.Strings(ids)
 	for _, id := range ids {
-		if err := activateFencedGraphWorkflowBead(store, id); err != nil {
+		if _, err := ActivateFencedGraphWorkflowBead(store, id); err != nil {
 			return fmt.Errorf("activating %s: %w", id, err)
 		}
 	}

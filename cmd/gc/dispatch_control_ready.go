@@ -250,6 +250,11 @@ func mergeControlReadyGroups(groups ...[]beads.Bead) []beads.Bead {
 				continue
 			}
 			if strings.TrimSpace(b.Metadata[beadmeta.InstantiatingMetadataKey]) != "" {
+				// A fence is invisible to this dispatcher until something clears
+				// it, and a fence left by a crashed instantiation is never
+				// cleared by its owner (gc-og1z). Silence here is what made that
+				// unobservable; the route-recovery backstop is what repairs it.
+				workflowTracef("control-ready: dropping %s: still instantiating (gc.instantiating set)", b.ID)
 				continue
 			}
 			seen[b.ID] = struct{}{}
