@@ -783,6 +783,31 @@ bd mol current --json        # no live molecule => every step below is inert
   rig, 12 were dead formula steps from two abandoned `mol-pr-ship` runs, stale 8
   to 23 days, with no live molecule driving them. The real unrouted P0
   engineering count was 11, not 31.)
+
+  **And not every step bead is closable: a convoy record outlives its run.** The
+  paragraph above sorts steps by whether the RUN is abandoned, which is the right
+  question for a `Stage N` bead and the wrong one for an `input convoy for <id>`.
+  A convoy record points at the bead it tracks, and that bead can be live work
+  while the molecule around it is long dead. Closing it strips structure the work
+  needs when it resumes, and the counting pass gives you no hint, because it is
+  stale and P0 exactly like the steps beside it. So resolve each convoy by its
+  TRACKED root, not by the run:
+
+```bash
+bd dep tree <convoy-id> | head -5        # names the tracked root
+bd show <root-id> --json | python3 -c 'import sys,json; d=json.load(sys.stdin); \
+d=d[0] if isinstance(d,list) else d; print(d.get("status"), d.get("priority"))'
+```
+
+  Root closed or abandoned => close the convoy with the steps. Root open or
+  blocked => do NOT close it; demote it out of the band instead (`bd update <id>
+  --priority 2`) and record why on the bead. Demotion fixes the actual harm, which
+  is claim-order pollution, and is reversible when the root is picked up.
+  (Precedent 2026-08-28, gc-zqtk2: 15 beads matched the counting pass, not 12. Of
+  those, 11 were closable steps across two dead runs; the other 4 were input
+  convoys tracking `gc-iipgc` (blocked), `gc-4wnvo` and `gc-dzhyp` (both open and
+  live). Closing all 15 leaf-first, which the rule as previously written reads as
+  authorising, would have stripped convoy structure from three live P0s.)
 - When a bead needs to pause on a specific actor or condition, only `hold:mayor` and `hold:external` are canonical (set via `bd set-state <id> hold=mayor|external --reason "..."`) — never invent a new ad hoc hold/blocked label. See `engdocs/contributors/hold-label-conventions.md`.
 
 ## Session Completion
