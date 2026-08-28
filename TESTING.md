@@ -199,6 +199,54 @@ not simulate implementation internals. Add recording only when call order or
 arguments are themselves the contract; a stateful fake is not automatically a
 spy.
 
+## A failing double must fail at the call the test names
+
+A double that fails unconditionally does not pin the failure it was written to
+pin. It pins the FIRST call that reaches it, and which call that is belongs to
+the production code, not to the test. Add one read to the path under test and
+the same fixture now aborts somewhere earlier, with a different error, and the
+assertion starts passing or failing for a reason nobody wrote down.
+
+The tell is a fixture whose comment names a specific boundary while its code
+names none:
+
+```go
+func (s depListFailingStore) DepList(_, _ string) ([]beads.Dep, error) {
+	return nil, fmt.Errorf("cross-store membership read failed")
+}
+```
+
+The comment above the fixture said tracking succeeds and the LATER read fails.
+The code says every read fails. Those agreed only for as long as the production
+path happened to make exactly one read before the boundary.
+
+Scope the failure to the boundary the test names. Fail on the call after the
+setup the test depends on, and say in the fixture why:
+
+```go
+// DepList fails from the second read onward. NormalizeInputConvoy itself now
+// reads dependencies (it repairs a convoy minted but never tracked), so failing
+// every read would abort before the convoy exists and this test would pass for
+// the wrong reason.
+func (s depListFailingStore) DepList(id, depType string) ([]beads.Dep, error) {
+	*s.reads++
+	if *s.reads == 1 {
+		return s.Store.DepList(id, depType)
+	}
+	return nil, fmt.Errorf("cross-store membership read failed")
+}
+```
+
+This is a rebase and merge hazard, not only an authoring one, and it belongs
+with the two-individually-correct-PRs class in `AGENTS.md`. A branch that adds a
+read to a path, and a main-side test whose double fails that read
+unconditionally, are each correct alone; the misdirected failure exists only in
+the result. Nothing in a per-branch gate sees it, because the test still
+compiles and still fails-then-passes. When a rebase makes a fixture-backed test
+fail, read the error's call site before adjusting the assertion: an error text
+that names a different function than the test does is the signal.
+(Precedent: gc-28jm, 2026-08-27.)
+
 ## Keep the critical end-to-end portfolio deliberately small
 
 An end-to-end test is admitted only when all of these are true:
