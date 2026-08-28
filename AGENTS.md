@@ -118,6 +118,27 @@ closed 2026-07-17 on a deleted branch, ran live for six weeks and left 506 of 63
 `gc.work_branch` values naming the shared rig checkout; two downstream beads had
 premises written against its unlanded code.)
 
+**Two individually-correct PRs can merge into a tree that does not compile.**
+Neither author is wrong and neither branch is red, so nothing in the per-PR
+gates catches it: one PR changes a function signature, a second PR written
+against the older base adds a caller, and the defect exists only in the merge
+result. Test files are where this lands hardest, because a broken test binary
+does not fail a build gate that only compiles non-test code, and every test in
+that package silently stops running while the gate still reports a pass. Before
+trusting any green check over a package, confirm its test binary actually
+builds at the merge commit:
+
+```bash
+go vet ./cmd/gc/            # compiles the test files too
+```
+
+(Precedent 2026-08-27, gc-xwerd: `filterAssignedWorkBeadsForPoolDemand` grew a
+`[]session.Info` parameter in `f6b3704fe` (#5660); tip commit `bbcc7bcf4`
+(#5094) added two calls against the pre-#5660 signature. `origin/main` could
+not build its `cmd/gc` test binary, so every test in the repo's largest package
+was unrunnable. The required CI gate does not appear to vet or build the
+`cmd/gc` test binary on the merge result.)
+
 **An OPEN bead is not proof the bug is live.** The mirror of the false close, and
 it costs the same wasted authoring pass. A bead names a mechanism at file:line,
 those line numbers no longer resolve, and the fix turns out to have landed under
@@ -138,6 +159,25 @@ before quoting it. (Precedent 2026-08-27: gc-j0cfh (P1) proposed guarding
 subject "close terminal workflow residue (#5026)", and the bead's "77 open"
 exposure had fallen to 18. The real remaining defect was a NEW mint path added
 minutes earlier in the same session's own claim-time commit.)
+
+**A negative symbol grep is itself a claim: guard it before reporting it.** The
+checks above turn on a symbol being ABSENT from `origin/main`, and a too-narrow
+grep manufactures that absence. Both narrowing devices are traps: a `func <name>`
+prefix misses the symbol when it is a method, a var, a struct field, or wrapped
+across lines, and a `-- <path>` pathspec misses it when the code lives in a
+sibling file you did not predict. Before reporting ABSENT, re-run the grep with
+the bare symbol and NO pathspec:
+
+```bash
+git grep -n '<symbol>' origin/main            # no `func `, no pathspec
+```
+
+Only an absence that survives the unnarrowed form is a finding. (Precedent
+2026-08-28: `git grep -n 'func updateMatchesCached' origin/main --
+internal/beads/` reported ABSENT while the symbol had 3 hits on `origin/main` in
+`internal/beads/caching_store_writes.go`. Had that reached a bead, it would have
+justified re-authoring a guard that already exists, which is the exact cost this
+whole section prevents.)
 
 ## Development approach
 
@@ -627,6 +667,17 @@ bd close <id>         # Complete work
 - Run `bd prime` for detailed command reference and session close protocol
 - Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
 - For controller or session reconciler incidents, use `gc trace` and follow `engdocs/contributors/reconciler-debugging.md` for the artifact collection workflow.
+- **Counting beads by routing target: metadata is FLAT, and targets have two
+  spellings.** `bd list --json` returns `metadata` as flat dotted keys
+  (`"gc.routed_to"`), not a nested `gc` object, so
+  `b["metadata"]["gc"]["routed_to"]` silently yields nothing and the count comes
+  back 0 or is quietly wrong. The same seat is also written both ways: as an
+  absolute path (`/home/ds/gascity/polecat`) and short
+  (`gascity/polecat`). And `gc.routed_to` is a different field from
+  `gc.execution_routed_to`. Sum every spelling of the field you mean, and state
+  which field you counted. (2026-08-27: a routed-backlog figure was reported as
+  61 when the real number was 299, because one spelling of one field was
+  counted.)
 - When a bead needs to pause on a specific actor or condition, only `hold:mayor` and `hold:external` are canonical (set via `bd set-state <id> hold=mayor|external --reason "..."`) — never invent a new ad hoc hold/blocked label. See `engdocs/contributors/hold-label-conventions.md`.
 
 ## Session Completion
