@@ -88,7 +88,7 @@ gc [flags]
 | [gc version](#gc-version) | Print gc version |
 | [gc wait](#gc-wait) | Inspect and manage durable session waits |
 | [gc whoami](#gc-whoami) | Show the authenticated hosted Gas City account |
-| [gc worktree](#gc-worktree) | Ensure or verify agent workspace worktrees |
+| [gc worktree](#gc-worktree) | Ensure, verify, or clean up agent workspace worktrees |
 
 ## gc agent
 
@@ -5056,8 +5056,43 @@ gc worktree
 
 | Subcommand | Description |
 |------------|-------------|
+| [gc worktree cleanup](#gc-worktree-cleanup) | Remove the worktree, refusing when it holds work that would be lost |
 | [gc worktree ensure](#gc-worktree-ensure) | Ensure the worktree exists and satisfies all postconditions |
 | [gc worktree verify](#gc-worktree-verify) | Verify the worktree satisfies all postconditions without mutating |
+
+## gc worktree cleanup
+
+Remove the worktree at --path after proving it is the named worktree.
+
+Cleanup refuses rather than destroying state: uncommitted changes, stashes,
+or commits no remote reaches each decline the removal and name the gate that
+refused, so the caller records an actionable retention. There is no force
+mode and no dry-run; a refusal is resolved by the workspace owner deciding
+the held work no longer matters, not by a stronger flag.
+
+A path that is already gone is a success, reported as already_absent so the
+caller does not record a removal this run did not perform.
+
+```
+gc worktree cleanup [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--base` | string |  | base ref the workspace branch was created from (recorded, not acted on) |
+| `--base-sha` | string |  | commit the workspace branch was created from |
+| `--bead` | string |  | work item this workspace belongs to |
+| `--branch` | string |  | branch that must be checked out (required) |
+| `--creator` | string |  | actor that provisioned the workspace |
+| `--generation` | string |  | provisioning generation for this work item |
+| `--json` | bool |  | emit the report as JSON |
+| `--lifecycle` | string |  | lifecycle state the caller believes the workspace is in |
+| `--owner` | string |  | actor responsible for work held in the workspace |
+| `--path` | string |  | worktree path (required) |
+| `--repo` | string |  | repository directory the worktree belongs to (required) |
+| `--rig` | string |  | rig the workspace belongs to |
+| `--root` | string |  | directory the workspace roots live under |
+| `--store-ref` | string |  | store the work item lives in |
 
 ## gc worktree ensure
 
@@ -5070,11 +5105,20 @@ gc worktree ensure [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--base` | string |  | base ref for creating a new branch (resolved verbatim locally) |
+| `--base-sha` | string |  | commit the workspace branch was created from |
+| `--bead` | string |  | work item this workspace belongs to |
 | `--branch` | string |  | branch that must be checked out (required) |
+| `--creator` | string |  | actor that provisioned the workspace |
 | `-n`, `--dry-run` | bool |  | plan without mutating anything |
+| `--generation` | string |  | provisioning generation for this work item |
 | `--json` | bool |  | emit the report as JSON |
+| `--lifecycle` | string |  | lifecycle state the caller believes the workspace is in |
+| `--owner` | string |  | actor responsible for work held in the workspace |
 | `--path` | string |  | worktree path (required) |
 | `--repo` | string |  | repository directory the worktree belongs to (required) |
+| `--rig` | string |  | rig the workspace belongs to |
+| `--root` | string |  | directory the workspace roots live under |
+| `--store-ref` | string |  | store the work item lives in |
 
 ## gc worktree verify
 
@@ -5086,7 +5130,16 @@ gc worktree verify [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--base-sha` | string |  | commit the workspace branch was created from |
+| `--bead` | string |  | work item this workspace belongs to |
 | `--branch` | string |  | branch that must be checked out (required) |
+| `--creator` | string |  | actor that provisioned the workspace |
+| `--generation` | string |  | provisioning generation for this work item |
 | `--json` | bool |  | emit the report as JSON |
+| `--lifecycle` | string |  | lifecycle state the caller believes the workspace is in |
+| `--owner` | string |  | actor responsible for work held in the workspace |
 | `--path` | string |  | worktree path (required) |
 | `--repo` | string |  | repository directory the worktree belongs to (required) |
+| `--rig` | string |  | rig the workspace belongs to |
+| `--root` | string |  | directory the workspace roots live under |
+| `--store-ref` | string |  | store the work item lives in |

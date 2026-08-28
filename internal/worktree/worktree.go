@@ -44,6 +44,12 @@ type Spec struct {
 	Base string
 	// DryRun plans without mutating anything.
 	DryRun bool
+	// BaseSHA is the commit the caller expects Base to resolve to. When
+	// set and a new branch is created, Ensure refuses if the local Base
+	// resolves elsewhere, so a caller that resolved the ref itself is
+	// told the ref moved instead of silently branching from somewhere
+	// other than the commit it recorded.
+	BaseSHA string
 }
 
 // Report describes the observed or planned workspace state.
@@ -59,6 +65,11 @@ type Report struct {
 	BranchCreated bool `json:"branch_created"`
 	// Planned lists the actions a dry-run would have executed.
 	Planned []string `json:"planned,omitempty"`
+	// BaseSHA is the commit Base resolved to when this call created the
+	// branch. It is empty when the branch already existed, because no
+	// base was consulted and reporting one would assert provenance this
+	// call did not establish.
+	BaseSHA string `json:"base_sha,omitempty"`
 }
 
 func (s Spec) validate() error {
@@ -184,6 +195,10 @@ func Ensure(spec Spec) (Report, error) {
 		if err != nil {
 			return rep, fmt.Errorf("ensuring worktree %q: %w", spec.Path, err)
 		}
+		if spec.BaseSHA != "" && sha != spec.BaseSHA {
+			return rep, fmt.Errorf("ensuring worktree %q: base %q resolves to %s, but caller expects %s",
+				spec.Path, spec.Base, sha, spec.BaseSHA)
+		}
 		resolvedBase = sha
 	}
 
@@ -196,6 +211,7 @@ func Ensure(spec Spec) (Report, error) {
 			rep.Planned = []string{
 				fmt.Sprintf("git worktree add -b %s %s %s", spec.Branch, spec.Path, spec.Base),
 			}
+			rep.BaseSHA = resolvedBase
 		}
 		return rep, nil
 	}
@@ -224,6 +240,7 @@ func Ensure(spec Spec) (Report, error) {
 	}
 	created.Created = true
 	created.BranchCreated = !branchExists
+	created.BaseSHA = resolvedBase
 	return created, nil
 }
 

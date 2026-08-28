@@ -10,7 +10,8 @@
     "path",
     "branch",
     "created",
-    "branch_created"
+    "branch_created",
+    "provenance"
   ],
   "properties": {
     "schema_version": { "const": "1" },
@@ -22,6 +23,11 @@
     "head": { "type": "string" },
     "created": { "type": "boolean" },
     "branch_created": { "type": "boolean" },
+    "provenance": {
+      "description": "Workspace identity supplied by the caller and echoed back, so the caller can confirm what this command was told. base_sha is the commit the base ref actually resolved to when this call created the branch, and is empty when the branch already existed.",
+      "type": "object",
+      "additionalProperties": true
+    },
     "planned": {
       "type": "array",
       "items": { "type": "string" }

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "gc worktree cleanup --json result",
+  "description": "Emitted on the success outcomes only. A safety refusal is reported through the shared failure envelope with error.code naming the gate that refused, and leaves the worktree in place.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "ok",
+    "command",
+    "action",
+    "path",
+    "branch",
+    "removed",
+    "already_absent",
+    "cleanup_pending"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1"
+    },
+    "ok": {
+      "const": true
+    },
+    "command": {
+      "const": "worktree cleanup"
+    },
+    "action": {
+      "const": "cleanup"
+    },
+    "path": {
+      "type": "string"
+    },
+    "branch": {
+      "type": "string"
+    },
+    "removed": {
+      "type": "boolean"
+    },
+    "already_absent": {
+      "type": "boolean"
+    },
+    "cleanup_pending": {
+      "type": "boolean"
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
