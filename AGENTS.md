@@ -737,6 +737,31 @@ gc agent list | grep "<rig-root>/"        # which of those targets actually exis
   either. True dead-routing total ~397 across four targets. The proposed fix,
   minting one worker seat, would have left roughly a quarter of the queue
   stranded, and nothing in the original count would have revealed it.)
+- **A priority band is not a work count: formula step beads inherit the root's
+  priority.** The two rules above fix WHERE work is addressed. This one fixes WHAT
+  is in the band. A molecule materializes as a root plus child step beads, and the
+  steps carry the root's priority, so a stalled run parks its whole ladder in the
+  P0 band. The scheduler sorts priority-first, so those inert steps outrank real
+  P0 engineering work in claim order, and the band stops being readable. Before
+  quoting a P0/P1 count or picking off the top of it, separate the steps from the
+  work:
+
+```bash
+bd list --status open --json | python3 -c 'import sys,json; \
+[print(b["id"], b.get("title","")[:70]) for b in json.load(sys.stdin) \
+ if b.get("priority")==0]'
+bd mol current --json        # no live molecule => every step below is inert
+```
+
+  Step beads announce themselves in the title (`Stage N -- ...`, `input convoy
+  for <id>`, `Resolve branch and prepare report path`, a bare formula name). Check
+  their `Updated` date: a step untouched for weeks belongs to an abandoned run.
+  Do NOT bulk-close them from a counting pass. Close per root, leaf-first, through
+  the typed closer, and never force-close a root that is still live (that orphans
+  its steps). (Precedent 2026-08-28, gc-zqtk2: of 31 unrouted P0s on the gascity
+  rig, 12 were dead formula steps from two abandoned `mol-pr-ship` runs, stale 8
+  to 23 days, with no live molecule driving them. The real unrouted P0
+  engineering count was 11, not 31.)
 - When a bead needs to pause on a specific actor or condition, only `hold:mayor` and `hold:external` are canonical (set via `bd set-state <id> hold=mayor|external --reason "..."`) — never invent a new ad hoc hold/blocked label. See `engdocs/contributors/hold-label-conventions.md`.
 
 ## Session Completion
