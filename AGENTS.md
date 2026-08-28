@@ -139,6 +139,27 @@ not build its `cmd/gc` test binary, so every test in the repo's largest package
 was unrunnable. The required CI gate does not appear to vet or build the
 `cmd/gc` test binary on the merge result.)
 
+**And do not assume the damage stops at the test binary.** The same class recurs
+on the PRODUCTION build, where the sentence above will mislead you: on
+2026-08-28 `origin/main` at `eec4a2fb6` failed a plain `go build ./cmd/gc/`
+(three `undefined: store` / `undefined: graphStore` errors in
+`cmd/gc/wisp_step_inject.go`), so `gc` could not be built from a fresh clone at
+all. `3b44512c8` (#5488) split one `store` parameter into `workStore` and
+`graphStore`; `29b3687cf` (#5297), written against the pre-#5488 base, merged
+callers using the old name. Nine PRs had merged on top without anyone noticing.
+So run the build, not only the vet, and run it in a clean worktree cut from the
+ref rather than reading a check's colour:
+
+```bash
+git worktree add -q --detach /var/tmp/mainbuild origin/main   # /var/tmp, not /tmp
+cd /var/tmp/mainbuild && go build ./cmd/gc/ && go vet ./...
+```
+
+When you find one, resolve it by porting the LATER semantics onto main's current
+structure, never by collapsing the refactor back to its pre-split form to make
+the compiler quiet: that silently reverts the earlier PR while looking like a
+build fix. (Tracked as gc-uobe9.)
+
 **An OPEN bead is not proof the bug is live.** The mirror of the false close, and
 it costs the same wasted authoring pass. A bead names a mechanism at file:line,
 those line numbers no longer resolve, and the fix turns out to have landed under
