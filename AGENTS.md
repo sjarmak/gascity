@@ -192,6 +192,24 @@ git status --porcelain AGENTS.md      # empty = committed
 git log --oneline -1 -- AGENTS.md
 ```
 
+**And a commit is not the end of the check: confirm the rule is on
+`origin/main`.** A seat branch in the shared checkout can sit hundreds of
+commits behind and never be published, so a rule committed only there is loaded
+by seats that read this working tree and by nobody else. The commit makes it
+survive a `git checkout`; only `origin/main` makes it survive the checkout being
+re-pointed, and only `origin/main` reaches a seat working from a fresh clone or
+a worktree cut from main:
+
+```bash
+git grep -c '<distinctive phrase from the rule>' origin/main -- AGENTS.md
+```
+
+A `0` there means the rule is unpublished work, not landed governance. Treat it
+like any other unpublished branch: it belongs in the publish gate, not in a
+"captured durably" claim. (Precedent 2026-08-28: four rules totalling 182 lines
+of AGENTS.md, all correctly committed, all reading `0` on `origin/main` because
+`pl-shared-checkout` was 362 behind and had never been pushed.)
+
 (Precedent 2026-08-28: three separate governance rules, added across different
 sessions, were all found uncommitted at once in `e815abe3a` — including the
 bead-routing-count rule that a seat's working set cited by line number as
