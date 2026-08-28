@@ -1267,7 +1267,7 @@ func TestCreateSingleItemInputConvoyClosesConvoyOnTrackFailure(t *testing.T) {
 	}
 	store := depAddFailingStore{Store: mem}
 
-	_, err = CreateSingleItemInputConvoy(store, target)
+	_, err = CreateSingleItemInputConvoy(store, target, InputConvoyInvocationKey(target.ID, "mol-example"))
 	if err == nil {
 		t.Fatal("CreateSingleItemInputConvoy succeeded, want tracking failure")
 	}
@@ -1288,9 +1288,20 @@ func TestCreateSingleItemInputConvoyClosesConvoyOnTrackFailure(t *testing.T) {
 // synthetic input convoy.
 type depListFailingStore struct {
 	beads.Store
+	reads *int
 }
 
-func (s depListFailingStore) DepList(_, _ string) ([]beads.Dep, error) {
+// DepList fails from the second read onward. NormalizeInputConvoy itself now
+// reads dependencies (it repairs a convoy that was minted but never tracked),
+// so failing every read would abort before the convoy exists and this test
+// would pass for the wrong reason. Letting the first read through keeps the
+// fixture on the boundary the test names: the convoy is minted and tracked,
+// and the alias read is what fails.
+func (s depListFailingStore) DepList(id, depType string) ([]beads.Dep, error) {
+	*s.reads++
+	if *s.reads == 1 {
+		return s.Store.DepList(id, depType)
+	}
 	return nil, fmt.Errorf("cross-store membership read failed")
 }
 
@@ -1319,7 +1330,8 @@ title = "Inspect {{issue}}"
 	}
 	// DepAdd (convoy tracking) still succeeds, so NormalizeInputConvoy mints the
 	// synthetic convoy; the later DepList inside ResolveLegacyIssueAlias fails.
-	store := depListFailingStore{Store: mem}
+	reads := 0
+	store := depListFailingStore{Store: mem, reads: &reads}
 
 	_, err = PrepareInvocation(context.Background(), store, "legacy", []string{dir}, target.ID, nil)
 	if err == nil {
@@ -1356,7 +1368,7 @@ func TestSyntheticInputConvoyIsWorkClassAndCoResidentWithItsTarget(t *testing.T)
 		t.Fatalf("create target: %v", err)
 	}
 
-	convoyID, err := NormalizeInputConvoy(work, target.ID)
+	convoyID, err := NormalizeInputConvoy(work, target.ID, "work")
 	if err != nil {
 		t.Fatalf("NormalizeInputConvoy: %v", err)
 	}
