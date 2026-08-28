@@ -179,6 +179,25 @@ internal/beads/` reported ABSENT while the symbol had 3 hits on `origin/main` in
 justified re-authoring a guard that already exists, which is the exact cost this
 whole section prevents.)
 
+**Writing a rule into this file is not landing it: it is not durable until it is
+committed.** This is the shared checkout, and several seats work in it. An
+addition that sits in the working tree is loaded by every seat that reads the
+file from disk, so it looks landed and behaves landed, right up until any
+`git checkout AGENTS.md` or pathspec checkout silently takes it. A working-set
+or handoff note claiming a lesson is "captured durably at AGENTS.md:NNN" is
+therefore evidence of nothing on its own. Confirm the commit:
+
+```bash
+git status --porcelain AGENTS.md      # empty = committed
+git log --oneline -1 -- AGENTS.md
+```
+
+(Precedent 2026-08-28: three separate governance rules, added across different
+sessions, were all found uncommitted at once in `e815abe3a` — including the
+bead-routing-count rule that a seat's working set cited by line number as
+durably captured. Losing it would have restored a routed-backlog undercount of
+61 against a true 299.)
+
 ## Development approach
 
 **TDD.** Write the test first, watch it fail, make it pass. Every package
