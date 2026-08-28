@@ -748,16 +748,40 @@ bd list --status open --json | python3 -c 'import sys,json,collections; \
 rows=json.load(sys.stdin); c=collections.Counter(); \
 [c.update([(b.get("metadata") or {}).get("gc.routed_to")]) for b in rows]; \
 print(c.most_common())'
-gc agent list | grep "<rig-root>/"        # which of those targets actually exist
+gc agent list                             # read EVERY row; do not filter it
 ```
 
-  (Precedent 2026-08-28, gc-hpidi: the stranded-queue figure was escalated to the
-  mayor as 299 beads routed to one suspended seat. That number was correct and
-  the exposure was not: 97 further open beads routed to `gascity/codex`,
-  `gascity/codex-w2i`, and `gascity/codex-w1h`, none of which exist on the rig
-  either. True dead-routing total ~397 across four targets. The proposed fix,
-  minting one worker seat, would have left roughly a quarter of the queue
-  stranded, and nothing in the original count would have revealed it.)
+  **Never filter the roster to check a target, and never conclude a seat is a
+  phantom.** The roster prints a seat under either spelling, absolute
+  (`/home/ds/gascity/polecat`) or short (`gascity/codex-w1h`), and which one it
+  uses is not yours to predict. Any filter narrow enough to be convenient
+  MANUFACTURES the absence you are testing for, exactly as a `-- <path>` pathspec
+  does to a symbol grep. So read every row and match each target against the
+  whole list. A target that looks missing is almost always present under the
+  other spelling, and the distinction that actually matters is not
+  exists-vs-phantom but **active vs suspended**: a suspended seat strands work
+  identically while being fixable by resuming it rather than by minting anything.
+  Read the ROSTER column, not the presence of the row.
+
+```bash
+gc agent list | sed 's/^ *//' | awk 'NF>=2{print $1"\t"$2}'   # target -> state
+```
+
+  Note what this does and does not prove: `gc agent list` is a roster read, not a
+  liveness probe. `active` means not suspended, never that the seat's dispatcher
+  is draining. Open work parked under an active target is unexplained, not fine.
+
+  (Precedent 2026-08-28, gc-hpidi, and this is the rule correcting its own earlier
+  text. The stranded queue was escalated to the mayor as ~397 beads routed to four
+  targets "that do not exist", with a proposal to mint a new worker seat and
+  re-point all four. All four exist. The roster had been checked with
+  `gc agent list | grep "<rig-root>/"` -- which this rule itself used to
+  prescribe -- and that grep matches only absolute-path rows, so all 17
+  short-name `gascity/` rows were invisible. Corrected distribution: polecat 380
+  across three spellings of ONE seat and `gascity/codex` 89, both SUSPENDED; 18
+  more under `codex-w2i`/`codex-w1h`, both ACTIVE and therefore not stranded by
+  this mechanism. The real remedy was resuming two switched-off seats, which is
+  reversible and mayor-tier, not a topology change needing a human.)
 - **A priority band is not a work count: formula step beads inherit the root's
   priority.** The two rules above fix WHERE work is addressed. This one fixes WHAT
   is in the band. A molecule materializes as a root plus child step beads, and the
