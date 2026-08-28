@@ -715,6 +715,28 @@ bd close <id>         # Complete work
   which field you counted. (2026-08-27: a routed-backlog figure was reported as
   61 when the real number was 299, because one spelling of one field was
   counted.)
+- **Counting the target you expected is not counting the exposure: enumerate
+  every target, then check each one exists.** The rule above fixes the count for
+  a seat you already suspect. It does not tell you the queue is also addressed to
+  seats you never thought to ask about, and a count scoped to the known-bad
+  target reads as complete while understating the real number. Print the full
+  distribution instead of grepping for one value, then check the roster:
+
+```bash
+bd list --status open --json | python3 -c 'import sys,json,collections; \
+rows=json.load(sys.stdin); c=collections.Counter(); \
+[c.update([(b.get("metadata") or {}).get("gc.routed_to")]) for b in rows]; \
+print(c.most_common())'
+gc agent list | grep "<rig-root>/"        # which of those targets actually exist
+```
+
+  (Precedent 2026-08-28, gc-hpidi: the stranded-queue figure was escalated to the
+  mayor as 299 beads routed to one suspended seat. That number was correct and
+  the exposure was not: 97 further open beads routed to `gascity/codex`,
+  `gascity/codex-w2i`, and `gascity/codex-w1h`, none of which exist on the rig
+  either. True dead-routing total ~397 across four targets. The proposed fix,
+  minting one worker seat, would have left roughly a quarter of the queue
+  stranded, and nothing in the original count would have revealed it.)
 - When a bead needs to pause on a specific actor or condition, only `hold:mayor` and `hold:external` are canonical (set via `bd set-state <id> hold=mayor|external --reason "..."`) — never invent a new ad hoc hold/blocked label. See `engdocs/contributors/hold-label-conventions.md`.
 
 ## Session Completion
