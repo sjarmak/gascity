@@ -832,6 +832,21 @@ d=d[0] if isinstance(d,list) else d; print(d.get("status"), d.get("priority"))'
   convoys tracking `gc-iipgc` (blocked), `gc-4wnvo` and `gc-dzhyp` (both open and
   live). Closing all 15 leaf-first, which the rule as previously written reads as
   authorising, would have stripped convoy structure from three live P0s.)
+- **Do not sling `mol-focus-review`; it does not complete.** Stephanie's ruling of
+  2026-08-25 stands: while the formula is broken, implementation work gets a manual
+  `git worktree add` plus the ship skills, not a focus-review molecule. The failure is
+  silent, which is why this needs writing down: the run materializes its full step
+  ladder, claims a target bead, and then stops, leaving nine inert beads that inherit
+  the target's priority and pollute the band (see the priority-band rule above). Three
+  such runs were found abandoned on 2026-08-28 (roots `gc-dcmbx`, `gc-yhrcx`,
+  `gc-5xr92`, stale 4 to 6 days, `bd mol current` empty), holding 15 of the 16 open
+  beads routed to `gascity/codex-w2i` and making an active seat look like a stranded
+  queue. Resolve an abandoned run by its TRACKED TARGET, never by the run: close the
+  steps leaf-first through the typed closer, and leave the target bead open and
+  re-dispatchable unless it closed on its own merits. The ruling is scoped to the
+  formula being broken (tracked in the ds-research store as `dr-snk0q` / `dec-tqgb`,
+  not visible from this rig's `gc-` store); confirm there before treating it as lifted.
+
 - When a bead needs to pause on a specific actor or condition, only `hold:mayor` and `hold:external` are canonical (set via `bd set-state <id> hold=mayor|external --reason "..."`) — never invent a new ad hoc hold/blocked label. See `engdocs/contributors/hold-label-conventions.md`.
 
 ## Session Completion
