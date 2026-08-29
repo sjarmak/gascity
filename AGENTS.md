@@ -779,9 +779,35 @@ gc agent list | sed 's/^ *//' | awk 'NF>=2{print $1"\t"$2}'   # target -> state
   prescribe -- and that grep matches only absolute-path rows, so all 17
   short-name `gascity/` rows were invisible. Corrected distribution: polecat 380
   across three spellings of ONE seat and `gascity/codex` 89, both SUSPENDED; 18
-  more under `codex-w2i`/`codex-w1h`, both ACTIVE and therefore not stranded by
-  this mechanism. The real remedy was resuming two switched-off seats, which is
+  more under `codex-w2i`/`codex-w1h`, read at the time as ACTIVE seats and
+  therefore not stranded. That last reading was itself wrong; see the next rule.
+  The remedy for the two genuinely switched-off seats is resuming them, which is
   reversible and mayor-tier, not a topology change needing a human.)
+- **A roster row is not a seat: `gc agent list` prints PROVIDERS in the same
+  shape.** The rule above makes you read every row rather than grep for one. Do
+  that and you hit the opposite error, which is how it just failed: the roster
+  renders each configured provider per rig as a `<rig>/<provider>` row,
+  character-identical to a real agent row, and a provider row always reports
+  `active` because the provider is enabled. It can never claim a bead. The tell
+  is that the SAME names repeat under every rig (`gascity/codex-w2i`,
+  `gascity-dashboard/codex-w2i`, `gascity-packs/codex-w2i`), because they are one
+  provider list rendered three times. Before concluding a seat exists, resolve the
+  name against the config, not the roster:
+
+```bash
+python3 -c "import tomllib;d=tomllib.load(open('city.toml','rb'));print(sorted(d['providers']))"
+grep -n 'name = "<target>"' city.toml     # a real seat has an [[patches.agent]] block
+```
+
+  A name in the first list is a provider and routing work to it strands that work
+  permanently, with no seat to resume and nothing to nudge. (Precedent 2026-08-29,
+  gc-hpidi: this seat read the unfiltered roster, found six `gascity/codex-*` rows
+  reading ACTIVE, and posted a correction asserting the rig had six live
+  implementation seats and that minting a worker would "add a row without adding a
+  drain." All six are providers. The bead's original premise, ONE seat
+  `/home/ds/gascity/polecat` and it is suspended, was right all along. The
+  retraction is on the bead. Note this also corrects the precedent paragraph
+  immediately above, which had recorded `codex-w2i`/`codex-w1h` as active seats.)
 - **A priority band is not a work count: formula step beads inherit the root's
   priority.** The two rules above fix WHERE work is addressed. This one fixes WHAT
   is in the band. A molecule materializes as a root plus child step beads, and the
