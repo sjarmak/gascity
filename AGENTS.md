@@ -808,6 +808,27 @@ grep -n 'name = "<target>"' city.toml     # a real seat has an [[patches.agent]]
   `/home/ds/gascity/polecat` and it is suspended, was right all along. The
   retraction is on the bead. Note this also corrects the precedent paragraph
   immediately above, which had recorded `codex-w2i`/`codex-w1h` as active seats.)
+- **P0 is falsy: a `priority or N` default silently drops the band you care most
+  about.** The counting rules above fix WHERE work is addressed and WHAT is in a
+  band. This one fixes the filter itself. The idiomatic-looking Python guard
+  `(b.get("priority") or 9) < 2`, written to tolerate a missing field, evaluates
+  `0 or 9` to `9` and therefore excludes every P0 bead, while a P1 passes
+  normally. The failure is invisible in both directions: the selection under-acts
+  on exactly the highest-priority rows, and the verification listing built with
+  the same filter reports the P0 band as clean. Write the membership test
+  explicitly, and never let a falsy-default stand in for a presence check:
+
+```python
+p = b.get("priority")
+if p in (0, 1):          # not: (b.get("priority") or 9) < 2
+    ...
+```
+
+  (Precedent 2026-08-28, during the formula-exhaust sweep: the filter excluded 8
+  P0 `gc.outcome=fail` beads from a demotion pass, and the confirming listing
+  then printed a P0-free band. Caught only because two P0s known by name were
+  missing from the output; a sweep that trusted its own listing would have
+  reported the band cleared with six inert P0 steps still polluting claim order.)
 - **A priority band is not a work count: formula step beads inherit the root's
   priority.** The two rules above fix WHERE work is addressed. This one fixes WHAT
   is in the band. A molecule materializes as a root plus child step beads, and the
