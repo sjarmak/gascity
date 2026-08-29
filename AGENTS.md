@@ -77,66 +77,21 @@ Useful search targets:
 If history contains working code, prefer porting the smallest proven slice
 instead of inventing a parallel mechanism.
 
-**Two individually-correct PRs can merge into a tree that does not compile.**
-Neither author is wrong and neither branch is red, so nothing in the per-PR
-gates catches it: one PR changes a function signature, a second PR written
-against the older base adds a caller, and the defect exists only in the merge
-result. Test files are where this lands hardest, because a broken test binary
-does not fail a build gate that only compiles non-test code, and every test in
-that package silently stops running while the gate still reports a pass. Before
-trusting any green check over a package, confirm its test binary actually
-builds at the merge commit:
-
-```bash
-go vet ./cmd/gc/            # compiles the test files too
-```
-
-(Precedent 2026-08-27, gc-xwerd: `filterAssignedWorkBeadsForPoolDemand` grew a
-`[]session.Info` parameter in `f6b3704fe` (#5660); tip commit `bbcc7bcf4`
-(#5094) added two calls against the pre-#5660 signature. `origin/main` could
-not build its `cmd/gc` test binary, so every test in the repo's largest package
-was unrunnable. The required CI gate does not appear to vet or build the
-`cmd/gc` test binary on the merge result.)
-
-**And do not assume the damage stops at the test binary.** The same class recurs
-on the PRODUCTION build, where the sentence above will mislead you: on
-2026-08-28 `origin/main` at `eec4a2fb6` failed a plain `go build ./cmd/gc/`
-(three `undefined: store` / `undefined: graphStore` errors in
-`cmd/gc/wisp_step_inject.go`), so `gc` could not be built from a fresh clone at
-all. `3b44512c8` (#5488) split one `store` parameter into `workStore` and
-`graphStore`; `29b3687cf` (#5297), written against the pre-#5488 base, merged
-callers using the old name. Nine PRs had merged on top without anyone noticing.
-So run the build, not only the vet, and run it in a clean worktree cut from the
-ref rather than reading a check's colour:
+**A green check does not mean `main` builds.** Two individually-correct PRs can
+merge into a tree that does not compile: one changes a signature, the other was
+written against the older base and adds a caller. No per-PR gate sees the merge
+result, and a broken *test* binary fails nothing while silently disabling every
+test in the package. Before trusting a ref, build it in a clean worktree cut from
+that ref:
 
 ```bash
 git worktree add -q --detach /var/tmp/mainbuild origin/main   # /var/tmp, not /tmp
 cd /var/tmp/mainbuild && go build ./cmd/gc/ && go vet ./...
 ```
 
-When you find one, resolve it by porting the LATER semantics onto main's current
-structure, never by collapsing the refactor back to its pre-split form to make
-the compiler quiet: that silently reverts the earlier PR while looking like a
-build fix. (Tracked as gc-uobe9.)
-
-**A negative symbol grep is itself a claim: guard it before reporting it.** The
-checks above turn on a symbol being ABSENT from `origin/main`, and a too-narrow
-grep manufactures that absence. Both narrowing devices are traps: a `func <name>`
-prefix misses the symbol when it is a method, a var, a struct field, or wrapped
-across lines, and a `-- <path>` pathspec misses it when the code lives in a
-sibling file you did not predict. Before reporting ABSENT, re-run the grep with
-the bare symbol and NO pathspec:
-
-```bash
-git grep -n '<symbol>' origin/main            # no `func `, no pathspec
-```
-
-Only an absence that survives the unnarrowed form is a finding. (Precedent
-2026-08-28: `git grep -n 'func updateMatchesCached' origin/main --
-internal/beads/` reported ABSENT while the symbol had 3 hits on `origin/main` in
-`internal/beads/caching_store_writes.go`. Had that reached a bead, it would have
-justified re-authoring a guard that already exists, which is the exact cost this
-whole section prevents.)
+Fix one by porting the LATER semantics onto main's current structure. Collapsing
+the refactor back to its pre-split form silences the compiler by reverting the
+earlier PR.
 
 ## Development approach
 
@@ -461,57 +416,22 @@ becoming more useful as models improve — it becomes LESS useful instead.
   into `applyRigPatch` so layered configs (fragments, patches) can
   override it. No field-sync test exists for Rig today; the patch path
   must be checked manually.
-- **Resolving conflicts in the command-census files:** `go run
-  ./cmd/gen-command-census` touches four files, but they are NOT
-  interchangeable "generated artifacts." `cmd/gc/productmetrics_command_census.json`
-  is the hand-maintained MANIFEST (`cmd/gen-command-census/main.go:48`
-  reads it as the generator's input); `cmd/gc/metrics_census_gen.go`,
-  `internal/productmetrics/command_ids_gen.go`, and
-  `schemas/metrics/example/result.schema.json` are the DERIVED output.
-  On a rebase/merge conflict, taking either side wholesale for the
-  manifest and then regenerating is unsafe: two branches that each add
-  new commands independently both consume `next_id` from their own base,
-  so their generated IDs collide once merged (e.g. one side assigns ID
-  202 to a new command, the other independently assigns 202 to a
-  different new command). Taking `--ours`/`--theirs` blindly either
-  silently drops one side's new commands or leaves colliding IDs that
-  the regenerator won't itself catch. Resolve it by hand: diff each
-  side's `commands` array against their common merge-base to find the
-  actual new entries, keep both sets, renumber the later side's new
-  entries starting from the CURRENT (post-merge) `next_id`, keep the
-  array sorted by `path` (`validateSortedRows` in
-  `internal/commandcensus/manifest.go` enforces this), bump `next_id`
-  past the highest ID used, then run `go run ./cmd/gen-command-census`
-  (no `--check`) to regenerate the three derived files from the
-  corrected manifest and `go run ./cmd/gen-command-census --check` to
-  confirm no drift. Any test asserting a literal generated-catalog count
-  (e.g. `internal/productmetrics/event_test.go`) must have its literal
-  updated to match the real post-regeneration count — get that count by
-  running the test once and reading its failure message, not by hand
-  arithmetic. (Landed 2026-08-18 after this exact mistake nearly shipped
-  during PR #5193's rebase — a first pass took `--ours` for the manifest
-  and silently dropped that PR's own new `gc worktree` commands.)
-
-- **Resolving conflicts in the resource-census ledger files**: a second,
-  unrelated generated-artifact family with the same failure mode.
-  `internal/testpolicy/resourcecensus/census.go`'s `bootstrapPolicy` Go
-  literal is the source of truth for test-resource-debt baselines
-  (subprocess/fixed_sleep/environment call-site counts); `test/test-resources.toml`
-  must mirror it exactly; `TESTING.md`'s "CHECKED TEST RESOURCE LEDGER" table is
-  *generated* from `test-resources.toml` (`go test
-  ./internal/testpolicy/resourcecensus -run
-  TestRepositoryLedgerMatchesCensusAndDocumentation -update`). On a rebase
-  conflict in any of these three, do not hand-merge the numbers from either
-  side: take the current/HEAD baseline as a starting point, then run `go test
-  ./internal/testpolicy/resourcecensus/... -count=1` to get the census
-  self-check's live diagnostic of exactly which counters the rebased branch's
-  own new code requires bumping, apply only those deltas to both `census.go`
-  and `test-resources.toml` in lockstep, then regenerate `TESTING.md` via the
-  `-update` flag above and re-run the check clean. (Landed 2026-08-18 while
-  rebasing `fix/supervisor-adopt-dolt-port` 518 commits onto `origin/main`;
-  an initial take-HEAD resolution was one increment stale because it didn't
-  yet account for the branch's own rebased-in test files.)
-
+- **Resolving conflicts in the command-census files:** `cmd/gc/productmetrics_command_census.json`
+  is a hand-maintained MANIFEST; the other three files `gen-command-census`
+  touches are derived from it. Never take `--ours`/`--theirs` on the manifest and
+  regenerate: two branches each allocate IDs from `next_id` at their own base, so
+  independently-added commands collide, and the regenerator does not detect it.
+  Merge the `commands` arrays by hand against the merge-base, renumber the later
+  side from the post-merge `next_id`, then regenerate. Procedure and the
+  sort/count invariants are documented at `cmd/gen-command-census/main.go`.
+- **Resolving conflicts in the resource-census ledger files:** same failure mode,
+  different family. `internal/testpolicy/resourcecensus/census.go`'s
+  `bootstrapPolicy` is the source of truth for test-resource baselines;
+  `test/test-resources.toml` mirrors it and `TESTING.md`'s ledger is generated
+  from that. Do not hand-merge the counts from either side. Start from HEAD's
+  baseline and let the census self-check tell you which counters the rebased code
+  actually requires; procedure is documented at
+  `internal/testpolicy/resourcecensus/census.go`.
 - `TESTING.md` — testing philosophy, tier boundaries, and sharded local
   runners. Read before writing any test. For broad local sweeps, prefer the
   documented shard targets (`make test-fast-parallel`,

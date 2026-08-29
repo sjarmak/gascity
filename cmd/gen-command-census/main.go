@@ -1,6 +1,28 @@
 // Command gen-command-census validates the committed Cobra census and
 // deterministically regenerates its typed runtime table, product-metrics
 // decode catalog, and public example schema enum.
+//
+// Resolving a rebase or merge conflict in these files:
+//
+// productmetrics_command_census.json is the hand-maintained MANIFEST and is
+// this generator's INPUT. metrics_census_gen.go, command_ids_gen.go and
+// result.schema.json are DERIVED. Taking --ours or --theirs on the manifest
+// and regenerating is unsafe: two branches each allocate IDs from next_id at
+// their own base, so commands added independently on both sides collide, and
+// neither the generator nor --check detects it. Resolve by hand:
+//
+//  1. Diff each side's "commands" array against their common merge-base to
+//     find the entries each side actually added, and keep both sets.
+//  2. Renumber the later side's new entries from the CURRENT (post-merge)
+//     next_id, then bump next_id past the highest ID used.
+//  3. Keep the array sorted by "path"; validateSortedRows in
+//     internal/commandcensus/manifest.go enforces this.
+//  4. Regenerate (no --check), then re-run with --check to confirm no drift.
+//
+// A test asserting a literal catalog count (for example
+// internal/productmetrics/event_test.go) must have its literal updated to the
+// real post-regeneration count. Get that count by running the test once and
+// reading its failure message, not by hand arithmetic.
 package main
 
 import (

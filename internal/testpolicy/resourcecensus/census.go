@@ -117,6 +117,25 @@ type Baseline struct {
 	Expires         string   `toml:"expires"`
 }
 
+// bootstrapPolicy is the source of truth for test-resource-debt baselines.
+// test/test-resources.toml must mirror it exactly, and TESTING.md's
+// "CHECKED TEST RESOURCE LEDGER" table is generated from that TOML via
+//
+//	go test ./internal/testpolicy/resourcecensus \
+//	    -run TestRepositoryLedgerMatchesCensusAndDocumentation -update
+//
+// Resolving a rebase conflict across those three files: do not hand-merge the
+// numbers from either side. Take the current HEAD baseline as the starting
+// point, then run
+//
+//	go test ./internal/testpolicy/resourcecensus/... -count=1
+//
+// and read the self-check's diagnostic, which names exactly which counters the
+// rebased branch's own new code requires bumping. Apply only those deltas, to
+// this literal and to test-resources.toml in lockstep, then regenerate
+// TESTING.md with -update and re-run the check clean. A take-HEAD resolution is
+// typically one increment stale, because it does not yet account for test files
+// the branch itself rebased in.
 var bootstrapPolicy = Ledger{
 	Version: 2,
 	AuditBaseline: []Baseline{
