@@ -181,6 +181,36 @@ subject "close terminal workflow residue (#5026)", and the bead's "77 open"
 exposure had fallen to 18. The real remaining defect was a NEW mint path added
 minutes earlier in the same session's own claim-time commit.)
 
+**A PASS verifies the artifact, never that the DECISION still holds.** The rules
+above test whether code landed. This one tests whether it should. A verification
+bead confirms an exact head against acceptance criteria, and every one of those
+criteria is a property of the branch: tests pass, the migration is reversible, the
+diff matches the design. None of them asks whether main still wants the change. So a
+branch can hold a clean, correctly-executed, unexpired PASS and be wrong to publish,
+because the constraint that forbids it landed on main AFTER the branch was authored.
+Re-running the verification does not catch this; it re-confirms the same branch
+properties against the same stale criteria. Before publishing on the strength of any
+recorded PASS, diff the constraint, not the code:
+
+```bash
+git log origin/main --oneline -S'<the value or symbol the branch changes>' -- <path>
+git show origin/main:<path> | sed -n '/<the setting>/,+20p'   # read main's rationale
+```
+
+If main's current text names the thing your branch does and explains why not, the
+PASS is intact and the decision is dead. Decline publication and record the
+superseding commit on the source bead; do not treat it as a stale branch to rebase.
+(Precedent 2026-08-29, gc-wi31y/gc-igbm1: branch `bd-gc-igbm1` promoted the Beads pin
+to v1.1.2 and carried two independent PASS verifications, 2026-07-27 and 2026-08-19,
+with migration, canary, rollback and checksum-provenance evidence all sound.
+`97e88d044` (#5147, 2026-08-09) had meanwhile written into `deps.env` that v1.1.2
+predates beads#5008 and therefore lacks the `--if-assignee`/`--if-status` flags.
+Merging would have promoted `BD_VERSION` to a release main documents as unusable AND
+regressed `BD_CURRENT_VERSION` from the flag-capable `v1.1.1-0.20260805` back to
+v1.1.2, which is the exact breakage #5147 was filed to fix. The second verification
+ran ten days after the constraint landed and could not see it, because "has main's
+policy moved?" was not one of its criteria.)
+
 **A negative symbol grep is itself a claim: guard it before reporting it.** The
 checks above turn on a symbol being ABSENT from `origin/main`, and a too-narrow
 grep manufactures that absence. Both narrowing devices are traps: a `func <name>`
