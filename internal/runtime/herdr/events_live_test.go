@@ -56,12 +56,30 @@ func TestSessionEventsLive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// evt-a exists before the stream: its pane rides the initial filter set.
+	// report stamps an agent identity onto a pane. Session events are
+	// attributed through herdr's pane → agent-name map, and a "sleep"
+	// command takes the raw-launch path (launchSpecFor: not an agent kind),
+	// so herdr names no agent on its own. Every pane whose events this test
+	// asserts on must be reported under its gc session name first.
+	report := func(pane, name, state string) {
+		t.Helper()
+		out, err := exec.Command("herdr", "--session", session, "pane", "report-agent", pane,
+			"--source", "gctest", "--agent", name, "--state", state).CombinedOutput()
+		if err != nil {
+			t.Fatalf("pane report-agent %s %s %s: %v: %s", pane, name, state, err, out)
+		}
+	}
+
+	// evt-a exists before the stream: its pane rides the initial filter set,
+	// so its identity must be stamped before SubscribeSessionEvents builds
+	// the map.
 	cfgA := runtime.Config{WorkDir: t.TempDir(), Command: "sleep 120"}
 	if err := p.Start(ctx, "evt-a", cfgA); err != nil {
 		t.Fatalf("Start evt-a: %v", err)
 	}
 	t.Cleanup(func() { _ = p.Stop("evt-a") })
+	paneA := firstPaneID(t, session)
+	report(paneA, "evt-a", "idle")
 
 	ch, err := p.SubscribeSessionEvents(ctx)
 	if err != nil {
@@ -72,19 +90,7 @@ func TestSessionEventsLive(t *testing.T) {
 	})
 
 	// Forced status change on evt-a's pane must arrive attributed.
-	a, ok, err := p.c.getAgent(ctx, "evt-a")
-	if err != nil || !ok {
-		t.Fatalf("getAgent evt-a: ok=%v err=%v", ok, err)
-	}
-	report := func(pane, state string) {
-		t.Helper()
-		out, err := exec.Command("herdr", "--session", session, "pane", "report-agent", pane,
-			"--source", "gctest", "--agent", "gctest", "--state", state).CombinedOutput()
-		if err != nil {
-			t.Fatalf("pane report-agent %s %s: %v: %s", pane, state, err, out)
-		}
-	}
-	report(a.PaneID, "working")
+	report(paneA, "evt-a", "working")
 	ev := waitForEvent(t, ch, 10*time.Second, func(ev runtime.SessionEvent) bool {
 		return ev.Kind == runtime.SessionEventAgentStatus && ev.Session == "evt-a"
 	})
@@ -99,16 +105,14 @@ func TestSessionEventsLive(t *testing.T) {
 		t.Fatalf("Start evt-b: %v", err)
 	}
 	t.Cleanup(func() { _ = p.Stop("evt-b") })
-	b, ok, err := p.c.getAgent(ctx, "evt-b")
-	if err != nil || !ok {
-		t.Fatalf("getAgent evt-b: ok=%v err=%v", ok, err)
-	}
+	paneB := firstPaneID(t, session, paneA)
+	report(paneB, "evt-b", "idle")
 	// The resubscribe cycle emits a fresh resync; wait for it so the report
 	// below races nothing.
 	waitForEvent(t, ch, 15*time.Second, func(ev runtime.SessionEvent) bool {
 		return ev.Kind == runtime.SessionEventResync
 	})
-	report(b.PaneID, "blocked")
+	report(paneB, "evt-b", "blocked")
 	ev = waitForEvent(t, ch, 10*time.Second, func(ev runtime.SessionEvent) bool {
 		return ev.Kind == runtime.SessionEventAgentStatus && ev.Session == "evt-b"
 	})
@@ -124,6 +128,7 @@ func TestSessionEventsLive(t *testing.T) {
 		t.Fatalf("Start evt-c: %v", err)
 	}
 	t.Cleanup(func() { _ = p.Stop("evt-c") })
+	report(firstPaneID(t, session, paneA, paneB), "evt-c", "idle")
 	waitForEvent(t, ch, 20*time.Second, func(ev runtime.SessionEvent) bool {
 		return ev.Kind == runtime.SessionEventExited && ev.Session == "evt-c"
 	})
