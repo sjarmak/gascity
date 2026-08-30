@@ -681,6 +681,18 @@ type Config struct {
 	// Empty means no overlay. Highest priority — overwrites pack overlays.
 	OverlayDir string
 
+	// SkipMergeableOverlayFiles tells session-start staging that mergeable
+	// provider files in WorkDir already have a reconciler owner. The desired-
+	// state path stages those overlays and then runs hooks.Install before a
+	// persistent home is launched; merging the raw pack files again at Start
+	// would recreate a hybrid hooks/settings document. This remains false for
+	// task worktrees, where runtime staging is the sole writer.
+	//
+	// This is a run-location ownership hint, not configuration identity. The
+	// launch-preparation path may clear it after core fingerprints are computed
+	// when an assigned task overrides WorkDir.
+	SkipMergeableOverlayFiles bool
+
 	// CopyFiles lists files/directories to stage before the command runs.
 	// Provider.Start handles the copy atomically: for local providers,
 	// files are copied to workDir; for remote providers, files are

@@ -59,19 +59,30 @@ func StageSessionWorkDir(cfg Config) error {
 // process. Nonfatal overlay preservation warnings are written to warnings.
 func StageSessionWorkDirWithWarnings(cfg Config, warnings io.Writer) error {
 	if cfg.WorkDir != "" {
-		overlayProviders := EffectiveOverlayProviderNames(cfg)
 		for _, od := range cfg.PackOverlayDirs {
-			if err := StageProviderOverlayDir(od, cfg.WorkDir, overlayProviders, warnings); err != nil {
+			if err := StageSessionOverlayDir(cfg, od, warnings); err != nil {
 				return fmt.Errorf("pack overlay %q -> %q: %w", od, cfg.WorkDir, err)
 			}
 		}
 		if cfg.OverlayDir != "" {
-			if err := StageProviderOverlayDir(cfg.OverlayDir, cfg.WorkDir, overlayProviders, warnings); err != nil {
+			if err := StageSessionOverlayDir(cfg, cfg.OverlayDir, warnings); err != nil {
 				return fmt.Errorf("overlay %q -> %q: %w", cfg.OverlayDir, cfg.WorkDir, err)
 			}
 		}
 	}
 	return stageCopyFiles(cfg.WorkDir, cfg.CopyFiles)
+}
+
+// StageSessionOverlayDir stages one provider-aware overlay according to the
+// ownership carried by cfg. Persistent reconciler-owned homes skip mergeable
+// hooks/settings because hooks.Install already owns them; task worktrees stage
+// every file because runtime start is their sole writer.
+func StageSessionOverlayDir(cfg Config, srcDir string, warnings io.Writer) error {
+	providers := EffectiveOverlayProviderNames(cfg)
+	if cfg.SkipMergeableOverlayFiles {
+		return StageProviderOverlayDirSkippingMergeable(srcDir, cfg.WorkDir, providers, warnings)
+	}
+	return StageProviderOverlayDir(srcDir, cfg.WorkDir, providers, warnings)
 }
 
 // EffectiveOverlayProviderNames returns the provider overlay slots to stage for
@@ -141,17 +152,10 @@ func StageProviderOverlayDir(srcDir, dstDir string, providers []string, warnings
 // reconciler-owned mergeable settings/hook files (overlay.IsMergeablePath —
 // .codex/hooks.json, .claude/settings.json, etc.).
 //
-// It is used only by the build_desired_state home-dir staging path,
-// which stages overlays and then immediately runs hooks.Install on the SAME
-// directory. Skipping the mergeable files here makes hooks.Install the sole
-// writer ON THE RECONCILE TICK, so the two writers can no longer disagree on
-// hook-entry matchers and leave a permanent codex-hooks-drift hybrid.
-//
-// Not a global invariant: for a persistent (non-task) agent the home dir is
-// also the session workDir, and session-start staging reaches these same paths
-// through the non-skipping StageProviderOverlayDir (tmux.stageStartFiles,
-// StageSessionWorkDir). A hybrid can therefore reappear at session start and is
-// converged by the next tick — permanent drift becomes transient.
+// It is used by the build_desired_state home-dir staging path and by runtime
+// session-start staging when Config.SkipMergeableOverlayFiles proves the same
+// directory is still reconciler-owned. In both cases hooks.Install is the sole
+// writer of mergeable files. Task worktrees keep using the non-skipping path.
 func StageProviderOverlayDirSkippingMergeable(srcDir, dstDir string, providers []string, warnings io.Writer) error {
 	skip := func(relPath string, isDir bool) bool {
 		return !isDir && overlay.IsMergeablePath(relPath)

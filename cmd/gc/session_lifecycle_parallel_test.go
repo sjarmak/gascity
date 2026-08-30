@@ -36,6 +36,52 @@ type failingMetadataBatchStore struct {
 	failBatch bool
 }
 
+func TestBuildPreparedStartScopesMergeableOverlayOwnershipToPersistentHome(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "persistent-home")
+	taskWorktree := filepath.Join(t.TempDir(), "task-worktree")
+	candidate := startCandidate{
+		info: sessionpkg.Info{
+			ID:                  "session-1",
+			SessionNameMetadata: "session-1",
+			InstanceToken:       "instance-token",
+		},
+		tp: TemplateParams{
+			Command:     "true",
+			WorkDir:     home,
+			SessionName: "session-1",
+			Env:         map[string]string{},
+		},
+	}
+
+	for _, tc := range []struct {
+		name     string
+		workDir  string
+		wantSkip bool
+	}{
+		{name: "persistent home", workDir: home, wantSkip: true},
+		{name: "task worktree", workDir: taskWorktree, wantSkip: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared, _, err := buildPreparedStartWithWorkDirResolver(
+				candidate,
+				"",
+				&config.City{},
+				nil,
+				func(startCandidate, *config.City) string { return tc.workDir },
+			)
+			if err != nil {
+				t.Fatalf("buildPreparedStartWithWorkDirResolver: %v", err)
+			}
+			if prepared.cfg.WorkDir != tc.workDir {
+				t.Fatalf("WorkDir = %q, want %q", prepared.cfg.WorkDir, tc.workDir)
+			}
+			if prepared.cfg.SkipMergeableOverlayFiles != tc.wantSkip {
+				t.Fatalf("SkipMergeableOverlayFiles = %v, want %v", prepared.cfg.SkipMergeableOverlayFiles, tc.wantSkip)
+			}
+		})
+	}
+}
+
 func (s *failingMetadataBatchStore) SetMetadataBatch(id string, kvs map[string]string) error {
 	if s.failBatch {
 		return errors.New("batch failed")

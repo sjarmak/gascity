@@ -1011,6 +1011,12 @@ func buildPreparedStartWithWorkDirResolver(
 	} else if wd := candidate.info.WorkDir; wd != "" {
 		agentCfg.WorkDir = resolveWorkDirAgainstCity(cityPath, wd)
 	}
+	if filepath.Clean(preOverrideWorkDir) != filepath.Clean(agentCfg.WorkDir) {
+		// The final launch directory is a task binding, not the persistent home
+		// that resolveTemplatePrepared reconciled. Runtime staging is the sole
+		// hook/settings writer in task worktrees, so it must not skip them.
+		agentCfg.SkipMergeableOverlayFiles = false
+	}
 	// The task work_dir override above can replace agentCfg.WorkDir after
 	// template resolution already rendered PreStart commands (materialize-
 	// skills, MCP projection) against the pre-override directory. Retarget

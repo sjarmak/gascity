@@ -6002,15 +6002,11 @@ func materializeProviderOverlaysBeforeFingerprint(
 	// The runtime task-worktree staging path keeps staging them — it is their
 	// sole writer.
 	//
-	// "Sole writer" is scoped to the tick on purpose. For a persistent
-	// (non-task) agent the home dir is also the session workDir, and
-	// session-start staging writes these same files through the NON-skipping
-	// path — internal/runtime/tmux.stageStartFiles and
-	// runtime.StageSessionWorkDir (subprocess/acp) both call
-	// StageProviderOverlayDir with a nil skip. So a hybrid document can
-	// reappear at session start; the next tick converges it. That turns the
-	// permanent drift this fix targets into a transient one, which is the
-	// actual invariant — not that nothing else ever writes these paths.
+	// The ownership continues through session start. templateParamsToConfig
+	// marks this prepared home as reconciler-owned, so tmux and the shared
+	// StageSessionWorkDir path skip these mergeable files too. If launch prep
+	// later binds the session to a task worktree, it clears that marker and
+	// runtime staging remains the sole writer there.
 	for _, od := range packDirs {
 		if err := runtime.StageProviderOverlayDirSkippingMergeable(od, workDir, overlayProviders, stderr); err != nil {
 			fmt.Fprintf(stderr, "agent %q: pack overlay %q: %v\n", qualifiedName, od, err) //nolint:errcheck
