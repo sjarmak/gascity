@@ -337,6 +337,7 @@ gc beads
 | [gc beads health](#gc-beads-health) | Check beads provider health |
 | [gc beads list](#gc-beads-list) | List beads (API-routed with bd fallback) |
 | [gc beads metadata-cas](#gc-beads-metadata-cas) | Atomically compare and set one metadata key in an exact local store |
+| [gc beads metadata-guarded-clear](#gc-beads-metadata-guarded-clear) | Atomically clear several metadata keys in one local store, gated on a guard key |
 | [gc beads show](#gc-beads-show) | Show a single bead (API-routed with bd fallback) |
 
 ## gc beads city
@@ -480,6 +481,54 @@ gc beads metadata-cas tr-123 \
 | `--json` | bool |  | emit the canonical JSON result |
 | `--key` | string |  | metadata key to compare and set |
 | `--next` | string |  | replacement value (explicit empty is allowed) |
+| `--store-ref` | string |  | exact local store: city:&lt;name&gt; or rig:&lt;name&gt; |
+
+## gc beads metadata-guarded-clear
+
+Atomically clear several metadata keys, and set a terminal set of
+key/values, as one indivisible write in one exact local bead store — iff a
+single guard key still holds an expected value at the instant of the write.
+
+The store must be selected explicitly with --store-ref=city:&lt;name&gt; or
+--store-ref=rig:&lt;name&gt;, exactly like "gc beads metadata-cas". This command
+never scans other stores or falls back to a cross-store search.
+
+A guard mismatch (the guard key's current value no longer equals
+--guard-expected) is an ordinary zero-exit "skipped" outcome, not an error:
+nothing was written. A store that cannot implement this capability (no real
+mutual exclusion across the guard check and the clear) fails closed with a
+non-zero exit and writes nothing — it never falls back to an unconditional
+clear.
+
+Use --json for the canonical machine-output contract. --format=json remains
+accepted for compatibility. Combining --json with an explicit --format=text is
+a usage error.
+
+```
+gc beads metadata-guarded-clear <bead-id> [flags]
+```
+
+**Example:**
+
+```
+gc beads metadata-guarded-clear gc-123 \
+  --store-ref=rig:tributary \
+  --guard-key=gc.worktree_attempt_id \
+  --guard-expected=att-7 \
+  --clear-key=gc.work_dir \
+  --clear-key=gc.work_branch \
+  --set-metadata=gc.worktree_lifecycle=removed \
+  --json
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--clear-key` | stringArray |  | metadata key to clear (repeatable) |
+| `--format` | string | `text` | output format: text or json |
+| `--guard-expected` | string |  | expected current value of --guard-key (explicit empty is allowed) |
+| `--guard-key` | string |  | metadata key whose current value gates the clear |
+| `--json` | bool |  | emit the canonical JSON result |
+| `--set-metadata` | stringArray |  | terminal metadata to set on a successful clear (key=value, repeatable) |
 | `--store-ref` | string |  | exact local store: city:&lt;name&gt; or rig:&lt;name&gt; |
 
 ## gc beads show

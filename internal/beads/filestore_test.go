@@ -1458,6 +1458,102 @@ func TestFileStoreDeleteRollsBackWhenSaveFails(t *testing.T) {
 	}
 }
 
+func TestFileStoreClearMetadataIfKeyMatchesPersistsAcrossReopen(t *testing.T) {
+	f := fsys.NewFake()
+	path := "/city/.gc/beads.json"
+
+	s1, err := beads.OpenFileStore(f, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := s1.Create(beads.Bead{
+		Title: "worktree provenance",
+		Metadata: beads.StringMap{
+			"gc.worktree_attempt_id": "attempt-1",
+			"gc.work_dir":            "/roots/dr-1",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	applied, err := s1.ClearMetadataIfKeyMatches(created.ID, "gc.worktree_attempt_id", "attempt-1",
+		[]string{"gc.work_dir", "gc.worktree_attempt_id"}, beads.StringMap{"gc.worktree_lifecycle": "removed"})
+	if err != nil || !applied {
+		t.Fatalf("ClearMetadataIfKeyMatches = (%v, %v), want (true, nil)", applied, err)
+	}
+
+	s2, err := beads.OpenFileStore(f, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s2.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get(%q) after reopen: %v", created.ID, err)
+	}
+	if _, present := got.Metadata["gc.work_dir"]; present {
+		t.Fatalf("gc.work_dir survived reopen: %v", got.Metadata)
+	}
+	if got.Metadata["gc.worktree_lifecycle"] != "removed" {
+		t.Fatalf("gc.worktree_lifecycle after reopen = %q, want %q", got.Metadata["gc.worktree_lifecycle"], "removed")
+	}
+}
+
+func TestFileStoreClearMetadataIfKeyMatchesRollsBackWhenSaveFails(t *testing.T) {
+	f := fsys.NewFake()
+	path := "/city/.gc/beads.json"
+
+	s1, err := beads.OpenFileStore(f, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := s1.Create(beads.Bead{
+		Title: "worktree provenance",
+		Metadata: beads.StringMap{
+			"gc.worktree_attempt_id": "attempt-1",
+			"gc.work_dir":            "/roots/dr-1",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.Errors[path+".tmp"] = fmt.Errorf("disk full")
+
+	applied, err := s1.ClearMetadataIfKeyMatches(created.ID, "gc.worktree_attempt_id", "attempt-1",
+		[]string{"gc.work_dir", "gc.worktree_attempt_id"}, beads.StringMap{"gc.worktree_lifecycle": "removed"})
+	if err == nil {
+		t.Fatalf("ClearMetadataIfKeyMatches applied=%v err=nil, want disk full", applied)
+	}
+	if !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("ClearMetadataIfKeyMatches err = %v, want disk full", err)
+	}
+
+	delete(f.Errors, path+".tmp")
+
+	got, err := s1.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get(%q) after rollback: %v", created.ID, err)
+	}
+	if got.Metadata["gc.work_dir"] != "/roots/dr-1" {
+		t.Fatalf("gc.work_dir after failed save = %q, want unchanged /roots/dr-1 (backend failure must leave state untouched)", got.Metadata["gc.work_dir"])
+	}
+	if got.Metadata["gc.worktree_attempt_id"] != "attempt-1" {
+		t.Fatalf("gc.worktree_attempt_id after failed save = %q, want unchanged attempt-1", got.Metadata["gc.worktree_attempt_id"])
+	}
+	if _, present := got.Metadata["gc.worktree_lifecycle"]; present {
+		t.Fatalf("gc.worktree_lifecycle written despite failed save: %v", got.Metadata)
+	}
+
+	s2, err := beads.OpenFileStore(f, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s2.Get(created.ID); err != nil || got.Metadata["gc.work_dir"] != "/roots/dr-1" {
+		t.Fatalf("Get(%q) after reopen = (%+v, %v), want gc.work_dir=/roots/dr-1 unchanged", created.ID, got, err)
+	}
+}
+
 func TestFileStoreDeletePersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "beads.json")
 
