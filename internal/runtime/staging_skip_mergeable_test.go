@@ -90,3 +90,63 @@ func TestStageSessionWorkDirStagesFunctionalCodexHooks(t *testing.T) {
 		t.Fatalf("staged codex hooks not functional, want SessionStart: %s", data)
 	}
 }
+
+// TestStageSessionWorkDirPreservesReconcilerOwnedHooks pins the persistent-home
+// side of the staging boundary. The reconciler has already staged overlays and
+// run hooks.Install in this directory, so session start must not merge the raw
+// pack hook back into that converged document. Non-mergeable siblings still
+// belong to runtime staging.
+func TestStageSessionWorkDirPreservesReconcilerOwnedHooks(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		configure func(*Config, string)
+	}{
+		{
+			name: "pack overlay",
+			configure: func(cfg *Config, src string) {
+				cfg.PackOverlayDirs = []string{src}
+			},
+		},
+		{
+			name: "agent overlay",
+			configure: func(cfg *Config, src string) {
+				cfg.OverlayDir = src
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := codexHooksOverlaySrc(t)
+			workDir := t.TempDir()
+			hooksPath := filepath.Join(workDir, ".codex", "hooks.json")
+			if err := os.MkdirAll(filepath.Dir(hooksPath), 0o755); err != nil {
+				t.Fatalf("mkdir persistent hooks dir: %v", err)
+			}
+			const installed = `{"hooks":{"PreCompact":[{"command":"/bin/precompact-working-set"}]}}`
+			if err := os.WriteFile(hooksPath, []byte(installed), 0o644); err != nil {
+				t.Fatalf("seed reconciler-owned hooks: %v", err)
+			}
+
+			cfg := Config{
+				WorkDir:                   workDir,
+				ProviderName:              "codex",
+				SkipMergeableOverlayFiles: true,
+			}
+			tc.configure(&cfg, src)
+			if err := StageSessionWorkDir(cfg); err != nil {
+				t.Fatalf("StageSessionWorkDir: %v", err)
+			}
+			data, err := os.ReadFile(hooksPath)
+			if err != nil {
+				t.Fatalf("read persistent hooks: %v", err)
+			}
+			if string(data) != installed {
+				t.Fatalf("persistent hooks changed at session start:\n got: %s\nwant: %s", data, installed)
+			}
+			if _, err := os.Stat(filepath.Join(workDir, "AGENTS.codex.md")); err != nil {
+				t.Fatalf("non-mergeable sibling should still stage: %v", err)
+			}
+		})
+	}
+}

@@ -112,17 +112,18 @@ var coreFieldHalf = map[string]string{
 }
 
 var excludedFromCore = map[string]string{
-	"WorkDir":                "run location, not config identity",
-	"StartupEnvelope":        "T3 startup metadata, explicitly excluded from Core",
-	"ReadyPromptPrefix":      "startup readiness hint",
-	"ReadyDelayMs":           "startup readiness hint",
-	"ProcessNames":           "liveness-check hint",
-	"EmitsPermissionWarning": "startup dialog hint",
-	"Nudge":                  "post-ready typed text",
-	"SessionLive":            "the LIVE axis — re-applied without restart (LiveFingerprint, not Core)",
-	"PackOverlayDirs":        "additive pack file staging, not hashed",
-	"PromptSuffix":           "volatile beacon text, deliberately excluded",
-	"PromptFlag":             "command-reconstruction hint, not hashed",
+	"WorkDir":                   "run location, not config identity",
+	"StartupEnvelope":           "T3 startup metadata, explicitly excluded from Core",
+	"ReadyPromptPrefix":         "startup readiness hint",
+	"ReadyDelayMs":              "startup readiness hint",
+	"ProcessNames":              "liveness-check hint",
+	"EmitsPermissionWarning":    "startup dialog hint",
+	"Nudge":                     "post-ready typed text",
+	"SessionLive":               "the LIVE axis — re-applied without restart (LiveFingerprint, not Core)",
+	"PackOverlayDirs":           "additive pack file staging, not hashed",
+	"SkipMergeableOverlayFiles": "run-location ownership hint selected after core hashing",
+	"PromptSuffix":              "volatile beacon text, deliberately excluded",
+	"PromptFlag":                "command-reconstruction hint, not hashed",
 }
 
 // TestFingerprintPartitionAccountsForEveryConfigField is the FP-1/GAP-6

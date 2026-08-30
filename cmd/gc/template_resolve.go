@@ -885,6 +885,11 @@ func templateParamsToConfigWithDelivery(tp TemplateParams) (runtime.Config, prom
 		cfg.MCPServers = tp.MCPServers
 	}
 	cfg.WorkDir = tp.WorkDir
+	// resolveTemplatePrepared has already staged the persistent home and run
+	// hooks.Install there. Runtime start must preserve those reconciler-owned
+	// mergeable files. buildPreparedStartWithWorkDirResolver clears this hint
+	// when a task binding replaces WorkDir with a task worktree.
+	cfg.SkipMergeableOverlayFiles = true
 	cfg.FingerprintExtra = tp.FPExtra
 	// Prompt delivery may prepend the startup prompt to the configured nudge.
 	cfg.Nudge = nudge

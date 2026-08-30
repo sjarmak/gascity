@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -98,6 +99,39 @@ func TestStageStartFilesKeepsScaffoldOutOfSpawnerCWD(t *testing.T) {
 		t.Fatalf("shared cwd contains stray bead-slug scaffold directory %q; scaffold must stay under %q", leakedWorkDir, workDir)
 	} else if !os.IsNotExist(err) {
 		t.Fatalf("stat leaked workdir %q: %v", leakedWorkDir, err)
+	}
+}
+
+func TestStageStartFilesPreservesReconcilerOwnedHooks(t *testing.T) {
+	t.Parallel()
+
+	workDir := t.TempDir()
+	packOverlay := t.TempDir()
+	overlayHooks := filepath.Join(packOverlay, "per-provider", "codex", ".codex", "hooks.json")
+	writeTmuxScaffoldFixture(t, overlayHooks, `{"hooks":{"SessionStart":[]}}`)
+	writeTmuxScaffoldFixture(t, filepath.Join(packOverlay, "per-provider", "codex", "AGENTS.codex.md"), "codex\n")
+
+	hooksPath := filepath.Join(workDir, ".codex", "hooks.json")
+	const installed = `{"hooks":{"PreCompact":[{"command":"/bin/precompact-working-set"}]}}`
+	writeTmuxScaffoldFixture(t, hooksPath, installed)
+
+	if err := stageStartFiles(runtime.Config{
+		WorkDir:                   workDir,
+		ProviderName:              "codex",
+		PackOverlayDirs:           []string{packOverlay},
+		SkipMergeableOverlayFiles: true,
+	}, io.Discard); err != nil {
+		t.Fatalf("stageStartFiles: %v", err)
+	}
+	data, err := os.ReadFile(hooksPath)
+	if err != nil {
+		t.Fatalf("read persistent hooks: %v", err)
+	}
+	if string(data) != installed {
+		t.Fatalf("persistent hooks changed at tmux start:\n got: %s\nwant: %s", data, installed)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "AGENTS.codex.md")); err != nil {
+		t.Fatalf("non-mergeable sibling should still stage: %v", err)
 	}
 }
 

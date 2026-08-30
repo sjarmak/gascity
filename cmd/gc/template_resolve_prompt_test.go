@@ -609,6 +609,13 @@ func TestTemplateParamsToConfigInteractiveSessionEnablesMouse(t *testing.T) {
 	}
 }
 
+func TestTemplateParamsToConfigProtectsReconcilerOwnedMergeableOverlays(t *testing.T) {
+	cfg := templateParamsToConfig(TemplateParams{WorkDir: "/agent/home"})
+	if !cfg.SkipMergeableOverlayFiles {
+		t.Fatal("SkipMergeableOverlayFiles = false, want true for reconciler-prepared agent home")
+	}
+}
+
 func TestResolveTemplateFlagModeRetainsPromptForStartupDelivery(t *testing.T) {
 	cityPath := t.TempDir()
 	fs := fsys.NewFake()
