@@ -9,7 +9,10 @@ import "fmt"
 // save → rollback wrapper its other write methods use. Revisions survive the
 // reload/save cycle via the out-of-band Revisions map in fileData (Bead.Revision
 // is json:"-").
-var _ ConditionalWriter = (*FileStore)(nil)
+var (
+	_ ConditionalWriter      = (*FileStore)(nil)
+	_ MetadataGuardedClearer = (*FileStore)(nil)
+)
 
 // UpdateIfMatch applies opts only when the bead's persisted revision matches,
 // then flushes to disk. A precondition failure or not-found leaves the store
@@ -113,6 +116,35 @@ func (fs *FileStore) CompareAndSetMetadataKey(id, key, expected, next string) (b
 	ok, err := fs.MemStore.CompareAndSetMetadataKey(id, key, expected, next)
 	if err != nil || !ok {
 		return ok, err // error, or (false, nil) genuine mismatch: nothing to persist
+	}
+	if err := fs.save(); err != nil {
+		fs.restoreFrom(snap.seq, snap.beads, snap.deps)
+		return false, err
+	}
+	return true, nil
+}
+
+// ClearMetadataIfKeyMatches performs a guarded multi-key metadata clear on the
+// embedded MemStore, then flushes to disk. A guard mismatch or error leaves
+// the store unchanged (no save); a failed flush rolls back the in-memory
+// mutation so a disk-write failure cannot leave memory and disk diverged.
+func (fs *FileStore) ClearMetadataIfKeyMatches(id, guardKey, guardExpected string, clearKeys []string, terminal map[string]string) (bool, error) {
+	fs.fmu.Lock()
+	defer fs.fmu.Unlock()
+	if fs.DisableConditionalWrites {
+		return false, ErrConditionalWriteUnsupported
+	}
+	if err := fs.locker.Lock(); err != nil {
+		return false, err
+	}
+	defer fs.locker.Unlock() //nolint:errcheck // best-effort unlock
+	if err := fs.reloadFromDisk(); err != nil {
+		return false, err
+	}
+	snap := fs.snapshotLocked()
+	applied, err := fs.MemStore.ClearMetadataIfKeyMatches(id, guardKey, guardExpected, clearKeys, terminal)
+	if err != nil || !applied {
+		return applied, err // error, or (false, nil) guard mismatch: nothing to persist
 	}
 	if err := fs.save(); err != nil {
 		fs.restoreFrom(snap.seq, snap.beads, snap.deps)

@@ -7,6 +7,7 @@ import (
 
 var (
 	_ ConditionalWriter                = (*MemStore)(nil)
+	_ MetadataGuardedClearer           = (*MemStore)(nil)
 	_ conditionalWritesModeCarrier     = (*MemStore)(nil)
 	_ conditionalWriteCapabilityProber = (*MemStore)(nil)
 
@@ -118,6 +119,41 @@ func (m *MemStore) CompareAndSetMetadataKey(id, key, expected, next string) (boo
 		m.beads[i].Metadata = make(StringMap)
 	}
 	m.beads[i].Metadata[key] = next
+	m.beads[i].UpdatedAt = time.Now()
+	m.beads[i].Revision++
+	return true, nil
+}
+
+// ClearMetadataIfKeyMatches clears every key in clearKeys and sets every
+// key/value in terminal, atomically, iff metadata[guardKey] == guardExpected.
+// The guard check and every mutation happen under the same lock, so no other
+// caller can observe or land a write between them.
+func (m *MemStore) ClearMetadataIfKeyMatches(id, guardKey, guardExpected string, clearKeys []string, terminal map[string]string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.DisableConditionalWrites {
+		return false, ErrConditionalWriteUnsupported
+	}
+	i := m.indexOfLocked(id)
+	if i < 0 {
+		return false, fmt.Errorf("guarded metadata clear on %q: %w", id, ErrNotFound)
+	}
+	if m.beads[i].Metadata[guardKey] != guardExpected {
+		return false, nil
+	}
+	if m.beads[i].Metadata != nil {
+		for _, key := range clearKeys {
+			delete(m.beads[i].Metadata, key)
+		}
+	}
+	if len(terminal) > 0 {
+		if m.beads[i].Metadata == nil {
+			m.beads[i].Metadata = make(StringMap)
+		}
+		for k, v := range terminal {
+			m.beads[i].Metadata[k] = v
+		}
+	}
 	m.beads[i].UpdatedAt = time.Now()
 	m.beads[i].Revision++
 	return true, nil

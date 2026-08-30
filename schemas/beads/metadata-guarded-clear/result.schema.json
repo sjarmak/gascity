@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gc://schemas/beads/metadata-guarded-clear/result.schema.json",
+  "title": "gc beads metadata-guarded-clear result",
+  "description": "Result of a guarded multi-key metadata clear attempt.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ok",
+    "bead_id",
+    "store_ref",
+    "guard_key",
+    "outcome",
+    "cleared_keys"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Schema version for this result.",
+      "const": "1"
+    },
+    "ok": {
+      "description": "True when the guarded clear attempt completed and was classified.",
+      "const": true
+    },
+    "bead_id": {
+      "description": "Exact bead identifier supplied by the caller.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "store_ref": {
+      "description": "Canonical exact local store selected for the operation.",
+      "type": "string",
+      "maxLength": 260,
+      "pattern": "^(city|rig):[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "guard_key": {
+      "description": "Metadata key whose current value gated the clear.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "outcome": {
+      "description": "Durable classification of the guarded clear attempt.",
+      "type": "string",
+      "enum": [
+        "cleared",
+        "skipped"
+      ]
+    },
+    "cleared_keys": {
+      "description": "Metadata keys requested for clearing.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      }
+    },
+    "terminal": {
+      "description": "Terminal metadata key/values requested on a successful clear.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    }
+  }
+}
