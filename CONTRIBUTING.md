@@ -3,6 +3,7 @@
 Gas City is experimental software, but the repo is now structured for external
 contributors. Before making changes, read:
 
+- [REVIEWING.md](REVIEWING.md)
 - [docs/index.mdx](docs/index.mdx)
 - [engdocs/contributors/index.md](engdocs/contributors/index.md)
 - [engdocs/contributors/codebase-map.md](engdocs/contributors/codebase-map.md)
@@ -57,7 +58,14 @@ contributors should:
 2. Make the change
 3. Run `make check`
 4. Run `make check-docs` if you touched docs, navigation, or cross-links
-5. Open a pull request
+5. Open a pull request with its review focus, non-goals, risks, and reproduction
+   or test instructions filled in
+6. Respond to every material review finding or decline it with a reason
+
+Anyone may review a pull request. Reviewers do not need merge access or prior
+permission; see [REVIEWING.md](REVIEWING.md) for the evidence a review records,
+the independent-approval gates, and the boundary between community review and
+maintainer merge authority.
 
 ### Branch Naming
 
