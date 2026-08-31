@@ -31,7 +31,7 @@
 
 Each reviewer should copy the block below into their own review comment. Do not
 ask the pull-request author to record someone else's review. Repeat it once per
-reviewer. See [REVIEWING.md](../REVIEWING.md).
+reviewer. See [REVIEWING.md](REVIEWING.md).
 
 ```text
 - Head SHA:
