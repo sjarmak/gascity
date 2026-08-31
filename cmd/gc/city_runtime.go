@@ -132,6 +132,18 @@ type CityRuntime struct {
 	orderRescanLast         time.Time
 	trace                   *sessionReconcilerTraceManager
 
+	// orderDispatchMu guards od, retiredOrderDispatchers, orderSet,
+	// orderSetSignature, orderRescanLast, wispIndexMigrationApplied, and the
+	// order-tracking watchdog timestamps below. dispatchOrders used to run
+	// exclusively on the single tick/reconciler goroutine, so these fields
+	// were safe unguarded; the order-dispatch lane (#2604/#3368) now calls
+	// dispatchOrders from its own goroutine, concurrently with a config
+	// reload rebuilding the order dispatcher on the tick goroutine
+	// (reloadConfigTraced). Both sides take this lock around their access.
+	orderDispatchMu        sync.Mutex
+	orderDispatchLastRunAt time.Time
+	orderDispatchRan       bool
+
 	// routeRecovery is the route-repair lane: an event-fed delta pass in the
 	// tick and a cadenced authoritative scan behind it. Created on first use so
 	// a directly-constructed runtime needs no wiring.
@@ -656,14 +668,15 @@ func (cr *CityRuntime) run(ctx context.Context) {
 		return
 	}
 
-	// Dispatch due orders before startup session reconciliation. A cold-start
-	// reconcile can take minutes when it has stale or config-drifted sessions;
-	// due event/condition formulas should not wait behind that maintenance work.
-	startupOrdersStart := time.Now()
-	cr.safeTick(func() {
-		cr.dispatchOrders(ctx, cityRoot)
-	}, "startup-orders")
-	logPhaseElapsed("startup-orders", startupOrdersStart)
+	// Order dispatch runs on its own lane goroutine, independent of both the
+	// tick and the FS-pressure skip gate (#2604, #3368). A cold-start reconcile
+	// can take minutes when it has stale or config-drifted sessions; due
+	// event/condition formulas should not wait behind that maintenance work,
+	// and a slow/blocking order exec must not delay it either. The lane fires
+	// once immediately (covering what the old synchronous startup-orders call
+	// did) and then on its own ticker for the life of the run.
+	orderDispatchDone := cr.startOrderDispatchLane(ctx, cityRoot)
+	defer func() { <-orderDispatchDone }()
 	if ctx.Err() != nil {
 		return
 	}
@@ -1226,13 +1239,19 @@ func (cr *CityRuntime) tick(
 		return
 	}
 
-	// Order dispatch is intentionally before the expensive session reconcile
-	// phases so due formulas are not starved by slow startup/config drift work,
-	// but after the pressure gate and managed-Dolt preflight so skipped or
-	// endpoint-repair ticks do not add tracking writes first.
+	// Order dispatch runs on its own lane goroutine (startOrderDispatchLane),
+	// independent of this tick and of the FS-pressure skip gate above, so a
+	// slow/blocking order exec cannot delay the session-reconcile phases below
+	// and pressure-shedding cannot silently suppress order liveness
+	// indefinitely (#2604, #3368). The tick only reports the lane's age here;
+	// RecordControllerOperation is what makes a stalled lane visible via
+	// `gc trace`, the same pattern used for the route-recovery and
+	// completions backstops below.
 	phaseStart = time.Now()
-	cr.dispatchOrders(ctx, cityRoot)
-	recordPhase(TraceSiteOrderDispatch, "dispatch_orders", phaseStart, nil)
+	orderFields := map[string]any{}
+	orderAt, orderRan := cr.orderDispatchLaneStatus()
+	addOrderDispatchAgeFields(orderFields, orderAt, orderRan)
+	recordPhase(TraceSiteOrderDispatch, "dispatch_orders", phaseStart, orderFields)
 	if ctx.Err() != nil {
 		return
 	}
@@ -1483,11 +1502,29 @@ func (cr *CityRuntime) tick(
 	tickCompleted = true
 }
 
+// dispatchOrders runs the order-dispatch pass: rescan-if-due, tracking
+// watchdogs, and the live dispatcher's own dispatch. It is called from the
+// order-dispatch lane's own goroutine (startOrderDispatchLane), never from
+// the tick goroutine directly (#2604/#3368) — orderDispatchMu is what makes
+// that safe against a concurrent config reload rebuilding cr.od on the tick
+// goroutine (see reloadConfigTraced).
 func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
 	if ctx.Err() != nil {
 		return
 	}
+	// Preflight ManagedDolt here (not just in tick's own phase) because this
+	// function's only caller is now the independent order-dispatch lane
+	// goroutine: nothing else guarantees a ManagedDolt publish has happened
+	// before this pass touches the order-tracking store. ensureManagedDoltPublishedForTick
+	// is a cheap no-op once already published, so this costs nothing on the
+	// common steady-state path.
+	cr.ensureManagedDoltPublishedForTick()
+	if ctx.Err() != nil {
+		return
+	}
 	now := time.Now()
+	cr.orderDispatchMu.Lock()
+	defer cr.orderDispatchMu.Unlock()
 	if !cr.wispIndexMigrationApplied {
 		cr.wispIndexMigrationApplied = true
 		cr.applyWispQueryIndexes(ctx)
@@ -1499,6 +1536,73 @@ func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
 	if cr.od != nil {
 		cr.od.dispatch(ctx, cityRoot, now)
 	}
+	cr.orderDispatchLastRunAt = now
+	cr.orderDispatchRan = true
+}
+
+// orderDispatchLaneStatus reports when the order-dispatch lane last completed
+// a dispatch pass, for the tick's cheap age-only observability phase (see
+// addOrderDispatchAgeFields). Safe to call from the tick goroutine while the
+// lane goroutine is running.
+func (cr *CityRuntime) orderDispatchLaneStatus() (at time.Time, ran bool) {
+	cr.orderDispatchMu.Lock()
+	defer cr.orderDispatchMu.Unlock()
+	return cr.orderDispatchLastRunAt, cr.orderDispatchRan
+}
+
+// startOrderDispatchLane runs order dispatch on its own goroutine, decoupled
+// from the tick (#2604) and from the FS-pressure skip gate (#3368): a
+// slow/blocking order exec can no longer delay session-reconcile phases, and
+// pressure-shedding on the tick can no longer suppress order liveness
+// indefinitely. It fires once immediately — covering what used to be the
+// synchronous startup-orders call — then on its own ticker for the life of
+// ctx. Modeled on the reload-accept goroutine above: wrapped in cr.safeTick
+// for panic recovery, and the returned channel closes when the goroutine
+// exits so the caller can join it (with a defer registered after
+// `defer cr.shutdown()`) before shutdown drains the order dispatchers.
+func (cr *CityRuntime) startOrderDispatchLane(ctx context.Context, cityRoot string) <-chan struct{} {
+	interval := cr.cfg.Daemon.PatrolIntervalDuration()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runOnce := func() {
+			cr.safeTick(func() {
+				cr.dispatchOrders(ctx, cityRoot)
+			}, "order-dispatch")
+		}
+		runOnce()
+		if ctx.Err() != nil {
+			return
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				runOnce()
+			}
+		}
+	}()
+	return done
+}
+
+// addOrderDispatchAgeFields records the order-dispatch lane's age on the tick
+// record that consumes it.
+//
+// The lane runs on its own background goroutine (startOrderDispatchLane), so
+// the tick is the only place its liveness is observable from the trace: `gc
+// trace` answers "when did order dispatch last run" without an operator
+// having to find the log line. "Never ran" is reported as a distinct value
+// from a fresh run, mirroring addBackstopAgeFields.
+func addOrderDispatchAgeFields(fields map[string]any, at time.Time, ran bool) {
+	if !ran {
+		fields["order_dispatch_ran"] = false
+		return
+	}
+	fields["order_dispatch_ran"] = true
+	fields["order_dispatch_age_seconds"] = int(time.Since(at).Round(time.Second) / time.Second)
 }
 
 func (cr *CityRuntime) rescanOrderDispatcherIfDue(ctx context.Context, cityRoot string, now time.Time) {
@@ -1508,7 +1612,13 @@ func (cr *CityRuntime) rescanOrderDispatcherIfDue(ctx context.Context, cityRoot 
 	if !cr.orderRescanLast.IsZero() && now.Sub(cr.orderRescanLast) < orderRescanInterval {
 		return
 	}
-	if _, _, err := cr.rescanOrderDispatcher(ctx, cityRoot, cr.cfg, "gc patrol: order scan", now); err != nil {
+	// cr.cfg is reassigned wholesale by a reload on the tick goroutine
+	// (reloadConfigTraced) while this may run on the order-dispatch lane
+	// goroutine; snapshot it under the same mutex the reload write uses.
+	cr.serviceStateMu.RLock()
+	cfg := cr.cfg
+	cr.serviceStateMu.RUnlock()
+	if _, _, err := cr.rescanOrderDispatcher(ctx, cityRoot, cfg, "gc patrol: order scan", now); err != nil {
 		cr.orderRescanLast = now
 		logDispatchError(cr.stderr, "%s: order rescan: %v", cr.logPrefix, err)
 	}
@@ -1665,10 +1775,14 @@ func (cr *CityRuntime) runOrderTrackingRetentionWatchdog(now time.Time) {
 	}
 	cr.orderTrackingRetentionWatchdogLast = now
 
+	cr.serviceStateMu.RLock()
+	cfg := cr.cfg
+	cr.serviceStateMu.RUnlock()
+
 	// The cityPath guard is a test affordance: real controllers always set it,
 	// so the backup-age check below always runs in production.
 	if cr.cityPath != "" {
-		if safe, reason := doctor.BulkDeleteSafe(cr.cityPath, cr.cfg, bulkDeleteMaxAge(cr.cfg), now); !safe {
+		if safe, reason := doctor.BulkDeleteSafe(cr.cityPath, cfg, bulkDeleteMaxAge(cfg), now); !safe {
 			if cr.stderr != nil {
 				fmt.Fprintf(cr.stderr, "%s: order-tracking retention watchdog: skipping bulk delete — %s\n", cr.logPrefix, reason) //nolint:errcheck // best-effort stderr
 			}
@@ -1685,7 +1799,7 @@ func (cr *CityRuntime) runOrderTrackingRetentionWatchdog(now time.Time) {
 		return
 	}
 
-	policy := orderTrackingRetentionPolicyForConfig(cr.cfg)
+	policy := orderTrackingRetentionPolicyForConfig(cfg)
 	deleted, sweepErr := sweepClosedOrderTrackingRetentionAcrossStoresBounded(
 		stores, now, policy, nil, orderTrackingRetentionWatchdogDeleteBudget)
 	if err := errors.Join(storeErr, sweepErr); err != nil && cr.stderr != nil {
@@ -1786,7 +1900,10 @@ func (cr *CityRuntime) runNudgeMailSweepWatchdog(now time.Time) {
 }
 
 func (cr *CityRuntime) orderTrackingSweepStores() ([]beads.Store, []orderTrackingSweepTarget, func(), error) { //nolint:unparam // targets slice returned for callers that need sweep scope metadata; current call sites discard it
-	targets := orderTrackingSweepTargetsForConfig(cr.cityPath, cr.cfg)
+	cr.serviceStateMu.RLock()
+	cfg := cr.cfg
+	cr.serviceStateMu.RUnlock()
+	targets := orderTrackingSweepTargetsForConfig(cr.cityPath, cfg)
 	rigStores := cr.rigBeadStores()
 	var freshlyOpened []beads.Store
 	stores, err := orderTrackingSweepStoresFromTargets(targets, func(sweepTarget orderTrackingSweepTarget) (beads.Store, error) {
@@ -2230,17 +2347,27 @@ func (cr *CityRuntime) reloadConfigTraced(
 	// and drained again during shutdown.
 	// Deriving from ctx (the tick ctx) lets a shutdown racing with reload
 	// short-circuit the drain instead of waiting the full 1s.
+	//
+	// The order-dispatch lane (#2604/#3368) calls dispatchOrders — which can
+	// itself rescan and replace cr.od — from its own goroutine, concurrently
+	// with this reload running on the tick goroutine. orderDispatchMu
+	// serializes both sides against cr.od/retiredOrderDispatchers/orderSet/
+	// orderSetSignature/orderRescanLast; it is held across the drain-then-
+	// replace sequence below (not just the final field writes) because the
+	// drain reads cr.od too.
+	nextOD, orderSnapshot := buildOrderDispatcherWithSnapshot(cr.storageRoutes, cityRoot, nextCfg, cr.rec, cr.stderr, "gc reload: order scan")
+	cr.orderDispatchMu.Lock()
 	if cr.od != nil {
 		drainCtx, drainCancel := context.WithTimeout(ctx, reloadOrderDrainTimeout)
 		cr.drainOutgoingOrderDispatcher(drainCtx, cr.od)
 		drainCancel()
 	}
-	nextOD, orderSnapshot := buildOrderDispatcherWithSnapshot(cr.storageRoutes, cityRoot, nextCfg, cr.rec, cr.stderr, "gc reload: order scan")
 	orderSummary := orderSetChangeSummary(cr.orderSet, orderSnapshot.Orders)
 	cr.replaceOrderDispatcher(nextOD)
 	cr.orderSet = orderSnapshot.Orders
 	cr.orderSetSignature = orderSnapshot.Signature
 	cr.orderRescanLast = time.Now()
+	cr.orderDispatchMu.Unlock()
 	if orderSummary != "unchanged" {
 		fmt.Fprintf(cr.stderr, "%s: orders reloaded: %s\n", cr.logPrefix, orderSummary) //nolint:errcheck // best-effort stderr
 	}

@@ -1056,7 +1056,14 @@ func TestCityRuntimeTickPreflightsManagedDoltBeforeSessionSnapshot(t *testing.T)
 	}
 }
 
-func TestCityRuntimeTickPreflightsManagedDoltBeforeDueOrderDispatch(t *testing.T) {
+func TestOrderDispatchPreflightsManagedDoltBeforeDueOrderDispatch(t *testing.T) {
+	// dispatchOrders now runs exclusively on the order-dispatch lane
+	// goroutine (startOrderDispatchLane), decoupled from tick (#2604/#3368),
+	// so it must own the "preflight before store work" invariant itself —
+	// nothing about tick() guarantees ordering relative to the lane anymore.
+	// This replaces the old TestCityRuntimeTickPreflightsManagedDoltBeforeDueOrderDispatch,
+	// which asserted the invariant via cr.tick() back when tick() dispatched
+	// orders synchronously.
 	disableManagedDoltRecoveryForTest(t)
 	t.Setenv("GC_BEADS", "bd")
 
@@ -1099,10 +1106,7 @@ func TestCityRuntimeTickPreflightsManagedDoltBeforeDueOrderDispatch(t *testing.T
 	cs.cityBeadStore = store
 	cr.setControllerState(cs)
 
-	dirty := &atomic.Bool{}
-	lastProviderName := ""
-	prevPoolRunning := map[string]bool{}
-	cr.tick(context.Background(), dirty, &lastProviderName, cr.cityPath, &prevPoolRunning, "patrol")
+	cr.dispatchOrders(context.Background(), cr.cityPath)
 
 	preflightIndex := orderEvents.index("preflight")
 	orderListIndex := orderEvents.index("order-list")
@@ -1547,7 +1551,13 @@ func (b *blockingOrderDispatcher) drainContextErrors() []error {
 	return append([]error(nil), b.ctxErrs...)
 }
 
-func TestCityRuntimeTickDispatchesOrdersBeforeDemandSnapshot(t *testing.T) {
+// TestCityRuntimeTickDoesNotDispatchOrdersDirectly pins the #2604/#3368
+// contract: order dispatch runs on its own lane goroutine
+// (startOrderDispatchLane), never on the tick itself, so a slow/blocking
+// order exec cannot delay the demand snapshot build. This replaces the old
+// "tick dispatches orders before the demand snapshot" contract, which is
+// exactly the synchronous coupling the lane removes.
+func TestCityRuntimeTickDoesNotDispatchOrdersDirectly(t *testing.T) {
 	store := beads.NewMemStore()
 	od := &recordingOrderDispatcher{}
 	cr := &CityRuntime{
@@ -1560,10 +1570,9 @@ func TestCityRuntimeTickDispatchesOrdersBeforeDemandSnapshot(t *testing.T) {
 		stdout:              io.Discard,
 		stderr:              io.Discard,
 	}
+	var buildRan bool
 	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
-		if !od.called.Load() {
-			t.Fatal("order dispatch should happen before demand snapshot build")
-		}
+		buildRan = true
 		return DesiredStateResult{State: map[string]TemplateParams{}}
 	}
 
@@ -1572,8 +1581,11 @@ func TestCityRuntimeTickDispatchesOrdersBeforeDemandSnapshot(t *testing.T) {
 	var prevPoolRunning map[string]bool
 	cr.tick(context.Background(), &dirty, &lastProviderName, cr.cityPath, &prevPoolRunning, "patrol")
 
-	if !od.called.Load() {
-		t.Fatal("order dispatcher was not called")
+	if od.called.Load() {
+		t.Fatal("tick must not dispatch orders directly; dispatch belongs to the order-dispatch lane")
+	}
+	if !buildRan {
+		t.Fatal("demand snapshot build should still run")
 	}
 }
 
@@ -1723,40 +1735,13 @@ func TestCityRuntimeTickReturnsBeforeDemandWhenCanceled(t *testing.T) {
 	}
 }
 
-func TestCityRuntimeTickReturnsBeforeDemandWhenCanceledDuringOrderDispatch(t *testing.T) {
-	store := beads.NewMemStore()
-	ctx, cancel := context.WithCancel(context.Background())
-	od := &recordingOrderDispatcher{
-		onDispatch: func(context.Context, string, time.Time) {
-			cancel()
-		},
-	}
-	cr := &CityRuntime{
-		cityName:            "test-city",
-		cityPath:            t.TempDir(),
-		cfg:                 &config.City{Workspace: config.Workspace{Name: "test-city"}},
-		sp:                  runtime.NewFake(),
-		standaloneCityStore: store,
-		od:                  od,
-		stdout:              io.Discard,
-		stderr:              io.Discard,
-	}
-	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
-		t.Fatal("demand snapshot should not run after order dispatch cancels the city context")
-		return DesiredStateResult{State: map[string]TemplateParams{}}
-	}
-
-	var dirty atomic.Bool
-	var lastProviderName string
-	var prevPoolRunning map[string]bool
-	cr.tick(ctx, &dirty, &lastProviderName, cr.cityPath, &prevPoolRunning, "patrol")
-
-	if !od.called.Load() {
-		t.Fatal("order dispatcher was not called")
-	}
-}
-
-func TestCityRuntimeRunDispatchesOrdersBeforeStartupReconcile(t *testing.T) {
+// TestCityRuntimeRunStartupReconcileNotBlockedByOrderDispatch is the #2604
+// regression test. Order dispatch used to run synchronously before startup
+// session reconciliation, so a slow/blocking order exec (subprocess spawn,
+// exec order) delayed BuildFn indefinitely. The order-dispatch lane
+// decouples the two: BuildFn must run even while a dispatch call is still
+// blocked in flight.
+func TestCityRuntimeRunStartupReconcileNotBlockedByOrderDispatch(t *testing.T) {
 	cityPath := t.TempDir()
 	tomlPath := filepath.Join(cityPath, "city.toml")
 	writeCityRuntimeConfig(t, tomlPath, "fake")
@@ -1766,52 +1751,70 @@ func TestCityRuntimeRunDispatchesOrdersBeforeStartupReconcile(t *testing.T) {
 		t.Fatalf("load config: %v", err)
 	}
 	sp := runtime.NewFake()
-	od := &recordingOrderDispatcher{}
+
+	dispatchStarted := make(chan struct{})
+	var dispatchStartedOnce sync.Once
+	release := make(chan struct{})
+	od := &recordingOrderDispatcher{
+		onDispatch: func(ctx context.Context, _ string, _ time.Time) {
+			dispatchStartedOnce.Do(func() { close(dispatchStarted) })
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		},
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var started atomic.Bool
-	cr, runtimeErr := newCityRuntime(CityRuntimeParams{
+	buildRan := make(chan struct{})
+	var buildRanOnce sync.Once
+	cr := newTestCityRuntime(t, CityRuntimeParams{
 		CityPath: cityPath,
 		CityName: "test-city",
 		TomlPath: tomlPath,
 		Cfg:      cfg,
 		SP:       sp,
 		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
-			if !od.called.Load() {
-				t.Fatal("order dispatch should happen before startup reconcile")
-			}
+			buildRanOnce.Do(func() { close(buildRan) })
 			return DesiredStateResult{State: map[string]TemplateParams{}}
 		},
-		Dops: newDrainOps(sp),
-		Rec:  events.Discard,
-		OnStarted: func() {
-			started.Store(true)
-			cancel()
-		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
 		Stdout: io.Discard,
 		Stderr: io.Discard,
 	})
-	if runtimeErr != nil {
-		t.Fatalf("building the city runtime: %v", runtimeErr)
-	}
 	cr.od = od
 
 	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
 	cs.cityBeadStore = beads.NewMemStore()
 	cr.setControllerState(cs)
 
-	cr.run(ctx)
+	done := make(chan struct{})
+	go func() {
+		cr.run(ctx)
+		close(done)
+	}()
 
-	if !started.Load() {
-		t.Fatal("OnStarted was not called")
-	}
-	if got := od.calls.Load(); got != 1 {
-		t.Fatalf("order dispatch calls = %d, want 1", got)
+	awaitClose(t, dispatchStarted, "order dispatch starting")
+	awaitClose(t, buildRan, "startup reconcile (BuildFn) running while order dispatch is still blocked")
+
+	close(release)
+	cancel()
+	awaitClose(t, done, "run returning after cancel")
+
+	if got := od.calls.Load(); got < 1 {
+		t.Fatalf("order dispatch calls = %d, want at least 1", got)
 	}
 }
 
+// TestCityRuntimeRunStartupOrderDispatchPanicIsRecovered pins that a panic
+// inside the order-dispatch lane's own dispatch call is recovered without
+// tearing down the controller. Because the lane now runs on its own
+// goroutine (#2604/#3368), the dispatch itself signals its own completion
+// via the dispatched channel instead of relying on OnStarted's cancel, which
+// could otherwise race ahead of (or behind) the lane's first dispatch.
 func TestCityRuntimeRunStartupOrderDispatchPanicIsRecovered(t *testing.T) {
 	cityPath := t.TempDir()
 	tomlPath := filepath.Join(cityPath, "city.toml")
@@ -1822,8 +1825,12 @@ func TestCityRuntimeRunStartupOrderDispatchPanicIsRecovered(t *testing.T) {
 		t.Fatalf("load config: %v", err)
 	}
 	sp := runtime.NewFake()
+
+	dispatched := make(chan struct{})
+	var dispatchedOnce sync.Once
 	od := &recordingOrderDispatcher{
 		onDispatch: func(context.Context, string, time.Time) {
+			dispatchedOnce.Do(func() { close(dispatched) })
 			panic("startup order boom")
 		},
 	}
@@ -1831,9 +1838,9 @@ func TestCityRuntimeRunStartupOrderDispatchPanicIsRecovered(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var stderr bytes.Buffer
+	var stderr lockedBuffer
 	var started atomic.Bool
-	cr, runtimeErr := newCityRuntime(CityRuntimeParams{
+	cr := newTestCityRuntime(t, CityRuntimeParams{
 		CityPath: cityPath,
 		CityName: "test-city",
 		TomlPath: tomlPath,
@@ -1846,30 +1853,36 @@ func TestCityRuntimeRunStartupOrderDispatchPanicIsRecovered(t *testing.T) {
 		Rec:  events.Discard,
 		OnStarted: func() {
 			started.Store(true)
-			cancel()
 		},
 		Stdout: io.Discard,
 		Stderr: &stderr,
 	})
-	if runtimeErr != nil {
-		t.Fatalf("building the city runtime: %v", runtimeErr)
-	}
 	cr.od = od
 
 	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
 	cs.cityBeadStore = beads.NewMemStore()
 	cr.setControllerState(cs)
 
-	cr.run(ctx)
+	done := make(chan struct{})
+	go func() {
+		cr.run(ctx)
+		close(done)
+	}()
 
-	if !started.Load() {
-		t.Fatal("OnStarted was not called after recovered startup order panic")
+	// The lane runs concurrently with startup, so wait for its first
+	// (panicking) dispatch directly instead of inferring it from OnStarted's
+	// timing.
+	awaitClose(t, dispatched, "order dispatch panicking")
+	awaitCond(t, started.Load, "OnStarted running despite the recovered order-dispatch panic")
+
+	cancel()
+	awaitClose(t, done, "run returning after cancel")
+
+	if got := od.calls.Load(); got < 1 {
+		t.Fatalf("order dispatch calls = %d, want at least 1", got)
 	}
-	if got := od.calls.Load(); got != 1 {
-		t.Fatalf("order dispatch calls = %d, want 1", got)
-	}
-	if !strings.Contains(stderr.String(), "trigger=startup-orders") {
-		t.Fatalf("stderr = %q, want startup-orders panic trigger", stderr.String())
+	if !strings.Contains(stderr.String(), "trigger=order-dispatch") {
+		t.Fatalf("stderr = %q, want order-dispatch panic trigger", stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "startup order boom") {
 		t.Fatalf("stderr = %q, want recovered panic detail", stderr.String())
@@ -5443,15 +5456,13 @@ func TestCityRuntimeManualHardReloadRepliesBeforeDispatch(t *testing.T) {
 	sp := runtime.NewFake()
 	var stdout bytes.Buffer
 
-	// recordingOrderDispatcher is a pure in-process fake (no order subprocesses),
-	// so it carries none of the tempdir-cleanup races the real dispatcher would.
-	od := &recordingOrderDispatcher{
-		onDispatch: func(context.Context, string, time.Time) {
-			if len(doneCh) == 0 {
-				t.Error("dispatchOrders ran before the manual hard-reload reply was sent (#3206)")
-			}
-		},
-	}
+	// Order dispatch is no longer reachable from tick() at all (it runs on
+	// its own lane, startOrderDispatchLane, decoupled from tick per
+	// #2604/#3368), so there is nothing left to assert about dispatch
+	// ordering relative to tick()'s reload reply here. This test now covers
+	// only the remaining #3206 invariant that still applies to tick(): the
+	// manual hard-reload reply is not held hostage by the desired-state
+	// rebuild.
 	cr := newTestCityRuntime(t, CityRuntimeParams{
 		CityPath:    cityPath,
 		CityName:    "test-city",
@@ -5471,16 +5482,12 @@ func TestCityRuntimeManualHardReloadRepliesBeforeDispatch(t *testing.T) {
 		Stdout: &stdout,
 		Stderr: io.Discard,
 	})
-	cr.od = od
 	cr.activeReload = &reloadRequest{doneCh: doneCh} // hard reload (soft=false)
 	lastProviderName := "fake"
 	var prevPoolRunning map[string]bool
 
 	cr.tick(context.Background(), dirty, &lastProviderName, cityPath, &prevPoolRunning, "poke")
 
-	if !od.called.Load() {
-		t.Fatal("order dispatcher was not called")
-	}
 	select {
 	case reply := <-doneCh:
 		if reply.Outcome != reloadOutcomeNoChange {
@@ -6952,7 +6959,11 @@ func TestCityRuntimeRunEmitsStartupPhaseTimingLogs(t *testing.T) {
 	cr.run(ctx)
 
 	out := stderr.w.(*bytes.Buffer).String()
-	wantPhases := []string{"adoption-barrier", "config-reload", "startup-orders", "startup", "convergence-startup"}
+	// startup-orders is intentionally absent: order dispatch now runs on its
+	// own unbounded background lane (startOrderDispatchLane, #2604/#3368)
+	// rather than as a bounded synchronous startup phase, so there is no
+	// single "elapsed" duration to log for it anymore.
+	wantPhases := []string{"adoption-barrier", "config-reload", "startup", "convergence-startup"}
 	for _, phase := range wantPhases {
 		marker := "startup phase=" + phase + " elapsed="
 		if !strings.Contains(out, marker) {

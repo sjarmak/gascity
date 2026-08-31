@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
@@ -375,6 +376,97 @@ func TestCityRuntimeTickSkipsDueOrderDispatchUnderFSPressure(t *testing.T) {
 	}
 	if payload.Outcome != fsPressureOutcomeSkipped {
 		t.Fatalf("payload outcome = %q, want %q", payload.Outcome, fsPressureOutcomeSkipped)
+	}
+}
+
+// TestOrderDispatchLaneRunsDespiteFSPressure is the #3368 regression test.
+// shouldSkipTickForFSPressure gates the tick itself, and order dispatch used
+// to run inline on the tick — so sustained FS pressure silently suppressed
+// due order work indefinitely, exactly as
+// TestCityRuntimeTickSkipsDueOrderDispatchUnderFSPressure above still shows
+// for the tick. The order-dispatch lane (startOrderDispatchLane) never calls
+// shouldSkipTickForFSPressure, so it keeps firing due orders on the very
+// same CityRuntime even while the tick is skipping.
+func TestOrderDispatchLaneRunsDespiteFSPressure(t *testing.T) {
+	withFakePressureFile(t, []byte(samplePressureHigh), nil)
+	t.Setenv(fsPressureThresholdEnv, "")
+
+	store := beads.NewMemStore()
+	releaseExec := make(chan struct{})
+	execStarted := make(chan struct{}, 1)
+	fakeExec := func(ctx context.Context, _, _ string, _ []string) ([]byte, error) {
+		select {
+		case execStarted <- struct{}{}:
+		default:
+		}
+		select {
+		case <-releaseExec:
+			return []byte("ok\n"), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	ad := buildOrderDispatcherFromListExec(
+		[]orders.Order{{Name: "pressure-due", Trigger: "cooldown", Interval: "1s", Exec: "scripts/noop.sh"}},
+		store, nil, fakeExec, nil,
+	)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	if mad, ok := ad.(*memoryOrderDispatcher); ok {
+		t.Cleanup(mad.cancel)
+	}
+
+	var buildCalls atomic.Int32
+	var stderr bytes.Buffer
+	sp := runtime.NewFake()
+	cr := &CityRuntime{
+		cityPath:            t.TempDir(),
+		cityName:            "test-city",
+		cfg:                 &config.City{Workspace: config.Workspace{Name: "test-city"}},
+		sp:                  sp,
+		standaloneCityStore: store,
+		buildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			buildCalls.Add(1)
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		dops:          newDrainOps(sp),
+		od:            ad,
+		rec:           events.NewFake(),
+		sessionDrains: newDrainTracker(),
+		logPrefix:     "gc test",
+		stdout:        io.Discard,
+		stderr:        &stderr,
+	}
+
+	// A tick on this exact CityRuntime still skips: confirms the pressure
+	// condition genuinely applies here, matching
+	// TestCityRuntimeTickSkipsDueOrderDispatchUnderFSPressure.
+	dirty := &atomic.Bool{}
+	lastProviderName := ""
+	prevPoolRunning := map[string]bool{}
+	cr.tick(context.Background(), dirty, &lastProviderName, cr.cityPath, &prevPoolRunning, "patrol")
+	if got := buildCalls.Load(); got != 0 {
+		t.Fatalf("build desired calls = %d, want 0: the tick itself should still skip under pressure", got)
+	}
+
+	// But the order-dispatch lane, running independently of the tick, still
+	// fires the due order.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := cr.startOrderDispatchLane(ctx, cr.cityPath)
+
+	select {
+	case <-execStarted:
+	case <-time.After(time.Second):
+		t.Fatal("order exec did not start despite the lane bypassing the FS-pressure gate")
+	}
+
+	close(releaseExec)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("order-dispatch lane did not exit after ctx cancellation")
 	}
 }
 
