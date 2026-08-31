@@ -41,7 +41,6 @@ func TestSessionEventsLive(t *testing.T) {
 
 	const session = "gctest-events-live"
 	p := New(session, t.TempDir(), t.TempDir(), 0, 0)
-	skipOnDetectionBasedRegistry(t, p)
 	_ = p.c.stopServer() // clear any leftover server from a crashed prior run
 	t.Cleanup(func() { _ = p.TeardownServer() })
 	if err := p.ConfigureServer(); err != nil {

@@ -172,8 +172,22 @@ func (p *Provider) clearPaneBinding(name string) {
 // binding (a stored name and pane id), for ListRunning to merge with herdr's
 // registry — which never sees raw shell sessions.
 func (p *Provider) boundSessionNames() []string {
-	names := make([]string, 0, len(p.boundPaneBindings()))
-	for _, name := range p.boundPaneBindings() {
+	entries, err := os.ReadDir(p.metaDir)
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name, err := readMetaFile(filepath.Join(p.metaDir, e.Name(), sanitize(metaBoundName)))
+		if err != nil || name == "" {
+			continue
+		}
+		if pane, err := readMetaFile(filepath.Join(p.metaDir, e.Name(), sanitize(metaBoundPane))); err != nil || pane == "" {
+			continue
+		}
 		names = append(names, name)
 	}
 	return names
@@ -189,6 +203,11 @@ func (p *Provider) boundSessionNames() []string {
 // sidecar's persisted metaBoundName also sidesteps herdrAgentName's lossy
 // mapping (lowercased, length-capped): the registry's a.Name is the herdr
 // label, not the gc session name, and the two only coincide by chance.
+//
+// Keyed by pane id, so two sessions sharing one pane (a stale binding not
+// yet cleared after a rebind) collapse to the survivor rather than both
+// appearing — callers that need every bound name regardless of pane
+// collisions want boundSessionNames instead.
 func (p *Provider) boundPaneBindings() map[string]string {
 	entries, err := os.ReadDir(p.metaDir)
 	if err != nil {
