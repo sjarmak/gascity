@@ -1783,14 +1783,16 @@ func (cr *CityRuntime) rescanOrderDispatcherIfDue(ctx context.Context, cityRoot 
 	}
 	// cr.cfg is reassigned wholesale by a reload on the tick goroutine
 	// (reloadConfigTraced) while this may run on the order-dispatch lane
-	// goroutine; snapshot cfg and its paired orderDispatchConfigVersion
-	// together under the same mutex the reload write uses, so the two can
-	// never come from different reloads.
+	// goroutine; a snapshot taken here would only be used for the disk scan
+	// below, not for whatever actually gets rebuilt — applyOrderSetSnapshotLocked
+	// re-reads cr.cfg/orderDispatchConfigVersion fresh at the moment it
+	// decides to rebuild, so a scan that started against an old cfg can never
+	// bake stale config into a rebuild it triggers (#2604/#3368 review
+	// followup, fifth pass).
 	cr.serviceStateMu.RLock()
 	cfg := cr.cfg
-	cfgVersion := cr.orderDispatchConfigVersion
 	cr.serviceStateMu.RUnlock()
-	if _, err := cr.rescanOrderDispatcher(ctx, cityRoot, cfg, cfgVersion, "gc patrol: order scan", now); err != nil {
+	if _, err := cr.rescanOrderDispatcher(ctx, cityRoot, cfg, "gc patrol: order scan", now); err != nil {
 		cr.orderDispatchMu.Lock()
 		cr.orderRescanLast = now
 		cr.orderDispatchMu.Unlock()
@@ -1818,10 +1820,10 @@ func (cr *CityRuntime) replaceOrderDispatcher(next orderDispatcher) {
 // drains and replaces the active dispatcher. Called only from the
 // order-dispatch lane's own goroutine (via rescanOrderDispatcherIfDue), so
 // it blocks acquiring orderDispatchMu — the lane is not latency-sensitive,
-// unlike config reload (see rescanOrderDispatcherForReload). cfgVersion is
-// the orderDispatchConfigVersion paired with cfg by the caller (captured
-// under the same serviceStateMu critical section as cfg itself).
-func (cr *CityRuntime) rescanOrderDispatcher(ctx context.Context, cityRoot string, cfg *config.City, cfgVersion uint64, cmdName string, now time.Time) (bool, error) {
+// unlike config reload (see rescanOrderDispatcherForReload). cfg is used
+// only for this scan's disk read; applyOrderSetSnapshotLocked re-reads
+// cr.cfg fresh for whatever it actually rebuilds.
+func (cr *CityRuntime) rescanOrderDispatcher(ctx context.Context, cityRoot string, cfg *config.City, cmdName string, now time.Time) (bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1832,7 +1834,7 @@ func (cr *CityRuntime) rescanOrderDispatcher(ctx context.Context, cityRoot strin
 	}
 	cr.orderDispatchMu.Lock()
 	defer cr.orderDispatchMu.Unlock()
-	changed, _ := cr.applyOrderSetSnapshotLocked(ctx, cityRoot, cfg, snapshot, seq, cfgVersion, now)
+	changed, _ := cr.applyOrderSetSnapshotLocked(ctx, cityRoot, snapshot, seq, now)
 	return changed, nil
 }
 
@@ -1842,9 +1844,10 @@ func (cr *CityRuntime) rescanOrderDispatcher(ctx context.Context, cityRoot strin
 // blocking indefinitely behind a slow order-dispatch-lane pass
 // (#2604/#3368). A timed-out acquire skips this reload's order-set refresh;
 // cr.cfg is unaffected, so the lane's own next scheduled pass re-scans it
-// and converges independently. cfgVersion is the orderDispatchConfigVersion
-// paired with cfg by the caller.
-func (cr *CityRuntime) rescanOrderDispatcherForReload(ctx context.Context, cityRoot string, cfg *config.City, cfgVersion uint64, cmdName string, now time.Time) (bool, string, error) {
+// and converges independently. cfg is used only for this scan's disk read;
+// applyOrderSetSnapshotLocked re-reads cr.cfg fresh for whatever it actually
+// rebuilds.
+func (cr *CityRuntime) rescanOrderDispatcherForReload(ctx context.Context, cityRoot string, cfg *config.City, cmdName string, now time.Time) (bool, string, error) {
 	seq := cr.orderScanSeqCounter.Add(1)
 	snapshot, err := scanOrderSetSnapshotFS(fsys.OSFS{}, cityRoot, cfg, cr.stderr, cmdName)
 	if err != nil {
@@ -1855,21 +1858,38 @@ func (cr *CityRuntime) rescanOrderDispatcherForReload(ctx context.Context, cityR
 		return false, "order-dispatch-busy", nil
 	}
 	defer cr.orderDispatchMu.Unlock()
-	changed, summary := cr.applyOrderSetSnapshotLocked(ctx, cityRoot, cfg, snapshot, seq, cfgVersion, now)
+	changed, summary := cr.applyOrderSetSnapshotLocked(ctx, cityRoot, snapshot, seq, now)
 	return changed, summary, nil
 }
 
 // applyOrderSetSnapshotLocked installs snapshot as the active order set,
-// draining and replacing cr.od if the set's signature changed or cfgVersion
-// is newer than orderDispatchAppliedConfigVersion (a config-only change that
-// orderSetSignature cannot see — see orderDispatchConfigVersion). seq is this
+// draining and replacing cr.od if the set's signature changed or the live
+// orderDispatchConfigVersion is newer than orderDispatchAppliedConfigVersion
+// (a config-only change that orderSetSignature cannot see). seq is this
 // scan's orderScanSeqCounter value, taken before the FS scan ran unlocked; a
 // seq at or below orderSetAppliedSeq means a fresher scan already applied its
 // result while this one was in flight, so it is dropped rather than
 // reverting that newer state — and orderRescanLast is left untouched too, so
 // a discarded scan cannot delay the next legitimate one. Callers must hold
 // orderDispatchMu.
-func (cr *CityRuntime) applyOrderSetSnapshotLocked(ctx context.Context, cityRoot string, cfg *config.City, snapshot orderSetSnapshot, seq uint64, cfgVersion uint64, now time.Time) (bool, string) {
+//
+// cr.cfg and cr.orderDispatchConfigVersion are read fresh here (under
+// serviceStateMu), rather than trusting a cfg/cfgVersion snapshot the caller
+// captured before its own unlocked disk scan. A caller's snapshot can be
+// arbitrarily stale by the time it acquires orderDispatchMu — a concurrent
+// reload may have already installed a newer cr.cfg and bumped
+// orderDispatchConfigVersion in that gap. Building from the caller's stale
+// cfg here would still work correctly for a rebuild the caller's own
+// (fresher) cfgVersion triggered, but a rebuild triggered instead by an
+// unrelated order-set signature change would then silently bake the OLD cfg
+// into cr.od while the max-clamp below (seeing the caller's old cfgVersion is
+// not newer than what a concurrent winner already recorded) correctly
+// declines to advance orderDispatchAppliedConfigVersion — leaving it stuck
+// claiming the newer config is applied when cr.od actually holds the old one,
+// permanently and undetectably (#2604/#3368 review followup, fifth pass).
+// Reading live state here instead means whatever gets built and whatever
+// version gets recorded always agree.
+func (cr *CityRuntime) applyOrderSetSnapshotLocked(ctx context.Context, cityRoot string, snapshot orderSetSnapshot, seq uint64, now time.Time) (bool, string) {
 	if seq != 0 && seq <= cr.orderSetAppliedSeq {
 		return false, "stale-scan"
 	}
@@ -1877,6 +1897,10 @@ func (cr *CityRuntime) applyOrderSetSnapshotLocked(ctx context.Context, cityRoot
 	if seq != 0 {
 		cr.orderSetAppliedSeq = seq
 	}
+	cr.serviceStateMu.RLock()
+	cfg := cr.cfg
+	cfgVersion := cr.orderDispatchConfigVersion
+	cr.serviceStateMu.RUnlock()
 	needsConfigRebuild := cfgVersion > cr.orderDispatchAppliedConfigVersion
 	if snapshot.Signature == cr.orderSetSignature && !needsConfigRebuild {
 		return false, "unchanged"
@@ -1892,12 +1916,9 @@ func (cr *CityRuntime) applyOrderSetSnapshotLocked(ctx context.Context, cityRoot
 	cr.orderSet = snapshot.Orders
 	cr.orderSetSignature = snapshot.Signature
 	// Record the config version actually baked into cr.od via this rebuild.
-	// Max-clamp (never move backward): a concurrent winner using a higher
-	// cfgVersion could already have advanced this field past ours while this
-	// call was still building its own dispatcher, and this call's cfg is no
-	// fresher than that — moving backward would make a still-owed gap a
-	// fresher rebuild already closed look pending again (#2604/#3368 review
-	// followup).
+	// Max-clamp (never move backward): cfg/cfgVersion above are the live pair
+	// read moments ago under serviceStateMu, so this can only ever match or
+	// exceed what is currently recorded — never move it backward.
 	if cfgVersion > cr.orderDispatchAppliedConfigVersion {
 		cr.orderDispatchAppliedConfigVersion = cfgVersion
 	}
@@ -2342,14 +2363,15 @@ func (cr *CityRuntime) reloadConfigTraced(
 		appendWarning(warning)
 	}
 	if cr.configRev != "" && result.Revision == cr.configRev {
-		// result.Cfg is content-equivalent to cr.cfg on this unchanged-revision
-		// path (no new cr.cfg install happens below), so the current
-		// orderDispatchConfigVersion is its paired version; read it fresh
-		// under serviceStateMu rather than assuming no concurrent writer.
-		cr.serviceStateMu.RLock()
-		cfgVersion := cr.orderDispatchConfigVersion
-		cr.serviceStateMu.RUnlock()
-		ordersChanged, orderSummary, orderErr := cr.rescanOrderDispatcherForReload(ctx, cityRoot, result.Cfg, cfgVersion, "gc reload: order scan", time.Now())
+		// result.Cfg is used only for this scan's disk read below; it is NOT
+		// assumed content-equivalent to cr.cfg despite the matching
+		// Revision — config loading applies .gc/site.toml bindings outside
+		// what Revision hashes (internal/config/compose.go), so the two can
+		// differ in dispatcher-relevant fields even here. Whatever actually
+		// gets rebuilt reads cr.cfg fresh inside applyOrderSetSnapshotLocked,
+		// so that mismatch cannot leak into cr.od (#2604/#3368 review
+		// followup, fifth pass).
+		ordersChanged, orderSummary, orderErr := cr.rescanOrderDispatcherForReload(ctx, cityRoot, result.Cfg, "gc reload: order scan", time.Now())
 		if orderErr != nil {
 			err := fmt.Errorf("order reload: %w", orderErr)
 			fmt.Fprintf(cr.stderr, "%s: %v (keeping old orders)\n", cr.logPrefix, err) //nolint:errcheck // best-effort stderr
