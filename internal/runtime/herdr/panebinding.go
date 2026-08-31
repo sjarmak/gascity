@@ -137,8 +137,12 @@ func resolveBinding(ops paneLookupOps) (paneID string, running bool, err error) 
 // bindPlacement persists the placement herdr assigned this agent plus its
 // launch mode, so every later name-keyed op survives the name clear. Called
 // by Start after the agent (fresh or adopted) is up; Stop's clearMeta
-// removes it.
+// removes it. Guarded by bindMu so a concurrent clearPaneBindingIfMatches
+// snapshot-and-clear (events.go's stale-pane prune) can never race a fresh
+// bind for the same name into a lost update.
 func (p *Provider) bindPlacement(name string, info agentInfo, mode string) error {
+	p.bindMu.Lock()
+	defer p.bindMu.Unlock()
 	for key, val := range map[string]string{
 		metaBoundPane:      info.PaneID,
 		metaBoundTab:       info.TabID,
@@ -158,47 +162,114 @@ func (p *Provider) bindPlacement(name string, info agentInfo, mode string) error
 }
 
 // clearPaneBinding drops the persisted placement (not the whole sidecar — the
-// session identity keys stay for the reconciler). Idempotent.
-func (p *Provider) clearPaneBinding(name string) {
-	_ = p.RemoveMeta(name, metaBoundPane)
-	_ = p.RemoveMeta(name, metaBoundTab)
-	_ = p.RemoveMeta(name, metaBoundWorkspace)
-	_ = p.RemoveMeta(name, metaBoundMode)
-	_ = p.RemoveMeta(name, metaBoundName)
-	_ = p.RemoveMeta(name, metaBoundAt)
+// session identity keys stay for the reconciler). Idempotent. Returns the
+// aggregated failures from the RemoveMeta calls instead of discarding them:
+// a caller that cannot tell a deletion failed cannot distinguish "cleared"
+// from "silently still bound," which is what let a stuck stale binding spin
+// the event stream's reconnect loop at full speed with backoff disabled.
+func (p *Provider) clearPaneBinding(name string) error {
+	p.bindMu.Lock()
+	defer p.bindMu.Unlock()
+	return p.clearPaneBindingLocked(name)
+}
+
+// clearPaneBindingIfMatches drops the persisted placement only if it still
+// points at expectedPane, so a stale-pane rejection computed from an
+// earlier snapshot (events.go's derivedFilterSet, built at cycle start) can
+// never clear a binding a concurrent Start has since rewritten to a
+// different, live pane. The read-compare-clear is atomic against
+// bindPlacement and any other clear under bindMu.
+func (p *Provider) clearPaneBindingIfMatches(name, expectedPane string) error {
+	p.bindMu.Lock()
+	defer p.bindMu.Unlock()
+	current, err := p.GetMeta(name, metaBoundPane)
+	if err != nil {
+		return err
+	}
+	if current != expectedPane {
+		return nil // binding moved on since the snapshot; nothing stale to clear
+	}
+	return p.clearPaneBindingLocked(name)
+}
+
+// clearPaneBindingLocked is clearPaneBinding's body for callers that already
+// hold bindMu (clearPaneBindingIfMatches), avoiding recursive locking.
+func (p *Provider) clearPaneBindingLocked(name string) error {
+	return errors.Join(
+		p.RemoveMeta(name, metaBoundPane),
+		p.RemoveMeta(name, metaBoundTab),
+		p.RemoveMeta(name, metaBoundWorkspace),
+		p.RemoveMeta(name, metaBoundMode),
+		p.RemoveMeta(name, metaBoundName),
+		p.RemoveMeta(name, metaBoundAt),
+	)
 }
 
 // forEachPaneBinding walks the sidecar directory once and calls fn with each
-// live-looking binding (a stored name and pane id), for boundSessionNames and
-// boundPaneBindings to project into the shape their caller needs.
-func (p *Provider) forEachPaneBinding(fn func(pane, name string)) {
+// live-looking binding (a stored name, pane id, and bind timestamp), for
+// boundSessionNames and boundPaneBindings to project into the shape their
+// caller needs. A read failure — on the root directory, or on any
+// per-session binding file — is returned rather than silently treated as "no
+// bindings": a caller that cannot tell metadata was transiently unreadable
+// from "genuinely nothing is bound" can subscribe successfully with a pane's
+// status filter simply missing, with no signal anything went wrong. Only the
+// root directory not existing yet (no session has ever bound) is a
+// legitimate empty case.
+func (p *Provider) forEachPaneBinding(fn func(pane, name string, boundAt int64)) error {
 	entries, err := os.ReadDir(p.metaDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
-		return
+		return err
 	}
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
-		name, err := readMetaFile(filepath.Join(p.metaDir, e.Name(), sanitize(metaBoundName)))
-		if err != nil || name == "" {
+		dir := filepath.Join(p.metaDir, e.Name())
+		name, err := readMetaFile(filepath.Join(dir, sanitize(metaBoundName)))
+		if err != nil {
+			return err
+		}
+		if name == "" {
 			continue
 		}
-		pane, err := readMetaFile(filepath.Join(p.metaDir, e.Name(), sanitize(metaBoundPane)))
-		if err != nil || pane == "" {
+		pane, err := readMetaFile(filepath.Join(dir, sanitize(metaBoundPane)))
+		if err != nil {
+			return err
+		}
+		if pane == "" {
 			continue
 		}
-		fn(pane, name)
+		at, err := readMetaFile(filepath.Join(dir, sanitize(metaBoundAt)))
+		if err != nil {
+			return err
+		}
+		fn(pane, name, parseBoundAt(at))
 	}
+	return nil
+}
+
+// parseBoundAt parses a metaBoundAt value, defaulting to 0 (oldest possible)
+// on a missing or malformed timestamp — a pre-upgrade binding written before
+// this field existed always loses a pane-id collision against one that has a
+// real timestamp, rather than winning by accident of a parse failure.
+func parseBoundAt(s string) int64 {
+	at, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return at
 }
 
 // boundSessionNames enumerates the session names with a live-looking sidecar
 // binding (a stored name and pane id), for ListRunning to merge with herdr's
 // registry — which never sees raw shell sessions.
-func (p *Provider) boundSessionNames() []string {
+func (p *Provider) boundSessionNames() ([]string, error) {
 	var names []string
-	p.forEachPaneBinding(func(_, name string) { names = append(names, name) })
-	return names
+	err := p.forEachPaneBinding(func(_, name string, _ int64) { names = append(names, name) })
+	return names, err
 }
 
 // boundPaneBindings enumerates every live-looking sidecar binding as a
@@ -213,13 +284,22 @@ func (p *Provider) boundSessionNames() []string {
 // label, not the gc session name, and the two only coincide by chance.
 //
 // Keyed by pane id, so two sessions sharing one pane (a stale binding not
-// yet cleared after a rebind) collapse to the survivor rather than both
-// appearing — callers that need every bound name regardless of pane
-// collisions want boundSessionNames instead.
-func (p *Provider) boundPaneBindings() map[string]string {
+// yet cleared after a rebind) collapse to one entry. The survivor is chosen
+// by metaBoundAt recency, not directory iteration order: the most recently
+// bound session is the pane's current occupant, and an older binding on the
+// same (possibly recycled) pane id is the stale one. Callers that need every
+// bound name regardless of pane collisions want boundSessionNames instead.
+func (p *Provider) boundPaneBindings() (map[string]string, error) {
 	bindings := make(map[string]string)
-	p.forEachPaneBinding(func(pane, name string) { bindings[pane] = name })
-	return bindings
+	boundAt := make(map[string]int64)
+	err := p.forEachPaneBinding(func(pane, name string, at int64) {
+		if prevAt, ok := boundAt[pane]; ok && prevAt >= at {
+			return
+		}
+		bindings[pane] = name
+		boundAt[pane] = at
+	})
+	return bindings, err
 }
 
 // readMetaFile reads one sidecar value ("" when absent).
@@ -326,6 +406,6 @@ func (p *Provider) lookupOps(ctx context.Context, name string) paneLookupOps {
 		},
 		probePane:    func(paneID string) (paneProbe, error) { return p.probePane(ctx, paneID) },
 		reapPane:     func(paneID string) { _ = p.c.closePane(ctx, paneID) },
-		clearBinding: func() { p.clearPaneBinding(name) },
+		clearBinding: func() { _ = p.clearPaneBinding(name) },
 	}
 }

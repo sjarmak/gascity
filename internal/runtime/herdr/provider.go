@@ -35,6 +35,13 @@ type Provider struct {
 	// plus this absolute ceiling.
 	setupMaxTimeout time.Duration
 	mu              sync.Mutex // serializes workspace/tab find-or-create across concurrent Starts
+	// bindMu serializes reads and writes of the sidecar pane-binding fields
+	// (bindPlacement, clearPaneBinding, clearPaneBindingIfMatches) so a
+	// snapshot-then-clear (a stale-pane prune racing a concurrent Start for
+	// the same session) can never observe a binding mid-write nor clear one
+	// that has since moved on. Separate from mu, which serializes an
+	// unrelated concern (workspace/tab find-or-create) with its own scope.
+	bindMu sync.Mutex
 	// act is the tracker-backed activity source behind GetLastActivity /
 	// CanReportActivity (#4217); started lazily on first GetLastActivity.
 	act activityTracker
@@ -863,10 +870,14 @@ func (p *Provider) ListRunning(prefix string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	boundNames, err := p.boundSessionNames()
+	if err != nil {
+		return nil, err
+	}
 	seen := make(map[string]bool)   // gc names already listed
 	mapped := make(map[string]bool) // herdr-side names owned by bound gc sessions
 	var out []string
-	for _, name := range p.boundSessionNames() {
+	for _, name := range boundNames {
 		mapped[herdrAgentName(name)] = true
 		if !strings.HasPrefix(name, prefix) || seen[name] {
 			continue

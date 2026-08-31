@@ -2,9 +2,20 @@ package herdr
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
+
+// sidecarProvider builds a bare Provider with a private metaDir and no herdr
+// binary — for tests exercising the sidecar (SetMeta/boundPaneBindings/
+// clearPaneBinding*) directly, with no socket or process involved.
+func sidecarProvider(t *testing.T) *Provider {
+	t.Helper()
+	return New("gctest-pb", t.TempDir(), "", 0, 0)
+}
 
 // ── resolveBinding: two-tier name→pane resolution + running verdict ──────────
 //
@@ -217,6 +228,128 @@ func TestPaneRootReplaced(t *testing.T) {
 	}
 	if paneRootReplaced(100, nil) {
 		t.Error("no root visible: want not replaced")
+	}
+}
+
+// ── sidecar enumeration: recency collision resolution + error propagation ────
+
+// bindAt persists a full binding (pane, name, and an explicit metaBoundAt),
+// bypassing bindPlacement so the timestamp can be controlled directly.
+func bindAt(t *testing.T, p *Provider, session, pane string, at int64) {
+	t.Helper()
+	if err := p.SetMeta(session, metaBoundPane, pane); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SetMeta(session, metaBoundName, session); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SetMeta(session, metaBoundAt, strconv.FormatInt(at, 10)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Two sessions bound to the same (recycled) pane id must collapse to the
+// more recently bound one, not whichever directory entry iteration visits
+// first — the exact-head review's Major finding on boundPaneBindings.
+func TestBoundPaneBindingsRecencyResolvesCollision(t *testing.T) {
+	p := sidecarProvider(t)
+	bindAt(t, p, "session-old", "w3:p1", 1000)
+	bindAt(t, p, "session-new", "w3:p1", 2000)
+
+	got, err := p.boundPaneBindings()
+	if err != nil {
+		t.Fatalf("boundPaneBindings: %v", err)
+	}
+	if got["w3:p1"] != "session-new" {
+		t.Fatalf("boundPaneBindings[w3:p1] = %q, want session-new (the more recent binding)", got["w3:p1"])
+	}
+
+	// Order independence: rebuild with the more-recent binding written first.
+	p2 := sidecarProvider(t)
+	bindAt(t, p2, "session-new", "w3:p1", 2000)
+	bindAt(t, p2, "session-old", "w3:p1", 1000)
+	got2, err := p2.boundPaneBindings()
+	if err != nil {
+		t.Fatalf("boundPaneBindings: %v", err)
+	}
+	if got2["w3:p1"] != "session-new" {
+		t.Fatalf("boundPaneBindings[w3:p1] = %q, want session-new regardless of write order", got2["w3:p1"])
+	}
+}
+
+// A sidecar entry unreadable for a reason other than "absent" (here: the
+// metaBoundName leaf replaced by a directory) must surface as an error from
+// both boundSessionNames and boundPaneBindings, not be silently folded into
+// "no bindings" — the exact-head review's Major finding on
+// forEachPaneBinding. A caller that cannot tell "transiently unreadable"
+// from "genuinely nothing bound" can subscribe successfully with a pane's
+// status filter simply missing, with no signal anything went wrong.
+func TestForEachPaneBindingPropagatesReadError(t *testing.T) {
+	p := sidecarProvider(t)
+	bindAt(t, p, "session-a", "w3:p1", 1000)
+
+	nameFile := filepath.Join(p.metaDir, sanitize("session-a"), sanitize(metaBoundName))
+	if err := os.Remove(nameFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(nameFile, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := p.boundSessionNames(); err == nil {
+		t.Fatal("boundSessionNames: want an error for an unreadable binding file, got nil")
+	}
+	if _, err := p.boundPaneBindings(); err == nil {
+		t.Fatal("boundPaneBindings: want an error for an unreadable binding file, got nil")
+	}
+}
+
+// A metaDir that has never been written to (no session has ever bound) is a
+// legitimate empty case, not an error — only a genuine read failure on an
+// existing entry propagates.
+func TestForEachPaneBindingEmptyMetaDirIsNotAnError(t *testing.T) {
+	p := sidecarProvider(t)
+	names, err := p.boundSessionNames()
+	if err != nil || len(names) != 0 {
+		t.Fatalf("boundSessionNames = %v, %v; want empty, nil", names, err)
+	}
+	bindings, err := p.boundPaneBindings()
+	if err != nil || len(bindings) != 0 {
+		t.Fatalf("boundPaneBindings = %v, %v; want empty, nil", bindings, err)
+	}
+}
+
+// ── clearPaneBindingIfMatches: compare-and-clear ──────────────────────────────
+
+// The binding still points at the pane the caller snapshotted: the clear
+// proceeds.
+func TestClearPaneBindingIfMatchesClearsOnExactMatch(t *testing.T) {
+	p := sidecarProvider(t)
+	bindAt(t, p, "session-a", "w3:p1", 1000)
+
+	if err := p.clearPaneBindingIfMatches("session-a", "w3:p1"); err != nil {
+		t.Fatalf("clearPaneBindingIfMatches: %v", err)
+	}
+	if got, _ := p.GetMeta("session-a", metaBoundPane); got != "" {
+		t.Fatalf("binding survived a matching clear: %q", got)
+	}
+}
+
+// The binding has moved on to a different pane since the caller's snapshot
+// (a concurrent Start rebound it): the clear must be a no-op, not destroy
+// the live binding — the exact-head review's Blocker on pruneStalePane.
+func TestClearPaneBindingIfMatchesSparesMovedBinding(t *testing.T) {
+	p := sidecarProvider(t)
+	bindAt(t, p, "session-a", "w3:p1", 1000)
+	// Concurrent Start rebinds session-a to a fresh pane before the stale
+	// rejection for the OLD pane (w3:p1) is handled.
+	bindAt(t, p, "session-a", "w9:p9", 2000)
+
+	if err := p.clearPaneBindingIfMatches("session-a", "w3:p1"); err != nil {
+		t.Fatalf("clearPaneBindingIfMatches: %v", err)
+	}
+	if got, _ := p.GetMeta("session-a", metaBoundPane); got != "w9:p9" {
+		t.Fatalf("binding after stale clear = %q, want w9:p9 (the current, live binding) untouched", got)
 	}
 }
 
