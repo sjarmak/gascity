@@ -209,9 +209,18 @@ type CityRuntime struct {
 	// stopManagedCity's forced-timeout fallback in cmd_supervisor.go) that
 	// never go through run()'s defer chain at all; without this, shutdown()
 	// could close storageRoutes while the lane goroutine is still mid-call
-	// against it. Guarded by orderDispatchMu since the writer (startup) and
-	// a forced-timeout shutdown call can race on separate goroutines.
-	orderDispatchLaneDone <-chan struct{}
+	// against it.
+	//
+	// Guarded by its OWN dedicated mutex (orderDispatchLaneDoneMu), NOT
+	// orderDispatchMu: dispatchOrders holds orderDispatchMu across the whole
+	// od.dispatch() call, which can run for as long as a dispatch pass's
+	// slowest condition-trigger check_timeout permits (see dispatchOrders).
+	// If shutdown() read this field under orderDispatchMu, it would block
+	// there for that same unbounded duration before ever reaching the
+	// bounded select on the channel itself, defeating
+	// orderDispatchLaneJoinTimeout entirely (#2604/#3368 review followup).
+	orderDispatchLaneDoneMu sync.Mutex
+	orderDispatchLaneDone   <-chan struct{}
 
 	// routeRecovery is the route-repair lane: an event-fed delta pass in the
 	// tick and a cadenced authoritative scan behind it. Created on first use so
@@ -1692,9 +1701,9 @@ func (cr *CityRuntime) orderDispatchLaneStatus() (at time.Time, ran bool, ok boo
 func (cr *CityRuntime) startOrderDispatchLane(ctx context.Context, cityRoot string) <-chan struct{} {
 	interval := cr.cfg.Daemon.PatrolIntervalDuration()
 	done := make(chan struct{})
-	cr.orderDispatchMu.Lock()
+	cr.orderDispatchLaneDoneMu.Lock()
 	cr.orderDispatchLaneDone = done
-	cr.orderDispatchMu.Unlock()
+	cr.orderDispatchLaneDoneMu.Unlock()
 	go func() {
 		defer close(done)
 		runOnce := func() {
@@ -1839,12 +1848,13 @@ func (cr *CityRuntime) rescanOrderDispatcherForReload(ctx context.Context, cityR
 // value, taken before the FS scan ran unlocked; a seq at or below
 // orderSetAppliedSeq means a fresher scan already applied its result while
 // this one was in flight, so it is dropped rather than reverting that newer
-// state. Callers must hold orderDispatchMu.
+// state — and orderRescanLast is left untouched too, so a discarded scan
+// cannot delay the next legitimate one. Callers must hold orderDispatchMu.
 func (cr *CityRuntime) applyOrderSetSnapshotLocked(ctx context.Context, cityRoot string, cfg *config.City, snapshot orderSetSnapshot, seq uint64, forceRebuild bool, now time.Time) (bool, string) {
-	cr.orderRescanLast = now
 	if seq != 0 && seq <= cr.orderSetAppliedSeq {
 		return false, "stale-scan"
 	}
+	cr.orderRescanLast = now
 	if seq != 0 {
 		cr.orderSetAppliedSeq = seq
 	}
@@ -1861,7 +1871,16 @@ func (cr *CityRuntime) applyOrderSetSnapshotLocked(ctx context.Context, cityRoot
 	cr.replaceOrderDispatcher(buildOrderDispatcherFromOrderSet(cr.storageRoutes, cityRoot, cfg, snapshot.Orders, cr.rec, cr.stderr))
 	cr.orderSet = snapshot.Orders
 	cr.orderSetSignature = snapshot.Signature
-	cr.orderDispatchConfigRebuildPending.Store(false)
+	// Only clear the pending flag when THIS call is the one that consumed a
+	// true reading of it. A rebuild triggered instead by an unrelated
+	// order-set signature change (forceRebuild false, snapshot.Signature
+	// differs) may have used a cfg snapshot taken before a concurrent
+	// reload's cr.cfg write landed; clearing the flag here would silently
+	// drop that reload's still-unapplied config-only change (#2604/#3368
+	// review followup).
+	if forceRebuild {
+		cr.orderDispatchConfigRebuildPending.Store(false)
+	}
 	if summary != "unchanged" {
 		fmt.Fprintf(cr.stderr, "%s: orders reloaded: %s\n", cr.logPrefix, summary) //nolint:errcheck // best-effort stderr
 	} else if forceRebuild {
@@ -2539,6 +2558,27 @@ func (cr *CityRuntime) reloadConfigTraced(
 
 	cr.wg = newWispGCForConfig(nextCfg)
 
+	// Install nextCfg BEFORE the order-dispatch section below touches
+	// orderDispatchConfigRebuildPending: a concurrent lane rescan
+	// (rescanOrderDispatcherIfDue) snapshots cr.cfg under serviceStateMu and
+	// separately Loads this flag, as two independent, unsynchronized reads.
+	// Writing cr.cfg first — and doing so through the same serviceStateMu
+	// release that every reader acquires before touching cr.cfg — means any
+	// goroutine whose Load of the flag observes a Store this function makes
+	// below is guaranteed (by Go's happens-before transitivity across the
+	// serviceStateMu release and the flag's own atomic release) to also see
+	// this cr.cfg write, so a scan that reacts to forceRebuild=true can never
+	// still be holding a cfg snapshot older than the change that pending flag
+	// represents. Reversing this order re-opens the exact config-only-change
+	// loss window orderDispatchConfigRebuildPending exists to close
+	// (#2604/#3368 review followup).
+	cr.serviceStateMu.Lock()
+	cr.cfg = nextCfg
+	cr.sp = nextSp
+	cr.dops = nextDops
+	cr.serviceStateMu.Unlock()
+	cr.demandSnapshot = nil
+
 	// Drain the outgoing dispatcher before replacing it so in-flight
 	// dispatchOne goroutines persist their tracking-bead outcomes against
 	// the store they were scheduled against. The reload budget is capped at
@@ -2598,13 +2638,6 @@ func (cr *CityRuntime) reloadConfigTraced(
 		cr.orderDispatchConfigRebuildPending.Store(true)
 		fmt.Fprintf(cr.stderr, "%s: order dispatch busy; deferring order-set refresh to next reload\n", cr.logPrefix) //nolint:errcheck // best-effort stderr
 	}
-
-	cr.serviceStateMu.Lock()
-	cr.cfg = nextCfg
-	cr.sp = nextSp
-	cr.dops = nextDops
-	cr.serviceStateMu.Unlock()
-	cr.demandSnapshot = nil
 
 	if cr.cs != nil {
 		cr.cs.updateFromRuntime(nextCfg, nextSp, result.Revision)
@@ -4343,10 +4376,13 @@ func (cr *CityRuntime) shutdown() {
 		// fallback) that can fire before run()'s defer chain ever reaches
 		// that join — without this wait here too, storageRoutes could close
 		// while the lane is still mid-call against it (#2604/#3368 review
-		// followup).
-		cr.orderDispatchMu.Lock()
+		// followup). Read under orderDispatchLaneDoneMu, NOT orderDispatchMu:
+		// the lane can hold orderDispatchMu for the whole od.dispatch() call,
+		// and blocking here on that mutex would defeat the bounded select
+		// below before it even starts (#2604/#3368 review followup).
+		cr.orderDispatchLaneDoneMu.Lock()
 		laneDone := cr.orderDispatchLaneDone
-		cr.orderDispatchMu.Unlock()
+		cr.orderDispatchLaneDoneMu.Unlock()
 		if laneDone != nil {
 			select {
 			case <-laneDone:
