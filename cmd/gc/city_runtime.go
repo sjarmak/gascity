@@ -1605,14 +1605,20 @@ func (cr *CityRuntime) tryLockOrderDispatchMu(ctx context.Context) bool {
 	if cr.orderDispatchMu.TryLock() {
 		return true
 	}
-	deadline := time.Now().Add(reloadOrderDispatchMuTimeout)
+	timer := time.NewTimer(reloadOrderDispatchMuTimeout)
+	defer timer.Stop()
+	poll := time.NewTicker(orderDispatchMuPollInterval)
+	defer poll.Stop()
 	for {
-		if ctx.Err() != nil || !time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
 			return false
-		}
-		time.Sleep(orderDispatchMuPollInterval)
-		if cr.orderDispatchMu.TryLock() {
-			return true
+		case <-timer.C:
+			return false
+		case <-poll.C:
+			if cr.orderDispatchMu.TryLock() {
+				return true
+			}
 		}
 	}
 }
