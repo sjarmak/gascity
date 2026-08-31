@@ -5565,7 +5565,7 @@ func TestCityRuntimeManualHardReloadNotDelayedByOrderDispatchLane(t *testing.T) 
 	cr.orderDispatchMu.Lock()
 	unlocked := make(chan struct{})
 	go func() {
-		time.Sleep(holdDuration)
+		<-time.After(holdDuration)
 		cr.orderDispatchMu.Unlock()
 		close(unlocked)
 	}()
