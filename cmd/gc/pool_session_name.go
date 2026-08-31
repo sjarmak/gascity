@@ -93,7 +93,37 @@ func poolIdentitySessionName(identity, template string) string {
 	if base == "" {
 		base = "pool"
 	}
-	return boundSessionNameLength(agent.SanitizeQualifiedNameForSession(base))
+	return boundSessionNameLength(ensureSessionNameLeadsWithIdentifierChar(agent.SanitizeQualifiedNameForSession(base)))
+}
+
+// poolIdentityPathShapedPrefix disambiguates a path-shaped pool identity
+// (a rig-less agent whose Dir is an absolute directory rather than a short
+// rig name) from every ordinary rig-shaped identity. Encoding a raw "/" as
+// "--" (agent.SanitizeQualifiedNameForSession) leaves such an identity
+// starting with "--" once its leading "/" is encoded, and the runtime
+// session-name grammar (session.ValidateExplicitName) requires the name to
+// start with a letter or digit — every spawn for such a pool then fails
+// ValidateExplicitName forever (gc-vf1mg: poolDesired=1, zero sessions ever
+// created). An ordinary identity never starts with "/", so it never triggers
+// this prefix and its derived name is unaffected byte-for-byte.
+const poolIdentityPathShapedPrefix = "p"
+
+// ensureSessionNameLeadsWithIdentifierChar prepends a fixed, deterministic
+// marker when name does not already start with a letter or digit, so the
+// result satisfies the runtime session-name grammar. The transform is
+// injective (a fixed prefix on an otherwise-unmodified string), so distinct
+// path-shaped identities never collide with each other or with any ordinary
+// identity, which by definition already starts with a letter or digit and
+// therefore passes through unchanged.
+func ensureSessionNameLeadsWithIdentifierChar(name string) string {
+	if name == "" {
+		return name
+	}
+	c := name[0]
+	if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+		return name
+	}
+	return poolIdentityPathShapedPrefix + name
 }
 
 // boundSessionNameLength keeps a derived name inside the explicit-name length
