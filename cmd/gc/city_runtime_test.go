@@ -1800,6 +1800,16 @@ func TestCityRuntimeRunStartupReconcileNotBlockedByOrderDispatch(t *testing.T) {
 	awaitClose(t, dispatchStarted, "order dispatch starting")
 	awaitClose(t, buildRan, "startup reconcile (BuildFn) running while order dispatch is still blocked")
 
+	// buildRan closing here is only proof reconcile was not blocked by
+	// dispatch if dispatch is still genuinely blocked at this instant, not
+	// merely because it happened to finish first within awaitClose's
+	// timeout. Assert release has not been closed yet to rule that out.
+	select {
+	case <-release:
+		t.Fatal("release already closed: order dispatch was not actually blocked while reconcile ran, so this test no longer proves the two are decoupled")
+	default:
+	}
+
 	close(release)
 	cancel()
 	awaitClose(t, done, "run returning after cancel")
@@ -5439,9 +5449,14 @@ func TestCityRuntimeReloadKeepsRegisteredAliasForEffectiveIdentity(t *testing.T)
 }
 
 // TestCityRuntimeManualHardReloadRepliesBeforeDispatch pins #3206: a manual
-// hard reload's reply is sent BEFORE dispatchOrders and the session-reconcile
-// phases, so reload-reply latency is independent of order count. (Soft
-// Applied/NoChange reloads still reply after applySoftReloadAcceptance — see
+// hard reload's reply is sent BEFORE the session-reconcile (desired-state
+// rebuild) phase of tick(), so reload-reply latency is independent of the
+// rebuild's cost. Order dispatch is no longer part of this ordering at all —
+// since #2604/#3368 it runs on its own lane (startOrderDispatchLane),
+// decoupled from tick() — so there is nothing left to assert about dispatch
+// here; see TestCityRuntimeManualHardReloadNotDelayedByOrderDispatchLane for
+// that lane-independence property. (Soft Applied/NoChange reloads still
+// reply after applySoftReloadAcceptance — see
 // TestCityRuntimeSoftReloadAcceptsDriftForAppliedAndNoChange.)
 func TestCityRuntimeManualHardReloadRepliesBeforeDispatch(t *testing.T) {
 	cityPath := t.TempDir()
@@ -5487,6 +5502,82 @@ func TestCityRuntimeManualHardReloadRepliesBeforeDispatch(t *testing.T) {
 	var prevPoolRunning map[string]bool
 
 	cr.tick(context.Background(), dirty, &lastProviderName, cityPath, &prevPoolRunning, "poke")
+
+	select {
+	case reply := <-doneCh:
+		if reply.Outcome != reloadOutcomeNoChange {
+			t.Fatalf("reply.Outcome = %q, want %q", reply.Outcome, reloadOutcomeNoChange)
+		}
+	default:
+		t.Fatal("manual reload did not reply")
+	}
+	if cr.activeReload != nil {
+		t.Fatal("activeReload was not cleared")
+	}
+}
+
+// TestCityRuntimeManualHardReloadNotDelayedByOrderDispatchLane pins the
+// #2604/#3368 fix for the gc-61ehe review's blocking-mutex finding: a manual
+// hard reload's reply must not wait on a slow order-dispatch lane pass.
+// reloadConfigTraced acquires orderDispatchMu through the bounded
+// tryLockOrderDispatchMu helper rather than blocking indefinitely, so even
+// while the lane holds the lock for the whole test, the reload still
+// completes and replies within reloadOrderDispatchMuTimeout instead of
+// waiting for the lane to release it.
+func TestCityRuntimeManualHardReloadNotDelayedByOrderDispatchLane(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, configRev := loadCityRuntimeControllerConfig(t, cityPath)
+
+	doneCh := make(chan reloadControlReply, 1)
+	dirty := &atomic.Bool{}
+	dirty.Store(true)
+	sp := runtime.NewFake()
+
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath:    cityPath,
+		CityName:    "test-city",
+		TomlPath:    tomlPath,
+		ConfigRev:   configRev,
+		ConfigDirty: dirty,
+		Cfg:         cfg,
+		SP:          sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+	cr.activeReload = &reloadRequest{doneCh: doneCh} // hard reload (soft=false)
+	lastProviderName := "fake"
+	var prevPoolRunning map[string]bool
+
+	// Simulate the order-dispatch lane holding orderDispatchMu for the
+	// whole tick, as it does while od.dispatch() runs a slow/blocking order
+	// effect (see dispatchOrders's doc comment on why dispatch() itself
+	// must stay under the lock).
+	holdDuration := 3 * reloadOrderDispatchMuTimeout
+	boundedWithin := 2 * reloadOrderDispatchMuTimeout
+	cr.orderDispatchMu.Lock()
+	unlocked := make(chan struct{})
+	go func() {
+		time.Sleep(holdDuration)
+		cr.orderDispatchMu.Unlock()
+		close(unlocked)
+	}()
+	defer func() { <-unlocked }()
+
+	start := time.Now()
+	cr.tick(context.Background(), dirty, &lastProviderName, cityPath, &prevPoolRunning, "poke")
+	elapsed := time.Since(start)
+
+	if elapsed >= boundedWithin {
+		t.Fatalf("tick() took %s (>= %s), which means the manual reload reply waited on the order-dispatch lane's lock instead of giving up after reloadOrderDispatchMuTimeout", elapsed, boundedWithin)
+	}
 
 	select {
 	case reply := <-doneCh:

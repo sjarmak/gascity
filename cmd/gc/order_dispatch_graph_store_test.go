@@ -417,7 +417,7 @@ func TestOrderDispatcherServesTheBootResolvedBinding(t *testing.T) {
 	// The rescan rebuilds the dispatcher only when the order SET changed, so
 	// add an order rather than rescanning an unchanged one.
 	writeCityOrder(t, cr.cityPath, "sweeper")
-	changed, _, err := cr.rescanOrderDispatcher(context.Background(), cr.cityPath, cr.cfg, "test: order scan", time.Now())
+	changed, err := cr.rescanOrderDispatcher(context.Background(), cr.cityPath, cr.cfg, "test: order scan", time.Now())
 	if err != nil {
 		t.Fatalf("rescanOrderDispatcher: %v", err)
 	}

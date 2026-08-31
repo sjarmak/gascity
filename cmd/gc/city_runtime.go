@@ -94,6 +94,33 @@ func sweepOrphanedOrderTrackingAtBoot(routes *storageRoutes, cityPath string, cf
 // cannot wait long enough.
 const reloadOrderDrainTimeout = 1 * time.Second
 
+// reloadOrderDispatchMuTimeout bounds how long config reload will wait to
+// acquire orderDispatchMu before giving up on refreshing the order set this
+// cycle. The order-dispatch lane can hold this mutex for as long as its
+// slowest condition-trigger check_timeout permits (#2604/#3368) — reload
+// must not block the tick goroutine behind that indefinitely. A timed-out
+// acquire is not a failure: cr.cfg has already been updated by the time this
+// runs, so the lane's own next scheduled pass re-scans it and converges
+// independently, and shutdown's own order drain compensates for any
+// dispatcher this left un-rebuilt.
+const reloadOrderDispatchMuTimeout = 500 * time.Millisecond
+
+// orderDispatchMuPollInterval is the retry cadence tryLockOrderDispatchMu
+// uses while waiting on orderDispatchMu.
+const orderDispatchMuPollInterval = 10 * time.Millisecond
+
+// orderDispatchLaneJoinTimeout bounds how long run() waits for the
+// order-dispatch lane goroutine to exit after ctx is canceled before
+// proceeding to shutdown() regardless. This join is registered after `defer
+// cr.shutdown()`, so by defer LIFO order it runs BEFORE shutdown() — an
+// unbounded wait here would block session shutdown behind a wedged order
+// exec (#2604/#3368). Sized above typical subprocess cancellation grace
+// (shellExecSignalGrace + shellExecPostCancelWaitDelay) so the common case
+// still joins cleanly; a lane that outlives this timeout leaks its goroutine
+// for the remainder of process shutdown, and any tracking bead it left open
+// is closed by sweepOrphanedOrderTrackingRetry on the next boot.
+const orderDispatchLaneJoinTimeout = 10 * time.Second
+
 var orderRescanInterval = time.Minute
 
 // CityRuntime holds all running state for a single city's reconciliation
@@ -133,13 +160,17 @@ type CityRuntime struct {
 	trace                   *sessionReconcilerTraceManager
 
 	// orderDispatchMu guards od, retiredOrderDispatchers, orderSet,
-	// orderSetSignature, orderRescanLast, wispIndexMigrationApplied, and the
-	// order-tracking watchdog timestamps below. dispatchOrders used to run
-	// exclusively on the single tick/reconciler goroutine, so these fields
-	// were safe unguarded; the order-dispatch lane (#2604/#3368) now calls
-	// dispatchOrders from its own goroutine, concurrently with a config
-	// reload rebuilding the order dispatcher on the tick goroutine
-	// (reloadConfigTraced). Both sides take this lock around their access.
+	// orderSetSignature, and orderRescanLast against a config reload
+	// rebuilding the order dispatcher on the tick goroutine
+	// (reloadConfigTraced) while the order-dispatch lane (#2604/#3368) calls
+	// dispatchOrders concurrently from its own goroutine. It does NOT guard
+	// wispIndexMigrationApplied or the order-tracking watchdog timestamps
+	// below (orderSweepWatchdogLast and friends): those are touched only
+	// from within dispatchOrders, which only the lane goroutine ever calls,
+	// so they need no lock. Reload's own acquires of this mutex are bounded
+	// (reloadOrderDispatchMuTimeout, via tryLockOrderDispatchMu) rather than
+	// blocking, since the lane can hold it for as long as a dispatch pass's
+	// slowest condition-trigger check_timeout permits.
 	orderDispatchMu        sync.Mutex
 	orderDispatchLastRunAt time.Time
 	orderDispatchRan       bool
@@ -676,7 +707,14 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	// once immediately (covering what the old synchronous startup-orders call
 	// did) and then on its own ticker for the life of the run.
 	orderDispatchDone := cr.startOrderDispatchLane(ctx, cityRoot)
-	defer func() { <-orderDispatchDone }()
+	defer func() {
+		select {
+		case <-orderDispatchDone:
+		case <-time.After(orderDispatchLaneJoinTimeout):
+			fmt.Fprintf(cr.stderr, "%s: order-dispatch lane did not exit within %s; proceeding with shutdown\n", //nolint:errcheck // best-effort stderr
+				cr.logPrefix, orderDispatchLaneJoinTimeout)
+		}
+	}()
 	if ctx.Err() != nil {
 		return
 	}
@@ -1249,8 +1287,8 @@ func (cr *CityRuntime) tick(
 	// completions backstops below.
 	phaseStart = time.Now()
 	orderFields := map[string]any{}
-	orderAt, orderRan := cr.orderDispatchLaneStatus()
-	addOrderDispatchAgeFields(orderFields, orderAt, orderRan)
+	orderAt, orderRan, orderStatusOK := cr.orderDispatchLaneStatus()
+	addOrderDispatchAgeFields(orderFields, orderAt, orderRan, orderStatusOK)
 	recordPhase(TraceSiteOrderDispatch, "dispatch_orders", phaseStart, orderFields)
 	if ctx.Err() != nil {
 		return
@@ -1508,6 +1546,21 @@ func (cr *CityRuntime) tick(
 // the tick goroutine directly (#2604/#3368) — orderDispatchMu is what makes
 // that safe against a concurrent config reload rebuilding cr.od on the tick
 // goroutine (see reloadConfigTraced).
+//
+// orderDispatchMu is held only around the dispatcher snapshot/dispatch call
+// and the trailing status fields, not across the rescan-if-due scan or the
+// tracking watchdogs: those touch fields the lane goroutine exclusively
+// owns (rescanOrderDispatcherIfDue's own staleness check is separately
+// guarded), so serializing them against reload buys nothing and only grows
+// how long reload can be blocked waiting for this mutex. od.dispatch()
+// itself must stay under the lock: memoryOrderDispatcher.carryLastRunCacheFrom
+// (and its gate-backoff/open-work-suppression siblings) require the outgoing
+// dispatcher's dispatch() call to have fully returned before a concurrent
+// drain-and-replace reads its cache, and drain() alone does not wait for
+// dispatch()'s synchronous phase — only for goroutines it has already
+// spawned. Reload's own acquire of this mutex is bounded
+// (reloadOrderDispatchMuTimeout) precisely because dispatch() can hold it
+// for a while.
 func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
 	if ctx.Err() != nil {
 		return
@@ -1523,8 +1576,6 @@ func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
 		return
 	}
 	now := time.Now()
-	cr.orderDispatchMu.Lock()
-	defer cr.orderDispatchMu.Unlock()
 	if !cr.wispIndexMigrationApplied {
 		cr.wispIndexMigrationApplied = true
 		cr.applyWispQueryIndexes(ctx)
@@ -1533,6 +1584,8 @@ func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
 	cr.runOrderTrackingSweepWatchdog(now)
 	cr.runOrderTrackingRetentionWatchdog(now)
 	cr.runNudgeMailSweepWatchdog(now)
+	cr.orderDispatchMu.Lock()
+	defer cr.orderDispatchMu.Unlock()
 	if cr.od != nil {
 		cr.od.dispatch(ctx, cityRoot, now)
 	}
@@ -1540,14 +1593,44 @@ func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
 	cr.orderDispatchRan = true
 }
 
+// tryLockOrderDispatchMu acquires orderDispatchMu, giving up after
+// reloadOrderDispatchMuTimeout or ctx cancellation. sync.Mutex has no
+// built-in timeout, so this polls TryLock (Go 1.18+); the poll interval is
+// small relative to the timeout so the added latency over a plain Lock() is
+// negligible, and the common uncontended case succeeds on the first
+// attempt. Every caller is on the tick goroutine bounding its wait behind a
+// possibly-slow lane dispatch() pass (#2604/#3368), so the timeout is fixed
+// rather than a parameter.
+func (cr *CityRuntime) tryLockOrderDispatchMu(ctx context.Context) bool {
+	if cr.orderDispatchMu.TryLock() {
+		return true
+	}
+	deadline := time.Now().Add(reloadOrderDispatchMuTimeout)
+	for {
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(orderDispatchMuPollInterval)
+		if cr.orderDispatchMu.TryLock() {
+			return true
+		}
+	}
+}
+
 // orderDispatchLaneStatus reports when the order-dispatch lane last completed
 // a dispatch pass, for the tick's cheap age-only observability phase (see
-// addOrderDispatchAgeFields). Safe to call from the tick goroutine while the
-// lane goroutine is running.
-func (cr *CityRuntime) orderDispatchLaneStatus() (at time.Time, ran bool) {
-	cr.orderDispatchMu.Lock()
+// addOrderDispatchAgeFields). This runs on every tick, not just reload, so
+// it must never block: a blocking Lock() here would let a slow lane
+// dispatch() pass delay session-reconcile on every tick, reintroducing
+// exactly the coupling #2604/#3368 removed. ok is false when the lane
+// currently holds orderDispatchMu; callers should report "unknown" rather
+// than block or fabricate stale data.
+func (cr *CityRuntime) orderDispatchLaneStatus() (at time.Time, ran bool, ok bool) {
+	if !cr.orderDispatchMu.TryLock() {
+		return time.Time{}, false, false
+	}
 	defer cr.orderDispatchMu.Unlock()
-	return cr.orderDispatchLastRunAt, cr.orderDispatchRan
+	return cr.orderDispatchLastRunAt, cr.orderDispatchRan, true
 }
 
 // startOrderDispatchLane runs order dispatch on its own goroutine, decoupled
@@ -1595,8 +1678,15 @@ func (cr *CityRuntime) startOrderDispatchLane(ctx context.Context, cityRoot stri
 // the tick is the only place its liveness is observable from the trace: `gc
 // trace` answers "when did order dispatch last run" without an operator
 // having to find the log line. "Never ran" is reported as a distinct value
-// from a fresh run, mirroring addBackstopAgeFields.
-func addOrderDispatchAgeFields(fields map[string]any, at time.Time, ran bool) {
+// from a fresh run, mirroring addBackstopAgeFields. ok is false when
+// orderDispatchLaneStatus could not acquire orderDispatchMu without
+// blocking (the lane is mid-dispatch); that is reported as its own distinct
+// status rather than fabricating a ran/age value from zero data.
+func addOrderDispatchAgeFields(fields map[string]any, at time.Time, ran bool, ok bool) {
+	if !ok {
+		fields["order_dispatch_status"] = "unknown_lane_busy"
+		return
+	}
 	if !ran {
 		fields["order_dispatch_ran"] = false
 		return
@@ -1609,7 +1699,14 @@ func (cr *CityRuntime) rescanOrderDispatcherIfDue(ctx context.Context, cityRoot 
 	if !cr.orderRescanEnabled || cr.tomlPath == "" || strings.TrimSpace(cityRoot) == "" {
 		return
 	}
-	if !cr.orderRescanLast.IsZero() && now.Sub(cr.orderRescanLast) < orderRescanInterval {
+	// orderRescanLast is also read and written by the reload paths under
+	// orderDispatchMu (applyOrderSetSnapshotLocked); guard this staleness
+	// check the same way now that it is no longer covered by dispatchOrders
+	// holding the mutex across this whole call.
+	cr.orderDispatchMu.Lock()
+	due := cr.orderRescanLast.IsZero() || now.Sub(cr.orderRescanLast) >= orderRescanInterval
+	cr.orderDispatchMu.Unlock()
+	if !due {
 		return
 	}
 	// cr.cfg is reassigned wholesale by a reload on the tick goroutine
@@ -1618,8 +1715,10 @@ func (cr *CityRuntime) rescanOrderDispatcherIfDue(ctx context.Context, cityRoot 
 	cr.serviceStateMu.RLock()
 	cfg := cr.cfg
 	cr.serviceStateMu.RUnlock()
-	if _, _, err := cr.rescanOrderDispatcher(ctx, cityRoot, cfg, "gc patrol: order scan", now); err != nil {
+	if _, err := cr.rescanOrderDispatcher(ctx, cityRoot, cfg, "gc patrol: order scan", now); err != nil {
+		cr.orderDispatchMu.Lock()
 		cr.orderRescanLast = now
+		cr.orderDispatchMu.Unlock()
 		logDispatchError(cr.stderr, "%s: order rescan: %v", cr.logPrefix, err)
 	}
 }
@@ -1640,17 +1739,53 @@ func (cr *CityRuntime) replaceOrderDispatcher(next orderDispatcher) {
 	cr.od = next
 }
 
-func (cr *CityRuntime) rescanOrderDispatcher(ctx context.Context, cityRoot string, cfg *config.City, cmdName string, now time.Time) (bool, string, error) {
+// rescanOrderDispatcher scans the order set from disk and, if changed,
+// drains and replaces the active dispatcher. Called only from the
+// order-dispatch lane's own goroutine (via rescanOrderDispatcherIfDue), so
+// it blocks acquiring orderDispatchMu — the lane is not latency-sensitive,
+// unlike config reload (see rescanOrderDispatcherForReload).
+func (cr *CityRuntime) rescanOrderDispatcher(ctx context.Context, cityRoot string, cfg *config.City, cmdName string, now time.Time) (bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	snapshot, err := scanOrderSetSnapshotFS(fsys.OSFS{}, cityRoot, cfg, cr.stderr, cmdName)
 	if err != nil {
+		return false, err
+	}
+	cr.orderDispatchMu.Lock()
+	defer cr.orderDispatchMu.Unlock()
+	changed, _ := cr.applyOrderSetSnapshotLocked(ctx, cityRoot, cfg, snapshot, now)
+	return changed, nil
+}
+
+// rescanOrderDispatcherForReload is rescanOrderDispatcher's config-reload
+// counterpart (the unchanged-config-revision reload path). Reload runs on
+// the tick goroutine, so it bounds its wait for orderDispatchMu instead of
+// blocking indefinitely behind a slow order-dispatch-lane pass
+// (#2604/#3368). A timed-out acquire skips this reload's order-set refresh;
+// cr.cfg is unaffected, so the lane's own next scheduled pass re-scans it
+// and converges independently.
+func (cr *CityRuntime) rescanOrderDispatcherForReload(ctx context.Context, cityRoot string, cfg *config.City, cmdName string, now time.Time) (bool, string, error) {
+	snapshot, err := scanOrderSetSnapshotFS(fsys.OSFS{}, cityRoot, cfg, cr.stderr, cmdName)
+	if err != nil {
 		return false, "", err
 	}
+	if !cr.tryLockOrderDispatchMu(ctx) {
+		fmt.Fprintf(cr.stderr, "%s: order dispatch busy; deferring order-set refresh to next scan\n", cr.logPrefix) //nolint:errcheck // best-effort stderr
+		return false, "order-dispatch-busy", nil
+	}
+	defer cr.orderDispatchMu.Unlock()
+	changed, summary := cr.applyOrderSetSnapshotLocked(ctx, cityRoot, cfg, snapshot, now)
+	return changed, summary, nil
+}
+
+// applyOrderSetSnapshotLocked installs snapshot as the active order set,
+// draining and replacing cr.od if the set's signature changed. Callers must
+// hold orderDispatchMu.
+func (cr *CityRuntime) applyOrderSetSnapshotLocked(ctx context.Context, cityRoot string, cfg *config.City, snapshot orderSetSnapshot, now time.Time) (bool, string) {
 	cr.orderRescanLast = now
 	if snapshot.Signature == cr.orderSetSignature {
-		return false, "unchanged", nil
+		return false, "unchanged"
 	}
 
 	summary := orderSetChangeSummary(cr.orderSet, snapshot.Orders)
@@ -1665,7 +1800,7 @@ func (cr *CityRuntime) rescanOrderDispatcher(ctx context.Context, cityRoot strin
 	if summary != "unchanged" {
 		fmt.Fprintf(cr.stderr, "%s: orders reloaded: %s\n", cr.logPrefix, summary) //nolint:errcheck // best-effort stderr
 	}
-	return true, summary, nil
+	return true, summary
 }
 
 func orderSetChangeSummary(oldOrders, newOrders []orders.Order) string {
@@ -2101,7 +2236,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 		appendWarning(warning)
 	}
 	if cr.configRev != "" && result.Revision == cr.configRev {
-		ordersChanged, orderSummary, orderErr := cr.rescanOrderDispatcher(ctx, cityRoot, result.Cfg, "gc reload: order scan", time.Now())
+		ordersChanged, orderSummary, orderErr := cr.rescanOrderDispatcherForReload(ctx, cityRoot, result.Cfg, "gc reload: order scan", time.Now())
 		if orderErr != nil {
 			err := fmt.Errorf("order reload: %w", orderErr)
 			fmt.Fprintf(cr.stderr, "%s: %v (keeping old orders)\n", cr.logPrefix, err) //nolint:errcheck // best-effort stderr
@@ -2339,14 +2474,11 @@ func (cr *CityRuntime) reloadConfigTraced(
 
 	// Drain the outgoing dispatcher before replacing it so in-flight
 	// dispatchOne goroutines persist their tracking-bead outcomes against
-	// the store they were scheduled against. Reload runs on the same
-	// goroutine as tick, so no concurrent dispatch can create a new
-	// in-flight signal on this dispatcher while drain observes it. The
-	// reload budget is capped at reloadOrderDrainTimeout so a wedged exec
-	// order cannot stall the tick loop; timed-out dispatchers are retained
-	// and drained again during shutdown.
-	// Deriving from ctx (the tick ctx) lets a shutdown racing with reload
-	// short-circuit the drain instead of waiting the full 1s.
+	// the store they were scheduled against. The reload budget is capped at
+	// reloadOrderDrainTimeout so a wedged exec order cannot stall the tick
+	// loop; timed-out dispatchers are retained and drained again during
+	// shutdown. Deriving from ctx (the tick ctx) lets a shutdown racing with
+	// reload short-circuit the drain instead of waiting the full 1s.
 	//
 	// The order-dispatch lane (#2604/#3368) calls dispatchOrders — which can
 	// itself rescan and replace cr.od — from its own goroutine, concurrently
@@ -2354,22 +2486,30 @@ func (cr *CityRuntime) reloadConfigTraced(
 	// serializes both sides against cr.od/retiredOrderDispatchers/orderSet/
 	// orderSetSignature/orderRescanLast; it is held across the drain-then-
 	// replace sequence below (not just the final field writes) because the
-	// drain reads cr.od too.
+	// drain reads cr.od too. The lane can hold this mutex for as long as its
+	// slowest condition-trigger check_timeout permits, so reload bounds its
+	// acquire (reloadOrderDispatchMuTimeout) instead of blocking the tick
+	// goroutine on it indefinitely (#2604/#3368 review). A timed-out acquire
+	// leaves the old dispatcher (built from the old config) active for this
+	// cycle; the next reload — which runs every tick — retries.
 	nextOD, orderSnapshot := buildOrderDispatcherWithSnapshot(cr.storageRoutes, cityRoot, nextCfg, cr.rec, cr.stderr, "gc reload: order scan")
-	cr.orderDispatchMu.Lock()
-	if cr.od != nil {
-		drainCtx, drainCancel := context.WithTimeout(ctx, reloadOrderDrainTimeout)
-		cr.drainOutgoingOrderDispatcher(drainCtx, cr.od)
-		drainCancel()
-	}
-	orderSummary := orderSetChangeSummary(cr.orderSet, orderSnapshot.Orders)
-	cr.replaceOrderDispatcher(nextOD)
-	cr.orderSet = orderSnapshot.Orders
-	cr.orderSetSignature = orderSnapshot.Signature
-	cr.orderRescanLast = time.Now()
-	cr.orderDispatchMu.Unlock()
-	if orderSummary != "unchanged" {
-		fmt.Fprintf(cr.stderr, "%s: orders reloaded: %s\n", cr.logPrefix, orderSummary) //nolint:errcheck // best-effort stderr
+	if cr.tryLockOrderDispatchMu(ctx) {
+		if cr.od != nil {
+			drainCtx, drainCancel := context.WithTimeout(ctx, reloadOrderDrainTimeout)
+			cr.drainOutgoingOrderDispatcher(drainCtx, cr.od)
+			drainCancel()
+		}
+		orderSummary := orderSetChangeSummary(cr.orderSet, orderSnapshot.Orders)
+		cr.replaceOrderDispatcher(nextOD)
+		cr.orderSet = orderSnapshot.Orders
+		cr.orderSetSignature = orderSnapshot.Signature
+		cr.orderRescanLast = time.Now()
+		cr.orderDispatchMu.Unlock()
+		if orderSummary != "unchanged" {
+			fmt.Fprintf(cr.stderr, "%s: orders reloaded: %s\n", cr.logPrefix, orderSummary) //nolint:errcheck // best-effort stderr
+		}
+	} else {
+		fmt.Fprintf(cr.stderr, "%s: order dispatch busy; deferring order-set refresh to next reload\n", cr.logPrefix) //nolint:errcheck // best-effort stderr
 	}
 
 	cr.serviceStateMu.Lock()
@@ -4038,20 +4178,42 @@ func (cr *CityRuntime) drainOutgoingOrderDispatcher(ctx context.Context, od orde
 	cr.retiredOrderDispatchers = append(cr.retiredOrderDispatchers, od)
 }
 
+// drainOrderDispatchers waits for in-flight dispatch goroutines on the
+// current and retired dispatchers to finish, bounded by ctx. Called from
+// shutdown() with the tick's own goroutine gone but the order-dispatch lane
+// goroutine potentially still running past orderDispatchLaneJoinTimeout
+// (#2604/#3368), so cr.od/cr.retiredOrderDispatchers are read and
+// written under orderDispatchMu rather than assumed quiescent. The mutex
+// acquisition itself is bounded (reloadOrderDispatchMuTimeout): a process
+// exiting does not need a perfect drain, and any tracking bead a skipped
+// drain leaves open is closed by sweepOrphanedOrderTrackingRetry on the
+// next boot.
 func (cr *CityRuntime) drainOrderDispatchers(ctx context.Context) {
-	var retained []orderDispatcher
-	if cr.od != nil && !cr.od.drain(ctx) {
-		retained = append(retained, cr.od)
+	if !cr.tryLockOrderDispatchMu(ctx) {
+		fmt.Fprintf(cr.stderr, "%s: order dispatch busy at shutdown; leaving drain to next boot's orphan sweep\n", cr.logPrefix) //nolint:errcheck // best-effort stderr
+		return
 	}
-	for _, od := range cr.retiredOrderDispatchers {
-		if od == nil {
+	od := cr.od
+	retired := append([]orderDispatcher(nil), cr.retiredOrderDispatchers...)
+	cr.orderDispatchMu.Unlock()
+
+	var retained []orderDispatcher
+	if od != nil && !od.drain(ctx) {
+		retained = append(retained, od)
+	}
+	for _, o := range retired {
+		if o == nil {
 			continue
 		}
-		if !od.drain(ctx) {
-			retained = append(retained, od)
+		if !o.drain(ctx) {
+			retained = append(retained, o)
 		}
 	}
-	cr.retiredOrderDispatchers = retained
+
+	if cr.tryLockOrderDispatchMu(ctx) {
+		cr.retiredOrderDispatchers = retained
+		cr.orderDispatchMu.Unlock()
+	}
 }
 
 func orderShutdownDrainTimeout(total time.Duration) time.Duration {
@@ -4143,7 +4305,16 @@ func (cr *CityRuntime) shutdown() {
 		if cr.forceStopRequested() {
 			gracefulTimeout = 0
 		}
-		if cr.od != nil || len(cr.retiredOrderDispatchers) > 0 {
+		// Bounded like drainOrderDispatchers below: the order-dispatch lane
+		// goroutine may still be running past orderDispatchLaneJoinTimeout in
+		// the pathological case, and this check must not itself become the
+		// thing that hangs shutdown.
+		hasOrderDispatchers := true
+		if cr.tryLockOrderDispatchMu(context.Background()) {
+			hasOrderDispatchers = cr.od != nil || len(cr.retiredOrderDispatchers) > 0
+			cr.orderDispatchMu.Unlock()
+		}
+		if hasOrderDispatchers {
 			drainTimeout := orderShutdownDrainTimeout(total)
 			if cr.forceStopRequested() {
 				drainTimeout = 0
