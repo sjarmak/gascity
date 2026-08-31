@@ -108,7 +108,16 @@ pane_run)
   printf '%s' "$4" | sed -e 's|^exec /bin/sh -c ||' -e "s/^'//" -e "s/'\$//" > "$STATE/rawcmd"
   exit 0 ;;
 pane_process-info)
-  if [ -e "$STATE/pane_gone" ]; then
+  if [ -e "$STATE/hang" ]; then
+    # Redirected off the inherited stdout pipe: exec.CommandContext kills
+    # only this script's own shell process on ctx cancellation, and an
+    # un-redirected sleep subprocess would survive that kill as an orphan
+    # still holding the pipe's write end open, so Output() would keep
+    # blocking for the sleep's own remaining duration instead of returning
+    # the moment the shell itself dies.
+    sleep 30 >/dev/null 2>&1
+    printf '%s' '{"result":{"process_info":{"shell_pid":4242,"foreground_processes":[{"pid":4242,"name":"zsh"}]}}}'
+  elif [ -e "$STATE/pane_gone" ]; then
     printf '%s' '{"error":{"code":"pane_not_found","message":"pane not found"}}'
   elif [ -e "$STATE/rawcmd" ]; then
     printf '%s' '{"result":{"process_info":{"shell_pid":4242,"foreground_processes":[{"pid":4242,"name":"bash","argv":["/bin/sh","-c","'"$(cat "$STATE/rawcmd")"'"]}]}}}'

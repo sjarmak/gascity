@@ -38,6 +38,20 @@ type Provider struct {
 	// act is the tracker-backed activity source behind GetLastActivity /
 	// CanReportActivity (#4217); started lazily on first GetLastActivity.
 	act activityTracker
+	// nameLocks backs lockName: a per-session-name mutex serializing the
+	// sidecar pane-binding sidecar's multi-file mutations (bindPlacement,
+	// clearPaneBinding, clearPaneBindingIfPane, clearMeta) and the
+	// coherent-snapshot reads in sidecarBindingLikelyCurrent against each
+	// other, since the sidecar has no single-file atomic representation to
+	// compare-and-swap against. Reference-counted (see lockName) so an entry
+	// is reclaimed the moment its last holder releases it, rather than
+	// growing unboundedly for the provider's whole lifetime under a
+	// session-naming scheme that churns names forever. nameLocksMu guards
+	// both the map and every entry's refcount so a lookup/increment can
+	// never race a decrement/delete into handing out two different mutexes
+	// for what should be one name's exclusion. Zero value is ready to use.
+	nameLocksMu sync.Mutex
+	nameLocks   map[string]*nameLock
 }
 
 // defaultSetupTimeout mirrors the tmux provider's [session] setup_timeout
@@ -165,7 +179,7 @@ func (p *Provider) start(ctx context.Context, name string, cfg runtime.Config) e
 	if err := p.seedMetaFromEnv(name, cfg.Env); err != nil {
 		return fmt.Errorf("herdr: seed session metadata for %q: %w", name, err)
 	}
-	if err := p.bindPlacement(name, info, mode); err != nil {
+	if err := p.bindPlacement(ctx, name, info, mode); err != nil {
 		return fmt.Errorf("herdr: persist pane binding for %q: %w", name, err)
 	}
 	// Clear any unconfirmed-delivery marker a prior life left behind, here
@@ -234,7 +248,7 @@ func (p *Provider) start(ctx context.Context, name string, cfg runtime.Config) e
 	// This binding is what keeps IsRunning/paneID resolving the session when
 	// no registry name exists — herdr ≥0.7.4 clears names on occupant change,
 	// and raw/bare-shell sessions never register one (see panebinding.go).
-	if err := p.bindPlacement(name, info, mode); err != nil {
+	if err := p.bindPlacement(ctx, name, info, mode); err != nil {
 		return fmt.Errorf("herdr: persist pane binding for %q: %w", name, err)
 	}
 	// Post-launch steps mirror tmux's doStartSession ordering: wait for
@@ -863,10 +877,18 @@ func (p *Provider) ListRunning(prefix string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A failed sidecar read loses only the raw-shell/undetected-agent names
+	// boundSessionNames would have added on top of the registry — the
+	// registry listing below is still a complete, independently-obtained
+	// result. Returning it with PartialListError (rather than discarding it
+	// for a hard error) keeps every registry-visible session reporting as
+	// running through a transient sidecar failure, instead of every one of
+	// them going invisible until the sidecar recovers.
+	bound, boundErr := p.boundSessionNames()
 	seen := make(map[string]bool)   // gc names already listed
 	mapped := make(map[string]bool) // herdr-side names owned by bound gc sessions
 	var out []string
-	for _, name := range p.boundSessionNames() {
+	for _, name := range bound {
 		mapped[herdrAgentName(name)] = true
 		if !strings.HasPrefix(name, prefix) || seen[name] {
 			continue
@@ -881,6 +903,9 @@ func (p *Provider) ListRunning(prefix string) ([]string, error) {
 			seen[a.Name] = true
 			out = append(out, a.Name)
 		}
+	}
+	if boundErr != nil {
+		return out, &runtime.PartialListError{Err: fmt.Errorf("herdr: list bound sessions: %w", boundErr)}
 	}
 	return out, nil
 }
@@ -1048,6 +1073,7 @@ func (p *Provider) RemoveMeta(name, key string) error {
 }
 
 func (p *Provider) clearMeta(name string) error {
+	defer p.lockName(name)()
 	return os.RemoveAll(filepath.Join(p.metaDir, sanitize(name)))
 }
 
