@@ -666,6 +666,32 @@ func TestDerivePoolSessionNameStepsAsideForTransientSlot(t *testing.T) {
 	}
 }
 
+// TestDerivePoolSessionNameAcceptsPathShapedIdentity reproduces gc-vf1mg: a
+// rig-less pool agent identified by an absolute directory path (no short rig
+// name) encodes its leading "/" to a leading "--" via
+// agent.SanitizeQualifiedNameForSession, and the runtime session-name grammar
+// (sessionNamePattern) requires the name to start with an alphanumeric
+// character. Before the fix this made derivePoolSessionName return
+// ErrInvalidSessionName for every slot of such a pool — poolDesired=1 but
+// zero session was ever created (~/.gc/supervisor.log, 2026-08-30T23:31Z).
+func TestDerivePoolSessionNameAcceptsPathShapedIdentity(t *testing.T) {
+	const template = "/home/ds/gas-city/city-infra-worker"
+	got, err := derivePoolSessionName(template, poolSessionCreateIdentity{
+		AgentName:     "/home/ds/gas-city/city-infra-worker-1",
+		Slot:          1,
+		TransientSlot: true,
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("derivePoolSessionName: %v", err)
+	}
+	if _, err := session.ValidateExplicitName(got); err != nil {
+		t.Fatalf("derived name %q is not a valid explicit session name: %v", got, err)
+	}
+	if strings.HasPrefix(got, "-") {
+		t.Fatalf("derived name %q must not start with '-'", got)
+	}
+}
+
 // TestPoolRuntimeSessionNameBoundsPoolSuffix pins the length-limit boundary on
 // the named-session step-aside lane: when a pool instance's identity name is
 // valid at exactly the explicit-name limit AND collides with a configured named
