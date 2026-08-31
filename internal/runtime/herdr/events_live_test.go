@@ -163,6 +163,22 @@ func TestSessionEventsLive(t *testing.T) {
 		return ev.Kind == runtime.SessionEventResync
 	})
 
+	// evt-a's binding predates the bounce and was never re-Start'ed; its
+	// status events must still arrive attributed afterward, proving the
+	// pre-bounce sidecar binding survives the reconnect/prune logic intact
+	// rather than being silently dropped or misattributed.
+	report(paneA, herdrAgentName("evt-a"), "idle")
+	waitForEvent(t, ch, 10*time.Second, func(ev runtime.SessionEvent) bool {
+		return ev.Kind == runtime.SessionEventAgentDetected && ev.Session == "evt-a"
+	})
+	report(paneA, herdrAgentName("evt-a"), "working")
+	postBounce := waitForEvent(t, ch, 10*time.Second, func(ev runtime.SessionEvent) bool {
+		return ev.Kind == runtime.SessionEventAgentStatus && ev.Session == "evt-a" && ev.AgentStatus == "working"
+	})
+	if postBounce.Ref != paneA {
+		t.Errorf("post-bounce evt-a status event ref = %q, want %q", postBounce.Ref, paneA)
+	}
+
 	cancel()
 	deadline := time.After(3 * time.Second)
 	for {
