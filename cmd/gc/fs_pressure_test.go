@@ -282,111 +282,15 @@ func TestCityRuntimeTickSkipsBeforeManagedDoltAndDemandUnderFSPressure(t *testin
 	}
 }
 
-func TestCityRuntimeTickSkipsDueOrderDispatchUnderFSPressure(t *testing.T) {
-	withFakePressureFile(t, []byte(samplePressureHigh), nil)
-	t.Setenv(fsPressureThresholdEnv, "")
-
-	store := beads.NewMemStore()
-	releaseExec := make(chan struct{})
-	execStarted := make(chan struct{}, 1)
-	fakeExec := func(ctx context.Context, _, _ string, _ []string) ([]byte, error) {
-		select {
-		case execStarted <- struct{}{}:
-		default:
-		}
-		select {
-		case <-releaseExec:
-			return []byte("ok\n"), nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	ad := buildOrderDispatcherFromListExec(
-		[]orders.Order{{Name: "pressure-due", Trigger: "cooldown", Interval: "1s", Exec: "scripts/noop.sh"}},
-		store, nil, fakeExec, nil,
-	)
-	if ad == nil {
-		t.Fatal("expected non-nil dispatcher")
-	}
-	if mad, ok := ad.(*memoryOrderDispatcher); ok {
-		t.Cleanup(mad.cancel)
-	}
-	t.Cleanup(func() { close(releaseExec) })
-
-	var buildCalls atomic.Int32
-	var stderr bytes.Buffer
-	rec := events.NewFake()
-	sp := runtime.NewFake()
-	cr := &CityRuntime{
-		cityPath:            t.TempDir(),
-		cityName:            "test-city",
-		cfg:                 &config.City{Workspace: config.Workspace{Name: "test-city"}},
-		sp:                  sp,
-		standaloneCityStore: store,
-		buildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
-			buildCalls.Add(1)
-			return DesiredStateResult{State: map[string]TemplateParams{}}
-		},
-		dops:          newDrainOps(sp),
-		od:            ad,
-		rec:           rec,
-		sessionDrains: newDrainTracker(),
-		logPrefix:     "gc test",
-		stdout:        io.Discard,
-		stderr:        &stderr,
-		managedDoltOwned: func(string) (bool, error) {
-			t.Fatal("managed dolt preflight should not run before pressure-skip gate")
-			return false, nil
-		},
-	}
-
-	dirty := &atomic.Bool{}
-	lastProviderName := ""
-	prevPoolRunning := map[string]bool{}
-	cr.tick(context.Background(), dirty, &lastProviderName, cr.cityPath, &prevPoolRunning, "patrol")
-
-	if got := buildCalls.Load(); got != 0 {
-		t.Fatalf("build desired calls = %d, want 0 before pressure-skip gate", got)
-	}
-	tracking, err := store.ListByLabel("order-run:pressure-due", 0, beads.IncludeClosed)
-	if err != nil {
-		t.Fatalf("list order tracking beads: %v", err)
-	}
-	if len(tracking) != 0 {
-		t.Fatalf("order tracking beads = %#v, want none while FS pressure skips tick", tracking)
-	}
-	select {
-	case <-execStarted:
-		t.Fatal("order exec started during pressure-skipped tick")
-	default:
-	}
-	if !strings.Contains(stderr.String(), "FS pressure high") {
-		t.Fatalf("stderr = %q, want FS pressure skip warning", stderr.String())
-	}
-	evts, err := rec.List(events.Filter{Type: events.SupervisorFSPressureSkippedTick})
-	if err != nil {
-		t.Fatalf("list FS pressure events: %v", err)
-	}
-	if len(evts) != 1 {
-		t.Fatalf("FS pressure events = %#v, want one skip event", evts)
-	}
-	var payload events.SupervisorFSPressureSkippedTickPayload
-	if err := json.Unmarshal(evts[0].Payload, &payload); err != nil {
-		t.Fatalf("unmarshal payload: %v", err)
-	}
-	if payload.Outcome != fsPressureOutcomeSkipped {
-		t.Fatalf("payload outcome = %q, want %q", payload.Outcome, fsPressureOutcomeSkipped)
-	}
-}
-
 // TestOrderDispatchLaneRunsDespiteFSPressure is the #3368 regression test.
-// shouldSkipTickForFSPressure gates the tick itself, and order dispatch used
-// to run inline on the tick — so sustained FS pressure silently suppressed
-// due order work indefinitely, exactly as
-// TestCityRuntimeTickSkipsDueOrderDispatchUnderFSPressure above still shows
-// for the tick. The order-dispatch lane (startOrderDispatchLane) never calls
-// shouldSkipTickForFSPressure, so it keeps firing due orders on the very
-// same CityRuntime even while the tick is skipping.
+// shouldSkipTickForFSPressure gates only the tick's own build/managed-Dolt/
+// reconcile phases (proven by
+// TestCityRuntimeTickSkipsBeforeManagedDoltAndDemandUnderFSPressure above);
+// order dispatch is no longer reachable from tick() at all, so a
+// tick-level "order dispatch skipped under pressure" test would be vacuous
+// by construction. The order-dispatch lane (startOrderDispatchLane) never
+// calls shouldSkipTickForFSPressure, so it keeps firing due orders on the
+// very same CityRuntime even while the tick is skipping.
 func TestOrderDispatchLaneRunsDespiteFSPressure(t *testing.T) {
 	withFakePressureFile(t, []byte(samplePressureHigh), nil)
 	t.Setenv(fsPressureThresholdEnv, "")

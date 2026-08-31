@@ -5,6 +5,7 @@ import (
 	"io"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
@@ -176,5 +177,52 @@ func TestCityRuntimeShutdownClosesStorageRoutesWhenSessionsArePreserved(t *testi
 	cr.shutdown()
 	if observed.closes != 1 {
 		t.Fatalf("a second shutdown closed the storage binding again (%d closes total)", observed.closes)
+	}
+}
+
+// TestCityRuntimeShutdownWaitsForOrderDispatchLaneBeforeClosingStorage pins
+// the #2604/#3368 review followup's Finding #4: shutdown() itself waits
+// (bounded by orderDispatchLaneJoinTimeout) for the order-dispatch lane's
+// done channel before its deferred storageRoutes.close() runs — not only
+// run()'s own defer-chain join. stopManagedCity's forced-timeout fallback
+// calls shutdown() directly, bypassing run()'s defer chain entirely, so
+// without this wait inside shutdown() too, a still-running lane goroutine
+// could call into a storage binding shutdown() already closed out from
+// under it.
+func TestCityRuntimeShutdownWaitsForOrderDispatchLaneBeforeClosingStorage(t *testing.T) {
+	cr, _, _ := splitCityRuntime(t)
+
+	observed := &observedStorageCloser{closer: cr.storageRoutes.closers[0]}
+	cr.storageRoutes.closers = []io.Closer{observed}
+
+	laneDone := make(chan struct{})
+	cr.orderDispatchMu.Lock()
+	cr.orderDispatchLaneDone = laneDone
+	cr.orderDispatchMu.Unlock()
+
+	shutdownReturned := make(chan struct{})
+	go func() {
+		cr.shutdown()
+		close(shutdownReturned)
+	}()
+
+	select {
+	case <-shutdownReturned:
+		t.Fatal("shutdown returned before the order-dispatch lane's done channel closed")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if observed.closes != 0 {
+		t.Fatalf("storage routes closed %d time(s) while the order-dispatch lane was still running, want 0", observed.closes)
+	}
+
+	close(laneDone)
+
+	select {
+	case <-shutdownReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown did not return after the order-dispatch lane's done channel closed")
+	}
+	if observed.closes != 1 {
+		t.Fatalf("storage routes closed %d time(s) after shutdown returned, want exactly 1", observed.closes)
 	}
 }
