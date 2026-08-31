@@ -27,14 +27,16 @@
 - [ ] Updated docs for user-facing changes
 - [ ] Called out breaking changes or migration notes
 
-## Review record
+## Reviewer comment template
 
-Each reviewer records the exact head SHA, what they inspected, checks they ran,
-and known gaps. See
-[REVIEWING.md](https://github.com/gastownhall/gascity/blob/main/REVIEWING.md).
+Each reviewer should copy the block below into their own review comment. Do not
+ask the pull-request author to record someone else's review. Repeat it once per
+reviewer. See [REVIEWING.md](../REVIEWING.md).
 
+```text
 - Head SHA:
 - Inspected:
 - Checks run:
 - Not checked / known gaps:
 - Material findings resolved or explicitly declined:
+```

@@ -26,7 +26,14 @@ encouragement, not a review record.
 - Other changes need two independent approvals from people other than the
   author.
 - Security, architecture, wire-format, and durable-state changes also need a
-  designated maintainer or area owner to resolve the high-impact decision.
+  designated maintainer or an area owner named in
+  [.github/CODEOWNERS](.github/CODEOWNERS) to resolve the high-impact decision.
+
+When a second independent reviewer is unavailable, a change may proceed with
+one independent approval only if the pull request records the open request for
+a second reviewer, the missing approval, and the final maintainer's explicit
+acceptance of that shortfall. The author cannot supply the independent approval
+or accept the exception. This is a visible bootstrap path, not a silent waiver.
 
 Maintainer-authored changes use the same gate. A maintainer may perform final
 review and merge, but may not replace the independent reviews with their own
@@ -47,7 +54,8 @@ crosses a security or publication boundary, or cannot yet be reproduced. State
 that reason and the single fact or decision that would unblock a patch.
 
 If reviewers cannot resolve a design disagreement, ask the designated area
-owner or maintainer to decide the disputed point. That decision ends the review
+owner in [.github/CODEOWNERS](.github/CODEOWNERS), or a maintainer when no area
+owner is listed, to decide the disputed point. That decision ends the review
 deadlock; it does not make unrelated scope mandatory.
 
 ## Final authority
