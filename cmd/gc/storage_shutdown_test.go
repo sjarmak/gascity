@@ -227,6 +227,45 @@ func TestCityRuntimeShutdownWaitsForOrderDispatchLaneBeforeClosingStorage(t *tes
 	}
 }
 
+// TestCityRuntimeShutdownLeavesStorageOpenWhenOrderDispatchLaneNeverExits
+// pins the #2604/#3368 review's fourth-pass followup: a lane that never
+// confirms exit within orderDispatchLaneJoinTimeout must NOT have
+// storageRoutes closed out from under it. A bounded wait only bounds how
+// long shutdown() waits for the common case; it must not license closing a
+// binding a still-running caller may be mid-call against. Shrinks the
+// package-level timeout var so the test does not wait out the real 10s.
+func TestCityRuntimeShutdownLeavesStorageOpenWhenOrderDispatchLaneNeverExits(t *testing.T) {
+	orig := orderDispatchLaneJoinTimeout
+	orderDispatchLaneJoinTimeout = 50 * time.Millisecond
+	defer func() { orderDispatchLaneJoinTimeout = orig }()
+
+	cr, _, _ := splitCityRuntime(t)
+
+	observed := &observedStorageCloser{closer: cr.storageRoutes.closers[0]}
+	cr.storageRoutes.closers = []io.Closer{observed}
+
+	// A lane that never closes its done channel: it never confirms exit.
+	laneDone := make(chan struct{})
+	cr.orderDispatchLaneDoneMu.Lock()
+	cr.orderDispatchLaneDone = laneDone
+	cr.orderDispatchLaneDoneMu.Unlock()
+
+	shutdownReturned := make(chan struct{})
+	go func() {
+		cr.shutdown()
+		close(shutdownReturned)
+	}()
+
+	select {
+	case <-shutdownReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown did not return after the shrunk order-dispatch lane join timeout elapsed")
+	}
+	if observed.closes != 0 {
+		t.Fatalf("storage routes closed %d time(s) while the order-dispatch lane never confirmed exit, want 0", observed.closes)
+	}
+}
+
 // TestCityRuntimeShutdownDoesNotBlockOnOrderDispatchMu pins the #2604/#3368
 // review's third-pass followup: orderDispatchLaneDone must be read under its
 // own dedicated mutex (orderDispatchLaneDoneMu), not orderDispatchMu.
