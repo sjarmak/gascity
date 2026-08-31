@@ -102,6 +102,73 @@ func TestResolveTemplatePrependsGCBinDirToConfiguredAgentPATH(t *testing.T) {
 	}
 }
 
+func TestResolveTemplatePrependsSessionBdPathShimForBdCity(t *testing.T) {
+	cityPath := t.TempDir()
+	writeTemplateResolveCityConfig(t, cityPath, "bd")
+	sep := string(os.PathListSeparator)
+	t.Setenv("PATH", "/opt/homebrew/bin"+sep+"/usr/bin")
+
+	params := &agentBuildParams{
+		cityName:   "city",
+		cityPath:   cityPath,
+		workspace:  &config.Workspace{Provider: "test"},
+		providers:  map[string]config.ProviderSpec{"test": {Command: "echo", PromptMode: "none"}},
+		lookPath:   func(string) (string, error) { return "/bin/echo", nil },
+		fs:         fsys.OSFS{},
+		beaconTime: time.Unix(0, 0),
+		beadNames:  make(map[string]string),
+		stderr:     io.Discard,
+	}
+
+	agent := &config.Agent{Name: "runner"}
+	tp, err := resolveTemplate(params, agent, agent.QualifiedName(), nil)
+	if err != nil {
+		t.Fatalf("resolveTemplate: %v", err)
+	}
+
+	wantShimDir := sessionBdPathShimDir(cityPath)
+	parts := strings.Split(tp.Env["PATH"], sep)
+	if len(parts) == 0 || parts[0] != wantShimDir {
+		t.Fatalf("PATH first entry = %q, want session bd path shim dir %q (PATH=%q)", parts[0], wantShimDir, tp.Env["PATH"])
+	}
+
+	shimPath := sessionBdPathShimScriptPath(cityPath)
+	if _, err := os.Stat(shimPath); err != nil {
+		t.Fatalf("Stat(shim): %v", err)
+	}
+}
+
+func TestResolveTemplateSkipsSessionBdPathShimForNonBdCity(t *testing.T) {
+	cityPath := t.TempDir()
+	writeTemplateResolveCityConfig(t, cityPath, "file")
+
+	params := &agentBuildParams{
+		cityName:   "city",
+		cityPath:   cityPath,
+		workspace:  &config.Workspace{Provider: "test"},
+		providers:  map[string]config.ProviderSpec{"test": {Command: "echo", PromptMode: "none"}},
+		lookPath:   func(string) (string, error) { return "/bin/echo", nil },
+		fs:         fsys.OSFS{},
+		beaconTime: time.Unix(0, 0),
+		beadNames:  make(map[string]string),
+		stderr:     io.Discard,
+	}
+
+	agent := &config.Agent{Name: "runner"}
+	tp, err := resolveTemplate(params, agent, agent.QualifiedName(), nil)
+	if err != nil {
+		t.Fatalf("resolveTemplate: %v", err)
+	}
+
+	wantShimDir := sessionBdPathShimDir(cityPath)
+	if strings.Contains(tp.Env["PATH"], wantShimDir) {
+		t.Fatalf("PATH=%q should not contain session bd path shim dir for a non-bd city", tp.Env["PATH"])
+	}
+	if _, err := os.Stat(sessionBdPathShimScriptPath(cityPath)); !os.IsNotExist(err) {
+		t.Fatalf("stat session bd path shim err = %v, want IsNotExist for non-bd city", err)
+	}
+}
+
 func TestResolveTemplateUsesTrustedRuntimeRootForControlTraceDefault(t *testing.T) {
 	cityPath := t.TempDir()
 	writeTemplateResolveCityConfig(t, cityPath, "file")

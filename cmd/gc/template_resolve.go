@@ -455,6 +455,19 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	}
 	env := mergeEnv(passthroughEnv(), expandEnvMap(workspaceEnv), expandEnvMap(resolved.Env), expandEnvMap(cfgAgent.Env), agentEnv)
 	processenv.PrependGCBinDirToPATH(env, env["GC_BIN"])
+	// Prepend the session bd path shim so a bare `bd` typed (or run by a
+	// formula step) inside this session resolves through `gc bd`'s call-time
+	// canonical endpoint resolution instead of the env baked in here at
+	// session creation. Without this, a managed Dolt port rotation after the
+	// session starts strands bare bd calls on the stale port and their own
+	// recovery hint (`bd dolt start`) boots a divergent database.
+	// See gastownhall/gascity#792.
+	if cityUsesBdStoreContract(p.cityPath) {
+		if err := ensureSessionBdPathShim(p.cityPath); err != nil {
+			return TemplateParams{}, fmt.Errorf("agent %q: preparing session bd path shim: %w", qualifiedName, err)
+		}
+		processenv.PrependDirToPATH(env, sessionBdPathShimDir(p.cityPath))
+	}
 	env = convergence.ScrubTokenEnv(env)
 
 	// Step 10b: Upstream axis (Phase C). Inject the selected upstream's serving

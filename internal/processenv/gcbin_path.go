@@ -30,6 +30,17 @@ func PrependGCBinDirToPATH(env map[string]string, gcBin string) {
 	if dir == "" || dir == "." {
 		return
 	}
+	PrependDirToPATH(env, dir)
+}
+
+// PrependDirToPATH ensures dir is the first entry in env["PATH"], moving it
+// to the front if already present rather than duplicating it. If env["PATH"]
+// is unset, falls back to the calling process's PATH as the base. A no-op
+// for an empty dir.
+func PrependDirToPATH(env map[string]string, dir string) {
+	if dir == "" {
+		return
+	}
 	sep := string(os.PathListSeparator)
 	base, ok := env["PATH"]
 	if !ok {

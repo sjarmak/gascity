@@ -83,6 +83,9 @@ func EnsureBuiltinRuntimeAssets(cityPath string, warningWriter io.Writer) error 
 	if err := ensureGcBeadsBdShim(cityPath); err != nil {
 		problems = append(problems, fmt.Errorf("writing gc-beads-bd shim: %w", err))
 	}
+	if err := ensureSessionBdPathShim(cityPath); err != nil {
+		problems = append(problems, fmt.Errorf("writing session bd path shim: %w", err))
+	}
 	pruneRetiredSystemPacks(cityPath, warningWriter)
 
 	if len(problems) > 0 {
