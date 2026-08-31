@@ -252,13 +252,19 @@ func (g *Git) HasUnreachableCommitsResult() (bool, error) {
 // repository's default branch or every HEAD-only commit is patch-equivalent to
 // that branch. Reachability from other refs (including rescue refs) is
 // deliberately irrelevant: such refs preserve work but do not prove landing.
+//
+// refs/remotes/origin/<branch> is checked before refs/heads/<branch>: the
+// remote-tracking ref is the canonical record of what actually landed
+// upstream, while the local branch ref is a convenience ref a caller can
+// advance (merge, reset, rebase) without ever pushing. Preferring the local
+// ref would let an unpushed local merge read as landed.
 func (g *Git) HeadLandedOnDefaultResult() (bool, error) {
 	branch, err := g.DefaultBranch()
 	if err != nil {
 		return false, fmt.Errorf("resolving default branch: %w", err)
 	}
 	var defaultRef string
-	for _, candidate := range []string{"refs/heads/" + branch, "refs/remotes/origin/" + branch} {
+	for _, candidate := range []string{"refs/remotes/origin/" + branch, "refs/heads/" + branch} {
 		if _, probeErr := g.run("rev-parse", "--verify", candidate+"^{commit}"); probeErr == nil {
 			defaultRef = candidate
 			break
