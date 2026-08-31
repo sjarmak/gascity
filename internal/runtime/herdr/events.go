@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -112,52 +113,131 @@ func (p *Provider) SubscribeSessionEvents(ctx context.Context) (<-chan runtime.S
 // not detected — a raw shell, or an agent kind herdr's detector does not
 // recognize, or simply one not yet classified — gets neither a paneNames
 // entry nor a status subscription, so its events are silently undeliverable.
-// Sidecar entries take precedence for the name attributed to a pane: it is
-// the exact gc session name, where the registry's a.Name is herdrAgentName's
-// lossy, length-capped mapping and only coincidentally equals it.
+//
+// Sidecar entries generally take precedence for the name attributed to a
+// pane: it is the exact gc session name, where the registry's a.Name is
+// herdrAgentName's lossy, length-capped mapping and only coincidentally
+// equals it. But pane ids recycle, so a sidecar binding is only trusted when
+// the registry does not contradict it: if the registry has since detected a
+// DIFFERENT agent on that exact pane id (its mapped name doesn't match what
+// herdrAgentName would produce for the sidecar's session), the registry is
+// the fresher source and wins — otherwise a stale old-session→pane binding
+// would silently steal every status/exit/close event belonging to whatever
+// new session now actually occupies that recycled pane.
 func (p *Provider) derivedFilterSet(ctx context.Context) (paneNames map[string]string, err error) {
 	agents, err := p.c.sockAgentList(ctx)
 	if err != nil {
 		return nil, err
 	}
+	registryPane := make(map[string]string, len(agents)) // pane id -> herdr registry name
 	paneNames = make(map[string]string, len(agents))
 	for _, a := range agents {
 		if a.PaneID == "" || a.Name == "" {
 			continue
 		}
+		registryPane[a.PaneID] = a.Name
 		paneNames[a.PaneID] = a.Name
 	}
-	for pane, name := range p.boundPaneBindings() {
+	bound, err := p.boundPaneBindings()
+	if err != nil {
+		return nil, err
+	}
+	for pane, name := range bound {
+		if reg, ok := registryPane[pane]; ok && reg != herdrAgentName(name) {
+			continue // registry has fresher knowledge of this pane: a different agent occupies it now
+		}
 		paneNames[pane] = name
 	}
 	return paneNames, nil
 }
 
-// stalePaneNotFound matches herdr's events.subscribe rejection for a
-// per-pane filter naming a pane it no longer has, e.g.
-// "pane_not_found: pane w3:p1 not found".
-var stalePaneNotFound = regexp.MustCompile(`^pane_not_found: pane (\S+) not found$`)
+// stalePaneToken matches a pane-id-shaped token anywhere in a herdr
+// pane_not_found rejection message: herdr pane ids look like "w1:p1" or
+// "%5" — a colon- or percent-delimited handle, never a bare English word —
+// which lets extraction skip past surrounding prose ("pane not found" names
+// no pane at all; matching on the word "pane" there would wrongly capture
+// "not") while still finding every id in a message naming several, and
+// staying immune to wrapping, quoting, or punctuation changes around them.
+// Message TEXT is not part of herdr's wire contract, so this is deliberately
+// loose; only the structural error code (checked by stalePaneIDs) is
+// trusted to mean anything.
+var stalePaneToken = regexp.MustCompile(`[A-Za-z0-9_-]*:[A-Za-z0-9_-]+|%[0-9]+`)
 
-// stalePaneID extracts the offending pane id from a stale-pane
-// events.subscribe rejection, if err is one.
-func stalePaneID(err error) (pane string, ok bool) {
-	m := stalePaneNotFound.FindStringSubmatch(err.Error())
-	if m == nil {
-		return "", false
+// stalePaneIDs reports the pane ids a herdr events.subscribe rejection
+// named, and whether err is a pane_not_found rejection at all — checked
+// structurally via the typed *herdrError code, not by matching message text,
+// since the code (unlike the message) is herdr's actual wire contract. Pane
+// ids have no structured field in the wire error envelope, so they are
+// best-effort extracted from the message; ok is true whenever the code
+// matches even if extraction finds nothing (e.g. a message that never names
+// the pane, like herdr's plain "pane not found"), so a caller can still tell
+// "this cycle's filter set has a stale pane somewhere" from "the rejection
+// was unrelated."
+func stalePaneIDs(err error) (panes []string, ok bool) {
+	if herdrErrorCode(err) != "pane_not_found" {
+		return nil, false
 	}
-	return m[1], true
+	var he *herdrError
+	if !errors.As(err, &he) {
+		return nil, true
+	}
+	return stalePaneToken.FindAllString(he.Message, -1), true
 }
 
-// pruneStalePane drops pane from this cycle's filter set and, if it is a
-// sidecar-bound session, clears the stale binding so it stops being
-// resubmitted on every future cycle.
-func (s *sessionEventStream) pruneStalePane(pane string) {
+// pruneStalePane drops pane from this cycle's in-memory filter set so an
+// immediate retry does not resubmit the identical rejected filter. If it is
+// a sidecar-bound session, it also tries to clear the durable binding — but
+// only if the binding still points at this exact pane (clearPaneBindingIfMatches):
+// the snapshot derivedFilterSet took at cycle start can be stale by the time
+// the rejection comes back, and clearing by name alone could destroy a
+// binding a concurrent Start has since rewritten to a different, live pane.
+func (s *sessionEventStream) pruneStalePane(pane string) error {
 	name := s.paneNames[pane]
 	delete(s.paneNames, pane)
 	delete(s.subscribed, pane)
-	if name != "" {
-		s.p.clearPaneBinding(name)
+	if name == "" {
+		return nil
 	}
+	return s.p.clearPaneBindingIfMatches(name, pane)
+}
+
+// handleSubscribeRejection processes an events.subscribe rejection, pruning
+// any stale pane(s) it names from this cycle's filter set. It reports
+// whether the caller should retry immediately (resubscribe: pruning actually
+// shrank the filter set, so the retry's subscribe request differs from the
+// one just rejected) versus back off. A pane_not_found rejection whose named
+// panes are all unknown to this cycle (a garbled or unrelated message) or
+// whose clears all failed makes no progress: retrying immediately would just
+// resubmit the identical filter set and reproduce the identical rejection at
+// full speed with backoff disabled, which is the busy loop the exact-head
+// review caught — so that case reports resubscribe=false. prunedErr is
+// non-nil only when pruning was attempted and failed; a rejection unrelated
+// to a stale pane returns (false, nil), leaving the original err for the
+// caller to report.
+func (s *sessionEventStream) handleSubscribeRejection(err error) (resubscribe bool, prunedErr error) {
+	panes, ok := stalePaneIDs(err)
+	if !ok {
+		return false, nil
+	}
+	pruned := false
+	var joinErr error
+	for _, pane := range panes {
+		if _, known := s.paneNames[pane]; !known {
+			continue
+		}
+		if cerr := s.pruneStalePane(pane); cerr != nil {
+			joinErr = errors.Join(joinErr, cerr)
+			continue
+		}
+		pruned = true
+	}
+	if pruned {
+		return true, nil
+	}
+	if joinErr != nil {
+		return false, fmt.Errorf("pruning stale pane(s): %w", joinErr)
+	}
+	return false, nil
 }
 
 // runSessionEventStream drives connection cycles until ctx is canceled. A
@@ -271,11 +351,11 @@ func (s *sessionEventStream) runCycle(ctx context.Context) (resubscribe bool, er
 		// binding left over from a session whose pane died without Stop
 		// clearing it (a crash, or a server bounce that dropped every pane).
 		// Left alone this is a permanent wedge: the same stale pane would be
-		// resubmitted every cycle and reject every subscribe forever. Prune
-		// the named pane and retry immediately rather than backing off.
-		if pane, ok := stalePaneID(err); ok {
-			s.pruneStalePane(pane)
+		// resubmitted every cycle and reject every subscribe forever.
+		if resub, prunedErr := s.handleSubscribeRejection(err); resub {
 			return true, nil
+		} else if prunedErr != nil {
+			return false, fmt.Errorf("herdr events.subscribe: %w", prunedErr)
 		}
 		return false, fmt.Errorf("herdr events.subscribe: %w", err)
 	}
@@ -447,7 +527,10 @@ func sockSend(conn net.Conn, method string, params any) error {
 	return err
 }
 
-// readSockResponse reads one response line and unwraps the envelope.
+// readSockResponse reads one response line and unwraps the envelope. A wire
+// error is returned as the typed *herdrError (via errors.As), not flattened
+// into a string: stalePaneIDs needs the structural Code field, which
+// fmt.Errorf("%s: %s", ...) would discard.
 func readSockResponse(r *bufio.Reader) (json.RawMessage, error) {
 	line, err := r.ReadBytes('\n')
 	if err != nil {
@@ -458,7 +541,7 @@ func readSockResponse(r *bufio.Reader) (json.RawMessage, error) {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 	if env.Error != nil {
-		return nil, fmt.Errorf("%s: %s", env.Error.Code, env.Error.Message)
+		return nil, env.Error
 	}
 	return env.Result, nil
 }

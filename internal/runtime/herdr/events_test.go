@@ -4,9 +4,12 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	goruntime "runtime"
 	"sync"
 	"testing"
@@ -490,5 +493,190 @@ func TestSessionEventStreamCtxCancelClosesChannel(t *testing.T) {
 		case <-deadline:
 			t.Fatal("channel not closed within 3s of ctx cancel")
 		}
+	}
+}
+
+// TestStalePaneIDs pins the typed-error gate plus the shape-based extraction
+// fallback: only a pane_not_found herdrError (however wrapped) qualifies, and
+// pane ids are pulled from free text by punctuation shape, not by the word
+// "pane" — herdr's real fixture message carries no id at all.
+func TestStalePaneIDs(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		wantOK    bool
+		wantPanes []string
+	}{
+		{
+			name:   "non-herdr error",
+			err:    errors.New("boom"),
+			wantOK: false,
+		},
+		{
+			name:   "herdr error, unrelated code",
+			err:    &herdrError{Code: "agent_not_found", Message: "agent target not found"},
+			wantOK: false,
+		},
+		{
+			name:      "pane_not_found, single id",
+			err:       &herdrError{Code: "pane_not_found", Message: "pane w3:p1 not found"},
+			wantOK:    true,
+			wantPanes: []string{"w3:p1"},
+		},
+		{
+			name:      "pane_not_found, quoted id",
+			err:       &herdrError{Code: "pane_not_found", Message: `pane "w3:p1" not found`},
+			wantOK:    true,
+			wantPanes: []string{"w3:p1"},
+		},
+		{
+			name:      "pane_not_found, several ids",
+			err:       &herdrError{Code: "pane_not_found", Message: "panes w3:p1, w4:p2 not found"},
+			wantOK:    true,
+			wantPanes: []string{"w3:p1", "w4:p2"},
+		},
+		{
+			name:      "pane_not_found, percent-form id",
+			err:       &herdrError{Code: "pane_not_found", Message: "pane %5 not found"},
+			wantOK:    true,
+			wantPanes: []string{"%5"},
+		},
+		{
+			name:      "pane_not_found, real fixture text has no id — must not capture the word 'not'",
+			err:       &herdrError{Code: "pane_not_found", Message: "pane not found"},
+			wantOK:    true,
+			wantPanes: nil,
+		},
+		{
+			name:      "pane_not_found, wrapped",
+			err:       fmt.Errorf("herdr events.subscribe: %w", &herdrError{Code: "pane_not_found", Message: "pane w3:p1 not found"}),
+			wantOK:    true,
+			wantPanes: []string{"w3:p1"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			panes, ok := stalePaneIDs(tt.err)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if !reflect.DeepEqual(panes, tt.wantPanes) {
+				t.Fatalf("panes = %v, want %v", panes, tt.wantPanes)
+			}
+		})
+	}
+}
+
+// TestHandleSubscribeRejectionRetriesOnlyOnProgress pins the exact-head
+// review's busy-loop finding: a pane_not_found rejection naming a pane this
+// cycle never subscribed to must NOT trigger an unconditional resubscribe —
+// only pruning a pane actually known to this cycle counts as progress.
+func TestHandleSubscribeRejectionRetriesOnlyOnProgress(t *testing.T) {
+	t.Run("prunes a known stale pane and reports progress", func(t *testing.T) {
+		p := sidecarProvider(t)
+		bindAt(t, p, "session-a", "w3:p1", 1000)
+		s := &sessionEventStream{
+			p:          p,
+			paneNames:  map[string]string{"w3:p1": "session-a"},
+			subscribed: map[string]bool{"w3:p1": true},
+		}
+		resub, err := s.handleSubscribeRejection(&herdrError{Code: "pane_not_found", Message: "pane w3:p1 not found"})
+		if !resub || err != nil {
+			t.Fatalf("handleSubscribeRejection = %v, %v; want true, nil", resub, err)
+		}
+		if _, still := s.paneNames["w3:p1"]; still {
+			t.Error("stale pane not dropped from in-cycle filter set")
+		}
+		if got, _ := p.GetMeta("session-a", metaBoundPane); got != "" {
+			t.Errorf("durable binding survived a matching prune: %q", got)
+		}
+	})
+
+	t.Run("named pane unknown to this cycle: backs off instead of spinning", func(t *testing.T) {
+		s := &sessionEventStream{
+			p:          sidecarProvider(t),
+			paneNames:  map[string]string{"w1:p1": "session-live"},
+			subscribed: map[string]bool{"w1:p1": true},
+		}
+		resub, err := s.handleSubscribeRejection(&herdrError{Code: "pane_not_found", Message: "pane w9:p9 not found"})
+		if resub {
+			t.Fatal("handleSubscribeRejection resubscribed for a pane absent from this cycle's filter set; this is the busy loop the exact-head review caught")
+		}
+		if err != nil {
+			t.Errorf("handleSubscribeRejection error = %v, want nil (nothing in this cycle to prune)", err)
+		}
+		if len(s.paneNames) != 1 {
+			t.Errorf("unrelated cycle state mutated: %v", s.paneNames)
+		}
+	})
+
+	t.Run("rejection unrelated to a stale pane makes no attempt", func(t *testing.T) {
+		s := &sessionEventStream{p: sidecarProvider(t), paneNames: map[string]string{}, subscribed: map[string]bool{}}
+		resub, err := s.handleSubscribeRejection(&herdrError{Code: "invalid_request", Message: "bad json"})
+		if resub || err != nil {
+			t.Fatalf("handleSubscribeRejection = %v, %v; want false, nil", resub, err)
+		}
+	})
+}
+
+// TestDerivedFilterSetSidecarYieldsToFresherRegistry pins Blocker 1: a
+// recycled pane id whose registry occupant disagrees with a stale sidecar
+// binding must resolve to the registry's occupant, not the sidecar's stale
+// name.
+func TestDerivedFilterSetSidecarYieldsToFresherRegistry(t *testing.T) {
+	f, sock := newFakeHerdrServer(t)
+	p := eventTestProvider(t, sock)
+
+	regName := herdrAgentName("session-new")
+	f.setAgents(agentInfo{Name: regName, PaneID: "w3:p1"})
+	if err := p.SetMeta("session-old", metaBoundPane, "w3:p1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SetMeta("session-old", metaBoundName, "session-old"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := p.derivedFilterSet(context.Background())
+	if err != nil {
+		t.Fatalf("derivedFilterSet: %v", err)
+	}
+	if got["w3:p1"] != regName {
+		t.Fatalf("paneNames[w3:p1] = %q, want the registry's %q — a stale sidecar binding must not steal a recycled pane's live registry entry", got["w3:p1"], regName)
+	}
+}
+
+// TestDerivedFilterSetSidecarWinsWithExactNameWhenUncontradicted covers the
+// two cases where the sidecar's exact gc session name must still win: the
+// registry's lossy mapped name agrees with the sidecar binding, and a pane
+// the registry has never detected at all (a raw shell session).
+func TestDerivedFilterSetSidecarWinsWithExactNameWhenUncontradicted(t *testing.T) {
+	f, sock := newFakeHerdrServer(t)
+	p := eventTestProvider(t, sock)
+
+	f.setAgents(agentInfo{Name: herdrAgentName("session-a"), PaneID: "w3:p1"})
+	if err := p.SetMeta("session-a", metaBoundPane, "w3:p1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SetMeta("session-a", metaBoundName, "session-a"); err != nil {
+		t.Fatal(err)
+	}
+	// Never detected by herdr at all: absent from the registry entirely,
+	// only the sidecar knows about it.
+	if err := p.SetMeta("session-shell", metaBoundPane, "w9:p9"); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SetMeta("session-shell", metaBoundName, "session-shell"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := p.derivedFilterSet(context.Background())
+	if err != nil {
+		t.Fatalf("derivedFilterSet: %v", err)
+	}
+	if got["w3:p1"] != "session-a" {
+		t.Errorf("paneNames[w3:p1] = %q, want the sidecar's exact name session-a", got["w3:p1"])
+	}
+	if got["w9:p9"] != "session-shell" {
+		t.Errorf("paneNames[w9:p9] = %q, want session-shell (registry never detected this raw-shell pane at all)", got["w9:p9"])
 	}
 }
