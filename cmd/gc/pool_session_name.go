@@ -110,11 +110,17 @@ const poolIdentityPathShapedPrefix = "p"
 
 // ensureSessionNameLeadsWithIdentifierChar prepends a fixed, deterministic
 // marker when name does not already start with a letter or digit, so the
-// result satisfies the runtime session-name grammar. The transform is
-// injective (a fixed prefix on an otherwise-unmodified string), so distinct
-// path-shaped identities never collide with each other or with any ordinary
-// identity, which by definition already starts with a letter or digit and
-// therefore passes through unchanged.
+// result satisfies the runtime session-name grammar. This is injective within
+// the transformed (non-alphanumeric-leading) input class: distinct path-shaped
+// identities never collide with each other. It is not globally injective —
+// acceptance also requires ordinary rig-shaped names to pass through byte-for-
+// byte unchanged, so a transformed name can coincide with an unrelated
+// ordinary identity that already happens to start with the same prefix (e.g.
+// transformed "--home--x" and ordinary "p--home--x" both land on
+// "p--home--x"). That residual collision, like any other same-name collision,
+// is caught fail-closed by session creation's existing name-availability
+// checks (session.ValidateExplicitName plus the ensureSessionNameAvailable*
+// family), not by this function.
 func ensureSessionNameLeadsWithIdentifierChar(name string) string {
 	if name == "" {
 		return name

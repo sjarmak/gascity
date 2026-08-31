@@ -676,6 +676,7 @@ func TestDerivePoolSessionNameStepsAsideForTransientSlot(t *testing.T) {
 // zero session was ever created (~/.gc/supervisor.log, 2026-08-30T23:31Z).
 func TestDerivePoolSessionNameAcceptsPathShapedIdentity(t *testing.T) {
 	const template = "/home/ds/gas-city/city-infra-worker"
+	const want = "p--home--ds--gas-city--city-infra-worker-1-pool"
 	got, err := derivePoolSessionName(template, poolSessionCreateIdentity{
 		AgentName:     "/home/ds/gas-city/city-infra-worker-1",
 		Slot:          1,
@@ -683,6 +684,9 @@ func TestDerivePoolSessionNameAcceptsPathShapedIdentity(t *testing.T) {
 	}, "", nil)
 	if err != nil {
 		t.Fatalf("derivePoolSessionName: %v", err)
+	}
+	if got != want {
+		t.Fatalf("derivePoolSessionName = %q, want %q", got, want)
 	}
 	if _, err := session.ValidateExplicitName(got); err != nil {
 		t.Fatalf("derived name %q is not a valid explicit session name: %v", got, err)
