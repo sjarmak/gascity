@@ -21,47 +21,14 @@ import (
 // user/grant setup that startPasswordedDoltServer performs, since both
 // persist in the data dir and must not be redone on a restart). Used to
 // simulate a managed Dolt process rebinding to a fresh port over the SAME
-// underlying database, the way recoverManagedDoltProcess does.
+// underlying database, the way recoverManagedDoltProcess does. Delegates to
+// the shared dolt_project_id_test.go helpers so this file adds no new
+// subprocess/fixed_sleep/slow_process_gate call site of its own (see
+// feedback_test_exec_command_trips_census_ratchet).
 func startPasswordedDoltServerOnExistingDataDir(t *testing.T, dataDir string) (port int, pid int, cleanup func()) {
 	t.Helper()
-	skipSlowCmdGCTest(t, "requires a real Dolt server; run make test-cmd-gc-process for full coverage")
-	configureTestDoltIdentityEnv(t)
-
-	doltPath := os.Getenv("GC_DOLT_REAL_BINARY")
-	var err error
-	if doltPath == "" {
-		doltPath, err = exec.LookPath("dolt")
-		if err != nil {
-			t.Skip("dolt not installed")
-		}
-	}
-
-	port = reserveRandomTCPPort(t)
-	cmd := exec.Command(doltPath, "sql-server", "--host", "127.0.0.1", "--port", fmt.Sprintf("%d", port), "--allow-cleartext-passwords", "--loglevel=warning")
-	cmd.Dir = dataDir
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start passworded dolt sql-server on existing data dir: %v", err)
-	}
-
-	t.Setenv("GC_DOLT_PASSWORD", "secret")
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := managedDoltQueryProbeDirect("127.0.0.1", fmt.Sprintf("%d", port), "root"); err == nil {
-			return port, cmd.Process.Pid, func() {
-				if cmd.Process != nil {
-					_ = cmd.Process.Kill()
-				}
-				_, _ = cmd.Process.Wait()
-			}
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	_ = cmd.Process.Kill()
-	_, _ = cmd.Process.Wait()
-	t.Fatalf("passworded dolt sql-server on existing data dir, port %d, did not become query-ready", port)
-	return 0, 0, func() {}
+	doltPath := resolveTestDoltBinary(t)
+	return startDoltSQLServerAndWait(t, doltPath, dataDir)
 }
 
 // TestGcBdReadWriteSurvivesRealManagedDoltPortRotation is the direct

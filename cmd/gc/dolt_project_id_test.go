@@ -94,17 +94,7 @@ func TestNativeStorageFixtureBootTimeoutSurvivesShardContention(t *testing.T) {
 
 func startPasswordedDoltServer(t *testing.T, repoDir string, setupQueries ...string) (string, int, int, func()) {
 	t.Helper()
-	skipSlowCmdGCTest(t, "requires a real Dolt server; run make test-cmd-gc-process for full coverage")
-	configureTestDoltIdentityEnv(t)
-
-	doltPath := os.Getenv("GC_DOLT_REAL_BINARY")
-	var err error
-	if doltPath == "" {
-		doltPath, err = exec.LookPath("dolt")
-		if err != nil {
-			t.Skip("dolt not installed")
-		}
-	}
+	doltPath := resolveTestDoltBinary(t)
 	if repoDir == "" {
 		repoDir = t.TempDir()
 	}
@@ -128,9 +118,38 @@ func startPasswordedDoltServer(t *testing.T, repoDir string, setupQueries ...str
 	}
 	run("sql", "-q", "CREATE USER 'root'@'%' IDENTIFIED BY 'secret'; GRANT ALL ON *.* TO 'root'@'%';")
 
-	port := reserveRandomTCPPort(t)
+	port, pid, cleanup := startDoltSQLServerAndWait(t, doltPath, repoDir)
+	return repoDir, port, pid, cleanup
+}
+
+// resolveTestDoltBinary applies the shared skip/env-setup preconditions for
+// any test that drives a real `dolt` binary (slow-test gate, test identity
+// env, GC_DOLT_REAL_BINARY override or PATH lookup). Skips the test (via
+// t.Skip, which halts this goroutine) if dolt is not installed.
+func resolveTestDoltBinary(t *testing.T) (doltPath string) {
+	t.Helper()
+	skipSlowCmdGCTest(t, "requires a real Dolt server; run make test-cmd-gc-process for full coverage")
+	configureTestDoltIdentityEnv(t)
+
+	if doltPath = os.Getenv("GC_DOLT_REAL_BINARY"); doltPath != "" {
+		return doltPath
+	}
+	doltPath, err := exec.LookPath("dolt")
+	if err != nil {
+		t.Skip("dolt not installed")
+	}
+	return doltPath
+}
+
+// startDoltSQLServerAndWait starts `dolt sql-server` over dataDir and blocks
+// until it accepts a passworded query connection, or the test fails. Shared
+// by every real-Dolt-server test helper so a new caller never adds its own
+// subprocess/fixed_sleep call site (see feedback_test_exec_command_trips_census_ratchet).
+func startDoltSQLServerAndWait(t *testing.T, doltPath, dataDir string) (port, pid int, cleanup func()) {
+	t.Helper()
+	port = reserveRandomTCPPort(t)
 	cmd := exec.Command(doltPath, "sql-server", "--host", "127.0.0.1", "--port", fmt.Sprintf("%d", port), "--allow-cleartext-passwords", "--loglevel=warning")
-	cmd.Dir = repoDir
+	cmd.Dir = dataDir
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -141,13 +160,12 @@ func startPasswordedDoltServer(t *testing.T, repoDir string, setupQueries ...str
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		if err := managedDoltQueryProbeDirect("127.0.0.1", fmt.Sprintf("%d", port), "root"); err == nil {
-			cleanup := func() {
+			return port, cmd.Process.Pid, func() {
 				if cmd.Process != nil {
 					_ = cmd.Process.Kill()
 				}
 				_, _ = cmd.Process.Wait()
 			}
-			return repoDir, port, cmd.Process.Pid, cleanup
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
@@ -155,7 +173,7 @@ func startPasswordedDoltServer(t *testing.T, repoDir string, setupQueries ...str
 	_ = cmd.Process.Kill()
 	_, _ = cmd.Process.Wait()
 	t.Fatalf("passworded dolt sql-server on %d did not become query-ready", port)
-	return "", 0, 0, func() {}
+	return 0, 0, func() {}
 }
 
 func TestManagedDoltHealthCheckWithPasswordUsesDirectHelpersAgainstRealServer(t *testing.T) {
