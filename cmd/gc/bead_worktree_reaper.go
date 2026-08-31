@@ -202,7 +202,7 @@ func reapClosedBeadWorktrees(
 				continue
 			}
 
-			if reason := cleanupDispositionProtectReason(bead, rigRoot, wt); reason != "" {
+			if reason := cleanupDispositionProtectReason(bead, rigRoot, git.Worktree{Path: wt.Path, Branch: wt.Branch, Head: wt.Head}); reason != "" {
 				if skips.shouldSurface(worktreePath, reason) {
 					fmt.Fprintf(stderr, "reapClosedBeadWorktrees: protecting %s (bead %s closed but %s)\n", worktreePath, beadID, reason) //nolint:errcheck
 					recordReapSkipped(rec, beadID, worktreePath, rigName, reason)
@@ -213,7 +213,7 @@ func reapClosedBeadWorktrees(
 				continue
 			}
 
-			if registeredChild := registeredChildWorktree(worktreePath, worktrees); registeredChild != "" {
+			if registeredChild := registeredChildWorktree(worktreePath, worktreeLivenessResults); registeredChild != "" {
 				reason := fmt.Sprintf("topology unsafe: registered child worktree %s", registeredChild)
 				if skips.shouldSurface(worktreePath, reason) {
 					fmt.Fprintf(stderr, "reapClosedBeadWorktrees: protecting %s (bead %s closed but %s)\n", worktreePath, beadID, reason) //nolint:errcheck
@@ -430,7 +430,7 @@ type reapCandidate struct {
 	head         string
 }
 
-func registeredChildWorktree(parent string, worktrees []git.Worktree) string {
+func registeredChildWorktree(parent string, worktrees []worktreeLiveness) string {
 	for _, wt := range worktrees {
 		if isStrictlyUnderDir(parent, wt.Path) {
 			return wt.Path

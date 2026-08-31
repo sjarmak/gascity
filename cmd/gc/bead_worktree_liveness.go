@@ -216,6 +216,7 @@ func liveSessionWorktreeDirs(snapshot *sessionBeadSnapshot) []string {
 type worktreeLiveness struct {
 	Path   string
 	Branch string
+	Head   string
 	Live   bool
 	Reason string
 }
@@ -242,7 +243,7 @@ func discoverWorktreeLiveness(rigRoot string, live liveWorktreeState, sessionDir
 	}
 	results := make([]worktreeLiveness, 0, len(worktrees))
 	for _, wt := range worktrees {
-		wl := worktreeLiveness{Path: wt.Path, Branch: wt.Branch}
+		wl := worktreeLiveness{Path: wt.Path, Branch: wt.Branch, Head: wt.Head}
 		if live.scanned {
 			wl.Live, wl.Reason = worktreeIsLive(wt.Path, live, sessionDirs)
 		}
