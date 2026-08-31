@@ -168,15 +168,14 @@ func (p *Provider) clearPaneBinding(name string) {
 	_ = p.RemoveMeta(name, metaBoundAt)
 }
 
-// boundSessionNames enumerates the session names with a live-looking sidecar
-// binding (a stored name and pane id), for ListRunning to merge with herdr's
-// registry — which never sees raw shell sessions.
-func (p *Provider) boundSessionNames() []string {
+// forEachPaneBinding walks the sidecar directory once and calls fn with each
+// live-looking binding (a stored name and pane id), for boundSessionNames and
+// boundPaneBindings to project into the shape their caller needs.
+func (p *Provider) forEachPaneBinding(fn func(pane, name string)) {
 	entries, err := os.ReadDir(p.metaDir)
 	if err != nil {
-		return nil
+		return
 	}
-	var names []string
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -185,11 +184,20 @@ func (p *Provider) boundSessionNames() []string {
 		if err != nil || name == "" {
 			continue
 		}
-		if pane, err := readMetaFile(filepath.Join(p.metaDir, e.Name(), sanitize(metaBoundPane))); err != nil || pane == "" {
+		pane, err := readMetaFile(filepath.Join(p.metaDir, e.Name(), sanitize(metaBoundPane)))
+		if err != nil || pane == "" {
 			continue
 		}
-		names = append(names, name)
+		fn(pane, name)
 	}
+}
+
+// boundSessionNames enumerates the session names with a live-looking sidecar
+// binding (a stored name and pane id), for ListRunning to merge with herdr's
+// registry — which never sees raw shell sessions.
+func (p *Provider) boundSessionNames() []string {
+	var names []string
+	p.forEachPaneBinding(func(_, name string) { names = append(names, name) })
 	return names
 }
 
@@ -209,25 +217,8 @@ func (p *Provider) boundSessionNames() []string {
 // appearing — callers that need every bound name regardless of pane
 // collisions want boundSessionNames instead.
 func (p *Provider) boundPaneBindings() map[string]string {
-	entries, err := os.ReadDir(p.metaDir)
-	if err != nil {
-		return nil
-	}
 	bindings := make(map[string]string)
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		name, err := readMetaFile(filepath.Join(p.metaDir, e.Name(), sanitize(metaBoundName)))
-		if err != nil || name == "" {
-			continue
-		}
-		pane, err := readMetaFile(filepath.Join(p.metaDir, e.Name(), sanitize(metaBoundPane)))
-		if err != nil || pane == "" {
-			continue
-		}
-		bindings[pane] = name
-	}
+	p.forEachPaneBinding(func(pane, name string) { bindings[pane] = name })
 	return bindings
 }
 
