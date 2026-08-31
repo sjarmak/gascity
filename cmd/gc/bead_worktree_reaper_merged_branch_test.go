@@ -27,6 +27,7 @@ func addMergedBranchWorktree(t *testing.T, rigRoot, cityPath, agentHome, beadID 
 	mustGit(t, wtPath, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "work ("+beadID+")")
 	mustGit(t, wtPath, "push", "origin", branch)
 	mustGit(t, rigRoot, "merge", "--ff-only", branch)
+	mustGit(t, rigRoot, "push", "origin", "main")
 	mustGit(t, rigRoot, "push", "origin", "--delete", branch)
 	mustGit(t, rigRoot, "fetch", "--prune", "origin")
 	backdateWorktreeGitFile(t, wtPath, 4*24*time.Hour)
