@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/molecule"
 )
 
@@ -119,6 +121,61 @@ func TestCityRuntimeClassAccessorsAreIdentity(t *testing.T) {
 			t.Errorf("workBeadStores()[%q] = %p, want %p", name, work[name].Store, store)
 		}
 	}
+}
+
+// TestCityRuntimeClassAccessorsRaceWithConfigReload pins the #2604/#3368
+// review's third-pass followup MAJOR finding: relocatedOrdersStore read
+// cr.cfg directly, unguarded, unlike its five sibling class accessors — a
+// data race against reloadConfigTraced's serviceStateMu-guarded cr.cfg write,
+// reachable from the independent order-dispatch lane via
+// orderTrackingSweepStores(). Run with -race: every accessor here must read
+// cr.cfg only through serviceStateMu, matching the concurrent writer below.
+func TestCityRuntimeClassAccessorsRaceWithConfigReload(t *testing.T) {
+	t.Parallel()
+	cr := &CityRuntime{
+		cityName:            "test-city",
+		standaloneCityStore: beads.NewMemStore(),
+		cfg:                 &config.City{},
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	readers := []func(){
+		func() { cr.graphBeadStore() },
+		func() { cr.sessionsBeadStore() },
+		func() { cr.mailBeadStore() },
+		func() { cr.nudgesBeadStore() },
+		func() { cr.ordersBeadStore("") },
+		func() { cr.relocatedOrdersStore() },
+	}
+	for _, read := range readers {
+		wg.Add(1)
+		go func(read func()) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					read()
+				}
+			}
+		}(read)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			cr.serviceStateMu.Lock()
+			cr.cfg = &config.City{}
+			cr.serviceStateMu.Unlock()
+		}
+		close(stop)
+	}()
+
+	wg.Wait()
 }
 
 // sameStorePtr reports pointer identity between two stores.

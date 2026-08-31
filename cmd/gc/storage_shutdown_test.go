@@ -196,9 +196,9 @@ func TestCityRuntimeShutdownWaitsForOrderDispatchLaneBeforeClosingStorage(t *tes
 	cr.storageRoutes.closers = []io.Closer{observed}
 
 	laneDone := make(chan struct{})
-	cr.orderDispatchMu.Lock()
+	cr.orderDispatchLaneDoneMu.Lock()
 	cr.orderDispatchLaneDone = laneDone
-	cr.orderDispatchMu.Unlock()
+	cr.orderDispatchLaneDoneMu.Unlock()
 
 	shutdownReturned := make(chan struct{})
 	go func() {
@@ -224,5 +224,42 @@ func TestCityRuntimeShutdownWaitsForOrderDispatchLaneBeforeClosingStorage(t *tes
 	}
 	if observed.closes != 1 {
 		t.Fatalf("storage routes closed %d time(s) after shutdown returned, want exactly 1", observed.closes)
+	}
+}
+
+// TestCityRuntimeShutdownDoesNotBlockOnOrderDispatchMu pins the #2604/#3368
+// review's third-pass followup: orderDispatchLaneDone must be read under its
+// own dedicated mutex (orderDispatchLaneDoneMu), not orderDispatchMu.
+// dispatchOrders holds orderDispatchMu across the whole od.dispatch() call
+// (by design — see dispatchOrders), which can run for as long as a dispatch
+// pass's slowest condition-trigger check_timeout permits. If shutdown() read
+// orderDispatchLaneDone under that same mutex, a stuck dispatch() holding it
+// would deadlock shutdown() before it ever reached the bounded select on the
+// lane's done channel, defeating orderDispatchLaneJoinTimeout entirely. This
+// test locks orderDispatchMu and never releases it, simulating a dispatch()
+// call that never returns; shutdown() must still complete promptly.
+func TestCityRuntimeShutdownDoesNotBlockOnOrderDispatchMu(t *testing.T) {
+	cr, _, _ := splitCityRuntime(t)
+
+	// Simulate a permanently stuck dispatch() pass: hold orderDispatchMu for
+	// the rest of the test and never unlock it.
+	cr.orderDispatchMu.Lock()
+
+	laneDone := make(chan struct{})
+	close(laneDone)
+	cr.orderDispatchLaneDoneMu.Lock()
+	cr.orderDispatchLaneDone = laneDone
+	cr.orderDispatchLaneDoneMu.Unlock()
+
+	shutdownReturned := make(chan struct{})
+	go func() {
+		cr.shutdown()
+		close(shutdownReturned)
+	}()
+
+	select {
+	case <-shutdownReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown blocked on orderDispatchMu instead of reading orderDispatchLaneDone under its own mutex")
 	}
 }

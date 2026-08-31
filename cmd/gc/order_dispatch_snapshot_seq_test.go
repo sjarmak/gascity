@@ -113,3 +113,84 @@ func TestApplyOrderSetSnapshotLockedForceRebuildAppliesConfigOnlyChange(t *testi
 		t.Fatal("orderDispatchConfigRebuildPending still set after a successful forced rebuild")
 	}
 }
+
+// TestApplyOrderSetSnapshotLockedStaleScanDoesNotAdvanceRescanTimestamp pins
+// the #2604/#3368 review's third-pass followup MINOR finding: a rejected
+// stale scan must leave orderRescanLast untouched, not just the applied order
+// set. rescanOrderDispatcherIfDue gates on time.Since(orderRescanLast), so
+// advancing that timestamp from a discarded scan would delay the next
+// legitimate rescan by orderRescanInterval for no reason — the discarded scan
+// contributed nothing.
+func TestApplyOrderSetSnapshotLockedStaleScanDoesNotAdvanceRescanTimestamp(t *testing.T) {
+	cr := &CityRuntime{stderr: io.Discard}
+	cfg := &config.City{}
+	fresh := orders.Order{Name: "fresh", Trigger: "cooldown", Interval: "1m", Exec: "true"}
+	stale := orders.Order{Name: "stale", Trigger: "cooldown", Interval: "1m", Exec: "true"}
+	freshSnapshot := orderSetSnapshot{Orders: []orders.Order{fresh}, Signature: "sig-fresh"}
+	staleSnapshot := orderSetSnapshot{Orders: []orders.Order{stale}, Signature: "sig-stale"}
+
+	freshApplyTime := time.Now()
+	if changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), cfg, freshSnapshot, 2, false, freshApplyTime); !changed {
+		t.Fatalf("first apply (seq 2) did not report a change: summary=%q", summary)
+	}
+	if cr.orderRescanLast != freshApplyTime {
+		t.Fatalf("orderRescanLast = %v after the applied scan, want %v", cr.orderRescanLast, freshApplyTime)
+	}
+
+	// The stale scan (seq 1) arrives later in wall-clock time but must be
+	// rejected on seq alone. Its `now` is strictly after freshApplyTime, so if
+	// applyOrderSetSnapshotLocked wrote orderRescanLast before checking
+	// staleness, this assertion would catch it advancing.
+	staleApplyTime := freshApplyTime.Add(time.Minute)
+	changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), cfg, staleSnapshot, 1, false, staleApplyTime)
+	if changed {
+		t.Fatalf("stale scan (seq 1) was applied over a fresher seq 2 result: summary=%q", summary)
+	}
+	if summary != "stale-scan" {
+		t.Fatalf("summary = %q, want %q", summary, "stale-scan")
+	}
+	if cr.orderRescanLast != freshApplyTime {
+		t.Fatalf("orderRescanLast = %v after a rejected stale scan, want unchanged %v", cr.orderRescanLast, freshApplyTime)
+	}
+}
+
+// TestApplyOrderSetSnapshotLockedUnrelatedChangeDoesNotClearPendingFlag pins
+// the #2604/#3368 review's third-pass followup MAJOR finding: a rebuild
+// triggered by an unrelated order-set signature change (forceRebuild=false)
+// must NOT clear orderDispatchConfigRebuildPending. That flag can only be
+// consumed by the call that actually observed it true and rebuilt against a
+// cfg snapshot taken after the pending-setting reload's cr.cfg write landed.
+// A signature-change rebuild racing a concurrent reload may still be holding
+// a cfg snapshot from before that write; clearing the flag here would
+// silently drop the reload's still-unapplied config-only change, since no
+// later signature-unchanged rescan would ever retry it.
+func TestApplyOrderSetSnapshotLockedUnrelatedChangeDoesNotClearPendingFlag(t *testing.T) {
+	cr := &CityRuntime{stderr: io.Discard}
+	cfg := &config.City{}
+	first := orders.Order{Name: "first", Trigger: "cooldown", Interval: "1m", Exec: "true"}
+	second := orders.Order{Name: "second", Trigger: "cooldown", Interval: "1m", Exec: "true"}
+	firstSnapshot := orderSetSnapshot{Orders: []orders.Order{first}, Signature: "sig-first"}
+	secondSnapshot := orderSetSnapshot{Orders: []orders.Order{second}, Signature: "sig-second"}
+
+	if changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), cfg, firstSnapshot, 1, false, time.Now()); !changed {
+		t.Fatalf("initial apply did not report a change: summary=%q", summary)
+	}
+
+	// A concurrent config reload has set the pending flag, representing a
+	// config-only change this scan's cfg snapshot may predate.
+	cr.orderDispatchConfigRebuildPending.Store(true)
+
+	// This scan sees an unrelated order-set signature change and rebuilds for
+	// that reason alone (forceRebuild is false: it never observed the pending
+	// flag as the trigger).
+	changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), cfg, secondSnapshot, 2, false, time.Now())
+	if !changed {
+		t.Fatalf("signature-change apply did not report a change: summary=%q", summary)
+	}
+	if summary == "unchanged" {
+		t.Fatalf("summary = %q, want a real change summary for a signature change", summary)
+	}
+	if !cr.orderDispatchConfigRebuildPending.Load() {
+		t.Fatal("orderDispatchConfigRebuildPending was cleared by a rebuild that did not consume it (forceRebuild=false); the concurrent reload's config-only change is now unreachable")
+	}
+}

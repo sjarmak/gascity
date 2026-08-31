@@ -345,7 +345,7 @@ func TestOrderDispatchLaneRunsDespiteFSPressure(t *testing.T) {
 
 	// A tick on this exact CityRuntime still skips: confirms the pressure
 	// condition genuinely applies here, matching
-	// TestCityRuntimeTickSkipsDueOrderDispatchUnderFSPressure.
+	// TestCityRuntimeTickSkipsBeforeManagedDoltAndDemandUnderFSPressure.
 	dirty := &atomic.Bool{}
 	lastProviderName := ""
 	prevPoolRunning := map[string]bool{}

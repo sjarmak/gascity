@@ -175,7 +175,10 @@ func (cr *CityRuntime) ordersBeadStore(_ string) beads.OrdersStore {
 // funnel. nil is what keeps a federation on a single-store city byte-identical:
 // there is no second store to add.
 func (cr *CityRuntime) relocatedOrdersStore() beads.Store {
-	return resolveOrderStore(cr.storageRoutes, nil, cr.cfg, cr.cityPath, cr.rec)
+	cr.serviceStateMu.RLock()
+	cfg := cr.cfg
+	cr.serviceStateMu.RUnlock()
+	return resolveOrderStore(cr.storageRoutes, nil, cfg, cr.cityPath, cr.rec)
 }
 
 // cityWorkStore returns the runtime's city-level WORK-class bead store. Work is
