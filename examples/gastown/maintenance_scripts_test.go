@@ -332,6 +332,237 @@ exit 1
 	}
 }
 
+func TestOrphanSweepPreservesAlphanumericPoolAssignmentsWhenSessionListIsPartial(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      printf 'Agent: gastown.polecat\n  source: pack\n'
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"rigs":[{"name":"hq","hq":true}]}\n'
+      exit 0
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '%s\n' "$ORPHAN_SWEEP_SESSION_LIST"
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "list" ]; then
+      cat <<'EOF'
+[
+  {"id":"gc-review-root","status":"in_progress","assignee":"polecat-gc-q9j0om"},
+  {"id":"gc-review-step","status":"in_progress","assignee":"polecat-gc-q9j0om"}
+]
+EOF
+      exit 0
+    fi
+    if [ "$2" = "show" ] && { [ "$3" = "gc-review-root" ] || [ "$3" = "gc-review-step" ]; }; then
+      printf '[{"id":"%s","status":"in_progress","assignee":"polecat-gc-q9j0om"}]\n' "$3"
+      exit 0
+    fi
+    if [ "$2" = "show" ] && [ "$3" = "gc-q9j0om" ] && [ "$4" = "--json" ]; then
+      printf '[{"id":"gc-q9j0om","status":"open","issue_type":"session","metadata":{"state":"active","session_name":"polecat-gc-q9j0om"}}]\n'
+      exit 0
+    fi
+    if [ "$2" = "release-if-current" ]; then
+      printf 'released\n'
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+
+	env := map[string]string{
+		"GC_CITY":                   cityDir,
+		"GC_CITY_PATH":              cityDir,
+		"GC_CALL_LOG":               gcLog,
+		"ORPHAN_SWEEP_SESSION_LIST": `{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}`,
+		"PATH":                      binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+	out, err := runScriptResult(t, coreScriptPath("orphan-sweep.sh"), env)
+	if err != nil {
+		t.Fatalf("orphan-sweep failed: %v\n%s", err, out)
+	}
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if strings.Contains(string(logData), "bd release-if-current ") {
+		t.Fatalf("partial session liveness released live root or step:\n%s", logData)
+	}
+	if got := strings.Count(string(logData), "bd show gc-q9j0om --json"); got != 2 {
+		t.Fatalf("live session bead probe count = %d, want 2:\n%s", got, logData)
+	}
+
+	if err := os.WriteFile(gcLog, nil, 0o644); err != nil {
+		t.Fatalf("reset gc log: %v", err)
+	}
+	env["ORPHAN_SWEEP_SESSION_LIST"] = `{"sessions":[]}`
+	out, err = runScriptResult(t, coreScriptPath("orphan-sweep.sh"), env)
+	if err != nil {
+		t.Fatalf("orphan-sweep with structurally partial liveness failed: %v\n%s", err, out)
+	}
+	logData, err = os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if strings.Contains(string(logData), "bd release-if-current ") {
+		t.Fatalf("structurally partial liveness released live root or step:\n%s", logData)
+	}
+}
+
+func TestOrphanSweepReleasesDeadPoolAssignmentWithAPISessionEnvelope(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      printf 'Agent: gastown.polecat\n  source: pack\n'
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"rigs":[{"name":"hq","hq":true}]}\n'
+      exit 0
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"_cache_age_s":0,"sessions":[]}\n'
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "list" ]; then
+      printf '[{"id":"gc-dead-step","status":"in_progress","assignee":"polecat-gc-625799"}]\n'
+      exit 0
+    fi
+    if [ "$2" = "show" ] && [ "$3" = "gc-dead-step" ]; then
+      printf '[{"id":"gc-dead-step","status":"in_progress","assignee":"polecat-gc-625799"}]\n'
+      exit 0
+    fi
+    if [ "$2" = "show" ] && [ "$3" = "gc-625799" ] && [ "$4" = "--json" ]; then
+      printf '[{"id":"gc-625799","status":"closed","issue_type":"session","metadata":{"state":"closed","session_name":"polecat-gc-625799"}}]\n'
+      exit 0
+    fi
+    if [ "$2" = "release-if-current" ] && [ "$3" = "gc-dead-step" ] && [ "$4" = "polecat-gc-625799" ]; then
+      printf 'released\n'
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+
+	env := map[string]string{
+		"GC_CITY":      cityDir,
+		"GC_CITY_PATH": cityDir,
+		"GC_CALL_LOG":  gcLog,
+		"PATH":         binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+	out, err := runScriptResult(t, coreScriptPath("orphan-sweep.sh"), env)
+	if err != nil {
+		t.Fatalf("orphan-sweep failed: %v\n%s", err, out)
+	}
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	log := string(logData)
+	for _, want := range []string{
+		"bd show gc-625799 --json",
+		"bd release-if-current gc-dead-step polecat-gc-625799",
+	} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("missing required gc call %q:\n%s", want, log)
+		}
+	}
+}
+
+func TestOrphanSweepReleasesNothingWhenRigDiscoveryFails(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      printf 'Agent: project/worker\n  source: pack\n'
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      exit 1
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "list" ]; then
+      printf '[{"id":"ga-hq-orphan","status":"in_progress","assignee":"missing-hq-session"}]\n'
+      exit 0
+    fi
+    if [ "$2" = "show" ] && [ "$3" = "ga-hq-orphan" ] && [ "$4" = "--json" ]; then
+      printf '[{"id":"ga-hq-orphan","status":"in_progress","assignee":"missing-hq-session"}]\n'
+      exit 0
+    fi
+    if [ "$2" = "release-if-current" ]; then
+      printf 'released\n'
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+
+	env := map[string]string{
+		"GC_CITY":      cityDir,
+		"GC_CITY_PATH": cityDir,
+		"GC_CALL_LOG":  gcLog,
+		"PATH":         binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+	out, err := runScriptResult(t, coreScriptPath("orphan-sweep.sh"), env)
+	if err != nil {
+		t.Fatalf("orphan-sweep failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "orphan-sweep: unable to discover rigs; skipping cycle") {
+		t.Fatalf("unexpected orphan-sweep output:\n%s", out)
+	}
+
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if strings.Contains(string(logData), "bd release-if-current ") {
+		t.Fatalf("failed rig discovery released work:\n%s", logData)
+	}
+}
+
 // orphanSweepBareShortFormGCStub writes a gc stub whose only live session is
 // the qualified agent "thriva/devpipeline.backend_dev", while the sole
 // in-progress bead is assigned to the bare short form "backend_dev". When
@@ -1494,6 +1725,10 @@ EOF
 EOF
 	      exit 0
 	    fi
+	    if [ "$2" = "show" ] && [ "$3" = "gc-closed" ] && [ "$4" = "--json" ]; then
+	      printf '[{"id":"gc-closed","status":"closed","issue_type":"session","metadata":{"state":"closed"}}]\n'
+	      exit 0
+	    fi
 	    if [ "$2" = "release-if-current" ]; then
 	      printf 'released\n'
 	      exit 0
@@ -1665,7 +1900,7 @@ exit 1
 	}
 }
 
-func TestOrphanSweepContinuesAfterSingleRigSessionListFailure(t *testing.T) {
+func TestOrphanSweepReleasesNothingAfterSingleRigSessionListFailure(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
 	gcLog := filepath.Join(t.TempDir(), "gc.log")
@@ -1765,7 +2000,7 @@ exit 1
 	if err != nil {
 		t.Fatalf("%s failed: %v\n%s", filepath.Base(script), err, out)
 	}
-	if !strings.Contains(string(out), "orphan-sweep: reset 2 orphaned beads") {
+	if !strings.Contains(string(out), "orphan-sweep: incomplete session liveness for rig broken; skipping cycle") {
 		t.Fatalf("unexpected orphan-sweep output:\n%s", out)
 	}
 
@@ -1774,16 +2009,8 @@ exit 1
 		t.Fatalf("ReadFile(gc log): %v", err)
 	}
 	log := string(logData)
-	for reset, assignee := range map[string]string{
-		"ga-hq-orphan":      "missing-hq-session",
-		"ga-healthy-orphan": "missing-healthy-session",
-	} {
-		if !strings.Contains(log, "bd release-if-current "+reset+" "+assignee) {
-			t.Fatalf("expected %s to be reset after partial rig failure:\n%s", reset, log)
-		}
-	}
-	if strings.Contains(log, "bd release-if-current ga-broken-orphan ") {
-		t.Fatalf("bead from rig with unknown session liveness was reset:\n%s", log)
+	if strings.Contains(log, "bd release-if-current ") {
+		t.Fatalf("incomplete session liveness released work:\n%s", log)
 	}
 }
 
@@ -2006,6 +2233,14 @@ if [ "$*" = "bd show $ORPHAN_SWEEP_ORPHAN_ID --json" ]; then
 fi
 if [ "$*" = "bd show $ORPHAN_SWEEP_ORPHAN_ASSIGNEE --json" ]; then
   exit 1
+fi
+case "$ORPHAN_SWEEP_ORPHAN_ASSIGNEE" in
+  *-gc-*) orphan_session_id="gc-${ORPHAN_SWEEP_ORPHAN_ASSIGNEE##*-gc-}" ;;
+  *) orphan_session_id="" ;;
+esac
+if [ -n "$orphan_session_id" ] && [ "$*" = "bd show $orphan_session_id --json" ]; then
+  printf '[{"id":"%s","status":"closed","issue_type":"session","metadata":{"state":"closed"}}]\n' "$orphan_session_id"
+  exit 0
 fi
 printf 'UNEXPECTED: %s\n' "$*" >> "$GC_CALL_LOG"
 printf 'UNEXPECTED: %s\n' "$*" >&2
