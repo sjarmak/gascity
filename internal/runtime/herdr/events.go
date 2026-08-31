@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -102,13 +103,70 @@ func (p *Provider) SubscribeSessionEvents(ctx context.Context) (<-chan runtime.S
 	return ch, nil
 }
 
+// derivedFilterSet is the pane↔name map and status-subscription filter set
+// a cycle builds by merging two sources: the herdr registry (agents it has
+// DETECTED — the only source with fresh knowledge of panes started outside
+// this provider) and the sidecar pane bindings (every pane this provider
+// itself bound at Start, regardless of whether herdr has classified its
+// occupant yet). Without the sidecar half, a session whose pane herdr has
+// not detected — a raw shell, or an agent kind herdr's detector does not
+// recognize, or simply one not yet classified — gets neither a paneNames
+// entry nor a status subscription, so its events are silently undeliverable.
+// Sidecar entries take precedence for the name attributed to a pane: it is
+// the exact gc session name, where the registry's a.Name is herdrAgentName's
+// lossy, length-capped mapping and only coincidentally equals it.
+func (p *Provider) derivedFilterSet(ctx context.Context) (paneNames map[string]string, err error) {
+	agents, err := p.c.sockAgentList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	paneNames = make(map[string]string, len(agents))
+	for _, a := range agents {
+		if a.PaneID == "" || a.Name == "" {
+			continue
+		}
+		paneNames[a.PaneID] = a.Name
+	}
+	for pane, name := range p.boundPaneBindings() {
+		paneNames[pane] = name
+	}
+	return paneNames, nil
+}
+
+// stalePaneNotFound matches herdr's events.subscribe rejection for a
+// per-pane filter naming a pane it no longer has, e.g.
+// "pane_not_found: pane w3:p1 not found".
+var stalePaneNotFound = regexp.MustCompile(`^pane_not_found: pane (\S+) not found$`)
+
+// stalePaneID extracts the offending pane id from a stale-pane
+// events.subscribe rejection, if err is one.
+func stalePaneID(err error) (pane string, ok bool) {
+	m := stalePaneNotFound.FindStringSubmatch(err.Error())
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
+
+// pruneStalePane drops pane from this cycle's filter set and, if it is a
+// sidecar-bound session, clears the stale binding so it stops being
+// resubmitted on every future cycle.
+func (s *sessionEventStream) pruneStalePane(pane string) {
+	name := s.paneNames[pane]
+	delete(s.paneNames, pane)
+	delete(s.subscribed, pane)
+	if name != "" {
+		s.p.clearPaneBinding(name)
+	}
+}
+
 // runSessionEventStream drives connection cycles until ctx is canceled. A
 // cycle ending in resubscribe (the pane filter set grew) reconnects
 // immediately; a transport failure reconnects with capped exponential
 // backoff. Failures are logged once per streak, not per retry.
 func (p *Provider) runSessionEventStream(ctx context.Context, ch chan runtime.SessionEvent) {
 	defer close(ch)
-	s := &sessionEventStream{c: p.c, ch: ch}
+	s := &sessionEventStream{p: p, ch: ch}
 	backoff := sessionEventMinBackoff
 	for {
 		if ctx.Err() != nil {
@@ -145,7 +203,7 @@ func (p *Provider) runSessionEventStream(ctx context.Context, ch chan runtime.Se
 
 // sessionEventStream is one subscriber's translation state.
 type sessionEventStream struct {
-	c  *client
+	p  *Provider
 	ch chan runtime.SessionEvent
 
 	// paneNames maps pane id → gc session name. Rebuilt at cycle start and
@@ -167,26 +225,22 @@ type sessionEventStream struct {
 // filter set, emit the leading resync, then translate frames until the
 // transport fails (err), the filter set must grow (resubscribe), or ctx ends.
 func (s *sessionEventStream) runCycle(ctx context.Context) (resubscribe bool, err error) {
-	agents, err := s.c.sockAgentList(ctx)
+	paneNames, err := s.p.derivedFilterSet(ctx)
 	if err != nil {
 		return false, err
 	}
-	s.paneNames = make(map[string]string, len(agents))
-	s.subscribed = make(map[string]bool, len(agents))
+	s.paneNames = paneNames
+	s.subscribed = make(map[string]bool, len(paneNames))
 	subs := []subscribeSub{
 		{Type: "pane.created"},
 		{Type: "pane.closed"},
 		{Type: "pane.exited"},
 		{Type: "pane.agent_detected"},
 	}
-	for _, a := range agents {
-		if a.PaneID == "" || a.Name == "" {
-			continue
-		}
-		s.paneNames[a.PaneID] = a.Name
-		if !s.subscribed[a.PaneID] {
-			s.subscribed[a.PaneID] = true
-			subs = append(subs, subscribeSub{Type: "pane.agent_status_changed", PaneID: a.PaneID})
+	for pane := range s.paneNames {
+		if !s.subscribed[pane] {
+			s.subscribed[pane] = true
+			subs = append(subs, subscribeSub{Type: "pane.agent_status_changed", PaneID: pane})
 		}
 	}
 
@@ -198,7 +252,7 @@ func (s *sessionEventStream) runCycle(ctx context.Context) (resubscribe bool, er
 	cctx, ccancel := context.WithCancel(ctx)
 	defer ccancel()
 
-	conn, err := s.c.dialSocket(ctx)
+	conn, err := s.p.c.dialSocket(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -212,6 +266,17 @@ func (s *sessionEventStream) runCycle(ctx context.Context) (resubscribe bool, er
 	}
 	reader := bufio.NewReader(conn)
 	if _, err := readSockResponse(reader); err != nil {
+		// herdr ≥0.8.0 rejects the WHOLE subscribe call if any per-pane
+		// filter targets a pane it no longer knows about — e.g. a sidecar
+		// binding left over from a session whose pane died without Stop
+		// clearing it (a crash, or a server bounce that dropped every pane).
+		// Left alone this is a permanent wedge: the same stale pane would be
+		// resubmitted every cycle and reject every subscribe forever. Prune
+		// the named pane and retry immediately rather than backing off.
+		if pane, ok := stalePaneID(err); ok {
+			s.pruneStalePane(pane)
+			return true, nil
+		}
 		return false, fmt.Errorf("herdr events.subscribe: %w", err)
 	}
 	// The stream idles indefinitely between events — no deadline from here.
@@ -261,16 +326,13 @@ func (s *sessionEventStream) runCycle(ctx context.Context) (resubscribe bool, er
 		case <-relist.C:
 			relistArmed = false
 			s.tryPendingResync() // piggyback: a drained consumer gets its owed resync even in a quiet stream
-			agents, err := s.c.sockAgentList(ctx)
+			paneNames, err := s.p.derivedFilterSet(ctx)
 			if err != nil {
 				return false, err
 			}
-			for _, a := range agents {
-				if a.PaneID == "" || a.Name == "" {
-					continue
-				}
-				s.paneNames[a.PaneID] = a.Name
-				if !s.subscribed[a.PaneID] {
+			for pane, name := range paneNames {
+				s.paneNames[pane] = name
+				if !s.subscribed[pane] {
 					resubscribe = true
 				}
 			}

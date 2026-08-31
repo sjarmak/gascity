@@ -172,11 +172,29 @@ func (p *Provider) clearPaneBinding(name string) {
 // binding (a stored name and pane id), for ListRunning to merge with herdr's
 // registry — which never sees raw shell sessions.
 func (p *Provider) boundSessionNames() []string {
+	names := make([]string, 0, len(p.boundPaneBindings()))
+	for _, name := range p.boundPaneBindings() {
+		names = append(names, name)
+	}
+	return names
+}
+
+// boundPaneBindings enumerates every live-looking sidecar binding as a
+// pane id → exact gc session name map. This is the pane↔name mapping the
+// herdr agent registry cannot supply on its own: herdr ≥0.8.0 only lists an
+// agent once it has DETECTED a supported interactive process in the pane
+// (`herdr agent explain`), so a pane whose occupant herdr has not yet
+// classified — or never will, such as a raw shell — is absent from
+// agent.list even though its session is live and bound. Keying by the
+// sidecar's persisted metaBoundName also sidesteps herdrAgentName's lossy
+// mapping (lowercased, length-capped): the registry's a.Name is the herdr
+// label, not the gc session name, and the two only coincide by chance.
+func (p *Provider) boundPaneBindings() map[string]string {
 	entries, err := os.ReadDir(p.metaDir)
 	if err != nil {
 		return nil
 	}
-	var names []string
+	bindings := make(map[string]string)
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -185,12 +203,13 @@ func (p *Provider) boundSessionNames() []string {
 		if err != nil || name == "" {
 			continue
 		}
-		if pane, err := readMetaFile(filepath.Join(p.metaDir, e.Name(), sanitize(metaBoundPane))); err != nil || pane == "" {
+		pane, err := readMetaFile(filepath.Join(p.metaDir, e.Name(), sanitize(metaBoundPane)))
+		if err != nil || pane == "" {
 			continue
 		}
-		names = append(names, name)
+		bindings[pane] = name
 	}
-	return names
+	return bindings
 }
 
 // readMetaFile reads one sidecar value ("" when absent).

@@ -51,12 +51,29 @@ func TestSessionEventsLive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// paneOf reads the pane id herdr assigned a session at Start from the
+	// sidecar binding rather than the agent registry: under herdr ≥0.8.0
+	// the registry only lists a pane once it has DETECTED a supported
+	// interactive agent inside it, and these sessions run a bare "sleep"
+	// (there is no real agent binary to detect), so `agent get`/`agent list`
+	// never see them at all. The sidecar binding is populated at Start
+	// regardless of detection, which is exactly the gap this test exercises.
+	paneOf := func(name string) string {
+		t.Helper()
+		pane, err := p.GetMeta(name, metaBoundPane)
+		if err != nil || pane == "" {
+			t.Fatalf("GetMeta %s %s: pane=%q err=%v", name, metaBoundPane, pane, err)
+		}
+		return pane
+	}
+
 	// evt-a exists before the stream: its pane rides the initial filter set.
 	cfgA := runtime.Config{WorkDir: t.TempDir(), Command: "sleep 120"}
 	if err := p.Start(ctx, "evt-a", cfgA); err != nil {
 		t.Fatalf("Start evt-a: %v", err)
 	}
 	t.Cleanup(func() { _ = p.Stop("evt-a") })
+	paneA := paneOf("evt-a")
 
 	ch, err := p.SubscribeSessionEvents(ctx)
 	if err != nil {
@@ -67,24 +84,30 @@ func TestSessionEventsLive(t *testing.T) {
 	})
 
 	// Forced status change on evt-a's pane must arrive attributed.
-	a, ok, err := p.c.getAgent(ctx, "evt-a")
-	if err != nil || !ok {
-		t.Fatalf("getAgent evt-a: ok=%v err=%v", ok, err)
-	}
-	report := func(pane, state string) {
+	report := func(pane, agent, state string) {
 		t.Helper()
 		out, err := exec.Command("herdr", "--session", session, "pane", "report-agent", pane,
-			"--source", "gctest", "--agent", "gctest", "--state", state).CombinedOutput()
+			"--source", "gctest", "--agent", agent, "--state", state).CombinedOutput()
 		if err != nil {
 			t.Fatalf("pane report-agent %s %s: %v: %s", pane, state, err, out)
 		}
 	}
-	report(a.PaneID, "working")
-	ev := waitForEvent(t, ch, 10*time.Second, func(ev runtime.SessionEvent) bool {
-		return ev.Kind == runtime.SessionEventAgentStatus && ev.Session == "evt-a"
+	// herdr ≥0.8.0's registry is detection-based: the FIRST report-agent call
+	// on a pane REGISTERS the agent (fires pane_agent_detected, which carries
+	// no status) rather than reporting a status transition; only a second
+	// call against an already-detected agent fires pane_agent_status_changed.
+	// A production agent TUI gets its "detected" call from herdr's own
+	// detector; these bare "sleep" panes need it simulated explicitly.
+	report(paneA, herdrAgentName("evt-a"), "idle")
+	waitForEvent(t, ch, 10*time.Second, func(ev runtime.SessionEvent) bool {
+		return ev.Kind == runtime.SessionEventAgentDetected && ev.Session == "evt-a"
 	})
-	if ev.AgentStatus != "working" {
-		t.Errorf("evt-a status event = %q, want working", ev.AgentStatus)
+	report(paneA, herdrAgentName("evt-a"), "working")
+	ev := waitForEvent(t, ch, 10*time.Second, func(ev runtime.SessionEvent) bool {
+		return ev.Kind == runtime.SessionEventAgentStatus && ev.Session == "evt-a" && ev.AgentStatus == "working"
+	})
+	if ev.Ref != paneA {
+		t.Errorf("evt-a status event ref = %q, want %q", ev.Ref, paneA)
 	}
 
 	// evt-b starts while the stream is live: pane_created → debounced re-list
@@ -94,22 +117,20 @@ func TestSessionEventsLive(t *testing.T) {
 		t.Fatalf("Start evt-b: %v", err)
 	}
 	t.Cleanup(func() { _ = p.Stop("evt-b") })
-	b, ok, err := p.c.getAgent(ctx, "evt-b")
-	if err != nil || !ok {
-		t.Fatalf("getAgent evt-b: ok=%v err=%v", ok, err)
-	}
+	paneB := paneOf("evt-b")
 	// The resubscribe cycle emits a fresh resync; wait for it so the report
 	// below races nothing.
 	waitForEvent(t, ch, 15*time.Second, func(ev runtime.SessionEvent) bool {
 		return ev.Kind == runtime.SessionEventResync
 	})
-	report(b.PaneID, "blocked")
-	ev = waitForEvent(t, ch, 10*time.Second, func(ev runtime.SessionEvent) bool {
-		return ev.Kind == runtime.SessionEventAgentStatus && ev.Session == "evt-b"
+	report(paneB, herdrAgentName("evt-b"), "idle")
+	waitForEvent(t, ch, 10*time.Second, func(ev runtime.SessionEvent) bool {
+		return ev.Kind == runtime.SessionEventAgentDetected && ev.Session == "evt-b"
 	})
-	if ev.AgentStatus != "blocked" {
-		t.Errorf("evt-b status event = %q, want blocked", ev.AgentStatus)
-	}
+	report(paneB, herdrAgentName("evt-b"), "blocked")
+	waitForEvent(t, ch, 10*time.Second, func(ev runtime.SessionEvent) bool {
+		return ev.Kind == runtime.SessionEventAgentStatus && ev.Session == "evt-b" && ev.AgentStatus == "blocked"
+	})
 
 	// evt-c exits on its own: pane_exited must arrive attributed (the
 	// merge-only pane map keeps the mapping even if herdr reaps the agent
