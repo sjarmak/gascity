@@ -168,7 +168,10 @@ func assignedWorkIndexReachableFromAgentOnClaimRefs(
 // filterAssignedWorkBeadsForPoolDemand resolves work through the routed
 // backing template because pool scale decisions are per agent template.
 // leading is the store this arm was handed; it resolves the claim refs, and is
-// a property of the CITY so it is read once rather than per bead.
+// a property of the CITY so it is read once rather than per bead. It returns
+// the filtered beads plus their store refs, index-aligned, so callers can feed
+// ComputePoolDesiredStatesAt (etc.) the same managed-worktree evidence the
+// wake-tier filter (filterAssignedWorkBeadsForSessionWake) already carries.
 func filterAssignedWorkBeadsForPoolDemand(
 	cfg *config.City,
 	cityPath string,
@@ -176,12 +179,12 @@ func filterAssignedWorkBeadsForPoolDemand(
 	sessionInfos []sessionpkg.Info,
 	assignedWorkBeads []beads.Bead,
 	assignedWorkStoreRefs []string,
-) []beads.Bead {
+) ([]beads.Bead, []string) {
 	if len(assignedWorkBeads) == 0 || len(assignedWorkStoreRefs) == 0 {
-		return assignedWorkBeads
+		return assignedWorkBeads, assignedWorkStoreRefs
 	}
 	if cfg == nil {
-		return assignedWorkBeads
+		return assignedWorkBeads, assignedWorkStoreRefs
 	}
 	claimRefs := assignedWorkRelocatedClaimRefs(cityPath, cfg, leading)
 	assigneeToSessionBeadID := make(map[string]string)
@@ -203,6 +206,7 @@ func filterAssignedWorkBeadsForPoolDemand(
 	}
 	now := time.Now().UTC()
 	filtered := make([]beads.Bead, 0, len(assignedWorkBeads))
+	filteredStoreRefs := make([]string, 0, len(assignedWorkBeads))
 	for i, wb := range assignedWorkBeads {
 		// A deferred bead is deliberately parked (future defer_until) and is
 		// invisible to bd ready, so scale_check reports zero demand for it.
@@ -236,9 +240,10 @@ func filterAssignedWorkBeadsForPoolDemand(
 		}
 		if assignedWorkIndexReachableFromAgentOnClaimRefs(cityPath, cfg, agentCfg, assignedWorkStoreRefs, i, claimRefs) {
 			filtered = append(filtered, wb)
+			filteredStoreRefs = append(filteredStoreRefs, assignedWorkStoreRefs[i])
 		}
 	}
-	return filtered
+	return filtered, filteredStoreRefs
 }
 
 // filterAssignedWorkBeadsForSessionWake resolves work through assignment

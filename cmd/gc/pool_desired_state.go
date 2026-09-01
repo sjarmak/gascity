@@ -195,15 +195,19 @@ func ComputePoolDesiredStates(
 
 // ComputePoolDesiredStatesAt computes pool demand at a caller-supplied
 // decision time so post-create retention is consistent with its session
-// snapshot.
+// snapshot. assignedWorkStoreRefs is index-aligned with assignedWorkBeads (per
+// beadmeta.RootStoreRefMetadataKey convention) so the resume and
+// wake-known-identity tiers can carry the same managed-worktree evidence the
+// new-demand tier already does; pass nil when store refs are unavailable.
 func ComputePoolDesiredStatesAt(
 	cfg *config.City,
 	assignedWorkBeads []beads.Bead,
+	assignedWorkStoreRefs []string,
 	sessionInfos []sessionpkg.Info,
 	scaleCheckCounts map[string]int,
 	decisionTime time.Time,
 ) []PoolDesiredState {
-	return computePoolDesiredStatesAt(cfg, assignedWorkBeads, sessionInfos, scaleCheckCounts, nil, decisionTime, nil)
+	return computePoolDesiredStatesAt(cfg, assignedWorkBeads, assignedWorkStoreRefs, sessionInfos, scaleCheckCounts, nil, decisionTime, nil)
 }
 
 func ComputePoolDesiredStatesTraced(
@@ -221,12 +225,13 @@ func ComputePoolDesiredStatesTraced(
 func ComputePoolDesiredStatesTracedAt(
 	cfg *config.City,
 	assignedWorkBeads []beads.Bead,
+	assignedWorkStoreRefs []string,
 	sessionInfos []sessionpkg.Info,
 	scaleCheckCounts map[string]int,
 	decisionTime time.Time,
 	trace *sessionReconcilerTraceCycle,
 ) []PoolDesiredState {
-	return computePoolDesiredStatesAt(cfg, assignedWorkBeads, sessionInfos, scaleCheckCounts, nil, decisionTime, trace)
+	return computePoolDesiredStatesAt(cfg, assignedWorkBeads, assignedWorkStoreRefs, sessionInfos, scaleCheckCounts, nil, decisionTime, trace)
 }
 
 func ComputePoolDesiredStatesWithDemandTraced(
@@ -242,16 +247,19 @@ func ComputePoolDesiredStatesWithDemandTraced(
 
 // ComputePoolDesiredStatesWithDemandTracedAt computes traced pool demand at a
 // caller-supplied decision time while preserving per-work demand provenance.
+// assignedWorkStoreRefs is index-aligned with assignedWorkBeads; see
+// ComputePoolDesiredStatesAt.
 func ComputePoolDesiredStatesWithDemandTracedAt(
 	cfg *config.City,
 	assignedWorkBeads []beads.Bead,
+	assignedWorkStoreRefs []string,
 	sessionInfos []sessionpkg.Info,
 	scaleCheckCounts map[string]int,
 	scaleCheckDemand map[string]scaleCheckDemand,
 	decisionTime time.Time,
 	trace *sessionReconcilerTraceCycle,
 ) []PoolDesiredState {
-	return computePoolDesiredStatesAt(cfg, assignedWorkBeads, sessionInfos, scaleCheckCounts, scaleCheckDemand, decisionTime, trace)
+	return computePoolDesiredStatesAt(cfg, assignedWorkBeads, assignedWorkStoreRefs, sessionInfos, scaleCheckCounts, scaleCheckDemand, decisionTime, trace)
 }
 
 func computePoolDesiredStates(
@@ -262,12 +270,13 @@ func computePoolDesiredStates(
 	scaleCheckDemand map[string]scaleCheckDemand,
 	trace *sessionReconcilerTraceCycle,
 ) []PoolDesiredState {
-	return computePoolDesiredStatesAt(cfg, assignedWorkBeads, sessionInfos, scaleCheckCounts, scaleCheckDemand, time.Time{}, trace)
+	return computePoolDesiredStatesAt(cfg, assignedWorkBeads, nil, sessionInfos, scaleCheckCounts, scaleCheckDemand, time.Time{}, trace)
 }
 
 func computePoolDesiredStatesAt(
 	cfg *config.City,
 	assignedWorkBeads []beads.Bead,
+	assignedWorkStoreRefs []string,
 	sessionInfos []sessionpkg.Info,
 	scaleCheckCounts map[string]int,
 	scaleCheckDemand map[string]scaleCheckDemand,
@@ -319,7 +328,16 @@ func computePoolDesiredStatesAt(
 
 		// Resume tier: actionable assigned work beads whose assignee resolves
 		// to a non-closed session bead. These sessions must stay alive.
-		for _, wb := range assignedWorkBeads {
+		for wbIdx, wb := range assignedWorkBeads {
+			var workStoreRef string
+			if wbIdx < len(assignedWorkStoreRefs) {
+				workStoreRef = strings.TrimSpace(assignedWorkStoreRefs[wbIdx])
+			}
+			worktreeSpec, worktreeSpecErr := worktreeSpecForBead(wb, workStoreRef)
+			worktreeErrMsg := ""
+			if worktreeSpecErr != nil {
+				worktreeErrMsg = worktreeSpecErr.Error()
+			}
 			routedTo := routedToOrLegacyWorkflowTarget(wb)
 			if wb.Status != "in_progress" && wb.Status != "open" {
 				continue
@@ -364,7 +382,10 @@ func computePoolDesiredStatesAt(
 					WorkBeadTitle:  strings.TrimSpace(wb.Title),
 					WorkPack:       strings.TrimSpace(wb.Metadata[beadmeta.PackMetadataKey]),
 					WorkWorkspace:  strings.TrimSpace(wb.Metadata[beadmeta.PackWorkspaceMetadataKey]),
+					WorkStoreRef:   workStoreRef,
 					BrainParentSID: strings.TrimSpace(wb.Metadata[beadmeta.BrainParentSIDMetadataKey]),
+					WorktreeSpec:   worktreeSpec,
+					WorktreeError:  worktreeErrMsg,
 				})
 				continue
 			}
@@ -398,7 +419,10 @@ func computePoolDesiredStatesAt(
 				WorkBeadTitle:  strings.TrimSpace(wb.Title),
 				WorkPack:       strings.TrimSpace(wb.Metadata[beadmeta.PackMetadataKey]),
 				WorkWorkspace:  strings.TrimSpace(wb.Metadata[beadmeta.PackWorkspaceMetadataKey]),
+				WorkStoreRef:   workStoreRef,
 				BrainParentSID: strings.TrimSpace(wb.Metadata[beadmeta.BrainParentSIDMetadataKey]),
+				WorktreeSpec:   worktreeSpec,
+				WorktreeError:  worktreeErrMsg,
 			})
 			if trace != nil {
 				trace.RecordDecision(TraceSitePoolWakeKnownIdentity, TraceReasonAssignedWork, TraceOutcomeScheduled, template, "", traceRecordPayload{

@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"io"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -881,6 +882,123 @@ func TestComputePoolDesiredStatesCarriesWorktreeOwnerEvidence(t *testing.T) {
 	}
 }
 
+// managedWorktreeWorkBead builds a real managed worktree on disk (via
+// worktree.Ensure) and a work bead whose metadata publishes matching
+// ownership evidence, so worktreeSpecForBead reconstructs an exact,
+// independently verifiable Spec for it. Returns the bead and its published
+// path.
+func managedWorktreeWorkBead(t *testing.T, id, assignee, routedTo string) (beads.Bead, string) {
+	t.Helper()
+	repo, base := worktreeTestRepo(t)
+	root := t.TempDir()
+	path := filepath.Join(root, id)
+	spec := worktree.Spec{
+		RepoDir: repo, Root: root, Path: path, Branch: "work/" + id, Base: base,
+		BeadID: id, StoreRef: "rig:gascity", Creator: "gc-sling",
+		Owner: "gc-sling", Generation: "1", Lifecycle: worktree.LifecycleActive,
+	}
+	report, err := worktree.Ensure(spec)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	spec.BaseSHA = report.Provenance.BaseSHA
+
+	wb := beads.Bead{
+		ID:       id,
+		Status:   "in_progress",
+		Assignee: assignee,
+		Priority: intPtr(5),
+		Metadata: map[string]string{
+			"gc.routed_to":                         routedTo,
+			beadmeta.WorkDirMetadataKey:            path,
+			beadmeta.WorktreeRepoMetadataKey:       repo,
+			beadmeta.WorktreeRootMetadataKey:       root,
+			beadmeta.WorkBranchMetadataKey:         "work/" + id,
+			beadmeta.WorktreeBaseRefMetadataKey:    base,
+			beadmeta.WorktreeBaseSHAMetadataKey:    spec.BaseSHA,
+			beadmeta.WorktreeCreatorMetadataKey:    "gc-sling",
+			beadmeta.WorktreeOwnerMetadataKey:      "gc-sling",
+			beadmeta.WorktreeGenerationMetadataKey: "1",
+			beadmeta.WorktreeLifecycleMetadataKey:  worktree.LifecycleActive,
+			beadmeta.RootStoreRefMetadataKey:       "rig:gascity",
+		},
+	}
+	return wb, path
+}
+
+// TestComputePoolDesiredStates_ResumeTierReachesVerifiedWorktreePath is the
+// gc-k0uii acceptance test: a resume request for a bead carrying managed-
+// worktree metadata must carry that evidence (WorkStoreRef + WorktreeSpec) so
+// verifiedPoolTriggerWorkDir takes its verified path -- not the unmanaged
+// fallback, which would derive a freshly computed directory instead of the
+// bead's actual bound workspace after a crashed session resumes.
+func TestComputePoolDesiredStates_ResumeTierReachesVerifiedWorktreePath(t *testing.T) {
+	cfg := &config.City{Agents: []config.Agent{poolAgent("claude", "rig", intPtr(2), 0)}}
+	wb, path := managedWorktreeWorkBead(t, "gc-resume", "sess-1", "rig/claude")
+	sessions := []beads.Bead{sessionBead("sess-1", "open")}
+	storeRefs := []string{"rig:gascity"}
+
+	result := computePoolDesiredStatesAt(cfg, []beads.Bead{wb}, storeRefs, sessionInfosFromBeads(sessions), nil, nil, time.Time{}, nil)
+
+	if len(result) != 1 || len(result[0].Requests) != 1 {
+		t.Fatalf("result = %+v, want one resume request", result)
+	}
+	request := result[0].Requests[0]
+	if request.Tier != "resume" || request.SessionBeadID != "sess-1" {
+		t.Fatalf("request = %+v, want resume for sess-1", request)
+	}
+	if request.WorkStoreRef != "rig:gascity" {
+		t.Fatalf("request.WorkStoreRef = %q, want rig:gascity", request.WorkStoreRef)
+	}
+	if request.WorktreeSpec == nil || request.WorktreeError != "" {
+		t.Fatalf("request worktree evidence = spec %+v error %q, want the bead's managed worktree spec and no error", request.WorktreeSpec, request.WorktreeError)
+	}
+	if request.WorktreeSpec.BeadID != "gc-resume" || request.WorktreeSpec.Path != path {
+		t.Fatalf("request.WorktreeSpec = %+v, want it to match the bead's own managed worktree", request.WorktreeSpec)
+	}
+
+	got, err := verifiedPoolTriggerWorkDir(nil, nil, "rig/claude", request)
+	if err != nil {
+		t.Fatalf("verifiedPoolTriggerWorkDir took the verified path and failed: %v", err)
+	}
+	if got != path {
+		t.Fatalf("verifiedPoolTriggerWorkDir = %q, want the verified managed worktree path %q (not an unmanaged fallback)", got, path)
+	}
+}
+
+// TestComputePoolDesiredStates_WakeKnownIdentityReachesVerifiedWorktreePath
+// is the wake-known-identity half of the gc-k0uii acceptance test: work
+// bound to the pool identity's own bare form, with no live session bead,
+// must still carry the bead's managed-worktree evidence into the emitted
+// wake request.
+func TestComputePoolDesiredStates_WakeKnownIdentityReachesVerifiedWorktreePath(t *testing.T) {
+	cfg := &config.City{Agents: []config.Agent{poolAgent("implementation-worker", "gascity-packs", intPtr(8), 0)}}
+	legacyIdentity := "gascity-packs/gc.implementation-worker"
+	wb, path := managedWorktreeWorkBead(t, "gc-wake", legacyIdentity, legacyIdentity)
+	storeRefs := []string{"rig:gascity"}
+
+	result := computePoolDesiredStatesAt(cfg, []beads.Bead{wb}, storeRefs, nil, nil, nil, time.Time{}, nil)
+
+	if len(result) != 1 || len(result[0].Requests) != 1 {
+		t.Fatalf("result = %+v, want one wake-known-identity request", result)
+	}
+	request := result[0].Requests[0]
+	if request.Tier != "wake-known-identity" || request.WorkBeadID != "gc-wake" {
+		t.Fatalf("request = %+v, want wake-known-identity for gc-wake", request)
+	}
+	if request.WorktreeSpec == nil || request.WorktreeError != "" {
+		t.Fatalf("request worktree evidence = spec %+v error %q, want the bead's managed worktree spec and no error", request.WorktreeSpec, request.WorktreeError)
+	}
+
+	got, err := verifiedPoolTriggerWorkDir(nil, nil, "gascity-packs/implementation-worker", request)
+	if err != nil {
+		t.Fatalf("verifiedPoolTriggerWorkDir took the verified path and failed: %v", err)
+	}
+	if got != path {
+		t.Fatalf("verifiedPoolTriggerWorkDir = %q, want the verified managed worktree path %q (not an unmanaged fallback)", got, path)
+	}
+}
+
 func TestComputePoolDesiredStates_ManualSessionDoesNotConsumeSingletonNewDemand(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{poolAgent("claude", "", intPtr(1), 0)},
@@ -1312,7 +1430,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionRetainsFreshSessionsAboveS
 		protectedPoolSessionBeadAt("sess-2", now.Add(-20*time.Second)),
 	}
 
-	result := ComputePoolDesiredStatesAt(cfg, nil, sessionInfosFromBeads(sessions), map[string]int{"claude": 1}, now)
+	result := ComputePoolDesiredStatesAt(cfg, nil, nil, sessionInfosFromBeads(sessions), map[string]int{"claude": 1}, now)
 
 	if len(result) != 1 || len(result[0].Requests) != 2 {
 		t.Fatalf("result = %#v, want both fresh sessions retained while scale_check reports one", result)
@@ -1334,7 +1452,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionRetainsFreshSessionsAtZero
 		protectedPoolSessionBeadAt("sess-2", now.Add(-20*time.Second)),
 	}
 
-	result := ComputePoolDesiredStatesAt(cfg, nil, sessionInfosFromBeads(sessions), map[string]int{"claude": 0}, now)
+	result := ComputePoolDesiredStatesAt(cfg, nil, nil, sessionInfosFromBeads(sessions), map[string]int{"claude": 0}, now)
 
 	if len(result) != 1 || len(result[0].Requests) != 2 {
 		t.Fatalf("result = %#v, want both fresh sessions retained at zero scale", result)
@@ -1359,7 +1477,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionDoesNotRequireScaleEntry(t
 			fresh := protectedPoolSessionBeadAt("sess-fresh", now.Add(-30*time.Second))
 			result := ComputePoolDesiredStatesAt(
 				cfg,
-				nil,
+				nil, nil,
 				sessionInfosFromBeads([]beads.Bead{fresh}),
 				tt.counts,
 				now,
@@ -1372,7 +1490,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionDoesNotRequireScaleEntry(t
 			pending := pendingPoolSessionBead("sess-pending")
 			pendingResult := ComputePoolDesiredStatesAt(
 				cfg,
-				nil,
+				nil, nil,
 				sessionInfosFromBeads([]beads.Bead{pending}),
 				tt.counts,
 				now,
@@ -1394,7 +1512,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionUsesFreshRecomputeTime(t *
 	session := pendingPoolSessionBeadAt("sess-1", createTime)
 	initial := ComputePoolDesiredStatesAt(
 		cfg,
-		nil,
+		nil, nil,
 		sessionInfosFromBeads([]beads.Bead{session}),
 		map[string]int{"claude": 1},
 		createTime,
@@ -1409,7 +1527,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionUsesFreshRecomputeTime(t *
 	session.Metadata["creation_complete_at"] = completeTime.Format(time.RFC3339)
 	recomputed := ComputePoolDesiredStatesAt(
 		cfg,
-		nil,
+		nil, nil,
 		sessionInfosFromBeads([]beads.Bead{session}),
 		nil,
 		recomputeTime,
@@ -1427,7 +1545,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionExpires(t *testing.T) {
 	}
 	expired := protectedPoolSessionBeadAt("sess-expired", now.Add(-postCreateProtectionTimeout))
 
-	result := ComputePoolDesiredStatesAt(cfg, nil, sessionInfosFromBeads([]beads.Bead{expired}), map[string]int{"claude": 0}, now)
+	result := ComputePoolDesiredStatesAt(cfg, nil, nil, sessionInfosFromBeads([]beads.Bead{expired}), map[string]int{"claude": 0}, now)
 
 	if got := PoolDesiredCounts(result)["claude"]; got != 0 {
 		t.Fatalf("poolDesired[claude] = %d, want 0 at the protection boundary", got)
@@ -1445,7 +1563,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionCoexistsWithResume(t *test
 		workBead("work-1", "claude", resume.ID, "in_progress", 5),
 	}
 
-	result := ComputePoolDesiredStatesAt(cfg, work, sessionInfosFromBeads([]beads.Bead{resume, fresh}), map[string]int{"claude": 0}, now)
+	result := ComputePoolDesiredStatesAt(cfg, work, nil, sessionInfosFromBeads([]beads.Bead{resume, fresh}), map[string]int{"claude": 0}, now)
 
 	if len(result) != 1 || len(result[0].Requests) != 2 {
 		t.Fatalf("result = %#v, want one resume plus one protected fresh session", result)
@@ -1497,7 +1615,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionBindsWakeKnownCapacity(t *
 
 			result := ComputePoolDesiredStatesAt(
 				cfg,
-				work,
+				work, nil,
 				sessionInfosFromBeads(sessions),
 				map[string]int{"claude": tt.scaleCount},
 				now,
@@ -1536,7 +1654,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionRespectsCapShrink(t *testi
 		protectedPoolSessionBeadAt("sess-newest", now.Add(-20*time.Second)),
 	}
 
-	result := ComputePoolDesiredStatesAt(cfg, nil, sessionInfosFromBeads(sessions), map[string]int{"claude": 0}, now)
+	result := ComputePoolDesiredStatesAt(cfg, nil, nil, sessionInfosFromBeads(sessions), map[string]int{"claude": 0}, now)
 
 	if len(result) != 1 || len(result[0].Requests) != 1 {
 		t.Fatalf("result = %#v, want cap shrink to retain only one session", result)
@@ -1556,7 +1674,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionDoesNotOvercreate(t *testi
 		protectedPoolSessionBeadAt("sess-2", now.Add(-20*time.Second)),
 	}
 
-	result := ComputePoolDesiredStatesAt(cfg, nil, sessionInfosFromBeads(sessions), map[string]int{"claude": 2}, now)
+	result := ComputePoolDesiredStatesAt(cfg, nil, nil, sessionInfosFromBeads(sessions), map[string]int{"claude": 2}, now)
 
 	if len(result) != 1 || len(result[0].Requests) != 2 {
 		t.Fatalf("result = %#v, want protected sessions to cover demand without anonymous creates", result)
@@ -1657,7 +1775,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionExcludesNonReusableSession
 
 			result := ComputePoolDesiredStatesAt(
 				cfg,
-				nil,
+				nil, nil,
 				sessionInfosFromBeads([]beads.Bead{session}),
 				map[string]int{"claude": 0},
 				now,
@@ -1685,7 +1803,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionDependencyOnlyNeverCreates
 	} {
 		result := ComputePoolDesiredStatesAt(
 			cfg,
-			nil,
+			nil, nil,
 			sessionInfosFromBeads([]beads.Bead{session}),
 			scaleCounts,
 			now,
@@ -1734,7 +1852,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionDoesNotBindBlockedCapacity
 
 			result := ComputePoolDesiredStatesAt(
 				cfg,
-				work,
+				work, nil,
 				sessionInfosFromBeads([]beads.Bead{session}),
 				map[string]int{"claude": 0},
 				now,
@@ -1849,7 +1967,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionReusesProtectedBeforePendi
 
 	result := ComputePoolDesiredStatesAt(
 		cfg,
-		nil,
+		nil, nil,
 		sessionInfosFromBeads([]beads.Bead{pending, protected}),
 		map[string]int{"claude": 2},
 		now,
@@ -1884,7 +2002,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionBindingPreservesScaleDeman
 
 	result := computePoolDesiredStatesAt(
 		cfg,
-		work,
+		work, nil,
 		sessionInfosFromBeads([]beads.Bead{protected}),
 		map[string]int{"claude": 1},
 		demand,
@@ -1919,7 +2037,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionAdvancesDemandIndex(t *tes
 
 	result := computePoolDesiredStatesAt(
 		cfg,
-		nil,
+		nil, nil,
 		sessionInfosFromBeads([]beads.Bead{protected}),
 		map[string]int{"claude": 2},
 		demand,
@@ -1966,7 +2084,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionAllocatesDemandByTriggerId
 
 	result := computePoolDesiredStatesAt(
 		cfg,
-		nil,
+		nil, nil,
 		sessionInfosFromBeads([]beads.Bead{protected}),
 		map[string]int{"claude": 2},
 		demand,
@@ -2023,7 +2141,7 @@ func TestComputePoolDesiredStates_PostCreateProtectionRebindsUnmatchedConcreteDe
 
 			result := computePoolDesiredStatesAt(
 				cfg,
-				nil,
+				nil, nil,
 				sessionInfosFromBeads([]beads.Bead{protected}),
 				map[string]int{"claude": 2},
 				demand,
@@ -2322,7 +2440,7 @@ func TestBuildDesiredState_BlockedFreshSessionMaterializesRunnableReplacement(t 
 				readyFlags[i] = result.ReadyAssigned[storeScopedBeadKey{StoreRef: storeRef, ID: work.ID}]
 			}
 			openInfos := snapshot.OpenInfos()
-			poolWork := filterAssignedWorkBeadsForPoolDemand(
+			poolWork, poolWorkStoreRefs := filterAssignedWorkBeadsForPoolDemand(
 				cfg,
 				cityPath,
 				store,
@@ -2333,6 +2451,7 @@ func TestBuildDesiredState_BlockedFreshSessionMaterializesRunnableReplacement(t 
 			poolDesired := PoolDesiredCounts(ComputePoolDesiredStatesAt(
 				cfg,
 				poolWork,
+				poolWorkStoreRefs,
 				openInfos,
 				result.ScaleCheckCounts,
 				decisionTime,

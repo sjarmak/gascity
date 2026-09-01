@@ -1055,12 +1055,12 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 
 	dt := newDrainTracker()
 	openInfos := sessionBeads.OpenInfos()
-	poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, oneShotStore, openInfos, dsResult.AssignedWorkBeads, dsResult.AssignedWorkStoreRefs)
+	poolWorkBeads, poolWorkStoreRefs := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, oneShotStore, openInfos, dsResult.AssignedWorkBeads, dsResult.AssignedWorkStoreRefs)
 	poolDecisionTime := time.Now()
 	poolDesired := retainScaleCheckPartialPoolDesired(
 		cfg,
 		PoolDesiredCounts(ComputePoolDesiredStatesAt(
-			cfg, poolWorkBeads, openInfos, dsResult.ScaleCheckCounts, poolDecisionTime)),
+			cfg, poolWorkBeads, poolWorkStoreRefs, openInfos, dsResult.ScaleCheckCounts, poolDecisionTime)),
 		sessionBeads,
 		effectivePoolPartialRetentionTemplates(dsResult),
 	)
