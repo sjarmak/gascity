@@ -294,6 +294,9 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 				kindMeta[session.NamedSessionMetadataKey] = "true"
 				kindMeta[session.NamedSessionIdentityMetadata] = configuredOwner
 			}
+			if agentOwnsPoolIdentity(&found) {
+				kindMeta[session.PoolOwnedIdentityMetadataKey] = "true"
+			}
 			if family := resolvedProviderFamilyMetadata(resolved); family != "" {
 				kindMeta["provider_kind"] = family
 			}
@@ -407,6 +410,9 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 	kindMeta := map[string]string{
 		"agent_name":     sessionQualifiedName,
 		"session_origin": sessionOriginForConfiguredNamed(configuredOwner, requestedAlias),
+	}
+	if agentOwnsPoolIdentity(&found) {
+		kindMeta[session.PoolOwnedIdentityMetadataKey] = "true"
 	}
 	if configuredOwner != "" && requestedAlias == "" {
 		kindMeta[session.NamedSessionMetadataKey] = "true"
@@ -677,6 +683,15 @@ func sessionOriginForConfiguredNamed(configuredOwner, requestedAlias string) str
 		return "named"
 	}
 	return "manual"
+}
+
+// agentOwnsPoolIdentity reports whether agent's explicit session name is
+// pool-owned: sessionExplicitNameForNewSession resolves the agent's
+// tmux_alias unconditionally, so every session created against this
+// template — pool-managed or manually created — shares that one runtime
+// identity and must release it on close instead of stranding it (gc-2ow7r).
+func agentOwnsPoolIdentity(agent *config.Agent) bool {
+	return agent != nil && strings.TrimSpace(agent.TmuxAlias) != ""
 }
 
 func sessionNewAliasOwner(cfg *config.City, agent *config.Agent) string {

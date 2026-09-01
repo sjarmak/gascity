@@ -157,6 +157,21 @@ func TestSessionExplicitNameForNewSessionAliasKeepsGeneratedNameOff(t *testing.T
 	}
 }
 
+func TestAgentOwnsPoolIdentity(t *testing.T) {
+	if agentOwnsPoolIdentity(nil) {
+		t.Fatal("nil agent must not own a pool identity")
+	}
+	if agentOwnsPoolIdentity(&config.Agent{Name: "worker"}) {
+		t.Fatal("agent without tmux_alias must not own a pool identity")
+	}
+	if !agentOwnsPoolIdentity(&config.Agent{Name: "worker", TmuxAlias: "gascity-worker-pool"}) {
+		t.Fatal("agent with tmux_alias must own its pool identity")
+	}
+	if agentOwnsPoolIdentity(&config.Agent{Name: "worker", TmuxAlias: "   "}) {
+		t.Fatal("agent with a blank tmux_alias must not own a pool identity")
+	}
+}
+
 func TestParsePruneDuration(t *testing.T) {
 	tests := []struct {
 		input   string

@@ -1722,6 +1722,91 @@ func TestClose_NamedSessionByIdentityRetiresIdentifiers(t *testing.T) {
 	}
 }
 
+// TestClose_PoolOwnedIdentityRetiresIdentifiers covers gc-2ow7r: a manual
+// session created against a pool template inherits the template's
+// tmux_alias as its explicit session_name (sessionExplicitNameForNewSession
+// resolves tmux_alias unconditionally), so it shares the exact runtime
+// identity a legitimate pool-managed session would also use. Closing that
+// manual session must release the identity — through the same mutation
+// boundary as a configured named session — or the pool can never regrow
+// past the closed session's leftover claim once it falls below
+// min_active_sessions.
+func TestClose_PoolOwnedIdentityRetiresIdentifiers(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(
+		context.Background(), CreateOptions{ExplicitName: "gascity-worker-pool", Template: "gascity-worker", Title: "Worker", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{
+			"session_origin":             "manual",
+			PoolOwnedIdentityMetadataKey: "true",
+		}})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	if err := mgr.Close(info.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := b.Status; got != "closed" {
+		t.Fatalf("Status = %q, want closed", got)
+	}
+	if got := b.Metadata["session_name"]; got != "" {
+		t.Fatalf("session_name = %q, want empty after close", got)
+	}
+	if got := b.Metadata["session_name_explicit"]; got != "" {
+		t.Fatalf("session_name_explicit = %q, want empty after close", got)
+	}
+
+	// The pool base name must be reusable so the controller can materialize a
+	// fresh pool-managed session on it (the incident's stranded-name symptom).
+	if _, err := mgr.CreateSession(context.Background(), CreateOptions{ExplicitName: "gascity-worker-pool", Template: "gascity-worker", Title: "Worker 2", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{
+		"session_origin": "ephemeral",
+		"pool_managed":   "true",
+	}}); err != nil {
+		t.Fatalf("CreateSession after close should reuse the released pool identity, got: %v", err)
+	}
+}
+
+// TestClose_UnrelatedManualIdentityStaysReserved pins the "preserve global
+// historical name uniqueness for unrelated explicit manual names" half of
+// gc-2ow7r's acceptance: a manual session whose explicit name was NOT
+// derived from a pool template's tmux_alias (no PoolOwnedIdentityMetadataKey
+// marker) must keep permanently reserving that name after close, exactly as
+// before this fix.
+func TestClose_UnrelatedManualIdentityStaysReserved(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{ExplicitName: "sky", Template: "helper", Title: "first", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := mgr.Close(info.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := b.Metadata["session_name"]; got != "sky" {
+		t.Fatalf("session_name = %q, want sky to remain reserved after close", got)
+	}
+
+	if _, err := mgr.CreateSession(context.Background(), CreateOptions{ExplicitName: "sky", Template: "helper", Title: "second", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}}); err == nil {
+		t.Fatal("expected closed unrelated manual session to keep reserving its explicit name")
+	} else if !errors.Is(err, ErrSessionNameExists) {
+		t.Fatalf("expected ErrSessionNameExists, got %v", err)
+	}
+}
+
 func TestCreateInjectsUnifiedSessionRuntimeEnv(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()

@@ -1382,7 +1382,13 @@ func (m *Manager) retireConfiguredNamedSessionIdentifiers(id string, b beads.Bea
 	// partially-tagged bead (identity recorded, boolean flag absent) still
 	// releases its reserved runtime name on close instead of stranding the
 	// name and blocking respawn (ga-841).
-	if !wasConfiguredNamedSession(b) {
+	//
+	// Also recognize a pool-owned identity: a manual or auto-materialized
+	// session created against a pool template inherits the template's
+	// tmux_alias as its explicit session_name, so closing it must release
+	// that shared identity the same way, or the pool can never regrow past
+	// the closed session's leftover claim (gc-2ow7r).
+	if !wasConfiguredNamedSession(b) && !wasPoolOwnedIdentity(b) {
 		return nil
 	}
 	update := beads.UpdateOpts{

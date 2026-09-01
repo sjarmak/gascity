@@ -311,6 +311,9 @@ func materializeSessionForAgentConfig(cityPath string, cfg *config.City, store b
 		"agent_name":     sessionQualifiedName,
 		"session_origin": "manual",
 	}
+	if agentOwnsPoolIdentity(agentCfg) {
+		extraMeta[session.PoolOwnedIdentityMetadataKey] = "true"
+	}
 	if family := resolvedProviderFamilyMetadata(resolved); family != "" {
 		extraMeta["provider_kind"] = family
 	}
