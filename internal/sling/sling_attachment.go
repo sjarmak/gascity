@@ -231,6 +231,27 @@ func checkNoMoleculeChildren(q BeadQuerier, beadID string, store beads.Store, re
 	return nil
 }
 
+// CheckTargetNotDirectlyClaimed reports (as a *MoleculeAttachedError, so it
+// shares the same fallbackToPlainOnMoleculeConflict handling as an ordinary
+// molecule/wisp attachment conflict) that beadID is already claimed by
+// another session. It is the admission fence against a graph.v2 (or legacy)
+// formula attach racing a direct claim on the same target: without it, a
+// claimed-but-not-yet-attached bead can still admit a duplicate dispatch
+// (gastownhall/gascity#e8lim). Call it only after the caller has already
+// confirmed no molecule/wisp/workflow attachment exists, so it never shadows
+// those more specific conflicts.
+func CheckTargetNotDirectlyClaimed(q BeadQuerier, beadID string, store beads.Store) error {
+	parent, ok := BeadFromGetters(beadID, q, store)
+	if !ok {
+		return nil
+	}
+	assignee := strings.TrimSpace(parent.Assignee)
+	if assignee == "" {
+		return nil
+	}
+	return &MoleculeAttachedError{BeadID: beadID, Label: "claim", AttachmentID: assignee}
+}
+
 // MoleculeAttachedError reports that a bead already has a live, non-workflow
 // molecule/wisp attachment blocking a new formula attach. It is distinct from
 // sourceworkflow.ConflictError (a live graph.v2 workflow attachment) so

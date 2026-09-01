@@ -2741,6 +2741,41 @@ func TestSlingAttachGraphFormulaCreatesFreshRootForBareBeadTarget(t *testing.T) 
 	}
 }
 
+// TestSlingAttachGraphFormulaRejectsDirectlyClaimedTarget is the admission
+// fence from gastownhall/gascity#e8lim: an explicit AttachFormula (--on)
+// against a target that is already directly claimed (Assignee set) but has
+// no molecule/wisp/workflow attached yet must be refused at dispatch time,
+// not silently admit a second in-flight dispatch for the same issue.
+func TestSlingAttachGraphFormulaRejectsDirectlyClaimedTarget(t *testing.T) {
+	formulaDir := t.TempDir()
+	writeGraphV2ConvoyFormula(t, formulaDir)
+	cfg := graphV2SlingTestConfig(t, formulaDir)
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	source, err := deps.Store.Create(beads.Bead{Title: "work", Type: "task", Status: "open", Assignee: "other-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	if _, err := s.AttachFormula(context.Background(), "graph-work", source.ID, a, FormulaOpts{}); err == nil {
+		t.Fatal("AttachFormula on a directly-claimed target: want error, got nil")
+	} else if !strings.Contains(err.Error(), "other-session") {
+		t.Fatalf("AttachFormula error = %v, want it to name the claiming session", err)
+	}
+	convoys, err := deps.Store.List(beads.ListQuery{Type: "convoy", IncludeClosed: true})
+	if err != nil {
+		t.Fatalf("List(convoy): %v", err)
+	}
+	for _, c := range convoys {
+		if c.Status != "closed" {
+			t.Errorf("convoy %s status = %q, want closed (refused dispatch must not leak an open input convoy)", c.ID, c.Status)
+		}
+	}
+}
+
 func TestSlingAttachGraphFormulaAllowsDifferentLiveBareBeadRoots(t *testing.T) {
 	formulaDir := t.TempDir()
 	writeNamedGraphV2ConvoyFormula(t, formulaDir, "graph-a")

@@ -551,6 +551,15 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 				}
 				return result, fmt.Errorf("%w", err)
 			}
+			if err := CheckTargetNotDirectlyClaimed(querier, beadID, deps.Store); err != nil {
+				var molErr *MoleculeAttachedError
+				if fallbackToPlainOnMoleculeConflict && errors.As(err, &molErr) {
+					result.BeadWarnings = append(result.BeadWarnings, fmt.Sprintf("skipped attaching %s %q on %s: %v; routed as a plain bead instead", errLabel, formulaName, beadID, molErr))
+					fellBackToPlainRoute = true
+					return finalize(opts, deps, beadID, "bead", result)
+				}
+				return result, fmt.Errorf("%w", err)
+			}
 			if err := checkLegacySourceWorkflowConflict(deps, beadID); err != nil {
 				return result, fmt.Errorf("%w", err)
 			}
@@ -624,6 +633,14 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 			// sling. Warn and route as a plain bead instead, so gc.routed_to
 			// still gets set. A workflow conflict or metadata-clear error is
 			// not this specific error class and keeps hard-failing above.
+			result.BeadWarnings = append(result.BeadWarnings, fmt.Sprintf("skipped attaching %s %q on %s: %v; routed as a plain bead instead", errLabel, formulaName, beadID, molErr))
+			return finalize(opts, deps, beadID, "bead", result)
+		}
+		return result, fmt.Errorf("%w", err)
+	}
+	if err := CheckTargetNotDirectlyClaimed(querier, beadID, deps.Store); err != nil {
+		var molErr *MoleculeAttachedError
+		if fallbackToPlainOnMoleculeConflict && errors.As(err, &molErr) {
 			result.BeadWarnings = append(result.BeadWarnings, fmt.Sprintf("skipped attaching %s %q on %s: %v; routed as a plain bead instead", errLabel, formulaName, beadID, molErr))
 			return finalize(opts, deps, beadID, "bead", result)
 		}
