@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/beadmeta"
 )
 
 // counterMemStore is a MemStore that also implements Counter, so the
@@ -49,8 +51,10 @@ func (s counterMemStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 		return nil, err
 	}
 	statusByID := make(map[string]string, len(all))
+	outcomeByID := make(map[string]string, len(all))
 	for _, b := range all {
 		statusByID[b.ID] = b.Status
+		outcomeByID[b.ID] = b.Metadata[beadmeta.OutcomeMetadataKey]
 	}
 	now := time.Now().UTC()
 	var result []Bead
@@ -65,7 +69,7 @@ func (s counterMemStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 		if derr != nil {
 			return nil, derr
 		}
-		if !cachedBeadReady(b, statusByID, deps) {
+		if !cachedBeadReady(b, statusByID, outcomeByID, deps) {
 			continue
 		}
 		result = append(result, cloneBead(b))
@@ -816,8 +820,10 @@ func (s depStrippingStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 		return nil, err
 	}
 	statusByID := make(map[string]string, len(all))
+	outcomeByID := make(map[string]string, len(all))
 	for _, b := range all {
 		statusByID[b.ID] = b.Status
+		outcomeByID[b.ID] = b.Metadata[beadmeta.OutcomeMetadataKey]
 	}
 	now := time.Now().UTC()
 	var result []Bead
@@ -832,7 +838,7 @@ func (s depStrippingStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 		if derr != nil {
 			return nil, derr
 		}
-		if !cachedBeadReady(b, statusByID, deps) {
+		if !cachedBeadReady(b, statusByID, outcomeByID, deps) {
 			continue
 		}
 		result = append(result, stripDepFields(cloneBead(b)))

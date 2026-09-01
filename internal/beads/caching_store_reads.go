@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"slices"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/beadmeta"
 )
 
 // List returns beads matching the query. Active-bead queries are served from
@@ -520,6 +522,7 @@ func (c *CachingStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 	}
 	var (
 		statusByID   map[string]string
+		outcomeByID  map[string]string
 		depsByID     map[string][]Dep
 		openBeads    []Bead
 		unanswerable bool
@@ -535,6 +538,7 @@ func (c *CachingStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 		},
 		func(suppressed map[string]struct{}) {
 			statusByID = make(map[string]string, len(c.beads))
+			outcomeByID = make(map[string]string, len(c.beads))
 			openBeads = make([]Bead, 0, len(c.beads))
 			now := time.Now().UTC()
 			for _, b := range c.beads {
@@ -542,6 +546,7 @@ func (c *CachingStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 					continue
 				}
 				statusByID[b.ID] = b.Status
+				outcomeByID[b.ID] = b.Metadata[beadmeta.OutcomeMetadataKey]
 				if IsReadyCandidate(b, now) {
 					if c.readyProjectionUnknownLocked(b.ID) {
 						unanswerable = true
@@ -566,7 +571,7 @@ func (c *CachingStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 
 	var result []Bead
 	for _, b := range openBeads {
-		if cachedBeadReady(b, statusByID, depsByID[b.ID]) {
+		if cachedBeadReady(b, statusByID, outcomeByID, depsByID[b.ID]) {
 			result = append(result, cloneBead(b))
 		}
 	}
@@ -614,10 +619,12 @@ func (c *CachingStore) CachedReady() ([]Bead, bool) {
 	}
 
 	statusByID := make(map[string]string, len(c.beads))
+	outcomeByID := make(map[string]string, len(c.beads))
 	openBeads := make([]Bead, 0, len(c.beads))
 	now := time.Now().UTC()
 	for _, b := range c.beads {
 		statusByID[b.ID] = b.Status
+		outcomeByID[b.ID] = b.Metadata[beadmeta.OutcomeMetadataKey]
 		if IsReadyCandidate(b, now) {
 			if c.readyProjectionUnknownLocked(b.ID) {
 				return nil, false
@@ -636,7 +643,7 @@ func (c *CachingStore) CachedReady() ([]Bead, bool) {
 		default:
 			return nil, false
 		}
-		if cachedBeadReady(b, statusByID, deps) {
+		if cachedBeadReady(b, statusByID, outcomeByID, deps) {
 			result = append(result, cloneBead(b))
 		}
 	}
@@ -646,7 +653,7 @@ func (c *CachingStore) CachedReady() ([]Bead, bool) {
 	return result, true
 }
 
-func cachedBeadReady(b Bead, statusByID map[string]string, deps []Dep) bool {
+func cachedBeadReady(b Bead, statusByID map[string]string, outcomeByID map[string]string, deps []Dep) bool {
 	if b.IsBlocked != nil {
 		return !*b.IsBlocked
 	}
@@ -654,7 +661,11 @@ func cachedBeadReady(b Bead, statusByID map[string]string, deps []Dep) bool {
 		if !isReadyBlockingDependencyType(dep.Type) {
 			continue
 		}
-		if status, ok := statusByID[dep.DependsOnID]; ok && status != "closed" {
+		status, ok := statusByID[dep.DependsOnID]
+		if !ok {
+			continue
+		}
+		if status != "closed" || dependencyOutcomeFailed(outcomeByID[dep.DependsOnID]) {
 			return false
 		}
 	}

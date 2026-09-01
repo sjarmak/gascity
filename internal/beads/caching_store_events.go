@@ -434,7 +434,7 @@ func (c *CachingStore) residentEdgesStillBlockLocked(id string) bool {
 		if !isReadyBlockingDependencyType(dep.Type) {
 			continue
 		}
-		if target, resident := c.beads[dep.DependsOnID]; resident && target.Status != "closed" {
+		if target, resident := c.beads[dep.DependsOnID]; resident && (target.Status != "closed" || dependencyOutcomeFailed(target.Metadata[beadmeta.OutcomeMetadataKey])) {
 			return true
 		}
 	}

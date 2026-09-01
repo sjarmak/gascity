@@ -665,6 +665,43 @@ func TestMemStoreReadyRespectsBlockingDeps(t *testing.T) {
 	}
 }
 
+// TestMemStoreReadyDoesNotSatisfyBlocksOnFailedClose guards gc-051lt: a
+// dependency closed with gc.outcome=fail must not satisfy a "blocks" edge
+// for its dependents, otherwise a hard-failed step in a ladder lets the
+// next step come up ready as if the failed step had succeeded.
+func TestMemStoreReadyDoesNotSatisfyBlocksOnFailedClose(t *testing.T) {
+	s := beads.NewMemStore()
+
+	blocker, err := s.Create(beads.Bead{Title: "blocker", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := s.Create(beads.Bead{Title: "blocked", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DepAdd(blocked.ID, blocker.ID, "blocks"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetMetadata(blocker.ID, "gc.outcome", "fail"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(blocker.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.Ready()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range got {
+		if b.ID == blocked.ID {
+			t.Fatalf("Ready() included %s, but its blocker %s closed with gc.outcome=fail", blocked.ID, blocker.ID)
+		}
+	}
+}
+
 func TestMemStoreReadyIgnoresParentChildDeps(t *testing.T) {
 	s := beads.NewMemStore()
 

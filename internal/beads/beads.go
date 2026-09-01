@@ -6,7 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/beadmeta"
 )
 
 // ErrNotFound is returned when a bead ID does not exist in the store.
@@ -584,6 +587,17 @@ func IsDeferred(b Bead, now time.Time) bool {
 
 func isReadyBlockingDependencyType(t string) bool {
 	return IsReadyBlockingDependencyType(t)
+}
+
+// dependencyOutcomeFailed reports whether a closed dependency's gc.outcome
+// marks it as failed, so it does NOT satisfy a "blocks" edge for its
+// dependents. Closure alone (bd's is_blocked and this package's own
+// fallback readiness predicates) previously treated any closed bead as
+// satisfying a "blocks" dependency regardless of outcome, which let a
+// hard-failed step's dependents come up ready and let a failed ladder keep
+// advancing (gc-051lt).
+func dependencyOutcomeFailed(outcome string) bool {
+	return strings.TrimSpace(outcome) == beadmeta.OutcomeFail
 }
 
 // Dep represents a dependency relationship between two beads. The IssueID
