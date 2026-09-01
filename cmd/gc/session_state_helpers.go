@@ -49,10 +49,10 @@ func poolSessionIsLiveInfo(i sessionpkg.Info) bool {
 // isPoolSessionSlotFreeable reports whether a session's bead is in a terminal
 // state where the pool slot it occupies can be freed: explicitly drained, or
 // asleep with sleep_reason one of idle, idle-timeout, city-stop,
-// failed-create, runtime-missing, provider-terminal-error, or
-// max-session-age. Sessions parked via `gc session wait` (sleep_reason=wait-hold),
-// held by context-churn quarantine, or otherwise signaling "don't touch me"
-// keep their slot.
+// failed-create, runtime-missing, provider-terminal-error, max-session-age,
+// or assigned-work-exhausted. Sessions parked via `gc session wait`
+// (sleep_reason=wait-hold), held by context-churn quarantine, or otherwise
+// signaling "don't touch me" keep their slot.
 //
 // Distinct from `isDrainedSessionBead` because drain-ack can land pool
 // workers in state=asleep+sleep_reason=idle when the pre-close ownership
@@ -64,6 +64,18 @@ func poolSessionIsLiveInfo(i sessionpkg.Info) bool {
 // markProviderTerminalError has classified it as a dead, non-retryable provider
 // failure, so its slot must be reaped — otherwise the dead bead and its worktree
 // leak indefinitely while still excluded from pool capacity.
+//
+// A session parked with sleep_reason=assigned-work-exhausted (the forced stop
+// after a session defers idle-timeout on the same assigned-work bead past the
+// reconciler's consecutive-defer limit, DecideAssignedWorkExhausted) is also
+// freeable, and deliberately so: unlike the other reasons here, this one is
+// the case most likely to still hold live claimed work. Excluding it would
+// mean the caller (isPoolFreeable's gate at session_reconciler.go) never runs
+// sessionHasOpenAssignedWorkForReachableStore/repairStrandedPoolWorkerBead for
+// exactly the session that needs that repair path, permanently stranding the
+// bead it was working. Including it here does not skip the repair check: the
+// caller still verifies open assigned work before closing, and reopens/
+// reassigns it rather than discarding it.
 //
 // An explicit sleep_reason is required: deny-by-default for unknown or
 // missing reasons so writes that land in state=asleep without a known
@@ -81,7 +93,7 @@ func isPoolSessionSlotFreeable(session beads.Bead) bool {
 	case string(sessionpkg.SleepReasonIdle), string(sessionpkg.SleepReasonIdleTimeout),
 		string(sessionpkg.SleepReasonCityStop), string(sessionpkg.SleepReasonFailedCreate),
 		string(sessionpkg.SleepReasonRuntimeMissing), string(sessionpkg.SleepReasonProviderTerminalError),
-		string(sessionpkg.SleepReasonMaxSessionAge):
+		string(sessionpkg.SleepReasonMaxSessionAge), string(sessionpkg.SleepReasonAssignedWorkExhausted):
 		return true
 	}
 	return false
@@ -100,7 +112,7 @@ func isPoolSessionSlotFreeableInfo(i sessionpkg.Info) bool {
 	case string(sessionpkg.SleepReasonIdle), string(sessionpkg.SleepReasonIdleTimeout),
 		string(sessionpkg.SleepReasonCityStop), string(sessionpkg.SleepReasonFailedCreate),
 		string(sessionpkg.SleepReasonRuntimeMissing), string(sessionpkg.SleepReasonProviderTerminalError),
-		string(sessionpkg.SleepReasonMaxSessionAge):
+		string(sessionpkg.SleepReasonMaxSessionAge), string(sessionpkg.SleepReasonAssignedWorkExhausted):
 		return true
 	}
 	return false
