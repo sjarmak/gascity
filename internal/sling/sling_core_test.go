@@ -206,3 +206,60 @@ func TestDoSlingDefaultFormulaFallsBackToPlainRouteWhenMoleculeAttachedGraphV2Fo
 		t.Errorf("synthetic input convoy %s status = %q, want closed (fallback must close it, not leak it)", convoys[0].ID, convoys[0].Status)
 	}
 }
+
+// TestDoSlingDefaultGraphFormulaFallsBackToPlainRouteWhenTargetAlreadyClaimed
+// is the admission fence from gastownhall/gascity#e8lim on the implicit
+// default_sling_formula path: a target that is already directly claimed
+// (Assignee set) but has no molecule/wisp/workflow attached yet must not
+// admit a second dispatch, but since the caller never explicitly asked for
+// this formula attach, it falls back to plain routing (same as an unrelated
+// live molecule/wisp conflict) instead of hard-failing.
+func TestDoSlingDefaultGraphFormulaFallsBackToPlainRouteWhenTargetAlreadyClaimed(t *testing.T) {
+	dir := t.TempDir()
+	content := "formula = \"graph-review\"\nversion = 1\ncontract = \"graph.v2\"\ntype = \"workflow\"\n\n[[steps]]\nid = \"work\"\ntitle = \"Work\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "graph-review.toml"), []byte(content), 0o644); err != nil {
+		t.Fatalf("writing graph-review fixture: %v", err)
+	}
+
+	store := beads.NewMemStoreFrom(0, []beads.Bead{
+		{ID: "BL-1", Type: "task", Status: "open", Assignee: "reviewer-session"},
+	}, nil)
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test"},
+		FormulaLayers: config.FormulaLayers{City: []string{dir}},
+	}
+	runner := newFakeRunner()
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	deps.Store = store
+
+	a := config.Agent{Name: "builder", MaxActiveSessions: intPtr(1), DefaultSlingFormula: stringPtr("graph-review")}
+	opts := SlingOpts{Target: a, BeadOrFormula: "BL-1", NoConvoy: true}
+
+	result, err := DoSling(opts, deps, deps.Store)
+	if err != nil {
+		t.Fatalf("DoSling default-formula (graph.v2) against a directly-claimed target: expected no error (fallback to plain route), got %v", err)
+	}
+	if result.Method != "bead" {
+		t.Errorf("Method = %q, want %q (fell back to plain bead routing)", result.Method, "bead")
+	}
+
+	var warned bool
+	for _, w := range result.BeadWarnings {
+		if strings.Contains(w, "reviewer-session") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("BeadWarnings = %v, want a warning naming the claiming session reviewer-session", result.BeadWarnings)
+	}
+
+	convoys, err := deps.Store.List(beads.ListQuery{Type: "convoy", IncludeClosed: true})
+	if err != nil {
+		t.Fatalf("List(convoy): %v", err)
+	}
+	for _, c := range convoys {
+		if c.Status != "closed" {
+			t.Errorf("convoy %s status = %q, want closed (fallback must close it, not leak it)", c.ID, c.Status)
+		}
+	}
+}
