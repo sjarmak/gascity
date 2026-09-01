@@ -210,6 +210,28 @@ func TestResolveBeadListFullScanDetachesReturnedPage(t *testing.T) {
 	}
 }
 
+// TestResolveBeadListBoundedPageDetachesReturnedPage is the bounded-mode
+// counterpart of TestResolveBeadListFullScanDetachesReturnedPage: a hydrated
+// (Counter-less) leg — the production graph binding always is one — appends
+// its full un-seeked history into `all` before the length-limit truncation,
+// so a bounded page can alias O(history) just like the full-scan path can.
+func TestResolveBeadListBoundedPageDetachesReturnedPage(t *testing.T) {
+	all := make([]beads.Bead, 20)
+	for i := range all {
+		all[i].ID = fmt.Sprintf("gc-%03d", i)
+	}
+
+	page, total, hasMore := resolveBeadListPage(all, nil, 10, true, map[int]int{0: 100}, false)
+	if len(page) != 10 || total != 100 || !hasMore {
+		t.Fatalf("page = %d items / total %d / hasMore %v, want 10 / 100 / true", len(page), total, hasMore)
+	}
+
+	all[0].ID = "mutated-bounded-backing-array"
+	if page[0].ID == all[0].ID {
+		t.Fatal("returned page still aliases the bounded backing array")
+	}
+}
+
 // countOKListFailStore is a Store + Counter fake whose Count succeeds — so the
 // bounded all=true path bakes its rows into the upfront Total — but whose List
 // fails with a non-partial error, so those rows never reach the merged page.

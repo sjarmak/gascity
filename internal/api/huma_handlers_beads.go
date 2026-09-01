@@ -310,7 +310,13 @@ func resolveBeadListPage(all []beads.Bead, seek *beads.SeekBoundary, limit int, 
 		if partial && len(page) > 0 {
 			hasMore = true
 		}
-		return page, total, hasMore
+		// A hydrated leg — the production graph binding always is one, since
+		// *beads.SQLiteStore implements no Counter — appends its full
+		// un-seeked history into `all` before the truncation above, so this
+		// page's backing array can span O(history) even though its length is
+		// bounded by limit. Detach it for the same response-cache-retention
+		// reason as the full-scan path below.
+		return slices.Clone(page), total, hasMore
 	}
 	// Full-scan path: `all` is the COMPLETE un-seeked set read in one shot, so
 	// `end < len(all)` is the honest has-more. The bounded branch's
