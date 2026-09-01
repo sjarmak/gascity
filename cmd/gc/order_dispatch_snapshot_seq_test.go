@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,8 +32,10 @@ func TestApplyOrderSetSnapshotLockedRejectsStaleScan(t *testing.T) {
 	staleSnapshot := orderSetSnapshot{Orders: []orders.Order{stale}, Signature: "sig-stale"}
 
 	// The fresher scan (seq 2) applies first, as if it started later than the
-	// stale scan below but won the race to acquire orderDispatchMu.
-	changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), freshSnapshot, 2, time.Now())
+	// stale scan below but won the race to acquire orderDispatchMu. Both
+	// scans observed the same (zero-value) config version, so the
+	// scanCfgVersion guard is not what is under test here.
+	changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), freshSnapshot, 2, 0, time.Now())
 	if !changed {
 		t.Fatalf("first apply (seq 2) did not report a change: summary=%q", summary)
 	}
@@ -42,7 +46,7 @@ func TestApplyOrderSetSnapshotLockedRejectsStaleScan(t *testing.T) {
 	// The older, slower scan (seq 1) arrives after. It carries a completely
 	// different order set, but its seq is at or below the already-applied
 	// seq, so it must be rejected rather than reverting the fresher state.
-	changed, summary = cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), staleSnapshot, 1, time.Now())
+	changed, summary = cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), staleSnapshot, 1, 0, time.Now())
 	if changed {
 		t.Fatalf("stale scan (seq 1) was applied over a fresher seq 2 result: summary=%q", summary)
 	}
@@ -68,7 +72,11 @@ func TestApplyOrderSetSnapshotLockedRejectsStaleScan(t *testing.T) {
 // cr.cfg, then record that version as applied. cr.cfg/orderDispatchConfigVersion
 // are set directly here (not passed as call arguments): applyOrderSetSnapshotLocked
 // reads them fresh under serviceStateMu at rebuild time, mirroring what a real
-// reload's cr.cfg install does.
+// reload's cr.cfg install does. Each call's scanCfgVersion matches the version
+// live at that call's own (simulated) scan time, so the sixth-pass
+// consistency guard is a no-op here — this test is about the version-vs-signature
+// rebuild trigger, not the scan/apply staleness guard (see
+// TestApplyOrderSetSnapshotLockedRejectsTornConfigScan for that).
 func TestApplyOrderSetSnapshotLockedNewerConfigVersionAppliesConfigOnlyChange(t *testing.T) {
 	oldMax := 1
 	oldCfg := &config.City{}
@@ -77,7 +85,7 @@ func TestApplyOrderSetSnapshotLockedNewerConfigVersionAppliesConfigOnlyChange(t 
 	order := orders.Order{Name: "reaper", Trigger: "cooldown", Interval: "1m", Exec: "true"}
 	snapshot := orderSetSnapshot{Orders: []orders.Order{order}, Signature: "sig-a"}
 
-	if changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), snapshot, 1, time.Now()); !changed {
+	if changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), snapshot, 1, 1, time.Now()); !changed {
 		t.Fatalf("initial apply did not report a change: summary=%q", summary)
 	}
 	if cr.orderDispatchAppliedConfigVersion != 1 {
@@ -104,7 +112,7 @@ func TestApplyOrderSetSnapshotLockedNewerConfigVersionAppliesConfigOnlyChange(t 
 	cr.cfg = newCfg
 	cr.orderDispatchConfigVersion = 2
 
-	changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), snapshot, 2, time.Now())
+	changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), snapshot, 2, 2, time.Now())
 	if !changed {
 		t.Fatalf("newer-version apply did not report a change: summary=%q", summary)
 	}
@@ -139,7 +147,7 @@ func TestApplyOrderSetSnapshotLockedStaleScanDoesNotAdvanceRescanTimestamp(t *te
 	staleSnapshot := orderSetSnapshot{Orders: []orders.Order{stale}, Signature: "sig-stale"}
 
 	freshApplyTime := time.Now()
-	if changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), freshSnapshot, 2, freshApplyTime); !changed {
+	if changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), freshSnapshot, 2, 0, freshApplyTime); !changed {
 		t.Fatalf("first apply (seq 2) did not report a change: summary=%q", summary)
 	}
 	if cr.orderRescanLast != freshApplyTime {
@@ -151,7 +159,7 @@ func TestApplyOrderSetSnapshotLockedStaleScanDoesNotAdvanceRescanTimestamp(t *te
 	// applyOrderSetSnapshotLocked wrote orderRescanLast before checking
 	// staleness, this assertion would catch it advancing.
 	staleApplyTime := freshApplyTime.Add(time.Minute)
-	changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), staleSnapshot, 1, staleApplyTime)
+	changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), staleSnapshot, 1, 0, staleApplyTime)
 	if changed {
 		t.Fatalf("stale scan (seq 1) was applied over a fresher seq 2 result: summary=%q", summary)
 	}
@@ -168,17 +176,13 @@ func TestApplyOrderSetSnapshotLockedStaleScanDoesNotAdvanceRescanTimestamp(t *te
 // unrelated order-set signature change must use the LIVE cr.cfg and record
 // the LIVE orderDispatchConfigVersion at the moment it actually rebuilds —
 // never a cfg/version pair a caller captured earlier and carried across its
-// own unlocked disk scan. If it used a stale caller-supplied pair instead, a
-// concurrent reload that already installed a newer cr.cfg (config-only
-// change, e.g. Orders.MaxDispatchesPerTick) in that gap would have its config
-// silently overwritten by the older one — while the version bookkeeping,
-// unaware the newer config never got applied, correctly declines to move
-// backward and so falsely leaves orderDispatchAppliedConfigVersion still
-// claiming the newer config is current. That drift would be permanent and
-// undetectable by any future scan. Reading cr.cfg/orderDispatchConfigVersion
-// fresh here instead means whatever gets built and whatever version gets
-// recorded always agree, regardless of how stale the triggering scan's own
-// view was.
+// own unlocked disk scan. The second scan here is modeled as having started
+// AFTER the concurrent reload already installed the newer cfg (its own
+// scanCfgVersion matches the live version), so the sixth-pass consistency
+// guard passes and this exercises what the fifth-pass fix actually
+// guarantees on the match path: whatever gets built and whatever version
+// gets recorded always agree and always reflect the live config, never a
+// value carried over from an earlier apply.
 func TestApplyOrderSetSnapshotLockedRebuildAlwaysUsesLiveConfig(t *testing.T) {
 	oldMax := 1
 	oldCfg := &config.City{}
@@ -187,7 +191,7 @@ func TestApplyOrderSetSnapshotLockedRebuildAlwaysUsesLiveConfig(t *testing.T) {
 
 	first := orders.Order{Name: "first", Trigger: "cooldown", Interval: "1m", Exec: "true"}
 	firstSnapshot := orderSetSnapshot{Orders: []orders.Order{first}, Signature: "sig-first"}
-	if changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), firstSnapshot, 1, time.Now()); !changed {
+	if changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), firstSnapshot, 1, 1, time.Now()); !changed {
 		t.Fatalf("initial apply did not report a change: summary=%q", summary)
 	}
 	if cr.orderDispatchAppliedConfigVersion != 1 {
@@ -205,14 +209,15 @@ func TestApplyOrderSetSnapshotLockedRebuildAlwaysUsesLiveConfig(t *testing.T) {
 	cr.cfg = newCfg
 	cr.orderDispatchConfigVersion = 2
 
-	// A scan that observed an UNRELATED order-set signature change (it never
-	// carries a cfg/version of its own any more) rebuilds for that reason.
-	// The fix under test is that this rebuild picks up newCfg and correctly
-	// records version 2 as applied, not oldCfg with version 1 falsely left
-	// stale or (worse) newCfg baked in while still reporting version 1.
+	// A scan that started after the reload above (its own scanCfgVersion is
+	// already 2, matching live) observed an UNRELATED order-set signature
+	// change and rebuilds for that reason. The fix under test is that this
+	// rebuild picks up newCfg and correctly records version 2 as applied, not
+	// oldCfg with version 1 falsely left stale or (worse) newCfg baked in
+	// while still reporting version 1.
 	second := orders.Order{Name: "second", Trigger: "cooldown", Interval: "1m", Exec: "true"}
 	secondSnapshot := orderSetSnapshot{Orders: []orders.Order{second}, Signature: "sig-second"}
-	changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), secondSnapshot, 2, time.Now())
+	changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), secondSnapshot, 2, 2, time.Now())
 	if !changed {
 		t.Fatalf("signature-change apply did not report a change: summary=%q", summary)
 	}
@@ -232,18 +237,88 @@ func TestApplyOrderSetSnapshotLockedRebuildAlwaysUsesLiveConfig(t *testing.T) {
 	}
 }
 
+// TestApplyOrderSetSnapshotLockedRejectsTornConfigScan pins the #2604/#3368
+// review's sixth-pass MAJOR finding: scanOrderSetSnapshotFS bakes
+// cfg-dependent fields (formula layers, skips, timezone, per-order overrides)
+// into snapshot.Orders using the cfg in effect AT SCAN TIME, which runs
+// unlocked before orderDispatchMu is acquired. If a concurrent reload
+// installs a newer cr.cfg/orderDispatchConfigVersion in that window,
+// combining the STALE-generation snapshot.Orders with the LIVE cfg read at
+// apply time would build a torn dispatcher — e.g. an order the new config
+// disabled via an override remains enabled because the stale scan never saw
+// it. The scanCfgVersion guard rejects any scan whose captured version no
+// longer matches the live cr.orderDispatchConfigVersion, leaving all applied
+// order-set and version state untouched so a later, self-consistent scan
+// (which will observe the newer version and scan under it) converges
+// instead of installing the mix.
+func TestApplyOrderSetSnapshotLockedRejectsTornConfigScan(t *testing.T) {
+	oldCfg := &config.City{}
+	cr := &CityRuntime{stderr: io.Discard, cfg: oldCfg, orderDispatchConfigVersion: 1}
+
+	first := orders.Order{Name: "first", Trigger: "cooldown", Interval: "1m", Exec: "true"}
+	firstSnapshot := orderSetSnapshot{Orders: []orders.Order{first}, Signature: "sig-first"}
+	if changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), firstSnapshot, 1, 1, time.Now()); !changed {
+		t.Fatalf("initial apply did not report a change: summary=%q", summary)
+	}
+	baselineDispatcher := cr.od
+	if cr.orderDispatchAppliedConfigVersion != 1 {
+		t.Fatalf("orderDispatchAppliedConfigVersion after initial apply = %d, want 1", cr.orderDispatchAppliedConfigVersion)
+	}
+
+	// A concurrent reload installs a newer cfg and bumps the version AFTER
+	// the scan below captured scanCfgVersion=1 but BEFORE it reaches this
+	// call — exactly the window scanOrderSetSnapshotFS's unlocked disk read
+	// leaves open.
+	cr.cfg = &config.City{}
+	cr.orderDispatchConfigVersion = 2
+
+	// The stale-generation scan carries an order set that was built under the
+	// OLD cfg (e.g. one the new config would have disabled via an override,
+	// but the stale scan never saw that) plus its own captured
+	// scanCfgVersion (1) — no longer matching the live version (2).
+	torn := orders.Order{Name: "torn", Trigger: "cooldown", Interval: "1m", Exec: "true"}
+	tornSnapshot := orderSetSnapshot{Orders: []orders.Order{torn}, Signature: "sig-torn"}
+	changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), tornSnapshot, 2, 1, time.Now())
+	if changed {
+		t.Fatalf("torn scan (scanCfgVersion=1, live=2) was applied instead of rejected: summary=%q", summary)
+	}
+	if summary != "stale-config-scan" {
+		t.Fatalf("summary = %q, want %q", summary, "stale-config-scan")
+	}
+	if cr.orderSetSignature != "sig-first" {
+		t.Fatalf("orderSetSignature = %q after a rejected torn scan, want unchanged %q", cr.orderSetSignature, "sig-first")
+	}
+	if len(cr.orderSet) != 1 || cr.orderSet[0].Name != "first" {
+		t.Fatalf("orderSet = %#v after a rejected torn scan, want the baseline order still installed", cr.orderSet)
+	}
+	if cr.orderDispatchAppliedConfigVersion != 1 {
+		t.Fatalf("orderDispatchAppliedConfigVersion = %d after a rejected torn scan, want unchanged 1", cr.orderDispatchAppliedConfigVersion)
+	}
+	if cr.od != baselineDispatcher {
+		t.Fatal("cr.od was replaced by a rejected torn scan")
+	}
+}
+
 // TestApplyOrderSetSnapshotLockedRacesWithConfigReload races
 // applyOrderSetSnapshotLocked's internal cr.cfg/orderDispatchConfigVersion
 // read against a concurrent serviceStateMu writer standing in for
 // reloadConfigTraced's cr.cfg install, mirroring
 // TestCityRuntimeClassAccessorsRaceWithConfigReload in class_store_test.go.
 // Run with -race: if the read inside applyOrderSetSnapshotLocked ever bypassed
-// serviceStateMu, this test would flag a data race.
+// serviceStateMu, this test would flag a data race. The apply goroutine
+// captures its own scanCfgVersion under serviceStateMu.RLock() immediately
+// before each call, mirroring rescanOrderDispatcher's real capture pattern,
+// and counts its successful applies: a legal schedule where the writer
+// closes stop before the apply goroutine ever runs would exercise no
+// synchronization at all, so the count is asserted nonzero after wg.Wait()
+// to keep this a reliable regression guard rather than a possibly-vacuous
+// one (#2604/#3368 review followup, sixth-pass MINOR finding).
 func TestApplyOrderSetSnapshotLockedRacesWithConfigReload(t *testing.T) {
 	cr := &CityRuntime{stderr: io.Discard, cfg: &config.City{}}
 	cityRoot := t.TempDir()
 	order := orders.Order{Name: "reaper", Trigger: "cooldown", Interval: "1m", Exec: "true"}
 
+	var applies atomic.Int64
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
 
@@ -256,10 +331,15 @@ func TestApplyOrderSetSnapshotLockedRacesWithConfigReload(t *testing.T) {
 				return
 			default:
 			}
+			cr.serviceStateMu.RLock()
+			scanCfgVersion := cr.orderDispatchConfigVersion
+			cr.serviceStateMu.RUnlock()
 			snapshot := orderSetSnapshot{Orders: []orders.Order{order}, Signature: fmt.Sprintf("sig-%d", i)}
 			cr.orderDispatchMu.Lock()
-			cr.applyOrderSetSnapshotLocked(context.Background(), cityRoot, snapshot, uint64(i+1), time.Now())
+			cr.applyOrderSetSnapshotLocked(context.Background(), cityRoot, snapshot, uint64(i+1), scanCfgVersion, time.Now())
 			cr.orderDispatchMu.Unlock()
+			applies.Add(1)
+			runtime.Gosched()
 		}
 	}()
 
@@ -271,9 +351,14 @@ func TestApplyOrderSetSnapshotLockedRacesWithConfigReload(t *testing.T) {
 			cr.cfg = &config.City{}
 			cr.orderDispatchConfigVersion++
 			cr.serviceStateMu.Unlock()
+			runtime.Gosched()
 		}
 		close(stop)
 	}()
 
 	wg.Wait()
+
+	if applies.Load() == 0 {
+		t.Fatal("the apply goroutine never ran before the writer closed stop; this schedule exercised no synchronization and is not a reliable regression guard")
+	}
 }
