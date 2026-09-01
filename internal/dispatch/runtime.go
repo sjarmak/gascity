@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1356,13 +1357,69 @@ func sourceChainRootIDs(roots []beads.Bead) string {
 	return strings.Join(ids, ",")
 }
 
+// workflowFinalizeDispositionRecorder identifies workflow-finalize as the
+// actor in a producer_disposition envelope it writes on a source bead's
+// behalf. It is used both as gc.coordinator_outcome.producer_disposition's
+// "recorded_by" and "producer" fields when no formula-step-level typed close
+// (e.g. gc-outcome-close) ever ran on this bead — the exhausted-retry path
+// that still lets the workflow settle to pass (gc-051lt), including the
+// branch-ready/publication-hold terminal state (gc-sbo5j).
+const workflowFinalizeDispositionRecorder = "workflow-finalize"
+
+// closeSourceBeadPreservingOutcome closes a source bead as workflow-finalize's
+// generic fallback path: the formula that ran this workflow may already have
+// closed the source bead itself via its own typed producer close (e.g.
+// gc-outcome-close), in which case walkSourceBeadChain never reaches this
+// function (see the already-closed skip above it). When it DOES reach here,
+// no typed close ever landed on this bead, so this is the only writer of its
+// gc.coordinator_outcome.producer_disposition envelope; every downstream
+// consumer of that key (retry eligibility, gc-sbo5j) depends on it being
+// present after any terminal-state close, not just a passing formula-step one.
 func closeSourceBeadPreservingOutcome(store beads.Store, bead beads.Bead) error {
 	status := "closed"
 	opts := beads.UpdateOpts{Status: &status}
+	metadata := make(map[string]string, 2)
 	if strings.TrimSpace(bead.Metadata[beadmeta.OutcomeMetadataKey]) == "" {
-		opts.Metadata = map[string]string{beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass}
+		metadata[beadmeta.OutcomeMetadataKey] = beadmeta.OutcomePass
+	}
+	if strings.TrimSpace(bead.Metadata[beadmeta.CoordinatorOutcomeProducerDispositionMetadataKey]) == "" {
+		envelope, err := workflowFinalizeProducerDispositionEnvelope(bead.ID)
+		if err != nil {
+			return fmt.Errorf("closing source bead %s: %w", bead.ID, err)
+		}
+		metadata[beadmeta.CoordinatorOutcomeProducerDispositionMetadataKey] = envelope
+	}
+	if len(metadata) > 0 {
+		opts.Metadata = metadata
 	}
 	return store.Update(bead.ID, opts)
+}
+
+// workflowFinalizeProducerDispositionEnvelope builds the strict JSON envelope
+// typedDeliverableCloseFor (retry.go) requires: contract_version, disposition,
+// work_id, recorded_by, reason, producer. No passing_verdict — workflow-finalize
+// is closing a source bead it never reviewed, not attesting to one.
+func workflowFinalizeProducerDispositionEnvelope(workID string) (string, error) {
+	envelope := struct {
+		ContractVersion int    `json:"contract_version"`
+		Disposition     string `json:"disposition"`
+		WorkID          string `json:"work_id"`
+		RecordedBy      string `json:"recorded_by"`
+		Reason          string `json:"reason"`
+		Producer        string `json:"producer"`
+	}{
+		ContractVersion: beadmeta.CoordinatorOutcomeContractVersion,
+		Disposition:     beadmeta.CoordinatorDispositionDeliverable,
+		WorkID:          workID,
+		RecordedBy:      workflowFinalizeDispositionRecorder,
+		Reason:          "workflow root closed pass with no typed producer close recorded on this source bead",
+		Producer:        workflowFinalizeDispositionRecorder,
+	}
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		return "", fmt.Errorf("marshaling producer_disposition envelope for %s: %w", workID, err)
+	}
+	return string(raw), nil
 }
 
 func propagateSourceBeadTerminalMetadata(store beads.Store, beadID string, metadata map[string]string) error {

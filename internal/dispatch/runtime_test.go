@@ -3,6 +3,7 @@ package dispatch
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -4744,6 +4745,107 @@ func TestProcessWorkflowFinalizeClosesIntraStoreSourceBeadWithoutResolver(t *tes
 	}
 	if got := sourceAfter.Metadata["gc.outcome"]; got != "pass" {
 		t.Fatalf("source gc.outcome = %q, want pass", got)
+	}
+}
+
+// TestProcessWorkflowFinalizeWritesProducerDispositionOnBranchReadySourceBead
+// covers gc-sbo5j: a formula step (e.g. mol-scoped-work's submit, under a
+// rig's publication_hold) can set gc.outcome=branch-ready on its input/source
+// bead and then fail before its own typed producer close (gc-outcome-close)
+// ever runs. If the workflow still settles to an overall pass (gc-051lt: a
+// hard_fail close satisfies dependents same as a pass), workflow-finalize's
+// closeSourceBeadChain is the only remaining writer for that source bead, and
+// it must not skip the typed gc.coordinator_outcome.producer_disposition
+// envelope just because gc.outcome was already set.
+func TestProcessWorkflowFinalizeWritesProducerDispositionOnBranchReadySourceBead(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	source := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Held work item",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.outcome":              "branch-ready",
+			"gc.land_skipped":         "publication_hold",
+			"held_sha":                "abc1234",
+			"gc.worktree_disposition": "retained",
+		},
+	})
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "mol-scoped-work",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+			"gc.source_bead_id":   source.ID,
+		},
+	})
+	cleanup := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "Clean up worktree",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.outcome": "pass",
+		},
+	})
+	finalizer := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "workflow-finalize",
+			"gc.root_bead_id": workflow.ID,
+		},
+	})
+	mustDepAdd(t, store, finalizer.ID, cleanup.ID, "blocks")
+	mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+
+	if _, err := ProcessControl(store, finalizer, ProcessOptions{}); err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+
+	sourceAfter, err := store.Get(source.ID)
+	if err != nil {
+		t.Fatalf("get source: %v", err)
+	}
+	if sourceAfter.Status != "closed" {
+		t.Fatalf("source status = %q, want closed", sourceAfter.Status)
+	}
+	if got := sourceAfter.Metadata["gc.outcome"]; got != "branch-ready" {
+		t.Fatalf("source gc.outcome = %q, want branch-ready preserved", got)
+	}
+
+	raw := sourceAfter.Metadata[beadmeta.CoordinatorOutcomeProducerDispositionMetadataKey]
+	if raw == "" {
+		t.Fatalf("source %s: %s is empty, want a typed producer_disposition envelope", source.ID, beadmeta.CoordinatorOutcomeProducerDispositionMetadataKey)
+	}
+	var envelope struct {
+		ContractVersion int    `json:"contract_version"`
+		Disposition     string `json:"disposition"`
+		WorkID          string `json:"work_id"`
+		RecordedBy      string `json:"recorded_by"`
+		Reason          string `json:"reason"`
+		Producer        string `json:"producer"`
+	}
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		t.Fatalf("unmarshal producer_disposition envelope %q: %v", raw, err)
+	}
+	if envelope.ContractVersion != beadmeta.CoordinatorOutcomeContractVersion {
+		t.Errorf("envelope contract_version = %d, want %d", envelope.ContractVersion, beadmeta.CoordinatorOutcomeContractVersion)
+	}
+	if envelope.Disposition != beadmeta.CoordinatorDispositionDeliverable {
+		t.Errorf("envelope disposition = %q, want %q", envelope.Disposition, beadmeta.CoordinatorDispositionDeliverable)
+	}
+	if envelope.WorkID != source.ID {
+		t.Errorf("envelope work_id = %q, want %q", envelope.WorkID, source.ID)
+	}
+	if strings.TrimSpace(envelope.RecordedBy) == "" {
+		t.Error("envelope recorded_by is empty")
+	}
+	if strings.TrimSpace(envelope.Reason) == "" {
+		t.Error("envelope reason is empty")
+	}
+	if strings.TrimSpace(envelope.Producer) == "" {
+		t.Error("envelope producer is empty")
 	}
 }
 
