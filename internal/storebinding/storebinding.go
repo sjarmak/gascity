@@ -388,7 +388,7 @@ type NudgeShadows interface {
 	Terminalize(nudgequeue.Item, string, string, string, time.Time) error
 	RollbackEnqueue(string) error
 	SweepStale(string, string, time.Time) error
-	StaleShadowsBefore(time.Time, int, map[string]bool) ([]nudgequeue.NudgeShadow, error)
+	StaleShadowsBefore(time.Time, int, map[string]bool, time.Time) ([]nudgequeue.NudgeShadow, error)
 	ShadowHistorySince(time.Time) ([]nudgequeue.NudgeShadow, error)
 	Find(string) (nudgequeue.NudgeShadow, bool, error)
 	FindIncludingTerminal(string) (nudgequeue.NudgeShadow, bool, error)
