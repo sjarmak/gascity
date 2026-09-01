@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	convoycore "github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
@@ -1010,6 +1012,9 @@ func processWorkflowFinalize(store beads.Store, bead beads.Bead, opts ProcessOpt
 			return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: closing source bead chain: %w", rootID, err))
 		}
 	}
+	if err := backfillInputConvoyProducerDisposition(store, rootID, outcome); err != nil {
+		return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: backfilling input bead producer disposition: %w", rootID, err))
+	}
 	if err := setOutcomeAndClose(store, bead.ID, beadmeta.OutcomePass); err != nil {
 		return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: completing workflow finalizer: %w", bead.ID, err))
 	}
@@ -1077,6 +1082,88 @@ func preflightSourceBeadChain(rootStore beads.Store, rootID string, opts Process
 // disappear from the human-visible queue once the rig-scope workflow merges.
 func closeSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOptions) error {
 	return walkSourceBeadChain(rootStore, rootID, opts, true)
+}
+
+// backfillInputConvoyProducerDisposition ensures a graph.v2 workflow root's
+// input bead -- resolved via gc.input_convoy_id, the graph.v2 replacement for
+// the gc.source_bead_id chain closeSourceBeadChain walks -- carries a typed
+// gc.coordinator_outcome.producer_disposition envelope once the workflow
+// itself has gone terminal (gc-sbo5j).
+//
+// mol-scoped-work's `submit` step is deliberately city-generic (see the
+// vendored formula) and may close the input bead without ever calling
+// gc-outcome-close. Left alone, that closed-but-undeclared bead is
+// structurally indistinguishable from a genuine typed refusal to
+// typedDeliverableCloseFor and to any other consumer of the envelope: both
+// read as an absent key. This backstop only consults this package's own
+// already-computed workflow outcome -- never city-specific metadata this
+// package does not own, such as gc.outcome=branch-ready or
+// gc.worktree_disposition, which are minted entirely outside this repo -- so
+// a passing workflow backfills "deliverable" and every other terminal
+// outcome backfills "non-deliverable", mirroring the outcome-defaulting
+// precedent in closeSourceBeadPreservingOutcome.
+//
+// It is a backstop, never an override: an input bead that already carries an
+// envelope (an agent genuinely called gc-outcome-close), that is still open,
+// or whose convoy resolves to zero or more than one tracked member is left
+// untouched.
+func backfillInputConvoyProducerDisposition(store beads.Store, rootID, outcome string) error {
+	root, err := store.Get(rootID)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("loading workflow root %s: %w", rootID, err)
+	}
+	convoyID := strings.TrimSpace(root.Metadata[beadmeta.InputConvoyIDMetadataKey])
+	if convoyID == "" {
+		return nil
+	}
+	members, err := convoycore.Members(store, convoyID, true)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("listing input convoy %s members: %w", convoyID, err)
+	}
+	if len(members) != 1 {
+		return nil
+	}
+	input := members[0]
+	if input.Status != "closed" {
+		return nil
+	}
+	if strings.TrimSpace(input.Metadata[beadmeta.CoordinatorOutcomeProducerDispositionMetadataKey]) != "" {
+		return nil
+	}
+
+	disposition := beadmeta.CoordinatorDispositionNonDeliverable
+	if outcome == beadmeta.OutcomePass {
+		disposition = beadmeta.CoordinatorDispositionDeliverable
+	}
+	envelope := struct {
+		ContractVersion int    `json:"contract_version"`
+		Disposition     string `json:"disposition"`
+		WorkID          string `json:"work_id"`
+		RecordedBy      string `json:"recorded_by"`
+		Reason          string `json:"reason"`
+		Producer        string `json:"producer"`
+	}{
+		ContractVersion: beadmeta.CoordinatorOutcomeContractVersion,
+		Disposition:     disposition,
+		WorkID:          input.ID,
+		RecordedBy:      "workflow-finalize",
+		Reason:          fmt.Sprintf("backfilled at workflow finalize: root %s closed with gc.outcome=%s and its input bead was already closed without a typed producer_disposition", rootID, outcome),
+		Producer:        "formula-step",
+	}
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		return fmt.Errorf("encoding producer disposition envelope for %s: %w", input.ID, err)
+	}
+	if err := store.SetMetadata(input.ID, beadmeta.CoordinatorOutcomeProducerDispositionMetadataKey, string(raw)); err != nil {
+		return fmt.Errorf("writing producer disposition on %s: %w", input.ID, err)
+	}
+	return nil
 }
 
 func walkSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOptions, mutate bool) error {

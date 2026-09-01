@@ -3,6 +3,7 @@ package dispatch
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/convergence"
+	convoycore "github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/formulatest"
 	"github.com/gastownhall/gascity/internal/molecule"
@@ -4744,6 +4746,175 @@ func TestProcessWorkflowFinalizeClosesIntraStoreSourceBeadWithoutResolver(t *tes
 	}
 	if got := sourceAfter.Metadata["gc.outcome"]; got != "pass" {
 		t.Fatalf("source gc.outcome = %q, want pass", got)
+	}
+}
+
+// mustCreateInputConvoyFixture builds a graph.v2 workflow root whose input
+// bead is linked solely via gc.input_convoy_id (never gc.source_bead_id),
+// mirroring mol-scoped-work's dispatch shape: the input bead is closed by an
+// external "submit" step before the workflow's own generated members finish,
+// and the workflow root and its finalize control bead reach the same store.
+func mustCreateInputConvoyFixture(t *testing.T, store beads.Store, inputMetadata map[string]string, cleanupOutcome string) (input, finalizer beads.Bead) {
+	t.Helper()
+	input = mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:    "Input work item",
+		Type:     "task",
+		Status:   "closed",
+		Metadata: inputMetadata,
+	})
+	convoy := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:    "input convoy",
+		Type:     "task",
+		Metadata: map[string]string{"gc.kind": "convoy"},
+	})
+	if err := convoycore.TrackItem(store, convoy.ID, input.ID); err != nil {
+		t.Fatalf("TrackItem(%s, %s): %v", convoy.ID, input.ID, err)
+	}
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+			"gc.input_convoy_id":  convoy.ID,
+		},
+	})
+	cleanup := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "Clean up worktree",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.outcome": cleanupOutcome,
+		},
+	})
+	finalizer = mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "workflow-finalize",
+			"gc.root_bead_id": workflow.ID,
+		},
+	})
+	mustDepAdd(t, store, finalizer.ID, cleanup.ID, "blocks")
+	mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+	return input, finalizer
+}
+
+func decodeProducerDispositionEnvelope(t *testing.T, bead beads.Bead) (contractVersion int, disposition, workID, recordedBy, reason, producer string) {
+	t.Helper()
+	raw := bead.Metadata[beadmeta.CoordinatorOutcomeProducerDispositionMetadataKey]
+	if raw == "" {
+		t.Fatalf("%s: missing %s", bead.ID, beadmeta.CoordinatorOutcomeProducerDispositionMetadataKey)
+	}
+	var envelope struct {
+		ContractVersion int    `json:"contract_version"`
+		Disposition     string `json:"disposition"`
+		WorkID          string `json:"work_id"`
+		RecordedBy      string `json:"recorded_by"`
+		Reason          string `json:"reason"`
+		Producer        string `json:"producer"`
+	}
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		t.Fatalf("%s: unmarshal producer disposition envelope %q: %v", bead.ID, raw, err)
+	}
+	return envelope.ContractVersion, envelope.Disposition, envelope.WorkID, envelope.RecordedBy, envelope.Reason, envelope.Producer
+}
+
+// Regression test for gc-sbo5j: a mol-scoped-work root closed with all its
+// generated steps closed, but its input bead (linked via gc.input_convoy_id,
+// the graph.v2 replacement for gc.source_bead_id) had already been closed by
+// an external submit step that never called gc-outcome-close, so
+// gc.coordinator_outcome.producer_disposition was never written. Absent that
+// key, typedDeliverableCloseFor and any other reader cannot distinguish a
+// genuine refusal from a disposition nobody ever recorded.
+func TestProcessWorkflowFinalizeBackfillsInputConvoyProducerDispositionOnPass(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	input, finalizer := mustCreateInputConvoyFixture(t, store, map[string]string{
+		"gc.outcome":                   "branch-ready",
+		"gc.worktree_disposition":      "retained",
+		"gc.worktree_disposition_note": "mol-scoped-work body reached terminal state",
+	}, beadmeta.OutcomePass)
+
+	if _, err := ProcessControl(store, finalizer, ProcessOptions{}); err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+
+	inputAfter, err := store.Get(input.ID)
+	if err != nil {
+		t.Fatalf("get input: %v", err)
+	}
+	contractVersion, disposition, workID, recordedBy, reason, producer := decodeProducerDispositionEnvelope(t, inputAfter)
+	if disposition != beadmeta.CoordinatorDispositionDeliverable {
+		t.Fatalf("disposition = %q, want %q", disposition, beadmeta.CoordinatorDispositionDeliverable)
+	}
+	if workID != input.ID {
+		t.Fatalf("work_id = %q, want %q", workID, input.ID)
+	}
+	if contractVersion != beadmeta.CoordinatorOutcomeContractVersion {
+		t.Fatalf("contract_version = %d, want %d", contractVersion, beadmeta.CoordinatorOutcomeContractVersion)
+	}
+	if strings.TrimSpace(recordedBy) == "" || strings.TrimSpace(reason) == "" || strings.TrimSpace(producer) == "" {
+		t.Fatalf("envelope has an empty required field: recorded_by=%q reason=%q producer=%q", recordedBy, reason, producer)
+	}
+	if !typedDeliverableCloseFor(inputAfter) {
+		t.Fatalf("typedDeliverableCloseFor(%s) = false, want true for a backfilled deliverable envelope", input.ID)
+	}
+}
+
+// A workflow root that finalizes with a non-pass outcome did not deliver, so
+// the backfilled envelope must say so rather than defaulting to deliverable.
+func TestProcessWorkflowFinalizeBackfillsInputConvoyProducerDispositionOnFail(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	input, finalizer := mustCreateInputConvoyFixture(t, store, map[string]string{
+		"gc.outcome": "fail",
+	}, beadmeta.OutcomeFail)
+
+	if _, err := ProcessControl(store, finalizer, ProcessOptions{}); err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+
+	inputAfter, err := store.Get(input.ID)
+	if err != nil {
+		t.Fatalf("get input: %v", err)
+	}
+	_, disposition, workID, _, _, _ := decodeProducerDispositionEnvelope(t, inputAfter)
+	if disposition != beadmeta.CoordinatorDispositionNonDeliverable {
+		t.Fatalf("disposition = %q, want %q", disposition, beadmeta.CoordinatorDispositionNonDeliverable)
+	}
+	if workID != input.ID {
+		t.Fatalf("work_id = %q, want %q", workID, input.ID)
+	}
+}
+
+// A producer_disposition an agent already recorded via gc-outcome-close is
+// the real signal; the finalize backstop must never overwrite it.
+func TestProcessWorkflowFinalizePreservesExistingInputConvoyProducerDisposition(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	existing := `{"contract_version":1,"disposition":"non-deliverable","work_id":"REPLACE","recorded_by":"gascity-worker","reason":"declined: out of scope","producer":"direct-worker"}`
+	input, finalizer := mustCreateInputConvoyFixture(t, store, map[string]string{
+		"gc.outcome": "branch-ready",
+	}, beadmeta.OutcomePass)
+	existing = strings.Replace(existing, "REPLACE", input.ID, 1)
+	if err := store.SetMetadata(input.ID, beadmeta.CoordinatorOutcomeProducerDispositionMetadataKey, existing); err != nil {
+		t.Fatalf("seed existing envelope: %v", err)
+	}
+
+	if _, err := ProcessControl(store, finalizer, ProcessOptions{}); err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+
+	inputAfter, err := store.Get(input.ID)
+	if err != nil {
+		t.Fatalf("get input: %v", err)
+	}
+	if got := inputAfter.Metadata[beadmeta.CoordinatorOutcomeProducerDispositionMetadataKey]; got != existing {
+		t.Fatalf("producer_disposition = %q, want untouched existing envelope %q", got, existing)
 	}
 }
 
