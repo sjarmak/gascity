@@ -174,18 +174,29 @@ func (c *StateCache) EvictSession(name string) {
 }
 
 // refresh executes a single coalesced fetch. If the fetch fails, the
-// last-known-good cache is preserved and the error is logged.
+// last-known-good cache is preserved and the error is logged. An UNPRIMED
+// cache (fetchedAt never set) has no last-known-good to fall back on, so a
+// single transient failure (a busy tmux socket, a fetchTimeout blip under
+// fleet load) would otherwise be indistinguishable from a confirmed-empty
+// fleet, misreporting a live session as not-running (gc-5a56b); it self-
+// corrects only because the NEXT unprimed cache (e.g. the next `gc`
+// invocation) usually gets a clean fetch. Retry once in that case before
+// giving up. A "no server" failure is excluded from the retry: it is handled
+// by the unprimed-empty-prime branch below, and retrying it would double the
+// list-panes spawn rate in the (common, nothing-wrong) empty-city steady
+// state.
 func (c *StateCache) refresh() {
 	_, _, _ = c.sf.Do("refresh", func() (interface{}, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
-		defer cancel()
-
 		c.mu.RLock()
 		startGeneration := c.generation
+		unprimed := c.fetchedAt.IsZero()
 		c.mu.RUnlock()
 
 		start := time.Now()
-		state, err := c.fetcher.FetchState(ctx)
+		state, err := c.fetchOnce()
+		if err != nil && unprimed && !isNoServerError(err) {
+			state, err = c.fetchOnce()
+		}
 		elapsed := time.Since(start)
 
 		if err != nil {
@@ -239,6 +250,13 @@ func (c *StateCache) refresh() {
 		c.mu.Unlock()
 		return nil, nil
 	})
+}
+
+// fetchOnce performs a single bounded fetch attempt against the fetcher.
+func (c *StateCache) fetchOnce() (runtimeStateSnapshot, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
+	defer cancel()
+	return c.fetcher.FetchState(ctx)
 }
 
 // tmuxFetcher implements StateFetcher using a real Tmux instance.

@@ -402,6 +402,77 @@ func TestStateCache_UnprimedNoServerPrimesEmptyWithoutRefetch(t *testing.T) {
 	}
 }
 
+// flakyFetcher fails the first failCount calls with failErr, then returns
+// state on every call after that.
+type flakyFetcher struct {
+	mu        sync.Mutex
+	calls     int
+	failCount int
+	failErr   error
+	state     runtimeStateSnapshot
+}
+
+func (f *flakyFetcher) FetchState(_ context.Context) (runtimeStateSnapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.calls <= f.failCount {
+		return runtimeStateSnapshot{}, f.failErr
+	}
+	return f.state, nil
+}
+
+func (f *flakyFetcher) getCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// TestStateCache_UnprimedTransientErrorRetriesBeforeReportingMissing is the
+// regression test for gc-5a56b: a live session was reported asleep with
+// sleep_reason=runtime-missing, then self-corrected on the next observation.
+// A brand-new (unprimed) cache has no last-known-good to fall back on, so a
+// single transient fetch failure (a busy tmux socket, a fetchTimeout blip
+// under fleet load, NOT a "no server" condition) must not be collapsed into
+// a confirmed "nothing running". The cache must retry once before reporting
+// missing.
+func TestStateCache_UnprimedTransientErrorRetriesBeforeReportingMissing(t *testing.T) {
+	f := &flakyFetcher{
+		failCount: 1,
+		failErr:   errors.New("exit status 1: tmux server busy"),
+		state: runtimeStateSnapshot{
+			Sessions: map[string]sessionRuntimeState{"agent-1": {Running: true}},
+		},
+	}
+	cache := NewStateCache(f, 2*time.Second)
+
+	if !cache.IsRunning("agent-1") {
+		t.Fatal("IsRunning(agent-1) = false after one transient probe failure on an unprimed cache, want true: the cache must retry before reporting a live session missing")
+	}
+	if got := f.getCalls(); got != 2 {
+		t.Fatalf("fetch calls = %d, want 2 (one failed attempt + one retry)", got)
+	}
+}
+
+// TestStateCache_UnprimedTransientErrorGivesUpAfterOneRetry confirms the
+// retry is bounded: if the retry ALSO fails, IsRunning still reports false
+// (a genuinely unreachable runtime must still fail closed) and no unbounded
+// retry loop is spawned.
+func TestStateCache_UnprimedTransientErrorGivesUpAfterOneRetry(t *testing.T) {
+	f := &flakyFetcher{
+		failCount: 1000,
+		failErr:   errors.New("exit status 1: tmux server busy"),
+	}
+	cache := NewStateCache(f, 2*time.Second)
+
+	if cache.IsRunning("agent-1") {
+		t.Fatal("IsRunning(agent-1) = true, want false when both the initial fetch and the retry fail")
+	}
+	if got := f.getCalls(); got != 2 {
+		t.Fatalf("fetch calls = %d, want exactly 2 (one attempt + one retry, no unbounded retry loop)", got)
+	}
+}
+
 func TestStateCache_RefreshFailurePreservesLastKnownGood(t *testing.T) {
 	f := &mockFetcher{
 		sessions: map[string]bool{"agent-1": true},
