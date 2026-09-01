@@ -23,6 +23,7 @@ import (
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/resilience"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/session/sessiontest"
@@ -2536,6 +2537,160 @@ func TestExecutePlannedStartsTraced_CircuitTripDoesNotCommitPreWakeMetadata(t *t
 	}
 }
 
+// TestExecutePlannedStartsTraced_SpawnBreakerBoundsRepeatedFailures covers
+// gc-7u51j: a pool whose provider rejects every spawn attempt (regardless of
+// cause — no vendor-specific error string is inspected anywhere on this
+// path) must stop retrying at the tick's fast cadence and back off instead,
+// without minting an unbounded number of session beads/directories.
+//
+// OpenBase/OpenMax are set to an hour (a real Settings field, no internal
+// clock/jitter injection available outside the resilience package) so the
+// breaker's real full-jitter deadline cannot plausibly elapse during the
+// test: the "further attempts stay gated" assertions are effectively
+// deterministic rather than racing real wall-clock time. The breaker's own
+// exponential doubling-on-re-trip math is unit-tested directly in
+// internal/resilience (TestBreakerHalfOpenFailureReopensWithDoubledBackoff);
+// this test's job is to prove the wiring: failures are actually recorded,
+// a success actually resets the count, and an open breaker actually stops
+// the spawn before a session bead's runtime start is attempted.
+func TestExecutePlannedStartsTraced_SpawnBreakerBoundsRepeatedFailures(t *testing.T) {
+	store := beads.NewMemStore()
+	clk := &clock.Fake{Time: time.Date(2026, 4, 26, 12, 5, 0, 0, time.UTC)}
+	sp := runtime.NewFake()
+	spawnErr := errors.New("provider quota exceeded")
+	sp.StartErrors["worker"] = spawnErr
+	cfg := &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	tp := TemplateParams{Command: "worker", SessionName: "worker", TemplateName: "worker"}
+	registry := resilience.NewRegistry(resilience.Settings{
+		Enabled:             true,
+		ConsecutiveFailures: 3,
+		OpenBase:            time.Hour,
+		OpenMax:             time.Hour,
+	})
+	var transitions []resilience.Transition
+	registry.SetOnStateChange(func(tr resilience.Transition) {
+		transitions = append(transitions, tr)
+	})
+
+	// attempt runs one simulated reconcile tick against a fresh session bead
+	// named sessionName. Reusing "worker" across the failing ticks mirrors the
+	// real bug (the supervisor mints a new session bead each tick while the
+	// provider keeps rejecting it); the one successful tick uses a distinct
+	// name so it doesn't leave a live fake session behind that a later
+	// same-named failing tick would collide with ("session already exists")
+	// — a collision that belongs to runtime.Fake bookkeeping, not to what
+	// this test is verifying.
+	var nextID int
+	attempt := func(sessionName string) {
+		nextID++
+		session, err := store.Create(beads.Bead{
+			ID:     fmt.Sprintf("gc-worker-%d", nextID),
+			Title:  sessionName,
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: creatingMeta(map[string]string{
+				"session_name":         sessionName,
+				"template":             "worker",
+				"generation":           "1",
+				"continuation_epoch":   "1",
+				"instance_token":       fmt.Sprintf("tok-worker-%d", nextID),
+				"pending_create_claim": "true",
+			}),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		executePlannedStartsTraced(
+			context.Background(),
+			[]startCandidate{{info: sessiontest.SeedBead(t, session), tp: tp}},
+			cfg,
+			map[string]TemplateParams{"worker": tp},
+			sp,
+			store,
+			"test-city",
+			"",
+			clk,
+			events.Discard,
+			time.Minute,
+			ioDiscard{},
+			ioDiscard{},
+			nil,
+			withSpawnBreakers(registry),
+		)
+	}
+
+	breaker := registry.Breaker("worker", resilience.OpClassSpawn)
+
+	// Two consecutive failures: below the trip threshold, breaker stays closed.
+	attempt("worker")
+	attempt("worker")
+	if got := sp.CountCalls("Start", "worker"); got != 2 {
+		t.Fatalf("Start calls after 2 failures = %d, want 2", got)
+	}
+	if state := breaker.State(); state != resilience.StateClosed {
+		t.Fatalf("breaker state after 2 failures = %v, want closed", state)
+	}
+
+	// A success on the same template (different session name, so it does not
+	// collide with the still-failing "worker" runtime session) resets the
+	// consecutive-failure count.
+	attempt("worker-ok")
+	if state := breaker.State(); state != resilience.StateClosed {
+		t.Fatalf("breaker state after a success = %v, want closed", state)
+	}
+
+	// Two more failures after the reset must NOT trip the breaker yet,
+	// proving the earlier success actually cleared the counter rather than
+	// merely being ignored.
+	attempt("worker")
+	attempt("worker")
+	if got := sp.CountCalls("Start", "worker"); got != 4 {
+		t.Fatalf("Start calls on the failing session so far = %d, want 4", got)
+	}
+	if state := breaker.State(); state != resilience.StateClosed {
+		t.Fatalf("breaker state after post-reset failures = %v, want still closed (reset should not carry over)", state)
+	}
+
+	// The third consecutive failure trips the breaker open.
+	attempt("worker")
+	if got := sp.CountCalls("Start", "worker"); got != 5 {
+		t.Fatalf("Start calls after tripping = %d, want 5", got)
+	}
+	if state := breaker.State(); state != resilience.StateOpen {
+		t.Fatalf("breaker state after 3 consecutive failures = %v, want open", state)
+	}
+
+	// Further attempts (simulating more reconcile ticks under a still-failing
+	// provider) must be skipped by the breaker gate before a runtime start is
+	// even attempted — this is what bounds session creation instead of
+	// retrying forever at the tick cadence.
+	for i := 0; i < 5; i++ {
+		attempt("worker")
+	}
+	if got := sp.CountCalls("Start", "worker"); got != 5 {
+		t.Fatalf("Start calls after breaker opened = %d, want unchanged at 5 (further attempts must be skipped)", got)
+	}
+
+	// The state transition is observable via the typed event wiring
+	// (SetOnStateChange / events.PoolSpawnBackoff), independent of session
+	// directories on disk.
+	var openTransition *resilience.Transition
+	for i := range transitions {
+		if transitions[i].To == resilience.StateOpen {
+			openTransition = &transitions[i]
+		}
+	}
+	if openTransition == nil {
+		t.Fatal("no closed->open transition observed on the spawn breaker")
+	}
+	if openTransition.Backoff <= 0 {
+		t.Fatalf("open transition backoff = %v, want > 0", openTransition.Backoff)
+	}
+	if openTransition.Scope != "worker" {
+		t.Fatalf("open transition scope = %q, want template name %q", openTransition.Scope, "worker")
+	}
+}
+
 func TestExecutePlannedStartsTraced_AsyncRequestsFollowUpAfterCommit(t *testing.T) {
 	store := beads.NewMemStore()
 	clk := &clock.Fake{Time: time.Date(2026, 4, 26, 12, 1, 30, 0, time.UTC)}
@@ -2938,7 +3093,7 @@ func TestCommitAsyncStartResult_IgnoresStaleSessionSnapshot(t *testing.T) {
 		finished: clk.Now(),
 	}
 
-	if commitAsyncStartResultWithContext(context.Background(), result, nil, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil) {
+	if commitAsyncStartResultWithContext(context.Background(), result, nil, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil, nil) {
 		t.Fatal("stale async start result should not commit")
 	}
 	updated, err := store.Get(session.ID)
@@ -2996,7 +3151,7 @@ func TestCommitAsyncStartResult_IgnoresClosedSessionSnapshot(t *testing.T) {
 		finished: clk.Now(),
 	}
 
-	if commitAsyncStartResultWithContext(context.Background(), result, nil, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil) {
+	if commitAsyncStartResultWithContext(context.Background(), result, nil, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil, nil) {
 		t.Fatal("closed async start result should not commit")
 	}
 	updated, err := store.Get(session.ID)
@@ -3069,7 +3224,7 @@ func TestCommitAsyncStartResult_StopsMatchingRuntimeForStaleSnapshot(t *testing.
 		finished: clk.Now(),
 	}
 
-	if commitAsyncStartResultWithContext(context.Background(), result, sp, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil) {
+	if commitAsyncStartResultWithContext(context.Background(), result, sp, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil, nil) {
 		t.Fatal("stale async start result should not commit")
 	}
 	if sp.IsRunning("worker") {
@@ -3717,7 +3872,7 @@ func TestCommitAsyncStartResult_GenerationDriftWithMatchingTokenCommits(t *testi
 		finished: clk.Now(),
 	}
 
-	if !commitAsyncStartResultWithContext(context.Background(), result, nil, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil) {
+	if !commitAsyncStartResultWithContext(context.Background(), result, nil, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil, nil) {
 		t.Fatal("generation drift with matching instance_token must commit; otherwise pool sessions stay stuck in creating")
 	}
 	updated, err := store.Get(session.ID)
@@ -3791,7 +3946,7 @@ func TestCommitAsyncStartResult_IgnoresCommandChangedDuringStartup(t *testing.T)
 		finished: clk.Now(),
 	}
 
-	if commitAsyncStartResultWithContext(context.Background(), result, sp, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil) {
+	if commitAsyncStartResultWithContext(context.Background(), result, sp, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil, nil) {
 		t.Fatal("async start with stale command should not commit")
 	}
 	updated, err := store.Get(session.ID)
@@ -3862,7 +4017,7 @@ func TestCommitAsyncStartResult_PreservesRuntimeWhenRefreshFails(t *testing.T) {
 		finished: clk.Now(),
 	}
 
-	if commitAsyncStartResultWithContext(context.Background(), result, sp, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil) {
+	if commitAsyncStartResultWithContext(context.Background(), result, sp, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil, nil) {
 		t.Fatal("async result should not commit when refresh fails")
 	}
 	if !sp.IsRunning("worker") {
@@ -3913,7 +4068,7 @@ func TestCommitAsyncStartResult_RecoversCommitPanic(t *testing.T) {
 		finished: clk.Now(),
 	}
 
-	if commitAsyncStartResultWithContext(context.Background(), result, nil, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil) {
+	if commitAsyncStartResultWithContext(context.Background(), result, nil, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil, nil) {
 		t.Fatal("async commit with panic should report not committed")
 	}
 	updated, err := store.Get(session.ID)
@@ -3963,7 +4118,7 @@ func TestCommitAsyncStartResultWithContext_SkipsCanceledCommit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if commitAsyncStartResultWithContext(ctx, result, nil, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil) {
+	if commitAsyncStartResultWithContext(ctx, result, nil, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil, nil) {
 		t.Fatal("canceled async commit should report not committed")
 	}
 	updated, err := store.Get(session.ID)
@@ -4027,7 +4182,7 @@ func TestCommitAsyncStartResultWithContext_StopsCanceledSuccessfulPendingCreateR
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if commitAsyncStartResultWithContext(ctx, result, sp, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil) {
+	if commitAsyncStartResultWithContext(ctx, result, sp, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil, nil) {
 		t.Fatal("canceled async success should report not committed")
 	}
 	if sp.IsRunning("worker") {
@@ -4088,7 +4243,7 @@ func TestCommitAsyncStartResultWithContext_RollsBackCanceledPendingCreateError(t
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if commitAsyncStartResultWithContext(ctx, result, nil, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil) {
+	if commitAsyncStartResultWithContext(ctx, result, nil, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil, nil) {
 		t.Fatal("canceled async error commit should report not committed")
 	}
 	updated, err := store.Get(session.ID)
@@ -4140,7 +4295,7 @@ func TestCommitAsyncStartResultWithContext_RollsBackCanceledPendingCreateSuccess
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if commitAsyncStartResultWithContext(ctx, result, nil, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil) {
+	if commitAsyncStartResultWithContext(ctx, result, nil, store, clk, events.Discard, 0, ioDiscard{}, ioDiscard{}, nil, nil) {
 		t.Fatal("canceled async success commit should report not committed")
 	}
 	updated, err := store.Get(session.ID)

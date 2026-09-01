@@ -2530,6 +2530,9 @@
             "$ref": "#/components/schemas/OutboundEventPayload"
           },
           {
+            "$ref": "#/components/schemas/PoolSpawnBackoffPayload"
+          },
+          {
             "$ref": "#/components/schemas/ProjectIdentityStampedPayload"
           },
           {
@@ -5683,6 +5686,36 @@
           "DrainTimeout",
           "OnDeath",
           "OnBoot"
+        ],
+        "type": "object"
+      },
+      "PoolSpawnBackoffPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "backoff_seconds": {
+            "format": "double",
+            "type": "number"
+          },
+          "consecutive_failures": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "from_state": {
+            "type": "string"
+          },
+          "template": {
+            "type": "string"
+          },
+          "to_state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "template",
+          "from_state",
+          "to_state",
+          "consecutive_failures",
+          "backoff_seconds"
         ],
         "type": "object"
       },
@@ -12162,6 +12195,7 @@
             "order.failed": "#/components/schemas/TypedEventStreamEnvelopeOrderFailed",
             "order.fired": "#/components/schemas/TypedEventStreamEnvelopeOrderFired",
             "order.suppressed": "#/components/schemas/TypedEventStreamEnvelopeOrderSuppressed",
+            "pool.spawn_backoff": "#/components/schemas/TypedEventStreamEnvelopePoolSpawnBackoff",
             "project.identity.stamped": "#/components/schemas/TypedEventStreamEnvelopeProjectIdentityStamped",
             "provider.swapped": "#/components/schemas/TypedEventStreamEnvelopeProviderSwapped",
             "request.failed": "#/components/schemas/TypedEventStreamEnvelopeRequestFailed",
@@ -12365,6 +12399,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeOrderSuppressed"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopePoolSpawnBackoff"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeProjectIdentityStamped"
@@ -13683,6 +13720,7 @@
                 "session.work_query_failed",
                 "session.demand_claim_divergence",
                 "session.cold_start_timeout",
+                "pool.spawn_backoff",
                 "bead.created",
                 "bead.closed",
                 "bead.deleted",
@@ -15712,6 +15750,63 @@
           "payload"
         ],
         "title": "TypedEventStreamEnvelope order.suppressed",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopePoolSpawnBackoff": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/PoolSpawnBackoffPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "pool.spawn_backoff",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope pool.spawn_backoff",
         "type": "object"
       },
       "TypedEventStreamEnvelopeProjectIdentityStamped": {
@@ -17938,6 +18033,7 @@
             "order.failed": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderFailed",
             "order.fired": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderFired",
             "order.suppressed": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderSuppressed",
+            "pool.spawn_backoff": "#/components/schemas/TypedTaggedEventStreamEnvelopePoolSpawnBackoff",
             "project.identity.stamped": "#/components/schemas/TypedTaggedEventStreamEnvelopeProjectIdentityStamped",
             "provider.swapped": "#/components/schemas/TypedTaggedEventStreamEnvelopeProviderSwapped",
             "request.failed": "#/components/schemas/TypedTaggedEventStreamEnvelopeRequestFailed",
@@ -18141,6 +18237,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderSuppressed"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopePoolSpawnBackoff"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeProjectIdentityStamped"
@@ -19542,6 +19641,7 @@
                 "session.work_query_failed",
                 "session.demand_claim_divergence",
                 "session.cold_start_timeout",
+                "pool.spawn_backoff",
                 "bead.created",
                 "bead.closed",
                 "bead.deleted",
@@ -21708,6 +21808,67 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope order.suppressed",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopePoolSpawnBackoff": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/PoolSpawnBackoffPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "pool.spawn_backoff",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope pool.spawn_backoff",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeProjectIdentityStamped": {

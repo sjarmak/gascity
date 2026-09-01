@@ -164,10 +164,18 @@ const (
 	// Emitted by the session reconciler's start-result commit path; the
 	// envelope's Subject carries the session name.
 	SessionColdStartTimeout = "session.cold_start_timeout"
-	ConvoyCreated           = "convoy.created"
-	ConvoyClosed            = "convoy.closed"
-	ControllerStarted       = "controller.started"
-	ControllerStopped       = "controller.stopped"
+	// PoolSpawnBackoff fires whenever the per-template spawn breaker changes
+	// state (closed/open/half-open). A run of consecutive spawn failures for
+	// one agent template opens the breaker and pauses further spawn attempts
+	// for that template until the backoff deadline; a subsequent success
+	// closes it again. This is the sole way to observe spawn backoff without
+	// reading session directories off disk. Emitted by the reconciler's
+	// spawn-breaker registry (internal/resilience), keyed by template name.
+	PoolSpawnBackoff  = "pool.spawn_backoff"
+	ConvoyCreated     = "convoy.created"
+	ConvoyClosed      = "convoy.closed"
+	ControllerStarted = "controller.started"
+	ControllerStopped = "controller.stopped"
 	// ControlStalled fires once, when a control bead's bounded semantic-refusal
 	// retry budget expires and the control dispatcher quarantines it. Before
 	// this event the control plane had no control.* vocabulary at all, so a
@@ -350,6 +358,7 @@ var KnownEventTypes = []string{
 	SessionWorkQueryFailed,
 	SessionDemandClaimDivergence,
 	SessionColdStartTimeout,
+	PoolSpawnBackoff,
 	BeadCreated, BeadClosed, BeadDeleted, BeadUpdated,
 	BeadWorktreeReaped, BeadWorktreeReapSkipped,
 	BeadClaimRejected, BeadClaimReleased,

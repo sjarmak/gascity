@@ -27,6 +27,7 @@ import (
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 	"github.com/gastownhall/gascity/internal/orders"
+	"github.com/gastownhall/gascity/internal/resilience"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
@@ -156,6 +157,11 @@ type CityRuntime struct {
 	rec events.Recorder
 	cs  *controllerState // nil when controller-managed bead stores are unavailable
 	svc *workspacesvc.Manager
+
+	// spawnBreakers is the per-template spawn-failure breaker registry
+	// (internal/resilience). In-memory, one per running city; see
+	// newSpawnBreakerRegistry.
+	spawnBreakers *resilience.Registry
 
 	poolSessions      map[string]time.Duration
 	poolDeathHandlers map[string]poolDeathInfo
@@ -367,6 +373,7 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 	it := buildIdleTracker(p.Cfg, p.CityName, p.CityPath, p.SP)
 	mat := buildMaxSessionAgeTracker(p.Cfg, p.CityName, p.SP)
 	adt := buildAssignedWorkDeferTracker(p.Cfg, p.CityName, p.SP)
+	spawnBreakers := newSpawnBreakerRegistry(p.Rec)
 
 	wg := newWispGCForConfig(p.Cfg)
 
@@ -429,6 +436,7 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 		it:                      it,
 		mat:                     mat,
 		adt:                     adt,
+		spawnBreakers:           spawnBreakers,
 		wg:                      wg,
 		od:                      od,
 		orderSet:                orderSnapshot.Orders,
@@ -2600,6 +2608,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		withAsyncDrainAckStopTracker(&cr.asyncStops),
 		withMaxSessionAgeTracker(cr.mat),
 		withAssignedWorkDeferTracker(cr.adt),
+		withSpawnBreakers(cr.spawnBreakers),
 		withReadyAssignedFlags(readyAssignedFlagsForBeads(result.ReadyAssigned, awakeAssignedWorkBeads, awakeAssignedStoreRefs)),
 		// Warm-bind claim nudge: deliver a pool slot's claim instruction to an
 		// already-running, idle slot that had on-demand work bound to it after it

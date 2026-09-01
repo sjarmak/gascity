@@ -21,6 +21,7 @@ import (
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/resilience"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
@@ -322,6 +323,11 @@ type startExecutionOptions struct {
 	// reconciler where the cached rig stores are in scope and consumed in
 	// startPreparedStartCandidate's warm-reuse branch. Nil disables the nudge.
 	warmClaimProbe warmClaimTriggerProbe
+
+	// spawnBreakers gates and records per-template spawn attempts (see
+	// internal/resilience). Nil disables spawn backoff entirely — every
+	// attempt is allowed and no failure/success is recorded, today's behavior.
+	spawnBreakers *resilience.Registry
 }
 
 type startExecutionOption func(*startExecutionOptions)
@@ -337,6 +343,14 @@ func withAsyncStartExecution() startExecutionOption {
 func withAsyncStartFollowUp(fn func()) startExecutionOption {
 	return func(opts *startExecutionOptions) {
 		opts.asyncFollowUp = fn
+	}
+}
+
+// withSpawnBreakers installs the per-template spawn breaker registry. Nil is
+// accepted and simply disables spawn backoff (the field's zero value).
+func withSpawnBreakers(registry *resilience.Registry) startExecutionOption {
+	return func(opts *startExecutionOptions) {
+		opts.spawnBreakers = registry
 	}
 }
 
@@ -1638,6 +1652,7 @@ func enqueuePreparedStartWaveForCity(
 	stabilityWaiter startStabilityWaiter,
 	sessionStaleKeyDetectionWaiter sessionpkg.StaleKeyDetectionWaiter,
 	warmClaim warmClaimTriggerProbe,
+	spawnBreakers *resilience.Registry,
 ) []startResult {
 	if len(prepared) == 0 {
 		return nil
@@ -1663,7 +1678,7 @@ func enqueuePreparedStartWaveForCity(
 				defer release()
 			}
 			result := runPreparedStartCandidate(ctx, item, cityPath, sp, store, cfg, startupTimeout, stabilityWaiter, sessionStaleKeyDetectionWaiter, warmClaim)
-			commitAsyncStartResultWithContext(ctx, result, sp, store, clk, rec, wave, stdout, stderr, trace)
+			commitAsyncStartResultWithContext(ctx, result, sp, store, clk, rec, wave, stdout, stderr, trace, spawnBreakers)
 			if asyncFollowUp != nil {
 				asyncFollowUp()
 			}
@@ -1686,6 +1701,7 @@ func commitAsyncStartResultWithContext(
 	wave int,
 	stdout, stderr io.Writer,
 	trace *sessionReconcilerTraceCycle,
+	spawnBreakers *resilience.Registry,
 ) (committed bool) {
 	name := result.prepared.candidate.name()
 	template := result.prepared.candidate.tp.TemplateName
@@ -1744,7 +1760,7 @@ func commitAsyncStartResultWithContext(
 	}
 	if ctx != nil && ctx.Err() != nil {
 		if refreshed.err != nil && refreshed.rollbackPending {
-			return commitStartResultTraced(refreshed, sessFront, clk, rec, wave, stdout, stderr, trace)
+			return commitStartResultTraced(refreshed, sessFront, clk, rec, wave, stdout, stderr, trace, spawnBreakers)
 		}
 		if refreshed.err == nil && shouldRollbackPendingCreateInfo(refreshed.prepared.candidate.info) {
 			stopStaleAsyncStartRuntime(refreshed, sp, stderr)
@@ -1756,7 +1772,7 @@ func commitAsyncStartResultWithContext(
 	if sp != nil && refreshed.err == nil && refreshed.outcome != TraceOutcomeSessionInitializing {
 		_ = clearReconcilerDrainAckMetadata(sp, refreshed.prepared.candidate.name())
 	}
-	return commitStartResultTraced(refreshed, sessFront, clk, rec, wave, stdout, stderr, trace)
+	return commitStartResultTraced(refreshed, sessFront, clk, rec, wave, stdout, stderr, trace, spawnBreakers)
 }
 
 // refreshAsyncStartResult re-reads the session bead just before commit so the async
@@ -2101,7 +2117,7 @@ func commitStartResult(
 	wave int, //nolint:unparam // always 0 here but passed through to commitStartResultTraced which uses it
 	stdout, stderr io.Writer,
 ) bool {
-	return commitStartResultTraced(result, sessFront, clk, rec, wave, stdout, stderr, nil)
+	return commitStartResultTraced(result, sessFront, clk, rec, wave, stdout, stderr, nil, nil)
 }
 
 // confirmPendingStart reports whether a session in the given metadata state
@@ -2125,6 +2141,7 @@ func commitStartResultTraced(
 	wave int,
 	stdout, stderr io.Writer,
 	trace *sessionReconcilerTraceCycle,
+	spawnBreakers *resilience.Registry,
 ) bool {
 	// info is the refreshed typed twin (async: refreshAsyncStartResult's currentInfo;
 	// sync: prepareStartCandidateForCity's coherence refresh) — the sole commit-time
@@ -2141,7 +2158,7 @@ func commitStartResultTraced(
 		return false
 	}
 	if result.err != nil {
-		commitStartFailure(result, sessFront, clk, rec, wave, stderr, trace)
+		commitStartFailure(result, sessFront, clk, rec, wave, stderr, trace, spawnBreakers)
 		return false
 	}
 	coreBreakdown := ""
@@ -2234,6 +2251,9 @@ func commitStartResultTraced(
 	// whose commit then fails — a fact the store never recorded, since the
 	// failure paths above report the start as failed and retry (ga-kmoj9c).
 	fmt.Fprintf(stdout, "Woke session '%s'\n", tp.DisplayName()) //nolint:errcheck
+	if spawnBreakers != nil {
+		spawnBreakers.Breaker(tp.TemplateName, resilience.OpClassSpawn).RecordSuccess()
+	}
 	rec.Record(events.Event{
 		Type:      events.SessionWoke,
 		Actor:     "gc",
@@ -2259,10 +2279,13 @@ func commitStartResultTraced(
 // wake-failure accounting, plus the matching trace and log records. It is split
 // out of commitStartResultTraced to keep the success path legible; the caller
 // returns false after invoking it.
-func commitStartFailure(result startResult, sessFront *sessionpkg.Store, clk clock.Clock, rec events.Recorder, wave int, stderr io.Writer, trace *sessionReconcilerTraceCycle) {
+func commitStartFailure(result startResult, sessFront *sessionpkg.Store, clk clock.Clock, rec events.Recorder, wave int, stderr io.Writer, trace *sessionReconcilerTraceCycle, spawnBreakers *resilience.Registry) {
 	info := result.prepared.candidate.info
 	name := result.prepared.candidate.name()
 	tp := result.prepared.candidate.tp
+	if spawnBreakers != nil {
+		spawnBreakers.Breaker(tp.TemplateName, resilience.OpClassSpawn).RecordFailure()
+	}
 	fmt.Fprintf(stderr, "session reconciler: starting %s: %s\n", name, formatLifecycleError(result.err)) //nolint:errcheck
 	if reason := runtime.ProviderTerminalErrorReason(result.err.Error()); reason != "" {
 		// This runs on the async start goroutine, and this failure arm is terminal
@@ -2829,6 +2852,24 @@ func executePlannedStartsTraced(
 						continue
 					}
 				}
+				if startOpts.spawnBreakers != nil {
+					template := candidate.tp.TemplateName
+					if !startOpts.spawnBreakers.Breaker(template, resilience.OpClassSpawn).Allow() {
+						if release != nil {
+							release()
+						}
+						if done != nil {
+							done()
+						}
+						logLifecycleOutcome(stderr, "start", wave, candidate.name(), template, "spawn_breaker_open", time.Time{}, time.Time{}, nil)
+						if trace != nil {
+							trace.RecordDecision(TraceSiteReconcilerSpawnBreakerOpen, TraceReasonSpawnBreakerOpen, TraceOutcomeSkipped, template, candidate.name(), traceRecordPayload{
+								"template": template,
+							})
+						}
+						continue
+					}
+				}
 				if cbEnabled {
 					identity := namedSessionIdentityInfo(candidate.info)
 					if identity != "" {
@@ -2905,7 +2946,7 @@ func executePlannedStartsTraced(
 				return wakeCount
 			}
 			if startOpts.async {
-				results = enqueuePreparedStartWaveForCity(ctx, asyncPrepared, cityPath, sp, store, cfg, clk, rec, startupTimeout, wave, stdout, stderr, trace, startOpts.asyncFollowUp, stabilityWaiter, sessionStaleKeyDetectionWaiter, startOpts.warmClaimProbe)
+				results = enqueuePreparedStartWaveForCity(ctx, asyncPrepared, cityPath, sp, store, cfg, clk, rec, startupTimeout, wave, stdout, stderr, trace, startOpts.asyncFollowUp, stabilityWaiter, sessionStaleKeyDetectionWaiter, startOpts.warmClaimProbe, startOpts.spawnBreakers)
 				if len(results) > 0 && asyncStartBatchNeedsFollowUp(batchCandidates, cfg) {
 					asyncFollowUpRequired = true
 				}
@@ -2939,7 +2980,7 @@ func executePlannedStartsTraced(
 				if result.err == nil && result.outcome != TraceOutcomeSessionInitializing {
 					_ = clearReconcilerDrainAckMetadata(sp, result.prepared.candidate.name())
 				}
-				if commitStartResultTraced(result, sessFront, clk, rec, wave, stdout, stderr, trace) {
+				if commitStartResultTraced(result, sessFront, clk, rec, wave, stdout, stderr, trace, startOpts.spawnBreakers) {
 					wakeCount++
 				}
 			}

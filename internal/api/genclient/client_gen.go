@@ -2900,6 +2900,15 @@ type PoolOverride struct {
 	OnDeath      *string `json:"OnDeath"`
 }
 
+// PoolSpawnBackoffPayload defines model for PoolSpawnBackoffPayload.
+type PoolSpawnBackoffPayload struct {
+	BackoffSeconds      float64 `json:"backoff_seconds"`
+	ConsecutiveFailures int64   `json:"consecutive_failures"`
+	FromState           string  `json:"from_state"`
+	Template            string  `json:"template"`
+	ToState             string  `json:"to_state"`
+}
+
 // ProjectIdentityStampedPayload defines model for ProjectIdentityStampedPayload.
 type ProjectIdentityStampedPayload struct {
 	Layer     string  `json:"layer"`
@@ -6159,6 +6168,22 @@ type TypedEventStreamEnvelopeOrderSuppressed struct {
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
 }
 
+// TypedEventStreamEnvelopePoolSpawnBackoff defines model for TypedEventStreamEnvelopePoolSpawnBackoff.
+type TypedEventStreamEnvelopePoolSpawnBackoff struct {
+	Actor            string                   `json:"actor"`
+	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
+	Message          *string                  `json:"message,omitempty"`
+	Payload          PoolSpawnBackoffPayload  `json:"payload"`
+	RunId            *string                  `json:"run_id,omitempty"`
+	Seq              int64                    `json:"seq"`
+	SessionId        *string                  `json:"session_id,omitempty"`
+	StepId           *string                  `json:"step_id,omitempty"`
+	Subject          *string                  `json:"subject,omitempty"`
+	Ts               time.Time                `json:"ts"`
+	Type             string                   `json:"type"`
+	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
 // TypedEventStreamEnvelopeProjectIdentityStamped defines model for TypedEventStreamEnvelopeProjectIdentityStamped.
 type TypedEventStreamEnvelopeProjectIdentityStamped struct {
 	Actor            string                        `json:"actor"`
@@ -7697,6 +7722,23 @@ type TypedTaggedEventStreamEnvelopeOrderSuppressed struct {
 	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
 	Message          *string                  `json:"message,omitempty"`
 	Payload          OrderSuppressedPayload   `json:"payload"`
+	RunId            *string                  `json:"run_id,omitempty"`
+	Seq              int64                    `json:"seq"`
+	SessionId        *string                  `json:"session_id,omitempty"`
+	StepId           *string                  `json:"step_id,omitempty"`
+	Subject          *string                  `json:"subject,omitempty"`
+	Ts               time.Time                `json:"ts"`
+	Type             string                   `json:"type"`
+	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
+// TypedTaggedEventStreamEnvelopePoolSpawnBackoff defines model for TypedTaggedEventStreamEnvelopePoolSpawnBackoff.
+type TypedTaggedEventStreamEnvelopePoolSpawnBackoff struct {
+	Actor            string                   `json:"actor"`
+	City             string                   `json:"city"`
+	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
+	Message          *string                  `json:"message,omitempty"`
+	Payload          PoolSpawnBackoffPayload  `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
@@ -10545,6 +10587,32 @@ func (t *EventPayload) FromOutboundEventPayload(v OutboundEventPayload) error {
 
 // MergeOutboundEventPayload performs a merge with any union data inside the EventPayload, using the provided OutboundEventPayload
 func (t *EventPayload) MergeOutboundEventPayload(v OutboundEventPayload) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsPoolSpawnBackoffPayload returns the union data inside the EventPayload as a PoolSpawnBackoffPayload
+func (t EventPayload) AsPoolSpawnBackoffPayload() (PoolSpawnBackoffPayload, error) {
+	var body PoolSpawnBackoffPayload
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromPoolSpawnBackoffPayload overwrites any union data inside the EventPayload as the provided PoolSpawnBackoffPayload
+func (t *EventPayload) FromPoolSpawnBackoffPayload(v PoolSpawnBackoffPayload) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergePoolSpawnBackoffPayload performs a merge with any union data inside the EventPayload, using the provided PoolSpawnBackoffPayload
+func (t *EventPayload) MergePoolSpawnBackoffPayload(v PoolSpawnBackoffPayload) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -14470,6 +14538,34 @@ func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeOrderSuppressed(
 	return err
 }
 
+// AsTypedEventStreamEnvelopePoolSpawnBackoff returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopePoolSpawnBackoff
+func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopePoolSpawnBackoff() (TypedEventStreamEnvelopePoolSpawnBackoff, error) {
+	var body TypedEventStreamEnvelopePoolSpawnBackoff
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedEventStreamEnvelopePoolSpawnBackoff overwrites any union data inside the TypedEventStreamEnvelope as the provided TypedEventStreamEnvelopePoolSpawnBackoff
+func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopePoolSpawnBackoff(v TypedEventStreamEnvelopePoolSpawnBackoff) error {
+	v.Type = "pool.spawn_backoff"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedEventStreamEnvelopePoolSpawnBackoff performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopePoolSpawnBackoff
+func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopePoolSpawnBackoff(v TypedEventStreamEnvelopePoolSpawnBackoff) error {
+	v.Type = "pool.spawn_backoff"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedEventStreamEnvelopeProjectIdentityStamped returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeProjectIdentityStamped
 func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeProjectIdentityStamped() (TypedEventStreamEnvelopeProjectIdentityStamped, error) {
 	var body TypedEventStreamEnvelopeProjectIdentityStamped
@@ -15686,6 +15782,8 @@ func (t TypedEventStreamEnvelope) ValueByDiscriminator() (interface{}, error) {
 		return t.AsTypedEventStreamEnvelopeOrderFired()
 	case "order.suppressed":
 		return t.AsTypedEventStreamEnvelopeOrderSuppressed()
+	case "pool.spawn_backoff":
+		return t.AsTypedEventStreamEnvelopePoolSpawnBackoff()
 	case "project.identity.stamped":
 		return t.AsTypedEventStreamEnvelopeProjectIdentityStamped()
 	case "provider.swapped":
@@ -17289,6 +17387,34 @@ func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeOrde
 	return err
 }
 
+// AsTypedTaggedEventStreamEnvelopePoolSpawnBackoff returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopePoolSpawnBackoff
+func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopePoolSpawnBackoff() (TypedTaggedEventStreamEnvelopePoolSpawnBackoff, error) {
+	var body TypedTaggedEventStreamEnvelopePoolSpawnBackoff
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedTaggedEventStreamEnvelopePoolSpawnBackoff overwrites any union data inside the TypedTaggedEventStreamEnvelope as the provided TypedTaggedEventStreamEnvelopePoolSpawnBackoff
+func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopePoolSpawnBackoff(v TypedTaggedEventStreamEnvelopePoolSpawnBackoff) error {
+	v.Type = "pool.spawn_backoff"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedTaggedEventStreamEnvelopePoolSpawnBackoff performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopePoolSpawnBackoff
+func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopePoolSpawnBackoff(v TypedTaggedEventStreamEnvelopePoolSpawnBackoff) error {
+	v.Type = "pool.spawn_backoff"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedTaggedEventStreamEnvelopeProjectIdentityStamped returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeProjectIdentityStamped
 func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeProjectIdentityStamped() (TypedTaggedEventStreamEnvelopeProjectIdentityStamped, error) {
 	var body TypedTaggedEventStreamEnvelopeProjectIdentityStamped
@@ -18505,6 +18631,8 @@ func (t TypedTaggedEventStreamEnvelope) ValueByDiscriminator() (interface{}, err
 		return t.AsTypedTaggedEventStreamEnvelopeOrderFired()
 	case "order.suppressed":
 		return t.AsTypedTaggedEventStreamEnvelopeOrderSuppressed()
+	case "pool.spawn_backoff":
+		return t.AsTypedTaggedEventStreamEnvelopePoolSpawnBackoff()
 	case "project.identity.stamped":
 		return t.AsTypedTaggedEventStreamEnvelopeProjectIdentityStamped()
 	case "provider.swapped":

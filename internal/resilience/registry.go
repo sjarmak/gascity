@@ -8,6 +8,11 @@ import "sync"
 // transport failures protect every other chokepoint.
 const OpClassBd = "bd"
 
+// OpClassSpawn is the operation class for agent session spawn attempts.
+// Scope is the agent template name: repeated spawn failures for one
+// template trip its breaker without affecting other templates.
+const OpClassSpawn = "spawn"
+
 // Key identifies a breaker: a store scope (canonical scope root path)
 // plus an operation class.
 type Key struct {

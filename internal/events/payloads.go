@@ -200,4 +200,25 @@ func (SessionDemandClaimDivergencePayload) IsEventPayload() {}
 
 func init() {
 	RegisterPayload(SessionDemandClaimDivergence, SessionDemandClaimDivergencePayload{})
+	RegisterPayload(PoolSpawnBackoff, PoolSpawnBackoffPayload{})
 }
+
+// PoolSpawnBackoffPayload is the typed payload for pool.spawn_backoff. It
+// carries the breaker's state transition for one agent template so an
+// operator (or dashboard) can see spawn backoff engage and clear without
+// reading session directories off disk.
+type PoolSpawnBackoffPayload struct {
+	Template string `json:"template"`
+	// FromState and ToState are breaker states: "closed", "open", or
+	// "half-open".
+	FromState string `json:"from_state"`
+	ToState   string `json:"to_state"`
+	// ConsecutiveFailures is the failure count at the transition.
+	ConsecutiveFailures int `json:"consecutive_failures"`
+	// BackoffSeconds is the chosen open-state wait, zero when transitioning
+	// to closed or half-open.
+	BackoffSeconds float64 `json:"backoff_seconds"`
+}
+
+// IsEventPayload marks PoolSpawnBackoffPayload as an events.Payload variant.
+func (PoolSpawnBackoffPayload) IsEventPayload() {}
