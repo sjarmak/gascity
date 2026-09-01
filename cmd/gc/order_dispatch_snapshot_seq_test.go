@@ -255,14 +255,18 @@ func TestApplyOrderSetSnapshotLockedRejectsTornConfigScan(t *testing.T) {
 	oldCfg := &config.City{}
 	cr := &CityRuntime{stderr: io.Discard, cfg: oldCfg, orderDispatchConfigVersion: 1}
 
+	baselineApplyTime := time.Now()
 	first := orders.Order{Name: "first", Trigger: "cooldown", Interval: "1m", Exec: "true"}
 	firstSnapshot := orderSetSnapshot{Orders: []orders.Order{first}, Signature: "sig-first"}
-	if changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), firstSnapshot, 1, 1, time.Now()); !changed {
+	if changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), firstSnapshot, 1, 1, baselineApplyTime); !changed {
 		t.Fatalf("initial apply did not report a change: summary=%q", summary)
 	}
 	baselineDispatcher := cr.od
 	if cr.orderDispatchAppliedConfigVersion != 1 {
 		t.Fatalf("orderDispatchAppliedConfigVersion after initial apply = %d, want 1", cr.orderDispatchAppliedConfigVersion)
+	}
+	if cr.orderSetAppliedSeq != 1 {
+		t.Fatalf("orderSetAppliedSeq after initial apply = %d, want 1", cr.orderSetAppliedSeq)
 	}
 
 	// A concurrent reload installs a newer cfg and bumps the version AFTER
@@ -275,10 +279,14 @@ func TestApplyOrderSetSnapshotLockedRejectsTornConfigScan(t *testing.T) {
 	// The stale-generation scan carries an order set that was built under the
 	// OLD cfg (e.g. one the new config would have disabled via an override,
 	// but the stale scan never saw that) plus its own captured
-	// scanCfgVersion (1) — no longer matching the live version (2).
+	// scanCfgVersion (1) — no longer matching the live version (2). Its seq
+	// (2) is fresher than the baseline's, exactly as it would be if this scan
+	// was allocated its sequence number AFTER a legitimate, still-in-flight
+	// v2 scan.
 	torn := orders.Order{Name: "torn", Trigger: "cooldown", Interval: "1m", Exec: "true"}
 	tornSnapshot := orderSetSnapshot{Orders: []orders.Order{torn}, Signature: "sig-torn"}
-	changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), tornSnapshot, 2, 1, time.Now())
+	rejectApplyTime := baselineApplyTime.Add(time.Minute)
+	changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), tornSnapshot, 2, 1, rejectApplyTime)
 	if changed {
 		t.Fatalf("torn scan (scanCfgVersion=1, live=2) was applied instead of rejected: summary=%q", summary)
 	}
@@ -296,6 +304,82 @@ func TestApplyOrderSetSnapshotLockedRejectsTornConfigScan(t *testing.T) {
 	}
 	if cr.od != baselineDispatcher {
 		t.Fatal("cr.od was replaced by a rejected torn scan")
+	}
+	// A rejected scan's own seq (2, fresher than the baseline's 1) must NOT
+	// advance orderSetAppliedSeq, and its `now` (a minute after the baseline)
+	// must not advance orderRescanLast: a subsequent legitimate v2 scan may
+	// have been allocated an EARLIER seq (it started scanning before this
+	// rejected one finished) and must not be discarded as stale against a
+	// watermark this rejected scan had no business raising (#2604/#3368
+	// review followup, seventh pass).
+	if cr.orderSetAppliedSeq != 1 {
+		t.Fatalf("orderSetAppliedSeq = %d after a rejected torn scan, want unchanged 1 (a rejected scan must not raise the seq watermark)", cr.orderSetAppliedSeq)
+	}
+	if cr.orderRescanLast != baselineApplyTime {
+		t.Fatalf("orderRescanLast = %v after a rejected torn scan, want unchanged %v", cr.orderRescanLast, baselineApplyTime)
+	}
+}
+
+// TestApplyOrderSetSnapshotLockedTornScanDoesNotBlockLegitimateRebuild pins
+// the #2604/#3368 review's seventh-pass MAJOR finding directly: an earlier
+// version of the scanCfgVersion guard advanced orderSetAppliedSeq and
+// orderRescanLast BEFORE checking the version match, so a rejected
+// stale-config scan with a fresher seq than a still-in-flight LEGITIMATE scan
+// could raise the seq watermark high enough to make that legitimate scan's
+// own (earlier-allocated, therefore lower) seq look stale by comparison —
+// silently discarding the only correct rebuild while the old, wrong-generation
+// dispatcher kept running. This reproduces exactly that interleaving: the
+// higher-seq torn scan is rejected first, then a lower-seq legitimate scan
+// (matching the live config version) must still be accepted.
+func TestApplyOrderSetSnapshotLockedTornScanDoesNotBlockLegitimateRebuild(t *testing.T) {
+	oldCfg := &config.City{}
+	cr := &CityRuntime{stderr: io.Discard, cfg: oldCfg, orderDispatchConfigVersion: 1}
+
+	baseline := orders.Order{Name: "baseline", Trigger: "cooldown", Interval: "1m", Exec: "true"}
+	baselineSnapshot := orderSetSnapshot{Orders: []orders.Order{baseline}, Signature: "sig-baseline"}
+	if changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), baselineSnapshot, 1, 1, time.Now()); !changed {
+		t.Fatalf("baseline apply did not report a change: summary=%q", summary)
+	}
+
+	// A concurrent reload installs v2. A legitimate reload-triggered scan
+	// allocates seq 2 under v2 and starts scanning (modeled here only by its
+	// seq/scanCfgVersion; its own applyOrderSetSnapshotLocked call arrives
+	// LATER, below). Meanwhile the lane's own scan — still carrying the OLD
+	// v1 it captured before the reload — finishes first and is allocated the
+	// LATER seq 3 (it started after the reload's scan, so it acquired its
+	// sequence number after it).
+	cr.cfg = &config.City{}
+	cr.orderDispatchConfigVersion = 2
+
+	torn := orders.Order{Name: "torn", Trigger: "cooldown", Interval: "1m", Exec: "true"}
+	tornSnapshot := orderSetSnapshot{Orders: []orders.Order{torn}, Signature: "sig-torn"}
+	if changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), tornSnapshot, 3, 1, time.Now()); changed {
+		t.Fatalf("torn scan (seq 3, scanCfgVersion=1, live=2) was applied instead of rejected: summary=%q", summary)
+	} else if summary != "stale-config-scan" {
+		t.Fatalf("torn scan summary = %q, want %q", summary, "stale-config-scan")
+	}
+	if cr.orderSetAppliedSeq != 1 {
+		t.Fatalf("orderSetAppliedSeq = %d after the rejected higher-seq torn scan, want unchanged 1", cr.orderSetAppliedSeq)
+	}
+
+	// The legitimate v2 scan now arrives with its own (lower, earlier-allocated)
+	// seq 2 and the matching live scanCfgVersion (2). If the torn scan above had
+	// incorrectly raised orderSetAppliedSeq to 3, this would be wrongly rejected
+	// as "stale-scan" (2 <= 3) and the v2 rebuild would be lost.
+	valid := orders.Order{Name: "valid", Trigger: "cooldown", Interval: "1m", Exec: "true"}
+	validSnapshot := orderSetSnapshot{Orders: []orders.Order{valid}, Signature: "sig-valid"}
+	changed, summary := cr.applyOrderSetSnapshotLocked(context.Background(), t.TempDir(), validSnapshot, 2, 2, time.Now())
+	if !changed {
+		t.Fatalf("legitimate v2 scan (seq 2) did not apply: summary=%q", summary)
+	}
+	if cr.orderSetSignature != "sig-valid" {
+		t.Fatalf("orderSetSignature = %q after the legitimate v2 scan, want %q", cr.orderSetSignature, "sig-valid")
+	}
+	if cr.orderDispatchAppliedConfigVersion != 2 {
+		t.Fatalf("orderDispatchAppliedConfigVersion = %d after the legitimate v2 scan, want 2", cr.orderDispatchAppliedConfigVersion)
+	}
+	if cr.orderSetAppliedSeq != 2 {
+		t.Fatalf("orderSetAppliedSeq = %d after the legitimate v2 scan, want 2", cr.orderSetAppliedSeq)
 	}
 }
 

@@ -1903,17 +1903,21 @@ func (cr *CityRuntime) rescanOrderDispatcherForReload(ctx context.Context, cityR
 // new-generation cfg — a torn snapshot that can, for example, leave an order
 // the new cfg disabled still enabled because the stale scan never saw the
 // override. Rather than risk that mix, a version mismatch here is rejected
-// outright: orderSet/orderSetSignature/orderDispatchAppliedConfigVersion are
-// all left untouched, and the next scan (which will observe the newer
-// version and scan under it) converges correctly (#2604/#3368 review
-// followup, sixth pass).
+// outright, and BEFORE orderRescanLast/orderSetAppliedSeq are touched: a
+// rejected scan must leave the seq watermark exactly where it was, or a
+// separate, legitimate scan already in flight with a lower (earlier-allocated)
+// seq but the correct matching config version would arrive afterward, see
+// its seq at or below what the rejected scan advanced orderSetAppliedSeq to,
+// and be wrongly discarded as stale itself — silently dropping the only
+// correct rebuild while the old, torn-generation dispatcher keeps running
+// (#2604/#3368 review followup, seventh pass). orderSet/orderSetSignature/
+// orderDispatchAppliedConfigVersion/orderRescanLast/orderSetAppliedSeq are
+// therefore all left untouched on rejection, and the next scan (which will
+// observe the newer version and scan under it) converges correctly
+// (#2604/#3368 review followup, sixth pass).
 func (cr *CityRuntime) applyOrderSetSnapshotLocked(ctx context.Context, cityRoot string, snapshot orderSetSnapshot, seq uint64, scanCfgVersion uint64, now time.Time) (bool, string) {
 	if seq != 0 && seq <= cr.orderSetAppliedSeq {
 		return false, "stale-scan"
-	}
-	cr.orderRescanLast = now
-	if seq != 0 {
-		cr.orderSetAppliedSeq = seq
 	}
 	cr.serviceStateMu.RLock()
 	cfg := cr.cfg
@@ -1921,6 +1925,10 @@ func (cr *CityRuntime) applyOrderSetSnapshotLocked(ctx context.Context, cityRoot
 	cr.serviceStateMu.RUnlock()
 	if cfgVersion != scanCfgVersion {
 		return false, "stale-config-scan"
+	}
+	cr.orderRescanLast = now
+	if seq != 0 {
+		cr.orderSetAppliedSeq = seq
 	}
 	needsConfigRebuild := cfgVersion > cr.orderDispatchAppliedConfigVersion
 	if snapshot.Signature == cr.orderSetSignature && !needsConfigRebuild {
