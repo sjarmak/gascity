@@ -342,6 +342,7 @@ gc beads
 | [gc beads health](#gc-beads-health) | Check beads provider health |
 | [gc beads list](#gc-beads-list) | List beads (API-routed with bd fallback) |
 | [gc beads metadata-cas](#gc-beads-metadata-cas) | Atomically compare and set one metadata key in an exact local store |
+| [gc beads metadata-guarded-clear](#gc-beads-metadata-guarded-clear) | Clear a set of metadata keys gated on a guard key, in an exact local store |
 | [gc beads show](#gc-beads-show) | Show a single bead (API-routed with bd fallback) |
 
 ## gc beads city
@@ -485,6 +486,57 @@ gc beads metadata-cas tr-123 \
 | `--json` | bool |  | emit the canonical JSON result |
 | `--key` | string |  | metadata key to compare and set |
 | `--next` | string |  | replacement value (explicit empty is allowed) |
+| `--store-ref` | string |  | exact local store: city:&lt;name&gt; or rig:&lt;name&gt; |
+
+## gc beads metadata-guarded-clear
+
+Clear a set of metadata keys in one exact local bead store, gated on a
+guard key matching an expected value.
+
+The store must be selected explicitly with --store-ref=city:&lt;name&gt; or
+--store-ref=rig:&lt;name&gt;. This command never scans other stores, follows a
+cross-store fallback, or operates on a remote city.
+
+Before every individual key write, the guard key is re-checked with a
+single-key compare-and-set against --guard-expected. If the guard no longer
+matches — because a fresh attempt re-provisioned the bead — the command stops
+and reports outcome=skipped without partially applying remaining writes; keys
+already cleared before the mismatch was observed stay cleared, which is safe
+because the operation is idempotent. This narrows, but does not eliminate,
+the race window: true multi-key atomicity needs a revision fence the beads
+v1.1.0 schema does not have (upstream beads#4697). A conflict on a --clear-key
+or --set-metadata key itself (as opposed to the guard) is a genuine write
+race and is reported as a hard, non-zero-exit failure.
+
+Use --json for the canonical machine-output contract. --format=json remains
+accepted for compatibility. Combining --json with an explicit --format=text is
+a usage error.
+
+```
+gc beads metadata-guarded-clear <bead-id> [flags]
+```
+
+**Example:**
+
+```
+gc beads metadata-guarded-clear wt-123 \
+  --store-ref=rig:tributary \
+  --guard-key=gc.worktree_attempt_id \
+  --guard-expected=att-9f2 \
+  --clear-key=gc.work_dir \
+  --clear-key=gc.work_branch \
+  --set-metadata="gc.worktree_disposition=removed" \
+  --json
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--clear-key` | stringArray |  | metadata key to clear (repeatable) |
+| `--format` | string | `text` | output format: text or json |
+| `--guard-expected` | string |  | expected current value of --guard-key (explicit empty is allowed) |
+| `--guard-key` | string |  | metadata key that must match --guard-expected before any write |
+| `--json` | bool |  | emit the canonical JSON result |
+| `--set-metadata` | stringArray |  | key=value metadata pair to set after clearing (repeatable) |
 | `--store-ref` | string |  | exact local store: city:&lt;name&gt; or rig:&lt;name&gt; |
 
 ## gc beads show

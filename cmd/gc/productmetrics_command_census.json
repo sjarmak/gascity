@@ -319,6 +319,23 @@
       "id": 202
     },
     {
+      "path": "gc beads metadata-guarded-clear",
+      "aliases": [],
+      "conditional_modes": [
+        "beads-machine-output"
+      ],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "beads-metadata-guarded-clear",
+      "owner": "immediate",
+      "id": 206
+    },
+    {
       "path": "gc beads show",
       "aliases": [],
       "conditional_modes": [
