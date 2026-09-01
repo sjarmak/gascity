@@ -238,8 +238,18 @@ func checkNoMoleculeChildren(q BeadQuerier, beadID string, store beads.Store, re
 // formula attach racing a direct claim on the same target: without it, a
 // claimed-but-not-yet-attached bead can still admit a duplicate dispatch
 // (gastownhall/gascity#e8lim). Call it only after the caller has already
-// confirmed no molecule/wisp/workflow attachment exists, so it never shadows
-// those more specific conflicts.
+// confirmed no *live* molecule/wisp/workflow attachment exists, so it never
+// shadows those more specific conflicts.
+//
+// A bead whose only attachment history is closed can still carry a stale
+// Assignee left over from that finished formula run (gc sling's claim and
+// molecule-attach paths update Assignee independently of any attachment
+// cleanup). That residue is not a live direct claim, and treating it as one
+// would fence out a legitimate fresh attach onto a bead whose prior work is
+// done (TestOnFormulaSkipsClosedMolecule). So this only reports a conflict
+// when the assignee is unexplained by any closed attachment: no attachment
+// at all, or an attachment that is not yet closed (e.g. one still
+// materializing on the same beadID under the re-check this function backs).
 func CheckTargetNotDirectlyClaimed(q BeadQuerier, beadID string, store beads.Store) error {
 	parent, ok := BeadFromGetters(beadID, q, store)
 	if !ok {
@@ -249,7 +259,48 @@ func CheckTargetNotDirectlyClaimed(q BeadQuerier, beadID string, store beads.Sto
 	if assignee == "" {
 		return nil
 	}
+	var childQuerier BeadChildQuerier
+	if cq, ok := q.(BeadChildQuerier); ok {
+		childQuerier = cq
+	} else if cq, ok := any(store).(BeadChildQuerier); ok {
+		childQuerier = cq
+	}
+	if hasClosedAttachment(parent, store, childQuerier) {
+		return nil
+	}
 	return &MoleculeAttachedError{BeadID: beadID, Label: "claim", AttachmentID: assignee}
+}
+
+// hasClosedAttachment reports whether parent has ever had a molecule or
+// workflow attached that has since closed. CollectAttachedBeads cannot answer
+// this: its child-list query omits closed beads by default (matching
+// checkNoMoleculeChildren's live-conflict use case), so a closed attachment
+// is only visible here via a dedicated IncludeClosed query.
+func hasClosedAttachment(parent beads.Bead, store beads.Store, childQuerier BeadChildQuerier) bool {
+	closed := func(id string) bool {
+		id = strings.TrimSpace(id)
+		if id == "" || store == nil {
+			return false
+		}
+		attached, err := store.Get(id)
+		return err == nil && attached.Status == "closed"
+	}
+	if closed(parent.Metadata[beadmeta.MoleculeIDMetadataKey]) || closed(parent.Metadata["workflow_id"]) {
+		return true
+	}
+	if childQuerier == nil {
+		return false
+	}
+	children, err := childQuerier.List(beads.ListQuery{ParentID: parent.ID, IncludeClosed: true, Sort: beads.SortCreatedAsc})
+	if err != nil {
+		return false
+	}
+	for _, child := range children {
+		if IsAttachedRoot(child) && child.Status == "closed" {
+			return true
+		}
+	}
+	return false
 }
 
 // MoleculeAttachedError reports that a bead already has a live, non-workflow
