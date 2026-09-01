@@ -583,6 +583,25 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 			if err != nil {
 				return result, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
 			}
+			// Re-check the target's claim state immediately before the
+			// workflow actually starts, not only at the top of this
+			// function: the initial CheckTargetNotDirectlyClaimed can pass
+			// on an open target that is then claimed or closed directly
+			// while InstantiateSlingFormula and the snapshot above were
+			// materializing this ladder (gc-amope).
+			if err := CheckTargetNotDirectlyClaimed(querier, beadID, deps.Store); err != nil {
+				var molErr *MoleculeAttachedError
+				isMolErr := errors.As(err, &molErr)
+				if rollbackErr := rollbackGraphV2ReplacementLaunch(deps.graphStore(), mResult.RootID, replacedSnapshot); rollbackErr != nil {
+					return result, errors.Join(err, rollbackErr)
+				}
+				if fallbackToPlainOnMoleculeConflict && isMolErr {
+					result.BeadWarnings = append(result.BeadWarnings, fmt.Sprintf("skipped attaching %s %q on %s: %v; routed as a plain bead instead", errLabel, formulaName, beadID, molErr))
+					fellBackToPlainRoute = true
+					return finalize(opts, deps, beadID, "bead", result)
+				}
+				return result, fmt.Errorf("%w", err)
+			}
 			wfResult, wfErr := doStartGraphWorkflow(mResult.RootID, "", a, method, deps)
 			wfResult.FormulaName = formulaName
 			if wfErr != nil {
@@ -657,6 +676,24 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 		}
 		wispRootID := mResult.RootID
 		if mResult.GraphWorkflow || IsGraphWorkflowAttachment(deps.Store, wispRootID) {
+			// Re-check immediately before the workflow starts: the target
+			// may have closed or been directly claimed while
+			// InstantiateSlingFormula was materializing this ladder
+			// (gc-amope).
+			if err := CheckTargetNotDirectlyClaimed(querier, beadID, deps.Store); err != nil {
+				var molErr *MoleculeAttachedError
+				if fallbackToPlainOnMoleculeConflict && errors.As(err, &molErr) {
+					if _, closeErr := sourceworkflow.CloseWorkflowSubtree(deps.graphStore(), wispRootID); closeErr != nil {
+						return result, fmt.Errorf("%w", errors.Join(err, closeErr))
+					}
+					result.BeadWarnings = append(result.BeadWarnings, fmt.Sprintf("skipped attaching %s %q on %s: %v; routed as a plain bead instead", errLabel, formulaName, beadID, molErr))
+					return finalize(opts, deps, beadID, "bead", result)
+				}
+				if _, closeErr := sourceworkflow.CloseWorkflowSubtree(deps.graphStore(), wispRootID); closeErr != nil {
+					return result, fmt.Errorf("%w", errors.Join(err, closeErr))
+				}
+				return result, fmt.Errorf("%w", err)
+			}
 			wfResult, wfErr := doStartGraphWorkflow(mResult.RootID, beadID, a, method, deps)
 			wfResult.FormulaName = formulaName
 			return wfResult, wfErr
@@ -1091,6 +1128,17 @@ func pendingGraphWorkflowLaunch(rootID, sourceBeadID string, a config.Agent, met
 		workflowID: rootID,
 		storeRef:   strings.TrimSpace(deps.StoreRef),
 		finalize: func() (SlingResult, error) {
+			// Re-check immediately before the workflow starts, under the
+			// held source-workflow lock: the target may have closed or
+			// been directly claimed while the caller's instantiate step
+			// materialized this ladder (gc-amope). withSourceWorkflowLaunchLock
+			// runs its own rollback (superseded-workflow restore, source
+			// bead workflow_id restore) when finalize returns an error.
+			if sourceBeadID != "" {
+				if err := CheckTargetNotDirectlyClaimed(deps.Store, sourceBeadID, deps.Store); err != nil {
+					return SlingResult{}, fmt.Errorf("%w", err)
+				}
+			}
 			result, err := doStartGraphWorkflow(rootID, sourceBeadID, a, method, deps)
 			result.FormulaName = formulaName
 			return result, err

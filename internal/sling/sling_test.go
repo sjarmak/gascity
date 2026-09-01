@@ -2776,6 +2776,93 @@ func TestSlingAttachGraphFormulaRejectsDirectlyClaimedTarget(t *testing.T) {
 	}
 }
 
+// claimDuringMaterializationStore simulates a direct claim landing on the
+// sling target after the initial admission check has already passed it as
+// open, but while the formula is still materializing (InstantiateSlingFormula
+// creating the molecule/workflow beads). It claims the target on the first
+// Create call after admission, modeling the gc-amope race window.
+type claimDuringMaterializationStore struct {
+	beads.Store
+	targetID string
+	claimant string
+	// skipCreates is the number of Create calls (the synthetic input convoy,
+	// which prepareGraphV2FormulaInvocation mints before the admission check
+	// runs) to let through before landing the race claim on the next one.
+	skipCreates int
+	claimed     bool
+}
+
+func (s *claimDuringMaterializationStore) Create(b beads.Bead) (beads.Bead, error) {
+	if !s.claimed {
+		if s.skipCreates > 0 {
+			s.skipCreates--
+		} else {
+			s.claimed = true
+			assignee := s.claimant
+			if err := s.Update(s.targetID, beads.UpdateOpts{Assignee: &assignee}); err != nil {
+				return beads.Bead{}, err
+			}
+		}
+	}
+	return s.Store.Create(b)
+}
+
+// TestSlingAttachGraphFormulaRejectsTargetClaimedDuringMaterialization is the
+// gc-amope follow-up to gc-e8lim's admission fence: a target that is open at
+// the initial CheckTargetNotDirectlyClaimed but is claimed directly by
+// another session while the graph.v2 ladder is still materializing must not
+// admit the ladder either. The fix re-checks immediately before the workflow
+// actually starts.
+func TestSlingAttachGraphFormulaRejectsTargetClaimedDuringMaterialization(t *testing.T) {
+	formulaDir := t.TempDir()
+	writeGraphV2ConvoyFormula(t, formulaDir)
+	cfg := graphV2SlingTestConfig(t, formulaDir)
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	source, err := deps.Store.Create(beads.Bead{Title: "work", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raceStore := &claimDuringMaterializationStore{Store: deps.Store, targetID: source.ID, claimant: "racing-session", skipCreates: 1}
+	deps.Store = raceStore
+
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	if _, err := s.AttachFormula(context.Background(), "graph-work", source.ID, a, FormulaOpts{}); err == nil {
+		t.Fatal("AttachFormula on a target claimed during materialization: want error, got nil")
+	} else if !strings.Contains(err.Error(), "racing-session") {
+		t.Fatalf("AttachFormula error = %v, want it to name the claiming session", err)
+	}
+
+	got, err := raceStore.Get(source.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", source.ID, err)
+	}
+	if got.Assignee != "racing-session" {
+		t.Fatalf("target assignee = %q, want the race to have kept its claim (racing-session)", got.Assignee)
+	}
+
+	convoys, err := raceStore.List(beads.ListQuery{Type: "convoy", IncludeClosed: true})
+	if err != nil {
+		t.Fatalf("List(convoy): %v", err)
+	}
+	for _, c := range convoys {
+		if c.Status != "closed" {
+			t.Errorf("convoy %s status = %q, want closed (refused dispatch must not leak an open input convoy)", c.ID, c.Status)
+		}
+	}
+
+	workflows, err := raceStore.List(beads.ListQuery{Type: "workflow", IncludeClosed: false})
+	if err != nil {
+		t.Fatalf("List(workflow): %v", err)
+	}
+	for _, w := range workflows {
+		t.Errorf("workflow %s left open: the race-admitted ladder must be rolled back, not left live", w.ID)
+	}
+}
+
 func TestSlingAttachGraphFormulaAllowsDifferentLiveBareBeadRoots(t *testing.T) {
 	formulaDir := t.TempDir()
 	writeNamedGraphV2ConvoyFormula(t, formulaDir, "graph-a")
