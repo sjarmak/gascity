@@ -26,7 +26,7 @@ func TestFilterReadyByRouteExcludesDispatchHoldLabels(t *testing.T) {
 		{ID: "ga-held-external", CreatedAt: older, Metadata: map[string]string{beadmeta.RunTargetMetadataKey: "core/control-dispatcher"}, Labels: []string{beadmeta.HoldExternalLabel}},
 		{ID: "ga-held-both", CreatedAt: older, Metadata: map[string]string{beadmeta.RunTargetMetadataKey: "core/control-dispatcher"}, Labels: []string{beadmeta.HoldMayorLabel, beadmeta.HoldExternalLabel}},
 	}
-	got := filterReadyByRoute(ready, beadmeta.RunTargetMetadataKey, "core/control-dispatcher")
+	got := filterReadyByRoute(ready, beadmeta.RunTargetMetadataKey, "core/control-dispatcher", nil)
 	want := []string{"ga-plain"}
 	if !stringSlicesEqual(beadIDs(got), want) {
 		t.Fatalf("filterReadyByRoute ids = %v, want %v (hold-labeled beads must be excluded, including a bead carrying both hold labels at once)", beadIDs(got), want)
@@ -59,7 +59,7 @@ func TestEvaluateControlReadyExcludesDispatchHoldLabels(t *testing.T) {
 		{ID: "ga-routed-held", Metadata: map[string]string{beadmeta.RunTargetMetadataKey: "gascity/control-dispatcher"}, Labels: []string{beadmeta.HoldMayorLabel}},
 		{ID: "ga-routed-held-both", Metadata: map[string]string{beadmeta.RunTargetMetadataKey: "gascity/control-dispatcher"}, Labels: []string{beadmeta.HoldMayorLabel, beadmeta.HoldExternalLabel}},
 	}
-	got := evaluateControlReady(ready, parsed, envList)
+	got := evaluateControlReady(ready, parsed, envList, nil)
 	want := []string{"ga-routed"}
 	if !stringSlicesEqual(beadIDs(got), want) {
 		t.Fatalf("evaluateControlReady ids = %v, want %v (hold-labeled routed bead must be excluded, including a bead carrying both hold labels at once)", beadIDs(got), want)

@@ -420,7 +420,11 @@ func legacyWorkflowTierServes(bead beads.Bead, opts readyOpts, metaWant []metada
 // first would miss every exclusion the hook applies afterwards, which is exactly
 // where the two use different comparisons (see demandRowServable).
 func workerIsServed(bead beads.Bead, opts readyOpts, metaWant []metadataFieldFilter) bool {
-	readerServed := filterReadyBeads([]beads.Bead{bead}, opts, metaWant)
+	// rootHeld is deliberately nil: this conformance test compares
+	// filterReadyBeads against the demand predicate (demandRowServable),
+	// which its own doc comment documents as not modeling root holds either
+	// -- see filterReadyBeads's doc comment.
+	readerServed := filterReadyBeads([]beads.Bead{bead}, opts, metaWant, nil)
 	if len(readerServed) != 1 {
 		return false
 	}

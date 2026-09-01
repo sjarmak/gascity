@@ -322,7 +322,7 @@ func readyBeadsForOpts(legs []readyLeg, opts readyOpts) ([]readyBead, error) {
 	if err != nil {
 		return nil, err
 	}
-	items = filterReadyBeads(items, opts, filters)
+	items = filterReadyBeads(items, opts, filters, rootHoldResolverOverStores(readyLegStores(legs)...))
 	order(items)
 	if opts.limit > 0 && len(items) > opts.limit {
 		items = items[:opts.limit]
@@ -453,7 +453,14 @@ func readyStatusSelector(status string) (string, error) {
 // are different backends with different filter semantics, and a predicate
 // evaluated once over the merged set gives one answer instead of one answer per
 // store.
-func filterReadyBeads(items []beads.Bead, opts readyOpts, metaWant []metadataFieldFilter) []beads.Bead {
+//
+// rootHeld additionally fences a candidate whose graph.v2 workflow root is
+// held even though the candidate carries no --exclude-label match of its own
+// (gc-6rae5) -- a nil resolver is a no-op, so a caller with no root-hold
+// information available (e.g. the demand/reader-agreement conformance suite,
+// which deliberately does not model root holds on either side of its
+// comparison) gets pre-gc-6rae5 behavior byte-for-byte.
+func filterReadyBeads(items []beads.Bead, opts readyOpts, metaWant []metadataFieldFilter, rootHeld rootHoldResolver) []beads.Bead {
 	assignee := strings.TrimSpace(opts.assignee)
 	exclude := make(map[string]bool, len(opts.excludeTypes))
 	for _, t := range opts.excludeTypes {
@@ -475,12 +482,27 @@ func filterReadyBeads(items []beads.Bead, opts readyOpts, metaWant []metadataFie
 		if beadCarriesExcludedLabel(b, opts.excludeLabels) {
 			continue
 		}
+		if beadRootIsHeld(b, rootHeld) {
+			continue
+		}
 		if !beadMatchesMetadata(b, metaWant) {
 			continue
 		}
 		out = append(out, b)
 	}
 	return out
+}
+
+// readyLegStores extracts each leg's store, for building a rootHoldResolver
+// that can resolve a workflow root id no matter which leg it resides in.
+func readyLegStores(legs []readyLeg) []beads.Store {
+	stores := make([]beads.Store, 0, len(legs))
+	for _, leg := range legs {
+		if leg.store != nil {
+			stores = append(stores, leg.store)
+		}
+	}
+	return stores
 }
 
 func beadCarriesExcludedLabel(b beads.Bead, excluded []string) bool {

@@ -80,7 +80,7 @@ esac
 	readyAfterRecovery := []beads.Bead{
 		{ID: "ga-held-work", Metadata: map[string]string{beadmeta.RunTargetMetadataKey: "gascity/builder"}, Labels: []string{beadmeta.HoldMayorLabel}},
 	}
-	served := filterReadyByRoute(readyAfterRecovery, beadmeta.RunTargetMetadataKey, "gascity/builder")
+	served := filterReadyByRoute(readyAfterRecovery, beadmeta.RunTargetMetadataKey, "gascity/builder", nil)
 	if len(served) != 0 {
 		t.Fatalf("filterReadyByRoute after on_death recovery = %v, want empty (a different agent's route-scoped hook must not be served a bead recovery just reopened while it is still held)", beadIDs(served))
 	}
@@ -117,7 +117,7 @@ esac
 	readyAfterRecovery := []beads.Bead{
 		{ID: "ga-held-boot", Metadata: map[string]string{beadmeta.RoutedToMetadataKey: "gascity/builder"}, Labels: []string{beadmeta.HoldExternalLabel}},
 	}
-	served := filterReadyByRoute(readyAfterRecovery, beadmeta.RoutedToMetadataKey, "gascity/builder")
+	served := filterReadyByRoute(readyAfterRecovery, beadmeta.RoutedToMetadataKey, "gascity/builder", nil)
 	if len(served) != 0 {
 		t.Fatalf("filterReadyByRoute after on_boot recovery = %v, want empty (a different agent's route-scoped hook must not be served a bead reboot recovery just reopened while it is still held)", beadIDs(served))
 	}

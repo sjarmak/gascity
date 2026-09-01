@@ -483,6 +483,7 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 	return doHook(workQuery, workDir, false, runner, stdout, stderr, hookVisibility{
 		Identities:   identityCandidates,
 		RouteTargets: routeTargets,
+		RootHeld:     newRootHoldResolver(hookRootBeadGetter(stores, queryEnv)),
 	})
 }
 
@@ -963,6 +964,12 @@ func workQueryEnvForDir(env []string, dir string) []string {
 type hookVisibility struct {
 	Identities   []string
 	RouteTargets []string
+	// RootHeld resolves whether a candidate's graph.v2 workflow root
+	// (gc.root_bead_id) is currently held, fencing every executable
+	// descendant of a held root the same way isHeldHookCandidate fences a
+	// directly-held bead (gc-6rae5). Nil disables the check, matching every
+	// other zero-value field on this struct.
+	RootHeld rootHoldResolver
 }
 
 // doHook is the pure logic for gc hook. Runs the work query and outputs
@@ -986,6 +993,7 @@ func doHook(workQuery, dir string, inject bool, runner WorkQueryRunner, stdout, 
 	trimmed := strings.TrimSpace(output)
 	normalized := normalizeWorkQueryOutput(trimmed)
 	normalized = filterUnreadyHookCandidates(normalized, time.Now())
+	normalized = filterRootHeldHookCandidates(normalized, visibility.RootHeld)
 	normalized = filterForeignHookCandidates(normalized, visibility)
 	hasWork := workQueryHasReadyWork(normalized)
 

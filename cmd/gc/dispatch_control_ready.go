@@ -206,7 +206,12 @@ func filterReadyByAssignee(ready []beads.Bead, assignee string, limit int) []bea
 // routing), so held beads must be excluded (ga-5736js): filterReadyByAssignee
 // (Tier 1/2, assignee-scoped) stays hold-transparent by design and must not
 // gain this filter.
-func filterReadyByRoute(ready []beads.Bead, metadataKey, route string) []beads.Bead {
+//
+// rootHeld additionally fences a candidate whose graph.v2 workflow root is
+// held even though the candidate carries no hold label of its own (gc-6rae5)
+// -- a nil resolver is a no-op, so a caller with no root-hold information
+// available gets pre-gc-6rae5 behavior byte-for-byte.
+func filterReadyByRoute(ready []beads.Bead, metadataKey, route string, rootHeld rootHoldResolver) []beads.Bead {
 	var matched []beads.Bead
 	for _, b := range ready {
 		if b.Assignee != "" || b.Type == controlReadyExcludeType {
@@ -222,7 +227,7 @@ func filterReadyByRoute(ready []beads.Bead, metadataKey, route string) []beads.B
 				break
 			}
 		}
-		if held {
+		if held || beadRootIsHeld(b, rootHeld) {
 			continue
 		}
 		matched = append(matched, b)
@@ -264,14 +269,18 @@ func mergeControlReadyGroups(groups ...[]beads.Bead) []beads.Bead {
 // fallback), applying the exact candidate precedence, legacy/bare route
 // aliasing, and instantiating-metadata dedup that
 // workflowServeControlReadyQueryForBeads encodes as shell.
-func evaluateControlReady(ready []beads.Bead, parsed parsedControlReadyQuery, envList []string) []beads.Bead {
+//
+// rootHeld is passed through to filterReadyByRoute's Tier 3 route groups
+// only -- filterReadyByAssignee's Tier 1/2 candidate groups stay
+// hold-transparent by design (gc-6rae5 does not change that).
+func evaluateControlReady(ready []beads.Bead, parsed parsedControlReadyQuery, envList []string, rootHeld rootHoldResolver) []beads.Bead {
 	var groups [][]beads.Bead
 	for _, cand := range controlReadyCandidates(parsed, envList) {
 		groups = append(groups, filterReadyByAssignee(ready, cand, workflowServeScanLimit))
 	}
 	for _, route := range controlReadyRoutes(parsed) {
-		groups = append(groups, filterReadyByRoute(ready, beadmeta.RunTargetMetadataKey, route))
-		groups = append(groups, filterReadyByRoute(ready, beadmeta.RoutedToMetadataKey, route))
+		groups = append(groups, filterReadyByRoute(ready, beadmeta.RunTargetMetadataKey, route, rootHeld))
+		groups = append(groups, filterReadyByRoute(ready, beadmeta.RoutedToMetadataKey, route, rootHeld))
 	}
 	return mergeControlReadyGroups(groups...)
 }
@@ -545,7 +554,12 @@ func tryControlReadyFromCacheOrFallback(workQuery, dir string, env map[string]st
 	if !parsed.includeEphemeral {
 		if caches := controlReadyCachesFor(dir, cityPath, cfg); len(caches) > 0 {
 			if ready, ok := cachedControlReadyUnion(caches); ok {
-				return beadsToHookBeads(evaluateControlReady(ready, parsed, envList)), true, nil
+				stores := make([]beads.Store, len(caches))
+				for i, cache := range caches {
+					stores[i] = cache
+				}
+				rootHeld := rootHoldResolverOverStores(stores...)
+				return beadsToHookBeads(evaluateControlReady(ready, parsed, envList, rootHeld)), true, nil
 			}
 		}
 	}
@@ -554,5 +568,18 @@ func tryControlReadyFromCacheOrFallback(workQuery, dir string, env map[string]st
 	if err != nil {
 		return nil, true, err
 	}
-	return beadsToHookBeads(evaluateControlReady(ready, parsed, envList)), true, nil
+	// Reuses controlReadyCacheSources' routing rule to source root-hold
+	// legs matching whichever ledger(s) controlReadyFallbackReady just read
+	// (see controlReadyFallbackReady's doc comment on why the queue and the
+	// root-hold answer must come from the same store). Building these legs
+	// is in-memory wiring, not I/O -- openControlStoreAtForCity constructs a
+	// store handle lazily, the same shape controlReadyCachesFor already
+	// calls on every miss, so a second call here does not duplicate a bd
+	// process or connection. A resolution error fails open (nil resolver),
+	// matching every other seam in this filter chain.
+	var rootHeld rootHoldResolver
+	if sources, srcErr := controlReadyCacheSources(dir, cityPath, cfg); srcErr == nil {
+		rootHeld = rootHoldResolverOverStores(sources...)
+	}
+	return beadsToHookBeads(evaluateControlReady(ready, parsed, envList, rootHeld)), true, nil
 }

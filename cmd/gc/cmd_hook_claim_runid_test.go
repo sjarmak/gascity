@@ -65,16 +65,26 @@ func claimOpsForRunMap(beadID string, claimedMeta map[string]string, spy *publis
 // TestDoHookClaimPublishesRunMapWithoutSessionBeadMutation pins the v1.3.5
 // safety boundary. If session-1 disappears after the claim, a fuzzy bd update
 // can otherwise resolve session-10 and corrupt it. Run-map publication retains
-// correlation without issuing any post-claim bd mutation.
+// correlation without issuing any post-claim bd MUTATION.
+//
+// This bead's gc.root_bead_id ("root-safe") makes it a graph.v2-shaped
+// candidate, so the gc-6rae5 post-claim root-hold recheck also fires here and
+// issues its own `bd show root-safe` read — that is expected and is not the
+// hazard this test pins. Only mutation ("update") calls are counted; a
+// same-exact-ID read cannot hit the fuzzy-prefix collision this test guards
+// against.
 func TestDoHookClaimPublishesRunMapWithoutSessionBeadMutation(t *testing.T) {
 	originalRunner := hookClaimCommandRunnerWithEnvContext
 	t.Cleanup(func() { hookClaimCommandRunnerWithEnvContext = originalRunner })
-	var bdCalls int
+	var mutationCalls int
 	collisionMetadata := map[string]string{"sentinel": "unchanged"}
 	hookClaimCommandRunnerWithEnvContext = func(context.Context, map[string]string) beads.CommandRunner {
 		return func(_ string, _ string, args ...string) ([]byte, error) {
-			bdCalls++
-			if len(args) >= 3 && args[0] == "update" && args[2] == "session-1" {
+			if len(args) == 0 || args[0] != "update" {
+				return nil, nil
+			}
+			mutationCalls++
+			if len(args) >= 3 && args[2] == "session-1" {
 				collisionMetadata["gc.current_run_id"] = "root-safe"
 			}
 			return nil, nil
@@ -91,8 +101,8 @@ func TestDoHookClaimPublishesRunMapWithoutSessionBeadMutation(t *testing.T) {
 	if code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr); code != 0 {
 		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
 	}
-	if bdCalls != 0 {
-		t.Fatalf("post-claim bd mutation calls = %d, want 0", bdCalls)
+	if mutationCalls != 0 {
+		t.Fatalf("post-claim bd mutation calls = %d, want 0", mutationCalls)
 	}
 	if !reflect.DeepEqual(collisionMetadata, map[string]string{"sentinel": "unchanged"}) {
 		t.Fatalf("prefix-colliding session metadata = %v, want sentinel only", collisionMetadata)

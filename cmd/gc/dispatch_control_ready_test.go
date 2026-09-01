@@ -140,7 +140,7 @@ func TestFilterReadyByRouteRequiresUnassignedAndSortsOldestFirst(t *testing.T) {
 		{ID: "ga-epic-routed", CreatedAt: older, Type: "epic", Metadata: map[string]string{beadmeta.RunTargetMetadataKey: "core/control-dispatcher"}},
 		{ID: "ga-other-route", CreatedAt: older, Metadata: map[string]string{beadmeta.RunTargetMetadataKey: "other"}},
 	}
-	got := filterReadyByRoute(ready, beadmeta.RunTargetMetadataKey, "core/control-dispatcher")
+	got := filterReadyByRoute(ready, beadmeta.RunTargetMetadataKey, "core/control-dispatcher", nil)
 	want := []string{"ga-older", "ga-newer"}
 	if !stringSlicesEqual(beadIDs(got), want) {
 		t.Fatalf("filterReadyByRoute = %#v, want %#v", beadIDs(got), want)
@@ -223,7 +223,7 @@ func TestEvaluateControlReadyMatchesShellQueryPriority(t *testing.T) {
 	// the run_target occurrence (checked first) must win.
 	ready = append(ready, beads.Bead{ID: "ga-route-dup", Metadata: map[string]string{beadmeta.RoutedToMetadataKey: "gascity/control-dispatcher", "source": "routed-to"}})
 
-	got := evaluateControlReady(ready, parsed, envList)
+	got := evaluateControlReady(ready, parsed, envList, nil)
 	wantIDs := []string{"ga-z-assigned", "ga-dup", "ga-a-routed", "ga-route-dup", "ga-route-dup-2"}
 	if !stringSlicesEqual(beadIDs(got), wantIDs) {
 		t.Fatalf("evaluateControlReady ids = %#v, want %#v", beadIDs(got), wantIDs)
@@ -252,7 +252,7 @@ func TestEvaluateControlReadyExcludesEpicAndInstantiating(t *testing.T) {
 		{ID: "ga-routed", Metadata: map[string]string{beadmeta.RunTargetMetadataKey: "gascity/control-dispatcher", "gc.kind": "scope-check"}},
 	}
 
-	got := evaluateControlReady(ready, parsed, envList)
+	got := evaluateControlReady(ready, parsed, envList, nil)
 	wantIDs := []string{"ga-ready", "ga-routed"}
 	if !stringSlicesEqual(beadIDs(got), wantIDs) {
 		t.Fatalf("evaluateControlReady ids = %#v, want %#v", beadIDs(got), wantIDs)

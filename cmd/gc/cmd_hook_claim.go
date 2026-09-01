@@ -39,6 +39,7 @@ const (
 const (
 	hookClaimReleaseReasonUndelivered = "result_undelivered"
 	hookClaimReleaseReasonStraddled   = "claim_window_straddled"
+	hookClaimReleaseReasonRootHeld    = "root_held"
 )
 
 var hookClaimMutationTimeout = 10 * time.Second
@@ -231,6 +232,15 @@ type hookClaimOps struct {
 	// not-found from ONE leg be checked against the others before it opens the
 	// escalation. See claim_class_route.go.
 	ClassRoute *hookClaimClassRoute
+	// RootHeld is a FACTORY, not a resolver: each call returns an
+	// independently-memoized rootHoldResolver bound to dir/env. tryHookClaim
+	// calls it once at selection time (filtering the whole candidate batch
+	// through one memoized resolver); writeHookClaimWorkResultForBead calls it
+	// again, fresh, for the post-claim recheck — deliberately NOT reusing the
+	// selection-time resolver's cache, because that recheck exists precisely to
+	// catch a hold that landed on the root AFTER selection (gc-6rae5 acceptance
+	// criterion 3).
+	RootHeld func(dir string, env []string) rootHoldResolver
 }
 
 type (
@@ -333,6 +343,7 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 
 	normalized := normalizeWorkQueryOutput(strings.TrimSpace(output))
 	normalized = filterUnreadyHookCandidates(normalized, now())
+	normalized = filterRootHeldHookCandidates(normalized, ops.RootHeld(dir, opts.Env))
 	if !workQueryHasReadyWork(normalized) {
 		return hookClaimResult{}
 	}
@@ -415,6 +426,13 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.Now == nil {
 		ops.Now = time.Now
+	}
+	if ops.RootHeld == nil {
+		ops.RootHeld = func(dir string, env []string) rootHoldResolver {
+			return newRootHoldResolver(func(id string) (beads.Bead, error) {
+				return hookClaimBdStore(dir, env, "").Get(id)
+			})
+		}
 	}
 	// Stamped once per invocation and never refreshed: every federated leg the
 	// claim loop tries shares the window the FIRST one opened, which is what
@@ -796,6 +814,23 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 		cause := fmt.Sprintf("claim of %s landed after the %s claim window closed (invocation age %s); releasing it rather than parking it",
 			bead.ID, ops.claimWindowOrDefault(), ops.invocationAge().Round(time.Millisecond))
 		return unwindUndeliveredHookClaim(hookClaimReleaseReasonStraddled, cause, bead, opts, ops, dir, stderr)
+	}
+	// F-D root-hold race. The candidate passed the selection-time root-hold
+	// filter in tryHookClaim, but the window between that read and this CAS
+	// landing is exactly where a mayor's `bd set-state <root> hold=mayor` can
+	// land (gc-6rae5 acceptance criterion 3). Re-check with a FRESH resolver —
+	// ops.RootHeld(dir, opts.Env) returns a newly-memoized instance every call,
+	// so this never reads the selection-time answer back — and give the claim
+	// back exactly like the straddle case above if the root is now held. Only a
+	// minted claim needs this: hookClaimExistingAssignment never reaches here
+	// without a fresh CAS, and its candidates already passed the same
+	// selection-time filter this invocation just ran.
+	if minted && ops.RootHeld != nil {
+		rootID := strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
+		if rootID != "" && rootID != bead.ID && ops.RootHeld(dir, opts.Env)(rootID) {
+			cause := fmt.Sprintf("claim of %s landed after its workflow root %s was held; releasing it rather than parking it", bead.ID, rootID)
+			return unwindUndeliveredHookClaim(hookClaimReleaseReasonRootHeld, cause, bead, opts, ops, dir, stderr)
+		}
 	}
 	result.RootBeadID = strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
 	result.ContinuationGroup = strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey])
