@@ -52,12 +52,12 @@ func TestBDVersionPins(t *testing.T) {
 	// source-built agent image must all use the same upstream commit. A drift
 	// here can pair one schema catalog with another version's write behavior.
 	goMod := readFile(t, root, "go.mod")
-	goModMatch := regexp.MustCompile(`(?m)^\s*github\.com/steveyegge/beads\s+v\S+-([0-9a-f]{12})\s*$`).FindStringSubmatch(goMod)
+	goModMatch := regexp.MustCompile(`(?m)^\s*github\.com/steveyegge/beads\s+(v\S+)\s*$`).FindStringSubmatch(goMod)
 	if goModMatch == nil {
-		t.Fatal("go.mod missing a pseudo-version pin for github.com/steveyegge/beads")
+		t.Fatal("go.mod missing an exact version pin for github.com/steveyegge/beads")
 	}
-	if got, want := goModMatch[1], bdCurrentRef[:12]; got != want {
-		t.Fatalf("go.mod beads pseudo-version commit = %q, want BD_CURRENT_REF prefix %q", got, want)
+	if got, want := goModMatch[1], bdCurrent; got != want {
+		t.Fatalf("go.mod beads version = %q, want BD_CURRENT_VERSION %q", got, want)
 	}
 	dockerfile := readFile(t, root, "contrib/k8s/Dockerfile.agent")
 	if !strings.Contains(dockerfile, "ARG BD_SOURCE_REF="+bdCurrentRef) {

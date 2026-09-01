@@ -609,10 +609,11 @@ test-bd-cli-contract:
 
 ## test-bd-conditional-release-contract: run the ReleaseIfCurrent CAS contract
 ## against the bd on PATH. Split from test-bd-cli-contract because it is the one
-## bd contract the installable default cannot run: deps.env BD_VERSION predates
-## `--if-assignee`/`--if-status`, so it belongs on the source-built
-## BD_CURRENT_REF cell. GC_REQUIRE_BD_CONDITIONAL_RELEASE=1 turns the row's
-## capability skip into a failure, so the cell cannot pass while proving nothing.
+## contract that requires `--if-assignee`/`--if-status`. The installable default
+## now has those flags, but the source-built BD_CURRENT_REF cell remains the
+## single required execution point so every ordinary compatibility job does not
+## repeat it. GC_REQUIRE_BD_CONDITIONAL_RELEASE=1 turns a capability skip into a
+## failure, so that cell cannot pass while proving nothing.
 ##
 ## The existence preflight closes the other way this cell can pass having proven
 ## nothing: a `-run` selector that matches no test is not an error to `go test`
