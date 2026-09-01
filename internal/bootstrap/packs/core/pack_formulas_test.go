@@ -252,39 +252,101 @@ func TestMolPolecatCommitResolvesRepoBeforeRemovingWorktree(t *testing.T) {
 	}
 }
 
-// TestMolScopedWorkResolvesRepoBeforeRemovingWorktree pins the same fix for
-// mol-scoped-work's cleanup step, which is worse than mol-polecat-commit's:
-// its `|| rm -rf` fallback makes the stranded git registration the designed
-// outcome of the bare form's failure path, not just an incidental risk.
-func TestMolScopedWorkResolvesRepoBeforeRemovingWorktree(t *testing.T) {
+// TestMolScopedWorkWorkspaceSetupPublishesWorktreeProvenance is the regression
+// test for gc-z9p6h: workspace-setup computed the creator, owner, generation,
+// attempt id, and store ref `gc worktree ensure` requires, but its closing
+// `bd update` never published gc.worktree_creator, gc.worktree_owner,
+// gc.worktree_generation, gc.worktree_attempt_id, or gc.root_store_ref onto
+// the source bead. cleanup-worktree then had no provenance to fence its
+// removal on, so it retained every mol-scoped-work workspace regardless of
+// whether the underlying attempt was actually theirs to remove.
+func TestMolScopedWorkWorkspaceSetupPublishesWorktreeProvenance(t *testing.T) {
+	step := formulaStep(t, readFormula(t, "mol-scoped-work.toml"), "workspace-setup")
+
+	if !strings.Contains(step, "gc worktree ensure") {
+		t.Fatal("workspace-setup must provision through `gc worktree ensure`, the transactional workspace owner")
+	}
+
+	requiredFlags := []string{"--creator", "--owner", "--generation", "--store-ref", "--bead", "--branch", "--base"}
+	for _, flag := range requiredFlags {
+		if !strings.Contains(step, flag) {
+			t.Errorf("workspace-setup's `gc worktree ensure` call is missing required flag %s", flag)
+		}
+	}
+
+	setMetadataAt := strings.Index(step, "gc bd update")
+	if setMetadataAt < 0 {
+		t.Fatal("workspace-setup must publish worktree provenance via `gc bd update`")
+	}
+	published := step[setMetadataAt:]
+
+	requiredKeys := []string{
+		"gc.worktree_creator",
+		"gc.worktree_owner",
+		"gc.worktree_generation",
+		"gc.worktree_attempt_id",
+		"gc.root_store_ref",
+	}
+	for _, key := range requiredKeys {
+		if !strings.Contains(published, "--set-metadata "+key+"=") {
+			t.Errorf("workspace-setup's closing bd update never publishes %s, so cleanup-worktree has no provenance to fence removal on", key)
+		}
+	}
+}
+
+// TestMolScopedWorkCleanupUsesWorktreeCleanupWithAttemptFencing pins the
+// cleanup-worktree half of the gc-z9p6h fix: teardown must route through
+// `gc worktree cleanup`, which refuses to remove a workspace whose recorded
+// attempt id does not match, and must retain (never force-delete) when the
+// provenance workspace-setup publishes is missing.
+func TestMolScopedWorkCleanupUsesWorktreeCleanupWithAttemptFencing(t *testing.T) {
 	step := formulaStep(t, readFormula(t, "mol-scoped-work.toml"), "cleanup-worktree")
 
 	if strings.Contains(step, `git worktree remove --force "$WORKTREE" || rm -rf "$WORKTREE"`) {
-		t.Error("cleanup-worktree calls bare `git worktree remove --force ... || rm -rf`; resolve the repo via --git-common-dir first and remove via `git -C \"$REPO\" worktree remove`")
+		t.Error("cleanup-worktree must not fall back to a bare `git worktree remove --force ... || rm -rf`; that destroys unpushed work unconditionally")
 	}
-	if !strings.Contains(step, "--git-common-dir") {
-		t.Error(`cleanup-worktree must resolve REPO via git -C "$WORKTREE" rev-parse --path-format=absolute --git-common-dir; cwd is not guaranteed inside the repo at this step`)
+	if !strings.Contains(step, "gc worktree cleanup") {
+		t.Fatal("cleanup-worktree must remove the workspace through `gc worktree cleanup`, the transactional teardown owner")
 	}
-	if !strings.Contains(step, `git -C "$REPO" worktree remove`) {
-		t.Error(`cleanup-worktree must remove the worktree via git -C "$REPO" worktree remove, not a bare invocation`)
-	}
-
-	// A stale directory that still passes [ -d ], or a git too old for
-	// --path-format, leaves REPO empty; `git -C ""` then resolves from a cwd
-	// this step explicitly does not guarantee is inside the repo.
-	if !strings.Contains(step, `[ -z "$REPO" ]`) {
-		t.Error(`cleanup-worktree must bail on an empty $REPO; git -C "" silently resolves from cwd, which this step cannot assume`)
+	if !strings.Contains(step, "--attempt-id") {
+		t.Error("cleanup-worktree must pass --attempt-id so cleanup is fenced to the exact provisioning attempt that created the workspace")
 	}
 
-	guardAt := strings.Index(step, `[ -f "$WORKTREE/.git" ]`)
-	if guardAt < 0 {
-		t.Fatal(`cleanup-worktree must guard the rm -rf fallback with [ -f "$WORKTREE/.git" ]; a linked worktree's .git is a file, a main checkout's is a directory`)
+	// Retain-on-missing-provenance: cleanup-worktree must check for the five
+	// published fields and refuse to call `gc worktree cleanup` (or delete
+	// anything itself) when any are absent.
+	requiredKeys := []string{
+		"gc.worktree_creator",
+		"gc.worktree_owner",
+		"gc.worktree_generation",
+		"gc.worktree_attempt_id",
+		"gc.root_store_ref",
 	}
-	if got := strings.Count(step, `rm -rf "$WORKTREE"`); got != 1 {
-		t.Fatalf(`cleanup-worktree must delete the worktree exactly once behind the guard; found %d occurrences of rm -rf "$WORKTREE"`, got)
+	for _, key := range requiredKeys {
+		if !strings.Contains(step, key) {
+			t.Errorf("cleanup-worktree must read %s from the bead before attempting removal", key)
+		}
 	}
-	removeAt := strings.Index(step, `rm -rf "$WORKTREE"`)
-	if guardAt > removeAt {
-		t.Error("cleanup-worktree runs rm -rf before the linked-worktree check; the check must gate the delete, not follow it")
+	if !strings.Contains(step, "gc.worktree_disposition=retained") {
+		t.Error("cleanup-worktree must record gc.worktree_disposition=retained when provenance is incomplete or `gc worktree cleanup` refuses")
+	}
+	if !strings.Contains(step, "gc.worktree_disposition=removed") {
+		t.Error("cleanup-worktree must record gc.worktree_disposition=removed on a successful `gc worktree cleanup`")
+	}
+
+	// The retain path must exit 0 without ever unsetting work_dir; only a
+	// confirmed removal may clear the pointer, or a retained workspace loses
+	// its only recovery handle.
+	missingAt := strings.Index(step, `if [ -n "$MISSING" ]`)
+	unsetWorkDirAt := strings.Index(step, `--unset-metadata work_dir`)
+	if missingAt < 0 {
+		t.Fatal("cleanup-worktree must gate on a computed $MISSING set of absent provenance keys")
+	}
+	if unsetWorkDirAt < 0 {
+		t.Fatal("cleanup-worktree must unset work_dir on a confirmed removal")
+	}
+	retainBlockEnd := strings.Index(step[missingAt:], "fi\n")
+	if retainBlockEnd < 0 || missingAt+retainBlockEnd > unsetWorkDirAt {
+		t.Error("work_dir must not be unset inside the missing-provenance retain branch")
 	}
 }

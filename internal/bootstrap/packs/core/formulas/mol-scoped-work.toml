@@ -88,6 +88,13 @@ needs = ["load-context"]
 description = """
 Ensure there is an isolated worktree for this work item.
 
+`gc worktree ensure` is the transactional owner of workspace provisioning: it
+is idempotent, so there is no reuse branch to get wrong, and it rolls back a
+failed creation instead of leaving a half-made tree. Its provenance is what
+the cleanup-worktree step below reads to decide whether a workspace is safe to
+remove, so publishing it here is what makes the workspace's end of life
+recordable rather than inferred.
+
 ```bash
 git fetch --prune origin
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
@@ -96,14 +103,87 @@ if [ -z "$WORK_BEAD_ID" ]; then
   echo "mol-scoped-work requires an input convoy with exactly one tracked member" >&2
   exit 1
 fi
-WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // empty')
-if [ -z "$WORKTREE" ]; then
-  WORKTREE_PATH=$(pwd)/worktrees/"$WORK_BEAD_ID"
-  git worktree add "$WORKTREE_PATH" --detach origin/{{base_branch}}
-  gc bd update "$WORK_BEAD_ID" --set-metadata work_dir="$WORKTREE_PATH"
-  WORKTREE="$WORKTREE_PATH"
+REPO_ROOT=$(git rev-parse --show-toplevel)
+WORKTREE_ROOT="$REPO_ROOT/worktrees"
+WORKTREE_PATH="$WORKTREE_ROOT/$WORK_BEAD_ID"
+BRANCH="work/$WORK_BEAD_ID"
+# Cut from the LOCAL base when it exists; fall back to the remote-tracking ref
+# only when it does not. A local base that has moved ahead is the base the
+# caller means.
+BASE_REF="{{base_branch}}"
+git rev-parse --verify --quiet "$BASE_REF" >/dev/null || BASE_REF="origin/{{base_branch}}"
+
+# `gc worktree ensure` requires the full provenance contract: creator, owner,
+# generation and store-ref are mandatory, not optional. Omitting them fails the
+# command outright with "required flag(s) not set".
+#
+# Store ref comes from the seat environment, NOT from the work bead's own
+# metadata: a freshly-dispatched bead carries no gc.root_store_ref of its own
+# (it lives on the workflow root and the trigger env instead). Prefer the
+# work-bead store, fall back to the trigger bead's, and only then to the
+# bead's own recorded root_store_ref.
+STORE_REF="${GC_TRIGGER_WORK_STORE_REF:-${GC_TRIGGER_BEAD_STORE_REF:-}}"
+if [ -z "$STORE_REF" ]; then
+  STORE_REF=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata["gc.root_store_ref"] // empty')
 fi
-cd "$WORKTREE"
+if [ -z "$STORE_REF" ]; then
+  echo "FATAL: cannot resolve a bead store reference (GC_TRIGGER_WORK_STORE_REF, GC_TRIGGER_BEAD_STORE_REF, and gc.root_store_ref are all empty)." >&2
+  exit 1
+fi
+CREATOR="formula:mol-scoped-work"
+GENERATION="$CREATOR:$WORK_BEAD_ID"
+
+if ! ENSURE_JSON=$(gc worktree ensure \
+      --repo "$REPO_ROOT" --root "$WORKTREE_ROOT" --path "$WORKTREE_PATH" \
+      --branch "$BRANCH" --base "$BASE_REF" \
+      --bead "$WORK_BEAD_ID" --creator "$CREATOR" --owner "$CREATOR" \
+      --generation "$GENERATION" --store-ref "$STORE_REF" \
+      --lifecycle active --json); then
+  echo "FATAL: gc worktree ensure failed for $WORK_BEAD_ID" >&2
+  exit 1
+fi
+# A zero exit is not evidence. Assert the postconditions the later steps and
+# the teardown depend on before publishing any of them.
+if ! printf '%s' "$ENSURE_JSON" | jq -e '
+      select(.ok == true
+             and (.path | length) > 0
+             and (.branch | length) > 0
+             and (.provenance.bead_id | length) > 0
+             and (.provenance.store_ref | length) > 0
+             and (.provenance.base_ref | length) > 0
+             and (.provenance.base_sha | length) > 0
+             and (.provenance.creator | length) > 0
+             and (.provenance.owner | length) > 0
+             and (.provenance.generation | length) > 0
+             and (.provenance.attempt_id | length) > 0
+             and (.provenance.lifecycle | length) > 0)' >/dev/null; then
+  echo "FATAL: gc worktree ensure returned invalid evidence: $ENSURE_JSON" >&2
+  exit 1
+fi
+BASE_SHA=$(printf '%s' "$ENSURE_JSON" | jq -r '.provenance.base_sha')
+WORKTREE_STORE_REF=$(printf '%s' "$ENSURE_JSON" | jq -r '.provenance.store_ref')
+WORKTREE_CREATOR=$(printf '%s' "$ENSURE_JSON" | jq -r '.provenance.creator')
+WORKTREE_OWNER=$(printf '%s' "$ENSURE_JSON" | jq -r '.provenance.owner')
+WORKTREE_GENERATION=$(printf '%s' "$ENSURE_JSON" | jq -r '.provenance.generation')
+WORKTREE_ATTEMPT_ID=$(printf '%s' "$ENSURE_JSON" | jq -r '.provenance.attempt_id')
+WORKTREE_LIFECYCLE=$(printf '%s' "$ENSURE_JSON" | jq -r '.provenance.lifecycle')
+
+gc bd update "$WORK_BEAD_ID" \
+  --set-metadata gc.root_store_ref="$WORKTREE_STORE_REF" \
+  --set-metadata gc.work_dir="$WORKTREE_PATH" \
+  --set-metadata work_dir="$WORKTREE_PATH" \
+  --set-metadata gc.work_branch="$BRANCH" \
+  --set-metadata gc.worktree_repo="$REPO_ROOT" \
+  --set-metadata gc.worktree_root="$WORKTREE_ROOT" \
+  --set-metadata gc.worktree_base_ref="$BASE_REF" \
+  --set-metadata gc.worktree_base_sha="$BASE_SHA" \
+  --set-metadata gc.worktree_creator="$WORKTREE_CREATOR" \
+  --set-metadata gc.worktree_owner="$WORKTREE_OWNER" \
+  --set-metadata gc.worktree_generation="$WORKTREE_GENERATION" \
+  --set-metadata gc.worktree_attempt_id="$WORKTREE_ATTEMPT_ID" \
+  --set-metadata gc.worktree_lifecycle="$WORKTREE_LIFECYCLE"
+
+cd "$WORKTREE_PATH"
 {{setup_command}}
 ```
 """
@@ -193,7 +273,18 @@ id = "cleanup-worktree"
 title = "Clean up the worktree"
 needs = ["body"]
 description = """
-Remove the temporary worktree after the body reaches terminal state.
+Record the terminal disposition of the workspace after the body reaches a
+terminal state.
+
+`gc worktree cleanup` is the transactional owner of workspace teardown and has
+no force mode on purpose. It requires the exact provenance workspace-setup
+published (creator, owner, generation, attempt id, store ref); a missing or
+mismatched field is a refusal, not a bug to route around. A refusal is a
+result: a workspace holding uncommitted, stashed, or unpushed work survives,
+and the retention is an obligation somebody can act on, recorded in
+gc.worktree_disposition_note. The previous bare `git worktree remove --force
+|| rm -rf` destroyed that work unconditionally and then unset `work_dir`,
+leaving nothing to recover it by.
 
 ```bash
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
@@ -202,23 +293,67 @@ if [ -z "$WORK_BEAD_ID" ]; then
   echo "mol-scoped-work requires an input convoy with exactly one tracked member" >&2
   exit 1
 fi
-WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // empty')
-if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
-  # cwd is not guaranteed to be inside the repo at this step, so resolve REPO
-  # off the worktree itself rather than off `pwd`.
-  REPO=$(git -C "$WORKTREE" rev-parse --path-format=absolute --git-common-dir)
-  if [ -z "$REPO" ]; then
-    echo "cleanup: could not resolve the owning repo for $WORKTREE; leaving it registered" >&2
-  elif ! git -C "$REPO" worktree remove --force "$WORKTREE"; then
-    if [ -f "$WORKTREE/.git" ]; then
-      rm -rf "$WORKTREE"
-      git -C "$REPO" worktree prune
-    else
-      echo "cleanup: refusing to rm -rf $WORKTREE: not a linked worktree" >&2
-    fi
-  fi
+BEAD_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
+WORKTREE=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata.work_dir // empty')
+if [ -z "$WORKTREE" ]; then
+  echo "cleanup: no work_dir recorded for $WORK_BEAD_ID; nothing to tear down" >&2
+  exit 0
 fi
-gc bd update "$WORK_BEAD_ID" --unset-metadata work_dir
+
+REPO=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata["gc.worktree_repo"] // empty')
+ROOT=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata["gc.worktree_root"] // empty')
+BRANCH=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata["gc.work_branch"] // empty')
+BASE_REF=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata["gc.worktree_base_ref"] // empty')
+CREATOR=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata["gc.worktree_creator"] // empty')
+OWNER=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata["gc.worktree_owner"] // empty')
+GENERATION=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata["gc.worktree_generation"] // empty')
+STORE_REF=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata["gc.root_store_ref"] // empty')
+ATTEMPT_ID=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata["gc.worktree_attempt_id"] // empty')
+
+MISSING=""
+for pair in "gc.worktree_repo:$REPO" "gc.worktree_root:$ROOT" "gc.work_branch:$BRANCH" \
+            "gc.worktree_base_ref:$BASE_REF" "gc.worktree_creator:$CREATOR" \
+            "gc.worktree_owner:$OWNER" "gc.worktree_generation:$GENERATION" \
+            "gc.root_store_ref:$STORE_REF" "gc.worktree_attempt_id:$ATTEMPT_ID"; do
+  key="${pair%%:*}"
+  val="${pair#*:}"
+  if [ -z "$val" ]; then
+    MISSING="${MISSING:+$MISSING,}$key"
+  fi
+done
+
+if [ -n "$MISSING" ]; then
+  gc bd update "$WORK_BEAD_ID" \
+    --set-metadata gc.worktree_disposition=retained \
+    --set-metadata gc.worktree_disposition_note="mol-scoped-work body reached terminal state" \
+    --set-metadata gc.worktree_retained_reason="incomplete_provenance:$MISSING" \
+    --set-metadata gc.worktree_recovery_owner=unknown
+  echo "cleanup: retaining $WORKTREE — incomplete provenance: $MISSING" >&2
+  exit 0
+fi
+
+if CLEANUP_JSON=$(gc worktree cleanup \
+      --repo "$REPO" --root "$ROOT" --path "$WORKTREE" \
+      --branch "$BRANCH" --base "$BASE_REF" \
+      --bead "$WORK_BEAD_ID" --creator "$CREATOR" --owner "$OWNER" \
+      --generation "$GENERATION" --store-ref "$STORE_REF" \
+      --attempt-id "$ATTEMPT_ID" --json); then
+  gc bd update "$WORK_BEAD_ID" \
+    --set-metadata gc.worktree_disposition=removed \
+    --set-metadata gc.worktree_disposition_note="mol-scoped-work body reached terminal state" \
+    --unset-metadata gc.worktree_retained_reason \
+    --unset-metadata gc.worktree_recovery_owner \
+    --unset-metadata work_dir \
+    --unset-metadata gc.work_dir
+else
+  REASON=$(printf '%s' "$CLEANUP_JSON" | jq -r '.error.message // "gc worktree cleanup refused"')
+  gc bd update "$WORK_BEAD_ID" \
+    --set-metadata gc.worktree_disposition=retained \
+    --set-metadata gc.worktree_disposition_note="mol-scoped-work body reached terminal state" \
+    --set-metadata gc.worktree_retained_reason="$REASON" \
+    --set-metadata gc.worktree_recovery_owner=unknown
+  echo "cleanup: retaining $WORKTREE — $REASON" >&2
+fi
 ```
 """
 metadata = { "gc.kind" = "cleanup", "gc.scope_ref" = "body", "gc.scope_role" = "teardown" }
