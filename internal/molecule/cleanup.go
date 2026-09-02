@@ -106,9 +106,9 @@ func CloseSubtreeWithMetadata(store beads.Store, rootID string, metadata map[str
 
 // TeardownTailExclusion builds the predicate that keeps a workflow's teardown
 // tail out of a terminal sweep over its subtree. Teardown work runs after the
-// root settles by contract (its pass condition may branch on the run
-// outcome), so force-closing it at settlement, or at cancellation, would skip
-// the very step that releases the workflow's resources.
+// root reaches a terminal state by contract (its pass condition may branch on
+// the run outcome), so force-closing it at settlement, or at cancellation,
+// would skip the very step that releases the workflow's resources.
 //
 // The tail is the teardown-scoped members plus every attempt of the same step:
 // retry expansion strips gc.scope_role from the first attempt, leaving

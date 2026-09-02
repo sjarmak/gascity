@@ -308,7 +308,8 @@ func rootSettled(root beads.Bead) bool {
 
 // isTeardownTailControl reports whether a control belongs to the teardown tail,
 // which runs AFTER the root reaches a terminal state by contract — its pass
-// condition may branch on ROOT_OUTCOME, which only finalize produces (#5271).
+// condition may branch on ROOT_OUTCOME, which finalize produces on settlement
+// and cancelRun's own close produces on cancellation (#5271).
 // molecule.TeardownTailExclusion keeps that tail out of the finalizer's own
 // terminal sweep for the same reason, and it is the authoritative definition,
 // so both the canceled-root and settled-root gates defer to it rather than
