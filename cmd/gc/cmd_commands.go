@@ -281,7 +281,8 @@ func readDiscoveredHelp(entry config.DiscoveredCommand) string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(data))
+	text := strings.ReplaceAll(string(data), "${GC_PACK_BINDING}", entry.BindingName)
+	return strings.TrimSpace(text)
 }
 
 var resolveInvokingExecutable = os.Executable
@@ -316,6 +317,7 @@ func runDiscoveredCommand(entry config.DiscoveredCommand, cityPath, cityName str
 	cmd.Env = append(cmd.Env,
 		"GC_PACK_DIR="+packDir,
 		"GC_PACK_NAME="+entry.PackName,
+		"GC_PACK_BINDING="+entry.BindingName,
 		"GC_CITY_NAME="+cityName,
 	)
 	// Pack commands are extensions of this exact gc process. Pin recursive
