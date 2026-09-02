@@ -433,6 +433,7 @@ func CreateSingleItemInputConvoy(store beads.Store, target beads.Bead) (beads.Be
 	if strings.TrimSpace(target.ID) == "" {
 		return beads.Bead{}, fmt.Errorf("input convoy target id is empty")
 	}
+	retireStaleSyntheticInputConvoys(store, target.ID)
 	metadata := map[string]string{
 		syntheticMetadataKey: "true",
 	}
@@ -454,6 +455,38 @@ func CreateSingleItemInputConvoy(store beads.Store, target beads.Bead) (beads.Be
 		return beads.Bead{}, fmt.Errorf("tracking %s from input convoy %s: %w", target.ID, created.ID, err)
 	}
 	return created, nil
+}
+
+// retireStaleSyntheticInputConvoys closes every open, non-terminal synthetic
+// input convoy already tracking targetID before CreateSingleItemInputConvoy
+// mints a new one.
+//
+// Without this, re-slinging the same target (for example after a rejected
+// pour) mints a second synthetic input convoy while the first is never
+// retired: nothing closes it, so it strands open as a P1,
+// dependency-ready, claim-attracting record that "bd ready --sort hybrid"
+// and KEEP_POOL_FED steer PLs onto, even though re-slinging that convoy type
+// is banned (gc-po8my / dec-g41e). Retiring here keeps exactly one live
+// synthetic input convoy per target, minted immediately before it. Failures
+// are best-effort and never block the mint: a synthetic convoy this pour
+// does not own is not this call's failure to surface.
+func retireStaleSyntheticInputConvoys(store beads.Store, targetID string) {
+	convoys, err := convoycore.TrackingConvoysForItem(store, targetID)
+	if err != nil {
+		return
+	}
+	for _, convoy := range convoys {
+		if convoy.Metadata[syntheticMetadataKey] != "true" {
+			continue
+		}
+		if convoycore.IsTerminalStatus(convoy.Status) {
+			continue
+		}
+		_ = store.SetMetadata(convoy.ID, beadmeta.OutcomeMetadataKey, beadmeta.OutcomeFail)                        //nolint:errcheck // best-effort retirement
+		_ = store.SetMetadata(convoy.ID, beadmeta.FailureClassMetadataKey, beadmeta.FailureClassHard)              //nolint:errcheck // best-effort retirement
+		_ = store.SetMetadata(convoy.ID, beadmeta.FailureReasonMetadataKey, "superseded by re-sling of "+targetID) //nolint:errcheck // best-effort retirement
+		_ = store.Close(convoy.ID)                                                                                 //nolint:errcheck // best-effort retirement
+	}
 }
 
 // PreparePreviewInvocation validates graph.v2 preview inputs without creating

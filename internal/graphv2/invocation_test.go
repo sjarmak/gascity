@@ -1057,6 +1057,54 @@ func TestCreateSingleItemInputConvoyClosesConvoyOnTrackFailure(t *testing.T) {
 	}
 }
 
+func TestCreateSingleItemInputConvoyRetiresStalePriorConvoy(t *testing.T) {
+	mem := beads.NewMemStore()
+	target, err := mem.Create(beads.Bead{Title: "work item", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := CreateSingleItemInputConvoy(mem, target)
+	if err != nil {
+		t.Fatalf("first CreateSingleItemInputConvoy: %v", err)
+	}
+
+	// Simulate a re-sling of the same target: a second pour mints a new
+	// synthetic input convoy for the same target without the first one ever
+	// being handed to a live workflow (gc-po8my).
+	second, err := CreateSingleItemInputConvoy(mem, target)
+	if err != nil {
+		t.Fatalf("second CreateSingleItemInputConvoy: %v", err)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("second convoy id = %q, want a distinct id from first %q", second.ID, first.ID)
+	}
+
+	firstAfter, err := mem.Get(first.ID)
+	if err != nil {
+		t.Fatalf("Get first convoy: %v", err)
+	}
+	if !convoycore.IsTerminalStatus(firstAfter.Status) {
+		t.Fatalf("first convoy status = %q, want terminal (retired at second mint)", firstAfter.Status)
+	}
+
+	secondAfter, err := mem.Get(second.ID)
+	if err != nil {
+		t.Fatalf("Get second convoy: %v", err)
+	}
+	if convoycore.IsTerminalStatus(secondAfter.Status) {
+		t.Fatalf("second convoy status = %q, want non-terminal (the live record)", secondAfter.Status)
+	}
+
+	convoys, err := mem.List(beads.ListQuery{Type: "convoy", Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(convoys) != 1 || convoys[0].ID != second.ID {
+		t.Fatalf("open synthetic convoys = %v, want exactly [%s]", convoys, second.ID)
+	}
+}
+
 // depListFailingStore mints and tracks convoys normally but fails every
 // DepList, simulating the cross-store membership read anomaly that makes
 // ResolveLegacyIssueAlias fail after PrepareInvocation has already minted the
