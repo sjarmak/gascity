@@ -224,7 +224,7 @@ func doConvoyCreateWithOptionsJSON(store beads.Store, cfg *config.City, cityPath
 		return 1
 	}
 
-	b := beads.Bead{Title: name, Type: "convoy"}
+	b := beads.Bead{Title: name, Type: "convoy", DeferUntil: beads.ConvoyDeferUntil()}
 	if opts.Owned {
 		b.Labels = []string{"owned"}
 	}

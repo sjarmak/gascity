@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
@@ -44,6 +45,9 @@ func TestConvoyCreate(t *testing.T) {
 	}
 	if b.Status != "open" {
 		t.Errorf("bead Status = %q, want %q", b.Status, "open")
+	}
+	if !beads.IsDeferred(b, time.Now()) {
+		t.Errorf("convoy %s DeferUntil = %v, want far-future (gc-c7lp0: convoys must never surface in a bare bd ready)", b.ID, b.DeferUntil)
 	}
 }
 
