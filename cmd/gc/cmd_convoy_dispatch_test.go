@@ -20,6 +20,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	convoycore "github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/dispatch"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/formula"
@@ -1292,6 +1293,93 @@ func TestCmdWorkflowDeleteSourceClosesGraphV2OnlyRoot(t *testing.T) {
 	}
 	if got := strings.TrimSpace(updatedSource.Metadata["workflow_id"]); got != "" {
 		t.Fatalf("source workflow_id = %q, want cleared", got)
+	}
+}
+
+func TestCmdWorkflowDeleteSourceFindsConvoyFirstRootByOriginalSourceBead(t *testing.T) {
+	// Regression for gc-f0lkv (Codex review gap): CreateSingleItemInputConvoy
+	// mints a synthetic convoy that TRACKS the original work bead rather than
+	// stamping the work bead's ID onto the root -- the root carries only
+	// gc.input_convoy_id, pointing at the synthetic convoy, never
+	// gc.source_bead_id. An operator who runs
+	// `gc workflow delete-source <original-bead-id>` (the ID they actually
+	// know) must still find and close the live root through the convoy's
+	// tracking edge, not just literal ID equality against gc.input_convoy_id.
+	cityDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n\n[daemon]\nformula_v2 = true\n"+testControlDispatcherAgentTOML("")), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+	prevCityFlag := cityFlag
+	cityFlag = ""
+	t.Cleanup(func() { cityFlag = prevCityFlag })
+
+	store, err := openStoreAtForCity(cityDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity: %v", err)
+	}
+	source, err := store.Create(beads.Bead{Title: "original work bead", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatalf("Create(source): %v", err)
+	}
+	convoy, err := store.Create(beads.Bead{Title: "synthetic input convoy", Type: "convoy", Status: "open"})
+	if err != nil {
+		t.Fatalf("Create(convoy): %v", err)
+	}
+	if err := convoycore.TrackItem(store, convoy.ID, source.ID); err != nil {
+		t.Fatalf("TrackItem: %v", err)
+	}
+	root, err := store.Create(beads.Bead{
+		Title:  "convoy-first graph workflow",
+		Type:   "task",
+		Status: "in_progress",
+		Metadata: map[string]string{
+			"gc.formula_contract": "graph.v2",
+			"gc.input_convoy_id":  convoy.ID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+	child, err := store.Create(beads.Bead{
+		Title:  "Child",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(child): %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdWorkflowDeleteSource(source.ID, sourceWorkflowStoreSelector{}, true, false, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdWorkflowDeleteSource(original source bead) = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "result=cleaned") {
+		t.Fatalf("stdout = %q, want cleaned result (root must be found through convoy tracking membership)", stdout.String())
+	}
+
+	reloaded, err := openStoreAtForCity(cityDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(reload): %v", err)
+	}
+	updatedRoot, err := reloaded.Get(root.ID)
+	if err != nil {
+		t.Fatalf("Get(root): %v", err)
+	}
+	if updatedRoot.Status != "closed" {
+		t.Fatalf("root status = %q, want closed", updatedRoot.Status)
+	}
+	updatedChild, err := reloaded.Get(child.ID)
+	if err != nil {
+		t.Fatalf("Get(child): %v", err)
+	}
+	if updatedChild.Status != "closed" {
+		t.Fatalf("child status = %q, want closed", updatedChild.Status)
 	}
 }
 
