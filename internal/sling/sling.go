@@ -1084,15 +1084,23 @@ func rigStoredDefaultBranch(cfg *config.City, beadID string, a config.Agent) str
 // Precedence (highest wins): explicit --var > rig.formula_vars > routing-injected
 // defaults (issue/rig_name/base_branch/...) > formula-level [vars.*].default.
 func BuildSlingFormulaVars(formulaName, beadID string, userVars []string, a config.Agent, deps SlingDeps) map[string]string {
-	return buildSlingFormulaVars(formulaName, beadID, userVars, a, deps, true)
+	vars, _ := buildSlingFormulaVars(formulaName, beadID, userVars, a, deps, true)
+	return vars
 }
 
 func buildGraphV2SlingFormulaVars(formulaName, beadID string, userVars []string, a config.Agent, deps SlingDeps) map[string]string {
-	return buildSlingFormulaVars(formulaName, beadID, userVars, a, deps, false)
+	vars, _ := buildSlingFormulaVars(formulaName, beadID, userVars, a, deps, false)
+	return vars
 }
 
-func buildSlingFormulaVars(formulaName, beadID string, userVars []string, a config.Agent, deps SlingDeps, includeIssue bool) map[string]string {
-	vars := make(map[string]string, len(userVars)+6)
+// buildSlingFormulaVars builds the variable map for formula instantiation
+// and, when requirements_path/context_path was neither carried in by the
+// caller nor exported successfully for a bead with a real description,
+// returns a non-empty requirementsExportWarning so the caller can surface
+// that the sling may be rendering spec-blind (gc-ozzqe) instead of failing
+// silently.
+func buildSlingFormulaVars(formulaName, beadID string, userVars []string, a config.Agent, deps SlingDeps, includeIssue bool) (vars map[string]string, requirementsExportWarning string) {
+	vars = make(map[string]string, len(userVars)+6)
 	for _, v := range userVars {
 		key, value, ok := strings.Cut(v, "=")
 		if ok && key != "" {
@@ -1124,7 +1132,15 @@ func buildSlingFormulaVars(formulaName, beadID string, userVars []string, a conf
 	addRoutingVar("binding_prefix", a.BindingPrefix())
 
 	if beadID != "" {
-		addVar("requirements_path", exportSlingRequirements(deps, beadID))
+		_, reqExplicit := vars["requirements_path"]
+		_, ctxExplicit := vars["context_path"]
+		if !reqExplicit && !ctxExplicit {
+			path, warn := exportSlingRequirements(deps, beadID)
+			if path != "" {
+				vars["requirements_path"] = path
+			}
+			requirementsExportWarning = warn
+		}
 	}
 
 	autoBranch := SlingFormulaTargetBranch(beadID, deps, a)
@@ -1135,7 +1151,7 @@ func buildSlingFormulaVars(formulaName, beadID string, userVars []string, a conf
 		addVar("target_branch", autoBranch)
 	}
 
-	return vars
+	return vars, requirementsExportWarning
 }
 
 // exportSlingRequirements writes beadID's title and description to
@@ -1145,24 +1161,29 @@ func buildSlingFormulaVars(formulaName, beadID string, userVars []string, a conf
 // criteria embedded in its description (gc-ozzqe: a bare formula sling
 // otherwise rendered spec-blind).
 //
-// Best-effort, mirroring resolveMoleculeArtifactDir: any failure (no
-// store, no city path, unsafe bead ID, store lookup error, empty
-// description, write error) yields "" and buildSlingFormulaVars leaves
-// requirements_path unset, exactly as before this fix.
-func exportSlingRequirements(deps SlingDeps, beadID string) string {
+// A bead with no store/city-path context, an unsafe ID, or a genuinely
+// empty description has nothing to export and returns ("", "") — that is
+// not a failure. A bead that DOES carry real instructions but could not be
+// exported (store lookup error, mkdir/write error) returns ("", warning)
+// so the caller can surface that the sling may be rendering spec-blind
+// instead of silently proceeding as if there was nothing to carry.
+func exportSlingRequirements(deps SlingDeps, beadID string) (path string, warning string) {
 	if deps.Store == nil || strings.TrimSpace(deps.CityPath) == "" {
-		return ""
+		return "", ""
 	}
 	if err := molecule.ValidateMemberID(beadID); err != nil {
-		return ""
+		return "", ""
+	}
+	failWarning := func(err error) (string, string) {
+		return "", fmt.Sprintf("warning: could not export bead %s's description into the formula's rendered context (%v) — pass --var context_path=<dir> or --var requirements_path=<doc> to carry your instructions explicitly.", beadID, err)
 	}
 	bead, err := deps.Store.Get(beadID)
 	if err != nil {
-		return ""
+		return failWarning(err)
 	}
 	desc := strings.TrimSpace(bead.Description)
 	if desc == "" {
-		return ""
+		return "", ""
 	}
 
 	var buf strings.Builder
@@ -1173,13 +1194,13 @@ func exportSlingRequirements(deps SlingDeps, beadID string) string {
 
 	dir := filepath.Join(deps.CityPath, ".gc", "sling-requirements")
 	if err := (fsys.OSFS{}).MkdirAll(dir, 0o755); err != nil {
-		return ""
+		return failWarning(err)
 	}
-	path := filepath.Join(dir, beadID+".md")
+	path = filepath.Join(dir, beadID+".md")
 	if err := (fsys.OSFS{}).WriteFile(path, []byte(buf.String()), 0o644); err != nil {
-		return ""
+		return failWarning(err)
 	}
-	return path
+	return path, ""
 }
 
 // mergeRigFormulaVars folds rig-scoped formula_vars defaults into vars.

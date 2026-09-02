@@ -2419,17 +2419,6 @@ func TestSlingAttachFormula(t *testing.T) {
 	}
 }
 
-// TestSlingAttachFormulaWarnsWhenBeadDescriptionDropped is the regression
-// for #3681: --on/AttachFormula never carries the target bead's own
-// description into the formula's rendered context via the wisp root (its
-// description is always the formula's own boilerplate). A caller relying
-// on the bead's description as the actual build instructions silently gets
-// a brainstorm that never saw them — unless some other route carries it
-// in. Since 2026-08-02 the legacy path auto-stamps gc.var.issue = beadID,
-// and every route-table formula resolves it back via `bd show` (Route B),
-// so this test must explicitly void that route (issue=) to exercise the
-// genuinely-silent case; see ga-tj5jbm. Warn instead of changing
-// routing/materialization.
 // TestSlingAttachFormulaCarriesBeadDescriptionByDefault is the gc-ozzqe
 // regression test: attaching a formula to a bead must carry the bead's
 // description (and any acceptance criteria embedded in it) into the
@@ -2490,6 +2479,79 @@ func TestSlingAttachFormulaNoRequirementsPathWhenBeadHasNoDescription(t *testing
 	vars := BuildSlingFormulaVars("code-review", b.ID, nil, a, deps)
 	if got, ok := vars["requirements_path"]; ok {
 		t.Errorf("requirements_path = %q, want unset for a description-less bead", got)
+	}
+}
+
+// requirementsGetErrStore forces q.Get(errID) to fail while serving every
+// other bead from the backing store, isolating the export-Get-error path.
+type requirementsGetErrStore struct {
+	beads.Store
+	errID string
+	err   error
+}
+
+func (s requirementsGetErrStore) Get(id string) (beads.Bead, error) {
+	if id == s.errID {
+		return beads.Bead{}, s.err
+	}
+	return s.Store.Get(id)
+}
+
+// TestExportSlingRequirementsWarnsOnGetError is a direct unit test of the
+// gc-ozzqe export helper's store-lookup failure path (isolated from the
+// rest of AttachFormula's own bead-existence validation, which reads the
+// same store and would otherwise fail first): the store lookup errors, so
+// there is no way to know whether the bead had real instructions to carry.
+// exportSlingRequirements must return a non-empty warning rather than
+// silently behaving as if the bead had no description.
+func TestExportSlingRequirementsWarnsOnGetError(t *testing.T) {
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	backing := deps.Store
+	b, _ := backing.Create(beads.Bead{Title: "work", Type: "task", Description: "acceptance: tests pass"})
+	deps.Store = requirementsGetErrStore{Store: backing, errID: b.ID, err: errors.New("boom: store unavailable")}
+
+	path, warn := exportSlingRequirements(deps, b.ID)
+	if path != "" {
+		t.Errorf("path = %q, want empty on a store lookup error", path)
+	}
+	if warn == "" {
+		t.Error("warn = \"\", want a non-empty warning on a store lookup error")
+	}
+}
+
+// TestSlingAttachFormulaWarnsWhenRequirementsExportWriteFails covers the
+// write-side failure: the sling-requirements directory cannot be created
+// because a file already occupies that path. AttachFormula must still
+// surface an explicit warning rather than silently proceeding as if the
+// bead had no description to carry.
+func TestSlingAttachFormulaWarnsWhenRequirementsExportWriteFails(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	deps.CityPath = t.TempDir()
+	if err := os.WriteFile(filepath.Join(deps.CityPath, ".gc"), []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("seeding blocking file: %v", err)
+	}
+	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task", Description: "acceptance: tests pass"})
+
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	result, err := s.AttachFormula(context.Background(), "code-review", b.ID, a, FormulaOpts{Vars: []string{"issue="}})
+	if err != nil {
+		t.Fatalf("AttachFormula: %v", err)
+	}
+	found := false
+	for _, w := range result.BeadWarnings {
+		if strings.Contains(w, "could not export bead") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("BeadWarnings = %#v, want a warning that the requirements export failed", result.BeadWarnings)
 	}
 }
 

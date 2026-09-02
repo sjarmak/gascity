@@ -459,7 +459,10 @@ func slingDefaultFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 // metadata-clear failure) keeps hard-failing regardless of this flag.
 func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID, formulaName, method, errLabel string, fallbackToPlainOnMoleculeConflict bool, result SlingResult) (SlingResult, error) {
 	a := opts.Target
-	formulaVars := BuildSlingFormulaVars(formulaName, beadID, opts.Vars, a, deps)
+	formulaVars, requirementsExportWarning := buildSlingFormulaVars(formulaName, beadID, opts.Vars, a, deps, true)
+	if requirementsExportWarning != "" {
+		result.BeadWarnings = append(result.BeadWarnings, requirementsExportWarning)
+	}
 	searchPaths := SlingFormulaSearchPaths(deps, a)
 	graphInv, isGraph, err := prepareGraphV2FormulaInvocation(context.Background(), formulaName, beadID, opts, deps, a)
 	if err != nil {
