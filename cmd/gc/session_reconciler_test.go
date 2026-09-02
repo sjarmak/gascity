@@ -6171,6 +6171,167 @@ func TestReconcileSessionBeads_OrphanDrainLiveAssignedWorkStaysOpen(t *testing.T
 	}
 }
 
+// TestReconcileSessionBeads_SuspendedAlwaysNamedSessionDrainsDespiteAssignedWork
+// covers gc-2nq11: suspending a rig (or the whole city) did not retire a
+// mode=always named session that held any open assigned bead —
+// preserveConfiguredNamedSessionBeadInfo does not consider suspension, so the
+// session stayed "preserved" and the assigned-work check on the orphan/
+// suspended drain path never even ran. The session idled at a prompt burning
+// quota indefinitely with no way to retire it short of a manual kill. The fix
+// diverts a suspended mode=always session out of the preserve path and lets
+// namedSessionSuspendedDrainOverridesAssignedWork override the assigned-work
+// skip, behind the existing #3630 confirm-ticks guard (2 consecutive ticks).
+func TestReconcileSessionBeads_SuspendedAlwaysNamedSessionDrainsDespiteAssignedWork(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "worker", StartCommand: "true", Suspended: true}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "always"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
+	_ = env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "true"})
+	session := env.createSessionBead(sessionName, "worker")
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "worker",
+		namedSessionModeMetadata:     "always",
+		"state":                      "active",
+		"last_woke_at":               env.clk.Now().UTC().Format(time.RFC3339),
+	})
+
+	if _, err := env.store.Create(beads.Bead{
+		Title:    "claimed work",
+		Type:     "task",
+		Status:   "in_progress",
+		Assignee: session.Metadata["session_name"],
+	}); err != nil {
+		t.Fatalf("Create assigned work bead: %v", err)
+	}
+
+	// Tick 1: suspended with live assigned work → confirm-ticks guard defers
+	// (counter=1), no drain yet.
+	env.reconcile([]beads.Bead{session})
+	if ds := env.dt.get(session.ID); ds != nil {
+		t.Fatalf("expected first suspended tick to defer via confirm-ticks guard, got immediate drain state %+v", ds)
+	}
+	if !env.sp.IsRunning(sessionName) {
+		t.Fatalf("session must stay running through the first confirming tick")
+	}
+
+	// Tick 2: confirmed → the suspended mode=always session must now drain
+	// despite its live assigned work.
+	env.reconcile([]beads.Bead{session})
+	ds := env.dt.get(session.ID)
+	if ds == nil {
+		t.Fatal("expected suspended mode=always named session with live assigned work to drain, got no drain state")
+	}
+	if ds.reason != "suspended" {
+		t.Fatalf("drain reason = %q, want %q", ds.reason, "suspended")
+	}
+}
+
+// TestReconcileSessionBeads_UnsuspendedAlwaysNamedSessionStaysOpenWithAssignedWork
+// guards the scope of the gc-2nq11 fix: a mode=always named session that is
+// NOT suspended must keep the pre-existing behavior of staying preserved and
+// running for as long as it holds live assigned work, even across multiple
+// ticks.
+func TestReconcileSessionBeads_UnsuspendedAlwaysNamedSessionStaysOpenWithAssignedWork(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "worker", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "always"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
+	_ = env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "true"})
+	session := env.createSessionBead(sessionName, "worker")
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "worker",
+		namedSessionModeMetadata:     "always",
+		"state":                      "active",
+		"last_woke_at":               env.clk.Now().UTC().Format(time.RFC3339),
+	})
+	env.desiredState[sessionName] = TemplateParams{
+		Command:                 "true",
+		SessionName:             sessionName,
+		TemplateName:            "worker",
+		ConfiguredNamedIdentity: "worker",
+		ConfiguredNamedMode:     "always",
+	}
+
+	if _, err := env.store.Create(beads.Bead{
+		Title:    "claimed work",
+		Type:     "task",
+		Status:   "in_progress",
+		Assignee: session.Metadata["session_name"],
+	}); err != nil {
+		t.Fatalf("Create assigned work bead: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		env.reconcile([]beads.Bead{session})
+		if ds := env.dt.get(session.ID); ds != nil {
+			t.Fatalf("tick %d: expected non-suspended mode=always session with assigned work to stay open, got drain state %+v", i+1, ds)
+		}
+	}
+	if !env.sp.IsRunning(sessionName) {
+		t.Fatalf("non-suspended named session %q should still be running", sessionName)
+	}
+}
+
+// TestReconcileSessionBeads_SuspendedOnDemandNamedSessionStaysOpenWithAssignedWork
+// guards the scope of the gc-2nq11 fix along the other axis: it is scoped to
+// mode=always named sessions only (per the bug title, "PL sessions"). An
+// on_demand named session that is suspended must keep its pre-existing
+// behavior of staying preserved while it holds live assigned work;
+// namedSessionSuspendedDrainOverridesAssignedWork returns false for anything
+// that does not resolve to mode=always.
+func TestReconcileSessionBeads_SuspendedOnDemandNamedSessionStaysOpenWithAssignedWork(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "worker", StartCommand: "true", Suspended: true}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "on_demand"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
+	_ = env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "true"})
+	session := env.createSessionBead(sessionName, "worker")
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "worker",
+		namedSessionModeMetadata:     "on_demand",
+		"state":                      "active",
+		"last_woke_at":               env.clk.Now().UTC().Format(time.RFC3339),
+	})
+	env.desiredState[sessionName] = TemplateParams{
+		Command:                 "true",
+		SessionName:             sessionName,
+		TemplateName:            "worker",
+		ConfiguredNamedIdentity: "worker",
+		ConfiguredNamedMode:     "on_demand",
+	}
+
+	if _, err := env.store.Create(beads.Bead{
+		Title:    "claimed work",
+		Type:     "task",
+		Status:   "in_progress",
+		Assignee: session.Metadata["session_name"],
+	}); err != nil {
+		t.Fatalf("Create assigned work bead: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		env.reconcile([]beads.Bead{session})
+		if ds := env.dt.get(session.ID); ds != nil {
+			t.Fatalf("tick %d: expected suspended on_demand session with assigned work to stay open (fix is scoped to mode=always), got drain state %+v", i+1, ds)
+		}
+	}
+	if !env.sp.IsRunning(sessionName) {
+		t.Fatalf("suspended on_demand named session %q should still be running (out of gc-2nq11 scope)", sessionName)
+	}
+}
+
 // TestReconcileSessionBeads_OrphanDrainLogThrottled covers issue #855:
 // once a session is draining, the reconciler must not re-emit
 // "Draining session '...': orphaned" on every subsequent tick. The

@@ -31,6 +31,7 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/storeref"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 	"github.com/gastownhall/gascity/internal/telemetry"
 )
 
@@ -1353,6 +1354,39 @@ func reconcileSessionBeadsTraced(
 	)
 }
 
+// namedSessionSuspendedDrainOverridesAssignedWork reports whether a session's
+// live assigned work should NOT block its suspension-triggered drain
+// (gc-2nq11). sessionHasOpenAssignedWorkForConfigInfo keeps a mode=always
+// named session alive forever once it holds any open bead, even after its
+// rig or the whole city is suspended — the drain reconciler skips the drain
+// unconditionally, so the session idles at a prompt burning quota with no
+// way to retire it short of a manual kill. Reuses
+// namedSessionBlockedBySuspension, the same primitive `gc status`/
+// `gc-capacity` already use to report "SUSPENDED BUT RUNNING", so suspend
+// semantics for named sessions stay defined in one place. Scoped to
+// mode=always named sessions only: on-demand named sessions and pool
+// sessions are unaffected.
+func namedSessionSuspendedDrainOverridesAssignedWork(
+	cfg *config.City,
+	cityName string,
+	info sessionpkg.Info,
+	suspState suspensionstate.State,
+	suspendedRigs map[string]bool,
+) bool {
+	if !isNamedSessionInfo(info) {
+		return false
+	}
+	identity := namedSessionIdentityInfo(info)
+	if identity == "" {
+		return false
+	}
+	spec, ok := findNamedSessionSpec(cfg, cityName, identity)
+	if !ok || spec.Mode != "always" {
+		return false
+	}
+	return namedSessionBlockedBySuspension(cfg, spec.Agent, suspState, suspendedRigs)
+}
+
 func reconcileSessionBeadsTracedWithNamedDemand(
 	ctx context.Context,
 	cityPath string,
@@ -1415,6 +1449,11 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	// Load provider-health snapshot once per tick (ADR-0013 A1 M3a).
 	// All per-session gate checks in Phase 2 use this snapshot — no I/O per session.
 	phSnap := loadProviderHealthSnapshot(cityPath)
+	// Load suspension state once per tick, same reasoning as phSnap above:
+	// it is file-backed and does not change mid-tick. Feeds
+	// namedSessionSuspendedDrainOverridesAssignedWork (gc-2nq11).
+	suspState := loadSuspensionStateBestEffort(cityPath)
+	suspendedRigs := buildEffectiveSuspendedRigNames(cfg, suspState)
 	reconcileOpts := startExecutionOptions{}
 	for _, apply := range startOptions {
 		if apply != nil {
@@ -1800,6 +1839,19 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			// snapshot: Info.PendingCreateClaimMetadata (the verbatim raw-string mirror,
 			// Step 6a) and Info.MetadataState (Step 5a).
 			preserveNamed := preserveConfiguredNamedSessionBeadInfo(info, cfg, cityName)
+			if preserveNamed && namedSessionSuspendedDrainOverridesAssignedWork(cfg, cityName, info, suspState, suspendedRigs) {
+				// gc-2nq11: preserveConfiguredNamedSessionBeadInfo does not
+				// consider suspension, so a live mode=always named session
+				// stays "preserved" (desired=true, never reaching the
+				// orphan/suspended drain path below) regardless of rig or
+				// city suspension — it idles at a prompt burning quota with
+				// no way to retire it short of a manual kill. Divert a
+				// suspended mode=always session into the ordinary drain path
+				// instead, where the live-assigned-work check further below
+				// (same helper) still protects genuinely in-flight work
+				// behind the #3630 confirm-ticks guard.
+				preserveNamed = false
+			}
 			// #3630: the configured spec is present this tick — reset any
 			// suspend-drain confirmation window so a later genuine removal still
 			// gets the full confirmation buffer.
@@ -2130,19 +2182,39 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						continue
 					}
 					if hasAssignedWork {
+						// gc-2nq11: a mode=always named session whose rig (or
+						// the whole city) is suspended must still be able to
+						// drain — otherwise suspending a rig never retires
+						// these sessions and they idle at a prompt burning
+						// quota indefinitely, regardless of suspension state.
+						suspensionOverride := namedSessionSuspendedDrainOverridesAssignedWork(cfg, cityName, infoPostHeal, suspState, suspendedRigs)
+						if !suspensionOverride {
+							if trace != nil {
+								template := normalizedSessionTemplateInfo(infoPostHeal, cfg)
+								if template == "" {
+									template = infoPostHeal.Template
+								}
+								trace.RecordDecision(TraceSiteReconcilerOrphaned, TraceReasonCode(reason), TraceOutcomeKeptOpen, template, name, traceRecordPayload{
+									"store_query_partial": storeQueryPartial,
+									"provider_alive":      providerAlive,
+									"live_assigned_work":  true,
+								})
+							}
+							fmt.Fprintf(stdout, "Skipping drain for '%s': live assigned work found\n", name) //nolint:errcheck
+							continue
+						}
 						if trace != nil {
 							template := normalizedSessionTemplateInfo(infoPostHeal, cfg)
 							if template == "" {
 								template = infoPostHeal.Template
 							}
-							trace.RecordDecision(TraceSiteReconcilerOrphaned, TraceReasonCode(reason), TraceOutcomeKeptOpen, template, name, traceRecordPayload{
+							trace.RecordDecision(TraceSiteReconcilerOrphaned, TraceReasonCode(reason), TraceOutcomeSuspensionOverride, template, name, traceRecordPayload{
 								"store_query_partial": storeQueryPartial,
 								"provider_alive":      providerAlive,
 								"live_assigned_work":  true,
 							})
 						}
-						fmt.Fprintf(stdout, "Skipping drain for '%s': live assigned work found\n", name) //nolint:errcheck
-						continue
+						fmt.Fprintf(stdout, "Draining suspended named session '%s' despite live assigned work: mode=always session blocked by suspension\n", name) //nolint:errcheck
 					}
 					// #3630: a LIVE named session reaches this drain only because
 					// its configured spec is absent this tick (preserve did not fire
