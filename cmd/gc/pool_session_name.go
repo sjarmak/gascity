@@ -14,6 +14,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sling"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
@@ -574,7 +575,44 @@ func releaseOrphanedPoolAssignment(store beads.Store, wb beads.Bead, clearDetach
 			return true
 		}
 	}
-	return releasePoolAssignmentWithRecheck(store, wb, clearDetached)
+	if !releasePoolAssignmentWithRecheck(store, wb, clearDetached) {
+		return false
+	}
+	if beadHasActiveContinuationGroup(wb) {
+		releaseOrphanedContinuationLease(store, wb)
+	}
+	return true
+}
+
+// releaseOrphanedContinuationLease force-releases wb's workflow root's
+// graph.v2 continuation lease after the reconciler has independently
+// determined wb's session assignment is orphaned and released the bead
+// itself. wb is always a step bead here, never the root:
+// isCanonicalWorkflowRoot excludes workflow roots from
+// isRecoverableUnassignedInProgressPoolWork, so
+// wb.Metadata[beadmeta.RootBeadIDMetadataKey] names a distinct bead.
+//
+// requireHolder is deliberately empty (force-release): the reconciler has
+// already proven the prior holder dead via the session-liveness checks that
+// led it to release wb, so this must not additionally require the lease to
+// still be held by wb's now-stale assignee. This is the crash-recovery path
+// molecule.ReleaseContinuationLease documents — it deterministically expires
+// the lease and frees the root's continuation for whichever session next
+// acquires it, rather than leaving the root's continuation ready but
+// permanently unassigned.
+func releaseOrphanedContinuationLease(store beads.Store, wb beads.Bead) {
+	rootID := strings.TrimSpace(wb.Metadata[beadmeta.RootBeadIDMetadataKey])
+	if rootID == "" {
+		return
+	}
+	_, outcome, err := molecule.ReleaseContinuationLease(store, rootID, "")
+	if err != nil {
+		log.Printf("releaseOrphanedPoolAssignments: releasing continuation lease on root %s for %s: %v", rootID, wb.ID, err)
+		return
+	}
+	if outcome == molecule.ContinuationLeaseStale {
+		log.Printf("releaseOrphanedPoolAssignments: continuation lease on root %s for %s was already superseded (stale generation) when releasing", rootID, wb.ID)
+	}
 }
 
 // beadHasActiveContinuationGroup reports whether wb still advertises the active
@@ -588,11 +626,11 @@ func releaseOrphanedPoolAssignment(store beads.Store, wb beads.Bead, clearDetach
 // gc.continuation_group + gc.root_bead_id. Routing these beads through
 // releasePoolAssignmentWithRecheck clears status, assignee, and the affinity
 // metadata in a single Update, so the group is never visible on a claimable
-// bead. gc.session_affinity is an advisory marker no routing path reads (see the
-// beadmeta.SessionAffinityMetadataKeys doc), so it needs no such guard and the
-// CAS path still clears it. Lift this once bd's native conditional-release verb
-// can clear the metadata in the same guarded write (BdStore.ReleaseIfCurrent
-// SEAM).
+// bead. This same call also force-releases the root's continuation lease (see
+// releaseOrphanedContinuationLease) so a crashed session's lease does not
+// outlive the bead assignment it was acquired for. Lift the two-write CAS
+// bypass once bd's native conditional-release verb can clear the metadata in
+// the same guarded write (BdStore.ReleaseIfCurrent SEAM).
 func beadHasActiveContinuationGroup(wb beads.Bead) bool {
 	return strings.TrimSpace(wb.Metadata[beadmeta.ContinuationGroupMetadataKey]) != ""
 }
