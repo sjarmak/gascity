@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -118,6 +119,79 @@ func TestHookClaimUnwindsOnLeaseAcquireError(t *testing.T) {
 	}
 	if len(rec.claimReleased) != 1 || rec.claimReleased[0].Reason != hookClaimReleaseReasonLeaseDenied {
 		t.Fatalf("bead.claim_released events = %+v, want reason %s", rec.claimReleased, hookClaimReleaseReasonLeaseDenied)
+	}
+}
+
+// TestHookClaimRejectsSiblingAssignmentAfterLeaseRevokedMidLoop pins the HIGH
+// authority gap from the gc-ue0tsw exact-head review: a lease acquired once
+// at claim time is only a caller-side preflight, not destination-validated
+// authority for every later mutation. This test models a reconciler
+// revoking/advancing this session's continuation lease AFTER the initial
+// acquireHookContinuationLease succeeded but WHILE preassignHookContinuationGroup
+// is still iterating siblings — the second sibling's revalidation call
+// observes the revoked lease (ContinuationLeaseHeldByOther) and must reject
+// that assignment rather than trusting the stale preflight, while the FIRST
+// sibling (assigned before the revocation) still went through legitimately.
+func TestHookClaimRejectsSiblingAssignmentAfterLeaseRevokedMidLoop(t *testing.T) {
+	const work = `[{"id":"work-1","status":"open","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"grp-1","gc.session_affinity":"require"}}]`
+	rec := &turnBoundClaimRecorder{}
+	ops := rec.ops(t, work)
+
+	var leaseCalls int
+	ops.AcquireContinuationLease = func(_ context.Context, _ string, _ []string, rootID, group, sessionID string) (molecule.ContinuationLeaseOutcome, error) {
+		leaseCalls++
+		if rootID != "root-1" || group != "grp-1" || sessionID != "worker-1" {
+			t.Fatalf("AcquireContinuationLease(%q,%q,%q), want root-1/grp-1/worker-1", rootID, group, sessionID)
+		}
+		switch leaseCalls {
+		case 1, 2:
+			// Call 1: the initial claim-time acquisition. Call 2: this
+			// session's own renewal before assigning the FIRST sibling —
+			// still legitimately held.
+			return molecule.ContinuationLeaseAcquired, nil
+		default:
+			// Call 3+: a reconciler has revoked/advanced the lease between
+			// the first sibling's assignment and the second sibling's
+			// renewal attempt.
+			return molecule.ContinuationLeaseHeldByOther, nil
+		}
+	}
+	ops.ListContinuation = func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
+		return []beads.Bead{
+			{ID: "sib-1", Status: "open", Metadata: map[string]string{"gc.routed_to": "worker"}},
+			{ID: "sib-2", Status: "open", Metadata: map[string]string{"gc.routed_to": "worker"}},
+		}, nil
+	}
+	var assigned []string
+	ops.AssignContinuation = func(_ context.Context, _ string, _ []string, beadID, assignee string) error {
+		assigned = append(assigned, beadID+"="+assignee)
+		return nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", "/rig", hookClaimOptions{
+		Assignee:     "worker-1",
+		RouteTargets: []string{"worker"},
+		JSON:         true,
+	}, ops, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("code = %d, want 1; stdout=%q stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if leaseCalls != 3 {
+		t.Fatalf("lease calls = %d, want 3 (initial acquire + 2 per-sibling renewals)", leaseCalls)
+	}
+	if got := strings.Join(assigned, ","); got != "sib-1=worker-1" {
+		t.Fatalf("assigned siblings = %q, want exactly [sib-1=worker-1]: sib-2 must be rejected, not silently assigned under a revoked lease", got)
+	}
+	if len(rec.claims) != 1 || rec.claims[0] != "work-1" {
+		t.Fatalf("claims = %v, want exactly [work-1]: the initial claim and lease acquisition legitimately succeeded", rec.claims)
+	}
+	if !strings.Contains(stderr.String(), "continuation lease on root root-1 not held before assigning sib-2") {
+		t.Fatalf("stderr = %q, want a diagnostic naming the rejected sibling", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty: a failed preassignment must not report a successful claim result", stdout.String())
 	}
 }
 
