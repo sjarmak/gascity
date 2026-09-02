@@ -2555,6 +2555,47 @@ func TestSlingAttachFormulaWarnsWhenRequirementsExportWriteFails(t *testing.T) {
 	}
 }
 
+func TestDoSlingBatchWarnsWhenChildRequirementsExportWriteFails(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	deps.CityPath = t.TempDir()
+	if err := os.WriteFile(filepath.Join(deps.CityPath, ".gc"), []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("seeding blocking file: %v", err)
+	}
+	convoy, err := deps.Store.Create(beads.Bead{Title: "convoy", Type: "convoy"})
+	if err != nil {
+		t.Fatalf("create convoy: %v", err)
+	}
+	child, err := deps.Store.Create(beads.Bead{Title: "child", Type: "task", Status: "open", ParentID: convoy.ID, Description: "acceptance: tests pass"})
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	if err := convoycore.TrackItem(deps.Store, convoy.ID, child.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	result, err := DoSlingBatch(SlingOpts{
+		Target:        a,
+		BeadOrFormula: convoy.ID,
+		OnFormula:     "code-review",
+		Vars:          []string{"issue="},
+	}, deps, deps.Store)
+	if err != nil {
+		t.Fatalf("DoSlingBatch: %v", err)
+	}
+	found := false
+	for _, w := range result.BeadWarnings {
+		if strings.Contains(w, "could not export bead") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("BeadWarnings = %#v, want a warning that the batch child's requirements export failed", result.BeadWarnings)
+	}
+}
+
 func TestSlingAttachFormulaRejectsMissingBead(t *testing.T) {
 	runner := newFakeRunner()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}

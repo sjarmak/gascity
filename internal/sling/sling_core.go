@@ -1347,7 +1347,13 @@ func sourceWorkflowRootByIDInStore(store beads.Store, sourceBeadID, workflowID, 
 // DoSlingBatch so that compiling N times for N children becomes a single
 // compile per batch.
 func attachBatchFormula(ctx context.Context, opts SlingOpts, deps SlingDeps, child beads.Bead, a config.Agent, formulaName, formulaLabel, method string, isGraph bool) (SlingResult, error) {
-	childVars := BuildSlingFormulaVars(formulaName, child.ID, opts.Vars, a, deps)
+	childVars, requirementsExportWarning := buildSlingFormulaVars(formulaName, child.ID, opts.Vars, a, deps, true)
+	attachWarning := func(result SlingResult) SlingResult {
+		if requirementsExportWarning != "" {
+			result.BeadWarnings = append(result.BeadWarnings, requirementsExportWarning)
+		}
+		return result
+	}
 	run := func() (SlingResult, error) {
 		mResult, err := InstantiateSlingFormula(ctx, formulaName, SlingFormulaSearchPaths(deps, a), molecule.Options{
 			Title:            opts.Title,
@@ -1387,9 +1393,17 @@ func attachBatchFormula(ctx context.Context, opts SlingOpts, deps SlingDeps, chi
 		return pendingGraphWorkflowLaunch(mResult.RootID, child.ID, a, method, formulaName, deps), nil
 	}
 	if !isGraph {
-		return run()
+		result, err := run()
+		if err != nil {
+			return SlingResult{}, err
+		}
+		return attachWarning(result), nil
 	}
-	return withSourceWorkflowLaunchLock(ctx, deps, child.ID, opts.Force, runGraph)
+	result, err := withSourceWorkflowLaunchLock(ctx, deps, child.ID, opts.Force, runGraph)
+	if err != nil {
+		return SlingResult{}, err
+	}
+	return attachWarning(result), nil
 }
 
 func isGraphSlingFormula(ctx context.Context, formulaName string, searchPaths []string, vars map[string]string) (bool, error) {
@@ -1440,17 +1454,21 @@ func checkLegacySourceWorkflowConflict(deps SlingDeps, beadID string) error {
 	}
 }
 
-func validateBatchSlingFormulaRuntimeVars(ctx context.Context, formulaName string, searchPaths []string, opts SlingOpts, open []beads.Bead, a config.Agent, deps SlingDeps) error {
+func validateBatchSlingFormulaRuntimeVars(ctx context.Context, formulaName string, searchPaths []string, opts SlingOpts, open []beads.Bead, a config.Agent, deps SlingDeps) ([]string, error) {
+	var warnings []string
 	for _, child := range open {
-		childVars := BuildSlingFormulaVars(formulaName, child.ID, opts.Vars, a, deps)
+		childVars, requirementsExportWarning := buildSlingFormulaVars(formulaName, child.ID, opts.Vars, a, deps, true)
+		if requirementsExportWarning != "" {
+			warnings = append(warnings, requirementsExportWarning)
+		}
 		if err := validateSlingFormulaRuntimeVars(ctx, formulaName, searchPaths, molecule.Options{
 			Title: opts.Title,
 			Vars:  childVars,
 		}); err != nil {
-			return fmt.Errorf("child %s: %w", child.ID, err)
+			return warnings, fmt.Errorf("child %s: %w", child.ID, err)
 		}
 	}
-	return nil
+	return warnings, nil
 }
 
 func sourceWorkflowLockScope(deps SlingDeps) string {
@@ -1602,7 +1620,9 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 		if err != nil {
 			return SlingResult{}, fmt.Errorf("instantiating formula %q on %s %s: %w", useFormula, b.Type, b.ID, err)
 		}
-		if err := validateBatchSlingFormulaRuntimeVars(context.Background(), useFormula, searchPaths, opts, open, a, deps); err != nil {
+		validationWarnings, err := validateBatchSlingFormulaRuntimeVars(context.Background(), useFormula, searchPaths, opts, open, a, deps)
+		batchResult.BeadWarnings = append(batchResult.BeadWarnings, validationWarnings...)
+		if err != nil {
 			return SlingResult{}, fmt.Errorf("instantiating formula %q on %s %s: %w", useFormula, b.Type, b.ID, err)
 		}
 		checkAttachments := CheckBatchNoMoleculeChildren
@@ -1675,6 +1695,7 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 				continue
 			}
 			batchResult.MetadataErrors = append(batchResult.MetadataErrors, formulaResult.MetadataErrors...)
+			batchResult.BeadWarnings = append(batchResult.BeadWarnings, formulaResult.BeadWarnings...)
 			childResult.FormulaName = formulaResult.FormulaName
 			childResult.WorkflowID = formulaResult.WorkflowID
 			childResult.WispRootID = formulaResult.WispRootID
