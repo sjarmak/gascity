@@ -130,6 +130,46 @@ func TestAcquireContinuationLease_SameSessionRenews(t *testing.T) {
 	}
 }
 
+// TestAcquireContinuationLease_SameSessionCannotSwitchGroup pins the MEDIUM
+// authority gap from the gc-ue0tsw exact-head review: AcquireContinuationLease
+// must fence the continuation group the same way it fences the holder. A
+// same-session renewal naming a DIFFERENT non-empty group must be rejected
+// (ContinuationLeaseHeldByOther) rather than silently overwriting the root's
+// live group — a session is only authorized to keep renewing the group it
+// actually acquired.
+func TestAcquireContinuationLease_SameSessionCannotSwitchGroup(t *testing.T) {
+	store := beads.NewMemStore()
+	root := mustCreateContinuationLeaseRoot(t, store)
+
+	if _, outcome, err := AcquireContinuationLease(store, root.ID, "cg-1", "session-alpha"); err != nil || outcome != ContinuationLeaseAcquired {
+		t.Fatalf("initial acquire: outcome=%q err=%v", outcome, err)
+	}
+
+	got, outcome, err := AcquireContinuationLease(store, root.ID, "cg-2", "session-alpha")
+	if err != nil {
+		t.Fatalf("group-switch acquire: %v", err)
+	}
+	if outcome != ContinuationLeaseHeldByOther {
+		t.Fatalf("group-switch outcome = %q, want %q", outcome, ContinuationLeaseHeldByOther)
+	}
+	if got.Metadata[beadmeta.ContinuationLeaseGroupMetadataKey] != "cg-1" {
+		t.Fatalf("group was switched: group = %q, want cg-1 (first group must survive)", got.Metadata[beadmeta.ContinuationLeaseGroupMetadataKey])
+	}
+	if got.Metadata[beadmeta.ClaimGenerationMetadataKey] != "1" {
+		t.Fatalf("generation after rejected group switch = %q, want 1 (no write should have landed)", got.Metadata[beadmeta.ClaimGenerationMetadataKey])
+	}
+
+	// Renewing with the ORIGINAL group must still succeed after the rejected
+	// switch attempt — the fence must not have corrupted the lease state.
+	got, outcome, err = AcquireContinuationLease(store, root.ID, "cg-1", "session-alpha")
+	if err != nil || outcome != ContinuationLeaseAcquired {
+		t.Fatalf("renew with original group: outcome=%q err=%v", outcome, err)
+	}
+	if got.Metadata[beadmeta.ContinuationLeaseGroupMetadataKey] != "cg-1" {
+		t.Fatalf("group after valid renew = %q, want cg-1", got.Metadata[beadmeta.ContinuationLeaseGroupMetadataKey])
+	}
+}
+
 // TestContinuationLease_RestartEpoch covers "restart epoch": a session
 // releases (e.g. clean shutdown) and later a NEW session (or the same one
 // after a restart) re-acquires. The generation must advance across the

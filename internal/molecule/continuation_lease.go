@@ -65,20 +65,25 @@ const (
 // stale can never win it out from under a live holder or a
 // reconciler-recovered new owner.
 //
-// rootID, group, and sessionID must all be non-empty; group is recorded
-// alongside the holder purely for observability (see
-// beadmeta.ContinuationLeaseGroupMetadataKey) since a root hosts at most one
-// live continuation group at a time by construction.
+// rootID, group, and sessionID must all be non-empty. group is fenced the
+// same way the holder is: a root hosts at most one live continuation group
+// at a time by construction, so a same-session renewal that names a
+// DIFFERENT non-empty group is rejected (ContinuationLeaseHeldByOther)
+// rather than silently overwriting the live group — a session renewing its
+// own lease is only ever authorized to keep renewing the group it actually
+// acquired, not to redirect the root to a group it merely wants next. A
+// caller must release and re-acquire to move a root to a new group.
 //
-// This is a read (to observe the root's current generation and holder) then a
-// single ClaimExact call fenced on that generation AND on the holder matching
-// what was just read — closing the gap a bare generation fence would leave
-// open: without the holder precondition, a brand-new session reading the SAME
-// generation a live holder is sitting on could steal the lease outright,
-// because nothing about "the generation hasn't moved" implies "you are
-// authorized to move it." The holder check and the generation bump travel in
-// the one CAS ClaimExact performs, so there is no window between "read
-// current holder" and "write new holder" a second acquirer could land in.
+// This is a read (to observe the root's current generation, holder, and
+// group) then a single ClaimExact call fenced on that generation AND on the
+// holder and group matching what was just read — closing the gap a bare
+// generation fence would leave open: without the holder precondition, a
+// brand-new session reading the SAME generation a live holder is sitting on
+// could steal the lease outright, because nothing about "the generation
+// hasn't moved" implies "you are authorized to move it." The holder/group
+// checks and the generation bump travel in the one CAS ClaimExact performs,
+// so there is no window between "read current holder/group" and "write new
+// holder/group" a second acquirer could land in.
 func AcquireContinuationLease(store beads.Store, rootID, group, sessionID string) (beads.Bead, ContinuationLeaseOutcome, error) {
 	rootID = strings.TrimSpace(rootID)
 	group = strings.TrimSpace(group)
@@ -99,11 +104,16 @@ func AcquireContinuationLease(store beads.Store, rootID, group, sessionID string
 	if currentHolder != "" && currentHolder != sessionID {
 		return root, ContinuationLeaseHeldByOther, nil
 	}
+	currentGroup := strings.TrimSpace(root.Metadata[beadmeta.ContinuationLeaseGroupMetadataKey])
+	if currentGroup != "" && currentGroup != group {
+		return root, ContinuationLeaseHeldByOther, nil
+	}
 
 	want := ClaimExactPreconditions{
 		Status: &root.Status,
 		MetadataEquals: map[string]*string{
 			beadmeta.ContinuationLeaseSessionMetadataKey: leaseHolderWant(currentHolder),
+			beadmeta.ContinuationLeaseGroupMetadataKey:   leaseHolderWant(currentGroup),
 		},
 	}
 	onSuccess := beads.UpdateOpts{
@@ -205,13 +215,13 @@ func ReleaseContinuationLease(store beads.Store, rootID, requireHolder string) (
 }
 
 // leaseHolderWant returns the ClaimExactPreconditions.MetadataEquals value
-// that pins the lease-session key to exactly currentHolder — nil (meaning
-// "must be absent or empty") when currentHolder is unheld, otherwise a
-// pointer to it, so a renewal only proceeds against the SAME holder this
-// call already observed.
-func leaseHolderWant(currentHolder string) *string {
-	if currentHolder == "" {
+// that pins a lease metadata field (holder or group) to exactly current —
+// nil (meaning "must be absent or empty") when current is empty, otherwise a
+// pointer to it, so a renewal only proceeds against the SAME value this call
+// already observed.
+func leaseHolderWant(current string) *string {
+	if current == "" {
 		return nil
 	}
-	return &currentHolder
+	return &current
 }
