@@ -2148,7 +2148,7 @@ func (c *sourceWorkflowMatchCollector) scanStore(index int, info convoyStoreView
 	}
 	c.visited[visitKey] = struct{}{}
 
-	roots, err := sourceworkflow.ListLiveRoots(info.store, currentSourceID, currentSourceStoreRef, rootStoreRef)
+	roots, err := sourceworkflow.ListLiveRootsViaConvoyMembership(info.store, currentSourceID, currentSourceStoreRef, rootStoreRef)
 	if err != nil {
 		return nil, c.recordScanFailure(index, info, currentSourceStoreRef, "listing live source workflows", err)
 	}

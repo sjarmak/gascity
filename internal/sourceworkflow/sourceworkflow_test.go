@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/testutil"
 )
 
@@ -343,6 +344,85 @@ func TestListLiveRootsFallsBackToInputConvoyIDWhenSourceBeadIDUnset(t *testing.T
 	}
 	if len(roots) != 1 || roots[0].ID != root.ID {
 		t.Fatalf("ListLiveRoots(...) = %#v, want exactly root %q", roots, root.ID)
+	}
+}
+
+func TestListLiveRootsViaConvoyMembershipResolvesOriginalSourceBead(t *testing.T) {
+	// Regression for the gc-f0lkv Codex review gap: CreateSingleItemInputConvoy
+	// mints a synthetic convoy (here CV-1) that TRACKS the original work bead
+	// (BL-83) rather than stamping the work bead's ID anywhere on the root. A
+	// caller running `gc workflow delete-source BL-83` -- the ID the operator
+	// actually knows, not the system-generated convoy -- must still find the
+	// root through the convoy's tracking edge, not just literal ID equality.
+	//
+	// The plain ListLiveRoots must NOT perform this resolution: the
+	// launch-time singleton conflict check uses it, and repeated bare-bead
+	// graph.v2 attaches each mint their own throwaway tracking convoy while
+	// intentionally being allowed to coexist as independent live roots (see
+	// TestSlingAttachGraphFormulaAllowsDifferentLiveBareBeadRoots). Resolving
+	// through convoy membership there would wrongly flag those as duplicates.
+	store := beads.NewMemStore()
+	store.HonorExplicitIDs = true
+	if _, err := store.Create(beads.Bead{
+		ID:     "BL-83",
+		Title:  "original work bead",
+		Type:   "task",
+		Status: "open",
+	}); err != nil {
+		t.Fatalf("Create(source): %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		ID:     "CV-1",
+		Title:  "input convoy for BL-83",
+		Type:   "convoy",
+		Status: "open",
+	}); err != nil {
+		t.Fatalf("Create(convoy): %v", err)
+	}
+	if err := convoy.TrackItem(store, "CV-1", "BL-83"); err != nil {
+		t.Fatalf("TrackItem: %v", err)
+	}
+	root, err := store.Create(beads.Bead{
+		Title:  "convoy-first workflow root",
+		Type:   "task",
+		Status: "in_progress",
+		Metadata: map[string]string{
+			"gc.kind":                 "workflow",
+			"gc.input_convoy_id":      "CV-1",
+			SourceStoreRefMetadataKey: "rig:alpha",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+
+	roots, err := ListLiveRootsViaConvoyMembership(store, "BL-83", "rig:alpha", "rig:alpha")
+	if err != nil {
+		t.Fatalf("ListLiveRootsViaConvoyMembership: %v", err)
+	}
+	if len(roots) != 1 || roots[0].ID != root.ID {
+		t.Fatalf("ListLiveRootsViaConvoyMembership(...) = %#v, want exactly root %q found via convoy membership", roots, root.ID)
+	}
+
+	// The convoy ID itself must still resolve directly, unaffected by the
+	// membership-lookup addition.
+	byConvoyID, err := ListLiveRootsViaConvoyMembership(store, "CV-1", "rig:alpha", "rig:alpha")
+	if err != nil {
+		t.Fatalf("ListLiveRootsViaConvoyMembership(convoy id): %v", err)
+	}
+	if len(byConvoyID) != 1 || byConvoyID[0].ID != root.ID {
+		t.Fatalf("ListLiveRootsViaConvoyMembership(convoy id) = %#v, want exactly root %q", byConvoyID, root.ID)
+	}
+
+	// The plain, launch-time-safe ListLiveRoots must NOT resolve the
+	// original source bead through convoy membership -- only its
+	// convoy-aware counterpart does.
+	narrow, err := ListLiveRoots(store, "BL-83", "rig:alpha", "rig:alpha")
+	if err != nil {
+		t.Fatalf("ListLiveRoots: %v", err)
+	}
+	if len(narrow) != 0 {
+		t.Fatalf("ListLiveRoots(original source bead) = %#v, want none (convoy membership must not be resolved by the narrow form)", narrow)
 	}
 }
 
