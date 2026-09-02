@@ -89,6 +89,15 @@ const (
 
 var errNudgeSessionFenceMismatch = errors.New("queued nudge session fence mismatch")
 
+// errNudgeGenerationMismatch attributes the poller's skip-and-retry-later
+// outcome when a queued nudge's recorded session/continuation identity no
+// longer matches the live session. It never persists to the queued-nudge
+// record (that stays the generation_mismatch terminal-state contract
+// reserved for goal-1 dispatch); it exists solely so this skip lands on the
+// same telemetry.RecordNudge metric/log surface every other poll outcome
+// already uses, instead of vanishing silently.
+var errNudgeGenerationMismatch = errors.New("queued nudge generation mismatch")
+
 var (
 	// Test seams for cmd_nudge_test.go. Tests that replace these package
 	// variables must stay serial; do not use t.Parallel in those tests.
@@ -1412,8 +1421,12 @@ func parseNudgeDeliveryMode(raw string) (nudgeDeliveryMode, error) {
 
 func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.Store, sp runtime.Provider, quiescence time.Duration, obs worker.LiveObservation) (bool, error) {
 	matches, err := nudgeTargetLiveGenerationMatches(target, obs, sp)
-	if err != nil || !matches {
+	if err != nil {
 		return false, err
+	}
+	if !matches {
+		telemetry.RecordNudge(context.Background(), target.agentKey(), errNudgeGenerationMismatch)
+		return false, nil
 	}
 	if !pollerSessionIdleEnough(target, sp, quiescence, obs) {
 		return false, nil

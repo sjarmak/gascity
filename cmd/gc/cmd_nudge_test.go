@@ -2544,6 +2544,68 @@ func TestTryDeliverQueuedNudgesByPollerDeliversAndAcks(t *testing.T) {
 	}
 }
 
+// TestTryDeliverQueuedNudgesByPollerGenerationMismatchRecordsTelemetry pins
+// gc-3atqv: a queued nudge whose recorded session/continuation identity no
+// longer matches the live session must skip delivery without claiming,
+// dead-lettering, or erroring (unchanged from before), but the skip must now
+// land on the same gc.session.nudges.total metric every other poll outcome
+// uses instead of vanishing with no claim, stamp, log, or dead-letter.
+func TestTryDeliverQueuedNudgesByPollerGenerationMismatchRecordsTelemetry(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	reader := installManualMetricReader(t)
+	dir := t.TempDir()
+	now := time.Now().Add(-1 * time.Minute)
+	if err := enqueueQueuedNudge(dir, newQueuedNudge("worker", "review the deploy logs", now)); err != nil {
+		t.Fatalf("enqueueQueuedNudge: %v", err)
+	}
+
+	store := openNudgeBeadStore(dir)
+	fake := runtime.NewFake()
+
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker"},
+		sessionID:   "recorded-stale-session-id",
+		resolved:    &config.ResolvedProvider{Name: "codex"},
+		sessionName: "worker",
+	}
+	// The live session reports a different session ID than the nudge's
+	// recorded target: this is the generation-mismatch case observed in
+	// production (recorded dr-wisp-13p, live gc-804169).
+	obs := worker.LiveObservation{Running: true, SessionID: "live-current-session-id"}
+
+	delivered, err := tryDeliverQueuedNudgesByPoller(target, store, store, fake, 3*time.Second, obs)
+	if err != nil {
+		t.Fatalf("tryDeliverQueuedNudgesByPoller: %v", err)
+	}
+	if delivered {
+		t.Fatal("delivered = true, want false on generation mismatch")
+	}
+
+	var nudgeCalls []runtime.Call
+	for _, call := range fake.Calls {
+		if call.Method == "Nudge" {
+			nudgeCalls = append(nudgeCalls, call)
+		}
+	}
+	if len(nudgeCalls) != 0 {
+		t.Fatalf("nudge calls = %d, want 0 on generation mismatch", len(nudgeCalls))
+	}
+
+	pending, inFlight, dead, err := listQueuedNudges(dir, "worker", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 1 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending=%d inFlight=%d dead=%d, want 1/0/0 (untouched by the mismatch skip)", len(pending), len(inFlight), len(dead))
+	}
+
+	points := collectCounterDataPoints(t, reader, "gc.session.nudges.total")
+	if !hasDataPointWithStringAttrs(points, map[string]string{"target": target.agentKey(), "status": "error"}) {
+		t.Fatalf("gc.session.nudges.total missing an error-status datapoint for target %q; points=%#v", target.agentKey(), points)
+	}
+}
+
 func TestTryDeliverQueuedNudgesByPollerDeliversActivitylessTimedOnlySession(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	dir := t.TempDir()
