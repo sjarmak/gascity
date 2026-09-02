@@ -26,6 +26,17 @@ type ClaimExactPreconditions struct {
 	RoutedTo          *string
 	RootBeadID        *string
 	ContinuationGroup *string
+	// MetadataEquals, when non-nil, requires exact equality on each named
+	// metadata key beyond the four named fields above. A non-nil string
+	// pointer requires that key to hold exactly that value; a nil pointer
+	// requires the key to be absent or empty — bead metadata has no tombstone
+	// distinct from "" (the codebase's established clearing convention, e.g.
+	// cmd/gc/session_affinity_metadata.go), so "absent" and "" are the same
+	// observable state and both satisfy a nil want. This is the generic escape
+	// hatch for callers (e.g. a continuation lease) that need to pin an
+	// arbitrary metadata key atomically alongside the generation fence,
+	// without ClaimExact growing a named field per caller.
+	MetadataEquals map[string]*string
 }
 
 // ClaimExactOutcome classifies how ClaimExact resolved. It is always paired
@@ -177,6 +188,18 @@ func claimExactPreconditionsMatch(b beads.Bead, want ClaimExactPreconditions) bo
 	}
 	if want.ContinuationGroup != nil && b.Metadata[beadmeta.ContinuationGroupMetadataKey] != *want.ContinuationGroup {
 		return false
+	}
+	for key, want := range want.MetadataEquals {
+		got := b.Metadata[key]
+		if want == nil {
+			if got != "" {
+				return false
+			}
+			continue
+		}
+		if got != *want {
+			return false
+		}
 	}
 	return true
 }

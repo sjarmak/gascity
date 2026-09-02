@@ -106,6 +106,12 @@ func TestClaimExact_EachPreconditionFieldMismatchesIndependently(t *testing.T) {
 		{"routed_to", ClaimExactPreconditions{RoutedTo: strp("session-bravo")}},
 		{"root_bead_id", ClaimExactPreconditions{RootBeadID: strp("root-99")}},
 		{"continuation_group", ClaimExactPreconditions{ContinuationGroup: strp("cg-99")}},
+		{"metadata_equals_wrong_value", ClaimExactPreconditions{
+			MetadataEquals: map[string]*string{beadmeta.RoutedToMetadataKey: strp("session-bravo")},
+		}},
+		{"metadata_equals_wants_absent_but_present", ClaimExactPreconditions{
+			MetadataEquals: map[string]*string{beadmeta.RoutedToMetadataKey: nil},
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -126,6 +132,66 @@ func TestClaimExact_EachPreconditionFieldMismatchesIndependently(t *testing.T) {
 				t.Fatalf("claim generation written on precondition failure: %q", got.Metadata[beadmeta.ClaimGenerationMetadataKey])
 			}
 		})
+	}
+}
+
+// TestClaimExact_MetadataEqualsMatchesAndClaims covers the positive path for
+// the generic escape hatch: a non-nil want must match the bead's current
+// value exactly, and a nil want must match a key that is genuinely absent
+// (never set at all, not merely set to "").
+func TestClaimExact_MetadataEqualsMatchesAndClaims(t *testing.T) {
+	store := beads.NewMemStore()
+	b := mustCreateExactClaimBead(t, store) // has no "custom.lease" key at all
+
+	want := ClaimExactPreconditions{
+		RoutedTo: strp("session-alpha"),
+		MetadataEquals: map[string]*string{
+			beadmeta.RoutedToMetadataKey: strp("session-alpha"),
+			"custom.lease":               nil,
+		},
+	}
+	got, outcome, err := ClaimExact(store, b.ID, want, "", beads.UpdateOpts{Assignee: strp("worker-9")})
+	if err != nil {
+		t.Fatalf("ClaimExact: %v", err)
+	}
+	if outcome != ClaimExactClaimed {
+		t.Fatalf("outcome = %q, want %q", outcome, ClaimExactClaimed)
+	}
+	if got.Assignee != "worker-9" {
+		t.Fatalf("assignee = %q, want worker-9", got.Assignee)
+	}
+}
+
+// TestClaimExact_MetadataEqualsNilWantMatchesExplicitEmptyString documents
+// that a nil want ("must be absent or empty") is also satisfied by a key
+// explicitly set to "" — bead metadata has no tombstone distinct from "",
+// per ClaimExactPreconditions.MetadataEquals's doc comment.
+func TestClaimExact_MetadataEqualsNilWantMatchesExplicitEmptyString(t *testing.T) {
+	store := beads.NewMemStore()
+	b, err := store.Create(beads.Bead{
+		Title:  "exact claim target",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"custom.lease": "",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create bead: %v", err)
+	}
+
+	want := ClaimExactPreconditions{
+		MetadataEquals: map[string]*string{"custom.lease": nil},
+	}
+	got, outcome, err := ClaimExact(store, b.ID, want, "", beads.UpdateOpts{Assignee: strp("worker-9")})
+	if err != nil {
+		t.Fatalf("ClaimExact: %v", err)
+	}
+	if outcome != ClaimExactClaimed {
+		t.Fatalf("outcome = %q, want %q", outcome, ClaimExactClaimed)
+	}
+	if got.Assignee != "worker-9" {
+		t.Fatalf("assignee = %q, want worker-9", got.Assignee)
 	}
 }
 
