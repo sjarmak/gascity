@@ -3,7 +3,9 @@ package sessionlog
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"sync"
 )
 
 // codexTokenUsage mirrors the token-usage object the codex CLI embeds in
@@ -49,7 +51,7 @@ func ExtractCodexTailMeta(path string) (*TailMeta, error) {
 	}
 	defer f.Close() //nolint:errcheck // best-effort close on read-only file
 
-	data, startsMidLine, truncated, err := readTailWindow(f, tailChunkSize)
+	data, startsMidLine, truncated, _, err := readTailWindow(f, tailChunkSize)
 	if err != nil {
 		return nil, err
 	}
@@ -238,18 +240,22 @@ func boundedContextPercentage(inputTokens, contextWindow int) int {
 //   - ReasoningTokens = last reasoning_output_tokens
 //   - CacheCreationTokens = 0 (codex reports no cache-write tokens)
 //
-// Model comes from the latest preceding turn_context payload.model — empty
-// when no turn_context falls inside the tail window (token_count itself
-// carries no model). MessageID is the cumulative-total identity
-// ("total:<total_tokens>") so the exact-duplicate token_count emissions the
-// CLI produces collapse to a single entry (the last observed wins, except a
-// first-observed non-empty Model is kept — a duplicate re-emitted after a
-// model-switching turn_context must not relabel the invocation), and
-// EntryUUID is the line timestamp. token_count lines with null info
-// (rate-limit-only refreshes) and all-zero per-call usage are skipped;
-// malformed lines are tolerated silently. The scan window is the last
-// tailChunkSize bytes, so usage that scrolled past the window is not
-// returned.
+// Model comes from the latest preceding turn_context payload.model. Codex
+// writes turn_context once per turn-context CHANGE (not per turn), so on a
+// long rollout the turn_context in effect for an in-window usage entry can
+// itself fall outside the tail window; when no turn_context precedes the
+// entry within the window, a bounded head scan (codexHeadTurnContextModel)
+// resolves the model that was in effect when the window began. Model is
+// empty only when no turn_context precedes the entry anywhere in the file.
+// MessageID is the cumulative-total identity ("total:<total_tokens>") so the
+// exact-duplicate token_count emissions the CLI produces collapse to a
+// single entry (the last observed wins, except a first-observed non-empty
+// Model is kept — a duplicate re-emitted after a model-switching
+// turn_context must not relabel the invocation), and EntryUUID is the line
+// timestamp. token_count lines with null info (rate-limit-only refreshes)
+// and all-zero per-call usage are skipped; malformed lines are tolerated
+// silently. The scan window is the last tailChunkSize bytes, so usage that
+// scrolled past the window is not returned.
 func ExtractCodexTailUsage(path string) ([]TailUsage, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -257,7 +263,7 @@ func ExtractCodexTailUsage(path string) ([]TailUsage, error) {
 	}
 	defer f.Close() //nolint:errcheck // best-effort close on read-only file
 
-	data, _, err := readTail(f, tailChunkSize)
+	data, _, _, offset, err := readTailWindow(f, tailChunkSize)
 	if err != nil {
 		return nil, err
 	}
@@ -267,6 +273,8 @@ func ExtractCodexTailUsage(path string) ([]TailUsage, error) {
 	// duplicate token_count emissions collapse to a single entry.
 	byMessageID := make(map[string]int)
 	var turnModel string
+	var headModel string
+	headModelResolved := false
 	for _, line := range splitLines(data) {
 		var entry codexRawEntry
 		if err := json.Unmarshal(line, &entry); err != nil {
@@ -285,6 +293,14 @@ func ExtractCodexTailUsage(path string) ([]TailUsage, error) {
 		if entry.Type != "event_msg" || payload.Type != "token_count" || payload.Info == nil {
 			continue
 		}
+		model := turnModel
+		if model == "" {
+			if !headModelResolved {
+				headModel = codexHeadTurnContextModel(path, offset)
+				headModelResolved = true
+			}
+			model = headModel
+		}
 		last := payload.Info.LastTokenUsage
 		input := last.InputTokens - last.CachedInputTokens
 		if input < 0 {
@@ -297,7 +313,7 @@ func ExtractCodexTailUsage(path string) ([]TailUsage, error) {
 		u := TailUsage{
 			EntryUUID:           entry.Timestamp,
 			MessageID:           fmt.Sprintf("total:%d", payload.Info.TotalTokenUsage.TotalTokens),
-			Model:               turnModel,
+			Model:               model,
 			InputTokens:         input,
 			OutputTokens:        last.OutputTokens,
 			ReasoningTokens:     last.ReasoningOutputTokens,
@@ -333,4 +349,100 @@ func ExtractCodexTailUsageFromSearchPaths(searchPaths []string, path string) ([]
 		return nil, err
 	}
 	return ExtractCodexTailUsage(safePath)
+}
+
+// codexHeadModelScanCap bounds the head scan's worst-case read: the rollout
+// bytes immediately before the tail window, capped so a pathologically large
+// rollout cannot force an unbounded read.
+const codexHeadModelScanCap = 8 * 1024 * 1024
+
+// codexHeadModelCacheLimit bounds the number of distinct rollout paths the
+// cache tracks, so a process that scans many short-lived rollout files (for
+// example, throwaway paths in tests) cannot grow the cache without bound.
+const codexHeadModelCacheLimit = 4096
+
+type codexHeadModelCacheEntry struct {
+	offset int64
+	model  string
+}
+
+var (
+	codexHeadModelCacheMu sync.Mutex
+	codexHeadModelCache   = make(map[string]codexHeadModelCacheEntry)
+)
+
+// codexHeadTurnContextModel returns the model of the last turn_context entry
+// before offset bytes into the rollout at path — the model in effect when
+// the tail window began, for a tail-window usage entry with no turn_context
+// of its own preceding it. offset is 0 when the whole file fit in the tail
+// window, in which case there is nothing before the window to scan.
+//
+// Rollouts are append-only, so the bytes below a given offset never change:
+// results are cached per (path, offset), and the offset check invalidates a
+// stale entry as soon as the file grows past its old tail window.
+func codexHeadTurnContextModel(path string, offset int64) string {
+	if offset <= 0 {
+		return ""
+	}
+
+	codexHeadModelCacheMu.Lock()
+	if entry, ok := codexHeadModelCache[path]; ok && entry.offset == offset {
+		codexHeadModelCacheMu.Unlock()
+		return entry.model
+	}
+	codexHeadModelCacheMu.Unlock()
+
+	model := scanCodexHeadModel(path, offset)
+
+	codexHeadModelCacheMu.Lock()
+	if len(codexHeadModelCache) >= codexHeadModelCacheLimit {
+		codexHeadModelCache = make(map[string]codexHeadModelCacheEntry)
+	}
+	codexHeadModelCache[path] = codexHeadModelCacheEntry{offset: offset, model: model}
+	codexHeadModelCacheMu.Unlock()
+	return model
+}
+
+// scanCodexHeadModel reads up to codexHeadModelScanCap bytes immediately
+// before offset and returns the model of the last turn_context entry found.
+// Read or parse failures resolve to an empty model rather than an error:
+// this is a best-effort fallback for a usage entry that already resolved
+// everything except its model.
+func scanCodexHeadModel(path string, offset int64) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close() //nolint:errcheck // best-effort close on read-only file
+
+	start := offset - codexHeadModelScanCap
+	if start < 0 {
+		start = 0
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return ""
+	}
+	data := make([]byte, offset-start)
+	if _, err := io.ReadFull(f, data); err != nil {
+		return ""
+	}
+
+	var model string
+	for _, line := range splitLines(data) {
+		var entry codexRawEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			continue
+		}
+		if entry.Type != "turn_context" {
+			continue
+		}
+		var payload codexUsagePayload
+		if err := json.Unmarshal(entry.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Model != "" {
+			model = payload.Model
+		}
+	}
+	return model
 }

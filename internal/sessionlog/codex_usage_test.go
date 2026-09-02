@@ -204,6 +204,89 @@ func TestExtractCodexTailUsageModelMissing(t *testing.T) {
 	}
 }
 
+// writeCodexUsageTailBoundaryFixture writes a rollout where outsideWindow
+// falls before the last tailChunkSize bytes and tailLines land inside it,
+// mirroring the boundary construction in
+// TestExtractCodexTailMetaTruncatedWindowFailsClosedOnFirstCumulativeTotal.
+func writeCodexUsageTailBoundaryFixture(t *testing.T, name string, outsideWindow []string, tailLines []string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	outside := strings.Join(outsideWindow, "\n") + "\n"
+
+	insideWindow := strings.Join(tailLines, "\n") + "\n"
+	const fillerPrefix = `{"timestamp":"2026-04-16T21:49:39.000Z","type":"ignored","payload":{"padding":"`
+	const fillerSuffix = `"}}` + "\n"
+	fillerBytes := int(tailChunkSize) - len(insideWindow) - len(fillerPrefix) - len(fillerSuffix)
+	if fillerBytes < 0 {
+		t.Fatalf("tail fixture is %d bytes larger than tailChunkSize", -fillerBytes)
+	}
+	tailWindow := fillerPrefix + strings.Repeat("x", fillerBytes) + fillerSuffix + insideWindow
+	if got, want := len(tailWindow), int(tailChunkSize); got != want {
+		t.Fatalf("tail fixture size = %d, want %d", got, want)
+	}
+	if err := os.WriteFile(path, []byte(outside+tailWindow), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q): %v", path, err)
+	}
+	return path
+}
+
+func TestExtractCodexTailUsageResolvesModelBeyondTailWindow(t *testing.T) {
+	path := writeCodexUsageTailBoundaryFixture(t, "rollout-tail-boundary-usage.jsonl",
+		[]string{codexTurnContextLine("2026-04-16T21:49:30.901Z", "gpt-5.4")},
+		[]string{codexTokenCountLine("2026-04-16T21:49:40.470Z", 15_917, 15_562, 10_624, 355, 166)},
+	)
+
+	usages, err := ExtractCodexTailUsage(path)
+	if err != nil {
+		t.Fatalf("ExtractCodexTailUsage: %v", err)
+	}
+	if len(usages) != 1 {
+		t.Fatalf("got %d usages, want 1", len(usages))
+	}
+	if got, want := usages[0].Model, "gpt-5.4"; got != want {
+		t.Errorf("Model = %q, want head-scanned model %q from before the tail window", got, want)
+	}
+}
+
+func TestExtractCodexTailUsageInWindowModelTakesPriorityOverHeadScan(t *testing.T) {
+	path := writeCodexUsageTailBoundaryFixture(t, "rollout-tail-boundary-usage-inwindow.jsonl",
+		[]string{codexTurnContextLine("2026-04-16T21:49:30.901Z", "gpt-5.4")},
+		[]string{
+			codexTurnContextLine("2026-04-16T21:49:40.000Z", "gpt-5.5"),
+			codexTokenCountLine("2026-04-16T21:49:40.470Z", 15_917, 15_562, 10_624, 355, 166),
+		},
+	)
+
+	usages, err := ExtractCodexTailUsage(path)
+	if err != nil {
+		t.Fatalf("ExtractCodexTailUsage: %v", err)
+	}
+	if len(usages) != 1 {
+		t.Fatalf("got %d usages, want 1", len(usages))
+	}
+	if got, want := usages[0].Model, "gpt-5.5"; got != want {
+		t.Errorf("Model = %q, want in-window turn_context model %q, not the head-scanned one", got, want)
+	}
+}
+
+func TestExtractCodexTailUsageModelMissingBeyondTailWindow(t *testing.T) {
+	path := writeCodexUsageTailBoundaryFixture(t, "rollout-tail-boundary-usage-nomodel.jsonl",
+		[]string{codexSessionMetaLine("2026-04-16T21:49:30.734Z", "/work/dir")},
+		[]string{codexTokenCountLine("2026-04-16T21:49:40.470Z", 15_917, 15_562, 10_624, 355, 166)},
+	)
+
+	usages, err := ExtractCodexTailUsage(path)
+	if err != nil {
+		t.Fatalf("ExtractCodexTailUsage: %v", err)
+	}
+	if len(usages) != 1 {
+		t.Fatalf("got %d usages, want 1", len(usages))
+	}
+	if got := usages[0].Model; got != "" {
+		t.Errorf("Model = %q, want empty when no turn_context precedes the entry anywhere in the file", got)
+	}
+}
+
 func TestExtractCodexTailMetaUsesLatestRealUsageShape(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "2026", "04", "16", "rollout-2026-04-16T21-49-29-meta.jsonl")
