@@ -136,6 +136,7 @@ const (
 	FanoutModeMetadataKey                = "gc.fanout_mode"
 	FanoutStateMetadataKey               = "gc.fanout_state"
 	FinalDispositionMetadataKey          = "gc.final_disposition"
+	FinalizeModeMetadataKey              = "gc.finalize_mode"
 	ForEachMetadataKey                   = "gc.for_each"
 	FormulaMetadataKey                   = "gc.formula"
 	FormulaContractMetadataKey           = "gc.formula_contract"
@@ -168,6 +169,7 @@ const (
 	ModelMetadataKey                    = "gc.model"
 	NativeStepDependenciesMetadataKey   = "gc.native_step_dependencies.v1"
 	NextAttemptMetadataKey              = "gc.next_attempt"
+	NoLandMetadataKey                   = "gc.no_land"
 	OnExhaustedMetadataKey              = "gc.on_exhausted"
 	OnFailMetadataKey                   = "gc.on_fail"
 	OriginalKindMetadataKey             = "gc.original_kind"
@@ -442,6 +444,7 @@ var KnownMetadataKeys = []string{
 	FanoutModeMetadataKey,
 	FanoutStateMetadataKey,
 	FinalDispositionMetadataKey,
+	FinalizeModeMetadataKey,
 	ForEachMetadataKey,
 	FormulaMetadataKey,
 	FormulaContractMetadataKey,
@@ -465,6 +468,7 @@ var KnownMetadataKeys = []string{
 	ModelMetadataKey,
 	NativeStepDependenciesMetadataKey,
 	NextAttemptMetadataKey,
+	NoLandMetadataKey,
 	OnExhaustedMetadataKey,
 	OnFailMetadataKey,
 	OriginalKindMetadataKey,
