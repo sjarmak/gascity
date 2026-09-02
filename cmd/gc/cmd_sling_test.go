@@ -1010,6 +1010,35 @@ func TestDoSlingFormulaInstantiationError(t *testing.T) {
 	}
 }
 
+// TestDoSlingRejectsReservedVarsAtCLI pins the gc-8umql fix at the CLI
+// boundary: --var no_land / --var finalize_mode look like they gate a
+// finalize guard, but stampFormulaVars only ever stamps gc.var.<name> on the
+// molecule root, never the bare key a guard reads off the target bead. gc
+// sling must reject the flag loudly and point at --set-metadata instead of
+// silently dispatching as if the guard were set.
+func TestDoSlingRejectsReservedVarsAtCLI(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	opts := testOpts(a, "code-review")
+	opts.IsFormula = true
+	opts.Vars = []string{"no_land=true", "finalize_mode=verify-only"}
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 1 {
+		t.Fatalf("doSling returned %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "--set-metadata") {
+		t.Errorf("stderr = %q, want error naming --set-metadata", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "no_land") {
+		t.Errorf("stderr = %q, want error naming the rejected --var key", stderr.String())
+	}
+}
+
 func TestDoSlingNudgeFixedAgent(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
