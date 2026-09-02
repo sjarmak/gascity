@@ -57,6 +57,9 @@ func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, 
 	if err := validateDeps(deps); err != nil {
 		return SlingResult{}, err
 	}
+	if err := validateReservedVarNames(opts.Vars); err != nil {
+		return SlingResult{}, err
+	}
 	a := opts.Target
 	result, preErr := preflight(opts, deps, querier)
 	if preErr != nil {
