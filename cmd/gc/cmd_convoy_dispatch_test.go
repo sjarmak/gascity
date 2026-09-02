@@ -1324,7 +1324,14 @@ func TestCmdWorkflowDeleteSourceFindsConvoyFirstRootByOriginalSourceBead(t *test
 	if err != nil {
 		t.Fatalf("Create(source): %v", err)
 	}
-	convoy, err := store.Create(beads.Bead{Title: "synthetic input convoy", Type: "convoy", Status: "open"})
+	convoy, err := store.Create(beads.Bead{
+		Title:  "synthetic input convoy",
+		Type:   "convoy",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.SyntheticMetadataKey: "true",
+		},
+	})
 	if err != nil {
 		t.Fatalf("Create(convoy): %v", err)
 	}
@@ -1380,6 +1387,105 @@ func TestCmdWorkflowDeleteSourceFindsConvoyFirstRootByOriginalSourceBead(t *test
 	}
 	if updatedChild.Status != "closed" {
 		t.Fatalf("child status = %q, want closed", updatedChild.Status)
+	}
+}
+
+func TestCmdWorkflowDeleteSourceIgnoresRootKeyedToOrdinaryMultiItemConvoy(t *testing.T) {
+	// Regression for the second gc-f0lkv review round: the convoy-tracking
+	// reverse lookup used by delete-source must only alias a source bead to
+	// SYNTHETIC single-item input convoys (CreateSingleItemInputConvoy,
+	// gc.synthetic=true), never to an ordinary, user-created convoy that
+	// happens to also track it. An ordinary convoy can carry unrelated
+	// sibling members; if delete-source on one member matched a workflow
+	// root keyed to the whole convoy, it would close work that was never
+	// named on the command line. Here delete-source is run against a member
+	// of a plain (non-synthetic) multi-item convoy and must report
+	// already_clean, leaving the convoy-keyed root and its child untouched.
+	cityDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n\n[daemon]\nformula_v2 = true\n"+testControlDispatcherAgentTOML("")), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+	prevCityFlag := cityFlag
+	cityFlag = ""
+	t.Cleanup(func() { cityFlag = prevCityFlag })
+
+	store, err := openStoreAtForCity(cityDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity: %v", err)
+	}
+	member, err := store.Create(beads.Bead{Title: "member of an ordinary convoy", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatalf("Create(member): %v", err)
+	}
+	sibling, err := store.Create(beads.Bead{Title: "sibling member of the same convoy", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatalf("Create(sibling): %v", err)
+	}
+	convoy, err := store.Create(beads.Bead{Title: "ordinary multi-item convoy", Type: "convoy", Status: "open"})
+	if err != nil {
+		t.Fatalf("Create(convoy): %v", err)
+	}
+	if err := convoycore.TrackItem(store, convoy.ID, member.ID); err != nil {
+		t.Fatalf("TrackItem(member): %v", err)
+	}
+	if err := convoycore.TrackItem(store, convoy.ID, sibling.ID); err != nil {
+		t.Fatalf("TrackItem(sibling): %v", err)
+	}
+	root, err := store.Create(beads.Bead{
+		Title: "workflow keyed to the ordinary convoy",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.formula_contract": "graph.v2",
+			"gc.input_convoy_id":  convoy.ID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+	// The store's default Create status (not necessarily "open" on every
+	// backend) is the pre-command baseline; the assertion below is that
+	// delete-source leaves it unchanged, not that it holds a specific value.
+	wantRootStatus := root.Status
+	child, err := store.Create(beads.Bead{
+		Title:  "Child",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(child): %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdWorkflowDeleteSource(member.ID, sourceWorkflowStoreSelector{}, true, false, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdWorkflowDeleteSource(member of ordinary convoy) = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "result=already_clean") {
+		t.Fatalf("stdout = %q, want already_clean (ordinary convoy must not alias its members to the root it tracks)", stdout.String())
+	}
+
+	reloaded, err := openStoreAtForCity(cityDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(reload): %v", err)
+	}
+	untouchedRoot, err := reloaded.Get(root.ID)
+	if err != nil {
+		t.Fatalf("Get(root): %v", err)
+	}
+	if untouchedRoot.Status != wantRootStatus || untouchedRoot.Status == "closed" {
+		t.Fatalf("root status = %q, want unchanged %q (sibling work must not be affected)", untouchedRoot.Status, wantRootStatus)
+	}
+	untouchedChild, err := reloaded.Get(child.ID)
+	if err != nil {
+		t.Fatalf("Get(child): %v", err)
+	}
+	if untouchedChild.Status != "open" {
+		t.Fatalf("child status = %q, want unchanged open", untouchedChild.Status)
 	}
 }
 
