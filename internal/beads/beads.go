@@ -582,6 +582,11 @@ func IsDeferred(b Bead, now time.Time) bool {
 	return b.DeferUntil != nil && b.DeferUntil.After(now)
 }
 
+// syntheticContainerDeferYears is how far out SyntheticContainerDeferUntil
+// pushes defer_until — long enough that the hold is effectively permanent
+// rather than a schedule to babysit.
+const syntheticContainerDeferYears = 100
+
 // SyntheticContainerDeferUntil returns the defer_until value system-minted
 // container beads (input convoys, drain unit convoys) should be created with,
 // so they never surface in bd's ready-work view — including a bare `bd ready`
@@ -592,11 +597,13 @@ func IsDeferred(b Bead, now time.Time) bool {
 // above treats every convoy as infrastructure. A caller-side --exclude-type
 // flag only helps gc's own Go call sites; it does nothing for a human or
 // agent running the bd CLI directly, so the hold has to live on the bead
-// itself. The container's own Close (CloseSyntheticInputConvoy or equivalent)
-// removes it long before this date; the far horizon just makes the deferral
-// effectively permanent rather than a schedule to babysit.
+// itself. An input convoy's own CloseSyntheticInputConvoy removes it well
+// before this date; a drain unit convoy is never closed at all — it persists
+// as a permanent tracking record for the life of the drain — so for that kind
+// the far-future hold is the only thing keeping it out of ready, not a
+// backstop for eventual cleanup.
 func SyntheticContainerDeferUntil() *time.Time {
-	t := time.Now().AddDate(100, 0, 0)
+	t := time.Now().AddDate(syntheticContainerDeferYears, 0, 0)
 	return &t
 }
 
