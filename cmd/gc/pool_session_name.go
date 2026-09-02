@@ -715,20 +715,26 @@ func releaseOrphanedPoolAssignment(store beads.Store, wb beads.Bead, clearDetach
 // isRecoverableUnassignedInProgressPoolWork, so
 // wb.Metadata[beadmeta.RootBeadIDMetadataKey] names a distinct bead.
 //
-// requireHolder is deliberately empty (force-release): the reconciler has
-// already proven the prior holder dead via the session-liveness checks that
-// led it to release wb, so this must not additionally require the lease to
-// still be held by wb's now-stale assignee. This is the crash-recovery path
-// molecule.ReleaseContinuationLease documents — it deterministically expires
-// the lease and frees the root's continuation for whichever session next
-// acquires it, rather than leaving the root's continuation ready but
-// permanently unassigned.
+// requireHolder is bound to wb's own (pre-release) assignee, snapshotted
+// before releasePoolAssignmentWithRecheck mutated the store — wb is passed by
+// value throughout releaseOrphanedPoolAssignment, so this snapshot is safe to
+// read here. The reconciler has only proven THAT specific identity dead via
+// the session-liveness checks that led it to release wb; it has proven
+// nothing about whoever else may currently hold the root's lease. Passing an
+// empty requireHolder would force-release regardless of holder, which can
+// revoke a live successor's lease if that successor acquired the root
+// between the orphan decision and this call. Binding to wb.Assignee makes
+// the release a no-op (ContinuationLeaseNotHeld) whenever the current holder
+// is anyone else — including a live successor — requiring a fresh liveness
+// decision for that holder rather than treating this call as blanket
+// permission to force-release it.
 func releaseOrphanedContinuationLease(store beads.Store, wb beads.Bead) {
 	rootID := strings.TrimSpace(wb.Metadata[beadmeta.RootBeadIDMetadataKey])
 	if rootID == "" {
 		return
 	}
-	_, outcome, err := molecule.ReleaseContinuationLease(store, rootID, "")
+	requireHolder := strings.TrimSpace(wb.Assignee)
+	_, outcome, err := molecule.ReleaseContinuationLease(store, rootID, requireHolder)
 	if err != nil {
 		log.Printf("releaseOrphanedPoolAssignments: releasing continuation lease on root %s for %s: %v", rootID, wb.ID, err)
 		return
