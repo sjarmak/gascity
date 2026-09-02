@@ -27,6 +27,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/closeorder"
 	"github.com/gastownhall/gascity/internal/citylayout"
+	"github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/pathutil"
 )
 
@@ -166,7 +167,26 @@ func WorkflowMatchesSource(root beads.Bead, sourceBeadID, sourceStoreRef, rootSt
 	if sourceBeadID == "" {
 		return false
 	}
-	if effectiveSourceBeadID(root) != sourceBeadID {
+	return workflowMatchesAnySource(root, []string{sourceBeadID}, sourceStoreRef, rootStoreRef)
+}
+
+// workflowMatchesAnySource is WorkflowMatchesSource generalized to a set of
+// acceptable source identities, so ListLiveRoots can accept a root whose
+// effectiveSourceBeadID matches either the queried source bead ID directly or
+// one of the synthetic convoys that tracks it.
+func workflowMatchesAnySource(root beads.Bead, sourceBeadIDs []string, sourceStoreRef, rootStoreRef string) bool {
+	effective := effectiveSourceBeadID(root)
+	if effective == "" {
+		return false
+	}
+	matched := false
+	for _, id := range sourceBeadIDs {
+		if id != "" && id == effective {
+			matched = true
+			break
+		}
+	}
+	if !matched {
 		return false
 	}
 	sourceStoreRef = NormalizeSourceStoreRef(sourceStoreRef)
@@ -186,35 +206,65 @@ func WorkflowMatchesSource(root beads.Bead, sourceBeadID, sourceStoreRef, rootSt
 
 // ListLiveRoots returns the live (not-closed) workflow roots in store that
 // belong to sourceBeadID, scoped to sourceStoreRef when set. It queries both
-// gc.source_bead_id and gc.input_convoy_id, since convoy-first graph launches
-// stamp only the latter (see effectiveSourceBeadID), and filters via
+// gc.source_bead_id and gc.input_convoy_id directly, since convoy-first graph
+// launches stamp only the latter (see effectiveSourceBeadID). It filters via
 // IsWorkflowRoot so both legacy gc.kind=workflow roots and graph.v2-only
 // roots are visible.
+//
+// This is the narrow, launch-time-safe form: it does NOT resolve
+// sourceBeadID through convoy-tracking membership. Repeated bare-bead
+// graph.v2 attaches each mint their own throwaway single-item input convoy
+// (CreateSingleItemInputConvoy) and are intentionally allowed to coexist as
+// independent live roots; resolving through convoy membership here would
+// make the launch-time singleton conflict pre-check treat those independent
+// attaches as duplicates. Use ListLiveRootsViaConvoyMembership for
+// lookup/cleanup paths (`gc workflow delete-source`) that need to find a
+// root by the original source bead's ID even when only a synthetic convoy ID
+// was stamped on it.
 func ListLiveRoots(store beads.Store, sourceBeadID, sourceStoreRef, rootStoreRef string) ([]beads.Bead, error) {
 	sourceBeadID = NormalizeSourceBeadID(sourceBeadID)
 	if store == nil || sourceBeadID == "" {
 		return nil, nil
 	}
+	return listLiveRootsForIDs(store, []string{sourceBeadID}, sourceStoreRef, rootStoreRef)
+}
+
+// ListLiveRootsViaConvoyMembership behaves like ListLiveRoots but also
+// resolves sourceBeadID through convoy-tracking membership:
+// CreateSingleItemInputConvoy mints a synthetic one-item convoy that TRACKS
+// the original work bead rather than being stamped onto it, so a caller who
+// passes that original bead's ID (not the synthetic convoy's ID) needs the
+// reverse lookup to find the root at all. This is the form `gc workflow
+// delete-source`/`gc convoy delete-source` use, so an operator can pass
+// either identity and still find the live root.
+func ListLiveRootsViaConvoyMembership(store beads.Store, sourceBeadID, sourceStoreRef, rootStoreRef string) ([]beads.Bead, error) {
+	sourceBeadID = NormalizeSourceBeadID(sourceBeadID)
+	if store == nil || sourceBeadID == "" {
+		return nil, nil
+	}
+	ids := []string{sourceBeadID}
+	trackingConvoys, err := convoy.TrackingConvoysForItem(store, sourceBeadID)
+	if err != nil {
+		return nil, fmt.Errorf("resolving tracking convoys for %s: %w", sourceBeadID, err)
+	}
+	for _, tc := range trackingConvoys {
+		if tc.ID == "" || tc.ID == sourceBeadID {
+			continue
+		}
+		ids = append(ids, tc.ID)
+	}
+	return listLiveRootsForIDs(store, ids, sourceStoreRef, rootStoreRef)
+}
+
+// listLiveRootsForIDs is the shared scan behind ListLiveRoots and
+// ListLiveRootsViaConvoyMembership: it looks up live roots keyed by either
+// gc.source_bead_id or gc.input_convoy_id for any of ids, and accepts a root
+// whose effectiveSourceBeadID matches any of ids.
+func listLiveRootsForIDs(store beads.Store, ids []string, sourceStoreRef, rootStoreRef string) ([]beads.Bead, error) {
 	live := beads.HandlesFor(store).Live
-	bySource, err := live.List(beads.ListQuery{
-		Metadata: map[string]string{
-			beadmeta.SourceBeadIDMetadataKey: sourceBeadID,
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	byInputConvoy, err := live.List(beads.ListQuery{
-		Metadata: map[string]string{
-			beadmeta.InputConvoyIDMetadataKey: sourceBeadID,
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	seen := make(map[string]struct{}, len(bySource)+len(byInputConvoy))
-	roots := make([]beads.Bead, 0, len(bySource)+len(byInputConvoy))
-	for _, candidates := range [][]beads.Bead{bySource, byInputConvoy} {
+	seen := make(map[string]struct{})
+	var roots []beads.Bead
+	addAll := func(candidates []beads.Bead) {
 		for _, root := range candidates {
 			if root.ID == "" {
 				continue
@@ -226,11 +276,31 @@ func ListLiveRoots(store beads.Store, sourceBeadID, sourceStoreRef, rootStoreRef
 			roots = append(roots, root)
 		}
 	}
+	for _, id := range ids {
+		bySource, err := live.List(beads.ListQuery{
+			Metadata: map[string]string{
+				beadmeta.SourceBeadIDMetadataKey: id,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		addAll(bySource)
+		byInputConvoy, err := live.List(beads.ListQuery{
+			Metadata: map[string]string{
+				beadmeta.InputConvoyIDMetadataKey: id,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		addAll(byInputConvoy)
+	}
 	roots = slices.DeleteFunc(roots, func(root beads.Bead) bool {
 		if !IsWorkflowRoot(root) {
 			return true
 		}
-		return !WorkflowMatchesSource(root, sourceBeadID, sourceStoreRef, rootStoreRef)
+		return !workflowMatchesAnySource(root, ids, sourceStoreRef, rootStoreRef)
 	})
 	slices.SortFunc(roots, func(a, b beads.Bead) int {
 		return strings.Compare(a.ID, b.ID)
