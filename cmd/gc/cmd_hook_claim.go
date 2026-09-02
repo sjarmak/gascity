@@ -18,6 +18,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/executionevent"
+	"github.com/gastownhall/gascity/internal/molecule"
 )
 
 const hookClaimCommandName = "hook"
@@ -39,6 +40,12 @@ const (
 const (
 	hookClaimReleaseReasonUndelivered = "result_undelivered"
 	hookClaimReleaseReasonStraddled   = "claim_window_straddled"
+	// hookClaimReleaseReasonLeaseDenied means the claim CAS won but this
+	// session could not acquire the bead's graph.v2 continuation lease (a
+	// live different holder, a stale generation, or a terminal root), so the
+	// claim is given back rather than executed without the affinity guarantee
+	// gc.session_affinity=require promises. See acquireHookContinuationLease.
+	hookClaimReleaseReasonLeaseDenied = "continuation_lease_denied"
 )
 
 var hookClaimMutationTimeout = 10 * time.Second
@@ -211,6 +218,20 @@ type hookClaimOps struct {
 	// legitimately changed hands in the meantime is left alone. It reports
 	// whether the release actually landed.
 	Release hookClaimReleaseFunc
+	// AcquireContinuationLease enforces graph.v2 gc.session_affinity=require: it
+	// atomically acquires or renews the single continuation lease on a
+	// workflow root for this session, fenced on molecule.ClaimExact's
+	// generation counter (see internal/molecule/continuation_lease.go). Called
+	// from writeHookClaimWorkResultForBead before any sibling preassignment, so
+	// siblings are only vacuumed onto a session that legitimately holds the
+	// root's lease.
+	AcquireContinuationLease hookAcquireContinuationLeaseFunc
+	// ContinuationLeaseHolder is a plain read of a workflow root's current
+	// continuation-lease holder, used ONLY for root-aware claim-candidate
+	// precedence (see reorderHookClaimCandidatesForRootAffinity) — it never
+	// mutates state, so it is safe to call speculatively for candidates that
+	// end up not being claimed.
+	ContinuationLeaseHolder hookContinuationLeaseHolderFunc
 	// EmitClaimWindowExpired and EmitClaimReleased publish the two turn-binding
 	// facts. Best-effort, like EmitClaimRejected.
 	EmitClaimWindowExpired func(hookClaimWindowExpiry)
@@ -244,6 +265,14 @@ type (
 	hookStampSessionClaimFunc  func(sessionID, beadID string) error
 	hookPublishRunMapFunc      func(runID, beadID string, sessionKeys ...string) error
 	hookClaimReleaseFunc       func(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error)
+	// hookAcquireContinuationLeaseFunc acquires/renews rootID's graph.v2
+	// continuation lease for sessionID, fenced on group. See
+	// molecule.AcquireContinuationLease.
+	hookAcquireContinuationLeaseFunc func(ctx context.Context, dir string, env []string, rootID, group, sessionID string) (molecule.ContinuationLeaseOutcome, error)
+	// hookContinuationLeaseHolderFunc is a plain, non-mutating read of rootID's
+	// current continuation-lease holder session ID ("" if unheld). See
+	// molecule.ContinuationLeaseHolder.
+	hookContinuationLeaseHolderFunc func(ctx context.Context, dir string, env []string, rootID string) (string, error)
 )
 
 type hookClaimJSONResult struct {
@@ -357,7 +386,11 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 	if readyResult.terminal {
 		return readyResult
 	}
-	eligibleResult := claimFirstEligibleHookCandidate(candidates, *opts, *ops, dir, stdout, stderr)
+	eligibleCandidates := candidates
+	if !ops.claimWindowSpent() {
+		eligibleCandidates = reorderHookClaimCandidatesForRootAffinity(candidates, *opts, *ops, dir)
+	}
+	eligibleResult := claimFirstEligibleHookCandidate(eligibleCandidates, *opts, *ops, dir, stdout, stderr)
 	// A skipped assigned-tier claim error must survive the handoff to the routed
 	// tier: both tiers feed ONE shared drain, and dropping the flag here would
 	// launder an assigned-tier write failure into a healthy no_work.
@@ -406,6 +439,12 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.Release == nil {
 		ops.Release = hookClaimReleaseWithBdStore
+	}
+	if ops.AcquireContinuationLease == nil {
+		ops.AcquireContinuationLease = hookAcquireContinuationLeaseWithBdStore
+	}
+	if ops.ContinuationLeaseHolder == nil {
+		ops.ContinuationLeaseHolder = hookContinuationLeaseHolderWithBdStore
 	}
 	if ops.EmitClaimWindowExpired == nil {
 		ops.EmitClaimWindowExpired = hookEmitClaimWindowExpired
@@ -644,6 +683,68 @@ func hookClaimBeadIsElsewhere(err error) bool {
 // non-terminal result (no output written) so a federated caller can try a later
 // store before the shared no-work drain; the result's claimsErrored flag records
 // whether any skip was an error so that drain stays distinguishable from idle.
+// reorderHookClaimCandidatesForRootAffinity implements graph.v2's
+// "root-aware claim precedence" and "no unrelated-root fallback" for
+// gc.session_affinity=require work, ahead of claimFirstEligibleHookCandidate
+// attempting candidates in order:
+//
+//   - A candidate whose workflow root THIS session already holds the
+//     continuation lease for is promoted ahead of unrelated generic work
+//     (root-aware precedence).
+//   - A candidate whose root is actively held by a DIFFERENT live session is
+//     dropped outright — never merely deprioritized — so this session can
+//     never fall back to claiming and executing it without the affinity
+//     guarantee session_affinity=require promises (no unrelated-root
+//     fallback). acquireHookContinuationLease would refuse it anyway; this
+//     avoids spending a claim attempt (and a claim-rejected event) on a
+//     candidate that can never be executed here.
+//   - Every other candidate (no required-affinity root/group, or one whose
+//     root has no current holder at all) keeps its original relative order:
+//     ordinary first-come eligibility for unheld roots.
+//
+// Candidates without a required-affinity root/group are never read here —
+// the lease holder lookup only runs for candidates that actually carry one,
+// so the common case (no continuation-group work in the batch) costs nothing
+// extra.
+func reorderHookClaimCandidatesForRootAffinity(candidates []beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string) []beads.Bead {
+	sessionID := continuationPinAssignee(opts)
+	owned := make([]beads.Bead, 0, len(candidates))
+	rest := make([]beads.Bead, 0, len(candidates))
+	var ctx context.Context
+	var cancel context.CancelFunc
+	for _, candidate := range candidates {
+		rootID := strings.TrimSpace(candidate.Metadata[beadmeta.RootBeadIDMetadataKey])
+		group := strings.TrimSpace(candidate.Metadata[beadmeta.ContinuationGroupMetadataKey])
+		if rootID == "" || group == "" || !strings.EqualFold(strings.TrimSpace(candidate.Metadata[beadmeta.SessionAffinityMetadataKey]), "require") {
+			rest = append(rest, candidate)
+			continue
+		}
+		if ctx == nil {
+			ctx, cancel = context.WithTimeout(context.Background(), hookClaimMutationTimeout)
+			defer cancel()
+		}
+		holder, err := ops.ContinuationLeaseHolder(ctx, dir, opts.Env, rootID)
+		if err != nil {
+			// Cannot confirm the lease state; leave the candidate in normal
+			// order rather than guessing. claimFirstEligibleHookCandidate plus
+			// acquireHookContinuationLease resolve it authoritatively (and
+			// fail closed) at actual claim time.
+			rest = append(rest, candidate)
+			continue
+		}
+		switch strings.TrimSpace(holder) {
+		case "":
+			rest = append(rest, candidate)
+		case sessionID:
+			owned = append(owned, candidate)
+		default:
+			// A different live session holds this root's lease: drop it. No
+			// unrelated-root fallback.
+		}
+	}
+	return append(owned, rest...)
+}
+
 func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stdout, stderr io.Writer) hookClaimResult {
 	ctx, cancel := ops.claimMutationContext()
 	defer cancel()
@@ -805,6 +906,20 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 	}
 	stampHookSessionCurrentClaim(bead, opts, ops, stderr)
 	publishHookClaimRunMap(bead, opts, ops, stderr)
+	if leaseErr := acquireHookContinuationLease(bead, opts, ops, dir); leaseErr != nil {
+		// The claim CAS already won, but graph.v2 gc.session_affinity=require
+		// promises this session will only execute the bead while it actually
+		// holds the workflow root's continuation lease. It does not, so the
+		// claim is given back exactly like the F-C EPIPE case below rather than
+		// executed without the affinity guarantee.
+		cause := fmt.Sprintf("acquiring continuation lease for %s: %v", bead.ID, leaseErr)
+		if !minted {
+			fmt.Fprintf(stderr, "gc hook --claim: %s\n", cause) //nolint:errcheck
+			return 1
+		}
+		clearHookSessionCurrentClaim(opts, ops, stderr)
+		return unwindUndeliveredHookClaim(hookClaimReleaseReasonLeaseDenied, cause, bead, opts, ops, dir, stderr)
+	}
 	assigned, err := preassignHookContinuationGroup(bead, opts, ops, dir)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc hook --claim: preassigning continuation group for %s: %v\n", bead.ID, err) //nolint:errcheck
@@ -997,6 +1112,45 @@ func writeHookClaimDrain(reason string, jsonOut, drainAck bool, drainAckFn hookD
 		return 0
 	}
 	return 1
+}
+
+// acquireHookContinuationLease enforces graph.v2 gc.session_affinity=require:
+// when bead carries a root/group AND is marked "require", this session must
+// hold (or be able to acquire) the root's single continuation lease before it
+// is allowed to execute the bead. It no-ops for ordinary work (no root/group,
+// or affinity not "require") — the vast majority of claims, which never
+// touch a lease at all.
+//
+// A non-nil error means the caller must give the claim back: either the lease
+// is genuinely held by a different live session or the root has gone
+// terminal (ContinuationLeaseHeldByOther / ContinuationLeaseRootTerminal), or
+// this session's view of the root's generation was superseded by a
+// concurrent acquire/release (ContinuationLeaseStale) and it must not guess.
+// Executing without the lease would defeat the affinity guarantee the caller
+// already promised by routing the bead this way.
+func acquireHookContinuationLease(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string) error {
+	rootID := strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
+	group := strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey])
+	if rootID == "" || group == "" {
+		return nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(bead.Metadata[beadmeta.SessionAffinityMetadataKey]), "require") {
+		return nil
+	}
+	sessionID := continuationPinAssignee(opts)
+	if sessionID == "" {
+		return fmt.Errorf("continuation lease for %s requires a session or assignee identity", rootID)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
+	defer cancel()
+	outcome, err := ops.AcquireContinuationLease(ctx, dir, opts.Env, rootID, group, sessionID)
+	if err != nil {
+		return fmt.Errorf("acquiring continuation lease on root %s: %w", rootID, err)
+	}
+	if outcome != molecule.ContinuationLeaseAcquired {
+		return fmt.Errorf("continuation lease on root %s not acquired: %s", rootID, outcome)
+	}
+	return nil
 }
 
 func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string) ([]string, error) {
@@ -1813,6 +1967,24 @@ func hookResolveWorkBranch(dir string) string {
 // city so the release reaches the ledger the claim actually landed in.
 func hookClaimReleaseWithBdStore(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error) {
 	return hookClaimBdStoreContext(ctx, dir, env, assignee).ReleaseIfCurrent(beadID, assignee)
+}
+
+// hookAcquireContinuationLeaseWithBdStore is the default
+// hookAcquireContinuationLeaseFunc: it opens a *beads.BdStore bound to sessionID
+// (mirroring hookAssignContinuationWithBdStore's actor binding) and delegates
+// the CAS-fenced acquisition to molecule.AcquireContinuationLease.
+func hookAcquireContinuationLeaseWithBdStore(_ context.Context, dir string, env []string, rootID, group, sessionID string) (molecule.ContinuationLeaseOutcome, error) {
+	store := hookClaimBdStore(dir, env, sessionID)
+	_, outcome, err := molecule.AcquireContinuationLease(store, rootID, group, sessionID)
+	return outcome, err
+}
+
+// hookContinuationLeaseHolderWithBdStore is the default
+// hookContinuationLeaseHolderFunc: a plain, non-mutating read of rootID's
+// current continuation-lease holder via molecule.ContinuationLeaseHolder.
+func hookContinuationLeaseHolderWithBdStore(_ context.Context, dir string, env []string, rootID string) (string, error) {
+	store := hookClaimBdStore(dir, env, "")
+	return molecule.ContinuationLeaseHolder(store, rootID)
 }
 
 // hookEmitClaimWindowExpired publishes a best-effort
