@@ -1123,6 +1123,10 @@ func buildSlingFormulaVars(formulaName, beadID string, userVars []string, a conf
 	addRoutingVar("binding_name", a.BindingName)
 	addRoutingVar("binding_prefix", a.BindingPrefix())
 
+	if beadID != "" {
+		addVar("requirements_path", exportSlingRequirements(deps, beadID))
+	}
+
 	autoBranch := SlingFormulaTargetBranch(beadID, deps, a)
 	if SlingFormulaUsesBaseBranch(formulaName) {
 		addVar("base_branch", autoBranch)
@@ -1132,6 +1136,50 @@ func buildSlingFormulaVars(formulaName, beadID string, userVars []string, a conf
 	}
 
 	return vars
+}
+
+// exportSlingRequirements writes beadID's title and description to
+// <cityPath>/.gc/sling-requirements/<beadID>.md and returns its path, so a
+// formula step that only re-renders the sling vars map (never re-fetches
+// the bead by ID) still sees the bead's instructions and any acceptance
+// criteria embedded in its description (gc-ozzqe: a bare formula sling
+// otherwise rendered spec-blind).
+//
+// Best-effort, mirroring resolveMoleculeArtifactDir: any failure (no
+// store, no city path, unsafe bead ID, store lookup error, empty
+// description, write error) yields "" and buildSlingFormulaVars leaves
+// requirements_path unset, exactly as before this fix.
+func exportSlingRequirements(deps SlingDeps, beadID string) string {
+	if deps.Store == nil || strings.TrimSpace(deps.CityPath) == "" {
+		return ""
+	}
+	if err := molecule.ValidateMemberID(beadID); err != nil {
+		return ""
+	}
+	bead, err := deps.Store.Get(beadID)
+	if err != nil {
+		return ""
+	}
+	desc := strings.TrimSpace(bead.Description)
+	if desc == "" {
+		return ""
+	}
+
+	var buf strings.Builder
+	if title := strings.TrimSpace(bead.Title); title != "" {
+		buf.WriteString("# " + title + "\n\n")
+	}
+	buf.WriteString(bead.Description)
+
+	dir := filepath.Join(deps.CityPath, ".gc", "sling-requirements")
+	if err := (fsys.OSFS{}).MkdirAll(dir, 0o755); err != nil {
+		return ""
+	}
+	path := filepath.Join(dir, beadID+".md")
+	if err := (fsys.OSFS{}).WriteFile(path, []byte(buf.String()), 0o644); err != nil {
+		return ""
+	}
+	return path
 }
 
 // mergeRigFormulaVars folds rig-scoped formula_vars defaults into vars.

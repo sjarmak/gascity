@@ -2430,80 +2430,66 @@ func TestSlingAttachFormula(t *testing.T) {
 // so this test must explicitly void that route (issue=) to exercise the
 // genuinely-silent case; see ga-tj5jbm. Warn instead of changing
 // routing/materialization.
-func TestSlingAttachFormulaWarnsWhenBeadDescriptionDropped(t *testing.T) {
+// TestSlingAttachFormulaCarriesBeadDescriptionByDefault is the gc-ozzqe
+// regression test: attaching a formula to a bead must carry the bead's
+// description (and any acceptance criteria embedded in it) into the
+// rendered vars by default, with no --var context_path/requirements_path
+// required from the caller.
+func TestSlingAttachFormulaCarriesBeadDescriptionByDefault(t *testing.T) {
 	runner := newFakeRunner()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
 	deps := testDeps(cfg, runtime.NewFake(), runner.run)
-	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task", Description: "follow ~/rigs/ultimate-brain-mcp patterns"})
+	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task", Description: "follow ~/rigs/ultimate-brain-mcp patterns\n\nAcceptance: tests pass"})
 
 	s, err := New(deps)
 	if err != nil {
 		t.Fatal(err)
 	}
 	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
-	result, err := s.AttachFormula(context.Background(), "code-review", b.ID, a, FormulaOpts{Vars: []string{"issue="}})
-	if err != nil {
+	if _, err := s.AttachFormula(context.Background(), "code-review", b.ID, a, FormulaOpts{Vars: []string{"issue="}}); err != nil {
 		t.Fatalf("AttachFormula: %v", err)
 	}
-	found := false
-	for _, w := range result.BeadWarnings {
-		if strings.Contains(w, "not carried into the formula's rendered context") {
-			found = true
-		}
+
+	path := filepath.Join(deps.CityPath, ".gc", "sling-requirements", b.ID+".md")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading exported requirements file: %v", err)
 	}
-	if !found {
-		t.Errorf("BeadWarnings = %#v, want a hint that the bead's description is dropped", result.BeadWarnings)
+	if !strings.Contains(string(content), "Acceptance: tests pass") {
+		t.Errorf("exported requirements %q = %q, want it to carry the bead's acceptance criteria", path, content)
 	}
 }
 
-// TestSlingAttachFormulaNoWarningWhenContextPathProvided guards the
-// #3681 hint's scope: a caller who already passes context_path (or
-// requirements_path) has explicitly carried the instructions in some
-// form, so the generic hint would be noise.
-func TestSlingAttachFormulaNoWarningWhenContextPathProvided(t *testing.T) {
+// TestSlingAttachFormulaRequirementsPathExplicitNotOverridden preserves
+// caller control: a caller who already passes context_path or
+// requirements_path has explicitly carried the instructions in some form,
+// so the auto-export must not clobber it.
+func TestSlingAttachFormulaRequirementsPathExplicitNotOverridden(t *testing.T) {
 	runner := newFakeRunner()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
 	deps := testDeps(cfg, runtime.NewFake(), runner.run)
 	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task", Description: "follow ~/rigs/ultimate-brain-mcp patterns"})
 
-	s, err := New(deps)
-	if err != nil {
-		t.Fatal(err)
-	}
 	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
-	result, err := s.AttachFormula(context.Background(), "code-review", b.ID, a, FormulaOpts{Vars: []string{"context_path=/tmp/spec"}})
-	if err != nil {
-		t.Fatalf("AttachFormula: %v", err)
-	}
-	for _, w := range result.BeadWarnings {
-		if strings.Contains(w, "not carried into the formula's rendered context") {
-			t.Errorf("BeadWarnings = %#v, want no drop hint once context_path is explicit", result.BeadWarnings)
-		}
+	vars := BuildSlingFormulaVars("code-review", b.ID, []string{"requirements_path=/tmp/explicit-spec.md"}, a, deps)
+	if got := vars["requirements_path"]; got != "/tmp/explicit-spec.md" {
+		t.Errorf("requirements_path = %q, want the caller's explicit path preserved", got)
 	}
 }
 
-// TestSlingAttachFormulaNoWarningWhenBeadHasNoDescription guards against
-// noise on the common case: a bare bead with no description text has
-// nothing to lose, so no hint should fire.
-func TestSlingAttachFormulaNoWarningWhenBeadHasNoDescription(t *testing.T) {
+// TestSlingAttachFormulaNoRequirementsPathWhenBeadHasNoDescription guards
+// against pointless file noise: a bare bead with no description text has
+// nothing to export, so requirements_path should stay unset.
+func TestSlingAttachFormulaNoRequirementsPathWhenBeadHasNoDescription(t *testing.T) {
 	runner := newFakeRunner()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
 	deps := testDeps(cfg, runtime.NewFake(), runner.run)
 	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task"})
 
-	s, err := New(deps)
-	if err != nil {
-		t.Fatal(err)
-	}
 	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
-	result, err := s.AttachFormula(context.Background(), "code-review", b.ID, a, FormulaOpts{})
-	if err != nil {
-		t.Fatalf("AttachFormula: %v", err)
-	}
-	for _, w := range result.BeadWarnings {
-		if strings.Contains(w, "not carried into the formula's rendered context") {
-			t.Errorf("BeadWarnings = %#v, want no drop hint for a description-less bead", result.BeadWarnings)
-		}
+	vars := BuildSlingFormulaVars("code-review", b.ID, nil, a, deps)
+	if got, ok := vars["requirements_path"]; ok {
+		t.Errorf("requirements_path = %q, want unset for a description-less bead", got)
 	}
 }
 

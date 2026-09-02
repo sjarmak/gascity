@@ -431,68 +431,12 @@ func rootOnlyVaporPourHint(formulaName string, recipe *formula.Recipe) string {
 
 // slingOnFormula handles the --on formula attachment path.
 func slingOnFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID string, result SlingResult) (SlingResult, error) {
-	result, err := attachFormulaToBead(opts, deps, querier, beadID, opts.OnFormula, "on-formula", "formula", false, result)
-	if err == nil {
-		if hint := attachedBeadInstructionsDroppedHint(querier, beadID, opts.Vars); hint != "" {
-			result.BeadWarnings = append(result.BeadWarnings, hint)
-		}
-	}
-	return result, err
-}
-
-// attachedBeadInstructionsDroppedHint returns a sling-time diagnostic when
-// --on/default-formula attaches a formula to an existing bead whose own
-// description carries real instructions and no route into the formula's
-// rendered context is available for it. The formula wisp root's own
-// description is always the FORMULA's own boilerplate
-// (internal/formula/compile.go rootDesc), never the target bead's text.
-// Two routes carry it in instead: the caller-supplied
-// context_path/requirements_path (#3681), and the legacy sling path's
-// auto-stamped `gc.var.issue`, which every route-table step template
-// resolves and re-fetches via `bd show` (Route B, added 2026-08-02). The
-// hint only fires when neither route is live — in practice, only when the
-// caller explicitly voids `issue=`, since BuildSlingFormulaVars stamps it
-// automatically otherwise. It changes neither routing nor the materialized
-// wisp.
-func attachedBeadInstructionsDroppedHint(querier BeadQuerier, beadID string, userVars []string) string {
-	if querier == nil || beadID == "" {
-		return ""
-	}
-	// BuildSlingFormulaVars auto-stamps gc.var.issue = beadID whenever
-	// beadID != "", unless the caller explicitly overrides it — so assume
-	// Route B is live unless userVars says otherwise.
-	issueVarCarriesBead := true
-	for _, v := range userVars {
-		key, value, ok := strings.Cut(v, "=")
-		if !ok {
-			continue
-		}
-		switch key {
-		case "context_path", "requirements_path":
-			return ""
-		case "issue":
-			issueVarCarriesBead = value != ""
-		}
-	}
-	if issueVarCarriesBead {
-		return ""
-	}
-	bead, err := querier.Get(beadID)
-	if err != nil || strings.TrimSpace(bead.Description) == "" {
-		return ""
-	}
-	return fmt.Sprintf("note: bead %s's description is not carried into the formula's rendered context — pass --var context_path=<dir> or --var requirements_path=<doc> to include your instructions, or the formula's brainstorm will not see them.", beadID)
+	return attachFormulaToBead(opts, deps, querier, beadID, opts.OnFormula, "on-formula", "formula", false, result)
 }
 
 // slingDefaultFormula handles the default formula attachment path.
 func slingDefaultFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID string, result SlingResult) (SlingResult, error) {
-	result, err := attachFormulaToBead(opts, deps, querier, beadID, opts.Target.EffectiveDefaultSlingFormula(), "default-on-formula", "default formula", true, result)
-	if err == nil {
-		if hint := attachedBeadInstructionsDroppedHint(querier, beadID, opts.Vars); hint != "" {
-			result.BeadWarnings = append(result.BeadWarnings, hint)
-		}
-	}
-	return result, err
+	return attachFormulaToBead(opts, deps, querier, beadID, opts.Target.EffectiveDefaultSlingFormula(), "default-on-formula", "default formula", true, result)
 }
 
 // attachFormulaToBead runs the shared formula-attachment pipeline for both the
