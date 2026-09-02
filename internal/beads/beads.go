@@ -582,6 +582,24 @@ func IsDeferred(b Bead, now time.Time) bool {
 	return b.DeferUntil != nil && b.DeferUntil.After(now)
 }
 
+// SyntheticContainerDeferUntil returns the defer_until value system-minted
+// container beads (input convoys, drain unit convoys) should be created with,
+// so they never surface in bd's ready-work view — including a bare `bd ready`
+// invocation with no exclude flags — from the instant they exist. That gap
+// matters because bd's real default ready-work exclusion list does not cover
+// "convoy" (only merge-request/gate/molecule/rig/agent/role/message; see
+// upstream sqlbuild.ReadyWorkExcludeTypes), even though readyExcludeTypes
+// above treats every convoy as infrastructure. A caller-side --exclude-type
+// flag only helps gc's own Go call sites; it does nothing for a human or
+// agent running the bd CLI directly, so the hold has to live on the bead
+// itself. The container's own Close (CloseSyntheticInputConvoy or equivalent)
+// removes it long before this date; the far horizon just makes the deferral
+// effectively permanent rather than a schedule to babysit.
+func SyntheticContainerDeferUntil() *time.Time {
+	t := time.Now().AddDate(100, 0, 0)
+	return &t
+}
+
 func isReadyBlockingDependencyType(t string) bool {
 	return IsReadyBlockingDependencyType(t)
 }

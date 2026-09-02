@@ -96,6 +96,39 @@ func TestCreateSingleItemInputConvoyRejectsNilStore(t *testing.T) {
 	}
 }
 
+// TestCreateSingleItemInputConvoyIsHeldOutOfReady guards gc-c7lp0: a synthetic
+// input convoy used to mint with no defer_until, so it inherited its target's
+// priority and could rank a bare `bd ready` (or `bd ready --sort hybrid`)
+// above real work — bd's real default ready-work exclusion list does not
+// cover the "convoy" issue type, only merge-request/gate/molecule/rig/
+// agent/role/message, so nothing upstream held it back. Minting with a
+// far-future defer_until closes that gap at the bead level, independent of
+// which exclusion flags (if any) a given `bd ready` caller passes.
+func TestCreateSingleItemInputConvoyIsHeldOutOfReady(t *testing.T) {
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task", Priority: intPtr(0)})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+
+	created, err := CreateSingleItemInputConvoy(store, target)
+	if err != nil {
+		t.Fatalf("CreateSingleItemInputConvoy: %v", err)
+	}
+
+	if created.DeferUntil == nil {
+		t.Fatal("input convoy DeferUntil is nil, want a far-future hold")
+	}
+	if !created.DeferUntil.After(time.Now().AddDate(1, 0, 0)) {
+		t.Fatalf("input convoy DeferUntil = %v, want more than a year out", created.DeferUntil)
+	}
+	if !beads.IsDeferred(created, time.Now()) {
+		t.Fatalf("input convoy %+v is not deferred, want it held out of ready", created)
+	}
+}
+
+func intPtr(v int) *int { return &v }
+
 func TestRootKeyIgnoresConvoyIDRuntimeVar(t *testing.T) {
 	base := RootKey("convoy-1", "graph-work", map[string]string{
 		ConvoyIDVar: "convoy-1",

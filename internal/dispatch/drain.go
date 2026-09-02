@@ -1299,10 +1299,11 @@ func ensureDrainUnitConvoy(store beads.Store, control beads.Bead, parentConvoyID
 		beadmeta.DrainUnitKeyMetadataKey:      row.UnitKey,
 	}
 	created, err := unitStore.Create(beads.Bead{
-		Title:    fmt.Sprintf("drain unit %d for %s", row.Index, member.ID),
-		Type:     "convoy",
-		Priority: member.Priority,
-		Metadata: metadata,
+		Title:      fmt.Sprintf("drain unit %d for %s", row.Index, member.ID),
+		Type:       "convoy",
+		Priority:   member.Priority,
+		Metadata:   metadata,
+		DeferUntil: beads.SyntheticContainerDeferUntil(),
 	})
 	if err != nil {
 		return beads.Bead{}, false, fmt.Errorf("%s: creating unit convoy for member %s: %w", control.ID, member.ID, err)

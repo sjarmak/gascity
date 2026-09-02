@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
@@ -1342,6 +1343,50 @@ func TestEnsureDrainUnitConvoyRepairsExistingTrack(t *testing.T) {
 	}
 	if len(members) != 1 || members[0].ID != member.ID {
 		t.Fatalf("members = %+v, want repaired member %s", members, member.ID)
+	}
+}
+
+// TestEnsureDrainUnitConvoyMintsWithFarFutureDeferUntil guards gc-c7lp0
+// (drain-unit-convoy side): a newly minted drain unit convoy inherits its
+// member's priority and, like a graph.v2 input convoy, has no exclusion in
+// bd's real default ready-work list for the "convoy" type. Stamping
+// defer_until at mint holds it out of a bare `bd ready` regardless of which
+// flags the caller passes.
+func TestEnsureDrainUnitConvoyMintsWithFarFutureDeferUntil(t *testing.T) {
+	store := beads.NewMemStore()
+	control, err := store.Create(beads.Bead{Title: "drain", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := store.Create(beads.Bead{Title: "parent", Type: "convoy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := store.Create(beads.Bead{Title: "member", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := drainManifestRow{
+		Index:    0,
+		MemberID: member.ID,
+		UnitKey:  "drain-unit:test:mint:" + member.ID,
+	}
+
+	unit, created, err := ensureDrainUnitConvoy(store, control, parent.ID, 1, row, member, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ensureDrainUnitConvoy: %v", err)
+	}
+	if !created {
+		t.Fatalf("unit=%+v created=%v, want a fresh mint", unit, created)
+	}
+	if unit.DeferUntil == nil {
+		t.Fatal("drain unit convoy DeferUntil is nil, want a far-future hold")
+	}
+	if !unit.DeferUntil.After(time.Now().AddDate(1, 0, 0)) {
+		t.Fatalf("drain unit convoy DeferUntil = %v, want more than a year out", unit.DeferUntil)
+	}
+	if !beads.IsDeferred(unit, time.Now()) {
+		t.Fatalf("drain unit convoy %+v is not deferred, want it held out of ready", unit)
 	}
 }
 
