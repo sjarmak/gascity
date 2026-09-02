@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
@@ -111,6 +112,47 @@ func TestDoSlingNudgeNamepoolNoRunningInstancePokesController(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "not found in config") {
 		t.Fatalf("stderr = %q, want no config lookup failure on the zero-instance path", stderr.String())
+	}
+}
+
+// TestDoSlingNudgeNamepoolNoRunningInstanceQueuesDurableWake covers gc-r5a0m:
+// with no live pool member, the "poke controller" path used to be the only
+// wake attempt. If the poke's fire-and-forget socket write failed or was
+// dropped before the controller reacted, the routed bead was left with no
+// durable trace that a wake was ever requested (success-shaped no-op). This
+// asserts a queued nudge now exists for every discovered pool instance, so
+// whichever instance boots next finds a deliverable item independent of the
+// poke landing.
+func TestDoSlingNudgeNamepoolNoRunningInstanceQueuesDurableWake(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := namepoolAgentForNudgeTest()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{a},
+	}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	deps.CityPath = t.TempDir() // isolated path so poke cannot hit a real socket
+
+	doSlingNudge(&a, deps.CityName, deps.CityPath, cfg, sp, deps.Store, stdout, stderr)
+
+	now := time.Now()
+	for _, qualified := range []string{"gascity/gastown.furiosa", "gascity/gastown.rictus"} {
+		pending, inFlight, _, err := listQueuedNudges(deps.CityPath, qualified, now)
+		if err != nil {
+			t.Fatalf("listQueuedNudges(%q): %v", qualified, err)
+		}
+		if len(pending)+len(inFlight) != 1 {
+			t.Fatalf("queued nudges for %q = %d pending + %d in-flight, want exactly 1 durable wake queued", qualified, len(pending), len(inFlight))
+		}
+		item := pending
+		if len(item) == 0 {
+			item = inFlight
+		}
+		if item[0].Source != "sling" {
+			t.Fatalf("queued nudge for %q source = %q, want %q", qualified, item[0].Source, "sling")
+		}
 	}
 }
 

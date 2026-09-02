@@ -1514,14 +1514,20 @@ func doSlingNudge(a *config.Agent, cityName, cityPath string, cfg *config.City,
 
 	if a.SupportsInstanceExpansion() {
 		sp0 := scaleParamsFor(a)
-		tryNudgeStore := func(rawStore beads.Store) bool {
+		// tryNudgeStore looks up this store's pool refs and, if any resolve to
+		// a running session, delivers the nudge to it directly. It always
+		// returns the refs it found (whether or not one was running) so a
+		// caller that gets false back can still fall back to queuing a
+		// durable wake for every known instance instead of only poking the
+		// controller (see below).
+		tryNudgeStore := func(rawStore beads.Store) (nudged bool, refs []poolSessionRef, sessStore beads.Store) {
 			// Session lookups (pool refs, running check, target fence) route to the
 			// session coordination-class store; the queued-nudge enqueue inside
 			// deliverSlingNudge stays on rawStore (nudges class). Identity today
 			// (cliSessionStore is the identity resolver), so byte-identical until a
 			// [beads.classes.sessions] relocation lands.
-			sessStore := cliSessionStore(rawStore, cfg, cityPath)
-			refs := resolvePoolSessionRefs(sessStore, cfg, a.Name, a.Dir, sp0, a, cityName, st, sp, stderr)
+			sessStore = cliSessionStore(rawStore, cfg, cityPath)
+			refs = resolvePoolSessionRefs(sessStore, cfg, a.Name, a.Dir, sp0, a, cityName, st, sp, stderr)
 			for _, ref := range refs {
 				running, err := workerSessionTargetRunningWithConfig(cityPath, sessStore, sp, cfg, ref.sessionName)
 				if err != nil || !running {
@@ -1530,21 +1536,62 @@ func doSlingNudge(a *config.Agent, cityName, cityPath string, cfg *config.City,
 				member := resolvePoolNudgeMember(cfg, a, ref.qualifiedInstance)
 				target := buildSlingNudgeTarget(member, cityName, cityPath, cfg, sessStore, ref.sessionName)
 				deliverSlingNudge(target, sp, rawStore, cityPath, stdout, stderr)
-				return true
+				return true, refs, sessStore
 			}
-			return false
+			return false, refs, sessStore
 		}
-		if tryNudgeStore(store) {
+
+		type poolRefSource struct {
+			rawStore  beads.Store
+			sessStore beads.Store
+			refs      []poolSessionRef
+		}
+		var sources []poolRefSource
+
+		nudged, refs, sessStore := tryNudgeStore(store)
+		sources = append(sources, poolRefSource{rawStore: store, sessStore: sessStore, refs: refs})
+		if nudged {
 			return
 		}
+
 		if cityPath != "" {
 			if _, statErr := os.Stat(filepath.Join(cityPath, "city.toml")); statErr == nil {
-				if cityStore, err := slingOpenCityStore(cityPath); err == nil && cityStore != nil && tryNudgeStore(cityStore) {
-					return
+				if cityStore, err := slingOpenCityStore(cityPath); err == nil && cityStore != nil {
+					nudged, refs, sessStore = tryNudgeStore(cityStore)
+					sources = append(sources, poolRefSource{rawStore: cityStore, sessStore: sessStore, refs: refs})
+					if nudged {
+						return
+					}
 				}
 			}
 		}
-		// No running config session — poke controller for immediate wake.
+
+		// No running instance in either store. A bare controller poke is
+		// fire-and-forget: if the socket write fails or is dropped before the
+		// controller reacts, the routed bead is left with no durable trace
+		// that a wake was ever requested — unlike the fixed-agent asleep
+		// path below, where deliverSlingNudge always enqueues a queued nudge
+		// before poking. Queue one for every known pool instance too, so
+		// whichever one actually boots next — matched by its own qualified
+		// name in the supervisor's dispatch tick, or drained on its first
+		// hook check in legacy mode — finds a deliverable item instead of
+		// depending solely on this poke landing.
+		now := time.Now()
+		seen := map[string]bool{}
+		for _, src := range sources {
+			for _, ref := range src.refs {
+				if seen[ref.sessionName] {
+					continue
+				}
+				seen[ref.sessionName] = true
+				member := resolvePoolNudgeMember(cfg, a, ref.qualifiedInstance)
+				target := buildSlingNudgeTarget(member, cityName, cityPath, cfg, src.sessStore, ref.sessionName)
+				if err := enqueueSlingWakeNudge(target, src.rawStore, cityPath, now); err != nil {
+					fmt.Fprintf(stderr, "warning: could not queue wake nudge for %s: %v\n", target.agent.QualifiedName(), err) //nolint:errcheck // best-effort
+				}
+			}
+		}
+
 		if err := pokeController(cityPath); err != nil {
 			fmt.Fprintf(stderr, "No running sessions for %q; poke failed: %v\n", a.QualifiedName(), err) //nolint:errcheck // best-effort
 		} else {
@@ -1638,8 +1685,21 @@ func buildSlingNudgeTarget(agent config.Agent, cityName, cityPath string, cfg *c
 	})
 }
 
+// slingNudgeMessage is the reminder text delivered (or queued) after a sling
+// routes a bead, whether the nudge lands immediately or waits for the target
+// to wake.
+const slingNudgeMessage = "Work slung. Check your hook."
+
+// enqueueSlingWakeNudge records a durable queued-nudge entry for target so a
+// wake that later observes the target's own identity (the supervisor's
+// dispatch tick, or the target's own hook-drain on startup) has something
+// deliverable to find, independent of whether an immediate wake attempt
+// (poke, poller) actually lands.
+func enqueueSlingWakeNudge(target nudgeTarget, store beads.Store, cityPath string, now time.Time) error {
+	return enqueueQueuedNudgeWithStore(cityPath, cliNudgesStore(store, target.cfg, target.cityPath), newQueuedNudgeWithOptions(target.agent.QualifiedName(), slingNudgeMessage, "sling", now, queuedNudgeOptionsFromTarget(target)))
+}
+
 func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Store, cityPath string, stdout, stderr io.Writer) {
-	const msg = "Work slung. Check your hook."
 	// Session observation/handle and the last-nudge-delivered stamp route to the
 	// session coordination-class store (derived from the target's cfg+cityPath); the
 	// queued-nudge enqueue below stays on the passed store (nudges class). Identity
@@ -1653,7 +1713,7 @@ func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Stor
 		handle, err := workerHandleForNudgeTarget(target, sessStore, sp)
 		if err == nil {
 			result, nudgeErr := handle.Nudge(context.Background(), worker.NudgeRequest{
-				Text:     msg,
+				Text:     slingNudgeMessage,
 				Delivery: worker.NudgeDeliveryWaitIdle,
 				Source:   "sling",
 				Wake:     worker.NudgeWakeLiveOnly,
@@ -1671,7 +1731,7 @@ func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Stor
 		}
 	}
 
-	if err := enqueueQueuedNudgeWithStore(target.cityPath, cliNudgesStore(store, target.cfg, target.cityPath), newQueuedNudgeWithOptions(target.agent.QualifiedName(), msg, "sling", now, queuedNudgeOptionsFromTarget(target))); err != nil {
+	if err := enqueueSlingWakeNudge(target, store, target.cityPath, now); err != nil {
 		telemetry.RecordNudge(context.Background(), target.agent.QualifiedName(), err)
 		fmt.Fprintf(stderr, "warning: bead routed but nudge failed: %v\n", err) //nolint:errcheck // best-effort
 		return
