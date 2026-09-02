@@ -1153,12 +1153,31 @@ func acquireHookContinuationLease(bead beads.Bead, opts hookClaimOptions, ops ho
 	return nil
 }
 
+// preassignHookContinuationGroup pins this session's OPEN, unassigned
+// siblings within bead's continuation group so the affinity guarantee
+// acquireHookContinuationLease established for bead extends to the rest of
+// the group. Each per-sibling assignment is an unconditional store.Update
+// (hookAssignContinuationWithBdStore carries no lease precondition of its
+// own), so on an affinity-required root this function must re-validate lease
+// authority immediately before every single assignment rather than trusting
+// the ONE acquisition acquireHookContinuationLease performed for bead
+// earlier in the same claim: a reconciler can advance or release the lease
+// at any point during this loop (e.g. recovering an unrelated stale sibling
+// mid-iteration), and a caller-side preflight from before the loop started
+// is not destination-validated authority for a write happening now. Renewing
+// via ops.AcquireContinuationLease is itself the CAS-fenced re-validation —
+// it only returns Acquired when this session still legitimately holds (or
+// can still legitimately renew) the root/group/generation triple — so a
+// revoked lease fails the very next renewal and the loop stops (fail
+// closed) instead of continuing to assign siblings under authority that no
+// longer exists.
 func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string) ([]string, error) {
 	rootID := strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
 	group := strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey])
 	if rootID == "" || group == "" {
 		return nil, nil
 	}
+	leaseRequired := strings.EqualFold(strings.TrimSpace(bead.Metadata[beadmeta.SessionAffinityMetadataKey]), "require")
 	ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
 	defer cancel()
 	siblings, err := ops.ListContinuation(ctx, dir, opts.Env, rootID, group)
@@ -1174,6 +1193,18 @@ func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops 
 			!strings.EqualFold(strings.TrimSpace(sibling.Status), "open") ||
 			!hookClaimMatchesRoute(sibling, opts.RouteTargets) {
 			continue
+		}
+		if leaseRequired {
+			if pinAssignee == "" {
+				return assigned, fmt.Errorf("continuation lease for %s requires a session or assignee identity", rootID)
+			}
+			outcome, err := ops.AcquireContinuationLease(ctx, dir, opts.Env, rootID, group, pinAssignee)
+			if err != nil {
+				return assigned, fmt.Errorf("revalidating continuation lease on root %s before assigning %s: %w", rootID, sibling.ID, err)
+			}
+			if outcome != molecule.ContinuationLeaseAcquired {
+				return assigned, fmt.Errorf("continuation lease on root %s not held before assigning %s: %s", rootID, sibling.ID, outcome)
+			}
 		}
 		if err := ops.AssignContinuation(ctx, dir, opts.Env, sibling.ID, pinAssignee); err != nil {
 			return assigned, fmt.Errorf("assigning %s: %w", sibling.ID, err)
