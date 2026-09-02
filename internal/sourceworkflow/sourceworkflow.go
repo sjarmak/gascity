@@ -230,13 +230,22 @@ func ListLiveRoots(store beads.Store, sourceBeadID, sourceStoreRef, rootStoreRef
 }
 
 // ListLiveRootsViaConvoyMembership behaves like ListLiveRoots but also
-// resolves sourceBeadID through convoy-tracking membership:
-// CreateSingleItemInputConvoy mints a synthetic one-item convoy that TRACKS
-// the original work bead rather than being stamped onto it, so a caller who
-// passes that original bead's ID (not the synthetic convoy's ID) needs the
-// reverse lookup to find the root at all. This is the form `gc workflow
-// delete-source`/`gc convoy delete-source` use, so an operator can pass
-// either identity and still find the live root.
+// resolves sourceBeadID through convoy-tracking membership, scoped to
+// SYNTHETIC single-item input convoys only:
+// CreateSingleItemInputConvoy mints a synthetic one-item convoy (stamped
+// gc.synthetic=true) that TRACKS the original work bead rather than being
+// stamped onto it, so a caller who passes that original bead's ID (not the
+// synthetic convoy's ID) needs the reverse lookup to find the root at all.
+// This is the form `gc workflow delete-source`/`gc convoy delete-source`
+// use, so an operator can pass either identity and still find the live root.
+//
+// The reverse lookup is deliberately restricted to synthetic convoys: an
+// ordinary, user-created multi-item convoy may also track sourceBeadID
+// alongside unrelated sibling members, and resolving through it would let
+// delete-source on one member close (or match) a workflow root that covers
+// the whole convoy, affecting sibling work that was never named. Only a
+// convoy that exists solely to wrap sourceBeadID (the synthetic one-item
+// kind) is safe to treat as an alias for it.
 func ListLiveRootsViaConvoyMembership(store beads.Store, sourceBeadID, sourceStoreRef, rootStoreRef string) ([]beads.Bead, error) {
 	sourceBeadID = NormalizeSourceBeadID(sourceBeadID)
 	if store == nil || sourceBeadID == "" {
@@ -249,6 +258,9 @@ func ListLiveRootsViaConvoyMembership(store beads.Store, sourceBeadID, sourceSto
 	}
 	for _, tc := range trackingConvoys {
 		if tc.ID == "" || tc.ID == sourceBeadID {
+			continue
+		}
+		if tc.Metadata[beadmeta.SyntheticMetadataKey] != "true" {
 			continue
 		}
 		ids = append(ids, tc.ID)

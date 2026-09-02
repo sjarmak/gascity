@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/testutil"
@@ -376,6 +377,9 @@ func TestListLiveRootsViaConvoyMembershipResolvesOriginalSourceBead(t *testing.T
 		Title:  "input convoy for BL-83",
 		Type:   "convoy",
 		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.SyntheticMetadataKey: "true",
+		},
 	}); err != nil {
 		t.Fatalf("Create(convoy): %v", err)
 	}
@@ -423,6 +427,71 @@ func TestListLiveRootsViaConvoyMembershipResolvesOriginalSourceBead(t *testing.T
 	}
 	if len(narrow) != 0 {
 		t.Fatalf("ListLiveRoots(original source bead) = %#v, want none (convoy membership must not be resolved by the narrow form)", narrow)
+	}
+}
+
+func TestListLiveRootsViaConvoyMembershipIgnoresOrdinaryMultiItemConvoy(t *testing.T) {
+	// Regression for the second gc-f0lkv review round: TrackingConvoysForItem
+	// returns EVERY convoy that tracks an item, not just synthetic
+	// single-item ones. An ordinary, user-created convoy can track many
+	// sibling members alongside sourceBeadID. If the reverse lookup treated
+	// that convoy's ID as an alias for sourceBeadID, `gc workflow
+	// delete-source <sourceBeadID>` would match (and, via the CLI, close) a
+	// workflow root keyed to the whole convoy -- collateral damage to
+	// sibling members that were never named. Only convoys stamped
+	// gc.synthetic=true (CreateSingleItemInputConvoy's mark) are safe to
+	// treat as an alias for the one item they exist to wrap.
+	store := beads.NewMemStore()
+	store.HonorExplicitIDs = true
+	if _, err := store.Create(beads.Bead{
+		ID:     "BL-90",
+		Title:  "member of an ordinary convoy",
+		Type:   "task",
+		Status: "open",
+	}); err != nil {
+		t.Fatalf("Create(source): %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		ID:     "BL-91",
+		Title:  "sibling member of the same ordinary convoy",
+		Type:   "task",
+		Status: "open",
+	}); err != nil {
+		t.Fatalf("Create(sibling): %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		ID:     "CV-2",
+		Title:  "ordinary multi-item convoy",
+		Type:   "convoy",
+		Status: "open",
+	}); err != nil {
+		t.Fatalf("Create(convoy): %v", err)
+	}
+	if err := convoy.TrackItem(store, "CV-2", "BL-90"); err != nil {
+		t.Fatalf("TrackItem(BL-90): %v", err)
+	}
+	if err := convoy.TrackItem(store, "CV-2", "BL-91"); err != nil {
+		t.Fatalf("TrackItem(BL-91): %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:  "workflow keyed to the ordinary convoy",
+		Type:   "task",
+		Status: "in_progress",
+		Metadata: map[string]string{
+			"gc.kind":                 "workflow",
+			"gc.input_convoy_id":      "CV-2",
+			SourceStoreRefMetadataKey: "rig:alpha",
+		},
+	}); err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+
+	roots, err := ListLiveRootsViaConvoyMembership(store, "BL-90", "rig:alpha", "rig:alpha")
+	if err != nil {
+		t.Fatalf("ListLiveRootsViaConvoyMembership: %v", err)
+	}
+	if len(roots) != 0 {
+		t.Fatalf("ListLiveRootsViaConvoyMembership(member of ordinary convoy) = %#v, want none (non-synthetic convoy tracking must not be resolved)", roots)
 	}
 }
 
