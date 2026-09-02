@@ -4313,23 +4313,39 @@ func TestPruneDeadQueuedNudges_RemovesOldDeadItems(t *testing.T) {
 	}
 }
 
-func TestPruneDeadQueuedNudges_RetainsItemsWithoutBeadID(t *testing.T) {
+func TestPruneDeadQueuedNudges_ItemsWithoutBeadIDPrunedByAge(t *testing.T) {
+	// Regression (gastownhall/gascity#5278, the empty-BeadID retain-forever
+	// path): a dead-letter item with no BeadID at all (the store was
+	// unavailable when the nudge was enqueued, so nudgequeue.Store.Save
+	// never created a shadow bead) has no terminal record to confirm or
+	// repair. Age is the only signal available, and it must still apply --
+	// otherwise such entries survive every sweep forever, independent of
+	// the reaped-backing-bead path #5328 already fixed.
 	dir := t.TempDir()
 	now := time.Now()
 
-	// Directly inject a dead item without a BeadID into the queue state.
+	// Directly inject two dead items without a BeadID at different ages.
 	err := withNudgeQueueState(dir, func(state *nudgeQueueState) error {
-		state.Dead = append(state.Dead, queuedNudge{
-			ID:      "n-orphan",
-			Agent:   "worker",
-			Source:  "session",
-			Message: "no bead record",
-			DeadAt:  now.Add(-3 * time.Hour),
-		})
+		state.Dead = append(state.Dead,
+			queuedNudge{
+				ID:      "n-orphan-old",
+				Agent:   "worker",
+				Source:  "session",
+				Message: "no bead record",
+				DeadAt:  now.Add(-3 * time.Hour),
+			},
+			queuedNudge{
+				ID:      "n-orphan-recent",
+				Agent:   "worker",
+				Source:  "session",
+				Message: "no bead record",
+				DeadAt:  now.Add(-10 * time.Minute),
+			},
+		)
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("seed dead item: %v", err)
+		t.Fatalf("seed dead items: %v", err)
 	}
 
 	err = withNudgeQueueState(dir, func(state *nudgeQueueState) error {
@@ -4339,12 +4355,15 @@ func TestPruneDeadQueuedNudges_RetainsItemsWithoutBeadID(t *testing.T) {
 		t.Fatalf("pruneDeadQueuedNudges: %v", err)
 	}
 
+	// With defaultQueuedNudgeDeadRetention (1h): the 3h-old orphan is past
+	// retention and must be pruned; the 10m-old orphan is still within
+	// retention and must be retained.
 	_, _, dead, err := listQueuedNudges(dir, "worker", now)
 	if err != nil {
 		t.Fatalf("listQueuedNudges: %v", err)
 	}
-	if len(dead) != 1 || dead[0].ID != "n-orphan" {
-		t.Fatalf("dead = %v, want [n-orphan] retained (no bead record)", dead)
+	if len(dead) != 1 || dead[0].ID != "n-orphan-recent" {
+		t.Fatalf("dead = %v, want [n-orphan-recent] (old orphan pruned by age, recent retained)", dead)
 	}
 }
 

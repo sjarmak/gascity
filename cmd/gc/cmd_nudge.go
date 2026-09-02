@@ -2552,9 +2552,11 @@ func recoverExpiredInFlightNudgesWithClock(state *nudgeQueueState, front *nudgeq
 	return nil
 }
 
-// pruneDeadQueuedNudges removes dead-letter items older than defaultQueuedNudgeDeadRetention
-// when a durable terminal bead record exists in the store. Items without a confirmed terminal
-// bead are retained so terminal history is not lost if the bead store write failed.
+// pruneDeadQueuedNudges removes dead-letter items older than defaultQueuedNudgeDeadRetention.
+// Items backed by a bead (BeadID set) are pruned once their terminal state is confirmed or
+// repaired in the store; items with no backing bead at all (the store was unavailable when the
+// nudge was enqueued, so no shadow bead was ever created) have no terminal record to lose and
+// are pruned by age alone.
 func pruneDeadQueuedNudges(state *nudgeQueueState, front *nudgequeue.Store, now, deadline time.Time) error {
 	return pruneDeadQueuedNudgesWithClock(state, front, now, deadline, clock.Real{})
 }
@@ -2604,11 +2606,17 @@ func pruneDeadQueuedNudgesWithClock(state *nudgeQueueState, front *nudgequeue.St
 				// bead is gone would be retained forever and pay a store
 				// lookup on every sweep (gastownhall/gascity#5278).
 			}
-			if !item.DeadAt.IsZero() && item.DeadAt.Before(cutoff) {
-				// Terminal (or the backing bead is gone entirely) — safe to
-				// prune once past retention.
-				continue
-			}
+		}
+		// Items with an empty BeadID never had a shadow bead created (the
+		// store was nil at enqueue time — see nudgequeue.Store.Save), so
+		// there is no terminal record to confirm or repair; age is the only
+		// signal. Without this, such entries survive every sweep forever and
+		// each pays its own dead-letter bookkeeping indefinitely
+		// (gastownhall/gascity#5278, the empty-BeadID retain-forever path).
+		if !item.DeadAt.IsZero() && item.DeadAt.Before(cutoff) {
+			// Terminal (or the backing bead is gone entirely) — safe to
+			// prune once past retention.
+			continue
 		}
 		filtered = append(filtered, item)
 	}
