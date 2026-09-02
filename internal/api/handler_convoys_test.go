@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 )
@@ -40,6 +41,9 @@ func TestConvoyCreateAndGet(t *testing.T) {
 	}
 	if convoy.Type != "convoy" {
 		t.Fatalf("type = %q, want %q", convoy.Type, "convoy")
+	}
+	if !beads.IsDeferred(convoy, time.Now()) {
+		t.Fatalf("convoy %s DeferUntil = %v, want far-future (gc-c7lp0: convoys must never surface in a bare bd ready)", convoy.ID, convoy.DeferUntil)
 	}
 	gotItem, err := store.Get(item.ID)
 	if err != nil {

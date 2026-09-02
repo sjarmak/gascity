@@ -752,9 +752,10 @@ func finalize(opts SlingOpts, deps SlingDeps, beadID, method string, result Slin
 				convoyLabels = []string{"owned"}
 			}
 			convoy, err := deps.Store.Create(beads.Bead{
-				Title:  fmt.Sprintf("sling-%s", beadID),
-				Type:   "convoy",
-				Labels: convoyLabels,
+				Title:      fmt.Sprintf("sling-%s", beadID),
+				Type:       "convoy",
+				Labels:     convoyLabels,
+				DeferUntil: beads.ConvoyDeferUntil(),
 			})
 			if err != nil {
 				result.MetadataErrors = append(result.MetadataErrors,

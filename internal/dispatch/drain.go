@@ -1303,7 +1303,7 @@ func ensureDrainUnitConvoy(store beads.Store, control beads.Bead, parentConvoyID
 		Type:       "convoy",
 		Priority:   member.Priority,
 		Metadata:   metadata,
-		DeferUntil: beads.SyntheticContainerDeferUntil(),
+		DeferUntil: beads.ConvoyDeferUntil(),
 	})
 	if err != nil {
 		return beads.Bead{}, false, fmt.Errorf("%s: creating unit convoy for member %s: %w", control.ID, member.ID, err)

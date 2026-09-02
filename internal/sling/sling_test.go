@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/agentutil"
@@ -3455,8 +3456,12 @@ func TestFinalizeAutoConvoy(t *testing.T) {
 		t.Error("expected auto-convoy creation")
 	}
 	// Verify convoy bead exists in store.
-	if _, err := deps.Store.Get(result.ConvoyID); err != nil {
+	convoy, err := deps.Store.Get(result.ConvoyID)
+	if err != nil {
 		t.Errorf("convoy %s not found in store: %v", result.ConvoyID, err)
+	}
+	if !beads.IsDeferred(convoy, time.Now()) {
+		t.Errorf("auto-convoy %s DeferUntil = %v, want far-future (gc-c7lp0: convoys must never surface in a bare bd ready)", convoy.ID, convoy.DeferUntil)
 	}
 }
 

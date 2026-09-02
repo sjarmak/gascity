@@ -3,6 +3,7 @@ package convoy
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
@@ -43,6 +44,9 @@ func TestConvoyCreateOps(t *testing.T) {
 	}
 	if got.Metadata["convoy.owner"] != "mayor" {
 		t.Errorf("owner = %q, want mayor", got.Metadata["convoy.owner"])
+	}
+	if !beads.IsDeferred(got, time.Now()) {
+		t.Errorf("convoy %s DeferUntil = %v, want far-future (gc-c7lp0: convoys must never surface in a bare bd ready)", got.ID, got.DeferUntil)
 	}
 
 	// Verify event was emitted.

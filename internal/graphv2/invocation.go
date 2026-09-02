@@ -441,7 +441,7 @@ func CreateSingleItemInputConvoy(store beads.Store, target beads.Bead) (beads.Be
 		Type:       "convoy",
 		Priority:   target.Priority,
 		Metadata:   metadata,
-		DeferUntil: beads.SyntheticContainerDeferUntil(),
+		DeferUntil: beads.ConvoyDeferUntil(),
 	})
 	if err != nil {
 		return beads.Bead{}, fmt.Errorf("creating input convoy for %s: %w", target.ID, err)

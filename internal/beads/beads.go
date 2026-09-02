@@ -492,8 +492,12 @@ func IsMoleculeType(t string) bool {
 
 // readyExcludeTypes enumerates bead types that Ready() excludes by
 // default. These are infrastructure or workflow-container types that
-// represent internal bookkeeping rather than actionable work. This
-// matches the exclusion list in the bd CLI's GetReadyWork query.
+// represent internal bookkeeping rather than actionable work. This is
+// Gas City's own Go-side filter and is layered on top of whatever the
+// underlying backend already excludes; it does NOT match the bd CLI's own
+// default GetReadyWork exclusion list, which omits "convoy" entirely (see
+// ConvoyDeferUntil's doc below) — a bare `bd ready` invocation
+// that bypasses this Go filter still needs defer_until to hold a convoy out.
 var readyExcludeTypes = map[string]bool{
 	"merge-request": true, // processed by automation
 	"gate":          true, // async wait conditions
@@ -582,28 +586,35 @@ func IsDeferred(b Bead, now time.Time) bool {
 	return b.DeferUntil != nil && b.DeferUntil.After(now)
 }
 
-// syntheticContainerDeferYears is how far out SyntheticContainerDeferUntil
-// pushes defer_until — long enough that the hold is effectively permanent
-// rather than a schedule to babysit.
-const syntheticContainerDeferYears = 100
+// convoyDeferYears is how far out ConvoyDeferUntil pushes defer_until —
+// long enough that the hold is effectively permanent rather than a
+// schedule to babysit.
+const convoyDeferYears = 100
 
-// SyntheticContainerDeferUntil returns the defer_until value system-minted
-// container beads (input convoys, drain unit convoys) should be created with,
-// so they never surface in bd's ready-work view — including a bare `bd ready`
-// invocation with no exclude flags — from the instant they exist. That gap
-// matters because bd's real default ready-work exclusion list does not cover
-// "convoy" (only merge-request/gate/molecule/rig/agent/role/message; see
-// upstream sqlbuild.ReadyWorkExcludeTypes), even though readyExcludeTypes
-// above treats every convoy as infrastructure. A caller-side --exclude-type
-// flag only helps gc's own Go call sites; it does nothing for a human or
-// agent running the bd CLI directly, so the hold has to live on the bead
-// itself. An input convoy's own CloseSyntheticInputConvoy removes it well
-// before this date; a drain unit convoy is never closed at all — it persists
-// as a permanent tracking record for the life of the drain — so for that kind
-// the far-future hold is the only thing keeping it out of ready, not a
-// backstop for eventual cleanup.
-func SyntheticContainerDeferUntil() *time.Time {
-	t := time.Now().AddDate(syntheticContainerDeferYears, 0, 0)
+// ConvoyDeferUntil returns the defer_until value every convoy bead should be
+// created with, so it never surfaces in bd's ready-work view — including a
+// bare `bd ready` invocation with no exclude flags — from the instant it
+// exists. A convoy is a container grouping child beads (see
+// readyExcludeTypes above and issue #3591); it is never itself actionable
+// Ready work, regardless of whether it was system-minted (a graph.v2 input
+// convoy, a drain unit convoy, a sling auto-convoy) or created directly by an
+// operator or the API (`gc convoy create`, `POST /v0/convoys`).
+//
+// That gap matters because bd's real default ready-work exclusion list does
+// not cover "convoy" (only merge-request/gate/molecule/rig/agent/role/
+// message; see upstream sqlbuild.ReadyWorkExcludeTypes), even though
+// readyExcludeTypes above already treats every convoy as infrastructure. A
+// caller-side --exclude-type flag only helps gc's own Go call sites; it does
+// nothing for a human or agent running the bd CLI directly, so the hold has
+// to live on the bead itself. A convoy that closes on its own (an input
+// convoy's CloseSyntheticInputConvoy, a sling auto-convoy tracking a single
+// bead) removes the defer along with the bead well before this date; a
+// convoy with no automatic close path (a drain unit convoy, an
+// operator-created grouping convoy) persists indefinitely, so for those the
+// far-future hold is the only thing keeping it out of ready, not a backstop
+// for eventual cleanup.
+func ConvoyDeferUntil() *time.Time {
+	t := time.Now().AddDate(convoyDeferYears, 0, 0)
 	return &t
 }
 

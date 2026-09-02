@@ -48,9 +48,10 @@ type ConvoyProgressResult struct {
 // convoy's own is refused before any edge is written.
 func ConvoyCreate(deps ConvoyDeps, classes MemberClasses, input ConvoyCreateInput) (ConvoyCreateResult, error) {
 	b := beads.Bead{
-		Title:  input.Title,
-		Type:   "convoy",
-		Labels: input.Labels,
+		Title:      input.Title,
+		Type:       "convoy",
+		Labels:     input.Labels,
+		DeferUntil: beads.ConvoyDeferUntil(),
 	}
 	ApplyConvoyFields(&b, input.Fields)
 

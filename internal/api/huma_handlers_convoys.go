@@ -223,8 +223,9 @@ func (s *Server) humaHandleConvoyCreate(_ context.Context, input *ConvoyCreateIn
 			}
 
 			created, err := store.Create(beads.Bead{
-				Title: input.Body.Title,
-				Type:  "convoy",
+				Title:      input.Body.Title,
+				Type:       "convoy",
+				DeferUntil: beads.ConvoyDeferUntil(),
 			})
 			if err != nil {
 				return beads.Bead{}, apierr.Internal.Msg(err.Error())
