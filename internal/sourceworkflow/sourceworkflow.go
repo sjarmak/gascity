@@ -140,6 +140,23 @@ func LockScopeForStoreRef(cityPath, defaultStorePath, storeRef string, rigPath f
 	return filepath.Clean(storeRef)
 }
 
+// effectiveSourceBeadID returns the identity a workflow root's cleanup and
+// singleton lookups key on: gc.source_bead_id when set, else
+// gc.input_convoy_id. The convoy-first sling launch path (attachFormulaToBead's
+// graph branch, slingFormula's direct --formula launch) deliberately leaves
+// gc.source_bead_id empty and tracks the source only through the input convoy
+// (see internal/sling/sling_core.go); without this fallback those roots are
+// invisible to ListLiveRoots no matter what ID `gc workflow delete-source` is
+// given, and every call reports the misleading result=already_clean. This
+// mirrors the same fallback already used by internal/dispatch/retry.go for
+// required-artifact lookups.
+func effectiveSourceBeadID(root beads.Bead) string {
+	if id := NormalizeSourceBeadID(root.Metadata[beadmeta.SourceBeadIDMetadataKey]); id != "" {
+		return id
+	}
+	return NormalizeSourceBeadID(root.Metadata[beadmeta.InputConvoyIDMetadataKey])
+}
+
 // WorkflowMatchesSource reports whether a workflow root belongs to the
 // given source bead and (optionally) a specific source store ref. Legacy
 // roots without SourceStoreRefMetadataKey are treated as belonging to the
@@ -149,7 +166,7 @@ func WorkflowMatchesSource(root beads.Bead, sourceBeadID, sourceStoreRef, rootSt
 	if sourceBeadID == "" {
 		return false
 	}
-	if NormalizeSourceBeadID(root.Metadata[beadmeta.SourceBeadIDMetadataKey]) != sourceBeadID {
+	if effectiveSourceBeadID(root) != sourceBeadID {
 		return false
 	}
 	sourceStoreRef = NormalizeSourceStoreRef(sourceStoreRef)
@@ -168,21 +185,46 @@ func WorkflowMatchesSource(root beads.Bead, sourceBeadID, sourceStoreRef, rootSt
 }
 
 // ListLiveRoots returns the live (not-closed) workflow roots in store that
-// belong to sourceBeadID, scoped to sourceStoreRef when set. The query
-// indexes on gc.source_bead_id and filters via IsWorkflowRoot so both
-// legacy gc.kind=workflow roots and graph.v2-only roots are visible.
+// belong to sourceBeadID, scoped to sourceStoreRef when set. It queries both
+// gc.source_bead_id and gc.input_convoy_id, since convoy-first graph launches
+// stamp only the latter (see effectiveSourceBeadID), and filters via
+// IsWorkflowRoot so both legacy gc.kind=workflow roots and graph.v2-only
+// roots are visible.
 func ListLiveRoots(store beads.Store, sourceBeadID, sourceStoreRef, rootStoreRef string) ([]beads.Bead, error) {
 	sourceBeadID = NormalizeSourceBeadID(sourceBeadID)
 	if store == nil || sourceBeadID == "" {
 		return nil, nil
 	}
-	roots, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
+	live := beads.HandlesFor(store).Live
+	bySource, err := live.List(beads.ListQuery{
 		Metadata: map[string]string{
 			beadmeta.SourceBeadIDMetadataKey: sourceBeadID,
 		},
 	})
 	if err != nil {
 		return nil, err
+	}
+	byInputConvoy, err := live.List(beads.ListQuery{
+		Metadata: map[string]string{
+			beadmeta.InputConvoyIDMetadataKey: sourceBeadID,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(bySource)+len(byInputConvoy))
+	roots := make([]beads.Bead, 0, len(bySource)+len(byInputConvoy))
+	for _, candidates := range [][]beads.Bead{bySource, byInputConvoy} {
+		for _, root := range candidates {
+			if root.ID == "" {
+				continue
+			}
+			if _, ok := seen[root.ID]; ok {
+				continue
+			}
+			seen[root.ID] = struct{}{}
+			roots = append(roots, root)
+		}
 	}
 	roots = slices.DeleteFunc(roots, func(root beads.Bead) bool {
 		if !IsWorkflowRoot(root) {
