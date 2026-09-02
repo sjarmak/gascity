@@ -78,6 +78,7 @@ func TestRunDiscoveredCommand_UsesPackContext(t *testing.T) {
 	script := `#!/bin/sh
 echo "packdir=$GC_PACK_DIR"
 echo "packname=$GC_PACK_NAME"
+echo "packbinding=$GC_PACK_BINDING"
 echo "cityname=$GC_CITY_NAME"
 echo "args=$*"
 echo "gcmetrics=$GC_DISABLE_USAGE_METRICS"
@@ -112,6 +113,9 @@ echo "otel=$OTEL_SERVICE_NAME"
 	}
 	if !strings.Contains(out, "packname=mypack") {
 		t.Fatalf("stdout missing pack name, got:\n%s", out)
+	}
+	if !strings.Contains(out, "packbinding=gs") {
+		t.Fatalf("stdout missing pack binding, got:\n%s", out)
 	}
 	if !strings.Contains(out, "cityname=testcity") {
 		t.Fatalf("stdout missing city name, got:\n%s", out)
@@ -3492,6 +3496,24 @@ func TestAddDiscoveredCommandsToRoot_HelpFlagShowsBuiltInHelp(t *testing.T) {
 	}
 	if strings.Contains(out, "should-not-run") {
 		t.Fatalf("help should not execute the discovered command, got:\n%s", out)
+	}
+}
+
+func TestReadDiscoveredHelp_SubstitutesPackBinding(t *testing.T) {
+	dir := t.TempDir()
+	helpPath := filepath.Join(dir, "help.md")
+	if err := os.WriteFile(helpPath, []byte("Run `${GC_PACK_BINDING} status` to check.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entry := config.DiscoveredCommand{
+		BindingName: "gs",
+		HelpFile:    helpPath,
+	}
+
+	got := readDiscoveredHelp(entry)
+	if want := "Run `gs status` to check."; got != want {
+		t.Fatalf("readDiscoveredHelp = %q, want %q", got, want)
 	}
 }
 
