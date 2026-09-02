@@ -111,14 +111,16 @@ func TestReleaseOrphanedPoolAssignment_ForceReleasesHeldContinuationLease(t *tes
 	}
 }
 
-// TestReleaseOrphanedPoolAssignment_ForceReleasesLeaseHeldByDifferentFencedSession
-// pins the "release it for a fenced owner" half of gc-jspv's requirement: the
-// root's lease holder need not match the orphaned step bead's own stale
-// assignee (the lease can have been acquired earlier by a session since
-// superseded on this particular step). releaseOrphanedContinuationLease calls
-// molecule.ReleaseContinuationLease with requireHolder="" specifically so
-// crash recovery force-releases regardless of who currently holds it.
-func TestReleaseOrphanedPoolAssignment_ForceReleasesLeaseHeldByDifferentFencedSession(t *testing.T) {
+// TestReleaseOrphanedPoolAssignment_SurvivesLeaseHeldByDifferentSession pins
+// the HIGH authority-gap fix from the gc-ue0tsw exact-head review: orphan
+// recovery only proved the step bead's OWN (pre-release) assignee
+// (worker-dead) is dead. It proved nothing about a different identity
+// (worker-other-fenced) that currently holds the root's continuation lease —
+// that holder could be a live successor that acquired the root between the
+// orphan decision and this release call. releaseOrphanedContinuationLease
+// must bind requireHolder to wb.Assignee, so a mismatched holder is a no-op
+// (the lease survives untouched) rather than a blanket force-release.
+func TestReleaseOrphanedPoolAssignment_SurvivesLeaseHeldByDifferentSession(t *testing.T) {
 	store, root, step := newOrphanedContinuationStepFixture(t, "open", "worker-other-fenced")
 
 	if !releaseOrphanedPoolAssignment(store, step, false) {
@@ -129,8 +131,29 @@ func TestReleaseOrphanedPoolAssignment_ForceReleasesLeaseHeldByDifferentFencedSe
 	if err != nil {
 		t.Fatalf("ContinuationLeaseHolder: %v", err)
 	}
+	if holder != "worker-other-fenced" {
+		t.Fatalf("lease holder = %q, want unchanged worker-other-fenced: the step's stale assignee (worker-dead) proves nothing about a different current holder, so recovery must not force-release it", holder)
+	}
+}
+
+// TestReleaseOrphanedPoolAssignment_ForceReleasesLeaseHeldByOwnStaleAssignee
+// is the companion positive case: when the root's current lease holder DOES
+// match the orphaned step's own (pre-release) assignee, recovery must still
+// clear it — the fenced requireHolder is wb.Assignee, not empty, so a true
+// match must succeed rather than accidentally becoming unconditionally inert.
+func TestReleaseOrphanedPoolAssignment_ForceReleasesLeaseHeldByOwnStaleAssignee(t *testing.T) {
+	store, root, step := newOrphanedContinuationStepFixture(t, "open", orphanedContinuationStepFixtureAssignee)
+
+	if !releaseOrphanedPoolAssignment(store, step, false) {
+		t.Fatalf("releaseOrphanedPoolAssignment returned false, want true")
+	}
+
+	holder, err := molecule.ContinuationLeaseHolder(store, root.ID)
+	if err != nil {
+		t.Fatalf("ContinuationLeaseHolder: %v", err)
+	}
 	if holder != "" {
-		t.Fatalf("lease holder = %q, want cleared even though the lease holder (worker-other-fenced) differs from the step's stale assignee (worker-dead)", holder)
+		t.Fatalf("lease holder = %q, want cleared: the current holder matches the step's own stale assignee (%s)", holder, orphanedContinuationStepFixtureAssignee)
 	}
 }
 
