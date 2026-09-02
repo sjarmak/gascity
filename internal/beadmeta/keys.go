@@ -71,9 +71,28 @@ const (
 	// (*beads.PreconditionFailedError) with no fallback and no partial
 	// effect ever lands. See molecule.ClaimExact's doc for the exact
 	// guarantee this does and does not provide.
-	ClaimGenerationMetadataKey           = "gc.claim_generation"
-	ClosedByAttemptMetadataKey           = "gc.closed_by_attempt"
-	ContinuationGroupMetadataKey         = "gc.continuation_group"
+	ClaimGenerationMetadataKey   = "gc.claim_generation"
+	ClosedByAttemptMetadataKey   = "gc.closed_by_attempt"
+	ContinuationGroupMetadataKey = "gc.continuation_group"
+	// ContinuationLeaseGroupMetadataKey records which gc.continuation_group
+	// value a root bead's continuation lease currently covers. It travels
+	// alongside ContinuationLeaseSessionMetadataKey in every
+	// molecule.AcquireContinuationLease write, purely for observability and
+	// defensive validation (e.g. a reconciler sanity-checking which group a
+	// lease it is about to release actually belongs to) — it is never itself
+	// a precondition ClaimExact checks, since a root bead hosts at most one
+	// live continuation group at a time by construction.
+	ContinuationLeaseGroupMetadataKey = "gc.continuation_lease_group"
+	// ContinuationLeaseSessionMetadataKey is the durable session ID currently
+	// holding the CAS-fenced continuation lease on a workflow root bead (see
+	// molecule.AcquireContinuationLease / molecule.ReleaseContinuationLease).
+	// Unlike ContinuationGroupMetadataKey (an advisory-until-enforced routing
+	// vector on step beads), this key lives on the ROOT bead and, combined
+	// with ClaimGenerationMetadataKey as the generation fence, is what turns
+	// gc.session_affinity=require from metadata into an enforced guarantee:
+	// only the current holder (or a reconciler that has proven it dead) can
+	// advance the lease to a new holder.
+	ContinuationLeaseSessionMetadataKey  = "gc.continuation_lease_session"
 	ControlDispatcherFallbackMetadataKey = "gc.control_dispatcher_fallback"
 	ControlEpochMetadataKey              = "gc.control_epoch"
 	ControlForMetadataKey                = "gc.control_for"
@@ -406,6 +425,8 @@ var KnownMetadataKeys = []string{
 	ClaimGenerationMetadataKey,
 	ClosedByAttemptMetadataKey,
 	ContinuationGroupMetadataKey,
+	ContinuationLeaseGroupMetadataKey,
+	ContinuationLeaseSessionMetadataKey,
 	ControlEpochMetadataKey,
 	ControlForMetadataKey,
 	ControlQuarantineReasonMetadataKey,
@@ -573,11 +594,17 @@ var KnownMetadataPrefixes = []string{
 // leaving another stale.
 //
 // Of these keys, ContinuationGroupMetadataKey is the active routing vector: the
-// hook claim path reads it to vacuum open, unassigned sibling work onto the
-// claiming session. SessionAffinityMetadataKey is currently an advisory marker —
-// it is written (e.g. internal/dispatch/drain.go) but no Go routing path reads
-// it yet, so it is cleared alongside the group for hygiene and future-proofing
-// rather than because it gates routing today.
+// hook claim path reads it (with RootBeadIDMetadataKey) to vacuum open,
+// unassigned sibling work onto the claiming session. SessionAffinityMetadataKey
+// gates enforcement of that routing: when set to "require", the hook claim
+// path (cmd/gc/cmd_hook_claim.go's acquireHookContinuationLease and
+// reorderHookClaimCandidatesForRootAffinity) requires the claiming session to
+// hold the root's single continuation lease (internal/molecule/continuation_lease.go)
+// before executing the bead, and the pool reconciler
+// (cmd/gc/pool_session_name.go's releaseOrphanedContinuationLease)
+// force-releases that lease on crash recovery. It is cleared here alongside
+// the group for the same reason: a stale "require" on a re-routed bead must
+// not survive to gate a session that never acquired the lease.
 var SessionAffinityMetadataKeys = []string{
 	SessionAffinityMetadataKey,
 	ContinuationGroupMetadataKey,
