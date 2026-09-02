@@ -314,6 +314,64 @@ func TestListLiveRootsTreatsLegacyRootAsStoreScoped(t *testing.T) {
 	}
 }
 
+func TestListLiveRootsFallsBackToInputConvoyIDWhenSourceBeadIDUnset(t *testing.T) {
+	// Regression for gc-f0lkv: the convoy-first graph launch path
+	// (attachFormulaToBead's graph branch, slingFormula's direct --formula
+	// launch) deliberately stamps only gc.input_convoy_id and leaves
+	// gc.source_bead_id empty. Without this fallback, `gc workflow
+	// delete-source <convoy-id>` can never find such a root -- ListLiveRoots
+	// returns zero matches no matter which ID is tried, and the CLI reports
+	// the misleading result=already_clean.
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title:  "convoy-first workflow root",
+		Type:   "task",
+		Status: "in_progress",
+		Metadata: map[string]string{
+			"gc.kind":                 "workflow",
+			"gc.input_convoy_id":      "CV-1",
+			SourceStoreRefMetadataKey: "rig:alpha",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+
+	roots, err := ListLiveRoots(store, "CV-1", "rig:alpha", "rig:alpha")
+	if err != nil {
+		t.Fatalf("ListLiveRoots: %v", err)
+	}
+	if len(roots) != 1 || roots[0].ID != root.ID {
+		t.Fatalf("ListLiveRoots(...) = %#v, want exactly root %q", roots, root.ID)
+	}
+}
+
+func TestListLiveRootsDoesNotDoubleCountRootMatchingBothKeys(t *testing.T) {
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title:  "workflow root with both keys",
+		Type:   "task",
+		Status: "in_progress",
+		Metadata: map[string]string{
+			"gc.kind":                 "workflow",
+			"gc.source_bead_id":       "BL-42",
+			"gc.input_convoy_id":      "BL-42",
+			SourceStoreRefMetadataKey: "rig:alpha",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+
+	roots, err := ListLiveRoots(store, "BL-42", "rig:alpha", "rig:alpha")
+	if err != nil {
+		t.Fatalf("ListLiveRoots: %v", err)
+	}
+	if len(roots) != 1 || roots[0].ID != root.ID {
+		t.Fatalf("ListLiveRoots(...) = %#v, want exactly one match for root %q", roots, root.ID)
+	}
+}
+
 type parentLastCloseStore struct {
 	*beads.MemStore
 }
