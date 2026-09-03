@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"sync"
 	"testing"
+	"time"
 )
 
 // countingBackingStore wraps a Store and counts SetMetadata /
@@ -962,6 +964,147 @@ func TestCachingStoreSetMetadataBatchPreservesConcurrentCloseDisposition(t *test
 	}
 	if got.Metadata["other"] != "x" {
 		t.Errorf("other = %q, want %q (unrelated field must survive)", got.Metadata["other"], "x")
+	}
+}
+
+// concurrentWholeRowStore reproduces dr-1tvd's whole-row write-back mechanism
+// (see staleWriteBackStore) while also tracking how many goroutines are
+// simultaneously inside SetMetadataBatch for the same id. A per-key backing
+// merge (like MemStore's own SetMetadataBatch) cannot exercise the race
+// described in gc-g7x3t Finding 2: it tolerates an unserialized CachingStore
+// by construction, because each writer's key survives independently of what
+// the others send. This fake instead REPLACES the whole row with exactly the
+// kvs it receives, so a caller whose merge was built from a stale cache
+// snapshot (because it ran concurrently with, instead of strictly after,
+// another writer for the same id) drops that writer's key on the floor —
+// the actual clobber mechanism, reproduced deterministically.
+type concurrentWholeRowStore struct {
+	*MemStore
+
+	mu          sync.Mutex
+	meta        map[string]map[string]string
+	inflight    int
+	maxInflight int
+}
+
+func newConcurrentWholeRowStore() *concurrentWholeRowStore {
+	return &concurrentWholeRowStore{
+		MemStore: NewMemStore(),
+		meta:     make(map[string]map[string]string),
+	}
+}
+
+func (s *concurrentWholeRowStore) Create(b Bead) (Bead, error) {
+	created, err := s.MemStore.Create(b)
+	if err != nil {
+		return created, err
+	}
+	s.mu.Lock()
+	s.meta[created.ID] = maps.Clone(b.Metadata)
+	s.mu.Unlock()
+	created.Metadata = maps.Clone(b.Metadata)
+	return created, nil
+}
+
+func (s *concurrentWholeRowStore) Get(id string) (Bead, error) {
+	b, err := s.MemStore.Get(id)
+	if err != nil {
+		return b, err
+	}
+	s.mu.Lock()
+	if row, ok := s.meta[id]; ok {
+		b.Metadata = maps.Clone(row)
+	}
+	s.mu.Unlock()
+	return b, nil
+}
+
+func (s *concurrentWholeRowStore) SetMetadata(id, key, value string) error {
+	return s.SetMetadataBatch(id, map[string]string{key: value})
+}
+
+// SetMetadataBatch replaces id's whole metadata row with exactly kvs — no
+// merge against whatever is currently stored. A short sleep between marking
+// entry and committing widens the window for a concurrent, unserialized
+// caller to interleave its own read-merge-write in a real (non-mocked)
+// scheduler, rather than relying on luck to hit the race.
+func (s *concurrentWholeRowStore) SetMetadataBatch(id string, kvs map[string]string) error {
+	s.mu.Lock()
+	s.inflight++
+	if s.inflight > s.maxInflight {
+		s.maxInflight = s.inflight
+	}
+	s.mu.Unlock()
+
+	time.Sleep(2 * time.Millisecond)
+
+	s.mu.Lock()
+	s.meta[id] = maps.Clone(kvs)
+	s.inflight--
+	s.mu.Unlock()
+	return nil
+}
+
+// TestCachingStoreConcurrentMetadataWritesAreSerializedPerID is gc-g7x3t
+// Finding 2's regression test: many goroutines calling SetMetadataBatch on
+// the SAME id, each with its own key, must not clobber one another even
+// though the backing store performs a whole-row write-back from whatever
+// CachingStore hands it (dr-1tvd's actual mechanism). Without idWriteLocks
+// serializing the merge-write-refresh-absorb critical section per id, a
+// writer's mergedMetadataForWrite call can read the cache before an
+// in-flight sibling writer has absorbed its own result, producing a merge
+// that omits the sibling's key — which the whole-row backing then commits
+// over the sibling's write.
+func TestCachingStoreConcurrentMetadataWritesAreSerializedPerID(t *testing.T) {
+	t.Parallel()
+
+	backing := newConcurrentWholeRowStore()
+	bead, err := backing.Create(Bead{Title: "race", Metadata: map[string]string{"other": "x"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	cache := NewCachingStoreForTest(backing, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	const n = 20
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			key := fmt.Sprintf("k%d", i)
+			value := fmt.Sprintf("v%d", i)
+			if err := cache.SetMetadataBatch(bead.ID, map[string]string{key: value}); err != nil {
+				t.Errorf("SetMetadataBatch(%q): %v", key, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	backing.mu.Lock()
+	maxInflight := backing.maxInflight
+	backing.mu.Unlock()
+	if maxInflight > 1 {
+		t.Errorf("observed %d concurrent backing.SetMetadataBatch calls for the same id; "+
+			"idWriteLocks should serialize the merge-write-absorb critical section to 1 at a time", maxInflight)
+	}
+
+	got, err := backing.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("k%d", i)
+		want := fmt.Sprintf("v%d", i)
+		if got.Metadata[key] != want {
+			t.Errorf("metadata[%q] = %q, want %q (lost to a concurrent writer)", key, got.Metadata[key], want)
+		}
+	}
+	if got.Metadata["other"] != "x" {
+		t.Errorf("other = %q, want %q (unrelated field must survive concurrent writes)", got.Metadata["other"], "x")
 	}
 }
 

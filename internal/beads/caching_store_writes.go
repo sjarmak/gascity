@@ -63,6 +63,9 @@ func (c *CachingStore) Update(id string, opts UpdateOpts) error {
 	if c.updateMatchesCached(id, opts) {
 		return nil
 	}
+	// Serialize against concurrent SetMetadata/SetMetadataBatch/Update/Close
+	// on the same id: see idWriteLocks (gc-g7x3t Finding 2).
+	defer c.lockIDWrite(id)()
 	if err := c.backing.Update(id, opts); err != nil {
 		return err
 	}
@@ -191,6 +194,9 @@ func (c *CachingStore) Close(id string) error {
 	if c.closeAlreadyMatchesCached(id) {
 		return nil
 	}
+	// Serialize against concurrent SetMetadata/SetMetadataBatch/Update/Close
+	// on the same id: see idWriteLocks (gc-g7x3t Finding 2).
+	defer c.lockIDWrite(id)()
 	if err := c.backing.Close(id); err != nil {
 		return err
 	}
@@ -224,11 +230,16 @@ func (c *CachingStore) Close(id string) error {
 			clearDirty: true,
 		})
 	} else if b, ok := c.beads[id]; ok {
+		// Backing confirmed the close committed, but the read-back that would
+		// verify the REST of the row failed. Only status is locally known-good
+		// here; clearDirty:true would stamp confirmedAt for the whole row,
+		// telling F2's idempotence short-circuits every other cached field is
+		// backing-fresh when it may not be. See gc-g7x3t Finding 3.
 		b.Status = "closed"
 		c.absorbFreshLocked(id, b, time.Now(), absorbOpts{
 			depsMode:   depsKeepCached,
 			seqMode:    seqKeep,
-			clearDirty: true,
+			clearDirty: false,
 		})
 		closed = cloneBead(b)
 		found = true
@@ -275,11 +286,13 @@ func (c *CachingStore) Reopen(id string) error {
 			clearDirty: true,
 		})
 	} else if b, ok := c.beads[id]; ok {
+		// Same reasoning as Close's fallback: only status is locally
+		// known-good here, not the rest of the row. See gc-g7x3t Finding 3.
 		b.Status = "open"
 		c.absorbFreshLocked(id, b, time.Now(), absorbOpts{
 			depsMode:   depsKeepCached,
 			seqMode:    seqKeep,
-			clearDirty: true,
+			clearDirty: false,
 		})
 		reopened = cloneBead(b)
 		found = true
@@ -404,6 +417,12 @@ func (c *CachingStore) SetMetadata(id, key, value string) error {
 	if c.metadataAlreadyMatchesCached(id, delta) {
 		return nil
 	}
+	// Serialize against concurrent SetMetadata/SetMetadataBatch/Update/Close
+	// on the same id: mergedMetadataForWrite reads the cache and the backing
+	// write below is built on it, so a concurrent writer for the same id
+	// must not merge onto a base this write is about to invalidate, or vice
+	// versa (gc-g7x3t Finding 2).
+	defer c.lockIDWrite(id)()
 	// Send the full merged metadata state when the cache has a row to merge
 	// onto (see mergedMetadataForWrite); this defends against bd clobbering
 	// fields this call never mentions. Fall back to the single-key call on a
@@ -432,6 +451,12 @@ func (c *CachingStore) SetMetadata(id, key, value string) error {
 		updated = cloneBead(fresh)
 		notify = true
 	} else if b, ok := c.beads[id]; ok {
+		// Backing confirmed the write committed, but the read-back that would
+		// verify the REST of the row failed. Only the written key is locally
+		// known-good here; clearDirty:true would stamp confirmedAt for the
+		// whole row, telling F2's idempotence short-circuits every other
+		// cached field is backing-fresh when it may not be. See gc-g7x3t
+		// Finding 3.
 		if b.Metadata == nil {
 			b.Metadata = make(map[string]string)
 		}
@@ -439,7 +464,7 @@ func (c *CachingStore) SetMetadata(id, key, value string) error {
 		c.absorbFreshLocked(id, b, time.Now(), absorbOpts{
 			depsMode:   depsKeepCached,
 			seqMode:    seqKeep,
-			clearDirty: true,
+			clearDirty: false,
 		})
 		updated = cloneBead(b)
 		notify = true
@@ -469,6 +494,9 @@ func (c *CachingStore) SetMetadataBatch(id string, kvs map[string]string) error 
 	if c.metadataAlreadyMatchesCached(id, kvs) {
 		return nil
 	}
+	// Serialize against concurrent SetMetadata/SetMetadataBatch/Update/Close
+	// on the same id: see idWriteLocks (gc-g7x3t Finding 2).
+	defer c.lockIDWrite(id)()
 	// Widen the batch to the full merged metadata state when the cache has a
 	// row to merge onto (see mergedMetadataForWrite), so bd cannot clobber
 	// fields this call never mentions from a stale base. Fall back to the
@@ -502,6 +530,9 @@ func (c *CachingStore) SetMetadataBatch(id string, kvs map[string]string) error 
 		updated = cloneBead(fresh)
 		notify = true
 	} else if b, ok := c.beads[id]; ok {
+		// Same reasoning as SetMetadata's fallback: only the written keys are
+		// locally known-good here, not the rest of the row. See gc-g7x3t
+		// Finding 3.
 		if b.Metadata == nil {
 			b.Metadata = make(map[string]string, len(kvs))
 		}
@@ -511,7 +542,7 @@ func (c *CachingStore) SetMetadataBatch(id string, kvs map[string]string) error 
 		c.absorbFreshLocked(id, b, time.Now(), absorbOpts{
 			depsMode:   depsKeepCached,
 			seqMode:    seqKeep,
-			clearDirty: true,
+			clearDirty: false,
 		})
 		updated = cloneBead(b)
 		notify = true

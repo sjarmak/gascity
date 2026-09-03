@@ -95,7 +95,11 @@ func TestMergeOracleFieldCoverage(t *testing.T) {
 		// observationRevision is a process-local publication fence, orthogonal to
 		// the merge oracle's durable cache-state comparison.
 		"observationRevision": true,
-		"backing":             true, "idPrefix": true, "mu": true, "reconciling": true,
+		// idWriteLocks is a process-local concurrency primitive (per-id write
+		// serialization), analogous to mu — it has no durable cache-state
+		// content for the merge oracle to compare.
+		"idWriteLocks": true,
+		"backing":      true, "idPrefix": true, "mu": true, "reconciling": true,
 		"onChange": true, "problemf": true, "problemLog": true,
 		"lastReconcileLogAt": true, "primeMu": true, "primeRunning": true,
 		"primeCycle": true, "lastFullPrimeStartedAt": true, "primeRetryDelay": true,
