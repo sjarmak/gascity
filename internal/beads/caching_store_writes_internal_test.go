@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"runtime"
 	"sync"
 	"testing"
-	"time"
 )
 
 // countingBackingStore wraps a Store and counts SetMetadata /
@@ -1024,10 +1024,12 @@ func (s *concurrentWholeRowStore) SetMetadata(id, key, value string) error {
 }
 
 // SetMetadataBatch replaces id's whole metadata row with exactly kvs — no
-// merge against whatever is currently stored. A short sleep between marking
-// entry and committing widens the window for a concurrent, unserialized
-// caller to interleave its own read-merge-write in a real (non-mocked)
-// scheduler, rather than relying on luck to hit the race.
+// merge against whatever is currently stored. Yielding the scheduler
+// repeatedly between marking entry and committing widens the window for a
+// concurrent, unserialized caller to interleave its own read-merge-write in
+// a real (non-mocked) scheduler, rather than relying on luck to hit the
+// race. This uses cooperative yields rather than a fixed sleep so the test
+// doesn't block on wall-clock time to detect the race.
 func (s *concurrentWholeRowStore) SetMetadataBatch(id string, kvs map[string]string) error {
 	s.mu.Lock()
 	s.inflight++
@@ -1036,7 +1038,9 @@ func (s *concurrentWholeRowStore) SetMetadataBatch(id string, kvs map[string]str
 	}
 	s.mu.Unlock()
 
-	time.Sleep(2 * time.Millisecond)
+	for i := 0; i < 1000; i++ {
+		runtime.Gosched()
+	}
 
 	s.mu.Lock()
 	s.meta[id] = maps.Clone(kvs)
