@@ -370,6 +370,12 @@ func mergeConditionEnv(environ, extra []string) []string {
 // checkEvent checks if matching events exist after the last cursor position.
 // Events emitted by order-tracking beads (controller bookkeeping) are excluded
 // to prevent event orders from self-firing on their own tracking-bead lifecycle.
+//
+// A cursor of 0 means the order has never fired (SetCursor is only written on
+// an actual run — see doOrderRunExecTracked / order_dispatch.go), so an event
+// order that is simply waiting for its first-ever match hits this path on
+// every dispatch tick until it fires. checkEventFromGenesis bounds that
+// repeated read; see its doc comment.
 func checkEvent(a Order, ep events.Provider, cursorFn CursorFunc) TriggerResult {
 	if ep == nil {
 		return TriggerResult{Due: false, Reason: "event: no events provider"}
@@ -377,6 +383,9 @@ func checkEvent(a Order, ep events.Provider, cursorFn CursorFunc) TriggerResult 
 	var cursor uint64
 	if cursorFn != nil {
 		cursor = cursorFn(a.ScopedName())
+	}
+	if cursor == 0 {
+		return checkEventFromGenesis(a, ep)
 	}
 
 	matched, err := ep.List(events.Filter{
@@ -386,18 +395,72 @@ func checkEvent(a Order, ep events.Provider, cursorFn CursorFunc) TriggerResult 
 	if err != nil {
 		return TriggerResult{Due: false, Reason: fmt.Sprintf("event: read error: %v", err)}
 	}
-	var count int
-	for _, e := range matched {
-		// Exclude the dispatcher's own order-tracking bookkeeping beads so an event
-		// order never self-fires on lifecycle events emitted by those beads (#3720).
-		if !payloadHasLabel(e.Payload, labelOrderTracking) {
-			count++
-		}
-	}
+	count := countNonTrackingMatches(matched)
 	if count == 0 {
 		return TriggerResult{Due: false, Reason: "event: no matching events"}
 	}
 	return TriggerResult{Due: true, Reason: fmt.Sprintf("event: %d %s event(s)", count, a.On)}
+}
+
+// checkEventZeroCursorInitialWindow is the width, in event sequence numbers,
+// of the first window checkEventFromGenesis reads. AfterSeq > 0 already lets
+// archiveOverlapsFilter skip any archive whose entire seq range predates it
+// (see checkEvent's non-zero-cursor path above); a cursor of 0 previously
+// disabled that pruning entirely (AfterSeq==0 means "no filter"), forcing
+// ep.List to gunzip and decode every retained archive on every tick a
+// never-fired event order was evaluated — the unbounded-archive-walk class of
+// gc-33htn / gastownhall/gascity#5191.
+const checkEventZeroCursorInitialWindow = 4096
+
+// checkEventFromGenesis answers checkEvent's cursor==0 case: has any
+// non-tracking a.On event ever occurred? It reads a recent window of the
+// event log instead of the whole retained history, then doubles the window
+// and retries whenever the window came back with zero real matches. Growing
+// rather than reading once with a small fixed limit matters because the
+// window's matches are post-filtered to drop order-tracking bookkeeping
+// events (#3720): a window that happens to hold only tracking-bead events
+// would otherwise report "no matching events" even though a real match sits
+// just outside it. The window doubles until either a real match turns up or
+// AfterSeq reaches 0 (List's "no filter" sentinel), at which point the read
+// covered the entire retained history and a true negative is confirmed.
+func checkEventFromGenesis(a Order, ep events.Provider) TriggerResult {
+	latest, err := ep.LatestSeq()
+	if err != nil {
+		return TriggerResult{Due: false, Reason: fmt.Sprintf("event: read error: %v", err)}
+	}
+	if latest == 0 {
+		return TriggerResult{Due: false, Reason: "event: no matching events"}
+	}
+
+	for window := uint64(checkEventZeroCursorInitialWindow); ; window *= 2 {
+		var afterSeq uint64
+		if window < latest {
+			afterSeq = latest - window
+		}
+		matched, err := ep.List(events.Filter{Type: a.On, AfterSeq: afterSeq})
+		if err != nil {
+			return TriggerResult{Due: false, Reason: fmt.Sprintf("event: read error: %v", err)}
+		}
+		if count := countNonTrackingMatches(matched); count > 0 {
+			return TriggerResult{Due: true, Reason: fmt.Sprintf("event: %d %s event(s)", count, a.On)}
+		}
+		if afterSeq == 0 {
+			return TriggerResult{Due: false, Reason: "event: no matching events"}
+		}
+	}
+}
+
+// countNonTrackingMatches reports how many of the given events are not the
+// dispatcher's own order-tracking bookkeeping beads, so an event order never
+// self-fires on lifecycle events emitted by those beads (#3720).
+func countNonTrackingMatches(matched []events.Event) int {
+	var count int
+	for _, e := range matched {
+		if !payloadHasLabel(e.Payload, labelOrderTracking) {
+			count++
+		}
+	}
+	return count
 }
 
 // payloadHasLabel reports whether a JSON bead payload contains the given label.

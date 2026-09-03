@@ -839,3 +839,162 @@ func TestCheckTriggerCronBadTZFailsClosed(t *testing.T) {
 		t.Errorf("due=%v reason=%q, want fail-closed with a bad-tz reason", res.Due, res.Reason)
 	}
 }
+
+// windowedEventsProvider is a fake events.Provider whose List records the
+// AfterSeq every call was made with and answers strictly from an in-memory
+// event set, so tests can assert exactly how checkEventFromGenesis grows its
+// read window without standing up real rotated archives (gc-33htn).
+type windowedEventsProvider struct {
+	latest      uint64
+	events      []events.Event
+	afterSeqLog []uint64
+}
+
+func (p *windowedEventsProvider) Record(events.Event) {}
+
+func (p *windowedEventsProvider) List(filter events.Filter) ([]events.Event, error) {
+	p.afterSeqLog = append(p.afterSeqLog, filter.AfterSeq)
+	var out []events.Event
+	for _, e := range p.events {
+		if filter.Type != "" && e.Type != filter.Type {
+			continue
+		}
+		if filter.AfterSeq > 0 && e.Seq <= filter.AfterSeq {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+func (p *windowedEventsProvider) LatestSeq() (uint64, error) { return p.latest, nil }
+
+func (p *windowedEventsProvider) Watch(context.Context, uint64) (events.Watcher, error) {
+	return nil, fmt.Errorf("windowedEventsProvider: Watch not implemented")
+}
+
+func (p *windowedEventsProvider) Close() error { return nil }
+
+// TestCheckEventFromGenesisFindsRecentMatchWithoutFullScan is the direct
+// regression for gc-33htn / gastownhall/gascity#5191: a cursor-0 event order
+// whose match sits in the recent window must be found with a single bounded
+// read, never the AfterSeq=0 ("no filter") read that forces every archive
+// open on a long-lived city.
+func TestCheckEventFromGenesisFindsRecentMatchWithoutFullScan(t *testing.T) {
+	const latest = 1_000_000
+	ep := &windowedEventsProvider{
+		latest: latest,
+		events: []events.Event{
+			{Seq: latest - 100, Type: "bead.closed"},
+		},
+	}
+	a := Order{Name: "convoy-check", Trigger: "event", On: "bead.closed"}
+	result := CheckTrigger(a, time.Time{}, neverRan, ep, nil)
+	if !result.Due {
+		t.Fatalf("Due = false, want true; reason: %s", result.Reason)
+	}
+	if len(ep.afterSeqLog) != 1 {
+		t.Fatalf("List called %d times, want exactly 1 (found on the first window): afterSeqLog=%v", len(ep.afterSeqLog), ep.afterSeqLog)
+	}
+	if ep.afterSeqLog[0] == 0 {
+		t.Errorf("first List call used AfterSeq=0 (unbounded/no-filter read) instead of a bounded recent window")
+	}
+}
+
+// TestCheckEventFromGenesisGrowsWindowUntilMatch proves the window genuinely
+// doubles and retries rather than giving up after one bounded read: a match
+// that only a wider window reaches must still be found.
+func TestCheckEventFromGenesisGrowsWindowUntilMatch(t *testing.T) {
+	const latest = 1_000_000
+	const matchSeq = latest - 10_000 // outside the first two windows (4096, 8192)
+	ep := &windowedEventsProvider{
+		latest: latest,
+		events: []events.Event{
+			{Seq: matchSeq, Type: "bead.closed"},
+		},
+	}
+	a := Order{Name: "convoy-check", Trigger: "event", On: "bead.closed"}
+	result := CheckTrigger(a, time.Time{}, neverRan, ep, nil)
+	if !result.Due {
+		t.Fatalf("Due = false, want true; reason: %s", result.Reason)
+	}
+	if len(ep.afterSeqLog) < 2 {
+		t.Fatalf("List called %d times, want >1 (must widen past the first window): afterSeqLog=%v", len(ep.afterSeqLog), ep.afterSeqLog)
+	}
+	for i := 1; i < len(ep.afterSeqLog); i++ {
+		if ep.afterSeqLog[i] >= ep.afterSeqLog[i-1] {
+			t.Errorf("afterSeqLog[%d]=%d did not shrink from afterSeqLog[%d]=%d (window must widen toward genesis)", i, ep.afterSeqLog[i], i-1, ep.afterSeqLog[i-1])
+		}
+	}
+}
+
+// TestCheckEventFromGenesisTrackingOnlyWindowKeepsGrowing is the post-filter
+// regression called out on gc-33htn: a window whose only matches are
+// order-tracking bookkeeping events must NOT be reported as "no matching
+// events" while a real match still exists further back in history.
+func TestCheckEventFromGenesisTrackingOnlyWindowKeepsGrowing(t *testing.T) {
+	const latest = 1_000_000
+	trackingPayload := mustMarshalLabels(t, []string{"order-run:convoy-check", "order-tracking"})
+	ep := &windowedEventsProvider{
+		latest: latest,
+		events: []events.Event{
+			// Inside the first window (AfterSeq ~ latest-4096): tracking-only,
+			// must be filtered to zero and NOT taken as a false no-match.
+			{Seq: latest - 50, Type: "bead.closed", Payload: trackingPayload},
+			// Only reachable once the window has widened past ~10,000.
+			{Seq: latest - 10_000, Type: "bead.closed"},
+		},
+	}
+	a := Order{Name: "convoy-check", Trigger: "event", On: "bead.closed"}
+	result := CheckTrigger(a, time.Time{}, neverRan, ep, nil)
+	if !result.Due {
+		t.Fatalf("Due = false, want true (a real match exists past the tracking-only window); reason: %s", result.Reason)
+	}
+	if result.Reason != "event: 1 bead.closed event(s)" {
+		t.Errorf("Reason = %q, want %q", result.Reason, "event: 1 bead.closed event(s)")
+	}
+	if len(ep.afterSeqLog) < 2 {
+		t.Fatalf("List called %d times, want >1 (the tracking-only window must not stop the search): afterSeqLog=%v", len(ep.afterSeqLog), ep.afterSeqLog)
+	}
+}
+
+// TestCheckEventFromGenesisExhaustsToGenesisOnTrueNegative confirms the
+// window keeps growing all the way to AfterSeq=0 (full retained history) and
+// then terminates with "no matching events" when there truly is no match —
+// the exhaustion side of the grow-until-match-or-exhausted contract — and
+// that it does so in a bounded number of doublings, not by looping forever.
+func TestCheckEventFromGenesisExhaustsToGenesisOnTrueNegative(t *testing.T) {
+	const latest = 1_000_000
+	ep := &windowedEventsProvider{latest: latest} // no events at all
+	a := Order{Name: "convoy-check", Trigger: "event", On: "bead.closed"}
+	result := CheckTrigger(a, time.Time{}, neverRan, ep, nil)
+	if result.Due {
+		t.Fatalf("Due = true, want false (no matching events exist anywhere); reason: %s", result.Reason)
+	}
+	if result.Reason != "event: no matching events" {
+		t.Errorf("Reason = %q, want %q", result.Reason, "event: no matching events")
+	}
+	if ep.afterSeqLog[len(ep.afterSeqLog)-1] != 0 {
+		t.Errorf("last AfterSeq = %d, want 0 (must reach genesis before declaring a true negative)", ep.afterSeqLog[len(ep.afterSeqLog)-1])
+	}
+	// latest=1,000,000 with a starting window of 4096 doubling each round
+	// reaches 0 well within 20 rounds; a much higher count would mean the
+	// window growth or termination logic regressed.
+	if len(ep.afterSeqLog) > 20 {
+		t.Errorf("List called %d times to exhaust history, want a small bounded number of doublings", len(ep.afterSeqLog))
+	}
+}
+
+// TestCheckEventFromGenesisEmptyLogIsImmediateNotDue confirms an empty event
+// log (LatestSeq()==0) short-circuits without ever calling List.
+func TestCheckEventFromGenesisEmptyLogIsImmediateNotDue(t *testing.T) {
+	ep := &windowedEventsProvider{latest: 0}
+	a := Order{Name: "convoy-check", Trigger: "event", On: "bead.closed"}
+	result := CheckTrigger(a, time.Time{}, neverRan, ep, nil)
+	if result.Due {
+		t.Fatalf("Due = true, want false (empty event log); reason: %s", result.Reason)
+	}
+	if len(ep.afterSeqLog) != 0 {
+		t.Errorf("List called %d times, want 0 for an empty log", len(ep.afterSeqLog))
+	}
+}
