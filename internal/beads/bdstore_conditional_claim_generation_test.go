@@ -2,6 +2,7 @@ package beads_test
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -77,17 +78,35 @@ func sequencedShow(t *testing.T, generations ...string) func(id string) ([]byte,
 	}
 }
 
-// TestClaimWithGenerationMintsFromAbsentInOneCall pins the exact argv for the
-// first-ever claim of a bead never claimed through this fence before — the
-// empty string reads as generation 0, so the first mint is "1" — and pins
-// that the claim and the mint travel in ONE bd invocation. This is the
-// gc-3ohe47 HIGH fix: a separate second write here would reopen the window
-// the exact-head review flagged against a prior, two-write shape of this fix.
-func TestClaimWithGenerationMintsFromAbsentInOneCall(t *testing.T) {
+// generationFromSetMetadataArg extracts the minted value from a recorded
+// `--set-metadata gc.claim_generation=<value>` pair, so a reply stub can echo
+// back whatever value production code actually chose without hardcoding it.
+func generationFromSetMetadataArg(t *testing.T, args []string) string {
+	t.Helper()
+	const prefix = "gc.claim_generation="
+	for i, a := range args {
+		if a == "--set-metadata" && i+1 < len(args) && strings.HasPrefix(args[i+1], prefix) {
+			return strings.TrimPrefix(args[i+1], prefix)
+		}
+	}
+	t.Fatalf("no --set-metadata gc.claim_generation=<value> in argv: %v", args)
+	return ""
+}
+
+// TestClaimWithGenerationMintsInOneCall pins that the claim and the mint
+// travel in ONE bd invocation carrying a valid positive decimal generation.
+// This is the gc-3ohe47 HIGH #1 fix: a separate second write here would
+// reopen the window the exact-head review flagged against a prior, two-write
+// shape of this fix. It does not pin an exact minted value — see
+// TestClaimWithGenerationDoesNotReuseAGenerationAcrossEpisodes for why
+// pinning a value derived from a pre-claim read would itself reintroduce the
+// round-3 ABA finding this file exists to close.
+func TestClaimWithGenerationMintsInOneCall(t *testing.T) {
 	runner := &generationVerbRunner{
 		show: sequencedShow(t, ""),
-		reply: func(_ []string) ([]byte, error) {
-			return []byte(`[{"id":"bd-42","assignee":"worker-1","metadata":{"gc.claim_generation":"1"}}]`), nil
+		reply: func(args []string) ([]byte, error) {
+			mint := generationFromSetMetadataArg(t, args)
+			return []byte(`[{"id":"bd-42","assignee":"worker-1","metadata":{"gc.claim_generation":"` + mint + `"}}]`), nil
 		},
 	}
 	s := beads.NewBdStore("/city", runner.run)
@@ -99,48 +118,68 @@ func TestClaimWithGenerationMintsFromAbsentInOneCall(t *testing.T) {
 	if !ok {
 		t.Fatal("ClaimWithGeneration reported no claim, want a win")
 	}
-	if next != "1" {
-		t.Fatalf("next = %q, want %q", next, "1")
-	}
 	if claimed.ID != "bd-42" {
 		t.Fatalf("claimed.ID = %q, want %q", claimed.ID, "bd-42")
 	}
-	want := []string{"bd", "update", "bd-42", "--claim", "--set-metadata", "gc.claim_generation=1", "--json"}
+	n, err := strconv.ParseInt(next, 10, 64)
+	if err != nil || n <= 0 {
+		t.Fatalf("next = %q, want a positive decimal integer (err=%v)", next, err)
+	}
 	calls := runner.generationVerbArgv()
 	if len(calls) != 1 {
 		t.Fatalf("mutation calls = %v, want exactly one (claim and mint in the SAME bd invocation)", calls)
 	}
+	want := []string{"bd", "update", "bd-42", "--claim", "--set-metadata", "gc.claim_generation=" + next, "--json"}
 	if strings.Join(calls[0], "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("argv = %q\nwant  %q", calls[0], want)
 	}
 }
 
-// TestClaimWithGenerationAdvancesFromExisting proves the monotonic-counter
-// contract survives the merge into one call: a bead already carrying a
-// generation (from an earlier claim/release cycle) advances by exactly one.
-func TestClaimWithGenerationAdvancesFromExisting(t *testing.T) {
+// TestClaimWithGenerationDoesNotReuseAGenerationAcrossEpisodes is the
+// discriminating regression for the gc-3ohe47 round-3 ABA finding recorded
+// against b740b1f3b: Codex showed empirically that a value computed from a
+// Get() taken before the claim attempt can be reused across two DISTINCT
+// claim episodes when the second episode's pre-claim read observes the same
+// prior generation the first one did (A reads 7; B claims 8 and releases;
+// A's stale claim then reuses 8 — a value a completed, released episode had
+// already consumed). This fixture answers EVERY pre-claim read with the same
+// stale generation, exactly reproducing that setup: a predecessor of the fix
+// under test computed next from that read and would mint the identical value
+// for both episodes.
+func TestClaimWithGenerationDoesNotReuseAGenerationAcrossEpisodes(t *testing.T) {
 	runner := &generationVerbRunner{
-		show: sequencedShow(t, "7"),
-		reply: func(_ []string) ([]byte, error) {
-			return []byte(`[{"id":"bd-42","assignee":"worker-1","metadata":{"gc.claim_generation":"8"}}]`), nil
+		show: func(id string) ([]byte, error) {
+			return []byte(`[{"id":"` + id + `","metadata":{"gc.claim_generation":"7"}}]`), nil
+		},
+		reply: func(args []string) ([]byte, error) {
+			mint := generationFromSetMetadataArg(t, args)
+			return []byte(`[{"id":"bd-42","assignee":"worker-1","metadata":{"gc.claim_generation":"` + mint + `"}}]`), nil
 		},
 	}
 	s := beads.NewBdStore("/city", runner.run)
 
-	_, next, ok, err := s.ClaimWithGeneration("bd-42")
+	_, next1, ok1, err1 := s.ClaimWithGeneration("bd-42")
+	if err1 != nil || !ok1 {
+		t.Fatalf("first claim: next=%q ok=%v err=%v", next1, ok1, err1)
+	}
+	_, next2, ok2, err2 := s.ClaimWithGeneration("bd-42")
+	if err2 != nil || !ok2 {
+		t.Fatalf("second claim: next=%q ok=%v err=%v", next2, ok2, err2)
+	}
+
+	if next1 == next2 {
+		t.Fatalf("two distinct claim episodes minted the SAME generation %q: a stale pre-claim read reused already-consumed authority", next1)
+	}
+	n1, err := strconv.ParseInt(next1, 10, 64)
 	if err != nil {
-		t.Fatalf("ClaimWithGeneration: %v", err)
+		t.Fatalf("next1 = %q is not a decimal integer: %v", next1, err)
 	}
-	if !ok {
-		t.Fatal("ClaimWithGeneration reported no claim, want a win")
+	n2, err := strconv.ParseInt(next2, 10, 64)
+	if err != nil {
+		t.Fatalf("next2 = %q is not a decimal integer: %v", next2, err)
 	}
-	if next != "8" {
-		t.Fatalf("next = %q, want %q", next, "8")
-	}
-	want := []string{"bd", "update", "bd-42", "--claim", "--set-metadata", "gc.claim_generation=8", "--json"}
-	calls := runner.generationVerbArgv()
-	if len(calls) != 1 || strings.Join(calls[0], "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("argv = %v\nwant  %q", calls, want)
+	if n2 <= n1 {
+		t.Fatalf("generation did not advance: first=%d second=%d, want second > first", n1, n2)
 	}
 }
 
@@ -211,25 +250,6 @@ func TestClaimWithGenerationRefusesAFuzzyIDCollision(t *testing.T) {
 	}
 	if mutations := runner.generationVerbArgv(); len(mutations) != 0 {
 		t.Fatalf("a collision must never reach bd: %v", mutations)
-	}
-}
-
-// TestClaimWithGenerationRefusesAnUnparsableGeneration is the fail-closed
-// guard on the pre-read side: a present-but-corrupt generation must refuse
-// rather than guess a restart point, and must never issue the claim.
-func TestClaimWithGenerationRefusesAnUnparsableGeneration(t *testing.T) {
-	runner := &generationVerbRunner{show: sequencedShow(t, "not-a-number")}
-	s := beads.NewBdStore("/city", runner.run)
-
-	claimed, next, ok, err := s.ClaimWithGeneration("bd-42")
-	if err == nil {
-		t.Fatal("an unparsable current generation must error, not guess")
-	}
-	if ok || next != "" || claimed.ID != "" {
-		t.Fatalf("claimed=%+v next=%q ok=%v on error, want all empty", claimed, next, ok)
-	}
-	if len(runner.generationVerbArgv()) != 0 {
-		t.Fatalf("an unparsable generation must never reach bd: %v", runner.argv())
 	}
 }
 

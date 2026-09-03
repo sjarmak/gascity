@@ -6,6 +6,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 )
@@ -38,6 +39,25 @@ import (
 // invocation — to land at all. A losing --claim aborts the whole bd update,
 // including the metadata write, exactly like BdStore.Claim's existing
 // race-loser classification.
+//
+// A second shape of this fix (superseded, see the exact-head review recorded
+// against b740b1f3b) computed the minted value from a Get() taken
+// immediately before the claim attempt, reasoning that the only way a second
+// call could also mint a competing value was to win the SAME --claim race —
+// which bd's single-writer exclusivity already rules out. That reasoning
+// covered CONCURRENT contenders but missed a SEQUENTIAL one: two DIFFERENT,
+// non-overlapping claim episodes can each read the SAME prior generation and
+// compute the SAME "next" value, because nothing fences the read against the
+// write across the gap between them. Codex demonstrated it empirically
+// against bd 1.3.0-rc.1: A reads generation 7; B claims 8 and releases; A's
+// stale claim then succeeds too, reusing generation 8 — a value a completed,
+// released claim episode had already consumed. bd has no flag that closes
+// this gap: --if-assignee and --if-status are both documented as unable to
+// combine with --claim, and no --if-metadata (or any other value-level CAS)
+// flag exists in `bd update --help`. No read taken before the write can ever
+// be proven fresh at the write, so nextClaimGenerationToken below computes
+// the minted value without reading the bead's prior generation at all — see
+// its doc for why that closes the gap instead of narrowing it.
 
 // AdvanceClaimGenerationOutcome classifies how ConfirmClaimGeneration
 // resolved. It is always paired with a nil error; a non-nil error means the
@@ -71,31 +91,27 @@ const (
 // second writer room to mint a competing generation against the same
 // ownership transition.
 //
-// next is computed from a Get immediately before the claim attempt. This is
-// not a compare-and-swap on that read — bd cannot express one against an
-// arbitrary metadata value — but the only writer of
-// beadmeta.ClaimGenerationMetadataKey on an unclaimed bead is another
-// ClaimWithGeneration call, and that call can only WIN by winning --claim's
-// single-writer exclusivity, so the read-to-write gap here cannot be raced
-// by a second call that also succeeds: the loser's whole update, mint
-// included, never lands.
+// The initial Get exists ONLY to verify id names exactly one existing bead
+// before anything is written — bd's resolver prefix/substring-matches an id
+// with no exact hit, and a mint issued against that would fence the wrong
+// bead entirely (the same gcy-g4o guard ReleaseIfCurrent carries). Its
+// result is never used to compute the minted generation: next comes from
+// nextClaimGenerationToken, which needs no read of the bead's prior state to
+// be unique. See that function's doc for why a value derived from this (or
+// any) pre-write read cannot be trusted for that computation.
 //
 // It returns ok=false, nil error when bd reports that another actor won the
 // claim race (the loser never wrote anything, generation included). A bd
 // build predating --claim or --set-metadata is refused as an error, never
 // silently downgraded to an unfenced claim.
 func (s *BdStore) ClaimWithGeneration(id string) (Bead, string, bool, error) {
-	before, err := s.Get(id)
-	if err != nil {
+	if _, err := s.Get(id); err != nil {
 		if errors.Is(err, ErrIDCollision) {
 			return Bead{}, "", false, fmt.Errorf("refusing to claim %q with generation: %w", id, err)
 		}
 		return Bead{}, "", false, fmt.Errorf("claiming bead %q with generation: reading current state: %w", id, err)
 	}
-	next, err := NextClaimGeneration(strings.TrimSpace(before.Metadata[beadmeta.ClaimGenerationMetadataKey]))
-	if err != nil {
-		return Bead{}, "", false, fmt.Errorf("claiming bead %q with generation: %w", id, err)
-	}
+	next := nextClaimGenerationToken()
 
 	out, runErr := s.runBDTransientWriteOutput(
 		"update", id,
@@ -125,6 +141,39 @@ func (s *BdStore) ClaimWithGeneration(id string) (Bead, string, bool, error) {
 		return Bead{}, "", false, fmt.Errorf("claiming bead %q with generation: %w", id, err)
 	}
 	return claimed, next, true, nil
+}
+
+// nextClaimGenerationToken mints a fresh beadmeta.ClaimGenerationMetadataKey
+// value without reading the bead's own last-recorded generation, closing the
+// gc-3ohe47 round-3 ABA a read-then-mint predecessor of this function had:
+// Codex found that a value computed from a Get() taken before the claim
+// attempt can be reused across two DISTINCT claim episodes whenever a second
+// claimant's whole claim-release cycle completes inside the gap between that
+// read and this call's own --claim landing. bd has no flag that fences
+// --claim against an expected prior metadata value (`bd update --help`
+// documents --if-assignee/--if-status as unable to combine with --claim, and
+// there is no --if-metadata or other value-level CAS flag), so no read taken
+// before the write can ever be proven fresh at the moment of the write —
+// narrowing the gap between them cannot close it, only shrink it.
+//
+// A value minted from the local monotonic-ish wall clock at the moment of
+// the write has no such dependency: it needs no read of prior state to be
+// unique, so a second claimant's stale belief about the bead's generation
+// cannot poison it. Two DIFFERENT claim episodes for the same bead are
+// always separated in real time by the first episode's completed release
+// (bd's own --claim exclusivity forbids a second winner while the first
+// still holds the claim), so the second episode's mint is always later, in
+// wall-clock terms, than the first's — a collision would require two `bd
+// update` process invocations completing within the same nanosecond, which
+// the process-spawn cost of running bd rules out in practice.
+//
+// The result is still a positive decimal integer, so it stays compatible
+// with NextClaimGeneration's parsing contract: a later claim on the same
+// bead through this mechanism, molecule.ClaimExact, or SQLiteStore.claimTx
+// advances from it exactly as it would advance from any smaller counter
+// value — nothing downstream needs to know this mechanism minted it.
+func nextClaimGenerationToken() string {
+	return strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
 }
 
 // ErrBdMissingClaimGenerationSupport means the installed bd predates --claim
@@ -177,7 +226,12 @@ func (s *BdStore) ConfirmClaimGeneration(id, expectedAssignee, expectedGeneratio
 //
 // Exported so cmd/gc's graph-store claim route (gc-3ohe47 HIGH #2) can advance
 // the same counter through its own CompareAndSetMetadataKey fence, without a
-// third independent reimplementation of this parsing.
+// third independent reimplementation of this parsing. BdStore.ClaimWithGeneration
+// itself no longer calls this directly (see nextClaimGenerationToken's doc for
+// why a pre-write read is unsafe as this function's input in that path); it
+// remains the correct successor function for any caller that already holds a
+// value fenced by a real compare-and-swap, such as molecule.ClaimExact's
+// UpdateIfMatch or SQLiteStore.claimTx's transaction-local read.
 func NextClaimGeneration(current string) (string, error) {
 	if current == "" {
 		return "1", nil

@@ -1683,7 +1683,7 @@ name = "worker"
 	script := fmt.Sprintf(`#!/bin/sh
 printf 'actor=%%s args=%%s\n' "${BEADS_ACTOR:-}" "$*" >> %q
 case "$*" in
-  *"update hw-claim --claim --set-metadata gc.claim_generation=1 --json"*)
+  *"update hw-claim --claim --set-metadata gc.claim_generation="*" --json"*)
     touch %q
     printf '[{"id":"hw-claim","status":"in_progress","assignee":"%%s","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body","gc.claim_generation":"1"}}]' "${BEADS_ACTOR:-}"
     ;;
@@ -1747,7 +1747,8 @@ esac
 		t.Fatalf("ReadFile(%s): %v", logPath, err)
 	}
 	logText := string(logData)
-	if !strings.Contains(logText, "actor=worker-1 args=update hw-claim --claim --set-metadata gc.claim_generation=1 --json") {
+	if !strings.Contains(logText, "actor=worker-1 args=update hw-claim --claim --set-metadata gc.claim_generation=") ||
+		!strings.Contains(logText, " --json") {
 		t.Fatalf("bd claim did not use canonical BEADS_ACTOR=worker-1; log:\n%s", logText)
 	}
 	if !strings.Contains(logText, "actor=worker-1 args=show --json hw-claim") {
