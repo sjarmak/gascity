@@ -1,6 +1,7 @@
 package molecule
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -9,7 +10,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 )
 
-func mustCreateContinuationLeaseRoot(t *testing.T, store *beads.MemStore) beads.Bead {
+func mustCreateContinuationLeaseRoot(t *testing.T, store beads.Store) beads.Bead {
 	t.Helper()
 	b, err := store.Create(beads.Bead{
 		Title:  "workflow root",
@@ -405,7 +406,7 @@ func mustGetBead(t *testing.T, store beads.Store, id string) beads.Bead {
 	return b
 }
 
-func mustCreateOpenSibling(t *testing.T, store *beads.MemStore) beads.Bead {
+func mustCreateOpenSibling(t *testing.T, store beads.Store) beads.Bead {
 	t.Helper()
 	b, err := store.Create(beads.Bead{Title: "sibling", Type: "task", Status: "open"})
 	if err != nil {
@@ -414,8 +415,28 @@ func mustCreateOpenSibling(t *testing.T, store *beads.MemStore) beads.Bead {
 	return b
 }
 
+// mustOpenAtomicSQLiteStore opens a real SQLite-backed store rooted at a
+// fresh temp dir. AssignContinuationFenced requires
+// beads.StoreSupportsAtomicTx, which *beads.MemStore never satisfies (see
+// TestAssignContinuationFenced_FailsClosedOnNonAtomicStore) — exercising the
+// atomic-Tx path needs a store with genuine transactional isolation between
+// its write connection and its read pool.
+func mustOpenAtomicSQLiteStore(t *testing.T) *beads.SQLiteStore {
+	t.Helper()
+	opened, err := beads.OpenSQLiteStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore: %v", err)
+	}
+	store := opened.(*beads.SQLiteStore)
+	t.Cleanup(func() { _ = store.CloseStore() })
+	if !beads.StoreSupportsAtomicTx(store) {
+		t.Fatal("SQLite store did not report atomic Tx support")
+	}
+	return store
+}
+
 func TestAssignContinuationFenced_HappyPath(t *testing.T) {
-	store := beads.NewMemStore()
+	store := mustOpenAtomicSQLiteStore(t)
 	root := mustCreateContinuationLeaseRoot(t, store)
 	sibling := mustCreateOpenSibling(t, store)
 
@@ -429,13 +450,16 @@ func TestAssignContinuationFenced_HappyPath(t *testing.T) {
 	if got := mustGetBead(t, store, sibling.ID).Assignee; got != "session-alpha" {
 		t.Fatalf("sibling assignee = %q, want session-alpha", got)
 	}
+	if got := mustGetBead(t, store, root.ID).Metadata[beadmeta.ContinuationLeaseSessionMetadataKey]; got != "session-alpha" {
+		t.Fatalf("root lease holder = %q, want session-alpha", got)
+	}
 }
 
 // TestAssignContinuationFenced_NotAuthorized covers the case where the lease
 // is already held by a different live session at call time: the sibling must
 // never be touched at all.
 func TestAssignContinuationFenced_NotAuthorized(t *testing.T) {
-	store := beads.NewMemStore()
+	store := mustOpenAtomicSQLiteStore(t)
 	root := mustCreateContinuationLeaseRoot(t, store)
 	sibling := mustCreateOpenSibling(t, store)
 	if _, outcome, err := AcquireContinuationLease(store, root.ID, "cg-1", "session-alpha"); err != nil || outcome != ContinuationLeaseAcquired {
@@ -454,62 +478,106 @@ func TestAssignContinuationFenced_NotAuthorized(t *testing.T) {
 	}
 }
 
-// interposeAfterUpdateStore wraps a *beads.MemStore and runs `after` the
-// instant a targeted Update commits, before control returns to the caller.
-// Embedding the concrete *beads.MemStore (not the beads.Store interface)
-// promotes every other method — including UpdateIfMatch — straight through,
-// so this wrapper still satisfies beads.ConditionalWriter for the revert path
-// AssignContinuationFenced falls back to.
-type interposeAfterUpdateStore struct {
-	*beads.MemStore
-	targetID string
-	after    func()
+// TestAssignContinuationFenced_FailsClosedOnNonAtomicStore pins the
+// gc-ue0tsw exact-head review's "fail closed on incapable stores"
+// requirement: a store whose Tx cannot guarantee atomic, isolated commit
+// (MemStore's sequential, non-transactional Tx — the same shape as
+// production's BdStore) must be refused outright, never silently downgraded
+// to the unsafe write-then-revert sequence this function used to perform.
+// Neither the sibling nor the root's lease metadata may be touched.
+func TestAssignContinuationFenced_FailsClosedOnNonAtomicStore(t *testing.T) {
+	store := beads.NewMemStore()
+	if beads.StoreSupportsAtomicTx(store) {
+		t.Fatal("precondition: MemStore must not support atomic Tx")
+	}
+	root := mustCreateContinuationLeaseRoot(t, store)
+	sibling := mustCreateOpenSibling(t, store)
+
+	outcome, err := AssignContinuationFenced(store, root.ID, "cg-1", "session-alpha", sibling.ID)
+	if err == nil {
+		t.Fatal("AssignContinuationFenced: want an error against a non-atomic store, got nil")
+	}
+	if !errors.Is(err, beads.ErrAtomicTxUnsupported) {
+		t.Fatalf("AssignContinuationFenced error = %v, want it to wrap beads.ErrAtomicTxUnsupported", err)
+	}
+	if outcome != "" {
+		t.Fatalf("outcome = %q, want empty on a rejected call", outcome)
+	}
+	if got := mustGetBead(t, store, sibling.ID).Assignee; got != "" {
+		t.Fatalf("sibling assignee = %q, want untouched (empty): a store lacking atomic Tx must never be written to", got)
+	}
+	if got := mustGetBead(t, store, root.ID).Metadata[beadmeta.ContinuationLeaseSessionMetadataKey]; got != "" {
+		t.Fatalf("root lease holder = %q, want untouched (empty)", got)
+	}
 }
 
-func (s *interposeAfterUpdateStore) Update(id string, opts beads.UpdateOpts) error {
-	if err := s.MemStore.Update(id, opts); err != nil {
-		return err
-	}
-	if id == s.targetID && s.after != nil {
-		s.after()
-	}
-	return nil
+// interposeDuringTxStore wraps a *beads.SQLiteStore and runs `during` after
+// the wrapped Tx callback finishes writing but strictly before the
+// transaction commits: SQLiteStore.Tx commits only after the callback passed
+// to it returns, and this wrapper's own callback (which runs AssignContinuationFenced's
+// writes via fn) returns to SQLiteStore.Tx only after `during` has already run
+// and returned. Embedding the concrete *beads.SQLiteStore (not the
+// beads.Store interface) promotes AtomicTx() straight through, so the
+// wrapper still reports atomic Tx support.
+type interposeDuringTxStore struct {
+	*beads.SQLiteStore
+	during func()
 }
 
-// TestAssignContinuationFenced_RevertsWhenLeaseRevokedBetweenWriteAndReverify
-// pins the exact race the gc-ue0tsw exact-head review demanded proof against:
-// revocation landing strictly BETWEEN the sibling write committing and
-// AssignContinuationFenced's own post-write re-read of the root — a window
-// no caller-side "renew, then write" pair can ever observe from outside,
-// because it lives entirely inside what is meant to be one fenced operation.
-// A reconciler revoking mid-write must cause the sibling assignment to be
-// reverted and the call to fail closed, not leave the sibling durably
-// assigned under authority that stopped holding before the operation
-// finished.
-func TestAssignContinuationFenced_RevertsWhenLeaseRevokedBetweenWriteAndReverify(t *testing.T) {
-	base := beads.NewMemStore()
+func (s *interposeDuringTxStore) Tx(commitMsg string, fn func(tx beads.Tx) error) error {
+	return s.SQLiteStore.Tx(commitMsg, func(tx beads.Tx) error {
+		if err := fn(tx); err != nil {
+			return err
+		}
+		if s.during != nil {
+			s.during()
+		}
+		return nil
+	})
+}
+
+// TestAssignContinuationFenced_SiblingAssignmentNeverObservedBeforeCommit is
+// the adversarial consumer-observation regression the gc-ue0tsw exact-head
+// review required: a concurrent reader using a genuinely separate connection
+// (SQLiteStore.Get reads through the read pool; the in-flight transaction
+// holds the single write connection) must never see the sibling assignment,
+// or the root's advanced lease generation, while AssignContinuationFenced's
+// transaction is still open. Only after the call returns may either become
+// visible. This proves the fix: the old design made the sibling write
+// visible via an unconditional store.Update before the compensating revert,
+// so a concurrent consumer could observe and act under authority that had
+// already been (or was about to be) revoked. The new design has no such
+// window because both the precondition check and both writes commit as one
+// atomic unit.
+func TestAssignContinuationFenced_SiblingAssignmentNeverObservedBeforeCommit(t *testing.T) {
+	base := mustOpenAtomicSQLiteStore(t)
 	root := mustCreateContinuationLeaseRoot(t, base)
 	sibling := mustCreateOpenSibling(t, base)
+	originalGeneration := mustGetBead(t, base, root.ID).Metadata[beadmeta.ClaimGenerationMetadataKey]
 
-	store := &interposeAfterUpdateStore{MemStore: base, targetID: sibling.ID}
-	store.after = func() {
-		// Simulate a reconciler revoking this session's lease at the one
-		// instant a caller-side check could never catch: after the sibling
-		// write has already committed, before AssignContinuationFenced reads
-		// the root back to verify authority held throughout.
-		if _, outcome, err := ReleaseContinuationLease(base, root.ID, ""); err != nil || outcome != ContinuationLeaseReleased {
-			t.Fatalf("simulated mid-write revocation: outcome=%q err=%v", outcome, err)
+	store := &interposeDuringTxStore{SQLiteStore: base}
+	observedDuringTx := false
+	store.during = func() {
+		observedDuringTx = true
+		if got := mustGetBead(t, base, sibling.ID).Assignee; got != "" {
+			t.Errorf("concurrent read mid-transaction: sibling assignee = %q, want untouched (empty) before commit", got)
+		}
+		if got := mustGetBead(t, base, root.ID).Metadata[beadmeta.ClaimGenerationMetadataKey]; got != originalGeneration {
+			t.Errorf("concurrent read mid-transaction: root claim generation = %q, want unchanged %q before commit", got, originalGeneration)
 		}
 	}
 
 	outcome, err := AssignContinuationFenced(store, root.ID, "cg-1", "session-alpha", sibling.ID)
-	if err == nil {
-		t.Fatal("AssignContinuationFenced: want an error when lease authority moves mid-write, got nil")
+	if err != nil {
+		t.Fatalf("AssignContinuationFenced: %v", err)
 	}
-	if outcome != ContinuationLeaseStale {
-		t.Fatalf("outcome = %q, want %q", outcome, ContinuationLeaseStale)
+	if outcome != ContinuationLeaseAcquired {
+		t.Fatalf("outcome = %q, want %q", outcome, ContinuationLeaseAcquired)
 	}
-	if got := mustGetBead(t, base, sibling.ID).Assignee; got != "" {
-		t.Fatalf("sibling assignee = %q, want reverted to empty: a lease revoked mid-write must not leave the sibling assigned", got)
+	if !observedDuringTx {
+		t.Fatal("interposeDuringTxStore.during was never invoked: test did not actually exercise the mid-transaction window")
+	}
+	if got := mustGetBead(t, base, sibling.ID).Assignee; got != "session-alpha" {
+		t.Fatalf("post-commit sibling assignee = %q, want session-alpha", got)
 	}
 }

@@ -42,9 +42,13 @@ const (
 	hookClaimReleaseReasonStraddled   = "claim_window_straddled"
 	// hookClaimReleaseReasonLeaseDenied means the claim CAS won but this
 	// session could not acquire the bead's graph.v2 continuation lease (a
-	// live different holder, a stale generation, or a terminal root), so the
-	// claim is given back rather than executed without the affinity guarantee
-	// gc.session_affinity=require promises. See acquireHookContinuationLease.
+	// live different holder, a stale generation, or a terminal root), or
+	// could not fence a sibling's continuation-group preassignment under
+	// that lease (including a store that cannot provide the atomic
+	// transaction molecule.AssignContinuationFenced now requires), so the
+	// claim is given back rather than executed without the affinity
+	// guarantee gc.session_affinity=require promises. See
+	// acquireHookContinuationLease and preassignHookContinuationGroup.
 	hookClaimReleaseReasonLeaseDenied = "continuation_lease_denied"
 )
 
@@ -227,14 +231,17 @@ type hookClaimOps struct {
 	// root's lease.
 	AcquireContinuationLease hookAcquireContinuationLeaseFunc
 	// AssignContinuationFenced re-validates sessionID's continuation lease on
-	// rootID/group and assigns siblingID under it as ONE fenced operation
-	// (see molecule.AssignContinuationFenced): the lease renewal, the sibling
-	// write, and a post-write re-verification that the exact holder/group/
-	// generation this call was authorized under still held throughout. It
-	// replaces the separate AcquireContinuationLease+AssignContinuation pair
-	// for lease-required sibling preassignment — that pair leaves a window
-	// between the renewal's read and the write's commit for a reconciler to
-	// revoke the lease, which this seam closes.
+	// rootID/group and assigns siblingID under it as ONE atomic operation
+	// (see molecule.AssignContinuationFenced): the lease precondition check,
+	// the lease renewal, and the sibling write all commit inside a single
+	// store transaction, so no external reader can ever observe the sibling
+	// assignment without the lease renewal that authorized it having also
+	// committed. It replaces the separate AcquireContinuationLease+
+	// AssignContinuation pair for lease-required sibling preassignment —
+	// that pair leaves a window between the renewal's read and the write's
+	// commit for a reconciler to revoke the lease, which this seam closes.
+	// It fails closed (an error, not a fenced outcome) against a store that
+	// cannot provide that atomic guarantee.
 	AssignContinuationFenced hookAssignContinuationFencedFunc
 	// ContinuationLeaseHolder is a plain read of a workflow root's current
 	// continuation-lease holder, used ONLY for root-aware claim-candidate
@@ -939,8 +946,18 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 	}
 	assigned, err := preassignHookContinuationGroup(bead, opts, ops, dir)
 	if err != nil {
-		fmt.Fprintf(stderr, "gc hook --claim: preassigning continuation group for %s: %v\n", bead.ID, err) //nolint:errcheck
-		return 1
+		// Mirrors the continuation-lease error handling above: the claim CAS
+		// already won, but graph.v2 gc.session_affinity=require could not
+		// fence this sibling's preassignment under the root's lease. A
+		// minted claim is given back rather than leaked; an adopted claim is
+		// left in place, matching the non-minted reasoning above.
+		cause := fmt.Sprintf("preassigning continuation group for %s: %v", bead.ID, err)
+		if !minted {
+			fmt.Fprintf(stderr, "gc hook --claim: %s\n", cause) //nolint:errcheck
+			return 1
+		}
+		clearHookSessionCurrentClaim(opts, ops, stderr)
+		return unwindUndeliveredHookClaim(hookClaimReleaseReasonLeaseDenied, cause, bead, opts, ops, dir, stderr)
 	}
 	result.ContinuationAssigned = assigned
 	if writeErr := writeHookClaimResultLine(result, opts.JSON, stdout); writeErr != nil {
@@ -1179,13 +1196,16 @@ func acquireHookContinuationLease(bead beads.Bead, opts hookClaimOptions, ops ho
 // renew-then-write pair leaves a window between the renewal's read and the
 // write's commit for a reconciler to revoke or advance the lease (e.g.
 // recovering an unrelated stale sibling mid-iteration), after which the
-// write would still land under authority that no longer exists.
-// AssignContinuationFenced closes that window by comparing the root's exact
-// holder/group/generation immediately before and immediately after the
-// sibling write, reverting the write if either changed (see
-// molecule.AssignContinuationFenced) — so a lease revoked at any point up to
-// and including the write itself fails that sibling closed instead of only
-// failing the next one.
+// write would still land under authority that no longer exists, and would
+// be externally visible before any compensating rollback could run.
+// AssignContinuationFenced closes that window by committing the root's
+// lease-precondition check, its renewal, and the sibling write inside one
+// atomic store transaction (see molecule.AssignContinuationFenced) — so a
+// lease revoked at any point up to and including the write either never
+// observably lands or fails that sibling closed, and any store unable to
+// provide that atomicity (e.g. the bd-CLI-backed store this seam defaults
+// to; see hookAssignContinuationFencedWithBdStore) refuses the assignment
+// outright rather than risk it.
 func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string) ([]string, error) {
 	rootID := strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
 	group := strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey])
