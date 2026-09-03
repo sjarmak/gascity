@@ -109,3 +109,75 @@ func TestBeadsGraphAdapterDelegatesClaimWhenAvailable(t *testing.T) {
 		t.Fatalf("adapter passed (%q, %q) to the store, want (%q, %q)", backing.lastID, backing.lastAssignee, created.ID, "worker")
 	}
 }
+
+// TestBeadsGraphAdapterReportsMissingClaimWithGenerationCapability pins
+// gc-3ohe47's atomic claim-and-mint combo as a DISTINCT capability from plain
+// Claim: claimingMemStore implements Claim but not ClaimWithGeneration, so a
+// caller that needs the fenced generation must see a typed capability veto
+// rather than the adapter silently falling back to the weaker two-write path
+// (which would reopen the race gc-3ohe47 exists to close).
+func TestBeadsGraphAdapterReportsMissingClaimWithGenerationCapability(t *testing.T) {
+	backing := &claimingMemStore{Store: beads.NewMemStore()}
+	graph := graphAdapterOver(t, backing)
+	created, err := graph.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	claimed, generation, ok, err := graph.ClaimWithGeneration(created.ID, "worker")
+	if !errors.Is(err, ErrBeadsAdapterCapability) {
+		t.Fatalf("ClaimWithGeneration over a store without it = %v, want ErrBeadsAdapterCapability", err)
+	}
+	if ok || generation != "" {
+		t.Fatalf("a vetoed ClaimWithGeneration reported (%+v, %q, %v), want no payload", claimed, generation, ok)
+	}
+	if backing.lastID != "" {
+		t.Fatalf("adapter fell through to plain Claim on the backing store (lastID=%q), want no delegation at all", backing.lastID)
+	}
+}
+
+// generationClaimingMemStore additionally implements ClaimWithGeneration,
+// proving the capability probe finds and uses it rather than always vetoing.
+type generationClaimingMemStore struct {
+	beads.Store
+	lastID         string
+	lastAssignee   string
+	stubGeneration string
+}
+
+func (s *generationClaimingMemStore) Claim(id, _ string) (beads.Bead, bool, error) {
+	bead, err := s.Get(id)
+	if err != nil {
+		return beads.Bead{}, false, err
+	}
+	return bead, true, nil
+}
+
+func (s *generationClaimingMemStore) ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error) {
+	s.lastID, s.lastAssignee = id, assignee
+	bead, err := s.Get(id)
+	if err != nil {
+		return beads.Bead{}, "", false, err
+	}
+	return bead, s.stubGeneration, true, nil
+}
+
+func TestBeadsGraphAdapterDelegatesClaimWithGenerationWhenAvailable(t *testing.T) {
+	backing := &generationClaimingMemStore{Store: beads.NewMemStore(), stubGeneration: "1"}
+	graph := graphAdapterOver(t, backing)
+	created, err := graph.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	claimed, generation, ok, err := graph.ClaimWithGeneration(created.ID, "worker")
+	if err != nil || !ok {
+		t.Fatalf("ClaimWithGeneration = (%+v, %q, %v, %v), want a delegated success", claimed, generation, ok, err)
+	}
+	if generation != "1" {
+		t.Fatalf("adapter returned generation %q, want the store's minted %q", generation, "1")
+	}
+	if backing.lastID != created.ID || backing.lastAssignee != "worker" {
+		t.Fatalf("adapter passed (%q, %q) to the store, want (%q, %q)", backing.lastID, backing.lastAssignee, created.ID, "worker")
+	}
+}

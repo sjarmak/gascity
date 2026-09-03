@@ -171,6 +171,18 @@ type hookClaimClassRoute struct {
 	workLegs []hookStore
 	readLeg  func(ctx context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, error)
 	workHeld map[string]bool
+
+	// mintedGeneration memoizes, per bead id, the beadmeta.ClaimGenerationMetadataKey
+	// value claim already minted atomically via graph.ClaimWithGeneration
+	// (gc-3ohe47 P1: "commit claim ownership and generation atomically"). It
+	// exists so advanceClaimGeneration can turn the follow-on generation
+	// write into a pure confirm instead of a second mutation: a two-write
+	// claim-then-advance sequence would leave a window in which the OLD
+	// generation is still canonical after ownership has already moved, which
+	// is exactly the window this memo closes for the graph route. Consumed
+	// (deleted) the first time advanceClaimGeneration reads it, so a stale
+	// entry can never answer for a later, unrelated claim of the same id.
+	mintedGeneration map[string]string
 }
 
 // newHookClaimClassRoute opens the claim-time class front door over an already
@@ -201,10 +213,11 @@ func newHookClaimClassRoute(class beads.Store) (*hookClaimClassRoute, error) {
 // created, so a route can never reach the escalation with a nil map.
 func newClaimClassRouteOver(class beads.Store, graph storebinding.GraphStore) *hookClaimClassRoute {
 	return &hookClaimClassRoute{
-		class:    class,
-		graph:    graph,
-		resident: map[string]bool{},
-		workHeld: map[string]bool{},
+		class:            class,
+		graph:            graph,
+		resident:         map[string]bool{},
+		workHeld:         map[string]bool{},
+		mintedGeneration: map[string]string{},
 	}
 }
 
@@ -388,10 +401,28 @@ func (r *hookClaimClassRoute) observeWorkLegs(stores []hookStore) {
 // applying the same post-mutation classification hookClaimWithBdStore applies to
 // the work store so the two claim paths report a lost race, a stale projection
 // and a canonical-readback failure identically.
+//
+// It claims through ClaimWithGeneration rather than Claim (gc-3ohe47 P1): the
+// binding mints beadmeta.ClaimGenerationMetadataKey in the SAME destination-side
+// write as the ownership transition, so there is no window in which ownership
+// has moved but the old generation is still canonical. The minted value is
+// recorded in mintedGeneration so advanceClaimGeneration can confirm it rather
+// than mutate a second time.
 func (r *hookClaimClassRoute) claim(beadID, assignee string) (beads.Bead, bool, error) {
-	return hookClaimThroughStore(beadID, assignee,
-		func() (beads.Bead, bool, error) { return r.graph.Claim(beadID, assignee) },
+	var generation string
+	claimed, ok, err := hookClaimThroughStore(beadID, assignee,
+		func() (beads.Bead, bool, error) {
+			claimedBead, gen, acquired, claimErr := r.graph.ClaimWithGeneration(beadID, assignee)
+			generation = gen
+			return claimedBead, acquired, claimErr
+		},
 		r.graph.Get)
+	if ok {
+		if id := strings.TrimSpace(beadID); id != "" && strings.TrimSpace(generation) != "" {
+			r.mintedGeneration[id] = generation
+		}
+	}
+	return claimed, ok, err
 }
 
 // advanceClaimGeneration mints or advances a binding-resident bead's
@@ -414,6 +445,24 @@ func (r *hookClaimClassRoute) claim(beadID, assignee string) (beads.Bead, bool, 
 // identical beads.AdvanceClaimGenerationOutcome vocabulary so
 // advanceHookClaimGeneration's caller cannot tell which store answered.
 func (r *hookClaimClassRoute) advanceClaimGeneration(beadID, fromGeneration string) (string, beads.AdvanceClaimGenerationOutcome, error) {
+	if id := strings.TrimSpace(beadID); id != "" {
+		if minted, ok := r.mintedGeneration[id]; ok {
+			delete(r.mintedGeneration, id)
+			if strings.TrimSpace(fromGeneration) == minted {
+				// claim already minted this generation atomically via
+				// ClaimWithGeneration: the merged bead's metadata already
+				// carries it as fromGeneration, so confirm it rather than
+				// advancing a second time. A second CAS here would consume
+				// the counter twice for one claim and (on a concurrent
+				// claim of the same id racing in) could stale-fail a
+				// confirmation that should always succeed.
+				return minted, beads.AdvanceClaimGenerationAdvanced, nil
+			}
+			// Defensive fallback: fromGeneration diverged from what the
+			// atomic claim minted. Fall through to the CAS below, which
+			// still fences correctly on whatever value the caller passed.
+		}
+	}
 	toGeneration, err := beads.NextClaimGeneration(fromGeneration)
 	if err != nil {
 		return "", "", fmt.Errorf("advance claim generation %q: %w", beadID, err)

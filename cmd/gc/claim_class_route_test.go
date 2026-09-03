@@ -377,6 +377,14 @@ func TestClassRoutedLifecycleEmissionFollowsTheClaimOnly(t *testing.T) {
 // binding-resident claim's fence still ran against the work-directory-rooted
 // BdStore — a store that never held the bead — reproducing the exact
 // uncloseable-graph-step defect (gc-ue0tsw) this route exists to close.
+//
+// Since the gc-3ohe47 P1 follow-up, route.claim itself mints the generation
+// atomically (ClaimWithGeneration) rather than leaving it for a second CAS, so
+// the fence call below the claim is a CONFIRM of the value the claim already
+// minted (fromGeneration == the memoized value), not a fresh advance. The
+// real caller (advanceHookClaimGeneration) reads that same minted value back
+// off the merged bead's metadata before calling AdvanceClaimGeneration, so
+// passing it here mirrors production exactly.
 func TestClassRoutedAdvanceClaimGenerationFollowsTheClaimOnly(t *testing.T) {
 	class := newClaimRouteClassStore(t)
 	mintClaimRouteBead(t, class, "gcg-c00", nil)
@@ -399,12 +407,19 @@ func TestClassRoutedAdvanceClaimGenerationFollowsTheClaimOnly(t *testing.T) {
 		t.Fatalf("work-scope advances = %d, want 1 before the claim routes; the memo, not a probe, is what moves this seam", workAdvances)
 	}
 
-	// After the claim routes the same id, the fence follows it into the
-	// binding and CASes gc.claim_generation there directly.
-	if _, ok, err := ops.Claim(context.Background(), "/work", nil, "gcg-c00", "worker-1"); !ok || err != nil {
+	// After the claim routes the same id, ClaimWithGeneration has already
+	// minted gc.claim_generation=1 atomically with the ownership transition.
+	claimed, ok, err := ops.Claim(context.Background(), "/work", nil, "gcg-c00", "worker-1")
+	if !ok || err != nil {
 		t.Fatalf("routed claim = (ok=%v err=%v)", ok, err)
 	}
-	next, outcome, err := ops.AdvanceClaimGeneration(context.Background(), "/work", nil, "gcg-c00", "worker-1", "")
+	if got := strings.TrimSpace(claimed.Metadata[beadmeta.ClaimGenerationMetadataKey]); got != "1" {
+		t.Fatalf("claimed bead's gc.claim_generation = %q, want %q — the atomic claim must return the minted value", got, "1")
+	}
+
+	// The follow-on fence call confirms the already-minted value rather than
+	// advancing a second time, and must still never touch the work store.
+	next, outcome, err := ops.AdvanceClaimGeneration(context.Background(), "/work", nil, "gcg-c00", "worker-1", "1")
 	if err != nil || outcome != beads.AdvanceClaimGenerationAdvanced || next != "1" {
 		t.Fatalf("routed advance = (next=%q outcome=%q err=%v), want (1 Advanced <nil>)", next, outcome, err)
 	}
@@ -419,26 +434,36 @@ func TestClassRoutedAdvanceClaimGenerationFollowsTheClaimOnly(t *testing.T) {
 
 // TestClassRoutedAdvanceClaimGenerationReportsStaleOnAMismatch pins the CAS
 // fence itself, not just the routing: a fromGeneration that no longer matches
-// the binding's current value (another advance already ran) must report Stale
-// with no write, the same vocabulary advanceHookClaimGeneration already
-// unwinds a minted claim on — so a graph-resident claim gets the identical
-// fail-closed behavior a work-resident one gets from
-// beads.BdStore.AdvanceClaimGenerationIfCurrent.
+// the binding's current value must report Stale with no write, the same
+// vocabulary advanceHookClaimGeneration already unwinds a minted claim on —
+// so a graph-resident claim gets the identical fail-closed behavior a
+// work-resident one gets from beads.BdStore.AdvanceClaimGenerationIfCurrent.
+//
+// Since the gc-3ohe47 P1 follow-up, route.claim's ClaimWithGeneration already
+// advances gc.claim_generation from the bead's preset "5" to "6" atomically
+// with the ownership transition — that IS "another advance already ran," now
+// folded into the claim itself. A caller presenting a stale fromGeneration
+// ("3", matching neither the pre-claim "5" nor the post-claim "6") must still
+// see Stale with the binding left exactly where the atomic claim put it.
 func TestClassRoutedAdvanceClaimGenerationReportsStaleOnAMismatch(t *testing.T) {
 	class := newClaimRouteClassStore(t)
 	mintClaimRouteBead(t, class, "gcg-c01", map[string]string{beadmeta.ClaimGenerationMetadataKey: "5"})
 	route := newClaimRouteFor(t, class)
 	ops := classRoutedHookClaimOps(hookClaimOps{Claim: notFoundClaim(t, "gcg-c01")}, route)
 
-	if _, ok, err := ops.Claim(context.Background(), "/work", nil, "gcg-c01", "worker-1"); !ok || err != nil {
+	claimed, ok, err := ops.Claim(context.Background(), "/work", nil, "gcg-c01", "worker-1")
+	if !ok || err != nil {
 		t.Fatalf("routed claim = (ok=%v err=%v)", ok, err)
+	}
+	if got := strings.TrimSpace(claimed.Metadata[beadmeta.ClaimGenerationMetadataKey]); got != "6" {
+		t.Fatalf("claimed bead's gc.claim_generation = %q, want %q — the atomic claim must advance from the preset 5", got, "6")
 	}
 	next, outcome, err := ops.AdvanceClaimGeneration(context.Background(), "/work", nil, "gcg-c01", "worker-1", "3")
 	if err != nil || outcome != beads.AdvanceClaimGenerationStale || next != "" {
 		t.Fatalf("routed advance against a stale fromGeneration = (next=%q outcome=%q err=%v), want (\"\" Stale <nil>)", next, outcome, err)
 	}
-	if held, getErr := class.Get("gcg-c01"); getErr != nil || strings.TrimSpace(held.Metadata[beadmeta.ClaimGenerationMetadataKey]) != "5" {
-		t.Fatalf("binding's gc.claim_generation for gcg-c01 = %q (err=%v), want it left at 5; a stale fence must not write", held.Metadata[beadmeta.ClaimGenerationMetadataKey], getErr)
+	if held, getErr := class.Get("gcg-c01"); getErr != nil || strings.TrimSpace(held.Metadata[beadmeta.ClaimGenerationMetadataKey]) != "6" {
+		t.Fatalf("binding's gc.claim_generation for gcg-c01 = %q (err=%v), want it left at 6; a stale fence must not write", held.Metadata[beadmeta.ClaimGenerationMetadataKey], getErr)
 	}
 }
 
