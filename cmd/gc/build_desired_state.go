@@ -3552,6 +3552,16 @@ func poolTriggerWorkDir(bp *agentBuildParams, cfgAgent *config.Agent, qualifiedN
 	if err != nil || strings.TrimSpace(base) == "" {
 		return ""
 	}
+	if agentHasNoConfiguredWorkLocation(cfgAgent) {
+		// cfgAgent has no work_dir template, no dir, and therefore no rig
+		// association, so ResolveWorkDirPathStrict silently fell through to
+		// the city root itself (gascity#938). A bare-provider trigger session
+		// (e.g. a direct `codex` invocation with no agents/ entry) that has a
+		// work bead to execute must not spawn its workdir there: route it to
+		// a dedicated per-bead scratch base instead so it can never litter or
+		// collide at the city root.
+		base = barePoolTriggerScratchDir(bp.cityPath, cfgAgent, qualifiedName, request.WorkBeadID)
+	}
 	if pack := strings.TrimSpace(request.WorkPack); pack != "" {
 		packDir := filepath.Join(filepath.Dir(base), pack)
 		if workspace := packWorkspaceSlug(request); workspace != "" {
@@ -3563,6 +3573,31 @@ func poolTriggerWorkDir(bp *agentBuildParams, cfgAgent *config.Agent, qualifiedN
 		return filepath.Join(base, workspace)
 	}
 	return base
+}
+
+// agentHasNoConfiguredWorkLocation reports whether cfgAgent carries none of
+// the fields resolveConfiguredWorkDirPath uses to place a session outside the
+// city root: an explicit work_dir template, or a dir (which is also the only
+// way an agent resolves to a rig). This is the exact condition under which
+// ResolveWorkDirPathStrict falls through to the city path itself.
+func agentHasNoConfiguredWorkLocation(cfgAgent *config.Agent) bool {
+	return strings.TrimSpace(cfgAgent.WorkDir) == "" && strings.TrimSpace(cfgAgent.Dir) == ""
+}
+
+// barePoolTriggerScratchDir returns a dedicated, per-bead scratch directory
+// for a pool-trigger session whose agent has no configured work location
+// (gascity#938), keyed by provider (or agent name, as a fallback) and the
+// work bead's ID so concurrent bare-provider sessions never share or collide
+// on the same directory.
+func barePoolTriggerScratchDir(cityPath string, cfgAgent *config.Agent, qualifiedName, workBeadID string) string {
+	provider := strings.TrimSpace(cfgAgent.Provider)
+	if provider == "" {
+		provider = strings.TrimSpace(qualifiedName)
+	}
+	if provider == "" {
+		provider = "agent"
+	}
+	return filepath.Join(cityPath, ".gc", "scratch", provider, workBeadID)
 }
 
 func packWorkspaceSlug(request SessionRequest) string {
