@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -241,7 +242,12 @@ func (s *Server) humaHandleFormulaFeed(_ context.Context, input *FormulaFeedInpu
 		items = append(items, workflowRunProjectionFeedItem(run))
 	}
 	if limit > 0 && len(items) > limit {
-		items = items[:limit]
+		// The response cache retains body.Items after this call returns.
+		// Detach the truncated page from the full O(history) items backing
+		// array so a cached response cannot keep every hydrated workflow-run
+		// projection reachable for the cache TTL (same fix as
+		// resolveBeadListPage's full-scan path in huma_handlers_beads.go).
+		items = slices.Clone(items[:limit])
 	}
 
 	body := formulaFeedBody{

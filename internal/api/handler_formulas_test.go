@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -528,6 +529,57 @@ func TestFormulaFeedUsesRootOnlyProjectionWithoutChildLookup(t *testing.T) {
 	}
 	if resp.Items[0].WorkflowID != "wf-fast-path" {
 		t.Fatalf("items[0] = %+v, want wf-fast-path", resp.Items[0])
+	}
+}
+
+// TestFormulaFeedDetachesTruncatedPage pins the ownership boundary between
+// the O(history) workflow-run scan buildWorkflowRunProjectionsRootOnly does
+// and the O(limit) page the response cache retains for its TTL. If the
+// truncated page shared the full scan's backing array, caching a
+// two-item page would retain every hydrated workflow-run projection
+// (same bug fixed for resolveBeadListPage in huma_handlers_beads.go).
+func TestFormulaFeedDetachesTruncatedPage(t *testing.T) {
+	state := newFakeState(t)
+	state.cityBeadStore = beads.NewMemStore()
+
+	const totalRuns = 10
+	const limit = 2
+	for i := 0; i < totalRuns; i++ {
+		root, err := state.cityBeadStore.Create(beads.Bead{
+			Title: fmt.Sprintf("City workflow run %d", i),
+			Ref:   "mol-adopt-pr-v2",
+			Metadata: map[string]string{
+				"gc.kind":             "workflow",
+				"gc.formula_contract": "graph.v2",
+				"gc.workflow_id":      fmt.Sprintf("wf-detach-%02d", i),
+				"gc.routed_to":        "mayor",
+				"gc.scope_kind":       "city",
+				"gc.scope_ref":        "test-city",
+			},
+		})
+		if err != nil {
+			t.Fatalf("create workflow root %d: %v", i, err)
+		}
+		inProgress := "in_progress"
+		if err := state.cityBeadStore.Update(root.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+			t.Fatalf("set workflow status %d: %v", i, err)
+		}
+	}
+
+	srv := &Server{state: state}
+	resp, err := srv.humaHandleFormulaFeed(context.Background(), &FormulaFeedInput{
+		ScopeKind: "city",
+		ScopeRef:  "test-city",
+		Limit:     limit,
+	})
+	if err != nil {
+		t.Fatalf("humaHandleFormulaFeed: %v", err)
+	}
+	if len(resp.Body.Items) != limit {
+		t.Fatalf("items = %d, want %d", len(resp.Body.Items), limit)
+	}
+	if cap(resp.Body.Items) != limit {
+		t.Fatalf("cap(items) = %d, want %d: truncated page still aliases the full O(history) scan's backing array", cap(resp.Body.Items), limit)
 	}
 }
 
