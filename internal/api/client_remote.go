@@ -257,6 +257,11 @@ func newRemoteHTTPClients(opts RemoteOptions) (rest, stream *http.Client, err er
 	if err != nil {
 		return nil, nil, err
 	}
+	// Each Transport gets its own *tls.Config clone, never the shared tlsCfg
+	// pointer: Transport.RoundTrip mutates TLSClientConfig.NextProtos in place
+	// (via a per-Transport sync.Once) on first use, so two Transports sharing
+	// one *tls.Config race on that field the moment both are used concurrently
+	// (as rest and stream are here).
 	newTransport := func() *http.Transport {
 		return &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
@@ -264,7 +269,7 @@ func newRemoteHTTPClients(opts RemoteOptions) (rest, stream *http.Client, err er
 				Timeout:   remoteDialTimeout,
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
-			TLSClientConfig:       tlsCfg,
+			TLSClientConfig:       tlsCfg.Clone(),
 			TLSHandshakeTimeout:   remoteTLSHandshakeTimeout,
 			ResponseHeaderTimeout: remoteResponseHeaderTimeout,
 			ForceAttemptHTTP2:     true,

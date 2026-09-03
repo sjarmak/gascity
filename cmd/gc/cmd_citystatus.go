@@ -391,8 +391,14 @@ func observeSessionTargetWithWarning(
 		err         error
 	}
 	done := make(chan observeResult, 1)
+	// Snapshot the seam var before spawning: the goroutine can outlive this
+	// call (the select below gives up after statusObservationTimeout, but the
+	// goroutine keeps running until observeSessionTargetForStatus returns), so
+	// reading the package var inside the goroutine would race a test's
+	// t.Cleanup restoring it after the test has already moved on.
+	observe := observeSessionTargetForStatus
 	go func() {
-		obs, err := observeSessionTargetForStatus(cityPath, nil, sp, cfg, target.runtimeSessionName)
+		obs, err := observe(cityPath, nil, sp, cfg, target.runtimeSessionName)
 		done <- observeResult{observation: obs, err: err}
 	}()
 
