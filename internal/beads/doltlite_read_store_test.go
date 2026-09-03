@@ -149,6 +149,55 @@ func TestDoltliteReadStoreReadyBlocksWorkflowDependencyTypes(t *testing.T) {
 	}
 }
 
+func TestDoltliteReadStoreReadyExcludesFutureDeferUntil(t *testing.T) {
+	store, closeStore := newTestDoltliteReadStore(t)
+	defer closeStore()
+	writer := openTestDoltliteWriter(t, store.db)
+	defer writer.Close() //nolint:errcheck // test cleanup
+
+	now := time.Now().UTC()
+	insertTestDoltliteIssue(t, writer, "issues", "labels", "dependencies", testDoltliteIssue{
+		ID:         "gc-deferred-future",
+		Title:      "deferred to the future",
+		Status:     "open",
+		IssueType:  "task",
+		CreatedAt:  now,
+		DeferUntil: now.Add(time.Hour),
+	})
+	insertTestDoltliteIssue(t, writer, "issues", "labels", "dependencies", testDoltliteIssue{
+		ID:         "gc-deferred-past",
+		Title:      "deferral already elapsed",
+		Status:     "open",
+		IssueType:  "task",
+		CreatedAt:  now,
+		DeferUntil: now.Add(-time.Hour),
+	})
+
+	rows, err := store.Ready()
+	if err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	if hasTestBead(rows, "gc-deferred-future") {
+		t.Fatalf("Ready included bead deferred until the future: %#v", rows)
+	}
+	if !hasTestBead(rows, "gc-deferred-past") {
+		t.Fatalf("Ready excluded bead whose deferral already elapsed: %#v", rows)
+	}
+}
+
+func TestDoltliteReadStoreReadyWithoutDeferUntilColumn(t *testing.T) {
+	store, closeStore := newLegacyTestDoltliteReadStore(t)
+	defer closeStore()
+
+	rows, err := store.Ready()
+	if err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	if !hasTestBead(rows, "gc-legacy-issue") {
+		t.Fatalf("Ready excluded bead on a schema without defer_until: %#v", rows)
+	}
+}
+
 func TestDoltliteReadStoreReadyDefaultsMissingDependencyTypeToBlocks(t *testing.T) {
 	store, closeStore := newTestDoltliteReadStore(t)
 	defer closeStore()
@@ -1556,6 +1605,7 @@ type testDoltliteIssue struct {
 	Dependencies []testDoltliteDependency
 	Ephemeral    bool
 	NoHistory    bool
+	DeferUntil   time.Time
 }
 
 // createTestDoltliteSchema mirrors the snapshot schema the current DoltLite
@@ -1566,7 +1616,8 @@ func createTestDoltliteSchema(t testing.TB, db *sql.DB) {
 	t.Helper()
 	const storageFlagColumns = `,
 			ephemeral INTEGER DEFAULT 0,
-			no_history INTEGER DEFAULT 0`
+			no_history INTEGER DEFAULT 0,
+			defer_until TEXT`
 	createTestDoltliteSchemaWithRowColumns(t, db, storageFlagColumns)
 }
 
@@ -1664,11 +1715,15 @@ func insertTestDoltliteIssue(t testing.TB, db *sql.DB, issueTable, labelTable, d
 		}
 		metadata = string(raw)
 	}
+	deferUntil := ""
+	if !issue.DeferUntil.IsZero() {
+		deferUntil = issue.DeferUntil.Format(time.RFC3339Nano)
+	}
 	_, err := db.Exec(`INSERT INTO `+issueTable+` (
 		id, title, status, issue_type, priority, created_at, updated_at,
 		assignee, description, design, acceptance_criteria, notes, metadata,
-		ephemeral, no_history
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', '', ?, ?, ?)`,
+		ephemeral, no_history, defer_until
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', '', ?, ?, ?, ?)`,
 		issue.ID,
 		issue.Title,
 		issue.Status,
@@ -1681,6 +1736,7 @@ func insertTestDoltliteIssue(t testing.TB, db *sql.DB, issueTable, labelTable, d
 		metadata,
 		boolToTestInt(issue.Ephemeral),
 		boolToTestInt(issue.NoHistory),
+		deferUntil,
 	)
 	if err != nil {
 		t.Fatalf("insert %s into %s: %v", issue.ID, issueTable, err)

@@ -70,11 +70,21 @@ func doltliteTableSetsForMode(mode TierMode) []doltliteTableSet {
 	}
 }
 
-func (s *DoltliteReadStore) doltliteReadyIssueWhere(tables doltliteTableSet) (string, []any) {
-	return doltliteReadyIssueWhere(tables, s.tableExists(doltliteWispTables.issues))
+func (s *DoltliteReadStore) doltliteReadyIssueWhere(tables doltliteTableSet) (string, []any, error) {
+	hasDeferUntil, err := s.tableHasColumn(tables.issues, "defer_until")
+	if err != nil {
+		return "", nil, err
+	}
+	where, args := doltliteReadyIssueWhere(tables, s.tableExists(doltliteWispTables.issues), hasDeferUntil)
+	return where, args, nil
 }
 
-func doltliteReadyIssueWhere(tables doltliteTableSet, includeWispTargets bool) (string, []any) {
+// doltliteReadyIssueWhere builds Ready()'s WHERE clause: type exclusion,
+// blocking-dependency, and (when the table carries the column) the same
+// "defer_until IS NULL OR in the past" gate the real bd CLI's ready query
+// applies server-side, so a future-dated deferral hides a bead from Ready()
+// through this backend too.
+func doltliteReadyIssueWhere(tables doltliteTableSet, includeWispTargets, hasDeferUntil bool) (string, []any) {
 	typePredicate, args := doltliteIssueTypeNotInPredicate("i")
 	blockingTypes := make([]string, 0, len(readyBlockingDependencyTypes))
 	for typ := range readyBlockingDependencyTypes {
@@ -96,14 +106,19 @@ func doltliteReadyIssueWhere(tables doltliteTableSet, includeWispTargets bool) (
 		blockerStatus = "CASE WHEN " + wispTarget + " IS NOT NULL THEN COALESCE(blocker_wisp.status, '') ELSE COALESCE(blocker_issue.status, '') END"
 	}
 
-	return strings.Join([]string{
+	predicates := []string{
 		typePredicate,
 		`NOT EXISTS (
 				SELECT 1 FROM ` + tables.deps + ` d
 				` + blockerJoins + `
 				WHERE d.issue_id = i.id AND ` + depType + ` IN (` + blockingPlaceholders + `) AND ` + blockerStatus + ` != 'closed'
 			)`,
-	}, " AND "), args
+	}
+	if hasDeferUntil {
+		predicates = append(predicates, "(i.defer_until IS NULL OR i.defer_until = '' OR julianday(i.defer_until) <= julianday(?))")
+		args = append(args, doltliteSQLiteTime(time.Now().UTC()))
+	}
+	return strings.Join(predicates, " AND "), args
 }
 
 func doltliteIssueTypeNotInPredicate(alias string) (string, []any) {
@@ -356,7 +371,10 @@ func (s *DoltliteReadStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 	if rq.Limit > 0 {
 		q.Limit = rq.Limit
 	}
-	readyWhere, readyArgs := s.doltliteReadyIssueWhere(doltliteIssueTables)
+	readyWhere, readyArgs, err := s.doltliteReadyIssueWhere(doltliteIssueTables)
+	if err != nil {
+		return nil, err
+	}
 	// The id tiebreaker keeps a LIMIT deterministic when rows share
 	// (priority, created_at) — same bug class as queryIssueTable (#3208).
 	//
@@ -1237,7 +1255,11 @@ func filterDoltliteMetadata(rows []Bead, filters map[string]string) []Bead {
 // (selectBoundedTopNIDs), so both apply identical filters from one source of
 // truth and cannot drift.
 type doltliteTableQuery struct {
-	flags      doltliteStorageFlagExprs
+	flags doltliteStorageFlagExprs
+	// deferUntil is the SQL expression yielding the row's defer_until value:
+	// "i.defer_until" when the table carries that column, or the constant NULL
+	// for legacy snapshots written before it existed.
+	deferUntil string
 	where      []string
 	args       []any
 	parentJoin string
@@ -1251,6 +1273,10 @@ type doltliteTableQuery struct {
 // skipTable=true when the tier predicate excludes the whole table.
 func (s *DoltliteReadStore) buildDoltliteTableQuery(query ListQuery, tables doltliteTableSet, extraWhere string, extraArgs []any) (doltliteTableQuery, error) {
 	flags, err := s.storageFlagExprsFor(tables)
+	if err != nil {
+		return doltliteTableQuery{}, err
+	}
+	deferUntil, err := s.deferUntilExprFor(tables)
 	if err != nil {
 		return doltliteTableQuery{}, err
 	}
@@ -1315,7 +1341,7 @@ func (s *DoltliteReadStore) buildDoltliteTableQuery(query ListQuery, tables dolt
 		args = append(args, extraArgs...)
 	}
 	parentJoin := " LEFT JOIN " + tables.deps + " pc ON pc.issue_id = i.id AND pc.type = 'parent-child'"
-	return doltliteTableQuery{flags: flags, where: where, args: args, parentJoin: parentJoin}, nil
+	return doltliteTableQuery{flags: flags, deferUntil: deferUntil, where: where, args: args, parentJoin: parentJoin}, nil
 }
 
 func (s *DoltliteReadStore) queryIssueTable(query ListQuery, tables doltliteTableSet, extraWhere string, extraArgs []any, limit int, orderBy string) ([]Bead, error) {
@@ -1332,7 +1358,7 @@ func (s *DoltliteReadStore) queryIssueTable(query ListQuery, tables doltliteTabl
 	parentColumn := doltliteQualifiedDependsOnExpr("pc")
 	sqlText := `SELECT i.id, COALESCE(i.title, ''), COALESCE(i.status, ''), COALESCE(i.issue_type, ''), i.priority, i.created_at,
 		COALESCE(i.updated_at, ''), COALESCE(i.assignee, ''), COALESCE(i.description, ''), COALESCE(i.metadata, '{}'),
-		` + parentColumn + `, ` + tq.flags.ephemeral + `, ` + tq.flags.noHistory + `
+		` + parentColumn + `, ` + tq.flags.ephemeral + `, ` + tq.flags.noHistory + `, ` + tq.deferUntil + `
 		FROM ` + tables.issues + ` i` + tq.parentJoin
 	if len(tq.where) > 0 {
 		sqlText += " WHERE " + strings.Join(tq.where, " AND ")
@@ -1418,6 +1444,21 @@ func (s *DoltliteReadStore) storageFlagExprsFor(tables doltliteTableSet) (doltli
 	return flags, nil
 }
 
+// deferUntilExprFor resolves the SQL expression yielding a row's defer_until
+// value for tables. Snapshots written before bd added the column carry no
+// defer_until at all; those rows report the constant NULL, matching the
+// existing behavior of never deferring beads read through this store.
+func (s *DoltliteReadStore) deferUntilExprFor(tables doltliteTableSet) (string, error) {
+	has, err := s.tableHasColumn(tables.issues, "defer_until")
+	if err != nil {
+		return "", err
+	}
+	if !has {
+		return "NULL", nil
+	}
+	return "i.defer_until", nil
+}
+
 // doltliteTierPredicate translates query.go's TierMode row filter (Matches)
 // into a SQL predicate for one storage table. It returns skipTable=true when
 // the table cannot hold rows for the tier at all (a legacy wisps table is
@@ -1481,8 +1522,9 @@ func scanBead(rows interface{ Scan(...any) error }) (Bead, error) {
 		metadataRaw string
 		ephemeral   int64
 		noHistory   int64
+		deferRaw    any
 	)
-	if err := rows.Scan(&b.ID, &b.Title, &b.Status, &b.Type, &priority, &createdRaw, &updatedRaw, &b.Assignee, &b.Description, &metadataRaw, &b.ParentID, &ephemeral, &noHistory); err != nil {
+	if err := rows.Scan(&b.ID, &b.Title, &b.Status, &b.Type, &priority, &createdRaw, &updatedRaw, &b.Assignee, &b.Description, &metadataRaw, &b.ParentID, &ephemeral, &noHistory, &deferRaw); err != nil {
 		return b, err
 	}
 	if priority.Valid {
@@ -1495,10 +1537,36 @@ func scanBead(rows interface{ Scan(...any) error }) (Bead, error) {
 	b.Metadata = parseMetadata(metadataRaw)
 	b.Ephemeral = ephemeral != 0
 	b.NoHistory = noHistory != 0
+	b.DeferUntil = parseDeferUntil(deferRaw)
 	if b.From == "" {
 		b.From = b.Metadata["from"]
 	}
 	return b, nil
+}
+
+// parseDeferUntil converts a nullable defer_until column value into a bead's
+// DeferUntil pointer, mirroring bd's own nil-means-never-deferred semantics.
+func parseDeferUntil(v any) *time.Time {
+	var raw string
+	switch t := v.(type) {
+	case nil:
+		return nil
+	case string:
+		raw = t
+	case []byte:
+		raw = string(t)
+	default:
+		return nil
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parsed := parseTimeString(raw)
+	if parsed.IsZero() {
+		return nil
+	}
+	return &parsed
 }
 
 func parseDBTime(v any) time.Time {
