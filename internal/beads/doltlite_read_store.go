@@ -624,16 +624,24 @@ func (s *DoltliteReadStore) SetMetadataBatch(id string, kvs map[string]string) e
 		}
 		current = rows[0]
 	}
-	changed := make(map[string]string, len(kvs))
+	anyChanged := false
 	for k, v := range kvs {
 		if current.Metadata[k] != v {
-			changed[k] = v
+			anyChanged = true
+			break
 		}
 	}
-	if len(changed) == 0 {
+	if !anyChanged {
 		return nil
 	}
-	err = s.BdStore.SetMetadataBatch(id, changed)
+	// Forward the caller's full kvs, not just the subset that differs from
+	// this read. A caller (CachingStore.mergedMetadataForWrite, F3/dr-1tvd)
+	// may deliberately widen the batch to the bead's full metadata so bd's
+	// own internal read-modify-write cannot silently drop a field this call
+	// never otherwise mentions. Narrowing back down to only the changed
+	// subset here would undo that widening before it ever reaches bd,
+	// reopening exactly the unspecified-field gap it exists to close.
+	err = s.BdStore.SetMetadataBatch(id, kvs)
 	if err == nil {
 		s.resetOrderRunCache()
 	}

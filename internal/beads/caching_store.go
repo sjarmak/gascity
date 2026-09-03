@@ -47,9 +47,21 @@ type CachingStore struct {
 	// matter how stale the cached row is. Unlike localBeadAt (which only
 	// tracks THIS process's own writes, for the reconcile local-truth fence),
 	// confirmedAt tracks any confirmed-fresh install — deliberately broader.
-	confirmedAt         map[string]time.Time
-	deletedSeq          map[string]uint64
-	state               cacheState
+	confirmedAt map[string]time.Time
+	deletedSeq  map[string]uint64
+	state       cacheState
+
+	// idWriteLocks serializes the read-merge-write critical section (merge
+	// cached metadata onto a write's delta, send the merged map to backing,
+	// refresh, absorb) across SetMetadata, SetMetadataBatch, Update, and
+	// Close for the SAME bead id. Without it, two concurrent writers to the
+	// same id can each merge onto a base that predates the other's write,
+	// then write their own stale-based merge back — reintroducing dr-1tvd's
+	// clobber as a same-process race instead of a cross-process one
+	// (gc-g7x3t Finding 2). Deliberately never cleaned up in evictLocked: a
+	// concurrent holder's *sync.Mutex must stay valid for the lifetime of
+	// its own Lock/Unlock pair even if the row is evicted mid-hold.
+	idWriteLocks        sync.Map // string -> *sync.Mutex
 	lastFreshAt         time.Time
 	mutationSeq         uint64
 	observationRevision uint64
@@ -119,6 +131,17 @@ var (
 	_ ConditionalAssignmentReleaser = (*CachingStore)(nil)
 	_ AtomicTxStore                 = (*CachingStore)(nil)
 )
+
+// lockIDWrite serializes the merge-write-refresh-absorb critical section for
+// id across concurrent SetMetadata/SetMetadataBatch/Update/Close calls (see
+// idWriteLocks). Call it before reading the cache to build a write, and
+// defer the returned unlock through the backing write and cache absorb.
+func (c *CachingStore) lockIDWrite(id string) func() {
+	muAny, _ := c.idWriteLocks.LoadOrStore(id, &sync.Mutex{})
+	mu := muAny.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
 
 type cacheState int
 
