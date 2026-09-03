@@ -211,6 +211,14 @@ type hookClaimOps struct {
 	// (gc.work_branch and/or the durable session back-reference gc.session_id /
 	// gc.session_name) onto the claimed bead in ONE update. Best-effort.
 	StampWorkMeta hookStampWorkMetaFunc
+	// AdvanceClaimGeneration mints or advances gc.claim_generation on a bead
+	// this invocation just WON (never on an adoption re-tick), fenced on the
+	// claiming assignee through the same CAS verb bin/gc-sling's dispatch path
+	// already uses. This is the gc-3ohe47 fix: gc hook --claim used to be the
+	// one dispatch route that could win a claim without minting the
+	// current-authority token gc-outcome-close needs to close it. Best-effort:
+	// see advanceHookClaimGeneration.
+	AdvanceClaimGeneration hookAdvanceClaimGenerationFunc
 	// StampSessionClaim records the claimed bead id on the CLAIMING SESSION's own
 	// bead — the reverse direction from StampWorkMeta, and the only route by
 	// which the step's shell can later learn which bead it is running.
@@ -251,17 +259,18 @@ type hookClaimOps struct {
 }
 
 type (
-	hookClaimFunc              func(context.Context, string, []string, string, string) (beads.Bead, bool, error)
-	hookListContinuationFunc   func(context.Context, string, []string, string, string) ([]beads.Bead, error)
-	hookAssignContinuationFunc func(context.Context, string, []string, string, string) error
-	hookDrainAckFunc           func(io.Writer) error
-	hookDrainPendingFunc       func(sessionID string) (bool, error)
-	hookEmitClaimRejectedFunc  func(beadID, existingClaimant, attemptedClaimant string)
-	hookResolveWorkBranchFunc  func(dir string) string
-	hookStampWorkMetaFunc      func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
-	hookStampSessionClaimFunc  func(sessionID, beadID string) error
-	hookPublishRunMapFunc      func(runID, beadID string, sessionKeys ...string) error
-	hookClaimReleaseFunc       func(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error)
+	hookClaimFunc                  func(context.Context, string, []string, string, string) (beads.Bead, bool, error)
+	hookListContinuationFunc       func(context.Context, string, []string, string, string) ([]beads.Bead, error)
+	hookAssignContinuationFunc     func(context.Context, string, []string, string, string) error
+	hookDrainAckFunc               func(io.Writer) error
+	hookDrainPendingFunc           func(sessionID string) (bool, error)
+	hookEmitClaimRejectedFunc      func(beadID, existingClaimant, attemptedClaimant string)
+	hookResolveWorkBranchFunc      func(dir string) string
+	hookStampWorkMetaFunc          func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
+	hookStampSessionClaimFunc      func(sessionID, beadID string) error
+	hookPublishRunMapFunc          func(runID, beadID string, sessionKeys ...string) error
+	hookClaimReleaseFunc           func(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error)
+	hookAdvanceClaimGenerationFunc func(ctx context.Context, dir string, env []string, beadID, assignee, fromGeneration string) (next string, outcome beads.AdvanceClaimGenerationOutcome, err error)
 )
 
 type hookClaimJSONResult struct {
@@ -476,6 +485,9 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.StampWorkMeta == nil {
 		ops.StampWorkMeta = hookStampWorkMetaWithBdStore
+	}
+	if ops.AdvanceClaimGeneration == nil {
+		ops.AdvanceClaimGeneration = hookAdvanceClaimGenerationWithBdStore
 	}
 	if ops.StampSessionClaim == nil {
 		ops.StampSessionClaim = hookStampSessionCurrentClaim
@@ -956,6 +968,9 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 	}
 	result.RootBeadID = strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
 	result.ContinuationGroup = strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey])
+	if minted {
+		advanceHookClaimGeneration(bead, opts, ops, dir, stderr)
+	}
 	durable, stamped := stampHookClaimIdentity(bead, opts, ops, dir, stderr)
 	if stamped && hookClaimLifecycleCandidate(durable, opts) {
 		ops.EmitExecutionStepStarted(durable, dir, opts.Env, opts.Assignee)
@@ -1301,6 +1316,51 @@ func hookClaimThroughStore(beadID, assignee string, claim func() (beads.Bead, bo
 // skip guard by itself. hookClaimIdentityPatch instead treats it as write-once:
 // stamped only when absent, never touched again once set. Best-effort: a missing
 // repo, detached HEAD, absent session, or write error never blocks the claim.
+// advanceHookClaimGeneration mints or advances gc.claim_generation on a bead
+// this invocation just WON (minted, never on an adoption re-tick — see
+// minted's doc on writeHookClaimWorkResultForBead), through the same
+// assignee-fenced compare-and-set bin/gc-sling's dispatch path already uses
+// (ADR-0019's 2026-08-18 amendment). Before this, gc hook --claim was the one
+// dispatch route that could win a claim without minting the token
+// gc-outcome-close needs to verify current authority before closing it: a
+// graph-dispatched step claimed only through this path (gc-ue0tsw) passed
+// review and then could not close (gc-3ohe47).
+//
+// Gated on minted rather than run unconditionally: stampHookClaimIdentity's
+// patch is compare-and-skipped because it also runs on adoption of a bead
+// this session already owns (every hook tick re-adopts an in-progress
+// assignment), but the generation is a per-claim fencing token. Advancing it
+// on an adoption tick would move it out from under a caller that already read
+// the value THIS claim minted and is about to pass it to gc-outcome-close,
+// turning a legitimate close into a spurious stale refusal.
+//
+// Best-effort like the rest of this claim-time patch: a claim already won by
+// ops.Claim stands regardless of whether the generation can be advanced,
+// matching this codebase's existing posture for gc.work_branch / gc.session_id
+// / gc.claimed_at. What must NOT happen is writing a generation that was not
+// actually fenced: a stale race (the assignee moved between the claim and
+// this call) or an unsupported bd leaves gc.claim_generation exactly as
+// absent/behind as it was before this call — the same fail-closed refusal
+// gc-outcome-close already enforces today. Nothing here defaults, fabricates,
+// or bypasses the token.
+func advanceHookClaimGeneration(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stderr io.Writer) {
+	if ops.AdvanceClaimGeneration == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
+	defer cancel()
+	fromGeneration := strings.TrimSpace(bead.Metadata[beadmeta.ClaimGenerationMetadataKey])
+	_, outcome, err := ops.AdvanceClaimGeneration(ctx, dir, opts.Env, bead.ID, opts.Assignee, fromGeneration)
+	switch {
+	case err != nil:
+		fmt.Fprintf(stderr, "gc hook --claim: advancing claim generation on %s: %v\n", bead.ID, err) //nolint:errcheck
+	case outcome == beads.AdvanceClaimGenerationStale:
+		fmt.Fprintf(stderr, "gc hook --claim: claim generation fence on %s refused (assignee moved before it could be advanced)\n", bead.ID) //nolint:errcheck
+	case outcome == beads.AdvanceClaimGenerationUnsupported:
+		fmt.Fprintf(stderr, "gc hook --claim: claim generation not advanced on %s (bd does not support --if-assignee/--set-metadata)\n", bead.ID) //nolint:errcheck
+	}
+}
+
 func stampHookClaimIdentity(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stderr io.Writer) (beads.Bead, bool) {
 	patch := hookClaimIdentityPatch(bead, opts, ops, dir)
 	sessionID := hookClaimSessionID(opts.Env)
@@ -1399,6 +1459,13 @@ func hookClaimIdentityPatch(bead beads.Bead, opts hookClaimOptions, ops hookClai
 func hookStampWorkMetaWithBdStore(_ context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error {
 	store := hookClaimBdStore(dir, env, assignee)
 	return store.Update(beadID, beads.UpdateOpts{Metadata: patch})
+}
+
+// hookAdvanceClaimGenerationWithBdStore is AdvanceClaimGeneration's production
+// implementation: the bd store's assignee-fenced CAS verb, bound to ctx so a
+// best-effort claim-time write cannot outlast the caller's deadline.
+func hookAdvanceClaimGenerationWithBdStore(ctx context.Context, dir string, env []string, beadID, assignee, fromGeneration string) (string, beads.AdvanceClaimGenerationOutcome, error) {
+	return hookClaimBdStoreContext(ctx, dir, env, assignee).AdvanceClaimGenerationIfCurrent(beadID, assignee, fromGeneration)
 }
 
 func hookReadClaimedBeadWithBdStore(_ context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, error) {
