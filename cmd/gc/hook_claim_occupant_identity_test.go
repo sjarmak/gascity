@@ -113,26 +113,60 @@ work_query = "printf '[{\"id\":\"%s\",\"status\":\"open\",\"assignee\":\"\",\"me
 	stateDir := t.TempDir()
 	logPath := filepath.Join(stateDir, "bd.log")
 	ownerPath := filepath.Join(stateDir, "owner")
-	// `bd update <id> --claim --json` is the claim mutation (BdStore.Claim); it
-	// takes its actor implicitly from BEADS_ACTOR, so echoing that back as the
-	// claimed assignee is what a real bd does and what lets the claim be
-	// accepted as ours (hookClaimThroughStore). The owner file makes the
-	// subsequent canonical readback agree with the mutation.
+	metaPath := filepath.Join(stateDir, "claim_generation")
+	// `bd update <id> --claim --set-metadata gc.claim_generation=<n> --json` is
+	// the atomic claim-and-mint mutation (BdStore.ClaimWithGeneration,
+	// gc-3ohe47): both the ownership transfer and the generation mint travel in
+	// the SAME bd invocation, so this branch persists both from one match on
+	// `--claim` rather than the metadata write needing (and never getting) a
+	// second, separate call. The actor comes implicitly from BEADS_ACTOR, so
+	// echoing it back as the claimed assignee is what a real bd does and what
+	// lets the claim be accepted as ours (hookClaimThroughStore). The owner and
+	// generation files make the subsequent canonical readback
+	// (beads.BdStore.ConfirmClaimGeneration's `bd show`) agree with the
+	// mutation, and the pre-claim `bd show` below (ClaimWithGeneration's own
+	// pre-read, computing the next generation) must also resolve the bead
+	// before any claim has landed — a stub that only answered `show` once
+	// claimed (the prior shape of this script) would make that pre-read see a
+	// nonexistent bead and fail before the claim mutation ever ran.
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\t%%s\n' "$BEADS_ACTOR" "$*" >> %q
+is_claim=0
+metadata_kv=""
+prev=""
 for arg in "$@"; do
-  if [ "$arg" = "--claim" ]; then
-    printf '%%s' "$BEADS_ACTOR" > %q
-    printf '{"id":"%s","status":"in_progress","assignee":"%%s"}' "$BEADS_ACTOR"
-    exit 0
-  fi
+  if [ "$arg" = "--claim" ]; then is_claim=1; fi
+  if [ "$prev" = "--set-metadata" ]; then metadata_kv="$arg"; fi
+  prev="$arg"
 done
-if [ "$1" = "show" ] && [ -f %q ]; then
-  printf '[{"id":"%s","status":"in_progress","assignee":"%%s"}]' "$(cat %q)"
+if [ "$is_claim" = "1" ]; then
+  printf '%%s' "$BEADS_ACTOR" > %q
+  if [ -n "$metadata_kv" ]; then
+    printf '%%s' "${metadata_kv#*=}" > %q
+    printf '{"id":"%s","status":"in_progress","assignee":"%%s","metadata":{"gc.claim_generation":"%%s"}}' "$BEADS_ACTOR" "${metadata_kv#*=}"
+  else
+    printf '{"id":"%s","status":"in_progress","assignee":"%%s"}' "$BEADS_ACTOR"
+  fi
+  exit 0
+fi
+if [ "$1" = "show" ]; then
+  if [ -f %q ]; then
+    owner="$(cat %q)"
+    gen=""
+    [ -f %q ] && gen="$(cat %q)"
+    if [ -n "$gen" ]; then
+      printf '[{"id":"%s","status":"in_progress","assignee":"%%s","metadata":{"gc.claim_generation":"%%s"}}]' "$owner" "$gen"
+    else
+      printf '[{"id":"%s","status":"in_progress","assignee":"%%s"}]' "$owner"
+    fi
+  else
+    printf '[{"id":"%s","status":"open","assignee":""}]'
+  fi
   exit 0
 fi
 printf '[]'
-`, logPath, ownerPath, beadID, ownerPath, beadID, ownerPath)
+`, logPath, ownerPath, metaPath, beadID, beadID,
+		ownerPath, ownerPath, metaPath, metaPath, beadID, beadID, beadID)
 	if err := os.WriteFile(filepath.Join(fakeBin, "bd"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

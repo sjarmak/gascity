@@ -190,20 +190,29 @@ type hookClaimClassRoute struct {
 // is testable against a store a test controls rather than only against a city on
 // disk.
 //
-// A binding without the two-argument claim CAS is refused here rather than
+// A binding without the atomic claim-and-mint CAS is refused here rather than
 // discovered per-bead mid-tick: the capability is a property of the opened
 // engine, the closed contract will not emulate it with a read-then-write, and a
 // route that cannot perform the one write it exists for is worse than no route.
 // Same check, same place and same reason as storebinding.NewBeadsNudgeQueue.
+//
+// The assertion checks ClaimWithGeneration specifically, not the plain
+// two-argument Claim: gc-3ohe47's MEDIUM finding was that this door checked
+// the weaker capability while r.claim (below) actually invokes the stronger
+// one at runtime, so a binding that implements Claim but not
+// ClaimWithGeneration passed this door and then failed the mid-tick assertion
+// the "discovered per-bead" comment above says this door exists to avoid.
+// internal/storebinding pins ClaimWithGeneration as a capability distinct
+// from Claim (beads_adapter_graph_capability_test.go); this door must agree.
 func newHookClaimClassRoute(class beads.Store) (*hookClaimClassRoute, error) {
 	graph, err := storebinding.NewBeadsGraphStore(class)
 	if err != nil {
 		return nil, fmt.Errorf("projecting the claim-time class front door: %w", err)
 	}
 	if _, ok := class.(interface {
-		Claim(id, assignee string) (beads.Bead, bool, error)
+		ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error)
 	}); !ok {
-		return nil, fmt.Errorf("%w: %T has no compare-and-swap assignment claim", errClaimRouteBindingCannotClaim, class)
+		return nil, fmt.Errorf("%w: %T has no compare-and-swap claim-with-generation", errClaimRouteBindingCannotClaim, class)
 	}
 	return newClaimClassRouteOver(class, graph), nil
 }
@@ -428,7 +437,7 @@ func (r *hookClaimClassRoute) claim(beadID, assignee string) (beads.Bead, bool, 
 // advanceClaimGeneration mints or advances a binding-resident bead's
 // gc.claim_generation through the closed contract's metadata CAS, so a
 // graph-dispatched claim gets the same closeable current-authority token
-// beads.BdStore.AdvanceClaimGenerationIfCurrent mints for a work-store claim
+// beads.BdStore.ClaimWithGeneration mints atomically for a work-store claim
 // (gc-3ohe47). Without this, classRoutedHookClaimOps left AdvanceClaimGeneration
 // unrouted, so a graph-resident claim's generation fence still ran against the
 // work-directory-rooted BdStore — a store that does not hold the bead — and

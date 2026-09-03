@@ -1,6 +1,7 @@
 package beads
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -18,83 +19,148 @@ import (
 // to verify and refuses the close outright — which is correct, existing,
 // fail-closed behavior this file must not weaken.
 //
-// molecule.ClaimExact's beads.ConditionalWriter.UpdateIfMatch path (and the
-// narrow beads.MetadataCASWriter it would otherwise share) both require bd's
-// --if-revision flag, which this city's installed bd does not have (verified
-// against `bd update --help`, which lists --if-assignee/--if-status/
-// --set-metadata but no --if-revision). So the hook-claim path cannot reuse
-// ClaimExact's revision-fenced mechanism as-is; this file gives it a second,
-// assignee-fenced fencing contract instead: read the bead's current
-// generation, compute next, and write it fenced on the bead's current
-// assignee (bd update <id> --if-assignee <holder> --set-metadata
-// gc.claim_generation=<next>).
+// A prior shape of this fix (superseded, see the exact-head review recorded
+// against cc8bdceae) claimed through the ordinary Claim and then minted the
+// generation in a SEPARATE, assignee-fenced write, narrowing the race with a
+// pre-write/post-write read pair. The review correctly rejected that: two
+// writes can detect some races but cannot make the ownership-transfer and
+// generation-mint ATOMIC, no matter how tightly the reads bracket the second
+// write. ClaimWithGeneration below folds both into the SAME bd update
+// invocation instead, mirroring SQLiteStore.claimTx's single-transaction
+// design as closely as bd's CLI allows: bd has no --if-revision CAS
+// (verified against `bd update --help`, which lists --if-assignee/
+// --if-status/--set-metadata but no --if-revision), so the generation value
+// itself cannot be fenced the way claimTx fences it inside one SQL
+// transaction. Instead this relies on the same guarantee BdStore.Claim
+// already depends on: bd's own single-writer exclusivity on --claim, which
+// admits only the winning claimant's --claim — and therefore only that
+// claimant's paired --set-metadata, issued in the SAME bd process
+// invocation — to land at all. A losing --claim aborts the whole bd update,
+// including the metadata write, exactly like BdStore.Claim's existing
+// race-loser classification.
 
-// AdvanceClaimGenerationOutcome classifies how
-// AdvanceClaimGenerationIfCurrent resolved. It is always paired with a nil
-// error; a non-nil error means the call could not be confirmed as a clean
-// outcome (an id collision, an unparsable current generation, or an
-// infrastructure failure bd did not classify as a precondition miss) and the
-// outcome is "".
+// AdvanceClaimGenerationOutcome classifies how ConfirmClaimGeneration
+// resolved. It is always paired with a nil error; a non-nil error means the
+// call could not be confirmed as a clean outcome (an id collision or an
+// infrastructure failure) and the outcome is "".
 type AdvanceClaimGenerationOutcome string
 
 const (
-	// AdvanceClaimGenerationAdvanced means the fenced write landed: id's
-	// beadmeta.ClaimGenerationMetadataKey is now the returned next value.
+	// AdvanceClaimGenerationAdvanced means the bead's current
+	// beadmeta.ClaimGenerationMetadataKey is exactly the value the caller
+	// expected under the assignee it expected.
 	AdvanceClaimGenerationAdvanced AdvanceClaimGenerationOutcome = "advanced"
-	// AdvanceClaimGenerationStale means bd refused the write because id's
-	// current assignee no longer equals expectedAssignee (its dedicated
-	// precondition-miss exit code, bdCASPreconditionExitCode). Nothing was
-	// written. This is a definitive "this call did not win the fence", not an
-	// invitation to retry against the same fromGeneration snapshot: the caller
-	// must re-read and re-decide.
+	// AdvanceClaimGenerationStale means the bead's current assignee or
+	// generation no longer match what the caller expected — the fence the
+	// caller is holding has already moved. Nothing was written; this
+	// classifies a read, not a rejected write.
 	AdvanceClaimGenerationStale AdvanceClaimGenerationOutcome = "stale"
 	// AdvanceClaimGenerationUnsupported means this bd build does not
-	// understand --if-assignee or --set-metadata. Nothing was written, and
+	// understand --claim or --set-metadata. Nothing was written, and
 	// nothing was fabricated in its place.
 	AdvanceClaimGenerationUnsupported AdvanceClaimGenerationOutcome = "unsupported"
 )
 
-// AdvanceClaimGenerationIfCurrent advances id's
-// beadmeta.ClaimGenerationMetadataKey by one, from fromGeneration (the value
-// the caller already holds, typically read off the bead a claim just landed
-// on) to next, in a single bd update fenced on id's assignee still being
-// exactly expectedAssignee. fromGeneration of "" means "never claimed through
-// this fence before"; its next value is "1".
+// ClaimWithGeneration atomically claims id for assignee AND mints its
+// beadmeta.ClaimGenerationMetadataKey in the SAME bd update invocation (`bd
+// update <id> --claim --set-metadata gc.claim_generation=<next> --json`),
+// closing gc-3ohe47's HIGH finding: an ordinary Claim followed by a second,
+// separate generation write leaves a window in which a reader — including
+// gc-outcome-close's typed closer — can observe ownership already
+// transferred while the stored generation is still stale, and gives a
+// second writer room to mint a competing generation against the same
+// ownership transition.
 //
-// The write is refused, never guessed, when: id resolves to a different bead
-// than named (bd's prefix/substring resolver, the gcy-g4o collision shape);
-// fromGeneration is present but not a positive decimal counter, or already at
-// the int64 ceiling (a caller holding a corrupt or overflowed snapshot must
-// not silently restart or overflow the counter); the assignee fence misses
-// (AdvanceClaimGenerationStale); or this bd predates the flags
-// (AdvanceClaimGenerationUnsupported). None of these defaults, fabricates, or
-// bypasses the generation — the exact invariant gc-3ohe47 requires.
-func (s *BdStore) AdvanceClaimGenerationIfCurrent(id, expectedAssignee, fromGeneration string) (next string, outcome AdvanceClaimGenerationOutcome, err error) {
-	if collision := s.releaseIDCollision(id); collision != nil {
-		return "", "", collision
+// next is computed from a Get immediately before the claim attempt. This is
+// not a compare-and-swap on that read — bd cannot express one against an
+// arbitrary metadata value — but the only writer of
+// beadmeta.ClaimGenerationMetadataKey on an unclaimed bead is another
+// ClaimWithGeneration call, and that call can only WIN by winning --claim's
+// single-writer exclusivity, so the read-to-write gap here cannot be raced
+// by a second call that also succeeds: the loser's whole update, mint
+// included, never lands.
+//
+// It returns ok=false, nil error when bd reports that another actor won the
+// claim race (the loser never wrote anything, generation included). A bd
+// build predating --claim or --set-metadata is refused as an error, never
+// silently downgraded to an unfenced claim.
+func (s *BdStore) ClaimWithGeneration(id string) (Bead, string, bool, error) {
+	before, err := s.Get(id)
+	if err != nil {
+		if errors.Is(err, ErrIDCollision) {
+			return Bead{}, "", false, fmt.Errorf("refusing to claim %q with generation: %w", id, err)
+		}
+		return Bead{}, "", false, fmt.Errorf("claiming bead %q with generation: reading current state: %w", id, err)
 	}
-
-	toGeneration, perr := NextClaimGeneration(fromGeneration)
-	if perr != nil {
-		return "", "", fmt.Errorf("advance claim generation %q: %w", id, perr)
+	next, err := NextClaimGeneration(strings.TrimSpace(before.Metadata[beadmeta.ClaimGenerationMetadataKey]))
+	if err != nil {
+		return Bead{}, "", false, fmt.Errorf("claiming bead %q with generation: %w", id, err)
 	}
 
 	out, runErr := s.runBDTransientWriteOutput(
 		"update", id,
-		"--if-assignee", expectedAssignee,
-		"--set-metadata", beadmeta.ClaimGenerationMetadataKey+"="+toGeneration,
+		"--claim",
+		"--set-metadata", beadmeta.ClaimGenerationMetadataKey+"="+next,
+		"--json",
 	)
-	if runErr == nil {
-		return toGeneration, AdvanceClaimGenerationAdvanced, nil
+	if runErr != nil {
+		msg := strings.TrimSpace(string(out))
+		if isBdClaimConflictMessage(msg) || isBdClaimConflictMessage(runErr.Error()) {
+			return Bead{}, "", false, nil
+		}
+		detail := msg + " " + runErr.Error()
+		if isBdUnknownFlagError(detail, "--claim") || isBdUnknownFlagError(detail, "--set-metadata") {
+			return Bead{}, "", false, fmt.Errorf("claiming bead %q with generation: %w", id, ErrBdMissingClaimGenerationSupport)
+		}
+		if isBdNotFound(runErr) {
+			return Bead{}, "", false, fmt.Errorf("claiming bead %q with generation: %w", id, ErrNotFound)
+		}
+		if msg != "" {
+			return Bead{}, "", false, fmt.Errorf("claiming bead %q with generation: %w: %s", id, runErr, msg)
+		}
+		return Bead{}, "", false, fmt.Errorf("claiming bead %q with generation: %w", id, runErr)
 	}
-	if bdExitCode(runErr) == bdCASPreconditionExitCode {
-		return "", AdvanceClaimGenerationStale, nil
+	claimed, err := parseBDMutationBead("bd claim-with-generation", out)
+	if err != nil {
+		return Bead{}, "", false, fmt.Errorf("claiming bead %q with generation: %w", id, err)
 	}
-	detail := strings.TrimSpace(string(out)) + " " + runErr.Error()
-	if isBdUnknownFlagError(detail, "--if-assignee") || isBdUnknownFlagError(detail, "--set-metadata") {
-		return "", AdvanceClaimGenerationUnsupported, nil
+	return claimed, next, true, nil
+}
+
+// ErrBdMissingClaimGenerationSupport means the installed bd predates --claim
+// or --set-metadata support and ClaimWithGeneration refused to claim rather
+// than deliver a claim it cannot fence with a generation.
+var ErrBdMissingClaimGenerationSupport = errors.New("bd does not support --claim with --set-metadata")
+
+// ConfirmClaimGeneration re-reads id and reports whether its current
+// assignee and beadmeta.ClaimGenerationMetadataKey are exactly
+// expectedAssignee and expectedGeneration, without writing anything.
+//
+// It exists for the caller that already won its claim through
+// ClaimWithGeneration in the SAME call: the generation was minted
+// atomically with the ownership transition, so there is nothing left to
+// advance — running a second CAS here would be a second mutation racing the
+// first, exactly the two-write shape gc-3ohe47 exists to close. This
+// re-verifies nothing raced the claim between the atomic mint and the
+// moment the caller is about to rely on the value, without ever writing.
+func (s *BdStore) ConfirmClaimGeneration(id, expectedAssignee, expectedGeneration string) (AdvanceClaimGenerationOutcome, error) {
+	if strings.TrimSpace(expectedGeneration) == "" {
+		return AdvanceClaimGenerationStale, nil
 	}
-	return "", "", fmt.Errorf("advance claim generation %q: %w", id, runErr)
+	current, err := s.Get(id)
+	if err != nil {
+		if errors.Is(err, ErrIDCollision) {
+			return "", fmt.Errorf("refusing to confirm claim generation for %q: %w", id, err)
+		}
+		return "", fmt.Errorf("confirm claim generation %q: %w", id, err)
+	}
+	if strings.TrimSpace(current.Assignee) != strings.TrimSpace(expectedAssignee) {
+		return AdvanceClaimGenerationStale, nil
+	}
+	if strings.TrimSpace(current.Metadata[beadmeta.ClaimGenerationMetadataKey]) != expectedGeneration {
+		return AdvanceClaimGenerationStale, nil
+	}
+	return AdvanceClaimGenerationAdvanced, nil
 }
 
 // NextClaimGeneration advances a beadmeta.ClaimGenerationMetadataKey value by

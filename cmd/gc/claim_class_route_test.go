@@ -84,6 +84,20 @@ func (s claimRouteFailingStore) Claim(id, assignee string) (beads.Bead, bool, er
 	return claimer.Claim(id, assignee)
 }
 
+// ClaimWithGeneration delegates the same way, for the same reason: the door
+// now requires this capability specifically (gc-3ohe47's MEDIUM finding), so a
+// wrapper that only forwarded plain Claim would itself be refused at
+// construction and never reach the read-failure rule these rows test.
+func (s claimRouteFailingStore) ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error) {
+	claimer, ok := s.Store.(interface {
+		ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error)
+	})
+	if !ok {
+		return beads.Bead{}, "", false, errors.New("wrapped store has no claim-with-generation")
+	}
+	return claimer.ClaimWithGeneration(id, assignee)
+}
+
 func TestClassRoutedClaimEscalatesOnlyOnNotFound(t *testing.T) {
 	class := newClaimRouteClassStore(t)
 	mintClaimRouteBead(t, class, "gcg-100", nil)
@@ -437,7 +451,7 @@ func TestClassRoutedAdvanceClaimGenerationFollowsTheClaimOnly(t *testing.T) {
 // the binding's current value must report Stale with no write, the same
 // vocabulary advanceHookClaimGeneration already unwinds a minted claim on —
 // so a graph-resident claim gets the identical fail-closed behavior a
-// work-resident one gets from beads.BdStore.AdvanceClaimGenerationIfCurrent.
+// work-resident one gets from beads.BdStore.ConfirmClaimGeneration.
 //
 // Since the gc-3ohe47 P1 follow-up, route.claim's ClaimWithGeneration already
 // advances gc.claim_generation from the bead's preset "5" to "6" atomically
@@ -605,6 +619,51 @@ func TestHookClaimRouteVerdictDegradesRatherThanWedgingTheTick(t *testing.T) {
 // returns. beads.MemStore implements Claim, so the capability has to be hidden
 // behind a wrapper that does not.
 type claimRouteNoCASStore struct{ beads.Store }
+
+// claimRouteClaimOnlyStore hides everything the wrapped store offers except the
+// plain two-argument Claim, reproducing exactly the shape gc-3ohe47's MEDIUM
+// finding fell through: a binding that CAN claim ownership but has no
+// ClaimWithGeneration to mint the fence alongside it. Before the fix,
+// newHookClaimClassRoute's door checked only Claim and let this through; the
+// bead was then claimed for real by r.claim (which does invoke
+// ClaimWithGeneration), so the door's approval was a lie the mid-tick call had
+// to discover the hard way. This type exists so the door itself states the
+// stronger requirement, not just the runtime call.
+type claimRouteClaimOnlyStore struct{ beads.Store }
+
+func (s claimRouteClaimOnlyStore) Claim(id, assignee string) (beads.Bead, bool, error) {
+	claimer, ok := s.Store.(interface {
+		Claim(id, assignee string) (beads.Bead, bool, error)
+	})
+	if !ok {
+		return beads.Bead{}, false, errors.New("wrapped store has no claim CAS")
+	}
+	return claimer.Claim(id, assignee)
+}
+
+// TestHookClaimClassRouteRefusesABindingWithClaimButNoGeneration is the
+// MEDIUM finding's discriminating regression: a binding that implements plain
+// Claim but not ClaimWithGeneration must be refused at construction, exactly
+// like internal/storebinding pins the same distinction for the graph adapter
+// (TestBeadsGraphAdapterReportsMissingClaimWithGenerationCapability). Before
+// the fix this store passed newHookClaimClassRoute's door (it asserted only
+// Claim) and would have failed later, mid-tick, inside r.claim instead.
+func TestHookClaimClassRouteRefusesABindingWithClaimButNoGeneration(t *testing.T) {
+	var class beads.Store = claimRouteClaimOnlyStore{Store: newClaimRouteClassStore(t)}
+	if _, ok := class.(interface {
+		ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error)
+	}); ok {
+		t.Fatal("claimRouteClaimOnlyStore leaks ClaimWithGeneration from the wrapped store; the test proves nothing")
+	}
+
+	route, err := newHookClaimClassRoute(class)
+	if !errors.Is(err, errClaimRouteBindingCannotClaim) {
+		t.Fatalf("newHookClaimClassRoute over a binding with Claim but no ClaimWithGeneration = (route=%v err=%v), want errClaimRouteBindingCannotClaim", route, err)
+	}
+	if route != nil {
+		t.Fatal("a refused binding still produced a route; a claim-time route that cannot mint a generation is worse than none")
+	}
+}
 
 // newClaimRouteFor opens a claim-time class route over a store the row controls.
 // It observes no work legs, so nothing can preempt the escalation and the rows

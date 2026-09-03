@@ -73,14 +73,17 @@ const (
 	//     that write outright (*beads.PreconditionFailedError) with no
 	//     fallback and no partial effect ever lands. See molecule.ClaimExact's
 	//     doc for the exact guarantee this does and does not provide.
-	//   - beads.BdStore.AdvanceClaimGenerationIfCurrent (the generic gc hook
-	//     --claim pool path): assignee-fenced through `bd update --if-assignee
-	//     <holder> --set-metadata gc.claim_generation=<next>`, run as a
-	//     follow-up write after a claim this invocation minted (never on an
-	//     adoption re-tick of an already-owned bead). This is the mechanism
-	//     that closes gc-3ohe47: a graph-dispatched step claimed only
-	//     through gc hook --claim previously never minted this key at all,
-	//     and gc-outcome-close correctly refused to close it.
+	//   - beads.BdStore.ClaimWithGeneration (the generic gc hook --claim pool
+	//     path): mints this key in the SAME `bd update <id> --claim
+	//     --set-metadata gc.claim_generation=<next>` invocation that transfers
+	//     ownership, relying on bd's own single-writer exclusivity on --claim
+	//     (bd has no --if-revision CAS) rather than a value-level fence — a
+	//     losing claimant's whole update, mint included, never lands. The
+	//     follow-up beads.BdStore.ConfirmClaimGeneration read (never a second
+	//     write) re-verifies nothing raced between the mint and delivery. This
+	//     is the mechanism that closes gc-3ohe47: a graph-dispatched step
+	//     claimed only through gc hook --claim previously never minted this
+	//     key at all, and gc-outcome-close correctly refused to close it.
 	// Both mechanisms are fail-closed: neither defaults, fabricates, or
 	// bypasses the generation on a stale or unsupported write.
 	ClaimGenerationMetadataKey           = "gc.claim_generation"

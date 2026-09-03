@@ -1257,7 +1257,10 @@ func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops 
 func hookClaimWithBdStore(ctx context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, bool, error) {
 	store := hookClaimBdStoreContext(ctx, dir, env, assignee)
 	return hookClaimThroughStore(beadID, assignee,
-		func() (beads.Bead, bool, error) { return store.Claim(beadID) },
+		func() (beads.Bead, bool, error) {
+			claimed, _, ok, err := store.ClaimWithGeneration(beadID)
+			return claimed, ok, err
+		},
 		store.Get)
 }
 
@@ -1328,24 +1331,29 @@ func hookClaimThroughStore(beadID, assignee string, claim func() (beads.Bead, bo
 // skip guard by itself. hookClaimIdentityPatch instead treats it as write-once:
 // stamped only when absent, never touched again once set. Best-effort: a missing
 // repo, detached HEAD, absent session, or write error never blocks the claim.
-// advanceHookClaimGeneration mints or advances gc.claim_generation on a bead
-// this invocation just WON (minted, never on an adoption re-tick — see
-// minted's doc on writeHookClaimWorkResultForBead), through
-// beads.BdStore.AdvanceClaimGenerationIfCurrent's assignee-fenced
-// compare-and-set (`bd update --if-assignee <holder> --set-metadata
-// gc.claim_generation=<next>`). Before this, gc hook --claim was the one
-// dispatch route that could win a claim without minting the token
-// gc-outcome-close needs to verify current authority before closing it: a
-// graph-dispatched step claimed only through this path (gc-ue0tsw) passed
-// review and then could not close (gc-3ohe47).
+// advanceHookClaimGeneration re-verifies gc.claim_generation on a bead this
+// invocation just WON (minted, never on an adoption re-tick — see minted's
+// doc on writeHookClaimWorkResultForBead). By this point
+// hookClaimWithBdStore's ClaimWithGeneration call has already minted the
+// generation ATOMICALLY with the ownership transfer, in the SAME bd update
+// invocation (see beads.BdStore.ClaimWithGeneration's doc for why: bd has no
+// --if-revision CAS, so a separate second write cannot be fenced the way a
+// single SQL transaction fences SQLiteStore.claimTx, and the exact-head
+// review against gc-3ohe47's cc8bdceae shape rejected a two-write design for
+// exactly that reason). This function's job is a pure read-only confirm,
+// through beads.BdStore.ConfirmClaimGeneration, that nothing raced the claim
+// between the atomic mint and this call. Before the atomic mint existed, gc
+// hook --claim was the one dispatch route that could win a claim without
+// minting the token gc-outcome-close needs to verify current authority
+// before closing it: a graph-dispatched step claimed only through this path
+// (gc-ue0tsw) passed review and then could not close (gc-3ohe47).
 //
 // Gated on minted rather than run unconditionally: stampHookClaimIdentity's
 // patch is compare-and-skipped because it also runs on adoption of a bead
 // this session already owns (every hook tick re-adopts an in-progress
-// assignment), but the generation is a per-claim fencing token. Advancing it
-// on an adoption tick would move it out from under a caller that already read
-// the value THIS claim minted and is about to pass it to gc-outcome-close,
-// turning a legitimate close into a spurious stale refusal.
+// assignment), but the generation is a per-claim fencing token. Confirming it
+// on an adoption tick would re-verify a value the adopting call never minted
+// and has no assignee-fenced basis to re-check.
 //
 // NOT best-effort, unlike the rest of this claim-time patch (gc.work_branch /
 // gc.session_id / gc.claimed_at): a minted claim without a confirmed current
@@ -1483,10 +1491,21 @@ func hookStampWorkMetaWithBdStore(_ context.Context, dir string, env []string, b
 }
 
 // hookAdvanceClaimGenerationWithBdStore is AdvanceClaimGeneration's production
-// implementation: the bd store's assignee-fenced CAS verb, bound to ctx so a
-// best-effort claim-time write cannot outlast the caller's deadline.
+// implementation. By the time this runs, hookClaimWithBdStore's
+// ClaimWithGeneration call already minted fromGeneration atomically with the
+// ownership transfer (see beads.BdStore.ClaimWithGeneration) and
+// hookClaimThroughStore's canonical re-read is what put it on the claimed
+// bead. There is nothing left to advance — a second CAS here would be a
+// second mutation racing the first, exactly the two-write shape gc-3ohe47
+// exists to close — so this is a pure, read-only re-verification that
+// nothing raced the claim between the atomic mint and this call, bound to
+// ctx so a best-effort claim-time read cannot outlast the caller's deadline.
 func hookAdvanceClaimGenerationWithBdStore(ctx context.Context, dir string, env []string, beadID, assignee, fromGeneration string) (string, beads.AdvanceClaimGenerationOutcome, error) {
-	return hookClaimBdStoreContext(ctx, dir, env, assignee).AdvanceClaimGenerationIfCurrent(beadID, assignee, fromGeneration)
+	outcome, err := hookClaimBdStoreContext(ctx, dir, env, assignee).ConfirmClaimGeneration(beadID, assignee, fromGeneration)
+	if err != nil || outcome != beads.AdvanceClaimGenerationAdvanced {
+		return "", outcome, err
+	}
+	return fromGeneration, outcome, nil
 }
 
 func hookReadClaimedBeadWithBdStore(_ context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, error) {

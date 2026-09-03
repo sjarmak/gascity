@@ -1055,10 +1055,17 @@ func assertClassRoutedClaimGenerationFencesInTheBinding(t *testing.T, e splitEnv
 	}, route)
 
 	assignee := "hook-claimant-generation-fence"
-	if _, ok, err := ops.Claim(context.Background(), e.cityPath, nil, step.ID, assignee); err != nil || !ok {
+	claimed, ok, err := ops.Claim(context.Background(), e.cityPath, nil, step.ID, assignee)
+	if err != nil || !ok {
 		t.Fatalf("routed claim of %s = (ok=%v err=%v), want a successful claim", step.ID, ok, err)
 	}
-	next, outcome, err := ops.AdvanceClaimGeneration(context.Background(), e.cityPath, nil, step.ID, assignee, "")
+	// Mirrors advanceHookClaimGeneration's own call convention
+	// (cmd_hook_claim.go): fromGeneration is read off the metadata the CLAIM
+	// itself just returned, never passed as a literal — ClaimWithGeneration
+	// minted the generation atomically with ownership, so the claimed bead's
+	// metadata already carries it before this call is made.
+	fromGeneration := claimed.Metadata[beadmeta.ClaimGenerationMetadataKey]
+	next, outcome, err := ops.AdvanceClaimGeneration(context.Background(), e.cityPath, nil, step.ID, assignee, fromGeneration)
 	if err != nil || outcome != beads.AdvanceClaimGenerationAdvanced || next != "1" {
 		t.Fatalf("routed generation advance for %s = (next=%q outcome=%q err=%v), want (1 Advanced <nil>)", step.ID, next, outcome, err)
 	}

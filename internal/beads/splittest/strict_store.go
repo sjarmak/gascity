@@ -507,6 +507,30 @@ func (s *StrictStore) Claim(id, assignee string) (beads.Bead, bool, error) {
 	return claimer.Claim(id, assignee)
 }
 
+// claimGenerationClaimer is the compare-and-swap claim-with-generation
+// capability, discovered on the leaf the same way assignmentClaimer is.
+// Declared locally for the same reason: the canonical Store surface has no
+// claim method at all, so the capability it composes with has none either.
+type claimGenerationClaimer interface {
+	ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error)
+}
+
+// ClaimWithGeneration forwards the leaf's atomic claim-plus-mint. Interface
+// embedding of beads.Store does not promote this method on its own: the base
+// Store interface never declares it, so a leaf that implements it is
+// invisible through the embedded field until a wrapper asserts for it here
+// explicitly, exactly as Claim does above. Without this method every strict
+// leaf that actually supports the capability (a real *beads.SQLiteStore, in
+// particular) would be refused at gc-3ohe47's claim-time class door despite
+// the leaf being able to serve it.
+func (s *StrictStore) ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error) {
+	claimer, ok := s.Store.(claimGenerationClaimer)
+	if !ok {
+		return beads.Bead{}, "", false, fmt.Errorf("strict store: leaf store %T does not support compare-and-swap claim-with-generation", s.Store)
+	}
+	return claimer.ClaimWithGeneration(id, assignee)
+}
+
 // DeleteBatch forwards the leaf's orphan-preserving batch delete. A leaf without
 // the capability errors — never a per-id fallback, which would defeat the
 // orphan-preserving contract (same rule as beadPolicyStore).

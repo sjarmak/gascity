@@ -25,8 +25,8 @@ func TestHookClaimWithBdStoreReloadsCanonicalBeadAfterPartialMutation(t *testing
 			}
 			calls = append(calls, append([]string(nil), args...))
 			switch {
-			case reflect.DeepEqual(args, []string{"update", "work-1", "--claim", "--json"}):
-				return []byte(`[{"id":"work-1","status":"in_progress","assignee":"worker-1","metadata":{"gc.routed_to":"rig/worker"}}]`), nil
+			case reflect.DeepEqual(args, []string{"update", "work-1", "--claim", "--set-metadata", "gc.claim_generation=1", "--json"}):
+				return []byte(`[{"id":"work-1","status":"in_progress","assignee":"worker-1","metadata":{"gc.routed_to":"rig/worker","gc.claim_generation":"1"}}]`), nil
 			case reflect.DeepEqual(args, []string{"show", "--json", "work-1"}):
 				return []byte(`[{"id":"work-1","status":"in_progress","assignee":"worker-1","metadata":{"gc.routed_to":"rig/worker","gc.root_bead_id":"root-1","gc.continuation_group":"review"}}]`), nil
 			default:
@@ -46,8 +46,13 @@ func TestHookClaimWithBdStoreReloadsCanonicalBeadAfterPartialMutation(t *testing
 	if claimed.Metadata["gc.root_bead_id"] != "root-1" || claimed.Metadata["gc.continuation_group"] != "review" {
 		t.Fatalf("claimed metadata = %#v, want canonical root and continuation group", claimed.Metadata)
 	}
-	if len(calls) != 2 {
-		t.Fatalf("bd calls = %#v, want claim update followed by canonical show", calls)
+	// ClaimWithGeneration reads the bead once to compute the next generation
+	// before the atomic claim+mint, so the canonical "reload after mutation"
+	// contract this test proves now spans three bd calls, not two: the
+	// pre-claim show, the atomic claim update, and hookClaimThroughStore's own
+	// canonical reload.
+	if len(calls) != 3 {
+		t.Fatalf("bd calls = %#v, want pre-claim show, atomic claim update, then canonical show", calls)
 	}
 }
 
