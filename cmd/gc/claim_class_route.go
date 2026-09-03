@@ -129,6 +129,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/executionevent"
+	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/storebinding"
 	"github.com/gastownhall/gascity/internal/storeref"
 )
@@ -624,6 +625,28 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 		default:
 			return err
 		}
+	}
+
+	// AssignContinuationFenced is the fenced sibling of AssignContinuation
+	// above, and it routes on the MEMO alone rather than probing: the only
+	// caller (preassignHookContinuationGroup) always resolves rootID through
+	// ops.ListContinuation first, so by the time a sibling reaches this seam
+	// the group's residence is already decided — knownResident(rootID) is
+	// true when ListContinuation escalated to route.listContinuation (which
+	// marks the root's own siblings resident too), and false when the work
+	// store answered the list itself. A probe here would ask the same
+	// question the list call already answered.
+	//
+	// It runs through route.class — the raw, capability-preserving
+	// beads.Store the binding was opened over — rather than route.graph,
+	// because AssignContinuationFenced requires beads.StoreSupportsAtomicTx,
+	// a capability storebinding.GraphStore's closed contract deliberately does
+	// not expose.
+	ops.AssignContinuationFenced = func(ctx context.Context, dir string, env []string, rootID, group, sessionID, siblingID string) (molecule.ContinuationLeaseOutcome, error) {
+		if route.knownResident(rootID) {
+			return molecule.AssignContinuationFenced(route.class, rootID, group, sessionID, siblingID)
+		}
+		return base.AssignContinuationFenced(ctx, dir, env, rootID, group, sessionID, siblingID)
 	}
 
 	// The release of an undelivered claim (F-C) must run against the ledger the
