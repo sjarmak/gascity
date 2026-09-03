@@ -81,6 +81,7 @@ type mergeEndState struct {
 	dirty        map[string]struct{}
 	beadSeq      map[string]uint64
 	localBeadAt  map[string]time.Time
+	confirmedAt  map[string]time.Time
 	deletedSeq   map[string]uint64
 	// readyLost is the set of rows whose is_blocked verdict the merge dropped
 	// without preserving, so readiness declines for them unless their own edges
@@ -270,6 +271,9 @@ func ensureMaps(c *CachingStore) {
 	if c.localBeadAt == nil {
 		c.localBeadAt = make(map[string]time.Time)
 	}
+	if c.confirmedAt == nil {
+		c.confirmedAt = make(map[string]time.Time)
+	}
 	if c.deletedSeq == nil {
 		c.deletedSeq = make(map[string]uint64)
 	}
@@ -292,6 +296,7 @@ func captureEndState(c *CachingStore) mergeEndState {
 		dirty:                cloneDirty(c.dirty),
 		beadSeq:              cloneU64Map(c.beadSeq),
 		localBeadAt:          cloneTimeMap(c.localBeadAt),
+		confirmedAt:          cloneTimeMap(c.confirmedAt),
 		deletedSeq:           cloneU64Map(c.deletedSeq),
 		readyLost:            cloneDirty(c.readyProjectionLost),
 		state:                c.state,
@@ -483,6 +488,7 @@ func legacyBranchBMerge(
 	nextDirty := make(map[string]struct{})
 	nextBeadSeq := make(map[string]uint64)
 	nextLocalBeadAt := make(map[string]time.Time)
+	nextConfirmedAt := make(map[string]time.Time)
 
 	for id, freshBead := range freshByID {
 		beadForCache := freshBead
@@ -490,7 +496,9 @@ func legacyBranchBMerge(
 		if current, keep := c.recentLocalBeadConflictLocked(id, freshBead, now, true); keep {
 			beadForCache = current
 			preservedRecentLocal = true
-			c.carryRecentLocalMutationLocked(id, nextDirty, nextBeadSeq, nextLocalBeadAt)
+			c.carryRecentLocalMutationLocked(id, nextDirty, nextBeadSeq, nextLocalBeadAt, nextConfirmedAt)
+		} else {
+			nextConfirmedAt[id] = now
 		}
 		freshDeps := c.depsForReconcileLocked(id, freshBead, depMap, useFreshDeps)
 		nextBeads[id] = cloneBead(beadForCache)
@@ -526,7 +534,7 @@ func legacyBranchBMerge(
 				if deps, ok := c.deps[id]; ok {
 					nextDeps[id] = cloneDeps(deps)
 				}
-				c.carryRecentLocalMutationLocked(id, nextDirty, nextBeadSeq, nextLocalBeadAt)
+				c.carryRecentLocalMutationLocked(id, nextDirty, nextBeadSeq, nextLocalBeadAt, nextConfirmedAt)
 				continue
 			}
 			removes++
@@ -551,6 +559,7 @@ func legacyBranchBMerge(
 	c.dirty = nextDirty
 	c.beadSeq = nextBeadSeq
 	c.localBeadAt = nextLocalBeadAt
+	c.confirmedAt = nextConfirmedAt
 	c.deletedSeq = make(map[string]uint64)
 	c.syncFailures = 0
 	c.primePartialErr = nil
