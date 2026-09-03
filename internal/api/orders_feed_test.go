@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -147,6 +148,57 @@ func TestBuildWorkflowRunProjectionsKeepsInProgressChildrenOnHistoryFailure(t *t
 	}
 	if !got.Items[0].UpdatedAt.Equal(child.CreatedAt) {
 		t.Fatalf("updatedAt = %s, want %s", got.Items[0].UpdatedAt, child.CreatedAt)
+	}
+}
+
+// TestOrdersFeedDetachesTruncatedPage pins the ownership boundary between the
+// O(history) workflow-run scan buildWorkflowRunProjections does and the
+// O(limit) page the response cache retains for its TTL. If the truncated
+// page shared the full scan's backing array, caching a two-item page would
+// retain every hydrated workflow-run projection (same bug fixed for
+// resolveBeadListPage in huma_handlers_beads.go and for
+// humaHandleFormulaFeed in huma_handlers_formulas.go).
+func TestOrdersFeedDetachesTruncatedPage(t *testing.T) {
+	state := newFakeState(t)
+	mem := beads.NewMemStore()
+	state.stores = map[string]beads.Store{
+		"myrig": &workflowProjectionStore{MemStore: mem},
+	}
+
+	const totalRuns = 10
+	const limit = 2
+	for i := 0; i < totalRuns; i++ {
+		root, err := mem.Create(beads.Bead{
+			Title: fmt.Sprintf("Rig workflow run %d", i),
+			Type:  "workflow",
+			Metadata: map[string]string{
+				"gc.kind":             "workflow",
+				"gc.formula_contract": "graph.v2",
+			},
+		})
+		if err != nil {
+			t.Fatalf("create workflow root %d: %v", i, err)
+		}
+		inProgress := "in_progress"
+		if err := mem.Update(root.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+			t.Fatalf("set workflow status %d: %v", i, err)
+		}
+	}
+
+	srv := &Server{state: state}
+	resp, err := srv.humaHandleOrdersFeed(context.Background(), &OrdersFeedInput{
+		ScopeKind: "rig",
+		ScopeRef:  "myrig",
+		Limit:     limit,
+	})
+	if err != nil {
+		t.Fatalf("humaHandleOrdersFeed: %v", err)
+	}
+	if len(resp.Body.Items) != limit {
+		t.Fatalf("items = %d, want %d", len(resp.Body.Items), limit)
+	}
+	if cap(resp.Body.Items) != limit {
+		t.Fatalf("cap(items) = %d, want %d: truncated page still aliases the full O(history) scan's backing array", cap(resp.Body.Items), limit)
 	}
 }
 

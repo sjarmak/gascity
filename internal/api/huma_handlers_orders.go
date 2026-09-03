@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -656,7 +657,12 @@ func (s *Server) humaHandleOrdersFeed(_ context.Context, input *OrdersFeedInput)
 	})
 
 	if limit > 0 && len(items) > limit {
-		items = items[:limit]
+		// items' backing array was allocated at the combined workflow+order
+		// run count (O(store history) for the workflow leg), so items[:limit]
+		// alone would still pin that full array reachable. Detach the page so
+		// the response cache below cannot retain it for the cache TTL, same
+		// as the sibling fix for resolveBeadListPage.
+		items = slices.Clone(items[:limit])
 	}
 
 	body := ordersFeedBody{
