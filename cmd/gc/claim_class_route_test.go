@@ -10,6 +10,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/molecule"
 )
 
 // The claim-time class routing unit rows. The split-topology conformance suite
@@ -331,6 +332,103 @@ func TestClassRoutedContinuationListStillFailsLoud(t *testing.T) {
 	}, route)
 	if _, err := ops.ListContinuation(context.Background(), "/work", nil, "gcg-900", "batch-1"); !errors.Is(err, listErr) {
 		t.Fatalf("continuation list over a failing work store = %v, want the error surfaced", err)
+	}
+}
+
+// TestClassRoutedAssignContinuationFencedFollowsAListEscalation pins the
+// gc-ue0tsw round-3 HIGH #2 finding: a binding-resident root and sibling
+// discovered through ops.ListContinuation's escalation must have their fenced
+// assignment land in the SAME atomic binding, not the unrelated work-directory
+// store hookAssignContinuationFencedWithBdStore opens. Before the fix,
+// AssignContinuationFenced was never wrapped by classRoutedHookClaimOps at all,
+// so this exact sequence sent the write to a store that had never heard of
+// either bead — ErrAtomicTxUnsupported against production's BdStore, or a
+// silent write to the wrong ledger against any atomic work store.
+//
+// The work store's own AssignContinuationFenced is a poisoned stub here: any
+// call into it fails the test outright, proving the routed write never reaches
+// it.
+func TestClassRoutedAssignContinuationFencedFollowsAListEscalation(t *testing.T) {
+	class := newClaimRouteClassStore(t)
+	root := mintClaimRouteBead(t, class, "gcg-c00", nil)
+	group := map[string]string{
+		beadmeta.RootBeadIDMetadataKey:        root.ID,
+		beadmeta.ContinuationGroupMetadataKey: "batch-1",
+	}
+	sibling := mintClaimRouteBead(t, class, "gcg-c01", group)
+	route := newClaimRouteFor(t, class)
+
+	ops := classRoutedHookClaimOps(hookClaimOps{
+		ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
+			return nil, nil
+		},
+		AssignContinuationFenced: func(context.Context, string, []string, string, string, string, string) (molecule.ContinuationLeaseOutcome, error) {
+			t.Fatal("the work store's AssignContinuationFenced ran for a binding-resident root; the routed write must land only in the binding that holds it")
+			return "", nil
+		},
+	}, route)
+
+	siblings, err := ops.ListContinuation(context.Background(), "/work", nil, root.ID, "batch-1")
+	if err != nil {
+		t.Fatalf("routed continuation list: %v", err)
+	}
+	if len(siblings) != 1 || siblings[0].ID != sibling.ID {
+		t.Fatalf("routed continuation list = %+v, want exactly %s", siblings, sibling.ID)
+	}
+
+	outcome, err := ops.AssignContinuationFenced(context.Background(), "/work", nil, root.ID, "batch-1", "worker-1", sibling.ID)
+	if err != nil {
+		t.Fatalf("routed AssignContinuationFenced: %v", err)
+	}
+	if outcome != molecule.ContinuationLeaseAcquired {
+		t.Fatalf("outcome = %q, want %q", outcome, molecule.ContinuationLeaseAcquired)
+	}
+	assigned, err := class.Get(sibling.ID)
+	if err != nil || strings.TrimSpace(assigned.Assignee) != "worker-1" {
+		t.Fatalf("binding holds %s assigned to %q (err=%v), want worker-1", sibling.ID, assigned.Assignee, err)
+	}
+	heldRoot, err := class.Get(root.ID)
+	if err != nil || strings.TrimSpace(heldRoot.Metadata[beadmeta.ContinuationLeaseSessionMetadataKey]) != "worker-1" {
+		t.Fatalf("binding's root lease holder = %q (err=%v), want worker-1", heldRoot.Metadata[beadmeta.ContinuationLeaseSessionMetadataKey], err)
+	}
+}
+
+// TestClassRoutedAssignContinuationFencedKeepsAWorkAnswer is the other half of
+// the monotone rule every other seam in this file observes: a root the work
+// store answers for on its own (never escalated through ops.ListContinuation,
+// so the residence memo has nothing recorded for it) must have its fenced
+// assignment run against the work store, never probed or redirected into the
+// binding.
+func TestClassRoutedAssignContinuationFencedKeepsAWorkAnswer(t *testing.T) {
+	class := newClaimRouteClassStore(t)
+	// A binding that also holds a bead by this id, so only the memo — not a
+	// probe — can be why the write stays on the work store.
+	mintClaimRouteBead(t, class, "gc-1", nil)
+	route := newClaimRouteFor(t, class)
+
+	baseCalled := false
+	ops := classRoutedHookClaimOps(hookClaimOps{
+		AssignContinuationFenced: func(_ context.Context, _ string, _ []string, rootID, group, sessionID, siblingID string) (molecule.ContinuationLeaseOutcome, error) {
+			baseCalled = true
+			if rootID != "gc-1" || group != "batch-1" || sessionID != "worker-1" || siblingID != "gc-2" {
+				t.Errorf("work-scope AssignContinuationFenced called with (%q,%q,%q,%q), want (gc-1,batch-1,worker-1,gc-2)", rootID, group, sessionID, siblingID)
+			}
+			return molecule.ContinuationLeaseAcquired, nil
+		},
+	}, route)
+
+	outcome, err := ops.AssignContinuationFenced(context.Background(), "/work", nil, "gc-1", "batch-1", "worker-1", "gc-2")
+	if err != nil {
+		t.Fatalf("AssignContinuationFenced: %v", err)
+	}
+	if outcome != molecule.ContinuationLeaseAcquired {
+		t.Fatalf("outcome = %q, want %q", outcome, molecule.ContinuationLeaseAcquired)
+	}
+	if !baseCalled {
+		t.Fatal("the work-scope AssignContinuationFenced never ran; an un-escalated root must keep the work store's own answer")
+	}
+	if held, getErr := class.Get("gc-1"); getErr != nil || strings.TrimSpace(held.Metadata[beadmeta.ContinuationLeaseSessionMetadataKey]) != "" {
+		t.Fatalf("the binding's copy of gc-1 shows a lease holder %q; an un-escalated assignment must never touch the binding", held.Metadata[beadmeta.ContinuationLeaseSessionMetadataKey])
 	}
 }
 
