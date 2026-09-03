@@ -53,6 +53,14 @@ const (
 	// to release for the given root (or one held by a different session, when
 	// requireHolder is set) — a no-op, not an error.
 	ContinuationLeaseNotHeld ContinuationLeaseOutcome = "not_held"
+	// ContinuationLeaseSiblingUnavailable means AssignContinuationFenced's
+	// in-transaction read of the sibling found it no longer eligible: it was
+	// assigned to a different session, closed, or moved off rootID/group
+	// after the caller selected it from a point-in-time snapshot (e.g.
+	// ListContinuation) but before this transaction began. No write was
+	// attempted — the root's lease, its generation, and the sibling are all
+	// exactly as this transaction found them.
+	ContinuationLeaseSiblingUnavailable ContinuationLeaseOutcome = "sibling_unavailable"
 )
 
 // AcquireContinuationLease atomically acquires or renews the single
@@ -247,6 +255,18 @@ func ReleaseContinuationLease(store beads.Store, rootID, requireHolder string) (
 // the root's generation and committing the write for a concurrent
 // acquire/renew/release to land in, unlike AcquireContinuationLease's
 // separate read-then-CAS.
+//
+// The transaction also re-reads and revalidates siblingID itself before
+// either write lands: the caller's own eligibility check
+// (preassignHookContinuationGroup's open/unassigned/route filter) runs
+// against a point-in-time ListContinuation snapshot, and the gap between
+// that snapshot and this call is exactly wide enough for another claimant to
+// assign the sibling, close it, or move it to a different root/group.
+// Committing the lease renewal is not proof the STALE sibling read is still
+// current, so this transaction takes its own reads of siblingID and refuses
+// (ContinuationLeaseSiblingUnavailable, no write at all) unless it is still
+// open, still belongs to rootID/group, and is either unassigned or already
+// assigned to this exact sessionID (a safe idempotent re-assignment).
 func AssignContinuationFenced(store beads.Store, rootID, group, sessionID, siblingID string) (ContinuationLeaseOutcome, error) {
 	rootID = strings.TrimSpace(rootID)
 	group = strings.TrimSpace(group)
@@ -279,6 +299,24 @@ func AssignContinuationFenced(store beads.Store, rootID, group, sessionID, sibli
 		currentGroup := strings.TrimSpace(root.Metadata[beadmeta.ContinuationLeaseGroupMetadataKey])
 		if currentGroup != "" && currentGroup != group {
 			outcome = ContinuationLeaseHeldByOther
+			return nil
+		}
+
+		sibling, err := tx.Get(siblingID)
+		if err != nil {
+			return fmt.Errorf("reading sibling %q: %w", siblingID, err)
+		}
+		if !strings.EqualFold(strings.TrimSpace(sibling.Status), "open") {
+			outcome = ContinuationLeaseSiblingUnavailable
+			return nil
+		}
+		if siblingAssignee := strings.TrimSpace(sibling.Assignee); siblingAssignee != "" && siblingAssignee != sessionID {
+			outcome = ContinuationLeaseSiblingUnavailable
+			return nil
+		}
+		if strings.TrimSpace(sibling.Metadata[beadmeta.RootBeadIDMetadataKey]) != rootID ||
+			strings.TrimSpace(sibling.Metadata[beadmeta.ContinuationGroupMetadataKey]) != group {
+			outcome = ContinuationLeaseSiblingUnavailable
 			return nil
 		}
 
