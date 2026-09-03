@@ -406,9 +406,24 @@ func mustGetBead(t *testing.T, store beads.Store, id string) beads.Bead {
 	return b
 }
 
-func mustCreateOpenSibling(t *testing.T, store beads.Store) beads.Bead {
+// mustCreateOpenSibling creates an open, unassigned sibling already stamped
+// with rootID and the "cg-1" continuation group — the shape every real
+// sibling AssignContinuationFenced is called on actually has, because
+// ListContinuation only ever returns beads whose metadata already matches
+// this exact root/group pair. Every test in this file exercises the same
+// group; a test that needs a sibling to move to a different group mutates it
+// after creation via store.Update rather than varying this fixture.
+func mustCreateOpenSibling(t *testing.T, store beads.Store, rootID string) beads.Bead {
 	t.Helper()
-	b, err := store.Create(beads.Bead{Title: "sibling", Type: "task", Status: "open"})
+	b, err := store.Create(beads.Bead{
+		Title:  "sibling",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.RootBeadIDMetadataKey:        rootID,
+			beadmeta.ContinuationGroupMetadataKey: "cg-1",
+		},
+	})
 	if err != nil {
 		t.Fatalf("create sibling bead: %v", err)
 	}
@@ -438,7 +453,7 @@ func mustOpenAtomicSQLiteStore(t *testing.T) *beads.SQLiteStore {
 func TestAssignContinuationFenced_HappyPath(t *testing.T) {
 	store := mustOpenAtomicSQLiteStore(t)
 	root := mustCreateContinuationLeaseRoot(t, store)
-	sibling := mustCreateOpenSibling(t, store)
+	sibling := mustCreateOpenSibling(t, store, root.ID)
 
 	outcome, err := AssignContinuationFenced(store, root.ID, "cg-1", "session-alpha", sibling.ID)
 	if err != nil {
@@ -461,7 +476,7 @@ func TestAssignContinuationFenced_HappyPath(t *testing.T) {
 func TestAssignContinuationFenced_NotAuthorized(t *testing.T) {
 	store := mustOpenAtomicSQLiteStore(t)
 	root := mustCreateContinuationLeaseRoot(t, store)
-	sibling := mustCreateOpenSibling(t, store)
+	sibling := mustCreateOpenSibling(t, store, root.ID)
 	if _, outcome, err := AcquireContinuationLease(store, root.ID, "cg-1", "session-alpha"); err != nil || outcome != ContinuationLeaseAcquired {
 		t.Fatalf("initial acquire: outcome=%q err=%v", outcome, err)
 	}
@@ -491,7 +506,7 @@ func TestAssignContinuationFenced_FailsClosedOnNonAtomicStore(t *testing.T) {
 		t.Fatal("precondition: MemStore must not support atomic Tx")
 	}
 	root := mustCreateContinuationLeaseRoot(t, store)
-	sibling := mustCreateOpenSibling(t, store)
+	sibling := mustCreateOpenSibling(t, store, root.ID)
 
 	outcome, err := AssignContinuationFenced(store, root.ID, "cg-1", "session-alpha", sibling.ID)
 	if err == nil {
@@ -552,7 +567,7 @@ func (s *interposeDuringTxStore) Tx(commitMsg string, fn func(tx beads.Tx) error
 func TestAssignContinuationFenced_SiblingAssignmentNeverObservedBeforeCommit(t *testing.T) {
 	base := mustOpenAtomicSQLiteStore(t)
 	root := mustCreateContinuationLeaseRoot(t, base)
-	sibling := mustCreateOpenSibling(t, base)
+	sibling := mustCreateOpenSibling(t, base, root.ID)
 	originalGeneration := mustGetBead(t, base, root.ID).Metadata[beadmeta.ClaimGenerationMetadataKey]
 
 	store := &interposeDuringTxStore{SQLiteStore: base}
@@ -579,5 +594,125 @@ func TestAssignContinuationFenced_SiblingAssignmentNeverObservedBeforeCommit(t *
 	}
 	if got := mustGetBead(t, base, sibling.ID).Assignee; got != "session-alpha" {
 		t.Fatalf("post-commit sibling assignee = %q, want session-alpha", got)
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+// TestAssignContinuationFenced_SiblingAssignedBetweenListAndAssign pins the
+// first gc-ue0tsw round-3 HIGH finding: preassignHookContinuationGroup's
+// eligibility check runs against a point-in-time ListContinuation snapshot,
+// and another claimant can assign the sibling in the gap between that
+// snapshot and this call. The transaction must re-read the sibling and
+// refuse rather than steal it back from whoever holds it now.
+func TestAssignContinuationFenced_SiblingAssignedBetweenListAndAssign(t *testing.T) {
+	store := mustOpenAtomicSQLiteStore(t)
+	root := mustCreateContinuationLeaseRoot(t, store)
+	sibling := mustCreateOpenSibling(t, store, root.ID)
+	originalGeneration := mustGetBead(t, store, root.ID).Metadata[beadmeta.ClaimGenerationMetadataKey]
+
+	// Simulates a second claimant winning the sibling after this session's
+	// ListContinuation snapshot was taken but before its AssignContinuationFenced call.
+	if err := store.Update(sibling.ID, beads.UpdateOpts{Assignee: strPtr("someone-else")}); err != nil {
+		t.Fatalf("Update sibling assignee: %v", err)
+	}
+
+	outcome, err := AssignContinuationFenced(store, root.ID, "cg-1", "session-alpha", sibling.ID)
+	if err != nil {
+		t.Fatalf("AssignContinuationFenced: %v", err)
+	}
+	if outcome != ContinuationLeaseSiblingUnavailable {
+		t.Fatalf("outcome = %q, want %q", outcome, ContinuationLeaseSiblingUnavailable)
+	}
+	if got := mustGetBead(t, store, sibling.ID).Assignee; got != "someone-else" {
+		t.Fatalf("sibling assignee = %q, want untouched (someone-else)", got)
+	}
+	root2 := mustGetBead(t, store, root.ID)
+	if got := root2.Metadata[beadmeta.ContinuationLeaseSessionMetadataKey]; got != "" {
+		t.Fatalf("root lease holder = %q, want untouched (empty): a losing precondition must not grant the lease", got)
+	}
+	if got := root2.Metadata[beadmeta.ClaimGenerationMetadataKey]; got != originalGeneration {
+		t.Fatalf("root claim generation = %q, want unchanged %q", got, originalGeneration)
+	}
+}
+
+// TestAssignContinuationFenced_SiblingClosedBetweenListAndAssign pins the
+// same HIGH finding for the "sibling closed" adversarial case named in the
+// review.
+func TestAssignContinuationFenced_SiblingClosedBetweenListAndAssign(t *testing.T) {
+	store := mustOpenAtomicSQLiteStore(t)
+	root := mustCreateContinuationLeaseRoot(t, store)
+	sibling := mustCreateOpenSibling(t, store, root.ID)
+	originalGeneration := mustGetBead(t, store, root.ID).Metadata[beadmeta.ClaimGenerationMetadataKey]
+
+	if err := store.Close(sibling.ID); err != nil {
+		t.Fatalf("Close sibling: %v", err)
+	}
+
+	outcome, err := AssignContinuationFenced(store, root.ID, "cg-1", "session-alpha", sibling.ID)
+	if err != nil {
+		t.Fatalf("AssignContinuationFenced: %v", err)
+	}
+	if outcome != ContinuationLeaseSiblingUnavailable {
+		t.Fatalf("outcome = %q, want %q", outcome, ContinuationLeaseSiblingUnavailable)
+	}
+	closed := mustGetBead(t, store, sibling.ID)
+	if closed.Status != "closed" {
+		t.Fatalf("sibling status = %q, want untouched (closed)", closed.Status)
+	}
+	if closed.Assignee != "" {
+		t.Fatalf("sibling assignee = %q, want untouched (empty)", closed.Assignee)
+	}
+	root2 := mustGetBead(t, store, root.ID)
+	if got := root2.Metadata[beadmeta.ContinuationLeaseSessionMetadataKey]; got != "" {
+		t.Fatalf("root lease holder = %q, want untouched (empty): a losing precondition must not grant the lease", got)
+	}
+	if got := root2.Metadata[beadmeta.ClaimGenerationMetadataKey]; got != originalGeneration {
+		t.Fatalf("root claim generation = %q, want unchanged %q", got, originalGeneration)
+	}
+}
+
+// TestAssignContinuationFenced_SiblingMovedToDifferentGroupBetweenListAndAssign
+// pins the "moved to a different continuation group" adversarial case named
+// in the review: applySQLiteUpdateOpts merges Metadata key-by-key
+// (internal/beads/sqlite_store.go), so this update only overwrites
+// ContinuationGroupMetadataKey and leaves RootBeadIDMetadataKey intact,
+// isolating the group-mismatch branch from the root-mismatch branch.
+func TestAssignContinuationFenced_SiblingMovedToDifferentGroupBetweenListAndAssign(t *testing.T) {
+	store := mustOpenAtomicSQLiteStore(t)
+	root := mustCreateContinuationLeaseRoot(t, store)
+	sibling := mustCreateOpenSibling(t, store, root.ID)
+	originalGeneration := mustGetBead(t, store, root.ID).Metadata[beadmeta.ClaimGenerationMetadataKey]
+
+	if err := store.Update(sibling.ID, beads.UpdateOpts{
+		Metadata: map[string]string{beadmeta.ContinuationGroupMetadataKey: "cg-2"},
+	}); err != nil {
+		t.Fatalf("Update sibling group: %v", err)
+	}
+	moved := mustGetBead(t, store, sibling.ID)
+	if got := moved.Metadata[beadmeta.RootBeadIDMetadataKey]; got != root.ID {
+		t.Fatalf("precondition: sibling root metadata = %q, want unchanged %q after the merge update", got, root.ID)
+	}
+
+	outcome, err := AssignContinuationFenced(store, root.ID, "cg-1", "session-alpha", sibling.ID)
+	if err != nil {
+		t.Fatalf("AssignContinuationFenced: %v", err)
+	}
+	if outcome != ContinuationLeaseSiblingUnavailable {
+		t.Fatalf("outcome = %q, want %q", outcome, ContinuationLeaseSiblingUnavailable)
+	}
+	after := mustGetBead(t, store, sibling.ID)
+	if got := after.Metadata[beadmeta.ContinuationGroupMetadataKey]; got != "cg-2" {
+		t.Fatalf("sibling group = %q, want untouched (cg-2)", got)
+	}
+	if after.Assignee != "" {
+		t.Fatalf("sibling assignee = %q, want untouched (empty)", after.Assignee)
+	}
+	root2 := mustGetBead(t, store, root.ID)
+	if got := root2.Metadata[beadmeta.ContinuationLeaseSessionMetadataKey]; got != "" {
+		t.Fatalf("root lease holder = %q, want untouched (empty): a losing precondition must not grant the lease", got)
+	}
+	if got := root2.Metadata[beadmeta.ClaimGenerationMetadataKey]; got != originalGeneration {
+		t.Fatalf("root claim generation = %q, want unchanged %q", got, originalGeneration)
 	}
 }
