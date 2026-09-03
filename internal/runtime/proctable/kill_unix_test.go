@@ -149,3 +149,76 @@ func TestWaitUntilRespectsZeroTimeout(t *testing.T) {
 		t.Fatal("waitUntil should report false when the condition never holds at zero timeout")
 	}
 }
+
+// TestThrottleLimitsUnderlyingChecks is the regression test for the reap-loop
+// doubling: a caller polling the throttled function every tick (as waitUntil
+// does every 25ms) must not drive the wrapped check any more often than once
+// per interval.
+func TestThrottleLimitsUnderlyingChecks(t *testing.T) {
+	var calls int
+	check := func() bool {
+		calls++
+		return true
+	}
+	current := time.Unix(0, 0)
+	now := func() time.Time { return current }
+	throttled := throttle(100*time.Millisecond, now, check)
+
+	if !throttled() {
+		t.Fatal("throttled() = false, want true")
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 after the first call", calls)
+	}
+
+	// Simulate waitUntil's 25ms ticks landing inside the throttle window.
+	for i := 0; i < 3; i++ {
+		current = current.Add(25 * time.Millisecond)
+		throttled()
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 while every tick lands inside the throttle interval", calls)
+	}
+
+	// Once the interval elapses, the next call re-invokes check.
+	current = current.Add(100 * time.Millisecond)
+	if !throttled() {
+		t.Fatal("throttled() = false after the interval elapsed")
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2 after the interval elapsed", calls)
+	}
+}
+
+// TestThrottleNeverInventsATrueResult pins the safe staleness direction: a
+// cached false must not be papered over by a stale true, and a transition to
+// true is only ever visible once the underlying check actually observes it.
+func TestThrottleNeverInventsATrueResult(t *testing.T) {
+	calls := 0
+	check := func() bool {
+		calls++
+		return calls > 1 // false on the first real check, true afterward
+	}
+	current := time.Unix(0, 0)
+	now := func() time.Time { return current }
+	throttled := throttle(50*time.Millisecond, now, check)
+
+	if throttled() {
+		t.Fatal("throttled() = true on the first (false) check")
+	}
+	current = current.Add(10 * time.Millisecond)
+	if throttled() {
+		t.Fatal("throttled() = true from cache before the interval elapsed")
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 before the interval elapsed", calls)
+	}
+
+	current = current.Add(50 * time.Millisecond)
+	if !throttled() {
+		t.Fatal("throttled() = false after the interval elapsed and the underlying check turned true")
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2 after the interval elapsed", calls)
+	}
+}
