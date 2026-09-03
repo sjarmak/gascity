@@ -12,6 +12,16 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
+// startTimeRecheckInterval bounds how often the post-SIGKILL reap poll
+// re-verifies PID identity via pidutil.AliveWithStartTime. waitUntil ticks
+// every 25ms; where /proc is unavailable (darwin) that check is itself a `ps`
+// invocation on top of the zombie check Alive already performs, so
+// re-running it on every tick roughly doubled process churn in the slow reap
+// path. The ps fallback also only carries one-second resolution (see
+// pidutil.StartTime), so re-checking far less often than 25ms loses nothing
+// a caller could have observed anyway.
+const startTimeRecheckInterval = 200 * time.Millisecond
+
 // KillByPID terminates pid with SIGTERM, then SIGKILL after
 // runtime.ManagedProcessStopGrace, then waits (bounded by
 // runtime.ManagedProcessReapGrace) for the process to be confirmed dead — gone
@@ -29,14 +39,44 @@ func KillByPID(pid int) error {
 	// mechanism can answer, in which case runLive falls back to plain liveness
 	// — current behavior preserved.
 	startTime, _ := pidutil.StartTime(pid)
+	runLive := throttle(startTimeRecheckInterval, time.Now, func() bool {
+		return pidutil.AliveWithStartTime(pid, startTime)
+	})
 	return killByPID(
 		pid,
 		syscall.Kill,
 		pidAlive,
-		func(p int) bool { return pidutil.AliveWithStartTime(p, startTime) },
+		func(int) bool { return runLive() },
 		runtime.ManagedProcessStopGrace,
 		runtime.ManagedProcessReapGrace,
 	)
+}
+
+// throttle wraps check so it runs at most once per interval; between runs it
+// returns the last result rather than re-invoking check. The first call
+// always invokes check, matching waitUntil's own up-front check of an
+// already-satisfied condition.
+//
+// This is safe for a liveness/identity probe specifically because the only
+// value that can go stale between real checks is "still alive" (true): a
+// stale true just delays noticing a transition to false by up to interval,
+// it never fabricates one. Callers that bound the overall wait (waitUntil's
+// timeout) still get a correct final answer, just possibly interval late.
+func throttle(interval time.Duration, now func() time.Time, check func() bool) func() bool {
+	var (
+		last   bool
+		lastAt time.Time
+		primed bool
+	)
+	return func() bool {
+		if primed && now().Sub(lastAt) < interval {
+			return last
+		}
+		last = check()
+		lastAt = now()
+		primed = true
+		return last
+	}
 }
 
 // killByPID is the signal/confirm core with its syscalls injected so the
