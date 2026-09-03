@@ -1490,6 +1490,95 @@ func TestNativeDoltStoreTxRollsBackOnError(t *testing.T) {
 	}
 }
 
+// stagedNativeDoltMemStorage models genuine transaction isolation for
+// NativeDoltStore's beadslib.Storage seam: RunInTransaction's writes land on
+// a private scratch copy of the live MemStore and are merged back only after
+// the callback returns nil. This differs from nativeDoltMemStorage, which
+// applies writes directly to the live store and only unwinds them on error —
+// enough to prove atomicity but not isolation, since a concurrent read
+// through the same live store would observe the in-flight writes before a
+// failure (if any) unwound them. during, if set, runs after the callback's
+// writes have landed on the scratch copy but strictly before they are merged
+// into the live store, mirroring interposeDuringTxStore in
+// internal/molecule/continuation_lease_test.go.
+type stagedNativeDoltMemStorage struct {
+	*nativeDoltMemStorage
+	during func()
+}
+
+func newStagedNativeDoltMemStorage() *stagedNativeDoltMemStorage {
+	return &stagedNativeDoltMemStorage{nativeDoltMemStorage: newNativeDoltMemStorage()}
+}
+
+func (s *stagedNativeDoltMemStorage) RunInTransaction(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
+	live := s.nativeDoltMemStorage
+	live.txMu.Lock()
+	defer live.txMu.Unlock()
+
+	live.store.mu.Lock()
+	seq, beadsSnap, deps := live.store.snapshot()
+	live.store.mu.Unlock()
+
+	scratch := &nativeDoltMemStorage{store: NewMemStoreFrom(seq, beadsSnap, deps)}
+	if err := fn(nativeDoltTransactionForTest{storage: scratch}); err != nil {
+		return err
+	}
+	if s.during != nil {
+		s.during()
+	}
+
+	scratch.store.mu.Lock()
+	finalSeq, finalBeads, finalDeps := scratch.store.snapshot()
+	scratch.store.mu.Unlock()
+	live.store.restoreFrom(finalSeq, finalBeads, finalDeps)
+	return nil
+}
+
+// TestNativeDoltStoreTxWritesNeverObservedBeforeCommit pins the gc-ue0tsw
+// round-3 MEDIUM finding: NativeDoltStore.AtomicTx() == true previously had
+// only rollback coverage (TestNativeDoltStoreTxRollsBackOnError), which
+// proves all-or-nothing but not isolation. AtomicTxStore's contract
+// (internal/beads/beads.go) now requires both: a concurrent read against the
+// same store, taken after the callback's writes have been applied but before
+// Tx returns, must observe none of them.
+func TestNativeDoltStoreTxWritesNeverObservedBeforeCommit(t *testing.T) {
+	storage := newStagedNativeDoltMemStorage()
+	store := newNativeDoltStoreForTest(storage)
+	seed, err := store.Create(Bead{Title: "seed", Metadata: map[string]string{"phase": "initial"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	observedDuringTx := false
+	storage.during = func() {
+		observedDuringTx = true
+		got, err := store.Get(seed.ID)
+		if err != nil {
+			t.Fatalf("concurrent Get mid-transaction: %v", err)
+		}
+		if got.Metadata["phase"] != "initial" {
+			t.Errorf("concurrent read mid-transaction: phase = %q, want untouched (initial) before commit", got.Metadata["phase"])
+		}
+	}
+
+	if err := store.Tx("isolation", func(tx Tx) error {
+		return tx.Update(seed.ID, UpdateOpts{Metadata: map[string]string{"phase": "mutated"}})
+	}); err != nil {
+		t.Fatalf("Tx: %v", err)
+	}
+	if !observedDuringTx {
+		t.Fatal("stagedNativeDoltMemStorage.during was never invoked: test did not actually exercise the mid-transaction window")
+	}
+
+	got, err := store.Get(seed.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Metadata["phase"] != "mutated" {
+		t.Fatalf("post-commit phase = %q, want mutated", got.Metadata["phase"])
+	}
+}
+
 func TestNativeDoltStoreCloseWithMetadataIfMatchCommitsOneFencedTerminalState(t *testing.T) {
 	storage := &commitCountingMemStorage{nativeDoltMemStorage: newNativeDoltMemStorage()}
 	store := newNativeDoltStoreForTest(storage)
