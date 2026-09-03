@@ -128,31 +128,47 @@ func TestHookClaimUnwindsOnLeaseAcquireError(t *testing.T) {
 // authority for every later mutation. This test models a reconciler
 // revoking/advancing this session's continuation lease AFTER the initial
 // acquireHookContinuationLease succeeded but WHILE preassignHookContinuationGroup
-// is still iterating siblings — the second sibling's revalidation call
+// is still iterating siblings — the second sibling's fenced assignment
 // observes the revoked lease (ContinuationLeaseHeldByOther) and must reject
 // that assignment rather than trusting the stale preflight, while the FIRST
 // sibling (assigned before the revocation) still went through legitimately.
+// The stricter race — revocation landing strictly between the per-sibling
+// write and its post-write re-verification, inside a single
+// AssignContinuationFenced call — is covered at the molecule layer by
+// TestAssignContinuationFenced_RevertsWhenLeaseRevokedBetweenWriteAndReverify,
+// since only that layer controls the interleaving precisely enough to model it.
 func TestHookClaimRejectsSiblingAssignmentAfterLeaseRevokedMidLoop(t *testing.T) {
 	const work = `[{"id":"work-1","status":"open","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"grp-1","gc.session_affinity":"require"}}]`
 	rec := &turnBoundClaimRecorder{}
 	ops := rec.ops(t, work)
 
-	var leaseCalls int
+	// The initial per-claim acquireHookContinuationLease call (gating work-1
+	// itself, before preassignHookContinuationGroup ever runs) must succeed so
+	// the flow reaches the sibling loop under test; only AssignContinuationFenced
+	// models the revocation.
 	ops.AcquireContinuationLease = func(_ context.Context, _ string, _ []string, rootID, group, sessionID string) (molecule.ContinuationLeaseOutcome, error) {
-		leaseCalls++
 		if rootID != "root-1" || group != "grp-1" || sessionID != "worker-1" {
 			t.Fatalf("AcquireContinuationLease(%q,%q,%q), want root-1/grp-1/worker-1", rootID, group, sessionID)
 		}
-		switch leaseCalls {
-		case 1, 2:
-			// Call 1: the initial claim-time acquisition. Call 2: this
-			// session's own renewal before assigning the FIRST sibling —
-			// still legitimately held.
+		return molecule.ContinuationLeaseAcquired, nil
+	}
+
+	var fencedCalls int
+	var assigned []string
+	ops.AssignContinuationFenced = func(_ context.Context, _ string, _ []string, rootID, group, sessionID, siblingID string) (molecule.ContinuationLeaseOutcome, error) {
+		fencedCalls++
+		if rootID != "root-1" || group != "grp-1" || sessionID != "worker-1" {
+			t.Fatalf("AssignContinuationFenced(%q,%q,%q,%q), want root-1/grp-1/worker-1/*", rootID, group, sessionID, siblingID)
+		}
+		switch fencedCalls {
+		case 1:
+			// The FIRST sibling's fenced assignment — still legitimately
+			// authorized.
+			assigned = append(assigned, siblingID+"="+sessionID)
 			return molecule.ContinuationLeaseAcquired, nil
 		default:
-			// Call 3+: a reconciler has revoked/advanced the lease between
-			// the first sibling's assignment and the second sibling's
-			// renewal attempt.
+			// A reconciler has revoked/advanced the lease between the first
+			// sibling's fenced assignment and the second sibling's.
 			return molecule.ContinuationLeaseHeldByOther, nil
 		}
 	}
@@ -161,11 +177,6 @@ func TestHookClaimRejectsSiblingAssignmentAfterLeaseRevokedMidLoop(t *testing.T)
 			{ID: "sib-1", Status: "open", Metadata: map[string]string{"gc.routed_to": "worker"}},
 			{ID: "sib-2", Status: "open", Metadata: map[string]string{"gc.routed_to": "worker"}},
 		}, nil
-	}
-	var assigned []string
-	ops.AssignContinuation = func(_ context.Context, _ string, _ []string, beadID, assignee string) error {
-		assigned = append(assigned, beadID+"="+assignee)
-		return nil
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -178,8 +189,8 @@ func TestHookClaimRejectsSiblingAssignmentAfterLeaseRevokedMidLoop(t *testing.T)
 	if code != 1 {
 		t.Fatalf("code = %d, want 1; stdout=%q stderr=%s", code, stdout.String(), stderr.String())
 	}
-	if leaseCalls != 3 {
-		t.Fatalf("lease calls = %d, want 3 (initial acquire + 2 per-sibling renewals)", leaseCalls)
+	if fencedCalls != 2 {
+		t.Fatalf("fenced assignment calls = %d, want 2 (one per eligible sibling)", fencedCalls)
 	}
 	if got := strings.Join(assigned, ","); got != "sib-1=worker-1" {
 		t.Fatalf("assigned siblings = %q, want exactly [sib-1=worker-1]: sib-2 must be rejected, not silently assigned under a revoked lease", got)
