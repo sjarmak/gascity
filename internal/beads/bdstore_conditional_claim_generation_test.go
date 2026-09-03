@@ -151,6 +151,33 @@ func TestAdvanceClaimGenerationIfCurrentRefusesAnUnparsableGeneration(t *testing
 	}
 }
 
+// TestAdvanceClaimGenerationIfCurrentRefusesNonPositiveOrCeilingGenerations
+// covers nextClaimGeneration's other two fail-closed branches, alongside the
+// non-decimal case above: a non-positive counter (corrupt/tampered metadata)
+// and the int64 ceiling (would silently wrap on overflow if incremented).
+// Both must error before ever reaching bd, the same as an unparsable string.
+func TestAdvanceClaimGenerationIfCurrentRefusesNonPositiveOrCeilingGenerations(t *testing.T) {
+	for _, from := range []string{"0", "-3", "9223372036854775807"} {
+		t.Run(from, func(t *testing.T) {
+			runner := &generationVerbRunner{reply: func(args []string) ([]byte, error) {
+				return nil, fmt.Errorf("unexpected call %v", args)
+			}}
+			s := beads.NewBdStore("/city", runner.run)
+
+			next, outcome, err := s.AdvanceClaimGenerationIfCurrent("bd-42", "worker-1", from)
+			if err == nil {
+				t.Fatalf("generation %q must error, not silently advance", from)
+			}
+			if outcome != "" || next != "" {
+				t.Fatalf("outcome=%q next=%q on error, want both empty", outcome, next)
+			}
+			if len(runner.generationVerbArgv()) != 0 {
+				t.Fatalf("generation %q must never reach bd: %v", from, runner.argv())
+			}
+		})
+	}
+}
+
 // TestAdvanceClaimGenerationIfCurrentTreatsAnUnsupportedFlagAsRefusal covers a
 // bd build predating --if-assignee/--set-metadata: refused, not silently
 // downgraded to an unfenced write.

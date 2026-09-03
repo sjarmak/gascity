@@ -74,8 +74,7 @@ const (
 	//     fallback and no partial effect ever lands. See molecule.ClaimExact's
 	//     doc for the exact guarantee this does and does not provide.
 	//   - beads.BdStore.AdvanceClaimGenerationIfCurrent (the generic gc hook
-	//     --claim pool path, and bin/gc-sling's dispatch path via the same
-	//     bd verb): assignee-fenced through `bd update --if-assignee
+	//     --claim pool path): assignee-fenced through `bd update --if-assignee
 	//     <holder> --set-metadata gc.claim_generation=<next>`, run as a
 	//     follow-up write after a claim this invocation minted (never on an
 	//     adoption re-tick of an already-owned bead). This is the mechanism

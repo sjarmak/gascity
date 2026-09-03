@@ -213,11 +213,10 @@ type hookClaimOps struct {
 	StampWorkMeta hookStampWorkMetaFunc
 	// AdvanceClaimGeneration mints or advances gc.claim_generation on a bead
 	// this invocation just WON (never on an adoption re-tick), fenced on the
-	// claiming assignee through the same CAS verb bin/gc-sling's dispatch path
-	// already uses. This is the gc-3ohe47 fix: gc hook --claim used to be the
-	// one dispatch route that could win a claim without minting the
-	// current-authority token gc-outcome-close needs to close it. Best-effort:
-	// see advanceHookClaimGeneration.
+	// claiming assignee via `bd update --if-assignee`. This is the gc-3ohe47
+	// fix: gc hook --claim used to be the one dispatch route that could win a
+	// claim without minting the current-authority token gc-outcome-close
+	// needs to close it. Best-effort: see advanceHookClaimGeneration.
 	AdvanceClaimGeneration hookAdvanceClaimGenerationFunc
 	// StampSessionClaim records the claimed bead id on the CLAIMING SESSION's own
 	// bead — the reverse direction from StampWorkMeta, and the only route by
@@ -1318,9 +1317,10 @@ func hookClaimThroughStore(beadID, assignee string, claim func() (beads.Bead, bo
 // repo, detached HEAD, absent session, or write error never blocks the claim.
 // advanceHookClaimGeneration mints or advances gc.claim_generation on a bead
 // this invocation just WON (minted, never on an adoption re-tick — see
-// minted's doc on writeHookClaimWorkResultForBead), through the same
-// assignee-fenced compare-and-set bin/gc-sling's dispatch path already uses
-// (ADR-0019's 2026-08-18 amendment). Before this, gc hook --claim was the one
+// minted's doc on writeHookClaimWorkResultForBead), through
+// beads.BdStore.AdvanceClaimGenerationIfCurrent's assignee-fenced
+// compare-and-set (`bd update --if-assignee <holder> --set-metadata
+// gc.claim_generation=<next>`). Before this, gc hook --claim was the one
 // dispatch route that could win a claim without minting the token
 // gc-outcome-close needs to verify current authority before closing it: a
 // graph-dispatched step claimed only through this path (gc-ue0tsw) passed

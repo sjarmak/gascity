@@ -18,19 +18,16 @@ import (
 // to verify and refuses the close outright — which is correct, existing,
 // fail-closed behavior this file must not weaken.
 //
-// bin/gc-sling's advance_claim_generation already mints/advances this same key
-// on its own dispatch path via the identical mechanism: read the bead's
-// current generation, compute next, and write it fenced on the bead's current
-// assignee (bd update <id> --if-assignee <holder> --set-metadata
-// gc.claim_generation=<next>). ADR-0019's 2026-08-18 amendment names this as
-// the live mechanism, and it is the ONLY one live in this city today —
-// molecule.ClaimExact's beads.ConditionalWriter.UpdateIfMatch path, and the
-// narrow beads.MetadataCASWriter it would otherwise share, both require bd's
+// molecule.ClaimExact's beads.ConditionalWriter.UpdateIfMatch path (and the
+// narrow beads.MetadataCASWriter it would otherwise share) both require bd's
 // --if-revision flag, which this city's installed bd does not have (verified
 // against `bd update --help`, which lists --if-assignee/--if-status/
-// --set-metadata but no --if-revision). This file gives the hook-claim path
-// the same --if-assignee-fenced verb gc-sling already uses, so both dispatch
-// routes mint the token the same way instead of inventing a second contract.
+// --set-metadata but no --if-revision). So the hook-claim path cannot reuse
+// ClaimExact's revision-fenced mechanism as-is; this file gives it a second,
+// assignee-fenced fencing contract instead: read the bead's current
+// generation, compute next, and write it fenced on the bead's current
+// assignee (bd update <id> --if-assignee <holder> --set-metadata
+// gc.claim_generation=<next>).
 
 // AdvanceClaimGenerationOutcome classifies how
 // AdvanceClaimGenerationIfCurrent resolved. It is always paired with a nil
