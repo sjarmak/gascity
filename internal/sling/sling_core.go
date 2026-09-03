@@ -1454,21 +1454,23 @@ func checkLegacySourceWorkflowConflict(deps SlingDeps, beadID string) error {
 	}
 }
 
-func validateBatchSlingFormulaRuntimeVars(ctx context.Context, formulaName string, searchPaths []string, opts SlingOpts, open []beads.Bead, a config.Agent, deps SlingDeps) ([]string, error) {
-	var warnings []string
+// validateBatchSlingFormulaRuntimeVars validates each open child's rendered
+// vars before any attachment mutates state. It deliberately does not surface
+// buildSlingFormulaVars's requirements-export warning: that warning is
+// re-derived (and reported) per child by attachBatchFormula on the success
+// path, and on the failure path here the caller discards batchResult
+// entirely, so collecting it here would either duplicate or drop it.
+func validateBatchSlingFormulaRuntimeVars(ctx context.Context, formulaName string, searchPaths []string, opts SlingOpts, open []beads.Bead, a config.Agent, deps SlingDeps) error {
 	for _, child := range open {
-		childVars, requirementsExportWarning := buildSlingFormulaVars(formulaName, child.ID, opts.Vars, a, deps, true)
-		if requirementsExportWarning != "" {
-			warnings = append(warnings, requirementsExportWarning)
-		}
+		childVars, _ := buildSlingFormulaVars(formulaName, child.ID, opts.Vars, a, deps, true)
 		if err := validateSlingFormulaRuntimeVars(ctx, formulaName, searchPaths, molecule.Options{
 			Title: opts.Title,
 			Vars:  childVars,
 		}); err != nil {
-			return warnings, fmt.Errorf("child %s: %w", child.ID, err)
+			return fmt.Errorf("child %s: %w", child.ID, err)
 		}
 	}
-	return warnings, nil
+	return nil
 }
 
 func sourceWorkflowLockScope(deps SlingDeps) string {
@@ -1620,9 +1622,7 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 		if err != nil {
 			return SlingResult{}, fmt.Errorf("instantiating formula %q on %s %s: %w", useFormula, b.Type, b.ID, err)
 		}
-		validationWarnings, err := validateBatchSlingFormulaRuntimeVars(context.Background(), useFormula, searchPaths, opts, open, a, deps)
-		batchResult.BeadWarnings = append(batchResult.BeadWarnings, validationWarnings...)
-		if err != nil {
+		if err := validateBatchSlingFormulaRuntimeVars(context.Background(), useFormula, searchPaths, opts, open, a, deps); err != nil {
 			return SlingResult{}, fmt.Errorf("instantiating formula %q on %s %s: %w", useFormula, b.Type, b.ID, err)
 		}
 		checkAttachments := CheckBatchNoMoleculeChildren

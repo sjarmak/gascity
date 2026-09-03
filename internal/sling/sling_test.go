@@ -2585,14 +2585,14 @@ func TestDoSlingBatchWarnsWhenChildRequirementsExportWriteFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DoSlingBatch: %v", err)
 	}
-	found := false
+	count := 0
 	for _, w := range result.BeadWarnings {
 		if strings.Contains(w, "could not export bead") {
-			found = true
+			count++
 		}
 	}
-	if !found {
-		t.Errorf("BeadWarnings = %#v, want a warning that the batch child's requirements export failed", result.BeadWarnings)
+	if count != 1 {
+		t.Errorf("BeadWarnings = %#v, want exactly 1 warning that the batch child's requirements export failed, got %d", result.BeadWarnings, count)
 	}
 }
 

@@ -1197,7 +1197,7 @@ func exportSlingRequirements(deps SlingDeps, beadID string) (path string, warnin
 		return failWarning(err)
 	}
 	path = filepath.Join(dir, beadID+".md")
-	if err := (fsys.OSFS{}).WriteFile(path, []byte(buf.String()), 0o644); err != nil {
+	if err := fsys.WriteFileAtomic(fsys.OSFS{}, path, []byte(buf.String()), 0o644); err != nil {
 		return failWarning(err)
 	}
 	return path, ""
