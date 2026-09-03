@@ -747,6 +747,11 @@ type strictTx struct {
 	store *StrictStore
 }
 
+// Get delegates to the leaf transaction.
+func (t *strictTx) Get(id string) (beads.Bead, error) {
+	return t.tx.Get(id)
+}
+
 // Create guards and post-checks exactly like StrictStore.Create, against the
 // transaction's write surface.
 func (t *strictTx) Create(b beads.Bead) (beads.Bead, error) {

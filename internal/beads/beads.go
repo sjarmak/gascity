@@ -63,6 +63,14 @@ var ErrConditionalReleaseUnsupported = errors.New("conditional assignment releas
 // unconditional write. See ConditionalWriter for the full contract.
 var ErrConditionalWriteUnsupported = errors.New("conditional writes unsupported")
 
+// ErrAtomicTxUnsupported reports that this store's Tx cannot guarantee
+// all-or-nothing commit (StoreSupportsAtomicTx returns false). Latching it per
+// store instance is the capability veto for callers that need a cross-bead
+// precondition and its dependent write to commit as one operation: no code
+// path in internal/beads converts it into a non-atomic Store.Tx sequence. See
+// AtomicTxStore for the full contract.
+var ErrAtomicTxUnsupported = errors.New("atomic transactions unsupported")
+
 // ErrBDSilentFallback reports that a bd-backed store operation saw bd exit
 // successfully after falling back to on-disk JSONL auto-import mode. BdStore
 // surfaces this as an error for reads and writes because the command may have
@@ -506,6 +514,13 @@ func StoreSupportsAtomicTx(store Store) bool {
 // Keep this interface limited to methods needed by current transactional
 // write pairs; do not add Store methods speculatively.
 type Tx interface {
+	// Get reads a bead's current state inside the transaction. Needed by
+	// transactional write pairs that must check a precondition on one bead
+	// before writing another (e.g. molecule.AssignContinuationFenced's
+	// root-lease precondition ahead of the sibling assignment) — without it,
+	// the precondition read would happen outside the transaction and reopen
+	// exactly the externally-visible race Store.Tx exists to close.
+	Get(id string) (Bead, error)
 	Create(b Bead) (Bead, error)
 	Update(id string, opts UpdateOpts) error
 	SetMetadataBatch(id string, kvs map[string]string) error

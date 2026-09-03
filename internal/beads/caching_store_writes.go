@@ -557,6 +557,10 @@ func newCachingStoreTx() *cachingStoreTx {
 	}
 }
 
+func (tx *cachingStoreTx) Get(id string) (Bead, error) {
+	return tx.backing.Get(id)
+}
+
 func (tx *cachingStoreTx) Create(b Bead) (Bead, error) {
 	created, err := tx.backing.Create(b)
 	if err != nil {

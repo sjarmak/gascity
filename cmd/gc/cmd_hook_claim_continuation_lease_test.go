@@ -132,11 +132,15 @@ func TestHookClaimUnwindsOnLeaseAcquireError(t *testing.T) {
 // observes the revoked lease (ContinuationLeaseHeldByOther) and must reject
 // that assignment rather than trusting the stale preflight, while the FIRST
 // sibling (assigned before the revocation) still went through legitimately.
-// The stricter race — revocation landing strictly between the per-sibling
-// write and its post-write re-verification, inside a single
-// AssignContinuationFenced call — is covered at the molecule layer by
-// TestAssignContinuationFenced_RevertsWhenLeaseRevokedBetweenWriteAndReverify,
-// since only that layer controls the interleaving precisely enough to model it.
+// It also pins the caller-side fix for the claim-leak this rejection used to
+// cause: a minted claim that fails sibling preassignment must be unwound
+// (released back, not left stuck to this session) exactly like a denied
+// continuation lease. The stricter race this seam delegates to — revocation
+// landing strictly inside a single AssignContinuationFenced call, between its
+// precondition check and its commit — is covered at the molecule layer by
+// TestAssignContinuationFenced_SiblingAssignmentNeverObservedBeforeCommit and
+// TestAssignContinuationFenced_FailsClosedOnNonAtomicStore, since only that
+// layer controls the transaction boundary precisely enough to model it.
 func TestHookClaimRejectsSiblingAssignmentAfterLeaseRevokedMidLoop(t *testing.T) {
 	const work = `[{"id":"work-1","status":"open","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"grp-1","gc.session_affinity":"require"}}]`
 	rec := &turnBoundClaimRecorder{}
@@ -197,6 +201,12 @@ func TestHookClaimRejectsSiblingAssignmentAfterLeaseRevokedMidLoop(t *testing.T)
 	}
 	if len(rec.claims) != 1 || rec.claims[0] != "work-1" {
 		t.Fatalf("claims = %v, want exactly [work-1]: the initial claim and lease acquisition legitimately succeeded", rec.claims)
+	}
+	if len(rec.releases) != 1 || rec.releases[0] != "work-1" {
+		t.Fatalf("releases = %v, want [work-1]: the minted claim must be given back, not leaked, when sibling preassignment is rejected", rec.releases)
+	}
+	if len(rec.claimReleased) != 1 || rec.claimReleased[0].BeadID != "work-1" || rec.claimReleased[0].Reason != hookClaimReleaseReasonLeaseDenied {
+		t.Fatalf("bead.claim_released events = %+v, want one for work-1 with reason %s", rec.claimReleased, hookClaimReleaseReasonLeaseDenied)
 	}
 	if !strings.Contains(stderr.String(), "continuation lease on root root-1 not held before assigning sib-2") {
 		t.Fatalf("stderr = %q, want a diagnostic naming the rejected sibling", stderr.String())

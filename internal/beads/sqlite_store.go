@@ -1665,6 +1665,10 @@ type sqliteStoreTx struct {
 	tx    *sql.Tx
 }
 
+func (t *sqliteStoreTx) Get(id string) (Bead, error) {
+	return t.store.getTx(t.ctx, t.tx, id)
+}
+
 // Create fences the same way the standalone Create does. A transaction is not
 // an exemption: the bead it writes is as resident, and as unreachable by an
 // id-shaped lookup of the namespace it lands in, as one written outside a
