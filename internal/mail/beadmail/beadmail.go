@@ -679,23 +679,27 @@ func beadmailError(operation string, err error) error {
 // only" visibility the list views (Inbox/Check/All/Count) already enforce — even
 // though Archive can still delete one when it is called explicitly.
 //
-// Retention-swept read mail is NOT user-removed and must be excluded here. The
-// always-on nudge-mail watchdog closes read mail past its TTL (stamping
-// [RetentionSweepCloseReason]) and PurgeReadMessageWisps deletes it later;
-// between close and purge the message is only system-aged. Gating on bare
-// Status!="open" turned every retention-swept read message into a not-found the
-// moment the sweep ran — an always-on regression for any caller that holds a
-// message ID and re-reads or replies to it after the TTL (a long-latency human
-// approval reply, a persisted molecule handle). Excluding the retention reason
-// preserves that pre-sweep addressability while still hiding genuinely
+// Retention-swept mail (read or unread) is NOT user-removed and must be
+// excluded here. The always-on nudge-mail watchdog closes read mail past its
+// TTL (stamping [RetentionSweepCloseReason]) and PurgeReadMessageWisps deletes
+// it later; it also closes unread mail past its own, longer TTL (stamping
+// [UnreadRetentionSweepCloseReason]) and PurgeUnreadSweptMessageWisps deletes
+// that later. Between close and purge the message is only system-aged. Gating
+// on bare Status!="open" turned every retention-swept message into a not-found
+// the moment the sweep ran — an always-on regression for any caller that holds
+// a message ID and re-reads or replies to it after the TTL (a long-latency
+// human approval reply, a persisted molecule handle). Excluding both retention
+// reasons preserves that pre-sweep addressability while still hiding genuinely
 // user-removed beads.
 func isRemovedMessageBead(b beads.Bead) bool {
 	if b.Type != messageBeadType || b.Status == "open" {
 		return false
 	}
 	// Retention-swept mail is system-aged, not user-removed; it stays
-	// addressable until PurgeReadMessageWisps deletes it.
-	return b.Metadata["close_reason"] != RetentionSweepCloseReason
+	// addressable until purge (PurgeReadMessageWisps /
+	// PurgeUnreadSweptMessageWisps) deletes it.
+	reason := b.Metadata["close_reason"]
+	return reason != RetentionSweepCloseReason && reason != UnreadRetentionSweepCloseReason
 }
 
 // deriveReplyTitle returns a non-empty title for a reply message. Callers
@@ -986,6 +990,155 @@ func PurgeReadMessageWisps(store beads.MailStore, cutoff time.Time) (int, error)
 			continue
 		}
 		if current.Metadata[mail.ReadMetadataKey] != "true" {
+			continue
+		}
+		if err := deleteMessageWispBead(store.Store, entry.ID); err != nil {
+			deleteErr = errors.Join(deleteErr, fmt.Errorf("deleting expired bead %q: %w", entry.ID, err))
+			continue
+		}
+		purged++
+	}
+	return purged, deleteErr
+}
+
+// unreadMessagesBefore lists open message beads created before `before`,
+// oldest first, that do NOT carry the "read" label — the candidate set for the
+// unread-mail retention sweep (see [UnreadRetentionSweepCloseReason]).
+//
+// Unlike readMessagesBefore, this deliberately omits both Label and Limit at
+// the query layer: beads.ListQuery has no "label absent" filter, so the
+// "unread" predicate can only be applied client-side after the list comes
+// back. Pushing Limit into the query too would silently truncate the
+// candidate set by CreatedAt order before that client-side filter ever runs,
+// undercounting or missing eligible beads. limit is instead enforced by the
+// caller's loop, exactly like SweepReadMessagesBefore's loop already does
+// defensively for its own (server-side-limited) query.
+func unreadMessagesBefore(store beads.Store, before time.Time) ([]beads.Bead, error) {
+	return store.List(beads.ListQuery{
+		Type:          messageBeadType,
+		CreatedBefore: before,
+		Sort:          beads.SortCreatedAsc,
+		TierMode:      beads.TierBoth,
+	})
+}
+
+// UnreadRetentionSweepCloseReason is the close_reason the unread-mail
+// retention sweep stamps on a message bead before closing it. It is
+// deliberately distinct from [RetentionSweepCloseReason]: a message closed
+// under this reason was never read, so conflating the two would let a
+// swept-unread backlog masquerade as attended-to mail. isRemovedMessageBead
+// excepts this reason the same way it excepts RetentionSweepCloseReason,
+// keeping a swept-unread bead addressable by direct ID until
+// PurgeUnreadSweptMessageWisps deletes it. The 20-character floor satisfies
+// validation.on-close=error.
+const UnreadRetentionSweepCloseReason = "mail gc-swept: unread mail bead past gc unread retention window"
+
+// SweepUnreadMessagesBefore closes unread message beads created before
+// cutoff, oldest first, stamping closeReason as "close_reason" metadata on
+// each bead before closing it. It is the unread-mail counterpart to
+// SweepReadMessagesBefore: display (Provider.Check / Provider.Read) never
+// marks a message read on the recipient's behalf, so an unread backlog is
+// never picked up by the read-mail sweep and would otherwise grow without
+// bound. This sweep ages unread mail out on its own, longer TTL instead,
+// closing with a reason distinct from the read-mail sweep's so a swept-unread
+// bead is never mistaken for one a seat actually read and handled.
+//
+// limit caps the number of beads closed (pass 0 for no cap). Errors are split
+// by severity so callers can preserve fatal-vs-recoverable handling: listErr
+// is the fatal candidate-listing failure (no beads were swept), while
+// closeErrs holds the per-bead metadata/close failures that do not abort the
+// sweep. Returns the number of beads closed.
+func SweepUnreadMessagesBefore(store beads.MailStore, cutoff time.Time, limit int, closeReason string) (closed int, closeErrs []error, listErr error) {
+	candidates, err := unreadMessagesBefore(store.Store, cutoff)
+	if err != nil {
+		return 0, nil, err
+	}
+	for _, b := range candidates {
+		if limit > 0 && closed >= limit {
+			break
+		}
+		if b.Status != "open" || hasLabel(b.Labels, "read") {
+			continue
+		}
+		if err := store.SetMetadata(b.ID, "close_reason", closeReason); err != nil {
+			closeErrs = append(closeErrs, fmt.Errorf("mail %s: set close_reason: %w", b.ID, err))
+			continue
+		}
+		if err := store.Close(b.ID); err != nil {
+			closeErrs = append(closeErrs, fmt.Errorf("mail %s: close: %w", b.ID, err))
+			continue
+		}
+		closed++
+	}
+	return closed, closeErrs, nil
+}
+
+// CountUnreadMessagesBefore returns how many unread message beads
+// SweepUnreadMessagesBefore would close for the same cutoff and limit,
+// without mutating any bead. It is the dry-run twin of the sweep and shares
+// its candidate query and limit semantics so the two stay in lockstep.
+func CountUnreadMessagesBefore(store beads.MailStore, cutoff time.Time, limit int) (int, error) {
+	candidates, err := unreadMessagesBefore(store.Store, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, b := range candidates {
+		if limit > 0 && count >= limit {
+			break
+		}
+		if b.Status != "open" || hasLabel(b.Labels, "read") {
+			continue
+		}
+		count++
+	}
+	return count, nil
+}
+
+// PurgeUnreadSweptMessageWisps deletes closed unread-swept message beads in
+// the wisp tier created before cutoff — the purge counterpart to
+// SweepUnreadMessagesBefore, mirroring PurgeReadMessageWisps for the
+// unread-mail arm. Unlike PurgeReadMessageWisps, whose candidate set keys on
+// [mail.ReadMetadataKey] (an unread-swept bead never carries that metadata),
+// this keys on close_reason == [UnreadRetentionSweepCloseReason]: the sweep's
+// own marker for a message it closed without it ever being read. Without this
+// arm, unread-swept beads would sit closed forever — trading an unbounded open
+// backlog for an unbounded closed one, which defeats the point of sweeping
+// them in the first place.
+//
+// Each candidate is re-verified against the live store immediately before
+// delete (see PurgeReadMessageWisps) so a concurrent unarchive or delete
+// inside a caching window is never acted on from a stale snapshot. Beads with
+// a zero or not-yet-past CreatedAt are skipped. Per-bead delete failures are
+// joined and returned without aborting the sweep; returns the number of beads
+// purged.
+func PurgeUnreadSweptMessageWisps(store beads.MailStore, cutoff time.Time) (int, error) {
+	entries, err := store.List(beads.ListQuery{
+		Type:          messageBeadType,
+		Metadata:      map[string]string{"close_reason": UnreadRetentionSweepCloseReason},
+		IncludeClosed: true,
+		TierMode:      beads.TierWisps,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("listing unread-swept message wisps: %w", err)
+	}
+	purged := 0
+	var deleteErr error
+	live := beads.HandlesFor(store.Store).Live
+	for _, entry := range entries {
+		if entry.CreatedAt.IsZero() || !entry.CreatedAt.Before(cutoff) {
+			continue
+		}
+		current, err := live.Get(entry.ID)
+		if errors.Is(err, beads.ErrNotFound) {
+			// Deleted by a concurrent path inside the cache window — nothing to do.
+			continue
+		}
+		if err != nil {
+			deleteErr = errors.Join(deleteErr, fmt.Errorf("live re-verify of bead %q before delete: %w", entry.ID, err))
+			continue
+		}
+		if current.Status != "closed" || current.Metadata["close_reason"] != UnreadRetentionSweepCloseReason {
 			continue
 		}
 		if err := deleteMessageWispBead(store.Store, entry.ID); err != nil {

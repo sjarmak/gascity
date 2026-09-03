@@ -2761,7 +2761,7 @@ gc order
 | [gc order list](#gc-order-list) | List available orders |
 | [gc order run](#gc-order-run) | Execute an order manually |
 | [gc order show](#gc-order-show) | Show details of an order |
-| [gc order sweep-nudge-mail](#gc-order-sweep-nudge-mail) | Close stale delivered nudge beads and read mail beads |
+| [gc order sweep-nudge-mail](#gc-order-sweep-nudge-mail) | Close stale delivered nudge beads, read mail beads, and unread mail beads |
 | [gc order sweep-tracking](#gc-order-sweep-tracking) | Close stale and prune closed order-tracking beads |
 
 ## gc order check
@@ -2860,10 +2860,13 @@ gc order show <name> [flags]
 
 ## gc order sweep-nudge-mail
 
-Close stale delivered nudge beads and read mail beads.
+Close stale delivered nudge beads, read mail beads, and unread mail beads.
 
 Nudge beads that are past --nudge-ttl and not in the live nudge queue are
-closed. Read mail beads past --mail-ttl are closed. A budget cap of 50 closes
+closed. Read mail beads past --mail-ttl are closed. Unread mail beads past
+--unread-mail-ttl are also closed, on their own longer TTL and with a close
+reason distinct from read mail's, so a swept-unread bead is never mistaken for
+one a seat actually read. A budget cap of 50 closes
 per invocation prevents runaway sweeps under load.
 
 Use --dry-run to log what would be closed without making any changes.
@@ -2879,6 +2882,7 @@ gc order sweep-nudge-mail [flags]
 | `--mail-ttl` | duration | `1h0m0s` | min age before a read mail bead is GC'd |
 | `--nudge-ttl` | duration | `10m0s` | min age before a delivered nudge bead is GC'd |
 | `--quiet` | bool |  | suppress success output |
+| `--unread-mail-ttl` | duration | `24h0m0s` | min age before an unread mail bead is GC'd |
 
 ## gc order sweep-tracking
 

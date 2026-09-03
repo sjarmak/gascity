@@ -223,6 +223,21 @@ func (m *memoryWispGC) runGC(graphStore beads.GraphStore, mailStore beads.MailSt
 		if mailPurged > 0 {
 			log.Printf("wisp gc: purged %d read message wisps (retention_ttl=%s)", mailPurged, gcRetentionTTLString(m.mailRetentionTTL))
 		}
+
+		// The unread-swept purge arm reuses the same mailRetentionTTL: a message
+		// the unread-mail sweep closed (stamping UnreadRetentionSweepCloseReason)
+		// is, once closed, exactly as collectible as a read-swept message — there
+		// is no separate config surface for it. Without this arm, unread-swept
+		// beads would sit closed forever, trading an unbounded open backlog for
+		// an unbounded closed one.
+		unreadPurged, unreadErr := beadmail.PurgeUnreadSweptMessageWisps(mailStore, now.Add(-m.mailRetentionTTL))
+		purged += unreadPurged
+		if unreadErr != nil {
+			deleteErr = errors.Join(deleteErr, unreadErr)
+		}
+		if unreadPurged > 0 {
+			log.Printf("wisp gc: purged %d unread-swept message wisps (retention_ttl=%s)", unreadPurged, gcRetentionTTLString(m.mailRetentionTTL))
+		}
 	}
 
 	return purged, deleteErr
