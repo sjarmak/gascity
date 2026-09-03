@@ -264,6 +264,16 @@ type hookClaimOps struct {
 	// siblings are only vacuumed onto a session that legitimately holds the
 	// root's lease.
 	AcquireContinuationLease hookAcquireContinuationLeaseFunc
+	// AssignContinuationFenced re-validates sessionID's continuation lease on
+	// rootID/group and assigns siblingID under it as ONE fenced operation
+	// (see molecule.AssignContinuationFenced): the lease renewal, the sibling
+	// write, and a post-write re-verification that the exact holder/group/
+	// generation this call was authorized under still held throughout. It
+	// replaces the separate AcquireContinuationLease+AssignContinuation pair
+	// for lease-required sibling preassignment — that pair leaves a window
+	// between the renewal's read and the write's commit for a reconciler to
+	// revoke the lease, which this seam closes.
+	AssignContinuationFenced hookAssignContinuationFencedFunc
 	// ContinuationLeaseHolder is a plain read of a workflow root's current
 	// continuation-lease holder, used ONLY for root-aware claim-candidate
 	// precedence (see reorderHookClaimCandidatesForRootAffinity) — it never
@@ -321,6 +331,10 @@ type (
 	// continuation lease for sessionID, fenced on group. See
 	// molecule.AcquireContinuationLease.
 	hookAcquireContinuationLeaseFunc func(ctx context.Context, dir string, env []string, rootID, group, sessionID string) (molecule.ContinuationLeaseOutcome, error)
+	// hookAssignContinuationFencedFunc re-validates sessionID's continuation
+	// lease on rootID/group and assigns siblingID under it in one fenced
+	// operation. See molecule.AssignContinuationFenced.
+	hookAssignContinuationFencedFunc func(ctx context.Context, dir string, env []string, rootID, group, sessionID, siblingID string) (molecule.ContinuationLeaseOutcome, error)
 	// hookContinuationLeaseHolderFunc is a plain, non-mutating read of rootID's
 	// current continuation-lease holder session ID ("" if unheld). See
 	// molecule.ContinuationLeaseHolder.
@@ -567,6 +581,9 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.AcquireContinuationLease == nil {
 		ops.AcquireContinuationLease = hookAcquireContinuationLeaseWithBdStore
+	}
+	if ops.AssignContinuationFenced == nil {
+		ops.AssignContinuationFenced = hookAssignContinuationFencedWithBdStore
 	}
 	if ops.ContinuationLeaseHolder == nil {
 		ops.ContinuationLeaseHolder = hookContinuationLeaseHolderWithBdStore
@@ -1478,21 +1495,19 @@ func acquireHookContinuationLease(bead beads.Bead, opts hookClaimOptions, ops ho
 // preassignHookContinuationGroup pins this session's OPEN, unassigned
 // siblings within bead's continuation group so the affinity guarantee
 // acquireHookContinuationLease established for bead extends to the rest of
-// the group. Each per-sibling assignment is an unconditional store.Update
-// (hookAssignContinuationWithBdStore carries no lease precondition of its
-// own), so on an affinity-required root this function must re-validate lease
-// authority immediately before every single assignment rather than trusting
-// the ONE acquisition acquireHookContinuationLease performed for bead
-// earlier in the same claim: a reconciler can advance or release the lease
-// at any point during this loop (e.g. recovering an unrelated stale sibling
-// mid-iteration), and a caller-side preflight from before the loop started
-// is not destination-validated authority for a write happening now. Renewing
-// via ops.AcquireContinuationLease is itself the CAS-fenced re-validation —
-// it only returns Acquired when this session still legitimately holds (or
-// can still legitimately renew) the root/group/generation triple — so a
-// revoked lease fails the very next renewal and the loop stops (fail
-// closed) instead of continuing to assign siblings under authority that no
-// longer exists.
+// the group. On an affinity-required root, each sibling assignment goes
+// through ops.AssignContinuationFenced rather than a caller-side lease
+// renewal followed by a separate, unconditional store.Update: a
+// renew-then-write pair leaves a window between the renewal's read and the
+// write's commit for a reconciler to revoke or advance the lease (e.g.
+// recovering an unrelated stale sibling mid-iteration), after which the
+// write would still land under authority that no longer exists.
+// AssignContinuationFenced closes that window by comparing the root's exact
+// holder/group/generation immediately before and immediately after the
+// sibling write, reverting the write if either changed (see
+// molecule.AssignContinuationFenced) — so a lease revoked at any point up to
+// and including the write itself fails that sibling closed instead of only
+// failing the next one.
 func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string) ([]string, error) {
 	rootID := strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
 	group := strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey])
@@ -1520,13 +1535,15 @@ func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops 
 			if pinAssignee == "" {
 				return assigned, fmt.Errorf("continuation lease for %s requires a session or assignee identity", rootID)
 			}
-			outcome, err := ops.AcquireContinuationLease(ctx, dir, opts.Env, rootID, group, pinAssignee)
+			outcome, err := ops.AssignContinuationFenced(ctx, dir, opts.Env, rootID, group, pinAssignee, sibling.ID)
 			if err != nil {
-				return assigned, fmt.Errorf("revalidating continuation lease on root %s before assigning %s: %w", rootID, sibling.ID, err)
+				return assigned, fmt.Errorf("assigning %s under continuation lease on root %s: %w", sibling.ID, rootID, err)
 			}
 			if outcome != molecule.ContinuationLeaseAcquired {
 				return assigned, fmt.Errorf("continuation lease on root %s not held before assigning %s: %s", rootID, sibling.ID, outcome)
 			}
+			assigned = append(assigned, sibling.ID)
+			continue
 		}
 		if err := ops.AssignContinuation(ctx, dir, opts.Env, sibling.ID, pinAssignee); err != nil {
 			return assigned, fmt.Errorf("assigning %s: %w", sibling.ID, err)
@@ -2853,6 +2870,17 @@ func hookAcquireContinuationLeaseWithBdStore(_ context.Context, dir string, env 
 	store := hookClaimBdStore(dir, env, sessionID)
 	_, outcome, err := molecule.AcquireContinuationLease(store, rootID, group, sessionID)
 	return outcome, err
+}
+
+// hookAssignContinuationFencedWithBdStore is the default
+// hookAssignContinuationFencedFunc: a single *beads.BdStore bound to
+// sessionID backs the whole molecule.AssignContinuationFenced sequence (the
+// root lease CAS, the sibling write, and the post-write root re-read), so the
+// re-read observes this store's own fresh state rather than a second,
+// independently-opened connection's view.
+func hookAssignContinuationFencedWithBdStore(_ context.Context, dir string, env []string, rootID, group, sessionID, siblingID string) (molecule.ContinuationLeaseOutcome, error) {
+	store := hookClaimBdStore(dir, env, sessionID)
+	return molecule.AssignContinuationFenced(store, rootID, group, sessionID, siblingID)
 }
 
 // hookContinuationLeaseHolderWithBdStore is the default

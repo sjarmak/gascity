@@ -404,3 +404,112 @@ func mustGetBead(t *testing.T, store beads.Store, id string) beads.Bead {
 	}
 	return b
 }
+
+func mustCreateOpenSibling(t *testing.T, store *beads.MemStore) beads.Bead {
+	t.Helper()
+	b, err := store.Create(beads.Bead{Title: "sibling", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatalf("create sibling bead: %v", err)
+	}
+	return b
+}
+
+func TestAssignContinuationFenced_HappyPath(t *testing.T) {
+	store := beads.NewMemStore()
+	root := mustCreateContinuationLeaseRoot(t, store)
+	sibling := mustCreateOpenSibling(t, store)
+
+	outcome, err := AssignContinuationFenced(store, root.ID, "cg-1", "session-alpha", sibling.ID)
+	if err != nil {
+		t.Fatalf("AssignContinuationFenced: %v", err)
+	}
+	if outcome != ContinuationLeaseAcquired {
+		t.Fatalf("outcome = %q, want %q", outcome, ContinuationLeaseAcquired)
+	}
+	if got := mustGetBead(t, store, sibling.ID).Assignee; got != "session-alpha" {
+		t.Fatalf("sibling assignee = %q, want session-alpha", got)
+	}
+}
+
+// TestAssignContinuationFenced_NotAuthorized covers the case where the lease
+// is already held by a different live session at call time: the sibling must
+// never be touched at all.
+func TestAssignContinuationFenced_NotAuthorized(t *testing.T) {
+	store := beads.NewMemStore()
+	root := mustCreateContinuationLeaseRoot(t, store)
+	sibling := mustCreateOpenSibling(t, store)
+	if _, outcome, err := AcquireContinuationLease(store, root.ID, "cg-1", "session-alpha"); err != nil || outcome != ContinuationLeaseAcquired {
+		t.Fatalf("initial acquire: outcome=%q err=%v", outcome, err)
+	}
+
+	outcome, err := AssignContinuationFenced(store, root.ID, "cg-1", "session-beta", sibling.ID)
+	if err != nil {
+		t.Fatalf("AssignContinuationFenced: %v", err)
+	}
+	if outcome != ContinuationLeaseHeldByOther {
+		t.Fatalf("outcome = %q, want %q", outcome, ContinuationLeaseHeldByOther)
+	}
+	if got := mustGetBead(t, store, sibling.ID).Assignee; got != "" {
+		t.Fatalf("sibling assignee = %q, want untouched (empty)", got)
+	}
+}
+
+// interposeAfterUpdateStore wraps a *beads.MemStore and runs `after` the
+// instant a targeted Update commits, before control returns to the caller.
+// Embedding the concrete *beads.MemStore (not the beads.Store interface)
+// promotes every other method — including UpdateIfMatch — straight through,
+// so this wrapper still satisfies beads.ConditionalWriter for the revert path
+// AssignContinuationFenced falls back to.
+type interposeAfterUpdateStore struct {
+	*beads.MemStore
+	targetID string
+	after    func()
+}
+
+func (s *interposeAfterUpdateStore) Update(id string, opts beads.UpdateOpts) error {
+	if err := s.MemStore.Update(id, opts); err != nil {
+		return err
+	}
+	if id == s.targetID && s.after != nil {
+		s.after()
+	}
+	return nil
+}
+
+// TestAssignContinuationFenced_RevertsWhenLeaseRevokedBetweenWriteAndReverify
+// pins the exact race the gc-ue0tsw exact-head review demanded proof against:
+// revocation landing strictly BETWEEN the sibling write committing and
+// AssignContinuationFenced's own post-write re-read of the root — a window
+// no caller-side "renew, then write" pair can ever observe from outside,
+// because it lives entirely inside what is meant to be one fenced operation.
+// A reconciler revoking mid-write must cause the sibling assignment to be
+// reverted and the call to fail closed, not leave the sibling durably
+// assigned under authority that stopped holding before the operation
+// finished.
+func TestAssignContinuationFenced_RevertsWhenLeaseRevokedBetweenWriteAndReverify(t *testing.T) {
+	base := beads.NewMemStore()
+	root := mustCreateContinuationLeaseRoot(t, base)
+	sibling := mustCreateOpenSibling(t, base)
+
+	store := &interposeAfterUpdateStore{MemStore: base, targetID: sibling.ID}
+	store.after = func() {
+		// Simulate a reconciler revoking this session's lease at the one
+		// instant a caller-side check could never catch: after the sibling
+		// write has already committed, before AssignContinuationFenced reads
+		// the root back to verify authority held throughout.
+		if _, outcome, err := ReleaseContinuationLease(base, root.ID, ""); err != nil || outcome != ContinuationLeaseReleased {
+			t.Fatalf("simulated mid-write revocation: outcome=%q err=%v", outcome, err)
+		}
+	}
+
+	outcome, err := AssignContinuationFenced(store, root.ID, "cg-1", "session-alpha", sibling.ID)
+	if err == nil {
+		t.Fatal("AssignContinuationFenced: want an error when lease authority moves mid-write, got nil")
+	}
+	if outcome != ContinuationLeaseStale {
+		t.Fatalf("outcome = %q, want %q", outcome, ContinuationLeaseStale)
+	}
+	if got := mustGetBead(t, base, sibling.ID).Assignee; got != "" {
+		t.Fatalf("sibling assignee = %q, want reverted to empty: a lease revoked mid-write must not leave the sibling assigned", got)
+	}
+}

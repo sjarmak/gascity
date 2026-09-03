@@ -214,6 +214,104 @@ func ReleaseContinuationLease(store beads.Store, rootID, requireHolder string) (
 	}
 }
 
+// AssignContinuationFenced is the single fenced primitive
+// preassignHookContinuationGroup uses per sibling on a session_affinity=require
+// root. A caller-side AcquireContinuationLease renewal followed by a separate,
+// unconditional sibling write leaves a window between the renewal's read and
+// the write's commit for a reconciler to revoke or advance the root's lease,
+// after which the write still lands under authority that no longer holds.
+// bd's own compare-and-swap (ConditionalWriter.UpdateIfMatch) is single-bead
+// only — there is no cross-bead transaction that could check the root's
+// lease state and write the sibling in one physical operation (see
+// ClaimExact's single-bead contract) — so this closes the gap with the
+// primitive the codebase actually has: beadmeta.ClaimGenerationMetadataKey
+// only ever increases (nextClaimGeneration never resets or wraps), so an
+// UNCHANGED (holder, group, generation) reading taken immediately before and
+// immediately after the sibling write is proof, not a heuristic, that no
+// acquire/renew/release landed on the root while the write was in flight. A
+// changed reading means authority moved mid-write: this function reverts the
+// sibling assignment (fenced on the sibling's own revision, re-read fresh, so
+// a write that legitimately lands on the sibling afterward — a different,
+// now-authorized session claiming it, say — is never clobbered) and reports
+// ContinuationLeaseStale instead of leaving the sibling durably assigned
+// under authority that did not hold for the write's whole duration.
+func AssignContinuationFenced(store beads.Store, rootID, group, sessionID, siblingID string) (ContinuationLeaseOutcome, error) {
+	rootID = strings.TrimSpace(rootID)
+	group = strings.TrimSpace(group)
+	sessionID = strings.TrimSpace(sessionID)
+	siblingID = strings.TrimSpace(siblingID)
+	if rootID == "" || group == "" || sessionID == "" || siblingID == "" {
+		return "", fmt.Errorf("assign continuation fenced: rootID, group, sessionID, and siblingID are all required (got rootID=%q group=%q sessionID=%q siblingID=%q)", rootID, group, sessionID, siblingID)
+	}
+
+	authorized, outcome, err := AcquireContinuationLease(store, rootID, group, sessionID)
+	if err != nil {
+		return "", err
+	}
+	if outcome != ContinuationLeaseAcquired {
+		return outcome, nil
+	}
+	wantSession := authorized.Metadata[beadmeta.ContinuationLeaseSessionMetadataKey]
+	wantGroup := authorized.Metadata[beadmeta.ContinuationLeaseGroupMetadataKey]
+	wantGeneration := authorized.Metadata[beadmeta.ClaimGenerationMetadataKey]
+
+	assignee := sessionID
+	if err := store.Update(siblingID, beads.UpdateOpts{Assignee: &assignee}); err != nil {
+		return "", fmt.Errorf("assign continuation fenced: assigning %q: %w", siblingID, err)
+	}
+
+	revalidated, err := store.Get(rootID)
+	if err != nil {
+		return "", fmt.Errorf("assign continuation fenced: re-reading root %q after assigning %q: %w", rootID, siblingID, err)
+	}
+	if revalidated.Metadata[beadmeta.ContinuationLeaseSessionMetadataKey] == wantSession &&
+		revalidated.Metadata[beadmeta.ContinuationLeaseGroupMetadataKey] == wantGroup &&
+		revalidated.Metadata[beadmeta.ClaimGenerationMetadataKey] == wantGeneration {
+		return ContinuationLeaseAcquired, nil
+	}
+
+	if revertErr := revertContinuationAssignment(store, siblingID, sessionID); revertErr != nil {
+		return "", fmt.Errorf("continuation lease on root %s changed while assigning %s (was holder=%s group=%s generation=%s); reverting the sibling assignment failed: %w", rootID, siblingID, wantSession, wantGroup, wantGeneration, revertErr)
+	}
+	return ContinuationLeaseStale, fmt.Errorf("continuation lease on root %s changed while assigning %s (was holder=%s group=%s generation=%s); assignment reverted", rootID, siblingID, wantSession, wantGroup, wantGeneration)
+}
+
+// revertContinuationAssignment undoes AssignContinuationFenced's sibling write
+// after the root's lease authority proved to have moved mid-write. It is
+// fenced on the sibling's own revision — re-read fresh, right before the
+// revert — so a write that lands on the sibling between the failed
+// re-verification and this call (a different, now-authorized session
+// claiming it, say) is left alone rather than clobbered. A store with no
+// conditional-write support cannot safely revert at all — an unconditional
+// write here could clobber exactly the write this function exists to
+// protect — so it fails closed with beads.ErrConditionalWriteUnsupported
+// rather than attempting one.
+func revertContinuationAssignment(store beads.Store, siblingID, expectedAssignee string) error {
+	writer, ok := beads.ConditionalWriterFor(store)
+	if !ok {
+		return fmt.Errorf("revert continuation assignment %q: %w", siblingID, beads.ErrConditionalWriteUnsupported)
+	}
+	current, err := store.Get(siblingID)
+	if err != nil {
+		return fmt.Errorf("revert continuation assignment %q: %w", siblingID, err)
+	}
+	if strings.TrimSpace(current.Assignee) != expectedAssignee {
+		// Someone else already moved the sibling on; nothing of ours remains
+		// to revert.
+		return nil
+	}
+	empty := ""
+	if err := writer.UpdateIfMatch(siblingID, current.Revision, beads.UpdateOpts{Assignee: &empty}); err != nil {
+		if beads.IsPreconditionFailed(err) {
+			// The sibling moved again between our re-read and this CAS;
+			// whatever is there now is not ours to revert.
+			return nil
+		}
+		return fmt.Errorf("revert continuation assignment %q: %w", siblingID, err)
+	}
+	return nil
+}
+
 // leaseHolderWant returns the ClaimExactPreconditions.MetadataEquals value
 // that pins a lease metadata field (holder or group) to exactly current —
 // nil (meaning "must be absent or empty") when current is empty, otherwise a
