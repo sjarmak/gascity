@@ -491,20 +491,39 @@ func IsConditionalWriteUnsupported(err error) bool {
 }
 
 // AtomicTxStore is implemented by stores whose Tx commits the whole callback
-// atomically: when the callback returns an error, none of its writes persist.
-// Stores that do not implement it (or whose AtomicTx returns false) may leave
-// partial writes after a failed Tx — see the Store.Tx contract — so callers that
-// need an all-or-nothing multi-write swap must either require such a store or
-// sequence their writes so a partial failure stays recoverable on non-atomic
-// backends.
+// atomically AND isolates it: when the callback returns an error, none of its
+// writes persist, and while the callback is still running, no reader outside
+// the transaction — not even one using the same store handle — may observe
+// any write the callback has made. Both halves are required: rollback alone
+// is not enough. A store that applies writes live and only unwinds them on
+// error satisfies rollback but not isolation, and callers that gate a
+// stale-precondition authority check on this capability (e.g.
+// molecule.AssignContinuationFenced) depend on the isolation half to close
+// the exact stale-snapshot window the check exists to prevent. Only a
+// snapshot's-worth of readers is required to be blind to in-flight writes;
+// Tx's own callback naturally sees its own writes via the Tx it was handed.
+// Stores that do not implement this interface (or whose AtomicTx returns
+// false) may leave partial writes after a failed Tx and may expose
+// in-flight writes before commit — see the Store.Tx contract — so callers
+// that need an all-or-nothing, externally-invisible-until-commit multi-write
+// swap must either require such a store or sequence their writes so a
+// partial or prematurely-visible write stays recoverable on non-conforming
+// backends. Every store returning true here needs conformance coverage for
+// both halves (rollback AND external invisibility until commit), including
+// wrappers that merely delegate AtomicTx() to a backing store — a delegating
+// wrapper's isolation depends entirely on whether it also forwards Tx
+// unmodified, so confirm that, not just the delegated boolean.
 type AtomicTxStore interface {
-	// AtomicTx reports whether Store.Tx rolls the whole callback back on error.
+	// AtomicTx reports whether Store.Tx rolls the whole callback back on
+	// error AND keeps its writes invisible to external readers until commit.
 	AtomicTx() bool
 }
 
-// StoreSupportsAtomicTx reports whether store's Tx provides atomic rollback. It
-// returns false for any store that does not implement AtomicTxStore, matching
-// the conservative Store.Tx contract for backends without native transactions.
+// StoreSupportsAtomicTx reports whether store's Tx provides atomic rollback
+// plus transaction-local isolation (external invisibility until commit) — see
+// AtomicTxStore. It returns false for any store that does not implement
+// AtomicTxStore, matching the conservative Store.Tx contract for backends
+// without native transactions.
 func StoreSupportsAtomicTx(store Store) bool {
 	a, ok := store.(AtomicTxStore)
 	return ok && a.AtomicTx()
