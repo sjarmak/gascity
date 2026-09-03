@@ -645,8 +645,14 @@ func cacheEventPatchMatchesBead(current, patch Bead, fields map[string]json.RawM
 	return !cacheEventConflictsCached(current, depsFromBeadFields(current), true, patch, fields)
 }
 
+// cacheRecencyWindow bounds how long a cached row's last confirmation against
+// backing may be trusted without a fresh check. recentLocalMutation uses it
+// for the reconcile local-truth fence; recentlyConfirmedLocked (caching_store.go)
+// uses the same window for the idempotence short-circuit fence (dr-1tvd F2).
+const cacheRecencyWindow = 5 * time.Second
+
 func recentLocalMutation(mutatedAt time.Time, now time.Time) bool {
-	return !mutatedAt.IsZero() && now.Sub(mutatedAt) <= 5*time.Second
+	return !mutatedAt.IsZero() && now.Sub(mutatedAt) <= cacheRecencyWindow
 }
 
 func (c *CachingStore) recentLocalBeadConflictLocked(id string, fresh Bead, now time.Time, skipLabels bool) (Bead, bool) {
@@ -663,7 +669,7 @@ func (c *CachingStore) recentLocalBeadConflictLocked(id string, fresh Bead, now 
 	return cloneBead(current), true
 }
 
-func (c *CachingStore) carryRecentLocalMutationLocked(id string, nextDirty map[string]struct{}, nextBeadSeq map[string]uint64, nextLocalBeadAt map[string]time.Time) {
+func (c *CachingStore) carryRecentLocalMutationLocked(id string, nextDirty map[string]struct{}, nextBeadSeq map[string]uint64, nextLocalBeadAt map[string]time.Time, nextConfirmedAt map[string]time.Time) {
 	if _, dirty := c.dirty[id]; dirty {
 		nextDirty[id] = struct{}{}
 	}
@@ -672,6 +678,9 @@ func (c *CachingStore) carryRecentLocalMutationLocked(id string, nextDirty map[s
 	}
 	if mutatedAt, ok := c.localBeadAt[id]; ok {
 		nextLocalBeadAt[id] = mutatedAt
+	}
+	if confirmedAt, ok := c.confirmedAt[id]; ok {
+		nextConfirmedAt[id] = confirmedAt
 	}
 }
 

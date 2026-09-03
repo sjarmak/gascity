@@ -86,6 +86,7 @@ func mountEndState(end mergeEndState, truth *MemStore) *CachingStore {
 		dirty:        cloneDirty(end.dirty),
 		beadSeq:      cloneU64Map(end.beadSeq),
 		localBeadAt:  cloneTimeMap(end.localBeadAt),
+		confirmedAt:  cloneTimeMap(end.confirmedAt),
 		deletedSeq:   cloneU64Map(end.deletedSeq),
 		state:        cacheLive,
 	}

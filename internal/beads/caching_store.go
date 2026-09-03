@@ -29,13 +29,25 @@ type CachingStore struct {
 	backing  Store // runtime: usually *BdStore; tests and projections may use any Store
 	idPrefix string
 
-	mu                  sync.RWMutex
-	beads               map[string]Bead
-	deps                map[string][]Dep
-	depsComplete        bool
-	dirty               map[string]struct{}
-	beadSeq             map[string]uint64
-	localBeadAt         map[string]time.Time
+	mu           sync.RWMutex
+	beads        map[string]Bead
+	deps         map[string][]Dep
+	depsComplete bool
+	dirty        map[string]struct{}
+	beadSeq      map[string]uint64
+	localBeadAt  map[string]time.Time
+	// confirmedAt records, per bead, the last time absorbFreshLocked installed
+	// a row with clearDirty set — i.e. a row backed by a real read or write
+	// against the backing store (a local write-through, a Prime scan, or a
+	// reconcile absorb), as opposed to a row only ever asserted in-memory.
+	// The idempotence short-circuits in caching_store_writes.go gate on
+	// recentlyConfirmedLocked so they never trust a cached row that has not
+	// been confirmed against backing within the window (dr-1tvd F2): an
+	// unbounded-trust short-circuit acks a write with zero backing IO no
+	// matter how stale the cached row is. Unlike localBeadAt (which only
+	// tracks THIS process's own writes, for the reconcile local-truth fence),
+	// confirmedAt tracks any confirmed-fresh install — deliberately broader.
+	confirmedAt         map[string]time.Time
 	deletedSeq          map[string]uint64
 	state               cacheState
 	lastFreshAt         time.Time
@@ -322,6 +334,7 @@ func newCachingStore(backing Store, idPrefix string, onChange func(eventType, be
 		dirty:               make(map[string]struct{}),
 		beadSeq:             make(map[string]uint64),
 		localBeadAt:         make(map[string]time.Time),
+		confirmedAt:         make(map[string]time.Time),
 		deletedSeq:          make(map[string]uint64),
 		readyProjectionLost: make(map[string]struct{}),
 		problemLog:          make(map[string]cacheProblemLogState),
@@ -501,6 +514,7 @@ func (c *CachingStore) absorbFreshLocked(id string, bead Bead, now time.Time, op
 	}
 	if opts.clearDirty {
 		delete(c.dirty, id)
+		c.confirmedAt[id] = now
 	}
 	delete(c.deletedSeq, id)
 	switch opts.seqMode {
@@ -512,6 +526,18 @@ func (c *CachingStore) absorbFreshLocked(id string, bead Bead, now time.Time, op
 	case seqClearBeadSeqOnly:
 		delete(c.beadSeq, id)
 	}
+}
+
+// recentlyConfirmedLocked reports whether id's cached row was installed by
+// absorbFreshLocked with clearDirty set within cacheRecencyWindow — i.e.
+// whether the row reflects a real, recent read or write against backing.
+// The idempotence short-circuits in caching_store_writes.go call this before
+// trusting a cached-value match as proof a write is a no-op (dr-1tvd F2):
+// without it, a cached row primed once at startup would be trusted forever,
+// acking writes with zero backing IO regardless of how stale the row is.
+// Caller must hold c.mu (read or write mode).
+func (c *CachingStore) recentlyConfirmedLocked(id string, now time.Time) bool {
+	return recentLocalMutation(c.confirmedAt[id], now)
 }
 
 // absorbReadyProjectionLocked decides what happens to a row's is_blocked
@@ -659,6 +685,7 @@ func (c *CachingStore) evictLocked(id string) {
 	delete(c.deletedSeq, id)
 	delete(c.beadSeq, id)
 	delete(c.localBeadAt, id)
+	delete(c.confirmedAt, id)
 	delete(c.readyProjectionLost, id)
 }
 
@@ -1073,6 +1100,14 @@ func (c *CachingStore) prime(ctx context.Context) error {
 		nextDirty := make(map[string]struct{})
 		nextBeadSeq := make(map[string]uint64)
 		nextLocalBeadAt := make(map[string]time.Time)
+		// Every row in beadMap is a fresh, just-confirmed backing read; rows
+		// kept from the old cache below overwrite this with their carried
+		// confirmation time instead (dr-1tvd F2: recentlyConfirmedLocked must
+		// not trust a row prime never actually confirmed this cycle).
+		nextConfirmedAt := make(map[string]time.Time, len(beadMap))
+		for id := range beadMap {
+			nextConfirmedAt[id] = now
+		}
 		// The projection ran over the whole snapshot, so every row the prime
 		// replaces gets a fresh verdict and its unknown mark drops. Only rows
 		// carried over from the old cache keep theirs.
@@ -1087,7 +1122,7 @@ func (c *CachingStore) prime(ctx context.Context) error {
 					if _, lost := c.readyProjectionLost[id]; lost {
 						nextReadyLost[id] = struct{}{}
 					}
-					c.carryRecentLocalMutationLocked(id, nextDirty, nextBeadSeq, nextLocalBeadAt)
+					c.carryRecentLocalMutationLocked(id, nextDirty, nextBeadSeq, nextLocalBeadAt, nextConfirmedAt)
 				}
 				continue
 			}
@@ -1099,7 +1134,7 @@ func (c *CachingStore) prime(ctx context.Context) error {
 				if _, lost := c.readyProjectionLost[id]; lost {
 					nextReadyLost[id] = struct{}{}
 				}
-				c.carryRecentLocalMutationLocked(id, nextDirty, nextBeadSeq, nextLocalBeadAt)
+				c.carryRecentLocalMutationLocked(id, nextDirty, nextBeadSeq, nextLocalBeadAt, nextConfirmedAt)
 			}
 		}
 		c.beads = nextBeads
@@ -1108,6 +1143,7 @@ func (c *CachingStore) prime(ctx context.Context) error {
 		c.dirty = nextDirty
 		c.beadSeq = nextBeadSeq
 		c.localBeadAt = nextLocalBeadAt
+		c.confirmedAt = nextConfirmedAt
 		c.readyProjectionLost = nextReadyLost
 		c.deletedSeq = make(map[string]uint64)
 	} else {

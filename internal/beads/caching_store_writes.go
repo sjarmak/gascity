@@ -354,6 +354,41 @@ func (c *CachingStore) CloseAll(ids []string, metadata map[string]string) (int, 
 	return n, errors.Join(err, refreshErr)
 }
 
+// mergedMetadataForWrite returns the full metadata map that should be sent
+// to backing for a write of delta onto id: a clone of the cached bead's
+// current metadata with delta applied on top. Mirrors the
+// preservedUpdateOpts precedent (bdstore.go), which re-emits a bead's full
+// state on every Tx-staged write because bd's own internal read-modify-write
+// can clobber fields never mentioned in a call, from a stale base, in
+// dolt-server mode (F3, dr-1tvd). Sending the full merged map instead of
+// just delta closes that gap for direct (non-Tx) metadata writes too.
+// Returns ok=false on a cache miss, or when the cache state cannot vouch for
+// the cached row (mirrors metadataAlreadyMatchesCached's own state gate — an
+// uninitialized/degraded cache cannot be trusted as a merge base either), so
+// the caller falls back to a delta-only backing call.
+func (c *CachingStore) mergedMetadataForWrite(id string, delta map[string]string) (merged map[string]string, ok bool) {
+	c.mu.RLock()
+	if c.state != cacheLive && c.state != cachePartial {
+		c.mu.RUnlock()
+		return nil, false
+	}
+	b, hit := c.beads[id]
+	if hit {
+		merged = make(map[string]string, len(b.Metadata)+len(delta))
+		for k, v := range b.Metadata {
+			merged[k] = v
+		}
+	}
+	c.mu.RUnlock()
+	if !hit {
+		return nil, false
+	}
+	for k, v := range delta {
+		merged[k] = v
+	}
+	return merged, true
+}
+
 // SetMetadata sets a single metadata key-value on a bead.
 func (c *CachingStore) SetMetadata(id, key, value string) error {
 	// Idempotence: if the cached bead already has metadata[key] == value,
@@ -365,11 +400,22 @@ func (c *CachingStore) SetMetadata(id, key, value string) error {
 	// producing thousands of no-op events per hour. The cache is the
 	// supervisor's authoritative read source, so a value-match here is
 	// a value-match in the store.
-	if c.metadataAlreadyMatchesCached(id, map[string]string{key: value}) {
+	delta := map[string]string{key: value}
+	if c.metadataAlreadyMatchesCached(id, delta) {
 		return nil
 	}
-	if err := c.backing.SetMetadata(id, key, value); err != nil {
-		return err
+	// Send the full merged metadata state when the cache has a row to merge
+	// onto (see mergedMetadataForWrite); this defends against bd clobbering
+	// fields this call never mentions. Fall back to the single-key call on a
+	// cache miss, matching prior behavior.
+	var writeErr error
+	if merged, ok := c.mergedMetadataForWrite(id, delta); ok {
+		writeErr = c.backing.SetMetadataBatch(id, merged)
+	} else {
+		writeErr = c.backing.SetMetadata(id, key, value)
+	}
+	if writeErr != nil {
+		return writeErr
 	}
 
 	fresh, refreshed := c.refreshBeadAfterWrite(id, "refresh bead after metadata")
@@ -423,7 +469,15 @@ func (c *CachingStore) SetMetadataBatch(id string, kvs map[string]string) error 
 	if c.metadataAlreadyMatchesCached(id, kvs) {
 		return nil
 	}
-	if err := c.backing.SetMetadataBatch(id, kvs); err != nil {
+	// Widen the batch to the full merged metadata state when the cache has a
+	// row to merge onto (see mergedMetadataForWrite), so bd cannot clobber
+	// fields this call never mentions from a stale base. Fall back to the
+	// delta-only batch on a cache miss.
+	writeKVs := kvs
+	if merged, ok := c.mergedMetadataForWrite(id, kvs); ok {
+		writeKVs = merged
+	}
+	if err := c.backing.SetMetadataBatch(id, writeKVs); err != nil {
 		// The backing may have rejected, partially committed, or fully committed
 		// the batch before returning an error. Fence the cached pre-write row
 		// until an ordinary read installs backing truth.
@@ -715,6 +769,9 @@ func (c *CachingStore) updateMatchesCached(id string, opts UpdateOpts) bool {
 	if _, dirty := c.dirty[id]; dirty {
 		return false
 	}
+	if !c.recentlyConfirmedLocked(id, time.Now()) {
+		return false
+	}
 	b, ok := c.beads[id]
 	if !ok {
 		return false
@@ -792,6 +849,9 @@ func (c *CachingStore) closeAlreadyMatchesCached(id string) bool {
 	if _, dirty := c.dirty[id]; dirty {
 		return false
 	}
+	if !c.recentlyConfirmedLocked(id, time.Now()) {
+		return false
+	}
 	b, ok := c.beads[id]
 	if !ok {
 		return false
@@ -815,6 +875,9 @@ func (c *CachingStore) metadataAlreadyMatchesCached(id string, kvs map[string]st
 		return false
 	}
 	if _, dirty := c.dirty[id]; dirty {
+		return false
+	}
+	if !c.recentlyConfirmedLocked(id, time.Now()) {
 		return false
 	}
 	b, ok := c.beads[id]

@@ -17,6 +17,7 @@ func newPrimitiveTestStore() *CachingStore {
 		dirty:       make(map[string]struct{}),
 		beadSeq:     make(map[string]uint64),
 		localBeadAt: make(map[string]time.Time),
+		confirmedAt: make(map[string]time.Time),
 		deletedSeq:  make(map[string]uint64),
 	}
 }

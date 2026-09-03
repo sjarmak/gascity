@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
+	"sync"
 	"testing"
 )
 
@@ -662,9 +664,12 @@ func TestCachingStoreSetMetadataFallsThroughOnValueMismatch(t *testing.T) {
 	if err := cache.SetMetadata(bead.ID, "foo", "new"); err != nil {
 		t.Fatalf("SetMetadata: %v", err)
 	}
-	if backing.setMetadataCalls != 1 {
-		t.Errorf("backing.SetMetadata called %d times; want 1 (real change must propagate)",
-			backing.setMetadataCalls)
+	// A cache hit now widens the write to the full merged metadata state
+	// (mergedMetadataForWrite, F3) and sends it via SetMetadataBatch instead
+	// of the single-key SetMetadata, so count both entry points.
+	if got := backing.setMetadataCalls + backing.setMetadataBatchCalls; got != 1 {
+		t.Errorf("backing SetMetadata/SetMetadataBatch called %d times; want 1 (real change must propagate)",
+			got)
 	}
 }
 
@@ -784,6 +789,179 @@ func TestCachingStoreSetMetadataBatchEmptyKVsIsNoop(t *testing.T) {
 	if backing.setMetadataBatchCalls != 0 {
 		t.Errorf("backing.SetMetadataBatch called %d times; want 0 (empty kvs must short-circuit)",
 			backing.setMetadataBatchCalls)
+	}
+}
+
+// staleWriteBackStore reproduces dr-1tvd's metadata-clobber defect class in a
+// deterministic, Go-level fake: bd's dolt-server-mode metadata engine reads
+// a bead's row at some point, then later writes the ENTIRE resulting
+// metadata map back as one blob built from that (possibly stale) base plus
+// only the keys the caller explicitly supplied — silently dropping any
+// field written by another actor after the base was captured that the
+// caller's own kvs do not restate. Real MemStore.Update/SetMetadataBatch
+// merge per key from the CURRENT row and cannot reproduce a dropped field,
+// so this fake tracks its own authoritative metadata row instead of
+// delegating metadata storage to MemStore, and lets a test freeze a stale
+// base explicitly via freezeStaleBase.
+type staleWriteBackStore struct {
+	*MemStore
+
+	mu     sync.Mutex
+	meta   map[string]map[string]string
+	frozen map[string]map[string]string
+}
+
+func newStaleWriteBackStore() *staleWriteBackStore {
+	return &staleWriteBackStore{
+		MemStore: NewMemStore(),
+		meta:     make(map[string]map[string]string),
+		frozen:   make(map[string]map[string]string),
+	}
+}
+
+func (s *staleWriteBackStore) Create(b Bead) (Bead, error) {
+	created, err := s.MemStore.Create(b)
+	if err != nil {
+		return created, err
+	}
+	s.mu.Lock()
+	s.meta[created.ID] = maps.Clone(b.Metadata)
+	s.mu.Unlock()
+	created.Metadata = maps.Clone(b.Metadata)
+	return created, nil
+}
+
+func (s *staleWriteBackStore) Get(id string) (Bead, error) {
+	b, err := s.MemStore.Get(id)
+	if err != nil {
+		return b, err
+	}
+	s.mu.Lock()
+	if row, ok := s.meta[id]; ok {
+		b.Metadata = maps.Clone(row)
+	}
+	s.mu.Unlock()
+	return b, nil
+}
+
+// freezeStaleBase captures id's current metadata row as the base the next
+// SetMetadata/SetMetadataBatch write-back will use instead of the row's true
+// current state, simulating an internal read that happened before a later
+// concurrent write lands (dr-1tvd Mechanism A: an 11ms race between an
+// outcome-close write and a session-stamp write from a stale base).
+func (s *staleWriteBackStore) freezeStaleBase(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.frozen[id] = maps.Clone(s.meta[id])
+}
+
+// Update applies non-metadata fields via MemStore and merges metadata
+// directly into the authoritative row — an immediate, non-stale write,
+// simulating a close's own commit landing.
+func (s *staleWriteBackStore) Update(id string, opts UpdateOpts) error {
+	nonMeta := opts
+	nonMeta.Metadata = nil
+	if err := s.MemStore.Update(id, nonMeta); err != nil {
+		return err
+	}
+	if len(opts.Metadata) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	row := maps.Clone(s.meta[id])
+	if row == nil {
+		row = make(map[string]string, len(opts.Metadata))
+	}
+	for k, v := range opts.Metadata {
+		row[k] = v
+	}
+	s.meta[id] = row
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *staleWriteBackStore) SetMetadata(id, key, value string) error {
+	return s.SetMetadataBatch(id, map[string]string{key: value})
+}
+
+// SetMetadataBatch reproduces the stale whole-row write-back: if a base was
+// frozen via freezeStaleBase, THAT base (not the row's true current state)
+// is used, merged with only kvs — dropping any field written since the
+// freeze that kvs does not restate.
+func (s *staleWriteBackStore) SetMetadataBatch(id string, kvs map[string]string) error {
+	s.mu.Lock()
+	base, frozen := s.frozen[id]
+	if !frozen {
+		base = s.meta[id]
+	}
+	full := maps.Clone(base)
+	if full == nil {
+		full = make(map[string]string, len(kvs))
+	}
+	for k, v := range kvs {
+		full[k] = v
+	}
+	s.meta[id] = full
+	delete(s.frozen, id)
+	s.mu.Unlock()
+	return nil
+}
+
+// TestCachingStoreSetMetadataBatchPreservesConcurrentCloseDisposition is the
+// dr-1tvd F2/F3 regression test: a supervisor stamp write (SetMetadataBatch)
+// racing a close's disposition write must not lose the disposition, even
+// against a backing store whose own metadata engine writes back from a
+// stale base (dr-1tvd Mechanism A). F3 widens CachingStore's outgoing
+// SetMetadata/SetMetadataBatch write to the bead's full cached metadata
+// (mergedMetadataForWrite) instead of sending just the delta, so the
+// disposition field the close just landed in the cache is resent explicitly
+// on the very next stamp write, surviving the backing's stale base.
+func TestCachingStoreSetMetadataBatchPreservesConcurrentCloseDisposition(t *testing.T) {
+	t.Parallel()
+
+	backing := newStaleWriteBackStore()
+	bead, err := backing.Create(Bead{Title: "race", Metadata: map[string]string{"other": "x"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	cache := NewCachingStoreForTest(backing, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	// Simulate bd's internal metadata engine having read this row before the
+	// close below commits.
+	backing.freezeStaleBase(bead.ID)
+
+	closedStatus := "closed"
+	if err := cache.Update(bead.ID, UpdateOpts{
+		Status:   &closedStatus,
+		Metadata: map[string]string{"producer_disposition": "success"},
+	}); err != nil {
+		t.Fatalf("Update (close): %v", err)
+	}
+
+	// The stamp write only supplies a narrow delta. Without F3's widening
+	// this backing call would carry only {"heartbeat": "t1"} and the stale
+	// write-back would drop producer_disposition.
+	if err := cache.SetMetadataBatch(bead.ID, map[string]string{"heartbeat": "t1"}); err != nil {
+		t.Fatalf("SetMetadataBatch (stamp): %v", err)
+	}
+
+	got, err := backing.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Metadata["producer_disposition"] != "success" {
+		t.Errorf("producer_disposition clobbered by stale stamp write-back: got %q, want %q",
+			got.Metadata["producer_disposition"], "success")
+	}
+	if got.Metadata["heartbeat"] != "t1" {
+		t.Errorf("heartbeat = %q, want %q", got.Metadata["heartbeat"], "t1")
+	}
+	if got.Metadata["other"] != "x" {
+		t.Errorf("other = %q, want %q (unrelated field must survive)", got.Metadata["other"], "x")
 	}
 }
 
