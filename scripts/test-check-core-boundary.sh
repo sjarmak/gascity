@@ -27,11 +27,26 @@ export GIT_COMMITTER_NAME="Test Author" GIT_COMMITTER_EMAIL="author@example.com"
 export GIT_CONFIG_NOSYSTEM=1
 unset GIT_DIR GIT_WORK_TREE 2>/dev/null || true
 
+# require_tmp_dir <path>: aborts the whole harness if <path> is empty or does
+# not exist — i.e. if the preceding `mktemp -d` failed. Without this, a
+# failed mktemp leaves the caller's variable empty, and every subsequent
+# `git -C "$var" ...` call silently degrades to operating on the ambient
+# working directory (this script's own real checkout) instead of the
+# intended isolated temp repo, turning a transient temp-dir-creation failure
+# (e.g. resource contention under `make test` parallel load) into a
+# misattributed, nondeterministic test result instead of a clear failure.
+require_tmp_dir() {
+    if [ -z "${1:-}" ] || [ ! -d "$1" ]; then
+        echo "FATAL: mktemp failed to create an isolated temp directory — aborting to avoid operating on the ambient working directory" >&2
+        exit 1
+    fi
+}
+
 # new_repo: an isolated git repo in a fresh tmpdir with a minimal go.mod
 # (check (d) requires one to be present), prints its path.
 new_repo() {
     local d
-    d="$(mktemp -d "${TMPDIR:-/tmp}/gc-ccb-test.XXXXXX")"
+    d="$(mktemp -d "${TMPDIR:-/var/tmp}/gc-ccb-test.XXXXXX")" || return 1
     git -C "$d" init -q -b main
     git -C "$d" config commit.gpgsign false
     printf 'module example.com/testmod\n\ngo 1.22\n' > "$d/go.mod"
@@ -58,6 +73,7 @@ run_check() {
 test_untracked_cache_dir_ignored() {
     local repo result ec out
     repo="$(new_repo)"
+    require_tmp_dir "$repo"
     mkdir -p "$repo/.cache/go-mod/github.com/google/go-github@v1.2.3"
     cat > "$repo/.cache/go-mod/github.com/google/go-github@v1.2.3/orgs.go" <<'EOF'
 package github
@@ -83,6 +99,7 @@ $out"
 test_tracked_org_token_still_blocked() {
     local repo result ec out
     repo="$(new_repo)"
+    require_tmp_dir "$repo"
     cat > "$repo/tenant.go" <<'EOF'
 package core
 
@@ -110,6 +127,7 @@ $out"
 test_tracked_vendor_and_testdata_still_excluded() {
     local repo result ec out
     repo="$(new_repo)"
+    require_tmp_dir "$repo"
     mkdir -p "$repo/vendor/github.com/example/pkg" "$repo/internal/foo/testdata"
     cat > "$repo/vendor/github.com/example/pkg/orgs.go" <<'EOF'
 package pkg
@@ -142,6 +160,7 @@ $out"
 test_boundary_allow_annotation_still_suppresses() {
     local repo result ec out
     repo="$(new_repo)"
+    require_tmp_dir "$repo"
     cat > "$repo/otel.go" <<'EOF'
 package core
 
@@ -168,7 +187,8 @@ $out"
 # ---------------------------------------------------------------------------
 test_non_git_dir_fails_closed() {
     local dir result ec out
-    dir="$(mktemp -d "${TMPDIR:-/tmp}/gc-ccb-test.XXXXXX")"
+    dir="$(mktemp -d "${TMPDIR:-/var/tmp}/gc-ccb-test.XXXXXX")"
+    require_tmp_dir "$dir"
     printf 'module example.com/testmod\n\ngo 1.22\n' > "$dir/go.mod"
     cat > "$dir/tenant.go" <<'EOF'
 package core
@@ -196,6 +216,7 @@ $out"
 test_tracked_path_with_space_still_blocked() {
     local repo result ec out
     repo="$(new_repo)"
+    require_tmp_dir "$repo"
     mkdir -p "$repo/dir space"
     cat > "$repo/dir space/tenant.go" <<'EOF'
 package core
@@ -226,6 +247,7 @@ $out"
 test_lone_tracked_test_file_not_blocked() {
     local repo result ec out
     repo="$(new_repo)"
+    require_tmp_dir "$repo"
     cat > "$repo/tenant_test.go" <<'EOF'
 package core
 
@@ -247,12 +269,56 @@ $out"
     rm -rf "$repo"
 }
 
+# ---------------------------------------------------------------------------
+# Test 8: require_tmp_dir must reject an empty path and a path that does not
+# exist. This is the guard that keeps a failed `mktemp -d` (e.g. transient
+# resource contention under `make test` parallel load — see AGENTS.md "Build
+# Cache Conventions") from silently falling through to a `git -C ""` call
+# that operates on the ambient working directory instead of an isolated
+# temp repo. Run in a subshell so its `exit` only ends the subshell.
+# ---------------------------------------------------------------------------
+test_require_tmp_dir_rejects_missing_paths() {
+    local ec
+    (require_tmp_dir "") >/dev/null 2>&1
+    ec=$?
+    if [ "$ec" -eq 0 ]; then
+        record_fail "require_tmp_dir rejects an empty or nonexistent path" "empty path: exit=$ec, expected nonzero"
+        return
+    fi
+    (require_tmp_dir "/definitely/does/not/exist/gc-ccb-test") >/dev/null 2>&1
+    ec=$?
+    if [ "$ec" -ne 0 ]; then
+        record_pass "require_tmp_dir rejects an empty or nonexistent path"
+    else
+        record_fail "require_tmp_dir rejects an empty or nonexistent path" "nonexistent path: exit=$ec, expected nonzero"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Test 9: new_repo must propagate a failed mktemp as a nonzero return and no
+# printed path, instead of the caller's `repo="$(new_repo)"` silently
+# capturing an empty string that every later `git -C "$repo"` call would then
+# run against the ambient working directory.
+# ---------------------------------------------------------------------------
+test_new_repo_fails_closed_when_mktemp_fails() {
+    local out ec
+    out=$(TMPDIR=/definitely/does/not/exist/gc-ccb-test new_repo 2>/dev/null)
+    ec=$?
+    if [ "$ec" -ne 0 ] && [ -z "$out" ]; then
+        record_pass "new_repo returns nonzero and prints no path when mktemp fails"
+    else
+        record_fail "new_repo returns nonzero and prints no path when mktemp fails" "exit=$ec, stdout=$out"
+    fi
+}
+
 test_untracked_cache_dir_ignored
 test_tracked_org_token_still_blocked
 test_tracked_vendor_and_testdata_still_excluded
 test_boundary_allow_annotation_still_suppresses
 test_non_git_dir_fails_closed
 test_tracked_path_with_space_still_blocked
+test_require_tmp_dir_rejects_missing_paths
+test_new_repo_fails_closed_when_mktemp_fails
 test_lone_tracked_test_file_not_blocked
 
 echo "----"
