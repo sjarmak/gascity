@@ -59,6 +59,13 @@ func runSigpipeUnwindHelper(mode, markerPath string) {
 		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
 			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee}, true, nil
 		},
+		AdvanceClaimGeneration: func(context.Context, string, []string, string, string, string) (string, beads.AdvanceClaimGenerationOutcome, error) {
+			// Confirmed unconditionally: this file's assertions are about the
+			// EPIPE-driven F-C unwind, not the gc-3ohe47 generation fence — a
+			// nil/failing seam here would unwind before the write this test
+			// exists to exercise is even attempted.
+			return "1", beads.AdvanceClaimGenerationAdvanced, nil
+		},
 		Release: func(_ context.Context, _ string, _ []string, beadID, _ string) (bool, error) {
 			// The marker IS the assertion: it exists only if the unwind ran.
 			_ = os.WriteFile(markerPath, []byte("released "+beadID), 0o644)

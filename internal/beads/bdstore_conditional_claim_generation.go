@@ -74,7 +74,7 @@ func (s *BdStore) AdvanceClaimGenerationIfCurrent(id, expectedAssignee, fromGene
 		return "", "", collision
 	}
 
-	toGeneration, perr := nextClaimGeneration(fromGeneration)
+	toGeneration, perr := NextClaimGeneration(fromGeneration)
 	if perr != nil {
 		return "", "", fmt.Errorf("advance claim generation %q: %w", id, perr)
 	}
@@ -97,7 +97,7 @@ func (s *BdStore) AdvanceClaimGenerationIfCurrent(id, expectedAssignee, fromGene
 	return "", "", fmt.Errorf("advance claim generation %q: %w", id, runErr)
 }
 
-// nextClaimGeneration advances a beadmeta.ClaimGenerationMetadataKey value by
+// NextClaimGeneration advances a beadmeta.ClaimGenerationMetadataKey value by
 // one, mirroring molecule.nextClaimGeneration's fail-closed semantics exactly
 // (duplicated rather than shared: internal/beadmeta deliberately owns key
 // NAMES only, not parsing behavior, so there is no import-safe common home for
@@ -108,7 +108,11 @@ func (s *BdStore) AdvanceClaimGenerationIfCurrent(id, expectedAssignee, fromGene
 // positive counter, or math.MaxInt64 (n+1 would silently overflow to a
 // negative value) fails closed rather than guessing a restart point or
 // writing a corrupt generation.
-func nextClaimGeneration(current string) (string, error) {
+//
+// Exported so cmd/gc's graph-store claim route (gc-3ohe47 HIGH #2) can advance
+// the same counter through its own CompareAndSetMetadataKey fence, without a
+// third independent reimplementation of this parsing.
+func NextClaimGeneration(current string) (string, error) {
 	if current == "" {
 		return "1", nil
 	}

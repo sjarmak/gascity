@@ -394,6 +394,40 @@ func (r *hookClaimClassRoute) claim(beadID, assignee string) (beads.Bead, bool, 
 		r.graph.Get)
 }
 
+// advanceClaimGeneration mints or advances a binding-resident bead's
+// gc.claim_generation through the closed contract's metadata CAS, so a
+// graph-dispatched claim gets the same closeable current-authority token
+// beads.BdStore.AdvanceClaimGenerationIfCurrent mints for a work-store claim
+// (gc-3ohe47). Without this, classRoutedHookClaimOps left AdvanceClaimGeneration
+// unrouted, so a graph-resident claim's generation fence still ran against the
+// work-directory-rooted BdStore — a store that does not hold the bead — and
+// either failed outright or (before the hard-fail fix) silently advanced
+// nothing, reproducing the exact uncloseable-graph-step defect this route
+// exists to close.
+//
+// The CAS fences on the generation VALUE itself
+// (ConditionalWriter.CompareAndSetMetadataKey's expected/next), not on the
+// assignee the bd path is forced to use because its installed CLI lacks
+// --if-revision (see bdstore_conditional_claim_generation.go's doc). The
+// binding's ConditionalWriter is not under that ceiling, so this fences on
+// exactly the value the caller is trying to advance FROM, and still reports the
+// identical beads.AdvanceClaimGenerationOutcome vocabulary so
+// advanceHookClaimGeneration's caller cannot tell which store answered.
+func (r *hookClaimClassRoute) advanceClaimGeneration(beadID, fromGeneration string) (string, beads.AdvanceClaimGenerationOutcome, error) {
+	toGeneration, err := beads.NextClaimGeneration(fromGeneration)
+	if err != nil {
+		return "", "", fmt.Errorf("advance claim generation %q: %w", beadID, err)
+	}
+	swapped, err := r.graph.CompareAndSetMetadataKey(beadID, beadmeta.ClaimGenerationMetadataKey, fromGeneration, toGeneration)
+	if err != nil {
+		return "", "", fmt.Errorf("advance claim generation %q: %w", beadID, err)
+	}
+	if !swapped {
+		return "", beads.AdvanceClaimGenerationStale, nil
+	}
+	return toGeneration, beads.AdvanceClaimGenerationAdvanced, nil
+}
+
 // listContinuation reads a continuation group out of the binding and records
 // every member as resident, so the per-sibling assignment that follows does not
 // re-probe (or re-fail) one bd subprocess at a time.
@@ -580,6 +614,18 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 			return route.graph.ReleaseIfCurrent(beadID, assignee)
 		}
 		return base.Release(ctx, dir, env, beadID, assignee)
+	}
+
+	// The claim-generation fence (gc-3ohe47) must land in the ledger the claim
+	// itself landed in, or the token gc-outcome-close later verifies would be
+	// minted against a bead the fenced store never held. Like Release above it
+	// routes on the MEMO alone and never probes: a bead this invocation did not
+	// route is one the work store claimed, so its fence belongs there too.
+	ops.AdvanceClaimGeneration = func(ctx context.Context, dir string, env []string, beadID, assignee, fromGeneration string) (string, beads.AdvanceClaimGenerationOutcome, error) {
+		if route.knownResident(beadID) {
+			return route.advanceClaimGeneration(beadID, fromGeneration)
+		}
+		return base.AdvanceClaimGeneration(ctx, dir, env, beadID, assignee, fromGeneration)
 	}
 
 	// The lifecycle-start emission reads the step's workflow root, so it belongs

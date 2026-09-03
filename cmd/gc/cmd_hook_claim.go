@@ -45,11 +45,12 @@ const (
 )
 
 // Reasons carried on a bead.claim_released event: which unwind gave the claim
-// back. Both describe a claim this process WON and could not hand to a live
-// consumer.
+// back. All three describe a claim this process WON and could not hand to a
+// live consumer with a verified current-authority token.
 const (
-	hookClaimReleaseReasonUndelivered = "result_undelivered"
-	hookClaimReleaseReasonStraddled   = "claim_window_straddled"
+	hookClaimReleaseReasonUndelivered        = "result_undelivered"
+	hookClaimReleaseReasonStraddled          = "claim_window_straddled"
+	hookClaimReleaseReasonGenerationUnfenced = "claim_generation_unfenced"
 )
 
 var hookClaimMutationTimeout = 10 * time.Second
@@ -216,7 +217,9 @@ type hookClaimOps struct {
 	// claiming assignee via `bd update --if-assignee`. This is the gc-3ohe47
 	// fix: gc hook --claim used to be the one dispatch route that could win a
 	// claim without minting the current-authority token gc-outcome-close
-	// needs to close it. Best-effort: see advanceHookClaimGeneration.
+	// needs to close it. NOT best-effort: a claim whose generation cannot be
+	// confirmed advanced is unwound rather than delivered — see
+	// advanceHookClaimGeneration.
 	AdvanceClaimGeneration hookAdvanceClaimGenerationFunc
 	// StampSessionClaim records the claimed bead id on the CLAIMING SESSION's own
 	// bead — the reverse direction from StampWorkMeta, and the only route by
@@ -968,7 +971,17 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 	result.RootBeadID = strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
 	result.ContinuationGroup = strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey])
 	if minted {
-		advanceHookClaimGeneration(bead, opts, ops, dir, stderr)
+		next, ok := advanceHookClaimGeneration(bead, opts, ops, dir, stderr)
+		if !ok {
+			cause := fmt.Sprintf("claim generation fence for %s could not be confirmed; refusing to deliver an unfenced claim", bead.ID)
+			return unwindUndeliveredHookClaim(hookClaimReleaseReasonGenerationUnfenced, cause, bead, opts, ops, dir, stderr)
+		}
+		metadata := maps.Clone(bead.Metadata)
+		if metadata == nil {
+			metadata = map[string]string{}
+		}
+		metadata[beadmeta.ClaimGenerationMetadataKey] = next
+		bead.Metadata = metadata
 	}
 	durable, stamped := stampHookClaimIdentity(bead, opts, ops, dir, stderr)
 	if stamped && hookClaimLifecycleCandidate(durable, opts) {
@@ -1334,31 +1347,39 @@ func hookClaimThroughStore(beadID, assignee string, claim func() (beads.Bead, bo
 // the value THIS claim minted and is about to pass it to gc-outcome-close,
 // turning a legitimate close into a spurious stale refusal.
 //
-// Best-effort like the rest of this claim-time patch: a claim already won by
-// ops.Claim stands regardless of whether the generation can be advanced,
-// matching this codebase's existing posture for gc.work_branch / gc.session_id
-// / gc.claimed_at. What must NOT happen is writing a generation that was not
-// actually fenced: a stale race (the assignee moved between the claim and
-// this call) or an unsupported bd leaves gc.claim_generation exactly as
-// absent/behind as it was before this call — the same fail-closed refusal
-// gc-outcome-close already enforces today. Nothing here defaults, fabricates,
-// or bypasses the token.
-func advanceHookClaimGeneration(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stderr io.Writer) {
+// NOT best-effort, unlike the rest of this claim-time patch (gc.work_branch /
+// gc.session_id / gc.claimed_at): a minted claim without a confirmed current
+// generation is exactly the gc-3ohe47 defect (a graph-dispatched step that
+// passed review and then could never close), so ok=false here must unwind the
+// claim rather than deliver it. A stale race (the assignee moved between the
+// claim and this call), an unsupported bd, or an infrastructure error all
+// leave gc.claim_generation exactly as absent/behind as it was before this
+// call — this function never defaults, fabricates, or bypasses the token, and
+// the caller must never treat that gap as deliverable.
+func advanceHookClaimGeneration(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stderr io.Writer) (next string, ok bool) {
 	if ops.AdvanceClaimGeneration == nil {
-		return
+		fmt.Fprintf(stderr, "gc hook --claim: no claim generation fence configured for %s\n", bead.ID) //nolint:errcheck
+		return "", false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
 	defer cancel()
 	fromGeneration := strings.TrimSpace(bead.Metadata[beadmeta.ClaimGenerationMetadataKey])
-	_, outcome, err := ops.AdvanceClaimGeneration(ctx, dir, opts.Env, bead.ID, opts.Assignee, fromGeneration)
+	next, outcome, err := ops.AdvanceClaimGeneration(ctx, dir, opts.Env, bead.ID, opts.Assignee, fromGeneration)
 	switch {
 	case err != nil:
 		fmt.Fprintf(stderr, "gc hook --claim: advancing claim generation on %s: %v\n", bead.ID, err) //nolint:errcheck
+		return "", false
 	case outcome == beads.AdvanceClaimGenerationStale:
 		fmt.Fprintf(stderr, "gc hook --claim: claim generation fence on %s refused (assignee moved before it could be advanced)\n", bead.ID) //nolint:errcheck
+		return "", false
 	case outcome == beads.AdvanceClaimGenerationUnsupported:
 		fmt.Fprintf(stderr, "gc hook --claim: claim generation not advanced on %s (bd does not support --if-assignee/--set-metadata)\n", bead.ID) //nolint:errcheck
+		return "", false
+	case outcome != beads.AdvanceClaimGenerationAdvanced || strings.TrimSpace(next) == "":
+		fmt.Fprintf(stderr, "gc hook --claim: claim generation fence on %s returned no confirmed generation\n", bead.ID) //nolint:errcheck
+		return "", false
 	}
+	return next, true
 }
 
 func stampHookClaimIdentity(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stderr io.Writer) (beads.Bead, bool) {

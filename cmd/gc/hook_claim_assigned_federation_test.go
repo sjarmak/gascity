@@ -72,9 +72,10 @@ func TestClaimHookWorkAssignedTierUnresolvableBeadDoesNotStrandLaterStore(t *tes
 			claimDir = dir
 			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker"}}, true, nil
 		},
-		EmitClaimRejected: func(string, string, string) {},
-		ResolveWorkBranch: func(string) string { return "" },
-		DrainAck:          func(io.Writer) error { return nil },
+		EmitClaimRejected:      func(string, string, string) {},
+		ResolveWorkBranch:      func(string) string { return "" },
+		DrainAck:               func(io.Writer) error { return nil },
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 
 	var stdout, stderr bytes.Buffer

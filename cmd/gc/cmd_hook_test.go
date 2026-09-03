@@ -395,6 +395,7 @@ func TestDoHookClaimPromotesReadyAssignment(t *testing.T) {
 		ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
 			return nil, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-canonical",
@@ -547,6 +548,7 @@ func TestDoHookClaimReadyAssignmentLostRaceFallsThrough(t *testing.T) {
 		ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
 			return nil, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -628,6 +630,7 @@ func TestDoHookClaimClaimsRoutedUnassignedWork(t *testing.T) {
 		ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
 			return nil, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -673,6 +676,7 @@ func TestDoHookClaimRetriesAfterClaimConflict(t *testing.T) {
 			}
 			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker"}}, true, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -722,7 +726,8 @@ func TestDoHookClaimEmitsRejectedOnLostClaim(t *testing.T) {
 		EmitClaimRejected: func(beadID, existing, attempted string) {
 			rejected = append(rejected, rejection{beadID, existing, attempted})
 		},
-		ResolveWorkBranch: func(string) string { return "" }, // suppress stamp noise
+		ResolveWorkBranch:      func(string) string { return "" }, // suppress stamp noise
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -768,6 +773,7 @@ func TestDoHookClaimStampsWorkBranch(t *testing.T) {
 			stampedBead, stampedAssignee, stampedBranch = beadID, assignee, patch["gc.work_branch"]
 			return nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -806,6 +812,7 @@ func TestDoHookClaimSkipsStampWhenBranchUnchanged(t *testing.T) {
 			stampCalls++
 			return nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -839,6 +846,7 @@ func TestDoHookClaimClaimsLegacyRunTargetWorkflowRoot(t *testing.T) {
 				Metadata: map[string]string{"gc.kind": "workflow", "gc.run_target": "worker"},
 			}, true, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -910,6 +918,7 @@ func TestDoHookClaimToleratesMalformedMetadataBead(t *testing.T) {
 			claimedID = beadID
 			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker"}}, true, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -1079,8 +1088,9 @@ func TestClaimHookWorkRetriesLaterStoreWhenSelectedStoreLosesClaimRace(t *testin
 			claimDir = dir
 			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker"}}, true, nil
 		},
-		EmitClaimRejected: func(string, string, string) {},   // suppress event side effect
-		ResolveWorkBranch: func(string) string { return "" }, // suppress stamp noise
+		EmitClaimRejected:      func(string, string, string) {},   // suppress event side effect
+		ResolveWorkBranch:      func(string) string { return "" }, // suppress stamp noise
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -1202,7 +1212,8 @@ func TestClaimHookWorkUsesFallbackStoreDirEnvAndOutput(t *testing.T) {
 			claimDir, claimEnv = dir, env
 			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker"}}, true, nil
 		},
-		ResolveWorkBranch: func(string) string { return "" },
+		ResolveWorkBranch:      func(string) string { return "" },
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -1262,6 +1273,7 @@ func TestDoHookClaimPreassignsContinuationGroupSiblings(t *testing.T) {
 			assigned = append(assigned, beadID+"="+assignee)
 			return nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -2167,6 +2179,7 @@ func TestHookClaimSkipsMessageBeadsAheadOfRoutedWork(t *testing.T) {
 			claimed = true
 			return beads.Bead{ID: id, Status: "in_progress", Assignee: assignee, Type: "task"}, true, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           identity,
@@ -2889,6 +2902,7 @@ func TestDoHookClaimSkipsUnclaimableCandidateError(t *testing.T) {
 			}
 			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker"}}, true, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",

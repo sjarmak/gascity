@@ -142,7 +142,8 @@ func TestDoHookClaimUsesSelectedStoreContextForMutationAndContinuation(t *testin
 			}
 			return nil
 		},
-		DrainAck: func(io.Writer) error { return nil },
+		DrainAck:               func(io.Writer) error { return nil },
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -246,7 +247,8 @@ func TestDoHookClaimSkipsBlockedRoutedHeadAndClaimsReadyBehindIt(t *testing.T) {
 			claimedBead = beadID
 			return beads.Bead{ID: beadID, Assignee: assignee, Status: "in_progress"}, true, nil
 		},
-		DrainAck: func(io.Writer) error { return nil },
+		DrainAck:               func(io.Writer) error { return nil },
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 
 	var stdout, stderr bytes.Buffer

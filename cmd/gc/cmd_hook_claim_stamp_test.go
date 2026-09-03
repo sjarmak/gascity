@@ -121,8 +121,9 @@ func poolClaimOps(runner string, claimedMeta map[string]string, branch string, s
 			meta[beadmeta.SessionNameMetadataKey] = "gc__role-mc-sess1"
 			return beads.Bead{ID: id, Status: "in_progress", Assignee: assignee, Metadata: meta}, nil
 		},
-		PublishRunMap:     noopPublishRunMap,
-		StampSessionClaim: noopStampSessionClaim,
+		PublishRunMap:          noopPublishRunMap,
+		StampSessionClaim:      noopStampSessionClaim,
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 }
 
@@ -509,10 +510,11 @@ func TestDoHookClaimStampsCurrentClaimOnAdoption(t *testing.T) {
 						Metadata: map[string]string{"gc.routed_to": "worker"},
 					}, true, nil
 				},
-				ResolveWorkBranch: func(string) string { return "" },
-				StampWorkMeta:     noopStampWorkMeta,
-				PublishRunMap:     noopPublishRunMap,
-				StampSessionClaim: sessSpy.fn,
+				ResolveWorkBranch:      func(string) string { return "" },
+				StampWorkMeta:          noopStampWorkMeta,
+				PublishRunMap:          noopPublishRunMap,
+				StampSessionClaim:      sessSpy.fn,
+				AdvanceClaimGeneration: advanceClaimGenerationOK,
 			}
 			var stdout, stderr bytes.Buffer
 			if code := doHookClaim("bd ready --json", "/tmp/work", poolClaimOpts(), ops, &stdout, &stderr); code != 0 {

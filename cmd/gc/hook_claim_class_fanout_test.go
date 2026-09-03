@@ -65,6 +65,7 @@ func hookFanoutBaseOps(claim hookClaimFunc) hookClaimOps {
 		},
 		EmitExecutionStepStarted: func(beads.Bead, string, []string, string) {},
 		PublishRunMap:            func(string, string, ...string) error { return nil },
+		AdvanceClaimGeneration:   advanceClaimGenerationOK,
 	}
 }
 

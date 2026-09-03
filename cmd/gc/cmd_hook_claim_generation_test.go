@@ -33,14 +33,43 @@ func (s *advanceClaimGenerationSpy) fn(_ context.Context, _ string, _ []string, 
 	return s.next, s.outcome, nil
 }
 
-// noopAdvanceClaimGeneration suppresses the gc.claim_generation fence so claim
-// tests that don't assert on it stay hermetic — the default seam opens a real
-// beads.BdStore bound to hookClaimCommandRunnerWithEnvContext, which a test
-// binary deliberately refuses (and which other fixtures, e.g. cmd_hook_claim_runid_test.go's
-// claimOpsForRunMap, override to pin an unrelated "zero post-claim bd
-// mutation" invariant that a live generation write would otherwise trip).
+// hookClaimReleaseSpy records the (beadID, assignee) an unwind releases and
+// always reports success, so a test can confirm a minted claim that fails its
+// generation fence is actually given back rather than delivered.
+type hookClaimReleaseSpy struct {
+	calls    int
+	beadID   string
+	assignee string
+}
+
+func (s *hookClaimReleaseSpy) fn(_ context.Context, _ string, _ []string, beadID, assignee string) (bool, error) {
+	s.calls++
+	s.beadID, s.assignee = beadID, assignee
+	return true, nil
+}
+
+// noopAdvanceClaimGeneration reports a clean not-advanced outcome (no error,
+// no confirmed generation) for tests that deliberately exercise the
+// generation-unfenced unwind path without scripting a spy. Since gc-3ohe47's
+// review fix, this is no longer a silent no-op for a minted claim: the
+// caller (advanceHookClaimGeneration) now unwinds any minted claim whose
+// generation is not confirmed advanced, so wiring this into a minted-claim
+// test deliberately drives that unwind. Tests that mint a claim and expect it
+// delivered must use advanceClaimGenerationOK instead.
 func noopAdvanceClaimGeneration(context.Context, string, []string, string, string, string) (string, beads.AdvanceClaimGenerationOutcome, error) {
 	return "", "", nil
+}
+
+// advanceClaimGenerationOK is the hermetic stand-in for a successful claim
+// generation fence: it always reports Advanced with a fixed placeholder next
+// value. Since gc-3ohe47's review fix, a minted claim is unwound unless this
+// seam confirms Advanced, so every minted-claim test that does not otherwise
+// stub or spy on AdvanceClaimGeneration must reach for this one to stay
+// hermetic — the real production seam (hookAdvanceClaimGenerationWithBdStore)
+// shells out to bd, which fails against a test fixture's directory and would
+// now trigger a spurious unwind instead of being silently swallowed.
+func advanceClaimGenerationOK(context.Context, string, []string, string, string, string) (string, beads.AdvanceClaimGenerationOutcome, error) {
+	return "1", beads.AdvanceClaimGenerationAdvanced, nil
 }
 
 // TestDoHookClaimAdvancesClaimGenerationOnFreshClaim is the primary gc-3ohe47
@@ -131,13 +160,15 @@ func TestDoHookClaimDoesNotAdvanceClaimGenerationOnAdoption(t *testing.T) {
 	}
 }
 
-// TestDoHookClaimAdvanceClaimGenerationFailureDoesNotFailClaim proves the
-// generation advance is best-effort, matching this claim path's existing posture
-// for gc.work_branch/gc.session_id/gc.claimed_at: a claim already won by
-// ops.Claim stands regardless of whether the generation could be advanced. The
-// failure is surfaced on stderr, never as a claim failure.
-func TestDoHookClaimAdvanceClaimGenerationFailureDoesNotFailClaim(t *testing.T) {
+// TestDoHookClaimAdvanceClaimGenerationFailureUnwindsTheClaim is the HIGH #1
+// regression from the gc-3ohe47 review: the generation advance is NOT
+// best-effort. A claim already won by ops.Claim must NOT be delivered when its
+// generation cannot be confirmed — an infra error advancing the fence unwinds
+// the just-minted claim (release, not deliver) rather than handing out a claim
+// with no current-authority token gc-outcome-close could ever verify.
+func TestDoHookClaimAdvanceClaimGenerationFailureUnwindsTheClaim(t *testing.T) {
 	genSpy := &advanceClaimGenerationSpy{err: errors.New("dolt boom")}
+	releaseSpy := &hookClaimReleaseSpy{}
 	ops := poolClaimOps(
 		`[{"id":"hw-err","status":"open","metadata":{"gc.routed_to":"worker"}}]`,
 		map[string]string{"gc.routed_to": "worker"},
@@ -145,23 +176,61 @@ func TestDoHookClaimAdvanceClaimGenerationFailureDoesNotFailClaim(t *testing.T) 
 		&stampMetaSpy{},
 	)
 	ops.AdvanceClaimGeneration = genSpy.fn
+	ops.Release = releaseSpy.fn
+	ops.EmitClaimReleased = func(hookClaimReleaseRecord) {}
 
 	var stdout, stderr bytes.Buffer
-	if code := doHookClaim("bd ready --json", "/tmp/work", poolClaimOpts(), ops, &stdout, &stderr); code != 0 {
-		t.Fatalf("doHookClaim = %d, want 0 (generation-advance error must not fail the claim); stderr=%s", code, stderr.String())
+	if code := doHookClaim("bd ready --json", "/tmp/work", poolClaimOpts(), ops, &stdout, &stderr); code != 1 {
+		t.Fatalf("doHookClaim = %d, want 1 (a generation-advance error must unwind the claim, not deliver it); stderr=%s", code, stderr.String())
 	}
 	if !bytes.Contains(stderr.Bytes(), []byte("advancing claim generation on hw-err")) {
 		t.Errorf("stderr = %q, want the failed generation advance surfaced", stderr.String())
 	}
+	if releaseSpy.calls != 1 || releaseSpy.beadID != "hw-err" {
+		t.Fatalf("Release calls = %d beadID = %q, want exactly one release of hw-err", releaseSpy.calls, releaseSpy.beadID)
+	}
 }
 
-// TestDoHookClaimAdvanceClaimGenerationStaleDoesNotFailClaim covers the
+// TestDoHookClaimAdvanceClaimGenerationUnconfirmedUnwindsTheClaim covers the
+// catch-all outcome: the seam reports no error and no recognized failure
+// outcome, but also no confirmed generation (the noopAdvanceClaimGeneration
+// stub's "clean no-op" shape). This must unwind exactly like the error and
+// stale cases — an unconfirmed generation is exactly as undeliverable as an
+// absent one, and advanceHookClaimGeneration must not treat empty-but-no-error
+// as success.
+func TestDoHookClaimAdvanceClaimGenerationUnconfirmedUnwindsTheClaim(t *testing.T) {
+	releaseSpy := &hookClaimReleaseSpy{}
+	ops := poolClaimOps(
+		`[{"id":"hw-unconfirmed","status":"open","metadata":{"gc.routed_to":"worker"}}]`,
+		map[string]string{"gc.routed_to": "worker"},
+		"bd-hw-unconfirmed",
+		&stampMetaSpy{},
+	)
+	ops.AdvanceClaimGeneration = noopAdvanceClaimGeneration
+	ops.Release = releaseSpy.fn
+	ops.EmitClaimReleased = func(hookClaimReleaseRecord) {}
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", poolClaimOpts(), ops, &stdout, &stderr); code != 1 {
+		t.Fatalf("doHookClaim = %d, want 1 (an unconfirmed generation fence must unwind the claim, not deliver it); stderr=%s", code, stderr.String())
+	}
+	if !bytes.Contains(stderr.Bytes(), []byte("claim generation fence on hw-unconfirmed returned no confirmed generation")) {
+		t.Errorf("stderr = %q, want the unconfirmed fence surfaced", stderr.String())
+	}
+	if releaseSpy.calls != 1 || releaseSpy.beadID != "hw-unconfirmed" {
+		t.Fatalf("Release calls = %d beadID = %q, want exactly one release of hw-unconfirmed", releaseSpy.calls, releaseSpy.beadID)
+	}
+}
+
+// TestDoHookClaimAdvanceClaimGenerationStaleUnwindsTheClaim covers the
 // definitive-refusal outcome: bd's assignee fence missed (the assignee moved
-// between the claim and this call), so nothing was written. Like the error case,
-// this must not fail the claim — but it also must not silently look identical
-// to success; it is logged so the gap is diagnosable.
-func TestDoHookClaimAdvanceClaimGenerationStaleDoesNotFailClaim(t *testing.T) {
+// between the claim and this call), so nothing was written. Like the error
+// case, this must unwind rather than deliver — a stale fence means the
+// generation gc-outcome-close would see is not this claim's, so this claim
+// cannot be handed out with authority it does not hold.
+func TestDoHookClaimAdvanceClaimGenerationStaleUnwindsTheClaim(t *testing.T) {
 	genSpy := &advanceClaimGenerationSpy{outcome: beads.AdvanceClaimGenerationStale}
+	releaseSpy := &hookClaimReleaseSpy{}
 	ops := poolClaimOps(
 		`[{"id":"hw-stale","status":"open","metadata":{"gc.routed_to":"worker"}}]`,
 		map[string]string{"gc.routed_to": "worker"},
@@ -169,12 +238,17 @@ func TestDoHookClaimAdvanceClaimGenerationStaleDoesNotFailClaim(t *testing.T) {
 		&stampMetaSpy{},
 	)
 	ops.AdvanceClaimGeneration = genSpy.fn
+	ops.Release = releaseSpy.fn
+	ops.EmitClaimReleased = func(hookClaimReleaseRecord) {}
 
 	var stdout, stderr bytes.Buffer
-	if code := doHookClaim("bd ready --json", "/tmp/work", poolClaimOpts(), ops, &stdout, &stderr); code != 0 {
-		t.Fatalf("doHookClaim = %d, want 0 (a stale generation fence must not fail the claim); stderr=%s", code, stderr.String())
+	if code := doHookClaim("bd ready --json", "/tmp/work", poolClaimOpts(), ops, &stdout, &stderr); code != 1 {
+		t.Fatalf("doHookClaim = %d, want 1 (a stale generation fence must unwind the claim, not deliver it); stderr=%s", code, stderr.String())
 	}
 	if !bytes.Contains(stderr.Bytes(), []byte("claim generation fence on hw-stale refused")) {
 		t.Errorf("stderr = %q, want the stale fence surfaced", stderr.String())
+	}
+	if releaseSpy.calls != 1 || releaseSpy.beadID != "hw-stale" {
+		t.Fatalf("Release calls = %d beadID = %q, want exactly one release of hw-stale", releaseSpy.calls, releaseSpy.beadID)
 	}
 }

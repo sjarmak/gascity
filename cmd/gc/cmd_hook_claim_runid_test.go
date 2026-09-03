@@ -38,7 +38,7 @@ func claimOpsForRunMap(beadID string, claimedMeta map[string]string, spy *publis
 		},
 		ResolveWorkBranch:      func(string) string { return "" },
 		StampWorkMeta:          noopStampWorkMeta,
-		AdvanceClaimGeneration: noopAdvanceClaimGeneration,
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 		ReadWorkMeta: func(_ context.Context, _ string, _ []string, id, assignee string) (beads.Bead, error) {
 			meta := map[string]string{}
 			for k, v := range claimedMeta {
