@@ -7049,6 +7049,97 @@ func TestExecutePreparedStartWave_RateLimitPendingCreateDeathClearsClaim(t *test
 	}
 }
 
+func TestExecutePreparedStartWave_RateLimitStartupDeathUsesProviderResetTime(t *testing.T) {
+	sp := &zombieAfterStartProvider{Fake: runtime.NewFake()}
+	store := beads.NewMemStore()
+	// The reset-time detection reads the real wall clock (it runs at
+	// screen-peek time, not commit time), so the fixture's reset timestamp
+	// must be safely in the future relative to actual now, not just the
+	// fake commit clock below.
+	future := time.Now().UTC().Add(72 * time.Hour)
+	clk := &clock.Fake{Time: future.Add(-2 * time.Hour)}
+	session, err := store.Create(beads.Bead{
+		ID:     "gc-100",
+		Title:  "reset-agent",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":         "reset-agent",
+			"session_key":          "stale-key-def",
+			"template":             "worker",
+			"state":                "active",
+			"last_woke_at":         clk.Now().Add(-10 * time.Second).UTC().Format(time.RFC3339),
+			"wake_attempts":        "2",
+			"started_config_hash":  "keep-hash",
+			"continuation_command": "resume",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	wantReset := time.Date(future.Year(), future.Month(), future.Day(), future.Hour(), future.Minute(), 0, 0, time.UTC)
+	sp.SetPeekOutput("reset-agent", fmt.Sprintf(
+		"Usage limit reached. Purchase more credits or try again at %s.",
+		wantReset.Format("Jan 2, 2006 3:04 PM"),
+	))
+	item := preparedStart{
+		candidate: startCandidate{
+			info: sessiontest.SeedBead(t, session),
+			tp: TemplateParams{
+				Command:      "claude --resume stale-key-def",
+				SessionName:  "reset-agent",
+				TemplateName: "worker",
+			},
+		},
+		cfg: runtime.Config{
+			Command:      "claude --resume stale-key-def",
+			ProcessNames: []string{"claude"},
+		},
+	}
+
+	results := executePreparedStartWaveForCity(
+		context.Background(),
+		[]preparedStart{item},
+		"",
+		sp,
+		nil,
+		&config.City{},
+		10*time.Second,
+		1,
+		withStartStabilityWaiter(immediateStartStabilityWaiter),
+	)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if !results[0].rateLimitScreen {
+		t.Fatal("expected provider rate-limit screen classification")
+	}
+	if !results[0].rateLimitResetAt.Equal(wantReset) {
+		t.Fatalf("rateLimitResetAt = %s, want %s", results[0].rateLimitResetAt.Format(time.RFC3339), wantReset.Format(time.RFC3339))
+	}
+
+	if commitStartResult(results[0], sessionFrontDoor(store), clk, events.Discard, 0, ioDiscard{}, ioDiscard{}) {
+		t.Fatal("startup rate-limit hold should not count as a committed wake")
+	}
+	got, err := store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", session.ID, err)
+	}
+	if got.Metadata["sleep_reason"] != "rate_limit" {
+		t.Fatalf("sleep_reason = %q, want rate_limit", got.Metadata["sleep_reason"])
+	}
+	qUntil, err := time.Parse(time.RFC3339, got.Metadata["quarantined_until"])
+	if err != nil {
+		t.Fatalf("quarantined_until parse: %v", err)
+	}
+	if !qUntil.Equal(wantReset) {
+		t.Fatalf("quarantined_until = %s, want provider reset time %s", qUntil.Format(time.RFC3339), wantReset.Format(time.RFC3339))
+	}
+	if defaultUntil := clk.Now().Add(defaultRateLimitQuarantineDuration); !wantReset.After(defaultUntil) {
+		t.Fatalf("test fixture reset time %s must exceed the fixed default %s to prove reset-time-aware behavior", wantReset, defaultUntil)
+	}
+}
+
 type ioDiscard struct{}
 
 func (ioDiscard) Write(p []byte) (int, error) { return len(p), nil }

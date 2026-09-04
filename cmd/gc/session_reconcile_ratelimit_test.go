@@ -91,6 +91,47 @@ func TestCheckStability_RateLimitScreen_DoesNotCountAsCrash(t *testing.T) {
 	}
 }
 
+// TestCheckStability_RateLimitScreen_UsesProviderResetTime pins the
+// reset-time-aware quarantine behavior: when the pane carries a fully-dated
+// provider reset timestamp beyond the fixed default quarantine window, the
+// quarantine runs until that timestamp instead of the fixed window.
+func TestCheckStability_RateLimitScreen_UsesProviderResetTime(t *testing.T) {
+	now := time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	store := newTestStore()
+	dt := newDrainTracker()
+
+	session := makeBead("b1", map[string]string{
+		"last_woke_at":        now.Add(-10 * time.Second).Format(time.RFC3339),
+		"session_key":         "keep-session",
+		"started_config_hash": "keep-hash",
+		"wake_attempts":       "3",
+	})
+
+	paneContent := "You've hit your limit, Pro plan\n\n/rate-limit-options\nResets Apr 29, 2026 6:00 AM (UTC)"
+	peek := func(_ int) (string, error) {
+		return paneContent, nil
+	}
+
+	_, stab := checkStability(seedSessionInfo(session), nil, false, dt, sessionFrontDoor(store), clk, peek)
+	syncBeadFromStore(&session, store)
+	if !stab {
+		t.Fatal("checkStability should return true when it records a rate-limit hold")
+	}
+
+	wantReset := time.Date(2026, 4, 29, 6, 0, 0, 0, time.UTC)
+	if defaultUntil := now.Add(defaultRateLimitQuarantineDuration); !wantReset.After(defaultUntil) {
+		t.Fatalf("test fixture reset time %s must exceed the fixed default %s", wantReset, defaultUntil)
+	}
+	qUntil, err := time.Parse(time.RFC3339, session.Metadata["quarantined_until"])
+	if err != nil {
+		t.Fatalf("quarantined_until parse: %v", err)
+	}
+	if !qUntil.Equal(wantReset) {
+		t.Errorf("quarantined_until = %s, want provider reset time %s", qUntil.Format(time.RFC3339), wantReset.Format(time.RFC3339))
+	}
+}
+
 func TestCheckStability_RateLimitPendingCreateClearsStartedAt(t *testing.T) {
 	now := time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC)
 	clk := &clock.Fake{Time: now}

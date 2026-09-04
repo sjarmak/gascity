@@ -527,6 +527,7 @@ func checkRateLimitStability(info sessionpkg.Info, cfg *config.City, alive bool,
 	facts := sessionExitFactsInfo(info, cfg, alive, dt, clk)
 	facts.ScreenAvailable = peek != nil
 	dec := sessionpkg.DecideSessionExit(facts)
+	var resetAt time.Time
 	for dec == sessionpkg.ExitGatherScreen {
 		facts.Screen = sessionpkg.ScreenOther
 		if content, err := peek(rateLimitPeekLines); err == nil {
@@ -539,6 +540,7 @@ func checkRateLimitStability(info sessionpkg.Info, cfg *config.City, alive bool,
 			}
 			if runtime.ContainsProviderRateLimitScreen(content) {
 				facts.Screen = sessionpkg.ScreenRateLimit
+				resetAt, _ = runtime.ParseProviderRateLimitResetTime(content, clk.Now())
 			}
 		}
 		dec = sessionpkg.DecideSessionExit(facts)
@@ -546,7 +548,7 @@ func checkRateLimitStability(info sessionpkg.Info, cfg *config.City, alive bool,
 	if dec != sessionpkg.ExitRateLimitQuarantine {
 		return info, false, nil
 	}
-	next, err := recordRateLimitQuarantine(info, sessFront, clk)
+	next, err := recordRateLimitQuarantine(info, sessFront, clk, resetAt)
 	if err != nil {
 		return info, false, err
 	}
@@ -595,8 +597,21 @@ func clearLastWokeAt(info sessionpkg.Info, sessFront *sessionpkg.Store) sessionp
 // advances the typed snapshot with the quarantine write (front-door migration
 // Step 6d, write-returns-Info); returns (info unchanged, err) on persist failure
 // (ApplyPatchInfo leaves the snapshot pinned to the rejected write).
-func recordRateLimitQuarantine(info sessionpkg.Info, sessFront *sessionpkg.Store, clk clock.Clock) (sessionpkg.Info, error) {
-	batch := sessionpkg.RateLimitQuarantinePatch(clk.Now().Add(defaultRateLimitQuarantineDuration))
+//
+// resetAt is the provider-reported reset time parsed from the rate-limit
+// screen, when the screen carried a fully-dated timestamp; a zero value means
+// none was found. When present and later than the fixed default quarantine
+// window, the quarantine runs until resetAt instead of the fixed window, so a
+// long-lived usage-limit exhaustion doesn't repeatedly crash-loop at the
+// fixed cadence between now and the account's actual reset. resetAt is never
+// allowed to shorten the quarantine below the fixed default: a parse that
+// somehow yields a near-term time is clamped up, not trusted verbatim.
+func recordRateLimitQuarantine(info sessionpkg.Info, sessFront *sessionpkg.Store, clk clock.Clock, resetAt time.Time) (sessionpkg.Info, error) {
+	until := clk.Now().Add(defaultRateLimitQuarantineDuration)
+	if !resetAt.IsZero() && resetAt.After(until) {
+		until = resetAt
+	}
+	batch := sessionpkg.RateLimitQuarantinePatch(until)
 	next, err := sessFront.ApplyPatchInfo(info, batch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "recordRateLimitQuarantine: SetMetadataBatch %s: %v\n", info.ID, err) //nolint:errcheck

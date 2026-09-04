@@ -241,6 +241,11 @@ type startResult struct {
 	finished        time.Time
 	rollbackPending bool
 	rateLimitScreen bool
+	// rateLimitResetAt is the provider-reported reset time parsed from the
+	// rate-limit screen, when the screen text carried a fully-dated timestamp.
+	// Zero means no confident reset time was found; the caller falls back to
+	// the fixed default quarantine duration.
+	rateLimitResetAt time.Time
 	// phases captures sub-phase wall-clock so the lifecycle log can pinpoint
 	// where a slow start spent its time. See gc-67o for context.
 	phases startPhaseTimings
@@ -1534,7 +1539,11 @@ func runPreparedStartCandidate(
 	}
 	finished := time.Now()
 	rollbackPending := err != nil && shouldRollbackPendingCreateInfo(item.candidate.info)
-	rateLimitScreen := err != nil && startupRateLimitScreenDetected(item, cityPath, sp, store, cfg)
+	var rateLimitScreen bool
+	var rateLimitResetAt time.Time
+	if err != nil {
+		rateLimitScreen, rateLimitResetAt = startupRateLimitScreenDetected(item, cityPath, sp, store, cfg)
+	}
 	if err != nil && rollbackPending && !rateLimitScreen && runningSessionMatchesPendingCreateInfo(item.candidate.info, item.candidate.name(), sp) {
 		return startResult{
 			prepared:        item,
@@ -1583,16 +1592,18 @@ func runPreparedStartCandidate(
 	}
 	if err == nil {
 		rateLimitScreen = false
+		rateLimitResetAt = time.Time{}
 	}
 	return startResult{
-		prepared:        item,
-		err:             err,
-		outcome:         outcome,
-		started:         started,
-		finished:        finished,
-		rollbackPending: rollbackPending,
-		rateLimitScreen: rateLimitScreen,
-		phases:          phases,
+		prepared:         item,
+		err:              err,
+		outcome:          outcome,
+		started:          started,
+		finished:         finished,
+		rollbackPending:  rollbackPending,
+		rateLimitScreen:  rateLimitScreen,
+		rateLimitResetAt: rateLimitResetAt,
+		phases:           phases,
 	}
 }
 
@@ -1611,25 +1622,30 @@ func restartPromptNudge(prompt, nudge string) string {
 	return prependStartupPromptToNudge(prompt, nudge)
 }
 
+// startupRateLimitScreenDetected reports whether the candidate's pane shows a
+// provider rate-limit screen and, when the screen text carries a fully-dated
+// reset timestamp, the parsed reset time. A zero time means no confident
+// reset time was found; the caller falls back to the fixed default
+// quarantine duration.
 func startupRateLimitScreenDetected(
 	item preparedStart,
 	cityPath string,
 	sp runtime.Provider,
 	store beads.Store,
 	cfg *config.City,
-) bool {
+) (bool, time.Time) {
 	if strings.TrimSpace(item.candidate.info.ID) == "" {
-		return false
+		return false, time.Time{}
 	}
 	if cfg != nil && cfg.Session.Provider == "subprocess" {
-		return false
+		return false, time.Time{}
 	}
 	lastWoke := item.candidate.info.LastWokeAt
 	if lastWoke == "" {
-		return false
+		return false, time.Time{}
 	}
 	if _, err := time.Parse(time.RFC3339, lastWoke); err != nil {
-		return false
+		return false, time.Time{}
 	}
 	content, err := workerSessionTargetPeekWithConfig(
 		cityPath,
@@ -1640,7 +1656,11 @@ func startupRateLimitScreenDetected(
 		rateLimitPeekLines,
 		item.cfg.ProcessNames,
 	)
-	return err == nil && runtime.ContainsProviderRateLimitScreen(content)
+	if err != nil || !runtime.ContainsProviderRateLimitScreen(content) {
+		return false, time.Time{}
+	}
+	resetAt, _ := runtime.ParseProviderRateLimitResetTime(content, time.Now())
+	return true, resetAt
 }
 
 func enqueuePreparedStartWaveForCity(
@@ -2309,7 +2329,7 @@ func commitStartFailure(result startResult, sessFront *sessionpkg.Store, clk clo
 	if result.rateLimitScreen {
 		// Terminal failure arm; discard the fold (see the terminal-provider-error note
 		// above). The persist lands via recordRateLimitQuarantine's ApplyPatchInfo.
-		if _, rlErr := recordRateLimitQuarantine(result.prepared.candidate.info, sessFront, clk); rlErr != nil {
+		if _, rlErr := recordRateLimitQuarantine(result.prepared.candidate.info, sessFront, clk, result.rateLimitResetAt); rlErr != nil {
 			fmt.Fprintf(stderr, "session reconciler: recording startup rate-limit hold for %s: %v\n", name, rlErr) //nolint:errcheck
 			if trace != nil {
 				trace.RecordOperation(TraceSiteLifecycleStartRateLimitHold, TraceReasonStart, TraceOutcomeHoldDeferred, "", tp.TemplateName, name, 0, traceRecordPayload{

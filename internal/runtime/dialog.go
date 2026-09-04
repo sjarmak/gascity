@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -1640,6 +1641,40 @@ func ContainsProviderRateLimitScreen(content string) bool {
 	return strings.Contains(strings.ToLower(content), "rate limit") &&
 		strings.Contains(content, "Keep trying") &&
 		strings.Contains(content, "Stop")
+}
+
+// providerRateLimitResetPattern matches a fully-dated reset timestamp in a
+// provider's usage-limit rejection text, e.g. "try again at Aug 7th, 2026
+// 11:32 PM". Only fully-dated matches (month, day, year, and a clock time)
+// are trusted: a bare time-of-day such as "try again at 11:26 PM" carries no
+// reliable date or timezone, so a misjudged AM/PM day rollover could produce
+// a too-short quarantine (reproducing the crash loop) or a too-long one
+// (starving the pool). Bare-time matches are deliberately left unparsed.
+var providerRateLimitResetPattern = regexp.MustCompile(
+	`(?i)(?:try again at|resets)\s+([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})[,\s]+(\d{1,2}):(\d{2})\s*([AP]M)`,
+)
+
+// ParseProviderRateLimitResetTime extracts a fully-dated provider-reported
+// reset timestamp from pane content. The timestamp is interpreted as UTC,
+// matching the convention used by structured reset_at fields elsewhere in
+// the provider APIs. It reports false when no fully-dated match is present,
+// the match fails to parse, or the parsed time is not strictly after now: a
+// stale or malformed match must never shorten a quarantine below the caller's
+// safe default.
+func ParseProviderRateLimitResetTime(content string, now time.Time) (time.Time, bool) {
+	m := providerRateLimitResetPattern.FindStringSubmatch(content)
+	if m == nil {
+		return time.Time{}, false
+	}
+	raw := fmt.Sprintf("%s %s %s %s:%s %s", m[1], m[2], m[3], m[4], m[5], strings.ToUpper(m[6]))
+	parsed, err := time.ParseInLocation("Jan 2 2006 3:04 PM", raw, time.UTC)
+	if err != nil {
+		return time.Time{}, false
+	}
+	if !parsed.After(now) {
+		return time.Time{}, false
+	}
+	return parsed, true
 }
 
 // spendLimitModalWindowLines bounds how many consecutive lines the Claude

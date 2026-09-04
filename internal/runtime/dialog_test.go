@@ -1708,6 +1708,56 @@ func TestContainsProviderRateLimitScreen(t *testing.T) {
 	}
 }
 
+func TestParseProviderRateLimitResetTime(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name    string
+		content string
+		want    time.Time
+		wantOK  bool
+	}{
+		{
+			name:    "fully dated codex reset",
+			content: "You have hit your usage limit. Purchase more credits or try again at Aug 7th, 2026 11:32 PM.",
+			want:    time.Date(2026, 8, 7, 23, 32, 0, 0, time.UTC),
+			wantOK:  true,
+		},
+		{
+			name:    "fully dated resets phrasing",
+			content: "Wait for limit to reset\nResets Sep 12, 2026 4:15 AM (UTC)",
+			want:    time.Date(2026, 9, 12, 4, 15, 0, 0, time.UTC),
+			wantOK:  true,
+		},
+		{
+			name:    "bare time with no date is left unparsed",
+			content: "purchase more credits or try again at 11:26 PM.",
+			wantOK:  false,
+		},
+		{
+			name:    "dated but already in the past is rejected",
+			content: "try again at Jan 1st, 2026 12:00 AM",
+			wantOK:  false,
+		},
+		{
+			name:    "no reset text at all",
+			content: "Hello world",
+			wantOK:  false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := ParseProviderRateLimitResetTime(tt.content, now)
+			if ok != tt.wantOK {
+				t.Fatalf("ParseProviderRateLimitResetTime(%q) ok = %v, want %v", tt.content, ok, tt.wantOK)
+			}
+			if ok && !got.Equal(tt.want) {
+				t.Errorf("ParseProviderRateLimitResetTime(%q) = %v, want %v", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestProviderTerminalErrorReason(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
