@@ -1696,6 +1696,48 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// preserved; the previously per-tick stderr line is now a throttled,
 		// durable session.unknown_state signal (folded onto the tick snapshot).
 		if !isKnownStateInfo(info) {
+			// Interrupted close: ClosePatch stamped a terminal state but the
+			// status flip to closed was lost. Finish the close so the bead
+			// stops holding its pool slot (#2085); fall through to the
+			// unknown-state diagnostic/skip below when the runtime is still
+			// alive, the store view is partial, the boot deferral window is
+			// active, or the work guard declines.
+			//
+			// Gated on isPoolManagedSessionInfo as defense-in-depth: every
+			// stateCode in interruptedCloseSessionStates is written only at
+			// the pool retire path (session_reconciler.go closeBead call
+			// site), which is itself pool-managed-gated, so today these
+			// states can only land on a pool bead. Enforcing that here
+			// rather than relying on the cross-file invariant means a future
+			// write that stamped one of these reasons onto a named/singleton
+			// session's state field would be skipped (the older, safe
+			// behavior) instead of finishing a close that costs a named
+			// session its identity/continuity.
+			if isInterruptedCloseStateInfo(info) && isPoolManagedSessionInfo(info) && !storeQueryPartial && !reconcileOpts.deferSessionClosesOnBoot {
+				state := info.MetadataState
+				providerAlive, aliveErr := workerSessionTargetRunningWithConfig(cityPath, store, sp, cfg, id)
+				if aliveErr != nil {
+					providerAlive = false
+				}
+				if !providerAlive && closeSessionBeadIfReachableStoreUnassigned(cityPath, cfg, store, rigStores, info, state, clk.Now().UTC(), stderr, false) {
+					fmt.Fprintf(stderr, "session reconciler: reaped %s with interrupted-close state %q\n", //nolint:errcheck // best-effort stderr
+						name, state)
+					if trace != nil {
+						trace.RecordDecision(TraceSiteReconcilerUnknownState, TraceReasonInterruptedCloseReaped, TraceOutcomeClosed, info.Template, name, traceRecordPayload{
+							"state": state,
+						})
+					}
+					// Store-only close (closeBead), so the write-returns-Info
+					// fold is MarkClosed: reflect it on the tick snapshot so
+					// the cross-session min-floor scan does not still count
+					// this session as open in its pool this tick.
+					tick.markClosed(id)
+					if shadowTick != nil {
+						shadowTick.markSkip(id, skipEarlyContinue)
+					}
+					continue
+				}
+			}
 			if fold := emitSessionUnknownStateDiagnostic(store, info, snapshot, rec, clk, stderr); fold != nil {
 				tick.apply(id, fold)
 			}
