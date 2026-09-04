@@ -1102,6 +1102,14 @@ func finalizeCanonicalBdScopeInit(cityPath, dir, prefix, doltDatabase string) er
 	} else if err := enforceCanonicalScopeMetadataForInit(fsys.OSFS{}, dir, doltDatabase); err != nil {
 		return err
 	}
+	// A genuinely external (operator-owned) Dolt endpoint is not gc-managed:
+	// init never requires a live connection to it (R5, see
+	// cityExternalDoltEndpointUnverified). Opening the store here would
+	// force a live probe against infrastructure gc does not own or manage
+	// the lifecycle of; defer that verification to actual store use.
+	if target, ok, err := canonicalScopeDoltTarget(cityPath, dir); err == nil && ok && target.External {
+		return nil
+	}
 	store, err := openStoreAtForCity(dir, cityPath)
 	if err != nil {
 		return err
