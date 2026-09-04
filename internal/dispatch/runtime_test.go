@@ -11683,11 +11683,19 @@ func TestFindFinalizeGateConvoyStore(t *testing.T) {
 	// must still resolve terminal through convoy.Members.
 	t.Run("non-synthetic co-resident convoy keeps cross-store member resolution", func(t *testing.T) {
 		primary := beads.NewMemStore()
-		rig := beads.NewMemStore()
+		// Distinct starting sequence: two independent MemStores otherwise both
+		// mint "gc-1" for their first bead, which the residency check (added
+		// on main after this test was written) correctly rejects as a real ID
+		// collision across class handles.
+		rig := beads.NewMemStoreFrom(1000, nil, nil)
 		convoy := mustCreateWorkflowBead(t, primary, beads.Bead{Title: "input convoy", Type: "convoy"})
 		member := mustCreateWorkflowBead(t, rig, beads.Bead{Title: "tracked", Type: "task"})
-		if err := convoycore.TrackItem(primary, convoy.ID, member.ID, rig); err != nil {
-			t.Fatalf("TrackItem: %v", err)
+		// TrackItem now enforces co-residency (ErrMemberNotCoResident), so a
+		// cross-store tracking edge — which convoycore.Members must still
+		// resolve for convoys created before that invariant existed — has to be
+		// written directly rather than through TrackItem.
+		if err := primary.DepAdd(convoy.ID, member.ID, convoycore.TrackingDepType); err != nil {
+			t.Fatalf("DepAdd: %v", err)
 		}
 		opts := ProcessOptions{SourceWorkflowStores: func() ([]SourceWorkflowStore, error) {
 			return []SourceWorkflowStore{{Store: rig, StoreRef: "rig:test"}}, nil
