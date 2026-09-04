@@ -1509,6 +1509,59 @@ func TestRegression_OpenAssignedWorkWithoutReadySignalDoesNotWake(t *testing.T) 
 	assertAsleep(t, result, "polecat-mc-p1")
 }
 
+// TestUnfinishedConvoy_WakesWithNoOtherDemand guards dr-j5yb: a session
+// between two graph.v2 continuation-group steps -- the prior step already
+// closed, the successor not yet materialized as a work bead -- carries no
+// WorkBeads entry at all during that gap, so every existing desired-set pass
+// (assigned-work, named-demand, ...) stays silent. UnfinishedConvoy is an
+// independent signal and must wake the session even with an otherwise-empty
+// desired set, instead of falling through to reason=no-wake-reason and
+// getting drained mid-convoy.
+func TestUnfinishedConvoy_WakesWithNoOtherDemand(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat"}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "mc-p1", SessionName: "polecat-mc-p1", Template: "hello-world/polecat", State: "asleep", UnfinishedConvoy: true},
+		},
+		Now: now,
+	})
+	assertAwake(t, result, "polecat-mc-p1")
+	assertReason(t, result, "polecat-mc-p1", "unfinished-convoy")
+}
+
+func TestUnfinishedConvoy_FalseDoesNotWake(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat"}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "mc-p1", SessionName: "polecat-mc-p1", Template: "hello-world/polecat", State: "asleep", UnfinishedConvoy: false},
+		},
+		Now: now,
+	})
+	assertAsleep(t, result, "polecat-mc-p1")
+}
+
+func TestUnfinishedConvoy_SuspendedAgentDoesNotWake(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat", Suspended: true}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "mc-p1", SessionName: "polecat-mc-p1", Template: "hello-world/polecat", State: "asleep", UnfinishedConvoy: true},
+		},
+		Now: now,
+	})
+	assertAsleep(t, result, "polecat-mc-p1")
+}
+
+func TestUnfinishedConvoy_ClosedSessionDoesNotWake(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat"}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "mc-p1", SessionName: "polecat-mc-p1", Template: "hello-world/polecat", State: "closed", UnfinishedConvoy: true},
+		},
+		Now: now,
+	})
+	assertAsleep(t, result, "polecat-mc-p1")
+}
+
 func TestRegression_SessionWithWorkByAlias_DoesNotWake(t *testing.T) {
 	result := ComputeAwakeSet(AwakeInput{
 		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat"}},

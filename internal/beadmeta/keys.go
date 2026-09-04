@@ -582,3 +582,26 @@ var SessionAffinityMetadataKeys = []string{
 	SessionAffinityMetadataKey,
 	ContinuationGroupMetadataKey,
 }
+
+// WorktreeOwnershipMetadataKeys are the metadata keys published together by
+// `gc worktree ensure` once it hands a bead verified single-owner workspace
+// evidence. cmd/gc/pool_desired_state.go's worktreeSpecForBead treats a work
+// bead as either fully unmanaged (none of these present) or fully verified
+// (all of these present); any other split is incomplete evidence and a hard
+// error, never permission to launch a session into an unverified directory.
+// That means any Go path that copies one of these onto a new bead — a drain
+// fan-out minting recipe steps from a convoy member
+// (internal/dispatch/drain.go), for instance — must copy this whole set
+// together or none of it, on pain of manufacturing exactly the partial-
+// evidence state the validator exists to reject.
+var WorktreeOwnershipMetadataKeys = []string{
+	WorktreeRepoMetadataKey,
+	WorktreeRootMetadataKey,
+	WorkBranchMetadataKey,
+	WorktreeBaseRefMetadataKey,
+	WorktreeBaseSHAMetadataKey,
+	WorktreeCreatorMetadataKey,
+	WorktreeOwnerMetadataKey,
+	WorktreeGenerationMetadataKey,
+	WorktreeLifecycleMetadataKey,
+}

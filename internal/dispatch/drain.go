@@ -1523,6 +1523,20 @@ func stampDrainItemRecipe(recipe *formula.Recipe, control, unit, member beads.Be
 		workDir = strings.TrimSpace(member.Metadata[beadmeta.LegacyWorkDirMetadataKey])
 	}
 	if workDir != "" {
+		// Carry the member's worktree ownership evidence along with work_dir,
+		// not just work_dir alone. worktreeSpecForBead
+		// (cmd/gc/pool_desired_state.go) treats a work bead as either fully
+		// unmanaged (none of beadmeta.WorktreeOwnershipMetadataKeys present) or
+		// fully verified (all present); dropping the ownership keys here while
+		// keeping work_dir manufactures the partial-evidence state that
+		// validator rejects, permanently starving every drained step of a
+		// member that already completed `gc worktree ensure`.
+		ownership := make(map[string]string, len(beadmeta.WorktreeOwnershipMetadataKeys))
+		for _, key := range beadmeta.WorktreeOwnershipMetadataKeys {
+			if value := strings.TrimSpace(member.Metadata[key]); value != "" {
+				ownership[key] = value
+			}
+		}
 		for i := range recipe.Steps {
 			step := &recipe.Steps[i]
 			if step.Metadata == nil {
@@ -1530,6 +1544,9 @@ func stampDrainItemRecipe(recipe *formula.Recipe, control, unit, member beads.Be
 			}
 			step.Metadata[beadmeta.WorkDirMetadataKey] = workDir
 			step.Metadata[beadmeta.LegacyWorkDirMetadataKey] = workDir
+			for key, value := range ownership {
+				step.Metadata[key] = value
+			}
 		}
 	}
 	if strings.TrimSpace(control.Metadata[beadmeta.DrainContextMetadataKey]) == beadmeta.DrainContextShared {

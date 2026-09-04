@@ -3592,6 +3592,19 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		cfg, cityPath, sessionInfos, poolDesired, namedSessionDemand, namedRoutedDemand, workSet, readyWaitSet,
 		assignedWorkBeads, reconcileOpts.readyAssignedFlags, wakeTargets, sp, clk.Now(),
 	)
+	// Fold in the unfinished-convoy signal (dr-j5yb) after the builder rather
+	// than threading store/rigStores through buildAwakeInputFromReconciler's
+	// already-long parameter list: this keeps the fix additive against the
+	// ~17 existing call sites of that builder (production and test) instead
+	// of forcing every one of them to grow two more arguments they don't care
+	// about. Same pattern as every other post-builder fold in this file.
+	if convoyHolders := unfinishedConvoyHolders(sessionInfos, store, rigStores); len(convoyHolders) > 0 {
+		for i := range awakeInput.SessionBeads {
+			if convoyHolders[awakeInput.SessionBeads[i].SessionName] {
+				awakeInput.SessionBeads[i].UnfinishedConvoy = true
+			}
+		}
+	}
 	awakeDecisions := ComputeAwakeSet(awakeInput)
 	wakeEvals := awakeSetToWakeEvals(awakeDecisions, awakeInput.SessionBeads)
 

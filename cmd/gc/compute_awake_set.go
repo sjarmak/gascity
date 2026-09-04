@@ -78,6 +78,16 @@ type AwakeSessionBead struct {
 	ContinuationResetPending  bool      // continuation_reset_pending metadata is set
 	CurrentlyProcessingBeadID string    // work bead the session is currently processing
 	PostCreateProtected       bool      // fresh successful pool create; preferred for scaled slots during grace
+	// UnfinishedConvoy is true when CurrentlyProcessingBeadID names a
+	// graph.v2 continuation-group step whose workflow root is still
+	// in_progress. It closes the dr-j5yb gap: the step this session was
+	// running can close before its successor materializes as a new work
+	// bead, so WorkBeads carries no entry for this session during that
+	// window and every other desired-set pass stays silent. Without an
+	// independent signal here the session falls through to
+	// reason=no-wake-reason and gets drained mid-convoy instead of waiting
+	// for its next step. See unfinishedConvoyHolders (compute_awake_bridge.go).
+	UnfinishedConvoy bool
 }
 
 // AwakeWorkBead represents a work bead with an assignee.
@@ -378,6 +388,25 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 			desired[bead.SessionName] = "min-active"
 			covered++
 		}
+	}
+
+	// Sessions holding an unfinished convoy — see AwakeSessionBead.UnfinishedConvoy
+	// and unfinishedConvoyHolders (compute_awake_bridge.go). Deliberately does
+	// not gate on WaitHold/DependencyOnly the way assigned-work does: those
+	// guards exist to stop demand FROM work waking a parked session, but an
+	// unfinished convoy is not new demand, it is the session's own in-flight
+	// task refusing to be abandoned mid-run.
+	for _, bead := range input.SessionBeads {
+		if !bead.UnfinishedConvoy || bead.State == "closed" {
+			continue
+		}
+		if agent, ok := lookupAgent(bead.Template); ok && agent.Suspended {
+			continue
+		}
+		if _, already := desired[bead.SessionName]; already {
+			continue
+		}
+		desired[bead.SessionName] = "unfinished-convoy"
 	}
 
 	for _, bead := range input.SessionBeads {

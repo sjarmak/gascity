@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -889,5 +890,176 @@ func TestBuildAwakeInputFromReconcilerNamedAlwaysPostChurnRewakes(t *testing.T) 
 	}
 	if got.Reason != "named-always" {
 		t.Errorf("wake reason = %q, want named-always", got.Reason)
+	}
+}
+
+// --- unfinishedConvoyHolders (dr-j5yb) -------------------------------------
+
+// convoyFixtureStore seeds a *beads.MemStore with a step bead (holding
+// gc.continuation_group + gc.root_bead_id) and a root bead the step points at,
+// applying rootOverrides on top of an otherwise-valid in_progress graph.v2
+// workflow root so each test case can flip exactly one field. Create() forces
+// Status="open" and a minted ID on every bead, so both beads are corrected
+// afterward via Update(), which applies an arbitrary Status/Metadata directly.
+func convoyFixtureStore(t *testing.T, stepID, rootID string, rootOverrides map[string]string) beads.Store {
+	t.Helper()
+	store := &beads.MemStore{HonorExplicitIDs: true}
+
+	if _, err := store.Create(beads.Bead{ID: stepID, Title: "step", Type: "task", Status: "open"}); err != nil {
+		t.Fatalf("seeding step bead: %v", err)
+	}
+	if err := store.Update(stepID, beads.UpdateOpts{
+		Status: strPtr("closed"),
+		Metadata: map[string]string{
+			beadmeta.ContinuationGroupMetadataKey: "cg-1",
+			beadmeta.RootBeadIDMetadataKey:        rootID,
+		},
+	}); err != nil {
+		t.Fatalf("closing step bead: %v", err)
+	}
+
+	if _, err := store.Create(beads.Bead{ID: rootID, Title: "root", Type: "task", Status: "open"}); err != nil {
+		t.Fatalf("seeding root bead: %v", err)
+	}
+	rootMeta := map[string]string{
+		beadmeta.FormulaContractMetadataKey: "graph.v2",
+		beadmeta.KindMetadataKey:            "workflow",
+	}
+	for k, v := range rootOverrides {
+		rootMeta[k] = v
+	}
+	rootStatus := "in_progress"
+	if s, ok := rootOverrides["__status"]; ok {
+		rootStatus = s
+		delete(rootMeta, "__status")
+	}
+	rootType := "task"
+	if ty, ok := rootOverrides["__type"]; ok {
+		rootType = ty
+		delete(rootMeta, "__type")
+	}
+	if err := store.Update(rootID, beads.UpdateOpts{
+		Status:   strPtr(rootStatus),
+		Type:     strPtr(rootType),
+		Metadata: rootMeta,
+	}); err != nil {
+		t.Fatalf("updating root bead: %v", err)
+	}
+
+	return store
+}
+
+func convoySessionInfo(t *testing.T, currentBeadID string, closed bool) session.Info {
+	t.Helper()
+	const sessionName = "s-worker"
+	status := "open"
+	if closed {
+		status = "closed"
+	}
+	return sessiontest.SeedBead(t, beads.Bead{
+		ID:     "mc-" + sessionName,
+		Status: status,
+		Type:   "session",
+		Metadata: map[string]string{
+			"session_name":                 sessionName,
+			"template":                     "worker",
+			"currently_processing_bead_id": currentBeadID,
+		},
+	})
+}
+
+func TestUnfinishedConvoyHolders_HoldsWhenRootIsOpenGraphV2Workflow(t *testing.T) {
+	store := convoyFixtureStore(t, "step-1", "root-1", nil)
+	infos := []session.Info{convoySessionInfo(t, "step-1", false)}
+
+	holders := unfinishedConvoyHolders(infos, store, nil)
+
+	if !holders["s-worker"] {
+		t.Fatalf("holders[s-worker] = false, want true (closed step -> in_progress graph.v2 workflow root)")
+	}
+}
+
+func TestUnfinishedConvoyHolders_LooksUpAcrossRigStores(t *testing.T) {
+	rigStore := convoyFixtureStore(t, "step-2", "root-2", nil)
+	infos := []session.Info{convoySessionInfo(t, "step-2", false)}
+
+	holders := unfinishedConvoyHolders(infos, beads.NewMemStore(), map[string]beads.Store{"rig-a": rigStore})
+
+	if !holders["s-worker"] {
+		t.Fatalf("holders[s-worker] = false, want true (fixture only present in a rig store)")
+	}
+}
+
+func TestUnfinishedConvoyHolders_NegativeCases(t *testing.T) {
+	cases := []struct {
+		name          string
+		rootOverrides map[string]string
+	}{
+		{"root closed", map[string]string{"__status": "closed"}},
+		{"root wrong type", map[string]string{"__type": "message"}},
+		{"root wrong formula contract", map[string]string{beadmeta.FormulaContractMetadataKey: "v1"}},
+		{"root wrong kind", map[string]string{beadmeta.KindMetadataKey: "step"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := convoyFixtureStore(t, "step-x", "root-x", tc.rootOverrides)
+			infos := []session.Info{convoySessionInfo(t, "step-x", false)}
+
+			holders := unfinishedConvoyHolders(infos, store, nil)
+
+			if holders["s-worker"] {
+				t.Fatalf("holders[s-worker] = true, want false for case %q", tc.name)
+			}
+		})
+	}
+}
+
+func TestUnfinishedConvoyHolders_StepMissingLinkageDoesNotHold(t *testing.T) {
+	store := &beads.MemStore{HonorExplicitIDs: true}
+	if _, err := store.Create(beads.Bead{ID: "step-y", Title: "step", Type: "task", Status: "open"}); err != nil {
+		t.Fatalf("seeding step bead: %v", err)
+	}
+	if err := store.Update("step-y", beads.UpdateOpts{Status: strPtr("closed")}); err != nil {
+		t.Fatalf("closing step bead: %v", err)
+	}
+	infos := []session.Info{convoySessionInfo(t, "step-y", false)}
+
+	holders := unfinishedConvoyHolders(infos, store, nil)
+
+	if holders["s-worker"] {
+		t.Fatalf("holders[s-worker] = true, want false (step carries no continuation_group/root_bead_id)")
+	}
+}
+
+func TestUnfinishedConvoyHolders_EmptyCurrentBeadIDDoesNotHold(t *testing.T) {
+	store := convoyFixtureStore(t, "step-z", "root-z", nil)
+	infos := []session.Info{convoySessionInfo(t, "", false)}
+
+	holders := unfinishedConvoyHolders(infos, store, nil)
+
+	if holders["s-worker"] {
+		t.Fatalf("holders[s-worker] = true, want false (no CurrentlyProcessingBeadID)")
+	}
+}
+
+func TestUnfinishedConvoyHolders_ClosedSessionDoesNotHold(t *testing.T) {
+	store := convoyFixtureStore(t, "step-w", "root-w", nil)
+	infos := []session.Info{convoySessionInfo(t, "step-w", true)}
+
+	holders := unfinishedConvoyHolders(infos, store, nil)
+
+	if holders["s-worker"] {
+		t.Fatalf("holders[s-worker] = true, want false (closed session Info)")
+	}
+}
+
+func TestUnfinishedConvoyHolders_MissingStepBeadIsFailOpen(t *testing.T) {
+	store := beads.NewMemStore()
+	infos := []session.Info{convoySessionInfo(t, "step-does-not-exist", false)}
+
+	holders := unfinishedConvoyHolders(infos, store, nil)
+
+	if holders["s-worker"] {
+		t.Fatalf("holders[s-worker] = true, want false (step lookup miss must fail open, not panic or hold)")
 	}
 }

@@ -1544,6 +1544,107 @@ bond = "mol-voter"
 	}
 }
 
+// TestStampDrainItemRecipePropagatesWorktreeOwnershipAlongsideWorkDir guards
+// dr-j5yb: worktreeSpecForBead (cmd/gc/pool_desired_state.go) treats a work
+// bead as either fully unmanaged (none of beadmeta.WorktreeOwnershipMetadataKeys
+// present) or fully verified (all present) -- any other split is a hard
+// error. A convoy member that already completed `gc worktree ensure` carries
+// full ownership evidence; every step stampDrainItemRecipe fans out from it
+// must carry that same evidence, not just gc.work_dir, or the fanned step
+// lands in the rejected partial-evidence state and starves forever.
+func TestStampDrainItemRecipePropagatesWorktreeOwnershipAlongsideWorkDir(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	content := `
+formula = "drain-item"
+version = 1
+contract = "graph.v2"
+type = "workflow"
+
+[[steps]]
+id = "work"
+title = "Work {{convoy_id}}"
+
+[steps.on_complete]
+for_each = "output.voters"
+bond = "mol-voter"
+`
+	if err := os.WriteFile(filepath.Join(dir, "drain-item.formula.toml"), []byte(strings.TrimSpace(content)+"\n"), 0o644); err != nil {
+		t.Fatalf("write formula: %v", err)
+	}
+
+	memberWorkDir := filepath.Join(t.TempDir(), "member-workspace")
+	fullOwnership := map[string]string{
+		beadmeta.WorktreeRepoMetadataKey:       "/home/ds/gascity",
+		beadmeta.WorktreeRootMetadataKey:       "/home/ds/gascity-worktrees/gascity-worker-slots",
+		beadmeta.WorkBranchMetadataKey:         "work/gc-dzhyp",
+		beadmeta.WorktreeBaseRefMetadataKey:    "origin/main",
+		beadmeta.WorktreeBaseSHAMetadataKey:    "1130f27c902fb5b320b2bfe4d37f91cc3ec78ab2",
+		beadmeta.WorktreeCreatorMetadataKey:    "gascity-worker-pool-4",
+		beadmeta.WorktreeOwnerMetadataKey:      "gascity-worker-pool-4",
+		beadmeta.WorktreeGenerationMetadataKey: "1",
+		beadmeta.WorktreeLifecycleMetadataKey:  "active",
+	}
+
+	t.Run("member has full ownership evidence", func(t *testing.T) {
+		recipe, err := formula.CompileWithoutRuntimeVarValidation(context.Background(), "drain-item", []string{dir}, map[string]string{graphv2.ConvoyIDVar: "unit-1"})
+		if err != nil {
+			t.Fatalf("CompileWithoutRuntimeVarValidation: %v", err)
+		}
+		control := beads.Bead{ID: "drain-1", Metadata: map[string]string{
+			beadmeta.KindMetadataKey: beadmeta.KindDrain,
+		}}
+		unit := beads.Bead{ID: "unit-1"}
+		memberMetadata := map[string]string{beadmeta.WorkDirMetadataKey: memberWorkDir}
+		for key, value := range fullOwnership {
+			memberMetadata[key] = value
+		}
+		member := beads.Bead{ID: "member-1", Metadata: memberMetadata}
+		row := &drainManifestRow{Index: 0, ItemRootKey: "item-key-1"}
+
+		stampDrainItemRecipe(recipe, control, unit, member, 1, row, "drain-item", nil)
+
+		if len(recipe.Steps) == 0 {
+			t.Fatalf("compiled recipe has no steps")
+		}
+		for i := range recipe.Steps {
+			step := &recipe.Steps[i]
+			if got := step.Metadata[beadmeta.WorkDirMetadataKey]; got != memberWorkDir {
+				t.Errorf("step %s gc.work_dir = %q, want %q", step.ID, got, memberWorkDir)
+			}
+			for key, want := range fullOwnership {
+				if got := step.Metadata[key]; got != want {
+					t.Errorf("step %s %s = %q, want %q", step.ID, key, got, want)
+				}
+			}
+		}
+	})
+
+	t.Run("member has no ownership evidence stays unmanaged", func(t *testing.T) {
+		recipe, err := formula.CompileWithoutRuntimeVarValidation(context.Background(), "drain-item", []string{dir}, map[string]string{graphv2.ConvoyIDVar: "unit-2"})
+		if err != nil {
+			t.Fatalf("CompileWithoutRuntimeVarValidation: %v", err)
+		}
+		control := beads.Bead{ID: "drain-2", Metadata: map[string]string{
+			beadmeta.KindMetadataKey: beadmeta.KindDrain,
+		}}
+		unit := beads.Bead{ID: "unit-2"}
+		member := beads.Bead{ID: "member-2", Metadata: map[string]string{beadmeta.WorkDirMetadataKey: memberWorkDir}}
+		row := &drainManifestRow{Index: 0, ItemRootKey: "item-key-2"}
+
+		stampDrainItemRecipe(recipe, control, unit, member, 1, row, "drain-item", nil)
+
+		for i := range recipe.Steps {
+			step := &recipe.Steps[i]
+			for _, key := range beadmeta.WorktreeOwnershipMetadataKeys {
+				if got := step.Metadata[key]; got != "" {
+					t.Errorf("step %s %s = %q, want unset (member published no ownership evidence)", step.ID, key, got)
+				}
+			}
+		}
+	})
+}
+
 func seedDrainWorkflow(t *testing.T) (*beads.MemStore, beads.Bead) {
 	t.Helper()
 	store := beads.NewMemStore()

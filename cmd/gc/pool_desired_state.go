@@ -84,34 +84,21 @@ func worktreeSpecForBead(bead beads.Bead, storeRef string) (*worktree.Spec, erro
 	if path == "" {
 		return nil, nil
 	}
-	values := []struct {
-		key   string
-		value string
-	}{
-		{beadmeta.WorktreeRepoMetadataKey, bead.Metadata[beadmeta.WorktreeRepoMetadataKey]},
-		{beadmeta.WorktreeRootMetadataKey, bead.Metadata[beadmeta.WorktreeRootMetadataKey]},
-		{beadmeta.WorkBranchMetadataKey, bead.Metadata[beadmeta.WorkBranchMetadataKey]},
-		{beadmeta.WorktreeBaseRefMetadataKey, bead.Metadata[beadmeta.WorktreeBaseRefMetadataKey]},
-		{beadmeta.WorktreeBaseSHAMetadataKey, bead.Metadata[beadmeta.WorktreeBaseSHAMetadataKey]},
-		{beadmeta.WorktreeCreatorMetadataKey, bead.Metadata[beadmeta.WorktreeCreatorMetadataKey]},
-		{beadmeta.WorktreeOwnerMetadataKey, bead.Metadata[beadmeta.WorktreeOwnerMetadataKey]},
-		{beadmeta.WorktreeGenerationMetadataKey, bead.Metadata[beadmeta.WorktreeGenerationMetadataKey]},
-		{beadmeta.WorktreeLifecycleMetadataKey, bead.Metadata[beadmeta.WorktreeLifecycleMetadataKey]},
-	}
-	missing := make([]string, 0, len(values))
-	for _, item := range values {
-		if strings.TrimSpace(item.value) == "" {
-			missing = append(missing, item.key)
+	missing := make([]string, 0, len(beadmeta.WorktreeOwnershipMetadataKeys))
+	for _, key := range beadmeta.WorktreeOwnershipMetadataKeys {
+		if strings.TrimSpace(bead.Metadata[key]) == "" {
+			missing = append(missing, key)
 		}
 	}
-	if len(missing) == len(values) {
+	if len(missing) == len(beadmeta.WorktreeOwnershipMetadataKeys) {
 		// A bead carrying work_dir without any ownership evidence is not
-		// incomplete evidence -- it never claimed to publish any. Recipe steps
-		// are still minted this way (stampDrainItemRecipe in
-		// internal/dispatch/drain.go copies both work_dir spellings and none
-		// of the nine ownership keys), so treat it as an unmanaged workspace
-		// and let the seat spawn as it always did, instead of erroring it into
-		// permanent starvation.
+		// incomplete evidence -- it never claimed to publish any. Treat it as
+		// an unmanaged workspace and let the seat spawn as it always did,
+		// instead of erroring it into permanent starvation. (Drain fan-out,
+		// internal/dispatch/drain.go's stampDrainItemRecipe, propagates
+		// beadmeta.WorktreeOwnershipMetadataKeys alongside work_dir when the
+		// convoy member carries it, so this all-missing branch is reserved for
+		// a member that itself never went through `gc worktree ensure`.)
 		if _, dup := legacyWorkDirNoticeSeen.LoadOrStore(bead.ID, struct{}{}); !dup {
 			log.Printf("worktreeSpecForBead: work bead %s has %s=%q with no worktree ownership metadata; treating as unmanaged",
 				bead.ID, pathKey, path)
