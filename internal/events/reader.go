@@ -472,15 +472,38 @@ func streamArchive(path string, _ Filter, fn func(Event) bool) error {
 // Only archives are searched. Callers that also care about the active log
 // should read its tail first, which is the cheap case, and fall back here only
 // when the active log holds no match.
+//
+// This is unbounded: for a rare event type whose newest occurrence is far
+// back, the walk still opens every archive between the tail and that match.
+// Callers on a latency budget should use LatestArchivedMatchBounded instead.
 func LatestArchivedMatch(path string, filter Filter) (Event, bool, error) {
+	e, found, _, err := LatestArchivedMatchBounded(path, filter, 0)
+	return e, found, err
+}
+
+// LatestArchivedMatchBounded is LatestArchivedMatch capped at opening at most
+// maxArchives archives (maxArchives <= 0 means unbounded, identical to
+// LatestArchivedMatch). The stopping rule that makes LatestArchivedMatch cheap
+// in the common case ("an unopened archive can only improve the answer once a
+// match is already in hand") cannot fire until a match is found, so for a rare
+// event type every newer archive holding no match is opened on the way back to
+// one. maxArchives turns that unbounded walk into a deterministic one: once the
+// budget of opened (filter-overlapping) archives is spent without a match, the
+// search stops and reports truncated=true rather than opening another archive.
+//
+// truncated is only meaningful when found is false: a match found within
+// budget is always the true newest archived match, exactly as
+// LatestArchivedMatch would return.
+func LatestArchivedMatchBounded(path string, filter Filter, maxArchives int) (event Event, found bool, truncated bool, err error) {
 	dir := filepath.Dir(path)
 	archives, err := archiveFilesIn(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return Event{}, false, nil
+			return Event{}, false, false, nil
 		}
-		return Event{}, false, fmt.Errorf("listing event archives in %q: %w", dir, err)
+		return Event{}, false, false, fmt.Errorf("listing event archives in %q: %w", dir, err)
 	}
+	opened := 0
 	// archiveFilesIn sorts ascending by FirstSeq, so descending indexes walk
 	// newest archive first.
 	for i := len(archives) - 1; i >= 0; i-- {
@@ -488,6 +511,10 @@ func LatestArchivedMatch(path string, filter Filter) (Event, bool, error) {
 		if !archiveOverlapsFilter(info, filter) {
 			continue
 		}
+		if maxArchives > 0 && opened >= maxArchives {
+			return Event{}, false, true, nil
+		}
+		opened++
 		var (
 			newest Event
 			found  bool
@@ -503,13 +530,13 @@ func LatestArchivedMatch(path string, filter Filter) (Event, bool, error) {
 			return true
 		})
 		if err != nil {
-			return Event{}, false, fmt.Errorf("reading archive %q: %w", info.Basename, err)
+			return Event{}, false, false, fmt.Errorf("reading archive %q: %w", info.Basename, err)
 		}
 		if found {
-			return newest, true, nil
+			return newest, true, false, nil
 		}
 	}
-	return Event{}, false, nil
+	return Event{}, false, false, nil
 }
 
 // ReadFilteredTail reads the trailing matching events from path. A positive

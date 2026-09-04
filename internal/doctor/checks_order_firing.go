@@ -41,6 +41,22 @@ const (
 	// exists to be a good citizen against the data plane rather than to
 	// protect the check — the wall time it saves is the whole point.
 	orderFiringLastRunConcurrency = 8
+	// controllerStartArchiveBudget bounds how many archives the controller-
+	// start fallback (events.LatestArchivedMatchBounded) will open. Even
+	// stopping at the newest matching archive, that walk is unbounded for a
+	// rare event type: controller.started is emitted only on controller or
+	// supervisor start, so on a city that has stayed up across many
+	// rotations, every archive back to the last start holds no match and is
+	// opened anyway (gc-wmhus). Measured archive cost is ~0.82s/archive
+	// (30.2s / 37 archives, zcat-only, before decode). This check shares its
+	// 15s orderFiringHistoryTimeout with the order.fired reads and the
+	// order-run lookups, so the archive budget is sized well under that
+	// ceiling rather than against it alone: 8 archives is ~6.6s of zcat,
+	// leaving headroom for the rest of the check on the same busy city that
+	// makes the walk expensive. Exhausting the budget without a match reports
+	// controller start as unknown (classifyOrderFiring's existing zero-time
+	// outcome), never a fabricated or stale timestamp.
+	controllerStartArchiveBudget = 8
 )
 
 // OrderFiringCurrentLastRunFunc reports the newest persisted run time for an
@@ -631,13 +647,19 @@ func (c *OrderFiringCurrentCheck) readEventTail(path string, filter events.Filte
 // all does it look in the archives, and then it stops at the newest archive
 // holding one.
 //
-// The archive leg deliberately does not use an unbounded read. That walk
-// gunzips and decodes every retained archive, and its cost grows with every
-// rotation: on a city with 70 archives it measured over 110 seconds of CPU,
-// inside `gc doctor` and inside the supervisor's order-dispatch pass. The
-// condition that reaches this leg — an active log with no controller start —
-// persists for as long as the controller stays up across rotations, so the
-// walk was paid on every invocation rather than rarely.
+// The archive leg deliberately does not use an unbounded read. Even stopping
+// at the newest archive holding a match, that walk grows with how far back
+// the newest match is: every newer archive containing no match is opened on
+// the way back to one. For controller.started — emitted only on controller or
+// supervisor start — a long-lived controller means the newest match can be
+// many rotations back, and on a city with 70 archives the unbounded version of
+// this walk measured over 110 seconds of CPU, inside `gc doctor` and inside
+// the supervisor's order-dispatch pass. The condition that reaches this leg —
+// an active log with no controller start — persists for as long as the
+// controller stays up across rotations, so the walk was paid on every
+// invocation rather than rarely. The archive count is bounded by
+// controllerStartArchiveBudget instead; exhausting it reports controller start
+// as unknown rather than opening another archive.
 func (c *OrderFiringCurrentCheck) latestControllerStartedAt(eventPath string) (time.Time, error) {
 	filter := events.Filter{Type: events.ControllerStarted}
 	startEvents, err := c.readEventTail(eventPath, filter, 1)
@@ -653,9 +675,12 @@ func (c *OrderFiringCurrentCheck) latestControllerStartedAt(eventPath string) (t
 	if !latest.IsZero() {
 		return latest, nil
 	}
-	archived, found, err := events.LatestArchivedMatch(eventPath, filter)
+	archived, found, truncated, err := events.LatestArchivedMatchBounded(eventPath, filter, controllerStartArchiveBudget)
 	if err != nil {
 		return time.Time{}, err
+	}
+	if truncated {
+		log.Printf("gc doctor: controller-start archive search truncated at %d archives for %s; reporting controller start as unknown", controllerStartArchiveBudget, eventPath)
 	}
 	if !found {
 		return time.Time{}, nil

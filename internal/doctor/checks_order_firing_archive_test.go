@@ -124,3 +124,51 @@ func TestLatestControllerStartedAtReportsUnknownWhenNothingRecorded(t *testing.T
 		t.Errorf("latestControllerStartedAt = %s, want zero time when no controller start was recorded", got.UTC())
 	}
 }
+
+// TestLatestControllerStartedAtTruncatesWithinArchiveBudget is the regression
+// guard for gc-wmhus: a controller.started match that lies further back than
+// controllerStartArchiveBudget must not be reached by opening more archives.
+// The check reports controller start as unknown (the existing zero-time
+// contract) rather than paying for an unbounded walk.
+//
+// The archives inside the budget are real matchless events; everything past
+// the budget is deliberately invalid gzip, so any read beyond the budget
+// fails loudly and the test would catch a regression to an unbounded walk.
+func TestLatestControllerStartedAtTruncatesWithinArchiveBudget(t *testing.T) {
+	cityPath := t.TempDir()
+	dir := filepath.Join(cityPath, ".gc")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("creating event dir: %v", err)
+	}
+
+	// Active log: no controller start, forces the archive fallback.
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.OrderFired, Ts: time.Date(2026, 8, 20, 1, 0, 0, 0, time.UTC)},
+	)
+
+	// One archive older than all the budget archives below, holding the only
+	// controller start. It is outside the budget and must never be opened.
+	base := "events.jsonl.archive-20260801T000000Z-seq-1-50.gz"
+	if err := os.WriteFile(filepath.Join(dir, base), []byte("not gzip at all"), 0o600); err != nil {
+		t.Fatalf("writing unreadable archive: %v", err)
+	}
+
+	// controllerStartArchiveBudget readable, matchless archives, all with
+	// seq ranges above the unreadable archive so they sort newer.
+	for i := 0; i < controllerStartArchiveBudget; i++ {
+		first := uint64(100 + i*100 + 1)
+		last := uint64(100 + (i+1)*100)
+		writeOrderFiringArchive(t, cityPath, fmt.Sprintf("202608%02dT000000Z", i+2), first, last,
+			fmt.Sprintf(`{"seq":%d,"type":%q,"ts":%q,"actor":"test"}`+"\n",
+				last, events.OrderFired, time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC).Format(time.RFC3339Nano)))
+	}
+
+	check := NewOrderFiringCurrentCheck(nil, cityPath)
+	got, err := check.latestControllerStartedAt(filepath.Join(dir, "events.jsonl"))
+	if err != nil {
+		t.Fatalf("latestControllerStartedAt opened past its archive budget: %v", err)
+	}
+	if !got.IsZero() {
+		t.Errorf("latestControllerStartedAt = %s, want zero time (unknown) when the match is outside the archive budget", got.UTC())
+	}
+}
