@@ -17,6 +17,8 @@ import (
 	"github.com/gastownhall/gascity/internal/formulatest"
 	"github.com/gastownhall/gascity/internal/graphv2"
 	"github.com/gastownhall/gascity/internal/molecule"
+	"github.com/gastownhall/gascity/internal/testutil"
+	"github.com/gastownhall/gascity/internal/worktree"
 )
 
 func TestProcessDrainSeparateExpandsConvoyIntoUnitRoots(t *testing.T) {
@@ -1541,6 +1543,193 @@ bond = "mol-voter"
 	}
 	if got, want := workStep.Metadata[beadmeta.SessionAffinityMetadataKey], "require"; got != want {
 		t.Errorf("work step gc.session_affinity = %q, want %q", got, want)
+	}
+}
+
+// managedWorktreeMemberMetadata returns the full nine-key worktree
+// ownership metadata plus work_dir a real drain member carries when its
+// workspace was minted through worktree.Ensure (e.g. mol-scoped-work's
+// workspace-setup step). The caller supplies the owning bead's id via the
+// member bead's own ID field, not through this metadata.
+func managedWorktreeMemberMetadata(t *testing.T, repo, root, workDir, base string) map[string]string {
+	t.Helper()
+	baseSHA := testutil.RunGit(t, repo, "rev-parse", base)
+	return map[string]string{
+		beadmeta.WorkDirMetadataKey:            workDir,
+		beadmeta.LegacyWorkDirMetadataKey:      workDir,
+		beadmeta.WorktreeRepoMetadataKey:       repo,
+		beadmeta.WorktreeRootMetadataKey:       root,
+		beadmeta.WorkBranchMetadataKey:         "work/member-1",
+		beadmeta.WorktreeBaseRefMetadataKey:    base,
+		beadmeta.WorktreeBaseSHAMetadataKey:    baseSHA,
+		beadmeta.WorktreeCreatorMetadataKey:    "formula:mol-scoped-work",
+		beadmeta.WorktreeOwnerMetadataKey:      "formula:mol-scoped-work",
+		beadmeta.WorktreeGenerationMetadataKey: "1",
+		beadmeta.WorktreeLifecycleMetadataKey:  worktree.LifecycleActive,
+		beadmeta.RootStoreRefMetadataKey:       "city",
+	}
+}
+
+func TestDrainMemberWorktreeSpecRequiresFullOwnership(t *testing.T) {
+	full := map[string]string{
+		beadmeta.WorkDirMetadataKey:            "/root/member-1",
+		beadmeta.LegacyWorkDirMetadataKey:      "/root/member-1",
+		beadmeta.WorktreeRepoMetadataKey:       "/repo",
+		beadmeta.WorktreeRootMetadataKey:       "/root",
+		beadmeta.WorkBranchMetadataKey:         "work/member-1",
+		beadmeta.WorktreeBaseRefMetadataKey:    "main",
+		beadmeta.WorktreeBaseSHAMetadataKey:    "deadbeef",
+		beadmeta.WorktreeCreatorMetadataKey:    "formula:mol-scoped-work",
+		beadmeta.WorktreeOwnerMetadataKey:      "formula:mol-scoped-work",
+		beadmeta.WorktreeGenerationMetadataKey: "1",
+		beadmeta.WorktreeLifecycleMetadataKey:  worktree.LifecycleActive,
+		beadmeta.RootStoreRefMetadataKey:       "city",
+	}
+	for key := range full {
+		if key == beadmeta.WorkDirMetadataKey || key == beadmeta.LegacyWorkDirMetadataKey {
+			continue
+		}
+		partial := make(map[string]string, len(full))
+		for k, v := range full {
+			partial[k] = v
+		}
+		delete(partial, key)
+		member := beads.Bead{ID: "member-1", Metadata: partial}
+		if got := drainMemberWorktreeSpec(member, partial[beadmeta.WorkDirMetadataKey]); got != nil {
+			t.Errorf("drainMemberWorktreeSpec with %s missing = %+v, want nil", key, got)
+		}
+	}
+	member := beads.Bead{ID: "member-1", Metadata: full}
+	spec := drainMemberWorktreeSpec(member, full[beadmeta.WorkDirMetadataKey])
+	if spec == nil {
+		t.Fatal("drainMemberWorktreeSpec with full ownership = nil, want a Spec")
+	}
+	if spec.BeadID != "member-1" {
+		t.Errorf("spec.BeadID = %q, want member's own id %q", spec.BeadID, "member-1")
+	}
+	if spec.Path != full[beadmeta.WorkDirMetadataKey] {
+		t.Errorf("spec.Path = %q, want %q", spec.Path, full[beadmeta.WorkDirMetadataKey])
+	}
+}
+
+func TestDrainMemberWorktreeSpecUnmanagedWhenOwnershipAbsent(t *testing.T) {
+	member := beads.Bead{ID: "member-1", Metadata: map[string]string{beadmeta.WorkDirMetadataKey: "/some/dir"}}
+	if got := drainMemberWorktreeSpec(member, "/some/dir"); got != nil {
+		t.Errorf("drainMemberWorktreeSpec with no ownership metadata = %+v, want nil", got)
+	}
+}
+
+func TestEnsureDrainMemberWorktreeCreatesManagedWorkspace(t *testing.T) {
+	repo, base := testutil.InitGitRepo(t)
+	root := t.TempDir()
+	workDir := filepath.Join(root, "member-1")
+	member := beads.Bead{
+		ID:       "member-1",
+		Metadata: managedWorktreeMemberMetadata(t, repo, root, workDir, base),
+	}
+
+	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
+		t.Fatalf("workDir %s must not exist before Ensure; stat err=%v", workDir, err)
+	}
+	if err := ensureDrainMemberWorktree(member, workDir); err != nil {
+		t.Fatalf("ensureDrainMemberWorktree: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, ".git")); err != nil {
+		t.Fatalf("workDir %s was not provisioned as a worktree: %v", workDir, err)
+	}
+	branch := testutil.RunGit(t, workDir, "rev-parse", "--abbrev-ref", "HEAD")
+	if branch != "work/member-1" {
+		t.Fatalf("workDir branch = %q, want %q", branch, "work/member-1")
+	}
+}
+
+func TestEnsureDrainMemberWorktreeFailsOnOwnershipMismatch(t *testing.T) {
+	repo, base := testutil.InitGitRepo(t)
+	root := t.TempDir()
+	workDir := filepath.Join(root, "member-1")
+	original := beads.Bead{
+		ID:       "member-1",
+		Metadata: managedWorktreeMemberMetadata(t, repo, root, workDir, base),
+	}
+	if err := ensureDrainMemberWorktree(original, workDir); err != nil {
+		t.Fatalf("ensureDrainMemberWorktree(original): %v", err)
+	}
+
+	impostor := beads.Bead{
+		ID:       "member-2",
+		Metadata: managedWorktreeMemberMetadata(t, repo, root, workDir, base),
+	}
+	if err := ensureDrainMemberWorktree(impostor, workDir); err == nil {
+		t.Fatal("ensureDrainMemberWorktree(impostor) = nil error, want ownership mismatch")
+	}
+}
+
+func TestStampDrainItemRecipePropagatesAfterMemberWorktreeEnsured(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeDrainItemFormula(t, dir)
+	recipe, err := formula.CompileWithoutRuntimeVarValidation(context.Background(), "drain-item", []string{dir}, map[string]string{graphv2.ConvoyIDVar: "unit-1"})
+	if err != nil {
+		t.Fatalf("CompileWithoutRuntimeVarValidation: %v", err)
+	}
+	repo, base := testutil.InitGitRepo(t)
+	root := t.TempDir()
+	workDir := filepath.Join(root, "member-1")
+	control := beads.Bead{ID: "drain-1", Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindDrain}}
+	unit := beads.Bead{ID: "unit-1"}
+	member := beads.Bead{
+		ID:       "member-1",
+		Metadata: managedWorktreeMemberMetadata(t, repo, root, workDir, base),
+	}
+	row := &drainManifestRow{Index: 0, ItemRootKey: "item-key-1"}
+
+	stampDrainItemRecipe(recipe, control, unit, member, 1, row, "drain-item", nil)
+
+	if _, err := os.Stat(filepath.Join(workDir, ".git")); err != nil {
+		t.Fatalf("workDir %s was not provisioned by stampDrainItemRecipe: %v", workDir, err)
+	}
+	for i := range recipe.Steps {
+		step := &recipe.Steps[i]
+		if got := step.Metadata[beadmeta.WorkDirMetadataKey]; got != workDir {
+			t.Errorf("step %s %s = %q, want %q", step.ID, beadmeta.WorkDirMetadataKey, got, workDir)
+		}
+	}
+}
+
+func TestStampDrainItemRecipeSkipsPropagationOnWorktreeVerificationFailure(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeDrainItemFormula(t, dir)
+	recipe, err := formula.CompileWithoutRuntimeVarValidation(context.Background(), "drain-item", []string{dir}, map[string]string{graphv2.ConvoyIDVar: "unit-1"})
+	if err != nil {
+		t.Fatalf("CompileWithoutRuntimeVarValidation: %v", err)
+	}
+	repo, base := testutil.InitGitRepo(t)
+	root := t.TempDir()
+	workDir := filepath.Join(root, "member-1")
+	original := beads.Bead{
+		ID:       "member-1",
+		Metadata: managedWorktreeMemberMetadata(t, repo, root, workDir, base),
+	}
+	if err := ensureDrainMemberWorktree(original, workDir); err != nil {
+		t.Fatalf("ensureDrainMemberWorktree(original): %v", err)
+	}
+
+	control := beads.Bead{ID: "drain-1", Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindDrain}}
+	unit := beads.Bead{ID: "unit-1"}
+	impostor := beads.Bead{
+		ID:       "member-2",
+		Metadata: managedWorktreeMemberMetadata(t, repo, root, workDir, base),
+	}
+	row := &drainManifestRow{Index: 0, ItemRootKey: "item-key-2"}
+
+	stampDrainItemRecipe(recipe, control, unit, impostor, 1, row, "drain-item", nil)
+
+	for i := range recipe.Steps {
+		step := &recipe.Steps[i]
+		if got := step.Metadata[beadmeta.WorkDirMetadataKey]; got != "" {
+			t.Errorf("step %s %s = %q, want unset after failed worktree verification", step.ID, beadmeta.WorkDirMetadataKey, got)
+		}
 	}
 }
 

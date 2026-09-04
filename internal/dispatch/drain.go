@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 	"github.com/gastownhall/gascity/internal/storeref"
+	"github.com/gastownhall/gascity/internal/worktree"
 )
 
 const (
@@ -1523,6 +1525,13 @@ func stampDrainItemRecipe(recipe *formula.Recipe, control, unit, member beads.Be
 		workDir = strings.TrimSpace(member.Metadata[beadmeta.LegacyWorkDirMetadataKey])
 	}
 	if workDir != "" {
+		if err := ensureDrainMemberWorktree(member, workDir); err != nil {
+			log.Printf("stampDrainItemRecipe: %s: member %s work dir %s failed worktree verification, not propagating to item workflow: %v",
+				control.ID, member.ID, workDir, err)
+			workDir = ""
+		}
+	}
+	if workDir != "" {
 		for i := range recipe.Steps {
 			step := &recipe.Steps[i]
 			if step.Metadata == nil {
@@ -1545,6 +1554,71 @@ func stampDrainItemRecipe(recipe *formula.Recipe, control, unit, member beads.Be
 			step.Metadata[beadmeta.ContinuationGroupMetadataKey] = group
 			step.Metadata[beadmeta.SessionAffinityMetadataKey] = "require"
 		}
+	}
+}
+
+// ensureDrainMemberWorktree verifies (creating if missing) the drain
+// member's own worktree before its work_dir is trusted and copied onto the
+// item workflow's steps. This closes the gap where a routed bead's work_dir
+// was computed (poolTriggerWorkDir) but never provisioned through
+// worktree.Ensure: without this check, stampDrainItemRecipe would copy an
+// unverified path onto every new item step, and a worker could end up
+// editing whatever that path actually resolves to.
+//
+// A member carrying the full nine-key worktree ownership set (see
+// worktreeSpecForBead in cmd/gc/pool_desired_state.go) gets that workspace
+// verified or created, using the member's own bead id as the worktree's
+// owner — mirroring what `gc worktree ensure` does for a freshly-minted
+// worktree. A member with partial or no ownership metadata is left
+// unmanaged, same as before this fix: reconstructing a Spec would need
+// RepoDir/Branch/Base this call site has no other source for.
+func ensureDrainMemberWorktree(member beads.Bead, workDir string) error {
+	spec := drainMemberWorktreeSpec(member, workDir)
+	if spec == nil {
+		return nil
+	}
+	if _, err := worktree.Ensure(*spec); err != nil {
+		return err
+	}
+	return nil
+}
+
+// drainMemberWorktreeSpec reconstructs a worktree.Spec from a drain
+// member's own metadata, mirroring worktreeSpecForBead
+// (cmd/gc/pool_desired_state.go). It returns nil when the member's
+// ownership metadata is absent or incomplete: an all-9-absent member never
+// claimed to publish worktree ownership, and a partial set cannot be
+// resolved into a valid Spec (no RepoDir/Branch/Base to fall back on), so
+// both cases are treated as unmanaged rather than erroring.
+func drainMemberWorktreeSpec(member beads.Bead, workDir string) *worktree.Spec {
+	repo := strings.TrimSpace(member.Metadata[beadmeta.WorktreeRepoMetadataKey])
+	root := strings.TrimSpace(member.Metadata[beadmeta.WorktreeRootMetadataKey])
+	branch := strings.TrimSpace(member.Metadata[beadmeta.WorkBranchMetadataKey])
+	base := strings.TrimSpace(member.Metadata[beadmeta.WorktreeBaseRefMetadataKey])
+	baseSHA := strings.TrimSpace(member.Metadata[beadmeta.WorktreeBaseSHAMetadataKey])
+	creator := strings.TrimSpace(member.Metadata[beadmeta.WorktreeCreatorMetadataKey])
+	owner := strings.TrimSpace(member.Metadata[beadmeta.WorktreeOwnerMetadataKey])
+	generation := strings.TrimSpace(member.Metadata[beadmeta.WorktreeGenerationMetadataKey])
+	lifecycle := strings.TrimSpace(member.Metadata[beadmeta.WorktreeLifecycleMetadataKey])
+	storeRef := strings.TrimSpace(member.Metadata[beadmeta.RootStoreRefMetadataKey])
+	for _, value := range []string{repo, root, branch, base, baseSHA, creator, owner, generation, lifecycle, storeRef} {
+		if value == "" {
+			return nil
+		}
+	}
+	return &worktree.Spec{
+		RepoDir:    repo,
+		Root:       root,
+		Path:       workDir,
+		Branch:     branch,
+		Base:       base,
+		BaseSHA:    baseSHA,
+		BeadID:     strings.TrimSpace(member.ID),
+		StoreRef:   storeRef,
+		Creator:    creator,
+		Owner:      owner,
+		Generation: generation,
+		Lifecycle:  lifecycle,
 	}
 }
 
