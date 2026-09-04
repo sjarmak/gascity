@@ -6,6 +6,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
@@ -54,10 +55,24 @@ import (
 // released claim episode had already consumed. bd has no flag that closes
 // this gap: --if-assignee and --if-status are both documented as unable to
 // combine with --claim, and no --if-metadata (or any other value-level CAS)
-// flag exists in `bd update --help`. No read taken before the write can ever
-// be proven fresh at the write, so nextClaimGenerationToken below computes
-// the minted value without reading the bead's prior generation at all — see
-// its doc for why that closes the gap instead of narrowing it.
+// flag exists in `bd update --help`.
+//
+// A third shape of this fix (superseded, see the exact-head review recorded
+// against 74e19c487) minted strconv.FormatInt(time.Now().UTC().UnixNano(),
+// 10) — a value computed fresh at the write, with no read of the bead's
+// prior state, closing the second shape's sequential-reuse gap. Codex found
+// two independent defects in it: UnixNano produces 19-digit values, but the
+// external consumer /home/ds/gas-city/bin/gc-outcome-close parses at most 15
+// decimal digits, so every claim minted this way was permanently uncloseable
+// — a straightforward compatibility break, not a race. And UnixNano is wall
+// -clock time with no monotonicity guarantee of its own: an NTP step or
+// manual clock correction between two mints can move it backward, which can
+// reproduce the exact reuse this file exists to close even with no
+// concurrent contender in sight. nextClaimGenerationToken below fixes both:
+// it mints from milliseconds since a fixed recent epoch (fits the 15-digit
+// ceiling for roughly 31,000 years, see its doc), and it is no longer pure
+// wall-clock — see mintClaimGeneration's doc for the two independent floors
+// that keep it moving forward even when the clock does not.
 
 // AdvanceClaimGenerationOutcome classifies how ConfirmClaimGeneration
 // resolved. It is always paired with a nil error; a non-nil error means the
@@ -91,27 +106,31 @@ const (
 // second writer room to mint a competing generation against the same
 // ownership transition.
 //
-// The initial Get exists ONLY to verify id names exactly one existing bead
-// before anything is written — bd's resolver prefix/substring-matches an id
-// with no exact hit, and a mint issued against that would fence the wrong
-// bead entirely (the same gcy-g4o guard ReleaseIfCurrent carries). Its
-// result is never used to compute the minted generation: next comes from
-// nextClaimGenerationToken, which needs no read of the bead's prior state to
-// be unique. See that function's doc for why a value derived from this (or
-// any) pre-write read cannot be trusted for that computation.
+// The initial Get exists to verify id names exactly one existing bead before
+// anything is written — bd's resolver prefix/substring-matches an id with no
+// exact hit, and a mint issued against that would fence the wrong bead
+// entirely (the same gcy-g4o guard ReleaseIfCurrent carries) — and, since
+// round 4, to give nextClaimGenerationToken a floor: the generation this
+// claim episode observed on the bead immediately before claiming it. That
+// floor is never trusted alone (a read taken before the write can never be
+// proven fresh at the write — see the round-3 doc above), only as one of two
+// independent lower bounds mintClaimGeneration enforces. See its doc for why
+// that is safe where the round-2 shape's read-then-mint was not: this read
+// no longer determines the minted value by itself.
 //
 // It returns ok=false, nil error when bd reports that another actor won the
 // claim race (the loser never wrote anything, generation included). A bd
 // build predating --claim or --set-metadata is refused as an error, never
 // silently downgraded to an unfenced claim.
 func (s *BdStore) ClaimWithGeneration(id string) (Bead, string, bool, error) {
-	if _, err := s.Get(id); err != nil {
+	current, err := s.Get(id)
+	if err != nil {
 		if errors.Is(err, ErrIDCollision) {
 			return Bead{}, "", false, fmt.Errorf("refusing to claim %q with generation: %w", id, err)
 		}
 		return Bead{}, "", false, fmt.Errorf("claiming bead %q with generation: reading current state: %w", id, err)
 	}
-	next := nextClaimGenerationToken()
+	next := nextClaimGenerationToken(parseClaimGenerationFloor(current.Metadata[beadmeta.ClaimGenerationMetadataKey]))
 
 	out, runErr := s.runBDTransientWriteOutput(
 		"update", id,
@@ -143,37 +162,94 @@ func (s *BdStore) ClaimWithGeneration(id string) (Bead, string, bool, error) {
 	return claimed, next, true, nil
 }
 
+// claimGenerationEpoch anchors mintClaimGeneration's millisecond timestamps
+// so they fit gc-outcome-close's 1-15 decimal digit ceiling (the gc-3ohe47
+// round-4 finding: raw UnixNano is 19 digits and every claim it mints is
+// permanently uncloseable by that consumer). Milliseconds since this epoch
+// do not reach 16 digits for roughly 31,000 years; a deployment still
+// running this scheme that close to the ceiling needs a new epoch pushed out
+// in coordination with any consumer that parses the digit width, exactly
+// like a Y2038-class rollover — not a silent wraparound.
+var claimGenerationEpoch = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+var (
+	claimGenerationHighWaterMu sync.Mutex
+	claimGenerationHighWater   int64
+)
+
 // nextClaimGenerationToken mints a fresh beadmeta.ClaimGenerationMetadataKey
-// value without reading the bead's own last-recorded generation, closing the
-// gc-3ohe47 round-3 ABA a read-then-mint predecessor of this function had:
-// Codex found that a value computed from a Get() taken before the claim
-// attempt can be reused across two DISTINCT claim episodes whenever a second
-// claimant's whole claim-release cycle completes inside the gap between that
-// read and this call's own --claim landing. bd has no flag that fences
-// --claim against an expected prior metadata value (`bd update --help`
-// documents --if-assignee/--if-status as unable to combine with --claim, and
-// there is no --if-metadata or other value-level CAS flag), so no read taken
-// before the write can ever be proven fresh at the moment of the write —
-// narrowing the gap between them cannot close it, only shrink it.
-//
-// A value minted from the local monotonic-ish wall clock at the moment of
-// the write has no such dependency: it needs no read of prior state to be
-// unique, so a second claimant's stale belief about the bead's generation
-// cannot poison it. Two DIFFERENT claim episodes for the same bead are
-// always separated in real time by the first episode's completed release
-// (bd's own --claim exclusivity forbids a second winner while the first
-// still holds the claim), so the second episode's mint is always later, in
-// wall-clock terms, than the first's — a collision would require two `bd
-// update` process invocations completing within the same nanosecond, which
-// the process-spawn cost of running bd rules out in practice.
+// value. observedFloor is the generation ClaimWithGeneration's preflight Get
+// observed on the bead immediately before this claim attempt; it is used
+// only as one of mintClaimGeneration's two lower bounds, never alone — see
+// that function's doc for why reintroducing a read into this computation
+// does not reopen the gc-3ohe47 round-3 ABA a pure-read-derived value had.
 //
 // The result is still a positive decimal integer, so it stays compatible
 // with NextClaimGeneration's parsing contract: a later claim on the same
 // bead through this mechanism, molecule.ClaimExact, or SQLiteStore.claimTx
 // advances from it exactly as it would advance from any smaller counter
 // value — nothing downstream needs to know this mechanism minted it.
-func nextClaimGenerationToken() string {
-	return strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
+func nextClaimGenerationToken(observedFloor int64) string {
+	return strconv.FormatInt(mintClaimGeneration(time.Now(), observedFloor), 10)
+}
+
+// mintClaimGeneration is nextClaimGenerationToken's pure core, taking the
+// wall-clock reading explicitly so it is unit-testable without depending on
+// real time. It returns a value strictly greater than BOTH of two
+// independent lower bounds, closing the gc-3ohe47 round-4 finding that raw
+// UnixNano has no monotonicity guarantee under host clock correction:
+//
+//  1. observedFloor, the generation this specific claim episode saw on the
+//     bead just before claiming it. This guards the common case: a single
+//     actor's own clock stepped backward between two of ITS OWN sequential
+//     claims on the same bead. It is safe to trust here in a way the round-2
+//     shape's read-then-mint was not, because it is only a floor, not the
+//     minted value itself — under normal (non-adversarial-clock) conditions
+//     the millisecond-since-epoch candidate below dwarfs it and this bound
+//     never binds; it only takes over when the clock term has regressed.
+//  2. claimGenerationHighWater, a process-local monotonic high-water mark.
+//     This guards the same failure mode across calls within one process
+//     even when observedFloor itself is stale relative to a writer this
+//     specific call never observed (a live process's clock being corrected
+//     mid-run, independent of any particular claim episode's read).
+//
+// Neither bound is a substitute for the other, and neither is a distributed
+// compare-and-swap: bd's CLI has no metadata-CAS flag combinable with
+// --claim (see the file doc), so a pathological combination of concurrent
+// contention landing in the same millisecond AND a simultaneous backward
+// clock step on the losing side is not provably closed by this function
+// alone. What closes it is the same guarantee BdStore.Claim already depends
+// on: bd's own --claim exclusivity admits only one writer's mint per
+// contention round, so that scenario requires the LOSER's read to also be
+// the one whose write eventually lands — which bd's single-writer semantics
+// rule out.
+func mintClaimGeneration(now time.Time, observedFloor int64) int64 {
+	candidate := now.UTC().Sub(claimGenerationEpoch).Milliseconds()
+	if candidate <= observedFloor {
+		candidate = observedFloor + 1
+	}
+
+	claimGenerationHighWaterMu.Lock()
+	defer claimGenerationHighWaterMu.Unlock()
+	if candidate <= claimGenerationHighWater {
+		candidate = claimGenerationHighWater + 1
+	}
+	claimGenerationHighWater = candidate
+	return candidate
+}
+
+// parseClaimGenerationFloor reads the generation ClaimWithGeneration's
+// preflight Get observed on a bead, for use ONLY as one of
+// mintClaimGeneration's two lower bounds — never as the minted value itself.
+// An absent or unparseable value floors at 0, matching NextClaimGeneration's
+// treatment of a bead never claimed through either fence: it drops out of
+// the max() and leaves the wall-clock/high-water bounds to decide the mint.
+func parseClaimGenerationFloor(raw string) int64 {
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // ErrBdMissingClaimGenerationSupport means the installed bd predates --claim

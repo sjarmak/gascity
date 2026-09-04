@@ -48,13 +48,13 @@ func TestHookClaimWithBdStoreReloadsCanonicalBeadAfterPartialMutation(t *testing
 	if claimed.Metadata["gc.root_bead_id"] != "root-1" || claimed.Metadata["gc.continuation_group"] != "review" {
 		t.Fatalf("claimed metadata = %#v, want canonical root and continuation group", claimed.Metadata)
 	}
-	// ClaimWithGeneration reads the bead once, ONLY to verify id names exactly
-	// one existing bead before minting anything against it (the generation
-	// value itself is minted independently of that read — see
-	// nextClaimGenerationToken's doc), so the canonical "reload after
-	// mutation" contract this test proves now spans three bd calls, not two:
-	// the pre-claim show, the atomic claim update, and
-	// hookClaimThroughStore's own canonical reload.
+	// ClaimWithGeneration reads the bead once before minting anything against
+	// it: to verify id names exactly one existing bead, and (since round 4)
+	// to hand mintClaimGeneration a floor. That floor never determines the
+	// minted value by itself — see mintClaimGeneration's doc — so this read
+	// does not change the call count the canonical "reload after mutation"
+	// contract proves: three bd calls, not two: the pre-claim show, the
+	// atomic claim update, and hookClaimThroughStore's own canonical reload.
 	if len(calls) != 3 {
 		t.Fatalf("bd calls = %#v, want pre-claim show, atomic claim update, then canonical show", calls)
 	}
