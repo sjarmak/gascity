@@ -10825,6 +10825,9 @@ func TestJsonlExportMigrationFromPreWatermarkState(t *testing.T) {
 	if err := json.Unmarshal(stateData, &state); err != nil {
 		t.Fatalf("state file is not valid JSON after migration (corruption?): %v\n%s", err, stateData)
 	}
+	if got := state["last_logged_mode"]; got != "local-only" {
+		t.Fatalf("last_logged_mode = %v, want local-only (pre-existing key must survive watermark write)", got)
+	}
 }
 
 // TestJsonlExportForcesFullSnapshotAfterInterval verifies an ancient full_at
