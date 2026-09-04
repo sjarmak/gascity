@@ -24,11 +24,11 @@ __SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CITY="${GC_CITY:-.}"
 
 # Bound the candidate scan so the 5-minute maintenance pass stops fighting live
-# writers (gastownhall/gascity#3342). An unbounded `bd list --all -n 0` walks the
+# writers (gastownhall/gascity#3342). An unbounded `--all -n 0` listing walks the
 # whole table every cycle; instead pull the oldest-updated beads — the ones most
 # likely past TTL — up to a configurable cap, and let later runs chip away at the
-# rest (NDI: deletion converges across cycles). `bd list --sort updated` defaults
-# to newest-first, so `--reverse` is required to surface the stale backlog first.
+# rest (NDI: deletion converges across cycles). Sorting by "updated" defaults to
+# newest-first, so `--reverse` is required to surface the stale backlog first.
 WISP_COMPACT_LIMIT="${GC_WISP_COMPACT_LIMIT:-5000}"
 
 # Get ephemeral beads (oldest-updated first, bounded).

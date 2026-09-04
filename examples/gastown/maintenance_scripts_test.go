@@ -10582,19 +10582,11 @@ func seedArchiveWithIssuesPayload(t *testing.T, archiveRepo, payload string) {
 	if err := os.WriteFile(filepath.Join(dbDir, "issues.jsonl"), []byte(payload+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	steps := [][]string{
-		{"-c", "init.defaultBranch=main", "init", "-q"},
-		{"config", "user.email", "test@example.invalid"},
-		{"config", "user.name", "test"},
-		{"add", "-A"},
-		{"commit", "-q", "-m", "seed"},
-	}
-	for _, args := range steps {
-		full := append([]string{"-C", archiveRepo}, args...)
-		if out, err := exec.Command("git", full...).CombinedOutput(); err != nil {
-			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
-		}
-	}
+	runGit(t, archiveRepo, "-c", "init.defaultBranch=main", "init", "-q")
+	runGit(t, archiveRepo, "config", "user.email", "test@example.invalid")
+	runGit(t, archiveRepo, "config", "user.name", "test")
+	runGit(t, archiveRepo, "add", "-A")
+	runGit(t, archiveRepo, "commit", "-q", "-m", "seed")
 }
 
 // writeWatermarkState pre-seeds the export state with an issues watermark and
