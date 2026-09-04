@@ -3,6 +3,7 @@ package beads
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -62,6 +63,9 @@ type StoreOpenOptions struct {
 	OpenExecStore    func() (Store, error)
 	OpenNativeStore  func() (Store, error)
 
+	// DisableNativeSelection runs preflight but always returns the bd store.
+	DisableNativeSelection bool
+
 	// ConditionalWrites is the resolved city-global beads.conditional_writes
 	// mode, stamped onto every store this open produces and latched for the
 	// store's lifetime — the factory is the ONE home of the mode (DESIGN
@@ -101,17 +105,6 @@ func OpenStoreAtForCity(ctx context.Context, opts StoreOpenOptions) (StoreOpenRe
 		return opts.stampedResult(StoreOpenResult{Store: store, Diagnostic: BeadsDiagnostic{Store: storeNameExecStore}}, err)
 	}
 
-	if forceNativeFallback() {
-		diag := BeadsDiagnostic{
-			Store:               storeNameBdStore,
-			NativeStoreEligible: false,
-			PreflightGate:       nativeForceFallbackGate,
-			PreflightReason:     nativeForceFallbackEnv + "=1",
-		}
-		logNativeUnavailable(opts.Logger, opts.ScopeRoot, diag.PreflightGate, diag.PreflightReason)
-		return opts.openBdFallback(provider, diag)
-	}
-
 	if !contract.ProviderUsesBDContract(provider) {
 		diag := BeadsDiagnostic{
 			Store:               storeNameBdStore,
@@ -125,6 +118,10 @@ func OpenStoreAtForCity(ctx context.Context, opts StoreOpenOptions) (StoreOpenRe
 
 	result, err := opts.PreflightChecker.Check(opts.ScopeRoot)
 	if err != nil {
+		var schemaHold *contract.SchemaCompatibilityHoldError
+		if errors.As(err, &schemaHold) {
+			return StoreOpenResult{}, fmt.Errorf("open beads store for %s: %w", opts.ScopeRoot, schemaHold)
+		}
 		diag := BeadsDiagnostic{
 			Store:               storeNameBdStore,
 			NativeStoreEligible: false,
@@ -135,6 +132,19 @@ func OpenStoreAtForCity(ctx context.Context, opts StoreOpenOptions) (StoreOpenRe
 		return opts.openBdFallback(provider, diag)
 	}
 	diag := diagnosticFromPreflight(result)
+	if forceNativeFallback() {
+		diag.Store = storeNameBdStore
+		diag.NativeStoreEligible = false
+		diag.PreflightGate = nativeForceFallbackGate
+		diag.PreflightReason = nativeForceFallbackEnv + "=1"
+		logNativeUnavailable(opts.Logger, opts.ScopeRoot, diag.PreflightGate, diag.PreflightReason)
+		return opts.openBdFallback(provider, diag)
+	}
+	if opts.DisableNativeSelection {
+		diag.Store = storeNameBdStore
+		diag.NativeStoreEligible = false
+		return opts.openBdFallback(provider, diag)
+	}
 	if !result.NativeStoreEligible {
 		logNativeUnavailable(opts.Logger, opts.ScopeRoot, diag.PreflightGate, diag.PreflightReason)
 		return opts.openBdFallback(provider, diag)

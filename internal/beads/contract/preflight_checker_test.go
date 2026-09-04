@@ -3,6 +3,7 @@ package contract
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -788,5 +789,92 @@ func TestComparableReleaseVersion(t *testing.T) {
 				t.Fatalf("comparableReleaseVersion(%q) = %v, want %v", tt.version, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPreflightCheckerRequiredSchemaVersionHold(t *testing.T) {
+	tests := []struct {
+		name            string
+		provider        string
+		metadataBackend string
+		contextBackend  string
+		schema          int
+		wantHold        bool
+	}{
+		{name: "schema 52 is held", provider: "bd", metadataBackend: "dolt", contextBackend: "dolt", schema: 52, wantHold: true},
+		{name: "schema 53 is accepted", provider: "bd", metadataBackend: "dolt", contextBackend: "dolt", schema: 53},
+		{name: "unknown schema is held", provider: "bd", metadataBackend: "dolt", contextBackend: "dolt", schema: 0, wantHold: true},
+		{name: "file provider is not held", provider: "file", metadataBackend: "dolt", contextBackend: "dolt", schema: 52},
+		{name: "non dolt metadata is not held", provider: "bd", metadataBackend: "postgres", contextBackend: "dolt", schema: 52},
+		{name: "authoritative schema holds despite non-dolt context", provider: "bd", metadataBackend: "dolt", contextBackend: "postgres", schema: 52, wantHold: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metadata := preflightMetadataJSON(fmt.Sprintf(`{"backend":%q,"dolt_mode":"server","project_id":"project-1"}`, tt.metadataBackend))
+			checker := testPreflightChecker(metadata, PreflightBDContext{Backend: tt.contextBackend, DoltMode: "server", BDVersion: "1.1.0", SchemaVersion: tt.schema}, "project-1")
+			checker.Provider = tt.provider
+			checker.DatabaseState = func(string) (PreflightDatabaseState, error) {
+				return PreflightDatabaseState{SchemaVersion: tt.schema, ProjectID: "project-1", HasProjectID: true}, nil
+			}
+			checker.RequiredSchemaVersion = 53
+			_, err := checker.Check("/city")
+			var hold *SchemaCompatibilityHoldError
+			gotHold := errors.As(err, &hold)
+			if gotHold != tt.wantHold {
+				t.Fatalf("Check() error = %v, typed hold = %t, want %t", err, gotHold, tt.wantHold)
+			}
+			if gotHold && (hold.Required != 53 || hold.Actual != tt.schema) {
+				t.Fatalf("hold = %+v, want required=53 actual=%d", hold, tt.schema)
+			}
+		})
+	}
+}
+
+func TestPreflightCheckerDirectSchemaMismatchHoldsWhenBDContextErrors(t *testing.T) {
+	checker := testPreflightChecker(preflightMetadataJSON(`{"backend":"dolt","dolt_mode":"server","project_id":"project-1"}`), PreflightBDContext{}, "project-1")
+	checker.RequiredSchemaVersion = 53
+	checker.BDContext = func(string) (PreflightBDContext, error) {
+		return PreflightBDContext{}, errors.New("bd context unavailable")
+	}
+	checker.DatabaseState = func(string) (PreflightDatabaseState, error) {
+		return PreflightDatabaseState{SchemaVersion: 52, ProjectID: "project-1", HasProjectID: true}, nil
+	}
+
+	_, err := checker.Check("/city")
+	var hold *SchemaCompatibilityHoldError
+	if !errors.As(err, &hold) {
+		t.Fatalf("Check() error = %v, want SchemaCompatibilityHoldError", err)
+	}
+	if hold.Required != 53 || hold.Actual != 52 {
+		t.Fatalf("hold = %+v, want required=53 actual=52", hold)
+	}
+}
+
+func TestPreflightCheckerUnknownDirectSchemaHolds(t *testing.T) {
+	checker := testPreflightChecker(preflightMetadataJSON(`{"backend":"dolt","dolt_mode":"server","project_id":"project-1"}`), PreflightBDContext{Backend: "dolt", DoltMode: "server", SchemaVersion: 53}, "project-1")
+	checker.RequiredSchemaVersion = 53
+	checker.DatabaseState = func(string) (PreflightDatabaseState, error) {
+		return PreflightDatabaseState{ProjectID: "project-1", HasProjectID: true}, nil
+	}
+
+	_, err := checker.Check("/city")
+	var hold *SchemaCompatibilityHoldError
+	if !errors.As(err, &hold) || hold.Actual != 0 || hold.Cause != nil {
+		t.Fatalf("Check() error = %#v, want unknown-version SchemaCompatibilityHoldError", err)
+	}
+}
+
+func TestPreflightCheckerAuthoritativeSchemaReadErrorHolds(t *testing.T) {
+	checker := testPreflightChecker(preflightMetadataJSON(`{"backend":"dolt","dolt_mode":"server","project_id":"project-1"}`), PreflightBDContext{Backend: "dolt", DoltMode: "server", SchemaVersion: 53}, "project-1")
+	checker.RequiredSchemaVersion = 53
+	readErr := errors.New("authenticated schema query failed")
+	checker.DatabaseState = func(string) (PreflightDatabaseState, error) {
+		return PreflightDatabaseState{}, readErr
+	}
+
+	_, err := checker.Check("/city")
+	var hold *SchemaCompatibilityHoldError
+	if !errors.As(err, &hold) || !errors.Is(err, readErr) {
+		t.Fatalf("Check() error = %v, want typed hold wrapping authoritative read error", err)
 	}
 }

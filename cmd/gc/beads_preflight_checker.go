@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -10,13 +11,61 @@ import (
 	"github.com/gastownhall/gascity/internal/fsys"
 )
 
+const beadsV110SchemaVersion = 53
+
+// preflightDatabaseStateReaderFn is a seam so tests can inject a fake
+// database-state reader without a live managed Dolt connection.
+var preflightDatabaseStateReaderFn = preflightDatabaseStateReader
+
 func newBeadsPreflightChecker(cityPath, provider string) contract.PreflightChecker {
 	return contract.PreflightChecker{
 		FS:                        fsys.OSFS{},
 		Provider:                  provider,
+		RequiredSchemaVersion:     beadsV110SchemaVersion,
 		BDContext:                 preflightBDContextReader(cityPath),
-		DatabaseProjectID:         preflightDatabaseProjectIDReader(cityPath),
+		DatabaseState:             preflightDatabaseStateReaderFn(cityPath),
 		DeferIdentityToNativeOpen: preflightIdentityDeferredReader(cityPath),
+	}
+}
+
+// preflightDatabaseStateReader reads the schema version and project identity
+// directly from the managed Dolt database, so preflight can fail closed on an
+// incompatible or unknown schema instead of silently falling back to the bd
+// CLI. The handle comes from managedDoltOpenDatabase's shared connection pool
+// (internal/doltpool) and must not be closed here.
+func preflightDatabaseStateReader(cityPath string) func(scope string) (contract.PreflightDatabaseState, error) {
+	return func(scope string) (contract.PreflightDatabaseState, error) {
+		target, ok, err := canonicalScopeDoltTarget(cityPath, scope)
+		if err != nil {
+			return contract.PreflightDatabaseState{}, err
+		}
+		if !ok {
+			// No authoritative .beads/config.yaml resolves for this scope (missing
+			// or legacy-minimal), so there is no live database to check at all —
+			// the same "cannot check" signal as ErrManagedRuntimeUnavailable's other
+			// causes (see its doc comment), not evidence of an incompatible or
+			// unknown schema on a real store.
+			return contract.PreflightDatabaseState{}, contract.ErrManagedRuntimeUnavailable
+		}
+		db, err := managedDoltOpenDatabase(target.Host, target.Port, target.User, target.Database)
+		if err != nil {
+			return contract.PreflightDatabaseState{}, err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var version sql.NullInt64
+		if err := db.QueryRowContext(ctx, "SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil {
+			return contract.PreflightDatabaseState{}, fmt.Errorf("read beads schema version: %w", err)
+		}
+		state := contract.PreflightDatabaseState{}
+		if version.Valid && version.Int64 > 0 {
+			state.SchemaVersion = int(version.Int64)
+		}
+		projectID, hasProjectID, err := readDatabaseProjectID(ctx, db)
+		state.ProjectID = projectID
+		state.HasProjectID = hasProjectID
+		return state, err
 	}
 }
 
@@ -57,26 +106,5 @@ func preflightIdentityDeferredReader(cityPath string) func(scope string) bool {
 			return false
 		}
 		return target.External
-	}
-}
-
-func preflightDatabaseProjectIDReader(cityPath string) func(scope string) (string, bool, error) {
-	return func(scope string) (string, bool, error) {
-		target, ok, err := canonicalScopeDoltTarget(cityPath, scope)
-		if err != nil || !ok {
-			return "", false, err
-		}
-		// Pooled handle owned by internal/doltpool; do not Close.
-		db, err := managedDoltOpenDatabase(target.Host, target.Port, target.User, target.Database)
-		if err != nil {
-			return "", false, err
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := db.PingContext(ctx); err != nil {
-			return "", false, err
-		}
-		return readDatabaseProjectID(ctx, db)
 	}
 }

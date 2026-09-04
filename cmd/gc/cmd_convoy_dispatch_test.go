@@ -4451,25 +4451,32 @@ func TestOpenControlStoreAtForCityUsesControlRunnerForStaleBdScope(t *testing.T)
 		t.Fatalf("stale rig control update: %v", err)
 	}
 
-	if len(calls) != 1 {
-		t.Fatalf("bd calls = %#v, want one update call", calls)
+	// The schema-hold preflight (Fix #4: managed beads stores fail closed on
+	// unknown/incompatible schema, including control/dispatch paths) now runs
+	// a real `bd context --json` probe ahead of the write, so this scope's
+	// control update is calls[1], not calls[0].
+	if len(calls) != 2 {
+		t.Fatalf("bd calls = %#v, want a preflight context call plus one update call", calls)
 	}
-	if len(envs) != 1 {
-		t.Fatalf("bd envs = %#v, want one command environment", envs)
+	if len(envs) != 2 {
+		t.Fatalf("bd envs = %#v, want two command environments", envs)
 	}
-	if call := calls[0]; len(call) < 1 || call[0] != "update" {
-		t.Fatalf("bd call = %#v, want update ...", calls[0])
+	if call := calls[0]; len(call) < 2 || call[0] != "context" || call[1] != "--json" {
+		t.Fatalf("bd call[0] = %#v, want context --json (preflight probe)", calls[0])
 	}
-	if slices.Contains(calls[0], "--sandbox") {
-		t.Fatalf("bd call = %#v, write-capable control stores must not use --sandbox", calls[0])
+	if call := calls[1]; len(call) < 1 || call[0] != "update" {
+		t.Fatalf("bd call[1] = %#v, want update ...", calls[1])
 	}
-	if got := envs[0]["BD_EXPORT_AUTO"]; got != "false" {
+	if slices.Contains(calls[1], "--sandbox") {
+		t.Fatalf("bd call = %#v, write-capable control stores must not use --sandbox", calls[1])
+	}
+	if got := envs[1]["BD_EXPORT_AUTO"]; got != "false" {
 		t.Fatalf("BD_EXPORT_AUTO = %q, want false", got)
 	}
-	if got := envs[0]["BEADS_DIR"]; got != filepath.Join(staleRigDir, ".beads") {
+	if got := envs[1]["BEADS_DIR"]; got != filepath.Join(staleRigDir, ".beads") {
 		t.Fatalf("BEADS_DIR = %q, want stale rig store", got)
 	}
-	if got := envs[0]["GC_RIG_ROOT"]; got != staleRigDir {
+	if got := envs[1]["GC_RIG_ROOT"]; got != staleRigDir {
 		t.Fatalf("GC_RIG_ROOT = %q, want stale rig root", got)
 	}
 }
