@@ -1696,6 +1696,47 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// preserved; the previously per-tick stderr line is now a throttled,
 		// durable session.unknown_state signal (folded onto the tick snapshot).
 		if !isKnownStateInfo(info) {
+			// Interrupted close: ClosePatch stamped a terminal state but the
+			// status flip to closed was lost (crash or failed write between
+			// the two). Finish the close so the bead stops holding its pool
+			// slot forever (#2085), instead of skip-spinning it as an
+			// ordinary unknown state. Gated on isPoolManagedSessionInfo as
+			// defense-in-depth: every stateCode in
+			// interruptedCloseSessionStates is written only at the pool
+			// retire path, itself pool-managed-gated, so today these states
+			// can only land on a pool bead — but enforcing that here means a
+			// future write that stamped one of these reasons onto a
+			// named/singleton session's state field is skipped (the older,
+			// safe behavior) instead of finishing a close that costs a named
+			// session its identity/continuity. Also gated on the same
+			// storeQueryPartial/deferSessionClosesOnBoot guards every other
+			// destructive close in this loop honors, so a degraded read or a
+			// fresh boot never triggers a reap off stale information.
+			if isInterruptedCloseStateInfo(info) && isPoolManagedSessionInfo(info) && !storeQueryPartial && !reconcileOpts.deferSessionClosesOnBoot {
+				providerAlive, livenessErr := workerSessionTargetRunningWithConfig(cityPath, store, sp, cfg, id)
+				if livenessErr != nil {
+					providerAlive = false
+				}
+				if shadowTick != nil {
+					shadowTick.captureRuntime(id, "workerSessionTargetRunningWithConfig", "", triFromBool(providerAlive), convergeTriUnknown)
+				}
+				if !providerAlive {
+					state := info.MetadataState
+					if closeSessionBeadIfReachableStoreUnassigned(cityPath, cfg, store, rigStores, info, state, clk.Now().UTC(), stderr, false) {
+						fmt.Fprintf(stderr, "session reconciler: reaped %s with interrupted-close state %q\n", name, state) //nolint:errcheck // best-effort stderr
+						if trace != nil {
+							trace.RecordDecision(TraceSiteReconcilerUnknownState, TraceReasonInterruptedCloseReaped, TraceOutcomeClosed, info.Template, name, traceRecordPayload{
+								"state": state,
+							})
+						}
+						tick.markClosed(id)
+						if shadowTick != nil {
+							shadowTick.markSkip(id, skipEarlyContinue)
+						}
+						continue
+					}
+				}
+			}
 			if fold := emitSessionUnknownStateDiagnostic(store, info, snapshot, rec, clk, stderr); fold != nil {
 				tick.apply(id, fold)
 			}

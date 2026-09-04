@@ -1304,6 +1304,47 @@ func isKnownStateInfo(i sessionpkg.Info) bool {
 	return knownSessionStates[i.MetadataState]
 }
 
+// interruptedCloseSessionStates lists terminal close stateCodes that
+// session.ClosePatch stamps onto a session bead immediately before the
+// status flips to closed. A crash or failed write between the two leaves an
+// open bead carrying a terminal state outside knownSessionStates; without
+// intervention the reconciler skips it on every tick forever while the bead
+// holds its agent's pool slot, and gc restart cannot recover because bd is
+// the source of truth (#2085). The reconciler treats these as interrupted
+// closes and finishes the close (guarded on pool-managed, provider-not-
+// running, no assigned work, and a coherent non-boot-deferred store view)
+// instead of spinning.
+//
+// "duplicate-repair" is deliberately absent: RetireNamedSessionPatch routes
+// it through ArchivePatch (state="archived", status stays open), so it never
+// lands in the state field as an interrupted close. States outside this set
+// and knownSessionStates remain skipped untouched for forward-compatible
+// rollback.
+var interruptedCloseSessionStates = map[string]bool{
+	"gc_swept":                true,
+	"stale-session":           true,
+	"duplicate":               true,
+	"reconfigured":            true,
+	"dead-runtime":            true,
+	"idle":                    true,
+	"idle-timeout":            true,
+	"no-wake-reason":          true,
+	"config-drift":            true,
+	"city-stop":               true,
+	"user-hold":               true,
+	"wait-hold":               true,
+	"rate_limit":              true,
+	"provider-terminal-error": true,
+	string(sessionpkg.SleepReasonRuntimeMissing): true,
+}
+
+// isInterruptedCloseStateInfo reports whether the session's raw metadata
+// state is an interrupted terminal close that the reconciler should finish,
+// keyed off the same untrimmed Info.MetadataState isKnownStateInfo uses.
+func isInterruptedCloseStateInfo(i sessionpkg.Info) bool {
+	return interruptedCloseSessionStates[i.MetadataState]
+}
+
 // reverseBeads returns a reversed copy of the bead slice.
 func reverseBeads(beadSlice []beads.Bead) []beads.Bead {
 	n := len(beadSlice)

@@ -146,6 +146,7 @@ const (
 	TraceReasonWakeFailureIncremented TraceReasonCode = "wake_failure_incremented"
 	TraceReasonQuarantineEntered      TraceReasonCode = "quarantine_entered"
 	TraceReasonUnknownStateSkipped    TraceReasonCode = "unknown_state_skipped"
+	TraceReasonInterruptedCloseReaped TraceReasonCode = "interrupted_close_reaped"
 	TraceReasonTemplateMissing        TraceReasonCode = "template_missing"
 	TraceReasonNoEffectTemplateMatch  TraceReasonCode = "no_effective_template_match"
 	TraceReasonAutoArmSuppressed      TraceReasonCode = "auto_arm_suppressed"
