@@ -198,6 +198,83 @@ func TestHookClaimFreshClaimWhenNothingHeldAcrossStores(t *testing.T) {
 	}
 }
 
+// hardParkedOwnClaim mirrors the gc-qmzou state shape from gc-94to5: a
+// load-context (or similar safety-gate) step intentionally left in_progress
+// and assigned to this session behind a hard, non-retryable failure
+// (gc.outcome=fail, gc.failure_class=hard), so the molecule cannot advance
+// past a failed gate. It must never be re-served as existing_assignment.
+const hardParkedOwnClaim = `{"id":"gcg-parked","status":"in_progress","assignee":"worker-1","issue_type":"task","metadata":{"gc.routed_to":"worker","gc.outcome":"fail","gc.failure_class":"hard"}}`
+
+// TestHookClaimSkipsHardParkedExistingAssignment pins the gc-94to5 fix: a
+// hard-parked own claim must not block a fresh routed demand in the same
+// batch from being served. Before the fix, hookClaimExistingAssignment
+// unconditionally re-adopted any in_progress+matching-assignee candidate,
+// so the parked step would win over the fresh demand and respawn forever.
+func TestHookClaimSkipsHardParkedExistingAssignment(t *testing.T) {
+	rec := &turnBoundClaimRecorder{}
+	output := `[` + hardParkedOwnClaim + `,` + selfResumeFreshDemand + `]`
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", "/rig", hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"worker"},
+		JSON:               true,
+	}, rec.ops(t, output), &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	result := decodeTurnBoundResult(t, stdout.String())
+	if result.BeadID != "gc-fresh" {
+		t.Fatalf("result = %+v, want the hard-parked bead skipped and the fresh demand served", result)
+	}
+	if len(rec.claims) != 1 || rec.claims[0] != "gc-fresh" {
+		t.Fatalf("claims = %v, want only [gc-fresh]: the parked bead must never be claimed", rec.claims)
+	}
+	for _, released := range rec.releases {
+		if released == "gcg-parked" {
+			t.Fatalf("releases = %v, the parked bead must not be touched at all", rec.releases)
+		}
+	}
+}
+
+// TestHookClaimDrainsWhenOnlyHardParkedAssignmentExists is the exact gc-qmzou
+// repro shape from gc-94to5: the ONLY candidate is the session's own
+// hard-parked claim. Before the fix this respawned the parked step as
+// existing_assignment on every drain-ack tick, forever. The fix must fall
+// through to a real no_work drain instead.
+func TestHookClaimDrainsWhenOnlyHardParkedAssignmentExists(t *testing.T) {
+	rec := &turnBoundClaimRecorder{}
+	output := `[` + hardParkedOwnClaim + `]`
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", "/rig", hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"worker"},
+		JSON:               true,
+		DrainAck:           true,
+	}, rec.ops(t, output), &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	result := decodeTurnBoundResult(t, stdout.String())
+	if result.Reason != hookClaimReasonNoWork {
+		t.Fatalf("result = %+v, want reason %q: a hard-parked step alone must drain, not respawn as existing_assignment", result, hookClaimReasonNoWork)
+	}
+	if len(rec.claims) != 0 {
+		t.Fatalf("claims = %v, want none: the parked bead must never be claimed", rec.claims)
+	}
+	if len(rec.releases) != 0 {
+		t.Fatalf("releases = %v, want none", rec.releases)
+	}
+	if !rec.drainAcked {
+		t.Fatal("drainAcked = false, want true: the drain-ack loop must actually terminate")
+	}
+}
+
 // TestGcReadyInProgressEnrichesBlockedBy pins the enrichment half of the swap:
 // the federated in_progress read carries blocked_by resolved from the leg that
 // served the row.

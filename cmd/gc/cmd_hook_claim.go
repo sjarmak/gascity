@@ -906,6 +906,9 @@ func hookClaimExistingAssignment(candidates []beads.Bead, opts hookClaimOptions)
 		if hookClaimCandidateIsMessage(candidate) {
 			continue
 		}
+		if hookClaimCandidateIsHardParked(candidate) {
+			continue
+		}
 		if strings.EqualFold(strings.TrimSpace(candidate.Status), "in_progress") &&
 			hookClaimHasIdentity(candidate.Assignee, opts.IdentityCandidates) {
 			result := hookClaimJSONResult{
@@ -922,6 +925,22 @@ func hookClaimExistingAssignment(candidates []beads.Bead, opts hookClaimOptions)
 		}
 	}
 	return hookClaimJSONResult{}, beads.Bead{}, false
+}
+
+// hookClaimCandidateIsHardParked reports whether candidate is a step
+// intentionally parked in_progress behind a hard, non-retryable failure
+// (gc.outcome=fail, gc.failure_class=hard). A load-context (or similar
+// safety-gate) contract can require leaving such a step open and assigned
+// rather than closing it, precisely so the molecule cannot advance past a
+// failed gate. Without this check the existing-assignment tier re-served
+// that same parked step as live work on every claim, forever, because
+// in_progress+matching-assignee is otherwise indistinguishable from a step a
+// session is legitimately resuming (gc-94to5). Skipping it here lets the
+// claim fall through to the ready/eligible tiers, and if nothing else is
+// claimable the session drains instead of re-executing the parked gate.
+func hookClaimCandidateIsHardParked(candidate beads.Bead) bool {
+	return strings.TrimSpace(candidate.Metadata[beadmeta.OutcomeMetadataKey]) == beadmeta.OutcomeFail &&
+		strings.TrimSpace(candidate.Metadata[beadmeta.FailureClassMetadataKey]) == beadmeta.FailureClassHard
 }
 
 // hookClaimCandidateIsMessage reports whether candidate is a mail message
