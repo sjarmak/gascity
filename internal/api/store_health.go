@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/storehealth"
 )
 
@@ -87,7 +88,10 @@ func (s *Server) computeStoreHealth(ctx context.Context) (*StatusStoreHealth, er
 	if err != nil {
 		return nil, err
 	}
-	lastAt, lastStatus := storehealth.LastMaintenance(s.state.EventProvider())
+	// Status requests are read-only. The controller seeds the projection while
+	// it owns the per-city lock; an absent sidecar falls back to a bounded scan
+	// without creating a request-lifetime writer that could outlive shutdown.
+	lastAt, lastStatus := storehealth.LastMaintenance(fsys.OSFS{}, cityPath, s.state.EventProvider())
 	// countBeadStoreRows returns an error (handled above) rather than a
 	// fabricated count on every failure path, so rows here is always a
 	// real measurement.

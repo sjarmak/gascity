@@ -17,6 +17,7 @@ import (
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/storehealth"
 	"github.com/gastownhall/gascity/internal/suspensionstate"
 	"github.com/gastownhall/gascity/internal/worker"
 )
@@ -129,17 +130,43 @@ func cityStatusStorePresent(cityPath string) bool {
 // the block still reports size/row data).
 var openStoreHealthEvents = defaultOpenStoreHealthEvents
 
-func defaultOpenStoreHealthEvents(cityPath string, stderr io.Writer) events.Provider {
+// readOnlyStoreHealthEvents is a lightweight storehealth.MaintenanceEventProvider
+// backed directly by events.ReadFiltered/ReadFilteredWithInFlight over the
+// city's event log path. It exists so the common case (a file-backed event
+// log) does not pay the cost of constructing and tearing down a full
+// events.Provider (with its own buffering/rotation machinery) just to read
+// two rare event types for the StoreHealth block — the projection sidecar
+// makes this the READ-ONLY fallback path anyway, exercised only when the
+// sidecar is absent.
+type readOnlyStoreHealthEvents struct {
+	path string
+}
+
+func (r readOnlyStoreHealthEvents) List(filter events.Filter) ([]events.Event, error) {
+	return events.ReadFiltered(r.path, filter)
+}
+
+func (r readOnlyStoreHealthEvents) ListInFlight(filter events.Filter) ([]events.Event, error) {
+	return events.ReadFilteredWithInFlight(r.path, filter)
+}
+
+func defaultOpenStoreHealthEvents(cityPath string, stderr io.Writer) storehealth.MaintenanceEventProvider {
 	eventsPath := filepath.Join(cityPath, ".gc", "events.jsonl")
 	providerName := os.Getenv("GC_EVENTS")
 	if providerName == "" {
 		providerName = peekEventsProvider(filepath.Join(cityPath, "city.toml"))
 	}
-	p, err := newEventsProviderForName(providerName, eventsPath, stderr)
-	if err != nil {
-		return nil
+	// Only construct a full events.Provider for the test/scripted provider
+	// names — the default (file-backed) case reads the event log directly
+	// via the lightweight read-only wrapper above.
+	if providerName == "fake" || providerName == "fail" || strings.HasPrefix(providerName, "exec:") {
+		p, err := newEventsProviderForName(providerName, eventsPath, stderr)
+		if err != nil {
+			return nil
+		}
+		return p
 	}
-	return p
+	return readOnlyStoreHealthEvents{path: eventsPath}
 }
 
 func buildCityStoreHealth(cityPath string, store beads.Store, stderr io.Writer) *StoreHealth {

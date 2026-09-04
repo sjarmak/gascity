@@ -1,17 +1,15 @@
 package storehealth
 
 import (
-	"bytes"
-	"compress/gzip"
 	"encoding/json"
-	"fmt"
-	"io"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/fsys"
 )
 
 func TestStorePath(t *testing.T) {
@@ -211,14 +209,48 @@ func TestWalkSizeSumsFiles(t *testing.T) {
 	}
 }
 
-func TestLastMaintenanceNilProvider(t *testing.T) {
-	ts, status := LastMaintenance(nil)
+func TestLastMaintenanceEmptyCityPath(t *testing.T) {
+	ts, status := LastMaintenance(fsys.OSFS{}, "", events.NewFake())
 	if !ts.IsZero() || status != "" {
-		t.Fatalf("LastMaintenance(nil) = (%v,%q), want (zero,\"\")", ts, status)
+		t.Fatalf("LastMaintenance(empty cityPath) = (%v,%q), want (zero,\"\")", ts, status)
 	}
 }
 
-func TestLastMaintenanceReturnsLatestAcrossTypes(t *testing.T) {
+func TestLastMaintenanceNilProvider(t *testing.T) {
+	city := t.TempDir()
+	ts, status := LastMaintenance(fsys.OSFS{}, city, nil)
+	if !ts.IsZero() || status != "" {
+		t.Fatalf("LastMaintenance(nil provider) = (%v,%q), want (zero,\"\")", ts, status)
+	}
+}
+
+// TestLastMaintenanceReadOnlyDoesNotWrite locks in the property that resolved
+// the two-process race: the CLI-facing read path never writes the shared
+// sidecar, even on the absent-sidecar scan fallback. Only the supervisor
+// (SeedMaintenanceProjection / RecordMaintenanceEvent) may write it.
+func TestLastMaintenanceReadOnlyDoesNotWrite(t *testing.T) {
+	city := t.TempDir()
+	ep := events.NewFake()
+	at := time.Date(2026, 4, 8, 3, 0, 0, 0, time.UTC)
+	payload, _ := json.Marshal(events.StoreMaintenanceDonePayload{DurationSeconds: 1})
+	ep.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: at, Payload: payload})
+
+	// Correct answer from the read-only history scan...
+	ts, status := LastMaintenance(fsys.OSFS{}, city, ep)
+	if !ts.Equal(at) || status != "success" {
+		t.Fatalf("LastMaintenance = (%v,%q), want (%v,success)", ts, status, at)
+	}
+	// ...but the sidecar must NOT have been created.
+	if _, ok, err := LoadMaintenanceProjection(fsys.OSFS{}, city); err != nil || ok {
+		t.Fatalf("read-only path wrote the sidecar: ok=%v err=%v", ok, err)
+	}
+	if _, err := os.Stat(MaintenanceProjectionPath(city)); !os.IsNotExist(err) {
+		t.Fatalf("sidecar exists after read-only call: err=%v", err)
+	}
+}
+
+func TestSeedMaintenanceProjectionAcrossTypes(t *testing.T) {
+	city := t.TempDir()
 	ep := events.NewFake()
 	older := time.Date(2026, 4, 1, 3, 0, 0, 0, time.UTC)
 	newer := time.Date(2026, 4, 8, 3, 0, 0, 0, time.UTC)
@@ -229,16 +261,24 @@ func TestLastMaintenanceReturnsLatestAcrossTypes(t *testing.T) {
 	ep.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: older, Payload: payloadDone})
 	ep.Record(events.Event{Type: events.StoreMaintenanceFailed, Ts: newer, Payload: payloadFail})
 
-	ts, status := LastMaintenance(ep)
-	if !ts.Equal(newer) {
-		t.Fatalf("ts = %v, want %v", ts, newer)
+	ts, status, err := SeedMaintenanceProjection(fsys.OSFS{}, city, ep)
+	if err != nil {
+		t.Fatalf("SeedMaintenanceProjection: %v", err)
 	}
-	if status != "failed" {
-		t.Fatalf("status = %q, want failed", status)
+	if !ts.Equal(newer) || status != "failed" {
+		t.Fatalf("SeedMaintenanceProjection = (%v,%q), want (%v,failed)", ts, status, newer)
+	}
+
+	// The seed persisted, so a follow-up read needs no provider: pass nil and
+	// require the same answer. If the read re-scanned, nil would yield zero.
+	ts2, status2 := LastMaintenance(fsys.OSFS{}, city, nil)
+	if !ts2.Equal(newer) || status2 != "failed" {
+		t.Fatalf("post-seed read = (%v,%q), want (%v,failed) — projection was re-scanned", ts2, status2, newer)
 	}
 }
 
-func TestLastMaintenanceOnlyDoneEvents(t *testing.T) {
+func TestSeedMaintenanceProjectionOnlyDoneEvents(t *testing.T) {
+	city := t.TempDir()
 	ep := events.NewFake()
 	t1 := time.Date(2026, 4, 1, 3, 0, 0, 0, time.UTC)
 	t2 := time.Date(2026, 4, 8, 3, 0, 0, 0, time.UTC)
@@ -246,168 +286,282 @@ func TestLastMaintenanceOnlyDoneEvents(t *testing.T) {
 	ep.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: t1, Payload: payload})
 	ep.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: t2, Payload: payload})
 
-	ts, status := LastMaintenance(ep)
-	if !ts.Equal(t2) {
-		t.Fatalf("ts = %v, want %v", ts, t2)
+	ts, status, err := SeedMaintenanceProjection(fsys.OSFS{}, city, ep)
+	if err != nil {
+		t.Fatalf("SeedMaintenanceProjection: %v", err)
 	}
-	if status != "success" {
-		t.Fatalf("status = %q, want success", status)
+	if !ts.Equal(t2) || status != "success" {
+		t.Fatalf("SeedMaintenanceProjection = (%v,%q), want (%v,success)", ts, status, t2)
 	}
 }
 
-func TestLastMaintenanceNoEvents(t *testing.T) {
-	ep := events.NewFake()
-	ts, status := LastMaintenance(ep)
+func TestSeedMaintenanceProjectionNoEvents(t *testing.T) {
+	city := t.TempDir()
+	ts, status, err := SeedMaintenanceProjection(fsys.OSFS{}, city, events.NewFake())
+	if err != nil {
+		t.Fatalf("SeedMaintenanceProjection(empty): %v", err)
+	}
 	if !ts.IsZero() || status != "" {
-		t.Fatalf("LastMaintenance(empty) = (%v,%q), want (zero,\"\")", ts, status)
+		t.Fatalf("SeedMaintenanceProjection(empty) = (%v,%q), want (zero,\"\")", ts, status)
 	}
 }
 
-// recordingProvider wraps a Fake and counts List vs ListTail calls, so tests
-// can assert which path LastMaintenance actually took rather than only
-// inferring it from the result.
-type recordingProvider struct {
+func TestSeedMaintenanceProjectionNilProviderDoesNotPersist(t *testing.T) {
+	city := t.TempDir()
+	ts, status, err := SeedMaintenanceProjection(fsys.OSFS{}, city, nil)
+	if err == nil {
+		t.Fatal("SeedMaintenanceProjection(nil) error = nil, want unavailable error")
+	}
+	if !ts.IsZero() || status != "" {
+		t.Fatalf("SeedMaintenanceProjection(nil) = (%v,%q), want (zero,\"\")", ts, status)
+	}
+	if _, ok, loadErr := LoadMaintenanceProjection(fsys.OSFS{}, city); loadErr != nil || ok {
+		t.Fatalf("nil provider persisted a projection: ok=%v err=%v", ok, loadErr)
+	}
+}
+
+func TestSeedMaintenanceProjectionListErrorDoesNotPersist(t *testing.T) {
+	city := t.TempDir()
+	ts, status, err := SeedMaintenanceProjection(fsys.OSFS{}, city, events.NewFailFake())
+	if err == nil {
+		t.Fatal("SeedMaintenanceProjection error = nil, want provider error")
+	}
+	if !ts.IsZero() || status != "" {
+		t.Fatalf("SeedMaintenanceProjection(error) = (%v,%q), want (zero,\"\")", ts, status)
+	}
+	if _, ok, loadErr := LoadMaintenanceProjection(fsys.OSFS{}, city); loadErr != nil || ok {
+		t.Fatalf("failed scan persisted a projection: ok=%v err=%v", ok, loadErr)
+	}
+}
+
+type maintenanceInFlightProvider struct {
 	*events.Fake
 	listCalls     int
-	listTailCalls int
+	inFlightCalls int
 }
 
-func (r *recordingProvider) List(filter events.Filter) ([]events.Event, error) {
-	r.listCalls++
-	return r.Fake.List(filter)
+func (p *maintenanceInFlightProvider) List(events.Filter) ([]events.Event, error) {
+	p.listCalls++
+	return nil, nil
 }
 
-func (r *recordingProvider) ListTail(filter events.Filter, limit int) ([]events.Event, error) {
-	r.listTailCalls++
-	return r.Fake.ListTail(filter, limit)
-}
-
-// providerWithoutTail implements events.Provider but deliberately omits
-// ListTail, so LastMaintenance must fall back to the unbounded List path
-// rather than a type assertion panicking or silently returning nothing.
-type providerWithoutTail struct {
-	*events.Fake
-}
-
-func (p *providerWithoutTail) List(filter events.Filter) ([]events.Event, error) {
+func (p *maintenanceInFlightProvider) ListInFlight(filter events.Filter) ([]events.Event, error) {
+	p.inFlightCalls++
 	return p.Fake.List(filter)
 }
 
-// TestLastMaintenanceUsesTailProviderFastPath is the regression for #4418:
-// when the provider implements events.TailProvider, LastMaintenance must
-// call ListTail (the bounded backward scan) instead of the unbounded List,
-// which on a large event log with a rare Type filter costs a full-file scan
-// for what is ultimately a cosmetic status field.
-func TestLastMaintenanceUsesTailProviderFastPath(t *testing.T) {
-	rp := &recordingProvider{Fake: events.NewFake()}
-	payload, _ := json.Marshal(events.StoreMaintenanceDonePayload{DurationSeconds: 3})
-	ts := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
-	rp.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: ts, Payload: payload})
+func TestSeedMaintenanceProjectionIncludesInFlightRotation(t *testing.T) {
+	city := t.TempDir()
+	provider := &maintenanceInFlightProvider{Fake: events.NewFake()}
+	doneAt := time.Date(2026, 6, 1, 4, 0, 0, 0, time.UTC)
+	provider.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: doneAt})
 
-	gotTs, gotStatus := LastMaintenance(rp)
-	if !gotTs.Equal(ts) || gotStatus != "success" {
-		t.Fatalf("LastMaintenance = (%v,%q), want (%v,success)", gotTs, gotStatus, ts)
+	ts, status, err := SeedMaintenanceProjection(fsys.OSFS{}, city, provider)
+	if err != nil {
+		t.Fatalf("SeedMaintenanceProjection: %v", err)
 	}
-	if rp.listTailCalls == 0 {
-		t.Fatalf("listTailCalls = 0, want > 0 (LastMaintenance should prefer the TailProvider fast path)")
+	if !ts.Equal(doneAt) || status != "success" {
+		t.Fatalf("SeedMaintenanceProjection = (%v,%q), want (%v,success)", ts, status, doneAt)
 	}
-	if rp.listCalls != 0 {
-		t.Fatalf("listCalls = %d, want 0 (fast path should not also fall back to List)", rp.listCalls)
+	if provider.listCalls != 0 || provider.inFlightCalls != 2 {
+		t.Fatalf("provider calls = List:%d ListInFlight:%d, want 0 and 2", provider.listCalls, provider.inFlightCalls)
 	}
 }
 
-// TestLastMaintenanceFallsBackWithoutTailProvider guards the fallback: a
-// provider that does not implement events.TailProvider (e.g. an exec-script
-// provider) must still get a correct answer via the existing List path.
-func TestLastMaintenanceFallsBackWithoutTailProvider(t *testing.T) {
-	pwt := &providerWithoutTail{Fake: events.NewFake()}
-	payload, _ := json.Marshal(events.StoreMaintenanceFailedPayload{Stage: "gc"})
-	ts := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
-	pwt.Record(events.Event{Type: events.StoreMaintenanceFailed, Ts: ts, Payload: payload})
-
-	gotTs, gotStatus := LastMaintenance(pwt)
-	if !gotTs.Equal(ts) || gotStatus != "failed" {
-		t.Fatalf("LastMaintenance = (%v,%q), want (%v,failed)", gotTs, gotStatus, ts)
-	}
+type failNthReadFS struct {
+	fsys.FS
+	path   string
+	failAt int
+	reads  int
 }
 
-// writeArchivedEvents writes evts as a gzipped canonical events archive
-// beside path, using the rotation naming convention
-// (events.jsonl.archive-<ts>-seq-<first>-<last>.gz) that the archive-aware
-// read path discovers by directory listing.
-func writeArchivedEvents(t *testing.T, path string, evts []events.Event) {
-	t.Helper()
-	if len(evts) == 0 {
-		t.Fatal("writeArchivedEvents: no events")
-	}
-	var raw bytes.Buffer
-	for _, e := range evts {
-		line, err := json.Marshal(e)
-		if err != nil {
-			t.Fatal(err)
+func (f *failNthReadFS) ReadFile(name string) ([]byte, error) {
+	if name == f.path {
+		f.reads++
+		if f.reads == f.failAt {
+			return nil, errors.New("transient read failure")
 		}
-		raw.Write(line)
-		raw.WriteString("\n")
 	}
-	var gz bytes.Buffer
-	zw := gzip.NewWriter(&gz)
-	if _, err := zw.Write(raw.Bytes()); err != nil {
-		t.Fatal(err)
+	return f.FS.ReadFile(name)
+}
+
+type maintenanceListHookProvider struct {
+	*events.Fake
+	beforeFirstList func()
+}
+
+func (p *maintenanceListHookProvider) List(filter events.Filter) ([]events.Event, error) {
+	if p.beforeFirstList != nil {
+		before := p.beforeFirstList
+		p.beforeFirstList = nil
+		before()
 	}
-	if err := zw.Close(); err != nil {
-		t.Fatal(err)
+	return p.Fake.List(filter)
+}
+
+func TestSeedMaintenanceProjectionReconcileReadErrorPreservesConcurrentEmit(t *testing.T) {
+	city := "/city"
+	baseFS := fsys.NewFake()
+	projectionPath := MaintenanceProjectionPath(city)
+	seedFS := &failNthReadFS{FS: baseFS, path: projectionPath, failAt: 2}
+	older := time.Date(2026, 6, 1, 4, 0, 0, 0, time.UTC)
+	newer := older.Add(time.Hour)
+	provider := &maintenanceListHookProvider{Fake: events.NewFake()}
+	provider.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: older})
+	provider.beforeFirstList = func() {
+		if err := RecordMaintenanceEvent(baseFS, city, newer, "success", nil); err != nil {
+			t.Fatalf("RecordMaintenanceEvent: %v", err)
+		}
 	}
-	name := fmt.Sprintf("events.jsonl.archive-%s-seq-%d-%d.gz",
-		evts[0].Ts.UTC().Format("20060102T150405Z"), evts[0].Seq, evts[len(evts)-1].Seq)
-	if err := os.WriteFile(filepath.Join(filepath.Dir(path), name), gz.Bytes(), 0o644); err != nil {
-		t.Fatal(err)
+
+	if _, _, err := SeedMaintenanceProjection(seedFS, city, provider); err == nil {
+		t.Fatal("SeedMaintenanceProjection error = nil, want reconciliation read error")
+	}
+	projection, ok, err := LoadMaintenanceProjection(baseFS, city)
+	if err != nil || !ok {
+		t.Fatalf("load concurrent projection: ok=%v err=%v", ok, err)
+	}
+	if got, status := projection.Latest(); !got.Equal(newer) || status != "success" {
+		t.Fatalf("projection after reconciliation failure = (%v,%q), want (%v,success)", got, status, newer)
 	}
 }
 
-// TestLastMaintenanceDoesNotReadRotatedArchives pins accepted, documented
-// behavior rather than a bug: FileRecorder.ListTail scans the active
-// events.jsonl only, so a maintenance event that has aged into a rotated
-// .gz archive is reported as absent. The old unbounded List path did read
-// archives; taking the archive-aware fall-through here (as
-// fetchEventPageAscending does) would restore the full scan #4418 removed,
-// and LastGCAt is display-only in every consumer. If this test starts
-// failing because LastMaintenance grew a fall-through, that is a
-// deliberate re-trade — update the comment on
-// lastMaintenanceScanWindowBytes with it, do not just delete the test.
-func TestLastMaintenanceDoesNotReadRotatedArchives(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "events.jsonl")
-	ts := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
-	payload, err := json.Marshal(events.StoreMaintenanceDonePayload{DurationSeconds: 3})
-	if err != nil {
+func TestSeedMaintenanceProjectionRepairsCorruptSidecar(t *testing.T) {
+	city := t.TempDir()
+	if err := os.MkdirAll(filepath.Dir(MaintenanceProjectionPath(city)), 0o755); err != nil {
 		t.Fatal(err)
 	}
-
-	// The only maintenance event lives in the archive; the active file
-	// holds unrelated traffic, as it would after a rotation.
-	writeArchivedEvents(t, path, []events.Event{
-		{Seq: 1, Type: events.StoreMaintenanceDone, Ts: ts, Payload: payload},
-	})
-
-	rec, err := events.NewFileRecorder(path, io.Discard)
-	if err != nil {
+	if err := os.WriteFile(MaintenanceProjectionPath(city), []byte("{not json"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	provider := events.NewFake()
+	doneAt := time.Date(2026, 6, 1, 4, 0, 0, 0, time.UTC)
+	provider.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: doneAt})
+
+	ts, status, err := SeedMaintenanceProjection(fsys.OSFS{}, city, provider)
+	if err != nil {
+		t.Fatalf("SeedMaintenanceProjection: %v", err)
+	}
+	if !ts.Equal(doneAt) || status != "success" {
+		t.Fatalf("SeedMaintenanceProjection = (%v,%q), want (%v,success)", ts, status, doneAt)
+	}
+}
+
+// TestSeedMaintenanceProjectionFindsEventAfterRotation is the regression the
+// previous ListTail-based fix failed: a real FileRecorder whose maintenance
+// event has rotated into a .gz archive. The active file holds only the
+// rotation anchor, so an active-file-only tail sees zero matches and reports
+// "never run". The seed scans the provider (archives included), so the
+// pre-rotation event is still found and persisted. The read-only path finds
+// it too (via the scan) without writing.
+func TestSeedMaintenanceProjectionFindsEventAfterRotation(t *testing.T) {
+	city := t.TempDir()
+	logPath := filepath.Join(city, ".gc", "events.jsonl")
+	rec, err := events.NewFileRecorder(logPath, os.Stderr)
+	if err != nil {
+		t.Fatalf("NewFileRecorder: %v", err)
 	}
 	defer rec.Close() //nolint:errcheck // test cleanup
-	rec.Record(events.Event{Type: "unrelated.event", Ts: ts.Add(time.Hour)})
 
-	// Control: the archive-aware List path DOES see it, so an empty result
-	// below is archive-blindness and not a broken fixture.
-	viaList, err := rec.List(events.Filter{Type: events.StoreMaintenanceDone})
+	doneAt := time.Date(2026, 6, 1, 4, 0, 0, 0, time.UTC)
+	payload, _ := json.Marshal(events.StoreMaintenanceDonePayload{DurationSeconds: 3})
+	rec.Record(events.Event{Type: events.StoreMaintenanceDone, Ts: doneAt, Payload: payload})
+
+	// Force the maintenance event into a .gz archive; the fresh active file
+	// then carries only the events.rotated anchor.
+	res, err := rec.ForceRotate()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ForceRotate: %v", err)
 	}
-	if len(viaList) != 1 {
-		t.Fatalf("List got %d events, want 1 (fixture must be readable via the archive-aware path)", len(viaList))
+	if !res.Rotated {
+		t.Fatalf("ForceRotate did not rotate: %s", res.Reason)
+	}
+	rec.WaitForRotations()
+
+	// Sanity: a bare tail of the active file must NOT see the event (this is
+	// exactly the blindness that made the ListTail approach unsafe).
+	tail, err := events.ReadFilteredTail(logPath, events.Filter{Type: events.StoreMaintenanceDone}, 1)
+	if err != nil {
+		t.Fatalf("ReadFilteredTail: %v", err)
+	}
+	if len(tail) != 0 {
+		t.Fatalf("active-file tail unexpectedly found the rotated event: %+v", tail)
 	}
 
-	gotTs, gotStatus := LastMaintenance(rec)
-	if !gotTs.IsZero() || gotStatus != "" {
-		t.Fatalf("LastMaintenance = (%v,%q), want (zero,\"\") — the tail fast path reads the active file only", gotTs, gotStatus)
+	ts, status, err := SeedMaintenanceProjection(fsys.OSFS{}, city, rec)
+	if err != nil {
+		t.Fatalf("SeedMaintenanceProjection: %v", err)
+	}
+	if !ts.Equal(doneAt) || status != "success" {
+		t.Fatalf("SeedMaintenanceProjection = (%v,%q), want (%v,success) — event must survive rotation into an archive", ts, status, doneAt)
+	}
+}
+
+// TestSeedMaintenanceProjectionNoMatchAfterRotationSeedsOnce covers the
+// production profile: a real, rotated history with zero maintenance events.
+// The seed scans once and persists an empty projection; a second read must be
+// answerable without the provider (nil), proving the expensive full-archive
+// scan does not repeat on every no-match /status call.
+func TestSeedMaintenanceProjectionNoMatchAfterRotationSeedsOnce(t *testing.T) {
+	city := t.TempDir()
+	logPath := filepath.Join(city, ".gc", "events.jsonl")
+	rec, err := events.NewFileRecorder(logPath, os.Stderr)
+	if err != nil {
+		t.Fatalf("NewFileRecorder: %v", err)
+	}
+	defer rec.Close() //nolint:errcheck // test cleanup
+
+	// Non-maintenance history, then rotation — no maintenance event anywhere.
+	rec.Record(events.Event{Type: events.SessionWoke, Ts: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)})
+	rec.Record(events.Event{Type: events.OrderFired, Ts: time.Date(2026, 6, 1, 1, 0, 0, 0, time.UTC)})
+	if _, err := rec.ForceRotate(); err != nil {
+		t.Fatalf("ForceRotate: %v", err)
+	}
+	rec.WaitForRotations()
+
+	ts, status, err := SeedMaintenanceProjection(fsys.OSFS{}, city, rec)
+	if err != nil {
+		t.Fatalf("SeedMaintenanceProjection(no-match): %v", err)
+	}
+	if !ts.IsZero() || status != "" {
+		t.Fatalf("SeedMaintenanceProjection(no-match) = (%v,%q), want (zero,\"\")", ts, status)
+	}
+	if _, ok, err := LoadMaintenanceProjection(fsys.OSFS{}, city); err != nil || !ok {
+		t.Fatalf("no-match seed did not persist a marker: ok=%v err=%v", ok, err)
+	}
+	// Second read with a nil provider must still return zero from the
+	// persisted marker — never a re-scan.
+	ts2, status2 := LastMaintenance(fsys.OSFS{}, city, nil)
+	if !ts2.IsZero() || status2 != "" {
+		t.Fatalf("second no-match read = (%v,%q), want (zero,\"\")", ts2, status2)
+	}
+}
+
+// TestRecordMaintenanceEventUpkeep proves the append-time path: on a fresh
+// install RecordMaintenanceEvent alone creates and keeps the projection
+// current — a later read with a nil provider reflects the recorded run.
+func TestRecordMaintenanceEventUpkeep(t *testing.T) {
+	city := t.TempDir()
+
+	done := time.Date(2026, 7, 1, 4, 0, 0, 0, time.UTC)
+	if err := RecordMaintenanceEvent(fsys.OSFS{}, city, done, "success", nil); err != nil {
+		t.Fatalf("RecordMaintenanceEvent: %v", err)
+	}
+	ts, status := LastMaintenance(fsys.OSFS{}, city, nil)
+	if !ts.Equal(done) || status != "success" {
+		t.Fatalf("after upkeep = (%v,%q), want (%v,success)", ts, status, done)
+	}
+
+	// A later failure supersedes; an older success does not lower it.
+	fail := done.Add(time.Hour)
+	if err := RecordMaintenanceEvent(fsys.OSFS{}, city, fail, "failed", nil); err != nil {
+		t.Fatalf("RecordMaintenanceEvent(failed): %v", err)
+	}
+	if err := RecordMaintenanceEvent(fsys.OSFS{}, city, done.Add(-time.Hour), "success", nil); err != nil {
+		t.Fatalf("RecordMaintenanceEvent(older success): %v", err)
+	}
+	ts, status = LastMaintenance(fsys.OSFS{}, city, nil)
+	if !ts.Equal(fail) || status != "failed" {
+		t.Fatalf("after failure = (%v,%q), want (%v,failed)", ts, status, fail)
 	}
 }

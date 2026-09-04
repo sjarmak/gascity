@@ -9,13 +9,15 @@
 package storehealth
 
 import (
+	"errors"
+	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads/contract"
-	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
 )
 
@@ -115,86 +117,96 @@ func WalkSize(path string) int64 {
 	return total
 }
 
-// lastMaintenanceScanWindowBytes bounds the TailProvider fast path in
-// LastMaintenance: a rare/optional event type (store maintenance may never
-// have run) forces a full-file backward walk otherwise, at the same cost as
-// an unfiltered forward scan (#4418). "Not found within the window" is a
-// valid, already-representable result — Health.LastGCAt is omitempty and
-// the status line simply omits "Last GC:" — so this trades a theoretical
-// miss on a maintenance event older than the window for bounded latency on
-// every call. 8 MiB comfortably covers many thousands of events at the
-// measured ~800 bytes/event average, while capping the worst case (a log
-// that has never emitted a matching event) to a small fraction of a full
-// scan.
-//
-// The window is not the only way this can miss, and not the dominant one.
-// FileRecorder.ListTail reads the ACTIVE events.jsonl only; it never opens
-// the sibling .gz archives that the old List path walked via ReadFiltered.
-// With rotation on by default at 256 MiB (defaultRotationMaxSize in
-// internal/events/recorder.go), a maintenance event that has aged into an
-// archive is invisible to this caller no matter how large the window is.
-// That is accepted, not an oversight — see LastMaintenance.
-const lastMaintenanceScanWindowBytes = 8 * 1024 * 1024
-
 // LastMaintenance returns the timestamp and status ("success" or
-// "failed") of the most-recent store-maintenance event in provider.
-// Zero time and empty status when no events, provider is nil, or the
-// provider returns an error.
-//
-// When provider implements [events.TailProvider], this uses the bounded
-// backward-tail scan instead of the unbounded forward List — see
-// lastMaintenanceScanWindowBytes. Providers without a tail fast path (e.g.
-// an exec-script provider) fall back to the original unbounded List call.
-//
-// This caller takes a short ListTail result at face value. It deliberately
-// does NOT take the under-fill fall-through that fetchEventPageAscending
-// (internal/api/huma_handlers_events.go) uses, where a tail result shorter
-// than the requested limit cannot distinguish "log exhausted" from "active
-// file exhausted, older matches in the archives" and so falls back to the
-// archive-aware full scan. Falling back here would restore exactly the full
-// scan this path exists to remove — and it would fire on the common case
-// (a city that has never run store maintenance), which is the worst case.
-// The cost is that a maintenance timestamp older than the window, or aged
-// into a rotated .gz archive, is reported as absent. Every consumer of the
-// resulting LastGCAt renders it conditionally for display and none gates a
-// decision on it, so absent is a safe answer. Operators who need a durable
-// answer have `gc maintenance status`.
-func LastMaintenance(ep events.Provider) (time.Time, string) {
-	if ep == nil {
+// "failed") of the most-recent store-maintenance event for the city at
+// cityPath. It is READ-ONLY and safe to call from any process — including
+// the transient `gc status` CLI — because it never writes the shared
+// projection sidecar. It reads the persisted latest-by-status sidecar in
+// O(1); when the sidecar is absent (a fresh install, or a supervisor that
+// has not seeded yet) it falls back to a bounded read-only scan of ep's
+// history (rotated .gz archives included) and returns that without
+// persisting. Persisting the sidecar is the supervisor's job alone — see
+// SeedMaintenanceProjection and RecordMaintenanceEvent — so there is
+// exactly one writer process and the process-local projectionWriteMu fully
+// serializes it. Zero time and empty status when no maintenance has been
+// recorded or cityPath is empty.
+func LastMaintenance(fs fsys.FS, cityPath string, ep MaintenanceEventProvider) (time.Time, string) {
+	if cityPath == "" {
 		return time.Time{}, ""
 	}
-	tp, hasTail := ep.(events.TailProvider)
-	var (
-		latestTs     time.Time
-		latestStatus string
-	)
-	for _, spec := range []struct {
-		typ    string
-		status string
-	}{
-		{events.StoreMaintenanceDone, "success"},
-		{events.StoreMaintenanceFailed, "failed"},
-	} {
-		var (
-			evts []events.Event
-			err  error
-		)
-		if hasTail {
-			evts, err = tp.ListTail(events.Filter{Type: spec.typ, MaxScanBytes: lastMaintenanceScanWindowBytes}, 1)
-		} else {
-			evts, err = ep.List(events.Filter{Type: spec.typ})
+	if p, ok, err := LoadMaintenanceProjection(fs, cityPath); err == nil && ok {
+		return p.Latest()
+	}
+	// Read-only fallback: derive the answer from history but do not write.
+	scanned, err := scanMaintenanceProjection(ep)
+	if err != nil {
+		return time.Time{}, ""
+	}
+	return scanned.Latest()
+}
+
+// SeedMaintenanceProjection returns the latest maintenance timestamp/status
+// exactly like LastMaintenance, but on an absent sidecar it also PERSISTS
+// the one-time seed so subsequent reads are O(1). It is the supervisor-only
+// persisting path: the supervisor process is the single writer of the
+// projection sidecar (this first-read seed plus RecordMaintenanceEvent at
+// emit time), which is why projectionWriteMu — a process-local lock — is
+// sufficient and the CLI fallback (LastMaintenance) must stay read-only.
+//
+// The scan runs outside the lock (it can be seconds on a large archive);
+// the result is then merged under the lock against any value the emit path
+// wrote meanwhile, taking the max per field, so a concurrent same-process
+// emit is never lowered. A no-match scan still persists an (empty) sidecar,
+// so the full scan runs at most once per city rather than on every
+// no-maintenance-events read — the failure mode that made request-time
+// scanning (and its archive-blind ListTail workaround) unacceptable.
+func SeedMaintenanceProjection(fs fsys.FS, cityPath string, ep MaintenanceEventProvider) (time.Time, string, error) {
+	if cityPath == "" {
+		return time.Time{}, "", nil
+	}
+	p, ok, loadErr := LoadMaintenanceProjection(fs, cityPath)
+	if loadErr == nil && ok {
+		ts, status := p.Latest()
+		return ts, status, nil
+	}
+	if loadErr != nil {
+		// Invalidate a persistently unreadable projection before scanning. This
+		// preserves corrupt-sidecar self-healing without allowing a later,
+		// transient reconciliation read failure to overwrite a concurrent emit.
+		projectionWriteMu.Lock()
+		p, ok, err := LoadMaintenanceProjection(fs, cityPath)
+		if err == nil && ok {
+			projectionWriteMu.Unlock()
+			ts, status := p.Latest()
+			return ts, status, nil
 		}
 		if err != nil {
-			continue
-		}
-		for _, e := range evts {
-			if e.Ts.After(latestTs) {
-				latestTs = e.Ts
-				latestStatus = spec.status
+			removeErr := fs.Remove(MaintenanceProjectionPath(cityPath))
+			if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				projectionWriteMu.Unlock()
+				return time.Time{}, "", fmt.Errorf("invalidate unreadable maintenance projection: %w", removeErr)
 			}
 		}
+		projectionWriteMu.Unlock()
 	}
-	return latestTs, latestStatus
+
+	scanned, err := scanMaintenanceProjection(ep)
+	if err != nil {
+		return time.Time{}, "", err
+	}
+	projectionWriteMu.Lock()
+	defer projectionWriteMu.Unlock()
+	current, _, err := LoadMaintenanceProjection(fs, cityPath)
+	if err != nil {
+		return time.Time{}, "", fmt.Errorf("reconcile maintenance projection: %w", err)
+	}
+	current.LastDoneAt = maxTime(current.LastDoneAt, scanned.LastDoneAt)
+	current.LastFailedAt = maxTime(current.LastFailedAt, scanned.LastFailedAt)
+	if err := writeMaintenanceProjectionLocked(fs, cityPath, current); err != nil {
+		return time.Time{}, "", err
+	}
+	ts, status := current.Latest()
+	return ts, status, nil
 }
 
 const bytesPerMB = 1_000_000

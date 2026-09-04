@@ -16,7 +16,9 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/storehealth"
 )
 
 const (
@@ -121,6 +123,7 @@ type StoreMaintenanceLoopDeps struct {
 	Store     beads.Store     // city Dolt store; future beads exercise it
 	CityPath  string          // absolute path for backup layout + logs
 	Recorder  events.Recorder // defaults to events.Discard when nil
+	FS        fsys.FS         // defaults to fsys.OSFS
 	Stderr    io.Writer       // defaults to io.Discard when nil
 	Clock     func() time.Time
 	Rand      func() float64 // returns [0,1); defaults to math/rand
@@ -169,6 +172,7 @@ type StoreMaintenanceLoop struct {
 	store             beads.Store
 	cityPath          string
 	recorder          events.Recorder
+	fs                fsys.FS
 	stderr            io.Writer
 	clock             func() time.Time
 	rand              func() float64
@@ -184,6 +188,12 @@ type StoreMaintenanceLoop struct {
 	// the same mutex so the manual-override API returns 409 when the
 	// scheduler (or a prior manual trigger) is mid-cycle.
 	mu sync.Mutex
+
+	// closed prevents new scheduled or API-triggered cycles once controller
+	// ownership begins shutting down. Close waits for any cycle that already
+	// holds mu, so the caller can keep its cross-process controller lock until
+	// every projection writer has exited.
+	closed atomic.Bool
 
 	// runStartedAt reports the start time of the currently in-flight run
 	// so callers contending for the lease can surface started_at in a 409
@@ -230,6 +240,9 @@ func NewStoreMaintenanceLoop(deps StoreMaintenanceLoopDeps) *StoreMaintenanceLoo
 	if deps.Recorder == nil {
 		deps.Recorder = events.Discard
 	}
+	if deps.FS == nil {
+		deps.FS = fsys.OSFS{}
+	}
 	if deps.Stderr == nil {
 		deps.Stderr = io.Discard
 	}
@@ -238,6 +251,7 @@ func NewStoreMaintenanceLoop(deps StoreMaintenanceLoopDeps) *StoreMaintenanceLoo
 		store:             deps.Store,
 		cityPath:          deps.CityPath,
 		recorder:          deps.Recorder,
+		fs:                deps.FS,
 		stderr:            deps.Stderr,
 		clock:             deps.Clock,
 		rand:              deps.Rand,
@@ -256,7 +270,7 @@ func NewStoreMaintenanceLoop(deps StoreMaintenanceLoopDeps) *StoreMaintenanceLoo
 // loop is configured with Enabled=false it returns immediately so the
 // caller can safely invoke it unconditionally during startup.
 func (m *StoreMaintenanceLoop) Run(ctx context.Context) {
-	if !m.cfg.Enabled {
+	if !m.cfg.Enabled || m.closed.Load() {
 		return
 	}
 	timer := time.NewTimer(m.nextDelay(m.clock()))
@@ -274,6 +288,16 @@ func (m *StoreMaintenanceLoop) Run(ctx context.Context) {
 		m.runOnce(ctx)
 		timer.Reset(m.nextDelay(m.clock()))
 	}
+}
+
+// Close prevents new maintenance cycles and waits for any in-flight cycle to
+// finish. Callers cancel Run's context first, then Close before releasing the
+// per-city controller lock. Close is idempotent.
+func (m *StoreMaintenanceLoop) Close() {
+	m.closed.Store(true)
+	m.mu.Lock()
+	m.runStartedAt.Store(nil)
+	m.mu.Unlock()
 }
 
 // LastRunAt returns the start time of the most recent maintenance run,
@@ -342,11 +366,11 @@ func (m *StoreMaintenanceLoop) applyJitter(interval time.Duration) time.Duration
 // a previous tick has not finished), it returns without doing work —
 // lease contention is a normal, silent condition.
 func (m *StoreMaintenanceLoop) runOnce(ctx context.Context) {
-	if !m.mu.TryLock() {
+	if m.closed.Load() || !m.mu.TryLock() {
 		return
 	}
 	defer m.mu.Unlock()
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || m.closed.Load() {
 		return
 	}
 	m.executeCycleLocked(ctx)
@@ -362,6 +386,9 @@ func (m *StoreMaintenanceLoop) runOnce(ctx context.Context) {
 // The returned run is a copy of the entry appended to history; callers may
 // mutate it freely.
 func (m *StoreMaintenanceLoop) TriggerNow(ctx context.Context) (MaintenanceRun, error) {
+	if m.closed.Load() {
+		return MaintenanceRun{}, context.Canceled
+	}
 	if !m.mu.TryLock() {
 		started := time.Time{}
 		if p := m.runStartedAt.Load(); p != nil {
@@ -372,6 +399,9 @@ func (m *StoreMaintenanceLoop) TriggerNow(ctx context.Context) (MaintenanceRun, 
 	defer m.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return MaintenanceRun{}, err
+	}
+	if m.closed.Load() {
+		return MaintenanceRun{}, context.Canceled
 	}
 	return m.executeCycleLocked(ctx), nil
 }
@@ -477,13 +507,23 @@ func (m *StoreMaintenanceLoop) emitRunEvent(run MaintenanceRun) {
 	if err != nil {
 		return
 	}
-	m.recorder.Record(events.Event{
+	event := events.Event{
 		Type:    eventType,
 		Actor:   maintenanceActor,
 		Subject: m.cityPath,
 		Ts:      run.FinishedAt,
 		Payload: raw,
-	})
+	}
+	status := "success"
+	if run.Err != "" {
+		status = "failed"
+	}
+	if err := storehealth.RecordMaintenanceEvent(m.fs, m.cityPath, run.FinishedAt, status, func() {
+		m.recorder.Record(event)
+	}); err != nil {
+		fmt.Fprintf(m.stderr, "events: store-maintenance projection: %v\n", err) //nolint:errcheck // best-effort stderr
+	}
+
 	if run.Err != "" {
 		m.sendFailureAlert(run)
 	}

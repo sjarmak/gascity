@@ -2258,7 +2258,6 @@ func startOneCity(
 
 	_ = runPostPrepareStep("starting_bead_event_watcher", func() error {
 		cs.startBeadEventWatcher(cityCtx)
-		cs.startMaintenanceLoop(cityCtx)
 		return nil
 	})
 
@@ -2343,14 +2342,20 @@ func startOneCity(
 	// started after the lock rather than before it.
 	registerResidencyRoutes(path, cityRuntime.storageRoutes, cityRuntime.cityBeadStore)
 
+	// Start the maintenance writer only after acquiring the per-city lock.
+	// Starting it earlier permits a standalone controller and supervisor to
+	// update the projection concurrently despite the process-local mutex.
+	cs.startMaintenanceLoop(cityCtx)
+
 	// Start controller socket AFTER the alreadyRunning check so we
 	// never destroy a live city's socket or leak a listener.
 	sockPath := controllerSocketPath(path)
 	lis, lisErr := startControllerSocket(path, controllerHostingSupervisor, cityCancel, forceShutdown, configDirty, reloadReqCh, convergenceReqCh, pokeCh, controlDispatcherCh)
 	if lisErr != nil {
 		fmt.Fprintf(stderr, "gc supervisor: city '%s': controller socket: %v\n", cityName, lisErr) //nolint:errcheck
-		lock.Close()                                                                               //nolint:errcheck // no socket to race with
 		cityCancel()
+		cs.stopMaintenanceLoop()
+		lock.Close() //nolint:errcheck // release only after the projection writer exits
 		cityRuntime.shutdown()
 		if fr != nil {
 			fr.Close() //nolint:errcheck
@@ -2375,8 +2380,9 @@ func startOneCity(
 		fmt.Fprintf(stderr, "gc supervisor: city '%s': controller token: %v\n", cityName, tokenErr) //nolint:errcheck
 		lis.Close()                                                                                 //nolint:errcheck
 		os.Remove(sockPath)                                                                         //nolint:errcheck
-		lock.Close()                                                                                //nolint:errcheck // lock released last
 		cityCancel()
+		cs.stopMaintenanceLoop()
+		lock.Close() //nolint:errcheck // release only after the projection writer exits
 		cityRuntime.shutdown()
 		if fr != nil {
 			fr.Close() //nolint:errcheck
@@ -2398,8 +2404,9 @@ func startOneCity(
 		fmt.Fprintf(stderr, "gc supervisor: city '%s': writing controller token: %v\n", cityName, err) //nolint:errcheck
 		lis.Close()                                                                                    //nolint:errcheck
 		os.Remove(sockPath)                                                                            //nolint:errcheck
-		lock.Close()                                                                                   //nolint:errcheck // lock released last
 		cityCancel()
+		cs.stopMaintenanceLoop()
+		lock.Close() //nolint:errcheck // release only after the projection writer exits
 		cityRuntime.shutdown()
 		if fr != nil {
 			fr.Close() //nolint:errcheck
@@ -2514,7 +2521,11 @@ func startOneCity(
 		// Resource cleanup defers pushed AFTER recovery/done so they
 		// execute BEFORE it in LIFO order: resources are released,
 		// then done is closed.
-		defer lk.Close()                 //nolint:errcheck // release controller lock (last released)
+		defer lk.Close() //nolint:errcheck // release controller lock last
+		defer func() {
+			cityCancel()
+			cs.stopMaintenanceLoop()
+		}()
 		defer convergence.RemoveToken(p) //nolint:errcheck // best-effort cleanup
 		defer func() {
 			// Ownership-safe socket removal: only unlink if the
