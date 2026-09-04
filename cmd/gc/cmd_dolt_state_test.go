@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -2145,8 +2147,8 @@ case "$*" in
     echo 'database is read only' >&2
     exit 1
     ;;
-  *"sql -r csv -q SELECT COUNT(*) AS cnt FROM information_schema.PROCESSLIST"*)
-    printf 'cnt\n812\n'
+  *"FROM information_schema.PROCESSLIST"*)
+    printf 'connection_count,max_connections,long_running_handlers,grouped_json_long_handlers\n812,1024,0,0\n'
     exit 0
     ;;
   *)
@@ -2172,6 +2174,14 @@ esac
 	}
 	if got["connection_count"] != "812" {
 		t.Fatalf("connection_count = %q, want 812", got["connection_count"])
+	}
+	for field, want := range map[string]string{
+		"max_connections": "1024", "long_running_handlers": "0",
+		"grouped_json_long_handlers": "0", "saturated": "false",
+	} {
+		if got[field] != want {
+			t.Fatalf("%s = %q, want %q", field, got[field], want)
+		}
 	}
 	invocation, err := os.ReadFile(invocationFile)
 	if err != nil {
@@ -2206,8 +2216,8 @@ case "$*" in
     printf 'Database\ninformation_schema\nmysql\ndolt\ndolt_cluster\nperformance_schema\nsys\n__gc_probe\n'
     exit 0
     ;;
-  *"sql -r csv -q SELECT COUNT(*) AS cnt FROM information_schema.PROCESSLIST"*)
-    printf 'cnt\n0\n'
+  *"FROM information_schema.PROCESSLIST"*)
+    printf 'connection_count,max_connections,long_running_handlers,grouped_json_long_handlers\n0,1024,0,0\n'
     exit 0
     ;;
   *"CREATE TABLE IF NOT EXISTS"*)
@@ -2257,7 +2267,7 @@ case "$*" in
   *"sql -r csv -q SELECT COUNT(*) AS cnt FROM information_schema.SCHEMATA"*)
     exit 0
     ;;
-  *"sql -r csv -q SELECT COUNT(*) AS cnt FROM information_schema.PROCESSLIST"*)
+  *"FROM information_schema.PROCESSLIST"*)
     exit 1
     ;;
   *)
@@ -2720,8 +2730,8 @@ while True:
     time.sleep(1)
 INNERPY
     ;;
-  *"SELECT COUNT(*) AS cnt FROM information_schema.PROCESSLIST"*)
-    printf 'cnt\n1\n'
+  *"FROM information_schema.PROCESSLIST"*)
+    printf 'connection_count,max_connections,long_running_handlers,grouped_json_long_handlers\n1,1024,0,0\n'
     ;;
   *"SELECT COUNT(*) AS cnt FROM information_schema.SCHEMATA"*)
     exit 0
@@ -2838,14 +2848,16 @@ func TestRecoverManagedDoltProcessReturnsWhenConcurrentStarterBecomesReady(t *te
 	t.Setenv("GC_DOLT_PASSWORD", "test-password")
 	oldQueryProbeDirect := managedDoltQueryProbeDirectFn
 	oldReadOnlyDirect := managedDoltReadOnlyStateDirectFn
-	oldConnectionCountDirect := managedDoltConnectionCountDirectFn
+	oldConnectionCountDirect := managedDoltProcessStatsDirectFn
 	managedDoltQueryProbeDirectFn = func(_, _, _ string) error { return nil }
 	managedDoltReadOnlyStateDirectFn = func(_, _, _ string) (string, error) { return "false", nil }
-	managedDoltConnectionCountDirectFn = func(_, _, _ string) (string, error) { return "1", nil }
+	managedDoltProcessStatsDirectFn = func(_, _, _ string) (managedDoltProcessStats, error) {
+		return managedDoltProcessStats{ConnectionCount: 1, MaxConnections: 100}, nil
+	}
 	defer func() {
 		managedDoltQueryProbeDirectFn = oldQueryProbeDirect
 		managedDoltReadOnlyStateDirectFn = oldReadOnlyDirect
-		managedDoltConnectionCountDirectFn = oldConnectionCountDirect
+		managedDoltProcessStatsDirectFn = oldConnectionCountDirect
 	}()
 
 	report, err := recoverManagedDoltProcess(cityPath, "127.0.0.1", strconv.Itoa(port), "root", "warning", 3*time.Second)
@@ -2955,7 +2967,7 @@ esac
 
 	oldQueryProbeDirect := managedDoltQueryProbeDirectFn
 	oldReadOnlyDirect := managedDoltReadOnlyStateDirectFn
-	oldConnectionCountDirect := managedDoltConnectionCountDirectFn
+	oldConnectionCountDirect := managedDoltProcessStatsDirectFn
 	managedDoltQueryProbeDirectFn = func(_, port, _ string) error {
 		if port != strconv.Itoa(newPort) {
 			return fmt.Errorf("unexpected query probe port %s", port)
@@ -2968,16 +2980,16 @@ esac
 		}
 		return "false", nil
 	}
-	managedDoltConnectionCountDirectFn = func(_, port, _ string) (string, error) {
+	managedDoltProcessStatsDirectFn = func(_, port, _ string) (managedDoltProcessStats, error) {
 		if port != strconv.Itoa(newPort) {
-			return "", fmt.Errorf("unexpected connection-count probe port %s", port)
+			return managedDoltProcessStats{}, fmt.Errorf("unexpected process-stats probe port %s", port)
 		}
-		return "1", nil
+		return managedDoltProcessStats{ConnectionCount: 1, MaxConnections: 100}, nil
 	}
 	defer func() {
 		managedDoltQueryProbeDirectFn = oldQueryProbeDirect
 		managedDoltReadOnlyStateDirectFn = oldReadOnlyDirect
-		managedDoltConnectionCountDirectFn = oldConnectionCountDirect
+		managedDoltProcessStatsDirectFn = oldConnectionCountDirect
 	}()
 
 	report, err := recoverManagedDoltProcess(cityPath, "127.0.0.1", strconv.Itoa(oldPort), "root", "warning", 2*time.Second)
@@ -3020,5 +3032,64 @@ func writeFakeDoltSQLBinary(t *testing.T, binDir, invocationFile, body string) {
 	path := filepath.Join(binDir, "dolt")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(fake dolt): %v", err)
+	}
+}
+
+func TestDoltStateInventoryCmdReportsReadOnlyInventory(t *testing.T) {
+	original := managedDoltInventoryQueryFn
+	t.Cleanup(func() { managedDoltInventoryQueryFn = original })
+	var queries []string
+	managedDoltInventoryQueryFn = func(_ context.Context, query string) (string, error) {
+		queries = append(queries, query)
+		switch {
+		case query == "SHOW DATABASES":
+			return "Database\nalpha\nmysql\nbeta\n", nil
+		case strings.Contains(query, "information_schema.TABLES") && strings.Contains(query, "alpha"):
+			return "schema_table,content_hash\n1,1\n", nil
+		case strings.Contains(query, "information_schema.TABLES") && strings.Contains(query, "beta"):
+			return "schema_table,content_hash\n0,0\n", nil
+		case strings.Contains(query, "MAX(version)"):
+			return "schema_version\n53\n", nil
+		case strings.Contains(query, "alpha") && strings.Contains(query, "dolt_remotes"):
+			return "name\nbackup\norigin\n", nil
+		case strings.Contains(query, "beta") && strings.Contains(query, "dolt_remotes"):
+			return "name\n", nil
+		case strings.Contains(query, "alpha") && strings.Contains(query, "dolt_remote_branches"):
+			return "name\nremotes/backup/release\nremotes/origin/main\nmain\nmalformed\n", nil
+		case strings.Contains(query, "beta") && strings.Contains(query, "dolt_remote_branches"):
+			return "name\n", nil
+		default:
+			return "", fmt.Errorf("unexpected query %q", query)
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"dolt-state", "inventory", "--port", "3311"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, stderr = %s", code, stderr.String())
+	}
+	want := "database\talpha\tschema_version\t53\tcontent_hash\tpresent\tremotes\tbackup,origin\tremote_branches\tbackup/release,origin/main\torigin_main\tpresent\n" + "database\tbeta\tschema_version\tabsent\tcontent_hash\tabsent\tremotes\tabsent\tremote_branches\tabsent\torigin_main\tabsent\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+	}
+	for _, query := range queries {
+		upper := strings.ToUpper(strings.TrimSpace(query))
+		if !strings.HasPrefix(upper, "SHOW ") && !strings.HasPrefix(upper, "SELECT ") {
+			t.Fatalf("inventory used non-read-only query %q", query)
+		}
+	}
+}
+
+func TestManagedDoltInventoryHonorsOverallCancellation(t *testing.T) {
+	original := managedDoltInventoryQueryFn
+	t.Cleanup(func() { managedDoltInventoryQueryFn = original })
+	managedDoltInventoryQueryFn = func(ctx context.Context, _ string) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := managedDoltInventoryContext(ctx, "", "3311", "")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("managedDoltInventoryContext() error = %v, want context.Canceled", err)
 	}
 }
