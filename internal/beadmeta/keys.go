@@ -149,6 +149,7 @@ const (
 	FanoutModeMetadataKey                = "gc.fanout_mode"
 	FanoutStateMetadataKey               = "gc.fanout_state"
 	FinalDispositionMetadataKey          = "gc.final_disposition"
+	FinalizeGateMetadataKey              = "gc.finalize_gate"
 	ForEachMetadataKey                   = "gc.for_each"
 	FormulaMetadataKey                   = "gc.formula"
 	FormulaContractMetadataKey           = "gc.formula_contract"
@@ -456,6 +457,7 @@ var KnownMetadataKeys = []string{
 	FanoutModeMetadataKey,
 	FanoutStateMetadataKey,
 	FinalDispositionMetadataKey,
+	FinalizeGateMetadataKey,
 	ForEachMetadataKey,
 	FormulaMetadataKey,
 	FormulaContractMetadataKey,
