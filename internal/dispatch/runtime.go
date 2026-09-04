@@ -1005,14 +1005,25 @@ func processWorkflowFinalize(store beads.Store, bead beads.Bead, opts ProcessOpt
 	// before completing the finalizer. This also repairs partially materialized
 	// workflows whose unused steps were never reached by ordinary dependency
 	// progression.
+	//
+	// The finalizer's own control bead is excluded from this sweep even though
+	// it is itself a member of rootID's subtree: it gets its own authoritative
+	// close via fencedSetOutcomeAndClose below, and letting the generic sweep
+	// stamp it gc.outcome=skipped first would race the fenced close's
+	// preserve-on-conflict semantics — the fence can't tell that skipped write
+	// apart from a genuine concurrent foreign close, so it would wrongly
+	// preserve "skipped" over this finalizer's real "pass" outcome.
 	excludeTeardown, err := molecule.TeardownTailExclusion(store, rootID)
 	if err != nil {
 		return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: resolving teardown members: %w", rootID, err))
 	}
+	excludeFinalizer := func(member beads.Bead) bool {
+		return member.ID == bead.ID || excludeTeardown(member)
+	}
 	if _, err := molecule.CloseSubtreeWithMetadataExcept(store, rootID, map[string]string{
 		beadmeta.OutcomeMetadataKey: beadmeta.OutcomeSkipped,
 		"close_reason":              sourceworkflow.WorkflowSkippedCloseReason,
-	}, excludeTeardown); err != nil {
+	}, excludeFinalizer); err != nil {
 		return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: closing terminal workflow members: %w", rootID, err))
 	}
 	// Skip pass-propagation to parent source beads when a concurrent run-cancel
