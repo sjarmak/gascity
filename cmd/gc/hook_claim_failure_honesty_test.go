@@ -70,6 +70,7 @@ func (h *failureHookHarness) ops() hookClaimOps {
 		ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
 			return nil, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 }
 

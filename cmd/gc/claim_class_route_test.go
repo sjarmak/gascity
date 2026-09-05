@@ -65,10 +65,16 @@ func notFoundClaim(t *testing.T, wantID string) hookClaimFunc {
 // one that answered "absent".
 type claimRouteFailingStore struct {
 	beads.Store
-	err error
+	read *beads.Bead
+	err  error
 }
 
-func (s claimRouteFailingStore) Get(string) (beads.Bead, error) { return beads.Bead{}, s.err }
+func (s claimRouteFailingStore) Get(string) (beads.Bead, error) {
+	if s.read != nil {
+		return *s.read, nil
+	}
+	return beads.Bead{}, s.err
+}
 
 // Claim delegates to the wrapped store. Embedding the beads.Store INTERFACE
 // hides the optional two-argument claim, and a binding without it is refused at
@@ -82,6 +88,20 @@ func (s claimRouteFailingStore) Claim(id, assignee string) (beads.Bead, bool, er
 		return beads.Bead{}, false, errors.New("wrapped store has no claim CAS")
 	}
 	return claimer.Claim(id, assignee)
+}
+
+// ClaimWithGeneration delegates the same way, for the same reason: the door
+// now requires this capability specifically (gc-3ohe47's MEDIUM finding), so a
+// wrapper that only forwarded plain Claim would itself be refused at
+// construction and never reach the read-failure rule these rows test.
+func (s claimRouteFailingStore) ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error) {
+	claimer, ok := s.Store.(interface {
+		ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error)
+	})
+	if !ok {
+		return beads.Bead{}, "", false, errors.New("wrapped store has no claim-with-generation")
+	}
+	return claimer.ClaimWithGeneration(id, assignee)
 }
 
 func TestClassRoutedClaimEscalatesOnlyOnNotFound(t *testing.T) {
@@ -369,6 +389,264 @@ func TestClassRoutedLifecycleEmissionFollowsTheClaimOnly(t *testing.T) {
 	}
 }
 
+// TestClassRoutedAdvanceClaimGenerationFollowsTheClaimOnly is the gc-3ohe47
+// HIGH #2 regression: a graph-dispatched claim's generation fence must land
+// in the ledger the claim itself landed in, exactly like Release and
+// EmitExecutionStepStarted route on the memo alone above. Before this wrapper
+// existed, classRoutedHookClaimOps left AdvanceClaimGeneration unwrapped, so a
+// binding-resident claim's fence still ran against the work-directory-rooted
+// BdStore — a store that never held the bead — reproducing the exact
+// uncloseable-graph-step defect (gc-ue0tsw) this route exists to close.
+//
+// Since the gc-3ohe47 P1 follow-up, route.claim itself mints the generation
+// atomically (ClaimWithGeneration) rather than leaving it for a second CAS, so
+// the fence call below the claim is a CONFIRM of the value the claim already
+// minted (fromGeneration == the memoized value), not a fresh advance. The
+// real caller (advanceHookClaimGeneration) reads that same minted value back
+// off the merged bead's metadata before calling AdvanceClaimGeneration, so
+// passing it here mirrors production exactly.
+func TestClassRoutedAdvanceClaimGenerationFollowsTheClaimOnly(t *testing.T) {
+	class := newClaimRouteClassStore(t)
+	mintClaimRouteBead(t, class, "gcg-c00", nil)
+	route := newClaimRouteFor(t, class)
+	workAdvances := 0
+	base := hookClaimOps{
+		Claim: notFoundClaim(t, "gcg-c00"),
+		AdvanceClaimGeneration: func(context.Context, string, []string, string, string, string) (string, beads.AdvanceClaimGenerationOutcome, error) {
+			workAdvances++
+			return "1", beads.AdvanceClaimGenerationAdvanced, nil
+		},
+	}
+
+	// Before any routed write, the fence stays on the work store.
+	ops := classRoutedHookClaimOps(base, route)
+	if _, _, err := ops.AdvanceClaimGeneration(context.Background(), "/work", nil, "gcg-c00", "worker-1", ""); err != nil {
+		t.Fatalf("routed advance before claim: %v", err)
+	}
+	if workAdvances != 1 {
+		t.Fatalf("work-scope advances = %d, want 1 before the claim routes; the memo, not a probe, is what moves this seam", workAdvances)
+	}
+
+	// After the claim routes the same id, ClaimWithGeneration has already
+	// minted gc.claim_generation=1 atomically with the ownership transition.
+	claimed, ok, err := ops.Claim(context.Background(), "/work", nil, "gcg-c00", "worker-1")
+	if !ok || err != nil {
+		t.Fatalf("routed claim = (ok=%v err=%v)", ok, err)
+	}
+	if got := strings.TrimSpace(claimed.Metadata[beadmeta.ClaimGenerationMetadataKey]); got != "1" {
+		t.Fatalf("claimed bead's gc.claim_generation = %q, want %q — the atomic claim must return the minted value", got, "1")
+	}
+
+	// The follow-on fence call confirms the already-minted value rather than
+	// advancing a second time, and must still never touch the work store.
+	next, outcome, err := ops.AdvanceClaimGeneration(context.Background(), "/work", nil, "gcg-c00", "worker-1", "1")
+	if err != nil || outcome != beads.AdvanceClaimGenerationAdvanced || next != "1" {
+		t.Fatalf("routed advance = (next=%q outcome=%q err=%v), want (1 Advanced <nil>)", next, outcome, err)
+	}
+	if workAdvances != 1 {
+		t.Fatalf("work-scope advances = %d, want 1 — after the claim landed in the binding the fence must not run against the ledger that never held the bead", workAdvances)
+	}
+	held, err := class.Get("gcg-c00")
+	if err != nil || strings.TrimSpace(held.Metadata[beadmeta.ClaimGenerationMetadataKey]) != "1" {
+		t.Fatalf("binding holds gcg-c00 with gc.claim_generation=%q (err=%v), want %q", held.Metadata[beadmeta.ClaimGenerationMetadataKey], err, "1")
+	}
+}
+
+// TestClassRoutedAdvanceClaimGenerationReportsStaleOnAMismatch pins the CAS
+// fence itself, not just the routing: a fromGeneration that no longer matches
+// the binding's current value must report Stale with no write, the same
+// vocabulary advanceHookClaimGeneration already unwinds a minted claim on —
+// so a graph-resident claim gets the identical fail-closed behavior a
+// work-resident one gets from beads.BdStore.ConfirmClaimGeneration.
+//
+// Since the gc-3ohe47 P1 follow-up, route.claim's ClaimWithGeneration already
+// advances gc.claim_generation from the bead's preset "5" to "6" atomically
+// with the ownership transition — that IS "another advance already ran," now
+// folded into the claim itself. A caller presenting a stale fromGeneration
+// ("3", matching neither the pre-claim "5" nor the post-claim "6") must still
+// see Stale with the binding left exactly where the atomic claim put it.
+func TestClassRoutedAdvanceClaimGenerationReportsStaleOnAMismatch(t *testing.T) {
+	class := newClaimRouteClassStore(t)
+	mintClaimRouteBead(t, class, "gcg-c01", map[string]string{beadmeta.ClaimGenerationMetadataKey: "5"})
+	route := newClaimRouteFor(t, class)
+	ops := classRoutedHookClaimOps(hookClaimOps{Claim: notFoundClaim(t, "gcg-c01")}, route)
+
+	claimed, ok, err := ops.Claim(context.Background(), "/work", nil, "gcg-c01", "worker-1")
+	if !ok || err != nil {
+		t.Fatalf("routed claim = (ok=%v err=%v)", ok, err)
+	}
+	if got := strings.TrimSpace(claimed.Metadata[beadmeta.ClaimGenerationMetadataKey]); got != "6" {
+		t.Fatalf("claimed bead's gc.claim_generation = %q, want %q — the atomic claim must advance from the preset 5", got, "6")
+	}
+	next, outcome, err := ops.AdvanceClaimGeneration(context.Background(), "/work", nil, "gcg-c01", "worker-1", "3")
+	if err != nil || outcome != beads.AdvanceClaimGenerationStale || next != "" {
+		t.Fatalf("routed advance against a stale fromGeneration = (next=%q outcome=%q err=%v), want (\"\" Stale <nil>)", next, outcome, err)
+	}
+	if held, getErr := class.Get("gcg-c01"); getErr != nil || strings.TrimSpace(held.Metadata[beadmeta.ClaimGenerationMetadataKey]) != "6" {
+		t.Fatalf("binding's gc.claim_generation for gcg-c01 = %q (err=%v), want it left at 6; a stale fence must not write", held.Metadata[beadmeta.ClaimGenerationMetadataKey], getErr)
+	}
+}
+
+func TestClassRoutedClaimGenerationMemoRejectsReclaimedDestination(t *testing.T) {
+	class := newClaimRouteClassStore(t)
+	mintClaimRouteBead(t, class, "gcg-c02", nil)
+	route := newClaimRouteFor(t, class)
+	ops := classRoutedHookClaimOps(hookClaimOps{Claim: notFoundClaim(t, "gcg-c02")}, route)
+
+	claimed, ok, err := ops.Claim(context.Background(), "/work", nil, "gcg-c02", "worker-a")
+	if err != nil || !ok {
+		t.Fatalf("first routed claim = (ok=%v err=%v), want success", ok, err)
+	}
+	firstGeneration := claimed.Metadata[beadmeta.ClaimGenerationMetadataKey]
+	releaser := class.(beads.ConditionalAssignmentReleaser)
+	if released, releaseErr := releaser.ReleaseIfCurrent("gcg-c02", "worker-a"); releaseErr != nil || !released {
+		t.Fatalf("release first claim = (released=%v err=%v), want success", released, releaseErr)
+	}
+	claimer := class.(interface {
+		ClaimWithGeneration(string, string) (beads.Bead, string, bool, error)
+	})
+	second, secondGeneration, acquired, claimErr := claimer.ClaimWithGeneration("gcg-c02", "worker-b")
+	if claimErr != nil || !acquired {
+		t.Fatalf("replacement claim = (acquired=%v err=%v), want success", acquired, claimErr)
+	}
+
+	next, outcome, advanceErr := ops.AdvanceClaimGeneration(context.Background(), "/work", nil, "gcg-c02", "worker-a", firstGeneration)
+	if advanceErr != nil || outcome != beads.AdvanceClaimGenerationStale || next != "" {
+		t.Fatalf("stale memo confirmation = (next=%q outcome=%q err=%v), want (\"\" Stale <nil>)", next, outcome, advanceErr)
+	}
+	if second.Assignee != "worker-b" || secondGeneration == firstGeneration {
+		t.Fatalf("replacement claim = (owner=%q generation=%q), want worker-b with a fresh generation after %q", second.Assignee, secondGeneration, firstGeneration)
+	}
+}
+
+func TestClassRoutedClaimGenerationFallbackChecksOwner(t *testing.T) {
+	class := newClaimRouteClassStore(t)
+	mintClaimRouteBead(t, class, "gcg-c03", map[string]string{beadmeta.ClaimGenerationMetadataKey: "7"})
+	owner := "worker-b"
+	status := "in_progress"
+	if err := class.Update("gcg-c03", beads.UpdateOpts{Assignee: &owner, Status: &status}); err != nil {
+		t.Fatalf("seeding replacement owner: %v", err)
+	}
+	route := newClaimRouteFor(t, class)
+	route.resident["gcg-c03"] = true
+	route.mintedGeneration["gcg-c03"] = "6"
+	ops := classRoutedHookClaimOps(hookClaimOps{}, route)
+
+	next, outcome, err := ops.AdvanceClaimGeneration(context.Background(), "/work", nil, "gcg-c03", "worker-a", "7")
+	if err != nil || outcome != beads.AdvanceClaimGenerationStale || next != "" {
+		t.Fatalf("foreign-owner fallback = (next=%q outcome=%q err=%v), want (\"\" Stale <nil>)", next, outcome, err)
+	}
+	held, getErr := class.Get("gcg-c03")
+	if getErr != nil {
+		t.Fatalf("reading destination after stale fallback: %v", getErr)
+	}
+	if held.Assignee != "worker-b" || held.Metadata[beadmeta.ClaimGenerationMetadataKey] != "7" {
+		t.Fatalf("destination after stale fallback = (owner=%q generation=%q), want (worker-b 7)", held.Assignee, held.Metadata[beadmeta.ClaimGenerationMetadataKey])
+	}
+}
+
+func TestClassRoutedClaimGenerationRejectsSameOwnerNewerGeneration(t *testing.T) {
+	class := newClaimRouteClassStore(t)
+	mintClaimRouteBead(t, class, "gcg-c04", map[string]string{beadmeta.ClaimGenerationMetadataKey: "7"})
+	owner := "worker-a"
+	status := "in_progress"
+	if err := class.Update("gcg-c04", beads.UpdateOpts{Assignee: &owner, Status: &status}); err != nil {
+		t.Fatalf("seeding current owner: %v", err)
+	}
+	route := newClaimRouteFor(t, class)
+	route.resident["gcg-c04"] = true
+	route.mintedGeneration["gcg-c04"] = "6"
+	ops := classRoutedHookClaimOps(hookClaimOps{}, route)
+
+	next, outcome, err := ops.AdvanceClaimGeneration(context.Background(), "/work", nil, "gcg-c04", "worker-a", "6")
+	if err != nil || outcome != beads.AdvanceClaimGenerationStale || next != "" {
+		t.Fatalf("same-owner stale generation = (next=%q outcome=%q err=%v), want (\"\" Stale <nil>)", next, outcome, err)
+	}
+}
+
+func TestClassRoutedClaimGenerationSurfacesDestinationReadFailure(t *testing.T) {
+	class := newClaimRouteClassStore(t)
+	failing := claimRouteFailingStore{Store: class, err: errors.New("destination unavailable")}
+	route, err := newHookClaimClassRoute(failing)
+	if err != nil {
+		t.Fatalf("opening failing route: %v", err)
+	}
+	route.resident["gcg-c05"] = true
+	route.mintedGeneration["gcg-c05"] = "6"
+	ops := classRoutedHookClaimOps(hookClaimOps{}, route)
+
+	next, outcome, advanceErr := ops.AdvanceClaimGeneration(context.Background(), "/work", nil, "gcg-c05", "worker-a", "6")
+	if advanceErr == nil || !strings.Contains(advanceErr.Error(), "destination unavailable") {
+		t.Fatalf("destination read failure = %v, want contextual destination unavailable error", advanceErr)
+	}
+	if outcome != "" || next != "" {
+		t.Fatalf("destination read failure = (next=%q outcome=%q), want empty refusal", next, outcome)
+	}
+}
+
+func TestClassRoutedClaimGenerationRejectsWrongDestinationID(t *testing.T) {
+	class := newClaimRouteClassStore(t)
+	wrong := beads.Bead{
+		ID:       "gcg-other",
+		Assignee: "worker-a",
+		Metadata: map[string]string{beadmeta.ClaimGenerationMetadataKey: "6"},
+	}
+	route, err := newHookClaimClassRoute(claimRouteFailingStore{Store: class, read: &wrong})
+	if err != nil {
+		t.Fatalf("opening wrong-id route: %v", err)
+	}
+	route.resident["gcg-c06"] = true
+	route.mintedGeneration["gcg-c06"] = "6"
+	ops := classRoutedHookClaimOps(hookClaimOps{}, route)
+
+	next, outcome, advanceErr := ops.AdvanceClaimGeneration(context.Background(), "/work", nil, "gcg-c06", "worker-a", "6")
+	if advanceErr != nil || outcome != beads.AdvanceClaimGenerationStale || next != "" {
+		t.Fatalf("wrong-id destination = (next=%q outcome=%q err=%v), want (\"\" Stale <nil>)", next, outcome, advanceErr)
+	}
+}
+
+func TestClassRoutedClaimGenerationRejectsEmptyOwner(t *testing.T) {
+	class := newClaimRouteClassStore(t)
+	mintClaimRouteBead(t, class, "gcg-c07", map[string]string{beadmeta.ClaimGenerationMetadataKey: "6"})
+	route := newClaimRouteFor(t, class)
+	route.resident["gcg-c07"] = true
+	route.mintedGeneration["gcg-c07"] = "6"
+	ops := classRoutedHookClaimOps(hookClaimOps{}, route)
+
+	next, outcome, err := ops.AdvanceClaimGeneration(context.Background(), "/work", nil, "gcg-c07", "", "6")
+	if err != nil || outcome != beads.AdvanceClaimGenerationStale || next != "" {
+		t.Fatalf("empty-owner destination = (next=%q outcome=%q err=%v), want (\"\" Stale <nil>)", next, outcome, err)
+	}
+}
+
+func TestClassRoutedClaimGenerationRejectsWhitespaceDifferentAuthority(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		assignee   string
+		generation string
+	}{
+		{name: "owner", assignee: " worker-a", generation: "6"},
+		{name: "generation", assignee: "worker-a", generation: " 6 "},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			class := newClaimRouteClassStore(t)
+			current := beads.Bead{ID: "gcg-c08", Assignee: tt.assignee, Metadata: map[string]string{beadmeta.ClaimGenerationMetadataKey: tt.generation}}
+			route, err := newHookClaimClassRoute(claimRouteFailingStore{Store: class, read: &current})
+			if err != nil {
+				t.Fatalf("opening route: %v", err)
+			}
+			route.resident["gcg-c08"] = true
+			route.mintedGeneration["gcg-c08"] = "6"
+			ops := classRoutedHookClaimOps(hookClaimOps{}, route)
+
+			next, outcome, advanceErr := ops.AdvanceClaimGeneration(context.Background(), "/work", nil, "gcg-c08", "worker-a", "6")
+			if advanceErr != nil || outcome != beads.AdvanceClaimGenerationStale || next != "" {
+				t.Fatalf("whitespace-different %s authority = (next=%q outcome=%q err=%v), want stale", tt.name, next, outcome, advanceErr)
+			}
+		})
+	}
+}
+
 // TestClassRoutedHookClaimOpsIsInertWithoutABinding is the single-store
 // byte-identity statement at the unit level: no route means the caller's own ops
 // value comes straight back, not a wrapper that delegates.
@@ -507,6 +785,51 @@ func TestHookClaimRouteVerdictDegradesRatherThanWedgingTheTick(t *testing.T) {
 // returns. beads.MemStore implements Claim, so the capability has to be hidden
 // behind a wrapper that does not.
 type claimRouteNoCASStore struct{ beads.Store }
+
+// claimRouteClaimOnlyStore hides everything the wrapped store offers except the
+// plain two-argument Claim, reproducing exactly the shape gc-3ohe47's MEDIUM
+// finding fell through: a binding that CAN claim ownership but has no
+// ClaimWithGeneration to mint the fence alongside it. Before the fix,
+// newHookClaimClassRoute's door checked only Claim and let this through; the
+// bead was then claimed for real by r.claim (which does invoke
+// ClaimWithGeneration), so the door's approval was a lie the mid-tick call had
+// to discover the hard way. This type exists so the door itself states the
+// stronger requirement, not just the runtime call.
+type claimRouteClaimOnlyStore struct{ beads.Store }
+
+func (s claimRouteClaimOnlyStore) Claim(id, assignee string) (beads.Bead, bool, error) {
+	claimer, ok := s.Store.(interface {
+		Claim(id, assignee string) (beads.Bead, bool, error)
+	})
+	if !ok {
+		return beads.Bead{}, false, errors.New("wrapped store has no claim CAS")
+	}
+	return claimer.Claim(id, assignee)
+}
+
+// TestHookClaimClassRouteRefusesABindingWithClaimButNoGeneration is the
+// MEDIUM finding's discriminating regression: a binding that implements plain
+// Claim but not ClaimWithGeneration must be refused at construction, exactly
+// like internal/storebinding pins the same distinction for the graph adapter
+// (TestBeadsGraphAdapterReportsMissingClaimWithGenerationCapability). Before
+// the fix this store passed newHookClaimClassRoute's door (it asserted only
+// Claim) and would have failed later, mid-tick, inside r.claim instead.
+func TestHookClaimClassRouteRefusesABindingWithClaimButNoGeneration(t *testing.T) {
+	var class beads.Store = claimRouteClaimOnlyStore{Store: newClaimRouteClassStore(t)}
+	if _, ok := class.(interface {
+		ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error)
+	}); ok {
+		t.Fatal("claimRouteClaimOnlyStore leaks ClaimWithGeneration from the wrapped store; the test proves nothing")
+	}
+
+	route, err := newHookClaimClassRoute(class)
+	if !errors.Is(err, errClaimRouteBindingCannotClaim) {
+		t.Fatalf("newHookClaimClassRoute over a binding with Claim but no ClaimWithGeneration = (route=%v err=%v), want errClaimRouteBindingCannotClaim", route, err)
+	}
+	if route != nil {
+		t.Fatal("a refused binding still produced a route; a claim-time route that cannot mint a generation is worse than none")
+	}
+}
 
 // newClaimRouteFor opens a claim-time class route over a store the row controls.
 // It observes no work legs, so nothing can preempt the escalation and the rows

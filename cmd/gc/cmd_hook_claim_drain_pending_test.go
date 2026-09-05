@@ -63,6 +63,7 @@ func (e *drainPendingClaimEnv) ops() hookClaimOps {
 			e.drainAcked = true
 			return nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 }
 

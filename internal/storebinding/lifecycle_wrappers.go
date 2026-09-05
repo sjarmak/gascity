@@ -261,6 +261,21 @@ func (g *wrappedGraphStore) Claim(id, assignee string) (beads.Bead, bool, error)
 	return claimed, acquired, err
 }
 
+func (g *wrappedGraphStore) ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error) {
+	var (
+		claimed    beads.Bead
+		generation string
+		acquired   bool
+	)
+	err := g.mutate(func() error {
+		var err error
+		claimed, generation, acquired, err = g.GraphStore.ClaimWithGeneration(id, assignee)
+		return err
+	})
+	g.emitter.observeClaim("ClaimWithGeneration", acquired, err)
+	return claimed, generation, acquired, err
+}
+
 func (g *wrappedGraphStore) ReleaseIfCurrent(id, assignee string) (bool, error) {
 	var released bool
 	err := g.mutate(func() error {

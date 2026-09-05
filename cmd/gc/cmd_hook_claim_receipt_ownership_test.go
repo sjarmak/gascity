@@ -109,7 +109,8 @@ func TestHookClaimEligibleTierReportsAnOwnedClaim(t *testing.T) {
 		Runner: func(string, string) (string, error) {
 			return `[{"id":"work-1","status":"open","metadata":{"gc.routed_to":"worker"}}]`, nil
 		},
-		Claim: ownershipClaimOp("in_progress", "worker-1"),
+		Claim:                  ownershipClaimOp("in_progress", "worker-1"),
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}, &stdout, &stderr)
 
 	if code != 0 {

@@ -582,6 +582,27 @@ func (s *emittingClassStore) Claim(id, assignee string) (beads.Bead, bool, error
 	return bead, claimed, err
 }
 
+// ClaimWithGeneration delegates the same way Claim does. It must exist here
+// specifically: gc-3ohe47's claim-time class door
+// (newHookClaimClassRoute) checks for ClaimWithGeneration rather than plain
+// Claim, and every production class-store construction wraps the underlying
+// binding in this emitter first — without this method the emitter would hide
+// a capability the wrapped store actually has, and every split-topology city
+// would fail the door check regardless of its real backing store.
+func (s *emittingClassStore) ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error) {
+	claimer, ok := s.Store.(interface {
+		ClaimWithGeneration(string, string) (beads.Bead, string, bool, error)
+	})
+	if !ok {
+		return beads.Bead{}, "", false, beads.ErrConditionalWriteUnsupported
+	}
+	bead, generation, claimed, err := claimer.ClaimWithGeneration(id, assignee)
+	if err == nil && claimed {
+		s.emitUpdated(id)
+	}
+	return bead, generation, claimed, err
+}
+
 func (s *emittingClassStore) ReleaseIfCurrent(id, expectedAssignee string) (bool, error) {
 	releaser, ok := s.Store.(beads.ConditionalAssignmentReleaser)
 	if !ok {

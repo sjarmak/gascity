@@ -107,6 +107,7 @@ func TestHookClaimSkipsHeldAssignmentAndClaimsReadyWork(t *testing.T) {
 			claimedID = id
 			return beads.Bead{ID: id, Status: "in_progress", Assignee: assignee, Type: "task"}, true, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	var stdout, stderr bytes.Buffer
 	doHookClaim("bd ready --json", "/tmp/work", holdTestClaimOptions(), ops, &stdout, &stderr)

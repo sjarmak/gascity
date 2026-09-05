@@ -505,6 +505,7 @@ func TestCanonicalizeLegacyBoundUnassignedRoutedWorkCanonicalWorkerClaims(t *tes
 			claimed.Assignee = assignee
 			return claimed, true, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "planner-gc-1",

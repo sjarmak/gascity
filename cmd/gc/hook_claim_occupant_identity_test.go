@@ -89,8 +89,8 @@ func TestHookClaimAssigneeIdentityPrecedence(t *testing.T) {
 
 // unaliasedPoolWorkerHookCity writes a city whose single agent yields one
 // unassigned, route-matched bead, plus a fake bd that records the BEADS_ACTOR
-// each subprocess ran under — the channel the claim's assignee travels on
-// (hookClaimEnvMap). It returns the bd log path.
+// each subprocess ran under and the explicit --actor on the guarded claim. It
+// returns the bd log path.
 func unaliasedPoolWorkerHookCity(t *testing.T, beadID string) string {
 	t.Helper()
 	cityDir := t.TempDir()
@@ -113,26 +113,71 @@ work_query = "printf '[{\"id\":\"%s\",\"status\":\"open\",\"assignee\":\"\",\"me
 	stateDir := t.TempDir()
 	logPath := filepath.Join(stateDir, "bd.log")
 	ownerPath := filepath.Join(stateDir, "owner")
-	// `bd update <id> --claim --json` is the claim mutation (BdStore.Claim); it
-	// takes its actor implicitly from BEADS_ACTOR, so echoing that back as the
-	// claimed assignee is what a real bd does and what lets the claim be
-	// accepted as ours (hookClaimThroughStore). The owner file makes the
-	// subsequent canonical readback agree with the mutation.
+	metaPath := filepath.Join(stateDir, "claim_generation")
+	// `bd update <id> --actor <assignee> --if-version <revision>
+	// --if-metadata-absent gc.claim_generation --claim --set-metadata
+	// gc.claim_generation=<n> --json` is
+	// the atomic claim-and-mint mutation (BdStore.ClaimWithGeneration,
+	// gc-3ohe47): both the ownership transfer and the generation mint travel in
+	// the SAME bd invocation, so this branch persists both from one match on
+	// `--claim` rather than the metadata write needing (and never getting) a
+	// second, separate call. The fixture requires the explicit --actor to agree
+	// with BEADS_ACTOR, then echoes it back as the claimed assignee. The owner
+	// and generation files make the subsequent canonical readback
+	// (beads.BdStore.ConfirmClaimGeneration's `bd show`) agree with the
+	// mutation, and the pre-claim `bd show` below (ClaimWithGeneration's own
+	// pre-read, computing the next generation) must also resolve the bead
+	// before any claim has landed — a stub that only answered `show` once
+	// claimed (the prior shape of this script) would make that pre-read see a
+	// nonexistent bead and fail before the claim mutation ever ran.
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\t%%s\n' "$BEADS_ACTOR" "$*" >> %q
+is_claim=0
+metadata_kv=""
+actor_arg=""
+expected_version=""
+expected_absent=""
+prev=""
 for arg in "$@"; do
-  if [ "$arg" = "--claim" ]; then
-    printf '%%s' "$BEADS_ACTOR" > %q
-    printf '{"id":"%s","status":"in_progress","assignee":"%%s"}' "$BEADS_ACTOR"
-    exit 0
-  fi
+  if [ "$arg" = "--claim" ]; then is_claim=1; fi
+  if [ "$prev" = "--set-metadata" ]; then metadata_kv="$arg"; fi
+  if [ "$prev" = "--actor" ]; then actor_arg="$arg"; fi
+  if [ "$prev" = "--if-version" ]; then expected_version="$arg"; fi
+  if [ "$prev" = "--if-metadata-absent" ]; then expected_absent="$arg"; fi
+  prev="$arg"
 done
-if [ "$1" = "show" ] && [ -f %q ]; then
-  printf '[{"id":"%s","status":"in_progress","assignee":"%%s"}]' "$(cat %q)"
+if [ "$is_claim" = "1" ]; then
+  if [ "$actor_arg" != "$BEADS_ACTOR" ] || [ "$expected_version" != "11" ] || [ "$expected_absent" != "gc.claim_generation" ]; then
+    printf 'invalid guarded claim actor=%%s env_actor=%%s version=%%s absent=%%s\n' "$actor_arg" "$BEADS_ACTOR" "$expected_version" "$expected_absent" >&2
+    exit 9
+  fi
+  printf '%%s' "$actor_arg" > %q
+  if [ -n "$metadata_kv" ]; then
+    printf '%%s' "${metadata_kv#*=}" > %q
+    printf '{"id":"%s","status":"in_progress","assignee":"%%s","revision":12,"metadata":{"gc.claim_generation":"%%s"}}' "$actor_arg" "${metadata_kv#*=}"
+  else
+    printf '{"id":"%s","status":"in_progress","assignee":"%%s","revision":12}' "$actor_arg"
+  fi
+  exit 0
+fi
+if [ "$1" = "show" ]; then
+  if [ -f %q ]; then
+    owner="$(cat %q)"
+    gen=""
+    [ -f %q ] && gen="$(cat %q)"
+    if [ -n "$gen" ]; then
+      printf '[{"id":"%s","status":"in_progress","assignee":"%%s","revision":12,"metadata":{"gc.claim_generation":"%%s"}}]' "$owner" "$gen"
+    else
+      printf '[{"id":"%s","status":"in_progress","assignee":"%%s","revision":12}]' "$owner"
+    fi
+  else
+    printf '[{"id":"%s","status":"open","assignee":"","revision":11,"metadata":{}}]'
+  fi
   exit 0
 fi
 printf '[]'
-`, logPath, ownerPath, beadID, ownerPath, beadID, ownerPath)
+`, logPath, ownerPath, metaPath, beadID, beadID,
+		ownerPath, ownerPath, metaPath, metaPath, beadID, beadID, beadID)
 	if err := os.WriteFile(filepath.Join(fakeBin, "bd"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -179,11 +224,21 @@ func TestCmdHookClaimUnaliasedPoolWorkerClaimsUnderItsSessionBeadID(t *testing.T
 	if err != nil {
 		t.Fatalf("ReadFile(%s): %v", logPath, err)
 	}
+	sawClaim := false
 	for _, line := range strings.Split(strings.TrimSpace(string(logData)), "\n") {
 		actor, args, _ := strings.Cut(line, "\t")
 		if actor == slotLabel {
 			t.Fatalf("bd ran under the slot label as BEADS_ACTOR (args: %s); the whole log:\n%s", args, logData)
 		}
+		if strings.Contains(args, "update") && strings.Contains(args, "--claim") {
+			sawClaim = true
+			if !strings.Contains(args, "--actor "+sessionID) {
+				t.Fatalf("guarded claim did not carry the occupant as explicit --actor (args: %s); the whole log:\n%s", args, logData)
+			}
+		}
+	}
+	if !sawClaim {
+		t.Fatalf("bd log has no guarded claim mutation:\n%s", logData)
 	}
 }
 
