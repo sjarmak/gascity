@@ -687,6 +687,46 @@ func scopeHasCompleteStorageBinding(path string) (bool, error) {
 	return false, fmt.Errorf("partial beads storage binding %s: backend, storage_endpoint, and storage_database must all be non-empty", path)
 }
 
+// probeCompleteStorageBindingHealth issues a real query against the resolved
+// endpoint of a complete storage binding, using the same command-runner
+// resolution (bdCommandRunnerForCity) that every other bd-contract operation
+// uses for this binding. A TCP-liveness check alone would pass a live port
+// bound to the wrong database; Ping runs an actual `bd list` query, so a
+// wrong database surfaces exactly like a dead endpoint: a non-nil error here.
+func probeCompleteStorageBindingHealth(cityPath string) error {
+	if err := bdStoreForCity(cityPath, cityPath).Ping(); err != nil {
+		return fmt.Errorf("unhealthy against %s: %w", describeCompleteStorageBindingEndpoint(cityPath), err)
+	}
+	return nil
+}
+
+// describeCompleteStorageBindingEndpoint renders the bound endpoint/database
+// for an unhealthy error message. It re-reads the same metadata file
+// scopeHasCompleteStorageBinding already validated as complete; any read or
+// parse failure here falls back to the metadata path itself so the health
+// error never masks the underlying probe failure with a formatting error.
+func describeCompleteStorageBindingEndpoint(cityPath string) string {
+	path := scopeMetadataJSONPath(cityPath)
+	data, err := fsys.OSFS{}.ReadFile(path)
+	if err != nil {
+		return path
+	}
+	var binding struct {
+		StorageEndpoint string `json:"storage_endpoint"`
+		StorageDatabase string `json:"storage_database"`
+	}
+	if err := json.Unmarshal(data, &binding); err != nil {
+		return path
+	}
+	if binding.StorageEndpoint == "" {
+		return path
+	}
+	if binding.StorageDatabase == "" {
+		return binding.StorageEndpoint
+	}
+	return fmt.Sprintf("%s (database %s)", binding.StorageEndpoint, binding.StorageDatabase)
+}
+
 // allowLegacyDoltMetadataRepair reports whether a metadata rejection may be
 // repaired in place rather than surfaced. It admits exactly one shape:
 // backend="legacy", the marker a pre-registry gc wrote, which names no backend
@@ -1225,7 +1265,7 @@ func healthBeadsProviderContext(ctx context.Context, cityPath string, waitForSco
 		if completeBinding, err := scopeHasCompleteStorageBinding(scopeMetadataJSONPath(cityPath)); err != nil {
 			return err
 		} else if completeBinding {
-			return nil
+			return probeCompleteStorageBindingHealth(cityPath)
 		}
 	}
 	provider := beadsProvider(cityPath)

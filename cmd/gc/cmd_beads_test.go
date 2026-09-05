@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -127,6 +128,99 @@ func TestDoBeadsHealth_ExecProviderUnhealthy(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "recovery failed") {
 		t.Errorf("stderr should mention recovery failure: %s", stderr.String())
+	}
+}
+
+// stubBeadsExecCommandRunnerWithEnv replaces the package-level bd exec runner
+// for the duration of the test with one that always fails with bdErr,
+// regardless of the args a caller passes (Ping issues "bd list --json
+// --limit 0", but the stub does not need to branch on that).
+func stubBeadsExecCommandRunnerWithEnv(t *testing.T, bdErr error) {
+	t.Helper()
+	orig := beadsExecCommandRunnerWithEnv
+	t.Cleanup(func() { beadsExecCommandRunnerWithEnv = orig })
+	beadsExecCommandRunnerWithEnv = func(_ map[string]string) beads.CommandRunner {
+		return func(_ string, _ string, _ ...string) ([]byte, error) {
+			return nil, bdErr
+		}
+	}
+}
+
+// writeCompleteStorageBindingCity sets up a city whose beads storage binding
+// is complete (backend + storage_endpoint + storage_database all present),
+// which routes gc beads health through probeCompleteStorageBindingHealth
+// instead of the exec-provider health/recover path.
+func writeCompleteStorageBindingCity(t *testing.T, cityPath, endpoint, database string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	metadata := fmt.Sprintf(`{"backend":"postgres","storage_endpoint":%q,"storage_database":%q,"dolt_mode":"server"}`, endpoint, database)
+	if err := os.WriteFile(scopeMetadataJSONPath(cityPath), []byte(metadata), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GC_BEADS", "exec:"+gcBeadsBdScriptPath(cityPath))
+}
+
+// TestDoBeadsHealth_CompleteStorageBindingWrongPortUnhealthy covers a dead
+// endpoint: the store never accepts a connection, so the probe's query fails
+// at the transport layer. This is the case a bare TCP-liveness check would
+// also have caught; it is here so the fix is proven against both failure
+// shapes, not just the one a liveness check would miss (see the wrong-
+// database test below).
+func TestDoBeadsHealth_CompleteStorageBindingWrongPortUnhealthy(t *testing.T) {
+	cityPath := t.TempDir()
+	writeCompleteStorageBindingCity(t, cityPath, "10.0.0.5:5432", "gascity")
+	stubBeadsExecCommandRunnerWithEnv(t, errors.New("dial tcp 10.0.0.5:5432: connect: connection refused"))
+
+	cityFlag = cityPath
+	defer func() { cityFlag = "" }()
+
+	var stdout, stderr bytes.Buffer
+	code := doBeadsHealth(false, false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "healthy") {
+		t.Errorf("stdout should not claim healthy: %s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "10.0.0.5:5432") {
+		t.Errorf("stderr = %q, want it to name the resolved endpoint", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "connection refused") {
+		t.Errorf("stderr = %q, want the underlying transport error", stderr.String())
+	}
+}
+
+// TestDoBeadsHealth_CompleteStorageBindingWrongDatabaseUnhealthy covers a
+// live port bound to the wrong database: the TCP connection succeeds, so a
+// liveness-only probe would wrongly report healthy. The fix must run a real
+// query (bd list) against the resolved endpoint, so a "database does not
+// exist" failure from that query still surfaces as unhealthy.
+func TestDoBeadsHealth_CompleteStorageBindingWrongDatabaseUnhealthy(t *testing.T) {
+	cityPath := t.TempDir()
+	writeCompleteStorageBindingCity(t, cityPath, "10.0.0.9:5432", "gascity")
+	stubBeadsExecCommandRunnerWithEnv(t, errors.New(`pq: database "gascity" does not exist`))
+
+	cityFlag = cityPath
+	defer func() { cityFlag = "" }()
+
+	var stdout, stderr bytes.Buffer
+	code := doBeadsHealth(false, false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "healthy") {
+		t.Errorf("stdout should not claim healthy: %s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "10.0.0.9:5432") {
+		t.Errorf("stderr = %q, want it to name the resolved endpoint", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `database "gascity" does not exist`) {
+		t.Errorf("stderr = %q, want the underlying query error", stderr.String())
 	}
 }
 
