@@ -78,6 +78,7 @@ type AwakeSessionBead struct {
 	ContinuationResetPending  bool      // continuation_reset_pending metadata is set
 	CurrentlyProcessingBeadID string    // work bead the session is currently processing
 	PostCreateProtected       bool      // fresh successful pool create; preferred for scaled slots during grace
+	UnfinishedContinuation    bool      // validated drain workflow still has successor work to materialize
 }
 
 // AwakeWorkBead represents a work bead with an assignee.

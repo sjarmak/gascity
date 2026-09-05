@@ -2480,6 +2480,105 @@ func TestReconcileSessionBeads_AsleepIdlePoolBeadFreesSlot(t *testing.T) {
 	}
 }
 
+func TestReconcileSessionBeads_UnfinishedDrainRetainsPoolIdentityUntilRootCompletes(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		Workspace: config.Workspace{Name: "test"},
+		Agents:    []config.Agent{{Name: "worker"}},
+	}
+	env.addDesired("worker", "worker", false)
+	member, err := env.store.Create(beads.Bead{Type: "task", Metadata: map[string]string{
+		beadmeta.RootStoreRefMetadataKey: "city:test",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := env.store.Create(beads.Bead{Type: "task", Status: "in_progress", Metadata: map[string]string{
+		beadmeta.RootStoreRefMetadataKey:        "city:test",
+		beadmeta.KindMetadataKey:                beadmeta.KindWorkflow,
+		beadmeta.FormulaContractMetadataKey:     beadmeta.FormulaContractGraphV2,
+		beadmeta.DrainMemberIDMetadataKey:       member.ID,
+		beadmeta.DrainMemberStoreRefMetadataKey: "city:test",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	step, err := env.store.Create(beads.Bead{Type: "task", Status: "closed", Metadata: map[string]string{
+		beadmeta.RootStoreRefMetadataKey:      "city:test",
+		beadmeta.RootBeadIDMetadataKey:        root.ID,
+		beadmeta.ContinuationGroupMetadataKey: "drain:control-1",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := env.createSessionBead("worker", "worker")
+	env.setSessionMetadata(&session, map[string]string{
+		"state":                                 "asleep",
+		"sleep_reason":                          "idle",
+		poolManagedMetadataKey:                  boolMetadata(true),
+		beadmeta.TriggerBeadIDMetadataKey:       step.ID,
+		beadmeta.TriggerBeadStoreRefMetadataKey: "city:test",
+		sessionpkg.CurrentBeadIDKey:             step.ID,
+	})
+
+	readErr := errors.New("continuation root unavailable")
+	unreadable := &failingGetStore{Store: env.store, failID: root.ID, err: readErr}
+	reconcileSessionBeadsAtPath(
+		context.Background(), "", []beads.Bead{session}, env.desiredState,
+		map[string]bool{"worker": true}, env.cfg, env.sp, unreadable, newFakeDrainOps(),
+		nil, nil, nil, env.dt, nil, false, nil, "", nil, env.clk, env.rec,
+		0, 0, &env.stdout, &env.stderr,
+	)
+	unknown, err := env.store.Get(session.ID)
+	if err != nil || unknown.Status == "closed" {
+		t.Fatalf("UNKNOWN continuation retired identity: status=%q err=%v", unknown.Status, err)
+	}
+	if !strings.Contains(env.stderr.String(), readErr.Error()) {
+		t.Fatalf("UNKNOWN lost cause: %s", env.stderr.String())
+	}
+	for _, call := range env.sp.SnapshotCalls() {
+		if call.Method == "Start" {
+			t.Fatal("UNKNOWN continuation woke worker")
+		}
+	}
+
+	reconcileSessionBeadsAtPath(
+		context.Background(), "", []beads.Bead{session}, env.desiredState,
+		map[string]bool{"worker": true}, env.cfg, env.sp, env.store, newFakeDrainOps(),
+		nil, nil, nil, env.dt, nil, false, nil, "", nil, env.clk, env.rec,
+		0, 0, &env.stdout, &env.stderr,
+	)
+	retained, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retained.Status == "closed" {
+		t.Fatalf("unfinished drain retired session identity: metadata=%v", retained.Metadata)
+	}
+	for _, call := range env.sp.SnapshotCalls() {
+		if call.Method == "Start" {
+			t.Fatal("unfinished continuation without runnable work woke worker")
+		}
+	}
+
+	if err := env.store.Close(root.ID); err != nil {
+		t.Fatal(err)
+	}
+	reconcileSessionBeadsAtPath(
+		context.Background(), "", []beads.Bead{retained}, env.desiredState,
+		map[string]bool{"worker": true}, env.cfg, env.sp, env.store, newFakeDrainOps(),
+		nil, nil, nil, env.dt, nil, false, nil, "", nil, env.clk, env.rec,
+		0, 0, &env.stdout, &env.stderr,
+	)
+	released, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released.Status != "closed" {
+		t.Fatalf("completed drain retained session status %q, want closed", released.Status)
+	}
+}
+
 // TestReconcileSessionBeads_AsleepMaxSessionAgePoolBeadFreesSlot mirrors
 // TestReconcileSessionBeads_AsleepIdlePoolBeadFreesSlot for
 // sleep_reason=max-session-age: a session forced to stop by the max-session-age

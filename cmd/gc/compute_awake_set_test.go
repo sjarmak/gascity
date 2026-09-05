@@ -1115,6 +1115,46 @@ func TestReadyWait_Wakes(t *testing.T) {
 	assertReason(t, result, "s-mc-1", "wait-ready")
 }
 
+func TestUnfinishedContinuation_WaitHoldRetainsWithoutWake(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "worker"}},
+		SessionBeads: []AwakeSessionBead{{
+			ID: "session-1", SessionName: "worker-1", Template: "worker", State: "asleep",
+			WaitHold: true, UnfinishedContinuation: true,
+		}},
+	})
+	if got := result["worker-1"]; got.ShouldWake {
+		t.Fatalf("unfinished wait-held session decision = %+v, want retained without wake", got)
+	}
+}
+
+func TestUnfinishedContinuation_DoesNotWakeWithoutRunnableWork(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "worker"}},
+		SessionBeads: []AwakeSessionBead{{
+			ID: "session-1", SessionName: "worker-1", Template: "worker", State: "asleep",
+			UnfinishedContinuation: true,
+		}},
+	})
+	if got := result["worker-1"]; got.ShouldWake {
+		t.Fatalf("unfinished continuation decision = %+v, want no wake without runnable work", got)
+	}
+}
+
+func TestUnfinishedContinuation_ReadyWaitStillWakesHeldSession(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "worker"}},
+		SessionBeads: []AwakeSessionBead{{
+			ID: "session-1", SessionName: "worker-1", Template: "worker", State: "asleep",
+			WaitHold: true, UnfinishedContinuation: true,
+		}},
+		ReadyWaitSet: map[string]bool{"session-1": true},
+	})
+	if got := result["worker-1"]; !got.ShouldWake || got.Reason != "wait-ready" {
+		t.Fatalf("ready wait decision = %+v, want wait-ready wake", got)
+	}
+}
+
 func TestReadyWait_NotReady_StaysAsleep(t *testing.T) {
 	result := ComputeAwakeSet(AwakeInput{
 		Agents: []AwakeAgent{{QualifiedName: "gascity/claude"}},
