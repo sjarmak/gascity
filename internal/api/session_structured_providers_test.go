@@ -1715,7 +1715,15 @@ func TestHandleSessionStreamStructuredResumeEmitsInclusiveTailUpsert(t *testing.
 		h.ServeHTTP(rec, req)
 		close(done)
 	}()
-	initialBody := waitForRecorderSubstring(t, rec, "event: activity", 10*time.Second)
+	// Both waits share the handler's own request context deadline, so
+	// together they can never outlive the context that will cancel the
+	// stream out from under them (a wait budget larger than the remaining
+	// context lifetime is what let the second wait silently starve here).
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatalf("request context has no deadline")
+	}
+	initialBody := waitForRecorderSubstring(t, rec, "event: activity", time.Until(deadline))
 	if !strings.Contains(initialBody, "event: activity") {
 		t.Fatalf("stream readiness activity did not arrive: %s", initialBody)
 	}
@@ -1734,7 +1742,7 @@ func TestHandleSessionStreamStructuredResumeEmitsInclusiveTailUpsert(t *testing.
 		t.Fatalf("close transcript: %v", closeErr)
 	}
 
-	body := waitForRecorderSubstring(t, rec, "event: structured", 10*time.Second)
+	body := waitForRecorderSubstring(t, rec, "event: structured", time.Until(deadline))
 	cancel()
 	<-done
 	frame := firstSSETestFrame(t, body, "structured")

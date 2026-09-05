@@ -714,7 +714,9 @@ func waitForRecorderSubstring(t *testing.T, rec *syncResponseRecorder, want stri
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return rec.BodyString()
+	body := rec.BodyString()
+	t.Fatalf("waitForRecorderSubstring: %q not found within %s; body: %s", want, timeout, body)
+	return body
 }
 
 func TestHandleSessionList(t *testing.T) {
