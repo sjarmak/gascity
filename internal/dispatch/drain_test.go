@@ -1544,6 +1544,60 @@ bond = "mol-voter"
 	}
 }
 
+func TestStampDrainItemRecipeLinksWorkspaceOwnerWithoutCopyingOwnershipEvidence(t *testing.T) {
+	recipe := &formula.Recipe{Steps: []formula.RecipeStep{
+		{ID: "root", Metadata: map[string]string{}},
+		{ID: "work", Metadata: map[string]string{}},
+	}}
+	member := beads.Bead{ID: "member-1", Metadata: map[string]string{
+		beadmeta.RootStoreRefMetadataKey:       "rig:owner",
+		beadmeta.WorkDirMetadataKey:            "/worktrees/member-1",
+		beadmeta.WorktreeRepoMetadataKey:       "/repos/gascity",
+		beadmeta.WorktreeRootMetadataKey:       "/worktrees",
+		beadmeta.WorkBranchMetadataKey:         "work/member-1",
+		beadmeta.WorktreeBaseRefMetadataKey:    "main",
+		beadmeta.WorktreeBaseSHAMetadataKey:    strings.Repeat("a", 40),
+		beadmeta.WorktreeCreatorMetadataKey:    "gc-sling",
+		beadmeta.WorktreeOwnerMetadataKey:      "gc-sling",
+		beadmeta.WorktreeGenerationMetadataKey: "7",
+		beadmeta.WorktreeLifecycleMetadataKey:  "active",
+	}}
+	stampDrainItemRecipe(recipe,
+		beads.Bead{ID: "drain-1"},
+		beads.Bead{ID: "unit-1"},
+		member,
+		1,
+		&drainManifestRow{Index: 0, ItemRootKey: "item-key-1"},
+		"drain-item",
+		nil,
+	)
+
+	root := recipe.RootStep()
+	if got := root.Metadata[beadmeta.DrainMemberIDMetadataKey]; got != member.ID {
+		t.Fatalf("root drain member id = %q, want %q", got, member.ID)
+	}
+	if got := root.Metadata[beadmeta.DrainMemberStoreRefMetadataKey]; got != "rig:owner" {
+		t.Fatalf("root drain member store ref = %q, want rig:owner", got)
+	}
+	for _, step := range recipe.Steps {
+		for _, key := range []string{
+			beadmeta.WorktreeRepoMetadataKey,
+			beadmeta.WorktreeRootMetadataKey,
+			beadmeta.WorkBranchMetadataKey,
+			beadmeta.WorktreeBaseRefMetadataKey,
+			beadmeta.WorktreeBaseSHAMetadataKey,
+			beadmeta.WorktreeCreatorMetadataKey,
+			beadmeta.WorktreeOwnerMetadataKey,
+			beadmeta.WorktreeGenerationMetadataKey,
+			beadmeta.WorktreeLifecycleMetadataKey,
+		} {
+			if value := step.Metadata[key]; value != "" {
+				t.Errorf("step %s copied workspace-owner evidence %s=%q", step.ID, key, value)
+			}
+		}
+	}
+}
+
 func seedDrainWorkflow(t *testing.T) (*beads.MemStore, beads.Bead) {
 	t.Helper()
 	store := beads.NewMemStore()

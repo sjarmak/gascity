@@ -1512,6 +1512,7 @@ func stampDrainItemRecipe(recipe *formula.Recipe, control, unit, member beads.Be
 	root.Metadata[beadmeta.DrainIndexMetadataKey] = strconv.Itoa(row.Index)
 	root.Metadata[beadmeta.DrainCountMetadataKey] = strconv.Itoa(count)
 	root.Metadata[beadmeta.DrainMemberIDMetadataKey] = member.ID
+	root.Metadata[beadmeta.DrainMemberStoreRefMetadataKey] = strings.TrimSpace(member.Metadata[beadmeta.RootStoreRefMetadataKey])
 	root.Metadata[beadmeta.DrainMemberAccessMetadataKey] = drainMemberAccess(control)
 	root.Metadata[beadmeta.ItemRootKeyMetadataKey] = row.ItemRootKey
 	root.Metadata[beadmeta.Graphv2RootKeyMetadataKey] = graphv2.RootKey(unit.ID, itemFormula, vars, "drain", control.ID+":"+member.ID)

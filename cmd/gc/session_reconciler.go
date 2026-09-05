@@ -3588,10 +3588,23 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	for i := range orderedIDs {
 		sessionInfos[i] = infoByID[orderedIDs[i]]
 	}
+	continuationCandidates, continuationCandidatesErr := censusStoreCandidates(cityPath, cfg, store, rigStores, nil, censusRefScoped)
+	continuationStatuses := unfinishedContinuationStatuses(
+		sessionInfos,
+		newQualifiedBeadResolver(qualifiedBindingsFromCandidates(continuationCandidates)),
+		continuationCandidatesErr,
+	)
 	awakeInput := buildAwakeInputFromReconciler(
 		cfg, cityPath, sessionInfos, poolDesired, namedSessionDemand, namedRoutedDemand, workSet, readyWaitSet,
 		assignedWorkBeads, reconcileOpts.readyAssignedFlags, wakeTargets, sp, clk.Now(),
 	)
+	for i := range awakeInput.SessionBeads {
+		retention := continuationStatuses[awakeInput.SessionBeads[i].ID]
+		awakeInput.SessionBeads[i].UnfinishedContinuation = retention.State == continuationRetain
+		if retention.State == continuationUnknown && retention.Err != nil {
+			fmt.Fprintf(stderr, "session reconciler: continuation retention unknown for %s: %v\n", awakeInput.SessionBeads[i].SessionName, retention.Err) //nolint:errcheck
+		}
+	}
 	awakeDecisions := ComputeAwakeSet(awakeInput)
 	wakeEvals := awakeSetToWakeEvals(awakeDecisions, awakeInput.SessionBeads)
 
@@ -3950,7 +3963,8 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// keep the same bead so later wake/restart happens in place instead
 		// of minting a fresh canonical owner.
 		hasAssignedWork := false
-		poolFreeable := !shouldWake && !target.alive && isPoolSessionSlotFreeableInfo(info) && isPoolManagedSessionInfo(info)
+		continuationState := continuationStatuses[target.info.ID].State
+		poolFreeable := !shouldWake && !target.alive && continuationState == continuationAbsent && isPoolSessionSlotFreeableInfo(info) && isPoolManagedSessionInfo(info)
 		if poolFreeable {
 			var assignedErr error
 			hasAssignedWork, assignedErr = sessionHasOpenAssignedWorkForReachableStore(cityPath, cfg, store, rigStores, info)
@@ -5906,6 +5920,14 @@ func resolveDrainSourceWorkDir(cityPath string, store beads.Store, bead beads.Be
 	}
 	memberID := strings.TrimSpace(root.Metadata[beadmeta.DrainMemberIDMetadataKey])
 	if memberID == "" {
+		return ""
+	}
+	// Qualified drain relations are resolved during demand binding and their
+	// current, strictly verified owner path is persisted on the session. Do not
+	// re-resolve those through this legacy same-physical-store fallback: a
+	// colliding member ID in the execution store could override the verified
+	// cross-store owner path immediately before launch.
+	if strings.TrimSpace(root.Metadata[beadmeta.DrainMemberStoreRefMetadataKey]) != "" {
 		return ""
 	}
 	source, err := store.Get(memberID)

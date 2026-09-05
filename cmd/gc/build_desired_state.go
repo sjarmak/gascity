@@ -171,21 +171,23 @@ type poolEvalWork struct {
 }
 
 type defaultScaleCheckTarget struct {
-	template string
-	storeKey string
-	store    beads.Store
-	err      error
+	template        string
+	storeKey        string
+	store           beads.Store
+	workspaceStores []qualifiedStoreBinding
+	err             error
 }
 
 type scaleCheckDemand struct {
-	Count          int
-	WorkBeadIDs    []string
-	Titles         map[string]string
-	Packs          map[string]string
-	Workspaces     map[string]string
-	StoreRefs      map[string]string
-	WorktreeSpecs  map[string]*worktree.Spec
-	WorktreeErrors map[string]string
+	Count            int
+	WorkBeadIDs      []string
+	Titles           map[string]string
+	Packs            map[string]string
+	Workspaces       map[string]string
+	StoreRefs        map[string]string
+	WorktreeSpecs    map[string]*worktree.Spec
+	WorktreeBindings map[string]*poolWorktreeBinding
+	WorktreeErrors   map[string]string
 	// ParentSIDs maps work-bead id → gc.brain_parent_sid, carrying the fork
 	// parent through to the new pool session bead so the launch path can fork
 	// the warm arm off its pre-built brain.
@@ -860,6 +862,15 @@ func buildDesiredStateWithSessionBeadsAt(
 			"pools": len(pendingPools),
 		})
 		if len(defaultScaleTargets) > 0 {
+			workspaceCandidates, workspaceCandidatesErr := censusStoreCandidates(cityPath, cfg, store, rigStores, suspendedRigPaths, censusRefScoped)
+			if workspaceCandidatesErr != nil {
+				fmt.Fprintf(stderr, "buildDesiredState: drain workspace store resolution: %v\n", workspaceCandidatesErr) //nolint:errcheck
+			} else {
+				workspaceBindings := qualifiedBindingsFromCandidates(workspaceCandidates)
+				for i := range defaultScaleTargets {
+					defaultScaleTargets[i].workspaceStores = workspaceBindings
+				}
+			}
 			subPhaseStart = time.Now()
 			defaultCounts, defaultDemand, partialTemplates, errs := defaultScaleCheckCountsAndDemand(cfg, defaultScaleTargets, demandReadyCache)
 			recordDemandSubPhase(trace, "demand_snapshot.default_scale_demand", subPhaseStart, map[string]any{
@@ -1893,6 +1904,21 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 	if len(targets) == 0 {
 		return counts, demand, nil, nil
 	}
+	workspaceStores := make([]qualifiedStoreBinding, 0, len(targets))
+	for _, target := range targets {
+		if len(target.workspaceStores) > 0 {
+			workspaceStores = append(workspaceStores, target.workspaceStores...)
+			continue
+		}
+		if target.store != nil {
+			workspaceStores = append(workspaceStores, qualifiedStoreBinding{
+				StoreRef:     target.storeKey,
+				Store:        target.store,
+				ClassBinding: storeref.IsClassRef(target.storeKey),
+			})
+		}
+	}
+	workspaceResolver := newQualifiedBeadResolver(workspaceStores)
 
 	type scaleStoreGroup struct {
 		store     beads.Store
@@ -1996,18 +2022,36 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 			if entry.StoreRefs == nil {
 				entry.StoreRefs = make(map[string]string)
 			}
-			entry.StoreRefs[b.ID] = group.storeKey
+			workStoreRef := strings.TrimSpace(b.Metadata[beadmeta.RootStoreRefMetadataKey])
+			if workStoreRef == "" {
+				workStoreRef = group.storeKey
+			}
+			entry.StoreRefs[b.ID] = workStoreRef
 			spec, specErr := worktreeSpecForBead(b, group.storeKey)
-			if specErr != nil {
+			switch {
+			case specErr != nil:
 				if entry.WorktreeErrors == nil {
 					entry.WorktreeErrors = make(map[string]string)
 				}
 				entry.WorktreeErrors[b.ID] = specErr.Error()
-			} else if spec != nil {
+			case spec != nil:
 				if entry.WorktreeSpecs == nil {
 					entry.WorktreeSpecs = make(map[string]*worktree.Spec)
 				}
 				entry.WorktreeSpecs[b.ID] = spec
+			case strings.TrimSpace(b.Metadata[beadmeta.RootBeadIDMetadataKey]) != "" && strings.TrimSpace(b.Metadata[beadmeta.RootStoreRefMetadataKey]) != "":
+				binding, bindingErr := drainWorkspaceBindingForExecution(b, workStoreRef, workspaceResolver)
+				if bindingErr != nil {
+					if entry.WorktreeErrors == nil {
+						entry.WorktreeErrors = make(map[string]string)
+					}
+					entry.WorktreeErrors[b.ID] = bindingErr.Error()
+				} else if binding != nil {
+					if entry.WorktreeBindings == nil {
+						entry.WorktreeBindings = make(map[string]*poolWorktreeBinding)
+					}
+					entry.WorktreeBindings[b.ID] = binding
+				}
 			}
 			if parentSID := strings.TrimSpace(b.Metadata[beadmeta.BrainParentSIDMetadataKey]); parentSID != "" {
 				if entry.ParentSIDs == nil {
@@ -2047,6 +2091,9 @@ func mergeScaleCheckDemand(existing, incoming scaleCheckDemand, count int) scale
 	if existing.WorktreeSpecs == nil && len(incoming.WorktreeSpecs) > 0 {
 		existing.WorktreeSpecs = make(map[string]*worktree.Spec, len(incoming.WorktreeSpecs))
 	}
+	if existing.WorktreeBindings == nil && len(incoming.WorktreeBindings) > 0 {
+		existing.WorktreeBindings = make(map[string]*poolWorktreeBinding, len(incoming.WorktreeBindings))
+	}
 	if existing.WorktreeErrors == nil && len(incoming.WorktreeErrors) > 0 {
 		existing.WorktreeErrors = make(map[string]string, len(incoming.WorktreeErrors))
 	}
@@ -2075,6 +2122,11 @@ func mergeScaleCheckDemand(existing, incoming scaleCheckDemand, count int) scale
 		if incoming.WorktreeSpecs != nil {
 			if spec := incoming.WorktreeSpecs[id]; spec != nil {
 				existing.WorktreeSpecs[id] = spec
+			}
+		}
+		if incoming.WorktreeBindings != nil {
+			if binding := incoming.WorktreeBindings[id]; binding != nil {
+				existing.WorktreeBindings[id] = binding
 			}
 		}
 		if incoming.WorktreeErrors != nil {
@@ -3497,7 +3549,7 @@ func bindPoolSessionTriggerBead(bp *agentBuildParams, cfgAgent *config.Agent, qu
 // stamped binding still names the previous bead's work dir and the caller
 // must skip the item rather than reuse it.
 func bindWriteFailure(request SessionRequest, err error) error {
-	if request.WorktreeSpec == nil {
+	if request.WorktreeBinding == nil && request.WorktreeSpec == nil {
 		return err
 	}
 	return fmt.Errorf("%w: binding write failed: %w", errPoolTriggerWorktreeEvidence, err)
@@ -3595,8 +3647,33 @@ func verifiedPoolTriggerWorkDir(bp *agentBuildParams, cfgAgent *config.Agent, qu
 	if strings.TrimSpace(request.WorktreeError) != "" {
 		return "", fmt.Errorf("%w invalid: %s", errPoolTriggerWorktreeEvidence, request.WorktreeError)
 	}
-	if request.WorktreeSpec == nil {
+	if request.WorktreeBinding == nil && request.WorktreeSpec == nil {
 		return poolTriggerWorkDir(bp, cfgAgent, qualifiedName, request), nil
+	}
+	if binding := request.WorktreeBinding; binding != nil {
+		workID := strings.TrimSpace(request.WorkBeadID)
+		if workID == "" || strings.TrimSpace(binding.Execution.ID) != workID {
+			return "", fmt.Errorf("%w: execution bead %q does not match request bead %q", errPoolTriggerWorktreeEvidence, binding.Execution.ID, workID)
+		}
+		requestRef := strings.TrimSpace(request.WorkStoreRef)
+		if requestRef == "" || strings.TrimSpace(binding.Execution.StoreRef) != requestRef {
+			return "", fmt.Errorf("%w: execution store %q does not match request store %q", errPoolTriggerWorktreeEvidence, binding.Execution.StoreRef, requestRef)
+		}
+		spec := binding.Spec
+		if strings.TrimSpace(binding.Owner.ID) == "" || strings.TrimSpace(spec.BeadID) != strings.TrimSpace(binding.Owner.ID) {
+			return "", fmt.Errorf("%w: owner bead %q does not match workspace bead %q", errPoolTriggerWorktreeEvidence, binding.Owner.ID, spec.BeadID)
+		}
+		if strings.TrimSpace(binding.Owner.StoreRef) == "" || strings.TrimSpace(spec.StoreRef) != strings.TrimSpace(binding.Owner.StoreRef) {
+			return "", fmt.Errorf("%w: owner store %q does not match workspace store %q", errPoolTriggerWorktreeEvidence, binding.Owner.StoreRef, spec.StoreRef)
+		}
+		if err := revalidateDrainWorkspaceBinding(bp, binding); err != nil {
+			return "", fmt.Errorf("%w: %w", errPoolTriggerWorktreeEvidence, err)
+		}
+		report, err := worktree.Verify(spec)
+		if err != nil {
+			return "", fmt.Errorf("%w: verification failed: %w", errPoolTriggerWorktreeEvidence, err)
+		}
+		return report.Path, nil
 	}
 	spec := *request.WorktreeSpec
 	workID := strings.TrimSpace(request.WorkBeadID)

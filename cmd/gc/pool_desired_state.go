@@ -30,6 +30,10 @@ type SessionRequest struct {
 	WorkPack      string // pack route key from the work bead, when known
 	WorkWorkspace string // explicit pack workspace route key from the work bead, when known
 	WorkStoreRef  string // city or rig:<name> store reference for WorkBeadID when known
+	// WorktreeBinding keeps execution and workspace-owner identities distinct.
+	// Drain steps execute under WorkBeadID/WorkStoreRef while entering the
+	// current workspace strictly owned by the qualified member identity.
+	WorktreeBinding *poolWorktreeBinding
 	// WorktreeSpec is the single-owner evidence published by the provisioner.
 	// When present, the pool path verifies it before publishing work_dir on a
 	// session bead; a mismatch fails the whole atomic metadata update.
@@ -48,6 +52,18 @@ type SessionRequest struct {
 	// pool's floor spawn cannot be starved by a warm pool's large elastic
 	// demand (follow-up to #2893).
 	FloorGuarantee bool
+}
+
+type qualifiedBeadIdentity struct {
+	StoreRef string
+	ID       string
+}
+
+type poolWorktreeBinding struct {
+	Execution qualifiedBeadIdentity
+	Root      qualifiedBeadIdentity
+	Owner     qualifiedBeadIdentity
+	Spec      worktree.Spec
 }
 
 func beadPriority(b beads.Bead) int {
@@ -492,6 +508,7 @@ func computePoolDesiredStatesAt(
 			workStoreRef := ""
 			workParentSID := ""
 			var worktreeSpec *worktree.Spec
+			var worktreeBinding *poolWorktreeBinding
 			worktreeError := ""
 			if len(residualWorkBeadIDs) > j {
 				workBeadID = residualWorkBeadIDs[j]
@@ -513,21 +530,25 @@ func computePoolDesiredStatesAt(
 				if demand.WorktreeSpecs != nil {
 					worktreeSpec = demand.WorktreeSpecs[workBeadID]
 				}
+				if demand.WorktreeBindings != nil {
+					worktreeBinding = demand.WorktreeBindings[workBeadID]
+				}
 				if demand.WorktreeErrors != nil {
 					worktreeError = strings.TrimSpace(demand.WorktreeErrors[workBeadID])
 				}
 			}
 			req := SessionRequest{
-				Template:       template,
-				Tier:           "new",
-				WorkBeadID:     workBeadID,
-				WorkBeadTitle:  workBeadTitle,
-				WorkPack:       workPack,
-				WorkWorkspace:  workWorkspace,
-				WorkStoreRef:   workStoreRef,
-				BrainParentSID: workParentSID,
-				WorktreeSpec:   worktreeSpec,
-				WorktreeError:  worktreeError,
+				Template:        template,
+				Tier:            "new",
+				WorkBeadID:      workBeadID,
+				WorkBeadTitle:   workBeadTitle,
+				WorkPack:        workPack,
+				WorkWorkspace:   workWorkspace,
+				WorkStoreRef:    workStoreRef,
+				BrainParentSID:  workParentSID,
+				WorktreeSpec:    worktreeSpec,
+				WorktreeBinding: worktreeBinding,
+				WorktreeError:   worktreeError,
 			}
 			allRequests = append(allRequests, req)
 			usage.accept(req, limits)
@@ -600,9 +621,13 @@ func requestWithScaleDemandProvenance(request SessionRequest, demand scaleCheckD
 	// previous bead's spec into a rebound request would hand the session a
 	// workspace verified for other work.
 	request.WorktreeSpec = nil
+	request.WorktreeBinding = nil
 	request.WorktreeError = ""
 	if demand.WorktreeSpecs != nil {
 		request.WorktreeSpec = demand.WorktreeSpecs[workBeadID]
+	}
+	if demand.WorktreeBindings != nil {
+		request.WorktreeBinding = demand.WorktreeBindings[workBeadID]
 	}
 	if demand.WorktreeErrors != nil {
 		request.WorktreeError = strings.TrimSpace(demand.WorktreeErrors[workBeadID])
