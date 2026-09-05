@@ -317,6 +317,80 @@ func TestFileRecorderPreservesTimestamp(t *testing.T) {
 	}
 }
 
+// TestFileRecorderClampsFutureTsToNow is a regression test for gc-y3o5r:
+// archiveOverlapsFilter's Since skip-fast assumes every event in an archive
+// was appended no later than the archive's rotation instant. FileRecorder
+// used to preserve a caller-supplied Ts verbatim, so a Ts that postdated the
+// eventual rotation instant broke that assumption and could cause a matching
+// archive to be silently skipped. Record now clamps a future-dated Ts back
+// to the append instant instead of persisting it verbatim.
+func TestFileRecorderClampsFutureTsToNow(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var stderr bytes.Buffer
+	rec, err := NewFileRecorder(path, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Close() //nolint:errcheck // test cleanup
+
+	before := time.Now()
+	bogusFuture := before.Add(2 * time.Hour)
+	rec.Record(Event{Type: BeadCreated, Actor: "human", Ts: bogusFuture})
+	after := time.Now()
+
+	events, err := ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	ts := events[0].Ts
+	if ts.Before(before) || ts.After(after) {
+		t.Errorf("Ts = %v, want clamped to between %v and %v (not the caller-supplied future %v)", ts, before, after, bogusFuture)
+	}
+	if stderr.Len() == 0 {
+		t.Error("expected a clamp warning on stderr, got none")
+	}
+}
+
+// TestFileRecorderAppendBatchClampsFutureTs mirrors
+// TestFileRecorderClampsFutureTsToNow for the AppendBatch write path, which
+// normalizes Ts through the separate marshalBatch helper.
+func TestFileRecorderAppendBatchClampsFutureTs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var stderr bytes.Buffer
+	rec, err := NewFileRecorder(path, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Close() //nolint:errcheck // test cleanup
+
+	before := time.Now()
+	bogusFuture := before.Add(2 * time.Hour)
+	if err := rec.AppendBatch([]Event{{Type: BeadCreated, Actor: "human", Ts: bogusFuture}}); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	after := time.Now()
+
+	events, err := ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	ts := events[0].Ts
+	if ts.Before(before) || ts.After(after) {
+		t.Errorf("Ts = %v, want clamped to between %v and %v (not the caller-supplied future %v)", ts, before, after, bogusFuture)
+	}
+	if stderr.Len() == 0 {
+		t.Error("expected a clamp warning on stderr, got none")
+	}
+}
+
 // TestFileRecorderNormalizesExplicitTsToLocalZone is a regression test for
 // #5300: writeRecordLocked only filled Ts when zero, so a caller-supplied Ts
 // serialized in whatever zone the caller happened to construct it in --

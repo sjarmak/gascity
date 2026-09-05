@@ -448,6 +448,52 @@ func TestReadFilteredIncludesEventWithinArchiveSubSecondWindow(t *testing.T) {
 	}
 }
 
+// TestForceRotateNeverArchivesEventPostdatingRotation is a regression test
+// for gc-y3o5r: archiveOverlapsFilter's Since skip-fast trusts that no event
+// in an archive has a Ts later than the archive's own rotation instant.
+// FileRecorder used to preserve a caller-supplied Ts verbatim, so recording
+// a bogus far-future Ts and then rotating could produce an archive that
+// violates that bound and gets incorrectly skipped by a later Since query.
+// The recorder now clamps such a Ts at write time, so the produced archive
+// must always satisfy the bound.
+func TestForceRotateNeverArchivesEventPostdatingRotation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var stderr bytes.Buffer
+	rec, err := NewFileRecorder(path, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Close() //nolint:errcheck // test cleanup
+
+	rec.Record(Event{Type: BeadCreated, Actor: "human", Ts: time.Now().Add(2 * time.Hour)})
+
+	result, err := rec.ForceRotate()
+	if err != nil {
+		t.Fatalf("ForceRotate: %v", err)
+	}
+	if !result.Rotated {
+		t.Fatal("ForceRotate did not rotate")
+	}
+	<-result.Done
+
+	info, err := parseArchiveBasename(filepath.Base(result.ArchivePath))
+	if err != nil {
+		t.Fatalf("parseArchiveBasename: %v", err)
+	}
+
+	bound := info.Timestamp.Add(time.Second)
+	err = streamArchive(result.ArchivePath, Filter{}, func(e Event) bool {
+		if !e.Ts.Before(bound) {
+			t.Errorf("archived event Ts %v does not precede the archive's soundness bound %v (rotation %v)", e.Ts, bound, info.Timestamp)
+		}
+		return true
+	})
+	if err != nil {
+		t.Fatalf("streamArchive: %v", err)
+	}
+}
+
 func TestReadFilteredHandlesMissingArchiveDir(t *testing.T) {
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "no-such-dir", "events.jsonl")

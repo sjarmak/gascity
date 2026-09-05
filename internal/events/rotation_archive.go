@@ -144,11 +144,12 @@ func archiveOverlapsFilter(info archiveInfo, filter Filter) bool {
 	// read; only a Since at or beyond info.Timestamp+1s is guaranteed to
 	// postdate every possible event.Time (#4628). A zero Timestamp carries
 	// no such guarantee (legacy basenames predate the stamped convention),
-	// so it is read. This also assumes event.Ts is never clamped forward of
-	// the true rotation instant by the recorder (see ga-da13nh follow-up).
-	// Until is deliberately not handled here: the filename records only the
-	// rotation instant, not the archive's first event, so there is no sound
-	// upper-bound skip.
+	// so it is read. event.Time <= T holds even for a caller-supplied Ts:
+	// FileRecorder clamps any Ts that postdates the append instant down to
+	// that instant (clampTsToNow in recorder.go), which is itself always
+	// <= T (gc-y3o5r). Until is deliberately not handled here: the filename
+	// records only the rotation instant, not the archive's first event, so
+	// there is no sound upper-bound skip.
 	if !filter.Since.IsZero() && !info.Timestamp.IsZero() && info.Timestamp.Add(time.Second).Before(filter.Since) {
 		return false
 	}

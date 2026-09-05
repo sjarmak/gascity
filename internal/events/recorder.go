@@ -226,8 +226,10 @@ func NewFileRecorder(path string, stderr io.Writer, opts ...FileRecorderOption) 
 	return r, nil
 }
 
-// Record appends an event to the log. It auto-fills Seq and Ts (if zero).
-// Errors are written to stderr — never returned.
+// Record appends an event to the log. It auto-fills Seq and Ts (if zero),
+// and clamps a caller-supplied Ts that postdates the append instant back to
+// that instant (see clampTsToNow). Errors are written to stderr — never
+// returned.
 //
 // Records are gated on size: when the recorder is configured with a
 // non-zero MaxSize, Record may rotate the active log before writing
@@ -310,7 +312,7 @@ func (r *FileRecorder) AppendBatch(batch []Event) (resultErr error) {
 		return fmt.Errorf("allocating %d event sequences after %d: sequence overflow", len(batch), latest)
 	}
 
-	data, lastSeq, err := marshalBatch(batch, latest, time.Now())
+	data, lastSeq, err := marshalBatch(batch, latest, time.Now(), r.stderr)
 	if err != nil {
 		return err
 	}
@@ -344,7 +346,23 @@ func lockRecorderFile(fd int, path string) error {
 	}
 }
 
-func marshalBatch(batch []Event, startingSeq uint64, now time.Time) ([]byte, uint64, error) {
+// clampTsToNow enforces the invariant archiveOverlapsFilter's Since
+// skip-fast depends on: no event's Ts may postdate the instant it was
+// appended, which is always <= the eventual rotation instant of the
+// archive it lands in (see gc-y3o5r). A caller-supplied Ts is otherwise
+// preserved verbatim; only a Ts strictly after now is pulled back to now,
+// and the clamp is reported to stderr since it silently discards the
+// caller's requested value.
+func clampTsToNow(ts, now time.Time, stderr io.Writer) time.Time {
+	if ts.After(now) {
+		fmt.Fprintf(stderr, "events: clamping future-dated Ts %s to %s (gc-y3o5r)\n", //nolint:errcheck // best-effort stderr
+			ts.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+		return now
+	}
+	return ts
+}
+
+func marshalBatch(batch []Event, startingSeq uint64, now time.Time, stderr io.Writer) ([]byte, uint64, error) {
 	var data bytes.Buffer
 	for i, event := range batch {
 		event.Seq = startingSeq + uint64(i) + 1
@@ -357,7 +375,7 @@ func marshalBatch(batch []Event, startingSeq uint64, now time.Time) ([]byte, uin
 			// changes -- but a mixed log otherwise silently breaks a
 			// lexical/window filter written against whichever form the
 			// majority of rows use (#5300).
-			event.Ts = event.Ts.Local()
+			event.Ts = clampTsToNow(event.Ts, now, stderr).Local()
 		}
 		encoded, err := json.Marshal(event)
 		if err != nil {
@@ -393,8 +411,9 @@ func (r *FileRecorder) writeRecordLocked(e *Event) error {
 	if e.Ts.IsZero() {
 		e.Ts = time.Now()
 	} else {
-		// See marshalBatch's matching normalization for why (#5300).
-		e.Ts = e.Ts.Local()
+		// See marshalBatch's matching normalization for why (#5300), and
+		// clampTsToNow for why a future-dated Ts is pulled back (gc-y3o5r).
+		e.Ts = clampTsToNow(e.Ts, time.Now(), r.stderr).Local()
 	}
 	data, err := json.Marshal(e)
 	if err != nil {
