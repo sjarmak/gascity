@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -116,7 +117,7 @@ func TestOrderFiringCurrent_LargeEventLogStaysInsideBudget(t *testing.T) {
 
 	check := NewOrderFiringCurrentCheck(cfg, cityPath)
 	check.clock = func() time.Time { return now }
-	check.lastRun = func(orders.Order) (time.Time, error) {
+	check.lastRun = func(context.Context, orders.Order) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("lastRun must not be consulted: the firing is in the event tail")
 	}
 
@@ -158,7 +159,7 @@ func TestOrderFiringCurrent_FiringOlderThanTailFallsBackToLastRun(t *testing.T) 
 		}
 		return events.ReadFilteredTail(path, filter, limit)
 	}
-	check.lastRun = func(orders.Order) (time.Time, error) {
+	check.lastRun = func(context.Context, orders.Order) (time.Time, error) {
 		lastRunCalled = true
 		return now.Add(-10 * time.Minute), nil
 	}
@@ -190,7 +191,7 @@ func TestOrderFiringCurrent_TimeoutHintNamesQueryCost(t *testing.T) {
 	check := NewOrderFiringCurrentCheck(cfg, cityPath)
 	check.clock = func() time.Time { return now }
 	check.historyTimeout = 20 * time.Millisecond
-	check.lastRun = func(orders.Order) (time.Time, error) {
+	check.lastRun = func(context.Context, orders.Order) (time.Time, error) {
 		<-release
 		return time.Time{}, nil
 	}
@@ -247,7 +248,7 @@ func TestOrderFiringCurrent_LastRunLookupsRunInParallel(t *testing.T) {
 
 	check := NewOrderFiringCurrentCheck(cfg, cityPath)
 	check.clock = func() time.Time { return now }
-	check.lastRun = func(orders.Order) (time.Time, error) {
+	check.lastRun = func(context.Context, orders.Order) (time.Time, error) {
 		cur := atomic.AddInt32(&inFlight, 1)
 		defer atomic.AddInt32(&inFlight, -1)
 		for {
@@ -288,7 +289,7 @@ func TestOrderFiringCurrent_PrefetchPreservesLookupErrors(t *testing.T) {
 
 	check := NewOrderFiringCurrentCheck(cfg, cityPath)
 	check.clock = func() time.Time { return now }
-	check.lastRun = func(orders.Order) (time.Time, error) {
+	check.lastRun = func(context.Context, orders.Order) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("store unreachable")
 	}
 
@@ -322,7 +323,7 @@ func TestOrderFiringCurrent_PrefetchSkipsOrdersTheEventLogAnswers(t *testing.T) 
 	var lookedUp []string
 	check := NewOrderFiringCurrentCheck(cfg, cityPath)
 	check.clock = func() time.Time { return now }
-	check.lastRun = func(o orders.Order) (time.Time, error) {
+	check.lastRun = func(_ context.Context, o orders.Order) (time.Time, error) {
 		mu.Lock()
 		lookedUp = append(lookedUp, o.ScopedName())
 		mu.Unlock()
