@@ -171,6 +171,18 @@ type hookClaimClassRoute struct {
 	workLegs []hookStore
 	readLeg  func(ctx context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, error)
 	workHeld map[string]bool
+
+	// mintedGeneration memoizes, per bead id, the beadmeta.ClaimGenerationMetadataKey
+	// value claim already minted atomically via graph.ClaimWithGeneration
+	// (gc-3ohe47 P1: "commit claim ownership and generation atomically"). It
+	// exists so advanceClaimGeneration can turn the follow-on generation
+	// write into a pure confirm instead of a second mutation: a two-write
+	// claim-then-advance sequence would leave a window in which the OLD
+	// generation is still canonical after ownership has already moved, which
+	// is exactly the window this memo closes for the graph route. Consumed
+	// (deleted) the first time advanceClaimGeneration reads it, so a stale
+	// entry can never answer for a later, unrelated claim of the same id.
+	mintedGeneration map[string]string
 }
 
 // newHookClaimClassRoute opens the claim-time class front door over an already
@@ -178,20 +190,29 @@ type hookClaimClassRoute struct {
 // is testable against a store a test controls rather than only against a city on
 // disk.
 //
-// A binding without the two-argument claim CAS is refused here rather than
+// A binding without the atomic claim-and-mint CAS is refused here rather than
 // discovered per-bead mid-tick: the capability is a property of the opened
 // engine, the closed contract will not emulate it with a read-then-write, and a
 // route that cannot perform the one write it exists for is worse than no route.
 // Same check, same place and same reason as storebinding.NewBeadsNudgeQueue.
+//
+// The assertion checks ClaimWithGeneration specifically, not the plain
+// two-argument Claim: gc-3ohe47's MEDIUM finding was that this door checked
+// the weaker capability while r.claim (below) actually invokes the stronger
+// one at runtime, so a binding that implements Claim but not
+// ClaimWithGeneration passed this door and then failed the mid-tick assertion
+// the "discovered per-bead" comment above says this door exists to avoid.
+// internal/storebinding pins ClaimWithGeneration as a capability distinct
+// from Claim (beads_adapter_graph_capability_test.go); this door must agree.
 func newHookClaimClassRoute(class beads.Store) (*hookClaimClassRoute, error) {
 	graph, err := storebinding.NewBeadsGraphStore(class)
 	if err != nil {
 		return nil, fmt.Errorf("projecting the claim-time class front door: %w", err)
 	}
 	if _, ok := class.(interface {
-		Claim(id, assignee string) (beads.Bead, bool, error)
+		ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error)
 	}); !ok {
-		return nil, fmt.Errorf("%w: %T has no compare-and-swap assignment claim", errClaimRouteBindingCannotClaim, class)
+		return nil, fmt.Errorf("%w: %T has no compare-and-swap claim-with-generation", errClaimRouteBindingCannotClaim, class)
 	}
 	return newClaimClassRouteOver(class, graph), nil
 }
@@ -201,10 +222,11 @@ func newHookClaimClassRoute(class beads.Store) (*hookClaimClassRoute, error) {
 // created, so a route can never reach the escalation with a nil map.
 func newClaimClassRouteOver(class beads.Store, graph storebinding.GraphStore) *hookClaimClassRoute {
 	return &hookClaimClassRoute{
-		class:    class,
-		graph:    graph,
-		resident: map[string]bool{},
-		workHeld: map[string]bool{},
+		class:            class,
+		graph:            graph,
+		resident:         map[string]bool{},
+		workHeld:         map[string]bool{},
+		mintedGeneration: map[string]string{},
 	}
 }
 
@@ -388,10 +410,56 @@ func (r *hookClaimClassRoute) observeWorkLegs(stores []hookStore) {
 // applying the same post-mutation classification hookClaimWithBdStore applies to
 // the work store so the two claim paths report a lost race, a stale projection
 // and a canonical-readback failure identically.
+//
+// It claims through ClaimWithGeneration rather than Claim (gc-3ohe47 P1): the
+// binding mints beadmeta.ClaimGenerationMetadataKey in the SAME destination-side
+// write as the ownership transition, so there is no window in which ownership
+// has moved but the old generation is still canonical. The minted value is
+// recorded in mintedGeneration so advanceClaimGeneration can confirm it rather
+// than mutate a second time.
 func (r *hookClaimClassRoute) claim(beadID, assignee string) (beads.Bead, bool, error) {
-	return hookClaimThroughStore(beadID, assignee,
-		func() (beads.Bead, bool, error) { return r.graph.Claim(beadID, assignee) },
+	var generation string
+	claimed, ok, err := hookClaimThroughStore(beadID, assignee,
+		func() (beads.Bead, bool, error) {
+			claimedBead, gen, acquired, claimErr := r.graph.ClaimWithGeneration(beadID, assignee)
+			generation = gen
+			return claimedBead, acquired, claimErr
+		},
 		r.graph.Get)
+	if ok {
+		if id := strings.TrimSpace(beadID); id != "" && strings.TrimSpace(generation) != "" {
+			r.mintedGeneration[id] = generation
+		}
+	}
+	return claimed, ok, err
+}
+
+// advanceClaimGeneration confirms the owner and generation minted atomically
+// by the binding's ClaimWithGeneration call. It never repairs or advances a
+// mismatch: doing so would mutate a successor claim episode. The memo proves
+// only that this invocation routed the claim; authority comes from the current
+// destination read of both owner and generation.
+func (r *hookClaimClassRoute) advanceClaimGeneration(beadID, assignee, fromGeneration string) (string, beads.AdvanceClaimGenerationOutcome, error) {
+	id := strings.TrimSpace(beadID)
+	minted, ok := r.mintedGeneration[id]
+	delete(r.mintedGeneration, id)
+	expected := fromGeneration
+	expectedAssignee := strings.TrimSpace(assignee)
+	if id == "" || expectedAssignee == "" || assignee != expectedAssignee || !ok ||
+		expected == "" || expected != strings.TrimSpace(expected) || expected != minted {
+		return "", beads.AdvanceClaimGenerationStale, nil
+	}
+
+	current, err := r.graph.Get(id)
+	if err != nil {
+		return "", "", fmt.Errorf("confirm claim generation %q: %w", beadID, err)
+	}
+	if current.ID != id ||
+		current.Assignee != expectedAssignee ||
+		current.Metadata[beadmeta.ClaimGenerationMetadataKey] != expected {
+		return "", beads.AdvanceClaimGenerationStale, nil
+	}
+	return expected, beads.AdvanceClaimGenerationAdvanced, nil
 }
 
 // listContinuation reads a continuation group out of the binding and records
@@ -580,6 +648,18 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 			return route.graph.ReleaseIfCurrent(beadID, assignee)
 		}
 		return base.Release(ctx, dir, env, beadID, assignee)
+	}
+
+	// The claim-generation fence (gc-3ohe47) must land in the ledger the claim
+	// itself landed in, or the token gc-outcome-close later verifies would be
+	// minted against a bead the fenced store never held. Like Release above it
+	// routes on the MEMO alone and never probes: a bead this invocation did not
+	// route is one the work store claimed, so its fence belongs there too.
+	ops.AdvanceClaimGeneration = func(ctx context.Context, dir string, env []string, beadID, assignee, fromGeneration string) (string, beads.AdvanceClaimGenerationOutcome, error) {
+		if route.knownResident(beadID) {
+			return route.advanceClaimGeneration(beadID, assignee, fromGeneration)
+		}
+		return base.AdvanceClaimGeneration(ctx, dir, env, beadID, assignee, fromGeneration)
 	}
 
 	// The lifecycle-start emission reads the step's workflow root, so it belongs

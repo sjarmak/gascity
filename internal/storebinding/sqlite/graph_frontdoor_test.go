@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/storebinding"
 )
@@ -365,6 +366,47 @@ func TestGraphFrontDoorClaimPreservesDeployedSemantics(t *testing.T) {
 	}
 	if _, ok, err := front.Claim(closed.ID, "worker"); err != nil || ok {
 		t.Fatalf("Claim(closed) = (%v, %v), want a conflict, never a resurrection", ok, err)
+	}
+}
+
+// TestGraphFrontDoorClaimWithGenerationDelegatesToTheEngine pins gc-3ohe47's
+// atomic claim-and-mint combo across the front door: the graph-dispatched
+// hook-claim route (cmd/gc's hookClaimClassRoute) calls this method through
+// the front door specifically, so a regression here would silently reopen
+// the two-write race the combo exists to close, even though the underlying
+// SQLiteStore.ClaimWithGeneration itself stays correct.
+func TestGraphFrontDoorClaimWithGenerationDelegatesToTheEngine(t *testing.T) {
+	front := openGraphFrontDoor(t)
+	target := mustCreateGraphBead(t, front, beads.Bead{Title: "claimable", Type: "task"})
+
+	claimed, generation, ok, err := front.ClaimWithGeneration(target.ID, "worker")
+	if err != nil || !ok {
+		t.Fatalf("ClaimWithGeneration = (%+v, %q, %v, %v), want success", claimed, generation, ok, err)
+	}
+	if generation != "1" {
+		t.Fatalf("minted generation = %q, want %q on a fresh claim", generation, "1")
+	}
+	if claimed.Metadata[beadmeta.ClaimGenerationMetadataKey] != generation {
+		t.Fatalf("returned bead's gc.claim_generation = %q, want it to match the returned generation %q", claimed.Metadata[beadmeta.ClaimGenerationMetadataKey], generation)
+	}
+	if claimed.Status != "in_progress" || claimed.Assignee != "worker" {
+		t.Fatalf("ClaimWithGeneration returned %+v, want in_progress held by worker", claimed)
+	}
+
+	stored, err := front.Get(target.ID)
+	if err != nil {
+		t.Fatalf("Get after ClaimWithGeneration: %v", err)
+	}
+	if stored.Metadata[beadmeta.ClaimGenerationMetadataKey] != "1" {
+		t.Fatalf("canonical row's gc.claim_generation = %q, want %q — the front door must not diverge from the engine", stored.Metadata[beadmeta.ClaimGenerationMetadataKey], "1")
+	}
+
+	contender, generation, ok, err := front.ClaimWithGeneration(target.ID, "other")
+	if err != nil {
+		t.Fatalf("contended ClaimWithGeneration error = %v, want a conflict reported as ok=false", err)
+	}
+	if ok || generation != "" {
+		t.Fatalf("contended ClaimWithGeneration = (%+v, %q, %v), want ok=false with no generation", contender, generation, ok)
 	}
 }
 

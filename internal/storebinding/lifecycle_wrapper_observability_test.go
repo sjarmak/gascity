@@ -72,6 +72,68 @@ func TestIdleClaimIsNotReportedAsAConflict(t *testing.T) {
 	}
 }
 
+// TestWrappedGraphClaimWithGenerationObservesOkAndConflict pins gc-3ohe47's
+// atomic claim-and-mint combo through the Graph wrapper: a caller reading the
+// class-event stream (an operator dashboard, an alert) must see
+// ClaimWithGeneration classified the same three ways plain Claim already is
+// (ok / conflict / failed), and the wrapper's cache must invalidate on the
+// mutating path rather than serving a pre-claim Get.
+//
+// This runs over the real SQLite-backed engine (openBeadsOverSQLite), not the
+// in-memory reference: ClaimWithGeneration is a narrower capability than
+// plain Claim (see beadsAssignmentGenerationClaimer in beads_adapter.go), and
+// the in-memory reference store does not implement it.
+func TestWrappedGraphClaimWithGenerationObservesOkAndConflict(t *testing.T) {
+	observer := &recordingObserver{}
+	adapters := openBeadsOverSQLite(t)
+	bare := adapters.Graph
+	wrapped, err := storebinding.WrapGraph(bare, storebinding.ClassWrapping{
+		Binding:    wrappedBindingName,
+		Capability: beadsOverSQLiteCapability,
+		Observer:   observer,
+		CacheReads: true,
+	})
+	if err != nil {
+		t.Fatalf("wrapping the Graph front door: %v", err)
+	}
+
+	created, err := wrapped.Create(beads.Bead{Title: "gen-target", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := wrapped.Get(created.ID); err != nil {
+		t.Fatalf("priming Get: %v", err)
+	}
+
+	claimed, generation, acquired, err := wrapped.ClaimWithGeneration(created.ID, "worker-a")
+	if err != nil || !acquired {
+		t.Fatalf("ClaimWithGeneration = (%+v, %q, %v, %v), want success", claimed, generation, acquired, err)
+	}
+	if generation == "" {
+		t.Fatal("ClaimWithGeneration returned an empty generation on a successful claim")
+	}
+
+	afterClaim, err := wrapped.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get after ClaimWithGeneration: %v", err)
+	}
+	if afterClaim.Assignee != "worker-a" {
+		t.Fatalf("cached Get after ClaimWithGeneration returned assignee %q, want %q; the claim did not invalidate the cache", afterClaim.Assignee, "worker-a")
+	}
+
+	if _, _, contended, err := wrapped.ClaimWithGeneration(created.ID, "worker-b"); err != nil || contended {
+		t.Fatalf("contended ClaimWithGeneration = (%v, %v), want a reported conflict, not an error or a second acquire", contended, err)
+	}
+
+	stream := observer.stream()
+	if want := "graph/wrapped claim ClaimWithGeneration ok"; !containsString(stream, want) {
+		t.Errorf("the observed stream never reports %q; it is:\n%s", want, formatStream(stream))
+	}
+	if want := "graph/wrapped claim ClaimWithGeneration conflict"; !containsString(stream, want) {
+		t.Errorf("the observed stream never reports %q; it is:\n%s", want, formatStream(stream))
+	}
+}
+
 // failingOrdersStore fails the retention sweep and counts attempts.
 type failingOrdersStore struct {
 	storebinding.OrdersStore

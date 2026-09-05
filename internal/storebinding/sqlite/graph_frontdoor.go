@@ -79,6 +79,7 @@ type graphEngine interface {
 	CloseAll([]string, map[string]string) (int, error)
 	Delete(string) error
 	Claim(string, string) (beads.Bead, bool, error)
+	ClaimWithGeneration(string, string) (beads.Bead, string, bool, error)
 	ReleaseIfCurrent(string, string) (bool, error)
 	DepAdd(string, string, string) error
 	DepRemove(string, string) error
@@ -288,6 +289,14 @@ func (f *graphFrontDoor) Delete(id string) error { return f.engine.Delete(id) }
 // write connection makes concurrent claims single-winner.
 func (f *graphFrontDoor) Claim(id, assignee string) (beads.Bead, bool, error) {
 	return f.engine.Claim(id, assignee)
+}
+
+// ClaimWithGeneration is Claim's atomic-combo sibling (gc-3ohe47): it mints
+// beadmeta.ClaimGenerationMetadataKey in the same destination-side write as
+// the ownership transition, so a caller never observes the claim before the
+// generation that fences it is canonical.
+func (f *graphFrontDoor) ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error) {
+	return f.engine.ClaimWithGeneration(id, assignee)
 }
 
 // ReleaseIfCurrent releases an assignment only while assignee still holds it.

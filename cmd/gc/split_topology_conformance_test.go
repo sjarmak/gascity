@@ -1052,6 +1052,54 @@ func conformanceHookClaimClassRouting(t *testing.T, e splitEnv, workBeadID strin
 	}
 
 	assertClassRoutedClaimIsReleasable(t, e)
+	assertClassRoutedClaimGenerationFencesInTheBinding(t, e, route)
+}
+
+// assertClassRoutedClaimGenerationFencesInTheBinding is the gc-3ohe47 HIGH #2
+// split-topology proof: a graph-dispatched claim's gc.claim_generation fence
+// must land in the store the claim itself landed in, and the work-directory-
+// rooted seam (what production's hookAdvanceClaimGenerationWithBdStore would
+// shell `bd` out against) must never run for a class-resident bead — a store
+// that never held it cannot mint a current-authority token for it, which is
+// the exact defect (gc-ue0tsw) that left a graph-dispatched claim permanently
+// unclosable.
+func assertClassRoutedClaimGenerationFencesInTheBinding(t *testing.T, e splitEnv, route *hookClaimClassRoute) {
+	t.Helper()
+	step := e.mintWispWith(t, wispOpts{title: "hook-claim generation-fenced graph step"})
+	workStoreTouched := false
+	ops := classRoutedHookClaimOps(hookClaimOps{
+		Claim: splitEnvStoreClaim(e.work),
+		AdvanceClaimGeneration: func(context.Context, string, []string, string, string, string) (string, beads.AdvanceClaimGenerationOutcome, error) {
+			workStoreTouched = true
+			return "", "", errors.New("the work-directory-rooted seam ran for a class-resident bead")
+		},
+	}, route)
+
+	assignee := "hook-claimant-generation-fence"
+	claimed, ok, err := ops.Claim(context.Background(), e.cityPath, nil, step.ID, assignee)
+	if err != nil || !ok {
+		t.Fatalf("routed claim of %s = (ok=%v err=%v), want a successful claim", step.ID, ok, err)
+	}
+	// Mirrors advanceHookClaimGeneration's own call convention
+	// (cmd_hook_claim.go): fromGeneration is read off the metadata the CLAIM
+	// itself just returned, never passed as a literal — ClaimWithGeneration
+	// minted the generation atomically with ownership, so the claimed bead's
+	// metadata already carries it before this call is made.
+	fromGeneration := claimed.Metadata[beadmeta.ClaimGenerationMetadataKey]
+	next, outcome, err := ops.AdvanceClaimGeneration(context.Background(), e.cityPath, nil, step.ID, assignee, fromGeneration)
+	if err != nil || outcome != beads.AdvanceClaimGenerationAdvanced || next != "1" {
+		t.Fatalf("routed generation advance for %s = (next=%q outcome=%q err=%v), want (1 Advanced <nil>)", step.ID, next, outcome, err)
+	}
+	if workStoreTouched {
+		t.Fatalf("the work-store generation-advance seam ran for class-resident bead %s; its fence must be CASed against the binding that actually holds it", step.ID)
+	}
+	held, err := e.class.Get(step.ID)
+	if err != nil || strings.TrimSpace(held.Metadata[beadmeta.ClaimGenerationMetadataKey]) != "1" {
+		t.Fatalf("the binding's copy of %s has gc.claim_generation=%q (err=%v), want %q", step.ID, held.Metadata[beadmeta.ClaimGenerationMetadataKey], err, "1")
+	}
+	if got, err := e.work.Get(step.ID); err == nil && strings.TrimSpace(got.Metadata[beadmeta.ClaimGenerationMetadataKey]) != "" {
+		t.Fatalf("the work store's copy of %s carries gc.claim_generation=%q; the fence must never write into a store that does not own the bead", step.ID, got.Metadata[beadmeta.ClaimGenerationMetadataKey])
+	}
 }
 
 // assertClassRoutedClaimIsReleasable is the other half of the routed claim: the
@@ -2765,7 +2813,8 @@ func conformanceAssignedTierClaimsTheGraphStep(t *testing.T, e splitEnv, assigne
 		StampWorkMeta: func(context.Context, string, []string, string, string, map[string]string) error {
 			return nil
 		},
-		DrainAck: func(io.Writer) error { return nil },
+		DrainAck:               func(io.Writer) error { return nil },
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}, route)
 	opts := hookClaimOptions{
 		Assignee:           e.qualified,
@@ -2846,7 +2895,8 @@ func conformanceUnresolvableCandidateStillDoesNotStrandWork(t *testing.T, e spli
 		StampWorkMeta: func(context.Context, string, []string, string, string, map[string]string) error {
 			return nil
 		},
-		DrainAck: func(io.Writer) error { return nil },
+		DrainAck:               func(io.Writer) error { return nil },
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}, route)
 	opts := hookClaimOptions{
 		Assignee:           e.qualified,

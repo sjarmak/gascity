@@ -505,6 +505,29 @@ func (a *beadsGraphAdapter) Claim(id, assignee string) (beads.Bead, bool, error)
 	return claimer.Claim(id, assignee)
 }
 
+// beadsAssignmentGenerationClaimer is ClaimWithGeneration's acquire-side
+// capability, discovered on the resolved store the same way
+// beadsAssignmentClaimer is. It is a distinct, narrower capability than plain
+// Claim: a store can support the ordinary CAS without supporting the atomic
+// generation-mint combo (gc-3ohe47), so the two are checked independently
+// rather than assuming one implies the other.
+type beadsAssignmentGenerationClaimer interface {
+	ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error)
+}
+
+// ClaimWithGeneration delegates to a store that implements the atomic
+// claim-and-mint combo. A store without it reports the capability as
+// unavailable rather than emulating the combo with Claim followed by a
+// separate metadata write, which would reopen exactly the window this
+// primitive exists to close.
+func (a *beadsGraphAdapter) ClaimWithGeneration(id, assignee string) (beads.Bead, string, bool, error) {
+	claimer, ok := a.store.(beadsAssignmentGenerationClaimer)
+	if !ok {
+		return beads.Bead{}, "", false, unsupportedBeadsCapability("assignment claim with generation")
+	}
+	return claimer.ClaimWithGeneration(id, assignee)
+}
+
 func (a *beadsGraphAdapter) ReleaseIfCurrent(id, assignee string) (bool, error) {
 	releaser, ok := a.store.(beads.ConditionalAssignmentReleaser)
 	if !ok {
