@@ -67,13 +67,15 @@ func TestHookClaimDoesNotAdoptForeignGraphResidentClaim(t *testing.T) {
 	foreign := `{"id":"gcg-foreign","status":"in_progress","assignee":"worker-2","issue_type":"task","metadata":{"gc.routed_to":"worker"}}`
 	output := `[` + foreign + `,` + selfResumeFreshDemand + `]`
 
+	ops := rec.ops(t, output)
+
 	var stdout, stderr bytes.Buffer
 	code := doHookClaim("query", "/rig", hookClaimOptions{
 		Assignee:           "worker-1",
 		IdentityCandidates: []string{"worker-1"},
 		RouteTargets:       []string{"worker"},
 		JSON:               true,
-	}, rec.ops(t, output), &stdout, &stderr)
+	}, ops, &stdout, &stderr)
 
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr=%s", code, stderr.String())
@@ -96,13 +98,15 @@ func TestHookClaimSkipsGraphResidentMessageBead(t *testing.T) {
 	message := `{"id":"gcg-mail","status":"in_progress","assignee":"worker-1","issue_type":"message","metadata":{"gc.routed_to":"worker"}}`
 	output := `[` + message + `,` + selfResumeFreshDemand + `]`
 
+	ops := rec.ops(t, output)
+
 	var stdout, stderr bytes.Buffer
 	code := doHookClaim("query", "/rig", hookClaimOptions{
 		Assignee:           "worker-1",
 		IdentityCandidates: []string{"worker-1"},
 		RouteTargets:       []string{"worker"},
 		JSON:               true,
-	}, rec.ops(t, output), &stdout, &stderr)
+	}, ops, &stdout, &stderr)
 
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr=%s", code, stderr.String())

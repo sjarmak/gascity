@@ -395,6 +395,7 @@ func TestDoHookClaimPromotesReadyAssignment(t *testing.T) {
 		ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
 			return nil, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-canonical",
@@ -547,6 +548,7 @@ func TestDoHookClaimReadyAssignmentLostRaceFallsThrough(t *testing.T) {
 		ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
 			return nil, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -628,6 +630,7 @@ func TestDoHookClaimClaimsRoutedUnassignedWork(t *testing.T) {
 		ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
 			return nil, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -673,6 +676,7 @@ func TestDoHookClaimRetriesAfterClaimConflict(t *testing.T) {
 			}
 			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker"}}, true, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -722,7 +726,8 @@ func TestDoHookClaimEmitsRejectedOnLostClaim(t *testing.T) {
 		EmitClaimRejected: func(beadID, existing, attempted string) {
 			rejected = append(rejected, rejection{beadID, existing, attempted})
 		},
-		ResolveWorkBranch: func(string) string { return "" }, // suppress stamp noise
+		ResolveWorkBranch:      func(string) string { return "" }, // suppress stamp noise
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -768,6 +773,7 @@ func TestDoHookClaimStampsWorkBranch(t *testing.T) {
 			stampedBead, stampedAssignee, stampedBranch = beadID, assignee, patch["gc.work_branch"]
 			return nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -806,6 +812,7 @@ func TestDoHookClaimSkipsStampWhenBranchUnchanged(t *testing.T) {
 			stampCalls++
 			return nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -839,6 +846,7 @@ func TestDoHookClaimClaimsLegacyRunTargetWorkflowRoot(t *testing.T) {
 				Metadata: map[string]string{"gc.kind": "workflow", "gc.run_target": "worker"},
 			}, true, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -910,6 +918,7 @@ func TestDoHookClaimToleratesMalformedMetadataBead(t *testing.T) {
 			claimedID = beadID
 			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker"}}, true, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -1079,8 +1088,9 @@ func TestClaimHookWorkRetriesLaterStoreWhenSelectedStoreLosesClaimRace(t *testin
 			claimDir = dir
 			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker"}}, true, nil
 		},
-		EmitClaimRejected: func(string, string, string) {},   // suppress event side effect
-		ResolveWorkBranch: func(string) string { return "" }, // suppress stamp noise
+		EmitClaimRejected:      func(string, string, string) {},   // suppress event side effect
+		ResolveWorkBranch:      func(string) string { return "" }, // suppress stamp noise
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -1202,7 +1212,8 @@ func TestClaimHookWorkUsesFallbackStoreDirEnvAndOutput(t *testing.T) {
 			claimDir, claimEnv = dir, env
 			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker"}}, true, nil
 		},
-		ResolveWorkBranch: func(string) string { return "" },
+		ResolveWorkBranch:      func(string) string { return "" },
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -1262,6 +1273,7 @@ func TestDoHookClaimPreassignsContinuationGroupSiblings(t *testing.T) {
 			assigned = append(assigned, beadID+"="+assignee)
 			return nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",
@@ -1667,14 +1679,20 @@ name = "worker"
 		t.Fatal(err)
 	}
 	fakeBD := filepath.Join(fakeBin, "bd")
+	claimedMarker := filepath.Join(fakeBin, "claimed")
 	script := fmt.Sprintf(`#!/bin/sh
 printf 'actor=%%s args=%%s\n' "${BEADS_ACTOR:-}" "$*" >> %q
 case "$*" in
-  *"update hw-claim --claim --json"*)
-    printf '[{"id":"hw-claim","status":"in_progress","assignee":"%%s","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}}]' "${BEADS_ACTOR:-}"
+  *"update hw-claim --actor worker-1 --if-version -7 --if-metadata-absent gc.claim_generation --claim --set-metadata gc.claim_generation="*" --json"*)
+    touch %q
+    printf '[{"id":"hw-claim","status":"in_progress","assignee":"%%s","revision":-8,"metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body","gc.claim_generation":"1"}}]' "${BEADS_ACTOR:-}"
     ;;
   *"show --json hw-claim"*)
-    printf '[{"id":"hw-claim","status":"in_progress","assignee":"%%s","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}}]' "${BEADS_ACTOR:-}"
+    if [ -f %q ]; then
+      printf '[{"id":"hw-claim","status":"in_progress","assignee":"%%s","revision":-8,"metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body","gc.claim_generation":"1"}}]' "${BEADS_ACTOR:-}"
+    else
+      printf '[{"id":"hw-claim","status":"open","revision":-7,"metadata":{"gc.routed_to":"worker"}}]'
+    fi
     ;;
   *"list --json --status=open"*"gc.continuation_group=body"*"gc.root_bead_id=root-1"*)
     printf '[{"id":"hw-claim","status":"open","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}},{"id":"hw-next","status":"open","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}},{"id":"hw-other","status":"open","metadata":{"gc.routed_to":"other","gc.root_bead_id":"root-1","gc.continuation_group":"body"}}]'
@@ -1692,7 +1710,7 @@ case "$*" in
     printf '[]'
     ;;
 esac
-`, logPath)
+`, logPath, claimedMarker, claimedMarker)
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1729,7 +1747,8 @@ esac
 		t.Fatalf("ReadFile(%s): %v", logPath, err)
 	}
 	logText := string(logData)
-	if !strings.Contains(logText, "actor=worker-1 args=update hw-claim --claim --json") {
+	if !strings.Contains(logText, "actor=worker-1 args=update hw-claim --actor worker-1 --if-version -7 --if-metadata-absent gc.claim_generation --claim --set-metadata gc.claim_generation=") ||
+		!strings.Contains(logText, " --json") {
 		t.Fatalf("bd claim did not use canonical BEADS_ACTOR=worker-1; log:\n%s", logText)
 	}
 	if !strings.Contains(logText, "actor=worker-1 args=show --json hw-claim") {
@@ -2167,6 +2186,7 @@ func TestHookClaimSkipsMessageBeadsAheadOfRoutedWork(t *testing.T) {
 			claimed = true
 			return beads.Bead{ID: id, Status: "in_progress", Assignee: assignee, Type: "task"}, true, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           identity,
@@ -2889,6 +2909,7 @@ func TestDoHookClaimSkipsUnclaimableCandidateError(t *testing.T) {
 			}
 			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker"}}, true, nil
 		},
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 	opts := hookClaimOptions{
 		Assignee:           "worker-1",

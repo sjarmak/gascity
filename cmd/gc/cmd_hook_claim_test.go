@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 )
 
@@ -18,6 +19,8 @@ func TestHookClaimWithBdStoreReloadsCanonicalBeadAfterPartialMutation(t *testing
 	t.Cleanup(func() { hookClaimCommandRunnerWithEnvContext = originalRunner })
 
 	var calls [][]string
+	var minted string
+	showCalls := 0
 	hookClaimCommandRunnerWithEnvContext = func(_ context.Context, _ map[string]string) beads.CommandRunner {
 		return func(_ string, name string, args ...string) ([]byte, error) {
 			if name != "bd" {
@@ -25,10 +28,16 @@ func TestHookClaimWithBdStoreReloadsCanonicalBeadAfterPartialMutation(t *testing
 			}
 			calls = append(calls, append([]string(nil), args...))
 			switch {
-			case reflect.DeepEqual(args, []string{"update", "work-1", "--claim", "--json"}):
-				return []byte(`[{"id":"work-1","status":"in_progress","assignee":"worker-1","metadata":{"gc.routed_to":"rig/worker"}}]`), nil
+			case len(args) == 12 && reflect.DeepEqual(args[:10], []string{"update", "work-1", "--actor", "worker-1", "--if-version", "10", "--if-metadata-absent", "gc.claim_generation", "--claim", "--set-metadata"}) &&
+				strings.HasPrefix(args[10], "gc.claim_generation=") && args[11] == "--json":
+				minted = strings.TrimPrefix(args[10], "gc.claim_generation=")
+				return []byte(`[{"id":"work-1","status":"in_progress","assignee":"worker-1","revision":11,"metadata":{"gc.routed_to":"rig/worker","gc.claim_generation":"` + minted + `"}}]`), nil
 			case reflect.DeepEqual(args, []string{"show", "--json", "work-1"}):
-				return []byte(`[{"id":"work-1","status":"in_progress","assignee":"worker-1","metadata":{"gc.routed_to":"rig/worker","gc.root_bead_id":"root-1","gc.continuation_group":"review"}}]`), nil
+				showCalls++
+				if showCalls == 1 {
+					return []byte(`[{"id":"work-1","status":"open","revision":10,"metadata":{"gc.routed_to":"rig/worker","gc.root_bead_id":"root-1","gc.continuation_group":"review"}}]`), nil
+				}
+				return []byte(`[{"id":"work-1","status":"in_progress","assignee":"worker-1","revision":12,"metadata":{"gc.routed_to":"rig/worker","gc.root_bead_id":"root-1","gc.continuation_group":"review","gc.claim_generation":"2"}}]`), nil
 			default:
 				t.Fatalf("unexpected bd args: %#v", args)
 				return nil, nil
@@ -46,8 +55,24 @@ func TestHookClaimWithBdStoreReloadsCanonicalBeadAfterPartialMutation(t *testing
 	if claimed.Metadata["gc.root_bead_id"] != "root-1" || claimed.Metadata["gc.continuation_group"] != "review" {
 		t.Fatalf("claimed metadata = %#v, want canonical root and continuation group", claimed.Metadata)
 	}
-	if len(calls) != 2 {
-		t.Fatalf("bd calls = %#v, want claim update followed by canonical show", calls)
+	if got := claimed.Metadata[beadmeta.ClaimGenerationMetadataKey]; got != minted {
+		t.Fatalf("returned generation = %q, want this attempt's minted %q; a newer same-owner canonical reload must not upgrade stale attempt authority", got, minted)
+	}
+	var confirmLog bytes.Buffer
+	next, confirmed := advanceHookClaimGeneration(claimed, hookClaimOptions{Assignee: "worker-1"}, hookClaimOps{
+		AdvanceClaimGeneration: hookAdvanceClaimGenerationWithBdStore,
+	}, "/rig", &confirmLog)
+	if confirmed || next != "" {
+		t.Fatalf("newer same-owner destination confirmation = (next=%q confirmed=%v), want stale refusal; log=%s", next, confirmed, confirmLog.String())
+	}
+	if !strings.Contains(confirmLog.String(), "claim generation fence on work-1 refused") {
+		t.Fatalf("destination confirmation log = %q, want stale fence refusal", confirmLog.String())
+	}
+	// ClaimWithGeneration reads the exact revision and raw generation metadata
+	// before its one guarded claim+mint update. hookClaimThroughStore then does
+	// its own canonical reload, so the contract remains three bd calls.
+	if len(calls) != 4 {
+		t.Fatalf("bd calls = %#v, want pre-claim show, atomic claim update, canonical reload, then destination confirmation", calls)
 	}
 }
 
@@ -142,7 +167,8 @@ func TestDoHookClaimUsesSelectedStoreContextForMutationAndContinuation(t *testin
 			}
 			return nil
 		},
-		DrainAck: func(io.Writer) error { return nil },
+		DrainAck:               func(io.Writer) error { return nil },
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -246,7 +272,8 @@ func TestDoHookClaimSkipsBlockedRoutedHeadAndClaimsReadyBehindIt(t *testing.T) {
 			claimedBead = beadID
 			return beads.Bead{ID: beadID, Assignee: assignee, Status: "in_progress"}, true, nil
 		},
-		DrainAck: func(io.Writer) error { return nil },
+		DrainAck:               func(io.Writer) error { return nil },
+		AdvanceClaimGeneration: advanceClaimGenerationOK,
 	}
 
 	var stdout, stderr bytes.Buffer

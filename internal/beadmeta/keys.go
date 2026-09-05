@@ -59,18 +59,33 @@ const (
 	// cmd/gc/cmd_hook_claim.go). Feeds the created→claimed and
 	// claimed→started latency-watch transitions (OBS-001).
 	ClaimedAtMetadataKey = "gc.claimed_at"
-	// ClaimGenerationMetadataKey is the scheduler-owned generation-fencing
-	// token for molecule.ClaimExact. It is a counter fenced through
-	// beads.ConditionalWriter.UpdateIfMatch on the bead's revision (distinct
-	// from gc.claimed_at's write-once and gc.control_epoch's
-	// compare-and-overwrite mechanisms): a caller reads the current value,
-	// computes the next generation, and applies a single UpdateIfMatch call
-	// that advances this key AND commits the claim's effects (assignee,
-	// status, session identity) together in one atomic, revision-fenced
-	// write. A stale or racing claimant loses that write outright
-	// (*beads.PreconditionFailedError) with no fallback and no partial
-	// effect ever lands. See molecule.ClaimExact's doc for the exact
-	// guarantee this does and does not provide.
+	// ClaimGenerationMetadataKey is a monotonic claim-fencing counter, the
+	// current-authority token gc-outcome-close verifies before it will close
+	// a bead. Two independent, currently-live mechanisms mint and advance it,
+	// fenced on different preconditions (distinct from gc.claimed_at's
+	// write-once and gc.control_epoch's compare-and-overwrite mechanisms):
+	//   - molecule.ClaimExact (scheduler-owned launch path): revision-fenced
+	//     through beads.ConditionalWriter.UpdateIfMatch. A caller reads the
+	//     current value, computes the next generation, and applies a single
+	//     UpdateIfMatch call that advances this key AND commits the claim's
+	//     effects (assignee, status, session identity) together in one
+	//     atomic, revision-fenced write. A stale or racing claimant loses
+	//     that write outright (*beads.PreconditionFailedError) with no
+	//     fallback and no partial effect ever lands. See molecule.ClaimExact's
+	//     doc for the exact guarantee this does and does not provide.
+	//   - beads.BdStore.ClaimWithGeneration (the generic gc hook --claim pool
+	//     path): reads the exact raw generation and signed row revision, then
+	//     mints this key in the SAME `bd update <id> --if-version <revision>
+	//     --if-metadata[-absent] ... --claim --set-metadata ...` invocation that
+	//     transfers ownership. A stale snapshot or losing claimant's whole
+	//     update, mint included, never lands. The
+	//     follow-up beads.BdStore.ConfirmClaimGeneration read (never a second
+	//     write) re-verifies nothing raced between the mint and delivery. This
+	//     is the mechanism that closes gc-3ohe47: a graph-dispatched step
+	//     claimed only through gc hook --claim previously never minted this
+	//     key at all, and gc-outcome-close correctly refused to close it.
+	// Both mechanisms are fail-closed: neither defaults, fabricates, or
+	// bypasses the generation on a stale or unsupported write.
 	ClaimGenerationMetadataKey           = "gc.claim_generation"
 	ClosedByAttemptMetadataKey           = "gc.closed_by_attempt"
 	ContinuationGroupMetadataKey         = "gc.continuation_group"
@@ -353,6 +368,10 @@ const (
 	// step to ask `gc hook current` would close somebody else's bead. Every path
 	// that takes work off a session clears it.
 	CurrentClaimBeadIDMetadataKey = "current_claim_bead_id"
+
+	// CurrentClaimStoreRefMetadataKey qualifies CurrentClaimBeadIDMetadataKey
+	// with the stable logical storage leg that supplied the claim.
+	CurrentClaimStoreRefMetadataKey = "current_claim_store_ref"
 )
 
 // Dispatch metadata keys: a non-"gc."-prefixed family that sling writes onto

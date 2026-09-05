@@ -19,6 +19,12 @@ import (
 // jq) into the fixture. The recorded argv is the assertion surface: a claim is a
 // `bd update <id> --claim`, so its presence or absence in the log is direct
 // evidence of whether a mutation ran, which an exit code alone cannot give.
+//
+// It also answers `bd show --json demand-1` with the same row and its revision:
+// ClaimWithGeneration uses both that revision and the absent generation as
+// destination-side predicates on the atomic claim-and-mint update. Without
+// this exact preflight shape, the probe would never reach the claim mutation
+// this test exists to observe.
 func installNonTurnDemandProbe(t *testing.T) (argvLog string) {
 	t.Helper()
 	fakeBin := t.TempDir()
@@ -31,6 +37,12 @@ for a in "$@"; do
     exit 0
   fi
 done
+case "$*" in
+  *"show --json demand-1"*)
+    printf '[{"id":"demand-1","status":"open","issue_type":"task","revision":11,"metadata":{"gc.routed_to":"worker"}}]'
+    exit 0
+    ;;
+esac
 printf '[]'
 `
 	if err := os.WriteFile(filepath.Join(fakeBin, "bd"), []byte(script), 0o755); err != nil {

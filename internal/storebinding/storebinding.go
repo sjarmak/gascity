@@ -79,6 +79,16 @@ type GraphStore interface {
 	// in-process by-ID operation the object model owns; without it the CLI
 	// projection would have to re-implement these exact semantics.
 	Claim(string, string) (beads.Bead, bool, error)
+	// ClaimWithGeneration is Claim's atomic-combo sibling (gc-3ohe47): it folds
+	// the beadmeta.ClaimGenerationMetadataKey mint into the SAME destination-side
+	// write as the ownership transition, closing the window a separate
+	// Claim-then-CompareAndSetMetadataKey sequence leaves between "ownership
+	// moved" and "the new generation is canonical" — the window a stale holder
+	// of the OLD generation could otherwise present to gc-outcome-close's
+	// current-authority check. The no-op "already owned, in_progress" branch
+	// returns the unchanged current generation and performs no write, matching
+	// Claim's own no-op contract.
+	ClaimWithGeneration(string, string) (beads.Bead, string, bool, error)
 	ReleaseIfCurrent(string, string) (bool, error)
 	DepAdd(string, string, string) error
 	DepRemove(string, string) error

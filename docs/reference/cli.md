@@ -1994,6 +1994,8 @@ gc hook current [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--id-only` | bool |  | print only the bead id, with no surrounding context |
+| `--json` | bool |  | emit a versioned machine-readable result |
+| `--root-var` | string |  | read one graph-v2 runtime variable from the current claim's workflow root |
 
 ## gc hook run
 
