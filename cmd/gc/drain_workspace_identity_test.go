@@ -72,6 +72,20 @@ func TestQualifiedBeadResolverTreatsClassResidencyAsPhysicalOnly(t *testing.T) {
 	}
 }
 
+func TestQualifiedBeadResolverPreservesIDCollision(t *testing.T) {
+	store := &failingGetStore{
+		Store:  beads.NewMemStore(),
+		failID: "step-1",
+		err:    beads.ErrIDCollision,
+	}
+	resolver := newQualifiedBeadResolver([]qualifiedStoreBinding{{StoreRef: "city", Store: store}})
+
+	_, err := resolver.Resolve(qualifiedBeadIdentity{StoreRef: "city:test", ID: "step-1"})
+	if !errors.Is(err, beads.ErrIDCollision) {
+		t.Fatalf("collision error = %v, want ErrIDCollision preserved", err)
+	}
+}
+
 func TestDrainWorkspaceBindingUsesCurrentQualifiedMemberEvidence(t *testing.T) {
 	repo, base := worktreeTestRepo(t)
 	worktreeRoot := t.TempDir()

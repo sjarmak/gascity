@@ -2579,6 +2579,57 @@ func TestReconcileSessionBeads_UnfinishedDrainRetainsPoolIdentityUntilRootComple
 	}
 }
 
+func TestReconcileSessionBeads_ContinuationCollisionDoesNotRetireSession(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		lookupErr  error
+		wantClosed bool
+	}{
+		{name: "collision retains UNKNOWN authority", lookupErr: beads.ErrIDCollision},
+		{name: "genuine not found releases slot", lookupErr: beads.ErrNotFound, wantClosed: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newReconcilerTestEnv()
+			env.cfg = &config.City{
+				Workspace: config.Workspace{Name: "test"},
+				Agents:    []config.Agent{{Name: "worker"}},
+			}
+			env.addDesired("worker", "worker", false)
+			session := env.createSessionBead("worker", "worker")
+			env.setSessionMetadata(&session, map[string]string{
+				"state":                                 "asleep",
+				"sleep_reason":                          "idle",
+				poolManagedMetadataKey:                  boolMetadata(true),
+				beadmeta.TriggerBeadIDMetadataKey:       "step-1",
+				beadmeta.TriggerBeadStoreRefMetadataKey: "city:test",
+				sessionpkg.CurrentBeadIDKey:             "step-1",
+			})
+			lookupStore := &failingGetStore{Store: env.store, failID: "step-1", err: tt.lookupErr}
+
+			reconcileSessionBeadsAtPath(
+				context.Background(), "", []beads.Bead{session}, env.desiredState,
+				map[string]bool{"worker": true}, env.cfg, env.sp, lookupStore, newFakeDrainOps(),
+				nil, nil, nil, env.dt, nil, false, nil, "", nil, env.clk, env.rec,
+				0, 0, &env.stdout, &env.stderr,
+			)
+
+			got, err := env.store.Get(session.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if closed := got.Status == "closed"; closed != tt.wantClosed {
+				t.Fatalf("session status = %q, want closed=%v; stderr=%q", got.Status, tt.wantClosed, env.stderr.String())
+			}
+			if errors.Is(tt.lookupErr, beads.ErrIDCollision) && !strings.Contains(env.stderr.String(), beads.ErrIDCollision.Error()) {
+				t.Fatalf("collision cause not surfaced: %q", env.stderr.String())
+			}
+			if tt.wantClosed && strings.Contains(env.stderr.String(), "continuation retention unknown") {
+				t.Fatalf("verified absence reported as UNKNOWN: %q", env.stderr.String())
+			}
+		})
+	}
+}
+
 // TestReconcileSessionBeads_AsleepMaxSessionAgePoolBeadFreesSlot mirrors
 // TestReconcileSessionBeads_AsleepIdlePoolBeadFreesSlot for
 // sleep_reason=max-session-age: a session forced to stop by the max-session-age

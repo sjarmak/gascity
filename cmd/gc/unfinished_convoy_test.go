@@ -77,6 +77,52 @@ func TestUnfinishedContinuationStatusDistinguishesUnknownFromNotFound(t *testing
 	}
 }
 
+func TestUnfinishedContinuationStatusPreservesIDCollisionAtEveryLookup(t *testing.T) {
+	const (
+		stepID   = "step-1"
+		rootID   = "root-1"
+		memberID = "member-1"
+		storeRef = "city:test"
+	)
+	store := beads.NewMemStore()
+	store.HonorExplicitIDs = true
+	for _, bead := range []beads.Bead{
+		{ID: memberID, Metadata: map[string]string{beadmeta.RootStoreRefMetadataKey: storeRef}},
+		{ID: rootID, Status: "in_progress", Metadata: map[string]string{
+			beadmeta.RootStoreRefMetadataKey:        storeRef,
+			beadmeta.KindMetadataKey:                beadmeta.KindWorkflow,
+			beadmeta.FormulaContractMetadataKey:     beadmeta.FormulaContractGraphV2,
+			beadmeta.DrainMemberIDMetadataKey:       memberID,
+			beadmeta.DrainMemberStoreRefMetadataKey: storeRef,
+		}},
+		{ID: stepID, Status: "closed", Metadata: map[string]string{
+			beadmeta.RootStoreRefMetadataKey:      storeRef,
+			beadmeta.RootBeadIDMetadataKey:        rootID,
+			beadmeta.ContinuationGroupMetadataKey: "drain:control-1",
+		}},
+	} {
+		if _, err := store.Create(bead); err != nil {
+			t.Fatalf("create %s: %v", bead.ID, err)
+		}
+	}
+	info := sessionpkg.Info{
+		ID: "session-1", CurrentlyProcessingBeadID: stepID,
+		TriggerBeadID: stepID, TriggerBeadStoreRef: storeRef,
+	}
+
+	for _, lookupID := range []string{stepID, rootID, memberID} {
+		t.Run(lookupID, func(t *testing.T) {
+			colliding := &failingGetStore{Store: store, failID: lookupID, err: beads.ErrIDCollision}
+			resolver := newQualifiedBeadResolver([]qualifiedStoreBinding{{StoreRef: "city", Store: colliding}})
+
+			got := unfinishedContinuationStatus(info, resolver, nil)
+			if got.State != continuationUnknown || !errors.Is(got.Err, beads.ErrIDCollision) {
+				t.Fatalf("collision at %s = %+v, want UNKNOWN preserving ErrIDCollision", lookupID, got)
+			}
+		})
+	}
+}
+
 func TestUnfinishedContinuationStatusRejectsMismatchedQualifiedTrigger(t *testing.T) {
 	info := sessionpkg.Info{
 		ID: "session-1", CurrentlyProcessingBeadID: "prior-step",

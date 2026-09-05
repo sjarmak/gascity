@@ -46,6 +46,9 @@ func unfinishedContinuationStatus(info sessionpkg.Info, resolver qualifiedBeadRe
 	}
 	step, err := resolver.Resolve(qualifiedBeadIdentity{StoreRef: storeRef, ID: stepID})
 	if err != nil {
+		if errors.Is(err, beads.ErrIDCollision) {
+			return continuationRetention{State: continuationUnknown, Err: fmt.Errorf("session %s continuation step %s/%s: %w", info.ID, storeRef, stepID, err)}
+		}
 		if errors.Is(err, beads.ErrNotFound) {
 			return continuationRetention{State: continuationAbsent}
 		}
@@ -61,6 +64,9 @@ func unfinishedContinuationStatus(info sessionpkg.Info, resolver qualifiedBeadRe
 	}
 	root, err := resolver.Resolve(qualifiedBeadIdentity{StoreRef: rootStoreRef, ID: rootID})
 	if err != nil {
+		if errors.Is(err, beads.ErrIDCollision) {
+			return continuationRetention{State: continuationUnknown, Err: fmt.Errorf("session %s continuation root %s/%s: %w", info.ID, rootStoreRef, rootID, err)}
+		}
 		if errors.Is(err, beads.ErrNotFound) {
 			return continuationRetention{State: continuationAbsent}
 		}
@@ -79,6 +85,9 @@ func unfinishedContinuationStatus(info sessionpkg.Info, resolver qualifiedBeadRe
 		return continuationRetention{State: continuationUnknown, Err: fmt.Errorf("session %s continuation root %s/%s has incomplete member relation", info.ID, rootStoreRef, rootID)}
 	}
 	if _, err := resolver.Resolve(qualifiedBeadIdentity{StoreRef: memberStoreRef, ID: memberID}); err != nil {
+		if errors.Is(err, beads.ErrIDCollision) {
+			return continuationRetention{State: continuationUnknown, Err: fmt.Errorf("session %s continuation member %s/%s: %w", info.ID, memberStoreRef, memberID, err)}
+		}
 		if errors.Is(err, beads.ErrNotFound) {
 			return continuationRetention{State: continuationAbsent}
 		}
