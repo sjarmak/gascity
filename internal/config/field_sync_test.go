@@ -594,6 +594,157 @@ func TestAgentCloneIsDeep(t *testing.T) {
 	}
 }
 
+// TestRigFieldSync verifies that Rig and RigPatch expose the same set of
+// overridable fields, mirroring TestAgentFieldSync. When a new field is
+// added to Rig, it must also be added to RigPatch + applyRigPatch (or
+// explicitly excluded below with a reason). This is the automated
+// replacement for the manual check AGENTS.md used to require for the
+// rig-override path.
+func TestRigFieldSync(t *testing.T) {
+	// Fields that exist on Rig but are NOT overridable via RigPatch.
+	// Add to this list with a comment explaining why.
+	excluded := map[string]string{
+		"Name": "identity/targeting field — RigPatch.Name is the lookup key, not an override value",
+		// Pack-composition inputs: consumed while expanding this rig's
+		// packs/agents, not values a later patch pass acts on.
+		"FormulasDir": "structural formula-layer path set at rig definition, not a patch concern",
+		"Includes":    "V1 pack composition input, resolved while expanding this rig",
+		"Imports":     "V2 pack composition input, resolved while expanding this rig",
+		// Cap field mirrors the identical exclusion for Agent.MaxActiveSessions
+		// / Agent.MinActiveSessions in TestAgentFieldSync above.
+		"MaxActiveSessions": "cap field, inherits from workspace — not a patch concern",
+		// These fields ARE the agent-override/patch mechanism applied to
+		// this rig's agents. Patching the list itself is not a supported
+		// composition; patch individual agents via [[patches.agent]].
+		"Overrides":  "the agent-override list itself; patch individual agents via [[patches.agent]]",
+		"RigPatches": "the V2 agent-patch list itself; patch individual agents via [[patches.agent]]",
+		// SessionSleep is a nested struct with its own dedicated field-sync
+		// guard (TestSessionSleepFieldSync + sessionSleepMergeFields), not a
+		// flat RigPatch-overridable value.
+		"SessionSleep": "guarded separately by TestSessionSleepFieldSync, not part of RigPatch",
+		// Real gaps, not design exclusions: these are plain scalar/slice
+		// fields with no structural reason to be unpatchable, but RigPatch
+		// is also a Huma-registered API type embedded directly in
+		// ListOutput[config.RigPatch] (internal/api/huma_handlers_patches.go),
+		// so wiring them up fans out into OpenAPI + generated dashboard type
+		// regeneration beyond this test-only fix. Tracked here (rather than
+		// silently dropped) precisely so a future pass closing this gap
+		// removes these four lines instead of rediscovering the gap cold.
+		"DefaultSlingTarget":  "not yet wired into RigPatch — tracked gap, see comment above",
+		"DefaultSlingTargets": "not yet wired into RigPatch — tracked gap, see comment above",
+		"DoltHost":            "not yet wired into RigPatch — tracked gap, see comment above",
+		"DoltPort":            "not yet wired into RigPatch — tracked gap, see comment above",
+	}
+
+	rigFields := structFields(reflect.TypeOf(Rig{}))
+	patchFields := structFields(reflect.TypeOf(RigPatch{}))
+
+	var expected []string
+	for _, f := range rigFields {
+		if _, ok := excluded[f]; !ok {
+			expected = append(expected, f)
+		}
+	}
+	sort.Strings(expected)
+
+	patchSet := toSet(patchFields)
+	var missingPatch []string
+	for _, f := range expected {
+		if !patchSet[f] {
+			missingPatch = append(missingPatch, f)
+		}
+	}
+	if len(missingPatch) > 0 {
+		t.Errorf("RigPatch missing fields that exist on Rig: %v\n"+
+			"Add them to RigPatch + applyRigPatch, or add to the excluded map with justification.", missingPatch)
+	}
+
+	// Check for extra fields on RigPatch that aren't on Rig. Unlike
+	// AgentPatch, RigPatch has no targeting-alias or append-modifier fields
+	// today, so every RigPatch field name is expected to mirror a same-named
+	// Rig field.
+	rigSet := toSet(rigFields)
+	for _, f := range patchFields {
+		if !rigSet[f] {
+			t.Errorf("RigPatch has field %q not found on Rig", f)
+		}
+	}
+}
+
+// TestApplyRigPatchCoversAllFields verifies that applyRigPatch actually
+// handles every field on RigPatch. If a new field is added to RigPatch but
+// not wired into applyRigPatch, this test catches it. Mirrors
+// TestApplyAgentPatchCoversAllFields.
+func TestApplyRigPatchCoversAllFields(t *testing.T) {
+	trueVal := true
+	strVal := func(s string) *string { return &s }
+
+	patch := RigPatch{
+		Name:             "target-rig",
+		Path:             strVal("/path/to/rig"),
+		Prefix:           strVal("tr"),
+		DefaultBranch:    strVal("develop"),
+		Suspended:        &trueVal,
+		SuspendedOnStart: &trueVal,
+		FormulaVars:      map[string]string{"branch": "release"},
+	}
+
+	// Verify every RigPatch field is set (non-zero).
+	pv := reflect.ValueOf(patch)
+	pt := pv.Type()
+	for i := 0; i < pt.NumField(); i++ {
+		f := pt.Field(i)
+		if pv.Field(i).IsZero() {
+			t.Errorf("RigPatch field %q is zero in test data — add it to the test patch", f.Name)
+		}
+	}
+
+	cfg := &City{Rigs: []Rig{{
+		Name:        "target-rig",
+		FormulaVars: map[string]string{"existing": "kept"},
+	}}}
+	if err := applyRigPatch(cfg, &patch); err != nil {
+		t.Fatalf("applyRigPatch: %v", err)
+	}
+	got := cfg.Rigs[0]
+
+	// Name is the targeting key, not applied as a value.
+	targeting := map[string]bool{"Name": true}
+
+	gv := reflect.ValueOf(got)
+	gt := gv.Type()
+	rigFieldByName := make(map[string]int, gt.NumField())
+	for i := 0; i < gt.NumField(); i++ {
+		rigFieldByName[gt.Field(i).Name] = i
+	}
+
+	for i := 0; i < pt.NumField(); i++ {
+		fname := pt.Field(i).Name
+		if targeting[fname] {
+			continue
+		}
+		if fname == "FormulaVars" {
+			continue // merge-map, checked explicitly below
+		}
+		idx, ok := rigFieldByName[fname]
+		if !ok {
+			continue
+		}
+		if gv.Field(idx).IsZero() {
+			t.Errorf("applyRigPatch did not apply field %q to Rig", fname)
+		}
+	}
+
+	// Verify FormulaVars was merged (existing key preserved, new key added),
+	// not replaced wholesale.
+	if got.FormulaVars["existing"] != "kept" {
+		t.Errorf("FormulaVars[existing] = %q, want %q (merge dropped a pre-existing key)", got.FormulaVars["existing"], "kept")
+	}
+	if got.FormulaVars["branch"] != "release" {
+		t.Errorf("FormulaVars[branch] = %q, want %q", got.FormulaVars["branch"], "release")
+	}
+}
+
 func structFields(t reflect.Type) []string {
 	var names []string
 	for i := 0; i < t.NumField(); i++ {
