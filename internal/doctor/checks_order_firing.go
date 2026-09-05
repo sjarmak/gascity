@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -48,7 +49,13 @@ const (
 // the orders it cannot answer from the event log in parallel, because these
 // lookups are store round-trips and running them serially is what pushes a
 // busy city past the check budget (ga-klv).
-type OrderFiringCurrentLastRunFunc func(order orders.Order) (time.Time, error)
+//
+// Implementations SHOULD observe ctx cancellation and return promptly when it
+// fires. The check cancels ctx the moment Run's own timeout elapses, and a
+// lookup already in flight at that point only stops if the implementation
+// itself checks ctx.Done() (gc-7n2eh) — the store round-trip beneath this
+// call is not otherwise interruptible.
+type OrderFiringCurrentLastRunFunc func(ctx context.Context, order orders.Order) (time.Time, error)
 
 // OrderFiringCurrentOption configures the scheduled-order freshness check.
 type OrderFiringCurrentOption func(*OrderFiringCurrentCheck)
@@ -108,12 +115,20 @@ func (c *OrderFiringCurrentCheck) Run(ctx *CheckContext) *CheckResult {
 		timeout = orderFiringHistoryTimeout
 	}
 
-	// The order-history resolver opens the beads/Dolt store and does not accept
-	// a context. Keep that potentially blocking I/O from wedging the complete
-	// doctor run; the gc process exits after printing this failed check.
+	// The order-history resolver opens the beads/Dolt store and the check's own
+	// timeout races it via time.After rather than the resolver accepting a
+	// context directly. Keep that potentially blocking I/O from wedging the
+	// complete doctor run; the gc process exits after printing this failed
+	// check. runCtx is canceled the moment the timeout below fires, so a
+	// lastRun implementation that respects ctx.Done() actually stops instead
+	// of running to completion after Run has already returned (gc-7n2eh) —
+	// see OrderFiringCurrentLastRunFunc for what that contract requires.
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	results := make(chan *CheckResult, 1)
 	go func() {
-		results <- c.run(ctx)
+		results <- c.run(runCtx, ctx)
 	}()
 
 	select {
@@ -138,7 +153,7 @@ func (c *OrderFiringCurrentCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 }
 
-func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
+func (c *OrderFiringCurrentCheck) run(runCtx context.Context, ctx *CheckContext) *CheckResult {
 	result := &CheckResult{Name: c.Name()}
 	if c.cfg == nil {
 		result.Status = StatusOK
@@ -194,7 +209,7 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 	// parallel. The pre-pass shares the cron-interval cache with the loop, so
 	// the expected intervals — and therefore which orders need a lookup — are
 	// identical to what the loop derives for itself.
-	lastRunFor := c.prefetchedLastRunFunc(c.pendingLastRunOrders(allOrders, firedEvents, suspendedRigs, cronIntervals, now))
+	lastRunFor := c.prefetchedLastRunFunc(runCtx, c.pendingLastRunOrders(allOrders, firedEvents, suspendedRigs, cronIntervals, now))
 
 	for _, order := range allOrders {
 		if order.Trigger != "cron" && order.Trigger != "cooldown" {
@@ -214,7 +229,7 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			blockingErrors++
 			continue
 		}
-		lastFired, err := c.latestOrderFiredAtUsing(lastRunFor, firedEvents, order, expected, now)
+		lastFired, err := c.latestOrderFiredAtUsing(runCtx, lastRunFor, firedEvents, order, expected, now)
 		if err != nil {
 			worst = worseStatus(worst, StatusError)
 			result.Details = append(result.Details, fmt.Sprintf("%s: cannot read order history: %v", orderDisplayName(order), err))
@@ -664,19 +679,19 @@ func (c *OrderFiringCurrentCheck) latestControllerStartedAt(eventPath string) (t
 }
 
 func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order orders.Order, expected time.Duration, now time.Time) (time.Time, error) {
-	return c.latestOrderFiredAtUsing(c.lastRun, evts, order, expected, now)
+	return c.latestOrderFiredAtUsing(context.Background(), c.lastRun, evts, order, expected, now)
 }
 
 // latestOrderFiredAtUsing is latestOrderFiredAt against a caller-supplied
 // order-run resolver, so the classification loop can read prefetched results
 // instead of issuing each store round-trip inline.
-func (c *OrderFiringCurrentCheck) latestOrderFiredAtUsing(lastRun OrderFiringCurrentLastRunFunc, evts []events.Event, order orders.Order, expected time.Duration, now time.Time) (time.Time, error) {
+func (c *OrderFiringCurrentCheck) latestOrderFiredAtUsing(runCtx context.Context, lastRun OrderFiringCurrentLastRunFunc, evts []events.Event, order orders.Order, expected time.Duration, now time.Time) (time.Time, error) {
 	latest := latestOrderFiredAt(evts, order.ScopedName())
 	if lastRun == nil {
 		return latest, nil
 	}
 	if !eventEvidenceSuffices(latest, expected, now) {
-		runAt, err := lastRun(order)
+		runAt, err := lastRun(runCtx, order)
 		if err != nil {
 			return time.Time{}, err
 		}
@@ -729,16 +744,16 @@ func (c *OrderFiringCurrentCheck) pendingLastRunOrders(allOrders []orders.Order,
 // serving those results. A lookup the pre-pass did not anticipate still falls
 // through to the live resolver, so the classification loop can never silently
 // lose an answer.
-func (c *OrderFiringCurrentCheck) prefetchedLastRunFunc(pending []orders.Order) OrderFiringCurrentLastRunFunc {
+func (c *OrderFiringCurrentCheck) prefetchedLastRunFunc(runCtx context.Context, pending []orders.Order) OrderFiringCurrentLastRunFunc {
 	if c.lastRun == nil {
 		return nil
 	}
-	prefetched := c.prefetchLastRuns(pending)
-	return func(order orders.Order) (time.Time, error) {
+	prefetched := c.prefetchLastRuns(runCtx, pending)
+	return func(ctx context.Context, order orders.Order) (time.Time, error) {
 		if result, ok := prefetched[order.ScopedName()]; ok {
 			return result.at, result.err
 		}
-		return c.lastRun(order)
+		return c.lastRun(ctx, order)
 	}
 }
 
@@ -749,7 +764,14 @@ func (c *OrderFiringCurrentCheck) prefetchedLastRunFunc(pending []orders.Order) 
 // fan-out reports a blocking failure that says nothing about order firing
 // (ga-klv). Results (values AND errors) are handed back verbatim so the
 // classification loop behaves exactly as it did when it called inline.
-func (c *OrderFiringCurrentCheck) prefetchLastRuns(pending []orders.Order) map[string]orderFiringLastRunResult {
+//
+// runCtx is canceled once Run's timeout fires (gc-7n2eh): a goroutine still
+// waiting for a semaphore slot at that point gives up immediately instead of
+// starting a doomed lookup, and one already inside c.lastRun stops as soon as
+// that call itself observes ctx.Done(). wg.Wait() still blocks on any lookup
+// that ignores cancellation — this cannot force-stop synchronous I/O the
+// implementation doesn't check ctx during, only give it the chance to.
+func (c *OrderFiringCurrentCheck) prefetchLastRuns(runCtx context.Context, pending []orders.Order) map[string]orderFiringLastRunResult {
 	out := make(map[string]orderFiringLastRunResult, len(pending))
 	if c.lastRun == nil || len(pending) == 0 {
 		return out
@@ -766,9 +788,13 @@ func (c *OrderFiringCurrentCheck) prefetchLastRuns(pending []orders.Order) map[s
 		wg.Add(1)
 		go func(order orders.Order) {
 			defer wg.Done()
-			sem <- struct{}{}
+			select {
+			case sem <- struct{}{}:
+			case <-runCtx.Done():
+				return
+			}
 			defer func() { <-sem }()
-			at, err := c.lastRun(order)
+			at, err := c.lastRun(runCtx, order)
 			mu.Lock()
 			out[order.ScopedName()] = orderFiringLastRunResult{at: at, err: err}
 			mu.Unlock()

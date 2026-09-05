@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -196,7 +197,7 @@ func TestOrderFiringCurrent_UsesNewestOrderRunHistory(t *testing.T) {
 		},
 	}, nil)
 
-	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(order orders.Order) (time.Time, error) {
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(_ context.Context, order orders.Order) (time.Time, error) {
 		return orders.NewStoreWithGraph(beads.OrdersStore{Store: store}, beads.GraphStore{Store: store}).LastRun(order.ScopedName())
 	}))
 	check.clock = func() time.Time { return now }
@@ -686,7 +687,7 @@ func TestLatestOrderFiredAt_RecentEventSkipsLastRun(t *testing.T) {
 
 	lastRunCalled := false
 	check := &OrderFiringCurrentCheck{
-		lastRun: func(orders.Order) (time.Time, error) {
+		lastRun: func(context.Context, orders.Order) (time.Time, error) {
 			lastRunCalled = true
 			return time.Time{}, fmt.Errorf("lastRun must not be consulted for a recent event")
 		},
@@ -717,7 +718,7 @@ func TestLatestOrderFiredAt_StaleEventConsultsLastRun(t *testing.T) {
 
 	lastRunCalled := false
 	check := &OrderFiringCurrentCheck{
-		lastRun: func(orders.Order) (time.Time, error) {
+		lastRun: func(context.Context, orders.Order) (time.Time, error) {
 			lastRunCalled = true
 			return freshRun, nil
 		},
@@ -749,7 +750,7 @@ func TestOrderFiringCurrent_TimesOutStalledOrderHistory(t *testing.T) {
 	check := NewOrderFiringCurrentCheck(cfg, cityPath)
 	check.clock = func() time.Time { return now }
 	check.historyTimeout = 20 * time.Millisecond
-	check.lastRun = func(orders.Order) (time.Time, error) {
+	check.lastRun = func(context.Context, orders.Order) (time.Time, error) {
 		<-release
 		return time.Time{}, nil
 	}
@@ -771,5 +772,45 @@ func TestOrderFiringCurrent_TimesOutStalledOrderHistory(t *testing.T) {
 	}
 	if !result.TimedOut {
 		t.Fatalf("TimedOut = false, want true so callers (JSON output, doctor summary) can distinguish this from a confirmed failure")
+	}
+}
+
+// TestOrderFiringCurrent_TimeoutCancelsAbandonedWorker proves the check
+// actually cancels its worker goroutine when Run's own timeout fires, rather
+// than merely returning to the caller while the goroutine keeps running
+// (gc-7n2eh). Asserting only on Run's latency is insufficient here: the old,
+// abandoning implementation returns just as promptly, since it races the
+// worker against time.After without ever signaling it. The proof has to come
+// from the worker itself observing cancellation.
+func TestOrderFiringCurrent_TimeoutCancelsAbandonedWorker(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "mol-dog-stalled-history", "cron", "0 */4 * * *")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "mol-dog-stalled-history", Ts: now.Add(-13 * time.Hour)},
+	)
+
+	stopped := make(chan struct{})
+	check := NewOrderFiringCurrentCheck(cfg, cityPath)
+	check.clock = func() time.Time { return now }
+	check.historyTimeout = 20 * time.Millisecond
+	check.lastRun = func(ctx context.Context, _ orders.Order) (time.Time, error) {
+		<-ctx.Done()
+		close(stopped)
+		return time.Time{}, ctx.Err()
+	}
+
+	result := check.Run(&CheckContext{CityPath: cityPath})
+	if !result.TimedOut {
+		t.Fatalf("TimedOut = false, want true")
+	}
+
+	select {
+	case <-stopped:
+		// The abandoned worker observed cancellation and returned; this is
+		// the fix under test.
+	case <-time.After(2 * time.Second):
+		t.Fatal("abandoned worker did not observe context cancellation after Run timed out")
 	}
 }

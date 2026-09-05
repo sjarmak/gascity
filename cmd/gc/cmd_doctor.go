@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -159,7 +160,10 @@ func doctorOrderFiringCurrentLastRunFunc(cityPath string, cfg *config.City, stde
 		stderr = io.Discard
 	}
 	resolveStores := cachedOrderHistoryStoresResolver(cityPath, cfg, stderr)
-	return func(order orders.Order) (time.Time, error) {
+	return func(ctx context.Context, order orders.Order) (time.Time, error) {
+		if err := ctx.Err(); err != nil {
+			return time.Time{}, err
+		}
 		stores, err := resolveStores(order)
 		if err != nil {
 			return time.Time{}, err
