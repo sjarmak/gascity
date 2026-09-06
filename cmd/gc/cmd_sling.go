@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -960,7 +962,9 @@ func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, stderr
 		return dryRunSingle(opts, deps, querier, stdout, stderr)
 	}
 	if result.NudgeAgent != nil {
-		doSlingNudge(result.NudgeAgent, deps.CityName, deps.CityPath, deps.Cfg, deps.SP, deps.Store, stdout, stderr)
+		if err := doSlingNudgeFromRoutedSource(result.NudgeAgent, deps, stdout, stderr); err != nil {
+			return slingWakeFailed(result, deps, err, false, stdout, stderr)
+		}
 	}
 	return 0
 }
@@ -1066,7 +1070,9 @@ func doSlingBatchWithJSON(opts slingOpts, deps slingDeps, querier BeadChildQueri
 		return dryRunSingle(opts, deps, querier, humanStdout, stderr)
 	}
 	if result.NudgeAgent != nil {
-		doSlingNudge(result.NudgeAgent, deps.CityName, deps.CityPath, deps.Cfg, deps.SP, deps.Store, humanStdout, stderr)
+		if err := doSlingNudgeFromRoutedSource(result.NudgeAgent, deps, humanStdout, stderr); err != nil {
+			return slingWakeFailed(result, deps, err, jsonOutput, jsonStdout, stderr)
+		}
 	}
 	// Success only (never dry-run or error): surface a dashboard deep link
 	// when one resolves. Resolution failure degrades silently to no link.
@@ -1121,6 +1127,42 @@ type slingJSONBatchSummary struct {
 	Failed        int    `json:"failed"`
 	Skipped       int    `json:"skipped"`
 	Idempotent    int    `json:"idempotent"`
+}
+
+// A failed attention request does not undo successful routing. Dead receipts
+// are unclaimable and retain the qualified source and conflicting session
+// evidence without changing ownership of the routed work.
+func slingWakeFailed(result sling.SlingResult, deps slingDeps, cause error, jsonOutput bool, stdout, stderr io.Writer) int {
+	reason := fmt.Sprintf("source StoreRef=%q bead=%q: %v", deps.StoreRef, result.BeadID, cause)
+	now := time.Now()
+	item := newQueuedNudgeWithOptions(result.Target, "Work routed; attention delivery failed", "sling", now, queuedNudgeOptions{
+		Reference: &nudgeReference{Kind: "bead", ID: result.BeadID},
+	})
+	item.DeadAt, item.LastError = now.UTC(), reason
+	if err := withNudgeQueueState(deps.CityPath, func(state *nudgeQueueState) error {
+		for _, previous := range state.Dead {
+			if previous.Agent == item.Agent && previous.Source == item.Source && previous.LastError == reason {
+				return nil
+			}
+		}
+		state.Dead = append(state.Dead, item)
+		return nil
+	}); err != nil {
+		reason += fmt.Sprintf("; delivery failure unrecorded (state unknown): %v", err)
+	} else {
+		reason += "; delivery failure recorded in dead nudge queue"
+	}
+	fmt.Fprintf(stderr, "gc sling: bead routed but %s\n", reason) //nolint:errcheck
+	if jsonOutput {
+		payload := slingJSONFromResult(result)
+		var partial *partialSlingWakeError
+		payload.Success, payload.Queued = false, errors.As(cause, &partial)
+		payload.Warnings = append(payload.Warnings, reason)
+		if err := writeCLIJSONLine(stdout, payload); err != nil {
+			fmt.Fprintf(stderr, "gc sling: %v\n", err) //nolint:errcheck
+		}
+	}
+	return 1
 }
 
 func writeSlingJSONResult(result sling.SlingResult, dashboardURL string, stdout, stderr io.Writer) int {
@@ -1498,68 +1540,150 @@ func checkBeadState(q BeadQuerier, beadID string, a config.Agent) beadCheckResul
 	return sling.CheckBeadState(q, beadID, a, deps)
 }
 
-// doSlingNudge sends a nudge to the target agent after routing.
-// For multi-session configs, nudges the first running instance. If the target is not
-// running, pokes the controller to trigger an immediate reconciler tick
-// so WakeWork can wake the session without waiting for the next patrol.
+// doSlingNudge sends attention after routing; acceptance is not a work claim.
 func doSlingNudge(a *config.Agent, cityName, cityPath string, cfg *config.City,
 	sp runtime.Provider, store beads.Store, stdout, stderr io.Writer,
-) {
-	st := cfg.Workspace.SessionTemplate
+) error {
+	return doSlingNudgeFromRoutedSource(a, slingDeps{CityName: cityName, CityPath: cityPath, Cfg: cfg, SP: sp, Store: store}, stdout, stderr)
+}
 
+// The routing caller supplies its resolved store/ref pair. Bare-store callers
+// carry no scope proof and must still scan the city fallback.
+func doSlingNudgeFromRoutedSource(a *config.Agent, deps slingDeps, stdout, stderr io.Writer) error {
+	cityName, cityPath, cfg, sp, store := deps.CityName, deps.CityPath, deps.Cfg, deps.SP, deps.Store
 	if a.Suspended {
-		fmt.Fprintf(stderr, "warning: cannot nudge %q: agent is suspended — bead routed but not nudged\n", a.QualifiedName()) //nolint:errcheck // best-effort
-		return
+		err := fmt.Errorf("cannot nudge %q: agent is suspended — bead routed but not nudged", a.QualifiedName())
+		fmt.Fprintf(stderr, "warning: %v\n", err) //nolint:errcheck
+		return err
 	}
-
 	if a.SupportsInstanceExpansion() {
-		sp0 := scaleParamsFor(a)
-		tryNudgeStore := func(rawStore beads.Store) bool {
-			// Session lookups (pool refs, running check, target fence) route to the
-			// session coordination-class store; the queued-nudge enqueue inside
-			// deliverSlingNudge stays on rawStore (nudges class). Identity today
-			// (cliSessionStore is the identity resolver), so byte-identical until a
-			// [beads.classes.sessions] relocation lands.
-			sessStore := cliSessionStore(rawStore, cfg, cityPath)
-			refs := resolvePoolSessionRefs(sessStore, cfg, a.Name, a.Dir, sp0, a, cityName, st, sp, stderr)
-			for _, ref := range refs {
-				running, err := workerSessionTargetRunningWithConfig(cityPath, sessStore, sp, cfg, ref.sessionName)
-				if err != nil || !running {
-					continue
-				}
-				member := resolvePoolNudgeMember(cfg, a, ref.qualifiedInstance)
-				target := buildSlingNudgeTarget(member, cityName, cityPath, cfg, sessStore, ref.sessionName)
-				deliverSlingNudge(target, sp, rawStore, cityPath, stdout, stderr)
-				return true
-			}
-			return false
-		}
-		if tryNudgeStore(store) {
-			return
-		}
-		if cityPath != "" {
-			if _, statErr := os.Stat(filepath.Join(cityPath, "city.toml")); statErr == nil {
-				if cityStore, err := slingOpenCityStore(cityPath); err == nil && cityStore != nil && tryNudgeStore(cityStore) {
-					return
-				}
-			}
-		}
-		// No running config session — poke controller for immediate wake.
-		if err := pokeController(cityPath); err != nil {
-			fmt.Fprintf(stderr, "No running sessions for %q; poke failed: %v\n", a.QualifiedName(), err) //nolint:errcheck // best-effort
-		} else {
-			fmt.Fprintf(stdout, "No running sessions for %q — poked controller for wake\n", a.QualifiedName()) //nolint:errcheck // best-effort
-		}
-		return
+		return slingPoolWake(a, deps, stdout, stderr)
 	}
-
-	// Fixed agent: nudge directly. Session lookups route to the session
-	// coordination-class store; deliverSlingNudge keeps the nudge enqueue on the
-	// plain store. Identity today.
 	sessStore := cliSessionStore(store, cfg, cityPath)
-	sn := lookupSessionNameOrLegacy(sessStore, cityName, a.QualifiedName(), st)
+	sn := lookupSessionNameOrLegacy(sessStore, cityName, a.QualifiedName(), cfg.Workspace.SessionTemplate)
 	target := buildSlingNudgeTarget(*a, cityName, cityPath, cfg, sessStore, sn)
-	deliverSlingNudge(target, sp, store, cityPath, stdout, stderr)
+	return deliverSlingNudge(target, sp, store, cityPath, stdout, stderr)
+}
+
+type slingPoolWakeCandidate struct {
+	target       nudgeTarget
+	rawStore     beads.Store
+	sessionStore beads.Store
+	origin       string
+}
+
+type slingWakeFence struct {
+	agent, sessionID, epoch, sessionName string
+}
+
+type partialSlingWakeError struct{ cause error }
+
+func (e *partialSlingWakeError) Error() string {
+	return "attention partially queued; " + e.cause.Error()
+}
+
+func (e *partialSlingWakeError) Unwrap() error { return e.cause }
+
+func (c slingPoolWakeCandidate) fence() slingWakeFence {
+	key := slingWakeFence{agent: c.target.agent.QualifiedName(), sessionID: c.target.sessionID, epoch: c.target.continuationEpoch}
+	if key.sessionID == "" {
+		key.sessionName = c.target.sessionName
+	}
+	return key
+}
+
+func slingPoolWake(a *config.Agent, deps slingDeps, stdout, stderr io.Writer) error {
+	cityName, cityPath, cfg, sp, store := deps.CityName, deps.CityPath, deps.Cfg, deps.SP, deps.Store
+	var candidates []slingPoolWakeCandidate
+	add := func(raw beads.Store, origin string) {
+		sessions := cliSessionStore(raw, cfg, cityPath)
+		for _, ref := range resolvePoolSessionRefs(sessions, cfg, a.Name, a.Dir, scaleParamsFor(a), a, cityName, cfg.Workspace.SessionTemplate, sp, stderr) {
+			member := resolvePoolNudgeMember(cfg, a, ref.qualifiedInstance)
+			target := buildSlingNudgeTarget(member, cityName, cityPath, cfg, sessions, ref.sessionName)
+			candidates = append(candidates, slingPoolWakeCandidate{target, raw, sessions, origin})
+		}
+	}
+	origin := "unknown-source/sessions"
+	if deps.StoreRef != "" {
+		origin = deps.StoreRef + "/sessions"
+	}
+	add(store, origin)
+	// This is the same source pair routing just used, not the target's scope.
+	// Reopening an already-included city leg would lose its handle identity.
+	if _, err := os.Stat(filepath.Join(cityPath, "city.toml")); err == nil && deps.StoreRef != "city:"+cityName {
+		cityStore, err := slingOpenCityStore(cityPath)
+		if err != nil {
+			return fmt.Errorf("pool wake city:%s session lookup: %w", cityName, err)
+		}
+		if cityStore != nil {
+			add(cityStore, "city:"+cityName+"/sessions")
+		}
+	}
+	// The queue carries an ID and epoch, not a StoreRef. Refuse colliding
+	// fences before any delivery; treating either store as authoritative here
+	// would make an indistinguishable queue item claimable by the other.
+	owners := make(map[slingWakeFence]slingPoolWakeCandidate)
+	for _, c := range candidates {
+		key := c.fence()
+		if previous, ok := owners[key]; ok && key.sessionID != "" && !sameSlingSessionStore(previous.sessionStore, c.sessionStore) {
+			return fmt.Errorf("ambiguous pool wake: %s and %s both own agent=%q session=%q epoch=%q runtime=%q; resolve session-store authority before retry",
+				previous.origin, c.origin, key.agent, key.sessionID, key.epoch, c.target.sessionName)
+		}
+		owners[key] = c
+	}
+	for _, c := range candidates {
+		running, err := workerSessionTargetRunningWithConfig(cityPath, c.sessionStore, sp, cfg, c.target.sessionName)
+		if err == nil && running {
+			return deliverSlingNudge(c.target, sp, c.rawStore, cityPath, stdout, stderr)
+		}
+	}
+	accepted := make(map[slingWakeFence]bool)
+	failures := make(map[slingWakeFence]error)
+	items := make(map[slingWakeFence]queuedNudge)
+	for _, c := range candidates {
+		key := c.fence()
+		if accepted[key] {
+			continue
+		}
+		item, exists := items[key]
+		if !exists {
+			item = newQueuedNudgeWithOptions(c.target.agent.QualifiedName(), "Work slung. Check your hook.", "sling", time.Now(), queuedNudgeOptionsFromTarget(c.target))
+			items[key] = item
+		}
+		if err := enqueueQueuedNudgeWithStore(cityPath, cliNudgesStore(c.rawStore, cfg, cityPath), item); err != nil {
+			failures[key] = err
+			continue
+		}
+		accepted[key] = true
+		delete(failures, key)
+	}
+	var failure error
+	for _, key := range slices.SortedFunc(maps.Keys(failures), func(a, b slingWakeFence) int {
+		return cmp.Or(cmp.Compare(a.agent, b.agent), cmp.Compare(a.sessionID, b.sessionID), cmp.Compare(a.epoch, b.epoch), cmp.Compare(a.sessionName, b.sessionName))
+	}) {
+		failure = errors.Join(failure, fmt.Errorf("queue pool wake for %s session %q: %w", key.agent, key.sessionID, failures[key]))
+	}
+	if len(accepted) == 0 {
+		if failure != nil {
+			return failure
+		}
+		return fmt.Errorf("no pool wake target for %q", a.QualifiedName())
+	}
+	if err := slingPokeController(cityPath); err != nil {
+		fmt.Fprintf(stderr, "No running sessions for %q; wake queued, poke failed: %v\n", a.QualifiedName(), err) //nolint:errcheck
+	} else {
+		fmt.Fprintf(stdout, "No running sessions for %q — wake queued, poked controller\n", a.QualifiedName()) //nolint:errcheck
+	}
+	if failure != nil {
+		return &partialSlingWakeError{cause: failure}
+	}
+	return nil
+}
+
+func sameSlingSessionStore(a, b beads.Store) bool {
+	left, lok := storePointerKey(a)
+	right, rok := storePointerKey(b)
+	return lok && rok && left == right
 }
 
 // resolvePoolNudgeMember resolves the config identity to nudge for a live pool
@@ -1638,7 +1762,7 @@ func buildSlingNudgeTarget(agent config.Agent, cityName, cityPath string, cfg *c
 	})
 }
 
-func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Store, cityPath string, stdout, stderr io.Writer) {
+func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Store, cityPath string, stdout, stderr io.Writer) error {
 	const msg = "Work slung. Check your hook."
 	// Session observation/handle and the last-nudge-delivered stamp route to the
 	// session coordination-class store (derived from the target's cfg+cityPath); the
@@ -1666,7 +1790,7 @@ func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Stor
 				}
 				stampLastNudgeDeliveredAt(sessFront, target.sessionID, time.Now())
 				fmt.Fprintf(stdout, "Nudged %s\n", target.agent.QualifiedName()) //nolint:errcheck // best-effort
-				return
+				return nil
 			}
 		}
 	}
@@ -1674,19 +1798,18 @@ func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Stor
 	if err := enqueueQueuedNudgeWithStore(target.cityPath, cliNudgesStore(store, target.cfg, target.cityPath), newQueuedNudgeWithOptions(target.agent.QualifiedName(), msg, "sling", now, queuedNudgeOptionsFromTarget(target))); err != nil {
 		telemetry.RecordNudge(context.Background(), target.agent.QualifiedName(), err)
 		fmt.Fprintf(stderr, "warning: bead routed but nudge failed: %v\n", err) //nolint:errcheck // best-effort
-		return
+		return err
 	}
-	if running {
-		maybeStartNudgePoller(target)
+	maybeStartNudgePoller(target)
+	// Nudge can lose the runtime after observation. The durable queue is the
+	// intent; notify its consumer without trusting the earlier liveness read.
+	if err := slingPokeController(cityPath); err != nil {
+		fmt.Fprintf(stderr, "Session %q wake queued; poke failed: %v\n", target.agent.QualifiedName(), err) //nolint:errcheck
 	} else {
-		maybeStartNudgePoller(target)
-		if err := pokeController(cityPath); err != nil {
-			fmt.Fprintf(stderr, "Session %q is asleep; poke failed: %v\n", target.agent.QualifiedName(), err) //nolint:errcheck // best-effort
-		} else {
-			fmt.Fprintf(stdout, "Session %q is asleep — poked controller for wake\n", target.agent.QualifiedName()) //nolint:errcheck // best-effort
-		}
+		fmt.Fprintf(stdout, "Session %q wake queued — poked controller\n", target.agent.QualifiedName()) //nolint:errcheck
 	}
 	fmt.Fprintf(stdout, "Queued nudge for %s\n", target.agent.QualifiedName()) //nolint:errcheck // best-effort
+	return nil
 }
 
 // dryRunSingle prints a step-by-step preview of what gc sling would do for a
