@@ -61,6 +61,7 @@ type fakeState struct {
 	allOrders         []orders.Order
 	services          workspacesvc.Registry
 	webhookDispatcher orderdispatch.Dispatcher // backs WebhookDispatchProvider; nil disables webhook dispatch
+	pokeMu            sync.Mutex
 	pokeCount         int
 	extmsgSvc         *extmsg.Services
 	adapterReg        *extmsg.AdapterRegistry
@@ -193,7 +194,22 @@ func (f *fakeState) OrdersAll() []orders.Order {
 	}
 	return f.autos
 }
-func (f *fakeState) Poke()                                  { f.pokeCount++ }
+
+func (f *fakeState) Poke() {
+	f.pokeMu.Lock()
+	defer f.pokeMu.Unlock()
+	f.pokeCount++
+}
+
+// PokeCount reads pokeCount under the same lock Poke() writes under, so tests
+// asserting on it don't race the async handlers that call Poke() from a
+// spawned goroutine.
+func (f *fakeState) PokeCount() int {
+	f.pokeMu.Lock()
+	defer f.pokeMu.Unlock()
+	return f.pokeCount
+}
+
 func (f *fakeState) ServiceRegistry() workspacesvc.Registry { return f.services }
 
 // WebhookDispatcher lets fakeState satisfy WebhookDispatchProvider so webhook

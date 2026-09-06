@@ -717,6 +717,43 @@ func waitForRecorderSubstring(t *testing.T, rec *syncResponseRecorder, want stri
 	return rec.BodyString()
 }
 
+// waitForPokeCount polls fs.PokeCount() until it reaches want. Async handlers
+// call Poke() from a goroutine spawned after the event a test already waits
+// on, so observing the event is not proof Poke() has run yet.
+func waitForPokeCount(t *testing.T, fs *fakeState, want int, timeout time.Duration) int {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if got := fs.PokeCount(); got == want {
+			return got
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return fs.PokeCount()
+}
+
+// syncLogBuffer is a bytes.Buffer safe for a log.Logger writing from a
+// background goroutine while a test concurrently reads String(). The
+// standard log.Logger serializes its own Output calls but has no visibility
+// into an external reader, so a bare bytes.Buffer races under -race.
+type syncLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func TestHandleSessionList(t *testing.T) {
 	fs := newSessionFakeState(t)
 	srv := New(fs)
@@ -2672,8 +2709,8 @@ func TestHandleSessionCreateAsync(t *testing.T) {
 	if success.Session.Alias != "sky" {
 		t.Fatalf("Alias = %q, want %q", success.Session.Alias, "sky")
 	}
-	if fs.pokeCount != 1 {
-		t.Fatalf("pokeCount = %d, want 1", fs.pokeCount)
+	if got := waitForPokeCount(t, fs, 1, testEventTimeout); got != 1 {
+		t.Fatalf("pokeCount = %d, want 1", got)
 	}
 }
 
@@ -2977,8 +3014,8 @@ func TestHandleProviderSessionCreateRejectsAsync(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "async session creation is only supported for configured agent templates") {
 		t.Fatalf("body = %q, want provider async guidance", w.Body.String())
 	}
-	if fs.pokeCount != 0 {
-		t.Fatalf("pokeCount = %d, want 0", fs.pokeCount)
+	if got := fs.PokeCount(); got != 0 {
+		t.Fatalf("pokeCount = %d, want 0", got)
 	}
 }
 
@@ -4890,7 +4927,7 @@ func TestHandleSessionMessageLogsLateProviderResultAfterTimeout(t *testing.T) {
 		sessionMessageAsyncTimeout = prevTimeout
 	})
 
-	var logs bytes.Buffer
+	var logs syncLogBuffer
 	oldOutput := log.Writer()
 	oldFlags := log.Flags()
 	log.SetOutput(&logs)
