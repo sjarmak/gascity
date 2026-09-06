@@ -3529,7 +3529,6 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	)
 	for i := range awakeInput.SessionBeads {
 		retention := continuationStatuses[awakeInput.SessionBeads[i].ID]
-		awakeInput.SessionBeads[i].UnfinishedContinuation = retention.State == continuationRetain
 		if retention.State == continuationUnknown && retention.Err != nil {
 			fmt.Fprintf(stderr, "session reconciler: continuation retention unknown for %s: %v\n", awakeInput.SessionBeads[i].SessionName, retention.Err) //nolint:errcheck
 		}

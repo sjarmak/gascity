@@ -62,6 +62,9 @@ func (r qualifiedBeadResolver) Resolve(identity qualifiedBeadIdentity) (beads.Be
 		seenStores[storeKey] = struct{}{}
 		bead, err := binding.Store.Get(id)
 		if err != nil {
+			if errors.Is(err, beads.ErrIDCollision) {
+				return beads.Bead{}, fmt.Errorf("resolve %s/%s via %s: %w", storeRef, id, binding.StoreRef, err)
+			}
 			if errors.Is(err, beads.ErrNotFound) {
 				continue
 			}
