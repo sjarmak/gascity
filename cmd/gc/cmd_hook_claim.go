@@ -18,6 +18,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/executionevent"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 const hookClaimCommandName = "hook"
@@ -157,6 +158,9 @@ type hookClaimOptions struct {
 	Env                []string
 	DrainAck           bool
 	JSON               bool
+	// ClaimStoreRef is the qualified logical work leg selected by the federated
+	// claim loop. A class-route claim replaces it with that route's stable ref.
+	ClaimStoreRef string
 }
 
 // continuationPinAssignee returns the identity a continuation sibling is pinned
@@ -226,6 +230,9 @@ type hookClaimOps struct {
 	// which the step's shell can later learn which bead it is running.
 	// Best-effort.
 	StampSessionClaim hookStampSessionClaimFunc
+	// StampSessionClaimReceipt is the qualified receipt seam. Tests that inject
+	// StampSessionClaim retain their legacy id-only observation through an adapter.
+	StampSessionClaimReceipt hookStampSessionClaimReceiptFunc
 	// ReadWorkMeta is the post-stamp authoritative readback used only to
 	// establish the durable lifecycle-start emission point.
 	ReadWorkMeta             func(context.Context, string, []string, string, string) (beads.Bead, error)
@@ -261,18 +268,19 @@ type hookClaimOps struct {
 }
 
 type (
-	hookClaimFunc                  func(context.Context, string, []string, string, string) (beads.Bead, bool, error)
-	hookListContinuationFunc       func(context.Context, string, []string, string, string) ([]beads.Bead, error)
-	hookAssignContinuationFunc     func(context.Context, string, []string, string, string) error
-	hookDrainAckFunc               func(io.Writer) error
-	hookDrainPendingFunc           func(sessionID string) (bool, error)
-	hookEmitClaimRejectedFunc      func(beadID, existingClaimant, attemptedClaimant string)
-	hookResolveWorkBranchFunc      func(dir string) string
-	hookStampWorkMetaFunc          func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
-	hookStampSessionClaimFunc      func(sessionID, beadID string) error
-	hookPublishRunMapFunc          func(runID, beadID string, sessionKeys ...string) error
-	hookClaimReleaseFunc           func(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error)
-	hookAdvanceClaimGenerationFunc func(ctx context.Context, dir string, env []string, beadID, assignee, fromGeneration string) (next string, outcome beads.AdvanceClaimGenerationOutcome, err error)
+	hookClaimFunc                    func(context.Context, string, []string, string, string) (beads.Bead, bool, error)
+	hookListContinuationFunc         func(context.Context, string, []string, string, string) ([]beads.Bead, error)
+	hookAssignContinuationFunc       func(context.Context, string, []string, string, string) error
+	hookDrainAckFunc                 func(io.Writer) error
+	hookDrainPendingFunc             func(sessionID string) (bool, error)
+	hookEmitClaimRejectedFunc        func(beadID, existingClaimant, attemptedClaimant string)
+	hookResolveWorkBranchFunc        func(dir string) string
+	hookStampWorkMetaFunc            func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
+	hookStampSessionClaimFunc        func(sessionID, beadID string) error
+	hookStampSessionClaimReceiptFunc func(sessionID string, receipt session.CurrentClaimReceipt) error
+	hookPublishRunMapFunc            func(runID, beadID string, sessionKeys ...string) error
+	hookClaimReleaseFunc             func(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error)
+	hookAdvanceClaimGenerationFunc   func(ctx context.Context, dir string, env []string, beadID, assignee, fromGeneration string) (next string, outcome beads.AdvanceClaimGenerationOutcome, err error)
 )
 
 type hookClaimJSONResult struct {
@@ -491,8 +499,15 @@ func (ops *hookClaimOps) applyDefaults() {
 	if ops.AdvanceClaimGeneration == nil {
 		ops.AdvanceClaimGeneration = hookAdvanceClaimGenerationWithBdStore
 	}
-	if ops.StampSessionClaim == nil {
-		ops.StampSessionClaim = hookStampSessionCurrentClaim
+	if ops.StampSessionClaimReceipt == nil {
+		if ops.StampSessionClaim != nil {
+			legacy := ops.StampSessionClaim
+			ops.StampSessionClaimReceipt = func(sessionID string, receipt session.CurrentClaimReceipt) error {
+				return legacy(sessionID, receipt.BeadID)
+			}
+		} else {
+			ops.StampSessionClaimReceipt = hookStampSessionCurrentClaimReceipt
+		}
 	}
 	if ops.PublishRunMap == nil {
 		ops.PublishRunMap = writeRunMap
@@ -1560,17 +1575,21 @@ func hookEmitExecutionStepStarted(step beads.Bead, dir string, env []string, ass
 // control-dispatcher session running a control step needs to name its own bead
 // exactly as much as any other worker does.
 //
-// Best-effort: the write is guarded and compare-and-skipped inside
-// session.Store.SetCurrentClaim, and a failure is reported on stderr but never
-// fails the claim. The loud refusal for a step that cannot name its bead belongs
-// at the point of use, not here.
+// Best-effort: the pair is guarded and compare-and-skipped inside
+// session.Store.SetCurrentClaimReceipt, and a failure is reported on stderr but
+// never fails the claim. The loud refusal for a step that cannot name its bead
+// belongs at the point of use, not here.
 func stampHookSessionCurrentClaim(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, stderr io.Writer) {
 	sessionID := hookClaimSessionID(opts.Env)
-	beadID := strings.TrimSpace(bead.ID)
+	beadID := bead.ID
 	if sessionID == "" || beadID == "" {
 		return
 	}
-	if err := ops.StampSessionClaim(sessionID, beadID); err != nil {
+	receipt := session.CurrentClaimReceipt{
+		BeadID:   beadID,
+		StoreRef: ops.ClassRoute.currentClaimStoreRef(beadID, opts.ClaimStoreRef),
+	}
+	if err := ops.StampSessionClaimReceipt(sessionID, receipt); err != nil {
 		fmt.Fprintf(stderr, "gc hook --claim: recording current claim %s on session %s: %v\n", beadID, sessionID, err) //nolint:errcheck
 	}
 }
@@ -1579,9 +1598,9 @@ func stampHookSessionCurrentClaim(bead beads.Bead, opts hookClaimOptions, ops ho
 // a claim this invocation recorded is being given back, so a released bead is
 // never left advertised as the session's current claim. It is the inverse of
 // stampHookSessionCurrentClaim and deliberately routes the clear through the same
-// ops.StampSessionClaim seam — an empty bead id, which session.Store.SetCurrentClaim
-// treats as a clear — so it reaches the SAME relocation-aware session front door the
-// stamp used. Clearing through the store-cascade helper instead
+// ops.StampSessionClaimReceipt seam — an empty receipt clears both fields — so
+// it reaches the SAME relocation-aware session front door the stamp used.
+// Clearing through the store-cascade helper instead
 // (clearSessionCurrentClaim, sessionFrontDoor(store)) would risk missing a relocated
 // session binding the stamp wrote to.
 //
@@ -1596,7 +1615,7 @@ func clearHookSessionCurrentClaim(opts hookClaimOptions, ops hookClaimOps, stder
 	if sessionID == "" {
 		return
 	}
-	if err := ops.StampSessionClaim(sessionID, ""); err != nil {
+	if err := ops.StampSessionClaimReceipt(sessionID, session.CurrentClaimReceipt{}); err != nil {
 		fmt.Fprintf(stderr, "gc hook --claim: clearing current claim on session %s: %v\n", sessionID, err) //nolint:errcheck
 	}
 }

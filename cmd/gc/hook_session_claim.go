@@ -33,24 +33,21 @@ func sessionCurrentClaimFrontDoor() (*session.Store, error) {
 	return cliSessionFrontDoor(store, cfg, cityPath), nil
 }
 
-// hookStampSessionCurrentClaim records beadID as the work bead the session
-// identified by sessionID is currently running. It is the production
-// implementation of the hookClaimOps.StampSessionClaim seam.
+// hookStampSessionCurrentClaimReceipt records the exact work bead and logical
+// store leg the session identified by sessionID is currently running. It is the
+// production implementation of hookClaimOps.StampSessionClaimReceipt.
 //
-// The write goes through session.Store.SetCurrentClaim, which resolves the id
-// EXACTLY and refuses a non-session bead before writing anything: bd's fuzzy id
-// resolver would otherwise let a post-claim update land on a prefix-colliding
-// session if the intended one disappeared concurrently, which is why the claim
-// path decorates the session bead only through this guarded seam (see
-// publishHookClaimRunMap, which stays a file-based sidecar for exactly that
-// reason). SetCurrentClaim also compare-and-skips, so the per-tick adoption
-// re-run issues no write once the value is current.
-func hookStampSessionCurrentClaim(sessionID, beadID string) error {
+// SetCurrentClaimReceipt resolves the session id EXACTLY, refuses a non-session
+// bead, and commits bead ID plus store ref in one Update. A fuzzy post-claim
+// write could otherwise decorate a prefix-colliding session; separate field
+// writes could authorize a same-ID row in the wrong store. The typed method also
+// compare-and-skips, so per-tick adoption emits no write once both values match.
+func hookStampSessionCurrentClaimReceipt(sessionID string, receipt session.CurrentClaimReceipt) error {
 	sessFront, err := sessionCurrentClaimFrontDoor()
 	if err != nil {
 		return err
 	}
-	_, err = sessFront.SetCurrentClaim(sessionID, beadID)
+	_, err = sessFront.SetCurrentClaimReceipt(sessionID, receipt)
 	return err
 }
 

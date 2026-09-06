@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "gc hook current --root-var --json result",
+  "description": "One exact, qualified current-claim workflow-root variable encoded as transport-safe data.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ok",
+    "command",
+    "session_id",
+    "bead_id",
+    "claim_store_ref",
+    "root_bead_id",
+    "root_store_ref",
+    "root_var"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1"
+    },
+    "ok": {
+      "const": true
+    },
+    "command": {
+      "const": "hook current"
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "bead_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "claim_store_ref": {
+      "type": "string",
+      "pattern": "^(city|rig|class):.+$"
+    },
+    "root_bead_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "root_store_ref": {
+      "type": "string",
+      "pattern": "^(city|rig|class):.+$"
+    },
+    "root_var": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "present",
+        "encoding",
+        "value"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "present": {
+          "type": "boolean"
+        },
+        "encoding": {
+          "const": "base64"
+        },
+        "value": {
+          "type": "string",
+          "contentEncoding": "base64"
+        }
+      }
+    }
+  }
+}

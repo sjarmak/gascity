@@ -130,6 +130,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/executionevent"
 	"github.com/gastownhall/gascity/internal/storebinding"
+	"github.com/gastownhall/gascity/internal/storeref"
 )
 
 // errClaimRouteBindingCannotClaim reports that the relocated coordination-class
@@ -161,6 +162,9 @@ type hookClaimClassRoute struct {
 	// takes a beads.Store rather than the closed contract.
 	class beads.Store
 	graph storebinding.GraphStore
+	// storeRef is the stable logical binding identity, never its backing path or
+	// provider endpoint. The city constructor populates it from the served class set.
+	storeRef string
 
 	resident map[string]bool
 
@@ -292,7 +296,12 @@ func hookClaimClassRouteForCity(cityPath string) (*hookClaimClassRoute, error) {
 	if !relocated {
 		return nil, nil
 	}
-	return newHookClaimClassRoute(binding.Store)
+	route, err := newHookClaimClassRoute(binding.Store)
+	if err != nil {
+		return nil, err
+	}
+	route.storeRef = string(storeref.ClassRef(binding.Classes))
+	return route, nil
 }
 
 // knownResident reports whether an earlier probe in THIS invocation already
@@ -303,6 +312,13 @@ func (r *hookClaimClassRoute) knownResident(id string) bool {
 		return false
 	}
 	return r.resident[strings.TrimSpace(id)]
+}
+
+func (r *hookClaimClassRoute) currentClaimStoreRef(id, fallback string) string {
+	if r != nil && r.knownResident(id) && strings.TrimSpace(r.storeRef) != "" {
+		return r.storeRef
+	}
+	return fallback
 }
 
 // holds probes the binding for id and memoizes the answer.

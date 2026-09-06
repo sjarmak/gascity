@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 // stampMetaSpy captures the (beadID, assignee, patch) a claim writes through the
@@ -477,6 +479,88 @@ func TestDoHookClaimStampsCurrentClaimOnSession(t *testing.T) {
 	if sessSpy.calls != 1 || sessSpy.sessionID != "mc-sess1" || sessSpy.beadID != "hw-pool" {
 		t.Fatalf("session claim stamp = {calls:%d session:%q bead:%q}, want {1 mc-sess1 hw-pool}",
 			sessSpy.calls, sessSpy.sessionID, sessSpy.beadID)
+	}
+}
+
+func TestDoHookClaimStampsQualifiedCurrentClaimReceipt(t *testing.T) {
+	var gotSession string
+	var gotReceipt session.CurrentClaimReceipt
+	ops := poolClaimOps(
+		`[{"id":"hw-qualified","status":"open","metadata":{"gc.routed_to":"worker"}}]`,
+		map[string]string{"gc.routed_to": "worker"},
+		"bd-hw-qualified",
+		&stampMetaSpy{},
+	)
+	ops.StampSessionClaimReceipt = func(sessionID string, receipt session.CurrentClaimReceipt) error {
+		gotSession, gotReceipt = sessionID, receipt
+		return nil
+	}
+	opts := poolClaimOpts()
+	opts.ClaimStoreRef = "rig:alpha"
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	want := session.CurrentClaimReceipt{BeadID: "hw-qualified", StoreRef: "rig:alpha"}
+	if gotSession != "mc-sess1" || gotReceipt != want {
+		t.Fatalf("qualified stamp = (%q, %#v), want (mc-sess1, %#v)", gotSession, gotReceipt, want)
+	}
+}
+
+func TestStampHookSessionCurrentClaimDoesNotNormalizeQualifiedReceipt(t *testing.T) {
+	var got session.CurrentClaimReceipt
+	ops := hookClaimOps{
+		StampSessionClaimReceipt: func(_ string, receipt session.CurrentClaimReceipt) error {
+			got = receipt
+			return session.ErrInvalidCurrentClaimReceipt
+		},
+	}
+	opts := hookClaimOptions{
+		Env:           []string{"GC_SESSION_ID=mc-sess1"},
+		ClaimStoreRef: " rig:alpha",
+	}
+
+	var stderr bytes.Buffer
+	stampHookSessionCurrentClaim(beads.Bead{ID: "gcg-step "}, opts, ops, &stderr)
+	if got != (session.CurrentClaimReceipt{BeadID: "gcg-step ", StoreRef: " rig:alpha"}) {
+		t.Fatalf("qualified receipt = %#v, want exact unnormalized authority", got)
+	}
+	if !strings.Contains(stderr.String(), session.ErrInvalidCurrentClaimReceipt.Error()) {
+		t.Fatalf("stderr = %q, want invalid-receipt diagnostic", stderr.String())
+	}
+}
+
+func TestStampHookSessionCurrentClaimUsesClassRefOnlyForProvenResident(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		resident bool
+		wantRef  string
+	}{
+		{name: "class resident", resident: true, wantRef: "class:gmnos"},
+		{name: "work resident", resident: false, wantRef: "rig:alpha"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var got session.CurrentClaimReceipt
+			route := &hookClaimClassRoute{
+				storeRef: "class:gmnos",
+				resident: map[string]bool{"gcg-step": tt.resident},
+			}
+			ops := hookClaimOps{
+				ClassRoute: route,
+				StampSessionClaimReceipt: func(_ string, receipt session.CurrentClaimReceipt) error {
+					got = receipt
+					return nil
+				},
+			}
+			opts := hookClaimOptions{Env: []string{"GC_SESSION_ID=mc-sess1"}, ClaimStoreRef: "rig:alpha"}
+
+			stampHookSessionCurrentClaim(beads.Bead{ID: "gcg-step"}, opts, ops, io.Discard)
+			want := session.CurrentClaimReceipt{BeadID: "gcg-step", StoreRef: tt.wantRef}
+			if got != want {
+				t.Fatalf("qualified receipt = %#v, want %#v", got, want)
+			}
+		})
 	}
 }
 
