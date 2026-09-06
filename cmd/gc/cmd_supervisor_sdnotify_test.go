@@ -53,23 +53,46 @@ func TestRunSupervisorEmitsSdNotifyLifecycle(t *testing.T) {
 	}()
 
 	var sigCh chan<- os.Signal
-	select {
-	case sigCh = <-sigChReady:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("timed out waiting for supervisor signal hook; stdout=%q stderr=%q", stdout.String(), stderr.String())
-	}
+	awaitCond(t, func() bool {
+		select {
+		case sigCh = <-sigChReady:
+			return true
+		default:
+			return false
+		}
+	}, "supervisor signal hook registering")
 
+	// readDatagram must not gate on a fixed wall-clock deadline: on a
+	// contended host the supervisor's reconcile loop can be descheduled long
+	// enough for a short deadline to fire even though the notification is
+	// still coming (gc-v8vlo). The read runs in its own goroutine so the test
+	// can poll for it with the shared hang budget instead of racing
+	// SetReadDeadline against host load.
 	readDatagram := func() string {
 		t.Helper()
-		if err := notifyConn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-			t.Fatal(err)
+		type result struct {
+			s   string
+			err error
 		}
-		buf := make([]byte, 256)
-		n, err := notifyConn.Read(buf)
-		if err != nil {
-			t.Fatalf("reading notify datagram: %v; stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+		resCh := make(chan result, 1)
+		go func() {
+			buf := make([]byte, 256)
+			n, err := notifyConn.Read(buf)
+			resCh <- result{s: string(buf[:n]), err: err}
+		}()
+		var res result
+		awaitCond(t, func() bool {
+			select {
+			case res = <-resCh:
+				return true
+			default:
+				return false
+			}
+		}, "notify datagram")
+		if res.err != nil {
+			t.Fatalf("reading notify datagram: %v; stdout=%q stderr=%q", res.err, stdout.String(), stderr.String())
 		}
-		return string(buf[:n])
+		return res.s
 	}
 
 	if got := readDatagram(); got != "READY=1" {
@@ -82,8 +105,11 @@ func TestRunSupervisorEmitsSdNotifyLifecycle(t *testing.T) {
 	sigCh <- syscall.SIGHUP
 
 	// Ticker reconciles may interleave WATCHDOG=1 datagrams before the
-	// reload branch runs; drain until RELOADING=1 arrives.
-	reloadDeadline := time.Now().Add(10 * time.Second)
+	// reload branch runs; drain until RELOADING=1 arrives. The outer bound
+	// is the shared hang budget, not a short fixed literal: each
+	// readDatagram call already backstops itself, so this only needs to
+	// catch a genuine "RELOADING=1 never arrives" wedge, not host jitter.
+	reloadDeadline := time.Now().Add(hangBudget)
 	var reload []string
 	for time.Now().Before(reloadDeadline) {
 		got := readDatagram()
@@ -111,8 +137,9 @@ func TestRunSupervisorEmitsSdNotifyLifecycle(t *testing.T) {
 	sigCh <- syscall.SIGTERM
 
 	// Ticker reconciles may interleave more WATCHDOG=1 datagrams before
-	// the shutdown branch runs; drain until STOPPING=1 arrives.
-	deadline := time.Now().Add(10 * time.Second)
+	// the shutdown branch runs; drain until STOPPING=1 arrives. Same
+	// hang-budget rationale as the reload drain above.
+	deadline := time.Now().Add(hangBudget)
 	var lifecycle []string
 	for time.Now().Before(deadline) {
 		got := readDatagram()
@@ -128,13 +155,17 @@ func TestRunSupervisorEmitsSdNotifyLifecycle(t *testing.T) {
 		t.Fatalf("never received STOPPING=1 after SIGTERM; saw %v; stdout=%q stderr=%q", lifecycle, stdout.String(), stderr.String())
 	}
 
-	select {
-	case code := <-done:
-		if code != 0 {
-			t.Fatalf("runSupervisor code = %d, want 0; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	var code int
+	awaitCond(t, func() bool {
+		select {
+		case code = <-done:
+			return true
+		default:
+			return false
 		}
-	case <-time.After(15 * time.Second):
-		t.Fatalf("runSupervisor did not exit after SIGTERM; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}, "runSupervisor exiting after SIGTERM")
+	if code != 0 {
+		t.Fatalf("runSupervisor code = %d, want 0; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "Supervisor stopped.") {
 		t.Fatalf("stdout = %q, want supervisor stop message", stdout.String())
@@ -171,24 +202,36 @@ func TestRunSupervisorNoNotifySocketIsSilentNoop(t *testing.T) {
 	}()
 
 	var sigCh chan<- os.Signal
-	select {
-	case sigCh = <-sigChReady:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("timed out waiting for supervisor signal hook; stdout=%q stderr=%q", stdout.String(), stderr.String())
-	}
-	waitDeadline := time.Now().Add(10 * time.Second)
+	awaitCond(t, func() bool {
+		select {
+		case sigCh = <-sigChReady:
+			return true
+		default:
+			return false
+		}
+	}, "supervisor signal hook registering")
+	// Best effort: give the supervisor a chance to log its start line before
+	// sending SIGTERM, but don't fail the test over it — the shutdown path
+	// below is the real assertion either way. The wait is a hang detector
+	// (shared budget), not a latency assertion, so it never truncates a slow
+	// but healthy start under host load.
+	waitDeadline := time.Now().Add(hangBudget)
 	for time.Now().Before(waitDeadline) && !strings.Contains(stdout.String(), "Supervisor started.") {
 		time.Sleep(10 * time.Millisecond)
 	}
 	sigCh <- syscall.SIGTERM
 
-	select {
-	case code := <-done:
-		if code != 0 {
-			t.Fatalf("runSupervisor code = %d, want 0; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	var code int
+	awaitCond(t, func() bool {
+		select {
+		case code = <-done:
+			return true
+		default:
+			return false
 		}
-	case <-time.After(15 * time.Second):
-		t.Fatalf("runSupervisor did not exit after SIGTERM; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}, "runSupervisor exiting after SIGTERM")
+	if code != 0 {
+		t.Fatalf("runSupervisor code = %d, want 0; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 	if strings.Contains(stderr.String(), "sd_notify") {
 		t.Fatalf("stderr = %q, want no sd_notify noise when NOTIFY_SOCKET is unset", stderr.String())
