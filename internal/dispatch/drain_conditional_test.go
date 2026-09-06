@@ -345,8 +345,12 @@ func TestFenceLossClassifiesTransientAndKeepsControlOpen(t *testing.T) {
 	if !IsTransientControllerError(fenceLoss) {
 		t.Fatal("fence-loss error not classified transient")
 	}
-	if retryable := markControllerSpawnError(store, control.ID, fenceLoss, ProcessOptions{}); !retryable {
+	outcome := markControllerSpawnError(store, control.ID, fenceLoss, ProcessOptions{})
+	if !outcome.Retryable {
 		t.Fatal("markControllerSpawnError treated the fence loss as hard")
+	}
+	if outcome.RecoveryErr != nil {
+		t.Fatalf("unexpected recovery error: %v", outcome.RecoveryErr)
 	}
 	after, err := store.Get(control.ID)
 	if err != nil {

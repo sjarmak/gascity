@@ -165,10 +165,7 @@ func processRetryEval(store beads.Store, bead beads.Bead, opts ProcessOptions) (
 			beadmeta.RetryStateMetadataKey:  beadmeta.SpawnStateSpawning,
 			beadmeta.NextAttemptMetadataKey: strconv.Itoa(nextAttempt),
 		}); err != nil {
-			if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-				return ControlResult{}, ErrControlPending
-			}
-			return ControlResult{}, fmt.Errorf("%s: recording retry spawn start: %w", bead.ID, err)
+			return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: recording retry spawn start", bead.ID))
 		}
 	case beadmeta.SpawnStateSpawning:
 		// Resume partial append below.
@@ -205,10 +202,7 @@ func processRetryEval(store beads.Store, bead beads.Bead, opts ProcessOptions) (
 
 	if bead.Metadata[beadmeta.RetryStateMetadataKey] != beadmeta.SpawnStateSpawned {
 		if err := appendRetryAttempt(store, logicalID, subject, bead, nextAttempt, routeCfg); err != nil {
-			if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-				return ControlResult{}, ErrControlPending
-			}
-			return ControlResult{}, fmt.Errorf("%s: appending retry attempt: %w", bead.ID, err)
+			return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: appending retry attempt", bead.ID))
 		}
 		spawnedMetadata := map[string]string{
 			beadmeta.RetryStateMetadataKey:  beadmeta.SpawnStateSpawned,
@@ -216,10 +210,7 @@ func processRetryEval(store beads.Store, bead beads.Bead, opts ProcessOptions) (
 		}
 		clearControllerSpawnErrorMetadata(spawnedMetadata)
 		if err := store.SetMetadataBatch(bead.ID, spawnedMetadata); err != nil {
-			if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-				return ControlResult{}, ErrControlPending
-			}
-			return ControlResult{}, fmt.Errorf("%s: recording retry spawn complete: %w", bead.ID, err)
+			return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: recording retry spawn complete", bead.ID))
 		}
 	}
 

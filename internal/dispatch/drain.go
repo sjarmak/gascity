@@ -164,16 +164,10 @@ func expandDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Contr
 			row.Status = "root-created"
 		}
 		if err := ensureBlockingDependency(store, bead.ID, row.ItemRootID); err != nil {
-			if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-				return ControlResult{}, ErrControlPending
-			}
-			return ControlResult{}, fmt.Errorf("%s: wiring drain item root %s: %w", bead.ID, row.ItemRootID, err)
+			return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: wiring drain item root %s", bead.ID, row.ItemRootID))
 		}
 		if err := ensureDrainRowDependencyProjection(store, bead, manifest, member.ID, row.ItemRootID, opts); err != nil {
-			if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-				return ControlResult{}, ErrControlPending
-			}
-			return ControlResult{}, fmt.Errorf("%s: projecting drain dependencies for member %s: %w", bead.ID, member.ID, err)
+			return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: projecting drain dependencies for member %s", bead.ID, member.ID))
 		}
 		row.Status = "wired"
 		if err := persistDrainManifest(store, bead.ID, manifest, map[string]string{beadmeta.DrainStateMetadataKey: beadmeta.DrainStateExpanding}); err != nil {
@@ -181,10 +175,7 @@ func expandDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Contr
 		}
 	}
 	if err := ensureDrainDependencyProjection(store, bead, manifest, opts); err != nil {
-		if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-			return ControlResult{}, ErrControlPending
-		}
-		return ControlResult{}, fmt.Errorf("%s: projecting drain dependencies: %w", bead.ID, err)
+		return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: projecting drain dependencies", bead.ID))
 	}
 	if err := persistDrainManifest(store, bead.ID, manifest, map[string]string{
 		beadmeta.DrainStateMetadataKey:          beadmeta.DrainStateExpanded,
@@ -475,17 +466,11 @@ func completeDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Con
 	// wired to source members by earlier builds heal while the drain waits on
 	// open item roots; expansion never revisits an expanded drain.
 	if err := ensureDrainDependencyProjection(store, bead, manifest, opts); err != nil {
-		if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-			return ControlResult{}, ErrControlPending
-		}
-		return ControlResult{}, fmt.Errorf("%s: repairing drain dependency projection: %w", bead.ID, err)
+		return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: repairing drain dependency projection", bead.ID))
 	}
 	if strings.TrimSpace(bead.Metadata[beadmeta.DrainStateMetadataKey]) != beadmeta.DrainStateCompleting {
 		if err := store.SetMetadata(bead.ID, beadmeta.DrainStateMetadataKey, beadmeta.DrainStateCompleting); err != nil {
-			if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-				return ControlResult{}, ErrControlPending
-			}
-			return ControlResult{}, fmt.Errorf("%s: marking drain completing: %w", bead.ID, err)
+			return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: marking drain completing", bead.ID))
 		}
 	}
 	failed := 0
@@ -560,10 +545,7 @@ func advanceSharedDrain(store beads.Store, bead beads.Bead, manifest drainManife
 	// source members), and in shared mode its blocker row is not even
 	// materialized until this row's root closes.
 	if err := ensureDrainDependencyProjection(store, bead, manifest, opts); err != nil {
-		if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-			return ControlResult{}, ErrControlPending
-		}
-		return ControlResult{}, fmt.Errorf("%s: repairing shared drain dependency projection: %w", bead.ID, err)
+		return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: repairing shared drain dependency projection", bead.ID))
 	}
 	onItemFailure := drainOnItemFailure(bead)
 	for i := range manifest.Rows {
@@ -605,10 +587,7 @@ func advanceSharedDrain(store beads.Store, bead beads.Bead, manifest drainManife
 			return ControlResult{}, err
 		}
 		if err := ensureDrainDependencyProjection(store, bead, manifest, opts); err != nil {
-			if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-				return ControlResult{}, ErrControlPending
-			}
-			return ControlResult{}, fmt.Errorf("%s: projecting shared drain dependencies: %w", bead.ID, err)
+			return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: projecting shared drain dependencies", bead.ID))
 		}
 		if err := persistDrainManifest(store, bead.ID, manifest, map[string]string{
 			beadmeta.DrainStateMetadataKey:          beadmeta.DrainStateExpanded,
@@ -662,16 +641,10 @@ func materializeDrainRow(store beads.Store, control beads.Bead, manifest drainMa
 		row.Status = "root-created"
 	}
 	if err := ensureBlockingDependency(store, control.ID, row.ItemRootID); err != nil {
-		if controllerSpawnBoundaryPending(store, control.ID, err, opts) {
-			return 0, ErrControlPending
-		}
-		return 0, fmt.Errorf("%s: wiring drain item root %s: %w", control.ID, row.ItemRootID, err)
+		return 0, classifySpawnBoundary(store, control.ID, err, opts, fmt.Sprintf("%s: wiring drain item root %s", control.ID, row.ItemRootID))
 	}
 	if err := ensureDrainRowDependencyProjection(store, control, manifest, member.ID, row.ItemRootID, opts); err != nil {
-		if controllerSpawnBoundaryPending(store, control.ID, err, opts) {
-			return 0, ErrControlPending
-		}
-		return 0, fmt.Errorf("%s: projecting drain dependencies for member %s: %w", control.ID, member.ID, err)
+		return 0, classifySpawnBoundary(store, control.ID, err, opts, fmt.Sprintf("%s: projecting drain dependencies for member %s", control.ID, member.ID))
 	}
 	row.Status = "wired"
 	return createdCount, nil
@@ -1414,10 +1387,7 @@ func ensureDrainItemRoot(store beads.Store, control, unit, member beads.Bead, co
 		if cleanupErr := closeFailedDrainItemRoots(store, control.ID, row.ItemRootKey); cleanupErr != nil {
 			err = errors.Join(err, cleanupErr)
 		}
-		if controllerSpawnBoundaryPending(store, control.ID, err, opts) {
-			return "", false, ErrControlPending
-		}
-		return "", false, fmt.Errorf("%s: instantiating drain item formula %q: %w", control.ID, itemFormula, err)
+		return "", false, classifySpawnBoundary(store, control.ID, err, opts, fmt.Sprintf("%s: instantiating drain item formula %q", control.ID, itemFormula))
 	}
 	return result.RootID, true, nil
 }

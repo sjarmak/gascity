@@ -108,10 +108,7 @@ func processFanout(store beads.Store, bead beads.Bead, opts ProcessOptions) (Con
 	}
 	if strings.TrimSpace(bead.Metadata[beadmeta.FanoutStateMetadataKey]) == "" {
 		if err := store.SetMetadataBatch(bead.ID, map[string]string{beadmeta.FanoutStateMetadataKey: beadmeta.SpawnStateSpawning}); err != nil {
-			if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-				return ControlResult{}, ErrControlPending
-			}
-			return ControlResult{}, fmt.Errorf("%s: recording fanout spawn start: %w", bead.ID, err)
+			return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: recording fanout spawn start", bead.ID))
 		}
 	}
 	fanoutSinkBlockers := fanoutSinkBlockerIDs(blockerIDs, source.ID)
@@ -167,10 +164,7 @@ func processFanout(store beads.Store, bead beads.Bead, opts ProcessOptions) (Con
 				ExternalDeps: externalDeps,
 			})
 			if err != nil {
-				if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-					return ControlResult{}, ErrControlPending
-				}
-				return ControlResult{}, fmt.Errorf("%s: instantiating fragment %d: %w", bead.ID, index+1, err)
+				return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: instantiating fragment %d", bead.ID, index+1))
 			}
 			totalCreated += inst.Created
 			idMapping = inst.IDMapping
@@ -179,10 +173,7 @@ func processFanout(store beads.Store, bead beads.Bead, opts ProcessOptions) (Con
 		sinkIDs := mapStepIDs(fragment.Sinks, idMapping)
 		for _, sinkID := range sinkIDs {
 			if err := store.DepAdd(bead.ID, sinkID, "blocks"); err != nil {
-				if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-					return ControlResult{}, ErrControlPending
-				}
-				return ControlResult{}, fmt.Errorf("%s: wiring fanout blocker: %w", bead.ID, err)
+				return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: wiring fanout blocker", bead.ID))
 			}
 		}
 		if len(sinkIDs) > 0 {
@@ -196,10 +187,7 @@ func processFanout(store beads.Store, bead beads.Bead, opts ProcessOptions) (Con
 	}
 	clearControllerSpawnErrorMetadata(spawnedMetadata)
 	if err := store.SetMetadataBatch(bead.ID, spawnedMetadata); err != nil {
-		if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-			return ControlResult{}, ErrControlPending
-		}
-		return ControlResult{}, fmt.Errorf("%s: recording fanout state: %w", bead.ID, err)
+		return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: recording fanout state", bead.ID))
 	}
 	return ControlResult{Processed: true, Action: "fanout-spawn", Created: totalCreated}, nil
 }

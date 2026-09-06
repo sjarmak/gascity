@@ -204,17 +204,11 @@ func processAttemptControl(store beads.Store, bead beads.Bead, opts ProcessOptio
 		spawnMetadata := map[string]string{beadmeta.AttemptLogMetadataKey: attemptLog}
 		clearControllerSpawnErrorMetadata(spawnMetadata)
 		if err := store.SetMetadataBatch(bead.ID, spawnMetadata); err != nil {
-			if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-				return ControlResult{}, ErrControlPending
-			}
-			return ControlResult{}, fmt.Errorf("%s: recording attempt log: %w", bead.ID, err)
+			return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: recording attempt log", bead.ID))
 		}
 		nextAttempt := attemptNum + 1
 		if err := spawnNextAttempt(context.Background(), store, bead, nextAttempt, opts); err != nil {
-			if markControllerSpawnError(store, bead.ID, err, opts) {
-				return ControlResult{}, ErrControlPending
-			}
-			return ControlResult{}, fmt.Errorf("%s: spawning %s %d: %w", bead.ID, strategy.subjectNoun, nextAttempt, err)
+			return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: spawning %s %d", bead.ID, strategy.subjectNoun, nextAttempt))
 		}
 
 		return ControlResult{Processed: true, Action: "retry", Created: 1}, nil
@@ -231,22 +225,13 @@ func processAttemptControl(store beads.Store, bead beads.Bead, opts ProcessOptio
 // controller spawn boundary so transient failures stay open for retry.
 func ensurePendingAttemptConverges(store beads.Store, bead, attempt beads.Bead, strategy controlAttemptStrategy, opts ProcessOptions) (ControlResult, error) {
 	if err := ensureBlockingDependency(store, bead.ID, attempt.ID); err != nil {
-		if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-			return ControlResult{}, ErrControlPending
-		}
-		return ControlResult{}, fmt.Errorf("%s: blocking on pending %s %s: %w", bead.ID, strategy.subjectNoun, attempt.ID, err)
+		return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: blocking on pending %s %s", bead.ID, strategy.subjectNoun, attempt.ID))
 	}
 	if err := syncControlEpochToAttempt(store, bead, attempt); err != nil {
-		if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-			return ControlResult{}, ErrControlPending
-		}
-		return ControlResult{}, fmt.Errorf("%s: advancing recovered %s epoch for %s: %w", bead.ID, strategy.subjectNoun, attempt.ID, err)
+		return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: advancing recovered %s epoch for %s", bead.ID, strategy.subjectNoun, attempt.ID))
 	}
 	if err := closeGeneratedSpecBeadsForAttempt(store, bead, attempt); err != nil {
-		if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-			return ControlResult{}, ErrControlPending
-		}
-		return ControlResult{}, fmt.Errorf("%s: closing generated spec beads for pending %s %s: %w", bead.ID, strategy.subjectNoun, attempt.ID, err)
+		return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: closing generated spec beads for pending %s %s", bead.ID, strategy.subjectNoun, attempt.ID))
 	}
 	return ControlResult{}, ErrControlPending
 }
@@ -318,11 +303,38 @@ func ensureBlockingDependency(store beads.Store, issueID, dependsOnID string) er
 	return store.DepAdd(issueID, dependsOnID, "blocks")
 }
 
-func controllerSpawnBoundaryPending(store beads.Store, beadID string, err error, opts ProcessOptions) bool {
+// controllerSpawnBoundaryPending classifies a controller store-boundary error
+// through markControllerSpawnError and returns whether the caller should
+// treat it as pending (retryable) along with any error encountered while
+// recording that classification. A non-nil recoveryErr means the store write
+// meant to make this failure visible on the bead did not itself succeed, so
+// the caller must surface a real error rather than silently reporting
+// pending/converged.
+func controllerSpawnBoundaryPending(store beads.Store, beadID string, err error, opts ProcessOptions) (bool, error) {
 	if err == nil {
-		return false
+		return false, nil
 	}
-	return markControllerSpawnError(store, beadID, err, opts)
+	outcome := markControllerSpawnError(store, beadID, err, opts)
+	return outcome.Retryable, outcome.RecoveryErr
+}
+
+// classifySpawnBoundary is the shared decision behind every controller
+// store-boundary call site: it classifies err through
+// controllerSpawnBoundaryPending and returns the single error value the
+// caller should propagate. When the recovery write itself failed, that is
+// always the returned error (never ErrControlPending) so a caller cannot
+// mistake an incompletely-recorded failure for ordinary pending convergence.
+// Otherwise a retryable original error yields ErrControlPending, and a hard
+// original error yields a wrapped, contextual error built from context.
+func classifySpawnBoundary(store beads.Store, beadID string, err error, opts ProcessOptions, context string) error {
+	pending, recoveryErr := controllerSpawnBoundaryPending(store, beadID, err, opts)
+	if recoveryErr != nil {
+		return fmt.Errorf("%s: %w (recovery incomplete: %w)", context, err, recoveryErr)
+	}
+	if pending {
+		return ErrControlPending
+	}
+	return fmt.Errorf("%s: %w", context, err)
 }
 
 func syncControlEpochToAttempt(store beads.Store, control, attempt beads.Bead) error {
@@ -370,17 +382,30 @@ func syncControlEpochToAttempt(store beads.Store, control, attempt beads.Bead) e
 	return fmt.Errorf("syncing control epoch on %s: conditional advance kept conflicting below attempt %d", control.ID, attemptNum)
 }
 
-func markControllerSpawnError(store beads.Store, beadID string, err error, opts ProcessOptions) bool {
+// controllerSpawnRecovery is the outcome of markControllerSpawnError: the
+// classification of the original spawn error (Retryable), plus any failure
+// encountered while writing that classification back to the store. The two
+// are orthogonal — a transient spawn error can still fail to record itself,
+// and a hard failure can close cleanly but fail to reconcile its scope.
+// RecoveryErr is nil only when every attempted recovery write succeeded.
+type controllerSpawnRecovery struct {
+	Retryable   bool
+	RecoveryErr error
+}
+
+func markControllerSpawnError(store beads.Store, beadID string, err error, opts ProcessOptions) controllerSpawnRecovery {
 	metadata := map[string]string{
 		beadmeta.ControllerErrorMetadataKey: err.Error(),
 	}
+	var recoveryErrs []error
 	if IsTransientControllerError(err) && !isPartialAttemptAttachError(err) {
 		metadata[beadmeta.ControllerErrorClassMetadataKey] = beadmeta.FailureClassTransient
 		metadata[beadmeta.ControllerRetryableMetadataKey] = "true"
 		if writeErr := store.SetMetadataBatch(beadID, metadata); writeErr != nil {
 			opts.tracef("controller-spawn-error bead=%s recording transient failure metadata failed err=%v", beadID, writeErr)
+			recoveryErrs = append(recoveryErrs, fmt.Errorf("recording transient failure metadata: %w", writeErr))
 		}
-		return true
+		return controllerSpawnRecovery{Retryable: true, RecoveryErr: errors.Join(recoveryErrs...)}
 	}
 
 	metadata[beadmeta.ControllerErrorClassMetadataKey] = beadmeta.FailureClassHard
@@ -388,16 +413,19 @@ func markControllerSpawnError(store beads.Store, beadID string, err error, opts 
 	metadata[beadmeta.FinalDispositionMetadataKey] = beadmeta.DispositionControllerError
 	if writeErr := store.SetMetadataBatch(beadID, metadata); writeErr != nil {
 		opts.tracef("controller-spawn-error bead=%s recording hard failure metadata failed err=%v", beadID, writeErr)
+		recoveryErrs = append(recoveryErrs, fmt.Errorf("recording hard failure metadata: %w", writeErr))
 	}
 	if closeErr := setOutcomeAndClose(store, beadID, beadmeta.OutcomeFail); closeErr != nil {
 		opts.tracef("controller-spawn-error bead=%s closing failed bead failed err=%v", beadID, closeErr)
+		recoveryErrs = append(recoveryErrs, fmt.Errorf("closing failed bead: %w", closeErr))
 	}
 	// Reconcile any enclosing scope so a controller_error terminal closure
 	// does not leave the scope body stalled.
 	if _, scopeErr := reconcileClosedScopeMemberWithOptions(store, beadID, opts); scopeErr != nil {
 		opts.tracef("controller-spawn-error bead=%s reconciling enclosing scope failed err=%v", beadID, scopeErr)
+		recoveryErrs = append(recoveryErrs, fmt.Errorf("reconciling enclosing scope: %w", scopeErr))
 	}
-	return false
+	return controllerSpawnRecovery{Retryable: false, RecoveryErr: errors.Join(recoveryErrs...)}
 }
 
 func clearControllerSpawnErrorMetadata(metadata map[string]string) {

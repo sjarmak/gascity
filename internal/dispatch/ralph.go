@@ -84,10 +84,7 @@ func processRalphCheck(store beads.Store, bead beads.Bead, opts ProcessOptions) 
 		infraRetries, _ := strconv.Atoi(bead.Metadata[beadmeta.CheckInfraRetryMetadataKey])
 		if infraRetries < maxCheckInfraRetries {
 			if err := store.SetMetadata(bead.ID, beadmeta.CheckInfraRetryMetadataKey, strconv.Itoa(infraRetries+1)); err != nil {
-				if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-					return ControlResult{}, ErrControlPending
-				}
-				return ControlResult{}, fmt.Errorf("%s: recording gate infra-retry: %w", bead.ID, err)
+				return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: recording gate infra-retry", bead.ID))
 			}
 			opts.tracef("ralph check-infra-retry bead=%s outcome=%s infra_retry=%d/%d attempt=%d (attempt not burned)",
 				bead.ID, result.Outcome, infraRetries+1, maxCheckInfraRetries, attempt)
@@ -167,10 +164,7 @@ func processRalphCheck(store beads.Store, bead beads.Bead, opts ProcessOptions) 
 			beadmeta.RetryStateMetadataKey:  beadmeta.SpawnStateSpawning,
 			beadmeta.NextAttemptMetadataKey: strconv.Itoa(nextAttempt),
 		}); err != nil {
-			if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-				return ControlResult{}, ErrControlPending
-			}
-			return ControlResult{}, fmt.Errorf("%s: recording retry spawn start: %w", bead.ID, err)
+			return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: recording retry spawn start", bead.ID))
 		}
 	case beadmeta.SpawnStateSpawning:
 		// Resume partial append below.
@@ -182,10 +176,7 @@ func processRalphCheck(store beads.Store, bead beads.Bead, opts ProcessOptions) 
 	if bead.Metadata[beadmeta.RetryStateMetadataKey] != beadmeta.SpawnStateSpawned {
 		opts.tracef("ralph retry-append-start bead=%s next=%d", bead.ID, nextAttempt)
 		if _, err := appendRalphRetry(store, logicalID, subject, bead, nextAttempt, opts); err != nil {
-			if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-				return ControlResult{}, ErrControlPending
-			}
-			return ControlResult{}, fmt.Errorf("%s: appending retry: %w", bead.ID, err)
+			return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: appending retry", bead.ID))
 		}
 		opts.tracef("ralph retry-append-done bead=%s next=%d", bead.ID, nextAttempt)
 		spawnedMetadata := map[string]string{
@@ -194,10 +185,7 @@ func processRalphCheck(store beads.Store, bead beads.Bead, opts ProcessOptions) 
 		}
 		clearControllerSpawnErrorMetadata(spawnedMetadata)
 		if err := store.SetMetadataBatch(bead.ID, spawnedMetadata); err != nil {
-			if controllerSpawnBoundaryPending(store, bead.ID, err, opts) {
-				return ControlResult{}, ErrControlPending
-			}
-			return ControlResult{}, fmt.Errorf("%s: recording retry spawn complete: %w", bead.ID, err)
+			return ControlResult{}, classifySpawnBoundary(store, bead.ID, err, opts, fmt.Sprintf("%s: recording retry spawn complete", bead.ID))
 		}
 	}
 	opts.tracef("ralph retry-finalize-start bead=%s next=%d", bead.ID, nextAttempt)
