@@ -514,7 +514,10 @@ func LatestArchivedMatch(path string, filter Filter) (Event, bool, error) {
 
 // ReadFilteredTail reads the trailing matching events from path. A positive
 // limit returns at most that many events in chronological order; limit <= 0
-// falls back to ReadFiltered.
+// falls back to ReadFiltered, which reads path AND every sibling archive,
+// decompressing each one. That fallback is unbounded in cost, not a tail
+// read: on a large log it can mean dozens of archives and tens of seconds
+// of gzip decompression, not a cheap trailing-events lookup.
 func ReadFilteredTail(path string, filter Filter, limit int) ([]Event, error) {
 	if limit <= 0 {
 		return ReadFiltered(path, filter)
