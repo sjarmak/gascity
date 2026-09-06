@@ -491,6 +491,24 @@ func Cleanup(spec Spec) (CleanupReport, error) {
 	if err != nil {
 		return cleanupFailure(report, CleanupErrorUnmerged, fmt.Sprintf("checking merge state against %q: %v", spec.Base, err))
 	}
+	// A local branch ref only advances when someone fetches and
+	// fast-forwards it, so spec.Base's local resolution can lag its
+	// remote-tracking counterpart by any number of commits. The
+	// reachability check above already treats every remote-tracking ref as
+	// an authoritative anchor (HasUnreachableCommitsResult scans
+	// --branches --remotes --tags); the merge-target check must accept one
+	// too, or a HEAD already identical to a fetched, up-to-date
+	// origin/<base> gets refused forever on a local base ref nobody
+	// happened to fast-forward (gc-kb028q).
+	if !merged {
+		if remoteSHA, remoteRef, found, remoteErr := repoGit.RevParseVerifyRemoteTrackingCommit(spec.Base); remoteErr == nil && found {
+			remoteMerged, err := isAncestor(spec.Path, "HEAD", remoteSHA)
+			if err != nil {
+				return cleanupFailure(report, CleanupErrorUnmerged, fmt.Sprintf("checking merge state against %q: %v", remoteRef, err))
+			}
+			merged = remoteMerged
+		}
+	}
 	if !merged {
 		return cleanupFailure(report, CleanupErrorUnmerged,
 			fmt.Sprintf("worktree HEAD is not merged into local base %q at %s", spec.Base, baseSHA))

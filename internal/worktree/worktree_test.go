@@ -801,6 +801,42 @@ func TestCleanupRefusesPushedButUnmergedCommits(t *testing.T) {
 	}
 }
 
+// TestCleanupAcceptsHeadMergedOnlyViaFresherRemoteTrackingBase reproduces
+// gc-kb028q: a worktree branch lands upstream and origin/<base> fast-forwards
+// past it, but the operator's local base branch is never pulled. HEAD is
+// byte-identical to the fetched, up-to-date origin/<base> tip, yet the local
+// base ref alone would report it unmerged forever. Cleanup must accept the
+// remote-tracking ref as proof the work landed.
+func TestCleanupAcceptsHeadMergedOnlyViaFresherRemoteTrackingBase(t *testing.T) {
+	repo, base := initTestRepo(t)
+	root := t.TempDir()
+	wt := filepath.Join(root, "gc-test")
+	spec := managedSpec(repo, root, wt, "work/gc-test", base)
+	rep, err := Ensure(spec)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	spec.AttemptID = rep.Provenance.AttemptID
+	runGit(t, wt, "commit", "--allow-empty", "-m", "landed-upstream")
+	tip := runGit(t, wt, "rev-parse", "HEAD")
+
+	// Simulate the merge landing on the remote without the local base
+	// branch ever fast-forwarding to it: local `base` stays at its original
+	// commit, only refs/remotes/origin/<base> advances to HEAD's tip.
+	publishRemoteRef(t, repo, base, tip)
+
+	report, cleanupErr := Cleanup(spec)
+	if cleanupErr != nil {
+		t.Fatalf("Cleanup refused a HEAD merged into a fresher remote-tracking base: %v (report: %+v)", cleanupErr, report)
+	}
+	if !report.Removed || report.CleanupPending || report.Error != nil {
+		t.Fatalf("Cleanup report = %+v, want removed cleanly", report)
+	}
+	if _, statErr := os.Stat(wt); !os.IsNotExist(statErr) {
+		t.Fatalf("worktree path remains after Cleanup: %v", statErr)
+	}
+}
+
 func TestCleanupRefusesAmbiguousOrMismatchedOwnership(t *testing.T) {
 	repo, base := initTestRepo(t)
 	root := t.TempDir()

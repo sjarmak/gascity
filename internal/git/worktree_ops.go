@@ -85,6 +85,30 @@ func (g *Git) RevParseVerifyCommit(ref string) (string, error) {
 	return sha, nil
 }
 
+// RevParseVerifyRemoteTrackingCommit resolves branch as a remote-tracking ref
+// (refs/remotes/<remote>/<branch>), trying each configured remote in
+// origin-first order. found is false, with a nil error, when no configured
+// remote has a matching remote-tracking ref locally — that is the expected
+// shape for a purely local repository or an unfetched branch, not a probe
+// failure.
+//
+// Unlike RevParseVerifyCommit, branch may already carry a remote prefix (e.g.
+// "origin/main"); it is stripped per candidate remote before qualifying, so
+// callers can pass either a bare branch name or an already-qualified ref.
+func (g *Git) RevParseVerifyRemoteTrackingCommit(branch string) (sha, ref string, found bool, err error) {
+	if err := validateRefArg("branch", branch); err != nil {
+		return "", "", false, err
+	}
+	for _, remote := range g.remoteNamesOriginFirst() {
+		short := strings.TrimPrefix(branch, remote+"/")
+		candidate := "refs/remotes/" + remote + "/" + short
+		if sha, err := g.RevParseVerifyCommit(candidate); err == nil {
+			return sha, candidate, true, nil
+		}
+	}
+	return "", "", false, nil
+}
+
 // WorktreeAddNewBranch creates a worktree at path with a NEW branch created
 // from base. It never detaches: the new worktree has branch checked out.
 // Fails if the branch already exists.
