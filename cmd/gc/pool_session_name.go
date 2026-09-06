@@ -817,7 +817,7 @@ func directSessionBeadIDCandidates(assignee string) []string {
 // The check itself lives in liveWorkAssignmentAssigneeMatches (work_assignment.go),
 // shared with the work-release and reassign paths.
 func liveWorkAssignmentStillReleasable(store beads.Store, id, expectedStatus, assignee string) bool {
-	matches, err := liveWorkAssignmentAssigneeMatches(store, id, expectedStatus, assignee)
+	matches, err := beads.LiveWorkAssignmentAssigneeMatches(store, id, expectedStatus, assignee)
 	if err != nil {
 		log.Printf("releaseOrphanedPoolAssignments: live work validation failed for %q: %v", id, err)
 		return false

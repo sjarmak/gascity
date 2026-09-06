@@ -193,6 +193,13 @@ func (s *Server) reassignContinuityIneligibleNamedSessionState(ctx context.Conte
 	return nil
 }
 
+// reassignOpenWorkAssignedToSession re-homes each open/in_progress WORK bead
+// assigned to a retired session onto its replacement. The write is
+// CONDITIONAL on the bead still being assigned to oldID at write time: a
+// worker that claims the bead in the window between the List above and this
+// loop's Update must not have its claim overwritten by the retired session's
+// successor (the dr-huhn defect class; see beads.LiveWorkAssignmentAssigneeMatches
+// for why the recheck must be a live read, not a cached one).
 func reassignOpenWorkAssignedToSession(store beads.Store, oldID, newID string) error {
 	if store == nil || strings.TrimSpace(oldID) == "" || strings.TrimSpace(newID) == "" {
 		return nil
@@ -204,6 +211,13 @@ func reassignOpenWorkAssignedToSession(store beads.Store, oldID, newID string) e
 		}
 		for _, item := range work {
 			if session.IsSessionBeadOrRepairable(item) {
+				continue
+			}
+			stillCurrent, err := beads.LiveWorkAssignmentAssigneeMatches(store, item.ID, item.Status, oldID)
+			if err != nil {
+				return err
+			}
+			if !stillCurrent {
 				continue
 			}
 			if err := store.Update(item.ID, beads.UpdateOpts{Assignee: &newID}); err != nil {

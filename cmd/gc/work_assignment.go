@@ -245,7 +245,7 @@ func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback strin
 	// snapshot with a live read immediately before the unconditional write. This
 	// shrinks the window rather than closing it; the residual recheck->write gap
 	// needs a store-level conditional write, which is exactly what tier 1 is.
-	stillCurrent, err := liveWorkAssignmentAssigneeMatches(store, item.ID, item.Status, item.Assignee)
+	stillCurrent, err := beads.LiveWorkAssignmentAssigneeMatches(store, item.ID, item.Status, item.Assignee)
 	if err != nil {
 		return err
 	}
@@ -302,52 +302,6 @@ func releaseWorkAssignmentIfCurrent(store beads.Store, item beads.Bead) (release
 	return released, true, nil
 }
 
-// liveWorkAssignmentAssigneeMatches reports whether a WORK bead still carries the
-// (status, assignee) pair a caller's earlier snapshot recorded. It is the single
-// implementation of the pre-write staleness check for both the work path here and
-// the pool path in pool_session_name.go, because the subtleties below are easy to
-// get wrong once and impossible to keep in sync twice.
-//
-// It uses a LIVE list query, not Get, and that choice is load-bearing:
-// CachingStore.Get serves a clone straight from the in-memory cache for a bead
-// that is tracked and not dirty (internal/beads/caching_store_reads.go). A
-// cached read here would re-verify the caller's stale snapshot against an
-// equally stale cache and confirm it, which reproduces the exact clobber this
-// guard exists to prevent.
-//
-// expectedStatus must be the status the caller observed: if the bead has since
-// transitioned (a concurrent claim moved open→in_progress, or another release
-// moved in_progress→open) the snapshot's decision is no longer safe. A bead
-// absent from the live result no longer holds that status, so it is not current
-// and not an error.
-//
-// A read failure returns the error rather than a verdict. Writing on an
-// unverified snapshot can destroy a live worker's claim, and reporting the write
-// as done when the read failed would let a caller close a session bead whose work
-// is still assigned to it.
-func liveWorkAssignmentAssigneeMatches(store beads.Store, id, expectedStatus, expectedAssignee string) (bool, error) {
-	id = strings.TrimSpace(id)
-	expectedStatus = strings.TrimSpace(expectedStatus)
-	if store == nil || id == "" || expectedStatus == "" {
-		return false, nil
-	}
-	work, err := store.List(beads.ListQuery{
-		Status:   expectedStatus,
-		Live:     true,
-		TierMode: beads.TierBoth,
-	})
-	if err != nil {
-		return false, fmt.Errorf("live work-assignment verification of %q: %w", id, err)
-	}
-	for _, wb := range work {
-		if wb.ID != id {
-			continue
-		}
-		return strings.TrimSpace(wb.Assignee) == strings.TrimSpace(expectedAssignee), nil
-	}
-	return false, nil
-}
-
 // ReassignWorkBead re-homes one WORK bead onto a new session identity, emitting
 // the exact Update{Assignee:&new} the raw reassign op in
 // reassignWorkAssignedToRetiredSessionBead emitted. It deliberately touches
@@ -365,7 +319,7 @@ func (w workAssignment) ReassignWorkBead(item beads.Bead, newSessionID string) e
 	if store == nil {
 		return nil
 	}
-	stillCurrent, err := liveWorkAssignmentAssigneeMatches(store, item.ID, item.Status, item.Assignee)
+	stillCurrent, err := beads.LiveWorkAssignmentAssigneeMatches(store, item.ID, item.Status, item.Assignee)
 	if err != nil {
 		return err
 	}
