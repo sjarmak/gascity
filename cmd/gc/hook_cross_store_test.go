@@ -68,6 +68,30 @@ func TestAppendOneRigHookStoreSkipsUnknownInput(t *testing.T) {
 	}
 }
 
+func TestHookStoreRefFromEnvBuildsOnlyExactConfiguredLogicalRefs(t *testing.T) {
+	cfg := &config.City{
+		ResolvedWorkspaceName: "test-city",
+		Rigs:                  []config.Rig{{Name: "alpha"}},
+	}
+	for _, tt := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{name: "city", env: []string{"GC_STORE_SCOPE=city"}, want: "city:test-city"},
+		{name: "rig", env: []string{"GC_STORE_SCOPE=rig", "GC_RIG=alpha"}, want: "rig:alpha"},
+		{name: "unknown rig", env: []string{"GC_STORE_SCOPE=rig", "GC_RIG=beta"}},
+		{name: "padded scope", env: []string{"GC_STORE_SCOPE= rig", "GC_RIG=alpha"}},
+		{name: "padded rig", env: []string{"GC_STORE_SCOPE=rig", "GC_RIG=alpha "}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hookStoreRefFromEnv("/tmp/test-city", cfg, tt.env); got != tt.want {
+				t.Fatalf("hookStoreRefFromEnv = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBestStoreWithWorkReturnsTheOnlyStoreThatHasWork(t *testing.T) {
 	stores := []hookStore{{dir: "city"}, {dir: "riga"}, {dir: "rigb"}}
 	var calls []string

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -9,6 +10,21 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 )
+
+// ErrIncompleteCurrentClaimReceipt reports a claim receipt with only one of
+// its required bead-id/store-ref fields populated.
+var ErrIncompleteCurrentClaimReceipt = errors.New("incomplete current claim receipt")
+
+// ErrInvalidCurrentClaimReceipt reports non-canonical whitespace or another
+// malformed identity in a qualified current-claim receipt.
+var ErrInvalidCurrentClaimReceipt = errors.New("invalid current claim receipt")
+
+// CurrentClaimReceipt is the exact work bead and logical storage leg most
+// recently claimed by a session.
+type CurrentClaimReceipt struct {
+	BeadID   string
+	StoreRef string
+}
 
 // This file extends the session-class domain wrapper (Store) with the
 // WRITE half of the front door per OBJECT-MODEL-FRONT-DOOR-DESIGN sec 3.1. The
@@ -210,17 +226,27 @@ func (s *Store) RecordCurrentBead(id, beadID string) error {
 // The current value is compared first and an unchanged value writes nothing: the
 // claim path re-runs on every hook tick through its adoption branches, so an
 // unconditional write would emit one bead.updated per tick per in-progress bead.
-// It emits a single-key SetMetadata, not a batch, matching RecordCurrentBead.
+// This legacy id-only writer clears current_claim_store_ref in the same Update,
+// so it cannot leave a stale qualified authority attached to a new bead id.
+// CurrentClaimBeadID remains compatible; CurrentClaimReceipt fails closed on
+// the deliberately incomplete legacy shape.
 func (s *Store) SetCurrentClaim(id, beadID string) (bool, error) {
+	return s.setCurrentClaimReceipt(id, CurrentClaimReceipt{BeadID: strings.TrimSpace(beadID)})
+}
+
+func (s *Store) setCurrentClaimReceipt(id string, receipt CurrentClaimReceipt) (bool, error) {
 	b, err := s.validatedBead(id)
 	if err != nil {
 		return false, err
 	}
-	beadID = strings.TrimSpace(beadID)
-	if strings.TrimSpace(b.Metadata[beadmeta.CurrentClaimBeadIDMetadataKey]) == beadID {
+	if b.Metadata[beadmeta.CurrentClaimBeadIDMetadataKey] == receipt.BeadID &&
+		b.Metadata[beadmeta.CurrentClaimStoreRefMetadataKey] == receipt.StoreRef {
 		return false, nil
 	}
-	if err := s.setMetadataValue(b.ID, beadmeta.CurrentClaimBeadIDMetadataKey, beadID); err != nil {
+	if err := s.store.Update(b.ID, beads.UpdateOpts{Metadata: map[string]string{
+		beadmeta.CurrentClaimBeadIDMetadataKey:   receipt.BeadID,
+		beadmeta.CurrentClaimStoreRefMetadataKey: receipt.StoreRef,
+	}}); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -240,6 +266,37 @@ func (s *Store) CurrentClaimBeadID(id string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(b.Metadata[beadmeta.CurrentClaimBeadIDMetadataKey]), nil
+}
+
+// SetCurrentClaimReceipt persists the exact current claim and its logical
+// storage leg.
+func (s *Store) SetCurrentClaimReceipt(id string, receipt CurrentClaimReceipt) (bool, error) {
+	if strings.TrimSpace(receipt.BeadID) != receipt.BeadID || strings.TrimSpace(receipt.StoreRef) != receipt.StoreRef {
+		return false, ErrInvalidCurrentClaimReceipt
+	}
+	if (receipt.BeadID == "") != (receipt.StoreRef == "") {
+		return false, ErrIncompleteCurrentClaimReceipt
+	}
+	return s.setCurrentClaimReceipt(id, receipt)
+}
+
+// CurrentClaimReceipt returns the exact qualified current-claim receipt.
+func (s *Store) CurrentClaimReceipt(id string) (CurrentClaimReceipt, error) {
+	b, err := s.validatedBead(id)
+	if err != nil {
+		return CurrentClaimReceipt{}, err
+	}
+	receipt := CurrentClaimReceipt{
+		BeadID:   b.Metadata[beadmeta.CurrentClaimBeadIDMetadataKey],
+		StoreRef: b.Metadata[beadmeta.CurrentClaimStoreRefMetadataKey],
+	}
+	if strings.TrimSpace(receipt.BeadID) != receipt.BeadID || strings.TrimSpace(receipt.StoreRef) != receipt.StoreRef {
+		return CurrentClaimReceipt{}, ErrInvalidCurrentClaimReceipt
+	}
+	if (receipt.BeadID == "") != (receipt.StoreRef == "") {
+		return CurrentClaimReceipt{}, ErrIncompleteCurrentClaimReceipt
+	}
+	return receipt, nil
 }
 
 // CloseWithoutReason closes the session bead identified by id without stamping

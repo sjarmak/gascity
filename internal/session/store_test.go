@@ -352,12 +352,9 @@ func TestRecordCurrentBeadEmitsSingleKeySetMetadata(t *testing.T) {
 	}
 }
 
-// TestSetCurrentClaimEmitsSingleKeySetMetadata proves SetCurrentClaim stamps the
-// claimed work-bead id as a single-key SetMetadata of
-// beadmeta.CurrentClaimBeadIDMetadataKey — the same shape as RecordCurrentBead,
-// and deliberately a DIFFERENT key so the self-claim lane and the reconciler's
-// wake-time assignment lane cannot clobber each other.
-func TestSetCurrentClaimEmitsSingleKeySetMetadata(t *testing.T) {
+// TestSetCurrentClaimLegacyWriteClearsQualifiedRefInOneUpdate proves the legacy
+// id-only seam cannot retain qualified authority from an earlier receipt.
+func TestSetCurrentClaimLegacyWriteClearsQualifiedRefInOneUpdate(t *testing.T) {
 	b := sessionBeadFixture("s-1", "open", nil)
 	is, rec := recordingStore(t, b)
 
@@ -368,19 +365,16 @@ func TestSetCurrentClaimEmitsSingleKeySetMetadata(t *testing.T) {
 	if !wrote {
 		t.Fatal("SetCurrentClaim reported no write for a fresh stamp")
 	}
-	c := rec.CallsForOp("SetMetadata")
+	c := rec.CallsForOp("Update")
 	if len(c) != 1 {
-		t.Fatalf("SetMetadata calls = %d, want 1 (ops=%v)", len(c), opsOf(rec.Calls()))
+		t.Fatalf("Update calls = %d, want 1 (ops=%v)", len(c), opsOf(rec.Calls()))
 	}
-	if c[0].ID != "s-1" || c[0].Key != beadmeta.CurrentClaimBeadIDMetadataKey || c[0].Value != "gcg-42" {
-		t.Errorf("SetCurrentClaim call = (%q,%q,%q), want (s-1,%q,gcg-42)",
-			c[0].ID, c[0].Key, c[0].Value, beadmeta.CurrentClaimBeadIDMetadataKey)
+	want := map[string]string{
+		beadmeta.CurrentClaimBeadIDMetadataKey:   "gcg-42",
+		beadmeta.CurrentClaimStoreRefMetadataKey: "",
 	}
-	if c[0].Key == CurrentBeadIDKey {
-		t.Errorf("SetCurrentClaim wrote the reconciler's %q key", CurrentBeadIDKey)
-	}
-	if n := len(rec.CallsForOp("SetMetadataBatch")); n != 0 {
-		t.Errorf("SetCurrentClaim emitted %d batch writes, want a single-key write", n)
+	if c[0].ID != "s-1" || !reflect.DeepEqual(c[0].Opts.Metadata, want) {
+		t.Errorf("SetCurrentClaim update = (%q,%#v), want (s-1,%#v)", c[0].ID, c[0].Opts.Metadata, want)
 	}
 }
 
@@ -403,9 +397,8 @@ func TestSetCurrentClaimSkipsWhenUnchanged(t *testing.T) {
 	}
 }
 
-// TestSetCurrentClaimClearsWithEmptyValue proves the release side of the stamp:
-// clearing writes an empty value through the same single-key op, so a session
-// that no longer owns work stops naming a bead it cannot close.
+// TestSetCurrentClaimClearsWithEmptyValue proves the legacy release side clears
+// both receipt fields atomically.
 func TestSetCurrentClaimClearsWithEmptyValue(t *testing.T) {
 	b := sessionBeadFixture("s-1", "open", map[string]string{beadmeta.CurrentClaimBeadIDMetadataKey: "gcg-42"})
 	is, rec := recordingStore(t, b)
@@ -413,9 +406,13 @@ func TestSetCurrentClaimClearsWithEmptyValue(t *testing.T) {
 	if _, err := is.SetCurrentClaim("s-1", ""); err != nil {
 		t.Fatalf("SetCurrentClaim clear: %v", err)
 	}
-	c := rec.CallsForOp("SetMetadata")
-	if len(c) != 1 || c[0].Key != beadmeta.CurrentClaimBeadIDMetadataKey || c[0].Value != "" {
-		t.Fatalf("clear = %#v, want one SetMetadata(%s,\"\")", c, beadmeta.CurrentClaimBeadIDMetadataKey)
+	c := rec.CallsForOp("Update")
+	want := map[string]string{
+		beadmeta.CurrentClaimBeadIDMetadataKey:   "",
+		beadmeta.CurrentClaimStoreRefMetadataKey: "",
+	}
+	if len(c) != 1 || !reflect.DeepEqual(c[0].Opts.Metadata, want) {
+		t.Fatalf("clear = %#v, want one atomic Update(%#v)", c, want)
 	}
 	got, err := is.CurrentClaimBeadID("s-1")
 	if err != nil {
@@ -447,6 +444,132 @@ func TestCurrentClaimBeadIDReadsTheStampedValue(t *testing.T) {
 	}
 	if got != "" {
 		t.Errorf("CurrentClaimBeadID (unstamped) = %q, want empty", got)
+	}
+}
+
+// TestSetCurrentClaimReceiptCommitsTheQualifiedPairInOneUpdate protects the
+// receipt from a torn id/ref write: a same-id row in another store must never
+// become authorized because only half of the selected claim location landed.
+func TestSetCurrentClaimReceiptCommitsTheQualifiedPairInOneUpdate(t *testing.T) {
+	b := sessionBeadFixture("s-1", "open", nil)
+	is, rec := recordingStore(t, b)
+	receipt := CurrentClaimReceipt{BeadID: "gcg-42", StoreRef: "class:gmnos"}
+
+	wrote, err := is.SetCurrentClaimReceipt("s-1", receipt)
+	if err != nil {
+		t.Fatalf("SetCurrentClaimReceipt: %v", err)
+	}
+	if !wrote {
+		t.Fatal("SetCurrentClaimReceipt reported no write for a fresh receipt")
+	}
+	updates := rec.CallsForOp("Update")
+	if len(updates) != 1 {
+		t.Fatalf("Update calls = %d, want one atomic operation (ops=%v)", len(updates), opsOf(rec.Calls()))
+	}
+	want := map[string]string{
+		beadmeta.CurrentClaimBeadIDMetadataKey:   "gcg-42",
+		beadmeta.CurrentClaimStoreRefMetadataKey: "class:gmnos",
+	}
+	if updates[0].ID != "s-1" || !reflect.DeepEqual(updates[0].Opts.Metadata, want) {
+		t.Fatalf("receipt update = (%q, %#v), want (s-1, %#v)", updates[0].ID, updates[0].Opts.Metadata, want)
+	}
+	if len(rec.CallsForOp("SetMetadata")) != 0 || len(rec.CallsForOp("SetMetadataBatch")) != 0 {
+		t.Fatalf("receipt used decomposable metadata operations: %v", opsOf(rec.Calls()))
+	}
+
+	got, err := is.CurrentClaimReceipt("s-1")
+	if err != nil {
+		t.Fatalf("CurrentClaimReceipt: %v", err)
+	}
+	if got != receipt {
+		t.Fatalf("CurrentClaimReceipt = %#v, want %#v", got, receipt)
+	}
+}
+
+func TestCurrentClaimReceiptRejectsIncompleteLegacyStampWithoutBreakingIDRead(t *testing.T) {
+	is, _ := recordingStore(t, sessionBeadFixture("s-1", "open", map[string]string{
+		beadmeta.CurrentClaimBeadIDMetadataKey: "gcg-42",
+	}))
+
+	if _, err := is.CurrentClaimReceipt("s-1"); !errors.Is(err, ErrIncompleteCurrentClaimReceipt) {
+		t.Fatalf("CurrentClaimReceipt legacy stamp error = %v, want ErrIncompleteCurrentClaimReceipt", err)
+	}
+	got, err := is.CurrentClaimBeadID("s-1")
+	if err != nil || got != "gcg-42" {
+		t.Fatalf("CurrentClaimBeadID legacy stamp = (%q, %v), want (gcg-42, nil)", got, err)
+	}
+}
+
+func TestSetCurrentClaimReceiptClearsBothFieldsAtomically(t *testing.T) {
+	b := sessionBeadFixture("s-1", "open", map[string]string{
+		beadmeta.CurrentClaimBeadIDMetadataKey:   "gcg-42",
+		beadmeta.CurrentClaimStoreRefMetadataKey: "rig:alpha",
+	})
+	is, rec := recordingStore(t, b)
+
+	wrote, err := is.SetCurrentClaimReceipt("s-1", CurrentClaimReceipt{})
+	if err != nil || !wrote {
+		t.Fatalf("SetCurrentClaimReceipt clear = (wrote=%v, err=%v), want (true, nil)", wrote, err)
+	}
+	updates := rec.CallsForOp("Update")
+	want := map[string]string{
+		beadmeta.CurrentClaimBeadIDMetadataKey:   "",
+		beadmeta.CurrentClaimStoreRefMetadataKey: "",
+	}
+	if len(updates) != 1 || !reflect.DeepEqual(updates[0].Opts.Metadata, want) {
+		t.Fatalf("clear updates = %#v, want one atomic %#v", updates, want)
+	}
+}
+
+func TestLegacySetCurrentClaimCannotLeaveAStaleQualifiedRef(t *testing.T) {
+	b := sessionBeadFixture("s-1", "open", map[string]string{
+		beadmeta.CurrentClaimBeadIDMetadataKey:   "gcg-old",
+		beadmeta.CurrentClaimStoreRefMetadataKey: "class:gmnos",
+	})
+	is, rec := recordingStore(t, b)
+
+	if _, err := is.SetCurrentClaim("s-1", "gcg-new"); err != nil {
+		t.Fatalf("SetCurrentClaim legacy write: %v", err)
+	}
+	if _, err := is.CurrentClaimReceipt("s-1"); !errors.Is(err, ErrIncompleteCurrentClaimReceipt) {
+		t.Fatalf("qualified read after legacy write error = %v, want incomplete rather than stale class authorization", err)
+	}
+	updates := rec.CallsForOp("Update")
+	if len(updates) != 1 || updates[0].Opts.Metadata[beadmeta.CurrentClaimStoreRefMetadataKey] != "" {
+		t.Fatalf("legacy write ops = %#v, want one Update clearing stale store ref", rec.Calls())
+	}
+}
+
+func TestSetCurrentClaimReceiptRejectsNonCanonicalWhitespaceWithoutWriting(t *testing.T) {
+	for _, receipt := range []CurrentClaimReceipt{
+		{BeadID: " gcg-42", StoreRef: "rig:alpha"},
+		{BeadID: "gcg-42", StoreRef: "rig:alpha "},
+	} {
+		is, rec := recordingStore(t, sessionBeadFixture("s-1", "open", nil))
+		if _, err := is.SetCurrentClaimReceipt("s-1", receipt); !errors.Is(err, ErrInvalidCurrentClaimReceipt) {
+			t.Fatalf("SetCurrentClaimReceipt(%#v) error = %v, want ErrInvalidCurrentClaimReceipt", receipt, err)
+		}
+		if len(rec.Calls()) != 0 {
+			t.Fatalf("SetCurrentClaimReceipt(%#v) wrote before rejecting: %#v", receipt, rec.Calls())
+		}
+	}
+}
+
+func TestCurrentClaimReceiptRejectsNonCanonicalStoredAuthority(t *testing.T) {
+	for _, metadata := range []map[string]string{
+		{
+			beadmeta.CurrentClaimBeadIDMetadataKey:   " gcg-42",
+			beadmeta.CurrentClaimStoreRefMetadataKey: "rig:alpha",
+		},
+		{
+			beadmeta.CurrentClaimBeadIDMetadataKey:   "gcg-42",
+			beadmeta.CurrentClaimStoreRefMetadataKey: "rig:alpha ",
+		},
+	} {
+		is, _ := recordingStore(t, sessionBeadFixture("s-1", "open", metadata))
+		if _, err := is.CurrentClaimReceipt("s-1"); !errors.Is(err, ErrInvalidCurrentClaimReceipt) {
+			t.Fatalf("CurrentClaimReceipt(%#v) error = %v, want ErrInvalidCurrentClaimReceipt", metadata, err)
+		}
 	}
 }
 

@@ -12,8 +12,9 @@ import (
 // hookStore is one store the hook work_query runs against: a working dir and
 // the rig/city-scoped subprocess env that points bd at that store.
 type hookStore struct {
-	dir string
-	env []string
+	dir      string
+	env      []string
+	storeRef string
 	// command overrides the shared work query for this store, and is empty on
 	// every store production builds: one command is run against each leg in
 	// turn. It was set by scopeFederatedHookStores when that pinned the
@@ -105,7 +106,7 @@ type hookStoreRunner func(command, dir string, env []string) (string, error)
 // (conformanceClaimRouting); closing the gap makes the claim stop being a bd
 // subprocess call, and I15 pins the see-but-cannot-claim asymmetry until it does.
 func hookWorkQueryStores(cityPath string, cfg *config.City, a *config.Agent, agentForQuery, workDir string, queryEnv []string, identityOverrides map[string]string) []hookStore {
-	stores := []hookStore{{dir: workDir, env: queryEnv}}
+	stores := []hookStore{{dir: workDir, env: queryEnv, storeRef: hookStoreRefFromEnv(cityPath, cfg, queryEnv)}}
 	if agentIsCrossStoreEligible(a) {
 		return appendRigHookStores(stores, cityPath, cfg, a, identityOverrides)
 	}
@@ -183,8 +184,9 @@ func appendOneRigHookStore(stores []hookStore, cityPath string, cfg *config.City
 		}
 	}
 	return append(stores, hookStore{
-		dir: agentCommandDir(cityPath, &view, cfg.Rigs),
-		env: mergeRuntimeEnv(os.Environ(), rigEnv),
+		dir:      agentCommandDir(cityPath, &view, cfg.Rigs),
+		env:      mergeRuntimeEnv(os.Environ(), rigEnv),
+		storeRef: "rig:" + rigName,
 	})
 }
 
@@ -217,9 +219,38 @@ func appendCityHookStore(stores []hookStore, cityPath string, cfg *config.City, 
 		}
 	}
 	return append(stores, hookStore{
-		dir: cityPath,
-		env: mergeRuntimeEnv(os.Environ(), cityEnv),
+		dir:      cityPath,
+		env:      mergeRuntimeEnv(os.Environ(), cityEnv),
+		storeRef: "city:" + loadedCityName(cfg, cityPath),
 	})
+}
+
+func hookStoreRefFromEnv(cityPath string, cfg *config.City, env []string) string {
+	switch hookStoreRawEnvValue(env, "GC_STORE_SCOPE") {
+	case "city":
+		return "city:" + loadedCityName(cfg, cityPath)
+	case "rig":
+		rigName := hookStoreRawEnvValue(env, "GC_RIG")
+		if cfg == nil || rigName == "" {
+			return ""
+		}
+		for i := range cfg.Rigs {
+			if cfg.Rigs[i].Name == rigName {
+				return "rig:" + rigName
+			}
+		}
+	}
+	return ""
+}
+
+func hookStoreRawEnvValue(env []string, key string) string {
+	value := ""
+	for _, entry := range env {
+		if name, candidate, ok := strings.Cut(entry, "="); ok && name == key {
+			value = candidate
+		}
+	}
+	return value
 }
 
 // rigScopedHookRig returns the rig whose store a rig-scoped agent must ALSO
