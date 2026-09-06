@@ -35,7 +35,7 @@ var supported = []string{"claude", "codex", "gemini", "antigravity", "kiro", "op
 const (
 	managedPiHookVersion       = 9
 	managedOpenCodeHookVersion = 6
-	managedMimoCodeHookVersion = 2
+	managedMimoCodeHookVersion = 3
 	managedOmpHookVersion      = 2
 )
 
@@ -388,7 +388,9 @@ func mimocodeHookNeedsUpgrade(existing []byte) bool {
 	if !strings.Contains(content, "Gas City hooks for MiMo Code.") {
 		return false
 	}
-	return mimocodeHookVersion(content) < managedMimoCodeHookVersion
+	return mimocodeHookVersion(content) < managedMimoCodeHookVersion ||
+		// The child's stdin must be closed or gc blocks on it (#5562).
+		!strings.Contains(content, "pending.child.stdin?.end();")
 }
 
 func mimocodeHookVersion(content string) int {
