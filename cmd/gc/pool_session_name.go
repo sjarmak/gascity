@@ -814,8 +814,9 @@ func directSessionBeadIDCandidates(assignee string) []string {
 // graph.v2 step beads stuck on a dead session's long-form assignee are
 // status=open, not in_progress.
 //
-// The check itself lives in liveWorkAssignmentAssigneeMatches (work_assignment.go),
-// shared with the work-release and reassign paths.
+// The check itself lives in beads.LiveWorkAssignmentAssigneeMatches, shared
+// across the work-release and reassign paths in this package and in
+// internal/api.
 func liveWorkAssignmentStillReleasable(store beads.Store, id, expectedStatus, assignee string) bool {
 	matches, err := beads.LiveWorkAssignmentAssigneeMatches(store, id, expectedStatus, assignee)
 	if err != nil {
