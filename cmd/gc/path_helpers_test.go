@@ -242,6 +242,13 @@ func (g *doltLeakGuardedTestingM) runWith(
 		} else if len(leaked) > 0 {
 			fmt.Fprintf(os.Stderr, "cmd/gc test dolt leak guard: leaked %d dolt sql-server process(es) under %s\n", len(leaked), strings.Join(g.nonEmptyLeakRoots(), ", ")) //nolint:errcheck
 			writeDoltLeakReport(os.Stderr, leaked)
+			// reapLeaks below kills every PID just printed, so it will already be
+			// dead by the time anyone inspects it — that is expected, not evidence
+			// the guard raced teardown. The leak was real; fix the leaking test, not
+			// this guard. (If checking by hand with `pgrep -af "dolt sql-server" |
+			// grep <worktree>`, filter on /proc/<pid>/cmdline instead: pgrep -af
+			// matches its own invoked command line too and over-reports.)
+			fmt.Fprintln(os.Stderr, "cmd/gc test dolt leak guard: reaping the process(es) above now; a dead PID if you inspect it afterward is expected and is NOT evidence the guard raced teardown — the leak was real, fix the leaking test") //nolint:errcheck
 			reapLeaks(leaked)
 			guardFailed = true
 		}
