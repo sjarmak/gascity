@@ -11072,6 +11072,15 @@ func newRecordServiceFixture(t *testing.T, eventID string) (gchome.ProductUsageH
 	deps := defaultTestServiceDependencies(home, 2)
 	deps.newUUID = uuidSequence(t, eventID)
 	deps.now = func() time.Time { return testRecordHour }
+	// The decision window's expiry is governed entirely by deps.now above, not
+	// by real elapsed time. Give the state-lock acquisition a context that
+	// never expires on its own so a loaded test host cannot race a real
+	// wall-clock deadline against the fixture's fake-clock scenario; the
+	// injected canStart/decisionGate checks already enforce expiry
+	// deterministically at every subsequent step.
+	deps.newRecordLockContext = func(ctx context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+		return context.WithCancel(ctx)
+	}
 	service := mustOpenTestService(t, deps)
 	permit := service.RecordingPermit(recordableInvocationAt(testRecordHour))
 	if !permit.Valid() {
