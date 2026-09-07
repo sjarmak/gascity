@@ -42,9 +42,9 @@ func defaultPricingRegistry() *pricing.Registry {
 // prompt-operation (message/nudge) finish: prompt submission returns at
 // keystroke-delivery time, so the transcript tail at that point holds
 // previously COMPLETED invocations — the turn this operation triggers is
-// recorded by the next prompt operation on the session. Entries beyond the
-// extractor's scan window (a 64KB tail for claude and codex) or after the
-// final prompt op of a session go unrecorded.
+// recorded by the next prompt operation on the session. The terminal sweep
+// recovers complete Codex rollouts; Claude entries beyond the 64KB live tail
+// and entries not attributable to a discovered transcript remain unrecorded.
 //
 // Coverage is per transcript provider family, driven by the
 // invocationUsageSpecs registry, with per-family discovery bounds:
@@ -403,12 +403,12 @@ func usagesAfterCursor(usages []sessionlog.TailUsage, cursor string) []sessionlo
 	return usages[len(usages)-1:]
 }
 
-// usagesSinceCursor is the end-of-interval sweep's fold: it returns every window
-// entry strictly after the cursor identity. Unlike usagesAfterCursor (the
-// prompt-op seam's conservative newest-only fallback), when the cursor is empty
-// it returns ALL window entries — the sweep's whole job is to recover the
-// interval's trailing invocations that the prompt-op seam never recorded,
-// bounded only by the extractor's tail window. When the cursor is present but
+// usagesSinceCursor is the bounded-family end-of-interval fold: it returns
+// every window entry strictly after the cursor identity. Unlike
+// usagesAfterCursor (the prompt-op seam's conservative newest-only fallback),
+// when the cursor is empty it returns ALL window entries — the sweep's whole
+// job is to recover the interval's trailing invocations that the prompt-op seam
+// never recorded. Codex uses ExtractCodexUsageSince instead. When the cursor is present but
 // has scrolled out of the window it also returns all window entries: read-time
 // IdempotencyKey dedup (usage.ReadFacts) collapses any overlap with
 // already-recorded facts, so recovering the whole bounded tail cannot
@@ -458,12 +458,12 @@ func usagesSinceCursor(usages []sessionlog.TailUsage, cursor string) []sessionlo
 // skipping it. Every gate is slog.Debug'd so a fleet-wide zero is attributable in
 // the field instead of silently swallowed.
 //
-// Coverage ceiling (known, intentional — do NOT widen): discovery and extraction
-// read only the extractor's bounded transcript tail (a 64KB window per family),
-// so a very long autonomous interval recovers only its final few invocations —
-// earlier model/cost facts of that interval are lost. Widening the tail re-opens
-// the unbounded-scan and misattribution risks that bound exists to prevent;
-// fuller recovery is a separate, deliberate change.
+// Coverage ceiling (known, intentional): discovery remains bounded so usage is
+// never attributed to an ambiguous transcript. Once a Codex rollout is
+// correlated, its terminal sweep streams the complete file and must agree with
+// Codex's final cumulative thread total with zero-token tolerance. Claude still
+// reads only its bounded 64KB transcript tail, so a very long autonomous
+// interval can lose earlier Claude model/cost facts.
 //
 // Overlap with the prompt-op seam is safe: both stamp usage.ModelIdempotencyKey,
 // which usage.ReadFacts collapses, so an invocation recorded by both beats folds
@@ -601,15 +601,27 @@ func (f *Factory) SweepSessionModelUsageAtPath(ctx context.Context, id string, m
 // the discovery-driven and already-resolved entry points.
 func (f *Factory) sweepResolvedTranscript(ctx context.Context, family, id string, meta map[string]string, path string, now time.Time) (emitted int, settled bool, err error) {
 	sink := f.usageSink
-	usages, extractErr := f.Adapter().InvocationUsage(family, path)
+	cursor := strings.TrimSpace(meta[sessionpkg.MetadataKeyInvocationUsageCursor])
+	var usages []sessionlog.TailUsage
+	var extractErr error
+	if family == "codex" {
+		// Terminal Codex sweeps stream the complete rollout after the persisted
+		// cumulative-total cursor. The live prompt seam stays tail-bounded, while
+		// this closing pass recovers every invocation that scrolled beyond 64 KiB.
+		usages, extractErr = f.Adapter().CodexUsageSince(path, cursor)
+	} else {
+		usages, extractErr = f.Adapter().InvocationUsage(family, path)
+	}
 	if extractErr != nil {
 		// Transient: a torn mid-write tail can fail the parse; retry on a later tick.
 		slog.Debug("model-usage sweep: usage extraction failed; will retry",
 			slog.String("session_id", id), slog.String("provider", family), slog.Any("error", extractErr))
 		return 0, false, nil
 	}
-	cursor := strings.TrimSpace(meta[sessionpkg.MetadataKeyInvocationUsageCursor])
-	pending := usagesSinceCursor(usages, cursor)
+	pending := usages
+	if family != "codex" {
+		pending = usagesSinceCursor(usages, cursor)
+	}
 	if len(pending) == 0 {
 		// Swept: the transcript was read and the cursor is already current.
 		return 0, true, nil

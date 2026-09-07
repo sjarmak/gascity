@@ -123,6 +123,13 @@ func (a SessionLogAdapter) CodexTailUsage(path string) ([]sessionlog.TailUsage, 
 	return sessionlog.ExtractCodexTailUsageFromSearchPaths(a.SearchPaths, path)
 }
 
+// CodexUsageSince reads the complete recoverable Codex invocation stream after
+// cursor. Unlike CodexTailUsage, this is intended for the terminal sweep, where
+// completeness outranks the bounded live-tail latency.
+func (a SessionLogAdapter) CodexUsageSince(path, cursor string) ([]sessionlog.TailUsage, error) {
+	return sessionlog.ExtractCodexUsageSinceFromSearchPaths(a.SearchPaths, path, cursor)
+}
+
 // InvocationUsage reads per-invocation token usage from a discovered
 // transcript using the SAME extractor the prompt-op telemetry gate uses for
 // the provider's invocation-usage family (invocationUsageSpecs). It returns

@@ -28,6 +28,18 @@ func codexTokenCountLine(ts string, total, lastInput, lastCached, lastOutput, la
 		lastInput, lastCached, lastOutput, lastReasoning, lastInput+lastOutput)
 }
 
+// codexTokenUsageRecordLine builds the newer top-level token_usage_record
+// shape. Codex emits these alongside legacy event_msg token_count snapshots,
+// but they can also contain response totals that never appear in the legacy
+// stream.
+func codexTokenUsageRecordLine(ts string, threadTotal, input, cached, cacheWrite, output, reasoning int) string {
+	return fmt.Sprintf(`{"timestamp":%q,"type":"token_usage_record","payload":{"response_id":"resp-%d","usage":{"input_tokens":%d,"cached_input_tokens":%d,"cache_write_input_tokens":%d,"output_tokens":%d,"reasoning_output_tokens":%d,"total_tokens":%d},"turn_token_usage":{"input_tokens":%d,"cached_input_tokens":%d,"cache_write_input_tokens":%d,"output_tokens":%d,"reasoning_output_tokens":%d,"total_tokens":%d},"thread_token_usage":{"input_tokens":%d,"cached_input_tokens":%d,"cache_write_input_tokens":%d,"output_tokens":%d,"reasoning_output_tokens":%d,"total_tokens":%d}}}`,
+		ts, threadTotal,
+		input, cached, cacheWrite, output, reasoning, input+output,
+		input, cached, cacheWrite, output, reasoning, input+output,
+		threadTotal-output, cached, cacheWrite, output, reasoning, threadTotal)
+}
+
 func codexTurnContextLine(ts, model string) string {
 	return fmt.Sprintf(`{"timestamp":%q,"type":"turn_context","payload":{"turn_id":"019d9845-45f6-70d2-86e8-53d8a44a830f","cwd":"/work/dir","current_date":"2026-04-16","timezone":"Etc/UTC","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"},"model":%q,"personality":"pragmatic"}}`, ts, model)
 }
@@ -119,6 +131,72 @@ func TestExtractCodexTailUsage(t *testing.T) {
 	}
 }
 
+func TestExtractCodexTailUsageTokenUsageRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout-token-usage-record.jsonl")
+	writeCodexUsageLines(t, path, []string{
+		codexTurnContextLine("2026-09-07T01:00:00.000Z", "gpt-5.5"),
+		codexTokenUsageRecordLine("2026-09-07T01:00:01.000Z", 34_114, 17_888, 15_232, 64, 309, 28),
+	})
+
+	usages, err := ExtractCodexTailUsage(path)
+	if err != nil {
+		t.Fatalf("ExtractCodexTailUsage: %v", err)
+	}
+	if len(usages) != 1 {
+		t.Fatalf("got %d usages, want 1: %+v", len(usages), usages)
+	}
+	got := usages[0]
+	if got.MessageID != "total:34114" {
+		t.Errorf("MessageID = %q, want total:34114", got.MessageID)
+	}
+	if got.EntryUUID != "2026-09-07T01:00:01.000Z" {
+		t.Errorf("EntryUUID = %q, want record timestamp", got.EntryUUID)
+	}
+	if got.Model != "gpt-5.5" {
+		t.Errorf("Model = %q, want gpt-5.5", got.Model)
+	}
+	if got.InputTokens != 17_888-15_232 {
+		t.Errorf("InputTokens = %d, want %d", got.InputTokens, 17_888-15_232)
+	}
+	if got.CacheReadTokens != 15_232 {
+		t.Errorf("CacheReadTokens = %d, want 15232", got.CacheReadTokens)
+	}
+	if got.CacheCreationTokens != 64 {
+		t.Errorf("CacheCreationTokens = %d, want 64", got.CacheCreationTokens)
+	}
+	if got.OutputTokens != 309 || got.ReasoningTokens != 28 {
+		t.Errorf("output/reasoning = %d/%d, want 309/28", got.OutputTokens, got.ReasoningTokens)
+	}
+}
+
+func TestExtractCodexTailUsageDeduplicatesLegacyAndTokenUsageRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout-mixed-token-usage.jsonl")
+	writeCodexUsageLines(t, path, []string{
+		codexTurnContextLine("2026-09-07T01:00:00.000Z", "gpt-5.5"),
+		codexTokenCountLine("2026-09-07T01:00:01.000Z", 34_114, 17_888, 15_232, 309, 28),
+		// The newer record for the same cumulative total replaces the legacy
+		// snapshot, preserving one billable invocation and exposing cache writes.
+		codexTokenUsageRecordLine("2026-09-07T01:00:01.500Z", 34_114, 17_888, 15_232, 64, 309, 28),
+		// A newer-only response must not be lost merely because no matching
+		// event_msg token_count line exists.
+		codexTokenUsageRecordLine("2026-09-07T01:00:02.000Z", 40_000, 5_000, 4_000, 32, 886, 80),
+	})
+
+	usages, err := ExtractCodexTailUsage(path)
+	if err != nil {
+		t.Fatalf("ExtractCodexTailUsage: %v", err)
+	}
+	if len(usages) != 2 {
+		t.Fatalf("got %d usages, want 2: %+v", len(usages), usages)
+	}
+	if got := usages[0]; got.MessageID != "total:34114" || got.EntryUUID != "2026-09-07T01:00:01.500Z" || got.CacheCreationTokens != 64 {
+		t.Errorf("deduplicated first usage = %+v, want newer record for total:34114", got)
+	}
+	if got := usages[1]; got.MessageID != "total:40000" || got.CacheCreationTokens != 32 {
+		t.Errorf("newer-only second usage = %+v, want total:40000 with cache creation", got)
+	}
+}
+
 // TestExtractCodexTailUsageDuplicateKeepsFirstModel pins the real codex
 // emission order around a model switch: the CLI re-emits the prior turn's
 // final cumulative snapshot AFTER the new turn's turn_context, so the
@@ -201,6 +279,103 @@ func TestExtractCodexTailUsageModelMissing(t *testing.T) {
 	}
 	if usages[0].InputTokens != 15562-10624 {
 		t.Errorf("InputTokens = %d, want %d", usages[0].InputTokens, 15562-10624)
+	}
+}
+
+func TestExtractCodexTailUsageFindsModelBeforeTailWindow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout-model-before-tail.jsonl")
+	lines := []string{
+		codexTurnContextLine("2026-09-07T01:00:00.000Z", "gpt-5.5"),
+		fmt.Sprintf(`{"timestamp":"2026-09-07T01:00:00.500Z","type":"ignored","payload":{"padding":%q}}`, strings.Repeat("x", int(tailChunkSize))),
+		codexTokenUsageRecordLine("2026-09-07T01:00:01.000Z", 34_114, 17_888, 15_232, 64, 309, 28),
+	}
+	writeCodexUsageLines(t, path, lines)
+
+	usages, err := ExtractCodexTailUsage(path)
+	if err != nil {
+		t.Fatalf("ExtractCodexTailUsage: %v", err)
+	}
+	if len(usages) != 1 {
+		t.Fatalf("got %d usages, want 1: %+v", len(usages), usages)
+	}
+	if got := usages[0].Model; got != "gpt-5.5" {
+		t.Errorf("Model = %q, want gpt-5.5 from the latest turn_context before the tail window", got)
+	}
+}
+
+func TestExtractCodexTailUsageFindsModelOnTailBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout-model-crosses-tail-boundary.jsonl")
+	contextLine := codexTurnContextLine("2026-09-07T01:00:00.000Z", "gpt-5.5")
+	usageLine := codexTokenUsageRecordLine("2026-09-07T01:00:01.000Z", 34_114, 17_888, 15_232, 64, 309, 28)
+	const boundaryInsideContext = 96
+	const fillerPrefix = `{"timestamp":"2026-09-07T01:00:00.500Z","type":"ignored","payload":{"padding":"`
+	const fillerSuffix = `"}}` + "\n"
+	fillerBytes := int(tailChunkSize) + boundaryInsideContext - len(contextLine) - 1 - len(usageLine) - 1 - len(fillerPrefix) - len(fillerSuffix)
+	if fillerBytes < 0 {
+		t.Fatalf("invalid boundary fixture: fillerBytes=%d", fillerBytes)
+	}
+	data := contextLine + "\n" + fillerPrefix + strings.Repeat("x", fillerBytes) + fillerSuffix + usageLine + "\n"
+	if got, want := len(data)-int(tailChunkSize), boundaryInsideContext; got != want {
+		t.Fatalf("tail starts at byte %d, want %d inside turn_context", got, want)
+	}
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	usages, err := ExtractCodexTailUsage(path)
+	if err != nil {
+		t.Fatalf("ExtractCodexTailUsage: %v", err)
+	}
+	if len(usages) != 1 {
+		t.Fatalf("got %d usages, want 1: %+v", len(usages), usages)
+	}
+	if got := usages[0].Model; got != "gpt-5.5" {
+		t.Errorf("Model = %q, want gpt-5.5 from turn_context crossing the tail boundary", got)
+	}
+}
+
+func TestExtractCodexUsageSinceCoversTurnsBeyondTailWindow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout-multi-turn.jsonl")
+	writeCodexUsageLines(t, path, []string{
+		codexTurnContextLine("2026-09-07T01:00:00.000Z", "gpt-5.5"),
+		codexTokenUsageRecordLine("2026-09-07T01:00:01.000Z", 110, 100, 20, 0, 10, 2),
+		fmt.Sprintf(`{"timestamp":"2026-09-07T01:00:01.500Z","type":"ignored","payload":{"padding":%q}}`, strings.Repeat("x", int(tailChunkSize))),
+		codexTokenUsageRecordLine("2026-09-07T01:00:02.000Z", 330, 200, 40, 0, 20, 4),
+		fmt.Sprintf(`{"timestamp":"2026-09-07T01:00:02.500Z","type":"ignored","payload":{"padding":%q}}`, strings.Repeat("y", int(tailChunkSize))),
+		codexTokenUsageRecordLine("2026-09-07T01:00:03.000Z", 660, 300, 60, 0, 30, 6),
+	})
+
+	all, err := ExtractCodexUsageSince(path, "")
+	if err != nil {
+		t.Fatalf("ExtractCodexUsageSince(all): %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("all usages = %d, want 3: %+v", len(all), all)
+	}
+	total := 0
+	for _, usage := range all {
+		total += usage.InputTokens + usage.CacheReadTokens + usage.OutputTokens
+		if usage.Model != "gpt-5.5" {
+			t.Errorf("usage %q Model = %q, want gpt-5.5", usage.MessageID, usage.Model)
+		}
+	}
+	if total != 660 {
+		t.Errorf("summed response tokens = %d, want final thread total 660", total)
+	}
+
+	pending, err := ExtractCodexUsageSince(path, "total:110")
+	if err != nil {
+		t.Fatalf("ExtractCodexUsageSince(cursor): %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("pending usages = %d, want 2: %+v", len(pending), pending)
+	}
+	pendingTotal := 0
+	for _, usage := range pending {
+		pendingTotal += usage.InputTokens + usage.CacheReadTokens + usage.OutputTokens
+	}
+	if pendingTotal != 550 {
+		t.Errorf("pending response tokens = %d, want 550", pendingTotal)
 	}
 }
 

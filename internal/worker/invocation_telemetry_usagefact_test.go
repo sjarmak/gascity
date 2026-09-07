@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -440,6 +441,66 @@ func TestFactorySweepSessionModelUsageClaude(t *testing.T) {
 	}
 	if len(facts2) != 2 {
 		t.Fatalf("second sweep changed fact count to %d, want 2", len(facts2))
+	}
+}
+
+func TestFactorySweepSessionModelUsageCodexCoversCompleteRollout(t *testing.T) {
+	searchBase := t.TempDir()
+	sinkPath := filepath.Join(t.TempDir(), "usage.jsonl")
+	factory, err := NewFactory(FactoryConfig{
+		Store:       beads.NewMemStore(),
+		Provider:    runtime.NewFake(),
+		SearchPaths: []string{searchBase},
+		UsageSink:   usage.NewLocalSink(sinkPath),
+	})
+	if err != nil {
+		t.Fatalf("NewFactory: %v", err)
+	}
+	rollout := filepath.Join(searchBase, "rollout-complete-codex.jsonl")
+	writeWorkerTestJSONL(t, rollout, []map[string]any{
+		codexWorkerTurnContext(),
+		codexWorkerTokenCount("2026-09-07T01:00:01.000Z", 110, 100, 20, 10),
+		{"timestamp": "2026-09-07T01:00:01.500Z", "type": "ignored", "payload": map[string]any{"padding": strings.Repeat("x", 64*1024)}},
+		codexWorkerTokenCount("2026-09-07T01:00:02.000Z", 330, 200, 40, 20),
+		{"timestamp": "2026-09-07T01:00:02.500Z", "type": "ignored", "payload": map[string]any{"padding": strings.Repeat("y", 64*1024)}},
+		codexWorkerTokenCount("2026-09-07T01:00:03.000Z", 660, 300, 60, 30),
+	})
+	meta := map[string]string{
+		"provider":     "codex",
+		"session_name": "codex-worker-1",
+		"molecule_id":  "run-complete",
+	}
+
+	emitted, settled, err := factory.SweepSessionModelUsageAtPath(
+		context.Background(), "gc-codex-complete", meta, rollout, time.Unix(1, 0).UTC())
+	if err != nil {
+		t.Fatalf("SweepSessionModelUsageAtPath: %v", err)
+	}
+	if !settled {
+		t.Fatal("complete codex rollout sweep must settle")
+	}
+	if emitted != 3 {
+		t.Fatalf("emitted = %d, want all 3 invocations beyond the tail window", emitted)
+	}
+	facts, warnings, err := usage.ReadFacts(sinkPath)
+	if err != nil {
+		t.Fatalf("ReadFacts: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("warnings: %v", warnings)
+	}
+	if len(facts) != 3 {
+		t.Fatalf("facts = %d, want 3: %+v", len(facts), facts)
+	}
+	total := 0
+	for _, fact := range facts {
+		total += fact.InputTokens + fact.CacheReadTokens + fact.OutputTokens
+		if fact.Model == "" {
+			t.Fatalf("fact has empty model despite preceding turn_context: %+v", fact)
+		}
+	}
+	if total != 660 {
+		t.Fatalf("summed ledger tokens = %d, want rollout cumulative total 660", total)
 	}
 }
 
