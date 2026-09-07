@@ -1372,7 +1372,93 @@ func TestUninstallSupervisorSystemdUnderDelegationStopsOwnUnitViaSocket(t *testi
 // build, so the check must FAIL: declaring "ready" here would leave every
 // subsequent `gc start` in a detect → no-op → "ready" treadmill against a
 // supervisor the unit does not manage.
+// TestPollDelegatedRestartVerified_NeverReplacedReportsNotReplaced covers
+// pollDelegatedRestartVerified's "was not replaced" branch — the same
+// control-flow TestRunStartDriftCheck_DelegatedRestartUsesTryRestart pinned
+// end-to-end via a real systemctl shim and a shrunk driftReadyTimeout — by
+// calling the poll directly with a scripted status sequence instead. There
+// is no subprocess exec and no production timeout global to shrink:
+// supervisorReadyPollInterval is shrunk so the still-real (but
+// millisecond-scale) poll loop finishes fast regardless of host scheduling,
+// and readyTimeout is passed as an explicit small argument.
+func TestPollDelegatedRestartVerified_NeverReplacedReportsNotReplaced(t *testing.T) {
+	oldPoll := supervisorReadyPollInterval
+	supervisorReadyPollInterval = time.Millisecond
+	t.Cleanup(func() { supervisorReadyPollInterval = oldPoll })
+
+	const oldBuildID = "old-build-id"
+	const localBuildID = "new-build-id"
+	oldPID := os.Getpid()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"status":"ok","version":"v0","build_id":%q,"uptime_sec":1,"cities_total":0,"cities_running":0}`, oldBuildID)
+	}))
+	t.Cleanup(srv.Close)
+
+	oldAlive := supervisorAliveHook
+	t.Cleanup(func() { supervisorAliveHook = oldAlive })
+	supervisorAliveHook = func() int { return oldPID }
+
+	d := systemdDelegation{Unit: "gascity-prod.service", Scope: "system"}
+	msg := pollDelegatedRestartVerified(srv.URL, oldPID, oldBuildID, localBuildID, d, 20*time.Millisecond)
+	for _, want := range []string{"was not replaced", "gascity-prod.service", oldBuildID} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message = %q, want to contain %q", msg, want)
+		}
+	}
+}
+
+// TestPollDelegatedRestartVerified_RetriesPastEarlyOldBuildProbesToLateReplacement
+// covers pollDelegatedRestartVerified's late-replacement success branch —
+// the same control-flow
+// TestRunStartDriftCheck_DelegatedTryRestartTimeoutThenReplacementSucceeds
+// pinned end-to-end via a real `exec sleep 5` systemctl shim and an elapsed
+// wall-time assertion — by calling the poll directly with a scripted status
+// sequence: the fake status handler keeps reporting the old build for
+// oldBuildProbesBeforeReplace probes, then flips to the new build. A
+// verify-once implementation would sample an early old-build probe and
+// misreport "was not replaced"; the poll must retry past them.
+// supervisorReadyPollInterval is shrunk so the retries resolve in
+// milliseconds, not by racing a wall-clock deadline against a real
+// subprocess.
+func TestPollDelegatedRestartVerified_RetriesPastEarlyOldBuildProbesToLateReplacement(t *testing.T) {
+	oldPoll := supervisorReadyPollInterval
+	supervisorReadyPollInterval = time.Millisecond
+	t.Cleanup(func() { supervisorReadyPollInterval = oldPoll })
+
+	const oldBuildID = "old-build-id"
+	const localBuildID = "new-build-id"
+	oldPID := os.Getpid()
+
+	const oldBuildProbesBeforeReplace = 3
+	var probes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		build := oldBuildID
+		if probes.Add(1) > oldBuildProbesBeforeReplace {
+			build = localBuildID
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"status":"ok","version":"v0","build_id":%q,"uptime_sec":1,"cities_total":0,"cities_running":0}`, build)
+	}))
+	t.Cleanup(srv.Close)
+
+	oldAlive := supervisorAliveHook
+	t.Cleanup(func() { supervisorAliveHook = oldAlive })
+	supervisorAliveHook = func() int { return oldPID }
+
+	d := systemdDelegation{Unit: "gascity-prod.service", Scope: "system"}
+	msg := pollDelegatedRestartVerified(srv.URL, oldPID, oldBuildID, localBuildID, d, time.Second)
+	if msg != "" {
+		t.Fatalf("message = %q, want empty (replacement observed)", msg)
+	}
+	if probes.Load() <= oldBuildProbesBeforeReplace {
+		t.Fatalf("probes = %d, want > %d (the poll must retry past the early old-build probes)", probes.Load(), oldBuildProbesBeforeReplace)
+	}
+}
+
 func TestRunStartDriftCheck_DelegatedRestartUsesTryRestart(t *testing.T) {
+	skipSlowCmdGCTest(t, "process/socket-backed: waits out a real driftReadyTimeout poll loop against a real systemctl shim; see TestPollDelegatedRestartVerified_NeverReplacedReportsNotReplaced for the fast-lane equivalent")
 	cityPath, setCommit := driftCheckEnv(t, "old-build-id")
 	setCommit("new-build-id")
 
@@ -1721,6 +1807,7 @@ func TestRunStartDriftCheck_DelegatedTryRestartBoundsSystemctl(t *testing.T) {
 // while the poll retries past them, observes the replacement, and reports
 // ready.
 func TestRunStartDriftCheck_DelegatedTryRestartTimeoutThenReplacementSucceeds(t *testing.T) {
+	skipSlowCmdGCTest(t, "process/socket-backed: bounds a real `exec sleep 5` systemctl shim and asserts an aggregate wall-time ceiling; see TestPollDelegatedRestartVerified_RetriesPastEarlyOldBuildProbesToLateReplacement for the fast-lane equivalent")
 	cityPath, setCommit := driftCheckEnv(t, "old-build-id")
 	setCommit("new-build-id")
 

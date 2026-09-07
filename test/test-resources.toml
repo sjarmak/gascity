@@ -103,8 +103,8 @@ expires = "2026-10-01"
 [[debt]]
 scope = "cmd/gc+untagged"
 resource = "slow_process_gate"
-baseline_calls = 58
-baseline_files = 24
+baseline_calls = 60
+baseline_files = 25
 reported_calls = 78
 reported_files = 27
 owner_bead = "ga-80po0c.2.3"
@@ -116,7 +116,7 @@ expires = "2026-10-01"
 [[debt]]
 scope = "untagged"
 resource = "http_test_server"
-baseline_calls = 318
+baseline_calls = 320
 baseline_files = 66
 reported_calls = 255
 reported_files = 56
@@ -407,8 +407,8 @@ expires = "2026-10-01"
 [[small_debt]]
 scope = "cmd/gc+untagged"
 resource = "slow_process_gate"
-baseline_calls = 58
-baseline_files = 24
+baseline_calls = 60
+baseline_files = 25
 reported_calls = 75
 reported_files = 25
 owner_bead = "ga-80po0c.2.1"
@@ -420,7 +420,7 @@ expires = "2026-10-01"
 [[small_debt]]
 scope = "untagged"
 resource = "http_test_server"
-baseline_calls = 318
+baseline_calls = 320
 baseline_files = 66
 reported_calls = 300
 reported_files = 66
