@@ -2,6 +2,8 @@ package herdr
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"os/exec"
 	"testing"
 	"time"
@@ -39,7 +41,10 @@ func waitForEvent(t *testing.T, ch <-chan runtime.SessionEvent, timeout time.Dur
 func TestSessionEventsLive(t *testing.T) {
 	requireLiveHerdr(t)
 
-	const session = "gctest-events-live"
+	// PID-scoped session name: the herdr session maps to a host-global socket
+	// path (see TestHerdrConformance in conformance_test.go), so concurrent
+	// processes running this suite must not collide on a fixed name.
+	session := fmt.Sprintf("gctest-events-live-%d", os.Getpid())
 	p := New(session, t.TempDir(), t.TempDir(), 0, 0)
 	skipOnDetectionBasedRegistry(t, p)
 	_ = p.c.stopServer() // clear any leftover server from a crashed prior run

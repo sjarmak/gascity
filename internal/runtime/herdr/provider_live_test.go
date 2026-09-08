@@ -2,6 +2,8 @@ package herdr
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +16,10 @@ import (
 func TestProviderLive(t *testing.T) {
 	requireLiveHerdr(t)
 
-	p := New("gctest-live", t.TempDir(), t.TempDir(), 0, 0)
+	// PID-scoped session name: the herdr session maps to a host-global socket
+	// path (see TestHerdrConformance in conformance_test.go), so concurrent
+	// processes running this suite must not collide on a fixed name.
+	p := New(fmt.Sprintf("gctest-live-%d", os.Getpid()), t.TempDir(), t.TempDir(), 0, 0)
 	_ = p.Stop("smoke") // clear any leftover from a crashed prior run
 	t.Cleanup(func() { _ = p.Stop("smoke"); _ = p.TeardownServer() })
 

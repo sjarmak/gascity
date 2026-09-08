@@ -3,6 +3,8 @@ package herdr
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -20,7 +22,10 @@ import (
 func TestProviderLiveOccupantSwapKeepsLiveness(t *testing.T) {
 	requireLiveHerdr(t)
 
-	p := New("gctest-swap", t.TempDir(), t.TempDir(), 0, 0)
+	// PID-scoped session name: the herdr session maps to a host-global socket
+	// path (see TestHerdrConformance in conformance_test.go), so concurrent
+	// processes running this suite must not collide on a fixed name.
+	p := New(fmt.Sprintf("gctest-swap-%d", os.Getpid()), t.TempDir(), t.TempDir(), 0, 0)
 	_ = p.Stop("swap") // clear any leftover from a crashed prior run
 	t.Cleanup(func() { _ = p.Stop("swap"); _ = p.TeardownServer() })
 

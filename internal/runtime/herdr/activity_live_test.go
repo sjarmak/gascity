@@ -3,6 +3,8 @@ package herdr
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
 	"os/exec"
 	"testing"
 	"time"
@@ -21,7 +23,10 @@ func TestActivityLive(t *testing.T) {
 
 	shrinkActivityKnobs(t)
 
-	const session = "gctest-activity-live"
+	// PID-scoped session name: the herdr session maps to a host-global socket
+	// path (see TestHerdrConformance in conformance_test.go), so concurrent
+	// processes running this suite must not collide on a fixed name.
+	session := fmt.Sprintf("gctest-activity-live-%d", os.Getpid())
 	p := New(session, t.TempDir(), t.TempDir(), 0, 0)
 	_ = p.c.stopServer() // clear any leftover server from a crashed prior run
 	t.Cleanup(func() { _ = p.TeardownServer() })
