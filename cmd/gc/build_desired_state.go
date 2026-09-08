@@ -6289,7 +6289,10 @@ func resolveTemplatePrepared(bp *agentBuildParams, cfgAgent *config.Agent, quali
 }
 
 func validateAgentSessionTransportForBuild(bp *agentBuildParams, cfgAgent *config.Agent, qualifiedName string) error {
-	if bp == nil || cfgAgent == nil {
+	if cfgAgent == nil {
+		return fmt.Errorf("validating session transport for %q: agent is nil", qualifiedName)
+	}
+	if bp == nil {
 		return nil
 	}
 	if bp.lookPath == nil {

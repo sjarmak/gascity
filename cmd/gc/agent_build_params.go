@@ -303,12 +303,20 @@ func templateNameFor(cfgAgent *config.Agent, qualifiedName string) string {
 }
 
 // resolveTmuxAliasForAgent expands the agent's tmux_alias template using the
-// build params' city/rig context. Returns "" when the agent is nil or the
-// template is empty. Template errors fail closed so pool reconciliation does
-// not silently spawn sessions under unintended fallback names.
+// build params' city/rig context. Returns "" when the resolved agent simply
+// has no tmux_alias template configured. A nil agent or nil build params is a
+// programming error further up the call chain, not "no alias configured", and
+// returns a non-nil error rather than silently falling through: an unreported
+// nil agent otherwise reaches pool-session creation as an empty alias, and the
+// session name silently degrades to its path-mangled fallback form. Template
+// errors also fail closed so pool reconciliation does not silently spawn
+// sessions under unintended fallback names.
 func (p *agentBuildParams) resolveTmuxAliasForAgent(agent *config.Agent) (string, error) {
-	if p == nil || agent == nil {
-		return "", nil
+	if agent == nil {
+		return "", fmt.Errorf("resolving tmux_alias: agent is nil")
+	}
+	if p == nil {
+		return "", fmt.Errorf("resolving tmux_alias for %q: build params unavailable", agent.QualifiedName())
 	}
 	resolved, err := workdirutil.ResolveTmuxAlias(p.cityPath, p.cityName, *agent, p.rigs)
 	if err != nil {

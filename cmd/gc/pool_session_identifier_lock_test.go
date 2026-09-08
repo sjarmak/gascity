@@ -711,3 +711,24 @@ func TestCreatePoolSessionBeadWithIdentifiers_UsesForeignAvailabilitySnapshotAnd
 		t.Fatalf("primary writeback = %#v, want newly created session %s", got, info.ID)
 	}
 }
+
+func TestCreatePoolSessionBeadWithGuardedAliasUsingLock_NilAgentFailsInsteadOfMangledName(t *testing.T) {
+	bp := &agentBuildParams{cityPath: "/city", cityName: "test-city"}
+	noopLocks := func(_ string, _ []string, fn func() error) error { return fn() }
+
+	info, err := createPoolSessionBeadWithGuardedAliasUsingLock(
+		bp,
+		nil,
+		"graph-worker",
+		"graph-worker-7",
+		7,
+		nil,
+		noopLocks,
+	)
+	if err == nil {
+		t.Fatalf("createPoolSessionBeadWithGuardedAliasUsingLock(nil agent) = (%#v, nil), want non-nil error", info)
+	}
+	if strings.HasPrefix(info.SessionNameMetadata, "--") {
+		t.Fatalf("createPoolSessionBeadWithGuardedAliasUsingLock(nil agent) produced path-mangled session name %q", info.SessionNameMetadata)
+	}
+}

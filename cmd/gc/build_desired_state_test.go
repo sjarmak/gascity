@@ -5906,7 +5906,8 @@ func TestCreatePoolSessionBeadWithGuardedAlias_LockSetupFailureNeverCreates(t *t
 		stderr:       &stderr,
 	}
 
-	bead, err := createPoolSessionBeadWithGuardedAlias(bp, nil, "claude", "claude-1", 1, nil)
+	cfgAgent := &config.Agent{Name: "claude"}
+	bead, err := createPoolSessionBeadWithGuardedAlias(bp, cfgAgent, "claude", "claude-1", 1, nil)
 	if err == nil || !strings.Contains(err.Error(), "session identifier lock") {
 		t.Fatalf("createPoolSessionBeadWithGuardedAlias error = %v, want identifier-lock setup failure", err)
 	}
@@ -9474,6 +9475,22 @@ func TestExistingPoolSlot_PreservesStampedOutOfBoundsLiveIdentity(t *testing.T) 
 
 	if slot := existingPoolSlot(cfgAgent, bead); slot != 7 {
 		t.Fatalf("existingPoolSlot(stamped live slot) = %d, want 7", slot)
+	}
+}
+
+func TestValidateAgentSessionTransportForBuild_NilAgentReturnsError(t *testing.T) {
+	bp := &agentBuildParams{
+		lookPath: func(string) (string, error) {
+			return "/usr/bin/test-agent", nil
+		},
+	}
+
+	err := validateAgentSessionTransportForBuild(bp, nil, "graph-worker/pool-7")
+	if err == nil {
+		t.Fatal("validateAgentSessionTransportForBuild(nil agent) returned nil, want non-nil error")
+	}
+	if !strings.Contains(err.Error(), "graph-worker/pool-7") {
+		t.Fatalf("validateAgentSessionTransportForBuild(nil agent) error = %v, want to identify qualified name %q", err, "graph-worker/pool-7")
 	}
 }
 
