@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/gchome"
@@ -137,73 +138,84 @@ func TestDisableAndPurgeCommitsBeforeUploaderWaitWithoutHoldingStateLock(t *test
 }
 
 func TestDisableAndPurgeBoundsInitialAndPostUploaderStateLocks(t *testing.T) {
+	// Advance lock deadlines only when the test goroutines are blocked, not
+	// while real filesystem setup competes with other packages for host time.
 	t.Run("initial state lock", func(t *testing.T) {
-		home, service, _ := newRecordServiceFixture(t, testEventIDThree)
-		before := readStateFixture(t, home)
-		root := mustOpenMutableRoot(t, home)
-		locked, err := root.acquireLock(context.Background(), stateLockName)
-		if err != nil {
-			t.Fatal(err)
-		}
-		service.deps.disableStateWait = 100 * time.Millisecond
-		result, err := service.DisableAndPurge(context.Background())
-		requirePurgeErrorClass(t, err, PurgeErrorDisableWrite)
-		if result.Outcome != PurgeFailed || result.DisabledDurable {
-			t.Fatalf("initial state timeout = %+v err=%v", result, err)
-		}
-		if result.IncompletePhase != PurgeIncompleteDisableWrite || result.ManualCleanupRequired ||
-			result.ManualCleanupReason != PurgeManualCleanupNone {
-			t.Fatalf("initial state timeout guidance = %+v", result)
-		}
-		if after := readStateFixture(t, home); after != before {
-			t.Fatalf("initial state timeout mutated state:\nbefore=%#v\nafter=%#v", before, after)
-		}
-		if closeErr := errors.Join(locked.Release(), root.Close()); closeErr != nil {
-			t.Fatal(closeErr)
-		}
+		synctest.Test(t, testDisableInitialStateLock)
 	})
-
 	t.Run("post-uploader state lock", func(t *testing.T) {
-		home, service, _ := newRecordServiceFixture(t, testEventIDThree)
-		service.deps.disableStateWait = 100 * time.Millisecond
-		atUploader := make(chan struct{})
-		releaseUploaderAttempt := make(chan struct{})
-		service.deps.beforeDisableUploaderLock = func() {
-			close(atUploader)
-			<-releaseUploaderAttempt
-		}
-		call := startDisableAndPurge(t, service)
-		select {
-		case <-atUploader:
-		case <-time.After(hangBudget):
-			t.Fatal("off did not reach uploader phase")
-		}
-		pending := readStateFixture(t, home)
-		if pending.Preference != preferenceDisabled || pending.CleanupKind != cleanupDisable {
-			t.Fatalf("post-uploader contention state = %#v", pending)
-		}
-		root := mustOpenMutableRoot(t, home)
-		locked, err := root.acquireLock(context.Background(), stateLockName)
-		if err != nil {
-			t.Fatal(err)
-		}
-		close(releaseUploaderAttempt)
-		outcome := receivePurgeCall(t, call)
-		requirePurgeErrorClass(t, outcome.err, PurgeErrorStorage)
-		if outcome.result.Outcome != PurgeCleanupPending || !outcome.result.DisabledDurable {
-			t.Fatalf("post-uploader state timeout = %+v err=%v", outcome.result, outcome.err)
-		}
-		if outcome.result.IncompletePhase != PurgeIncompleteLocalCleanup || outcome.result.ManualCleanupRequired ||
-			outcome.result.ManualCleanupReason != PurgeManualCleanupNone {
-			t.Fatalf("post-uploader state timeout guidance = %+v", outcome.result)
-		}
-		if after := readStateFixture(t, home); after != pending {
-			t.Fatalf("post-uploader timeout changed owner:\nbefore=%#v\nafter=%#v", pending, after)
-		}
-		if closeErr := errors.Join(locked.Release(), root.Close()); closeErr != nil {
-			t.Fatal(closeErr)
-		}
+		synctest.Test(t, testDisablePostUploaderStateLock)
 	})
+}
+
+func testDisableInitialStateLock(t *testing.T) {
+	home, service, _ := newRecordServiceFixture(t, testEventIDThree)
+	before := readStateFixture(t, home)
+	root := mustOpenMutableRoot(t, home)
+	locked, err := root.acquireLock(context.Background(), stateLockName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.deps.disableStateWait = 100 * time.Millisecond
+	result, err := service.DisableAndPurge(context.Background())
+	requirePurgeErrorClass(t, err, PurgeErrorDisableWrite)
+	if result.Outcome != PurgeFailed || result.DisabledDurable {
+		t.Fatalf("initial state timeout = %+v err=%v", result, err)
+	}
+	if result.IncompletePhase != PurgeIncompleteDisableWrite || result.ManualCleanupRequired ||
+		result.ManualCleanupReason != PurgeManualCleanupNone {
+		t.Fatalf("initial state timeout guidance = %+v", result)
+	}
+	if after := readStateFixture(t, home); after != before {
+		t.Fatalf("initial state timeout mutated state:\nbefore=%#v\nafter=%#v", before, after)
+	}
+	if closeErr := errors.Join(locked.Release(), root.Close()); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+}
+
+func testDisablePostUploaderStateLock(t *testing.T) {
+	home, service, _ := newRecordServiceFixture(t, testEventIDThree)
+	service.deps.disableStateWait = 100 * time.Millisecond
+	atUploader := make(chan struct{})
+	releaseUploaderAttempt := make(chan struct{})
+	service.deps.beforeDisableUploaderLock = func() {
+		close(atUploader)
+		<-releaseUploaderAttempt
+	}
+	call := startDisableAndPurge(t, service)
+	select {
+	case <-atUploader:
+	case outcome := <-call:
+		t.Fatalf("off returned before uploader phase: result=%+v err=%v", outcome.result, outcome.err)
+	case <-time.After(hangBudget):
+		t.Fatal("off did not reach uploader phase")
+	}
+	pending := readStateFixture(t, home)
+	if pending.Preference != preferenceDisabled || pending.CleanupKind != cleanupDisable {
+		t.Fatalf("post-uploader contention state = %#v", pending)
+	}
+	root := mustOpenMutableRoot(t, home)
+	locked, err := root.acquireLock(context.Background(), stateLockName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(releaseUploaderAttempt)
+	outcome := receivePurgeCall(t, call)
+	requirePurgeErrorClass(t, outcome.err, PurgeErrorStorage)
+	if outcome.result.Outcome != PurgeCleanupPending || !outcome.result.DisabledDurable {
+		t.Fatalf("post-uploader state timeout = %+v err=%v", outcome.result, outcome.err)
+	}
+	if outcome.result.IncompletePhase != PurgeIncompleteLocalCleanup || outcome.result.ManualCleanupRequired ||
+		outcome.result.ManualCleanupReason != PurgeManualCleanupNone {
+		t.Fatalf("post-uploader state timeout guidance = %+v", outcome.result)
+	}
+	if after := readStateFixture(t, home); after != pending {
+		t.Fatalf("post-uploader timeout changed owner:\nbefore=%#v\nafter=%#v", pending, after)
+	}
+	if closeErr := errors.Join(locked.Release(), root.Close()); closeErr != nil {
+		t.Fatal(closeErr)
+	}
 }
 
 func TestDisableAndPurgeBlockedUploaderConvergesAndCleanDisabledCrossesBarrier(t *testing.T) {
