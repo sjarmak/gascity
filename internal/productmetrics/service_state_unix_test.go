@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/gchome"
 )
@@ -1087,6 +1088,11 @@ func defaultTestServiceDependencies(home gchome.ProductUsageHome, epoch uint64) 
 			return randomUUIDv4(rand.Reader)
 		},
 		verifyTTY: func(io.Writer) bool { return true },
+		// Scripted decision clocks must not race the host's lock deadline.
+		// The real deadline retains its own boundary proof.
+		newRecordLockContext: func(parent context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+			return context.WithCancel(parent)
+		},
 	}
 }
 
