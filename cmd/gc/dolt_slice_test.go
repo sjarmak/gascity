@@ -95,13 +95,18 @@ func TestManagedDoltPlacementOffUnderTestWithoutProbing(t *testing.T) {
 }
 
 func TestWrapManagedDoltArgvPreservesUnsetProductionSpawn(t *testing.T) {
+	withManagedDoltTestMode(t, false)
+	t.Setenv(managedDoltTestModeEnv, "0")
+	if managedDoltTestModeEnabled() {
+		t.Fatal("managedDoltTestModeEnabled() = true, want production-mode false")
+	}
 	argv := []string{"dolt", "sql-server", "--config", "/tmp/c.yaml"}
-	got, err := wrapManagedDoltArgvFor(argv, "", false)
+	got, err := wrapManagedDoltArgv(argv)
 	if err != nil {
-		t.Fatalf("wrapManagedDoltArgvFor unset production: %v", err)
+		t.Fatalf("wrapManagedDoltArgv unset production: %v", err)
 	}
 	if strings.Join(got, "\x00") != strings.Join(argv, "\x00") {
-		t.Fatalf("wrapManagedDoltArgvFor unset production = %q, want %q", got, argv)
+		t.Fatalf("wrapManagedDoltArgv unset production = %q, want %q", got, argv)
 	}
 }
 
