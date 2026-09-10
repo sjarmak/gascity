@@ -83,14 +83,12 @@ func managedDoltSlice() string {
 }
 
 // managedDoltSliceFor is the pure decision behind managedDoltSlice, split out
-// for tests (the test binary is always in managed-dolt test mode, so the
-// production default is otherwise unreachable in-process).
+// for tests.
 //
 // An explicit setting always wins at resolution time. The production boundary
-// rejects an empty result; keeping that case in this pure resolver lets tests
-// pin the configuration decision separately from enforcement. Absent a
-// setting, test mode declines the implicit default: managed-dolt tests spawn
-// fake servers in tight loops and must not depend on a systemd user manager.
+// rejects an explicitly configured empty result at the placement boundary;
+// keeping that case in this pure resolver lets tests pin configuration apart
+// from enforcement. An unset value preserves the existing direct spawn.
 func managedDoltSliceFor(testMode bool, envValue string, envSet bool) string {
 	if envSet {
 		return strings.TrimSpace(envValue)
@@ -153,9 +151,9 @@ func wrapManagedDoltArgv(argv []string) ([]string, error) {
 
 func wrapManagedDoltArgvFor(argv []string, slice string, explicitlyConfigured bool) ([]string, error) {
 	if slice == "" {
-		// The test suite deliberately declines the production default unless a
-		// test opts into real systemd placement. An explicit empty setting is
-		// not an opt-out: in production that would recreate the incident path.
+		// Unset preserves the existing direct spawn in every mode. An explicit
+		// empty setting is not an opt-out: in production that would recreate
+		// the incident path.
 		if !explicitlyConfigured {
 			return argv, nil
 		}
