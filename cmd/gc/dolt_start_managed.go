@@ -426,14 +426,29 @@ func startManagedDoltSQLServer(cityPath, configFile, logFilePath string, logFile
 	if managedDoltScopeWatchdogEnabled() {
 		return startManagedDoltSQLServerWithScopeWatchdog(cityPath, configFile, logFilePath, logFile)
 	}
-	cmd := exec.Command("dolt", "sql-server", "--config", configFile)
+	argv, err := wrapManagedDoltArgv([]string{"dolt", "sql-server", "--config", configFile})
+	if err != nil {
+		return managedDoltStartedProcess{}, err
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
 	cmd.SysProcAttr = managedDoltSQLServerSysProcAttr()
 	cmd.Env = doltServerEnv(cityPath, os.Environ())
-	if err := cmd.Start(); err != nil {
-		return managedDoltStartedProcess{}, fmt.Errorf("start dolt sql-server: %w", err)
+	cmd.Dir = managedDoltWorkingDir(cityPath, configFile)
+	managedDoltOOMScoreAdjMu.Lock()
+	previousOOMScoreAdj, loweredOOMScoreAdj, oomErr := applyManagedDoltOOMScoreAdj()
+	startErr := cmd.Start()
+	if loweredOOMScoreAdj {
+		_ = restoreManagedDoltOOMScoreAdj(previousOOMScoreAdj)
+	}
+	managedDoltOOMScoreAdjMu.Unlock()
+	if startErr != nil {
+		return managedDoltStartedProcess{}, fmt.Errorf("start dolt sql-server: %w", startErr)
+	}
+	if oomErr != nil {
+		fmt.Fprintf(logFile, "gc: could not clear inherited oom_score_adj: %v\n", oomErr) //nolint:errcheck
 	}
 	// Snapshot the child's OS-level start identity while it is still definitely
 	// alive — before the reap goroutine below can Wait() it and free the PID.

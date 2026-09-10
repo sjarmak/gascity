@@ -134,11 +134,18 @@ func startManagedDoltSQLServerWithScopeWatchdog(cityPath, configFile, logFilePat
 	if err != nil {
 		return managedDoltStartedProcess{}, err
 	}
-	cmd := exec.Command(watchdogExecutable, managedDoltScopeWatchdogArg, configFile, logFilePath, cityPath)
+	argv, err := wrapManagedDoltArgv([]string{
+		watchdogExecutable, managedDoltScopeWatchdogArg, configFile, logFilePath, cityPath,
+	})
+	if err != nil {
+		return managedDoltStartedProcess{}, err
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
 	cmd.SysProcAttr = managedDoltSQLServerSysProcAttr()
 	cmd.Env = doltServerEnv(cityPath, os.Environ())
+	cmd.Dir = managedDoltWorkingDir(cityPath, configFile)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return managedDoltStartedProcess{}, fmt.Errorf("prepare dolt scope watchdog: %w", err)
@@ -212,10 +219,23 @@ func runManagedDoltScopeWatchdog(args []string, stdout, stderr *os.File) int {
 	// escalation of an unresponsive server could strand descendants.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = doltServerEnv(cityPath, os.Environ())
+	cmd.Dir = managedDoltWorkingDir(cityPath, configFile)
+	managedDoltOOMScoreAdjMu.Lock()
+	previousOOMScoreAdj, loweredOOMScoreAdj, oomErr := applyManagedDoltOOMScoreAdj()
+	if oomErr != nil {
+		fmt.Fprintf(stderr, "gc: could not clear inherited oom_score_adj: %v\n", oomErr) //nolint:errcheck
+	}
 	if err := cmd.Start(); err != nil {
+		managedDoltOOMScoreAdjMu.Unlock()
 		fmt.Fprintf(stderr, "start dolt sql-server: %v\n", err) //nolint:errcheck
 		return 1
 	}
+	if loweredOOMScoreAdj {
+		if restoreErr := restoreManagedDoltOOMScoreAdj(previousOOMScoreAdj); restoreErr != nil {
+			fmt.Fprintf(stderr, "gc: could not restore this process's oom_score_adj: %v\n", restoreErr) //nolint:errcheck
+		}
+	}
+	managedDoltOOMScoreAdjMu.Unlock()
 	// Report the dolt child's PID and OS start identity to the parent BEFORE the
 	// reap goroutine below can Wait() the child and free its numeric PID.
 	// Snapshotting here — while the watchdog still holds the un-reaped child — is
