@@ -29,6 +29,7 @@ import (
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/session/sessiontest"
 	"github.com/gastownhall/gascity/internal/storeref"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 	"github.com/gastownhall/gascity/internal/worktree"
 )
 
@@ -8197,6 +8198,185 @@ func TestRefreshDesiredStateWithSessionBeadsIncludesManualCreatedDuringBuild(t *
 	if !tp.ManualSession {
 		t.Fatalf("refreshed manual session flag = false, want true")
 	}
+}
+
+func TestBuildDesiredStateSuspendedNamedSessionRetainsIdentity(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	clk := &clock.Fake{Time: time.Date(2026, 9, 10, 0, 0, 0, 0, time.UTC)}
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "api", StartCommand: "true", Suspended: true}},
+		NamedSessions: []config.NamedSession{{Template: "api", Mode: "always"}},
+	}
+	result := buildDesiredStateWithSessionBeads("test-city", cityPath, clk.Now(), cfg, sp, store, nil, nil, nil, io.Discard)
+	if len(result.State) != 0 {
+		t.Fatal("suspended named agent must not materialize a new session")
+	}
+	cfg.Agents[0].Suspended = false
+	result = buildDesiredStateWithSessionBeads("test-city", cityPath, clk.Now(), cfg, sp, store, nil, nil, nil, io.Discard)
+	syncSessionBeads(cityPath, store, result.State, sp, allConfiguredDS(result.State), cfg, clk, io.Discard, false)
+	cfg.Agents[0].Suspended = true
+	result = buildDesiredStateWithSessionBeads("test-city", cityPath, clk.Now(), cfg, sp, store, nil, nil, nil, io.Discard)
+	syncSessionBeads(cityPath, store, result.State, sp, allConfiguredDS(result.State), cfg, clk, io.Discard, false)
+	all := allSessionBeads(t, store)
+	if len(all) != 1 {
+		t.Fatalf("got %d sessions, want the one existing named session", len(all))
+	}
+	for _, b := range all {
+		if b.Metadata[namedSessionIdentityMetadata] != "api" || b.Metadata[namedSessionModeMetadata] != "always" {
+			t.Fatalf("suspension erased named identity: %v", b.Metadata)
+		}
+		if b.Status == "closed" || b.Metadata["session_origin"] != "named" || b.Metadata["pool_managed"] == "true" {
+			t.Fatalf("suspension changed the named session's lifecycle ownership: %+v", b)
+		}
+		tp, ok := result.State[b.Metadata["session_name"]]
+		if !ok || tp.Env["GC_AGENT"] != "api" || tp.Env["GC_ALIAS"] != "api" || tp.Env["GC_SESSION_ORIGIN"] != "named" {
+			t.Fatalf("rediscovered named session has inconsistent runtime identity: %+v", tp)
+		}
+	}
+}
+
+func TestBuildDesiredStateSuspendedNamedSessionRequiresCurrentSpec(t *testing.T) {
+	for _, change := range []string{"removed", "retargeted"} {
+		t.Run(change, func(t *testing.T) {
+			cityPath := t.TempDir()
+			store := beads.NewMemStore()
+			sp := runtime.NewFake()
+			clk := &clock.Fake{Time: time.Date(2026, 9, 10, 0, 0, 0, 0, time.UTC)}
+			cfg := &config.City{
+				Workspace: config.Workspace{Name: "test-city"},
+				Agents: []config.Agent{
+					{Name: "api", StartCommand: "true"},
+					{Name: "replacement", StartCommand: "true", Suspended: true},
+				},
+				NamedSessions: []config.NamedSession{{Name: "service", Template: "api", Mode: "always"}},
+			}
+			result := buildDesiredStateWithSessionBeads("test-city", cityPath, clk.Now(), cfg, sp, store, nil, nil, nil, io.Discard)
+			syncSessionBeads(cityPath, store, result.State, sp, allConfiguredDS(result.State), cfg, clk, io.Discard, false)
+			cfg.Agents[0].Suspended = true
+			if change == "removed" {
+				cfg.NamedSessions = nil
+			} else {
+				cfg.NamedSessions[0].Template = "replacement"
+			}
+			result = buildDesiredStateWithSessionBeads("test-city", cityPath, clk.Now(), cfg, sp, store, nil, nil, nil, io.Discard)
+			if len(result.State) == 0 {
+				t.Fatal("expected the existing session to exercise rediscovery")
+			}
+			for name, tp := range result.State {
+				if tp.ConfiguredNamedIdentity != "" || tp.Env["GC_SESSION_ORIGIN"] == "named" {
+					t.Fatalf("obsolete named claim on %s became current authority: %+v", name, tp)
+				}
+			}
+		})
+	}
+}
+
+func TestCityRuntimeDemandSnapshotRestoresNamedSessionAfterCityResume(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	cr := &CityRuntime{
+		cityName: "test-city", cityPath: cityPath,
+		cfg: &config.City{
+			Workspace:     config.Workspace{Name: "test-city"},
+			Agents:        []config.Agent{{Name: "api", StartCommand: "true"}},
+			NamedSessions: []config.NamedSession{{Template: "api", Mode: "always"}},
+		},
+		sp: runtime.NewFake(), standaloneCityStore: store,
+		cs: &controllerState{eventProv: events.NewFake()}, stderr: io.Discard,
+	}
+	cr.buildFnWithSessionBeads = supervisorBuildAgentsFnWithSessionBeads(cityPath, "test-city", io.Discard)
+	snapshot := newSessionBeadSnapshot(nil)
+	suspended := true
+	if err := suspensionstate.SetCitySuspended(fsys.OSFS{}, cityPath, &suspended); err != nil {
+		t.Fatal(err)
+	}
+	if got := cr.loadDemandSnapshot(snapshot, nil, "patrol", false); len(got.result.State) != 0 {
+		t.Fatal("suspended city materialized a new session")
+	}
+	suspended = false
+	if err := suspensionstate.SetCitySuspended(fsys.OSFS{}, cityPath, &suspended); err != nil {
+		t.Fatal(err)
+	}
+	got := cr.loadDemandSnapshot(snapshot, nil, "patrol", false)
+	if len(got.result.State) != 1 {
+		t.Fatalf("resumed named desired sessions = %d, want 1 without waiting for cache expiry", len(got.result.State))
+	}
+	suspended = true
+	if err := suspensionstate.SetCitySuspended(fsys.OSFS{}, cityPath, &suspended); err != nil {
+		t.Fatal(err)
+	}
+	if got := cr.loadDemandSnapshot(snapshot, nil, "patrol", false); len(got.result.State) != 0 {
+		t.Fatal("suspending again retained cached named demand")
+	}
+}
+
+func TestCityRuntimeDemandSnapshotDetectsSuspensionChangeDuringBuild(t *testing.T) {
+	cityPath := t.TempDir()
+	cr := &CityRuntime{
+		cityPath: cityPath, cfg: &config.City{},
+		cs: &controllerState{eventProv: events.NewFake()}, stderr: io.Discard,
+	}
+	builds := 0
+	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
+		builds++
+		if builds == 1 {
+			suspended := true
+			if err := suspensionstate.SetCitySuspended(fsys.OSFS{}, cityPath, &suspended); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return DesiredStateResult{}
+	}
+	snapshot := newSessionBeadSnapshot(nil)
+	cr.loadDemandSnapshot(snapshot, nil, "patrol", false)
+	suspended := false
+	if err := suspensionstate.SetCitySuspended(fsys.OSFS{}, cityPath, &suspended); err != nil {
+		t.Fatal(err)
+	}
+	cr.loadDemandSnapshot(snapshot, nil, "patrol", false)
+	if builds != 2 {
+		t.Fatalf("build calls = %d, want 2 after suspension changed during the first build", builds)
+	}
+}
+
+func TestBuildDesiredStateNamedSessionRecoversFailedCreate(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	clk := &clock.Fake{Time: time.Date(2026, 9, 10, 0, 0, 0, 0, time.UTC)}
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "api", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "api", Mode: "always"}},
+	}
+	result := buildDesiredStateWithSessionBeads("test-city", cityPath, clk.Now(), cfg, sp, store, nil, nil, nil, io.Discard)
+	syncSessionBeads(cityPath, store, result.State, sp, allConfiguredDS(result.State), cfg, clk, io.Discard, false)
+	initial := allSessionBeads(t, store)
+	if len(initial) != 1 {
+		t.Fatalf("initial sessions = %d, want 1", len(initial))
+	}
+	if err := store.SetMetadata(initial[0].ID, "state", "failed-create"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(initial[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := loadSessionBeadSnapshot(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result = buildDesiredStateWithSessionBeads("test-city", cityPath, clk.Now(), cfg, sp, store, nil, snapshot, nil, io.Discard)
+	result = refreshDesiredStateWithSessionBeads(result, "test-city", cityPath, cfg, sp, store, snapshot, io.Discard)
+	syncSessionBeads(cityPath, store, result.State, sp, allConfiguredDS(result.State), cfg, clk, io.Discard, false)
+	for _, b := range allSessionBeads(t, store) {
+		if b.Status != "closed" && b.Metadata[namedSessionIdentityMetadata] == "api" {
+			return
+		}
+	}
+	t.Fatal("always named session has no open owner after failed creation")
 }
 
 func TestBuildDesiredState_ManualImplicitPoolSessionsStayDesired(t *testing.T) {

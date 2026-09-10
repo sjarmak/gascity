@@ -272,6 +272,7 @@ const scaleCheckDemandMinInterval = 1 * time.Second
 
 type runtimeDemandSnapshot struct {
 	createdAt              time.Time
+	suspensionUpdatedAt    time.Time
 	sessionFingerprint     string
 	readyDemandFingerprint string
 	result                 DesiredStateResult
@@ -3755,9 +3756,16 @@ func (cr *CityRuntime) loadDemandSnapshot(
 	trigger string,
 	configChanged bool,
 ) runtimeDemandSnapshot {
+	cityState := loadSuspensionStateBestEffort(cr.cityPath)
 	sessionFingerprint := sessionBeadSnapshotFingerprint(sessionBeads)
 	readyDemandFingerprint := ""
 	refresh := cr.shouldRefreshDemandSnapshot(trigger, configChanged, sessionFingerprint)
+	// Suspension is per-clone runtime state, not a config or session change.
+	// Track the write revision, not only the effective boolean: suspend/resume
+	// can happen during a build and return to the same value by the next tick.
+	if cr.demandSnapshot != nil && !cr.demandSnapshot.suspensionUpdatedAt.Equal(cityState.UpdatedAt) {
+		refresh = true
+	}
 	if !refresh && trigger == "patrol" && cr.demandSnapshotsEnabled() {
 		readyDemandFingerprint = cr.readyDemandSnapshotFingerprint()
 		refresh = cr.demandSnapshot.readyDemandFingerprint != readyDemandFingerprint
@@ -3791,6 +3799,7 @@ func (cr *CityRuntime) loadDemandSnapshot(
 		result.WorkSet = make(map[string]bool)
 		cr.demandSnapshot = &runtimeDemandSnapshot{
 			createdAt:              time.Now(),
+			suspensionUpdatedAt:    cityState.UpdatedAt,
 			sessionFingerprint:     sessionFingerprint,
 			readyDemandFingerprint: readyDemandFingerprint,
 			result:                 result,
