@@ -90,9 +90,12 @@ func runEventsReemitExecution(cmd *cobra.Command, runID string, apply bool, stdo
 	if err != nil {
 		return fmt.Errorf("opening city work store: %w", err)
 	}
+	routes := cliStorageRoutes(cityPath)
+	graphStore := resolveGraphStore(routes, store, cfg, cityPath, nil)
+	workRef := workflowStoreRefForDir(cityPath, cityPath, loadedCityName(cfg, cityPath), cfg)
 	projection, err := executionevent.ProjectCurrent(
-		beads.GraphStore{Store: resolveGraphStore(cliStorageRoutes(cityPath), store, cfg, cityPath, nil)},
-		beads.WorkStore{Store: store},
+		beads.GraphStore{Store: executionGraphProjectionStore(routes, store, graphStore, workRef)},
+		beads.WorkStore{Store: executionevent.WithStoreRef(store, workRef)},
 		strings.TrimSpace(runID),
 	)
 	if err != nil {

@@ -865,7 +865,7 @@ store, copy them into the binding with
 							}
 							return err
 						}
-						emitFormulaCookExecutionFacts(store, store, cityPath, result, stderr)
+						emitFormulaCookExecutionFacts(store, store, cityPath, storeRef, result, stderr)
 						return ensureFormulaCookAttachDep(store, attach, result.RootID)
 					})
 					if err != nil {
@@ -939,7 +939,8 @@ store, copy them into the binding with
 				if err != nil {
 					return formulaCommandError(stderr, "gc formula cook: attach", jsonOutput, err)
 				}
-				emitAttachedFormulaCookExecutionFacts(store, cfg, cityPath, result.WorkflowRootID, stderr)
+				storeRef := workflowStoreRefForDir(scope.storeRoot, cityPath, loadedCityName(cfg, cityPath), cfg)
+				emitAttachedFormulaCookExecutionFacts(store, cfg, cityPath, storeRef, result.WorkflowRootID, stderr)
 
 				if jsonOutput {
 					if err := writeCLIJSONLineOrErr(stdout, stderr, "gc formula cook", formulaCookJSONResult{
@@ -1027,7 +1028,7 @@ store, copy them into the binding with
 				if err != nil {
 					return formulaCommandError(stderr, "gc formula cook", jsonOutput, err)
 				}
-				emitFormulaCookExecutionFacts(rootStore, store, cityPath, result, stderr)
+				emitFormulaCookExecutionFacts(rootStore, store, cityPath, storeRef, result, stderr)
 			} else {
 				// The legacy compiler still emits a graph-class root for a
 				// root-only formula: `phase = "vapor"` (or no [[steps]]) compiles
@@ -1095,17 +1096,23 @@ store, copy them into the binding with
 // the work store holds the tracks edges of the input convoy the root names.
 // Wrapping one store as both legs reads the convoy out of the ledger it does not
 // live in; on a city that relocates nothing the two arguments are the same value.
-func emitFormulaCookExecutionFacts(graphStore, workStore beads.Store, cityPath string, result *molecule.Result, stderr io.Writer) {
+func emitFormulaCookExecutionFacts(graphStore, workStore beads.Store, cityPath, workRef string, result *molecule.Result, stderr io.Writer) {
 	if result == nil || !result.GraphWorkflow {
 		return
 	}
-	if err := executionevent.EmitCurrent(openCityRecorderAt(cityPath, stderr), beads.GraphStore{Store: graphStore}, beads.WorkStore{Store: workStore}, result.RootID, "formula-cook"); err != nil {
+	projectionGraph := executionGraphProjectionStore(cliStorageRoutes(cityPath), workStore, graphStore, workRef)
+	projectionWork := executionEmitStore(executionevent.WithStoreRef(workStore, workRef), cityPath)
+	if err := executionevent.EmitCurrent(openCityRecorderAt(cityPath, stderr), beads.GraphStore{Store: projectionGraph}, beads.WorkStore{Store: projectionWork}, result.RootID, "formula-cook"); err != nil {
 		fmt.Fprintf(stderr, "warning: gc formula cook: projecting execution facts for %s: %v\n", result.RootID, err) //nolint:errcheck // successful cook is preserved
 	}
 }
 
-func emitAttachedFormulaCookExecutionFacts(store beads.Store, cfg *config.City, cityPath, workflowRootID string, stderr io.Writer) {
-	if err := executionevent.EmitCurrent(openCityRecorderAt(cityPath, stderr), beads.GraphStore{Store: resolveGraphStore(cliStorageRoutes(cityPath), store, cfg, cityPath, nil)}, beads.WorkStore{Store: store}, workflowRootID, "formula-cook"); err != nil {
+func emitAttachedFormulaCookExecutionFacts(store beads.Store, cfg *config.City, cityPath, workRef, workflowRootID string, stderr io.Writer) {
+	routes := cliStorageRoutes(cityPath)
+	graphStore := resolveGraphStore(routes, store, cfg, cityPath, nil)
+	projectionGraph := executionGraphProjectionStore(routes, store, graphStore, workRef)
+	projectionWork := executionEmitStore(executionevent.WithStoreRef(store, workRef), cityPath)
+	if err := executionevent.EmitCurrent(openCityRecorderAt(cityPath, stderr), beads.GraphStore{Store: projectionGraph}, beads.WorkStore{Store: projectionWork}, workflowRootID, "formula-cook"); err != nil {
 		fmt.Fprintf(stderr, "warning: gc formula cook: projecting execution facts for %s: %v\n", workflowRootID, err) //nolint:errcheck // successful attach is preserved
 	}
 }

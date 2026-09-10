@@ -1186,6 +1186,9 @@ title = "Do work for {{convoy_id}}"
 			}
 			if event.Type == events.ExecutionWorkAssociated && event.Subject == source.ID {
 				seenAssociation = true
+				if event.RunStoreRef != "city:my-city" || event.SubjectStoreRef != "city:my-city" {
+					t.Fatalf("attached work association missing producer store provenance: %#v", event)
+				}
 			}
 			if event.Type == events.ExecutionStepDefined && event.Subject != root.ID {
 				seenStep = true

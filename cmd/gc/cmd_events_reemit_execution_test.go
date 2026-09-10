@@ -155,6 +155,9 @@ func TestEventsReemitExecutionApplyAppendsProjectedBatch(t *testing.T) {
 	if got[0].Type != events.ExecutionStepDefined || got[0].Actor != "execution-reemit" || got[0].RunID != root.ID || got[0].StepID != "build" {
 		t.Fatalf("emitted event = %#v, want projected execution step", got[0])
 	}
+	if got[0].RunStoreRef != "city:reemit" || got[0].SubjectStoreRef != "city:reemit" {
+		t.Fatalf("emitted store refs = run %q, subject %q; want city:reemit for both", got[0].RunStoreRef, got[0].SubjectStoreRef)
+	}
 	var summary struct {
 		Applied bool `json:"applied"`
 	}

@@ -882,7 +882,10 @@ func doOrderRunWithJSON(aa []orders.Order, name, rig, cityPath string, store bea
 		// steps, the scope store owns the tracks edges of any input convoy the
 		// root names. Wrapping one store as both legs reads the convoy out of the
 		// ledger it does not live in.
-		if err := executionevent.EmitCurrent(ep, beads.GraphStore{Store: moleculeStore}, beads.WorkStore{Store: genericStore}, rootID, "order-run"); err != nil {
+		workRef := workflowStoreRefForDir(storeTarget.ScopeRoot, cityPath, cityName, cfg)
+		projectionGraph := executionGraphProjectionStore(cliStorageRoutes(cityPath), genericStore, moleculeStore, workRef)
+		projectionWork := executionEmitStore(executionevent.WithStoreRef(genericStore, workRef), cityPath)
+		if err := executionevent.EmitCurrent(ep, beads.GraphStore{Store: projectionGraph}, beads.WorkStore{Store: projectionWork}, rootID, "order-run"); err != nil {
 			fmt.Fprintf(stderr, "warning: gc order run: projecting execution facts for %s: %v\n", rootID, err) //nolint:errcheck // successful order run is preserved
 		}
 	}

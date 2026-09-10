@@ -42,6 +42,38 @@ import (
 // guard that went red on revert would be testing the wrong thing. Its teeth come
 // from mutation instead (documented on each such test).
 
+func TestOrderRunExecutionStoreProvenance(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		name, want := "collapsed", "city:one-shot-city"
+		if split {
+			name, want = "relocated", "class:gmnos"
+		}
+		t.Run(name, func(t *testing.T) {
+			cityPath, order := oneShotGraphOrderCity(t, "cooldown")
+			work := beads.NewMemStore()
+			if split {
+				graph := splittest.NewClassStore(t, config.BeadClassGraph)
+				seedCLIStorageRoutes(t, cityPath, messagingSplitRoutes(graph))
+			}
+			recorder := events.NewFake()
+			rootID := runOneShotOrder(t, cityPath, order, work, recorder)
+			seen := false
+			for _, event := range recorder.Events {
+				if event.Type != events.ExecutionStepDefined {
+					continue
+				}
+				seen = true
+				if event.RunID != rootID || event.RunStoreRef != want || event.SubjectStoreRef != want {
+					t.Fatalf("execution fact = %#v; want run %s with store %s", event, rootID, want)
+				}
+			}
+			if !seen {
+				t.Fatal("no execution step fact emitted")
+			}
+		})
+	}
+}
+
 // enableFormulaV2ForOneShotTest turns on the graph.v2 compiler capability the way
 // a booting city does — through the sanctioned propagator, derived from a config
 // that declares [daemon] formula_v2, rather than through the legacy global
@@ -382,6 +414,22 @@ func TestFormulaCookGraphV2RootLandsInGraphStoreOnSplitCity(t *testing.T) {
 	seedCLIStorageRoutes(t, cityDir, messagingSplitRoutes(graph))
 
 	res := cookFormula(t, "graph-work")
+	recorded, err := events.ReadAll(filepath.Join(cityDir, ".gc", "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := false
+	for _, event := range recorded {
+		if event.Type == events.ExecutionStepDefined && event.RunID == res.RootID {
+			seen = true
+			if event.RunStoreRef != "class:gmnos" || event.SubjectStoreRef != "class:gmnos" {
+				t.Fatalf("relocated formula execution scope = %#v; want class:gmnos", event)
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("no execution step definition emitted")
+	}
 
 	root, err := graph.Get(res.RootID)
 	if err != nil {
@@ -820,7 +868,7 @@ func TestEmitFormulaCookExecutionFactsReadsTheConvoyFromTheWorkLeg(t *testing.T)
 	}
 
 	var stderr bytes.Buffer
-	emitFormulaCookExecutionFacts(graph, work, cityPath, &molecule.Result{RootID: root.ID, GraphWorkflow: true}, &stderr)
+	emitFormulaCookExecutionFacts(graph, work, cityPath, "city:test", &molecule.Result{RootID: root.ID, GraphWorkflow: true}, &stderr)
 
 	recorded, err := events.ReadAll(filepath.Join(cityPath, ".gc", "events.jsonl"))
 	if err != nil {
