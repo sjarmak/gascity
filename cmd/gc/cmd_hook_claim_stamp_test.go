@@ -438,6 +438,32 @@ func TestHookClaimIdentityPatchWorkBranchPartialEvidenceGuard(t *testing.T) {
 	}
 }
 
+func TestClaimLifecycleScopeFollowsSelectedFallbackStore(t *testing.T) {
+	spy := &stampMetaSpy{}
+	ready := `[{"id":"gcg-attempt","status":"open","metadata":{"gc.routed_to":"worker"}}]`
+	meta := map[string]string{"gc.routed_to": "worker", beadmeta.RootBeadIDMetadataKey: "gcg-root", beadmeta.StepIDMetadataKey: "build"}
+	ops := poolClaimOps(ready, meta, "", spy)
+	var gotRef string
+	ops.EmitExecutionStepStarted = func(_ beads.Bead, _ string, _ []string, _ string, ref string) { gotRef = ref }
+	opts := poolClaimOpts()
+	opts.ExecutionStoreRef = "city:must-not-leak"
+	stores := []hookStore{
+		{dir: "/city", env: opts.Env, storeRef: "city:primary"},
+		{dir: "/different-worktree", env: opts.Env, storeRef: "rig:fallback"},
+	}
+	run := func(_ string, dir string, _ []string) (string, error) {
+		if dir == "/city" {
+			return `[]`, nil
+		}
+		return ready, nil
+	}
+	var stdout, stderr bytes.Buffer
+	code := claimHookWorkWithRunner("query", "/city", opts.Env, stores, opts, ops, run, func(string, error) {}, &stdout, &stderr)
+	if code != 0 || gotRef != "rig:fallback" {
+		t.Fatalf("code=%d ref=%q stderr=%s", code, gotRef, stderr.String())
+	}
+}
+
 func TestDoHookClaimEmitsStartedOnlyAfterDurableSessionReadback(t *testing.T) {
 	spy := &stampMetaSpy{}
 	meta := map[string]string{
@@ -446,13 +472,22 @@ func TestDoHookClaimEmitsStartedOnlyAfterDurableSessionReadback(t *testing.T) {
 	}
 	ops := poolClaimOps(`[{"id":"gcg-attempt","status":"open","metadata":{"gc.routed_to":"worker"}}]`, meta, "", spy)
 	var emitted []beads.Bead
-	ops.EmitExecutionStepStarted = func(b beads.Bead, _ string, _ []string, _ string) { emitted = append(emitted, b) }
+	var emittedRef string
+	ops.EmitExecutionStepStarted = func(b beads.Bead, _ string, _ []string, _ string, ref string) {
+		emitted = append(emitted, b)
+		emittedRef = ref
+	}
 	var stdout, stderr bytes.Buffer
-	if code := doHookClaim("bd ready --json", "/tmp/work", poolClaimOpts(), ops, &stdout, &stderr); code != 0 {
+	opts := poolClaimOpts()
+	opts.ExecutionStoreRef = "rig:actual-store"
+	if code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr); code != 0 {
 		t.Fatalf("doHookClaim = %d; stderr=%s", code, stderr.String())
 	}
 	if len(emitted) != 1 || emitted[0].ID != "gcg-attempt" || emitted[0].Metadata[beadmeta.SessionIDMetadataKey] != "mc-sess1" || emitted[0].Status != "in_progress" {
 		t.Fatalf("started emission = %#v, want one durable in-progress session-stamped step", emitted)
+	}
+	if emittedRef != opts.ExecutionStoreRef {
+		t.Fatalf("emitted ref = %q", emittedRef)
 	}
 
 	spy.err = errors.New("stamp failed")
@@ -491,7 +526,7 @@ func TestDoHookClaimAdoptionReconcilesDurableStartedFact(t *testing.T) {
 		PublishRunMap: noopPublishRunMap,
 	}
 	var emitted []beads.Bead
-	ops.EmitExecutionStepStarted = func(b beads.Bead, _ string, _ []string, _ string) { emitted = append(emitted, b) }
+	ops.EmitExecutionStepStarted = func(b beads.Bead, _ string, _ []string, _ string, _ string) { emitted = append(emitted, b) }
 
 	var stdout, stderr bytes.Buffer
 	if code := doHookClaim("bd ready --json", "/tmp/work", poolClaimOpts(), ops, &stdout, &stderr); code != 0 {

@@ -303,7 +303,13 @@ func runControlDispatcherWithStoreAndConfig(cityPath, storePath string, store be
 		rootID := strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
 		if rootID != "" {
 			recorder := openCityRecorderAt(cityPath, stderr)
-			emitErr := executionevent.EmitCurrent(recorder, beads.GraphStore{Store: graphStore}, beads.WorkStore{Store: executionEmitStore(store, cityPath)}, rootID, "control-dispatch")
+			workRef := ""
+			if cfg != nil {
+				workRef = workflowStoreRefForDir(storePath, cityPath, loadedCityName(cfg, cityPath), cfg)
+			}
+			projectionGraph := executionGraphProjectionStore(cliStorageRoutes(cityPath), store, graphStore, workRef)
+			projectionWork := executionEmitStore(executionevent.WithStoreRef(store, workRef), cityPath)
+			emitErr := executionevent.EmitCurrent(recorder, beads.GraphStore{Store: projectionGraph}, beads.WorkStore{Store: projectionWork}, rootID, "control-dispatch")
 			var closeErr error
 			if closer, ok := recorder.(io.Closer); ok {
 				closeErr = closer.Close()

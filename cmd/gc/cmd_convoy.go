@@ -806,23 +806,33 @@ func resolveConvoyStore(convoyID string, cfg *config.City, cityPath string, open
 // and that is not a fudge. Callers map this directory to a store-ref
 // ("city:<name>" / "rig:<name>") that scopes molecule-root lookups. These beads
 // lived in the city store and carried the city's ref before the migration moved
-// them; a binding is not a rig and has no ref of its own, and inventing one
-// would strand every root recorded before the move.
+// them. Replacing that legacy lookup scope with the physical class ref would
+// strand roots recorded before the move. Event projection obtains the separate
+// physical ref through resolveOwningStoreIdentity instead.
 func resolveOwningStoreDir(beadID string, cfg *config.City, cityPath string, openStore func(string) (beads.Store, error)) (beads.Store, string, error) {
+	store, dir, _, err := resolveOwningStoreIdentity(beadID, cfg, cityPath, openStore)
+	return store, dir, err
+}
+
+// resolveOwningStoreIdentity retains the physical store ref separately from
+// the logical directory used by older workflow lookup callers. In particular,
+// a binding can share cityPath with work without sharing its physical identity.
+// Both APIs use exactly the same residency and collision policy.
+func resolveOwningStoreIdentity(beadID string, cfg *config.City, cityPath string, openStore func(string) (beads.Store, error)) (beads.Store, string, string, error) {
 	owner, ownedByBinding, err := cliByIDBindingOwner(cityPath, beadID)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	if ownedByBinding {
 		if err := refuseBindingRigCollision(beadID, cfg, cityPath, openStore); err != nil {
-			return nil, "", err
+			return nil, "", "", err
 		}
-		return owner.Store, cityPath, nil
+		return owner.Store, cityPath, string(owner.Ref), nil
 	}
 
 	candidates, err := openConvoyStores(cfg, cityPath, beadID, openStore)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	var (
 		foundStore beads.Store
@@ -836,18 +846,22 @@ func resolveOwningStoreDir(beadID string, cfg *config.City, cityPath string, ope
 			if errors.Is(err, beads.ErrNotFound) {
 				continue
 			}
-			return nil, "", err
+			return nil, "", "", err
 		}
 		if foundStore != nil {
-			return nil, "", fmt.Errorf("bead %s exists in multiple stores (%s and %s); resolution requires a uniquely addressable bead id", beadID, foundDir, candidate.path)
+			return nil, "", "", fmt.Errorf("bead %s exists in multiple stores (%s and %s); resolution requires a uniquely addressable bead id", beadID, foundDir, candidate.path)
 		}
 		foundStore = candidate.store
 		foundDir = candidate.path
 	}
 	if foundStore == nil {
-		return nil, "", beads.ErrNotFound
+		return nil, "", "", beads.ErrNotFound
 	}
-	return foundStore, foundDir, nil
+	ref := ""
+	if cfg != nil {
+		ref = workflowStoreRefForDir(foundDir, cityPath, loadedCityName(cfg, cityPath), cfg)
+	}
+	return foundStore, foundDir, ref, nil
 }
 
 // refuseBindingRigCollision restores the uniqueness contract to the one case
@@ -2151,20 +2165,25 @@ func doConvoyAutoclose(beadID string, stdout, stderr io.Writer) {
 // without wedging every close on a city with a sick store — but it is announced
 // first. See warnAutocloseResolutionFault.
 func autocloseOwningStore(beadID, cityPath string) (beads.Store, string, bool) {
+	store, dir, _, ok := autocloseOwningStoreIdentity(beadID, cityPath)
+	return store, dir, ok
+}
+
+func autocloseOwningStoreIdentity(beadID, cityPath string) (beads.Store, string, string, bool) {
 	cfg, _, err := config.LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
 	if err != nil {
-		return nil, "", false
+		return nil, "", "", false
 	}
-	store, dir, err := resolveOwningStoreDir(beadID, cfg, cityPath, func(storeDir string) (beads.Store, error) {
+	store, dir, ref, err := resolveOwningStoreIdentity(beadID, cfg, cityPath, func(storeDir string) (beads.Store, error) {
 		return openStoreAtForCity(storeDir, cityPath)
 	})
 	if err != nil {
 		if !errors.Is(err, beads.ErrNotFound) {
 			warnAutocloseResolutionFault(beadID, err)
 		}
-		return nil, "", false
+		return nil, "", "", false
 	}
-	return store, dir, true
+	return store, dir, ref, true
 }
 
 // autocloseFaultOnce bounds warnAutocloseResolutionFault to one line per

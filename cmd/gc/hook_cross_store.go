@@ -14,6 +14,8 @@ import (
 type hookStore struct {
 	dir string
 	env []string
+	// storeRef is paired with env when this work-store leg is constructed.
+	storeRef string
 	// command overrides the shared work query for this store, and is empty on
 	// every store production builds: one command is run against each leg in
 	// turn. It was set by scopeFederatedHookStores when that pinned the
@@ -105,7 +107,7 @@ type hookStoreRunner func(command, dir string, env []string) (string, error)
 // (conformanceClaimRouting); closing the gap makes the claim stop being a bd
 // subprocess call, and I15 pins the see-but-cannot-claim asymmetry until it does.
 func hookWorkQueryStores(cityPath string, cfg *config.City, a *config.Agent, agentForQuery, workDir string, queryEnv []string, identityOverrides map[string]string) []hookStore {
-	stores := []hookStore{{dir: workDir, env: queryEnv}}
+	stores := []hookStore{{dir: workDir, env: queryEnv, storeRef: hookWorkStoreRefForEnv(cityPath, cfg, a, queryEnv, identityOverrides)}}
 	if agentIsCrossStoreEligible(a) {
 		return appendRigHookStores(stores, cityPath, cfg, a, identityOverrides)
 	}
@@ -120,6 +122,47 @@ func hookWorkQueryStores(cityPath string, cfg *config.City, a *config.Agent, age
 	// entry reaches the CITY store and root-only beads assigned to the agent
 	// stay invisible. Best-effort tertiary; see appendCityHookStore.
 	return appendCityHookStore(stores, cityPath, cfg, a, identityOverrides)
+}
+
+// hookWorkStoreRef uses the same configured scope selection as
+// controllerWorkQueryEnv. The agent's command directory is not its store.
+func hookWorkStoreRef(cityPath string, cfg *config.City, a *config.Agent) string {
+	if cityPath == "" || cfg == nil || a == nil {
+		return ""
+	}
+	if rig := configuredRigName(cityPath, a, cfg.Rigs); rig != "" && rigRootForName(rig, cfg.Rigs) != "" {
+		return "rig:" + rig
+	}
+	return workflowStoreRefForDir(cityPath, cityPath, loadedCityName(cfg, cityPath), cfg)
+}
+
+// hookWorkStoreRefForEnv binds the label to the environment actually supplied
+// to the claim subprocess. Construction metadata alone is not evidence when a
+// caller replaces or adds a store selector. No re-resolution or recovery is
+// performed here: failure to prove the pairing only withholds trace enrichment.
+func hookWorkStoreRefForEnv(cityPath string, cfg *config.City, a *config.Agent, env []string, constructed map[string]string) string {
+	if len(env) == 0 || constructed["BEADS_DIR"] == "" {
+		return ""
+	}
+	actual := hookClaimEnvMap(env, "", "")
+	selector := func(key string) bool {
+		return strings.HasPrefix(key, "BEADS_") && key != "BEADS_ACTOR" ||
+			strings.HasPrefix(key, "GC_STORE_") || strings.HasPrefix(key, "GC_DOLT_") ||
+			strings.HasPrefix(key, "GC_BEADS") || key == "GC_RIG" || key == "GC_RIG_ROOT" ||
+			key == "BD_BIN" || key == "GC_DOLT" || key == "GC_CITY" ||
+			key == "GC_CITY_PATH" || key == "GC_CITY_RUNTIME_DIR"
+	}
+	for key, value := range constructed {
+		if selector(key) && actual[key] != value {
+			return ""
+		}
+	}
+	for key, value := range actual {
+		if selector(key) && constructed[key] != value {
+			return ""
+		}
+	}
+	return hookWorkStoreRef(cityPath, cfg, a)
 }
 
 // hookIdentityEnvKeys are the identity overrides that must stay constant across
@@ -182,9 +225,11 @@ func appendOneRigHookStore(stores []hookStore, cityPath string, cfg *config.City
 			rigEnv[k] = v
 		}
 	}
+	env := mergeRuntimeEnv(os.Environ(), rigEnv)
 	return append(stores, hookStore{
-		dir: agentCommandDir(cityPath, &view, cfg.Rigs),
-		env: mergeRuntimeEnv(os.Environ(), rigEnv),
+		dir:      agentCommandDir(cityPath, &view, cfg.Rigs),
+		env:      env,
+		storeRef: hookWorkStoreRefForEnv(cityPath, cfg, &view, env, rigEnv),
 	})
 }
 
@@ -216,9 +261,11 @@ func appendCityHookStore(stores []hookStore, cityPath string, cfg *config.City, 
 			cityEnv[k] = v
 		}
 	}
+	env := mergeRuntimeEnv(os.Environ(), cityEnv)
 	return append(stores, hookStore{
-		dir: cityPath,
-		env: mergeRuntimeEnv(os.Environ(), cityEnv),
+		dir:      cityPath,
+		env:      env,
+		storeRef: hookWorkStoreRefForEnv(cityPath, cfg, &view, env, cityEnv),
 	})
 }
 

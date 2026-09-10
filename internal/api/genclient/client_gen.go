@@ -1766,10 +1766,12 @@ type EventStreamEnvelope struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          *EventPayload            `json:"payload,omitempty"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5291,10 +5293,12 @@ type TaggedEventStreamEnvelope struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          *EventPayload            `json:"payload,omitempty"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5318,10 +5322,12 @@ type TypedEventStreamEnvelopeBackendCredentialResolved struct {
 	Message          *string                          `json:"message,omitempty"`
 	Payload          BackendCredentialResolvedPayload `json:"payload"`
 	RunId            *string                          `json:"run_id,omitempty"`
+	RunStoreRef      *string                          `json:"run_store_ref,omitempty"`
 	Seq              int64                            `json:"seq"`
 	SessionId        *string                          `json:"session_id,omitempty"`
 	StepId           *string                          `json:"step_id,omitempty"`
 	Subject          *string                          `json:"subject,omitempty"`
+	SubjectStoreRef  *string                          `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                        `json:"ts"`
 	Type             string                           `json:"type"`
 	Workflow         *WorkflowEventProjection         `json:"workflow,omitempty"`
@@ -5334,10 +5340,12 @@ type TypedEventStreamEnvelopeBeadClaimRejected struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          BeadClaimRejectedPayload `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5350,10 +5358,12 @@ type TypedEventStreamEnvelopeBeadClaimReleased struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          BeadClaimReleasedPayload `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5366,10 +5376,12 @@ type TypedEventStreamEnvelopeBeadClosed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          BeadEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5382,10 +5394,12 @@ type TypedEventStreamEnvelopeBeadCreated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          BeadEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5398,10 +5412,12 @@ type TypedEventStreamEnvelopeBeadDeadAssigneeReopened struct {
 	Message          *string                         `json:"message,omitempty"`
 	Payload          BeadDeadAssigneeReopenedPayload `json:"payload"`
 	RunId            *string                         `json:"run_id,omitempty"`
+	RunStoreRef      *string                         `json:"run_store_ref,omitempty"`
 	Seq              int64                           `json:"seq"`
 	SessionId        *string                         `json:"session_id,omitempty"`
 	StepId           *string                         `json:"step_id,omitempty"`
 	Subject          *string                         `json:"subject,omitempty"`
+	SubjectStoreRef  *string                         `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                       `json:"ts"`
 	Type             string                          `json:"type"`
 	Workflow         *WorkflowEventProjection        `json:"workflow,omitempty"`
@@ -5414,10 +5430,12 @@ type TypedEventStreamEnvelopeBeadDeleted struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          BeadEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5430,10 +5448,12 @@ type TypedEventStreamEnvelopeBeadUpdated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          BeadEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5446,10 +5466,12 @@ type TypedEventStreamEnvelopeBeadWorktreeReapSkipped struct {
 	Message          *string                        `json:"message,omitempty"`
 	Payload          BeadWorktreeReapSkippedPayload `json:"payload"`
 	RunId            *string                        `json:"run_id,omitempty"`
+	RunStoreRef      *string                        `json:"run_store_ref,omitempty"`
 	Seq              int64                          `json:"seq"`
 	SessionId        *string                        `json:"session_id,omitempty"`
 	StepId           *string                        `json:"step_id,omitempty"`
 	Subject          *string                        `json:"subject,omitempty"`
+	SubjectStoreRef  *string                        `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                      `json:"ts"`
 	Type             string                         `json:"type"`
 	Workflow         *WorkflowEventProjection       `json:"workflow,omitempty"`
@@ -5462,10 +5484,12 @@ type TypedEventStreamEnvelopeBeadWorktreeReaped struct {
 	Message          *string                   `json:"message,omitempty"`
 	Payload          BeadWorktreeReapedPayload `json:"payload"`
 	RunId            *string                   `json:"run_id,omitempty"`
+	RunStoreRef      *string                   `json:"run_store_ref,omitempty"`
 	Seq              int64                     `json:"seq"`
 	SessionId        *string                   `json:"session_id,omitempty"`
 	StepId           *string                   `json:"step_id,omitempty"`
 	Subject          *string                   `json:"subject,omitempty"`
+	SubjectStoreRef  *string                   `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                 `json:"ts"`
 	Type             string                    `json:"type"`
 	Workflow         *WorkflowEventProjection  `json:"workflow,omitempty"`
@@ -5478,10 +5502,12 @@ type TypedEventStreamEnvelopeBeadsConditionalWritesDegraded struct {
 	Message          *string                          `json:"message,omitempty"`
 	Payload          ConditionalWritesDegradedPayload `json:"payload"`
 	RunId            *string                          `json:"run_id,omitempty"`
+	RunStoreRef      *string                          `json:"run_store_ref,omitempty"`
 	Seq              int64                            `json:"seq"`
 	SessionId        *string                          `json:"session_id,omitempty"`
 	StepId           *string                          `json:"step_id,omitempty"`
 	Subject          *string                          `json:"subject,omitempty"`
+	SubjectStoreRef  *string                          `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                        `json:"ts"`
 	Type             string                           `json:"type"`
 	Workflow         *WorkflowEventProjection         `json:"workflow,omitempty"`
@@ -5494,10 +5520,12 @@ type TypedEventStreamEnvelopeCityCreated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          CityLifecyclePayload     `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5510,10 +5538,12 @@ type TypedEventStreamEnvelopeCityResumed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5526,10 +5556,12 @@ type TypedEventStreamEnvelopeCitySuspended struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5542,10 +5574,12 @@ type TypedEventStreamEnvelopeCityUnregisterRequested struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          CityLifecyclePayload     `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5558,10 +5592,12 @@ type TypedEventStreamEnvelopeControlRootSettleFailed struct {
 	Message          *string                        `json:"message,omitempty"`
 	Payload          ControlRootSettleFailedPayload `json:"payload"`
 	RunId            *string                        `json:"run_id,omitempty"`
+	RunStoreRef      *string                        `json:"run_store_ref,omitempty"`
 	Seq              int64                          `json:"seq"`
 	SessionId        *string                        `json:"session_id,omitempty"`
 	StepId           *string                        `json:"step_id,omitempty"`
 	Subject          *string                        `json:"subject,omitempty"`
+	SubjectStoreRef  *string                        `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                      `json:"ts"`
 	Type             string                         `json:"type"`
 	Workflow         *WorkflowEventProjection       `json:"workflow,omitempty"`
@@ -5574,10 +5610,12 @@ type TypedEventStreamEnvelopeControlStalled struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          ControlStalledPayload    `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5590,10 +5628,12 @@ type TypedEventStreamEnvelopeControllerStarted struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5606,10 +5646,12 @@ type TypedEventStreamEnvelopeControllerStopped struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5622,10 +5664,12 @@ type TypedEventStreamEnvelopeConvoyClosed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5638,10 +5682,12 @@ type TypedEventStreamEnvelopeConvoyCreated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5654,10 +5700,12 @@ type TypedEventStreamEnvelopeCustom struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          interface{}              `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5670,10 +5718,12 @@ type TypedEventStreamEnvelopeEmergencyAcked struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          Record                   `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5686,10 +5736,12 @@ type TypedEventStreamEnvelopeEmergencySignaled struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          Record                   `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5702,10 +5754,12 @@ type TypedEventStreamEnvelopeEventsRotated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          RotatedPayload           `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5718,10 +5772,12 @@ type TypedEventStreamEnvelopeExecutionClaimWindowExpired struct {
 	Message          *string                            `json:"message,omitempty"`
 	Payload          ExecutionClaimWindowExpiredPayload `json:"payload"`
 	RunId            *string                            `json:"run_id,omitempty"`
+	RunStoreRef      *string                            `json:"run_store_ref,omitempty"`
 	Seq              int64                              `json:"seq"`
 	SessionId        *string                            `json:"session_id,omitempty"`
 	StepId           *string                            `json:"step_id,omitempty"`
 	Subject          *string                            `json:"subject,omitempty"`
+	SubjectStoreRef  *string                            `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                          `json:"ts"`
 	Type             string                             `json:"type"`
 	Workflow         *WorkflowEventProjection           `json:"workflow,omitempty"`
@@ -5734,10 +5790,12 @@ type TypedEventStreamEnvelopeExecutionRunAnchored struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5750,10 +5808,12 @@ type TypedEventStreamEnvelopeExecutionStepCompleted struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5766,10 +5826,12 @@ type TypedEventStreamEnvelopeExecutionStepDefined struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5782,10 +5844,12 @@ type TypedEventStreamEnvelopeExecutionStepStalled struct {
 	Message          *string                     `json:"message,omitempty"`
 	Payload          ExecutionStepStalledPayload `json:"payload"`
 	RunId            *string                     `json:"run_id,omitempty"`
+	RunStoreRef      *string                     `json:"run_store_ref,omitempty"`
 	Seq              int64                       `json:"seq"`
 	SessionId        *string                     `json:"session_id,omitempty"`
 	StepId           *string                     `json:"step_id,omitempty"`
 	Subject          *string                     `json:"subject,omitempty"`
+	SubjectStoreRef  *string                     `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                   `json:"ts"`
 	Type             string                      `json:"type"`
 	Workflow         *WorkflowEventProjection    `json:"workflow,omitempty"`
@@ -5798,10 +5862,12 @@ type TypedEventStreamEnvelopeExecutionStepStarted struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5814,10 +5880,12 @@ type TypedEventStreamEnvelopeExecutionWorkAssociated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5830,10 +5898,12 @@ type TypedEventStreamEnvelopeExtmsgAdapterAdded struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          AdapterEventPayload      `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5846,10 +5916,12 @@ type TypedEventStreamEnvelopeExtmsgAdapterRemoved struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          AdapterEventPayload      `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5862,10 +5934,12 @@ type TypedEventStreamEnvelopeExtmsgBound struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          BoundEventPayload        `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5878,10 +5952,12 @@ type TypedEventStreamEnvelopeExtmsgGroupCreated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          GroupCreatedEventPayload `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5894,10 +5970,12 @@ type TypedEventStreamEnvelopeExtmsgInbound struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          InboundEventPayload      `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5910,10 +5988,12 @@ type TypedEventStreamEnvelopeExtmsgOutbound struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          OutboundEventPayload     `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5926,10 +6006,12 @@ type TypedEventStreamEnvelopeExtmsgOutboundChannelMismatch struct {
 	Message          *string                        `json:"message,omitempty"`
 	Payload          OutboundChannelMismatchPayload `json:"payload"`
 	RunId            *string                        `json:"run_id,omitempty"`
+	RunStoreRef      *string                        `json:"run_store_ref,omitempty"`
 	Seq              int64                          `json:"seq"`
 	SessionId        *string                        `json:"session_id,omitempty"`
 	StepId           *string                        `json:"step_id,omitempty"`
 	Subject          *string                        `json:"subject,omitempty"`
+	SubjectStoreRef  *string                        `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                      `json:"ts"`
 	Type             string                         `json:"type"`
 	Workflow         *WorkflowEventProjection       `json:"workflow,omitempty"`
@@ -5942,10 +6024,12 @@ type TypedEventStreamEnvelopeExtmsgUnbound struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          UnboundEventPayload      `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5958,10 +6042,12 @@ type TypedEventStreamEnvelopeGcStoreDiskCritical struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          StoreDiskCriticalPayload `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5974,10 +6060,12 @@ type TypedEventStreamEnvelopeGcStoreDiskWarn struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          StoreDiskWarnPayload     `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -5990,10 +6078,12 @@ type TypedEventStreamEnvelopeGcStoreMaintenanceDone struct {
 	Message          *string                     `json:"message,omitempty"`
 	Payload          StoreMaintenanceDonePayload `json:"payload"`
 	RunId            *string                     `json:"run_id,omitempty"`
+	RunStoreRef      *string                     `json:"run_store_ref,omitempty"`
 	Seq              int64                       `json:"seq"`
 	SessionId        *string                     `json:"session_id,omitempty"`
 	StepId           *string                     `json:"step_id,omitempty"`
 	Subject          *string                     `json:"subject,omitempty"`
+	SubjectStoreRef  *string                     `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                   `json:"ts"`
 	Type             string                      `json:"type"`
 	Workflow         *WorkflowEventProjection    `json:"workflow,omitempty"`
@@ -6006,10 +6096,12 @@ type TypedEventStreamEnvelopeGcStoreMaintenanceFailed struct {
 	Message          *string                       `json:"message,omitempty"`
 	Payload          StoreMaintenanceFailedPayload `json:"payload"`
 	RunId            *string                       `json:"run_id,omitempty"`
+	RunStoreRef      *string                       `json:"run_store_ref,omitempty"`
 	Seq              int64                         `json:"seq"`
 	SessionId        *string                       `json:"session_id,omitempty"`
 	StepId           *string                       `json:"step_id,omitempty"`
 	Subject          *string                       `json:"subject,omitempty"`
+	SubjectStoreRef  *string                       `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                     `json:"ts"`
 	Type             string                        `json:"type"`
 	Workflow         *WorkflowEventProjection      `json:"workflow,omitempty"`
@@ -6022,10 +6114,12 @@ type TypedEventStreamEnvelopeMailArchived struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MailEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6038,10 +6132,12 @@ type TypedEventStreamEnvelopeMailDeleted struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MailEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6054,10 +6150,12 @@ type TypedEventStreamEnvelopeMailMarkedRead struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MailEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6070,10 +6168,12 @@ type TypedEventStreamEnvelopeMailMarkedUnread struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MailEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6086,10 +6186,12 @@ type TypedEventStreamEnvelopeMailRead struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MailEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6102,10 +6204,12 @@ type TypedEventStreamEnvelopeMailReplied struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MailEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6118,10 +6222,12 @@ type TypedEventStreamEnvelopeMailSent struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MailEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6134,10 +6240,12 @@ type TypedEventStreamEnvelopeMoleculeResolved struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MoleculeResolvedPayload  `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6150,10 +6258,12 @@ type TypedEventStreamEnvelopeOrderCompleted struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6166,10 +6276,12 @@ type TypedEventStreamEnvelopeOrderFailed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6182,10 +6294,12 @@ type TypedEventStreamEnvelopeOrderFired struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6198,10 +6312,12 @@ type TypedEventStreamEnvelopeOrderSuppressed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          OrderSuppressedPayload   `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6214,10 +6330,12 @@ type TypedEventStreamEnvelopeProjectIdentityStamped struct {
 	Message          *string                       `json:"message,omitempty"`
 	Payload          ProjectIdentityStampedPayload `json:"payload"`
 	RunId            *string                       `json:"run_id,omitempty"`
+	RunStoreRef      *string                       `json:"run_store_ref,omitempty"`
 	Seq              int64                         `json:"seq"`
 	SessionId        *string                       `json:"session_id,omitempty"`
 	StepId           *string                       `json:"step_id,omitempty"`
 	Subject          *string                       `json:"subject,omitempty"`
+	SubjectStoreRef  *string                       `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                     `json:"ts"`
 	Type             string                        `json:"type"`
 	Workflow         *WorkflowEventProjection      `json:"workflow,omitempty"`
@@ -6230,10 +6348,12 @@ type TypedEventStreamEnvelopeProviderSwapped struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6246,10 +6366,12 @@ type TypedEventStreamEnvelopeRequestFailed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          RequestFailedPayload     `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6262,10 +6384,12 @@ type TypedEventStreamEnvelopeRequestResultCityCreate struct {
 	Message          *string                    `json:"message,omitempty"`
 	Payload          CityCreateSucceededPayload `json:"payload"`
 	RunId            *string                    `json:"run_id,omitempty"`
+	RunStoreRef      *string                    `json:"run_store_ref,omitempty"`
 	Seq              int64                      `json:"seq"`
 	SessionId        *string                    `json:"session_id,omitempty"`
 	StepId           *string                    `json:"step_id,omitempty"`
 	Subject          *string                    `json:"subject,omitempty"`
+	SubjectStoreRef  *string                    `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                  `json:"ts"`
 	Type             string                     `json:"type"`
 	Workflow         *WorkflowEventProjection   `json:"workflow,omitempty"`
@@ -6278,10 +6402,12 @@ type TypedEventStreamEnvelopeRequestResultCityUnregister struct {
 	Message          *string                        `json:"message,omitempty"`
 	Payload          CityUnregisterSucceededPayload `json:"payload"`
 	RunId            *string                        `json:"run_id,omitempty"`
+	RunStoreRef      *string                        `json:"run_store_ref,omitempty"`
 	Seq              int64                          `json:"seq"`
 	SessionId        *string                        `json:"session_id,omitempty"`
 	StepId           *string                        `json:"step_id,omitempty"`
 	Subject          *string                        `json:"subject,omitempty"`
+	SubjectStoreRef  *string                        `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                      `json:"ts"`
 	Type             string                         `json:"type"`
 	Workflow         *WorkflowEventProjection       `json:"workflow,omitempty"`
@@ -6294,10 +6420,12 @@ type TypedEventStreamEnvelopeRequestResultRigCreate struct {
 	Message          *string                   `json:"message,omitempty"`
 	Payload          RigCreateSucceededPayload `json:"payload"`
 	RunId            *string                   `json:"run_id,omitempty"`
+	RunStoreRef      *string                   `json:"run_store_ref,omitempty"`
 	Seq              int64                     `json:"seq"`
 	SessionId        *string                   `json:"session_id,omitempty"`
 	StepId           *string                   `json:"step_id,omitempty"`
 	Subject          *string                   `json:"subject,omitempty"`
+	SubjectStoreRef  *string                   `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                 `json:"ts"`
 	Type             string                    `json:"type"`
 	Workflow         *WorkflowEventProjection  `json:"workflow,omitempty"`
@@ -6310,10 +6438,12 @@ type TypedEventStreamEnvelopeRequestResultSessionCreate struct {
 	Message          *string                       `json:"message,omitempty"`
 	Payload          SessionCreateSucceededPayload `json:"payload"`
 	RunId            *string                       `json:"run_id,omitempty"`
+	RunStoreRef      *string                       `json:"run_store_ref,omitempty"`
 	Seq              int64                         `json:"seq"`
 	SessionId        *string                       `json:"session_id,omitempty"`
 	StepId           *string                       `json:"step_id,omitempty"`
 	Subject          *string                       `json:"subject,omitempty"`
+	SubjectStoreRef  *string                       `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                     `json:"ts"`
 	Type             string                        `json:"type"`
 	Workflow         *WorkflowEventProjection      `json:"workflow,omitempty"`
@@ -6326,10 +6456,12 @@ type TypedEventStreamEnvelopeRequestResultSessionMessage struct {
 	Message          *string                        `json:"message,omitempty"`
 	Payload          SessionMessageSucceededPayload `json:"payload"`
 	RunId            *string                        `json:"run_id,omitempty"`
+	RunStoreRef      *string                        `json:"run_store_ref,omitempty"`
 	Seq              int64                          `json:"seq"`
 	SessionId        *string                        `json:"session_id,omitempty"`
 	StepId           *string                        `json:"step_id,omitempty"`
 	Subject          *string                        `json:"subject,omitempty"`
+	SubjectStoreRef  *string                        `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                      `json:"ts"`
 	Type             string                         `json:"type"`
 	Workflow         *WorkflowEventProjection       `json:"workflow,omitempty"`
@@ -6342,10 +6474,12 @@ type TypedEventStreamEnvelopeRequestResultSessionSubmit struct {
 	Message          *string                       `json:"message,omitempty"`
 	Payload          SessionSubmitSucceededPayload `json:"payload"`
 	RunId            *string                       `json:"run_id,omitempty"`
+	RunStoreRef      *string                       `json:"run_store_ref,omitempty"`
 	Seq              int64                         `json:"seq"`
 	SessionId        *string                       `json:"session_id,omitempty"`
 	StepId           *string                       `json:"step_id,omitempty"`
 	Subject          *string                       `json:"subject,omitempty"`
+	SubjectStoreRef  *string                       `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                     `json:"ts"`
 	Type             string                        `json:"type"`
 	Workflow         *WorkflowEventProjection      `json:"workflow,omitempty"`
@@ -6358,10 +6492,12 @@ type TypedEventStreamEnvelopeRigProvisionProgress struct {
 	Message          *string                     `json:"message,omitempty"`
 	Payload          RigProvisionProgressPayload `json:"payload"`
 	RunId            *string                     `json:"run_id,omitempty"`
+	RunStoreRef      *string                     `json:"run_store_ref,omitempty"`
 	Seq              int64                       `json:"seq"`
 	SessionId        *string                     `json:"session_id,omitempty"`
 	StepId           *string                     `json:"step_id,omitempty"`
 	Subject          *string                     `json:"subject,omitempty"`
+	SubjectStoreRef  *string                     `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                   `json:"ts"`
 	Type             string                      `json:"type"`
 	Workflow         *WorkflowEventProjection    `json:"workflow,omitempty"`
@@ -6374,10 +6510,12 @@ type TypedEventStreamEnvelopeSessionColdStartTimeout struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6390,10 +6528,12 @@ type TypedEventStreamEnvelopeSessionCrashed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          SessionLifecyclePayload  `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6406,10 +6546,12 @@ type TypedEventStreamEnvelopeSessionDemandClaimDivergence struct {
 	Message          *string                             `json:"message,omitempty"`
 	Payload          SessionDemandClaimDivergencePayload `json:"payload"`
 	RunId            *string                             `json:"run_id,omitempty"`
+	RunStoreRef      *string                             `json:"run_store_ref,omitempty"`
 	Seq              int64                               `json:"seq"`
 	SessionId        *string                             `json:"session_id,omitempty"`
 	StepId           *string                             `json:"step_id,omitempty"`
 	Subject          *string                             `json:"subject,omitempty"`
+	SubjectStoreRef  *string                             `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                           `json:"ts"`
 	Type             string                              `json:"type"`
 	Workflow         *WorkflowEventProjection            `json:"workflow,omitempty"`
@@ -6422,10 +6564,12 @@ type TypedEventStreamEnvelopeSessionDrainAckedWithAssignedWork struct {
 	Message          *string                                  `json:"message,omitempty"`
 	Payload          SessionDrainAckedWithAssignedWorkPayload `json:"payload"`
 	RunId            *string                                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                                  `json:"run_store_ref,omitempty"`
 	Seq              int64                                    `json:"seq"`
 	SessionId        *string                                  `json:"session_id,omitempty"`
 	StepId           *string                                  `json:"step_id,omitempty"`
 	Subject          *string                                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                                `json:"ts"`
 	Type             string                                   `json:"type"`
 	Workflow         *WorkflowEventProjection                 `json:"workflow,omitempty"`
@@ -6438,10 +6582,12 @@ type TypedEventStreamEnvelopeSessionDrainFenceUnavailable struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          SessionLifecyclePayload  `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6454,10 +6600,12 @@ type TypedEventStreamEnvelopeSessionDraining struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6470,10 +6618,12 @@ type TypedEventStreamEnvelopeSessionIdleKilled struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6486,10 +6636,12 @@ type TypedEventStreamEnvelopeSessionMaxAgeKilled struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6502,10 +6654,12 @@ type TypedEventStreamEnvelopeSessionQuarantined struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6518,10 +6672,12 @@ type TypedEventStreamEnvelopeSessionResetStalled struct {
 	Message          *string                    `json:"message,omitempty"`
 	Payload          SessionResetStalledPayload `json:"payload"`
 	RunId            *string                    `json:"run_id,omitempty"`
+	RunStoreRef      *string                    `json:"run_store_ref,omitempty"`
 	Seq              int64                      `json:"seq"`
 	SessionId        *string                    `json:"session_id,omitempty"`
 	StepId           *string                    `json:"step_id,omitempty"`
 	Subject          *string                    `json:"subject,omitempty"`
+	SubjectStoreRef  *string                    `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                  `json:"ts"`
 	Type             string                     `json:"type"`
 	Workflow         *WorkflowEventProjection   `json:"workflow,omitempty"`
@@ -6534,10 +6690,12 @@ type TypedEventStreamEnvelopeSessionStopped struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          SessionLifecyclePayload  `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6550,10 +6708,12 @@ type TypedEventStreamEnvelopeSessionStranded struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          SessionStrandedPayload   `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6566,10 +6726,12 @@ type TypedEventStreamEnvelopeSessionSuspended struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6582,10 +6744,12 @@ type TypedEventStreamEnvelopeSessionUndrained struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6598,10 +6762,12 @@ type TypedEventStreamEnvelopeSessionUnknownState struct {
 	Message          *string                    `json:"message,omitempty"`
 	Payload          SessionUnknownStatePayload `json:"payload"`
 	RunId            *string                    `json:"run_id,omitempty"`
+	RunStoreRef      *string                    `json:"run_store_ref,omitempty"`
 	Seq              int64                      `json:"seq"`
 	SessionId        *string                    `json:"session_id,omitempty"`
 	StepId           *string                    `json:"step_id,omitempty"`
 	Subject          *string                    `json:"subject,omitempty"`
+	SubjectStoreRef  *string                    `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                  `json:"ts"`
 	Type             string                     `json:"type"`
 	Workflow         *WorkflowEventProjection   `json:"workflow,omitempty"`
@@ -6614,10 +6780,12 @@ type TypedEventStreamEnvelopeSessionUpdated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6630,10 +6798,12 @@ type TypedEventStreamEnvelopeSessionWakeRefused struct {
 	Message          *string                   `json:"message,omitempty"`
 	Payload          SessionWakeRefusedPayload `json:"payload"`
 	RunId            *string                   `json:"run_id,omitempty"`
+	RunStoreRef      *string                   `json:"run_store_ref,omitempty"`
 	Seq              int64                     `json:"seq"`
 	SessionId        *string                   `json:"session_id,omitempty"`
 	StepId           *string                   `json:"step_id,omitempty"`
 	Subject          *string                   `json:"subject,omitempty"`
+	SubjectStoreRef  *string                   `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                 `json:"ts"`
 	Type             string                    `json:"type"`
 	Workflow         *WorkflowEventProjection  `json:"workflow,omitempty"`
@@ -6646,10 +6816,12 @@ type TypedEventStreamEnvelopeSessionWoke struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6662,10 +6834,12 @@ type TypedEventStreamEnvelopeSessionWorkQueryFailed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          SessionLifecyclePayload  `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6678,10 +6852,12 @@ type TypedEventStreamEnvelopeStorageBindingConverged struct {
 	Message          *string                      `json:"message,omitempty"`
 	Payload          StorageBindingOutcomePayload `json:"payload"`
 	RunId            *string                      `json:"run_id,omitempty"`
+	RunStoreRef      *string                      `json:"run_store_ref,omitempty"`
 	Seq              int64                        `json:"seq"`
 	SessionId        *string                      `json:"session_id,omitempty"`
 	StepId           *string                      `json:"step_id,omitempty"`
 	Subject          *string                      `json:"subject,omitempty"`
+	SubjectStoreRef  *string                      `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                    `json:"ts"`
 	Type             string                       `json:"type"`
 	Workflow         *WorkflowEventProjection     `json:"workflow,omitempty"`
@@ -6694,10 +6870,12 @@ type TypedEventStreamEnvelopeStorageBindingGenesis struct {
 	Message          *string                      `json:"message,omitempty"`
 	Payload          StorageBindingOutcomePayload `json:"payload"`
 	RunId            *string                      `json:"run_id,omitempty"`
+	RunStoreRef      *string                      `json:"run_store_ref,omitempty"`
 	Seq              int64                        `json:"seq"`
 	SessionId        *string                      `json:"session_id,omitempty"`
 	StepId           *string                      `json:"step_id,omitempty"`
 	Subject          *string                      `json:"subject,omitempty"`
+	SubjectStoreRef  *string                      `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                    `json:"ts"`
 	Type             string                       `json:"type"`
 	Workflow         *WorkflowEventProjection     `json:"workflow,omitempty"`
@@ -6710,10 +6888,12 @@ type TypedEventStreamEnvelopeStorageBindingNotConfigured struct {
 	Message          *string                      `json:"message,omitempty"`
 	Payload          StorageBindingOutcomePayload `json:"payload"`
 	RunId            *string                      `json:"run_id,omitempty"`
+	RunStoreRef      *string                      `json:"run_store_ref,omitempty"`
 	Seq              int64                        `json:"seq"`
 	SessionId        *string                      `json:"session_id,omitempty"`
 	StepId           *string                      `json:"step_id,omitempty"`
 	Subject          *string                      `json:"subject,omitempty"`
+	SubjectStoreRef  *string                      `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                    `json:"ts"`
 	Type             string                       `json:"type"`
 	Workflow         *WorkflowEventProjection     `json:"workflow,omitempty"`
@@ -6726,10 +6906,12 @@ type TypedEventStreamEnvelopeStorageBindingUncheckable struct {
 	Message          *string                      `json:"message,omitempty"`
 	Payload          StorageBindingOutcomePayload `json:"payload"`
 	RunId            *string                      `json:"run_id,omitempty"`
+	RunStoreRef      *string                      `json:"run_store_ref,omitempty"`
 	Seq              int64                        `json:"seq"`
 	SessionId        *string                      `json:"session_id,omitempty"`
 	StepId           *string                      `json:"step_id,omitempty"`
 	Subject          *string                      `json:"subject,omitempty"`
+	SubjectStoreRef  *string                      `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                    `json:"ts"`
 	Type             string                       `json:"type"`
 	Workflow         *WorkflowEventProjection     `json:"workflow,omitempty"`
@@ -6742,10 +6924,12 @@ type TypedEventStreamEnvelopeStorageBindingUnconverged struct {
 	Message          *string                      `json:"message,omitempty"`
 	Payload          StorageBindingOutcomePayload `json:"payload"`
 	RunId            *string                      `json:"run_id,omitempty"`
+	RunStoreRef      *string                      `json:"run_store_ref,omitempty"`
 	Seq              int64                        `json:"seq"`
 	SessionId        *string                      `json:"session_id,omitempty"`
 	StepId           *string                      `json:"step_id,omitempty"`
 	Subject          *string                      `json:"subject,omitempty"`
+	SubjectStoreRef  *string                      `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                    `json:"ts"`
 	Type             string                       `json:"type"`
 	Workflow         *WorkflowEventProjection     `json:"workflow,omitempty"`
@@ -6758,10 +6942,12 @@ type TypedEventStreamEnvelopeSupervisorFsPressureSkippedTick struct {
 	Message          *string                                `json:"message,omitempty"`
 	Payload          SupervisorFSPressureSkippedTickPayload `json:"payload"`
 	RunId            *string                                `json:"run_id,omitempty"`
+	RunStoreRef      *string                                `json:"run_store_ref,omitempty"`
 	Seq              int64                                  `json:"seq"`
 	SessionId        *string                                `json:"session_id,omitempty"`
 	StepId           *string                                `json:"step_id,omitempty"`
 	Subject          *string                                `json:"subject,omitempty"`
+	SubjectStoreRef  *string                                `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                              `json:"ts"`
 	Type             string                                 `json:"type"`
 	Workflow         *WorkflowEventProjection               `json:"workflow,omitempty"`
@@ -6774,10 +6960,12 @@ type TypedEventStreamEnvelopeSupervisorRequest struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          SupervisorRequestPayload `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6790,10 +6978,12 @@ type TypedEventStreamEnvelopeSupervisorShutdownRequested struct {
 	Message          *string                   `json:"message,omitempty"`
 	Payload          SupervisorShutdownPayload `json:"payload"`
 	RunId            *string                   `json:"run_id,omitempty"`
+	RunStoreRef      *string                   `json:"run_store_ref,omitempty"`
 	Seq              int64                     `json:"seq"`
 	SessionId        *string                   `json:"session_id,omitempty"`
 	StepId           *string                   `json:"step_id,omitempty"`
 	Subject          *string                   `json:"subject,omitempty"`
+	SubjectStoreRef  *string                   `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                 `json:"ts"`
 	Type             string                    `json:"type"`
 	Workflow         *WorkflowEventProjection  `json:"workflow,omitempty"`
@@ -6806,10 +6996,12 @@ type TypedEventStreamEnvelopeSupervisorStarted struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          SupervisorStartedPayload `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6822,10 +7014,12 @@ type TypedEventStreamEnvelopeWebhookReceived struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          WebhookReceivedPayload   `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6838,10 +7032,12 @@ type TypedEventStreamEnvelopeWebhookRejected struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          WebhookRejectedPayload   `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6854,10 +7050,12 @@ type TypedEventStreamEnvelopeWorkerOperation struct {
 	Message          *string                     `json:"message,omitempty"`
 	Payload          WorkerOperationEventPayload `json:"payload"`
 	RunId            *string                     `json:"run_id,omitempty"`
+	RunStoreRef      *string                     `json:"run_store_ref,omitempty"`
 	Seq              int64                       `json:"seq"`
 	SessionId        *string                     `json:"session_id,omitempty"`
 	StepId           *string                     `json:"step_id,omitempty"`
 	Subject          *string                     `json:"subject,omitempty"`
+	SubjectStoreRef  *string                     `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                   `json:"ts"`
 	Type             string                      `json:"type"`
 	Workflow         *WorkflowEventProjection    `json:"workflow,omitempty"`
@@ -6876,10 +7074,12 @@ type TypedTaggedEventStreamEnvelopeBackendCredentialResolved struct {
 	Message          *string                          `json:"message,omitempty"`
 	Payload          BackendCredentialResolvedPayload `json:"payload"`
 	RunId            *string                          `json:"run_id,omitempty"`
+	RunStoreRef      *string                          `json:"run_store_ref,omitempty"`
 	Seq              int64                            `json:"seq"`
 	SessionId        *string                          `json:"session_id,omitempty"`
 	StepId           *string                          `json:"step_id,omitempty"`
 	Subject          *string                          `json:"subject,omitempty"`
+	SubjectStoreRef  *string                          `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                        `json:"ts"`
 	Type             string                           `json:"type"`
 	Workflow         *WorkflowEventProjection         `json:"workflow,omitempty"`
@@ -6893,10 +7093,12 @@ type TypedTaggedEventStreamEnvelopeBeadClaimRejected struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          BeadClaimRejectedPayload `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6910,10 +7112,12 @@ type TypedTaggedEventStreamEnvelopeBeadClaimReleased struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          BeadClaimReleasedPayload `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6927,10 +7131,12 @@ type TypedTaggedEventStreamEnvelopeBeadClosed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          BeadEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6944,10 +7150,12 @@ type TypedTaggedEventStreamEnvelopeBeadCreated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          BeadEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6961,10 +7169,12 @@ type TypedTaggedEventStreamEnvelopeBeadDeadAssigneeReopened struct {
 	Message          *string                         `json:"message,omitempty"`
 	Payload          BeadDeadAssigneeReopenedPayload `json:"payload"`
 	RunId            *string                         `json:"run_id,omitempty"`
+	RunStoreRef      *string                         `json:"run_store_ref,omitempty"`
 	Seq              int64                           `json:"seq"`
 	SessionId        *string                         `json:"session_id,omitempty"`
 	StepId           *string                         `json:"step_id,omitempty"`
 	Subject          *string                         `json:"subject,omitempty"`
+	SubjectStoreRef  *string                         `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                       `json:"ts"`
 	Type             string                          `json:"type"`
 	Workflow         *WorkflowEventProjection        `json:"workflow,omitempty"`
@@ -6978,10 +7188,12 @@ type TypedTaggedEventStreamEnvelopeBeadDeleted struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          BeadEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -6995,10 +7207,12 @@ type TypedTaggedEventStreamEnvelopeBeadUpdated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          BeadEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7012,10 +7226,12 @@ type TypedTaggedEventStreamEnvelopeBeadWorktreeReapSkipped struct {
 	Message          *string                        `json:"message,omitempty"`
 	Payload          BeadWorktreeReapSkippedPayload `json:"payload"`
 	RunId            *string                        `json:"run_id,omitempty"`
+	RunStoreRef      *string                        `json:"run_store_ref,omitempty"`
 	Seq              int64                          `json:"seq"`
 	SessionId        *string                        `json:"session_id,omitempty"`
 	StepId           *string                        `json:"step_id,omitempty"`
 	Subject          *string                        `json:"subject,omitempty"`
+	SubjectStoreRef  *string                        `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                      `json:"ts"`
 	Type             string                         `json:"type"`
 	Workflow         *WorkflowEventProjection       `json:"workflow,omitempty"`
@@ -7029,10 +7245,12 @@ type TypedTaggedEventStreamEnvelopeBeadWorktreeReaped struct {
 	Message          *string                   `json:"message,omitempty"`
 	Payload          BeadWorktreeReapedPayload `json:"payload"`
 	RunId            *string                   `json:"run_id,omitempty"`
+	RunStoreRef      *string                   `json:"run_store_ref,omitempty"`
 	Seq              int64                     `json:"seq"`
 	SessionId        *string                   `json:"session_id,omitempty"`
 	StepId           *string                   `json:"step_id,omitempty"`
 	Subject          *string                   `json:"subject,omitempty"`
+	SubjectStoreRef  *string                   `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                 `json:"ts"`
 	Type             string                    `json:"type"`
 	Workflow         *WorkflowEventProjection  `json:"workflow,omitempty"`
@@ -7046,10 +7264,12 @@ type TypedTaggedEventStreamEnvelopeBeadsConditionalWritesDegraded struct {
 	Message          *string                          `json:"message,omitempty"`
 	Payload          ConditionalWritesDegradedPayload `json:"payload"`
 	RunId            *string                          `json:"run_id,omitempty"`
+	RunStoreRef      *string                          `json:"run_store_ref,omitempty"`
 	Seq              int64                            `json:"seq"`
 	SessionId        *string                          `json:"session_id,omitempty"`
 	StepId           *string                          `json:"step_id,omitempty"`
 	Subject          *string                          `json:"subject,omitempty"`
+	SubjectStoreRef  *string                          `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                        `json:"ts"`
 	Type             string                           `json:"type"`
 	Workflow         *WorkflowEventProjection         `json:"workflow,omitempty"`
@@ -7063,10 +7283,12 @@ type TypedTaggedEventStreamEnvelopeCityCreated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          CityLifecyclePayload     `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7080,10 +7302,12 @@ type TypedTaggedEventStreamEnvelopeCityResumed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7097,10 +7321,12 @@ type TypedTaggedEventStreamEnvelopeCitySuspended struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7114,10 +7340,12 @@ type TypedTaggedEventStreamEnvelopeCityUnregisterRequested struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          CityLifecyclePayload     `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7131,10 +7359,12 @@ type TypedTaggedEventStreamEnvelopeControlRootSettleFailed struct {
 	Message          *string                        `json:"message,omitempty"`
 	Payload          ControlRootSettleFailedPayload `json:"payload"`
 	RunId            *string                        `json:"run_id,omitempty"`
+	RunStoreRef      *string                        `json:"run_store_ref,omitempty"`
 	Seq              int64                          `json:"seq"`
 	SessionId        *string                        `json:"session_id,omitempty"`
 	StepId           *string                        `json:"step_id,omitempty"`
 	Subject          *string                        `json:"subject,omitempty"`
+	SubjectStoreRef  *string                        `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                      `json:"ts"`
 	Type             string                         `json:"type"`
 	Workflow         *WorkflowEventProjection       `json:"workflow,omitempty"`
@@ -7148,10 +7378,12 @@ type TypedTaggedEventStreamEnvelopeControlStalled struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          ControlStalledPayload    `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7165,10 +7397,12 @@ type TypedTaggedEventStreamEnvelopeControllerStarted struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7182,10 +7416,12 @@ type TypedTaggedEventStreamEnvelopeControllerStopped struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7199,10 +7435,12 @@ type TypedTaggedEventStreamEnvelopeConvoyClosed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7216,10 +7454,12 @@ type TypedTaggedEventStreamEnvelopeConvoyCreated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7233,10 +7473,12 @@ type TypedTaggedEventStreamEnvelopeCustom struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          interface{}              `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7250,10 +7492,12 @@ type TypedTaggedEventStreamEnvelopeEmergencyAcked struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          Record                   `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7267,10 +7511,12 @@ type TypedTaggedEventStreamEnvelopeEmergencySignaled struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          Record                   `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7284,10 +7530,12 @@ type TypedTaggedEventStreamEnvelopeEventsRotated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          RotatedPayload           `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7301,10 +7549,12 @@ type TypedTaggedEventStreamEnvelopeExecutionClaimWindowExpired struct {
 	Message          *string                            `json:"message,omitempty"`
 	Payload          ExecutionClaimWindowExpiredPayload `json:"payload"`
 	RunId            *string                            `json:"run_id,omitempty"`
+	RunStoreRef      *string                            `json:"run_store_ref,omitempty"`
 	Seq              int64                              `json:"seq"`
 	SessionId        *string                            `json:"session_id,omitempty"`
 	StepId           *string                            `json:"step_id,omitempty"`
 	Subject          *string                            `json:"subject,omitempty"`
+	SubjectStoreRef  *string                            `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                          `json:"ts"`
 	Type             string                             `json:"type"`
 	Workflow         *WorkflowEventProjection           `json:"workflow,omitempty"`
@@ -7318,10 +7568,12 @@ type TypedTaggedEventStreamEnvelopeExecutionRunAnchored struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7335,10 +7587,12 @@ type TypedTaggedEventStreamEnvelopeExecutionStepCompleted struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7352,10 +7606,12 @@ type TypedTaggedEventStreamEnvelopeExecutionStepDefined struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7369,10 +7625,12 @@ type TypedTaggedEventStreamEnvelopeExecutionStepStalled struct {
 	Message          *string                     `json:"message,omitempty"`
 	Payload          ExecutionStepStalledPayload `json:"payload"`
 	RunId            *string                     `json:"run_id,omitempty"`
+	RunStoreRef      *string                     `json:"run_store_ref,omitempty"`
 	Seq              int64                       `json:"seq"`
 	SessionId        *string                     `json:"session_id,omitempty"`
 	StepId           *string                     `json:"step_id,omitempty"`
 	Subject          *string                     `json:"subject,omitempty"`
+	SubjectStoreRef  *string                     `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                   `json:"ts"`
 	Type             string                      `json:"type"`
 	Workflow         *WorkflowEventProjection    `json:"workflow,omitempty"`
@@ -7386,10 +7644,12 @@ type TypedTaggedEventStreamEnvelopeExecutionStepStarted struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7403,10 +7663,12 @@ type TypedTaggedEventStreamEnvelopeExecutionWorkAssociated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7420,10 +7682,12 @@ type TypedTaggedEventStreamEnvelopeExtmsgAdapterAdded struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          AdapterEventPayload      `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7437,10 +7701,12 @@ type TypedTaggedEventStreamEnvelopeExtmsgAdapterRemoved struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          AdapterEventPayload      `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7454,10 +7720,12 @@ type TypedTaggedEventStreamEnvelopeExtmsgBound struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          BoundEventPayload        `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7471,10 +7739,12 @@ type TypedTaggedEventStreamEnvelopeExtmsgGroupCreated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          GroupCreatedEventPayload `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7488,10 +7758,12 @@ type TypedTaggedEventStreamEnvelopeExtmsgInbound struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          InboundEventPayload      `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7505,10 +7777,12 @@ type TypedTaggedEventStreamEnvelopeExtmsgOutbound struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          OutboundEventPayload     `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7522,10 +7796,12 @@ type TypedTaggedEventStreamEnvelopeExtmsgOutboundChannelMismatch struct {
 	Message          *string                        `json:"message,omitempty"`
 	Payload          OutboundChannelMismatchPayload `json:"payload"`
 	RunId            *string                        `json:"run_id,omitempty"`
+	RunStoreRef      *string                        `json:"run_store_ref,omitempty"`
 	Seq              int64                          `json:"seq"`
 	SessionId        *string                        `json:"session_id,omitempty"`
 	StepId           *string                        `json:"step_id,omitempty"`
 	Subject          *string                        `json:"subject,omitempty"`
+	SubjectStoreRef  *string                        `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                      `json:"ts"`
 	Type             string                         `json:"type"`
 	Workflow         *WorkflowEventProjection       `json:"workflow,omitempty"`
@@ -7539,10 +7815,12 @@ type TypedTaggedEventStreamEnvelopeExtmsgUnbound struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          UnboundEventPayload      `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7556,10 +7834,12 @@ type TypedTaggedEventStreamEnvelopeGcStoreDiskCritical struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          StoreDiskCriticalPayload `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7573,10 +7853,12 @@ type TypedTaggedEventStreamEnvelopeGcStoreDiskWarn struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          StoreDiskWarnPayload     `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7590,10 +7872,12 @@ type TypedTaggedEventStreamEnvelopeGcStoreMaintenanceDone struct {
 	Message          *string                     `json:"message,omitempty"`
 	Payload          StoreMaintenanceDonePayload `json:"payload"`
 	RunId            *string                     `json:"run_id,omitempty"`
+	RunStoreRef      *string                     `json:"run_store_ref,omitempty"`
 	Seq              int64                       `json:"seq"`
 	SessionId        *string                     `json:"session_id,omitempty"`
 	StepId           *string                     `json:"step_id,omitempty"`
 	Subject          *string                     `json:"subject,omitempty"`
+	SubjectStoreRef  *string                     `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                   `json:"ts"`
 	Type             string                      `json:"type"`
 	Workflow         *WorkflowEventProjection    `json:"workflow,omitempty"`
@@ -7607,10 +7891,12 @@ type TypedTaggedEventStreamEnvelopeGcStoreMaintenanceFailed struct {
 	Message          *string                       `json:"message,omitempty"`
 	Payload          StoreMaintenanceFailedPayload `json:"payload"`
 	RunId            *string                       `json:"run_id,omitempty"`
+	RunStoreRef      *string                       `json:"run_store_ref,omitempty"`
 	Seq              int64                         `json:"seq"`
 	SessionId        *string                       `json:"session_id,omitempty"`
 	StepId           *string                       `json:"step_id,omitempty"`
 	Subject          *string                       `json:"subject,omitempty"`
+	SubjectStoreRef  *string                       `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                     `json:"ts"`
 	Type             string                        `json:"type"`
 	Workflow         *WorkflowEventProjection      `json:"workflow,omitempty"`
@@ -7624,10 +7910,12 @@ type TypedTaggedEventStreamEnvelopeMailArchived struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MailEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7641,10 +7929,12 @@ type TypedTaggedEventStreamEnvelopeMailDeleted struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MailEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7658,10 +7948,12 @@ type TypedTaggedEventStreamEnvelopeMailMarkedRead struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MailEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7675,10 +7967,12 @@ type TypedTaggedEventStreamEnvelopeMailMarkedUnread struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MailEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7692,10 +7986,12 @@ type TypedTaggedEventStreamEnvelopeMailRead struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MailEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7709,10 +8005,12 @@ type TypedTaggedEventStreamEnvelopeMailReplied struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MailEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7726,10 +8024,12 @@ type TypedTaggedEventStreamEnvelopeMailSent struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MailEventPayload         `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7743,10 +8043,12 @@ type TypedTaggedEventStreamEnvelopeMoleculeResolved struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          MoleculeResolvedPayload  `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7760,10 +8062,12 @@ type TypedTaggedEventStreamEnvelopeOrderCompleted struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7777,10 +8081,12 @@ type TypedTaggedEventStreamEnvelopeOrderFailed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7794,10 +8100,12 @@ type TypedTaggedEventStreamEnvelopeOrderFired struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7811,10 +8119,12 @@ type TypedTaggedEventStreamEnvelopeOrderSuppressed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          OrderSuppressedPayload   `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7828,10 +8138,12 @@ type TypedTaggedEventStreamEnvelopeProjectIdentityStamped struct {
 	Message          *string                       `json:"message,omitempty"`
 	Payload          ProjectIdentityStampedPayload `json:"payload"`
 	RunId            *string                       `json:"run_id,omitempty"`
+	RunStoreRef      *string                       `json:"run_store_ref,omitempty"`
 	Seq              int64                         `json:"seq"`
 	SessionId        *string                       `json:"session_id,omitempty"`
 	StepId           *string                       `json:"step_id,omitempty"`
 	Subject          *string                       `json:"subject,omitempty"`
+	SubjectStoreRef  *string                       `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                     `json:"ts"`
 	Type             string                        `json:"type"`
 	Workflow         *WorkflowEventProjection      `json:"workflow,omitempty"`
@@ -7845,10 +8157,12 @@ type TypedTaggedEventStreamEnvelopeProviderSwapped struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7862,10 +8176,12 @@ type TypedTaggedEventStreamEnvelopeRequestFailed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          RequestFailedPayload     `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -7879,10 +8195,12 @@ type TypedTaggedEventStreamEnvelopeRequestResultCityCreate struct {
 	Message          *string                    `json:"message,omitempty"`
 	Payload          CityCreateSucceededPayload `json:"payload"`
 	RunId            *string                    `json:"run_id,omitempty"`
+	RunStoreRef      *string                    `json:"run_store_ref,omitempty"`
 	Seq              int64                      `json:"seq"`
 	SessionId        *string                    `json:"session_id,omitempty"`
 	StepId           *string                    `json:"step_id,omitempty"`
 	Subject          *string                    `json:"subject,omitempty"`
+	SubjectStoreRef  *string                    `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                  `json:"ts"`
 	Type             string                     `json:"type"`
 	Workflow         *WorkflowEventProjection   `json:"workflow,omitempty"`
@@ -7896,10 +8214,12 @@ type TypedTaggedEventStreamEnvelopeRequestResultCityUnregister struct {
 	Message          *string                        `json:"message,omitempty"`
 	Payload          CityUnregisterSucceededPayload `json:"payload"`
 	RunId            *string                        `json:"run_id,omitempty"`
+	RunStoreRef      *string                        `json:"run_store_ref,omitempty"`
 	Seq              int64                          `json:"seq"`
 	SessionId        *string                        `json:"session_id,omitempty"`
 	StepId           *string                        `json:"step_id,omitempty"`
 	Subject          *string                        `json:"subject,omitempty"`
+	SubjectStoreRef  *string                        `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                      `json:"ts"`
 	Type             string                         `json:"type"`
 	Workflow         *WorkflowEventProjection       `json:"workflow,omitempty"`
@@ -7913,10 +8233,12 @@ type TypedTaggedEventStreamEnvelopeRequestResultRigCreate struct {
 	Message          *string                   `json:"message,omitempty"`
 	Payload          RigCreateSucceededPayload `json:"payload"`
 	RunId            *string                   `json:"run_id,omitempty"`
+	RunStoreRef      *string                   `json:"run_store_ref,omitempty"`
 	Seq              int64                     `json:"seq"`
 	SessionId        *string                   `json:"session_id,omitempty"`
 	StepId           *string                   `json:"step_id,omitempty"`
 	Subject          *string                   `json:"subject,omitempty"`
+	SubjectStoreRef  *string                   `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                 `json:"ts"`
 	Type             string                    `json:"type"`
 	Workflow         *WorkflowEventProjection  `json:"workflow,omitempty"`
@@ -7930,10 +8252,12 @@ type TypedTaggedEventStreamEnvelopeRequestResultSessionCreate struct {
 	Message          *string                       `json:"message,omitempty"`
 	Payload          SessionCreateSucceededPayload `json:"payload"`
 	RunId            *string                       `json:"run_id,omitempty"`
+	RunStoreRef      *string                       `json:"run_store_ref,omitempty"`
 	Seq              int64                         `json:"seq"`
 	SessionId        *string                       `json:"session_id,omitempty"`
 	StepId           *string                       `json:"step_id,omitempty"`
 	Subject          *string                       `json:"subject,omitempty"`
+	SubjectStoreRef  *string                       `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                     `json:"ts"`
 	Type             string                        `json:"type"`
 	Workflow         *WorkflowEventProjection      `json:"workflow,omitempty"`
@@ -7947,10 +8271,12 @@ type TypedTaggedEventStreamEnvelopeRequestResultSessionMessage struct {
 	Message          *string                        `json:"message,omitempty"`
 	Payload          SessionMessageSucceededPayload `json:"payload"`
 	RunId            *string                        `json:"run_id,omitempty"`
+	RunStoreRef      *string                        `json:"run_store_ref,omitempty"`
 	Seq              int64                          `json:"seq"`
 	SessionId        *string                        `json:"session_id,omitempty"`
 	StepId           *string                        `json:"step_id,omitempty"`
 	Subject          *string                        `json:"subject,omitempty"`
+	SubjectStoreRef  *string                        `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                      `json:"ts"`
 	Type             string                         `json:"type"`
 	Workflow         *WorkflowEventProjection       `json:"workflow,omitempty"`
@@ -7964,10 +8290,12 @@ type TypedTaggedEventStreamEnvelopeRequestResultSessionSubmit struct {
 	Message          *string                       `json:"message,omitempty"`
 	Payload          SessionSubmitSucceededPayload `json:"payload"`
 	RunId            *string                       `json:"run_id,omitempty"`
+	RunStoreRef      *string                       `json:"run_store_ref,omitempty"`
 	Seq              int64                         `json:"seq"`
 	SessionId        *string                       `json:"session_id,omitempty"`
 	StepId           *string                       `json:"step_id,omitempty"`
 	Subject          *string                       `json:"subject,omitempty"`
+	SubjectStoreRef  *string                       `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                     `json:"ts"`
 	Type             string                        `json:"type"`
 	Workflow         *WorkflowEventProjection      `json:"workflow,omitempty"`
@@ -7981,10 +8309,12 @@ type TypedTaggedEventStreamEnvelopeRigProvisionProgress struct {
 	Message          *string                     `json:"message,omitempty"`
 	Payload          RigProvisionProgressPayload `json:"payload"`
 	RunId            *string                     `json:"run_id,omitempty"`
+	RunStoreRef      *string                     `json:"run_store_ref,omitempty"`
 	Seq              int64                       `json:"seq"`
 	SessionId        *string                     `json:"session_id,omitempty"`
 	StepId           *string                     `json:"step_id,omitempty"`
 	Subject          *string                     `json:"subject,omitempty"`
+	SubjectStoreRef  *string                     `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                   `json:"ts"`
 	Type             string                      `json:"type"`
 	Workflow         *WorkflowEventProjection    `json:"workflow,omitempty"`
@@ -7998,10 +8328,12 @@ type TypedTaggedEventStreamEnvelopeSessionColdStartTimeout struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8015,10 +8347,12 @@ type TypedTaggedEventStreamEnvelopeSessionCrashed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          SessionLifecyclePayload  `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8032,10 +8366,12 @@ type TypedTaggedEventStreamEnvelopeSessionDemandClaimDivergence struct {
 	Message          *string                             `json:"message,omitempty"`
 	Payload          SessionDemandClaimDivergencePayload `json:"payload"`
 	RunId            *string                             `json:"run_id,omitempty"`
+	RunStoreRef      *string                             `json:"run_store_ref,omitempty"`
 	Seq              int64                               `json:"seq"`
 	SessionId        *string                             `json:"session_id,omitempty"`
 	StepId           *string                             `json:"step_id,omitempty"`
 	Subject          *string                             `json:"subject,omitempty"`
+	SubjectStoreRef  *string                             `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                           `json:"ts"`
 	Type             string                              `json:"type"`
 	Workflow         *WorkflowEventProjection            `json:"workflow,omitempty"`
@@ -8049,10 +8385,12 @@ type TypedTaggedEventStreamEnvelopeSessionDrainAckedWithAssignedWork struct {
 	Message          *string                                  `json:"message,omitempty"`
 	Payload          SessionDrainAckedWithAssignedWorkPayload `json:"payload"`
 	RunId            *string                                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                                  `json:"run_store_ref,omitempty"`
 	Seq              int64                                    `json:"seq"`
 	SessionId        *string                                  `json:"session_id,omitempty"`
 	StepId           *string                                  `json:"step_id,omitempty"`
 	Subject          *string                                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                                `json:"ts"`
 	Type             string                                   `json:"type"`
 	Workflow         *WorkflowEventProjection                 `json:"workflow,omitempty"`
@@ -8066,10 +8404,12 @@ type TypedTaggedEventStreamEnvelopeSessionDrainFenceUnavailable struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          SessionLifecyclePayload  `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8083,10 +8423,12 @@ type TypedTaggedEventStreamEnvelopeSessionDraining struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8100,10 +8442,12 @@ type TypedTaggedEventStreamEnvelopeSessionIdleKilled struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8117,10 +8461,12 @@ type TypedTaggedEventStreamEnvelopeSessionMaxAgeKilled struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8134,10 +8480,12 @@ type TypedTaggedEventStreamEnvelopeSessionQuarantined struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8151,10 +8499,12 @@ type TypedTaggedEventStreamEnvelopeSessionResetStalled struct {
 	Message          *string                    `json:"message,omitempty"`
 	Payload          SessionResetStalledPayload `json:"payload"`
 	RunId            *string                    `json:"run_id,omitempty"`
+	RunStoreRef      *string                    `json:"run_store_ref,omitempty"`
 	Seq              int64                      `json:"seq"`
 	SessionId        *string                    `json:"session_id,omitempty"`
 	StepId           *string                    `json:"step_id,omitempty"`
 	Subject          *string                    `json:"subject,omitempty"`
+	SubjectStoreRef  *string                    `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                  `json:"ts"`
 	Type             string                     `json:"type"`
 	Workflow         *WorkflowEventProjection   `json:"workflow,omitempty"`
@@ -8168,10 +8518,12 @@ type TypedTaggedEventStreamEnvelopeSessionStopped struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          SessionLifecyclePayload  `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8185,10 +8537,12 @@ type TypedTaggedEventStreamEnvelopeSessionStranded struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          SessionStrandedPayload   `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8202,10 +8556,12 @@ type TypedTaggedEventStreamEnvelopeSessionSuspended struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8219,10 +8575,12 @@ type TypedTaggedEventStreamEnvelopeSessionUndrained struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8236,10 +8594,12 @@ type TypedTaggedEventStreamEnvelopeSessionUnknownState struct {
 	Message          *string                    `json:"message,omitempty"`
 	Payload          SessionUnknownStatePayload `json:"payload"`
 	RunId            *string                    `json:"run_id,omitempty"`
+	RunStoreRef      *string                    `json:"run_store_ref,omitempty"`
 	Seq              int64                      `json:"seq"`
 	SessionId        *string                    `json:"session_id,omitempty"`
 	StepId           *string                    `json:"step_id,omitempty"`
 	Subject          *string                    `json:"subject,omitempty"`
+	SubjectStoreRef  *string                    `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                  `json:"ts"`
 	Type             string                     `json:"type"`
 	Workflow         *WorkflowEventProjection   `json:"workflow,omitempty"`
@@ -8253,10 +8613,12 @@ type TypedTaggedEventStreamEnvelopeSessionUpdated struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8270,10 +8632,12 @@ type TypedTaggedEventStreamEnvelopeSessionWakeRefused struct {
 	Message          *string                   `json:"message,omitempty"`
 	Payload          SessionWakeRefusedPayload `json:"payload"`
 	RunId            *string                   `json:"run_id,omitempty"`
+	RunStoreRef      *string                   `json:"run_store_ref,omitempty"`
 	Seq              int64                     `json:"seq"`
 	SessionId        *string                   `json:"session_id,omitempty"`
 	StepId           *string                   `json:"step_id,omitempty"`
 	Subject          *string                   `json:"subject,omitempty"`
+	SubjectStoreRef  *string                   `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                 `json:"ts"`
 	Type             string                    `json:"type"`
 	Workflow         *WorkflowEventProjection  `json:"workflow,omitempty"`
@@ -8287,10 +8651,12 @@ type TypedTaggedEventStreamEnvelopeSessionWoke struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8304,10 +8670,12 @@ type TypedTaggedEventStreamEnvelopeSessionWorkQueryFailed struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          SessionLifecyclePayload  `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8321,10 +8689,12 @@ type TypedTaggedEventStreamEnvelopeStorageBindingConverged struct {
 	Message          *string                      `json:"message,omitempty"`
 	Payload          StorageBindingOutcomePayload `json:"payload"`
 	RunId            *string                      `json:"run_id,omitempty"`
+	RunStoreRef      *string                      `json:"run_store_ref,omitempty"`
 	Seq              int64                        `json:"seq"`
 	SessionId        *string                      `json:"session_id,omitempty"`
 	StepId           *string                      `json:"step_id,omitempty"`
 	Subject          *string                      `json:"subject,omitempty"`
+	SubjectStoreRef  *string                      `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                    `json:"ts"`
 	Type             string                       `json:"type"`
 	Workflow         *WorkflowEventProjection     `json:"workflow,omitempty"`
@@ -8338,10 +8708,12 @@ type TypedTaggedEventStreamEnvelopeStorageBindingGenesis struct {
 	Message          *string                      `json:"message,omitempty"`
 	Payload          StorageBindingOutcomePayload `json:"payload"`
 	RunId            *string                      `json:"run_id,omitempty"`
+	RunStoreRef      *string                      `json:"run_store_ref,omitempty"`
 	Seq              int64                        `json:"seq"`
 	SessionId        *string                      `json:"session_id,omitempty"`
 	StepId           *string                      `json:"step_id,omitempty"`
 	Subject          *string                      `json:"subject,omitempty"`
+	SubjectStoreRef  *string                      `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                    `json:"ts"`
 	Type             string                       `json:"type"`
 	Workflow         *WorkflowEventProjection     `json:"workflow,omitempty"`
@@ -8355,10 +8727,12 @@ type TypedTaggedEventStreamEnvelopeStorageBindingNotConfigured struct {
 	Message          *string                      `json:"message,omitempty"`
 	Payload          StorageBindingOutcomePayload `json:"payload"`
 	RunId            *string                      `json:"run_id,omitempty"`
+	RunStoreRef      *string                      `json:"run_store_ref,omitempty"`
 	Seq              int64                        `json:"seq"`
 	SessionId        *string                      `json:"session_id,omitempty"`
 	StepId           *string                      `json:"step_id,omitempty"`
 	Subject          *string                      `json:"subject,omitempty"`
+	SubjectStoreRef  *string                      `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                    `json:"ts"`
 	Type             string                       `json:"type"`
 	Workflow         *WorkflowEventProjection     `json:"workflow,omitempty"`
@@ -8372,10 +8746,12 @@ type TypedTaggedEventStreamEnvelopeStorageBindingUncheckable struct {
 	Message          *string                      `json:"message,omitempty"`
 	Payload          StorageBindingOutcomePayload `json:"payload"`
 	RunId            *string                      `json:"run_id,omitempty"`
+	RunStoreRef      *string                      `json:"run_store_ref,omitempty"`
 	Seq              int64                        `json:"seq"`
 	SessionId        *string                      `json:"session_id,omitempty"`
 	StepId           *string                      `json:"step_id,omitempty"`
 	Subject          *string                      `json:"subject,omitempty"`
+	SubjectStoreRef  *string                      `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                    `json:"ts"`
 	Type             string                       `json:"type"`
 	Workflow         *WorkflowEventProjection     `json:"workflow,omitempty"`
@@ -8389,10 +8765,12 @@ type TypedTaggedEventStreamEnvelopeStorageBindingUnconverged struct {
 	Message          *string                      `json:"message,omitempty"`
 	Payload          StorageBindingOutcomePayload `json:"payload"`
 	RunId            *string                      `json:"run_id,omitempty"`
+	RunStoreRef      *string                      `json:"run_store_ref,omitempty"`
 	Seq              int64                        `json:"seq"`
 	SessionId        *string                      `json:"session_id,omitempty"`
 	StepId           *string                      `json:"step_id,omitempty"`
 	Subject          *string                      `json:"subject,omitempty"`
+	SubjectStoreRef  *string                      `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                    `json:"ts"`
 	Type             string                       `json:"type"`
 	Workflow         *WorkflowEventProjection     `json:"workflow,omitempty"`
@@ -8406,10 +8784,12 @@ type TypedTaggedEventStreamEnvelopeSupervisorFsPressureSkippedTick struct {
 	Message          *string                                `json:"message,omitempty"`
 	Payload          SupervisorFSPressureSkippedTickPayload `json:"payload"`
 	RunId            *string                                `json:"run_id,omitempty"`
+	RunStoreRef      *string                                `json:"run_store_ref,omitempty"`
 	Seq              int64                                  `json:"seq"`
 	SessionId        *string                                `json:"session_id,omitempty"`
 	StepId           *string                                `json:"step_id,omitempty"`
 	Subject          *string                                `json:"subject,omitempty"`
+	SubjectStoreRef  *string                                `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                              `json:"ts"`
 	Type             string                                 `json:"type"`
 	Workflow         *WorkflowEventProjection               `json:"workflow,omitempty"`
@@ -8423,10 +8803,12 @@ type TypedTaggedEventStreamEnvelopeSupervisorRequest struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          SupervisorRequestPayload `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8440,10 +8822,12 @@ type TypedTaggedEventStreamEnvelopeSupervisorShutdownRequested struct {
 	Message          *string                   `json:"message,omitempty"`
 	Payload          SupervisorShutdownPayload `json:"payload"`
 	RunId            *string                   `json:"run_id,omitempty"`
+	RunStoreRef      *string                   `json:"run_store_ref,omitempty"`
 	Seq              int64                     `json:"seq"`
 	SessionId        *string                   `json:"session_id,omitempty"`
 	StepId           *string                   `json:"step_id,omitempty"`
 	Subject          *string                   `json:"subject,omitempty"`
+	SubjectStoreRef  *string                   `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                 `json:"ts"`
 	Type             string                    `json:"type"`
 	Workflow         *WorkflowEventProjection  `json:"workflow,omitempty"`
@@ -8457,10 +8841,12 @@ type TypedTaggedEventStreamEnvelopeSupervisorStarted struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          SupervisorStartedPayload `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8474,10 +8860,12 @@ type TypedTaggedEventStreamEnvelopeWebhookReceived struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          WebhookReceivedPayload   `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8491,10 +8879,12 @@ type TypedTaggedEventStreamEnvelopeWebhookRejected struct {
 	Message          *string                  `json:"message,omitempty"`
 	Payload          WebhookRejectedPayload   `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
+	RunStoreRef      *string                  `json:"run_store_ref,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
 	StepId           *string                  `json:"step_id,omitempty"`
 	Subject          *string                  `json:"subject,omitempty"`
+	SubjectStoreRef  *string                  `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
@@ -8508,10 +8898,12 @@ type TypedTaggedEventStreamEnvelopeWorkerOperation struct {
 	Message          *string                     `json:"message,omitempty"`
 	Payload          WorkerOperationEventPayload `json:"payload"`
 	RunId            *string                     `json:"run_id,omitempty"`
+	RunStoreRef      *string                     `json:"run_store_ref,omitempty"`
 	Seq              int64                       `json:"seq"`
 	SessionId        *string                     `json:"session_id,omitempty"`
 	StepId           *string                     `json:"step_id,omitempty"`
 	Subject          *string                     `json:"subject,omitempty"`
+	SubjectStoreRef  *string                     `json:"subject_store_ref,omitempty"`
 	Ts               time.Time                   `json:"ts"`
 	Type             string                      `json:"type"`
 	Workflow         *WorkflowEventProjection    `json:"workflow,omitempty"`

@@ -34,8 +34,10 @@ var (
 
 // WorkAssociation relates one physical input work bead to an execution run.
 type WorkAssociation struct {
-	WorkBeadID     string
-	ExecutionRunID string
+	WorkBeadID      string
+	ExecutionRunID  string
+	SubjectStoreRef string
+	RunStoreRef     string
 }
 
 // RunAnchor relates a source work bead to an execution run through the
@@ -43,8 +45,10 @@ type WorkAssociation struct {
 // the latter continues to identify the physical rig launch that entered the
 // input convoy.
 type RunAnchor struct {
-	SourceBeadID   string
-	ExecutionRunID string
+	SourceBeadID    string
+	ExecutionRunID  string
+	SubjectStoreRef string
+	RunStoreRef     string
 }
 
 // StepDefinition describes one physical execution-step occurrence. A nil
@@ -55,6 +59,8 @@ type StepDefinition struct {
 	ExecutionRunID   string
 	StepID           string
 	DependsOnStepIDs *[]string
+	SubjectStoreRef  string
+	RunStoreRef      string
 }
 
 // Projection is the deterministic current-store execution projection for one
@@ -89,18 +95,22 @@ func (p Projection) Events(actor string) []events.Event {
 	result := make([]events.Event, 0, len(p.WorkAssociations)+len(p.RunAnchors)+len(p.Steps))
 	for _, association := range p.WorkAssociations {
 		result = append(result, events.Event{
-			Type:    events.ExecutionWorkAssociated,
-			Actor:   actor,
-			Subject: association.WorkBeadID,
-			RunID:   association.ExecutionRunID,
+			Type:            events.ExecutionWorkAssociated,
+			Actor:           actor,
+			Subject:         association.WorkBeadID,
+			RunID:           association.ExecutionRunID,
+			SubjectStoreRef: association.SubjectStoreRef,
+			RunStoreRef:     association.RunStoreRef,
 		})
 	}
 	for _, anchor := range p.RunAnchors {
 		result = append(result, events.Event{
-			Type:    events.ExecutionRunAnchored,
-			Actor:   actor,
-			Subject: anchor.SourceBeadID,
-			RunID:   anchor.ExecutionRunID,
+			Type:            events.ExecutionRunAnchored,
+			Actor:           actor,
+			Subject:         anchor.SourceBeadID,
+			RunID:           anchor.ExecutionRunID,
+			SubjectStoreRef: anchor.SubjectStoreRef,
+			RunStoreRef:     anchor.RunStoreRef,
 		})
 	}
 	for _, step := range p.Steps {
@@ -109,6 +119,8 @@ func (p Projection) Events(actor string) []events.Event {
 			Actor:            actor,
 			Subject:          step.BeadID,
 			RunID:            step.ExecutionRunID,
+			SubjectStoreRef:  step.SubjectStoreRef,
+			RunStoreRef:      step.RunStoreRef,
 			StepID:           step.StepID,
 			DependsOnStepIDs: cloneTopology(step.DependsOnStepIDs),
 		})
@@ -127,7 +139,7 @@ func ProjectCurrent(graphStore beads.GraphStore, convoyStore beads.WorkStore, ro
 	if !eventexport.IsOpaqueRef(rootID) {
 		return Projection{}, fmt.Errorf("%w: %q", ErrInvalidRootReference, rootID)
 	}
-	root, err := graphStore.Get(rootID)
+	root, runStoreRef, err := ReadWithStoreRef(graphStore.Store, rootID)
 	if err != nil {
 		return Projection{}, fmt.Errorf("loading workflow root %q: %w", rootID, err)
 	}
@@ -143,6 +155,11 @@ func ProjectCurrent(graphStore beads.GraphStore, convoyStore beads.WorkStore, ro
 	if err != nil {
 		return Projection{}, err
 	}
+	// This graph store exclusively owns the root and its physical steps.
+	for i := range steps {
+		steps[i].SubjectStoreRef = runStoreRef
+		steps[i].RunStoreRef = runStoreRef
+	}
 	convoyID := root.Metadata[beadmeta.InputConvoyIDMetadataKey]
 	if convoyID == "" {
 		return Projection{Steps: steps}, nil
@@ -152,6 +169,12 @@ func ProjectCurrent(graphStore beads.GraphStore, convoyStore beads.WorkStore, ro
 		return Projection{}, err
 	}
 	anchors := currentRunAnchors(convoyStore, root, work)
+	for i := range work {
+		work[i].RunStoreRef = runStoreRef
+	}
+	for i := range anchors {
+		anchors[i].RunStoreRef = runStoreRef
+	}
 	return Projection{WorkAssociations: work, RunAnchors: anchors, Steps: steps}, nil
 }
 
@@ -193,7 +216,7 @@ func currentRunAnchors(store beads.WorkStore, root beads.Bead, work []WorkAssoci
 			return nil
 		}
 		seenSources[sourceID] = launchID
-		anchors = append(anchors, RunAnchor{SourceBeadID: sourceID, ExecutionRunID: root.ID})
+		anchors = append(anchors, RunAnchor{SourceBeadID: sourceID, ExecutionRunID: root.ID, SubjectStoreRef: resolvedSubjectStoreRef(store.Store, sourceID)})
 	}
 	if (declaredLaunchID != "" && !declaredMatched) || len(anchors) == 0 {
 		return nil
@@ -227,7 +250,7 @@ func currentWorkAssociations(store beads.WorkStore, rootID, convoyID string) ([]
 	sort.Strings(sorted)
 	associations := make([]WorkAssociation, 0, len(sorted))
 	for _, id := range sorted {
-		associations = append(associations, WorkAssociation{WorkBeadID: id, ExecutionRunID: rootID})
+		associations = append(associations, WorkAssociation{WorkBeadID: id, ExecutionRunID: rootID, SubjectStoreRef: resolvedSubjectStoreRef(store.Store, id)})
 	}
 	return associations, nil
 }
@@ -362,6 +385,10 @@ func LifecycleEvent(eventType string, root, step beads.Bead, actor string) (even
 // root is loaded from graphStore so a v1 or unrelated parent can never produce
 // a lifecycle event by metadata resemblance alone.
 func EmitLifecycle(recorder events.Recorder, graphStore beads.Store, eventType string, step beads.Bead, actor string) bool {
+	return emitLifecycle(recorder, graphStore, eventType, step, actor, resolvedSubjectStoreRef(graphStore, step.ID))
+}
+
+func emitLifecycle(recorder events.Recorder, graphStore beads.Store, eventType string, step beads.Bead, actor, subjectStoreRef string) bool {
 	if recorder == nil || graphStore == nil {
 		return false
 	}
@@ -369,20 +396,41 @@ func EmitLifecycle(recorder events.Recorder, graphStore beads.Store, eventType s
 	if !eventexport.IsOpaqueRef(rootID) {
 		return false
 	}
-	root, err := graphStore.Get(rootID)
+	root, rootRef, err := ReadWithStoreRef(graphStore, rootID)
 	if err != nil {
+		return false
+	}
+	if subjectStoreRef != "" && rootRef != subjectStoreRef {
 		return false
 	}
 	event, ok := LifecycleEvent(eventType, root, step, actor)
 	if !ok {
 		return false
 	}
+	if subjectStoreRef != "" {
+		event.SubjectStoreRef = subjectStoreRef
+		event.RunStoreRef = rootRef
+	}
 	recorder.Record(event)
 	return true
 }
 
-// EmitCompletedFromClosedNotification is the sole close-side lifecycle entry
-// point. It consumes the physical bead snapshot carried by the authoritative
+// EmitCompletedFromEvent validates the physical snapshot's producer-owned
+// origin against the opened graph leg. Unknown legacy origins stay unknown;
+// a matching ID in another store is not evidence of shared ownership.
+func EmitCompletedFromEvent(recorder events.Recorder, graphStore beads.Store, notification events.Event) bool {
+	if notification.Type != events.BeadClosed {
+		return false
+	}
+	step, ok := beads.DecodeBeadEventPayload(notification.Payload)
+	if !ok || step.ID != notification.Subject || !strings.EqualFold(strings.TrimSpace(step.Status), "closed") {
+		return false
+	}
+	return emitLifecycle(recorder, graphStore, events.ExecutionStepCompleted, step, notification.Actor, notification.SubjectStoreRef)
+}
+
+// EmitCompletedFromClosedNotification handles legacy notifications without an
+// origin envelope. It consumes the physical bead snapshot carried by the
 // bead.closed notification rather than inferring completion from dependencies
 // or re-projecting current graph state.
 func EmitCompletedFromClosedNotification(recorder events.Recorder, graphStore beads.Store, payload json.RawMessage, actor string) bool {
@@ -390,7 +438,7 @@ func EmitCompletedFromClosedNotification(recorder events.Recorder, graphStore be
 	if !ok || !strings.EqualFold(strings.TrimSpace(step.Status), "closed") {
 		return false
 	}
-	return EmitLifecycle(recorder, graphStore, events.ExecutionStepCompleted, step, actor)
+	return emitLifecycle(recorder, graphStore, events.ExecutionStepCompleted, step, actor, "")
 }
 
 // ReconcileCompleted repairs completed facts that were stranded between a
@@ -506,8 +554,13 @@ type CompletedFactIndex struct {
 	// only a confirmed key witnesses convergence. warm() drops the unconfirmed
 	// ones on every re-derivation, so a dropped Record is re-emitted next pass
 	// rather than masked as converged forever.
-	facts  map[completedFactKey]bool
-	loaded bool
+	facts map[completedFactKey]bool
+	// Recovery has no historical store-origin evidence. Preserve its existing
+	// unscoped journal identity without weakening exact scoped lookups. Only
+	// journal-confirmed facts enter this compatibility index; attempted writes
+	// must never become convergence witnesses through it.
+	recoveryFacts map[completedFactKey]struct{}
+	loaded        bool
 	// baseline is len(facts) as the last FULL journal load (a cold read or a
 	// rebuild) left it. Growth past it by completedFactIndexGrowthCap forces the
 	// next rebuild; a tail merge extends the set without moving the baseline, so
@@ -540,6 +593,7 @@ func (idx *CompletedFactIndex) Absorb(event events.Event) {
 	// absorbed fact is journal-confirmed: it witnesses convergence and upgrades
 	// an earlier unconfirmed add() of the same key.
 	idx.facts[completedFactKeyFor(event)] = true
+	idx.confirmRecoveryLocked(completedFactKeyFor(event))
 }
 
 // Invalidate marks the set stale so the next pass re-derives from the journal
@@ -663,6 +717,7 @@ func (idx *CompletedFactIndex) mergeFromJournal(existing []events.Event, rebuild
 		// journal no longer backs — keys for facts rotated out of retention and
 		// any unconfirmed phantom a dropped Record left behind.
 		idx.facts = make(map[completedFactKey]bool, len(existing))
+		idx.recoveryFacts = nil
 		idx.maxSeq = 0
 	case idx.facts == nil:
 		idx.facts = make(map[completedFactKey]bool, len(existing))
@@ -682,6 +737,7 @@ func (idx *CompletedFactIndex) mergeFromJournal(existing []events.Event, rebuild
 		if event.Type == events.ExecutionStepCompleted {
 			// Read back from the journal: journal-confirmed, a convergence witness.
 			idx.facts[completedFactKeyFor(event)] = true
+			idx.confirmRecoveryLocked(completedFactKeyFor(event))
 		}
 		if event.Seq > maxSeq {
 			maxSeq = event.Seq
@@ -714,6 +770,29 @@ func (idx *CompletedFactIndex) lookup(key completedFactKey) (present, confirmed 
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	confirmed, present = idx.facts[key]
+	return present, confirmed
+}
+
+func (idx *CompletedFactIndex) confirmRecoveryLocked(key completedFactKey) {
+	if idx.recoveryFacts == nil {
+		idx.recoveryFacts = make(map[completedFactKey]struct{})
+	}
+	key.subjectStoreRef, key.runStoreRef = "", ""
+	idx.recoveryFacts[key] = struct{}{}
+}
+
+// lookupRecovery is exclusively for the legacy unscoped repair lane. Labels
+// added to new observations must not replay an existing fact. This does not
+// infer or export a store owner, nor let one known owner satisfy another.
+func (idx *CompletedFactIndex) lookupRecovery(key completedFactKey) (present, confirmed bool) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	confirmed, present = idx.facts[key]
+	if key.subjectStoreRef == "" && key.runStoreRef == "" {
+		if _, witnessed := idx.recoveryFacts[key]; witnessed {
+			return true, true
+		}
+	}
 	return present, confirmed
 }
 
@@ -1039,7 +1118,7 @@ func reconcileRootSteps(recorder events.Recorder, root beads.Bead, rows []stepRo
 			continue
 		}
 		key := completedFactKeyFor(event)
-		if present, confirmed := completed.lookup(key); present {
+		if present, confirmed := completed.lookupRecovery(key); present {
 			// Already recorded: dedup on presence. But an UNconfirmed key
 			// (this process's own best-effort add that no journal read has
 			// returned) is not a convergence witness — it may be a dropped
@@ -1106,7 +1185,9 @@ func completedFacts(recorder events.Provider, filter events.Filter) ([]events.Ev
 
 type completedFactKey struct {
 	subject           string
+	subjectStoreRef   string
 	runID             string
+	runStoreRef       string
 	sessionID         string
 	stepID            string
 	topologyKnown     bool
@@ -1115,10 +1196,12 @@ type completedFactKey struct {
 
 func completedFactKeyFor(event events.Event) completedFactKey {
 	key := completedFactKey{
-		subject:   event.Subject,
-		runID:     event.RunID,
-		sessionID: event.SessionID,
-		stepID:    event.StepID,
+		subject:         event.Subject,
+		subjectStoreRef: event.SubjectStoreRef,
+		runID:           event.RunID,
+		runStoreRef:     event.RunStoreRef,
+		sessionID:       event.SessionID,
+		stepID:          event.StepID,
 	}
 	if event.DependsOnStepIDs != nil {
 		key.topologyKnown = true

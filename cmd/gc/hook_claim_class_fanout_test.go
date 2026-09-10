@@ -63,7 +63,7 @@ func hookFanoutBaseOps(claim hookClaimFunc) hookClaimOps {
 		ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
 			return nil, nil
 		},
-		EmitExecutionStepStarted: func(beads.Bead, string, []string, string) {},
+		EmitExecutionStepStarted: func(beads.Bead, string, []string, string, string) {},
 		PublishRunMap:            func(string, string, ...string) error { return nil },
 	}
 }

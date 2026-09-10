@@ -31,10 +31,12 @@ func TestFileRecorderWritesEvent(t *testing.T) {
 	defer rec.Close() //nolint:errcheck // test cleanup
 
 	rec.Record(Event{
-		Type:    BeadCreated,
-		Actor:   "human",
-		Subject: "gc-1",
-		Message: "Build Tower of Hanoi",
+		Type:            BeadCreated,
+		Actor:           "human",
+		Subject:         "gc-1",
+		Message:         "Build Tower of Hanoi",
+		SubjectStoreRef: "rig:alpha",
+		RunStoreRef:     "class:graph",
 	})
 
 	if stderr.Len() > 0 {
@@ -66,6 +68,9 @@ func TestFileRecorderWritesEvent(t *testing.T) {
 	}
 	if e.Ts.IsZero() {
 		t.Error("Ts should be auto-filled, got zero")
+	}
+	if e.SubjectStoreRef != "rig:alpha" || e.RunStoreRef != "class:graph" {
+		t.Errorf("store scope was not preserved in the journal: subject=%q run=%q", e.SubjectStoreRef, e.RunStoreRef)
 	}
 }
 

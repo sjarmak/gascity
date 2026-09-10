@@ -10,6 +10,50 @@ import (
 
 var errTestStoreTimeout = errors.New("store timed out")
 
+func TestHookPrimaryScopeRequiresMatchingConstructedSelectors(t *testing.T) {
+	cityPath := oneShotCLICity(t, "")
+	cfg := &config.City{}
+	a := &config.Agent{Name: "worker"}
+	constructed := map[string]string{"BEADS_DIR": cityPath + "/.beads", "GC_STORE_SCOPE": "city", "GC_STORE_ROOT": cityPath}
+	for _, tc := range []struct {
+		name      string
+		env       []string
+		wantKnown bool
+	}{
+		{"paired environment", []string{"BEADS_DIR=" + cityPath + "/.beads", "GC_STORE_SCOPE=city", "GC_STORE_ROOT=" + cityPath}, true},
+		{"absent selectors", nil, false},
+		{"different selected store", []string{"BEADS_DIR=/other/.beads", "GC_STORE_SCOPE=city", "GC_STORE_ROOT=" + cityPath}, false},
+		{"extra database override", []string{"BEADS_DIR=" + cityPath + "/.beads", "GC_STORE_SCOPE=city", "GC_STORE_ROOT=" + cityPath, "BEADS_DB=other"}, false},
+		{"extra executable override", []string{"BEADS_DIR=" + cityPath + "/.beads", "GC_STORE_SCOPE=city", "GC_STORE_ROOT=" + cityPath, "BD_BIN=/other/bd"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stores := hookWorkQueryStores(cityPath, cfg, a, "worker", cityPath, tc.env, constructed)
+			if (stores[0].storeRef != "") != tc.wantKnown {
+				t.Fatalf("scope known=%v, want %v", stores[0].storeRef != "", tc.wantKnown)
+			}
+		})
+	}
+}
+
+func TestHookWorkStoreRefsFollowEnvironmentConstruction(t *testing.T) {
+	cityPath := oneShotCLICity(t, "")
+	cfg := &config.City{Rigs: []config.Rig{{Name: "riga", Path: cityPath + "/riga"}}}
+	for _, tc := range []struct{ dir, want string }{
+		{"riga", "rig:riga"},
+		{"", "city:" + loadedCityName(cfg, cityPath)},
+		{"unregistered-worktree", "city:" + loadedCityName(cfg, cityPath)},
+	} {
+		a := &config.Agent{Name: "worker", Dir: tc.dir}
+		got := hookWorkStoreRef(cityPath, cfg, a)
+		if got != tc.want {
+			t.Fatalf("dir=%q ref=%q, want %q", tc.dir, got, tc.want)
+		}
+	}
+	if got := hookWorkStoreRef(cityPath, nil, nil); got != "" {
+		t.Fatalf("unknown construction ref=%q", got)
+	}
+}
+
 // TestRigScopedHookRig is the core of the rig-scope hook fix: a rig-scoped agent
 // ("<rig>/<name>") must resolve to its own rig so the hook also queries that
 // rig's store, where its routed work lives. City-scoped identities (no "/") and

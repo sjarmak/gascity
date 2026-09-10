@@ -2287,7 +2287,13 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 		// ledger it does not live in. The tracked launch beads themselves may
 		// be resident in a per-rig store, so the work leg routes launch reads
 		// to the owning convoy store.
-		if err := executionevent.EmitCurrent(m.rec, beads.GraphStore{Store: graphStore}, beads.WorkStore{Store: executionEmitStore(store, cityPath)}, rootID, "order-dispatch"); err != nil {
+		workRef := ""
+		if m.cfg != nil {
+			workRef = workflowStoreRefForDir(target.ScopeRoot, cityPath, m.cityName, m.cfg)
+		}
+		projectionGraph := executionGraphProjectionStore(m.storageRoutes, store, graphStore, workRef)
+		projectionWork := executionEmitStore(executionevent.WithStoreRef(store, workRef), cityPath)
+		if err := executionevent.EmitCurrent(m.rec, beads.GraphStore{Store: projectionGraph}, beads.WorkStore{Store: projectionWork}, rootID, "order-dispatch"); err != nil {
 			logDispatchError(m.stderr, "gc: order %s: projecting execution facts for %s: %v", scoped, rootID, err)
 		}
 	}

@@ -134,7 +134,10 @@ type SlingDeps struct {
 	// caller supplies a read leg that routes a primary miss to the owning
 	// store. Nil keeps the single-store behavior of reading Store.
 	ExecutionWorkStore beads.Store
-	StoreRef           string
+	// ExecutionGraphStore is the ownership-aware projection leg only. Graph
+	// mutations still use GraphStore with all its optional capabilities intact.
+	ExecutionGraphStore beads.Store
+	StoreRef            string
 	// ValidationQuerier overrides Store for existence checks when a caller has
 	// already resolved the bead through a narrower view.
 	ValidationQuerier BeadQuerier
@@ -1417,6 +1420,9 @@ func materializeCompiledSlingFormula(ctx context.Context, recipe *formula.Recipe
 }
 
 func emitCurrentExecutionFacts(deps SlingDeps, graphStore beads.Store, rootID, actor, formulaName string) {
+	if deps.ExecutionGraphStore != nil {
+		graphStore = deps.ExecutionGraphStore
+	}
 	workStore := deps.Store
 	if deps.ExecutionWorkStore != nil {
 		workStore = deps.ExecutionWorkStore

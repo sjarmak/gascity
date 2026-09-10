@@ -51,7 +51,7 @@ func (r *turnBoundClaimRecorder) ops(t *testing.T, output string) hookClaimOps {
 			r.drainAcked = true
 			return nil
 		},
-		EmitExecutionStepStarted: func(step beads.Bead, _ string, _ []string, _ string) {
+		EmitExecutionStepStarted: func(step beads.Bead, _ string, _ []string, _ string, _ string) {
 			r.stepsStarted = append(r.stepsStarted, step.ID)
 		},
 		EmitClaimWindowExpired: func(expiry hookClaimWindowExpiry) {

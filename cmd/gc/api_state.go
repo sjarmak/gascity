@@ -771,6 +771,9 @@ func (cs *controllerState) applyBeadEventToStores(evt events.Event) {
 	var storeRef string
 	if evt.Type == events.BeadClosed {
 		storeRef = cs.autocloseStoreRefLocked(evt.Subject)
+		if evt.SubjectStoreRef != "" {
+			storeRef = evt.SubjectStoreRef
+		}
 	}
 	cs.mu.RUnlock()
 
@@ -799,8 +802,14 @@ func (cs *controllerState) applyBeadEventToStores(evt events.Event) {
 		if cs.eventProv != nil {
 			rec = cs.eventProv
 		}
+		graphStore := resolveGraphStore(cs.storageRoutes, cs.cityBeadStore, cs.cfg, cs.cityPath, cs.eventProv)
+		workRef := ""
+		if cs.cfg != nil {
+			workRef = workflowStoreRefForDir(cs.cityPath, cs.cityPath, loadedCityName(cs.cfg, cs.cityPath), cs.cfg)
+		}
+		projectionStore := executionGraphProjectionStore(cs.storageRoutes, cs.cityBeadStore, graphStore, workRef)
 		cs.mu.RUnlock()
-		executionevent.EmitCompletedFromClosedNotification(rec, cs.GraphBeadStore().Store, evt.Payload, evt.Actor)
+		executionevent.EmitCompletedFromEvent(rec, projectionStore, evt)
 		cs.runBeadCloseAutoclose(evt.Subject, stores[0], storeRef)
 	}
 }
@@ -852,6 +861,19 @@ func (cs *controllerState) runBeadCloseAutoclose(beadID string, store beads.Stor
 }
 
 func (cs *controllerState) beadEventStoresLocked(evt events.Event) []beads.Store {
+	if evt.SubjectStoreRef != "" {
+		// Explicit origin must never fall back to prefix routing or broadcast.
+		// Resolve only already-open destinations; this observation does not
+		// replace the canonical reads and mutation guards in autoclose.
+		payload, ok := beads.DecodeBeadEventPayload(evt.Payload)
+		if !ok || evt.Subject == "" || payload.ID != evt.Subject {
+			return nil
+		}
+		if store := cs.beadEventScopedStoreLocked(evt.SubjectStoreRef); store != nil {
+			return []beads.Store{store} // residency:allow singleton exact-origin destination; unknown origins never enumerate or fall back
+		}
+		return nil
+	}
 	if id := beadEventID(evt); id != "" && cs.cfg != nil {
 		if store, known := cs.beadEventConfiguredStoreLocked(id); known {
 			if store == nil {
@@ -869,6 +891,30 @@ func (cs *controllerState) beadEventStoresLocked(evt events.Event) []beads.Store
 		stores = append(stores, cs.cityBeadStore)
 	}
 	return stores
+}
+
+func (cs *controllerState) beadEventScopedStoreLocked(ref string) beads.Store {
+	if cs.cfg != nil {
+		cityRef := workflowStoreRefForDir(cs.cityPath, cs.cityPath, loadedCityName(cs.cfg, cs.cityPath), cs.cfg)
+		if ref == cityRef {
+			return cs.cityBeadStore
+		}
+		for _, rig := range cs.cfg.Rigs {
+			if ref == "rig:"+rig.Name {
+				return cs.beadStores[rig.Name]
+			}
+		}
+	}
+	bindings, err := residencyBindingsFromRoutes(cs.storageRoutes)
+	if err != nil {
+		return nil
+	}
+	for _, binding := range bindings {
+		if ref == string(binding.Leg.Ref) {
+			return binding.Leg.Store // residency:allow exact reference lookup in opened bindings under cs.mu; no bead probe, opening, or fallback
+		}
+	}
+	return nil
 }
 
 func (cs *controllerState) beadEventConfiguredStoreLocked(id string) (beads.Store, bool) {

@@ -20,6 +20,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	convoycore "github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/executionevent"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/graphroute"
 	"github.com/gastownhall/gascity/internal/graphv2"
@@ -497,17 +498,19 @@ func cmdSlingWithJSON(args []string, isFormula, doNudge, force bool, title strin
 	if !dryRun {
 		eventRecorder = openCityRecorderAt(cityPath, stderr)
 	}
+	graphStore := resolveGraphStore(cliStorageRoutes(cityPath), store, cfg, cityPath, eventRecorder)
 	deps := slingDeps{
-		CityName:           cityName,
-		CityPath:           cityPath,
-		Cfg:                cfg,
-		SP:                 sp,
-		Runner:             runner,
-		Store:              store,
-		GraphStore:         resolveGraphStore(cliStorageRoutes(cityPath), store, cfg, cityPath, eventRecorder),
-		Events:             eventRecorder,
-		ExecutionWorkStore: executionEmitStore(store, cityPath),
-		StoreRef:           storeRef,
+		CityName:            cityName,
+		CityPath:            cityPath,
+		Cfg:                 cfg,
+		SP:                  sp,
+		Runner:              runner,
+		Store:               store,
+		GraphStore:          graphStore,
+		Events:              eventRecorder,
+		ExecutionWorkStore:  executionEmitStore(executionevent.WithStoreRef(store, storeRef), cityPath),
+		ExecutionGraphStore: executionGraphProjectionStore(cliStorageRoutes(cityPath), store, graphStore, storeRef),
+		StoreRef:            storeRef,
 		SourceWorkflowStores: func() ([]sling.SourceWorkflowStore, error) {
 			stores, skips, err := openSourceWorkflowStoresWithProvider(cfg, cityPath, "", func(scopeRoot string) string {
 				return authoritativeBeadsProviderForScope(scopeRoot, cityPath)

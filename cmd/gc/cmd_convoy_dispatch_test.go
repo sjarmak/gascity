@@ -2792,6 +2792,9 @@ title = "Review {reviewer}"
 	foundNewStep := false
 	for _, event := range recorded {
 		if event.Type == events.ExecutionStepDefined && event.RunID == root.ID {
+			if event.SubjectStoreRef != "city:test-city" || event.RunStoreRef != "city:test-city" {
+				t.Fatalf("control event lost opened store identity: %#v", event)
+			}
 			if _, ok := childIDs[event.Subject]; ok {
 				foundNewStep = true
 			}

@@ -6,8 +6,53 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/coordclass"
 	"github.com/gastownhall/gascity/internal/executionevent"
+	"github.com/gastownhall/gascity/internal/storeref"
 )
+
+func TestExecutionEmitStoreLabelsBindingFallback(t *testing.T) {
+	cityPath, _ := foreignProviderCity(t)
+	work := workStoreFor(t, cityPath)
+	shadow, err := work.Create(beads.Bead{Title: "retained work copy", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resident, _ := classResidentWorkShapedBead(t, cityPath, shadow.ID, "binding copy")
+	reader := executionEmitStore(nonResidentBeadStore{Store: work, hidden: resident.ID}, cityPath)
+	row, ref, err := executionevent.ReadWithStoreRef(reader, resident.ID)
+	want := string(storeref.ClassRef(infrastructureClasses()))
+	if err != nil || row.Title != "binding copy" || ref != want {
+		t.Fatalf("fallback row=%#v ref=%q err=%v, want binding copy with ref %q", row, ref, err, want)
+	}
+}
+
+func TestExecutionGraphProjectionUsesOpenedRouteIdentity(t *testing.T) {
+	work, graph := beads.NewMemStore(), beads.NewMemStore()
+	row, err := graph.Create(beads.Bead{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := &storageRoutes{stores: map[coordclass.Class]beads.Store{coordclass.ClassGraph: graph}}
+	for _, tc := range []struct {
+		name          string
+		routes        *storageRoutes
+		work          beads.Store
+		workRef, want string
+	}{
+		{"relocated", routes, work, "city:test", "class:g"},
+		{"collapsed", nil, graph, "rig:project", "rig:project"},
+		{"unmatched", nil, work, "city:test", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := executionGraphProjectionStore(tc.routes, tc.work, graph, tc.workRef)
+			got, ref, err := executionevent.ReadWithStoreRef(reader, row.ID)
+			if err != nil || got.ID != row.ID || ref != tc.want {
+				t.Fatalf("row=%#v ref=%q err=%v, want ref %q", got, ref, err, tc.want)
+			}
+		})
+	}
+}
 
 // nonResidentBeadStore hides one bead from Get while serving everything else,
 // modeling a split-store city where a convoy's tracks edges are readable from
@@ -109,5 +154,48 @@ func TestExecutionEmitStorePreservesPrimaryReadsAndMisses(t *testing.T) {
 	}
 	if resolved != 1 {
 		t.Fatalf("absent read consulted the resolver %d times, want once", resolved)
+	}
+}
+
+type executionScopedTestStore struct {
+	beads.Store
+	ref string
+}
+
+func (s executionScopedTestStore) GetWithStoreRef(id string) (beads.Bead, string, error) {
+	row, err := s.Get(id)
+	return row, s.ref, err
+}
+
+func TestExecutionEmitStorePairsScopeWithResolvedRead(t *testing.T) {
+	primary, remote := beads.NewMemStore(), beads.NewMemStore()
+	primary.HonorExplicitIDs, remote.HonorExplicitIDs = true, true
+	for _, item := range []struct {
+		store beads.Store
+		id    string
+	}{{primary, "gc-primary"}, {remote, "gc-remote"}} {
+		if _, err := item.store.Create(beads.Bead{ID: item.id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resolved := 0
+	routed := executionEmitWorkStore{Store: executionScopedTestStore{primary, "city:test"}, resolveOwning: func(string) (beads.Store, bool) {
+		resolved++
+		return executionScopedTestStore{remote, "rig:remote"}, true
+	}}
+	for _, tc := range []struct {
+		id, ref string
+		calls   int
+	}{{"gc-primary", "city:test", 0}, {"gc-remote", "rig:remote", 1}, {"gc-absent", "", 2}} {
+		row, ref, err := routed.GetWithStoreRef(tc.id)
+		if ref != tc.ref || resolved != tc.calls {
+			t.Fatalf("%s: ref=%q resolutions=%d", tc.id, ref, resolved)
+		}
+		if tc.ref != "" && (err != nil || row.ID != tc.id) {
+			t.Fatalf("%s: row=%#v err=%v", tc.id, row, err)
+		}
+		if tc.ref == "" && !errors.Is(err, beads.ErrNotFound) {
+			t.Fatalf("missing row: %v", err)
+		}
 	}
 }

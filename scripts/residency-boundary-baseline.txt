@@ -128,7 +128,7 @@
 # new surface routing class-reserved ids, which is the thing worth seeing.
 #
 # cmd/gc/cmd_convoy.go's refuseBindingRigCollision holds two rows and is one
-# site, deliberately. The binding short-circuit in resolveOwningStoreDir returns
+# site, deliberately. The binding short-circuit in resolveOwningStoreIdentity returns
 # before the scan runs, and the scan is where "this id exists in more than one
 # store" is refused — correct to skip for the city's own retained copy, wrong to
 # skip for a rig, which is never a migration target. Restoring the refusal for
@@ -190,7 +190,7 @@ cmd/gc/cmd_convoy.go	openConvoyStores	a:convoyStoreCandidates	1
 cmd/gc/cmd_convoy.go	openConvoyStores	a:openConvoyStores	1
 cmd/gc/cmd_convoy.go	refuseBindingRigCollision	a:openConvoyStores	1
 cmd/gc/cmd_convoy.go	refuseBindingRigCollision	d:bdIDIsClassReserved	1
-cmd/gc/cmd_convoy.go	resolveOwningStoreDir	a:openConvoyStores	1
+cmd/gc/cmd_convoy.go	resolveOwningStoreIdentity	a:openConvoyStores	1
 cmd/gc/cmd_convoy_dispatch.go	cmdWorkflowDelete	a:openConvoyStores	1
 cmd/gc/cmd_convoy_dispatch.go	collectSourceWorkflowMatches	a:openSourceWorkflowStores	1
 cmd/gc/cmd_convoy_dispatch.go	controlGraphBinding	b:graphClassBinding	1

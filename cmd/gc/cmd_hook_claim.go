@@ -146,6 +146,8 @@ type hookClaimReleaseRecord struct {
 
 type hookClaimOptions struct {
 	Assignee string
+	// ExecutionStoreRef comes from the selected hook store, not bead metadata.
+	ExecutionStoreRef string
 	// SessionID is this session's durable bead ID. Assignee is deliberately the
 	// alias/agent form that read paths query through GC_AGENT, but a continuation
 	// pin means "run this on THIS session", which only a session identity can
@@ -219,7 +221,7 @@ type hookClaimOps struct {
 	// ReadWorkMeta is the post-stamp authoritative readback used only to
 	// establish the durable lifecycle-start emission point.
 	ReadWorkMeta             func(context.Context, string, []string, string, string) (beads.Bead, error)
-	EmitExecutionStepStarted func(beads.Bead, string, []string, string)
+	EmitExecutionStepStarted func(beads.Bead, string, []string, string, string)
 	// PublishRunMap writes best-effort session-to-run correlation without
 	// mutating the session bead after a successful work claim.
 	PublishRunMap hookPublishRunMapFunc
@@ -983,7 +985,7 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 	result.ContinuationGroup = strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey])
 	durable, stamped := stampHookClaimIdentity(bead, opts, ops, dir, stderr)
 	if stamped && hookClaimLifecycleCandidate(durable, opts) {
-		ops.EmitExecutionStepStarted(durable, dir, opts.Env, opts.Assignee)
+		ops.EmitExecutionStepStarted(durable, dir, opts.Env, opts.Assignee, opts.ExecutionStoreRef)
 	}
 	stampHookSessionCurrentClaim(bead, opts, ops, stderr)
 	publishHookClaimRunMap(bead, opts, ops, stderr)
@@ -1464,14 +1466,15 @@ func hookReadClaimedBeadWithBdStore(_ context.Context, dir string, env []string,
 	return hookClaimBdStore(dir, env, assignee).Get(beadID)
 }
 
-func hookEmitExecutionStepStarted(step beads.Bead, dir string, env []string, assignee string) {
+func hookEmitExecutionStepStarted(step beads.Bead, dir string, env []string, assignee, storeRef string) {
 	rec := openCityRecorder(io.Discard)
 	if closer, ok := rec.(io.Closer); ok {
 		defer closer.Close() //nolint:errcheck // lifecycle events are best-effort
 	}
 	// The hook's bd context owns both the claimed graph step and its workflow
 	// root; EmitLifecycle verifies the root is graph.v2 before recording.
-	_ = executionevent.EmitLifecycle(rec, hookClaimBdStore(dir, env, assignee), events.ExecutionStepStarted, step, eventActor())
+	store := executionevent.WithStoreRef(hookClaimBdStore(dir, env, assignee), storeRef)
+	_ = executionevent.EmitLifecycle(rec, store, events.ExecutionStepStarted, step, eventActor())
 }
 
 // stampHookSessionCurrentClaim records the claimed bead id on the CLAIMING

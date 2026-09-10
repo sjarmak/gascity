@@ -1132,6 +1132,11 @@ metadata = { "gc.run_target" = "worker" }
 	if !rec.hasType(events.ExecutionStepDefined) {
 		t.Fatalf("events = %+v, want initial execution step-definition snapshot", rec.events)
 	}
+	for _, event := range rec.events {
+		if event.Type == events.ExecutionStepDefined && (event.SubjectStoreRef != "rig:fixture" || event.RunStoreRef != "rig:fixture") {
+			t.Fatalf("order event lost opened store identity: %#v", event)
+		}
+	}
 }
 
 func TestOrderDispatchRigOwnedGraphKeepsOwnerStoreWhenPoolRunsOnAnotherRig(t *testing.T) {

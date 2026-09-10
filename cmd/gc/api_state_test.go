@@ -2079,17 +2079,27 @@ func TestControllerStateEmitsCompletedFromAuthoritativeGraphStepClose(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := events.NewFake()
-	cs := &controllerState{cityBeadStore: store, eventProv: rec}
-	cs.applyBeadEventToStores(events.Event{Type: events.BeadClosed, Actor: "bd-close", Subject: step.ID, Payload: payload})
-	var completed []events.Event
-	for _, event := range rec.Events {
-		if event.Type == events.ExecutionStepCompleted {
-			completed = append(completed, event)
-		}
-	}
-	if len(completed) != 1 || completed[0].Subject != step.ID || completed[0].RunID != root.ID || completed[0].SessionID != "gcs-session" || completed[0].StepID != "build" {
-		t.Fatalf("completed lifecycle events = %#v", completed)
+	for _, origin := range []string{"", "class:gmnos", "rig:other"} {
+		t.Run("origin="+origin, func(t *testing.T) {
+			rec := events.NewFake()
+			cs := &controllerState{cityBeadStore: beads.NewMemStore(), storageRoutes: splitClassRoutes(store), eventProv: rec}
+			cs.applyBeadEventToStores(events.Event{Type: events.BeadClosed, Actor: "bd-close", Subject: step.ID, SubjectStoreRef: origin, Payload: payload})
+			var completed []events.Event
+			for _, event := range rec.Events {
+				if event.Type == events.ExecutionStepCompleted {
+					completed = append(completed, event)
+				}
+			}
+			if origin == "rig:other" {
+				if len(completed) != 0 {
+					t.Fatalf("foreign close joined local same-ID root: %#v", completed)
+				}
+				return
+			}
+			if len(completed) != 1 || completed[0].Subject != step.ID || completed[0].RunID != root.ID || completed[0].SessionID != "gcs-session" || completed[0].StepID != "build" || completed[0].SubjectStoreRef != origin || completed[0].RunStoreRef != origin {
+				t.Fatalf("completed lifecycle events = %#v", completed)
+			}
+		})
 	}
 }
 

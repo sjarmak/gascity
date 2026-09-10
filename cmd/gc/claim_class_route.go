@@ -488,7 +488,14 @@ func (r *hookClaimClassRoute) emitExecutionStepStarted(step beads.Bead) {
 	if closer, ok := rec.(io.Closer); ok {
 		defer closer.Close() //nolint:errcheck // lifecycle events are best-effort
 	}
-	_ = executionevent.EmitLifecycle(rec, r.class, events.ExecutionStepStarted, step, eventActor())
+	projectionStore := r.class
+	for _, binding := range r.topology.Bindings {
+		if sameExecutionStore(binding.Leg.Store, r.class) { // residency:allow label the class store already selected by the claim resolver; no additional read or routing
+			projectionStore = executionevent.WithStoreRef(r.class, string(binding.Leg.Ref))
+			break
+		}
+	}
+	_ = executionevent.EmitLifecycle(rec, projectionStore, events.ExecutionStepStarted, step, eventActor())
 }
 
 // classRoutedHookClaimOps returns ops whose claim-time writes fall back to the
@@ -644,9 +651,9 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 	// probes: a step this invocation did not route is one the work store
 	// answered for, and emitting it anywhere else would be a second opinion
 	// about ownership rather than a consequence of the claim.
-	ops.EmitExecutionStepStarted = func(step beads.Bead, dir string, env []string, assignee string) {
+	ops.EmitExecutionStepStarted = func(step beads.Bead, dir string, env []string, assignee, storeRef string) {
 		if !route.knownResident(step.ID) {
-			base.EmitExecutionStepStarted(step, dir, env, assignee)
+			base.EmitExecutionStepStarted(step, dir, env, assignee, storeRef)
 			return
 		}
 		route.emitExecutionStepStarted(step)

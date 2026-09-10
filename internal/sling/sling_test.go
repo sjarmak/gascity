@@ -19,6 +19,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	convoycore "github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/executionevent"
 	"github.com/gastownhall/gascity/internal/formulatest"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/molecule"
@@ -2671,6 +2672,8 @@ func TestSlingAttachGraphFormulaEmitsCurrentExecutionFacts(t *testing.T) {
 	deps := testDeps(graphV2SlingTestConfig(t, formulaDir), runtime.NewFake(), newFakeRunner().run)
 	recorder := events.NewFake()
 	deps.Events = recorder
+	deps.ExecutionGraphStore = executionevent.WithStoreRef(deps.Store, "city:test")
+	deps.ExecutionWorkStore = executionevent.WithStoreRef(deps.Store, "city:test")
 	source, err := deps.Store.Create(beads.Bead{Title: "work", Type: "task", Status: "open"})
 	if err != nil {
 		t.Fatal(err)
@@ -2689,6 +2692,11 @@ func TestSlingAttachGraphFormulaEmitsCurrentExecutionFacts(t *testing.T) {
 	}
 	if recorder.Events[0].Type != events.ExecutionWorkAssociated || recorder.Events[1].Type != events.ExecutionStepDefined || recorder.Events[2].Type != events.ExecutionStepDefined {
 		t.Fatalf("execution event types = %s, %s, %s, want association then definitions", recorder.Events[0].Type, recorder.Events[1].Type, recorder.Events[2].Type)
+	}
+	for _, event := range recorder.Events {
+		if event.SubjectStoreRef != "city:test" || event.RunStoreRef != "city:test" {
+			t.Fatalf("materialized event lost its owner: %#v", event)
+		}
 	}
 }
 

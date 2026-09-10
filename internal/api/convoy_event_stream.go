@@ -49,16 +49,18 @@ type WorkflowAttemptSummary struct {
 // Payload is decoded via the events registry into a typed variant when
 // possible. Custom event types pass through with their raw JSON payload.
 type WireEvent struct {
-	Seq       uint64            `json:"seq"`
-	Type      string            `json:"type"`
-	Ts        time.Time         `json:"ts"`
-	Actor     string            `json:"actor"`
-	Subject   string            `json:"subject,omitempty"`
-	Message   string            `json:"message,omitempty"`
-	Payload   EventPayloadUnion `json:"payload,omitempty"`
-	RunID     string            `json:"run_id,omitempty"`
-	SessionID string            `json:"session_id,omitempty"`
-	StepID    string            `json:"step_id,omitempty"`
+	Seq             uint64            `json:"seq"`
+	Type            string            `json:"type"`
+	Ts              time.Time         `json:"ts"`
+	Actor           string            `json:"actor"`
+	Subject         string            `json:"subject,omitempty"`
+	Message         string            `json:"message,omitempty"`
+	Payload         EventPayloadUnion `json:"payload,omitempty"`
+	RunID           string            `json:"run_id,omitempty"`
+	SubjectStoreRef string            `json:"subject_store_ref,omitempty"`
+	RunStoreRef     string            `json:"run_store_ref,omitempty"`
+	SessionID       string            `json:"session_id,omitempty"`
+	StepID          string            `json:"step_id,omitempty"`
 	// DependsOnStepIDs is nil when topology is unknown. A present empty slice
 	// identifies an authoritative root step.
 	DependsOnStepIDs *[]string `json:"depends_on_step_ids,omitempty"`
@@ -111,6 +113,8 @@ func toWireEvent(e events.Event) (WireEvent, bool) {
 		Message:          e.Message,
 		Payload:          EventPayloadUnion{Value: payload},
 		RunID:            e.RunID,
+		SubjectStoreRef:  e.SubjectStoreRef,
+		RunStoreRef:      e.RunStoreRef,
 		SessionID:        e.SessionID,
 		StepID:           e.StepID,
 		DependsOnStepIDs: cloneStepDependencies(e.DependsOnStepIDs),
@@ -144,6 +148,8 @@ type eventStreamEnvelope struct {
 	Message          string                   `json:"message,omitempty"`
 	Payload          EventPayloadUnion        `json:"payload,omitempty"`
 	RunID            string                   `json:"run_id,omitempty"`
+	SubjectStoreRef  string                   `json:"subject_store_ref,omitempty"`
+	RunStoreRef      string                   `json:"run_store_ref,omitempty"`
 	SessionID        string                   `json:"session_id,omitempty"`
 	StepID           string                   `json:"step_id,omitempty"`
 	DependsOnStepIDs *[]string                `json:"depends_on_step_ids,omitempty"`
@@ -162,6 +168,8 @@ type taggedEventStreamEnvelope struct {
 	Message          string                   `json:"message,omitempty"`
 	Payload          EventPayloadUnion        `json:"payload,omitempty"`
 	RunID            string                   `json:"run_id,omitempty"`
+	SubjectStoreRef  string                   `json:"subject_store_ref,omitempty"`
+	RunStoreRef      string                   `json:"run_store_ref,omitempty"`
 	SessionID        string                   `json:"session_id,omitempty"`
 	StepID           string                   `json:"step_id,omitempty"`
 	DependsOnStepIDs *[]string                `json:"depends_on_step_ids,omitempty"`
@@ -243,6 +251,8 @@ func wireEventFrom(e events.Event, workflow *workflowEventProjection) (eventStre
 		Message:          e.Message,
 		Payload:          EventPayloadUnion{Value: payload},
 		RunID:            e.RunID,
+		SubjectStoreRef:  e.SubjectStoreRef,
+		RunStoreRef:      e.RunStoreRef,
 		SessionID:        e.SessionID,
 		StepID:           e.StepID,
 		DependsOnStepIDs: cloneStepDependencies(e.DependsOnStepIDs),
@@ -272,6 +282,8 @@ func wireTaggedEventFrom(te events.TaggedEvent, workflow *workflowEventProjectio
 		Message:          te.Message,
 		Payload:          EventPayloadUnion{Value: payload},
 		RunID:            te.RunID,
+		SubjectStoreRef:  te.SubjectStoreRef,
+		RunStoreRef:      te.RunStoreRef,
 		SessionID:        te.SessionID,
 		StepID:           te.StepID,
 		DependsOnStepIDs: cloneStepDependencies(te.DependsOnStepIDs),

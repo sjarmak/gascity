@@ -264,7 +264,7 @@ func (h *handoffFixture) ops() hookClaimOps {
 		StampWorkMeta: func(_ context.Context, _ string, _ []string, beadID, _ string, patch map[string]string) error {
 			return h.store.Update(beadID, beads.UpdateOpts{Metadata: patch})
 		},
-		EmitExecutionStepStarted: func(step beads.Bead, _ string, _ []string, _ string) {
+		EmitExecutionStepStarted: func(step beads.Bead, _ string, _ []string, _ string, _ string) {
 			h.stepStarted = append(h.stepStarted, step.ID)
 		},
 		EmitClaimRejected: func(string, string, string) {},

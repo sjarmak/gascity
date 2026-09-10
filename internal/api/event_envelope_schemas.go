@@ -134,6 +134,8 @@ func typedEventEnvelopeVariantSchema(r huma.Registry, variant typedEventEnvelope
 		"run_id": {
 			Type: huma.TypeString,
 		},
+		"subject_store_ref": {Type: huma.TypeString},
+		"run_store_ref":     {Type: huma.TypeString},
 		"session_id": {
 			Type: huma.TypeString,
 		},
@@ -189,6 +191,8 @@ func customEventEnvelopeVariantSchema(r huma.Registry, cfg typedEventEnvelopeSch
 		"run_id": {
 			Type: huma.TypeString,
 		},
+		"subject_store_ref": {Type: huma.TypeString},
+		"run_store_ref":     {Type: huma.TypeString},
 		"session_id": {
 			Type: huma.TypeString,
 		},

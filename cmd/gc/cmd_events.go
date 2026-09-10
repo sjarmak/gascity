@@ -51,6 +51,8 @@ type cliWireEvent struct {
 	Message          string          `json:"message,omitempty"`
 	Payload          json.RawMessage `json:"payload,omitempty"`
 	RunID            string          `json:"run_id,omitempty"`
+	SubjectStoreRef  string          `json:"subject_store_ref,omitempty"`
+	RunStoreRef      string          `json:"run_store_ref,omitempty"`
 	SessionID        string          `json:"session_id,omitempty"`
 	StepID           string          `json:"step_id,omitempty"`
 	DependsOnStepIDs *[]string       `json:"depends_on_step_ids,omitempty"`
@@ -67,6 +69,8 @@ type cliWireTaggedEvent struct {
 	Message          string          `json:"message,omitempty"`
 	Payload          json.RawMessage `json:"payload,omitempty"`
 	RunID            string          `json:"run_id,omitempty"`
+	SubjectStoreRef  string          `json:"subject_store_ref,omitempty"`
+	RunStoreRef      string          `json:"run_store_ref,omitempty"`
 	SessionID        string          `json:"session_id,omitempty"`
 	StepID           string          `json:"step_id,omitempty"`
 	DependsOnStepIDs *[]string       `json:"depends_on_step_ids,omitempty"`
@@ -756,6 +760,8 @@ func localWireEvent(e events.Event, _ io.Writer) cliWireEvent {
 		Ts:               e.Ts,
 		Type:             e.Type,
 		RunID:            e.RunID,
+		SubjectStoreRef:  e.SubjectStoreRef,
+		RunStoreRef:      e.RunStoreRef,
 		SessionID:        e.SessionID,
 		StepID:           e.StepID,
 		DependsOnStepIDs: cloneCLIEventStepDependencies(e.DependsOnStepIDs),

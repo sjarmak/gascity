@@ -10,6 +10,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/events"
 )
 
 // The claim-time class routing unit rows. The split-topology conformance suite
@@ -340,6 +341,29 @@ func TestClassRoutedContinuationListStillFailsLoud(t *testing.T) {
 // the memo alone: a step this invocation never routed is one the work store
 // answered for, and emitting it against the binding would be a second opinion
 // about ownership rather than a consequence of the claim.
+func TestClassRoutedLifecycleEmissionCarriesOpenedBindingOwner(t *testing.T) {
+	cityPath := oneShotCLICity(t, t.TempDir())
+	t.Setenv("GC_CITY", cityPath)
+	class := newClaimRouteClassStore(t)
+	root := mintClaimRouteBead(t, class, "gcg-root", map[string]string{
+		"gc.kind": "workflow", "gc.formula_contract": "graph.v2",
+	})
+	step := mintClaimRouteBead(t, class, "gcg-step", map[string]string{
+		"gc.root_bead_id": root.ID, "gc.step_id": "build", "gc.session_id": "gcs-session",
+	})
+	route := newClaimRouteFor(t, class)
+	route.emitExecutionStepStarted(step)
+	var started []events.Event
+	for _, evt := range readCityJournal(t, cityPath) {
+		if evt.Type == events.ExecutionStepStarted {
+			started = append(started, evt)
+		}
+	}
+	if len(started) != 1 || started[0].SubjectStoreRef != "class:gmnos" || started[0].RunStoreRef != "class:gmnos" {
+		t.Fatalf("start events = %#v", started)
+	}
+}
+
 func TestClassRoutedLifecycleEmissionFollowsTheClaimOnly(t *testing.T) {
 	class := newClaimRouteClassStore(t)
 	mintClaimRouteBead(t, class, "gcg-a00", nil)
@@ -347,14 +371,14 @@ func TestClassRoutedLifecycleEmissionFollowsTheClaimOnly(t *testing.T) {
 	workEmissions := 0
 	base := hookClaimOps{
 		Claim: notFoundClaim(t, "gcg-a00"),
-		EmitExecutionStepStarted: func(beads.Bead, string, []string, string) {
+		EmitExecutionStepStarted: func(beads.Bead, string, []string, string, string) {
 			workEmissions++
 		},
 	}
 
 	// Before any routed write, the emission stays on the work store.
 	ops := classRoutedHookClaimOps(base, route)
-	ops.EmitExecutionStepStarted(beads.Bead{ID: "gcg-a00"}, "/work", nil, "worker-1")
+	ops.EmitExecutionStepStarted(beads.Bead{ID: "gcg-a00"}, "/work", nil, "worker-1", "")
 	if workEmissions != 1 {
 		t.Fatalf("work-scope emissions = %d, want 1 before the claim routes; the memo, not a probe, is what moves this seam", workEmissions)
 	}
@@ -363,7 +387,7 @@ func TestClassRoutedLifecycleEmissionFollowsTheClaimOnly(t *testing.T) {
 	if _, ok, err := ops.Claim(context.Background(), "/work", nil, "gcg-a00", "worker-1"); !ok || err != nil {
 		t.Fatalf("routed claim = (ok=%v err=%v)", ok, err)
 	}
-	ops.EmitExecutionStepStarted(beads.Bead{ID: "gcg-a00"}, "/work", nil, "worker-1")
+	ops.EmitExecutionStepStarted(beads.Bead{ID: "gcg-a00"}, "/work", nil, "worker-1", "")
 	if workEmissions != 1 {
 		t.Fatalf("work-scope emissions = %d, want 1 — after the claim landed in the binding the emission must not run against the ledger that cannot read the step's root", workEmissions)
 	}

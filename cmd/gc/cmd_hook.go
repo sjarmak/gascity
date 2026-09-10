@@ -705,6 +705,7 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 			break // selected store emptied and no later store has ready work
 		}
 		storeOpts := claimOpts
+		storeOpts.ExecutionStoreRef = claimStore.storeRef
 		storeOpts.Env = queryEnv
 		if len(claimStore.env) > 0 {
 			storeOpts.Env = claimStore.env

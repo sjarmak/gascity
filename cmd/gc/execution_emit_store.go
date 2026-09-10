@@ -1,10 +1,35 @@
 package main
 
 import (
+	"reflect"
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/executionevent"
 )
+
+// executionGraphProjectionStore labels only the read leg used to emit facts.
+// Mutation callers retain their original store and optional capabilities. The
+// class identity comes from opened routes, never a reconstructed config plan.
+func executionGraphProjectionStore(routes *storageRoutes, workStore, graphStore beads.Store, workRef string) beads.Store {
+	bindings, err := residencyBindingsFromRoutes(routes)
+	if err != nil {
+		return graphStore
+	}
+	for _, binding := range bindings {
+		if sameExecutionStore(binding.Leg.Store, graphStore) { // residency:allow label an already-selected store by identity; no ownership probe or candidate selection
+			return executionevent.WithStoreRef(graphStore, string(binding.Leg.Ref))
+		}
+	}
+	if sameExecutionStore(workStore, graphStore) {
+		return executionevent.WithStoreRef(graphStore, workRef)
+	}
+	return graphStore
+}
+
+func sameExecutionStore(a, b beads.Store) bool {
+	return a != nil && b != nil && reflect.TypeOf(a).Comparable() && reflect.TypeOf(b).Comparable() && a == b
+}
 
 // executionEmitWorkStore is the work-store leg an execution-fact projection
 // reads through. A convoy's tracks edges live in the store that materialized
@@ -18,18 +43,25 @@ type executionEmitWorkStore struct {
 }
 
 func (s executionEmitWorkStore) Get(id string) (beads.Bead, error) {
-	bead, err := s.Store.Get(id)
+	bead, _, err := s.GetWithStoreRef(id)
+	return bead, err
+}
+
+// GetWithStoreRef keeps ownership paired with the store that answered. A
+// primary miss must not attach the primary's scope to a remotely resolved row.
+func (s executionEmitWorkStore) GetWithStoreRef(id string) (beads.Bead, string, error) {
+	bead, ref, err := executionevent.ReadWithStoreRef(s.Store, id)
 	if err == nil {
-		return bead, nil
+		return bead, ref, nil
 	}
 	if s.resolveOwning == nil {
-		return bead, err
+		return bead, "", err
 	}
 	owning, ok := s.resolveOwning(id)
 	if !ok || owning == nil {
-		return bead, err
+		return bead, "", err
 	}
-	return owning.Get(id)
+	return executionevent.ReadWithStoreRef(owning, id)
 }
 
 // executionEmitStore wraps store for executionevent projection so run anchors
@@ -41,7 +73,7 @@ func executionEmitStore(store beads.Store, cityPath string) beads.Store {
 		return store
 	}
 	return executionEmitWorkStore{Store: store, resolveOwning: func(id string) (beads.Store, bool) {
-		owning, _, ok := autocloseOwningStore(id, cityPath)
-		return owning, ok
+		owning, _, ref, ok := autocloseOwningStoreIdentity(id, cityPath)
+		return executionevent.WithStoreRef(owning, ref), ok
 	}}
 }

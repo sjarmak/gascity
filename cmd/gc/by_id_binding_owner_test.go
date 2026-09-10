@@ -28,6 +28,39 @@ func convoyCityConfig(t *testing.T, cityPath string) *config.City {
 	return cfg
 }
 
+func TestResolveOwningStoreIdentityDistinguishesBindingFromCityDirectory(t *testing.T) {
+	cityPath := t.TempDir()
+	work, binding := splittest.NewWorkStore(t, "hq"), splittest.NewWorkStore(t, "hq")
+	seedCLIStorageRoutes(t, cityPath, messagingSplitRoutes(binding))
+	shadow, err := work.Create(beads.Bead{Title: "retained"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resident, err := binding.Create(beads.Bead{Title: "current"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shadow.ID != resident.ID {
+		t.Fatal("fixture needs identical retained and binding IDs")
+	}
+	ordinary, err := work.Create(beads.Bead{Title: "work only"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	for _, tc := range []struct {
+		id, ref string
+		store   beads.Store
+	}{
+		{resident.ID, "class:gmnos", binding}, {ordinary.ID, "city:test-city", work},
+	} {
+		store, dir, ref, err := resolveOwningStoreIdentity(tc.id, cfg, cityPath, func(string) (beads.Store, error) { return work, nil })
+		if err != nil || store != tc.store || dir != cityPath || ref != tc.ref {
+			t.Fatalf("%s: store=%p dir=%q ref=%q err=%v, want store=%p dir=%q ref=%q", tc.id, store, dir, ref, err, tc.store, cityPath, tc.ref)
+		}
+	}
+}
+
 // resolveThroughTheConvoyScan is the convoy arm's by-id resolution, as its
 // callers reach it.
 func resolveThroughTheConvoyScan(t *testing.T, cityPath, id string) (beads.Store, string) {

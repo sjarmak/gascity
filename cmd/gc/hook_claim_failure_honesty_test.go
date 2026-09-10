@@ -65,7 +65,7 @@ func (h *failureHookHarness) ops() hookClaimOps {
 		DrainAck:                 func(io.Writer) error { h.drained = true; return nil },
 		ResolveWorkBranch:        func(string) string { return "" },
 		PublishRunMap:            func(string, string, ...string) error { return nil },
-		EmitExecutionStepStarted: func(beads.Bead, string, []string, string) {},
+		EmitExecutionStepStarted: func(beads.Bead, string, []string, string, string) {},
 		EmitClaimRejected:        func(string, string, string) {},
 		ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
 			return nil, nil

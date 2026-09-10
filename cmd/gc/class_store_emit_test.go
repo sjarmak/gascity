@@ -141,6 +141,33 @@ func seedClassBead(t *testing.T, leaf beads.Store, stepID string) beads.Bead {
 // its recorder for ALL of them, and the supported split moves all five at once
 // — a seam that only covered graph would leave a mail write, a nudge
 // terminalization and an order close just as dark as before.
+func TestClassStoreEmissionSeparatesIdenticalIDsByOpenedStore(t *testing.T) {
+	cityPath := t.TempDir()
+	graph, mail := beads.NewMemStore(), beads.NewMemStore()
+	graphRow := seedClassBead(t, graph, "implement")
+	mailRow := seedClassBead(t, mail, "implement")
+	if graphRow.ID != mailRow.ID {
+		t.Fatal("fixture must exercise identical IDs in different stores")
+	}
+	routes := (&storageRoutes{stores: map[coordclass.Class]beads.Store{
+		coordclass.ClassGraph: graph, coordclass.ClassMessaging: mail,
+	}}).withCLIEmission(cityPath)
+	for _, class := range []coordclass.Class{coordclass.ClassGraph, coordclass.ClassMessaging} {
+		if err := routes.stores[class].Close(graphRow.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := beadEvents(readCityJournal(t, cityPath))
+	if len(got) != 2 {
+		t.Fatalf("got %d events, want two independent closes", len(got))
+	}
+	for i, want := range []string{"class:g", "class:m"} {
+		if got[i].Subject != graphRow.ID || got[i].SubjectStoreRef != want || got[i].RunStoreRef != "" {
+			t.Errorf("event %d identity = %q/%q/%q, want %s/%s/unknown", i, got[i].Subject, got[i].SubjectStoreRef, got[i].RunStoreRef, graphRow.ID, want)
+		}
+	}
+}
+
 func TestClassStoreDoorMutationEmitsExactlyOneBeadEvent(t *testing.T) {
 	for _, row := range []struct {
 		name  string
@@ -183,6 +210,12 @@ func TestClassStoreDoorMutationEmitsExactlyOneBeadEvent(t *testing.T) {
 				t.Fatalf("a class-store close appended %d bead event(s), want exactly 1: %s", len(got), eventSummary(got))
 			}
 			evt := got[0]
+			if evt.SubjectStoreRef != "class:gmnos" {
+				t.Errorf("event subject owner = %q, want opened binding class:gmnos", evt.SubjectStoreRef)
+			}
+			if evt.RunStoreRef != "" {
+				t.Errorf("event inferred run owner from metadata: %q", evt.RunStoreRef)
+			}
 			if evt.Type != events.BeadClosed {
 				t.Errorf("event type = %q, want %q", evt.Type, events.BeadClosed)
 			}
@@ -1177,6 +1210,9 @@ func TestOneShotCLIWritesEmitBeadEventsOnAMigratedCity(t *testing.T) {
 		created := 0
 		for _, evt := range beadEvents(readCityJournal(t, cityPath)) {
 			if evt.Subject == sent.ID && evt.Type == events.BeadCreated {
+				if evt.SubjectStoreRef != "class:gmnos" {
+					t.Errorf("mail origin = %q, want opened binding class:gmnos", evt.SubjectStoreRef)
+				}
 				created++
 			}
 		}
@@ -1217,6 +1253,9 @@ func TestOneShotCLIWritesEmitBeadEventsOnAMigratedCity(t *testing.T) {
 		var got []string
 		for _, evt := range beadEvents(readCityJournal(t, cityPath)) {
 			if evt.Subject == step.ID {
+				if evt.SubjectStoreRef != "class:gmnos" || evt.RunStoreRef != "" {
+					t.Errorf("graph event owners = %q/%q, want class:gmnos/unknown", evt.SubjectStoreRef, evt.RunStoreRef)
+				}
 				got = append(got, evt.Type)
 			}
 		}

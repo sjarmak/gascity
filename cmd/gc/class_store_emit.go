@@ -105,6 +105,17 @@ func (r *storageRoutes) withCLIEmission(cityPath string) *storageRoutes {
 	if r == nil || cityPath == "" || len(r.stores) == 0 {
 		return r
 	}
+	// Capture physical ownership before replacing the backing stores. Failure
+	// to resolve ownership leaves it unknown; telemetry must not block writes.
+	refs := make(map[beads.Store]string)
+	bindings, err := residencyBindingsFromRoutes(r)
+	if err != nil {
+		warnClassStoreEmit(fmt.Errorf("resolving event store ownership: %w", err))
+	} else {
+		for _, binding := range bindings {
+			refs[binding.Leg.Store] = string(binding.Leg.Ref) // residency:allow snapshot opened binding identities before wrappers replace them; not a bead ownership query
+		}
+	}
 	emitting := make(map[beads.Store]beads.Store, 1)
 	for class, store := range r.stores {
 		if store == nil {
@@ -112,7 +123,7 @@ func (r *storageRoutes) withCLIEmission(cityPath string) *storageRoutes {
 		}
 		wrapped, ok := emitting[store]
 		if !ok {
-			wrapped = &emittingClassStore{Store: store, cityPath: cityPath}
+			wrapped = &emittingClassStore{Store: store, cityPath: cityPath, subjectStoreRef: refs[store]}
 			emitting[store] = wrapped
 		}
 		r.stores[class] = wrapped
@@ -127,7 +138,8 @@ func (r *storageRoutes) withCLIEmission(cityPath string) *storageRoutes {
 // explicitly below.
 type emittingClassStore struct {
 	beads.Store
-	cityPath string
+	cityPath        string
+	subjectStoreRef string
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +186,7 @@ func (s *emittingClassStore) emit(emissions ...classStoreEmission) {
 			Type:             emission.eventType,
 			Actor:            actor,
 			Subject:          emission.bead.ID,
+			SubjectStoreRef:  s.subjectStoreRef,
 			RunID:            beadmeta.ResolveRunID(emission.bead.Metadata, emission.bead.ID, ""),
 			SessionID:        emission.bead.Metadata[beadmeta.SessionIDMetadataKey],
 			StepID:           stepID,

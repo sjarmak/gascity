@@ -465,6 +465,13 @@ type Event struct {
 	RunID     string          `json:"run_id,omitempty"`
 	SessionID string          `json:"session_id,omitempty"`
 	StepID    string          `json:"step_id,omitempty"`
+	// SubjectStoreRef and RunStoreRef identify the authoritative stores owning
+	// Subject and RunID respectively. Producers stamp them from resolved store
+	// routing, never from ID prefixes or actor names. They can differ for a work
+	// association; both refer to the graph store for a physical step. Missing
+	// scope stays absent, including when reading historical journal records.
+	SubjectStoreRef string `json:"subject_store_ref,omitempty"`
+	RunStoreRef     string `json:"run_store_ref,omitempty"`
 	// DependsOnStepIDs is nil for unknown native topology; a present empty
 	// slice represents a known root.
 	DependsOnStepIDs *[]string `json:"depends_on_step_ids,omitempty"`
