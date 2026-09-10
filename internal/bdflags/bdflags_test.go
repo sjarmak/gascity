@@ -8,6 +8,35 @@ import (
 	"testing"
 )
 
+// Pin value consumption, not just presence: a misplaced value flag can make
+// a mutation guard mistake its value for a bead ID.
+func TestSeptemberCLIFlagConsumption(t *testing.T) {
+	for _, tc := range []struct {
+		sub, flag string
+		value     bool
+	}{
+		{"create", "--storage-class", true},
+		{"create", "--allow-empty-description", false},
+		{"update", "--force", false},
+		{"list", "--external-contains", true},
+		{"list", "--external-ref", true},
+		{"list", "--max-rows", true},
+		{"list", "--brief", false},
+		{"list", "--deps", false}, // Optional value uses --deps=all; bare --deps consumes nothing.
+		{"ready", "--max-rows", true},
+		{"ready", "--label-pattern", true},
+		{"ready", "--label-regex", true},
+		{"ready", "--brief", false},
+		{"show", "--brief-deps", false},
+	} {
+		t.Run(tc.sub+"/"+tc.flag, func(t *testing.T) {
+			if ValueFlags(tc.sub)[tc.flag] != tc.value || BoolFlags(tc.sub)[tc.flag] == tc.value {
+				t.Fatalf("%s %s: want consumes-next=%v in exactly one pinned set", tc.sub, tc.flag, tc.value)
+			}
+		})
+	}
+}
+
 func TestParseHelpFlagsToSets(t *testing.T) {
 	helpText := `Flags:
       -a, --assignee string   Assignee

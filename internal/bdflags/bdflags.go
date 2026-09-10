@@ -43,6 +43,8 @@ var globalBoolFlags = map[string]bool{
 // global set), keyed by subcommand: a single word ("update") or, for
 // compound bd subcommands, "parent child" ("mol pour"). The key set here
 // defines every subcommand this package knows about — see Known/Subcommands.
+// Refreshed 2026-09-10 against bd 1.3.0-rc.1 (9c6a69ec1235) --help;
+// retain older flags as a compatibility superset. This is not the Go module pin.
 var valueFlagsBySub = map[string]map[string]bool{
 	"create": {
 		"--acceptance": true, "--append-notes": true, "-a": true, "--assignee": true,
@@ -55,7 +57,7 @@ var valueFlagsBySub = map[string]map[string]bool{
 		"--mol-type": true, "--notes": true, "--parent": true, "-p": true,
 		"--priority": true, "--repo": true, "--skills": true, "--spec-id": true,
 		"-s": true, "--status": true, "--title": true, "-t": true, "--type": true, "--waits-for": true,
-		"--waits-for-gate": true, "--wisp-type": true,
+		"--waits-for-gate": true, "--wisp-type": true, "--storage-class": true,
 	},
 	"update": {
 		"--acceptance": true, "--add-label": true, "--append-notes": true,
@@ -83,6 +85,7 @@ var valueFlagsBySub = map[string]map[string]bool{
 		"--from-file": true,
 	},
 	"ready": {
+		"--label-pattern": true, "--label-regex": true, "--max-rows": true,
 		"-a": true, "--assignee": true, "--exclude-label": true, "--exclude-type": true,
 		"--has-metadata-key": true, "-l": true, "--label": true, "--label-any": true,
 		"-n": true, "--limit": true, "--metadata-field": true, "--mol": true,
@@ -90,6 +93,7 @@ var valueFlagsBySub = map[string]map[string]bool{
 		"--priority": true, "-s": true, "--sort": true, "-t": true, "--type": true,
 	},
 	"list": {
+		"--external-contains": true, "--external-ref": true, "--max-rows": true,
 		"-a": true, "--assignee": true, "--closed-after": true, "--closed-before": true,
 		"--created-after": true, "--created-before": true, "--defer-after": true,
 		"--defer-before": true, "--desc-contains": true, "--due-after": true,
@@ -136,10 +140,12 @@ var valueFlagsBySub = map[string]map[string]bool{
 // global set. Same keying convention as valueFlagsBySub.
 var boolFlagsBySub = map[string]map[string]bool{
 	"create": {
-		"--dry-run": true, "--ephemeral": true, "--force": true, "--no-history": true,
+		"--allow-empty-description": true,
+		"--dry-run":                 true, "--ephemeral": true, "--force": true, "--no-history": true,
 		"--no-inherit-labels": true, "--silent": true, "--stdin": true, "--validate": true,
 	},
 	"update": {
+		"--force":                   true,
 		"--allow-empty-description": true, "--claim": true, "--ephemeral": true,
 		"--history": true, "--no-history": true, "--persistent": true, "--stdin": true,
 	},
@@ -152,10 +158,13 @@ var boolFlagsBySub = map[string]map[string]bool{
 		"--cascade": true, "--dry-run": true, "-f": true, "--force": true,
 	},
 	"ready": {
+		"--brief": true,
 		"--claim": true, "--explain": true, "--gated": true, "--include-deferred": true,
 		"--include-ephemeral": true, "--plain": true, "--pretty": true, "-u": true, "--unassigned": true,
 	},
 	"list": {
+		// --deps has an optional inline value; bare --deps consumes no next argument.
+		"--brief": true, "--deps": true,
 		"--all": true, "--deferred": true, "--empty-description": true, "--flat": true,
 		"--include-gates": true, "--include-infra": true, "--include-templates": true,
 		"--long": true, "--no-assignee": true, "--no-labels": true, "--no-pager": true,
@@ -164,7 +173,8 @@ var boolFlagsBySub = map[string]map[string]bool{
 		"--skip-labels": true, "--tree": true, "-w": true, "--watch": true,
 	},
 	"show": {
-		"--children": true, "--current": true, "--include-comments": true,
+		"--brief-deps": true,
+		"--children":   true, "--current": true, "--include-comments": true,
 		"--include-dependents": true, "--local-time": true, "--long": true,
 		"--refs": true, "--short": true, "--thread": true, "-w": true, "--watch": true,
 	},
