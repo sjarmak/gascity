@@ -2,13 +2,14 @@ package gitcred
 
 import (
 	"fmt"
-	"os"
 	"strings"
+
+	"github.com/gastownhall/gascity/internal/processenv"
 )
 
 // osExecutable is the package seam for resolving the running gc binary path.
 // Tests stub it to point the deferred git-credential helper at a fixture.
-var osExecutable = os.Executable
+var osExecutable = processenv.ResolveGCBinary
 
 // Injection is what one network git invocation must add to authenticate. The
 // zero value means "run byte-identical to today": no extra argv, no extra env.
@@ -73,7 +74,10 @@ func CredentialedNetworkArgs(gcExe, cityRoot, cloneURL string) (Injection, error
 
 // httpsInjection builds the credential-helper injection for an http(s) clone.
 func httpsInjection(gcExe, cityRoot string, matched bool, origin string) (Injection, error) {
-	exe := strings.TrimSpace(gcExe)
+	// Preserve caller-provided paths byte-for-byte. Persistent wrappers may
+	// intentionally contain spaces or trailing whitespace; only an actually
+	// empty value asks this layer to resolve the running binary.
+	exe := gcExe
 	if exe == "" {
 		resolved, err := osExecutable()
 		if err != nil {

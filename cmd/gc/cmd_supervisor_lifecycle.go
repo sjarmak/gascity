@@ -517,7 +517,7 @@ func doSupervisorStartJSON(stdout, stderr io.Writer, jsonOut bool) int {
 	}
 	lock.Close() //nolint:errcheck // release probe lock
 
-	gcPath, err := os.Executable()
+	gcPath, err := processenv.ResolveGCBinary()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc supervisor start: finding executable: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1010,12 +1010,18 @@ type supervisorServiceEnvVar struct {
 }
 
 func buildSupervisorServiceData() (*supervisorServiceData, error) {
-	gcExe, err := os.Executable()
+	gcExe, err := processenv.ResolveGCBinary()
 	if err != nil {
 		return nil, fmt.Errorf("finding executable: %w", err)
 	}
 	homeDir, _ := os.UserHomeDir()
-	gcPath := resolveStableSupervisorBinaryPath(homeDir, stableSupervisorBinaryGopath(homeDir), gcExe)
+	gcPath := gcExe
+	// An explicit GC_BIN is a caller-selected persistent launcher (for
+	// example, gc_pinned_launcher.py). Preserve that literal path; inode-based
+	// alias selection is only safe for ordinary resident binaries.
+	if strings.TrimSpace(os.Getenv("GC_BIN")) == "" {
+		gcPath = resolveStableSupervisorBinaryPath(homeDir, stableSupervisorBinaryGopath(homeDir), gcExe)
+	}
 	home := supervisor.DefaultHome()
 	xdgRuntimeDir := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR"))
 	if supervisor.UsesIsolatedGCHomeOverride() {

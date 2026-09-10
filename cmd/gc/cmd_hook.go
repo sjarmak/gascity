@@ -19,6 +19,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/session"
 )
 
@@ -100,7 +101,7 @@ type hookRunOptions struct {
 	TimeoutExitCode int
 }
 
-var hookRunExecutable = os.Executable
+var hookRunExecutable = processenv.ResolveGCBinary
 
 func cmdHookRun(args []string, opts hookRunOptions, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {

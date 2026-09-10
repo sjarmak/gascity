@@ -17,6 +17,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/spf13/cobra"
 )
 
@@ -349,9 +350,9 @@ var defaultSlinguedSynthDeps = slinguedSynthDeps{
 // re-enter via subprocess to avoid duplicating the routing/convoy/event
 // machinery in this file.
 func defaultSlingCaller(ctx context.Context, args []string) error {
-	bin, err := os.Executable()
+	bin, err := processenv.ResolveGCBinary()
 	if err != nil {
-		bin = os.Args[0]
+		return fmt.Errorf("resolving gc executable: %w", err)
 	}
 	cmd := exec.CommandContext(ctx, bin, append([]string{"sling"}, args...)...)
 	var stderr bytes.Buffer

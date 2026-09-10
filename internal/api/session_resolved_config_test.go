@@ -415,7 +415,10 @@ func TestCityAnchoredSessionEnvSkipsCityAnchorsWhenCityPathEmpty(t *testing.T) {
 		"PROVIDER_TOKEN": "ok",
 	}
 
-	got := cityAnchoredSessionEnv(" \t\n ", nil, providerEnv)
+	got, err := cityAnchoredSessionEnv(" \t\n ", nil, providerEnv)
+	if err != nil {
+		t.Fatalf("cityAnchoredSessionEnv: %v", err)
+	}
 	if got["GC_CITY"] != "/provider/city" {
 		t.Fatalf("GC_CITY = %q, want provider value", got["GC_CITY"])
 	}

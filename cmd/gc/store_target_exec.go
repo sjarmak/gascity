@@ -93,6 +93,9 @@ func gcExecStoreEnv(cityPath string, target execStoreTarget, provider string) ma
 }
 
 func gcExecLifecycleInitProcessEnv(cityPath string, target execStoreTarget, provider string) ([]string, error) {
+	if err := validateProviderLifecycleGCBinary(); err != nil {
+		return nil, fmt.Errorf("validate GC_BIN for exec-provider lifecycle: %w", err)
+	}
 	env := gcExecStoreEnv(cityPath, target, provider)
 	if !execProviderNeedsScopedDoltInit(provider) {
 		return mergeRuntimeEnv(os.Environ(), env), nil

@@ -14,6 +14,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/spf13/cobra"
 )
 
@@ -284,7 +285,7 @@ func readDiscoveredHelp(entry config.DiscoveredCommand) string {
 	return strings.TrimSpace(string(data))
 }
 
-var resolveInvokingExecutable = os.Executable
+var resolveInvokingExecutable = processenv.ResolveGCBinary
 
 func discoveredHelpRequested(args []string) bool {
 	for _, arg := range args {

@@ -6,12 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/credentialprovider"
+	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/shellquote"
 	"github.com/spf13/cobra"
 )
@@ -19,9 +18,10 @@ import (
 const hostedBeadsCredentialSubcommand = "internal beads-credential"
 
 // hostedBeadsCredentialExecutable is a seam for the command projection's
-// executable lookup. Production uses os.Executable, while tests can prove the
+// executable lookup. Production uses the shared persistent-binary resolver,
+// while tests can prove the
 // absolute-path and shell-quoting contract without invoking a real binary.
-var hostedBeadsCredentialExecutable = os.Executable
+var hostedBeadsCredentialExecutable = processenv.ResolveGCBinary
 
 // hostedBeadsCredentialCommand returns the command bd runs to mint a hosted
 // Beads credential. The executable is made absolute before shell quoting so a
@@ -32,9 +32,12 @@ func hostedBeadsCredentialCommand() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolving the running gc executable for the credential provider: %w", err)
 	}
-	if strings.TrimSpace(executable) == "" {
+	if executable == "" {
 		return "", errors.New("resolving the running gc executable for the credential provider: empty path")
 	}
+	// The production resolver always returns an absolute persistent path. Keep
+	// the historical absolute-normalization behavior for test seams and other
+	// injected callers, which may provide a relative fixture path.
 	if !filepath.IsAbs(executable) {
 		executable, err = filepath.Abs(executable)
 		if err != nil {
