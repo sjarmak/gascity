@@ -1124,19 +1124,8 @@ func buildDesiredStateWithSessionBeadsAt(
 			fmt.Fprintf(stderr, "buildDesiredState: named session %q: %v (skipping)\n", identity, err) //nolint:errcheck
 			continue
 		}
-		tp.Alias = identity
-		tp.TemplateName = namedSessionBackingTemplate(spec)
-		tp.InstanceName = identity
-		tp.ConfiguredNamedIdentity = identity
-		tp.ConfiguredNamedMode = spec.Mode
+		applyNamedSessionIdentity(&tp, spec)
 		tp.BoundStepID = namedWorkBeadID[identity]
-		if tp.Env == nil {
-			tp.Env = make(map[string]string)
-		}
-		tp.Env["GC_TEMPLATE"] = namedSessionBackingTemplate(spec)
-		tp.Env["GC_ALIAS"] = identity
-		tp.Env["GC_AGENT"] = identity
-		tp.Env["GC_SESSION_ORIGIN"] = "named"
 		// When a canonical bead exists, use ITS session_name as the
 		// desiredState key so syncSessionBeads finds it in bySessionName
 		// and takes the UPDATE path. Without this, resolveSessionName
@@ -2946,6 +2935,15 @@ func discoverSessionBeadsWithRoots(
 			continue
 		}
 		tp.ManualSession = isManualSessionInfoForAgent(info, cfgAgent)
+		// Suspended named sessions can reach this rediscovery path. Rebuild
+		// their identity from current configuration, not merely a stored claim.
+		if isNamedSessionInfo(info) {
+			if spec, ok := findNamedSessionSpec(cfg, bp.cityName, namedSessionIdentityInfo(info)); ok && namedSessionBackingTemplate(spec) == template {
+				if canonical, exists := findCanonicalNamedSessionInfo(sessionBeads, spec); exists && canonical.ID == info.ID {
+					applyNamedSessionIdentity(&tp, spec)
+				}
+			}
+		}
 		if tp.ManualSession {
 			if manualAlias := strings.TrimSpace(info.Alias); manualAlias != "" {
 				// Explicit aliases from `gc session new --alias ...` are
@@ -2967,6 +2965,23 @@ func discoverSessionBeadsWithRoots(
 		desired[sn] = tp
 	}
 	return roots
+}
+
+// applyNamedSessionIdentity keeps normal construction and rediscovery aligned.
+// Callers must establish ownership from current configuration and session state.
+func applyNamedSessionIdentity(tp *TemplateParams, spec namedSessionSpec) {
+	tp.Alias = spec.Identity
+	tp.TemplateName = namedSessionBackingTemplate(spec)
+	tp.InstanceName = spec.Identity
+	tp.ConfiguredNamedIdentity = spec.Identity
+	tp.ConfiguredNamedMode = spec.Mode
+	if tp.Env == nil {
+		tp.Env = make(map[string]string)
+	}
+	tp.Env["GC_TEMPLATE"] = namedSessionBackingTemplate(spec)
+	tp.Env["GC_ALIAS"] = spec.Identity
+	tp.Env["GC_AGENT"] = spec.Identity
+	tp.Env["GC_SESSION_ORIGIN"] = "named"
 }
 
 // isPendingPoolCreateInfo reports whether a pool-managed session is an in-flight
@@ -3845,11 +3860,9 @@ func resolveTemplateForSessionBeadInfo(
 // template's base name, and every named session backed by that template
 // resolves work_dir to one shared directory instead of its own. A named bead
 // with no stored identity (legacy, pre-stamp) falls back to the template QN,
-// unchanged from before. NOTE: this aligns the (agent, qualifiedName) pair and
-// therefore WorkDir/AgentBase; the rest of the named TemplateParams Env shape
-// (GC_SESSION_ORIGIN=named, ConfiguredNamedIdentity/Mode) is still authored
-// only by the named-session loop, so Env-side drift across rediscovery vs.
-// that loop remains a separate follow-up.
+// unchanged from before. This helper aligns WorkDir/AgentBase only. Named
+// lifecycle fields and environment require a current spec and canonical owner;
+// the named-session loop and rediscovery apply those separately.
 //
 // Rules:
 //   - Named bead with stored identity → (cfgAgent, configured_named_identity).
