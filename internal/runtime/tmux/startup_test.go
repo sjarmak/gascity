@@ -2807,16 +2807,40 @@ func TestRecordStartCrashDisabledWhenNoRuntimeDir(t *testing.T) {
 // slow-but-healthy setup commands killed mid-flight by the fixed wall-clock
 // deadline (e.g. a large `git worktree add` checkout streaming progress past
 // setup_timeout). With the activity budget enabled, output resets the idle
-// clock, so a command that streams for 3x the idle window and exits 0 must
-// succeed.
+// clock, so a command that streams for longer than the idle window and exits 0
+// must succeed.
+//
+// Two timing properties make this test meaningful, and they pull in opposite
+// directions. Keep both when touching the numbers:
+//
+//  1. Total runtime must EXCEED the idle budget. Otherwise the command would
+//     finish inside a single idle window and the test would pass even against
+//     an implementation that never resets the clock, asserting nothing.
+//  2. Each gap between consecutive writes must be FAR UNDER the idle budget,
+//     because that gap is what the monitor actually measures
+//     (execgrace.Monitor.checkIdle cancels when time since the last write
+//     reaches idle). The observed gap is not the nominal sleep: it also carries
+//     shell startup before the first write, a /bin/sleep fork per iteration,
+//     and scheduling of the goroutine that copies the pipe into the activity
+//     writer. Under a loaded or cold-cache sweep those costs are what close the
+//     margin.
+//
+// The original numbers (10 iterations of sleep 0.1 against a 300ms budget) held
+// property 1 but gave property 2 only ~3x of nominal margin, and flaked by
+// dying on the very first progress line while stdout showed healthy output
+// (gc-zvchq). The shape below keeps ~2x on property 1 and ~15x on property 2.
 func TestRunSetupCommandActivityStreamingSurvivesIdleWindow(t *testing.T) {
 	ops := &tmuxStartOps{tm: &Tmux{}, setupMaxTimeout: 30 * time.Second}
 
+	const idleBudget = 1500 * time.Millisecond
+
 	err := ops.runSetupCommand(
 		context.Background(),
-		"for i in 1 2 3 4 5 6 7 8 9 10; do echo progress $i; sleep 0.1; done; exit 0",
+		// 30 writes spaced ~100ms apart: nominal total ~3s, twice the idle
+		// budget, while no single gap approaches it.
+		"i=0; while [ $i -lt 30 ]; do i=$((i+1)); echo progress $i; sleep 0.1; done; exit 0",
 		map[string]string{},
-		300*time.Millisecond, // idle budget — total runtime (~1s) far exceeds it
+		idleBudget,
 	)
 	if err != nil {
 		t.Fatalf("streaming setup command killed despite visible progress: %v", err)
@@ -2852,15 +2876,22 @@ func TestRunSetupCommandActivityIdleKillsSilentHang(t *testing.T) {
 
 // TestRunSetupCommandActivityCeilingKillsRunaway proves the runaway backstop:
 // continuous output must not extend a command past the absolute ceiling.
+//
+// This test asserts WHICH budget fired, so it carries the same gap-margin
+// requirement as the streaming test above: the spinner must never stall long
+// enough for the idle budget to trip, or the command dies of ErrIdle and the
+// ceiling assertion fails on an error that names the wrong budget. The gap is
+// held ~20x under the idle budget, and the ceiling sits above the idle budget
+// so the ceiling is the only thing that can end a healthy spinner.
 func TestRunSetupCommandActivityCeilingKillsRunaway(t *testing.T) {
-	ops := &tmuxStartOps{tm: &Tmux{}, setupMaxTimeout: 700 * time.Millisecond}
+	ops := &tmuxStartOps{tm: &Tmux{}, setupMaxTimeout: 2 * time.Second}
 
 	start := time.Now()
 	err := ops.runSetupCommand(
 		context.Background(),
-		"while true; do echo spinning; sleep 0.1; done",
+		"while true; do echo spinning; sleep 0.05; done",
 		map[string]string{},
-		300*time.Millisecond,
+		1*time.Second,
 	)
 	elapsed := time.Since(start)
 	if err == nil {
