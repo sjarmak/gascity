@@ -1538,7 +1538,7 @@ Current branch progress:
 - worker handles stamp explicit profile identity and certification
   fingerprint metadata into production session beads
 - transcript discovery policy now routes through
-  `internal/worker/transcript` for worker, API, and `gc session logs`
+  `internal/transcript` for worker, API, and `gc session logs`
 - API submit / background-nudge / stop-turn / respond paths now call the
   worker handle rather than invoking `session.Manager` semantics
   directly

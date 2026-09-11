@@ -2922,7 +2922,7 @@
     {
       "package": "transcript",
       "function": "DiscoverFallbackPath",
-      "file": "internal/worker/transcript/discovery.go",
+      "file": "internal/transcript/discovery.go",
       "ccn": 20
     },
     {

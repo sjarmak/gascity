@@ -10,9 +10,9 @@ import (
 
 	"github.com/gastownhall/gascity/internal/config"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/transcript"
 	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 	"github.com/gastownhall/gascity/internal/worker"
-	workertranscript "github.com/gastownhall/gascity/internal/worker/transcript"
 	"github.com/spf13/cobra"
 )
 
@@ -119,7 +119,7 @@ func resolveSessionLogPath(searchPaths []string, logCtx sessionLogContext) strin
 }
 
 func resolveSessionKeyedLogPath(searchPaths []string, logCtx sessionLogContext) string {
-	return workertranscript.DiscoverKeyedPath(searchPaths, logCtx.provider, logCtx.workDir, logCtx.sessionKey)
+	return transcript.DiscoverKeyedPath(searchPaths, logCtx.provider, logCtx.workDir, logCtx.sessionKey)
 }
 
 type sessionLogContext struct {

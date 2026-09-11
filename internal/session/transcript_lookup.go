@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/sessionlog"
-	workertranscript "github.com/gastownhall/gascity/internal/worker/transcript"
+	"github.com/gastownhall/gascity/internal/transcript"
 )
 
 // ResolveKeyedTranscriptPath returns a transcript only when info carries a
@@ -17,7 +17,7 @@ import (
 // this session. The Info-based input lets list/read-model callers reuse their
 // already-loaded projection without issuing a per-session store Get.
 //
-// Codex needs a stricter path than workertranscript.DiscoverKeyedPath: copied
+// Codex needs a stricter path than transcript.DiscoverKeyedPath: copied
 // rollouts can share a UUID and workdir, so the bounded lookup refuses multiple
 // physical matches instead of choosing the newest. Gemini has no exact by-key
 // transcript lookup and therefore remains unsupported here.
@@ -68,7 +68,7 @@ func ResolveKeyedTranscriptPaths(infos []Info, searchPaths []string, fallbackPro
 		case "gemini":
 			continue
 		default:
-			if path := workertranscript.DiscoverKeyedPath(searchPaths, provider, workDir, sessionKey); path != "" {
+			if path := transcript.DiscoverKeyedPath(searchPaths, provider, workDir, sessionKey); path != "" {
 				paths[info.ID] = path
 			}
 		}
@@ -111,7 +111,7 @@ func ResolveCodexTranscriptBySessionOrder(searchPaths []string, provider, workDi
 			continue
 		}
 		end := codexSessionWindowEnd(anchored, i)
-		return workertranscript.DiscoverCodexPathInTimeWindow(searchPaths, workDir, item.start, end)
+		return transcript.DiscoverCodexPathInTimeWindow(searchPaths, workDir, item.start, end)
 	}
 	return ""
 }

@@ -25,8 +25,8 @@ import (
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
 	"github.com/gastownhall/gascity/internal/telemetry"
+	"github.com/gastownhall/gascity/internal/transcript"
 	"github.com/gastownhall/gascity/internal/worker"
-	workertranscript "github.com/gastownhall/gascity/internal/worker/transcript"
 )
 
 const (
@@ -2024,7 +2024,7 @@ func observeRuntimeProviderLiveness(sp runtime.Provider, name string, processNam
 // provider's own default roots on top of the supplied claude default, so
 // claude/kimi/pi each probe their real location.
 var staleResumeKeyProbe = func(provider, workDir, sessionKey string) (present, probeable bool) {
-	return workertranscript.HasKeyedTranscript(worker.DefaultSearchPaths(), provider, workDir, sessionKey)
+	return transcript.HasKeyedTranscript(worker.DefaultSearchPaths(), provider, workDir, sessionKey)
 }
 
 // validateForkLaunch enforces fork-launch invariants before command resolution.

@@ -1,4 +1,4 @@
-// Package transcript contains worker transcript discovery helpers.
+// Package transcript contains transcript discovery helpers.
 package transcript
 
 import (

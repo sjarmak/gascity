@@ -15,7 +15,7 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/sessionlog"
 	"github.com/gastownhall/gascity/internal/telemetry"
-	workertranscript "github.com/gastownhall/gascity/internal/worker/transcript"
+	"github.com/gastownhall/gascity/internal/transcript"
 )
 
 // staleKeyDetectDelay is the immutable production window between a keyed
@@ -1227,7 +1227,7 @@ func (m *Manager) TranscriptPathClassified(id string, searchPaths []string) (str
 	if len(searchPaths) == 0 {
 		searchPaths = sessionlog.DefaultSearchPaths()
 	}
-	if path := workertranscript.DiscoverKeyedPath(searchPaths, provider, workDir, b.Metadata["session_key"]); path != "" {
+	if path := transcript.DiscoverKeyedPath(searchPaths, provider, workDir, b.Metadata["session_key"]); path != "" {
 		return path, TranscriptFound, nil
 	}
 	// zcode carries no session_key — no session-id flag, no hook plugin — so
@@ -1235,7 +1235,7 @@ func (m *Manager) TranscriptPathClassified(id string, searchPaths []string) (str
 	// would leave every pooled worker transcript-dark. Its mirror is keyed by
 	// the identity the bead does hold: its name, its own id (the seat — two
 	// seats can share a name and epoch), and its continuation epoch.
-	if path := workertranscript.DiscoverScopedPath(
+	if path := transcript.DiscoverScopedPath(
 		searchPaths,
 		provider,
 		workDir,
@@ -1262,7 +1262,7 @@ func (m *Manager) TranscriptPathClassified(id string, searchPaths []string) (str
 		// workdir cannot be mapped safely to a single transcript.
 		return "", TranscriptAmbiguous, nil
 	}
-	if path := workertranscript.DiscoverPath(searchPaths, provider, workDir, ""); path != "" {
+	if path := transcript.DiscoverPath(searchPaths, provider, workDir, ""); path != "" {
 		return path, TranscriptFound, nil
 	}
 	return "", TranscriptAbsent, nil

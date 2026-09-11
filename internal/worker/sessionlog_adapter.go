@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/sessionlog"
-	workertranscript "github.com/gastownhall/gascity/internal/worker/transcript"
+	"github.com/gastownhall/gascity/internal/transcript"
 )
 
 // LoadRequest scopes a Phase 1 transcript load.
@@ -62,20 +62,20 @@ type SessionLogAdapter struct {
 // DiscoverTranscript returns the best available transcript path for a worker.
 func (a SessionLogAdapter) DiscoverTranscript(provider, workDir, gcSessionID string) string {
 	if strings.TrimSpace(gcSessionID) != "" {
-		if path := workertranscript.DiscoverKeyedPath(a.SearchPaths, provider, workDir, gcSessionID); path != "" {
+		if path := transcript.DiscoverKeyedPath(a.SearchPaths, provider, workDir, gcSessionID); path != "" {
 			return path
 		}
-		if path := workertranscript.DiscoverFallbackPath(a.SearchPaths, provider, workDir, gcSessionID); path != "" {
+		if path := transcript.DiscoverFallbackPath(a.SearchPaths, provider, workDir, gcSessionID); path != "" {
 			return path
 		}
 	}
-	return workertranscript.DiscoverPath(a.SearchPaths, provider, workDir, gcSessionID)
+	return transcript.DiscoverPath(a.SearchPaths, provider, workDir, gcSessionID)
 }
 
 // DiscoverWorkDirTranscript resolves the best provider-specific transcript for
 // a workdir without requiring a stable session identifier.
 func (a SessionLogAdapter) DiscoverWorkDirTranscript(provider, workDir string) string {
-	return workertranscript.DiscoverPath(a.SearchPaths, provider, workDir, "")
+	return transcript.DiscoverPath(a.SearchPaths, provider, workDir, "")
 }
 
 // TailMeta reads model/context metadata from a discovered transcript path.
