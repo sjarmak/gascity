@@ -27,6 +27,19 @@ import (
 const (
 	bdParentProjectionPollInterval = 50 * time.Millisecond
 	bdTxProjectionTimeout          = 5 * time.Second
+	// bdMaxConcurrentCommands bounds the memory and connection footprint of
+	// bd subprocess bursts within one gc process. Each subprocess is relatively
+	// heavy and may remain live until its command timeout under Dolt contention.
+	bdMaxConcurrentCommands = 6
+	// bdCommandWaitDelay bounds how long a bd command keeps waiting after its
+	// context is done. Canceling the context kills the child, but Run and Output
+	// also wait for the goroutines copying its output, and a grandchild that
+	// inherited the pipe holds it open after its parent dies. Without the bound
+	// that wait is unbounded, which matters more now that a waiting command holds
+	// one of the bdMaxConcurrentCommands slots: what used to hang a single caller
+	// can now starve every bd command in the process. Both exec paths read this
+	// so the two cannot drift apart.
+	bdCommandWaitDelay = 2 * time.Second
 )
 
 // CommandRunner executes a command in the given directory and returns stdout bytes.
@@ -34,6 +47,11 @@ const (
 type CommandRunner func(dir, name string, args ...string) ([]byte, error)
 
 var (
+	// bdCommandSlots is the process-wide bd concurrency budget. It is a
+	// package var so tests can pass their own channel to the seam helpers
+	// rather than mutating shared state.
+	bdCommandSlots = make(chan struct{}, bdMaxConcurrentCommands)
+
 	bdCommandTimeout = 120 * time.Second
 	// bdReadCommandTimeout bounds bd read-only subcommands (count, list,
 	// ready, show, sql, stats, version). Default matches bdCommandTimeout to preserve
@@ -118,10 +136,21 @@ func execCommandRunner(parent context.Context, env map[string]string, withoutAmb
 				execName = pinned
 			}
 		}
-		start := time.Now()
-		trace := newBDExecTrace(start, dir, name, args)
+		traceStart := time.Now()
+		trace := newBDExecTrace(traceStart, dir, name, args)
 		trace("start", nil)
 
+		// Queue for a bd slot before the per-command budget starts, so a burst
+		// waiting its turn does not spend the timeout it needs to run. The wait
+		// is bounded by parent, which is the caller's own budget.
+		release, err := acquireBDCommandSlot(parent, name, bdCommandSlots)
+		if err != nil {
+			return nil, fmt.Errorf("waiting for %s execution slot: %w", name, err)
+		}
+		releaseOnce := sync.OnceFunc(release)
+		defer releaseOnce()
+
+		start := time.Now()
 		timeout := bdCommandTimeoutFor(name, args)
 		ctx, cancel := context.WithTimeout(parent, timeout)
 		defer cancel()
@@ -136,7 +165,7 @@ func execCommandRunner(parent context.Context, env map[string]string, withoutAmb
 		}
 
 		cmd := exec.CommandContext(ctx, execName, args...)
-		cmd.WaitDelay = 2 * time.Second
+		cmd.WaitDelay = bdCommandWaitDelay
 		prepareCommandForTimeout(cmd)
 		cmd.Dir = dir
 		cmd.Cancel = func() error {
@@ -156,6 +185,9 @@ func execCommandRunner(parent context.Context, env map[string]string, withoutAmb
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		out, err := cmd.Output()
+		// Hand the slot back at child exit; the telemetry and classification
+		// below are in-process and must not hold the budget.
+		releaseOnce()
 
 		recordBDExecTelemetry(name, dir, args, start, out, stderr.String(), err)
 
@@ -181,6 +213,24 @@ func effectiveEnvValue(baseEnv []string, overrides map[string]string, key string
 		}
 	}
 	return "", false
+}
+
+// acquireBDCommandSlot takes one slot from the bd concurrency budget and
+// returns the release. Only bd is metered: the budget exists to bound bd
+// subprocess bursts, and charging git or any other helper to it would let
+// unrelated work starve bd reads. The returned release is safe to call once;
+// callers wrap it in sync.OnceFunc so an early hand-back at child exit and the
+// deferred safety net cannot double-release.
+func acquireBDCommandSlot(ctx context.Context, name string, slots chan struct{}) (func(), error) {
+	if name != "bd" {
+		return func() {}, nil
+	}
+	select {
+	case slots <- struct{}{}:
+		return func() { <-slots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // newBDExecTrace returns the legacy line-format trace callback for one command
@@ -680,11 +730,27 @@ func (s *BdStore) Purge(beadsDir string, dryRun bool) (PurgeResult, error) {
 
 // execPurge runs bd purge via exec.CommandContext with a 60-second timeout.
 func execPurge(dir string, env, args []string) ([]byte, error) {
-	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	return execPurgeWithContext(ctx, dir, env, args, bdCommandSlots)
+}
 
+// execPurgeWithContext is execPurge with the budget and the slot channel
+// injected, so a test can prove the limiter wait honors the context without
+// touching the process-wide budget. Unlike the command runner, purge has no
+// caller context to bound an unbounded queue wait, so its own 60s budget has to
+// cover both queueing and execution.
+func execPurgeWithContext(ctx context.Context, dir string, env, args []string, slots chan struct{}) ([]byte, error) {
+	release, err := acquireBDCommandSlot(ctx, "bd", slots)
+	if err != nil {
+		return nil, fmt.Errorf("waiting for bd execution slot: %w", err)
+	}
+	releaseOnce := sync.OnceFunc(release)
+	defer releaseOnce()
+
+	start := time.Now()
 	cmd := exec.CommandContext(ctx, "bd", args...)
+	cmd.WaitDelay = bdCommandWaitDelay
 	cmd.Dir = dir
 	cmd.Env = env
 
@@ -692,7 +758,8 @@ func execPurge(dir string, env, args []string) ([]byte, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err = cmd.Run()
+	releaseOnce()
 	traceExit := 0
 	if err != nil {
 		var exitErr *exec.ExitError

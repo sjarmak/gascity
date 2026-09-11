@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -94,6 +95,131 @@ func TestExecCommandRunnerWithEnvContextTimeoutReportsCallerDeadline(t *testing.
 	}
 	if perCommand := bdCommandTimeout.String(); strings.Contains(msg, perCommand) {
 		t.Fatalf("timeout error = %q, must not report the %s per-command timeout when the caller deadline won", msg, perCommand)
+	}
+}
+
+func TestAcquireBDCommandSlotBoundsConcurrencyAndHonorsContext(t *testing.T) {
+	slots := make(chan struct{}, 2)
+	release1, err := acquireBDCommandSlot(context.Background(), "bd", slots)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	defer release1()
+	release2, err := acquireBDCommandSlot(context.Background(), "bd", slots)
+	if err != nil {
+		t.Fatalf("second acquire: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := acquireBDCommandSlot(ctx, "bd", slots); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("third acquire error = %v, want context deadline", err)
+	}
+
+	release2()
+	release3, err := acquireBDCommandSlot(context.Background(), "bd", slots)
+	if err != nil {
+		t.Fatalf("acquire after release: %v", err)
+	}
+	release3()
+
+	// Non-bd commands do not consume the bd budget.
+	releaseOther, err := acquireBDCommandSlot(ctx, "git", slots)
+	if err != nil {
+		t.Fatalf("non-bd acquire: %v", err)
+	}
+	releaseOther()
+}
+
+// TestExecCommandRunnerBoundsConcurrentBDCommands proves the budget is actually
+// WIRED INTO the command runner, not merely available as a helper. A unit test of
+// acquireBDCommandSlot alone passes whether or not the runner ever calls it, so it
+// cannot catch the wiring being dropped. This drives real subprocesses through
+// ExecCommandRunner concurrently and has each one observe how many siblings are
+// live, which fails if the acquire is removed from the runner body.
+func TestExecCommandRunnerBoundsConcurrentBDCommands(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh unavailable")
+	}
+
+	const budget = 2
+	const callers = 8
+
+	oldSlots := bdCommandSlots
+	bdCommandSlots = make(chan struct{}, budget)
+	t.Cleanup(func() { bdCommandSlots = oldSlots })
+
+	liveDir := t.TempDir()
+	maxFile := filepath.Join(t.TempDir(), "max")
+	binDir := t.TempDir()
+	// Each invocation registers itself, counts the registered siblings while it
+	// sleeps, records a running maximum, then deregisters. mkdir is the atomic
+	// primitive used for the lock so the read-modify-write of the max file cannot
+	// interleave between concurrent children.
+	writeExecutable(t, filepath.Join(binDir, "bd"), `#!/bin/sh
+live="$GC_LIVE_DIR/live.$$"
+: > "$live"
+sleep 0.15
+n=$(ls "$GC_LIVE_DIR" | wc -l | tr -d " ")
+until mkdir "$GC_MAX_FILE.lock" 2>/dev/null; do sleep 0.01; done
+cur=0
+if [ -f "$GC_MAX_FILE" ]; then cur=$(cat "$GC_MAX_FILE"); fi
+if [ "$n" -gt "$cur" ]; then printf %s "$n" > "$GC_MAX_FILE"; fi
+rmdir "$GC_MAX_FILE.lock"
+rm -f "$live"
+printf "[]\n"
+`)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	runner := ExecCommandRunnerWithEnvContext(context.Background(), map[string]string{
+		"GC_LIVE_DIR": liveDir,
+		"GC_MAX_FILE": maxFile,
+	})
+
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := runner(t.TempDir(), "bd", "list"); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent bd call: %v", err)
+	}
+
+	raw, err := os.ReadFile(maxFile)
+	if err != nil {
+		t.Fatalf("read observed max: %v", err)
+	}
+	observed, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		t.Fatalf("parse observed max %q: %v", raw, err)
+	}
+	if observed > budget {
+		t.Fatalf("observed %d concurrent bd subprocesses, budget is %d; the runner is not taking a slot", observed, budget)
+	}
+	// Progress assert: a budget that is never actually contended would also
+	// satisfy the bound above, so require that the run really did saturate it.
+	if observed < budget {
+		t.Fatalf("observed only %d concurrent bd subprocesses across %d callers; the test never contended the budget of %d, so the bound above proved nothing", observed, callers, budget)
+	}
+}
+
+func TestExecPurgeSlotWaitHonorsContext(t *testing.T) {
+	slots := make(chan struct{}, 1)
+	slots <- struct{}{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := execPurgeWithContext(ctx, t.TempDir(), nil, nil, slots)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("execPurgeWithContext error = %v, want context cancellation", err)
 	}
 }
 
