@@ -554,19 +554,40 @@ func TestHookClaimStoreHeadComparesRepositoriesNotPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("a store with no repository refuses a usable candidate", func(t *testing.T) {
+	t.Run("a store demonstrably holding no repository admits a usable candidate", func(t *testing.T) {
 		f := newHookClaimStoreFixture(t)
 		plain := filepath.Join(f.root, "not-a-repository")
 		if err := os.MkdirAll(plain, 0o755); err != nil {
 			t.Fatalf("creating %s: %v", plain, err)
 		}
-		// Nothing can be compared against a store whose repository was never
-		// identified, and the premise of the change is that the store's branch is
-		// worse than no branch, so the refusal holds when the answer is unknown. A
-		// store that genuinely holds no repository hands out no branch either, so
-		// this costs only the claim-time convenience stamp.
-		if !hookClaimResolveStoreHead(plain).Covers(f.worker) {
-			t.Errorf("a candidate was admitted against a store whose repository was never identified")
+		// A city directory that is not itself a Git checkout is a supported
+		// deployment, not an edge case, and it carries no on-disk repository
+		// marker of its own -- unlike the DECLINED case below, there is nothing
+		// here that git could be hiding. Refusing every candidate whenever the
+		// store's probe merely came back Absent, without asking whether the
+		// store could even hold a repository, costs every valid worker checkout
+		// its claim-time stamp for a deployment shape the fork explicitly
+		// supports (review11 finding 1).
+		if hookClaimResolveStoreHead(plain).Covers(f.worker) {
+			t.Errorf("a candidate was refused against a store the filesystem itself shows holds no repository")
+		}
+	})
+
+	t.Run("a store that declines to identify itself refuses a usable candidate", func(t *testing.T) {
+		f := newHookClaimStoreFixture(t)
+		// Unlike the plain-directory case above, the store here IS a repository
+		// on disk; git simply would not answer for it (dubious ownership,
+		// unreadable config). hookClaimDirLooksLikeRepo has to find the marker
+		// so the refusal still holds: the store's branch, if it turns out to
+		// answer for the candidate too, is worse than no branch at all.
+		t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+		t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+		t.Setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+		if _, probe := hookClaimHeadRepoDir(f.store); probe != hookClaimProbeAbsent {
+			t.Fatalf("the store probe is %v; this case needs git to decline it with an exit status", probe)
+		}
+		if !hookClaimResolveStoreHead(f.store).Covers(f.worker) {
+			t.Errorf("a candidate was admitted against a store git declined to identify, though the store carries a real repository marker on disk")
 		}
 	})
 
@@ -1143,5 +1164,103 @@ func TestHookClaimPinnedBranchReadKeepsRelativeConfigSemantics(t *testing.T) {
 	tree := hookClaimTreeFor(t, f.worker)
 	if got := hookResolveWorkBranch(tree); got != hookClaimFixtureWorkerBranch {
 		t.Errorf("branch = %q, want %q; the pinned read resolved its relative config against the process directory", got, hookClaimFixtureWorkerBranch)
+	}
+}
+
+// review11 finding 2: hookClaimDirLooksLikeRepo must climb ancestors to find a
+// repository marker instead of only checking the directory it was handed, and must
+// stop at GIT_CEILING_DIRECTORIES the same way git's own probes do.
+func TestHookClaimDirLooksLikeRepoClimbsToCeiling(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	nested := filepath.Join(repo, "a", "b", "c")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("creating nested dir: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatalf("creating .git marker: %v", err)
+	}
+	t.Setenv("GIT_CEILING_DIRECTORIES", root)
+
+	if !hookClaimDirLooksLikeRepo(nested) {
+		t.Errorf("nested dir under a repository was not recognized by climbing to the ancestor .git")
+	}
+
+	outside := filepath.Join(root, "unrelated", "x")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatalf("creating outside dir: %v", err)
+	}
+	if hookClaimDirLooksLikeRepo(outside) {
+		t.Errorf("dir with no repository marker above it, up to the ceiling, was reported as a repository")
+	}
+}
+
+// review11 finding 2: a linked worktree's own administrative directory (HEAD beside
+// commondir, no objects/) must be recognized as a repository shape, since its objects
+// live in the main repository it points back to.
+func TestHookClaimDirLooksLikeRepoRecognizesLinkedWorktreeAdminDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("writing HEAD: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "commondir"), []byte("../..\n"), 0o644); err != nil {
+		t.Fatalf("writing commondir: %v", err)
+	}
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(dir))
+
+	if !hookClaimDirLooksLikeRepo(dir) {
+		t.Errorf("a linked worktree administrative directory (HEAD+commondir, no objects/) was not recognized as a repository")
+	}
+}
+
+// review11 finding 2: a stat failure that is not "does not exist" -- permission
+// denied, an unreadable mount -- proves nothing either way and must be treated
+// conservatively as "cannot rule out a repository", not folded into "no repository".
+func TestHookClaimDirHasRepoMarkersTreatsPermissionDeniedAsCannotRuleOut(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permission bits")
+	}
+	root := t.TempDir()
+	blocked := filepath.Join(root, "blocked")
+	if err := os.Mkdir(blocked, 0o755); err != nil {
+		t.Fatalf("creating blocked dir: %v", err)
+	}
+	if err := os.Chmod(blocked, 0o000); err != nil {
+		t.Fatalf("chmod 000: %v", err)
+	}
+	defer func() {
+		if err := os.Chmod(blocked, 0o755); err != nil {
+			t.Fatalf("restoring blocked dir permissions: %v", err)
+		}
+	}()
+
+	if !hookClaimDirHasRepoMarkers(blocked) {
+		t.Errorf("a directory whose entries could not be statted (permission denied) was treated as demonstrably repository-free")
+	}
+}
+
+// review11 finding 3: an aliased directory reached through a symlink, with a missing
+// trailing component, must resolve consistently with the direct spelling instead of
+// falling back to the wholly-unresolved literal path once EvalSymlinks fails on the
+// missing tail.
+func TestHookClaimPathOutsideResolvesAliasWithMissingChild(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "store-by-another-name")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatalf("creating real dir: %v", err)
+	}
+	alias := filepath.Join(root, "shared-checkout")
+	if err := os.Symlink(realDir, alias); err != nil {
+		t.Fatalf("creating alias symlink: %v", err)
+	}
+
+	directMissing := filepath.Join(realDir, "missing-slot")
+	aliasedMissing := filepath.Join(alias, "missing-slot")
+
+	if hookClaimPathOutside(directMissing, realDir) {
+		t.Errorf("missing child under the real, unaliased spelling was refused as outside its own parent")
+	}
+	if hookClaimPathOutside(aliasedMissing, realDir) {
+		t.Errorf("missing child spelled through the alias was refused as outside the real parent it resolves to; alias and direct spellings disagreed")
 	}
 }

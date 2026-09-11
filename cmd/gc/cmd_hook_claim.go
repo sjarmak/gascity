@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"os"
 	"os/exec"
@@ -1637,11 +1638,21 @@ func (s hookClaimStoreHead) Admit(candidate string) (hookClaimWorkTree, bool) {
 		return hookClaimWorkTree{}, false
 	}
 	if s.probe != hookClaimProbeAnswered {
-		// The store's own repository was never identified, so there is nothing to
-		// compare the candidate against, and the same ordering applies. A store that
-		// genuinely holds no repository hands out no branch, so this costs only the
-		// claim-time convenience stamp; the closer still supplies the branch with its
-		// own metadata.
+		// The store's own repository was never identified. When git ran and
+		// reported nothing there, and the filesystem itself carries no repository
+		// marker either, the store demonstrably holds no repository at all -- a
+		// city directory outside any Git checkout is a supported deployment, not
+		// an edge case -- so there is nothing to compare the already-identified
+		// candidate against, and refusing here would cost every valid worker
+		// checkout its claim-time stamp for no safety gained. A declined or
+		// incomplete probe is a different question: the store MIGHT hold a
+		// repository that simply would not answer, and that keeps the original
+		// refusal, because a store that genuinely holds no repository hands out
+		// no branch either way, so this costs only the claim-time convenience
+		// stamp; the closer still supplies the branch with its own metadata.
+		if s.probe == hookClaimProbeAbsent && !hookClaimDirLooksLikeRepo(s.dir) {
+			return hookClaimWorkTree{Dir: cand, RepoDir: candRepo}, true
+		}
 		return hookClaimWorkTree{}, false
 	}
 	if hookClaimSameDir(candRepo, s.repoDir) {
@@ -1650,9 +1661,10 @@ func (s hookClaimStoreHead) Admit(candidate string) (hookClaimWorkTree, bool) {
 	return hookClaimWorkTree{Dir: cand, RepoDir: candRepo}, true
 }
 
-// hookClaimDirLooksLikeRepo reports whether dir carries a repository on disk, asked
-// without git. It separates the two readings that share one exit status: a directory
-// that holds no repository at all, and a repository git declined to answer for.
+// hookClaimDirLooksLikeRepo reports whether dir, or a directory it sits inside,
+// carries a repository on disk, asked without git. It separates the two readings
+// that share one exit status: a directory that holds no repository at all, and a
+// repository git declined to answer for.
 //
 // Only the second one is dangerous. When the store holds a repository that refused to
 // identify itself -- another user owns it, or its config is unreadable -- then every
@@ -1662,26 +1674,137 @@ func (s hookClaimStoreHead) Admit(candidate string) (hookClaimWorkTree, bool) {
 // the store holds no repository, there is no branch to leak and the path comparison
 // is the whole question.
 //
-// A worktree carries .git as a directory or as a file; a bare repository carries HEAD
-// beside objects/.
+// git itself discovers a repository by climbing from dir to its ancestors, and a
+// store directory named one level inside a checkout carries no marker of its own
+// even though git would still find one above it. This walks the same way, so a
+// dubious-ownership refusal at a nested store directory is read the same as it
+// would be at the checkout root.
+//
+// The walk stops at the same GIT_CEILING_DIRECTORIES boundary hookClaimRunGit's own
+// probes respect (git.SanitizedEnv passes it through), so this filesystem check and
+// the git query it exists to disambiguate never disagree about how far "climbing"
+// is allowed to reach -- a test fixture rooted under a real checkout, or any deployment
+// that sets the same ceiling for the same reason, gets one consistent answer from both.
 func hookClaimDirLooksLikeRepo(dir string) bool {
-	if strings.TrimSpace(dir) == "" {
+	current := filepath.Clean(strings.TrimSpace(dir))
+	if current == "" || current == "." {
 		return false
 	}
+	ceilings := hookClaimGitCeilingDirs()
+	for {
+		if hookClaimDirHasRepoMarkers(current) {
+			return true
+		}
+		if hookClaimDirIsCeiling(current, ceilings) {
+			return false
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return false
+		}
+		current = parent
+	}
+}
+
+// hookClaimGitCeilingDirs returns the cleaned, absolute form of every directory
+// named in GIT_CEILING_DIRECTORIES, the same variable git itself stops climbing at.
+func hookClaimGitCeilingDirs() []string {
+	raw := strings.TrimSpace(os.Getenv("GIT_CEILING_DIRECTORIES"))
+	if raw == "" {
+		return nil
+	}
+	var ceilings []string
+	for _, entry := range strings.Split(raw, string(filepath.ListSeparator)) {
+		entry = strings.TrimSpace(entry)
+		if entry == "" || !filepath.IsAbs(entry) {
+			continue
+		}
+		ceilings = append(ceilings, filepath.Clean(entry))
+	}
+	return ceilings
+}
+
+// hookClaimDirIsCeiling reports whether dir is itself one of the configured ceiling
+// directories, at which point climbing to its parent would cross the boundary git's
+// own discovery was told not to cross.
+func hookClaimDirIsCeiling(dir string, ceilings []string) bool {
+	for _, ceiling := range ceilings {
+		if dir == ceiling {
+			return true
+		}
+	}
+	return false
+}
+
+// hookClaimDirHasRepoMarkers reports whether dir itself carries the on-disk shape of
+// a repository. A worktree carries .git as a directory or as a file; a bare
+// repository carries HEAD beside objects/; a linked worktree's own administrative
+// directory carries HEAD beside commondir instead, because its objects live in the
+// main repository it points back to.
+//
+// A stat failure that is not "does not exist" -- permission denied, an unreadable
+// mount -- proves nothing either way, and reading it as "no repository" is exactly
+// the mistake this exists to avoid: it would turn "I could not check" into "there is
+// nothing here" and license an admission the failure gave no grounds for. Such a
+// failure reports true instead, because it cannot be ruled out.
+func hookClaimDirHasRepoMarkers(dir string) bool {
 	if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
 		return true
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return true
 	}
-	if _, err := os.Stat(filepath.Join(dir, "HEAD")); err != nil {
+	headInfo, err := os.Stat(filepath.Join(dir, "HEAD"))
+	if err != nil {
+		return !errors.Is(err, fs.ErrNotExist)
+	}
+	if headInfo.IsDir() {
 		return false
 	}
-	info, err := os.Stat(filepath.Join(dir, "objects"))
-	return err == nil && info.IsDir()
+	if info, err := os.Stat(filepath.Join(dir, "objects")); err == nil && info.IsDir() {
+		return true
+	} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	if info, err := os.Stat(filepath.Join(dir, "commondir")); err == nil && !info.IsDir() {
+		return true
+	} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	return false
+}
+
+// hookClaimResolveAsFarAsPossible resolves symlinks along path up to its first
+// missing component, then rejoins the unresolved remainder onto whatever prefix did
+// resolve. EvalSymlinks fails outright the moment any component does not exist yet,
+// which previously fell back to the literal, unresolved spelling of the WHOLE path --
+// comparing that against a fully symlink-resolved directory on the other side answers
+// a different question than the one being asked, because an aliased directory with a
+// missing child then compares as if the alias were never resolved at all.
+func hookClaimResolveAsFarAsPossible(path string) string {
+	clean := filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		return resolved
+	}
+	var trailing []string
+	current := clean
+	for {
+		parent := filepath.Dir(current)
+		if parent == current {
+			return clean
+		}
+		trailing = append([]string{filepath.Base(current)}, trailing...)
+		current = parent
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			return filepath.Join(append([]string{resolved}, trailing...)...)
+		}
+	}
 }
 
 // hookClaimPathOutside reports whether child can be SHOWN to name a directory that
 // is neither parent nor inside it. Symlinks are resolved on both sides so an aliased
 // spelling is compared as the directory it reaches; when a name cannot be resolved --
-// a recorded path that no longer exists -- the cleaned names are compared instead.
+// a recorded path that no longer exists -- as much of it as does exist is still
+// resolved, and only the missing tail is rejoined unresolved.
 //
 // Every reading it cannot establish is false, because the caller admits on true. A
 // relative name is refused because it means nothing without the process directory it
@@ -1696,13 +1819,7 @@ func hookClaimPathOutside(child, parent string) bool {
 	if hookClaimPathFoldsDotDot(child) || hookClaimPathFoldsDotDot(parent) {
 		return false
 	}
-	resolve := func(path string) string {
-		if resolved, err := filepath.EvalSymlinks(path); err == nil {
-			return resolved
-		}
-		return filepath.Clean(path)
-	}
-	childPath, parentPath := resolve(child), resolve(parent)
+	childPath, parentPath := hookClaimResolveAsFarAsPossible(child), hookClaimResolveAsFarAsPossible(parent)
 	if childPath == parentPath {
 		return false
 	}
