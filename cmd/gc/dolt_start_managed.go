@@ -426,10 +426,12 @@ func startManagedDoltSQLServer(cityPath, configFile, logFilePath string, logFile
 	if managedDoltScopeWatchdogEnabled() {
 		return startManagedDoltSQLServerWithScopeWatchdog(cityPath, configFile, logFilePath, logFile)
 	}
-	cmd := exec.Command("dolt", "sql-server", "--config", configFile)
+	command, args := managedDoltCommand("dolt", []string{"sql-server", "--config", configFile}, logFile)
+	cmd := exec.Command(command, args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
+	cmd.Dir = cityPath
 	cmd.SysProcAttr = managedDoltSQLServerSysProcAttr()
 	cmd.Env = doltServerEnv(cityPath, os.Environ())
 	if err := cmd.Start(); err != nil {
@@ -444,6 +446,8 @@ func startManagedDoltSQLServer(cityPath, configFile, logFilePath string, logFile
 	// (cmd_dolt_cleanup.go:sameReapProcessIdentity): start-time ticks first, ps
 	// lstart as the no-/proc fallback.
 	pid := cmd.Process.Pid
+	// The child may still be systemd-run pre-exec; oom_score_adj survives the exec into dolt.
+	lowerManagedDoltOOMScoreAdj(pid, logFile)
 	startTimeTicks, startIdentity := snapshotManagedDoltStartIdentity(pid)
 	started := managedDoltStartedProcess{
 		CityPath:       cityPath,

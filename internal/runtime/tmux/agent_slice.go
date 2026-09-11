@@ -1,17 +1,15 @@
 package tmux
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"log"
 	"os"
-	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/shellquote"
+	"github.com/gastownhall/gascity/internal/systemdscope"
 )
 
 // AgentSliceEnv names the environment variable that, when set to a systemd
@@ -60,22 +58,7 @@ func isWrapperCommand(cmd string) bool {
 // DBUS_SESSION_BUS_ADDRESS) can still fail wrapped spawns after a
 // successful probe here.
 func probeAgentSliceSupport(slice string) error {
-	if _, err := exec.LookPath("systemd-run"); err != nil {
-		return fmt.Errorf("systemd-run not found: %w", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), agentSliceProbeTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "systemd-run",
-		"--user", "--scope", "--slice="+slice, "--collect", "--quiet", "--", "true")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg != "" {
-			return fmt.Errorf("systemd user manager probe failed: %w: %s", err, msg)
-		}
-		return fmt.Errorf("systemd user manager probe failed: %w", err)
-	}
-	return nil
+	return systemdscope.Probe(slice, agentSliceProbeTimeout)
 }
 
 // agentSliceWrapper decides whether pane commands are wrapped in a transient

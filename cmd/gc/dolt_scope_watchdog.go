@@ -134,9 +134,12 @@ func startManagedDoltSQLServerWithScopeWatchdog(cityPath, configFile, logFilePat
 	if err != nil {
 		return managedDoltStartedProcess{}, err
 	}
-	cmd := exec.Command(watchdogExecutable, managedDoltScopeWatchdogArg, configFile, logFilePath, cityPath)
+	command, args := managedDoltCommand(watchdogExecutable,
+		[]string{managedDoltScopeWatchdogArg, configFile, logFilePath, cityPath}, logFile)
+	cmd := exec.Command(command, args...)
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
+	cmd.Dir = cityPath
 	cmd.SysProcAttr = managedDoltSQLServerSysProcAttr()
 	cmd.Env = doltServerEnv(cityPath, os.Environ())
 	stdout, err := cmd.StdoutPipe()
@@ -194,11 +197,14 @@ func runManagedDoltScopeWatchdog(args []string, stdout, stderr *os.File) int {
 		return 1
 	}
 	defer logFile.Close() //nolint:errcheck
+	// Lower before spawning dolt because the child inherits oom_score_adj across fork and exec.
+	lowerManagedDoltOOMScoreAdj(os.Getpid(), logFile)
 
 	cmd := exec.Command("dolt", "sql-server", "--config", configFile)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
+	cmd.Dir = cityPath
 	// Setpgid: the dolt sql-server leads its own process group, matching
 	// the direct production spawn (managedDoltSQLServerSysProcAttr) and the
 	// test watchdog's layout, and keeping the server's descendants out of
