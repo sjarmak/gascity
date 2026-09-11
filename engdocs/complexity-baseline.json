@@ -1530,7 +1530,7 @@
     {
       "package": "main",
       "function": "finalizeDrainAckStoppedSession",
-      "file": "cmd/gc/session_reconciler.go",
+      "file": "cmd/gc/session_reconciler_drain_ack.go",
       "ccn": 25
     },
     {

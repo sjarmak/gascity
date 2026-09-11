@@ -163,29 +163,51 @@ var infoByIDBareAssign = regexp.MustCompile(`\binfoByID\[[^\]]*\]\s*=[^=]`)
 var infoByIDTupleAssign = regexp.MustCompile(`^\s*infoByID\[[^\]]*\]\s*,[^=]*=[^=]`)
 
 // TestReconcileTickFoldFrontDoor forbids reintroducing a direct
-// `infoByID[...] =` fold in session_reconciler.go: every manual mutation of the
+// `infoByID[...] =` fold anywhere in the reconciler: every manual mutation of the
 // tick snapshot must route through the reconcileTick front door (apply /
 // applyResult / markClosed / set / applyStore / applyOptimistic) so a forgotten
 // fold cannot silently desync the cross-session min-floor / awake / drain scans
 // from the store. The only place a bare `t.infoByID[...] =` write is allowed is
 // reconcile_tick.go itself.
+//
+// The scan globs every session_reconciler*.go rather than naming one file, so
+// extracting a slice of the reconciler into a sibling cannot quietly carry its
+// folds out of this guard's reach: such a move leaves the test passing over a
+// smaller surface, which looks identical to a pass over the whole one.
 func TestReconcileTickFoldFrontDoor(t *testing.T) {
 	_, currentFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller failed")
 	}
-	path := filepath.Join(filepath.Dir(currentFile), "session_reconciler.go")
-	data, err := os.ReadFile(path)
+	paths, err := filepath.Glob(filepath.Join(filepath.Dir(currentFile), "session_reconciler*.go"))
 	if err != nil {
-		t.Fatalf("ReadFile(%q): %v", path, err)
+		t.Fatalf("Glob: %v", err)
 	}
-	for i, line := range strings.Split(string(data), "\n") {
-		code := line
-		if idx := strings.Index(code, "//"); idx >= 0 {
-			code = code[:idx] // strip line/inline comment
+	scanned := 0
+	for _, path := range paths {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
 		}
-		if infoByIDBareAssign.MatchString(code) || infoByIDTupleAssign.MatchString(code) {
-			t.Errorf("session_reconciler.go:%d writes infoByID directly (%q); route the fold through the reconcileTick front door (tick.apply / tick.applyResult / tick.markClosed / tick.set / tick.applyStore / tick.applyOptimistic) instead", i+1, strings.TrimSpace(line))
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%q): %v", path, err)
 		}
+		scanned++
+		name := filepath.Base(path)
+		for i, line := range strings.Split(string(data), "\n") {
+			code := line
+			if idx := strings.Index(code, "//"); idx >= 0 {
+				code = code[:idx] // strip line/inline comment
+			}
+			if infoByIDBareAssign.MatchString(code) || infoByIDTupleAssign.MatchString(code) {
+				t.Errorf("%s:%d writes infoByID directly (%q); route the fold through the reconcileTick front door (tick.apply / tick.applyResult / tick.markClosed / tick.set / tick.applyStore / tick.applyOptimistic) instead", name, i+1, strings.TrimSpace(line))
+			}
+		}
+	}
+	// A guard whose PASS signal is the absence of output needs a positive control:
+	// a glob that matches nothing, or only the orchestration file, would pass while
+	// checking less than intended.
+	if scanned < 2 {
+		t.Fatalf("scanned %d reconciler file(s) via %q; expected the orchestration file plus at least one extracted sibling", scanned, "session_reconciler*.go")
 	}
 }
