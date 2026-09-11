@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
 	"reflect"
 	"strings"
 	"testing"
@@ -11,6 +13,94 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime/systemdscope"
 	"github.com/gastownhall/gascity/internal/testutil"
 )
+
+type oomScoreAdjAttempt struct {
+	value        int
+	lastAccepted int
+}
+
+type oomScoreAdjFloorWriter struct {
+	floor        int
+	lastAccepted int
+	errAt        int
+	injectErr    error
+	attempts     []oomScoreAdjAttempt
+}
+
+func (w *oomScoreAdjFloorWriter) write(value int) error {
+	w.attempts = append(w.attempts, oomScoreAdjAttempt{value: value, lastAccepted: w.lastAccepted})
+	if len(w.attempts) == w.errAt && w.injectErr != nil {
+		return w.injectErr
+	}
+	if value < w.floor {
+		return fmt.Errorf("kernel floor %d rejects %d: %w", w.floor, value, fs.ErrPermission)
+	}
+	w.lastAccepted = value
+	return nil
+}
+
+type lowerOOMScoreAdjCase struct {
+	name                                     string
+	current, target, floor, want, wantWrites int
+	errAt                                    int
+	injectErr, wantErr                       error
+}
+
+func TestLowerOOMScoreAdjToFloor(t *testing.T) {
+	nonPermissionErr := fmt.Errorf("write oom_score_adj: %w", fs.ErrNotExist)
+	tests := []lowerOOMScoreAdjCase{
+		{name: "production host floor", current: 200, floor: 100, want: 100, wantWrites: -1},
+		{name: "target accepted", current: 200, floor: 0, want: 0, wantWrites: 1},
+		{name: "nothing below current accepted", current: 200, floor: 200, want: 200, wantErr: fs.ErrPermission, wantWrites: -1},
+		{name: "already at target", current: 0, floor: 0, want: 0, wantWrites: 0},
+		{name: "already below target", current: -500, floor: 0, want: -500, wantWrites: 0},
+		{name: "odd floor", current: 200, floor: 137, want: 137, wantWrites: -1},
+		{
+			name: "first write has non-permission error", current: 200, floor: 0,
+			errAt: 1, injectErr: nonPermissionErr, want: 200, wantErr: nonPermissionErr,
+			wantWrites: 1,
+		},
+		{
+			name: "non-permission error mid-search", current: 200, floor: 100,
+			errAt: 3, injectErr: nonPermissionErr, want: 100, wantErr: nonPermissionErr,
+			wantWrites: 3,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) { checkLowerOOMScoreAdjCase(t, tc) })
+	}
+}
+
+func checkLowerOOMScoreAdjCase(t *testing.T, tc lowerOOMScoreAdjCase) {
+	t.Helper()
+	writer := &oomScoreAdjFloorWriter{
+		floor: tc.floor, lastAccepted: tc.current, errAt: tc.errAt, injectErr: tc.injectErr,
+	}
+	got, err := lowerOOMScoreAdjToFloor(tc.current, tc.target, writer.write)
+	if got != tc.want {
+		t.Errorf("lowerOOMScoreAdjToFloor(%d, %d) = %d, want %d", tc.current, tc.target, got, tc.want)
+	}
+	if got != writer.lastAccepted {
+		t.Errorf("returned value = %d, value in effect = %d", got, writer.lastAccepted)
+	}
+	if tc.wantErr == nil && err != nil {
+		t.Errorf("lowerOOMScoreAdjToFloor error = %v, want nil", err)
+	}
+	if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+		t.Errorf("lowerOOMScoreAdjToFloor error = %v, want error wrapping %v", err, tc.wantErr)
+	}
+	if tc.wantWrites >= 0 && len(writer.attempts) != tc.wantWrites {
+		t.Errorf("writes = %d, want %d: %+v", len(writer.attempts), tc.wantWrites, writer.attempts)
+	}
+	if tc.wantWrites == 1 && len(writer.attempts) == 1 && writer.attempts[0].value != tc.target {
+		t.Errorf("only write = %d, want target %d", writer.attempts[0].value, tc.target)
+	}
+	for _, attempt := range writer.attempts {
+		if attempt.value >= attempt.lastAccepted {
+			t.Errorf("write %d was not below last accepted value %d", attempt.value, attempt.lastAccepted)
+		}
+	}
+}
 
 func TestManagedDoltSliceFor(t *testing.T) {
 	tests := []struct {
@@ -35,29 +125,6 @@ func TestManagedDoltSliceFor(t *testing.T) {
 			if got := managedDoltSliceFor(tc.testMode, tc.envValue, tc.envSet); got != tc.want {
 				t.Errorf("managedDoltSliceFor(%v, %q, %v) = %q, want %q",
 					tc.testMode, tc.envValue, tc.envSet, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestManagedDoltOOMScoreAdjNeedsLowering pins the direction of the
-// adjustment: only ever downward, and never below zero. The rationale for the
-// target lives on managedDoltOOMScoreAdj; what this pins is that an operator
-// value at or below it survives untouched.
-func TestManagedDoltOOMScoreAdjNeedsLowering(t *testing.T) {
-	tests := []struct {
-		name    string
-		current int
-		want    bool
-	}{
-		{name: "inherited user-manager default is lowered", current: 200, want: true},
-		{name: "already neutral is left alone", current: 0, want: false},
-		{name: "operator-set negative is preserved", current: -500, want: false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := managedDoltOOMScoreAdjNeedsLowering(tc.current); got != tc.want {
-				t.Errorf("managedDoltOOMScoreAdjNeedsLowering(%d) = %v, want %v", tc.current, got, tc.want)
 			}
 		})
 	}

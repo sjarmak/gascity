@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -82,6 +84,53 @@ func readProcOOMScoreAdj(t *testing.T, pid int) int {
 	return value
 }
 
+func TestOOMScoreAdjFloorProbeHelper(t *testing.T) {
+	rawStart := strings.TrimSpace(os.Getenv("GC_TEST_OOM_FLOOR_PROBE_START"))
+	if rawStart == "" {
+		t.Skip("helper process only")
+	}
+	start, err := strconv.Atoi(rawStart)
+	if err != nil {
+		t.Fatalf("parse probe start %q: %v", rawStart, err)
+	}
+	if err := os.WriteFile(procSelfOOMScoreAdj, []byte(strconv.Itoa(start)), 0o644); err != nil {
+		t.Fatalf("set probe start %d: %v", start, err)
+	}
+	for value := managedDoltOOMScoreAdj; value <= start; value++ {
+		err := os.WriteFile(procSelfOOMScoreAdj, []byte(strconv.Itoa(value)), 0o644)
+		if err == nil {
+			fmt.Printf("OOM_FLOOR=%d\n", value)
+			return
+		}
+		if !errors.Is(err, fs.ErrPermission) {
+			t.Fatalf("probe oom_score_adj=%d: %v", value, err)
+		}
+	}
+	t.Fatalf("no oom_score_adj accepted from %d through %d", managedDoltOOMScoreAdj, start)
+}
+
+func probeOOMScoreAdjFloor(t *testing.T, start int) int {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestOOMScoreAdjFloorProbeHelper$")
+	cmd.Env = sanitizedBaseEnv("GC_TEST_OOM_FLOOR_PROBE_START=" + strconv.Itoa(start))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("probe oom_score_adj floor from %d: %v\n%s", start, err, output)
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		if !strings.HasPrefix(line, "OOM_FLOOR=") {
+			continue
+		}
+		value, err := strconv.Atoi(strings.TrimPrefix(line, "OOM_FLOOR="))
+		if err != nil {
+			t.Fatalf("parse oom_score_adj floor from %q: %v", line, err)
+		}
+		return value
+	}
+	t.Fatalf("probe oom_score_adj floor from %d returned no OOM_FLOOR line:\n%s", start, output)
+	return 0
+}
+
 func readProcCwd(t *testing.T, pid int) string {
 	t.Helper()
 	cwd, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "cwd"))
@@ -154,16 +203,12 @@ func TestManagedDoltScopeWatchdogPlacesServerInSlice(t *testing.T) {
 		t.Errorf("dolt pid %d cwd = %q, want config directory %q", doltPID, got, dir)
 	}
 
-	// The helper set its own oom_score_adj to 200 before spawning; the
-	// watchdog must have cleared it so the server inherits a neutral value.
-	if got := readProcOOMScoreAdj(t, doltPID); got != managedDoltOOMScoreAdj {
+	// The helper set its own oom_score_adj to 200 before spawning. The server
+	// must inherit the lowest value this host permits from that starting point.
+	if got, want := readProcOOMScoreAdj(t, doltPID), probeOOMScoreAdjFloor(t, 200); got != want {
 		logData, _ := os.ReadFile(logPath)
-		if !strings.Contains(string(logData), "could not clear inherited oom_score_adj") {
-			t.Errorf("dolt pid %d oom_score_adj = %d, want %d; watchdog log:\n%s",
-				doltPID, got, managedDoltOOMScoreAdj, logData)
-		} else {
-			t.Logf("dolt pid %d retained oom_score_adj=%d because this test process cannot write %s; watchdog evidence: %s", doltPID, got, procSelfOOMScoreAdj, strings.TrimSpace(string(logData)))
-		}
+		t.Errorf("dolt pid %d oom_score_adj = %d, want host floor %d; watchdog log:\n%s",
+			doltPID, got, want, logData)
 	}
 }
 
@@ -210,6 +255,14 @@ func TestManagedDoltDirectSpawnPlacesServerInSlice(t *testing.T) {
 	waitForCgroupPlacement(t, started.PID, managedDoltPlacementTestSlice)
 	if got := readProcCwd(t, started.PID); got != dir {
 		t.Errorf("dolt pid %d cwd = %q, want config directory %q", started.PID, got, dir)
+	}
+	want := before
+	if before > managedDoltOOMScoreAdj {
+		want = probeOOMScoreAdjFloor(t, before)
+	}
+	if got := readProcOOMScoreAdj(t, started.PID); got != want {
+		logData, _ := os.ReadFile(logPath)
+		t.Errorf("dolt pid %d oom_score_adj = %d, want %d; log:\n%s", started.PID, got, want, logData)
 	}
 	// The caller is a general-purpose gc process here, so its own badness must
 	// be exactly what it was before it started a server.
