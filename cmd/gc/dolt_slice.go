@@ -23,12 +23,15 @@ package main
 // the units under it, and that value is inherited by every descendant process.
 // On a 62 GiB host it adds a ~12.5 GiB-equivalent bonus to the kernel's
 // badness score, so a ~1 GiB dolt was ranked as though it were ~13 GiB and
-// picked ahead of genuinely large processes. Resetting it to 0 is legal for an
-// unprivileged process; negative values need CAP_SYS_RESOURCE.
+// picked ahead of genuinely large processes. Lowering it toward 0 removes as
+// much of that bonus as the user manager's unprivileged floor permits;
+// negative values need CAP_SYS_RESOURCE.
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -57,9 +60,9 @@ const (
 	managedDoltManagedOOMPreference      = "avoid"
 	managedDoltPlacementOperationTimeout = 5 * time.Second
 
-	// managedDoltOOMScoreAdj is the best-effort badness target. Zero, not
-	// negative: a manager-imposed unprivileged floor can still reject lowering
-	// to zero, while negative values additionally require CAP_SYS_RESOURCE.
+	// managedDoltOOMScoreAdj is the preferred badness target. Application finds
+	// the lowest accepted value at or above it when the kernel enforces a higher
+	// unprivileged floor. Negative values additionally require CAP_SYS_RESOURCE.
 	managedDoltOOMScoreAdj = 0
 
 	// procSelfOOMScoreAdj is the calling process's badness knob. Writing it
@@ -171,12 +174,43 @@ func wrapManagedDoltArgvFor(argv []string, slice string, explicitlyConfigured bo
 	return wrapped, nil
 }
 
-// managedDoltOOMScoreAdjNeedsLowering reports whether the current badness
-// adjustment is above the target. Lowering is the only direction ever applied,
-// so a value already at or below the target is left alone and an operator who
-// deliberately protected the server further is not overridden.
-func managedDoltOOMScoreAdjNeedsLowering(current int) bool {
-	return current > managedDoltOOMScoreAdj
+// lowerOOMScoreAdjToFloor returns the lowest value in [target, current) that
+// write accepted, or current if none was accepted. It never writes when current
+// is at or below target, so an operator who deliberately protected the server
+// further is not overridden. It only searches past a permission error, because a
+// permission error is how the kernel reports an unprivileged floor. A
+// non-permission error stops the search and returns the value already in effect.
+// It never writes a value at or above one already accepted, so it only ever
+// lowers the value.
+func lowerOOMScoreAdjToFloor(current, target int, write func(int) error) (int, error) {
+	if current <= target {
+		return current, nil
+	}
+	firstErr := write(target)
+	if firstErr == nil {
+		return target, nil
+	}
+	if !errors.Is(firstErr, fs.ErrPermission) {
+		return current, firstErr
+	}
+
+	lowest := current
+	for low, high := target+1, current-1; low <= high; {
+		candidate := low + (high-low)/2
+		switch err := write(candidate); {
+		case err == nil:
+			lowest = candidate
+			high = candidate - 1
+		case errors.Is(err, fs.ErrPermission):
+			low = candidate + 1
+		default:
+			return lowest, err
+		}
+	}
+	if lowest == current {
+		return current, fmt.Errorf("could not lower oom_score_adj value %d toward %d: %w", current, target, firstErr)
+	}
+	return lowest, nil
 }
 
 // managedDoltOOMScoreAdjMu serializes the lower/spawn/restore sequence on the
@@ -185,11 +219,11 @@ func managedDoltOOMScoreAdjNeedsLowering(current int) bool {
 // such that the second server inherits the value the first restored.
 var managedDoltOOMScoreAdjMu sync.Mutex
 
-// applyManagedDoltOOMScoreAdj attempts to clear the inherited badness bonus
-// from the calling process so a dolt server forked from it inherits the best
-// value available to this unprivileged process. It reports the previous value
-// — so a caller that must not keep the new one can hand it to
-// [restoreManagedDoltOOMScoreAdj] — and whether anything changed.
+// applyManagedDoltOOMScoreAdj lowers the calling process's inherited badness
+// bonus to the lowest value the kernel accepts at or above the preferred
+// target, so a dolt server forked from it inherits that value. It reports the
+// previous value — so a caller that must not keep the new one can hand it to
+// [restoreManagedDoltOOMScoreAdj] — and whether any lowering occurred.
 //
 // The knob only exists on the calling process and is inherited across fork, and
 // Go's os/exec offers no pre-exec hook, so writing it here is the only way to
@@ -206,18 +240,15 @@ func applyManagedDoltOOMScoreAdj() (previous int, changed bool, err error) {
 	if err != nil {
 		return 0, false, fmt.Errorf("parse %s: %w", procSelfOOMScoreAdj, err)
 	}
-	if !managedDoltOOMScoreAdjNeedsLowering(current) {
-		return current, false, nil
-	}
-	if err := os.WriteFile(procSelfOOMScoreAdj, []byte(strconv.Itoa(managedDoltOOMScoreAdj)), 0o644); err != nil {
-		return current, false, fmt.Errorf("write %s: %w", procSelfOOMScoreAdj, err)
-	}
-	return current, true, nil
+	lowest, err := lowerOOMScoreAdjToFloor(current, managedDoltOOMScoreAdj, func(value int) error {
+		return os.WriteFile(procSelfOOMScoreAdj, []byte(strconv.Itoa(value)), 0o644)
+	})
+	return current, lowest < current, err
 }
 
-// restoreManagedDoltOOMScoreAdj puts back a value captured by applyManagedDoltOOMScoreAdj.
-// It cannot fail for want of privilege: the captured value is by construction
-// higher than the target, and raising oom_score_adj is always permitted.
+// restoreManagedDoltOOMScoreAdj puts back a value captured by a changed
+// applyManagedDoltOOMScoreAdj call. The captured value is higher than the
+// accepted value that was written, and raising oom_score_adj is permitted.
 func restoreManagedDoltOOMScoreAdj(previous int) error {
 	if err := os.WriteFile(procSelfOOMScoreAdj, []byte(strconv.Itoa(previous)), 0o644); err != nil {
 		return fmt.Errorf("restore %s to %d: %w", procSelfOOMScoreAdj, previous, err)
