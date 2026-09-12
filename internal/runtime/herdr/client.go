@@ -329,7 +329,7 @@ func (c *client) deliverNudge(ctx context.Context, paneID, text string) error {
 	if err == nil {
 		return nil
 	}
-	if !isAgentNotFound(err) {
+	if !isNoNamedAgent(err) {
 		return err
 	}
 	return c.pasteAndSubmit(ctx, paneID, text)
@@ -406,7 +406,7 @@ func (c *client) deliverStartupTurn(ctx context.Context, paneID, text string) er
 	if err == nil {
 		return nil
 	}
-	if isAgentNotFound(err) {
+	if isNoNamedAgent(err) {
 		return c.pasteAndSubmit(ctx, paneID, text)
 	}
 	switch herdrErrorCode(err) {
@@ -460,6 +460,31 @@ func isAgentNotFound(err error) bool {
 		return true
 	}
 	return strings.Contains(err.Error(), "not_found") || strings.Contains(err.Error(), "not found")
+}
+
+// isNoNamedAgent reports whether err is herdr saying the target pane carries no
+// named agent to act on. Two rejections mean that: agent_not_found (no
+// registration at all) and, from herdr 0.8.0, "is not an active named agent" —
+// a pane holding only a reported agent state, with no kind-launched agent behind
+// it. 0.7.x answered the same situation with agent_not_found, so a caller
+// matching only that code silently lost its fallback when herdr respelled it.
+//
+// The match is on the message rather than on 0.8.0's agent_not_ready code, for
+// two reasons that pull the same way. The code is not available on every shape:
+// when the CLI exits non-zero this client keeps herdr's stderr as plain text,
+// with no envelope to parse a code out of (observed live: the whole
+// {"error":{"code":"agent_not_ready",...}} envelope arrives as the message).
+// And the code alone is too broad: agent_not_ready ALSO covers a real named
+// agent that is merely still booting. Callers read a no-named-agent pane as one
+// to paste into, or as nothing to wait on; doing either to a booting agent types
+// into a TUI that is not accepting input yet, or reports a live session as
+// agentless. That case must keep returning the error so the caller retries, and
+// only this message distinguishes it.
+func isNoNamedAgent(err error) bool {
+	if isAgentNotFound(err) {
+		return true
+	}
+	return err != nil && strings.Contains(err.Error(), "not an active named agent")
 }
 
 // submitSettleDelay is how long the unregistered-pane fallback waits for a
