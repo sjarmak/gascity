@@ -7556,3 +7556,57 @@ func TestWarnIfClosedOrderTrackingBacklogLarge_CountsStoresTogether(t *testing.T
 		t.Fatalf("warning = %q, want one advisory line for the city", got)
 	}
 }
+
+// TestNewCityRuntimeWiresAssignedWorkDeferTracker pins the assigned-work defer
+// tracker into the runtime's construction, not merely into the option that
+// consumes it. The tracker is the same-bead backstop the idle-kill ladder
+// consults; its behavior tests all drive withAssignedWorkDeferTracker directly,
+// so dropping cr.adt from newCityRuntime leaves every one of them green while
+// the backstop is dead in production. That has happened once already, during a
+// branch split, and only the unused-symbol linter noticed, because the builder
+// happened to lose its last caller at the same time. Losing just the
+// construction call would be silent.
+func TestNewCityRuntimeWiresAssignedWorkDeferTracker(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath,
+		CityName: "test-city",
+		TomlPath: tomlPath,
+		Cfg:      cfg,
+		SP:       sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+
+	if cr.adt == nil {
+		t.Fatal("newCityRuntime left adt nil: the idle-kill same-bead defer backstop is not wired")
+	}
+
+	// Construction alone is not the whole wiring: the tracker also has to be
+	// HANDED to the reconcile pass. Applying the option here would only prove
+	// the option works, which no one doubts, and would stay green with the
+	// production call deleted. The production call site is what needs pinning,
+	// and this package already pins call sites by reading the source
+	// (TestGCNonTestFilesStayOnWorkerBoundary), so do that.
+	src, err := os.ReadFile("city_runtime.go")
+	if err != nil {
+		t.Fatalf("read city_runtime.go: %v", err)
+	}
+	if !bytes.Contains(src, []byte("withAssignedWorkDeferTracker(cr.adt)")) {
+		t.Fatal("city_runtime.go no longer hands the constructed tracker to the reconcile pass: the backstop is dead in production while every behavior test that drives the option directly stays green")
+	}
+}
