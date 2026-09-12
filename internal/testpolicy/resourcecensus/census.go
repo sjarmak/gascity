@@ -125,7 +125,7 @@ var bootstrapPolicy = Ledger{
 		{
 			Scope:           ScopeAll,
 			Resource:        ResourceSubprocess,
-			BaselineCalls:   663,
+			BaselineCalls:   661,
 			BaselineFiles:   191,
 			ReportedCalls:   495,
 			ReportedFiles:   135,
@@ -166,7 +166,7 @@ var bootstrapPolicy = Ledger{
 		{
 			Scope:           ScopeUntagged,
 			Resource:        ResourceSubprocess,
-			BaselineCalls:   450,
+			BaselineCalls:   448,
 			BaselineFiles:   129,
 			ReportedCalls:   380,
 			ReportedFiles:   98,
@@ -488,7 +488,7 @@ var bootstrapPolicy = Ledger{
 		{
 			Scope:           ScopeUntagged,
 			Resource:        ResourceSubprocess,
-			BaselineCalls:   441,
+			BaselineCalls:   439,
 			BaselineFiles:   123,
 			ReportedCalls:   394,
 			ReportedFiles:   105,

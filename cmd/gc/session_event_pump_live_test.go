@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -23,7 +26,9 @@ func TestSessionEventPumpLiveHerdr(t *testing.T) {
 		t.Skip("herdr not installed")
 	}
 
-	const session = "gctest-pump-live"
+	// Unique per run: herdr persists session state across server restarts, so a
+	// fixed name inherits a prior run's leftovers.
+	session := fmt.Sprintf("gctest-pump-live-%d", time.Now().UnixNano())
 	p := herdr.New(session, t.TempDir(), t.TempDir(), 0, 0)
 	_ = p.TeardownServer() // clear any leftover server from a crashed prior run
 	t.Cleanup(func() { _ = p.TeardownServer() })
@@ -33,6 +38,30 @@ func TestSessionEventPumpLiveHerdr(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// The agent blocks on a flag file rather than a fixed sleep, so the exit
+	// happens when this test asks for it. A timed exit races the quiet-drain
+	// below, which would consume the very poke the assertion then waits for,
+	// and the failure reads as "the pump never poked".
+	const agentName = "evt-pump-live"
+	work := t.TempDir()
+	exitFlag := filepath.Join(work, "exit-now")
+	cfg := runtime.Config{
+		WorkDir: work,
+		Command: fmt.Sprintf("/bin/sh -c 'while [ ! -e %s ]; do sleep 0.2; done'", exitFlag),
+	}
+	if err := p.Start(ctx, agentName, cfg); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Stop(agentName) })
+
+	// Register the pane as an agent under the gc session name BEFORE the pump
+	// subscribes. The stream builds its pane-to-session map from herdr's agent
+	// registry, and herdr 0.8.0 registers nothing for a raw-command pane, so
+	// without this every frame for this pane arrives unattributed and the pump
+	// drops it by design.
+	herdrLiveReportAgent(t, p, session, agentName, "working")
+
 	pokeCh := make(chan struct{}, 1)
 	pump := newSessionEventPump(ctx, pokeCh, &bytes.Buffer{}, "live")
 	// Park resync pokes outside the test window so the only poke observed
@@ -42,13 +71,6 @@ func TestSessionEventPumpLiveHerdr(t *testing.T) {
 	if !pump.streaming() {
 		t.Fatal("pump not streaming against live herdr")
 	}
-
-	// A short-lived agent: its natural exit is the death we detect.
-	cfg := runtime.Config{WorkDir: t.TempDir(), Command: "sleep 2"}
-	if err := p.Start(ctx, "evt-pump-live", cfg); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	t.Cleanup(func() { _ = p.Stop("evt-pump-live") })
 
 	// Drain startup noise (leading resync, resubscribe cycles for the new
 	// agent pane) until the pokes go quiet, then the process exit must poke.
@@ -61,6 +83,9 @@ func TestSessionEventPumpLiveHerdr(t *testing.T) {
 		}
 	}
 
+	if err := os.WriteFile(exitFlag, nil, 0o600); err != nil {
+		t.Fatalf("signaling the agent to exit: %v", err)
+	}
 	start := time.Now()
 	select {
 	case <-pokeCh:

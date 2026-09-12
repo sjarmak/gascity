@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -46,11 +45,12 @@ func TestNudgeEventDispatcherLiveHerdr(t *testing.T) {
 		t.Fatalf("ConfigureServer: %v", err)
 	}
 
-	// Start the runtime directly on the provider: a bare interactive sh pane
-	// (it echoes pastes, which the closed-loop delivery's screen-diff
-	// verification needs, and herdr keeps bare-sh agents registered — unlike
-	// adopted codex TUIs, which it drops). The session bead exists only for
-	// target resolution.
+	// Start the runtime directly on the provider: a bare interactive sh pane,
+	// because it echoes pastes, which the closed-loop delivery's screen-diff
+	// verification needs. herdr 0.8.0 does not register an agent for a pane
+	// started from a raw command, so the first herdrLiveReportAgent below is
+	// what puts this pane in the registry the event stream reads. The session
+	// bead exists only for target resolution.
 	const agentName = "nudge-live-a"
 	startCtx, startCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer startCancel()
@@ -100,7 +100,7 @@ func TestNudgeEventDispatcherLiveHerdr(t *testing.T) {
 	}
 
 	// The agent is BUSY when the nudge is queued — the wait-idle contract.
-	herdrLiveReportAgent(t, herdrSession, agentName, "working")
+	herdrLiveReportAgent(t, p, herdrSession, agentName, "working")
 	const nudgeText = "wait satisfied: live-dispatch proceed"
 	if err := enqueueQueuedNudge(cityPath, newQueuedNudge("worker", nudgeText, time.Now().Add(-time.Minute))); err != nil {
 		t.Fatalf("enqueueQueuedNudge: %v", err)
@@ -118,7 +118,7 @@ func TestNudgeEventDispatcherLiveHerdr(t *testing.T) {
 		deadline := time.Now().Add(25 * time.Second)
 		for time.Now().Before(deadline) {
 			if out, err := p.Peek(agentName, 0); err == nil && screenContains(out, "live-dispatch proceed") {
-				herdrLiveBestEffortReport(herdrSession, agentName, "working")
+				herdrLiveBestEffortReport(p, herdrSession, agentName, "working")
 				return
 			}
 			time.Sleep(250 * time.Millisecond)
@@ -129,7 +129,7 @@ func TestNudgeEventDispatcherLiveHerdr(t *testing.T) {
 	// delivery: event → fresh-stamp attempt → aged-stamp retry → verified
 	// paste+submit.
 	time.Sleep(1 * time.Second)
-	herdrLiveReportAgent(t, herdrSession, agentName, "idle")
+	herdrLiveReportAgent(t, p, herdrSession, agentName, "idle")
 	idleAt := time.Now()
 
 	deadline := time.Now().Add(30 * time.Second)
@@ -175,53 +175,44 @@ func screenContains(screen, needle string) bool {
 	return strings.Contains(compact(screen), compact(needle))
 }
 
-// herdrLivePaneID resolves the pane id for an agent name via the herdr CLI's
-// JSON envelope output. Returns "" when the agent is not (yet) listed.
-func herdrLivePaneID(t *testing.T, herdrSession, agentName string) string {
-	t.Helper()
-	out, err := exec.Command("herdr", "--session", herdrSession, "agent", "list").CombinedOutput()
+// herdrLivePaneID resolves the pane herdr bound to a gc session by reading the
+// sidecar binding the provider writes at Start. It deliberately does NOT ask
+// `herdr agent list`: from herdr 0.8.0 that registry holds only panes with a
+// registered agent, and these fixtures start a raw command rather than an agent
+// kind, so the pane has no registration until this file creates one. Resolving
+// the pane through the registry is therefore circular -- it needs the
+// registration it exists to make possible. "GC_HERDR_PANE_ID" is
+// internal/runtime/herdr's metaBoundPane, the same value the provider's own
+// lookups read. Returns "" until the binding lands, so callers can poll.
+func herdrLivePaneID(p *herdr.Provider, agentName string) string {
+	pane, err := p.GetMeta(agentName, "GC_HERDR_PANE_ID")
 	if err != nil {
-		t.Fatalf("herdr agent list: %v: %s", err, out)
+		return ""
 	}
-	var envelope struct {
-		Result struct {
-			Agents []struct {
-				Name   string `json:"name"`
-				PaneID string `json:"pane_id"`
-			} `json:"agents"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(out, &envelope); err != nil {
-		t.Fatalf("parsing herdr agent list output: %v: %s", err, out)
-	}
-	for _, a := range envelope.Result.Agents {
-		if a.Name == agentName {
-			return a.PaneID
-		}
-	}
-	return ""
+	return strings.TrimSpace(pane)
 }
 
 // herdrLiveReportAgent forces an agent status via herdr's report-agent API,
-// generating a real pane.agent_status_changed event on the stream. The pane
-// id is re-resolved per attempt with retries: right after an agent start the
-// provider closes the placement's stray shell pane, and the listed pane id
-// can go stale for a beat.
-func herdrLiveReportAgent(t *testing.T, herdrSession, agentName, state string) {
+// retrying until the pane binding exists. On herdr 0.8.0 the first call also
+// CREATES the pane's agent registration, so --agent carries the gc session name
+// rather than a reporter label: the event stream builds its pane-to-session map
+// from that registry (sessionEventStream.runCycle), and a registration under any
+// other name leaves every frame for this pane unattributed.
+func herdrLiveReportAgent(t *testing.T, p *herdr.Provider, herdrSession, agentName, state string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	var lastErr string
 	for time.Now().Before(deadline) {
-		paneID := herdrLivePaneID(t, herdrSession, agentName)
+		paneID := herdrLivePaneID(p, agentName)
 		if paneID != "" {
 			out, err := exec.Command("herdr", "--session", herdrSession, "pane", "report-agent", paneID,
-				"--source", "gctest", "--agent", "gctest", "--state", state).CombinedOutput()
+				"--source", "gctest", "--agent", agentName, "--state", state).CombinedOutput()
 			if err == nil {
 				return
 			}
 			lastErr = fmt.Sprintf("pane report-agent %s %s: %v: %s", paneID, state, err, out)
 		} else {
-			lastErr = fmt.Sprintf("agent %q not in herdr agent list", agentName)
+			lastErr = fmt.Sprintf("no pane binding recorded for %q yet", agentName)
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
@@ -230,27 +221,11 @@ func herdrLiveReportAgent(t *testing.T, herdrSession, agentName, state string) {
 
 // herdrLiveBestEffortReport is herdrLiveReportAgent without test-fatal
 // semantics, safe to call from helper goroutines.
-func herdrLiveBestEffortReport(herdrSession, agentName, state string) {
-	out, err := exec.Command("herdr", "--session", herdrSession, "agent", "list").CombinedOutput()
-	if err != nil {
+func herdrLiveBestEffortReport(p *herdr.Provider, herdrSession, agentName, state string) {
+	paneID := herdrLivePaneID(p, agentName)
+	if paneID == "" {
 		return
 	}
-	var envelope struct {
-		Result struct {
-			Agents []struct {
-				Name   string `json:"name"`
-				PaneID string `json:"pane_id"`
-			} `json:"agents"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(out, &envelope); err != nil {
-		return
-	}
-	for _, a := range envelope.Result.Agents {
-		if a.Name == agentName {
-			_ = exec.Command("herdr", "--session", herdrSession, "pane", "report-agent", a.PaneID,
-				"--source", "gctest", "--agent", "gctest", "--state", state).Run()
-			return
-		}
-	}
+	_ = exec.Command("herdr", "--session", herdrSession, "pane", "report-agent", paneID,
+		"--source", "gctest", "--agent", agentName, "--state", state).Run()
 }
