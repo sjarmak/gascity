@@ -1305,6 +1305,13 @@ func clearRetryEphemera(meta map[string]string) {
 		return
 	}
 	for _, key := range []string{
+		// A cloned attempt has not been claimed; gc.claimed_at must not survive
+		// the clone, both because it feeds the created-to-claimed /
+		// claimed-to-started latency transitions (OBS-001, beadmeta.ClaimedAtMetadataKey
+		// doc) and because a carried-forward timestamp is exactly the signal
+		// isDetachedHandoffOrphanCandidate (cmd/gc/pool_detached_orphan_sweep.go)
+		// reads as proof of completed work.
+		beadmeta.ClaimedAtMetadataKey,
 		beadmeta.OutcomeMetadataKey,
 		beadmeta.ExitCodeMetadataKey,
 		beadmeta.StdoutMetadataKey,

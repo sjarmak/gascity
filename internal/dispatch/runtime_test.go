@@ -9278,6 +9278,43 @@ func TestRetryClonedStepGetsItsOwnStepDefined(t *testing.T) {
 	}
 }
 
+// gc-6i5vst DEFECT 1: a retry clone must not carry the previous attempt's
+// gc.claimed_at. retryAttemptBead clones the previous attempt's metadata
+// wholesale (cloneMetadata), and the clone itself has not been claimed — a
+// carried-forward timestamp both misreports the created-to-claimed /
+// claimed-to-started latency transitions (OBS-001) and, worse, is read by
+// isDetachedHandoffOrphanCandidate (cmd/gc/pool_detached_orphan_sweep.go) as
+// proof of completed work, re-establishing pool routing for a bead the retry
+// path deliberately left unrouted.
+func TestClearRetryEphemeraStripsClaimedAt(t *testing.T) {
+	t.Parallel()
+
+	meta := map[string]string{
+		beadmeta.ClaimedAtMetadataKey: "2026-09-14T00:00:00Z",
+		"gc.routed_to":                "demo/reviewer",
+	}
+	clearRetryEphemera(meta)
+	if _, ok := meta[beadmeta.ClaimedAtMetadataKey]; ok {
+		t.Fatal("clearRetryEphemera must strip gc.claimed_at from a retry clone")
+	}
+
+	// End to end: a cloned retry attempt must be born without gc.claimed_at.
+	prev := beads.Bead{
+		ID:    "gcg-attempt-1",
+		Title: "build",
+		Type:  "task",
+		Metadata: map[string]string{
+			beadmeta.ClaimedAtMetadataKey:  "2026-09-14T00:00:00Z",
+			beadmeta.RootBeadIDMetadataKey: "gcg-root",
+			beadmeta.StepIDMetadataKey:     "build",
+		},
+	}
+	clone := retryAttemptBead(prev, "gcg-logical", "step.ref.2", 2, (*config.City)(nil))
+	if _, ok := clone.Metadata[beadmeta.ClaimedAtMetadataKey]; ok {
+		t.Fatal("retry attempt clone inherited gc.claimed_at; would be misread as completed-work evidence by the detached-orphan sweep")
+	}
+}
+
 func TestRewriteRalphAttemptRefRespectsAttemptBoundaries(t *testing.T) {
 	t.Parallel()
 

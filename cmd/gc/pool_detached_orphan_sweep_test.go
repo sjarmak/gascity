@@ -326,13 +326,13 @@ func TestSweepDetachedHandoffOrphans_RestoresBranchlessClaimedBead(t *testing.T)
 	}
 }
 
-// A bead that was only route-decorated — carrying gc.session_id and
-// gc.work_branch from somewhere other than the claim path, but never
-// actually claimed — must not be recovered. This is FINDING 1/2 from the
-// gc-wk9izw investigation: gc.session_id alone (or gc.work_branch alone) is
-// not proof of completed work, since internal/graphroute stamps
-// gc.session_id at route-decoration time, before any claim.
-func TestSweepDetachedHandoffOrphans_SkipsBranchedButNeverClaimed(t *testing.T) {
+// gc-6i5vst DEFECT 2: a bead claimed before gc.claimed_at existed (it landed
+// 2026-08-18, 187e538287/b06f458e70) carries gc.work_branch as its only
+// completed-work evidence. Requiring gc.claimed_at unconditionally strands
+// that class permanently — with no route it can never be claimed again to
+// acquire the key. gc.work_branch alone must be admitted as completed-work
+// evidence, the same as gc.claimed_at alone.
+func TestSweepDetachedHandoffOrphans_RestoresBranchedNeverClaimedBead(t *testing.T) {
 	store := beads.NewMemStore()
 
 	sessionBead, err := store.Create(beads.Bead{
@@ -348,14 +348,64 @@ func TestSweepDetachedHandoffOrphans_SkipsBranchedButNeverClaimed(t *testing.T) 
 		t.Fatalf("create session bead: %v", err)
 	}
 
-	_, err = store.Create(beads.Bead{
-		Title:  "route-decorated, never claimed",
+	work, err := store.Create(beads.Bead{
+		Title:  "branch-carrying, pre-claimed_at orphan",
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "some-branch",
 			beadmeta.SessionIDMetadataKey:   sessionBead.ID,
 			beadmeta.SessionNameMetadataKey: sessionBead.Metadata["session_name"],
-			// no gc.claimed_at — never actually claimed
+			// no gc.claimed_at — predates the key, or was never claimed
+		},
+	})
+	if err != nil {
+		t.Fatalf("create work bead: %v", err)
+	}
+
+	n, err := sweepDetachedHandoffOrphans(store)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("restored=%d, want 1 (gc.work_branch alone must recover a pre-claimed_at orphan)", n)
+	}
+
+	got, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if got.Metadata[beadmeta.RoutedToMetadataKey] != "gascity/gastown.polecat" {
+		t.Fatalf("gc.routed_to=%q, want gascity/gastown.polecat", got.Metadata[beadmeta.RoutedToMetadataKey])
+	}
+}
+
+// Neither completed-work signal present: no gc.claimed_at, no gc.work_branch.
+// Must not be recovered — route-decoration alone (gc.session_id) is not
+// proof of completed work, since internal/graphroute stamps gc.session_id
+// at route-decoration time, before any claim.
+func TestSweepDetachedHandoffOrphans_SkipsNeitherSignal(t *testing.T) {
+	store := beads.NewMemStore()
+
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  "pool session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "gastown__polecat-th-neversignaled",
+			"template":     "gascity/gastown.polecat",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+
+	_, err = store.Create(beads.Bead{
+		Title:  "route-decorated, never claimed or branched",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.SessionIDMetadataKey:   sessionBead.ID,
+			beadmeta.SessionNameMetadataKey: sessionBead.Metadata["session_name"],
+			// no gc.claimed_at, no gc.work_branch — never actually worked
 		},
 	})
 	if err != nil {
@@ -367,7 +417,7 @@ func TestSweepDetachedHandoffOrphans_SkipsBranchedButNeverClaimed(t *testing.T) 
 		t.Fatalf("sweep: %v", err)
 	}
 	if n != 0 {
-		t.Fatalf("restored=%d, want 0 (branch+session_id without gc.claimed_at must not be treated as completed work)", n)
+		t.Fatalf("restored=%d, want 0 (session_id alone, with neither gc.claimed_at nor gc.work_branch, must not be treated as completed work)", n)
 	}
 }
 

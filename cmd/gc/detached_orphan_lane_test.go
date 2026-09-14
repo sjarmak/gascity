@@ -285,8 +285,12 @@ func TestDetachedOrphanObserveKeepsOnlyTheOrphanShape(t *testing.T) {
 	routed.Metadata[beadmeta.RoutedToMetadataKey] = detachedOrphanTestPool
 	assigned := detachedOrphanWorkBead("A-1")
 	assigned.Assignee = "someone"
+	// gc-6i5vst: completed-work evidence is EITHER gc.claimed_at OR
+	// gc.work_branch, so a never-touched bead must carry neither to model
+	// ordinary bead traffic.
 	neverClaimed := detachedOrphanWorkBead("N-1")
 	delete(neverClaimed.Metadata, beadmeta.ClaimedAtMetadataKey)
+	delete(neverClaimed.Metadata, beadmeta.WorkBranchMetadataKey)
 
 	for _, b := range []beads.Bead{routed, assigned, neverClaimed} {
 		lane.observe(beadCreatedEvent(t, b))
