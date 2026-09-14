@@ -1340,6 +1340,26 @@ func clearRetryEphemera(meta map[string]string) {
 		"review.verdict",
 		"design_review.verdict",
 		"code_review.verdict",
+		// The gc.work_* completed-work record (ADR-0009) is the previous
+		// attempt's evidence that it claimed a worktree, made a commit, and
+		// closed with a disposition. A retry clone has done none of that, so
+		// none of the family may survive the clone (gc-tqs8ce): leaving
+		// gc.work_branch alone lets isDetachedHandoffOrphanCandidate
+		// (cmd/gc/pool_detached_orphan_sweep.go) admit the clone as completed
+		// work on evidence it fabricated by inheritance, and leaving
+		// gc.work_outcome/gc.work_commit without gc.work_branch would instead
+		// manufacture a close-gate violation (internal/workrecord/gate.go).
+		// gc.work_dir is included: per worktreeSpecForBead
+		// (cmd/gc/pool_desired_state.go:95-178) it is a per-attempt worktree
+		// path keyed by the bead that created it (the pool slot root/repo are
+		// the separate gc.worktree_root/gc.worktree_repo keys, not this one),
+		// so a clone under a new bead ID must not carry the previous
+		// attempt's path forward as if it were the clone's own workspace.
+		beadmeta.WorkBranchMetadataKey,
+		beadmeta.WorkCommitMetadataKey,
+		beadmeta.WorkDirMetadataKey,
+		beadmeta.WorkOutcomeMetadataKey,
+		beadmeta.WorkVerificationMetadataKey,
 	} {
 		delete(meta, key)
 	}

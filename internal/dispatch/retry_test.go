@@ -2559,3 +2559,41 @@ func TestClassifyRetryAttemptWithPostconditionsResolvesInputConvoyViaMemberStore
 		t.Fatalf("classifyRetryAttemptWithPostconditions() = %+v, want %+v (input convoy not resolved via MemberStores?)", got, want)
 	}
 }
+
+// TestRetryAttemptBeadStripsWorkRecordFamily proves a retry clone of a
+// claimed pool step carries none of the gc.work_* completed-work record
+// (gc-tqs8ce): a clone inherits gc.work_branch (and siblings) from the
+// previous attempt's metadata map wholesale unless clearRetryEphemera strips
+// them, and gc.work_branch alone is exactly the fabricated evidence
+// isDetachedHandoffOrphanCandidate (cmd/gc/pool_detached_orphan_sweep.go)
+// reads as a completed attempt.
+func TestRetryAttemptBeadStripsWorkRecordFamily(t *testing.T) {
+	t.Parallel()
+
+	prev := beads.Bead{
+		ID:    "gc-prevattempt",
+		Title: "step",
+		Type:  "task",
+		Metadata: map[string]string{
+			beadmeta.WorkBranchMetadataKey:       "work/prev-1",
+			beadmeta.WorkCommitMetadataKey:       "deadbeef",
+			beadmeta.WorkDirMetadataKey:          "/tmp/worktrees/gc-prevattempt",
+			beadmeta.WorkOutcomeMetadataKey:      "shipped",
+			beadmeta.WorkVerificationMetadataKey: "manual",
+		},
+	}
+
+	clone := retryAttemptBead(prev, "gc-logical", "demo.step", 2, nil)
+
+	for _, key := range []string{
+		beadmeta.WorkBranchMetadataKey,
+		beadmeta.WorkCommitMetadataKey,
+		beadmeta.WorkDirMetadataKey,
+		beadmeta.WorkOutcomeMetadataKey,
+		beadmeta.WorkVerificationMetadataKey,
+	} {
+		if value, present := clone.Metadata[key]; present {
+			t.Errorf("retryAttemptBead() clone carries %s=%q, want stripped", key, value)
+		}
+	}
+}

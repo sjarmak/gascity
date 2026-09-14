@@ -217,6 +217,54 @@ func TestSweepDetachedHandoffOrphans_SkipsWorkflowKind(t *testing.T) {
 	}
 }
 
+// isDetachedHandoffOrphanCandidate must reject the exact shape a retry clone
+// carries once clearRetryEphemera (internal/dispatch/ralph.go) strips the
+// gc.work_* completed-work family (gc-tqs8ce, round 3 of the detached-orphan
+// sweep review). Before that fix, gc.work_branch survived the clone and was
+// the sole completed-work evidence the OR admitted on — the clone had never
+// claimed a worktree, made a commit, or closed with a disposition, so
+// admitting it here would stamp gc.routed_to on fabricated evidence. This is
+// the composed-system proof: the clone's post-strip shape (no gc.claimed_at,
+// no gc.work_branch, session back-references intact — measured directly
+// against retryAttemptBead at 118731a877) must be rejected, while a genuine
+// pre-gc.claimed_at orphan with gc.work_branch and no clone provenance must
+// still be accepted. The OR itself is correct and untouched by this test;
+// only the clone's shape changed.
+func TestDetachedHandoffOrphanCandidateRejectsStrippedRetryCloneShape(t *testing.T) {
+	// The shape retryAttemptBead produces once clearRetryEphemera strips the
+	// gc.work_* family: gc.claimed_at absent (round 2's fix), gc.work_branch
+	// now also absent (round 3's fix), but gc.session_id/gc.session_name
+	// survive clearSessionAffinityMetadata untouched, and gc.routed_to was
+	// consumed by the prior claim.
+	strippedClone := beads.Bead{
+		ID:     "K-clone",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.SessionIDMetadataKey:   "gc-prevsession",
+			beadmeta.SessionNameMetadataKey: "gastown__polecat-th-clone",
+		},
+	}
+	if isDetachedHandoffOrphanCandidate(strippedClone) {
+		t.Fatal("a retry clone with neither gc.claimed_at nor gc.work_branch is a detached-orphan candidate; the sweep would stamp gc.routed_to on fabricated completed-work evidence")
+	}
+
+	// The genuine article the OR exists to recover: claimed before
+	// gc.claimed_at existed (landed 2026-08-18), so only gc.work_branch is
+	// present, and it carries no clone provenance.
+	genuineOrphan := beads.Bead{
+		ID:     "K-genuine",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.WorkBranchMetadataKey:  "polecat/ga-real",
+			beadmeta.SessionIDMetadataKey:   "gc-prevsession",
+			beadmeta.SessionNameMetadataKey: "gastown__polecat-th-clone",
+		},
+	}
+	if !isDetachedHandoffOrphanCandidate(genuineOrphan) {
+		t.Fatal("a genuine pre-gc.claimed_at orphan carrying gc.work_branch must still be a detached-orphan candidate; narrowing the round-2 OR would re-strand it")
+	}
+}
+
 // The same refusal one layer down, over every kind the dispatcher and the
 // workflow topology use — not just gc.kind=workflow.
 //
