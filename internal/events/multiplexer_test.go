@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -440,53 +441,46 @@ func TestMultiplexerWatch(t *testing.T) {
 }
 
 func TestMultiplexerWatchDoesNotWaitForSlowProvider(t *testing.T) {
-	m := NewMultiplexer()
-	m.providerTimeout = 20 * time.Millisecond
+	// The differential property under test — Watch returns once the
+	// healthy provider attaches without waiting out the slow provider's
+	// timeout — is a synchronization order, not a duration. A
+	// wall-clock providerTimeout raced against a wall-clock test bound
+	// (both previously 20ms vs. 200ms) is flaky under host load: a
+	// loaded scheduler can miss the 20ms bound for the HEALTHY provider
+	// too, so the test observes "every provider timed out" instead of
+	// "the slow provider was skipped". testing/synctest's fake clock
+	// makes providerTimeout fire only once every goroutine in the bubble
+	// (including the slow provider's attach, which blocks forever) is
+	// durably blocked, so the outcome no longer depends on real time.
+	synctest.Test(t, func(t *testing.T) {
+		m := NewMultiplexer()
+		m.providerTimeout = 20 * time.Millisecond
 
-	healthy := NewFake()
-	slow := newBlockingProvider()
-	defer slow.release()
+		healthy := NewFake()
+		slow := newBlockingProvider()
+		defer slow.release()
 
-	m.Add("healthy", healthy)
-	m.Add("slow", slow)
+		m.Add("healthy", healthy)
+		m.Add("slow", slow)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
 
-	result := make(chan struct {
-		w   *MuxWatcher
-		err error
-	}, 1)
-	go func() {
 		w, err := m.Watch(ctx, nil)
-		result <- struct {
-			w   *MuxWatcher
-			err error
-		}{w: w, err: err}
-	}()
-
-	var w *MuxWatcher
-	select {
-	case got := <-result:
-		if got.err != nil {
-			t.Fatalf("Watch() error = %v", got.err)
+		if err != nil {
+			t.Fatalf("Watch() error = %v", err)
 		}
-		w = got.w
-	case <-time.After(200 * time.Millisecond):
-		slow.release()
-		cancel()
-		t.Fatal("Watch() waited for the slow provider")
-	}
-	defer w.Close() //nolint:errcheck
+		defer w.Close() //nolint:errcheck
 
-	healthy.Record(Event{Type: SessionWoke, Actor: "a1"})
-	te, err := w.Next()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if te.City != "healthy" || te.Actor != "a1" {
-		t.Fatalf("Next() = %+v, want healthy provider event", te)
-	}
+		healthy.Record(Event{Type: SessionWoke, Actor: "a1"})
+		te, err := w.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if te.City != "healthy" || te.Actor != "a1" {
+			t.Fatalf("Next() = %+v, want healthy provider event", te)
+		}
+	})
 }
 
 func TestMultiplexerWatchWithCursors(t *testing.T) {
