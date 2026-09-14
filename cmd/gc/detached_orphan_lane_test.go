@@ -28,6 +28,7 @@ const (
 func detachedOrphanWorkBead(id string) beads.Bead {
 	return beads.Bead{ID: id, Title: "orphaned work", Type: "task", Status: "open", Metadata: map[string]string{
 		beadmeta.WorkBranchMetadataKey:  "polecat/" + id,
+		beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 		beadmeta.SessionNameMetadataKey: detachedOrphanTestSession,
 	}}
 }
@@ -284,10 +285,10 @@ func TestDetachedOrphanObserveKeepsOnlyTheOrphanShape(t *testing.T) {
 	routed.Metadata[beadmeta.RoutedToMetadataKey] = detachedOrphanTestPool
 	assigned := detachedOrphanWorkBead("A-1")
 	assigned.Assignee = "someone"
-	noBranch := detachedOrphanWorkBead("N-1")
-	delete(noBranch.Metadata, beadmeta.WorkBranchMetadataKey)
+	neverClaimed := detachedOrphanWorkBead("N-1")
+	delete(neverClaimed.Metadata, beadmeta.ClaimedAtMetadataKey)
 
-	for _, b := range []beads.Bead{routed, assigned, noBranch} {
+	for _, b := range []beads.Bead{routed, assigned, neverClaimed} {
 		lane.observe(beadCreatedEvent(t, b))
 	}
 	if got := lane.takePending(); len(got) != 0 {

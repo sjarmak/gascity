@@ -36,6 +36,7 @@ func TestSweepDetachedHandoffOrphans_RestoresRoute(t *testing.T) {
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-abc",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionNameMetadataKey: sessionBead.Metadata["session_name"],
 			// gc.routed_to and assignee left empty by failed done sequence
 		},
@@ -76,6 +77,7 @@ func TestSweepDetachedHandoffOrphans_SkipsAlreadyRouted(t *testing.T) {
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-routed",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionNameMetadataKey: "some-session",
 			beadmeta.RoutedToMetadataKey:    "gascity/gastown.polecat",
 		},
@@ -112,6 +114,7 @@ func TestSweepDetachedHandoffOrphans_SkipsAssigned(t *testing.T) {
 		Assignee: "some-session-id",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-assigned",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionNameMetadataKey: "some-session-id",
 		},
 	})
@@ -164,6 +167,7 @@ func TestSweepDetachedHandoffOrphans_SkipsWorkflowKind(t *testing.T) {
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-wf",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionNameMetadataKey: "gastown__polecat-th-wf",
 			beadmeta.KindMetadataKey:        beadmeta.KindWorkflow,
 		},
@@ -181,6 +185,7 @@ func TestSweepDetachedHandoffOrphans_SkipsWorkflowKind(t *testing.T) {
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-plain",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionNameMetadataKey: "gastown__polecat-th-wf",
 		},
 	})
@@ -222,6 +227,7 @@ func TestDetachedHandoffOrphanCandidateRefusesEveryKindedBead(t *testing.T) {
 	base := func() beads.Bead {
 		return beads.Bead{ID: "K-1", Status: "open", Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-k",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionNameMetadataKey: "gastown__polecat-th-wf",
 		}}
 	}
@@ -238,12 +244,15 @@ func TestDetachedHandoffOrphanCandidateRefusesEveryKindedBead(t *testing.T) {
 	}
 }
 
-// A bead with no branch set is not a completed-work bead and must be skipped.
-func TestSweepDetachedHandoffOrphans_SkipsNoBranch(t *testing.T) {
+// A bead with no gc.claimed_at is not a completed-work bead and must be
+// skipped — the claim path is the only non-test writer of gc.claimed_at, so
+// its absence means the bead was never claimed and worked, only minted or
+// route-decorated.
+func TestSweepDetachedHandoffOrphans_SkipsNoClaimedAt(t *testing.T) {
 	store := beads.NewMemStore()
 
 	_, err := store.Create(beads.Bead{
-		Title:  "no-branch bead",
+		Title:  "never-claimed bead",
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.SessionNameMetadataKey: "some-session",
@@ -258,7 +267,107 @@ func TestSweepDetachedHandoffOrphans_SkipsNoBranch(t *testing.T) {
 		t.Fatalf("sweep: %v", err)
 	}
 	if n != 0 {
-		t.Fatalf("restored=%d, want 0 (no branch → not a completed-work bead)", n)
+		t.Fatalf("restored=%d, want 0 (no gc.claimed_at → never claimed, not a completed-work bead)", n)
+	}
+}
+
+// gc-wk9izw: a pool-routed bead claimed by a pool-managed session correctly
+// carries no gc.work_branch (its WorkDir is a shared slot label, so stamping
+// a branch would manufacture worktree-ownership evidence for a tree nobody
+// owns). Such a bead must still be recoverable — gc.claimed_at is the
+// completed-work signal now, not the branch.
+func TestSweepDetachedHandoffOrphans_RestoresBranchlessClaimedBead(t *testing.T) {
+	store := beads.NewMemStore()
+
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  "pool session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "gastown__polecat-th-nobranch",
+			"template":     "gascity/gastown.polecat",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+
+	work, err := store.Create(beads.Bead{
+		Title:  "branchless claimed orphan",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
+			beadmeta.SessionIDMetadataKey:   sessionBead.ID,
+			beadmeta.SessionNameMetadataKey: sessionBead.Metadata["session_name"],
+			// no gc.work_branch — the pool-slot shape this fix targets
+		},
+	})
+	if err != nil {
+		t.Fatalf("create work bead: %v", err)
+	}
+	if _, ok := work.Metadata[beadmeta.WorkBranchMetadataKey]; ok {
+		t.Fatalf("fixture must not carry gc.work_branch — it pins the branchless pool-slot shape")
+	}
+
+	n, err := sweepDetachedHandoffOrphans(store)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("restored=%d, want 1 (gc.claimed_at alone must recover a branchless pool orphan)", n)
+	}
+
+	got, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if got.Metadata[beadmeta.RoutedToMetadataKey] != "gascity/gastown.polecat" {
+		t.Fatalf("gc.routed_to=%q, want gascity/gastown.polecat", got.Metadata[beadmeta.RoutedToMetadataKey])
+	}
+}
+
+// A bead that was only route-decorated — carrying gc.session_id and
+// gc.work_branch from somewhere other than the claim path, but never
+// actually claimed — must not be recovered. This is FINDING 1/2 from the
+// gc-wk9izw investigation: gc.session_id alone (or gc.work_branch alone) is
+// not proof of completed work, since internal/graphroute stamps
+// gc.session_id at route-decoration time, before any claim.
+func TestSweepDetachedHandoffOrphans_SkipsBranchedButNeverClaimed(t *testing.T) {
+	store := beads.NewMemStore()
+
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  "pool session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "gastown__polecat-th-neverclaimed",
+			"template":     "gascity/gastown.polecat",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+
+	_, err = store.Create(beads.Bead{
+		Title:  "route-decorated, never claimed",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.WorkBranchMetadataKey:  "some-branch",
+			beadmeta.SessionIDMetadataKey:   sessionBead.ID,
+			beadmeta.SessionNameMetadataKey: sessionBead.Metadata["session_name"],
+			// no gc.claimed_at — never actually claimed
+		},
+	})
+	if err != nil {
+		t.Fatalf("create work bead: %v", err)
+	}
+
+	n, err := sweepDetachedHandoffOrphans(store)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("restored=%d, want 0 (branch+session_id without gc.claimed_at must not be treated as completed work)", n)
 	}
 }
 
@@ -272,6 +381,7 @@ func TestSweepDetachedHandoffOrphans_SkipsNoSessionName(t *testing.T) {
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey: "polecat/ga-nosession",
+			beadmeta.ClaimedAtMetadataKey:  "2026-09-14T00:00:00Z",
 		},
 	})
 	if err != nil {
@@ -297,6 +407,7 @@ func TestSweepDetachedHandoffOrphans_SkipsWhenSessionNotFound(t *testing.T) {
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-gone",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionNameMetadataKey: "gastown__polecat-gone",
 		},
 	})
@@ -343,6 +454,7 @@ func TestSweepDetachedHandoffOrphans_SkipsWhenSessionHasNoTemplate(t *testing.T)
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-notempl",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionNameMetadataKey: "unknown-session",
 		},
 	})
@@ -395,6 +507,7 @@ func TestSweepDetachedHandoffOrphans_RecoverFromClosedSessionBead(t *testing.T) 
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-closed",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionNameMetadataKey: sessionBead.Metadata["session_name"],
 		},
 	})
@@ -441,6 +554,7 @@ func TestSweepDetachedHandoffOrphans_MultipleCandidates(t *testing.T) {
 			Status: "open",
 			Metadata: map[string]string{
 				beadmeta.WorkBranchMetadataKey:  "polecat/ga-multi",
+				beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 				beadmeta.SessionNameMetadataKey: sessionBead.Metadata["session_name"],
 			},
 		}); err != nil {
@@ -497,6 +611,7 @@ func TestSweepDetachedHandoffOrphansAcrossStores_RigOrphanCityStoredSession(t *t
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-xyz",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionNameMetadataKey: "gastown__polecat-th-xyz",
 			// gc.routed_to and assignee left empty by the failed done sequence
 		},
@@ -544,6 +659,7 @@ func TestSweepDetachedHandoffOrphans_SkipsBlockedCollapsedCandidate(t *testing.T
 	live := beads.NewMemStoreFrom(0, []beads.Bead{
 		{ID: "EB-blk", Title: "finalize", Type: "task", Status: "open", Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-blk",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionNameMetadataKey: sessionName,
 		}},
 	}, nil)
@@ -552,6 +668,7 @@ func TestSweepDetachedHandoffOrphans_SkipsBlockedCollapsedCandidate(t *testing.T
 		cachedSnapshot: []beads.Bead{
 			{ID: "EB-blk", Title: "finalize", Type: "task", Status: "open", Metadata: map[string]string{
 				beadmeta.WorkBranchMetadataKey:  "polecat/ga-blk",
+				beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 				beadmeta.SessionNameMetadataKey: sessionName,
 			}},
 		},
@@ -601,6 +718,7 @@ func TestSweepDetachedHandoffOrphans_SkipsRaceClaimedCandidate(t *testing.T) {
 			ID: "EB-race", Title: "work", Type: "task", Status: "in_progress",
 			Assignee: "gascity/gastown.polecat/th-race", Metadata: map[string]string{
 				beadmeta.WorkBranchMetadataKey:  "polecat/ga-race",
+				beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 				beadmeta.SessionNameMetadataKey: sessionName,
 			},
 		},
@@ -613,6 +731,7 @@ func TestSweepDetachedHandoffOrphans_SkipsRaceClaimedCandidate(t *testing.T) {
 		cached: beads.Bead{
 			ID: "EB-race", Title: "work", Type: "task", Status: "open", Metadata: map[string]string{
 				beadmeta.WorkBranchMetadataKey:  "polecat/ga-race",
+				beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 				beadmeta.SessionNameMetadataKey: sessionName,
 			},
 		},
@@ -677,6 +796,7 @@ func TestSweepDetachedHandoffOrphans_ClaimShapedRoute(t *testing.T) {
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-claim",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionIDMetadataKey:   sessionBead.ID,
 			beadmeta.SessionNameMetadataKey: sessionBead.Metadata["session_name"],
 		},
@@ -694,7 +814,7 @@ func TestSweepDetachedHandoffOrphans_ClaimShapedRoute(t *testing.T) {
 		t.Fatalf("sweep: %v", err)
 	}
 	if n != 1 {
-		t.Fatalf("restored=%d, want 1 (claim-shaped orphan must be recovered via gc.work_branch)", n)
+		t.Fatalf("restored=%d, want 1 (claim-shaped orphan must be recovered via gc.claimed_at)", n)
 	}
 
 	got, err := store.Get(work.ID)
@@ -747,6 +867,7 @@ func TestSweepDetachedHandoffOrphans_DuplicateSessionNamePrefersSessionID(t *tes
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-dup",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionIDMetadataKey:   sessionB.ID,
 			beadmeta.SessionNameMetadataKey: sharedName,
 		},
@@ -799,6 +920,7 @@ func TestSweepDetachedHandoffOrphans_AmbiguousSessionNameWithoutSessionID(t *tes
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-ambig",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionNameMetadataKey: sharedName,
 			// no gc.session_id — nothing to disambiguate the shared name
 		},
@@ -851,6 +973,7 @@ func TestSweepDetachedHandoffOrphans_DuplicateSessionNameAgreeingRouteResolves(t
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-agree",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionNameMetadataKey: sharedName,
 		},
 	})
@@ -905,6 +1028,7 @@ func TestSweepDetachedHandoffOrphans_SessionIDOnlyNoSessionName(t *testing.T) {
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey: "polecat/ga-idonly",
+			beadmeta.ClaimedAtMetadataKey:  "2026-09-14T00:00:00Z",
 			beadmeta.SessionIDMetadataKey:  sessionBead.ID,
 			// no gc.session_name — GC_SESSION_NAME was unset at claim time
 		},
@@ -975,6 +1099,7 @@ func TestSweepDetachedHandoffOrphans_PartialSessionListSkipsNameFallback(t *test
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-partial",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionNameMetadataKey: sharedName,
 			// no gc.session_id — nothing to disambiguate the shared name
 		},
@@ -1033,6 +1158,7 @@ func TestSweepDetachedHandoffOrphans_PartialSessionListStillResolvesByID(t *test
 		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.WorkBranchMetadataKey:  "polecat/ga-partial-id",
+			beadmeta.ClaimedAtMetadataKey:   "2026-09-14T00:00:00Z",
 			beadmeta.SessionIDMetadataKey:   "SB-partial-id",
 			beadmeta.SessionNameMetadataKey: sharedName,
 		},

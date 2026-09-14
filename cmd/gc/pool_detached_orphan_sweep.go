@@ -177,14 +177,29 @@ func detachedOrphanRoutesFor(store, routeStore beads.Store) (detachedOrphanRoute
 
 // isDetachedHandoffOrphanCandidate reports whether b has the signature of a
 // fully-detached handoff orphan: open, unassigned, no pool route (neither
-// gc.routed_to nor a legacy gc.run_target), no gc.kind, branch set (indicating
-// work was done and pushed), and a session back-reference — gc.session_id or
-// gc.session_name — from which the pool route can be recovered. This sweep's
-// novel domain is exactly work that carries *no* self-declared route: a bead
-// that still has gc.run_target is recovered earlier in the same tick by
+// gc.routed_to nor a legacy gc.run_target), no gc.kind, claimed (indicating
+// the claim path actually processed this bead, not merely route-decorated
+// it), and a session back-reference — gc.session_id or gc.session_name —
+// from which the pool route can be recovered. This sweep's novel domain is
+// exactly work that carries *no* self-declared route: a bead that still has
+// gc.run_target is recovered earlier in the same tick by
 // restoreCarriedWorkRoutes from its own declared route, and any non-empty
 // gc.kind is a workflow-root/control/topology bead that carriedPoolRoute
 // deliberately keeps out of pool demand.
+//
+// gc.claimed_at, not gc.work_branch, is the completed-work discriminator.
+// gc.work_branch is unsuitable: a pool-routed bead claimed by a pool-managed
+// session correctly records no branch (its WorkDir is a shared slot label,
+// so stamping a branch would manufacture worktree-ownership evidence for a
+// tree nobody owns), which strands exactly the class this sweep exists to
+// recover (gc-wk9izw). gc.claimed_at is also unsuitable to combine with
+// gc.session_id alone as a substitute: internal/graphroute's
+// ApplyGraphRouteBinding stamps gc.session_id at route-decoration time,
+// before a bead is ever claimed or worked, so gc.session_id by itself would
+// re-admit the never-started class the branch check was keeping out.
+// gc.claimed_at has exactly one non-test writer — the claim path
+// (cmd_hook_claim.go), stamped unconditionally when absent — so it cannot be
+// fabricated by routing and is real evidence the bead was claimed.
 func isDetachedHandoffOrphanCandidate(b beads.Bead) bool {
 	if b.Status != "open" {
 		return false
@@ -201,8 +216,8 @@ func isDetachedHandoffOrphanCandidate(b beads.Bead) bool {
 	if strings.TrimSpace(b.Metadata[beadmeta.KindMetadataKey]) != "" {
 		return false // any non-empty kind is workflow-root/control/topology work, not fully-detached pool work
 	}
-	if strings.TrimSpace(b.Metadata[beadmeta.WorkBranchMetadataKey]) == "" {
-		return false // no work branch → not a completed-work handoff bead
+	if strings.TrimSpace(b.Metadata[beadmeta.ClaimedAtMetadataKey]) == "" {
+		return false // never claimed → not a completed-work handoff bead
 	}
 	// Accept either session back-reference. The claim path stamps gc.session_id
 	// whenever GC_SESSION_ID is set and adds gc.session_name only when
