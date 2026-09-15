@@ -636,7 +636,12 @@ func claimHookWork(cityPath, workQuery, workDir string, queryEnv []string, store
 	if !proceed {
 		return 1
 	}
-	ops := classRoutedHookClaimOps(hookClaimOps{}, route)
+	ops, err := mixedCityRootHookClaimOps(cityPath, hookClaimOps{})
+	if err != nil {
+		fmt.Fprintf(stderr, "gc hook --claim: opening mixed city-root claim route: %v\n", err) //nolint:errcheck
+		return 1
+	}
+	ops = classRoutedHookClaimOps(ops, route)
 	return claimHookWorkWithRunner(workQuery, workDir, queryEnv, stores, claimOpts, ops, shellWorkQueryWithEnv, emitFailure, stdout, stderr)
 }
 
